@@ -19,7 +19,9 @@ import '../model/query_aggregation.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/system_table.dart';
+import '../model/table_identity.dart';
 import '../model/table_schema.dart';
+import '../model/table_context.dart';
 import '../model/transaction_models.dart';
 import '../query/query_condition.dart';
 import '../query/query_executor.dart';
@@ -45,8 +47,28 @@ class TableDataManager {
   final Map<String, bool> _tableFlushingFlags = {};
 
   /// Check if a table is currently being cleared/flushed
-  bool isTableBeingCleared(String tableName) {
-    return _tableFlushingFlags.containsKey(tableName);
+  bool isTableBeingCleared(TableContext table) {
+    return _tableFlushingFlags.containsKey(table.tableUid);
+  }
+
+  TableContext _resolveTableContext(TableContext table, {TableSchema? schema}) {
+    if (schema != null && schema.tableUid.isNotEmpty) {
+      final route = _dataStore.schemaManager?.getRouteByUid(schema.tableUid);
+      if (route != null) {
+        return TableContext(
+          tableUid: schema.tableUid,
+          tableName: TableName(route.tableName),
+          isGlobal: route.isGlobal,
+          dataDirIndex: route.dataDirIndex,
+          schema: schema,
+        );
+      }
+    }
+    return table;
+  }
+
+  TableContext? _tableContextFromUid(TableUid tableUid) {
+    return _dataStore.schemaManager?.getTableContextSync(tableUid);
   }
 
   // Store table partition size configuration (in bytes)
@@ -69,12 +91,12 @@ class TableDataManager {
   late final TreeCache<TableMeta> _tableMetaCache;
 
   // -------------------- Table record cache --------------------
-  // Composite key format: [tableName, pk]
+  // Composite key format: [tableUid, pk]
   late final TreeCache<Map<String, dynamic>> _tableRecordCache;
 
   // -------------------- Transactional structures --------------------
   // Per-transaction deferred ops (insert/update/delete) not written until commit
-  // txId -> tableName -> pk -> TxnDeferredOp
+  // txId -> tableUid -> pk -> TxnDeferredOp
   final Map<String, Map<String, Map<String, TxnDeferredOp>>> _txnDeferredOps =
       {};
 
@@ -121,19 +143,20 @@ class TableDataManager {
   /// Factory to provide comparators for TreeCache based on path (Table Record Cache)
   Comparator<dynamic> _tableRecordComparatorFactory(List<dynamic> path) {
     if (path.isNotEmpty) {
-      final tableName = path[0] as String;
-      return _pkComparators[tableName] ?? TreeCache.compareNative;
+      final tableUid = path[0] as String;
+      return _pkComparators[tableUid] ?? TreeCache.compareNative;
     }
     return TreeCache.compareNative;
   }
 
   /// Register a comparator for a table's primary key
-  void _registerTableComparator(String tableName, TableSchema schema) {
-    if (_pkComparators.containsKey(tableName)) return;
+  void _registerTableComparator(TableContext table, TableSchema schema) {
+    final tableUid = table.tableUid;
+    if (_pkComparators.containsKey(tableUid)) return;
 
     // Use ValueMatcher to get the correct comparator for the PK type
     final pdType = schema.getPrimaryKeyMatcherType();
-    _pkComparators[tableName] = ValueMatcher.getMatcher(pdType);
+    _pkComparators[tableUid] = ValueMatcher.getMatcher(pdType);
   }
 
   TableDataManager(this._dataStore) {
@@ -182,34 +205,35 @@ class TableDataManager {
   // -------------------- Table record cache APIs --------------------
   /// Get a cached record by [pk] if present.
   /// Returns a defensive copy to avoid external mutation of cached value.
-  Map<String, dynamic>? getCachedTableRecord(String tableName, String pk) {
-    return _tableRecordCache.get([tableName, pk]);
+  Map<String, dynamic>? getCachedTableRecord(TableContext table, String pk) {
+    return _tableRecordCache.get([table.tableUid, pk]);
   }
 
   /// Check if a record exists in the table record cache (O(1) fast check).
   /// Note: This returns true even for tombstones (deleted records) if they are in the cache.
-  bool hasTableRecord(String tableName, String pk) {
-    return _tableRecordCache.containsKey([tableName, pk]);
+  bool hasTableRecord(TableContext table, String pk) {
+    return _tableRecordCache.containsKey([table.tableUid, pk]);
   }
 
   /// Check if a record exists in the table record cache and is NOT a tombstone.
   ///
   /// This is safer than [hasTableRecord] for uniqueness/existence checks.
   /// Uses TreeCache.peek() to avoid polluting access stats during hot validation loops.
-  bool hasLiveTableRecord(String tableName, String pk) {
-    final rec = _tableRecordCache.get([tableName, pk], updateStats: false);
+  bool hasLiveTableRecord(TableContext table, String pk) {
+    final rec = _tableRecordCache.get([table.tableUid, pk], updateStats: false);
     return rec != null && !isDeletedRecord(rec);
   }
 
   /// Returns true when the record is hidden by a delete overlay in the current
   /// visibility context, even if the physical row still exists on disk.
-  bool isRecordHiddenByDeleteOverlay(String tableName, String pk,
+  bool isRecordHiddenByDeleteOverlay(TableContext table, String pk,
       {String? transactionId}) {
+    final tableUid = table.tableUid;
     final currentTxId =
         transactionId ?? TransactionContext.getCurrentTransactionId();
 
     if (currentTxId != null) {
-      final txOp = _txnDeferredOps[currentTxId]?[tableName]?[pk];
+      final txOp = _txnDeferredOps[currentTxId]?[tableUid]?[pk];
       if (txOp != null) {
         return txOp.type == BufferOperationType.delete ||
             isDeletedRecord(txOp.data);
@@ -217,7 +241,7 @@ class TableDataManager {
     }
 
     final bufferEntry =
-        _dataStore.writeBufferManager.getBufferedRecord(tableName, pk);
+        _dataStore.writeBufferManager.getBufferedRecord(table, pk);
     if (bufferEntry == null) {
       return false;
     }
@@ -227,27 +251,28 @@ class TableDataManager {
   }
 
   /// Cache a single table record
-  void cacheTableRecord(String tableName, String pk,
+  void cacheTableRecord(TableContext table, String pk,
       Map<String, dynamic> record, TableSchema schema,
       {bool force = false}) {
+    final tableUid = table.tableUid;
     if (_tableRecordCache.maxByteThreshold <= 0) {
       return;
     }
 
     if (isDeletedRecord(record)) {
-      _tableRecordCache.remove([tableName, pk]);
+      _tableRecordCache.remove([tableUid, pk]);
       return;
     }
 
     // [Cache Optimization] Use Fast O(1) checks
-    final bool alreadyInCache = _tableRecordCache.containsKey([tableName, pk]);
+    final bool alreadyInCache = _tableRecordCache.containsKey([tableUid, pk]);
 
     if (alreadyInCache || force || _dataStore.isGlobalPrewarming) {
       // Lazy registration of comparator
-      _registerTableComparator(tableName, schema);
+      _registerTableComparator(table, schema);
 
       _tableRecordCache.put(
-        [tableName, pk],
+        [tableUid, pk],
         record,
         size: estimateRecordSizeBytes(record),
       );
@@ -258,7 +283,7 @@ class TableDataManager {
   ///
   /// [isInsertOperation] should be true for internal batch insert paths.
   void cacheTableRecordsBatch(
-    String tableName,
+    TableContext table,
     List<Map<String, dynamic>> records, {
     required String primaryKey,
     required TableSchema schema,
@@ -266,6 +291,7 @@ class TableDataManager {
     bool force = false,
   }) {
     if (records.isEmpty) return;
+    final tableUid = table.tableUid;
     if (_tableRecordCache.maxByteThreshold <= 0) {
       return;
     }
@@ -278,14 +304,14 @@ class TableDataManager {
     }
 
     // Lazy registration of comparator
-    _registerTableComparator(tableName, schema);
+    _registerTableComparator(table, schema);
 
     for (final r in records) {
       final pk = r[primaryKey]?.toString();
       if (pk == null || pk.isEmpty) continue;
       if (isDeletedRecord(r)) continue;
 
-      final key = [tableName, pk];
+      final key = [tableUid, pk];
 
       // If not forced/prewarming, we only update if it's already there
       if (doNotCache) {
@@ -301,7 +327,7 @@ class TableDataManager {
   /// Asynchronously cache results fetched from disk after validating against write buffer.
   /// This prevents Read-Through Cache Pollution without blocking the main query flow.
   void _asyncCacheDiskResults({
-    required String tableName,
+    required TableContext table,
     required List<Map<String, dynamic>> diskResults,
     required TableSchema schema,
   }) {
@@ -311,6 +337,7 @@ class TableDataManager {
     scheduleMicrotask(() async {
       final validatedForCache = <Map<String, dynamic>>[];
       final primaryKey = schema.primaryKey;
+      final tableContext = _resolveTableContext(table, schema: schema);
 
       for (final r in diskResults) {
         final pk = r[primaryKey]?.toString();
@@ -319,7 +346,7 @@ class TableDataManager {
         // Only cache if the record is NOT marked as deleted in the global write buffer.
         final bufferEntry =
             _dataStore.writeBufferManager.getBufferedRecordForRead(
-          tableName,
+          tableContext,
           pk,
         );
         if (bufferEntry != null &&
@@ -332,7 +359,7 @@ class TableDataManager {
 
       if (validatedForCache.isNotEmpty) {
         cacheTableRecordsBatch(
-          tableName,
+          table,
           validatedForCache,
           primaryKey: primaryKey,
           schema: schema,
@@ -344,32 +371,32 @@ class TableDataManager {
 
   /// Remove a cached table record (if present).
 
-  void removeTableRecord(String tableName, String pk) {
-    _tableRecordCache.remove([tableName, pk]);
+  void removeTableRecord(TableContext table, String pk) {
+    _tableRecordCache.remove([table.tableUid, pk]);
   }
 
   /// Remove multiple cached table records.
-  Future<void> removeTableRecords(String tableName, List<String> pks) async {
+  Future<void> removeTableRecords(TableContext table, List<String> pks) async {
     if (pks.isEmpty) return;
     final yieldController =
         YieldController('TableDataManager.removeTableRecords');
     for (final pk in pks) {
       await yieldController.maybeYield();
-      _tableRecordCache.remove([tableName, pk]);
+      _tableRecordCache.remove([table.tableUid, pk]);
     }
   }
 
   /// Remove all cached records of a table (used for drop/clear/space switching).
-  Future<void> clearTableRecordsForTable(String tableName) async {
-    _tableRecordCache.remove([tableName]);
+  Future<void> clearTableRecordsForTable(TableContext table) async {
+    _tableRecordCache.remove([table.tableUid]);
 
     // Also remove from record count cache
-    _tableRecordCounts.remove(tableName);
+    _tableRecordCounts.remove(table.tableUid);
   }
 
   /// Remove record count cache for a table.
-  void removeRecordCountCache(String tableName) {
-    _tableRecordCounts.remove(tableName);
+  void removeRecordCountCache(TableContext table) {
+    _tableRecordCounts.remove(table.tableUid);
   }
 
   /// Remove record count cache for all tables.
@@ -395,12 +422,12 @@ class TableDataManager {
   }
 
   /// Query weight for table record cache entry
-  /// Path format: [tableName, pk]
-  /// Weight object is the tableName
+  /// Path format: [tableUid, pk]
+  /// Weight object is the tableUid
   Future<int?> _queryTableRecordWeight(List<dynamic> path) async {
     if (path.isEmpty) return null;
-    final tableName = path[0]?.toString();
-    if (tableName == null || tableName.isEmpty) return null;
+    final tableUid = path[0]?.toString();
+    if (tableUid == null || tableUid.isEmpty) return null;
 
     try {
       final weightManager = _dataStore.weightManager;
@@ -408,10 +435,14 @@ class TableDataManager {
 
       return await weightManager.getWeight(
         WeightType.tableRecord,
-        tableName,
+        tableUid,
       );
     } catch (e) {
-      Logger.warn('Failed to query table record weight for $tableName',
+      final logTable = _dataStore.schemaManager
+              ?.resolveTableNameFromField(tableUid)
+              ?.value ??
+          'unknown';
+      Logger.warn('Failed to query table record weight for $logTable',
           rawError: e);
       return null;
     }
@@ -548,8 +579,8 @@ class TableDataManager {
   }
 
   /// Invalidate cached table metadata for a single table (best-effort).
-  void invalidateTableMetaCacheForTable(String tableName) {
-    _tableMetaCache.remove(tableName);
+  void invalidateTableMetaCacheForTable(TableContext table) {
+    _tableMetaCache.remove(table.tableUid);
   }
 
   /// Load statistics from configuration
@@ -604,8 +635,14 @@ class TableDataManager {
       );
       final int statsConc = (statsLease?.asConcurrency(0.3) ?? 1);
       final metaList = await ParallelProcessor.execute<TableMeta?>(
-        tableNames.map((tableName) {
-          return () => getTableMeta(tableName);
+        tableNames.map((name) {
+          return () async {
+            final uid = schemaManager.getUidByName(TableName(name));
+            if (uid == null) return null;
+            final ctx = schemaManager.getTableContextSync(uid);
+            if (ctx == null) return null;
+            return getTableMeta(ctx);
+          };
         }).toList(),
         concurrency: statsConc,
         label: 'TableDataManager._calculateTableStatistics',
@@ -642,8 +679,8 @@ class TableDataManager {
   }
 
   /// Get current max ID in memory for a table
-  dynamic getMaxIdInMemory(String tableName) {
-    return _maxIds[tableName];
+  dynamic getMaxIdInMemory(TableContext table) {
+    return _maxIds[table.tableUid];
   }
 
   /// Save statistics to configuration
@@ -671,7 +708,7 @@ class TableDataManager {
 
   /// Update max ID value (only in memory)
   /// [updateFileMeta] if true, also updates FileMeta.maxAutoIncrementId to keep cache consistent
-  Future<void> updateMaxIdInMemory(String tableName, dynamic id,
+  Future<void> updateMaxIdInMemory(TableContext table, dynamic id,
       {bool updateFileMeta = false}) async {
     try {
       // Ensure id is in string format
@@ -682,13 +719,13 @@ class TableDataManager {
         return;
       }
 
-      final currentMaxId = _maxIds[tableName];
+      final currentMaxId = _maxIds[table.tableUid];
       bool shouldUpdate = false;
 
       if (currentMaxId == null) {
         // First set max ID
-        _maxIds[tableName] = idStr;
-        _maxIdsDirty[tableName] = true;
+        _maxIds[table.tableUid] = idStr;
+        _maxIdsDirty[table.tableUid] = true;
         shouldUpdate = true;
       } else {
         // Ensure currentMaxId is also a string
@@ -697,8 +734,8 @@ class TableDataManager {
         // Compare current value with max value
         final matcher = ValueMatcher.getMatcher(MatcherType.pkNumericString);
         if (matcher(idStr, currentMaxIdStr) > 0) {
-          _maxIds[tableName] = idStr;
-          _maxIdsDirty[tableName] = true;
+          _maxIds[table.tableUid] = idStr;
+          _maxIdsDirty[table.tableUid] = true;
           shouldUpdate = true;
         }
       }
@@ -707,10 +744,10 @@ class TableDataManager {
       // This ensures cache consistency and prevents unnecessary recalculations
       if (updateFileMeta && shouldUpdate) {
         try {
-          final fileMeta = await getTableMeta(tableName);
+          final fileMeta = await getTableMeta(table);
           if (fileMeta != null) {
             final updatedMeta = fileMeta.copyWith(maxAutoIncrementId: idStr);
-            await updateTableMeta(tableName, updatedMeta);
+            await updateTableMeta(table, updatedMeta);
           }
         } catch (e) {
           Logger.error('Failed to update FileMeta maxAutoIncrementId',
@@ -718,28 +755,29 @@ class TableDataManager {
         }
       }
     } catch (e) {
-      Logger.error('Failed to update max ID, tableName=$tableName, id=$id',
+      Logger.error('Failed to update max ID, table=${table.tableName}, id=$id',
           rawError: e);
     }
   }
 
   /// Get next auto-increment ID
-  Future<String> getNextId(String tableName) async {
+  Future<String> getNextId(TableContext table) async {
     try {
       // Get table schema
-      final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+      final schema =
+          await _dataStore.schemaManager?.getTableSchema(table.tableUid);
       if (schema == null) {
         return '';
       }
       // Check if initialization of auto-increment ID is needed for the table (lazy loading)
       if (schema.primaryKeyConfig.type == PrimaryKeyType.sequential &&
-          !_maxIds.containsKey(tableName)) {
+          !_maxIds.containsKey(table.tableUid)) {
         // Load auto-increment ID value only when first used (lock is already held)
-        await _updateMaxIdFromTableInternal(tableName);
+        await _updateMaxIdFromTableInternal(table);
       }
 
       // Get ID generator
-      final generator = await _getIdGenerator(tableName);
+      final generator = await _getIdGenerator(table);
 
       // Use ID pool optimization - batch generation method is implemented internally
       final ids = await generator.getId(1);
@@ -754,11 +792,11 @@ class TableDataManager {
 
       // If it's a sequential increment type, update max ID value
       if (schema.primaryKeyConfig.type == PrimaryKeyType.sequential) {
-        await updateMaxIdInMemory(tableName, ids.first);
+        await updateMaxIdInMemory(table, ids.first);
       }
 
       // Save ID range (if needed)
-      await _saveIdRange(tableName);
+      await _saveIdRange(table);
 
       return ids.first;
     } catch (e) {
@@ -768,24 +806,25 @@ class TableDataManager {
   }
 
   /// Get batch of IDs (used for optimizing bulk insert scenarios)
-  Future<List<String>> getBatchIds(String tableName, int count) async {
+  Future<List<String>> getBatchIds(TableContext table, int count) async {
     try {
       if (count <= 0) return [];
 
       // Get table schema
-      final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+      final schema =
+          await _dataStore.schemaManager?.getTableSchema(table.tableUid);
       if (schema == null) {
         return [];
       }
       // Check if initialization of auto-increment ID is needed for the table (lazy loading)
       if (schema.primaryKeyConfig.type == PrimaryKeyType.sequential &&
-          !_maxIds.containsKey(tableName)) {
+          !_maxIds.containsKey(table.tableUid)) {
         // Load auto-increment ID value only when first used (lock is already held)
-        await _updateMaxIdFromTableInternal(tableName);
+        await _updateMaxIdFromTableInternal(table);
       }
 
       // Get ID generator
-      final generator = await _getIdGenerator(tableName);
+      final generator = await _getIdGenerator(table);
 
       // Get IDs directly in batch
       final ids = await generator.getId(count);
@@ -793,11 +832,11 @@ class TableDataManager {
       // If it's a sequential increment type, update max ID value
       if (schema.primaryKeyConfig.type == PrimaryKeyType.sequential &&
           ids.isNotEmpty) {
-        await updateMaxIdInMemory(tableName, ids.last);
+        await updateMaxIdInMemory(table, ids.last);
       }
 
       // Save ID range (if needed)
-      await _saveIdRange(tableName);
+      await _saveIdRange(table);
 
       return ids;
     } catch (e) {
@@ -821,9 +860,10 @@ class TableDataManager {
         // Save ID range information for all tables
         final idGenKeys = List<String>.from(_idGenerators.keys);
         final yieldController = YieldController('TableDataManager.dispose');
-        for (final tableName in idGenKeys) {
+        for (final tableUid in idGenKeys) {
           await yieldController.maybeYield();
-          await _saveIdRange(tableName);
+          final ctx = _tableContextFromUid(TableUid(tableUid));
+          if (ctx != null) await _saveIdRange(ctx);
         }
       }
 
@@ -862,20 +902,22 @@ class TableDataManager {
         await yieldController.maybeYield();
         if (!entry.value) continue; // Skip unchanged
 
-        final tableName = entry.key;
-        if (isTableBeingCleared(tableName)) continue;
+        final tableUid = entry.key;
+        final table = _tableContextFromUid(TableUid(tableUid));
+        if (table == null) continue;
+        if (isTableBeingCleared(table)) continue;
 
-        final maxId = _maxIds[tableName];
+        final maxId = _maxIds[tableUid];
         if (maxId == null) continue;
 
         // Save to FileMeta
-        final fileMeta = await getTableMeta(tableName);
+        final fileMeta = await getTableMeta(table);
         if (fileMeta != null) {
           final updatedMeta = fileMeta.copyWith(maxAutoIncrementId: maxId);
-          await updateTableMeta(tableName, updatedMeta);
+          await updateTableMeta(table, updatedMeta);
         }
 
-        _maxIdsDirty[tableName] = false;
+        _maxIdsDirty[tableUid] = false;
       }
     } catch (e) {
       Logger.error('Failed to flush max IDs', rawError: e);
@@ -883,16 +925,16 @@ class TableDataManager {
   }
 
   /// Get partition size limit for a table
-  int _getPartitionSizeLimit(String tableName) {
+  int _getPartitionSizeLimit(TableContext table) {
     // If table has specific partition size configuration, use it
-    if (_tablePartitionSizes.containsKey(tableName)) {
-      final configuredSize = _tablePartitionSizes[tableName]!;
+    if (_tablePartitionSizes.containsKey(table.tableUid)) {
+      final configuredSize = _tablePartitionSizes[table.tableUid]!;
 
       // Ensure configured partition size doesn't exceed system maximum
       final systemMax = _dataStore.config.maxPartitionFileSize;
       if (configuredSize > systemMax) {
         Logger.warn(
-          'Table $tableName configured partition size ${configuredSize ~/ 1024}KB exceeds system limit ${systemMax ~/ 1024}KB, will use system limit',
+          'Table ${table.tableName} configured partition size ${configuredSize ~/ 1024}KB exceeds system limit ${systemMax ~/ 1024}KB, will use system limit',
         );
         return systemMax;
       }
@@ -901,7 +943,7 @@ class TableDataManager {
       const minSize = 10 * 1024; // 10KB
       if (configuredSize < minSize) {
         Logger.warn(
-          'Table $tableName configured partition size ${configuredSize ~/ 1024}KB is too small, will use minimum value ${minSize ~/ 1024}KB',
+          'Table ${table.tableName} configured partition size ${configuredSize ~/ 1024}KB is too small, will use minimum value ${minSize ~/ 1024}KB',
         );
         return minSize;
       }
@@ -914,32 +956,32 @@ class TableDataManager {
   }
 
   /// Set partition size limit for a table
-  void setTablePartitionSize(String tableName, int sizeInBytes) {
+  void setTablePartitionSize(TableContext table, int sizeInBytes) {
     if (sizeInBytes <= 0) {
       Logger.warn(
-        'Attempted to set partition size for table $tableName to $sizeInBytes, invalid value, will use default',
+        'Attempted to set partition size for table ${table.tableName} to $sizeInBytes, invalid value, will use default',
       );
       _tablePartitionSizes
-          .remove(tableName); // Remove invalid config, use default
+          .remove(table.tableUid); // Remove invalid config, use default
       return;
     }
 
-    _tablePartitionSizes[tableName] = sizeInBytes;
+    _tablePartitionSizes[table.tableUid] = sizeInBytes;
 
     // Log configuration change
     Logger.debug(
-      'Set partition size for table $tableName to ${sizeInBytes ~/ 1024}KB',
+      'Set partition size for table ${table.tableName} to ${sizeInBytes ~/ 1024}KB',
     );
   }
 
   /// Get partition size limit for a table (public method)
-  int getTablePartitionSize(String tableName) {
-    return _getPartitionSizeLimit(tableName);
+  int getTablePartitionSize(TableContext table) {
+    return _getPartitionSizeLimit(table);
   }
 
   /// Add record to buffer
   Future<void> addToBuffer(
-    String tableName,
+    TableContext table,
     Map<String, dynamic> data,
     BufferOperationType operationType, {
     List<UniqueKeyRef>? uniqueKeyRefs,
@@ -947,7 +989,8 @@ class TableDataManager {
     String? transactionId,
     required String schemaVersion,
   }) async {
-    final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+    final schema =
+        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
     if (schema == null) {
       Logger.error('Table schema is null, cannot add to buffer');
       return;
@@ -956,7 +999,7 @@ class TableDataManager {
     final recordId = data[primaryKey]?.toString();
     if (recordId == null) {
       Logger.error(
-        'Record in table $tableName does not have a primary key value, cannot add to buffer',
+        'Record in table ${table.tableName} does not have a primary key value, cannot add to buffer',
       );
       return;
     }
@@ -969,7 +1012,7 @@ class TableDataManager {
       final byTable = _txnDeferredOps.putIfAbsent(
           currentTxId, () => <String, Map<String, TxnDeferredOp>>{});
       final map =
-          byTable.putIfAbsent(tableName, () => <String, TxnDeferredOp>{});
+          byTable.putIfAbsent(table.tableUid, () => <String, TxnDeferredOp>{});
 
       final rec = Map<String, dynamic>.from(data);
 
@@ -985,11 +1028,11 @@ class TableDataManager {
           throw DbException([
             ConstraintStatus(
               type: ResultType.bizRecordNotFound,
-              tableName: tableName,
+              tableName: table.tableName,
               fields: [primaryKey],
               conflictingKeys: [recordId],
               message:
-                  'Cannot update record $recordId in table $tableName because it has already been deleted in the current transaction',
+                  'Cannot update record $recordId in table ${table.tableName} because it has already been deleted in the current transaction',
             ),
           ]);
         }
@@ -1032,7 +1075,7 @@ class TableDataManager {
         if (pkVal != null) {
           _dataStore.writeBufferManager.addTransactionUniqueKeys(
             transactionId: currentTxId,
-            tableName: tableName,
+            table: _resolveTableContext(table, schema: schema),
             recordId: pkVal,
             uniqueKeys: uniqueKeyRefs,
           );
@@ -1042,18 +1085,18 @@ class TableDataManager {
     }
 
     if (operationType == BufferOperationType.update) {
-      final priorBuffered =
-          _dataStore.writeBufferManager.getBufferedRecord(tableName, recordId);
+      final priorBuffered = _dataStore.writeBufferManager.getBufferedRecord(
+          _resolveTableContext(table, schema: schema), recordId);
       if (priorBuffered != null &&
           priorBuffered.operation == BufferOperationType.delete) {
         throw DbException([
           ConstraintStatus(
             type: ResultType.bizRecordNotFound,
-            tableName: tableName,
+            tableName: table.tableName,
             fields: [primaryKey],
             conflictingKeys: [recordId],
             message:
-                'Cannot update record $recordId in table $tableName because it has already been deleted',
+                'Cannot update record $recordId in table ${table.tableName} because it has already been deleted',
           ),
         ]);
       }
@@ -1064,19 +1107,19 @@ class TableDataManager {
       final BufferOperationType finalOperation = operationType;
 
       if (finalOperation == BufferOperationType.delete) {
-        removeTableRecord(tableName, recordId);
+        removeTableRecord(table, recordId);
         // Best-effort stats.
-        final cur = _tableRecordCounts[tableName];
+        final cur = _tableRecordCounts[table.tableUid];
         if (cur != null && cur > 0) {
-          _tableRecordCounts[tableName] = cur - 1;
+          _tableRecordCounts[table.tableUid] = cur - 1;
         }
       } else {
         // Insert/Update both materialize the full record in the table record cache.
         // Use force=true so memory mode treats cache as the primary store.
-        cacheTableRecord(tableName, recordId, data, schema, force: true);
+        cacheTableRecord(table, recordId, data, schema, force: true);
         if (finalOperation == BufferOperationType.insert) {
-          _tableRecordCounts[tableName] =
-              (_tableRecordCounts[tableName] ?? 0) + 1;
+          _tableRecordCounts[table.tableUid] =
+              (_tableRecordCounts[table.tableUid] ?? 0) + 1;
         }
       }
 
@@ -1099,7 +1142,7 @@ class TableDataManager {
         if (indexOldData != null || indexNewData != null) {
           // Fire and forget, don't block main flow
           await _dataStore.indexManager!.updateIndexDataCache(
-            tableName,
+            table,
             recordId,
             indexOldData,
             indexNewData,
@@ -1120,7 +1163,7 @@ class TableDataManager {
     // Append WAL (if enabled) and get pointer
     final walPointer = await _dataStore.walManager.append({
       'op': finalOperation.index,
-      'table': tableName,
+      'table': table.tableUid,
       'data': bufferedData,
       'ts': DateTime.now().toIso8601String(),
       if (currentTxId != null) 'txId': currentTxId,
@@ -1140,7 +1183,7 @@ class TableDataManager {
 
     // Enqueue into write buffer/queue (in-memory)
     await _dataStore.writeBufferManager.addRecord(
-      tableName: tableName,
+      table: _resolveTableContext(table, schema: schema),
       recordId: recordId,
       entry: entry,
       uniqueKeys: uniqueKeyRefs ?? const <UniqueKeyRef>[],
@@ -1162,7 +1205,7 @@ class TableDataManager {
       if (indexOldData != null || indexNewData != null) {
         // Fire and forget, don't block main flow
         await _dataStore.indexManager!.updateIndexDataCache(
-          tableName,
+          table,
           recordId,
           indexOldData,
           indexNewData,
@@ -1172,9 +1215,9 @@ class TableDataManager {
 
     // Sync to TableRecordCache
     if (finalOperation == BufferOperationType.delete) {
-      removeTableRecord(tableName, recordId);
+      removeTableRecord(table, recordId);
     } else if (finalOperation == BufferOperationType.update) {
-      cacheTableRecord(tableName, recordId, bufferedData, schema);
+      cacheTableRecord(table, recordId, bufferedData, schema);
     }
 
     // Statistics
@@ -1185,7 +1228,7 @@ class TableDataManager {
   /// Handles Transactions, Memory-Mode, and Persistent WAL+Buffer paths.
   Future<({List<String> successRecordIds, List<String> failedRecordIds})>
       addBatchToBuffer({
-    required String tableName,
+    required TableContext table,
     required List<Map<String, dynamic>> records,
     required BufferOperationType operation,
     required TableSchema schema,
@@ -1216,7 +1259,7 @@ class TableDataManager {
       final byTable = _txnDeferredOps.putIfAbsent(
           currentTxId, () => <String, Map<String, TxnDeferredOp>>{});
       final map =
-          byTable.putIfAbsent(tableName, () => <String, TxnDeferredOp>{});
+          byTable.putIfAbsent(table.tableUid, () => <String, TxnDeferredOp>{});
       final yieldController = YieldController('TableDataManager._addBatch.tx');
 
       for (int i = 0; i < records.length; i++) {
@@ -1243,14 +1286,15 @@ class TableDataManager {
           if (uniqueRefs.isNotEmpty) {
             _dataStore.writeBufferManager.addTransactionUniqueKeys(
               transactionId: currentTxId,
-              tableName: tableName,
+              table: _resolveTableContext(table, schema: schema),
               recordId: recordId,
               uniqueKeys: uniqueRefs,
             );
           }
           successIds.add(recordId);
         } catch (e) {
-          Logger.warn('Txn deferred batch op failed: $tableName pk=$recordId',
+          Logger.warn(
+              'Txn deferred batch op failed: ${table.tableName} pk=$recordId',
               rawError: e);
           failedIds.add(recordId);
         }
@@ -1262,7 +1306,7 @@ class TableDataManager {
     if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
       final yieldController =
           YieldController('TableDataManager._addBatch.memory');
-      _registerTableComparator(tableName, schema);
+      _registerTableComparator(table, schema);
 
       for (int i = 0; i < records.length; i++) {
         await yieldController.maybeYield();
@@ -1276,37 +1320,37 @@ class TableDataManager {
 
           if (operation == BufferOperationType.delete) {
             // Memory mode: Removal from primary cache
-            removeTableRecord(tableName, recordId);
+            removeTableRecord(table, recordId);
 
-            _tableRecordCounts[tableName] =
-                (_tableRecordCounts[tableName] ?? 0) - successIds.length;
+            _tableRecordCounts[table.tableUid] =
+                (_tableRecordCounts[table.tableUid] ?? 0) - successIds.length;
             _needSaveStats = true;
 
             // Memory mode: Index erasure (newData is null)
             if (_dataStore.indexManager != null) {
               await _dataStore.indexManager!.updateIndexDataCache(
-                  tableName, recordId, r, null,
+                  table, recordId, r, null,
                   overrideSchema: schema, force: true);
             }
           } else {
             if (operation == BufferOperationType.insert) {
-              _tableRecordCounts[tableName] =
-                  (_tableRecordCounts[tableName] ?? 0) + successIds.length;
+              _tableRecordCounts[table.tableUid] =
+                  (_tableRecordCounts[table.tableUid] ?? 0) + successIds.length;
               _needSaveStats = true;
             }
             // Memory mode: Update primary cache
-            cacheTableRecord(tableName, recordId, r, schema, force: true);
+            cacheTableRecord(table, recordId, r, schema, force: true);
 
             // Memory mode: Index update
             if (_dataStore.indexManager != null) {
               await _dataStore.indexManager!.updateIndexDataCache(
-                  tableName, recordId, oldR, r,
+                  table, recordId, oldR, r,
                   overrideSchema: schema, force: true);
             }
           }
           successIds.add(recordId);
         } catch (e) {
-          Logger.warn('Memory batch op failed: $tableName pk=$recordId',
+          Logger.warn('Memory batch op failed: ${table.tableName} pk=$recordId',
               rawError: e);
           failedIds.add(recordId);
         }
@@ -1344,7 +1388,7 @@ class TableDataManager {
 
       walEntries.add({
         'op': operation.index,
-        'table': tableName,
+        'table': table.tableUid,
         'ts': tsIso,
         if (currentTxId != null) 'txId': currentTxId,
         'data': walData,
@@ -1382,18 +1426,18 @@ class TableDataManager {
           }
 
           if (operation == BufferOperationType.update) {
-            cacheTableRecord(tableName, recordId, r, schema);
+            cacheTableRecord(table, recordId, r, schema);
             await _dataStore.indexManager?.updateIndexDataCache(
-              tableName,
+              table,
               recordId,
               oldR,
               r,
               overrideSchema: schema,
             );
           } else if (operation == BufferOperationType.delete) {
-            removeTableRecord(tableName, recordId);
+            removeTableRecord(table, recordId);
             await _dataStore.indexManager?.updateIndexDataCache(
-              tableName,
+              table,
               recordId,
               r,
               null,
@@ -1402,7 +1446,7 @@ class TableDataManager {
           }
         }
       } catch (e) {
-        Logger.error('Persistent batch WAL append failed: $tableName',
+        Logger.error('Persistent batch WAL append failed: ${table.tableName}',
             rawError: e);
         // Fallback or fail whole batch? Fail whole batch for consistency.
         return (
@@ -1418,13 +1462,13 @@ class TableDataManager {
     if (recordIds.isNotEmpty) {
       if (operation == BufferOperationType.insert) {
         await _dataStore.writeBufferManager.addInsertBatch(
-            tableName: tableName,
+            table: _resolveTableContext(table, schema: schema),
             recordIds: recordIds,
             entries: entries,
             uniqueKeysList: finalUniqueKeysList);
       } else if (operation == BufferOperationType.update) {
         await _dataStore.writeBufferManager.addUpdateBatch(
-            tableName: tableName,
+            table: _resolveTableContext(table, schema: schema),
             recordIds: recordIds,
             entries: entries,
             uniqueKeysList: finalUniqueKeysList);
@@ -1432,7 +1476,9 @@ class TableDataManager {
         // For batch delete, we use the standard batch processor which handles
         // tombstone entries and buffer merging.
         await _dataStore.writeBufferManager.addDeleteBatch(
-            tableName: tableName, recordIds: recordIds, entries: entries);
+            table: _resolveTableContext(table, schema: schema),
+            recordIds: recordIds,
+            entries: entries);
       }
       successIds.addAll(recordIds);
       _needSaveStats = true;
@@ -1443,18 +1489,19 @@ class TableDataManager {
 
   /// Update the record count cache based on the operation.
   Future<void> updateTableRecordCount(
-      String tableName, BufferOperationType op) async {
+      TableContext table, BufferOperationType op) async {
     // Ensure loaded first so we start from a valid base
-    await _ensureRecordCountLoaded(tableName);
+    await _ensureRecordCountLoaded(table);
 
     if (op == BufferOperationType.insert) {
-      _tableRecordCounts[tableName] = (_tableRecordCounts[tableName] ?? 0) + 1;
+      _tableRecordCounts[table.tableUid] =
+          (_tableRecordCounts[table.tableUid] ?? 0) + 1;
       _totalRecordCount++;
       _needSaveStats = true;
     } else if (op == BufferOperationType.delete) {
-      final current = _tableRecordCounts[tableName] ?? 0;
+      final current = _tableRecordCounts[table.tableUid] ?? 0;
       if (current > 0) {
-        _tableRecordCounts[tableName] = current - 1;
+        _tableRecordCounts[table.tableUid] = current - 1;
         _totalRecordCount = max(0, _totalRecordCount - 1);
         _needSaveStats = true;
       }
@@ -1466,23 +1513,23 @@ class TableDataManager {
   /// This is optimized for large batch operations (e.g. batchInsert) to avoid
   /// 10k+ awaited calls to [updateTableRecordCount].
   Future<void> updateTableRecordCountDelta(
-    String tableName, {
+    TableContext table, {
     int insertDelta = 0,
     int deleteDelta = 0,
   }) async {
     final int delta = insertDelta - deleteDelta;
     if (delta == 0) return;
 
-    await _ensureRecordCountLoaded(tableName);
+    await _ensureRecordCountLoaded(table);
 
-    final current = _tableRecordCounts[tableName] ?? 0;
-    _tableRecordCounts[tableName] = max(0, current + delta);
+    final current = _tableRecordCounts[table.tableUid] ?? 0;
+    _tableRecordCounts[table.tableUid] = max(0, current + delta);
     _totalRecordCount = max(0, _totalRecordCount + delta);
     _needSaveStats = true;
   }
 
   Future<List<Map<String, dynamic>>> _prepareDeleteBufferRecords({
-    required String tableName,
+    required TableContext table,
     required List<Map<String, dynamic>> records,
     required String primaryKey,
     required List<String> requiredFields,
@@ -1508,7 +1555,7 @@ class TableDataManager {
         ComputeTask(
           function: prepareDeleteBatchChunk,
           message: DeleteBatchPrepareRequest(
-            tableName: tableName,
+            tableName: table.tableName,
             primaryKeyField: primaryKey,
             requiredFields: requiredFields,
             records: records.sublist(range.start, range.end),
@@ -1535,11 +1582,12 @@ class TableDataManager {
 
   /// Add records to delete buffer - for batch deleting
   Future<void> addToDeleteBuffer(
-      String tableName, List<Map<String, dynamic>> records,
+      TableContext table, List<Map<String, dynamic>> records,
       {required String schemaVersion}) async {
     if (records.isEmpty) return;
 
-    final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+    final schema =
+        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
     if (schema == null) {
       Logger.error('Table schema is null, cannot add to delete buffer');
       return;
@@ -1559,7 +1607,7 @@ class TableDataManager {
     }();
 
     final trimmedRecords = await _prepareDeleteBufferRecords(
-      tableName: tableName,
+      table: table,
       records: records,
       primaryKey: primaryKey,
       requiredFields: needFields.toList(growable: false),
@@ -1567,7 +1615,7 @@ class TableDataManager {
 
     if (trimmedRecords.isNotEmpty) {
       await addBatchToBuffer(
-        tableName: tableName,
+        table: table,
         records: trimmedRecords,
         operation: BufferOperationType.delete,
         schema: schema,
@@ -1588,7 +1636,7 @@ class TableDataManager {
   /// 2. Record is added to hot cache (force=true) to ensure immediate consistency.
   /// 3. MaxID is updated in memory to restore auto-increment sequence.
   Future<void> recoverRecordToBuffer(
-    String tableName,
+    TableContext table,
     Map<String, dynamic> data,
     BufferOperationType operationType, {
     required BufferEntry entry,
@@ -1596,7 +1644,8 @@ class TableDataManager {
     Map<String, dynamic>? oldValues,
     bool updateStats = true,
   }) async {
-    final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+    final schema =
+        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
     if (schema == null) return;
 
     final primaryKey = schema.primaryKey;
@@ -1607,7 +1656,7 @@ class TableDataManager {
     // We bypass the standard addToBuffer/batchInsert path to inject the *exact*
     // original WAL entry (preserving timestamp, walPointer, etc.)
     await _dataStore.writeBufferManager.addRecord(
-      tableName: tableName,
+      table: _resolveTableContext(table, schema: schema),
       recordId: recordId,
       entry: entry, // Use the recovered entry directly
       uniqueKeys: uniqueKeyRefs ?? const <UniqueKeyRef>[],
@@ -1637,9 +1686,9 @@ class TableDataManager {
 
   /// table created, update stats
   /// Only counts user tables, excluding system tables
-  void tableCreated(String tableName) {
+  void tableCreated(TableContext table) {
     // Only count user tables, exclude system tables
-    if (!SystemTable.isSystemTable(tableName)) {
+    if (!SystemTable.isSystemTable(table.tableName)) {
       _totalTableCount++;
       markStatsDirty();
     }
@@ -1647,12 +1696,12 @@ class TableDataManager {
 
   /// table deleted, update stats
   /// Only counts user tables, excluding system tables
-  Future<void> tableDeleted(String tableName) async {
+  Future<void> tableDeleted(TableContext table) async {
     try {
       // Only update stats for user tables, exclude system tables
-      if (!SystemTable.isSystemTable(tableName)) {
+      if (!SystemTable.isSystemTable(table.tableName)) {
         // get current table stats
-        final meta = await getTableMeta(tableName);
+        final meta = await getTableMeta(table);
         if (meta != null) {
           // update total record count and total size
           _totalRecordCount = max(0, _totalRecordCount - meta.totalRecords);
@@ -1664,7 +1713,7 @@ class TableDataManager {
         _totalTableCount = max(0, _totalTableCount - 1);
 
         // Remove record count cache
-        _tableRecordCounts.remove(tableName);
+        _tableRecordCounts.remove(table.tableUid);
 
         markStatsDirty();
       }
@@ -1673,52 +1722,52 @@ class TableDataManager {
     }
   }
 
-  /// Ensure the record count for [tableName] is loaded into cache.
+  /// Ensure the record count for [table] is loaded into cache.
   /// Uses loading lock pattern to prevent thundering herd when many
   /// concurrent inserts happen for the same table.
-  Future<void> _ensureRecordCountLoaded(String tableName) async {
+  Future<void> _ensureRecordCountLoaded(TableContext table) async {
     // Fast path: already cached
-    if (_tableRecordCounts.containsKey(tableName)) return;
+    if (_tableRecordCounts.containsKey(table.tableUid)) return;
 
     // Check if another call is already loading this table
-    final existing = _recordCountLoadingFutures[tableName];
+    final existing = _recordCountLoadingFutures[table.tableUid];
     if (existing != null) {
       await existing;
       return;
     }
 
     // Start loading and register the future
-    final loadFuture = _doLoadRecordCount(tableName);
-    _recordCountLoadingFutures[tableName] = loadFuture;
+    final loadFuture = _doLoadRecordCount(table);
+    _recordCountLoadingFutures[table.tableUid] = loadFuture;
     try {
       await loadFuture;
     } finally {
-      _recordCountLoadingFutures.remove(tableName);
+      _recordCountLoadingFutures.remove(table.tableUid);
     }
   }
 
   /// Internal helper to actually load record count from metadata.
-  Future<void> _doLoadRecordCount(String tableName) async {
-    final meta = await getTableMeta(tableName);
-    _tableRecordCounts[tableName] = meta?.totalRecords ?? 0;
+  Future<void> _doLoadRecordCount(TableContext table) async {
+    final meta = await getTableMeta(table);
+    _tableRecordCounts[table.tableUid] = meta?.totalRecords ?? 0;
   }
 
   /// get table record count by table name
-  Future<int> getTableRecordCount(String tableName) async {
+  Future<int> getTableRecordCount(TableContext table) async {
     // Ensure cache is populated
-    await _ensureRecordCountLoaded(tableName);
+    await _ensureRecordCountLoaded(table);
 
-    int count = _tableRecordCounts[tableName] ?? 0;
+    int count = _tableRecordCounts[table.tableUid] ?? 0;
 
     // Transaction overlay: include deferred inserts/deletes (read-your-writes) for current tx.
     // Skip during applyCommit to avoid double counting when promotion already enters WAL/buffer.
     final String? txId = TransactionContext.getCurrentTransactionId();
     if (txId != null && !TransactionContext.isApplyingCommit()) {
-      final defOps = _txnDeferredOps[txId]?[tableName];
+      final defOps = _txnDeferredOps[txId]?[table.tableUid];
       if (defOps != null && defOps.isNotEmpty) {
         try {
           final schema =
-              await _dataStore.schemaManager?.getTableSchema(tableName);
+              await _dataStore.schemaManager?.getTableSchema(table.tableUid);
           final pkName = schema?.primaryKey;
           if (pkName != null && pkName.isNotEmpty) {
             // Track unique primary keys to avoid double counting the same record.
@@ -1760,36 +1809,32 @@ class TableDataManager {
   }
 
   /// get table file size
-  Future<int> getTableFileSize(String tableName) async {
-    final tableUid =
-        _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+  Future<int> getTableFileSize(TableContext table) async {
+    final tableUid = table.tableUid;
     if (!_fileSizes.containsKey(tableUid)) {
-      final meta = await getTableMeta(tableUid);
+      final meta = await getTableMeta(table);
       return meta?.totalSizeInBytes ?? 0;
     }
     return _fileSizes[tableUid] ?? 0;
   }
 
   /// update table file size and modified time
-  Future<void> updateFileSize(String tableName, int size) async {
-    final tableUid =
-        _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+  Future<void> updateFileSize(TableContext table, int size) async {
+    final tableUid = table.tableUid;
     _fileSizes[tableUid] = size;
     _lastModifiedTimes[tableUid] = DateTime.now();
   }
 
   /// check if file is modified
-  bool isFileModified(String tableName, DateTime lastReadTime) {
-    final tableUid =
-        _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+  bool isFileModified(TableContext table, DateTime lastReadTime) {
+    final tableUid = table.tableUid;
     final lastModified = _lastModifiedTimes[tableUid];
     return lastModified == null || lastModified.isAfter(lastReadTime);
   }
 
   /// get file last modified time
-  DateTime? getLastModifiedTime(String tableName) {
-    final tableUid =
-        _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+  DateTime? getLastModifiedTime(TableContext table) {
+    final tableUid = table.tableUid;
     return _lastModifiedTimes[tableUid];
   }
 
@@ -1855,9 +1900,8 @@ class TableDataManager {
   }
 
   /// Get table meta information
-  Future<TableMeta?> getTableMeta(String tableName) async {
-    final tableUid =
-        _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+  Future<TableMeta?> getTableMeta(TableContext table) async {
+    final tableUid = table.tableUid;
 
     // Table meta cache fast path
     final cached = _tableMetaCache.get(tableUid);
@@ -1884,7 +1928,7 @@ class TableDataManager {
   }
 
   /// Internal method to perform the actual file load
-  Future<TableMeta?> _doLoadTableMeta(String tableUid) async {
+  Future<TableMeta?> _doLoadTableMeta(TableUid tableUid) async {
     try {
       final mainFilePath =
           await _dataStore.pathManager.getDataMetaPath(tableUid);
@@ -1910,7 +1954,7 @@ class TableDataManager {
           return null;
         }
 
-        final meta = TableMeta.fromJson(jsonData);
+        final meta = TableMeta.fromJson(jsonData, tableUidFallback: tableUid);
         // Cache update
         _tableMetaCache.put(tableUid, meta);
         return meta;
@@ -1925,10 +1969,9 @@ class TableDataManager {
   }
 
   /// Update table meta
-  Future<void> updateTableMeta(String tableName, TableMeta meta,
+  Future<void> updateTableMeta(TableContext table, TableMeta meta,
       {bool flush = true}) async {
-    final tableUid =
-        _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+    final tableUid = table.tableUid;
     final mainFilePath = await _dataStore.pathManager.getDataMetaPath(tableUid);
 
     // Create directory if not exists
@@ -1955,7 +1998,7 @@ class TableDataManager {
     }
 
     // update file size
-    updateFileSize(tableUid, meta.totalSizeInBytes);
+    updateFileSize(table, meta.totalSizeInBytes);
   }
 
   /// Ensure directory exists
@@ -1964,34 +2007,35 @@ class TableDataManager {
   }
 
   /// Get id generator, create if not exists. Single instance per table under concurrency.
-  Future<IdGenerator> _getIdGenerator(String tableName) async {
-    final cached = _idGenerators[tableName];
+  Future<IdGenerator> _getIdGenerator(TableContext table) async {
+    final cached = _idGenerators[table.tableUid];
     if (cached != null) return cached;
 
-    final pending = _idGeneratorPending[tableName];
+    final pending = _idGeneratorPending[table.tableUid];
     if (pending != null) return await pending;
 
-    final future = _createIdGeneratorForTable(tableName);
-    _idGeneratorPending[tableName] = future;
+    final future = _createIdGeneratorForTable(table);
+    _idGeneratorPending[table.tableUid] = future;
     try {
       final generator = await future;
-      _idGenerators[tableName] = generator;
+      _idGenerators[table.tableUid] = generator;
       return generator;
     } finally {
-      _idGeneratorPending.remove(tableName);
+      _idGeneratorPending.remove(table.tableUid);
     }
   }
 
   /// Create and initialize id generator for a table (single creation per table under concurrency).
-  Future<IdGenerator> _createIdGeneratorForTable(String tableName) async {
+  Future<IdGenerator> _createIdGeneratorForTable(TableContext table) async {
     try {
-      final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+      final schema =
+          await _dataStore.schemaManager?.getTableSchema(table.tableUid);
       if (schema == null) {
         throw DbException([
           SchemaValidationStatus(
             type: ResultType.devTableNotFound,
             message: 'Table schema is null, cannot get batch ids',
-            tableName: tableName,
+            tableName: table.tableName,
           ),
         ]);
       }
@@ -2003,7 +2047,7 @@ class TableDataManager {
       );
 
       if (generator is SequentialIdGenerator) {
-        final currentId = _maxIds[tableName];
+        final currentId = _maxIds[table.tableUid];
 
         if (currentId != null) {
           try {
@@ -2023,8 +2067,8 @@ class TableDataManager {
               schema.primaryKeyConfig.sequentialConfig?.initialValue ?? 1;
           generator.setCurrentId(initialValue - 1);
         }
-        if (_idRanges.containsKey(tableName)) {
-          final rangeInfo = _idRanges[tableName];
+        if (_idRanges.containsKey(table.tableUid)) {
+          final rangeInfo = _idRanges[table.tableUid];
           if (rangeInfo != null &&
               rangeInfo.containsKey('current') &&
               rangeInfo.containsKey('max')) {
@@ -2051,22 +2095,23 @@ class TableDataManager {
     } catch (e) {
       Logger.error('Failed to get id generator', rawError: e);
       const defaultConfig = SequentialIdConfig();
+      final tableUid = table.tableUid;
       final defaultGenerator =
-          SequentialIdGenerator(defaultConfig, tableName: tableName);
-      _idGenerators[tableName] = defaultGenerator;
+          SequentialIdGenerator(defaultConfig, tableUid: tableUid);
+      _idGenerators[table.tableUid] = defaultGenerator;
       return defaultGenerator;
     }
   }
 
   /// save id range info
-  Future<void> _saveIdRange(String tableName) async {
+  Future<void> _saveIdRange(TableContext table) async {
     if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
       return;
     }
-    final generator = _idGenerators[tableName];
+    final generator = _idGenerators[table.tableUid];
     if (generator is SequentialIdGenerator && generator.isDistributed) {
       // get current max id value
-      final currentMaxId = _maxIds[tableName];
+      final currentMaxId = _maxIds[table.tableUid];
 
       if (currentMaxId == null) return;
 
@@ -2079,7 +2124,7 @@ class TableDataManager {
           final currentIdInt = generator.currentId;
 
           // save as string type
-          _idRanges[tableName] = {
+          _idRanges[table.tableUid] = {
             'current': currentIdInt.toString(),
             'max': maxIdStr,
           };
@@ -2090,7 +2135,7 @@ class TableDataManager {
         }
       } else {
         // non-numeric string id, save current value directly
-        _idRanges[tableName] = {
+        _idRanges[table.tableUid] = {
           'current': maxIdStr,
           'max': maxIdStr,
         };
@@ -2106,15 +2151,15 @@ class TableDataManager {
   /// 3. Schema-defined initial value if table is empty
   ///
   /// [forceRecalculate] if true, forces recalculation even if cache matches
-  Future<void> updateMaxIdFromTable(String tableName,
+  Future<void> updateMaxIdFromTable(TableContext table,
       {bool forceRecalculate = false}) async {
-    final lockKey = 'id_gen_$tableName';
+    final lockKey = 'id_gen_${table.tableUid}';
     final operationId = GlobalIdGenerator.generate('update_max_id_');
     bool acquired = await (_dataStore.lockManager
             ?.acquireExclusiveLock(lockKey, operationId) ??
         Future.value(false));
     try {
-      await _updateMaxIdFromTableInternal(tableName,
+      await _updateMaxIdFromTableInternal(table,
           forceRecalculate: forceRecalculate);
     } finally {
       if (acquired) {
@@ -2123,11 +2168,12 @@ class TableDataManager {
     }
   }
 
-  /// Internal version of updateMaxIdFromTable that assumes id_gen_$tableName lock is already held
-  Future<void> _updateMaxIdFromTableInternal(String tableName,
+  /// Internal version of updateMaxIdFromTable that assumes id_gen_tableUid lock is already held
+  Future<void> _updateMaxIdFromTableInternal(TableContext table,
       {bool forceRecalculate = false}) async {
     try {
-      final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+      final schema =
+          await _dataStore.schemaManager?.getTableSchema(table.tableUid);
       if (schema == null) {
         Logger.error('Table schema is null, cannot update max id');
         return;
@@ -2138,15 +2184,15 @@ class TableDataManager {
       }
 
       // get max id from table meta + buffered WAL (if any)
-      TableMeta? fileMeta = await getTableMeta(tableName);
+      TableMeta? fileMeta = await getTableMeta(table);
 
       // Performance optimization: if maxId is already in memory and matches FileMeta cache,
       // skip recalculation (especially useful after recovery when maxId was already updated)
       // However, if forceRecalculate is true, skip this check to ensure we include partition data
       if (!forceRecalculate &&
-          _maxIds.containsKey(tableName) &&
+          _maxIds.containsKey(table.tableUid) &&
           fileMeta?.maxAutoIncrementId != null) {
-        final cachedMaxId = _maxIds[tableName];
+        final cachedMaxId = _maxIds[table.tableUid];
         final fileMetaMaxId = fileMeta!.maxAutoIncrementId;
         if (cachedMaxId == fileMetaMaxId) {
           // Cache is valid, no need to recalculate
@@ -2163,7 +2209,7 @@ class TableDataManager {
         try {
           final last = await _dataStore.tableTreePartitionManager
               ?.scanRecordsByPrimaryKeyRange(
-            tableName: tableName,
+            table: table,
             startKeyInclusive: Uint8List(0),
             endKeyExclusive: Uint8List(0),
             reverse: true,
@@ -2178,8 +2224,10 @@ class TableDataManager {
       // Also consider buffered inserts recovered from WAL (in-memory buffer)
       dynamic maxFromBuffer;
       try {
-        maxFromBuffer = _dataStore.writeBufferManager
-            .getMaxPrimaryKey(tableName, schema.primaryKey, pkMatcher);
+        maxFromBuffer = _dataStore.writeBufferManager.getMaxPrimaryKey(
+            _resolveTableContext(table, schema: schema),
+            schema.primaryKey,
+            pkMatcher);
       } catch (_) {}
 
       // Combine candidates: take the maximum of partition max, buffer max, and current memory value
@@ -2194,7 +2242,7 @@ class TableDataManager {
 
       // Also compare with current memory value (which may include WAL recovery max)
       // This is important when forceRecalculate=true after WAL recovery
-      final currentMemoryMax = _maxIds[tableName];
+      final currentMemoryMax = _maxIds[table.tableUid];
       if (currentMemoryMax != null) {
         try {
           dynamic currentMaxValue;
@@ -2214,43 +2262,45 @@ class TableDataManager {
       }
 
       if (finalMax != null) {
-        _maxIds[tableName] = finalMax.toString();
-        _maxIdsDirty[tableName] = true;
+        _maxIds[table.tableUid] = finalMax.toString();
+        _maxIdsDirty[table.tableUid] = true;
 
         // Save to FileMeta for caching (avoid recalculation on next initialization)
         if (fileMeta != null) {
           fileMeta = fileMeta.copyWith(maxAutoIncrementId: finalMax.toString());
-          await updateTableMeta(tableName, fileMeta);
+          await updateTableMeta(table, fileMeta);
         }
         return;
       }
 
       // If table and buffer are empty, initialize maxAutoIncrementId to "0".
       const emptyMaxIdStr = '0';
-      _maxIds[tableName] = emptyMaxIdStr;
-      _maxIdsDirty[tableName] = true;
+      _maxIds[table.tableUid] = emptyMaxIdStr;
+      _maxIdsDirty[table.tableUid] = true;
       if (fileMeta != null) {
         fileMeta = fileMeta.copyWith(maxAutoIncrementId: emptyMaxIdStr);
-        await updateTableMeta(tableName, fileMeta);
+        await updateTableMeta(table, fileMeta);
       }
     } catch (e) {
-      Logger.error('Failed to update max id for table $tableName', rawError: e);
+      Logger.error('Failed to update max id for table ${table.tableName}',
+          rawError: e);
     }
   }
 
   /// handle primary key conflict when updating max id
   /// Reuses updateMaxIdFromTable to get the accurate max ID, then adjusts based on conflict
   Future<void> handlePrimaryKeyConflict(
-      String tableName, dynamic conflictId) async {
+      TableContext table, dynamic conflictId) async {
     try {
-      final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+      final schema =
+          await _dataStore.schemaManager?.getTableSchema(table.tableUid);
       if (schema == null) return;
 
       // Ensure max ID is loaded and up-to-date by recalculating from partitions and buffer
-      await updateMaxIdFromTable(tableName, forceRecalculate: true);
+      await updateMaxIdFromTable(table, forceRecalculate: true);
 
       // get current max id
-      final currentMaxId = _maxIds[tableName];
+      final currentMaxId = _maxIds[table.tableUid];
       if (currentMaxId == null) return;
 
       // use general compare method to compare id
@@ -2292,23 +2342,23 @@ class TableDataManager {
               '${maxCandidate.toString()}${String.fromCharCode(97 + (DateTime.now().millisecondsSinceEpoch % 26))}';
         }
 
-        _maxIds[tableName] = newMaxId;
-        _maxIdsDirty[tableName] = true;
+        _maxIds[table.tableUid] = newMaxId;
+        _maxIdsDirty[table.tableUid] = true;
 
         // Save to FileMeta instead of standalone file
-        final fileMeta = await getTableMeta(tableName);
+        final fileMeta = await getTableMeta(table);
         if (fileMeta != null) {
           final updatedMeta = fileMeta.copyWith(maxAutoIncrementId: newMaxId);
-          await updateTableMeta(tableName, updatedMeta);
+          await updateTableMeta(table, updatedMeta);
         }
 
         Logger.warn(
-          'Table $tableName has primary key conflict, update auto increment start: $newMaxId',
+          'Table ${table.tableName} has primary key conflict, update auto increment start: $newMaxId',
         );
 
         // update generator current id (only for numeric id)
-        if (_idGenerators.containsKey(tableName)) {
-          final generator = _idGenerators[tableName];
+        if (_idGenerators.containsKey(table.tableUid)) {
+          final generator = _idGenerators[table.tableUid];
           if (generator is SequentialIdGenerator &&
               _isNumericString(newMaxId)) {
             try {
@@ -2323,7 +2373,7 @@ class TableDataManager {
       } else {
         // if current id is greater than conflict id, no need to adjust
         Logger.debug(
-          'Table $tableName has primary key conflict, but current max id $currentMaxId is greater than conflict id $conflictId, no need to adjust',
+          'Table ${table.tableName} has primary key conflict, but current max id $currentMaxId is greater than conflict id $conflictId, no need to adjust',
         );
       }
     } catch (e) {
@@ -2334,25 +2384,27 @@ class TableDataManager {
   /// Stream records from a table.
   /// - File mode: traverse global B+Tree leaf chain + overlay buffer/transactions.
   /// - Memory mode: traverse inmemory TreeCache logical range + overlay buffer/transactions.
-  Stream<Map<String, dynamic>> streamRecords(String tableName,
+  Stream<Map<String, dynamic>> streamRecords(TableContext table,
       {Uint8List? customKey, int? customKeyId}) async* {
-    final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+    final schema =
+        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
     if (schema == null) {
-      Logger.error('Failed to get schema for $tableName');
+      Logger.error('Failed to get schema for ${table.tableName}');
       return;
     }
     final primaryKey = schema.primaryKey;
+    final tableContext = _resolveTableContext(table, schema: schema);
     final bool isMemoryMode =
         _dataStore.config.persistenceMode == PersistenceMode.memory;
 
     // Fast path for empty tables (no partitions yet): only merge buffer/txn overlay.
     if (!isMemoryMode) {
-      final fileMeta = await getTableMeta(tableName);
+      final fileMeta = await getTableMeta(table);
       if (fileMeta == null || fileMeta.btreeFirstLeaf.isNull) {
         final yieldController =
             YieldController('TableDataManager.streamRecords_empty');
         final overlay = await mergeConsistency(
-          tableName,
+          table,
           [],
         );
         for (final r in overlay) {
@@ -2385,7 +2437,7 @@ class TableDataManager {
         // Check buffer for updates/deletes (O(1) lookup)
         final bufferEntry =
             _dataStore.writeBufferManager.getBufferedRecordForRead(
-          tableName,
+          tableContext,
           pk,
         );
         if (bufferEntry != null) {
@@ -2400,7 +2452,7 @@ class TableDataManager {
 
         // Check transaction for updates/deletes (O(1) lookup)
         if (currentTxId != null) {
-          final defOps = _txnDeferredOps[currentTxId]?[tableName];
+          final defOps = _txnDeferredOps[currentTxId]?[table.tableUid];
           final txOp = defOps?[pk];
           if (txOp != null) {
             if (txOp.type == BufferOperationType.delete) {
@@ -2428,7 +2480,7 @@ class TableDataManager {
           return;
         }
         await for (final record in rangeManager.streamRecordsByPrimaryKeyRange(
-          tableName: tableName,
+          table: table,
           startKeyInclusive: Uint8List(0),
           endKeyExclusive: Uint8List(0),
           reverse: false,
@@ -2458,7 +2510,7 @@ class TableDataManager {
         () async {
           try {
             await _forEachRecordByPrimaryKeyRangeLogical(
-              tableName: tableName,
+              table: table,
               schema: schema,
               primaryKey: primaryKey,
               pkMatcher: pkMatcher,
@@ -2495,11 +2547,11 @@ class TableDataManager {
 
       // After streaming base records, yield buffer/transaction inserts that weren't in base stream.
       final bufferInsertKeys = _dataStore.writeBufferManager
-          .getBufferedInsertKeys(tableName, reverse: false);
+          .getBufferedInsertKeys(tableContext, reverse: false);
 
       final Set<String> txInsertKeys = <String>{};
       if (currentTxId != null) {
-        final defOps = _txnDeferredOps[currentTxId]?[tableName];
+        final defOps = _txnDeferredOps[currentTxId]?[table.tableUid];
         if (defOps != null) {
           for (final op in defOps.values) {
             if (op.type != BufferOperationType.delete) {
@@ -2521,7 +2573,7 @@ class TableDataManager {
 
         bool shadowedByDelete = false;
         if (currentTxId != null) {
-          final defOps = _txnDeferredOps[currentTxId]?[tableName];
+          final defOps = _txnDeferredOps[currentTxId]?[table.tableUid];
           final txOp = defOps?[key];
           if (txOp != null && txOp.type == BufferOperationType.delete) {
             shadowedByDelete = true;
@@ -2530,7 +2582,7 @@ class TableDataManager {
         if (shadowedByDelete) continue;
 
         final entry = _dataStore.writeBufferManager.getBufferedRecordForRead(
-          tableName,
+          tableContext,
           key,
         );
         if (entry != null &&
@@ -2547,7 +2599,7 @@ class TableDataManager {
 
         await yieldController.maybeYield();
 
-        final defOps = _txnDeferredOps[currentTxId]?[tableName];
+        final defOps = _txnDeferredOps[currentTxId]?[table.tableUid];
         final txOp = defOps?[key];
         if (txOp != null &&
             txOp.type != BufferOperationType.delete &&
@@ -2584,11 +2636,11 @@ class TableDataManager {
     _txnDeferredOps.remove(txId);
   }
 
-  String _tableLockResource(String tableName) =>
-      _dataStore.getScopedResourceKey('table_$tableName');
+  String _tableLockResource(TableContext table) =>
+      _dataStore.getScopedResourceKey('table_${table.tableUid}');
 
   Future<TableWriteLock> acquireTableWriteLock(
-    String tableName, {
+    TableContext table, {
     String operationPrefix = 'table_write_',
   }) async {
     final lockManager = _dataStore.lockManager;
@@ -2597,12 +2649,12 @@ class TableDataManager {
         GeneralStatus(
           type: ResultType.engError,
           message:
-              'Cannot acquire table write lock after database shutdown: $tableName',
+              'Cannot acquire table write lock after database shutdown: ${table.tableName}',
         ),
       ]);
     }
 
-    final lockKey = _tableLockResource(tableName);
+    final lockKey = _tableLockResource(table);
     final operationId = GlobalIdGenerator.generate(operationPrefix);
 
     final acquired = await lockManager.acquireExclusiveLock(
@@ -2613,14 +2665,14 @@ class TableDataManager {
       throw DbException([
         GeneralStatus(
           type: ResultType.sysTimeoutLockAcquisition,
-          message: 'Timed out waiting for table write lock: $tableName',
+          message: 'Timed out waiting for table write lock: ${table.tableName}',
           target: lockKey,
           operation: 'acquireTableWriteLock',
         ),
       ]);
     }
     return TableWriteLock._(
-      tableName: tableName,
+      tableUid: table.tableUid,
       resource: lockKey,
       operationId: operationId,
     );
@@ -2628,11 +2680,11 @@ class TableDataManager {
 
   void releaseTableWriteLock(TableWriteLock lock) {
     if (lock._released) return;
-    if (lock.tableName.isEmpty) {
+    if (lock.tableUid.isEmpty) {
       throw DbException([
         InvalidArgumentStatus(
           type: ResultType.engError,
-          message: 'Invalid table write lock: tableName is empty',
+          message: 'Invalid table write lock: tableUid is empty',
           parameterName: 'lock',
         ),
       ]);
@@ -2645,7 +2697,7 @@ class TableDataManager {
   }
 
   Future<void> withTableWriteLock(
-    String tableName,
+    TableContext table,
     Future<void> Function(TableWriteLock lock) action, {
     TableWriteLock? tableLock,
     String operationPrefix = 'table_write_',
@@ -2653,19 +2705,19 @@ class TableDataManager {
     if (tableLock != null) {
       // Borrowed from an outer withTableWriteLock scope to avoid same-table
       // re-entry deadlocks. It is validated here, not acquired or released.
-      tableLock.validateBorrowedFor(tableName);
+      tableLock.validateBorrowedFor(table.tableUid);
       return action(tableLock);
     }
 
     if (_dataStore.lockManager == null) {
       Logger.debug(
-        'Skip table write lock after database shutdown: $tableName',
+        'Skip table write lock after database shutdown: ${table.tableName}',
       );
       return;
     }
 
     final lock = await acquireTableWriteLock(
-      tableName,
+      table,
       operationPrefix: operationPrefix,
     );
     try {
@@ -2676,18 +2728,18 @@ class TableDataManager {
   }
 
   /// high performance table data cleanup, including physical files and memory cache
-  Future<void> clearTable(String tableName) async {
+  Future<void> clearTable(TableContext table) async {
     // Admission flag: set before acquiring the table lock so pending flushes
     // that acquire the lock earlier than clearTable can still yield to clear.
-    _tableFlushingFlags[tableName] = true;
-    _maxIdsDirty[tableName] = false; // Proactively stop background flush
+    _tableFlushingFlags[table.tableUid] = true;
+    _maxIdsDirty[table.tableUid] = false; // Proactively stop background flush
     try {
       await withTableWriteLock(
-        tableName,
+        table,
         (_) async {
           // First, update statistics by subtracting this table's counts
           try {
-            final fileMeta = await getTableMeta(tableName);
+            final fileMeta = await getTableMeta(table);
             if (fileMeta != null) {
               // Subtract this table's records and size from the totals
               _totalRecordCount =
@@ -2700,38 +2752,39 @@ class TableDataManager {
             }
           } catch (e) {
             Logger.warn(
-                'Failed to update stats during clearTable for $tableName',
+                'Failed to update stats during clearTable for ${table.tableName}',
                 rawError: e);
           }
 
-          await _dataStore.writeBufferManager.clearTable(tableName);
+          await _dataStore.writeBufferManager
+              .clearTable(_resolveTableContext(table));
 
           // 2. directly delete the entire partition directory
           bool deletedDir = false;
           try {
             final dataPath =
-                await _dataStore.pathManager.getDataDirPath(tableName);
+                await _dataStore.pathManager.getDataDirPath(table.tableUid);
             if (await _dataStore.storage.existsDirectory(dataPath)) {
               await _dataStore.storage.deleteDirectory(dataPath);
               // delete and recreate empty directory, ensure directory structure is complete
               await _dataStore.storage.ensureDirectoryExists(dataPath);
               Logger.debug(
-                  'deleted entire partition directory for table $tableName');
+                  'deleted entire partition directory for table ${table.tableName}');
               deletedDir = true;
             }
           } catch (e) {
-            Logger.error('delete table $tableName partition directory failed',
+            Logger.error(
+                'delete table ${table.tableName} partition directory failed',
                 rawError: e);
           }
 
           // 3. create empty table meta
-          final prevMeta = await getTableMeta(tableName);
+          final prevMeta = await getTableMeta(table);
           final int pageSize =
               prevMeta?.btreePageSize ?? TableMeta.defaultPageSize;
           final int newPartitionCount =
               deletedDir ? 1 : max(1, (prevMeta?.btreePartitionCount ?? 0) + 1);
-          final tableUid =
-              _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+          final tableUid = table.tableUid;
           final emptyMeta = TableMeta.createEmpty(
             tableUid: tableUid,
             pageSize: pageSize,
@@ -2739,54 +2792,55 @@ class TableDataManager {
           );
 
           // 4. update table meta
-          await updateTableMeta(tableName, emptyMeta);
+          await updateTableMeta(table, emptyMeta);
 
           // 5. clean ID generator related resources
-          _idGenerators.remove(tableName);
-          _idGeneratorPending.remove(tableName);
-          TimeBasedIdGenerator.handleTableDelete(tableName);
+          _idGenerators.remove(table.tableUid);
+          _idGeneratorPending.remove(table.tableUid);
+          TimeBasedIdGenerator.handleTableDelete(table.tableUid);
 
           // 6. handle auto increment ID reset
           try {
             final schema =
-                await _dataStore.schemaManager?.getTableSchema(tableName);
+                await _dataStore.schemaManager?.getTableSchema(table.tableUid);
             if (schema == null) {
               return;
             }
             if (schema.primaryKeyConfig.type == PrimaryKeyType.sequential) {
               // Reset maxId in FileMeta to "0"
-              final fileMeta = await getTableMeta(tableName);
+              final fileMeta = await getTableMeta(table);
               if (fileMeta != null) {
                 final updatedMeta = fileMeta.copyWith(maxAutoIncrementId: "0");
-                await updateTableMeta(tableName, updatedMeta);
+                await updateTableMeta(table, updatedMeta);
               }
 
               // update memory cache
-              _maxIds[tableName] = "0";
-              _maxIdsDirty[tableName] = false; // Already saved to FileMeta
+              _maxIds[table.tableUid] = "0";
+              _maxIdsDirty[table.tableUid] = false; // Already saved to FileMeta
 
               // clean ID generator resources
-              _idRanges.remove(tableName);
+              _idRanges.remove(table.tableUid);
             }
           } catch (e) {
-            Logger.error('reset table $tableName auto increment ID failed',
+            Logger.error(
+                'reset table ${table.tableName} auto increment ID failed',
                 rawError: e);
           }
 
           // 7. clean other caches
-          _tableMetaCache.remove(tableName);
-          _fileSizes.remove(tableName);
-          _lastModifiedTimes.remove(tableName);
-          _checkedOrderedRange.remove(tableName);
+          _tableMetaCache.remove(table.tableUid);
+          _fileSizes.remove(table.tableUid);
+          _lastModifiedTimes.remove(table.tableUid);
+          _checkedOrderedRange.remove(table.tableUid);
         },
         operationPrefix: 'clear_table_',
       );
     } catch (e) {
-      Logger.error('clear table $tableName failed', rawError: e);
+      Logger.error('clear table ${table.tableName} failed', rawError: e);
       rethrow; // rethrow error to upper level
     } finally {
       // clear table flush flag
-      _tableFlushingFlags.remove(tableName);
+      _tableFlushingFlags.remove(table.tableUid);
     }
   }
 
@@ -2842,8 +2896,10 @@ class TableDataManager {
 
       // Get source table schema for decoding old data
       // In migration scenarios, this should be the OLD schema before changes
+      final sourceTable = await _dataStore.getTableContext(sourceTableName);
+      final targetTable = await _dataStore.getTableContext(targetTableName);
       final sourceSchema =
-          await _dataStore.schemaManager?.getTableSchema(sourceTableName);
+          await _dataStore.schemaManager?.getTableSchema(sourceTable.tableUid);
       if (sourceSchema == null) {
         return;
       }
@@ -2865,7 +2921,7 @@ class TableDataManager {
         batch.clear();
         if (processed.isEmpty) return;
         await rangeManager?.writeChanges(
-          tableName: targetTableName,
+          table: targetTable,
           inserts: processed,
           updates: const [],
           deletes: const [],
@@ -2878,7 +2934,7 @@ class TableDataManager {
       // This ensures old data is decoded using the old schema structure
       if (rangeManager == null) return;
       await for (final r in rangeManager.streamRecordsByPrimaryKeyRange(
-        tableName: sourceTableName,
+        table: sourceTable,
         startKeyInclusive: Uint8List(0),
         endKeyExclusive: Uint8List(0),
         reverse: false,
@@ -2922,7 +2978,7 @@ class TableDataManager {
   /// for the query context (e.g. all point-lookup keys were found). In such cases, we can skip
   /// scanning buffers for NEW inserts.
   Future<List<Map<String, dynamic>>> mergeConsistency(
-    String tableName,
+    TableContext table,
     List<Map<String, dynamic>> records, {
     ConditionRecordMatcher? matcher,
     bool Function(String)? keyPredicate,
@@ -2934,9 +2990,11 @@ class TableDataManager {
     Iterable<String>? explicitInsertKeys,
     Iterable<String>? explicitTxInsertKeys,
   }) async {
-    final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+    final schema =
+        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
     if (schema == null) return records;
 
+    final tableContext = _resolveTableContext(table, schema: schema);
     final primaryKey = schema.primaryKey;
     final baseRecords = <String, Map<String, dynamic>>{};
 
@@ -3009,7 +3067,7 @@ class TableDataManager {
       final initialKeys = baseRecords.keys.toList(growable: false);
       for (final pk in initialKeys) {
         final be = _dataStore.writeBufferManager.getBufferedRecordForRead(
-          tableName,
+          tableContext,
           pk,
         );
         if (be != null) {
@@ -3026,20 +3084,16 @@ class TableDataManager {
       if (explicitInsertKeys != null) {
         keys = explicitInsertKeys;
       } else {
-        final candidates = _dataStore.migrationManager
-                ?.getRuntimeReadTableCandidates(tableName) ??
-            const <String>[];
+        final candidates =
+            _dataStore.migrationManager?.getRuntimeReadTableCandidates(table) ??
+                const <String>[];
         if (candidates.isEmpty) {
           keys = _dataStore.writeBufferManager
-              .getBufferedInsertKeys(tableName, reverse: reverse);
+              .getBufferedInsertKeys(tableContext, reverse: reverse);
         } else {
           final allInsertKeys = <String>[];
           allInsertKeys.addAll(_dataStore.writeBufferManager
-              .getBufferedInsertKeys(tableName, reverse: reverse));
-          for (final candidate in candidates) {
-            allInsertKeys.addAll(_dataStore.writeBufferManager
-                .getBufferedInsertKeys(candidate, reverse: reverse));
-          }
+              .getBufferedInsertKeys(tableContext, reverse: reverse));
           keys = allInsertKeys;
         }
       }
@@ -3051,7 +3105,7 @@ class TableDataManager {
         if (keyPredicate != null && !keyPredicate(key)) continue;
 
         final entry = _dataStore.writeBufferManager.getBufferedRecordForRead(
-          tableName,
+          tableContext,
           key,
         );
         if (entry == null) continue;
@@ -3065,7 +3119,7 @@ class TableDataManager {
 
     // 2.3 Transaction Deferred Ops (if any)
     if (currentTxId != null) {
-      final defOps = _txnDeferredOps[currentTxId]?[tableName];
+      final defOps = _txnDeferredOps[currentTxId]?[table.tableUid];
       if (defOps != null && defOps.isNotEmpty) {
         // Phase 3.1: Efficient Update/Delete (Lookup from baseRecords)
         if (baseRecords.isNotEmpty) {
@@ -3137,10 +3191,10 @@ class TableDataManager {
             const <HeavyDeletePlan>[];
         if (plans.isNotEmpty) {
           for (final plan in plans) {
-            if (plan.tableName != tableName) continue;
+            if (plan.tableUid != tableContext.tableUid) continue;
             final qc = QueryCondition.fromMap(plan.condition);
             final hdMatcher = ConditionRecordMatcher.prepare(
-                qc, {tableName: schema}, tableName);
+                qc, {table.tableUid: schema}, table.tableUid);
 
             final snapshotList = baseRecords.entries.toList(growable: false);
             for (final entry in snapshotList) {
@@ -3160,11 +3214,11 @@ class TableDataManager {
             const <HeavyUpdatePlan>[];
         if (plans.isNotEmpty) {
           for (final plan in plans) {
-            if (plan.tableName != tableName) continue;
+            if (plan.tableUid != tableContext.tableUid) continue;
             // We need to apply updates to all matching records in baseRecords
             final qc = QueryCondition.fromMap(plan.condition);
             final hmMatcher = ConditionRecordMatcher.prepare(
-                qc, {tableName: schema}, tableName);
+                qc, {table.tableUid: schema}, table.tableUid);
 
             // Iterate keys first to avoid concurrent modification of baseRecords during update
 
@@ -3191,7 +3245,7 @@ class TableDataManager {
     if (matcher != null && !trackReadKeys && recordValues.length > 1000) {
       final matchResult = await ConditionBatchMatcher.matchRecordIndices(
         schema: schema,
-        tableName: tableName,
+        table: tableContext,
         condition: matcher.condition.build(),
         records: recordValues,
         estimateRecordBytes: estimateRecordSizeBytes,
@@ -3210,7 +3264,7 @@ class TableDataManager {
       if (trackReadKeys) {
         final k = r[primaryKey]?.toString();
         if (k != null && k.isNotEmpty) {
-          TransactionContext.registerReadKey(tableName, k);
+          TransactionContext.registerReadKey(table.tableUid, k);
         }
       }
     }
@@ -3218,31 +3272,32 @@ class TableDataManager {
   }
 
   /// Removes a record from any of the in-memory buffers.
-  void removeRecordFromBuffer(String tableName, String recordId) {
-    _dataStore.writeBufferManager.removeRecord(tableName, recordId);
+  void removeRecordFromBuffer(TableContext table, String recordId) {
+    _dataStore.writeBufferManager
+        .removeRecord(_resolveTableContext(table), recordId);
   }
 
   /// Removes all data and metadata for a table from the manager.
-  Future<void> removeTable(String tableName) async {
+  Future<void> removeTable(TableContext table) async {
     // Clean up all in-memory buffers and caches
     // legacy buffers removed
 
     // Clear WAL-driven table-level write buffer and queue to prevent subsequent writes
-    _dataStore.writeBufferManager.clearTable(tableName);
+    _dataStore.writeBufferManager.clearTable(_resolveTableContext(table));
 
     // Clean up other caches
-    _tableMetaCache.remove(tableName);
-    _fileSizes.remove(tableName);
-    _lastModifiedTimes.remove(tableName);
-    _tablePartitionSizes.remove(tableName);
-    _maxIds.remove(tableName);
-    _maxIdsDirty.remove(tableName);
-    _idGenerators.remove(tableName);
-    _idGeneratorPending.remove(tableName);
-    TimeBasedIdGenerator.handleTableDelete(tableName);
-    _idRanges.remove(tableName);
-    _checkedOrderedRange.remove(tableName);
-    _tableFlushingFlags.remove(tableName);
+    _tableMetaCache.remove(table.tableUid);
+    _fileSizes.remove(table.tableUid);
+    _lastModifiedTimes.remove(table.tableUid);
+    _tablePartitionSizes.remove(table.tableUid);
+    _maxIds.remove(table.tableUid);
+    _maxIdsDirty.remove(table.tableUid);
+    _idGenerators.remove(table.tableUid);
+    _idGeneratorPending.remove(table.tableUid);
+    TimeBasedIdGenerator.handleTableDelete(table.tableUid);
+    _idRanges.remove(table.tableUid);
+    _checkedOrderedRange.remove(table.tableUid);
+    _tableFlushingFlags.remove(table.tableUid);
   }
 
   /// Cleanup transactional in-memory state not tied to active transactions
@@ -3299,7 +3354,7 @@ class TableDataManager {
   /// This method merges inserted, updated, and deleted records according to their partitions and then writes them
   /// to the corresponding partition files. Optionally supports encryption via a custom key.
   ///
-  /// [tableName]          - Name of the table for which changes should be written.
+  /// [table]              - Table context for which changes should be written.
   /// [inserts]            - List of records to insert.
   /// [updates]            - List of records to update.
   /// [deletes]            - List of records to delete.
@@ -3313,7 +3368,7 @@ class TableDataManager {
   /// [fieldStructureOverride] - Optional physical field layout override.
   /// [schemaOverride] - Optional schema override (primary-key extraction/encoding).
   Future<void> writeChanges({
-    required String tableName,
+    required TableContext table,
     List<Map<String, dynamic>> inserts = const [],
     List<Map<String, dynamic>> updates = const [],
     List<Map<String, dynamic>> deletes = const [],
@@ -3332,14 +3387,14 @@ class TableDataManager {
     if (recordCountDelta != 0) {
       // Load before the physical write so applying the explicit delta below
       // does not accidentally double-count against freshly updated metadata.
-      await _ensureRecordCountLoaded(tableName);
+      await _ensureRecordCountLoaded(table);
     }
 
     await withTableWriteLock(
-      tableName,
+      table,
       (lock) async {
         await _dataStore.tableTreePartitionManager?.writeChanges(
-          tableName: tableName,
+          table: table,
           inserts: inserts,
           updates: updates,
           deletes: deletes,
@@ -3357,7 +3412,7 @@ class TableDataManager {
 
     if (recordCountDelta != 0) {
       await updateTableRecordCountDelta(
-        tableName,
+        table,
         insertDelta: recordCountInsertDelta,
         deleteDelta: recordCountDeleteDelta,
       );
@@ -3368,7 +3423,7 @@ class TableDataManager {
   /// Batch query. Note: Returns results from Cache and Disk (Committed data).
   /// [isConsistent] in the result indicates if all requested keys were found in the committed state.
   Future<TableScanResult> queryRecordsBatch(
-    String tableName,
+    TableContext table,
     List<dynamic> keys, {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
@@ -3379,7 +3434,7 @@ class TableDataManager {
     if (keys.isEmpty) return TableScanResult(records: []);
 
     final schema = decodeSchema ??
-        await _dataStore.schemaManager?.getTableSchema(tableName);
+        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
     if (schema == null) return TableScanResult(records: []);
 
     final results = <Map<String, dynamic>>[];
@@ -3390,7 +3445,7 @@ class TableDataManager {
     if (!readFromFileOnly) {
       for (final key in uniqueKeys) {
         final pk = key.toString();
-        final cached = _tableRecordCache.get([tableName, pk]);
+        final cached = _tableRecordCache.get([table.tableUid, pk]);
         if (cached != null) {
           results.add(cached);
         } else {
@@ -3410,7 +3465,7 @@ class TableDataManager {
       }
       final diskResults =
           await _dataStore.tableTreePartitionManager?.queryRecordsBatch(
-        tableName: tableName,
+        table: table,
         primaryKey: schema.primaryKey,
         keyComparator: pkMatcher,
         keys: missingKeys,
@@ -3427,7 +3482,7 @@ class TableDataManager {
       // Read-Through: Cache the results fetched from disk (Asynchronously)
       if (diskResults.isNotEmpty && !readFromFileOnly) {
         _asyncCacheDiskResults(
-          tableName: tableName,
+          table: table,
           diskResults: diskResults,
           schema: schema,
         );
@@ -3441,7 +3496,7 @@ class TableDataManager {
   }
 
   Future<void> _forEachRecordByPrimaryKeyRangeLogical({
-    required String tableName,
+    required TableContext table,
     required TableSchema schema,
     required String primaryKey,
     required MatcherFunction pkMatcher,
@@ -3467,7 +3522,7 @@ class TableDataManager {
     if (!isMemoryMode) {
       await _dataStore.tableTreePartitionManager
           ?.forEachRecordByPrimaryKeyRange(
-        tableName: tableName,
+        table: table,
         startKeyInclusive: startKeyInclusive,
         endKeyExclusive: endKeyExclusive,
         reverse: reverse,
@@ -3482,7 +3537,7 @@ class TableDataManager {
       return;
     }
 
-    _registerTableComparator(tableName, schema);
+    _registerTableComparator(table, schema);
 
     int yielded = 0;
     final int? hardLimit = limit;
@@ -3517,13 +3572,13 @@ class TableDataManager {
     if (!reverse) {
       // ASC: start from lowBoundPk (if any) until highBoundPk (if any)
       if (lowBoundPk != null) {
-        startKeyPath = [tableName, lowBoundPk];
+        startKeyPath = [table.tableUid, lowBoundPk];
       } else {
-        startKeyPath = [tableName];
+        startKeyPath = [table.tableUid];
       }
 
       if (highBoundPk != null) {
-        endKeyPath = [tableName, highBoundPk];
+        endKeyPath = [table.tableUid, highBoundPk];
       } else {
         endKeyPath = null;
       }
@@ -3531,13 +3586,13 @@ class TableDataManager {
       // DESC: start from rangeMin (if any, otherwise tableName prefix)
       // end at highBoundPk (the smaller value of rangeMax/cursor)
       if (lowBoundPk != null) {
-        startKeyPath = [tableName, lowBoundPk];
+        startKeyPath = [table.tableUid, lowBoundPk];
       } else {
-        startKeyPath = [tableName];
+        startKeyPath = [table.tableUid];
       }
 
       if (highBoundPk != null) {
-        endKeyPath = [tableName, highBoundPk];
+        endKeyPath = [table.tableUid, highBoundPk];
       } else {
         endKeyPath = null;
       }
@@ -3594,7 +3649,7 @@ class TableDataManager {
   }
 
   Future<List<Map<String, dynamic>>> _scanRecordsByPrimaryKeyRangeLogical({
-    required String tableName,
+    required TableContext table,
     required TableSchema schema,
     required String primaryKey,
     required MatcherFunction pkMatcher,
@@ -3622,7 +3677,7 @@ class TableDataManager {
 
     if (!isMemoryMode) {
       return rangeMgr.scanRecordsByPrimaryKeyRange(
-        tableName: tableName,
+        table: table,
         startKeyInclusive: startKeyInclusive,
         endKeyExclusive: endKeyExclusive,
         reverse: reverse,
@@ -3634,11 +3689,11 @@ class TableDataManager {
       );
     }
 
-    _registerTableComparator(tableName, schema);
+    _registerTableComparator(table, schema);
 
     final out = <Map<String, dynamic>>[];
     await _forEachRecordByPrimaryKeyRangeLogical(
-      tableName: tableName,
+      table: table,
       schema: schema,
       primaryKey: primaryKey,
       pkMatcher: pkMatcher,
@@ -3665,7 +3720,7 @@ class TableDataManager {
   }
 
   Future<TableScanResult> searchTableData(
-    String tableName,
+    TableContext table,
     ConditionRecordMatcher? matcher, {
     int? limit,
     int? offset,
@@ -3682,11 +3737,11 @@ class TableDataManager {
     // Increment table access weight for caching optimization
     _dataStore.weightManager?.incrementAccess(
       WeightType.tableRecord,
-      tableName,
+      table.tableUid,
       spaceName: _dataStore.currentSpaceName,
     );
     final schema = decodeSchema ??
-        await _dataStore.schemaManager?.getTableSchema(tableName);
+        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
     if (schema == null) {
       return TableScanResult(
           records: const [],
@@ -3698,6 +3753,7 @@ class TableDataManager {
         ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
 
     final bufferMgr = _dataStore.writeBufferManager;
+    final tableContext = _resolveTableContext(table, schema: schema);
 
     bool recordMatches(Map<String, dynamic> r) {
       // Defensive: always treat deleted/tombstone as non-visible.
@@ -3712,11 +3768,11 @@ class TableDataManager {
         if (pk != null) {
           if (onlyCount) {
             // Skip if in buffer for onlyCount fast path to avoid double counting
-            if (bufferMgr.getBufferedRecordForRead(tableName, pk) != null) {
+            if (bufferMgr.getBufferedRecordForRead(tableContext, pk) != null) {
               return false;
             }
           } else {
-            final be = bufferMgr.getBufferedRecordForRead(tableName, pk);
+            final be = bufferMgr.getBufferedRecordForRead(tableContext, pk);
             if (be != null) {
               if (be.operation == BufferOperationType.delete) {
                 return false;
@@ -3802,7 +3858,7 @@ class TableDataManager {
       }
 
       final batchRes = await queryRecordsBatch(
-        tableName,
+        table,
         keys,
         readFromFileOnly: readFromFileOnly,
         decodeSchema: decodeSchema,
@@ -3879,7 +3935,7 @@ class TableDataManager {
 
     TableMeta? fileMeta;
     if (!isMemoryMode) {
-      fileMeta = await getTableMeta(tableName);
+      fileMeta = await getTableMeta(table);
       if (fileMeta == null || fileMeta.totalRecords <= 0) {
         return TableScanResult(
           records: const [],
@@ -4055,7 +4111,7 @@ class TableDataManager {
       if (onlyCount) {
         int totalCount = 0;
         await _forEachRecordByPrimaryKeyRangeLogical(
-          tableName: tableName,
+          table: table,
           schema: schema,
           primaryKey: primaryKey,
           pkMatcher: pkMatcher,
@@ -4087,7 +4143,7 @@ class TableDataManager {
       } else if (aggregations != null && aggregations.isNotEmpty) {
         final agg = QueryAggregator(aggregations, groupBy: groupBy);
         await _forEachRecordByPrimaryKeyRangeLogical(
-          tableName: tableName,
+          table: table,
           schema: schema,
           primaryKey: primaryKey,
           pkMatcher: pkMatcher,
@@ -4112,7 +4168,7 @@ class TableDataManager {
         return TableScanResult(records: const [], aggregateResult: agg.result);
       } else {
         final out = await _scanRecordsByPrimaryKeyRangeLogical(
-          tableName: tableName,
+          table: table,
           schema: schema,
           primaryKey: primaryKey,
           pkMatcher: pkMatcher,
@@ -4139,10 +4195,11 @@ class TableDataManager {
     // Non-PK orderBy: must scan all target partitions, then do in-memory topK sort (bounded by offset+limit).
     // Pre-build matcher functions for orderBy fields (critical for topK performance).
     final orderMatchers = <MatcherFunction>[];
-    final schemas = <String, TableSchema>{tableName: schema};
+    final schemas = <String, TableSchema>{table.tableUid: schema};
     for (int i = 0; i < sortFields.length; i++) {
       final f = sortFields[i];
-      final s = ConditionRecordMatcher.getSchemaForField(f, schemas, tableName);
+      final s =
+          ConditionRecordMatcher.getSchemaForField(f, schemas, table.tableUid);
       final fieldName = f.contains('.') ? f.split('.').last : f;
       orderMatchers.add(
         ValueMatcher.getMatcher(
@@ -4170,7 +4227,7 @@ class TableDataManager {
     if (needCount <= 0) {
       // No limit provided: fall back to full collection (may be large).
       out.addAll(await _scanRecordsByPrimaryKeyRangeLogical(
-        tableName: tableName,
+        table: table,
         schema: schema,
         primaryKey: primaryKey,
         pkMatcher: pkMatcher,
@@ -4238,7 +4295,7 @@ class TableDataManager {
         final localTop = TopKHeap<Map<String, dynamic>>(
             k: needCount, compare: compareRecords);
         await _forEachRecordByPrimaryKeyRangeLogical(
-          tableName: tableName,
+          table: table,
           schema: schema,
           primaryKey: primaryKey,
           pkMatcher: pkMatcher,
@@ -4441,13 +4498,13 @@ final class PartitionPageBatch {
 }
 
 final class TableWriteLock {
-  final String tableName;
+  final TableUid tableUid;
   final String resource;
   final String operationId;
   bool _released = false;
 
   TableWriteLock._({
-    required this.tableName,
+    required this.tableUid,
     required this.resource,
     required this.operationId,
   });
@@ -4458,21 +4515,21 @@ final class TableWriteLock {
     _released = true;
   }
 
-  void validateBorrowedFor(String expectedTableName) {
+  void validateBorrowedFor(TableUid expectedTableUid) {
     if (_released) {
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,
-          message: 'Table write lock already released: $tableName',
+          message: 'Table write lock already released: $tableUid',
         ),
       ]);
     }
-    if (tableName != expectedTableName) {
+    if (tableUid != expectedTableUid) {
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,
           message:
-              'Table write lock mismatch: expected $expectedTableName, got $tableName',
+              'Table write lock mismatch: expected $expectedTableUid, got $tableUid',
         ),
       ]);
     }
