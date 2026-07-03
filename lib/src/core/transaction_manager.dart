@@ -1,17 +1,21 @@
 import 'dart:convert';
-import '../model/buffer_entry.dart';
+
 import '../handler/logger.dart';
-// common utilities may be used by callers; keep imports minimal here
-import 'transaction_context.dart';
-import '../model/transaction_models.dart';
+import '../model/buffer_entry.dart';
 import '../model/data_store_config.dart';
-import 'data_store_impl.dart';
+import '../model/id_generator.dart';
+import '../model/table_context.dart';
+import '../model/table_identity.dart';
+import '../model/table_schema.dart';
+import '../model/transaction_models.dart';
 import '../query/query_condition.dart';
 import 'crontab_manager.dart';
-import '../model/id_generator.dart';
+import 'data_store_impl.dart';
+// common utilities may be used by callers; keep imports minimal here
+import 'transaction_context.dart';
+import 'tree_cache.dart';
 import 'write_buffer_manager.dart';
 import 'yield_controller.dart';
-import 'tree_cache.dart';
 
 /// Transaction manager: append-only per-partition logs with compact meta
 class TransactionManager {
@@ -27,10 +31,10 @@ class TransactionManager {
   // true => committed, false => rolled back. Absence => unknown/not finalized.
   final Map<String, bool> _txnStatusCache = <String, bool>{};
 
-  // Track per-transaction write-set for SSI: txId -> { table -> Set<pk> }
+  // Track per-transaction write-set for SSI: txId -> { tableUid -> Set<pk> }
   final Map<String, Map<String, Set<String>>> _txnWriteSets =
       <String, Map<String, Set<String>>>{};
-  // Recently committed write index for SSI: [tableName, pk] -> lastCommitTimeMillis
+  // Recently committed write index for SSI: [tableUid, pk] -> lastCommitTimeMillis
   // Using TreeCache for automatic LRU eviction in large-scale data scenarios
   late final TreeCache<int> _recentCommittedWrites;
 
@@ -177,7 +181,7 @@ class TransactionManager {
     _mainMetaCache ??= TransactionMainMeta();
 
     // Initialize TreeCache for recent committed writes (SSI index)
-    // Key format: [tableName, pk], Value: lastCommitTimeMillis (int)
+    // Key format: [tableUid, pk], Value: lastCommitTimeMillis (int)
     // Using TreeCache for automatic LRU eviction in large-scale data scenarios
     final resourceManager = _dataStore.resourceManager;
     final cacheSize = resourceManager?.getMetaCacheSize() ?? (32 * 1024 * 1024);
@@ -187,7 +191,7 @@ class TransactionManager {
       sizeCalculator: (_) => 8, // int timestamp = 8 bytes
       maxByteThreshold: maxBytes,
       minByteThreshold: 10 * 1024 * 1024, // 10MB minimum
-      groupDepth: 1, // Group by tableName
+      groupDepth: 1, // Group by tableUid
       debugLabel: 'RecentCommittedWrites',
     );
 
@@ -351,11 +355,11 @@ class TransactionManager {
       final writesByTable = _txnWriteSets.remove(transactionId);
       if (writesByTable != null) {
         final nowMs = DateTime.now().millisecondsSinceEpoch;
-        writesByTable.forEach((table, keys) {
+        writesByTable.forEach((tableUid, keys) {
           for (final k in keys) {
-            // Use TreeCache: key format [tableName, pk], value: timestamp
+            // Use TreeCache: key format [tableUid, pk], value: timestamp
             // TreeCache automatically handles LRU eviction when size exceeds threshold
-            _recentCommittedWrites.put([table, k], nowMs);
+            _recentCommittedWrites.put([tableUid, k], nowMs);
           }
         });
       }
@@ -587,7 +591,8 @@ class TransactionManager {
             final ev = obj['event'] as String?;
             if (ev == 'plan' && obj['transactionId'] == transactionId) {
               final planMap = obj['plan'] as Map<String, dynamic>;
-              found = TransactionCommitPlan.fromJson(planMap);
+              found = _withNormalizedTableKeys(
+                  TransactionCommitPlan.fromJson(planMap));
               return found;
             }
             if (ev == 'continue_in_next_partition' &&
@@ -611,13 +616,14 @@ class TransactionManager {
 
   /// Apply commit plan during crash recovery (idempotent): write updates/deletes into buffers and flush.
   Future<void> applyCommitPlan(TransactionCommitPlan plan) async {
+    final commitPlan = _withNormalizedTableKeys(plan);
     try {
       // Wait for any active table renames to finish
       if (_dataStore.hasActiveTableRenames) {
         final tablesToLock = <String>{
-          ...plan.inserts.keys,
-          ...plan.updates.keys,
-          ...plan.deletes.keys,
+          ...commitPlan.inserts.keys,
+          ...commitPlan.updates.keys,
+          ...commitPlan.deletes.keys,
         };
         for (final table in tablesToLock) {
           final barrier = _dataStore.checkTableRenameBarrier(table);
@@ -628,7 +634,7 @@ class TransactionManager {
       }
 
       // Resume from plan progress checkpoint (per-table applied counts)
-      final progress = await _loadPlanProgress(plan.transactionId);
+      final progress = await _loadPlanProgress(commitPlan.transactionId);
 
       int processedSinceLastCheckpoint = 0;
       const int checkpointEvery = 1000; // persist progress every N operations
@@ -639,7 +645,7 @@ class TransactionManager {
       Future<String> ensurePk(String table) async {
         var pk = pkByTable[table];
         if (pk != null && pk.isNotEmpty) return pk;
-        final schema = await _dataStore.schemaManager?.getTableSchema(table);
+        final schema = await _resolveTableSchemaFromField(table);
         pk = schema?.primaryKey ?? 'id';
         pkByTable[table] = pk;
         return pk;
@@ -647,21 +653,29 @@ class TransactionManager {
 
       // Re-enact inserts as INSERT to unified range partition write
       final yieldController = YieldController('txn_apply_commit_plan');
-      for (final entry in plan.inserts.entries) {
-        final table = entry.key;
+      for (final entry in commitPlan.inserts.entries) {
+        final tableUid = entry.key;
         final recs = entry.value;
-        final schema = await _dataStore.schemaManager?.getTableSchema(table);
+        final tableCtx =
+            await _dataStore.schemaManager?.getTableContext(TableUid(tableUid));
+        if (tableCtx == null) {
+          Logger.warn(
+              'Table context not found for $tableUid during applyCommitPlan');
+          continue;
+        }
+        final schema =
+            await _dataStore.schemaManager?.getTableSchema(tableCtx.tableUid);
         if (schema == null) {
           Logger.warn(
-              'Schema not found for table $table during applyCommitPlan');
+              'Schema not found for table $tableUid during applyCommitPlan');
           continue;
         }
 
-        final startIdx = progress['inserts']![table] ?? 0;
+        final startIdx = progress['inserts']![tableUid] ?? 0;
         const int batchSize = 1000;
         final migrationManager = _dataStore.migrationManager;
         final hasRuntimeMigration = migrationManager != null &&
-            migrationManager.hasRuntimeMigrationForTable(table);
+            migrationManager.hasRuntimeMigrationForTable(tableCtx);
 
         for (int i = startIdx; i < recs.length; i += batchSize) {
           await yieldController.maybeYield();
@@ -676,7 +690,7 @@ class TransactionManager {
             rec.remove('_oldValues'); // inserts do not use oldValues
             final uks = rec.remove('_uniqueKeys') as List?;
             final normalizedRec = (hasRuntimeMigration)
-                ? migrationManager.normalizeRecordToLatestSync(table, rec,
+                ? migrationManager.normalizeRecordToLatestSync(tableCtx, rec,
                     fromVersion: '')
                 : rec;
             uniqueKeysList.add(uks
@@ -688,39 +702,50 @@ class TransactionManager {
           }
 
           await _dataStore.tableDataManager.addBatchToBuffer(
-            tableName: table,
+            table: tableCtx,
             records: records,
             operation: BufferOperationType.insert,
             schema: schema,
             uniqueKeyRefsList: uniqueKeysList,
-            transactionId: plan.transactionId,
+            transactionId: commitPlan.transactionId,
             schemaVersion: schema.schemaVersion ?? '',
           );
 
-          progress['inserts']![table] = end;
+          progress['inserts']![tableUid] = end;
           processedSinceLastCheckpoint += (end - i);
           if (processedSinceLastCheckpoint >= checkpointEvery) {
-            await _persistPlanProgress(plan.transactionId, progress['inserts']!,
-                progress['updates']!, progress['deletes']!);
+            await _persistPlanProgress(
+                commitPlan.transactionId,
+                progress['inserts']!,
+                progress['updates']!,
+                progress['deletes']!);
             processedSinceLastCheckpoint = 0;
           }
         }
       }
-      for (final entry in plan.updates.entries) {
-        final table = entry.key;
+      for (final entry in commitPlan.updates.entries) {
+        final tableUid = entry.key;
         final recs = entry.value;
-        final schema = await _dataStore.schemaManager?.getTableSchema(table);
+        final tableCtx =
+            await _dataStore.schemaManager?.getTableContext(TableUid(tableUid));
+        if (tableCtx == null) {
+          Logger.warn(
+              'Table context not found for $tableUid during applyCommitPlan');
+          continue;
+        }
+        final schema =
+            await _dataStore.schemaManager?.getTableSchema(tableCtx.tableUid);
         if (schema == null) {
           Logger.warn(
-              'Schema not found for table $table during applyCommitPlan');
+              'Schema not found for table $tableUid during applyCommitPlan');
           continue;
         }
 
-        final startIdx = progress['updates']![table] ?? 0;
+        final startIdx = progress['updates']![tableUid] ?? 0;
         const int batchSize = 1000;
         final migrationManager = _dataStore.migrationManager;
         final hasRuntimeMigration = migrationManager != null &&
-            migrationManager.hasRuntimeMigrationForTable(table);
+            migrationManager.hasRuntimeMigrationForTable(tableCtx);
 
         for (int i = startIdx; i < recs.length; i += batchSize) {
           await yieldController.maybeYield();
@@ -738,11 +763,11 @@ class TransactionManager {
             final old = rec.remove('_oldValues') as Map<String, dynamic>?;
             final uks = rec.remove('_uniqueKeys') as List?;
             final normalizedRec = (hasRuntimeMigration)
-                ? migrationManager.normalizeRecordToLatestSync(table, rec,
+                ? migrationManager.normalizeRecordToLatestSync(tableCtx, rec,
                     fromVersion: '')
                 : rec;
             final normalizedOld = (hasRuntimeMigration && old != null)
-                ? migrationManager.normalizeRecordToLatestSync(table, old,
+                ? migrationManager.normalizeRecordToLatestSync(tableCtx, old,
                     fromVersion: '')
                 : old;
 
@@ -760,30 +785,40 @@ class TransactionManager {
           }
 
           await _dataStore.tableDataManager.addBatchToBuffer(
-            tableName: table,
+            table: tableCtx,
             records: records,
             operation: BufferOperationType.update,
             schema: schema,
             uniqueKeyRefsList: uniqueKeysList,
             oldRecordsMap: oldRecordsMap,
-            transactionId: plan.transactionId,
+            transactionId: commitPlan.transactionId,
             schemaVersion: schema.schemaVersion ?? '',
           );
 
-          progress['updates']![table] = end;
+          progress['updates']![tableUid] = end;
           processedSinceLastCheckpoint += (end - i);
           if (processedSinceLastCheckpoint >= checkpointEvery) {
-            await _persistPlanProgress(plan.transactionId, progress['inserts']!,
-                progress['updates']!, progress['deletes']!);
+            await _persistPlanProgress(
+                commitPlan.transactionId,
+                progress['inserts']!,
+                progress['updates']!,
+                progress['deletes']!);
             processedSinceLastCheckpoint = 0;
           }
         }
       }
-      for (final entry in plan.deletes.entries) {
-        final table = entry.key;
+      for (final entry in commitPlan.deletes.entries) {
+        final tableUid = entry.key;
         final recs = entry.value; // now full records
         if (recs.isEmpty) continue;
-        final startIdx = progress['deletes']![table] ?? 0;
+        final tableCtx =
+            await _dataStore.schemaManager?.getTableContext(TableUid(tableUid));
+        if (tableCtx == null) {
+          Logger.warn(
+              'Table context not found for $tableUid during applyCommitPlan');
+          continue;
+        }
+        final startIdx = progress['deletes']![tableUid] ?? 0;
         const int batchSize = 1000;
         for (int i = startIdx; i < recs.length; i += batchSize) {
           await yieldController.maybeYield();
@@ -794,54 +829,62 @@ class TransactionManager {
           String? pkName;
           final migrationManager = _dataStore.migrationManager;
           final hasRuntimeMigration = migrationManager != null &&
-              migrationManager.hasRuntimeMigrationForTable(table);
+              migrationManager.hasRuntimeMigrationForTable(tableCtx);
           for (int j = i; j < end; j++) {
             await yieldController.maybeYield();
             final rec = Map<String, dynamic>.from(recs[j]);
             rec.remove('_oldValues'); // delete: old values not used
             final normalizedRec = (hasRuntimeMigration)
-                ? migrationManager.normalizeRecordToLatestSync(table, rec,
+                ? migrationManager.normalizeRecordToLatestSync(tableCtx, rec,
                     fromVersion: '')
                 : rec;
             batch.add(normalizedRec);
             try {
-              pkName ??= await ensurePk(table);
+              pkName ??= await ensurePk(tableUid);
               final k = normalizedRec[pkName]?.toString();
               if (k != null && k.isNotEmpty) cacheKeys.add(k);
             } catch (_) {}
           }
-          final schema = await _dataStore.schemaManager?.getTableSchema(table);
+          final schema = await _resolveTableSchemaFromField(tableUid);
           final version = schema?.schemaVersion ?? '';
           await _dataStore.tableDataManager.addToDeleteBuffer(
-            table,
+            tableCtx,
             batch,
             schemaVersion: version,
           );
-          progress['deletes']![table] = end;
+          progress['deletes']![tableUid] = end;
           processedSinceLastCheckpoint += (end - i);
           if (processedSinceLastCheckpoint >= checkpointEvery) {
-            await _persistPlanProgress(plan.transactionId, progress['inserts']!,
-                progress['updates']!, progress['deletes']!);
+            await _persistPlanProgress(
+                commitPlan.transactionId,
+                progress['inserts']!,
+                progress['updates']!,
+                progress['deletes']!);
             processedSinceLastCheckpoint = 0;
           }
         }
       }
 
       // Execute deferred cascade delete operations (commit-time, after all main operations)
-      final cascadeDeletes = getDeferredCascadeDeletes(plan.transactionId);
+      final cascadeDeletes =
+          getDeferredCascadeDeletes(commitPlan.transactionId);
       if (cascadeDeletes.isNotEmpty && _dataStore.foreignKeyManager != null) {
         for (final cd in cascadeDeletes) {
           await yieldController.maybeYield();
+          final tableContext =
+              await _dataStore.schemaManager?.getTableContext(cd.tableUid);
+          if (tableContext == null) continue;
+          final tableName = tableContext.tableName;
           try {
             await _dataStore.foreignKeyManager!.handleCascadeDelete(
-              tableName: cd.tableName,
+              table: tableContext,
               deletedPkValues: cd.deletedPkValues,
               skipRestrictCheck:
                   true, // RESTRICT already checked when delete was attempted
             );
           } catch (e) {
             Logger.warn(
-                'Cascade delete during applyCommitPlan failed on ${cd.tableName}',
+                'Cascade delete during applyCommitPlan failed on $tableName',
                 rawError: e);
             rethrow;
           }
@@ -849,13 +892,18 @@ class TransactionManager {
       }
 
       // Execute deferred cascade update operations (commit-time, after cascade deletes)
-      final cascadeUpdates = getDeferredCascadeUpdates(plan.transactionId);
+      final cascadeUpdates =
+          getDeferredCascadeUpdates(commitPlan.transactionId);
       if (cascadeUpdates.isNotEmpty && _dataStore.foreignKeyManager != null) {
         for (final cu in cascadeUpdates) {
           await yieldController.maybeYield();
+          final tableContext =
+              await _dataStore.schemaManager?.getTableContext(cu.tableUid);
+          if (tableContext == null) continue;
+          final tableName = tableContext.tableName;
           try {
             await _dataStore.foreignKeyManager!.handleCascadeUpdate(
-              tableName: cu.tableName,
+              table: tableContext,
               oldPkValues: cu.oldPkValues,
               newPkValues: cu.newPkValues,
               visitedTables: null,
@@ -864,7 +912,7 @@ class TransactionManager {
             );
           } catch (e) {
             Logger.warn(
-                'Cascade update during applyCommitPlan failed on ${cu.tableName}',
+                'Cascade update during applyCommitPlan failed on $tableName',
                 rawError: e);
             rethrow;
           }
@@ -872,13 +920,17 @@ class TransactionManager {
       }
 
       // Execute deferred heavy delete plans (commit-time, idempotent via internal checkpoints)
-      if (plan.heavyDeletes.isNotEmpty) {
-        for (final hd in plan.heavyDeletes) {
+      if (commitPlan.heavyDeletes.isNotEmpty) {
+        for (final hd in commitPlan.heavyDeletes) {
           await yieldController.maybeYield();
+          final table =
+              await _dataStore.schemaManager?.getTableContext(hd.tableUid);
+          if (table == null) continue;
+          final tableName = table.tableName;
           try {
             final qc = QueryCondition.fromMap(hd.condition);
             await _dataStore.deleteInternal(
-              hd.tableName,
+              table,
               qc,
               orderBy: hd.orderBy,
               limit: hd.limit,
@@ -887,7 +939,7 @@ class TransactionManager {
             );
           } catch (e) {
             Logger.warn(
-                'Heavy delete during applyCommitPlan failed on ${hd.tableName}',
+                'Heavy delete during applyCommitPlan failed on $tableName',
                 rawError: e);
             rethrow;
           }
@@ -895,13 +947,17 @@ class TransactionManager {
       }
 
       // Execute deferred heavy update plans (commit-time, idempotent via internal checkpoints)
-      if (plan.heavyUpdates.isNotEmpty) {
-        for (final hu in plan.heavyUpdates) {
+      if (commitPlan.heavyUpdates.isNotEmpty) {
+        for (final hu in commitPlan.heavyUpdates) {
           await yieldController.maybeYield();
+          final table =
+              await _dataStore.schemaManager?.getTableContext(hu.tableUid);
+          if (table == null) continue;
+          final tableName = table.tableName;
           try {
             final qc = QueryCondition.fromMap(hu.condition);
             await _dataStore.updateInternal(
-              hu.tableName,
+              table,
               hu.updateData,
               qc,
               orderBy: hu.orderBy,
@@ -911,7 +967,7 @@ class TransactionManager {
             );
           } catch (e) {
             Logger.warn(
-                'Heavy update during applyCommitPlan failed on ${hu.tableName}',
+                'Heavy update during applyCommitPlan failed on $tableName',
                 rawError: e);
             rethrow;
           }
@@ -919,10 +975,11 @@ class TransactionManager {
       }
 
       // Final checkpoint before flush
-      await _persistPlanProgress(plan.transactionId, progress['inserts']!,
+      await _persistPlanProgress(commitPlan.transactionId, progress['inserts']!,
           progress['updates']!, progress['deletes']!);
 
-      _dataStore.tableDataManager.clearTransactionState(plan.transactionId);
+      _dataStore.tableDataManager
+          .clearTransactionState(commitPlan.transactionId);
     } catch (e) {
       Logger.warn('Apply commit plan failed', rawError: e);
       rethrow;
@@ -1110,111 +1167,15 @@ class TransactionManager {
   Future<void> renameTableInCaches(
       String oldTableName, String newTableName) async {
     if (oldTableName == newTableName) return;
-
-    final yieldController = YieldController('txn_rename_caches');
-
-    // 1. Rename table in _txnWriteSets
-    for (final txId in _txnWriteSets.keys) {
-      await yieldController.maybeYield();
-      final tableMap = _txnWriteSets[txId];
-      if (tableMap != null && tableMap.containsKey(oldTableName)) {
-        final pks = tableMap.remove(oldTableName);
-        if (pks != null) {
-          tableMap[newTableName] = pks;
-        }
-      }
-    }
-
-    // 2. Rename table in _recentCommittedWrites (TreeCache)
-    _recentCommittedWrites.renameGroup(oldTableName, newTableName);
-
-    // 3. Rename table in _txnHeavyDeletes
-    for (final txId in _txnHeavyDeletes.keys) {
-      await yieldController.maybeYield();
-      final list = _txnHeavyDeletes[txId];
-      if (list != null) {
-        for (var i = 0; i < list.length; i++) {
-          await yieldController.maybeYield();
-          final plan = list[i];
-          if (plan.tableName == oldTableName) {
-            list[i] = HeavyDeletePlan(
-              tableName: newTableName,
-              condition: plan.condition,
-              orderBy: plan.orderBy,
-              limit: plan.limit,
-              offset: plan.offset,
-            );
-          }
-        }
-      }
-    }
-
-    // 4. Rename table in _txnHeavyUpdates
-    for (final txId in _txnHeavyUpdates.keys) {
-      await yieldController.maybeYield();
-      final list = _txnHeavyUpdates[txId];
-      if (list != null) {
-        for (var i = 0; i < list.length; i++) {
-          await yieldController.maybeYield();
-          final plan = list[i];
-          if (plan.tableName == oldTableName) {
-            list[i] = HeavyUpdatePlan(
-              tableName: newTableName,
-              condition: plan.condition,
-              updateData: plan.updateData,
-              orderBy: plan.orderBy,
-              limit: plan.limit,
-              offset: plan.offset,
-            );
-          }
-        }
-      }
-    }
-
-    // 5. Rename table in _txnCascadeDeletes
-    for (final txId in _txnCascadeDeletes.keys) {
-      await yieldController.maybeYield();
-      final list = _txnCascadeDeletes[txId];
-      if (list != null) {
-        for (var i = 0; i < list.length; i++) {
-          await yieldController.maybeYield();
-          final op = list[i];
-          if (op.tableName == oldTableName) {
-            list[i] = _CascadeDeleteOp(
-              tableName: newTableName,
-              deletedPkValues: op.deletedPkValues,
-            );
-          }
-        }
-      }
-    }
-
-    // 6. Rename table in _txnCascadeUpdates
-    for (final txId in _txnCascadeUpdates.keys) {
-      await yieldController.maybeYield();
-      final list = _txnCascadeUpdates[txId];
-      if (list != null) {
-        for (var i = 0; i < list.length; i++) {
-          await yieldController.maybeYield();
-          final op = list[i];
-          if (op.tableName == oldTableName) {
-            list[i] = _CascadeUpdateOp(
-              tableName: newTableName,
-              oldPkValues: op.oldPkValues,
-              newPkValues: op.newPkValues,
-            );
-          }
-        }
-      }
-    }
+    // Internal structures are keyed by stable tableUid; rename does not change uid.
   }
 
   /// Register a write key (table, primaryKey) for current transaction (used by SSI)
-  void registerWriteKey(String txId, String tableName, String primaryKey) {
+  void registerWriteKey(String txId, TableContext table, String primaryKey) {
     try {
       final byTable =
           _txnWriteSets.putIfAbsent(txId, () => <String, Set<String>>{});
-      final set = byTable.putIfAbsent(tableName, () => <String>{});
+      final set = byTable.putIfAbsent(table.tableUid, () => <String>{});
       set.add(primaryKey);
     } catch (_) {}
   }
@@ -1247,11 +1208,11 @@ class TransactionManager {
 
   /// Register a deferred cascade delete operation for a transaction
   void registerDeferredCascadeDelete(
-      String txId, String tableName, dynamic deletedPkValues) {
+      String txId, TableContext table, dynamic deletedPkValues) {
     final list =
         _txnCascadeDeletes.putIfAbsent(txId, () => <_CascadeDeleteOp>[]);
     list.add(_CascadeDeleteOp(
-      tableName: tableName,
+      tableUid: table.tableUid,
       deletedPkValues: deletedPkValues,
     ));
   }
@@ -1265,12 +1226,12 @@ class TransactionManager {
   }
 
   /// Register a deferred cascade update operation for a transaction
-  void registerDeferredCascadeUpdate(
-      String txId, String tableName, dynamic oldPkValues, dynamic newPkValues) {
+  void registerDeferredCascadeUpdate(String txId, TableContext table,
+      dynamic oldPkValues, dynamic newPkValues) {
     final list =
         _txnCascadeUpdates.putIfAbsent(txId, () => <_CascadeUpdateOp>[]);
     list.add(_CascadeUpdateOp(
-      tableName: tableName,
+      tableUid: table.tableUid,
       oldPkValues: oldPkValues,
       newPkValues: newPkValues,
     ));
@@ -1287,7 +1248,7 @@ class TransactionManager {
   /// SSI conflict detection: for each read key, if a different tx committed a write
   /// after this tx's start, report conflict.
   Future<List<String>> checkSerializableConflictsTransactional(
-      Map<String, Set<String>> readKeysByTable,
+      Map<TableUid, Set<String>> readKeysByTable,
       DateTime startedAt,
       String currentTxId) async {
     final conflicts = <String>[];
@@ -1295,16 +1256,19 @@ class TransactionManager {
       final startMs = startedAt.millisecondsSinceEpoch;
 
       for (final e in readKeysByTable.entries) {
-        final table = e.key;
+        final tableUid = e.key;
         final keys = e.value;
         if (keys.isEmpty) continue;
         final yieldController = YieldController('txn_ssi_check');
         for (final k in keys) {
           await yieldController.maybeYield();
-          // Use TreeCache: key format [tableName, pk]
-          final lastMs = _recentCommittedWrites.get([table, k]);
+          // Use TreeCache: key format [tableUid, pk]
+          final lastMs = _recentCommittedWrites.get([tableUid, k]);
           if (lastMs != null && lastMs > startMs) {
-            conflicts.add('$table:$k');
+            final tableName =
+                _dataStore.schemaManager?.getNameByUid(tableUid) ??
+                    TableName(tableUid);
+            conflicts.add('$tableName:$k');
             return conflicts; // early return on first conflict
           }
         }
@@ -1567,28 +1531,62 @@ class TransactionManager {
       }
     }
   }
+
+  Future<TableSchema?> _resolveTableSchemaFromField(String tableField) async {
+    final normalized =
+        _dataStore.schemaManager?.normalizeTableFieldKey(tableField) ??
+            tableField;
+    final ctx =
+        await _dataStore.schemaManager?.getTableContext(TableUid(normalized));
+    if (ctx == null) return null;
+    return _dataStore.schemaManager?.getTableSchema(ctx.tableUid);
+  }
+
+  Map<String, List<Map<String, dynamic>>> _normalizeCommitPlanTableMap(
+    Map<String, List<Map<String, dynamic>>> byTable,
+  ) {
+    final mgr = _dataStore.schemaManager;
+    if (mgr == null) return byTable;
+    final normalized = <String, List<Map<String, dynamic>>>{};
+    for (final entry in byTable.entries) {
+      final key = mgr.normalizeTableFieldKey(entry.key);
+      normalized.putIfAbsent(key, () => []).addAll(entry.value);
+    }
+    return normalized;
+  }
+
+  TransactionCommitPlan _withNormalizedTableKeys(TransactionCommitPlan plan) {
+    return TransactionCommitPlan(
+      transactionId: plan.transactionId,
+      inserts: _normalizeCommitPlanTableMap(plan.inserts),
+      updates: _normalizeCommitPlanTableMap(plan.updates),
+      deletes: _normalizeCommitPlanTableMap(plan.deletes),
+      heavyDeletes: plan.heavyDeletes,
+      heavyUpdates: plan.heavyUpdates,
+    );
+  }
 }
 
 /// Internal class to represent a deferred cascade delete operation
 class _CascadeDeleteOp {
-  final String tableName;
+  final TableUid tableUid;
   final dynamic
       deletedPkValues; // Can be a single value or Map for composite keys
 
   _CascadeDeleteOp({
-    required this.tableName,
+    required this.tableUid,
     required this.deletedPkValues,
   });
 }
 
 /// Internal class to represent a deferred cascade update operation
 class _CascadeUpdateOp {
-  final String tableName;
+  final TableUid tableUid;
   final dynamic oldPkValues; // Can be a single value or Map for composite keys
   final dynamic newPkValues; // Can be a single value or Map for composite keys
 
   _CascadeUpdateOp({
-    required this.tableName,
+    required this.tableUid,
     required this.oldPkValues,
     required this.newPkValues,
   });
