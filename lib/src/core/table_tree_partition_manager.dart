@@ -17,6 +17,7 @@ import '../model/meta_info.dart';
 import '../model/parallel_journal_entry.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
+import '../model/table_context.dart';
 import '../model/stored_value.dart';
 import '../model/table_schema.dart';
 import 'btree_page.dart';
@@ -49,7 +50,7 @@ final class TableTreePartitionManager {
   String keyOfPtr(TreePagePtr p) => '${p.partitionNo}:${p.pageNo}';
 
   Future<Map<String, dynamic>?> _decodeStoredRecord({
-    required String tableName,
+    required TableContext table,
     required TableMeta meta,
     required Uint8List storedValue,
     required List<FieldStructure> fieldStruct,
@@ -58,11 +59,12 @@ final class TableTreePartitionManager {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
   }) async {
+    final tableUid = table.tableUid;
     final sv = StoredValue.decode(storedValue);
     Uint8List bytes;
     if (sv.tag == StoredValue.tagOverflowRef) {
       bytes = await _dataStore.overflowManager.getLargeValue(
-        tableName: tableName,
+        table: table,
         ref: sv.ref!,
         pageSize: meta.btreePageSize,
         encryptionKey: encryptionKey,
@@ -79,7 +81,7 @@ final class TableTreePartitionManager {
 
     final migrationManager = _dataStore.migrationManager;
     final hasRuntimeMigration = migrationManager != null &&
-        migrationManager.hasRuntimeMigrationForTable(tableName);
+        migrationManager.hasRuntimeMigrationForTable(table);
 
     // Tier 1: Direct decoding if slot counts match
     if (storedFieldCount != null && storedFieldCount == fieldStruct.length) {
@@ -92,11 +94,11 @@ final class TableTreePartitionManager {
     // Tier 2: Match layout dynamically by slot count if they differ (independent of fallback flag)
     if (hasRuntimeMigration && storedFieldCount != null) {
       final historicSchema = await migrationManager.getTableSchemaBySlotCount(
-          tableName, storedFieldCount);
+          table, storedFieldCount);
       if (historicSchema != null) {
         final historicFieldStruct =
             await _dataStore.schemaManager?.getStorageFieldStructure(
-          tableName,
+          tableUid,
           schema: historicSchema,
         );
         if (historicFieldStruct != null) {
@@ -104,7 +106,7 @@ final class TableTreePartitionManager {
               BinarySchemaCodec.decodeRecord(bytes, historicFieldStruct);
           if (decoded != null) {
             return migrationManager.normalizeRecordToLatestSync(
-              tableName,
+              table,
               decoded,
               fromVersion: historicSchema.schemaVersion ?? '',
             );
@@ -116,7 +118,7 @@ final class TableTreePartitionManager {
     // Tier 3: Legacy migration fallback pathway
     if (allowLegacyMigrationFallback && hasRuntimeMigration) {
       final legacyDecoded =
-          migrationManager.decodeLegacyRecordForReadSync(tableName, bytes);
+          migrationManager.decodeLegacyRecordForReadSync(table, bytes);
       if (legacyDecoded != null) {
         return legacyDecoded;
       }
@@ -132,16 +134,17 @@ final class TableTreePartitionManager {
   }
 
   Future<List<FieldStructure>> _resolveStorageFieldStructure({
-    required String tableName,
+    required TableContext table,
     required TableSchema schema,
     List<FieldStructure>? override,
   }) async {
+    final tableUid = table.tableUid;
     if (override != null) {
       return override;
     }
 
     final resolved = await _dataStore.schemaManager?.getStorageFieldStructure(
-      tableName,
+      tableUid,
       schema: schema,
     );
     if (resolved != null && resolved.isNotEmpty) {
@@ -174,7 +177,7 @@ final class TableTreePartitionManager {
       sizeCalculator: _estimateLeafPageSize,
       maxByteThreshold: leafCacheSize,
       minByteThreshold: 50 * 1024 * 1024, // 50MB minimum
-      groupDepth: 1, // Group by tableName
+      groupDepth: 1, // Group by tableUid
       debugLabel: 'TableLeafPageCache',
     );
 
@@ -182,7 +185,7 @@ final class TableTreePartitionManager {
       sizeCalculator: _estimateInternalPageSize,
       maxByteThreshold: internalCacheSize,
       minByteThreshold: 50 * 1024 * 1024, // 50MB minimum
-      groupDepth: 1, // Group by tableName
+      groupDepth: 1, // Group by tableUid
       debugLabel: 'TableInternalPageCache',
     );
   }
@@ -299,10 +302,10 @@ final class TableTreePartitionManager {
   }
 
   /// Clear page cache for a specific table
-  void clearPageCacheForTable(String tableName) {
+  void clearPageCacheForTable(TableContext table) {
     try {
-      _leafPageCache.remove([tableName]);
-      _internalPageCache.remove([tableName]);
+      _leafPageCache.remove([table.tableUid]);
+      _internalPageCache.remove([table.tableUid]);
     } catch (e) {
       Logger.warn('Clear page cache for table failed', rawError: e);
     }
@@ -312,13 +315,14 @@ final class TableTreePartitionManager {
   ///
   /// Returns an approximate number of bytes loaded into the page cache.
   Future<int> prewarmBoundaryPages(
-    String tableName, {
+    TableContext table, {
     TableMeta? meta,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
   }) async {
+    final tableUid = table.tableUid;
     final resolvedMeta =
-        meta ?? await _dataStore.tableDataManager.getTableMeta(tableName);
+        meta ?? await _dataStore.tableDataManager.getTableMeta(table);
     if (resolvedMeta == null || resolvedMeta.btreeFirstLeaf.isNull) {
       return 0;
     }
@@ -330,10 +334,10 @@ final class TableTreePartitionManager {
 
     Future<void> prewarmLeaf(TreePagePtr ptr) async {
       if (ptr.isNull) return;
-      final cacheKey = [tableName, ptr.partitionNo, ptr.pageNo];
+      final cacheKey = [tableUid, ptr.partitionNo, ptr.pageNo];
       final alreadyCached = _leafPageCache.containsKey(cacheKey);
       await _readLeafPage(
-        tableName,
+        table,
         resolvedMeta,
         ptr,
         encryptionKey: encryptionKey,
@@ -352,15 +356,13 @@ final class TableTreePartitionManager {
     return loadedBytes;
   }
 
-  Future<TableMeta> _createInitialTableMeta(String tableName) async {
-    final tableUid =
-        _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
-    return TableMeta.createEmpty(tableUid: tableUid);
+  Future<TableMeta> _createInitialTableMeta(TableContext table) async {
+    return TableMeta.createEmpty(tableUid: table.tableUid);
   }
 
   /// Get partition file path using the dirIndex from partition meta.
   Future<String> _partitionFilePath(
-      String tableName, TableMeta meta, int partitionNo) async {
+      TableContext table, TableMeta meta, int partitionNo) async {
     final count = meta.btreePartitionCount;
     if (partitionNo < 0 || partitionNo >= count) {
       throw DbException([
@@ -371,7 +373,7 @@ final class TableTreePartitionManager {
       ]);
     }
     return _dataStore.pathManager
-        .getPartitionFilePathByNo(tableName, partitionNo);
+        .getPartitionFilePathByNo(table.tableUid, partitionNo);
   }
 
   Future<TableMeta> _rotatePartition(TableMeta state) async {
@@ -387,7 +389,7 @@ final class TableTreePartitionManager {
       state.copyWith(btreeNextPageNo: state.btreeNextPageNo + 1);
 
   Future<LeafPage> _readLeafPage(
-    String tableName,
+    TableContext table,
     TableMeta meta,
     TreePagePtr ptr, {
     Uint8List? encryptionKey,
@@ -395,6 +397,8 @@ final class TableTreePartitionManager {
     Map<String, LeafPage>? localCache,
     bool readFromFileOnly = false,
   }) async {
+    final tableName = table.tableName;
+    final tableUid = table.tableUid;
     if (ptr.isNull) return LeafPage.empty();
 
     // Check local cache first (for writeChanges batch consistency)
@@ -405,7 +409,7 @@ final class TableTreePartitionManager {
     }
 
     // Check instance-level cache
-    final cacheKey = [tableName, ptr.partitionNo, ptr.pageNo];
+    final cacheKey = [tableUid, ptr.partitionNo, ptr.pageNo];
     final instanceCached = _leafPageCache.get(cacheKey);
     if (instanceCached != null) {
       // Copy to local cache if provided
@@ -420,7 +424,7 @@ final class TableTreePartitionManager {
     if (ptr.partitionNo < 0 || ptr.partitionNo >= count) {
       return LeafPage.empty();
     }
-    final path = await _partitionFilePath(tableName, meta, ptr.partitionNo);
+    final path = await _partitionFilePath(table, meta, ptr.partitionNo);
     final offset = ptr.pageNo * meta.btreePageSize;
     final raw =
         await _storage.readAsBytesAt(path, offset, length: meta.btreePageSize);
@@ -468,7 +472,7 @@ final class TableTreePartitionManager {
   }
 
   Future<InternalPage> _readInternalPage(
-    String tableName,
+    TableContext table,
     TableMeta meta,
     TreePagePtr ptr, {
     Uint8List? encryptionKey,
@@ -476,6 +480,8 @@ final class TableTreePartitionManager {
     Map<String, InternalPage>? localCache,
     bool readFromFileOnly = false,
   }) async {
+    final tableName = table.tableName;
+    final tableUid = table.tableUid;
     if (ptr.isNull) return InternalPage.empty();
 
     // Check local cache first (for writeChanges batch consistency)
@@ -486,7 +492,7 @@ final class TableTreePartitionManager {
     }
 
     // Check instance-level cache
-    final cacheKey = [tableName, ptr.partitionNo, ptr.pageNo];
+    final cacheKey = [tableUid, ptr.partitionNo, ptr.pageNo];
     final instanceCached = _internalPageCache.get(cacheKey);
     if (instanceCached != null) {
       // Copy to local cache if provided
@@ -501,7 +507,7 @@ final class TableTreePartitionManager {
     if (ptr.partitionNo < 0 || ptr.partitionNo >= count) {
       return InternalPage.empty();
     }
-    final path = await _partitionFilePath(tableName, meta, ptr.partitionNo);
+    final path = await _partitionFilePath(table, meta, ptr.partitionNo);
     final offset = ptr.pageNo * meta.btreePageSize;
     final raw =
         await _storage.readAsBytesAt(path, offset, length: meta.btreePageSize);
@@ -541,7 +547,7 @@ final class TableTreePartitionManager {
   }
 
   Future<TreePagePtr> _locateLeafForKey(
-    String tableName,
+    TableContext table,
     TableMeta meta,
     Uint8List keyBytes, {
     Uint8List? encryptionKey,
@@ -552,7 +558,7 @@ final class TableTreePartitionManager {
     if (meta.btreeHeight <= 0) return meta.btreeRoot;
     TreePagePtr cur = meta.btreeRoot;
     for (int depth = meta.btreeHeight; depth > 0; depth--) {
-      final node = await _readInternalPage(tableName, meta, cur,
+      final node = await _readInternalPage(table, meta, cur,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           readFromFileOnly: readFromFileOnly);
@@ -564,7 +570,7 @@ final class TableTreePartitionManager {
   }
 
   Future<TreePagePtr> _locateRightmostLeaf(
-    String tableName,
+    TableContext table,
     TableMeta meta, {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
@@ -574,7 +580,7 @@ final class TableTreePartitionManager {
     if (meta.btreeHeight <= 0) return meta.btreeRoot;
     TreePagePtr cur = meta.btreeRoot;
     for (int depth = meta.btreeHeight; depth > 0; depth--) {
-      final node = await _readInternalPage(tableName, meta, cur,
+      final node = await _readInternalPage(table, meta, cur,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           readFromFileOnly: readFromFileOnly);
@@ -586,7 +592,7 @@ final class TableTreePartitionManager {
   }
 
   Future<TreePagePtr> _locateRightmostLeafFast(
-    String tableName,
+    TableContext table,
     TableMeta meta, {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
@@ -598,7 +604,7 @@ final class TableTreePartitionManager {
     if (meta.btreeHeight <= 0) return root;
     if (lastLeaf.isNull) {
       return _locateRightmostLeaf(
-        tableName,
+        table,
         meta,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
@@ -608,7 +614,7 @@ final class TableTreePartitionManager {
 
     try {
       final leaf = await _readLeafPage(
-        tableName,
+        table,
         meta,
         lastLeaf,
         encryptionKey: encryptionKey,
@@ -623,7 +629,7 @@ final class TableTreePartitionManager {
     } catch (_) {}
 
     return _locateRightmostLeaf(
-      tableName,
+      table,
       meta,
       encryptionKey: encryptionKey,
       encryptionKeyId: encryptionKeyId,
@@ -633,7 +639,7 @@ final class TableTreePartitionManager {
 
   /// Batch write changes for a table.
   Future<void> writeChanges({
-    required String tableName,
+    required TableContext table,
     List<Map<String, dynamic>> inserts = const [],
     List<Map<String, dynamic>> updates = const [],
     List<Map<String, dynamic>> deletes = const [],
@@ -644,6 +650,8 @@ final class TableTreePartitionManager {
     List<FieldStructure>? fieldStructureOverride,
     TableSchema? schemaOverride,
   }) async {
+    final tableName = table.tableName;
+    final tableUid = table.tableUid;
     final sw = Stopwatch()..start();
     final totalRecords = inserts.length + updates.length + deletes.length;
 
@@ -652,7 +660,7 @@ final class TableTreePartitionManager {
     }
 
     final schema = schemaOverride ??
-        await _dataStore.schemaManager?.getTableSchema(tableName);
+        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
     if (schema == null) {
       throw DbException([
         SchemaValidationStatus(
@@ -665,13 +673,13 @@ final class TableTreePartitionManager {
 
     // Values-only encoding structure.
     final fieldStruct = await _resolveStorageFieldStructure(
-      tableName: tableName,
+      table: table,
       schema: schema,
       override: fieldStructureOverride,
     );
 
-    var meta = await _dataStore.tableDataManager.getTableMeta(tableName) ??
-        await _createInitialTableMeta(tableName);
+    var meta = await _dataStore.tableDataManager.getTableMeta(table) ??
+        await _createInitialTableMeta(table);
 
     // ---- Batch op coalescing (PK last-write-wins) ----
     final ops = <String, _TableOp>{};
@@ -734,7 +742,7 @@ final class TableTreePartitionManager {
     Future<void> ensurePartitionHeaderLoaded(int pNo) async {
       final stats = getStats(pNo);
       if (stats.headerLoaded) return;
-      stats.path ??= await _partitionFilePath(tableName, meta, pNo);
+      stats.path ??= await _partitionFilePath(table, meta, pNo);
       final pageSize = meta.btreePageSize;
       try {
         final raw0 =
@@ -771,7 +779,7 @@ final class TableTreePartitionManager {
       if (ptr.pageNo <= 0) return; // never free meta page
       await ensurePartitionHeaderLoaded(ptr.partitionNo);
       final stats = getStats(ptr.partitionNo);
-      stats.path ??= await _partitionFilePath(tableName, meta, ptr.partitionNo);
+      stats.path ??= await _partitionFilePath(table, meta, ptr.partitionNo);
       if (!stats.dirEnsured) {
         await _storage.ensureDirectoryExists(p.dirname(stats.path!));
         stats.dirEnsured = true;
@@ -793,7 +801,7 @@ final class TableTreePartitionManager {
       final stats = getStats(partitionNo);
       final head = stats.freeListHeadPageNo;
       if (head < TableMeta.firstDataPageNo) return null;
-      stats.path ??= await _partitionFilePath(tableName, meta, partitionNo);
+      stats.path ??= await _partitionFilePath(table, meta, partitionNo);
       final pageSize = meta.btreePageSize;
       final off = head * pageSize;
       final stagedBytes = peekStaged(stats.path!, off);
@@ -875,14 +883,14 @@ final class TableTreePartitionManager {
     }
 
     Future<LeafPage> getLeaf(TreePagePtr ptr) async {
-      return await _readLeafPage(tableName, meta, ptr,
+      return await _readLeafPage(table, meta, ptr,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           localCache: leafCache);
     }
 
     Future<InternalPage> getInternal(TreePagePtr ptr) async {
-      return await _readInternalPage(tableName, meta, ptr,
+      return await _readInternalPage(table, meta, ptr,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           localCache: internalCache);
@@ -1133,7 +1141,7 @@ final class TableTreePartitionManager {
     if (totalOverflowChunks > 0) {
       overflowAllocator = await _dataStore.overflowManager.startBatchAllocation(
         totalChunks: totalOverflowChunks,
-        tableName: tableName,
+        table: table,
         pageSize: meta.btreePageSize,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
@@ -1171,7 +1179,7 @@ final class TableTreePartitionManager {
           final oldSv = StoredValue.decode(oldStoredBytes);
           if (oldSv.tag == StoredValue.tagOverflowRef && oldSv.ref != null) {
             await _dataStore.overflowManager.deleteLargeValue(
-              tableName: tableName,
+              table: table,
               ref: oldSv.ref!,
               pageSize: meta.btreePageSize,
               encryptionKey: encryptionKey,
@@ -1210,7 +1218,7 @@ final class TableTreePartitionManager {
             final oldSv = StoredValue.decode(oldStoredBytes);
             if (oldSv.tag == StoredValue.tagOverflowRef && oldSv.ref != null) {
               await _dataStore.overflowManager.deleteLargeValue(
-                tableName: tableName,
+                table: table,
                 ref: oldSv.ref!,
                 pageSize: meta.btreePageSize,
                 encryptionKey: encryptionKey,
@@ -1218,7 +1226,7 @@ final class TableTreePartitionManager {
               );
               final overflowPath = await _dataStore.pathManager
                   .getOverflowPartitionFilePathByNo(
-                      tableName, oldSv.ref!.overflowPartitionNo);
+                      tableUid, oldSv.ref!.overflowPartitionNo);
               dirtyOverflowPaths.add(overflowPath);
             }
           } catch (_) {}
@@ -1228,7 +1236,7 @@ final class TableTreePartitionManager {
         if (_dataStore.overflowManager
             .shouldExternalize(meta.btreePageSize, encoded.length)) {
           final ref = await _dataStore.overflowManager.putLargeValue(
-            tableName: tableName,
+            table: table,
             valueBytes: encoded,
             pageSize: meta.btreePageSize,
             encryptionKey: encryptionKey,
@@ -1238,7 +1246,7 @@ final class TableTreePartitionManager {
           );
           final overflowPath = await _dataStore.pathManager
               .getOverflowPartitionFilePathByNo(
-                  tableName, ref.overflowPartitionNo);
+                  tableUid, ref.overflowPartitionNo);
           dirtyOverflowPaths.add(overflowPath);
           stored = StoredValue.overflow(ref).encode();
         } else {
@@ -1311,7 +1319,7 @@ final class TableTreePartitionManager {
     if (lastDeleteLeafPtr != null && !lastDeleteLeafPtr.isNull) {
       try {
         _dataStore.compactionManager
-            .enqueueTable(tableName, hint: lastDeleteLeafPtr);
+            .enqueueTable(table, hint: lastDeleteLeafPtr);
       } catch (_) {}
     }
 
@@ -1382,7 +1390,7 @@ final class TableTreePartitionManager {
           pages: List<BTreePageEncodeItem>.from(pending, growable: false),
           pageRedoTreeKindIndex:
               batchContext != null ? PageRedoTreeKind.table.index : null,
-          pageRedoTableName: batchContext != null ? tableName : null,
+          pageRedoTableUid: batchContext != null ? tableUid : null,
         );
 
         final bytesList = res.pageBytes;
@@ -1399,8 +1407,7 @@ final class TableTreePartitionManager {
           await stageYc.maybeYield();
           final ptr = pendingPtrs[i];
           final stats = getStats(ptr.partitionNo);
-          stats.path ??=
-              await _partitionFilePath(tableName, meta, ptr.partitionNo);
+          stats.path ??= await _partitionFilePath(table, meta, ptr.partitionNo);
           if (!stats.dirEnsured) {
             await _storage.ensureDirectoryExists(p.dirname(stats.path!));
             stats.dirEnsured = true;
@@ -1579,7 +1586,7 @@ final class TableTreePartitionManager {
       final pNo = entry.key;
       final stats = entry.value;
 
-      stats.path ??= await _partitionFilePath(tableName, meta, pNo);
+      stats.path ??= await _partitionFilePath(table, meta, pNo);
       if (!stats.dirEnsured) {
         await _storage.ensureDirectoryExists(p.dirname(stats.path!));
         stats.dirEnsured = true;
@@ -1666,7 +1673,7 @@ final class TableTreePartitionManager {
         final currentTotalSize = max(0, meta.totalSizeInBytes + sizeDeltaSum);
         await _dataStore.parallelJournalManager.appendJournalEntry(
           TablePartitionFlushedEntry(
-            table: tableName,
+            table: tableUid,
             partitionNo: pNo,
             totalRecords: currentTotalRecords,
             totalSizeInBytes: currentTotalSize,
@@ -1687,7 +1694,7 @@ final class TableTreePartitionManager {
       await _storage.ensureDirectoryExists(p.dirname(redoPath));
       final rec = PageRedoLogCodec.encodeTreeMetaRecord(
         treeKind: PageRedoTreeKind.table,
-        tableName: tableName,
+        tableUid: table.tableUid,
         btreePageSize: meta.btreePageSize,
         btreeNextPageNo: meta.btreeNextPageNo,
         btreePartitionCount: meta.btreePartitionCount,
@@ -1773,7 +1780,7 @@ final class TableTreePartitionManager {
       timestamps: Timestamps(created: meta.timestamps.created, modified: now),
     );
     await _dataStore.tableDataManager.updateTableMeta(
-      tableName,
+      table,
       updatedMeta,
       flush: false,
     );
@@ -1783,7 +1790,7 @@ final class TableTreePartitionManager {
     if (batchContext != null) {
       await _dataStore.parallelJournalManager.appendJournalEntry(
         TableMetaUpdatedEntry(
-          table: tableName,
+          table: tableUid,
           batchId: batchContext.batchId,
           batchType: batchContext.batchType,
         ),
@@ -1810,7 +1817,7 @@ final class TableTreePartitionManager {
   ///
   /// Returns the next leaf pointer cursor, or null when finished for now.
   Future<TreePagePtr?> compactLeafChain({
-    required String tableName,
+    required TableContext table,
     TreePagePtr? startFrom,
     required int maxVisitedLeaves,
     required int maxMerges,
@@ -1818,7 +1825,7 @@ final class TableTreePartitionManager {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
   }) async {
-    final meta0 = await _dataStore.tableDataManager.getTableMeta(tableName);
+    final meta0 = await _dataStore.tableDataManager.getTableMeta(table);
     if (meta0 == null || meta0.btreeFirstLeaf.isNull) return null;
     var meta = meta0;
     if (maxVisitedLeaves <= 0 || maxMerges <= 0) return startFrom;
@@ -1840,7 +1847,7 @@ final class TableTreePartitionManager {
     Future<void> ensureHeaderLoaded(int pNo) async {
       final s = getStats(pNo);
       if (s.headerLoaded) return;
-      s.path ??= await _partitionFilePath(tableName, meta, pNo);
+      s.path ??= await _partitionFilePath(table, meta, pNo);
       try {
         final raw0 = await _storage.readAsBytesAt(s.path!, 0,
             length: meta.btreePageSize);
@@ -1867,7 +1874,7 @@ final class TableTreePartitionManager {
       if (pagePtr.pageNo <= 0) return;
       await ensureHeaderLoaded(pagePtr.partitionNo);
       final s = getStats(pagePtr.partitionNo);
-      s.path ??= await _partitionFilePath(tableName, meta, pagePtr.partitionNo);
+      s.path ??= await _partitionFilePath(table, meta, pagePtr.partitionNo);
       if (!s.dirEnsured) {
         await _storage.ensureDirectoryExists(p.dirname(s.path!));
         s.dirEnsured = true;
@@ -1927,7 +1934,7 @@ final class TableTreePartitionManager {
       if (meta.btreeHeight <= 0) return meta.btreeRoot;
       TreePagePtr cur = meta.btreeRoot;
       for (int depth = meta.btreeHeight; depth > 0; depth--) {
-        final node = await _readInternalPage(tableName, meta, cur,
+        final node = await _readInternalPage(table, meta, cur,
             encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
         if (node.children.isEmpty) return meta.btreeFirstLeaf;
         final idx = node.childIndexForKey(key);
@@ -1944,7 +1951,7 @@ final class TableTreePartitionManager {
 
     while (!ptr.isNull && visited < maxVisitedLeaves && merged < maxMerges) {
       await yc.maybeYield();
-      final leaf = await _readLeafPage(tableName, meta, ptr,
+      final leaf = await _readLeafPage(table, meta, ptr,
           encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
       visited++;
       if (leaf.keys.isEmpty) {
@@ -1976,7 +1983,7 @@ final class TableTreePartitionManager {
         ptr = leaf.next;
         continue;
       }
-      final right = await _readLeafPage(tableName, meta, rightPtr,
+      final right = await _readLeafPage(table, meta, rightPtr,
           encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
       if (right.keys.isEmpty) {
         ptr = leaf.next;
@@ -2007,11 +2014,11 @@ final class TableTreePartitionManager {
       final oldRightNext = right.next;
       leaf.next = oldRightNext;
       if (!oldRightNext.isNull) {
-        final nextLeaf = await _readLeafPage(tableName, meta, oldRightNext,
+        final nextLeaf = await _readLeafPage(table, meta, oldRightNext,
             encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
         nextLeaf.prev = ptr;
         final nextPath =
-            await _partitionFilePath(tableName, meta, oldRightNext.partitionNo);
+            await _partitionFilePath(table, meta, oldRightNext.partitionNo);
         stageWrite(nextPath, oldRightNext.pageNo * meta.btreePageSize,
             encodeLeaf(oldRightNext, nextLeaf));
       }
@@ -2031,15 +2038,14 @@ final class TableTreePartitionManager {
         newHeight = 0;
         await pushFree(parentFrame.ptr);
       } else {
-        final parentPath = await _partitionFilePath(
-            tableName, meta, parentFrame.ptr.partitionNo);
+        final parentPath =
+            await _partitionFilePath(table, meta, parentFrame.ptr.partitionNo);
         stageWrite(parentPath, parentFrame.ptr.pageNo * meta.btreePageSize,
             encodeInternal(parentFrame.ptr, parent));
       }
 
       // Persist leaf page and mark right as free.
-      final leftPath =
-          await _partitionFilePath(tableName, meta, ptr.partitionNo);
+      final leftPath = await _partitionFilePath(table, meta, ptr.partitionNo);
       stageWrite(
           leftPath, ptr.pageNo * meta.btreePageSize, encodeLeaf(ptr, leaf));
       await pushFree(rightPtr);
@@ -2059,7 +2065,7 @@ final class TableTreePartitionManager {
       for (final e in partitionStats.entries) {
         final pNo = e.key;
         final s = e.value;
-        s.path ??= await _partitionFilePath(tableName, meta, pNo);
+        s.path ??= await _partitionFilePath(table, meta, pNo);
         if (!s.dirEnsured) {
           await _storage.ensureDirectoryExists(p.dirname(s.path!));
           s.dirEnsured = true;
@@ -2098,7 +2104,7 @@ final class TableTreePartitionManager {
 
     // Persist updated table meta (structure pointers).
     await _dataStore.tableDataManager.updateTableMeta(
-      tableName,
+      table,
       meta.copyWith(
         timestamps: Timestamps(
             created: meta.timestamps.created, modified: DateTime.now()),
@@ -2118,7 +2124,7 @@ final class TableTreePartitionManager {
   ///
   /// API shape matches existing caller expectations in `TableDataManager`.
   Future<List<Map<String, dynamic>>> queryRecordsBatch({
-    required String tableName,
+    required TableContext table,
     required String primaryKey,
     required Comparator<dynamic> keyComparator,
     required List<dynamic> keys,
@@ -2130,16 +2136,16 @@ final class TableTreePartitionManager {
   }) async {
     if (keys.isEmpty) return const <Map<String, dynamic>>[];
     final schema = schemaOverride ??
-        await _dataStore.schemaManager?.getTableSchema(tableName);
+        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
     if (schema == null) return const <Map<String, dynamic>>[];
 
     final fieldStruct = await _resolveStorageFieldStructure(
-      tableName: tableName,
+      table: table,
       schema: schema,
       override: decodeFieldStructureOverride,
     );
 
-    final meta = await _dataStore.tableDataManager.getTableMeta(tableName);
+    final meta = await _dataStore.tableDataManager.getTableMeta(table);
     if (meta == null || (meta.btreeFirstLeaf).isNull) {
       return const <Map<String, dynamic>>[];
     }
@@ -2152,7 +2158,7 @@ final class TableTreePartitionManager {
       if (pk == null || pk.isEmpty) continue;
       pkStrings[i] = pk;
       final keyBytes = schema.encodePrimaryKeyComponent(pk);
-      var ptr = await _locateLeafForKey(tableName, meta, keyBytes,
+      var ptr = await _locateLeafForKey(table, meta, keyBytes,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           readFromFileOnly: readFromFileOnly);
@@ -2169,7 +2175,7 @@ final class TableTreePartitionManager {
       await yc.maybeYield();
       final parts = e.key.split(':');
       final ptr = TreePagePtr(int.parse(parts[0]), int.parse(parts[1]));
-      final leaf = await _readLeafPage(tableName, meta, ptr,
+      final leaf = await _readLeafPage(table, meta, ptr,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           readFromFileOnly: readFromFileOnly);
@@ -2180,7 +2186,7 @@ final class TableTreePartitionManager {
         final pos = leaf.find(keyBytes);
         if (pos == null) continue;
         final decoded = await _decodeStoredRecord(
-          tableName: tableName,
+          table: table,
           meta: meta,
           storedValue: leaf.values[pos],
           fieldStruct: fieldStruct,
@@ -2197,32 +2203,32 @@ final class TableTreePartitionManager {
   }
 
   /// Disk existence check for primary key.
-  Future<bool> existsPrimaryKey(String tableName, String primaryKeyValue,
+  Future<bool> existsPrimaryKey(TableContext table, String primaryKeyValue,
       {TableSchema? schemaOverride}) async {
     if (primaryKeyValue.isEmpty) return false;
     final schema = schemaOverride ??
-        await _dataStore.schemaManager?.getTableSchema(tableName);
+        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
     if (schema == null) return false;
-    final meta = await _dataStore.tableDataManager.getTableMeta(tableName);
+    final meta = await _dataStore.tableDataManager.getTableMeta(table);
     if (meta == null || (meta.btreeFirstLeaf).isNull) return false;
     final keyBytes = schema.encodePrimaryKeyComponent(primaryKeyValue);
-    var ptr = await _locateLeafForKey(tableName, meta, keyBytes);
+    var ptr = await _locateLeafForKey(table, meta, keyBytes);
     if (ptr.isNull) ptr = (meta.btreeFirstLeaf);
-    final leaf = await _readLeafPage(tableName, meta, ptr);
+    final leaf = await _readLeafPage(table, meta, ptr);
     return leaf.find(keyBytes) != null;
   }
 
   /// For custom PK inserts (PrimaryKeyType.none): check which PKs already exist on disk.
   Future<Set<String>> existingPrimaryKeysBatch(
-    String tableName,
+    TableContext table,
     List<String> primaryKeys, {
     TableSchema? schemaOverride,
   }) async {
     if (primaryKeys.isEmpty) return const <String>{};
     final schema = schemaOverride ??
-        await _dataStore.schemaManager?.getTableSchema(tableName);
+        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
     if (schema == null) return const <String>{};
-    final meta = await _dataStore.tableDataManager.getTableMeta(tableName);
+    final meta = await _dataStore.tableDataManager.getTableMeta(table);
     if (meta == null || (meta.btreeFirstLeaf).isNull) return const <String>{};
     final out = <String>{};
     final yc = YieldController(
@@ -2231,9 +2237,9 @@ final class TableTreePartitionManager {
     for (final pk in primaryKeys) {
       await yc.maybeYield();
       final keyBytes = schema.encodePrimaryKeyComponent(pk);
-      var leafPtr = await _locateLeafForKey(tableName, meta, keyBytes);
+      var leafPtr = await _locateLeafForKey(table, meta, keyBytes);
       if (leafPtr.isNull) leafPtr = (meta.btreeFirstLeaf);
-      final leaf = await _readLeafPage(tableName, meta, leafPtr);
+      final leaf = await _readLeafPage(table, meta, leafPtr);
       if (leaf.find(keyBytes) != null) out.add(pk);
     }
     return out;
@@ -2241,24 +2247,24 @@ final class TableTreePartitionManager {
 
   /// Return the current physical partition file size, or zero if it is missing.
   Future<int> getPartitionFileSizeByNo({
-    required String tableName,
+    required TableContext table,
     required int partitionNo,
     TableMeta? metaOverride,
   }) async {
-    final meta = metaOverride ??
-        await _dataStore.tableDataManager.getTableMeta(tableName);
+    final meta =
+        metaOverride ?? await _dataStore.tableDataManager.getTableMeta(table);
     if (meta == null) return 0;
     if (partitionNo < 0 || partitionNo >= meta.btreePartitionCount) {
       return 0;
     }
-    final path = await _partitionFilePath(tableName, meta, partitionNo);
+    final path = await _partitionFilePath(table, meta, partitionNo);
     if (!await _storage.existsFile(path)) return 0;
     return _storage.getFileSize(path);
   }
 
   Future<({List<Map<String, dynamic>> records, bool reachedEnd})>
       _loadPartitionDataPageRangeByNo({
-    required String tableName,
+    required TableContext table,
     required int partitionNo,
     required int startPageNo,
     required int pageLimit,
@@ -2268,17 +2274,18 @@ final class TableTreePartitionManager {
     TableSchema? decodeSchema,
     List<FieldStructure>? decodeFieldStructureOverride,
   }) async {
+    final tableName = table.tableName;
     if (pageLimit <= 0) {
       return (records: const <Map<String, dynamic>>[], reachedEnd: false);
     }
 
     final schema = decodeSchema ??
-        await _dataStore.schemaManager?.getTableSchema(tableName);
+        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
     if (schema == null) {
       return (records: const <Map<String, dynamic>>[], reachedEnd: true);
     }
-    final meta = metaSnapshot ??
-        await _dataStore.tableDataManager.getTableMeta(tableName);
+    final meta =
+        metaSnapshot ?? await _dataStore.tableDataManager.getTableMeta(table);
     if (meta == null) {
       return (records: const <Map<String, dynamic>>[], reachedEnd: true);
     }
@@ -2286,10 +2293,10 @@ final class TableTreePartitionManager {
       return (records: const <Map<String, dynamic>>[], reachedEnd: true);
     }
 
-    final path = await _partitionFilePath(tableName, meta, partitionNo);
+    final path = await _partitionFilePath(table, meta, partitionNo);
 
     final fieldStruct = await _resolveStorageFieldStructure(
-      tableName: tableName,
+      table: table,
       schema: schema,
       override: decodeFieldStructureOverride,
     );
@@ -2362,7 +2369,7 @@ final class TableTreePartitionManager {
       if (leaf.keys.isEmpty) continue;
       for (int i = 0; i < leaf.keys.length; i++) {
         final decoded = await _decodeStoredRecord(
-          tableName: tableName,
+          table: table,
           meta: meta,
           storedValue: leaf.values[i],
           fieldStruct: fieldStruct,
@@ -2386,7 +2393,7 @@ final class TableTreePartitionManager {
   /// This keeps maintenance callers from materializing a very large partition
   /// file as one in-memory list.
   Stream<List<Map<String, dynamic>>> streamPartitionDataPageBatchesByNo({
-    required String tableName,
+    required TableContext table,
     required int partitionNo,
     int pagesPerBatch = 500,
     bool prefetchNextPageBatch = false,
@@ -2397,12 +2404,12 @@ final class TableTreePartitionManager {
   }) async* {
     if (pagesPerBatch <= 0) pagesPerBatch = 500;
 
-    final meta = await _dataStore.tableDataManager.getTableMeta(tableName);
+    final meta = await _dataStore.tableDataManager.getTableMeta(table);
     if (meta == null) return;
     if (partitionNo < 0 || partitionNo >= meta.btreePartitionCount) {
       return;
     }
-    final path = await _partitionFilePath(tableName, meta, partitionNo);
+    final path = await _partitionFilePath(table, meta, partitionNo);
     if (!await _storage.existsFile(path)) return;
     final size = await _storage.getFileSize(path);
     final snapshotPageCount =
@@ -2420,7 +2427,7 @@ final class TableTreePartitionManager {
     ) {
       final pageLimit = min(pagesPerBatch, snapshotPageCount - pageNo);
       return _loadPartitionDataPageRangeByNo(
-        tableName: tableName,
+        table: table,
         partitionNo: partitionNo,
         startPageNo: pageNo,
         pageLimit: pageLimit,
@@ -2469,7 +2476,7 @@ final class TableTreePartitionManager {
   /// This is critical for migration scenarios where old data must be decoded
   /// using the old schema before applying schema changes.
   Future<List<Map<String, dynamic>>> loadPartitionDataByNo({
-    required String tableName,
+    required TableContext table,
     required int partitionNo,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
@@ -2478,21 +2485,21 @@ final class TableTreePartitionManager {
   }) async {
     // Use provided decodeSchema for migration, or current schema for normal operations
     final schema = decodeSchema ??
-        await _dataStore.schemaManager?.getTableSchema(tableName);
+        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
     if (schema == null) return const <Map<String, dynamic>>[];
-    final meta = await _dataStore.tableDataManager.getTableMeta(tableName);
+    final meta = await _dataStore.tableDataManager.getTableMeta(table);
     if (meta == null) return const <Map<String, dynamic>>[];
     if (partitionNo < 0 || partitionNo >= meta.btreePartitionCount) {
       return const <Map<String, dynamic>>[];
     }
 
-    final path = await _partitionFilePath(tableName, meta, partitionNo);
+    final path = await _partitionFilePath(table, meta, partitionNo);
     if (!await _storage.existsFile(path)) return const <Map<String, dynamic>>[];
     final size = await _storage.getFileSize(path);
     if (size <= meta.btreePageSize) return const <Map<String, dynamic>>[];
 
     final fieldStruct = await _resolveStorageFieldStructure(
-      tableName: tableName,
+      table: table,
       schema: schema,
       override: decodeFieldStructureOverride,
     );
@@ -2508,7 +2515,7 @@ final class TableTreePartitionManager {
       await yc.maybeYield();
       final ptr = TreePagePtr(partitionNo, pageNo);
       final leaf = await _readLeafPage(
-        tableName,
+        table,
         meta,
         ptr,
         encryptionKey: encryptionKey,
@@ -2517,7 +2524,7 @@ final class TableTreePartitionManager {
       if (leaf.keys.isEmpty) continue;
       for (int i = 0; i < leaf.keys.length; i++) {
         final decoded = await _decodeStoredRecord(
-          tableName: tableName,
+          table: table,
           meta: meta,
           storedValue: leaf.values[i],
           fieldStruct: fieldStruct,
@@ -2543,7 +2550,7 @@ final class TableTreePartitionManager {
   /// This is critical for migration scenarios where old data must be decoded
   /// using the old schema before applying schema changes.
   Stream<Map<String, dynamic>> streamRecordsByPrimaryKeyRange({
-    required String tableName,
+    required TableContext table,
     required Uint8List startKeyInclusive,
     required Uint8List endKeyExclusive,
     required bool reverse,
@@ -2557,16 +2564,16 @@ final class TableTreePartitionManager {
   }) async* {
     // Use provided decodeSchema for migration, or current schema for normal operations
     final schema = decodeSchema ??
-        await _dataStore.schemaManager?.getTableSchema(tableName);
+        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
     if (schema == null) return;
 
     final fieldStruct = await _resolveStorageFieldStructure(
-      tableName: tableName,
+      table: table,
       schema: schema,
       override: decodeFieldStructureOverride,
     );
 
-    final meta = await _dataStore.tableDataManager.getTableMeta(tableName);
+    final meta = await _dataStore.tableDataManager.getTableMeta(table);
     if (meta == null || meta.btreeFirstLeaf.isNull) return;
 
     int remaining = (limit == null || limit <= 0) ? (1 << 30) : limit;
@@ -2574,14 +2581,14 @@ final class TableTreePartitionManager {
     TreePagePtr ptr;
     int startIndexInLeaf = -1;
     if (!reverse) {
-      ptr = await _locateLeafForKey(tableName, meta, startKeyInclusive,
+      ptr = await _locateLeafForKey(table, meta, startKeyInclusive,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           readFromFileOnly: readFromFileOnly);
       if (ptr.isNull) ptr = meta.btreeFirstLeaf;
     } else {
       if (endKeyExclusive.isNotEmpty) {
-        ptr = await _locateLeafForKey(tableName, meta, endKeyExclusive,
+        ptr = await _locateLeafForKey(table, meta, endKeyExclusive,
             encryptionKey: encryptionKey,
             encryptionKeyId: encryptionKeyId,
             readFromFileOnly: readFromFileOnly);
@@ -2589,7 +2596,7 @@ final class TableTreePartitionManager {
       } else {
         // Fast path: trust meta.btreeLastLeaf when it still points to the
         // boundary leaf, and fall back to a full right-edge descent otherwise.
-        ptr = await _locateRightmostLeafFast(tableName, meta,
+        ptr = await _locateRightmostLeafFast(table, meta,
             encryptionKey: encryptionKey,
             encryptionKeyId: encryptionKeyId,
             readFromFileOnly: readFromFileOnly);
@@ -2610,7 +2617,7 @@ final class TableTreePartitionManager {
       final f = prefetched.remove(k);
       if (f != null) return f;
       return _readLeafPage(
-        tableName,
+        table,
         meta,
         p,
         encryptionKey: encryptionKey,
@@ -2625,7 +2632,7 @@ final class TableTreePartitionManager {
       if (prefetched.isNotEmpty) return;
       final k = keyOfPtr(p);
       prefetched[k] = _readLeafPage(
-        tableName,
+        table,
         meta,
         p,
         encryptionKey: encryptionKey,
@@ -2669,7 +2676,7 @@ final class TableTreePartitionManager {
             return;
           }
           final decoded = await _decodeStoredRecord(
-            tableName: tableName,
+            table: table,
             meta: meta,
             storedValue: leaf.values[i],
             fieldStruct: fieldStruct,
@@ -2713,7 +2720,7 @@ final class TableTreePartitionManager {
             continue;
           }
           final decoded = await _decodeStoredRecord(
-            tableName: tableName,
+            table: table,
             meta: meta,
             storedValue: leaf.values[i],
             fieldStruct: fieldStruct,
@@ -2738,7 +2745,7 @@ final class TableTreePartitionManager {
   }
 
   Future<List<Map<String, dynamic>>> scanRecordsByPrimaryKeyRange({
-    required String tableName,
+    required TableContext table,
     required Uint8List startKeyInclusive,
     required Uint8List endKeyExclusive,
     required bool reverse,
@@ -2752,7 +2759,7 @@ final class TableTreePartitionManager {
   }) async {
     final out = <Map<String, dynamic>>[];
     await forEachRecordByPrimaryKeyRange(
-      tableName: tableName,
+      table: table,
       startKeyInclusive: startKeyInclusive,
       endKeyExclusive: endKeyExclusive,
       reverse: reverse,
@@ -2772,7 +2779,7 @@ final class TableTreePartitionManager {
   }
 
   Future<void> forEachRecordByPrimaryKeyRange({
-    required String tableName,
+    required TableContext table,
     required Uint8List startKeyInclusive,
     required Uint8List endKeyExclusive,
     required bool reverse,
@@ -2787,14 +2794,14 @@ final class TableTreePartitionManager {
     bool readFromFileOnly = false,
   }) async {
     final schema = decodeSchema ??
-        await _dataStore.schemaManager?.getTableSchema(tableName);
+        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
     if (schema == null) return;
     final fieldStruct = await _resolveStorageFieldStructure(
-      tableName: tableName,
+      table: table,
       schema: schema,
       override: decodeFieldStructureOverride,
     );
-    final meta = await _dataStore.tableDataManager.getTableMeta(tableName);
+    final meta = await _dataStore.tableDataManager.getTableMeta(table);
     if (meta == null || (meta.btreeFirstLeaf).isNull) return;
 
     int remaining = (limit == null || limit <= 0) ? (1 << 30) : limit;
@@ -2802,20 +2809,20 @@ final class TableTreePartitionManager {
     TreePagePtr ptr;
     int startIndexInLeaf = -1;
     if (!reverse) {
-      ptr = await _locateLeafForKey(tableName, meta, startKeyInclusive,
+      ptr = await _locateLeafForKey(table, meta, startKeyInclusive,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           readFromFileOnly: readFromFileOnly);
       if (ptr.isNull) ptr = (meta.btreeFirstLeaf);
     } else {
       if (endKeyExclusive.isNotEmpty) {
-        ptr = await _locateLeafForKey(tableName, meta, endKeyExclusive,
+        ptr = await _locateLeafForKey(table, meta, endKeyExclusive,
             encryptionKey: encryptionKey,
             encryptionKeyId: encryptionKeyId,
             readFromFileOnly: readFromFileOnly);
         if (ptr.isNull) ptr = (meta.btreeLastLeaf);
       } else {
-        ptr = await _locateRightmostLeafFast(tableName, meta,
+        ptr = await _locateRightmostLeafFast(table, meta,
             encryptionKey: encryptionKey,
             encryptionKeyId: encryptionKeyId,
             readFromFileOnly: readFromFileOnly);
@@ -2834,7 +2841,7 @@ final class TableTreePartitionManager {
       final f = prefetched.remove(k);
       if (f != null) return f;
       return _readLeafPage(
-        tableName,
+        table,
         meta,
         p,
         encryptionKey: encryptionKey,
@@ -2848,7 +2855,7 @@ final class TableTreePartitionManager {
       if (prefetched.isNotEmpty) return;
       final k = keyOfPtr(p);
       prefetched[k] = _readLeafPage(
-        tableName,
+        table,
         meta,
         p,
         encryptionKey: encryptionKey,
@@ -2894,7 +2901,7 @@ final class TableTreePartitionManager {
           Map<String, dynamic> row;
           if (decodeRecord) {
             final decoded = await _decodeStoredRecord(
-              tableName: tableName,
+              table: table,
               meta: meta,
               storedValue: leaf.values[i],
               fieldStruct: fieldStruct,
@@ -2944,7 +2951,7 @@ final class TableTreePartitionManager {
           Map<String, dynamic> row;
           if (decodeRecord) {
             final decoded = await _decodeStoredRecord(
-              tableName: tableName,
+              table: table,
               meta: meta,
               storedValue: leaf.values[i],
               fieldStruct: fieldStruct,
