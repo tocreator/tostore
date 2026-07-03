@@ -9,8 +9,10 @@ import '../model/db_exception.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/value_ref.dart';
+import '../model/table_context.dart';
 import 'btree_page.dart';
 import 'data_store_impl.dart';
+import '../model/table_identity.dart';
 
 /// Out-of-line large value store (TOAST-like), page based.
 ///
@@ -59,13 +61,13 @@ final class OverflowManager {
 
   Future<OverflowBatchAllocator> startBatchAllocation({
     required int totalChunks,
-    required String tableName,
+    required TableContext table,
     required int pageSize,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
     bool flush = true,
   }) async {
-    final path = await _overflowPath(tableName, _defaultPartitionNo);
+    final path = await _overflowPath(table.tableUid, _defaultPartitionNo);
     return _getLock(path).synchronized(() async {
       await _ensureFileInitialized(
         path: path,
@@ -90,7 +92,7 @@ final class OverflowManager {
   }
 
   Future<ValueRef> putLargeValue({
-    required String tableName,
+    required TableContext table,
     required Uint8List valueBytes,
     required int pageSize,
     Uint8List? encryptionKey,
@@ -109,7 +111,7 @@ final class OverflowManager {
       ]);
     }
 
-    final path = await _overflowPath(tableName, _defaultPartitionNo);
+    final path = await _overflowPath(table.tableUid, _defaultPartitionNo);
 
     final crc = Crc32.of(valueBytes);
     final maxChunk = _maxChunkLen(
@@ -178,7 +180,7 @@ final class OverflowManager {
 
   /// Free overflow pages back to the freelist.
   Future<void> deleteLargeValue({
-    required String tableName,
+    required TableContext table,
     required ValueRef ref,
     required int pageSize,
     Uint8List? encryptionKey,
@@ -186,7 +188,7 @@ final class OverflowManager {
   }) async {
     if (ref.kind != ValueRef.kindOverflow) return;
 
-    final path = await _overflowPath(tableName, ref.overflowPartitionNo);
+    final path = await _overflowPath(table.tableUid, ref.overflowPartitionNo);
     if (!await _dataStore.storage.existsFile(path)) return;
 
     await _getLock(path).synchronized(() async {
@@ -282,13 +284,13 @@ final class OverflowManager {
   }
 
   Future<Uint8List> getLargeValue({
-    required String tableName,
+    required TableContext table,
     required ValueRef ref,
     required int pageSize,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
   }) async {
-    final path = await _overflowPath(tableName, ref.overflowPartitionNo);
+    final path = await _overflowPath(table.tableUid, ref.overflowPartitionNo);
     // Fast path: if file missing, treat as corruption.
     if (!await _dataStore.storage.existsFile(path)) {
       throw DbException([
@@ -370,9 +372,9 @@ final class OverflowManager {
 
   // ---- Internal helpers ----
 
-  Future<String> _overflowPath(String tableName, int partitionNo) async {
+  Future<String> _overflowPath(TableUid tableUid, int partitionNo) async {
     return _dataStore.pathManager
-        .getOverflowPartitionFilePathByNo(tableName, partitionNo);
+        .getOverflowPartitionFilePathByNo(tableUid, partitionNo);
   }
 
   Uint8List _aadForOverflowPage(int partitionNo, int pageNo) {
