@@ -1,9 +1,10 @@
 import '../../handler/logger.dart';
+import '../../model/table_identity.dart';
 import '../yield_controller.dart';
 
 /// Pure-compute request for trimming delete-buffer records.
 class DeleteBatchPrepareRequest {
-  final String tableName;
+  final TableName tableName;
   final String primaryKeyField;
   final List<String> requiredFields;
   final List<Map<String, dynamic>> records;
