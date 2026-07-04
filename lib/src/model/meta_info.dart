@@ -2,6 +2,7 @@ import '../handler/common.dart';
 import 'db_exception.dart';
 import 'result_status.dart';
 import 'result_type.dart';
+import 'table_identity.dart';
 
 // ============================================================================
 // B+Tree Paged Storage Metadata
@@ -193,7 +194,7 @@ class FileMeta {
 /// table meta model
 class TableMeta {
   final int version;
-  final String tableUid;
+  final TableUid tableUid;
   final int totalSizeInBytes;
   final int totalRecords;
   final Timestamps timestamps;
@@ -262,7 +263,7 @@ class TableMeta {
   /// - Creating a new table
   /// - Clearing an existing table (with optional preserved pageSize/partitionCount)
   static TableMeta createEmpty({
-    required String tableUid,
+    required TableUid tableUid,
     int pageSize = defaultPageSize,
     int partitionCount = 1,
     DateTime? now,
@@ -285,7 +286,7 @@ class TableMeta {
 
   TableMeta copyWith({
     int? version,
-    String? tableUid,
+    TableUid? tableUid,
     int? totalSizeInBytes,
     int? totalRecords,
     Timestamps? timestamps,
@@ -316,9 +317,15 @@ class TableMeta {
   }
 
   /// deserialize from json
-  factory TableMeta.fromJson(Map<String, dynamic> json) {
-    final loadedUid = (json['tableUid'] ?? json['name']) as String?;
-    if (loadedUid == null ||
+  ///
+  /// [tableUidFallback] supplies the uid when legacy meta files omit or leave
+  /// [tableUid] empty (e.g. loaded from a uid-based directory path).
+  factory TableMeta.fromJson(
+    Map<String, dynamic> json, {
+    TableUid? tableUidFallback,
+  }) {
+    final resolvedUid = _resolveTableUidFromJson(json, tableUidFallback);
+    if (resolvedUid == null ||
         json['totalSizeInBytes'] == null ||
         json['totalRecords'] == null ||
         json['timestamps'] == null ||
@@ -333,7 +340,7 @@ class TableMeta {
         GeneralStatus(
           type: ResultType.engError,
           message: 'Missing required fields for TableMeta. Missing fields: ${[
-            if (loadedUid == null) 'tableUid',
+            if (resolvedUid == null) 'tableUid',
             if (json['totalSizeInBytes'] == null) 'totalSizeInBytes',
             if (json['totalRecords'] == null) 'totalRecords',
             if (json['timestamps'] == null) 'timestamps',
@@ -352,7 +359,7 @@ class TableMeta {
     return TableMeta(
       version:
           resolveVersionValue(json['version'], InternalConfig.tableDataVersion),
-      tableUid: loadedUid,
+      tableUid: TableUid.parse(resolvedUid),
       totalSizeInBytes: json['totalSizeInBytes'] is int
           ? json['totalSizeInBytes'] as int
           : int.parse('${json['totalSizeInBytes']}'),
@@ -650,8 +657,8 @@ class SchemaPartitionMeta {
   /// current partition file size
   final int fileSizeInBytes;
 
-  /// table names in the partition
-  final List<String> tableNames;
+  /// table uids in the partition
+  final List<String> tableUids;
 
   /// table size mapping
   final Map<String, int> tableSizes;
@@ -674,7 +681,7 @@ class SchemaPartitionMeta {
     int? version,
     required this.index,
     required this.fileSizeInBytes,
-    required this.tableNames,
+    required this.tableUids,
     required this.tableSizes,
     required this.tableSchemas,
     required this.tableFieldLayouts,
@@ -686,7 +693,7 @@ class SchemaPartitionMeta {
     int? version,
     int? index,
     int? fileSizeInBytes,
-    List<String>? tableNames,
+    List<String>? tableUids,
     Map<String, int>? tableSizes,
     Map<String, dynamic>? tableSchemas,
     Map<String, dynamic>? tableFieldLayouts,
@@ -697,7 +704,7 @@ class SchemaPartitionMeta {
       version: version ?? this.version,
       index: index ?? this.index,
       fileSizeInBytes: fileSizeInBytes ?? this.fileSizeInBytes,
-      tableNames: tableNames ?? List.from(this.tableNames),
+      tableUids: tableUids ?? List.from(this.tableUids),
       tableSizes: tableSizes ?? Map.from(this.tableSizes),
       tableSchemas: tableSchemas ?? Map.from(this.tableSchemas),
       tableFieldLayouts: tableFieldLayouts ?? Map.from(this.tableFieldLayouts),
@@ -712,7 +719,8 @@ class SchemaPartitionMeta {
           json['version'], InternalConfig.legacySchemaVersion),
       index: json['index'] as int,
       fileSizeInBytes: json['fileSizeInBytes'] as int,
-      tableNames: List<String>.from(json['tableNames'] as List),
+      tableUids:
+          List<String>.from((json['tableUids'] ?? json['tableNames']) as List),
       tableSizes: Map<String, int>.from(json['tableSizes'] as Map),
       tableSchemas: Map<String, dynamic>.from(json['tableSchemas'] as Map),
       tableFieldLayouts: json['tableFieldLayouts'] is Map
@@ -729,7 +737,7 @@ class SchemaPartitionMeta {
       'version': version,
       'index': index,
       'fileSizeInBytes': fileSizeInBytes,
-      'tableNames': tableNames,
+      'tableUids': tableUids,
       'tableSizes': tableSizes,
       'tableSchemas': tableSchemas,
       'tableFieldLayouts': tableFieldLayouts,
@@ -740,13 +748,13 @@ class SchemaPartitionMeta {
 
   @override
   String toString() {
-    return 'SchemaPartitionMeta(version: $version, index: $index, fileSizeInBytes: $fileSizeInBytes, tableNames: $tableNames, tableSizes: $tableSizes, timestamps: $timestamps)';
+    return 'SchemaPartitionMeta(version: $version, index: $index, fileSizeInBytes: $fileSizeInBytes, tableUids: $tableUids, tableSizes: $tableSizes, timestamps: $timestamps)';
   }
 }
 
 /// stable table schema route entry
 class TableSchemaRouteEntry {
-  final String tableUid;
+  final TableUid tableUid;
   final String tableName;
   final int dirIndex;
   final int partitionIndex;
@@ -763,8 +771,18 @@ class TableSchemaRouteEntry {
   });
 
   factory TableSchemaRouteEntry.fromJson(Map<String, dynamic> json) {
+    final rawTableUid = json['tableUid'] as String?;
+    if (rawTableUid == null || rawTableUid.isEmpty) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Missing required field "tableUid" for TableSchemaRouteEntry.',
+        )
+      ]);
+    }
     return TableSchemaRouteEntry(
-      tableUid: json['tableUid'] as String,
+      tableUid: TableUid.parse(rawTableUid),
       tableName: json['tableName'] as String,
       dirIndex: json['dirIndex'] as int,
       partitionIndex: json['partitionIndex'] as int,
@@ -864,10 +882,10 @@ class IndexMeta {
   final int version;
 
   /// index unique identifier
-  final String indexUid;
+  final IndexUid indexUid;
 
   /// table unique identifier
-  final String tableUid;
+  final TableUid tableUid;
 
   /// whether the index is unique
   final bool isUnique;
@@ -943,8 +961,8 @@ class IndexMeta {
   /// [partitionCount] - Initial partition count (default: 1).
   /// [now] - Optional timestamp override; uses current time if not provided.
   static IndexMeta createEmpty({
-    required String indexUid,
-    required String tableUid,
+    required IndexUid indexUid,
+    required TableUid tableUid,
     required bool isUnique,
     bool isBuilding = false,
     int pageSize = defaultPageSize,
@@ -972,8 +990,8 @@ class IndexMeta {
 
   IndexMeta copyWith({
     int? version,
-    String? indexUid,
-    String? tableUid,
+    IndexUid? indexUid,
+    TableUid? tableUid,
     bool? isUnique,
     bool? isBuilding,
     Timestamps? timestamps,
@@ -1006,12 +1024,17 @@ class IndexMeta {
     );
   }
 
-  factory IndexMeta.fromJson(Map<String, dynamic> json) {
-    final loadedIndexUid = (json['indexUid'] ?? json['name']) as String?;
-    final loadedTableUid = (json['tableUid'] ?? json['tableName']) as String?;
+  factory IndexMeta.fromJson(
+    Map<String, dynamic> json, {
+    TableUid? tableUidFallback,
+    IndexUid? indexUidFallback,
+  }) {
+    final resolvedIndexUid = _resolveIndexUidFromJson(json, indexUidFallback);
+    final resolvedTableUid =
+        _resolveIndexTableUidFromJson(json, tableUidFallback);
 
-    if (loadedIndexUid == null ||
-        loadedTableUid == null ||
+    if (resolvedIndexUid == null ||
+        resolvedTableUid == null ||
         json['isUnique'] == null ||
         json['timestamps'] == null ||
         json['btreePageSize'] == null ||
@@ -1025,8 +1048,8 @@ class IndexMeta {
         GeneralStatus(
           type: ResultType.engError,
           message: 'Missing required fields for IndexMeta. Missing fields: ${[
-            if (loadedIndexUid == null) 'indexUid',
-            if (loadedTableUid == null) 'tableUid',
+            if (resolvedIndexUid == null) 'indexUid',
+            if (resolvedTableUid == null) 'tableUid',
             if (json['isUnique'] == null) 'isUnique',
             if (json['timestamps'] == null) 'timestamps',
             if (json['btreePageSize'] == null) 'btreePageSize',
@@ -1044,8 +1067,8 @@ class IndexMeta {
     return IndexMeta(
       version:
           resolveVersionValue(json['version'], InternalConfig.indexVersion),
-      indexUid: loadedIndexUid,
-      tableUid: loadedTableUid,
+      indexUid: IndexUid.parse(resolvedIndexUid),
+      tableUid: TableUid.parse(resolvedTableUid),
       isUnique: json['isUnique'] as bool,
       isBuilding: json['isBuilding'] as bool? ?? false,
       timestamps:
@@ -1330,4 +1353,41 @@ class DirectoryMappingString {
   @override
   String toString() =>
       'DirectoryMappingString(idToDir: $idToDir, dirToFileCount: $dirToFileCount)';
+}
+
+String? _nonEmptyString(dynamic raw) {
+  if (raw is! String || raw.isEmpty) return null;
+  return raw;
+}
+
+/// Resolve table uid from persisted meta, preferring explicit [tableUid] then
+/// caller [fallback], then legacy [name].
+String? _resolveTableUidFromJson(
+  Map<String, dynamic> json,
+  TableUid? fallback,
+) {
+  return _nonEmptyString(json['tableUid']) ??
+      (fallback != null && fallback.isNotEmpty ? fallback.value : null) ??
+      _nonEmptyString(json['name']);
+}
+
+/// Resolve index uid from persisted meta, preferring explicit [indexUid] then
+/// caller [fallback], then legacy [name].
+String? _resolveIndexUidFromJson(
+  Map<String, dynamic> json,
+  IndexUid? fallback,
+) {
+  return _nonEmptyString(json['indexUid']) ??
+      (fallback != null && fallback.isNotEmpty ? fallback.value : null) ??
+      _nonEmptyString(json['name']);
+}
+
+/// Resolve owning table uid for index meta.
+String? _resolveIndexTableUidFromJson(
+  Map<String, dynamic> json,
+  TableUid? fallback,
+) {
+  return _nonEmptyString(json['tableUid']) ??
+      (fallback != null && fallback.isNotEmpty ? fallback.value : null) ??
+      _nonEmptyString(json['tableName']);
 }
