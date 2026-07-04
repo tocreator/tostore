@@ -1,12 +1,13 @@
+import 'table_identity.dart';
 import 'table_schema.dart';
 
 /// Table context, mainly used to pass resolved table info conveniently across the engine path.
 class TableContext {
-  final String tableUid; // Table unique identifier
-  String tableName; // Table name (can be updated on renaming in memory context)
-  final bool isGlobal; // Whether it is a global table
-  final int dataDirIndex; // Data directory index
-  final TableSchema schema; // Schema snapshot
+  final TableUid tableUid;
+  TableName tableName;
+  final bool isGlobal;
+  final int dataDirIndex;
+  final TableSchema schema;
 
   TableContext({
     required this.tableUid,
@@ -23,8 +24,8 @@ class TableContext {
 
 /// Index context, used for index operations.
 class IndexContext {
-  final String indexUid;
-  final String indexName;
+  final IndexUid indexUid;
+  final IndexName indexName;
   final IndexSchema schema;
   final TableContext table;
 
