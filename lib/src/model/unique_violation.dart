@@ -9,7 +9,7 @@ class UniqueViolation {
   /// The actual value that caused the violation (human-readable, not internal key).
   final dynamic value;
 
-  /// Internal index name (optional).
+  /// User-visible index name (optional, e.g. `uniq_email` or `pk`).
   final String? indexName;
 
   /// The primary key of the existing record that caused the violation (optional).
