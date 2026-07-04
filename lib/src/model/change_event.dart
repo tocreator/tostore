@@ -1,3 +1,5 @@
+import 'table_identity.dart';
+
 /// Type of data change
 enum ChangeType {
   insert,
@@ -9,7 +11,7 @@ enum ChangeType {
 /// Event payload for data changes
 class ChangeEvent {
   final ChangeType type;
-  final String tableUid;
+  final TableUid tableUid;
   final Map<String, dynamic>? record; // The new record (null for delete)
   final Map<String, dynamic>? oldRecord; // The old record (null for insert)
 
