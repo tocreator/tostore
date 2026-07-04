@@ -1,4 +1,5 @@
 import '../model/buffer_entry.dart';
+import 'table_identity.dart';
 
 /// Transaction status
 enum TransactionStatus {
@@ -10,7 +11,7 @@ enum TransactionStatus {
 /// A single operation within a transaction, captured with before-image for rollback
 class TransactionEntry {
   final String transactionId;
-  final String tableName;
+  final TableUid tableUid;
   final BufferOperationType operation;
   final String primaryKeyName;
   final dynamic primaryKeyValue;
@@ -19,7 +20,7 @@ class TransactionEntry {
 
   const TransactionEntry({
     required this.transactionId,
-    required this.tableName,
+    required this.tableUid,
     required this.operation,
     required this.primaryKeyName,
     required this.primaryKeyValue,
@@ -30,7 +31,7 @@ class TransactionEntry {
   Map<String, dynamic> toJson() {
     return {
       'transactionId': transactionId,
-      'tableName': tableName,
+      'tableUid': tableUid,
       'operation': operation.toString().split('.').last,
       'primaryKeyName': primaryKeyName,
       'primaryKeyValue': primaryKeyValue,
@@ -46,7 +47,7 @@ class TransactionEntry {
         orElse: () => BufferOperationType.insert);
     return TransactionEntry(
       transactionId: json['transactionId'] as String,
-      tableName: json['tableName'] as String,
+      tableUid: TableUid((json['tableUid'] ?? json['tableName']) as String),
       operation: op,
       primaryKeyName: json['primaryKeyName'] as String,
       primaryKeyValue: json['primaryKeyValue'],
@@ -147,14 +148,14 @@ class TransactionMainMeta {
 
 /// Heavy delete plan descriptor for deferred execution at commit time
 class HeavyDeletePlan {
-  final String tableName;
+  final TableUid tableUid;
   final Map<String, dynamic> condition; // normalized QueryCondition.build()
   final List<String>? orderBy;
   final int? limit;
   final int? offset;
 
   const HeavyDeletePlan({
-    required this.tableName,
+    required this.tableUid,
     required this.condition,
     this.orderBy,
     this.limit,
@@ -163,7 +164,7 @@ class HeavyDeletePlan {
 
   Map<String, dynamic> toJson() {
     return {
-      'tableName': tableName,
+      'tableUid': tableUid,
       'condition': condition,
       if (orderBy != null) 'orderBy': orderBy,
       if (limit != null) 'limit': limit,
@@ -173,7 +174,7 @@ class HeavyDeletePlan {
 
   factory HeavyDeletePlan.fromJson(Map<String, dynamic> json) {
     return HeavyDeletePlan(
-      tableName: json['tableName'] as String,
+      tableUid: TableUid((json['tableUid'] ?? json['tableName']) as String),
       condition: (json['condition'] as Map).cast<String, dynamic>(),
       orderBy: (json['orderBy'] as List?)?.cast<String>(),
       limit: (json['limit'] as num?)?.toInt(),
@@ -184,7 +185,7 @@ class HeavyDeletePlan {
 
 /// Heavy update plan descriptor for deferred execution at commit time
 class HeavyUpdatePlan {
-  final String tableName;
+  final TableUid tableUid;
   final Map<String, dynamic> condition; // normalized QueryCondition.build()
   final Map<String, dynamic> updateData; // data to update
   final List<String>? orderBy;
@@ -192,7 +193,7 @@ class HeavyUpdatePlan {
   final int? offset;
 
   const HeavyUpdatePlan({
-    required this.tableName,
+    required this.tableUid,
     required this.condition,
     required this.updateData,
     this.orderBy,
@@ -202,7 +203,7 @@ class HeavyUpdatePlan {
 
   Map<String, dynamic> toJson() {
     return {
-      'tableName': tableName,
+      'tableUid': tableUid,
       'condition': condition,
       'updateData': updateData,
       if (orderBy != null) 'orderBy': orderBy,
@@ -213,7 +214,7 @@ class HeavyUpdatePlan {
 
   factory HeavyUpdatePlan.fromJson(Map<String, dynamic> json) {
     return HeavyUpdatePlan(
-      tableName: json['tableName'] as String,
+      tableUid: TableUid((json['tableUid'] ?? json['tableName']) as String),
       condition: (json['condition'] as Map).cast<String, dynamic>(),
       updateData: (json['updateData'] as Map).cast<String, dynamic>(),
       orderBy: (json['orderBy'] as List?)?.cast<String>(),
