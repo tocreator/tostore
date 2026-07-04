@@ -10,6 +10,7 @@ import '../model/transaction_result.dart';
 import '../model/space_info.dart';
 import '../model/table_info.dart';
 import '../model/table_schema.dart';
+import '../model/query_result.dart';
 import '../model/backup_scope.dart';
 import '../Interface/kv_store.dart';
 import 'status_provider.dart';
@@ -110,6 +111,19 @@ abstract class DataStoreInterface {
 
   /// get table info
   Future<TableInfo?> getTableInfo(String tableName);
+
+  /// get all table names in the current space
+  Future<List<String>> getTableNames();
+
+  /// Perform approximate nearest neighbor (ANN) vector similarity search
+  Future<List<VectorSearchResult>> vectorSearch(
+    String tableName, {
+    required String fieldName,
+    required VectorData queryVector,
+    int topK = 10,
+    int? efSearch,
+    double? distanceThreshold,
+  });
 
   /// switch space
   ///
