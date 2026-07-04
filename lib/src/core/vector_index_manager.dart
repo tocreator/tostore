@@ -11,6 +11,7 @@ import '../model/ngh_index_meta.dart';
 import '../model/parallel_journal_entry.dart';
 import '../model/query_result.dart';
 import '../model/table_schema.dart';
+import '../model/table_context.dart';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
@@ -26,6 +27,7 @@ import 'vector_cache.dart';
 import 'vector_quantizer.dart';
 import 'workload_scheduler.dart';
 import 'yield_controller.dart';
+import '../model/table_identity.dart';
 
 /// Manages all NGH vector indexes for the data store.
 class VectorIndexManager {
@@ -36,7 +38,7 @@ class VectorIndexManager {
   late final VectorCache _vectorCache;
 
   /// In-flight meta loads — prevents parallel readers from each hitting disk.
-  /// Key: "$tableName/$indexName", value: the single in-progress Future.
+  /// Key: "$tableUid/$indexUid", value: the single in-progress Future.
   final Map<String, Future<NghIndexMeta?>> _metaLoadingFutures = {};
 
   VectorIndexManager(this._dataStore) {
@@ -301,7 +303,7 @@ class VectorIndexManager {
   /// Extracts vector fields from records, encodes them, inserts into the
   /// NGH graph, and flushes dirty pages to disk — all batched.
   Future<void> writeChanges({
-    required String tableName,
+    required TableContext table,
     List<Map<String, dynamic>> inserts = const [],
     List<Map<String, dynamic>> deletes = const [],
     BatchContext? batchContext,
@@ -310,7 +312,7 @@ class VectorIndexManager {
     List<IndexSchema>? targetIndexesOverride,
   }) async {
     final schema = schemaOverride ??
-        await _dataStore.schemaManager?.getTableSchema(tableName);
+        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
     if (schema == null) return;
 
     final vectorIndexes = List<IndexSchema>.from(
@@ -329,7 +331,7 @@ class VectorIndexManager {
 
     for (final idx in vectorIndexes) {
       await yc.maybeYield();
-      final indexName = idx.actualIndexName;
+      final indexUid = idx.indexUid;
       final fieldName = idx.fields.first; // vector index is single-field
       FieldSchema? fieldSchema;
       try {
@@ -339,16 +341,16 @@ class VectorIndexManager {
       }
 
       // Load or create meta
-      var meta = await _getOrCreateMeta(
-          tableName, indexName, fieldName, fieldSchema, idx);
+      var meta =
+          await _getOrCreateMeta(table, indexUid, fieldName, fieldSchema, idx);
 
       // Load or train quantizer
-      var quantizer = await _getOrTrainQuantizer(
-          tableName, indexName, meta, inserts, fieldName);
+      var quantizer =
+          await _getOrTrainQuantizer(table, indexUid, meta, inserts, fieldName);
       if (quantizer == null) continue; // not enough data yet
 
       // Ensure mapping B+Tree metas are initialised
-      meta = _ensureMappingMetas(meta, tableName);
+      meta = _ensureMappingMetas(meta, table);
 
       // ── Process inserts ──
       if (inserts.isNotEmpty) {
@@ -372,8 +374,8 @@ class VectorIndexManager {
 
           // Main isolate: graph insert + flush (all NGH file read/write here)
           final insertResult = await _graphEngine.insertBatch(
-            tableName: tableName,
-            indexName: indexName,
+            table: table,
+            indexUid: indexUid,
             meta: meta,
             quantizer: quantizer,
             vectors: vectors,
@@ -382,8 +384,8 @@ class VectorIndexManager {
           );
           meta = insertResult.meta;
           meta = await _partitionManager.writeChanges(
-            tableName: tableName,
-            indexName: indexName,
+            table: table,
+            indexUid: indexUid,
             meta: meta,
             dirtyGraphPages: insertResult.dirtyGraphPages,
             dirtyPqCodePages: insertResult.dirtyPqCodePages,
@@ -394,7 +396,7 @@ class VectorIndexManager {
 
           // Write nodeId ↔ PK dual B+Tree mappings (persistent, not in memory)
           meta = await _writeMappings(
-            tableName: tableName,
+            table: table,
             meta: meta,
             startNodeId: startNodeId,
             pks: pks,
@@ -404,7 +406,7 @@ class VectorIndexManager {
           );
 
           // Persist updated meta
-          await _persistMeta(tableName, indexName, meta);
+          await _persistMeta(table, indexUid, meta);
         }
       }
 
@@ -424,7 +426,7 @@ class VectorIndexManager {
           final record = deletes[di];
           final pk = record[pkName]?.toString();
           if (pk == null) continue;
-          final nodeId = await _lookupNodeIdByPk(tableName, meta, pk);
+          final nodeId = await _lookupNodeIdByPk(table, meta, pk);
           if (nodeId != null) {
             nodeIdsToDelete.add(nodeId);
             deletePks.add(pk);
@@ -433,15 +435,15 @@ class VectorIndexManager {
 
         if (nodeIdsToDelete.isNotEmpty) {
           final result = await _graphEngine.deleteBatch(
-            tableName: tableName,
-            indexName: indexName,
+            table: table,
+            indexUid: indexUid,
             meta: meta,
             nodeIds: nodeIdsToDelete,
           );
 
           // Remove mappings from both B+Trees
           meta = await _writeMappings(
-            tableName: tableName,
+            table: table,
             meta: meta,
             startNodeId: -1,
             pks: deletePks,
@@ -452,8 +454,8 @@ class VectorIndexManager {
           );
 
           meta = await _partitionManager.writeChanges(
-            tableName: tableName,
-            indexName: indexName,
+            table: table,
+            indexUid: indexUid,
             meta: meta,
             dirtyGraphPages: result.dirtyGraphPages,
             dirtyPqCodePages: const {},
@@ -466,8 +468,8 @@ class VectorIndexManager {
       }
 
       // Persist updated meta
-      await _persistMeta(tableName, indexName, meta);
-      _vectorCache.putMeta(tableName, indexName, meta);
+      await _persistMeta(table, indexUid, meta);
+      _vectorCache.putMeta(table, indexUid, meta);
     }
   }
 
@@ -479,7 +481,7 @@ class VectorIndexManager {
   ///
   /// Returns the top-[topK] most similar records, sorted by similarity.
   Future<List<VectorSearchResult>> vectorSearch({
-    required String tableName,
+    required TableContext table,
     required String fieldName,
     required VectorData queryVector,
     int topK = 10,
@@ -487,7 +489,8 @@ class VectorIndexManager {
     double? distanceThreshold,
   }) async {
     // Find the vector index for this field
-    final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+    final schema =
+        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
     if (schema == null) return const [];
 
     final vectorIndexes =
@@ -502,19 +505,19 @@ class VectorIndexManager {
     }
     if (targetIdx == null) return const [];
 
-    final indexName = targetIdx.actualIndexName;
+    final indexUid = targetIdx.indexUid;
 
     // Load meta
-    var meta = _vectorCache.getMeta(tableName, indexName);
-    meta ??= await _loadMeta(tableName, indexName);
+    var meta = _vectorCache.getMeta(table, indexUid);
+    meta ??= await _loadMeta(table, indexUid);
     if (meta == null || meta.totalVectors == 0) return const [];
 
     // Load quantizer
-    final quantizer = await _getQuantizer(tableName, indexName, meta);
+    final quantizer = await _getQuantizer(table, indexUid, meta);
     if (quantizer == null) return const [];
 
     // Lazy full-cache preload in background (maintenance); does not block query
-    _partitionManager.preloadForVectorSearch(tableName, indexName, meta);
+    _partitionManager.preloadForVectorSearch(table, indexUid, meta);
 
     // Prepare query vector
     final queryF32 = _toFloat32(queryVector.values, meta.dimensions);
@@ -542,8 +545,8 @@ class VectorIndexManager {
     List<NghSearchResult> results;
     try {
       results = await _graphEngine.search(
-        tableName: tableName,
-        indexName: indexName,
+        table: table,
+        indexUid: indexUid,
         meta: meta,
         quantizer: quantizer,
         query: searchQuery,
@@ -567,8 +570,8 @@ class VectorIndexManager {
         ? List<String?>.filled(sortedByNode.length, null, growable: false)
         : await _dataStore.indexTreePartitionManager
                 ?.lookupUniquePrimaryKeysBatch(
-              tableName: tableName,
-              indexName: meta.nid2pkIndexName,
+              table: table,
+              indexUid: nid2pk.indexUid,
               meta: nid2pk,
               uniqueKeys: keys,
             ) ??
@@ -599,38 +602,148 @@ class VectorIndexManager {
   // =====================================================================
 
   /// Load meta from disk with coalesce: concurrent callers share a single I/O.
-  Future<NghIndexMeta?> _loadMeta(String tableName, String indexName) {
-    final loadKey = '$tableName/$indexName';
+  Future<NghIndexMeta?> _loadMeta(TableContext table, IndexUid indexUid) {
+    final loadKey = '${table.tableUid}/$indexUid';
     final existing = _metaLoadingFutures[loadKey];
     if (existing != null) return existing;
 
-    final future = _doLoadMeta(tableName, indexName).whenComplete(() {
+    final future = _doLoadMeta(table, indexUid).whenComplete(() {
       _metaLoadingFutures.remove(loadKey);
     });
     _metaLoadingFutures[loadKey] = future;
     return future;
   }
 
-  Future<NghIndexMeta?> _doLoadMeta(String tableName, String indexName) async {
+  Future<NghIndexMeta?> _doLoadMeta(
+      TableContext table, IndexUid indexUid) async {
     try {
-      final path =
-          await _dataStore.pathManager.getNghMetaPath(tableName, indexName);
-      final content = await _dataStore.storage.readAsString(path);
-      if (content == null || content.isEmpty) return null;
-      final json = jsonDecode(content) as Map<String, dynamic>;
-      final meta = NghIndexMeta.fromJson(json);
-      _vectorCache.putMeta(tableName, indexName, meta);
-      return meta;
-    } catch (_) {
+      // Hot path: read stable uid layout only (single I/O).
+      var diskLoad = await _readNghMetaFromDisk(table, indexUid);
+      var loadedFromLegacyPath = false;
+
+      if (diskLoad == null) {
+        // Stable meta missing — fall back to deprecated logical-name directory.
+        final idx = _dataStore.schemaManager
+            ?.findIndexSchemaByUid(table.schema, indexUid);
+        final schemaLegacyName = idx?.actualIndexName;
+        if (schemaLegacyName != null &&
+            schemaLegacyName.isNotEmpty &&
+            schemaLegacyName != indexUid.value) {
+          diskLoad =
+              await _readNghMetaFromDisk(table, IndexUid(schemaLegacyName));
+          loadedFromLegacyPath = diskLoad != null;
+        }
+      }
+
+      if (diskLoad == null) return null;
+
+      final needsRepair = loadedFromLegacyPath ||
+          NghIndexMeta.needsOnDiskRepair(
+            meta: diskLoad.meta,
+            expectedIndexUid: indexUid,
+            hadLegacyDisplayFields: diskLoad.hadLegacyDisplayFields,
+          );
+
+      if (needsRepair) {
+        var legacyLogicalName = NghIndexMeta.inferLegacyLogicalName(
+          meta: diskLoad.meta,
+          expectedIndexUid: indexUid,
+          legacyNameFromJson: diskLoad.legacyLogicalNameFromJson,
+        );
+        if (loadedFromLegacyPath &&
+            (legacyLogicalName == null || legacyLogicalName.isEmpty)) {
+          legacyLogicalName = _dataStore.schemaManager
+              ?.findIndexSchemaByUid(table.schema, indexUid)
+              ?.actualIndexName;
+        }
+        if (legacyLogicalName != null &&
+            legacyLogicalName.isNotEmpty &&
+            legacyLogicalName != indexUid.value) {
+          await _dataStore.indexManager?.ensureStableIndexLayoutOnLoad(
+            table,
+            indexUid: indexUid,
+            legacyLogicalName: legacyLogicalName,
+          );
+          if (loadedFromLegacyPath) {
+            diskLoad = await _readNghMetaFromDisk(table, indexUid) ?? diskLoad;
+          }
+        }
+      }
+
+      final reconciled = _reconcileLoadedNghMeta(diskLoad.meta, indexUid);
+      if (reconciled != diskLoad.meta || diskLoad.hadLegacyDisplayFields) {
+        await _persistMeta(table, indexUid, reconciled);
+      }
+      _vectorCache.putMeta(table, indexUid, reconciled);
+      return reconciled;
+    } catch (e) {
+      Logger.warn('Failed to load NGH meta for $indexUid', rawError: e);
       return null;
     }
   }
 
+  Future<
+      ({
+        NghIndexMeta meta,
+        String? legacyLogicalNameFromJson,
+        bool hadLegacyDisplayFields,
+      })?> _readNghMetaFromDisk(
+      TableContext table, IndexUid pathKey) async {
+    final path =
+        await _dataStore.pathManager.getNghMetaPath(table.tableUid, pathKey);
+    if (!await _dataStore.storage.existsFile(path)) {
+      return null;
+    }
+    final content = await _dataStore.storage.readAsString(path);
+    if (content == null || content.isEmpty) return null;
+    final json = jsonDecode(content) as Map<String, dynamic>;
+    return (
+      meta: NghIndexMeta.fromJson(json),
+      legacyLogicalNameFromJson: NghIndexMeta.legacyLogicalNameFromJson(json),
+      hadLegacyDisplayFields: NghIndexMeta.hasLegacyDisplayFieldsInJson(json),
+    );
+  }
+
+  /// Align in-memory meta with stable [pathKey] and derived mapping uids.
+  NghIndexMeta _reconcileLoadedNghMeta(NghIndexMeta meta, IndexUid pathKey) {
+    var reconciled = meta;
+    if (pathKey.isNotEmpty && reconciled.indexUid != pathKey) {
+      reconciled = reconciled.copyWith(indexUid: pathKey);
+    }
+
+    IndexMeta? nid2pk = reconciled.nodeIdToPkMeta;
+    IndexMeta? pk2nid = reconciled.pkToNodeIdMeta;
+    final expectedNid2pk = reconciled.nid2pkIndexUid;
+    final expectedPk2nid = reconciled.pk2nidIndexUid;
+
+    if (nid2pk != null && nid2pk.indexUid != expectedNid2pk) {
+      nid2pk = nid2pk.copyWith(
+        indexUid: expectedNid2pk,
+        tableUid: reconciled.tableUid,
+      );
+    }
+    if (pk2nid != null && pk2nid.indexUid != expectedPk2nid) {
+      pk2nid = pk2nid.copyWith(
+        indexUid: expectedPk2nid,
+        tableUid: reconciled.tableUid,
+      );
+    }
+
+    if (nid2pk != reconciled.nodeIdToPkMeta ||
+        pk2nid != reconciled.pkToNodeIdMeta) {
+      reconciled = reconciled.copyWith(
+        nodeIdToPkMeta: nid2pk,
+        pkToNodeIdMeta: pk2nid,
+      );
+    }
+    return reconciled;
+  }
+
   Future<void> _persistMeta(
-      String tableName, String indexName, NghIndexMeta meta) async {
+      TableContext table, IndexUid indexUid, NghIndexMeta meta) async {
     try {
       final path =
-          await _dataStore.pathManager.getNghMetaPath(tableName, indexName);
+          await _dataStore.pathManager.getNghMetaPath(table.tableUid, indexUid);
       final content = jsonEncode(meta.toJson());
       await _dataStore.storage.writeAsString(path, content, flush: false);
     } catch (e) {
@@ -639,20 +752,20 @@ class VectorIndexManager {
   }
 
   Future<NghIndexMeta> _getOrCreateMeta(
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
     String fieldName,
     FieldSchema fieldSchema,
     IndexSchema idx,
   ) async {
     // Check cache
-    var meta = _vectorCache.getMeta(tableName, indexName);
+    var meta = _vectorCache.getMeta(table, indexUid);
     if (meta != null) return meta;
 
     // Try load from disk
-    meta = await _loadMeta(tableName, indexName);
+    meta = await _loadMeta(table, indexUid);
     if (meta != null) {
-      _vectorCache.putMeta(tableName, indexName, meta);
+      _vectorCache.putMeta(table, indexUid, meta);
       return meta;
     }
 
@@ -661,9 +774,8 @@ class VectorIndexManager {
     final vc = idx.vectorConfig;
 
     meta = NghIndexMeta.createEmpty(
-      name: indexName,
-      tableName: tableName,
-      fieldName: fieldName,
+      indexUid: indexUid,
+      tableUid: table.tableUid,
       dimensions: dims,
       distanceMetric: vc?.distanceMetric ?? VectorDistanceMetric.cosine,
       precision: fieldSchema.vectorConfig?.precision ?? VectorPrecision.float32,
@@ -675,7 +787,7 @@ class VectorIndexManager {
       maxPartitionFileSize: _dataStore.config.maxPartitionFileSize,
     );
 
-    _vectorCache.putMeta(tableName, indexName, meta);
+    _vectorCache.putMeta(table, indexUid, meta);
     return meta;
   }
 
@@ -684,14 +796,14 @@ class VectorIndexManager {
   // =====================================================================
 
   Future<VectorQuantizer?> _getQuantizer(
-      String tableName, String indexName, NghIndexMeta meta) async {
+      TableContext table, IndexUid indexUid, NghIndexMeta meta) async {
     // Check codebook cache
-    var pqCodebook = _vectorCache.getCodebook(tableName, indexName);
+    var pqCodebook = _vectorCache.getCodebook(table, indexUid);
 
     if (pqCodebook == null) {
       // Load from disk
       final cbPage = await _partitionManager.readCodebook(
-          tableName, indexName, meta.nghPageSize);
+          table, indexUid, meta.nghPageSize);
       if (cbPage == null) return null;
 
       pqCodebook = PqCodebook(
@@ -700,7 +812,7 @@ class VectorIndexManager {
         subDimensions: cbPage.subspaceDimensions,
         data: cbPage.centroids,
       );
-      _vectorCache.putCodebook(tableName, indexName, pqCodebook);
+      _vectorCache.putCodebook(table, indexUid, pqCodebook);
     }
 
     final quantizer = VectorQuantizer(pqCodebook);
@@ -710,7 +822,7 @@ class VectorIndexManager {
       return quantizer;
     }
 
-    Logger.warn('Existing quantizer mismatch for $indexName: '
+    Logger.warn('Existing quantizer mismatch for $indexUid: '
         'loaded(${quantizer.dimensions}d, ${quantizer.subspaces}m) != '
         'meta(${meta.dimensions}d, ${meta.pqSubspaces}m). '
         'Retraining might be required.');
@@ -719,14 +831,14 @@ class VectorIndexManager {
   }
 
   Future<VectorQuantizer?> _getOrTrainQuantizer(
-    String tableName,
-    String indexName,
+    TableContext table,
+    IndexUid indexUid,
     NghIndexMeta meta,
     List<Map<String, dynamic>> inserts,
     String fieldName,
   ) async {
     // Try cached/loaded first (returns null on mismatch)
-    final existing = await _getQuantizer(tableName, indexName, meta);
+    final existing = await _getQuantizer(table, indexUid, meta);
     if (existing != null) {
       return existing;
     }
@@ -862,9 +974,9 @@ class VectorIndexManager {
       centroids: codebook.data,
     );
     await _partitionManager.writeCodebook(
-        tableName, indexName, cbPage, meta.nghPageSize);
+        table, indexUid, cbPage, meta.nghPageSize);
 
-    _vectorCache.putCodebook(tableName, indexName, codebook);
+    _vectorCache.putCodebook(table, indexUid, codebook);
     return VectorQuantizer(codebook);
   }
 
@@ -877,10 +989,10 @@ class VectorIndexManager {
   /// Repairs graph edges around deleted nodes and reclaims tombstone slots.
   /// Should be called periodically by the compaction manager, using
   /// [WorkloadType.maintenance] tokens.
-  Future<void> compactTombstones(String tableName,
+  Future<void> compactTombstones(TableContext table,
       {int maxVisitedPages = 100}) async {
-    final vectorIndexes =
-        await _dataStore.schemaManager?.getVectorIndexesForTable(tableName);
+    final vectorIndexes = await _dataStore.schemaManager
+        ?.getVectorIndexesForTable(table.tableUid);
     if (vectorIndexes == null || vectorIndexes.isEmpty) return;
 
     final yc = YieldController(
@@ -890,9 +1002,9 @@ class VectorIndexManager {
     );
     for (final idx in vectorIndexes) {
       await yc.maybeYield();
-      final indexName = idx.actualIndexName;
-      var meta = _vectorCache.getMeta(tableName, indexName);
-      meta ??= await _loadMeta(tableName, indexName);
+      final indexUid = idx.indexUid;
+      var meta = _vectorCache.getMeta(table, indexUid);
+      meta ??= await _loadMeta(table, indexUid);
       if (meta == null) continue;
 
       // Skip if deletion ratio is low (< 10%)
@@ -902,24 +1014,24 @@ class VectorIndexManager {
       }
 
       final result = await _graphEngine.compactTombstones(
-        tableName: tableName,
-        indexName: indexName,
+        table: table,
+        indexUid: indexUid,
         meta: meta,
         maxVisitedPages: maxVisitedPages,
       );
 
       if (result.dirtyGraphPages.isNotEmpty) {
         meta = await _partitionManager.writeChanges(
-          tableName: tableName,
-          indexName: indexName,
+          table: table,
+          indexUid: indexUid,
           meta: meta,
           dirtyGraphPages: result.dirtyGraphPages,
           dirtyPqCodePages: const {},
           dirtyRawVectorPages: const {},
           deletedDelta: -result.compactedCount,
         );
-        await _persistMeta(tableName, indexName, meta);
-        _vectorCache.putMeta(tableName, indexName, meta);
+        await _persistMeta(table, indexUid, meta);
+        _vectorCache.putMeta(table, indexUid, meta);
       }
     }
   }
@@ -932,9 +1044,9 @@ class VectorIndexManager {
   /// (e.g. after large bulk imports) using [WorkloadType.maintenance] tokens.
   ///
   /// Returns `true` if reordering was performed.
-  Future<bool> reorderByLocality(String tableName, String indexName) async {
-    var meta = _vectorCache.getMeta(tableName, indexName);
-    meta ??= await _loadMeta(tableName, indexName);
+  Future<bool> reorderByLocality(TableContext table, IndexUid indexUid) async {
+    var meta = _vectorCache.getMeta(table, indexUid);
+    meta ??= await _loadMeta(table, indexUid);
     if (meta == null || meta.totalVectors < 2 || meta.medoidNodeId < 0) {
       return false;
     }
@@ -966,7 +1078,7 @@ class VectorIndexManager {
       bfsOrder.add(current);
 
       final neighbors =
-          await _loadNeighborsForReorder(tableName, indexName, meta, current);
+          await _loadNeighborsForReorder(table, indexUid, meta, current);
       if (neighbors == null) continue;
       for (int i = 0; i < neighbors.length; i++) {
         final nId = neighbors[i];
@@ -1011,7 +1123,7 @@ class VectorIndexManager {
       final oldPage = meta.graphLocalPageForNode(oldId);
       final oldSlot = meta.graphSlotForNode(oldId);
       final oldGraphPage = await _partitionManager.readGraphPage(
-          tableName, indexName, meta, oldPartition, oldPage,
+          table, indexUid, meta, oldPartition, oldPage,
           localCache: localGraphCache);
 
       final node = oldSlot < oldGraphPage.slots.length
@@ -1053,7 +1165,7 @@ class VectorIndexManager {
       final oldPqPage = meta.pqLocalPageForNode(oldId);
       final oldPqSlot = meta.pqSlotForNode(oldId);
       final oldPqCodePage = await _partitionManager.readPqCodePage(
-          tableName, indexName, meta, oldPqPartition, oldPqPage,
+          table, indexUid, meta, oldPqPartition, oldPqPage,
           localCache: localPqCache);
       final pqCode = oldPqCodePage.getCode(oldPqSlot);
 
@@ -1074,7 +1186,7 @@ class VectorIndexManager {
       final oldRawPage = meta.rawVectorLocalPageForNode(oldId);
       final oldRawSlot = meta.rawVectorSlotForNode(oldId);
       final oldRawVecPage = await _partitionManager.readRawVectorPage(
-          tableName, indexName, meta, oldRawPartition, oldRawPage);
+          table, indexUid, meta, oldRawPartition, oldRawPage);
       final rawVec = oldRawVecPage.getVectorAsFloat32(oldRawSlot);
 
       final newRawPartition = meta.rawVectorPartitionForNode(newId);
@@ -1103,8 +1215,8 @@ class VectorIndexManager {
     );
 
     meta = await _partitionManager.writeChanges(
-      tableName: tableName,
-      indexName: indexName,
+      table: table,
+      indexUid: indexUid,
       meta: meta,
       dirtyGraphPages: dirtyGraph,
       dirtyPqCodePages: dirtyPq,
@@ -1113,7 +1225,7 @@ class VectorIndexManager {
 
     // Phase 5: Rebuild nodeId ↔ PK mapping with new IDs
     // Requires reading old mappings and writing new ones
-    meta = _ensureMappingMetas(meta, tableName);
+    meta = _ensureMappingMetas(meta, table);
     final nid2pkDeltas = <DataBlockEntry>[];
     final pk2nidDeltas = <DataBlockEntry>[];
 
@@ -1123,7 +1235,7 @@ class VectorIndexManager {
       if (oldToNew[oldId] < 0) continue;
 
       // Read old PK
-      final pk = await _lookupPkByNodeId(tableName, meta, oldId);
+      final pk = await _lookupPkByNodeId(table, meta, oldId);
       if (pk == null) continue;
 
       // Delete old mappings
@@ -1141,34 +1253,34 @@ class VectorIndexManager {
 
     if (nid2pkDeltas.isNotEmpty) {
       await _dataStore.indexTreePartitionManager?.writeChanges(
-        tableName: tableName,
-        indexName: meta.nid2pkIndexName,
+        table: table,
+        indexUid: meta.nodeIdToPkMeta!.indexUid,
         indexMeta: meta.nodeIdToPkMeta!,
         deltas: nid2pkDeltas,
       );
       await _dataStore.indexTreePartitionManager?.writeChanges(
-        tableName: tableName,
-        indexName: meta.pk2nidIndexName,
+        table: table,
+        indexUid: meta.pkToNodeIdMeta!.indexUid,
         indexMeta: meta.pkToNodeIdMeta!,
         deltas: pk2nidDeltas,
       );
     }
 
-    await _persistMeta(tableName, indexName, meta);
-    _vectorCache.putMeta(tableName, indexName, meta);
-    _partitionManager.clearFullyCachedForIndex(tableName, indexName);
-    _partitionManager.clearPageCacheForIndex(tableName, indexName);
+    await _persistMeta(table, indexUid, meta);
+    _vectorCache.putMeta(table, indexUid, meta);
+    _partitionManager.clearFullyCachedForIndex(table.tableUid, indexUid);
+    _partitionManager.clearPageCacheForIndex(table.tableUid, indexUid);
     return true;
   }
 
   /// Helper: load neighbors for reorder (bypasses deletion check).
-  Future<Uint32List?> _loadNeighborsForReorder(
-      String tableName, String indexName, NghIndexMeta meta, int nodeId) async {
+  Future<Uint32List?> _loadNeighborsForReorder(TableContext table,
+      IndexUid indexUid, NghIndexMeta meta, int nodeId) async {
     final partitionNo = meta.graphPartitionForNode(nodeId);
     final pageNo = meta.graphLocalPageForNode(nodeId);
     final slot = meta.graphSlotForNode(nodeId);
     final page = await _partitionManager.readGraphPage(
-        tableName, indexName, meta, partitionNo, pageNo);
+        table, indexUid, meta, partitionNo, pageNo);
     if (slot >= page.slots.length) return null;
     final node = page.slots[slot];
     if (node.isDeleted || node.actualDegree == 0) return null;
@@ -1192,16 +1304,16 @@ class VectorIndexManager {
   }
 
   /// Clear all caches for a table.
-  void clearCacheForTable(String tableName) {
-    _vectorCache.clearForTable(tableName);
-    _partitionManager.clearPageCacheForTable(tableName);
+  void clearCacheForTable(TableUid tableUid) {
+    _vectorCache.clearForTable(tableUid);
+    _partitionManager.clearPageCacheForTable(tableUid);
   }
 
   /// Clear all caches for a specific index.
-  void clearCacheForIndex(String tableName, String indexName) {
-    _vectorCache.clearForIndex(tableName, indexName);
-    _partitionManager.clearFullyCachedForIndex(tableName, indexName);
-    _partitionManager.clearPageCacheForIndex(tableName, indexName);
+  void clearCacheForIndex(TableUid tableUid, IndexUid indexUid) {
+    _vectorCache.clearForIndex(tableUid, indexUid);
+    _partitionManager.clearFullyCachedForIndex(tableUid, indexUid);
+    _partitionManager.clearPageCacheForIndex(tableUid, indexUid);
   }
 
   /// Clear all caches.
@@ -1223,16 +1335,15 @@ class VectorIndexManager {
   // =====================================================================
 
   /// Ensure mapping B+Tree IndexMeta objects exist in [meta].
-  NghIndexMeta _ensureMappingMetas(NghIndexMeta meta, String tableName) {
+  NghIndexMeta _ensureMappingMetas(NghIndexMeta meta, TableContext table) {
     bool changed = false;
     IndexMeta? nid2pk = meta.nodeIdToPkMeta;
     IndexMeta? pk2nid = meta.pkToNodeIdMeta;
-    final tableUid =
-        _dataStore.schemaManager?.getUidByName(tableName) ?? tableName;
+    final tableUid = table.tableUid;
 
     if (nid2pk == null) {
       nid2pk = IndexMeta.createEmpty(
-        indexUid: meta.nid2pkIndexName,
+        indexUid: meta.nid2pkIndexUid,
         tableUid: tableUid,
         isUnique: true,
       );
@@ -1240,7 +1351,7 @@ class VectorIndexManager {
     }
     if (pk2nid == null) {
       pk2nid = IndexMeta.createEmpty(
-        indexUid: meta.pk2nidIndexName,
+        indexUid: meta.pk2nidIndexUid,
         tableUid: tableUid,
         isUnique: true,
       );
@@ -1257,7 +1368,7 @@ class VectorIndexManager {
   /// For inserts: [startNodeId] is the first allocated nodeId, [pks] aligned.
   /// For deletes: [deleteNodeIds] and [pks] aligned; [startNodeId] is ignored.
   Future<NghIndexMeta> _writeMappings({
-    required String tableName,
+    required TableContext table,
     required NghIndexMeta meta,
     required int startNodeId,
     required List<String> pks,
@@ -1302,8 +1413,8 @@ class VectorIndexManager {
 
     await Future.wait([
       _dataStore.indexTreePartitionManager?.writeChanges(
-            tableName: tableName,
-            indexName: meta.nid2pkIndexName,
+            table: table,
+            indexUid: nid2pkMeta.indexUid,
             indexMeta: nid2pkMeta,
             deltas: nid2pkDeltas,
             batchContext: batchContext,
@@ -1311,8 +1422,8 @@ class VectorIndexManager {
           ) ??
           Future.value(),
       _dataStore.indexTreePartitionManager?.writeChanges(
-            tableName: tableName,
-            indexName: meta.pk2nidIndexName,
+            table: table,
+            indexUid: pk2nidMeta.indexUid,
             indexMeta: pk2nidMeta,
             deltas: pk2nidDeltas,
             batchContext: batchContext,
@@ -1323,9 +1434,9 @@ class VectorIndexManager {
 
     // Re-read the updated metas in parallel
     final metaResults = await Future.wait([
-      _dataStore.indexManager?.getIndexMeta(tableName, meta.nid2pkIndexName) ??
+      _dataStore.indexManager?.getIndexMeta(table, meta.nid2pkIndexUid) ??
           Future.value(nid2pkMeta),
-      _dataStore.indexManager?.getIndexMeta(tableName, meta.pk2nidIndexName) ??
+      _dataStore.indexManager?.getIndexMeta(table, meta.pk2nidIndexUid) ??
           Future.value(pk2nidMeta),
     ]);
     nid2pkMeta = metaResults[0] ?? nid2pkMeta;
@@ -1336,13 +1447,13 @@ class VectorIndexManager {
   }
 
   Future<String?> _lookupPkByNodeId(
-      String tableName, NghIndexMeta meta, int nodeId) async {
+      TableContext table, NghIndexMeta meta, int nodeId) async {
     final nid2pk = meta.nodeIdToPkMeta;
     if (nid2pk == null || nid2pk.btreeFirstLeaf.isNull) return null;
     final pk =
         await _dataStore.indexTreePartitionManager?.lookupUniquePrimaryKey(
-      tableName: tableName,
-      indexName: meta.nid2pkIndexName,
+      table: table,
+      indexUid: nid2pk.indexUid,
       meta: nid2pk,
       uniqueKey: _encodeNodeIdKey(nodeId),
     );
@@ -1351,13 +1462,13 @@ class VectorIndexManager {
 
   /// Look up nodeId by PK via the reverse B+Tree (disk, with LRU page cache).
   Future<int?> _lookupNodeIdByPk(
-      String tableName, NghIndexMeta meta, String pk) async {
+      TableContext table, NghIndexMeta meta, String pk) async {
     final pk2nid = meta.pkToNodeIdMeta;
     if (pk2nid == null || pk2nid.btreeFirstLeaf.isNull) return null;
     final result =
         await _dataStore.indexTreePartitionManager?.lookupUniquePrimaryKey(
-      tableName: tableName,
-      indexName: meta.pk2nidIndexName,
+      table: table,
+      indexUid: pk2nid.indexUid,
       meta: pk2nid,
       uniqueKey: MemComparableKey.encodeTextLex(pk),
     );
