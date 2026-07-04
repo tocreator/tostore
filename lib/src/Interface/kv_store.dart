@@ -349,6 +349,7 @@ class KvStore {
   Future<int> count({bool isGlobal = false}) async {
     await _db.ensureInitialized();
     final tableName = _getTableName(isGlobal);
-    return await _db.tableDataManager.getTableRecordCount(tableName);
+    final table = await _db.getTableContext(tableName);
+    return await _db.tableDataManager.getTableRecordCount(table);
   }
 }
