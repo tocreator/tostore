@@ -1,3 +1,4 @@
+import 'table_identity.dart';
 import 'table_schema.dart';
 
 class SystemTable {
@@ -16,6 +17,9 @@ class SystemTable {
   static const String keyValueUpdatedAtField = 'updated_at';
   static const String keyValueExpiresAtField = 'expires_at';
   static const String keyValueExpiryIndexName = '_system_kv_expiry';
+
+  /// Stable uid for the engine-managed KV expiry index (immutable across renames).
+  static const IndexUid keyValueExpiryIndexUid = IndexUid('i_sys_kv_expiry');
 
   /// get key-value store table name
   static String getKeyValueName(bool isGlobal) {
