@@ -1,6 +1,7 @@
 import '../handler/common.dart';
 import '../core/ngh_page.dart';
 import 'meta_info.dart';
+import 'table_identity.dart';
 import 'table_schema.dart';
 
 // ============================================================================
@@ -16,14 +17,14 @@ class NghIndexMeta {
   /// Metadata format version for forward-compatibility.
   final int version;
 
-  /// Index name (matches [IndexSchema.actualIndexName]).
-  final String name;
+  /// Stable index uid for NGH paths, caches, and mapping B+Tree directories.
+  ///
+  /// Required for all instances. [fromJson] may synthesize a legacy value from
+  /// the deprecated on-disk `name` field when loading pre-uid files.
+  final IndexUid indexUid;
 
-  /// Owning table name.
-  final String tableName;
-
-  /// The vector field this index covers.
-  final String fieldName;
+  /// Owning table unique identifier.
+  final TableUid tableUid;
 
   /// Vector dimensionality (128–4096).
   final int dimensions;
@@ -105,18 +106,18 @@ class NghIndexMeta {
   // ===================== nodeId ↔ PK B+Tree Mapping ============
 
   /// B+Tree index meta for nodeId → PK forward lookup.
-  /// Stored as a standard B+Tree index under virtual name `{name}__nid2pk`.
+  /// Stored under [nid2pkIndexUid] (derived from [indexUid]).
   final IndexMeta? nodeIdToPkMeta;
 
   /// B+Tree index meta for PK → nodeId reverse lookup.
-  /// Stored as a standard B+Tree index under virtual name `{name}__pk2nid`.
+  /// Stored under [pk2nidIndexUid] (derived from [indexUid]).
   final IndexMeta? pkToNodeIdMeta;
 
-  /// Virtual index name for forward mapping B+Tree.
-  String get nid2pkIndexName => '${name}__nid2pk';
+  /// Stable virtual B+Tree uid for nodeId → PK mapping.
+  IndexUid get nid2pkIndexUid => IndexUid('${indexUid.value}__nid2pk');
 
-  /// Virtual index name for reverse mapping B+Tree.
-  String get pk2nidIndexName => '${name}__pk2nid';
+  /// Stable virtual B+Tree uid for PK → nodeId mapping.
+  IndexUid get pk2nidIndexUid => IndexUid('${indexUid.value}__pk2nid');
 
   // ===================== Free-List State ======================
 
@@ -185,9 +186,8 @@ class NghIndexMeta {
 
   NghIndexMeta({
     int? version,
-    required this.name,
-    required this.tableName,
-    required this.fieldName,
+    required this.indexUid,
+    required this.tableUid,
     required this.dimensions,
     required this.distanceMetric,
     required this.precision,
@@ -243,9 +243,8 @@ class NghIndexMeta {
 
   /// Create an initial empty [NghIndexMeta] with sane defaults.
   static NghIndexMeta createEmpty({
-    required String name,
-    required String tableName,
-    required String fieldName,
+    required IndexUid indexUid,
+    required TableUid tableUid,
     required int dimensions,
     VectorDistanceMetric distanceMetric = VectorDistanceMetric.cosine,
     VectorPrecision precision = VectorPrecision.float32,
@@ -261,9 +260,8 @@ class NghIndexMeta {
     final ts = now ?? DateTime.now();
     final m = pqSubspaces ?? autoPqSubspaces(dimensions);
     return NghIndexMeta(
-      name: name,
-      tableName: tableName,
-      fieldName: fieldName,
+      indexUid: indexUid,
+      tableUid: tableUid,
       dimensions: dimensions,
       distanceMetric: distanceMetric,
       precision: precision,
@@ -282,9 +280,8 @@ class NghIndexMeta {
 
   NghIndexMeta copyWith({
     int? version,
-    String? name,
-    String? tableName,
-    String? fieldName,
+    IndexUid? indexUid,
+    TableUid? tableUid,
     int? dimensions,
     VectorDistanceMetric? distanceMetric,
     VectorPrecision? precision,
@@ -317,9 +314,8 @@ class NghIndexMeta {
   }) {
     return NghIndexMeta(
       version: version ?? this.version,
-      name: name ?? this.name,
-      tableName: tableName ?? this.tableName,
-      fieldName: fieldName ?? this.fieldName,
+      indexUid: indexUid ?? this.indexUid,
+      tableUid: tableUid ?? this.tableUid,
       dimensions: dimensions ?? this.dimensions,
       distanceMetric: distanceMetric ?? this.distanceMetric,
       precision: precision ?? this.precision,
@@ -359,9 +355,8 @@ class NghIndexMeta {
   factory NghIndexMeta.fromJson(Map<String, dynamic> json) {
     return NghIndexMeta(
       version: (json['version'] as num?)?.toInt(),
-      name: json['name'] as String,
-      tableName: json['tableName'] as String,
-      fieldName: json['fieldName'] as String,
+      indexUid: _indexUidFromJson(json),
+      tableUid: TableUid((json['tableUid'] ?? json['tableName']) as String),
       dimensions: (json['dimensions'] as num).toInt(),
       distanceMetric: _parseDistanceMetric(json['distanceMetric'] as String?),
       precision: _parsePrecision(json['precision'] as String?),
@@ -410,9 +405,8 @@ class NghIndexMeta {
   Map<String, dynamic> toJson() {
     return {
       'version': version,
-      'name': name,
-      'tableName': tableName,
-      'fieldName': fieldName,
+      'indexUid': indexUid,
+      'tableUid': tableUid,
       'dimensions': dimensions,
       'distanceMetric': distanceMetric.name,
       'precision': precision.name,
@@ -528,8 +522,101 @@ class NghIndexMeta {
 
   @override
   String toString() =>
-      'NghIndexMeta(name: $name, table: $tableName, field: $fieldName, '
-      'dim: $dimensions, vectors: $totalVectors, deleted: $deletedCount, '
-      'graphPartitions: $graphPartitionCount, '
+      'NghIndexMeta(uid: $indexUid, table: $tableUid, '
+      'dim: $dimensions, vectors: $totalVectors, '
+      'deleted: $deletedCount, graphPartitions: $graphPartitionCount, '
       'pqTrained: $pqTrained, medoid: $medoidNodeId)';
+
+  /// Legacy logical index name from deprecated on-disk `name` (migration only).
+  static String? legacyLogicalNameFromJson(Map<String, dynamic> json) {
+    final legacy = json['name'] as String?;
+    if (legacy != null && legacy.isNotEmpty) return legacy;
+    return null;
+  }
+
+  /// Whether on-disk JSON still carries deprecated display fields.
+  static bool hasLegacyDisplayFieldsInJson(Map<String, dynamic> json) {
+    return json.containsKey('name') || json.containsKey('fieldName');
+  }
+
+  /// True when persisted meta still needs uid/layout repair (not for hot-path loads).
+  static bool needsOnDiskRepair({
+    required NghIndexMeta meta,
+    required IndexUid expectedIndexUid,
+    required bool hadLegacyDisplayFields,
+  }) {
+    if (hadLegacyDisplayFields) return true;
+    if (expectedIndexUid.isNotEmpty && meta.indexUid != expectedIndexUid) {
+      return true;
+    }
+    return hasLegacyMappingIndexUids(meta);
+  }
+
+  /// Nested mapping B+Tree uids still keyed by a legacy logical base name.
+  static bool hasLegacyMappingIndexUids(NghIndexMeta meta) {
+    final nid = meta.nodeIdToPkMeta;
+    if (nid != null && nid.indexUid != meta.nid2pkIndexUid) {
+      return true;
+    }
+    final pk = meta.pkToNodeIdMeta;
+    if (pk != null && pk.indexUid != meta.pk2nidIndexUid) {
+      return true;
+    }
+    return false;
+  }
+
+  /// Infer the on-disk legacy directory base name for one-time layout repair.
+  static String? inferLegacyLogicalName({
+    required NghIndexMeta meta,
+    required IndexUid expectedIndexUid,
+    String? legacyNameFromJson,
+  }) {
+    if (legacyNameFromJson != null &&
+        legacyNameFromJson.isNotEmpty &&
+        legacyNameFromJson != expectedIndexUid.value) {
+      return legacyNameFromJson;
+    }
+    final fromNid = _legacyBaseFromMappingUid(
+      meta.nodeIdToPkMeta?.indexUid.value,
+      expectedIndexUid.value,
+    );
+    if (fromNid != null) return fromNid;
+    final fromPk = _legacyBaseFromMappingUid(
+      meta.pkToNodeIdMeta?.indexUid.value,
+      expectedIndexUid.value,
+    );
+    if (fromPk != null) return fromPk;
+    if (meta.indexUid.isNotEmpty &&
+        meta.indexUid != expectedIndexUid &&
+        !meta.indexUid.looksLikeStableUid) {
+      return meta.indexUid.value;
+    }
+    return null;
+  }
+
+  static String? _legacyBaseFromMappingUid(
+    String? mappingUid,
+    String stableIndexUid,
+  ) {
+    if (mappingUid == null || mappingUid.isEmpty) return null;
+    for (final suffix in ['__nid2pk', '__pk2nid']) {
+      if (!mappingUid.endsWith(suffix)) continue;
+      final base = mappingUid.substring(0, mappingUid.length - suffix.length);
+      if (base.isNotEmpty && base != stableIndexUid) return base;
+    }
+    return null;
+  }
+
+  /// Parse stable uid from JSON, falling back to legacy `name` for old files.
+  static IndexUid _indexUidFromJson(Map<String, dynamic> json) {
+    final parsed = IndexUid.tryParse(json['indexUid'] as String?);
+    if (parsed != null && parsed.isNotEmpty) {
+      return parsed;
+    }
+    final legacyName = json['name'] as String?;
+    if (legacyName != null && legacyName.isNotEmpty) {
+      return IndexUid(legacyName);
+    }
+    return IndexUid.empty;
+  }
 }
