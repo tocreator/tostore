@@ -23,6 +23,8 @@ import '../model/join_clause.dart';
 import '../model/query_aggregation.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
+import '../model/table_context.dart';
+import '../model/table_identity.dart';
 import '../model/table_schema.dart';
 import 'query_cache.dart';
 import 'query_condition.dart';
@@ -51,6 +53,19 @@ class QueryExecutor {
     );
   }
 
+  TableContext _tableContextFromSchema(TableSchema schema,
+      [String? tableName]) {
+    final name = tableName ?? schema.name;
+    final uid = schema.tableUid.isNotEmpty ? schema.tableUid : name;
+    return TableContext(
+      tableUid: TableUid(uid),
+      tableName: TableName(name),
+      isGlobal: schema.isGlobal,
+      dataDirIndex: 0,
+      schema: schema,
+    );
+  }
+
   /// Execute query with optional cursor/keyset pagination.
   ///
   /// - When [cursor] is provided, cursor pagination is used (mutually exclusive with [offset]).
@@ -62,7 +77,7 @@ class QueryExecutor {
   ///   - UNION/OR plans
   ///   - JOINs (cursor semantics become ambiguous due to row multiplication)
   Future<ExecuteResult> execute(
-    String tableName, {
+    TableContext table, {
     QueryCondition? condition,
     List<String>? orderBy,
     int? limit,
@@ -87,17 +102,15 @@ class QueryExecutor {
       ]);
     }
 
-    final schema = await schemaMgr.getTableSchema(tableName);
-    if (schema == null) {
-      Logger.error('Table $tableName not found, cannot execute query.');
-      return const ExecuteResult.empty();
-    }
+    final tableName = table.tableName;
+    final schema = table.schema;
 
     final schemas = <String, TableSchema>{tableName: schema};
     if (condition != null && !condition.isEmpty) {
       if (joins != null && joins.isNotEmpty) {
         for (final join in joins) {
-          final joinSchema = await schemaMgr.getTableSchema(join.table);
+          final joinSchema =
+              await schemaMgr.getTableSchemaByName(TableName(join.table));
           if (joinSchema != null) {
             schemas[join.table] = joinSchema;
           }
@@ -124,11 +137,11 @@ class QueryExecutor {
         joins.isNotEmpty) {
       // For JOIN queries, unprefixed fields are assumed to belong to the main table.
       // This preserves existing QueryBuilder behavior while centralizing planning here.
-      where = _prefixMainTableForJoinWhere(tableName, where);
+      where = _prefixMainTableForJoinWhere(table, where);
     }
 
     final plan = await optimizer.optimize(
-      tableName,
+      table,
       where,
       orderBy: orderBy,
       limit: limit,
@@ -137,7 +150,7 @@ class QueryExecutor {
 
     return _executeWithPlan(
       plan,
-      tableName,
+      table,
       schemas: schemas,
       condition: condition,
       where: where,
@@ -157,9 +170,10 @@ class QueryExecutor {
 
   /// Prefix unqualified where-clause fields with main table name for JOIN queries.
   Map<String, dynamic> _prefixMainTableForJoinWhere(
-    String mainTableName,
+    TableContext table,
     Map<String, dynamic> conditions,
   ) {
+    final mainTableName = table.tableName;
     Map<String, dynamic> convert(Map<String, dynamic> node) {
       final out = <String, dynamic>{};
       for (final entry in node.entries) {
@@ -200,9 +214,10 @@ class QueryExecutor {
   /// predicates that reference other tables are rewritten to `TRUE` (empty map)
   /// so we won't accidentally drop rows that could match after JOIN.
   Map<String, dynamic> _extractTableConditionTreeForExecution(
-    String mainTableName,
+    TableContext table,
     Map<String, dynamic> node,
   ) {
+    final mainTableName = table.tableName;
     Map<String, dynamic> extract(Map<String, dynamic> n) {
       final hasAnd = n.containsKey('AND') && n['AND'] is List;
       final hasOr = n.containsKey('OR') && n['OR'] is List;
@@ -278,7 +293,7 @@ class QueryExecutor {
 
   Future<ExecuteResult> _executeWithPlan(
     QueryPlan plan,
-    String tableName, {
+    TableContext table, {
     required Map<String, TableSchema> schemas,
     QueryCondition? condition,
     Map<String, dynamic>? where,
@@ -296,6 +311,7 @@ class QueryExecutor {
     TableSchema? decodeSchema,
     List<FieldStructure>? decodeFieldStructureOverride,
   }) async {
+    final tableName = table.tableName;
     try {
       // Cursor and offset are mutually exclusive at the API level.
       // We implicitly use cursor mode if no token is provided but offset is 0/null.
@@ -448,7 +464,7 @@ class QueryExecutor {
         // Validate query signature hash to prevent mismatched query cursors
         if (cursorToken.querySigHash != null) {
           final currentSigHash = _buildQuerySignatureHash(
-            tableName: tableName,
+            tableUid: table.tableUid,
             where: where,
             orderBy: orderBy,
           );
@@ -475,8 +491,8 @@ class QueryExecutor {
         // For correctness, use a main-table-only matcher for the base scan, and
         // apply the full matcher after JOIN as a final filter.
         if (joins != null && joins.isNotEmpty) {
-          final mainOnlyTree = _extractTableConditionTreeForExecution(
-              tableName, condition.build());
+          final mainOnlyTree =
+              _extractTableConditionTreeForExecution(table, condition.build());
           final mainOnlyCondition = QueryCondition.fromMap(mainOnlyTree);
           // Values are already normalized in [condition], but running normalize again is safe.
           mainOnlyCondition.normalize(schemas, tableName);
@@ -515,7 +531,7 @@ class QueryExecutor {
       }
 
       final _CursorMode? cursorMode = _determineCursorMode(
-        tableName: tableName,
+        table: table,
         schema: schema,
         plan: plan,
         orderBy: effectiveOrderBy,
@@ -524,7 +540,7 @@ class QueryExecutor {
 
       final planResult = await _executeQueryPlan(
         plan,
-        tableName,
+        table,
         condition,
         schemas,
         matcher,
@@ -557,7 +573,7 @@ class QueryExecutor {
         // uncommitted inserts/updates that were NOT in the persistent index/table scan.
         final bufferResults =
             await _dataStore.tableDataManager.mergeConsistency(
-          tableName,
+          table,
           const [], // base results empty for count
           matcher: matcher,
           limit: effectiveLimit,
@@ -568,7 +584,7 @@ class QueryExecutor {
         int? tableTotalCount;
         try {
           tableTotalCount =
-              await _dataStore.tableDataManager.getTableRecordCount(tableName);
+              await _dataStore.tableDataManager.getTableRecordCount(table);
         } catch (_) {}
         return ExecuteResult(
           records: const [],
@@ -609,7 +625,7 @@ class QueryExecutor {
             join.secondKey,
             join.type.toString().split('.').last,
             schemas,
-            tableName,
+            table,
             enableQueryCache: enableQueryCache,
             limit: effectiveLimit,
             offset: effectiveOffset,
@@ -641,14 +657,13 @@ class QueryExecutor {
         // For index cursor mode, validate orderBy matches index key order.
         if (cursorMode == _CursorMode.indexKey) {
           _validateIndexOrderByForCursor(
-            tableName: tableName,
+            table: table,
             schema: schema,
             plan: plan,
             orderBy: effectiveOrderBy,
           );
         }
-        results =
-            await _applySort(results, effectiveOrderBy, schemas, tableName);
+        results = await _applySort(results, effectiveOrderBy, schemas, table);
       }
 
       // CRITICAL: Apply limit truncation BEFORE pagination status check.
@@ -710,7 +725,7 @@ class QueryExecutor {
           if (hasMore) {
             nextCursor = _buildNextCursor(
               mode: cursorMode,
-              tableName: tableName,
+              table: table,
               schema: schema,
               plan: plan,
               orderBy: orderBy,
@@ -723,7 +738,7 @@ class QueryExecutor {
           if (hasPrev) {
             prevCursor = _buildNextCursor(
               mode: cursorMode,
-              tableName: tableName,
+              table: table,
               schema: schema,
               plan: plan,
               orderBy: orderBy,
@@ -757,7 +772,7 @@ class QueryExecutor {
       int? tableTotalCount;
       try {
         tableTotalCount =
-            await _dataStore.tableDataManager.getTableRecordCount(tableName);
+            await _dataStore.tableDataManager.getTableRecordCount(table);
       } catch (_) {}
 
       stopwatch.stop();
@@ -780,7 +795,7 @@ class QueryExecutor {
   /// execute query plan
   Future<PlanExecutionResult> _executeQueryPlan(
     QueryPlan plan,
-    String tableName,
+    TableContext table,
     QueryCondition? condition,
     Map<String, TableSchema> schemas,
     ConditionRecordMatcher? matcher, {
@@ -799,8 +814,9 @@ class QueryExecutor {
     TableSchema? decodeSchema,
     List<FieldStructure>? decodeFieldStructureOverride,
   }) async {
+    final tableName = table.tableName;
     final schema = decodeSchema ??
-        await _dataStore.schemaManager?.getTableSchema(tableName);
+        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
     if (schema == null) {
       return PlanExecutionResult([], onlyCount ? 0 : null, null);
     }
@@ -812,7 +828,7 @@ class QueryExecutor {
         cursorMode == _CursorMode.sortKey &&
         cursorToken.mode == _CursorMode.sortKey) {
       cursorFilter = _buildSortKeyCursorFilter(
-        tableName: tableName,
+        table: table,
         schema: schema,
         schemas: schemas,
         orderBy: orderBy ?? const <String>[],
@@ -823,7 +839,7 @@ class QueryExecutor {
     // Query cache
     if (enableQueryCache && !readFromFileOnly) {
       final cacheKey = QueryCacheKey(
-        tableName: tableName,
+        tableUid: table.tableUid,
         condition: condition ?? QueryCondition(),
         orderBy: orderBy,
         limit: limit,
@@ -850,7 +866,7 @@ class QueryExecutor {
           }
           final updatedResults = resultMap.values.toList();
           final filteredResults = await _dataStore.tableDataManager
-              .mergeConsistency(tableName, updatedResults,
+              .mergeConsistency(table, updatedResults,
                   matcher: matcher, limit: limit);
           if (onlyCount) {
             return PlanExecutionResult(const [], filteredResults.length, null);
@@ -886,7 +902,7 @@ class QueryExecutor {
               ? cursorToken.primaryKey
               : null;
           final scanRes = await _performTableScan(
-            tableName,
+            table,
             matcher,
             limit: limit,
             offset: offset,
@@ -922,7 +938,7 @@ class QueryExecutor {
             orderBy: orderBy,
           );
           final indexRes = await _performIndexScan(
-            tableName,
+            table,
             operation.indexUid!,
             cond,
             matcher,
@@ -974,7 +990,7 @@ class QueryExecutor {
           );
 
           final unionRes = await _performUnionPlans(
-            tableName,
+            table,
             plans,
             schemas,
             limit: limit,
@@ -1003,7 +1019,7 @@ class QueryExecutor {
         // The tree scan only counts flushed (committed) records.
         // Unflushed write-buffer records must also be counted for consistency.
         final bufferMerged = await _dataStore.tableDataManager.mergeConsistency(
-          tableName,
+          table,
           const <Map<String, dynamic>>[],
           matcher: matcher,
           limit: limit,
@@ -1057,7 +1073,7 @@ class QueryExecutor {
             pivotValues
                 .addAll(MemComparableKey.decodeTuple(cursorToken.indexKey!));
 
-            final idxUid = cursorToken.indexUid!;
+            final idxUid = cursorToken.indexUid;
             // Find index schema match.
             IndexSchema? idx;
             try {
@@ -1125,7 +1141,7 @@ class QueryExecutor {
 
       if (!readFromFileOnly) {
         results = await _dataStore.tableDataManager.mergeConsistency(
-          tableName,
+          table,
           results,
           matcher: matcher,
           limit: bufferMergeLimit,
@@ -1141,7 +1157,7 @@ class QueryExecutor {
           !readFromFileOnly &&
           TransactionContext.getCurrentTransactionId() == null) {
         final cacheKey = QueryCacheKey(
-          tableName: tableName,
+          tableUid: table.tableUid,
           condition: condition ?? QueryCondition(),
           orderBy: orderBy,
           limit: limit,
@@ -1178,7 +1194,7 @@ class QueryExecutor {
   /// Each child plan is executed with its own predicate matcher so that range-partition
   /// pruning remains effective even when the original query contains nested OR.
   Future<TableScanResult> _performUnionPlans(
-    String tableName,
+    TableContext table,
     List<QueryPlan> plans,
     Map<String, TableSchema> schemas, {
     int? limit,
@@ -1194,9 +1210,10 @@ class QueryExecutor {
     TableSchema? decodeSchema,
     List<FieldStructure>? decodeFieldStructureOverride,
   }) async {
+    final tableName = table.tableName;
     final tblSchema = decodeSchema ??
         schemas[tableName] ??
-        await _dataStore.schemaManager?.getTableSchema(tableName);
+        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
     if (tblSchema == null) {
       return TableScanResult(records: const [], count: onlyCount ? 0 : null);
     }
@@ -1254,7 +1271,7 @@ class QueryExecutor {
             switch (op.type) {
               case QueryOperationType.tableScan:
                 final scan = await _performTableScan(
-                  tableName,
+                  table,
                   clauseMatcher,
                   limit: limit,
                   offset: 0,
@@ -1277,7 +1294,7 @@ class QueryExecutor {
                     ? (vv['where'] ?? vv) as Map<String, dynamic>
                     : const <String, dynamic>{};
                 return (await _performIndexScan(
-                  tableName,
+                  table,
                   op.indexUid!,
                   cond,
                   clauseMatcher,
@@ -1308,7 +1325,7 @@ class QueryExecutor {
                   if (c is QueryPlan) subPlans.add(c);
                 }
                 if (subPlans.isEmpty) return const <Map<String, dynamic>>[];
-                return (await _performUnionPlans(tableName, subPlans, schemas,
+                return (await _performUnionPlans(table, subPlans, schemas,
                         limit: limit,
                         offset: 0,
                         orderBy: orderBy,
@@ -1403,7 +1420,7 @@ class QueryExecutor {
       String rightKey,
       String joinType,
       Map<String, TableSchema> schemas,
-      String mainTableName,
+      TableContext mainTable,
       {bool enableQueryCache = false,
       int? limit,
       int? offset,
@@ -1449,22 +1466,26 @@ class QueryExecutor {
     if (leftJoinKeys.isNotEmpty) {
       final rightTableCondition =
           QueryCondition().where(rightKeyName, 'IN', leftJoinKeys.toList());
-      final rightSchema =
-          await _dataStore.schemaManager?.getTableSchema(rightTableName);
+      final rightSchema = await _dataStore.schemaManager
+          ?.getTableSchemaByName(TableName(rightTableName));
       if (rightSchema == null) {
         return [];
       }
       final rightMatcher = ConditionRecordMatcher.prepare(
           rightTableCondition, {rightTableName: rightSchema}, rightTableName);
       // Use optimizer + full single-table pipeline (with caches)
-      final rightPlan = await _dataStore
-          .getQueryOptimizer()
-          ?.optimize(rightTableName, rightTableCondition.build());
+      final rightPlan = await _dataStore.getQueryOptimizer()?.optimize(
+          _tableContextFromSchema(rightSchema, rightTableName),
+          rightTableCondition.build());
       if (rightPlan == null) {
         return [];
       }
-      final rightPlanResult = await _executeQueryPlan(rightPlan, rightTableName,
-          rightTableCondition, {rightTableName: rightSchema}, rightMatcher,
+      final rightPlanResult = await _executeQueryPlan(
+          rightPlan,
+          _tableContextFromSchema(rightSchema, rightTableName),
+          rightTableCondition,
+          {rightTableName: rightSchema},
+          rightMatcher,
           enableQueryCache: enableQueryCache,
           queryCacheExpiry: queryCacheExpiry);
       rightRecords = rightPlanResult.records;
@@ -1472,17 +1493,22 @@ class QueryExecutor {
       // LEFT keys empty (e.g., RIGHT JOIN needs full right scan): route through normal pipeline
       final rightCondition = QueryCondition(); // full scan
       final rightSchema = schemas[rightTableName] ??
-          await _dataStore.schemaManager?.getTableSchema(rightTableName);
+          await _dataStore.schemaManager
+              ?.getTableSchemaByName(TableName(rightTableName));
       if (rightSchema == null) {
         return [];
       }
-      final rightPlan = await _dataStore
-          .getQueryOptimizer()
-          ?.optimize(rightTableName, rightCondition.build());
+      final rightPlan = await _dataStore.getQueryOptimizer()?.optimize(
+          _tableContextFromSchema(rightSchema, rightTableName),
+          rightCondition.build());
       if (rightPlan != null) {
         // Use full pipeline (with overlay application)
-        final rightPlanResult = await _executeQueryPlan(rightPlan,
-            rightTableName, rightCondition, {rightTableName: rightSchema}, null,
+        final rightPlanResult = await _executeQueryPlan(
+            rightPlan,
+            _tableContextFromSchema(rightSchema, rightTableName),
+            rightCondition,
+            {rightTableName: rightSchema},
+            null,
             enableQueryCache: enableQueryCache,
             limit: limit,
             offset: offset,
@@ -1492,10 +1518,11 @@ class QueryExecutor {
         // Fallback: perform raw scan then apply overlays manually
         final int localViewId = _dataStore.readViewManager.registerReadView();
         try {
-          final scanRes = await _performTableScan(rightTableName, null);
+          final scanRes = await _performTableScan(
+              _tableContextFromSchema(rightSchema, rightTableName), null);
           rightRecords = scanRes.records;
           rightRecords = await _dataStore.tableDataManager.mergeConsistency(
-            rightTableName,
+            _tableContextFromSchema(rightSchema, rightTableName),
             rightRecords,
           );
         } finally {
@@ -1508,7 +1535,7 @@ class QueryExecutor {
     final resultRecords = <Map<String, dynamic>>[];
 
     // Determine left table name (main table name)
-    String leftTableName = mainTableName;
+    String leftTableName = mainTable.tableName;
     if (leftKey.contains('.')) {
       leftTableName = leftKey.split('.')[0];
     }
@@ -1517,7 +1544,7 @@ class QueryExecutor {
     final leftFieldName =
         leftKey.contains('.') ? leftKey.split('.').last : leftKey;
     final leftSchema = ConditionRecordMatcher.getSchemaForField(
-        leftKey, schemas, mainTableName);
+        leftKey, schemas, mainTable.tableName);
     final matcher = leftSchema != null
         ? ValueMatcher.getMatcher(leftSchema.getFieldMatcherType(leftFieldName))
         : ValueMatcher.getMatcher(MatcherType.unsupported);
@@ -1745,7 +1772,7 @@ class QueryExecutor {
   /// retired in favor of precise range-partition reads + default limits to avoid
   /// read amplification and cross-query blocking.
   Future<TableScanResult> _performTableScan(
-    String tableName,
+    TableContext table,
     ConditionRecordMatcher? matcher, {
     int? limit,
     int? offset,
@@ -1761,7 +1788,7 @@ class QueryExecutor {
   }) async {
     try {
       return await _dataStore.tableDataManager.searchTableData(
-        tableName,
+        table,
         matcher,
         limit: limit,
         offset: offset,
@@ -1852,12 +1879,13 @@ class QueryExecutor {
 
   IndexCondition? _buildIndexConditionForSchema(
     IndexSchema? indexSchema,
-    String actualIndexName,
+    IndexUid indexUid,
     Map<String, dynamic> conditions,
   ) {
     if (indexSchema == null || indexSchema.fields.isEmpty) {
-      if (actualIndexName.startsWith('uniq_') && actualIndexName.length > 5) {
-        final fieldName = actualIndexName.substring(5);
+      final legacyName = indexUid.value;
+      if (legacyName.startsWith('uniq_') && legacyName.length > 5) {
+        final fieldName = legacyName.substring(5);
         if (!conditions.containsKey(fieldName)) return null;
         final raw = conditions[fieldName];
         if (raw is Map<String, dynamic>) {
@@ -1920,8 +1948,8 @@ class QueryExecutor {
 
   /// perform index scan
   Future<TableScanResult> _performIndexScan(
-    String tableName,
-    String indexUid,
+    TableContext table,
+    IndexUid indexUid,
     Map<String, dynamic> conditions,
     ConditionRecordMatcher? matcher, {
     int? limit,
@@ -1937,33 +1965,29 @@ class QueryExecutor {
     TableSchema? decodeSchema,
     List<FieldStructure>? decodeFieldStructureOverride,
   }) async {
+    final tableName = table.tableName;
     try {
       final schema = decodeSchema ??
-          await _dataStore.schemaManager?.getTableSchema(tableName);
+          await _dataStore.schemaManager?.getTableSchema(table.tableUid);
       if (schema == null) {
         return TableScanResult(records: const [], count: onlyCount ? 0 : null);
       }
 
-      // Index name used by storage is already the actual index name.
-      final String actualIndexUid = indexUid;
-
+      // Index uid from query plan is the stable engine identifier.
       IndexSchema? indexSchema;
       try {
         final allIndexes = _dataStore.schemaManager?.getAllIndexesFor(schema) ??
             <IndexSchema>[];
         indexSchema = allIndexes.firstWhere(
-          (idx) =>
-              idx.indexUid == actualIndexUid ||
-              idx.actualIndexName == actualIndexUid,
+          (idx) => idx.indexUid == indexUid,
         );
       } catch (_) {
         indexSchema = null;
       }
-      final String actualIndexName = indexSchema?.actualIndexName ?? indexUid;
 
       final IndexCondition? builtCondition = _buildIndexConditionForSchema(
         indexSchema,
-        actualIndexName,
+        indexUid,
         conditions,
       );
       final IndexCondition indexCondition = builtCondition ??
@@ -1985,7 +2009,7 @@ class QueryExecutor {
       // Safety: avoid unbounded index reads that can OOM on large tables.
       // Higher-level executor applies default limits; if it doesn't, we fall back to a bounded table scan.
       if (!onlyCount && limit == null) {
-        return await _performTableScan(tableName, matcher,
+        return await _performTableScan(table, matcher,
             limit: limit,
             offset: offset,
             orderBy: orderBy,
@@ -2005,7 +2029,7 @@ class QueryExecutor {
       }
 
       final tblSchema =
-          await _dataStore.schemaManager?.getTableSchema(tableName);
+          await _dataStore.schemaManager?.getTableSchema(table.tableUid);
       if (tblSchema == null) {
         return TableScanResult(records: const [], count: onlyCount ? 0 : null);
       }
@@ -2021,7 +2045,7 @@ class QueryExecutor {
       bool orderByAligned = true;
       if (hasOrderBy) {
         try {
-          final spec = _resolveIndexSpecForCursor(schema, actualIndexName);
+          final spec = _resolveIndexSpecForCursor(schema, indexUid);
           if (ob.length > spec.fields.length) {
             orderByAligned = false;
           } else {
@@ -2102,8 +2126,8 @@ class QueryExecutor {
               remaining > countBatchSize ? countBatchSize : remaining;
 
           final indexResults = await _indexManager.searchIndex(
-            tableName,
-            actualIndexName,
+            table,
+            indexUid,
             indexCondition,
             limit: batch,
             offset: null,
@@ -2114,7 +2138,7 @@ class QueryExecutor {
           );
 
           if (indexResults.requiresTableScan) {
-            return await _performTableScan(tableName, matcher,
+            return await _performTableScan(table, matcher,
                 limit: limit,
                 offset: offset,
                 orderBy: orderBy,
@@ -2158,7 +2182,7 @@ class QueryExecutor {
               // Skip if in buffer for onlyCount fast path to avoid double counting
               if (onlyCount &&
                   _dataStore.writeBufferManager
-                          .getBufferedRecordForRead(tableName, pk) !=
+                          .getBufferedRecordForRead(table, pk) !=
                       null) {
                 continue;
               }
@@ -2176,7 +2200,7 @@ class QueryExecutor {
 
             final matchedVirtualIndices = await _matchRecordIndicesIfNeeded(
               schema: tblSchema,
-              tableName: tableName,
+              table: table,
               matcherCondition: matcherCondition,
               records: virtualRecords,
             );
@@ -2209,7 +2233,7 @@ class QueryExecutor {
             final records = pks.isEmpty
                 ? const <Map<String, dynamic>>[]
                 : (await _dataStore.tableDataManager.queryRecordsBatch(
-                    tableName,
+                    table,
                     pks,
                     readFromFileOnly: readFromFileOnly,
                     decodeSchema: decodeSchema,
@@ -2244,13 +2268,13 @@ class QueryExecutor {
                 // Skip if in buffer for onlyCount
                 if (onlyCount) {
                   if (_dataStore.writeBufferManager
-                          .getBufferedRecordForRead(tableName, pk) !=
+                          .getBufferedRecordForRead(table, pk) !=
                       null) {
                     continue;
                   }
                 } else {
                   final be = _dataStore.writeBufferManager
-                      .getBufferedRecordForRead(tableName, pk);
+                      .getBufferedRecordForRead(table, pk);
                   if (be != null &&
                       be.operation == BufferOperationType.delete) {
                     continue;
@@ -2261,7 +2285,7 @@ class QueryExecutor {
 
               final matchedCandidateIndices = await _matchRecordIndicesIfNeeded(
                 schema: tblSchema,
-                tableName: tableName,
+                table: table,
                 matcherCondition: matcherCondition,
                 records: candidateRecords,
               );
@@ -2327,7 +2351,7 @@ class QueryExecutor {
             final lastRec = recordByPk[lastPk];
             if (lastRec == null) break;
             try {
-              final spec = _resolveIndexSpecForCursor(schema, actualIndexName);
+              final spec = _resolveIndexSpecForCursor(schema, indexUid);
               final comps = <Uint8List>[];
               final bool truncateText = !spec.isUnique;
               for (final f in spec.fields) {
@@ -2445,8 +2469,8 @@ class QueryExecutor {
         final int batch = onlyCount ? countBatchSize : targetNeed;
 
         final indexResults = await _indexManager.searchIndex(
-          tableName,
-          actualIndexName,
+          table,
+          indexUid,
           indexCondition,
           limit: batch,
           offset: null,
@@ -2457,7 +2481,7 @@ class QueryExecutor {
         );
 
         if (indexResults.requiresTableScan) {
-          return await _performTableScan(tableName, matcher,
+          return await _performTableScan(table, matcher,
               limit: limit,
               offset: offset,
               orderBy: orderBy,
@@ -2473,7 +2497,7 @@ class QueryExecutor {
         final records = pks.isEmpty
             ? const <Map<String, dynamic>>[]
             : (await _dataStore.tableDataManager.queryRecordsBatch(
-                tableName,
+                table,
                 pks,
                 readFromFileOnly: readFromFileOnly,
                 decodeSchema: decodeSchema,
@@ -2498,13 +2522,13 @@ class QueryExecutor {
             // Skip if in buffer for onlyCount
             if (onlyCount) {
               if (_dataStore.writeBufferManager
-                      .getBufferedRecordForRead(tableName, pk) !=
+                      .getBufferedRecordForRead(table, pk) !=
                   null) {
                 continue;
               }
             } else {
               final be = _dataStore.writeBufferManager
-                  .getBufferedRecordForRead(tableName, pk);
+                  .getBufferedRecordForRead(table, pk);
               if (be != null && be.operation == BufferOperationType.delete) {
                 continue;
               }
@@ -2514,7 +2538,7 @@ class QueryExecutor {
 
           final matchedCandidateIndices = await _matchRecordIndicesIfNeeded(
             schema: tblSchema,
-            tableName: tableName,
+            table: table,
             matcherCondition: matcherCondition,
             records: candidateRecords,
           );
@@ -2577,7 +2601,7 @@ class QueryExecutor {
       );
     } catch (e) {
       Logger.error('Index scan failed', rawError: e);
-      return await _performTableScan(tableName, matcher,
+      return await _performTableScan(table, matcher,
           limit: limit,
           offset: offset,
           orderBy: orderBy,
@@ -2589,7 +2613,7 @@ class QueryExecutor {
 
   Future<List<int>?> _matchRecordIndicesIfNeeded({
     required TableSchema schema,
-    required String tableName,
+    required TableContext table,
     required Map<String, dynamic>? matcherCondition,
     required List<Map<String, dynamic>> records,
   }) async {
@@ -2601,7 +2625,7 @@ class QueryExecutor {
 
     final matchResult = await ConditionBatchMatcher.matchRecordIndices(
       schema: schema,
-      tableName: tableName,
+      table: table,
       condition: matcherCondition,
       records: records,
       estimateRecordBytes: _estimateRecordSizeBytes,
@@ -2614,7 +2638,8 @@ class QueryExecutor {
       List<Map<String, dynamic>> data,
       List<String> orderBy,
       Map<String, TableSchema> schemas,
-      String tableName) async {
+      TableContext table) async {
+    final tableName = table.tableName;
     try {
       if (data.isEmpty) return data;
 
@@ -2748,8 +2773,7 @@ class QueryExecutor {
     try {
       final allIndexes = _dataStore.schemaManager?.getAllIndexesFor(schema);
       if (allIndexes == null) return false;
-      final idx = allIndexes.firstWhere(
-          (i) => i.indexUid == idxUid || i.actualIndexName == idxUid);
+      final idx = allIndexes.firstWhere((i) => i.indexUid == idxUid);
       if (orderBy.length != idx.fields.length) return false;
       // We assume validation has already passed and all fields have uniform direction.
       final parsed = _parseSortField(orderBy[0]);
@@ -2759,25 +2783,44 @@ class QueryExecutor {
     }
   }
 
+  /// User-facing index label for error/explain messages (never expose stable [IndexUid]).
+  String _indexDisplayLabel(TableSchema schema, IndexUid indexUid) {
+    if (indexUid.isEmpty) return 'index';
+    final idx =
+        _dataStore.schemaManager?.findIndexSchemaByUid(schema, indexUid);
+    if (idx != null) {
+      final name = idx.indexName;
+      if (name != null && name.isNotEmpty) return name;
+      return idx.actualIndexName;
+    }
+    // Legacy logical names (idx_*/uniq_*) are user-visible; stable uids are not.
+    if (!indexUid.looksLikeStableUid) return indexUid.value;
+    return 'index';
+  }
+
   /// Resolve index spec for cursor building.
   ({List<String> fields, bool isUnique}) _resolveIndexSpecForCursor(
-      TableSchema schema, String indexUidOrName) {
+      TableSchema schema, IndexUid indexUid) {
     try {
       final allIndexes = _dataStore.schemaManager?.getAllIndexesFor(schema);
       if (allIndexes == null) return (fields: <String>[], isUnique: false);
-      final idx = allIndexes.firstWhere(
-          (i) => i.indexUid == indexUidOrName || i.actualIndexName == indexUidOrName);
+      final idx = allIndexes.firstWhere((i) => i.indexUid == indexUid);
       return (fields: idx.fields, isUnique: idx.unique);
     } catch (e) {
       if (e is DbException) rethrow;
       // Fallback for implicit unique single-field indexes (uniq_field).
-      if (indexUidOrName.startsWith('uniq_') && indexUidOrName.length > 5) {
-        return (fields: <String>[indexUidOrName.substring(5)], isUnique: true);
+      final legacyName = indexUid.value;
+      if (legacyName.startsWith('uniq_') && legacyName.length > 5) {
+        return (fields: <String>[legacyName.substring(5)], isUnique: true);
       }
+      final label = _indexDisplayLabel(schema, indexUid);
+      final message = label == 'index'
+          ? 'Index schema not found for cursor pagination.'
+          : 'Index schema not found for cursor pagination on index "$label".';
       throw DbException([
         GeneralStatus(
           type: ResultType.devIndexNotFound,
-          message: 'Index schema not found for cursor pagination: $indexUidOrName.',
+          message: message,
         ),
       ]);
     }
@@ -2785,7 +2828,7 @@ class QueryExecutor {
 
   /// Validate that orderBy matches index key order for cursor pagination.
   void _validateIndexOrderByForCursor({
-    required String tableName,
+    required TableContext table,
     required TableSchema schema,
     required QueryPlan plan,
     required List<String> orderBy,
@@ -2795,7 +2838,8 @@ class QueryExecutor {
       throw DbException([
         GeneralStatus(
           type: ResultType.devIndexNotFound,
-          message: 'Index scan plan is missing indexUid for cursor pagination.',
+          message:
+              'Index scan plan is missing index selection for cursor pagination.',
         ),
       ]);
     }
@@ -2885,12 +2929,13 @@ class QueryExecutor {
   }
 
   bool Function(Map<String, dynamic>) _buildSortKeyCursorFilter({
-    required String tableName,
+    required TableContext table,
     required TableSchema schema,
     required Map<String, TableSchema> schemas,
     required List<String> orderBy,
     required _QueryCursorToken cursorToken,
   }) {
+    final tableName = table.tableName;
     if (cursorToken.mode != _CursorMode.sortKey) {
       throw DbException([
         InvalidArgumentStatus(
@@ -3027,7 +3072,7 @@ class QueryExecutor {
   /// Returns null if the current query configuration (e.g. non-indexed orderBy)
   /// does not support cursor-based pagination.
   _CursorMode? _determineCursorMode({
-    required String tableName,
+    required TableContext table,
     required TableSchema schema,
     required QueryPlan plan,
     required List<String> orderBy,
@@ -3050,13 +3095,13 @@ class QueryExecutor {
     }
 
     if (op.type == QueryOperationType.indexScan) {
-      final idxUid = op.indexUid ?? '';
+      final idxUid = op.indexUid ?? IndexUid.empty;
       if (idxUid.isEmpty) {
         throw DbException([
           GeneralStatus(
             type: ResultType.devIndexNotFound,
             message:
-                'Index scan plan is missing indexUid for cursor pagination.',
+                'Index scan plan is missing index selection for cursor pagination.',
           ),
         ]);
       }
@@ -3066,7 +3111,7 @@ class QueryExecutor {
       if (orderBy.isNotEmpty) {
         try {
           _validateIndexOrderByForCursor(
-            tableName: tableName,
+            table: table,
             schema: schema,
             plan: plan,
             orderBy: orderBy,
@@ -3090,7 +3135,7 @@ class QueryExecutor {
 
   String _buildNextCursor({
     required _CursorMode mode,
-    required String tableName,
+    required TableContext table,
     required TableSchema schema,
     required QueryPlan plan,
     required List<String>? orderBy,
@@ -3098,8 +3143,9 @@ class QueryExecutor {
     required Map<String, dynamic>? where,
     bool isBackward = false,
   }) {
+    final tableName = table.tableName;
     final sigHash = _buildQuerySignatureHash(
-      tableName: tableName,
+      tableUid: table.tableUid,
       where: where,
       orderBy: orderBy,
     );
@@ -3206,7 +3252,7 @@ class QueryExecutor {
         GeneralStatus(
           type: ResultType.devIndexNotFound,
           message:
-              'Cannot build next cursor: missing indexName from query plan.',
+              'Cannot build next cursor: missing index selection from query plan.',
         ),
       ]);
     }
@@ -3258,40 +3304,41 @@ class QueryExecutor {
       comps.add(schema.encodePrimaryKeyComponent(pkVal));
     }
 
-    final IndexSchema? idx = (schema.indexes.cast<IndexSchema?>().firstWhere(
-            (i) => i?.indexUid == idxUid || i?.actualIndexName == idxUid,
-            orElse: () => null) ??
-        schema.autoIndexes?.cast<IndexSchema?>().firstWhere(
-            (i) => i?.indexUid == idxUid || i?.actualIndexName == idxUid,
-            orElse: () => null));
-    final indexUid = idx?.indexUid ?? idxUid;
+    final IndexSchema? idx = (schema.indexes
+            .cast<IndexSchema?>()
+            .firstWhere((i) => i?.indexUid == idxUid, orElse: () => null) ??
+        schema.autoIndexes
+            ?.cast<IndexSchema?>()
+            .firstWhere((i) => i?.indexUid == idxUid, orElse: () => null));
+    final resolvedIndexUid = idx?.indexUid ?? idxUid;
 
     return _QueryCursorToken.indexKey(
       tableUid: schema.tableUid,
-      indexUid: indexUid,
+      indexUid: resolvedIndexUid,
       indexKey: MemComparableKey.encodeTuple(comps),
       isBackward: isBackward,
       querySigHash: sigHash,
     ).encode();
   }
 
-  int _getTableQueryGeneration(String tableName) {
-    return _tableQueryGenerations[tableName] ?? 0;
+  int _getTableQueryGeneration(TableUid tableUid) {
+    return _tableQueryGenerations[tableUid] ?? 0;
   }
 
   List<Object> _buildQueryCacheKey(QueryCacheKey key) {
-    final gen = _getTableQueryGeneration(key.tableName);
-    // Use hierarchical key [tableName, gen, queryStr] for efficient table-wide purging.
-    return [key.tableName, gen, key.toString()];
+    final gen = _getTableQueryGeneration(key.tableUid);
+    // Use hierarchical key [tableUid, gen, queryStr] for efficient table-wide purging.
+    return [key.tableUid, gen, key.toString()];
   }
 
   /// Invalidate query cache for a table (best-effort, O(1)).
-  void invalidateQueryCacheForTable(String tableName) {
-    final cur = _tableQueryGenerations[tableName] ?? 0;
+  void invalidateQueryCacheForTable(TableContext table) {
+    final tableUid = table.tableUid;
+    final cur = _tableQueryGenerations[tableUid] ?? 0;
     // Keep it positive and bounded.
-    _tableQueryGenerations[tableName] = (cur + 1) & 0x7fffffff;
+    _tableQueryGenerations[tableUid] = (cur + 1) & 0x7fffffff;
     // Explicitly purge all query cache entries for this table using hierarchical prefix.
-    _queryCache.remove([tableName]);
+    _queryCache.remove([tableUid]);
   }
 
   /// Clear a specific cached query entry for the current generation.
@@ -3435,11 +3482,11 @@ class QueryExecutor {
   }
 
   /// Construct a primary key cursor token for a table.
-  static String buildPrimaryKeyCursor(String tableName, String primaryKeyStr,
+  static String buildPrimaryKeyCursor(TableContext table, String primaryKeyStr,
       {bool reverse = false}) {
     final Map<String, dynamic> payload = <String, dynamic>{
       'v': 1,
-      't': tableName,
+      't': table.tableUid,
       'm': 'pk',
       'b': false,
       'pk': primaryKeyStr,
@@ -3452,7 +3499,7 @@ class QueryExecutor {
   /// Query data batch-by-batch using cursors directly from files (bypassing WriteBuffer and read views).
   /// Enforces a flush before starting.
   Future<void> queryEachBatch(
-    String tableName, {
+    TableContext table, {
     required int batchSize,
     required Future<bool> Function(List<Map<String, dynamic>> batch,
             String? currentCursor, String? nextCursor)
@@ -3477,17 +3524,8 @@ class QueryExecutor {
         )
       ]);
     }
-    final schema = decodeSchema ?? await schemaMgr.getTableSchema(tableName);
-    if (schema == null) {
-      throw DbException([
-        InvalidArgumentStatus(
-          type: ResultType.devTableNotFound,
-          message: 'Table schema not found for $tableName',
-          parameterName: 'tableName',
-          passedValue: tableName,
-        )
-      ]);
-    }
+    final tableName = table.tableName;
+    final schema = decodeSchema ?? table.schema;
 
     final schemas = <String, TableSchema>{tableName: schema};
     if (condition != null && !condition.isEmpty) {
@@ -3507,7 +3545,7 @@ class QueryExecutor {
 
     final Map<String, dynamic>? where = condition?.build();
     final plan = await optimizer.optimize(
-      tableName,
+      table,
       where,
       orderBy: orderBy,
       limit: batchSize,
@@ -3530,7 +3568,7 @@ class QueryExecutor {
 
       final result = await _executeWithPlan(
         plan,
-        tableName,
+        table,
         schemas: schemas,
         condition: condition,
         where: where,
@@ -3656,7 +3694,7 @@ final class _QueryCursorToken {
 
   final int version;
   final _CursorMode mode;
-  final String tableUid;
+  final TableUid tableUid;
   final int? querySigHash;
 
   // primaryKey mode
@@ -3664,7 +3702,7 @@ final class _QueryCursorToken {
   final bool reverse;
 
   // indexKey mode
-  final String? indexUid;
+  final IndexUid indexUid;
   final Uint8List? indexKey;
 
   // sortKey mode (orderBy fields + primary key tie-breaker)
@@ -3691,7 +3729,7 @@ final class _QueryCursorToken {
   });
 
   factory _QueryCursorToken.primaryKey({
-    required String tableUid,
+    required TableUid tableUid,
     required String primaryKey,
     required bool reverse,
     bool isBackward = false,
@@ -3703,7 +3741,7 @@ final class _QueryCursorToken {
       tableUid: tableUid,
       primaryKey: primaryKey,
       reverse: reverse,
-      indexUid: null,
+      indexUid: IndexUid.empty,
       indexKey: null,
       sortFields: null,
       sortDesc: null,
@@ -3714,8 +3752,8 @@ final class _QueryCursorToken {
   }
 
   factory _QueryCursorToken.indexKey({
-    required String tableUid,
-    required String indexUid,
+    required TableUid tableUid,
+    required IndexUid indexUid,
     required Uint8List indexKey,
     bool isBackward = false,
     int? querySigHash,
@@ -3737,7 +3775,7 @@ final class _QueryCursorToken {
   }
 
   factory _QueryCursorToken.sortKey({
-    required String tableUid,
+    required TableUid tableUid,
     required List<String> sortFields,
     required List<bool> sortDesc,
     required Uint8List sortKey,
@@ -3750,7 +3788,7 @@ final class _QueryCursorToken {
       tableUid: tableUid,
       primaryKey: null,
       reverse: false,
-      indexUid: null,
+      indexUid: IndexUid.empty,
       indexKey: null,
       sortFields: List<String>.from(sortFields, growable: false),
       sortDesc: List<bool>.from(sortDesc, growable: false),
@@ -3839,7 +3877,7 @@ final class _QueryCursorToken {
         final bool reverse = obj['r'] == true;
         final bool isBackward = obj['b'] == true;
         return _QueryCursorToken.primaryKey(
-          tableUid: t,
+          tableUid: TableUid(t),
           primaryKey: pk,
           reverse: reverse,
           isBackward: isBackward,
@@ -3872,8 +3910,8 @@ final class _QueryCursorToken {
         }
         final bool isBackward = obj['b'] == true;
         return _QueryCursorToken.indexKey(
-          tableUid: t,
-          indexUid: idx,
+          tableUid: TableUid(t),
+          indexUid: IndexUid(idx),
           indexKey: keyBytes,
           isBackward: isBackward,
           querySigHash: querySigHash,
@@ -3932,7 +3970,7 @@ final class _QueryCursorToken {
         }
         final bool isBackward = obj['b'] == true;
         return _QueryCursorToken.sortKey(
-          tableUid: t,
+          tableUid: TableUid(t),
           sortFields: fields,
           sortDesc: desc,
           sortKey: keyBytes,
@@ -4014,12 +4052,12 @@ int _fnv1aHash32(String str) {
 }
 
 int _buildQuerySignatureHash({
-  required String tableName,
+  required TableUid tableUid,
   required Map<String, dynamic>? where,
   required List<String>? orderBy,
 }) {
   final cleanWhere = _deterministicJsonStringify(where);
   final cleanOrderBy = jsonEncode(orderBy ?? const <String>[]);
-  final sigStr = '$tableName|$cleanWhere|$cleanOrderBy';
+  final sigStr = '$tableUid|$cleanWhere|$cleanOrderBy';
   return _fnv1aHash32(sigStr);
 }
