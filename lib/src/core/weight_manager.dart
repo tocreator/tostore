@@ -2,10 +2,12 @@ import 'dart:async';
 import 'dart:convert';
 import '../handler/logger.dart';
 import '../model/system_table.dart';
+import '../model/table_context.dart';
 import 'data_store_impl.dart';
 import 'crontab_manager.dart';
 import 'yield_controller.dart';
 import 'path_manager.dart';
+import '../model/table_identity.dart';
 
 /// Weight type enum
 enum WeightType {
@@ -106,6 +108,9 @@ class WeightManager {
   /// Whether weight data has changed since last save
   bool _dirty = false;
 
+  static const _indexDataKeyFormatField = 'indexDataKeyFormat';
+  static const _indexUidKeyFormatValue = 'indexUid';
+
   /// Lock for saving weights to file
   Future<void>? _saveLock;
 
@@ -197,6 +202,15 @@ class WeightManager {
       // Load last decay time
       _lastDecayTime = json['lastDecayTime'] as int? ?? 0;
 
+      final indexDataKeyFormatIndexUid =
+          json[_indexDataKeyFormatField] == _indexUidKeyFormatValue;
+      if (!indexDataKeyFormatIndexUid) {
+        await _migrateLegacyIndexDataKeys(spaceName: spaceName);
+        // Persist format marker once; avoids re-scanning on every future boot.
+        _onMutation();
+        await saveWeights(spaceName: spaceName, force: true);
+      }
+
       // Rebuild high weight cache
       _rebuildHighWeightCache();
 
@@ -237,12 +251,12 @@ class WeightManager {
         if (!existsInSpace) continue;
 
         // Get table schema
-        final schema =
-            await _dataStore.schemaManager?.getTableSchema(tableName);
+        final schema = await _dataStore.schemaManager
+            ?.getTableSchemaByName(TableName(tableName));
         if (schema == null) continue;
 
         // Initialize table record weights
-        final tableKey = _getTableRecordKey(tableName);
+        final tableKey = _getTableRecordKey(schema.tableUid);
         if (!_weightCache[WeightType.tableRecord]!.containsKey(tableKey)) {
           int initialWeight = 0;
           if (isSystemTable) {
@@ -264,7 +278,7 @@ class WeightManager {
         if (indexes == null) return;
         for (final index in indexes) {
           await yieldController.maybeYield();
-          final indexKey = _getIndexDataKey(tableName, index.actualIndexName);
+          final indexKey = _getIndexDataKey(schema.tableUid, index.indexUid);
           if (!_weightCache[WeightType.indexData]!.containsKey(indexKey)) {
             int initialWeight = 0;
             if (isSystemTable) {
@@ -331,6 +345,7 @@ class WeightManager {
             entry.key: entry.value.toJson(),
         },
         'lastDecayTime': _lastDecayTime,
+        _indexDataKeyFormatField: _indexUidKeyFormatValue,
       };
 
       await _dataStore.storage.writeAsString(
@@ -493,11 +508,138 @@ class WeightManager {
   }
 
   /// Get table record identifier
-  String _getTableRecordKey(String tableName) => tableName;
+  String _getTableRecordKey(TableUid tableUid) => tableUid;
+
+  /// Index weight cache key: [tableUid]:[indexUid].
+  static String indexDataIdentifier(TableUid tableUid, IndexUid indexUid) =>
+      '$tableUid:${indexUid.value}';
 
   /// Get index data identifier
-  String _getIndexDataKey(String tableName, String indexName) =>
-      '$tableName:$indexName';
+  String _getIndexDataKey(TableUid tableUid, IndexUid indexUid) =>
+      indexDataIdentifier(tableUid, indexUid);
+
+  /// Merge weight from [fromKey] into [toKey] (used for legacy key migration).
+  void _mergeIndexWeightKey(String fromKey, String toKey) {
+    if (fromKey == toKey) return;
+    final cache = _weightCache[WeightType.indexData]!;
+    final from = cache.remove(fromKey);
+    if (from == null) return;
+
+    final existing = cache[toKey];
+    if (existing == null) {
+      cache[toKey] = from;
+      return;
+    }
+
+    cache[toKey] = WeightData(
+      weight: from.weight > existing.weight ? from.weight : existing.weight,
+      accessCount: from.accessCount + existing.accessCount,
+      lastUpdateTime: from.lastUpdateTime > existing.lastUpdateTime
+          ? from.lastUpdateTime
+          : existing.lastUpdateTime,
+      neverDecay: from.neverDecay || existing.neverDecay,
+      customWeight: from.customWeight ?? existing.customWeight,
+    );
+  }
+
+  /// Migrate a legacy index weight key (actualIndexName suffix) to [indexUid].
+  bool _migrateLegacyIndexKey(
+    TableUid tableUid,
+    String legacySuffix,
+    IndexUid indexUid,
+  ) {
+    if (legacySuffix.isEmpty || indexUid.isEmpty) return false;
+    final legacyKey = '$tableUid:$legacySuffix';
+    final uidKey = _getIndexDataKey(tableUid, indexUid);
+    if (legacyKey == uidKey) return false;
+    if (!_weightCache[WeightType.indexData]!.containsKey(legacyKey)) {
+      return false;
+    }
+    _mergeIndexWeightKey(legacyKey, uidKey);
+    return true;
+  }
+
+  /// In-memory check: any indexData key whose suffix is not a stable [IndexUid].
+  bool _hasLegacyIndexDataKeysInCache() {
+    for (final key in _weightCache[WeightType.indexData]!.keys) {
+      final colon = key.indexOf(':');
+      if (colon <= 0 || colon >= key.length - 1) continue;
+      if (!IndexUid(key.substring(colon + 1)).looksLikeStableUid) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// Migrate on-disk / in-memory index weight keys from legacy names to [IndexUid].
+  ///
+  /// Caller persists [indexDataKeyFormat] after this returns; do not save here.
+  Future<void> _migrateLegacyIndexDataKeys({String? spaceName}) async {
+    if (!_hasLegacyIndexDataKeysInCache()) return;
+
+    final schemaMgr = _dataStore.schemaManager;
+    if (schemaMgr == null) return;
+
+    final yieldController = YieldController(
+      'WeightManager._migrateLegacyIndexDataKeys',
+      checkInterval: 100,
+    );
+
+    try {
+      final allTables = await _dataStore.getTableNames();
+      for (final tableName in allTables) {
+        await yieldController.maybeYield();
+
+        final existsInSpace =
+            await _dataStore.tableExistsInCurrentSpace(tableName);
+        if (!existsInSpace) continue;
+
+        final schema =
+            await schemaMgr.getTableSchemaByName(TableName(tableName));
+        if (schema == null) continue;
+
+        final tableUid = schema.tableUid;
+        final indexes = schemaMgr.getBtreeIndexesFor(schema);
+        for (final index in indexes) {
+          await yieldController.maybeYield();
+          if (index.indexUid.isEmpty) continue;
+
+          final legacyNames = <String>{
+            index.actualIndexName,
+            if (index.indexName != null && index.indexName!.isNotEmpty)
+              index.indexName!,
+          };
+          for (final legacy in legacyNames) {
+            _migrateLegacyIndexKey(tableUid, legacy, index.indexUid);
+          }
+        }
+      }
+
+      // Sweep orphan keys whose suffix is not a stable uid.
+      final indexCache = _weightCache[WeightType.indexData]!;
+      final keysToProcess = indexCache.keys.toList(growable: false);
+      for (final key in keysToProcess) {
+        await yieldController.maybeYield();
+        final colon = key.indexOf(':');
+        if (colon <= 0 || colon >= key.length - 1) continue;
+
+        final tableUid = TableUid(key.substring(0, colon));
+        final suffix = key.substring(colon + 1);
+        if (IndexUid(suffix).looksLikeStableUid) continue;
+
+        final schema = await schemaMgr.getTableSchema(tableUid);
+        if (schema == null) continue;
+
+        final indexUid = schemaMgr.resolveIndexUidFromField(schema, suffix);
+        if (!indexUid.looksLikeStableUid || indexUid.value == suffix) {
+          continue;
+        }
+        _migrateLegacyIndexKey(tableUid, suffix, indexUid);
+      }
+    } catch (e) {
+      Logger.warn('Failed to migrate legacy index weight keys', rawError: e);
+    }
+  }
 
   /// Ensure weights are loaded
   Future<void> _ensureWeightsLoaded({String? spaceName}) async {
@@ -663,86 +805,20 @@ class WeightManager {
     return entries.map((e) => e.key).toList();
   }
 
-  /// Rename table and its btree indexes weight keys in the weight cache
-  Future<void> renameTableWeights(
-    String oldTableName,
-    String newTableName, {
-    required List<String> oldIndexNames,
-    required List<String> newIndexNames,
-    String? spaceName,
-  }) async {
-    await _ensureWeightsLoaded(spaceName: spaceName);
-
-    var dirty = false;
-
-    // 1. Rename tableRecord weight key
-    final tableRecordCache = _weightCache[WeightType.tableRecord]!;
-    final oldTableKey = _getTableRecordKey(oldTableName);
-    final newTableKey = _getTableRecordKey(newTableName);
-    if (tableRecordCache.containsKey(oldTableKey)) {
-      final weightData = tableRecordCache.remove(oldTableKey)!;
-      tableRecordCache[newTableKey] = weightData;
-      dirty = true;
-    }
-
-    // 2. Rename indexData weight keys
-    final indexDataCache = _weightCache[WeightType.indexData]!;
-    for (int i = 0; i < oldIndexNames.length; i++) {
-      final oldIndexName = oldIndexNames[i];
-      final newIndexName =
-          i < newIndexNames.length ? newIndexNames[i] : oldIndexName;
-      final oldIndexKey = _getIndexDataKey(oldTableName, oldIndexName);
-      final newIndexKey = _getIndexDataKey(newTableName, newIndexName);
-      if (indexDataCache.containsKey(oldIndexKey)) {
-        final weightData = indexDataCache.remove(oldIndexKey)!;
-        indexDataCache[newIndexKey] = weightData;
-        dirty = true;
-      }
-    }
-
-    if (dirty) {
-      _rebuildHighWeightCache();
-      _onMutation();
-      await saveWeights(spaceName: spaceName, force: true);
-    }
-  }
-
-  /// Rename a single index weight key in the weight cache
-  Future<void> renameIndexWeights(
-    String tableName, {
-    required String oldIndexName,
-    required String newIndexName,
-    String? spaceName,
-  }) async {
-    if (oldIndexName == newIndexName) return;
-    await _ensureWeightsLoaded(spaceName: spaceName);
-
-    final indexDataCache = _weightCache[WeightType.indexData]!;
-    final oldIndexKey = _getIndexDataKey(tableName, oldIndexName);
-    final newIndexKey = _getIndexDataKey(tableName, newIndexName);
-
-    if (indexDataCache.containsKey(oldIndexKey)) {
-      final weightData = indexDataCache.remove(oldIndexKey)!;
-      indexDataCache[newIndexKey] = weightData;
-      _rebuildHighWeightCache();
-      _onMutation();
-      await saveWeights(spaceName: spaceName, force: true);
-    }
-  }
-
   /// Clear weights for a specific table
-  void clearWeightsForTable(String tableName) {
+  void clearWeightsForTable(TableContext table) {
+    final tableUid = table.tableUid;
     bool changed = false;
 
     // 1. Remove table record weight
-    if (_weightCache[WeightType.tableRecord]!.containsKey(tableName)) {
-      _weightCache[WeightType.tableRecord]!.remove(tableName);
+    if (_weightCache[WeightType.tableRecord]!.containsKey(tableUid)) {
+      _weightCache[WeightType.tableRecord]!.remove(tableUid);
       changed = true;
     }
 
     // 2. Remove index weights
     final indexCache = _weightCache[WeightType.indexData]!;
-    final prefix = '$tableName:';
+    final prefix = '$tableUid:';
     final keysToRemove =
         indexCache.keys.where((k) => k.startsWith(prefix)).toList();
     for (final key in keysToRemove) {
