@@ -1,6 +1,8 @@
 import 'dart:typed_data';
 
 import '../model/ngh_index_meta.dart';
+import '../model/table_context.dart';
+import '../model/table_identity.dart';
 import 'tree_cache.dart';
 import 'vector_quantizer.dart';
 
@@ -16,18 +18,18 @@ import 'vector_quantizer.dart';
 // by nodeId (not by page) and are tiny enough to store per-vector.
 // ============================================================================
 
-/// Hot cache for PQ codes and codebooks, keyed by [tableName, indexName].
+/// Hot cache for PQ codes and codebooks, keyed by [tableUid, indexUid].
 class VectorCache {
-  /// PQ code cache: key = [tableName, indexName, nodeId], value = Uint8List (M bytes).
+  /// PQ code cache: key = [tableUid, indexUid, nodeId], value = Uint8List (M bytes).
   /// This is the most performance-critical cache — every ADC distance check
   /// does a lookup here instead of reading a full page from disk.
   late final TreeCache<Uint8List> _pqCodeCache;
 
-  /// Codebook cache: key = [tableName, indexName], value = PqCodebook.
-  /// Uses TreeCache with groupDepth=1 (tableName) for O(1) prefix removal.
+  /// Codebook cache: key = [tableUid, indexUid], value = PqCodebook.
+  /// Uses TreeCache with groupDepth=1 (tableUid) for O(1) prefix removal.
   late final TreeCache<PqCodebook> _codebookCache;
 
-  /// NghIndexMeta cache: key = [tableName, indexName], value = NghIndexMeta.
+  /// NghIndexMeta cache: key = [tableUid, indexUid], value = NghIndexMeta.
   late final TreeCache<NghIndexMeta> _metaCache;
 
   VectorCache({int pqCodeBudgetBytes = 64 * 1024 * 1024}) {
@@ -35,7 +37,7 @@ class VectorCache {
       sizeCalculator: (code) => code.length + 16, // overhead
       maxByteThreshold: pqCodeBudgetBytes,
       minByteThreshold: (pqCodeBudgetBytes * 0.7).round(),
-      groupDepth: 2, // [tableName, indexName]
+      groupDepth: 2, // [tableUid, indexUid]
       debugLabel: 'VectorPqCodeCache',
     );
 
@@ -43,7 +45,7 @@ class VectorCache {
       sizeCalculator: (cb) => cb.data.lengthInBytes + 64,
       maxByteThreshold: 64 * 1024 * 1024, // 64MB — codebooks are small
       minByteThreshold: 32 * 1024 * 1024,
-      groupDepth: 1, // [tableName]
+      groupDepth: 1, // [tableUid]
       debugLabel: 'VectorCodebookCache',
     );
 
@@ -51,7 +53,7 @@ class VectorCache {
       sizeCalculator: (_) => 512, // small fixed-size
       maxByteThreshold: 64 * 1024 * 1024, // 64MB — codebooks are small
       minByteThreshold: 32 * 1024 * 1024,
-      groupDepth: 1, // [tableName]
+      groupDepth: 1, // [tableUid]
       debugLabel: 'VectorMetaCache',
     );
   }
@@ -61,21 +63,21 @@ class VectorCache {
   // =====================================================================
 
   /// Get cached PQ code for a node.
-  Uint8List? getPqCode(String tableName, String indexName, int nodeId) {
-    return _pqCodeCache.get([tableName, indexName, nodeId]);
+  Uint8List? getPqCode(TableContext table, IndexUid indexUid, int nodeId) {
+    return _pqCodeCache.get([table.tableUid, indexUid, nodeId]);
   }
 
   /// Cache a PQ code for a node.
   void putPqCode(
-      String tableName, String indexName, int nodeId, Uint8List code) {
-    _pqCodeCache.put([tableName, indexName, nodeId], code);
+      TableContext table, IndexUid indexUid, int nodeId, Uint8List code) {
+    _pqCodeCache.put([table.tableUid, indexUid, nodeId], code);
   }
 
   /// Batch-cache PQ codes for a range of nodes (e.g. after reading a PQ page).
-  void putPqCodeBatch(String tableName, String indexName, int startNodeId,
+  void putPqCodeBatch(TableContext table, IndexUid indexUid, int startNodeId,
       List<Uint8List> codes) {
     for (int i = 0; i < codes.length; i++) {
-      _pqCodeCache.put([tableName, indexName, startNodeId + i], codes[i]);
+      _pqCodeCache.put([table.tableUid, indexUid, startNodeId + i], codes[i]);
     }
   }
 
@@ -84,18 +86,18 @@ class VectorCache {
   // =====================================================================
 
   /// Get cached codebook for an index.
-  PqCodebook? getCodebook(String tableName, String indexName) {
-    return _codebookCache.get([tableName, indexName]);
+  PqCodebook? getCodebook(TableContext table, IndexUid indexUid) {
+    return _codebookCache.get([table.tableUid, indexUid]);
   }
 
   /// Cache a codebook for an index.
-  void putCodebook(String tableName, String indexName, PqCodebook codebook) {
-    _codebookCache.put([tableName, indexName], codebook);
+  void putCodebook(TableContext table, IndexUid indexUid, PqCodebook codebook) {
+    _codebookCache.put([table.tableUid, indexUid], codebook);
   }
 
   /// Remove cached codebook (e.g. after retraining).
-  void removeCodebook(String tableName, String indexName) {
-    _codebookCache.remove([tableName, indexName]);
+  void removeCodebook(TableContext table, IndexUid indexUid) {
+    _codebookCache.remove([table.tableUid, indexUid]);
   }
 
   // =====================================================================
@@ -103,13 +105,13 @@ class VectorCache {
   // =====================================================================
 
   /// Get cached NghIndexMeta.
-  NghIndexMeta? getMeta(String tableName, String indexName) {
-    return _metaCache.get([tableName, indexName]);
+  NghIndexMeta? getMeta(TableContext table, IndexUid indexUid) {
+    return _metaCache.get([table.tableUid, indexUid]);
   }
 
   /// Cache NghIndexMeta.
-  void putMeta(String tableName, String indexName, NghIndexMeta meta) {
-    _metaCache.put([tableName, indexName], meta);
+  void putMeta(TableContext table, IndexUid indexUid, NghIndexMeta meta) {
+    _metaCache.put([table.tableUid, indexUid], meta);
   }
 
   // =====================================================================
@@ -130,17 +132,17 @@ class VectorCache {
   }
 
   /// Clear all caches for a specific table (O(1) via TreeCache group prefix).
-  void clearForTable(String tableName) {
-    _pqCodeCache.remove([tableName]);
-    _codebookCache.remove([tableName]);
-    _metaCache.remove([tableName]);
+  void clearForTable(TableUid tableUid) {
+    _pqCodeCache.remove([tableUid]);
+    _codebookCache.remove([tableUid]);
+    _metaCache.remove([tableUid]);
   }
 
   /// Clear all caches for a specific index.
-  void clearForIndex(String tableName, String indexName) {
-    _pqCodeCache.remove([tableName, indexName]);
-    _codebookCache.remove([tableName, indexName]);
-    _metaCache.remove([tableName, indexName]);
+  void clearForIndex(TableUid tableUid, IndexUid indexUid) {
+    _pqCodeCache.remove([tableUid, indexUid]);
+    _codebookCache.remove([tableUid, indexUid]);
+    _metaCache.remove([tableUid, indexUid]);
   }
 
   /// Clear all vector caches.
