@@ -1,3 +1,4 @@
+import '../model/table_identity.dart';
 import '../model/wal_pointer.dart';
 
 /// Table-level WAL-tracked maintenance operation (e.g., clear / drop table).
@@ -11,15 +12,15 @@ class TableOpMeta {
   /// Unique operation id (generated via GlobalIdGenerator).
   final String opId;
 
-  /// Target table name.
-  final String table;
+  /// Target table stable identifier.
+  final TableUid tableUid;
 
   /// Operation type: 'clear' | 'drop'.
   final String type;
 
   /// WAL pointer at which this operation logically takes effect.
   ///
-  /// All WAL entries for [table] at or before this pointer should be skipped
+  /// All WAL entries for [tableUid] at or before this pointer should be skipped
   /// during recovery, because the clear/drop operation rewrites the table
   /// state at this boundary.
   final WalPointer cutoff;
@@ -34,7 +35,7 @@ class TableOpMeta {
 
   TableOpMeta({
     required this.opId,
-    required this.table,
+    required this.tableUid,
     required this.type,
     required this.cutoff,
     required this.createdAt,
@@ -43,7 +44,7 @@ class TableOpMeta {
 
   TableOpMeta copyWith({bool? completed}) => TableOpMeta(
         opId: opId,
-        table: table,
+        tableUid: tableUid,
         type: type,
         cutoff: cutoff,
         createdAt: createdAt,
@@ -52,7 +53,7 @@ class TableOpMeta {
 
   Map<String, dynamic> toJson() => {
         'opId': opId,
-        'table': table,
+        'tableUid': tableUid,
         'type': type,
         'cutoff': cutoff.toJson(),
         'createdAt': createdAt,
@@ -61,7 +62,8 @@ class TableOpMeta {
 
   static TableOpMeta fromJson(Map<String, dynamic> json) => TableOpMeta(
         opId: (json['opId'] as String?) ?? '',
-        table: (json['table'] as String?) ?? '',
+        tableUid: TableUid(
+            (json['tableUid'] ?? json['table'] ?? json['tableName']) as String),
         type: (json['type'] as String?) ?? 'clear',
         cutoff: WalPointer.fromJson((json['cutoff'] as Map<String, dynamic>)),
         createdAt:
