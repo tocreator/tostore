@@ -1,11 +1,12 @@
 import 'dart:convert';
 import '../model/query_aggregation.dart';
 import '../model/join_clause.dart';
+import '../model/table_identity.dart';
 import 'query_condition.dart';
 
 /// query cache key
 class QueryCacheKey {
-  final String tableName;
+  final TableUid tableUid;
   final QueryCondition condition;
   final List<String>? orderBy;
   final int? limit;
@@ -19,7 +20,7 @@ class QueryCacheKey {
   String? _cachedString;
 
   QueryCacheKey({
-    required this.tableName,
+    required this.tableUid,
     required this.condition,
     this.orderBy,
     this.limit,
@@ -40,7 +41,7 @@ class QueryCacheKey {
     try {
       // Uniformly generate cache keys for easier comparison and lookup
       final Map<String, dynamic> keyData = {
-        'tableName': tableName,
+        'tableUid': tableUid,
         'condition': condition.build(),
       };
 
@@ -77,7 +78,7 @@ class QueryCacheKey {
     } catch (e) {
       // Final fallback option, ensure cache key can always be generated
       final fallbackKey =
-          '$tableName-${condition.build()}-${DateTime.now().millisecondsSinceEpoch}';
+          '$tableUid-${condition.build()}-${DateTime.now().millisecondsSinceEpoch}';
       return fallbackKey;
     }
   }
@@ -98,7 +99,7 @@ class QueryCacheKey {
   int get hashCode {
     // Use consistent JSON structure to calculate hash values, ensure equivalent objects have the same hash
     final Map<String, dynamic> keyData = {
-      'tableName': tableName,
+      'tableUid': tableUid,
       'condition': condition.build().toString(),
     };
 
