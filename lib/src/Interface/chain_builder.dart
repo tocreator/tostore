@@ -15,6 +15,7 @@ import '../model/join_clause.dart';
 import '../model/query_result.dart';
 import '../model/query_aggregation.dart';
 import '../query/query_cache.dart';
+import '../model/table_identity.dart';
 import '../query/query_executor.dart';
 import '../core/yield_controller.dart';
 
