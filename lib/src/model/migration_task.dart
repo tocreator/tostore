@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'migration_write_mode.dart';
 import 'meta_info.dart';
+import 'table_identity.dart';
 import 'table_schema.dart';
 import 'wal_pointer.dart';
 import 'result_status.dart';
@@ -11,7 +12,7 @@ class MigrationTask {
   // task id
   final String taskId;
   // table unique id
-  final String tableUid;
+  final TableUid tableUid;
   // whether the table structure is updated
   final bool isSchemaUpdated;
   // pending migration spaces
@@ -42,8 +43,8 @@ class MigrationTask {
   final String? backupPath;
   // target write mode for background execution
   final MigrationWriteMode? writeMode;
-  // specific index names to build during execution (null means all)
-  final List<String>? specificIndexes;
+  // specific index uids to build during execution (null means all)
+  final List<String>? specificIndexUids;
   // execution errors
   final List<ResultStatus>? errors;
   // estimated migration duration
@@ -67,14 +68,14 @@ class MigrationTask {
     this.spaceCheckpointKeys = const <String, String>{},
     this.backupPath,
     this.writeMode,
-    this.specificIndexes,
+    this.specificIndexUids,
     this.errors,
     this.estimateDuration,
   });
 
   /// Compatibility getter for tableName (returns old table name, falls back to target or uid)
-  String get tableName =>
-      oldSchemaSnapshot?.name ?? targetSchemaSnapshot?.name ?? tableUid;
+  TableName get tableName => TableName(
+      oldSchemaSnapshot?.name ?? targetSchemaSnapshot?.name ?? tableUid);
 
   /// Compatibility getter for currentTableName (rename-aware current active physical name)
   String? get currentTableName => isSchemaUpdated
@@ -94,7 +95,7 @@ class MigrationTask {
           )
         : null;
 
-    final tableUid = json['tableUid'] as String? ??
+    final resolvedUid = json['tableUid'] as String? ??
         (oldSchema != null && oldSchema.tableUid.isNotEmpty
             ? oldSchema.tableUid
             : null) ??
@@ -105,7 +106,7 @@ class MigrationTask {
 
     return MigrationTask(
       taskId: json['taskId'] as String,
-      tableUid: tableUid,
+      tableUid: TableUid(resolvedUid),
       isSchemaUpdated: json['isSchemaUpdated'] as bool,
       pendingMigrationSpaces:
           (json['pendingMigrationSpaces'] as List).cast<String>(),
@@ -141,10 +142,12 @@ class MigrationTask {
           ? MigrationWriteMode.values
               .firstWhere((e) => e.name == json['writeMode'])
           : null,
-      specificIndexes: (json['specificIndexes'] as List?)?.cast<String>(),
+      specificIndexUids:
+          ((json['specificIndexUids'] ?? json['specificIndexes']) as List?)
+              ?.cast<String>(),
       errors: (json['errors'] as List?)
-          ?.map((e) =>
-              ResultStatus.fromJson(Map<String, dynamic>.from(e as Map)))
+          ?.map(
+              (e) => ResultStatus.fromJson(Map<String, dynamic>.from(e as Map)))
           .toList(),
       estimateDuration: json['estimateDuration'] != null
           ? Duration(microseconds: json['estimateDuration'] as int)
@@ -172,7 +175,7 @@ class MigrationTask {
           'spaceCheckpointKeys': spaceCheckpointKeys,
         if (backupPath != null) 'backupPath': backupPath,
         if (writeMode != null) 'writeMode': writeMode!.name,
-        if (specificIndexes != null) 'specificIndexes': specificIndexes,
+        if (specificIndexUids != null) 'specificIndexUids': specificIndexUids,
         if (errors != null) 'errors': errors!.map((e) => e.toJson()).toList(),
         if (estimateDuration != null)
           'estimateDuration': estimateDuration!.inMicroseconds,
@@ -249,7 +252,7 @@ class MigrationTask {
   /// create a copy (basic method)
   MigrationTask copyWith({
     String? taskId,
-    String? tableUid,
+    TableUid? tableUid,
     bool? isSchemaUpdated,
     List<String>? pendingMigrationSpaces,
     List<String>? pendingPhysicalRenameSpaces,
@@ -265,7 +268,7 @@ class MigrationTask {
     Map<String, String>? spaceCheckpointKeys,
     String? backupPath,
     MigrationWriteMode? writeMode,
-    List<String>? specificIndexes,
+    List<String>? specificIndexUids,
     List<ResultStatus>? errors,
     Duration? estimateDuration,
   }) =>
@@ -291,7 +294,7 @@ class MigrationTask {
         spaceCheckpointKeys: spaceCheckpointKeys ?? this.spaceCheckpointKeys,
         backupPath: backupPath ?? this.backupPath,
         writeMode: writeMode ?? this.writeMode,
-        specificIndexes: specificIndexes ?? this.specificIndexes,
+        specificIndexUids: specificIndexUids ?? this.specificIndexUids,
         errors: errors ?? this.errors,
         estimateDuration: estimateDuration ?? this.estimateDuration,
       );
