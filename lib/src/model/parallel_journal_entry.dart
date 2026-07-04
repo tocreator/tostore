@@ -2,6 +2,17 @@
 /// Keep JSON schema compatible with existing map-based entries.
 library;
 
+/// Resolve persisted table reference from journal JSON (uid preferred).
+String resolveTableFieldFromJson(Map<String, dynamic> json) {
+  final tableUid = json['tableUid'];
+  if (tableUid is String && tableUid.isNotEmpty) return tableUid;
+  final table = json['table'];
+  if (table is String && table.isNotEmpty) return table;
+  final tableName = json['tableName'];
+  if (tableName is String && tableName.isNotEmpty) return tableName;
+  return '';
+}
+
 abstract class ParallelJournalEntry {
   String get type; // discriminator
   Map<String, dynamic> toJson();
@@ -190,7 +201,7 @@ class TaskDoneEntry extends ParallelJournalEntry {
 
   static TaskDoneEntry fromJson(Map<String, dynamic> json) => TaskDoneEntry(
         at: (json['at'] as String?) ?? '',
-        table: (json['table'] as String?) ?? '',
+        table: resolveTableFieldFromJson(json),
         count: (json['count'] as num?)?.toInt() ?? 0,
         batchId: (json['batchId'] as String?),
         batchType: BatchType.fromString(
@@ -244,7 +255,7 @@ class TablePartitionFlushedEntry extends ParallelJournalEntry {
     final totalSizeInBytes = (json['totalSizeInBytes'] as num?)?.toInt();
 
     return TablePartitionFlushedEntry(
-      table: (json['table'] as String?) ?? '',
+      table: resolveTableFieldFromJson(json),
       partitionNo: partitionNo,
       totalRecords: totalRecords,
       totalSizeInBytes: totalSizeInBytes,
@@ -275,7 +286,7 @@ class TableMetaUpdatedEntry extends ParallelJournalEntry {
 
   static TableMetaUpdatedEntry fromJson(Map<String, dynamic> json) =>
       TableMetaUpdatedEntry(
-        table: (json['table'] as String?) ?? '',
+        table: resolveTableFieldFromJson(json),
         batchId: (json['batchId'] as String?),
         batchType: BatchType.fromString(
             (json['batchType'] as String?) ?? (json['scope'] as String?)),
@@ -332,7 +343,7 @@ class IndexPartitionFlushedEntry extends ParallelJournalEntry {
     final totalSizeInBytes = (json['totalSizeInBytes'] as num?)?.toInt();
 
     return IndexPartitionFlushedEntry(
-      table: (json['table'] as String?) ?? '',
+      table: resolveTableFieldFromJson(json),
       index: (json['index'] as String?) ?? '',
       partitionNo: partitionNo,
       totalEntries: totalEntries,
@@ -367,7 +378,7 @@ class IndexMetaUpdatedEntry extends ParallelJournalEntry {
 
   static IndexMetaUpdatedEntry fromJson(Map<String, dynamic> json) =>
       IndexMetaUpdatedEntry(
-        table: (json['table'] as String?) ?? '',
+        table: resolveTableFieldFromJson(json),
         index: (json['index'] as String?) ?? '',
         batchId: (json['batchId'] as String?),
         batchType: BatchType.fromString(
