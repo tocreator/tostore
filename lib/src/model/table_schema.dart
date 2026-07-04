@@ -7,9 +7,10 @@ import '../handler/memcomparable.dart';
 import '../handler/sha256.dart';
 import '../handler/value_matcher.dart';
 import 'db_exception.dart';
+import 'id_generator.dart';
 import 'result_status.dart';
 import 'result_type.dart';
-import 'id_generator.dart';
+import 'table_identity.dart';
 
 /// table schema
 class TableSchema {
@@ -43,7 +44,7 @@ class TableSchema {
   final String? tableId;
 
   /// Stable internal unique identifier for routing and buffers
-  final String tableUid;
+  final TableUid tableUid;
 
   /// Schema structure version tracking migration tasks
   final String? schemaVersion;
@@ -69,7 +70,7 @@ class TableSchema {
     this.isGlobal = false,
     this.tableId,
     this.ttlConfig,
-  })  : tableUid = '',
+  })  : tableUid = TableUid.empty,
         schemaVersion = null,
         isSystemTable = false,
         autoIndexes = null;
@@ -84,7 +85,7 @@ class TableSchema {
     required this.isGlobal,
     this.tableId,
     this.ttlConfig,
-    this.tableUid = '',
+    this.tableUid = TableUid.empty,
     this.schemaVersion,
     required this.isSystemTable,
     this.autoIndexes,
@@ -257,14 +258,14 @@ class TableSchema {
             }
           }
         }
-        if (matchedOldIdx != null && matchedOldIdx.indexUid != null) {
+        if (matchedOldIdx != null && matchedOldIdx.indexUid.isNotEmpty) {
           resolvedImplicit =
               implicit.copyWith(indexUid: matchedOldIdx.indexUid);
         }
       }
-      if (resolvedImplicit.indexUid == null) {
+      if (resolvedImplicit.indexUid.isEmpty) {
         resolvedImplicit = resolvedImplicit.copyWith(
-          indexUid: GlobalIdGenerator.generate("i"),
+          indexUid: IndexUid(GlobalIdGenerator.generate("i")),
         );
       }
       populatedAutoIndexes.add(resolvedImplicit);
@@ -273,7 +274,7 @@ class TableSchema {
     final List<IndexSchema> populatedExplicitIndexes = [];
     for (final explicit in indexes) {
       IndexSchema resolvedExplicit = explicit;
-      if (resolvedExplicit.indexUid == null && oldSchema != null) {
+      if (resolvedExplicit.indexUid.isEmpty && oldSchema != null) {
         IndexSchema? matchedOldIdx;
         for (final idx in oldSchema.indexes) {
           if (idx.actualIndexName == explicit.actualIndexName ||
@@ -291,14 +292,14 @@ class TableSchema {
             }
           }
         }
-        if (matchedOldIdx != null && matchedOldIdx.indexUid != null) {
+        if (matchedOldIdx != null && matchedOldIdx.indexUid.isNotEmpty) {
           resolvedExplicit =
               explicit.copyWith(indexUid: matchedOldIdx.indexUid);
         }
       }
-      if (resolvedExplicit.indexUid == null) {
+      if (resolvedExplicit.indexUid.isEmpty) {
         resolvedExplicit = resolvedExplicit.copyWith(
-          indexUid: GlobalIdGenerator.generate("i"),
+          indexUid: IndexUid(GlobalIdGenerator.generate("i")),
         );
       }
       populatedExplicitIndexes.add(resolvedExplicit);
@@ -857,7 +858,7 @@ class TableSchema {
     bool? isGlobal,
     String? tableId,
     TableTtlConfig? ttlConfig,
-    String? tableUid,
+    TableUid? tableUid,
     String? schemaVersion,
     bool? isSystemTable,
     List<IndexSchema>? autoIndexes,
@@ -943,7 +944,7 @@ class TableSchema {
       ttlConfig: json['ttlConfig'] is Map<String, dynamic>
           ? TableTtlConfig.fromJson(json['ttlConfig'] as Map<String, dynamic>)
           : null,
-      tableUid: (json['tableUid'] as String?) ?? '',
+      tableUid: TableUid((json['tableUid'] as String?) ?? ''),
       schemaVersion: json['schemaVersion'] as String?,
       isSystemTable: json['isSystemTable'] as bool? ?? false,
       autoIndexes: (json['autoIndexes'] as List?)
@@ -2145,8 +2146,12 @@ class IndexSchema {
   /// Vector index configuration (only valid when type is IndexType.vector)
   final VectorIndexConfig? vectorConfig;
 
-  /// Index unique identifier
-  final String? indexUid;
+  /// Stable unique identifier (immutable across renames).
+  ///
+  /// Assigned by [TableSchema.generateAutoIndexes] before schema persistence.
+  /// May be [IndexUid.empty] only on in-memory [IndexSchema] builders prior to
+  /// the first [SchemaManager.saveTableSchema] / v3 upgrade pass.
+  final IndexUid indexUid;
 
   const IndexSchema({
     this.indexName,
@@ -2154,7 +2159,7 @@ class IndexSchema {
     this.unique = false,
     this.type = IndexType.btree,
     this.vectorConfig,
-  }) : indexUid = null;
+  }) : indexUid = IndexUid.empty;
 
   const IndexSchema._internal({
     this.indexName,
@@ -2162,7 +2167,7 @@ class IndexSchema {
     required this.unique,
     required this.type,
     this.vectorConfig,
-    this.indexUid,
+    this.indexUid = IndexUid.empty,
   });
 
   /// get actual index name
@@ -2207,7 +2212,8 @@ class IndexSchema {
       unique: json['unique'] as bool? ?? false,
       type: indexType,
       vectorConfig: vectorConfig,
-      indexUid: json['indexUid'] as String?,
+      indexUid:
+          IndexUid.tryParse(json['indexUid'] as String?) ?? IndexUid.empty,
     );
   }
 
@@ -2218,7 +2224,7 @@ class IndexSchema {
       'unique': unique,
       'type': type.toString().split('.').last,
       if (vectorConfig != null) 'vectorConfig': vectorConfig!.toJson(),
-      if (indexUid != null) 'indexUid': indexUid,
+      if (indexUid.isNotEmpty) 'indexUid': indexUid,
     };
   }
 
@@ -2228,7 +2234,7 @@ class IndexSchema {
     bool? unique,
     IndexType? type,
     VectorIndexConfig? vectorConfig,
-    String? indexUid,
+    IndexUid? indexUid,
   }) {
     return IndexSchema._internal(
       indexName: indexName ?? this.indexName,
