@@ -9,19 +9,21 @@ import '../model/data_block_entry.dart';
 import '../model/index_search.dart';
 import '../model/system_table.dart';
 import '../model/table_schema.dart';
+import '../model/table_context.dart';
 import '../query/query_condition.dart';
 import 'crontab_manager.dart';
 import 'data_store_impl.dart';
 import 'workload_scheduler.dart';
 import 'yield_controller.dart';
+import '../model/table_identity.dart';
 
 class _TtlCleanupPlan {
-  final String tableName;
+  final TableUid tableUid;
   final int ttlMs;
   final String sourceField;
 
   const _TtlCleanupPlan({
-    required this.tableName,
+    required this.tableUid,
     required this.ttlMs,
     required this.sourceField,
   });
@@ -96,7 +98,7 @@ class TtlCleanupManager {
 
     final ttl = schema.ttlConfig;
     if (ttl == null) {
-      _planCache.remove(schema.name);
+      _planCache.remove(schema.tableUid);
       _planCacheRefreshedMs = DateTime.now().millisecondsSinceEpoch;
       return;
     }
@@ -105,17 +107,17 @@ class TtlCleanupManager {
         ? _systemIngestTsMsField
         : ttl.sourceField!;
 
-    _planCache[schema.name] = _TtlCleanupPlan(
-      tableName: schema.name,
+    _planCache[schema.tableUid] = _TtlCleanupPlan(
+      tableUid: schema.tableUid,
       ttlMs: ttl.ttlMs,
       sourceField: sourceField,
     );
     _planCacheRefreshedMs = DateTime.now().millisecondsSinceEpoch;
   }
 
-  void removePlanForTable(String tableName) {
+  void removePlanForTable(TableContext table) {
     if (!_planCacheFullyLoaded) return;
-    _planCache.remove(tableName);
+    _planCache.remove(table.tableUid);
     _planCacheRefreshedMs = DateTime.now().millisecondsSinceEpoch;
   }
 
@@ -138,6 +140,17 @@ class TtlCleanupManager {
       SystemTable.getKeyValueName(false),
       SystemTable.getKeyValueName(true),
     ];
+  }
+
+  Future<List<TableContext>> _systemKvTableContexts() async {
+    final contexts = <TableContext>[];
+    for (final name in _systemKvTables()) {
+      final uid = _dataStore.schemaManager?.getUidByName(TableName(name));
+      if (uid == null) continue;
+      final ctx = await _dataStore.schemaManager?.getTableContext(uid);
+      if (ctx != null) contexts.add(ctx);
+    }
+    return contexts;
   }
 
   Future<Map<String, _TtlCleanupPlan>> _getCleanupPlans() async {
@@ -177,8 +190,8 @@ class TtlCleanupManager {
       final tasks = tables
           .map<Future<_TtlCleanupPlan?> Function()>(
             (table) => () async {
-              final schema =
-                  await _dataStore.schemaManager?.getTableSchema(table);
+              final schema = await _dataStore.schemaManager
+                  ?.getTableSchemaByName(TableName(table));
               final ttl = schema?.ttlConfig;
               if (schema == null || ttl == null) return null;
 
@@ -188,7 +201,7 @@ class TtlCleanupManager {
                       : ttl.sourceField!;
 
               return _TtlCleanupPlan(
-                tableName: table,
+                tableUid: schema.tableUid,
                 ttlMs: ttl.ttlMs,
                 sourceField: sourceField,
               );
@@ -207,7 +220,7 @@ class TtlCleanupManager {
         ..clear()
         ..addEntries(
           results.whereType<_TtlCleanupPlan>().map(
-                (plan) => MapEntry(plan.tableName, plan),
+                (plan) => MapEntry(plan.tableUid, plan),
               ),
         );
       _planCacheRefreshedMs = nowMs;
@@ -226,26 +239,36 @@ class TtlCleanupManager {
     DateTime cycleNow, {
     required int batchSize,
   }) async {
+    final tableName =
+        _dataStore.schemaManager?.resolveTableNameFromField(plan.tableUid) ??
+            TableName(plan.tableUid);
     try {
+      final table =
+          await _dataStore.schemaManager?.getTableContext(plan.tableUid);
+      if (table == null) {
+        return const _TtlBatchResult(deleted: 0, ok: false);
+      }
       final cutoff = cycleNow.subtract(Duration(milliseconds: plan.ttlMs));
       final cutoffIso = cutoff.toIso8601String();
 
       // Internal TTL source is virtual/index-only. Use TTL index range scan to fetch PKs.
       if (plan.sourceField == _systemIngestTsMsField) {
-        final schema =
-            await _dataStore.schemaManager?.getTableSchema(plan.tableName);
-        if (schema == null) {
-          return const _TtlBatchResult(deleted: 0, ok: false);
+        final schema = table.schema;
+        IndexUid? ttlIndexUid;
+        for (final idx in schema.getAllIndexes()) {
+          if (idx.fields.contains(TableSchema.internalTtlIngestTsMsField) &&
+              idx.indexUid.isNotEmpty) {
+            ttlIndexUid = idx.indexUid;
+            break;
+          }
         }
-        final ttlIndexName = IndexSchema(
-          indexName: TableSchema.internalTtlIngestTsMsField,
-          fields: const [TableSchema.internalTtlIngestTsMsField],
-          unique: false,
-        ).actualIndexName;
+        if (ttlIndexUid == null || ttlIndexUid.isEmpty) {
+          return const _TtlBatchResult(deleted: 0, ok: true);
+        }
 
         final res = await _dataStore.indexManager?.searchIndex(
-          plan.tableName,
-          ttlIndexName,
+          table,
+          ttlIndexUid,
           IndexCondition.lessThanOrEqual(cutoffIso),
           limit: batchSize,
         );
@@ -259,13 +282,13 @@ class TtlCleanupManager {
         final pkName = schema.primaryKey;
         final condition = QueryCondition()..whereIn(pkName, pks);
         final r = await _dataStore.deleteInternal(
-          plan.tableName,
+          table,
           condition,
           limit: batchSize,
         );
         if (!r.isSuccess) {
           Logger.warn(
-            'TTL cleanup delete failed on ${plan.tableName}: ${r.message}',
+            'TTL cleanup delete failed on $tableName: ${r.message}',
           );
           return const _TtlBatchResult(deleted: 0, ok: false);
         }
@@ -277,41 +300,50 @@ class TtlCleanupManager {
         if (deletedCount > 0 &&
             entries != null &&
             entries.length == pks.length) {
-          try {
-            final meta = await _dataStore.indexManager
-                ?.getIndexMeta(plan.tableName, ttlIndexName);
-            if (meta != null) {
-              // Build pk -> index positions map to align deleted PKs with index keys.
-              final Map<String, List<Uint8List>> keysByPk = {};
-              for (final e in entries) {
-                (keysByPk[e.primaryKey] ??= <Uint8List>[]).add(e.keyBytes);
-              }
+          IndexSchema? ttlIndex;
+          for (final idx in schema.getAllIndexes()) {
+            if (idx.fields.contains(TableSchema.internalTtlIngestTsMsField)) {
+              ttlIndex = idx;
+              break;
+            }
+          }
+          if (ttlIndex != null && ttlIndex.indexUid.isNotEmpty) {
+            try {
+              final meta = await _dataStore.indexManager
+                  ?.getIndexMeta(table, ttlIndex.indexUid);
+              if (meta != null) {
+                // Build pk -> index positions map to align deleted PKs with index keys.
+                final Map<String, List<Uint8List>> keysByPk = {};
+                for (final e in entries) {
+                  (keysByPk[e.primaryKey] ??= <Uint8List>[]).add(e.keyBytes);
+                }
 
-              Uint8List encodeDeleteValue() =>
-                  Uint8List.fromList(const <int>[1]);
+                Uint8List encodeDeleteValue() =>
+                    Uint8List.fromList(const <int>[1]);
 
-              final deltas = <DataBlockEntry>[];
-              for (final pk in r.successKeys) {
-                final keyList = keysByPk[pk];
-                if (keyList == null || keyList.isEmpty) continue;
-                for (final keyBytes in keyList) {
-                  if (keyBytes.isEmpty) continue;
-                  deltas.add(DataBlockEntry(keyBytes, encodeDeleteValue()));
+                final deltas = <DataBlockEntry>[];
+                for (final pk in r.successKeys) {
+                  final keyList = keysByPk[pk];
+                  if (keyList == null || keyList.isEmpty) continue;
+                  for (final keyBytes in keyList) {
+                    if (keyBytes.isEmpty) continue;
+                    deltas.add(DataBlockEntry(keyBytes, encodeDeleteValue()));
+                  }
+                }
+
+                if (deltas.isNotEmpty) {
+                  await _dataStore.indexTreePartitionManager?.writeChanges(
+                    table: table,
+                    indexUid: ttlIndex.indexUid,
+                    indexMeta: meta,
+                    deltas: deltas,
+                  );
                 }
               }
-
-              if (deltas.isNotEmpty) {
-                await _dataStore.indexTreePartitionManager?.writeChanges(
-                  tableName: plan.tableName,
-                  indexName: ttlIndexName,
-                  indexMeta: meta,
-                  deltas: deltas,
-                );
-              }
+            } catch (e) {
+              Logger.warn('TTL index cleanup failed on $tableName',
+                  rawError: e);
             }
-          } catch (e) {
-            Logger.warn('TTL index cleanup failed on ${plan.tableName}',
-                rawError: e);
           }
         }
 
@@ -322,21 +354,21 @@ class TtlCleanupManager {
       final condition = QueryCondition()
         ..whereLessThanOrEqualTo(plan.sourceField, cutoffIso);
       final r = await _dataStore.deleteInternal(
-        plan.tableName,
+        table,
         condition,
         orderBy: [plan.sourceField],
         limit: batchSize,
       );
       if (!r.isSuccess) {
         Logger.warn(
-          'TTL cleanup delete failed on ${plan.tableName}: ${r.message}',
+          'TTL cleanup delete failed on $tableName: ${r.message}',
         );
         return const _TtlBatchResult(deleted: 0, ok: false);
       }
 
       return _TtlBatchResult(deleted: r.successKeys.length, ok: true);
     } catch (e) {
-      Logger.warn('TTL cleanup batch failed on ${plan.tableName}', rawError: e);
+      Logger.warn('TTL cleanup batch failed on $tableName', rawError: e);
       return const _TtlBatchResult(deleted: 0, ok: false);
     }
   }
@@ -374,29 +406,27 @@ class TtlCleanupManager {
   }
 
   Future<void> _removeKvExpiryIndexEntry(
-    String tableName,
+    TableContext table,
     Uint8List keyBytes,
   ) async {
     if (keyBytes.isEmpty) return;
     await _dataStore.indexManager
-        ?.removeInternalKvExpiryIndexEntryByRawKey(tableName, keyBytes);
+        ?.removeInternalKvExpiryIndexEntryByRawKey(table, keyBytes);
   }
 
   Future<_TtlBatchResult> _runKvCleanupBatch(
-    String tableName,
+    TableContext table,
     DateTime cycleNow, {
     required int batchSize,
   }) async {
+    final tableName = table.tableName;
     try {
-      final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
-      if (schema == null) {
-        return const _TtlBatchResult(deleted: 0, ok: false);
-      }
+      final schema = table.schema;
 
       final pkName = schema.primaryKey;
       final res =
           await _dataStore.indexManager?.searchInternalKvExpiryIndexUpTo(
-        tableName,
+        table,
         cycleNow,
         limit: batchSize,
       );
@@ -412,12 +442,12 @@ class TtlCleanupManager {
         await yieldController.maybeYield();
 
         final rows = await _dataStore.executeQuery(
-          tableName,
+          table,
           QueryCondition()..where(pkName, '=', entry.primaryKey),
           limit: 1,
         );
         if (rows.isEmpty) {
-          await _removeKvExpiryIndexEntry(tableName, entry.keyBytes);
+          await _removeKvExpiryIndexEntry(table, entry.keyBytes);
           continue;
         }
 
@@ -425,18 +455,18 @@ class TtlCleanupManager {
         final currentExpiresAtIso =
             _normalizeDateTimeIso(row[SystemTable.keyValueExpiresAtField]);
         if (currentExpiresAtIso == null) {
-          await _removeKvExpiryIndexEntry(tableName, entry.keyBytes);
+          await _removeKvExpiryIndexEntry(table, entry.keyBytes);
           continue;
         }
 
         final currentExpiresAt = DateTime.tryParse(currentExpiresAtIso);
         if (currentExpiresAt == null || currentExpiresAt.isAfter(cycleNow)) {
-          await _removeKvExpiryIndexEntry(tableName, entry.keyBytes);
+          await _removeKvExpiryIndexEntry(table, entry.keyBytes);
           continue;
         }
 
         final deleteResult = await _dataStore.deleteInternal(
-          tableName,
+          table,
           QueryCondition()
             ..where(pkName, '=', entry.primaryKey)
             ..where(
@@ -457,25 +487,25 @@ class TtlCleanupManager {
           deletedCount += deleteResult.successKeys.length;
         }
 
-        await _removeKvExpiryIndexEntry(tableName, entry.keyBytes);
+        await _removeKvExpiryIndexEntry(table, entry.keyBytes);
 
         if (deleteResult.successKeys.isNotEmpty) {
           final currentKeyBytes =
               await _dataStore.indexManager?.encodeInternalKvExpiryIndexKey(
-            tableName,
+            table,
             expiresAt: currentExpiresAtIso,
             primaryKey: entry.primaryKey,
           );
           if (currentKeyBytes != null &&
               currentKeyBytes.isNotEmpty &&
               MemComparableKey.compare(currentKeyBytes, entry.keyBytes) != 0) {
-            await _removeKvExpiryIndexEntry(tableName, currentKeyBytes);
+            await _removeKvExpiryIndexEntry(table, currentKeyBytes);
           }
         } else {
           final candidateExpiresAtIso = _decodeKvExpiryIso(entry.keyBytes);
           if (candidateExpiresAtIso != null &&
               candidateExpiresAtIso != currentExpiresAtIso) {
-            await _removeKvExpiryIndexEntry(tableName, entry.keyBytes);
+            await _removeKvExpiryIndexEntry(table, entry.keyBytes);
           }
         }
       }
@@ -492,7 +522,7 @@ class TtlCleanupManager {
     CrontabManager.acquireBackgroundWorkLease(_backgroundLeaseId);
     try {
       final plans = await _getCleanupPlans();
-      final systemKvTables = _systemKvTables();
+      final systemKvTables = await _systemKvTableContexts();
       if (plans.isEmpty && systemKvTables.isEmpty) return;
 
       const int batchSize = 1000;
@@ -527,7 +557,7 @@ class TtlCleanupManager {
         try {
           int roundDeleted = 0;
           final nextPlans = <_TtlCleanupPlan>[];
-          final nextKvTables = <String>[];
+          final nextKvTables = <TableContext>[];
 
           if (activePlans.isNotEmpty) {
             final tasks = activePlans
@@ -560,8 +590,11 @@ class TtlCleanupManager {
               if (deleted > 0) {
                 roundDeleted += deleted;
                 totalDeleted += deleted;
+                final resolvedName = _dataStore.schemaManager
+                        ?.resolveTableNameFromField(plan.tableUid) ??
+                    TableName(plan.tableUid);
                 Logger.info(
-                  'TTL cleanup deleted $deleted rows from table ${plan.tableName}',
+                  'TTL cleanup deleted $deleted rows from table $resolvedName',
                 );
               }
 
@@ -574,8 +607,8 @@ class TtlCleanupManager {
           if (activeKvTables.isNotEmpty) {
             final tasks = activeKvTables
                 .map<Future<_TtlBatchResult> Function()>(
-                  (tableName) => () => _runKvCleanupBatch(
-                        tableName,
+                  (table) => () => _runKvCleanupBatch(
+                        table,
                         cycleNow,
                         batchSize: batchSize,
                       ),
@@ -591,7 +624,7 @@ class TtlCleanupManager {
 
             for (int i = 0; i < kvResults.length; i++) {
               final result = kvResults[i];
-              final tableName = activeKvTables[i];
+              final table = activeKvTables[i];
 
               if (result == null || !result.ok) {
                 continue;
@@ -602,12 +635,12 @@ class TtlCleanupManager {
                 roundDeleted += deleted;
                 totalDeleted += deleted;
                 Logger.info(
-                  'KV TTL cleanup deleted $deleted rows from table $tableName',
+                  'KV TTL cleanup deleted $deleted rows from table ${table.tableName}',
                 );
               }
 
               if (deleted >= batchSize) {
-                nextKvTables.add(tableName);
+                nextKvTables.add(table);
               }
             }
           }
@@ -623,7 +656,7 @@ class TtlCleanupManager {
 
           if (roundDeleted <= 0) {
             activePlans = const <_TtlCleanupPlan>[];
-            activeKvTables = const <String>[];
+            activeKvTables = const <TableContext>[];
           } else if (hasBacklog && !ioBusy) {
             // There is still TTL backlog and the write buffer is not busy:
             // continue another cleanup round and keep CrontabManager active.
@@ -634,7 +667,7 @@ class TtlCleanupManager {
             // Write buffer is under pressure or there is no backlog: yield to
             // foreground writes and end this cleanup cycle.
             activePlans = const <_TtlCleanupPlan>[];
-            activeKvTables = const <String>[];
+            activeKvTables = const <TableContext>[];
           }
 
           if (hasBacklog) {
