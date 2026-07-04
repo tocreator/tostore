@@ -2,6 +2,7 @@ import 'dart:math';
 import 'dart:async';
 import 'dart:collection';
 import '../model/table_schema.dart';
+import '../model/table_identity.dart';
 import '../model/data_store_config.dart';
 import '../handler/logger.dart';
 import '../core/lock_manager.dart';
@@ -34,7 +35,7 @@ abstract class IdGenerator {
 class SequentialIdGenerator implements IdGenerator {
   final SequentialIdConfig config;
   final DistributedNodeConfig? nodeConfig;
-  String? tableName;
+  String? tableUid;
   final CentralServerClient? centralClient;
 
   int _currentId;
@@ -60,7 +61,7 @@ class SequentialIdGenerator implements IdGenerator {
   SequentialIdGenerator(
     this.config, {
     this.nodeConfig,
-    this.tableName,
+    this.tableUid,
     this.centralClient,
   }) : _currentId = config.initialValue - 1 {
     _initializeGenerator();
@@ -107,8 +108,8 @@ class SequentialIdGenerator implements IdGenerator {
     if (_idGenerationInProgress) return;
 
     bool acquired = false;
-    final lockResource = 'sequential_id_refill_${tableName ?? "default"}';
-    final operationId = '${tableName ?? "default"}_sequential_refill';
+    final lockResource = 'sequential_id_refill_${tableUid ?? "default"}';
+    final operationId = '${tableUid ?? "default"}_sequential_refill';
     try {
       _idGenerationInProgress = true;
       acquired =
@@ -227,7 +228,7 @@ class SequentialIdGenerator implements IdGenerator {
       _lastRequestTime = now;
 
       final result = await centralClient!.requestIdBatch(
-          tableName: tableName!, nodeId: nodeConfig!.nodeId, batchSize: 10000);
+          tableUid: tableUid!, nodeId: nodeConfig!.nodeId, batchSize: 10000);
 
       if (result != null) {
         _currentId = result.startId - 1;
@@ -257,7 +258,7 @@ class SequentialIdGenerator implements IdGenerator {
   int get currentId => _currentId;
 
   void renameTable(String newTableName) {
-    tableName = newTableName;
+    tableUid = newTableName;
   }
 }
 
@@ -332,7 +333,7 @@ class Base62Encoder {
 class TimeBasedIdGenerator implements IdGenerator {
   final PrimaryKeyType keyType; // timestampBased, datePrefixed or shortCode
   final DistributedNodeConfig nodeConfig;
-  String tableName;
+  String tableUid;
 
   // Timestamp/date prefix ID generation related properties
   final Map<String, int> _sequenceMap =
@@ -441,16 +442,16 @@ class TimeBasedIdGenerator implements IdGenerator {
               generator._lastCountResetTime.remove(oldTableName)!;
         }
 
-        generator.tableName = newTableName;
+        generator.tableUid = newTableName;
       }
     }
   }
 
   /// Clean up static states when a table is deleted to avoid memory leaks
-  static void handleTableDelete(String tableName) {
+  static void handleTableDelete(String tableUid) {
     final keysToRemove = <String>[];
     for (final key in _instances.keys) {
-      if (key.endsWith('_$tableName')) {
+      if (key.endsWith('_$tableUid')) {
         keysToRemove.add(key);
       }
     }
@@ -462,10 +463,10 @@ class TimeBasedIdGenerator implements IdGenerator {
   }
 
   /// Get generator from instance map, create new instance if not exists
-  static TimeBasedIdGenerator getInstance(PrimaryKeyType keyType,
-      DistributedNodeConfig nodeConfig, String tableName,
+  static TimeBasedIdGenerator getInstance(
+      PrimaryKeyType keyType, DistributedNodeConfig nodeConfig, String tableUid,
       {int? maxConcurrent}) {
-    final key = '${keyType}_$tableName';
+    final key = '${keyType}_$tableUid';
 
     // If instance already exists, return directly
     if (_instances.containsKey(key)) {
@@ -482,7 +483,7 @@ class TimeBasedIdGenerator implements IdGenerator {
     }
 
     // Create new instance
-    final generator = TimeBasedIdGenerator._(keyType, nodeConfig, tableName);
+    final generator = TimeBasedIdGenerator._(keyType, nodeConfig, tableUid);
 
     // Set parallel count
     if (maxConcurrent != null && maxConcurrent > 0) {
@@ -495,7 +496,7 @@ class TimeBasedIdGenerator implements IdGenerator {
   }
 
   // Make constructor private, force use of getInstance
-  TimeBasedIdGenerator._(this.keyType, this.nodeConfig, this.tableName) {
+  TimeBasedIdGenerator._(this.keyType, this.nodeConfig, this.tableUid) {
     // Check if keyType is a valid type
     if (keyType != PrimaryKeyType.timestampBased &&
         keyType != PrimaryKeyType.datePrefixed &&
@@ -546,18 +547,18 @@ class TimeBasedIdGenerator implements IdGenerator {
     }
 
     // Create separate sequence number count for table
-    _sequenceMap[tableName] = 0;
-    _lastValueMap[tableName] = _lastValue;
+    _sequenceMap[tableUid] = 0;
+    _lastValueMap[tableUid] = _lastValue;
 
     // Ensure ID pool exists
-    if (!_idPools.containsKey(tableName)) {
-      _idPools[tableName] = Queue<String>();
+    if (!_idPools.containsKey(tableUid)) {
+      _idPools[tableUid] = Queue<String>();
     }
 
     // Initialize statistics
-    _recentRequestCount[tableName] = 0;
-    _lastCountResetTime[tableName] = DateTime.now();
-    _idGenerationInProgress[tableName] = false;
+    _recentRequestCount[tableUid] = 0;
+    _lastCountResetTime[tableUid] = DateTime.now();
+    _idGenerationInProgress[tableUid] = false;
 
     // Precompute commonly used values
     _sequenceFactor = BigInt.from(100000); // 10^5
@@ -589,18 +590,18 @@ class TimeBasedIdGenerator implements IdGenerator {
   /// Refill ID pool - the only entry point for all ID generation
   Future<void> _refillIdPool(int targetCount, int recentTotal) async {
     // Add duplicate fill check
-    if (_idGenerationInProgress[tableName] == true) {
+    if (_idGenerationInProgress[tableUid] == true) {
       Logger.debug(
-          'Skip duplicate ID pool fill request: $tableName, fill task already running');
+          'Skip duplicate ID pool fill request: $tableUid, fill task already running');
       return;
     }
 
     bool acquired = false;
-    final lockResource = 'id_refill_$tableName';
-    final operationId = '${tableName}_id_fill';
+    final lockResource = 'id_refill_$tableUid';
+    final operationId = '${tableUid}_id_fill';
     try {
       // Mark generation task start - mark before acquiring lock to avoid duplicate requests
-      _idGenerationInProgress[tableName] = true;
+      _idGenerationInProgress[tableUid] = true;
 
       // Acquire lock to ensure only one thread is generating IDs at the same time
 
@@ -608,18 +609,18 @@ class TimeBasedIdGenerator implements IdGenerator {
           await _lockManager.acquireExclusiveLock(lockResource, operationId);
       if (!acquired) {
         Logger.warn(
-            'Failed to acquire exclusive lock for ID pool refill: $tableName');
+            'Failed to acquire exclusive lock for ID pool refill: $tableUid');
         return;
       }
 
       try {
         // Ensure ID pool exists
-        if (!_idPools.containsKey(tableName)) {
-          _idPools[tableName] = Queue<String>();
+        if (!_idPools.containsKey(tableUid)) {
+          _idPools[tableUid] = Queue<String>();
         }
 
         // Recheck pool size, it might have been filled by other threads while waiting for lock
-        final currentPoolSize = _idPools[tableName]!.length;
+        final currentPoolSize = _idPools[tableUid]!.length;
         if (currentPoolSize >= targetCount) {
           return; // Pool ID is enough
         }
@@ -655,8 +656,8 @@ class TimeBasedIdGenerator implements IdGenerator {
 
           // Add generated IDs to ID pool
           if (generatedIds.isNotEmpty) {
-            _idPools[tableName]!.addAll(generatedIds);
-            _idPoolLastUpdateTime[tableName] = DateTime.now();
+            _idPools[tableUid]!.addAll(generatedIds);
+            _idPoolLastUpdateTime[tableUid] = DateTime.now();
 
             totalGenerated = generatedIds.length;
 
@@ -667,7 +668,7 @@ class TimeBasedIdGenerator implements IdGenerator {
                 duration > 0 ? ((totalGenerated * 1000) ~/ duration) : 0;
 
             Logger.debug(
-                'ID isolate batch generated: $tableName, added count: $totalGenerated, current pool size: ${_idPools[tableName]!.length},'
+                'ID isolate batch generated: $tableUid, added count: $totalGenerated, current pool size: ${_idPools[tableUid]!.length},'
                 'Duration: ${duration}ms, Generation rate: $genRate IDs/s');
           }
         } else {
@@ -690,11 +691,11 @@ class TimeBasedIdGenerator implements IdGenerator {
             final formattedIds = _formatIds(numericIds);
 
             // Add to ID pool
-            _idPools[tableName]!.addAll(formattedIds);
-            _idPoolLastUpdateTime[tableName] = DateTime.now();
+            _idPools[tableUid]!.addAll(formattedIds);
+            _idPoolLastUpdateTime[tableUid] = DateTime.now();
 
             // Update instance last access time
-            _lastInstanceAccessTime['${keyType}_$tableName'] = DateTime.now();
+            _lastInstanceAccessTime['${keyType}_$tableUid'] = DateTime.now();
 
             totalGenerated += formattedIds.length;
             remainingCount -= formattedIds.length;
@@ -715,7 +716,7 @@ class TimeBasedIdGenerator implements IdGenerator {
                   _calculateExpectedPoolSize(newRecentTotal);
 
               // Get current pool size (already generated minus already consumed)
-              final currentSize = _idPools[tableName]!.length;
+              final currentSize = _idPools[tableUid]!.length;
 
               // Calculate the number of IDs needed to generate
               final newNeededCount = max(0, newExpectedSize - currentSize);
@@ -739,16 +740,16 @@ class TimeBasedIdGenerator implements IdGenerator {
               duration > 0 ? ((totalGenerated * 1000) ~/ duration) : 0;
           final purpose = totalGenerated > 1000 ? "refill" : "preheat";
           Logger.debug(
-              'ID ${purpose}ed: $tableName, added count: $totalGenerated, current pool size: ${_idPools[tableName]!.length},'
+              'ID ${purpose}ed: $tableUid, added count: $totalGenerated, current pool size: ${_idPools[tableUid]!.length},'
               'Duration: ${duration}ms, Generation rate: $genRate IDs/s');
         }
       } finally {
         // Ensure mark is cleared
-        _idGenerationInProgress[tableName] = false;
+        _idGenerationInProgress[tableUid] = false;
       }
     } catch (e) {
       // Ensure mark is cleared (even if exception occurs)
-      _idGenerationInProgress[tableName] = false;
+      _idGenerationInProgress[tableUid] = false;
       Logger.error('Refill ID pool failed', rawError: e);
       rethrow; // Re-throw exception for caller to handle
     } finally {
@@ -768,20 +769,20 @@ class TimeBasedIdGenerator implements IdGenerator {
       int neededCount, int recentTotal) async {
     try {
       final isHighGeneration = recentTotal >= (_maxSequence ~/ 5);
-      final startSequence = _sequenceMap[tableName] ?? 0;
+      final startSequence = _sequenceMap[tableUid] ?? 0;
       dynamic startValue;
       bool useNewTimestamp = false;
 
       if (keyType == PrimaryKeyType.timestampBased ||
           keyType == PrimaryKeyType.shortCode) {
         final currentTimestamp = _getCurrentLogicalTimestamp();
-        final lastTimestamp = _lastValueMap[tableName] ?? currentTimestamp;
+        final lastTimestamp = _lastValueMap[tableUid] ?? currentTimestamp;
         useNewTimestamp =
             currentTimestamp > (lastTimestamp + 60) || !isHighGeneration;
         startValue = useNewTimestamp ? currentTimestamp : lastTimestamp;
       } else {
         final currentDateString = _getCurrentDateString();
-        final lastDate = _lastValueMap[tableName] ?? currentDateString;
+        final lastDate = _lastValueMap[tableUid] ?? currentDateString;
         useNewTimestamp =
             currentDateString.compareTo(lastDate) != 0 || !isHighGeneration;
         startValue = useNewTimestamp ? currentDateString : lastDate;
@@ -793,7 +794,7 @@ class TimeBasedIdGenerator implements IdGenerator {
           message: TimeBasedIdGenerateRequest(
             keyType: keyType,
             nodeConfig: nodeConfig,
-            tableName: tableName,
+            tableUid: TableUid(tableUid),
             count: neededCount,
             startValue: startValue,
             startSequence: startSequence,
@@ -815,8 +816,8 @@ class TimeBasedIdGenerator implements IdGenerator {
         ]);
       }
 
-      _sequenceMap[tableName] = result.lastSequence;
-      _lastValueMap[tableName] = result.lastValue;
+      _sequenceMap[tableUid] = result.lastSequence;
+      _lastValueMap[tableUid] = result.lastValue;
       _lastValue = result.lastValue;
 
       return result.ids;
@@ -838,21 +839,21 @@ class TimeBasedIdGenerator implements IdGenerator {
     _updateRequestStats(count);
 
     // Ensure ID pool exists
-    if (!_idPools.containsKey(tableName)) {
-      _idPools[tableName] = Queue<String>();
+    if (!_idPools.containsKey(tableUid)) {
+      _idPools[tableUid] = Queue<String>();
     }
 
     // Prepare result list
     final result = <String>[];
 
     // Check existing IDs in pool
-    if (_idPools[tableName]!.isNotEmpty) {
+    if (_idPools[tableUid]!.isNotEmpty) {
       // Update last use time
-      _idPoolLastUpdateTime[tableName] = DateTime.now();
+      _idPoolLastUpdateTime[tableUid] = DateTime.now();
 
       // Get IDs from pool until demand is met or pool is empty
-      while (result.length < count && _idPools[tableName]!.isNotEmpty) {
-        result.add(_idPools[tableName]!.removeFirst());
+      while (result.length < count && _idPools[tableUid]!.isNotEmpty) {
+        result.add(_idPools[tableUid]!.removeFirst());
       }
 
       // If enough IDs are retrieved, return directly
@@ -891,12 +892,12 @@ class TimeBasedIdGenerator implements IdGenerator {
         // Timeout check: If it has exceeded the set time, exit loop
         if (DateTime.now().isAfter(endTime)) {
           Logger.warn(
-              'Get ID timeout: Table=$tableName, Request=$count, Retrieved=${result.length}, Timeout=${timeout.inSeconds} seconds');
+              'Get ID timeout: Table=$tableUid, Request=$count, Retrieved=${result.length}, Timeout=${timeout.inSeconds} seconds');
           break; // Exit loop, return retrieved IDs
         }
         // Directly get latest queue state from _idPools
-        if (_idPools[tableName]?.isNotEmpty ?? false) {
-          result.add(_idPools[tableName]!.removeFirst());
+        if (_idPools[tableUid]?.isNotEmpty ?? false) {
+          result.add(_idPools[tableUid]!.removeFirst());
         } else {
           // Briefly wait to yield CPU, avoid tight loop
           await Future.delayed(const Duration(milliseconds: 10));
@@ -912,9 +913,9 @@ class TimeBasedIdGenerator implements IdGenerator {
         GeneralStatus(
           type: ResultType.sysTimeout,
           message:
-              'Unable to generate ID: Pool is empty and fill timeout. Table=$tableName, Request=$count, '
-              'FillInProgress=${_idGenerationInProgress[tableName] ?? false}, '
-              'Current pool size=${_idPools[tableName]?.length ?? 0}.',
+              'Unable to generate ID: Pool is empty and fill timeout. Table=$tableUid, Request=$count, '
+              'FillInProgress=${_idGenerationInProgress[tableUid] ?? false}, '
+              'Current pool size=${_idPools[tableUid]?.length ?? 0}.',
         )
       ]);
     }
@@ -925,34 +926,34 @@ class TimeBasedIdGenerator implements IdGenerator {
   /// Update request stats
   void _updateRequestStats(int count) {
     final now = DateTime.now();
-    final lastReset = _lastCountResetTime[tableName] ??
+    final lastReset = _lastCountResetTime[tableUid] ??
         now.subtract(const Duration(seconds: 4));
 
     // Reset count if more than 3 seconds
     if (now.difference(lastReset).inSeconds > 3) {
-      _recentRequestCount[tableName] = count;
-      _lastCountResetTime[tableName] = now;
+      _recentRequestCount[tableUid] = count;
+      _lastCountResetTime[tableUid] = now;
     } else {
       // Accumulate count
-      _recentRequestCount[tableName] =
-          (_recentRequestCount[tableName] ?? 0) + count;
+      _recentRequestCount[tableUid] =
+          (_recentRequestCount[tableUid] ?? 0) + count;
     }
   }
 
   /// Get recent request count
   int _getRecentRequestCount() {
     final now = DateTime.now();
-    final lastReset = _lastCountResetTime[tableName] ??
+    final lastReset = _lastCountResetTime[tableUid] ??
         now.subtract(const Duration(seconds: 4));
 
     // Count over 3 seconds is considered expired
     if (now.difference(lastReset).inSeconds > 3) {
-      _recentRequestCount[tableName] = 0;
-      _lastCountResetTime[tableName] = now;
+      _recentRequestCount[tableUid] = 0;
+      _lastCountResetTime[tableUid] = now;
       return 0;
     }
 
-    return _recentRequestCount[tableName] ?? 0;
+    return _recentRequestCount[tableUid] ?? 0;
   }
 
   /// Calculate expected ID pool size
@@ -969,14 +970,14 @@ class TimeBasedIdGenerator implements IdGenerator {
   /// Clean up expired ID pools
   void _cleanupExpiredPools() {
     final now = DateTime.now();
-    for (final tableName in List.from(_idPoolLastUpdateTime.keys)) {
-      final lastUpdateTime = _idPoolLastUpdateTime[tableName];
+    for (final tableUid in List.from(_idPoolLastUpdateTime.keys)) {
+      final lastUpdateTime = _idPoolLastUpdateTime[tableUid];
       if (lastUpdateTime != null &&
           now.difference(lastUpdateTime) > _idPoolExpiry) {
-        _idPools.remove(tableName);
-        _idPoolLastUpdateTime.remove(tableName);
+        _idPools.remove(tableUid);
+        _idPoolLastUpdateTime.remove(tableUid);
 
-        Logger.debug('Clean up expired ID pool: $tableName');
+        Logger.debug('Clean up expired ID pool: $tableUid');
       }
     }
   }
@@ -1005,8 +1006,8 @@ class TimeBasedIdGenerator implements IdGenerator {
 
     // Get current state
     int currentTimestamp = _getCurrentLogicalTimestamp();
-    int sequence = _sequenceMap[tableName] ?? 0;
-    int lastTimestamp = _lastValueMap[tableName] ?? currentTimestamp;
+    int sequence = _sequenceMap[tableUid] ?? 0;
+    int lastTimestamp = _lastValueMap[tableUid] ?? currentTimestamp;
 
     // Determine generation strategy based on load
     bool isHighGeneration = recentTotal >= (_maxSequence ~/ 5);
@@ -1026,8 +1027,8 @@ class TimeBasedIdGenerator implements IdGenerator {
       }
 
       // Update state
-      _sequenceMap[tableName] = sequence;
-      _lastValueMap[tableName] = timestamp;
+      _sequenceMap[tableUid] = sequence;
+      _lastValueMap[tableUid] = timestamp;
       _lastValue = timestamp;
 
       return result;
@@ -1059,8 +1060,8 @@ class TimeBasedIdGenerator implements IdGenerator {
     }
 
     // Update state
-    _sequenceMap[tableName] = sequence;
-    _lastValueMap[tableName] = timestamp;
+    _sequenceMap[tableUid] = sequence;
+    _lastValueMap[tableUid] = timestamp;
     _lastValue = timestamp;
 
     return result;
@@ -1074,8 +1075,8 @@ class TimeBasedIdGenerator implements IdGenerator {
 
     // Get current date string
     String currentDateString = _getCurrentDateString();
-    int sequence = _sequenceMap[tableName] ?? 0;
-    String lastDate = _lastValueMap[tableName] ?? currentDateString;
+    int sequence = _sequenceMap[tableUid] ?? 0;
+    String lastDate = _lastValueMap[tableUid] ?? currentDateString;
 
     // Determine generation strategy based on load
     bool isHighGeneration = recentTotal >= (_maxSequence ~/ 5);
@@ -1096,8 +1097,8 @@ class TimeBasedIdGenerator implements IdGenerator {
       }
 
       // Update state
-      _sequenceMap[tableName] = sequence;
-      _lastValueMap[tableName] = dateString;
+      _sequenceMap[tableUid] = sequence;
+      _lastValueMap[tableUid] = dateString;
       _lastValue = dateString;
 
       return result;
@@ -1131,8 +1132,8 @@ class TimeBasedIdGenerator implements IdGenerator {
     }
 
     // Update state
-    _sequenceMap[tableName] = sequence;
-    _lastValueMap[tableName] = dateString;
+    _sequenceMap[tableUid] = sequence;
+    _lastValueMap[tableUid] = dateString;
     _lastValue = dateString;
 
     return result;
@@ -1166,11 +1167,11 @@ class TimeBasedIdGenerator implements IdGenerator {
             _instances.containsKey(key)) {
           // Check if there's associated ID pool
           final instance = _instances[key]!;
-          final tableName = instance.tableName;
+          final tableUid = instance.tableUid;
 
           // Check if pool exists and is not empty (pool with data should not be recycled)
-          if (!instance._idPools.containsKey(tableName) ||
-              instance._idPools[tableName]!.isEmpty) {
+          if (!instance._idPools.containsKey(tableUid) ||
+              instance._idPools[tableUid]!.isEmpty) {
             keysToRemove.add(key);
           }
         }
@@ -1195,7 +1196,7 @@ class TimeBasedIdGenerator implements IdGenerator {
   void _periodicMaintenance() {
     try {
       // Update instance last access time to indicate this instance is still active
-      _lastInstanceAccessTime['${keyType}_$tableName'] = DateTime.now();
+      _lastInstanceAccessTime['${keyType}_$tableUid'] = DateTime.now();
 
       // Clean up expired pools
       _cleanupExpiredPools();
@@ -1204,14 +1205,14 @@ class TimeBasedIdGenerator implements IdGenerator {
       final recentTotal = _getRecentRequestCount();
 
       // Only perform maintenance check if there's recent request or pool is not empty
-      if (recentTotal > 0 || (_idPools[tableName]?.isNotEmpty ?? false)) {
+      if (recentTotal > 0 || (_idPools[tableUid]?.isNotEmpty ?? false)) {
         // Calculate expected pool size
         final expectedPoolSize = _calculateExpectedPoolSize(recentTotal);
-        final currentPoolSize = _idPools[tableName]?.length ?? 0;
+        final currentPoolSize = _idPools[tableUid]?.length ?? 0;
 
         // If pool size is less than 70% of expected and current no generation task in progress, trigger refill
         if (currentPoolSize < expectedPoolSize * 0.7 &&
-            _idGenerationInProgress[tableName] != true) {
+            _idGenerationInProgress[tableUid] != true) {
           // Asynchronous refill pool, no waiting for result
           Future.microtask(() => _refillIdPool(expectedPoolSize, recentTotal));
         }
@@ -1222,7 +1223,7 @@ class TimeBasedIdGenerator implements IdGenerator {
   }
 
   @override
-  int get remainingIds => _idPools[tableName]?.length ?? 0;
+  int get remainingIds => _idPools[tableUid]?.length ?? 0;
 
   @override
   bool get needsFetch => false; // Local generation, no need to get
@@ -1409,7 +1410,7 @@ class IdBatchResult {
 abstract class CentralServerClient {
   /// Request ID segment
   Future<IdBatchResult?> requestIdBatch(
-      {required String tableName, required int nodeId, required int batchSize});
+      {required String tableUid, required int nodeId, required int batchSize});
 
   /// Get node information
   Future<DistributedNodeConfig?> fetchNodeInfo(String? accessToken);
@@ -1428,7 +1429,7 @@ class IdGeneratorFactory {
         return SequentialIdGenerator(
           pkConfig.sequentialConfig ?? const SequentialIdConfig(),
           nodeConfig: config.distributedNodeConfig,
-          tableName: schema.name,
+          tableUid: schema.tableUid,
           centralClient: centralClient,
         );
 
@@ -1439,7 +1440,7 @@ class IdGeneratorFactory {
         return TimeBasedIdGenerator.getInstance(
           pkConfig.type,
           config.distributedNodeConfig,
-          schema.name,
+          schema.tableUid,
           maxConcurrent: config.maxConcurrency,
         );
 
