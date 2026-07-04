@@ -1,14 +1,15 @@
 import 'buffer_entry.dart';
 import 'background_write_type.dart';
 import 'migration_write_mode.dart';
+import 'table_identity.dart';
 
 /// Entry representing a background write operation scheduled for flushing.
 class BackgroundWriteEntry {
   /// The operation ID or migration task ID this entry belongs to.
   final String taskId;
 
-  /// The physical table name.
-  final String tableName;
+  /// The stable table unique identifier.
+  final TableUid tableUid;
 
   /// The record primary key.
   final String primaryKey;
@@ -22,9 +23,9 @@ class BackgroundWriteEntry {
   /// The wrapped data entry containing mutation details.
   final BufferEntry entry;
 
-  /// Specific index names to build or update. If null and mode includes index write,
+  /// Specific index uids to build or update. If null and mode includes index write,
   /// all indexes of the table will be processed by default.
-  final List<String>? specificIndexes;
+  final List<String>? specificIndexUids;
 
   /// The current batch start cursor (for safe persisted checkpoint recovery).
   final String? currentCursor;
@@ -38,12 +39,12 @@ class BackgroundWriteEntry {
 
   BackgroundWriteEntry({
     required this.taskId,
-    required this.tableName,
+    required this.tableUid,
     required this.primaryKey,
     required this.type,
     required this.mode,
     required this.entry,
-    this.specificIndexes,
+    this.specificIndexUids,
     this.currentCursor,
     this.nextCursor,
     this.isValid = true,
@@ -51,24 +52,24 @@ class BackgroundWriteEntry {
 
   BackgroundWriteEntry copyWith({
     String? taskId,
-    String? tableName,
+    TableUid? tableUid,
     String? primaryKey,
     BackgroundWriteType? type,
     MigrationWriteMode? mode,
     BufferEntry? entry,
-    List<String>? specificIndexes,
+    List<String>? specificIndexUids,
     String? currentCursor,
     String? nextCursor,
     bool? isValid,
   }) {
     return BackgroundWriteEntry(
       taskId: taskId ?? this.taskId,
-      tableName: tableName ?? this.tableName,
+      tableUid: tableUid ?? this.tableUid,
       primaryKey: primaryKey ?? this.primaryKey,
       type: type ?? this.type,
       mode: mode ?? this.mode,
       entry: entry ?? this.entry,
-      specificIndexes: specificIndexes ?? this.specificIndexes,
+      specificIndexUids: specificIndexUids ?? this.specificIndexUids,
       currentCursor: currentCursor ?? this.currentCursor,
       nextCursor: nextCursor ?? this.nextCursor,
       isValid: isValid ?? this.isValid,
