@@ -1,3 +1,4 @@
+import '../model/table_context.dart';
 import '../model/table_statistics.dart';
 import 'query_plan.dart';
 
@@ -92,7 +93,7 @@ class CostEstimator {
 
   /// estimate cardinality (return row count)
   int estimateCardinality(
-    String tableName,
+    TableContext table,
     Map<String, dynamic>? where,
   ) {
     if (where == null || where.isEmpty) {
