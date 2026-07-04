@@ -2,6 +2,7 @@ import 'dart:math';
 
 import '../handler/logger.dart';
 import '../core/data_store_impl.dart';
+import '../model/table_context.dart';
 import '../model/table_schema.dart';
 import 'query_plan.dart';
 
@@ -16,50 +17,47 @@ class QueryOptimizer {
 
   /// optimize query plan
   Future<QueryPlan> optimize(
-    String tableName,
+    TableContext table,
     Map<String, dynamic>? where, {
     List<String>? orderBy,
     int? limit,
     int? offset,
   }) async {
     try {
-      // get table schema
-      final schema = await _dataStore.schemaManager?.getTableSchema(tableName);
+      final schema = table.schema;
 
       if (where == null || where.isEmpty) {
-        if (schema != null && orderBy != null && orderBy.isNotEmpty) {
+        if (orderBy != null && orderBy.isNotEmpty) {
           // If no where, check if orderBy can benefit from an index.
           final bestSortingIndex = _findSortingIndex(schema, orderBy);
           if (bestSortingIndex != null) {
             return QueryPlan(
               QueryOperation(
                 type: QueryOperationType.indexScan,
-                indexUid: bestSortingIndex.indexUid ??
-                    bestSortingIndex.actualIndexName,
-                value: <String, dynamic>{'table': tableName, 'where': null},
+                indexUid: bestSortingIndex.indexUid,
+                value: <String, dynamic>{
+                  'table': table.tableUid,
+                  'where': null
+                },
               ),
               naturalOrderBy: bestSortingIndex.fields,
             );
           }
         }
-        return _createTableScanPlan(tableName, primaryKey: schema?.primaryKey);
-      }
-
-      if (schema == null) {
-        return _createTableScanPlan(tableName);
+        return _createTableScanPlan(table, primaryKey: schema.primaryKey);
       }
 
       // Reduce the where-clause to conditions relevant to this table only,
       // while preserving AND/OR structure for nested boolean optimization.
       final tableTree =
-          _simplifyLogicalTree(_extractTableConditionTree(tableName, where));
+          _simplifyLogicalTree(_extractTableConditionTree(table, where));
       if (tableTree.isEmpty) {
-        return _createTableScanPlan(tableName, primaryKey: schema.primaryKey);
+        return _createTableScanPlan(table, primaryKey: schema.primaryKey);
       }
 
       // No OR => keep the fast AND-only optimizer.
       if (!_containsOr(tableTree)) {
-        final filterPlan = await _optimizeAndOnly(tableName, tableTree, schema);
+        final filterPlan = await _optimizeAndOnly(table, tableTree, schema);
 
         // Cost-based choice between:
         // - Filter-first plan (most selective access path)
@@ -76,8 +74,7 @@ class QueryOptimizer {
 
         // If already using the same index, keep the filter plan.
         if (filterPlan.operation.type == QueryOperationType.indexScan &&
-            filterPlan.operation.indexUid ==
-                (sortingIdx.indexUid ?? sortingIdx.actualIndexName)) {
+            filterPlan.operation.indexUid == sortingIdx.indexUid) {
           return filterPlan;
         }
 
@@ -90,7 +87,7 @@ class QueryOptimizer {
             : limit;
         final int need = max(1, effOffset + max(1, effLimit));
 
-        final int totalRows = await _estimateTotalRows(tableName);
+        final int totalRows = await _estimateTotalRows(table);
         final fieldSel = _estimateFieldSelectivity(
           schema: schema,
           where: tableWhere,
@@ -101,14 +98,17 @@ class QueryOptimizer {
         final sortPlan = QueryPlan(
           QueryOperation(
             type: QueryOperationType.indexScan,
-            indexUid: sortingIdx.indexUid ?? sortingIdx.actualIndexName,
-            value: <String, dynamic>{'table': tableName, 'where': tableWhere},
+            indexUid: sortingIdx.indexUid,
+            value: <String, dynamic>{
+              'table': table.tableUid,
+              'where': tableWhere
+            },
           ),
           naturalOrderBy: sortingIdx.fields,
         );
 
         final double filterCost = _estimatePlanCost(
-          tableName: tableName,
+          table: table,
           plan: filterPlan,
           schema: schema,
           orderBy: orderBy,
@@ -119,7 +119,7 @@ class QueryOptimizer {
         );
 
         final double sortCost = _estimatePlanCost(
-          tableName: tableName,
+          table: table,
           plan: sortPlan,
           schema: schema,
           orderBy: orderBy,
@@ -137,29 +137,29 @@ class QueryOptimizer {
       final dnfClauses = _toDnfClauses(tableTree, maxClauses: _maxDnfClauses);
       if (dnfClauses == null || dnfClauses.isEmpty) {
         // Fallback: keep correctness with a table scan (executor will evaluate full predicate).
-        return _createTableScanPlan(tableName,
+        return _createTableScanPlan(table,
             where: tableTree, primaryKey: schema.primaryKey);
       }
       if (dnfClauses.length == 1) {
-        return await _optimizeAndOnly(tableName, dnfClauses.first, schema);
+        return await _optimizeAndOnly(table, dnfClauses.first, schema);
       }
 
       final children = <QueryPlan>[];
       for (final clause in dnfClauses) {
         if (clause.isEmpty) {
           // Clause is always-true => full scan.
-          children.add(
-              _createTableScanPlan(tableName, primaryKey: schema.primaryKey));
+          children
+              .add(_createTableScanPlan(table, primaryKey: schema.primaryKey));
           continue;
         }
-        children.add(await _optimizeAndOnly(tableName, clause, schema));
+        children.add(await _optimizeAndOnly(table, clause, schema));
       }
 
       return QueryPlan(
         QueryOperation(
           type: QueryOperationType.union,
           value: <String, dynamic>{
-            'table': tableName,
+            'table': table.tableUid,
             'children': children,
           },
         ),
@@ -168,18 +168,18 @@ class QueryOptimizer {
     } catch (e) {
       Logger.error('query optimization failed', rawError: e);
       // use full table scan when error occurs
-      return _createTableScanPlan(tableName);
+      return _createTableScanPlan(table);
     }
   }
 
   /// create table scan query plan (optionally carrying a table-local predicate)
-  QueryPlan _createTableScanPlan(String tableName,
+  QueryPlan _createTableScanPlan(TableContext table,
       {Map<String, dynamic>? where, String? primaryKey}) {
     return QueryPlan(
       QueryOperation(
         type: QueryOperationType.tableScan,
         value: <String, dynamic>{
-          'table': tableName,
+          'table': table.tableUid,
           'where': (where == null || where.isEmpty) ? null : where,
         },
       ),
@@ -192,7 +192,7 @@ class QueryOptimizer {
   // ------------------------- AND-only optimizer (no OR) -------------------------
 
   Future<QueryPlan> _optimizeAndOnly(
-    String tableName,
+    TableContext table,
     Map<String, dynamic> where,
     TableSchema schema,
   ) async {
@@ -244,7 +244,7 @@ class QueryOptimizer {
     visit(where);
 
     if (tableWhere.isEmpty) {
-      return _createTableScanPlan(tableName, primaryKey: schema.primaryKey);
+      return _createTableScanPlan(table, primaryKey: schema.primaryKey);
     }
 
     bool isPrefixLike(String pattern) {
@@ -341,14 +341,14 @@ class QueryOptimizer {
     // Priority 1: Primary key '=' / IN (fastest and most selective).
     if (tableWhere.containsKey(schema.primaryKey) &&
         isEqualityOrIn(tableWhere[schema.primaryKey])) {
-      return _createTableScanPlan(tableName,
+      return _createTableScanPlan(table,
           where: tableWhere, primaryKey: schema.primaryKey);
     }
 
     // Priority 2: Primary key range / prefix LIKE (range-partition scan on table data).
     if (tableWhere.containsKey(schema.primaryKey) &&
         isRangeOrPrefixLike(tableWhere[schema.primaryKey])) {
-      return _createTableScanPlan(tableName,
+      return _createTableScanPlan(table,
           where: tableWhere, primaryKey: schema.primaryKey);
     }
 
@@ -373,8 +373,11 @@ class QueryOptimizer {
       return QueryPlan(
         QueryOperation(
           type: QueryOperationType.indexScan,
-          indexUid: bestUniqueEq.indexUid ?? bestUniqueEq.actualIndexName,
-          value: <String, dynamic>{'table': tableName, 'where': tableWhere},
+          indexUid: bestUniqueEq.indexUid,
+          value: <String, dynamic>{
+            'table': table.tableUid,
+            'where': tableWhere
+          },
         ),
         naturalOrderBy: bestUniqueEq.fields,
       );
@@ -402,15 +405,18 @@ class QueryOptimizer {
       return QueryPlan(
         QueryOperation(
           type: QueryOperationType.indexScan,
-          indexUid: bestIndex.indexUid ?? bestIndex.actualIndexName,
-          value: <String, dynamic>{'table': tableName, 'where': tableWhere},
+          indexUid: bestIndex.indexUid,
+          value: <String, dynamic>{
+            'table': table.tableUid,
+            'where': tableWhere
+          },
         ),
         naturalOrderBy: bestIndex.fields,
       );
     }
 
     // Fallback: table scan with full predicate (non-indexable operators will be evaluated by the matcher).
-    return _createTableScanPlan(tableName,
+    return _createTableScanPlan(table,
         where: tableWhere, primaryKey: schema.primaryKey);
   }
 
@@ -438,7 +444,8 @@ class QueryOptimizer {
   }
 
   Map<String, dynamic> _extractTableConditionTree(
-      String tableName, Map<String, dynamic> node) {
+      TableContext table, Map<String, dynamic> node) {
+    final tableName = table.tableName;
     // Split node into logical children and leaf field predicates.
     final hasAnd = node.containsKey('AND') && node['AND'] is List;
     final hasOr = node.containsKey('OR') && node['OR'] is List;
@@ -468,7 +475,7 @@ class QueryOptimizer {
       final list = node['AND'] as List;
       for (final c in list) {
         if (c is Map<String, dynamic>) {
-          final sub = _extractTableConditionTree(tableName, c);
+          final sub = _extractTableConditionTree(table, c);
           if (sub.isNotEmpty) outChildren.add(sub);
         }
       }
@@ -483,7 +490,7 @@ class QueryOptimizer {
       final list = node['OR'] as List;
       for (final c in list) {
         if (c is Map<String, dynamic>) {
-          final sub = _extractTableConditionTree(tableName, c);
+          final sub = _extractTableConditionTree(table, c);
           if (sub.isNotEmpty) outChildren.add(sub);
         }
       }
@@ -635,10 +642,9 @@ class QueryOptimizer {
     return const <String, dynamic>{};
   }
 
-  Future<int> _estimateTotalRows(String tableName) async {
+  Future<int> _estimateTotalRows(TableContext table) async {
     try {
-      final n =
-          await _dataStore.tableDataManager.getTableRecordCount(tableName);
+      final n = await _dataStore.tableDataManager.getTableRecordCount(table);
       return max(1, n);
     } catch (_) {
       return 1;
@@ -793,12 +799,13 @@ class QueryOptimizer {
   }
 
   bool _canStreamInRequestedOrder({
-    required String tableName,
+    required TableContext table,
     required QueryPlan plan,
     required TableSchema schema,
     required List<String> orderBy,
   }) {
     if (orderBy.isEmpty) return true;
+    final tableName = table.tableName;
 
     // Derive the natural order for this plan.
     final natural = plan.naturalOrderBy.isNotEmpty
@@ -844,7 +851,7 @@ class QueryOptimizer {
   }
 
   double _estimatePlanCost({
-    required String tableName,
+    required TableContext table,
     required QueryPlan plan,
     required TableSchema schema,
     required List<String> orderBy,
@@ -864,7 +871,7 @@ class QueryOptimizer {
         (totalRows * rangeSel).clamp(1.0, totalRows.toDouble());
 
     final bool canStream = _canStreamInRequestedOrder(
-      tableName: tableName,
+      table: table,
       plan: plan,
       schema: schema,
       orderBy: orderBy,
