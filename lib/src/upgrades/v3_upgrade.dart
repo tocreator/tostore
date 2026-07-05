@@ -297,7 +297,7 @@ class V3Upgrade {
 
     // 5. Construct and write space_tables.bin per space
     for (final spaceName in spaces) {
-      final spaceTableUids = <String>[];
+      final spaceTableUids = <TableUid>[];
       final map = spaceTableDirMaps[spaceName];
       if (map != null) {
         for (final key in map.keys) {
@@ -310,7 +310,7 @@ class V3Upgrade {
           }
           final tableUid = tableUidMap[tableName];
           if (tableUid != null) {
-            spaceTableUids.add(tableUid);
+            spaceTableUids.add(TableUid(tableUid));
           }
         }
       }
