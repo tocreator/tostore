@@ -521,8 +521,7 @@ class NghIndexMeta {
   }
 
   @override
-  String toString() =>
-      'NghIndexMeta(uid: $indexUid, table: $tableUid, '
+  String toString() => 'NghIndexMeta(uid: $indexUid, table: $tableUid, '
       'dim: $dimensions, vectors: $totalVectors, '
       'deleted: $deletedCount, graphPartitions: $graphPartitionCount, '
       'pqTrained: $pqTrained, medoid: $medoidNodeId)';
