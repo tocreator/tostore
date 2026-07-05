@@ -29,7 +29,6 @@ import '../model/global_config.dart';
 import '../model/id_generator.dart';
 import '../model/memory_info.dart';
 import '../model/migration_task.dart';
-import '../model/ngh_index_meta.dart';
 import '../model/query_result.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
@@ -167,19 +166,6 @@ class DataStoreImpl {
   /// Active table renaming barriers (conversion locks) to prevent concurrent operations
   /// during name migrations.
   final Map<String, Completer<void>> _activeTableRenames = {};
-
-  /// Map of pending table renames: newTableName -> oldTableName.
-  /// These represent renames whose schemas are updated in memory,
-  /// but physical metadata and directory renaming are deferred until
-  /// WAL flushed pointer catches up with the rename cutover pointer.
-  final Map<String, String> _pendingTableRenames = {};
-
-  Map<String, String> get pendingTableRenames => _pendingTableRenames;
-
-  /// Helper to resolve target physical table name if there is a pending rename.
-  String resolvePhysicalTableName(String tableName) {
-    return _pendingTableRenames[tableName] ?? tableName;
-  }
 
   /// Checks if there are currently any active table renames.
   bool get hasActiveTableRenames => _activeTableRenames.isNotEmpty;
@@ -7075,237 +7061,55 @@ class DataStoreImpl {
     );
   }
 
-  /// Rename table in-memory caches and schema states immediately as part of a migration task.
-  /// The physical directory move and metadata renaming on disk are deferred.
-  Future<void> renameTableInMemory(
-    String oldTableName,
-    String newTableName, {
-    TableSchema? oldSchemaSnapshot,
-    bool updateSchema = true,
-    bool refreshForeignKeySystemTables = true,
+  /// Apply logical table-rename side effects during schema cutover.
+  ///
+  /// Data/index paths are keyed by stable [TableUid], so there is no directory
+  /// move. This updates referencing schemas, FK system tables, and in-flight
+  /// key-migration bookkeeping.
+  Future<void> applyTableRenameSideEffects({
+    required String oldTableName,
+    required String newTableName,
+    required TableContext table,
     String? spaceName,
   }) async {
-    if (oldTableName == newTableName) {
-      return;
-    }
+    if (oldTableName == newTableName) return;
 
-    final schemaMgr = schemaManager;
-    if (schemaMgr == null) {
-      throw DbClosedException();
-    }
-
-    final actualOldSchema =
-        await schemaMgr.getTableSchemaByName(TableName(oldTableName));
-    final existingNewSchema =
-        await schemaMgr.getTableSchemaByName(TableName(newTableName));
-    final currentSpace = spaceName ?? currentSpaceName;
-
-    startTableRenameBarrier(oldTableName, newTableName);
-    try {
-      final existingOldSchema = oldSchemaSnapshot ?? actualOldSchema;
-      final schemaForLayout = existingOldSchema ?? existingNewSchema;
-
-      final renamedSchema = schemaForLayout != null
-          ? _schemaWithRenamedReferencedTable(
-              schemaForLayout.copyWith(name: newTableName),
-              oldTableName,
-              newTableName,
-            )
-          : null;
-
-      // Register the rename mapping in memory
-      _pendingTableRenames[newTableName] = oldTableName;
-
-      // Update schema in cache immediately so that users can read/write using newTableName
-      final renameContext = await getTableContext(newTableName);
-      if (updateSchema && renamedSchema != null) {
-        schemaMgr.cacheTableSchema(renameContext.tableUid, renamedSchema);
-        schemaMgr.removeCachedTableSchema(
-            schemaMgr.getUidByName(TableName(oldTableName)) ??
-                renameContext.tableUid);
-        await cacheManager.invalidateCache(renameContext,
-            invalidateSchema: true);
-      }
-
-      // Synchronize in-memory structures and state for renaming
-      await transactionManager?.renameTableInCaches(oldTableName, newTableName);
-      await backgroundWriteScheduler.renameTable(renameContext);
-      await writeBufferManager.renameTable(
-          renameContext, oldTableName, newTableName);
-      tableDataManager.renameTable(oldTableName, newTableName);
-
-      await _renameKeyMigrationInMemory(
-          oldTableName, newTableName, currentSpace);
-    } finally {
-      endTableRenameBarrier(oldTableName, newTableName);
-    }
+    final updatedReferencingTables = <String>{};
+    await _updateSchemasReferencingRenamedTable(
+      oldTableName,
+      newTableName,
+      updatedTables: updatedReferencingTables,
+    );
+    await _refreshForeignKeyMetadataAfterRename(
+      oldTableName,
+      newTableName,
+      referencingTables: updatedReferencingTables,
+      throwOnError: true,
+    );
+    await _syncKeyMigrationAfterTableRename(
+      table: table,
+      oldTableName: oldTableName,
+      newTableName: newTableName,
+      spaceName: spaceName ?? currentSpaceName,
+    );
   }
 
-  Future<void> _renameKeyMigrationInMemory(
-      String oldTableName, String newTableName, String spaceName) async {
-    final oldTable = getTableContextSync(oldTableName);
-    if (KeyMigrationRunner.isTableMigrating(oldTable)) {
-      KeyMigrationRunner.renameTable(oldTable, newTableName);
+  Future<void> _syncKeyMigrationAfterTableRename({
+    required TableContext table,
+    required String oldTableName,
+    required String newTableName,
+    required String spaceName,
+  }) async {
+    if (KeyMigrationRunner.isTableMigrating(table)) {
+      KeyMigrationRunner.renameTable(table, newTableName);
     }
     await KeyMigrationProgressStore.renameTableProgress(
       this,
-      table: oldTable,
+      table: table,
       oldTableName: oldTableName,
       newTableName: newTableName,
       spaceName: spaceName,
     );
-  }
-
-  /// Perform the physical rename operations on disk (directory move, metadata files write,外键)
-  /// after in-flight buffer writes for the old table name have been flushed.
-  Future<void> renameTableOnDisk(
-    String oldTableName,
-    String newTableName, {
-    TableSchema? oldSchemaSnapshot,
-    bool updateSchema = true,
-    bool refreshForeignKeySystemTables = true,
-    String? spaceName,
-  }) async {
-    if (oldTableName == newTableName) {
-      return;
-    }
-
-    final schemaMgr = schemaManager;
-    if (schemaMgr == null) {
-      throw DbClosedException();
-    }
-
-    final currentSpace = spaceName ?? currentSpaceName;
-
-    // Load schemas
-    final actualOldSchema = await schemaMgr.getTableSchema(
-        schemaMgr.getUidByName(TableName(oldTableName)) ??
-            TableUid(oldTableName));
-    final existingOldSchema = oldSchemaSnapshot ?? actualOldSchema;
-    final existingNewSchema = await schemaMgr.getTableSchema(
-        schemaMgr.getUidByName(TableName(newTableName)) ??
-            TableUid(newTableName));
-    final schemaForLayout = existingOldSchema ?? existingNewSchema;
-    if (schemaForLayout == null) {
-      _pendingTableRenames.remove(newTableName);
-      return;
-    }
-
-    // Idempotent recovery check: If newTableName already has schema, and oldTableName mapping/directory
-    // is already missing, it means physical rename is already fully done.
-    if (existingNewSchema != null &&
-        !schemaMgr.uidByName.containsKey(oldTableName)) {
-      Logger.info(
-          'Physical rename $oldTableName -> $newTableName already completed, skip.');
-      _pendingTableRenames.remove(newTableName);
-      return;
-    }
-
-    startTableRenameBarrier(oldTableName, newTableName);
-    final removedMapping = _pendingTableRenames.remove(newTableName);
-
-    final renamedSchema = _schemaWithRenamedReferencedTable(
-      schemaForLayout.copyWith(name: newTableName),
-      oldTableName,
-      newTableName,
-    );
-
-    final updatedReferencingTables = <String>{};
-    bool keyMigrating = false;
-    bool backgroundPaused = false;
-
-    try {
-      // 1. Pause background tasks for physical I/O isolation during directory moves
-      await LargeOperationRunner.pauseAndAwait(currentSpace);
-      backgroundPaused = true;
-
-      keyMigrating = KeyMigrationRunner.isTableMigrating(
-          await getTableContext(oldTableName));
-      if (keyMigrating) {
-        await keyManager.pauseKeyMigration();
-      }
-
-      if (updateSchema && actualOldSchema != null) {
-        await schemaMgr.renameTableSchema(
-            await getTableContext(oldTableName), oldTableName, renamedSchema);
-      }
-      if (updateSchema) {
-        await _updateSchemasReferencingRenamedTable(
-          oldTableName,
-          newTableName,
-          updatedTables: updatedReferencingTables,
-        );
-      }
-
-      await _rewriteMovedTableMetadataAfterRename(
-        newTableName,
-        schemaForLayout,
-      );
-
-      if (refreshForeignKeySystemTables) {
-        await _refreshForeignKeyMetadataAfterRename(
-          oldTableName,
-          newTableName,
-          referencingTables: updatedReferencingTables,
-          throwOnError: true,
-        );
-      }
-
-      // 3. Symmetrically resume background tasks if they were paused
-      if (keyMigrating) {
-        unawaited(keyManager
-            .startDeferredKeyMigrationWork()
-            .catchError((_) {}, test: (e) => e is DbClosedException));
-      }
-      if (backgroundPaused) {
-        unawaited(LargeOperationRunner.runPendingOperations(this)
-            .catchError((_) {}, test: (e) => e is DbClosedException));
-      }
-    } catch (error, stackTrace) {
-      // 4. Symmetrically resume on exceptions and roll back metadata changes
-      if (removedMapping != null) {
-        _pendingTableRenames[newTableName] = removedMapping;
-      }
-      if (keyMigrating) {
-        try {
-          final rollbackTable = getTableContextSync(newTableName);
-          KeyMigrationRunner.renameTable(rollbackTable, oldTableName);
-          await KeyMigrationProgressStore.renameTableProgress(
-            this,
-            table: rollbackTable,
-            oldTableName: newTableName,
-            newTableName: oldTableName,
-            spaceName: currentSpace,
-          );
-        } catch (_) {}
-        unawaited(keyManager
-            .startDeferredKeyMigrationWork()
-            .catchError((_) {}, test: (e) => e is DbClosedException));
-      }
-      if (backgroundPaused) {
-        unawaited(LargeOperationRunner.runPendingOperations(this)
-            .catchError((_) {}, test: (e) => e is DbClosedException));
-      }
-      try {
-        if (updateSchema && actualOldSchema != null) {
-          await schemaMgr.renameTableSchema(await getTableContext(newTableName),
-              newTableName, schemaForLayout);
-        }
-      } catch (rollbackError) {
-        Logger.error(
-            'Failed to rollback table rename $oldTableName -> $newTableName after error',
-            rawError: rollbackError);
-      }
-      Error.throwWithStackTrace(error, stackTrace);
-    } finally {
-      try {
-        await cacheManager.invalidateCache(await getTableContext(oldTableName));
-      } catch (_) {}
-      try {
-        await cacheManager.invalidateCache(await getTableContext(newTableName));
-      } catch (_) {}
-      endTableRenameBarrier(oldTableName, newTableName);
-    }
   }
 
   TableSchema _schemaWithRenamedReferencedTable(
@@ -7357,45 +7161,6 @@ class DataStoreImpl {
       final tableCtx = await getTableContext(tableName);
       await schemaMgr.saveTableSchema(tableCtx, updatedSchema);
       updatedTables?.add(tableName);
-    }
-  }
-
-  Future<void> _rewriteMovedTableMetadataAfterRename(
-    String tableName,
-    TableSchema schemaForLayout,
-  ) async {
-    // With stable UIDs, TableMeta, B+Tree IndexMeta, and NghIndexMeta contain
-    // only tableUid/indexUid — logical names live in schema only.
-
-    final vectorIndexes =
-        schemaManager?.getVectorIndexesFor(schemaForLayout) ?? <IndexSchema>[];
-    for (final index in vectorIndexes) {
-      final metaPath = await pathManager.getNghMetaPath(
-          TableUid(schemaForLayout.tableUid), index.indexUid);
-      if (!await storage.existsFile(metaPath)) {
-        continue;
-      }
-
-      final content = await storage.readAsString(metaPath);
-      if (content == null || content.isEmpty) {
-        continue;
-      }
-
-      final json = jsonDecode(content);
-      if (json is! Map) {
-        continue;
-      }
-
-      final meta = NghIndexMeta.fromJson(Map<String, dynamic>.from(json));
-      if (meta.tableUid == schemaForLayout.tableUid) {
-        continue;
-      }
-
-      final updatedMeta = meta.copyWith(
-        tableUid: schemaForLayout.tableUid,
-      );
-
-      await storage.writeAsString(metaPath, jsonEncode(updatedMeta.toJson()));
     }
   }
 
