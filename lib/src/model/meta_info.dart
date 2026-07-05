@@ -658,16 +658,16 @@ class SchemaPartitionMeta {
   final int fileSizeInBytes;
 
   /// table uids in the partition
-  final List<String> tableUids;
+  final List<TableUid> tableUids;
 
-  /// table size mapping
-  final Map<String, int> tableSizes;
+  /// table size mapping (stable uid keys; legacy name keys normalized on load)
+  final Map<TableUid, int> tableSizes;
 
-  /// table schema data
-  final Map<String, dynamic> tableSchemas;
+  /// table schema payload keyed by stable [TableUid]
+  final Map<TableUid, dynamic> tableSchemas;
 
   /// stable field storage layout per table
-  final Map<String, dynamic> tableFieldLayouts;
+  final Map<TableUid, dynamic> tableFieldLayouts;
 
   /// timestamps
   final Timestamps timestamps;
@@ -693,10 +693,10 @@ class SchemaPartitionMeta {
     int? version,
     int? index,
     int? fileSizeInBytes,
-    List<String>? tableUids,
-    Map<String, int>? tableSizes,
-    Map<String, dynamic>? tableSchemas,
-    Map<String, dynamic>? tableFieldLayouts,
+    List<TableUid>? tableUids,
+    Map<TableUid, int>? tableSizes,
+    Map<TableUid, dynamic>? tableSchemas,
+    Map<TableUid, dynamic>? tableFieldLayouts,
     Timestamps? timestamps,
     int? dirIndex,
   }) {
@@ -704,10 +704,12 @@ class SchemaPartitionMeta {
       version: version ?? this.version,
       index: index ?? this.index,
       fileSizeInBytes: fileSizeInBytes ?? this.fileSizeInBytes,
-      tableUids: tableUids ?? List.from(this.tableUids),
-      tableSizes: tableSizes ?? Map.from(this.tableSizes),
-      tableSchemas: tableSchemas ?? Map.from(this.tableSchemas),
-      tableFieldLayouts: tableFieldLayouts ?? Map.from(this.tableFieldLayouts),
+      tableUids: tableUids ?? List<TableUid>.from(this.tableUids),
+      tableSizes: tableSizes ?? Map<TableUid, int>.from(this.tableSizes),
+      tableSchemas:
+          tableSchemas ?? Map<TableUid, dynamic>.from(this.tableSchemas),
+      tableFieldLayouts: tableFieldLayouts ??
+          Map<TableUid, dynamic>.from(this.tableFieldLayouts),
       timestamps: timestamps ?? this.timestamps,
       dirIndex: dirIndex ?? this.dirIndex,
     );
@@ -719,16 +721,36 @@ class SchemaPartitionMeta {
           json['version'], InternalConfig.legacySchemaVersion),
       index: json['index'] as int,
       fileSizeInBytes: json['fileSizeInBytes'] as int,
-      tableUids:
-          List<String>.from((json['tableUids'] ?? json['tableNames']) as List),
-      tableSizes: Map<String, int>.from(json['tableSizes'] as Map),
-      tableSchemas: Map<String, dynamic>.from(json['tableSchemas'] as Map),
+      tableUids: _tableUidListFromJson(json['tableUids'] ?? json['tableNames']),
+      tableSizes: _tableUidIntMapFromJson(json['tableSizes'] as Map),
+      tableSchemas: _tableUidDynamicMapFromJson(json['tableSchemas'] as Map),
       tableFieldLayouts: json['tableFieldLayouts'] is Map
-          ? Map<String, dynamic>.from(json['tableFieldLayouts'] as Map)
-          : <String, dynamic>{},
+          ? _tableUidDynamicMapFromJson(json['tableFieldLayouts'] as Map)
+          : <TableUid, dynamic>{},
       timestamps:
           Timestamps.fromJson(json['timestamps'] as Map<String, dynamic>),
       dirIndex: json['dirIndex'] as int?,
+    );
+  }
+
+  static List<TableUid> _tableUidListFromJson(dynamic raw) {
+    if (raw is! List) return const <TableUid>[];
+    return raw.map((e) => TableUid(e as String)).toList();
+  }
+
+  static Map<TableUid, int> _tableUidIntMapFromJson(Map raw) {
+    return Map<TableUid, int>.fromEntries(
+      raw.entries.map(
+        (e) => MapEntry(TableUid(e.key as String), (e.value as num).toInt()),
+      ),
+    );
+  }
+
+  static Map<TableUid, dynamic> _tableUidDynamicMapFromJson(Map raw) {
+    return Map<TableUid, dynamic>.fromEntries(
+      raw.entries.map(
+        (e) => MapEntry(TableUid(e.key as String), e.value),
+      ),
     );
   }
 
@@ -737,10 +759,11 @@ class SchemaPartitionMeta {
       'version': version,
       'index': index,
       'fileSizeInBytes': fileSizeInBytes,
-      'tableUids': tableUids,
-      'tableSizes': tableSizes,
-      'tableSchemas': tableSchemas,
-      'tableFieldLayouts': tableFieldLayouts,
+      'tableUids': tableUids.map((u) => u.value).toList(),
+      'tableSizes': tableSizes.map((k, v) => MapEntry(k.value, v)),
+      'tableSchemas': tableSchemas.map((k, v) => MapEntry(k.value, v)),
+      'tableFieldLayouts':
+          tableFieldLayouts.map((k, v) => MapEntry(k.value, v)),
       'timestamps': timestamps.toJson(),
       if (dirIndex != null) 'dirIndex': dirIndex,
     };
@@ -755,7 +778,7 @@ class SchemaPartitionMeta {
 /// stable table schema route entry
 class TableSchemaRouteEntry {
   final TableUid tableUid;
-  final String tableName;
+  final TableName tableName;
   final int dirIndex;
   final int partitionIndex;
   final int dataDirIndex;
@@ -783,7 +806,7 @@ class TableSchemaRouteEntry {
     }
     return TableSchemaRouteEntry(
       tableUid: TableUid.parse(rawTableUid),
-      tableName: json['tableName'] as String,
+      tableName: TableName(json['tableName'] as String),
       dirIndex: json['dirIndex'] as int,
       partitionIndex: json['partitionIndex'] as int,
       dataDirIndex: json['dataDirIndex'] as int,
