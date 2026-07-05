@@ -25,7 +25,7 @@ class BackgroundWriteEntry {
 
   /// Specific index uids to build or update. If null and mode includes index write,
   /// all indexes of the table will be processed by default.
-  final List<String>? specificIndexUids;
+  final List<IndexUid>? specificIndexUids;
 
   /// The current batch start cursor (for safe persisted checkpoint recovery).
   final String? currentCursor;
@@ -57,7 +57,7 @@ class BackgroundWriteEntry {
     BackgroundWriteType? type,
     MigrationWriteMode? mode,
     BufferEntry? entry,
-    List<String>? specificIndexUids,
+    List<IndexUid>? specificIndexUids,
     String? currentCursor,
     String? nextCursor,
     bool? isValid,
