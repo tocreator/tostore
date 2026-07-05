@@ -1074,16 +1074,8 @@ class QueryExecutor {
                 .addAll(MemComparableKey.decodeTuple(cursorToken.indexKey!));
 
             final idxUid = cursorToken.indexUid;
-            // Find index schema match.
-            IndexSchema? idx;
-            try {
-              final allIndexes =
-                  _dataStore.schemaManager?.getAllIndexesFor(schema) ??
-                      <IndexSchema>[];
-              idx = allIndexes.firstWhere((i) => i.indexUid == idxUid);
-            } catch (_) {
-              // Not found
-            }
+            final idx =
+                _dataStore.schemaManager?.findIndexSchemaByUid(schema, idxUid);
 
             if (idx != null) {
               for (var f in idx.fields) {
@@ -2770,17 +2762,12 @@ class QueryExecutor {
     if (orderBy == null || orderBy.isEmpty) return false;
     final idxUid = plan.operation.indexUid;
     if (idxUid == null) return false;
-    try {
-      final allIndexes = _dataStore.schemaManager?.getAllIndexesFor(schema);
-      if (allIndexes == null) return false;
-      final idx = allIndexes.firstWhere((i) => i.indexUid == idxUid);
-      if (orderBy.length != idx.fields.length) return false;
-      // We assume validation has already passed and all fields have uniform direction.
-      final parsed = _parseSortField(orderBy[0]);
-      return parsed.descending;
-    } catch (_) {
-      return false;
-    }
+    final idx = _dataStore.schemaManager?.findIndexSchemaByUid(schema, idxUid);
+    if (idx == null) return false;
+    if (orderBy.length != idx.fields.length) return false;
+    // We assume validation has already passed and all fields have uniform direction.
+    final parsed = _parseSortField(orderBy[0]);
+    return parsed.descending;
   }
 
   /// User-facing index label for error/explain messages (never expose stable [IndexUid]).
@@ -2801,29 +2788,26 @@ class QueryExecutor {
   /// Resolve index spec for cursor building.
   ({List<String> fields, bool isUnique}) _resolveIndexSpecForCursor(
       TableSchema schema, IndexUid indexUid) {
-    try {
-      final allIndexes = _dataStore.schemaManager?.getAllIndexesFor(schema);
-      if (allIndexes == null) return (fields: <String>[], isUnique: false);
-      final idx = allIndexes.firstWhere((i) => i.indexUid == indexUid);
+    final idx =
+        _dataStore.schemaManager?.findIndexSchemaByUid(schema, indexUid);
+    if (idx != null) {
       return (fields: idx.fields, isUnique: idx.unique);
-    } catch (e) {
-      if (e is DbException) rethrow;
-      // Fallback for implicit unique single-field indexes (uniq_field).
-      final legacyName = indexUid.value;
-      if (legacyName.startsWith('uniq_') && legacyName.length > 5) {
-        return (fields: <String>[legacyName.substring(5)], isUnique: true);
-      }
-      final label = _indexDisplayLabel(schema, indexUid);
-      final message = label == 'index'
-          ? 'Index schema not found for cursor pagination.'
-          : 'Index schema not found for cursor pagination on index "$label".';
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.devIndexNotFound,
-          message: message,
-        ),
-      ]);
     }
+    // Fallback for implicit unique single-field indexes (uniq_field).
+    final legacyName = indexUid.value;
+    if (legacyName.startsWith('uniq_') && legacyName.length > 5) {
+      return (fields: <String>[legacyName.substring(5)], isUnique: true);
+    }
+    final label = _indexDisplayLabel(schema, indexUid);
+    final message = label == 'index'
+        ? 'Index schema not found for cursor pagination.'
+        : 'Index schema not found for cursor pagination on index "$label".';
+    throw DbException([
+      GeneralStatus(
+        type: ResultType.devIndexNotFound,
+        message: message,
+      ),
+    ]);
   }
 
   /// Validate that orderBy matches index key order for cursor pagination.
@@ -3304,12 +3288,7 @@ class QueryExecutor {
       comps.add(schema.encodePrimaryKeyComponent(pkVal));
     }
 
-    final IndexSchema? idx = (schema.indexes
-            .cast<IndexSchema?>()
-            .firstWhere((i) => i?.indexUid == idxUid, orElse: () => null) ??
-        schema.autoIndexes
-            ?.cast<IndexSchema?>()
-            .firstWhere((i) => i?.indexUid == idxUid, orElse: () => null));
+    final idx = _dataStore.schemaManager?.findIndexSchemaByUid(schema, idxUid);
     final resolvedIndexUid = idx?.indexUid ?? idxUid;
 
     return _QueryCursorToken.indexKey(
