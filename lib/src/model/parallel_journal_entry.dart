@@ -2,6 +2,17 @@
 /// Keep JSON schema compatible with existing map-based entries.
 library;
 
+/// Resolve persisted index reference from journal JSON (uid preferred).
+String resolveIndexFieldFromJson(Map<String, dynamic> json) {
+  final indexUid = json['indexUid'];
+  if (indexUid is String && indexUid.isNotEmpty) return indexUid;
+  final index = json['index'];
+  if (index is String && index.isNotEmpty) return index;
+  final indexName = json['indexName'];
+  if (indexName is String && indexName.isNotEmpty) return indexName;
+  return '';
+}
+
 /// Resolve persisted table reference from journal JSON (uid preferred).
 String resolveTableFieldFromJson(Map<String, dynamic> json) {
   final tableUid = json['tableUid'];
@@ -344,7 +355,7 @@ class IndexPartitionFlushedEntry extends ParallelJournalEntry {
 
     return IndexPartitionFlushedEntry(
       table: resolveTableFieldFromJson(json),
-      index: (json['index'] as String?) ?? '',
+      index: resolveIndexFieldFromJson(json),
       partitionNo: partitionNo,
       totalEntries: totalEntries,
       totalSizeInBytes: totalSizeInBytes,
@@ -379,7 +390,7 @@ class IndexMetaUpdatedEntry extends ParallelJournalEntry {
   static IndexMetaUpdatedEntry fromJson(Map<String, dynamic> json) =>
       IndexMetaUpdatedEntry(
         table: resolveTableFieldFromJson(json),
-        index: (json['index'] as String?) ?? '',
+        index: resolveIndexFieldFromJson(json),
         batchId: (json['batchId'] as String?),
         batchType: BatchType.fromString(
             (json['batchType'] as String?) ?? (json['scope'] as String?)),
