@@ -235,7 +235,7 @@ class SchemaManager {
         GeneralStatus(
           type: ResultType.engError,
           message:
-              'Route entry not found for tableUid "$uid" (schema version "$schemaVersion").',
+              'Route entry not found for table "${schema.name}" (schema version "$schemaVersion").',
         )
       ]);
     }
@@ -539,7 +539,8 @@ class SchemaManager {
           );
           if (match.key.isNotEmpty) {
             oldName = match.key;
-            currentTarget = match.key; // Trace chain recursively (e.g. a -> b -> c)
+            currentTarget =
+                match.key; // Trace chain recursively (e.g. a -> b -> c)
           } else {
             found = false;
           }
@@ -726,11 +727,12 @@ class SchemaManager {
 
     final name = getNameByUid(tableUid)?.value ?? resolvedSchema?.name;
     if (resolvedSchema == null || name == null) {
+      final logName = name ?? getNameByUid(tableUid)?.value ?? 'unknown';
       throw DbException([
         SchemaValidationStatus(
           type: ResultType.devTableNotFound,
-          message: 'Table schema not found for table: ${name ?? tableUid}',
-          tableName: name ?? tableUid,
+          message: 'Table schema not found for table: $logName',
+          tableName: logName,
         ),
       ]);
     }
@@ -739,7 +741,7 @@ class SchemaManager {
       throw DbException([
         SchemaValidationStatus(
           type: ResultType.devTableNotFound,
-          message: 'Table context not found for table: $tableUid',
+          message: 'Table context not found for table: $name',
           tableName: name,
         ),
       ]);
