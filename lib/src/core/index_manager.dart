@@ -134,8 +134,36 @@ class IndexManager {
   String _indexLogLabel(TableContext table, IndexUid indexUid,
       {TableSchema? schema}) {
     final s = schema ?? table.schema;
-    final idx = _dataStore.schemaManager?.findIndexSchemaByUid(s, indexUid);
-    return idx?.actualIndexName ?? indexUid.value;
+    final idx = _findBtreeIndexSchema(s, indexUid, table: table);
+    return idx?.actualIndexName ?? 'index';
+  }
+
+  /// O(1) lookup of B+Tree [IndexSchema] by stable [IndexUid].
+  ///
+  /// Uses [SchemaManager.findIndexSchemaByUid] first, then legacy alias /
+  /// engine-managed indexes. Avoids linear [TableSchema.getAllIndexes] scans
+  /// on hot paths (search, encode key, comparator registration).
+  IndexSchema? _findBtreeIndexSchema(
+    TableSchema schema,
+    IndexUid indexUid, {
+    TableContext? table,
+  }) {
+    if (indexUid.isEmpty) return null;
+    final schemaMgr = _dataStore.schemaManager;
+    if (schemaMgr == null) return null;
+
+    var found = schemaMgr.findIndexSchemaByUid(schema, indexUid);
+    if (found != null) return found;
+
+    found = schemaMgr.findIndexSchemaByField(schema, indexUid.value);
+    if (found != null) return found;
+
+    if (table != null) {
+      for (final i in getEngineManagedBtreeIndexes(table, schema)) {
+        if (_indexUidFromSchema(i) == indexUid) return i;
+      }
+    }
+    return null;
   }
 
   String _indexLockKey(TableUid tableUid, IndexUid indexUid) =>
@@ -797,18 +825,7 @@ class IndexManager {
     final key = '${table.tableUid}:$indexUid';
     if (_indexFieldMatchers.containsKey(key)) return;
 
-    var indexSchema =
-        _dataStore.schemaManager?.findIndexSchemaByUid(schema, indexUid);
-
-    if (indexSchema == null) {
-      final engineManaged = getEngineManagedBtreeIndexes(table, schema);
-      for (final i in engineManaged) {
-        if (_indexUidFromSchema(i) == indexUid) {
-          indexSchema = i;
-          break;
-        }
-      }
-    }
+    final indexSchema = _findBtreeIndexSchema(schema, indexUid, table: table);
 
     if (indexSchema == null || indexSchema.fields.isEmpty) return;
 
@@ -883,17 +900,8 @@ class IndexManager {
     }
 
     // Resolve index schema for encoding key components (truncateText for non-unique).
-    var indexSchema =
-        _dataStore.schemaManager?.findIndexSchemaByUid(schema, indexUid);
-    if (indexSchema == null) {
-      for (final i in getEngineManagedBtreeIndexes(table, schema)) {
-        if (_indexUidFromSchema(i) == indexUid) {
-          indexSchema = i;
-          break;
-        }
-      }
-    }
-    indexSchema ??= IndexSchema(indexName: '', fields: const []);
+    final indexSchema = _findBtreeIndexSchema(schema, indexUid, table: table) ??
+        IndexSchema(indexName: '', fields: const []);
     final resolvedIndexSchema = indexSchema;
     final int fieldCount = resolvedIndexSchema.fields.length;
     final bool truncateText = !isUnique;
@@ -1484,7 +1492,13 @@ class IndexManager {
           'the auto-created unique index "${autoIdx.actualIndexName}". '
           'Removing auto-created index and proceeding with explicit index.',
         );
-        await removeIndex(table, indexName: autoIdx.actualIndexName);
+        await removeIndex(
+          table,
+          indexUid: autoIdx.indexUid.isNotEmpty ? autoIdx.indexUid : null,
+          indexName: autoIdx.indexUid.isEmpty
+              ? IndexName(autoIdx.actualIndexName)
+              : null,
+        );
       }
       break;
     }
@@ -1625,11 +1639,13 @@ class IndexManager {
               await _dataStore.storage.deleteDirectory(indexPath);
             }
           } catch (e) {
-            final idxSchema = schema.getAllIndexes().firstWhere(
-                (i) => i.indexUid == indexUid || i.actualIndexName == indexUid,
-                orElse: () => IndexSchema(indexName: '', fields: const []));
-            final friendlyName = idxSchema.actualIndexName.isNotEmpty
-                ? idxSchema.actualIndexName
+            final idxSchema = _findBtreeIndexSchema(
+              schema,
+              IndexUid(indexUid),
+              table: table,
+            );
+            final friendlyName = idxSchema?.actualIndexName.isNotEmpty == true
+                ? idxSchema!.actualIndexName
                 : indexUid;
             Logger.warn('Failed to delete index directory for $friendlyName',
                 rawError: e);
@@ -1661,10 +1677,12 @@ class IndexManager {
   IndexSchema _resolveIndexSchemaForRepair(
     TableSchema schema,
     IndexUid indexUid,
-    IndexMeta meta,
-  ) {
-    final byUid =
-        _dataStore.schemaManager?.findIndexSchemaByUid(schema, indexUid);
+    IndexMeta meta, {
+    TableContext? table,
+  }) {
+    final byUid = table != null
+        ? _findBtreeIndexSchema(schema, indexUid, table: table)
+        : _dataStore.schemaManager?.findIndexSchemaByUid(schema, indexUid);
     if (byUid != null) return byUid;
     return IndexSchema(
       indexName: indexUid.value,
@@ -1746,7 +1764,7 @@ class IndexManager {
             startProcessing: true,
             targetSchemaSnapshot: schema,
             writeMode: MigrationWriteMode.indexOnly,
-            specificIndexUids: [indexUid.value],
+            specificIndexUids: [indexUid],
           );
         }
       } catch (e) {
@@ -1830,7 +1848,7 @@ class IndexManager {
                 tableName: table.tableName,
                 fields: [primaryKey],
                 value: primaryValue,
-                indexName: 'pk',
+                indexName: IndexName('pk'),
                 existingPrimaryKey: conflictId,
               );
             }
@@ -1844,7 +1862,7 @@ class IndexManager {
               tableName: table.tableName,
               fields: [primaryKey],
               value: primaryValue,
-              indexName: 'pk',
+              indexName: IndexName('pk'),
             );
           }
         } else {
@@ -1865,7 +1883,7 @@ class IndexManager {
                 tableName: table.tableName,
                 fields: [primaryKey],
                 value: primaryValue,
-                indexName: 'pk',
+                indexName: IndexName('pk'),
               );
             }
           } catch (e) {
@@ -1876,7 +1894,7 @@ class IndexManager {
               tableName: table.tableName,
               fields: [primaryKey],
               value: primaryValue,
-              indexName: 'pk',
+              indexName: IndexName('pk'),
             );
           }
         }
@@ -1904,7 +1922,7 @@ class IndexManager {
           fields: index.fields,
           value: v,
           indexUid: _indexUidFromSchema(index),
-          indexName: index.actualIndexName,
+          indexName: IndexName(index.actualIndexName),
           canonicalKey: schema.createCanonicalIndexKey(index.fields, data),
         ));
       }
@@ -2008,23 +2026,22 @@ class IndexManager {
 
       // 3. Execute disk checks using existsUniqueKeysBatch (fast BinaryFuseFilter + grouped I/O)
       try {
-        // Group constraints by index name for batch processing
-        final constraintsByIndex = <String, List<_UniqueConstraint>>{};
+        // Group constraints by stable index uid for batch processing
+        final constraintsByIndex = <IndexUid, List<_UniqueConstraint>>{};
         for (final constraint in constraintsToCheckOnDisk) {
           constraintsByIndex
-              .putIfAbsent(constraint.indexName, () => [])
+              .putIfAbsent(constraint.indexUid, () => [])
               .add(constraint);
         }
 
         // Check each index group
         for (final entry in constraintsByIndex.entries) {
-          final indexName = entry.key;
+          final indexUid = entry.key;
           final indexConstraints = entry.value;
           if (indexConstraints.isEmpty) continue;
 
           // Get index metadata
-          final meta =
-              await getIndexMeta(table, indexConstraints.first.indexUid);
+          final meta = await getIndexMeta(table, indexUid);
           if (meta == null || meta.isBuilding || meta.totalEntries <= 0) {
             final tableMeta =
                 await _dataStore.tableDataManager.getTableMeta(table);
@@ -2090,7 +2107,6 @@ class IndexManager {
           if (keyBytes.isEmpty) continue;
 
           // Batch check existence using BinaryFuseFilter + grouped I/O
-          final indexUid = indexConstraints.first.indexUid;
           final exists =
               await _dataStore.indexTreePartitionManager?.existsUniqueKeysBatch(
                     table: table,
@@ -2140,7 +2156,9 @@ class IndexManager {
             // the resolved owner record is still logically visible.
             if (existingPk == null || existingPk.isEmpty) {
               Logger.warn(
-                'Unique key exists but owner lookup returned null: table=${table.tableName} index=$indexName value=${constraint.value}',
+                'Unique key exists but owner lookup returned null: '
+                'table=${table.tableName} index=${_indexLogLabel(table, indexUid)} '
+                'value=${constraint.value}',
               );
             } else {
               if (_isPrimaryKeyHiddenByDeleteOverlay(
@@ -2273,7 +2291,7 @@ class IndexManager {
               tableName: table.tableName,
               fields: [primaryKey],
               value: pk,
-              indexName: 'pk',
+              indexName: IndexName('pk'),
               existingPrimaryKey: pk,
             );
             if (resolveInPlace) {
@@ -2299,7 +2317,7 @@ class IndexManager {
                 tableName: table.tableName,
                 fields: [primaryKey],
                 value: pk,
-                indexName: 'pk',
+                indexName: IndexName('pk'),
                 existingPrimaryKey: conflictId,
               );
               if (resolveInPlace) {
@@ -2343,7 +2361,7 @@ class IndexManager {
                 tableName: table.tableName,
                 fields: [primaryKey],
                 value: pk,
-                indexName: 'pk',
+                indexName: IndexName('pk'),
                 existingPrimaryKey: pk,
               );
               if (resolveInPlace) {
@@ -2363,8 +2381,8 @@ class IndexManager {
 
     for (final idx in uniqueIndexes) {
       final indexUid = _indexUidFromSchema(idx);
-      final indexName = idx.actualIndexName;
-      if (indexName.isEmpty) continue;
+      final indexLabel = IndexName(idx.actualIndexName);
+      if (indexLabel.isEmpty) continue;
       final preparedEntries = await _prepareUniqueIndexEntriesBatch(
         schema: schema,
         index: idx,
@@ -2410,7 +2428,7 @@ class IndexManager {
             tableName: table.tableName,
             fields: idx.fields,
             value: canKey,
-            indexName: indexName,
+            indexName: indexLabel,
             existingPrimaryKey: existingPk,
           );
           if (resolveInPlace && existingPk != null) {
@@ -2434,7 +2452,7 @@ class IndexManager {
               tableName: table.tableName,
               fields: idx.fields,
               value: canKey,
-              indexName: indexName,
+              indexName: indexLabel,
               existingPrimaryKey: conflictId,
             );
             if (resolveInPlace) {
@@ -2471,7 +2489,7 @@ class IndexManager {
               tableName: table.tableName,
               fields: idx.fields,
               value: (idx.fields.length == 1) ? vals.first : vals,
-              indexName: indexName,
+              indexName: indexLabel,
               existingPrimaryKey: existingPk,
             );
             if (resolveInPlace) {
@@ -2514,7 +2532,7 @@ class IndexManager {
               tableName: table.tableName,
               fields: idx.fields,
               value: canKey,
-              indexName: indexName,
+              indexName: indexLabel,
               existingPrimaryKey: existingPk,
             );
             if (resolveInPlace) {
@@ -2593,7 +2611,7 @@ class IndexManager {
               tableName: table.tableName,
               fields: idx.fields,
               value: canKey,
-              indexName: indexName,
+              indexName: indexLabel,
               existingPrimaryKey: existingPk,
             );
             if (resolveInPlace) {
@@ -2643,59 +2661,65 @@ class IndexManager {
     return null;
   }
 
-  /// remove index from table
-  /// @param tableName table name
-  /// @param indexName index name
-  /// @param fields field list (when indexName is not provided)
+  /// Remove index from table (schema + physical artifacts).
+  ///
+  /// Prefer [indexUid] for engine-internal calls. [indexName] and [fields]
+  /// remain for logical-name / field-list matching.
   Future<void> removeIndex(
     TableContext table, {
-    String? indexName,
+    IndexUid? indexUid,
+    IndexName? indexName,
     List<String>? fields,
   }) async {
     try {
-      if (indexName == null && (fields == null || fields.isEmpty)) {
+      if ((indexUid == null || indexUid.isEmpty) &&
+          (indexName == null || indexName.isEmpty) &&
+          (fields == null || fields.isEmpty)) {
         throw DbException([
           InvalidArgumentStatus(
             type: ResultType.devInvalidArgumentMissing,
-            message: 'index name or field list is required for removeIndex',
-            parameterName: 'indexName/fields',
-            passedValue: 'indexName=$indexName, fields=$fields',
+            message:
+                'indexUid, index name, or field list is required for removeIndex',
+            parameterName: 'indexUid/indexName/fields',
+            passedValue:
+                'indexUid=$indexUid, indexName=$indexName, fields=$fields',
           ),
         ]);
       }
 
-      final schema =
-          await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+      final schemaMgr = _dataStore.schemaManager;
+      final schema = await schemaMgr?.getTableSchema(table.tableUid);
       if (schema == null) {
         Logger.warn(
             'table ${table.tableName} does not exist, cannot remove index');
         return;
       }
 
-      final allIndexes = _dataStore.schemaManager?.getAllIndexesFor(schema);
+      final allIndexes = schemaMgr?.getAllIndexesFor(schema);
       if (allIndexes == null) return;
 
-      // find matching index
       IndexSchema? targetIndex;
 
-      // 1. if index name is provided, try to match by index name
-      if (indexName != null) {
-        // try to match by index name
+      // 1. match by stable uid
+      if (indexUid != null && indexUid.isNotEmpty) {
+        targetIndex = schemaMgr?.findIndexSchemaByUid(schema, indexUid);
+      }
+
+      // 2. match by logical / physical name
+      if (targetIndex == null && indexName != null && indexName.isNotEmpty) {
+        final name = indexName.value;
         for (var index in allIndexes) {
-          if (index.indexName == indexName ||
-              index.actualIndexName == indexName) {
+          if (index.indexName == name || index.actualIndexName == name) {
             targetIndex = index;
             break;
           }
         }
 
-        // if not found, try to match by index name generated by fields
         if (targetIndex == null) {
-          // check if it is an auto-generated index name
           final autoGenPattern = RegExp(r'^' + table.tableName + r'_\w+');
-          if (autoGenPattern.hasMatch(indexName)) {
+          if (autoGenPattern.hasMatch(name)) {
             for (var index in allIndexes) {
-              if (index.actualIndexName == indexName) {
+              if (index.actualIndexName == name) {
                 targetIndex = index;
                 break;
               }
@@ -2704,7 +2728,7 @@ class IndexManager {
         }
       }
 
-      // 2. if fields list is provided, try to match by fields list
+      // 3. match by fields list
       if (targetIndex == null && fields != null && fields.isNotEmpty) {
         for (var index in allIndexes) {
           if (_areFieldListsEqual(index.fields, fields)) {
@@ -2715,21 +2739,26 @@ class IndexManager {
       }
 
       String? actualName;
-
-      // if target index is found
       if (targetIndex != null) {
         actualName = targetIndex.actualIndexName;
-      } else if (indexName != null) {
-        actualName = indexName;
+      } else if (indexName != null && indexName.isNotEmpty) {
+        actualName = indexName.value;
+      } else if (indexUid != null && indexUid.isNotEmpty) {
+        actualName = indexUid.value;
       } else {
         return;
       }
 
-      final indexUid = targetIndex?.indexUid ??
-          _resolveIndexUid(table, actualName, schema: schema);
+      final resolvedIndexUid =
+          targetIndex != null && targetIndex.indexUid.isNotEmpty
+              ? targetIndex.indexUid
+              : (indexUid != null && indexUid.isNotEmpty
+                  ? indexUid
+                  : _resolveIndexUid(table, actualName, schema: schema));
+      if (resolvedIndexUid.isEmpty) return;
 
       final lockMgr = _dataStore.lockManager;
-      final indexLockKey = _indexLockKey(table.tableUid, indexUid);
+      final indexLockKey = _indexLockKey(table.tableUid, resolvedIndexUid);
       final indexLockOpId = GlobalIdGenerator.generate('remove_index_');
       bool indexLocked = false;
 
@@ -2750,7 +2779,7 @@ class IndexManager {
           }
         }
 
-        await deletePhysicalIndexArtifacts(table, indexUid);
+        await deletePhysicalIndexArtifacts(table, resolvedIndexUid);
 
         // if target index is found, remove it from table schema
         if (targetIndex != null) {
@@ -2759,7 +2788,7 @@ class IndexManager {
           final newSchema = schema.copyWith(indexes: newIndexes);
 
           // update table schema
-          await _dataStore.schemaManager!.saveTableSchema(table, newSchema);
+          await schemaMgr!.saveTableSchema(table, newSchema);
         }
       } finally {
         if (indexLocked && lockMgr != null) {
@@ -2973,15 +3002,19 @@ class IndexManager {
 
       for (final indexSchema in indexesToBuild) {
         if (indexSchema.type == IndexType.vector) continue;
-        final indexName = indexSchema.actualIndexName;
+        final indexUid = indexSchema.indexUid;
+        if (indexUid.isEmpty) {
+          Logger.error(
+            'Cannot rebuild index without stable indexUid: '
+            '${table.tableName}.${indexSchema.actualIndexName}',
+          );
+          continue;
+        }
         // Clean physical index files before rebuild starts
-        await deletePhysicalIndexArtifacts(table, indexSchema.indexUid);
+        await deletePhysicalIndexArtifacts(table, indexUid);
         final tableUid =
             _dataStore.schemaManager?.getUidByName(table.tableName) ??
                 table.tableUid;
-        final indexUid = indexSchema.indexUid.isNotEmpty
-            ? indexSchema.indexUid
-            : IndexUid(indexName);
         final indexMeta = IndexMeta.createEmpty(
           indexUid: indexUid,
           tableUid: tableUid,
@@ -3190,18 +3223,21 @@ class IndexManager {
     }
   }
 
-  /// Helper to encode index key from record
+  /// Helper to encode index key from record.
+  ///
+  /// B+Tree keys remain memcomparable field tuples — [indexUid] selects which
+  /// index tree to write, not what goes into [MemComparableKey.encodeTuple].
   Uint8List? encodeIndexKeyFromRecord({
     required TableSchema schema,
     required IndexMeta meta,
     required Map<String, dynamic> record,
     required String pkValue,
+    TableContext? table,
   }) {
-    final indexSchema = schema.getAllIndexes().firstWhere(
-          (i) =>
-              i.indexUid == meta.indexUid || i.actualIndexName == meta.indexUid,
-          orElse: () => IndexSchema(indexName: '', fields: const []),
-        );
+    final indexSchema = table != null
+        ? _findBtreeIndexSchema(schema, meta.indexUid, table: table)
+        : _dataStore.schemaManager?.findIndexSchemaByUid(schema, meta.indexUid);
+    if (indexSchema == null || indexSchema.fields.isEmpty) return null;
     final fields = indexSchema.fields;
     final isUnique = meta.isUnique;
     final truncateText = !isUnique;
@@ -3224,7 +3260,7 @@ class IndexManager {
 
   /// Write index changes (inserts, updates, deletes) to index partition files
   ///
-  /// [skipIndexes] - Optional set of index names to skip processing.
+  /// [skipIndexes] - Optional set of index uids to skip processing.
   /// Used during recovery to skip indexes that have already been fully flushed.
   Future<void> writeChanges({
     required TableContext table,
@@ -3235,7 +3271,7 @@ class IndexManager {
     int? concurrency,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
-    Set<String>? skipIndexes,
+    Set<IndexUid>? skipIndexes,
     TableSchema? schemaOverride,
     List<IndexSchema>? targetIndexesOverride,
   }) async {
@@ -3308,9 +3344,7 @@ class IndexManager {
       final indexUid = _indexUidFromSchema(idx);
       final indexName = idx.actualIndexName;
       // Skip indexes that are already fully flushed (used during recovery)
-      if (skipIndexes != null &&
-          (skipIndexes.contains(indexUid.value) ||
-              skipIndexes.contains(indexName))) {
+      if (skipIndexes != null && skipIndexes.contains(indexUid)) {
         continue;
       }
       idxTasks.add(() async {
@@ -3497,8 +3531,12 @@ class IndexManager {
         );
         final persistedTableRecords = tableMeta?.totalRecords ?? 0;
         if (persistedTableRecords > 0) {
-          final indexSchema =
-              _resolveIndexSchemaForRepair(schema, indexUid, meta);
+          final indexSchema = _resolveIndexSchemaForRepair(
+            schema,
+            indexUid,
+            meta,
+            table: table,
+          );
           await _scheduleEmptyIndexRepair(
             table: table,
             indexName: indexSchema.actualIndexName,
@@ -3518,12 +3556,10 @@ class IndexManager {
         return out;
       }
 
-      final indexSchema = schema.getAllIndexes().firstWhere(
-            (i) =>
-                i.indexUid == meta.indexUid ||
-                i.actualIndexName == meta.indexUid,
-            orElse: () => IndexSchema(indexName: '', fields: const []),
-          );
+      final indexSchema = _findBtreeIndexSchema(schema, indexUid, table: table);
+      if (indexSchema == null || indexSchema.fields.isEmpty) {
+        return IndexSearchResult.tableScan();
+      }
       final fields = indexSchema.fields;
       final bool isUnique = meta.isUnique;
       final bool truncateText = !isUnique;
@@ -4590,7 +4626,7 @@ class _UniqueConstraint {
   final List<String> fields;
   final dynamic value;
   final IndexUid indexUid;
-  final String indexName;
+  final IndexName indexName;
   // fast-path canonical key for write buffer check (raw value or List)
   final dynamic canonicalKey;
 
