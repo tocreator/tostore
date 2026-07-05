@@ -476,18 +476,18 @@ class ParallelJournalManager {
         // Skip entries for tables that are being cleared to avoid race conditions where clearTable
         // deletes files while flush is processing queued operations.
         // Coalesce all records (migration + business) by PK to ensure consistency
-        final Map<String, Map<String, BufferEntry>> tablePkMap = {};
-        final Map<String, int> tableEpochs = {};
-        final Map<String, List<WriteQueueEntry>> entriesByTable = {};
-        final Map<String, List<BackgroundWriteEntry>> bgEntriesByTable = {};
-        final Map<String, List<BackgroundWriteEntry>> bgLargeUpdatesByTable =
+        final Map<TableUid, Map<String, BufferEntry>> tablePkMap = {};
+        final Map<TableUid, int> tableEpochs = {};
+        final Map<TableUid, List<WriteQueueEntry>> entriesByTable = {};
+        final Map<TableUid, List<BackgroundWriteEntry>> bgEntriesByTable = {};
+        final Map<TableUid, List<BackgroundWriteEntry>> bgLargeUpdatesByTable =
             {};
 
         final yieldController =
             YieldController('ParallelJournalManager._pumpFlush');
 
         // Calculate the target checkpoint for each table in this batch
-        final Map<String, String> targetCheckpoints = {};
+        final Map<TableUid, String> targetCheckpoints = {};
         final flushCheckpointMap = <String, BgTaskProgress>{};
         for (final entry in bgEntries) {
           bgEntriesByTable.putIfAbsent(entry.tableUid, () => []).add(entry);
@@ -558,7 +558,7 @@ class ParallelJournalManager {
         }
 
         // 3. Finalize 'grouped' structure from the coalesced PK maps
-        final Map<String, Map<BufferOperationType, Map<String, BufferEntry>>>
+        final Map<TableUid, Map<BufferOperationType, Map<String, BufferEntry>>>
             grouped = {};
         int totalBatchUniqueRecords = 0;
 
@@ -615,7 +615,7 @@ class ParallelJournalManager {
         // Build lightweight table plan with index names to indicate index meta involvement
         final Map<String, dynamic> tablePlan = {};
         int estimatedTotalWorkOps = 0;
-        final allTables = <String>{...grouped.keys, ...bgEntriesByTable.keys};
+        final allTables = <TableUid>{...grouped.keys, ...bgEntriesByTable.keys};
 
         for (final tableUid in allTables) {
           final tableContext = _resolveTableContext(tableUid);
@@ -625,7 +625,7 @@ class ParallelJournalManager {
                 ?.getTableSchema(tableContext.tableUid);
             final tableMeta =
                 await _dataStore.tableDataManager.getTableMeta(tableContext);
-            final indexNames = <String>[];
+            final indexUids = <String>[];
             final baseIndexTotalEntries = <String, int>{};
             final baseIndexTotalSizeInBytes = <String, int>{};
 
@@ -638,7 +638,7 @@ class ParallelJournalManager {
               ];
               for (final idx in allIndexes) {
                 final idxUid = idx.indexUid.value;
-                indexNames.add(idxUid);
+                indexUids.add(idxUid);
 
                 // Fetch base index metadata
                 final idxMeta = await _dataStore.indexManager
@@ -658,12 +658,12 @@ class ParallelJournalManager {
             final bgRecords = bgEntriesByTable[tableUid] ?? [];
             tableRecordCount += bgRecords.length;
 
-            estimatedTotalWorkOps += tableRecordCount * (1 + indexNames.length);
+            estimatedTotalWorkOps += tableRecordCount * (1 + indexUids.length);
 
             tablePlan[tableUid] = {
               'willUpdateTableMeta': true,
-              'indexes': indexNames,
-              'willUpdateIndexMeta': indexNames.isNotEmpty,
+              'indexes': indexUids,
+              'willUpdateIndexMeta': indexUids.isNotEmpty,
               'baseTotalRecords': tableMeta?.totalRecords,
               'baseTotalSizeInBytes': tableMeta?.totalSizeInBytes,
               'baseIndexTotalEntries': baseIndexTotalEntries,
@@ -715,7 +715,7 @@ class ParallelJournalManager {
         late final int perTableTokenBudget;
 
         for (final tableUid in allTables) {
-          final tableContext = _tableContextFromUid(TableUid(tableUid));
+          final tableContext = _tableContextFromUid(tableUid);
           if (tableContext == null) continue;
           final tableName = tableContext.tableName;
           // Use the epoch captured before/during grouping
@@ -1018,8 +1018,7 @@ class ParallelJournalManager {
                         List<IndexSchema>? targetOverride;
                         if (specificIdxs != null) {
                           targetOverride = allIndexes
-                              .where((i) =>
-                                  specificIdxs.contains(i.indexUid.value))
+                              .where((i) => specificIdxs.contains(i.indexUid))
                               .toList();
                         }
 
@@ -1313,10 +1312,9 @@ class ParallelJournalManager {
       bool hasEffectiveEntry = false;
       // Track max primary key for each table during WAL recovery
       // This will be used to update maxId after recovery completes
-      final Map<String, dynamic> maxPkByTable = <String, dynamic>{};
-      // Store matcher functions for each table to compare primary keys
-      final Map<String, MatcherFunction> pkMatchersByTable =
-          <String, MatcherFunction>{};
+      final Map<TableUid, dynamic> maxPkByTable = <TableUid, dynamic>{};
+      final Map<TableUid, MatcherFunction> pkMatchersByTable =
+          <TableUid, MatcherFunction>{};
       // Precompute table-level WAL cutoff pointers from WAL meta (clear/drop ops)
       final Map<String, List<WalPointer>> tableCutoffs =
           <String, List<WalPointer>>{};
@@ -1418,8 +1416,7 @@ class ParallelJournalManager {
 
             // Skip WAL entries that are logically before a clear/drop cutoff
             // for this table.
-            final cutoffs = _tableCutoffsFor(tableCutoffs, resolvedTable) ??
-                _tableCutoffsFor(tableCutoffs, table);
+            final cutoffs = _tableCutoffsFor(tableCutoffs, resolvedTable);
             if (cutoffs != null && cutoffs.isNotEmpty) {
               final ptr = WalPointer(partitionIndex: p, entrySeq: seq);
               bool skip = false;
@@ -1439,7 +1436,7 @@ class ParallelJournalManager {
             if (schema == null) {
               Logger.warn(
                 'WAL recovery: skipping entry for unresolved table field '
-                '"$table"${resolvedTable != table ? ' (resolved: "$resolvedTable")' : ''}',
+                '"$table"${resolvedTable.value != table ? ' (resolved: "${resolvedTable.value}")' : ''}',
               );
               continue;
             }
@@ -1642,8 +1639,9 @@ class ParallelJournalManager {
     // Collect per-table: max partitionNo and its corresponding TablePartitionFlushedEntry
     // Collect per-index: max partitionNo and its corresponding IndexPartitionFlushedEntry
     // This allows us to quickly check if metadata is consistent without traversing all partitions
-    final Map<String, TablePartitionFlushedEntry> tableLastFlushedEntry = {};
-    final Map<String, IndexPartitionFlushedEntry> indexLastFlushedEntry = {};
+    final Map<TableUid, TablePartitionFlushedEntry> tableLastFlushedEntry = {};
+    final Map<TableUid, Map<IndexUid, IndexPartitionFlushedEntry>>
+        indexLastFlushedEntry = {};
 
     try {
       if (await _dataStore.storage.existsFile(path)) {
@@ -1670,12 +1668,19 @@ class ParallelJournalManager {
               } else if (entry is IndexPartitionFlushedEntry &&
                   entry.batchId == batch.batchId) {
                 final resolvedTable = _resolvePersistedTableField(entry.table);
-                // Track the last flushed entry (max partitionNo) for each index
-                final indexKey = '$resolvedTable:${entry.index}';
-                final existing = indexLastFlushedEntry[indexKey];
+                final tableContext = _resolveTableContext(resolvedTable);
+                final resolvedIndex = tableContext != null
+                    ? _resolvePersistedIndexField(
+                        tableContext.schema, entry.index)
+                    : IndexUid(entry.index);
+                final byIndex = indexLastFlushedEntry.putIfAbsent(
+                  resolvedTable,
+                  () => <IndexUid, IndexPartitionFlushedEntry>{},
+                );
+                final existing = byIndex[resolvedIndex];
                 if (existing == null ||
                     entry.partitionNo > existing.partitionNo) {
-                  indexLastFlushedEntry[indexKey] = entry;
+                  byIndex[resolvedIndex] = entry;
                 }
               }
             }
@@ -1695,14 +1700,15 @@ class ParallelJournalManager {
     }
 
     // Recover index metadata
-    for (final entry in indexLastFlushedEntry.entries) {
-      final parts = entry.key.split(':');
-      if (parts.length == 2) {
-        final tableContext = _resolveTableContext(parts[0]);
-        if (tableContext != null) {
-          await _recoverIndexMaintenanceMetadata(
-              tableContext, parts[1], entry.value);
-        }
+    for (final tableEntry in indexLastFlushedEntry.entries) {
+      final tableContext = _resolveTableContext(tableEntry.key);
+      if (tableContext == null) continue;
+      for (final indexEntry in tableEntry.value.entries) {
+        await _recoverIndexMaintenanceMetadata(
+          tableContext,
+          indexEntry.key,
+          indexEntry.value,
+        );
       }
     }
   }
@@ -1711,46 +1717,46 @@ class ParallelJournalManager {
   ///
   /// Fast path (common): normalize once; if already a live uid, return immediately.
   /// Slow path (legacy name + in-flight rename): apply pending renames, then normalize.
-  String _resolvePersistedTableField(String rawField) {
-    if (rawField.isEmpty) return rawField;
+  TableUid _resolvePersistedTableField(String rawField) {
+    if (rawField.isEmpty) return TableUid.empty;
     final mgr = _dataStore.schemaManager;
     final normalized = mgr?.normalizeTableFieldKey(rawField) ?? rawField;
     if (mgr != null && mgr.isActiveTableUidKey(normalized)) {
-      return normalized;
+      return TableUid(normalized);
     }
     final migMgr = _dataStore.migrationManager;
-    if (migMgr == null) return normalized;
+    if (migMgr == null) return TableUid(normalized);
     final pendingRenames = migMgr.getPendingTableRenames();
-    if (pendingRenames.isEmpty) return normalized;
+    if (pendingRenames.isEmpty) return TableUid(normalized);
     final renamed = pendingRenames[rawField] ?? pendingRenames[normalized];
-    if (renamed == null) return normalized;
-    return mgr?.normalizeTableFieldKey(renamed) ?? renamed;
+    if (renamed == null) return TableUid(normalized);
+    return TableUid(mgr?.normalizeTableFieldKey(renamed) ?? renamed);
   }
 
-  TableContext? _resolveTableContext(String tableField) {
-    if (tableField.isEmpty) return null;
-    final normalized = _resolvePersistedTableField(tableField);
-    return _dataStore.schemaManager?.getTableContextSync(TableUid(normalized));
+  TableContext? _resolveTableContext(TableUid tableUid) {
+    if (tableUid.isEmpty) return null;
+    return _dataStore.schemaManager?.getTableContextSync(tableUid);
   }
 
-  TablePlan? _tablePlanFor(Map<String, TablePlan> plans, String tableField) {
-    if (plans.isEmpty || tableField.isEmpty) return null;
-    final normalized = _resolvePersistedTableField(tableField);
-    return plans[normalized] ?? plans[tableField];
+  TablePlan? _tablePlanFor(Map<TableUid, TablePlan> plans, TableUid tableUid) {
+    if (plans.isEmpty || tableUid.isEmpty) return null;
+    return plans[tableUid];
   }
 
   List<WalPointer>? _tableCutoffsFor(
     Map<String, List<WalPointer>> tableCutoffs,
-    String tableField,
+    TableUid tableUid,
   ) {
     final mgr = _dataStore.schemaManager;
-    if (mgr == null) return tableCutoffs[tableField];
-    final normalized = mgr.normalizeTableFieldKey(tableField);
-    return tableCutoffs[normalized] ?? tableCutoffs[tableField];
+    if (mgr == null) {
+      return tableCutoffs[tableUid.value];
+    }
+    final normalized = mgr.normalizeTableFieldKey(tableUid.value);
+    return tableCutoffs[normalized] ?? tableCutoffs[tableUid.value];
   }
 
-  Future<TableSchema?> _resolveTableSchema(String tableField) async {
-    final ctx = _resolveTableContext(tableField);
+  Future<TableSchema?> _resolveTableSchema(TableUid tableUid) async {
+    final ctx = _resolveTableContext(tableUid);
     if (ctx == null) return null;
     return _dataStore.schemaManager?.getTableSchema(ctx.tableUid);
   }
@@ -1763,7 +1769,7 @@ class ParallelJournalManager {
   IndexUid _resolveRedoIndexUid(TableSchema schema, IndexUid uidOrName) {
     if (uidOrName.isEmpty ||
         uidOrName.looksLikeStableUid ||
-        uidOrName.value == 'pk') {
+        uidOrName == IndexUid('pk')) {
       return uidOrName;
     }
     final resolved = _dataStore.schemaManager
@@ -1772,6 +1778,31 @@ class ParallelJournalManager {
       return resolved;
     }
     return uidOrName;
+  }
+
+  /// Normalize a persisted journal index field to stable uid when possible.
+  IndexUid _resolvePersistedIndexField(TableSchema schema, String rawField) {
+    if (rawField.isEmpty) return IndexUid.empty;
+    final asUid = IndexUid(rawField);
+    if (asUid.looksLikeStableUid || asUid == IndexUid('pk')) {
+      return asUid;
+    }
+    final resolved =
+        _dataStore.schemaManager?.resolveIndexUidFromField(schema, rawField);
+    if (resolved != null &&
+        resolved.isNotEmpty &&
+        resolved.looksLikeStableUid) {
+      return resolved;
+    }
+    return asUid;
+  }
+
+  bool _indexMarkedFlushed(
+    Set<IndexUid> flushedForTable,
+    IndexUid indexUid,
+  ) {
+    if (flushedForTable.contains(indexUid)) return true;
+    return false;
   }
 
   /// Recover table metadata from maintenance batch
@@ -1888,11 +1919,15 @@ class ParallelJournalManager {
 
   /// Recover index metadata from maintenance batch
   Future<void> _recoverIndexMaintenanceMetadata(TableContext table,
-      String indexName, IndexPartitionFlushedEntry lastEntry) async {
+      IndexUid indexUid, IndexPartitionFlushedEntry lastEntry) async {
     final tableName = table.tableName;
+    final indexLabel = _dataStore.schemaManager
+            ?.findIndexSchemaByUid(table.schema, indexUid)
+            ?.actualIndexName ??
+        indexUid.value;
     try {
-      final indexMeta = await _dataStore.indexManager
-          ?.getIndexMeta(table, IndexUid(indexName));
+      final indexMeta =
+          await _dataStore.indexManager?.getIndexMeta(table, indexUid);
       if (indexMeta == null) return;
 
       // Get expected values from the last flushed entry (if it has totalEntries/totalSizeInBytes)
@@ -1938,7 +1973,7 @@ class ParallelJournalManager {
           }
         } catch (e) {
           Logger.warn(
-              'Failed to recover B+Tree structure for $tableName.$indexName from partition $lastPartitionNo',
+              'Failed to recover B+Tree structure for $tableName.$indexLabel from partition $lastPartitionNo',
               rawError: e);
         }
       }
@@ -1976,31 +2011,31 @@ class ParallelJournalManager {
 
         if (needsStatsUpdate && needsBTreeRecovery) {
           Logger.info(
-            'Recovered maintenance batch metadata and B+Tree structure for $tableName.$indexName: $expectedTotalEntries entries (was $currentTotalEntries), $expectedTotalSize bytes (was $currentTotalSize), partitionCount=$recoveredPartitionCount (was ${indexMeta.btreePartitionCount})',
+            'Recovered maintenance batch metadata and B+Tree structure for $tableName.$indexLabel: $expectedTotalEntries entries (was $currentTotalEntries), $expectedTotalSize bytes (was $currentTotalSize), partitionCount=$recoveredPartitionCount (was ${indexMeta.btreePartitionCount})',
           );
         } else if (needsStatsUpdate) {
           Logger.info(
-            'Recovered maintenance batch metadata for $tableName.$indexName: $expectedTotalEntries entries (was $currentTotalEntries), $expectedTotalSize bytes (was $currentTotalSize)',
+            'Recovered maintenance batch metadata for $tableName.$indexLabel: $expectedTotalEntries entries (was $currentTotalEntries), $expectedTotalSize bytes (was $currentTotalSize)',
           );
         } else if (needsBTreeRecovery) {
           Logger.info(
-            'Recovered B+Tree structure for $tableName.$indexName: partitionCount=$recoveredPartitionCount (was ${indexMeta.btreePartitionCount})',
+            'Recovered B+Tree structure for $tableName.$indexLabel: partitionCount=$recoveredPartitionCount (was ${indexMeta.btreePartitionCount})',
           );
         }
       } else if (expectedTotalEntries != null && expectedTotalSize != null) {
         // Metadata is consistent, no need to update
         Logger.info(
-          'Maintenance batch metadata for $tableName.$indexName is already correct: $currentTotalEntries entries, $currentTotalSize bytes (verified from last flushed partition ${lastEntry.partitionNo})',
+          'Maintenance batch metadata for $tableName.$indexLabel is already correct: $currentTotalEntries entries, $currentTotalSize bytes (verified from last flushed partition ${lastEntry.partitionNo})',
         );
       } else {
         // Legacy entry without totalEntries/totalSizeInBytes, skip update
         Logger.info(
-          'Skipping metadata update for $tableName.$indexName: last flushed entry (partition ${lastEntry.partitionNo}) does not have complete statistics. Metadata will be corrected on next operation.',
+          'Skipping metadata update for $tableName.$indexLabel: last flushed entry (partition ${lastEntry.partitionNo}) does not have complete statistics. Metadata will be corrected on next operation.',
         );
       }
     } catch (e) {
       Logger.error(
-          'Failed to recover maintenance batch metadata for $tableName.$indexName',
+          'Failed to recover maintenance batch metadata for $tableName.$indexLabel',
           rawError: e);
     }
   }
@@ -2048,7 +2083,7 @@ class ParallelJournalManager {
       // Populate tablePlans from scanResult for repair
       walData.tablePlans.addAll(scanResult.tablePlans);
 
-      final maxIds = <String, int>{};
+      final maxIds = <TableUid, int>{};
       int count = 0;
       // Iterate in exact WAL order so buffer queue order matches normal flush;
       // then pop(captureCount) yields exactly this batch (all tables, no partial-table loss).
@@ -2164,9 +2199,9 @@ class ParallelJournalManager {
   /// This handles the case where pages were written but metadata update
   /// was not journaled before crash.
   Future<void> _repairUnflushedTablesAndIndexes({
-    required Set<String> batchTables,
-    required Set<String> flushedTables,
-    required Map<String, Set<String>> flushedIndexes,
+    required Set<TableUid> batchTables,
+    required Set<TableUid> flushedTables,
+    required Map<TableUid, Set<IndexUid>> flushedIndexes,
     required _BatchWalData walData,
     required String batchCreatedAt,
   }) async {
@@ -2229,16 +2264,15 @@ class ParallelJournalManager {
         ];
         if (btreeIndexes.isEmpty) continue;
 
-        final normalizedTableKey = _resolvePersistedTableField(tableUid);
-        final flushedForTable = flushedIndexes[normalizedTableKey] ??
-            flushedIndexes[tableUid] ??
-            const <String>{};
+        final normalizedTableKey = tableUid;
+        final flushedForTable =
+            flushedIndexes[normalizedTableKey] ?? const <IndexUid>{};
         final plan = _tablePlanFor(walData.tablePlans, tableUid);
         if (plan == null) continue;
 
         for (final idx in btreeIndexes) {
           final indexUid = idx.indexUid;
-          if (flushedForTable.contains(indexUid.value)) {
+          if (_indexMarkedFlushed(flushedForTable, indexUid)) {
             continue;
           }
 
@@ -2289,12 +2323,11 @@ class ParallelJournalManager {
 
   Future<_BatchWalData> _collectBatchWalChanges(
       PendingParallelBatch batch) async {
-    final Map<String, List<Map<String, dynamic>>> inserts = {};
-    final Map<String, List<Map<String, dynamic>>> updates = {};
-    final Map<String, List<Map<String, dynamic>>> deletes = {};
-    final Map<String, List<_WalOp>> ordered = {};
-    // Same ops in exact WAL order so recovery push order matches normal flush pop order.
-    final List<({String table, _WalOp op})> orderedOpsInWalOrder = [];
+    final Map<TableUid, List<Map<String, dynamic>>> inserts = {};
+    final Map<TableUid, List<Map<String, dynamic>>> updates = {};
+    final Map<TableUid, List<Map<String, dynamic>>> deletes = {};
+    final Map<TableUid, List<_WalOp>> ordered = {};
+    final List<({TableUid table, _WalOp op})> orderedOpsInWalOrder = [];
 
     try {
       // Precompute table-level WAL cutoff pointers from WAL meta (clear/drop ops)
@@ -2385,8 +2418,7 @@ class ParallelJournalManager {
 
             // Skip WAL entries that are logically before a clear/drop cutoff
             // for this table.
-            final cutoffs = _tableCutoffsFor(tableCutoffs, resolvedTable) ??
-                _tableCutoffsFor(tableCutoffs, table);
+            final cutoffs = _tableCutoffsFor(tableCutoffs, resolvedTable);
             if (cutoffs != null && cutoffs.isNotEmpty) {
               final ptr = WalPointer(partitionIndex: p, entrySeq: seq);
               bool skip = false;
@@ -2490,7 +2522,7 @@ class ParallelJournalManager {
     final schema = tableContext.schema;
     final tableMeta =
         await _dataStore.tableDataManager.getTableMeta(tableContext);
-    final indexNames = <String>[];
+    final indexUids = <String>[];
     final baseIndexTotalEntries = <String, int>{};
     final baseIndexTotalSizeInBytes = <String, int>{};
     try {
@@ -2502,7 +2534,7 @@ class ParallelJournalManager {
       ];
       for (final idx in btreeIndexes) {
         final idxUid = idx.indexUid.value;
-        indexNames.add(idxUid);
+        indexUids.add(idxUid);
         final idxMeta = await _dataStore.indexManager
             ?.getIndexMeta(tableContext, idx.indexUid);
         if (idxMeta != null) {
@@ -2514,8 +2546,8 @@ class ParallelJournalManager {
     final Map<String, TablePlan> tablePlan = {
       tableUid: TablePlan(
         willUpdateTableMeta: true,
-        indexes: indexNames,
-        willUpdateIndexMeta: indexNames.isNotEmpty,
+        indexes: indexUids,
+        willUpdateIndexMeta: indexUids.isNotEmpty,
         baseTotalRecords: tableMeta?.totalRecords,
         baseTotalSizeInBytes: tableMeta?.totalSizeInBytes,
         baseIndexTotalEntries: baseIndexTotalEntries,
@@ -2727,8 +2759,7 @@ class ParallelJournalManager {
           } else {
             final idxUid = rec.indexUid;
             if (idxUid == null || idxUid.isEmpty) continue;
-            final resolved =
-                _resolveRedoIndexUid(tableContext.schema, idxUid);
+            final resolved = _resolveRedoIndexUid(tableContext.schema, idxUid);
             final meta = await _dataStore.indexManager
                 ?.getIndexMeta(tableContext, resolved);
             if (meta == null) continue;
@@ -2750,7 +2781,7 @@ class ParallelJournalManager {
             );
             await _dataStore.indexManager?.updateIndexMeta(
               table: tableContext,
-              indexUid: IndexUid(idxUid),
+              indexUid: resolved,
               updatedMeta: updated,
               flush: true,
             );
@@ -2774,9 +2805,9 @@ class ParallelJournalManager {
   /// Scan journal to find batch status, flushed tables, and flushed indexes.
   Future<_BatchJournalScanResult> _scanBatchJournalStatus(
       PendingParallelBatch batch) async {
-    final flushedTables = <String>{};
-    final flushedIndexes = <String, Set<String>>{}; // table -> indexes
-    final tablePlans = <String, TablePlan>{};
+    final flushedTables = <TableUid>{};
+    final flushedIndexes = <TableUid, Set<IndexUid>>{};
+    final tablePlans = <TableUid, TablePlan>{};
     bool isCompleted = false;
     final path = batch.journalFile == 'A'
         ? _dataStore.pathManager
@@ -2822,9 +2853,13 @@ class ParallelJournalManager {
           } else if (entry is IndexMetaUpdatedEntry &&
               entry.batchId == batch.batchId) {
             final resolvedTable = _resolvePersistedTableField(entry.table);
+            final tableContext = _resolveTableContext(resolvedTable);
+            final resolvedIndex = tableContext != null
+                ? _resolvePersistedIndexField(tableContext.schema, entry.index)
+                : IndexUid(entry.index);
             flushedIndexes
-                .putIfAbsent(resolvedTable, () => <String>{})
-                .add(entry.index);
+                .putIfAbsent(resolvedTable, () => <IndexUid>{})
+                .add(resolvedIndex);
           }
         } catch (_) {}
       }
@@ -2999,15 +3034,15 @@ class _BatchJournalScanResult {
   final bool isCompleted;
 
   /// Tables whose metadata has been successfully updated (TableMetaUpdatedEntry).
-  final Set<String> flushedTables;
+  final Set<TableUid> flushedTables;
 
   /// Indexes whose metadata has been successfully updated (IndexMetaUpdatedEntry).
   ///
-  /// Map: `tableName -> Set<indexName>`
-  final Map<String, Set<String>> flushedIndexes;
+  /// Map: `tableUid -> Set<indexUid>`
+  final Map<TableUid, Set<IndexUid>> flushedIndexes;
 
   /// Table plans found in BatchStartEntry
-  final Map<String, TablePlan> tablePlans;
+  final Map<TableUid, TablePlan> tablePlans;
 
   _BatchJournalScanResult({
     required this.isCompleted,
@@ -3018,17 +3053,15 @@ class _BatchJournalScanResult {
 }
 
 class _BatchWalData {
-  final Map<String, List<Map<String, dynamic>>> insertsByTable;
-  final Map<String, List<Map<String, dynamic>>> updatesByTable;
-  final Map<String, List<Map<String, dynamic>>> deletesByTable;
-  // Preserve ordered operations per table for coalescing within a batch
-  final Map<String, List<_WalOp>> orderedOpsByTable;
+  final Map<TableUid, List<Map<String, dynamic>>> insertsByTable;
+  final Map<TableUid, List<Map<String, dynamic>>> updatesByTable;
+  final Map<TableUid, List<Map<String, dynamic>>> deletesByTable;
+  final Map<TableUid, List<_WalOp>> orderedOpsByTable;
 
   /// Same ops in exact WAL (partition+seq) order so recovery push order
   /// matches normal flush pop order and pop(captureCount) yields this batch.
-  final List<({String table, _WalOp op})> orderedOpsInWalOrder;
-  // Table plans for precise repair
-  final Map<String, TablePlan> tablePlans = {};
+  final List<({TableUid table, _WalOp op})> orderedOpsInWalOrder;
+  final Map<TableUid, TablePlan> tablePlans = {};
 
   _BatchWalData({
     required this.insertsByTable,
