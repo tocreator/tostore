@@ -69,8 +69,8 @@ class MigrationManager {
   // Lock for thread-safe access to cache
   Future<MigrationMeta>? _loadingFuture;
   // Runtime conversion descriptors for tables that are schema-updated but data not fully migrated yet.
-  final Map<String, _RuntimeMigrationDescriptor> _runtimeMigrations =
-      <String, _RuntimeMigrationDescriptor>{};
+  final Map<TableUid, _RuntimeMigrationDescriptor> _runtimeMigrations =
+      <TableUid, _RuntimeMigrationDescriptor>{};
 
   // Cache of versioned table schemas for active migrations keyed by schemaVersion
   final Map<String, TableSchema> _schemaByVersion = {};
@@ -258,7 +258,7 @@ class MigrationManager {
       if (task.specificIndexUids == null) return true;
       final schema = task.targetSchemaSnapshot ?? task.oldSchemaSnapshot;
       for (final field in task.specificIndexUids!) {
-        if (field == indexUid.value) return true;
+        if (field == indexUid) return true;
         if (schema == null) continue;
         final a =
             _dataStore.schemaManager?.resolveIndexUidFromField(schema, field);
@@ -1366,7 +1366,7 @@ class MigrationManager {
       bool allowAfterDataMigration = false,
       TableSchema? targetSchemaSnapshot,
       MigrationWriteMode? writeMode,
-      List<String>? specificIndexUids}) async {
+      List<IndexUid>? specificIndexUids}) async {
     try {
       TableSchema? targetSchema = targetSchemaSnapshot;
       if (targetSchema != null && targetSchema.schemaVersion == null) {
@@ -1996,7 +1996,7 @@ class MigrationManager {
       // Incremental rebuild for a specific table component
       MigrationTask? seed;
       for (final task in pending) {
-        if (task.tableUid == affectedTableUid.value) {
+        if (task.tableUid == affectedTableUid) {
           seed = task;
           break;
         }
@@ -2004,7 +2004,7 @@ class MigrationManager {
 
       // If no task found for this table, remove any existing descriptor
       if (seed == null) {
-        _runtimeMigrations.remove(affectedTableUid.value);
+        _runtimeMigrations.remove(affectedTableUid);
         return;
       }
 
@@ -2013,7 +2013,7 @@ class MigrationManager {
       final descriptor = _buildRuntimeDescriptorForComponent(component);
 
       // Remove old descriptor for this table uid
-      _runtimeMigrations.remove(affectedTableUid.value);
+      _runtimeMigrations.remove(affectedTableUid);
 
       // Add new descriptor
       if (descriptor != null) {
@@ -2317,21 +2317,24 @@ class MigrationManager {
     return false;
   }
 
-  bool _specificIndexFieldMatches(IndexSchema index, String field) =>
-      index.indexUid.value == field || index.actualIndexName == field;
+  bool _specificIndexFieldMatches(IndexSchema index, IndexUid field) =>
+      index.indexUid == field;
 
   IndexSchema _resolveSpecificIndexSchema(
     List<IndexSchema> allIndexes,
-    String field,
+    IndexUid field,
   ) {
     for (final i in allIndexes) {
       if (_specificIndexFieldMatches(i, field)) return i;
     }
-    return IndexSchema(indexName: field, fields: const []);
+    return IndexSchema(indexName: field.value, fields: const []);
   }
 
   void _markIndexRemoved(Set<String> removed, IndexSchema index) {
-    removed.add(index.indexUid.value);
+    if (index.indexUid.isNotEmpty) {
+      removed.add(index.indexUid.value);
+    }
+    // Legacy aliases for persisted tasks that still reference logical names.
     removed.add(index.actualIndexName);
     final logicalName = index.indexName;
     if (logicalName != null && logicalName.isNotEmpty) {
@@ -2339,13 +2342,13 @@ class MigrationManager {
     }
   }
 
-  List<String> _calculateBuildingIndexes({
+  List<IndexUid> _calculateBuildingIndexes({
     required TableSchema? oldSchema,
     required TableSchema? targetSchema,
     required List<MigrationOperation> sortedOperations,
     required TableContext table,
   }) {
-    final indexesToBuild = <String>[];
+    final indexesToBuild = <IndexUid>[];
 
     if (oldSchema != null && targetSchema != null) {
       // Build field rename mapping: old field name -> new field name
@@ -2372,7 +2375,7 @@ class MigrationManager {
 
       // 1. Identify newly added or modified index definitions (including unique constraints, TTL, foreign keys)
       for (final newIdx in targetAllIndexes) {
-        final newIdxUid = newIdx.indexUid.value;
+        final newIdxUid = newIdx.indexUid;
         IndexSchema? oldIdx;
 
         if (fieldRenames.isNotEmpty) {
@@ -2391,8 +2394,12 @@ class MigrationManager {
           }
         } else {
           for (final oldIndex in oldAllIndexes) {
-            if (oldIndex.actualIndexName == newIdx.actualIndexName ||
+            if (oldIndex.indexUid.isNotEmpty &&
                 oldIndex.indexUid == newIdx.indexUid) {
+              oldIdx = oldIndex;
+              break;
+            }
+            if (oldIndex.actualIndexName == newIdx.actualIndexName) {
               oldIdx = oldIndex;
               break;
             }
@@ -2401,7 +2408,9 @@ class MigrationManager {
 
         if (oldIdx == null) {
           // Brand new index, must be physically built
-          indexesToBuild.add(newIdxUid);
+          if (newIdxUid.isNotEmpty) {
+            indexesToBuild.add(newIdxUid);
+          }
         } else {
           // Existing index, check if its definition changed
           bool definitionChanged = false;
@@ -2452,7 +2461,7 @@ class MigrationManager {
             definitionChanged = true;
           }
 
-          if (definitionChanged) {
+          if (definitionChanged && newIdxUid.isNotEmpty) {
             indexesToBuild.add(newIdxUid);
           }
         }
@@ -2478,7 +2487,9 @@ class MigrationManager {
             for (final idx in targetAllIndexes) {
               if (idx.fields.contains(fieldUpdate.name) ||
                   idx.fields.contains(newFieldName)) {
-                indexesToBuild.add(idx.indexUid.value);
+                if (idx.indexUid.isNotEmpty) {
+                  indexesToBuild.add(idx.indexUid);
+                }
               }
             }
           }
@@ -3846,7 +3857,7 @@ class MigrationManager {
 
       final needsTableWrite = _needDataMigration(sortedOperations, oldSchema);
       final specificIndexUids =
-          currentTask.specificIndexUids ?? const <String>[];
+          currentTask.specificIndexUids ?? const <IndexUid>[];
       final needDataMigration =
           currentTask.writeMode != MigrationWriteMode.none &&
               (currentTask.forceDataMigration ||
@@ -4373,11 +4384,12 @@ class MigrationManager {
     }
 
     final fieldRenames = _buildOldToNewFieldRenameMap(operations);
-    final targetByActual = <String, IndexSchema>{
-      for (final index in targetIndexes) index.actualIndexName: index,
+    final targetByUid = <IndexUid, IndexSchema>{
+      for (final index in targetIndexes)
+        if (index.indexUid.isNotEmpty) index.indexUid: index,
     };
-    final handledOldActualNames = <String>{};
-    final updatedActualNames = <String>{};
+    final handledOldUids = <IndexUid>{};
+    final updatedUids = <IndexUid>{};
 
     if (fieldRenames.isNotEmpty) {
       for (final oldIndex in oldIndexes) {
@@ -4393,7 +4405,9 @@ class MigrationManager {
           continue;
         }
 
-        handledOldActualNames.add(oldIndex.actualIndexName);
+        if (oldIndex.indexUid.isNotEmpty) {
+          handledOldUids.add(oldIndex.indexUid);
+        }
         bool typeChanged = false;
         for (final oldFieldName in oldIndex.fields) {
           FieldSchema? oldField;
@@ -4428,7 +4442,9 @@ class MigrationManager {
             indexUid: oldIndex.indexUid,
             legacyLogicalName: oldIndex.actualIndexName,
           );
-          updatedActualNames.add(targetIndex.actualIndexName);
+          if (targetIndex.indexUid.isNotEmpty) {
+            updatedUids.add(targetIndex.indexUid);
+          }
         } else {
           await migrationInstance.indexManager
               ?.deleteIndexArtifactsForMigration(
@@ -4440,21 +4456,29 @@ class MigrationManager {
     }
 
     for (final oldIndex in oldIndexes) {
-      final oldActual = oldIndex.actualIndexName;
-      if (handledOldActualNames.contains(oldActual)) {
+      final oldUid = oldIndex.indexUid;
+      if (oldUid.isNotEmpty && handledOldUids.contains(oldUid)) {
         continue;
       }
 
-      final targetIndex = targetByActual[oldActual];
+      final targetIndex = oldUid.isNotEmpty
+          ? targetByUid[oldUid]
+          : targetIndexes.cast<IndexSchema?>().firstWhere(
+                (t) => t!.actualIndexName == oldIndex.actualIndexName,
+                orElse: () => null,
+              );
       if (targetIndex == null) {
-        await migrationInstance.indexManager?.deleteIndexArtifactsForMigration(
-          table,
-          indexUid: oldIndex.indexUid,
-        );
+        if (oldUid.isNotEmpty) {
+          await migrationInstance.indexManager
+              ?.deleteIndexArtifactsForMigration(
+            table,
+            indexUid: oldUid,
+          );
+        }
         continue;
       }
 
-      if (updatedActualNames.contains(oldActual)) {
+      if (oldUid.isNotEmpty && updatedUids.contains(oldUid)) {
         continue;
       }
 
@@ -4614,12 +4638,19 @@ class MigrationManager {
       final oldChildIndexes = childSchema.getAllIndexes();
       final newChildIndexes = updatedChildSchema.getAllIndexes();
       for (final oldIdx in oldChildIndexes) {
-        final stillExists = newChildIndexes
-            .any((newIdx) => newIdx.actualIndexName == oldIdx.actualIndexName);
+        final stillExists = oldIdx.indexUid.isNotEmpty
+            ? newChildIndexes
+                .any((newIdx) => newIdx.indexUid == oldIdx.indexUid)
+            : newChildIndexes.any(
+                (newIdx) => newIdx.actualIndexName == oldIdx.actualIndexName,
+              );
         if (!stillExists) {
           await migrationInstance.indexManager?.removeIndex(
             childTableCtx,
-            indexName: oldIdx.actualIndexName,
+            indexUid: oldIdx.indexUid.isNotEmpty ? oldIdx.indexUid : null,
+            indexName: oldIdx.indexUid.isEmpty
+                ? IndexName(oldIdx.actualIndexName)
+                : null,
           );
         }
       }
@@ -4704,6 +4735,14 @@ class MigrationManager {
     List<IndexSchema> targetIndexes,
     Map<String, String> fieldRenames,
   ) {
+    if (oldIndex.indexUid.isNotEmpty) {
+      for (final target in targetIndexes) {
+        if (target.indexUid == oldIndex.indexUid) {
+          return target;
+        }
+      }
+    }
+
     final expectedFields = oldIndex.fields
         .map((field) => fieldRenames[field] ?? field)
         .toList(growable: false);
@@ -6156,7 +6195,7 @@ class MigrationManager {
           task.specificIndexUids!.isNotEmpty) {
         final initialLength = task.specificIndexUids!.length;
         final updatedSpecificIndexes = task.specificIndexUids!
-            .where((idx) => !removedIndexes.contains(idx))
+            .where((idx) => !removedIndexes.contains(idx.value))
             .toList();
 
         if (updatedSpecificIndexes.length < initialLength) {
