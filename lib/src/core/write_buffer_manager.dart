@@ -370,9 +370,9 @@ class _PendingCleanup {
 class WriteBufferManager {
   final DataStoreImpl _dataStore;
 
-  final Map<String, WriteDataBuffer> _buffersByTableUid =
-      <String, WriteDataBuffer>{};
-  final Map<String, int> _tableClearEpochs = <String, int>{};
+  final Map<TableUid, WriteDataBuffer> _buffersByTableUid =
+      <TableUid, WriteDataBuffer>{};
+  final Map<TableUid, int> _tableClearEpochs = <TableUid, int>{};
   int _globalClearEpoch = 0;
   final Queue<WriteQueueEntry> _writeQueue = Queue<WriteQueueEntry>();
   final StreamController<int> _sizeController =
@@ -909,7 +909,7 @@ class WriteBufferManager {
 
   /// Remove already processed items for current batch based on counts by table/op
   void removeProcessedForCurrentBatch(
-      Map<String, Map<BufferOperationType, int>> processedCounts) {
+      Map<TableUid, Map<BufferOperationType, int>> processedCounts) {
     if (processedCounts.isEmpty || _writeQueue.isEmpty) return;
     _writeQueue.removeWhere((e) {
       final byOp = processedCounts[e.tableUid];
@@ -1223,11 +1223,11 @@ class WriteBufferManager {
 
   // Transaction-specific unique key tracking
   // transactionId -> tableUid -> _TxnUniqueTableBuffer
-  final Map<String, Map<String, _TxnUniqueTableBuffer>> _txnBuffers = {};
+  final Map<String, Map<TableUid, _TxnUniqueTableBuffer>> _txnBuffers = {};
 
   // Global inverted index for valid active transaction unique keys (O(1) conflict detection)
   // tableUid -> indexUid -> internalKey -> { Map<txId, Set<recordId>> }
-  final Map<String, Map<IndexUid, Map<dynamic, Map<String, Set<String>>>>>
+  final Map<TableUid, Map<IndexUid, Map<dynamic, Map<String, Set<String>>>>>
       _txnGlobalUniqueKeyOwners = {};
 
   void addTransactionUniqueKeys({
@@ -1354,7 +1354,7 @@ class WriteBufferManager {
     // Cleanup global index
     final yieldController = YieldController('buf_remove_txn_keys');
     for (final tEntry in byTable.entries) {
-      final tableUid = TableUid(tEntry.key);
+      final tableUid = tEntry.key;
       final buf = tEntry.value;
       for (final iEntry in buf.uniqueKeyOwners.entries) {
         final indexUid = iEntry.key;
