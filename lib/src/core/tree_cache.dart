@@ -36,9 +36,9 @@ class TreeCache<T> {
   final int minByteThreshold;
 
   /// Group depth for hierarchical operations:
-  /// - 1: group by first component (e.g. tableName)
-  /// - 2: group by first 2 components (e.g. tableName + indexName)
-  /// - 3: group by first 3 components (e.g. tableName + indexName + partitionNo)
+  /// - 1: group by first component (e.g. tableUid)
+  /// - 2: group by first 2 components (e.g. tableUid + indexUid)
+  /// - 3: group by first 3 components (e.g. tableUid + indexUid + partitionNo)
   ///
   /// Prefix removals whose path length is `<= [groupDepth]` can be executed without
   /// scanning entries (O(number of affected groups)).
@@ -47,7 +47,7 @@ class TreeCache<T> {
   /// Factory to provide the comparator for the **first component after group prefix**.
   /// For example:
   /// - groupDepth=1 (table records): comparator for PK based on [tableName]
-  /// - groupDepth=2 (index data): comparator for first index field based on [table, index]
+  /// - groupDepth=2 (index data): comparator for first index field based on [tableUid, indexUid]
   final TreeCacheComparatorFactory? comparatorFactory;
 
   /// Optional group-level weight callback used by eviction.
