@@ -163,54 +163,6 @@ class DataStoreImpl {
   TransactionManager? transactionManager;
   ResourceManager? _resourceManager;
 
-  /// Active table renaming barriers (conversion locks) to prevent concurrent operations
-  /// during name migrations.
-  final Map<String, Completer<void>> _activeTableRenames = {};
-
-  /// Checks if there are currently any active table renames.
-  bool get hasActiveTableRenames => _activeTableRenames.isNotEmpty;
-
-  /// Check and wait if a table is currently undergoing renaming.
-  /// Returns `null` if the table is not renaming (synchronous path),
-  /// or a `Future` that completes when renaming finishes.
-  FutureOr<void> checkTableRenameBarrier(String tableName) {
-    final completer = _activeTableRenames[tableName];
-    if (completer != null) {
-      return completer.future;
-    }
-    return null;
-  }
-
-  /// Wait until all active table renames are completed.
-  Future<void> awaitActiveTableRenames() async {
-    while (_activeTableRenames.isNotEmpty) {
-      final futures = _activeTableRenames.values.map((c) => c.future).toList();
-      if (futures.isNotEmpty) {
-        try {
-          await Future.wait(futures);
-        } catch (_) {}
-      } else {
-        break;
-      }
-    }
-  }
-
-  /// Mark a table as renaming to block concurrent operations.
-  void startTableRenameBarrier(String oldTableName, String newTableName) {
-    final completer = Completer<void>();
-    _activeTableRenames[oldTableName] = completer;
-    _activeTableRenames[newTableName] = completer;
-  }
-
-  /// Mark a table renaming as finished to release blocked operations.
-  void endTableRenameBarrier(String oldTableName, String newTableName) {
-    final completer = _activeTableRenames.remove(oldTableName);
-    _activeTableRenames.remove(newTableName);
-    if (completer != null && !completer.isCompleted) {
-      completer.complete();
-    }
-  }
-
   /// Key-value storage namespace
   late final KvStore kv = KvStore(this);
 
