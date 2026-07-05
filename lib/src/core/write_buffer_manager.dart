@@ -409,13 +409,6 @@ class WriteBufferManager {
     return (_tableClearEpochs[table.tableUid] ?? 0) + _globalClearEpoch;
   }
 
-  /// With uid-stable buffer keys, table rename is a no-op for internal maps.
-  Future<void> renameTable(
-      TableContext table, String oldTableName, String newTableName) async {
-    if (oldTableName == newTableName) return;
-    // Buffer maps, clear epochs, txn buffers, and queues are keyed by tableUid (stable).
-  }
-
   /// Remove a specific record from buffer and queue (best effort)
   void removeRecord(TableContext table, String recordId) {
     final tableUid = table.tableUid;
