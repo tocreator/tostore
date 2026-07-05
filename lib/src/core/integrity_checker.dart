@@ -352,11 +352,13 @@ class IntegrityChecker {
 
       // Validate that unique index metadata files exist and are accessible
       for (var index in uniqueIndexes) {
-        final indexMetaPath = await _dataStore.pathManager.getIndexMetaPath(
-            table.tableUid,
-            IndexUid(index.indexUid.isNotEmpty
-                ? index.indexUid
-                : index.actualIndexName));
+        if (index.indexUid.isEmpty) {
+          Logger.warn(
+              'Unique index missing stable indexUid: ${index.actualIndexName}');
+          continue;
+        }
+        final indexMetaPath = await _dataStore.pathManager
+            .getIndexMetaPath(table.tableUid, index.indexUid);
         if (!await _dataStore.storage.existsFile(indexMetaPath)) {
           Logger.warn(
               'Unique index metadata file not found: ${index.actualIndexName}');
@@ -505,11 +507,13 @@ class IntegrityChecker {
             _dataStore.schemaManager?.getBtreeIndexesFor(newSchema) ??
                 <IndexSchema>[];
         for (var index in allIndexes) {
-          final indexMetaPath = await _dataStore.pathManager.getIndexMetaPath(
-              table.tableUid,
-              IndexUid(index.indexUid.isNotEmpty
-                  ? index.indexUid
-                  : index.actualIndexName));
+          if (index.indexUid.isEmpty) {
+            Logger.info(
+                'Index missing stable indexUid: ${index.actualIndexName}, skipping meta path check');
+            continue;
+          }
+          final indexMetaPath = await _dataStore.pathManager
+              .getIndexMetaPath(table.tableUid, index.indexUid);
 
           if (!await _dataStore.storage.existsFile(indexMetaPath)) {
             Logger.info(
