@@ -17,6 +17,7 @@ import '../core/workload_scheduler.dart';
 import '../handler/parallel_processor.dart';
 import '../core/yield_controller.dart';
 import 'v3_upgrade.dart';
+import '../model/table_identity.dart';
 
 /// Version 2 upgrade handler.
 /// This upgrade adds stable partition directory mapping for table data partitions,
@@ -126,8 +127,8 @@ class V2Upgrade {
       final yieldController = YieldController('upgrade_v2_space_tables');
       if (tableNames.isNotEmpty) {
         for (final tableName in tableNames) {
-          final schema =
-              await migrationInstance.schemaManager?.getTableSchema(tableName);
+          final schema = await migrationInstance.schemaManager
+              ?.getTableSchemaByName(TableName(tableName));
           if (schema == null) continue;
 
           if (schema.isGlobal) {
@@ -374,7 +375,7 @@ class V2Upgrade {
         'Starting table data upgrade for table: $tableName',
       );
 
-      final tableUid = db.schemaManager?.getUidByName(tableName);
+      final tableUid = db.schemaManager?.getUidByName(TableName(tableName));
       if (tableUid == null) {
         Logger.warn(
             'Table UID not found for table: $tableName, skipping data upgrade');
@@ -487,7 +488,8 @@ class V2Upgrade {
               results.expand((r) => r ?? <Map<String, dynamic>>[]).toList();
 
           if (batchRecords.isNotEmpty) {
-            final schema = await db.schemaManager?.getTableSchema(tableName);
+            final schema = await db.schemaManager
+                ?.getTableSchemaByName(TableName(tableName));
             if (schema == null) {
               Logger.warn(
                 'Schema not found for table $tableName, skipping batch',
@@ -495,11 +497,13 @@ class V2Upgrade {
               return;
             }
 
+            final table = await db.getTableContext(tableName);
+
             // Use writeChanges directly for migration instances
             // This bypasses WAL/buffer and writes directly to table partitions
             // which is safe for migration since we're doing a one-time data transformation
             await db.tableDataManager.writeChanges(
-              tableName: tableName,
+              table: table,
               inserts: batchRecords,
               updates: const [],
               deletes: const [],
@@ -510,7 +514,7 @@ class V2Upgrade {
             // Also write index changes for the inserted records
             if (db.indexManager != null && batchRecords.isNotEmpty) {
               await db.indexManager!.writeChanges(
-                tableName: tableName,
+                table: table,
                 inserts: batchRecords,
                 updates: const [],
                 deletes: const [],
@@ -672,7 +676,7 @@ class V2Upgrade {
   }
 
   String _manualGetTablePath(DataStoreImpl db, String tableName) {
-    final tableUid = db.schemaManager?.getUidByName(tableName);
+    final tableUid = db.schemaManager?.getUidByName(TableName(tableName));
     if (tableUid == null) {
       throw DbException([
         SchemaValidationStatus(
