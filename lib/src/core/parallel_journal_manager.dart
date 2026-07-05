@@ -1316,14 +1316,17 @@ class ParallelJournalManager {
       final Map<TableUid, MatcherFunction> pkMatchersByTable =
           <TableUid, MatcherFunction>{};
       // Precompute table-level WAL cutoff pointers from WAL meta (clear/drop ops)
-      final Map<String, List<WalPointer>> tableCutoffs =
-          <String, List<WalPointer>>{};
+      final Map<TableUid, List<WalPointer>> tableCutoffs =
+          <TableUid, List<WalPointer>>{};
       try {
         for (final op in _walManager.tableOps.values) {
-          final key =
+          final normalized =
               _dataStore.schemaManager?.normalizeTableFieldKey(op.tableUid) ??
                   op.tableUid;
-          tableCutoffs.putIfAbsent(key, () => <WalPointer>[]).add(op.cutoff);
+          final tableUid = TableUid(normalized);
+          tableCutoffs
+              .putIfAbsent(tableUid, () => <WalPointer>[])
+              .add(op.cutoff);
         }
       } catch (_) {}
       final encoderConfig = EncoderHandler.getCurrentEncodingState();
@@ -1744,15 +1747,15 @@ class ParallelJournalManager {
   }
 
   List<WalPointer>? _tableCutoffsFor(
-    Map<String, List<WalPointer>> tableCutoffs,
+    Map<TableUid, List<WalPointer>> tableCutoffs,
     TableUid tableUid,
   ) {
     final mgr = _dataStore.schemaManager;
     if (mgr == null) {
-      return tableCutoffs[tableUid.value];
+      return tableCutoffs[tableUid];
     }
-    final normalized = mgr.normalizeTableFieldKey(tableUid.value);
-    return tableCutoffs[normalized] ?? tableCutoffs[tableUid.value];
+    final normalized = TableUid(mgr.normalizeTableFieldKey(tableUid.value));
+    return tableCutoffs[normalized] ?? tableCutoffs[tableUid];
   }
 
   Future<TableSchema?> _resolveTableSchema(TableUid tableUid) async {
@@ -2331,14 +2334,17 @@ class ParallelJournalManager {
 
     try {
       // Precompute table-level WAL cutoff pointers from WAL meta (clear/drop ops)
-      final Map<String, List<WalPointer>> tableCutoffs =
-          <String, List<WalPointer>>{};
+      final Map<TableUid, List<WalPointer>> tableCutoffs =
+          <TableUid, List<WalPointer>>{};
       try {
         for (final op in _walManager.tableOps.values) {
-          final key =
+          final normalized =
               _dataStore.schemaManager?.normalizeTableFieldKey(op.tableUid) ??
                   op.tableUid;
-          tableCutoffs.putIfAbsent(key, () => <WalPointer>[]).add(op.cutoff);
+          final tableUid = TableUid(normalized);
+          tableCutoffs
+              .putIfAbsent(tableUid, () => <WalPointer>[])
+              .add(op.cutoff);
         }
       } catch (_) {}
       final startP = batch.start.partitionIndex;
