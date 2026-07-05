@@ -256,10 +256,6 @@ class SequentialIdGenerator implements IdGenerator {
 
   /// Current id position (for persistence/recovery). Last allocated id.
   int get currentId => _currentId;
-
-  void renameTable(String newTableName) {
-    tableUid = newTableName;
-  }
 }
 
 /// Base62 encoder (used for generating short code IDs)
@@ -388,64 +384,6 @@ class TimeBasedIdGenerator implements IdGenerator {
 
   // Static mapping for global access to all generator instances
   static final Map<String, TimeBasedIdGenerator> _instances = {};
-
-  /// Clean up static states when a table is renamed
-  static void handleTableRename(String oldTableName, String newTableName) {
-    if (oldTableName == newTableName) return;
-
-    final keysToRename = <String>[];
-    for (final key in _instances.keys) {
-      if (key.endsWith('_$oldTableName')) {
-        keysToRename.add(key);
-      }
-    }
-
-    for (final oldKey in keysToRename) {
-      final generator = _instances.remove(oldKey);
-      if (generator != null) {
-        final keyType = generator.keyType;
-        final newKey = '${keyType}_$newTableName';
-        _instances[newKey] = generator;
-
-        if (_lastInstanceAccessTime.containsKey(oldKey)) {
-          _lastInstanceAccessTime[newKey] =
-              _lastInstanceAccessTime.remove(oldKey)!;
-        }
-
-        // Rename table-scoped state maps internally via the generator instance
-        if (generator._sequenceMap.containsKey(oldTableName)) {
-          generator._sequenceMap[newTableName] =
-              generator._sequenceMap.remove(oldTableName)!;
-        }
-        if (generator._lastValueMap.containsKey(oldTableName)) {
-          generator._lastValueMap[newTableName] =
-              generator._lastValueMap.remove(oldTableName)!;
-        }
-        if (generator._idPools.containsKey(oldTableName)) {
-          generator._idPools[newTableName] =
-              generator._idPools.remove(oldTableName)!;
-        }
-        if (generator._idPoolLastUpdateTime.containsKey(oldTableName)) {
-          generator._idPoolLastUpdateTime[newTableName] =
-              generator._idPoolLastUpdateTime.remove(oldTableName)!;
-        }
-        if (generator._idGenerationInProgress.containsKey(oldTableName)) {
-          generator._idGenerationInProgress[newTableName] =
-              generator._idGenerationInProgress.remove(oldTableName)!;
-        }
-        if (generator._recentRequestCount.containsKey(oldTableName)) {
-          generator._recentRequestCount[newTableName] =
-              generator._recentRequestCount.remove(oldTableName)!;
-        }
-        if (generator._lastCountResetTime.containsKey(oldTableName)) {
-          generator._lastCountResetTime[newTableName] =
-              generator._lastCountResetTime.remove(oldTableName)!;
-        }
-
-        generator.tableUid = newTableName;
-      }
-    }
-  }
 
   /// Clean up static states when a table is deleted to avoid memory leaks
   static void handleTableDelete(String tableUid) {
