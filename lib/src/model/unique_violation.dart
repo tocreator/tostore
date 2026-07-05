@@ -1,3 +1,5 @@
+import 'table_identity.dart';
+
 /// Standardized information about a unique constraint violation.
 class UniqueViolation {
   /// Name of the table where the violation occurred.
@@ -10,7 +12,7 @@ class UniqueViolation {
   final dynamic value;
 
   /// User-visible index name (optional, e.g. `uniq_email` or `pk`).
-  final String? indexName;
+  final IndexName? indexName;
 
   /// The primary key of the existing record that caused the violation (optional).
   /// This is useful for resolving record identities during upsert or batch updates.
