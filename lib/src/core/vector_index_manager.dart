@@ -687,8 +687,7 @@ class VectorIndexManager {
         NghIndexMeta meta,
         String? legacyLogicalNameFromJson,
         bool hadLegacyDisplayFields,
-      })?> _readNghMetaFromDisk(
-      TableContext table, IndexUid pathKey) async {
+      })?> _readNghMetaFromDisk(TableContext table, IndexUid pathKey) async {
     final path =
         await _dataStore.pathManager.getNghMetaPath(table.tableUid, pathKey);
     if (!await _dataStore.storage.existsFile(path)) {
