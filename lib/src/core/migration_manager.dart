@@ -1602,15 +1602,12 @@ class MigrationManager {
         targetSchema ?? oldSchema,
       );
       final cutoverPointer = _dataStore.walManager.currentPointer;
-      final physicalRenameSpaces =
-          renameOp != null ? List<String>.from(spaces) : <String>[];
 
       var task = MigrationTask(
         taskId: taskId,
         tableUid: tableUid,
         isSchemaUpdated: false,
         pendingMigrationSpaces: spaces,
-        pendingPhysicalRenameSpaces: physicalRenameSpaces,
         operations: sortedOperations,
         createTime: DateTime.now(),
         dirIndex: dirIndex,
@@ -1742,10 +1739,6 @@ class MigrationManager {
         needDataMigration: needDataMigration,
       );
       _registerRuntimeMigration(task);
-
-      if (renameOp != null && renameOp.newTableName != null) {
-        _startAsyncRenameTableOnDiskForCurrentSpace(task);
-      }
 
       if (task.oldSchemaSnapshot != null) {
         registerSchemaVersion(task.oldSchemaSnapshot!);
@@ -2124,50 +2117,65 @@ class MigrationManager {
 
       final currentTableName = resolvedTargetSchema.name;
       final fieldRenameHints = _buildFieldRenameHints(operations);
+      final isTableRename = renameOp != null &&
+          renameOp.newTableName != null &&
+          tableName != currentTableName;
 
-      if (renameOp != null && renameOp.newTableName != null) {
-        await _dataStore.renameTableInMemory(
-          tableName,
-          currentTableName,
-          oldSchemaSnapshot: oldSchema,
-          updateSchema: true,
-          refreshForeignKeySystemTables: true,
+      if (isTableRename) {
+        _dataStore.startTableRenameBarrier(tableName, currentTableName);
+      }
+
+      try {
+        final tableUid = resolvedTargetSchema.tableUid.isNotEmpty
+            ? resolvedTargetSchema.tableUid
+            : table.tableUid;
+        final schemaToSave = resolvedTargetSchema.copyWith(
+          tableUid: tableUid,
+          schemaVersion: resolvedTargetSchema.schemaVersion ??
+              GlobalIdGenerator.generate("s"),
         );
+
+        final tableForSave = TableContext(
+          tableUid: TableUid(tableUid),
+          tableName: TableName(currentTableName),
+          isGlobal: resolvedTargetSchema.isGlobal,
+          dataDirIndex: table.dataDirIndex,
+          schema: schemaToSave,
+        );
+
+        await _dataStore.schemaManager?.saveTableSchema(
+          tableForSave,
+          schemaToSave,
+          fieldRenameHints: fieldRenameHints,
+        );
+
+        if (isTableRename) {
+          await _dataStore.applyTableRenameSideEffects(
+            oldTableName: tableName,
+            newTableName: currentTableName,
+            table: tableForSave,
+          );
+        }
+
+        final fkManager = _dataStore.foreignKeyManager;
+        await fkManager?.updateSystemTableForTable(
+          tableForSave,
+          resolvedTargetSchema,
+        );
+
+        if (isTableRename) {
+          await _dataStore.cacheManager.invalidateCache(table);
+          await _dataStore.cacheManager.invalidateCache(
+            tableForSave,
+            invalidateSchema: true,
+          );
+        }
+        return currentTableName;
+      } finally {
+        if (isTableRename) {
+          _dataStore.endTableRenameBarrier(tableName, currentTableName);
+        }
       }
-
-      final tableUid = resolvedTargetSchema.tableUid.isNotEmpty
-          ? resolvedTargetSchema.tableUid
-          : table.tableUid;
-      final schemaToSave = resolvedTargetSchema.copyWith(
-        tableUid: tableUid,
-        schemaVersion: resolvedTargetSchema.schemaVersion ??
-            GlobalIdGenerator.generate("s"),
-      );
-
-      final tableForSave = TableContext(
-        tableUid: TableUid(tableUid),
-        tableName: TableName(currentTableName),
-        isGlobal: resolvedTargetSchema.isGlobal,
-        dataDirIndex: table.dataDirIndex,
-        schema: schemaToSave,
-      );
-
-      await _dataStore.schemaManager?.saveTableSchema(
-        tableForSave,
-        schemaToSave,
-        fieldRenameHints: fieldRenameHints,
-      );
-
-      final fkManager = _dataStore.foreignKeyManager;
-      await fkManager?.updateSystemTableForTable(
-        tableForSave,
-        resolvedTargetSchema,
-      );
-
-      if (renameOp != null && tableName != currentTableName) {
-        await _dataStore.cacheManager.invalidateCache(table);
-      }
-      return currentTableName;
     } finally {
       if (backgroundPaused) {
         unawaited(LargeOperationRunner.runPendingOperations(_dataStore)
@@ -3990,28 +3998,6 @@ class MigrationManager {
               }
             }
 
-            if (renameOp != null && renameOp.newTableName != null) {
-              if (currentTask.pendingPhysicalRenameSpaces.contains(space)) {
-                // After checkpoint catchup, perform physical renaming cutover.
-                await migrationInstance.renameTableOnDisk(
-                  originalTableName,
-                  currentTableName,
-                  oldSchemaSnapshot: oldSchema,
-                  updateSchema: false,
-                  refreshForeignKeySystemTables: true,
-                  spaceName: space,
-                );
-
-                currentTask =
-                    currentTask.removePendingPhysicalRenameSpace(space);
-                _updatePendingTaskInMemory(currentTask);
-                await _saveMigrationTask(currentTask);
-              }
-
-              // Remove from _pendingTableRenames now that the physical cutover is complete
-              _dataStore.pendingTableRenames.remove(currentTableName);
-            }
-
             final migrationTableCtx =
                 await migrationInstance.getTableContext(currentTableName);
 
@@ -4033,7 +4019,7 @@ class MigrationManager {
               );
             }
 
-            // Process data migration in place after any physical rename is done.
+            // Process data migration in place after schema cutover.
             if (needDataMigration) {
               final decodeFieldStructureOverride = oldFieldLayout != null
                   ? _buildFieldStructureFromLayout(oldFieldLayout)
@@ -4885,11 +4871,6 @@ class MigrationManager {
   /// Cleanup task files after completion
   Future<void> _cleanupTask(MigrationTask task) async {
     try {
-      final renameOp = _findRenameOperation(task.operations);
-      if (renameOp != null && renameOp.newTableName != null) {
-        _dataStore.pendingTableRenames.remove(renameOp.newTableName!);
-      }
-
       final taskPath = _dataStore.pathManager
           .getMigrationTaskPath(task.dirIndex, task.taskId);
 
@@ -4927,130 +4908,10 @@ class MigrationManager {
         systemSchemas: systemSchemas,
       );
 
-      // Re-hydrate pending table renames map from recovered unfinished tasks for current space only
-      _dataStore.pendingTableRenames.clear();
-      final currentSpace = _dataStore.currentSpaceName;
-      for (final task in _pendingTasks) {
-        final renameOp = _findRenameOperation(task.operations);
-        if (renameOp != null && renameOp.newTableName != null) {
-          if (task.pendingPhysicalRenameSpaces.contains(currentSpace)) {
-            _dataStore.pendingTableRenames[renameOp.newTableName!] =
-                task.tableName;
-          }
-        }
-      }
-
       await syncHasMigrationTask();
-      await catchUpPendingPhysicalRenamesOnStartup();
     } catch (e) {
       Logger.error('Failed to initialize migration manager', rawError: e);
     }
-  }
-
-  /// For any pending renameTable migration tasks, perform their physical renaming
-  /// (moving directory, writing schemas, updating mappings) synchronously before WAL replay.
-  /// Note: This only blocks on the current space. Other spaces will be processed asynchronously later.
-  Future<void> catchUpPendingPhysicalRenamesOnStartup() async {
-    for (final task in _pendingTasks) {
-      if (!task.isSchemaUpdated) continue;
-      final renameOp = _findRenameOperation(task.operations);
-      var currentTask = task;
-      if (renameOp != null && renameOp.newTableName != null) {
-        final oldTableName = currentTask.tableName;
-        final newTableName = renameOp.newTableName!;
-
-        final currentSpace = _dataStore.currentSpaceName;
-        // Perform physical rename cutovers for current space only, blocking!
-        if (currentTask.pendingPhysicalRenameSpaces.contains(currentSpace)) {
-          try {
-            Logger.info(
-                'Catching up pending physical rename on startup: $oldTableName -> $newTableName in space $currentSpace');
-            await _dataStore.renameTableOnDisk(
-              oldTableName,
-              newTableName,
-              oldSchemaSnapshot: currentTask.oldSchemaSnapshot,
-              updateSchema: true,
-              refreshForeignKeySystemTables: true,
-              spaceName: currentSpace,
-            );
-
-            currentTask =
-                currentTask.removePendingPhysicalRenameSpace(currentSpace);
-            await _saveMigrationTask(currentTask);
-            _updatePendingTaskInMemory(currentTask);
-          } catch (e) {
-            Logger.error(
-                'Failed to catch up physical rename on startup: $oldTableName -> $newTableName in space $currentSpace',
-                rawError: e);
-          }
-        }
-      }
-    }
-  }
-
-  void _startAsyncRenameTableOnDiskForCurrentSpace(MigrationTask task) {
-    unawaited(() async {
-      try {
-        final currentSpace = _dataStore.currentSpaceName;
-        // Verify if it is still pending physical rename in current space
-        if (!task.pendingPhysicalRenameSpaces.contains(currentSpace)) {
-          return;
-        }
-
-        final renameOp = _findRenameOperation(task.operations);
-        if (renameOp == null || renameOp.newTableName == null) return;
-        final newTableName = renameOp.newTableName!;
-        final oldTableName = task.tableName;
-
-        final cutover = task.schemaCutoverWalPointer;
-        if (cutover != null) {
-          // Wait until the WAL checkpoint advances past schemaCutoverWalPointer.
-          // This ensures all buffered old-name writes are safely flushed to disk.
-          while (!_dataStore.walManager
-              .isAtOrBefore(cutover, _dataStore.walManager.meta.checkpoint)) {
-            await Future.delayed(const Duration(milliseconds: 100));
-          }
-        }
-
-        // Check again if the task has been updated/completed while waiting
-        final freshTask = _findPendingTaskById(task.taskId);
-        if (freshTask == null ||
-            !freshTask.pendingPhysicalRenameSpaces.contains(currentSpace)) {
-          return;
-        }
-
-        Logger.info(
-            'Checkpoint cleared. Performing async physical rename for current space [$currentSpace]: $oldTableName -> $newTableName');
-        await _dataStore.renameTableOnDisk(
-          oldTableName,
-          newTableName,
-          oldSchemaSnapshot: freshTask.oldSchemaSnapshot,
-          updateSchema: false,
-          refreshForeignKeySystemTables: true,
-          spaceName: currentSpace,
-        );
-
-        // Update task state
-        var updatedTask =
-            freshTask.removePendingPhysicalRenameSpace(currentSpace);
-        await _saveMigrationTask(updatedTask);
-        _updatePendingTaskInMemory(updatedTask);
-
-        // Remove from _pendingTableRenames now that the physical cutover is complete for this space
-        _dataStore.pendingTableRenames.remove(newTableName);
-      } catch (e) {
-        if (e is DbClosedException) return;
-        Logger.error('Failed in async renameTableOnDisk for current space',
-            rawError: e);
-      }
-    }());
-  }
-
-  MigrationTask? _findPendingTaskById(String taskId) {
-    for (final t in _pendingTasks) {
-      if (t.taskId == taskId) return t;
-    }
-    return null;
   }
 
   /// Returns a map of pending table renames: oldTableName -> newTableName
@@ -6219,11 +6080,10 @@ class MigrationManager {
               task.spaceCheckpointKeys.isNotEmpty ||
               task.pendingMigrationSpaces.length < scopes.length;
 
-          // If a task is completely resolved to no-op (no write mode, no physical rename, no force write),
+          // If a task is completely resolved to no-op (no write mode, no force write),
           // we can discard the task if it is already schema-updated and NOT physically started yet.
           if (updatedTask.writeMode == MigrationWriteMode.none &&
               !updatedTask.forceDataMigration &&
-              updatedTask.pendingPhysicalRenameSpaces.isEmpty &&
               updatedTask.isSchemaUpdated &&
               !isTaskStarted) {
             _pendingTasks.removeWhere((t) => t.taskId == task.taskId);
@@ -6293,7 +6153,7 @@ class MigrationManager {
           taskA.targetSchemaSnapshot ?? taskA.oldSchemaSnapshot);
       final isTaskAStarted = taskA.taskId == _activeExecutingTaskId ||
           taskA.spaceCheckpointKeys.isNotEmpty ||
-          taskA.pendingPhysicalRenameSpaces.length < scopesA.length;
+          taskA.pendingMigrationSpaces.length < scopesA.length;
       if (isTaskAStarted) continue;
 
       for (int j = i + 1; j < refreshedComponent.length; j++) {
@@ -6305,7 +6165,7 @@ class MigrationManager {
             taskB.targetSchemaSnapshot ?? taskB.oldSchemaSnapshot);
         final isTaskBStarted = taskB.taskId == _activeExecutingTaskId ||
             taskB.spaceCheckpointKeys.isNotEmpty ||
-            taskB.pendingPhysicalRenameSpaces.length < scopesB.length;
+            taskB.pendingMigrationSpaces.length < scopesB.length;
         if (isTaskBStarted) continue;
 
         if (renameOpA.newTableName == taskB.tableName) {
