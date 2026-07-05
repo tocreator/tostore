@@ -5,6 +5,8 @@ import '../handler/common.dart';
 import '../handler/logger.dart';
 import '../model/global_config.dart';
 import '../model/table_schema.dart';
+import '../model/table_context.dart';
+import '../model/table_identity.dart';
 import '../model/meta_info.dart';
 import '../handler/space_tables_codec.dart';
 import '../model/id_generator.dart';
@@ -185,8 +187,8 @@ class V3Upgrade {
               final schema = TableSchema.fromJson(schemaJson);
 
               // Generate stable tableUid
-              final tableUid = GlobalIdGenerator.generate("t");
-              tableUidMap[tableName] = tableUid;
+              final tableUid = TableUid(GlobalIdGenerator.generate("t"));
+              tableUidMap[tableName] = tableUid.value;
               tableIsGlobalMap[tableName] = schema.isGlobal;
 
               // Generate autoIndexes and populate indexes with stable UIDs
@@ -200,8 +202,8 @@ class V3Upgrade {
               // Map generated indexUids for directory rename
               final idxUidMap = <String, String>{};
               for (final idx in upgradedSchema.getAllIndexes()) {
-                if (idx.indexUid != null) {
-                  idxUidMap[idx.actualIndexName] = idx.indexUid!;
+                if (idx.indexUid.isNotEmpty) {
+                  idxUidMap[idx.actualIndexName] = idx.indexUid;
                 }
               }
               tableIndexUidMap[tableName] = idxUidMap;
@@ -209,10 +211,20 @@ class V3Upgrade {
               final finalDirIndex = allocateDirIndex(schema.isGlobal);
               tableDirIndexMap[tableName] = finalDirIndex;
 
+              final tableCtx = TableContext(
+                tableUid: TableUid(tableUid),
+                tableName: TableName(tableName),
+                isGlobal: upgradedSchema.isGlobal,
+                dataDirIndex: finalDirIndex,
+                schema: upgradedSchema,
+              );
+
               // Save the upgraded schema via the new schema manager
               await _dataStore.schemaManager!.saveTableSchema(
-                  tableUid, tableName, upgradedSchema,
-                  dataDirIndex: finalDirIndex);
+                tableCtx,
+                upgradedSchema,
+                dataDirIndex: finalDirIndex,
+              );
             }
           } catch (e) {
             Logger.error(
@@ -375,29 +387,164 @@ class V3Upgrade {
         final oldIndexFilePath = path.join(indexDirPath, indexName);
         final newIndexFilePath = path.join(indexDirPath, indexUid);
         if (await _dataStore.storage.existsDirectory(oldIndexFilePath)) {
-          await _dataStore.storage
-              .moveDirectory(oldIndexFilePath, newIndexFilePath);
-          final indexMetaFilePath = path.join(newIndexFilePath, 'meta.json');
-          if (await _dataStore.storage.existsFile(indexMetaFilePath)) {
-            try {
-              final content =
-                  await _dataStore.storage.readAsString(indexMetaFilePath);
-              if (content != null && content.isNotEmpty) {
-                final json = jsonDecode(content) as Map<String, dynamic>;
-                json['tableUid'] = tableUid;
-                json['indexUid'] = indexUid;
-                json.remove('tableName');
-                json.remove('indexName');
-                await _dataStore.storage
-                    .writeAsString(indexMetaFilePath, jsonEncode(json));
-              }
-            } catch (e) {
-              Logger.warn('Failed to update index metadata in v3 upgrade',
-                  rawError: e);
-            }
+          if (await _dataStore.storage.existsDirectory(newIndexFilePath)) {
+            await _dataStore.storage.deleteDirectory(oldIndexFilePath);
+          } else {
+            await _dataStore.storage
+                .moveDirectory(oldIndexFilePath, newIndexFilePath);
           }
+          await _rewriteIndexMetaJson(
+            path.join(newIndexFilePath, 'meta.json'),
+            tableUid: tableUid,
+            indexUid: indexUid,
+          );
         }
+
+        // Vector mapping B+Trees are sibling dirs ({name}__nid2pk / __pk2nid), not
+        // under the main index tree — migrate them separately.
+        for (final suffix in const ['__nid2pk', '__pk2nid']) {
+          await _migrateMappingIndexDirectory(
+            indexDirPath: indexDirPath,
+            legacyBaseName: indexName,
+            stableIndexUid: indexUid,
+            tableUid: tableUid,
+            suffix: suffix,
+          );
+        }
+
+        // Rewrite NGH vector meta at stable and/or legacy paths.
+        await _rewriteNghMetaJson(
+          indexDirPath: indexDirPath,
+          indexUid: indexUid,
+          tableUid: tableUid,
+          legacyIndexName: indexName,
+        );
       }
+    }
+  }
+
+  Future<void> _rewriteIndexMetaJson(
+    String metaFilePath, {
+    required String tableUid,
+    required String indexUid,
+  }) async {
+    if (!await _dataStore.storage.existsFile(metaFilePath)) {
+      return;
+    }
+    try {
+      final content = await _dataStore.storage.readAsString(metaFilePath);
+      if (content == null || content.isEmpty) return;
+      final json = jsonDecode(content) as Map<String, dynamic>;
+      json['tableUid'] = tableUid;
+      json['indexUid'] = indexUid;
+      json.remove('tableName');
+      json.remove('indexName');
+      await _dataStore.storage.writeAsString(metaFilePath, jsonEncode(json));
+    } catch (e) {
+      Logger.warn('Failed to update index metadata in v3 upgrade', rawError: e);
+    }
+  }
+
+  Future<void> _migrateMappingIndexDirectory({
+    required String indexDirPath,
+    required String legacyBaseName,
+    required String stableIndexUid,
+    required String tableUid,
+    required String suffix,
+  }) async {
+    final oldPath = path.join(indexDirPath, '$legacyBaseName$suffix');
+    final newPath = path.join(indexDirPath, '$stableIndexUid$suffix');
+    if (oldPath == newPath ||
+        !await _dataStore.storage.existsDirectory(oldPath)) {
+      return;
+    }
+
+    if (await _dataStore.storage.existsDirectory(newPath)) {
+      await _dataStore.storage.deleteDirectory(oldPath);
+    } else {
+      await _dataStore.storage.moveDirectory(oldPath, newPath);
+    }
+
+    await _rewriteIndexMetaJson(
+      path.join(newPath, 'meta.json'),
+      tableUid: tableUid,
+      indexUid: '$stableIndexUid$suffix',
+    );
+  }
+
+  Future<void> _rewriteNghMetaJson({
+    required String indexDirPath,
+    required String indexUid,
+    required String tableUid,
+    String? legacyIndexName,
+  }) async {
+    final stableMetaPath =
+        path.join(indexDirPath, indexUid, 'ngh', 'meta.json');
+    if (await _dataStore.storage.existsFile(stableMetaPath)) {
+      await _rewriteNghMetaJsonFile(stableMetaPath, indexUid, tableUid);
+      return;
+    }
+
+    if (legacyIndexName == null ||
+        legacyIndexName.isEmpty ||
+        legacyIndexName == indexUid) {
+      return;
+    }
+
+    final legacyIndexDir = path.join(indexDirPath, legacyIndexName);
+    final stableIndexDir = path.join(indexDirPath, indexUid);
+    final legacyMetaPath = path.join(legacyIndexDir, 'ngh', 'meta.json');
+    if (!await _dataStore.storage.existsFile(legacyMetaPath)) {
+      return;
+    }
+
+    // NGH still under logical-name tree while stable uid tree is absent/incomplete.
+    if (!await _dataStore.storage.existsDirectory(stableIndexDir)) {
+      await _dataStore.storage.moveDirectory(legacyIndexDir, stableIndexDir);
+    } else if (!await _dataStore.storage.existsFile(stableMetaPath)) {
+      final legacyNghDir = path.join(legacyIndexDir, 'ngh');
+      final stableNghDir = path.join(stableIndexDir, 'ngh');
+      if (await _dataStore.storage.existsDirectory(legacyNghDir)) {
+        await _dataStore.storage.moveDirectory(legacyNghDir, stableNghDir);
+      }
+    }
+
+    final rewrittenPath = path.join(indexDirPath, indexUid, 'ngh', 'meta.json');
+    if (await _dataStore.storage.existsFile(rewrittenPath)) {
+      await _rewriteNghMetaJsonFile(rewrittenPath, indexUid, tableUid);
+    } else {
+      await _rewriteNghMetaJsonFile(legacyMetaPath, indexUid, tableUid);
+    }
+  }
+
+  Future<void> _rewriteNghMetaJsonFile(
+    String metaFilePath,
+    String indexUid,
+    String tableUid,
+  ) async {
+    try {
+      final content = await _dataStore.storage.readAsString(metaFilePath);
+      if (content == null || content.isEmpty) return;
+      final json = jsonDecode(content) as Map<String, dynamic>;
+      json['indexUid'] = indexUid;
+      json['tableUid'] = tableUid;
+      json.remove('tableName');
+      json.remove('name');
+      json.remove('fieldName');
+
+      for (final key in ['nodeIdToPkMeta', 'pkToNodeIdMeta']) {
+        final nested = json[key];
+        if (nested is! Map<String, dynamic>) continue;
+        final suffix = key == 'pkToNodeIdMeta' ? '__pk2nid' : '__nid2pk';
+        nested['indexUid'] = '$indexUid$suffix';
+        nested['tableUid'] = tableUid;
+        nested.remove('tableName');
+        nested.remove('indexName');
+      }
+
+      await _dataStore.storage.writeAsString(metaFilePath, jsonEncode(json));
+    } catch (e) {
+      Logger.warn('Failed to update NGH metadata in v3 upgrade', rawError: e);
     }
   }
 
