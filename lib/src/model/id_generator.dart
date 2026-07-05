@@ -330,6 +330,7 @@ class TimeBasedIdGenerator implements IdGenerator {
   final PrimaryKeyType keyType; // timestampBased, datePrefixed or shortCode
   final DistributedNodeConfig nodeConfig;
   String tableUid;
+  final String tableDisplayName;
 
   // Timestamp/date prefix ID generation related properties
   final Map<String, int> _sequenceMap =
@@ -403,7 +404,7 @@ class TimeBasedIdGenerator implements IdGenerator {
   /// Get generator from instance map, create new instance if not exists
   static TimeBasedIdGenerator getInstance(
       PrimaryKeyType keyType, DistributedNodeConfig nodeConfig, String tableUid,
-      {int? maxConcurrent}) {
+      {int? maxConcurrent, String? tableName}) {
     final key = '${keyType}_$tableUid';
 
     // If instance already exists, return directly
@@ -421,7 +422,12 @@ class TimeBasedIdGenerator implements IdGenerator {
     }
 
     // Create new instance
-    final generator = TimeBasedIdGenerator._(keyType, nodeConfig, tableUid);
+    final generator = TimeBasedIdGenerator._(
+      keyType,
+      nodeConfig,
+      tableUid,
+      tableName ?? 'unknown',
+    );
 
     // Set parallel count
     if (maxConcurrent != null && maxConcurrent > 0) {
@@ -434,7 +440,12 @@ class TimeBasedIdGenerator implements IdGenerator {
   }
 
   // Make constructor private, force use of getInstance
-  TimeBasedIdGenerator._(this.keyType, this.nodeConfig, this.tableUid) {
+  TimeBasedIdGenerator._(
+    this.keyType,
+    this.nodeConfig,
+    this.tableUid,
+    this.tableDisplayName,
+  ) {
     // Check if keyType is a valid type
     if (keyType != PrimaryKeyType.timestampBased &&
         keyType != PrimaryKeyType.datePrefixed &&
@@ -851,7 +862,7 @@ class TimeBasedIdGenerator implements IdGenerator {
         GeneralStatus(
           type: ResultType.sysTimeout,
           message:
-              'Unable to generate ID: Pool is empty and fill timeout. Table=$tableUid, Request=$count, '
+              'Unable to generate ID: Pool is empty and fill timeout. Table=$tableDisplayName, Request=$count, '
               'FillInProgress=${_idGenerationInProgress[tableUid] ?? false}, '
               'Current pool size=${_idPools[tableUid]?.length ?? 0}.',
         )
@@ -1380,6 +1391,7 @@ class IdGeneratorFactory {
           config.distributedNodeConfig,
           schema.tableUid,
           maxConcurrent: config.maxConcurrency,
+          tableName: schema.name,
         );
 
       case PrimaryKeyType.none:
