@@ -8,6 +8,9 @@ import '../core/path_manager.dart';
 import '../core/storage_adapter.dart';
 import '../core/yield_controller.dart';
 import '../model/table_schema.dart';
+import '../model/table_context.dart';
+import '../model/table_identity.dart';
+import '../model/id_generator.dart';
 
 /// Old path structure migration handler
 /// Handles the logic for migrating from the old version database path structure to the new version
@@ -237,10 +240,25 @@ class OldStructureMigrationHandler {
           final schemaJson = jsonDecode(schemaContent);
           // create new table using SchemaManager
           final schema = TableSchema.fromJson(schemaJson);
+          final tableUid = schema.tableUid.isNotEmpty
+              ? schema.tableUid
+              : TableUid(GlobalIdGenerator.generate('t'));
+          final upgradedSchema = schema.tableUid.isEmpty
+              ? schema.copyWith(tableUid: tableUid)
+              : schema;
+          final dataDirIndex = dataStore.schemaManager!
+              .allocateDataDirIndex(upgradedSchema.isGlobal);
+          final tableCtx = TableContext(
+            tableUid: TableUid(tableUid),
+            tableName: TableName(tableName),
+            isGlobal: upgradedSchema.isGlobal,
+            dataDirIndex: dataDirIndex,
+            schema: upgradedSchema,
+          );
           await dataStore.schemaManager!.saveTableSchema(
-            tableName,
-            tableName,
-            schema,
+            tableCtx,
+            upgradedSchema,
+            dataDirIndex: dataDirIndex,
           );
           Logger.info('Table $tableName structure migration succeeded');
         } catch (e) {
@@ -283,15 +301,16 @@ class OldStructureMigrationHandler {
               for (int start = 0; start < records.length; start += batchSize) {
                 final end = min(start + batchSize, records.length);
                 final batch = records.sublist(start, end);
+                final table = await dataStore.getTableContext(tableName);
 
                 await dataStore.tableDataManager.writeChanges(
-                  tableName: tableName,
+                  table: table,
                   inserts: batch,
                 );
 
                 // Maintain indexes to keep query paths consistent after migration.
                 await dataStore.indexManager?.writeChanges(
-                  tableName: tableName,
+                  table: table,
                   inserts: batch,
                 );
 
@@ -314,11 +333,11 @@ class OldStructureMigrationHandler {
         if (maxIdContent != null && maxIdContent.isNotEmpty) {
           final maxId = int.parse(maxIdContent.trim());
           // get new table auto increment ID file path
-          final fileMeta =
-              await dataStore.tableDataManager.getTableMeta(tableName);
+          final table = await dataStore.getTableContext(tableName);
+          final fileMeta = await dataStore.tableDataManager.getTableMeta(table);
           if (fileMeta != null) {
-            await dataStore.tableDataManager.updateTableMeta(tableName,
-                fileMeta.copyWith(maxAutoIncrementId: maxId.toString()));
+            await dataStore.tableDataManager.updateTableMeta(
+                table, fileMeta.copyWith(maxAutoIncrementId: maxId.toString()));
           }
         }
       }
