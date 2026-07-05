@@ -1838,67 +1838,6 @@ class TableDataManager {
     return _lastModifiedTimes[tableUid];
   }
 
-  /// Rename table in all internal metadata maps.
-  void renameTable(String oldTableName, String newTableName) {
-    if (oldTableName == newTableName) return;
-
-    if (_tableFlushingFlags.containsKey(oldTableName)) {
-      _tableFlushingFlags[newTableName] =
-          _tableFlushingFlags.remove(oldTableName)!;
-    }
-    if (_tablePartitionSizes.containsKey(oldTableName)) {
-      _tablePartitionSizes[newTableName] =
-          _tablePartitionSizes.remove(oldTableName)!;
-    }
-    if (_fileSizes.containsKey(oldTableName)) {
-      _fileSizes[newTableName] = _fileSizes.remove(oldTableName)!;
-    }
-    if (_lastModifiedTimes.containsKey(oldTableName)) {
-      _lastModifiedTimes[newTableName] =
-          _lastModifiedTimes.remove(oldTableName)!;
-    }
-    if (_tableRecordCounts.containsKey(oldTableName)) {
-      _tableRecordCounts[newTableName] =
-          _tableRecordCounts.remove(oldTableName)!;
-    }
-    if (_recordCountLoadingFutures.containsKey(oldTableName)) {
-      _recordCountLoadingFutures[newTableName] =
-          _recordCountLoadingFutures.remove(oldTableName)!;
-    }
-    if (_metaLoadingFutures.containsKey(oldTableName)) {
-      _metaLoadingFutures[newTableName] =
-          _metaLoadingFutures.remove(oldTableName)!;
-    }
-    if (_maxIds.containsKey(oldTableName)) {
-      _maxIds[newTableName] = _maxIds.remove(oldTableName);
-    }
-    if (_maxIdsDirty.containsKey(oldTableName)) {
-      _maxIdsDirty[newTableName] = _maxIdsDirty.remove(oldTableName)!;
-    }
-    if (_idGenerators.containsKey(oldTableName)) {
-      final generator = _idGenerators.remove(oldTableName)!;
-      if (generator is SequentialIdGenerator) {
-        generator.renameTable(newTableName);
-      }
-      _idGenerators[newTableName] = generator;
-    }
-    TimeBasedIdGenerator.handleTableRename(oldTableName, newTableName);
-    if (_idGeneratorPending.containsKey(oldTableName)) {
-      _idGeneratorPending[newTableName] =
-          _idGeneratorPending.remove(oldTableName)!;
-    }
-    if (_idRanges.containsKey(oldTableName)) {
-      _idRanges[newTableName] = _idRanges.remove(oldTableName)!;
-    }
-    if (_checkedOrderedRange.containsKey(oldTableName)) {
-      _checkedOrderedRange[newTableName] =
-          _checkedOrderedRange.remove(oldTableName)!;
-    }
-    if (_pkComparators.containsKey(oldTableName)) {
-      _pkComparators[newTableName] = _pkComparators.remove(oldTableName)!;
-    }
-  }
-
   /// Get table meta information
   Future<TableMeta?> getTableMeta(TableContext table) async {
     final tableUid = table.tableUid;
