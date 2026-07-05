@@ -44,7 +44,7 @@ class MigrationTask {
   // target write mode for background execution
   final MigrationWriteMode? writeMode;
   // specific index uids to build during execution (null means all)
-  final List<String>? specificIndexUids;
+  final List<IndexUid>? specificIndexUids;
   // execution errors
   final List<ResultStatus>? errors;
   // estimated migration duration
@@ -144,7 +144,8 @@ class MigrationTask {
           : null,
       specificIndexUids:
           ((json['specificIndexUids'] ?? json['specificIndexes']) as List?)
-              ?.cast<String>(),
+              ?.map((e) => IndexUid(e as String))
+              .toList(),
       errors: (json['errors'] as List?)
           ?.map(
               (e) => ResultStatus.fromJson(Map<String, dynamic>.from(e as Map)))
@@ -175,7 +176,8 @@ class MigrationTask {
           'spaceCheckpointKeys': spaceCheckpointKeys,
         if (backupPath != null) 'backupPath': backupPath,
         if (writeMode != null) 'writeMode': writeMode!.name,
-        if (specificIndexUids != null) 'specificIndexUids': specificIndexUids,
+        if (specificIndexUids != null)
+          'specificIndexUids': specificIndexUids!.map((u) => u.value).toList(),
         if (errors != null) 'errors': errors!.map((e) => e.toJson()).toList(),
         if (estimateDuration != null)
           'estimateDuration': estimateDuration!.inMicroseconds,
@@ -268,7 +270,7 @@ class MigrationTask {
     Map<String, String>? spaceCheckpointKeys,
     String? backupPath,
     MigrationWriteMode? writeMode,
-    List<String>? specificIndexUids,
+    List<IndexUid>? specificIndexUids,
     List<ResultStatus>? errors,
     Duration? estimateDuration,
   }) =>
