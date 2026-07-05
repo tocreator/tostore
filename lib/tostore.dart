@@ -513,6 +513,7 @@ class ToStore implements DataStoreInterface {
   /// [efSearch] NGH 算法的搜索宽度（值越大越精确，但速度越慢）。
   /// [distanceThreshold] 距离阈值，超过此值的记录将被过滤。
   /// 返回按相似度排序的 [VectorSearchResult] 列表。
+  @override
   Future<List<VectorSearchResult>> vectorSearch(
     String tableName, {
     required String fieldName,
@@ -1053,7 +1054,13 @@ class ToStore implements DataStoreInterface {
   /// 返回表结构 [TableSchema]，若未找到则返回 null。
   @override
   Future<TableSchema?> getTableSchema(String tableName) async {
-    return await _impl.schemaManager?.getTableSchema(tableName);
+    return await _impl.getTableSchema(tableName);
+  }
+
+  /// Get all table names in the current space.
+  @override
+  Future<List<String>> getTableNames() async {
+    return await _impl.getTableNames();
   }
 
   /// Get table information including:
