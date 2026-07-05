@@ -2612,6 +2612,7 @@ class TableDataManager {
     }
     return TableWriteLock._(
       tableUid: table.tableUid,
+      tableName: table.tableName.value,
       resource: lockKey,
       operationId: operationId,
     );
@@ -2623,7 +2624,7 @@ class TableDataManager {
       throw DbException([
         InvalidArgumentStatus(
           type: ResultType.engError,
-          message: 'Invalid table write lock: tableUid is empty',
+          message: 'Invalid table write lock: table identity is missing',
           parameterName: 'lock',
         ),
       ]);
@@ -2644,7 +2645,10 @@ class TableDataManager {
     if (tableLock != null) {
       // Borrowed from an outer withTableWriteLock scope to avoid same-table
       // re-entry deadlocks. It is validated here, not acquired or released.
-      tableLock.validateBorrowedFor(table.tableUid);
+      tableLock.validateBorrowedFor(
+        table.tableUid,
+        expectedTableName: table.tableName.value,
+      );
       return action(tableLock);
     }
 
@@ -4438,12 +4442,14 @@ final class PartitionPageBatch {
 
 final class TableWriteLock {
   final TableUid tableUid;
+  final String tableName;
   final String resource;
   final String operationId;
   bool _released = false;
 
   TableWriteLock._({
     required this.tableUid,
+    required this.tableName,
     required this.resource,
     required this.operationId,
   });
@@ -4454,12 +4460,15 @@ final class TableWriteLock {
     _released = true;
   }
 
-  void validateBorrowedFor(TableUid expectedTableUid) {
+  void validateBorrowedFor(
+    TableUid expectedTableUid, {
+    String? expectedTableName,
+  }) {
     if (_released) {
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,
-          message: 'Table write lock already released: $tableUid',
+          message: 'Table write lock already released: $tableName',
         ),
       ]);
     }
@@ -4468,7 +4477,7 @@ final class TableWriteLock {
         GeneralStatus(
           type: ResultType.engError,
           message:
-              'Table write lock mismatch: expected $expectedTableUid, got $tableUid',
+              'Table write lock mismatch: expected ${expectedTableName ?? 'unknown'}, got $tableName',
         ),
       ]);
     }
