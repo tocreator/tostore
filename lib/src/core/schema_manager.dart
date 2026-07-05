@@ -481,7 +481,7 @@ class SchemaManager {
         fieldName: field.name,
         typeIndex: field.type.index,
         deleted: false,
-        fieldId: field.name,
+        fieldId: field.fieldId ?? field.name,
       ));
     }
     return FieldStorageLayout(nextSlotId: nextSlotId, slots: slots);
@@ -520,15 +520,37 @@ class SchemaManager {
     }
 
     for (final field in nextSchema.fields) {
-      final oldName = renameHints.entries
-          .firstWhere((e) => e.value == field.name,
-              orElse: () => MapEntry('', ''))
-          .key;
-
       int matchIdx = -1;
-      if (oldName.isNotEmpty) {
-        matchIdx = slots.indexWhere((s) => s.fieldName == oldName);
+
+      // 1. Prioritize matching by stable fieldId if available
+      if (field.fieldId != null && field.fieldId!.isNotEmpty) {
+        matchIdx = slots.indexWhere((s) => s.fieldId == field.fieldId);
       }
+
+      // 2. Fallback to chain-tracing matching via renameHints if fieldId matching fails
+      if (matchIdx == -1 && renameHints.isNotEmpty) {
+        String oldName = '';
+        String currentTarget = field.name;
+        bool found = true;
+        while (found) {
+          final match = renameHints.entries.firstWhere(
+            (e) => e.value == currentTarget,
+            orElse: () => const MapEntry('', ''),
+          );
+          if (match.key.isNotEmpty) {
+            oldName = match.key;
+            currentTarget = match.key; // Trace chain recursively (e.g. a -> b -> c)
+          } else {
+            found = false;
+          }
+        }
+
+        if (oldName.isNotEmpty) {
+          matchIdx = slots.indexWhere((s) => s.fieldName == oldName);
+        }
+      }
+
+      // 3. Fallback to direct name matching (unchanged fields)
       if (matchIdx == -1) {
         matchIdx = slots.indexWhere((s) => s.fieldName == field.name);
       }
@@ -536,6 +558,7 @@ class SchemaManager {
       if (matchIdx != -1) {
         slots[matchIdx] = slots[matchIdx].copyWith(
           fieldName: field.name,
+          fieldId: field.fieldId ?? slots[matchIdx].fieldId,
           typeIndex: field.type.index,
           deleted: false,
         );
@@ -545,7 +568,7 @@ class SchemaManager {
           fieldName: field.name,
           typeIndex: field.type.index,
           deleted: false,
-          fieldId: field.name,
+          fieldId: field.fieldId ?? field.name,
         ));
       }
     }

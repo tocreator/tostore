@@ -2197,12 +2197,13 @@ class MigrationManager {
   Map<String, String> _buildFieldRenameHints(
     List<MigrationOperation> operations,
   ) {
+    // oldFieldName -> newFieldName (matches evolveFieldStorageLayout lookup)
     final hints = <String, String>{};
     for (final operation in operations) {
       if (operation.type == MigrationType.renameField &&
           operation.fieldName != null &&
           operation.newName != null) {
-        hints[operation.newName!] = operation.fieldName!;
+        hints[operation.fieldName!] = operation.newName!;
       }
     }
     return hints;
