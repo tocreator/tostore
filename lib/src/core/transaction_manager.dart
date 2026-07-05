@@ -618,21 +618,6 @@ class TransactionManager {
   Future<void> applyCommitPlan(TransactionCommitPlan plan) async {
     final commitPlan = _withNormalizedTableKeys(plan);
     try {
-      // Wait for any active table renames to finish
-      if (_dataStore.hasActiveTableRenames) {
-        final tablesToLock = <String>{
-          ...commitPlan.inserts.keys,
-          ...commitPlan.updates.keys,
-          ...commitPlan.deletes.keys,
-        };
-        for (final table in tablesToLock) {
-          final barrier = _dataStore.checkTableRenameBarrier(table);
-          if (barrier is Future) {
-            await barrier;
-          }
-        }
-      }
-
       // Resume from plan progress checkpoint (per-table applied counts)
       final progress = await _loadPlanProgress(commitPlan.transactionId);
 
