@@ -1163,13 +1163,6 @@ class TransactionManager {
     }
   }
 
-  /// Rename table in write-sets, recent committed writes (SSI), heavy delete/update plans, and cascade operations.
-  Future<void> renameTableInCaches(
-      String oldTableName, String newTableName) async {
-    if (oldTableName == newTableName) return;
-    // Internal structures are keyed by stable tableUid; rename does not change uid.
-  }
-
   /// Register a write key (table, primaryKey) for current transaction (used by SSI)
   void registerWriteKey(String txId, TableContext table, String primaryKey) {
     try {
