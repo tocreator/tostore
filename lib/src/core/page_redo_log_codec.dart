@@ -292,7 +292,8 @@ final class PageRedoLogCodec {
     if (pos + indexLen > end) return null;
     final IndexUid? indexUid = indexLen == 0
         ? null
-        : IndexUid(utf8.decode(Uint8List.sublistView(bytes, pos, pos + indexLen)));
+        : IndexUid(
+            utf8.decode(Uint8List.sublistView(bytes, pos, pos + indexLen)));
     pos += indexLen;
 
     switch (recType) {
