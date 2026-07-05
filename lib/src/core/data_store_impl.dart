@@ -7305,7 +7305,7 @@ class DataStoreImpl {
   /// Check if table exists in current space
   Future<bool> tableExistsInCurrentSpace(String tableName) async {
     if (schemaManager == null) return false;
-    return schemaManager!.uidByName.containsKey(tableName);
+    return schemaManager!.uidByName.containsKey(TableName(tableName));
   }
 
   /// Get information about the current space
