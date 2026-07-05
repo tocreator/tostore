@@ -81,20 +81,17 @@ class WeightManager {
   final DataStoreImpl _dataStore;
   final PathManager _pathManager;
 
-  /// Weight data cache
-  /// Structure: WeightType -> identifier -> WeightData
-  final Map<WeightType, Map<String, WeightData>> _weightCache = {
-    WeightType.tableRecord: {},
-    WeightType.indexData: {},
-  };
+  /// Table record weights keyed by stable [TableUid].
+  final Map<TableUid, WeightData> _tableRecordWeights = {};
 
-  /// High weight cache (default 70% or higher)
-  ///
-  /// Structure: `WeightType -> Set<identifier>`
-  final Map<WeightType, Set<String>> _highWeightCache = {
-    WeightType.tableRecord: {},
-    WeightType.indexData: {},
-  };
+  /// Index data weights keyed by [indexDataIdentifier] (`tableUid:indexUid`).
+  final Map<String, WeightData> _indexDataWeights = {};
+
+  /// High weight table records (default threshold 70% or higher).
+  final Set<TableUid> _highWeightTableRecords = {};
+
+  /// High weight index entries (default threshold 70% or higher).
+  final Set<String> _highWeightIndexData = {};
 
   /// File load lock, avoid high concurrency duplicate read
   final Map<String, Completer<void>> _loadingLocks = {};
@@ -185,7 +182,7 @@ class WeightManager {
       if (json['tableRecord'] is Map) {
         final tableRecordWeights = json['tableRecord'] as Map<String, dynamic>;
         for (final entry in tableRecordWeights.entries) {
-          _weightCache[WeightType.tableRecord]![entry.key] =
+          _tableRecordWeights[TableUid(entry.key)] =
               WeightData.fromJson(entry.value as Map<String, dynamic>);
         }
       }
@@ -194,7 +191,7 @@ class WeightManager {
       if (json['indexData'] is Map) {
         final indexDataWeights = json['indexData'] as Map<String, dynamic>;
         for (final entry in indexDataWeights.entries) {
-          _weightCache[WeightType.indexData]![entry.key] =
+          _indexDataWeights[entry.key] =
               WeightData.fromJson(entry.value as Map<String, dynamic>);
         }
       }
@@ -256,8 +253,8 @@ class WeightManager {
         if (schema == null) continue;
 
         // Initialize table record weights
-        final tableKey = _getTableRecordKey(schema.tableUid);
-        if (!_weightCache[WeightType.tableRecord]!.containsKey(tableKey)) {
+        final tableKey = schema.tableUid;
+        if (!_tableRecordWeights.containsKey(tableKey)) {
           int initialWeight = 0;
           if (isSystemTable) {
             initialWeight = 10; // System table initial weight 10
@@ -266,7 +263,7 @@ class WeightManager {
             initialWeight += 10; // Global table extra 10
           }
 
-          _weightCache[WeightType.tableRecord]![tableKey] = WeightData(
+          _tableRecordWeights[tableKey] = WeightData(
             weight: initialWeight,
             accessCount: 0,
             lastUpdateTime: DateTime.now().millisecondsSinceEpoch,
@@ -279,7 +276,7 @@ class WeightManager {
         for (final index in indexes) {
           await yieldController.maybeYield();
           final indexKey = _getIndexDataKey(schema.tableUid, index.indexUid);
-          if (!_weightCache[WeightType.indexData]!.containsKey(indexKey)) {
+          if (!_indexDataWeights.containsKey(indexKey)) {
             int initialWeight = 0;
             if (isSystemTable) {
               initialWeight = 10; // System table index initial weight 10
@@ -288,7 +285,7 @@ class WeightManager {
               initialWeight += 10; // Global table index extra 10
             }
 
-            _weightCache[WeightType.indexData]![indexKey] = WeightData(
+            _indexDataWeights[indexKey] = WeightData(
               weight: initialWeight,
               accessCount: 0,
               lastUpdateTime: DateTime.now().millisecondsSinceEpoch,
@@ -337,11 +334,11 @@ class WeightManager {
       final filePath = _getWeightFilePath(spaceName: spaceName);
       final json = {
         'tableRecord': {
-          for (final entry in _weightCache[WeightType.tableRecord]!.entries)
-            entry.key: entry.value.toJson(),
+          for (final entry in _tableRecordWeights.entries)
+            entry.key.value: entry.value.toJson(),
         },
         'indexData': {
-          for (final entry in _weightCache[WeightType.indexData]!.entries)
+          for (final entry in _indexDataWeights.entries)
             entry.key: entry.value.toJson(),
         },
         'lastDecayTime': _lastDecayTime,
@@ -370,10 +367,10 @@ class WeightManager {
 
   /// Clear memory cache only (standardized for CacheManager)
   void clearMemory() {
-    _weightCache[WeightType.tableRecord]!.clear();
-    _weightCache[WeightType.indexData]!.clear();
-    _highWeightCache[WeightType.tableRecord]!.clear();
-    _highWeightCache[WeightType.indexData]!.clear();
+    _tableRecordWeights.clear();
+    _indexDataWeights.clear();
+    _highWeightTableRecords.clear();
+    _highWeightIndexData.clear();
     _dirty = false;
   }
 
@@ -385,9 +382,8 @@ class WeightManager {
   }) async {
     // High-concurrency optimization: check initialized status synchronously first
     if (_initialized) {
-      final cache = _weightCache[type]!;
-      // If weights for this type are already loaded (common case), handle synchronously
-      if (cache.isNotEmpty || type == WeightType.tableRecord) {
+      if (type == WeightType.tableRecord ||
+          (type == WeightType.indexData && _indexDataWeights.isNotEmpty)) {
         _syncIncrementAccess(type, identifier, spaceName: spaceName);
         return;
       }
@@ -401,27 +397,41 @@ class WeightManager {
   /// Internal synchronous increment (assumes weights are loaded)
   void _syncIncrementAccess(WeightType type, String identifier,
       {String? spaceName}) {
-    final cache = _weightCache[type]!;
     final now = DateTime.now().millisecondsSinceEpoch;
 
-    if (cache.containsKey(identifier)) {
-      // Update existing weight data
-      final existing = cache[identifier]!;
-      cache[identifier] = existing.copyWith(
-        accessCount: existing.accessCount + 1,
-        lastUpdateTime: now,
-      );
+    if (type == WeightType.tableRecord) {
+      final key = TableUid(identifier);
+      final existing = _tableRecordWeights[key];
+      if (existing != null) {
+        _tableRecordWeights[key] = existing.copyWith(
+          accessCount: existing.accessCount + 1,
+          lastUpdateTime: now,
+        );
+      } else {
+        _tableRecordWeights[key] = WeightData(
+          weight: 0,
+          accessCount: 1,
+          lastUpdateTime: now,
+          neverDecay: false,
+        );
+      }
     } else {
-      // Create new weight data
-      cache[identifier] = WeightData(
-        weight: 0,
-        accessCount: 1,
-        lastUpdateTime: now,
-        neverDecay: false,
-      );
+      final existing = _indexDataWeights[identifier];
+      if (existing != null) {
+        _indexDataWeights[identifier] = existing.copyWith(
+          accessCount: existing.accessCount + 1,
+          lastUpdateTime: now,
+        );
+      } else {
+        _indexDataWeights[identifier] = WeightData(
+          weight: 0,
+          accessCount: 1,
+          lastUpdateTime: now,
+          neverDecay: false,
+        );
+      }
     }
 
-    // Mark as dirty and notify activity
     _onMutation();
   }
 
@@ -432,7 +442,9 @@ class WeightManager {
     String? spaceName,
   }) async {
     await _ensureWeightsLoaded(spaceName: spaceName);
-    final data = _weightCache[type]![identifier];
+    final data = type == WeightType.tableRecord
+        ? _tableRecordWeights[TableUid(identifier)]
+        : _indexDataWeights[identifier];
     if (data == null) return 0;
     return data.customWeight ?? data.weight;
   }
@@ -444,7 +456,9 @@ class WeightManager {
     String? spaceName,
   }) async {
     await _ensureWeightsLoaded(spaceName: spaceName);
-    final data = _weightCache[type]![identifier];
+    final data = type == WeightType.tableRecord
+        ? _tableRecordWeights[TableUid(identifier)]
+        : _indexDataWeights[identifier];
     if (data == null) return 0;
     return data.accessCount;
   }
@@ -459,30 +473,47 @@ class WeightManager {
   }) async {
     await _ensureWeightsLoaded(spaceName: spaceName);
 
-    final cache = _weightCache[type]!;
     final now = DateTime.now().millisecondsSinceEpoch;
 
-    if (cache.containsKey(identifier)) {
-      final existing = cache[identifier]!;
-      cache[identifier] = existing.copyWith(
-        customWeight: weight,
-        neverDecay: neverDecay,
-        lastUpdateTime: now,
-      );
+    if (type == WeightType.tableRecord) {
+      final key = TableUid(identifier);
+      final existing = _tableRecordWeights[key];
+      if (existing != null) {
+        _tableRecordWeights[key] = existing.copyWith(
+          customWeight: weight,
+          neverDecay: neverDecay,
+          lastUpdateTime: now,
+        );
+      } else {
+        _tableRecordWeights[key] = WeightData(
+          weight: weight ?? 0,
+          accessCount: 0,
+          lastUpdateTime: now,
+          neverDecay: neverDecay,
+          customWeight: weight,
+        );
+      }
+      _updateHighWeightCache(type, key);
     } else {
-      cache[identifier] = WeightData(
-        weight: weight ?? 0,
-        accessCount: 0,
-        lastUpdateTime: now,
-        neverDecay: neverDecay,
-        customWeight: weight,
-      );
+      final existing = _indexDataWeights[identifier];
+      if (existing != null) {
+        _indexDataWeights[identifier] = existing.copyWith(
+          customWeight: weight,
+          neverDecay: neverDecay,
+          lastUpdateTime: now,
+        );
+      } else {
+        _indexDataWeights[identifier] = WeightData(
+          weight: weight ?? 0,
+          accessCount: 0,
+          lastUpdateTime: now,
+          neverDecay: neverDecay,
+          customWeight: weight,
+        );
+      }
+      _updateHighWeightCache(type, identifier);
     }
 
-    // Update high weight cache
-    _updateHighWeightCache(type, identifier);
-
-    // Mark as dirty and notify activity
     _onMutation();
   }
 
@@ -497,8 +528,9 @@ class WeightManager {
 
     // Use cache for quick query
     if (threshold == 0.7) {
-      // Default threshold, use cache
-      return _highWeightCache[type]!.contains(identifier);
+      return type == WeightType.tableRecord
+          ? _highWeightTableRecords.contains(TableUid(identifier))
+          : _highWeightIndexData.contains(identifier);
     }
 
     // Custom threshold, need to calculate
@@ -506,9 +538,6 @@ class WeightManager {
     final maxWeight = 100;
     return weight >= (maxWeight * threshold).round();
   }
-
-  /// Get table record identifier
-  String _getTableRecordKey(TableUid tableUid) => tableUid;
 
   /// Index weight cache key: [tableUid]:[indexUid].
   static String indexDataIdentifier(TableUid tableUid, IndexUid indexUid) =>
@@ -521,17 +550,16 @@ class WeightManager {
   /// Merge weight from [fromKey] into [toKey] (used for legacy key migration).
   void _mergeIndexWeightKey(String fromKey, String toKey) {
     if (fromKey == toKey) return;
-    final cache = _weightCache[WeightType.indexData]!;
-    final from = cache.remove(fromKey);
+    final from = _indexDataWeights.remove(fromKey);
     if (from == null) return;
 
-    final existing = cache[toKey];
+    final existing = _indexDataWeights[toKey];
     if (existing == null) {
-      cache[toKey] = from;
+      _indexDataWeights[toKey] = from;
       return;
     }
 
-    cache[toKey] = WeightData(
+    _indexDataWeights[toKey] = WeightData(
       weight: from.weight > existing.weight ? from.weight : existing.weight,
       accessCount: from.accessCount + existing.accessCount,
       lastUpdateTime: from.lastUpdateTime > existing.lastUpdateTime
@@ -552,7 +580,7 @@ class WeightManager {
     final legacyKey = '$tableUid:$legacySuffix';
     final uidKey = _getIndexDataKey(tableUid, indexUid);
     if (legacyKey == uidKey) return false;
-    if (!_weightCache[WeightType.indexData]!.containsKey(legacyKey)) {
+    if (!_indexDataWeights.containsKey(legacyKey)) {
       return false;
     }
     _mergeIndexWeightKey(legacyKey, uidKey);
@@ -561,7 +589,7 @@ class WeightManager {
 
   /// In-memory check: any indexData key whose suffix is not a stable [IndexUid].
   bool _hasLegacyIndexDataKeysInCache() {
-    for (final key in _weightCache[WeightType.indexData]!.keys) {
+    for (final key in _indexDataWeights.keys) {
       final colon = key.indexOf(':');
       if (colon <= 0 || colon >= key.length - 1) continue;
       if (!IndexUid(key.substring(colon + 1)).looksLikeStableUid) {
@@ -616,7 +644,7 @@ class WeightManager {
       }
 
       // Sweep orphan keys whose suffix is not a stable uid.
-      final indexCache = _weightCache[WeightType.indexData]!;
+      final indexCache = _indexDataWeights;
       final keysToProcess = indexCache.keys.toList(growable: false);
       for (final key in keysToProcess) {
         await yieldController.maybeYield();
@@ -646,40 +674,129 @@ class WeightManager {
     if (!_initialized) {
       await initialize();
     }
-    // If cache is empty, try to load
-    if (_weightCache[WeightType.tableRecord]!.isEmpty &&
-        _weightCache[WeightType.indexData]!.isEmpty) {
+    if (_tableRecordWeights.isEmpty && _indexDataWeights.isEmpty) {
       await _loadWeights(spaceName: spaceName);
     }
   }
 
   /// Rebuild high weight cache
   void _rebuildHighWeightCache() {
-    _highWeightCache[WeightType.tableRecord]!.clear();
-    _highWeightCache[WeightType.indexData]!.clear();
+    _highWeightTableRecords.clear();
+    _highWeightIndexData.clear();
 
-    for (final type in WeightType.values) {
-      final cache = _weightCache[type]!;
-      for (final entry in cache.entries) {
-        _updateHighWeightCache(type, entry.key);
-      }
+    for (final entry in _tableRecordWeights.entries) {
+      _updateHighWeightCache(WeightType.tableRecord, entry.key);
+    }
+    for (final entry in _indexDataWeights.entries) {
+      _updateHighWeightCache(WeightType.indexData, entry.key);
     }
   }
 
   /// Update high weight cache
-  void _updateHighWeightCache(WeightType type, String identifier) {
-    final data = _weightCache[type]![identifier];
+  void _updateHighWeightCache(WeightType type, Object identifier) {
+    if (type == WeightType.tableRecord) {
+      final key = identifier as TableUid;
+      final data = _tableRecordWeights[key];
+      if (data == null) {
+        _highWeightTableRecords.remove(key);
+        return;
+      }
+      final weight = data.customWeight ?? data.weight;
+      final threshold = (100 * 0.7).round();
+      if (weight >= threshold) {
+        _highWeightTableRecords.add(key);
+      } else {
+        _highWeightTableRecords.remove(key);
+      }
+      return;
+    }
+
+    final key = identifier as String;
+    final data = _indexDataWeights[key];
     if (data == null) {
-      _highWeightCache[type]!.remove(identifier);
+      _highWeightIndexData.remove(key);
       return;
     }
 
     final weight = data.customWeight ?? data.weight;
-    final threshold = (100 * 0.7).round(); // 70%
+    final threshold = (100 * 0.7).round();
     if (weight >= threshold) {
-      _highWeightCache[type]!.add(identifier);
+      _highWeightIndexData.add(key);
     } else {
-      _highWeightCache[type]!.remove(identifier);
+      _highWeightIndexData.remove(key);
+    }
+  }
+
+  /// Decay weights for one cache bucket.
+  Future<void> _decayWeightCache<K>(
+    WeightType type,
+    Map<K, WeightData> cache,
+    int now,
+    YieldController yieldController,
+  ) async {
+    if (cache.isEmpty) return;
+
+    final candidates = <K, WeightData>{};
+    for (final entry in cache.entries) {
+      await yieldController.maybeYield();
+      if (!entry.value.neverDecay && entry.value.accessCount > 0) {
+        candidates[entry.key] = entry.value;
+      }
+    }
+    if (candidates.isEmpty) return;
+
+    final sorted = candidates.entries.toList()
+      ..sort((a, b) => b.value.accessCount.compareTo(a.value.accessCount));
+
+    final totalCount = sorted.length;
+    final top50Count = (totalCount * 0.5).ceil();
+    final top50 = sorted.take(top50Count).toList();
+    final bottom50 = sorted.skip(top50Count).toList();
+
+    if (top50.isNotEmpty) {
+      final maxAccessCount = top50.first.value.accessCount;
+      if (maxAccessCount > 0) {
+        for (final entry in top50) {
+          await yieldController.maybeYield();
+
+          final data = entry.value;
+          final score = (data.accessCount * 100 / maxAccessCount).round();
+          final weightIncrease = (data.weight * 0.1).round();
+          final newWeight =
+              (data.weight + weightIncrease + score).clamp(0, 100);
+
+          cache[entry.key] = data.copyWith(
+            weight: newWeight,
+            accessCount: 0,
+            lastUpdateTime: now,
+          );
+          _updateHighWeightCache(type, entry.key as Object);
+        }
+      }
+    }
+
+    if (bottom50.isNotEmpty) {
+      final maxAccessCount = top50.isNotEmpty
+          ? top50.first.value.accessCount
+          : bottom50.first.value.accessCount;
+      if (maxAccessCount > 0) {
+        for (final entry in bottom50) {
+          await yieldController.maybeYield();
+
+          final data = entry.value;
+          final score = (data.accessCount * 100 / maxAccessCount).round();
+          final weightDecrease = (data.weight * 0.1).round();
+          final newWeight =
+              (data.weight - weightDecrease - score).clamp(0, 100);
+
+          cache[entry.key] = data.copyWith(
+            weight: newWeight,
+            accessCount: 0,
+            lastUpdateTime: now,
+          );
+          _updateHighWeightCache(type, entry.key as Object);
+        }
+      }
     }
   }
 
@@ -692,86 +809,18 @@ class WeightManager {
       final now = DateTime.now().millisecondsSinceEpoch;
 
       // Process each type separately
-      for (final type in WeightType.values) {
-        await yieldController.maybeYield();
-
-        final cache = _weightCache[type]!;
-        if (cache.isEmpty) continue;
-
-        // Collect weight data that needs to be decayed (excluding never decaying)
-        final candidates = <String, WeightData>{};
-        for (final entry in cache.entries) {
-          if (!entry.value.neverDecay && entry.value.accessCount > 0) {
-            candidates[entry.key] = entry.value;
-          }
-        }
-
-        if (candidates.isEmpty) continue;
-
-        // Sort by access count
-        final sorted = candidates.entries.toList()
-          ..sort((a, b) => b.value.accessCount.compareTo(a.value.accessCount));
-
-        // Calculate 50% boundary
-        final totalCount = sorted.length;
-        final top50Count = (totalCount * 0.5).ceil();
-        final top50 = sorted.take(top50Count).toList();
-        final bottom50 = sorted.skip(top50Count).toList();
-
-        // Process前50%
-        if (top50.isNotEmpty) {
-          final maxAccessCount = top50.first.value.accessCount;
-          if (maxAccessCount > 0) {
-            for (final entry in top50) {
-              await yieldController.maybeYield();
-
-              final data = entry.value;
-              // Calculate score (0-100)
-              final score = (data.accessCount * 100 / maxAccessCount).round();
-              // Increase weight (10% of old weight cumulative value)
-              final weightIncrease = (data.weight * 0.1).round();
-              final newWeight =
-                  (data.weight + weightIncrease + score).clamp(0, 100);
-
-              cache[entry.key] = data.copyWith(
-                weight: newWeight,
-                accessCount: 0, // Reset access count
-                lastUpdateTime: now,
-              );
-
-              _updateHighWeightCache(type, entry.key);
-            }
-          }
-        }
-
-        // Process last 50% (deduction)
-        if (bottom50.isNotEmpty) {
-          final maxAccessCount = top50.isNotEmpty
-              ? top50.first.value.accessCount
-              : bottom50.first.value.accessCount;
-          if (maxAccessCount > 0) {
-            for (final entry in bottom50) {
-              await yieldController.maybeYield();
-
-              final data = entry.value;
-              // Calculate score (relative to highest access count)
-              final score = (data.accessCount * 100 / maxAccessCount).round();
-              // Decrease weight (10% of old weight cumulative value)
-              final weightDecrease = (data.weight * 0.1).round();
-              final newWeight =
-                  (data.weight - weightDecrease - score).clamp(0, 100);
-
-              cache[entry.key] = data.copyWith(
-                weight: newWeight,
-                accessCount: 0, // Reset access count
-                lastUpdateTime: now,
-              );
-
-              _updateHighWeightCache(type, entry.key);
-            }
-          }
-        }
-      }
+      await _decayWeightCache(
+        WeightType.tableRecord,
+        _tableRecordWeights,
+        now,
+        yieldController,
+      );
+      await _decayWeightCache(
+        WeightType.indexData,
+        _indexDataWeights,
+        now,
+        yieldController,
+      );
 
       // Update last decay time
       _lastDecayTime = now;
@@ -791,8 +840,11 @@ class WeightManager {
   }) async {
     await _ensureWeightsLoaded(spaceName: spaceName);
 
-    final cache = _weightCache[type]!;
-    final entries = cache.entries.toList();
+    final entries = type == WeightType.tableRecord
+        ? _tableRecordWeights.entries
+            .map((e) => MapEntry<String, WeightData>(e.key.value, e.value))
+            .toList()
+        : _indexDataWeights.entries.toList();
 
     entries.sort((a, b) {
       final weightA = a.value.customWeight ?? a.value.weight;
@@ -811,18 +863,17 @@ class WeightManager {
     bool changed = false;
 
     // 1. Remove table record weight
-    if (_weightCache[WeightType.tableRecord]!.containsKey(tableUid)) {
-      _weightCache[WeightType.tableRecord]!.remove(tableUid);
+    if (_tableRecordWeights.containsKey(tableUid)) {
+      _tableRecordWeights.remove(tableUid);
       changed = true;
     }
 
     // 2. Remove index weights
-    final indexCache = _weightCache[WeightType.indexData]!;
     final prefix = '$tableUid:';
     final keysToRemove =
-        indexCache.keys.where((k) => k.startsWith(prefix)).toList();
+        _indexDataWeights.keys.where((k) => k.startsWith(prefix)).toList();
     for (final key in keysToRemove) {
-      indexCache.remove(key);
+      _indexDataWeights.remove(key);
       changed = true;
     }
 
