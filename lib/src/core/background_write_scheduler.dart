@@ -316,13 +316,6 @@ class BackgroundWriteScheduler {
     }
   }
 
-  /// Rename table for queued background write entries.
-  ///
-  /// Queue keys and entries use stable [table.tableUid], so table rename is a no-op.
-  Future<void> renameTable(TableContext table) async {
-    // Entries and lookup maps are keyed by stable tableUid; nothing to remap.
-  }
-
   /// Clear all pending entries in the scheduler.
   void clearAll() {
     _queue.clear();
