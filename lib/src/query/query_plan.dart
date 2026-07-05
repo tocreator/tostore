@@ -1,3 +1,5 @@
+import '../model/table_identity.dart';
+import '../model/table_context.dart';
 import 'cost_estimator.dart';
 
 /// query plan
@@ -27,14 +29,13 @@ class QueryPlan {
   }
 
   /// get estimated number of rows
-  int estimatedRows(CostEstimator estimator) {
+  int estimatedRows(CostEstimator estimator, TableContext table) {
     final v = operation.value;
     if (v is Map<String, dynamic>) {
-      final tableName = (v['table'] as String?) ?? '';
       final where = v['where'] as Map<String, dynamic>?;
-      return estimator.estimateCardinality(tableName, where);
+      return estimator.estimateCardinality(table, where);
     }
-    return estimator.estimateCardinality('', null);
+    return estimator.estimateCardinality(table, null);
   }
 
   /// get query plan description
@@ -55,7 +56,7 @@ class QueryPlan {
       case QueryOperationType.indexScan:
         final v = operation.value;
         final where = (v is Map<String, dynamic>) ? v['where'] : null;
-        return 'INDEX SCAN using ${operation.indexUid} with conditions: $where';
+        return 'INDEX SCAN with conditions: $where';
       case QueryOperationType.union:
         final v = operation.value;
         final table = (v is Map<String, dynamic>) ? (v['table'] ?? '') : '';
@@ -82,7 +83,7 @@ class QueryPlan {
 /// query operation
 class QueryOperation {
   final QueryOperationType type;
-  final String? indexUid;
+  final IndexUid? indexUid;
   final dynamic value;
 
   QueryOperation({
@@ -94,8 +95,8 @@ class QueryOperation {
   @override
   String toString() {
     final parts = [type.toString().split('.').last];
-    if (indexUid != null) {
-      parts.add('indexUid: $indexUid');
+    if (indexUid != null && indexUid!.isNotEmpty) {
+      parts.add('index: selected');
     }
     if (value != null) {
       parts.add('value: $value');
