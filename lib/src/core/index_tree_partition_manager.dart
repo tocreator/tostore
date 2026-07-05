@@ -83,7 +83,7 @@ final class IndexTreePartitionManager {
   String _indexDisplayName(TableContext table, IndexUid indexUid) {
     final idx =
         _dataStore.schemaManager?.findIndexSchemaByUid(table.schema, indexUid);
-    return idx?.actualIndexName ?? indexUid.value;
+    return idx?.actualIndexName ?? 'index';
   }
 
   /// Estimate size in bytes for a LeafPage
