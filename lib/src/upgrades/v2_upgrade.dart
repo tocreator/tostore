@@ -694,8 +694,7 @@ class V2Upgrade {
       throw DbException([
         SchemaValidationStatus(
           type: ResultType.devTableNotFound,
-          message:
-              'Route entry tableUid: $tableUid not found for table: $tableName',
+          message: 'Route entry not found for table: $tableName',
           tableName: tableName,
         )
       ]);
