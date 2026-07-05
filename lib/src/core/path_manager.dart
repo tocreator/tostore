@@ -130,11 +130,13 @@ class PathManager {
 
     final route = dataStore.schemaManager?.getRouteByUid(tableUid);
     if (route == null) {
+      final displayName =
+          dataStore.schemaManager?.getNameByUid(tableUid)?.value ?? 'unknown';
       throw DbException([
         SchemaValidationStatus(
           type: ResultType.devTableNotFound,
-          message: 'Table Route Entry not found for table: $uid',
-          tableName: uid,
+          message: 'Table Route Entry not found for table: $displayName',
+          tableName: displayName,
         ),
       ]);
     }
