@@ -981,8 +981,7 @@ class SchemaManager {
         return existingRoute.partitionIndex;
       }
 
-      final existingPartitions =
-          meta.routes.map((r) => r.partitionIndex).toSet().toList()..sort();
+      final existingPartitions = _partitionDirIndexMap.keys.toList()..sort();
       for (final partitionIndex in existingPartitions) {
         int? size = _partitionSizes[partitionIndex];
         if (size == null) {
@@ -1000,8 +999,7 @@ class SchemaManager {
       return existingPartitions.isEmpty ? 0 : existingPartitions.last + 1;
     } catch (e) {
       Logger.error('Failed to find suitable partition', rawError: e);
-      final existingPartitions =
-          meta.routes.map((r) => r.partitionIndex).toSet().toList()..sort();
+      final existingPartitions = _partitionDirIndexMap.keys.toList()..sort();
       return existingPartitions.isEmpty ? 0 : existingPartitions.last + 1;
     }
   }
@@ -1147,10 +1145,10 @@ class SchemaManager {
           .writeAsString(partitionPath, jsonEncode(updatedMeta.toJson()));
       _partitionSizes[targetPartition] = updatedMeta.fileSizeInBytes;
 
-      int idx = meta.routes.indexWhere((r) => r.tableUid == tableUidStr);
+      final oldRoute = routeByUid[tableUidStr];
       int finalDataDirIndex = dataDirIndex ??
-          ((idx >= 0)
-              ? meta.routes[idx].dataDirIndex
+          (oldRoute != null
+              ? oldRoute.dataDirIndex
               : allocateDataDirIndex(schema.isGlobal));
 
       final routeEntry = TableSchemaRouteEntry(
@@ -1162,6 +1160,7 @@ class SchemaManager {
         isGlobal: schema.isGlobal,
       );
 
+      int idx = meta.routes.indexWhere((r) => r.tableUid == tableUidStr);
       if (idx >= 0) {
         meta.routes[idx] = routeEntry;
       } else {
@@ -1194,20 +1193,36 @@ class SchemaManager {
 
   /// read table schema by stable uid
   Future<TableSchema?> getTableSchema(TableUid tableUid) async {
+    if (tableUid.isEmpty) return null;
+
+    // 1. Hot cached path: O(1) memory lookup with zero extra overhead
     final cached = getCachedTableSchema(tableUid);
     if (cached != null) return cached;
 
-    final existing = _schemaLoadingFutures[tableUid];
+    // 2. Slow path: Check route and resolve legacy tableName fallbacks
+    var targetUid = tableUid;
+    var route = getRouteByUid(targetUid);
+    if (route == null) {
+      final resolvedUid =
+          await resolveTableUidFromName(TableName(tableUid.value));
+      if (resolvedUid != null) {
+        targetUid = resolvedUid;
+        final realCached = getCachedTableSchema(targetUid);
+        if (realCached != null) return realCached;
+      }
+    }
+
+    final existing = _schemaLoadingFutures[targetUid];
     if (existing != null) {
       return existing;
     }
 
-    final loadFuture = _doLoadTableSchema(tableUid);
-    _schemaLoadingFutures[tableUid] = loadFuture;
+    final loadFuture = _doLoadTableSchema(targetUid);
+    _schemaLoadingFutures[targetUid] = loadFuture;
     try {
       return await loadFuture;
     } finally {
-      _schemaLoadingFutures.remove(tableUid);
+      _schemaLoadingFutures.remove(targetUid);
     }
   }
 
@@ -1559,8 +1574,7 @@ class SchemaManager {
   Future<Map<String, dynamic>> getPartitionStats() async {
     try {
       final meta = await getSchemaMeta();
-      final uniquePartitions =
-          meta.routes.map((r) => r.partitionIndex).toSet().toList();
+      final uniquePartitions = _partitionDirIndexMap.keys.toList();
 
       final result = <String, dynamic>{
         'totalTables': meta.routes.length,
@@ -1611,8 +1625,7 @@ class SchemaManager {
         return true;
       }
 
-      final uniquePartitions =
-          meta.routes.map((r) => r.partitionIndex).toSet().toList();
+      final uniquePartitions = _partitionDirIndexMap.keys.toList();
 
       if (uniquePartitions.isEmpty) {
         Logger.debug('No partition info, skip optimization');
