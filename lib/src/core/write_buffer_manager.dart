@@ -71,12 +71,12 @@ UniqueViolation _uniqueViolationForKeyRef(
   UniqueKeyRef uk,
   String existingPrimaryKey,
 ) {
-  if (uk.indexUid.value == 'pk') {
+  if (uk.indexUid == IndexUid('pk')) {
     return UniqueViolation(
       tableName: table.tableName,
       fields: [table.schema.primaryKey],
       value: uk.compositeKey,
-      indexName: 'pk',
+      indexName: IndexName('pk'),
       existingPrimaryKey: existingPrimaryKey,
     );
   }
@@ -86,7 +86,7 @@ UniqueViolation _uniqueViolationForKeyRef(
     tableName: table.tableName,
     fields: idx?.fields ?? const <String>[],
     value: uk.compositeKey,
-    indexName: idx?.actualIndexName ?? uk.indexUid.value,
+    indexName: idx != null ? IndexName(idx.actualIndexName) : null,
     existingPrimaryKey: existingPrimaryKey,
   );
 }
