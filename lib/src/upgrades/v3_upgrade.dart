@@ -8,13 +8,14 @@ import '../model/table_schema.dart';
 import '../model/table_context.dart';
 import '../model/table_identity.dart';
 import '../model/meta_info.dart';
-import '../handler/space_tables_codec.dart';
+import '../handler/space_manifest_codec.dart';
+import '../model/space_manifest.dart';
 import '../model/id_generator.dart';
 
 /// Version 3 upgrade:
 /// - Restructures storage directory names from physical table/index names to stable UIDs.
 /// - Migrates TableMeta/IndexMeta files on disk.
-/// - Writes `space_tables.bin` active tables tracking.
+/// - Writes `space_manifest.bin` deferred space metadata.
 /// - Bumps version config markers and cleans up legacy map properties.
 class V3Upgrade {
   final DataStoreImpl _dataStore;
@@ -295,7 +296,7 @@ class V3Upgrade {
       }
     }
 
-    // 5. Construct and write space_tables.bin per space
+    // 5. Construct and write space_manifest.bin per space
     for (final spaceName in spaces) {
       final spaceTableUids = <TableUid>[];
       final map = spaceTableDirMaps[spaceName];
@@ -314,12 +315,14 @@ class V3Upgrade {
           }
         }
       }
-      final spaceTablesBinPath =
-          _dataStore.pathManager.getSpaceTablesBinPath(spaceName);
+      final manifestPath =
+          _dataStore.pathManager.getSpaceManifestPath(spaceName);
       await _dataStore.storage
-          .ensureDirectoryExists(path.dirname(spaceTablesBinPath));
+          .ensureDirectoryExists(path.dirname(manifestPath));
       await _dataStore.storage.writeAsBytes(
-          spaceTablesBinPath, SpaceTablesCodec.encode(spaceTableUids));
+          manifestPath,
+          SpaceManifestCodec.encode(
+              SpaceManifest(activeTableUids: spaceTableUids)));
     }
 
     if (!skipVersionBump) {
