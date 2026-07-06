@@ -1,6 +1,9 @@
 import '../handler/common.dart';
 
-/// The initialization configuration model
+/// Lightweight per-space configuration read at startup (keys, aggregate counters).
+///
+/// For deferred/large per-space data (active table inventory, future bulk stats),
+/// see [SpaceManifest] persisted as `space_manifest.bin`.
 class SpaceConfig {
   /// current encryption key info
   final EncryptionKeyInfo current;
