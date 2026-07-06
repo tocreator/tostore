@@ -288,12 +288,7 @@ class SchemaBuilder with FutureBuilderMixin<SchemaUpdateResult> {
 
       if (task == null) {
         result = SchemaUpdateResult(
-          validationStatuses: [
-            GeneralStatus(
-              type: ResultType.engError,
-              message: 'Failed to add migration task: returned task is null',
-            )
-          ],
+          validationStatuses: const [],
           taskId: null,
           estimateDuration: Duration.zero,
           writeMode: MigrationWriteMode.none,

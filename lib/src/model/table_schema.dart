@@ -94,6 +94,28 @@ class TableSchema {
   /// Get primary key name
   String get primaryKey => primaryKeyConfig.name;
 
+  /// Prepare a caller-defined schema for first-time table creation.
+  ///
+  /// Copies only the declarative shape (name, fields, indexes, …) and assigns
+  /// engine-owned identifiers. [tableUid], [schemaVersion], and [autoIndexes]
+  /// are never taken from user input; index uids are assigned later in
+  /// [SchemaManager.saveTableSchema] via [generateAutoIndexes].
+  TableSchema materializeForCreate({bool isSystemTable = false}) {
+    return TableSchema._internal(
+      name: name,
+      primaryKeyConfig: primaryKeyConfig,
+      fields: fields,
+      indexes: indexes,
+      foreignKeys: foreignKeys,
+      isGlobal: isGlobal,
+      tableId: tableId,
+      ttlConfig: ttlConfig,
+      tableUid: TableUid(GlobalIdGenerator.generate('t')),
+      schemaVersion: GlobalIdGenerator.generate('s'),
+      isSystemTable: isSystemTable,
+    );
+  }
+
   /// Returns a new map with primary key first, then other fields in original order.
   /// Use when returning rows from storage so display/serialization shows PK first.
   static Map<String, dynamic> rowWithPrimaryKeyFirst(

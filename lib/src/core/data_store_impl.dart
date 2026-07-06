@@ -1203,40 +1203,29 @@ class DataStoreImpl {
       await ensureInitialized();
     }
 
-    // Strip user-defined internal properties to prevent tampering
-    final userSchema = schema.copyWith(
-      tableUid: null,
-      isSystemTable: false,
-      schemaVersion: null,
-      autoIndexes: null,
-    );
-
-    // Generate stable internal tableUid; index uids are assigned in saveTableSchema
-    // via generateAutoIndexes().
-    final tableUid = TableUid(GlobalIdGenerator.generate("t"));
-
-    final schemaValid = userSchema.copyWith(
-      tableUid: tableUid,
-      isSystemTable: isSystemTable,
-    );
+    final tableSchema =
+        schema.materializeForCreate(isSystemTable: isSystemTable);
+    final tableUid = tableSchema.tableUid;
 
     try {
       // Check if table already exists
-      final tableExists = await this.tableExists(schema.name);
+      final tableExists = await this.tableExists(tableSchema.name);
       if (tableExists) {
-        Logger.info('Table ${schema.name} already exists, skipping creation');
+        Logger.info(
+            'Table ${tableSchema.name} already exists, skipping creation');
         return finish(DbResult.error(
           type: ResultType.devSchemaTableExists,
-          message: 'Table ${schema.name} already exists',
+          message: 'Table ${tableSchema.name} already exists',
         ));
       }
 
       try {
         // Validate primary key configuration and field types
         final reservedSystemTableNames = SystemTable.systemTableNames;
-        final bool isKnownSystemTable = SystemTable.isSystemTable(schema.name);
+        final bool isKnownSystemTable =
+            SystemTable.isSystemTable(tableSchema.name);
         final bool allowSystemSchema = isKnownSystemTable || isSystemTable;
-        schemaValid.validateTableSchema(
+        tableSchema.validateTableSchema(
           reservedTableNames: reservedSystemTableNames,
           allowReservedTableNames: allowSystemSchema,
           allowInternalTableNamePrefix: allowSystemSchema,
@@ -1244,7 +1233,7 @@ class DataStoreImpl {
         );
 
         // Validate foreign key constraints with referenced tables
-        for (final fk in schemaValid.foreignKeys) {
+        for (final fk in tableSchema.foreignKeys) {
           if (!fk.enabled) continue;
 
           final referencedSchema = await schemaManager
@@ -1254,41 +1243,41 @@ class DataStoreImpl {
               SchemaValidationStatus(
                 type: ResultType.devTableNotFound,
                 message:
-                    'Cannot create table ${schema.name}: Referenced table ${fk.referencedTable} does not exist for foreign key ${fk.actualName}',
-                tableName: schema.name,
+                    'Cannot create table ${tableSchema.name}: Referenced table ${fk.referencedTable} does not exist for foreign key ${fk.actualName}',
+                tableName: tableSchema.name,
                 field: fk.fields.join(','),
                 wrongValue: fk.referencedTable,
               ),
             ]);
           }
 
-          if (schemaValid.isGlobal != referencedSchema.isGlobal) {
+          if (tableSchema.isGlobal != referencedSchema.isGlobal) {
             throw DbException([
               SchemaValidationStatus(
                 type: ResultType.devInvalidSchemaSpaceMismatch,
                 message:
-                    'Space mismatch in foreign key "${fk.actualName}" of table "${schema.name}": '
-                    '${schema.name} is ${schema.isGlobal ? "global" : "space-specific"} but '
+                    'Space mismatch in foreign key "${fk.actualName}" of table "${tableSchema.name}": '
+                    '${tableSchema.name} is ${tableSchema.isGlobal ? "global" : "space-specific"} but '
                     'referenced table ${fk.referencedTable} is ${referencedSchema.isGlobal ? "global" : "space-specific"}. '
                     'Foreign key relationships across global and space boundaries are not allowed.',
-                tableName: schema.name,
+                tableName: tableSchema.name,
                 field: fk.fields.join(','),
                 wrongValue: {
-                  'tableIsGlobal': schema.isGlobal,
+                  'tableIsGlobal': tableSchema.isGlobal,
                   'referencedTableIsGlobal': referencedSchema.isGlobal,
                 },
               ),
             ]);
           }
 
-          if (!schemaValid.validateForeignKeyWithReferencedTable(
+          if (!tableSchema.validateForeignKeyWithReferencedTable(
               fk, referencedSchema)) {
             throw DbException([
               SchemaValidationStatus(
                 type: ResultType.devInvalidSchemaForeignKey,
                 message:
-                    'Invalid foreign key ${fk.actualName} in table ${schema.name}: Field type mismatch or invalid configuration',
-                tableName: schema.name,
+                    'Invalid foreign key ${fk.actualName} in table ${tableSchema.name}: Field type mismatch or invalid configuration',
+                tableName: tableSchema.name,
                 field: fk.fields.join(','),
               ),
             ]);
@@ -1297,19 +1286,17 @@ class DataStoreImpl {
 
         // Write schema file and register routing
         final tableCtx = TableContext(
-          tableUid: TableUid(tableUid),
-          tableName: TableName(schema.name),
-          isGlobal: schema.isGlobal,
-          dataDirIndex:
-              schemaManager!.getTableSchemaDirIndex(TableUid(tableUid)) ?? 0,
-          schema: schemaValid,
+          tableUid: tableUid,
+          tableName: TableName(tableSchema.name),
+          isGlobal: tableSchema.isGlobal,
+          dataDirIndex: schemaManager!.getTableSchemaDirIndex(tableUid) ?? 0,
+          schema: tableSchema,
         );
-        await schemaManager?.saveTableSchema(tableCtx, schemaValid);
+        await schemaManager?.saveTableSchema(tableCtx, tableSchema);
 
         // Initialize B+Tree index metadata (empty table — no full-table scan).
         final persistedSchema =
-            schemaManager?.getCachedTableSchema(TableUid(tableUid)) ??
-                tableCtx.schema;
+            schemaManager?.getCachedTableSchema(tableUid) ?? tableCtx.schema;
         final btreeIndexes =
             schemaManager?.getBtreeIndexesFor(persistedSchema) ??
                 <IndexSchema>[];
@@ -1321,28 +1308,28 @@ class DataStoreImpl {
 
         // Auto-create indexes for foreign keys
         if (_foreignKeyManager != null &&
-            !SystemTable.isSystemTable(schema.name)) {
+            !SystemTable.isSystemTable(tableSchema.name)) {
           await _foreignKeyManager!
-              .updateSystemTableForTable(tableCtx, schemaValid);
+              .updateSystemTableForTable(tableCtx, tableSchema);
         }
 
         // New table created successfully, call table creation statistics method
         tableDataManager.tableCreated(tableCtx);
 
-        if (!SystemTable.isSystemTable(schema.name)) {
+        if (!SystemTable.isSystemTable(tableSchema.name)) {
           Logger.info(
-            'Table ${schema.name} created successfully${schema.isGlobal ? ' (global)' : ' (space)'}',
+            'Table ${tableSchema.name} created successfully${tableSchema.isGlobal ? ' (global)' : ' (space)'}',
           );
         }
 
         return finish(DbResult.success(
-          successKey: schema.name,
-          message: 'Table ${schema.name} created successfully',
+          successKey: tableSchema.name,
+          message: 'Table ${tableSchema.name} created successfully',
         ));
       } catch (e) {
         // Cleanup schema
         if (schemaManager != null) {
-          await schemaManager!.deleteTableSchema(TableUid(tableUid));
+          await schemaManager!.deleteTableSchema(tableUid);
         }
 
         Logger.error('Create table failed', rawError: e);

@@ -1089,10 +1089,17 @@ class SchemaManager {
       final currentSchema = await getTableSchema(schema.tableUid);
       schema = schema.generateAutoIndexes(oldSchema: currentSchema);
 
-      if (schema.schemaVersion == null) {
-        schema = schema.copyWith(
-          schemaVersion: GlobalIdGenerator.generate("s"),
-        );
+      // schemaVersion bumps are owned by migration tasks (or explicit createTable
+      // initialization). Incidental saves preserve the persisted version.
+      if (schema.schemaVersion == null || schema.schemaVersion!.isEmpty) {
+        final preserved = currentSchema?.schemaVersion;
+        if (preserved != null && preserved.isNotEmpty) {
+          schema = schema.copyWith(schemaVersion: preserved);
+        } else {
+          schema = schema.copyWith(
+            schemaVersion: GlobalIdGenerator.generate("s"),
+          );
+        }
       }
 
       final meta = await getSchemaMeta();
