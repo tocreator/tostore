@@ -78,10 +78,10 @@ class PathManager {
     return pathJoin(spacePath, 'space_config.json');
   }
 
-  /// get space tables active list binary path
-  String getSpaceTablesBinPath(String spaceName) {
+  /// Deferred per-space metadata (inventory, large stats). Loaded asynchronously.
+  String getSpaceManifestPath(String spaceName) {
     final spacePath = getSpacePath(spaceName: spaceName);
-    return pathJoin(spacePath, 'space_tables.bin');
+    return pathJoin(spacePath, 'space_manifest.bin');
   }
 
   /// Get weight file path
