@@ -166,10 +166,83 @@ class PlatformHandlerImpl implements PlatformInterface {
     return _cachedIsLinux!;
   }
 
+  @override
   bool get isServerEnvironment {
     if (_cachedIsServerEnvironment == null) {
       try {
-        _cachedIsServerEnvironment = isLinux;
+        final env = Platform.environment;
+
+        // 1. Explicit user override env var (highest priority, supports all platforms)
+        if (env['TOSTORE_SERVER_MODE'] == 'true' ||
+            env['DATABASE_ENV'] == 'server') {
+          _cachedIsServerEnvironment = true;
+          return true;
+        }
+
+        if (isLinux) {
+          // 2a. Fast in-memory container/cloud check (no File I/O)
+          // Docker, K8s, AWS Lambda, Google Cloud Run, Azure Functions, Vercel, Heroku, etc.
+          final containerEnvVars = [
+            'KUBERNETES_SERVICE_HOST',
+            'K_SERVICE',
+            'LAMBDA_TASK_ROOT',
+            'AWS_LAMBDA_FUNCTION_NAME',
+            'FUNCTIONS_WORKER_RUNTIME',
+            'VERCEL',
+            'HEROKU_APP_DIR',
+            'container'
+          ];
+          for (final key in containerEnvVars) {
+            if (env.containsKey(key)) {
+              _cachedIsServerEnvironment = true;
+              return true;
+            }
+          }
+
+          // 2b. Containerized environment fallback via filesystem checks
+          bool isContainer = false;
+          try {
+            if (File('/.dockerenv').existsSync()) {
+              isContainer = true;
+            } else {
+              final cgroup = File('/proc/1/cgroup');
+              if (cgroup.existsSync()) {
+                final content = cgroup.readAsStringSync();
+                if (content.contains('docker') ||
+                    content.contains('kubepods') ||
+                    content.contains('container')) {
+                  isContainer = true;
+                }
+              }
+            }
+          } catch (_) {
+            // Ignore filesystem errors for sandbox safety
+          }
+
+          if (isContainer) {
+            _cachedIsServerEnvironment = true;
+            return true;
+          }
+
+          // 3. Headless environment check (missing X11/Wayland display server)
+          final hasDisplay =
+              env.containsKey('DISPLAY') || env.containsKey('WAYLAND_DISPLAY');
+
+          // 4. Executable check: if running via standard 'dart' VM or AOT runtime instead of
+          // a compiled GUI application binary (e.g. Flutter app), it is a server process.
+          final execName =
+              path.basename(Platform.resolvedExecutable).toLowerCase();
+          final isDartVm = execName == 'dart' || execName == 'dartaotruntime';
+
+          if (!hasDisplay || isDartVm) {
+            _cachedIsServerEnvironment = true;
+          } else {
+            _cachedIsServerEnvironment = false;
+          }
+        } else {
+          // Non-Linux platforms default to client/desktop/mobile unless explicitly overridden
+          _cachedIsServerEnvironment = false;
+        }
       } catch (e) {
         _cachedIsServerEnvironment = false;
         Logger.warn('Error detecting server environment', rawError: e);
