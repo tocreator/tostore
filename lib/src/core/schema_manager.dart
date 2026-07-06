@@ -6,7 +6,8 @@ import 'package:path/path.dart' show dirname;
 import '../handler/binary_schema_codec.dart';
 import '../handler/common.dart';
 import '../handler/logger.dart';
-import '../handler/space_tables_codec.dart';
+import '../model/space_manifest.dart';
+import '../handler/space_manifest_codec.dart';
 import '../model/db_exception.dart';
 import '../model/id_generator.dart';
 import '../model/meta_info.dart';
@@ -64,8 +65,8 @@ class SchemaManager {
   final Map<int, Set<int>> _dirPartitions = {};
   final Map<int, int> _partitionSizes = {};
 
-  /// Map of active table UIDs per space name
-  final Map<String, List<TableUid>> _activeUidsBySpace = {};
+  /// Deferred per-space metadata (inventory, large stats). Loaded asynchronously.
+  final Map<String, SpaceManifest> _manifestBySpace = {};
 
   SchemaManager(this._dataStore);
 
@@ -268,38 +269,58 @@ class SchemaManager {
     await cache.cleanup(removeRatio: ratio);
   }
 
-  /// Load space-specific active table UIDs from `space_tables.bin`.
-  Future<void> loadSpaceTables(String spaceName) async {
-    final path = _dataStore.pathManager.getSpaceTablesBinPath(spaceName);
+  /// Load deferred space metadata from `space_manifest.bin`.
+  Future<void> loadSpaceManifest(String spaceName) async {
+    final path = _dataStore.pathManager.getSpaceManifestPath(spaceName);
     if (await _dataStore.storage.existsFile(path)) {
       final bytes = await _dataStore.storage.readAsBytes(path);
-      final uids = SpaceTablesCodec.decode(bytes);
-      _activeUidsBySpace[spaceName] = uids;
+      _manifestBySpace[spaceName] = SpaceManifestCodec.decode(bytes);
       _rebuildLookups();
       return;
     }
-    _activeUidsBySpace[spaceName] = [];
+    _manifestBySpace[spaceName] = SpaceManifest.empty;
     _rebuildLookups();
   }
 
-  /// Get active UIDs for a specific space
-  Future<List<TableUid>> getActiveUidsForSpace(String spaceName) async {
-    var list = _activeUidsBySpace[spaceName];
-
-    if (list == null) {
-      await loadSpaceTables(spaceName);
-      list = _activeUidsBySpace[spaceName];
+  /// Get the deferred manifest for a space (lazy-loaded from disk).
+  Future<SpaceManifest> getSpaceManifest(String spaceName) async {
+    var manifest = _manifestBySpace[spaceName];
+    if (manifest == null) {
+      await loadSpaceManifest(spaceName);
+      manifest = _manifestBySpace[spaceName];
     }
-    return list ?? const <TableUid>[];
+    return manifest ?? SpaceManifest.empty;
   }
 
-  /// Save space-specific active table UIDs to `space_tables.bin`.
-  Future<void> saveSpaceTables(String spaceName) async {
-    final path = _dataStore.pathManager.getSpaceTablesBinPath(spaceName);
-    final uids = _activeUidsBySpace[spaceName] ?? const <TableUid>[];
-    final bytes = SpaceTablesCodec.encode(uids);
+  /// Active non-global table UIDs for a space.
+  Future<List<TableUid>> getActiveUidsForSpace(String spaceName) async {
+    final manifest = await getSpaceManifest(spaceName);
+    return manifest.activeTableUids;
+  }
+
+  /// Persist deferred space metadata to `space_manifest.bin`.
+  Future<void> saveSpaceManifest(String spaceName) async {
+    final path = _dataStore.pathManager.getSpaceManifestPath(spaceName);
+    final manifest = _manifestBySpace[spaceName] ?? SpaceManifest.empty;
+    final bytes = SpaceManifestCodec.encode(manifest);
     await _dataStore.storage.ensureDirectoryExists(dirname(path));
     await _dataStore.storage.writeAsBytes(path, bytes);
+  }
+
+  List<TableUid> _activeUidsForSpace(String spaceName) {
+    return _manifestBySpace[spaceName]?.activeTableUids ?? const <TableUid>[];
+  }
+
+  Future<void> _updateActiveTableUids(
+    String spaceName,
+    void Function(List<TableUid> uids) mutate,
+  ) async {
+    final current = List<TableUid>.from(_activeUidsForSpace(spaceName));
+    mutate(current);
+    _manifestBySpace[spaceName] =
+        (_manifestBySpace[spaceName] ?? SpaceManifest.empty)
+            .copyWith(activeTableUids: current);
+    await saveSpaceManifest(spaceName);
   }
 
   /// Rebuild fast-path lookup maps in memory based on current schemaMeta and active space tables.
@@ -331,7 +352,7 @@ class SchemaManager {
     }
 
     final activeSpace = _dataStore.currentSpaceName;
-    final activeUids = _activeUidsBySpace[activeSpace] ?? const <TableUid>[];
+    final activeUids = _activeUidsForSpace(activeSpace);
     for (final uid in activeUids) {
       final route = getRouteByUid(uid);
       if (route != null && !route.isGlobal) {
@@ -358,7 +379,7 @@ class SchemaManager {
 
     final activeSpace = _dataStore.currentSpaceName;
     final isActive = route.isGlobal ||
-        (_activeUidsBySpace[activeSpace]?.contains(route.tableUid) ?? false);
+        _activeUidsForSpace(activeSpace).contains(route.tableUid);
 
     if (isActive) {
       uidByName[route.tableName] = route.tableUid;
@@ -414,7 +435,7 @@ class SchemaManager {
     routeByUid.clear();
     uidByName.clear();
     nameByUid.clear();
-    _activeUidsBySpace.clear();
+    _manifestBySpace.clear();
     _globalDirCounts.clear();
     _nonGlobalDirCounts.clear();
     _partitionDirIndexMap.clear();
@@ -907,7 +928,7 @@ class SchemaManager {
       if (content != null && content.isNotEmpty) {
         try {
           _schemaMeta = SchemaMeta.fromJson(jsonDecode(content));
-          loadSpaceTables(_dataStore.currentSpaceName);
+          loadSpaceManifest(_dataStore.currentSpaceName);
           return _schemaMeta!;
         } catch (e) {
           Logger.error('Failed to load schema meta', rawError: e);
@@ -924,7 +945,7 @@ class SchemaManager {
       ),
     );
     await saveSchemaStructure();
-    loadSpaceTables(_dataStore.currentSpaceName);
+    loadSpaceManifest(_dataStore.currentSpaceName);
     return _schemaMeta!;
   }
 
@@ -1201,10 +1222,11 @@ class SchemaManager {
 
       if (!schema.isGlobal) {
         final currentSpace = _dataStore.currentSpaceName;
-        final list = _activeUidsBySpace.putIfAbsent(currentSpace, () => []);
-        if (!list.contains(tableUid)) {
-          list.add(tableUid);
-          await saveSpaceTables(currentSpace);
+        final activeUids = _activeUidsForSpace(currentSpace);
+        if (!activeUids.contains(tableUid)) {
+          await _updateActiveTableUids(currentSpace, (uids) {
+            uids.add(tableUid);
+          });
         }
       }
 
@@ -1284,10 +1306,12 @@ class SchemaManager {
       _registerRouteInLookups(route);
     } else {
       final currentSpace = _dataStore.currentSpaceName;
-      final list = _activeUidsBySpace.putIfAbsent(currentSpace, () => []);
-      if (!list.contains(route.tableUid)) {
-        list.add(route.tableUid);
-        await saveSpaceTables(currentSpace);
+      final tableUid = route.tableUid;
+      final activeUids = _activeUidsForSpace(currentSpace);
+      if (!activeUids.contains(tableUid)) {
+        await _updateActiveTableUids(currentSpace, (uids) {
+          uids.add(tableUid);
+        });
       }
       _registerRouteInLookups(route);
     }
@@ -1394,10 +1418,10 @@ class SchemaManager {
 
         if (!route.isGlobal) {
           final currentSpace = _dataStore.currentSpaceName;
-          final list = _activeUidsBySpace[currentSpace];
-          if (list != null && list.contains(tableUid)) {
-            list.remove(tableUid);
-            await saveSpaceTables(currentSpace);
+          if (_activeUidsForSpace(currentSpace).contains(tableUid)) {
+            await _updateActiveTableUids(currentSpace, (uids) {
+              uids.remove(tableUid);
+            });
           }
         }
 
