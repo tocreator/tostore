@@ -47,6 +47,8 @@ class MigrationTask {
   final List<ResultStatus>? errors;
   // estimated migration duration
   final Duration? estimateDuration;
+  // child table index uids that need to be dropped in each space (childTableUid -> indexUids)
+  final Map<TableUid, List<IndexUid>>? referencingChildIndexesToDrop;
 
   const MigrationTask({
     required this.taskId,
@@ -68,6 +70,7 @@ class MigrationTask {
     this.specificIndexUids,
     this.errors,
     this.estimateDuration,
+    this.referencingChildIndexesToDrop,
   });
 
   /// Compatibility getter for tableName (returns old table name, falls back to target or uid)
@@ -147,6 +150,15 @@ class MigrationTask {
       estimateDuration: json['estimateDuration'] != null
           ? Duration(microseconds: json['estimateDuration'] as int)
           : null,
+      referencingChildIndexesToDrop:
+          json['referencingChildIndexesToDrop'] != null
+              ? (json['referencingChildIndexesToDrop'] as Map).map(
+                  (k, v) => MapEntry(
+                    TableUid(k as String),
+                    (v as List).map((e) => IndexUid(e as String)).toList(),
+                  ),
+                )
+              : null,
     );
   }
 
@@ -174,6 +186,9 @@ class MigrationTask {
         if (errors != null) 'errors': errors!.map((e) => e.toJson()).toList(),
         if (estimateDuration != null)
           'estimateDuration': estimateDuration!.inMicroseconds,
+        if (referencingChildIndexesToDrop != null)
+          'referencingChildIndexesToDrop': referencingChildIndexesToDrop!
+              .map((k, v) => MapEntry(k.value, v.map((e) => e.value).toList())),
       };
 
   String? checkpointKeyForSpace(String spaceName) =>
@@ -252,6 +267,7 @@ class MigrationTask {
     List<IndexUid>? specificIndexUids,
     List<ResultStatus>? errors,
     Duration? estimateDuration,
+    Map<TableUid, List<IndexUid>>? referencingChildIndexesToDrop,
   }) =>
       MigrationTask(
         taskId: taskId ?? this.taskId,
@@ -276,6 +292,8 @@ class MigrationTask {
         specificIndexUids: specificIndexUids ?? this.specificIndexUids,
         errors: errors ?? this.errors,
         estimateDuration: estimateDuration ?? this.estimateDuration,
+        referencingChildIndexesToDrop:
+            referencingChildIndexesToDrop ?? this.referencingChildIndexesToDrop,
       );
 }
 

@@ -280,12 +280,12 @@ class SchemaBuilder with FutureBuilderMixin<SchemaUpdateResult> {
           _dataStore.schemaManager?.getUidByName(TableName(_tableName));
       if (tableUid == null) {
         throw DbException([
-        SchemaValidationStatus(
-          type: ResultType.devTableNotFound,
-          message: 'Table $_tableName does not exist',
-          tableName: _tableName,
-        )
-      ]);
+          SchemaValidationStatus(
+            type: ResultType.devTableNotFound,
+            message: 'Table $_tableName does not exist',
+            tableName: _tableName,
+          )
+        ]);
       }
       final task = await _dataStore.migrationManager?.addMigrationTask(
         tableUid,

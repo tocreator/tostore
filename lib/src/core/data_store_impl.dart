@@ -1203,8 +1203,8 @@ class DataStoreImpl {
       await ensureInitialized();
     }
 
-    final tableSchema =
-        schema.materializeForCreate(isSystemTable: isSystemTable);
+    final tableSchema = schema.materializeForCreate(
+        isSystemTable: isSystemTable || SystemTable.isSystemTable(schema.name));
     final tableUid = tableSchema.tableUid;
 
     try {

@@ -101,18 +101,39 @@ class TableSchema {
   /// are never taken from user input; index uids are assigned later in
   /// [SchemaManager.saveTableSchema] via [generateAutoIndexes].
   TableSchema materializeForCreate({bool isSystemTable = false}) {
+    final cleaned = cleanInternalFields();
+    return TableSchema._internal(
+      name: cleaned.name,
+      primaryKeyConfig: cleaned.primaryKeyConfig,
+      fields: cleaned.fields,
+      indexes: cleaned.indexes,
+      foreignKeys: cleaned.foreignKeys,
+      isGlobal: cleaned.isGlobal,
+      tableId: cleaned.tableId,
+      ttlConfig: cleaned.ttlConfig,
+      tableUid: TableUid(GlobalIdGenerator.generate('t')),
+      schemaVersion: GlobalIdGenerator.generate('s'),
+      isSystemTable: isSystemTable,
+    );
+  }
+
+  /// Returns a clean copy of the schema with all internal/metadata fields stripped.
+  /// Used to ensure user-defined definitions don't carry internal metadata.
+  TableSchema cleanInternalFields() {
     return TableSchema._internal(
       name: name,
       primaryKeyConfig: primaryKeyConfig,
       fields: fields,
-      indexes: indexes,
+      indexes:
+          indexes.map((i) => i.copyWith(indexUid: IndexUid.empty)).toList(),
       foreignKeys: foreignKeys,
       isGlobal: isGlobal,
       tableId: tableId,
       ttlConfig: ttlConfig,
-      tableUid: TableUid(GlobalIdGenerator.generate('t')),
-      schemaVersion: GlobalIdGenerator.generate('s'),
-      isSystemTable: isSystemTable,
+      tableUid: TableUid.empty,
+      schemaVersion: null,
+      isSystemTable: false,
+      autoIndexes: null,
     );
   }
 
