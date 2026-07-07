@@ -124,9 +124,7 @@ class PlatformHandler {
   }
 
   /// Detect if it's a server environment
-  static bool get isServerEnvironment {
-    return isLinux;
-  }
+  static bool get isServerEnvironment => _instance.isServerEnvironment;
 
   /// Get device hardware signature for enhanced security
   /// Combines CPU, memory, and platform identifiers
