@@ -1460,7 +1460,7 @@ class IndexManager {
   }
 
   Future<bool> _tableHasPersistedRecords(TableContext table) async {
-    final meta = await _dataStore.tableDataManager.getTableMeta(table);
+    final meta = await _dataStore.tableDataManager.getTableDataMeta(table);
     return (meta?.totalRecords ?? 0) > 0;
   }
 
@@ -2043,9 +2043,9 @@ class IndexManager {
           // Get index metadata
           final meta = await getIndexMeta(table, indexUid);
           if (meta == null || meta.isBuilding || meta.totalEntries <= 0) {
-            final tableMeta =
-                await _dataStore.tableDataManager.getTableMeta(table);
-            if (tableMeta == null || tableMeta.totalRecords <= 0) {
+            final tableDataMeta =
+                await _dataStore.tableDataManager.getTableDataMeta(table);
+            if (tableDataMeta == null || tableDataMeta.totalRecords <= 0) {
               // Verified empty table on disk; no persistent conflict possible.
               continue;
             }
@@ -2505,9 +2505,10 @@ class IndexManager {
       final meta = await getIndexMeta(table, indexUid);
       if (meta == null || meta.isBuilding || meta.totalEntries <= 0) {
         // Fast path for brand new tables: if meta is missing or index is empty,
-        // and the table metadata also indicates 0 records, we can skip the heavy disk scan.
-        final tableMeta = await _dataStore.tableDataManager.getTableMeta(table);
-        if (tableMeta == null || tableMeta.totalRecords <= 0) {
+        // and the table data metadata also indicates 0 records, we can skip the heavy disk scan.
+        final tableDataMeta =
+            await _dataStore.tableDataManager.getTableDataMeta(table);
+        if (tableDataMeta == null || tableDataMeta.totalRecords <= 0) {
           // Verified empty table on disk; no persistent conflict possible.
           continue;
         }
@@ -3526,10 +3527,11 @@ class IndexManager {
       // pointers/entry counts may be unset or stale. We still allow searching.
       if (!isMemoryMode &&
           (meta.totalEntries <= 0 || meta.btreeFirstLeaf.isNull)) {
-        final tableMeta = await _dataStore.tableDataManager.getTableMeta(
+        final tableDataMeta =
+            await _dataStore.tableDataManager.getTableDataMeta(
           table,
         );
-        final persistedTableRecords = tableMeta?.totalRecords ?? 0;
+        final persistedTableRecords = tableDataMeta?.totalRecords ?? 0;
         if (persistedTableRecords > 0) {
           final indexSchema = _resolveIndexSchemaForRepair(
             schema,
