@@ -51,7 +51,7 @@ final class TableTreePartitionManager {
 
   Future<Map<String, dynamic>?> _decodeStoredRecord({
     required TableContext table,
-    required TableMeta meta,
+    required TableDataMeta meta,
     required Uint8List storedValue,
     required List<FieldStructure> fieldStruct,
     bool allowLegacyMigrationFallback = true,
@@ -316,13 +316,13 @@ final class TableTreePartitionManager {
   /// Returns an approximate number of bytes loaded into the page cache.
   Future<int> prewarmBoundaryPages(
     TableContext table, {
-    TableMeta? meta,
+    TableDataMeta? meta,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
   }) async {
     final tableUid = table.tableUid;
     final resolvedMeta =
-        meta ?? await _dataStore.tableDataManager.getTableMeta(table);
+        meta ?? await _dataStore.tableDataManager.getTableDataMeta(table);
     if (resolvedMeta == null || resolvedMeta.btreeFirstLeaf.isNull) {
       return 0;
     }
@@ -356,13 +356,13 @@ final class TableTreePartitionManager {
     return loadedBytes;
   }
 
-  Future<TableMeta> _createInitialTableMeta(TableContext table) async {
-    return TableMeta.createEmpty(tableUid: table.tableUid);
+  Future<TableDataMeta> _createInitialTableDataMeta(TableContext table) async {
+    return TableDataMeta.createEmpty(tableUid: table.tableUid);
   }
 
   /// Get partition file path using the dirIndex from partition meta.
   Future<String> _partitionFilePath(
-      TableContext table, TableMeta meta, int partitionNo) async {
+      TableContext table, TableDataMeta meta, int partitionNo) async {
     final count = meta.btreePartitionCount;
     if (partitionNo < 0 || partitionNo >= count) {
       throw DbException([
@@ -376,21 +376,21 @@ final class TableTreePartitionManager {
         .getPartitionFilePathByNo(table.tableUid, partitionNo);
   }
 
-  Future<TableMeta> _rotatePartition(TableMeta state) async {
+  Future<TableDataMeta> _rotatePartition(TableDataMeta state) async {
     final currentCount = state.btreePartitionCount;
     return state.copyWith(
       btreePartitionCount: currentCount + 1,
       // Reserve pageNo=0 for partition meta page.
-      btreeNextPageNo: TableMeta.firstDataPageNo,
+      btreeNextPageNo: TableDataMeta.firstDataPageNo,
     );
   }
 
-  TableMeta _consumeNextPageNo(TableMeta state) =>
+  TableDataMeta _consumeNextPageNo(TableDataMeta state) =>
       state.copyWith(btreeNextPageNo: state.btreeNextPageNo + 1);
 
   Future<LeafPage> _readLeafPage(
     TableContext table,
-    TableMeta meta,
+    TableDataMeta meta,
     TreePagePtr ptr, {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
@@ -473,7 +473,7 @@ final class TableTreePartitionManager {
 
   Future<InternalPage> _readInternalPage(
     TableContext table,
-    TableMeta meta,
+    TableDataMeta meta,
     TreePagePtr ptr, {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
@@ -548,7 +548,7 @@ final class TableTreePartitionManager {
 
   Future<TreePagePtr> _locateLeafForKey(
     TableContext table,
-    TableMeta meta,
+    TableDataMeta meta,
     Uint8List keyBytes, {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
@@ -571,7 +571,7 @@ final class TableTreePartitionManager {
 
   Future<TreePagePtr> _locateRightmostLeaf(
     TableContext table,
-    TableMeta meta, {
+    TableDataMeta meta, {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
     bool readFromFileOnly = false,
@@ -593,7 +593,7 @@ final class TableTreePartitionManager {
 
   Future<TreePagePtr> _locateRightmostLeafFast(
     TableContext table,
-    TableMeta meta, {
+    TableDataMeta meta, {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
     bool readFromFileOnly = false,
@@ -678,8 +678,8 @@ final class TableTreePartitionManager {
       override: fieldStructureOverride,
     );
 
-    var meta = await _dataStore.tableDataManager.getTableMeta(table) ??
-        await _createInitialTableMeta(table);
+    var meta = await _dataStore.tableDataManager.getTableDataMeta(table) ??
+        await _createInitialTableDataMeta(table);
 
     // ---- Batch op coalescing (PK last-write-wins) ----
     final ops = <String, _TableOp>{};
@@ -800,7 +800,7 @@ final class TableTreePartitionManager {
       await ensurePartitionHeaderLoaded(partitionNo);
       final stats = getStats(partitionNo);
       final head = stats.freeListHeadPageNo;
-      if (head < TableMeta.firstDataPageNo) return null;
+      if (head < TableDataMeta.firstDataPageNo) return null;
       stats.path ??= await _partitionFilePath(table, meta, partitionNo);
       final pageSize = meta.btreePageSize;
       final off = head * pageSize;
@@ -1779,17 +1779,17 @@ final class TableTreePartitionManager {
       totalSizeInBytes: max(0, meta.totalSizeInBytes + sizeDeltaSum),
       timestamps: Timestamps(created: meta.timestamps.created, modified: now),
     );
-    await _dataStore.tableDataManager.updateTableMeta(
+    await _dataStore.tableDataManager.updateTableDataMeta(
       table,
       updatedMeta,
       flush: false,
     );
 
-    // Mark table metadata as updated in journal for crash recovery.
+    // Mark table data metadata as updated in journal for crash recovery.
     // If this entry exists, recovery knows the metadata is consistent.
     if (batchContext != null) {
       await _dataStore.parallelJournalManager.appendJournalEntry(
-        TableMetaUpdatedEntry(
+        TableDataMetaUpdatedEntry(
           table: tableUid,
           batchId: batchContext.batchId,
           batchType: batchContext.batchType,
@@ -1825,7 +1825,7 @@ final class TableTreePartitionManager {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
   }) async {
-    final meta0 = await _dataStore.tableDataManager.getTableMeta(table);
+    final meta0 = await _dataStore.tableDataManager.getTableDataMeta(table);
     if (meta0 == null || meta0.btreeFirstLeaf.isNull) return null;
     var meta = meta0;
     if (maxVisitedLeaves <= 0 || maxMerges <= 0) return startFrom;
@@ -2102,8 +2102,8 @@ final class TableTreePartitionManager {
       await _storage.writeManyAsBytesAt(path, writes, flush: false);
     }
 
-    // Persist updated table meta (structure pointers).
-    await _dataStore.tableDataManager.updateTableMeta(
+    // Persist updated table data meta (structure pointers).
+    await _dataStore.tableDataManager.updateTableDataMeta(
       table,
       meta.copyWith(
         timestamps: Timestamps(
@@ -2145,7 +2145,7 @@ final class TableTreePartitionManager {
       override: decodeFieldStructureOverride,
     );
 
-    final meta = await _dataStore.tableDataManager.getTableMeta(table);
+    final meta = await _dataStore.tableDataManager.getTableDataMeta(table);
     if (meta == null || (meta.btreeFirstLeaf).isNull) {
       return const <Map<String, dynamic>>[];
     }
@@ -2209,7 +2209,7 @@ final class TableTreePartitionManager {
     final schema = schemaOverride ??
         await _dataStore.schemaManager?.getTableSchema(table.tableUid);
     if (schema == null) return false;
-    final meta = await _dataStore.tableDataManager.getTableMeta(table);
+    final meta = await _dataStore.tableDataManager.getTableDataMeta(table);
     if (meta == null || (meta.btreeFirstLeaf).isNull) return false;
     final keyBytes = schema.encodePrimaryKeyComponent(primaryKeyValue);
     var ptr = await _locateLeafForKey(table, meta, keyBytes);
@@ -2228,7 +2228,7 @@ final class TableTreePartitionManager {
     final schema = schemaOverride ??
         await _dataStore.schemaManager?.getTableSchema(table.tableUid);
     if (schema == null) return const <String>{};
-    final meta = await _dataStore.tableDataManager.getTableMeta(table);
+    final meta = await _dataStore.tableDataManager.getTableDataMeta(table);
     if (meta == null || (meta.btreeFirstLeaf).isNull) return const <String>{};
     final out = <String>{};
     final yc = YieldController(
@@ -2249,10 +2249,10 @@ final class TableTreePartitionManager {
   Future<int> getPartitionFileSizeByNo({
     required TableContext table,
     required int partitionNo,
-    TableMeta? metaOverride,
+    TableDataMeta? metaOverride,
   }) async {
-    final meta =
-        metaOverride ?? await _dataStore.tableDataManager.getTableMeta(table);
+    final meta = metaOverride ??
+        await _dataStore.tableDataManager.getTableDataMeta(table);
     if (meta == null) return 0;
     if (partitionNo < 0 || partitionNo >= meta.btreePartitionCount) {
       return 0;
@@ -2268,7 +2268,7 @@ final class TableTreePartitionManager {
     required int partitionNo,
     required int startPageNo,
     required int pageLimit,
-    TableMeta? metaSnapshot,
+    TableDataMeta? metaSnapshot,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
     TableSchema? decodeSchema,
@@ -2284,8 +2284,8 @@ final class TableTreePartitionManager {
     if (schema == null) {
       return (records: const <Map<String, dynamic>>[], reachedEnd: true);
     }
-    final meta =
-        metaSnapshot ?? await _dataStore.tableDataManager.getTableMeta(table);
+    final meta = metaSnapshot ??
+        await _dataStore.tableDataManager.getTableDataMeta(table);
     if (meta == null) {
       return (records: const <Map<String, dynamic>>[], reachedEnd: true);
     }
@@ -2302,7 +2302,7 @@ final class TableTreePartitionManager {
     );
 
     final pageSize = meta.btreePageSize;
-    final fromPage = max(TableMeta.firstDataPageNo, startPageNo);
+    final fromPage = max(TableDataMeta.firstDataPageNo, startPageNo);
     final toPage = fromPage + pageLimit;
 
     final out = <Map<String, dynamic>>[];
@@ -2404,7 +2404,7 @@ final class TableTreePartitionManager {
   }) async* {
     if (pagesPerBatch <= 0) pagesPerBatch = 500;
 
-    final meta = await _dataStore.tableDataManager.getTableMeta(table);
+    final meta = await _dataStore.tableDataManager.getTableDataMeta(table);
     if (meta == null) return;
     if (partitionNo < 0 || partitionNo >= meta.btreePartitionCount) {
       return;
@@ -2414,7 +2414,7 @@ final class TableTreePartitionManager {
     final size = await _storage.getFileSize(path);
     final snapshotPageCount =
         (size + meta.btreePageSize - 1) ~/ meta.btreePageSize;
-    if (snapshotPageCount <= TableMeta.firstDataPageNo) {
+    if (snapshotPageCount <= TableDataMeta.firstDataPageNo) {
       return;
     }
 
@@ -2441,7 +2441,8 @@ final class TableTreePartitionManager {
 
     Future<({List<Map<String, dynamic>> records, bool reachedEnd})>? pending;
 
-    for (int pageNo = TableMeta.firstDataPageNo; pageNo < snapshotPageCount;) {
+    for (int pageNo = TableDataMeta.firstDataPageNo;
+        pageNo < snapshotPageCount;) {
       await yc.maybeYield();
       final pageLimit = min(pagesPerBatch, snapshotPageCount - pageNo);
       final batchFuture = pending ?? loadBatch(pageNo);
@@ -2487,7 +2488,7 @@ final class TableTreePartitionManager {
     final schema = decodeSchema ??
         await _dataStore.schemaManager?.getTableSchema(table.tableUid);
     if (schema == null) return const <Map<String, dynamic>>[];
-    final meta = await _dataStore.tableDataManager.getTableMeta(table);
+    final meta = await _dataStore.tableDataManager.getTableDataMeta(table);
     if (meta == null) return const <Map<String, dynamic>>[];
     if (partitionNo < 0 || partitionNo >= meta.btreePartitionCount) {
       return const <Map<String, dynamic>>[];
@@ -2573,7 +2574,7 @@ final class TableTreePartitionManager {
       override: decodeFieldStructureOverride,
     );
 
-    final meta = await _dataStore.tableDataManager.getTableMeta(table);
+    final meta = await _dataStore.tableDataManager.getTableDataMeta(table);
     if (meta == null || meta.btreeFirstLeaf.isNull) return;
 
     int remaining = (limit == null || limit <= 0) ? (1 << 30) : limit;
@@ -2801,7 +2802,7 @@ final class TableTreePartitionManager {
       schema: schema,
       override: decodeFieldStructureOverride,
     );
-    final meta = await _dataStore.tableDataManager.getTableMeta(table);
+    final meta = await _dataStore.tableDataManager.getTableDataMeta(table);
     if (meta == null || (meta.btreeFirstLeaf).isNull) return;
 
     int remaining = (limit == null || limit <= 0) ? (1 << 30) : limit;
