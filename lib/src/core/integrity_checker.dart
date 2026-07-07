@@ -31,7 +31,8 @@ class IntegrityChecker {
         return false;
       }
 
-      final fileMeta = await _dataStore.tableDataManager.getTableMeta(table);
+      final fileMeta =
+          await _dataStore.tableDataManager.getTableDataMeta(table);
       if (fileMeta == null || fileMeta.totalRecords == 0) {
         return true; // Empty table is valid
       }
@@ -105,12 +106,13 @@ class IntegrityChecker {
   Future<bool> checkDataConsistency(TableContext table) async {
     final tableName = table.tableName;
     try {
-      // get table meta data
-      final fileMeta = await _dataStore.tableDataManager.getTableMeta(table);
+      // get table data meta data
+      final fileMeta =
+          await _dataStore.tableDataManager.getTableDataMeta(table);
 
       // get table schema info
       if (fileMeta == null) {
-        Logger.warn('Table meta not found for $tableName');
+        Logger.warn('Table data meta not found for $tableName');
         return false;
       }
 
@@ -207,7 +209,8 @@ class IntegrityChecker {
     try {
       final schema = table.schema;
 
-      final fileMeta = await _dataStore.tableDataManager.getTableMeta(table);
+      final fileMeta =
+          await _dataStore.tableDataManager.getTableDataMeta(table);
       if (fileMeta == null || fileMeta.totalRecords == 0) {
         return true; // Empty table is valid
       }
@@ -336,7 +339,8 @@ class IntegrityChecker {
     try {
       final schema = table.schema;
 
-      final fileMeta = await _dataStore.tableDataManager.getTableMeta(table);
+      final fileMeta =
+          await _dataStore.tableDataManager.getTableDataMeta(table);
       if (fileMeta == null || fileMeta.totalRecords == 0) {
         return true; // Empty table is valid
       }
@@ -482,20 +486,22 @@ class IntegrityChecker {
     final stopwatch = Stopwatch()..start();
 
     try {
-      // check if table meta data file exists
+      // check if table data meta data file exists
       final dataMetaPath =
           await _dataStore.pathManager.getDataMetaPath(table.tableUid);
-      final tableMetaExists = await _dataStore.storage.existsFile(dataMetaPath);
+      final tableDataMetaExists =
+          await _dataStore.storage.existsFile(dataMetaPath);
 
-      // get table meta data (if exists)
-      TableMeta? fileMeta;
-      if (tableMetaExists) {
-        fileMeta = await _dataStore.tableDataManager.getTableMeta(table);
+      // get table data meta data (if exists)
+      TableDataMeta? fileMeta;
+      if (tableDataMetaExists) {
+        fileMeta = await _dataStore.tableDataManager.getTableDataMeta(table);
       }
 
       // check if it is a new table (no meta data or meta data has no partition info)
-      final isNewTable =
-          !tableMetaExists || fileMeta == null || fileMeta.totalRecords <= 0;
+      final isNewTable = !tableDataMetaExists ||
+          fileMeta == null ||
+          fileMeta.totalRecords <= 0;
 
       if (isNewTable) {
         Logger.info(
@@ -523,7 +529,7 @@ class IntegrityChecker {
         }
 
         // Sample validation: only validate meta pages of first/last *existing* physical partitions.
-        final TableMeta meta = fileMeta;
+        final TableDataMeta meta = fileMeta;
         Future<int?> findLastExistingPartitionNo() async {
           for (int pNo = meta.btreePartitionCount - 1; pNo >= 0; pNo--) {
             final path = await _dataStore.pathManager
