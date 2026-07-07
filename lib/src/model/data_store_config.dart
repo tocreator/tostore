@@ -124,6 +124,9 @@ class DataStoreConfig {
   /// Maximum number of open file handles to keep in the handle pool (native only).
   final int maxOpenFiles;
 
+  /// Explicitly force server environment optimizations (throughput prioritized over UI responsiveness).
+  final bool isServerEnvironment;
+
   /// Background flush policy for recovery artifacts (WAL/journal/meta) only.
   final RecoveryFlushPolicy recoveryFlushPolicy;
 
@@ -157,29 +160,75 @@ class DataStoreConfig {
   /// Defaults to 8ms for client (UI) platforms, 50ms for server.
   final int yieldDurationMs;
 
-  DataStoreConfig({
-    this.persistenceMode = PersistenceMode.file,
+  /// Private generative constructor for DataStoreConfig.
+  DataStoreConfig._internal({
+    required this.persistenceMode,
     this.dbPath,
-    this.dbName = 'default',
-    this.spaceName = 'default',
-    this.compressionLevel = 6,
-    this.ignoreUnknownFields = true,
-    this.enableMonitoring = true,
-    this.enableCompression = true,
-    this.enableAutoRepair = true,
+    required this.dbName,
+    required this.spaceName,
+    required this.compressionLevel,
+    required this.ignoreUnknownFields,
+    required this.enableMonitoring,
+    required this.enableCompression,
+    required this.enableAutoRepair,
     this.encryptionConfig,
-    this.migrationConfig = const MigrationConfig(),
-    int? maxPartitionFileSize,
-    this.enableLog = true,
-    this.logLevel = LogLevel.warn,
-    int? maxConcurrency,
-    int? maxIoConcurrency,
-    DistributedNodeConfig? distributedNodeConfig,
+    this.migrationConfig,
+    required this.maxPartitionFileSize,
+    required this.enableLog,
+    required this.logLevel,
+    required this.maxConcurrency,
+    required this.maxIoConcurrency,
+    required this.distributedNodeConfig,
     this.cacheMemoryBudgetMB,
     this.enablePrewarmCache,
     this.prewarmThresholdMB,
+    required this.maxLogPartitionFileSize,
+    required this.logPartitionCycle,
+    required this.enableJournal,
+    required this.logWriteBatchSize,
+    required this.writeBatchSize,
+    required this.maxFlushLatencyMs,
+    required this.parallelJournalMaxFileSize,
+    required this.maxOpenFiles,
+    required this.recoveryFlushPolicy,
+    required this.persistRecoveryOnCommit,
+    required this.defaultTransactionIsolationLevel,
+    required this.transactionTimeout,
+    required this.enableTransactionCleanup,
+    required this.transactionCleanupIntervalMs,
+    required this.transactionMetaTtlMs,
+    required this.ttlCleanupIntervalMs,
+    required this.defaultQueryLimit,
+    required this.maxQueryOffset,
+    required this.yieldDurationMs,
+    required this.isServerEnvironment,
+  });
+
+  /// Factory constructor for DataStoreConfig that handles default parameters
+  /// and platform-specific environment resolutions.
+  factory DataStoreConfig({
+    PersistenceMode persistenceMode = PersistenceMode.file,
+    String? dbPath,
+    String dbName = 'default',
+    String spaceName = 'default',
+    int compressionLevel = 6,
+    bool ignoreUnknownFields = true,
+    bool enableMonitoring = true,
+    bool enableCompression = true,
+    bool enableAutoRepair = true,
+    EncryptionConfig? encryptionConfig,
+    MigrationConfig? migrationConfig = const MigrationConfig(),
+    int? maxPartitionFileSize,
+    bool enableLog = true,
+    LogLevel logLevel = LogLevel.warn,
+    int? maxConcurrency,
+    int? maxIoConcurrency,
+    DistributedNodeConfig? distributedNodeConfig,
+    int? cacheMemoryBudgetMB,
+    bool? enablePrewarmCache,
+    int? prewarmThresholdMB,
     int? maxLogPartitionFileSize,
-    this.logPartitionCycle = 900000,
+    int logPartitionCycle = 900000,
     bool? enableJournal,
     int? logWriteBatchSize,
     int? writeBatchSize,
@@ -189,61 +238,94 @@ class DataStoreConfig {
     RecoveryFlushPolicy? recoveryFlushPolicy,
     bool? persistRecoveryOnCommit,
     TransactionIsolationLevel? defaultTransactionIsolationLevel,
-    this.transactionTimeout = const Duration(minutes: 5),
-    this.enableTransactionCleanup = true,
+    Duration transactionTimeout = const Duration(minutes: 5),
+    bool enableTransactionCleanup = true,
     int? transactionCleanupIntervalMs,
     int? transactionMetaTtlMs,
     int? ttlCleanupIntervalMs,
     int? defaultQueryLimit,
     int? maxQueryOffset,
     int? yieldDurationMs,
-  })  : maxPartitionFileSize =
-            maxPartitionFileSize ?? _getDefaultMaxPartitionFileSize(),
-        maxLogPartitionFileSize =
-            maxLogPartitionFileSize ?? _getDefaultMaxPartitionFileSize(),
-        enableJournal = enableJournal ?? !PlatformHandler.isWeb,
-        logWriteBatchSize = logWriteBatchSize ?? _getDefaultLogWriteBatchSize(),
-        writeBatchSize =
-            writeBatchSize ?? _getWriteBatchSize(cacheMemoryBudgetMB),
-        maxFlushLatencyMs = maxFlushLatencyMs ?? _getDefaultMaxFlushLatencyMs(),
-        parallelJournalMaxFileSize = parallelJournalMaxFileSize ??
-            _getDefaultParallelJournalMaxFileSize(),
-        maxConcurrency = maxConcurrency ?? _getDefaultMaxConcurrent(),
-        maxIoConcurrency = maxIoConcurrency ??
-            _getDefaultMaxIoConcurrent(
-                maxConcurrency ?? _getDefaultMaxConcurrent(),
-                maxPartitionFileSize ?? _getDefaultMaxPartitionFileSize()),
-        defaultQueryLimit = defaultQueryLimit ?? 1000,
-        maxQueryOffset = maxQueryOffset ?? 10000,
-        distributedNodeConfig =
-            distributedNodeConfig ?? const DistributedNodeConfig(),
-        maxOpenFiles = maxOpenFiles ?? _getDefaultMaxOpenHandles(),
-        recoveryFlushPolicy =
-            recoveryFlushPolicy ?? _getDefaultRecoveryFlushPolicy(),
-        persistRecoveryOnCommit =
-            persistRecoveryOnCommit ?? _getDefaultPersistRecoveryOnCommit(),
-        defaultTransactionIsolationLevel = defaultTransactionIsolationLevel ??
-            _getDefaultTransactionIsolationLevel(),
-        transactionCleanupIntervalMs = transactionCleanupIntervalMs ?? 600000,
-        transactionMetaTtlMs = transactionMetaTtlMs ?? 600000,
-        ttlCleanupIntervalMs = max(ttlCleanupIntervalMs ?? 300000, 300000),
-        yieldDurationMs = yieldDurationMs ?? _getDefaultYieldDurationMs();
+    bool? isServerEnvironment,
+  }) {
+    final resolvedServer =
+        isServerEnvironment ?? PlatformHandler.isServerEnvironment;
+    final resolvedMaxPartition =
+        maxPartitionFileSize ?? _getDefaultMaxPartitionFileSize(resolvedServer);
+    final resolvedMaxLogPartition =
+        maxLogPartitionFileSize ?? resolvedMaxPartition;
+    final resolvedConcurrency = maxConcurrency ?? _getDefaultMaxConcurrent();
+
+    return DataStoreConfig._internal(
+      persistenceMode: persistenceMode,
+      dbPath: dbPath,
+      dbName: dbName,
+      spaceName: spaceName,
+      compressionLevel: compressionLevel,
+      ignoreUnknownFields: ignoreUnknownFields,
+      enableMonitoring: enableMonitoring,
+      enableCompression: enableCompression,
+      enableAutoRepair: enableAutoRepair,
+      encryptionConfig: encryptionConfig,
+      migrationConfig: migrationConfig,
+      maxPartitionFileSize: resolvedMaxPartition,
+      enableLog: enableLog,
+      logLevel: logLevel,
+      maxConcurrency: resolvedConcurrency,
+      maxIoConcurrency: maxIoConcurrency ??
+          _getDefaultMaxIoConcurrent(
+              resolvedConcurrency, resolvedMaxPartition, resolvedServer),
+      distributedNodeConfig:
+          distributedNodeConfig ?? const DistributedNodeConfig(),
+      cacheMemoryBudgetMB: cacheMemoryBudgetMB,
+      enablePrewarmCache: enablePrewarmCache,
+      prewarmThresholdMB: prewarmThresholdMB,
+      maxLogPartitionFileSize: resolvedMaxLogPartition,
+      logPartitionCycle: logPartitionCycle,
+      enableJournal: enableJournal ?? !PlatformHandler.isWeb,
+      logWriteBatchSize:
+          logWriteBatchSize ?? _getDefaultLogWriteBatchSize(resolvedServer),
+      writeBatchSize: writeBatchSize ??
+          _getWriteBatchSize(cacheMemoryBudgetMB, resolvedServer),
+      maxFlushLatencyMs:
+          maxFlushLatencyMs ?? _getDefaultMaxFlushLatencyMs(resolvedServer),
+      parallelJournalMaxFileSize: parallelJournalMaxFileSize ??
+          _getDefaultParallelJournalMaxFileSize(resolvedServer),
+      maxOpenFiles: maxOpenFiles ?? _getDefaultMaxOpenHandles(resolvedServer),
+      recoveryFlushPolicy:
+          recoveryFlushPolicy ?? _getDefaultRecoveryFlushPolicy(),
+      persistRecoveryOnCommit:
+          persistRecoveryOnCommit ?? _getDefaultPersistRecoveryOnCommit(),
+      defaultTransactionIsolationLevel: defaultTransactionIsolationLevel ??
+          _getDefaultTransactionIsolationLevel(),
+      transactionTimeout: transactionTimeout,
+      enableTransactionCleanup: enableTransactionCleanup,
+      transactionCleanupIntervalMs: transactionCleanupIntervalMs ?? 600000,
+      transactionMetaTtlMs: transactionMetaTtlMs ?? 600000,
+      ttlCleanupIntervalMs: max(ttlCleanupIntervalMs ?? 300000, 300000),
+      defaultQueryLimit: defaultQueryLimit ?? 1000,
+      maxQueryOffset: maxQueryOffset ?? 10000,
+      yieldDurationMs:
+          yieldDurationMs ?? _getDefaultYieldDurationMs(resolvedServer),
+      isServerEnvironment: resolvedServer,
+    );
+  }
 
   /// Default yield duration based on platform constraint
-  static int _getDefaultYieldDurationMs() {
-    if (PlatformHandler.isServerEnvironment) {
+  static int _getDefaultYieldDurationMs(bool isServer) {
+    if (isServer) {
       return 50; // Server: prioritize throughput over latency
     }
     return 8; // Client: prioritize 120fps/60fps UI responsiveness
   }
 
   /// get default partition file size limit, based on platform
-  static int _getDefaultMaxPartitionFileSize() {
+  static int _getDefaultMaxPartitionFileSize(bool isServer) {
     if (PlatformHandler.isWeb) {
       return 64 * 1024; // Web: 64KB - Browser memory constraints
     } else if (PlatformHandler.isMobile) {
       return 4 * 1024 * 1024; // Mobile: 4MB
-    } else if (PlatformHandler.isServerEnvironment) {
+    } else if (isServer) {
       // Server: prefer larger partitions to curb partition explosion while
       // keeping sparse-index guided reads efficient. Scale with recommended
       // concurrency, bounded to avoid excessive per-partition IO/caching cost.
@@ -261,12 +343,12 @@ class DataStoreConfig {
 
   /// Default WAL/log write batch size for background persistence.
   /// Tuned separately from [writeBatchSize] which is for table data flush.
-  static int _getDefaultLogWriteBatchSize() {
+  static int _getDefaultLogWriteBatchSize(bool isServer) {
     if (PlatformHandler.isWeb) {
       return 1000;
     } else if (PlatformHandler.isMobile) {
       return 10000;
-    } else if (PlatformHandler.isServerEnvironment) {
+    } else if (isServer) {
       // Server: higher throughput
       return 100000;
     } else {
@@ -313,13 +395,13 @@ class DataStoreConfig {
   /// - Partition file size (larger partitions need more memory/CPU per task
   ///   for sparse-index parsing and block encoding/decoding)
   static int _getDefaultMaxIoConcurrent(
-      int cpuConcurrent, int partitionFileSize) {
+      int cpuConcurrent, int partitionFileSize, bool isServer) {
     // Calculate base I/O concurrency from CPU cores
     int baseIo;
     int minIo;
     int maxIo;
 
-    if (PlatformHandler.isServerEnvironment) {
+    if (isServer) {
       // Server: IO is highly parallelizable, use 4x CPU cores
       // But clamp to reasonable limits to avoid FD exhaustion
       baseIo = cpuConcurrent * 4;
@@ -350,7 +432,7 @@ class DataStoreConfig {
     // - Below threshold: use full baseIo
     // - Above threshold: scale down proportionally
     // - At 2x threshold: use ~50% of baseIo
-    final int threshold = _getLargePartitionThreshold();
+    final int threshold = _getLargePartitionThreshold(isServer);
     if (partitionFileSize > threshold) {
       // Linear scale-down: at 2x threshold, use 50% of base concurrency
       // ratio goes from 0.0 (at threshold) to 1.0 (at 2x threshold)
@@ -367,24 +449,56 @@ class DataStoreConfig {
   /// Threshold for considering a partition file "large" for concurrency scaling.
   /// Beyond this size, I/O concurrency is reduced to prevent memory pressure
   /// from heavier sparse-index parsing and block encoding/decoding.
-  static int _getLargePartitionThreshold() {
+  static int _getLargePartitionThreshold(bool isServer) {
     if (PlatformHandler.isWeb) {
       return 64 * 1024; // 64KB - web has tight memory constraints
     } else if (PlatformHandler.isMobile) {
       return 4 * 1024 * 1024; // 4MB - mobile has moderate constraints
-    } else if (PlatformHandler.isServerEnvironment) {
+    } else if (isServer) {
       return 128 * 1024 * 1024; // 128MB - server can handle large partitions
     } else {
       return 8 * 1024 * 1024; // 8MB - desktop balanced
     }
   }
 
-  static int _getDefaultMaxOpenHandles() {
-    // Use a conservative default tuned by platform
-    if (PlatformHandler.isServerEnvironment) return 512;
-    if (PlatformHandler.isDesktop) return 256;
-    if (PlatformHandler.isMobile) return 128;
-    return 64; // Web/others minimal (not used on web)
+  static int _getDefaultMaxOpenHandles(bool isServer) {
+    // Use fine-grained defaults tuned by specific platforms to avoid EMFILE (Too many open files)
+    // or handle exhaustion, while maintaining optimal storage engine performance.
+    if (PlatformHandler.isWeb) {
+      return 64; // Web doesn't use standard OS file descriptors
+    }
+
+    if (PlatformHandler.isWindows) {
+      // Windows OS handle limit is extremely high, but CRT default limit is 512.
+      // 256 is safe and provides excellent concurrency.
+      return 256;
+    }
+
+    if (PlatformHandler.isMacOS) {
+      // macOS has a notoriously low default soft limit of 256 file descriptors per process.
+      // Setting to 128 leaves a safe buffer for GUI assets, sockets, and standard I/O.
+      return 128;
+    }
+
+    if (PlatformHandler.isLinux) {
+      // Linux default soft limit is 1024.
+      // Server environment gets 512 for higher concurrency, Desktop gets 256.
+      return isServer ? 512 : 256;
+    }
+
+    if (PlatformHandler.isAndroid) {
+      // Android default soft limit is typically 1024+. 128 is highly safe and performant.
+      return 128;
+    }
+
+    if (PlatformHandler.isIOS) {
+      // iOS has a strict file descriptor limit (often 256 soft limit), and shares resources
+      // heavily with system frameworks. 64 is a safe default.
+      return 64;
+    }
+
+    // Fallback default
+    return 128;
   }
 
   static RecoveryFlushPolicy _getDefaultRecoveryFlushPolicy() {
@@ -397,7 +511,7 @@ class DataStoreConfig {
     return true; // native defaults to persisting WAL/journal/meta at commit
   }
 
-  static int _getWriteBatchSize(int? cacheMemoryBudgetMB) {
+  static int _getWriteBatchSize(int? cacheMemoryBudgetMB, bool isServer) {
     final int cores = PlatformHandler.processorCores;
 
     // Scale factor based on cores: more cores = more parallel flush capacity
@@ -423,7 +537,7 @@ class DataStoreConfig {
     } else if (PlatformHandler.isMobile) {
       // Mobile: 100k - 200k
       return targetBatchSize.clamp(100000, 200000);
-    } else if (PlatformHandler.isServerEnvironment) {
+    } else if (isServer) {
       // Server: 200k - 1M (High throughput focus)
       return targetBatchSize.clamp(200000, 1000000);
     } else {
@@ -432,7 +546,7 @@ class DataStoreConfig {
     }
   }
 
-  static int _getDefaultMaxFlushLatencyMs() {
+  static int _getDefaultMaxFlushLatencyMs(bool isServer) {
     // Favor energy saving with bounded latency; mobile defaults a bit lower
     if (PlatformHandler.isMobile || PlatformHandler.isDesktop) {
       return 5000; // 5s on mobile/desktop
@@ -443,13 +557,13 @@ class DataStoreConfig {
     return 10000; // 10s on server
   }
 
-  static int _getDefaultParallelJournalMaxFileSize() {
+  static int _getDefaultParallelJournalMaxFileSize(bool isServer) {
     // Platform-tuned defaults, independent of data partition size
     if (PlatformHandler.isWeb) {
       return 512 * 1024; // 512KB
     } else if (PlatformHandler.isMobile) {
       return 4 * 1024 * 1024; // 4MB
-    } else if (PlatformHandler.isServerEnvironment) {
+    } else if (isServer) {
       return 16 * 1024 * 1024; // 16MB
     } else {
       return 8 * 1024 * 1024; // Desktop: 8MB
@@ -601,6 +715,7 @@ class DataStoreConfig {
           ? json['maxQueryOffset'] as int
           : int.tryParse('${json['maxQueryOffset']}'),
       yieldDurationMs: json['yieldDurationMs'] as int?,
+      isServerEnvironment: json['isServerEnvironment'] as bool?,
     );
   }
 
@@ -648,6 +763,7 @@ class DataStoreConfig {
       'defaultQueryLimit': defaultQueryLimit,
       'maxQueryOffset': maxQueryOffset,
       'yieldDurationMs': yieldDurationMs,
+      'isServerEnvironment': isServerEnvironment,
     };
   }
 
@@ -692,6 +808,7 @@ class DataStoreConfig {
     int? defaultQueryLimit,
     int? maxQueryOffset,
     int? yieldDurationMs,
+    bool? isServerEnvironment,
   }) {
     return DataStoreConfig(
       persistenceMode: persistenceMode ?? this.persistenceMode,
@@ -741,6 +858,7 @@ class DataStoreConfig {
       defaultQueryLimit: defaultQueryLimit ?? this.defaultQueryLimit,
       maxQueryOffset: maxQueryOffset ?? this.maxQueryOffset,
       yieldDurationMs: yieldDurationMs ?? this.yieldDurationMs,
+      isServerEnvironment: isServerEnvironment ?? this.isServerEnvironment,
     );
   }
 }
