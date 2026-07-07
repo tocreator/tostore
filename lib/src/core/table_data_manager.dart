@@ -84,11 +84,11 @@ class TableDataManager {
   // Loading futures to prevent thundering herd on concurrent inserts
   final Map<String, Future<void>> _recordCountLoadingFutures = {};
 
-  /// Map of table names to futures that are currently loading table metadata
-  final Map<String, Future<TableMeta?>> _metaLoadingFutures = {};
+  /// Map of table names to futures that are currently loading table data metadata
+  final Map<String, Future<TableDataMeta?>> _metaLoadingFutures = {};
 
-  // Table meta cache for table file metadata (TableMeta).
-  late final TreeCache<TableMeta> _tableMetaCache;
+  // Table data meta cache for table file metadata (TableDataMeta).
+  late final TreeCache<TableDataMeta> _tableDataMetaCache;
 
   // -------------------- Table record cache --------------------
   // Composite key format: [tableUid, pk]
@@ -162,16 +162,16 @@ class TableDataManager {
   TableDataManager(this._dataStore) {
     // Initialize table record cache (table data quota).
     final mem = _dataStore.resourceManager;
-    // Initialize table metadata cache (meta quota slice).
+    // Initialize table data metadata cache (meta quota slice).
     final int metaQuota = mem?.getMetaCacheSize() ?? (64 * 1024 * 1024);
     // Meta quota is shared by multiple caches (index meta, footers, etc.).
-    // Allocate a conservative slice for table metadata.
-    final int tableMetaMax = max(1, (metaQuota * 0.25).toInt());
-    _tableMetaCache = TreeCache<TableMeta>(
-      sizeCalculator: _estimateTableMetaSize,
-      maxByteThreshold: tableMetaMax,
+    // Allocate a conservative slice for table data metadata.
+    final int tableDataMetaMax = max(1, (metaQuota * 0.25).toInt());
+    _tableDataMetaCache = TreeCache<TableDataMeta>(
+      sizeCalculator: _estimateTableDataMetaSize,
+      maxByteThreshold: tableDataMetaMax,
       minByteThreshold: 50 * 1024 * 1024,
-      debugLabel: 'TableMetaCache',
+      debugLabel: 'TableDataMetaCache',
     );
 
     final int tableQuota =
@@ -414,8 +414,8 @@ class TableDataManager {
     return _tableRecordCache.estimatedTotalSizeBytes;
   }
 
-  /// Estimate table metadata size (bytes)
-  int _estimateTableMetaSize(TableMeta meta) {
+  /// Estimate table data metadata size (bytes)
+  int _estimateTableDataMetaSize(TableDataMeta meta) {
     // v2+ meta is small and fixed-shape (no partition lists).
     // Keep a conservative estimate to guide cache sizing.
     return 160 + meta.tableUid.length * 2;
@@ -569,18 +569,18 @@ class TableDataManager {
     }
   }
 
-  /// Evict a ratio of table metadata cache entries under memory pressure.
-  Future<void> evictTableMetaCache({double ratio = 0.3}) async {
+  /// Evict a ratio of table data metadata cache entries under memory pressure.
+  Future<void> evictTableDataMetaCache({double ratio = 0.3}) async {
     try {
-      await _tableMetaCache.cleanup(removeRatio: ratio);
+      await _tableDataMetaCache.cleanup(removeRatio: ratio);
     } catch (e) {
-      Logger.warn('Evict table meta cache failed', rawError: e);
+      Logger.warn('Evict table data meta cache failed', rawError: e);
     }
   }
 
-  /// Invalidate cached table metadata for a single table (best-effort).
-  void invalidateTableMetaCacheForTable(TableContext table) {
-    _tableMetaCache.remove(table.tableUid);
+  /// Invalidate cached table data metadata for a single table (best-effort).
+  void invalidateTableDataMetaCacheForTable(TableContext table) {
+    _tableDataMetaCache.remove(table.tableUid);
   }
 
   /// Load statistics from configuration
@@ -614,7 +614,7 @@ class TableDataManager {
   /// Only counts user tables, excluding system tables
   Future<void> recalculateAllStatistics() async {
     try {
-      // Get all table metadata (only user tables, excluding system tables)
+      // Get all table data metadata (only user tables, excluding system tables)
       final schemaManager = _dataStore.schemaManager;
       if (schemaManager == null) return;
 
@@ -625,7 +625,7 @@ class TableDataManager {
       int totalRecords = 0;
       int totalSize = 0;
 
-      // Use ParallelProcessor to fetch table metadata concurrently (maintenance read)
+      // Use ParallelProcessor to fetch table data metadata concurrently (maintenance read)
       final statsLease = await _dataStore.workloadScheduler.tryAcquire(
         WorkloadType.maintenance,
         requestedTokens: _dataStore.workloadScheduler
@@ -634,14 +634,14 @@ class TableDataManager {
         label: 'TableDataManager.recalculateAllStatistics',
       );
       final int statsConc = (statsLease?.asConcurrency(0.3) ?? 1);
-      final metaList = await ParallelProcessor.execute<TableMeta?>(
+      final metaList = await ParallelProcessor.execute<TableDataMeta?>(
         tableNames.map((name) {
           return () async {
             final uid = schemaManager.getUidByName(TableName(name));
             if (uid == null) return null;
             final ctx = schemaManager.getTableContextSync(uid);
             if (ctx == null) return null;
-            return getTableMeta(ctx);
+            return getTableDataMeta(ctx);
           };
         }).toList(),
         concurrency: statsConc,
@@ -658,7 +658,7 @@ class TableDataManager {
           // Accumulate record count
           totalRecords += meta.totalRecords;
 
-          // Total file size is maintained in v2+ table meta.
+          // Total file size is maintained in v2+ table data meta.
           totalSize += meta.totalSizeInBytes;
         }
       }
@@ -744,10 +744,10 @@ class TableDataManager {
       // This ensures cache consistency and prevents unnecessary recalculations
       if (updateFileMeta && shouldUpdate) {
         try {
-          final fileMeta = await getTableMeta(table);
+          final fileMeta = await getTableDataMeta(table);
           if (fileMeta != null) {
             final updatedMeta = fileMeta.copyWith(maxAutoIncrementId: idStr);
-            await updateTableMeta(table, updatedMeta);
+            await updateTableDataMeta(table, updatedMeta);
           }
         } catch (e) {
           Logger.error('Failed to update FileMeta maxAutoIncrementId',
@@ -868,7 +868,7 @@ class TableDataManager {
       }
 
       _tableRecordCache.clear();
-      _tableMetaCache.clear();
+      _tableDataMetaCache.clear();
       _tableRecordCounts.clear();
       _recordCountLoadingFutures.clear();
       _metaLoadingFutures.clear();
@@ -911,10 +911,10 @@ class TableDataManager {
         if (maxId == null) continue;
 
         // Save to FileMeta
-        final fileMeta = await getTableMeta(table);
+        final fileMeta = await getTableDataMeta(table);
         if (fileMeta != null) {
           final updatedMeta = fileMeta.copyWith(maxAutoIncrementId: maxId);
-          await updateTableMeta(table, updatedMeta);
+          await updateTableDataMeta(table, updatedMeta);
         }
 
         _maxIdsDirty[tableUid] = false;
@@ -1701,7 +1701,7 @@ class TableDataManager {
       // Only update stats for user tables, exclude system tables
       if (!SystemTable.isSystemTable(table.tableName)) {
         // get current table stats
-        final meta = await getTableMeta(table);
+        final meta = await getTableDataMeta(table);
         if (meta != null) {
           // update total record count and total size
           _totalRecordCount = max(0, _totalRecordCount - meta.totalRecords);
@@ -1748,7 +1748,7 @@ class TableDataManager {
 
   /// Internal helper to actually load record count from metadata.
   Future<void> _doLoadRecordCount(TableContext table) async {
-    final meta = await getTableMeta(table);
+    final meta = await getTableDataMeta(table);
     _tableRecordCounts[table.tableUid] = meta?.totalRecords ?? 0;
   }
 
@@ -1812,7 +1812,7 @@ class TableDataManager {
   Future<int> getTableFileSize(TableContext table) async {
     final tableUid = table.tableUid;
     if (!_fileSizes.containsKey(tableUid)) {
-      final meta = await getTableMeta(table);
+      final meta = await getTableDataMeta(table);
       return meta?.totalSizeInBytes ?? 0;
     }
     return _fileSizes[tableUid] ?? 0;
@@ -1838,12 +1838,12 @@ class TableDataManager {
     return _lastModifiedTimes[tableUid];
   }
 
-  /// Get table meta information
-  Future<TableMeta?> getTableMeta(TableContext table) async {
+  /// Get table data meta information
+  Future<TableDataMeta?> getTableDataMeta(TableContext table) async {
     final tableUid = table.tableUid;
 
-    // Table meta cache fast path
-    final cached = _tableMetaCache.get(tableUid);
+    // Table data meta cache fast path
+    final cached = _tableDataMetaCache.get(tableUid);
     if (cached != null) return cached;
 
     // Check if another call is already loading this meta
@@ -1853,7 +1853,7 @@ class TableDataManager {
     }
 
     // Load from disk with future tracking
-    final loadFuture = _doLoadTableMeta(tableUid);
+    final loadFuture = _doLoadTableDataMeta(tableUid);
     _metaLoadingFutures[tableUid] = loadFuture;
 
     try {
@@ -1867,7 +1867,7 @@ class TableDataManager {
   }
 
   /// Internal method to perform the actual file load
-  Future<TableMeta?> _doLoadTableMeta(TableUid tableUid) async {
+  Future<TableDataMeta?> _doLoadTableDataMeta(TableUid tableUid) async {
     try {
       final mainFilePath =
           await _dataStore.pathManager.getDataMetaPath(tableUid);
@@ -1893,22 +1893,23 @@ class TableDataManager {
           return null;
         }
 
-        final meta = TableMeta.fromJson(jsonData, tableUidFallback: tableUid);
+        final meta =
+            TableDataMeta.fromJson(jsonData, tableUidFallback: tableUid);
         // Cache update
-        _tableMetaCache.put(tableUid, meta);
+        _tableDataMetaCache.put(tableUid, meta);
         return meta;
       } catch (e) {
-        Logger.error('Failed to parse table meta', rawError: e);
+        Logger.error('Failed to parse table data meta', rawError: e);
         return null; // Return null on parse error
       }
     } catch (e) {
-      Logger.error('Failed to get table meta', rawError: e);
+      Logger.error('Failed to get table data meta', rawError: e);
       rethrow;
     }
   }
 
-  /// Update table meta
-  Future<void> updateTableMeta(TableContext table, TableMeta meta,
+  /// Update table data meta
+  Future<void> updateTableDataMeta(TableContext table, TableDataMeta meta,
       {bool flush = true}) async {
     final tableUid = table.tableUid;
     final mainFilePath = await _dataStore.pathManager.getDataMetaPath(tableUid);
@@ -1920,10 +1921,10 @@ class TableDataManager {
 
     try {
       // Update meta cache in memory first so subsequent reads see latest value.
-      _tableMetaCache.put(
+      _tableDataMetaCache.put(
         tableUid,
         meta,
-        size: _estimateTableMetaSize(meta),
+        size: _estimateTableDataMetaSize(meta),
       );
       _lastModifiedTimes[tableUid] = DateTime.now();
 
@@ -1931,7 +1932,7 @@ class TableDataManager {
       await _dataStore.storage
           .writeAsString(mainFilePath, jsonEncode(meta.toJson()), flush: flush);
     } catch (e) {
-      Logger.error('Failed to update table meta', rawError: e);
+      Logger.error('Failed to update table data meta', rawError: e);
       // Re-throw to handle at higher level
       rethrow;
     }
@@ -2082,7 +2083,7 @@ class TableDataManager {
     }
   }
 
-  /// update max id from table meta
+  /// update max id from table data meta
   /// Update max auto-increment ID from table partitions and buffer
   /// This method calculates the maximum ID from:
   /// 1. Partition metadata (fast path for ordered partitions: O(1), fallback: O(n))
@@ -2122,8 +2123,8 @@ class TableDataManager {
         return;
       }
 
-      // get max id from table meta + buffered WAL (if any)
-      TableMeta? fileMeta = await getTableMeta(table);
+      // get max id from table data meta + buffered WAL (if any)
+      TableDataMeta? fileMeta = await getTableDataMeta(table);
 
       // Performance optimization: if maxId is already in memory and matches FileMeta cache,
       // skip recalculation (especially useful after recovery when maxId was already updated)
@@ -2207,7 +2208,7 @@ class TableDataManager {
         // Save to FileMeta for caching (avoid recalculation on next initialization)
         if (fileMeta != null) {
           fileMeta = fileMeta.copyWith(maxAutoIncrementId: finalMax.toString());
-          await updateTableMeta(table, fileMeta);
+          await updateTableDataMeta(table, fileMeta);
         }
         return;
       }
@@ -2218,7 +2219,7 @@ class TableDataManager {
       _maxIdsDirty[table.tableUid] = true;
       if (fileMeta != null) {
         fileMeta = fileMeta.copyWith(maxAutoIncrementId: emptyMaxIdStr);
-        await updateTableMeta(table, fileMeta);
+        await updateTableDataMeta(table, fileMeta);
       }
     } catch (e) {
       Logger.error('Failed to update max id for table ${table.tableName}',
@@ -2285,10 +2286,10 @@ class TableDataManager {
         _maxIdsDirty[table.tableUid] = true;
 
         // Save to FileMeta instead of standalone file
-        final fileMeta = await getTableMeta(table);
+        final fileMeta = await getTableDataMeta(table);
         if (fileMeta != null) {
           final updatedMeta = fileMeta.copyWith(maxAutoIncrementId: newMaxId);
-          await updateTableMeta(table, updatedMeta);
+          await updateTableDataMeta(table, updatedMeta);
         }
 
         Logger.warn(
@@ -2338,7 +2339,7 @@ class TableDataManager {
 
     // Fast path for empty tables (no partitions yet): only merge buffer/txn overlay.
     if (!isMemoryMode) {
-      final fileMeta = await getTableMeta(table);
+      final fileMeta = await getTableDataMeta(table);
       if (fileMeta == null || fileMeta.btreeFirstLeaf.isNull) {
         final yieldController =
             YieldController('TableDataManager.streamRecords_empty');
@@ -2682,7 +2683,7 @@ class TableDataManager {
         (_) async {
           // First, update statistics by subtracting this table's counts
           try {
-            final fileMeta = await getTableMeta(table);
+            final fileMeta = await getTableDataMeta(table);
             if (fileMeta != null) {
               // Subtract this table's records and size from the totals
               _totalRecordCount =
@@ -2721,21 +2722,21 @@ class TableDataManager {
                 rawError: e);
           }
 
-          // 3. create empty table meta
-          final prevMeta = await getTableMeta(table);
+          // 3. create empty table data meta
+          final prevMeta = await getTableDataMeta(table);
           final int pageSize =
-              prevMeta?.btreePageSize ?? TableMeta.defaultPageSize;
+              prevMeta?.btreePageSize ?? TableDataMeta.defaultPageSize;
           final int newPartitionCount =
               deletedDir ? 1 : max(1, (prevMeta?.btreePartitionCount ?? 0) + 1);
           final tableUid = table.tableUid;
-          final emptyMeta = TableMeta.createEmpty(
+          final emptyMeta = TableDataMeta.createEmpty(
             tableUid: tableUid,
             pageSize: pageSize,
             partitionCount: newPartitionCount,
           );
 
-          // 4. update table meta
-          await updateTableMeta(table, emptyMeta);
+          // 4. update table data meta
+          await updateTableDataMeta(table, emptyMeta);
 
           // 5. clean ID generator related resources
           _idGenerators.remove(table.tableUid);
@@ -2751,10 +2752,10 @@ class TableDataManager {
             }
             if (schema.primaryKeyConfig.type == PrimaryKeyType.sequential) {
               // Reset maxId in FileMeta to "0"
-              final fileMeta = await getTableMeta(table);
+              final fileMeta = await getTableDataMeta(table);
               if (fileMeta != null) {
                 final updatedMeta = fileMeta.copyWith(maxAutoIncrementId: "0");
-                await updateTableMeta(table, updatedMeta);
+                await updateTableDataMeta(table, updatedMeta);
               }
 
               // update memory cache
@@ -2771,7 +2772,7 @@ class TableDataManager {
           }
 
           // 7. clean other caches
-          _tableMetaCache.remove(table.tableUid);
+          _tableDataMetaCache.remove(table.tableUid);
           _fileSizes.remove(table.tableUid);
           _lastModifiedTimes.remove(table.tableUid);
           _checkedOrderedRange.remove(table.tableUid);
@@ -2911,9 +2912,9 @@ class TableDataManager {
     }
   }
 
-  /// Get current table metadata cache size in bytes
-  int getCurrentTableMetaCacheSize() {
-    return _tableMetaCache.estimatedTotalSizeBytes;
+  /// Get current table data metadata cache size in bytes
+  int getCurrentTableDataMetaCacheSize() {
+    return _tableDataMetaCache.estimatedTotalSizeBytes;
   }
 
   /// Merges uncommitted data (WAL buffer and transaction overlays) into the results.
@@ -3229,7 +3230,7 @@ class TableDataManager {
     _dataStore.writeBufferManager.clearTable(_resolveTableContext(table));
 
     // Clean up other caches
-    _tableMetaCache.remove(table.tableUid);
+    _tableDataMetaCache.remove(table.tableUid);
     _fileSizes.remove(table.tableUid);
     _lastModifiedTimes.remove(table.tableUid);
     _tablePartitionSizes.remove(table.tableUid);
@@ -3876,9 +3877,9 @@ class TableDataManager {
     final bool isMemoryMode =
         _dataStore.config.persistenceMode == PersistenceMode.memory;
 
-    TableMeta? fileMeta;
+    TableDataMeta? fileMeta;
     if (!isMemoryMode) {
-      fileMeta = await getTableMeta(table);
+      fileMeta = await getTableDataMeta(table);
       if (fileMeta == null || fileMeta.totalRecords <= 0) {
         return TableScanResult(
           records: const [],
