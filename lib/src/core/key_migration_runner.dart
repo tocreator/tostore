@@ -434,13 +434,14 @@ class KeyMigrationRunner {
     int targetKeyId,
   ) async {
     try {
-      final tableMeta = await dataStore.tableDataManager.getTableMeta(table);
-      if (tableMeta == null || tableMeta.btreeFirstLeaf.isNull) {
+      final tableDataMeta =
+          await dataStore.tableDataManager.getTableDataMeta(table);
+      if (tableDataMeta == null || tableDataMeta.btreeFirstLeaf.isNull) {
         return true;
       }
-      final firstLeaf = tableMeta.btreeFirstLeaf;
-      final lastLeaf = tableMeta.btreeLastLeaf;
-      final btreePageSize = tableMeta.btreePageSize;
+      final firstLeaf = tableDataMeta.btreeFirstLeaf;
+      final lastLeaf = tableDataMeta.btreeLastLeaf;
+      final btreePageSize = tableDataMeta.btreePageSize;
 
       Future<bool> checkPage(TreePagePtr leaf) async {
         if (leaf.isNull) return true;
