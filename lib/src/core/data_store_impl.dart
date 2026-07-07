@@ -2534,7 +2534,7 @@ class DataStoreImpl {
         }
       }
       // Get table file metadata to make an informed decision on the update strategy
-      final tableMeta = await tableDataManager.getTableMeta(table);
+      final tableDataMeta = await tableDataManager.getTableDataMeta(table);
 
       // Get memory manager to access cache size limits
       final recordCacheSize =
@@ -2548,13 +2548,13 @@ class DataStoreImpl {
       // If resuming a large update from checkpoint, force heavy path (disable optimizable branch)
       if (checkpointOpId == null) {
         // Small table heuristics: always optimize when
-        // - table meta is unknown or size invalid
+        // - table data meta is unknown or size invalid
         // - size < 5MB (unconditional minimum threshold)
         // - size < 30% of record cache size
         const int minSmallTableBytes = 5 * 1024 * 1024; // 5MB
-        if (tableMeta == null ||
-            tableMeta.totalSizeInBytes < minSmallTableBytes ||
-            tableMeta.totalSizeInBytes < recordCacheSize * 0.3) {
+        if (tableDataMeta == null ||
+            tableDataMeta.totalSizeInBytes < minSmallTableBytes ||
+            tableDataMeta.totalSizeInBytes < recordCacheSize * 0.3) {
           isOptimizableQuery = true;
         }
 
@@ -3291,7 +3291,7 @@ class DataStoreImpl {
       // If inside a transaction and this is a heavy delete path, we should defer execution
       final String? txId = Zone.current[_txnZoneKey] as String?;
       // Get table file metadata to make an informed decision on the deletion strategy
-      final tableMeta = await tableDataManager.getTableMeta(table);
+      final tableDataMeta = await tableDataManager.getTableDataMeta(table);
 
       // Get memory manager to access cache size limits
       final recordCacheSize =
@@ -3309,13 +3309,13 @@ class DataStoreImpl {
       // If resuming a large delete from checkpoint, force heavy path (disable optimizable branch)
       if (checkpointOpId == null) {
         // Small table heuristics: always optimize when
-        // - table meta is unknown or size invalid
+        // - table data meta is unknown or size invalid
         // - size < 5MB (unconditional minimum threshold)
         // - size < 30% of record cache size
         const int minSmallTableBytes = 5 * 1024 * 1024; // 5MB
-        if (tableMeta == null ||
-            tableMeta.totalSizeInBytes < minSmallTableBytes ||
-            tableMeta.totalSizeInBytes < recordCacheSize * 0.3) {
+        if (tableDataMeta == null ||
+            tableDataMeta.totalSizeInBytes < minSmallTableBytes ||
+            tableDataMeta.totalSizeInBytes < recordCacheSize * 0.3) {
           isOptimizableQuery = true;
         }
 
@@ -4086,11 +4086,11 @@ class DataStoreImpl {
         for (final f in tableSchema.fields) f.name: f
       };
 
-      // Snapshot table meta once: avoids repeated meta reads in hot loops.
-      final tableMeta = await tableDataManager.getTableMeta(table);
+      // Snapshot table data meta once: avoids repeated meta reads in hot loops.
+      final tableDataMeta = await tableDataManager.getTableDataMeta(table);
       // We can safely skip disk unique checks if there is no committed data.
       final bool hasCommittedData =
-          tableMeta != null && tableMeta.totalRecords > 0;
+          tableDataMeta != null && tableDataMeta.totalRecords > 0;
       final bool skipDiskUniqueChecks = !hasCommittedData;
       final pkMatcher =
           ValueMatcher.getMatcher(tableSchema.getPrimaryKeyMatcherType());
@@ -5851,11 +5851,11 @@ class DataStoreImpl {
           }
 
           final table = await getTableContext(tableName);
-          final tableMeta = await tableDataManager.getTableMeta(table);
-          if (tableMeta != null && !tableMeta.btreeFirstLeaf.isNull) {
+          final tableDataMeta = await tableDataManager.getTableDataMeta(table);
+          if (tableDataMeta != null && !tableDataMeta.btreeFirstLeaf.isNull) {
             await tableTreePartitionManager?.prewarmBoundaryPages(
               table,
-              meta: tableMeta,
+              meta: tableDataMeta,
             );
           }
 
@@ -5933,12 +5933,12 @@ class DataStoreImpl {
       if (!_isInitialized) return maxPrewarmBytes - currentPrewarmedBytes;
       try {
         final table = getTableContextSync(tableName);
-        final tableMeta = await tableDataManager.getTableMeta(table);
+        final tableDataMeta = await tableDataManager.getTableDataMeta(table);
         if (!_isInitialized) return maxPrewarmBytes - currentPrewarmedBytes;
-        if (tableMeta == null || tableMeta.totalRecords <= 0) continue;
+        if (tableDataMeta == null || tableDataMeta.totalRecords <= 0) continue;
 
         final indexBytes = await _estimateTableIndexBytes(table);
-        final estimatedBytes = tableMeta.totalSizeInBytes + indexBytes;
+        final estimatedBytes = tableDataMeta.totalSizeInBytes + indexBytes;
         if (currentPrewarmedBytes + estimatedBytes > maxPrewarmBytes) {
           continue;
         }
@@ -5998,16 +5998,16 @@ class DataStoreImpl {
         if (!tableExistsInSpace || !_isInitialized) continue;
 
         final table = await getTableContext(tableName);
-        final tableMeta = await tableDataManager.getTableMeta(table);
-        if (tableMeta == null || tableMeta.totalRecords <= 0) continue;
+        final tableDataMeta = await tableDataManager.getTableDataMeta(table);
+        if (tableDataMeta == null || tableDataMeta.totalRecords <= 0) continue;
 
         final schema = table.schema;
 
         final indexBytes = await _estimateTableIndexBytes(table);
-        final estimatedBytes = tableMeta.totalSizeInBytes + indexBytes;
+        final estimatedBytes = tableDataMeta.totalSizeInBytes + indexBytes;
 
         if (currentPrewarmedBytes + estimatedBytes > prewarmBudgetBytes ||
-            tableMeta.totalRecords > maxRecordsSafetyCap) {
+            tableDataMeta.totalRecords > maxRecordsSafetyCap) {
           break;
         }
 
