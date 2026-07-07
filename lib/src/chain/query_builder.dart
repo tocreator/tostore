@@ -350,7 +350,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   /// a limit of 1 so the engine can short‑circuit as soon as the first match is
   /// found. For join queries, it falls back to fetching at most one record.
   Future<bool> exists() async {
-    // No conditions, no joins: use table metadata for O(1) check.
+    // No conditions, no joins: use table data metadata for O(1) check.
     if (queryCondition.isEmpty &&
         _joins.isEmpty &&
         _pendingForeignKeyJoins?.isEmpty != false) {
