@@ -158,7 +158,8 @@ class _Reader {
 
   int u32le() {
     if (_offset + 4 > _data.length) return 0;
-    final value = ByteData.sublistView(_data, _offset).getUint32(0, Endian.little);
+    final value =
+        ByteData.sublistView(_data, _offset).getUint32(0, Endian.little);
     _offset += 4;
     return value;
   }
