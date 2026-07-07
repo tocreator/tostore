@@ -76,12 +76,12 @@ final class CacheManager {
       }
     });
 
-    // Meta caches (table meta + index meta)
+    // Meta caches (table data meta + index meta)
     mm.registerCacheEvictionCallback(MemoryQuotaType.meta, () async {
       try {
-        await _dataStore.tableDataManager.evictTableMetaCache(ratio: 0.3);
+        await _dataStore.tableDataManager.evictTableDataMetaCache(ratio: 0.3);
       } catch (e) {
-        Logger.warn('Evict table meta cache failed', rawError: e);
+        Logger.warn('Evict table data meta cache failed', rawError: e);
       }
       try {
         await _dataStore.indexManager?.evictIndexMetaCache(0.3);
@@ -161,7 +161,7 @@ final class CacheManager {
     bool invalidateQuery = true,
     bool invalidateRecords = true,
     bool invalidateRecordCount = true,
-    bool invalidateTableMeta = true,
+    bool invalidateTableDataMeta = true,
     bool invalidateTablePages = true,
     bool invalidateIndexData = true,
     bool invalidateIndexMeta = true,
@@ -181,8 +181,8 @@ final class CacheManager {
         // Record count cache may need refresh even when hot records are kept.
         _dataStore.tableDataManager.removeRecordCountCache(table);
       }
-      if (invalidateTableMeta) {
-        _dataStore.tableDataManager.invalidateTableMetaCacheForTable(table);
+      if (invalidateTableDataMeta) {
+        _dataStore.tableDataManager.invalidateTableDataMetaCacheForTable(table);
       }
       if (invalidateTablePages) {
         _dataStore.tableTreePartitionManager?.clearPageCacheForTable(table);
