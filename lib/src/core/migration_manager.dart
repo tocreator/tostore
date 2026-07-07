@@ -4096,11 +4096,11 @@ class MigrationManager {
 
               final sourcePkName = sourceSchema.primaryKey;
 
-              final tableMeta = await migrationInstance.tableDataManager
-                  .getTableMeta(migrationTableCtx);
-              if (tableMeta != null) {
+              final tableDataMeta = await migrationInstance.tableDataManager
+                  .getTableDataMeta(migrationTableCtx);
+              if (tableDataMeta != null) {
                 _telemetry.setCurrentSpaceExpectedRecords(
-                    currentTask.taskId, tableMeta.totalRecords);
+                    currentTask.taskId, tableDataMeta.totalRecords);
               }
 
               final startCursor = currentTask.checkpointKeyForSpace(space);
@@ -5641,7 +5641,7 @@ class MigrationManager {
         invalidateQuery: invalidateRecordViews,
         invalidateRecords: invalidateRecordViews,
         invalidateRecordCount: false,
-        invalidateTableMeta: false,
+        invalidateTableDataMeta: false,
         invalidateTablePages: false,
         invalidateIndexData: invalidateIndexCaches,
         invalidateIndexMeta: invalidateIndexCaches,
