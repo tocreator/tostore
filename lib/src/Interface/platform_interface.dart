@@ -30,6 +30,9 @@ abstract class PlatformInterface {
   /// Whether it's a Linux platform
   bool get isLinux;
 
+  /// Whether it's a server environment (e.g. headless Linux)
+  bool get isServerEnvironment;
+
   /// Get system memory (MB)
   Future<int> getSystemMemoryMB();
 
