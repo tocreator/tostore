@@ -622,7 +622,7 @@ class VectorIndexManager {
       var loadedFromLegacyPath = false;
 
       if (diskLoad == null) {
-        // Stable meta missing — fall back to deprecated logical-name directory.
+        // Stable data meta missing — fall back to deprecated logical-name directory.
         final idx = _dataStore.schemaManager
             ?.findIndexSchemaByUid(table.schema, indexUid);
         final schemaLegacyName = idx?.actualIndexName;
