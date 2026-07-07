@@ -369,13 +369,13 @@ class ResourceManager {
         case MemoryQuotaType.schema:
           return _dataStore!.cacheManager.getCurrentSchemaCacheSize();
         case MemoryQuotaType.meta:
-          // Meta cache = Table Meta + Index Meta (Data excluded)
-          final tableMetaSize =
-              _dataStore!.tableDataManager.getCurrentTableMetaCacheSize();
+          // Meta cache = Table Data Meta + Index Meta (Data excluded)
+          final tableDataMetaSize =
+              _dataStore!.tableDataManager.getCurrentTableDataMetaCacheSize();
           final indexMetaSize =
               await _dataStore!.indexManager?.getCurrentIndexMetaCacheSize() ??
                   0;
-          return tableMetaSize + indexMetaSize;
+          return tableDataMetaSize + indexMetaSize;
       }
     } catch (e) {
       Logger.error('Failed to get current cache size for ${cacheType.name}',
