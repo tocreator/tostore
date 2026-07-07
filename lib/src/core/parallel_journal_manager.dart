@@ -619,8 +619,8 @@ class ParallelJournalManager {
           try {
             final schema = await _dataStore.schemaManager
                 ?.getTableSchema(tableContext.tableUid);
-            final tableMeta =
-                await _dataStore.tableDataManager.getTableMeta(tableContext);
+            final tableDataMeta = await _dataStore.tableDataManager
+                .getTableDataMeta(tableContext);
             final indexUids = <String>[];
             final baseIndexTotalEntries = <String, int>{};
             final baseIndexTotalSizeInBytes = <String, int>{};
@@ -657,11 +657,11 @@ class ParallelJournalManager {
             estimatedTotalWorkOps += tableRecordCount * (1 + indexUids.length);
 
             tablePlan[tableUid] = {
-              'willUpdateTableMeta': true,
+              'willUpdateTableDataMeta': true,
               'indexes': indexUids,
               'willUpdateIndexMeta': indexUids.isNotEmpty,
-              'baseTotalRecords': tableMeta?.totalRecords,
-              'baseTotalSizeInBytes': tableMeta?.totalSizeInBytes,
+              'baseTotalRecords': tableDataMeta?.totalRecords,
+              'baseTotalSizeInBytes': tableDataMeta?.totalSizeInBytes,
               'baseIndexTotalEntries': baseIndexTotalEntries,
               'baseIndexTotalSizeInBytes': baseIndexTotalSizeInBytes,
             };
@@ -684,8 +684,8 @@ class ParallelJournalManager {
               tablePlan: tablePlan.map((k, v) => MapEntry(
                   k,
                   TablePlan(
-                    willUpdateTableMeta:
-                        v['willUpdateTableMeta'] as bool? ?? true,
+                    willUpdateTableDataMeta:
+                        v['willUpdateTableDataMeta'] as bool? ?? true,
                     indexes: ((v['indexes'] as List?) ?? const <dynamic>[])
                         .map((e) => e.toString())
                         .toList(),
@@ -1690,7 +1690,7 @@ class ParallelJournalManager {
       Logger.warn('Failed to scan journal for flushed partitions', rawError: e);
     }
 
-    // Recover table metadata
+    // Recover table data metadata
     for (final entry in tableLastFlushedEntry.entries) {
       final tableContext = _resolveTableContext(entry.key);
       if (tableContext != null) {
@@ -1804,30 +1804,31 @@ class ParallelJournalManager {
     return false;
   }
 
-  /// Recover table metadata from maintenance batch
+  /// Recover table data meta from maintenance batch
   Future<void> _recoverTableMaintenanceMetadata(
       TableContext table, TablePartitionFlushedEntry lastEntry) async {
     final tableName = table.tableName;
     try {
-      final tableMeta = await _dataStore.tableDataManager.getTableMeta(table);
-      if (tableMeta == null) return;
+      final tableDataMeta =
+          await _dataStore.tableDataManager.getTableDataMeta(table);
+      if (tableDataMeta == null) return;
 
       // Get expected values from the last flushed entry (if it has totalRecords/totalSizeInBytes)
       final expectedTotalRecords = lastEntry.totalRecords;
       final expectedTotalSize = lastEntry.totalSizeInBytes;
-      final currentTotalRecords = tableMeta.totalRecords;
-      final currentTotalSize = tableMeta.totalSizeInBytes;
+      final currentTotalRecords = tableDataMeta.totalRecords;
+      final currentTotalSize = tableDataMeta.totalSizeInBytes;
 
       // Check if B+Tree structure fields need recovery (e.g., new partition created but metadata not updated)
-      // If lastEntry.partitionNo >= tableMeta.btreePartitionCount, a new partition was created
+      // If lastEntry.partitionNo >= tableDataMeta.btreePartitionCount, a new partition was created
       final needsBTreeRecovery =
-          lastEntry.partitionNo >= tableMeta.btreePartitionCount;
+          lastEntry.partitionNo >= tableDataMeta.btreePartitionCount;
       int? recoveredPartitionCount;
       int? recoveredNextPageNo;
 
       if (needsBTreeRecovery) {
         // New partition was created but metadata not updated, recover from last partition file
-        final pageSize = tableMeta.btreePageSize;
+        final pageSize = tableDataMeta.btreePageSize;
         final lastPartitionNo = lastEntry.partitionNo;
         try {
           final lastPartitionPath = await _dataStore.pathManager
@@ -1868,26 +1869,29 @@ class ParallelJournalManager {
 
       // Update metadata once if needed (combine stats and B+Tree structure updates)
       if (needsStatsUpdate || needsBTreeRecovery) {
-        final updatedMeta = tableMeta.copyWith(
+        final updatedMeta = tableDataMeta.copyWith(
           // Update statistics if needed (needsStatsUpdate ensures non-null)
-          totalRecords:
-              needsStatsUpdate ? expectedTotalRecords : tableMeta.totalRecords,
-          totalSizeInBytes:
-              needsStatsUpdate ? expectedTotalSize : tableMeta.totalSizeInBytes,
+          totalRecords: needsStatsUpdate
+              ? expectedTotalRecords
+              : tableDataMeta.totalRecords,
+          totalSizeInBytes: needsStatsUpdate
+              ? expectedTotalSize
+              : tableDataMeta.totalSizeInBytes,
           // Update B+Tree structure if needed
           btreePartitionCount:
-              recoveredPartitionCount ?? tableMeta.btreePartitionCount,
-          btreeNextPageNo: recoveredNextPageNo ?? tableMeta.btreeNextPageNo,
+              recoveredPartitionCount ?? tableDataMeta.btreePartitionCount,
+          btreeNextPageNo: recoveredNextPageNo ?? tableDataMeta.btreeNextPageNo,
           timestamps: Timestamps(
-            created: tableMeta.timestamps.created,
+            created: tableDataMeta.timestamps.created,
             modified: DateTime.now(),
           ),
         );
-        await _dataStore.tableDataManager.updateTableMeta(table, updatedMeta);
+        await _dataStore.tableDataManager
+            .updateTableDataMeta(table, updatedMeta);
 
         if (needsStatsUpdate && needsBTreeRecovery) {
           Logger.info(
-            'Recovered maintenance batch metadata and B+Tree structure for $tableName: $expectedTotalRecords records (was $currentTotalRecords), $expectedTotalSize bytes (was $currentTotalSize), partitionCount=$recoveredPartitionCount (was ${tableMeta.btreePartitionCount})',
+            'Recovered maintenance batch metadata and B+Tree structure for $tableName: $expectedTotalRecords records (was $currentTotalRecords), $expectedTotalSize bytes (was $currentTotalSize), partitionCount=$recoveredPartitionCount (was ${tableDataMeta.btreePartitionCount})',
           );
         } else if (needsStatsUpdate) {
           Logger.info(
@@ -1895,7 +1899,7 @@ class ParallelJournalManager {
           );
         } else if (needsBTreeRecovery) {
           Logger.info(
-            'Recovered B+Tree structure for $tableName: partitionCount=$recoveredPartitionCount (was ${tableMeta.btreePartitionCount})',
+            'Recovered B+Tree structure for $tableName: partitionCount=$recoveredPartitionCount (was ${tableDataMeta.btreePartitionCount})',
           );
         }
       } else if (expectedTotalRecords != null && expectedTotalSize != null) {
@@ -2156,7 +2160,7 @@ class ParallelJournalManager {
       // Capture tables/indexes already marked as flushed (metadata updated).
       final captureFlushedTables = scanResult.flushedTables;
       final captureFlushedIndexes = scanResult.flushedIndexes;
-      // were NOT marked with TableMetaUpdatedEntry/IndexMetaUpdatedEntry.
+      // were NOT marked with TableDataMetaUpdatedEntry/IndexMetaUpdatedEntry.
       // This ensures metadata is consistent with actual B+Tree data.
       await _repairUnflushedTablesAndIndexes(
         batchTables: captureBatchTables,
@@ -2193,7 +2197,7 @@ class ParallelJournalManager {
   }
 
   /// Repair statistics for tables/indexes that were NOT marked with
-  /// TableMetaUpdatedEntry/IndexMetaUpdatedEntry during recovery.
+  /// TableDataMetaUpdatedEntry/IndexMetaUpdatedEntry during recovery.
   ///
   /// This handles the case where pages were written but metadata update
   /// was not journaled before crash.
@@ -2223,7 +2227,7 @@ class ParallelJournalManager {
           }
 
           final meta =
-              await _dataStore.tableDataManager.getTableMeta(tableContext);
+              await _dataStore.tableDataManager.getTableDataMeta(tableContext);
           if (meta == null) continue;
 
           // Restore to the state BEFORE the batch.
@@ -2236,7 +2240,7 @@ class ParallelJournalManager {
                 created: meta.timestamps.created, modified: DateTime.now()),
           );
 
-          await _dataStore.tableDataManager.updateTableMeta(
+          await _dataStore.tableDataManager.updateTableDataMeta(
             tableContext,
             updated,
             flush: true,
@@ -2522,8 +2526,8 @@ class ParallelJournalManager {
     };
     // Capture base totals so recovery can safely restore to "before maintenance batch".
     final schema = tableContext.schema;
-    final tableMeta =
-        await _dataStore.tableDataManager.getTableMeta(tableContext);
+    final tableDataMeta =
+        await _dataStore.tableDataManager.getTableDataMeta(tableContext);
     final indexUids = <String>[];
     final baseIndexTotalEntries = <String, int>{};
     final baseIndexTotalSizeInBytes = <String, int>{};
@@ -2547,11 +2551,11 @@ class ParallelJournalManager {
     } catch (_) {}
     final Map<String, TablePlan> tablePlan = {
       tableUid: TablePlan(
-        willUpdateTableMeta: true,
+        willUpdateTableDataMeta: true,
         indexes: indexUids,
         willUpdateIndexMeta: indexUids.isNotEmpty,
-        baseTotalRecords: tableMeta?.totalRecords,
-        baseTotalSizeInBytes: tableMeta?.totalSizeInBytes,
+        baseTotalRecords: tableDataMeta?.totalRecords,
+        baseTotalSizeInBytes: tableDataMeta?.totalSizeInBytes,
         baseIndexTotalEntries: baseIndexTotalEntries,
         baseIndexTotalSizeInBytes: baseIndexTotalSizeInBytes,
       ),
@@ -2737,8 +2741,8 @@ class ParallelJournalManager {
           final tableContext = _tableContextFromUid(TableUid(rec.tableUid));
           if (tableContext == null) continue;
           if (rec.treeKind == PageRedoTreeKind.table) {
-            final meta =
-                await _dataStore.tableDataManager.getTableMeta(tableContext);
+            final meta = await _dataStore.tableDataManager
+                .getTableDataMeta(tableContext);
             if (meta == null) continue;
             final updated = meta.copyWith(
               btreePageSize: rec.btreePageSize,
@@ -2757,7 +2761,7 @@ class ParallelJournalManager {
               ),
             );
             await _dataStore.tableDataManager
-                .updateTableMeta(tableContext, updated, flush: true);
+                .updateTableDataMeta(tableContext, updated, flush: true);
           } else {
             final idxUid = rec.indexUid;
             if (idxUid == null || idxUid.isEmpty) continue;
@@ -2849,7 +2853,7 @@ class ParallelJournalManager {
           } else if (entry is BatchCompletedEntry &&
               entry.batchId == batch.batchId) {
             isCompleted = true;
-          } else if (entry is TableMetaUpdatedEntry &&
+          } else if (entry is TableDataMetaUpdatedEntry &&
               entry.batchId == batch.batchId) {
             flushedTables.add(_resolvePersistedTableField(entry.table));
           } else if (entry is IndexMetaUpdatedEntry &&
@@ -2957,7 +2961,7 @@ class ParallelJournalManager {
         else if (entry is TablePartitionFlushedEntry)
           // ignore: curly_braces_in_flow_control_structures
           json['batchId'] = entry.batchId;
-        else if (entry is TableMetaUpdatedEntry)
+        else if (entry is TableDataMetaUpdatedEntry)
           // ignore: curly_braces_in_flow_control_structures
           json['batchId'] = entry.batchId ?? (activeContext?.batchId ?? '');
         else if (entry is IndexPartitionFlushedEntry)
@@ -2984,7 +2988,7 @@ class ParallelJournalManager {
         else if (entry is TablePartitionFlushedEntry)
           // ignore: curly_braces_in_flow_control_structures
           json['batchType'] = entry.batchType.value;
-        else if (entry is TableMetaUpdatedEntry)
+        else if (entry is TableDataMetaUpdatedEntry)
           // ignore: curly_braces_in_flow_control_structures
           json['batchType'] = entry.batchType?.value ??
               (activeContext?.batchType.value ?? BatchType.flush.value);
@@ -3035,7 +3039,7 @@ class ParallelJournalManager {
 class _BatchJournalScanResult {
   final bool isCompleted;
 
-  /// Tables whose metadata has been successfully updated (TableMetaUpdatedEntry).
+  /// Tables whose metadata has been successfully updated (TableDataMetaUpdatedEntry).
   final Set<TableUid> flushedTables;
 
   /// Indexes whose metadata has been successfully updated (IndexMetaUpdatedEntry).
