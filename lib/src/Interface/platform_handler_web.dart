@@ -53,6 +53,9 @@ class PlatformHandlerImpl implements PlatformInterface {
   bool get isLinux => false;
 
   @override
+  bool get isServerEnvironment => false;
+
+  @override
   Future<int> getSystemMemoryMB() async {
     return 512;
   }
