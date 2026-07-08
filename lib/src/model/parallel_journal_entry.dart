@@ -37,8 +37,8 @@ abstract class ParallelJournalEntry {
         return TaskDoneEntry.fromJson(json);
       case 'tablePartitionFlushed':
         return TablePartitionFlushedEntry.fromJson(json);
-      case 'tableMetaUpdated':
-        return TableMetaUpdatedEntry.fromJson(json);
+      case 'tableDataMetaUpdated':
+        return TableDataMetaUpdatedEntry.fromJson(json);
       case 'indexPartitionFlushed':
         return IndexPartitionFlushedEntry.fromJson(json);
       case 'indexMetaUpdated':
@@ -66,7 +66,7 @@ class WalPointerRef {
 }
 
 class TablePlan {
-  final bool willUpdateTableMeta;
+  final bool willUpdateTableDataMeta;
   final List<String> indexes;
   final bool willUpdateIndexMeta;
   final int? baseTotalRecords;
@@ -75,7 +75,7 @@ class TablePlan {
   final Map<String, int>? baseIndexTotalSizeInBytes;
 
   const TablePlan({
-    required this.willUpdateTableMeta,
+    required this.willUpdateTableDataMeta,
     required this.indexes,
     required this.willUpdateIndexMeta,
     this.baseTotalRecords,
@@ -85,7 +85,7 @@ class TablePlan {
   });
 
   Map<String, dynamic> toJson() => {
-        'willUpdateTableMeta': willUpdateTableMeta,
+        'willUpdateTableDataMeta': willUpdateTableDataMeta,
         'indexes': indexes,
         'willUpdateIndexMeta': willUpdateIndexMeta,
         if (baseTotalRecords != null) 'baseTotalRecords': baseTotalRecords,
@@ -98,7 +98,8 @@ class TablePlan {
       };
 
   static TablePlan fromJson(Map<String, dynamic> json) => TablePlan(
-        willUpdateTableMeta: json['willUpdateTableMeta'] as bool? ?? true,
+        willUpdateTableDataMeta:
+            json['willUpdateTableDataMeta'] as bool? ?? true,
         indexes: ((json['indexes'] as List?) ?? const <dynamic>[])
             .map((e) => e.toString())
             .toList(),
@@ -277,13 +278,14 @@ class TablePartitionFlushedEntry extends ParallelJournalEntry {
   }
 }
 
-class TableMetaUpdatedEntry extends ParallelJournalEntry {
+class TableDataMetaUpdatedEntry extends ParallelJournalEntry {
   @override
-  final String type = 'tableMetaUpdated';
+  final String type = 'tableDataMetaUpdated';
   final String table;
   final String? batchId;
   final BatchType? batchType;
-  TableMetaUpdatedEntry({required this.table, this.batchId, this.batchType});
+  TableDataMetaUpdatedEntry(
+      {required this.table, this.batchId, this.batchType});
   @override
   Map<String, dynamic> toJson() {
     final result = <String, dynamic>{
@@ -295,8 +297,8 @@ class TableMetaUpdatedEntry extends ParallelJournalEntry {
     return result;
   }
 
-  static TableMetaUpdatedEntry fromJson(Map<String, dynamic> json) =>
-      TableMetaUpdatedEntry(
+  static TableDataMetaUpdatedEntry fromJson(Map<String, dynamic> json) =>
+      TableDataMetaUpdatedEntry(
         table: resolveTableFieldFromJson(json),
         batchId: (json['batchId'] as String?),
         batchType: BatchType.fromString(
