@@ -382,7 +382,7 @@ class V2Upgrade {
         return;
       }
 
-      // Manually build old table meta path (old format: main.dat)
+      // Manually build old table data meta path (old format: main.dat)
       final tablePath = _manualGetTablePath(db, tableName);
       final oldDataMetaPath = pathJoin(tablePath, 'data', 'main.dat');
 
