@@ -6,7 +6,7 @@ import 'package:path/path.dart' as p;
 
 import '../Interface/storage_interface.dart';
 import '../handler/common.dart';
-import '../handler/encoder.dart';
+import '../handler/encryption.dart';
 import '../handler/logger.dart';
 import '../handler/memcomparable.dart';
 import '../handler/parallel_processor.dart';
@@ -1042,7 +1042,7 @@ final class IndexTreePartitionManager {
       final int? encTypeIndex =
           _dataStore.config.encryptionConfig?.encryptionType.index;
       final EncoderConfig encoderConfig =
-          EncoderHandler.getCurrentEncodingState();
+          EncryptionManager.getCurrentEncodingState();
 
       EncryptionType? encType;
       if (encTypeIndex != null) {
