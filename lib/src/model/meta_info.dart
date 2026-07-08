@@ -191,8 +191,8 @@ class FileMeta {
       'FileMeta(version: $version, type: ${type.key}, name: $name, fileSizeInBytes: $fileSizeInBytes, timestamps: $timestamps)';
 }
 
-/// table meta model
-class TableMeta {
+/// table data meta model
+class TableDataMeta {
   final int version;
   final TableUid tableUid;
   final int totalSizeInBytes;
@@ -230,7 +230,7 @@ class TableMeta {
   /// B+Tree height (0 = root is leaf).
   final int btreeHeight;
 
-  TableMeta({
+  TableDataMeta({
     int? version,
     required this.tableUid,
     required this.totalSizeInBytes,
@@ -252,24 +252,24 @@ class TableMeta {
   /// First data page number (pageNo=0 is reserved for [PartitionMetaPage]).
   static const int firstDataPageNo = 1;
 
-  /// Creates an initial empty [TableMeta] with default B+Tree configuration.
+  /// Creates an initial empty [TableDataMeta] with default B+Tree configuration.
   ///
   /// [tableUid] - The table unique identifier.
   /// [pageSize] - Page size in bytes (default: 16KB).
   /// [partitionCount] - Initial partition count (default: 1).
   /// [now] - Optional timestamp override; uses current time if not provided.
   ///
-  /// This is the canonical way to create an initial [TableMeta] when:
+  /// This is the canonical way to create an initial [TableDataMeta] when:
   /// - Creating a new table
   /// - Clearing an existing table (with optional preserved pageSize/partitionCount)
-  static TableMeta createEmpty({
+  static TableDataMeta createEmpty({
     required TableUid tableUid,
     int pageSize = defaultPageSize,
     int partitionCount = 1,
     DateTime? now,
   }) {
     final timestamp = now ?? DateTime.now();
-    return TableMeta(
+    return TableDataMeta(
       tableUid: tableUid,
       totalSizeInBytes: 0,
       totalRecords: 0,
@@ -284,7 +284,7 @@ class TableMeta {
     );
   }
 
-  TableMeta copyWith({
+  TableDataMeta copyWith({
     int? version,
     TableUid? tableUid,
     int? totalSizeInBytes,
@@ -299,7 +299,7 @@ class TableMeta {
     TreePagePtr? btreeLastLeaf,
     int? btreeHeight,
   }) {
-    return TableMeta(
+    return TableDataMeta(
       version: version ?? this.version,
       tableUid: tableUid ?? this.tableUid,
       totalSizeInBytes: totalSizeInBytes ?? this.totalSizeInBytes,
@@ -320,7 +320,7 @@ class TableMeta {
   ///
   /// [tableUidFallback] supplies the uid when legacy meta files omit or leave
   /// [tableUid] empty (e.g. loaded from a uid-based directory path).
-  factory TableMeta.fromJson(
+  factory TableDataMeta.fromJson(
     Map<String, dynamic> json, {
     TableUid? tableUidFallback,
   }) {
@@ -339,7 +339,8 @@ class TableMeta {
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,
-          message: 'Missing required fields for TableMeta. Missing fields: ${[
+          message:
+              'Missing required fields for TableDataMeta. Missing fields: ${[
             if (resolvedUid == null) 'tableUid',
             if (json['totalSizeInBytes'] == null) 'totalSizeInBytes',
             if (json['totalRecords'] == null) 'totalRecords',
@@ -356,7 +357,7 @@ class TableMeta {
       ]);
     }
 
-    return TableMeta(
+    return TableDataMeta(
       version:
           resolveVersionValue(json['version'], InternalConfig.tableDataVersion),
       tableUid: TableUid.parse(resolvedUid),
@@ -403,7 +404,7 @@ class TableMeta {
 
   @override
   String toString() =>
-      'TableMeta(version: $version, tableUid: $tableUid, totalSizeInBytes: $totalSizeInBytes, totalRecords: $totalRecords, btreePartitionCount: $btreePartitionCount, btreeHeight: $btreeHeight, btreeRoot: $btreeRoot)';
+      'TableDataMeta(version: $version, tableUid: $tableUid, totalSizeInBytes: $totalSizeInBytes, totalRecords: $totalRecords, btreePartitionCount: $btreePartitionCount, btreeHeight: $btreeHeight, btreeRoot: $btreeRoot)';
 }
 
 /// timestamp info
