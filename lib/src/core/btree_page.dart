@@ -1,7 +1,7 @@
 import 'dart:typed_data';
 
 import '../handler/memcomparable.dart';
-import '../handler/encoder.dart';
+import '../handler/encryption.dart';
 import '../handler/platform_byte_data.dart';
 import '../model/data_store_config.dart';
 import '../model/meta_info.dart';
@@ -794,7 +794,7 @@ final class BTreePageCodec {
   }) {
     final ec = config.encryptionConfig;
     if (ec == null) return payload;
-    return EncoderHandler.encodeBytes(
+    return EncryptionManager.encodeBytes(
       payload,
       customKey: encryptionKey,
       keyId: encryptionKeyId,
@@ -813,7 +813,7 @@ final class BTreePageCodec {
   }) {
     final ec = config.encryptionConfig;
     if (ec == null) return encoded;
-    return EncoderHandler.decodeBytes(
+    return EncryptionManager.decodeBytes(
       encoded,
       customKey: encryptionKey,
       keyId: encryptionKeyId,
@@ -875,7 +875,7 @@ final class BTreePageSizer {
     final ec = config.encryptionConfig;
     if (ec == null) return plainPayloadLen;
 
-    final int keyId = encryptionKeyId ?? EncoderHandler.getCurrentKeyId();
+    final int keyId = encryptionKeyId ?? EncryptionManager.getCurrentKeyId();
     final int headerLen = _encoderHeaderLen(keyId);
 
     switch (ec.encryptionType) {
