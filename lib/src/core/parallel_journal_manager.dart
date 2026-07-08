@@ -6,7 +6,7 @@ import 'dart:typed_data';
 import 'package:path/path.dart' as p;
 
 import '../Interface/storage_interface.dart';
-import '../handler/encoder.dart';
+import '../handler/encryption.dart';
 import '../handler/logger.dart';
 import '../handler/parallel_processor.dart';
 import '../handler/value_matcher.dart';
@@ -1325,7 +1325,7 @@ class ParallelJournalManager {
               .add(op.cutoff);
         }
       } catch (_) {}
-      final encoderConfig = EncoderHandler.getCurrentEncodingState();
+      final encoderConfig = EncryptionManager.getCurrentEncodingState();
       final partitionYieldController = YieldController(
           'ParallelJournalManager._recoverFromWal.partition',
           checkInterval: 1);
@@ -2359,7 +2359,7 @@ class ParallelJournalManager {
         );
       }
       final cap = _dataStore.config.logPartitionCycle;
-      final encoderConfig = EncoderHandler.getCurrentEncodingState();
+      final encoderConfig = EncryptionManager.getCurrentEncodingState();
       int p = startP;
       bool first = true;
       while (true) {
