@@ -14,7 +14,7 @@ import '../model/id_generator.dart';
 
 /// Version 3 upgrade:
 /// - Restructures storage directory names from physical table/index names to stable UIDs.
-/// - Migrates TableMeta/IndexMeta files on disk.
+/// - Migrates TableDataMeta/IndexMeta files on disk.
 /// - Writes `space_manifest.bin` deferred space metadata.
 /// - Bumps version config markers and cleans up legacy map properties.
 class V3Upgrade {
@@ -364,7 +364,7 @@ class V3Upgrade {
     // Rename/move the table directory
     await _dataStore.storage.moveDirectory(oldPath, newPath);
 
-    // Update table metadata: data/meta.json
+    // Update table data metadata: data/meta.json
     final metaFilePath = path.join(newPath, 'data', 'meta.json');
     if (await _dataStore.storage.existsFile(metaFilePath)) {
       try {
@@ -377,7 +377,8 @@ class V3Upgrade {
               .writeAsString(metaFilePath, jsonEncode(json));
         }
       } catch (e) {
-        Logger.warn('Failed to update table metadata tableUid in v3 upgrade',
+        Logger.warn(
+            'Failed to update table data metadata tableUid in v3 upgrade',
             rawError: e);
       }
     }
@@ -481,10 +482,9 @@ class V3Upgrade {
     required String tableUid,
     String? legacyIndexName,
   }) async {
-    final stableMetaPath =
-        path.join(indexDirPath, indexUid, 'ngh', 'meta.json');
-    if (await _dataStore.storage.existsFile(stableMetaPath)) {
-      await _rewriteNghMetaJsonFile(stableMetaPath, indexUid, tableUid);
+    final nghMetaPath = path.join(indexDirPath, indexUid, 'ngh', 'meta.json');
+    if (await _dataStore.storage.existsFile(nghMetaPath)) {
+      await _rewriteNghMetaJsonFile(nghMetaPath, indexUid, tableUid);
       return;
     }
 
@@ -504,7 +504,7 @@ class V3Upgrade {
     // NGH still under logical-name tree while stable uid tree is absent/incomplete.
     if (!await _dataStore.storage.existsDirectory(stableIndexDir)) {
       await _dataStore.storage.moveDirectory(legacyIndexDir, stableIndexDir);
-    } else if (!await _dataStore.storage.existsFile(stableMetaPath)) {
+    } else if (!await _dataStore.storage.existsFile(nghMetaPath)) {
       final legacyNghDir = path.join(legacyIndexDir, 'ngh');
       final stableNghDir = path.join(stableIndexDir, 'ngh');
       if (await _dataStore.storage.existsDirectory(legacyNghDir)) {
