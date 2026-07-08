@@ -1,7 +1,7 @@
 import 'dart:math';
 import 'dart:typed_data';
 
-import '../../handler/encoder.dart';
+import '../../handler/encryption.dart';
 import '../../handler/platform_handler.dart';
 import '../../handler/wal_encoder.dart';
 import '../../model/encoder_config.dart';
@@ -55,7 +55,7 @@ final class WalDecodeChunkRequest {
 Future<List<Map<String, dynamic>>> decodeWalChunk(
   WalDecodeChunkRequest request,
 ) async {
-  EncoderHandler.setEncodingState(request.encoderConfig);
+  EncryptionManager.setEncodingState(request.encoderConfig);
   return WalEncoder.decodeFile(request.chunkBytes, request.partitionIndex);
 }
 
