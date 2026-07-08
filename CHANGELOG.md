@@ -11,6 +11,7 @@ All notable changes to this project will be documented in this file.
 - Added `next()` and `prev()` methods to `QueryResult` for seamless and stateful cursor-based pagination.
 - Added `ResultStatus` (along with `SuccessStatus` and `GeneralStatus`) to represent granular item-level diagnostic outcomes, optimized for AI agents and automated scripts to precisely inspect operation results.
 - Added `LogRecord` structure and `LogLevel.critical` level for human-intervention-required events.
+- Added configurable `EncryptionScope` (`standard` and `full`) to `EncryptionConfig` to allow users to customize the database encryption boundary.
 
 ### Changed
 - Changed `db.updateSchema(...)` return value from a plain `String` (taskId) to `SchemaUpdateResult` to carry validation statuses, task identifier, estimated duration, and migration write mode.
