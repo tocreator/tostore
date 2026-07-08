@@ -3,7 +3,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import '../handler/chacha20_poly1305.dart';
-import '../handler/encoder.dart';
+import '../handler/encryption.dart';
 import '../handler/logger.dart';
 import '../model/db_exception.dart';
 import '../model/data_store_config.dart';
@@ -104,7 +104,7 @@ class KeyManager {
       if (isPlaintext) {
         return decrypted;
       }
-      return EncoderHandler.generateKey(decrypted);
+      return EncryptionManager.generateKey(decrypted);
     } catch (e) {
       return null;
     }
@@ -118,7 +118,7 @@ class KeyManager {
     _getEncryptionKey();
 
     // Set EncoderHandler encryption type
-    EncoderHandler.setEncryptionType(_getEncryptionType());
+    EncryptionManager.setEncryptionType(_getEncryptionType());
 
     // Try to get existing space configuration to determine the correct keyId
     SpaceConfig? spaceConfig = await _dataStore.getSpaceConfig();
@@ -210,7 +210,7 @@ class KeyManager {
     if (keyChanged && newKey.isNotEmpty) {
       // Key has changed, add new key to fallback keys with incremented keyId
       final newKeyId = spaceConfig.current.keyId + 1;
-      final newDecodedKey = EncoderHandler.generateKey(newKey);
+      final newDecodedKey = EncryptionManager.generateKey(newKey);
       fallbackKeys[newKeyId] = newDecodedKey;
       keyIdToUse = newKeyId;
       Logger.info(
@@ -224,11 +224,11 @@ class KeyManager {
       );
     }
 
-    EncoderHandler.setFallbackKeys(fallbackKeys);
+    EncryptionManager.setFallbackKeys(fallbackKeys);
 
     final encryptionType = _getEncryptionType();
     if (encryptionType != EncryptionType.none && newKey.isNotEmpty) {
-      EncoderHandler.setCurrentKey(newKey, keyIdToUse);
+      EncryptionManager.setCurrentKey(newKey, keyIdToUse);
     }
 
     return keyChangeInfo;
@@ -301,10 +301,10 @@ class KeyManager {
     final info = await migrationManager.getKeyMigrationInfo();
     if (info == null || !info.isRunning) return;
 
-    if (info.targetKeyId != EncoderHandler.getCurrentKeyId()) {
+    if (info.targetKeyId != EncryptionManager.getCurrentKeyId()) {
       Logger.warn(
         'Stale key migration meta (targetKeyId=${info.targetKeyId}, '
-        'current=${EncoderHandler.getCurrentKeyId()}); abandoning resume',
+        'current=${EncryptionManager.getCurrentKeyId()}); abandoning resume',
       );
       return;
     }
@@ -364,7 +364,7 @@ class KeyManager {
     if (plain.isEmpty) return null;
     return KeyChangeInfo(
       hasChanged: true,
-      newKey: EncoderHandler.generateKey(plain),
+      newKey: EncryptionManager.generateKey(plain),
       newKeyId: keyId,
       encryptKey: _encryptKey(plain, keyId),
     );
