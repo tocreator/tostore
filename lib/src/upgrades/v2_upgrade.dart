@@ -2,7 +2,7 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 import '../handler/common.dart';
-import '../handler/encoder.dart';
+import '../handler/encryption.dart';
 import '../handler/logger.dart';
 import '../handler/chacha20_poly1305_old.dart';
 import '../model/global_config.dart';
@@ -193,7 +193,7 @@ class V2Upgrade {
           final decoded = base64.decode(info.key);
           final plain = ChaCha20Poly1305Old.decrypt(
               encryptedData: decoded, key: key32Old);
-          fallbackKeys[info.keyId] = EncoderHandler.generateKey(plain);
+          fallbackKeys[info.keyId] = EncryptionManager.generateKey(plain);
         } catch (e) {
           // might be already upgraded if we are resuming?
           // but backup is "v1" config, so it should be old.
@@ -207,7 +207,7 @@ class V2Upgrade {
       }
 
       if (fallbackKeys.isNotEmpty) {
-        EncoderHandler.setFallbackKeys(fallbackKeys);
+        EncryptionManager.setFallbackKeys(fallbackKeys);
         Logger.info(
             'Set ${fallbackKeys.length} fallback keys from backup config');
       }
@@ -619,7 +619,7 @@ class V2Upgrade {
         return [];
       }
 
-      final decodedString = EncoderHandler.decode(partitionBytes);
+      final decodedString = EncryptionManager.decode(partitionBytes);
       if (decodedString.isEmpty) {
         return [];
       }
