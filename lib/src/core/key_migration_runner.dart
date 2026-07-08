@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 
-import '../handler/encoder.dart';
+import '../handler/encryption.dart';
 import '../handler/logger.dart';
 import '../model/db_exception.dart';
 import '../model/background_write_entry.dart';
@@ -455,7 +455,7 @@ class KeyMigrationRunner {
           offset,
           length: 32,
         );
-        return EncoderHandler.parseKeyId(bytes) == targetKeyId;
+        return EncryptionManager.parseKeyId(bytes) == targetKeyId;
       }
 
       if (!await checkPage(firstLeaf)) return false;
