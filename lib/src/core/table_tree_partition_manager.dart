@@ -6,7 +6,7 @@ import 'package:path/path.dart' as p;
 import '../Interface/storage_interface.dart';
 import '../handler/binary_schema_codec.dart';
 import '../handler/common.dart';
-import '../handler/encoder.dart';
+import '../handler/encryption.dart';
 import '../handler/logger.dart';
 import '../handler/memcomparable.dart';
 import '../handler/parallel_processor.dart';
@@ -38,7 +38,7 @@ import 'yield_controller.dart';
 ///
 /// - Cross-file global leaf chain: leaf next/prev uses (partitionNo,pageNo) and can cross files.
 /// - Partition files are purely physical sharding by size threshold (NOT range split).
-/// - Records are encoded by schema (values only) using [BinarySchemaCodec], then encrypted by [EncoderHandler].
+/// - Records are encoded by schema (values only) using [BinarySchemaCodec], then encrypted by [EncryptionManager].
 ///
 /// NOTE: This is an initial implementation focused on correctness + batch-friendly IO.
 final class TableTreePartitionManager {
@@ -1338,7 +1338,7 @@ final class TableTreePartitionManager {
 
       final int? encTypeIndex = _config.encryptionConfig?.encryptionType.index;
       final EncoderConfig encoderConfig =
-          EncoderHandler.getCurrentEncodingState();
+          EncryptionManager.getCurrentEncodingState();
 
       EncryptionType? encType;
       if (encTypeIndex != null) {
