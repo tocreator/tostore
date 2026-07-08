@@ -3,7 +3,7 @@ import 'dart:collection';
 import 'dart:convert';
 import 'dart:typed_data';
 
-import '../handler/encoder.dart';
+import '../handler/encryption.dart';
 import '../handler/logger.dart';
 import '../handler/platform_handler.dart';
 import '../handler/wal_encoder.dart';
@@ -501,7 +501,7 @@ class WalManager {
     );
     final useIsolate = dispatchPlan.useIsolate;
     final actualTaskCount = dispatchPlan.actualTaskCount;
-    final encoderConfig = EncoderHandler.getCurrentEncodingState();
+    final encoderConfig = EncryptionManager.getCurrentEncodingState();
 
     final tasks = <ComputeTask<BatchWalEncodeRequest, BatchWalEncodeResult>>[];
     for (final range
@@ -1437,7 +1437,7 @@ class WalManager {
       if (fullData.isEmpty) {
         return WalPointer(partitionIndex: pIdx, entrySeq: 0);
       }
-      final encoderConfig = EncoderHandler.getCurrentEncodingState();
+      final encoderConfig = EncryptionManager.getCurrentEncodingState();
       final allEntries = await WalDecodeBatchRunner.decodeFile(
         fileBytes: fullData,
         partitionIndex: pIdx,
