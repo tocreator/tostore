@@ -6,10 +6,10 @@ import '../model/encoder_config.dart';
 import 'chacha20_poly1305.dart';
 import 'aes_gcm.dart';
 
-/// Data encoding is efficient and fast, slightly slower than regular UTF-8 encoding
+/// Data encryption is efficient and fast, slightly slower than regular UTF-8 encryption
 /// Protects data privacy by preventing casual viewing of data files
-class EncoderHandler {
-  /// encoding version
+class EncryptionManager {
+  /// encryption version
   static const int _encodingVersion = 1;
 
   // current encryption type
@@ -32,10 +32,10 @@ class EncoderHandler {
   // current active key
   static Uint8List _activeKey = _defaultXorKey;
 
-  // High-performance encoding: UTF8 encoding with XOR obfuscation (binary data)
+  // High-performance encryption: UTF8 encryption with XOR obfuscation (binary data)
   static const String _encodeUtf8Prefix = "ToU8_";
 
-  // Raw encoding: plain UTF8 encoding without obfuscation (binary data)
+  // Raw encryption: plain UTF8 encryption without obfuscation (binary data)
   static const String _encodeRawPrefix = "ToUr_";
 
   // ChaCha20-Poly1305 encrypted binary data prefix
@@ -44,7 +44,7 @@ class EncoderHandler {
   // AES-256-GCM encrypted binary data prefix
   static const String _encodeAesPrefix = "ToAe_";
 
-  // Binary encoding prefixes derived from string prefixes
+  // Binary encryption prefixes derived from string prefixes
   static final List<int> _utf8PrefixBytes = utf8.encode(_encodeUtf8Prefix);
   static final List<int> _rawPrefixBytes = utf8.encode(_encodeRawPrefix);
   static final List<int> _chacha20PrefixBytes =
@@ -327,7 +327,7 @@ class EncoderHandler {
     }
   }
 
-  /// Highest performance encoding: returns UTF-8 bytes, optionally encrypted
+  /// Highest performance encryption: returns UTF-8 bytes, optionally encrypted
   /// Returns complete binary data with header bytes, suitable for direct storage in files or binary dataspaces
   static Uint8List encode(String input,
       {Uint8List? customKey, int? keyId, EncryptionType? encryptionType}) {
@@ -633,7 +633,7 @@ class EncoderHandler {
         _hasPrefix(bytes, _aesPrefixBytes);
   }
 
-  // encoding method, encoding version, keyId, for example 'ToB64_v1_k0_'
+  // encryption method, encryption version, keyId, for example 'ToB64_v1_k0_'
   static String _buildHeader(String basePrefix, int keyId) {
     return '${basePrefix}v${_encodingVersion}_k${keyId}_';
   }
@@ -690,7 +690,7 @@ class EncoderHandler {
     return null;
   }
 
-  /// Get current complete encoding state, for isolate thread passing
+  /// Get current complete encryption state, for isolate thread passing
   static EncoderConfig getCurrentEncodingState() {
     return EncoderConfig(
       activeKey: _activeKey,
@@ -700,7 +700,7 @@ class EncoderHandler {
     );
   }
 
-  /// set complete encoding state, for isolate thread passing
+  /// set complete encryption state, for isolate thread passing
   static void setEncodingState(EncoderConfig config) {
     _activeKey = config.activeKey;
     _currentKeyId = config.keyId;
@@ -710,6 +710,6 @@ class EncoderHandler {
     }
   }
 
-  /// Check if encoding is enabled
+  /// Check if encryption is enabled
   static bool get isEncodingEnabled => _encryptionType != EncryptionType.none;
 }
