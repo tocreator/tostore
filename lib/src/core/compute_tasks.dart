@@ -7,7 +7,7 @@ import '../model/db_exception.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
 
-import '../handler/encoder.dart';
+import '../handler/encryption.dart';
 import '../handler/logger.dart';
 import '../handler/value_matcher.dart';
 import '../model/data_store_config.dart';
@@ -1523,7 +1523,7 @@ class BatchWalEncodeResult {
 Future<BatchWalEncodeResult> batchEncodeWal(
     BatchWalEncodeRequest request) async {
   // 1. Sync encoder state
-  EncoderHandler.setEncodingState(request.encoderConfig);
+  EncryptionManager.setEncodingState(request.encoderConfig);
 
   final results = <Uint8List>[];
   final yieldController =
@@ -1654,7 +1654,7 @@ Future<BatchBTreePageEncodeResult> batchEncodeBTreePages(
   if (pages.isEmpty) return const BatchBTreePageEncodeResult(<Uint8List>[]);
 
   // Ensure isolate has the same encoder state as main isolate.
-  EncoderHandler.setEncodingState(request.encoderConfig);
+  EncryptionManager.setEncodingState(request.encoderConfig);
 
   final int? encTypeIndex = request.encryptionTypeIndex;
   final EncryptionType? encType = encTypeIndex == null
@@ -1697,7 +1697,7 @@ Future<BatchBTreePageEncodeResult> batchEncodeBTreePages(
       // No encryption config: keep payload as-is (no header).
       encodedPayload = plainPayload;
     } else {
-      encodedPayload = EncoderHandler.encodeBytes(
+      encodedPayload = EncryptionManager.encodeBytes(
         plainPayload,
         customKey: request.customKey,
         keyId: request.customKeyId,
@@ -1709,7 +1709,8 @@ Future<BatchBTreePageEncodeResult> batchEncodeBTreePages(
     // Extra guardrail: provide full context if caller's sizing/splitting is wrong.
     final int totalLen = BTreePageHeader.size + encodedPayload.length;
     if (totalLen > pageSize) {
-      final int keyId = request.customKeyId ?? EncoderHandler.getCurrentKeyId();
+      final int keyId =
+          request.customKeyId ?? EncryptionManager.getCurrentKeyId();
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,
