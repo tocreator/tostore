@@ -1,6 +1,6 @@
 import 'dart:convert';
 import 'dart:typed_data';
-import 'encoder.dart';
+import 'encryption.dart';
 import 'binary_map_codec.dart';
 
 /// High-performance binary encoder for WAL entries
@@ -49,7 +49,7 @@ class WalEncoder {
 
     // Step 3: Encrypt binary directly using EncoderHandler.encodeBytes
     // No string conversion! Direct binary encryption with partition-based AAD
-    final encrypted = EncoderHandler.encodeBytes(serialized, aad: aad);
+    final encrypted = EncryptionManager.encodeBytes(serialized, aad: aad);
 
     // Step 4: Build WAL binary format with header
     final header = ByteData(9);
@@ -150,7 +150,7 @@ class WalEncoder {
 
     // Step 3: Decrypt binary directly using EncoderHandler.decodeBytes
     // No string conversion! Direct binary decryption with partition-based AAD
-    final decrypted = EncoderHandler.decodeBytes(encryptedData, aad: aad);
+    final decrypted = EncryptionManager.decodeBytes(encryptedData, aad: aad);
 
     // Step 4: Parse MessagePack binary
     return BinaryMapCodec.decodeMap(decrypted);
