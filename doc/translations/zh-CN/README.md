@@ -1525,6 +1525,10 @@ final db = await ToStore.open(
       // 优点：可提升数据库文件被直接拷贝时的保护效果。
       // 缺点：如果应用安装路径发生变化及设备特征发生变化，数据将无法还原。
       deviceBinding: false, 
+
+      // 加密范围：standard (默认标准加密，加密关键的表数据、索引数据与日志) 
+      // 或 full (全量加密，对整个引擎文件进行全方位加密)
+      encryptionScope: EncryptionScope.standard,
     ),
     // 启用崩溃恢复日志 (Write-Ahead Logging)，默认开启
     enableJournal: true, 
