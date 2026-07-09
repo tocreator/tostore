@@ -835,7 +835,7 @@ final class NghPartitionManager {
   ) async {
     final tableUid = table.tableUid;
     final encCfg = _dataStore.config.encryptionConfig;
-    final encrypt = encCfg != null &&
+    final bool encrypt = encCfg != null &&
         encCfg.encryptVectorIndex &&
         encCfg.encryptionType != EncryptionType.none;
     final path =
@@ -1115,7 +1115,7 @@ final class NghPartitionManager {
   /// Decode page payload, applying decryption if vector encryption is enabled.
   Uint8List _decodePayload(Uint8List encodedPayload) {
     final encCfg = _dataStore.config.encryptionConfig;
-    final encrypt = encCfg != null &&
+    final bool encrypt = encCfg != null &&
         encCfg.encryptVectorIndex &&
         encCfg.encryptionType != EncryptionType.none;
     if (!encrypt) return encodedPayload;
