@@ -1467,7 +1467,14 @@ O ToStore pode rotear logs do ciclo de vida do banco de dados de volta para a ca
 ## <a id="security-config"></a>Configuração de segurança
 
 > [!WARNING]
-> **Gerenciamento de chaves**: **`encodingKey`** pode ser alterado livremente e o mecanismo migrará os dados automaticamente, para que os dados permaneçam recuperáveis. **`encryptionKey`** não deve ser alterado casualmente. Depois de alterados, os dados antigos não podem ser descriptografados, a menos que você os migre explicitamente. Nunca codifique chaves sensíveis; é recomendável buscá-los em um serviço seguro.
+> **Gerenciamento de chaves**
+>
+> | Chave | Função | Como alterar | Reescrita completa dos dados? |
+> | :--- | :--- | :--- | :--- |
+> | **`encodingKey`** | Chave de criptografia de dados | Definir novo valor e `open` novamente | **Sim** (lento) |
+> | **`encryptionKey`** | Chave de segurança; protege `encodingKey` | Chamar `db.rotateEncryptionKey` em tempo de execução | **Não** (rápido) |
+>
+> Nunca codifique chaves sensíveis; obtenha-as de um serviço seguro.
 
 ```dart
 final db = await ToStore.open(
@@ -1476,10 +1483,10 @@ final db = await ToStore.open(
       // Supported encryption algorithms: none, xorObfuscation, chacha20Poly1305, aes256Gcm
       encryptionType: EncryptionType.chacha20Poly1305,
 
-      // Encoding key (can be changed; data will be migrated automatically)
+      // Data encryption key: encrypts data; changing it triggers a full background rewrite of encrypted data
       encodingKey: 'Your-32-Byte-Long-Encoding-Key...',
 
-      // Encryption key for critical data (do not change casually unless you are migrating data)
+      // Security key: protects encodingKey; does not encrypt data directly; rotate online via rotateEncryptionKey
       encryptionKey: 'Your-Secure-Encryption-Key...',
 
       // Device binding (path-based binding)
@@ -1499,6 +1506,19 @@ final db = await ToStore.open(
     persistRecoveryOnCommit: true,
   ),
 );
+```
+
+**Alterar `encodingKey`**: defina o novo valor em `EncryptionConfig` e execute `open` novamente. O mecanismo detecta a alteração e migra os dados automaticamente em segundo plano, sem intervenção da aplicação.
+
+**Rotacionar `encryptionKey`** (rotação periódica de segurança/conformidade): sem reescrita de dados; executável online.
+
+```dart
+final result = await db.rotateEncryptionKey(oldEncryptionKey, newEncryptionKey);
+if (result.hasErrors) {
+  // Tratar falha (oldKey incorreto, migração de encodingKey em andamento, etc.)
+  return;
+}
+// Sucesso: config em memória atualizada; passe o encryptionKey mais recente no próximo ToStore.open
 ```
 
 ### Criptografia em nível de valor (ToCrypto)
