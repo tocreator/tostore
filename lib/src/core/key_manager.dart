@@ -67,6 +67,11 @@ class KeyManager {
     return _getEncryptionConfig().encryptionType;
   }
 
+  /// Get effective encryption scope
+  EncryptionScope _getEncryptionScope() {
+    return _getEncryptionConfig().encryptionScope;
+  }
+
   /// Generate AAD (Additional Authenticated Data) for key encryption
   /// This prevents key reuse across different databases or key versions
   Uint8List _generateAAD(int keyId) {
@@ -117,8 +122,9 @@ class KeyManager {
     _getEncodingKey();
     _getEncryptionKey();
 
-    // Set EncoderHandler encryption type
+    // Set EncoderHandler encryption type and scope
     EncryptionManager.setEncryptionType(_getEncryptionType());
+    EncryptionManager.setEncryptionScope(_getEncryptionScope());
 
     // Try to get existing space configuration to determine the correct keyId
     SpaceConfig? spaceConfig = await _dataStore.getSpaceConfig();
