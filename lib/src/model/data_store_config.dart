@@ -1071,6 +1071,40 @@ extension EncryptionTypeExtension on EncryptionType {
   }
 }
 
+/// Encryption scope configuration
+enum EncryptionScope {
+  /// Default standard encryption, encrypts key data such as table data, index data, and log data.
+  standard,
+
+  /// Full encryption, encrypts the entire engine files completely.
+  full,
+}
+
+extension EncryptionScopeExtension on EncryptionScope {
+  /// Convert encryption scope to string for configuration
+  String toConfigString() {
+    switch (this) {
+      case EncryptionScope.standard:
+        return 'standard';
+      case EncryptionScope.full:
+        return 'full';
+    }
+  }
+
+  /// Create encryption scope from configuration string
+  static EncryptionScope fromConfigString(String? value) {
+    if (value == null) return EncryptionScope.standard;
+    switch (value.toLowerCase()) {
+      case 'standard':
+        return EncryptionScope.standard;
+      case 'full':
+        return EncryptionScope.full;
+      default:
+        return EncryptionScope.standard;
+    }
+  }
+}
+
 /// Encryption configuration for data store
 /// Supports device binding (path-based) for enhanced security
 class EncryptionConfig {
@@ -1121,12 +1155,18 @@ class EncryptionConfig {
   /// which can significantly impact search latency.
   final bool encryptVectorIndex;
 
+  /// The encryption scope configures how much of the database engine is encrypted.
+  /// standard: Default standard encryption, encrypts key data such as table data, index data, and log data.
+  /// full: Full encryption, encrypts the entire engine files completely.
+  final EncryptionScope encryptionScope;
+
   const EncryptionConfig({
     this.encryptionType = EncryptionType.xorObfuscation,
     this.encodingKey,
     this.encryptionKey,
     this.deviceBinding = false,
     this.encryptVectorIndex = false,
+    this.encryptionScope = EncryptionScope.standard,
   });
 
   /// Generate encoding key based on configuration
@@ -1195,7 +1235,9 @@ class EncryptionConfig {
     final base64Str = base64Encode(keyBytes);
     // Take first 24 characters for key (similar length to default keys)
     return base64Str.substring(
-        0, base64Str.length > 24 ? 24 : base64Str.length);
+      0,
+      base64Str.length > 24 ? 24 : base64Str.length,
+    );
   }
 
   /// Create from JSON
@@ -1203,7 +1245,8 @@ class EncryptionConfig {
     return EncryptionConfig(
       encryptionType: json['encryptionType'] != null
           ? EncryptionTypeExtension.fromConfigString(
-              json['encryptionType'] as String)
+              json['encryptionType'] as String,
+            )
           : EncryptionType.xorObfuscation,
       encodingKey: json['encodingKey'] as String?,
       encryptionKey: json['encryptionKey'] as String?,
@@ -1211,6 +1254,11 @@ class EncryptionConfig {
           json['pathBinding'] as bool? ??
           false, // Backward compatibility
       encryptVectorIndex: json['encryptVectorIndex'] as bool? ?? false,
+      encryptionScope: json['encryptionScope'] != null
+          ? EncryptionScopeExtension.fromConfigString(
+              json['encryptionScope'] as String?,
+            )
+          : EncryptionScope.standard,
     );
   }
 
@@ -1222,6 +1270,7 @@ class EncryptionConfig {
       if (encryptionKey != null) 'encryptionKey': encryptionKey,
       'deviceBinding': deviceBinding,
       'encryptVectorIndex': encryptVectorIndex,
+      'encryptionScope': encryptionScope.toConfigString(),
     };
   }
 
@@ -1232,6 +1281,7 @@ class EncryptionConfig {
     String? encryptionKey,
     bool? deviceBinding,
     bool? encryptVectorIndex,
+    EncryptionScope? encryptionScope,
   }) {
     return EncryptionConfig(
       encryptionType: encryptionType ?? this.encryptionType,
@@ -1239,6 +1289,7 @@ class EncryptionConfig {
       encryptionKey: encryptionKey ?? this.encryptionKey,
       deviceBinding: deviceBinding ?? this.deviceBinding,
       encryptVectorIndex: encryptVectorIndex ?? this.encryptVectorIndex,
+      encryptionScope: encryptionScope ?? this.encryptionScope,
     );
   }
 
@@ -1246,6 +1297,7 @@ class EncryptionConfig {
   String toString() {
     return 'EncryptionConfig('
         'encryptionType: $encryptionType, '
-        'deviceBinding: $deviceBinding)';
+        'deviceBinding: $deviceBinding, '
+        'encryptionScope: $encryptionScope)';
   }
 }
