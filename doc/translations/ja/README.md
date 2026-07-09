@@ -1469,7 +1469,14 @@ ToStore は、`ToStore.setLogConfig(...)` を通じて、データベースの�
 ## <a id="security-config"></a>セキュリティ構成
 
 > [!WARNING]
-> **キー管理**: **`encodingKey`** は自由に変更でき、エンジンがデータを自動的に移行するため、データは回復可能なままになります。 **`encryptionKey`** はむやみに変更しないでください。変更された古いデータは、明示的に移行しない限り復号化できません。機密キーをハードコーディングしないでください。安全なサービスから取得することをお勧めします。
+> **キー管理**
+>
+> | キー | 役割 | 変更方法 | データ全量再書き込み |
+> | :--- | :--- | :--- | :--- |
+> | **`encodingKey`** | データ暗号化キー | 新しい値を設定して再度 `open` | **はい**（時間がかかる） |
+> | **`encryptionKey`** | セキュリティキー、`encodingKey` を保護 | 実行時に `db.rotateEncryptionKey` を呼び出す | **いいえ**（高速） |
+>
+> 機密キーをハードコーディングしないでください。安全なサービスから取得することを推奨します。
 
 ```dart
 final db = await ToStore.open(
@@ -1478,10 +1485,10 @@ final db = await ToStore.open(
       // Supported encryption algorithms: none, xorObfuscation, chacha20Poly1305, aes256Gcm
       encryptionType: EncryptionType.chacha20Poly1305,
 
-      // Encoding key (can be changed; data will be migrated automatically)
+      // Data encryption key: encrypts data; changing it triggers a full background rewrite of encrypted data
       encodingKey: 'Your-32-Byte-Long-Encoding-Key...',
 
-      // Encryption key for critical data (do not change casually unless you are migrating data)
+      // Security key: protects encodingKey; does not encrypt data directly; rotate online via rotateEncryptionKey
       encryptionKey: 'Your-Secure-Encryption-Key...',
 
       // Device binding (path-based binding)
@@ -1501,6 +1508,19 @@ final db = await ToStore.open(
     persistRecoveryOnCommit: true,
   ),
 );
+```
+
+**`encodingKey` の変更**：`EncryptionConfig` に新しい値を設定して再度 `open` します。エンジンが変更を検出し、バックグラウンドで自動的にデータを移行します。アプリケーション側の操作は不要です。
+
+**`encryptionKey` のローテーション**（セキュリティ／コンプライアンスの定期ローテーション）：データの再書き込みなし、オンラインで実行可能。
+
+```dart
+final result = await db.rotateEncryptionKey(oldEncryptionKey, newEncryptionKey);
+if (result.hasErrors) {
+  // 失敗時の処理（oldKey が不正、encodingKey 移行中など）
+  return;
+}
+// 成功：メモリ上の設定が更新済み。次回 ToStore.open 時に最新の encryptionKey を渡す
 ```
 
 ### 値レベルの暗号化 (ToCrypto)
