@@ -15,6 +15,9 @@ class EncryptionManager {
   // current encryption type
   static EncryptionType _encryptionType = EncryptionType.xorObfuscation;
 
+  // current encryption scope
+  static EncryptionScope _encryptionScope = EncryptionScope.standard;
+
   /// Set encryption type (recommended API)
   static void setEncryptionType(EncryptionType type) {
     _encryptionType = type;
@@ -23,6 +26,16 @@ class EncryptionManager {
   /// Get current encryption type
   static EncryptionType getEncryptionType() {
     return _encryptionType;
+  }
+
+  /// Set encryption scope
+  static void setEncryptionScope(EncryptionScope scope) {
+    _encryptionScope = scope;
+  }
+
+  /// Get current encryption scope
+  static EncryptionScope getEncryptionScope() {
+    return _encryptionScope;
   }
 
   // default xor key
@@ -697,6 +710,7 @@ class EncryptionManager {
       keyId: _currentKeyId,
       fallbackKeys: _fallbackKeys,
       encryptionType: _encryptionType,
+      encryptionScope: _encryptionScope,
     );
   }
 
@@ -705,6 +719,7 @@ class EncryptionManager {
     _activeKey = config.activeKey;
     _currentKeyId = config.keyId;
     _encryptionType = config.encryptionType;
+    _encryptionScope = config.encryptionScope;
     if (config.fallbackKeys != null) {
       _fallbackKeys = config.fallbackKeys;
     }
