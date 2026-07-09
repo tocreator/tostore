@@ -1488,6 +1488,10 @@ final db = await ToStore.open(
       // Advantage: better protection if database files are copied directly.
       // Drawback: if the install path or device characteristics change, data may become unrecoverable.
       deviceBinding: false,
+
+      // Encryption scope: standard (default, encrypts key table data, index data, and logs)
+      // or full (full encryption, encrypts the entire engine files completely)
+      encryptionScope: EncryptionScope.standard,
     ),
     // Enable crash recovery logging (Write-Ahead Logging), enabled by default
     enableJournal: true,
