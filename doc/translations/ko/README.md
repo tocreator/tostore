@@ -1469,7 +1469,14 @@ ToStore는 `ToStore.setLogConfig(...)`를 통해 데이터베이스 수명 주�
 ## <a id="security-config"></a>보안 구성
 
 > [!WARNING]
-> **키 관리**: **`encodingKey`** 자유롭게 변경할 수 있으며 엔진이 자동으로 데이터를 마이그레이션하므로 데이터를 복구 가능한 상태로 유지합니다. **`encryptionKey`** 임의로 변경하면 안 됩니다. 변경된 후에는 명시적으로 마이그레이션하지 않는 한 오래된 데이터를 해독할 수 없습니다. 민감한 키를 하드코딩하지 마세요. 보안 서비스에서 가져오는 것이 좋습니다.
+> **키 관리**
+>
+> | 키 | 역할 | 변경 방법 | 데이터 전체 재작성 |
+> | :--- | :--- | :--- | :--- |
+> | **`encodingKey`** | 데이터 암호화 키 | 새 값 설정 후 다시 `open` | **예** (시간 소요) |
+> | **`encryptionKey`** | 보안 키, `encodingKey` 보호 | 런타임에 `db.rotateEncryptionKey` 호출 | **아니오** (빠름) |
+>
+> 민감한 키를 하드코딩하지 마세요. 보안 서비스에서 가져오는 것을 권장합니다.
 
 ```dart
 final db = await ToStore.open(
@@ -1478,10 +1485,10 @@ final db = await ToStore.open(
       // Supported encryption algorithms: none, xorObfuscation, chacha20Poly1305, aes256Gcm
       encryptionType: EncryptionType.chacha20Poly1305,
 
-      // Encoding key (can be changed; data will be migrated automatically)
+      // Data encryption key: encrypts data; changing it triggers a full background rewrite of encrypted data
       encodingKey: 'Your-32-Byte-Long-Encoding-Key...',
 
-      // Encryption key for critical data (do not change casually unless you are migrating data)
+      // Security key: protects encodingKey; does not encrypt data directly; rotate online via rotateEncryptionKey
       encryptionKey: 'Your-Secure-Encryption-Key...',
 
       // Device binding (path-based binding)
@@ -1501,6 +1508,19 @@ final db = await ToStore.open(
     persistRecoveryOnCommit: true,
   ),
 );
+```
+
+**`encodingKey` 변경**: `EncryptionConfig`에 새 값을 설정하고 다시 `open`합니다. 엔진이 변경을 감지하여 백그라운드에서 자동으로 데이터를 마이그레이션하며, 애플리케이션 측 조치는 필요 없습니다.
+
+**`encryptionKey` 로테이션**(보안/컴플라이언스 정기 교체): 데이터 재작성 없음, 온라인 실행 가능.
+
+```dart
+final result = await db.rotateEncryptionKey(oldEncryptionKey, newEncryptionKey);
+if (result.hasErrors) {
+  // 실패 처리 (oldKey 오류, encodingKey 마이그레이션 진행 중 등)
+  return;
+}
+// 성공: 메모리 설정 업데이트됨; 다음 ToStore.open 시 최신 encryptionKey 전달
 ```
 
 ### 값 수준 암호화(ToCrypto)
