@@ -1467,7 +1467,14 @@ ToStore может направлять журналы жизненного ци
 ## <a id="security-config"></a>Конфигурация безопасности
 
 > [!WARNING]
-> **Управление ключами**: **`encodingKey`** можно свободно менять, и механизм автоматически перенесет данные, поэтому данные можно будет восстановить. **`encryptionKey`** нельзя менять случайно. После изменения старые данные невозможно расшифровать, если вы явно не перенесете их. Никогда не кодируйте чувствительные клавиши жестко; рекомендуется получать их из безопасного сервиса.
+> **Управление ключами**
+>
+> | Ключ | Назначение | Как изменить | Полная перезапись данных? |
+> | :--- | :--- | :--- | :--- |
+> | **`encodingKey`** | Ключ шифрования данных | Задать новое значение и снова вызвать `open` | **Да** (долго) |
+> | **`encryptionKey`** | Ключ безопасности; защищает `encodingKey` | Вызвать `db.rotateEncryptionKey` во время работы | **Нет** (быстро) |
+>
+> Никогда не хардкодьте чувствительные ключи; рекомендуется получать их из защищённого сервиса.
 
 ```dart
 final db = await ToStore.open(
@@ -1476,10 +1483,10 @@ final db = await ToStore.open(
       // Supported encryption algorithms: none, xorObfuscation, chacha20Poly1305, aes256Gcm
       encryptionType: EncryptionType.chacha20Poly1305,
 
-      // Encoding key (can be changed; data will be migrated automatically)
+      // Data encryption key: encrypts data; changing it triggers a full background rewrite of encrypted data
       encodingKey: 'Your-32-Byte-Long-Encoding-Key...',
 
-      // Encryption key for critical data (do not change casually unless you are migrating data)
+      // Security key: protects encodingKey; does not encrypt data directly; rotate online via rotateEncryptionKey
       encryptionKey: 'Your-Secure-Encryption-Key...',
 
       // Device binding (path-based binding)
@@ -1499,6 +1506,19 @@ final db = await ToStore.open(
     persistRecoveryOnCommit: true,
   ),
 );
+```
+
+**Изменение `encodingKey`**: задайте новое значение в `EncryptionConfig` и снова вызовите `open`. Движок обнаружит изменение и автоматически мигрирует данные в фоне — без действий со стороны приложения.
+
+**Ротация `encryptionKey`** (периодическая смена по требованиям безопасности): без перезаписи данных; выполняется онлайн.
+
+```dart
+final result = await db.rotateEncryptionKey(oldEncryptionKey, newEncryptionKey);
+if (result.hasErrors) {
+  // Обработка ошибки (неверный oldKey, идёт миграция encodingKey и т.д.)
+  return;
+}
+// Успех: конфигурация в памяти обновлена; передайте актуальный encryptionKey при следующем ToStore.open
 ```
 
 ### Шифрование уровня значений (ToCrypto)
