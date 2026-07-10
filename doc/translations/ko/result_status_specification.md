@@ -306,7 +306,8 @@ Dart/Flutter에서 `ResultStatus`와 `ResultType`은 수동 범위 체크나 문
   | `22004`<br>`devSpaceNotFound` | 스페이스를 찾을 수 없음(개발자 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `23001`<br>`devLargeScaleOperationBypassRequired` | OOM 방지를 위해 결과 상세 건너뛰기 필요(개발자 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `24001`<br>`devEngineIncompatible` | **심각**: 엔진 버전 불일치(개발자 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `50003`<br>`sysMigrationBatchExecutionFailed` | 마이그레이션 배치 실행 실패(시스템 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `50003`<br>`sysTransactionLimitExceeded` | 메모리 압박 상태에서 트랜잭션 버퍼 데이터가 안전 한도를 초과함(시스템 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `50004`<br>`sysMigrationBatchExecutionFailed` | 마이그레이션 배치 실행 실패(시스템 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51001`<br>`sysTimeoutLockAcquisition` | 락 획득 타임아웃(시스템 오류) | <ul><li>`primaryKey`: 대상 키(존재 시)</li><li>`target`: 락 리소스 ID</li><li>`operation`: `"acquire"`</li></ul> |
   | `51002`<br>`sysTimeout` | 작업 타임아웃(시스템 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51003`<br>`sysDbClosed` | 데이터베이스가 닫혔습니다. 작업이 안전하게 취소되었습니다(시스템 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
@@ -515,7 +516,8 @@ try {
 | **30018** | `DEV_INVALID_SCHEMA_INDEX_FIELD` | `ResultType.devInvalidSchemaIndexField` | 개발자 오류 | 인덱스가 존재하지 않는 필드를 참조합니다 |
 | **50001** | `SYS_TRANSACTION_ABORTED` | `ResultType.sysTransactionAborted` | 시스템 오류 | 트랜잭션이 중단되었습니다 |
 | **50002** | `SYS_TRANSACTION_CONFLICT` | `ResultType.sysTransactionConflict` | 시스템 오류 | 트랜잭션 충돌 |
-| **50003** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | 시스템 오류 | **심각**: 마이그레이션 배치 실행 실패 |
+| **50003** | `SYS_TRANSACTION_LIMIT_EXCEEDED` | `ResultType.sysTransactionLimitExceeded` | 시스템 오류 | 메모리 압박 상태에서 트랜잭션이 안전 메모리 한도를 초과함 |
+| **50004** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | 시스템 오류 | **심각**: 마이그레이션 배치 실행 실패 |
 | **51001** | `SYS_TIMEOUT_LOCK_ACQUISITION` | `ResultType.sysTimeoutLockAcquisition` | 시스템 오류 | 락 획득 타임아웃 |
 | **51002** | `SYS_TIMEOUT` | `ResultType.sysTimeout` | 시스템 오류 | 작업 타임아웃 |
 | **51003** | `SYS_DB_CLOSED` | `ResultType.sysDbClosed` | 시스템 오류 | 데이터베이스가 닫혔습니다. 작업이 안전하게 취소되었습니다 |
