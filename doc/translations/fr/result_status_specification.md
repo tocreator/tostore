@@ -306,7 +306,8 @@ Selon la plage de `code` / `codeKey` et la sous-classe spécifique de `ResultSta
   | `22004`<br>`devSpaceNotFound` | Espace non trouvé (Erreur Développeur) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `23001`<br>`devLargeScaleOperationBypassRequired` | Le saut des détails est requis pour éviter le OOM (Erreur Développeur) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `24001`<br>`devEngineIncompatible` | **Critique**: Version du moteur incompatible | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `50003`<br>`sysMigrationBatchExecutionFailed` | Échec de l'exécution du lot de migration (Erreur Système) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `50003`<br>`sysTransactionLimitExceeded` | Les données mises en tampon par la transaction dépassent la limite sûre sous pression mémoire (Erreur Système) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `50004`<br>`sysMigrationBatchExecutionFailed` | Échec de l'exécution du lot de migration (Erreur Système) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51001`<br>`sysTimeoutLockAcquisition` | Expiration de l'acquisition du verrou (Erreur Système) | <ul><li>`primaryKey`: Clé cible (le cas échéant)</li><li>`target`: ID de la ressource de verrou</li><li>`operation`: `"acquire"`</li></ul> |
   | `51002`<br>`sysTimeout` | Expiration de l'opération (Erreur Système) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51003`<br>`sysDbClosed` | La base de données est fermée, l'opération a été annulée en toute sécurité (Erreur Système) | <ul><li>`primaryKey`: `null`</li></ul> |
@@ -515,7 +516,8 @@ Reportez-vous au tableau ci-dessous pour le routage et l'analyse exacts des éta
 | **30018** | `DEV_INVALID_SCHEMA_INDEX_FIELD` | `ResultType.devInvalidSchemaIndexField` | Erreur Développeur | L'index fait référence à un champ inexistant |
 | **50001** | `SYS_TRANSACTION_ABORTED` | `ResultType.sysTransactionAborted` | Erreur Système | Transaction annulée |
 | **50002** | `SYS_TRANSACTION_CONFLICT` | `ResultType.sysTransactionConflict` | Erreur Système | Conflit de transaction |
-| **50003** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | Erreur Système | **Critique**: Échec de l'exécution du lot de migration |
+| **50003** | `SYS_TRANSACTION_LIMIT_EXCEEDED` | `ResultType.sysTransactionLimitExceeded` | Erreur Système | La transaction dépasse la limite mémoire sûre sous pression mémoire |
+| **50004** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | Erreur Système | **Critique**: Échec de l'exécution du lot de migration |
 | **51001** | `SYS_TIMEOUT_LOCK_ACQUISITION` | `ResultType.sysTimeoutLockAcquisition` | Erreur Système | Expiration de l'acquisition du verrou |
 | **51002** | `SYS_TIMEOUT` | `ResultType.sysTimeout` | Erreur Système | Expiration de l'opération |
 | **51003** | `SYS_DB_CLOSED` | `ResultType.sysDbClosed` | Erreur Système | La base de données est fermée, l'opération a été annulée en toute sécurité |
