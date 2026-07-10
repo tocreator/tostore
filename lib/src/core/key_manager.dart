@@ -6,8 +6,11 @@ import '../handler/chacha20_poly1305.dart';
 import '../handler/encryption.dart';
 import '../handler/logger.dart';
 import '../model/db_exception.dart';
+import '../model/db_result.dart';
 import '../model/data_store_config.dart';
 import '../model/key_migration_info.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../model/space_config.dart';
 import 'data_store_impl.dart';
 import 'key_migration_progress.dart';
@@ -83,7 +86,14 @@ class KeyManager {
   /// Encrypt a plain key using the encryption key from config
   /// AAD includes dbPath and keyId to ensure key is bound to specific database instance and version
   String _encryptKey(String plainKey, int keyId) {
-    final encryptionKey = _getEncryptionKey();
+    return _encryptKeyWithEncryptionKey(plainKey, keyId, _getEncryptionKey());
+  }
+
+  String _encryptKeyWithEncryptionKey(
+    String plainKey,
+    int keyId,
+    String encryptionKey,
+  ) {
     final aad = _generateAAD(keyId);
     final encryptedBytes = ChaCha20Poly1305.encrypt(
       plaintext: plainKey,
@@ -93,26 +103,194 @@ class KeyManager {
     return base64.encode(encryptedBytes);
   }
 
-  /// Decode an encrypted key
-  /// Supports backward compatibility: tries with AAD first, then without AAD if keyId is not provided
-  dynamic _decodeKey(String encodedKey, int keyId, {bool isPlaintext = false}) {
+  String? _decodePlainKeyWithEncryptionKey(
+    String encodedKey,
+    int keyId,
+    String encryptionKey,
+  ) {
     try {
-      final encryptionKey = _getEncryptionKey();
       final encodedBytes = base64.decode(encodedKey);
-
       final aad = _generateAAD(keyId);
-      final decrypted = ChaCha20Poly1305.decrypt(
+      return ChaCha20Poly1305.decrypt(
         encryptedData: encodedBytes,
         key: ChaCha20Poly1305.generateKeyFromString(encryptionKey),
         aad: aad,
       );
-      if (isPlaintext) {
-        return decrypted;
-      }
-      return EncryptionManager.generateKey(decrypted);
     } catch (e) {
       return null;
     }
+  }
+
+  /// Decode an encrypted key
+  /// Supports backward compatibility: tries with AAD first, then without AAD if keyId is not provided
+  dynamic _decodeKey(String encodedKey, int keyId, {bool isPlaintext = false}) {
+    final decrypted = _decodePlainKeyWithEncryptionKey(
+      encodedKey,
+      keyId,
+      _getEncryptionKey(),
+    );
+    if (decrypted == null) {
+      return null;
+    }
+    if (isPlaintext) {
+      return decrypted;
+    }
+    return EncryptionManager.generateKey(decrypted);
+  }
+
+  /// Rotate the master [encryptionKey] that wraps stored [encodingKey] blobs.
+  ///
+  /// Re-wraps `space_config.json` in every space: decrypt with [oldKey], encrypt with [newKey].
+  /// Does not rewrite table data. Updates in-memory config to [newKey].
+  Future<DbResult> rotateEncryptionKey({
+    required String oldKey,
+    required String newKey,
+  }) async {
+    if (oldKey.isEmpty || newKey.isEmpty) {
+      return DbResult.batch(
+        statuses: [
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidArgumentMissing,
+            message: 'oldKey and newKey must be non-empty',
+            parameterName: oldKey.isEmpty ? 'oldKey' : 'newKey',
+            passedValue: oldKey.isEmpty ? oldKey : newKey,
+          ),
+        ],
+        failedCount: 1,
+      );
+    }
+    if (oldKey == newKey) {
+      return DbResult.batch(
+        statuses: [
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidArgumentFormat,
+            message: 'newKey must differ from oldKey',
+            parameterName: 'newKey',
+            passedValue: newKey,
+          ),
+        ],
+        failedCount: 1,
+      );
+    }
+
+    final migrationManager = _dataStore.migrationManager;
+    final keyMigration = await migrationManager?.getKeyMigrationInfo();
+    if (keyMigration != null && keyMigration.isRunning) {
+      return DbResult.error(
+        type: ResultType.devUnsupportedOperation,
+        message:
+            'Cannot rotate encryptionKey while encodingKey migration is in progress',
+      );
+    }
+
+    try {
+      final spaces = await _dataStore.listSpaces();
+      final rotatedBySpace = <String, SpaceConfig>{};
+
+      for (final spaceName in spaces) {
+        final spaceConfig = await _dataStore.getSpaceConfig(
+          nowGetFromFile: true,
+          spaceName: spaceName,
+        );
+        if (spaceConfig == null || !_hasWrappedEncodingKeys(spaceConfig)) {
+          continue;
+        }
+
+        final rewrapResult = _rewrapSpaceConfig(spaceConfig, oldKey, newKey);
+        if (rewrapResult.config == null) {
+          return DbResult.batch(
+            statuses: rewrapResult.errors,
+            failedCount: rewrapResult.errors.length,
+          );
+        }
+        rotatedBySpace[spaceName] = rewrapResult.config!;
+      }
+
+      if (rotatedBySpace.isEmpty) {
+        return DbResult.error(
+          type: ResultType.devInvalidArgumentFormat,
+          message:
+              'oldKey failed to decrypt stored encodingKey; verify the key and retry',
+        );
+      }
+
+      for (final entry in rotatedBySpace.entries) {
+        await _dataStore.saveSpaceConfigToFile(
+          entry.value,
+          spaceName: entry.key,
+          propagateErrors: true,
+        );
+      }
+
+      _cachedEncryptionKey = newKey;
+      _dataStore.updateEncryptionKeyInConfig(newKey);
+      Logger.info('encryptionKey rotated successfully');
+      return DbResult.success(
+        message: 'encryptionKey rotated successfully',
+      );
+    } catch (e) {
+      Logger.error('encryptionKey rotation failed', rawError: e);
+      final dbEx = DbException.wrap(
+        e,
+        fallbackType: ResultType.engError,
+        fallbackMessage: 'encryptionKey rotation failed',
+      );
+      return DbResult.batch(
+        statuses: dbEx.statuses,
+        failedCount: dbEx.statuses.length,
+      );
+    }
+  }
+
+  bool _hasWrappedEncodingKeys(SpaceConfig config) {
+    if (config.current.key.isNotEmpty) return true;
+    if (config.previous?.key.isNotEmpty == true) return true;
+    return config.historyKeys.any((key) => key.key.isNotEmpty);
+  }
+
+  ({SpaceConfig? config, List<ResultStatus> errors}) _rewrapSpaceConfig(
+    SpaceConfig config,
+    String oldKey,
+    String newKey,
+  ) {
+    final errors = <ResultStatus>[];
+
+    EncryptionKeyInfo rewrapInfo(EncryptionKeyInfo info) {
+      if (info.key.isEmpty) return info;
+
+      final plain = _decodePlainKeyWithEncryptionKey(
+        info.key,
+        info.keyId,
+        oldKey,
+      );
+      if (plain == null) {
+        errors.add(
+          GeneralStatus(
+            type: ResultType.devInvalidArgumentFormat,
+            message:
+                'oldKey failed to decrypt encodingKey blob (keyId=${info.keyId})',
+          ),
+        );
+        return info;
+      }
+
+      return EncryptionKeyInfo(
+        key: _encryptKeyWithEncryptionKey(plain, info.keyId, newKey),
+        keyId: info.keyId,
+      );
+    }
+
+    final updated = config.copyWith(
+      current: rewrapInfo(config.current),
+      previous: config.previous == null ? null : rewrapInfo(config.previous!),
+      historyKeys: config.historyKeys.map(rewrapInfo).toList(),
+    );
+
+    if (errors.isNotEmpty) {
+      return (config: null, errors: errors);
+    }
+
+    return (config: updated, errors: errors);
   }
 
   /// initialize KeyManager and start key migration process
