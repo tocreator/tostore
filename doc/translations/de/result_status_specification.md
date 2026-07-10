@@ -306,7 +306,8 @@ Abhängig vom Bereich von `code` / `codeKey` und der spezifischen Unterklasse vo
   | `22004`<br>`devSpaceNotFound` | Space nicht gefunden (Entwicklerfehler) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `23001`<br>`devLargeScaleOperationBypassRequired` | Überspringen von Details erforderlich, um OOM zu verhindern (Entwicklerfehler) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `24001`<br>`devEngineIncompatible` | **Kritisch**: Engine-Version inkompatibel | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `50003`<br>`sysMigrationBatchExecutionFailed` | Chargenmigration-Ausführung fehlgeschlagen (Systemfehler) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `50003`<br>`sysTransactionLimitExceeded` | Transaktionspufferdaten überschreiten bei Speicherdruck den sicheren Grenzwert (Systemfehler) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `50004`<br>`sysMigrationBatchExecutionFailed` | Chargenmigration-Ausführung fehlgeschlagen (Systemfehler) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51001`<br>`sysTimeoutLockAcquisition` | Timeout beim Sperrenerwerb (Systemfehler) | <ul><li>`primaryKey`: Zielschlüssel (falls vorhanden)</li><li>`target`: ID der gesperrten Ressource</li><li>`operation`: `"acquire"`</li></ul> |
   | `51002`<br>`sysTimeout` | Operation-Timeout (Systemfehler) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51003`<br>`sysDbClosed` | Datenbank ist geschlossen, die Operation wurde sicher abgebrochen (Systemfehler) | <ul><li>`primaryKey`: `null`</li></ul> |
@@ -515,7 +516,8 @@ Die genaue Zuordnung der Status-Routings und -Parsings entnehmen Sie bitte der f
 | **30018** | `DEV_INVALID_SCHEMA_INDEX_FIELD` | `ResultType.devInvalidSchemaIndexField` | Entwicklerfehler | Index verweist auf ein nicht existierendes Feld |
 | **50001** | `SYS_TRANSACTION_ABORTED` | `ResultType.sysTransactionAborted` | Systemfehler | Transaktion abgebrochen |
 | **50002** | `SYS_TRANSACTION_CONFLICT` | `ResultType.sysTransactionConflict` | Systemfehler | Transaktionskonflikt |
-| **50003** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | Systemfehler | **Kritisch**: Chargenmigration-Ausführung fehlgeschlagen |
+| **50003** | `SYS_TRANSACTION_LIMIT_EXCEEDED` | `ResultType.sysTransactionLimitExceeded` | Systemfehler | Transaktion überschreitet bei Speicherdruck den sicheren Speichergrenzwert |
+| **50004** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | Systemfehler | **Kritisch**: Chargenmigration-Ausführung fehlgeschlagen |
 | **51001** | `SYS_TIMEOUT_LOCK_ACQUISITION` | `ResultType.sysTimeoutLockAcquisition` | Systemfehler | Timeout beim Sperrenerwerb |
 | **51002** | `SYS_TIMEOUT` | `ResultType.sysTimeout` | Systemfehler | Operation-Timeout |
 | **51003** | `SYS_DB_CLOSED` | `ResultType.sysDbClosed` | Systemfehler | Datenbank ist geschlossen, die Operation wurde sicher abgebrochen |
