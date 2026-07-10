@@ -1505,37 +1505,57 @@ ToStore 可以通过 `ToStore.setLogConfig(...)` 把数据库生命周期的日�
 
 
 > [!WARNING]
-> **密钥管理**：**`encodingKey`** 可随意修改，修改后引擎会自动迁移数据，无需担心数据不可恢复。**`encryptionKey`** 不可随意变更，变更后旧数据将无法解密（除非执行数据迁移）。请勿硬编码敏感密钥，建议从安全服务端获取。
+> **密钥管理**
+>
+> | 密钥 | 作用 | 如何变更 | 是否全量重写数据 |
+> | :--- | :--- | :--- | :--- |
+> | **`encodingKey`** | 数据加密密钥 | 修改配置后重新 `open` | **是**（耗时） |
+> | **`encryptionKey`** | 安全密钥，保护`encodingKey` | 运行时调用 `db.rotateEncryptionKey` | **否**（快速） |
+>
+> 请勿硬编码敏感密钥，建议从安全服务端获取。
 
 ```dart
 final db = await ToStore.open(
   config: DataStoreConfig(
     encryptionConfig: EncryptionConfig(
       // 加密算法支持：none, xorObfuscation, chacha20Poly1305, aes256Gcm
-      encryptionType: EncryptionType.chacha20Poly1305, 
-      
-      // 编码密钥（可随意修改，修改后数据会自动迁移）
-      encodingKey: 'Your-32-Byte-Long-Encoding-Key...', 
-      
-      // 关键数据加密密钥（不可随意变更，否则旧数据无法解密，除非执行迁移）
+      encryptionType: EncryptionType.chacha20Poly1305,
+
+      // 数据加密密钥：加密数据；变更后引擎会后台重写全部加密数据
+      encodingKey: 'Your-32-Byte-Long-Encoding-Key...',
+
+      // 安全密钥：保护 encodingKey，不直接参与数据加密；可用 rotateEncryptionKey 在线轮换
       encryptionKey: 'Your-Secure-Encryption-Key...',
-      
+
       // 设备绑定 (Path-based binding)
       // 开启后密钥将与数据库文件路径、设备特征深度绑定。数据在不同物理路径下无法解密。
       // 优点：可提升数据库文件被直接拷贝时的保护效果。
       // 缺点：如果应用安装路径发生变化及设备特征发生变化，数据将无法还原。
-      deviceBinding: false, 
+      deviceBinding: false,
 
-      // 加密范围：standard (默认标准加密，加密关键的表数据、索引数据与日志) 
+      // 加密范围：standard (默认标准加密，加密关键的表数据、索引数据与日志)
       // 或 full (全量加密，对整个引擎文件进行全方位加密)
       encryptionScope: EncryptionScope.standard,
     ),
     // 启用崩溃恢复日志 (Write-Ahead Logging)，默认开启
-    enableJournal: true, 
+    enableJournal: true,
     // 事务提交时是否强制刷新数据到磁盘，如需降低同步刷新开销可设为 false（交由后台自动刷新）
     persistRecoveryOnCommit: true,
   ),
 );
+```
+
+**`encodingKey` 变更**：在 `EncryptionConfig` 中设置新值并 `open` 即可，引擎检测到变更后会在后台自动迁移数据，无需应用层干预。
+
+**`encryptionKey` 轮换**（安全合规定期更换）：不重写数据，在线轮换。
+
+```dart
+final result = await db.rotateEncryptionKey(oldEncryptionKey, newEncryptionKey);
+if (result.hasErrors) {
+  // 处理失败（如 oldKey 不正确、encodingKey 迁移进行中）
+  return;
+}
+// 成功：内存配置已更新；下次 ToStore.open 时传入当前最新 encryptionKey
 ```
 
 ### 价值级加密（ToCrypto）
