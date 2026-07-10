@@ -306,7 +306,8 @@ Dart/Flutter'da `ResultStatus` ve `ResultType`, manuel aralık kontrolleri veya 
   | `22004`<br>`devSpaceNotFound` | Alan bulunamadı (Geliştirici Hatası) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `23001`<br>`devLargeScaleOperationBypassRequired` | OOM'yi önlemek için ayrıntıları atlamak gerekiyor (Geliştirici Hatası) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `24001`<br>`devEngineIncompatible` | **Kritik**: Motor sürümü uyumsuz | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `50003`<br>`sysMigrationBatchExecutionFailed` | Toplu geçiş yürütmesi başarısız oldu (Sistem Hatası) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `50003`<br>`sysTransactionLimitExceeded` | İşlem arabelleğindeki veriler bellek baskısı altında güvenli sınırı aşıyor (Sistem Hatası) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `50004`<br>`sysMigrationBatchExecutionFailed` | Toplu geçiş yürütmesi başarısız oldu (Sistem Hatası) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51001`<br>`sysTimeoutLockAcquisition` | Kilit alma zaman aşımı (Sistem Hatası) | <ul><li>`primaryKey`: Hedef anahtar (varsa)</li><li>`target`: Kilit kaynak kimliği</li><li>`operation`: `"acquire"`</li></ul> |
   | `51002`<br>`sysTimeout` | İşlem zaman aşımı (Sistem Hatası) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51003`<br>`sysDbClosed` | Veritabanı kapalı, işlem güvenli bir şekilde iptal edildi (Sistem Hatası) | <ul><li>`primaryKey`: `null`</li></ul> |
@@ -515,7 +516,8 @@ Tam durum yönlendirmesi ve ayrıştırması için aşağıdaki tabloya bakın:
 | **30018** | `DEV_INVALID_SCHEMA_INDEX_FIELD` | `ResultType.devInvalidSchemaIndexField` | Geliştirici Hatası | Dizin mevcut olmayan bir alana başvuruyor |
 | **50001** | `SYS_TRANSACTION_ABORTED` | `ResultType.sysTransactionAborted` | Sistem Hatası | İşlem iptal edildi |
 | **50002** | `SYS_TRANSACTION_CONFLICT` | `ResultType.sysTransactionConflict` | Sistem Hatası | İşlem çakışması |
-| **50003** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | Sistem Hatası | **Kritik**: Toplu geçiş yürütmesi başarısız oldu |
+| **50003** | `SYS_TRANSACTION_LIMIT_EXCEEDED` | `ResultType.sysTransactionLimitExceeded` | Sistem Hatası | İşlem, bellek baskısı altında güvenli bellek sınırını aşıyor |
+| **50004** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | Sistem Hatası | **Kritik**: Toplu geçiş yürütmesi başarısız oldu |
 | **51001** | `SYS_TIMEOUT_LOCK_ACQUISITION` | `ResultType.sysTimeoutLockAcquisition` | Sistem Hatası | Kilit alma zaman aşımı |
 | **51002** | `SYS_TIMEOUT` | `ResultType.sysTimeout` | Sistem Hatası | İşlem zaman aşımı |
 | **51003** | `SYS_DB_CLOSED` | `ResultType.sysDbClosed` | Sistem Hatası | Veritabanı kapalı, işlem güvenli bir şekilde iptal edildi |
