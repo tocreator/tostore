@@ -306,7 +306,8 @@ Depending on the `code` / `codeKey` range and the specific subclass of `ResultSt
   | `22004`<br>`devSpaceNotFound` | Space not found (Developer Error) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `23001`<br>`devLargeScaleOperationBypassRequired` | Skip details required to prevent OOM (Developer Error) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `24001`<br>`devEngineIncompatible` | **Critical**: Engine version incompatible | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `50003`<br>`sysMigrationBatchExecutionFailed` | Batch migration execution failed (System Error) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `50003`<br>`sysTransactionLimitExceeded` | Transaction buffered data exceeds the safe limit under memory pressure (System Error) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `50004`<br>`sysMigrationBatchExecutionFailed` | Batch migration execution failed (System Error) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51001`<br>`sysTimeoutLockAcquisition` | Lock acquisition timeout (System Error) | <ul><li>`primaryKey`: Target key (if any)</li><li>`target`: Lock resource ID</li><li>`operation`: `"acquire"`</li></ul> |
   | `51002`<br>`sysTimeout` | Operation timeout (System Error) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51003`<br>`sysDbClosed` | Database is closed, operation safely cancelled (System Error) | <ul><li>`primaryKey`: `null`</li></ul> |
@@ -515,7 +516,8 @@ Refer to the table below for exact status routing and parsing:
 | **30018** | `DEV_INVALID_SCHEMA_INDEX_FIELD` | `ResultType.devInvalidSchemaIndexField` | Developer Error | Index references non-existent field |
 | **50001** | `SYS_TRANSACTION_ABORTED` | `ResultType.sysTransactionAborted` | System Error | Transaction aborted |
 | **50002** | `SYS_TRANSACTION_CONFLICT` | `ResultType.sysTransactionConflict` | System Error | Transaction conflict |
-| **50003** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | System Error | **Critical**: Batch migration execution failed |
+| **50003** | `SYS_TRANSACTION_LIMIT_EXCEEDED` | `ResultType.sysTransactionLimitExceeded` | System Error | Transaction exceeds the safe in-memory limit under memory pressure |
+| **50004** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | System Error | **Critical**: Batch migration execution failed |
 | **51001** | `SYS_TIMEOUT_LOCK_ACQUISITION` | `ResultType.sysTimeoutLockAcquisition` | System Error | Lock acquisition timeout |
 | **51002** | `SYS_TIMEOUT` | `ResultType.sysTimeout` | System Error | Operation timeout |
 | **51003** | `SYS_DB_CLOSED` | `ResultType.sysDbClosed` | System Error | Database is closed, operation safely cancelled |
