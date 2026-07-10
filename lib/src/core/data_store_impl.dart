@@ -232,6 +232,7 @@ class DataStoreImpl {
       DbResult result, String operation, String tableName) {
     final String? txId = Zone.current[_txnZoneKey] as String?;
     if (txId == null) return result;
+    tableDataManager.ensureTransactionWithinResourceLimits(txId);
     final bool rollbackOnError =
         Zone.current[_txnRollbackOnErrorKey] as bool? ?? true;
     if (!rollbackOnError) return result;
@@ -3692,6 +3693,7 @@ class DataStoreImpl {
         final Duration timeout = config.transactionTimeout;
         Future<void> doWork() async {
           try {
+            tableDataManager.ensureTransactionWithinResourceLimits(txId);
             await Future.sync(action);
             // If SSI, check conflicts before applying commit
             if ((isolation ?? config.defaultTransactionIsolationLevel) ==
@@ -3711,6 +3713,7 @@ class DataStoreImpl {
                 ]);
               }
             }
+            tableDataManager.ensureTransactionWithinResourceLimits(txId);
             // Build and persist commit plan (inserts/updates/deletes), then apply
             final plan = await transactionManager!.buildCommitPlan(txId);
             await transactionManager!.persistCommitPlan(plan);
