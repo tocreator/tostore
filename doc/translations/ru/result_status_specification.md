@@ -306,7 +306,8 @@
   | `22004`<br>`devSpaceNotFound` | Пространство (Space) не найдено (Ошибка разработчика) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `23001`<br>`devLargeScaleOperationBypassRequired` | Требуется пропуск деталей для предотвращения OOM (Ошибка разработчика) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `24001`<br>`devEngineIncompatible` | **Критично**: Версия ядра несовместима | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `50003`<br>`sysMigrationBatchExecutionFailed` | Сбой выполнения пакета миграции (Системная ошибка) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `50003`<br>`sysTransactionLimitExceeded` | Буферизованные данные транзакции превышают безопасный предел при нехватке памяти (Системная ошибка) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `50004`<br>`sysMigrationBatchExecutionFailed` | Сбой выполнения пакета миграции (Системная ошибка) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51001`<br>`sysTimeoutLockAcquisition` | Таймаут получения блокировки (Системная ошибка) | <ul><li>`primaryKey`: Целевой ключ (при наличии)</li><li>`target`: ID ресурса блокировки</li><li>`operation`: `"acquire"`</li></ul> |
   | `51002`<br>`sysTimeout` | Таймаут операции (Системная ошибка) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51003`<br>`sysDbClosed` | База данных закрыта, операция безопасно отменена (Системная ошибка) | <ul><li>`primaryKey`: `null`</li></ul> |
@@ -515,7 +516,8 @@ try {
 | **30018** | `DEV_INVALID_SCHEMA_INDEX_FIELD` | `ResultType.devInvalidSchemaIndexField` | Ошибка разработчика | Индекс ссылается на несуществующее поле |
 | **50001** | `SYS_TRANSACTION_ABORTED` | `ResultType.sysTransactionAborted` | Системная ошибка | Транзакция прервана |
 | **50002** | `SYS_TRANSACTION_CONFLICT` | `ResultType.sysTransactionConflict` | Системная ошибка | Конфликт транзакции |
-| **50003** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | Системная ошибка | **Критично**: Сбой выполнения пакета миграции |
+| **50003** | `SYS_TRANSACTION_LIMIT_EXCEEDED` | `ResultType.sysTransactionLimitExceeded` | Системная ошибка | Транзакция превышает безопасный предел памяти при нехватке памяти |
+| **50004** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | Системная ошибка | **Критично**: Сбой выполнения пакета миграции |
 | **51001** | `SYS_TIMEOUT_LOCK_ACQUISITION` | `ResultType.sysTimeoutLockAcquisition` | Системная ошибка | Таймаут получения блокировки |
 | **51002** | `SYS_TIMEOUT` | `ResultType.sysTimeout` | Системная ошибка | Таймаут операции |
 | **51003** | `SYS_DB_CLOSED` | `ResultType.sysDbClosed` | Системная ошибка | База данных закрыта, операция безопасно отменена |
