@@ -494,8 +494,11 @@ class DataStoreImpl {
   }
 
   /// Save space config to file
-  Future<void> saveSpaceConfigToFile(SpaceConfig config,
-      {String? spaceName}) async {
+  Future<void> saveSpaceConfigToFile(
+    SpaceConfig config, {
+    String? spaceName,
+    bool propagateErrors = false,
+  }) async {
     try {
       final resolvedSpaceName = spaceName ?? _currentSpaceName;
       final spaceFilePath =
@@ -508,6 +511,7 @@ class DataStoreImpl {
       }
     } catch (e) {
       Logger.error('Failed to save space config', rawError: e);
+      if (propagateErrors) rethrow;
     }
   }
 
@@ -3044,7 +3048,6 @@ class DataStoreImpl {
               failedKeys: const [],
               successCount: successCount,
               failedCount: failedCount,
-              data: null,
             ));
           }
           return finish(DbResult.batch(
@@ -3063,7 +3066,6 @@ class DataStoreImpl {
                 failedKeys: const [],
                 successCount: successCount,
                 failedCount: partialFailedCount,
-                data: null,
               ));
             }
             return finish(DbResult.batch(
@@ -3080,7 +3082,6 @@ class DataStoreImpl {
               failedKeys: const [],
               successCount: successCount,
               failedCount: 0,
-              data: null,
             ));
           }
           return finish(DbResult.success(
@@ -7385,6 +7386,22 @@ class DataStoreImpl {
     }
     final list = List<String>.from(globalConfig.spaceNames)..sort();
     return list;
+  }
+
+  /// Update in-memory encryption key after [KeyManager.rotateEncryptionKey].
+  void updateEncryptionKeyInConfig(String newKey) {
+    final base = _config?.encryptionConfig ?? const EncryptionConfig();
+    _config = _config!.copyWith(
+      encryptionConfig: base.copyWith(encryptionKey: newKey),
+    );
+  }
+
+  /// Rotate the master [encryptionKey] that wraps stored [encodingKey] blobs.
+  ///
+  /// Returns [DbResult]. On success, [DbResult.data] contains rotated space names.
+  Future<DbResult> rotateEncryptionKey(String oldKey, String newKey) async {
+    await ensureInitialized();
+    return keyManager.rotateEncryptionKey(oldKey: oldKey, newKey: newKey);
   }
 
   /// Stream records from a table with filtering
