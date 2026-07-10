@@ -256,6 +256,40 @@ final class BTreePageIO {
     }
     return (type: hdr.pageType, encodedPayload: payload);
   }
+
+  /// Decode payload from an already-validated header + contiguous payload bytes.
+  ///
+  /// Used by bootstrap two-phase IO (header → payloadLen) when
+  /// [GlobalConfig.pageSize] is not yet known. Prefer a single full-page read
+  /// via [BTreePageIO.parsePageBytes] once page size is configured.
+  static ({BTreePageType type, Uint8List encodedPayload})
+      parseHeaderAndPayload({
+    required BTreePageHeader header,
+    required Uint8List encodedPayload,
+  }) {
+    if (encodedPayload.length != header.payloadLen) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.sysIoDataCorrupted,
+          message:
+              'Payload length mismatch: header=${header.payloadLen} actual=${encodedPayload.length}.',
+          operation: 'parseHeaderAndPayload',
+        )
+      ]);
+    }
+    final crc = Crc32.of(encodedPayload);
+    if (crc != header.payloadCrc32) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.sysIoDataCorrupted,
+          message:
+              'Page CRC mismatch: expected=${header.payloadCrc32} actual=$crc. Torn write or storage fault detected.',
+          operation: 'parseHeaderAndPayload',
+        )
+      ]);
+    }
+    return (type: header.pageType, encodedPayload: encodedPayload);
+  }
 }
 
 // ============================================================================
