@@ -306,7 +306,8 @@ A seconda dell'intervallo di `code` / `codeKey` e della sottoclasse specifica di
   | `22004`<br>`devSpaceNotFound` | Spazio non trovato (Errore dello sviluppatore) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `23001`<br>`devLargeScaleOperationBypassRequired` | Salto dei dettagli richiesto per evitare OOM (Errore dello sviluppatore) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `24001`<br>`devEngineIncompatible` | **Critico**: Versione del motore incompatibile | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `50003`<br>`sysMigrationBatchExecutionFailed` | Errore di esecuzione del batch di migrazione (Errore di sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `50003`<br>`sysTransactionLimitExceeded` | I dati memorizzati nel buffer della transazione superano il limite sicuro sotto pressione di memoria (Errore di sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `50004`<br>`sysMigrationBatchExecutionFailed` | Errore di esecuzione del batch di migrazione (Errore di sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51001`<br>`sysTimeoutLockAcquisition` | Timeout di acquisizione del blocco (Errore di sistema) | <ul><li>`primaryKey`: Chiave target (se presente)</li><li>`target`: ID della risorsa di blocco</li><li>`operation`: `"acquire"`</li></ul> |
   | `51002`<br>`sysTimeout` | Timeout dell'operazione (Errore di sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51003`<br>`sysDbClosed` | Il database è chiuso, l'operazione è stata annullata in modo sicuro (Errore di sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
@@ -515,7 +516,8 @@ Fare riferimento alla tabella seguente per l'instradamento e l'analisi dello sta
 | **30018** | `DEV_INVALID_SCHEMA_INDEX_FIELD` | `ResultType.devInvalidSchemaIndexField` | Errore dello Sviluppatore | L'indice fa riferimento a un campo inesistente |
 | **50001** | `SYS_TRANSACTION_ABORTED` | `ResultType.sysTransactionAborted` | Errore di Sistema | Transazione interrotta |
 | **50002** | `SYS_TRANSACTION_CONFLICT` | `ResultType.sysTransactionConflict` | Errore di Sistema | Conflitto di transazione |
-| **50003** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | Errore di Sistema | **Critico**: Errore di esecuzione del batch di migrazione |
+| **50003** | `SYS_TRANSACTION_LIMIT_EXCEEDED` | `ResultType.sysTransactionLimitExceeded` | Errore di Sistema | La transazione supera il limite di memoria sicuro sotto pressione di memoria |
+| **50004** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | Errore di Sistema | **Critico**: Errore di esecuzione del batch di migrazione |
 | **51001** | `SYS_TIMEOUT_LOCK_ACQUISITION` | `ResultType.sysTimeoutLockAcquisition` | Errore di Sistema | Timeout di acquisizione del blocco |
 | **51002** | `SYS_TIMEOUT` | `ResultType.sysTimeout` | Errore di Sistema | Timeout dell'operazione |
 | **51003** | `SYS_DB_CLOSED` | `ResultType.sysDbClosed` | Errore di Sistema | Il database è chiuso, l'operazione è stata annullata in modo sicuro |
