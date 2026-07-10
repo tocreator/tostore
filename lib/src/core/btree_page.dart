@@ -806,13 +806,10 @@ final class BTreePageCodec {
   /// Decode payload with optional decryption.
   static Uint8List decodePayload(
     Uint8List encoded, {
-    required DataStoreConfig config,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
     Uint8List? aad,
   }) {
-    final ec = config.encryptionConfig;
-    if (ec == null) return encoded;
     return EncryptionManager.decodeBytes(
       encoded,
       customKey: encryptionKey,

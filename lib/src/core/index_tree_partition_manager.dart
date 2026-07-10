@@ -275,7 +275,6 @@ final class IndexTreePartitionManager {
       if (parsed.type != BTreePageType.leaf) return LeafPage.empty();
       final payload = BTreePageCodec.decodePayload(
         parsed.encodedPayload,
-        config: _dataStore.config,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
         aad: _aad(ptr, parsed.type),
@@ -351,7 +350,6 @@ final class IndexTreePartitionManager {
       if (parsed.type != BTreePageType.internal) return InternalPage.empty();
       final payload = BTreePageCodec.decodePayload(
         parsed.encodedPayload,
-        config: _dataStore.config,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
         aad: _aad(ptr, parsed.type),

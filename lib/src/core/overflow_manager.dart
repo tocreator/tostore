@@ -210,7 +210,6 @@ final class OverflowManager {
           if (parsed.type != BTreePageType.overflow) break;
           final decodedPayload = BTreePageCodec.decodePayload(
             parsed.encodedPayload,
-            config: _dataStore.config,
             encryptionKey: encryptionKey,
             encryptionKeyId: encryptionKeyId,
             aad: _aadForOverflowPage(ref.overflowPartitionNo, curPageNo),
@@ -328,7 +327,6 @@ final class OverflowManager {
       }
       final decodedPayload = BTreePageCodec.decodePayload(
         parsed.encodedPayload,
-        config: _dataStore.config,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
         aad: _aadForOverflowPage(ref.overflowPartitionNo, pageNo),
@@ -495,7 +493,6 @@ final class OverflowManager {
     }
     final decodedPayload = BTreePageCodec.decodePayload(
       parsed.encodedPayload,
-      config: _dataStore.config,
       encryptionKey: encryptionKey,
       encryptionKeyId: encryptionKeyId,
       aad: _aadForOverflowPage(partitionNo, 0),
@@ -576,7 +573,6 @@ final class OverflowManager {
         }
         final decodedPayload = BTreePageCodec.decodePayload(
           parsed.encodedPayload,
-          config: _dataStore.config,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           aad: _aadForOverflowPage(partitionNo, head),

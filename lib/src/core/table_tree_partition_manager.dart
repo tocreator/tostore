@@ -435,7 +435,6 @@ final class TableTreePartitionManager {
       if (parsed.type != BTreePageType.leaf) return LeafPage.empty();
       final payload = BTreePageCodec.decodePayload(
         parsed.encodedPayload,
-        config: _config,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
         aad: _aad(ptr, parsed.type),
@@ -518,7 +517,6 @@ final class TableTreePartitionManager {
       if (parsed.type != BTreePageType.internal) return InternalPage.empty();
       final payload = BTreePageCodec.decodePayload(
         parsed.encodedPayload,
-        config: _config,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
         aad: _aad(ptr, parsed.type),
@@ -2350,7 +2348,6 @@ final class TableTreePartitionManager {
         }
         final payload = BTreePageCodec.decodePayload(
           parsed.encodedPayload,
-          config: _config,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           aad: _aad(ptr, parsed.type),

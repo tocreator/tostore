@@ -1114,14 +1114,8 @@ final class NghPartitionManager {
 
   /// Decode page payload, applying decryption if vector encryption is enabled.
   Uint8List _decodePayload(Uint8List encodedPayload) {
-    final encCfg = _dataStore.config.encryptionConfig;
-    final bool encrypt = encCfg != null &&
-        encCfg.encryptVectorIndex &&
-        encCfg.encryptionType != EncryptionType.none;
-    if (!encrypt) return encodedPayload;
     return BTreePageCodec.decodePayload(
       encodedPayload,
-      config: _dataStore.config,
     );
   }
 
