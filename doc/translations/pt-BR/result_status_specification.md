@@ -306,7 +306,8 @@ Dependendo do intervalo de `code` / `codeKey` e da subclasse específica de `Res
   | `22004`<br>`devSpaceNotFound` | Espaço não encontrado (Erro de Desenvolvedor) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `23001`<br>`devLargeScaleOperationBypassRequired` | Pular detalhes é necessário para evitar OOM (Erro de Desenvolvedor) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `24001`<br>`devEngineIncompatible` | **Crítico**: Versão do motor incompatível | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `50003`<br>`sysMigrationBatchExecutionFailed` | Falha na execução do lote de migração (Erro do Sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `50003`<br>`sysTransactionLimitExceeded` | Os dados em buffer da transação excedem o limite seguro sob pressão de memória (Erro do Sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `50004`<br>`sysMigrationBatchExecutionFailed` | Falha na execução do lote de migração (Erro do Sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51001`<br>`sysTimeoutLockAcquisition` | Tempo limite de aquisição de bloqueio (Erro do Sistema) | <ul><li>`primaryKey`: Chave de destino (se houver)</li><li>`target`: ID do recurso de bloqueio</li><li>`operation`: `"acquire"`</li></ul> |
   | `51002`<br>`sysTimeout` | Tempo limite da operação (Erro do Sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51003`<br>`sysDbClosed` | O banco de dados está fechado, a operação foi cancelada com segurança (Erro do Sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
@@ -515,7 +516,8 @@ Consulte a tabela abaixo para roteamento e análise exatos do status:
 | **30018** | `DEV_INVALID_SCHEMA_INDEX_FIELD` | `ResultType.devInvalidSchemaIndexField` | Erro de Desenvolvedor | Índice faz referência a um campo inexistente |
 | **50001** | `SYS_TRANSACTION_ABORTED` | `ResultType.sysTransactionAborted` | Erro do Sistema | Transação abortada |
 | **50002** | `SYS_TRANSACTION_CONFLICT` | `ResultType.sysTransactionConflict` | Erro do Sistema | Conflito de transação |
-| **50003** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | Erro do Sistema | **Crítico**: Falha na execução do lote de migração |
+| **50003** | `SYS_TRANSACTION_LIMIT_EXCEEDED` | `ResultType.sysTransactionLimitExceeded` | Erro do Sistema | A transação excede o limite seguro de memória sob pressão de memória |
+| **50004** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | Erro do Sistema | **Crítico**: Falha na execução do lote de migração |
 | **51001** | `SYS_TIMEOUT_LOCK_ACQUISITION` | `ResultType.sysTimeoutLockAcquisition` | Erro do Sistema | Tempo limite de aquisição de bloqueio |
 | **51002** | `SYS_TIMEOUT` | `ResultType.sysTimeout` | Erro do Sistema | Tempo limite da operação |
 | **51003** | `SYS_DB_CLOSED` | `ResultType.sysDbClosed` | Erro do Sistema | O banco de dados está fechado, a operação foi cancelada com segurança |
