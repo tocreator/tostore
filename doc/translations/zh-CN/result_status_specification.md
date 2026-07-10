@@ -311,7 +311,8 @@
   | **Code**: `22004`<br>`ResultType.devSpaceNotFound` | **级别**：开发者错误<br>试图操作或删除一个不存在 Space（命名空间/数据库文件路径）时触发。 | <ul><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `23001`<br>`ResultType.devLargeScaleOperationBypassRequired` | **级别**：开发者错误<br>超大规模写入/更新操作需调用 `skipResultDetails()` 开启防 OOM 旁路模式。 | <ul><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `24001`<br>`ResultType.devEngineIncompatible` | **级别**：**致命错误**<br>库配置或数据文件与当前引擎版本不兼容，强制拦截抛出。 | <ul><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `50003`<br>`ResultType.sysMigrationBatchExecutionFailed` | **级别**：系统错误<br>批量表结构迁移物理执行失败。 | <ul><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `50003`<br>`ResultType.sysTransactionLimitExceeded` | **级别**：系统错误<br>内存压力下事务缓冲数据超过安全限制。 | <ul><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `50004`<br>`ResultType.sysMigrationBatchExecutionFailed` | **级别**：系统错误<br>批量表结构迁移物理执行失败。 | <ul><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `51001`<br>`ResultType.sysTimeoutLockAcquisition` | **级别**：系统错误<br>并发控制：在高负载下等待行锁或表锁，锁获取超时（默认 10s）。 | <ul><li>`primaryKey`: 等待获取锁的主键值（如有）</li><li>`target`: 锁定的资源名称</li><li>`operation`: `"acquire"`</li></ul> |
   | **Code**: `51002`<br>`ResultType.sysTimeout` | **级别**：系统错误<br>系统超时：整个异步运算执行时间超时未归还。 | <ul><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `51003`<br>`ResultType.sysDbClosed` | **级别**：系统错误<br>数据库已关闭，操作安全取消。 | <ul><li>`primaryKey`: `null`</li></ul> |
@@ -520,7 +521,8 @@ try {
 | **30018** | `DEV_INVALID_SCHEMA_INDEX_FIELD` | `ResultType.devInvalidSchemaIndexField` | 开发者错误 | 索引指向了表中并不存在的字段名 |
 | **50001** | `SYS_TRANSACTION_ABORTED` | `ResultType.sysTransactionAborted` | 系统错误 | 事务主动回滚或被强制中止 |
 | **50002** | `SYS_TRANSACTION_CONFLICT` | `ResultType.sysTransactionConflict` | 系统错误 | 并发事务修改了同一实体导致版本冲突 |
-| **50003** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | 系统错误 | 批量表结构迁移物理执行失败 |
+| **50003** | `SYS_TRANSACTION_LIMIT_EXCEEDED` | `ResultType.sysTransactionLimitExceeded` | 系统错误 | 事务在内存压力下超过安全内存限制 |
+| **50004** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | 系统错误 | 批量表结构迁移物理执行失败 |
 | **51001** | `SYS_TIMEOUT_LOCK_ACQUISITION` | `ResultType.sysTimeoutLockAcquisition` | 系统错误 | 事务内获取排他锁超时 |
 | **51002** | `SYS_TIMEOUT` | `ResultType.sysTimeout` | 系统错误 | 查询、写入等底层操作执行超时 |
 | **51003** | `SYS_DB_CLOSED` | `ResultType.sysDbClosed` | 系统错误 | 数据库已关闭，操作安全取消 |
