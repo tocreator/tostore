@@ -1132,6 +1132,34 @@ class ToStore implements DataStoreInterface {
     return await _impl.setVersion(version);
   }
 
+  /// Rotate [EncryptionConfig.encryptionKey].
+  ///
+  /// Use when your security policy requires rotating the master encryption key.
+  /// [oldKey] must be the key currently in use; [newKey] takes effect for this
+  /// instance immediately and is saved for subsequent [open] calls.
+  ///
+  /// Does not re-encrypt existing table, index, or log data. To rotate the data
+  /// encryption key, change [EncryptionConfig.encodingKey] instead — the engine
+  /// migrates data automatically.
+  /// Returns [DbResult] for graceful error handling in production. On success.
+  ///
+  /// 轮换 [EncryptionConfig.encryptionKey]。
+  ///
+  /// 用于按安全策略定期更换主加密密钥。[oldKey] 为当前正在使用的密钥；
+  /// [newKey] 立即对本实例生效，并保存以供后续 [open] 使用。
+  ///
+  /// 不会重新加密已有的表、索引与日志数据。若要更换数据加密密钥，
+  /// 请修改 [EncryptionConfig.encodingKey]，引擎会自动迁移数据。
+  ///
+  /// 应用重启后，请在 [open] 时将 [newKey] 作为 [EncryptionConfig.encryptionKey] 传入。
+  ///
+  /// 返回 [DbResult] 方便在生产环境处理错误。
+  Future<DbResult> rotateEncryptionKey(String oldKey, String newKey) async {
+    final result = await _impl.rotateEncryptionKey(oldKey, newKey);
+    DbException.checkDeveloperError(result);
+    return result;
+  }
+
   /// Flush pending writes to disk.
   /// [flushStorage] When true (default), also flush underlying storage buffers.
   ///
