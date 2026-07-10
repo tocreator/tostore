@@ -1467,7 +1467,14 @@ ToStore, veritabanı yaşam döngüsü günlüklerini `ToStore.setLogConfig(...)
 ## <a id="security-config"></a>Güvenlik Yapılandırması
 
 > [!WARNING]
-> **Anahtar yönetimi**: **`encodingKey`** serbestçe değiştirilebilir ve motor, verileri otomatik olarak taşıyarak verilerin kurtarılabilir kalmasını sağlar. **`encryptionKey`** rastgele değiştirilmemelidir. Bir kez değiştirildikten sonra, siz açıkça taşımadığınız sürece eski verilerin şifresi çözülemez. Hassas anahtarları hiçbir zaman sabit kodlamayın; bunları güvenli bir servisten almanız önerilir.
+> **Anahtar yönetimi**
+>
+> | Anahtar | Rol | Nasıl değiştirilir | Verilerin tamamen yeniden yazılması? |
+> | :--- | :--- | :--- | :--- |
+> | **`encodingKey`** | Veri şifreleme anahtarı | Yeni değer ayarlayıp tekrar `open` | **Evet** (yavaş) |
+> | **`encryptionKey`** | Güvenlik anahtarı; `encodingKey`'i korur | Çalışma zamanında `db.rotateEncryptionKey` çağırın | **Hayır** (hızlı) |
+>
+> Hassas anahtarları asla sabit kodlamayın; güvenli bir servisten almanız önerilir.
 
 ```dart
 final db = await ToStore.open(
@@ -1476,10 +1483,10 @@ final db = await ToStore.open(
       // Supported encryption algorithms: none, xorObfuscation, chacha20Poly1305, aes256Gcm
       encryptionType: EncryptionType.chacha20Poly1305,
 
-      // Encoding key (can be changed; data will be migrated automatically)
+      // Data encryption key: encrypts data; changing it triggers a full background rewrite of encrypted data
       encodingKey: 'Your-32-Byte-Long-Encoding-Key...',
 
-      // Encryption key for critical data (do not change casually unless you are migrating data)
+      // Security key: protects encodingKey; does not encrypt data directly; rotate online via rotateEncryptionKey
       encryptionKey: 'Your-Secure-Encryption-Key...',
 
       // Device binding (path-based binding)
@@ -1499,6 +1506,19 @@ final db = await ToStore.open(
     persistRecoveryOnCommit: true,
   ),
 );
+```
+
+**`encodingKey` değiştirme**: `EncryptionConfig` içinde yeni değeri ayarlayın ve tekrar `open` çağırın. Motor değişikliği algılar ve verileri arka planda otomatik olarak taşır; uygulama tarafında ek işlem gerekmez.
+
+**`encryptionKey` rotasyonu** (periyodik güvenlik/uyumluluk rotasyonu): veri yeniden yazımı yok; çevrimiçi çalıştırılabilir.
+
+```dart
+final result = await db.rotateEncryptionKey(oldEncryptionKey, newEncryptionKey);
+if (result.hasErrors) {
+  // Hata işleme (yanlış oldKey, encodingKey taşıması devam ediyor vb.)
+  return;
+}
+// Başarılı: bellekteki yapılandırma güncellendi; sonraki ToStore.open çağrısında güncel encryptionKey verin
 ```
 
 ### Değer Düzeyinde Şifreleme (ToCrypto)
