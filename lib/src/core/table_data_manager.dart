@@ -32,6 +32,7 @@ import 'compute/query_aggregate_compute.dart';
 import 'compute_manager.dart';
 import 'crontab_manager.dart';
 import 'data_store_impl.dart';
+import 'resource_manager.dart';
 import 'transaction_context.dart';
 import 'tree_cache.dart';
 import 'weight_manager.dart';
@@ -99,6 +100,14 @@ class TableDataManager {
   // txId -> tableUid -> pk -> TxnDeferredOp
   final Map<String, Map<String, Map<String, TxnDeferredOp>>> _txnDeferredOps =
       {};
+
+  // Lightweight accounting for transaction data retained in memory. Record
+  // sizes are sampled only, so normal-resource transactions remain unbounded.
+  final Map<String, _TransactionResourceEstimate> _txnResourceEstimates = {};
+
+  static const int _transactionOperationWarningLimit = 50000;
+  static const int _transactionBytesWarningLimit = 50 * 1024 * 1024;
+  static const int _transactionSampleSize = 10;
 
   /// Add auto-increment ID to write buffer
   final Map<String, dynamic> _maxIds = {};
@@ -873,6 +882,7 @@ class TableDataManager {
       _recordCountLoadingFutures.clear();
       _metaLoadingFutures.clear();
       _txnDeferredOps.clear();
+      _txnResourceEstimates.clear();
       _maxIds.clear();
       _maxIdsDirty.clear();
       _idGenerators.clear();
@@ -1060,6 +1070,13 @@ class TableDataManager {
         }
         // For other combinations, use the latest operation.
       }
+
+      _trackTransactionBufferBatch(
+        currentTxId,
+        [finalData],
+        mergedOldValues != null ? {recordId: mergedOldValues} : null,
+        primaryKey,
+      );
 
       // We already checked recordId is not null above
       map[recordId] = TxnDeferredOp(
@@ -1260,6 +1277,13 @@ class TableDataManager {
           currentTxId, () => <String, Map<String, TxnDeferredOp>>{});
       final map =
           byTable.putIfAbsent(table.tableUid, () => <String, TxnDeferredOp>{});
+      _trackTransactionBufferBatch(
+        currentTxId,
+        records,
+        oldRecordsMap,
+        pkName,
+      );
+
       final yieldController = YieldController('TableDataManager._addBatch.tx');
 
       for (int i = 0; i < records.length; i++) {
@@ -1271,10 +1295,10 @@ class TableDataManager {
           continue;
         }
 
-        try {
-          final uniqueRefs = uniqueKeyRefsList[i];
-          final oldR = oldRecordsMap != null ? oldRecordsMap[recordId] : null;
+        final uniqueRefs = uniqueKeyRefsList[i];
+        final oldR = oldRecordsMap != null ? oldRecordsMap[recordId] : null;
 
+        try {
           map[recordId] = TxnDeferredOp(
             operation,
             Map<String, dynamic>.from(r),
@@ -2574,6 +2598,7 @@ class TableDataManager {
   /// Rollback: remove placeholders and drop deferred ops.
   Future<void> applyTransactionRollback(String txId) async {
     _txnDeferredOps.remove(txId);
+    _txnResourceEstimates.remove(txId);
   }
 
   String _tableLockResource(TableContext table) =>
@@ -3258,6 +3283,7 @@ class TableDataManager {
 
       for (final tx in inactive) {
         _txnDeferredOps.remove(tx);
+        _txnResourceEstimates.remove(tx);
       }
     } catch (e) {
       Logger.warn('cleanupTransactionalState failed', rawError: e);
@@ -3267,6 +3293,7 @@ class TableDataManager {
   /// Remove specific transaction state (called by rollback/cleanup)
   Future<void> clearTransactionState(String transactionId) async {
     _txnDeferredOps.remove(transactionId);
+    _txnResourceEstimates.remove(transactionId);
     // Also clear from WriteBufferManager unique key tracking
     await _dataStore.writeBufferManager
         .removeTransactionUniqueKeys(transactionId);
@@ -3291,6 +3318,128 @@ class TableDataManager {
       result[tableName] = pkMap.values;
     });
     return result;
+  }
+
+  /// Reject a transaction only when memory pressure makes its retained data
+  /// unsafe. Under normal memory conditions no transaction size cap is applied.
+  void ensureTransactionWithinResourceLimits(String transactionId) {
+    final rm = _dataStore.resourceManager;
+    if (rm == null) return;
+    final status = rm.memoryStatus;
+    if (status == ResourceStatus.normal) return;
+
+    final estimateCount =
+        _txnResourceEstimates[transactionId]?.operationCount ?? 0;
+    _checkTransactionLimits(transactionId, status, estimateCount);
+  }
+
+  /// Perform batch resource validation and tracking for transactions.
+  /// This optimizes performance in batch write scenarios by scaling from O(M) down to O(1) database checks.
+  void _trackTransactionBufferBatch(
+    String transactionId,
+    List<Map<String, dynamic>> records,
+    Map<String, Map<String, dynamic>>? oldRecordsMap,
+    String pkName,
+  ) {
+    final rm = _dataStore.resourceManager;
+    if (rm == null) return;
+
+    final status = rm.memoryStatus;
+
+    // 1. Retrieve or initialize the resource estimate (performs only 1 Map lookup)
+    final estimate = _txnResourceEstimates.putIfAbsent(
+        transactionId, _TransactionResourceEstimate.new);
+
+    // 2. Proactive validation under memory pressure
+    if (status != ResourceStatus.normal) {
+      final projectedCount = estimate.operationCount + records.length;
+      _checkTransactionLimits(transactionId, status, projectedCount);
+    }
+
+    if (records.isEmpty) return;
+
+    // 3. Increment operation count directly (using records.length without loops)
+    estimate.operationCount += records.length;
+
+    // 4. Sample data size: only active and compiled under warning stage to keep normal path zero-overhead
+    if (status == ResourceStatus.warning &&
+        estimate.sampleCount < _transactionSampleSize) {
+      // Sample head records (up to 5)
+      final int headCount = min(5, records.length);
+      for (int i = 0; i < headCount; i++) {
+        if (estimate.sampleCount >= _transactionSampleSize) break;
+        final data = records[i];
+        final rId = data[pkName]?.toString();
+        final oldVal = oldRecordsMap != null ? oldRecordsMap[rId] : null;
+        estimate.sampleBytes += estimateRecordSizeBytes(data) +
+            (oldVal == null ? 0 : estimateRecordSizeBytes(oldVal));
+        estimate.sampleCount++;
+      }
+
+      // Sample tail records (up to 5, if they don't overlap with head)
+      if (records.length > 5 && estimate.sampleCount < _transactionSampleSize) {
+        final int tailStart = max(5, records.length - 5);
+        for (int i = tailStart; i < records.length; i++) {
+          if (estimate.sampleCount >= _transactionSampleSize) break;
+          final data = records[i];
+          final rId = data[pkName]?.toString();
+          final oldVal = oldRecordsMap != null ? oldRecordsMap[rId] : null;
+          estimate.sampleBytes += estimateRecordSizeBytes(data) +
+              (oldVal == null ? 0 : estimateRecordSizeBytes(oldVal));
+          estimate.sampleCount++;
+        }
+      }
+    }
+
+    // 5. Post-aggregation limit verification (warning stage check)
+    if (status == ResourceStatus.warning) {
+      _checkTransactionLimits(transactionId, status, estimate.operationCount);
+    }
+  }
+
+  /// Internal helper to evaluate memory resource safety limits.
+  void _checkTransactionLimits(
+      String transactionId, ResourceStatus status, int projectedCount) {
+    if (status == ResourceStatus.critical) {
+      throw DbException([
+        TransactionOperationStatus(
+          type: ResultType.sysResourceExhaustedMemory,
+          message:
+              'Transaction blocked: Insufficient system memory to execute transaction write operations. Please free up memory or retry later.',
+          txId: transactionId,
+        ),
+      ]);
+    }
+
+    if (status == ResourceStatus.warning) {
+      if (projectedCount > _transactionOperationWarningLimit) {
+        throw DbException([
+          TransactionOperationStatus(
+            type: ResultType.sysTransactionLimitExceeded,
+            message:
+                'Transaction rejected because its buffered data is too large under current memory pressure. Split the work into smaller transactions and retry.',
+            txId: transactionId,
+          ),
+        ]);
+      }
+
+      final estimate = _txnResourceEstimates[transactionId];
+      if (estimate != null && estimate.sampleCount > 0) {
+        final exceedsBytes = estimate.sampleBytes * projectedCount >
+            _transactionBytesWarningLimit * estimate.sampleCount;
+
+        if (exceedsBytes) {
+          throw DbException([
+            TransactionOperationStatus(
+              type: ResultType.sysTransactionLimitExceeded,
+              message:
+                  'Transaction rejected because its buffered data is too large under current memory pressure. Split the work into smaller transactions and retry.',
+              txId: transactionId,
+            ),
+          ]);
+        }
+      }
+    }
   }
 
   /// Writes the given changes (inserts, updates, deletes) to the partition files of the specified table.
@@ -4421,6 +4570,12 @@ class TxnDeferredOp {
 
   const TxnDeferredOp(this.type, this.data,
       {this.uniqueKeyRefs, this.oldValues});
+}
+
+class _TransactionResourceEstimate {
+  int operationCount = 0;
+  int sampleBytes = 0;
+  int sampleCount = 0;
 }
 
 enum PartitionStreamAction {
