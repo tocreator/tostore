@@ -53,6 +53,9 @@ class ResourceManager {
   /// Current resource status
   ResourceStatus _status = ResourceStatus.normal;
 
+  /// Current memory status, kept separate from the combined memory/disk status.
+  ResourceStatus _memoryStatus = ResourceStatus.normal;
+
   /// Initialization flag
   bool _initialized = false;
 
@@ -87,6 +90,14 @@ class ResourceManager {
 
     // Calculate cache sizes
     _calculateCacheSizes();
+
+    // Establish an actual resource state before accepting operations instead
+    // of waiting for the first periodic monitor tick.
+    try {
+      await _updateResourceStatus();
+    } catch (e) {
+      Logger.warn('Initial resource status check failed', rawError: e);
+    }
 
     // Register resource monitoring task
     _registerResourceMonitor();
@@ -208,6 +219,7 @@ class ResourceManager {
     } else if (availableMemoryMB < systemMemoryMB * 0.1) {
       memoryStatus = ResourceStatus.warning;
     }
+    _memoryStatus = memoryStatus;
 
     // Determine disk status
     ResourceStatus diskStatus = ResourceStatus.normal;
@@ -476,6 +488,9 @@ class ResourceManager {
   /// Get current resource status
   ResourceStatus get status => _status;
 
+  /// Get current memory status without conflating it with disk pressure.
+  ResourceStatus get memoryStatus => _memoryStatus;
+
   /// Whether write operations should be blocked
   bool get isWriteBlocked => _status == ResourceStatus.critical;
 
@@ -562,6 +577,8 @@ class ResourceManager {
     _cacheEvictionCallbacks.updateAll((key, value) => null);
     _dataStore = null;
     _effectivePrewarmThresholdMB = null;
+    _status = ResourceStatus.normal;
+    _memoryStatus = ResourceStatus.normal;
     _initialized = false;
   }
 }
