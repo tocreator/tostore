@@ -306,7 +306,8 @@ Dart/Flutterでは、`ResultStatus`と`ResultType`は、手動の範囲チェッ
   | `22004`<br>`devSpaceNotFound` | スペースが見つかりません（開発者エラー） | <ul><li>`primaryKey`: `null`</li></ul> |
   | `23001`<br>`devLargeScaleOperationBypassRequired` | OOM防止のため結果詳細のスキップが必要（開発者エラー） | <ul><li>`primaryKey`: `null`</li></ul> |
   | `24001`<br>`devEngineIncompatible` | **重大**: エンジンバージョン不整合（開発者エラー） | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `50003`<br>`sysMigrationBatchExecutionFailed` | 重大な移行バッチ実行の失敗（システムエラー） | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `50003`<br>`sysTransactionLimitExceeded` | メモリ逼迫時にトランザクションのバッファデータが安全な上限を超過（システムエラー） | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `50004`<br>`sysMigrationBatchExecutionFailed` | 重大な移行バッチ実行の失敗（システムエラー） | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51001`<br>`sysTimeoutLockAcquisition` | ロック取得タイムアウト（システムエラー） | <ul><li>`primaryKey`: ターゲットキー（存在する場合）</li><li>`target`: ロックリソースID</li><li>`operation`: `"acquire"`</li></ul> |
   | `51002`<br>`sysTimeout` | 操作タイムアウト（システムエラー） | <ul><li>`primaryKey`: `null`</li></ul> |
   | `51003`<br>`sysDbClosed` | データベースが閉じられています。操作は安全にキャンセルされました（システムエラー） | <ul><li>`primaryKey`: `null`</li></ul> |
@@ -515,7 +516,8 @@ try {
 | **30018** | `DEV_INVALID_SCHEMA_INDEX_FIELD` | `ResultType.devInvalidSchemaIndexField` | 開発者エラー | インデックスが存在しないフィールドを参照しています |
 | **50001** | `SYS_TRANSACTION_ABORTED` | `ResultType.sysTransactionAborted` | システムエラー | トランザクションがアボートされました |
 | **50002** | `SYS_TRANSACTION_CONFLICT` | `ResultType.sysTransactionConflict` | systemエラー | トランザクション競合 |
-| **50003** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | システムエラー | **重大**: 重大な移行バッチ実行の失敗 |
+| **50003** | `SYS_TRANSACTION_LIMIT_EXCEEDED` | `ResultType.sysTransactionLimitExceeded` | システムエラー | メモリ逼迫時にトランザクションが安全なメモリ上限を超過 |
+| **50004** | `SYS_MIGRATION_BATCH_EXECUTION_FAILED` | `ResultType.sysMigrationBatchExecutionFailed` | システムエラー | **重大**: 重大な移行バッチ実行の失敗 |
 | **51001** | `SYS_TIMEOUT_LOCK_ACQUISITION` | `ResultType.sysTimeoutLockAcquisition` | システムエラー | ロック取得タイムアウト |
 | **51002** | `SYS_TIMEOUT` | `ResultType.sysTimeout` | システムエラー | 操作タイムアウト |
 | **51003** | `SYS_DB_CLOSED` | `ResultType.sysDbClosed` | システムエラー | データベースが閉じられています。操作は安全にキャンセルされました |
