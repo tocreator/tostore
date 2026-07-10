@@ -10,9 +10,6 @@ class DbResult {
   /// Whether the operation has any failures
   final bool hasErrors;
 
-  /// Optional arbitrary data payload (e.g. for returning modified rows or records)
-  final dynamic data;
-
   /// Total number of successful items
   final int successCount;
 
@@ -25,7 +22,6 @@ class DbResult {
     int? successCount,
     int? failedCount,
     bool? hasErrors,
-    this.data,
     List<String>? successKeys,
     List<String>? failedKeys,
   })  : successCount =
@@ -140,7 +136,6 @@ class DbResult {
     String? successKey,
     List<String>? successKeys,
     String message = 'Operation successful',
-    dynamic data,
   }) {
     final keys = successKey != null ? [successKey] : successKeys ?? [];
     return DbResult(
@@ -156,7 +151,6 @@ class DbResult {
       successCount: keys.length,
       failedCount: 0,
       hasErrors: false,
-      data: data,
     );
   }
 
@@ -199,7 +193,6 @@ class DbResult {
     int? failedCount,
     bool? hasErrors,
     String? message,
-    dynamic data,
   }) {
     final effectiveStatuses = statuses ??
         [
@@ -224,7 +217,6 @@ class DbResult {
       successCount: successCount ?? successKeys.length,
       failedCount: failedCount ?? failedKeys.length,
       hasErrors: hasErrors,
-      data: data,
     );
   }
 
@@ -234,7 +226,6 @@ class DbResult {
       'hasErrors': hasErrors,
       'successCount': successCount,
       'failedCount': failedCount,
-      if (data != null) 'data': data,
       'statuses': statuses.map((e) => e.toJson()).toList(),
     };
   }
@@ -245,7 +236,6 @@ class DbResult {
         .map((e) => ResultStatus.fromJson(Map<String, dynamic>.from(e as Map)))
         .toList();
 
-    final data = json['data'];
     final successCount = json['successCount'] as int? ?? 0;
     final failedCount = json['failedCount'] as int? ?? 0;
     final hasErrors = json['hasErrors'] as bool?;
@@ -255,7 +245,6 @@ class DbResult {
       successCount: successCount,
       failedCount: failedCount,
       hasErrors: hasErrors,
-      data: data,
     );
   }
 
