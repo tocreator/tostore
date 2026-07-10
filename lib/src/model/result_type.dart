@@ -140,8 +140,10 @@ enum ResultType {
       50001, 'SYS_TRANSACTION_ABORTED', 'Transaction aborted'),
   sysTransactionConflict(
       50002, 'SYS_TRANSACTION_CONFLICT', 'Transaction conflict'),
+  sysTransactionLimitExceeded(50003, 'SYS_TRANSACTION_LIMIT_EXCEEDED',
+      'Transaction exceeds the safe in-memory limit'),
   sysMigrationBatchExecutionFailed(
-      50003,
+      50004,
       'SYS_MIGRATION_BATCH_EXECUTION_FAILED',
       'Batch migration execution failed',
       isCritical: true),
