@@ -9,6 +9,7 @@ import '../handler/common.dart';
 import '../handler/encryption.dart';
 import '../handler/logger.dart';
 import '../handler/memcomparable.dart';
+import '../handler/meta_binary_codec.dart';
 import '../handler/parallel_processor.dart';
 import '../model/data_block_entry.dart';
 import '../model/data_store_config.dart';
@@ -166,14 +167,14 @@ final class IndexTreePartitionManager {
     int? encryptionKeyId,
   }) async {
     final tableUid = table.tableUid;
-    final resolvedMeta =
-        meta ?? await _dataStore.indexManager?.getIndexMeta(table, indexUid);
+    final resolvedMeta = meta ??
+        await _dataStore.indexManager?.getIndexMeta(table.tableUid, indexUid);
     if (resolvedMeta == null || resolvedMeta.btreeFirstLeaf.isNull) {
       return 0;
     }
 
     int loadedBytes = 0;
-    final pageSize = resolvedMeta.btreePageSize;
+    final pageSize = _dataStore.configuredPageSize;
     final firstLeaf = resolvedMeta.btreeFirstLeaf;
     final lastLeaf = resolvedMeta.btreeLastLeaf;
 
@@ -265,7 +266,7 @@ final class IndexTreePartitionManager {
     }
     final path =
         await _partitionFilePath(table, indexUid, meta, ptr.partitionNo);
-    final pageSize = meta.btreePageSize;
+    final pageSize = _dataStore.configuredPageSize;
     final raw = await _storage.readAsBytesAt(path, ptr.pageNo * pageSize,
         length: pageSize);
     if (raw.isEmpty) return LeafPage.empty();
@@ -340,7 +341,7 @@ final class IndexTreePartitionManager {
     }
     final path =
         await _partitionFilePath(table, indexUid, meta, ptr.partitionNo);
-    final pageSize = meta.btreePageSize;
+    final pageSize = _dataStore.configuredPageSize;
     final raw = await _storage.readAsBytesAt(path, ptr.pageNo * pageSize,
         length: pageSize);
     if (raw.isEmpty) return InternalPage.empty();
@@ -575,23 +576,26 @@ final class IndexTreePartitionManager {
       final stats = getStats(pNo);
       if (stats.headerLoaded) return;
       stats.path ??= await _partitionFilePath(table, indexUid, meta, pNo);
-      final pageSize = meta.btreePageSize;
+      final pageSize = _dataStore.configuredPageSize;
       try {
         final raw0 =
             await _storage.readAsBytesAt(stats.path!, 0, length: pageSize);
         if (raw0.isNotEmpty) {
-          final parsed0 = BTreePageIO.parsePageBytes(raw0);
-          if (parsed0.type == BTreePageType.meta) {
-            final hdr =
-                PartitionMetaPage.tryDecodePayload(parsed0.encodedPayload);
-            if (hdr != null) {
-              stats.oldTotalEntries = hdr.totalEntries;
-              stats.oldFileSizeInBytes = hdr.fileSizeInBytes;
-              stats.oldFreeListHeadPageNo = hdr.freeListHeadPageNo;
-              stats.oldFreePageCount = hdr.freePageCount;
-              stats.freeListHeadPageNo = hdr.freeListHeadPageNo;
-              stats.freePageCount = hdr.freePageCount;
-            }
+          final local =
+              _dataStore.treeMetaPageService.parsePartitionLocalFromPageBytes(
+            raw0,
+            partitionNo: pNo,
+            pageType: BTreePageType.meta,
+            encryptionKey: encryptionKey,
+            encryptionKeyId: encryptionKeyId,
+          );
+          if (local != null) {
+            stats.oldTotalEntries = local.totalEntries;
+            stats.oldFileSizeInBytes = local.fileSizeInBytes;
+            stats.oldFreeListHeadPageNo = local.freeListHeadPageNo;
+            stats.oldFreePageCount = local.freePageCount;
+            stats.freeListHeadPageNo = local.freeListHeadPageNo;
+            stats.freePageCount = local.freePageCount;
           } else {
             stats.oldFileSizeInBytes = await _storage.getFileSize(stats.path!);
           }
@@ -619,9 +623,10 @@ final class IndexTreePartitionManager {
       final freeBytes = BTreePageIO.buildPageBytes(
         type: BTreePageType.free,
         encodedPayload: FreePage(nextFreePageNo: next).encodePayload(),
-        pageSize: meta.btreePageSize,
+        pageSize: _dataStore.configuredPageSize,
       );
-      stageWrite(stats.path!, ptr.pageNo * meta.btreePageSize, freeBytes);
+      stageWrite(
+          stats.path!, ptr.pageNo * _dataStore.configuredPageSize, freeBytes);
       stats.freeListHeadPageNo = ptr.pageNo;
       stats.freePageCount = stats.freePageCount + 1;
       stats.maxPageNoWritten = max(stats.maxPageNoWritten, ptr.pageNo);
@@ -634,7 +639,7 @@ final class IndexTreePartitionManager {
       if (head < _firstDataPageNo) return null;
       stats.path ??=
           await _partitionFilePath(table, indexUid, meta, partitionNo);
-      final pageSize = meta.btreePageSize;
+      final pageSize = _dataStore.configuredPageSize;
       final off = head * pageSize;
       final stagedBytes = peekStaged(stats.path!, off);
       final raw = stagedBytes ??
@@ -684,7 +689,7 @@ final class IndexTreePartitionManager {
 
     bool leafFits(LeafPage leaf) {
       return BTreePageSizer.fitsInPage(
-        pageSize: meta.btreePageSize,
+        pageSize: _dataStore.configuredPageSize,
         plainPayloadLen: leaf.estimatePayloadSize(),
         config: _dataStore.config,
         encryptionKeyId: encryptionKeyId,
@@ -693,7 +698,7 @@ final class IndexTreePartitionManager {
 
     bool internalFits(InternalPage page) {
       return BTreePageSizer.fitsInPage(
-        pageSize: meta.btreePageSize,
+        pageSize: _dataStore.configuredPageSize,
         plainPayloadLen: page.estimatePayloadSize(),
         config: _dataStore.config,
         encryptionKeyId: encryptionKeyId,
@@ -719,7 +724,7 @@ final class IndexTreePartitionManager {
       final reused = await popFreePage(activePartitionNo);
       if (reused != null) return reused;
 
-      final pageSize = meta.btreePageSize;
+      final pageSize = _dataStore.configuredPageSize;
       final nextPg = meta.btreeNextPageNo;
       if (BTreeAllocator.estimateFileSizeBytes(pageSize, nextPg) >
           _dataStore.config.maxPartitionFileSize) {
@@ -831,7 +836,7 @@ final class IndexTreePartitionManager {
     bool isLeafUnderfull(LeafPage leaf) {
       if (leaf.keys.isEmpty) return false;
       final int used = leaf.estimatePayloadSize();
-      final int threshold = (meta.btreePageSize * 0.25).floor();
+      final int threshold = (_dataStore.configuredPageSize * 0.25).floor();
       return used > 0 && used < threshold;
     }
 
@@ -1065,7 +1070,7 @@ final class IndexTreePartitionManager {
           shouldUseIsolateForPageEncode(totalPagesToEncode);
 
       bool payloadFitsInPage(int plainPayloadLen) => BTreePageSizer.fitsInPage(
-            pageSize: meta.btreePageSize,
+            pageSize: _dataStore.configuredPageSize,
             plainPayloadLen: plainPayloadLen,
             config: _dataStore.config,
             encryptionKeyId: encryptionKeyId,
@@ -1078,7 +1083,7 @@ final class IndexTreePartitionManager {
       Future<void> flushEncodeChunk() async {
         if (pending.isEmpty) return;
 
-        final pageSize = meta.btreePageSize;
+        final pageSize = _dataStore.configuredPageSize;
         final res = await BTreePageEncodeBatchRunner.encode(
           enableIsolate: useIsolateForPageEncode,
           pageSize: pageSize,
@@ -1165,7 +1170,7 @@ final class IndexTreePartitionManager {
                       'Index $tableName.$indexLogName: page overflow after split '
                       '(single entry may exceed page capacity). '
                       'leftPayload=${leftPayload.length} rightPayload=${rightPayload.length} '
-                      'pageSize=${meta.btreePageSize}',
+                      'pageSize=${_dataStore.configuredPageSize}',
                 ),
               ]);
             }
@@ -1252,7 +1257,7 @@ final class IndexTreePartitionManager {
                   type: ResultType.engError,
                   message:
                       'Index $tableName.$indexLogName: internal page overflow after split. '
-                      'pageSize=${meta.btreePageSize}',
+                      'pageSize=${_dataStore.configuredPageSize}',
                 ),
               ]);
             }
@@ -1290,7 +1295,7 @@ final class IndexTreePartitionManager {
     // ---- Stage per-partition meta page (pageNo=0) and compute index total deltas ----
     int entriesDeltaSum = 0;
     int sizeDeltaSum = 0;
-    final int pageSize = meta.btreePageSize;
+    final int pageSize = _dataStore.configuredPageSize;
 
     for (final entry in partitionStats.entries) {
       await yc.maybeYield();
@@ -1308,19 +1313,21 @@ final class IndexTreePartitionManager {
           final raw0 =
               await _storage.readAsBytesAt(stats.path!, 0, length: pageSize);
           if (raw0.isNotEmpty) {
-            final parsed0 = BTreePageIO.parsePageBytes(raw0);
-            if (parsed0.type == BTreePageType.meta) {
-              final hdr =
-                  PartitionMetaPage.tryDecodePayload(parsed0.encodedPayload);
-              if (hdr != null) {
-                stats.oldTotalEntries = hdr.totalEntries;
-                stats.oldFileSizeInBytes = hdr.fileSizeInBytes;
-                stats.oldFreeListHeadPageNo = hdr.freeListHeadPageNo;
-                stats.oldFreePageCount = hdr.freePageCount;
-                // Initialize current freelist state from persisted header.
-                stats.freeListHeadPageNo = hdr.freeListHeadPageNo;
-                stats.freePageCount = hdr.freePageCount;
-              }
+            final local =
+                _dataStore.treeMetaPageService.parsePartitionLocalFromPageBytes(
+              raw0,
+              partitionNo: pNo,
+              pageType: BTreePageType.meta,
+              encryptionKey: encryptionKey,
+              encryptionKeyId: encryptionKeyId,
+            );
+            if (local != null) {
+              stats.oldTotalEntries = local.totalEntries;
+              stats.oldFileSizeInBytes = local.fileSizeInBytes;
+              stats.oldFreeListHeadPageNo = local.freeListHeadPageNo;
+              stats.oldFreePageCount = local.freePageCount;
+              stats.freeListHeadPageNo = local.freeListHeadPageNo;
+              stats.freePageCount = local.freePageCount;
             } else {
               stats.oldFileSizeInBytes =
                   await _storage.getFileSize(stats.path!);
@@ -1354,18 +1361,24 @@ final class IndexTreePartitionManager {
       }
       final int newSize = max(oldSize, computedSize);
 
-      final metaBytes = BTreePageIO.buildPageBytes(
-        type: BTreePageType.meta,
-        encodedPayload: PartitionMetaPage(
+      if (pNo != 0) {
+        final metaBytes =
+            _dataStore.treeMetaPageService.buildPartitionPage0Bytes(
+          pageSize: pageSize,
           partitionNo: pNo,
-          totalEntries: newEntries,
-          fileSizeInBytes: newSize,
-          freeListHeadPageNo: stats.freeListHeadPageNo,
-          freePageCount: stats.freePageCount,
-        ).encodePayload(),
-        pageSize: pageSize,
-      );
-      stageWrite(stats.path!, 0, metaBytes);
+          pageType: BTreePageType.meta,
+          partitionLocal: PartitionLocalStats(
+            partitionNo: pNo,
+            totalEntries: newEntries,
+            fileSizeInBytes: newSize,
+            freeListHeadPageNo: stats.freeListHeadPageNo,
+            freePageCount: stats.freePageCount,
+          ),
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+        );
+        stageWrite(stats.path!, 0, metaBytes);
+      }
 
       // IMPORTANT: global totals delta must not depend on reading old partition meta page
       // (may be corrupted during crash tests). Use batch-local delta (idempotent).
@@ -1397,6 +1410,99 @@ final class IndexTreePartitionManager {
       }
     }
 
+    final now = DateTime.now();
+    final updatedMeta = meta.copyWith(
+      totalEntries: max(0, meta.totalEntries + entriesDeltaSum),
+      totalSizeInBytes: max(0, meta.totalSizeInBytes + sizeDeltaSum),
+      timestamps: Timestamps(created: meta.timestamps.created, modified: now),
+    );
+
+    // Partition 0 page 0 carries index-global metadata + local partition stats.
+    // Local size must use the same rule as the loop above: btreeNextPageNo only
+    // applies when partition 0 is the active (last) partition.
+    {
+      final p0Stats = getStats(0);
+      p0Stats.path ??=
+          await _partitionFilePath(table, indexUid, updatedMeta, 0);
+      if (!p0Stats.dirEnsured) {
+        await _storage.ensureDirectoryExists(p.dirname(p0Stats.path!));
+        p0Stats.dirEnsured = true;
+      }
+      if (!p0Stats.headerLoaded) {
+        try {
+          final raw0 =
+              await _storage.readAsBytesAt(p0Stats.path!, 0, length: pageSize);
+          if (raw0.isNotEmpty) {
+            final local =
+                _dataStore.treeMetaPageService.parsePartitionLocalFromPageBytes(
+              raw0,
+              partitionNo: 0,
+              pageType: BTreePageType.meta,
+              encryptionKey: encryptionKey,
+              encryptionKeyId: encryptionKeyId,
+            );
+            if (local != null) {
+              p0Stats.oldTotalEntries = local.totalEntries;
+              p0Stats.oldFileSizeInBytes = local.fileSizeInBytes;
+              p0Stats.oldFreeListHeadPageNo = local.freeListHeadPageNo;
+              p0Stats.oldFreePageCount = local.freePageCount;
+              p0Stats.freeListHeadPageNo = local.freeListHeadPageNo;
+              p0Stats.freePageCount = local.freePageCount;
+            }
+          }
+        } catch (_) {}
+        p0Stats.headerLoaded = true;
+      }
+      final int p0NewEntries =
+          max(0, p0Stats.oldTotalEntries + p0Stats.entriesDelta);
+      final int p0ComputedSize;
+      if (updatedMeta.btreePartitionCount <= 1) {
+        p0ComputedSize = updatedMeta.btreeNextPageNo * pageSize;
+      } else {
+        p0ComputedSize = p0Stats.maxPageNoWritten > 0
+            ? (p0Stats.maxPageNoWritten + 1) * pageSize
+            : p0Stats.oldFileSizeInBytes;
+      }
+      final int p0NewSize = max(p0Stats.oldFileSizeInBytes, p0ComputedSize);
+      final globalBlob = TreeGlobalMetaBlobCodec.encode(
+        TreeGlobalMetaKind.indexTree,
+        IndexMetaCodec.encode(updatedMeta),
+      );
+      final p0Bytes = _dataStore.treeMetaPageService.buildPartitionPage0Bytes(
+        pageSize: pageSize,
+        partitionNo: 0,
+        pageType: BTreePageType.meta,
+        partitionLocal: PartitionLocalStats(
+          partitionNo: 0,
+          totalEntries: p0NewEntries,
+          fileSizeInBytes: p0NewSize,
+          freeListHeadPageNo: p0Stats.freeListHeadPageNo,
+          freePageCount: p0Stats.freePageCount,
+        ),
+        treeGlobalMeta: globalBlob,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+      );
+      stageWrite(p0Stats.path!, 0, p0Bytes);
+
+      if (batchContext != null) {
+        final redoPath = _dataStore.pathManager.getPageRedoLogPath(
+          batchContext.batchId,
+          spaceName: _dataStore.currentSpaceName,
+        );
+        await _storage.ensureDirectoryExists(p.dirname(redoPath));
+        final rec = PageRedoLogCodec.encodePageRecord(
+          treeKind: PageRedoTreeKind.indexTree,
+          tableUid: table.tableUid,
+          indexUid: indexUid,
+          partitionNo: 0,
+          pageNo: 0,
+          payload: p0Bytes,
+        );
+        await _storage.appendBytes(redoPath, rec, flush: true);
+      }
+    }
+
     // ---- Page redo: persist tree structure snapshot (no totals) ----
     // Needed because replay may write newly split pages/partitions before meta.json update.
     if (batchContext != null) {
@@ -1409,7 +1515,7 @@ final class IndexTreePartitionManager {
         treeKind: PageRedoTreeKind.indexTree,
         tableUid: table.tableUid,
         indexUid: indexUid,
-        btreePageSize: meta.btreePageSize,
+        btreePageSize: _dataStore.configuredPageSize,
         btreeNextPageNo: meta.btreeNextPageNo,
         btreePartitionCount: meta.btreePartitionCount,
         btreeRootPartitionNo: meta.btreeRoot.partitionNo,
@@ -1486,21 +1592,17 @@ final class IndexTreePartitionManager {
     }
 
     // Atomically update IndexMeta with corrected totals and B+Tree pointers.
-    // Use flush=false for batch atomicity; caller flushes at batch end.
     final indexManager = _dataStore.indexManager;
     if (indexManager != null) {
-      final now = DateTime.now();
-      final updatedMeta = meta.copyWith(
-        totalEntries: max(0, meta.totalEntries + entriesDeltaSum),
-        totalSizeInBytes: max(0, meta.totalSizeInBytes + sizeDeltaSum),
-        timestamps: Timestamps(created: meta.timestamps.created, modified: now),
-      );
-
-      await indexManager.updateIndexMeta(
-        table: table,
-        indexUid: indexUid,
-        updatedMeta: updatedMeta,
+      await indexManager.mutateIndexMeta(
+        table,
+        indexUid,
+        (_) => updatedMeta,
         flush: false,
+        persistToDisk: false,
+        batchContext: batchContext,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
       );
 
       // Mark index metadata as updated in journal for crash recovery.
@@ -1541,7 +1643,8 @@ final class IndexTreePartitionManager {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
   }) async {
-    final meta0 = await _dataStore.indexManager?.getIndexMeta(table, indexUid);
+    final meta0 =
+        await _dataStore.indexManager?.getIndexMeta(table.tableUid, indexUid);
     if (meta0 == null || meta0.btreeFirstLeaf.isNull) return null;
     var meta = meta0;
     if (maxVisitedLeaves <= 0 || maxMerges <= 0) return startFrom;
@@ -1565,18 +1668,21 @@ final class IndexTreePartitionManager {
       s.path ??= await _partitionFilePath(table, indexUid, meta, pNo);
       try {
         final raw0 = await _storage.readAsBytesAt(s.path!, 0,
-            length: meta.btreePageSize);
+            length: _dataStore.configuredPageSize);
         if (raw0.isNotEmpty) {
-          final parsed0 = BTreePageIO.parsePageBytes(raw0);
-          if (parsed0.type == BTreePageType.meta) {
-            final hdr =
-                PartitionMetaPage.tryDecodePayload(parsed0.encodedPayload);
-            if (hdr != null) {
-              s.oldFileSizeInBytes = hdr.fileSizeInBytes;
-              s.oldTotalEntries = hdr.totalEntries;
-              s.freeListHeadPageNo = hdr.freeListHeadPageNo;
-              s.freePageCount = hdr.freePageCount;
-            }
+          final local =
+              _dataStore.treeMetaPageService.parsePartitionLocalFromPageBytes(
+            raw0,
+            partitionNo: pNo,
+            pageType: BTreePageType.meta,
+            encryptionKey: encryptionKey,
+            encryptionKeyId: encryptionKeyId,
+          );
+          if (local != null) {
+            s.oldFileSizeInBytes = local.fileSizeInBytes;
+            s.oldTotalEntries = local.totalEntries;
+            s.freeListHeadPageNo = local.freeListHeadPageNo;
+            s.freePageCount = local.freePageCount;
           }
         }
       } catch (_) {
@@ -1599,9 +1705,10 @@ final class IndexTreePartitionManager {
       final freeBytes = BTreePageIO.buildPageBytes(
         type: BTreePageType.free,
         encodedPayload: FreePage(nextFreePageNo: next).encodePayload(),
-        pageSize: meta.btreePageSize,
+        pageSize: _dataStore.configuredPageSize,
       );
-      stageWrite(s.path!, pagePtr.pageNo * meta.btreePageSize, freeBytes);
+      stageWrite(
+          s.path!, pagePtr.pageNo * _dataStore.configuredPageSize, freeBytes);
       s.freeListHeadPageNo = pagePtr.pageNo;
       s.freePageCount = s.freePageCount + 1;
       s.maxPageNoWritten = max(s.maxPageNoWritten, pagePtr.pageNo);
@@ -1619,7 +1726,7 @@ final class IndexTreePartitionManager {
       return BTreePageIO.buildPageBytes(
         type: BTreePageType.leaf,
         encodedPayload: enc,
-        pageSize: meta.btreePageSize,
+        pageSize: _dataStore.configuredPageSize,
       );
     }
 
@@ -1635,14 +1742,14 @@ final class IndexTreePartitionManager {
       return BTreePageIO.buildPageBytes(
         type: BTreePageType.internal,
         encodedPayload: enc,
-        pageSize: meta.btreePageSize,
+        pageSize: _dataStore.configuredPageSize,
       );
     }
 
     bool underfull(LeafPage leaf) {
       if (leaf.keys.isEmpty) return false;
       final used = leaf.estimatePayloadSize();
-      return used > 0 && used < (meta.btreePageSize * 0.25).floor();
+      return used > 0 && used < (_dataStore.configuredPageSize * 0.25).floor();
     }
 
     Future<TreePagePtr> descendToLeaf(
@@ -1713,7 +1820,7 @@ final class IndexTreePartitionManager {
         values: <Uint8List>[...leaf.values, ...right.values],
       );
       if (!BTreePageSizer.fitsInPage(
-        pageSize: meta.btreePageSize,
+        pageSize: _dataStore.configuredPageSize,
         plainPayloadLen: mergedLeaf.estimatePayloadSize(),
         config: _dataStore.config,
         encryptionKeyId: encryptionKeyId,
@@ -1733,7 +1840,7 @@ final class IndexTreePartitionManager {
         nextLeaf.prev = ptr;
         final pth = await _partitionFilePath(
             table, indexUid, meta, oldRightNext.partitionNo);
-        stageWrite(pth, oldRightNext.pageNo * meta.btreePageSize,
+        stageWrite(pth, oldRightNext.pageNo * _dataStore.configuredPageSize,
             encodeLeaf(oldRightNext, nextLeaf));
       }
 
@@ -1752,14 +1859,16 @@ final class IndexTreePartitionManager {
       } else {
         final parentPath = await _partitionFilePath(
             table, indexUid, meta, parentFrame.ptr.partitionNo);
-        stageWrite(parentPath, parentFrame.ptr.pageNo * meta.btreePageSize,
+        stageWrite(
+            parentPath,
+            parentFrame.ptr.pageNo * _dataStore.configuredPageSize,
             encodeInternal(parentFrame.ptr, parent));
       }
 
       final leftPath =
           await _partitionFilePath(table, indexUid, meta, ptr.partitionNo);
-      stageWrite(
-          leftPath, ptr.pageNo * meta.btreePageSize, encodeLeaf(ptr, leaf));
+      stageWrite(leftPath, ptr.pageNo * _dataStore.configuredPageSize,
+          encodeLeaf(ptr, leaf));
       await pushFree(rightPtr);
 
       if (meta.btreeLastLeaf == rightPtr) {
@@ -1787,18 +1896,45 @@ final class IndexTreePartitionManager {
           actualSize = 0;
         }
         final newSize = max(s.oldFileSizeInBytes, actualSize);
-        final metaBytes = BTreePageIO.buildPageBytes(
-          type: BTreePageType.meta,
-          encodedPayload: PartitionMetaPage(
-            partitionNo: pNo,
-            totalEntries: s.oldTotalEntries,
-            fileSizeInBytes: newSize,
-            freeListHeadPageNo: s.freeListHeadPageNo,
-            freePageCount: s.freePageCount,
-          ).encodePayload(),
-          pageSize: meta.btreePageSize,
+        final local = PartitionLocalStats(
+          partitionNo: pNo,
+          totalEntries: s.oldTotalEntries,
+          fileSizeInBytes: newSize,
+          freeListHeadPageNo: s.freeListHeadPageNo,
+          freePageCount: s.freePageCount,
         );
-        stageWrite(s.path!, 0, metaBytes);
+        if (pNo == 0) {
+          final globalBlob = TreeGlobalMetaBlobCodec.encode(
+            TreeGlobalMetaKind.indexTree,
+            IndexMetaCodec.encode(meta),
+          );
+          stageWrite(
+            s.path!,
+            0,
+            _dataStore.treeMetaPageService.buildPartitionPage0Bytes(
+              pageSize: _dataStore.configuredPageSize,
+              partitionNo: 0,
+              pageType: BTreePageType.meta,
+              partitionLocal: local,
+              treeGlobalMeta: globalBlob,
+              encryptionKey: encryptionKey,
+              encryptionKeyId: encryptionKeyId,
+            ),
+          );
+        } else {
+          stageWrite(
+            s.path!,
+            0,
+            _dataStore.treeMetaPageService.buildPartitionPage0Bytes(
+              pageSize: _dataStore.configuredPageSize,
+              partitionNo: pNo,
+              pageType: BTreePageType.meta,
+              partitionLocal: local,
+              encryptionKey: encryptionKey,
+              encryptionKeyId: encryptionKeyId,
+            ),
+          );
+        }
       }
     }
 
@@ -1811,15 +1947,16 @@ final class IndexTreePartitionManager {
       await _storage.writeManyAsBytesAt(path, writes, flush: false);
     }
 
-    // Update IndexMeta (structure pointers only).
-    await _dataStore.indexManager?.updateIndexMeta(
-      table: table,
-      indexUid: indexUid,
-      updatedMeta: meta.copyWith(
-        timestamps: Timestamps(
-            created: meta.timestamps.created, modified: DateTime.now()),
-      ),
+    final compactedMeta = meta.copyWith(
+      timestamps: Timestamps(
+          created: meta.timestamps.created, modified: DateTime.now()),
+    );
+    await _dataStore.indexManager?.mutateIndexMeta(
+      table,
+      indexUid,
+      (_) => compactedMeta,
       flush: false,
+      persistToDisk: false,
     );
 
     if (merged == 0) return null;
