@@ -24,16 +24,13 @@ class IntegrityChecker {
     final tableName = table.tableName;
     try {
       final schema = table.schema;
-      final dataPath =
-          await _dataStore.pathManager.getDataMetaPath(table.tableUid);
-
-      if (!await _dataStore.storage.existsFile(dataPath)) {
-        return false;
-      }
 
       final fileMeta =
-          await _dataStore.tableDataManager.getTableDataMeta(table);
-      if (fileMeta == null || fileMeta.totalRecords == 0) {
+          await _dataStore.tableDataManager.getTableDataMeta(table.tableUid);
+      if (fileMeta == null) {
+        return false;
+      }
+      if (fileMeta.totalRecords == 0) {
         return true; // Empty table is valid
       }
 
@@ -108,7 +105,7 @@ class IntegrityChecker {
     try {
       // get table data meta data
       final fileMeta =
-          await _dataStore.tableDataManager.getTableDataMeta(table);
+          await _dataStore.tableDataManager.getTableDataMeta(table.tableUid);
 
       // get table schema info
       if (fileMeta == null) {
@@ -123,7 +120,7 @@ class IntegrityChecker {
 
       // For large-scale data, only validate first and last partition meta pages
       // This avoids traversing tens of thousands of partitions which would be fatal
-      final pageSize = fileMeta.btreePageSize;
+      final pageSize = _dataStore.configuredPageSize;
       final partitionsToCheck = <int>{0}; // Always check first partition
 
       // Find and check last existing partition
@@ -171,20 +168,25 @@ class IntegrityChecker {
                 'Partition file missing meta page (pNo=$pNo, type=${parsed0.type})');
             return false;
           }
-          final hdr =
-              PartitionMetaPage.tryDecodePayload(parsed0.encodedPayload);
-          if (hdr == null) {
-            Logger.error('Failed to decode PartitionMetaPage (pNo=$pNo)');
+          final local =
+              _dataStore.treeMetaPageService.parsePartitionLocalFromPageBytes(
+            raw0,
+            partitionNo: pNo,
+            pageType: BTreePageType.meta,
+          );
+          if (local == null) {
+            Logger.error(
+                'Failed to decode partition page0 local stats (pNo=$pNo)');
             return false;
           }
-          if (hdr.partitionNo != pNo) {
+          if (local.partitionNo != pNo) {
             Logger.error(
-                'PartitionMetaPage.partitionNo mismatch: expected=$pNo actual=${hdr.partitionNo}');
+                'PartitionLocalStats.partitionNo mismatch: expected=$pNo actual=${local.partitionNo}');
             return false;
           }
-          if (hdr.fileSizeInBytes > actualSize) {
+          if (local.fileSizeInBytes > actualSize) {
             Logger.error(
-                'PartitionMetaPage.fileSizeInBytes exceeds actual file size: pNo=$pNo hdr=${hdr.fileSizeInBytes} actual=$actualSize');
+                'PartitionLocalStats.fileSizeInBytes exceeds actual file size: pNo=$pNo hdr=${local.fileSizeInBytes} actual=$actualSize');
             return false;
           }
         } catch (e) {
@@ -210,7 +212,7 @@ class IntegrityChecker {
       final schema = table.schema;
 
       final fileMeta =
-          await _dataStore.tableDataManager.getTableDataMeta(table);
+          await _dataStore.tableDataManager.getTableDataMeta(table.tableUid);
       if (fileMeta == null || fileMeta.totalRecords == 0) {
         return true; // Empty table is valid
       }
@@ -298,10 +300,11 @@ class IntegrityChecker {
       if (referencedSchema == null) {
         return false;
       }
-      final dataPath = await _dataStore.pathManager.getDataMetaPath(
+      final dataPath = await _dataStore.pathManager.getPartitionFilePathByNo(
         referencedSchema.tableUid.isNotEmpty
             ? TableUid(referencedSchema.tableUid)
             : TableUid(referencedTable),
+        0,
       );
 
       if (!await _dataStore.storage.existsFile(dataPath)) {
@@ -340,7 +343,7 @@ class IntegrityChecker {
       final schema = table.schema;
 
       final fileMeta =
-          await _dataStore.tableDataManager.getTableDataMeta(table);
+          await _dataStore.tableDataManager.getTableDataMeta(table.tableUid);
       if (fileMeta == null || fileMeta.totalRecords == 0) {
         return true; // Empty table is valid
       }
@@ -354,26 +357,17 @@ class IntegrityChecker {
         return true; // No unique constraints to check
       }
 
-      // Validate that unique index metadata files exist and are accessible
+      // Validate that unique index metadata can be loaded from index partition 0.
       for (var index in uniqueIndexes) {
         if (index.indexUid.isEmpty) {
           Logger.warn(
               'Unique index missing stable indexUid: ${index.actualIndexName}');
           continue;
         }
-        final indexMetaPath = await _dataStore.pathManager
-            .getIndexMetaPath(table.tableUid, index.indexUid);
-        if (!await _dataStore.storage.existsFile(indexMetaPath)) {
-          Logger.warn(
-              'Unique index metadata file not found: ${index.actualIndexName}');
-          // Don't fail for missing index metadata (might be a new index)
-          continue;
-        }
 
-        // Verify index metadata can be loaded
         try {
           final indexMeta = await _dataStore.indexManager
-              ?.getIndexMeta(table, index.indexUid);
+              ?.getIndexMeta(table.tableUid, index.indexUid);
           if (indexMeta == null) {
             Logger.warn(
                 'Failed to load unique index metadata: ${index.actualIndexName}');
@@ -486,22 +480,12 @@ class IntegrityChecker {
     final stopwatch = Stopwatch()..start();
 
     try {
-      // check if table data meta data file exists
-      final dataMetaPath =
-          await _dataStore.pathManager.getDataMetaPath(table.tableUid);
-      final tableDataMetaExists =
-          await _dataStore.storage.existsFile(dataMetaPath);
+      // Load table data meta from partition 0 page0 (not legacy meta.json).
+      final fileMeta =
+          await _dataStore.tableDataManager.getTableDataMeta(table.tableUid);
 
-      // get table data meta data (if exists)
-      TableDataMeta? fileMeta;
-      if (tableDataMetaExists) {
-        fileMeta = await _dataStore.tableDataManager.getTableDataMeta(table);
-      }
-
-      // check if it is a new table (no meta data or meta data has no partition info)
-      final isNewTable = !tableDataMetaExists ||
-          fileMeta == null ||
-          fileMeta.totalRecords <= 0;
+      // check if it is a new table (no meta data or meta data has no records)
+      final isNewTable = fileMeta == null || fileMeta.totalRecords <= 0;
 
       if (isNewTable) {
         Logger.info(
@@ -515,13 +499,12 @@ class IntegrityChecker {
         for (var index in allIndexes) {
           if (index.indexUid.isEmpty) {
             Logger.info(
-                'Index missing stable indexUid: ${index.actualIndexName}, skipping meta path check');
+                'Index missing stable indexUid: ${index.actualIndexName}, skipping meta load check');
             continue;
           }
-          final indexMetaPath = await _dataStore.pathManager
-              .getIndexMetaPath(table.tableUid, index.indexUid);
-
-          if (!await _dataStore.storage.existsFile(indexMetaPath)) {
+          final indexMeta = await _dataStore.indexManager
+              ?.getIndexMeta(table.tableUid, index.indexUid);
+          if (indexMeta == null) {
             Logger.info(
                 'Index metadata does not exist: ${index.actualIndexName}, possibly a new index');
             // for new index, do not fail
@@ -551,14 +534,18 @@ class IntegrityChecker {
             return partitionNo != 0;
           }
           final raw0 = await _dataStore.storage
-              .readAsBytesAt(path, 0, length: meta.btreePageSize);
+              .readAsBytesAt(path, 0, length: _dataStore.configuredPageSize);
           if (raw0.isEmpty) return false;
           final parsed0 = BTreePageIO.parsePageBytes(raw0);
           if (parsed0.type != BTreePageType.meta) return false;
-          final hdr =
-              PartitionMetaPage.tryDecodePayload(parsed0.encodedPayload);
-          if (hdr == null) return false;
-          return hdr.partitionNo == partitionNo;
+          final local =
+              _dataStore.treeMetaPageService.parsePartitionLocalFromPageBytes(
+            raw0,
+            partitionNo: partitionNo,
+            pageType: BTreePageType.meta,
+          );
+          if (local == null) return false;
+          return local.partitionNo == partitionNo;
         }
 
         final toCheck = <int>{0};
