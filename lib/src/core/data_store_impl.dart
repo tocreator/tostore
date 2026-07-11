@@ -83,6 +83,7 @@ import 'shared_engine_registry.dart';
 import 'storage_adapter.dart';
 import 'table_data_manager.dart';
 import 'table_tree_partition_manager.dart';
+import 'tree_meta_page_service.dart';
 import 'transaction_context.dart';
 import 'transaction_manager.dart';
 import 'ttl_cleanup_manager.dart';
@@ -193,6 +194,17 @@ class DataStoreImpl {
   int get maxEntriesPerDir => (_globalConfigCache?.maxEntriesPerDir ??
       InternalConfig.defaultMaxEntriesPerDir);
 
+  /// Fixed B+Tree / NGH page size for this database (from [GlobalConfig.pageSize]).
+  ///
+  /// Immutable after first persist / v3 upgrade. Falls back to
+  /// [InternalConfig.defaultPageSize] only before GlobalConfig is loaded or when
+  /// legacy configs have not yet been upgraded.
+  int get configuredPageSize =>
+      _globalConfigCache?.pageSize ?? InternalConfig.defaultPageSize;
+
+  /// True when [GlobalConfig.pageSize] has been persisted for this database.
+  bool get hasConfiguredPageSize => (_globalConfigCache?.pageSize ?? 0) > 0;
+
   TableDataManager? _tableDataManager;
   TableDataManager get tableDataManager {
     if (_tableDataManager == null) {
@@ -212,6 +224,15 @@ class DataStoreImpl {
   late BackgroundWriteScheduler backgroundWriteScheduler;
   TableTreePartitionManager? tableTreePartitionManager;
   IndexTreePartitionManager? indexTreePartitionManager;
+  TreeMetaPageService? _treeMetaPageService;
+
+  /// Unified partition page-0 read/write (global meta + local stats).
+  TreeMetaPageService get treeMetaPageService {
+    if (_treeMetaPageService == null) {
+      throw DbClosedException();
+    }
+    return _treeMetaPageService!;
+  }
 
   /// Global workload scheduler for centralized concurrency budgeting.
   late WorkloadScheduler workloadScheduler;
@@ -775,6 +796,7 @@ class DataStoreImpl {
       indexTreePartitionManager = IndexTreePartitionManager(this);
       tableTreePartitionManager = TableTreePartitionManager(this);
       _tableDataManager = TableDataManager(this);
+      _treeMetaPageService = TreeMetaPageService(this);
       // Initialize WAL and parallel journal pipeline
       walManager = WalManager(this);
       writeBufferManager = WriteBufferManager(this);
@@ -1156,6 +1178,7 @@ class DataStoreImpl {
         _indexManager = null;
         tableTreePartitionManager = null;
         indexTreePartitionManager = null;
+        _treeMetaPageService = null;
         _vectorIndexManager = null;
         _tableDataManager = null;
         _queryOptimizer = null;
@@ -2539,7 +2562,8 @@ class DataStoreImpl {
         }
       }
       // Get table file metadata to make an informed decision on the update strategy
-      final tableDataMeta = await tableDataManager.getTableDataMeta(table);
+      final tableDataMeta =
+          await tableDataManager.getTableDataMeta(table.tableUid);
 
       // Get memory manager to access cache size limits
       final recordCacheSize =
@@ -3293,7 +3317,8 @@ class DataStoreImpl {
       // If inside a transaction and this is a heavy delete path, we should defer execution
       final String? txId = Zone.current[_txnZoneKey] as String?;
       // Get table file metadata to make an informed decision on the deletion strategy
-      final tableDataMeta = await tableDataManager.getTableDataMeta(table);
+      final tableDataMeta =
+          await tableDataManager.getTableDataMeta(table.tableUid);
 
       // Get memory manager to access cache size limits
       final recordCacheSize =
@@ -4091,7 +4116,8 @@ class DataStoreImpl {
       };
 
       // Snapshot table data meta once: avoids repeated meta reads in hot loops.
-      final tableDataMeta = await tableDataManager.getTableDataMeta(table);
+      final tableDataMeta =
+          await tableDataManager.getTableDataMeta(table.tableUid);
       // We can safely skip disk unique checks if there is no committed data.
       final bool hasCommittedData =
           tableDataMeta != null && tableDataMeta.totalRecords > 0;
@@ -5855,7 +5881,8 @@ class DataStoreImpl {
           }
 
           final table = await getTableContext(tableName);
-          final tableDataMeta = await tableDataManager.getTableDataMeta(table);
+          final tableDataMeta =
+              await tableDataManager.getTableDataMeta(table.tableUid);
           if (tableDataMeta != null && !tableDataMeta.btreeFirstLeaf.isNull) {
             await tableTreePartitionManager?.prewarmBoundaryPages(
               table,
@@ -5871,8 +5898,8 @@ class DataStoreImpl {
                 .where((index) => index.type == IndexType.btree);
             for (final index in indexes) {
               if (!_isInitialized) break;
-              final indexMeta =
-                  await _indexManager?.getIndexMeta(table, index.indexUid);
+              final indexMeta = await _indexManager?.getIndexMeta(
+                  table.tableUid, index.indexUid);
               if (indexMeta == null || indexMeta.btreeFirstLeaf.isNull) {
                 continue;
               }
@@ -5937,7 +5964,8 @@ class DataStoreImpl {
       if (!_isInitialized) return maxPrewarmBytes - currentPrewarmedBytes;
       try {
         final table = getTableContextSync(tableName);
-        final tableDataMeta = await tableDataManager.getTableDataMeta(table);
+        final tableDataMeta =
+            await tableDataManager.getTableDataMeta(table.tableUid);
         if (!_isInitialized) return maxPrewarmBytes - currentPrewarmedBytes;
         if (tableDataMeta == null || tableDataMeta.totalRecords <= 0) continue;
 
@@ -6002,7 +6030,8 @@ class DataStoreImpl {
         if (!tableExistsInSpace || !_isInitialized) continue;
 
         final table = await getTableContext(tableName);
-        final tableDataMeta = await tableDataManager.getTableDataMeta(table);
+        final tableDataMeta =
+            await tableDataManager.getTableDataMeta(table.tableUid);
         if (tableDataMeta == null || tableDataMeta.totalRecords <= 0) continue;
 
         final schema = table.schema;
@@ -6026,7 +6055,7 @@ class DataStoreImpl {
         for (final index in indexes) {
           if (!_isInitialized) break;
           final indexMeta =
-              await _indexManager?.getIndexMeta(table, index.indexUid);
+              await _indexManager?.getIndexMeta(table.tableUid, index.indexUid);
           if (indexMeta == null || indexMeta.btreeFirstLeaf.isNull) continue;
 
           // Warm the full index by traversing its leaf chain directly.
@@ -6064,7 +6093,7 @@ class DataStoreImpl {
         .where((index) => index.type == IndexType.btree);
     for (final index in indexes) {
       final indexMeta =
-          await _indexManager?.getIndexMeta(table, index.indexUid);
+          await _indexManager?.getIndexMeta(table.tableUid, index.indexUid);
       if (indexMeta != null) {
         total += indexMeta.totalSizeInBytes;
       }
@@ -6985,11 +7014,15 @@ class DataStoreImpl {
     await ensureInitialized();
     final table = await getTableContext(tableName);
     final schema = table.schema;
-    final dataPath = await pathManager.getDataMetaPath(table.tableUid);
+    final part0Path =
+        await pathManager.getPartitionFilePathByNo(table.tableUid, 0);
     DateTime? createdAt;
-    if (await storage.existsFile(dataPath)) {
-      createdAt = await storage.getFileCreationTime(dataPath);
+    if (await storage.existsFile(part0Path)) {
+      createdAt = await storage.getFileCreationTime(part0Path);
     }
+    createdAt ??= (await tableDataManager.getTableDataMeta(table.tableUid))
+        ?.timestamps
+        .created;
     final totalRecords = await tableDataManager.getTableRecordCount(table);
     final fileSize = await tableDataManager.getTableFileSize(table);
     return TableInfo(
