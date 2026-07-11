@@ -4097,7 +4097,7 @@ class MigrationManager {
               final sourcePkName = sourceSchema.primaryKey;
 
               final tableDataMeta = await migrationInstance.tableDataManager
-                  .getTableDataMeta(migrationTableCtx);
+                  .getTableDataMeta(migrationTableCtx.tableUid);
               if (tableDataMeta != null) {
                 _telemetry.setCurrentSpaceExpectedRecords(
                     currentTask.taskId, tableDataMeta.totalRecords);
@@ -4144,7 +4144,7 @@ class MigrationManager {
                     // Always ensure/repair metadata as isBuilding = true during ongoing migration
                     final existingMeta =
                         await migrationInstance.indexManager!.getIndexMeta(
-                      migrationTableCtx,
+                      migrationTableCtx.tableUid,
                       indexUid,
                     );
                     if (existingMeta == null || !existingMeta.isBuilding) {
@@ -4267,7 +4267,7 @@ class MigrationManager {
                       : IndexSchema(indexName: indexField, fields: const []);
                   final indexUid = idxSchema.indexUid;
                   final existingMeta = await migrationInstance.indexManager!
-                      .getIndexMeta(migrationTableCtx, indexUid);
+                      .getIndexMeta(migrationTableCtx.tableUid, indexUid);
                   if (existingMeta != null && existingMeta.isBuilding) {
                     await migrationInstance.indexManager!.updateIndexMeta(
                       table: migrationTableCtx,
