@@ -1748,7 +1748,10 @@ Future<BatchBTreePageEncodeResult> batchEncodeBTreePages(
       records.add(PageRedoLogCodec.encodePageRecord(
         treeKind: treeKind,
         tableUid: tableUid,
-        indexUid: treeKind == PageRedoTreeKind.indexTree ? indexUid : null,
+        indexUid: (treeKind == PageRedoTreeKind.indexTree ||
+                treeKind == PageRedoTreeKind.ngh)
+            ? indexUid
+            : null,
         partitionNo: p.partitionNo,
         pageNo: p.pageNo,
         payload: out[i],
