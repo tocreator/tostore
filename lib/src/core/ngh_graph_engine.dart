@@ -58,6 +58,8 @@ class NghGraphEngine {
 
   NghGraphEngine(this._partitionManager);
 
+  int get _pageSize => _partitionManager.configuredPageSize;
+
   // =====================================================================
   // Search — Beam Search with ADC + Full-Vector Re-ranking
   // =====================================================================
@@ -195,9 +197,9 @@ class NghGraphEngine {
       if (resultHeap.isFull && currentDist > resultHeap.peekDist) break;
 
       //  Load graph page (reused for all neighbours on this page)
-      final gPartition = meta.graphPartitionForNode(currentId);
-      final gPage = meta.graphLocalPageForNode(currentId);
-      final gSlot = meta.graphSlotForNode(currentId);
+      final gPartition = meta.graphPartitionForNode(currentId, _pageSize);
+      final gPage = meta.graphLocalPageForNode(currentId, _pageSize);
+      final gSlot = meta.graphSlotForNode(currentId, _pageSize);
       final gKey = gPartition << 20 | gPage;
       var graphPage = graphPageLocal[gKey];
       graphPage ??= await _partitionManager.readGraphPage(
@@ -219,9 +221,9 @@ class NghGraphEngine {
 
         // Piggyback deletion check: if neighbour is on the SAME graph page,
         // we already have the page loaded — zero extra I/O.
-        final nPartition = meta.graphPartitionForNode(nId);
-        final nPage = meta.graphLocalPageForNode(nId);
-        final nSlot = meta.graphSlotForNode(nId);
+        final nPartition = meta.graphPartitionForNode(nId, _pageSize);
+        final nPage = meta.graphLocalPageForNode(nId, _pageSize);
+        final nSlot = meta.graphSlotForNode(nId, _pageSize);
         if (nPartition == gPartition && nPage == gPage) {
           if (nSlot < graphPage.slots.length &&
               graphPage.slots[nSlot].isDeleted) {
@@ -232,9 +234,9 @@ class NghGraphEngine {
         // for deletion check — rare false positives (deleted nodes) just get
         // a bad distance and naturally fall out of the result heap.
 
-        final pqP = meta.pqPartitionForNode(nId);
-        final pqPg = meta.pqLocalPageForNode(nId);
-        final pqSlot = meta.pqSlotForNode(nId);
+        final pqP = meta.pqPartitionForNode(nId, _pageSize);
+        final pqPg = meta.pqLocalPageForNode(nId, _pageSize);
+        final pqSlot = meta.pqSlotForNode(nId, _pageSize);
         pqPageGroups.putIfAbsent(pqP << 20 | pqPg, () => []).add((nId, pqSlot));
       }
 
@@ -421,9 +423,9 @@ class NghGraphEngine {
 
     for (final nodeId in nodeIds) {
       await yc.maybeYield();
-      final partitionNo = meta.graphPartitionForNode(nodeId);
-      final pageNo = meta.graphLocalPageForNode(nodeId);
-      final slot = meta.graphSlotForNode(nodeId);
+      final partitionNo = meta.graphPartitionForNode(nodeId, _pageSize);
+      final pageNo = meta.graphLocalPageForNode(nodeId, _pageSize);
+      final slot = meta.graphSlotForNode(nodeId, _pageSize);
       final cacheKey = partitionNo << 20 | pageNo;
 
       var page = localCache[cacheKey];
@@ -474,9 +476,9 @@ class NghGraphEngine {
     final candidateCodes = <int, Uint8List>{};
     final pqPageGroups = <int, List<(int, int)>>{};
     for (final cId in candidates) {
-      final pqP = meta.pqPartitionForNode(cId);
-      final pqPg = meta.pqLocalPageForNode(cId);
-      final pqSlot = meta.pqSlotForNode(cId);
+      final pqP = meta.pqPartitionForNode(cId, _pageSize);
+      final pqPg = meta.pqLocalPageForNode(cId, _pageSize);
+      final pqSlot = meta.pqSlotForNode(cId, _pageSize);
       pqPageGroups.putIfAbsent(pqP << 20 | pqPg, () => []).add((cId, pqSlot));
     }
     for (final pgEntry in pqPageGroups.entries) {
@@ -543,9 +545,9 @@ class NghGraphEngine {
     int nodeId, {
     Map<int, NghPqCodePage>? localCache,
   }) async {
-    final partitionNo = meta.pqPartitionForNode(nodeId);
-    final pageNo = meta.pqLocalPageForNode(nodeId);
-    final slot = meta.pqSlotForNode(nodeId);
+    final partitionNo = meta.pqPartitionForNode(nodeId, _pageSize);
+    final pageNo = meta.pqLocalPageForNode(nodeId, _pageSize);
+    final slot = meta.pqSlotForNode(nodeId, _pageSize);
 
     final page = await _partitionManager.readPqCodePage(
         table, indexUid, meta, partitionNo, pageNo,
@@ -570,9 +572,9 @@ class NghGraphEngine {
         <int, List<(int, int)>>{}; // pageKey -> [(nodeIds index, slot)]
     for (int i = 0; i < nodeIds.length; i++) {
       final nodeId = nodeIds[i];
-      final partitionNo = meta.rawVectorPartitionForNode(nodeId);
-      final pageNo = meta.rawVectorLocalPageForNode(nodeId);
-      final slot = meta.rawVectorSlotForNode(nodeId);
+      final partitionNo = meta.rawVectorPartitionForNode(nodeId, _pageSize);
+      final pageNo = meta.rawVectorLocalPageForNode(nodeId, _pageSize);
+      final slot = meta.rawVectorSlotForNode(nodeId, _pageSize);
       final key = partitionNo << 20 | pageNo;
       pageKeyToIndices.putIfAbsent(key, () => []).add((i, slot));
     }
@@ -621,9 +623,9 @@ class NghGraphEngine {
     int nodeId, {
     Map<int, NghGraphPage>? localCache,
   }) async {
-    final partitionNo = meta.graphPartitionForNode(nodeId);
-    final pageNo = meta.graphLocalPageForNode(nodeId);
-    final slot = meta.graphSlotForNode(nodeId);
+    final partitionNo = meta.graphPartitionForNode(nodeId, _pageSize);
+    final pageNo = meta.graphLocalPageForNode(nodeId, _pageSize);
+    final slot = meta.graphSlotForNode(nodeId, _pageSize);
 
     final page = await _partitionManager.readGraphPage(
         table, indexUid, meta, partitionNo, pageNo,
@@ -642,9 +644,9 @@ class NghGraphEngine {
     int nodeId, {
     Map<int, NghGraphPage>? localCache,
   }) async {
-    final partitionNo = meta.graphPartitionForNode(nodeId);
-    final pageNo = meta.graphLocalPageForNode(nodeId);
-    final slot = meta.graphSlotForNode(nodeId);
+    final partitionNo = meta.graphPartitionForNode(nodeId, _pageSize);
+    final pageNo = meta.graphLocalPageForNode(nodeId, _pageSize);
+    final slot = meta.graphSlotForNode(nodeId, _pageSize);
 
     final page = await _partitionManager.readGraphPage(
         table, indexUid, meta, partitionNo, pageNo,
@@ -666,9 +668,9 @@ class NghGraphEngine {
     Map<NghPagePtr, NghPqCodePage> dirtyPages,
     Map<int, NghPqCodePage> localCache,
   ) async {
-    final partitionNo = meta.pqPartitionForNode(nodeId);
-    final pageNo = meta.pqLocalPageForNode(nodeId);
-    final slot = meta.pqSlotForNode(nodeId);
+    final partitionNo = meta.pqPartitionForNode(nodeId, _pageSize);
+    final pageNo = meta.pqLocalPageForNode(nodeId, _pageSize);
+    final slot = meta.pqSlotForNode(nodeId, _pageSize);
     final cacheKey = partitionNo << 20 | pageNo;
 
     // Ensure page exists, allocate if needed
@@ -698,9 +700,9 @@ class NghGraphEngine {
     Map<NghPagePtr, NghRawVectorPage> dirtyPages,
     Map<int, NghRawVectorPage> localCache,
   ) async {
-    final partitionNo = meta.rawVectorPartitionForNode(nodeId);
-    final pageNo = meta.rawVectorLocalPageForNode(nodeId);
-    final slot = meta.rawVectorSlotForNode(nodeId);
+    final partitionNo = meta.rawVectorPartitionForNode(nodeId, _pageSize);
+    final pageNo = meta.rawVectorLocalPageForNode(nodeId, _pageSize);
+    final slot = meta.rawVectorSlotForNode(nodeId, _pageSize);
     final cacheKey = partitionNo << 20 | pageNo;
 
     if (pageNo >= meta.rawVectorNextPageNo &&
@@ -729,9 +731,9 @@ class NghGraphEngine {
     Map<NghPagePtr, NghGraphPage> dirtyPages,
     Map<int, NghGraphPage> localCache,
   ) async {
-    final partitionNo = meta.graphPartitionForNode(nodeId);
-    final pageNo = meta.graphLocalPageForNode(nodeId);
-    final slot = meta.graphSlotForNode(nodeId);
+    final partitionNo = meta.graphPartitionForNode(nodeId, _pageSize);
+    final pageNo = meta.graphLocalPageForNode(nodeId, _pageSize);
+    final slot = meta.graphSlotForNode(nodeId, _pageSize);
     final cacheKey = partitionNo << 20 | pageNo;
 
     if (pageNo >= meta.graphNextPageNo &&
@@ -771,9 +773,9 @@ class NghGraphEngine {
     Map<int, NghGraphPage> localCache,
     Map<int, NghPqCodePage> localPqCache,
   ) async {
-    final partitionNo = meta.graphPartitionForNode(neighborId);
-    final pageNo = meta.graphLocalPageForNode(neighborId);
-    final slot = meta.graphSlotForNode(neighborId);
+    final partitionNo = meta.graphPartitionForNode(neighborId, _pageSize);
+    final pageNo = meta.graphLocalPageForNode(neighborId, _pageSize);
+    final slot = meta.graphSlotForNode(neighborId, _pageSize);
     final cacheKey = partitionNo << 20 | pageNo;
 
     var page = localCache[cacheKey];
@@ -875,9 +877,9 @@ class NghGraphEngine {
         final nId = neighbors[i];
         if (visited.contains(nId)) continue;
         visited.add(nId);
-        final pqP = meta.pqPartitionForNode(nId);
-        final pqPg = meta.pqLocalPageForNode(nId);
-        final pqSlot = meta.pqSlotForNode(nId);
+        final pqP = meta.pqPartitionForNode(nId, _pageSize);
+        final pqPg = meta.pqLocalPageForNode(nId, _pageSize);
+        final pqSlot = meta.pqSlotForNode(nId, _pageSize);
         pqGroups.putIfAbsent(pqP << 20 | pqPg, () => []).add((nId, pqSlot));
       }
 
@@ -974,7 +976,8 @@ class NghGraphEngine {
     for (int pNo = 0; pNo < meta.graphPartitionCount; pNo++) {
       final maxPageNo = (pNo == meta.graphPartitionCount - 1)
           ? meta.graphNextPageNo
-          : meta.graphPagesPerPartition + NghIndexMeta.firstDataPageNo;
+          : meta.graphPagesPerPartition(_pageSize) +
+              NghIndexMeta.firstDataPageNo;
 
       for (int pgNo = NghIndexMeta.firstDataPageNo; pgNo < maxPageNo; pgNo++) {
         if (pagesVisited >= maxVisitedPages) {
