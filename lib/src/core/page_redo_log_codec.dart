@@ -20,6 +20,9 @@ import '../model/table_identity.dart';
 enum PageRedoTreeKind {
   table,
   indexTree,
+
+  /// NGH vector graph partition pages (global meta lives on partition 0 page 0).
+  ngh,
 }
 
 sealed class PageRedoLogRecord {
@@ -112,16 +115,16 @@ final class PageRedoLogCodec {
     required Uint8List payload,
   }) {
     final tableBytes = _u16StringBytes(tableUid);
-    final indexBytes = (treeKind == PageRedoTreeKind.indexTree)
-        ? _u16StringBytes(indexUid?.value ?? '')
-        : Uint8List(0);
+    final needsIndex = treeKind == PageRedoTreeKind.indexTree ||
+        treeKind == PageRedoTreeKind.ngh;
+    final indexBytes =
+        needsIndex ? _u16StringBytes(indexUid?.value ?? '') : Uint8List(0);
 
-    if (treeKind == PageRedoTreeKind.indexTree &&
-        (indexUid == null || indexUid.isEmpty)) {
+    if (needsIndex && (indexUid == null || indexUid.isEmpty)) {
       throw DbException([
         InvalidArgumentStatus(
           type: ResultType.engError,
-          message: 'PageRedoLog: indexUid required for index records',
+          message: 'PageRedoLog: indexUid required for index/ngh records',
           parameterName: 'indexUid',
         ),
       ]);
@@ -187,16 +190,16 @@ final class PageRedoLogCodec {
     required int btreeHeight,
   }) {
     final tableBytes = _u16StringBytes(tableUid);
-    final indexBytes = (treeKind == PageRedoTreeKind.indexTree)
-        ? _u16StringBytes(indexUid?.value ?? '')
-        : Uint8List(0);
+    final needsIndex = treeKind == PageRedoTreeKind.indexTree ||
+        treeKind == PageRedoTreeKind.ngh;
+    final indexBytes =
+        needsIndex ? _u16StringBytes(indexUid?.value ?? '') : Uint8List(0);
 
-    if (treeKind == PageRedoTreeKind.indexTree &&
-        (indexUid == null || indexUid.isEmpty)) {
+    if (needsIndex && (indexUid == null || indexUid.isEmpty)) {
       throw DbException([
         InvalidArgumentStatus(
           type: ResultType.engError,
-          message: 'PageRedoLog: indexUid required for index meta records',
+          message: 'PageRedoLog: indexUid required for index/ngh meta records',
           parameterName: 'indexUid',
         ),
       ]);
