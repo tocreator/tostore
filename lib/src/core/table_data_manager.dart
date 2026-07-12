@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
@@ -650,7 +649,7 @@ class TableDataManager {
             if (uid == null) return null;
             final ctx = schemaManager.getTableContextSync(uid);
             if (ctx == null) return null;
-            return getTableDataMeta(ctx);
+            return getTableDataMeta(ctx.tableUid);
           };
         }).toList(),
         concurrency: statsConc,
@@ -753,11 +752,10 @@ class TableDataManager {
       // This ensures cache consistency and prevents unnecessary recalculations
       if (updateFileMeta && shouldUpdate) {
         try {
-          final fileMeta = await getTableDataMeta(table);
-          if (fileMeta != null) {
-            final updatedMeta = fileMeta.copyWith(maxAutoIncrementId: idStr);
-            await updateTableDataMeta(table, updatedMeta);
-          }
+          await mutateTableDataMeta(table, (fileMeta) {
+            if (fileMeta == null) return null;
+            return fileMeta.copyWith(maxAutoIncrementId: idStr);
+          });
         } catch (e) {
           Logger.error('Failed to update FileMeta maxAutoIncrementId',
               rawError: e);
@@ -921,11 +919,10 @@ class TableDataManager {
         if (maxId == null) continue;
 
         // Save to FileMeta
-        final fileMeta = await getTableDataMeta(table);
-        if (fileMeta != null) {
-          final updatedMeta = fileMeta.copyWith(maxAutoIncrementId: maxId);
-          await updateTableDataMeta(table, updatedMeta);
-        }
+        await mutateTableDataMeta(table, (fileMeta) {
+          if (fileMeta == null) return null;
+          return fileMeta.copyWith(maxAutoIncrementId: maxId);
+        });
 
         _maxIdsDirty[tableUid] = false;
       }
@@ -1725,7 +1722,7 @@ class TableDataManager {
       // Only update stats for user tables, exclude system tables
       if (!SystemTable.isSystemTable(table.tableName)) {
         // get current table stats
-        final meta = await getTableDataMeta(table);
+        final meta = await getTableDataMeta(table.tableUid);
         if (meta != null) {
           // update total record count and total size
           _totalRecordCount = max(0, _totalRecordCount - meta.totalRecords);
@@ -1772,7 +1769,7 @@ class TableDataManager {
 
   /// Internal helper to actually load record count from metadata.
   Future<void> _doLoadRecordCount(TableContext table) async {
-    final meta = await getTableDataMeta(table);
+    final meta = await getTableDataMeta(table.tableUid);
     _tableRecordCounts[table.tableUid] = meta?.totalRecords ?? 0;
   }
 
@@ -1836,7 +1833,7 @@ class TableDataManager {
   Future<int> getTableFileSize(TableContext table) async {
     final tableUid = table.tableUid;
     if (!_fileSizes.containsKey(tableUid)) {
-      final meta = await getTableDataMeta(table);
+      final meta = await getTableDataMeta(table.tableUid);
       return meta?.totalSizeInBytes ?? 0;
     }
     return _fileSizes[tableUid] ?? 0;
@@ -1862,10 +1859,68 @@ class TableDataManager {
     return _lastModifiedTimes[tableUid];
   }
 
-  /// Get table data meta information
-  Future<TableDataMeta?> getTableDataMeta(TableContext table) async {
-    final tableUid = table.tableUid;
+  String _tableDataMetaLockResource(TableUid tableUid) =>
+      'table_data_meta:${tableUid.value}';
 
+  /// Read-modify-write under exclusive lock.
+  ///
+  /// Use for any metadata mutation path. [getTableDataMeta] remains lock-free for
+  /// read-only use; do not call get → work → [updateTableDataMeta] across an
+  /// unbounded window — that produces stale overwrites.
+  Future<TableDataMeta?> mutateTableDataMeta(
+    TableContext table,
+    FutureOr<TableDataMeta?> Function(TableDataMeta? current) mutator, {
+    bool flush = true,
+    bool persistToDisk = true,
+    BatchContext? batchContext,
+    Uint8List? encryptionKey,
+    int? encryptionKeyId,
+  }) async {
+    final lockResource = _tableDataMetaLockResource(table.tableUid);
+    final operationId = GlobalIdGenerator.generate('mutate_table_meta_');
+    final lockMgr = _dataStore.lockManager;
+    if (lockMgr == null) {
+      final current = await getTableDataMeta(table.tableUid);
+      final next = await mutator(current);
+      if (next == null) return null;
+      await updateTableDataMeta(
+        table,
+        next,
+        flush: flush,
+        persistToDisk: persistToDisk,
+        batchContext: batchContext,
+        acquireLock: false,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+      );
+      return next;
+    }
+
+    final acquired =
+        await lockMgr.acquireExclusiveLock(lockResource, operationId);
+    if (!acquired) return null;
+    try {
+      final current = await getTableDataMeta(table.tableUid);
+      final next = await mutator(current);
+      if (next == null) return null;
+      await updateTableDataMeta(
+        table,
+        next,
+        flush: flush,
+        persistToDisk: persistToDisk,
+        batchContext: batchContext,
+        acquireLock: false,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+      );
+      return next;
+    } finally {
+      lockMgr.releaseExclusiveLock(lockResource, operationId);
+    }
+  }
+
+  /// Get table data meta (cache first, disk on miss).
+  Future<TableDataMeta?> getTableDataMeta(TableUid tableUid) async {
     // Table data meta cache fast path
     final cached = _tableDataMetaCache.get(tableUid);
     if (cached != null) return cached;
@@ -1893,39 +1948,13 @@ class TableDataManager {
   /// Internal method to perform the actual file load
   Future<TableDataMeta?> _doLoadTableDataMeta(TableUid tableUid) async {
     try {
-      final mainFilePath =
-          await _dataStore.pathManager.getDataMetaPath(tableUid);
-      if (!await _dataStore.storage.existsFile(mainFilePath)) {
+      final meta =
+          await _dataStore.treeMetaPageService.readTableGlobalMeta(tableUid);
+      if (meta == null) {
         return null;
       }
-      try {
-        final decodedString =
-            await _dataStore.storage.readAsString(mainFilePath);
-        if (decodedString == null) {
-          Logger.error("Failed to decode file meta: $mainFilePath");
-          return null;
-        }
-
-        // parse JSON
-        Map<String, dynamic> jsonData;
-        try {
-          jsonData = jsonDecode(decodedString) as Map<String, dynamic>;
-        } catch (e) {
-          Logger.error(
-              "Failed to parse JSON meta\ncontent: ${decodedString.substring(0, min(100, decodedString.length))}...",
-              rawError: e);
-          return null;
-        }
-
-        final meta =
-            TableDataMeta.fromJson(jsonData, tableUidFallback: tableUid);
-        // Cache update
-        _tableDataMetaCache.put(tableUid, meta);
-        return meta;
-      } catch (e) {
-        Logger.error('Failed to parse table data meta', rawError: e);
-        return null; // Return null on parse error
-      }
+      _tableDataMetaCache.put(tableUid, meta);
+      return meta;
     } catch (e) {
       Logger.error('Failed to get table data meta', rawError: e);
       rethrow;
@@ -1933,18 +1962,45 @@ class TableDataManager {
   }
 
   /// Update table data meta
+  ///
+  /// When [persistToDisk] is false, only the in-memory cache is updated. Batch
+  /// flush paths embed global meta into partition-0 page 0 and use this to
+  /// publish the latest values without a second disk write.
+  ///
+  /// Prefer [mutateTableDataMeta] for read-modify-write. This method is for
+  /// publishing a fully computed snapshot (e.g. batch flush cache publish).
   Future<void> updateTableDataMeta(TableContext table, TableDataMeta meta,
-      {bool flush = true}) async {
+      {bool flush = true,
+      bool persistToDisk = true,
+      BatchContext? batchContext,
+      bool acquireLock = false,
+      Uint8List? encryptionKey,
+      int? encryptionKeyId}) async {
     final tableUid = table.tableUid;
-    final mainFilePath = await _dataStore.pathManager.getDataMetaPath(tableUid);
-
-    // Create directory if not exists
-    final partitionsDir =
-        await _dataStore.pathManager.getPartitionsDirPath(tableUid);
-    await _ensureDirectoryExists(partitionsDir);
+    final lockResource = _tableDataMetaLockResource(tableUid);
+    final operationId = GlobalIdGenerator.generate('update_table_meta_');
+    final lockMgr = _dataStore.lockManager;
+    var lockHeld = false;
+    if (acquireLock && lockMgr != null) {
+      lockHeld = await lockMgr.acquireExclusiveLock(lockResource, operationId);
+      if (!lockHeld) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.sysTimeoutLockAcquisition,
+            message:
+                'Timed out waiting for table data meta lock: ${table.tableName}',
+            target: lockResource,
+            operation: 'updateTableDataMeta',
+          ),
+        ]);
+      }
+    }
 
     try {
-      // Update meta cache in memory first so subsequent reads see latest value.
+      final partitionsDir =
+          await _dataStore.pathManager.getPartitionsDirPath(tableUid);
+      await _ensureDirectoryExists(partitionsDir);
+
       _tableDataMetaCache.put(
         tableUid,
         meta,
@@ -1952,17 +2008,26 @@ class TableDataManager {
       );
       _lastModifiedTimes[tableUid] = DateTime.now();
 
-      // then write to file
-      await _dataStore.storage
-          .writeAsString(mainFilePath, jsonEncode(meta.toJson()), flush: flush);
+      if (persistToDisk) {
+        await _dataStore.treeMetaPageService.persistTableGlobalMeta(
+          tableUid: tableUid,
+          meta: meta,
+          batchContext: batchContext,
+          flush: flush,
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+        );
+      }
+
+      updateFileSize(table, meta.totalSizeInBytes);
     } catch (e) {
       Logger.error('Failed to update table data meta', rawError: e);
-      // Re-throw to handle at higher level
       rethrow;
+    } finally {
+      if (lockHeld && lockMgr != null) {
+        lockMgr.releaseExclusiveLock(lockResource, operationId);
+      }
     }
-
-    // update file size
-    updateFileSize(table, meta.totalSizeInBytes);
   }
 
   /// Ensure directory exists
@@ -2148,7 +2213,7 @@ class TableDataManager {
       }
 
       // get max id from table data meta + buffered WAL (if any)
-      TableDataMeta? fileMeta = await getTableDataMeta(table);
+      TableDataMeta? fileMeta = await getTableDataMeta(table.tableUid);
 
       // Performance optimization: if maxId is already in memory and matches FileMeta cache,
       // skip recalculation (especially useful after recovery when maxId was already updated)
@@ -2230,10 +2295,10 @@ class TableDataManager {
         _maxIdsDirty[table.tableUid] = true;
 
         // Save to FileMeta for caching (avoid recalculation on next initialization)
-        if (fileMeta != null) {
-          fileMeta = fileMeta.copyWith(maxAutoIncrementId: finalMax.toString());
-          await updateTableDataMeta(table, fileMeta);
-        }
+        await mutateTableDataMeta(table, (current) {
+          if (current == null) return null;
+          return current.copyWith(maxAutoIncrementId: finalMax.toString());
+        });
         return;
       }
 
@@ -2241,10 +2306,10 @@ class TableDataManager {
       const emptyMaxIdStr = '0';
       _maxIds[table.tableUid] = emptyMaxIdStr;
       _maxIdsDirty[table.tableUid] = true;
-      if (fileMeta != null) {
-        fileMeta = fileMeta.copyWith(maxAutoIncrementId: emptyMaxIdStr);
-        await updateTableDataMeta(table, fileMeta);
-      }
+      await mutateTableDataMeta(table, (current) {
+        if (current == null) return null;
+        return current.copyWith(maxAutoIncrementId: emptyMaxIdStr);
+      });
     } catch (e) {
       Logger.error('Failed to update max id for table ${table.tableName}',
           rawError: e);
@@ -2310,11 +2375,10 @@ class TableDataManager {
         _maxIdsDirty[table.tableUid] = true;
 
         // Save to FileMeta instead of standalone file
-        final fileMeta = await getTableDataMeta(table);
-        if (fileMeta != null) {
-          final updatedMeta = fileMeta.copyWith(maxAutoIncrementId: newMaxId);
-          await updateTableDataMeta(table, updatedMeta);
-        }
+        await mutateTableDataMeta(table, (fileMeta) {
+          if (fileMeta == null) return null;
+          return fileMeta.copyWith(maxAutoIncrementId: newMaxId);
+        });
 
         Logger.warn(
           'Table ${table.tableName} has primary key conflict, update auto increment start: $newMaxId',
@@ -2363,7 +2427,7 @@ class TableDataManager {
 
     // Fast path for empty tables (no partitions yet): only merge buffer/txn overlay.
     if (!isMemoryMode) {
-      final fileMeta = await getTableDataMeta(table);
+      final fileMeta = await getTableDataMeta(table.tableUid);
       if (fileMeta == null || fileMeta.btreeFirstLeaf.isNull) {
         final yieldController =
             YieldController('TableDataManager.streamRecords_empty');
@@ -2708,7 +2772,7 @@ class TableDataManager {
         (_) async {
           // First, update statistics by subtracting this table's counts
           try {
-            final fileMeta = await getTableDataMeta(table);
+            final fileMeta = await getTableDataMeta(table.tableUid);
             if (fileMeta != null) {
               // Subtract this table's records and size from the totals
               _totalRecordCount =
@@ -2748,20 +2812,17 @@ class TableDataManager {
           }
 
           // 3. create empty table data meta
-          final prevMeta = await getTableDataMeta(table);
-          final int pageSize =
-              prevMeta?.btreePageSize ?? TableDataMeta.defaultPageSize;
+          final prevMeta = await getTableDataMeta(table.tableUid);
           final int newPartitionCount =
               deletedDir ? 1 : max(1, (prevMeta?.btreePartitionCount ?? 0) + 1);
           final tableUid = table.tableUid;
           final emptyMeta = TableDataMeta.createEmpty(
             tableUid: tableUid,
-            pageSize: pageSize,
             partitionCount: newPartitionCount,
           );
 
-          // 4. update table data meta
-          await updateTableDataMeta(table, emptyMeta);
+          // 4. update table data meta (full replace under table write lock)
+          await mutateTableDataMeta(table, (_) => emptyMeta);
 
           // 5. clean ID generator related resources
           _idGenerators.remove(table.tableUid);
@@ -2777,11 +2838,10 @@ class TableDataManager {
             }
             if (schema.primaryKeyConfig.type == PrimaryKeyType.sequential) {
               // Reset maxId in FileMeta to "0"
-              final fileMeta = await getTableDataMeta(table);
-              if (fileMeta != null) {
-                final updatedMeta = fileMeta.copyWith(maxAutoIncrementId: "0");
-                await updateTableDataMeta(table, updatedMeta);
-              }
+              await mutateTableDataMeta(table, (fileMeta) {
+                if (fileMeta == null) return null;
+                return fileMeta.copyWith(maxAutoIncrementId: '0');
+              });
 
               // update memory cache
               _maxIds[table.tableUid] = "0";
@@ -4028,7 +4088,7 @@ class TableDataManager {
 
     TableDataMeta? fileMeta;
     if (!isMemoryMode) {
-      fileMeta = await getTableDataMeta(table);
+      fileMeta = await getTableDataMeta(table.tableUid);
       if (fileMeta == null || fileMeta.totalRecords <= 0) {
         return TableScanResult(
           records: const [],
