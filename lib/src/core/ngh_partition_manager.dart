@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:path/path.dart' as p;
 
 import '../Interface/storage_interface.dart';
+import '../handler/meta_binary_codec.dart';
 import '../handler/parallel_processor.dart';
 import '../model/data_store_config.dart';
 import '../model/db_exception.dart';
@@ -102,6 +103,8 @@ final class NghPartitionManager {
     _initCaches(indexBudget);
   }
 
+  int get configuredPageSize => _dataStore.configuredPageSize;
+
   void _initCaches(int indexBudget) {
     final nghBudget = (indexBudget * 0.15).round();
     final int minThreshold = 50 * 1024 * 1024;
@@ -158,26 +161,29 @@ final class NghPartitionManager {
     // When index is marked fully cached, do not fall back to disk
     if (_graphPageCache.isFullyCached(_indexPrefix(tableUid, indexUid))) {
       return NghGraphPage.empty(
-          maxDegree: meta.maxDegree, slotCount: meta.nodesPerGraphPage);
+          maxDegree: meta.maxDegree,
+          slotCount: meta.nodesPerGraphPage(_dataStore.configuredPageSize));
     }
 
     // 3. Disk read
     final path = await _dataStore.pathManager
         .getNghGraphPartitionPath(tableUid, indexUid, partitionNo);
     final raw = await _dataStore.storage.readAsBytesAt(
-        path, pageNo * meta.nghPageSize,
-        length: meta.nghPageSize);
+        path, pageNo * _dataStore.configuredPageSize,
+        length: _dataStore.configuredPageSize);
     if (raw.isEmpty) {
       // Return empty page
       return NghGraphPage.empty(
-          maxDegree: meta.maxDegree, slotCount: meta.nodesPerGraphPage);
+          maxDegree: meta.maxDegree,
+          slotCount: meta.nodesPerGraphPage(_dataStore.configuredPageSize));
     }
     final parsed = BTreePageIO.parsePageBytes(raw);
     final page =
         NghGraphPage.tryDecodePayload(_decodePayload(parsed.encodedPayload));
     if (page == null) {
       return NghGraphPage.empty(
-          maxDegree: meta.maxDegree, slotCount: meta.nodesPerGraphPage);
+          maxDegree: meta.maxDegree,
+          slotCount: meta.nodesPerGraphPage(_dataStore.configuredPageSize));
     }
     _graphPageCache.put(instanceKey, page);
     return page;
@@ -219,24 +225,27 @@ final class NghPartitionManager {
 
     if (_pqCodePageCache.isFullyCached(_indexPrefix(tableUid, indexUid))) {
       return NghPqCodePage.empty(
-          pqSubspaces: meta.pqSubspaces, capacity: meta.vectorsPerPqPage);
+          pqSubspaces: meta.pqSubspaces,
+          capacity: meta.vectorsPerPqPage(_dataStore.configuredPageSize));
     }
 
     final path = await _dataStore.pathManager
         .getNghPqCodePartitionPath(tableUid, indexUid, partitionNo);
     final raw = await _dataStore.storage.readAsBytesAt(
-        path, pageNo * meta.nghPageSize,
-        length: meta.nghPageSize);
+        path, pageNo * _dataStore.configuredPageSize,
+        length: _dataStore.configuredPageSize);
     if (raw.isEmpty) {
       return NghPqCodePage.empty(
-          pqSubspaces: meta.pqSubspaces, capacity: meta.vectorsPerPqPage);
+          pqSubspaces: meta.pqSubspaces,
+          capacity: meta.vectorsPerPqPage(_dataStore.configuredPageSize));
     }
     final parsed = BTreePageIO.parsePageBytes(raw);
     final page =
         NghPqCodePage.tryDecodePayload(_decodePayload(parsed.encodedPayload));
     if (page == null) {
       return NghPqCodePage.empty(
-          pqSubspaces: meta.pqSubspaces, capacity: meta.vectorsPerPqPage);
+          pqSubspaces: meta.pqSubspaces,
+          capacity: meta.vectorsPerPqPage(_dataStore.configuredPageSize));
     }
     _pqCodePageCache.put(instanceKey, page);
     return page;
@@ -267,19 +276,19 @@ final class NghPartitionManager {
       return NghRawVectorPage.empty(
           dimensions: meta.dimensions,
           precisionIndex: meta.precision.index,
-          capacity: meta.vectorsPerRawPage);
+          capacity: meta.vectorsPerRawPage(_dataStore.configuredPageSize));
     }
 
     final path = await _dataStore.pathManager
         .getNghRawVectorPartitionPath(tableUid, indexUid, partitionNo);
     final raw = await _dataStore.storage.readAsBytesAt(
-        path, pageNo * meta.nghPageSize,
-        length: meta.nghPageSize);
+        path, pageNo * _dataStore.configuredPageSize,
+        length: _dataStore.configuredPageSize);
     if (raw.isEmpty) {
       return NghRawVectorPage.empty(
           dimensions: meta.dimensions,
           precisionIndex: meta.precision.index,
-          capacity: meta.vectorsPerRawPage);
+          capacity: meta.vectorsPerRawPage(_dataStore.configuredPageSize));
     }
     final parsed = BTreePageIO.parsePageBytes(raw);
     final page = NghRawVectorPage.tryDecodePayload(
@@ -288,7 +297,7 @@ final class NghPartitionManager {
       return NghRawVectorPage.empty(
           dimensions: meta.dimensions,
           precisionIndex: meta.precision.index,
-          capacity: meta.vectorsPerRawPage);
+          capacity: meta.vectorsPerRawPage(_dataStore.configuredPageSize));
     }
     _rawVectorPageCache.put(instanceKey, page);
     return page;
@@ -362,21 +371,30 @@ final class NghPartitionManager {
     const firstData = NghIndexMeta.firstDataPageNo;
     final n = meta.totalVectors;
     final graphPages =
-        (n + meta.nodesPerGraphPage - 1) ~/ meta.nodesPerGraphPage;
-    final pqPages = (n + meta.vectorsPerPqPage - 1) ~/ meta.vectorsPerPqPage;
+        (n + meta.nodesPerGraphPage(_dataStore.configuredPageSize) - 1) ~/
+            meta.nodesPerGraphPage(_dataStore.configuredPageSize);
+    final pqPages =
+        (n + meta.vectorsPerPqPage(_dataStore.configuredPageSize) - 1) ~/
+            meta.vectorsPerPqPage(_dataStore.configuredPageSize);
 
     final graphTasks = <Future<void> Function()>[];
     for (int logicalPage = 0; logicalPage < graphPages; logicalPage++) {
-      final partitionNo = logicalPage ~/ meta.graphPagesPerPartition;
-      final pageNo = firstData + (logicalPage % meta.graphPagesPerPartition);
+      final partitionNo = logicalPage ~/
+          meta.graphPagesPerPartition(_dataStore.configuredPageSize);
+      final pageNo = firstData +
+          (logicalPage %
+              meta.graphPagesPerPartition(_dataStore.configuredPageSize));
       graphTasks.add(() async {
         await readGraphPage(table, indexUid, meta, partitionNo, pageNo);
       });
     }
     final pqTasks = <Future<void> Function()>[];
     for (int logicalPage = 0; logicalPage < pqPages; logicalPage++) {
-      final partitionNo = logicalPage ~/ meta.pqCodePagesPerPartition;
-      final pageNo = firstData + (logicalPage % meta.pqCodePagesPerPartition);
+      final partitionNo = logicalPage ~/
+          meta.pqCodePagesPerPartition(_dataStore.configuredPageSize);
+      final pageNo = firstData +
+          (logicalPage %
+              meta.pqCodePagesPerPartition(_dataStore.configuredPageSize));
       pqTasks.add(() async {
         await readPqCodePage(table, indexUid, meta, partitionNo, pageNo);
       });
@@ -436,7 +454,7 @@ final class NghPartitionManager {
       return meta;
     }
 
-    final pageSize = meta.nghPageSize;
+    final pageSize = _dataStore.configuredPageSize;
     final yc = YieldController(
       'NghPartitionManager.writeChanges',
       checkInterval: 40,
@@ -533,13 +551,38 @@ final class NghPartitionManager {
           .put([tableUid, indexUid, ptr.partitionNo, ptr.pageNo], page);
     }
 
+    // Apply meta deltas before staging page0 so graph partition 0 embeds the
+    // same NghIndexMeta that callers will cache (no wipe-before-persist window).
+    final now = DateTime.now();
+    final updatedMeta = meta.copyWith(
+      totalVectors: max(0, meta.totalVectors + vectorsDelta),
+      deletedCount: max(0, meta.deletedCount + deletedDelta),
+      timestamps: meta.timestamps.copyWith(modified: now),
+    );
+
     // ── Stage per-partition meta pages (pageNo=0) ──
+    await _stagePartitionMeta(graphStats, pageSize, updatedMeta, stageWrite, yc,
+        NghDataCategory.graph);
     await _stagePartitionMeta(
-        graphStats, pageSize, meta, stageWrite, yc, NghDataCategory.graph);
-    await _stagePartitionMeta(
-        pqStats, pageSize, meta, stageWrite, yc, NghDataCategory.pqCode);
-    await _stagePartitionMeta(
-        rawStats, pageSize, meta, stageWrite, yc, NghDataCategory.rawVector);
+        pqStats, pageSize, updatedMeta, stageWrite, yc, NghDataCategory.pqCode);
+    await _stagePartitionMeta(rawStats, pageSize, updatedMeta, stageWrite, yc,
+        NghDataCategory.rawVector);
+
+    // Graph partition 0 always carries NghIndexMeta (same as table/index p0).
+    // Ensure it is refreshed even when this batch only touched other files.
+    if (!graphStats.containsKey(0) && staged.isNotEmpty) {
+      final p0Stats = getStats(graphStats, 0);
+      p0Stats.path ??= await _dataStore.pathManager
+          .getNghGraphPartitionPath(tableUid, indexUid, 0);
+      await _stagePartitionMeta(
+        {0: p0Stats},
+        pageSize,
+        updatedMeta,
+        stageWrite,
+        yc,
+        NghDataCategory.graph,
+      );
+    }
 
     // ── Flush all staged writes ──
     if (staged.isNotEmpty) {
@@ -597,13 +640,7 @@ final class NghPartitionManager {
       }
     }
 
-    // ── Update NghIndexMeta ──
-    final now = DateTime.now();
-    return meta.copyWith(
-      totalVectors: max(0, meta.totalVectors + vectorsDelta),
-      deletedCount: max(0, meta.deletedCount + deletedDelta),
-      timestamps: meta.timestamps.copyWith(modified: now),
-    );
+    return updatedMeta;
   }
 
   // =====================================================================
@@ -630,7 +667,7 @@ final class NghPartitionManager {
 
     // 2) Append allocation with partition rotation
     final maxFileSize = _dataStore.config.maxPartitionFileSize;
-    final pageSize = meta.nghPageSize;
+    final pageSize = _dataStore.configuredPageSize;
 
     switch (category) {
       case NghDataCategory.graph:
@@ -705,7 +742,7 @@ final class NghPartitionManager {
     IndexUid indexUid,
     void Function(String path, int offset, Uint8List bytes) stageWrite,
   ) async {
-    final pageSize = meta.nghPageSize;
+    final pageSize = _dataStore.configuredPageSize;
     final heads = _getFreeListHeads(category, meta);
     final currentHead = heads[ptr.partitionNo] ?? -1;
 
@@ -749,7 +786,7 @@ final class NghPartitionManager {
       if (headPageNo < NghIndexMeta.firstDataPageNo) continue;
 
       final path = await _partitionPath(category, table, indexUid, partitionNo);
-      final pageSize = meta.nghPageSize;
+      final pageSize = _dataStore.configuredPageSize;
 
       try {
         final raw = await _dataStore.storage
@@ -1141,16 +1178,17 @@ final class NghPartitionManager {
           final raw0 = await _dataStore.storage
               .readAsBytesAt(stats.path!, 0, length: pageSize);
           if (raw0.isNotEmpty) {
-            final parsed0 = BTreePageIO.parsePageBytes(raw0);
-            if (parsed0.type == BTreePageType.nghMeta) {
-              final hdr =
-                  NghPartitionMetaPage.tryDecodePayload(parsed0.encodedPayload);
-              if (hdr != null) {
-                stats.oldTotalEntries = hdr.totalEntries;
-                stats.oldFileSizeInBytes = hdr.fileSizeInBytes;
-                stats.freeListHeadPageNo = hdr.freeListHeadPageNo;
-                stats.freePageCount = hdr.freePageCount;
-              }
+            final local =
+                _dataStore.treeMetaPageService.parsePartitionLocalFromPageBytes(
+              raw0,
+              partitionNo: pNo,
+              pageType: BTreePageType.nghMeta,
+            );
+            if (local != null) {
+              stats.oldTotalEntries = local.totalEntries;
+              stats.oldFileSizeInBytes = local.fileSizeInBytes;
+              stats.freeListHeadPageNo = local.freeListHeadPageNo;
+              stats.freePageCount = local.freePageCount;
             }
           }
         } catch (_) {
@@ -1167,19 +1205,28 @@ final class NghPartitionManager {
       final computedSize = (stats.maxPageNoWritten + 1) * pageSize;
       final newSize = max(stats.oldFileSizeInBytes, computedSize);
 
-      final metaPayload = NghPartitionMetaPage(
-        partitionNo: pNo,
-        dataCategory: category.index,
-        totalEntries: newEntries,
-        fileSizeInBytes: newSize,
-        freeListHeadPageNo: stats.freeListHeadPageNo,
-        freePageCount: stats.freePageCount,
-      ).encodePayload();
+      // NghIndexMeta lives only on graph partition 0 (same as table/index p0).
+      Uint8List? treeGlobalMeta;
+      if (category == NghDataCategory.graph && pNo == 0) {
+        treeGlobalMeta = TreeGlobalMetaBlobCodec.encode(
+          TreeGlobalMetaKind.ngh,
+          NghIndexMetaCodec.encode(meta),
+        );
+      }
 
-      final metaBytes = BTreePageIO.buildPageBytes(
-        type: BTreePageType.nghMeta,
-        encodedPayload: metaPayload,
+      final metaBytes = _dataStore.treeMetaPageService.buildPartitionPage0Bytes(
         pageSize: pageSize,
+        partitionNo: pNo,
+        pageType: BTreePageType.nghMeta,
+        partitionLocal: PartitionLocalStats(
+          partitionNo: pNo,
+          dataCategory: category.index,
+          totalEntries: newEntries,
+          fileSizeInBytes: newSize,
+          freeListHeadPageNo: stats.freeListHeadPageNo,
+          freePageCount: stats.freePageCount,
+        ),
+        treeGlobalMeta: treeGlobalMeta,
       );
       stageWrite(stats.path!, 0, metaBytes);
     }
