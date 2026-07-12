@@ -620,7 +620,7 @@ class ParallelJournalManager {
             final schema = await _dataStore.schemaManager
                 ?.getTableSchema(tableContext.tableUid);
             final tableDataMeta = await _dataStore.tableDataManager
-                .getTableDataMeta(tableContext);
+                .getTableDataMeta(tableContext.tableUid);
             final indexUids = <String>[];
             final baseIndexTotalEntries = <String, int>{};
             final baseIndexTotalSizeInBytes = <String, int>{};
@@ -638,7 +638,7 @@ class ParallelJournalManager {
 
                 // Fetch base index metadata
                 final idxMeta = await _dataStore.indexManager
-                    ?.getIndexMeta(tableContext, idx.indexUid);
+                    ?.getIndexMeta(tableContext.tableUid, idx.indexUid);
                 if (idxMeta != null) {
                   baseIndexTotalEntries[idxUid] = idxMeta.totalEntries;
                   baseIndexTotalSizeInBytes[idxUid] = idxMeta.totalSizeInBytes;
@@ -1810,7 +1810,7 @@ class ParallelJournalManager {
     final tableName = table.tableName;
     try {
       final tableDataMeta =
-          await _dataStore.tableDataManager.getTableDataMeta(table);
+          await _dataStore.tableDataManager.getTableDataMeta(table.tableUid);
       if (tableDataMeta == null) return;
 
       // Get expected values from the last flushed entry (if it has totalRecords/totalSizeInBytes)
@@ -1828,24 +1828,28 @@ class ParallelJournalManager {
 
       if (needsBTreeRecovery) {
         // New partition was created but metadata not updated, recover from last partition file
-        final pageSize = tableDataMeta.btreePageSize;
+        final pageSize = _dataStore.configuredPageSize;
         final lastPartitionNo = lastEntry.partitionNo;
         try {
           final lastPartitionPath = await _dataStore.pathManager
               .getPartitionFilePathByNo(table.tableUid, lastPartitionNo);
           if (await _dataStore.storage.existsFile(lastPartitionPath)) {
-            // Read last partition's meta page to get actual partition count
+            // Read last partition's page0 local stats (TMP1 or legacy).
             final raw0 = await _dataStore.storage
                 .readAsBytesAt(lastPartitionPath, 0, length: pageSize);
             if (raw0.isNotEmpty) {
               final parsed0 = BTreePageIO.parsePageBytes(raw0);
               if (parsed0.type == BTreePageType.meta) {
-                final hdr =
-                    PartitionMetaPage.tryDecodePayload(parsed0.encodedPayload);
-                if (hdr != null && hdr.partitionNo == lastPartitionNo) {
+                final local = _dataStore.treeMetaPageService
+                    .parsePartitionLocalFromPageBytes(
+                  raw0,
+                  partitionNo: lastPartitionNo,
+                  pageType: BTreePageType.meta,
+                );
+                if (local != null && local.partitionNo == lastPartitionNo) {
                   // Recover B+Tree structure: partitionCount should be lastPartitionNo + 1
                   recoveredPartitionCount = lastPartitionNo + 1;
-                  // btreeNextPageNo should be reset to 1 (pageNo=0 is reserved for PartitionMetaPage)
+                  // btreeNextPageNo should be reset to 1 (pageNo=0 is reserved for page0 meta)
                   // but we don't know the actual value, so we'll use a safe default
                   // (it will be corrected on next write)
                   recoveredNextPageNo = 1;
@@ -1930,7 +1934,7 @@ class ParallelJournalManager {
         indexUid.value;
     try {
       final indexMeta =
-          await _dataStore.indexManager?.getIndexMeta(table, indexUid);
+          await _dataStore.indexManager?.getIndexMeta(table.tableUid, indexUid);
       if (indexMeta == null) return;
 
       // Get expected values from the last flushed entry (if it has totalEntries/totalSizeInBytes)
@@ -1948,25 +1952,29 @@ class ParallelJournalManager {
 
       if (needsBTreeRecovery) {
         // New partition was created but metadata not updated, recover from last partition file
-        final pageSize = indexMeta.btreePageSize;
+        final pageSize = _dataStore.configuredPageSize;
         final lastPartitionNo = lastEntry.partitionNo;
         try {
           final lastPartitionPath = await _dataStore.pathManager
               .getIndexPartitionPathByNo(table.tableUid,
                   IndexUid(indexMeta.indexUid), lastPartitionNo);
           if (await _dataStore.storage.existsFile(lastPartitionPath)) {
-            // Read last partition's meta page to get actual partition count
+            // Read last partition's page0 local stats (TMP1 or legacy).
             final raw0 = await _dataStore.storage
                 .readAsBytesAt(lastPartitionPath, 0, length: pageSize);
             if (raw0.isNotEmpty) {
               final parsed0 = BTreePageIO.parsePageBytes(raw0);
               if (parsed0.type == BTreePageType.meta) {
-                final hdr =
-                    PartitionMetaPage.tryDecodePayload(parsed0.encodedPayload);
-                if (hdr != null && hdr.partitionNo == lastPartitionNo) {
+                final local = _dataStore.treeMetaPageService
+                    .parsePartitionLocalFromPageBytes(
+                  raw0,
+                  partitionNo: lastPartitionNo,
+                  pageType: BTreePageType.meta,
+                );
+                if (local != null && local.partitionNo == lastPartitionNo) {
                   // Recover B+Tree structure: partitionCount should be lastPartitionNo + 1
                   recoveredPartitionCount = lastPartitionNo + 1;
-                  // btreeNextPageNo should be reset to 1 (pageNo=0 is reserved for PartitionMetaPage)
+                  // btreeNextPageNo should be reset to 1 (pageNo=0 is reserved for page0 meta)
                   // but we don't know the actual value, so we'll use a safe default
                   // (it will be corrected on next write)
                   recoveredNextPageNo = 1;
@@ -2226,8 +2234,8 @@ class ParallelJournalManager {
             continue;
           }
 
-          final meta =
-              await _dataStore.tableDataManager.getTableDataMeta(tableContext);
+          final meta = await _dataStore.tableDataManager
+              .getTableDataMeta(tableContext.tableUid);
           if (meta == null) continue;
 
           // Restore to the state BEFORE the batch.
@@ -2287,7 +2295,7 @@ class ParallelJournalManager {
             if (baseEntries == null || baseSize == null) continue;
 
             final idxMeta = await _dataStore.indexManager
-                ?.getIndexMeta(tableContext, indexUid);
+                ?.getIndexMeta(tableContext.tableUid, indexUid);
             if (idxMeta == null) continue;
 
             // Restore index meta to its base (pre-batch) state.
@@ -2526,8 +2534,8 @@ class ParallelJournalManager {
     };
     // Capture base totals so recovery can safely restore to "before maintenance batch".
     final schema = tableContext.schema;
-    final tableDataMeta =
-        await _dataStore.tableDataManager.getTableDataMeta(tableContext);
+    final tableDataMeta = await _dataStore.tableDataManager
+        .getTableDataMeta(tableContext.tableUid);
     final indexUids = <String>[];
     final baseIndexTotalEntries = <String, int>{};
     final baseIndexTotalSizeInBytes = <String, int>{};
@@ -2542,7 +2550,7 @@ class ParallelJournalManager {
         final idxUid = idx.indexUid.value;
         indexUids.add(idxUid);
         final idxMeta = await _dataStore.indexManager
-            ?.getIndexMeta(tableContext, idx.indexUid);
+            ?.getIndexMeta(tableContext.tableUid, idx.indexUid);
         if (idxMeta != null) {
           baseIndexTotalEntries[idxUid] = idxMeta.totalEntries;
           baseIndexTotalSizeInBytes[idxUid] = idxMeta.totalSizeInBytes;
@@ -2612,6 +2620,51 @@ class ParallelJournalManager {
     _activeBatchContext = null;
   }
 
+  /// Run [action] under a batch id that is registered in WAL `pendingBatches`,
+  /// so page redo can be discovered on crash recovery.
+  ///
+  /// Resolution order:
+  /// 1. Explicit [batchContext] with non-empty id (caller owns batch lifecycle)
+  /// 2. Open a short-lived maintenance batch via [beginMaintenanceBatch], then
+  ///    [completeMaintenanceBatch] in `finally`
+  ///
+  /// Does **not** reuse [activeBatchContext] from an in-flight flush batch —
+  /// ad-hoc page-0 writes must not share redo / recovery scope with unrelated
+  /// flush work.
+  ///
+  /// Skips opening a new batch when journal is off, during recovery, or when
+  /// [table] cannot be resolved — [action] still runs (`batchContext` may be
+  /// null; caller should force `flush: true` for single page writes).
+  ///
+  /// [action] receives `(ctx, ownedBatch)`. When [ownedBatch] is true the
+  /// page write must be flushed before this method completes (redo is deleted
+  /// on complete).
+  Future<T> runWithPageRedoBatch<T>({
+    required TableContext table,
+    BatchContext? batchContext,
+    required Future<T> Function(BatchContext? ctx, {required bool ownedBatch})
+        action,
+  }) async {
+    if (batchContext != null && batchContext.batchId.isNotEmpty) {
+      return action(batchContext, ownedBatch: false);
+    }
+    if (!_dataStore.config.enableJournal ||
+        _isRecovering ||
+        table.tableUid.isEmpty) {
+      return action(null, ownedBatch: false);
+    }
+
+    final owned = await beginMaintenanceBatch(table: table);
+    if (owned.batchId.isEmpty) {
+      return action(null, ownedBatch: false);
+    }
+    try {
+      return await action(owned, ownedBatch: true);
+    } finally {
+      await completeMaintenanceBatch(batchContext: owned);
+    }
+  }
+
   /// Replay page redo log for [batchId] if it exists and has content.
   /// Writes each (path, offset, payload) from the log so recovery does not read possibly corrupted pages.
   ///
@@ -2678,7 +2731,9 @@ class ParallelJournalManager {
       final key = e.key;
       final pages = e.value;
       if (pages.isEmpty) continue;
-      if (key.kind == PageRedoTreeKind.indexTree && key.indexUid.isEmpty) {
+      if ((key.kind == PageRedoTreeKind.indexTree ||
+              key.kind == PageRedoTreeKind.ngh) &&
+          key.indexUid.isEmpty) {
         continue;
       }
 
@@ -2687,6 +2742,13 @@ class ParallelJournalManager {
         if (key.kind == PageRedoTreeKind.table) {
           path = await _dataStore.pathManager
               .getPartitionFilePathByNo(key.tableUid, key.partitionNo);
+        } else if (key.kind == PageRedoTreeKind.ngh) {
+          final tableContext = _tableContextFromUid(key.tableUid);
+          if (tableContext == null) continue;
+          final indexUid =
+              _resolveRedoIndexUid(tableContext.schema, key.indexUid);
+          path = await _dataStore.pathManager.getNghGraphPartitionPath(
+              key.tableUid, indexUid, key.partitionNo);
         } else {
           final tableContext = _tableContextFromUid(key.tableUid);
           if (tableContext == null) continue;
@@ -2742,10 +2804,9 @@ class ParallelJournalManager {
           if (tableContext == null) continue;
           if (rec.treeKind == PageRedoTreeKind.table) {
             final meta = await _dataStore.tableDataManager
-                .getTableDataMeta(tableContext);
+                .getTableDataMeta(tableContext.tableUid);
             if (meta == null) continue;
             final updated = meta.copyWith(
-              btreePageSize: rec.btreePageSize,
               btreeNextPageNo: rec.btreeNextPageNo,
               btreePartitionCount: rec.btreePartitionCount,
               btreeRoot:
@@ -2762,15 +2823,14 @@ class ParallelJournalManager {
             );
             await _dataStore.tableDataManager
                 .updateTableDataMeta(tableContext, updated, flush: true);
-          } else {
+          } else if (rec.treeKind == PageRedoTreeKind.indexTree) {
             final idxUid = rec.indexUid;
             if (idxUid == null || idxUid.isEmpty) continue;
             final resolved = _resolveRedoIndexUid(tableContext.schema, idxUid);
             final meta = await _dataStore.indexManager
-                ?.getIndexMeta(tableContext, resolved);
+                ?.getIndexMeta(tableContext.tableUid, resolved);
             if (meta == null) continue;
             final updated = meta.copyWith(
-              btreePageSize: rec.btreePageSize,
               btreeNextPageNo: rec.btreeNextPageNo,
               btreePartitionCount: rec.btreePartitionCount,
               btreeRoot:
@@ -2792,6 +2852,7 @@ class ParallelJournalManager {
               flush: true,
             );
           }
+          // NGH global meta is carried inside page-0 images; no TreeMetaRecord apply.
         } catch (_) {}
       }
     }
