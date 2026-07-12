@@ -46,11 +46,6 @@ class PathManager {
     return pathJoin(_instancePath, 'backups');
   }
 
-  /// get log directory path
-  String getLogPath() {
-    return pathJoin(_instancePath, 'logs');
-  }
-
   /// get migrations directory path
   String getMigrationsPath() {
     return pathJoin(_instancePath, 'migrations');
@@ -117,10 +112,6 @@ class PathManager {
   // table path methods (async methods)
   //==================================
 
-  //==================================
-  // table path methods (async methods)
-  //==================================
-
   /// get table path by UID
   String getTablePathByUid(TableUid tableUid) {
     final uid = tableUid;
@@ -155,12 +146,6 @@ class PathManager {
   Future<String> getDataDirPath(TableUid tableUid) async {
     final tablePath = getTablePathByUid(tableUid);
     return pathJoin(tablePath, 'data');
-  }
-
-  /// get table data main meta file path
-  Future<String> getDataMetaPath(TableUid tableUid) async {
-    final dataPath = await getDataDirPath(tableUid);
-    return pathJoin(dataPath, 'meta.json');
   }
 
   /// get table data btree partitions directory path
@@ -210,12 +195,6 @@ class PathManager {
     return pathJoin(indexDirPath, indexUid);
   }
 
-  /// get index meta file path
-  Future<String> getIndexMetaPath(TableUid tableUid, IndexUid indexUid) async {
-    final indexPath = await getIndexPath(tableUid, indexUid);
-    return pathJoin(indexPath, 'meta.json');
-  }
-
   /// get index btree partition directory path
   Future<String> getIndexPartitionDirPath(
       TableUid tableUid, IndexUid indexUid, int dirIndex) async {
@@ -232,12 +211,6 @@ class PathManager {
     return pathJoin(dirPath, 'p$partitionNo.idx');
   }
 
-  /// get stats file path
-  Future<String> getStatsPath(TableUid tableUid) async {
-    final tablePath = getTablePathByUid(tableUid);
-    return pathJoin(tablePath, 'stats.json');
-  }
-
   // ==================================
   // NGH vector index path methods
   // ==================================
@@ -246,12 +219,6 @@ class PathManager {
   Future<String> getNghIndexPath(TableUid tableUid, IndexUid indexUid) async {
     final indexPath = await getIndexPath(tableUid, indexUid);
     return pathJoin(indexPath, 'ngh');
-  }
-
-  /// NGH index metadata file.
-  Future<String> getNghMetaPath(TableUid tableUid, IndexUid indexUid) async {
-    final nghPath = await getNghIndexPath(tableUid, indexUid);
-    return pathJoin(nghPath, 'meta.json');
   }
 
   /// NGH PQ codebook file.
@@ -293,25 +260,6 @@ class PathManager {
     final dir =
         await _nghPartitionDirPath(tableUid, indexUid, 'rawvec', dirIndex);
     return pathJoin(dir, 'p$partitionNo.ngh');
-  }
-
-  //==================================
-  // cache path methods (sync methods)
-  //==================================
-
-  /// get cache root path
-  String getCacheRootPath() {
-    return pathJoin(_instancePath, 'caches');
-  }
-
-  /// get global cache path
-  String getGlobalCachePath() {
-    return pathJoin(getCacheRootPath(), 'global');
-  }
-
-  /// get spaces cache root path
-  String getSpacesCachePath() {
-    return pathJoin(getCacheRootPath(), 'spaces');
   }
 
   //==================================
