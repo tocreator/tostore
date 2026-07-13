@@ -49,7 +49,7 @@ class DataStoreConfig {
   final MigrationConfig? migrationConfig;
 
   /// max partition file size based on platform
-  /// Web: 64KB, Mobile: 4MB, Desktop: 16MB, Server: 256-1024MB (dynamic)
+  /// Web: 64KB, Mobile: 256MB, Desktop: 512MB, Server: 1-4GB (dynamic).
   final int maxPartitionFileSize;
 
   /// Enable diagnostic logging (info/debug/warn/error).
@@ -252,8 +252,8 @@ class DataStoreConfig {
         isServerEnvironment ?? PlatformHandler.isServerEnvironment;
     final resolvedMaxPartition =
         maxPartitionFileSize ?? _getDefaultMaxPartitionFileSize(resolvedServer);
-    final resolvedMaxLogPartition =
-        maxLogPartitionFileSize ?? resolvedMaxPartition;
+    final resolvedMaxLogPartition = maxLogPartitionFileSize ??
+        _getDefaultMaxLogPartitionFileSize(resolvedServer);
     final resolvedConcurrency = maxConcurrency ?? _getDefaultMaxConcurrent();
 
     return DataStoreConfig._internal(
@@ -273,8 +273,7 @@ class DataStoreConfig {
       logLevel: logLevel,
       maxConcurrency: resolvedConcurrency,
       maxIoConcurrency: maxIoConcurrency ??
-          _getDefaultMaxIoConcurrent(
-              resolvedConcurrency, resolvedMaxPartition, resolvedServer),
+          _getDefaultMaxIoConcurrent(resolvedConcurrency, resolvedServer),
       distributedNodeConfig:
           distributedNodeConfig ?? const DistributedNodeConfig(),
       cacheMemoryBudgetMB: cacheMemoryBudgetMB,
@@ -322,22 +321,35 @@ class DataStoreConfig {
   /// get default partition file size limit, based on platform
   static int _getDefaultMaxPartitionFileSize(bool isServer) {
     if (PlatformHandler.isWeb) {
-      return 64 * 1024; // Web: 64KB - Browser memory constraints
+      // Web must rewrite whole blobs; keep tiny.
+      return 64 * 1024; // 64KB
     } else if (PlatformHandler.isMobile) {
-      return 4 * 1024 * 1024; // Mobile: 4MB
+      return 256 * 1024 * 1024; // 256MB
     } else if (isServer) {
-      // Server: prefer larger partitions to curb partition explosion while
-      // keeping sparse-index guided reads efficient. Scale with recommended
-      // concurrency, bounded to avoid excessive per-partition IO/caching cost.
-      final cores = PlatformHandler.recommendedConcurrency;
-      const int base = 256 * 1024 * 1024; // 256MB baseline
-      // Add 32MB per usable core, up to 16 cores (caps growth to 512MB add-on).
-      final int scaled = base + (min(cores, 16) * 32 * 1024 * 1024);
-      // Clamp between 256MB and 1024MB.
-      return min(max(scaled, base), 1024 * 1024 * 1024);
+      // Server: 1GB baseline (low-spec VPS/containers), scale to 4GB on
+      // wider machines. Use real core count — not recommendedConcurrency
+      // (which floors at 8 on servers and would oversize tiny boxes).
+      final cores = PlatformHandler.processorCores;
+      const int base = 1024 * 1024 * 1024; // 1GB
+      const int maxSize = 4 * 1024 * 1024 * 1024; // 4GB
+      // +192MB per core (up to 16) => +3GB max → 1-4GB range.
+      final int scaled = base + (min(max(cores, 1), 16) * 192 * 1024 * 1024);
+      return min(max(scaled, base), maxSize);
     } else {
-      // Desktop platform: 16MB
-      return 16 * 1024 * 1024;
+      return 512 * 1024 * 1024; // Desktop: 512MB
+    }
+  }
+
+  /// Default WAL/txn/redo log segment size — intentionally small and
+  /// independent of data partition size.
+  static int _getDefaultMaxLogPartitionFileSize(bool isServer) {
+    if (PlatformHandler.isWeb) {
+      return 64 * 1024; // 64KB
+    } else if (isServer) {
+      return 8 * 1024 * 1024; // 8MB
+    } else {
+      // Mobile + desktop
+      return 4 * 1024 * 1024; // 4MB
     }
   }
 
@@ -388,77 +400,31 @@ class DataStoreConfig {
     return PlatformHandler.recommendedConcurrency;
   }
 
-  /// Get default max IO concurrency
-  ///
-  /// Takes into account:
-  /// - CPU cores (base concurrency)
-  /// - Partition file size (larger partitions need more memory/CPU per task
-  ///   for sparse-index parsing and block encoding/decoding)
-  static int _getDefaultMaxIoConcurrent(
-      int cpuConcurrent, int partitionFileSize, bool isServer) {
-    // Calculate base I/O concurrency from CPU cores
+  /// get default max io concurrency, based on cpu concurrent and platform
+  static int _getDefaultMaxIoConcurrent(int cpuConcurrent, bool isServer) {
     int baseIo;
     int minIo;
     int maxIo;
 
     if (isServer) {
-      // Server: IO is highly parallelizable, use 4x CPU cores
-      // But clamp to reasonable limits to avoid FD exhaustion
+      // Server: IO is highly parallelizable; clamp to avoid FD exhaustion
       baseIo = cpuConcurrent * 4;
       minIo = 32;
       maxIo = 256;
     } else if (PlatformHandler.isDesktop) {
-      // Desktop: 2x CPU cores
       baseIo = cpuConcurrent * 3;
       minIo = 12;
       maxIo = 64;
     } else if (PlatformHandler.isMobile) {
-      // Mobile: 2x CPU cores, but bounded
       baseIo = cpuConcurrent * 3;
       minIo = 12;
       maxIo = 64;
     } else {
-      // Web: keep low regardless of partition size
+      // Web: keep low
       return 6;
     }
 
-    // Scale down concurrency for large partition files
-    // Large partitions require more memory for:
-    // - Sparse index structures (grows with partition size)
-    // - Block buffer allocation during encode/decode
-    // - Binary fuse filter construction
-    //
-    // Thresholds (platform-specific):
-    // - Below threshold: use full baseIo
-    // - Above threshold: scale down proportionally
-    // - At 2x threshold: use ~50% of baseIo
-    final int threshold = _getLargePartitionThreshold(isServer);
-    if (partitionFileSize > threshold) {
-      // Linear scale-down: at 2x threshold, use 50% of base concurrency
-      // ratio goes from 0.0 (at threshold) to 1.0 (at 2x threshold)
-      final double ratio =
-          ((partitionFileSize - threshold) / threshold).clamp(0.0, 1.0);
-      // scaleFactor goes from 1.0 to 0.5 as ratio goes from 0.0 to 1.0
-      final double scaleFactor = 1.0 - (ratio * 0.5);
-      baseIo = (baseIo * scaleFactor).floor();
-    }
-
     return baseIo.clamp(minIo, maxIo);
-  }
-
-  /// Threshold for considering a partition file "large" for concurrency scaling.
-  /// Beyond this size, I/O concurrency is reduced to prevent memory pressure
-  /// from heavier sparse-index parsing and block encoding/decoding.
-  static int _getLargePartitionThreshold(bool isServer) {
-    if (PlatformHandler.isWeb) {
-      return 64 * 1024; // 64KB - web has tight memory constraints
-    } else if (PlatformHandler.isMobile) {
-      return 4 * 1024 * 1024; // 4MB - mobile has moderate constraints
-    } else if (isServer) {
-      return 128 * 1024 * 1024; // 128MB - server can handle large partitions
-    } else {
-      return 8 * 1024 * 1024; // 8MB - desktop balanced
-    }
   }
 
   static int _getDefaultMaxOpenHandles(bool isServer) {
@@ -558,15 +524,14 @@ class DataStoreConfig {
   }
 
   static int _getDefaultParallelJournalMaxFileSize(bool isServer) {
-    // Platform-tuned defaults, independent of data partition size
+    // Align with log-segment sizing: keep recovery A/B journals compact.
     if (PlatformHandler.isWeb) {
       return 512 * 1024; // 512KB
-    } else if (PlatformHandler.isMobile) {
-      return 4 * 1024 * 1024; // 4MB
     } else if (isServer) {
-      return 16 * 1024 * 1024; // 16MB
+      return 8 * 1024 * 1024; // 8MB
     } else {
-      return 8 * 1024 * 1024; // Desktop: 8MB
+      // Mobile + desktop
+      return 4 * 1024 * 1024; // 4MB
     }
   }
 
