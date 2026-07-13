@@ -43,6 +43,13 @@ class InternalConfig {
   /// - Persisted in [GlobalConfig.maxEntriesPerDir] for forward-compatibility.
   /// - Used for deterministic sharding: `dirIndex = pIndex ~/ maxEntriesPerDir`.
   static const int defaultMaxEntriesPerDir = 2000;
+
+  /// Default B+Tree / NGH page size (16KB).
+  ///
+  /// Used only when creating a brand-new database or filling missing
+  /// [GlobalConfig.pageSize] during upgrades. Once persisted in GlobalConfig,
+  /// page size is immutable for that database lifetime.
+  static const int defaultPageSize = 16 * 1024;
 }
 
 /// convert any object type to string
