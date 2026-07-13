@@ -688,18 +688,15 @@ class VectorIndexManager {
         String? legacyLogicalNameFromJson,
         bool hadLegacyDisplayFields,
       })?> _readNghMetaFromDisk(TableContext table, IndexUid pathKey) async {
-    final path =
-        await _dataStore.pathManager.getNghMetaPath(table.tableUid, pathKey);
-    if (!await _dataStore.storage.existsFile(path)) {
-      return null;
-    }
-    final content = await _dataStore.storage.readAsString(path);
-    if (content == null || content.isEmpty) return null;
-    final json = jsonDecode(content) as Map<String, dynamic>;
+    final meta = await _dataStore.treeMetaPageService.readNghGlobalMeta(
+      table.tableUid,
+      pathKey,
+    );
+    if (meta == null) return null;
     return (
-      meta: NghIndexMeta.fromJson(json),
-      legacyLogicalNameFromJson: NghIndexMeta.legacyLogicalNameFromJson(json),
-      hadLegacyDisplayFields: NghIndexMeta.hasLegacyDisplayFieldsInJson(json),
+      meta: meta,
+      legacyLogicalNameFromJson: null,
+      hadLegacyDisplayFields: false,
     );
   }
 
@@ -741,10 +738,12 @@ class VectorIndexManager {
   Future<void> _persistMeta(
       TableContext table, IndexUid indexUid, NghIndexMeta meta) async {
     try {
-      final path =
-          await _dataStore.pathManager.getNghMetaPath(table.tableUid, indexUid);
-      final content = jsonEncode(meta.toJson());
-      await _dataStore.storage.writeAsString(path, content, flush: false);
+      await _dataStore.treeMetaPageService.persistNghGlobalMeta(
+        tableUid: table.tableUid,
+        indexUid: indexUid,
+        meta: meta,
+        flush: false,
+      );
     } catch (e) {
       Logger.error('Failed to persist NGH meta', rawError: e);
     }
@@ -802,7 +801,7 @@ class VectorIndexManager {
     if (pqCodebook == null) {
       // Load from disk
       final cbPage = await _partitionManager.readCodebook(
-          table, indexUid, meta.nghPageSize);
+          table, indexUid, _dataStore.configuredPageSize);
       if (cbPage == null) return null;
 
       pqCodebook = PqCodebook(
@@ -973,7 +972,7 @@ class VectorIndexManager {
       centroids: codebook.data,
     );
     await _partitionManager.writeCodebook(
-        table, indexUid, cbPage, meta.nghPageSize);
+        table, indexUid, cbPage, _dataStore.configuredPageSize);
 
     _vectorCache.putCodebook(table, indexUid, codebook);
     return VectorQuantizer(codebook);
@@ -1118,9 +1117,12 @@ class VectorIndexManager {
       final oldId = bfsOrder[newId];
 
       // Read old graph node
-      final oldPartition = meta.graphPartitionForNode(oldId);
-      final oldPage = meta.graphLocalPageForNode(oldId);
-      final oldSlot = meta.graphSlotForNode(oldId);
+      final oldPartition =
+          meta.graphPartitionForNode(oldId, _dataStore.configuredPageSize);
+      final oldPage =
+          meta.graphLocalPageForNode(oldId, _dataStore.configuredPageSize);
+      final oldSlot =
+          meta.graphSlotForNode(oldId, _dataStore.configuredPageSize);
       final oldGraphPage = await _partitionManager.readGraphPage(
           table, indexUid, meta, oldPartition, oldPage,
           localCache: localGraphCache);
@@ -1141,14 +1143,18 @@ class VectorIndexManager {
       }
 
       // Write to new position
-      final newPartition = meta.graphPartitionForNode(newId);
-      final newPage = meta.graphLocalPageForNode(newId);
-      final newSlot = meta.graphSlotForNode(newId);
+      final newPartition =
+          meta.graphPartitionForNode(newId, _dataStore.configuredPageSize);
+      final newPage =
+          meta.graphLocalPageForNode(newId, _dataStore.configuredPageSize);
+      final newSlot =
+          meta.graphSlotForNode(newId, _dataStore.configuredPageSize);
       final newGraphPageKey = newPartition << 20 | newPage;
 
       var targetPage = localGraphCache[newGraphPageKey];
       targetPage ??= NghGraphPage.empty(
-          maxDegree: meta.maxDegree, slotCount: meta.nodesPerGraphPage);
+          maxDegree: meta.maxDegree,
+          slotCount: meta.nodesPerGraphPage(_dataStore.configuredPageSize));
 
       if (newSlot < targetPage.slots.length) {
         targetPage.slots[newSlot].flags = node.flags;
@@ -1160,44 +1166,57 @@ class VectorIndexManager {
           targetPage;
 
       // Copy PQ code: old slot → new slot
-      final oldPqPartition = meta.pqPartitionForNode(oldId);
-      final oldPqPage = meta.pqLocalPageForNode(oldId);
-      final oldPqSlot = meta.pqSlotForNode(oldId);
+      final oldPqPartition =
+          meta.pqPartitionForNode(oldId, _dataStore.configuredPageSize);
+      final oldPqPage =
+          meta.pqLocalPageForNode(oldId, _dataStore.configuredPageSize);
+      final oldPqSlot =
+          meta.pqSlotForNode(oldId, _dataStore.configuredPageSize);
       final oldPqCodePage = await _partitionManager.readPqCodePage(
           table, indexUid, meta, oldPqPartition, oldPqPage,
           localCache: localPqCache);
       final pqCode = oldPqCodePage.getCode(oldPqSlot);
 
-      final newPqPartition = meta.pqPartitionForNode(newId);
-      final newPqPage = meta.pqLocalPageForNode(newId);
-      final newPqSlot = meta.pqSlotForNode(newId);
+      final newPqPartition =
+          meta.pqPartitionForNode(newId, _dataStore.configuredPageSize);
+      final newPqPage =
+          meta.pqLocalPageForNode(newId, _dataStore.configuredPageSize);
+      final newPqSlot =
+          meta.pqSlotForNode(newId, _dataStore.configuredPageSize);
       final newPqKey = newPqPartition << 20 | newPqPage;
       var targetPq = localPqCache[newPqKey];
       targetPq ??= NghPqCodePage.empty(
-          pqSubspaces: meta.pqSubspaces, capacity: meta.vectorsPerPqPage);
+          pqSubspaces: meta.pqSubspaces,
+          capacity: meta.vectorsPerPqPage(_dataStore.configuredPageSize));
       targetPq.setCode(newPqSlot, pqCode);
       localPqCache[newPqKey] = targetPq;
       dirtyPq[NghPagePtr(NghDataCategory.pqCode, newPqPartition, newPqPage)] =
           targetPq;
 
       // Copy raw vector: old slot → new slot
-      final oldRawPartition = meta.rawVectorPartitionForNode(oldId);
-      final oldRawPage = meta.rawVectorLocalPageForNode(oldId);
-      final oldRawSlot = meta.rawVectorSlotForNode(oldId);
+      final oldRawPartition =
+          meta.rawVectorPartitionForNode(oldId, _dataStore.configuredPageSize);
+      final oldRawPage =
+          meta.rawVectorLocalPageForNode(oldId, _dataStore.configuredPageSize);
+      final oldRawSlot =
+          meta.rawVectorSlotForNode(oldId, _dataStore.configuredPageSize);
       final oldRawVecPage = await _partitionManager.readRawVectorPage(
           table, indexUid, meta, oldRawPartition, oldRawPage);
       final rawVec = oldRawVecPage.getVectorAsFloat32(oldRawSlot);
 
-      final newRawPartition = meta.rawVectorPartitionForNode(newId);
-      final newRawPage = meta.rawVectorLocalPageForNode(newId);
-      final newRawSlot = meta.rawVectorSlotForNode(newId);
+      final newRawPartition =
+          meta.rawVectorPartitionForNode(newId, _dataStore.configuredPageSize);
+      final newRawPage =
+          meta.rawVectorLocalPageForNode(newId, _dataStore.configuredPageSize);
+      final newRawSlot =
+          meta.rawVectorSlotForNode(newId, _dataStore.configuredPageSize);
       final newRawKey = newRawPartition << 20 | newRawPage;
 
       var targetRaw = localRawCache[newRawKey];
       targetRaw ??= NghRawVectorPage.empty(
           dimensions: meta.dimensions,
           precisionIndex: meta.precision.index,
-          capacity: meta.vectorsPerRawPage);
+          capacity: meta.vectorsPerRawPage(_dataStore.configuredPageSize));
 
       targetRaw.setVectorFromFloat32(newRawSlot, rawVec);
       localRawCache[newRawKey] = targetRaw;
@@ -1275,9 +1294,11 @@ class VectorIndexManager {
   /// Helper: load neighbors for reorder (bypasses deletion check).
   Future<Uint32List?> _loadNeighborsForReorder(TableContext table,
       IndexUid indexUid, NghIndexMeta meta, int nodeId) async {
-    final partitionNo = meta.graphPartitionForNode(nodeId);
-    final pageNo = meta.graphLocalPageForNode(nodeId);
-    final slot = meta.graphSlotForNode(nodeId);
+    final partitionNo =
+        meta.graphPartitionForNode(nodeId, _dataStore.configuredPageSize);
+    final pageNo =
+        meta.graphLocalPageForNode(nodeId, _dataStore.configuredPageSize);
+    final slot = meta.graphSlotForNode(nodeId, _dataStore.configuredPageSize);
     final page = await _partitionManager.readGraphPage(
         table, indexUid, meta, partitionNo, pageNo);
     if (slot >= page.slots.length) return null;
@@ -1433,9 +1454,11 @@ class VectorIndexManager {
 
     // Re-read the updated metas in parallel
     final metaResults = await Future.wait([
-      _dataStore.indexManager?.getIndexMeta(table, meta.nid2pkIndexUid) ??
+      _dataStore.indexManager
+              ?.getIndexMeta(table.tableUid, meta.nid2pkIndexUid) ??
           Future.value(nid2pkMeta),
-      _dataStore.indexManager?.getIndexMeta(table, meta.pk2nidIndexUid) ??
+      _dataStore.indexManager
+              ?.getIndexMeta(table.tableUid, meta.pk2nidIndexUid) ??
           Future.value(pk2nidMeta),
     ]);
     nid2pkMeta = metaResults[0] ?? nid2pkMeta;
