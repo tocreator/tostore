@@ -1,0 +1,869 @@
+import 'dart:typed_data';
+
+import '../core/btree_page.dart';
+import '../core/ngh_page.dart';
+import 'binary_codec.dart';
+import 'common.dart';
+import 'platform_byte_data.dart';
+import '../model/meta_info.dart';
+import '../model/ngh_index_meta.dart';
+import '../model/table_identity.dart';
+import '../model/table_schema.dart';
+
+/// Stable field IDs for [TimestampsCodec]. Reserved: 3..127.
+abstract final class TimestampsFieldId {
+  static const int createdMs = 1;
+  static const int modifiedMs = 2;
+}
+
+/// Stable field IDs for [TreePagePtrCodec]. Reserved: 3..127.
+abstract final class TreePagePtrFieldId {
+  static const int partitionNo = 1;
+  static const int pageNo = 2;
+}
+
+/// Stable field IDs for [TableDataMetaCodec]. Reserved: 17..127.
+abstract final class TableDataMetaFieldId {
+  static const int version = 1;
+  static const int tableUid = 2;
+  static const int totalSizeInBytes = 3;
+  static const int totalRecords = 4;
+  static const int timestamps = 5;
+  static const int maxAutoIncrementId = 6;
+
+  /// Legacy — ignored; page size lives in [GlobalConfig].
+  static const int btreePageSize = 10;
+  static const int btreeNextPageNo = 11;
+  static const int btreePartitionCount = 12;
+  static const int btreeRoot = 13;
+  static const int btreeFirstLeaf = 14;
+  static const int btreeLastLeaf = 15;
+  static const int btreeHeight = 16;
+}
+
+/// Stable field IDs for [IndexMetaCodec]. Reserved: 17..127.
+abstract final class IndexMetaFieldId {
+  static const int version = 1;
+  static const int indexUid = 2;
+  static const int tableUid = 3;
+  static const int isUnique = 4;
+  static const int isBuilding = 5;
+  static const int totalSizeInBytes = 6;
+  static const int totalEntries = 7;
+  static const int timestamps = 8;
+
+  /// Legacy — ignored; page size lives in [GlobalConfig].
+  static const int btreePageSize = 10;
+  static const int btreeNextPageNo = 11;
+  static const int btreePartitionCount = 12;
+  static const int btreeRoot = 13;
+  static const int btreeFirstLeaf = 14;
+  static const int btreeLastLeaf = 15;
+  static const int btreeHeight = 16;
+}
+
+/// Stable field IDs for [NghIndexMetaCodec]. Reserved: 40..127.
+abstract final class NghIndexMetaFieldId {
+  static const int version = 1;
+  static const int indexUid = 2;
+  static const int tableUid = 3;
+  static const int dimensions = 4;
+  static const int distanceMetric = 5;
+  static const int precision = 6;
+  static const int timestamps = 7;
+  static const int maxDegree = 10;
+  static const int efSearch = 11;
+  static const int constructionEf = 12;
+  static const int pruneAlpha = 13;
+  static const int pqSubspaces = 14;
+  static const int pqCentroids = 15;
+  static const int pqTrained = 16;
+  static const int totalVectors = 20;
+  static const int deletedCount = 21;
+  static const int medoidNodeId = 22;
+  static const int nextNodeId = 23;
+
+  /// Legacy — ignored; page size lives in [GlobalConfig].
+  static const int nghPageSize = 24;
+  static const int graphPartitionCount = 25;
+  static const int graphNextPageNo = 26;
+  static const int pqCodePartitionCount = 27;
+  static const int pqCodeNextPageNo = 28;
+  static const int rawVectorPartitionCount = 29;
+  static const int rawVectorNextPageNo = 30;
+  static const int totalSizeInBytes = 31;
+  static const int nodeIdToPkMeta = 32;
+  static const int pkToNodeIdMeta = 33;
+  static const int graphFreeListHeads = 34;
+  static const int pqCodeFreeListHeads = 35;
+  static const int rawVectorFreeListHeads = 36;
+  static const int maxPartitionFileSize = 37;
+}
+
+/// Discriminator for global meta blobs embedded in partition-0 page 0.
+enum TreeGlobalMetaKind {
+  table(0),
+  indexTree(1),
+  ngh(2);
+
+  final int wireValue;
+  const TreeGlobalMetaKind(this.wireValue);
+
+  static TreeGlobalMetaKind? fromWire(int v) {
+    for (final k in values) {
+      if (k.wireValue == v) return k;
+    }
+    return null;
+  }
+}
+
+final class TimestampsCodec {
+  static Uint8List encode(Timestamps ts) {
+    final w = BinaryWriter(initialCapacity: 32);
+    w.writeFieldTag(TimestampsFieldId.createdMs, WireType.fixed64);
+    w.writeFixed64(ts.created.millisecondsSinceEpoch);
+    w.writeFieldTag(TimestampsFieldId.modifiedMs, WireType.fixed64);
+    w.writeFixed64(ts.modified.millisecondsSinceEpoch);
+    return w.view;
+  }
+
+  static Timestamps decode(Uint8List bytes) {
+    final reader = BinaryReader(bytes);
+    var createdMs = 0;
+    var modifiedMs = 0;
+    while (!reader.isEOF) {
+      final (fieldId, wireType) = reader.readFieldTag();
+      switch (fieldId) {
+        case TimestampsFieldId.createdMs:
+          createdMs = reader.readFixed64();
+          break;
+        case TimestampsFieldId.modifiedMs:
+          modifiedMs = reader.readFixed64();
+          break;
+        default:
+          reader.skipField(wireType);
+      }
+    }
+    final now = DateTime.now();
+    return Timestamps(
+      created: createdMs > 0
+          ? DateTime.fromMillisecondsSinceEpoch(createdMs, isUtc: false)
+          : now,
+      modified: modifiedMs > 0
+          ? DateTime.fromMillisecondsSinceEpoch(modifiedMs, isUtc: false)
+          : now,
+    );
+  }
+}
+
+final class TreePagePtrCodec {
+  static Uint8List encode(TreePagePtr ptr) {
+    final w = BinaryWriter(initialCapacity: 16);
+    w.writeFieldTag(TreePagePtrFieldId.partitionNo, WireType.varint);
+    w.writeZigZag32(ptr.partitionNo);
+    w.writeFieldTag(TreePagePtrFieldId.pageNo, WireType.varint);
+    w.writeZigZag32(ptr.pageNo);
+    return w.view;
+  }
+
+  static TreePagePtr decode(Uint8List bytes) {
+    final reader = BinaryReader(bytes);
+    var partitionNo = -1;
+    var pageNo = -1;
+    while (!reader.isEOF) {
+      final (fieldId, wireType) = reader.readFieldTag();
+      switch (fieldId) {
+        case TreePagePtrFieldId.partitionNo:
+          partitionNo = reader.readZigZag32();
+          break;
+        case TreePagePtrFieldId.pageNo:
+          pageNo = reader.readZigZag32();
+          break;
+        default:
+          reader.skipField(wireType);
+      }
+    }
+    return TreePagePtr(partitionNo, pageNo);
+  }
+}
+
+final class TableDataMetaCodec {
+  static Uint8List encode(TableDataMeta meta) {
+    final w = BinaryWriter(initialCapacity: 256);
+    w.writeFieldTag(TableDataMetaFieldId.version, WireType.varint);
+    w.writeVarint(meta.version);
+    w.writeFieldTag(TableDataMetaFieldId.tableUid, WireType.lengthDelimited);
+    w.writeString(meta.tableUid.value);
+    w.writeFieldTag(TableDataMetaFieldId.totalSizeInBytes, WireType.varint);
+    w.writeVarint(meta.totalSizeInBytes);
+    w.writeFieldTag(TableDataMetaFieldId.totalRecords, WireType.varint);
+    w.writeVarint(meta.totalRecords);
+    w.writeFieldTag(TableDataMetaFieldId.timestamps, WireType.lengthDelimited);
+    w.writeBytes(TimestampsCodec.encode(meta.timestamps));
+    if (meta.maxAutoIncrementId != null) {
+      w.writeFieldTag(
+          TableDataMetaFieldId.maxAutoIncrementId, WireType.lengthDelimited);
+      w.writeString(meta.maxAutoIncrementId!);
+    }
+    w.writeFieldTag(TableDataMetaFieldId.btreeNextPageNo, WireType.varint);
+    w.writeVarint(meta.btreeNextPageNo);
+    w.writeFieldTag(TableDataMetaFieldId.btreePartitionCount, WireType.varint);
+    w.writeVarint(meta.btreePartitionCount);
+    w.writeFieldTag(TableDataMetaFieldId.btreeRoot, WireType.lengthDelimited);
+    w.writeBytes(TreePagePtrCodec.encode(meta.btreeRoot));
+    w.writeFieldTag(
+        TableDataMetaFieldId.btreeFirstLeaf, WireType.lengthDelimited);
+    w.writeBytes(TreePagePtrCodec.encode(meta.btreeFirstLeaf));
+    w.writeFieldTag(
+        TableDataMetaFieldId.btreeLastLeaf, WireType.lengthDelimited);
+    w.writeBytes(TreePagePtrCodec.encode(meta.btreeLastLeaf));
+    w.writeFieldTag(TableDataMetaFieldId.btreeHeight, WireType.varint);
+    w.writeVarint(meta.btreeHeight);
+    return w.view;
+  }
+
+  static TableDataMeta decode(
+    Uint8List bytes, {
+    TableUid? tableUidFallback,
+  }) {
+    final reader = BinaryReader(bytes);
+    int version = InternalConfig.tableDataVersion;
+    TableUid? tableUid = tableUidFallback;
+    int totalSizeInBytes = 0;
+    int totalRecords = 0;
+    Timestamps? timestamps;
+    String? maxAutoIncrementId;
+    int btreeNextPageNo = TableDataMeta.firstDataPageNo;
+    int btreePartitionCount = 1;
+    TreePagePtr btreeRoot = TreePagePtr.nullPtr;
+    TreePagePtr btreeFirstLeaf = TreePagePtr.nullPtr;
+    TreePagePtr btreeLastLeaf = TreePagePtr.nullPtr;
+    int btreeHeight = 0;
+
+    while (!reader.isEOF) {
+      final (fieldId, wireType) = reader.readFieldTag();
+      switch (fieldId) {
+        case TableDataMetaFieldId.version:
+          version = reader.readVarint();
+          break;
+        case TableDataMetaFieldId.tableUid:
+          tableUid = TableUid(reader.readString());
+          break;
+        case TableDataMetaFieldId.totalSizeInBytes:
+          totalSizeInBytes = reader.readVarint();
+          break;
+        case TableDataMetaFieldId.totalRecords:
+          totalRecords = reader.readVarint();
+          break;
+        case TableDataMetaFieldId.timestamps:
+          timestamps = TimestampsCodec.decode(reader.readBytes());
+          break;
+        case TableDataMetaFieldId.maxAutoIncrementId:
+          maxAutoIncrementId = reader.readString();
+          break;
+        case TableDataMetaFieldId.btreePageSize:
+          reader.readVarint(); // legacy field — ignore
+          break;
+        case TableDataMetaFieldId.btreeNextPageNo:
+          btreeNextPageNo = reader.readVarint();
+          break;
+        case TableDataMetaFieldId.btreePartitionCount:
+          btreePartitionCount = reader.readVarint();
+          break;
+        case TableDataMetaFieldId.btreeRoot:
+          btreeRoot = TreePagePtrCodec.decode(reader.readBytes());
+          break;
+        case TableDataMetaFieldId.btreeFirstLeaf:
+          btreeFirstLeaf = TreePagePtrCodec.decode(reader.readBytes());
+          break;
+        case TableDataMetaFieldId.btreeLastLeaf:
+          btreeLastLeaf = TreePagePtrCodec.decode(reader.readBytes());
+          break;
+        case TableDataMetaFieldId.btreeHeight:
+          btreeHeight = reader.readVarint();
+          break;
+        default:
+          reader.skipField(wireType);
+      }
+    }
+
+    final resolvedUid = tableUid ?? tableUidFallback;
+    if (resolvedUid == null || timestamps == null) {
+      throw StateError('Incomplete TableDataMeta binary payload');
+    }
+
+    return TableDataMeta(
+      version: version,
+      tableUid: resolvedUid,
+      totalSizeInBytes: totalSizeInBytes,
+      totalRecords: totalRecords,
+      timestamps: timestamps,
+      maxAutoIncrementId: maxAutoIncrementId,
+      btreeNextPageNo: btreeNextPageNo,
+      btreePartitionCount: btreePartitionCount,
+      btreeRoot: btreeRoot,
+      btreeFirstLeaf: btreeFirstLeaf,
+      btreeLastLeaf: btreeLastLeaf,
+      btreeHeight: btreeHeight,
+    );
+  }
+}
+
+final class IndexMetaCodec {
+  static Uint8List encode(IndexMeta meta) {
+    final w = BinaryWriter(initialCapacity: 256);
+    w.writeFieldTag(IndexMetaFieldId.version, WireType.varint);
+    w.writeVarint(meta.version);
+    w.writeFieldTag(IndexMetaFieldId.indexUid, WireType.lengthDelimited);
+    w.writeString(meta.indexUid.value);
+    w.writeFieldTag(IndexMetaFieldId.tableUid, WireType.lengthDelimited);
+    w.writeString(meta.tableUid.value);
+    w.writeFieldTag(IndexMetaFieldId.isUnique, WireType.varint);
+    w.writeBool(meta.isUnique);
+    w.writeFieldTag(IndexMetaFieldId.isBuilding, WireType.varint);
+    w.writeBool(meta.isBuilding);
+    w.writeFieldTag(IndexMetaFieldId.totalSizeInBytes, WireType.varint);
+    w.writeVarint(meta.totalSizeInBytes);
+    w.writeFieldTag(IndexMetaFieldId.totalEntries, WireType.varint);
+    w.writeVarint(meta.totalEntries);
+    w.writeFieldTag(IndexMetaFieldId.timestamps, WireType.lengthDelimited);
+    w.writeBytes(TimestampsCodec.encode(meta.timestamps));
+    w.writeFieldTag(IndexMetaFieldId.btreeNextPageNo, WireType.varint);
+    w.writeVarint(meta.btreeNextPageNo);
+    w.writeFieldTag(IndexMetaFieldId.btreePartitionCount, WireType.varint);
+    w.writeVarint(meta.btreePartitionCount);
+    w.writeFieldTag(IndexMetaFieldId.btreeRoot, WireType.lengthDelimited);
+    w.writeBytes(TreePagePtrCodec.encode(meta.btreeRoot));
+    w.writeFieldTag(IndexMetaFieldId.btreeFirstLeaf, WireType.lengthDelimited);
+    w.writeBytes(TreePagePtrCodec.encode(meta.btreeFirstLeaf));
+    w.writeFieldTag(IndexMetaFieldId.btreeLastLeaf, WireType.lengthDelimited);
+    w.writeBytes(TreePagePtrCodec.encode(meta.btreeLastLeaf));
+    w.writeFieldTag(IndexMetaFieldId.btreeHeight, WireType.varint);
+    w.writeVarint(meta.btreeHeight);
+    return w.view;
+  }
+
+  static IndexMeta decode(
+    Uint8List bytes, {
+    TableUid? tableUidFallback,
+    IndexUid? indexUidFallback,
+  }) {
+    final reader = BinaryReader(bytes);
+    int version = InternalConfig.indexVersion;
+    IndexUid? indexUid = indexUidFallback;
+    TableUid? tableUid = tableUidFallback;
+    bool isUnique = false;
+    bool isBuilding = false;
+    int totalSizeInBytes = 0;
+    int totalEntries = 0;
+    Timestamps? timestamps;
+    int btreeNextPageNo = IndexMeta.firstDataPageNo;
+    int btreePartitionCount = 1;
+    TreePagePtr btreeRoot = TreePagePtr.nullPtr;
+    TreePagePtr btreeFirstLeaf = TreePagePtr.nullPtr;
+    TreePagePtr btreeLastLeaf = TreePagePtr.nullPtr;
+    int btreeHeight = 0;
+
+    while (!reader.isEOF) {
+      final (fieldId, wireType) = reader.readFieldTag();
+      switch (fieldId) {
+        case IndexMetaFieldId.version:
+          version = reader.readVarint();
+          break;
+        case IndexMetaFieldId.indexUid:
+          indexUid = IndexUid(reader.readString());
+          break;
+        case IndexMetaFieldId.tableUid:
+          tableUid = TableUid(reader.readString());
+          break;
+        case IndexMetaFieldId.isUnique:
+          isUnique = reader.readBool();
+          break;
+        case IndexMetaFieldId.isBuilding:
+          isBuilding = reader.readBool();
+          break;
+        case IndexMetaFieldId.totalSizeInBytes:
+          totalSizeInBytes = reader.readVarint();
+          break;
+        case IndexMetaFieldId.totalEntries:
+          totalEntries = reader.readVarint();
+          break;
+        case IndexMetaFieldId.timestamps:
+          timestamps = TimestampsCodec.decode(reader.readBytes());
+          break;
+        case IndexMetaFieldId.btreePageSize:
+          reader.readVarint(); // legacy field — ignore
+          break;
+        case IndexMetaFieldId.btreeNextPageNo:
+          btreeNextPageNo = reader.readVarint();
+          break;
+        case IndexMetaFieldId.btreePartitionCount:
+          btreePartitionCount = reader.readVarint();
+          break;
+        case IndexMetaFieldId.btreeRoot:
+          btreeRoot = TreePagePtrCodec.decode(reader.readBytes());
+          break;
+        case IndexMetaFieldId.btreeFirstLeaf:
+          btreeFirstLeaf = TreePagePtrCodec.decode(reader.readBytes());
+          break;
+        case IndexMetaFieldId.btreeLastLeaf:
+          btreeLastLeaf = TreePagePtrCodec.decode(reader.readBytes());
+          break;
+        case IndexMetaFieldId.btreeHeight:
+          btreeHeight = reader.readVarint();
+          break;
+        default:
+          reader.skipField(wireType);
+      }
+    }
+
+    final resolvedIndexUid = indexUid ?? indexUidFallback;
+    final resolvedTableUid = tableUid ?? tableUidFallback;
+    if (resolvedIndexUid == null ||
+        resolvedTableUid == null ||
+        timestamps == null) {
+      throw StateError('Incomplete IndexMeta binary payload');
+    }
+
+    return IndexMeta(
+      version: version,
+      indexUid: resolvedIndexUid,
+      tableUid: resolvedTableUid,
+      isUnique: isUnique,
+      isBuilding: isBuilding,
+      timestamps: timestamps,
+      totalSizeInBytes: totalSizeInBytes,
+      totalEntries: totalEntries,
+      btreeNextPageNo: btreeNextPageNo,
+      btreePartitionCount: btreePartitionCount,
+      btreeRoot: btreeRoot,
+      btreeFirstLeaf: btreeFirstLeaf,
+      btreeLastLeaf: btreeLastLeaf,
+      btreeHeight: btreeHeight,
+    );
+  }
+}
+
+final class NghIndexMetaCodec {
+  static Uint8List encode(NghIndexMeta meta) {
+    final w = BinaryWriter(initialCapacity: 512);
+    w.writeFieldTag(NghIndexMetaFieldId.version, WireType.varint);
+    w.writeVarint(meta.version);
+    w.writeFieldTag(NghIndexMetaFieldId.indexUid, WireType.lengthDelimited);
+    w.writeString(meta.indexUid.value);
+    w.writeFieldTag(NghIndexMetaFieldId.tableUid, WireType.lengthDelimited);
+    w.writeString(meta.tableUid.value);
+    w.writeFieldTag(NghIndexMetaFieldId.dimensions, WireType.varint);
+    w.writeVarint(meta.dimensions);
+    w.writeFieldTag(NghIndexMetaFieldId.distanceMetric, WireType.varint);
+    w.writeVarint(meta.distanceMetric.index);
+    w.writeFieldTag(NghIndexMetaFieldId.precision, WireType.varint);
+    w.writeVarint(meta.precision.index);
+    w.writeFieldTag(NghIndexMetaFieldId.timestamps, WireType.lengthDelimited);
+    w.writeBytes(TimestampsCodec.encode(meta.timestamps));
+    w.writeFieldTag(NghIndexMetaFieldId.maxDegree, WireType.varint);
+    w.writeVarint(meta.maxDegree);
+    w.writeFieldTag(NghIndexMetaFieldId.efSearch, WireType.varint);
+    w.writeVarint(meta.efSearch);
+    w.writeFieldTag(NghIndexMetaFieldId.constructionEf, WireType.varint);
+    w.writeVarint(meta.constructionEf);
+    w.writeFieldTag(NghIndexMetaFieldId.pruneAlpha, WireType.fixed64);
+    w.writeDouble(meta.pruneAlpha);
+    w.writeFieldTag(NghIndexMetaFieldId.pqSubspaces, WireType.varint);
+    w.writeVarint(meta.pqSubspaces);
+    w.writeFieldTag(NghIndexMetaFieldId.pqCentroids, WireType.varint);
+    w.writeVarint(meta.pqCentroids);
+    w.writeFieldTag(NghIndexMetaFieldId.pqTrained, WireType.varint);
+    w.writeBool(meta.pqTrained);
+    w.writeFieldTag(NghIndexMetaFieldId.totalVectors, WireType.varint);
+    w.writeVarint(meta.totalVectors);
+    w.writeFieldTag(NghIndexMetaFieldId.deletedCount, WireType.varint);
+    w.writeVarint(meta.deletedCount);
+    w.writeFieldTag(NghIndexMetaFieldId.medoidNodeId, WireType.varint);
+    w.writeZigZag32(meta.medoidNodeId);
+    w.writeFieldTag(NghIndexMetaFieldId.nextNodeId, WireType.varint);
+    w.writeVarint(meta.nextNodeId);
+    w.writeFieldTag(NghIndexMetaFieldId.graphPartitionCount, WireType.varint);
+    w.writeVarint(meta.graphPartitionCount);
+    w.writeFieldTag(NghIndexMetaFieldId.graphNextPageNo, WireType.varint);
+    w.writeVarint(meta.graphNextPageNo);
+    w.writeFieldTag(NghIndexMetaFieldId.pqCodePartitionCount, WireType.varint);
+    w.writeVarint(meta.pqCodePartitionCount);
+    w.writeFieldTag(NghIndexMetaFieldId.pqCodeNextPageNo, WireType.varint);
+    w.writeVarint(meta.pqCodeNextPageNo);
+    w.writeFieldTag(
+        NghIndexMetaFieldId.rawVectorPartitionCount, WireType.varint);
+    w.writeVarint(meta.rawVectorPartitionCount);
+    w.writeFieldTag(NghIndexMetaFieldId.rawVectorNextPageNo, WireType.varint);
+    w.writeVarint(meta.rawVectorNextPageNo);
+    w.writeFieldTag(NghIndexMetaFieldId.totalSizeInBytes, WireType.varint);
+    w.writeVarint(meta.totalSizeInBytes);
+    if (meta.nodeIdToPkMeta != null) {
+      w.writeFieldTag(
+          NghIndexMetaFieldId.nodeIdToPkMeta, WireType.lengthDelimited);
+      w.writeBytes(IndexMetaCodec.encode(meta.nodeIdToPkMeta!));
+    }
+    if (meta.pkToNodeIdMeta != null) {
+      w.writeFieldTag(
+          NghIndexMetaFieldId.pkToNodeIdMeta, WireType.lengthDelimited);
+      w.writeBytes(IndexMetaCodec.encode(meta.pkToNodeIdMeta!));
+    }
+    _writeIntIntMap(
+        w, NghIndexMetaFieldId.graphFreeListHeads, meta.graphFreeListHeads);
+    _writeIntIntMap(
+        w, NghIndexMetaFieldId.pqCodeFreeListHeads, meta.pqCodeFreeListHeads);
+    _writeIntIntMap(w, NghIndexMetaFieldId.rawVectorFreeListHeads,
+        meta.rawVectorFreeListHeads);
+    w.writeFieldTag(NghIndexMetaFieldId.maxPartitionFileSize, WireType.varint);
+    w.writeVarint(meta.maxPartitionFileSizeBytes);
+    return w.view;
+  }
+
+  static NghIndexMeta decode(
+    Uint8List bytes, {
+    TableUid? tableUidFallback,
+    IndexUid? indexUidFallback,
+  }) {
+    final reader = BinaryReader(bytes);
+    int version = InternalConfig.indexVersion;
+    IndexUid? indexUid = indexUidFallback;
+    TableUid? tableUid = tableUidFallback;
+    int dimensions = 0;
+    VectorDistanceMetric distanceMetric = VectorDistanceMetric.cosine;
+    VectorPrecision precision = VectorPrecision.float32;
+    Timestamps? timestamps;
+    int maxDegree = 64;
+    int efSearch = 64;
+    int constructionEf = 128;
+    double pruneAlpha = 1.2;
+    int pqSubspaces = 16;
+    int pqCentroids = 256;
+    bool pqTrained = false;
+    int totalVectors = 0;
+    int deletedCount = 0;
+    int medoidNodeId = -1;
+    int nextNodeId = 0;
+    int graphPartitionCount = 1;
+    int graphNextPageNo = NghIndexMeta.firstDataPageNo;
+    int pqCodePartitionCount = 1;
+    int pqCodeNextPageNo = NghIndexMeta.firstDataPageNo;
+    int rawVectorPartitionCount = 1;
+    int rawVectorNextPageNo = NghIndexMeta.firstDataPageNo;
+    int totalSizeInBytes = 0;
+    IndexMeta? nodeIdToPkMeta;
+    IndexMeta? pkToNodeIdMeta;
+    Map<int, int> graphFreeListHeads = const {};
+    Map<int, int> pqCodeFreeListHeads = const {};
+    Map<int, int> rawVectorFreeListHeads = const {};
+    int maxPartitionFileSize = 16 * 1024 * 1024;
+
+    while (!reader.isEOF) {
+      final (fieldId, wireType) = reader.readFieldTag();
+      switch (fieldId) {
+        case NghIndexMetaFieldId.version:
+          version = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.indexUid:
+          indexUid = IndexUid(reader.readString());
+          break;
+        case NghIndexMetaFieldId.tableUid:
+          tableUid = TableUid(reader.readString());
+          break;
+        case NghIndexMetaFieldId.dimensions:
+          dimensions = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.distanceMetric:
+          final idx = reader.readVarint();
+          if (idx >= 0 && idx < VectorDistanceMetric.values.length) {
+            distanceMetric = VectorDistanceMetric.values[idx];
+          }
+          break;
+        case NghIndexMetaFieldId.precision:
+          final idx = reader.readVarint();
+          if (idx >= 0 && idx < VectorPrecision.values.length) {
+            precision = VectorPrecision.values[idx];
+          }
+          break;
+        case NghIndexMetaFieldId.timestamps:
+          timestamps = TimestampsCodec.decode(reader.readBytes());
+          break;
+        case NghIndexMetaFieldId.maxDegree:
+          maxDegree = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.efSearch:
+          efSearch = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.constructionEf:
+          constructionEf = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.pruneAlpha:
+          pruneAlpha = reader.readDouble();
+          break;
+        case NghIndexMetaFieldId.pqSubspaces:
+          pqSubspaces = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.pqCentroids:
+          pqCentroids = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.pqTrained:
+          pqTrained = reader.readBool();
+          break;
+        case NghIndexMetaFieldId.totalVectors:
+          totalVectors = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.deletedCount:
+          deletedCount = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.medoidNodeId:
+          medoidNodeId = reader.readZigZag32();
+          break;
+        case NghIndexMetaFieldId.nextNodeId:
+          nextNodeId = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.nghPageSize:
+          reader.readVarint(); // legacy field — ignore
+          break;
+        case NghIndexMetaFieldId.graphPartitionCount:
+          graphPartitionCount = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.graphNextPageNo:
+          graphNextPageNo = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.pqCodePartitionCount:
+          pqCodePartitionCount = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.pqCodeNextPageNo:
+          pqCodeNextPageNo = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.rawVectorPartitionCount:
+          rawVectorPartitionCount = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.rawVectorNextPageNo:
+          rawVectorNextPageNo = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.totalSizeInBytes:
+          totalSizeInBytes = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.nodeIdToPkMeta:
+          nodeIdToPkMeta = IndexMetaCodec.decode(reader.readBytes());
+          break;
+        case NghIndexMetaFieldId.pkToNodeIdMeta:
+          pkToNodeIdMeta = IndexMetaCodec.decode(reader.readBytes());
+          break;
+        case NghIndexMetaFieldId.graphFreeListHeads:
+          graphFreeListHeads = _readIntIntMap(reader);
+          break;
+        case NghIndexMetaFieldId.pqCodeFreeListHeads:
+          pqCodeFreeListHeads = _readIntIntMap(reader);
+          break;
+        case NghIndexMetaFieldId.rawVectorFreeListHeads:
+          rawVectorFreeListHeads = _readIntIntMap(reader);
+          break;
+        case NghIndexMetaFieldId.maxPartitionFileSize:
+          maxPartitionFileSize = reader.readVarint();
+          break;
+        default:
+          reader.skipField(wireType);
+      }
+    }
+
+    final resolvedIndexUid = indexUid ?? indexUidFallback;
+    final resolvedTableUid = tableUid ?? tableUidFallback;
+    if (resolvedIndexUid == null ||
+        resolvedTableUid == null ||
+        timestamps == null ||
+        dimensions <= 0) {
+      throw StateError('Incomplete NghIndexMeta binary payload');
+    }
+
+    return NghIndexMeta(
+      version: version,
+      indexUid: resolvedIndexUid,
+      tableUid: resolvedTableUid,
+      dimensions: dimensions,
+      distanceMetric: distanceMetric,
+      precision: precision,
+      timestamps: timestamps,
+      maxDegree: maxDegree,
+      efSearch: efSearch,
+      constructionEf: constructionEf,
+      pruneAlpha: pruneAlpha,
+      pqSubspaces: pqSubspaces,
+      pqCentroids: pqCentroids,
+      pqTrained: pqTrained,
+      totalVectors: totalVectors,
+      deletedCount: deletedCount,
+      medoidNodeId: medoidNodeId,
+      nextNodeId: nextNodeId,
+      graphPartitionCount: graphPartitionCount,
+      graphNextPageNo: graphNextPageNo,
+      pqCodePartitionCount: pqCodePartitionCount,
+      pqCodeNextPageNo: pqCodeNextPageNo,
+      rawVectorPartitionCount: rawVectorPartitionCount,
+      rawVectorNextPageNo: rawVectorNextPageNo,
+      totalSizeInBytes: totalSizeInBytes,
+      nodeIdToPkMeta: nodeIdToPkMeta,
+      pkToNodeIdMeta: pkToNodeIdMeta,
+      graphFreeListHeads: graphFreeListHeads,
+      pqCodeFreeListHeads: pqCodeFreeListHeads,
+      rawVectorFreeListHeads: rawVectorFreeListHeads,
+      maxPartitionFileSize: maxPartitionFileSize,
+    );
+  }
+
+  static void _writeIntIntMap(
+    BinaryWriter w,
+    int fieldId,
+    Map<int, int> map,
+  ) {
+    if (map.isEmpty) return;
+    w.writeMessage(fieldId, (sub) {
+      for (final e in map.entries) {
+        sub.writeFieldTag(1, WireType.varint);
+        sub.writeZigZag32(e.key);
+        sub.writeFieldTag(2, WireType.varint);
+        sub.writeZigZag32(e.value);
+      }
+    });
+  }
+
+  static Map<int, int> _readIntIntMap(BinaryReader reader) {
+    final out = <int, int>{};
+    reader.readMessage((sub, _) {
+      int? pendingKey;
+      while (!sub.isEOF) {
+        final (fieldId, wt) = sub.readFieldTag();
+        switch (fieldId) {
+          case 1:
+            pendingKey = sub.readZigZag32();
+            break;
+          case 2:
+            final value = sub.readZigZag32();
+            if (pendingKey != null) {
+              out[pendingKey] = value;
+              pendingKey = null;
+            }
+            break;
+          default:
+            sub.skipField(wt);
+        }
+      }
+    });
+    return out;
+  }
+}
+
+/// Wraps a global meta blob with a stable kind discriminator.
+final class TreeGlobalMetaBlobCodec {
+  static Uint8List encode(TreeGlobalMetaKind kind, Uint8List payload) {
+    final w = BinaryWriter(initialCapacity: payload.length + 8);
+    w.writeFieldTag(1, WireType.varint);
+    w.writeVarint(kind.wireValue);
+    w.writeFieldTag(2, WireType.lengthDelimited);
+    w.writeBytes(payload);
+    return w.view;
+  }
+
+  static ({TreeGlobalMetaKind kind, Uint8List payload})? decode(
+      Uint8List bytes) {
+    final reader = BinaryReader(bytes);
+    TreeGlobalMetaKind? kind;
+    Uint8List? payload;
+    while (!reader.isEOF) {
+      final (fieldId, wireType) = reader.readFieldTag();
+      switch (fieldId) {
+        case 1:
+          kind = TreeGlobalMetaKind.fromWire(reader.readVarint());
+          break;
+        case 2:
+          payload = reader.readBytes();
+          break;
+        default:
+          reader.skipField(wireType);
+      }
+    }
+    if (kind == null || payload == null) return null;
+    return (kind: kind, payload: payload);
+  }
+}
+
+/// Per-partition local statistics embedded in every partition file page 0.
+final class PartitionLocalStats {
+  static const int payloadMagic = 0x31534C50; // 'PLS1'
+  static const int payloadVersion = 1;
+  static const int payloadSize = 40;
+
+  final int partitionNo;
+  final int totalEntries;
+  final int fileSizeInBytes;
+  final int freeListHeadPageNo;
+  final int freePageCount;
+
+  /// NGH data category (0=graph, 1=pq, 2=raw, 3=codebook). B+Tree uses 0.
+  final int dataCategory;
+
+  const PartitionLocalStats({
+    required this.partitionNo,
+    this.totalEntries = 0,
+    this.fileSizeInBytes = 0,
+    this.freeListHeadPageNo = -1,
+    this.freePageCount = 0,
+    this.dataCategory = 0,
+  });
+
+  Uint8List encode() {
+    final bd = ByteData(payloadSize);
+    bd.setUint32(0, payloadMagic, Endian.little);
+    bd.setUint16(4, payloadVersion, Endian.little);
+    bd.setUint8(6, dataCategory);
+    bd.setUint8(7, 0);
+    bd.setInt32(8, partitionNo, Endian.little);
+    bd.setInt32(12, 0, Endian.little);
+    PlatformByteData.setInt64(bd, 16, totalEntries, Endian.little);
+    PlatformByteData.setInt64(bd, 24, fileSizeInBytes, Endian.little);
+    bd.setInt32(32, freeListHeadPageNo, Endian.little);
+    bd.setInt32(36, freePageCount, Endian.little);
+    return bd.buffer.asUint8List();
+  }
+
+  static PartitionLocalStats? tryDecode(Uint8List bytes) {
+    if (bytes.length < payloadSize) return null;
+    final bd = ByteData.sublistView(bytes);
+    if (bd.getUint32(0, Endian.little) != payloadMagic) return null;
+    final v = bd.getUint16(4, Endian.little);
+    if (v <= 0) return null;
+    return PartitionLocalStats(
+      dataCategory: bd.getUint8(6),
+      partitionNo: bd.getInt32(8, Endian.little),
+      totalEntries: PlatformByteData.getInt64(bd, 16, Endian.little),
+      fileSizeInBytes: PlatformByteData.getInt64(bd, 24, Endian.little),
+      freeListHeadPageNo: bd.getInt32(32, Endian.little),
+      freePageCount: bd.getInt32(36, Endian.little),
+    );
+  }
+
+  /// Upgrade helper: map legacy [PartitionMetaPage] into [PartitionLocalStats].
+  static PartitionLocalStats fromLegacyPartitionMetaPage(
+      PartitionMetaPage page) {
+    return PartitionLocalStats(
+      partitionNo: page.partitionNo,
+      totalEntries: page.totalEntries,
+      fileSizeInBytes: page.fileSizeInBytes,
+      freeListHeadPageNo: page.freeListHeadPageNo,
+      freePageCount: page.freePageCount,
+    );
+  }
+
+  /// Upgrade helper: map legacy [NghPartitionMetaPage].
+  static PartitionLocalStats fromLegacyNghPartitionMetaPage(
+      NghPartitionMetaPage page) {
+    return PartitionLocalStats(
+      partitionNo: page.partitionNo,
+      dataCategory: page.dataCategory,
+      totalEntries: page.totalEntries,
+      fileSizeInBytes: page.fileSizeInBytes,
+      freeListHeadPageNo: page.freeListHeadPageNo,
+      freePageCount: page.freePageCount,
+    );
+  }
+}
