@@ -310,7 +310,7 @@ class TtlCleanupManager {
           if (ttlIndex != null && ttlIndex.indexUid.isNotEmpty) {
             try {
               final meta = await _dataStore.indexManager
-                  ?.getIndexMeta(table, ttlIndex.indexUid);
+                  ?.getIndexMeta(table.tableUid, ttlIndex.indexUid);
               if (meta != null) {
                 // Build pk -> index positions map to align deleted PKs with index keys.
                 final Map<String, List<Uint8List>> keysByPk = {};
