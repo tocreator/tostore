@@ -207,9 +207,6 @@ class TableDataMeta {
   // ==================== B+Tree Fields ====================
   // partitionNo = physical partition file number (0..btreePartitionCount-1).
 
-  /// Page size in bytes for B+Tree pages.
-  final int btreePageSize;
-
   /// Next page number in the active partition (last partition).
   ///
   /// NOTE: pageNo=0 is reserved for `PartitionMetaPage`, so valid data pages start at 1.
@@ -237,7 +234,6 @@ class TableDataMeta {
     required this.totalRecords,
     required this.timestamps,
     this.maxAutoIncrementId,
-    required this.btreePageSize,
     required this.btreeNextPageNo,
     required this.btreePartitionCount,
     required this.btreeRoot,
@@ -246,25 +242,17 @@ class TableDataMeta {
     required this.btreeHeight,
   }) : version = version ?? InternalConfig.tableDataVersion;
 
-  /// Default page size for B+Tree pages (16KB).
-  static const int defaultPageSize = 16 * 1024;
-
   /// First data page number (pageNo=0 is reserved for [PartitionMetaPage]).
   static const int firstDataPageNo = 1;
 
   /// Creates an initial empty [TableDataMeta] with default B+Tree configuration.
   ///
   /// [tableUid] - The table unique identifier.
-  /// [pageSize] - Page size in bytes (default: 16KB).
   /// [partitionCount] - Initial partition count (default: 1).
   /// [now] - Optional timestamp override; uses current time if not provided.
   ///
-  /// This is the canonical way to create an initial [TableDataMeta] when:
-  /// - Creating a new table
-  /// - Clearing an existing table (with optional preserved pageSize/partitionCount)
   static TableDataMeta createEmpty({
     required TableUid tableUid,
-    int pageSize = defaultPageSize,
     int partitionCount = 1,
     DateTime? now,
   }) {
@@ -274,7 +262,6 @@ class TableDataMeta {
       totalSizeInBytes: 0,
       totalRecords: 0,
       timestamps: Timestamps(created: timestamp, modified: timestamp),
-      btreePageSize: pageSize,
       btreeNextPageNo: firstDataPageNo,
       btreePartitionCount: partitionCount,
       btreeRoot: TreePagePtr.nullPtr,
@@ -291,7 +278,6 @@ class TableDataMeta {
     int? totalRecords,
     Timestamps? timestamps,
     String? maxAutoIncrementId,
-    int? btreePageSize,
     int? btreeNextPageNo,
     int? btreePartitionCount,
     TreePagePtr? btreeRoot,
@@ -306,7 +292,6 @@ class TableDataMeta {
       totalRecords: totalRecords ?? this.totalRecords,
       timestamps: timestamps ?? this.timestamps,
       maxAutoIncrementId: maxAutoIncrementId ?? this.maxAutoIncrementId,
-      btreePageSize: btreePageSize ?? this.btreePageSize,
       btreeNextPageNo: btreeNextPageNo ?? this.btreeNextPageNo,
       btreePartitionCount: btreePartitionCount ?? this.btreePartitionCount,
       btreeRoot: btreeRoot ?? this.btreeRoot,
@@ -329,7 +314,6 @@ class TableDataMeta {
         json['totalSizeInBytes'] == null ||
         json['totalRecords'] == null ||
         json['timestamps'] == null ||
-        json['btreePageSize'] == null ||
         json['btreeNextPageNo'] == null ||
         json['btreePartitionCount'] == null ||
         json['btreeRoot'] == null ||
@@ -345,7 +329,6 @@ class TableDataMeta {
             if (json['totalSizeInBytes'] == null) 'totalSizeInBytes',
             if (json['totalRecords'] == null) 'totalRecords',
             if (json['timestamps'] == null) 'timestamps',
-            if (json['btreePageSize'] == null) 'btreePageSize',
             if (json['btreeNextPageNo'] == null) 'btreeNextPageNo',
             if (json['btreePartitionCount'] == null) 'btreePartitionCount',
             if (json['btreeRoot'] == null) 'btreeRoot',
@@ -370,7 +353,6 @@ class TableDataMeta {
       timestamps:
           Timestamps.fromJson(json['timestamps'] as Map<String, dynamic>),
       maxAutoIncrementId: json['maxAutoIncrementId'] as String?,
-      btreePageSize: (json['btreePageSize'] as num).toInt(),
       btreeNextPageNo: (json['btreeNextPageNo'] as num).toInt(),
       btreePartitionCount: (json['btreePartitionCount'] as num).toInt(),
       btreeRoot:
@@ -392,7 +374,6 @@ class TableDataMeta {
       'totalRecords': totalRecords,
       'timestamps': timestamps.toJson(),
       if (maxAutoIncrementId != null) 'maxAutoIncrementId': maxAutoIncrementId,
-      'btreePageSize': btreePageSize,
       'btreeNextPageNo': btreeNextPageNo,
       'btreePartitionCount': btreePartitionCount,
       'btreeRoot': btreeRoot.toJson(),
@@ -929,9 +910,6 @@ class IndexMeta {
   // ==================== B+Tree Fields ====================
   // partitionNo = physical partition file number (0..btreePartitionCount-1).
 
-  /// Page size in bytes for B+Tree pages.
-  final int btreePageSize;
-
   /// Next page number in the active partition (last partition).
   ///
   /// NOTE: pageNo=0 is reserved for `PartitionMetaPage`, so valid data pages start at 1.
@@ -961,7 +939,6 @@ class IndexMeta {
     required this.timestamps,
     this.totalSizeInBytes = 0,
     this.totalEntries = 0,
-    required this.btreePageSize,
     required this.btreeNextPageNo,
     required this.btreePartitionCount,
     required this.btreeRoot,
@@ -970,26 +947,16 @@ class IndexMeta {
     required this.btreeHeight,
   }) : version = version ?? InternalConfig.indexVersion;
 
-  /// Default page size for B+Tree pages (16KB).
-  static const int defaultPageSize = 16 * 1024;
-
   /// First data page number (pageNo=0 is reserved for [PartitionMetaPage]).
   static const int firstDataPageNo = 1;
 
   /// Creates an initial empty [IndexMeta] with default B+Tree configuration.
   ///
-  /// [indexUid] - The index unique identifier.
-  /// [tableUid] - The table unique identifier.
-  /// [isUnique] - Whether this is a unique index.
-  /// [pageSize] - Page size in bytes (default: 16KB).
-  /// [partitionCount] - Initial partition count (default: 1).
-  /// [now] - Optional timestamp override; uses current time if not provided.
   static IndexMeta createEmpty({
     required IndexUid indexUid,
     required TableUid tableUid,
     required bool isUnique,
     bool isBuilding = false,
-    int pageSize = defaultPageSize,
     int partitionCount = 1,
     DateTime? now,
   }) {
@@ -1002,7 +969,6 @@ class IndexMeta {
       timestamps: Timestamps(created: timestamp, modified: timestamp),
       totalSizeInBytes: 0,
       totalEntries: 0,
-      btreePageSize: pageSize,
       btreeNextPageNo: firstDataPageNo,
       btreePartitionCount: partitionCount,
       btreeRoot: TreePagePtr.nullPtr,
@@ -1021,7 +987,6 @@ class IndexMeta {
     Timestamps? timestamps,
     int? totalSizeInBytes,
     int? totalEntries,
-    int? btreePageSize,
     int? btreeNextPageNo,
     int? btreePartitionCount,
     TreePagePtr? btreeRoot,
@@ -1038,7 +1003,6 @@ class IndexMeta {
       timestamps: timestamps ?? this.timestamps,
       totalSizeInBytes: totalSizeInBytes ?? this.totalSizeInBytes,
       totalEntries: totalEntries ?? this.totalEntries,
-      btreePageSize: btreePageSize ?? this.btreePageSize,
       btreeNextPageNo: btreeNextPageNo ?? this.btreeNextPageNo,
       btreePartitionCount: btreePartitionCount ?? this.btreePartitionCount,
       btreeRoot: btreeRoot ?? this.btreeRoot,
@@ -1061,7 +1025,6 @@ class IndexMeta {
         resolvedTableUid == null ||
         json['isUnique'] == null ||
         json['timestamps'] == null ||
-        json['btreePageSize'] == null ||
         json['btreeNextPageNo'] == null ||
         json['btreePartitionCount'] == null ||
         json['btreeRoot'] == null ||
@@ -1076,7 +1039,6 @@ class IndexMeta {
             if (resolvedTableUid == null) 'tableUid',
             if (json['isUnique'] == null) 'isUnique',
             if (json['timestamps'] == null) 'timestamps',
-            if (json['btreePageSize'] == null) 'btreePageSize',
             if (json['btreeNextPageNo'] == null) 'btreeNextPageNo',
             if (json['btreePartitionCount'] == null) 'btreePartitionCount',
             if (json['btreeRoot'] == null) 'btreeRoot',
@@ -1099,7 +1061,6 @@ class IndexMeta {
           Timestamps.fromJson(json['timestamps'] as Map<String, dynamic>),
       totalSizeInBytes: (json['totalSizeInBytes'] as num?)?.toInt() ?? 0,
       totalEntries: (json['totalEntries'] as num?)?.toInt() ?? 0,
-      btreePageSize: (json['btreePageSize'] as num).toInt(),
       btreeNextPageNo: (json['btreeNextPageNo'] as num).toInt(),
       btreePartitionCount: (json['btreePartitionCount'] as num).toInt(),
       btreeRoot:
@@ -1122,7 +1083,6 @@ class IndexMeta {
       'totalSizeInBytes': totalSizeInBytes,
       'totalEntries': totalEntries,
       'timestamps': timestamps.toJson(),
-      'btreePageSize': btreePageSize,
       'btreeNextPageNo': btreeNextPageNo,
       'btreePartitionCount': btreePartitionCount,
       'btreeRoot': btreeRoot.toJson(),
