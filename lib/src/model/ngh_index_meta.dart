@@ -79,9 +79,6 @@ class NghIndexMeta {
 
   // ===================== Partition Layout ======================
 
-  /// Page size in bytes for all NGH page types.
-  final int nghPageSize;
-
   /// Number of graph partition files.
   final int graphPartitionCount;
 
@@ -131,37 +128,39 @@ class NghIndexMeta {
   final Map<int, int> rawVectorFreeListHeads;
 
   // ===================== Derived Constants ====================
-  // Computed once from (dimensions, maxDegree, pqSubspaces, nghPageSize).
 
   /// Bytes per graph node slot: 1(flags) + 1(degree) + maxDegree*4(neighbors).
   int get graphNodeSlotSize => 2 + maxDegree * 4;
 
   /// Number of node slots that fit in one graph page.
-  int get nodesPerGraphPage =>
-      NghPageSizer.nodesPerGraphPage(nghPageSize, maxDegree);
+  int nodesPerGraphPage(int pageSize) =>
+      NghPageSizer.nodesPerGraphPage(pageSize, maxDegree);
 
   /// Bytes per PQ code entry.
   int get pqCodeEntrySize => pqSubspaces;
 
   /// Number of PQ entries that fit in one PQ-code page.
-  int get vectorsPerPqPage =>
-      NghPageSizer.vectorsPerPqPage(nghPageSize, pqSubspaces);
+  int vectorsPerPqPage(int pageSize) =>
+      NghPageSizer.vectorsPerPqPage(pageSize, pqSubspaces);
 
   /// Bytes per raw vector: dimensions × bytesPerElement.
   int get rawVectorEntrySize => dimensions * _bytesPerElement;
 
   /// Number of raw vectors that fit in one raw-vector page.
-  int get vectorsPerRawPage =>
-      NghPageSizer.vectorsPerRawPage(nghPageSize, dimensions, _bytesPerElement);
+  int vectorsPerRawPage(int pageSize) =>
+      NghPageSizer.vectorsPerRawPage(pageSize, dimensions, _bytesPerElement);
 
   /// Maximum logical graph pages per partition file.
-  int get graphPagesPerPartition => _maxPagesPerPartitionFile;
+  int graphPagesPerPartition(int pageSize) =>
+      _maxPagesPerPartitionFile(pageSize);
 
   /// Maximum logical PQ-code pages per partition file.
-  int get pqCodePagesPerPartition => _maxPagesPerPartitionFile;
+  int pqCodePagesPerPartition(int pageSize) =>
+      _maxPagesPerPartitionFile(pageSize);
 
   /// Maximum logical raw-vector pages per partition file.
-  int get rawVectorPagesPerPartition => _maxPagesPerPartitionFile;
+  int rawVectorPagesPerPartition(int pageSize) =>
+      _maxPagesPerPartitionFile(pageSize);
 
   // ===================== Private Helpers =======================
 
@@ -176,7 +175,11 @@ class NghIndexMeta {
     }
   }
 
-  int get _maxPagesPerPartitionFile => _maxPartitionFileSize ~/ nghPageSize;
+  int _maxPagesPerPartitionFile(int pageSize) =>
+      _maxPartitionFileSize ~/ pageSize;
+
+  /// Snapshot of the per-partition file size limit used when this meta was created.
+  int get maxPartitionFileSizeBytes => _maxPartitionFileSize;
 
   /// Placeholder — the actual limit is injected from [DataStoreConfig].
   /// We store a snapshot so the meta is self-contained.
@@ -203,7 +206,6 @@ class NghIndexMeta {
     this.deletedCount = 0,
     this.medoidNodeId = -1,
     this.nextNodeId = 0,
-    this.nghPageSize = defaultPageSize,
     this.graphPartitionCount = 1,
     this.graphNextPageNo = firstDataPageNo,
     this.pqCodePartitionCount = 1,
@@ -224,9 +226,6 @@ class NghIndexMeta {
         _maxPartitionFileSize = maxPartitionFileSize;
 
   // ===================== Defaults ==============================
-
-  /// Default page size for NGH pages (16 KB).
-  static const int defaultPageSize = 16 * 1024;
 
   /// First data page number (pageNo=0 reserved for per-file meta).
   static const int firstDataPageNo = 1;
@@ -253,7 +252,6 @@ class NghIndexMeta {
     int? constructionEf,
     double? pruneAlpha,
     int? pqSubspaces,
-    int pageSize = defaultPageSize,
     int maxPartitionFileSize = 16 * 1024 * 1024,
     DateTime? now,
   }) {
@@ -271,7 +269,6 @@ class NghIndexMeta {
       constructionEf: constructionEf ?? 128,
       pruneAlpha: pruneAlpha ?? 1.2,
       pqSubspaces: m,
-      nghPageSize: pageSize,
       maxPartitionFileSize: maxPartitionFileSize,
     );
   }
@@ -297,7 +294,6 @@ class NghIndexMeta {
     int? deletedCount,
     int? medoidNodeId,
     int? nextNodeId,
-    int? nghPageSize,
     int? graphPartitionCount,
     int? graphNextPageNo,
     int? pqCodePartitionCount,
@@ -331,7 +327,6 @@ class NghIndexMeta {
       deletedCount: deletedCount ?? this.deletedCount,
       medoidNodeId: medoidNodeId ?? this.medoidNodeId,
       nextNodeId: nextNodeId ?? this.nextNodeId,
-      nghPageSize: nghPageSize ?? this.nghPageSize,
       graphPartitionCount: graphPartitionCount ?? this.graphPartitionCount,
       graphNextPageNo: graphNextPageNo ?? this.graphNextPageNo,
       pqCodePartitionCount: pqCodePartitionCount ?? this.pqCodePartitionCount,
@@ -374,8 +369,6 @@ class NghIndexMeta {
       deletedCount: (json['deletedCount'] as num?)?.toInt() ?? 0,
       medoidNodeId: (json['medoidNodeId'] as num?)?.toInt() ?? -1,
       nextNodeId: (json['nextNodeId'] as num?)?.toInt() ?? 0,
-      nghPageSize: (json['nghPageSize'] as num?)?.toInt() ??
-          NghIndexMeta.defaultPageSize,
       graphPartitionCount: (json['graphPartitionCount'] as num?)?.toInt() ?? 1,
       graphNextPageNo:
           (json['graphNextPageNo'] as num?)?.toInt() ?? firstDataPageNo,
@@ -422,7 +415,6 @@ class NghIndexMeta {
       'deletedCount': deletedCount,
       'medoidNodeId': medoidNodeId,
       'nextNodeId': nextNodeId,
-      'nghPageSize': nghPageSize,
       'graphPartitionCount': graphPartitionCount,
       'graphNextPageNo': graphNextPageNo,
       'pqCodePartitionCount': pqCodePartitionCount,
@@ -442,46 +434,50 @@ class NghIndexMeta {
   // ===================== Node → Page Mapping ===================
 
   /// Compute the graph partition file number for a given [nodeId].
-  int graphPartitionForNode(int nodeId) {
-    final logicalPage = nodeId ~/ nodesPerGraphPage;
-    return logicalPage ~/ graphPagesPerPartition;
+  int graphPartitionForNode(int nodeId, int pageSize) {
+    final logicalPage = nodeId ~/ nodesPerGraphPage(pageSize);
+    return logicalPage ~/ graphPagesPerPartition(pageSize);
   }
 
   /// Compute the local page number within its graph partition for [nodeId].
-  int graphLocalPageForNode(int nodeId) {
-    final logicalPage = nodeId ~/ nodesPerGraphPage;
+  int graphLocalPageForNode(int nodeId, int pageSize) {
+    final logicalPage = nodeId ~/ nodesPerGraphPage(pageSize);
     // +1 because pageNo=0 is meta page in each partition file
-    return firstDataPageNo + (logicalPage % graphPagesPerPartition);
+    return firstDataPageNo + (logicalPage % graphPagesPerPartition(pageSize));
   }
 
   /// Compute the slot index within its graph page for [nodeId].
-  int graphSlotForNode(int nodeId) => nodeId % nodesPerGraphPage;
+  int graphSlotForNode(int nodeId, int pageSize) =>
+      nodeId % nodesPerGraphPage(pageSize);
 
   /// Compute the PQ-code partition and local page for [nodeId].
-  int pqPartitionForNode(int nodeId) {
-    final logicalPage = nodeId ~/ vectorsPerPqPage;
-    return logicalPage ~/ pqCodePagesPerPartition;
+  int pqPartitionForNode(int nodeId, int pageSize) {
+    final logicalPage = nodeId ~/ vectorsPerPqPage(pageSize);
+    return logicalPage ~/ pqCodePagesPerPartition(pageSize);
   }
 
-  int pqLocalPageForNode(int nodeId) {
-    final logicalPage = nodeId ~/ vectorsPerPqPage;
-    return firstDataPageNo + (logicalPage % pqCodePagesPerPartition);
+  int pqLocalPageForNode(int nodeId, int pageSize) {
+    final logicalPage = nodeId ~/ vectorsPerPqPage(pageSize);
+    return firstDataPageNo + (logicalPage % pqCodePagesPerPartition(pageSize));
   }
 
-  int pqSlotForNode(int nodeId) => nodeId % vectorsPerPqPage;
+  int pqSlotForNode(int nodeId, int pageSize) =>
+      nodeId % vectorsPerPqPage(pageSize);
 
   /// Compute the raw-vector partition and local page for [nodeId].
-  int rawVectorPartitionForNode(int nodeId) {
-    final logicalPage = nodeId ~/ vectorsPerRawPage;
-    return logicalPage ~/ rawVectorPagesPerPartition;
+  int rawVectorPartitionForNode(int nodeId, int pageSize) {
+    final logicalPage = nodeId ~/ vectorsPerRawPage(pageSize);
+    return logicalPage ~/ rawVectorPagesPerPartition(pageSize);
   }
 
-  int rawVectorLocalPageForNode(int nodeId) {
-    final logicalPage = nodeId ~/ vectorsPerRawPage;
-    return firstDataPageNo + (logicalPage % rawVectorPagesPerPartition);
+  int rawVectorLocalPageForNode(int nodeId, int pageSize) {
+    final logicalPage = nodeId ~/ vectorsPerRawPage(pageSize);
+    return firstDataPageNo +
+        (logicalPage % rawVectorPagesPerPartition(pageSize));
   }
 
-  int rawVectorSlotForNode(int nodeId) => nodeId % vectorsPerRawPage;
+  int rawVectorSlotForNode(int nodeId, int pageSize) =>
+      nodeId % vectorsPerRawPage(pageSize);
 
   // ===================== Private Helpers =======================
 
