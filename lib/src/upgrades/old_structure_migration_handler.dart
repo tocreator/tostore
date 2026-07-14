@@ -335,7 +335,7 @@ class OldStructureMigrationHandler {
           // get new table auto increment ID file path
           final table = await dataStore.getTableContext(tableName);
           final fileMeta =
-              await dataStore.tableDataManager.getTableDataMeta(table);
+              await dataStore.tableDataManager.getTableDataMeta(table.tableUid);
           if (fileMeta != null) {
             await dataStore.tableDataManager.updateTableDataMeta(
                 table, fileMeta.copyWith(maxAutoIncrementId: maxId.toString()));
