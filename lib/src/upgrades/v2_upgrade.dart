@@ -62,9 +62,12 @@ class V2Upgrade {
     }
 
     // After all spaces upgraded successfully, bump GlobalConfig.version
-    final updatedGlobal =
-        oldGlobalConfig.setVersion(InternalConfig.engineVersion);
-    await _dataStore.saveGlobalConfig(updatedGlobal);
+    // Prefer config already updated by v3 (pageSize, etc.).
+    final currentGlobal =
+        await _dataStore.getGlobalConfig() ?? oldGlobalConfig;
+    await _dataStore.saveGlobalConfig(
+      currentGlobal.setVersion(InternalConfig.engineVersion),
+    );
 
     Logger.info(
       'Database upgrade to version 2 completed',
@@ -427,14 +430,11 @@ class V2Upgrade {
         'Found ${oldPartitionMetas.length} old partitions for table: $tableName',
       );
 
-      // Delete new ranges directory and data meta file to avoid data migration confusion
+      // Delete btree partitions written by an earlier partial upgrade / empty stub.
+      // After v3, tree meta lives in partition-0 page0 (no data/meta.json).
       final newRangesPath = await db.pathManager.getPartitionsDirPath(tableUid);
-      final newDataMetaPath = await db.pathManager.getDataMetaPath(tableUid);
       if (await db.storage.existsDirectory(newRangesPath)) {
         await db.storage.deleteDirectory(newRangesPath);
-      }
-      if (await db.storage.existsFile(newDataMetaPath)) {
-        await db.storage.deleteFile(newDataMetaPath);
       }
 
       // delete index root directory
