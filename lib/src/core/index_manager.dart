@@ -81,6 +81,13 @@ class IndexManager {
         ?.clearPageCacheForIndex(table, indexUid);
   }
 
+  /// Invalidate cached [IndexMeta] after external partition-0 rewrite (redo replay).
+  void invalidateIndexMetaCache(TableUid tableUid, IndexUid indexUid) {
+    if (indexUid.isEmpty) return;
+    _indexMetaCache.remove([tableUid, indexUid]);
+    _metaLoadingFutures.remove(_getMetaLoadingKey(tableUid, indexUid));
+  }
+
   /// Resolve [uidOrName] to an [IndexUid].
   ///
   /// 1. Treat as [IndexUid] and do O(1) schema lookup by uid.
