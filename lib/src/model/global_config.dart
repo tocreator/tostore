@@ -17,6 +17,15 @@ class GlobalConfig {
   /// migration for on-disk directory layout.
   final int maxEntriesPerDir;
 
+  /// Fixed B+Tree / NGH page size for this database.
+  ///
+  /// Set once at first init or v3 upgrade and **never changed** afterward.
+  /// All table / index / vector trees use this value.
+  ///
+  /// `0` means unset (legacy GlobalConfig before pageSize was persisted);
+  /// callers should treat that via [hasConfiguredPageSize] and fill during upgrade.
+  final int pageSize;
+
   /// all created space names
   final Set<String> spaceNames;
 
@@ -32,6 +41,7 @@ class GlobalConfig {
     int? version,
     int? userVersion,
     int? maxEntriesPerDir,
+    int? pageSize,
     Set<String>? spaceNames,
     this.activeSpace,
     this.hasMigrationTask = false,
@@ -39,16 +49,24 @@ class GlobalConfig {
         userVersion = userVersion ?? 0,
         maxEntriesPerDir =
             maxEntriesPerDir ?? InternalConfig.defaultMaxEntriesPerDir,
+        pageSize = pageSize ?? InternalConfig.defaultPageSize,
         spaceNames = spaceNames ?? {'default'};
+
+  /// True when [pageSize] was persisted (legacy files may have 0 until v3).
+  bool get hasConfiguredPageSize => pageSize > 0;
 
   /// create from json
   factory GlobalConfig.fromJson(Map<String, dynamic> json) {
+    final rawPageSize = json['pageSize'];
     return GlobalConfig(
       version: resolveVersionValue(
           json['version'], InternalConfig.legacyEngineVersion),
       userVersion: resolveVersionValue(json['userVersion'], 0),
       maxEntriesPerDir: resolveVersionValue(
           json['maxEntriesPerDir'], InternalConfig.defaultMaxEntriesPerDir),
+      // Missing key → 0 (unset), must NOT default here or v3 loses the signal
+      // to sample page size from existing table meta.
+      pageSize: rawPageSize == null ? 0 : (rawPageSize as num).toInt(),
       spaceNames: (json['spaceNames'] as List<dynamic>?)
               ?.map((e) => e as String)
               .toSet() ??
@@ -64,6 +82,7 @@ class GlobalConfig {
       'version': version,
       'userVersion': userVersion,
       'maxEntriesPerDir': maxEntriesPerDir,
+      if (pageSize > 0) 'pageSize': pageSize,
       'spaceNames': spaceNames.toList(),
       if (activeSpace != null) 'activeSpace': activeSpace!,
       'hasMigrationTask': hasMigrationTask,
@@ -72,19 +91,30 @@ class GlobalConfig {
 
   /// create a copy and modify some fields
   /// [clearActiveSpace] when true, sets [activeSpace] to null (e.g. for logout).
+  ///
+  /// [pageSize] may only be set when the current value is unset (`<= 0`);
+  /// a configured page size is immutable for the database lifetime.
   GlobalConfig copyWith({
     int? version,
     int? userVersion,
     int? maxEntriesPerDir,
+    int? pageSize,
     Set<String>? spaceNames,
     String? activeSpace,
     bool clearActiveSpace = false,
     bool? hasMigrationTask,
   }) {
+    final int nextPageSize;
+    if (hasConfiguredPageSize) {
+      nextPageSize = this.pageSize;
+    } else {
+      nextPageSize = pageSize ?? this.pageSize;
+    }
     return GlobalConfig(
       version: version ?? this.version,
       userVersion: userVersion ?? this.userVersion,
       maxEntriesPerDir: maxEntriesPerDir ?? this.maxEntriesPerDir,
+      pageSize: nextPageSize,
       spaceNames: spaceNames ?? this.spaceNames,
       activeSpace: clearActiveSpace ? null : (activeSpace ?? this.activeSpace),
       hasMigrationTask: hasMigrationTask ?? this.hasMigrationTask,
