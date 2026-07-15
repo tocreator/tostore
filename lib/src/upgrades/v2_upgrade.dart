@@ -63,8 +63,7 @@ class V2Upgrade {
 
     // After all spaces upgraded successfully, bump GlobalConfig.version
     // Prefer config already updated by v3 (pageSize, etc.).
-    final currentGlobal =
-        await _dataStore.getGlobalConfig() ?? oldGlobalConfig;
+    final currentGlobal = await _dataStore.getGlobalConfig() ?? oldGlobalConfig;
     await _dataStore.saveGlobalConfig(
       currentGlobal.setVersion(InternalConfig.engineVersion),
     );
