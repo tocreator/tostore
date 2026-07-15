@@ -2,6 +2,9 @@ import 'dart:typed_data';
 
 import '../core/btree_page.dart';
 import '../core/ngh_page.dart';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import 'binary_codec.dart';
 import 'common.dart';
 import 'platform_byte_data.dart';
@@ -289,7 +292,12 @@ final class TableDataMetaCodec {
 
     final resolvedUid = tableUid ?? tableUidFallback;
     if (resolvedUid == null || timestamps == null) {
-      throw StateError('Incomplete TableDataMeta binary payload');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.sysInvalidDataFormat,
+          message: 'Incomplete TableDataMeta binary payload',
+        ),
+      ]);
     }
 
     return TableDataMeta(
@@ -422,7 +430,12 @@ final class IndexMetaCodec {
     if (resolvedIndexUid == null ||
         resolvedTableUid == null ||
         timestamps == null) {
-      throw StateError('Incomplete IndexMeta binary payload');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.sysInvalidDataFormat,
+          message: 'Incomplete IndexMeta binary payload',
+        ),
+      ]);
     }
 
     return IndexMeta(
@@ -673,7 +686,12 @@ final class NghIndexMetaCodec {
         resolvedTableUid == null ||
         timestamps == null ||
         dimensions <= 0) {
-      throw StateError('Incomplete NghIndexMeta binary payload');
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.sysInvalidDataFormat,
+          message: 'Incomplete NghIndexMeta binary payload',
+        ),
+      ]);
     }
 
     return NghIndexMeta(
