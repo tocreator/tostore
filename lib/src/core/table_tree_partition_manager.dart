@@ -763,8 +763,16 @@ final class TableTreePartitionManager {
             stats.oldFileSizeInBytes = local.fileSizeInBytes;
             stats.oldFreeListHeadPageNo = local.freeListHeadPageNo;
             stats.oldFreePageCount = local.freePageCount;
+            stats.oldFlushBatchKey = local.lastFlushBatchKey;
+            stats.oldMaintBatchKey = local.lastMaintenanceBatchKey;
             stats.freeListHeadPageNo = local.freeListHeadPageNo;
             stats.freePageCount = local.freePageCount;
+            if (batchContext != null && batchContext.batchId.isNotEmpty) {
+              stats.alreadyDurableForBatch = local.matchesBatchKey(
+                isMaintenance: batchContext.batchType == BatchType.maintenance,
+                batchId: batchContext.batchId,
+              );
+            }
           } else {
             stats.oldFileSizeInBytes = await _storage.getFileSize(stats.path!);
           }
@@ -1615,8 +1623,17 @@ final class TableTreePartitionManager {
               stats.oldFileSizeInBytes = local.fileSizeInBytes;
               stats.oldFreeListHeadPageNo = local.freeListHeadPageNo;
               stats.oldFreePageCount = local.freePageCount;
+              stats.oldFlushBatchKey = local.lastFlushBatchKey;
+              stats.oldMaintBatchKey = local.lastMaintenanceBatchKey;
               stats.freeListHeadPageNo = local.freeListHeadPageNo;
               stats.freePageCount = local.freePageCount;
+              if (batchContext != null && batchContext.batchId.isNotEmpty) {
+                stats.alreadyDurableForBatch = local.matchesBatchKey(
+                  isMaintenance:
+                      batchContext.batchType == BatchType.maintenance,
+                  batchId: batchContext.batchId,
+                );
+              }
             } else {
               // Legacy file without meta page. Fall back to file size only.
               stats.oldFileSizeInBytes =
@@ -1647,22 +1664,29 @@ final class TableTreePartitionManager {
       final int newSize = max(oldSize, computedSize);
 
       if (pNo != 0) {
-        final metaBytes =
-            _dataStore.treeMetaPageService.buildPartitionPage0Bytes(
-          pageSize: pageSize,
-          partitionNo: pNo,
-          pageType: BTreePageType.meta,
-          partitionLocal: PartitionLocalStats(
+        if (!stats.alreadyDurableForBatch) {
+          final metaBytes =
+              _dataStore.treeMetaPageService.buildPartitionPage0Bytes(
+            pageSize: pageSize,
             partitionNo: pNo,
-            totalEntries: newEntries,
-            fileSizeInBytes: newSize,
-            freeListHeadPageNo: stats.freeListHeadPageNo,
-            freePageCount: stats.freePageCount,
-          ),
-          encryptionKey: encryptionKey,
-          encryptionKeyId: encryptionKeyId,
-        );
-        stageWrite(stats.path!, 0, metaBytes);
+            pageType: BTreePageType.meta,
+            partitionLocal: PartitionLocalStats(
+              partitionNo: pNo,
+              totalEntries: newEntries,
+              fileSizeInBytes: newSize,
+              freeListHeadPageNo: stats.freeListHeadPageNo,
+              freePageCount: stats.freePageCount,
+            ).withBatchMarkers(
+              isMaintenance: batchContext?.batchType == BatchType.maintenance,
+              batchId: batchContext?.batchId,
+              preservedFlushKey: stats.oldFlushBatchKey,
+              preservedMaintKey: stats.oldMaintBatchKey,
+            ),
+            encryptionKey: encryptionKey,
+            encryptionKeyId: encryptionKeyId,
+          );
+          stageWrite(stats.path!, 0, metaBytes);
+        }
       }
 
       // IMPORTANT: global totals delta must not depend on reading old partition meta page
@@ -1671,25 +1695,6 @@ final class TableTreePartitionManager {
       final int partitionSizeDelta = newSize - oldSize;
       recordsDeltaSum += partitionRecordsDelta;
       sizeDeltaSum += partitionSizeDelta;
-
-      // For maintenance batches, record per-partition delta in journal for efficient recovery
-      if (batchContext != null &&
-          batchContext.batchType == BatchType.maintenance &&
-          (partitionRecordsDelta != 0 || partitionSizeDelta != 0)) {
-        // Calculate current table totals after this partition's changes
-        final currentTotalRecords = max(0, meta.totalRecords + recordsDeltaSum);
-        final currentTotalSize = max(0, meta.totalSizeInBytes + sizeDeltaSum);
-        await _dataStore.parallelJournalManager.appendJournalEntry(
-          TablePartitionFlushedEntry(
-            table: tableUid,
-            partitionNo: pNo,
-            totalRecords: currentTotalRecords,
-            totalSizeInBytes: currentTotalSize,
-            batchId: batchContext.batchId,
-            batchType: batchContext.batchType,
-          ),
-        );
-      }
     }
 
     final now = DateTime.now();
@@ -1728,37 +1733,51 @@ final class TableTreePartitionManager {
         TreeGlobalMetaKind.table,
         TableDataMetaCodec.encode(updatedMeta),
       );
-      final p0Bytes = _dataStore.treeMetaPageService.buildPartitionPage0Bytes(
-        pageSize: pageSize,
-        partitionNo: 0,
-        pageType: BTreePageType.meta,
-        partitionLocal: PartitionLocalStats(
+      // Recovery may have rolled global totals back to batch-start base while
+      // some partition files already carry this batch's marker. If any sibling
+      // was previously marked durable, always rewrite p0 so recomputed totals
+      // land; never treat partition-0 alone as "whole tree done".
+      if (partitionStats.values.any((s) => s.alreadyDurableForBatch)) {
+        p0Stats.alreadyDurableForBatch = false;
+      }
+      if (!p0Stats.alreadyDurableForBatch) {
+        final p0Bytes = _dataStore.treeMetaPageService.buildPartitionPage0Bytes(
+          pageSize: pageSize,
           partitionNo: 0,
-          totalEntries: p0NewEntries,
-          fileSizeInBytes: p0NewSize,
-          freeListHeadPageNo: p0Stats.freeListHeadPageNo,
-          freePageCount: p0Stats.freePageCount,
-        ),
-        treeGlobalMeta: globalBlob,
-        encryptionKey: encryptionKey,
-        encryptionKeyId: encryptionKeyId,
-      );
-      stageWrite(p0Stats.path!, 0, p0Bytes);
+          pageType: BTreePageType.meta,
+          partitionLocal: PartitionLocalStats(
+            partitionNo: 0,
+            totalEntries: p0NewEntries,
+            fileSizeInBytes: p0NewSize,
+            freeListHeadPageNo: p0Stats.freeListHeadPageNo,
+            freePageCount: p0Stats.freePageCount,
+          ).withBatchMarkers(
+            isMaintenance: batchContext?.batchType == BatchType.maintenance,
+            batchId: batchContext?.batchId,
+            preservedFlushKey: p0Stats.oldFlushBatchKey,
+            preservedMaintKey: p0Stats.oldMaintBatchKey,
+          ),
+          treeGlobalMeta: globalBlob,
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+        );
+        stageWrite(p0Stats.path!, 0, p0Bytes);
 
-      if (batchContext != null) {
-        final redoPath = _dataStore.pathManager.getPageRedoLogPath(
-          batchContext.batchId,
-          spaceName: _dataStore.currentSpaceName,
-        );
-        await _storage.ensureDirectoryExists(p.dirname(redoPath));
-        final rec = PageRedoLogCodec.encodePageRecord(
-          treeKind: PageRedoTreeKind.table,
-          tableUid: table.tableUid,
-          partitionNo: 0,
-          pageNo: 0,
-          payload: p0Bytes,
-        );
-        await _storage.appendBytes(redoPath, rec, flush: true);
+        if (batchContext != null) {
+          final redoPath = _dataStore.pathManager.getPageRedoLogPath(
+            batchContext.batchId,
+            spaceName: _dataStore.currentSpaceName,
+          );
+          await _storage.ensureDirectoryExists(p.dirname(redoPath));
+          final rec = PageRedoLogCodec.encodePageRecord(
+            treeKind: PageRedoTreeKind.table,
+            tableUid: table.tableUid,
+            partitionNo: 0,
+            pageNo: 0,
+            payload: p0Bytes,
+          );
+          await _storage.appendBytes(redoPath, rec, flush: true);
+        }
       }
     }
 
@@ -1773,6 +1792,10 @@ final class TableTreePartitionManager {
       for (final e in staged.entries) {
         await flushYc.maybeYield();
         final path = e.key;
+        // Skip partition files already durable for this batch (crash recovery).
+        final durable = partitionStats.values
+            .any((s) => s.path == path && s.alreadyDurableForBatch);
+        if (durable) continue;
         final offsets = e.value.keys.toList(growable: false)..sort();
         final writes = <ByteWrite>[
           for (final off in offsets)
@@ -1838,18 +1861,6 @@ final class TableTreePartitionManager {
       encryptionKey: encryptionKey,
       encryptionKeyId: encryptionKeyId,
     );
-
-    // Mark table data metadata (partition-0 page0) as consistent for this batch.
-    // If this entry exists, recovery knows page0 global meta was committed.
-    if (batchContext != null) {
-      await _dataStore.parallelJournalManager.appendJournalEntry(
-        TableDataMetaUpdatedEntry(
-          table: tableUid,
-          batchId: batchContext.batchId,
-          batchType: batchContext.batchType,
-        ),
-      );
-    }
 
     // Log persistence statistics
     if (InternalConfig.showLoggerInternalLabel && totalRecords > 0) {
@@ -1918,6 +1929,8 @@ final class TableTreePartitionManager {
           if (local != null) {
             s.oldFileSizeInBytes = local.fileSizeInBytes;
             s.oldTotalEntries = local.totalEntries;
+            s.oldFlushBatchKey = local.lastFlushBatchKey;
+            s.oldMaintBatchKey = local.lastMaintenanceBatchKey;
             s.freeListHeadPageNo = local.freeListHeadPageNo;
             s.freePageCount = local.freePageCount;
           }
@@ -2146,6 +2159,11 @@ final class TableTreePartitionManager {
           fileSizeInBytes: newSize,
           freeListHeadPageNo: s.freeListHeadPageNo,
           freePageCount: s.freePageCount,
+        ).withBatchMarkers(
+          isMaintenance: batchContext?.batchType == BatchType.maintenance,
+          batchId: batchContext?.batchId,
+          preservedFlushKey: s.oldFlushBatchKey,
+          preservedMaintKey: s.oldMaintBatchKey,
         );
         if (pNo == 0) {
           final globalBlob = TreeGlobalMetaBlobCodec.encode(
@@ -3098,6 +3116,11 @@ final class _PartitionStats {
   bool headerLoaded = false;
   int oldTotalEntries = 0;
   int oldFileSizeInBytes = 0;
+  int oldFlushBatchKey = 0;
+  int oldMaintBatchKey = 0;
+
+  /// True when on-disk page0 already carries this batch's durable marker.
+  bool alreadyDurableForBatch = false;
 
   // Freelist state (per-partition).
   int oldFreeListHeadPageNo = -1;
