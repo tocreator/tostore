@@ -1,11 +1,13 @@
-﻿import 'dart:convert';
+import 'dart:convert';
 import 'package:path/path.dart' as path;
 import '../core/btree_page.dart';
 import '../core/data_store_impl.dart';
+import '../core/wal_manager.dart';
 import '../handler/common.dart';
 import '../handler/logger.dart';
 import '../handler/meta_binary_codec.dart';
 import '../model/global_config.dart';
+import '../model/parallel_journal_entry.dart';
 import '../model/table_schema.dart';
 import '../model/table_context.dart';
 import '../model/table_identity.dart';
@@ -20,6 +22,8 @@ import '../model/id_generator.dart';
 /// - Reads legacy meta.json once, writes TableDataMeta/IndexMeta/NghIndexMeta into
 ///   partition-0 page0, then deletes the JSON files (no intermediate JSON rewrite).
 /// - Writes `space_manifest.bin` deferred space metadata.
+/// - Migrates pending parallel-batch `tablePlan` out of A/B journal into WalMeta,
+///   then deletes `journal_a.log` / `journal_b.log`.
 /// - Bumps version config markers and cleans up legacy map properties.
 class V3Upgrade {
   final DataStoreImpl _dataStore;
@@ -367,9 +371,168 @@ class V3Upgrade {
       await _dataStore.storage.deleteFile(schemaMetaPathOld);
     }
 
+    // Migrate in-flight parallel batch plans from A/B journal into WalMeta,
+    // then delete legacy journal files.
+    for (final spaceName in spaces) {
+      await _migrateParallelJournalIntoWalMeta(spaceName);
+    }
+
     Logger.info(
       'Database upgrade to version 3 completed',
     );
+  }
+
+  /// Lift `BatchStart.tablePlan` from remnant A/B journals into
+  /// [PendingParallelBatch.tablePlans], then delete `journal_a/b.log`.
+  ///
+  /// Remnant-only: `journalFile` / `recoverStartOffset` are read from the raw
+  /// WAL meta JSON (not fields on [PendingParallelBatch]). Paths are built
+  /// under [PathManager.getPageRedoRootPath] — no A/B helpers in PathManager.
+  Future<void> _migrateParallelJournalIntoWalMeta(String spaceName) async {
+    final walMetaPath =
+        _dataStore.pathManager.getWalMainMetaPath(spaceName: spaceName);
+    WalMeta? meta;
+    Map<String, dynamic>? metaJson;
+    if (await _dataStore.storage.existsFile(walMetaPath)) {
+      try {
+        final content = await _dataStore.storage.readAsString(walMetaPath);
+        if (content != null && content.isNotEmpty) {
+          metaJson = jsonDecode(content) as Map<String, dynamic>;
+          meta = WalMeta.fromJson(metaJson);
+        }
+      } catch (e) {
+        Logger.warn('v3: failed to parse WAL meta for space $spaceName',
+            rawError: e);
+      }
+    }
+
+    if (meta != null && meta.pendingBatches.isNotEmpty) {
+      final rawPending =
+          (metaJson?['pendingBatches'] as List?) ?? const <dynamic>[];
+      final legacyByBatchId = <String, Map<String, dynamic>>{};
+      for (final item in rawPending) {
+        if (item is! Map) continue;
+        final raw = Map<String, dynamic>.from(item);
+        final id = raw['batchId'] as String?;
+        if (id != null && id.isNotEmpty) {
+          legacyByBatchId[id] = raw;
+        }
+      }
+
+      final migrated = <PendingParallelBatch>[];
+      var changed = false;
+      for (final batch in meta.pendingBatches) {
+        var plans = Map<TableUid, BatchTablePlan>.from(batch.tablePlans);
+        final raw = legacyByBatchId[batch.batchId];
+        final journalFile = raw?['journalFile'] as String?;
+        final recoverStartOffset =
+            (raw?['recoverStartOffset'] as num?)?.toInt() ?? 0;
+        final hadLegacyKeys = raw != null &&
+            (raw.containsKey('journalFile') ||
+                raw.containsKey('recoverStartOffset') ||
+                raw.containsKey('tables') ||
+                raw.containsKey('indexIds'));
+
+        final needsPlan = plans.isEmpty ||
+            plans.values.every((p) =>
+                p.baseTotalRecords == null && p.baseTotalSizeInBytes == null);
+        if (needsPlan && journalFile != null && journalFile.isNotEmpty) {
+          final fromJournal = await _readLegacyBatchStartTablePlans(
+            spaceName: spaceName,
+            journalFile: journalFile,
+            recoverStartOffset: recoverStartOffset,
+            batchId: batch.batchId,
+          );
+          if (fromJournal.isNotEmpty) {
+            plans = fromJournal;
+            changed = true;
+          }
+        }
+        if (hadLegacyKeys) changed = true;
+        migrated.add(batch.copyWith(tablePlans: plans));
+      }
+      if (changed) {
+        final updated = meta.copyWith(pendingBatches: migrated);
+        try {
+          await _dataStore.storage.writeAsString(
+            walMetaPath,
+            jsonEncode(updated.toJson()),
+            flush: true,
+          );
+          Logger.info(
+              'v3: migrated pending parallel batch tablePlans for space $spaceName');
+        } catch (e) {
+          Logger.warn(
+              'v3: failed to write migrated WAL meta for space $spaceName',
+              rawError: e);
+        }
+      }
+    }
+
+    // Remnant A/B files only — page_redo_* stays under the same root.
+    final redoRoot =
+        _dataStore.pathManager.getParallelJournalRootPath(spaceName: spaceName);
+    try {
+      for (final name in const ['journal_a.log', 'journal_b.log']) {
+        final p = path.join(redoRoot, name);
+        if (await _dataStore.storage.existsFile(p)) {
+          await _dataStore.storage.deleteFile(p);
+        }
+      }
+    } catch (e) {
+      Logger.warn(
+          'v3: failed to delete legacy parallel journals for space $spaceName',
+          rawError: e);
+    }
+  }
+
+  /// Remnant path: `parallel_journal/journal_a.log` or `journal_b.log`.
+  String _legacyAbJournalPath(String spaceName, String journalFile) {
+    final root =
+        _dataStore.pathManager.getParallelJournalRootPath(spaceName: spaceName);
+    final isB = journalFile == 'B' ||
+        journalFile == 'journal_b.log' ||
+        journalFile.endsWith('journal_b.log');
+    return path.join(root, isB ? 'journal_b.log' : 'journal_a.log');
+  }
+
+  /// Parse remnant JSONL A/B journal for this batch's `batchStart.tablePlan`.
+  Future<Map<TableUid, BatchTablePlan>> _readLegacyBatchStartTablePlans({
+    required String spaceName,
+    required String journalFile,
+    required int recoverStartOffset,
+    required String batchId,
+  }) async {
+    final journalPath = _legacyAbJournalPath(spaceName, journalFile);
+    final result = <TableUid, BatchTablePlan>{};
+    try {
+      if (!await _dataStore.storage.existsFile(journalPath)) return result;
+      final stream = _dataStore.storage
+          .readLinesStream(journalPath, offset: recoverStartOffset);
+      await for (final line in stream) {
+        if (line.isEmpty) continue;
+        try {
+          final json = jsonDecode(line);
+          if (json is! Map) continue;
+          final map = json.cast<String, dynamic>();
+          if (map['type'] != 'batchStart') continue;
+          if ((map['batchId'] as String?) != batchId) continue;
+          final rawPlan = (map['tablePlan'] as Map?) ??
+              (map['tablePlans'] as Map?) ??
+              const {};
+          rawPlan.forEach((k, v) {
+            result[TableUid(k.toString())] = BatchTablePlan.fromJson(
+                ((v as Map?) ?? const {}).cast<String, dynamic>());
+          });
+          if (result.isNotEmpty) break;
+        } catch (_) {}
+      }
+    } catch (e) {
+      Logger.warn(
+          'v3: failed to read legacy BatchStart tablePlan from $journalPath',
+          rawError: e);
+    }
+    return result;
   }
 
   Future<void> _migrateTableDirectory(String oldPath, String newPath,
