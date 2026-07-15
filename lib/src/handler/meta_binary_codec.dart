@@ -787,11 +787,59 @@ final class TreeGlobalMetaBlobCodec {
   }
 }
 
-/// Per-partition local statistics embedded in every partition file page 0.
+/// Per-partition local statistics embedded in every partition file page 0
+/// under [TreeMetaPagePayload] field 1 (length-delimited blob).
+///
+/// ## Wire evolution (append-only)
+///
+/// Fixed layout for the hot path (every partition open). Extensibility rules:
+///
+/// 1. **Append only** — new fields go after [payloadSize]; never reorder,
+///    shrink, or repurpose existing offsets.
+/// 2. **Bump [payloadVersion]** when appending; update [payloadSize] to the
+///    new encode length. Keep [minPayloadSize] at the v1 size (56) forever.
+/// 3. **Readers** require `bytes.length >= minPayloadSize`, decode the known
+///    prefix by offset/`version`, and **ignore trailing bytes** from newer
+///    writers (forward compatible).
+/// 4. **Writers** always emit exactly [payloadSize] for the current version.
+/// 5. **Breaking** layout changes need a new magic (e.g. `PLS2`), not a soft
+///    version bump — avoid dual on-disk PLS layouts inside `PLS1`.
+///
+/// Current layout (`payloadVersion == 1`, little-endian):
+///
+/// | Off | Len | Field |
+/// |----:|----:|-------|
+/// |   0 |   4 | magic `PLS1` |
+/// |   4 |   2 | payloadVersion |
+/// |   6 |   1 | dataCategory |
+/// |   7 |   1 | reserved |
+/// |   8 |   4 | partitionNo |
+/// |  12 |   4 | reserved |
+/// |  16 |   8 | totalEntries |
+/// |  24 |   8 | fileSizeInBytes |
+/// |  32 |   4 | freeListHeadPageNo |
+/// |  36 |   4 | freePageCount |
+/// |  40 |   8 | lastFlushBatchKey |
+/// |  48 |   8 | lastMaintenanceBatchKey |
 final class PartitionLocalStats {
   static const int payloadMagic = 0x31534C50; // 'PLS1'
+
+  /// Current schema version written by [encode].
   static const int payloadVersion = 1;
+
+  /// Smallest blob a reader of this library accepts (v1). Never decrease.
+  static const int minPayloadSize = 56;
+
+  /// Exact byte length produced by [encode] for [payloadVersion].
+  /// When appending fields: bump [payloadVersion] and set this to the new size.
   static const int payloadSize = 56;
+
+  /// Encoded size for a historical [version], or 0 if unknown/unsupported.
+  /// Used when decoding version-gated trailing fields.
+  static int encodedSizeForVersion(int version) {
+    if (version >= 1) return 56;
+    return 0;
+  }
 
   final int partitionNo;
   final int totalEntries;
@@ -892,13 +940,14 @@ final class PartitionLocalStats {
   }
 
   Uint8List encode() {
+    assert(payloadSize == encodedSizeForVersion(payloadVersion));
     final bd = ByteData(payloadSize);
     bd.setUint32(0, payloadMagic, Endian.little);
     bd.setUint16(4, payloadVersion, Endian.little);
     bd.setUint8(6, dataCategory);
-    bd.setUint8(7, 0);
+    bd.setUint8(7, 0); // reserved
     bd.setInt32(8, partitionNo, Endian.little);
-    bd.setInt32(12, 0, Endian.little);
+    bd.setInt32(12, 0, Endian.little); // reserved
     PlatformByteData.setInt64(bd, 16, totalEntries, Endian.little);
     PlatformByteData.setInt64(bd, 24, fileSizeInBytes, Endian.little);
     bd.setInt32(32, freeListHeadPageNo, Endian.little);
@@ -908,12 +957,20 @@ final class PartitionLocalStats {
     return bd.buffer.asUint8List();
   }
 
+  /// Decode PLS1 blob. Accepts current and newer (longer) blobs; rejects
+  /// truncated or unknown-magic input. Trailing bytes past the known prefix
+  /// are ignored (forward compatible with append-only writers).
   static PartitionLocalStats? tryDecode(Uint8List bytes) {
-    if (bytes.length < payloadSize) return null;
+    if (bytes.length < minPayloadSize) return null;
     final bd = ByteData.sublistView(bytes);
     if (bd.getUint32(0, Endian.little) != payloadMagic) return null;
-    final v = bd.getUint16(4, Endian.little);
-    if (v <= 0) return null;
+    final version = bd.getUint16(4, Endian.little);
+    if (version <= 0) return null;
+
+    // v1 prefix (offsets 0..55). Newer versions append after this; unread.
+    final v1Size = encodedSizeForVersion(1);
+    if (bytes.length < v1Size) return null;
+
     return PartitionLocalStats(
       dataCategory: bd.getUint8(6),
       partitionNo: bd.getInt32(8, Endian.little),
@@ -923,6 +980,10 @@ final class PartitionLocalStats {
       freePageCount: bd.getInt32(36, Endian.little),
       lastFlushBatchKey: PlatformByteData.getInt64(bd, 40, Endian.little),
       lastMaintenanceBatchKey: PlatformByteData.getInt64(bd, 48, Endian.little),
+      // Future append example:
+      // newField: (version >= 2 && bytes.length >= encodedSizeForVersion(2))
+      //     ? PlatformByteData.getInt64(bd, 56, Endian.little)
+      //     : 0,
     );
   }
 

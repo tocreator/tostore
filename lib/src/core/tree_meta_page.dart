@@ -13,8 +13,9 @@ abstract final class TreeMetaPageFieldId {
 
 /// Extensible page-0 payload for B+Tree / NGH partition files.
 ///
-/// Every partition file stores [partitionLocal] (field 1).
-/// Partition 0 additionally stores [treeGlobalMeta] (field 2) for tree-level metadata.
+/// Every partition file stores [partitionLocal] (field 1) — see
+/// [PartitionLocalStats] for the append-only blob evolution rules.
+/// Partition 0 additionally stores [treeGlobalMeta] (field 2).
 final class TreeMetaPagePayload {
   static const int payloadMagic = 0x31504D54; // 'TMP1'
   static const int schemaVersion = 1;
