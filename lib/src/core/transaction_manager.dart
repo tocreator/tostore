@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import '../handler/logger.dart';
+import '../handler/txn_encoder.dart';
 import '../model/buffer_entry.dart';
 import '../model/data_store_config.dart';
 import '../model/id_generator.dart';
@@ -239,13 +240,11 @@ class TransactionManager {
           .getTransactionPartitionDirPath(dirIndex, partitionIndex));
       final statusPath = _dataStore.pathManager
           .getTransactionPartitionStatusLogPathById(txId, dirIndex);
-      final statusLine = '${jsonEncode({
-            'transactionId': txId,
-            'event': 'begin',
-            'timestamp': DateTime.now().toIso8601String(),
-          })}\n';
-      await _dataStore.storage
-          .appendString(statusPath, statusLine, flush: false);
+      await _appendTxnEvent(
+        statusPath,
+        TxnLogEvent.simple(transactionId: txId, event: TxnLogEventType.begin),
+        partitionIndex,
+      );
     }
 
     // Track active transaction in memory for fast checks
@@ -286,12 +285,12 @@ class TransactionManager {
         .getTransactionPartitionDirPath(dirIndex, pIndex));
     final statusPath = _dataStore.pathManager
         .getTransactionPartitionStatusLogPathById(transactionId, dirIndex);
-    final statusLine = '${jsonEncode({
-          'transactionId': transactionId,
-          'event': 'commit',
-          'timestamp': DateTime.now().toIso8601String(),
-        })}\n';
-    await _dataStore.storage.appendString(statusPath, statusLine, flush: false);
+    await _appendTxnEvent(
+      statusPath,
+      TxnLogEvent.simple(
+          transactionId: transactionId, event: TxnLogEventType.commit),
+      pIndex,
+    );
 
     // Determine whether to persist recovery artifacts (WAL/log/meta/journal)
     final bool shouldPersistRecovery =
@@ -475,33 +474,43 @@ class TransactionManager {
           .getTransactionPartitionDirPath(currentDirIndex, currentIndex));
       final currentLogPath = _dataStore.pathManager
           .getTransactionPartitionLogPath(currentDirIndex, currentIndex);
-      final planLine = jsonEncode({
-        'transactionId': plan.transactionId,
-        'event': 'plan',
-        'timestamp': DateTime.now().toIso8601String(),
-        'plan': plan.toJson(),
-      });
+
+      final planEvent = TxnLogEvent.simple(
+        transactionId: plan.transactionId,
+        event: TxnLogEventType.plan,
+        plan: plan,
+      );
+      final planRecord = await TxnEncoder.encodeAsRecord(
+        planEvent,
+        currentIndex,
+        resolveTable: _resolveTxnTableCodec,
+      );
+
       // Use in-memory size cache to avoid frequent filesystem size calls
       _logSizeCache ??= <String, int>{};
       final cachedSize = _logSizeCache![currentLogPath];
       final int currentSize =
           cachedSize ?? await _dataStore.storage.getFileSize(currentLogPath);
-      final int planBytes = utf8.encode('$planLine\n').length;
+      final int planBytes = planRecord.length;
       final int threshold = _config.maxLogPartitionFileSize;
 
       if (currentSize > 0 && currentSize + planBytes > threshold) {
         // Mark continuation at tail and write plan into next partition's log
         final int nextIndex = _nextPartitionIndex(currentIndex);
-        final continueLine = jsonEncode({
-          'transactionId': plan.transactionId,
-          'event': 'continue_in_next_partition',
-          'nextPartitionIndex': nextIndex,
-          'timestamp': DateTime.now().toIso8601String(),
-        });
-        await _dataStore.storage
-            .appendString(currentLogPath, '$continueLine\n', flush: false);
-        _logSizeCache![currentLogPath] =
-            (cachedSize ?? 0) + utf8.encode('$continueLine\n').length;
+        await initialize();
+        _mainMetaCache!.activePartitions.add(nextIndex);
+        await _persistMainMeta(flush: false);
+
+        await _appendTxnEvent(
+          currentLogPath,
+          TxnLogEvent.simple(
+            transactionId: plan.transactionId,
+            event: TxnLogEventType.continueInNextPartition,
+            nextPartitionIndex: nextIndex,
+          ),
+          currentIndex,
+          knownBaseSize: currentSize,
+        );
 
         // Ensure next partition directory exists
         final nextDirIndex = _dirIndexForPartition(nextIndex);
@@ -510,10 +519,18 @@ class TransactionManager {
         await _dataStore.storage.ensureDirectoryExists(nextDir);
         final nextLogPath = _dataStore.pathManager
             .getTransactionPartitionLogPath(nextDirIndex, nextIndex);
+        // Plan may continue into another partition; re-encode with that AAD.
+        final continuedPlanRecord = await TxnEncoder.encodeAsRecord(
+          planEvent,
+          nextIndex,
+          resolveTable: _resolveTxnTableCodec,
+        );
+        final nextCached = _logSizeCache![nextLogPath];
+        final nextBase =
+            nextCached ?? await _dataStore.storage.getFileSize(nextLogPath);
         await _dataStore.storage
-            .appendString(nextLogPath, '$planLine\n', flush: false);
-        _logSizeCache![nextLogPath] =
-            (_logSizeCache![nextLogPath] ?? 0) + planBytes;
+            .appendBytes(nextLogPath, continuedPlanRecord, flush: false);
+        _logSizeCache![nextLogPath] = nextBase + continuedPlanRecord.length;
 
         // Write plan_persisted hints to both status logs (best-effort)
         try {
@@ -522,41 +539,44 @@ class TransactionManager {
                   plan.transactionId, currentDirIndex);
           final nextStatus = _dataStore.pathManager
               .getTransactionPartitionStatusLogPath(nextDirIndex, nextIndex);
-          final hintCurr = jsonEncode({
-            'transactionId': plan.transactionId,
-            'event': 'plan_persisted',
-            'timestamp': DateTime.now().toIso8601String(),
-            'continuedTo': nextIndex,
-          });
-          final hintNext = jsonEncode({
-            'transactionId': plan.transactionId,
-            'event': 'plan_persisted',
-            'timestamp': DateTime.now().toIso8601String(),
-          });
           await _dataStore.storage.ensureDirectoryExists(_dataStore.pathManager
               .getTransactionPartitionDirPath(currentDirIndex, currentIndex));
-          await _dataStore.storage
-              .appendString(currStatus, '$hintCurr\n', flush: false);
-          await _dataStore.storage
-              .appendString(nextStatus, '$hintNext\n', flush: false);
+          await _appendTxnEvent(
+            currStatus,
+            TxnLogEvent.simple(
+              transactionId: plan.transactionId,
+              event: TxnLogEventType.planPersisted,
+              continuedTo: nextIndex,
+            ),
+            currentIndex,
+          );
+          await _appendTxnEvent(
+            nextStatus,
+            TxnLogEvent.simple(
+              transactionId: plan.transactionId,
+              event: TxnLogEventType.planPersisted,
+            ),
+            nextIndex,
+          );
         } catch (_) {}
       } else {
         await _dataStore.storage
-            .appendString(currentLogPath, '$planLine\n', flush: false);
-        _logSizeCache![currentLogPath] = (cachedSize ?? 0) + planBytes;
+            .appendBytes(currentLogPath, planRecord, flush: false);
+        _logSizeCache![currentLogPath] = currentSize + planBytes;
         try {
           final statusPath = _dataStore.pathManager
               .getTransactionPartitionStatusLogPathById(
                   plan.transactionId, currentDirIndex);
-          final hint = jsonEncode({
-            'transactionId': plan.transactionId,
-            'event': 'plan_persisted',
-            'timestamp': DateTime.now().toIso8601String(),
-          });
           await _dataStore.storage.ensureDirectoryExists(_dataStore.pathManager
               .getTransactionPartitionDirPath(currentDirIndex, currentIndex));
-          await _dataStore.storage
-              .appendString(statusPath, '$hint\n', flush: false);
+          await _appendTxnEvent(
+            statusPath,
+            TxnLogEvent.simple(
+              transactionId: plan.transactionId,
+              event: TxnLogEventType.planPersisted,
+            ),
+            currentIndex,
+          );
         } catch (_) {}
       }
       // Rotate partition if needed (size-based)
@@ -569,7 +589,6 @@ class TransactionManager {
   /// Load commit plan (unified: from partition append-only log, early return on first match)
   Future<TransactionCommitPlan?> loadCommitPlan(String transactionId) async {
     if (_isMemoryMode) return null;
-    // Try file first
     try {
       int currentIndex =
           _dataStore.pathManager.parseTransactionPartitionIndex(transactionId);
@@ -581,28 +600,20 @@ class TransactionManager {
         final logPath = _dataStore.pathManager
             .getTransactionPartitionLogPath(currentDirIndex, currentIndex);
         if (!await _dataStore.storage.existsFile(logPath)) return null;
-        TransactionCommitPlan? found;
         int? nextIndex;
-        final stream = _dataStore.storage.readLinesStream(logPath);
-        await for (final line in stream) {
-          if (line.isEmpty) continue;
-          try {
-            final obj = jsonDecode(line) as Map<String, dynamic>;
-            final ev = obj['event'] as String?;
-            if (ev == 'plan' && obj['transactionId'] == transactionId) {
-              final planMap = obj['plan'] as Map<String, dynamic>;
-              found = _withNormalizedTableKeys(
-                  TransactionCommitPlan.fromJson(planMap));
-              return found;
+        final events = await _readTxnLogEvents(logPath, currentIndex);
+        for (final ev in events) {
+          if (ev.event == TxnLogEventType.plan &&
+              ev.transactionId == transactionId) {
+            if (ev.plan != null) {
+              return _withNormalizedTableKeys(ev.plan!);
             }
-            if (ev == 'continue_in_next_partition' &&
-                obj['transactionId'] == transactionId) {
-              final ni = obj['nextPartitionIndex'];
-              if (ni is int) {
-                nextIndex = ni;
-              }
-            }
-          } catch (_) {}
+          }
+          if (ev.event == TxnLogEventType.continueInNextPartition &&
+              ev.transactionId == transactionId &&
+              ev.nextPartitionIndex != null) {
+            nextIndex = ev.nextPartitionIndex;
+          }
         }
         if (nextIndex == null) return null; // no continuation
         currentIndex = nextIndex;
@@ -993,27 +1004,20 @@ class TransactionManager {
       final statusPath = _dataStore.pathManager
           .getTransactionPartitionStatusLogPathById(transactionId, dirIndex);
       if (await _dataStore.storage.existsFile(statusPath)) {
-        final stream = _dataStore.storage.readLinesStream(statusPath);
-        await for (final line in stream) {
-          if (line.isEmpty) continue;
-          try {
-            final obj = jsonDecode(line) as Map<String, dynamic>;
-            if (obj['transactionId'] == transactionId &&
-                obj['event'] == 'plan_progress') {
-              final i = (obj['insertsApplied'] as Map<String, dynamic>?)
-                      ?.map((k, v) => MapEntry(k, (v as num).toInt())) ??
-                  const <String, int>{};
-              final u = (obj['updatesApplied'] as Map<String, dynamic>?)
-                      ?.map((k, v) => MapEntry(k, (v as num).toInt())) ??
-                  const <String, int>{};
-              final d = (obj['deletesApplied'] as Map<String, dynamic>?)
-                      ?.map((k, v) => MapEntry(k, (v as num).toInt())) ??
-                  const <String, int>{};
-              inserts.addAll(i);
-              updates.addAll(u);
-              deletes.addAll(d);
+        final events = await _readTxnLogEvents(statusPath, pIndex);
+        for (final ev in events) {
+          if (ev.transactionId == transactionId &&
+              ev.event == TxnLogEventType.planProgress) {
+            if (ev.insertsApplied != null) {
+              inserts.addAll(ev.insertsApplied!);
             }
-          } catch (_) {}
+            if (ev.updatesApplied != null) {
+              updates.addAll(ev.updatesApplied!);
+            }
+            if (ev.deletesApplied != null) {
+              deletes.addAll(ev.deletesApplied!);
+            }
+          }
         }
       }
     } catch (_) {}
@@ -1040,16 +1044,17 @@ class TransactionManager {
           .getTransactionPartitionDirPath(dirIndex, pIndex));
       final statusPath = _dataStore.pathManager
           .getTransactionPartitionStatusLogPathById(transactionId, dirIndex);
-      final line = jsonEncode({
-        'transactionId': transactionId,
-        'event': 'plan_progress',
-        'timestamp': DateTime.now().toIso8601String(),
-        'insertsApplied': insertsApplied,
-        'updatesApplied': updatesApplied,
-        'deletesApplied': deletesApplied,
-      });
-      await _dataStore.storage
-          .appendString(statusPath, '$line\n', flush: false);
+      await _appendTxnEvent(
+        statusPath,
+        TxnLogEvent.simple(
+          transactionId: transactionId,
+          event: TxnLogEventType.planProgress,
+          insertsApplied: insertsApplied,
+          updatesApplied: updatesApplied,
+          deletesApplied: deletesApplied,
+        ),
+        pIndex,
+      );
     } catch (_) {}
   }
 
@@ -1109,12 +1114,12 @@ class TransactionManager {
         .getTransactionPartitionDirPath(dirIndex, pIndex));
     final statusPath = _dataStore.pathManager
         .getTransactionPartitionStatusLogPathById(transactionId, dirIndex);
-    final statusLine = '${jsonEncode({
-          'transactionId': transactionId,
-          'event': 'rollback',
-          'timestamp': DateTime.now().toIso8601String(),
-        })}\n';
-    await _dataStore.storage.appendString(statusPath, statusLine, flush: false);
+    await _appendTxnEvent(
+      statusPath,
+      TxnLogEvent.simple(
+          transactionId: transactionId, event: TxnLogEventType.rollback),
+      pIndex,
+    );
 
     await _maybeCleanupPartition(pIndex);
     // Remove from active set
@@ -1287,26 +1292,18 @@ class TransactionManager {
           .getTransactionPartitionStatusLogPathById(transactionId, dirIndex);
       if (!await _dataStore.storage.existsFile(statusPath)) return false;
 
-      // Stream lines to avoid loading large files into memory.
-      final stream = _dataStore.storage.readLinesStream(statusPath);
-      final yieldController = YieldController('txn_is_committed_scan');
-      await for (final line in stream) {
-        await yieldController.maybeYield();
-        if (line.isEmpty) continue;
-        try {
-          final m = jsonDecode(line) as Map<String, dynamic>;
-          if (m['transactionId'] == transactionId) {
-            final ev = (m['event'] as String?)?.toLowerCase();
-            if (ev == 'commit') {
-              _txnStatusCache[transactionId] = true;
-              return true;
-            }
-            if (ev == 'rollback') {
-              _txnStatusCache[transactionId] = false;
-              return false;
-            }
+      final events = await _readTxnLogEvents(statusPath, pIndex);
+      for (final ev in events) {
+        if (ev.transactionId == transactionId) {
+          if (ev.event == TxnLogEventType.commit) {
+            _txnStatusCache[transactionId] = true;
+            return true;
           }
-        } catch (_) {}
+          if (ev.event == TxnLogEventType.rollback) {
+            _txnStatusCache[transactionId] = false;
+            return false;
+          }
+        }
       }
       return false;
     } catch (_) {
@@ -1456,45 +1453,18 @@ class TransactionManager {
         final statusPath = _dataStore.pathManager
             .getTransactionPartitionStatusLogPath(pDirIndex, p);
         if (!await _dataStore.storage.existsFile(statusPath)) continue;
-        // Strategy: small files -> readAsLines; large -> streaming
-        final fileSize = await _dataStore.storage.getFileSize(statusPath);
-        final threshold = _config.maxLogPartitionFileSize;
 
         final begins = <String>{};
         final finished = <String>{};
-        if (fileSize <= threshold) {
-          final lines = await _dataStore.storage.readAsLines(statusPath);
-          for (final line in lines) {
-            await yieldController.maybeYield();
-            if (line.isEmpty) continue;
-            try {
-              final m = jsonDecode(line) as Map<String, dynamic>;
-              final id = m['transactionId'] as String?;
-              final ev = m['event'] as String?;
-              if (id == null || ev == null) continue;
-              if (ev == 'begin') {
-                begins.add(id);
-              } else if (ev == 'commit' || ev == 'rollback') {
-                finished.add(id);
-              }
-            } catch (_) {}
-          }
-        } else {
-          final stream = _dataStore.storage.readLinesStream(statusPath);
-          await for (final line in stream) {
-            await yieldController.maybeYield();
-            if (line.isEmpty) continue;
-            try {
-              final m = jsonDecode(line) as Map<String, dynamic>;
-              final id = m['transactionId'] as String?;
-              final ev = m['event'] as String?;
-              if (id == null || ev == null) continue;
-              if (ev == 'begin') {
-                begins.add(id);
-              } else if (ev == 'commit' || ev == 'rollback') {
-                finished.add(id);
-              }
-            } catch (_) {}
+        final events = await _readTxnLogEvents(statusPath, p);
+        for (final ev in events) {
+          await yieldController.maybeYield();
+          final id = ev.transactionId;
+          if (ev.event == TxnLogEventType.begin) {
+            begins.add(id);
+          } else if (ev.event == TxnLogEventType.commit ||
+              ev.event == TxnLogEventType.rollback) {
+            finished.add(id);
           }
         }
 
@@ -1518,6 +1488,58 @@ class TransactionManager {
         await _dataStore.schemaManager?.getTableContext(TableUid(normalized));
     if (ctx == null) return null;
     return _dataStore.schemaManager?.getTableSchema(ctx.tableUid);
+  }
+
+  Future<TxnTableCodecContext?> _resolveTxnTableCodec(String tableUid) async {
+    final schema = await _resolveTableSchemaFromField(tableUid);
+    if (schema == null) return null;
+    final normalized =
+        _dataStore.schemaManager?.normalizeTableFieldKey(tableUid) ?? tableUid;
+    final struct = await _dataStore.schemaManager
+            ?.getStorageFieldStructure(TableUid(normalized), schema: schema) ??
+        const [];
+    return TxnTableCodecContext(
+      primaryKeyField: schema.primaryKey,
+      fieldStructure: struct,
+    );
+  }
+
+  Future<void> _appendTxnEvent(
+    String path,
+    TxnLogEvent event,
+    int partitionIndex, {
+    int? knownBaseSize,
+  }) async {
+    final record = await TxnEncoder.encodeAsRecord(
+      event,
+      partitionIndex,
+      resolveTable: _resolveTxnTableCodec,
+    );
+    await _dataStore.storage.appendBytes(path, record, flush: false);
+    _logSizeCache ??= <String, int>{};
+    final cached = _logSizeCache![path];
+    if (knownBaseSize != null) {
+      _logSizeCache![path] = knownBaseSize + record.length;
+    } else if (cached != null) {
+      _logSizeCache![path] = cached + record.length;
+    } else {
+      // After append, filesystem size includes this record.
+      _logSizeCache![path] = await _dataStore.storage.getFileSize(path);
+    }
+  }
+
+  Future<List<TxnLogEvent>> _readTxnLogEvents(
+    String path,
+    int partitionIndex,
+  ) async {
+    if (!await _dataStore.storage.existsFile(path)) return const [];
+    final bytes = await _dataStore.storage.readAsBytes(path);
+    if (bytes.isEmpty) return const [];
+    return TxnEncoder.decodeFile(
+      bytes,
+      partitionIndex,
+      resolveTable: _resolveTxnTableCodec,
+    );
   }
 
   Map<String, List<Map<String, dynamic>>> _normalizeCommitPlanTableMap(
