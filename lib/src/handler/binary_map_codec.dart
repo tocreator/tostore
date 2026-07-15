@@ -53,6 +53,27 @@ class BinaryMapCodec {
     }
   }
 
+  /// Encode a single MessagePack-compatible value (no map wrapper).
+  static Uint8List encodeValue(dynamic value) {
+    final buffer = BytesBuilder(copy: false);
+    _writeValue(buffer, value);
+    return buffer.toBytes();
+  }
+
+  /// Decode a single MessagePack-compatible value.
+  ///
+  /// Returns null only when [data] is empty or decoding fails.
+  /// A legitimate MessagePack null (`0xC0`) also yields null.
+  static dynamic decodeValue(Uint8List data) {
+    if (data.isEmpty) return null;
+    try {
+      final r = _Reader(data);
+      return _readValue(r);
+    } catch (_) {
+      return null;
+    }
+  }
+
   static void _writeValue(BytesBuilder b, dynamic value) {
     if (value == null) {
       b.addByte(0xC0);
