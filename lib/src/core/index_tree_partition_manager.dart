@@ -594,8 +594,16 @@ final class IndexTreePartitionManager {
             stats.oldFileSizeInBytes = local.fileSizeInBytes;
             stats.oldFreeListHeadPageNo = local.freeListHeadPageNo;
             stats.oldFreePageCount = local.freePageCount;
+            stats.oldFlushBatchKey = local.lastFlushBatchKey;
+            stats.oldMaintBatchKey = local.lastMaintenanceBatchKey;
             stats.freeListHeadPageNo = local.freeListHeadPageNo;
             stats.freePageCount = local.freePageCount;
+            if (batchContext != null && batchContext.batchId.isNotEmpty) {
+              stats.alreadyDurableForBatch = local.matchesBatchKey(
+                isMaintenance: batchContext.batchType == BatchType.maintenance,
+                batchId: batchContext.batchId,
+              );
+            }
           } else {
             stats.oldFileSizeInBytes = await _storage.getFileSize(stats.path!);
           }
@@ -1326,8 +1334,17 @@ final class IndexTreePartitionManager {
               stats.oldFileSizeInBytes = local.fileSizeInBytes;
               stats.oldFreeListHeadPageNo = local.freeListHeadPageNo;
               stats.oldFreePageCount = local.freePageCount;
+              stats.oldFlushBatchKey = local.lastFlushBatchKey;
+              stats.oldMaintBatchKey = local.lastMaintenanceBatchKey;
               stats.freeListHeadPageNo = local.freeListHeadPageNo;
               stats.freePageCount = local.freePageCount;
+              if (batchContext != null && batchContext.batchId.isNotEmpty) {
+                stats.alreadyDurableForBatch = local.matchesBatchKey(
+                  isMaintenance:
+                      batchContext.batchType == BatchType.maintenance,
+                  batchId: batchContext.batchId,
+                );
+              }
             } else {
               stats.oldFileSizeInBytes =
                   await _storage.getFileSize(stats.path!);
@@ -1362,22 +1379,29 @@ final class IndexTreePartitionManager {
       final int newSize = max(oldSize, computedSize);
 
       if (pNo != 0) {
-        final metaBytes =
-            _dataStore.treeMetaPageService.buildPartitionPage0Bytes(
-          pageSize: pageSize,
-          partitionNo: pNo,
-          pageType: BTreePageType.meta,
-          partitionLocal: PartitionLocalStats(
+        if (!stats.alreadyDurableForBatch) {
+          final metaBytes =
+              _dataStore.treeMetaPageService.buildPartitionPage0Bytes(
+            pageSize: pageSize,
             partitionNo: pNo,
-            totalEntries: newEntries,
-            fileSizeInBytes: newSize,
-            freeListHeadPageNo: stats.freeListHeadPageNo,
-            freePageCount: stats.freePageCount,
-          ),
-          encryptionKey: encryptionKey,
-          encryptionKeyId: encryptionKeyId,
-        );
-        stageWrite(stats.path!, 0, metaBytes);
+            pageType: BTreePageType.meta,
+            partitionLocal: PartitionLocalStats(
+              partitionNo: pNo,
+              totalEntries: newEntries,
+              fileSizeInBytes: newSize,
+              freeListHeadPageNo: stats.freeListHeadPageNo,
+              freePageCount: stats.freePageCount,
+            ).withBatchMarkers(
+              isMaintenance: batchContext?.batchType == BatchType.maintenance,
+              batchId: batchContext?.batchId,
+              preservedFlushKey: stats.oldFlushBatchKey,
+              preservedMaintKey: stats.oldMaintBatchKey,
+            ),
+            encryptionKey: encryptionKey,
+            encryptionKeyId: encryptionKeyId,
+          );
+          stageWrite(stats.path!, 0, metaBytes);
+        }
       }
 
       // IMPORTANT: global totals delta must not depend on reading old partition meta page
@@ -1386,28 +1410,6 @@ final class IndexTreePartitionManager {
       final int partitionSizeDelta = newSize - oldSize;
       entriesDeltaSum += partitionEntriesDelta;
       sizeDeltaSum += partitionSizeDelta;
-
-      // For maintenance batches, record per-partition entry with complete index statistics
-      // This allows recovery to simply use the last entry's values, avoiding partition traversal
-      if (batchContext != null &&
-          batchContext.batchType == BatchType.maintenance &&
-          (partitionEntriesDelta != 0 || partitionSizeDelta != 0)) {
-        // Calculate current index totals after this partition's changes
-        final currentTotalEntries = max(0, meta.totalEntries + entriesDeltaSum);
-        final currentTotalSize = max(0, meta.totalSizeInBytes + sizeDeltaSum);
-        await _dataStore.parallelJournalManager.appendJournalEntry(
-          IndexPartitionFlushedEntry(
-            table: tableUid,
-            index: indexUid.value,
-            partitionNo: pNo,
-            totalEntries: currentTotalEntries, // New: complete index statistics
-            totalSizeInBytes:
-                currentTotalSize, // New: complete index statistics
-            batchId: batchContext.batchId,
-            batchType: batchContext.batchType,
-          ),
-        );
-      }
     }
 
     final now = DateTime.now();
@@ -1446,8 +1448,17 @@ final class IndexTreePartitionManager {
               p0Stats.oldFileSizeInBytes = local.fileSizeInBytes;
               p0Stats.oldFreeListHeadPageNo = local.freeListHeadPageNo;
               p0Stats.oldFreePageCount = local.freePageCount;
+              p0Stats.oldFlushBatchKey = local.lastFlushBatchKey;
+              p0Stats.oldMaintBatchKey = local.lastMaintenanceBatchKey;
               p0Stats.freeListHeadPageNo = local.freeListHeadPageNo;
               p0Stats.freePageCount = local.freePageCount;
+              if (batchContext != null && batchContext.batchId.isNotEmpty) {
+                p0Stats.alreadyDurableForBatch = local.matchesBatchKey(
+                  isMaintenance:
+                      batchContext.batchType == BatchType.maintenance,
+                  batchId: batchContext.batchId,
+                );
+              }
             }
           }
         } catch (_) {}
@@ -1468,38 +1479,50 @@ final class IndexTreePartitionManager {
         TreeGlobalMetaKind.indexTree,
         IndexMetaCodec.encode(updatedMeta),
       );
-      final p0Bytes = _dataStore.treeMetaPageService.buildPartitionPage0Bytes(
-        pageSize: pageSize,
-        partitionNo: 0,
-        pageType: BTreePageType.meta,
-        partitionLocal: PartitionLocalStats(
+      // Same recovery rule as table writeChanges: prior-marked siblings mean we
+      // must rewrite p0 global totals after a base-totals rollback.
+      if (partitionStats.values.any((s) => s.alreadyDurableForBatch)) {
+        p0Stats.alreadyDurableForBatch = false;
+      }
+      if (!p0Stats.alreadyDurableForBatch) {
+        final p0Bytes = _dataStore.treeMetaPageService.buildPartitionPage0Bytes(
+          pageSize: pageSize,
           partitionNo: 0,
-          totalEntries: p0NewEntries,
-          fileSizeInBytes: p0NewSize,
-          freeListHeadPageNo: p0Stats.freeListHeadPageNo,
-          freePageCount: p0Stats.freePageCount,
-        ),
-        treeGlobalMeta: globalBlob,
-        encryptionKey: encryptionKey,
-        encryptionKeyId: encryptionKeyId,
-      );
-      stageWrite(p0Stats.path!, 0, p0Bytes);
+          pageType: BTreePageType.meta,
+          partitionLocal: PartitionLocalStats(
+            partitionNo: 0,
+            totalEntries: p0NewEntries,
+            fileSizeInBytes: p0NewSize,
+            freeListHeadPageNo: p0Stats.freeListHeadPageNo,
+            freePageCount: p0Stats.freePageCount,
+          ).withBatchMarkers(
+            isMaintenance: batchContext?.batchType == BatchType.maintenance,
+            batchId: batchContext?.batchId,
+            preservedFlushKey: p0Stats.oldFlushBatchKey,
+            preservedMaintKey: p0Stats.oldMaintBatchKey,
+          ),
+          treeGlobalMeta: globalBlob,
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+        );
+        stageWrite(p0Stats.path!, 0, p0Bytes);
 
-      if (batchContext != null) {
-        final redoPath = _dataStore.pathManager.getPageRedoLogPath(
-          batchContext.batchId,
-          spaceName: _dataStore.currentSpaceName,
-        );
-        await _storage.ensureDirectoryExists(p.dirname(redoPath));
-        final rec = PageRedoLogCodec.encodePageRecord(
-          treeKind: PageRedoTreeKind.indexTree,
-          tableUid: table.tableUid,
-          indexUid: indexUid,
-          partitionNo: 0,
-          pageNo: 0,
-          payload: p0Bytes,
-        );
-        await _storage.appendBytes(redoPath, rec, flush: true);
+        if (batchContext != null) {
+          final redoPath = _dataStore.pathManager.getPageRedoLogPath(
+            batchContext.batchId,
+            spaceName: _dataStore.currentSpaceName,
+          );
+          await _storage.ensureDirectoryExists(p.dirname(redoPath));
+          final rec = PageRedoLogCodec.encodePageRecord(
+            treeKind: PageRedoTreeKind.indexTree,
+            tableUid: table.tableUid,
+            indexUid: indexUid,
+            partitionNo: 0,
+            pageNo: 0,
+            payload: p0Bytes,
+          );
+          await _storage.appendBytes(redoPath, rec, flush: true);
+        }
       }
     }
 
@@ -1514,6 +1537,9 @@ final class IndexTreePartitionManager {
       for (final e in staged.entries) {
         await flushYc.maybeYield();
         final path = e.key;
+        final durable = partitionStats.values
+            .any((s) => s.path == path && s.alreadyDurableForBatch);
+        if (durable) continue;
         final offsets = e.value.keys.toList(growable: false)..sort();
         final writes = <ByteWrite>[
           for (final off in offsets)
@@ -1578,18 +1604,6 @@ final class IndexTreePartitionManager {
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
       );
-
-      // Mark index metadata (partition-0 page0) as consistent for this batch.
-      if (batchContext != null) {
-        await _dataStore.parallelJournalManager.appendJournalEntry(
-          IndexMetaUpdatedEntry(
-            table: tableUid,
-            index: indexUid.value,
-            batchId: batchContext.batchId,
-            batchType: batchContext.batchType,
-          ),
-        );
-      }
     }
 
     // Log persistence statistics
@@ -1654,6 +1668,8 @@ final class IndexTreePartitionManager {
           if (local != null) {
             s.oldFileSizeInBytes = local.fileSizeInBytes;
             s.oldTotalEntries = local.totalEntries;
+            s.oldFlushBatchKey = local.lastFlushBatchKey;
+            s.oldMaintBatchKey = local.lastMaintenanceBatchKey;
             s.freeListHeadPageNo = local.freeListHeadPageNo;
             s.freePageCount = local.freePageCount;
           }
@@ -1875,6 +1891,11 @@ final class IndexTreePartitionManager {
           fileSizeInBytes: newSize,
           freeListHeadPageNo: s.freeListHeadPageNo,
           freePageCount: s.freePageCount,
+        ).withBatchMarkers(
+          isMaintenance: batchContext?.batchType == BatchType.maintenance,
+          batchId: batchContext?.batchId,
+          preservedFlushKey: s.oldFlushBatchKey,
+          preservedMaintKey: s.oldMaintBatchKey,
         );
         if (pNo == 0) {
           final globalBlob = TreeGlobalMetaBlobCodec.encode(
@@ -2343,6 +2364,9 @@ final class _IndexPartitionStats {
   bool headerLoaded = false;
   int oldTotalEntries = 0;
   int oldFileSizeInBytes = 0;
+  int oldFlushBatchKey = 0;
+  int oldMaintBatchKey = 0;
+  bool alreadyDurableForBatch = false;
 
   // Freelist state (per-partition).
   int oldFreeListHeadPageNo = -1;
