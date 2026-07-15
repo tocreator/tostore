@@ -284,6 +284,9 @@ class TableDataMetaUpdatedEntry extends ParallelJournalEntry {
   final String table;
   final String? batchId;
   final BatchType? batchType;
+
+  /// Journal marker: partition-0 page0 global [TableDataMeta] is consistent
+  /// for this batch (replaces the old independent meta.json commit signal).
   TableDataMetaUpdatedEntry(
       {required this.table, this.batchId, this.batchType});
   @override
@@ -375,6 +378,9 @@ class IndexMetaUpdatedEntry extends ParallelJournalEntry {
   final String index;
   final String? batchId;
   final BatchType? batchType;
+
+  /// Journal marker: partition-0 page0 global [IndexMeta] is consistent for
+  /// this batch (replaces the old independent index meta.json commit signal).
   IndexMetaUpdatedEntry(
       {required this.table, required this.index, this.batchId, this.batchType});
   @override
