@@ -791,7 +791,7 @@ final class TreeGlobalMetaBlobCodec {
 final class PartitionLocalStats {
   static const int payloadMagic = 0x31534C50; // 'PLS1'
   static const int payloadVersion = 1;
-  static const int payloadSize = 40;
+  static const int payloadSize = 56;
 
   final int partitionNo;
   final int totalEntries;
@@ -802,6 +802,12 @@ final class PartitionLocalStats {
   /// NGH data category (0=graph, 1=pq, 2=raw, 3=codebook). B+Tree uses 0.
   final int dataCategory;
 
+  /// FNV-1a-64 of the last flush [batchId] that durable-wrote this partition (0 = none).
+  final int lastFlushBatchKey;
+
+  /// FNV-1a-64 of the last maintenance [batchId] that durable-wrote this partition (0 = none).
+  final int lastMaintenanceBatchKey;
+
   const PartitionLocalStats({
     required this.partitionNo,
     this.totalEntries = 0,
@@ -809,7 +815,81 @@ final class PartitionLocalStats {
     this.freeListHeadPageNo = -1,
     this.freePageCount = 0,
     this.dataCategory = 0,
+    this.lastFlushBatchKey = 0,
+    this.lastMaintenanceBatchKey = 0,
   });
+
+  /// Stable 64-bit fingerprint of a batch id for partition-local durable markers.
+  static int batchKeyFromId(String batchId) {
+    if (batchId.isEmpty) return 0;
+    const int fnvOffset = -3750763034362895579; // 0xcbf29ce484222325
+    const int fnvPrime = 1099511628211; // 0x100000001b3
+    var hash = fnvOffset;
+    for (final b in batchId.codeUnits) {
+      hash ^= b;
+      hash = (hash * fnvPrime);
+    }
+    return hash;
+  }
+
+  PartitionLocalStats copyWith({
+    int? partitionNo,
+    int? totalEntries,
+    int? fileSizeInBytes,
+    int? freeListHeadPageNo,
+    int? freePageCount,
+    int? dataCategory,
+    int? lastFlushBatchKey,
+    int? lastMaintenanceBatchKey,
+  }) {
+    return PartitionLocalStats(
+      partitionNo: partitionNo ?? this.partitionNo,
+      totalEntries: totalEntries ?? this.totalEntries,
+      fileSizeInBytes: fileSizeInBytes ?? this.fileSizeInBytes,
+      freeListHeadPageNo: freeListHeadPageNo ?? this.freeListHeadPageNo,
+      freePageCount: freePageCount ?? this.freePageCount,
+      dataCategory: dataCategory ?? this.dataCategory,
+      lastFlushBatchKey: lastFlushBatchKey ?? this.lastFlushBatchKey,
+      lastMaintenanceBatchKey:
+          lastMaintenanceBatchKey ?? this.lastMaintenanceBatchKey,
+    );
+  }
+
+  /// Apply durable batch markers while preserving the opposite batch-type key.
+  PartitionLocalStats withBatchMarkers({
+    required bool isMaintenance,
+    required String? batchId,
+    required int preservedFlushKey,
+    required int preservedMaintKey,
+  }) {
+    final key =
+        (batchId == null || batchId.isEmpty) ? 0 : batchKeyFromId(batchId);
+    if (key == 0) {
+      return copyWith(
+        lastFlushBatchKey: preservedFlushKey,
+        lastMaintenanceBatchKey: preservedMaintKey,
+      );
+    }
+    if (isMaintenance) {
+      return copyWith(
+        lastFlushBatchKey: preservedFlushKey,
+        lastMaintenanceBatchKey: key,
+      );
+    }
+    return copyWith(
+      lastFlushBatchKey: key,
+      lastMaintenanceBatchKey: preservedMaintKey,
+    );
+  }
+
+  bool matchesBatchKey({required bool isMaintenance, required String batchId}) {
+    if (batchId.isEmpty) return false;
+    final key = batchKeyFromId(batchId);
+    if (key == 0) return false;
+    return isMaintenance
+        ? lastMaintenanceBatchKey == key
+        : lastFlushBatchKey == key;
+  }
 
   Uint8List encode() {
     final bd = ByteData(payloadSize);
@@ -823,6 +903,8 @@ final class PartitionLocalStats {
     PlatformByteData.setInt64(bd, 24, fileSizeInBytes, Endian.little);
     bd.setInt32(32, freeListHeadPageNo, Endian.little);
     bd.setInt32(36, freePageCount, Endian.little);
+    PlatformByteData.setInt64(bd, 40, lastFlushBatchKey, Endian.little);
+    PlatformByteData.setInt64(bd, 48, lastMaintenanceBatchKey, Endian.little);
     return bd.buffer.asUint8List();
   }
 
@@ -839,6 +921,8 @@ final class PartitionLocalStats {
       fileSizeInBytes: PlatformByteData.getInt64(bd, 24, Endian.little),
       freeListHeadPageNo: bd.getInt32(32, Endian.little),
       freePageCount: bd.getInt32(36, Endian.little),
+      lastFlushBatchKey: PlatformByteData.getInt64(bd, 40, Endian.little),
+      lastMaintenanceBatchKey: PlatformByteData.getInt64(bd, 48, Endian.little),
     );
   }
 
