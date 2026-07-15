@@ -118,9 +118,6 @@ class DataStoreConfig {
   /// Max latency before forcing a flush (milliseconds).
   final int maxFlushLatencyMs;
 
-  /// A/B parallel journal file size threshold (bytes) before rotation.
-  final int parallelJournalMaxFileSize;
-
   /// Maximum number of open file handles to keep in the handle pool (native only).
   final int maxOpenFiles;
 
@@ -188,7 +185,6 @@ class DataStoreConfig {
     required this.logWriteBatchSize,
     required this.writeBatchSize,
     required this.maxFlushLatencyMs,
-    required this.parallelJournalMaxFileSize,
     required this.maxOpenFiles,
     required this.recoveryFlushPolicy,
     required this.persistRecoveryOnCommit,
@@ -233,7 +229,6 @@ class DataStoreConfig {
     int? logWriteBatchSize,
     int? writeBatchSize,
     int? maxFlushLatencyMs,
-    int? parallelJournalMaxFileSize,
     int? maxOpenFiles,
     RecoveryFlushPolicy? recoveryFlushPolicy,
     bool? persistRecoveryOnCommit,
@@ -288,8 +283,6 @@ class DataStoreConfig {
           _getWriteBatchSize(cacheMemoryBudgetMB, resolvedServer),
       maxFlushLatencyMs:
           maxFlushLatencyMs ?? _getDefaultMaxFlushLatencyMs(resolvedServer),
-      parallelJournalMaxFileSize: parallelJournalMaxFileSize ??
-          _getDefaultParallelJournalMaxFileSize(resolvedServer),
       maxOpenFiles: maxOpenFiles ?? _getDefaultMaxOpenHandles(resolvedServer),
       recoveryFlushPolicy:
           recoveryFlushPolicy ?? _getDefaultRecoveryFlushPolicy(),
@@ -523,18 +516,6 @@ class DataStoreConfig {
     return 10000; // 10s on server
   }
 
-  static int _getDefaultParallelJournalMaxFileSize(bool isServer) {
-    // Align with log-segment sizing: keep recovery A/B journals compact.
-    if (PlatformHandler.isWeb) {
-      return 512 * 1024; // 512KB
-    } else if (isServer) {
-      return 8 * 1024 * 1024; // 8MB
-    } else {
-      // Mobile + desktop
-      return 4 * 1024 * 1024; // 4MB
-    }
-  }
-
   /// Default isolation level: prefer readCommitted for broad compatibility
   static TransactionIsolationLevel _getDefaultTransactionIsolationLevel() {
     return TransactionIsolationLevel.readCommitted;
@@ -659,7 +640,6 @@ class DataStoreConfig {
       logWriteBatchSize: json['logWriteBatchSize'] as int?,
       writeBatchSize: json['writeBatchSize'] as int?,
       maxFlushLatencyMs: json['maxFlushLatencyMs'] as int?,
-      parallelJournalMaxFileSize: json['parallelJournalMaxFileSize'] as int?,
       maxOpenFiles: json['maxOpenFiles'] as int?,
       recoveryFlushPolicy:
           parsedRecoveryFlushPolicy ?? _getDefaultRecoveryFlushPolicy(),
@@ -715,7 +695,6 @@ class DataStoreConfig {
       'logWriteBatchSize': logWriteBatchSize,
       'writeBatchSize': writeBatchSize,
       'maxFlushLatencyMs': maxFlushLatencyMs,
-      'parallelJournalMaxFileSize': parallelJournalMaxFileSize,
       'maxOpenFiles': maxOpenFiles,
       'recoveryFlushPolicy': recoveryFlushPolicy.toString().split('.').last,
       'persistRecoveryOnCommit': persistRecoveryOnCommit,
@@ -761,7 +740,6 @@ class DataStoreConfig {
     int? logWriteBatchSize,
     int? writeBatchSize,
     int? maxFlushLatencyMs,
-    int? parallelJournalMaxFileSize,
     int? maxOpenFiles,
     RecoveryFlushPolicy? recoveryFlushPolicy,
     bool? persistRecoveryOnCommit,
@@ -805,8 +783,6 @@ class DataStoreConfig {
       logWriteBatchSize: logWriteBatchSize ?? this.logWriteBatchSize,
       writeBatchSize: writeBatchSize ?? this.writeBatchSize,
       maxFlushLatencyMs: maxFlushLatencyMs ?? this.maxFlushLatencyMs,
-      parallelJournalMaxFileSize:
-          parallelJournalMaxFileSize ?? this.parallelJournalMaxFileSize,
       maxOpenFiles: maxOpenFiles ?? this.maxOpenFiles,
       recoveryFlushPolicy: recoveryFlushPolicy ?? this.recoveryFlushPolicy,
       persistRecoveryOnCommit:
