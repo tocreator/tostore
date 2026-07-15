@@ -21,58 +21,98 @@ import 'data_store_impl.dart';
 import 'storage_adapter.dart';
 import 'yield_controller.dart';
 
-/// Pending parallel batch metadata recorded in WAL meta for recovery
+/// Pending parallel batch metadata recorded in WAL meta for recovery.
+///
+/// Batch lifecycle is entirely in WAL meta (present = incomplete). Per-partition
+/// durable progress uses page0 `lastFlushBatchKey` / `lastMaintenanceBatchKey`.
 class PendingParallelBatch {
   final String batchId;
   final BatchType batchType;
-  final String journalFile; // 'A' or 'B'
-  final int recoverStartOffset; // byte offset in journal file to resume reading
   final WalPointer
       start; // WAL start pointer for this batch (-1:-1 for maintenance)
   final WalPointer
       end; // WAL end pointer for this batch (-1:-1 for maintenance)
-  final List<String> tables; // tables involved in this batch
+  final Map<TableUid, BatchTablePlan> tablePlans;
   final String createdAt; // ISO8601
 
   PendingParallelBatch({
     required this.batchId,
     required this.batchType,
-    required this.journalFile,
-    required this.recoverStartOffset,
     required this.start,
     required this.end,
-    required this.tables,
+    required this.tablePlans,
     required this.createdAt,
   });
+
+  Iterable<TableUid> get tableUids => tablePlans.keys;
 
   Map<String, dynamic> toJson() => {
         'batchId': batchId,
         'batchType': batchType.value,
-        'journalFile': journalFile,
-        'recoverStartOffset': recoverStartOffset,
         'start': start.toJson(),
         'end': end.toJson(),
-        'tables': tables,
+        'tablePlans': tablePlans.map((k, v) => MapEntry(k.value, v.toJson())),
         'createdAt': createdAt,
       };
 
-  static PendingParallelBatch fromJson(Map<String, dynamic> json) =>
-      PendingParallelBatch(
-        batchId: (json['batchId'] as String?) ?? '',
-        batchType: BatchType.fromStringOrFlush(
-            (json['batchType'] as String?) ?? (json['scope'] as String?)),
-        journalFile: (json['journalFile'] as String?) ?? 'A',
-        recoverStartOffset: (json['recoverStartOffset'] as num?)?.toInt() ?? 0,
-        start: WalPointer.fromJson(
-            ((json['start'] as Map?) ?? const {}).cast<String, dynamic>()),
-        end: WalPointer.fromJson(
-            ((json['end'] as Map?) ?? const {}).cast<String, dynamic>()),
-        tables: ((json['tables'] as List?) ?? const <dynamic>[])
-            .map((e) => e.toString())
-            .toList(),
-        createdAt:
-            (json['createdAt'] as String?) ?? DateTime.now().toIso8601String(),
-      );
+  static PendingParallelBatch fromJson(Map<String, dynamic> json) {
+    final rawPlans = (json['tablePlans'] as Map?) ??
+        (json['tablePlan'] as Map?) ??
+        const <String, dynamic>{};
+    final tablePlans = <TableUid, BatchTablePlan>{};
+    rawPlans.forEach((k, v) {
+      tablePlans[TableUid(k.toString())] = BatchTablePlan.fromJson(
+          ((v as Map?) ?? const {}).cast<String, dynamic>());
+    });
+
+    // Legacy: tables list without plans — synthesize empty plans so keys exist.
+    if (tablePlans.isEmpty) {
+      final tables = ((json['tables'] as List?) ?? const <dynamic>[])
+          .map((e) => e.toString())
+          .where((e) => e.isNotEmpty);
+      for (final t in tables) {
+        tablePlans.putIfAbsent(
+          TableUid(t),
+          () => const BatchTablePlan(
+            willUpdateTableDataMeta: true,
+            indexes: <IndexUid>[],
+            willUpdateIndexMeta: false,
+          ),
+        );
+      }
+    }
+
+    return PendingParallelBatch(
+      batchId: (json['batchId'] as String?) ?? '',
+      batchType: BatchType.fromStringOrFlush(
+          (json['batchType'] as String?) ?? (json['scope'] as String?)),
+      start: WalPointer.fromJson(
+          ((json['start'] as Map?) ?? const {}).cast<String, dynamic>()),
+      end: WalPointer.fromJson(
+          ((json['end'] as Map?) ?? const {}).cast<String, dynamic>()),
+      tablePlans: tablePlans,
+      createdAt:
+          (json['createdAt'] as String?) ?? DateTime.now().toIso8601String(),
+    );
+  }
+
+  PendingParallelBatch copyWith({
+    String? batchId,
+    BatchType? batchType,
+    WalPointer? start,
+    WalPointer? end,
+    Map<TableUid, BatchTablePlan>? tablePlans,
+    String? createdAt,
+  }) {
+    return PendingParallelBatch(
+      batchId: batchId ?? this.batchId,
+      batchType: batchType ?? this.batchType,
+      start: start ?? this.start,
+      end: end ?? this.end,
+      tablePlans: tablePlans ?? this.tablePlans,
+      createdAt: createdAt ?? this.createdAt,
+    );
+  }
 }
 
 /// Large delete operation metadata for WAL meta (single-table delete with checkpoint)
@@ -275,7 +315,6 @@ class WalMeta {
   WalPointer checkpoint;
   int existingStartPartitionIndex; // inclusive
   int existingEndPartitionIndex; // inclusive
-  String activeParallelJournal; // 'A' or 'B'
   // Pending batches for parallel recovery (supports multiple, flush/maintenance)
   List<PendingParallelBatch> pendingBatches;
   // Running large delete operations keyed by opId
@@ -299,7 +338,6 @@ class WalMeta {
     required this.checkpoint,
     required this.existingStartPartitionIndex,
     required this.existingEndPartitionIndex,
-    required this.activeParallelJournal,
     required this.pendingBatches,
     required this.largeDeletes,
     required this.largeUpdates,
@@ -314,7 +352,6 @@ class WalMeta {
     WalPointer? checkpoint,
     int? existingStartPartitionIndex,
     int? existingEndPartitionIndex,
-    String? activeParallelJournal,
     List<PendingParallelBatch>? pendingBatches,
     Map<String, LargeDeleteMeta>? largeDeletes,
     Map<String, LargeUpdateMeta>? largeUpdates,
@@ -329,8 +366,6 @@ class WalMeta {
           existingStartPartitionIndex ?? this.existingStartPartitionIndex,
       existingEndPartitionIndex:
           existingEndPartitionIndex ?? this.existingEndPartitionIndex,
-      activeParallelJournal:
-          activeParallelJournal ?? this.activeParallelJournal,
       pendingBatches: pendingBatches ?? this.pendingBatches,
       largeDeletes: largeDeletes ?? this.largeDeletes,
       largeUpdates: largeUpdates ?? this.largeUpdates,
@@ -346,7 +381,6 @@ class WalMeta {
         'checkpoint': checkpoint.toJson(),
         'existingStartPartitionIndex': existingStartPartitionIndex,
         'existingEndPartitionIndex': existingEndPartitionIndex,
-        'activeParallelJournal': activeParallelJournal,
         'pendingBatches': pendingBatches.map((e) => e.toJson()).toList(),
         'largeDeletes': largeDeletes.map((k, v) => MapEntry(k, v.toJson())),
         'largeUpdates': largeUpdates.map((k, v) => MapEntry(k, v.toJson())),
@@ -364,7 +398,6 @@ class WalMeta {
             WalPointer(partitionIndex: startPartitionIndex, entrySeq: 0),
         existingStartPartitionIndex: -1,
         existingEndPartitionIndex: -1,
-        activeParallelJournal: 'A',
         pendingBatches: <PendingParallelBatch>[],
         largeDeletes: <String, LargeDeleteMeta>{},
         largeUpdates: <String, LargeUpdateMeta>{},
@@ -384,7 +417,6 @@ class WalMeta {
           (json['existingStartPartitionIndex'] as num?)?.toInt() ?? -1,
       existingEndPartitionIndex:
           (json['existingEndPartitionIndex'] as num?)?.toInt() ?? -1,
-      activeParallelJournal: (json['activeParallelJournal'] as String?) ?? 'A',
       pendingBatches: ((json['pendingBatches'] as List?) ?? const <dynamic>[])
           .map((e) => PendingParallelBatch.fromJson(
               ((e as Map?) ?? const {}).cast<String, dynamic>()))
@@ -979,7 +1011,6 @@ class WalManager {
       checkpoint: const WalPointer(partitionIndex: 0, entrySeq: 0),
       existingStartPartitionIndex: -1,
       existingEndPartitionIndex: -1,
-      activeParallelJournal: _meta.activeParallelJournal,
       pendingBatches: _meta.pendingBatches,
       largeDeletes: _meta.largeDeletes,
       largeUpdates: _meta.largeUpdates,
@@ -1092,14 +1123,6 @@ class WalManager {
     } catch (e) {
       Logger.error('cleanupObsoletePartitions failed', rawError: e);
     }
-  }
-
-  /// Switch A/B active journal file (only when no pending batch)
-  Future<void> rotateParallelJournalActive() async {
-    if (_meta.pendingBatches.isNotEmpty) return;
-    _meta.activeParallelJournal =
-        _meta.activeParallelJournal == 'A' ? 'B' : 'A';
-    await persistMeta(flush: false);
   }
 
   /// Update current WAL pointer after a recovery scan has replayed WAL entries.
