@@ -1,80 +1,18 @@
-/// Typed journal entry models for parallel processing A/B journal.
-/// Keep JSON schema compatible with existing map-based entries.
 library;
 
-/// Resolve persisted index reference from journal JSON (uid preferred).
-String resolveIndexFieldFromJson(Map<String, dynamic> json) {
-  final indexUid = json['indexUid'];
-  if (indexUid is String && indexUid.isNotEmpty) return indexUid;
-  final index = json['index'];
-  if (index is String && index.isNotEmpty) return index;
-  final indexName = json['indexName'];
-  if (indexName is String && indexName.isNotEmpty) return indexName;
-  return '';
-}
+import 'table_identity.dart';
 
-/// Resolve persisted table reference from journal JSON (uid preferred).
-String resolveTableFieldFromJson(Map<String, dynamic> json) {
-  final tableUid = json['tableUid'];
-  if (tableUid is String && tableUid.isNotEmpty) return tableUid;
-  final table = json['table'];
-  if (table is String && table.isNotEmpty) return table;
-  final tableName = json['tableName'];
-  if (tableName is String && tableName.isNotEmpty) return tableName;
-  return '';
-}
-
-abstract class ParallelJournalEntry {
-  String get type; // discriminator
-  Map<String, dynamic> toJson();
-
-  static ParallelJournalEntry? fromJson(Map<String, dynamic> json) {
-    final t = json['type'] as String?;
-    switch (t) {
-      case 'batchStart':
-        return BatchStartEntry.fromJson(json);
-      case 'taskDone':
-        return TaskDoneEntry.fromJson(json);
-      case 'tablePartitionFlushed':
-        return TablePartitionFlushedEntry.fromJson(json);
-      case 'tableDataMetaUpdated':
-        return TableDataMetaUpdatedEntry.fromJson(json);
-      case 'indexPartitionFlushed':
-        return IndexPartitionFlushedEntry.fromJson(json);
-      case 'indexMetaUpdated':
-        return IndexMetaUpdatedEntry.fromJson(json);
-      case 'batchCompleted':
-        return BatchCompletedEntry.fromJson(json);
-      default:
-        return null;
-    }
-  }
-}
-
-class WalPointerRef {
-  final int partitionIndex;
-  final int entrySeq;
-  const WalPointerRef({required this.partitionIndex, required this.entrySeq});
-  Map<String, dynamic> toJson() => {
-        'partitionIndex': partitionIndex,
-        'entrySeq': entrySeq,
-      };
-  static WalPointerRef fromJson(Map<String, dynamic> json) => WalPointerRef(
-        partitionIndex: json['partitionIndex'] as int,
-        entrySeq: json['entrySeq'] as int,
-      );
-}
-
-class TablePlan {
+/// Per-table plan captured at batch start for recovery (base totals + indexes).
+class BatchTablePlan {
   final bool willUpdateTableDataMeta;
-  final List<String> indexes;
+  final List<IndexUid> indexes;
   final bool willUpdateIndexMeta;
   final int? baseTotalRecords;
   final int? baseTotalSizeInBytes;
-  final Map<String, int>? baseIndexTotalEntries;
-  final Map<String, int>? baseIndexTotalSizeInBytes;
+  final Map<IndexUid, int>? baseIndexTotalEntries;
+  final Map<IndexUid, int>? baseIndexTotalSizeInBytes;
 
-  const TablePlan({
+  const BatchTablePlan({
     required this.willUpdateTableDataMeta,
     required this.indexes,
     required this.willUpdateIndexMeta,
@@ -86,353 +24,47 @@ class TablePlan {
 
   Map<String, dynamic> toJson() => {
         'willUpdateTableDataMeta': willUpdateTableDataMeta,
-        'indexes': indexes,
+        'indexes': indexes.map((e) => e.value).toList(),
         'willUpdateIndexMeta': willUpdateIndexMeta,
         if (baseTotalRecords != null) 'baseTotalRecords': baseTotalRecords,
         if (baseTotalSizeInBytes != null)
           'baseTotalSizeInBytes': baseTotalSizeInBytes,
         if (baseIndexTotalEntries != null)
-          'baseIndexTotalEntries': baseIndexTotalEntries,
+          'baseIndexTotalEntries':
+              baseIndexTotalEntries!.map((k, v) => MapEntry(k.value, v)),
         if (baseIndexTotalSizeInBytes != null)
-          'baseIndexTotalSizeInBytes': baseIndexTotalSizeInBytes,
+          'baseIndexTotalSizeInBytes':
+              baseIndexTotalSizeInBytes!.map((k, v) => MapEntry(k.value, v)),
       };
 
-  static TablePlan fromJson(Map<String, dynamic> json) => TablePlan(
-        willUpdateTableDataMeta:
-            json['willUpdateTableDataMeta'] as bool? ?? true,
-        indexes: ((json['indexes'] as List?) ?? const <dynamic>[])
-            .map((e) => e.toString())
-            .toList(),
-        willUpdateIndexMeta: json['willUpdateIndexMeta'] as bool? ?? false,
-        baseTotalRecords: json['baseTotalRecords'] as int?,
-        baseTotalSizeInBytes: json['baseTotalSizeInBytes'] as int?,
-        baseIndexTotalEntries: (json['baseIndexTotalEntries'] as Map?)
-            ?.cast<String, int>()
-            .map((k, v) => MapEntry(k, v)),
-        baseIndexTotalSizeInBytes: (json['baseIndexTotalSizeInBytes'] as Map?)
-            ?.cast<String, int>()
-            .map((k, v) => MapEntry(k, v)),
+  static BatchTablePlan fromJson(Map<String, dynamic> json) {
+    Map<IndexUid, int>? mapIndexTotals(Map? raw) {
+      if (raw == null) return null;
+      return raw.map(
+        (k, v) => MapEntry(IndexUid(k.toString()), (v as num).toInt()),
       );
-}
-
-class BatchStartEntry extends ParallelJournalEntry {
-  @override
-  final String type = 'batchStart';
-  final String at;
-  final WalPointerRef start;
-  final WalPointerRef end;
-  final int size;
-  final Map<String, Map<int, int>> plan; // table -> op.index -> count
-  final Map<String, TablePlan> tablePlan;
-  final String batchId;
-  final BatchType batchType;
-  BatchStartEntry({
-    required this.at,
-    required this.start,
-    required this.end,
-    required this.size,
-    required this.plan,
-    required this.tablePlan,
-    required this.batchId,
-    required this.batchType,
-  });
-  @override
-  Map<String, dynamic> toJson() => {
-        'type': type,
-        'at': at,
-        'start': start.toJson(),
-        'end': end.toJson(),
-        'size': size,
-        'plan': plan.map(
-          (table, byOp) => MapEntry(
-            table,
-            byOp.map(
-              (opIdx, count) => MapEntry(opIdx.toString(), count),
-            ),
-          ),
-        ),
-        'tablePlan': tablePlan.map((k, v) => MapEntry(k, v.toJson())),
-        'batchId': batchId,
-        'batchType': batchType.value,
-        // Keep backward-compatibility key
-        'scope': batchType.value,
-      };
-  static BatchStartEntry fromJson(Map<String, dynamic> json) => BatchStartEntry(
-        at: (json['at'] as String?) ?? '',
-        start: WalPointerRef.fromJson(
-            (json['start'] as Map).cast<String, dynamic>()),
-        end: WalPointerRef.fromJson(
-            (json['end'] as Map).cast<String, dynamic>()),
-        size: json['size'] as int? ?? 0,
-        plan: (json['plan'] as Map?)
-                ?.map((k, v) => MapEntry(
-                    k.toString(),
-                    ((v as Map?) ?? const {}).map((ik, iv) => MapEntry(
-                        int.parse(ik.toString()), (iv as num).toInt()))))
-                .cast<String, Map<int, int>>() ??
-            <String, Map<int, int>>{},
-        tablePlan: (json['tablePlan'] as Map?)
-                ?.map((k, v) => MapEntry(
-                    k.toString(),
-                    TablePlan.fromJson(
-                        ((v as Map?) ?? const {}).cast<String, dynamic>())))
-                .cast<String, TablePlan>() ??
-            <String, TablePlan>{},
-        batchId: (json['batchId'] as String?) ?? '',
-        batchType: BatchType.fromStringOrFlush(
-            (json['batchType'] as String?) ?? (json['scope'] as String?)),
-      );
-}
-
-class TaskDoneEntry extends ParallelJournalEntry {
-  @override
-  final String type = 'taskDone';
-  final String at;
-  final String table;
-  final int count;
-  final String? batchId;
-  final BatchType? batchType;
-  TaskDoneEntry(
-      {required this.at,
-      required this.table,
-      required this.count,
-      this.batchId,
-      this.batchType});
-  @override
-  Map<String, dynamic> toJson() {
-    final result = <String, dynamic>{
-      'type': type,
-      'at': at,
-      'table': table,
-      'count': count,
-    };
-    if (batchId != null) result['batchId'] = batchId;
-    if (batchType != null) result['batchType'] = batchType!.value;
-    return result;
-  }
-
-  static TaskDoneEntry fromJson(Map<String, dynamic> json) => TaskDoneEntry(
-        at: (json['at'] as String?) ?? '',
-        table: resolveTableFieldFromJson(json),
-        count: (json['count'] as num?)?.toInt() ?? 0,
-        batchId: (json['batchId'] as String?),
-        batchType: BatchType.fromString(
-            (json['batchType'] as String?) ?? (json['scope'] as String?)),
-      );
-}
-
-class TablePartitionFlushedEntry extends ParallelJournalEntry {
-  @override
-  final String type = 'tablePartitionFlushed';
-  final String table;
-  final int partitionNo; // Physical partition number (0-based)
-  final int? totalRecords; // Total records in table after this partition flush
-  final int? totalSizeInBytes; // Total size in bytes after this partition flush
-  final String batchId;
-  final BatchType batchType;
-  TablePartitionFlushedEntry({
-    required this.table,
-    required this.partitionNo,
-    this.totalRecords, // New: complete table statistics
-    this.totalSizeInBytes, // New: complete table statistics
-    required this.batchId,
-    required this.batchType,
-  });
-  @override
-  Map<String, dynamic> toJson() {
-    final result = <String, dynamic>{
-      'type': type,
-      'table': table,
-      'partitionNo': partitionNo,
-      'batchId': batchId,
-      'batchType': batchType.value,
-    };
-    // Include new fields if present
-    if (totalRecords != null) result['totalRecords'] = totalRecords;
-    if (totalSizeInBytes != null) result['totalSizeInBytes'] = totalSizeInBytes;
-    return result;
-  }
-
-  static TablePartitionFlushedEntry fromJson(Map<String, dynamic> json) {
-    // Backward compatibility: support old format with 'partition' and 'meta'
-    int partitionNo = 0;
-
-    if (json.containsKey('partitionNo')) {
-      // New format
-      partitionNo = (json['partitionNo'] as num?)?.toInt() ?? 0;
     }
 
-    // New fields: complete table statistics (preferred for recovery)
-    final totalRecords = (json['totalRecords'] as num?)?.toInt();
-    final totalSizeInBytes = (json['totalSizeInBytes'] as num?)?.toInt();
-
-    return TablePartitionFlushedEntry(
-      table: resolveTableFieldFromJson(json),
-      partitionNo: partitionNo,
-      totalRecords: totalRecords,
-      totalSizeInBytes: totalSizeInBytes,
-      batchId: (json['batchId'] as String?) ?? '',
-      batchType: BatchType.fromStringOrFlush(
-          (json['batchType'] as String?) ?? (json['scope'] as String?)),
+    return BatchTablePlan(
+      willUpdateTableDataMeta: json['willUpdateTableDataMeta'] as bool? ?? true,
+      indexes: ((json['indexes'] as List?) ?? const <dynamic>[])
+          .map((e) => IndexUid(e.toString()))
+          .toList(),
+      willUpdateIndexMeta: json['willUpdateIndexMeta'] as bool? ?? false,
+      baseTotalRecords: json['baseTotalRecords'] as int?,
+      baseTotalSizeInBytes: json['baseTotalSizeInBytes'] as int?,
+      baseIndexTotalEntries:
+          mapIndexTotals(json['baseIndexTotalEntries'] as Map?),
+      baseIndexTotalSizeInBytes:
+          mapIndexTotals(json['baseIndexTotalSizeInBytes'] as Map?),
     );
   }
 }
 
-class TableDataMetaUpdatedEntry extends ParallelJournalEntry {
-  @override
-  final String type = 'tableDataMetaUpdated';
-  final String table;
-  final String? batchId;
-  final BatchType? batchType;
+/// Backward-compatible alias used by older call sites / upgrade parsers.
+typedef TablePlan = BatchTablePlan;
 
-  /// Journal marker: partition-0 page0 global [TableDataMeta] is consistent
-  /// for this batch (replaces the old independent meta.json commit signal).
-  TableDataMetaUpdatedEntry(
-      {required this.table, this.batchId, this.batchType});
-  @override
-  Map<String, dynamic> toJson() {
-    final result = <String, dynamic>{
-      'type': type,
-      'table': table,
-    };
-    if (batchId != null) result['batchId'] = batchId;
-    if (batchType != null) result['batchType'] = batchType!.value;
-    return result;
-  }
-
-  static TableDataMetaUpdatedEntry fromJson(Map<String, dynamic> json) =>
-      TableDataMetaUpdatedEntry(
-        table: resolveTableFieldFromJson(json),
-        batchId: (json['batchId'] as String?),
-        batchType: BatchType.fromString(
-            (json['batchType'] as String?) ?? (json['scope'] as String?)),
-      );
-}
-
-class IndexPartitionFlushedEntry extends ParallelJournalEntry {
-  @override
-  final String type = 'indexPartitionFlushed';
-  final String table;
-  final String index;
-  final int partitionNo; // Physical partition number (0-based)
-  // New fields: complete index metadata statistics after this partition was flushed
-  final int? totalEntries; // Total entries in index after this partition flush
-  final int? totalSizeInBytes; // Total size in bytes after this partition flush
-  final String batchId;
-  final BatchType batchType;
-  IndexPartitionFlushedEntry({
-    required this.table,
-    required this.index,
-    required this.partitionNo,
-    this.totalEntries, // New: complete index statistics
-    this.totalSizeInBytes, // New: complete index statistics
-    required this.batchId,
-    required this.batchType,
-  });
-  @override
-  Map<String, dynamic> toJson() {
-    final result = <String, dynamic>{
-      'type': type,
-      'table': table,
-      'index': index,
-      'partitionNo': partitionNo,
-      'batchId': batchId,
-      'batchType': batchType.value,
-    };
-    // Include new fields if present
-    if (totalEntries != null) result['totalEntries'] = totalEntries;
-    if (totalSizeInBytes != null) result['totalSizeInBytes'] = totalSizeInBytes;
-    return result;
-  }
-
-  static IndexPartitionFlushedEntry fromJson(Map<String, dynamic> json) {
-    // Backward compatibility: support old format with 'partition' and 'meta'
-    int partitionNo = 0;
-
-    if (json.containsKey('partitionNo')) {
-      // New format
-      partitionNo = (json['partitionNo'] as num?)?.toInt() ?? 0;
-    }
-
-    // New fields: complete index statistics (preferred for recovery)
-    final totalEntries = (json['totalEntries'] as num?)?.toInt();
-    final totalSizeInBytes = (json['totalSizeInBytes'] as num?)?.toInt();
-
-    return IndexPartitionFlushedEntry(
-      table: resolveTableFieldFromJson(json),
-      index: resolveIndexFieldFromJson(json),
-      partitionNo: partitionNo,
-      totalEntries: totalEntries,
-      totalSizeInBytes: totalSizeInBytes,
-      batchId: (json['batchId'] as String?) ?? '',
-      batchType: BatchType.fromStringOrFlush(
-          (json['batchType'] as String?) ?? (json['scope'] as String?)),
-    );
-  }
-}
-
-class IndexMetaUpdatedEntry extends ParallelJournalEntry {
-  @override
-  final String type = 'indexMetaUpdated';
-  final String table;
-  final String index;
-  final String? batchId;
-  final BatchType? batchType;
-
-  /// Journal marker: partition-0 page0 global [IndexMeta] is consistent for
-  /// this batch (replaces the old independent index meta.json commit signal).
-  IndexMetaUpdatedEntry(
-      {required this.table, required this.index, this.batchId, this.batchType});
-  @override
-  Map<String, dynamic> toJson() {
-    final result = <String, dynamic>{
-      'type': type,
-      'table': table,
-      'index': index,
-    };
-    if (batchId != null) result['batchId'] = batchId;
-    if (batchType != null) result['batchType'] = batchType!.value;
-    return result;
-  }
-
-  static IndexMetaUpdatedEntry fromJson(Map<String, dynamic> json) =>
-      IndexMetaUpdatedEntry(
-        table: resolveTableFieldFromJson(json),
-        index: resolveIndexFieldFromJson(json),
-        batchId: (json['batchId'] as String?),
-        batchType: BatchType.fromString(
-            (json['batchType'] as String?) ?? (json['scope'] as String?)),
-      );
-}
-
-class BatchCompletedEntry extends ParallelJournalEntry {
-  @override
-  final String type = 'batchCompleted';
-  final String at;
-  final String? batchId;
-  final BatchType? batchType;
-  BatchCompletedEntry({required this.at, this.batchId, this.batchType});
-  @override
-  Map<String, dynamic> toJson() {
-    final result = <String, dynamic>{
-      'type': type,
-      'at': at,
-    };
-    if (batchId != null) result['batchId'] = batchId;
-    if (batchType != null) result['batchType'] = batchType!.value;
-    return result;
-  }
-
-  static BatchCompletedEntry fromJson(Map<String, dynamic> json) =>
-      BatchCompletedEntry(
-        at: (json['at'] as String?) ?? '',
-        batchId: (json['batchId'] as String?),
-        batchType: BatchType.fromString(
-            (json['batchType'] as String?) ?? (json['scope'] as String?)),
-      );
-}
-
-/// Type-safe batch type enum for parallel journal entries.
+/// Type-safe batch type enum for parallel flush / maintenance.
 enum BatchType {
   flush,
   maintenance;
@@ -456,8 +88,7 @@ enum BatchType {
   }
 }
 
-/// Batch context containing batch ID and type for journal operations.
-/// This model simplifies method signatures by bundling related batch information.
+/// Batch context containing batch ID and type for journal / redo operations.
 class BatchContext {
   final String batchId;
   final BatchType batchType;
@@ -467,17 +98,14 @@ class BatchContext {
     required this.batchType,
   });
 
-  /// Create a flush batch context
   factory BatchContext.flush(String batchId) {
     return BatchContext(batchId: batchId, batchType: BatchType.flush);
   }
 
-  /// Create a maintenance batch context
   factory BatchContext.maintenance(String batchId) {
     return BatchContext(batchId: batchId, batchType: BatchType.maintenance);
   }
 
-  /// Convert to legacy string format for backward compatibility
   String get batchTypeString => batchType.value;
 
   @override
