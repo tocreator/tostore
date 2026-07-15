@@ -1762,31 +1762,6 @@ final class TableTreePartitionManager {
       }
     }
 
-    // ---- Page redo: persist tree structure snapshot (no totals) ----
-    // Needed because replay may write newly split pages/partitions before meta.json update.
-    if (batchContext != null) {
-      final redoPath = _dataStore.pathManager.getPageRedoLogPath(
-        batchContext.batchId,
-        spaceName: _dataStore.currentSpaceName,
-      );
-      await _storage.ensureDirectoryExists(p.dirname(redoPath));
-      final rec = PageRedoLogCodec.encodeTreeMetaRecord(
-        treeKind: PageRedoTreeKind.table,
-        tableUid: table.tableUid,
-        btreePageSize: _dataStore.configuredPageSize,
-        btreeNextPageNo: meta.btreeNextPageNo,
-        btreePartitionCount: meta.btreePartitionCount,
-        btreeRootPartitionNo: meta.btreeRoot.partitionNo,
-        btreeRootPageNo: meta.btreeRoot.pageNo,
-        btreeFirstLeafPartitionNo: meta.btreeFirstLeaf.partitionNo,
-        btreeFirstLeafPageNo: meta.btreeFirstLeaf.pageNo,
-        btreeLastLeafPartitionNo: meta.btreeLastLeaf.partitionNo,
-        btreeLastLeafPageNo: meta.btreeLastLeaf.pageNo,
-        btreeHeight: meta.btreeHeight,
-      );
-      await _storage.appendBytes(redoPath, rec, flush: true);
-    }
-
     // ---- Flush staged random writes per file (budgeted parallel IO) ----
     if (staged.isNotEmpty) {
       final flushYc = YieldController(
@@ -1864,8 +1839,8 @@ final class TableTreePartitionManager {
       encryptionKeyId: encryptionKeyId,
     );
 
-    // Mark table data metadata as updated in journal for crash recovery.
-    // If this entry exists, recovery knows the metadata is consistent.
+    // Mark table data metadata (partition-0 page0) as consistent for this batch.
+    // If this entry exists, recovery knows page0 global meta was committed.
     if (batchContext != null) {
       await _dataStore.parallelJournalManager.appendJournalEntry(
         TableDataMetaUpdatedEntry(
