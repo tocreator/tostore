@@ -88,7 +88,7 @@ final class TreeMetaPageService {
         pageSize: pageSize,
         partitionNo: 0,
         pageType: BTreePageType.meta,
-        partitionLocal: local,
+        partitionLocal: _applyBatchMarkers(local, ctx),
         treeGlobalMeta: globalBlob,
         batchContext: ctx,
         pageRedoTreeKind: PageRedoTreeKind.table,
@@ -160,7 +160,7 @@ final class TreeMetaPageService {
         pageSize: pageSize,
         partitionNo: 0,
         pageType: BTreePageType.meta,
-        partitionLocal: local,
+        partitionLocal: _applyBatchMarkers(local, ctx),
         treeGlobalMeta: globalBlob,
         batchContext: ctx,
         pageRedoTreeKind: PageRedoTreeKind.indexTree,
@@ -233,7 +233,7 @@ final class TreeMetaPageService {
         pageSize: pageSize,
         partitionNo: 0,
         pageType: BTreePageType.nghMeta,
-        partitionLocal: local,
+        partitionLocal: _applyBatchMarkers(local, ctx),
         treeGlobalMeta: globalBlob,
         batchContext: ctx,
         pageRedoTreeKind: PageRedoTreeKind.ngh,
@@ -298,6 +298,20 @@ final class TreeMetaPageService {
       type: pageType,
       encodedPayload: encoded,
       pageSize: pageSize,
+    );
+  }
+
+  /// Apply flush/maintenance durable markers onto partition-local stats.
+  PartitionLocalStats _applyBatchMarkers(
+    PartitionLocalStats local,
+    BatchContext? ctx,
+  ) {
+    if (ctx == null || ctx.batchId.isEmpty) return local;
+    return local.withBatchMarkers(
+      isMaintenance: ctx.batchType == BatchType.maintenance,
+      batchId: ctx.batchId,
+      preservedFlushKey: local.lastFlushBatchKey,
+      preservedMaintKey: local.lastMaintenanceBatchKey,
     );
   }
 
