@@ -2204,10 +2204,11 @@ class ParallelJournalManager {
     }
   }
 
-  /// Repair statistics for tables/indexes that were NOT marked with
-  /// TableDataMetaUpdatedEntry/IndexMetaUpdatedEntry during recovery.
+  /// Repair tables/indexes that were NOT marked with
+  /// [TableDataMetaUpdatedEntry]/[IndexMetaUpdatedEntry] during recovery
+  /// (partition-0 page0 global meta not journaled as committed for this batch).
   ///
-  /// This handles the case where pages were written but metadata update
+  /// Handles the case where pages were written but page0 meta consistency
   /// was not journaled before crash.
   Future<void> _repairUnflushedTablesAndIndexes({
     required Set<TableUid> batchTables,
@@ -2666,13 +2667,18 @@ class ParallelJournalManager {
   }
 
   /// Replay page redo log for [batchId] if it exists and has content.
-  /// Writes each (path, offset, payload) from the log so recovery does not read possibly corrupted pages.
+  /// Writes each (path, offset, payload) from the log so recovery does not read
+  /// possibly corrupted pages.
   ///
-  /// Redo log contains **intended page images** (what the batch was about to write), not "before" images,
-  /// so we always correct to latest. Consistency: for **flush**, metadata is restored to "before batch"
-  /// and then [_pumpFlush] re-runs the batch (same pages written again, meta updated). For **maintenance**,
-  /// we replay redo first so disk matches intended content, then [_recoverMaintenanceBatch] recovers
-  /// metadata from journal + last partition file on disk, so meta aligns with replayed data.
+  /// Redo log contains **intended page images** (what the batch was about to write).
+  /// Partition-0 page0 images include full tree-global meta (TMP1).
+  /// Legacy [PageRedoTreeMetaRecord] (structure-only) is applied only when page0
+  /// was absent from the same redo log.
+  ///
+  /// Consistency: for **flush**, metadata may be restored to "before batch"
+  /// totals then [_pumpFlush] re-runs the batch. For **maintenance**, redo is
+  /// replayed first so disk matches intended content, then maintenance meta
+  /// recovery aligns journal totals with replayed data.
   Future<void> _replayPageRedoLogIfExists(String batchId) async {
     final redoPath = _dataStore.pathManager
         .getPageRedoLogPath(batchId, spaceName: _dataStore.currentSpaceName);
@@ -2789,9 +2795,35 @@ class ParallelJournalManager {
       if (writes.isEmpty) continue;
       writes.sort((a, b) => a.offset.compareTo(b.offset));
       await _dataStore.storage.writeManyAsBytesAt(path, writes, flush: true);
+
+      // Partition-0 page0 carries global TableDataMeta / IndexMeta / NghIndexMeta.
+      // Invalidate meta caches so later recovery reads the restored page0, not
+      // a pre-crash in-memory snapshot.
+      if (key.partitionNo == 0 && pages.containsKey(0)) {
+        final tableContext = _tableContextFromUid(key.tableUid);
+        if (tableContext != null) {
+          if (key.kind == PageRedoTreeKind.table) {
+            _dataStore.tableDataManager
+                .invalidateTableDataMetaCacheForTable(tableContext);
+          } else if (key.kind == PageRedoTreeKind.indexTree) {
+            final indexUid =
+                _resolveRedoIndexUid(tableContext.schema, key.indexUid);
+            _dataStore.indexManager
+                ?.invalidateIndexMetaCache(key.tableUid, indexUid);
+          } else if (key.kind == PageRedoTreeKind.ngh) {
+            final indexUid =
+                _resolveRedoIndexUid(tableContext.schema, key.indexUid);
+            _dataStore.vectorIndexManager
+                ?.clearCacheForIndex(key.tableUid, indexUid);
+          }
+        }
+      }
     }
 
-    // Apply tree metadata snapshots after pages are restored.
+    // Legacy TreeMetaRecord: only apply when partition-0 page0 was NOT restored
+    // in this redo (old logs before global meta lived in page0). New write path
+    // embeds full meta in page0 images — applying TreeMetaRecord after p0 would
+    // overwrite restored totals with a stale cache RMW.
     if (treeMeta.isNotEmpty) {
       final metaYc = YieldController(
         'ParallelJournalManager._replayPageRedoLog.meta',
@@ -2802,6 +2834,18 @@ class ParallelJournalManager {
         try {
           final tableContext = _tableContextFromUid(TableUid(rec.tableUid));
           if (tableContext == null) continue;
+
+          final p0Key = (
+            kind: rec.treeKind,
+            tableUid: rec.tableUid,
+            indexUid: rec.indexUid ?? IndexUid.empty,
+            partitionNo: 0,
+          );
+          final p0Restored = byPartition[p0Key]?.containsKey(0) == true;
+          if (p0Restored) {
+            continue;
+          }
+
           if (rec.treeKind == PageRedoTreeKind.table) {
             final meta = await _dataStore.tableDataManager
                 .getTableDataMeta(tableContext.tableUid);
@@ -2852,7 +2896,7 @@ class ParallelJournalManager {
               flush: true,
             );
           }
-          // NGH global meta is carried inside page-0 images; no TreeMetaRecord apply.
+          // NGH: global meta is only in page-0 images (never TreeMetaRecord).
         } catch (_) {}
       }
     }
@@ -3100,10 +3144,12 @@ class ParallelJournalManager {
 class _BatchJournalScanResult {
   final bool isCompleted;
 
-  /// Tables whose metadata has been successfully updated (TableDataMetaUpdatedEntry).
+  /// Tables whose partition-0 page0 meta was marked committed
+  /// ([TableDataMetaUpdatedEntry]) for this batch.
   final Set<TableUid> flushedTables;
 
-  /// Indexes whose metadata has been successfully updated (IndexMetaUpdatedEntry).
+  /// Indexes whose partition-0 page0 meta was marked committed
+  /// ([IndexMetaUpdatedEntry]) for this batch.
   ///
   /// Map: `tableUid -> Set<indexUid>`
   final Map<TableUid, Set<IndexUid>> flushedIndexes;
