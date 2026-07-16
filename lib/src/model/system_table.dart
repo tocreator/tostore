@@ -7,9 +7,20 @@ class SystemTable {
   /// Structure: referenced_table -> referencing_table -> foreign_key_info
   static const String _fkReferencesName = '_system_fk_references';
 
-  /// Key-value store table name
+  /// User-facing key-value store table names.
+  ///
+  /// Early design: auto-increment PK + unique secondary index on [key].
   static const String _keyValueName = '_system_kv_store';
   static const String _globalKeyValueName = '_system_global_kv_store';
+
+  /// Engine-internal key-value store table names.
+  ///
+  /// Used for metadata, config, stats, and other small engine state that
+  /// should not live as separate tiny files. [key] is the primary key for
+  /// direct B-tree lookup (no secondary unique index on key).
+  static const String _internalKeyValueName = '_system_internal_kv_store';
+  static const String _internalGlobalKeyValueName =
+      '_system_internal_global_kv_store';
 
   /// Key-value store field names
   static const String keyValueKeyField = 'key';
@@ -21,13 +32,23 @@ class SystemTable {
   /// Stable uid for the engine-managed KV expiry index (immutable across renames).
   static const IndexUid keyValueExpiryIndexUid = IndexUid('i_sys_kv_expiry');
 
-  /// get key-value store table name
+  /// get user-facing key-value store table name
   static String getKeyValueName(bool isGlobal) {
     return isGlobal ? _globalKeyValueName : _keyValueName;
   }
 
+  /// get engine-internal key-value store table name
+  static String getInternalKeyValueName(bool isGlobal) {
+    return isGlobal ? _internalGlobalKeyValueName : _internalKeyValueName;
+  }
+
   static bool isKeyValueTable(String tableName) {
     return tableName == _keyValueName || tableName == _globalKeyValueName;
+  }
+
+  static bool isInternalKeyValueTable(String tableName) {
+    return tableName == _internalKeyValueName ||
+        tableName == _internalGlobalKeyValueName;
   }
 
   /// get foreign key references system table name
@@ -51,6 +72,8 @@ class SystemTable {
     _fkReferencesName,
     _keyValueName,
     _globalKeyValueName,
+    _internalKeyValueName,
+    _internalGlobalKeyValueName,
     keyMigrationProgressTableName,
     // Legacy system table names (append when a system table is removed):
     'system_fk_references',
@@ -71,6 +94,8 @@ class SystemTable {
     _fkReferencesTable(),
     _kVTable(false),
     _kVTable(true),
+    _internalKVTable(false),
+    _internalKVTable(true),
     _keyMigrationProgressTable(),
   ];
 
@@ -202,7 +227,10 @@ class SystemTable {
         ],
       );
 
-  /// Key-value store table
+  /// User-facing key-value store table.
+  ///
+  /// Uses auto-increment PK with a unique secondary index on [key]
+  /// (legacy layout; keep unchanged for compatibility).
   static TableSchema _kVTable(bool isGlobal) => TableSchema(
         name: getKeyValueName(isGlobal),
         tableId: isGlobal ? 'global_kv_store' : 'kv_store',
@@ -233,6 +261,34 @@ class SystemTable {
         indexes: const [
           IndexSchema(fields: [keyValueKeyField], unique: true),
           IndexSchema(fields: [keyValueUpdatedAtField]),
+        ],
+      );
+
+  /// Engine-internal key-value store table.
+  ///
+  /// [key] is the primary key ([PrimaryKeyType.none]) so point lookups hit the
+  /// primary B-tree directly — no secondary unique index on key.
+  /// No TTL fields: intended for durable engine metadata / config / stats.
+  static TableSchema _internalKVTable(bool isGlobal) => TableSchema(
+        name: getInternalKeyValueName(isGlobal),
+        tableId: getInternalKeyValueName(isGlobal),
+        isGlobal: isGlobal,
+        primaryKeyConfig: const PrimaryKeyConfig(
+          name: keyValueKeyField,
+          type: PrimaryKeyType.none,
+        ),
+        fields: const [
+          FieldSchema(
+            name: keyValueValueField,
+            fieldId: keyValueValueField,
+            type: DataType.text,
+          ),
+          FieldSchema(
+            name: keyValueUpdatedAtField,
+            fieldId: keyValueUpdatedAtField,
+            type: DataType.datetime,
+            defaultValueType: DefaultValueType.currentTimestamp,
+          ),
         ],
       );
 }
