@@ -2210,7 +2210,6 @@ class MigrationManager {
         await _dataStore.applyTableRenameSideEffects(
           oldTableName: tableName,
           newTableName: currentTableName,
-          table: tableForSave,
         );
       }
 

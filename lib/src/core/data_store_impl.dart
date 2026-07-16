@@ -67,8 +67,6 @@ import 'index_manager.dart';
 import 'index_tree_partition_manager.dart';
 import 'integrity_checker.dart';
 import 'key_manager.dart';
-import 'key_migration_progress.dart';
-import 'key_migration_runner.dart';
 import 'large_operation_runner.dart';
 import 'lock_manager.dart';
 import 'migration_manager.dart';
@@ -7040,13 +7038,10 @@ class DataStoreImpl {
   /// Apply logical table-rename side effects during schema cutover.
   ///
   /// Data/index paths are keyed by stable [TableUid], so there is no directory
-  /// move. This updates referencing schemas, FK system tables, and in-flight
-  /// key-migration bookkeeping.
+  /// move. This updates referencing schemas and FK system tables.
   Future<void> applyTableRenameSideEffects({
     required String oldTableName,
     required String newTableName,
-    required TableContext table,
-    String? spaceName,
   }) async {
     if (oldTableName == newTableName) return;
 
@@ -7061,30 +7056,6 @@ class DataStoreImpl {
       newTableName,
       referencingTables: updatedReferencingTables,
       throwOnError: true,
-    );
-    await _syncKeyMigrationAfterTableRename(
-      table: table,
-      oldTableName: oldTableName,
-      newTableName: newTableName,
-      spaceName: spaceName ?? currentSpaceName,
-    );
-  }
-
-  Future<void> _syncKeyMigrationAfterTableRename({
-    required TableContext table,
-    required String oldTableName,
-    required String newTableName,
-    required String spaceName,
-  }) async {
-    if (KeyMigrationRunner.isTableMigrating(table)) {
-      KeyMigrationRunner.renameTable(table, newTableName);
-    }
-    await KeyMigrationProgressStore.renameTableProgress(
-      this,
-      table: table,
-      oldTableName: oldTableName,
-      newTableName: newTableName,
-      spaceName: spaceName,
     );
   }
 

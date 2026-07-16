@@ -1,11 +1,13 @@
 import '../model/system_table.dart';
 import '../model/table_context.dart';
-import '../query/query_condition.dart';
 import 'data_store_impl.dart';
 import 'transaction_context.dart';
 import '../model/table_identity.dart';
 
 /// Persistence helpers for [_system_key_migration] progress rows.
+///
+/// Rows are keyed by stable [TableUid] (via [progressKey] and [table_uid]),
+/// so table renames do not require rewriting progress rows.
 class KeyMigrationProgressStore {
   KeyMigrationProgressStore._();
 
@@ -90,51 +92,6 @@ class KeyMigrationProgressStore {
     });
   }
 
-  static Future<void> renameTableProgress(
-    DataStoreImpl dataStore, {
-    required TableContext table,
-    required String oldTableName,
-    required String newTableName,
-    required String spaceName,
-  }) async {
-    final progressTable = await _progressTableContext(dataStore);
-    if (progressTable == null) return;
-    final oldPk = progressKey(table.tableUid, spaceName);
-    final rows = await dataStore.queryBy(
-      progressTable,
-      SystemTable.keyMigrationProgressKeyField,
-      oldPk,
-    );
-
-    if (rows.isNotEmpty) {
-      final oldRow = rows.first;
-      final status =
-          oldRow[SystemTable.keyMigrationStatusField]?.toString() ?? 'running';
-      final checkpoint =
-          oldRow[SystemTable.keyMigrationCheckpointField]?.toString();
-
-      // Delete old progress row
-      await TransactionContext.runAsSystemOperation(() async {
-        await dataStore.deleteInternal(
-          progressTable,
-          QueryCondition.fromMap({
-            SystemTable.keyMigrationProgressKeyField: oldPk,
-          }),
-        );
-      });
-
-      // Insert new progress row
-      table.tableName = TableName(newTableName);
-      await _upsert(
-        dataStore,
-        table: table,
-        spaceName: spaceName,
-        status: status,
-        checkpointKey: checkpoint,
-      );
-    }
-  }
-
   static Future<void> _upsert(
     DataStoreImpl dataStore, {
     required TableContext table,
@@ -146,7 +103,7 @@ class KeyMigrationProgressStore {
     final pk = progressKey(table.tableUid, spaceName);
     final row = <String, dynamic>{
       SystemTable.keyMigrationProgressKeyField: pk,
-      SystemTable.keyMigrationTableNameField: table.tableName,
+      SystemTable.keyMigrationTableUidField: table.tableUid,
       SystemTable.keyMigrationSpaceNameField: spaceName,
       SystemTable.keyMigrationStatusField: status,
     };

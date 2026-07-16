@@ -45,13 +45,6 @@ class KeyMigrationRunner {
   static bool isTableMigrating(TableContext table) =>
       _activeTableMigrations.contains(table.tableUid);
 
-  static void renameTable(TableContext table, String newTableName) {
-    if (_activeTableMigrations.remove(table.tableUid)) {
-      _activeTableMigrations.add(table.tableUid);
-    }
-    table.tableName = TableName(newTableName);
-  }
-
   static bool get isRunning => _runToken != null;
 
   static bool get isPauseRequested => _runToken?.isCancelled ?? false;

@@ -59,7 +59,8 @@ class SystemTable {
   /// Key migration per-table progress (global table).
   static const String keyMigrationProgressTableName = '_system_key_migration';
 
-  static const String keyMigrationTableNameField = 'table_name';
+  /// Stable table identity (immutable across renames). Do not store logical names.
+  static const String keyMigrationTableUidField = 'table_uid';
   static const String keyMigrationSpaceNameField = 'space_name';
   static const String keyMigrationStatusField = 'status';
   static const String keyMigrationCheckpointField = 'checkpoint_key';
@@ -195,8 +196,8 @@ class SystemTable {
         ),
         fields: const [
           FieldSchema(
-            name: keyMigrationTableNameField,
-            fieldId: keyMigrationTableNameField,
+            name: keyMigrationTableUidField,
+            fieldId: keyMigrationTableUidField,
             type: DataType.text,
             nullable: false,
           ),
@@ -220,7 +221,7 @@ class SystemTable {
         ],
         indexes: const [
           IndexSchema(
-            fields: [keyMigrationTableNameField, keyMigrationSpaceNameField],
+            fields: [keyMigrationTableUidField, keyMigrationSpaceNameField],
             unique: true,
           ),
           IndexSchema(fields: [keyMigrationStatusField]),
