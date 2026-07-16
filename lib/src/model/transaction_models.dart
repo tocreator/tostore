@@ -8,6 +8,43 @@ enum TransactionStatus {
   rolledBack,
 }
 
+/// Append-only transaction log event kinds (`tx_*.log` / `status.log`).
+///
+/// [wireId] is the binary on-disk tag (stable; do not renumber).
+/// [wireName] is only for legacy NDJSON migration.
+enum TxnLogEventType {
+  begin(1, 'begin'),
+  commit(2, 'commit'),
+  rollback(3, 'rollback'),
+  plan(4, 'plan'),
+  planPersisted(5, 'plan_persisted'),
+  planProgress(6, 'plan_progress'),
+  continueInNextPartition(7, 'continue_in_next_partition');
+
+  const TxnLogEventType(this.wireId, this.wireName);
+
+  /// Stable binary wire id (varint).
+  final int wireId;
+
+  /// Legacy NDJSON `event` string.
+  final String wireName;
+
+  static final Map<int, TxnLogEventType> _byWireId = {
+    for (final e in TxnLogEventType.values) e.wireId: e,
+  };
+
+  static final Map<String, TxnLogEventType> _byWireName = {
+    for (final e in TxnLogEventType.values) e.wireName: e,
+  };
+
+  static TxnLogEventType? fromWireId(int id) => _byWireId[id];
+
+  static TxnLogEventType? fromWireName(String? name) {
+    if (name == null || name.isEmpty) return null;
+    return _byWireName[name] ?? _byWireName[name.toLowerCase()];
+  }
+}
+
 /// A single operation within a transaction, captured with before-image for rollback
 class TransactionEntry {
   final String transactionId;
@@ -161,26 +198,6 @@ class HeavyDeletePlan {
     this.limit,
     this.offset,
   });
-
-  Map<String, dynamic> toJson() {
-    return {
-      'tableUid': tableUid,
-      'condition': condition,
-      if (orderBy != null) 'orderBy': orderBy,
-      if (limit != null) 'limit': limit,
-      if (offset != null) 'offset': offset,
-    };
-  }
-
-  factory HeavyDeletePlan.fromJson(Map<String, dynamic> json) {
-    return HeavyDeletePlan(
-      tableUid: TableUid((json['tableUid'] ?? json['tableName']) as String),
-      condition: (json['condition'] as Map).cast<String, dynamic>(),
-      orderBy: (json['orderBy'] as List?)?.cast<String>(),
-      limit: (json['limit'] as num?)?.toInt(),
-      offset: (json['offset'] as num?)?.toInt(),
-    );
-  }
 }
 
 /// Heavy update plan descriptor for deferred execution at commit time
@@ -200,31 +217,11 @@ class HeavyUpdatePlan {
     this.limit,
     this.offset,
   });
-
-  Map<String, dynamic> toJson() {
-    return {
-      'tableUid': tableUid,
-      'condition': condition,
-      'updateData': updateData,
-      if (orderBy != null) 'orderBy': orderBy,
-      if (limit != null) 'limit': limit,
-      if (offset != null) 'offset': offset,
-    };
-  }
-
-  factory HeavyUpdatePlan.fromJson(Map<String, dynamic> json) {
-    return HeavyUpdatePlan(
-      tableUid: TableUid((json['tableUid'] ?? json['tableName']) as String),
-      condition: (json['condition'] as Map).cast<String, dynamic>(),
-      updateData: (json['updateData'] as Map).cast<String, dynamic>(),
-      orderBy: (json['orderBy'] as List?)?.cast<String>(),
-      limit: (json['limit'] as num?)?.toInt(),
-      offset: (json['offset'] as num?)?.toInt(),
-    );
-  }
 }
 
-/// Compact commit plan persisted at commit time for crash recovery
+/// Compact commit plan persisted at commit time for crash recovery.
+///
+/// Disk encoding is binary ([TxnEncoder]); this model stays Map-based in memory.
 class TransactionCommitPlan {
   final String transactionId;
   final Map<String, List<Map<String, dynamic>>>
@@ -245,42 +242,4 @@ class TransactionCommitPlan {
     List<HeavyUpdatePlan>? heavyUpdates,
   })  : heavyDeletes = heavyDeletes ?? const <HeavyDeletePlan>[],
         heavyUpdates = heavyUpdates ?? const <HeavyUpdatePlan>[];
-
-  Map<String, dynamic> toJson() {
-    return {
-      'transactionId': transactionId,
-      'inserts': inserts,
-      'updates': updates,
-      'deletes': deletes,
-      if (heavyDeletes.isNotEmpty)
-        'heavyDeletes': heavyDeletes.map((e) => e.toJson()).toList(),
-      if (heavyUpdates.isNotEmpty)
-        'heavyUpdates': heavyUpdates.map((e) => e.toJson()).toList(),
-    };
-  }
-
-  factory TransactionCommitPlan.fromJson(Map<String, dynamic> json) {
-    return TransactionCommitPlan(
-      transactionId: json['transactionId'] as String,
-      inserts: (json['inserts'] as Map<String, dynamic>?)?.map((k, v) =>
-              MapEntry(k, (v as List).cast<Map<String, dynamic>>())) ??
-          <String, List<Map<String, dynamic>>>{},
-      updates: (json['updates'] as Map<String, dynamic>?)?.map((k, v) =>
-              MapEntry(k, (v as List).cast<Map<String, dynamic>>())) ??
-          <String, List<Map<String, dynamic>>>{},
-      deletes: (json['deletes'] as Map<String, dynamic>?)?.map((k, v) =>
-              MapEntry(k, (v as List).cast<Map<String, dynamic>>())) ??
-          <String, List<Map<String, dynamic>>>{},
-      heavyDeletes: (json['heavyDeletes'] as List?)
-              ?.map((e) =>
-                  HeavyDeletePlan.fromJson((e as Map).cast<String, dynamic>()))
-              .toList() ??
-          const <HeavyDeletePlan>[],
-      heavyUpdates: (json['heavyUpdates'] as List?)
-              ?.map((e) =>
-                  HeavyUpdatePlan.fromJson((e as Map).cast<String, dynamic>()))
-              .toList() ??
-          const <HeavyUpdatePlan>[],
-    );
-  }
 }
