@@ -16,6 +16,7 @@ import '../model/ngh_index_meta.dart';
 import '../handler/space_manifest_codec.dart';
 import '../model/space_manifest.dart';
 import '../model/id_generator.dart';
+import 'transaction_log_migration.dart';
 
 /// Version 3 upgrade:
 /// - Restructures storage directory names from physical table/index names to stable UIDs.
@@ -24,7 +25,9 @@ import '../model/id_generator.dart';
 /// - Writes `space_manifest.bin` deferred space metadata.
 /// - Migrates pending parallel-batch `tablePlan` out of A/B journal into WalMeta,
 ///   then deletes `journal_a.log` / `journal_b.log`.
-/// - Bumps version config markers and cleans up legacy map properties.
+/// - Migrates legacy NDJSON transaction logs to binary ToTX.
+/// - Bumps version config markers last (after format migrations) for crash resume.
+/// - Cleans up legacy map properties.
 class V3Upgrade {
   final DataStoreImpl _dataStore;
 
@@ -337,20 +340,12 @@ class V3Upgrade {
     }
 
     // Always lock pageSize from sampled legacy meta (or default).
-    // When [skipVersionBump] (v2 path), version is bumped by the caller later.
+    // Version bump is deferred until after journal/txn migrations so a crash
+    // mid-upgrade can re-enter this path on next startup.
     final resolvedPageSize =
         _discoveredPageSize ?? InternalConfig.defaultPageSize;
-    if (!skipVersionBump) {
-      for (final spaceName in spaces) {
-        await _upgradeSpaceVersion(spaceName);
-      }
-
-      final updatedGlobal =
-          oldGlobalConfig.setVersion(InternalConfig.engineVersion).copyWith(
-                pageSize: resolvedPageSize,
-              );
-      await _dataStore.saveGlobalConfig(updatedGlobal);
-    } else if (!oldGlobalConfig.hasConfiguredPageSize) {
+    if (!oldGlobalConfig.hasConfiguredPageSize) {
+      // Persist pageSize early without bumping version yet.
       await _dataStore.saveGlobalConfig(
         oldGlobalConfig.copyWith(pageSize: resolvedPageSize),
       );
@@ -375,6 +370,24 @@ class V3Upgrade {
     // then delete legacy journal files.
     for (final spaceName in spaces) {
       await _migrateParallelJournalIntoWalMeta(spaceName);
+    }
+
+    // Migrate legacy NDJSON transaction logs to binary ToTX format.
+    // Must finish before version bump so crash mid-migration re-runs V3.
+    await TransactionLogMigration(_dataStore).migrateAllSpaces(spaces);
+
+    // Version bump last — only after all durable format migrations succeed.
+    // When [skipVersionBump] (v2 path), version is bumped by the caller later.
+    if (!skipVersionBump) {
+      for (final spaceName in spaces) {
+        await _upgradeSpaceVersion(spaceName);
+      }
+
+      final updatedGlobal =
+          oldGlobalConfig.setVersion(InternalConfig.engineVersion).copyWith(
+                pageSize: resolvedPageSize,
+              );
+      await _dataStore.saveGlobalConfig(updatedGlobal);
     }
 
     Logger.info(
