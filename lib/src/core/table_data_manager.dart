@@ -53,7 +53,7 @@ class TableDataManager {
 
   TableContext _resolveTableContext(TableContext table, {TableSchema? schema}) {
     if (schema != null && schema.tableUid.isNotEmpty) {
-      final route = _dataStore.schemaManager?.getRouteByUid(schema.tableUid);
+      final route = _dataStore.tableMetaManager?.getRouteByUid(schema.tableUid);
       if (route != null) {
         return TableContext(
           tableUid: schema.tableUid,
@@ -68,7 +68,7 @@ class TableDataManager {
   }
 
   TableContext? _tableContextFromUid(TableUid tableUid) {
-    return _dataStore.schemaManager?.getTableContextSync(tableUid);
+    return _dataStore.tableMetaManager?.getTableContextSync(tableUid);
   }
 
   // Store table partition size configuration (in bytes)
@@ -446,7 +446,7 @@ class TableDataManager {
         tableUid,
       );
     } catch (e) {
-      final logTable = _dataStore.schemaManager
+      final logTable = _dataStore.tableMetaManager
               ?.resolveTableNameFromField(tableUid)
               ?.value ??
           'unknown';
@@ -623,11 +623,11 @@ class TableDataManager {
   Future<void> recalculateAllStatistics() async {
     try {
       // Get all table data metadata (only user tables, excluding system tables)
-      final schemaManager = _dataStore.schemaManager;
-      if (schemaManager == null) return;
+      final tableMetaManager = _dataStore.tableMetaManager;
+      if (tableMetaManager == null) return;
 
       final tableNames =
-          await schemaManager.listAllTables(onlyUserTables: true);
+          await tableMetaManager.listAllTables(onlyUserTables: true);
 
       int tableCount = tableNames.length;
       int totalRecords = 0;
@@ -645,9 +645,9 @@ class TableDataManager {
       final metaList = await ParallelProcessor.execute<TableDataMeta?>(
         tableNames.map((name) {
           return () async {
-            final uid = schemaManager.getUidByName(TableName(name));
+            final uid = tableMetaManager.getUidByName(TableName(name));
             if (uid == null) return null;
-            final ctx = schemaManager.getTableContextSync(uid);
+            final ctx = tableMetaManager.getTableContextSync(uid);
             if (ctx == null) return null;
             return getTableDataMeta(ctx.tableUid);
           };
@@ -772,7 +772,7 @@ class TableDataManager {
     try {
       // Get table schema
       final schema =
-          await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+          await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
       if (schema == null) {
         return '';
       }
@@ -819,7 +819,7 @@ class TableDataManager {
 
       // Get table schema
       final schema =
-          await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+          await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
       if (schema == null) {
         return [];
       }
@@ -997,7 +997,7 @@ class TableDataManager {
     required String schemaVersion,
   }) async {
     final schema =
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) {
       Logger.error('Table schema is null, cannot add to buffer');
       return;
@@ -1608,7 +1608,7 @@ class TableDataManager {
     if (records.isEmpty) return;
 
     final schema =
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) {
       Logger.error('Table schema is null, cannot add to delete buffer');
       return;
@@ -1620,7 +1620,8 @@ class TableDataManager {
       final s = <String>{primaryKey};
       // Collect all fields used in any index (auto-generated unique/fk or explicit)
       final allIndexes =
-          _dataStore.schemaManager?.getAllIndexesFor(schema) ?? <IndexSchema>[];
+          _dataStore.tableMetaManager?.getAllIndexesFor(schema) ??
+              <IndexSchema>[];
       for (final idx in allIndexes) {
         s.addAll(idx.fields);
       }
@@ -1666,7 +1667,7 @@ class TableDataManager {
     bool updateStats = true,
   }) async {
     final schema =
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) return;
 
     final primaryKey = schema.primaryKey;
@@ -1788,7 +1789,7 @@ class TableDataManager {
       if (defOps != null && defOps.isNotEmpty) {
         try {
           final schema =
-              await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+              await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
           final pkName = schema?.primaryKey;
           if (pkName != null && pkName.isNotEmpty) {
             // Track unique primary keys to avoid double counting the same record.
@@ -2058,7 +2059,7 @@ class TableDataManager {
   Future<IdGenerator> _createIdGeneratorForTable(TableContext table) async {
     try {
       final schema =
-          await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+          await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
       if (schema == null) {
         throw DbException([
           SchemaValidationStatus(
@@ -2202,7 +2203,7 @@ class TableDataManager {
       {bool forceRecalculate = false}) async {
     try {
       final schema =
-          await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+          await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
       if (schema == null) {
         Logger.error('Table schema is null, cannot update max id');
         return;
@@ -2322,7 +2323,7 @@ class TableDataManager {
       TableContext table, dynamic conflictId) async {
     try {
       final schema =
-          await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+          await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
       if (schema == null) return;
 
       // Ensure max ID is loaded and up-to-date by recalculating from partitions and buffer
@@ -2415,7 +2416,7 @@ class TableDataManager {
   Stream<Map<String, dynamic>> streamRecords(TableContext table,
       {Uint8List? customKey, int? customKeyId}) async* {
     final schema =
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) {
       Logger.error('Failed to get schema for ${table.tableName}');
       return;
@@ -2831,8 +2832,8 @@ class TableDataManager {
 
           // 6. handle auto increment ID reset
           try {
-            final schema =
-                await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+            final schema = await _dataStore.tableMetaManager
+                ?.getTableSchema(table.tableUid);
             if (schema == null) {
               return;
             }
@@ -2927,8 +2928,8 @@ class TableDataManager {
       // In migration scenarios, this should be the OLD schema before changes
       final sourceTable = await _dataStore.getTableContext(sourceTableName);
       final targetTable = await _dataStore.getTableContext(targetTableName);
-      final sourceSchema =
-          await _dataStore.schemaManager?.getTableSchema(sourceTable.tableUid);
+      final sourceSchema = await _dataStore.tableMetaManager
+          ?.getTableSchema(sourceTable.tableUid);
       if (sourceSchema == null) {
         return;
       }
@@ -3020,7 +3021,7 @@ class TableDataManager {
     Iterable<String>? explicitTxInsertKeys,
   }) async {
     final schema =
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) return records;
 
     final tableContext = _resolveTableContext(table, schema: schema);
@@ -3587,7 +3588,7 @@ class TableDataManager {
     if (keys.isEmpty) return TableScanResult(records: []);
 
     final schema = decodeSchema ??
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) return TableScanResult(records: []);
 
     final results = <Map<String, dynamic>>[];
@@ -3894,7 +3895,7 @@ class TableDataManager {
       spaceName: _dataStore.currentSpaceName,
     );
     final schema = decodeSchema ??
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) {
       return TableScanResult(
           records: const [],
