@@ -15,8 +15,8 @@ class KeyMigrationProgressStore {
       '$tableUid|$spaceName';
 
   static Future<void> ensureTable(DataStoreImpl dataStore) async {
-    final schemaManager = dataStore.schemaManager;
-    if (schemaManager == null) return;
+    final tableMetaManager = dataStore.tableMetaManager;
+    if (tableMetaManager == null) return;
 
     final tableName = SystemTable.keyMigrationProgressTableName;
     if (await dataStore.tableExists(tableName)) return;
@@ -31,10 +31,10 @@ class KeyMigrationProgressStore {
 
   static Future<TableContext?> _progressTableContext(
       DataStoreImpl dataStore) async {
-    final uid = dataStore.schemaManager
+    final uid = dataStore.tableMetaManager
         ?.getUidByName(TableName(SystemTable.keyMigrationProgressTableName));
     if (uid == null) return null;
-    return dataStore.schemaManager?.getTableContext(uid);
+    return dataStore.tableMetaManager?.getTableContext(uid);
   }
 
   static Future<String?> loadCheckpoint(
