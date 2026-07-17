@@ -95,11 +95,6 @@ class TableSchema {
   String get primaryKey => primaryKeyConfig.name;
 
   /// Prepare a caller-defined schema for first-time table creation.
-  ///
-  /// Copies only the declarative shape (name, fields, indexes, …) and assigns
-  /// engine-owned identifiers. [tableUid], [schemaVersion], and [autoIndexes]
-  /// are never taken from user input; index uids are assigned later in
-  /// [SchemaManager.saveTableSchema] via [generateAutoIndexes].
   TableSchema materializeForCreate({bool isSystemTable = false}) {
     final cleaned = cleanInternalFields();
     return TableSchema._internal(
@@ -2190,10 +2185,6 @@ class IndexSchema {
   final VectorIndexConfig? vectorConfig;
 
   /// Stable unique identifier (immutable across renames).
-  ///
-  /// Assigned by [TableSchema.generateAutoIndexes] before schema persistence.
-  /// May be [IndexUid.empty] only on in-memory [IndexSchema] builders prior to
-  /// the first [SchemaManager.saveTableSchema] / v3 upgrade pass.
   final IndexUid indexUid;
 
   const IndexSchema({
