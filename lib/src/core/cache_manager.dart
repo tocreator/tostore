@@ -67,10 +67,10 @@ final class CacheManager {
       }
     });
 
-    // Schema cache (SchemaManager + HotspotCache)
+    // Schema cache (tableMetaManager + HotspotCache)
     mm.registerCacheEvictionCallback(MemoryQuotaType.schema, () async {
       try {
-        await _dataStore.schemaManager?.evictSchemaCache(ratio: 0.3);
+        await _dataStore.tableMetaManager?.evictSchemaCache(ratio: 0.3);
       } catch (e) {
         Logger.warn('Evict schema cache failed', rawError: e);
       }
@@ -92,7 +92,7 @@ final class CacheManager {
   }
 
   int getCurrentSchemaCacheSize() {
-    return _dataStore.schemaManager?.getCurrentSchemaCacheSize() ?? 0;
+    return _dataStore.tableMetaManager?.getCurrentSchemaCacheSize() ?? 0;
   }
 
   int getCurrentTableDataCacheSize() {
@@ -138,7 +138,7 @@ final class CacheManager {
   Future<void> dispose({bool includeSchema = true}) async {
     // Batch wait for multiple asynchronous tasks
     await Future.wait([
-      _dataStore.schemaManager?.dispose() ?? Future.value(),
+      _dataStore.tableMetaManager?.dispose() ?? Future.value(),
       _dataStore.tableDataManager.dispose(),
       _dataStore.indexManager?.dispose() ?? Future.value(),
       _dataStore.vectorIndexManager?.dispose() ?? Future.value(),
@@ -188,7 +188,7 @@ final class CacheManager {
         _dataStore.tableTreePartitionManager?.clearPageCacheForTable(table);
       }
       if (invalidateSchema) {
-        _dataStore.schemaManager?.removeCachedTableSchema(table.tableUid);
+        _dataStore.tableMetaManager?.removeCachedTableSchema(table.tableUid);
       }
 
       if (invalidateQuery) {
