@@ -100,7 +100,7 @@ class IndexManager {
     if (uidOrName.isEmpty) return IndexUid.empty;
     final asUid = IndexUid(uidOrName);
     final s = schema ?? table.schema;
-    final schemaMgr = _dataStore.schemaManager;
+    final schemaMgr = _dataStore.tableMetaManager;
     if (schemaMgr != null && schemaMgr.findIndexSchemaByUid(s, asUid) != null) {
       return asUid;
     }
@@ -123,7 +123,7 @@ class IndexManager {
     if (_isInternalKvExpiryIndexField(table, indexName)) {
       return SystemTable.keyValueExpiryIndexUid;
     }
-    final schemaMgr = _dataStore.schemaManager;
+    final schemaMgr = _dataStore.tableMetaManager;
     if (schemaMgr == null) return IndexUid.empty;
     final s = schema ?? table.schema;
     final byName = schemaMgr.findIndexSchemaByField(s, indexName);
@@ -152,7 +152,7 @@ class IndexManager {
     TableContext? table,
   }) {
     if (indexUid.isEmpty) return null;
-    final schemaMgr = _dataStore.schemaManager;
+    final schemaMgr = _dataStore.tableMetaManager;
     if (schemaMgr == null) return null;
 
     final byUid = schemaMgr.findIndexSchemaByUid(schema, indexUid);
@@ -464,7 +464,7 @@ class IndexManager {
         indexKey,
       );
     } catch (e) {
-      final logTable = _dataStore.schemaManager
+      final logTable = _dataStore.tableMetaManager
               ?.resolveTableNameFromField(tableUid)
               ?.value ??
           'unknown';
@@ -546,7 +546,7 @@ class IndexManager {
       return null;
     }
     final schema =
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) return null;
     return _encodeInternalKvExpiryIndexKey(schema, expiresAt, primaryKey);
   }
@@ -561,7 +561,7 @@ class IndexManager {
     }
 
     final schema =
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) {
       return IndexSearchResult.empty();
     }
@@ -710,10 +710,10 @@ class IndexManager {
       {TableSchema? overrideSchema, bool force = false}) async {
     try {
       final schema = overrideSchema ??
-          await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+          await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
       if (schema == null) return;
       final indexes = <IndexSchema>[
-        ...?_dataStore.schemaManager?.getAllIndexesFor(schema),
+        ...?_dataStore.tableMetaManager?.getAllIndexesFor(schema),
         ...getEngineManagedBtreeIndexes(table, schema),
       ];
       if (indexes.isEmpty) return;
@@ -1018,7 +1018,7 @@ class IndexManager {
     // Memory mode: index data cache is the primary index store.
     // Use in-memory TreeCache scan to preserve cursor paging semantics.
     final schema =
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) return IndexSearchResult.tableScan();
     return _scanIndexDataCacheRange(
       table: table,
@@ -1070,7 +1070,8 @@ class IndexManager {
     }
     final migrationMgr = _dataStore.migrationManager;
     if (migrationMgr != null) {
-      final tableUid = _dataStore.schemaManager?.getUidByName(table.tableName);
+      final tableUid =
+          _dataStore.tableMetaManager?.getUidByName(table.tableName);
       if (tableUid != null &&
           migrationMgr.hasPendingIndexBuild(tableUid, indexUid)) {
         return true;
@@ -1099,7 +1100,7 @@ class IndexManager {
     final direct = await _loadIndexMetaCached(tableUid, indexUid);
     if (direct != null) return direct;
 
-    final table = _dataStore.schemaManager?.getTableContextSync(tableUid);
+    final table = _dataStore.tableMetaManager?.getTableContextSync(tableUid);
     if (table == null) return null;
     final resolved = _resolveIndexUidFromIndexName(table, indexUid.value);
     // Same uid ⇒ the IndexUid path already missed; do not retry.
@@ -1218,16 +1219,17 @@ class IndexManager {
       // Synthesize an in-memory IndexMeta from the consolidated index list
       // (includes implicit indexes like TTL / foreign keys).
       try {
-        final schema = await _dataStore.schemaManager?.getTableSchema(tableUid);
+        final schema =
+            await _dataStore.tableMetaManager?.getTableSchema(tableUid);
         if (schema != null) {
           final allIndexes = <IndexSchema>[
-            ...?_dataStore.schemaManager?.getAllIndexesFor(schema),
+            ...?_dataStore.tableMetaManager?.getAllIndexesFor(schema),
             ...getEngineManagedBtreeIndexes(
-                _dataStore.schemaManager?.getTableContextSync(tableUid) ??
+                _dataStore.tableMetaManager?.getTableContextSync(tableUid) ??
                     TableContext(
                       tableUid: tableUid,
                       tableName:
-                          _dataStore.schemaManager?.getNameByUid(tableUid) ??
+                          _dataStore.tableMetaManager?.getNameByUid(tableUid) ??
                               TableName(tableUid),
                       isGlobal: false,
                       dataDirIndex: 0,
@@ -1241,7 +1243,7 @@ class IndexManager {
           );
           if (idx.fields.isNotEmpty) {
             final tableContext =
-                _dataStore.schemaManager?.getTableContextSync(tableUid);
+                _dataStore.tableMetaManager?.getTableContextSync(tableUid);
             final isBuilding = tableContext != null
                 ? _shouldCreateIndexAsBuilding(tableContext, indexUid)
                 : false;
@@ -1361,7 +1363,7 @@ class IndexManager {
     if (indexes.isEmpty) return;
 
     final tableSchema = tableSchemaOverride ??
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (tableSchema == null) return;
 
     for (final schema in indexes) {
@@ -1467,7 +1469,7 @@ class IndexManager {
 
       // Get table structure
       final tableSchema = tableSchemaOverride ??
-          await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+          await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
       if (tableSchema == null) {
         return;
       }
@@ -1595,8 +1597,9 @@ class IndexManager {
       }
     }
 
-    final tableUid = _dataStore.schemaManager?.getUidByName(table.tableName) ??
-        table.tableUid;
+    final tableUid =
+        _dataStore.tableMetaManager?.getUidByName(table.tableName) ??
+            table.tableUid;
     final indexMeta = IndexMeta.createEmpty(
       indexUid: indexUid,
       tableUid: tableUid,
@@ -1626,13 +1629,13 @@ class IndexManager {
     try {
       // Get table structure
       final schema =
-          await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+          await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
       if (schema == null) {
         return;
       }
 
       // Clear all index data (files + caches).
-      final indexesToReset = _dataStore.schemaManager
+      final indexesToReset = _dataStore.tableMetaManager
               ?.getAllIndexesFor(schema)
               .map((i) => i.indexUid.value)
               .toList() ??
@@ -1650,7 +1653,7 @@ class IndexManager {
       allIndexesToReset.addAll(engineManagedIndexes);
       // Add mapping indexes only for vector indexes (using dedicated method for efficiency)
       final vectorIndexes =
-          _dataStore.schemaManager?.getVectorIndexesFor(schema) ??
+          _dataStore.tableMetaManager?.getVectorIndexesFor(schema) ??
               const <IndexSchema>[];
       for (final indexSchema in vectorIndexes) {
         final mappingBase = indexSchema.indexUid.value;
@@ -1724,7 +1727,7 @@ class IndexManager {
 
         // Collect B+Tree indexes to rebuild (vector indexes are managed separately).
         final indexesToBuild =
-            _dataStore.schemaManager?.getBtreeIndexesFor(schema);
+            _dataStore.tableMetaManager?.getBtreeIndexesFor(schema);
         if (indexesToBuild == null || indexesToBuild.isEmpty) return;
 
         // Use optimized batch index building mechanism
@@ -1752,7 +1755,7 @@ class IndexManager {
   }) {
     final byUid = table != null
         ? _findBtreeIndexSchema(schema, indexUid, table: table)
-        : _dataStore.schemaManager?.findIndexSchemaByUid(schema, indexUid);
+        : _dataStore.tableMetaManager?.findIndexSchemaByUid(schema, indexUid);
     if (byUid != null) return byUid;
     return IndexSchema(
       indexName: indexUid.value,
@@ -1804,7 +1807,7 @@ class IndexManager {
 
         // Lock the index building state (read-modify-write under meta lock).
         final tableUid =
-            _dataStore.schemaManager?.getUidByName(table.tableName) ??
+            _dataStore.tableMetaManager?.getUidByName(table.tableName) ??
                 table.tableUid;
         await mutateIndexMeta(
           table,
@@ -1866,7 +1869,7 @@ class IndexManager {
       bool skipBufferCheck = false}) async {
     try {
       final schema = schemaOverride ??
-          await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+          await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
       if (schema == null) {
         return null;
       }
@@ -1972,7 +1975,7 @@ class IndexManager {
       }
 
       // Add all unique indexes from schema (single and composite)
-      final allIndexes = _dataStore.schemaManager?.getAllIndexesFor(schema);
+      final allIndexes = _dataStore.tableMetaManager?.getAllIndexesFor(schema);
       if (allIndexes == null) return null;
       for (final index in allIndexes) {
         if (!index.unique) continue;
@@ -2298,7 +2301,7 @@ class IndexManager {
         YieldController('IndexManager.checkUniqueConstraintsBatch');
 
     final schema = schemaOverride ??
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) {
       return List<UniqueViolation?>.filled(records.length, null,
           growable: false);
@@ -2446,7 +2449,7 @@ class IndexManager {
 
     // 2) Unique indexes
     final uniqueIndexes =
-        (_dataStore.schemaManager?.getUniqueIndexesFor(schema) ??
+        (_dataStore.tableMetaManager?.getUniqueIndexesFor(schema) ??
             const <IndexSchema>[]);
     if (uniqueIndexes.isEmpty) return violations;
 
@@ -2759,7 +2762,7 @@ class IndexManager {
         ]);
       }
 
-      final schemaMgr = _dataStore.schemaManager;
+      final schemaMgr = _dataStore.tableMetaManager;
       final schema = await schemaMgr?.getTableSchema(table.tableUid);
       if (schema == null) {
         Logger.warn(
@@ -3085,7 +3088,7 @@ class IndexManager {
         // Clean physical index files before rebuild starts
         await deletePhysicalIndexArtifacts(table, indexUid);
         final tableUid =
-            _dataStore.schemaManager?.getUidByName(table.tableName) ??
+            _dataStore.tableMetaManager?.getUidByName(table.tableName) ??
                 table.tableUid;
         final indexMeta = IndexMeta.createEmpty(
           indexUid: indexUid,
@@ -3306,7 +3309,8 @@ class IndexManager {
   }) {
     final indexSchema = table != null
         ? _findBtreeIndexSchema(schema, meta.indexUid, table: table)
-        : _dataStore.schemaManager?.findIndexSchemaByUid(schema, meta.indexUid);
+        : _dataStore.tableMetaManager
+            ?.findIndexSchemaByUid(schema, meta.indexUid);
     if (indexSchema == null || indexSchema.fields.isEmpty) return null;
     final fields = indexSchema.fields;
     final isUnique = meta.isUnique;
@@ -3350,7 +3354,7 @@ class IndexManager {
     final updatesCopy = List<IndexRecordUpdate>.from(updates);
     final deletesCopy = List<Map<String, dynamic>>.from(deletes);
     final schema = schemaOverride ??
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) return;
     final pkName = schema.primaryKey;
 
@@ -3358,7 +3362,7 @@ class IndexManager {
     final targets = List<IndexSchema>.from(
       targetIndexesOverride ??
           <IndexSchema>[
-            ...?_dataStore.schemaManager?.getAllIndexesFor(schema),
+            ...?_dataStore.tableMetaManager?.getAllIndexesFor(schema),
             ...getEngineManagedBtreeIndexes(table, schema),
           ],
     );
@@ -3419,7 +3423,7 @@ class IndexManager {
       }
       idxTasks.add(() async {
         final tableUid =
-            _dataStore.schemaManager?.getUidByName(table.tableName) ??
+            _dataStore.tableMetaManager?.getUidByName(table.tableName) ??
                 table.tableUid;
         var meta = await getIndexMeta(table.tableUid, indexUid);
         // If index metadata doesn't exist, create it in memory only (avoid extra IO)
@@ -3569,7 +3573,7 @@ class IndexManager {
     bool readFromFileOnly = false,
   }) async {
     final schema =
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) return IndexSearchResult.tableScan();
     if (indexUid.isEmpty) return IndexSearchResult.tableScan();
 
