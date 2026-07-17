@@ -119,10 +119,11 @@ class PathManager {
       return 'memory://${dataStore.currentSpaceName}/tables/$uid';
     }
 
-    final route = dataStore.schemaManager?.getRouteByUid(tableUid);
+    final route = dataStore.tableMetaManager?.getRouteByUid(tableUid);
     if (route == null) {
       final displayName =
-          dataStore.schemaManager?.getNameByUid(tableUid)?.value ?? 'unknown';
+          dataStore.tableMetaManager?.getNameByUid(tableUid)?.value ??
+              'unknown';
       throw DbException([
         SchemaValidationStatus(
           type: ResultType.devTableNotFound,
