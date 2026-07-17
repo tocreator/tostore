@@ -145,9 +145,9 @@ class TtlCleanupManager {
   Future<List<TableContext>> _systemKvTableContexts() async {
     final contexts = <TableContext>[];
     for (final name in _systemKvTables()) {
-      final uid = _dataStore.schemaManager?.getUidByName(TableName(name));
+      final uid = _dataStore.tableMetaManager?.getUidByName(TableName(name));
       if (uid == null) continue;
-      final ctx = await _dataStore.schemaManager?.getTableContext(uid);
+      final ctx = await _dataStore.tableMetaManager?.getTableContext(uid);
       if (ctx != null) contexts.add(ctx);
     }
     return contexts;
@@ -162,9 +162,9 @@ class TtlCleanupManager {
       return Map<String, _TtlCleanupPlan>.from(_planCache);
     }
 
-    final tables =
-        await _dataStore.schemaManager?.listAllTables(onlyUserTables: true) ??
-            const <String>[];
+    final tables = await _dataStore.tableMetaManager
+            ?.listAllTables(onlyUserTables: true) ??
+        const <String>[];
     if (tables.isEmpty) {
       _planCache.clear();
       _planCacheRefreshedMs = nowMs;
@@ -190,7 +190,7 @@ class TtlCleanupManager {
       final tasks = tables
           .map<Future<_TtlCleanupPlan?> Function()>(
             (table) => () async {
-              final schema = await _dataStore.schemaManager
+              final schema = await _dataStore.tableMetaManager
                   ?.getTableSchemaByName(TableName(table));
               final ttl = schema?.ttlConfig;
               if (schema == null || ttl == null) return null;
@@ -240,11 +240,11 @@ class TtlCleanupManager {
     required int batchSize,
   }) async {
     final tableName =
-        _dataStore.schemaManager?.resolveTableNameFromField(plan.tableUid) ??
+        _dataStore.tableMetaManager?.resolveTableNameFromField(plan.tableUid) ??
             TableName(plan.tableUid);
     try {
       final table =
-          await _dataStore.schemaManager?.getTableContext(plan.tableUid);
+          await _dataStore.tableMetaManager?.getTableContext(plan.tableUid);
       if (table == null) {
         return const _TtlBatchResult(deleted: 0, ok: false);
       }
@@ -590,7 +590,7 @@ class TtlCleanupManager {
               if (deleted > 0) {
                 roundDeleted += deleted;
                 totalDeleted += deleted;
-                final resolvedName = _dataStore.schemaManager
+                final resolvedName = _dataStore.tableMetaManager
                         ?.resolveTableNameFromField(plan.tableUid) ??
                     TableName(plan.tableUid);
                 Logger.info(
