@@ -248,7 +248,7 @@ class WeightManager {
         if (!existsInSpace) continue;
 
         // Get table schema
-        final schema = await _dataStore.schemaManager
+        final schema = await _dataStore.tableMetaManager
             ?.getTableSchemaByName(TableName(tableName));
         if (schema == null) continue;
 
@@ -271,7 +271,7 @@ class WeightManager {
         }
 
         // Initialize B+Tree index weights (vector index weights are separate).
-        final indexes = _dataStore.schemaManager?.getBtreeIndexesFor(schema);
+        final indexes = _dataStore.tableMetaManager?.getBtreeIndexesFor(schema);
         if (indexes == null) return;
         for (final index in indexes) {
           await yieldController.maybeYield();
@@ -605,7 +605,7 @@ class WeightManager {
   Future<void> _migrateLegacyIndexDataKeys({String? spaceName}) async {
     if (!_hasLegacyIndexDataKeysInCache()) return;
 
-    final schemaMgr = _dataStore.schemaManager;
+    final schemaMgr = _dataStore.tableMetaManager;
     if (schemaMgr == null) return;
 
     final yieldController = YieldController(
