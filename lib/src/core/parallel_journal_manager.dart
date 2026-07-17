@@ -574,7 +574,7 @@ class ParallelJournalManager {
           final tableContext = _resolveTableContext(tableUid);
           if (tableContext == null) continue;
           try {
-            final schema = await _dataStore.schemaManager
+            final schema = await _dataStore.tableMetaManager
                 ?.getTableSchema(tableContext.tableUid);
             final tableDataMeta = await _dataStore.tableDataManager
                 .getTableDataMeta(tableContext.tableUid);
@@ -585,7 +585,7 @@ class ParallelJournalManager {
             if (schema != null) {
               // B+Tree indexes only (vector indexes have separate meta).
               final allIndexes = <IndexSchema>[
-                ...?_dataStore.schemaManager?.getBtreeIndexesFor(schema),
+                ...?_dataStore.tableMetaManager?.getBtreeIndexesFor(schema),
                 ...?_dataStore.indexManager
                     ?.getEngineManagedBtreeIndexes(tableContext, schema),
               ];
@@ -884,7 +884,7 @@ class ParallelJournalManager {
                   }
 
                   final allIndexes = <IndexSchema>[
-                    ...?_dataStore.schemaManager?.getAllIndexesFor(schema),
+                    ...?_dataStore.tableMetaManager?.getAllIndexesFor(schema),
                     ...?_dataStore.indexManager
                         ?.getEngineManagedBtreeIndexes(tableContext, schema),
                   ];
@@ -1241,9 +1241,9 @@ class ParallelJournalManager {
           <TableUid, List<WalPointer>>{};
       try {
         for (final op in _walManager.tableOps.values) {
-          final normalized =
-              _dataStore.schemaManager?.normalizeTableFieldKey(op.tableUid) ??
-                  op.tableUid;
+          final normalized = _dataStore.tableMetaManager
+                  ?.normalizeTableFieldKey(op.tableUid) ??
+              op.tableUid;
           final tableUid = TableUid(normalized);
           tableCutoffs
               .putIfAbsent(tableUid, () => <WalPointer>[])
@@ -1620,7 +1620,7 @@ class ParallelJournalManager {
   /// Slow path (legacy name + in-flight rename): apply pending renames, then normalize.
   TableUid _resolvePersistedTableField(String rawField) {
     if (rawField.isEmpty) return TableUid.empty;
-    final mgr = _dataStore.schemaManager;
+    final mgr = _dataStore.tableMetaManager;
     final normalized = mgr?.normalizeTableFieldKey(rawField) ?? rawField;
     if (mgr != null && mgr.isActiveTableUidKey(normalized)) {
       return TableUid(normalized);
@@ -1636,7 +1636,7 @@ class ParallelJournalManager {
 
   TableContext? _resolveTableContext(TableUid tableUid) {
     if (tableUid.isEmpty) return null;
-    return _dataStore.schemaManager?.getTableContextSync(tableUid);
+    return _dataStore.tableMetaManager?.getTableContextSync(tableUid);
   }
 
   BatchTablePlan? _tablePlanFor(
@@ -1649,7 +1649,7 @@ class ParallelJournalManager {
     Map<TableUid, List<WalPointer>> tableCutoffs,
     TableUid tableUid,
   ) {
-    final mgr = _dataStore.schemaManager;
+    final mgr = _dataStore.tableMetaManager;
     if (mgr == null) {
       return tableCutoffs[tableUid];
     }
@@ -1660,11 +1660,11 @@ class ParallelJournalManager {
   Future<TableSchema?> _resolveTableSchema(TableUid tableUid) async {
     final ctx = _resolveTableContext(tableUid);
     if (ctx == null) return null;
-    return _dataStore.schemaManager?.getTableSchema(ctx.tableUid);
+    return _dataStore.tableMetaManager?.getTableSchema(ctx.tableUid);
   }
 
   TableContext? _tableContextFromUid(TableUid tableUid) {
-    return _dataStore.schemaManager?.getTableContextSync(tableUid);
+    return _dataStore.tableMetaManager?.getTableContextSync(tableUid);
   }
 
   /// Resolve stable [IndexUid] for redo replay (legacy logs may store logical names).
@@ -1674,7 +1674,7 @@ class ParallelJournalManager {
         uidOrName == IndexUid('pk')) {
       return uidOrName;
     }
-    final resolved = _dataStore.schemaManager
+    final resolved = _dataStore.tableMetaManager
         ?.resolveIndexUidFromField(schema, uidOrName.value);
     if (resolved != null && resolved.isNotEmpty) {
       return resolved;
@@ -1837,7 +1837,7 @@ class ParallelJournalManager {
         if (tableContext == null) continue;
         final schema = tableContext.schema;
         final btreeIndexes = <IndexSchema>[
-          ...?_dataStore.schemaManager?.getBtreeIndexesFor(schema),
+          ...?_dataStore.tableMetaManager?.getBtreeIndexesFor(schema),
           ...?_dataStore.indexManager
               ?.getEngineManagedBtreeIndexes(tableContext, schema),
         ];
@@ -1876,9 +1876,9 @@ class ParallelJournalManager {
           <TableUid, List<WalPointer>>{};
       try {
         for (final op in _walManager.tableOps.values) {
-          final normalized =
-              _dataStore.schemaManager?.normalizeTableFieldKey(op.tableUid) ??
-                  op.tableUid;
+          final normalized = _dataStore.tableMetaManager
+                  ?.normalizeTableFieldKey(op.tableUid) ??
+              op.tableUid;
           final tableUid = TableUid(normalized);
           tableCutoffs
               .putIfAbsent(tableUid, () => <WalPointer>[])
@@ -2047,7 +2047,7 @@ class ParallelJournalManager {
     final baseIndexTotalSizeInBytes = <IndexUid, int>{};
     try {
       final btreeIndexes = <IndexSchema>[
-        ...?_dataStore.schemaManager?.getBtreeIndexesFor(schema),
+        ...?_dataStore.tableMetaManager?.getBtreeIndexesFor(schema),
         ...?_dataStore.indexManager
             ?.getEngineManagedBtreeIndexes(tableContext, schema),
       ];
@@ -2446,12 +2446,13 @@ class ParallelJournalManager {
       TableUid tableUid, Map<String, dynamic> data) async {
     final refs = <UniqueKeyRef>[];
     try {
-      final schema = await _dataStore.schemaManager?.getTableSchema(tableUid);
+      final schema =
+          await _dataStore.tableMetaManager?.getTableSchema(tableUid);
       if (schema == null) return refs;
 
       // Unique indexes from schema (implicit/explicit)
       final allIndexes =
-          _dataStore.schemaManager?.getUniqueIndexesFor(schema) ??
+          _dataStore.tableMetaManager?.getUniqueIndexesFor(schema) ??
               <IndexSchema>[];
       for (final idx in allIndexes) {
         // Skip primary key check usually not needed if getAllIndexes doesn't include it or if we handle it
