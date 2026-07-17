@@ -652,15 +652,15 @@ class TransactionManager {
       for (final entry in commitPlan.inserts.entries) {
         final tableUid = entry.key;
         final recs = entry.value;
-        final tableCtx =
-            await _dataStore.schemaManager?.getTableContext(TableUid(tableUid));
+        final tableCtx = await _dataStore.tableMetaManager
+            ?.getTableContext(TableUid(tableUid));
         if (tableCtx == null) {
           Logger.warn(
               'Table context not found for $tableUid during applyCommitPlan');
           continue;
         }
-        final schema =
-            await _dataStore.schemaManager?.getTableSchema(tableCtx.tableUid);
+        final schema = await _dataStore.tableMetaManager
+            ?.getTableSchema(tableCtx.tableUid);
         if (schema == null) {
           Logger.warn(
               'Schema not found for table $tableUid during applyCommitPlan');
@@ -722,15 +722,15 @@ class TransactionManager {
       for (final entry in commitPlan.updates.entries) {
         final tableUid = entry.key;
         final recs = entry.value;
-        final tableCtx =
-            await _dataStore.schemaManager?.getTableContext(TableUid(tableUid));
+        final tableCtx = await _dataStore.tableMetaManager
+            ?.getTableContext(TableUid(tableUid));
         if (tableCtx == null) {
           Logger.warn(
               'Table context not found for $tableUid during applyCommitPlan');
           continue;
         }
-        final schema =
-            await _dataStore.schemaManager?.getTableSchema(tableCtx.tableUid);
+        final schema = await _dataStore.tableMetaManager
+            ?.getTableSchema(tableCtx.tableUid);
         if (schema == null) {
           Logger.warn(
               'Schema not found for table $tableUid during applyCommitPlan');
@@ -807,8 +807,8 @@ class TransactionManager {
         final tableUid = entry.key;
         final recs = entry.value; // now full records
         if (recs.isEmpty) continue;
-        final tableCtx =
-            await _dataStore.schemaManager?.getTableContext(TableUid(tableUid));
+        final tableCtx = await _dataStore.tableMetaManager
+            ?.getTableContext(TableUid(tableUid));
         if (tableCtx == null) {
           Logger.warn(
               'Table context not found for $tableUid during applyCommitPlan');
@@ -868,7 +868,7 @@ class TransactionManager {
         for (final cd in cascadeDeletes) {
           await yieldController.maybeYield();
           final tableContext =
-              await _dataStore.schemaManager?.getTableContext(cd.tableUid);
+              await _dataStore.tableMetaManager?.getTableContext(cd.tableUid);
           if (tableContext == null) continue;
           final tableName = tableContext.tableName;
           try {
@@ -894,7 +894,7 @@ class TransactionManager {
         for (final cu in cascadeUpdates) {
           await yieldController.maybeYield();
           final tableContext =
-              await _dataStore.schemaManager?.getTableContext(cu.tableUid);
+              await _dataStore.tableMetaManager?.getTableContext(cu.tableUid);
           if (tableContext == null) continue;
           final tableName = tableContext.tableName;
           try {
@@ -920,7 +920,7 @@ class TransactionManager {
         for (final hd in commitPlan.heavyDeletes) {
           await yieldController.maybeYield();
           final table =
-              await _dataStore.schemaManager?.getTableContext(hd.tableUid);
+              await _dataStore.tableMetaManager?.getTableContext(hd.tableUid);
           if (table == null) continue;
           final tableName = table.tableName;
           try {
@@ -947,7 +947,7 @@ class TransactionManager {
         for (final hu in commitPlan.heavyUpdates) {
           await yieldController.maybeYield();
           final table =
-              await _dataStore.schemaManager?.getTableContext(hu.tableUid);
+              await _dataStore.tableMetaManager?.getTableContext(hu.tableUid);
           if (table == null) continue;
           final tableName = table.tableName;
           try {
@@ -1249,7 +1249,7 @@ class TransactionManager {
           final lastMs = _recentCommittedWrites.get([tableUid, k]);
           if (lastMs != null && lastMs > startMs) {
             final tableName =
-                _dataStore.schemaManager?.getNameByUid(tableUid) ??
+                _dataStore.tableMetaManager?.getNameByUid(tableUid) ??
                     TableName(tableUid);
             conflicts.add('$tableName:$k');
             return conflicts; // early return on first conflict
@@ -1482,20 +1482,21 @@ class TransactionManager {
 
   Future<TableSchema?> _resolveTableSchemaFromField(String tableField) async {
     final normalized =
-        _dataStore.schemaManager?.normalizeTableFieldKey(tableField) ??
+        _dataStore.tableMetaManager?.normalizeTableFieldKey(tableField) ??
             tableField;
-    final ctx =
-        await _dataStore.schemaManager?.getTableContext(TableUid(normalized));
+    final ctx = await _dataStore.tableMetaManager
+        ?.getTableContext(TableUid(normalized));
     if (ctx == null) return null;
-    return _dataStore.schemaManager?.getTableSchema(ctx.tableUid);
+    return _dataStore.tableMetaManager?.getTableSchema(ctx.tableUid);
   }
 
   Future<TxnTableCodecContext?> _resolveTxnTableCodec(String tableUid) async {
     final schema = await _resolveTableSchemaFromField(tableUid);
     if (schema == null) return null;
     final normalized =
-        _dataStore.schemaManager?.normalizeTableFieldKey(tableUid) ?? tableUid;
-    final struct = await _dataStore.schemaManager
+        _dataStore.tableMetaManager?.normalizeTableFieldKey(tableUid) ??
+            tableUid;
+    final struct = await _dataStore.tableMetaManager
             ?.getStorageFieldStructure(TableUid(normalized), schema: schema) ??
         const [];
     return TxnTableCodecContext(
@@ -1545,7 +1546,7 @@ class TransactionManager {
   Map<String, List<Map<String, dynamic>>> _normalizeCommitPlanTableMap(
     Map<String, List<Map<String, dynamic>>> byTable,
   ) {
-    final mgr = _dataStore.schemaManager;
+    final mgr = _dataStore.tableMetaManager;
     if (mgr == null) return byTable;
     final normalized = <String, List<Map<String, dynamic>>>{};
     for (final entry in byTable.entries) {
