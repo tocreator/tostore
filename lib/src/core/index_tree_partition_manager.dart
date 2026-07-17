@@ -82,8 +82,8 @@ final class IndexTreePartitionManager {
   }
 
   String _indexDisplayName(TableContext table, IndexUid indexUid) {
-    final idx =
-        _dataStore.schemaManager?.findIndexSchemaByUid(table.schema, indexUid);
+    final idx = _dataStore.tableMetaManager
+        ?.findIndexSchemaByUid(table.schema, indexUid);
     return idx?.actualIndexName ?? 'index';
   }
 
