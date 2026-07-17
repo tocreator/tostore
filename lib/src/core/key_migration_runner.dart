@@ -189,9 +189,9 @@ class KeyMigrationRunner {
       if (tableName == SystemTable.keyMigrationProgressTableName) continue;
 
       final tableUid =
-          dataStore.schemaManager?.getUidByName(TableName(tableName));
+          dataStore.tableMetaManager?.getUidByName(TableName(tableName));
       if (tableUid == null) continue;
-      final table = await dataStore.schemaManager?.getTableContext(tableUid);
+      final table = await dataStore.tableMetaManager?.getTableContext(tableUid);
       if (table == null) continue;
 
       if (table.isGlobal && !migrateGlobal) continue;
