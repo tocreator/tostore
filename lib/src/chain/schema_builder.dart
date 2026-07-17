@@ -277,7 +277,7 @@ class SchemaBuilder with FutureBuilderMixin<SchemaUpdateResult> {
     SchemaUpdateResult result;
     try {
       final tableUid =
-          _dataStore.schemaManager?.getUidByName(TableName(_tableName));
+          _dataStore.tableMetaManager?.getUidByName(TableName(_tableName));
       if (tableUid == null) {
         throw DbException([
           SchemaValidationStatus(
