@@ -35,10 +35,10 @@ class ForeignKeyManager {
   ForeignKeyManager(this._dataStore);
 
   TableUid? _uidForName(String name) =>
-      _dataStore.schemaManager?.getUidByName(TableName(name));
+      _dataStore.tableMetaManager?.getUidByName(TableName(name));
 
   TableName _nameForUid(TableUid uid) =>
-      _dataStore.schemaManager?.getNameByUid(uid) ?? TableName(uid);
+      _dataStore.tableMetaManager?.getNameByUid(uid) ?? TableName(uid);
 
   /// Preload foreign key cache synchronously
   ///
@@ -260,7 +260,7 @@ class ForeignKeyManager {
   }) async {
     final tableName = table.tableName;
     final schema =
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) return;
 
     // Check all foreign key constraints for this table
@@ -339,7 +339,7 @@ class ForeignKeyManager {
     required TableContext table,
   }) async {
     final tableName = table.tableName;
-    final referencedSchema = await _dataStore.schemaManager
+    final referencedSchema = await _dataStore.tableMetaManager
         ?.getTableSchemaByName(TableName(fk.referencedTable));
     if (referencedSchema == null) {
       throw DbException([
@@ -978,7 +978,7 @@ class ForeignKeyManager {
           // where all foreign key fields are not null. This is sufficient for RESTRICT check.
           try {
             // Get child table schema to understand field types
-            final childSchema = await _dataStore.schemaManager!
+            final childSchema = await _dataStore.tableMetaManager!
                 .getTableSchemaByName(TableName(referencingTableName));
             if (childSchema == null) {
               // Table doesn't exist, skip this check
@@ -1110,8 +1110,8 @@ class ForeignKeyManager {
           // Set to default: set all foreign key fields to their default values
           try {
             // Get child table schema to get default values
-            final childSchema =
-                await _dataStore.schemaManager?.getTableSchema(childTableUid);
+            final childSchema = await _dataStore.tableMetaManager
+                ?.getTableSchema(childTableUid);
             if (childSchema == null) {
               Logger.warn(
                 'Child table $childTableName does not exist during cascade clear, skipping',
@@ -1175,7 +1175,7 @@ class ForeignKeyManager {
 
     // Get child table schema to ensure type conversion
     final childSchema =
-        await _dataStore.schemaManager?.getTableSchema(childTableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(childTableUid);
     if (childSchema == null) {
       return false;
     }
@@ -1247,7 +1247,7 @@ class ForeignKeyManager {
     // Get child schema for primary key
     // Note: Table may have been dropped during cascade operation, check and handle gracefully
     final childSchema =
-        await _dataStore.schemaManager?.getTableSchema(childTableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(childTableUid);
     if (childSchema == null) {
       Logger.warn(
         'Child table $childTableName does not exist during cascade delete, skipping',
@@ -1264,7 +1264,7 @@ class ForeignKeyManager {
       // Convert condition values to match child table field types
       // This is critical for type matching (e.g., integer foreign key vs text primary key)
       final childSchemaForConversion =
-          await _dataStore.schemaManager?.getTableSchema(childTableUid);
+          await _dataStore.tableMetaManager?.getTableSchema(childTableUid);
       final convertedCondition = <String, dynamic>{};
       if (childSchemaForConversion != null) {
         for (final entry in condition.entries) {
@@ -1432,7 +1432,7 @@ class ForeignKeyManager {
     final childTableName = _nameForUid(childTableUid);
     // Verify that the child table still exists (may have been dropped during cascade)
     final childSchema =
-        await _dataStore.schemaManager?.getTableSchema(childTableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(childTableUid);
     if (childSchema == null) {
       Logger.warn(
         'Child table $childTableName does not exist during cascade update, skipping',
@@ -1441,7 +1441,7 @@ class ForeignKeyManager {
     }
 
     // Verify that the referenced table still exists
-    final referencedSchema = await _dataStore.schemaManager
+    final referencedSchema = await _dataStore.tableMetaManager
         ?.getTableSchemaByName(TableName(fk.referencedTable));
     if (referencedSchema == null) {
       throw DbException([
@@ -1581,7 +1581,7 @@ class ForeignKeyManager {
     // Validate that foreign key fields allow NULL
     // Note: Table may have been dropped during cascade operation, check and handle gracefully
     final childSchema =
-        await _dataStore.schemaManager?.getTableSchema(childTableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(childTableUid);
     if (childSchema == null) {
       Logger.warn(
         'Child table $childTableName does not exist during set NULL operation, skipping',
@@ -1651,7 +1651,7 @@ class ForeignKeyManager {
     // Get the child table structure
     // Note: Table may have been dropped during cascade operation, check and handle gracefully
     final childSchema =
-        await _dataStore.schemaManager?.getTableSchema(childTableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(childTableUid);
     if (childSchema == null) {
       Logger.warn(
         'Child table $childTableName does not exist during set DEFAULT operation, skipping',
