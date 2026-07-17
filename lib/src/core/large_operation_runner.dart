@@ -167,7 +167,8 @@ class LargeOperationRunner {
     final tempConflictTableName = '_system_temp_op_conflict_${op.opId}';
 
     try {
-      final table = await dataStore.schemaManager?.getTableContext(op.tableUid);
+      final table =
+          await dataStore.tableMetaManager?.getTableContext(op.tableUid);
       if (table == null) {
         Logger.warn(
             'Background delete skipped: table not found (opId: ${op.opId}).');
@@ -377,7 +378,8 @@ class LargeOperationRunner {
     final tempConflictTableName = '_system_temp_op_conflict_${op.opId}';
 
     try {
-      final table = await dataStore.schemaManager?.getTableContext(op.tableUid);
+      final table =
+          await dataStore.tableMetaManager?.getTableContext(op.tableUid);
       if (table == null) {
         Logger.warn(
             'Background update skipped: table not found (opId: ${op.opId}).');
@@ -402,7 +404,7 @@ class LargeOperationRunner {
       final Set<String> uniqueFieldsToCheck = <String>{};
       if (dataStore.indexManager != null) {
         final allIndexes =
-            dataStore.schemaManager?.getUniqueIndexesFor(schema) ??
+            dataStore.tableMetaManager?.getUniqueIndexesFor(schema) ??
                 <IndexSchema>[];
         for (final index in allIndexes) {
           if (index.fields.any(
