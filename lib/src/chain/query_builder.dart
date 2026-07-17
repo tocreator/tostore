@@ -224,7 +224,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   QueryBuilder joinWithForeignKey(String tableName,
       {JoinType type = JoinType.inner}) {
     // Store the join request - will be resolved during query execution
-    final joinUid = _db.schemaManager?.getUidByName(TableName(tableName));
+    final joinUid = _db.tableMetaManager?.getUidByName(TableName(tableName));
     if (joinUid == null) {
       throw DbException([
         SchemaValidationStatus(
@@ -301,7 +301,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   Future<bool> clearQueryCache() async {
     await _db.ensureInitialized();
 
-    final tableUid = _db.schemaManager?.getUidByName(TableName(_tableName));
+    final tableUid = _db.tableMetaManager?.getUidByName(TableName(_tableName));
     if (tableUid == null) return false;
 
     // Build cache key to ensure correct matching
@@ -911,7 +911,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
 
     // Get current table schema
     final currentSchema =
-        await _db.schemaManager?.getTableSchemaByName(TableName(_tableName));
+        await _db.tableMetaManager?.getTableSchemaByName(TableName(_tableName));
     if (currentSchema == null) {
       throw DbException([
         SchemaValidationStatus(
@@ -924,13 +924,13 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
 
     for (final pendingJoin in _pendingForeignKeyJoins!) {
       final joinTableUid = TableUid(pendingJoin.tableUid);
-      final resolvedName = _db.schemaManager?.getNameByUid(joinTableUid);
+      final resolvedName = _db.tableMetaManager?.getNameByUid(joinTableUid);
       final tableName = resolvedName?.value ?? pendingJoin.tableUid;
       final type = pendingJoin.type;
 
       // Get target table schema
-      final targetSchema =
-          await _db.schemaManager?.getTableSchemaByName(TableName(tableName));
+      final targetSchema = await _db.tableMetaManager
+          ?.getTableSchemaByName(TableName(tableName));
       if (targetSchema == null) {
         throw DbException([
           SchemaValidationStatus(
