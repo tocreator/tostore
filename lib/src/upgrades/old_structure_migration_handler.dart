@@ -238,7 +238,7 @@ class OldStructureMigrationHandler {
         // parse table structure
         try {
           final schemaJson = jsonDecode(schemaContent);
-          // create new table using SchemaManager
+          // create new table using tableMetaManager
           final schema = TableSchema.fromJson(schemaJson);
           final tableUid = schema.tableUid.isNotEmpty
               ? schema.tableUid
@@ -246,7 +246,7 @@ class OldStructureMigrationHandler {
           final upgradedSchema = schema.tableUid.isEmpty
               ? schema.copyWith(tableUid: tableUid)
               : schema;
-          final dataDirIndex = dataStore.schemaManager!
+          final dataDirIndex = dataStore.tableMetaManager!
               .allocateDataDirIndex(upgradedSchema.isGlobal);
           final tableCtx = TableContext(
             tableUid: TableUid(tableUid),
@@ -255,7 +255,7 @@ class OldStructureMigrationHandler {
             dataDirIndex: dataDirIndex,
             schema: upgradedSchema,
           );
-          await dataStore.schemaManager!.saveTableSchema(
+          await dataStore.tableMetaManager!.saveTableSchema(
             tableCtx,
             upgradedSchema,
             dataDirIndex: dataDirIndex,
