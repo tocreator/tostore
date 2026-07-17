@@ -76,7 +76,7 @@ import 'parallel_journal_manager.dart';
 import 'path_manager.dart';
 import 'read_view_manager.dart';
 import 'resource_manager.dart';
-import 'schema_manager.dart';
+import 'table_meta_manager.dart';
 import 'shared_engine_registry.dart';
 import 'storage_adapter.dart';
 import 'table_data_manager.dart';
@@ -156,7 +156,7 @@ class DataStoreImpl {
   WeightManager? _weightManager;
   late StorageAdapter storage;
   SpaceConfig? _spaceConfigCache;
-  SchemaManager? schemaManager;
+  TableMetaManager? tableMetaManager;
   PathManager? _pathManager;
   LockManager? lockManager;
   TransactionManager? transactionManager;
@@ -738,7 +738,7 @@ class DataStoreImpl {
         flushPolicy: _config!.recoveryFlushPolicy,
       );
 
-      schemaManager = SchemaManager(this);
+      tableMetaManager = TableMetaManager(this);
       _pathManager = PathManager(this);
 
       // Initialize resource manager
@@ -757,14 +757,14 @@ class DataStoreImpl {
           Future(() async => await transactionManager!.initialize()),
         ]);
       } else {
-        // In memory mode, pre-cache all known schemas so that SchemaManager
+        // In memory mode, pre-cache all known schemas so that tableMetaManager
         // can serve getTableSchema() without touching storage.
         if (isMemoryMode) {
           for (final s in SystemTable.gettableSchemas) {
-            schemaManager?.cacheTableSchema(TableUid(s.tableUid), s);
+            tableMetaManager?.cacheTableSchema(TableUid(s.tableUid), s);
           }
           for (final s in _userSchemas) {
-            schemaManager?.cacheTableSchema(TableUid(s.tableUid), s);
+            tableMetaManager?.cacheTableSchema(TableUid(s.tableUid), s);
           }
         }
         await Future.wait([
@@ -951,16 +951,17 @@ class DataStoreImpl {
       bool userSchemaChanged = false;
 
       // Check if there are existing table structures
-      final schemaMeta = await schemaManager!.getSchemaMeta();
+      final schemaMeta = await tableMetaManager!.getSchemaMeta();
       if (schemaMeta.routes.isEmpty) {
         // First run, need to initialize
         needInitialize = true;
       } else {
         // Compare hash values to check if upgrade is needed
         systemSchemaChanged =
-            await schemaManager!.isSystemSchemaChanged(systemSchemas);
+            await tableMetaManager!.isSystemSchemaChanged(systemSchemas);
         if (userSchemas.isNotEmpty) {
-          userSchemaChanged = await schemaManager!.isSchemaChanged(userSchemas);
+          userSchemaChanged =
+              await tableMetaManager!.isSchemaChanged(userSchemas);
         }
       }
 
@@ -985,7 +986,7 @@ class DataStoreImpl {
           }
         }
 
-        await schemaManager?.updateSystemSchemaHash(systemSchemas);
+        await tableMetaManager?.updateSystemSchemaHash(systemSchemas);
 
         // Create user tables
         if (userSchemas.isNotEmpty) {
@@ -1000,7 +1001,7 @@ class DataStoreImpl {
               throw DbException(userFatalErrors);
             }
           }
-          await schemaManager?.updateUserSchemaHash(userSchemas);
+          await tableMetaManager?.updateUserSchemaHash(userSchemas);
         }
 
         // Call creation callback
@@ -1026,11 +1027,11 @@ class DataStoreImpl {
         );
 
         if (systemSchemaChanged) {
-          await schemaManager?.updateSystemSchemaHash(systemSchemas);
+          await tableMetaManager?.updateSystemSchemaHash(systemSchemas);
         }
 
         if (userSchemaChanged) {
-          await schemaManager?.updateUserSchemaHash(userSchemas);
+          await tableMetaManager?.updateUserSchemaHash(userSchemas);
         }
       }
     } catch (e) {
@@ -1184,7 +1185,7 @@ class DataStoreImpl {
         _integrityChecker = null;
         _keyManager = null;
         _weightManager = null;
-        schemaManager = null;
+        tableMetaManager = null;
         transactionManager = null;
         _resourceManager = null;
         migrationManager = null;
@@ -1262,7 +1263,7 @@ class DataStoreImpl {
         for (final fk in tableSchema.foreignKeys) {
           if (!fk.enabled) continue;
 
-          final referencedSchema = await schemaManager
+          final referencedSchema = await tableMetaManager
               ?.getTableSchemaByName(TableName(fk.referencedTable));
           if (referencedSchema == null) {
             throw DbException([
@@ -1315,16 +1316,16 @@ class DataStoreImpl {
           tableUid: tableUid,
           tableName: TableName(tableSchema.name),
           isGlobal: tableSchema.isGlobal,
-          dataDirIndex: schemaManager!.getTableSchemaDirIndex(tableUid) ?? 0,
+          dataDirIndex: tableMetaManager!.getTableSchemaDirIndex(tableUid) ?? 0,
           schema: tableSchema,
         );
-        await schemaManager?.saveTableSchema(tableCtx, tableSchema);
+        await tableMetaManager?.saveTableSchema(tableCtx, tableSchema);
 
         // Initialize B+Tree index metadata (empty table — no full-table scan).
         final persistedSchema =
-            schemaManager?.getCachedTableSchema(tableUid) ?? tableCtx.schema;
+            tableMetaManager?.getCachedTableSchema(tableUid) ?? tableCtx.schema;
         final btreeIndexes =
-            schemaManager?.getBtreeIndexesFor(persistedSchema) ??
+            tableMetaManager?.getBtreeIndexesFor(persistedSchema) ??
                 <IndexSchema>[];
         await _indexManager?.initializeEmptyTableIndexes(
           tableCtx,
@@ -1354,8 +1355,8 @@ class DataStoreImpl {
         ));
       } catch (e) {
         // Cleanup schema
-        if (schemaManager != null) {
-          await schemaManager!.deleteTableSchema(tableUid);
+        if (tableMetaManager != null) {
+          await tableMetaManager!.deleteTableSchema(tableUid);
         }
 
         Logger.error('Create table failed', rawError: e);
@@ -1523,7 +1524,7 @@ class DataStoreImpl {
   /// Easily obtain the TableContext of this table
   Future<TableContext> getTableContext(String tableName) async {
     final name = TableName(tableName);
-    final tableUid = await schemaManager?.resolveTableUidFromName(name);
+    final tableUid = await tableMetaManager?.resolveTableUidFromName(name);
     if (tableUid == null) {
       throw DbException([
         SchemaValidationStatus(
@@ -1533,7 +1534,7 @@ class DataStoreImpl {
         )
       ]);
     }
-    final context = await schemaManager?.getTableContext(tableUid);
+    final context = await tableMetaManager?.getTableContext(tableUid);
     if (context == null) {
       throw DbException([
         SchemaValidationStatus(
@@ -1549,7 +1550,7 @@ class DataStoreImpl {
   /// Synchronous [TableContext] lookup (memory cache only).
   TableContext getTableContextSync(String tableName) {
     final name = TableName(tableName);
-    final tableUid = schemaManager?.getUidByName(name);
+    final tableUid = tableMetaManager?.getUidByName(name);
     if (tableUid == null) {
       throw DbException([
         SchemaValidationStatus(
@@ -1559,7 +1560,7 @@ class DataStoreImpl {
         )
       ]);
     }
-    final context = schemaManager?.getTableContextSync(tableUid);
+    final context = tableMetaManager?.getTableContextSync(tableUid);
     if (context == null) {
       throw DbException([
         SchemaValidationStatus(
@@ -1803,7 +1804,7 @@ class DataStoreImpl {
       try {
         // Clear cache
         final schema = table?.schema ??
-            await schemaManager?.getTableSchemaByName(TableName(tableName));
+            await tableMetaManager?.getTableSchemaByName(TableName(tableName));
         final primaryKeyValue = validData != null && schema != null
             ? validData[schema.primaryKey]
             : null;
@@ -1829,7 +1830,7 @@ class DataStoreImpl {
       List<String> failedKeys = [];
       try {
         final schema =
-            await schemaManager?.getTableSchemaByName(TableName(tableName));
+            await tableMetaManager?.getTableSchemaByName(TableName(tableName));
         if (schema != null && data.containsKey(schema.primaryKey)) {
           final keyValue = data[schema.primaryKey]?.toString();
           if (keyValue != null && keyValue.isNotEmpty) {
@@ -2260,7 +2261,7 @@ class DataStoreImpl {
     }
 
     final allIndexes = uniqueIndexes ??
-        schemaManager?.getUniqueIndexesFor(schema) ??
+        tableMetaManager?.getUniqueIndexesFor(schema) ??
         <IndexSchema>[];
     for (final idx in allIndexes) {
       // use actualIndexName which handles both explicit and implicit names
@@ -2276,7 +2277,7 @@ class DataStoreImpl {
       Map<String, dynamic> updatedRecord, Set<String> changedFields) {
     final refs = <UniqueKeyRef>[];
     final allIndexes =
-        schemaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
+        tableMetaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
     for (final idx in allIndexes) {
       // Check if any field in the unique index is changed
       if (idx.fields.any((f) => changedFields.contains(f))) {
@@ -2306,7 +2307,7 @@ class DataStoreImpl {
     }
 
     final schema =
-        await schemaManager?.getTableSchemaByName(TableName(tableName));
+        await tableMetaManager?.getTableSchemaByName(TableName(tableName));
     if (schema == null) {
       return finish(DbResult.error(
         type: ResultType.devTableNotFound,
@@ -2481,7 +2482,7 @@ class DataStoreImpl {
       final String? txIdCheck = Zone.current[_txnZoneKey] as String?;
       if (txIdCheck == null || TransactionContext.isApplyingCommit()) {
         final uniqueIndexes =
-            schemaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
+            tableMetaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
         final uniqueFields = <String>{schema.primaryKey};
         for (final idx in uniqueIndexes) {
           uniqueFields.addAll(idx.fields);
@@ -2609,7 +2610,8 @@ class DataStoreImpl {
             if (!isOptimizableQuery) {
               final uniqueFieldNames = <String>{};
               final allIndexes =
-                  schemaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
+                  tableMetaManager?.getUniqueIndexesFor(schema) ??
+                      <IndexSchema>[];
               for (final index in allIndexes) {
                 if (index.fields.length == 1) {
                   uniqueFieldNames.add(index.fields[0]);
@@ -2799,7 +2801,7 @@ class DataStoreImpl {
 
         // Collect fields from unique composite/single-field indexes that are affected by this update
         final allIndexes =
-            schemaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
+            tableMetaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
         for (final index in allIndexes) {
           if (index.fields.any((f) => changedFields.contains(f))) {
             fieldsToCheck.addAll(index.fields);
@@ -3001,7 +3003,7 @@ class DataStoreImpl {
               updatedRecord[primaryKey] != null &&
               record[primaryKey] != updatedRecord[primaryKey];
           final allIndexes = <IndexSchema>[
-            ...?schemaManager?.getAllIndexesFor(schema),
+            ...?tableMetaManager?.getAllIndexesFor(schema),
             ...?indexManager?.getEngineManagedBtreeIndexes(
               table,
               schema,
@@ -3152,7 +3154,7 @@ class DataStoreImpl {
     }
 
     final schema =
-        await schemaManager?.getTableSchemaByName(TableName(tableName));
+        await tableMetaManager?.getTableSchemaByName(TableName(tableName));
 
     if (schema == null) {
       Logger.error('Table $tableName does not exist');
@@ -3368,7 +3370,8 @@ class DataStoreImpl {
             if (!isOptimizableQuery) {
               final uniqueFieldNames = <String>{};
               final allIndexes =
-                  schemaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
+                  tableMetaManager?.getUniqueIndexesFor(schema) ??
+                      <IndexSchema>[];
               for (final index in allIndexes) {
                 if (index.fields.length == 1) {
                   uniqueFieldNames.add(index.fields[0]);
@@ -3646,7 +3649,7 @@ class DataStoreImpl {
           continue; // Already finished; only used for cutoff, do not re-execute
         }
         final tableName =
-            schemaManager?.resolveTableNameFromField(op.tableUid)?.value ??
+            tableMetaManager?.resolveTableNameFromField(op.tableUid)?.value ??
                 'unknown';
         try {
           // 1) Re-execute the physical operation, but do not re-register WAL metadata
@@ -3876,11 +3879,11 @@ class DataStoreImpl {
       }
 
       // Resolve tableUid
-      final tableUid = schemaManager?.getUidByName(TableName(tableName));
+      final tableUid = tableMetaManager?.getUidByName(TableName(tableName));
 
       // Check if table exists
       final schema = tableUid != null
-          ? await schemaManager?.getTableSchema(tableUid)
+          ? await tableMetaManager?.getTableSchema(tableUid)
           : null;
       if (schema == null) {
         return finish(DbResult.error(
@@ -3904,7 +3907,7 @@ class DataStoreImpl {
               'Deleted data directory for table $tableName in space $_currentSpaceName: $tablePath',
             );
           }
-          await schemaManager?.deleteTableSchema(TableUid(tableUid));
+          await tableMetaManager?.deleteTableSchema(TableUid(tableUid));
         }
 
         return finish(DbResult.success(
@@ -3960,8 +3963,8 @@ class DataStoreImpl {
         }
 
         // Delete table structure
-        if (schemaManager != null && tableUid != null) {
-          await schemaManager!.deleteTableSchema(TableUid(tableUid));
+        if (tableMetaManager != null && tableUid != null) {
+          await tableMetaManager!.deleteTableSchema(TableUid(tableUid));
         }
 
         // Delete table directory and all related files
@@ -4036,10 +4039,10 @@ class DataStoreImpl {
 
   /// check table exists
   Future<bool> tableExists(String tableName) async {
-    if (schemaManager == null) return false;
+    if (tableMetaManager == null) return false;
     try {
       final schema =
-          await schemaManager!.getTableSchemaByName(TableName(tableName));
+          await tableMetaManager!.getTableSchemaByName(TableName(tableName));
       return schema != null;
     } catch (e) {
       Logger.error('Failed to check table existence', rawError: e);
@@ -4049,9 +4052,9 @@ class DataStoreImpl {
 
   /// get all table names
   Future<List<String>> getTableNames() async {
-    if (schemaManager == null) return <String>[];
+    if (tableMetaManager == null) return <String>[];
     try {
-      return await schemaManager!.listAllTables();
+      return await tableMetaManager!.listAllTables();
     } catch (e) {
       Logger.error('Failed to get table names', rawError: e);
       return [];
@@ -4089,7 +4092,8 @@ class DataStoreImpl {
     TableSchema? schema;
     try {
       // 1. Get table schema and validate data
-      schema = await schemaManager?.getTableSchemaByName(TableName(tableName));
+      schema =
+          await tableMetaManager?.getTableSchemaByName(TableName(tableName));
       if (schema == null || schema.name.isEmpty) {
         Logger.error('Table $tableName does not exist');
         return finish(DbResult.error(
@@ -4102,9 +4106,9 @@ class DataStoreImpl {
       final table = await getTableContext(tableName);
       final primaryKey = tableSchema.primaryKey;
       // Cache unique indexes for this table once per batch to avoid repeated
-      // schemaManager lookups inside the hot record loop.
+      // tableMetaManager lookups inside the hot record loop.
       final uniqueIndexesForTable =
-          schemaManager?.getUniqueIndexesFor(tableSchema) ?? <IndexSchema>[];
+          tableMetaManager?.getUniqueIndexesFor(tableSchema) ?? <IndexSchema>[];
       // Whether table has secondary (non-PK) unique indexes.
       final bool hasSecondaryUniqueIndexes = uniqueIndexesForTable.isNotEmpty;
       // Build a single fieldName -> FieldSchema map per table for this batch and
@@ -4948,7 +4952,7 @@ class DataStoreImpl {
     }
 
     final TableSchema? schema =
-        await schemaManager?.getTableSchemaByName(TableName(tableName));
+        await tableMetaManager?.getTableSchemaByName(TableName(tableName));
     if (schema == null || schema.name.isEmpty) {
       return finish(DbResult.error(
         type: ResultType.devTableNotFound,
@@ -4959,7 +4963,7 @@ class DataStoreImpl {
     final table = await getTableContext(tableName);
 
     final uniqueIndexes =
-        schemaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
+        tableMetaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
     final pk = schema.primaryKey;
     final successKeys = <String>[];
     final failedKeys = <String>[];
@@ -5156,7 +5160,7 @@ class DataStoreImpl {
     }
 
     final TableSchema? schema =
-        await schemaManager?.getTableSchemaByName(TableName(tableName));
+        await tableMetaManager?.getTableSchemaByName(TableName(tableName));
     if (schema == null || schema.name.isEmpty) {
       return finish(DbResult.error(
         type: ResultType.devTableNotFound,
@@ -5168,7 +5172,7 @@ class DataStoreImpl {
     final table = await getTableContext(tableName);
     final primaryKey = schema.primaryKey;
     final allUniqueIndexes =
-        schemaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
+        tableMetaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
 
     final successKeys = <String>[];
     final failedKeys = <String>[];
@@ -5848,10 +5852,10 @@ class DataStoreImpl {
 
   Future<void> _executePrewarm() async {
     try {
-      final schemaMgr = schemaManager;
+      final schemaMgr = tableMetaManager;
       if (schemaMgr == null) return;
 
-      // From schemaManager get all tables
+      // From tableMetaManager get all tables
       final allTables = await getTableNames();
       if (allTables.isEmpty || !_isInitialized) return;
 
@@ -5994,7 +5998,7 @@ class DataStoreImpl {
     List<String>? prioritizedTables,
     required int prewarmBudgetBytes,
   }) async {
-    final schemaMgr = schemaManager;
+    final schemaMgr = tableMetaManager;
     if (schemaMgr == null || !_isInitialized) return;
 
     final spaceConfig = await getSpaceConfig();
@@ -6078,7 +6082,7 @@ class DataStoreImpl {
   }
 
   Future<int> _estimateTableIndexBytes(TableContext table) async {
-    final schemaMgr = schemaManager;
+    final schemaMgr = tableMetaManager;
     if (schemaMgr == null) return 0;
     final schema = table.schema;
 
@@ -6151,9 +6155,9 @@ class DataStoreImpl {
     for (final tableName in allTables) {
       await yieldController.maybeYield();
       // Check if it's a global table
-      final uid = schemaManager?.getUidByName(TableName(tableName));
+      final uid = tableMetaManager?.getUidByName(TableName(tableName));
       final isGlobal = uid != null
-          ? await schemaManager?.isTableGlobal(uid) ?? false
+          ? await tableMetaManager?.isTableGlobal(uid) ?? false
           : false;
       if (isGlobal) {
         globalTables.add(tableName);
@@ -6420,7 +6424,7 @@ class DataStoreImpl {
     };
 
     final schema =
-        await schemaManager?.getTableSchemaByName(TableName(tableName));
+        await tableMetaManager?.getTableSchemaByName(TableName(tableName));
     if (schema == null) {
       return finish(DbResult.error(
         type: ResultType.devTableNotFound,
@@ -6478,7 +6482,7 @@ class DataStoreImpl {
     }
 
     final schema =
-        await schemaManager?.getTableSchemaByName(TableName(tableName));
+        await tableMetaManager?.getTableSchemaByName(TableName(tableName));
     if (schema == null) {
       return finish(DbResult.error(
         type: ResultType.devTableNotFound,
@@ -7003,7 +7007,7 @@ class DataStoreImpl {
 
   /// get table schema by name (user-facing entry point)
   Future<TableSchema?> getTableSchema(String tableName) async {
-    return schemaManager?.getTableSchemaByName(TableName(tableName));
+    return tableMetaManager?.getTableSchemaByName(TableName(tableName));
   }
 
   /// Get table info
@@ -7082,7 +7086,7 @@ class DataStoreImpl {
   Future<void> _updateSchemasReferencingRenamedTable(
       String oldTableName, String newTableName,
       {Iterable<String>? candidateTables, Set<String>? updatedTables}) async {
-    final schemaMgr = schemaManager;
+    final schemaMgr = tableMetaManager;
     if (schemaMgr == null) {
       return;
     }
@@ -7118,7 +7122,7 @@ class DataStoreImpl {
     bool throwOnError = false,
   }) async {
     final fkManager = foreignKeyManager;
-    final schemaMgr = schemaManager;
+    final schemaMgr = tableMetaManager;
     if (fkManager == null || schemaMgr == null) {
       return;
     }
@@ -7251,8 +7255,8 @@ class DataStoreImpl {
 
   /// Check if table exists in current space
   Future<bool> tableExistsInCurrentSpace(String tableName) async {
-    if (schemaManager == null) return false;
-    return schemaManager!.uidByName.containsKey(TableName(tableName));
+    if (tableMetaManager == null) return false;
+    return tableMetaManager!.uidByName.containsKey(TableName(tableName));
   }
 
   /// Get information about the current space
@@ -7274,9 +7278,10 @@ class DataStoreImpl {
       }
 
       final activeUids =
-          await schemaManager?.getActiveUidsForSpace(_currentSpaceName) ?? [];
+          await tableMetaManager?.getActiveUidsForSpace(_currentSpaceName) ??
+              [];
       final userTables = activeUids
-          .map((uid) => schemaManager?.getNameByUid(TableUid(uid)))
+          .map((uid) => tableMetaManager?.getNameByUid(TableUid(uid)))
           .whereType<TableName>()
           .map((name) => name.value)
           .where((name) => !SystemTable.isSystemTable(name))
@@ -7544,7 +7549,7 @@ class DataStoreImpl {
           ? op.spaceName == '__global__'
           : op.spaceName == currentSpaceName;
       if (!isSpaceMatch) continue;
-      if (!schemaManager!.tableFieldMatches(op.tableUid, table.tableUid)) {
+      if (!tableMetaManager!.tableFieldMatches(op.tableUid, table.tableUid)) {
         continue;
       }
 
@@ -7590,7 +7595,7 @@ class DataStoreImpl {
           ? op.spaceName == '__global__'
           : op.spaceName == currentSpaceName;
       if (!isSpaceMatch) continue;
-      if (!schemaManager!.tableFieldMatches(op.tableUid, table.tableUid)) {
+      if (!tableMetaManager!.tableFieldMatches(op.tableUid, table.tableUid)) {
         continue;
       }
 
