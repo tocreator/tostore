@@ -98,7 +98,7 @@ final class TableTreePartitionManager {
           table, storedFieldCount);
       if (historicSchema != null) {
         final historicFieldStruct =
-            await _dataStore.schemaManager?.getStorageFieldStructure(
+            await _dataStore.tableMetaManager?.getStorageFieldStructure(
           tableUid,
           schema: historicSchema,
         );
@@ -144,7 +144,8 @@ final class TableTreePartitionManager {
       return override;
     }
 
-    final resolved = await _dataStore.schemaManager?.getStorageFieldStructure(
+    final resolved =
+        await _dataStore.tableMetaManager?.getStorageFieldStructure(
       tableUid,
       schema: schema,
     );
@@ -661,7 +662,7 @@ final class TableTreePartitionManager {
     }
 
     final schema = schemaOverride ??
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) {
       throw DbException([
         SchemaValidationStatus(
@@ -2251,7 +2252,7 @@ final class TableTreePartitionManager {
   }) async {
     if (keys.isEmpty) return const <Map<String, dynamic>>[];
     final schema = schemaOverride ??
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) return const <Map<String, dynamic>>[];
 
     final fieldStruct = await _resolveStorageFieldStructure(
@@ -2323,7 +2324,7 @@ final class TableTreePartitionManager {
       {TableSchema? schemaOverride}) async {
     if (primaryKeyValue.isEmpty) return false;
     final schema = schemaOverride ??
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) return false;
     final meta =
         await _dataStore.tableDataManager.getTableDataMeta(table.tableUid);
@@ -2343,7 +2344,7 @@ final class TableTreePartitionManager {
   }) async {
     if (primaryKeys.isEmpty) return const <String>{};
     final schema = schemaOverride ??
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) return const <String>{};
     final meta =
         await _dataStore.tableDataManager.getTableDataMeta(table.tableUid);
@@ -2398,7 +2399,7 @@ final class TableTreePartitionManager {
     }
 
     final schema = decodeSchema ??
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) {
       return (records: const <Map<String, dynamic>>[], reachedEnd: true);
     }
@@ -2604,7 +2605,7 @@ final class TableTreePartitionManager {
   }) async {
     // Use provided decodeSchema for migration, or current schema for normal operations
     final schema = decodeSchema ??
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) return const <Map<String, dynamic>>[];
     final meta =
         await _dataStore.tableDataManager.getTableDataMeta(table.tableUid);
@@ -2686,7 +2687,7 @@ final class TableTreePartitionManager {
   }) async* {
     // Use provided decodeSchema for migration, or current schema for normal operations
     final schema = decodeSchema ??
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) return;
 
     final fieldStruct = await _resolveStorageFieldStructure(
@@ -2917,7 +2918,7 @@ final class TableTreePartitionManager {
     bool readFromFileOnly = false,
   }) async {
     final schema = decodeSchema ??
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) return;
     final fieldStruct = await _resolveStorageFieldStructure(
       table: table,
