@@ -20,8 +20,8 @@ import '../model/table_schema.dart';
 import 'data_store_impl.dart';
 import 'tree_cache.dart';
 
-/// table schema manager
-class SchemaManager {
+/// Table meta manager.
+class TableMetaManager {
   final DataStoreImpl _dataStore;
   SchemaMeta? _schemaMeta; // Cache schema meta
 
@@ -68,7 +68,7 @@ class SchemaManager {
   /// Deferred per-space metadata (inventory, large stats). Loaded asynchronously.
   final Map<String, SpaceManifest> _manifestBySpace = {};
 
-  SchemaManager(this._dataStore);
+  TableMetaManager(this._dataStore);
 
   /// Get tableUid by tableName
   TableUid? getUidByName(TableName tableName) {
