@@ -354,8 +354,8 @@ class QueryOptimizer {
 
     // Priority 3: Unique index '=' / IN (single-field) or full '=' tuple (composite).
     IndexSchema? bestUniqueEq;
-    final allIndexes =
-        _dataStore.schemaManager?.getAllIndexesFor(schema) ?? <IndexSchema>[];
+    final allIndexes = _dataStore.tableMetaManager?.getAllIndexesFor(schema) ??
+        <IndexSchema>[];
     for (final idx in allIndexes) {
       if (!idx.unique) continue;
       final match = analyzeIndexMatch(idx);
@@ -670,7 +670,8 @@ class QueryOptimizer {
 
     bool isUniqueSingleField(String field) {
       if (field == schema.primaryKey) return true;
-      final allIndexes = _dataStore.schemaManager?.getUniqueIndexesFor(schema);
+      final allIndexes =
+          _dataStore.tableMetaManager?.getUniqueIndexesFor(schema);
       if (allIndexes == null) return false;
       for (final idx in allIndexes) {
         if (idx.fields.length == 1 && idx.fields.first == field) return true;
@@ -761,8 +762,8 @@ class QueryOptimizer {
 
   List<String> _resolveIndexFields(TableSchema schema, String indexUid) {
     try {
-      final indexes =
-          _dataStore.schemaManager?.getAllIndexesFor(schema) ?? <IndexSchema>[];
+      final indexes = _dataStore.tableMetaManager?.getAllIndexesFor(schema) ??
+          <IndexSchema>[];
       final idx = indexes.firstWhere(
           (i) => i.indexUid == indexUid || i.actualIndexName == indexUid);
       return idx.fields;
@@ -894,8 +895,8 @@ class QueryOptimizer {
   IndexSchema? _findSortingIndex(TableSchema schema, List<String> orderBy) {
     if (orderBy.isEmpty) return null;
 
-    final allIndexes =
-        _dataStore.schemaManager?.getAllIndexesFor(schema) ?? <IndexSchema>[];
+    final allIndexes = _dataStore.tableMetaManager?.getAllIndexesFor(schema) ??
+        <IndexSchema>[];
     for (final idx in allIndexes) {
       // For now, we only support single-field orderBy matching the first field of an index
       // OR a composite index where the orderBy prefix matches exactly.
