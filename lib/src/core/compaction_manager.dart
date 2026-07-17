@@ -158,7 +158,7 @@ final class CompactionManager {
         try {
           if (task.kind == _CompactionKind.table) {
             final tableCtx =
-                _dataStore.schemaManager?.getTableContextSync(task.tableUid);
+                _dataStore.tableMetaManager?.getTableContextSync(task.tableUid);
             if (tableCtx == null) continue;
             final TreePagePtr? hint = _tableHint[task.tableUid];
             final next =
@@ -175,7 +175,7 @@ final class CompactionManager {
             }
           } else {
             final tableCtx =
-                _dataStore.schemaManager?.getTableContextSync(task.tableUid);
+                _dataStore.tableMetaManager?.getTableContextSync(task.tableUid);
             if (tableCtx == null) continue;
             final TreePagePtr? hint =
                 _indexHint['${task.tableUid}:${task.indexUid!.value}'];
