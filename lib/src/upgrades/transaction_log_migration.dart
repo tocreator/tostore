@@ -315,7 +315,7 @@ class TransactionLogMigration {
     TransactionCommitPlan plan,
     String spaceName,
   ) {
-    final mgr = _dataStore.schemaManager;
+    final mgr = _dataStore.tableMetaManager;
     if (mgr == null) return plan;
 
     Map<String, List<Map<String, dynamic>>> norm(
@@ -343,7 +343,7 @@ class TransactionLogMigration {
     String tableUid,
     String spaceName,
   ) async {
-    final mgr = _dataStore.schemaManager;
+    final mgr = _dataStore.tableMetaManager;
     if (mgr == null) return null;
     final normalized = mgr.normalizeTableFieldKey(tableUid);
     final ctx = await mgr.getTableContext(TableUid(normalized));
