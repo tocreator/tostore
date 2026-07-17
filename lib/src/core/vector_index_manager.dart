@@ -312,12 +312,12 @@ class VectorIndexManager {
     List<IndexSchema>? targetIndexesOverride,
   }) async {
     final schema = schemaOverride ??
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) return;
 
     final vectorIndexes = List<IndexSchema>.from(
       targetIndexesOverride?.where((index) => index.type == IndexType.vector) ??
-          (_dataStore.schemaManager?.getVectorIndexesFor(schema) ??
+          (_dataStore.tableMetaManager?.getVectorIndexesFor(schema) ??
               const <IndexSchema>[]),
     );
     if (vectorIndexes.isEmpty) return;
@@ -490,11 +490,11 @@ class VectorIndexManager {
   }) async {
     // Find the vector index for this field
     final schema =
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) return const [];
 
     final vectorIndexes =
-        _dataStore.schemaManager?.getVectorIndexesFor(schema) ??
+        _dataStore.tableMetaManager?.getVectorIndexesFor(schema) ??
             const <IndexSchema>[];
     IndexSchema? targetIdx;
     for (final idx in vectorIndexes) {
@@ -623,7 +623,7 @@ class VectorIndexManager {
 
       if (diskLoad == null) {
         // Stable data meta missing — fall back to deprecated logical-name directory.
-        final idx = _dataStore.schemaManager
+        final idx = _dataStore.tableMetaManager
             ?.findIndexSchemaByUid(table.schema, indexUid);
         final schemaLegacyName = idx?.actualIndexName;
         if (schemaLegacyName != null &&
@@ -652,7 +652,7 @@ class VectorIndexManager {
         );
         if (loadedFromLegacyPath &&
             (legacyLogicalName == null || legacyLogicalName.isEmpty)) {
-          legacyLogicalName = _dataStore.schemaManager
+          legacyLogicalName = _dataStore.tableMetaManager
               ?.findIndexSchemaByUid(table.schema, indexUid)
               ?.actualIndexName;
         }
@@ -989,7 +989,7 @@ class VectorIndexManager {
   /// [WorkloadType.maintenance] tokens.
   Future<void> compactTombstones(TableContext table,
       {int maxVisitedPages = 100}) async {
-    final vectorIndexes = await _dataStore.schemaManager
+    final vectorIndexes = await _dataStore.tableMetaManager
         ?.getVectorIndexesForTable(table.tableUid);
     if (vectorIndexes == null || vectorIndexes.isEmpty) return;
 
