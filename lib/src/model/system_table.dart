@@ -282,7 +282,7 @@ class SystemTable {
           FieldSchema(
             name: keyValueValueField,
             fieldId: keyValueValueField,
-            type: DataType.text,
+            type: DataType.blob,
           ),
           FieldSchema(
             name: keyValueUpdatedAtField,

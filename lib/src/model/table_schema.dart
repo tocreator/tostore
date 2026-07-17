@@ -2407,17 +2407,36 @@ class TableTtlConfig {
   }
 }
 
-/// data type enum
+/// Field data type.
 enum DataType {
-  integer, // Occupies slightly less than bigInt, loses precision overflow above 18 digits
-  bigInt, // Large integer, supports integer values above 18 digits
+  /// Integer. For general numeric values; use [bigInt] if values exceed 18 digits.
+  integer,
+
+  /// Big integer. For larger numeric values such as large IDs or counters.
+  bigInt,
+
+  /// Floating-point number. For decimal values like prices, scores, or measurements.
   double,
+
+  /// Text. For strings such as names, descriptions, codes, or addresses.
   text,
+
+  /// Binary data. For images, file contents, or other raw bytes.
   blob,
+
+  /// Boolean. Represents true / false, e.g. toggles or flags.
   boolean,
+
+  /// Date and time. For timestamps like created_at, updated_at, or order_time.
   datetime,
+
+  /// Array. For storing an ordered list of values.
   array,
-  vector, // Vector data type for storing numerical vector (embeddings)
+
+  /// Vector. For numerical vectors such as embeddings or feature vectors.
+  vector,
+
+  /// JSON object or structured data. For flexible or schema-less extension fields.
   json,
 }
 
