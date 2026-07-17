@@ -111,8 +111,8 @@ class V3Upgrade {
       await _dataStore.storage
           .writeAsString(schemaMetaPath, jsonEncode(emptySchemaMeta.toJson()));
 
-      // Invalidate the cache inside schemaManager so it loads the new file on next read
-      _dataStore.schemaManager?.invalidateCache();
+      // Invalidate the cache inside tableMetaManager so it loads the new file on next read
+      _dataStore.tableMetaManager?.invalidateCache();
     }
 
     // 2. Read legacy global config mapping
@@ -235,7 +235,7 @@ class V3Upgrade {
               );
 
               // Save the upgraded schema via the new schema manager
-              await _dataStore.schemaManager!.saveTableSchema(
+              await _dataStore.tableMetaManager!.saveTableSchema(
                 tableCtx,
                 upgradedSchema,
                 dataDirIndex: finalDirIndex,
