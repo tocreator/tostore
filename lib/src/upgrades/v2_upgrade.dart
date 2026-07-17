@@ -124,12 +124,12 @@ class V2Upgrade {
 
       // Upgrade tables in this space (including global tables if requested)
       final tableNames =
-          await migrationInstance.schemaManager?.listAllTables() ??
+          await migrationInstance.tableMetaManager?.listAllTables() ??
               const <String>[];
       final yieldController = YieldController('upgrade_v2_space_tables');
       if (tableNames.isNotEmpty) {
         for (final tableName in tableNames) {
-          final schema = await migrationInstance.schemaManager
+          final schema = await migrationInstance.tableMetaManager
               ?.getTableSchemaByName(TableName(tableName));
           if (schema == null) continue;
 
@@ -377,7 +377,7 @@ class V2Upgrade {
         'Starting table data upgrade for table: $tableName',
       );
 
-      final tableUid = db.schemaManager?.getUidByName(TableName(tableName));
+      final tableUid = db.tableMetaManager?.getUidByName(TableName(tableName));
       if (tableUid == null) {
         Logger.warn(
             'Table UID not found for table: $tableName, skipping data upgrade');
@@ -487,7 +487,7 @@ class V2Upgrade {
               results.expand((r) => r ?? <Map<String, dynamic>>[]).toList();
 
           if (batchRecords.isNotEmpty) {
-            final schema = await db.schemaManager
+            final schema = await db.tableMetaManager
                 ?.getTableSchemaByName(TableName(tableName));
             if (schema == null) {
               Logger.warn(
@@ -675,7 +675,7 @@ class V2Upgrade {
   }
 
   String _manualGetTablePath(DataStoreImpl db, String tableName) {
-    final tableUid = db.schemaManager?.getUidByName(TableName(tableName));
+    final tableUid = db.tableMetaManager?.getUidByName(TableName(tableName));
     if (tableUid == null) {
       throw DbException([
         SchemaValidationStatus(
@@ -688,7 +688,7 @@ class V2Upgrade {
     if (db.config.persistenceMode == PersistenceMode.memory) {
       return 'memory://${db.currentSpaceName}/tables/$tableUid';
     }
-    final route = db.schemaManager?.getRouteByUid(tableUid);
+    final route = db.tableMetaManager?.getRouteByUid(tableUid);
     if (route == null) {
       throw DbException([
         SchemaValidationStatus(
