@@ -91,7 +91,7 @@ class QueryExecutor {
     List<String>? groupBy,
     bool readFromFileOnly = false,
   }) async {
-    final schemaMgr = _dataStore.schemaManager;
+    final schemaMgr = _dataStore.tableMetaManager;
     if (schemaMgr == null) {
       if (!_dataStore.isInitialized) return ExecuteResult.empty();
       throw DbException([
@@ -758,7 +758,7 @@ class QueryExecutor {
       // - fill missing schema fields with defaults
       // - enforce user-defined schema field order
       if ((joins == null || joins.isEmpty) && results.isNotEmpty) {
-        final schemaMgr = _dataStore.schemaManager;
+        final schemaMgr = _dataStore.tableMetaManager;
         if (schemaMgr != null) {
           results = List<Map<String, dynamic>>.generate(
             results.length,
@@ -816,7 +816,7 @@ class QueryExecutor {
   }) async {
     final tableName = table.tableName;
     final schema = decodeSchema ??
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) {
       return PlanExecutionResult([], onlyCount ? 0 : null, null);
     }
@@ -1074,8 +1074,8 @@ class QueryExecutor {
                 .addAll(MemComparableKey.decodeTuple(cursorToken.indexKey!));
 
             final idxUid = cursorToken.indexUid;
-            final idx =
-                _dataStore.schemaManager?.findIndexSchemaByUid(schema, idxUid);
+            final idx = _dataStore.tableMetaManager
+                ?.findIndexSchemaByUid(schema, idxUid);
 
             if (idx != null) {
               for (var f in idx.fields) {
@@ -1205,7 +1205,7 @@ class QueryExecutor {
     final tableName = table.tableName;
     final tblSchema = decodeSchema ??
         schemas[tableName] ??
-        await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (tblSchema == null) {
       return TableScanResult(records: const [], count: onlyCount ? 0 : null);
     }
@@ -1458,7 +1458,7 @@ class QueryExecutor {
     if (leftJoinKeys.isNotEmpty) {
       final rightTableCondition =
           QueryCondition().where(rightKeyName, 'IN', leftJoinKeys.toList());
-      final rightSchema = await _dataStore.schemaManager
+      final rightSchema = await _dataStore.tableMetaManager
           ?.getTableSchemaByName(TableName(rightTableName));
       if (rightSchema == null) {
         return [];
@@ -1485,7 +1485,7 @@ class QueryExecutor {
       // LEFT keys empty (e.g., RIGHT JOIN needs full right scan): route through normal pipeline
       final rightCondition = QueryCondition(); // full scan
       final rightSchema = schemas[rightTableName] ??
-          await _dataStore.schemaManager
+          await _dataStore.tableMetaManager
               ?.getTableSchemaByName(TableName(rightTableName));
       if (rightSchema == null) {
         return [];
@@ -1960,7 +1960,7 @@ class QueryExecutor {
     final tableName = table.tableName;
     try {
       final schema = decodeSchema ??
-          await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+          await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
       if (schema == null) {
         return TableScanResult(records: const [], count: onlyCount ? 0 : null);
       }
@@ -1968,8 +1968,9 @@ class QueryExecutor {
       // Index uid from query plan is the stable engine identifier.
       IndexSchema? indexSchema;
       try {
-        final allIndexes = _dataStore.schemaManager?.getAllIndexesFor(schema) ??
-            <IndexSchema>[];
+        final allIndexes =
+            _dataStore.tableMetaManager?.getAllIndexesFor(schema) ??
+                <IndexSchema>[];
         indexSchema = allIndexes.firstWhere(
           (idx) => idx.indexUid == indexUid,
         );
@@ -2021,7 +2022,7 @@ class QueryExecutor {
       }
 
       final tblSchema =
-          await _dataStore.schemaManager?.getTableSchema(table.tableUid);
+          await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
       if (tblSchema == null) {
         return TableScanResult(records: const [], count: onlyCount ? 0 : null);
       }
@@ -2762,7 +2763,8 @@ class QueryExecutor {
     if (orderBy == null || orderBy.isEmpty) return false;
     final idxUid = plan.operation.indexUid;
     if (idxUid == null) return false;
-    final idx = _dataStore.schemaManager?.findIndexSchemaByUid(schema, idxUid);
+    final idx =
+        _dataStore.tableMetaManager?.findIndexSchemaByUid(schema, idxUid);
     if (idx == null) return false;
     if (orderBy.length != idx.fields.length) return false;
     // We assume validation has already passed and all fields have uniform direction.
@@ -2774,7 +2776,7 @@ class QueryExecutor {
   String _indexDisplayLabel(TableSchema schema, IndexUid indexUid) {
     if (indexUid.isEmpty) return 'index';
     final idx =
-        _dataStore.schemaManager?.findIndexSchemaByUid(schema, indexUid);
+        _dataStore.tableMetaManager?.findIndexSchemaByUid(schema, indexUid);
     if (idx != null) {
       final name = idx.indexName;
       if (name != null && name.isNotEmpty) return name;
@@ -2789,7 +2791,7 @@ class QueryExecutor {
   ({List<String> fields, bool isUnique}) _resolveIndexSpecForCursor(
       TableSchema schema, IndexUid indexUid) {
     final idx =
-        _dataStore.schemaManager?.findIndexSchemaByUid(schema, indexUid);
+        _dataStore.tableMetaManager?.findIndexSchemaByUid(schema, indexUid);
     if (idx != null) {
       return (fields: idx.fields, isUnique: idx.unique);
     }
@@ -3288,7 +3290,8 @@ class QueryExecutor {
       comps.add(schema.encodePrimaryKeyComponent(pkVal));
     }
 
-    final idx = _dataStore.schemaManager?.findIndexSchemaByUid(schema, idxUid);
+    final idx =
+        _dataStore.tableMetaManager?.findIndexSchemaByUid(schema, idxUid);
     final resolvedIndexUid = idx?.indexUid ?? idxUid;
 
     return _QueryCursorToken.indexKey(
@@ -3494,7 +3497,7 @@ class QueryExecutor {
     await _dataStore.flush(flushStorage: true);
 
     // 2. Resolve Table Schema
-    final schemaMgr = _dataStore.schemaManager;
+    final schemaMgr = _dataStore.tableMetaManager;
     if (schemaMgr == null) {
       throw DbException([
         GeneralStatus(
