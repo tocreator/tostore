@@ -295,7 +295,7 @@ class IntegrityChecker {
 
     final referencedTable = _inferReferencedTable(fieldName);
     try {
-      final referencedSchema = await _dataStore.schemaManager
+      final referencedSchema = await _dataStore.tableMetaManager
           ?.getTableSchemaByName(TableName(referencedTable));
       if (referencedSchema == null) {
         return false;
@@ -351,7 +351,7 @@ class IntegrityChecker {
       // For large-scale data, validate index metadata structure instead of full scan
       // Unique constraints are enforced at write time, so we only validate index metadata exists
       final uniqueIndexes =
-          (_dataStore.schemaManager?.getUniqueIndexesFor(schema) ??
+          (_dataStore.tableMetaManager?.getUniqueIndexesFor(schema) ??
               const <IndexSchema>[]);
       if (uniqueIndexes.isEmpty) {
         return true; // No unique constraints to check
@@ -494,7 +494,7 @@ class IntegrityChecker {
         // for table with data, validate B+Tree index meta data
         // (vector indexes use separate meta paths managed by VectorIndexManager)
         final allIndexes =
-            _dataStore.schemaManager?.getBtreeIndexesFor(newSchema) ??
+            _dataStore.tableMetaManager?.getBtreeIndexesFor(newSchema) ??
                 <IndexSchema>[];
         for (var index in allIndexes) {
           if (index.indexUid.isEmpty) {
