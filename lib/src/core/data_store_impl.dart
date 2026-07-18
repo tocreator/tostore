@@ -66,6 +66,7 @@ import 'foreign_key_manager.dart';
 import 'index_manager.dart';
 import 'index_tree_partition_manager.dart';
 import 'integrity_checker.dart';
+import 'internal_kv_store.dart';
 import 'key_manager.dart';
 import 'large_operation_runner.dart';
 import 'lock_manager.dart';
@@ -164,6 +165,9 @@ class DataStoreImpl {
 
   /// Key-value storage namespace
   late final KvStore kv = KvStore(this);
+
+  /// Engine-internal key-value store (not user-facing).
+  late final InternalKvStore internalKv = InternalKvStore(this);
 
   // Transaction zone key
   static const Symbol _txnZoneKey = #to_txn_zone;
