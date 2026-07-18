@@ -89,17 +89,16 @@ extension type const IndexUid(String value) implements String {
 
   /// Whether [value] matches engine-issued stable index uid shape.
   ///
-  /// Stable ids are generated via `GlobalIdGenerator.generate("i")` (`i` + letter + …)
-  /// or fixed system ids (`i_sys_…`). Legacy on-disk paths and API aliases use
-  /// logical names such as `idx_username` / `uniq_email` without this prefix.
+  /// Stable ids are `GlobalIdGenerator.
+  /// body (length 15)  Logical names fromgenerate("i")` — `'i'` + 14-char Base36
+  /// `IndexSchema.actualIndexName` always use `idx_` / `uniq_` and are excluded.
   bool get looksLikeStableUid {
     if (isEmpty) return false;
     if (value == 'pk') return true;
     if (!value.startsWith('i')) return false;
-    if (value.startsWith('i_')) return true;
-    return value.length >= 2 &&
-        value.codeUnitAt(1) >= 0x61 &&
-        value.codeUnitAt(1) <= 0x7a;
+    if (value.startsWith('idx_')) return false; // logical non-unique name
+    // uniq_* starts with 'u', already outside the 'i' path below.
+    return value.length == 15;
   }
 }
 

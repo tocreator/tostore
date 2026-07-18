@@ -1,13 +1,14 @@
-import 'dart:math';
 import 'dart:async';
 import 'dart:collection';
-import '../model/table_schema.dart';
-import '../model/table_identity.dart';
-import '../model/data_store_config.dart';
-import '../handler/logger.dart';
-import '../core/lock_manager.dart';
+import 'dart:math';
+
 import '../core/compute_manager.dart';
 import '../core/compute_tasks.dart';
+import '../core/lock_manager.dart';
+import '../handler/logger.dart';
+import '../model/data_store_config.dart';
+import '../model/table_identity.dart';
+import '../model/table_schema.dart';
 import 'db_exception.dart';
 import 'result_status.dart';
 import 'result_type.dart';
@@ -1409,10 +1410,14 @@ class IdGeneratorFactory {
 
 /// Global ID generator shared by locks, partitions, WAL, migration etc.
 /// Generates short, filesystem-safe IDs.
-/// Output: exactly [_coreLen] chars — 1 random lowercase letter + Base36 body.
-/// All chars are lowercase letters or digits; the first char is always a letter.
+///
+/// Output: `[prefix]` + optional default lead + fixed-width Base36 body.
+/// - Non-empty [prefix]: caller-owned prefix + [_bodyLen] Base36 digits.
+/// - Empty [prefix]: default lead `'a'` + [_bodyLen] Base36 digits (avoids a
+///   leading digit, which is unsafe for identifiers / some filesystems).
+/// All output chars are lowercase letters or digits; the first char is always
+/// a letter when [prefix] is empty or itself starts with a letter.
 /// Safe as a filename, table name, identifier, and cross-platform path component.
-/// [_coreLen] is derived automatically from _timestampBits + _sequenceBits.
 class GlobalIdGenerator {
   static final Random _random = Random.secure();
   static const int _timestampBits = 36; // 36 bits seconds (~2177 years)
@@ -1445,12 +1450,11 @@ class GlobalIdGenerator {
   static const int _totalBits =
       _timestampBits + _nodeBits + _sequenceBits; // 72 bits
 
-  /// Mathematically correct body length calculation.
+  /// Fixed-width Base36 body length derived from [_totalBits].
   /// Uses final instead of const since log/ceil are computed at runtime.
   static final int _bodyLen = (_totalBits / (log(36) / log(2))).ceil();
-  static final int _coreLen = 1 + _bodyLen; // 1 lead + body digits
 
-  /// Unified static output buffer for prefix + core + suffix in a single allocation.
+  /// Unified static output buffer for prefix + body + suffix in a single allocation.
   /// WARNING: This buffer is globally shared and reused in a single isolate.
   /// Do not read directly from it or pass it out of _build.
   /// It is dirty-written; String.fromCharCodes relies strictly on the length argument to isolate output.
@@ -1459,22 +1463,25 @@ class GlobalIdGenerator {
   static int _lastTimestampSec = 0;
   static int _sequence = 0;
 
-  /// Generates [prefix] + core ID in a single [String.fromCharCodes] call.
-  /// Core is exactly [_coreLen] chars: one lead letter + [_bodyLen] Base36 digits.
+  /// Generates [prefix] + Base36 body in a single [String.fromCharCodes] call.
+  /// Empty [prefix] injects a default lead `'a'` before the body.
   static String generate(String prefix) => _build(prefix, null);
 
-  /// Generates [prefix] + core ID + optional [suffix] in a single [String.fromCharCodes] call.
+  /// Generates [prefix] + Base36 body + optional [suffix] in one allocation.
+  /// Empty [prefix] injects a default lead 'a' before the body.
   static String generateWithSuffix(String prefix, {String? suffix}) =>
       _build(prefix, suffix);
 
   /// Builds the complete output string in-place with exactly one String allocation.
-  ///
   static String _build(String prefix, String? suffix) {
     final BigInt id = _nextId();
     final int pLen = prefix.length;
     final int sLen = suffix?.length ?? 0;
-    final int coreEnd = pLen + _coreLen;
-    final int totalLen = coreEnd + sLen;
+    // Empty prefix: inject default lead 'a' so the ID never starts with a digit.
+    final int leadLen = pLen == 0 ? 1 : 0;
+    final int bodyStart = pLen + leadLen;
+    final int bodyEnd = bodyStart + _bodyLen;
+    final int totalLen = bodyEnd + sLen;
 
     // Fallback dynamic buffer to prevent out-of-bounds RangeError crash in production.
     // Keeps 0-GC overhead for <= 128 chars, but handles arbitrarily long inputs gracefully.
@@ -1486,13 +1493,18 @@ class GlobalIdGenerator {
       buf[i] = prefix.codeUnitAt(i);
     }
 
-    // ── suffix (write before body so pos cursor starts cleanly at coreEnd) ──
-    for (int i = 0; i < sLen; i++) {
-      buf[coreEnd + i] = suffix!.codeUnitAt(i);
+    // ── default lead (empty prefix only) ────────────────────────────────────
+    if (leadLen == 1) {
+      buf[0] = 0x61; // 'a'
     }
 
-    // ── body: right-to-left into [pLen+1 .. coreEnd-1] ─────────────────────
-    int pos = coreEnd;
+    // ── suffix (write before body so pos cursor starts cleanly at bodyEnd) ──
+    for (int i = 0; i < sLen; i++) {
+      buf[bodyEnd + i] = suffix!.codeUnitAt(i);
+    }
+
+    // ── body: right-to-left into [bodyStart .. bodyEnd-1] ───────────────────
+    int pos = bodyEnd;
     BigInt body = id;
     final BigInt base = BigInt.from(36);
     do {
@@ -1503,17 +1515,11 @@ class GlobalIdGenerator {
       body = q;
     } while (body > BigInt.zero);
 
-    // ── zero-pad gap between lead slot and first encoded digit ───────────────
-    while (pos > pLen + 1) {
+    // ── zero-pad remaining body slots ───────────────────────────────────────
+    while (pos > bodyStart) {
       buf[pos - 1] = 0x30; // '0'
       pos--;
     }
-
-    // ── lead: letter written LAST at pLen — encode loop never reaches it
-    // To guarantee global monotonic sorting order, we fix the lead character.
-    // If prefix is empty, we use 't' (0x74) to make the ID look like 't[body]'.
-    // If prefix is not empty, we use 'a' (0x61) to avoid double-character stacking (e.g., 'tt...' when prefix is 't').
-    buf[pLen] = pLen == 0 ? 0x74 : 0x61;
 
     return String.fromCharCodes(buf, 0, totalLen); // single allocation
   }
