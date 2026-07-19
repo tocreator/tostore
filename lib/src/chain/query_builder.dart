@@ -223,20 +223,10 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   /// Throws [DbException] if no foreign key relationship is found
   QueryBuilder joinWithForeignKey(String tableName,
       {JoinType type = JoinType.inner}) {
-    // Store the join request - will be resolved during query execution
-    final joinUid = _db.tableMetaManager?.getUidByName(TableName(tableName));
-    if (joinUid == null) {
-      throw DbException([
-        SchemaValidationStatus(
-          type: ResultType.devTableNotFound,
-          message: 'Target table $tableName does not exist',
-          tableName: tableName,
-        ),
-      ]);
-    }
+    // Store the join request - resolved during query execution (async existence check).
     _pendingForeignKeyJoins ??= [];
     _pendingForeignKeyJoins!.add(PendingForeignKeyJoin(
-      tableUid: joinUid,
+      tableName: tableName,
       type: type,
     ));
     _onChanged();
@@ -301,7 +291,8 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   Future<bool> clearQueryCache() async {
     await _db.ensureInitialized();
 
-    final tableUid = _db.tableMetaManager?.getUidByName(TableName(_tableName));
+    final tableUid =
+        await _db.tableMetaManager?.getUidByName(TableName(_tableName));
     if (tableUid == null) return false;
 
     // Build cache key to ensure correct matching
@@ -923,12 +914,10 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     }
 
     for (final pendingJoin in _pendingForeignKeyJoins!) {
-      final joinTableUid = TableUid(pendingJoin.tableUid);
-      final resolvedName = _db.tableMetaManager?.getNameByUid(joinTableUid);
-      final tableName = resolvedName?.value ?? pendingJoin.tableUid;
+      final tableName = pendingJoin.tableName;
       final type = pendingJoin.type;
 
-      // Get target table schema
+      // Get target table schema (async existence check)
       final targetSchema = await _db.tableMetaManager
           ?.getTableSchemaByName(TableName(tableName));
       if (targetSchema == null) {
