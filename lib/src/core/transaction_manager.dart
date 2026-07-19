@@ -606,7 +606,7 @@ class TransactionManager {
           if (ev.event == TxnLogEventType.plan &&
               ev.transactionId == transactionId) {
             if (ev.plan != null) {
-              return _withNormalizedTableKeys(ev.plan!);
+              return await _withNormalizedTableKeys(ev.plan!);
             }
           }
           if (ev.event == TxnLogEventType.continueInNextPartition &&
@@ -627,7 +627,7 @@ class TransactionManager {
 
   /// Apply commit plan during crash recovery (idempotent): write updates/deletes into buffers and flush.
   Future<void> applyCommitPlan(TransactionCommitPlan plan) async {
-    final commitPlan = _withNormalizedTableKeys(plan);
+    final commitPlan = await _withNormalizedTableKeys(plan);
     try {
       // Resume from plan progress checkpoint (per-table applied counts)
       final progress = await _loadPlanProgress(commitPlan.transactionId);
@@ -1249,7 +1249,7 @@ class TransactionManager {
           final lastMs = _recentCommittedWrites.get([tableUid, k]);
           if (lastMs != null && lastMs > startMs) {
             final tableName =
-                _dataStore.tableMetaManager?.getNameByUid(tableUid) ??
+                await _dataStore.tableMetaManager?.getNameByUid(tableUid) ??
                     TableName(tableUid);
             conflicts.add('$tableName:$k');
             return conflicts; // early return on first conflict
@@ -1482,7 +1482,7 @@ class TransactionManager {
 
   Future<TableSchema?> _resolveTableSchemaFromField(String tableField) async {
     final normalized =
-        _dataStore.tableMetaManager?.normalizeTableFieldKey(tableField) ??
+        await _dataStore.tableMetaManager?.normalizeTableFieldKey(tableField) ??
             tableField;
     final ctx = await _dataStore.tableMetaManager
         ?.getTableContext(TableUid(normalized));
@@ -1494,7 +1494,7 @@ class TransactionManager {
     final schema = await _resolveTableSchemaFromField(tableUid);
     if (schema == null) return null;
     final normalized =
-        _dataStore.tableMetaManager?.normalizeTableFieldKey(tableUid) ??
+        await _dataStore.tableMetaManager?.normalizeTableFieldKey(tableUid) ??
             tableUid;
     final struct = await _dataStore.tableMetaManager
             ?.getStorageFieldStructure(TableUid(normalized), schema: schema) ??
@@ -1543,25 +1543,26 @@ class TransactionManager {
     );
   }
 
-  Map<String, List<Map<String, dynamic>>> _normalizeCommitPlanTableMap(
+  Future<Map<String, List<Map<String, dynamic>>>> _normalizeCommitPlanTableMap(
     Map<String, List<Map<String, dynamic>>> byTable,
-  ) {
+  ) async {
     final mgr = _dataStore.tableMetaManager;
     if (mgr == null) return byTable;
     final normalized = <String, List<Map<String, dynamic>>>{};
     for (final entry in byTable.entries) {
-      final key = mgr.normalizeTableFieldKey(entry.key);
+      final key = await mgr.normalizeTableFieldKey(entry.key);
       normalized.putIfAbsent(key, () => []).addAll(entry.value);
     }
     return normalized;
   }
 
-  TransactionCommitPlan _withNormalizedTableKeys(TransactionCommitPlan plan) {
+  Future<TransactionCommitPlan> _withNormalizedTableKeys(
+      TransactionCommitPlan plan) async {
     return TransactionCommitPlan(
       transactionId: plan.transactionId,
-      inserts: _normalizeCommitPlanTableMap(plan.inserts),
-      updates: _normalizeCommitPlanTableMap(plan.updates),
-      deletes: _normalizeCommitPlanTableMap(plan.deletes),
+      inserts: await _normalizeCommitPlanTableMap(plan.inserts),
+      updates: await _normalizeCommitPlanTableMap(plan.updates),
+      deletes: await _normalizeCommitPlanTableMap(plan.deletes),
       heavyDeletes: plan.heavyDeletes,
       heavyUpdates: plan.heavyUpdates,
     );
