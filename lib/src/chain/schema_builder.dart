@@ -276,8 +276,8 @@ class SchemaBuilder with FutureBuilderMixin<SchemaUpdateResult> {
   Future<SchemaUpdateResult> get future async {
     SchemaUpdateResult result;
     try {
-      final tableUid =
-          _dataStore.tableMetaManager?.getUidByName(TableName(_tableName));
+      final tableUid = await _dataStore.tableMetaManager
+          ?.getUidByName(TableName(_tableName));
       if (tableUid == null) {
         throw DbException([
           SchemaValidationStatus(
