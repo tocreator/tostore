@@ -498,7 +498,7 @@ class ParallelJournalManager {
         // Process business writes (as the "newer" data, overwriting migration)
         for (final e in batch) {
           await yieldController.maybeYield();
-          final tableContext = _tableContextFromUid(e.tableUid);
+          final tableContext = await _tableContextFromUid(e.tableUid);
           if (tableContext == null) continue;
           tableEpochs.putIfAbsent(
               e.tableUid, () => _bufferManager.getClearEpoch(tableContext));
@@ -571,7 +571,7 @@ class ParallelJournalManager {
         final tablePlans = <TableUid, BatchTablePlan>{};
 
         for (final tableUid in allTables) {
-          final tableContext = _resolveTableContext(tableUid);
+          final tableContext = await _resolveTableContext(tableUid);
           if (tableContext == null) continue;
           try {
             final schema = await _dataStore.tableMetaManager
@@ -662,7 +662,7 @@ class ParallelJournalManager {
         late final int perTableTokenBudget;
 
         for (final tableUid in allTables) {
-          final tableContext = _tableContextFromUid(tableUid);
+          final tableContext = await _tableContextFromUid(tableUid);
           if (tableContext == null) continue;
           final tableName = tableContext.tableName;
           // Use the epoch captured before/during grouping
@@ -1241,7 +1241,7 @@ class ParallelJournalManager {
           <TableUid, List<WalPointer>>{};
       try {
         for (final op in _walManager.tableOps.values) {
-          final normalized = _dataStore.tableMetaManager
+          final normalized = await _dataStore.tableMetaManager
                   ?.normalizeTableFieldKey(op.tableUid) ??
               op.tableUid;
           final tableUid = TableUid(normalized);
@@ -1336,11 +1336,11 @@ class ParallelJournalManager {
             final opIdx = entry['op'] as int?;
             if (table == null || data == null || opIdx == null) continue;
 
-            var resolvedTable = _resolvePersistedTableField(table);
+            var resolvedTable = await _resolvePersistedTableField(table);
 
             // Skip WAL entries that are logically before a clear/drop cutoff
             // for this table.
-            final cutoffs = _tableCutoffsFor(tableCutoffs, resolvedTable);
+            final cutoffs = await _tableCutoffsFor(tableCutoffs, resolvedTable);
             if (cutoffs != null && cutoffs.isNotEmpty) {
               final ptr = WalPointer(partitionIndex: p, entrySeq: seq);
               bool skip = false;
@@ -1404,7 +1404,7 @@ class ParallelJournalManager {
             final walPtr = WalPointer(partitionIndex: p, entrySeq: seq);
             final uniqueRefs =
                 await _computeUniqueKeyRefs(TableUid(resolvedTable), data);
-            final tableContext = _resolveTableContext(resolvedTable);
+            final tableContext = await _resolveTableContext(resolvedTable);
             if (tableContext == null) continue;
             await _bufferManager.addRecord(
               table: tableContext,
@@ -1460,7 +1460,7 @@ class ParallelJournalManager {
       if (maxPkByTable.isNotEmpty) {
         try {
           for (final entry in maxPkByTable.entries) {
-            final tableContext = _resolveTableContext(entry.key);
+            final tableContext = await _resolveTableContext(entry.key);
             if (tableContext == null) continue;
             final maxPk = entry.value;
             // First, update memory and FileMeta with tracked WAL max to preserve it
@@ -1557,7 +1557,7 @@ class ParallelJournalManager {
         plan.baseTotalSizeInBytes == null) {
       return;
     }
-    final tableContext = _resolveTableContext(tableUid);
+    final tableContext = await _resolveTableContext(tableUid);
     if (tableContext == null) return;
     try {
       final meta = await _dataStore.tableDataManager
@@ -1590,7 +1590,7 @@ class ParallelJournalManager {
     final baseEntries = plan.baseIndexTotalEntries?[indexUid];
     final baseSize = plan.baseIndexTotalSizeInBytes?[indexUid];
     if (baseEntries == null || baseSize == null) return;
-    final tableContext = _resolveTableContext(tableUid);
+    final tableContext = await _resolveTableContext(tableUid);
     if (tableContext == null) return;
     try {
       final idxMeta =
@@ -1618,11 +1618,11 @@ class ParallelJournalManager {
   ///
   /// Fast path (common): normalize once; if already a live uid, return immediately.
   /// Slow path (legacy name + in-flight rename): apply pending renames, then normalize.
-  TableUid _resolvePersistedTableField(String rawField) {
+  Future<TableUid> _resolvePersistedTableField(String rawField) async {
     if (rawField.isEmpty) return TableUid.empty;
     final mgr = _dataStore.tableMetaManager;
-    final normalized = mgr?.normalizeTableFieldKey(rawField) ?? rawField;
-    if (mgr != null && mgr.isActiveTableUidKey(normalized)) {
+    final normalized = await mgr?.normalizeTableFieldKey(rawField) ?? rawField;
+    if (mgr != null && await mgr.isActiveTableUidKey(normalized)) {
       return TableUid(normalized);
     }
     final migMgr = _dataStore.migrationManager;
@@ -1631,12 +1631,12 @@ class ParallelJournalManager {
     if (pendingRenames.isEmpty) return TableUid(normalized);
     final renamed = pendingRenames[rawField] ?? pendingRenames[normalized];
     if (renamed == null) return TableUid(normalized);
-    return TableUid(mgr?.normalizeTableFieldKey(renamed) ?? renamed);
+    return TableUid(await mgr?.normalizeTableFieldKey(renamed) ?? renamed);
   }
 
-  TableContext? _resolveTableContext(TableUid tableUid) {
+  Future<TableContext?> _resolveTableContext(TableUid tableUid) async {
     if (tableUid.isEmpty) return null;
-    return _dataStore.tableMetaManager?.getTableContextSync(tableUid);
+    return _dataStore.tableMetaManager?.getTableContext(tableUid);
   }
 
   BatchTablePlan? _tablePlanFor(
@@ -1645,26 +1645,27 @@ class ParallelJournalManager {
     return plans[tableUid];
   }
 
-  List<WalPointer>? _tableCutoffsFor(
+  Future<List<WalPointer>?> _tableCutoffsFor(
     Map<TableUid, List<WalPointer>> tableCutoffs,
     TableUid tableUid,
-  ) {
+  ) async {
     final mgr = _dataStore.tableMetaManager;
     if (mgr == null) {
       return tableCutoffs[tableUid];
     }
-    final normalized = TableUid(mgr.normalizeTableFieldKey(tableUid.value));
+    final normalized =
+        TableUid(await mgr.normalizeTableFieldKey(tableUid.value));
     return tableCutoffs[normalized] ?? tableCutoffs[tableUid];
   }
 
   Future<TableSchema?> _resolveTableSchema(TableUid tableUid) async {
-    final ctx = _resolveTableContext(tableUid);
+    final ctx = await _resolveTableContext(tableUid);
     if (ctx == null) return null;
     return _dataStore.tableMetaManager?.getTableSchema(ctx.tableUid);
   }
 
-  TableContext? _tableContextFromUid(TableUid tableUid) {
-    return _dataStore.tableMetaManager?.getTableContextSync(tableUid);
+  Future<TableContext?> _tableContextFromUid(TableUid tableUid) async {
+    return _dataStore.tableMetaManager?.getTableContext(tableUid);
   }
 
   /// Resolve stable [IndexUid] for redo replay (legacy logs may store logical names).
@@ -1723,7 +1724,7 @@ class ParallelJournalManager {
         final tableUid = item.table;
         final op = item.op;
         if (op.walPointer == null) continue;
-        final tableContext = _resolveTableContext(tableUid);
+        final tableContext = await _resolveTableContext(tableUid);
         if (tableContext == null) {
           Logger.warn(
             'Batch recovery: skipping WAL op for unresolved table "$tableUid"',
@@ -1771,7 +1772,7 @@ class ParallelJournalManager {
 
       // Batch update maxId
       for (final tableUid in maxIds.keys) {
-        final tableContext = _resolveTableContext(tableUid);
+        final tableContext = await _resolveTableContext(tableUid);
         if (tableContext == null) continue;
         await _dataStore.tableDataManager.updateMaxIdInMemory(
             tableContext, maxIds[tableUid]!,
@@ -1833,7 +1834,7 @@ class ParallelJournalManager {
       }
 
       for (final tableUid in batchTables) {
-        final tableContext = _resolveTableContext(tableUid);
+        final tableContext = await _resolveTableContext(tableUid);
         if (tableContext == null) continue;
         final schema = tableContext.schema;
         final btreeIndexes = <IndexSchema>[
@@ -1876,7 +1877,7 @@ class ParallelJournalManager {
           <TableUid, List<WalPointer>>{};
       try {
         for (final op in _walManager.tableOps.values) {
-          final normalized = _dataStore.tableMetaManager
+          final normalized = await _dataStore.tableMetaManager
                   ?.normalizeTableFieldKey(op.tableUid) ??
               op.tableUid;
           final tableUid = TableUid(normalized);
@@ -1958,11 +1959,11 @@ class ParallelJournalManager {
             final opIdx = entry['op'] as int?;
             if (table == null || data == null || opIdx == null) continue;
 
-            var resolvedTable = _resolvePersistedTableField(table);
+            var resolvedTable = await _resolvePersistedTableField(table);
 
             // Skip WAL entries that are logically before a clear/drop cutoff
             // for this table.
-            final cutoffs = _tableCutoffsFor(tableCutoffs, resolvedTable);
+            final cutoffs = await _tableCutoffsFor(tableCutoffs, resolvedTable);
             if (cutoffs != null && cutoffs.isNotEmpty) {
               final ptr = WalPointer(partitionIndex: p, entrySeq: seq);
               bool skip = false;
@@ -2256,14 +2257,14 @@ class ParallelJournalManager {
           path = await _dataStore.pathManager
               .getPartitionFilePathByNo(key.tableUid, key.partitionNo);
         } else if (key.kind == PageRedoTreeKind.ngh) {
-          final tableContext = _tableContextFromUid(key.tableUid);
+          final tableContext = await _tableContextFromUid(key.tableUid);
           if (tableContext == null) continue;
           final indexUid =
               _resolveRedoIndexUid(tableContext.schema, key.indexUid);
           path = await _dataStore.pathManager.getNghGraphPartitionPath(
               key.tableUid, indexUid, key.partitionNo);
         } else {
-          final tableContext = _tableContextFromUid(key.tableUid);
+          final tableContext = await _tableContextFromUid(key.tableUid);
           if (tableContext == null) continue;
           final indexUid =
               _resolveRedoIndexUid(tableContext.schema, key.indexUid);
@@ -2307,7 +2308,7 @@ class ParallelJournalManager {
       // Invalidate meta caches so later recovery reads the restored page0, not
       // a pre-crash in-memory snapshot.
       if (key.partitionNo == 0 && pages.containsKey(0)) {
-        final tableContext = _tableContextFromUid(key.tableUid);
+        final tableContext = await _tableContextFromUid(key.tableUid);
         if (tableContext != null) {
           if (key.kind == PageRedoTreeKind.table) {
             _dataStore.tableDataManager
@@ -2339,7 +2340,8 @@ class ParallelJournalManager {
       for (final rec in treeMeta.values) {
         await metaYc.maybeYield();
         try {
-          final tableContext = _tableContextFromUid(TableUid(rec.tableUid));
+          final tableContext =
+              await _tableContextFromUid(TableUid(rec.tableUid));
           if (tableContext == null) continue;
 
           final p0Key = (
