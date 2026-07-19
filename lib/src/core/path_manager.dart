@@ -113,39 +113,39 @@ class PathManager {
   //==================================
 
   /// get table path by UID
-  String getTablePathByUid(TableUid tableUid) {
+  Future<String> getTablePathByUid(TableUid tableUid) async {
     final uid = tableUid;
     if (dataStore.config.persistenceMode == PersistenceMode.memory) {
       return 'memory://${dataStore.currentSpaceName}/tables/$uid';
     }
 
-    final route = dataStore.tableMetaManager?.getRouteByUid(tableUid);
-    if (route == null) {
+    final meta = await dataStore.tableMetaManager?.getTableMeta(tableUid);
+    if (meta == null) {
       final displayName =
-          dataStore.tableMetaManager?.getNameByUid(tableUid)?.value ??
-              'unknown';
+          (await dataStore.tableMetaManager?.getNameByUid(tableUid))?.value ??
+              tableUid.value;
       throw DbException([
         SchemaValidationStatus(
           type: ResultType.devTableNotFound,
-          message: 'Table Route Entry not found for table: $displayName',
+          message: 'Table meta not found for table: $displayName',
           tableName: displayName,
         ),
       ]);
     }
 
     final String parentDir;
-    if (route.isGlobal) {
+    if (meta.isGlobal) {
       parentDir = pathJoin(_instancePath, 'global');
     } else {
       parentDir = getSpacePath(spaceName: dataStore.currentSpaceName);
     }
 
-    return pathJoin(parentDir, 'tables_${route.dataDirIndex}', uid);
+    return pathJoin(parentDir, 'tables_${meta.dirIndex}', uid);
   }
 
   /// get table data root directory path
   Future<String> getDataDirPath(TableUid tableUid) async {
-    final tablePath = getTablePathByUid(tableUid);
+    final tablePath = await getTablePathByUid(tableUid);
     return pathJoin(tablePath, 'data');
   }
 
@@ -186,7 +186,7 @@ class PathManager {
 
   /// get table index directory path
   Future<String> getIndexDirPath(TableUid tableUid) async {
-    final tablePath = getTablePathByUid(tableUid);
+    final tablePath = await getTablePathByUid(tableUid);
     return pathJoin(tablePath, 'index');
   }
 
