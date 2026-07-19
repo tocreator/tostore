@@ -34,11 +34,13 @@ class ForeignKeyManager {
 
   ForeignKeyManager(this._dataStore);
 
-  TableUid? _uidForName(String name) =>
-      _dataStore.tableMetaManager?.getUidByName(TableName(name));
+  Future<TableUid?> _uidForName(String name) =>
+      _dataStore.tableMetaManager?.getUidByName(TableName(name)) ??
+      Future<TableUid?>.value(null);
 
-  TableName _nameForUid(TableUid uid) =>
-      _dataStore.tableMetaManager?.getNameByUid(uid) ?? TableName(uid);
+  Future<TableName> _nameForUid(TableUid uid) async =>
+      await _dataStore.tableMetaManager?.getNameByUid(uid) ??
+      TableName(uid.value);
 
   /// Preload foreign key cache synchronously
   ///
@@ -202,8 +204,8 @@ class ForeignKeyManager {
           continue;
         }
 
-        final referencedUid = _uidForName(referencedTable);
-        final referencingUid = _uidForName(referencingTable);
+        final referencedUid = await _uidForName(referencedTable);
+        final referencingUid = await _uidForName(referencingTable);
         if (referencedUid == null || referencingUid == null) {
           continue;
         }
@@ -529,7 +531,7 @@ class ForeignKeyManager {
     // Check RESTRICT/NO ACTION constraints
     for (final entry in sortedEntries) {
       final childTableUid = entry.key;
-      final childTableName = _nameForUid(childTableUid);
+      final childTableName = await _nameForUid(childTableUid);
       final fks = entry.value;
 
       for (final fk in fks) {
@@ -588,7 +590,7 @@ class ForeignKeyManager {
     // Check RESTRICT/NO ACTION constraints
     for (final entry in sortedEntries) {
       final childTableUid = entry.key;
-      final childTableName = _nameForUid(childTableUid);
+      final childTableName = await _nameForUid(childTableUid);
       final fks = entry.value;
 
       for (final fk in fks) {
@@ -676,7 +678,7 @@ class ForeignKeyManager {
     if (!skipRestrictCheck) {
       for (final entry in sortedEntries) {
         final childTableUid = entry.key;
-        final childTableName = _nameForUid(childTableUid);
+        final childTableName = await _nameForUid(childTableUid);
         final fks = entry.value;
 
         for (final fk in fks) {
@@ -715,7 +717,7 @@ class ForeignKeyManager {
     // Phase 2: After RESTRICT checks pass, process all CASCADE, SET NULL, and SET DEFAULT actions
     for (final entry in sortedEntries) {
       final childTableUid = entry.key;
-      final childTableName = _nameForUid(childTableUid);
+      final childTableName = await _nameForUid(childTableUid);
       final fks = entry.value;
 
       for (final fk in fks) {
@@ -821,7 +823,7 @@ class ForeignKeyManager {
     // Handle each referenced table
     for (final entry in sortedEntries) {
       final childTableUid = entry.key;
-      final childTableName = _nameForUid(childTableUid);
+      final childTableName = await _nameForUid(childTableUid);
       final fks = entry.value;
 
       for (final fk in fks) {
@@ -1048,7 +1050,7 @@ class ForeignKeyManager {
 
     for (final entry in sortedEntries) {
       final childTableUid = entry.key;
-      final childTableName = _nameForUid(childTableUid);
+      final childTableName = await _nameForUid(childTableUid);
       final fks = entry.value;
 
       for (final fk in fks) {
@@ -1165,7 +1167,7 @@ class ForeignKeyManager {
     required ForeignKeySchema fk,
     required dynamic parentPkValues,
   }) async {
-    final childTableName = _nameForUid(childTableUid);
+    final childTableName = await _nameForUid(childTableUid);
     // Build query conditions using helper method
     final condition = _buildForeignKeyCondition(fk, parentPkValues);
 
@@ -1237,7 +1239,7 @@ class ForeignKeyManager {
     required dynamic parentPkValues,
     required Set<String> visitedRecords,
   }) async {
-    final childTableName = _nameForUid(childTableUid);
+    final childTableName = await _nameForUid(childTableUid);
     // Build query conditions using helper method
     final condition = _buildForeignKeyCondition(fk, parentPkValues);
     if (condition.isEmpty) {
@@ -1337,7 +1339,7 @@ class ForeignKeyManager {
 
         for (final childEntry in sortedChildTables) {
           final grandChildTableUid = childEntry.key;
-          final grandChildTableName = _nameForUid(grandChildTableUid);
+          final grandChildTableName = await _nameForUid(grandChildTableUid);
           final grandChildFks = childEntry.value;
 
           for (final grandChildFk in grandChildFks) {
@@ -1429,7 +1431,7 @@ class ForeignKeyManager {
     required dynamic oldParentPkValues,
     required dynamic newParentPkValues,
   }) async {
-    final childTableName = _nameForUid(childTableUid);
+    final childTableName = await _nameForUid(childTableUid);
     // Verify that the child table still exists (may have been dropped during cascade)
     final childSchema =
         await _dataStore.tableMetaManager?.getTableSchema(childTableUid);
@@ -1577,7 +1579,7 @@ class ForeignKeyManager {
     required ForeignKeySchema fk,
     required dynamic parentPkValues,
   }) async {
-    final childTableName = _nameForUid(childTableUid);
+    final childTableName = await _nameForUid(childTableUid);
     // Validate that foreign key fields allow NULL
     // Note: Table may have been dropped during cascade operation, check and handle gracefully
     final childSchema =
@@ -1647,7 +1649,7 @@ class ForeignKeyManager {
     required ForeignKeySchema fk,
     required dynamic parentPkValues,
   }) async {
-    final childTableName = _nameForUid(childTableUid);
+    final childTableName = await _nameForUid(childTableUid);
     // Get the child table structure
     // Note: Table may have been dropped during cascade operation, check and handle gracefully
     final childSchema =
