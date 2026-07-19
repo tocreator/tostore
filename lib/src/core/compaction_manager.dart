@@ -157,8 +157,8 @@ final class CompactionManager {
         bool finished = true;
         try {
           if (task.kind == _CompactionKind.table) {
-            final tableCtx =
-                _dataStore.tableMetaManager?.getTableContextSync(task.tableUid);
+            final tableCtx = await _dataStore.tableMetaManager
+                ?.getTableContext(task.tableUid);
             if (tableCtx == null) continue;
             final TreePagePtr? hint = _tableHint[task.tableUid];
             final next =
@@ -174,8 +174,8 @@ final class CompactionManager {
               finished = false;
             }
           } else {
-            final tableCtx =
-                _dataStore.tableMetaManager?.getTableContextSync(task.tableUid);
+            final tableCtx = await _dataStore.tableMetaManager
+                ?.getTableContext(task.tableUid);
             if (tableCtx == null) continue;
             final TreePagePtr? hint =
                 _indexHint['${task.tableUid}:${task.indexUid!.value}'];
