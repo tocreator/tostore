@@ -31,7 +31,7 @@ class KeyMigrationProgressStore {
 
   static Future<TableContext?> _progressTableContext(
       DataStoreImpl dataStore) async {
-    final uid = dataStore.tableMetaManager
+    final uid = await dataStore.tableMetaManager
         ?.getUidByName(TableName(SystemTable.keyMigrationProgressTableName));
     if (uid == null) return null;
     return dataStore.tableMetaManager?.getTableContext(uid);
