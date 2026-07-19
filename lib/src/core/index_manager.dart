@@ -24,6 +24,7 @@ import '../model/parallel_journal_entry.dart';
 import '../model/system_table.dart';
 import '../model/table_schema.dart';
 import '../model/table_context.dart';
+import '../model/table_identity.dart';
 import '../model/unique_violation.dart';
 import '../query/query_condition.dart';
 import 'compute/compute_batch_planner.dart';
@@ -38,7 +39,6 @@ import 'transaction_context.dart';
 import 'tree_cache.dart';
 import 'weight_manager.dart';
 import 'yield_controller.dart';
-import '../model/table_identity.dart';
 
 /// Index Manager
 /// Responsible for index creation, update, deletion, and query operations
@@ -464,8 +464,8 @@ class IndexManager {
         indexKey,
       );
     } catch (e) {
-      final logTable = _dataStore.tableMetaManager
-              ?.resolveTableNameFromField(tableUid)
+      final logTable = (await _dataStore.tableMetaManager
+                  ?.resolveTableNameFromField(tableUid))
               ?.value ??
           'unknown';
       Logger.warn('Failed to query index data weight for $logTable:$indexUid',
@@ -511,13 +511,15 @@ class IndexManager {
   bool _isInternalKvExpiryIndexField(TableContext table, String field) {
     return SystemTable.isKeyValueTable(table.tableName) &&
         (field == SystemTable.keyValueExpiryIndexUid ||
+            field == 'i_sys_kv_expiry' || // legacy semantic uid
             field == _internalKvExpiryActualIndexName ||
             field == SystemTable.keyValueExpiryIndexName);
   }
 
   bool _isInternalKvExpiryIndex(TableContext table, IndexUid indexUid) {
-    return SystemTable.isKeyValueTable(table.tableName) &&
-        indexUid == SystemTable.keyValueExpiryIndexUid;
+    if (!SystemTable.isKeyValueTable(table.tableName)) return false;
+    return indexUid == SystemTable.keyValueExpiryIndexUid ||
+        indexUid.value == 'i_sys_kv_expiry'; // legacy semantic uid
   }
 
   Uint8List? _encodeInternalKvExpiryIndexKey(
@@ -1070,9 +1072,8 @@ class IndexManager {
     }
     final migrationMgr = _dataStore.migrationManager;
     if (migrationMgr != null) {
-      final tableUid =
-          _dataStore.tableMetaManager?.getUidByName(table.tableName);
-      if (tableUid != null &&
+      final tableUid = table.tableUid;
+      if (tableUid.isNotEmpty &&
           migrationMgr.hasPendingIndexBuild(tableUid, indexUid)) {
         return true;
       }
@@ -1100,7 +1101,7 @@ class IndexManager {
     final direct = await _loadIndexMetaCached(tableUid, indexUid);
     if (direct != null) return direct;
 
-    final table = _dataStore.tableMetaManager?.getTableContextSync(tableUid);
+    final table = await _dataStore.tableMetaManager?.getTableContext(tableUid);
     if (table == null) return null;
     final resolved = _resolveIndexUidFromIndexName(table, indexUid.value);
     // Same uid ⇒ the IndexUid path already missed; do not retry.
@@ -1219,43 +1220,30 @@ class IndexManager {
       // Synthesize an in-memory IndexMeta from the consolidated index list
       // (includes implicit indexes like TTL / foreign keys).
       try {
-        final schema =
-            await _dataStore.tableMetaManager?.getTableSchema(tableUid);
-        if (schema != null) {
-          final allIndexes = <IndexSchema>[
-            ...?_dataStore.tableMetaManager?.getAllIndexesFor(schema),
-            ...getEngineManagedBtreeIndexes(
-                _dataStore.tableMetaManager?.getTableContextSync(tableUid) ??
-                    TableContext(
-                      tableUid: tableUid,
-                      tableName:
-                          _dataStore.tableMetaManager?.getNameByUid(tableUid) ??
-                              TableName(tableUid),
-                      isGlobal: false,
-                      dataDirIndex: 0,
-                      schema: schema,
-                    ),
-                schema),
-          ];
-          final idx = allIndexes.firstWhere(
-            (i) => i.indexUid == indexUid || i.actualIndexName == indexUid,
-            orElse: () => IndexSchema(indexName: '', fields: const []),
+        final tableContext =
+            await _dataStore.tableMetaManager?.getTableContext(tableUid);
+        if (tableContext == null) return null;
+
+        final schema = tableContext.schema;
+        final allIndexes = <IndexSchema>[
+          ...?_dataStore.tableMetaManager?.getAllIndexesFor(schema),
+          ...getEngineManagedBtreeIndexes(tableContext, schema),
+        ];
+        final idx = allIndexes.firstWhere(
+          (i) => i.indexUid == indexUid || i.actualIndexName == indexUid,
+          orElse: () => IndexSchema(indexName: '', fields: const []),
+        );
+        if (idx.fields.isNotEmpty) {
+          final isBuilding =
+              _shouldCreateIndexAsBuilding(tableContext, indexUid);
+          final synthesized = IndexMeta.createEmpty(
+            indexUid: indexUid,
+            tableUid: tableUid,
+            isUnique: idx.unique,
+            isBuilding: isBuilding,
           );
-          if (idx.fields.isNotEmpty) {
-            final tableContext =
-                _dataStore.tableMetaManager?.getTableContextSync(tableUid);
-            final isBuilding = tableContext != null
-                ? _shouldCreateIndexAsBuilding(tableContext, indexUid)
-                : false;
-            final synthesized = IndexMeta.createEmpty(
-              indexUid: indexUid,
-              tableUid: tableUid,
-              isUnique: idx.unique,
-              isBuilding: isBuilding,
-            );
-            _indexMetaCache.put([tableUid, indexUid], synthesized);
-            return synthesized;
-          }
+          _indexMetaCache.put([tableUid, indexUid], synthesized);
+          return synthesized;
         }
       } catch (_) {
         // Fallback: no meta available; let caller decide (usually tableScan).
@@ -1597,9 +1585,7 @@ class IndexManager {
       }
     }
 
-    final tableUid =
-        _dataStore.tableMetaManager?.getUidByName(table.tableName) ??
-            table.tableUid;
+    final tableUid = table.tableUid;
     final indexMeta = IndexMeta.createEmpty(
       indexUid: indexUid,
       tableUid: tableUid,
@@ -1806,9 +1792,7 @@ class IndexManager {
         await deletePhysicalIndexArtifacts(table, indexUid);
 
         // Lock the index building state (read-modify-write under meta lock).
-        final tableUid =
-            _dataStore.tableMetaManager?.getUidByName(table.tableName) ??
-                table.tableUid;
+        final tableUid = table.tableUid;
         await mutateIndexMeta(
           table,
           indexUid,
@@ -2863,7 +2847,10 @@ class IndexManager {
           final newSchema = schema.copyWith(indexes: newIndexes);
 
           // update table schema
-          await schemaMgr!.saveTableSchema(table, newSchema);
+          await schemaMgr!.updateTableMeta(
+            table.tableUid,
+            schema: newSchema,
+          );
         }
       } finally {
         if (indexLocked && lockMgr != null) {
@@ -3087,9 +3074,7 @@ class IndexManager {
         }
         // Clean physical index files before rebuild starts
         await deletePhysicalIndexArtifacts(table, indexUid);
-        final tableUid =
-            _dataStore.tableMetaManager?.getUidByName(table.tableName) ??
-                table.tableUid;
+        final tableUid = table.tableUid;
         final indexMeta = IndexMeta.createEmpty(
           indexUid: indexUid,
           tableUid: tableUid,
@@ -3422,9 +3407,7 @@ class IndexManager {
         continue;
       }
       idxTasks.add(() async {
-        final tableUid =
-            _dataStore.tableMetaManager?.getUidByName(table.tableName) ??
-                table.tableUid;
+        final tableUid = table.tableUid;
         var meta = await getIndexMeta(table.tableUid, indexUid);
         // If index metadata doesn't exist, create it in memory only (avoid extra IO)
         if (meta == null) {
