@@ -72,8 +72,8 @@ class InternalKvStore {
     if (key.isEmpty) return;
     try {
       final table = await _table(isGlobal: isGlobal);
-      final condition =
-          QueryCondition()..where(SystemTable.keyValueKeyField, '=', key);
+      final condition = QueryCondition()
+        ..where(SystemTable.keyValueKeyField, '=', key);
 
       final result = await TransactionContext.runAsSystemOperation(() async {
         return await _db.deleteInternal(table, condition);

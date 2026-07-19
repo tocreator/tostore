@@ -96,6 +96,26 @@ class TableSchema {
 
   /// Prepare a caller-defined schema for first-time table creation.
   TableSchema materializeForCreate({bool isSystemTable = false}) {
+    final schemaVersion = GlobalIdGenerator.generate('s');
+    if (isSystemTable) {
+      return TableSchema._internal(
+        name: name,
+        primaryKeyConfig: primaryKeyConfig,
+        fields: fields,
+        indexes: indexes,
+        foreignKeys: foreignKeys,
+        isGlobal: isGlobal,
+        tableId: tableId,
+        ttlConfig: ttlConfig,
+        tableUid: tableUid.isNotEmpty
+            ? tableUid
+            : TableUid(GlobalIdGenerator.generate('t')),
+        schemaVersion: schemaVersion,
+        isSystemTable: true,
+        autoIndexes: autoIndexes,
+      );
+    }
+
     final cleaned = cleanInternalFields();
     return TableSchema._internal(
       name: cleaned.name,
@@ -107,13 +127,13 @@ class TableSchema {
       tableId: cleaned.tableId,
       ttlConfig: cleaned.ttlConfig,
       tableUid: TableUid(GlobalIdGenerator.generate('t')),
-      schemaVersion: GlobalIdGenerator.generate('s'),
-      isSystemTable: isSystemTable,
+      schemaVersion: schemaVersion,
+      isSystemTable: false,
     );
   }
 
   /// Returns a clean copy of the schema with all internal/metadata fields stripped.
-  /// Used to ensure user-defined definitions don't carry internal metadata.
+  /// Used at user-schema input boundaries so definitions cannot inject engine fields.
   TableSchema cleanInternalFields() {
     return TableSchema._internal(
       name: name,

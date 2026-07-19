@@ -1234,8 +1234,9 @@ class DataStoreImpl {
       await ensureInitialized();
     }
 
-    final tableSchema = schema.materializeForCreate(
-        isSystemTable: isSystemTable || SystemTable.isSystemTable(schema.name));
+    // Privilege is caller-asserted only — never inferred from table name.
+    final tableSchema =
+        schema.materializeForCreate(isSystemTable: isSystemTable);
     final tableUid = tableSchema.tableUid;
 
     try {
@@ -1253,14 +1254,11 @@ class DataStoreImpl {
       try {
         // Validate primary key configuration and field types
         final reservedSystemTableNames = SystemTable.systemTableNames;
-        final bool isKnownSystemTable =
-            SystemTable.isSystemTable(tableSchema.name);
-        final bool allowSystemSchema = isKnownSystemTable || isSystemTable;
         tableSchema.validateTableSchema(
           reservedTableNames: reservedSystemTableNames,
-          allowReservedTableNames: allowSystemSchema,
-          allowInternalTableNamePrefix: allowSystemSchema,
-          allowOtherInternalFields: allowSystemSchema,
+          allowReservedTableNames: isSystemTable,
+          allowInternalTableNamePrefix: isSystemTable,
+          allowOtherInternalFields: isSystemTable,
         );
 
         // Validate foreign key constraints with referenced tables
@@ -1338,8 +1336,7 @@ class DataStoreImpl {
         );
 
         // Auto-create indexes for foreign keys
-        if (_foreignKeyManager != null &&
-            !SystemTable.isSystemTable(tableSchema.name)) {
+        if (_foreignKeyManager != null && !tableSchema.isSystemTable) {
           await _foreignKeyManager!
               .updateSystemTableForTable(tableCtx, tableSchema);
         }
@@ -1347,7 +1344,7 @@ class DataStoreImpl {
         // New table created successfully, call table creation statistics method
         tableDataManager.tableCreated(tableCtx);
 
-        if (!SystemTable.isSystemTable(tableSchema.name)) {
+        if (!tableSchema.isSystemTable) {
           Logger.info(
             'Table ${tableSchema.name} created successfully${tableSchema.isGlobal ? ' (global)' : ' (space)'}',
           );
