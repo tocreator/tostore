@@ -1,33 +1,43 @@
 import 'dart:async';
-import 'dart:convert';
 
 import 'package:path/path.dart' show dirname;
 
 import '../handler/binary_schema_codec.dart';
-import '../handler/common.dart';
 import '../handler/logger.dart';
-import '../model/space_manifest.dart';
 import '../handler/space_manifest_codec.dart';
+import '../handler/table_meta_codec.dart';
 import '../model/db_exception.dart';
+import '../model/db_result.dart';
+import '../model/global_config.dart';
 import '../model/id_generator.dart';
 import '../model/meta_info.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
+import '../model/space_manifest.dart';
 import '../model/system_table.dart';
 import '../model/table_context.dart';
 import '../model/table_identity.dart';
+import '../model/table_meta.dart';
 import '../model/table_schema.dart';
+import '../query/query_condition.dart';
 import 'data_store_impl.dart';
+import 'transaction_context.dart';
 import 'tree_cache.dart';
+import 'yield_controller.dart';
 
-/// Table meta manager.
+/// Table meta manager — stores metadata in `_system_table_meta`.
 class TableMetaManager {
   final DataStoreImpl _dataStore;
-  SchemaMeta? _schemaMeta; // Cache schema meta
+
+  /// Hot [TableMeta] cache. Managed by ResourceManager: [MemoryQuotaType.schema].
+  TreeCache<TableMeta>? _tableMetaCache;
 
   /// Hot schema cache (TableSchema) using [TreeCache].
   /// Managed by ResourceManager quota: [MemoryQuotaType.schema].
   TreeCache<TableSchema>? _tableSchemaCache;
+
+  /// O(1) lookup of full [TableMeta] (not subject to TreeCache eviction).
+  final Map<TableUid, TableMeta> _metaByUid = <TableUid, TableMeta>{};
 
   /// Per-table index cache derived from [TableSchema].
   final Map<TableUid, _IndexListCacheEntry> _indexListCache =
@@ -37,94 +47,127 @@ class TableMetaManager {
   final Map<TableUid, FieldStorageLayout> _tableFieldLayoutCache =
       <TableUid, FieldStorageLayout>{};
 
-  /// Per-table cached storage field structure derived from layout + schema (keyed by tableUid).
+  /// Per-table cached storage field structure derived from layout + schema.
   final Map<TableUid, List<FieldStructure>> _storageFieldStructCache =
       <TableUid, List<FieldStructure>>{};
 
-  // Loading futures to prevent thundering herd on concurrent schema reads (keyed by tableUid)
-  final Map<TableUid, Future<TableSchema?>> _schemaLoadingFutures = {};
+  /// Loading futures to prevent thundering herd on concurrent meta reads.
+  final Map<TableUid, Future<TableMeta?>> _metaLoadingFutures = {};
 
   static const String _deletedSlotFieldPrefix = '_system_storage_deleted_slot_';
 
-  // --- Dynamic O(1) Memory Lookups ---
-  /// Mapping from tableUid to its Schema Route Entry
-  final Map<TableUid, TableSchemaRouteEntry> routeByUid = {};
+  /// Name→uid inventory for **all** tables in the database (not space-filtered).
+  ///
+  /// After [loadAllTableMetaAsync] completes this is the complete lightweight
+  /// listing source and is **not** cleared by TreeCache eviction of full
+  /// [TableMeta]. Before it is ready, lookups must point-query the system
+  /// table (never block startup on full load). Current-space visibility is
+  /// applied only when listing with [listAllTables] `onlyCurrentSpace: true`.
+  final Map<TableName, TableUid> _uidByName = {};
 
-  /// Mapping from tableName to tableUid (active + global tables only)
-  final Map<TableName, TableUid> uidByName = {};
+  /// Uid→name reverse inventory (same scope / lifetime as [_uidByName]).
+  final Map<TableUid, TableName> _nameByUid = {};
 
-  /// Mapping from tableUid to tableName (active + global tables only)
-  final Map<TableUid, TableName> nameByUid = {};
+  /// Global table UIDs in the name inventory (never in space activeUids).
+  /// Used so [onlyCurrentSpace] listings always include globals without
+  /// depending on full [TableMeta] still being hot in memory.
+  final Set<TableUid> _globalTableUids = {};
 
-  // --- In-Memory Pre-Aggregated Sharding Counts ---
+  /// True once startup [loadAllTableMetaAsync] finished building name maps.
+  bool _nameInventoryReady = false;
+
+  /// Single-flight handle for [loadAllTableMetaAsync] (startup / explicit).
+  Future<void>? _loadAllMetaFuture;
+
+  /// Under-capacity data-dir usage only (count < maxEntriesPerDir).
   final Map<int, int> _globalDirCounts = {};
   final Map<int, int> _nonGlobalDirCounts = {};
 
-  // --- In-Memory Pre-Aggregated Partition Mappings & Sizes ---
-  final Map<int, int> _partitionDirIndexMap = {};
-  final Map<int, Set<int>> _dirPartitions = {};
-  final Map<int, int> _partitionSizes = {};
-
-  /// Deferred per-space metadata (inventory, large stats). Loaded asynchronously.
+  /// Deferred per-space metadata (inventory). Loaded asynchronously.
   final Map<String, SpaceManifest> _manifestBySpace = {};
+
+  /// Serializes [allocateDirIndex] against concurrent creates.
+  Future<void> _dirAllocChain = Future.value();
 
   TableMetaManager(this._dataStore);
 
-  /// Get tableUid by tableName
-  TableUid? getUidByName(TableName tableName) {
-    return uidByName[tableName];
+  /// True if any table meta is currently held in memory.
+  bool get hasAnyTableMeta => _metaByUid.isNotEmpty;
+
+  /// Whether the lightweight name↔uid inventory is complete for listing.
+  bool get isNameInventoryReady => _nameInventoryReady;
+
+  /// Mark name inventory complete (e.g. memory-mode startup after all schemas
+  /// are registered via [registerTableSchemaInMemory]).
+  void markNameInventoryReady() {
+    _nameInventoryReady = true;
+    _ensureTableMetaCache().setFullyCached('all', true);
   }
 
-  /// Get tableName by tableUid
-  TableName? getNameByUid(TableUid tableUid) {
-    return nameByUid[tableUid];
+  /// Resolve tableUid from tableName (memory → fully-cached miss → system table).
+  Future<TableUid?> getUidByName(TableName tableName) =>
+      resolveTableUidFromName(tableName);
+
+  /// Resolve tableName from tableUid via [getTableMeta] (system-table aware).
+  Future<TableName?> getNameByUid(TableUid tableUid) async {
+    if (tableUid.isEmpty) return null;
+    final meta = await getTableMeta(tableUid);
+    return meta?.tableName;
   }
 
-  /// Normalize a persisted uid-or-name field to a stable map key (prefers uid).
-  String normalizeTableFieldKey(String field) {
-    if (field.isEmpty) return field;
-    if (routeByUid.containsKey(TableUid(field))) return field;
-    return getUidByName(TableName(field))?.value ?? field;
-  }
-
-  /// Whether [normalizedKey] is an active table uid in the route map (O(1)).
-  bool isActiveTableUidKey(String normalizedKey) {
-    return normalizedKey.isNotEmpty &&
-        routeByUid.containsKey(TableUid(normalizedKey));
-  }
-
-  /// Resolve user-visible table name from a persisted uid-or-name field.
-  TableName? resolveTableNameFromField(String field) {
-    if (field.isEmpty) return null;
-    final byUid = getNameByUid(TableUid(field));
-    if (byUid != null) return byUid;
-    if (uidByName.containsKey(TableName(field))) return TableName(field);
-    return null;
-  }
-
-  /// Whether [field] refers to the same table as [tableUid] (legacy name aware).
-  bool tableFieldMatches(String field, TableUid tableUid) {
-    if (field == tableUid.value) return true;
-    return getUidByName(TableName(field)) == tableUid;
-  }
-
-  /// Resolve key used in schema partition maps (uid preferred, legacy name fallback).
-  TableUid? _resolvePartitionTableKey(
-    SchemaPartitionMeta meta,
-    TableUid tableUid,
-  ) {
-    if (meta.tableSchemas.containsKey(tableUid)) return tableUid;
-    final name = getNameByUid(tableUid);
-    if (name != null) {
-      final legacyKey = TableUid(name.value);
-      if (meta.tableSchemas.containsKey(legacyKey)) return legacyKey;
+  /// Memory-only name→uid peek. Do not use for existence / correctness.
+  TableUid? _peekUidByName(TableName tableName) {
+    if (tableName.isEmpty) return null;
+    final cached = _uidByName[tableName];
+    if (cached != null) return cached;
+    final asUid = TableUid(tableName.value);
+    if (_metaByUid.containsKey(asUid) || _tableMetaCache?.get(asUid) != null) {
+      return asUid;
     }
     return null;
   }
 
-  /// Get TableSchemaRouteEntry by tableUid
-  TableSchemaRouteEntry? getRouteByUid(TableUid tableUid) {
-    return routeByUid[tableUid];
+  /// Memory-only uid→name peek (logs / best-effort display only).
+  TableName? _peekNameByUid(TableUid tableUid) {
+    if (tableUid.isEmpty) return null;
+    return _nameByUid[tableUid] ?? _metaByUid[tableUid]?.tableName;
+  }
+
+  /// Normalize a persisted uid-or-name field to a stable map key (prefers uid).
+  Future<String> normalizeTableFieldKey(String field) async {
+    if (field.isEmpty) return field;
+    if (await isActiveTableUidKey(field)) return field;
+    final uid = await getUidByName(TableName(field));
+    return uid?.value ?? field;
+  }
+
+  /// Whether [normalizedKey] is a known table uid (system-table aware).
+  Future<bool> isActiveTableUidKey(String normalizedKey) async {
+    if (normalizedKey.isEmpty) return false;
+    return await getTableMeta(TableUid(normalizedKey)) != null;
+  }
+
+  /// Resolve user-visible table name from a persisted uid-or-name field.
+  Future<TableName?> resolveTableNameFromField(String field) async {
+    if (field.isEmpty) return null;
+    final byUid = await getNameByUid(TableUid(field));
+    if (byUid != null) return byUid;
+    final uid = await getUidByName(TableName(field));
+    if (uid != null) return TableName(field);
+    return null;
+  }
+
+  /// Whether [field] refers to the same table as [tableUid] (legacy name aware).
+  Future<bool> tableFieldMatches(String field, TableUid tableUid) async {
+    if (field.isEmpty || tableUid.isEmpty) return false;
+    if (field == tableUid.value) return true;
+    final resolved = await getUidByName(TableName(field));
+    return resolved == tableUid;
+  }
+
+  /// Memory peek only (no I/O). Prefer [getTableMeta] on engine paths.
+  TableMeta? _peekTableMeta(TableUid tableUid) {
+    return _metaByUid[tableUid] ?? _tableMetaCache?.get(tableUid);
   }
 
   TreeCache<TableSchema> _ensureTableSchemaCache() {
@@ -139,18 +182,41 @@ class TableMetaManager {
       sizeCalculator: _estimateTableSchemaSize,
       maxByteThreshold: maxBytes,
       minByteThreshold: minBytes,
+      debugLabel: 'TableSchemaCache',
     );
     _tableSchemaCache = cache;
     return cache;
   }
 
-  /// Get cached [TableSchema] if present (O(1)).
-  TableSchema? getCachedTableSchema(TableUid tableUid) {
-    return _tableSchemaCache?.get(tableUid);
+  TreeCache<TableMeta> _ensureTableMetaCache() {
+    final existing = _tableMetaCache;
+    if (existing != null) return existing;
+
+    final int maxBytes =
+        _dataStore.resourceManager?.getSchemaCacheSize() ?? (50 * 1024 * 1024);
+    final int minBytes = 50 * 1024 * 1024;
+
+    final cache = TreeCache<TableMeta>(
+      sizeCalculator: _estimateTableMetaSize,
+      maxByteThreshold: maxBytes,
+      minByteThreshold: minBytes,
+      debugLabel: 'TableMetaCache',
+    );
+    _tableMetaCache = cache;
+    return cache;
   }
 
-  /// Cache [TableSchema] into hotspot cache.
-  void cacheTableSchema(TableUid tableUid, TableSchema schema) {
+  /// Memory peek of [TableSchema] only (layout/struct identical checks).
+  /// Correctness paths must use [getTableSchema] / [getTableMeta].
+  TableSchema? _peekTableSchema(TableUid tableUid) {
+    if (tableUid.isEmpty) return null;
+    return _metaByUid[tableUid]?.schema ??
+        _tableMetaCache?.get(tableUid)?.schema ??
+        _tableSchemaCache?.get(tableUid);
+  }
+
+  /// Hotspot schema cache + derived index lists (called from [_cacheTableMeta]).
+  void _cacheTableSchema(TableUid tableUid, TableSchema schema) {
     _ensureTableSchemaCache().put(tableUid, schema);
     _indexListCache[tableUid] = _buildIndexListCache(schema);
     _storageFieldStructCache.remove(tableUid);
@@ -159,56 +225,131 @@ class TableMetaManager {
     }
   }
 
-  /// Get TableContext by tableUid (asynchronous).
+  void _cacheTableMeta(TableMeta meta) {
+    _metaByUid[meta.tableUid] = meta;
+    _ensureTableMetaCache().put(meta.tableUid, meta);
+    _tableFieldLayoutCache[meta.tableUid] = meta.fieldLayout;
+    _storageFieldStructCache.remove(meta.tableUid);
+    _cacheTableSchema(meta.tableUid, meta.schema);
+  }
+
+  /// Register [schema] as a full in-memory [TableMeta] visible to [getTableMeta].
   ///
-  /// When [tableUid] is a legacy logical table name stored in older metadata,
-  /// falls back to name lookup only if route resolution fails.
+  /// Used by memory-mode startup and other callers that previously only wrote
+  /// the schema TreeCache (which [getTableSchema] could not see).
+  Future<TableMeta> registerTableSchemaInMemory(TableSchema schema) async {
+    var resolved = schema;
+    if (resolved.tableUid.isEmpty &&
+        SystemTable.isTableMetaTable(resolved.name)) {
+      resolved = resolved.copyWith(tableUid: SystemTable.tableMetaTableUid);
+    }
+
+    final uid = resolved.tableUid;
+    final existing = uid.isNotEmpty ? _peekTableMeta(uid) : null;
+    final layout = existing?.fieldLayout ??
+        (uid.isNotEmpty ? _tableFieldLayoutCache[uid] : null) ??
+        _createInitialFieldStorageLayout(resolved);
+    final now = DateTime.now();
+    final int? knownDirIndex = SystemTable.isTableMetaTable(resolved.name)
+        ? SystemTable.tableMetaDirIndex
+        : existing?.dirIndex;
+
+    return saveTableMeta(
+      TableMeta(
+        tableUid: uid,
+        tableName: TableName(resolved.name),
+        isGlobal: resolved.isGlobal,
+        schema: resolved,
+        fieldLayout: layout,
+        dirIndex: knownDirIndex ?? 0,
+        createdAt: existing?.createdAt ?? now,
+        updatedAt: now,
+      ),
+      memoryOnly: true,
+      dirIndex: knownDirIndex,
+      layoutOverride: layout,
+    );
+  }
+
+  /// Hard-coded [TableContext] for `_system_table_meta` (no disk read).
+  TableContext bootstrapTableMetaContext() {
+    final schema = _bootstrapTableMetaSchema();
+    return TableContext(
+      tableUid: SystemTable.tableMetaTableUid,
+      tableName: TableName(SystemTable.tableMetaName),
+      isGlobal: true,
+      dirIndex: SystemTable.tableMetaDirIndex,
+      schema: schema,
+    );
+  }
+
+  TableSchema _bootstrapTableMetaSchema() {
+    TableSchema? found;
+    for (final s in SystemTable.gettableSchemas) {
+      if (s.name == SystemTable.tableMetaName) {
+        found = s;
+        break;
+      }
+    }
+    if (found == null) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'System table schema for "${SystemTable.tableMetaName}" is missing.',
+        ),
+      ]);
+    }
+    if (found.tableUid.isEmpty) {
+      return found.copyWith(tableUid: SystemTable.tableMetaTableUid);
+    }
+    return found;
+  }
+
+  TableMeta _buildBootstrapTableMeta() {
+    final schema = _bootstrapTableMetaSchema();
+    final layout = _tableFieldLayoutCache[SystemTable.tableMetaTableUid] ??
+        _createInitialFieldStorageLayout(schema);
+    final now = DateTime.now();
+    final existing = _metaByUid[SystemTable.tableMetaTableUid];
+    return TableMeta(
+      tableUid: SystemTable.tableMetaTableUid,
+      tableName: TableName(SystemTable.tableMetaName),
+      isGlobal: true,
+      schema: schema,
+      fieldLayout: layout,
+      dirIndex: SystemTable.tableMetaDirIndex,
+      extra: existing?.extra,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: existing?.updatedAt ?? now,
+    );
+  }
+
+  /// Get [TableContext] by tableUid (asynchronous).
+  ///
+  /// Uses [getTableMeta]: memory → fully-cached miss = absent → else system table.
   Future<TableContext?> getTableContext(TableUid tableUid) async {
     if (tableUid.isEmpty) return null;
     var uid = tableUid;
-    var route = getRouteByUid(uid);
-    if (route == null) {
-      final legacyUid = getUidByName(TableName(uid));
-      if (legacyUid == null) return null;
-      uid = legacyUid;
-      route = getRouteByUid(uid);
-      if (route == null) return null;
+    var meta = await getTableMeta(uid);
+    if (meta == null) {
+      final legacyUid = await getUidByName(TableName(uid.value));
+      if (legacyUid != null && legacyUid != uid) {
+        uid = legacyUid;
+        meta = await getTableMeta(uid);
+      }
     }
-    final schema = await getTableSchema(uid);
-    if (schema == null) return null;
+    if (meta == null) return null;
     return TableContext(
-      tableUid: uid,
-      tableName: route.tableName,
-      isGlobal: route.isGlobal,
-      dataDirIndex: route.dataDirIndex,
-      schema: schema,
+      tableUid: meta.tableUid,
+      tableName: meta.tableName,
+      isGlobal: meta.isGlobal,
+      dirIndex: meta.dirIndex,
+      schema: meta.schema,
     );
   }
 
-  /// Get TableContext by tableUid (synchronous, checks memory cache).
-  TableContext? getTableContextSync(TableUid tableUid) {
-    if (tableUid.isEmpty) return null;
-    var uid = tableUid;
-    var route = getRouteByUid(uid);
-    if (route == null) {
-      final legacyUid = getUidByName(TableName(uid));
-      if (legacyUid == null) return null;
-      uid = legacyUid;
-      route = getRouteByUid(uid);
-      if (route == null) return null;
-    }
-    final schema = getCachedTableSchema(uid);
-    if (schema == null) return null;
-    return TableContext(
-      tableUid: uid,
-      tableName: route.tableName,
-      isGlobal: route.isGlobal,
-      dataDirIndex: route.dataDirIndex,
-      schema: schema,
-    );
-  }
-
-  /// Get TableContext by schemaVersion (O(1) lookup in migrationManager)
+  /// Get [TableContext] by schemaVersion (O(1) lookup in migrationManager).
   TableContext getTableContextByVersion(String schemaVersion) {
     final migrationMgr = _dataStore.migrationManager;
     final schema = migrationMgr?.getTableSchemaByVersion(schemaVersion);
@@ -230,28 +371,29 @@ class TableMetaManager {
         )
       ]);
     }
-    final route = getRouteByUid(uid);
-    if (route == null) {
+    final meta = _peekTableMeta(uid);
+    if (meta == null) {
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,
           message:
-              'Route entry not found for table "${schema.name}" (schema version "$schemaVersion").',
+              'Table meta not found for table "${schema.name}" (schema version "$schemaVersion").',
         )
       ]);
     }
     return TableContext(
       tableUid: uid,
-      tableName: route.tableName,
-      isGlobal: route.isGlobal,
-      dataDirIndex: route.dataDirIndex,
+      tableName: meta.tableName,
+      isGlobal: meta.isGlobal,
+      dirIndex: meta.dirIndex,
       schema: schema,
     );
   }
 
-  /// Remove cached schema for [tableUid].
+  /// Remove cached schema / meta for [tableUid].
   void removeCachedTableSchema(TableUid tableUid) {
     _tableSchemaCache?.remove(tableUid);
+    _tableMetaCache?.remove(tableUid);
     _indexListCache.remove(tableUid);
     _tableFieldLayoutCache.remove(tableUid);
     _storageFieldStructCache.remove(tableUid);
@@ -259,14 +401,21 @@ class TableMetaManager {
 
   /// Current schema cache size in bytes (incremental tracked).
   int getCurrentSchemaCacheSize() {
-    return _tableSchemaCache?.estimatedTotalSizeBytes ?? 0;
+    final schemaBytes = _tableSchemaCache?.estimatedTotalSizeBytes ?? 0;
+    final metaBytes = _tableMetaCache?.estimatedTotalSizeBytes ?? 0;
+    return schemaBytes + metaBytes;
   }
 
   /// Evict a ratio of schema cache entries under memory pressure.
   Future<void> evictSchemaCache({double ratio = 0.3}) async {
-    final cache = _tableSchemaCache;
-    if (cache == null) return;
-    await cache.cleanup(removeRatio: ratio);
+    final schemaCache = _tableSchemaCache;
+    if (schemaCache != null) {
+      await schemaCache.cleanup(removeRatio: ratio);
+    }
+    final metaCache = _tableMetaCache;
+    if (metaCache != null) {
+      await metaCache.cleanup(removeRatio: ratio);
+    }
   }
 
   /// Load deferred space metadata from `space_manifest.bin`.
@@ -275,11 +424,11 @@ class TableMetaManager {
     if (await _dataStore.storage.existsFile(path)) {
       final bytes = await _dataStore.storage.readAsBytes(path);
       _manifestBySpace[spaceName] = SpaceManifestCodec.decode(bytes);
-      _rebuildLookups();
+      _rebuildNameLookups();
       return;
     }
     _manifestBySpace[spaceName] = SpaceManifest.empty;
-    _rebuildLookups();
+    _rebuildNameLookups();
   }
 
   /// Get the deferred manifest for a space (lazy-loaded from disk).
@@ -292,10 +441,60 @@ class TableMetaManager {
     return manifest ?? SpaceManifest.empty;
   }
 
-  /// Active non-global table UIDs for a space.
-  Future<List<TableUid>> getActiveUidsForSpace(String spaceName) async {
-    final manifest = await getSpaceManifest(spaceName);
-    return manifest.activeTableUids;
+  /// Visible table UIDs in [spaceName]: **all global tables** ∪ non-global
+  /// UIDs from [SpaceManifest.activeTableUids].
+  ///
+  /// Globals are never stored in the space manifest — they are merged from
+  /// [_globalTableUids] after the one-shot name inventory is ready (awaits
+  /// [loadAllTableMetaAsync] if still building — never a second full scan).
+  ///
+  /// [onlyUserTables] hides `_system_*` (use `true` on user-facing paths such
+  /// as [DataStoreImpl.getSpaceInfo]; engine paths keep the default `false`).
+  Future<List<TableUid>> getActiveUidsForSpace(
+    String spaceName, {
+    bool onlyUserTables = false,
+  }) async {
+    await _ensureNameInventoryReady();
+    await getSpaceManifest(spaceName);
+    final nonGlobal = _activeUidsForSpace(spaceName);
+
+    final seen = <TableUid>{};
+    final out = <TableUid>[];
+    void addAll(Iterable<TableUid> uids) {
+      for (final uid in uids) {
+        if (uid.isEmpty || !seen.add(uid)) continue;
+        out.add(uid);
+      }
+    }
+
+    addAll(_globalTableUids);
+    addAll(nonGlobal);
+
+    if (!onlyUserTables) return out;
+
+    final filtered = <TableUid>[];
+    for (final uid in out) {
+      if (await _isSystemTableUid(uid)) continue;
+      filtered.add(uid);
+    }
+    return filtered;
+  }
+
+  /// Wait for the startup name inventory (joins the existing single-flight
+  /// [loadAllTableMetaAsync]; does not start a parallel full-table scan).
+  Future<void> _ensureNameInventoryReady() async {
+    if (_nameInventoryReady) return;
+    await loadAllTableMetaAsync();
+  }
+
+  Future<bool> _isSystemTableUid(TableUid tableUid) async {
+    final peeked = _peekNameByUid(tableUid);
+    if (peeked != null) {
+      return SystemTable.isSystemTable(peeked.value);
+    }
+    final meta = await getTableMeta(tableUid);
+    if (meta == null) return false;
+    return SystemTable.isSystemTable(meta.tableName.value);
   }
 
   /// Persist deferred space metadata to `space_manifest.bin`.
@@ -307,153 +506,167 @@ class TableMetaManager {
     await _dataStore.storage.writeAsBytes(path, bytes);
   }
 
+  /// Raw non-global active UIDs from the space manifest (no globals).
   List<TableUid> _activeUidsForSpace(String spaceName) {
     return _manifestBySpace[spaceName]?.activeTableUids ?? const <TableUid>[];
   }
 
   Future<void> _updateActiveTableUids(
     String spaceName,
-    void Function(List<TableUid> uids) mutate,
-  ) async {
+    void Function(List<TableUid> uids) mutate, {
+    bool persist = true,
+  }) async {
     final current = List<TableUid>.from(_activeUidsForSpace(spaceName));
     mutate(current);
     _manifestBySpace[spaceName] =
         (_manifestBySpace[spaceName] ?? SpaceManifest.empty)
             .copyWith(activeTableUids: current);
-    await saveSpaceManifest(spaceName);
+    if (persist) {
+      await saveSpaceManifest(spaceName);
+    }
   }
 
-  /// Rebuild fast-path lookup maps in memory based on current schemaMeta and active space tables.
-  void _rebuildLookups() {
-    routeByUid.clear();
-    uidByName.clear();
-    nameByUid.clear();
+  /// Rebuild [_uidByName] / [_nameByUid] / [_globalTableUids] from [_metaByUid].
+  void _rebuildNameLookups() {
+    _uidByName.clear();
+    _nameByUid.clear();
+    _globalTableUids.clear();
+
+    for (final meta in _metaByUid.values) {
+      _uidByName[meta.tableName] = meta.tableUid;
+      _nameByUid[meta.tableUid] = meta.tableName;
+      if (meta.isGlobal) {
+        _globalTableUids.add(meta.tableUid);
+      }
+    }
+  }
+
+  void _rebuildDirCountsFromMeta() {
     _globalDirCounts.clear();
     _nonGlobalDirCounts.clear();
-    _partitionDirIndexMap.clear();
-    _dirPartitions.clear();
+    final max = _dataStore.maxEntriesPerDir;
+    final globalRaw = <int, int>{};
+    final nonGlobalRaw = <int, int>{};
 
-    if (_schemaMeta != null) {
-      for (final route in _schemaMeta!.routes) {
-        routeByUid[route.tableUid] = route;
-        final counts = route.isGlobal ? _globalDirCounts : _nonGlobalDirCounts;
-        counts[route.dataDirIndex] = (counts[route.dataDirIndex] ?? 0) + 1;
-
-        _partitionDirIndexMap[route.partitionIndex] = route.dirIndex;
-        _dirPartitions
-            .putIfAbsent(route.dirIndex, () => {})
-            .add(route.partitionIndex);
-
-        if (route.isGlobal) {
-          uidByName[route.tableName] = route.tableUid;
-          nameByUid[route.tableUid] = route.tableName;
-        }
-      }
+    for (final meta in _metaByUid.values) {
+      final map = meta.isGlobal ? globalRaw : nonGlobalRaw;
+      map[meta.dirIndex] = (map[meta.dirIndex] ?? 0) + 1;
     }
 
-    final activeSpace = _dataStore.currentSpaceName;
-    final activeUids = _activeUidsForSpace(activeSpace);
-    for (final uid in activeUids) {
-      final route = getRouteByUid(uid);
-      if (route != null && !route.isGlobal) {
-        uidByName[route.tableName] = route.tableUid;
-        nameByUid[route.tableUid] = route.tableName;
+    for (final e in globalRaw.entries) {
+      if (e.value < max) {
+        _globalDirCounts[e.key] = e.value;
+      }
+    }
+    for (final e in nonGlobalRaw.entries) {
+      if (e.value < max) {
+        _nonGlobalDirCounts[e.key] = e.value;
       }
     }
   }
 
-  void _registerRouteInLookups(TableSchemaRouteEntry route) {
-    final oldRoute = routeByUid[route.tableUid];
-    if (oldRoute != null) {
-      _unregisterRouteFromLookups(oldRoute);
-    }
-
-    routeByUid[route.tableUid] = route;
-    final counts = route.isGlobal ? _globalDirCounts : _nonGlobalDirCounts;
-    counts[route.dataDirIndex] = (counts[route.dataDirIndex] ?? 0) + 1;
-
-    _partitionDirIndexMap[route.partitionIndex] = route.dirIndex;
-    _dirPartitions
-        .putIfAbsent(route.dirIndex, () => {})
-        .add(route.partitionIndex);
-
-    final activeSpace = _dataStore.currentSpaceName;
-    final isActive = route.isGlobal ||
-        _activeUidsForSpace(activeSpace).contains(route.tableUid);
-
-    if (isActive) {
-      uidByName[route.tableName] = route.tableUid;
-      nameByUid[route.tableUid] = route.tableName;
-    }
-  }
-
-  void _unregisterRouteFromLookups(TableSchemaRouteEntry route) {
-    routeByUid.remove(route.tableUid);
-    final counts = route.isGlobal ? _globalDirCounts : _nonGlobalDirCounts;
-    final currentCount = counts[route.dataDirIndex] ?? 0;
-    if (currentCount > 1) {
-      counts[route.dataDirIndex] = currentCount - 1;
+  void _incrementDirCount(bool isGlobal, int dirIndex) {
+    final usage = isGlobal ? _globalDirCounts : _nonGlobalDirCounts;
+    final max = _dataStore.maxEntriesPerDir;
+    final next = (usage[dirIndex] ?? 0) + 1;
+    if (next >= max) {
+      usage.remove(dirIndex);
     } else {
-      counts.remove(route.dataDirIndex);
+      usage[dirIndex] = next;
+    }
+  }
+
+  void _decrementDirCount(bool isGlobal, int dirIndex) {
+    final usage = isGlobal ? _globalDirCounts : _nonGlobalDirCounts;
+    final max = _dataStore.maxEntriesPerDir;
+    if (!usage.containsKey(dirIndex)) {
+      // Was at capacity (not tracked); freeing one slot brings it under capacity.
+      usage[dirIndex] = max - 1;
+      return;
+    }
+    final current = usage[dirIndex]!;
+    if (current <= 1) {
+      usage.remove(dirIndex);
+    } else {
+      usage[dirIndex] = current - 1;
+    }
+  }
+
+  void _registerMetaInLookups(
+    TableMeta meta, {
+    bool skipDirCountIncrement = false,
+  }) {
+    final old = _metaByUid[meta.tableUid];
+    if (old != null) {
+      _unregisterMetaFromLookups(old);
     }
 
-    bool partitionInUse = false;
-    for (final r in routeByUid.values) {
-      if (r.partitionIndex == route.partitionIndex) {
-        partitionInUse = true;
-        break;
-      }
-    }
-    if (!partitionInUse) {
-      _partitionDirIndexMap.remove(route.partitionIndex);
-      final set = _dirPartitions[route.dirIndex];
-      if (set != null) {
-        set.remove(route.partitionIndex);
-        if (set.isEmpty) {
-          _dirPartitions.remove(route.dirIndex);
-        }
-      }
+    _metaByUid[meta.tableUid] = meta;
+    // Pre-counted only applies to brand-new registrations (allocateDirIndex
+    // already bumped usage). Updates always re-count after unregister.
+    if (!skipDirCountIncrement || old != null) {
+      _incrementDirCount(meta.isGlobal, meta.dirIndex);
     }
 
-    uidByName.remove(route.tableName);
-    nameByUid.remove(route.tableUid);
+    // Full-DB name inventory (space visibility is applied only at list time).
+    _uidByName[meta.tableName] = meta.tableUid;
+    _nameByUid[meta.tableUid] = meta.tableName;
+    if (meta.isGlobal) {
+      _globalTableUids.add(meta.tableUid);
+    } else {
+      _globalTableUids.remove(meta.tableUid);
+    }
+  }
+
+  void _unregisterMetaFromLookups(TableMeta meta) {
+    _metaByUid.remove(meta.tableUid);
+    _decrementDirCount(meta.isGlobal, meta.dirIndex);
+    _uidByName.remove(meta.tableName);
+    _nameByUid.remove(meta.tableUid);
+    _globalTableUids.remove(meta.tableUid);
   }
 
   /// Clear all in-memory caches and reset state.
   Future<void> dispose() async {
-    if (_schemaLoadingFutures.isNotEmpty) {
+    if (_metaLoadingFutures.isNotEmpty) {
       try {
-        await Future.wait(_schemaLoadingFutures.values);
+        await Future.wait(_metaLoadingFutures.values);
       } catch (_) {}
     }
     _tableSchemaCache?.clear();
+    _tableMetaCache?.clear();
     _indexListCache.clear();
     _tableFieldLayoutCache.clear();
     _storageFieldStructCache.clear();
-    _schemaMeta = null;
-    _schemaLoadingFutures.clear();
-    routeByUid.clear();
-    uidByName.clear();
-    nameByUid.clear();
+    _metaLoadingFutures.clear();
+    _metaByUid.clear();
+    _uidByName.clear();
+    _nameByUid.clear();
+    _globalTableUids.clear();
+    _nameInventoryReady = false;
+    _loadAllMetaFuture = null;
     _manifestBySpace.clear();
     _globalDirCounts.clear();
     _nonGlobalDirCounts.clear();
-    _partitionDirIndexMap.clear();
-    _dirPartitions.clear();
-    _partitionSizes.clear();
   }
 
-  /// Invalidate schema metadata cache
+  /// Invalidate meta caches (keeps space manifests).
   void invalidateCache() {
-    _schemaMeta = null;
-    routeByUid.clear();
-    uidByName.clear();
-    nameByUid.clear();
+    _tableMetaCache?.clear();
+    _tableSchemaCache?.clear();
+    _metaByUid.clear();
+    _uidByName.clear();
+    _nameByUid.clear();
+    _globalTableUids.clear();
+    _nameInventoryReady = false;
+    _loadAllMetaFuture = null;
+    _tableMetaCache?.setFullyCached('all', false);
     _globalDirCounts.clear();
     _nonGlobalDirCounts.clear();
-    _partitionDirIndexMap.clear();
-    _dirPartitions.clear();
-    _partitionSizes.clear();
+    _indexListCache.clear();
+    _tableFieldLayoutCache.clear();
+    _storageFieldStructCache.clear();
+    _metaLoadingFutures.clear();
   }
 
   int _estimateTableSchemaSize(TableSchema schema) {
@@ -493,6 +706,12 @@ class TableMetaManager {
     return layout.slots.length * 64 + 16;
   }
 
+  int _estimateTableMetaSize(TableMeta meta) {
+    return _estimateTableSchemaSize(meta.schema) +
+        _estimateFieldStorageLayoutSize(meta.fieldLayout) +
+        128;
+  }
+
   FieldStorageLayout _createInitialFieldStorageLayout(TableSchema schema) {
     final slots = <FieldStorageSlot>[];
     int nextSlotId = 0;
@@ -508,21 +727,6 @@ class TableMetaManager {
     return FieldStorageLayout(nextSlotId: nextSlotId, slots: slots);
   }
 
-  FieldStorageLayout? _tryParseFieldStorageLayout(dynamic raw) {
-    if (raw == null) return null;
-    try {
-      if (raw is Map<String, dynamic>) {
-        return FieldStorageLayout.fromJson(raw);
-      } else if (raw is Map) {
-        return FieldStorageLayout.fromJson(Map<String, dynamic>.from(raw));
-      } else if (raw is String) {
-        return FieldStorageLayout.fromJson(
-            jsonDecode(raw) as Map<String, dynamic>);
-      }
-    } catch (_) {}
-    return null;
-  }
-
   FieldStorageLayout evolveFieldStorageLayout({
     FieldStorageLayout? existingLayout,
     required TableSchema nextSchema,
@@ -535,7 +739,6 @@ class TableMetaManager {
     final slots = <FieldStorageSlot>[...existingLayout.slots];
     int nextSlotId = existingLayout.nextSlotId;
 
-    // Mark all slots as deleted initially, then reactivate matched ones
     for (int i = 0; i < slots.length; i++) {
       slots[i] = slots[i].copyWith(deleted: true);
     }
@@ -543,12 +746,10 @@ class TableMetaManager {
     for (final field in nextSchema.fields) {
       int matchIdx = -1;
 
-      // 1. Prioritize matching by stable fieldId if available
       if (field.fieldId != null && field.fieldId!.isNotEmpty) {
         matchIdx = slots.indexWhere((s) => s.fieldId == field.fieldId);
       }
 
-      // 2. Fallback to chain-tracing matching via renameHints if fieldId matching fails
       if (matchIdx == -1 && renameHints.isNotEmpty) {
         String oldName = '';
         String currentTarget = field.name;
@@ -560,8 +761,7 @@ class TableMetaManager {
           );
           if (match.key.isNotEmpty) {
             oldName = match.key;
-            currentTarget =
-                match.key; // Trace chain recursively (e.g. a -> b -> c)
+            currentTarget = match.key;
           } else {
             found = false;
           }
@@ -572,7 +772,6 @@ class TableMetaManager {
         }
       }
 
-      // 3. Fallback to direct name matching (unchanged fields)
       if (matchIdx == -1) {
         matchIdx = slots.indexWhere((s) => s.fieldName == field.name);
       }
@@ -620,15 +819,8 @@ class TableMetaManager {
       return false;
     }
 
-    final activeByFieldId = <String, FieldStorageSlot>{};
     final activeByName = <String, FieldStorageSlot>{};
     for (final slot in activeSlots) {
-      final fieldId = slot.fieldId;
-      if (fieldId != null &&
-          fieldId.isNotEmpty &&
-          !activeByFieldId.containsKey(fieldId)) {
-        activeByFieldId[fieldId] = slot;
-      }
       if (!activeByName.containsKey(slot.fieldName)) {
         activeByName[slot.fieldName] = slot;
       }
@@ -674,24 +866,16 @@ class TableMetaManager {
       if (schema == null) {
         return cached;
       }
-      final cachedSchema = getCachedTableSchema(tableUid);
+      final cachedSchema = _peekTableSchema(tableUid);
       if (cachedSchema != null && identical(cachedSchema, schema)) {
         return cached;
       }
     }
 
-    final partitionIndex = getTableSchemaPartitionIndex(tableUid);
-    final dirIndex = getTableSchemaDirIndex(tableUid);
-    if (partitionIndex != null && dirIndex != null) {
-      final partitionMeta = await _loadPartitionMeta(partitionIndex);
-      if (partitionMeta != null) {
-        final raw = partitionMeta.tableFieldLayouts[tableUid];
-        final parsed = _tryParseFieldStorageLayout(raw);
-        if (parsed != null) {
-          _tableFieldLayoutCache[tableUid] = parsed;
-          return parsed;
-        }
-      }
+    final meta = await getTableMeta(tableUid);
+    if (meta != null) {
+      _tableFieldLayoutCache[tableUid] = meta.fieldLayout;
+      return meta.fieldLayout;
     }
 
     final resolvedSchema = schema ?? await getTableSchema(tableUid);
@@ -720,7 +904,7 @@ class TableMetaManager {
       return const <FieldStructure>[];
     }
 
-    final cachedSchema = getCachedTableSchema(tableUid);
+    final cachedSchema = _peekTableSchema(tableUid);
     final useCache = schema == null ||
         (cachedSchema != null && identical(cachedSchema, resolvedSchema));
     if (useCache) {
@@ -744,11 +928,11 @@ class TableMetaManager {
     FieldStorageLayout layout, {
     TableSchema? schema,
   }) async {
-    final resolvedSchema = schema ?? await getTableSchema(tableUid);
-
-    final name = getNameByUid(tableUid)?.value ?? resolvedSchema?.name;
-    if (resolvedSchema == null || name == null) {
-      final logName = name ?? getNameByUid(tableUid)?.value ?? 'unknown';
+    final existing = await getTableMeta(tableUid);
+    final resolvedSchema = schema ?? existing?.schema;
+    final name = _peekNameByUid(tableUid)?.value ?? resolvedSchema?.name;
+    if (existing == null || resolvedSchema == null || name == null) {
+      final logName = name ?? _peekNameByUid(tableUid)?.value ?? 'unknown';
       throw DbException([
         SchemaValidationStatus(
           type: ResultType.devTableNotFound,
@@ -757,20 +941,11 @@ class TableMetaManager {
         ),
       ]);
     }
-    final tableContext = getTableContextSync(tableUid);
-    if (tableContext == null) {
-      throw DbException([
-        SchemaValidationStatus(
-          type: ResultType.devTableNotFound,
-          message: 'Table context not found for table: $name',
-          tableName: name,
-        ),
-      ]);
-    }
-    await saveTableSchema(
-      tableContext,
-      resolvedSchema,
-      layoutOverride: layout,
+
+    await updateTableMeta(
+      tableUid,
+      schema: resolvedSchema,
+      fieldLayout: layout,
     );
   }
 
@@ -870,10 +1045,6 @@ class TableMetaManager {
   }
 
   /// Resolve a persisted uid-or-legacy-name field to a stable [IndexUid].
-  ///
-  /// Fast path: O(1) via per-table index cache. When [field] is not found in
-  /// schema indexes, returns [IndexUid(field)] so callers can still access
-  /// pre-migration on-disk artifacts keyed by legacy names.
   IndexUid resolveIndexUidFromField(TableSchema schema, String field) {
     if (field.isEmpty) return IndexUid.empty;
     final entry = _indexCacheEntryFor(schema);
@@ -916,238 +1087,364 @@ class TableMetaManager {
               ));
   }
 
-  /// get database schema meta
-  Future<SchemaMeta> getSchemaMeta() async {
-    if (_schemaMeta != null) {
-      return _schemaMeta!;
-    }
-
-    final path = _dataStore.pathManager.getSchemaMetaPath();
-    if (await _dataStore.storage.existsFile(path)) {
-      final content = await _dataStore.storage.readAsString(path);
-      if (content != null && content.isNotEmpty) {
-        try {
-          _schemaMeta = SchemaMeta.fromJson(jsonDecode(content));
-          loadSpaceManifest(_dataStore.currentSpaceName);
-          return _schemaMeta!;
-        } catch (e) {
-          Logger.error('Failed to load schema meta', rawError: e);
-        }
+  /// Allocate a data directory index for a new table.
+  ///
+  /// Prefers under-capacity dirs rebuilt after [loadAllTableMetaAsync].
+  /// Otherwise advances [GlobalConfig] high-water
+  /// (`last*DirIndex` / `last*DirEntries`) with no extra KV IO.
+  Future<int> allocateDirIndex(bool isGlobal) {
+    final done = Completer<int>();
+    _dirAllocChain = _dirAllocChain.then((_) async {
+      try {
+        done.complete(await _allocateDirIndexUnlocked(isGlobal));
+      } catch (e, st) {
+        done.completeError(e, st);
       }
-    }
-
-    // Create new structure meta
-    _schemaMeta = SchemaMeta(
-      routes: [],
-      timestamps: Timestamps(
-        created: DateTime.now(),
-        modified: DateTime.now(),
-      ),
-    );
-    await saveSchemaStructure();
-    loadSpaceManifest(_dataStore.currentSpaceName);
-    return _schemaMeta!;
+    });
+    return done.future;
   }
 
-  /// save database schema meta
-  Future<void> saveSchemaStructure() async {
-    if (_schemaMeta == null) return;
-
-    final path = _dataStore.pathManager.getSchemaMetaPath();
-    await _dataStore.storage.ensureDirectoryExists(dirname(path));
-    await _dataStore.storage
-        .writeAsString(path, jsonEncode(_schemaMeta!.toJson()));
-  }
-
-  /// get table schema metadata partition index
-  int? getTableSchemaPartitionIndex(TableUid tableUid) {
-    final route = getRouteByUid(tableUid);
-    return route?.partitionIndex;
-  }
-
-  /// get table schema metadata directory index
-  int? getTableSchemaDirIndex(TableUid tableUid) {
-    final route = getRouteByUid(tableUid);
-    return route?.dirIndex;
-  }
-
-  /// allocate data directory index for a table
-  int allocateDataDirIndex(bool isGlobal) {
+  Future<int> _allocateDirIndexUnlocked(bool isGlobal) async {
     final usage = isGlobal ? _globalDirCounts : _nonGlobalDirCounts;
-    int selectedDir = 0;
-    int minCount = _dataStore.maxEntriesPerDir + 1;
+    final max = _dataStore.maxEntriesPerDir;
 
-    for (final dir in usage.keys) {
-      final count = usage[dir] ?? 0;
-      if (count < minCount && count < _dataStore.maxEntriesPerDir) {
-        selectedDir = dir;
-        minCount = count;
+    int? selectedDir;
+    var minCount = max;
+    for (final e in usage.entries) {
+      if (e.value < minCount) {
+        selectedDir = e.key;
+        minCount = e.value;
       }
     }
 
-    if (minCount >= _dataStore.maxEntriesPerDir) {
-      int maxDir = -1;
-      for (final dir in usage.keys) {
-        if (dir > maxDir) maxDir = dir;
+    if (selectedDir != null) {
+      final next = minCount + 1;
+      if (next >= max) {
+        usage.remove(selectedDir);
+      } else {
+        usage[selectedDir] = next;
       }
-      selectedDir = maxDir + 1;
+      await _touchDirHighWater(
+        isGlobal: isGlobal,
+        dirIndex: selectedDir,
+        entriesInDir: next > max ? max : next,
+      );
+      return selectedDir;
     }
 
-    // Optimistically update count to prevent race conditions during batch creates
-    usage[selectedDir] = (usage[selectedDir] ?? 0) + 1;
-    return selectedDir;
-  }
+    final config = await _dataStore.getGlobalConfig() ?? GlobalConfig();
+    var index =
+        isGlobal ? config.lastGlobalDirIndex : config.lastNonGlobalDirIndex;
+    var entries =
+        isGlobal ? config.lastGlobalDirEntries : config.lastNonGlobalDirEntries;
 
-  /// get or allocate directory index for a partition index
-  int getOrCreatePartitionDirIndex(int partitionIndex) {
-    final cached = _partitionDirIndexMap[partitionIndex];
-    if (cached != null) return cached;
-
-    int maxDir = 0;
-    for (final dir in _dirPartitions.keys) {
-      if (dir > maxDir) maxDir = dir;
+    if (entries >= max) {
+      index += 1;
+      entries = 1;
+    } else {
+      entries += 1;
     }
 
-    final count = _dirPartitions[maxDir]?.length ?? 0;
-    final allocatedDir =
-        (count < _dataStore.maxEntriesPerDir) ? maxDir : maxDir + 1;
+    final updated = isGlobal
+        ? config.copyWith(
+            lastGlobalDirIndex: index,
+            lastGlobalDirEntries: entries,
+          )
+        : config.copyWith(
+            lastNonGlobalDirIndex: index,
+            lastNonGlobalDirEntries: entries,
+          );
+    await _dataStore.saveGlobalConfig(updated);
 
-    // Optimistically update memory mappings
-    _partitionDirIndexMap[partitionIndex] = allocatedDir;
-    _dirPartitions.putIfAbsent(allocatedDir, () => {}).add(partitionIndex);
-
-    return allocatedDir;
+    if (entries < max) {
+      usage[index] = entries;
+    }
+    return index;
   }
 
-  /// find suitable partition for schema storage
-  Future<int> _findSuitablePartition(
-      SchemaMeta meta, TableUid tableUid, int contentSize) async {
+  /// Keep GlobalConfig high-water consistent when packing an existing dir.
+  Future<void> _touchDirHighWater({
+    required bool isGlobal,
+    required int dirIndex,
+    required int entriesInDir,
+  }) async {
+    final config = await _dataStore.getGlobalConfig() ?? GlobalConfig();
+    final lastIndex =
+        isGlobal ? config.lastGlobalDirIndex : config.lastNonGlobalDirIndex;
+    final lastEntries =
+        isGlobal ? config.lastGlobalDirEntries : config.lastNonGlobalDirEntries;
+
+    if (dirIndex < lastIndex) return;
+    if (dirIndex == lastIndex && entriesInDir <= lastEntries) return;
+
+    final updated = isGlobal
+        ? config.copyWith(
+            lastGlobalDirIndex: dirIndex,
+            lastGlobalDirEntries: entriesInDir,
+          )
+        : config.copyWith(
+            lastNonGlobalDirIndex: dirIndex,
+            lastNonGlobalDirEntries: entriesInDir,
+          );
+    await _dataStore.saveGlobalConfig(updated);
+  }
+
+  /// Load [TableMeta] by stable uid — the single entry for meta / routing.
+  ///
+  /// 1. Memory (`_metaByUid` / TreeCache)
+  /// 2. If miss and [TreeCache.isFullyCached](`all`) → absent (`null`)
+  /// 3. Else query `_system_table_meta` (covers cold start and eviction)
+  Future<TableMeta?> getTableMeta(TableUid tableUid) async {
+    if (tableUid.isEmpty) return null;
+
+    // Self-row: never fabricate existence. Use [bootstrapTableMetaContext] for
+    // QueryExecutor I/O; only return meta after save/load registered it.
+    if (tableUid == SystemTable.tableMetaTableUid) {
+      final cached = _metaByUid[tableUid] ?? _tableMetaCache?.get(tableUid);
+      if (cached != null) return cached;
+      if (_tableMetaCache?.isFullyCached('all') == true) {
+        return null;
+      }
+      // Try disk self-row via bootstrap context (no recursive getTableMeta).
+      final existing = _metaLoadingFutures[tableUid];
+      if (existing != null) return existing;
+      final loadFuture = _doLoadTableMeta(tableUid);
+      _metaLoadingFutures[tableUid] = loadFuture;
+      try {
+        return await loadFuture;
+      } finally {
+        _metaLoadingFutures.remove(tableUid);
+      }
+    }
+
+    final hot = _metaByUid[tableUid] ?? _tableMetaCache?.get(tableUid);
+    if (hot != null) return hot;
+
+    if (_tableMetaCache?.isFullyCached('all') == true) {
+      return null;
+    }
+
+    final existing = _metaLoadingFutures[tableUid];
+    if (existing != null) return existing;
+
+    final loadFuture = _doLoadTableMeta(tableUid);
+    _metaLoadingFutures[tableUid] = loadFuture;
     try {
-      final existingRoute = getRouteByUid(tableUid);
-      if (existingRoute != null) {
-        return existingRoute.partitionIndex;
-      }
-
-      final existingPartitions = _partitionDirIndexMap.keys.toList()..sort();
-      for (final partitionIndex in existingPartitions) {
-        int? size = _partitionSizes[partitionIndex];
-        if (size == null) {
-          final partitionMeta = await _loadPartitionMeta(partitionIndex);
-          if (partitionMeta != null) {
-            size = partitionMeta.fileSizeInBytes;
-            _partitionSizes[partitionIndex] = size;
-          }
-        }
-        if (size != null && size + contentSize <= schemaMaxPartitionFileSize) {
-          return partitionIndex;
-        }
-      }
-
-      return existingPartitions.isEmpty ? 0 : existingPartitions.last + 1;
-    } catch (e) {
-      Logger.error('Failed to find suitable partition', rawError: e);
-      final existingPartitions = _partitionDirIndexMap.keys.toList()..sort();
-      return existingPartitions.isEmpty ? 0 : existingPartitions.last + 1;
+      return await loadFuture;
+    } finally {
+      _metaLoadingFutures.remove(tableUid);
     }
   }
 
-  /// create new partition meta
-  SchemaPartitionMeta _createNewPartitionMeta(int index, int dirIndex) {
-    return SchemaPartitionMeta(
-      version: 1,
-      index: index,
-      fileSizeInBytes: 0,
-      tableUids: [],
-      tableSizes: {},
-      tableSchemas: {},
-      tableFieldLayouts: {},
-      timestamps: Timestamps(
-        created: DateTime.now(),
-        modified: DateTime.now(),
-      ),
-      dirIndex: dirIndex,
-    );
-  }
-
-  /// load partition meta
-  Future<SchemaPartitionMeta?> _loadPartitionMeta(int partitionIndex) async {
-    final dirIndex = getOrCreatePartitionDirIndex(partitionIndex);
-    final partitionPath = _dataStore.pathManager
-        .getSchemaPartitionFilePath(partitionIndex, dirIndex);
-    if (!await _dataStore.storage.existsFile(partitionPath)) return null;
-
-    final content = await _dataStore.storage.readAsString(partitionPath);
-    if (content == null) return null;
-
+  Future<TableMeta?> _doLoadTableMeta(TableUid tableUid) async {
     try {
-      final meta = SchemaPartitionMeta.fromJson(jsonDecode(content));
-      _partitionSizes[partitionIndex] = meta.fileSizeInBytes;
+      final rows = await _dataStore.executeQuery(
+        bootstrapTableMetaContext(),
+        QueryCondition()
+          ..where(SystemTable.tableMetaUidField, '=', tableUid.value),
+        limit: 1,
+      );
+      if (rows.isEmpty) return null;
+
+      final meta = TableMetaCodec.decodeRow(rows.first);
+      _registerMetaInLookups(meta);
+      _cacheTableMeta(meta);
       return meta;
     } catch (e) {
-      Logger.error('Failed to load partition meta', rawError: e);
+      final logTable = _peekNameByUid(tableUid)?.value ?? tableUid.value;
+      Logger.error('Failed to load table meta: $logTable', rawError: e);
       return null;
     }
   }
 
-  /// save table schema, auto manage partitions
-  Future<void> saveTableSchema(
-    TableContext table,
-    TableSchema schema, {
-    FieldStorageLayout? layoutOverride,
-    Map<String, String> fieldRenameHints = const <String, String>{},
-    int? dataDirIndex,
-  }) async {
-    final tableUid = table.tableUid;
-    final tableName = table.tableName;
+  /// Load [TableMeta] by logical table name.
+  Future<TableMeta?> getTableMetaByName(TableName tableName) async {
+    final uid = await resolveTableUidFromName(tableName);
+    if (uid == null) return null;
+    return getTableMeta(uid);
+  }
+
+  /// Convenience: schema from [getTableMeta].
+  Future<TableSchema?> getTableSchema(TableUid tableUid) async {
+    final meta = await getTableMeta(tableUid);
+    return meta?.schema;
+  }
+
+  /// Read table schema by logical table name.
+  Future<TableSchema?> getTableSchemaByName(TableName tableName) async {
+    final meta = await getTableMetaByName(tableName);
+    return meta?.schema;
+  }
+
+  /// Resolve table uid by name, activating non-global tables in the current space.
+  Future<TableUid?> resolveTableUidFromName(TableName tableName) async {
+    if (tableName.isEmpty) return null;
+    final cached = _peekUidByName(tableName);
+    if (cached != null) return cached;
+
+    // Loaded but not yet in name index (e.g. inactive in current space).
+    for (final meta in _metaByUid.values) {
+      if (meta.tableName == tableName) {
+        if (meta.isGlobal) {
+          _registerMetaInLookups(meta);
+        } else {
+          await _ensureActiveInCurrentSpace(meta.tableUid);
+          _registerMetaInLookups(meta);
+        }
+        return meta.tableUid;
+      }
+    }
+
+    if (_tableMetaCache?.isFullyCached('all') == true) {
+      return null;
+    }
+
     try {
-      if (schema.tableUid.isEmpty) {
-        var targetUid = tableUid.isNotEmpty
-            ? tableUid
-            : TableUid(GlobalIdGenerator.generate("t"));
-        schema = schema.copyWith(tableUid: targetUid);
+      final rows = await _dataStore.executeQuery(
+        bootstrapTableMetaContext(),
+        QueryCondition()
+          ..where(SystemTable.tableMetaNameField, '=', tableName.value),
+        limit: 1,
+      );
+      if (rows.isEmpty) return null;
+
+      final meta = TableMetaCodec.decodeRow(rows.first);
+      if (!meta.isGlobal) {
+        await _ensureActiveInCurrentSpace(meta.tableUid);
+      }
+      _registerMetaInLookups(meta);
+      _cacheTableMeta(meta);
+      return meta.tableUid;
+    } catch (e) {
+      Logger.error(
+        'Failed to resolve table uid from name: ${tableName.value}',
+        rawError: e,
+      );
+      return null;
+    }
+  }
+
+  Future<void> _ensureActiveInCurrentSpace(
+    TableUid tableUid, {
+    bool persist = true,
+  }) async {
+    final currentSpace = _dataStore.currentSpaceName;
+    final activeUids = _activeUidsForSpace(currentSpace);
+    if (!activeUids.contains(tableUid)) {
+      await _updateActiveTableUids(
+        currentSpace,
+        (uids) => uids.add(tableUid),
+        persist: persist,
+      );
+    }
+  }
+
+  /// Patch an existing [TableMeta] row (schema / name / layout / extra).
+  ///
+  /// Loads current meta, applies only provided fields, then persists via
+  /// [saveTableMeta]. Does not create tables; missing uid → [DbException].
+  /// Does not change [TableMeta.dirIndex] (create/allocate only via save).
+  Future<TableMeta> updateTableMeta(
+    TableUid tableUid, {
+    TableSchema? schema,
+    TableName? tableName,
+    FieldStorageLayout? fieldLayout,
+    TableMetaExtra? extra,
+    bool clearExtra = false,
+    bool memoryOnly = false,
+    Map<String, String> fieldRenameHints = const <String, String>{},
+  }) async {
+    if (tableUid.isEmpty) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'updateTableMeta requires a non-empty tableUid',
+        ),
+      ]);
+    }
+
+    final current = await getTableMeta(tableUid);
+    if (current == null) {
+      final logName = _peekNameByUid(tableUid)?.value ?? tableUid.value;
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.devTableNotFound,
+          message: 'Table meta not found for update: $logName',
+          tableName: logName,
+        ),
+      ]);
+    }
+
+    final nextName = tableName ?? current.tableName;
+    var nextSchema = schema ?? current.schema;
+    if (nextSchema.tableUid != tableUid) {
+      nextSchema = nextSchema.copyWith(tableUid: tableUid);
+    }
+    if (nextSchema.name != nextName.value) {
+      nextSchema = nextSchema.copyWith(name: nextName.value);
+    }
+
+    return saveTableMeta(
+      current.copyWith(
+        tableName: nextName,
+        schema: nextSchema,
+        clearExtra: clearExtra,
+        extra: clearExtra ? null : extra,
+        updatedAt: DateTime.now(),
+      ),
+      memoryOnly: memoryOnly,
+      fieldRenameHints: fieldRenameHints,
+      layoutOverride: fieldLayout,
+    );
+  }
+
+  /// Persist full [TableMeta] (create / upgrade ingest / bootstrap).
+  ///
+  /// Prefer [updateTableMeta] when patching an existing table.
+  /// Returns the final saved meta (tableUid may be reallocated on collision).
+  Future<TableMeta> saveTableMeta(
+    TableMeta meta, {
+    bool memoryOnly = false,
+    Map<String, String> fieldRenameHints = const <String, String>{},
+    FieldStorageLayout? layoutOverride,
+    int? dirIndex,
+  }) async {
+    try {
+      var schema = meta.schema;
+      var tableUid = meta.tableUid.isNotEmpty
+          ? meta.tableUid
+          : (schema.tableUid.isNotEmpty ? schema.tableUid : TableUid.empty);
+
+      // Resolve update vs create; reallocate tableUid on collision with another table.
+      final preferredName =
+          meta.tableName.isNotEmpty ? meta.tableName : TableName(schema.name);
+      tableUid = await _resolveTableUidForSave(
+        preferredUid: tableUid,
+        tableName: preferredName,
+      );
+      if (schema.tableUid != tableUid) {
+        schema = schema.copyWith(tableUid: tableUid);
       }
 
-      final currentSchema = await getTableSchema(schema.tableUid);
+      final current = _metaByUid[tableUid] ?? await getTableMeta(tableUid);
+      // Avoid recursive bootstrap for the meta table itself during first save.
+      final currentSchema = current?.schema;
       schema = schema.generateAutoIndexes(oldSchema: currentSchema);
 
-      // schemaVersion bumps are owned by migration tasks (or explicit createTable
-      // initialization). Incidental saves preserve the persisted version.
       if (schema.schemaVersion == null || schema.schemaVersion!.isEmpty) {
         final preserved = currentSchema?.schemaVersion;
         if (preserved != null && preserved.isNotEmpty) {
           schema = schema.copyWith(schemaVersion: preserved);
         } else {
           schema = schema.copyWith(
-            schemaVersion: GlobalIdGenerator.generate("s"),
+            schemaVersion: GlobalIdGenerator.generate('s'),
           );
         }
       }
 
-      final meta = await getSchemaMeta();
-      var contentSize = _estimateTableSchemaSize(schema);
-
-      int targetPartition =
-          await _findSuitablePartition(meta, tableUid, contentSize);
-      final dirIndex = getOrCreatePartitionDirIndex(targetPartition);
-
-      final partitionPath = _dataStore.pathManager
-          .getSchemaPartitionFilePath(targetPartition, dirIndex);
-      SchemaPartitionMeta partitionMeta;
-
-      if (await _dataStore.storage.existsFile(partitionPath)) {
-        final content = await _dataStore.storage.readAsString(partitionPath);
-        if (content != null) {
-          partitionMeta = SchemaPartitionMeta.fromJson(jsonDecode(content));
-        } else {
-          partitionMeta = _createNewPartitionMeta(targetPartition, dirIndex);
-        }
-      } else {
-        partitionMeta = _createNewPartitionMeta(targetPartition, dirIndex);
-      }
-
-      final schemaObject = schema.toJson();
-      final existingLayout = _tryParseFieldStorageLayout(
-          partitionMeta.tableFieldLayouts[tableUid]);
+      final existingLayout = layoutOverride ??
+          current?.fieldLayout ??
+          _tableFieldLayoutCache[tableUid];
       final resolvedLayout = layoutOverride ??
           ((existingLayout != null &&
                   _canReuseExistingFieldStorageLayout(
@@ -1161,333 +1458,282 @@ class TableMetaManager {
                   nextSchema: schema,
                   renameHints: fieldRenameHints,
                 ));
-      final layoutObject = resolvedLayout.toJson();
-      contentSize += _estimateFieldStorageLayoutSize(resolvedLayout);
 
-      final oldSize = partitionMeta.tableSizes[tableUid] ?? 0;
-      final newSizeChange = partitionMeta.tableUids.contains(tableUid)
-          ? contentSize - oldSize
-          : contentSize;
-
-      final updatedMeta = partitionMeta.copyWith(
-        fileSizeInBytes: partitionMeta.fileSizeInBytes + newSizeChange,
-        tableUids: partitionMeta.tableUids.contains(tableUid)
-            ? partitionMeta.tableUids
-            : [...partitionMeta.tableUids, tableUid],
-        tableSizes: {
-          ...partitionMeta.tableSizes,
-          tableUid: contentSize,
-        },
-        tableSchemas: {
-          ...partitionMeta.tableSchemas,
-          tableUid: schemaObject,
-        },
-        tableFieldLayouts: {
-          ...partitionMeta.tableFieldLayouts,
-          tableUid: layoutObject,
-        },
-        timestamps: Timestamps(
-          created: partitionMeta.timestamps.created,
-          modified: DateTime.now(),
-        ),
-      );
-
-      await _dataStore.storage.ensureDirectoryExists(dirname(partitionPath));
-      await _dataStore.storage
-          .writeAsString(partitionPath, jsonEncode(updatedMeta.toJson()));
-      _partitionSizes[targetPartition] = updatedMeta.fileSizeInBytes;
-
-      final oldRoute = routeByUid[tableUid];
-      int finalDataDirIndex = dataDirIndex ??
-          (oldRoute != null
-              ? oldRoute.dataDirIndex
-              : allocateDataDirIndex(schema.isGlobal));
-
-      final routeEntry = TableSchemaRouteEntry(
-        tableUid: tableUid,
-        tableName: tableName,
-        dirIndex: dirIndex,
-        partitionIndex: targetPartition,
-        dataDirIndex: finalDataDirIndex,
-        isGlobal: schema.isGlobal,
-      );
-
-      int idx = meta.routes.indexWhere((r) => r.tableUid == tableUid);
-      if (idx >= 0) {
-        meta.routes[idx] = routeEntry;
+      // Dir index: keep existing, or allocate. Bootstrap table is fixed at 0.
+      // allocateDirIndex / caller-supplied dirIndex already bump under-capacity
+      // maps — skip a second increment in _registerMetaInLookups for new tables.
+      final int resolvedDirIndex;
+      final bool dirPreCounted;
+      if (tableUid == SystemTable.tableMetaTableUid) {
+        resolvedDirIndex = SystemTable.tableMetaDirIndex;
+        dirPreCounted = false;
+      } else if (current != null) {
+        resolvedDirIndex = dirIndex ?? current.dirIndex;
+        dirPreCounted = false;
+      } else if (dirIndex != null) {
+        resolvedDirIndex = dirIndex;
+        dirPreCounted = true;
       } else {
-        meta.routes.add(routeEntry);
+        resolvedDirIndex = await allocateDirIndex(schema.isGlobal);
+        dirPreCounted = true;
       }
-      await saveSchemaStructure();
 
-      if (!schema.isGlobal) {
+      final now = DateTime.now();
+      var saved = TableMeta(
+        tableUid: tableUid,
+        tableName: preferredName,
+        isGlobal: schema.isGlobal,
+        schema: schema,
+        fieldLayout: resolvedLayout,
+        dirIndex: resolvedDirIndex,
+        extra: meta.extra,
+        createdAt: current?.createdAt ?? meta.createdAt,
+        updatedAt: now,
+      );
+
+      // Register lookups (handles dir-count delta vs old meta).
+      _registerMetaInLookups(saved, skipDirCountIncrement: dirPreCounted);
+      _cacheTableMeta(saved);
+
+      if (!memoryOnly) {
+        final beforeUid = saved.tableUid;
+        saved = await _persistTableMetaRowWithUidRetry(saved);
+        // Persist retry may have reallocated uid and unregistered the provisional.
+        if (saved.tableUid != beforeUid) {
+          _registerMetaInLookups(saved, skipDirCountIncrement: true);
+          _cacheTableMeta(saved);
+        }
+      }
+
+      if (!saved.isGlobal) {
+        await _ensureActiveInCurrentSpace(
+          saved.tableUid,
+          persist: !memoryOnly,
+        );
+        // Re-apply name maps after space activation.
+        _uidByName[saved.tableName] = saved.tableUid;
+        _nameByUid[saved.tableUid] = saved.tableName;
+      }
+
+      _dataStore.upsertTtlPlanForSchema(saved.schema);
+      return saved;
+    } catch (e) {
+      Logger.error(
+        'Failed to save table meta: ${meta.tableUid} (${meta.tableName})',
+        rawError: e,
+      );
+      throw DbException.wrap(e, fallbackMessage: 'Failed to save table meta');
+    }
+  }
+
+  /// Resolve [preferredUid] for create/update; reallocates on collision with another table.
+  Future<TableUid> _resolveTableUidForSave({
+    required TableUid preferredUid,
+    required TableName tableName,
+  }) async {
+    if (preferredUid == SystemTable.tableMetaTableUid ||
+        tableName.value == SystemTable.tableMetaName) {
+      return SystemTable.tableMetaTableUid;
+    }
+
+    if (preferredUid.isNotEmpty) {
+      final localMeta = _metaByUid[preferredUid];
+      if (localMeta != null) {
+        return localMeta.tableName == tableName
+            ? preferredUid
+            : await _allocateUniqueTableUid();
+      }
+      if (_tableMetaCache?.isFullyCached('all') != true) {
+        final disk = await _doLoadTableMeta(preferredUid);
+        if (disk != null) {
+          return disk.tableName == tableName
+              ? preferredUid
+              : await _allocateUniqueTableUid();
+        }
+      }
+      return preferredUid;
+    }
+
+    return _allocateUniqueTableUid();
+  }
+
+  /// Allocate a free [TableUid], preferring [preferred] when unused.
+  Future<TableUid> _allocateUniqueTableUid({TableUid? preferred}) async {
+    const maxAttempts = 8;
+    var candidate = (preferred != null &&
+            preferred.isNotEmpty &&
+            preferred != SystemTable.tableMetaTableUid)
+        ? preferred
+        : TableUid(GlobalIdGenerator.generate('t'));
+
+    for (var attempt = 0; attempt < maxAttempts; attempt++) {
+      if (candidate == SystemTable.tableMetaTableUid || candidate.isEmpty) {
+        candidate = TableUid(GlobalIdGenerator.generate('t'));
+        continue;
+      }
+
+      if (_metaByUid.containsKey(candidate)) {
+        candidate = TableUid(GlobalIdGenerator.generate('t'));
+        continue;
+      }
+
+      if (_tableMetaCache?.isFullyCached('all') == true) {
+        return candidate;
+      }
+
+      final disk = await _doLoadTableMeta(candidate);
+      if (disk == null) return candidate;
+
+      candidate = TableUid(GlobalIdGenerator.generate('t'));
+    }
+
+    throw DbException([
+      GeneralStatus(
+        type: ResultType.engError,
+        message:
+            'Failed to allocate a unique tableUid after $maxAttempts attempts',
+      ),
+    ]);
+  }
+
+  bool _isPrimaryOrUniqueConflict(DbResult result) {
+    for (final s in result.statuses) {
+      if (s.type == ResultType.bizPrimaryKeyViolation ||
+          s.type == ResultType.bizUniqueViolation) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// Upsert system-table row; on PK/unique conflict reallocate tableUid and retry.
+  Future<TableMeta> _persistTableMetaRowWithUidRetry(TableMeta saved) async {
+    const maxAttempts = 8;
+    var current = saved;
+    final originalUid = saved.tableUid;
+
+    for (var attempt = 0; attempt < maxAttempts; attempt++) {
+      final row = TableMetaCodec.encodeRow(current);
+      final result = await TransactionContext.runAsSystemOperation(() async {
+        return await _dataStore.upsert(SystemTable.tableMetaName, row);
+      });
+
+      if (!result.hasErrors) return current;
+
+      if (!_isPrimaryOrUniqueConflict(result)) {
+        throw DbException(result.statuses);
+      }
+
+      // Do not reallocate the bootstrap system table uid.
+      if (current.tableUid == SystemTable.tableMetaTableUid) {
+        throw DbException(result.statuses);
+      }
+
+      final newUid = await _allocateUniqueTableUid();
+      Logger.warn(
+        'tableUid collision on persist for ${current.tableName}; '
+        'reallocating ${current.tableUid} → $newUid',
+      );
+
+      // Drop the colliding registration if we had provisionally registered it.
+      if (attempt == 0 && originalUid != newUid) {
+        final provisional = _metaByUid[originalUid];
+        if (provisional != null && provisional.tableName == current.tableName) {
+          _unregisterMetaFromLookups(provisional);
+        }
+      }
+
+      current = current.copyWith(
+        tableUid: newUid,
+        schema: current.schema.copyWith(tableUid: newUid),
+        updatedAt: DateTime.now(),
+      );
+    }
+
+    throw DbException([
+      GeneralStatus(
+        type: ResultType.engError,
+        message:
+            'Failed to persist table meta after $maxAttempts tableUid collision retries',
+      ),
+    ]);
+  }
+
+  /// Delete table meta from caches and system table.
+  Future<bool> deleteTableMeta(TableUid tableUid) async {
+    try {
+      final meta = _metaByUid[tableUid] ?? await getTableMeta(tableUid);
+      if (meta == null) return false;
+
+      final tableName = meta.tableName;
+      final ctx = TableContext(
+        tableUid: meta.tableUid,
+        tableName: meta.tableName,
+        isGlobal: meta.isGlobal,
+        dirIndex: meta.dirIndex,
+        schema: meta.schema,
+      );
+
+      _unregisterMetaFromLookups(meta);
+      removeCachedTableSchema(tableUid);
+
+      if (!meta.isGlobal) {
         final currentSpace = _dataStore.currentSpaceName;
-        final activeUids = _activeUidsForSpace(currentSpace);
-        if (!activeUids.contains(tableUid)) {
+        if (_activeUidsForSpace(currentSpace).contains(tableUid)) {
           await _updateActiveTableUids(currentSpace, (uids) {
-            uids.add(tableUid);
+            uids.remove(tableUid);
           });
         }
       }
 
-      _registerRouteInLookups(routeEntry);
-
-      cacheTableSchema(tableUid, schema);
-      _tableFieldLayoutCache[tableUid] = resolvedLayout;
-      _storageFieldStructCache.remove(tableUid);
-
-      _dataStore.upsertTtlPlanForSchema(schema);
-    } catch (e) {
-      Logger.error('Failed to save table schema: $tableUid ($tableName), ',
-          rawError: e);
-      throw DbException.wrap(e, fallbackMessage: 'Failed to save table schema');
-    }
-  }
-
-  /// read table schema by stable uid
-  Future<TableSchema?> getTableSchema(TableUid tableUid) async {
-    if (tableUid.isEmpty) return null;
-
-    // 1. Hot cached path: O(1) memory lookup with zero extra overhead
-    final cached = getCachedTableSchema(tableUid);
-    if (cached != null) return cached;
-
-    // 2. Slow path: Check route and resolve legacy tableName fallbacks
-    var targetUid = tableUid;
-    var route = getRouteByUid(targetUid);
-    if (route == null) {
-      final resolvedUid =
-          await resolveTableUidFromName(TableName(tableUid.value));
-      if (resolvedUid != null) {
-        targetUid = resolvedUid;
-        final realCached = getCachedTableSchema(targetUid);
-        if (realCached != null) return realCached;
-      }
-    }
-
-    final existing = _schemaLoadingFutures[targetUid];
-    if (existing != null) {
-      return existing;
-    }
-
-    final loadFuture = _doLoadTableSchema(targetUid);
-    _schemaLoadingFutures[targetUid] = loadFuture;
-    try {
-      return await loadFuture;
-    } finally {
-      _schemaLoadingFutures.remove(targetUid);
-    }
-  }
-
-  /// read table schema by logical table name (user-facing / FK DSL)
-  Future<TableSchema?> getTableSchemaByName(TableName tableName) async {
-    final tableUid = await resolveTableUidFromName(tableName);
-    if (tableUid == null) return null;
-    return getTableSchema(tableUid);
-  }
-
-  /// Resolve table uid by name, lazily activating the table in the current space when needed.
-  Future<TableUid?> resolveTableUidFromName(TableName tableName) async {
-    final cached = getUidByName(tableName);
-    if (cached != null) return cached;
-
-    await getSchemaMeta();
-
-    TableSchemaRouteEntry? route;
-    for (final r in routeByUid.values) {
-      if (r.tableName == tableName) {
-        route = r;
-        break;
-      }
-    }
-    if (route == null) return null;
-
-    if (route.isGlobal) {
-      _registerRouteInLookups(route);
-    } else {
-      final currentSpace = _dataStore.currentSpaceName;
-      final tableUid = route.tableUid;
-      final activeUids = _activeUidsForSpace(currentSpace);
-      if (!activeUids.contains(tableUid)) {
-        await _updateActiveTableUids(currentSpace, (uids) {
-          uids.add(tableUid);
-        });
-      }
-      _registerRouteInLookups(route);
-    }
-    return route.tableUid;
-  }
-
-  /// Internal helper to actually load schema from file.
-  Future<TableSchema?> _doLoadTableSchema(TableUid tableUid) async {
-    try {
-      final route = getRouteByUid(tableUid);
-      if (route == null) return null;
-
-      final partitionPath = _dataStore.pathManager
-          .getSchemaPartitionFilePath(route.partitionIndex, route.dirIndex);
-      if (!await _dataStore.storage.existsFile(partitionPath)) return null;
-
-      final content = await _dataStore.storage.readAsString(partitionPath);
-      if (content == null) return null;
-
-      try {
-        final partitionMeta = SchemaPartitionMeta.fromJson(jsonDecode(content));
-        final partitionKey = _resolvePartitionTableKey(partitionMeta, tableUid);
-        if (partitionKey == null) {
-          return null;
-        }
-
-        final raw = partitionMeta.tableSchemas[partitionKey];
-        Map<String, dynamic>? schemaMap;
-        if (raw is Map<String, dynamic>) {
-          schemaMap = raw;
-        } else if (raw is Map) {
-          schemaMap = Map<String, dynamic>.from(raw);
-        } else if (raw is String) {
-          final decoded = jsonDecode(raw);
-          if (decoded is Map<String, dynamic>) {
-            schemaMap = decoded;
-          } else if (decoded is Map) {
-            schemaMap = Map<String, dynamic>.from(decoded);
-          }
-        }
-        if (schemaMap == null) return null;
-
-        final schema = TableSchema.fromJson(schemaMap);
-        var normalized = schema;
-        if (normalized.getAllIndexes().any((idx) => idx.indexUid.isEmpty)) {
-          normalized = normalized.generateAutoIndexes();
-          unawaited(() async {
-            try {
-              final route = getRouteByUid(tableUid);
-              if (route == null) return;
-              await saveTableSchema(
-                TableContext(
-                  tableUid: tableUid,
-                  tableName: route.tableName,
-                  isGlobal: route.isGlobal,
-                  dataDirIndex: route.dataDirIndex,
-                  schema: normalized,
-                ),
-                normalized,
-              );
-            } catch (e) {
-              Logger.warn(
-                'Failed to persist indexUid repair for table $tableUid',
-                rawError: e,
-              );
-            }
-          }());
-        }
-        cacheTableSchema(tableUid, normalized);
-        final layoutRaw = partitionMeta.tableFieldLayouts[partitionKey] ??
-            partitionMeta.tableFieldLayouts[tableUid];
-        final parsedLayout = _tryParseFieldStorageLayout(layoutRaw);
-        if (parsedLayout != null) {
-          _tableFieldLayoutCache[tableUid] = parsedLayout;
-          _storageFieldStructCache.remove(tableUid);
-        }
-        return normalized;
-      } catch (e) {
-        final logTable = getNameByUid(tableUid)?.value ?? 'unknown';
-        Logger.error('Failed to parse table schema: $logTable, ', rawError: e);
-        return null;
-      }
-    } catch (e) {
-      final logTable = getNameByUid(tableUid)?.value ?? 'unknown';
-      Logger.error('Failed to get table schema: $logTable, ', rawError: e);
-      return null;
-    }
-  }
-
-  /// delete table schema
-  Future<bool> deleteTableSchema(TableUid tableUid) async {
-    try {
-      final meta = await getSchemaMeta();
-      int routeIdx = meta.routes.indexWhere((r) => r.tableUid == tableUid);
-      if (routeIdx < 0) return false;
-
-      final route = meta.routes[routeIdx];
-      final success = await _removeTableFromPartition(
-          tableUid, route.partitionIndex, route.dirIndex);
-
-      if (success) {
-        meta.routes.removeAt(routeIdx);
-        await saveSchemaStructure();
-
-        if (!route.isGlobal) {
-          final currentSpace = _dataStore.currentSpaceName;
-          if (_activeUidsForSpace(currentSpace).contains(tableUid)) {
-            await _updateActiveTableUids(currentSpace, (uids) {
-              uids.remove(tableUid);
-            });
-          }
-        }
-
-        final tableName = getNameByUid(tableUid);
-        _unregisterRouteFromLookups(route);
-        removeCachedTableSchema(tableUid);
-
-        if (tableName != null && tableName.isNotEmpty) {
-          _dataStore.removeTtlPlanForTable(getTableContextSync(tableUid)!);
-        }
+      final result = await TransactionContext.runAsSystemOperation(() async {
+        return await _dataStore.deleteInternal(
+          bootstrapTableMetaContext(),
+          QueryCondition()
+            ..where(SystemTable.tableMetaUidField, '=', tableUid.value),
+        );
+      });
+      if (result.hasErrors) {
+        Logger.error(
+          'Failed to delete table meta row: ${tableName.value}',
+          rawError: result.message,
+        );
+        return false;
       }
 
-      return success;
-    } catch (e) {
-      final logTable = getNameByUid(tableUid)?.value ?? 'unknown';
-      Logger.error('Failed to delete table schema: $logTable, ', rawError: e);
-      return false;
-    }
-  }
-
-  /// remove table from partition
-  Future<bool> _removeTableFromPartition(
-      TableUid tableUid, int partitionIndex, int dirIndex) async {
-    final partitionPath = _dataStore.pathManager
-        .getSchemaPartitionFilePath(partitionIndex, dirIndex);
-    if (!await _dataStore.storage.existsFile(partitionPath)) return false;
-
-    final content = await _dataStore.storage.readAsString(partitionPath);
-    if (content == null) return false;
-
-    try {
-      final partitionMeta = SchemaPartitionMeta.fromJson(jsonDecode(content));
-      if (!partitionMeta.tableSchemas.containsKey(tableUid)) return false;
-
-      final oldSize = partitionMeta.tableSizes[tableUid] ?? 0;
-      final newSize = partitionMeta.fileSizeInBytes - oldSize;
-
-      final updatedMeta = partitionMeta.copyWith(
-        fileSizeInBytes: newSize,
-        tableUids:
-            partitionMeta.tableUids.where((uid) => uid != tableUid).toList(),
-        tableSizes: Map.from(partitionMeta.tableSizes)..remove(tableUid),
-        tableSchemas: Map.from(partitionMeta.tableSchemas)..remove(tableUid),
-        tableFieldLayouts: Map.from(partitionMeta.tableFieldLayouts)
-          ..remove(tableUid),
-        timestamps: Timestamps(
-          created: partitionMeta.timestamps.created,
-          modified: DateTime.now(),
-        ),
-      );
-
-      await _dataStore.storage
-          .writeAsString(partitionPath, jsonEncode(updatedMeta.toJson()));
-      _partitionSizes[partitionIndex] = updatedMeta.fileSizeInBytes;
-
+      _dataStore.removeTtlPlanForTable(ctx);
       return true;
     } catch (e) {
-      Logger.error('Failed to delete table schema from partition', rawError: e);
+      final logTable = _peekNameByUid(tableUid)?.value ?? tableUid.value;
+      Logger.error('Failed to delete table meta: $logTable', rawError: e);
       return false;
     }
   }
 
-  /// list all table names visible in current context
-  Future<List<String>> listAllTables({bool onlyUserTables = false}) async {
-    await getSchemaMeta();
-    final names = uidByName.keys.map((n) => n.value).toList();
+  /// List table names.
+  ///
+  /// Default: **entire database** (all `_system_table_meta` rows).
+  ///
+  /// [onlyCurrentSpace] is a narrow view for cache prewarm / space UI:
+  /// **always includes every global table** (`_globalTableUids` / `isGlobal`)
+  /// plus non-global UIDs in [SpaceManifest.activeTableUids].
+  ///
+  /// Awaits the one-shot name inventory when cold (joins
+  /// [loadAllTableMetaAsync]) — never starts a second full-table scan.
+  Future<List<String>> listAllTables({
+    bool onlyUserTables = false,
+    bool onlyCurrentSpace = false,
+  }) async {
+    await _ensureNameInventoryReady();
+
+    final List<String> names;
+    if (onlyCurrentSpace) {
+      names = await _filterNamesToCurrentSpace(
+        _uidByName.keys.map((n) => n.value),
+      );
+    } else {
+      names = _uidByName.keys.map((n) => n.value).toList(growable: false);
+    }
 
     if (onlyUserTables) {
       return names
@@ -1498,336 +1744,203 @@ class TableMetaManager {
     return names;
   }
 
-  /// get partition status, for monitoring and management
-  Future<Map<String, dynamic>> getPartitionStats() async {
-    try {
-      final meta = await getSchemaMeta();
-      final uniquePartitions = _partitionDirIndexMap.keys.toList();
-
-      final result = <String, dynamic>{
-        'totalTables': meta.routes.length,
-        'partitionDetails': <Map<String, dynamic>>[],
-      };
-
-      if (uniquePartitions.isEmpty) {
-        return result;
+  /// Current-space view: globals ∪ active non-globals (see [_globalTableUids]).
+  Future<List<String>> _filterNamesToCurrentSpace(
+    Iterable<String> names,
+  ) async {
+    await loadSpaceManifest(_dataStore.currentSpaceName);
+    final active = _activeUidsForSpace(_dataStore.currentSpaceName).toSet();
+    final out = <String>[];
+    for (final name in names) {
+      final uid = _uidByName[TableName(name)];
+      if (uid == null) continue;
+      if (_globalTableUids.contains(uid) || active.contains(uid)) {
+        out.add(name);
       }
-
-      final partitionDetails = <Map<String, dynamic>>[];
-
-      for (final partitionIndex in uniquePartitions) {
-        final partitionMeta = await _loadPartitionMeta(partitionIndex);
-        if (partitionMeta != null) {
-          partitionDetails.add({
-            'index': partitionMeta.index,
-            'version': partitionMeta.version,
-            'currentSize': partitionMeta.fileSizeInBytes,
-            'maxSize': schemaMaxPartitionFileSize,
-            'usagePercentage': (partitionMeta.fileSizeInBytes /
-                    schemaMaxPartitionFileSize *
-                    100)
-                .toStringAsFixed(2),
-            'tableCount': partitionMeta.tableUids.length,
-            'lastModified': partitionMeta.timestamps.modified.toIso8601String(),
-          });
-        }
-      }
-
-      result['partitionDetails'] = partitionDetails;
-      return result;
-    } catch (e) {
-      Logger.error('Failed to get partition stats', rawError: e);
-      return {'error': '$e', 'totalTables': 0, 'partitionDetails': []};
     }
+    return out;
   }
 
-  /// optimize partitions, reassign tables to balance storage
-  Future<bool> optimizePartitions() async {
-    try {
-      final startTime = DateTime.now();
-      Logger.debug('Start partition optimization...');
-
-      final meta = await getSchemaMeta();
-      if (meta.routes.isEmpty) {
-        Logger.debug('No table info, skip optimization');
-        return true;
-      }
-
-      final uniquePartitions = _partitionDirIndexMap.keys.toList();
-
-      if (uniquePartitions.isEmpty) {
-        Logger.debug('No partition info, skip optimization');
-        return true;
-      }
-
-      int totalSize = 0;
-      final partitionMetas = <int, SchemaPartitionMeta>{};
-
-      for (final partitionIndex in uniquePartitions) {
-        final partitionMeta = await _loadPartitionMeta(partitionIndex);
-        if (partitionMeta != null) {
-          totalSize += partitionMeta.fileSizeInBytes;
-          partitionMetas[partitionIndex] = partitionMeta;
-        }
-      }
-
-      if (partitionMetas.isEmpty) {
-        Logger.debug('No valid partition meta, skip optimization');
-        return true;
-      }
-
-      final averageSize = totalSize / partitionMetas.length;
-      const threshold = 0.2; // 20% difference threshold
-
-      final overloadedPartitions = <int>[];
-      final underutilizedPartitions = <int>[];
-
-      for (final entry in partitionMetas.entries) {
-        final partitionMeta = entry.value;
-        if (partitionMeta.fileSizeInBytes > averageSize * (1 + threshold)) {
-          overloadedPartitions.add(entry.key);
-        } else if (partitionMeta.fileSizeInBytes <
-                averageSize * (1 - threshold) &&
-            partitionMeta.fileSizeInBytes + averageSize * threshold <
-                schemaMaxPartitionFileSize) {
-          underutilizedPartitions.add(entry.key);
-        }
-      }
-
-      if (overloadedPartitions.isEmpty) {
-        Logger.debug(
-          'No partitions need optimization, all partitions are balanced',
-        );
-        return true;
-      }
-
-      final tablesMovedCount = <TableUid>[];
-
-      for (final overloadedIndex in overloadedPartitions) {
-        if (underutilizedPartitions.isEmpty) break;
-
-        final overloadedMeta = await _loadPartitionMeta(overloadedIndex);
-        if (overloadedMeta == null) continue;
-
-        final tablesToMove = <TableUid>[];
-
-        for (final tableUid in overloadedMeta.tableUids) {
-          final tableSize = overloadedMeta.tableSizes[tableUid] ?? 0;
-          if (tableSize > 0 && tableSize < schemaMaxPartitionFileSize * 0.5) {
-            tablesToMove.add(tableUid);
-            if (overloadedMeta.fileSizeInBytes - tableSize <= averageSize) {
-              break;
-            }
-          }
-        }
-
-        for (final tableUid in tablesToMove) {
-          if (underutilizedPartitions.isEmpty) break;
-
-          final tableSize = overloadedMeta.tableSizes[tableUid] ?? 0;
-          int targetPartition = -1;
-
-          for (final underIndex in underutilizedPartitions) {
-            final underMeta = partitionMetas[underIndex];
-            if (underMeta != null &&
-                underMeta.fileSizeInBytes + tableSize <=
-                    schemaMaxPartitionFileSize) {
-              targetPartition = underIndex;
-              break;
-            }
-          }
-
-          if (targetPartition == -1) continue;
-
-          final schema = overloadedMeta.tableSchemas[tableUid];
-          if (schema == null) continue;
-          final fieldLayout = overloadedMeta.tableFieldLayouts[tableUid];
-
-          Logger.debug(
-            'Moving table $tableUid from partition $overloadedIndex to partition $targetPartition (size: $tableSize bytes)',
-          );
-
-          final success = await _removeTableFromPartition(tableUid,
-              overloadedIndex, getOrCreatePartitionDirIndex(overloadedIndex));
-          if (success) {
-            final targetDirIndex =
-                getOrCreatePartitionDirIndex(targetPartition);
-            final targetPartitionPath = _dataStore.pathManager
-                .getSchemaPartitionFilePath(targetPartition, targetDirIndex);
-            SchemaPartitionMeta targetPartitionMeta;
-
-            if (await _dataStore.storage.existsFile(targetPartitionPath)) {
-              final content =
-                  await _dataStore.storage.readAsString(targetPartitionPath);
-              if (content != null) {
-                targetPartitionMeta =
-                    SchemaPartitionMeta.fromJson(jsonDecode(content));
-              } else {
-                targetPartitionMeta =
-                    _createNewPartitionMeta(targetPartition, targetDirIndex);
-              }
-            } else {
-              targetPartitionMeta =
-                  _createNewPartitionMeta(targetPartition, targetDirIndex);
-            }
-
-            final updatedMeta = targetPartitionMeta.copyWith(
-              fileSizeInBytes: targetPartitionMeta.fileSizeInBytes + tableSize,
-              tableUids: [...targetPartitionMeta.tableUids, tableUid],
-              tableSizes: {
-                ...targetPartitionMeta.tableSizes,
-                tableUid: tableSize,
-              },
-              tableSchemas: {
-                ...targetPartitionMeta.tableSchemas,
-                tableUid: schema,
-              },
-              tableFieldLayouts: {
-                ...targetPartitionMeta.tableFieldLayouts,
-                if (fieldLayout != null) tableUid: fieldLayout,
-              },
-              timestamps: Timestamps(
-                created: targetPartitionMeta.timestamps.created,
-                modified: DateTime.now(),
-              ),
-            );
-
-            await _dataStore.storage
-                .ensureDirectoryExists(dirname(targetPartitionPath));
-            await _dataStore.storage.writeAsString(
-                targetPartitionPath, jsonEncode(updatedMeta.toJson()));
-
-            int rIdx = meta.routes.indexWhere((r) => r.tableUid == tableUid);
-            if (rIdx >= 0) {
-              final r = meta.routes[rIdx];
-              meta.routes[rIdx] = TableSchemaRouteEntry(
-                tableUid: r.tableUid,
-                tableName: r.tableName,
-                dirIndex: targetDirIndex,
-                partitionIndex: targetPartition,
-                dataDirIndex: r.dataDirIndex,
-                isGlobal: r.isGlobal,
-              );
-            }
-
-            tablesMovedCount.add(tableUid);
-          }
-
-          final updatedMeta = await _loadPartitionMeta(targetPartition);
-          if (updatedMeta != null &&
-              updatedMeta.fileSizeInBytes > averageSize) {
-            underutilizedPartitions.remove(targetPartition);
-          }
-        }
-      }
-
-      await saveSchemaStructure();
-      _rebuildLookups();
-
-      final duration = DateTime.now().difference(startTime);
-      Logger.debug(
-        'Partition optimization completed: moved ${tablesMovedCount.length} tables, time taken ${duration.inMilliseconds}ms',
-      );
-
-      return true;
-    } catch (e) {
-      Logger.error('Partition optimization failed', rawError: e);
-      return false;
-    }
-  }
-
-  /// get table is global table
+  /// Whether the table is global (null if unknown).
   Future<bool?> isTableGlobal(TableUid tableUid) async {
-    final schema = await getTableSchema(tableUid);
-    if (schema == null) {
-      return null;
-    }
-    return schema.isGlobal;
+    final meta = await getTableMeta(tableUid);
+    return meta?.isGlobal;
   }
 
   bool _hasSchemaChanged(List<TableSchema> schemas, String? oldHash) {
     if (oldHash == null || oldHash.isEmpty) {
       return true;
     }
-
     final newHash = TableSchema.generateSchemasHash(schemas);
     return oldHash != newHash;
   }
 
-  /// High-performance check if user-defined table schema has changed
+  /// High-performance check if user-defined table schema has changed.
   Future<bool> isSchemaChanged(List<TableSchema> schemas) async {
     try {
-      final meta = await getSchemaMeta();
-      final oldHash = meta.userSchemaHash;
-
-      return _hasSchemaChanged(
-        schemas,
-        oldHash,
-      );
+      final config = await _dataStore.getGlobalConfig();
+      return _hasSchemaChanged(schemas, config?.userSchemaHash);
     } catch (e) {
       Logger.error('Failed to judge table schema change', rawError: e);
-      return true; // return true when error, for safety upgrade
+      return true;
     }
   }
 
-  /// Check if system table schema has changed
+  /// Check if system table schema has changed.
   Future<bool> isSystemSchemaChanged(List<TableSchema> schemas) async {
     try {
-      final meta = await getSchemaMeta();
-      final oldHash = meta.systemSchemaHash;
-
-      return _hasSchemaChanged(
-        schemas,
-        oldHash,
-      );
+      final config = await _dataStore.getGlobalConfig();
+      return _hasSchemaChanged(schemas, config?.systemSchemaHash);
     } catch (e) {
       Logger.error('Failed to judge system schema change', rawError: e);
       return true;
     }
   }
 
-  /// Update user-defined table schema hash
+  /// Update user-defined table schema hash in [GlobalConfig].
   Future<void> updateUserSchemaHash(List<TableSchema> schemas) async {
     if (schemas.isEmpty) return;
     try {
       final hash = TableSchema.generateSchemasHash(schemas);
-      final meta = await getSchemaMeta();
-      _schemaMeta = meta.copyWith(userSchemaHash: hash);
-      await saveSchemaStructure();
+      final existing = await _dataStore.getGlobalConfig() ?? GlobalConfig();
+      await _dataStore.saveGlobalConfig(
+        existing.copyWith(userSchemaHash: hash),
+      );
     } catch (e) {
       Logger.error('Failed to update user schema hash', rawError: e);
     }
   }
 
-  /// Update system table schema hash
+  /// Update system table schema hash in [GlobalConfig].
   Future<void> updateSystemSchemaHash(List<TableSchema> schemas) async {
     if (schemas.isEmpty) return;
     try {
       final hash = TableSchema.generateSchemasHash(schemas);
-      final meta = await getSchemaMeta();
-      _schemaMeta = meta.copyWith(systemSchemaHash: hash);
-      await saveSchemaStructure();
+      final existing = await _dataStore.getGlobalConfig() ?? GlobalConfig();
+      await _dataStore.saveGlobalConfig(
+        existing.copyWith(systemSchemaHash: hash),
+      );
     } catch (e) {
       Logger.error('Failed to update system schema hash', rawError: e);
     }
   }
+
+  /// Load all rows from `_system_table_meta` into memory (with yield).
+  ///
+  Future<void> loadAllTableMetaAsync() {
+    final existing = _loadAllMetaFuture;
+    if (existing != null) return existing;
+
+    final future = _doLoadAllTableMetaAsync();
+    _loadAllMetaFuture = future;
+    return future.whenComplete(() {
+      if (identical(_loadAllMetaFuture, future)) {
+        _loadAllMetaFuture = null;
+      }
+    });
+  }
+
+  Future<void> _doLoadAllTableMetaAsync() async {
+    final yieldController =
+        YieldController('TableMetaManager.loadAllTableMetaAsync');
+    try {
+      // Ensure bootstrap meta is present without querying self.
+      final bootstrap = _buildBootstrapTableMeta();
+      if (!_metaByUid.containsKey(bootstrap.tableUid)) {
+        _registerMetaInLookups(bootstrap);
+        _cacheTableMeta(bootstrap);
+      }
+
+      final rows = await _dataStore.executeQuery(
+        bootstrapTableMetaContext(),
+        QueryCondition()..where(SystemTable.tableMetaUidField, '>=', ''),
+      );
+
+      for (final row in rows) {
+        await yieldController.maybeYield();
+        final meta = TableMetaCodec.decodeRow(row);
+        if (meta.tableUid == SystemTable.tableMetaTableUid) {
+          // Prefer disk row when present (preserves createdAt / layout).
+          _registerMetaInLookups(meta);
+          _cacheTableMeta(meta);
+          continue;
+        }
+        _registerMetaInLookups(meta);
+        _cacheTableMeta(meta);
+      }
+
+      _rebuildDirCountsFromMeta();
+      await _reconcileDirHighWaterFromMeta();
+      await loadSpaceManifest(_dataStore.currentSpaceName);
+      _rebuildNameLookups();
+      _nameInventoryReady = true;
+      _ensureTableMetaCache().setFullyCached('all', true);
+    } catch (e) {
+      _nameInventoryReady = false;
+      Logger.error('Failed to load all table meta', rawError: e);
+      throw DbException.wrap(
+        e,
+        fallbackMessage: 'Failed to load all table meta',
+      );
+    }
+  }
+
+  /// Align GlobalConfig dir high-water with authoritative in-memory metas.
+  Future<void> _reconcileDirHighWaterFromMeta() async {
+    var maxGlobal = -1;
+    var maxNonGlobal = -1;
+    var globalAtMax = 0;
+    var nonGlobalAtMax = 0;
+
+    for (final meta in _metaByUid.values) {
+      if (meta.isGlobal) {
+        if (meta.dirIndex > maxGlobal) {
+          maxGlobal = meta.dirIndex;
+          globalAtMax = 1;
+        } else if (meta.dirIndex == maxGlobal) {
+          globalAtMax++;
+        }
+      } else {
+        if (meta.dirIndex > maxNonGlobal) {
+          maxNonGlobal = meta.dirIndex;
+          nonGlobalAtMax = 1;
+        } else if (meta.dirIndex == maxNonGlobal) {
+          nonGlobalAtMax++;
+        }
+      }
+    }
+
+    final config = await _dataStore.getGlobalConfig() ?? GlobalConfig();
+    final nextGlobalIndex = maxGlobal < 0 ? 0 : maxGlobal;
+    final nextGlobalEntries = maxGlobal < 0 ? 0 : globalAtMax;
+    final nextNonGlobalIndex = maxNonGlobal < 0 ? 0 : maxNonGlobal;
+    final nextNonGlobalEntries = maxNonGlobal < 0 ? 0 : nonGlobalAtMax;
+
+    if (config.lastGlobalDirIndex == nextGlobalIndex &&
+        config.lastGlobalDirEntries == nextGlobalEntries &&
+        config.lastNonGlobalDirIndex == nextNonGlobalIndex &&
+        config.lastNonGlobalDirEntries == nextNonGlobalEntries) {
+      return;
+    }
+
+    await _dataStore.saveGlobalConfig(
+      config.copyWith(
+        lastGlobalDirIndex: nextGlobalIndex,
+        lastGlobalDirEntries: nextGlobalEntries,
+        lastNonGlobalDirIndex: nextNonGlobalIndex,
+        lastNonGlobalDirEntries: nextNonGlobalEntries,
+      ),
+    );
+  }
 }
 
 /// Lightweight per-table index cache entry.
-///
-/// All lists are immutable views to avoid accidental modification on hot paths.
 class _IndexListCacheEntry {
   final List<IndexSchema> allIndexes;
   final List<IndexSchema> uniqueIndexes;
   final List<IndexSchema> vectorIndexes;
-
-  /// All non-vector indexes (btree).
   final List<IndexSchema> btreeIndexes;
-
-  /// Stable uid -> schema (O(1) hot-path lookup).
   final Map<String, IndexSchema> byUid;
-
-  /// Legacy alias -> schema (actualIndexName / indexName; compat only).
   final Map<String, IndexSchema> byAlias;
 
   const _IndexListCacheEntry({
@@ -1841,10 +1954,6 @@ class _IndexListCacheEntry {
 }
 
 /// Build index cache entry from a [TableSchema].
-///
-/// This is the only place that calls the relatively expensive
-/// [TableSchema.getAllIndexes], ensuring we pay the cost only when
-/// table structure actually changes, not per-record.
 _IndexListCacheEntry _buildIndexListCache(TableSchema schema) {
   final all = schema.getAllIndexes();
   if (all.isEmpty) {
@@ -1884,7 +1993,6 @@ _IndexListCacheEntry _buildIndexListCache(TableSchema schema) {
     }
   }
 
-  // Use unmodifiable views to guard against accidental mutation.
   return _IndexListCacheEntry(
     allIndexes: List<IndexSchema>.unmodifiable(all),
     uniqueIndexes: List<IndexSchema>.unmodifiable(unique),
