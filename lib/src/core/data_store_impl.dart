@@ -38,6 +38,7 @@ import '../model/system_table.dart';
 import '../model/table_context.dart';
 import '../model/table_identity.dart';
 import '../model/table_info.dart';
+import '../model/table_meta.dart';
 import '../model/table_op_meta.dart';
 import '../model/table_schema.dart';
 import '../model/transaction_models.dart';
@@ -761,15 +762,16 @@ class DataStoreImpl {
           Future(() async => await transactionManager!.initialize()),
         ]);
       } else {
-        // In memory mode, pre-cache all known schemas so that tableMetaManager
-        // can serve getTableSchema() without touching storage.
-        if (isMemoryMode) {
+        // In memory mode, register full TableMeta so getTableSchema/getTableMeta
+        // see the same source of truth (not schema-only TreeCache).
+        if (isMemoryMode && tableMetaManager != null) {
           for (final s in SystemTable.gettableSchemas) {
-            tableMetaManager?.cacheTableSchema(TableUid(s.tableUid), s);
+            await tableMetaManager!.registerTableSchemaInMemory(s);
           }
           for (final s in _userSchemas) {
-            tableMetaManager?.cacheTableSchema(TableUid(s.tableUid), s);
+            await tableMetaManager!.registerTableSchemaInMemory(s);
           }
+          tableMetaManager!.markNameInventoryReady();
         }
         await Future.wait([
           _resourceManager!.initialize(_config!, this),
@@ -888,6 +890,14 @@ class DataStoreImpl {
         _isInitialized = true;
         _startupProgressCallback?.call(1.0, DbStartupStage.ready);
 
+        // Background: full TableMeta cache + reconcile dir high-water.
+        if (!isMigrationInstance && !isMemoryMode) {
+          unawaited(
+              tableMetaManager?.loadAllTableMetaAsync().catchError((Object e) {
+            Logger.warn('Background table meta load failed', rawError: e);
+          }));
+        }
+
         if (!_initCompleter.isCompleted) {
           _initCompleter.complete();
         }
@@ -954,9 +964,8 @@ class DataStoreImpl {
       bool systemSchemaChanged = false;
       bool userSchemaChanged = false;
 
-      // Check if there are existing table structures
-      final schemaMeta = await tableMetaManager!.getSchemaMeta();
-      if (schemaMeta.routes.isEmpty) {
+      final globalConfig = await getGlobalConfig() ?? GlobalConfig();
+      if (globalConfig.systemSchemaHash == null) {
         // First run, need to initialize
         needInitialize = true;
       } else {
@@ -1313,51 +1322,85 @@ class DataStoreImpl {
           }
         }
 
-        // Write schema file and register routing
-        final tableCtx = TableContext(
+        // Register TableMeta (memory-only for _system_table_meta until indexes exist)
+        final isTableMeta = SystemTable.isTableMetaTable(tableSchema.name);
+        final dirIndex = isTableMeta
+            ? SystemTable.tableMetaDirIndex
+            : await tableMetaManager!.allocateDirIndex(tableSchema.isGlobal);
+        final layout =
+            tableMetaManager!.evolveFieldStorageLayout(nextSchema: tableSchema);
+        final now = DateTime.now();
+        final meta = TableMeta(
           tableUid: tableUid,
           tableName: TableName(tableSchema.name),
           isGlobal: tableSchema.isGlobal,
-          dataDirIndex: tableMetaManager!.getTableSchemaDirIndex(tableUid) ?? 0,
           schema: tableSchema,
+          fieldLayout: layout,
+          dirIndex: dirIndex,
+          createdAt: now,
+          updatedAt: now,
         );
-        await tableMetaManager?.saveTableSchema(tableCtx, tableSchema);
+        final savedMeta = await tableMetaManager!.saveTableMeta(
+          meta,
+          memoryOnly: isTableMeta,
+          dirIndex: dirIndex,
+          layoutOverride: layout,
+        );
+        final resolvedUid = savedMeta.tableUid;
+        final resolvedSchema = savedMeta.schema;
+        final tableCtx = TableContext(
+          tableUid: resolvedUid,
+          tableName: savedMeta.tableName,
+          isGlobal: savedMeta.isGlobal,
+          dirIndex: savedMeta.dirIndex,
+          schema: resolvedSchema,
+        );
 
         // Initialize B+Tree index metadata (empty table — no full-table scan).
-        final persistedSchema =
-            tableMetaManager?.getCachedTableSchema(tableUid) ?? tableCtx.schema;
         final btreeIndexes =
-            tableMetaManager?.getBtreeIndexesFor(persistedSchema) ??
+            tableMetaManager?.getBtreeIndexesFor(resolvedSchema) ??
                 <IndexSchema>[];
         await _indexManager?.initializeEmptyTableIndexes(
           tableCtx,
           btreeIndexes,
-          tableSchemaOverride: persistedSchema,
+          tableSchemaOverride: resolvedSchema,
         );
 
+        // Persist self-row once indexes are ready (bootstrap recursion avoided).
+        if (isTableMeta) {
+          await tableMetaManager?.saveTableMeta(
+            savedMeta,
+            dirIndex: savedMeta.dirIndex,
+            layoutOverride: savedMeta.fieldLayout,
+          );
+        }
+
         // Auto-create indexes for foreign keys
-        if (_foreignKeyManager != null && !tableSchema.isSystemTable) {
+        if (_foreignKeyManager != null && !resolvedSchema.isSystemTable) {
           await _foreignKeyManager!
-              .updateSystemTableForTable(tableCtx, tableSchema);
+              .updateSystemTableForTable(tableCtx, resolvedSchema);
         }
 
         // New table created successfully, call table creation statistics method
         tableDataManager.tableCreated(tableCtx);
 
-        if (!tableSchema.isSystemTable) {
+        if (!resolvedSchema.isSystemTable) {
           Logger.info(
-            'Table ${tableSchema.name} created successfully${tableSchema.isGlobal ? ' (global)' : ' (space)'}',
+            'Table ${resolvedSchema.name} created successfully${resolvedSchema.isGlobal ? ' (global)' : ' (space)'}',
           );
         }
 
         return finish(DbResult.success(
-          successKey: tableSchema.name,
-          message: 'Table ${tableSchema.name} created successfully',
+          successKey: resolvedSchema.name,
+          message: 'Table ${resolvedSchema.name} created successfully',
         ));
       } catch (e) {
-        // Cleanup schema
+        // Cleanup schema (uid may have been reallocated during save)
         if (tableMetaManager != null) {
-          await tableMetaManager!.deleteTableSchema(tableUid);
+          final cleanupUid = await tableMetaManager!
+                  .getUidByName(TableName(tableSchema.name)) ??
+              tableUid;
+          await tableMetaManager!.deleteTableMeta(cleanupUid);
         }
 
         Logger.error('Create table failed', rawError: e);
@@ -1536,32 +1579,6 @@ class DataStoreImpl {
       ]);
     }
     final context = await tableMetaManager?.getTableContext(tableUid);
-    if (context == null) {
-      throw DbException([
-        SchemaValidationStatus(
-          type: ResultType.devTableNotFound,
-          message: 'Table $tableName does not exist',
-          tableName: tableName,
-        )
-      ]);
-    }
-    return context;
-  }
-
-  /// Synchronous [TableContext] lookup (memory cache only).
-  TableContext getTableContextSync(String tableName) {
-    final name = TableName(tableName);
-    final tableUid = tableMetaManager?.getUidByName(name);
-    if (tableUid == null) {
-      throw DbException([
-        SchemaValidationStatus(
-          type: ResultType.devTableNotFound,
-          message: 'Table $tableName does not exist',
-          tableName: tableName,
-        )
-      ]);
-    }
-    final context = tableMetaManager?.getTableContextSync(tableUid);
     if (context == null) {
       throw DbException([
         SchemaValidationStatus(
@@ -3650,7 +3667,8 @@ class DataStoreImpl {
           continue; // Already finished; only used for cutoff, do not re-execute
         }
         final tableName =
-            tableMetaManager?.resolveTableNameFromField(op.tableUid)?.value ??
+            (await tableMetaManager?.resolveTableNameFromField(op.tableUid))
+                    ?.value ??
                 'unknown';
         try {
           // 1) Re-execute the physical operation, but do not re-register WAL metadata
@@ -3880,7 +3898,8 @@ class DataStoreImpl {
       }
 
       // Resolve tableUid
-      final tableUid = tableMetaManager?.getUidByName(TableName(tableName));
+      final tableUid =
+          await tableMetaManager?.getUidByName(TableName(tableName));
 
       // Check if table exists
       final schema = tableUid != null
@@ -3901,14 +3920,14 @@ class DataStoreImpl {
         );
 
         if (tableUid != null) {
-          final tablePath = _pathManager!.getTablePathByUid(tableUid);
+          final tablePath = await _pathManager!.getTablePathByUid(tableUid);
           if (await storage.existsDirectory(tablePath)) {
             await storage.deleteDirectory(tablePath);
             Logger.info(
               'Deleted data directory for table $tableName in space $_currentSpaceName: $tablePath',
             );
           }
-          await tableMetaManager?.deleteTableSchema(TableUid(tableUid));
+          await tableMetaManager?.deleteTableMeta(tableUid);
         }
 
         return finish(DbResult.success(
@@ -3957,7 +3976,7 @@ class DataStoreImpl {
         String? tablePath;
         if (tableUid != null) {
           try {
-            tablePath = _pathManager!.getTablePathByUid(tableUid);
+            tablePath = await _pathManager!.getTablePathByUid(tableUid);
           } catch (e) {
             // skip
           }
@@ -3965,7 +3984,7 @@ class DataStoreImpl {
 
         // Delete table structure
         if (tableMetaManager != null && tableUid != null) {
-          await tableMetaManager!.deleteTableSchema(TableUid(tableUid));
+          await tableMetaManager!.deleteTableMeta(tableUid);
         }
 
         // Delete table directory and all related files
@@ -4051,11 +4070,21 @@ class DataStoreImpl {
     }
   }
 
-  /// get all table names
-  Future<List<String>> getTableNames() async {
+  /// Get table names.
+  ///
+  /// Engine default: full inventory including system tables
+  /// ([onlyUserTables] false). Public [ToStore.getTableNames] defaults to
+  /// user tables only.
+  Future<List<String>> getTableNames({
+    bool onlyCurrentSpace = false,
+    bool onlyUserTables = false,
+  }) async {
     if (tableMetaManager == null) return <String>[];
     try {
-      return await tableMetaManager!.listAllTables();
+      return await tableMetaManager!.listAllTables(
+        onlyCurrentSpace: onlyCurrentSpace,
+        onlyUserTables: onlyUserTables,
+      );
     } catch (e) {
       Logger.error('Failed to get table names', rawError: e);
       return [];
@@ -5856,8 +5885,8 @@ class DataStoreImpl {
       final schemaMgr = tableMetaManager;
       if (schemaMgr == null) return;
 
-      // From tableMetaManager get all tables
-      final allTables = await getTableNames();
+      // From tableMetaManager get tables visible in the current space
+      final allTables = await getTableNames(onlyCurrentSpace: true);
       if (allTables.isEmpty || !_isInitialized) return;
 
       // Sort tables by weight
@@ -5966,7 +5995,7 @@ class DataStoreImpl {
     for (final tableName in kvTables) {
       if (!_isInitialized) return maxPrewarmBytes - currentPrewarmedBytes;
       try {
-        final table = getTableContextSync(tableName);
+        final table = await getTableContext(tableName);
         final tableDataMeta =
             await tableDataManager.getTableDataMeta(table.tableUid);
         if (!_isInitialized) return maxPrewarmBytes - currentPrewarmedBytes;
@@ -6156,7 +6185,7 @@ class DataStoreImpl {
     for (final tableName in allTables) {
       await yieldController.maybeYield();
       // Check if it's a global table
-      final uid = tableMetaManager?.getUidByName(TableName(tableName));
+      final uid = await tableMetaManager?.getUidByName(TableName(tableName));
       final isGlobal = uid != null
           ? await tableMetaManager?.isTableGlobal(uid) ?? false
           : false;
@@ -6510,7 +6539,7 @@ class DataStoreImpl {
     await ensureInitialized();
 
     final tableName = SystemTable.getKeyValueName(isGlobal);
-    final table = getTableContextSync(tableName);
+    final table = await getTableContext(tableName);
     final result = await executeQuery(
       table,
       QueryCondition()..where(_kvKeyField, '=', key),
@@ -6533,7 +6562,7 @@ class DataStoreImpl {
   Future<List<String>> getKeys({String? prefix, bool isGlobal = false}) async {
     await ensureInitialized();
     final tableName = SystemTable.getKeyValueName(isGlobal);
-    final table = getTableContextSync(tableName);
+    final table = await getTableContext(tableName);
     final condition = QueryCondition();
     if (prefix != null && prefix.isNotEmpty) {
       condition.whereStartsWith(_kvKeyField, prefix);
@@ -6558,7 +6587,7 @@ class DataStoreImpl {
   Future<bool> exists(String key, {bool isGlobal = false}) async {
     await ensureInitialized();
     final tableName = SystemTable.getKeyValueName(isGlobal);
-    final table = getTableContextSync(tableName);
+    final table = await getTableContext(tableName);
     final result = await executeQuery(
       table,
       QueryCondition()..where(_kvKeyField, '=', key),
@@ -6579,7 +6608,7 @@ class DataStoreImpl {
     await ensureInitialized();
 
     final tableName = SystemTable.getKeyValueName(isGlobal);
-    final table = getTableContextSync(tableName);
+    final table = await getTableContext(tableName);
     // Build delete condition
     final condition = QueryCondition()..where(_kvKeyField, '=', key);
     return await deleteInternal(table, condition);
@@ -6593,7 +6622,7 @@ class DataStoreImpl {
     if (keyList.isEmpty) return DbResult.success();
 
     final tableName = SystemTable.getKeyValueName(isGlobal);
-    final table = getTableContextSync(tableName);
+    final table = await getTableContext(tableName);
     final condition = QueryCondition()..whereIn(_kvKeyField, keyList);
     return await deleteInternal(table, condition);
   }
@@ -6602,7 +6631,7 @@ class DataStoreImpl {
   Future<Duration?> getTtl(String key, {bool isGlobal = false}) async {
     await ensureInitialized();
     final tableName = SystemTable.getKeyValueName(isGlobal);
-    final table = getTableContextSync(tableName);
+    final table = await getTableContext(tableName);
     final result = await executeQuery(
       table,
       QueryCondition()..where(_kvKeyField, '=', key),
@@ -6627,7 +6656,7 @@ class DataStoreImpl {
       {DateTime? expiresAt, bool isGlobal = false}) async {
     await ensureInitialized();
     final tableName = SystemTable.getKeyValueName(isGlobal);
-    final table = getTableContextSync(tableName);
+    final table = await getTableContext(tableName);
 
     final now = DateTime.now();
     final expiresAtIso = expiresAt?.toIso8601String() ??
@@ -6647,7 +6676,7 @@ class DataStoreImpl {
       {int amount = 1, bool isGlobal = false}) async {
     await ensureInitialized();
     final tableName = SystemTable.getKeyValueName(isGlobal);
-    final table = getTableContextSync(tableName);
+    final table = await getTableContext(tableName);
 
     // Efficiently check if key exists and is not expired.
     // If not exists, we use setValue to handle insert and default values (TTL etc.)
@@ -6672,55 +6701,55 @@ class DataStoreImpl {
   Stream<T?> watchValue<T>(String key,
       {bool isGlobal = false, T? defaultValue, bool distinct = true}) {
     final tableName = SystemTable.getKeyValueName(isGlobal);
-    final table = getTableContextSync(tableName);
-    final condition = QueryCondition()..where(_kvKeyField, '=', key);
+    return Stream.fromFuture(getTableContext(tableName)).asyncExpand((table) {
+      final condition = QueryCondition()..where(_kvKeyField, '=', key);
+      return _watchKvQuery<T?>(
+        table: table,
+        condition: condition,
+        distinct: distinct,
+        loadSnapshot: () async {
+          final rows = await executeQuery(table, condition);
+          if (rows.isEmpty) {
+            return (
+              value: defaultValue,
+              fingerprint: jsonEncode([
+                key,
+                false,
+                null,
+              ]),
+              nextRefreshAt: null,
+            );
+          }
 
-    return _watchKvQuery<T?>(
-      table: table,
-      condition: condition,
-      distinct: distinct,
-      loadSnapshot: () async {
-        final rows = await executeQuery(table, condition);
-        if (rows.isEmpty) {
+          final row = rows.first;
+          final rawExpiresAt = row[_kvExpiresAtField];
+          final expiresAt = _parseKvDateTime(rawExpiresAt);
+          if (expiresAt != null && !expiresAt.isAfter(DateTime.now())) {
+            _scheduleExactExpiredKvCleanup(table, key, rawExpiresAt);
+            return (
+              value: defaultValue,
+              fingerprint: jsonEncode([
+                key,
+                false,
+                null,
+              ]),
+              nextRefreshAt: null,
+            );
+          }
+
+          final rawValue = row[_kvValueField];
           return (
-            value: defaultValue,
+            value: _decodeStoredKeyValue(rawValue, key: key) as T?,
             fingerprint: jsonEncode([
               key,
-              false,
-              null,
+              true,
+              rawValue,
             ]),
-            nextRefreshAt: null,
+            nextRefreshAt: expiresAt,
           );
-        }
-
-        final row = rows.first;
-        final rawExpiresAt = row[_kvExpiresAtField];
-        final expiresAt = _parseKvDateTime(rawExpiresAt);
-        if (expiresAt != null && !expiresAt.isAfter(DateTime.now())) {
-          _scheduleExactExpiredKvCleanup(table, key, rawExpiresAt);
-          return (
-            value: defaultValue,
-            fingerprint: jsonEncode([
-              key,
-              false,
-              null,
-            ]),
-            nextRefreshAt: null,
-          );
-        }
-
-        final rawValue = row[_kvValueField];
-        return (
-          value: _decodeStoredKeyValue(rawValue, key: key) as T?,
-          fingerprint: jsonEncode([
-            key,
-            true,
-            rawValue,
-          ]),
-          nextRefreshAt: expiresAt,
-        );
-      },
-    );
+        },
+      );
+    });
   }
 
   /// Watch multiple key-value pairs and emit the latest snapshot immediately.
@@ -6734,67 +6763,68 @@ class DataStoreImpl {
     }
 
     final tableName = SystemTable.getKeyValueName(isGlobal);
-    final table = getTableContextSync(tableName);
-    final condition = QueryCondition();
-    if (requestedKeys.length == 1) {
-      condition.where(_kvKeyField, '=', requestedKeys.first);
-    } else {
-      condition.where(_kvKeyField, 'IN', requestedKeys);
-    }
+    return Stream.fromFuture(getTableContext(tableName)).asyncExpand((table) {
+      final condition = QueryCondition();
+      if (requestedKeys.length == 1) {
+        condition.where(_kvKeyField, '=', requestedKeys.first);
+      } else {
+        condition.where(_kvKeyField, 'IN', requestedKeys);
+      }
 
-    return _watchKvQuery<Map<String, dynamic>>(
-      table: table,
-      condition: condition,
-      distinct: distinct,
-      loadSnapshot: () async {
-        final rows = await executeQuery(table, condition);
-        final rowsByKey = <String, Map<String, dynamic>>{};
-        for (final row in rows) {
-          final rowKey = row[_kvKeyField];
-          if (rowKey != null) {
-            rowsByKey[rowKey.toString()] = row;
-          }
-        }
-
-        final values = <String, dynamic>{};
-        final fingerprintParts = <Object?>[];
-        DateTime? nextRefreshAt;
-        final now = DateTime.now();
-        for (final requestedKey in requestedKeys) {
-          final row = rowsByKey[requestedKey];
-          if (row == null) {
-            values[requestedKey] = null;
-            fingerprintParts.add([requestedKey, false, null]);
-            continue;
+      return _watchKvQuery<Map<String, dynamic>>(
+        table: table,
+        condition: condition,
+        distinct: distinct,
+        loadSnapshot: () async {
+          final rows = await executeQuery(table, condition);
+          final rowsByKey = <String, Map<String, dynamic>>{};
+          for (final row in rows) {
+            final rowKey = row[_kvKeyField];
+            if (rowKey != null) {
+              rowsByKey[rowKey.toString()] = row;
+            }
           }
 
-          final rawExpiresAt = row[_kvExpiresAtField];
-          final expiresAt = _parseKvDateTime(rawExpiresAt);
-          if (expiresAt != null && !expiresAt.isAfter(now)) {
-            values[requestedKey] = null;
-            fingerprintParts.add([requestedKey, false, null]);
-            _scheduleExactExpiredKvCleanup(table, requestedKey, rawExpiresAt);
-            continue;
+          final values = <String, dynamic>{};
+          final fingerprintParts = <Object?>[];
+          DateTime? nextRefreshAt;
+          final now = DateTime.now();
+          for (final requestedKey in requestedKeys) {
+            final row = rowsByKey[requestedKey];
+            if (row == null) {
+              values[requestedKey] = null;
+              fingerprintParts.add([requestedKey, false, null]);
+              continue;
+            }
+
+            final rawExpiresAt = row[_kvExpiresAtField];
+            final expiresAt = _parseKvDateTime(rawExpiresAt);
+            if (expiresAt != null && !expiresAt.isAfter(now)) {
+              values[requestedKey] = null;
+              fingerprintParts.add([requestedKey, false, null]);
+              _scheduleExactExpiredKvCleanup(table, requestedKey, rawExpiresAt);
+              continue;
+            }
+
+            if (expiresAt != null &&
+                (nextRefreshAt == null || expiresAt.isBefore(nextRefreshAt))) {
+              nextRefreshAt = expiresAt;
+            }
+
+            final rawValue = row[_kvValueField];
+            values[requestedKey] =
+                _decodeStoredKeyValue(rawValue, key: requestedKey);
+            fingerprintParts.add([requestedKey, true, rawValue]);
           }
 
-          if (expiresAt != null &&
-              (nextRefreshAt == null || expiresAt.isBefore(nextRefreshAt))) {
-            nextRefreshAt = expiresAt;
-          }
-
-          final rawValue = row[_kvValueField];
-          values[requestedKey] =
-              _decodeStoredKeyValue(rawValue, key: requestedKey);
-          fingerprintParts.add([requestedKey, true, rawValue]);
-        }
-
-        return (
-          value: Map<String, dynamic>.unmodifiable(values),
-          fingerprint: jsonEncode(fingerprintParts),
-          nextRefreshAt: nextRefreshAt,
-        );
-      },
-    );
+          return (
+            value: Map<String, dynamic>.unmodifiable(values),
+            fingerprint: jsonEncode(fingerprintParts),
+            nextRefreshAt: nextRefreshAt,
+          );
+        },
+      );
+    });
   }
 
   Stream<T> _watchKvQuery<T>({
@@ -7111,7 +7141,10 @@ class DataStoreImpl {
         continue;
       }
       final tableCtx = await getTableContext(tableName);
-      await schemaMgr.saveTableSchema(tableCtx, updatedSchema);
+      await schemaMgr.updateTableMeta(
+        tableCtx.tableUid,
+        schema: updatedSchema,
+      );
       updatedTables?.add(tableName);
     }
   }
@@ -7254,10 +7287,16 @@ class DataStoreImpl {
     }
   }
 
-  /// Check if table exists in current space
+  /// Check if table exists in current space (global or active in this space).
   Future<bool> tableExistsInCurrentSpace(String tableName) async {
     if (tableMetaManager == null) return false;
-    return tableMetaManager!.uidByName.containsKey(TableName(tableName));
+    final uid = await tableMetaManager!.getUidByName(TableName(tableName));
+    if (uid == null) return false;
+    final active = await tableMetaManager!.getActiveUidsForSpace(
+      _currentSpaceName,
+      onlyUserTables: false,
+    );
+    return active.contains(uid);
   }
 
   /// Get information about the current space
@@ -7278,15 +7317,18 @@ class DataStoreImpl {
         config = await getSpaceConfig();
       }
 
-      final activeUids =
-          await tableMetaManager?.getActiveUidsForSpace(_currentSpaceName) ??
-              [];
-      final userTables = activeUids
-          .map((uid) => tableMetaManager?.getNameByUid(TableUid(uid)))
-          .whereType<TableName>()
-          .map((name) => name.value)
-          .where((name) => !SystemTable.isSystemTable(name))
-          .toList(growable: false);
+      final activeUids = await tableMetaManager?.getActiveUidsForSpace(
+            _currentSpaceName,
+            onlyUserTables: true,
+          ) ??
+          [];
+      final userTables = <String>[];
+      for (final uid in activeUids) {
+        final name = await tableMetaManager?.getNameByUid(TableUid(uid));
+        if (name != null && name.isNotEmpty) {
+          userTables.add(name.value);
+        }
+      }
 
       // Create the SpaceInfo object with user-table information
       return SpaceInfo(
@@ -7550,7 +7592,8 @@ class DataStoreImpl {
           ? op.spaceName == '__global__'
           : op.spaceName == currentSpaceName;
       if (!isSpaceMatch) continue;
-      if (!tableMetaManager!.tableFieldMatches(op.tableUid, table.tableUid)) {
+      if (!await tableMetaManager!
+          .tableFieldMatches(op.tableUid, table.tableUid)) {
         continue;
       }
 
@@ -7596,7 +7639,8 @@ class DataStoreImpl {
           ? op.spaceName == '__global__'
           : op.spaceName == currentSpaceName;
       if (!isSpaceMatch) continue;
-      if (!tableMetaManager!.tableFieldMatches(op.tableUid, table.tableUid)) {
+      if (!await tableMetaManager!
+          .tableFieldMatches(op.tableUid, table.tableUid)) {
         continue;
       }
 
