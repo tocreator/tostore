@@ -278,41 +278,17 @@ class TableMetaManager {
 
   /// Hard-coded [TableContext] for `_system_table_meta` (no disk read).
   TableContext bootstrapTableMetaContext() {
-    final schema = _bootstrapTableMetaSchema();
     return TableContext(
       tableUid: SystemTable.tableMetaTableUid,
       tableName: TableName(SystemTable.tableMetaName),
       isGlobal: true,
       dirIndex: SystemTable.tableMetaDirIndex,
-      schema: schema,
+      schema: SystemTable.tableMetaTable(),
     );
   }
 
-  TableSchema _bootstrapTableMetaSchema() {
-    TableSchema? found;
-    for (final s in SystemTable.gettableSchemas) {
-      if (s.name == SystemTable.tableMetaName) {
-        found = s;
-        break;
-      }
-    }
-    if (found == null) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message:
-              'System table schema for "${SystemTable.tableMetaName}" is missing.',
-        ),
-      ]);
-    }
-    if (found.tableUid.isEmpty) {
-      return found.copyWith(tableUid: SystemTable.tableMetaTableUid);
-    }
-    return found;
-  }
-
   TableMeta _buildBootstrapTableMeta() {
-    final schema = _bootstrapTableMetaSchema();
+    final schema = SystemTable.tableMetaTable();
     final layout = _tableFieldLayoutCache[SystemTable.tableMetaTableUid] ??
         _createInitialFieldStorageLayout(schema);
     final now = DateTime.now();
