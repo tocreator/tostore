@@ -14,6 +14,12 @@ typedef TreeCacheComparatorFactory = Comparator<dynamic> Function(
 typedef TreeCacheWeightQueryCallback = Future<int?> Function(
     List<dynamic> groupPath);
 
+/// Invoked once after [TreeCache.cleanup] actually removes entries.
+///
+/// Use for cache-level invariants that group-path [TreeCache.setFullyCached]
+/// markers cannot express (e.g. a global "fully loaded" flag).
+typedef TreeCacheEvictedCallback = void Function(int removedCount);
+
 /// A high-performance hierarchical cache built on a custom B+Tree.
 ///
 /// Key model:
@@ -53,6 +59,11 @@ class TreeCache<T> {
   /// Optional group-level weight callback used by eviction.
   final TreeCacheWeightQueryCallback? weightQueryCallback;
 
+  /// Optional hook after a cleanup pass that removed at least one entry.
+  ///
+  /// Not invoked for single-entry [remove] / [clear] (callers own those).
+  final TreeCacheEvictedCallback? onEvicted;
+
   final String debugLabel;
 
   int _estimatedTotalSizeBytes = 0;
@@ -80,6 +91,7 @@ class TreeCache<T> {
     this.groupDepth = 1,
     this.comparatorFactory,
     this.weightQueryCallback,
+    this.onEvicted,
     String? debugLabel,
   })  : maxByteThreshold = math.max(maxByteThreshold, minByteThreshold),
         debugLabel = debugLabel ?? 'TreeCache' {
@@ -468,6 +480,15 @@ class TreeCache<T> {
           '[$debugLabel] cleanup removed=$removedTotal target=$targetRemove '
           'entries=$_totalEntries bytes=$_estimatedTotalSizeBytes',
         );
+        // After group-path markers are cleared: notify for global invariants.
+        try {
+          onEvicted?.call(removedTotal);
+        } catch (e) {
+          Logger.warn(
+            '[$debugLabel] onEvicted callback failed',
+            rawError: e,
+          );
+        }
       }
       // Update cooldown timestamp AFTER cleanup completes.
       _lastCleanupTime = DateTime.now();

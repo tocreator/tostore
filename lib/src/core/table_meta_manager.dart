@@ -201,6 +201,11 @@ class TableMetaManager {
       maxByteThreshold: maxBytes,
       minByteThreshold: minBytes,
       debugLabel: 'TableMetaCache',
+      // Quota eviction clears per-uid group markers only; drop the global
+      // "all metas loaded" bit so miss paths re-query `_system_table_meta`.
+      onEvicted: (_) {
+        _tableMetaCache?.setFullyCached('all', false);
+      },
     );
     _tableMetaCache = cache;
     return cache;
