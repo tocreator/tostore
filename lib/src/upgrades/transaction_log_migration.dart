@@ -287,7 +287,7 @@ class TransactionLogMigration {
 
         TransactionCommitPlan? plan = fields.plan;
         if (plan != null) {
-          plan = _normalizePlanTableKeys(plan, spaceName);
+          plan = await _normalizePlanTableKeys(plan, spaceName);
         }
 
         events.add(TxnLogEvent(
@@ -311,19 +311,19 @@ class TransactionLogMigration {
     return events;
   }
 
-  TransactionCommitPlan _normalizePlanTableKeys(
+  Future<TransactionCommitPlan> _normalizePlanTableKeys(
     TransactionCommitPlan plan,
     String spaceName,
-  ) {
+  ) async {
     final mgr = _dataStore.tableMetaManager;
     if (mgr == null) return plan;
 
-    Map<String, List<Map<String, dynamic>>> norm(
+    Future<Map<String, List<Map<String, dynamic>>>> norm(
       Map<String, List<Map<String, dynamic>>> src,
-    ) {
+    ) async {
       final out = <String, List<Map<String, dynamic>>>{};
       for (final e in src.entries) {
-        final key = mgr.normalizeTableFieldKey(e.key);
+        final key = await mgr.normalizeTableFieldKey(e.key);
         out.putIfAbsent(key, () => []).addAll(e.value);
       }
       return out;
@@ -331,9 +331,9 @@ class TransactionLogMigration {
 
     return TransactionCommitPlan(
       transactionId: plan.transactionId,
-      inserts: norm(plan.inserts),
-      updates: norm(plan.updates),
-      deletes: norm(plan.deletes),
+      inserts: await norm(plan.inserts),
+      updates: await norm(plan.updates),
+      deletes: await norm(plan.deletes),
       heavyDeletes: plan.heavyDeletes,
       heavyUpdates: plan.heavyUpdates,
     );
@@ -345,7 +345,7 @@ class TransactionLogMigration {
   ) async {
     final mgr = _dataStore.tableMetaManager;
     if (mgr == null) return null;
-    final normalized = mgr.normalizeTableFieldKey(tableUid);
+    final normalized = await mgr.normalizeTableFieldKey(tableUid);
     final ctx = await mgr.getTableContext(TableUid(normalized));
     if (ctx == null) return null;
     final schema = await mgr.getTableSchema(ctx.tableUid);
