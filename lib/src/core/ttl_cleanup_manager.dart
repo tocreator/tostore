@@ -145,7 +145,8 @@ class TtlCleanupManager {
   Future<List<TableContext>> _systemKvTableContexts() async {
     final contexts = <TableContext>[];
     for (final name in _systemKvTables()) {
-      final uid = _dataStore.tableMetaManager?.getUidByName(TableName(name));
+      final uid =
+          await _dataStore.tableMetaManager?.getUidByName(TableName(name));
       if (uid == null) continue;
       final ctx = await _dataStore.tableMetaManager?.getTableContext(uid);
       if (ctx != null) contexts.add(ctx);
@@ -239,9 +240,9 @@ class TtlCleanupManager {
     DateTime cycleNow, {
     required int batchSize,
   }) async {
-    final tableName =
-        _dataStore.tableMetaManager?.resolveTableNameFromField(plan.tableUid) ??
-            TableName(plan.tableUid);
+    final tableName = await _dataStore.tableMetaManager
+            ?.resolveTableNameFromField(plan.tableUid) ??
+        TableName(plan.tableUid.value);
     try {
       final table =
           await _dataStore.tableMetaManager?.getTableContext(plan.tableUid);
@@ -590,9 +591,9 @@ class TtlCleanupManager {
               if (deleted > 0) {
                 roundDeleted += deleted;
                 totalDeleted += deleted;
-                final resolvedName = _dataStore.tableMetaManager
+                final resolvedName = await _dataStore.tableMetaManager
                         ?.resolveTableNameFromField(plan.tableUid) ??
-                    TableName(plan.tableUid);
+                    TableName(plan.tableUid.value);
                 Logger.info(
                   'TTL cleanup deleted $deleted rows from table $resolvedName',
                 );
