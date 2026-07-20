@@ -8,8 +8,8 @@ import '../core/path_manager.dart';
 import '../core/storage_adapter.dart';
 import '../core/yield_controller.dart';
 import '../model/table_schema.dart';
-import '../model/table_context.dart';
 import '../model/table_identity.dart';
+import '../model/table_meta.dart';
 import '../model/id_generator.dart';
 
 /// Old path structure migration handler
@@ -246,19 +246,25 @@ class OldStructureMigrationHandler {
           final upgradedSchema = schema.tableUid.isEmpty
               ? schema.copyWith(tableUid: tableUid)
               : schema;
-          final dataDirIndex = dataStore.tableMetaManager!
-              .allocateDataDirIndex(upgradedSchema.isGlobal);
-          final tableCtx = TableContext(
-            tableUid: TableUid(tableUid),
-            tableName: TableName(tableName),
-            isGlobal: upgradedSchema.isGlobal,
-            dataDirIndex: dataDirIndex,
-            schema: upgradedSchema,
-          );
-          await dataStore.tableMetaManager!.saveTableSchema(
-            tableCtx,
-            upgradedSchema,
-            dataDirIndex: dataDirIndex,
+          final schemaMgr = dataStore.tableMetaManager!;
+          final dirIndex =
+              await schemaMgr.allocateDirIndex(upgradedSchema.isGlobal);
+          final layout =
+              schemaMgr.evolveFieldStorageLayout(nextSchema: upgradedSchema);
+          final now = DateTime.now();
+          await schemaMgr.saveTableMeta(
+            TableMeta(
+              tableUid: TableUid(tableUid),
+              tableName: TableName(tableName),
+              isGlobal: upgradedSchema.isGlobal,
+              schema: upgradedSchema,
+              fieldLayout: layout,
+              dirIndex: dirIndex,
+              createdAt: now,
+              updatedAt: now,
+            ),
+            dirIndex: dirIndex,
+            layoutOverride: layout,
           );
           Logger.info('Table $tableName structure migration succeeded');
         } catch (e) {
