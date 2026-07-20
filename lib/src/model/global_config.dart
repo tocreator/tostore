@@ -37,6 +37,26 @@ class GlobalConfig {
   /// Authoritative state is in migration_meta.json (task files + keyMigrationInfo).
   final bool hasMigrationTask;
 
+  /// Hash of user-defined table schemas (migration gating).
+  final String? userSchemaHash;
+
+  /// Hash of system table schemas (migration gating / first-init probe).
+  ///
+  /// `null` means the database has not finished first system-table init.
+  final String? systemSchemaHash;
+
+  /// High-water `tables_{dirIndex}` for global tables (cold-start create path).
+  final int lastGlobalDirIndex;
+
+  /// Occupancy of [lastGlobalDirIndex] (0 = unused / empty DB).
+  final int lastGlobalDirEntries;
+
+  /// High-water `tables_{dirIndex}` for non-global tables.
+  final int lastNonGlobalDirIndex;
+
+  /// Occupancy of [lastNonGlobalDirIndex] (0 = unused / empty DB).
+  final int lastNonGlobalDirEntries;
+
   GlobalConfig({
     int? version,
     int? userVersion,
@@ -45,6 +65,12 @@ class GlobalConfig {
     Set<String>? spaceNames,
     this.activeSpace,
     this.hasMigrationTask = false,
+    this.userSchemaHash,
+    this.systemSchemaHash,
+    this.lastGlobalDirIndex = 0,
+    this.lastGlobalDirEntries = 0,
+    this.lastNonGlobalDirIndex = 0,
+    this.lastNonGlobalDirEntries = 0,
   })  : version = version ?? InternalConfig.engineVersion,
         userVersion = userVersion ?? 0,
         maxEntriesPerDir =
@@ -73,6 +99,15 @@ class GlobalConfig {
           {'default'},
       activeSpace: json['activeSpace'] as String? ?? 'default',
       hasMigrationTask: json['hasMigrationTask'] as bool? ?? false,
+      userSchemaHash: json['userSchemaHash'] as String?,
+      systemSchemaHash: json['systemSchemaHash'] as String?,
+      lastGlobalDirIndex: (json['lastGlobalDirIndex'] as num?)?.toInt() ?? 0,
+      lastGlobalDirEntries:
+          (json['lastGlobalDirEntries'] as num?)?.toInt() ?? 0,
+      lastNonGlobalDirIndex:
+          (json['lastNonGlobalDirIndex'] as num?)?.toInt() ?? 0,
+      lastNonGlobalDirEntries:
+          (json['lastNonGlobalDirEntries'] as num?)?.toInt() ?? 0,
     );
   }
 
@@ -86,6 +121,12 @@ class GlobalConfig {
       'spaceNames': spaceNames.toList(),
       if (activeSpace != null) 'activeSpace': activeSpace!,
       'hasMigrationTask': hasMigrationTask,
+      if (userSchemaHash != null) 'userSchemaHash': userSchemaHash,
+      if (systemSchemaHash != null) 'systemSchemaHash': systemSchemaHash,
+      'lastGlobalDirIndex': lastGlobalDirIndex,
+      'lastGlobalDirEntries': lastGlobalDirEntries,
+      'lastNonGlobalDirIndex': lastNonGlobalDirIndex,
+      'lastNonGlobalDirEntries': lastNonGlobalDirEntries,
     };
   }
 
@@ -103,6 +144,14 @@ class GlobalConfig {
     String? activeSpace,
     bool clearActiveSpace = false,
     bool? hasMigrationTask,
+    String? userSchemaHash,
+    String? systemSchemaHash,
+    bool clearUserSchemaHash = false,
+    bool clearSystemSchemaHash = false,
+    int? lastGlobalDirIndex,
+    int? lastGlobalDirEntries,
+    int? lastNonGlobalDirIndex,
+    int? lastNonGlobalDirEntries,
   }) {
     final int nextPageSize;
     if (hasConfiguredPageSize) {
@@ -118,6 +167,17 @@ class GlobalConfig {
       spaceNames: spaceNames ?? this.spaceNames,
       activeSpace: clearActiveSpace ? null : (activeSpace ?? this.activeSpace),
       hasMigrationTask: hasMigrationTask ?? this.hasMigrationTask,
+      userSchemaHash:
+          clearUserSchemaHash ? null : (userSchemaHash ?? this.userSchemaHash),
+      systemSchemaHash: clearSystemSchemaHash
+          ? null
+          : (systemSchemaHash ?? this.systemSchemaHash),
+      lastGlobalDirIndex: lastGlobalDirIndex ?? this.lastGlobalDirIndex,
+      lastGlobalDirEntries: lastGlobalDirEntries ?? this.lastGlobalDirEntries,
+      lastNonGlobalDirIndex:
+          lastNonGlobalDirIndex ?? this.lastNonGlobalDirIndex,
+      lastNonGlobalDirEntries:
+          lastNonGlobalDirEntries ?? this.lastNonGlobalDirEntries,
     );
   }
 
