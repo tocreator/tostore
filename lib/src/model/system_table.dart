@@ -2,6 +2,27 @@ import 'table_identity.dart';
 import 'table_schema.dart';
 
 class SystemTable {
+  /// Table structure metadata system table (global, dir_index fixed at 0).
+  static const String tableMetaName = '_system_table_meta';
+
+  static const String tableMetaUidField = 'table_uid';
+  static const String tableMetaNameField = 'table_name';
+  static const String tableMetaIsGlobalField = 'is_global';
+  static const String tableMetaSchemaField = 'schema';
+  static const String tableMetaFieldLayoutField = 'field_layout';
+  static const String tableMetaDirIndexField = 'dir_index';
+  static const String tableMetaExtraField = 'extra';
+  static const String tableMetaCreatedAtField = 'created_at';
+  static const String tableMetaUpdatedAtField = 'updated_at';
+
+  /// Fixed data directory index for [_system_table_meta] itself.
+  static const int tableMetaDirIndex = 0;
+
+  /// Bootstrap-only stable IDs (pre-generated; other system tables generate at create).
+  static const TableUid tableMetaTableUid = TableUid('t00904io78tpkao');
+  static const IndexUid tableMetaNameIndexUid = IndexUid('i00904io78tpkap');
+  static const IndexUid tableMetaDirIndexUid = IndexUid('i00904io78tpkaq');
+
   /// Foreign key references system table name
   /// This table stores the reverse mapping of foreign key relationships
   /// Structure: referenced_table -> referencing_table -> foreign_key_info
@@ -30,7 +51,8 @@ class SystemTable {
   static const String keyValueExpiryIndexName = '_system_kv_expiry';
 
   /// Stable uid for the engine-managed KV expiry index (immutable across renames).
-  static const IndexUid keyValueExpiryIndexUid = IndexUid('i_sys_kv_expiry');
+  /// Pre-generated opaque id — do not use semantic names in paths.
+  static const IndexUid keyValueExpiryIndexUid = IndexUid('i00907llpssrl6q');
 
   /// get user-facing key-value store table name
   static String getKeyValueName(bool isGlobal) {
@@ -70,6 +92,7 @@ class SystemTable {
   static const String globalMigrationScope = '__global__';
 
   static const Set<String> _systemTableNames = {
+    tableMetaName,
     _fkReferencesName,
     _keyValueName,
     _globalKeyValueName,
@@ -92,13 +115,92 @@ class SystemTable {
 
   /// get all table schemas
   static List<TableSchema> gettableSchemas = [
+    tableMetaTable(),
     _fkReferencesTable(),
     _kVTable(false),
     _kVTable(true),
-    _internalKVTable(false),
-    _internalKVTable(true),
+    internalKVTable(false),
+    internalKVTable(true),
     _keyMigrationProgressTable(),
   ];
+
+  /// Whether [tableName] is the table-meta system table.
+  static bool isTableMetaTable(String tableName) => tableName == tableMetaName;
+
+  /// Table structure metadata store (binary schema + layout per table).
+  ///
+  /// Uses fixed [tableMetaTableUid] / index UIDs so bootstrap can construct
+  /// [TableContext] without reading this table first.
+  static TableSchema tableMetaTable() => TableSchema(
+        name: tableMetaName,
+        tableId: tableMetaName,
+        isGlobal: true,
+        primaryKeyConfig: const PrimaryKeyConfig(
+          name: tableMetaUidField,
+          type: PrimaryKeyType.none,
+        ),
+        fields: const [
+          FieldSchema(
+            name: tableMetaNameField,
+            fieldId: tableMetaNameField,
+            type: DataType.text,
+            nullable: false,
+            unique: true,
+          ),
+          FieldSchema(
+            name: tableMetaIsGlobalField,
+            fieldId: tableMetaIsGlobalField,
+            type: DataType.boolean,
+            nullable: false,
+          ),
+          FieldSchema(
+            name: tableMetaSchemaField,
+            fieldId: tableMetaSchemaField,
+            type: DataType.blob,
+            nullable: false,
+          ),
+          FieldSchema(
+            name: tableMetaFieldLayoutField,
+            fieldId: tableMetaFieldLayoutField,
+            type: DataType.blob,
+            nullable: false,
+          ),
+          FieldSchema(
+            name: tableMetaDirIndexField,
+            fieldId: tableMetaDirIndexField,
+            type: DataType.integer,
+            nullable: false,
+          ),
+          FieldSchema(
+            name: tableMetaExtraField,
+            fieldId: tableMetaExtraField,
+            type: DataType.blob,
+          ),
+          FieldSchema(
+            name: tableMetaCreatedAtField,
+            fieldId: tableMetaCreatedAtField,
+            type: DataType.datetime,
+            nullable: false,
+            defaultValueType: DefaultValueType.currentTimestamp,
+          ),
+          FieldSchema(
+            name: tableMetaUpdatedAtField,
+            fieldId: tableMetaUpdatedAtField,
+            type: DataType.datetime,
+            nullable: false,
+            defaultValueType: DefaultValueType.currentTimestamp,
+          ),
+        ],
+        indexes: [
+          IndexSchema(
+            fields: const [tableMetaNameField],
+            unique: true,
+          ).copyWith(indexUid: tableMetaNameIndexUid),
+          IndexSchema(
+            fields: const [tableMetaIsGlobalField, tableMetaDirIndexField],
+          ).copyWith(indexUid: tableMetaDirIndexUid),
+        ],
+      ).copyWith(tableUid: tableMetaTableUid);
 
   /// Foreign key references system table
   ///
@@ -270,7 +372,7 @@ class SystemTable {
   /// [key] is the primary key ([PrimaryKeyType.none]) so point lookups hit the
   /// primary B-tree directly — no secondary unique index on key.
   /// No TTL fields: intended for durable engine metadata / config / stats.
-  static TableSchema _internalKVTable(bool isGlobal) => TableSchema(
+  static TableSchema internalKVTable(bool isGlobal) => TableSchema(
         name: getInternalKeyValueName(isGlobal),
         tableId: getInternalKeyValueName(isGlobal),
         isGlobal: isGlobal,
