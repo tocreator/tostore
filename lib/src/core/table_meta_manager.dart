@@ -1,7 +1,5 @@
 import 'dart:async';
 
-import 'package:path/path.dart' show dirname;
-
 import '../handler/binary_schema_codec.dart';
 import '../handler/logger.dart';
 import '../handler/space_manifest_codec.dart';
@@ -93,8 +91,9 @@ class TableMetaManager {
   final Map<int, int> _globalDirCounts = {};
   final Map<int, int> _nonGlobalDirCounts = {};
 
-  /// Deferred per-space metadata (inventory). Loaded asynchronously.
-  final Map<String, SpaceManifest> _manifestBySpace = {};
+  /// Deferred current-space metadata (inventory). Bound to this instance's
+  /// [DataStoreImpl.currentSpaceName]; cleared on [dispose] / space switch.
+  SpaceManifest? _spaceManifest;
 
   /// Serializes [allocateDirIndex] against concurrent creates.
   Future<void> _dirAllocChain = Future.value();
@@ -424,29 +423,37 @@ class TableMetaManager {
     }
   }
 
-  /// Load deferred space metadata from `space_manifest.bin`.
-  Future<void> loadSpaceManifest(String spaceName) async {
-    final path = _dataStore.pathManager.getSpaceManifestPath(spaceName);
-    if (await _dataStore.storage.existsFile(path)) {
-      final bytes = await _dataStore.storage.readAsBytes(path);
-      _manifestBySpace[spaceName] = SpaceManifestCodec.decode(bytes);
+  /// Drop the in-memory current-space manifest.
+  ///
+  /// Must be called on space switch (or before binding a different
+  /// [DataStoreImpl.currentSpaceName]) so active UIDs are not reused across spaces.
+  void clearSpaceManifest() {
+    _spaceManifest = null;
+  }
+
+  /// Load deferred current-space metadata from internal KV.
+  Future<void> loadSpaceManifest() async {
+    final bytes = await _dataStore.internalKv.get(
+      SpaceManifestCodec.internalKvKey,
+      isGlobal: false,
+    );
+    if (bytes == null || bytes.isEmpty) {
+      _spaceManifest = SpaceManifest.empty;
       return;
     }
-    _manifestBySpace[spaceName] = SpaceManifest.empty;
+    _spaceManifest = SpaceManifestCodec.decode(bytes);
   }
 
-  /// Get the deferred manifest for a space (lazy-loaded from disk).
-  Future<SpaceManifest> getSpaceManifest(String spaceName) async {
-    var manifest = _manifestBySpace[spaceName];
-    if (manifest == null) {
-      await loadSpaceManifest(spaceName);
-      manifest = _manifestBySpace[spaceName];
+  /// Get the deferred manifest for the current space (lazy-loaded from KV).
+  Future<SpaceManifest> getSpaceManifest() async {
+    if (_spaceManifest == null) {
+      await loadSpaceManifest();
     }
-    return manifest ?? SpaceManifest.empty;
+    return _spaceManifest ?? SpaceManifest.empty;
   }
 
-  /// Visible table UIDs in [spaceName]: **all global tables** ∪ non-global
-  /// UIDs from [SpaceManifest.activeTableUids].
+  /// Visible table UIDs in the current space: **all global tables** ∪
+  /// non-global UIDs from [SpaceManifest.activeTableUids].
   ///
   /// Globals are never stored in the space manifest — they are merged from
   /// [_globalTableUids] after the one-shot name inventory is ready (awaits
@@ -454,13 +461,12 @@ class TableMetaManager {
   ///
   /// [onlyUserTables] hides `_system_*` (use `true` on user-facing paths such
   /// as [DataStoreImpl.getSpaceInfo]; engine paths keep the default `false`).
-  Future<List<TableUid>> getActiveUidsForSpace(
-    String spaceName, {
+  Future<List<TableUid>> getActiveUids({
     bool onlyUserTables = false,
   }) async {
     await _ensureNameInventoryReady();
-    await getSpaceManifest(spaceName);
-    final nonGlobal = _activeUidsForSpace(spaceName);
+    await getSpaceManifest();
+    final nonGlobal = _activeTableUids;
 
     final seen = <TableUid>{};
     final out = <TableUid>[];
@@ -501,32 +507,40 @@ class TableMetaManager {
     return SystemTable.isSystemTable(meta.tableName.value);
   }
 
-  /// Persist deferred space metadata to `space_manifest.bin`.
-  Future<void> saveSpaceManifest(String spaceName) async {
-    final path = _dataStore.pathManager.getSpaceManifestPath(spaceName);
-    final manifest = _manifestBySpace[spaceName] ?? SpaceManifest.empty;
+  /// Persist deferred current-space metadata to internal KV.
+  Future<void> saveSpaceManifest() async {
+    final manifest = _spaceManifest ?? SpaceManifest.empty;
     final bytes = SpaceManifestCodec.encode(manifest);
-    await _dataStore.storage.ensureDirectoryExists(dirname(path));
-    await _dataStore.storage.writeAsBytes(path, bytes);
+    await _dataStore.internalKv.set(
+      SpaceManifestCodec.internalKvKey,
+      bytes,
+      isGlobal: false,
+    );
+  }
+
+  /// Replace the current-space active non-global UID inventory and persist.
+  ///
+  /// Used by upgrades that rebuild the inventory in bulk.
+  Future<void> replaceActiveTableUids(List<TableUid> uids) async {
+    _spaceManifest = SpaceManifest(activeTableUids: List<TableUid>.from(uids));
+    await saveSpaceManifest();
   }
 
   /// Raw non-global active UIDs from the space manifest (no globals).
-  List<TableUid> _activeUidsForSpace(String spaceName) {
-    return _manifestBySpace[spaceName]?.activeTableUids ?? const <TableUid>[];
-  }
+  List<TableUid> get _activeTableUids =>
+      _spaceManifest?.activeTableUids ?? const <TableUid>[];
 
   Future<void> _updateActiveTableUids(
-    String spaceName,
     void Function(List<TableUid> uids) mutate, {
     bool persist = true,
   }) async {
-    final current = List<TableUid>.from(_activeUidsForSpace(spaceName));
+    await getSpaceManifest();
+    final current = List<TableUid>.from(_activeTableUids);
     mutate(current);
-    _manifestBySpace[spaceName] =
-        (_manifestBySpace[spaceName] ?? SpaceManifest.empty)
-            .copyWith(activeTableUids: current);
+    _spaceManifest = (_spaceManifest ?? SpaceManifest.empty)
+        .copyWith(activeTableUids: current);
     if (persist) {
-      await saveSpaceManifest(spaceName);
+      await saveSpaceManifest();
     }
   }
 
@@ -643,12 +657,14 @@ class TableMetaManager {
     _dirIndexByUid.clear();
     _nameInventoryReady = false;
     _loadAllMetaFuture = null;
-    _manifestBySpace.clear();
+    clearSpaceManifest();
     _globalDirCounts.clear();
     _nonGlobalDirCounts.clear();
   }
 
-  /// Invalidate meta caches (keeps space manifests).
+  /// Invalidate meta caches (keeps current-space [SpaceManifest] — same space only).
+  ///
+  /// Space switch must call [clearSpaceManifest] / [dispose]; do not rely on this.
   void invalidateCache() {
     _tableMetaCache?.clear();
     _tableSchemaCache?.clear();
@@ -1322,11 +1338,9 @@ class TableMetaManager {
     TableUid tableUid, {
     bool persist = true,
   }) async {
-    final currentSpace = _dataStore.currentSpaceName;
-    final activeUids = _activeUidsForSpace(currentSpace);
-    if (!activeUids.contains(tableUid)) {
+    await getSpaceManifest();
+    if (!_activeTableUids.contains(tableUid)) {
       await _updateActiveTableUids(
-        currentSpace,
         (uids) => uids.add(tableUid),
         persist: persist,
       );
@@ -1683,9 +1697,9 @@ class TableMetaManager {
       removeCachedTableSchema(tableUid);
 
       if (!meta.isGlobal) {
-        final currentSpace = _dataStore.currentSpaceName;
-        if (_activeUidsForSpace(currentSpace).contains(tableUid)) {
-          await _updateActiveTableUids(currentSpace, (uids) {
+        await getSpaceManifest();
+        if (_activeTableUids.contains(tableUid)) {
+          await _updateActiveTableUids((uids) {
             uids.remove(tableUid);
           });
         }
@@ -1753,8 +1767,8 @@ class TableMetaManager {
   Future<List<String>> _filterNamesToCurrentSpace(
     Iterable<String> names,
   ) async {
-    await loadSpaceManifest(_dataStore.currentSpaceName);
-    final active = _activeUidsForSpace(_dataStore.currentSpaceName).toSet();
+    await loadSpaceManifest();
+    final active = _activeTableUids.toSet();
     final out = <String>[];
     for (final name in names) {
       final uid = _uidByName[TableName(name)];
@@ -1876,7 +1890,7 @@ class TableMetaManager {
 
       _rebuildDirCountsFromMeta();
       await _reconcileDirHighWaterFromMeta();
-      await loadSpaceManifest(_dataStore.currentSpaceName);
+      await loadSpaceManifest();
       _nameInventoryReady = true;
       // May stay false if mid-load eviction left TreeCache partial.
       _syncTableMetaFullyCachedFlag();
