@@ -328,7 +328,7 @@ final class TreeMetaPageService {
             {required bool ownedBatch})
         write,
   }) async {
-    final table = _dataStore.tableMetaManager?.getTableContextSync(tableUid);
+    final table = await _dataStore.tableMetaManager?.getTableContext(tableUid);
     if (table == null) {
       // Cannot register a pending batch without a table context.
       await write(batchContext, ownedBatch: false);
