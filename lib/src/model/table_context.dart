@@ -6,20 +6,22 @@ class TableContext {
   final TableUid tableUid;
   TableName tableName;
   final bool isGlobal;
-  final int dataDirIndex;
+
+  /// Upper-level data directory index (`tables_{dirIndex}`).
+  final int dirIndex;
   final TableSchema schema;
 
   TableContext({
     required this.tableUid,
     required this.tableName,
     required this.isGlobal,
-    required this.dataDirIndex,
+    required this.dirIndex,
     required this.schema,
   });
 
   @override
   String toString() =>
-      'TableContext(uid: $tableUid, name: $tableName, isGlobal: $isGlobal, dir: $dataDirIndex, schemaVersion: ${schema.schemaVersion})';
+      'TableContext(uid: $tableUid, name: $tableName, isGlobal: $isGlobal, dir: $dirIndex, schemaVersion: ${schema.schemaVersion})';
 }
 
 /// Index context, used for index operations.
