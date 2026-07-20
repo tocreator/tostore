@@ -229,7 +229,7 @@ class WeightManager {
           'WeightManager._initializeWeights',
           checkInterval: 100);
 
-      // Get all tables
+      // Full database table list (globals included); space filter is not applied.
       final allTables = await _dataStore.getTableNames();
       final systemTables = <String>{};
 
