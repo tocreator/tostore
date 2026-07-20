@@ -29,15 +29,17 @@ import 'yield_controller.dart';
 class TableMetaManager {
   final DataStoreImpl _dataStore;
 
-  /// Hot [TableMeta] cache. Managed by ResourceManager: [MemoryQuotaType.schema].
+  /// Hot [TableMeta] cache (LRU + quota). Managed by ResourceManager:
+  /// [MemoryQuotaType.schema]. Full meta lives only here.
+  ///
+  /// [TreeCache.isFullyCached](`all`) means every inventoried meta is still
+  /// hot. After eviction it is cleared; miss then re-queries the system table
+  /// even when [_nameInventoryReady] is true.
   TreeCache<TableMeta>? _tableMetaCache;
 
   /// Hot schema cache (TableSchema) using [TreeCache].
   /// Managed by ResourceManager quota: [MemoryQuotaType.schema].
   TreeCache<TableSchema>? _tableSchemaCache;
-
-  /// O(1) lookup of full [TableMeta] (not subject to TreeCache eviction).
-  final Map<TableUid, TableMeta> _metaByUid = <TableUid, TableMeta>{};
 
   /// Per-table index cache derived from [TableSchema].
   final Map<TableUid, _IndexListCacheEntry> _indexListCache =
@@ -73,7 +75,15 @@ class TableMetaManager {
   /// depending on full [TableMeta] still being hot in memory.
   final Set<TableUid> _globalTableUids = {};
 
-  /// True once startup [loadAllTableMetaAsync] finished building name maps.
+  /// Dir index per tableUid (lightweight; survives TreeCache eviction).
+  final Map<TableUid, int> _dirIndexByUid = {};
+
+  /// True once startup [loadAllTableMetaAsync] (or memory-mode registration)
+  /// finished building the **lightweight** name↔uid inventory.
+  ///
+  /// This is **not** "all [TableMeta] are in TreeCache". After quota eviction the
+  /// inventory stays complete while the cache may be partial — full-meta reads
+  /// must still hit `_system_table_meta` on cache miss (see [getTableMeta]).
   bool _nameInventoryReady = false;
 
   /// Single-flight handle for [loadAllTableMetaAsync] (startup / explicit).
@@ -91,9 +101,6 @@ class TableMetaManager {
 
   TableMetaManager(this._dataStore);
 
-  /// True if any table meta is currently held in memory.
-  bool get hasAnyTableMeta => _metaByUid.isNotEmpty;
-
   /// Whether the lightweight name↔uid inventory is complete for listing.
   bool get isNameInventoryReady => _nameInventoryReady;
 
@@ -101,16 +108,36 @@ class TableMetaManager {
   /// are registered via [registerTableSchemaInMemory]).
   void markNameInventoryReady() {
     _nameInventoryReady = true;
-    _ensureTableMetaCache().setFullyCached('all', true);
+    _syncTableMetaFullyCachedFlag();
   }
 
-  /// Resolve tableUid from tableName (memory → fully-cached miss → system table).
+  /// Set TreeCache `all` flag only when every inventoried uid is still hot.
+  ///
+  /// [_nameInventoryReady] may be true while this stays false (eviction left a
+  /// partial cache) — miss paths must then query the system table.
+  void _syncTableMetaFullyCachedFlag() {
+    final cache = _ensureTableMetaCache();
+    if (!_nameInventoryReady || _nameByUid.isEmpty) {
+      cache.setFullyCached('all', false);
+      return;
+    }
+    if (cache.length < _nameByUid.length) {
+      cache.setFullyCached('all', false);
+      return;
+    }
+    cache.setFullyCached('all', true);
+  }
+
+  /// Resolve tableUid from tableName (inventory → system table when cold).
   Future<TableUid?> getUidByName(TableName tableName) =>
       resolveTableUidFromName(tableName);
 
-  /// Resolve tableName from tableUid via [getTableMeta] (system-table aware).
+  /// Resolve tableName from tableUid (inventory first; cold → [getTableMeta]).
   Future<TableName?> getNameByUid(TableUid tableUid) async {
     if (tableUid.isEmpty) return null;
+    final inv = _nameByUid[tableUid];
+    if (inv != null) return inv;
+    if (_nameInventoryReady) return null;
     final meta = await getTableMeta(tableUid);
     return meta?.tableName;
   }
@@ -121,7 +148,7 @@ class TableMetaManager {
     final cached = _uidByName[tableName];
     if (cached != null) return cached;
     final asUid = TableUid(tableName.value);
-    if (_metaByUid.containsKey(asUid) || _tableMetaCache?.get(asUid) != null) {
+    if (_nameByUid.containsKey(asUid) || _tableMetaCache?.peek(asUid) != null) {
       return asUid;
     }
     return null;
@@ -130,7 +157,7 @@ class TableMetaManager {
   /// Memory-only uid→name peek (logs / best-effort display only).
   TableName? _peekNameByUid(TableUid tableUid) {
     if (tableUid.isEmpty) return null;
-    return _nameByUid[tableUid] ?? _metaByUid[tableUid]?.tableName;
+    return _nameByUid[tableUid] ?? _tableMetaCache?.peek(tableUid)?.tableName;
   }
 
   /// Normalize a persisted uid-or-name field to a stable map key (prefers uid).
@@ -167,7 +194,7 @@ class TableMetaManager {
 
   /// Memory peek only (no I/O). Prefer [getTableMeta] on engine paths.
   TableMeta? _peekTableMeta(TableUid tableUid) {
-    return _metaByUid[tableUid] ?? _tableMetaCache?.get(tableUid);
+    return _tableMetaCache?.peek(tableUid);
   }
 
   TreeCache<TableSchema> _ensureTableSchemaCache() {
@@ -215,9 +242,8 @@ class TableMetaManager {
   /// Correctness paths must use [getTableSchema] / [getTableMeta].
   TableSchema? _peekTableSchema(TableUid tableUid) {
     if (tableUid.isEmpty) return null;
-    return _metaByUid[tableUid]?.schema ??
-        _tableMetaCache?.get(tableUid)?.schema ??
-        _tableSchemaCache?.get(tableUid);
+    return _tableMetaCache?.peek(tableUid)?.schema ??
+        _tableSchemaCache?.peek(tableUid);
   }
 
   /// Hotspot schema cache + derived index lists (called from [_cacheTableMeta]).
@@ -231,7 +257,6 @@ class TableMetaManager {
   }
 
   void _cacheTableMeta(TableMeta meta) {
-    _metaByUid[meta.tableUid] = meta;
     _ensureTableMetaCache().put(meta.tableUid, meta);
     _tableFieldLayoutCache[meta.tableUid] = meta.fieldLayout;
     _storageFieldStructCache.remove(meta.tableUid);
@@ -292,7 +317,7 @@ class TableMetaManager {
     final layout = _tableFieldLayoutCache[SystemTable.tableMetaTableUid] ??
         _createInitialFieldStorageLayout(schema);
     final now = DateTime.now();
-    final existing = _metaByUid[SystemTable.tableMetaTableUid];
+    final existing = _peekTableMeta(SystemTable.tableMetaTableUid);
     return TableMeta(
       tableUid: SystemTable.tableMetaTableUid,
       tableName: TableName(SystemTable.tableMetaName),
@@ -405,11 +430,9 @@ class TableMetaManager {
     if (await _dataStore.storage.existsFile(path)) {
       final bytes = await _dataStore.storage.readAsBytes(path);
       _manifestBySpace[spaceName] = SpaceManifestCodec.decode(bytes);
-      _rebuildNameLookups();
       return;
     }
     _manifestBySpace[spaceName] = SpaceManifest.empty;
-    _rebuildNameLookups();
   }
 
   /// Get the deferred manifest for a space (lazy-loaded from disk).
@@ -507,21 +530,6 @@ class TableMetaManager {
     }
   }
 
-  /// Rebuild [_uidByName] / [_nameByUid] / [_globalTableUids] from [_metaByUid].
-  void _rebuildNameLookups() {
-    _uidByName.clear();
-    _nameByUid.clear();
-    _globalTableUids.clear();
-
-    for (final meta in _metaByUid.values) {
-      _uidByName[meta.tableName] = meta.tableUid;
-      _nameByUid[meta.tableUid] = meta.tableName;
-      if (meta.isGlobal) {
-        _globalTableUids.add(meta.tableUid);
-      }
-    }
-  }
-
   void _rebuildDirCountsFromMeta() {
     _globalDirCounts.clear();
     _nonGlobalDirCounts.clear();
@@ -529,9 +537,9 @@ class TableMetaManager {
     final globalRaw = <int, int>{};
     final nonGlobalRaw = <int, int>{};
 
-    for (final meta in _metaByUid.values) {
-      final map = meta.isGlobal ? globalRaw : nonGlobalRaw;
-      map[meta.dirIndex] = (map[meta.dirIndex] ?? 0) + 1;
+    for (final e in _dirIndexByUid.entries) {
+      final map = _globalTableUids.contains(e.key) ? globalRaw : nonGlobalRaw;
+      map[e.value] = (map[e.value] ?? 0) + 1;
     }
 
     for (final e in globalRaw.entries) {
@@ -577,34 +585,43 @@ class TableMetaManager {
     TableMeta meta, {
     bool skipDirCountIncrement = false,
   }) {
-    final old = _metaByUid[meta.tableUid];
-    if (old != null) {
-      _unregisterMetaFromLookups(old);
+    final uid = meta.tableUid;
+    final oldName = _nameByUid[uid];
+    final oldDir = _dirIndexByUid[uid];
+    final existed = oldName != null || oldDir != null;
+    final wasGlobal = _globalTableUids.contains(uid);
+
+    if (existed && oldDir != null) {
+      _decrementDirCount(wasGlobal, oldDir);
+    }
+    if (oldName != null && oldName != meta.tableName) {
+      _uidByName.remove(oldName);
     }
 
-    _metaByUid[meta.tableUid] = meta;
     // Pre-counted only applies to brand-new registrations (allocateDirIndex
     // already bumped usage). Updates always re-count after unregister.
-    if (!skipDirCountIncrement || old != null) {
+    if (!skipDirCountIncrement || existed) {
       _incrementDirCount(meta.isGlobal, meta.dirIndex);
     }
 
+    _dirIndexByUid[uid] = meta.dirIndex;
     // Full-DB name inventory (space visibility is applied only at list time).
-    _uidByName[meta.tableName] = meta.tableUid;
-    _nameByUid[meta.tableUid] = meta.tableName;
+    _uidByName[meta.tableName] = uid;
+    _nameByUid[uid] = meta.tableName;
     if (meta.isGlobal) {
-      _globalTableUids.add(meta.tableUid);
+      _globalTableUids.add(uid);
     } else {
-      _globalTableUids.remove(meta.tableUid);
+      _globalTableUids.remove(uid);
     }
   }
 
   void _unregisterMetaFromLookups(TableMeta meta) {
-    _metaByUid.remove(meta.tableUid);
-    _decrementDirCount(meta.isGlobal, meta.dirIndex);
+    final uid = meta.tableUid;
+    final dir = _dirIndexByUid.remove(uid) ?? meta.dirIndex;
+    _decrementDirCount(meta.isGlobal, dir);
     _uidByName.remove(meta.tableName);
-    _nameByUid.remove(meta.tableUid);
-    _globalTableUids.remove(meta.tableUid);
+    _nameByUid.remove(uid);
+    _globalTableUids.remove(uid);
   }
 
   /// Clear all in-memory caches and reset state.
@@ -620,10 +637,10 @@ class TableMetaManager {
     _tableFieldLayoutCache.clear();
     _storageFieldStructCache.clear();
     _metaLoadingFutures.clear();
-    _metaByUid.clear();
     _uidByName.clear();
     _nameByUid.clear();
     _globalTableUids.clear();
+    _dirIndexByUid.clear();
     _nameInventoryReady = false;
     _loadAllMetaFuture = null;
     _manifestBySpace.clear();
@@ -635,10 +652,10 @@ class TableMetaManager {
   void invalidateCache() {
     _tableMetaCache?.clear();
     _tableSchemaCache?.clear();
-    _metaByUid.clear();
     _uidByName.clear();
     _nameByUid.clear();
     _globalTableUids.clear();
+    _dirIndexByUid.clear();
     _nameInventoryReady = false;
     _loadAllMetaFuture = null;
     _tableMetaCache?.setFullyCached('all', false);
@@ -1172,18 +1189,26 @@ class TableMetaManager {
 
   /// Load [TableMeta] by stable uid — the single entry for meta / routing.
   ///
-  /// 1. Memory (`_metaByUid` / TreeCache)
-  /// 2. If miss and [TreeCache.isFullyCached](`all`) → absent (`null`)
-  /// 3. Else query `_system_table_meta` (covers cold start and eviction)
+  /// 1. Hot [TreeCache] (LRU)
+  /// 2. If [_nameInventoryReady] and uid absent from [_nameByUid] → absent
+  /// 3. Else query `_system_table_meta` (cold start, partial inventory, or
+  ///    inventory hit but cache miss after eviction)
+  ///
+  /// Note: [TreeCache.isFullyCached](`all`) alone is **not** used for the
+  /// negative short-circuit — loadAll may set it after mid-load eviction left
+  /// the TreeCache incomplete while the lightweight inventory is complete.
   Future<TableMeta?> getTableMeta(TableUid tableUid) async {
     if (tableUid.isEmpty) return null;
 
     // Self-row: never fabricate existence. Use [bootstrapTableMetaContext] for
     // QueryExecutor I/O; only return meta after save/load registered it.
     if (tableUid == SystemTable.tableMetaTableUid) {
-      final cached = _metaByUid[tableUid] ?? _tableMetaCache?.get(tableUid);
+      final cached = _tableMetaCache?.get(tableUid);
       if (cached != null) return cached;
       if (_tableMetaCache?.isFullyCached('all') == true) {
+        return null;
+      }
+      if (_nameInventoryReady && !_nameByUid.containsKey(tableUid)) {
         return null;
       }
       // Try disk self-row via bootstrap context (no recursive getTableMeta).
@@ -1198,10 +1223,12 @@ class TableMetaManager {
       }
     }
 
-    final hot = _metaByUid[tableUid] ?? _tableMetaCache?.get(tableUid);
+    final hot = _tableMetaCache?.get(tableUid);
     if (hot != null) return hot;
 
-    if (_tableMetaCache?.isFullyCached('all') == true) {
+    // Partial / empty cache: inventory can only skip IO for unknown uids.
+    // Known uids (in [_nameByUid]) with a cache miss must hit the system table.
+    if (_nameInventoryReady && !_nameByUid.containsKey(tableUid)) {
       return null;
     }
 
@@ -1263,22 +1290,8 @@ class TableMetaManager {
     final cached = _peekUidByName(tableName);
     if (cached != null) return cached;
 
-    // Loaded but not yet in name index (e.g. inactive in current space).
-    for (final meta in _metaByUid.values) {
-      if (meta.tableName == tableName) {
-        if (meta.isGlobal) {
-          _registerMetaInLookups(meta);
-        } else {
-          await _ensureActiveInCurrentSpace(meta.tableUid);
-          _registerMetaInLookups(meta);
-        }
-        return meta.tableUid;
-      }
-    }
-
-    if (_tableMetaCache?.isFullyCached('all') == true) {
-      return null;
-    }
+    // Full inventory: name miss ⇒ table does not exist (no IO).
+    if (_nameInventoryReady) return null;
 
     try {
       final rows = await _dataStore.executeQuery(
@@ -1407,7 +1420,7 @@ class TableMetaManager {
         schema = schema.copyWith(tableUid: tableUid);
       }
 
-      final current = _metaByUid[tableUid] ?? await getTableMeta(tableUid);
+      final current = _peekTableMeta(tableUid) ?? await getTableMeta(tableUid);
       // Avoid recursive bootstrap for the meta table itself during first save.
       final currentSchema = current?.schema;
       schema = schema.generateAutoIndexes(oldSchema: currentSchema);
@@ -1518,13 +1531,21 @@ class TableMetaManager {
     }
 
     if (preferredUid.isNotEmpty) {
-      final localMeta = _metaByUid[preferredUid];
+      final invName = _nameByUid[preferredUid];
+      if (invName != null) {
+        return invName == tableName
+            ? preferredUid
+            : await _allocateUniqueTableUid();
+      }
+      final localMeta = _peekTableMeta(preferredUid);
       if (localMeta != null) {
         return localMeta.tableName == tableName
             ? preferredUid
             : await _allocateUniqueTableUid();
       }
-      if (_tableMetaCache?.isFullyCached('all') != true) {
+      // Inventory incomplete: probe disk. Ready + absent from [_nameByUid]
+      // means the uid is free to claim.
+      if (!_nameInventoryReady) {
         final disk = await _doLoadTableMeta(preferredUid);
         if (disk != null) {
           return disk.tableName == tableName
@@ -1553,12 +1574,14 @@ class TableMetaManager {
         continue;
       }
 
-      if (_metaByUid.containsKey(candidate)) {
+      if (_nameByUid.containsKey(candidate) ||
+          _peekTableMeta(candidate) != null) {
         candidate = TableUid(GlobalIdGenerator.generate('t'));
         continue;
       }
 
-      if (_tableMetaCache?.isFullyCached('all') == true) {
+      // Inventory complete ⇒ candidate not listed is free. Otherwise probe disk.
+      if (_nameInventoryReady) {
         return candidate;
       }
 
@@ -1618,9 +1641,10 @@ class TableMetaManager {
 
       // Drop the colliding registration if we had provisionally registered it.
       if (attempt == 0 && originalUid != newUid) {
-        final provisional = _metaByUid[originalUid];
+        final provisional = _peekTableMeta(originalUid);
         if (provisional != null && provisional.tableName == current.tableName) {
           _unregisterMetaFromLookups(provisional);
+          removeCachedTableSchema(originalUid);
         }
       }
 
@@ -1643,7 +1667,7 @@ class TableMetaManager {
   /// Delete table meta from caches and system table.
   Future<bool> deleteTableMeta(TableUid tableUid) async {
     try {
-      final meta = _metaByUid[tableUid] ?? await getTableMeta(tableUid);
+      final meta = _peekTableMeta(tableUid) ?? await getTableMeta(tableUid);
       if (meta == null) return false;
 
       final tableName = meta.tableName;
@@ -1827,7 +1851,7 @@ class TableMetaManager {
     try {
       // Ensure bootstrap meta is present without querying self.
       final bootstrap = _buildBootstrapTableMeta();
-      if (!_metaByUid.containsKey(bootstrap.tableUid)) {
+      if (_peekTableMeta(bootstrap.tableUid) == null) {
         _registerMetaInLookups(bootstrap);
         _cacheTableMeta(bootstrap);
       }
@@ -1853,9 +1877,9 @@ class TableMetaManager {
       _rebuildDirCountsFromMeta();
       await _reconcileDirHighWaterFromMeta();
       await loadSpaceManifest(_dataStore.currentSpaceName);
-      _rebuildNameLookups();
       _nameInventoryReady = true;
-      _ensureTableMetaCache().setFullyCached('all', true);
+      // May stay false if mid-load eviction left TreeCache partial.
+      _syncTableMetaFullyCachedFlag();
     } catch (e) {
       _nameInventoryReady = false;
       Logger.error('Failed to load all table meta', rawError: e);
@@ -1866,26 +1890,28 @@ class TableMetaManager {
     }
   }
 
-  /// Align GlobalConfig dir high-water with authoritative in-memory metas.
+  /// Align GlobalConfig dir high-water with lightweight inventory
+  /// ([_dirIndexByUid] / [_globalTableUids]) — survives TreeCache eviction.
   Future<void> _reconcileDirHighWaterFromMeta() async {
     var maxGlobal = -1;
     var maxNonGlobal = -1;
     var globalAtMax = 0;
     var nonGlobalAtMax = 0;
 
-    for (final meta in _metaByUid.values) {
-      if (meta.isGlobal) {
-        if (meta.dirIndex > maxGlobal) {
-          maxGlobal = meta.dirIndex;
+    for (final e in _dirIndexByUid.entries) {
+      final dirIndex = e.value;
+      if (_globalTableUids.contains(e.key)) {
+        if (dirIndex > maxGlobal) {
+          maxGlobal = dirIndex;
           globalAtMax = 1;
-        } else if (meta.dirIndex == maxGlobal) {
+        } else if (dirIndex == maxGlobal) {
           globalAtMax++;
         }
       } else {
-        if (meta.dirIndex > maxNonGlobal) {
-          maxNonGlobal = meta.dirIndex;
+        if (dirIndex > maxNonGlobal) {
+          maxNonGlobal = dirIndex;
           nonGlobalAtMax = 1;
-        } else if (meta.dirIndex == maxNonGlobal) {
+        } else if (dirIndex == maxNonGlobal) {
           nonGlobalAtMax++;
         }
       }
