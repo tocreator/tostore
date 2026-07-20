@@ -112,8 +112,11 @@ abstract class DataStoreInterface {
   /// get table info
   Future<TableInfo?> getTableInfo(String tableName);
 
-  /// get all table names in the current space
-  Future<List<String>> getTableNames();
+  /// Get table names.
+  ///
+  /// By default returns **all** tables in the database. Pass
+  /// [onlyCurrentSpace] for globals + tables active in the current space.
+  Future<List<String>> getTableNames({bool onlyCurrentSpace = false});
 
   /// Perform approximate nearest neighbor (ANN) vector similarity search
   Future<List<VectorSearchResult>> vectorSearch(
