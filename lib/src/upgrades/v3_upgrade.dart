@@ -6,19 +6,26 @@ import '../core/wal_manager.dart';
 import '../handler/common.dart';
 import '../handler/logger.dart';
 import '../handler/meta_binary_codec.dart';
+import '../model/db_exception.dart';
 import '../model/global_config.dart';
 import '../model/parallel_journal_entry.dart';
+import '../model/result_type.dart';
+import '../model/system_table.dart';
 import '../model/table_schema.dart';
-import '../model/table_context.dart';
 import '../model/table_identity.dart';
+import '../model/table_meta.dart';
 import '../model/meta_info.dart';
 import '../model/ngh_index_meta.dart';
 import '../handler/space_manifest_codec.dart';
 import '../model/space_manifest.dart';
 import '../model/id_generator.dart';
+import 'legacy_model/legacy_schema_json.dart';
 import 'transaction_log_migration.dart';
 
 /// Version 3 upgrade:
+/// - Bootstraps `_system_table_meta` + internal KV only; migrates 3.1.2 schema
+///   partitions (user + existing system tables) into `TableMeta` rows, then
+///   renames directories to stable UIDs (no SchemaMeta/routes rewrite).
 /// - Restructures storage directory names from physical table/index names to stable UIDs.
 /// - Reads legacy meta.json once, writes TableDataMeta/IndexMeta/NghIndexMeta into
 ///   partition-0 page0, then deletes the JSON files (no intermediate JSON rewrite).
@@ -59,61 +66,30 @@ class V3Upgrade {
     Map<int, int> partitionToDir = {};
     String? userSchemaHash;
     String? systemSchemaHash;
-    DateTime createdTime = DateTime.now();
+    DateTime? legacySchemaMetaCreatedAt;
 
     if (await _dataStore.storage.existsFile(schemaMetaPath)) {
       final content = await _dataStore.storage.readAsString(schemaMetaPath);
       if (content != null && content.isNotEmpty) {
-        try {
-          final json = jsonDecode(content) as Map<String, dynamic>;
-          if (json.containsKey('tablePartitionMap')) {
-            final map = json['tablePartitionMap'] as Map<String, dynamic>;
-            tablePartitionMap = map.map((k, v) => MapEntry(k, v as int));
-          }
-          if (json.containsKey('directoryMapping')) {
-            final dm = json['directoryMapping'] as Map<String, dynamic>;
-            if (dm.containsKey('partitionToDir')) {
-              final p2d = dm['partitionToDir'] as Map<String, dynamic>;
-              partitionToDir =
-                  p2d.map((k, v) => MapEntry(int.parse(k), v as int));
-            }
-          }
-          userSchemaHash = json['userSchemaHash'] as String?;
-          systemSchemaHash = json['systemSchemaHash'] as String?;
-          if (json['timestamps'] != null &&
-              json['timestamps']['created'] != null) {
-            createdTime =
-                DateTime.parse(json['timestamps']['created'] as String);
-          }
-        } catch (e) {
-          Logger.warn('Failed to parse old schema meta in v3 upgrade',
-              rawError: e);
+        final legacy = LegacySchemaMetaJson.tryParse(content);
+        if (legacy != null) {
+          tablePartitionMap = Map<String, int>.from(legacy.tablePartitionMap);
+          partitionToDir = Map<int, int>.from(legacy.partitionToDir);
+          userSchemaHash = legacy.userSchemaHash;
+          systemSchemaHash = legacy.systemSchemaHash;
+          legacySchemaMetaCreatedAt = legacy.createdAt;
+        } else {
+          Logger.warn('Failed to parse old schema meta in v3 upgrade');
         }
       }
-      // Backup old schema_meta.json before modifying it so we can recover on crash
+      // Backup old schema_meta.json before mutating so we can recover on crash
       if (!await _dataStore.storage.existsFile(schemaMetaPathOld)) {
         await _dataStore.storage.copyFile(schemaMetaPath, schemaMetaPathOld);
       }
-
-      // Construct a new, empty-routes SchemaMeta in the new format but preserving hashes/timestamps
-      final emptySchemaMeta = SchemaMeta(
-        version: InternalConfig.schemaVersion,
-        routes: const [],
-        userSchemaHash: userSchemaHash,
-        systemSchemaHash: systemSchemaHash,
-        timestamps: Timestamps(
-          created: createdTime,
-          modified: DateTime.now(),
-        ),
-      );
-
-      // Overwrite schema_meta.json with the empty new-format layout
-      await _dataStore.storage
-          .writeAsString(schemaMetaPath, jsonEncode(emptySchemaMeta.toJson()));
-
-      // Invalidate the cache inside tableMetaManager so it loads the new file on next read
-      _dataStore.tableMetaManager?.invalidateCache();
     }
+
+    // Bootstrap only brand-new engine tables (not present in 3.1.2).
+    await _ensureBootstrapSystemTables();
 
     // 2. Read legacy global config mapping
     final globalConfigPath = _dataStore.pathManager.getGlobalConfigPath();
@@ -154,101 +130,135 @@ class V3Upgrade {
     final tableIndexUidMap = <String, Map<String, String>>{};
     final tableIsGlobalMap = <String, bool>{};
     final tableDirIndexMap = <String, int>{};
-    final nonGlobalUsage = <int, int>{};
-    final globalUsage = <int, int>{};
+
+    // Seed from GlobalConfig (bootstrap createTable may already have advanced it).
+    final seedCfg = await _dataStore.getGlobalConfig() ?? GlobalConfig();
+    var lastGlobalDirIndex = seedCfg.lastGlobalDirIndex;
+    var lastGlobalDirEntries = seedCfg.lastGlobalDirEntries;
+    var lastNonGlobalDirIndex = seedCfg.lastNonGlobalDirIndex;
+    var lastNonGlobalDirEntries = seedCfg.lastNonGlobalDirEntries;
+    final maxPerDir = _dataStore.maxEntriesPerDir;
 
     int allocateDirIndex(bool isGlobal) {
-      final usage = isGlobal ? globalUsage : nonGlobalUsage;
-      int selectedDir = 0;
-      int minCount = _dataStore.maxEntriesPerDir + 1;
-
-      for (final dir in usage.keys) {
-        final count = usage[dir] ?? 0;
-        if (count < minCount && count < _dataStore.maxEntriesPerDir) {
-          selectedDir = dir;
-          minCount = count;
+      if (isGlobal) {
+        if (lastGlobalDirEntries >= maxPerDir) {
+          lastGlobalDirIndex += 1;
+          lastGlobalDirEntries = 1;
+        } else {
+          lastGlobalDirEntries += 1;
         }
+        return lastGlobalDirIndex;
       }
-
-      if (minCount >= _dataStore.maxEntriesPerDir) {
-        int maxDir = -1;
-        for (final dir in usage.keys) {
-          if (dir > maxDir) maxDir = dir;
-        }
-        selectedDir = maxDir + 1;
+      if (lastNonGlobalDirEntries >= maxPerDir) {
+        lastNonGlobalDirIndex += 1;
+        lastNonGlobalDirEntries = 1;
+      } else {
+        lastNonGlobalDirEntries += 1;
       }
-
-      usage[selectedDir] = (usage[selectedDir] ?? 0) + 1;
-      return selectedDir;
+      return lastNonGlobalDirIndex;
     }
 
-    // 3. Upgrade table schemas
+    final schemaMgr = _dataStore.tableMetaManager!;
+    final schemaMetaCreatedAt = legacySchemaMetaCreatedAt;
+
+    // 3. Ingest ALL legacy schema tables (user + existing system) into
+    // `_system_table_meta`. Read each partition file once.
+    final tablesByPartition = <int, List<String>>{};
     for (final tableName in tablePartitionMap.keys) {
+      // Brand-new bootstrap tables are not in 3.1.2 partitions.
+      if (SystemTable.isTableMetaTable(tableName) ||
+          SystemTable.isInternalKeyValueTable(tableName)) {
+        continue;
+      }
       final partitionIndex = tablePartitionMap[tableName]!;
+      tablesByPartition
+          .putIfAbsent(partitionIndex, () => <String>[])
+          .add(tableName);
+    }
+
+    for (final entry in tablesByPartition.entries) {
+      final partitionIndex = entry.key;
+      final tableNames = entry.value;
       final dirIndex = partitionToDir[partitionIndex] ??
           (partitionIndex ~/ _dataStore.maxEntriesPerDir);
       final partitionPath = _dataStore.pathManager
           .getSchemaPartitionFilePath(partitionIndex, dirIndex);
 
-      if (await _dataStore.storage.existsFile(partitionPath)) {
-        final content = await _dataStore.storage.readAsString(partitionPath);
-        if (content != null && content.isNotEmpty) {
-          try {
-            final json = jsonDecode(content) as Map<String, dynamic>;
-            final tableSchemas = json['tableSchemas'] as Map<String, dynamic>?;
-            if (tableSchemas != null && tableSchemas.containsKey(tableName)) {
-              final schemaJson =
-                  tableSchemas[tableName] as Map<String, dynamic>;
-              final schema = TableSchema.fromJson(schemaJson);
+      if (!await _dataStore.storage.existsFile(partitionPath)) {
+        continue;
+      }
+      final content = await _dataStore.storage.readAsString(partitionPath);
+      if (content == null || content.isEmpty) {
+        continue;
+      }
 
-              // Generate stable tableUid
-              final tableUid = TableUid(GlobalIdGenerator.generate("t"));
-              tableUidMap[tableName] = tableUid.value;
-              tableIsGlobalMap[tableName] = schema.isGlobal;
+      final partitionSnap = LegacySchemaPartitionJson.tryParse(content);
+      if (partitionSnap == null) {
+        continue;
+      }
+      final tableCreatedAt =
+          partitionSnap.createdAt ?? schemaMetaCreatedAt ?? DateTime.now();
 
-              // Generate autoIndexes and populate indexes with stable UIDs
-              var upgradedSchema = schema.generateAutoIndexes();
-              upgradedSchema = upgradedSchema.copyWith(
-                tableUid: tableUid,
-                schemaVersion:
-                    schema.schemaVersion ?? GlobalIdGenerator.generate("s"),
-              );
+      for (final tableName in tableNames) {
+        final schemaJson = partitionSnap.tableSchemas[tableName];
+        if (schemaJson == null) {
+          continue;
+        }
 
-              // Map generated indexUids for directory rename
-              final idxUidMap = <String, String>{};
-              for (final idx in upgradedSchema.getAllIndexes()) {
-                if (idx.indexUid.isNotEmpty) {
-                  idxUidMap[idx.actualIndexName] = idx.indexUid;
-                }
-              }
-              tableIndexUidMap[tableName] = idxUidMap;
+        try {
+          final schema = TableSchema.fromJson(schemaJson);
+          final tableUid = TableUid(GlobalIdGenerator.generate('t'));
+          tableUidMap[tableName] = tableUid.value;
+          tableIsGlobalMap[tableName] = schema.isGlobal;
 
-              final finalDirIndex = allocateDirIndex(schema.isGlobal);
-              tableDirIndexMap[tableName] = finalDirIndex;
+          final isSys = SystemTable.isSystemTable(tableName);
+          var upgradedSchema = schema.generateAutoIndexes();
+          upgradedSchema = upgradedSchema.copyWith(
+            tableUid: tableUid,
+            schemaVersion:
+                schema.schemaVersion ?? GlobalIdGenerator.generate('s'),
+            isSystemTable: isSys,
+          );
 
-              final tableCtx = TableContext(
-                tableUid: TableUid(tableUid),
-                tableName: TableName(tableName),
-                isGlobal: upgradedSchema.isGlobal,
-                dataDirIndex: finalDirIndex,
-                schema: upgradedSchema,
-              );
-
-              // Save the upgraded schema via the new schema manager
-              await _dataStore.tableMetaManager!.saveTableSchema(
-                tableCtx,
-                upgradedSchema,
-                dataDirIndex: finalDirIndex,
-              );
+          final idxUidMap = <String, String>{};
+          for (final idx in upgradedSchema.getAllIndexes()) {
+            if (idx.indexUid.isNotEmpty) {
+              idxUidMap[idx.actualIndexName] = idx.indexUid;
             }
-          } catch (e) {
-            Logger.error(
-                'Failed to upgrade schema for table $tableName in v3 upgrade',
-                rawError: e);
           }
+          tableIndexUidMap[tableName] = idxUidMap;
+
+          final finalDirIndex = allocateDirIndex(schema.isGlobal);
+          tableDirIndexMap[tableName] = finalDirIndex;
+
+          final layout =
+              schemaMgr.evolveFieldStorageLayout(nextSchema: upgradedSchema);
+          final now = DateTime.now();
+          await schemaMgr.saveTableMeta(
+            TableMeta(
+              tableUid: tableUid,
+              tableName: TableName(tableName),
+              isGlobal: upgradedSchema.isGlobal,
+              schema: upgradedSchema,
+              fieldLayout: layout,
+              dirIndex: finalDirIndex,
+              createdAt: tableCreatedAt,
+              updatedAt: now,
+            ),
+            dirIndex: finalDirIndex,
+            layoutOverride: layout,
+          );
+        } catch (e) {
+          Logger.error(
+              'Failed to upgrade schema for table $tableName in v3 upgrade',
+              rawError: e);
         }
       }
     }
+
+    // Dir high-water is folded into the single GlobalConfig write below.
+    final resolvedSystemHash = systemSchemaHash ??
+        TableSchema.generateSchemasHash(SystemTable.gettableSchemas);
 
     // 4. Move physical folders; migrate legacy meta.json → partition-0 page0.
     for (final tableName in tableUidMap.keys) {
@@ -339,19 +349,10 @@ class V3Upgrade {
               SpaceManifest(activeTableUids: spaceTableUids)));
     }
 
-    // Always lock pageSize from sampled legacy meta (or default).
-    // Version bump is deferred until after journal/txn migrations so a crash
-    // mid-upgrade can re-enter this path on next startup.
     final resolvedPageSize =
         _discoveredPageSize ?? InternalConfig.defaultPageSize;
-    if (!oldGlobalConfig.hasConfiguredPageSize) {
-      // Persist pageSize early without bumping version yet.
-      await _dataStore.saveGlobalConfig(
-        oldGlobalConfig.copyWith(pageSize: resolvedPageSize),
-      );
-    }
 
-    // 7. Delete old partition files and backup schema meta only after everything succeeds
+    // 7. Delete old partition files and schema_meta only after everything succeeds
     for (final partitionIndex in tablePartitionMap.values.toSet()) {
       final dirIndex = partitionToDir[partitionIndex] ??
           (partitionIndex ~/ _dataStore.maxEntriesPerDir);
@@ -362,6 +363,9 @@ class V3Upgrade {
       }
     }
 
+    if (await _dataStore.storage.existsFile(schemaMetaPath)) {
+      await _dataStore.storage.deleteFile(schemaMetaPath);
+    }
     if (await _dataStore.storage.existsFile(schemaMetaPathOld)) {
       await _dataStore.storage.deleteFile(schemaMetaPathOld);
     }
@@ -376,23 +380,50 @@ class V3Upgrade {
     // Must finish before version bump so crash mid-migration re-runs V3.
     await TransactionLogMigration(_dataStore).migrateAllSpaces(spaces);
 
-    // Version bump last — only after all durable format migrations succeed.
-    // When [skipVersionBump] (v2 path), version is bumped by the caller later.
+    // Single GlobalConfig write: schema hashes + pageSize + dir high-water + version.
+    var updatedGlobal = oldGlobalConfig.copyWith(
+      userSchemaHash: userSchemaHash,
+      systemSchemaHash: resolvedSystemHash,
+      pageSize: resolvedPageSize,
+      lastGlobalDirIndex: lastGlobalDirIndex,
+      lastGlobalDirEntries: lastGlobalDirEntries,
+      lastNonGlobalDirIndex: lastNonGlobalDirIndex,
+      lastNonGlobalDirEntries: lastNonGlobalDirEntries,
+    );
     if (!skipVersionBump) {
       for (final spaceName in spaces) {
         await _upgradeSpaceVersion(spaceName);
       }
-
-      final updatedGlobal =
-          oldGlobalConfig.setVersion(InternalConfig.engineVersion).copyWith(
-                pageSize: resolvedPageSize,
-              );
-      await _dataStore.saveGlobalConfig(updatedGlobal);
+      updatedGlobal = updatedGlobal.setVersion(InternalConfig.engineVersion);
     }
+    await _dataStore.saveGlobalConfig(updatedGlobal);
 
     Logger.info(
       'Database upgrade to version 3 completed',
     );
+  }
+
+  /// Create `_system_table_meta` + engine-internal KV (space + global).
+  Future<void> _ensureBootstrapSystemTables() async {
+    for (final schema in [
+      SystemTable.tableMetaTable(),
+      SystemTable.internalKVTable(false),
+      SystemTable.internalKVTable(true),
+    ]) {
+      if (await _dataStore.tableExists(schema.name)) continue;
+
+      final result = await _dataStore.createTable(schema, isSystemTable: true);
+      if (!result.hasErrors) continue;
+
+      final fatal = result.statuses
+          .where((s) =>
+              s.type != ResultType.success &&
+              s.type != ResultType.devSchemaTableExists)
+          .toList();
+      if (fatal.isNotEmpty) {
+        throw DbException(fatal);
+      }
+    }
   }
 
   /// Lift `BatchStart.tablePlan` from remnant A/B journals into
