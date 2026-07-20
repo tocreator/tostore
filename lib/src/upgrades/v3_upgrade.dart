@@ -29,7 +29,8 @@ import 'transaction_log_migration.dart';
 /// - Restructures storage directory names from physical table/index names to stable UIDs.
 /// - Reads legacy meta.json once, writes TableDataMeta/IndexMeta/NghIndexMeta into
 ///   partition-0 page0, then deletes the JSON files (no intermediate JSON rewrite).
-/// - Writes `space_manifest.bin` deferred space metadata.
+/// - Writes per-space [SpaceManifest] into `_system_internal_kv_store`
+///   (`isGlobal: false`, key [SpaceManifestCodec.internalKvKey]).
 /// - Migrates pending parallel-batch `tablePlan` out of A/B journal into WalMeta,
 ///   then deletes `journal_a.log` / `journal_b.log`.
 /// - Migrates legacy NDJSON transaction logs to binary ToTX.
@@ -320,7 +321,7 @@ class V3Upgrade {
       }
     }
 
-    // 5. Construct and write space_manifest.bin per space
+    // 5. Write SpaceManifest into each space's internal KV (isGlobal: false).
     for (final spaceName in spaces) {
       final spaceTableUids = <TableUid>[];
       final map = spaceTableDirMaps[spaceName];
@@ -339,14 +340,7 @@ class V3Upgrade {
           }
         }
       }
-      final manifestPath =
-          _dataStore.pathManager.getSpaceManifestPath(spaceName);
-      await _dataStore.storage
-          .ensureDirectoryExists(path.dirname(manifestPath));
-      await _dataStore.storage.writeAsBytes(
-          manifestPath,
-          SpaceManifestCodec.encode(
-              SpaceManifest(activeTableUids: spaceTableUids)));
+      await _writeSpaceManifest(spaceName, spaceTableUids);
     }
 
     final resolvedPageSize =
@@ -423,6 +417,51 @@ class V3Upgrade {
       if (fatal.isNotEmpty) {
         throw DbException(fatal);
       }
+    }
+  }
+
+  /// Persist [SpaceManifest] for [spaceName] via internal KV (`isGlobal: false`).
+  ///
+  /// Current space writes on the primary instance; other spaces use a short-lived
+  /// migration [DataStoreImpl] (skips version upgrades) so paths bind correctly.
+  Future<void> _writeSpaceManifest(
+    String spaceName,
+    List<TableUid> activeTableUids,
+  ) async {
+    if (spaceName == _dataStore.currentSpaceName) {
+      final mgr = _dataStore.tableMetaManager;
+      if (mgr != null) {
+        await mgr.replaceActiveTableUids(activeTableUids);
+      } else {
+        await _dataStore.internalKv.set(
+          SpaceManifestCodec.internalKvKey,
+          SpaceManifestCodec.encode(
+            SpaceManifest(activeTableUids: activeTableUids),
+          ),
+          isGlobal: false,
+        );
+      }
+      return;
+    }
+
+    final bytes = SpaceManifestCodec.encode(
+      SpaceManifest(activeTableUids: activeTableUids),
+    );
+    final temp = DataStoreImpl(
+      dbPath: _dataStore.config.dbPath,
+      dbName: _dataStore.config.dbName,
+      config: _dataStore.config.copyWith(spaceName: spaceName),
+      isMigrationInstance: true,
+    );
+    try {
+      await temp.initialize(applyActiveSpaceOnDefault: false);
+      await temp.internalKv.set(
+        SpaceManifestCodec.internalKvKey,
+        bytes,
+        isGlobal: false,
+      );
+    } finally {
+      await temp.close();
     }
   }
 
