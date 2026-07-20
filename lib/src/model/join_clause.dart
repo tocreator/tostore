@@ -1,5 +1,3 @@
-import 'table_identity.dart';
-
 /// Join types supported in the query
 enum JoinType {
   /// Inner join - only returns records that have matches in both tables
@@ -48,11 +46,11 @@ class JoinClause {
 
 /// Internal class to store pending foreign key join requests
 class PendingForeignKeyJoin {
-  final TableUid tableUid;
+  final String tableName;
   final JoinType type;
 
   PendingForeignKeyJoin({
-    required this.tableUid,
+    required this.tableName,
     required this.type,
   });
 }
