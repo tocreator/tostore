@@ -7292,8 +7292,7 @@ class DataStoreImpl {
     if (tableMetaManager == null) return false;
     final uid = await tableMetaManager!.getUidByName(TableName(tableName));
     if (uid == null) return false;
-    final active = await tableMetaManager!.getActiveUidsForSpace(
-      _currentSpaceName,
+    final active = await tableMetaManager!.getActiveUids(
       onlyUserTables: false,
     );
     return active.contains(uid);
@@ -7317,8 +7316,7 @@ class DataStoreImpl {
         config = await getSpaceConfig();
       }
 
-      final activeUids = await tableMetaManager?.getActiveUidsForSpace(
-            _currentSpaceName,
+      final activeUids = await tableMetaManager?.getActiveUids(
             onlyUserTables: true,
           ) ??
           [];
