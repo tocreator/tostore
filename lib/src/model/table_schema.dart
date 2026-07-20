@@ -293,6 +293,30 @@ class TableSchema {
 
   /// Dynamically generate implicit indexes and inherit indexUids from oldSchema if matches are found.
   TableSchema generateAutoIndexes({TableSchema? oldSchema}) {
+    final usedIndexUids = <String>{};
+
+    IndexUid nextUniqueIndexUid() {
+      const maxAttempts = 8;
+      for (var i = 0; i < maxAttempts; i++) {
+        final uid = IndexUid(GlobalIdGenerator.generate('i'));
+        if (uid.isEmpty) continue;
+        if (usedIndexUids.add(uid.value)) return uid;
+      }
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Failed to allocate a unique indexUid after $maxAttempts attempts',
+        ),
+      ]);
+    }
+
+    IndexUid claimOrAllocate(IndexUid existing) {
+      if (existing.isEmpty) return nextUniqueIndexUid();
+      if (usedIndexUids.add(existing.value)) return existing;
+      return nextUniqueIndexUid();
+    }
+
     final implicitIndexes = _computeRawImplicitIndexes();
     final List<IndexSchema> populatedAutoIndexes = [];
 
@@ -321,11 +345,9 @@ class TableSchema {
               implicit.copyWith(indexUid: matchedOldIdx.indexUid);
         }
       }
-      if (resolvedImplicit.indexUid.isEmpty) {
-        resolvedImplicit = resolvedImplicit.copyWith(
-          indexUid: IndexUid(GlobalIdGenerator.generate("i")),
-        );
-      }
+      resolvedImplicit = resolvedImplicit.copyWith(
+        indexUid: claimOrAllocate(resolvedImplicit.indexUid),
+      );
       populatedAutoIndexes.add(resolvedImplicit);
     }
 
@@ -355,11 +377,9 @@ class TableSchema {
               explicit.copyWith(indexUid: matchedOldIdx.indexUid);
         }
       }
-      if (resolvedExplicit.indexUid.isEmpty) {
-        resolvedExplicit = resolvedExplicit.copyWith(
-          indexUid: IndexUid(GlobalIdGenerator.generate("i")),
-        );
-      }
+      resolvedExplicit = resolvedExplicit.copyWith(
+        indexUid: claimOrAllocate(resolvedExplicit.indexUid),
+      );
       populatedExplicitIndexes.add(resolvedExplicit);
     }
 
