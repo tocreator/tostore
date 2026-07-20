@@ -53,19 +53,6 @@ class QueryExecutor {
     );
   }
 
-  TableContext _tableContextFromSchema(TableSchema schema,
-      [String? tableName]) {
-    final name = tableName ?? schema.name;
-    final uid = schema.tableUid.isNotEmpty ? schema.tableUid : name;
-    return TableContext(
-      tableUid: TableUid(uid),
-      tableName: TableName(name),
-      isGlobal: schema.isGlobal,
-      dataDirIndex: 0,
-      schema: schema,
-    );
-  }
-
   /// Execute query with optional cursor/keyset pagination.
   ///
   /// - When [cursor] is provided, cursor pagination is used (mutually exclusive with [offset]).
@@ -1455,52 +1442,42 @@ class QueryExecutor {
         rightKey.contains('.') ? rightKey.split('.').last : rightKey;
     List<Map<String, dynamic>> rightRecords;
 
+    // Real routing (dirIndex / isGlobal / uid) — never fabricate from schema alone.
+    TableContext rightTable;
+    try {
+      rightTable = await _dataStore.getTableContext(rightTableName);
+    } catch (_) {
+      return [];
+    }
+    final rightSchema = rightTable.schema;
+
     if (leftJoinKeys.isNotEmpty) {
       final rightTableCondition =
           QueryCondition().where(rightKeyName, 'IN', leftJoinKeys.toList());
-      final rightSchema = await _dataStore.tableMetaManager
-          ?.getTableSchemaByName(TableName(rightTableName));
-      if (rightSchema == null) {
-        return [];
-      }
       final rightMatcher = ConditionRecordMatcher.prepare(
           rightTableCondition, {rightTableName: rightSchema}, rightTableName);
       // Use optimizer + full single-table pipeline (with caches)
-      final rightPlan = await _dataStore.getQueryOptimizer()?.optimize(
-          _tableContextFromSchema(rightSchema, rightTableName),
-          rightTableCondition.build());
+      final rightPlan = await _dataStore
+          .getQueryOptimizer()
+          ?.optimize(rightTable, rightTableCondition.build());
       if (rightPlan == null) {
         return [];
       }
-      final rightPlanResult = await _executeQueryPlan(
-          rightPlan,
-          _tableContextFromSchema(rightSchema, rightTableName),
-          rightTableCondition,
-          {rightTableName: rightSchema},
-          rightMatcher,
+      final rightPlanResult = await _executeQueryPlan(rightPlan, rightTable,
+          rightTableCondition, {rightTableName: rightSchema}, rightMatcher,
           enableQueryCache: enableQueryCache,
           queryCacheExpiry: queryCacheExpiry);
       rightRecords = rightPlanResult.records;
     } else {
       // LEFT keys empty (e.g., RIGHT JOIN needs full right scan): route through normal pipeline
       final rightCondition = QueryCondition(); // full scan
-      final rightSchema = schemas[rightTableName] ??
-          await _dataStore.tableMetaManager
-              ?.getTableSchemaByName(TableName(rightTableName));
-      if (rightSchema == null) {
-        return [];
-      }
-      final rightPlan = await _dataStore.getQueryOptimizer()?.optimize(
-          _tableContextFromSchema(rightSchema, rightTableName),
-          rightCondition.build());
+      final rightPlan = await _dataStore
+          .getQueryOptimizer()
+          ?.optimize(rightTable, rightCondition.build());
       if (rightPlan != null) {
         // Use full pipeline (with overlay application)
-        final rightPlanResult = await _executeQueryPlan(
-            rightPlan,
-            _tableContextFromSchema(rightSchema, rightTableName),
-            rightCondition,
-            {rightTableName: rightSchema},
-            null,
+        final rightPlanResult = await _executeQueryPlan(rightPlan, rightTable,
+            rightCondition, {rightTableName: rightSchema}, null,
             enableQueryCache: enableQueryCache,
             limit: limit,
             offset: offset,
@@ -1510,11 +1487,10 @@ class QueryExecutor {
         // Fallback: perform raw scan then apply overlays manually
         final int localViewId = _dataStore.readViewManager.registerReadView();
         try {
-          final scanRes = await _performTableScan(
-              _tableContextFromSchema(rightSchema, rightTableName), null);
+          final scanRes = await _performTableScan(rightTable, null);
           rightRecords = scanRes.records;
           rightRecords = await _dataStore.tableDataManager.mergeConsistency(
-            _tableContextFromSchema(rightSchema, rightTableName),
+            rightTable,
             rightRecords,
           );
         } finally {
