@@ -122,7 +122,7 @@ class V2Upgrade {
         return;
       }
 
-      // Upgrade tables in this space (including global tables if requested)
+      // Upgrade all tables (globals gated by upgradeGlobal below)
       final tableNames =
           await migrationInstance.tableMetaManager?.listAllTables() ??
               const <String>[];
@@ -377,7 +377,8 @@ class V2Upgrade {
         'Starting table data upgrade for table: $tableName',
       );
 
-      final tableUid = db.tableMetaManager?.getUidByName(TableName(tableName));
+      final tableUid =
+          await db.tableMetaManager?.getUidByName(TableName(tableName));
       if (tableUid == null) {
         Logger.warn(
             'Table UID not found for table: $tableName, skipping data upgrade');
@@ -385,7 +386,7 @@ class V2Upgrade {
       }
 
       // Manually build old table data meta path (old format: main.dat)
-      final tablePath = _manualGetTablePath(db, tableName);
+      final tablePath = await _manualGetTablePath(db, tableName);
       final oldDataMetaPath = pathJoin(tablePath, 'data', 'main.dat');
 
       // Check if old data meta file exists
@@ -604,7 +605,7 @@ class V2Upgrade {
       final dirIndex = oldPartitionIndex ~/ db.maxEntriesPerDir;
 
       // Manually build old partition file path (old format: p{index}.dat)
-      final tablePath = _manualGetTablePath(db, tableName);
+      final tablePath = await _manualGetTablePath(db, tableName);
       final oldPartitionPath = pathJoin(tablePath, 'data', 'partitions',
           'dir_$dirIndex', 'p$oldPartitionIndex.dat');
 
@@ -674,8 +675,9 @@ class V2Upgrade {
     }
   }
 
-  String _manualGetTablePath(DataStoreImpl db, String tableName) {
-    final tableUid = db.tableMetaManager?.getUidByName(TableName(tableName));
+  Future<String> _manualGetTablePath(DataStoreImpl db, String tableName) async {
+    final tableUid =
+        await db.tableMetaManager?.getUidByName(TableName(tableName));
     if (tableUid == null) {
       throw DbException([
         SchemaValidationStatus(
@@ -688,19 +690,19 @@ class V2Upgrade {
     if (db.config.persistenceMode == PersistenceMode.memory) {
       return 'memory://${db.currentSpaceName}/tables/$tableUid';
     }
-    final route = db.tableMetaManager?.getRouteByUid(tableUid);
-    if (route == null) {
+    final meta = await db.tableMetaManager?.getTableMeta(tableUid);
+    if (meta == null) {
       throw DbException([
         SchemaValidationStatus(
           type: ResultType.devTableNotFound,
-          message: 'Route entry not found for table: $tableName',
+          message: 'Table meta not found for table: $tableName',
           tableName: tableName,
         )
       ]);
     }
-    final parentDir = route.isGlobal
+    final parentDir = meta.isGlobal
         ? db.pathManager.getGlobalPath()
         : db.pathManager.getSpacePath();
-    return pathJoin(parentDir, 'tables_${route.dataDirIndex}', tableUid);
+    return pathJoin(parentDir, 'tables_${meta.dirIndex}', tableUid);
   }
 }
