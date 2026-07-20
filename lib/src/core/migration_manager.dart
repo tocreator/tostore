@@ -4043,7 +4043,7 @@ class MigrationManager {
                     await schemaMgr.getUidByName(TableName(originalTableName));
                 final currentUid =
                     await schemaMgr.getUidByName(TableName(currentTableName));
-                final activeUids = await schemaMgr.getActiveUidsForSpace(space);
+                final activeUids = await schemaMgr.getActiveUids();
                 exists =
                     (originalUid != null && activeUids.contains(originalUid)) ||
                         (currentUid != null && activeUids.contains(currentUid));
