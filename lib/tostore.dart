@@ -1057,10 +1057,18 @@ class ToStore implements DataStoreInterface {
     return await _impl.getTableSchema(tableName);
   }
 
-  /// Get all table names in the current space.
+  /// Get table names.
+  ///
+  /// By default returns **all** tables in the database. Pass
+  /// [onlyCurrentSpace] for globals + tables active in the current space.
+  ///
+  /// [onlyCurrentSpace] 为 true 时，返回当前空间中已经使用的所有表，包括全局表。
   @override
-  Future<List<String>> getTableNames() async {
-    return await _impl.getTableNames();
+  Future<List<String>> getTableNames({bool onlyCurrentSpace = false}) async {
+    return await _impl.getTableNames(
+      onlyCurrentSpace: onlyCurrentSpace,
+      onlyUserTables: true,
+    );
   }
 
   /// Get table information including:
