@@ -5,8 +5,8 @@ import '../model/data_store_config.dart';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
-import 'binary_codec.dart';
 import 'chacha20_poly1305.dart';
+import 'tobf_file_codec.dart';
 
 /// Shared TOBF frame wrap/unwrap for GlobalConfig / SpaceConfig files.
 ///
@@ -17,11 +17,8 @@ import 'chacha20_poly1305.dart';
 abstract final class ConfigFileCodec {
   ConfigFileCodec._();
 
-  /// TOBF flags bit0: body is ChaCha20-Poly1305 ciphertext under ConfigVaultKey.
-  static const int flagEncrypted = 1 << 0;
-
   /// Soft DoS cap for config frames (configs are small).
-  static const int maxBodyBytes = 1 * 1024 * 1024;
+  static const int maxBodyBytes = TobfFileCodec.maxBodyBytesDefault;
 
   /// Engine-default vault passphrase (open-source obfuscation for metadata only).
   static const String _vaultPassphrase = 'ToStore.ConfigVault.v1.DefaultKey';
@@ -41,18 +38,16 @@ abstract final class ConfigFileCodec {
             aad: _vaultAad,
           )
         : payload;
-    return TOBFHeader.encodeFrame(
-      body,
-      flags: encrypt ? flagEncrypted : 0,
-    );
+    return TobfFileCodec.encodeFrame(body, encrypted: encrypt);
   }
 
   /// Decode a TOBF file frame into the inner field-tag payload.
   static Uint8List decodeFile(Uint8List frameBytes) {
-    final decoded = TOBFHeader.decodeFrameWithHeader(frameBytes,
-        maxBodyLimit: maxBodyBytes);
-    final encrypted = (decoded.header.flags & flagEncrypted) != 0;
-    if (!encrypted) return decoded.body;
+    final decoded = TobfFileCodec.decodeFrameWithHeader(
+      frameBytes,
+      maxBodyLimit: maxBodyBytes,
+    );
+    if (!TobfFileCodec.isEncrypted(decoded.header)) return decoded.body;
 
     // Copy out of the TOBF frame view: ChaCha20 assumes 4-byte-aligned offsets.
     final cipherBytes = Uint8List.fromList(decoded.body);
@@ -73,9 +68,6 @@ abstract final class ConfigFileCodec {
   }
 
   /// Whether [EncryptionScope.full] is active on the given config.
-  static bool shouldEncrypt(EncryptionConfig? encryptionConfig) {
-    if (encryptionConfig == null) return false;
-    if (encryptionConfig.encryptionType == EncryptionType.none) return false;
-    return encryptionConfig.encryptionScope == EncryptionScope.full;
-  }
+  static bool shouldEncrypt(EncryptionConfig? encryptionConfig) =>
+      TobfFileCodec.shouldEncryptFullScope(encryptionConfig);
 }
