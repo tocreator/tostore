@@ -35,7 +35,7 @@ final class SpaceManifestCodec {
     if (bytes.isEmpty) return SpaceManifest.empty;
 
     final r = BinaryReader(bytes);
-    final uids = <TableUid>[];
+    final uids = <TableUid>{};
     while (!r.isEOF) {
       final (fieldId, wireType) = r.readFieldTag();
       switch (fieldId) {

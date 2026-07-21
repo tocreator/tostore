@@ -323,7 +323,7 @@ class V3Upgrade {
 
     // 5. Write SpaceManifest into each space's internal KV (isGlobal: false).
     for (final spaceName in spaces) {
-      final spaceTableUids = <TableUid>[];
+      final spaceTableUids = <TableUid>{};
       final map = spaceTableDirMaps[spaceName];
       if (map != null) {
         for (final key in map.keys) {
@@ -426,7 +426,7 @@ class V3Upgrade {
   /// migration [DataStoreImpl] (skips version upgrades) so paths bind correctly.
   Future<void> _writeSpaceManifest(
     String spaceName,
-    List<TableUid> activeTableUids,
+    Set<TableUid> activeTableUids,
   ) async {
     if (spaceName == _dataStore.currentSpaceName) {
       final mgr = _dataStore.tableMetaManager;
