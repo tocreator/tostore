@@ -7,7 +7,6 @@ import '../core/data_store_impl.dart';
 import '../handler/logger.dart';
 import '../handler/txn_encoder.dart';
 import '../model/db_exception.dart';
-import '../model/global_config.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/table_identity.dart';
@@ -47,15 +46,6 @@ class TransactionLogMigration {
       }
     }
     if (firstError != null) throw firstError;
-  }
-
-  /// Residual entry for DBs whose engine version already matches but a prior
-  /// interrupted upgrade may have left NDJSON txn logs (idempotent).
-  Future<void> migrateResidualIfNeeded(GlobalConfig globalConfig) async {
-    final spaces = globalConfig.spaceNames.isNotEmpty
-        ? globalConfig.spaceNames.toList()
-        : <String>['default'];
-    await migrateAllSpaces(spaces);
   }
 
   Future<void> migrateSpace(String spaceName) async {
