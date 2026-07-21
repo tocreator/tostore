@@ -3203,9 +3203,12 @@ class IndexManager {
         final encodedKey = base64Encode(key);
         final existingOwner = seenInBatch[encodedKey];
         if (existingOwner != null && existingOwner != pk) {
+          final isPk = index.actualIndexName == 'pk' || index.indexUid == 'pk';
           throw DbException([
             ConstraintStatus(
-              type: ResultType.bizUniqueViolation,
+              type: isPk
+                  ? ResultType.bizPrimaryKeyViolation
+                  : ResultType.bizUniqueViolation,
               message:
                   'Unique index rebuild failed for ${table.tableName}.${index.actualIndexName}: duplicate key detected between pk=$existingOwner and pk=$pk',
               tableName: table.tableName,
@@ -3244,7 +3247,9 @@ class IndexManager {
         }
         throw DbException([
           ConstraintStatus(
-            type: ResultType.bizUniqueViolation,
+            type: index.actualIndexName == 'pk' || index.indexUid == 'pk'
+                ? ResultType.bizPrimaryKeyViolation
+                : ResultType.bizUniqueViolation,
             message:
                 'Unique index rebuild failed for ${table.tableName}.${index.actualIndexName}: duplicate key detected between pk=$existingOwner and pk=${owners[i]}',
             tableName: table.tableName,

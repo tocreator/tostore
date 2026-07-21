@@ -1,3 +1,4 @@
+import 'result_type.dart';
 import 'table_identity.dart';
 
 /// Standardized information about a unique constraint violation.
@@ -26,6 +27,14 @@ class UniqueViolation {
     this.existingPrimaryKey,
   });
 
+  /// Whether this violation is on the primary-key index (`pk`).
+  bool get isPrimaryKeyConflict => indexName == 'pk';
+
+  /// [ResultType] to surface on [DbResult] / [ConstraintStatus].
+  ResultType get constraintResultType => isPrimaryKeyConflict
+      ? ResultType.bizPrimaryKeyViolation
+      : ResultType.bizUniqueViolation;
+
   /// Returns a user-friendly message describing the violation,
   /// including the field names and the conflicting value.
   String get message {
@@ -34,6 +43,15 @@ class UniqueViolation {
 
     // Optional fields segment, only shown when we know the fields that participate in the constraint
     final String fieldsSegment = hasFields ? " ($fieldsStr)" : '';
+
+    if (isPrimaryKeyConflict) {
+      String msg =
+          "Primary key conflict on '$tableName'$fieldsSegment with value: $value";
+      if (existingPrimaryKey != null) {
+        msg += " (Existing PK: $existingPrimaryKey)";
+      }
+      return msg;
+    }
 
     String msg =
         "Unique constraint violation on '$tableName'$fieldsSegment with value: $value";

@@ -1698,7 +1698,7 @@ class DataStoreImpl {
           }
 
           return finish(DbResult.error(
-            type: ResultType.bizUniqueViolation,
+            type: e.constraintResultType,
             message: e.message,
             failedKeys: [recordId],
           ));
@@ -1776,7 +1776,7 @@ class DataStoreImpl {
         } catch (_) {}
 
         return finish(DbResult.error(
-          type: ResultType.bizUniqueViolation,
+          type: uniqueViolation.constraintResultType,
           message: uniqueViolation.message,
           failedKeys: [recordId],
         ));
@@ -2557,7 +2557,10 @@ class DataStoreImpl {
 
                 throw DbException([
                   ConstraintStatus(
-                    type: ResultType.bizUniqueViolation,
+                    type: conflictFields.length == 1 &&
+                            conflictFields.first == schema.primaryKey
+                        ? ResultType.bizPrimaryKeyViolation
+                        : ResultType.bizUniqueViolation,
                     message:
                         'Batch update would modify multiple records but unique key or primary key would be duplicated. '
                         'Conflicting fields: ${conflictFields.join(", ")}, Update values: ${conflictValues.map((v) => v.toString()).join(", ")}',
@@ -2884,7 +2887,7 @@ class DataStoreImpl {
                   continue;
                 }
                 return finish(DbResult.error(
-                  type: ResultType.bizUniqueViolation,
+                  type: e.constraintResultType,
                   message: e.message,
                   failedKeys: returnResultDetails ? [recordKey] : const [],
                 ));
@@ -2967,7 +2970,8 @@ class DataStoreImpl {
               continue;
             }
             return finish(DbResult.error(
-              type: ResultType.bizUniqueViolation,
+              type: uniqueViolation?.constraintResultType ??
+                  ResultType.bizUniqueViolation,
               message:
                   uniqueViolation?.message ?? 'Unique constraint violation',
               failedKeys: returnResultDetails ? [recordKey] : const [],
@@ -4411,13 +4415,14 @@ class DataStoreImpl {
                           originalIndex != -1 ? originalIndex + start : 0;
                       if (returnResultDetails) {
                         batchStatuses.add(ConstraintStatus(
-                          type: ResultType.bizUniqueViolation,
+                          type: vio.constraintResultType,
                           message: 'pk=$rid: [Disk Conflict] ${vio.message}',
                           tableName: tableName,
                           fields: vio.fields,
                           conflictingKeys: [vio.value],
                           index: effectiveIndex,
                           primaryKey: rid,
+                          constraintName: vio.indexName?.value,
                         ));
                         failedKeys.add(rid);
                       }
@@ -4759,7 +4764,7 @@ class DataStoreImpl {
                       // Flush pending successful records to avoid leaving reservations behind.
                       await flushBatch();
                       return finish(DbResult.error(
-                        type: ResultType.bizUniqueViolation,
+                        type: e.constraintResultType,
                         message: e.message,
                         failedKeys: returnResultDetails ? failedKeys : const [],
                       ));
@@ -5549,13 +5554,23 @@ class DataStoreImpl {
               final originalIndex =
                   records.indexWhere((r) => r[primaryKey]?.toString() == pkVal);
               final globalIndex = originalIndex != -1 ? originalIndex : 0;
+              final violationType = e is UniqueViolation
+                  ? e.constraintResultType
+                  : ResultType.bizUniqueViolation;
+              final violationMessage = e is UniqueViolation
+                  ? e.message
+                  : 'Unique reservation failed for $pkVal: $e';
               if (returnResultDetails) {
                 batchStatuses.add(ConstraintStatus(
-                  type: ResultType.bizUniqueViolation,
-                  message: 'Unique reservation failed for $pkVal: $e',
+                  type: violationType,
+                  message: violationMessage,
                   tableName: tableName,
                   index: globalIndex,
                   primaryKey: pkVal,
+                  constraintName:
+                      e is UniqueViolation ? e.indexName?.value : null,
+                  fields: e is UniqueViolation ? e.fields : const [],
+                  conflictingKeys: e is UniqueViolation ? [e.value] : const [],
                 ));
               }
               if (!allowPartialErrors) {
@@ -5570,8 +5585,8 @@ class DataStoreImpl {
                   } catch (_) {}
                 }
                 return finish(DbResult.error(
-                  type: ResultType.bizUniqueViolation,
-                  message: 'Unique reservation failed for $pkVal: $e',
+                  type: violationType,
+                  message: violationMessage,
                   failedKeys: returnResultDetails ? failedKeys : const [],
                   statuses: returnResultDetails ? batchStatuses : const [],
                 ));
@@ -5621,14 +5636,14 @@ class DataStoreImpl {
             final globalIndex = originalIndex != -1 ? originalIndex : 0;
             if (returnResultDetails) {
               batchStatuses.add(ConstraintStatus(
-                type: ResultType.bizUniqueViolation,
-                message:
-                    'Unique constraint violation on ${violation.fields.join(', ')}: ${violation.value}',
+                type: violation.constraintResultType,
+                message: violation.message,
                 tableName: tableName,
                 fields: violation.fields,
                 conflictingKeys: [violation.value],
                 index: globalIndex,
                 primaryKey: pkVal,
+                constraintName: violation.indexName?.value,
               ));
             }
             // Rollback reservation for this specific record on disk conflict
@@ -5654,9 +5669,8 @@ class DataStoreImpl {
                 } catch (_) {}
               }
               return finish(DbResult.error(
-                type: ResultType.bizUniqueViolation,
-                message:
-                    'Unique constraint violation on ${violation.fields.join(', ')}: ${violation.value}',
+                type: violation.constraintResultType,
+                message: violation.message,
                 failedKeys: returnResultDetails ? failedKeys : const [],
                 statuses: returnResultDetails ? batchStatuses : const [],
               ));

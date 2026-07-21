@@ -4,7 +4,6 @@ import 'dart:math';
 import '../handler/logger.dart';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
-import '../model/result_type.dart';
 import '../model/background_write_entry.dart';
 import '../model/migration_write_mode.dart';
 import '../model/background_write_type.dart';
@@ -601,10 +600,10 @@ class LargeOperationRunner {
                 if (violation != null) {
                   throw DbException([
                     ConstraintStatus(
-                      type: ResultType.bizUniqueViolation,
+                      type: violation.constraintResultType,
                       message: violation.message,
                       tableName: table.tableName,
-                      constraintName: violation.indexName,
+                      constraintName: violation.indexName?.value,
                       fields: violation.fields,
                       conflictingKeys: [violation.value],
                       primaryKey: pkValueStr,
@@ -675,10 +674,10 @@ class LargeOperationRunner {
                   if (violation != null) {
                     throw DbException([
                       ConstraintStatus(
-                        type: ResultType.bizUniqueViolation,
+                        type: violation.constraintResultType,
                         message: violation.message,
                         tableName: table.tableName,
-                        constraintName: violation.indexName,
+                        constraintName: violation.indexName?.value,
                         fields: violation.fields,
                         conflictingKeys: [violation.value],
                         primaryKey: newPkVal,

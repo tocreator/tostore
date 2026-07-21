@@ -480,13 +480,11 @@ class TableMetaManager {
     if (!onlyUserTables) return out;
 
     // Inventory is ready — filter by name without per-uid async meta loads.
-    return out
-        .where((uid) {
-          final name = _nameByUid[uid];
-          if (name == null) return true;
-          return !SystemTable.isSystemTable(name.value);
-        })
-        .toList(growable: false);
+    return out.where((uid) {
+      final name = _nameByUid[uid];
+      if (name == null) return true;
+      return !SystemTable.isSystemTable(name.value);
+    }).toList(growable: false);
   }
 
   /// Wait for the startup name inventory (joins the existing single-flight
@@ -1732,8 +1730,9 @@ class TableMetaManager {
     return false;
   }
 
-  /// Upsert system-table row; on PK conflict (create only) reallocate tableUid
-  /// and retry. Unique/name conflicts and other errors are not retried.
+  /// Persist system-table row. Create uses [insert] so PK/name collisions
+  /// surface as errors (upsert would rewrite an existing row). Update uses
+  /// [upsert]. On create PK conflict only, reallocate tableUid and retry.
   Future<TableMeta> _persistTableMetaRowWithUidRetry(
     TableMeta saved, {
     required bool allowUidRealloc,
@@ -1744,6 +1743,10 @@ class TableMetaManager {
     for (var attempt = 0; attempt < maxAttempts; attempt++) {
       final row = TableMetaCodec.encodeRow(current);
       final result = await TransactionContext.runAsSystemOperation(() async {
+        if (allowUidRealloc) {
+          // Create: insert must fail on colliding table_uid / table_name.
+          return await _dataStore.insert(SystemTable.tableMetaName, row);
+        }
         return await _dataStore.upsert(SystemTable.tableMetaName, row);
       });
 
