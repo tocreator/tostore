@@ -140,7 +140,7 @@ class KeyManager {
 
   /// Rotate the master [encryptionKey] that wraps stored [encodingKey] blobs.
   ///
-  /// Re-wraps `space_config.json` in every space: decrypt with [oldKey], encrypt with [newKey].
+  /// Re-wraps space config in every space: decrypt with [oldKey], encrypt with [newKey].
   /// Does not rewrite table data. Updates in-memory config to [newKey].
   Future<DbResult> rotateEncryptionKey({
     required String oldKey,
