@@ -10,10 +10,14 @@ import '../Interface/kv_store.dart';
 import '../Interface/noop_storage_impl.dart';
 import '../Interface/status_provider.dart';
 import '../handler/common.dart';
+import '../handler/config_file_codec.dart';
+import '../handler/global_config_codec.dart';
 import '../handler/logger.dart';
 import '../handler/parallel_processor.dart';
 import '../handler/platform_handler.dart';
+import '../handler/space_config_codec.dart';
 import '../handler/value_matcher.dart';
+import '../upgrades/legacy_model/legacy_config_bootstrap.dart';
 import '../model/backup_scope.dart';
 import '../model/buffer_entry.dart';
 import '../model/cancellation_token.dart';
@@ -191,7 +195,7 @@ class DataStoreImpl {
     return _pathManager!;
   }
 
-  /// Engine-managed directory sharding parameter (persisted in `global_config.json`).
+  /// Engine-managed directory sharding parameter (persisted in `global_config.tobf`).
   ///
   /// Used for deterministic sharding: `dirIndex = pIndex ~/ maxEntriesPerDir`.
   int get maxEntriesPerDir => (_globalConfigCache?.maxEntriesPerDir ??
@@ -479,7 +483,7 @@ class DataStoreImpl {
     });
   }
 
-  // Helper method to load the space configuration from the space_config.json file and update the cache
+  // Helper method to load the space configuration from space_config.tobf and update the cache
   Future<SpaceConfig?> getSpaceConfig({
     bool nowGetFromFile = false,
     String? spaceName,
@@ -494,24 +498,38 @@ class DataStoreImpl {
         pathManager.getSpaceConfigPath(spaceName: resolvedSpaceName);
 
     try {
-      final content = await storage.readAsString(spaceFilePath) ?? "";
-      if (content.isEmpty) {
-        // Only auto-create for the current space; callers reading another space
-        // should not implicitly mutate that space.
-        if (_keyManager != null && shouldUseCurrentCache) {
-          final spaceConfig = await _keyManager!.createKeySpaceConfig();
-          await saveSpaceConfigToFile(spaceConfig);
-          return spaceConfig;
+      if (await storage.existsFile(spaceFilePath)) {
+        final bytes = await storage.readAsBytes(spaceFilePath);
+        if (bytes.isNotEmpty) {
+          final parsed = SpaceConfigCodec.decodeFile(bytes);
+          if (shouldUseCurrentCache) {
+            _spaceConfigCache = parsed;
+          }
+          return parsed;
         }
-        return null;
       }
 
-      final parsed =
-          SpaceConfig.fromJson(jsonDecode(content) as Map<String, dynamic>);
-      if (shouldUseCurrentCache) {
-        _spaceConfigCache = parsed;
+      // Pre-v3: read JSON into memory only — do NOT write TOBF or delete JSON.
+      // `tableDirectoryMap` must remain on disk until V3Upgrade consumes it.
+      final legacy = await LegacyConfigBootstrap.readSpaceConfig(
+        this,
+        spaceName: resolvedSpaceName,
+      );
+      if (legacy != null) {
+        if (shouldUseCurrentCache) {
+          _spaceConfigCache = legacy;
+        }
+        return legacy;
       }
-      return parsed;
+
+      // Only auto-create for the current space; callers reading another space
+      // should not implicitly mutate that space.
+      if (_keyManager != null && shouldUseCurrentCache) {
+        final spaceConfig = await _keyManager!.createKeySpaceConfig();
+        await saveSpaceConfigToFile(spaceConfig);
+        return spaceConfig;
+      }
+      return null;
     } catch (e) {
       Logger.error('Failed to parse init config', rawError: e);
       return null;
@@ -529,8 +547,9 @@ class DataStoreImpl {
       final spaceFilePath =
           pathManager.getSpaceConfigPath(spaceName: resolvedSpaceName);
 
-      final content = jsonEncode(config.toJson());
-      await storage.writeAsString(spaceFilePath, content);
+      final encrypt = ConfigFileCodec.shouldEncrypt(_config?.encryptionConfig);
+      final bytes = SpaceConfigCodec.encodeFile(config, encrypt: encrypt);
+      await storage.writeAsBytes(spaceFilePath, bytes);
       if (resolvedSpaceName == _currentSpaceName) {
         _spaceConfigCache = config;
       }
@@ -7221,20 +7240,23 @@ class DataStoreImpl {
 
       final configPath = pathManager.getGlobalConfigPath();
 
-      if (!await storage.existsFile(configPath)) {
-        return null;
+      if (await storage.existsFile(configPath)) {
+        final bytes = await storage.readAsBytes(configPath);
+        if (bytes.isEmpty) return null;
+
+        final config = GlobalConfigCodec.decodeFile(bytes);
+        _globalConfigCache = config;
+        return config;
       }
 
-      final content = await storage.readAsString(configPath);
-      if (content == null || content.isEmpty) return null;
-
-      final config =
-          GlobalConfig.fromJson(jsonDecode(content) as Map<String, dynamic>);
-
-      // Update cache
-      _globalConfigCache = config;
-
-      return config;
+      // Pre-v3: read JSON into memory only — do NOT write TOBF or delete JSON.
+      // `tableDirectoryMap` must remain on disk until V3Upgrade consumes it.
+      final legacy = await LegacyConfigBootstrap.readGlobalConfig(this);
+      if (legacy != null) {
+        _globalConfigCache = legacy;
+        return legacy;
+      }
+      return null;
     } catch (e) {
       Logger.error('Failed to get global config', rawError: e);
       return null;
@@ -7254,9 +7276,9 @@ class DataStoreImpl {
         path.dirname(configPath),
       );
 
-      // Serialize and save
-      final content = jsonEncode(config.toJson());
-      await storage.writeAsString(configPath, content);
+      final encrypt = ConfigFileCodec.shouldEncrypt(_config?.encryptionConfig);
+      final bytes = GlobalConfigCodec.encodeFile(config, encrypt: encrypt);
+      await storage.writeAsBytes(configPath, bytes);
     } catch (e) {
       Logger.error('Failed to save global config', rawError: e);
     }
