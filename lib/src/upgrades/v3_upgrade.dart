@@ -19,6 +19,8 @@ import '../model/ngh_index_meta.dart';
 import '../handler/space_manifest_codec.dart';
 import '../model/space_manifest.dart';
 import '../model/id_generator.dart';
+import 'config_format_migration.dart';
+import 'legacy_model/legacy_config_bootstrap.dart';
 import 'legacy_model/legacy_schema_json.dart';
 import 'transaction_log_migration.dart';
 
@@ -92,15 +94,10 @@ class V3Upgrade {
     // Bootstrap only brand-new engine tables (not present in 3.1.2).
     await _ensureBootstrapSystemTables();
 
-    // 2. Read legacy global config mapping
-    final globalConfigPath = _dataStore.pathManager.getGlobalConfigPath();
-    Map<String, dynamic>? globalJson;
-    if (await _dataStore.storage.existsFile(globalConfigPath)) {
-      final content = await _dataStore.storage.readAsString(globalConfigPath);
-      if (content != null && content.isNotEmpty) {
-        globalJson = jsonDecode(content) as Map<String, dynamic>?;
-      }
-    }
+    // 2. Read legacy JSON config mappings (must stay on disk until finalize).
+    // Hot-path GlobalConfig model no longer carries tableDirectoryMap — read raw JSON.
+    final globalJson =
+        await LegacyConfigBootstrap.readGlobalJsonMap(_dataStore);
     final globalTableDirMap = globalJson != null
         ? (globalJson['tableDirectoryMap'] as Map<String, dynamic>?)
         : null;
@@ -112,17 +109,13 @@ class V3Upgrade {
     // Read legacy space configs directory mappings
     final spaceTableDirMaps = <String, Map<String, dynamic>>{};
     for (final spaceName in spaces) {
-      final spaceConfigPath =
-          _dataStore.pathManager.getSpaceConfigPath(spaceName: spaceName);
-      if (await _dataStore.storage.existsFile(spaceConfigPath)) {
-        final content = await _dataStore.storage.readAsString(spaceConfigPath);
-        if (content != null && content.isNotEmpty) {
-          final spaceJson = jsonDecode(content) as Map<String, dynamic>;
-          if (spaceJson.containsKey('tableDirectoryMap')) {
-            spaceTableDirMaps[spaceName] =
-                spaceJson['tableDirectoryMap'] as Map<String, dynamic>;
-          }
-        }
+      final spaceJson = await LegacyConfigBootstrap.readSpaceJsonMap(
+        _dataStore,
+        spaceName: spaceName,
+      );
+      if (spaceJson != null && spaceJson.containsKey('tableDirectoryMap')) {
+        spaceTableDirMaps[spaceName] =
+            spaceJson['tableDirectoryMap'] as Map<String, dynamic>;
       }
     }
 
@@ -391,6 +384,13 @@ class V3Upgrade {
       updatedGlobal = updatedGlobal.setVersion(InternalConfig.engineVersion);
     }
     await _dataStore.saveGlobalConfig(updatedGlobal);
+
+    // After tableDirectoryMap has been consumed: ensure TOBF on disk, then
+    // delete legacy JSON. Must not run earlier or maps are permanently lost.
+    await ConfigFormatMigration.finalizeTobfAndDeleteJson(
+      _dataStore,
+      spaceNames: spaces,
+    );
 
     Logger.info(
       'Database upgrade to version 3 completed',
