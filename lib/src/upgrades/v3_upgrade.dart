@@ -20,8 +20,7 @@ import '../handler/space_manifest_codec.dart';
 import '../model/space_manifest.dart';
 import '../model/id_generator.dart';
 import 'config_format_migration.dart';
-import 'legacy_model/legacy_config_bootstrap.dart';
-import 'legacy_model/legacy_schema_json.dart';
+import 'legacy_model/pre_v3.dart';
 import 'transaction_log_migration.dart';
 
 /// Version 3 upgrade:
