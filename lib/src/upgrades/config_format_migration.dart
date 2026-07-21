@@ -1,6 +1,6 @@
 import '../core/data_store_impl.dart';
 import '../handler/logger.dart';
-import 'legacy_model/legacy_config_bootstrap.dart';
+import 'legacy_model/pre_v3.dart';
 
 /// Finalize GlobalConfig / SpaceConfig TOBF files and delete legacy JSON.
 ///
