@@ -175,8 +175,11 @@ class BinaryReader {
   /// Current cursor position.
   int get position => _pos;
 
-  /// Check if Reader has reached EOF.
-  bool get isEOF => _pos >= _buf.length;
+  /// Check if Reader has reached EOF (or the current nested message limit).
+  bool get isEOF {
+    if (_limits.isNotEmpty) return _pos >= _limits.last;
+    return _pos >= _buf.length;
+  }
 
   /// Safely positions the reading cursor, checking boundary limits.
   void positionTo(int newPos) {
@@ -541,6 +544,14 @@ class TOBFHeader {
   /// Safely resolves future header extensions using headerLen forward seek,
   /// and performs checksum validation with DoS protection.
   static Uint8List decodeFrame(Uint8List frameBytes, {int? maxBodyLimit}) {
+    return decodeFrameWithHeader(frameBytes, maxBodyLimit: maxBodyLimit).body;
+  }
+
+  /// Same as [decodeFrame] but also returns the parsed header (e.g. for flags).
+  static ({TOBFHeader header, Uint8List body}) decodeFrameWithHeader(
+    Uint8List frameBytes, {
+    int? maxBodyLimit,
+  }) {
     if (frameBytes.length < length) {
       throw DbException([
         GeneralStatus(
@@ -583,7 +594,7 @@ class TOBFHeader {
       ]);
     }
 
-    return body;
+    return (header: header, body: body);
   }
 }
 
