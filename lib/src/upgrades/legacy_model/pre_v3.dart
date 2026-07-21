@@ -127,7 +127,11 @@ final class LegacyGlobalConfigJson {
   static GlobalConfig? tryParse(String content) {
     final map = tryParseMap(content);
     if (map == null) return null;
-    return fromMap(map);
+    try {
+      return fromMap(map);
+    } catch (_) {
+      return null;
+    }
   }
 
   /// Raw map so V3 can read `tableDirectoryMap` (dropped from the live model).
@@ -179,7 +183,11 @@ final class LegacySpaceConfigJson {
   static SpaceConfig? tryParse(String content) {
     final map = tryParseMap(content);
     if (map == null) return null;
-    return fromMap(map);
+    try {
+      return fromMap(map);
+    } catch (_) {
+      return null;
+    }
   }
 
   /// Raw map so V3 can read `tableDirectoryMap` (dropped from the live model).

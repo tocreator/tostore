@@ -264,10 +264,8 @@ class V3Upgrade {
         // Move global table directory
         int? oldGlobalDirIndex;
         if (globalTableDirMap != null) {
-          final entry = globalTableDirMap['global:$tableName'];
-          if (entry is Map<String, dynamic>) {
-            oldGlobalDirIndex = entry['dirIndex'] as int?;
-          }
+          oldGlobalDirIndex =
+              _legacyDirIndex(globalTableDirMap['global:$tableName']);
         }
         final actualOldGlobalDirIndex = oldGlobalDirIndex ?? 0;
 
@@ -286,10 +284,8 @@ class V3Upgrade {
           final spaceTableDirMap = spaceTableDirMaps[spaceName];
           int? oldSpaceDirIndex;
           if (spaceTableDirMap != null) {
-            final entry = spaceTableDirMap['$spaceName:$tableName'];
-            if (entry is Map<String, dynamic>) {
-              oldSpaceDirIndex = entry['dirIndex'] as int?;
-            }
+            oldSpaceDirIndex =
+                _legacyDirIndex(spaceTableDirMap['$spaceName:$tableName']);
           }
           final actualOldDirIndex = oldSpaceDirIndex ?? 0;
 
@@ -382,7 +378,10 @@ class V3Upgrade {
       }
       updatedGlobal = updatedGlobal.setVersion(InternalConfig.engineVersion);
     }
-    await _dataStore.saveGlobalConfig(updatedGlobal);
+    await _dataStore.saveGlobalConfig(
+      updatedGlobal,
+      propagateErrors: true,
+    );
 
     // After tableDirectoryMap has been consumed: ensure TOBF on disk, then
     // delete legacy JSON. Must not run earlier or maps are permanently lost.
@@ -956,10 +955,25 @@ class V3Upgrade {
       await _dataStore.saveSpaceConfigToFile(
         config.copyWith(version: InternalConfig.engineVersion),
         spaceName: spaceName,
+        propagateErrors: true,
       );
     } catch (e) {
       Logger.warn('Skip upgrading space [$spaceName] config to v3',
           rawError: e);
+      rethrow;
     }
+  }
+
+  /// Parse `TableDirectoryInfo.dirIndex` from legacy JSON map values.
+  ///
+  /// jsonDecode nested maps are often `Map<dynamic, dynamic>`, so a strict
+  /// `is Map<String, dynamic>` check would miss valid entries and fall back
+  /// to dirIndex 0 — looking up the wrong table directory.
+  static int? _legacyDirIndex(dynamic entry) {
+    if (entry is! Map) return null;
+    final raw = entry['dirIndex'];
+    if (raw is int) return raw;
+    if (raw is num) return raw.toInt();
+    return null;
   }
 }

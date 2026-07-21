@@ -549,6 +549,7 @@ class DataStoreImpl {
 
       final encrypt = ConfigFileCodec.shouldEncrypt(_config?.encryptionConfig);
       final bytes = SpaceConfigCodec.encodeFile(config, encrypt: encrypt);
+      await storage.ensureDirectoryExists(path.dirname(spaceFilePath));
       await storage.writeAsBytes(spaceFilePath, bytes);
       if (resolvedSpaceName == _currentSpaceName) {
         _spaceConfigCache = config;
@@ -7264,14 +7265,18 @@ class DataStoreImpl {
   }
 
   /// Save global configuration
-  Future<void> saveGlobalConfig(GlobalConfig config) async {
+  ///
+  /// When [propagateErrors] is true, failures are rethrown (required for v3
+  /// finalize so legacy JSON is never deleted after a failed TOBF write).
+  Future<void> saveGlobalConfig(
+    GlobalConfig config, {
+    bool propagateErrors = false,
+  }) async {
     try {
-      // Update memory cache
-      _globalConfigCache = config;
-
+      // Update memory cache only after successful disk write when propagating,
+      // so a failed upgrade write cannot leave cache ahead of durable state.
       final configPath = pathManager.getGlobalConfigPath();
 
-      // Ensure directory exists
       await storage.ensureDirectoryExists(
         path.dirname(configPath),
       );
@@ -7279,8 +7284,10 @@ class DataStoreImpl {
       final encrypt = ConfigFileCodec.shouldEncrypt(_config?.encryptionConfig);
       final bytes = GlobalConfigCodec.encodeFile(config, encrypt: encrypt);
       await storage.writeAsBytes(configPath, bytes);
+      _globalConfigCache = config;
     } catch (e) {
       Logger.error('Failed to save global config', rawError: e);
+      if (propagateErrors) rethrow;
     }
   }
 

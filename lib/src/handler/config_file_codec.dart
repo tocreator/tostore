@@ -74,6 +74,8 @@ abstract final class ConfigFileCodec {
 
   /// Whether [EncryptionScope.full] is active on the given config.
   static bool shouldEncrypt(EncryptionConfig? encryptionConfig) {
-    return encryptionConfig?.encryptionScope == EncryptionScope.full;
+    if (encryptionConfig == null) return false;
+    if (encryptionConfig.encryptionType == EncryptionType.none) return false;
+    return encryptionConfig.encryptionScope == EncryptionScope.full;
   }
 }
