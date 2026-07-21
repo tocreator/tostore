@@ -1,12 +1,12 @@
 import 'dart:async';
 import 'dart:collection';
-import 'dart:convert';
 import 'dart:typed_data';
 
 import '../handler/encryption.dart';
 import '../handler/logger.dart';
 import '../handler/platform_handler.dart';
 import '../handler/wal_encoder.dart';
+import '../handler/wal_meta_codec.dart';
 import '../model/data_store_config.dart';
 import '../model/meta_info.dart';
 import '../model/parallel_journal_entry.dart';
@@ -669,12 +669,13 @@ class WalManager {
         WalMeta? loaded;
         bool recoveredFromBackup = false;
 
-        // 1) Try primary WAL meta
+        // 1) Try primary WAL meta (.tobf)
         try {
-          final content = await _dataStore.storage.readAsString(metaPath);
-          if (content != null && content.isNotEmpty) {
-            final jsonMap = jsonDecode(content) as Map<String, dynamic>;
-            loaded = WalMeta.fromJson(jsonMap);
+          if (await _dataStore.storage.existsFile(metaPath)) {
+            final bytes = await _dataStore.storage.readAsBytes(metaPath);
+            if (bytes.isNotEmpty) {
+              loaded = WalMetaCodec.decodeFile(bytes);
+            }
           }
         } catch (e) {
           // Primary meta is corrupted or unreadable; fallback to backup.
@@ -685,13 +686,14 @@ class WalManager {
         // 2) Fallback to backup WAL meta if primary failed
         if (loaded == null) {
           try {
-            final content = await _dataStore.storage.readAsString(backupPath);
-            if (content != null && content.isNotEmpty) {
-              final jsonMap = jsonDecode(content) as Map<String, dynamic>;
-              loaded = WalMeta.fromJson(jsonMap);
-              recoveredFromBackup = true;
-              Logger.warn(
-                  'Recovered WAL meta from backup after primary failure.');
+            if (await _dataStore.storage.existsFile(backupPath)) {
+              final bytes = await _dataStore.storage.readAsBytes(backupPath);
+              if (bytes.isNotEmpty) {
+                loaded = WalMetaCodec.decodeFile(bytes);
+                recoveredFromBackup = true;
+                Logger.warn(
+                    'Recovered WAL meta from backup after primary failure.');
+              }
             }
           } catch (e) {
             Logger.error('Backup WAL meta is also invalid.', rawError: e);
@@ -1605,8 +1607,11 @@ class WalManager {
           }
         }
 
-        final jsonStr = jsonEncode(_meta.toJson());
-        await _dataStore.storage.writeAsString(metaPath, jsonStr, flush: flush);
+        final bytes = WalMetaCodec.encodeFile(
+          _meta,
+          encryptionConfig: _dataStore.config.encryptionConfig,
+        );
+        await _dataStore.storage.writeAsBytes(metaPath, bytes, flush: flush);
       } catch (e) {
         // Log the full error with stack trace for debugging
         Logger.error('Failed to persist WAL meta', rawError: e);
