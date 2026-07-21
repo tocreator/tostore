@@ -64,6 +64,7 @@ class SpaceConfig {
             : null);
   }
 
+  /// Legacy JSON map helper. On-disk persistence uses [SpaceConfigCodec] (TOBF).
   Map<String, dynamic> toJson() {
     return {
       'current': current.toJson(),
