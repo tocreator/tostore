@@ -2,15 +2,13 @@ import '../core/data_store_impl.dart';
 import '../handler/common.dart';
 import '../handler/logger.dart';
 import '../model/db_exception.dart';
-import '../model/global_config.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
-import 'transaction_log_migration.dart';
 import 'v2_upgrade.dart';
 import 'v3_upgrade.dart';
 
 /// Manage database major version upgrades (GlobalConfig/SpaceConfig/table data).
-/// Each major upgrade should be implemented in separate files under version_upgrades/
+/// Each major upgrade should be implemented in separate files under upgrades/
 /// to avoid polluting business logic and keep upgrade logic organized.
 class VersionUpgradeManager {
   final DataStoreImpl _dataStore;
@@ -31,7 +29,7 @@ class VersionUpgradeManager {
 
       // 1. Handle Downgrade: Current engine is older than the database.
       if (currentVersion > engineVersion) {
-        // The database was created or upgraded by a newer version of ToStore.
+        // The database was created or upgraded by a newer version of the engine.
         // Opening it with an older engine may lead to data corruption or crashes
         // because the older engine doesn't understand the newer file formats or metadata.
         throw DbException([
@@ -48,9 +46,7 @@ class VersionUpgradeManager {
 
       // 2. Handle Up-to-date: Version matches exactly.
       // Still run residual idempotent migrations in case an older build bumped
-      // the version before finishing format rewrites (e.g. txn NDJSON→binary).
       if (currentVersion == engineVersion) {
-        await _runResidualMigrations(globalConfig);
         return;
       }
 
@@ -59,7 +55,6 @@ class VersionUpgradeManager {
         'Database version upgrade required: v$currentVersion -> v$engineVersion',
       );
 
-      // Route to specific version upgrade handlers
       if (currentVersion < 2 && engineVersion >= 2) {
         final v2Upgrade = V2Upgrade(_dataStore);
         await v2Upgrade.execute(globalConfig);
@@ -72,21 +67,6 @@ class VersionUpgradeManager {
 
       Logger.critical('Database version upgrade failed', rawError: e);
       rethrow;
-    }
-  }
-
-  /// Idempotent post-version-match cleanup for interrupted format migrations.
-  Future<void> _runResidualMigrations(GlobalConfig globalConfig) async {
-    try {
-      await TransactionLogMigration(_dataStore)
-          .migrateResidualIfNeeded(globalConfig);
-    } catch (e) {
-      // Do not block DB open forever on residual cleanup; log and continue.
-      // Leftover NDJSON is retried next startup (idempotent).
-      Logger.warn(
-        'Residual transaction log migration failed',
-        rawError: e,
-      );
     }
   }
 }
