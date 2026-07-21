@@ -17,7 +17,7 @@ import '../handler/parallel_processor.dart';
 import '../handler/platform_handler.dart';
 import '../handler/space_config_codec.dart';
 import '../handler/value_matcher.dart';
-import '../upgrades/legacy_model/legacy_config_bootstrap.dart';
+import '../upgrades/legacy_model/pre_v3.dart';
 import '../model/backup_scope.dart';
 import '../model/buffer_entry.dart';
 import '../model/cancellation_token.dart';
