@@ -81,7 +81,7 @@ class GlobalConfig {
   /// True when [pageSize] was persisted (legacy files may have 0 until v3).
   bool get hasConfiguredPageSize => pageSize > 0;
 
-  /// create from json
+  /// create from json (legacy / tooling). On-disk persistence uses GlobalConfigCodec.
   factory GlobalConfig.fromJson(Map<String, dynamic> json) {
     final rawPageSize = json['pageSize'];
     return GlobalConfig(
@@ -111,7 +111,7 @@ class GlobalConfig {
     );
   }
 
-  /// convert to json
+  /// convert to json (legacy / tooling). On-disk persistence uses GlobalConfigCodec.
   Map<String, dynamic> toJson() {
     return {
       'version': version,
