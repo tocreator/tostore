@@ -989,8 +989,8 @@ class VectorIndexManager {
   /// [WorkloadType.maintenance] tokens.
   Future<void> compactTombstones(TableContext table,
       {int maxVisitedPages = 100}) async {
-    final vectorIndexes = await _dataStore.tableMetaManager
-        ?.getVectorIndexesForTable(table.tableUid);
+    final vectorIndexes =
+        _dataStore.tableMetaManager?.getVectorIndexesFor(table.schema);
     if (vectorIndexes == null || vectorIndexes.isEmpty) return;
 
     final yc = YieldController(

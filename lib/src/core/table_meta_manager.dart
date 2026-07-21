@@ -1073,27 +1073,6 @@ class TableMetaManager {
     return _indexCacheEntryFor(schema).vectorIndexes;
   }
 
-  /// Async helper by tableUid – mainly for management / background tasks.
-  Future<List<IndexSchema>> getAllIndexesForTable(TableUid tableUid) async {
-    final schema = await getTableSchema(tableUid);
-    if (schema == null) return const <IndexSchema>[];
-    return getAllIndexesFor(schema);
-  }
-
-  /// Async helper by tableUid – unique indexes only.
-  Future<List<IndexSchema>> getUniqueIndexesForTable(TableUid tableUid) async {
-    final schema = await getTableSchema(tableUid);
-    if (schema == null) return const <IndexSchema>[];
-    return getUniqueIndexesFor(schema);
-  }
-
-  /// Async helper by tableUid – vector indexes only.
-  Future<List<IndexSchema>> getVectorIndexesForTable(TableUid tableUid) async {
-    final schema = await getTableSchema(tableUid);
-    if (schema == null) return const <IndexSchema>[];
-    return getVectorIndexesFor(schema);
-  }
-
   /// Shared index lists are bound only to the **hot** schema instance
   /// ([_peekTableSchema]). Migration / foreign snapshots are built ephemerally
   /// and never written into [_indexListCache] (avoids pinning stale schemas).

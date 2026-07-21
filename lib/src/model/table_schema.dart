@@ -178,9 +178,6 @@ class TableSchema {
     }
 
     final allIndexes = <IndexSchema>[];
-    final existingIndexNames = <String>{};
-
-    // 1. Add explicit indexes
     for (final index in indexes) {
       if (_isPrimaryKeyOnlyIndex(index)) {
         Logger.warn(
@@ -189,105 +186,8 @@ class TableSchema {
         continue;
       }
       allIndexes.add(index);
-      existingIndexNames.add(index.actualIndexName);
     }
-
-    // 2. Add implicit unique indexes and field-level indexes
-    for (final field in fields) {
-      if (field.name == primaryKey) continue;
-
-      if (field.unique) {
-        final alreadyHasUniqueIndex = indexes.any((i) =>
-            i.unique && i.fields.length == 1 && i.fields.first == field.name);
-
-        if (!alreadyHasUniqueIndex) {
-          final uniqueIndexSchema = IndexSchema(
-            indexName: field.name,
-            fields: [field.name],
-            unique: true,
-          );
-          if (!existingIndexNames.contains(uniqueIndexSchema.actualIndexName)) {
-            allIndexes.add(uniqueIndexSchema);
-            existingIndexNames.add(uniqueIndexSchema.actualIndexName);
-          }
-        }
-      } else if (field.createIndex) {
-        final alreadyHasIndex = indexes
-            .any((i) => i.fields.length == 1 && i.fields.first == field.name);
-
-        if (!alreadyHasIndex) {
-          final indexSchema = IndexSchema(
-            indexName: field.name,
-            fields: [field.name],
-            unique: false,
-          );
-
-          if (!existingIndexNames.contains(indexSchema.actualIndexName)) {
-            allIndexes.add(indexSchema);
-            existingIndexNames.add(indexSchema.actualIndexName);
-          }
-        }
-      }
-    }
-
-    // 2.5 Add implicit TTL source index
-    final ttl = ttlConfig;
-    final ttlField = (ttl != null)
-        ? ((ttl.sourceField == null || ttl.sourceField!.isEmpty)
-            ? internalTtlIngestTsMsField
-            : ttl.sourceField!)
-        : null;
-    if (ttlField != null) {
-      final alreadyCovered = allIndexes
-          .any((i) => i.fields.isNotEmpty && i.fields.first == ttlField);
-      if (!alreadyCovered) {
-        final ttlIndex = IndexSchema(
-          indexName: ttlField,
-          fields: [ttlField],
-          unique: false,
-        );
-        if (!existingIndexNames.contains(ttlIndex.actualIndexName)) {
-          allIndexes.add(ttlIndex);
-          existingIndexNames.add(ttlIndex.actualIndexName);
-        }
-      }
-    }
-
-    // 3. Add implicit foreign key indexes
-    for (final fk in foreignKeys) {
-      if (!fk.enabled || !fk.autoCreateIndex) continue;
-
-      bool isCovered = false;
-
-      for (final index in allIndexes) {
-        if (index.fields.length >= fk.fields.length) {
-          bool match = true;
-          for (int i = 0; i < fk.fields.length; i++) {
-            if (index.fields[i] != fk.fields[i]) {
-              match = false;
-              break;
-            }
-          }
-          if (match) {
-            isCovered = true;
-            break;
-          }
-        }
-      }
-
-      if (!isCovered) {
-        final fkIndex = IndexSchema(
-          indexName: fk.actualName,
-          fields: fk.fields,
-          unique: false,
-        );
-        if (!existingIndexNames.contains(fkIndex.actualIndexName)) {
-          allIndexes.add(fkIndex);
-          existingIndexNames.add(fkIndex.actualIndexName);
-        }
-      }
-    }
-
+    allIndexes.addAll(_computeRawImplicitIndexes());
     return allIndexes;
   }
 
