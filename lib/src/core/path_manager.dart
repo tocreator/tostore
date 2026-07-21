@@ -269,7 +269,7 @@ class PathManager {
 
   /// transaction main meta file path (track active partitions, next index, etc.)
   String getTransactionMainMetaPath({String? spaceName}) {
-    return pathJoin(getTransactionRootPath(spaceName: spaceName), 'meta.json');
+    return pathJoin(getTransactionRootPath(spaceName: spaceName), 'meta.tobf');
   }
 
   /// transaction directory path by directory shard
@@ -307,7 +307,7 @@ class PathManager {
       {String? spaceName}) {
     final dirPath = getTransactionPartitionDirPath(dirIndex, partitionIndex,
         spaceName: spaceName);
-    return pathJoin(dirPath, 'meta.json');
+    return pathJoin(dirPath, 'meta.tobf');
   }
 
   /// transaction partition status log file path
@@ -359,12 +359,12 @@ class PathManager {
 
   /// WAL backup meta file path (stores previous stable WAL meta snapshot)
   String getWalBackupMetaPath({String? spaceName}) {
-    return pathJoin(getWalRootPath(spaceName: spaceName), 'meta.bak.json');
+    return pathJoin(getWalRootPath(spaceName: spaceName), 'meta.bak.tobf');
   }
 
   /// WAL main meta file path (checkpoint, partition ranges, flags)
   String getWalMainMetaPath({String? spaceName}) {
-    return pathJoin(getWalRootPath(spaceName: spaceName), 'meta.json');
+    return pathJoin(getWalRootPath(spaceName: spaceName), 'meta.tobf');
   }
 
   /// WAL partition directory shard path
