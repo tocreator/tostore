@@ -1,7 +1,6 @@
-import 'dart:convert';
-
 import '../handler/logger.dart';
 import '../handler/txn_encoder.dart';
+import '../handler/txn_meta_codec.dart';
 import '../model/buffer_entry.dart';
 import '../model/data_store_config.dart';
 import '../model/id_generator.dart';
@@ -169,10 +168,9 @@ class TransactionManager {
       if (!_isMemoryMode) {
         final path = _dataStore.pathManager.getTransactionMainMetaPath();
         if (await _dataStore.storage.existsFile(path)) {
-          final content = await _dataStore.storage.readAsString(path);
-          if (content != null && content.isNotEmpty) {
-            _mainMetaCache = TransactionMainMeta.fromJson(
-                jsonDecode(content) as Map<String, dynamic>);
+          final bytes = await _dataStore.storage.readAsBytes(path);
+          if (bytes.isNotEmpty) {
+            _mainMetaCache = TxnMetaCodec.decodeMainFile(bytes);
           }
         }
       }
@@ -1350,10 +1348,9 @@ class TransactionManager {
     TransactionPartitionMeta meta;
     try {
       if (await _dataStore.storage.existsFile(path)) {
-        final content = await _dataStore.storage.readAsString(path);
-        if (content != null && content.isNotEmpty) {
-          meta = TransactionPartitionMeta.fromJson(
-              jsonDecode(content) as Map<String, dynamic>);
+        final bytes = await _dataStore.storage.readAsBytes(path);
+        if (bytes.isNotEmpty) {
+          meta = TxnMetaCodec.decodePartitionFile(bytes);
         } else {
           meta = TransactionPartitionMeta(partitionIndex: partitionIndex);
         }
@@ -1379,17 +1376,22 @@ class TransactionManager {
         .getTransactionPartitionDirPath(dirIndex, meta.partitionIndex));
     final path = _dataStore.pathManager
         .getTransactionPartitionMetaPath(dirIndex, meta.partitionIndex);
-    await _dataStore.storage
-        .writeAsString(path, jsonEncode(meta.toJson()), flush: flush);
+    final bytes = TxnMetaCodec.encodePartitionFile(
+      meta,
+      encryptionConfig: _dataStore.config.encryptionConfig,
+    );
+    await _dataStore.storage.writeAsBytes(path, bytes, flush: flush);
     _partitionMetaCache[meta.partitionIndex] = meta;
   }
 
   Future<void> _persistMainMeta({bool flush = false}) async {
-    if (_isMemoryMode) return;
+    if (_isMemoryMode || _mainMetaCache == null) return;
     final path = _dataStore.pathManager.getTransactionMainMetaPath();
-    await _dataStore.storage.writeAsString(
-        path, jsonEncode(_mainMetaCache!.toJson()),
-        flush: flush);
+    final bytes = TxnMetaCodec.encodeMainFile(
+      _mainMetaCache!,
+      encryptionConfig: _dataStore.config.encryptionConfig,
+    );
+    await _dataStore.storage.writeAsBytes(path, bytes, flush: flush);
   }
 
   Future<void> _maybeCleanupPartition(int partitionIndex) async {
@@ -1419,7 +1421,9 @@ class TransactionManager {
             shardIsEmpty = files.isEmpty ||
                 files.every((f) =>
                     f.endsWith('.tmp') ||
+                    f.endsWith('meta.tobf') ||
                     f.endsWith('meta.json') ||
+                    f.contains('meta.tobf') ||
                     f.contains('meta.json'));
             if (shardIsEmpty) {
               await _dataStore.storage.deleteDirectory(shardPath);
