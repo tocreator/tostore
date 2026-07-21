@@ -61,16 +61,16 @@ class PathManager {
     return pathJoin(getMigrationsPath(), 'dir_$dirIndex', 'task_$taskId.json');
   }
 
-  /// get global config file path
+  /// get global config file path (TOBF binary)
   String getGlobalConfigPath() {
-    return pathJoin(_instancePath, 'global_config.json');
+    return pathJoin(_instancePath, 'global_config.tobf');
   }
 
-  /// get space config path
+  /// get space config path (TOBF binary)
   /// If [rootPath] is provided, build path from that root; otherwise use instance path
   String getSpaceConfigPath({String? rootPath, String? spaceName}) {
     final spacePath = getSpacePath(rootPath: rootPath, spaceName: spaceName);
-    return pathJoin(spacePath, 'space_config.json');
+    return pathJoin(spacePath, 'space_config.tobf');
   }
 
   /// Get weight file path
