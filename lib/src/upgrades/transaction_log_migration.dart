@@ -11,7 +11,7 @@ import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/table_identity.dart';
 import '../model/transaction_models.dart';
-import 'legacy_model/legacy_json.dart';
+import 'legacy_model/pre_v3.dart';
 
 /// One-shot migration of legacy NDJSON transaction logs to binary ToTX records.
 ///
