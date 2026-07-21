@@ -16,8 +16,7 @@ import '../core/data_store_impl.dart';
 import '../core/workload_scheduler.dart';
 import '../handler/parallel_processor.dart';
 import '../core/yield_controller.dart';
-import 'legacy_model/legacy_config_paths.dart';
-import 'legacy_model/legacy_space_config_json.dart';
+import 'legacy_model/pre_v3.dart';
 import 'v3_upgrade.dart';
 import '../model/table_identity.dart';
 
