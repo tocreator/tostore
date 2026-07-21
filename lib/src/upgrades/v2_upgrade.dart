@@ -16,6 +16,8 @@ import '../core/data_store_impl.dart';
 import '../core/workload_scheduler.dart';
 import '../handler/parallel_processor.dart';
 import '../core/yield_controller.dart';
+import 'legacy_model/legacy_config_paths.dart';
+import 'legacy_model/legacy_space_config_json.dart';
 import 'v3_upgrade.dart';
 import '../model/table_identity.dart';
 
@@ -40,6 +42,16 @@ class V2Upgrade {
     // Upgrade migration metadata (global, not space-specific)
     await _upgradeMigrationMeta(_dataStore);
 
+    final spaces = oldGlobalConfig.spaceNames.isNotEmpty
+        ? oldGlobalConfig.spaceNames.toList()
+        : <String>['default'];
+
+    // Backup legacy JSON space configs BEFORE V3 deletes them (key re-wrap needs
+    // the old ChaCha algorithm payload from JSON).
+    for (final spaceName in spaces) {
+      await _backupLegacySpaceConfigJson(spaceName);
+    }
+
     // IMMEDIATELY execute version 3 metadata and directory mapping upgrade
     // so that subsequent data rewriting has correct path resolution via table UIDs.
     final v3Upgrade = V3Upgrade(_dataStore);
@@ -47,10 +59,6 @@ class V2Upgrade {
 
     // Backup and upgrade encryption keys for each space before migration
     // This ensures we can recover from backup if migration fails
-    final spaces = oldGlobalConfig.spaceNames.isNotEmpty
-        ? oldGlobalConfig.spaceNames.toList()
-        : <String>['default'];
-
     final yieldController =
         YieldController('upgrade_v2_execute', checkInterval: 1);
 
@@ -73,6 +81,21 @@ class V2Upgrade {
     );
   }
 
+  Future<void> _backupLegacySpaceConfigJson(String spaceName) async {
+    final root = _dataStore.instancePath;
+    if (root == null) return;
+    final legacyConfigPath = LegacyConfigPaths.spaceJson(root, spaceName);
+    final backupConfigPath = '$legacyConfigPath.old';
+    if (!await _dataStore.storage.existsFile(legacyConfigPath)) return;
+    if (await _dataStore.storage.existsFile(backupConfigPath)) return;
+
+    final content = await _dataStore.storage.readAsString(legacyConfigPath);
+    if (content != null && content.isNotEmpty) {
+      await _dataStore.storage.writeAsString(backupConfigPath, content);
+      Logger.info('Backed up space config to $backupConfigPath');
+    }
+  }
+
   /// Upgrade a specific space to version 2 using a dedicated migration instance.
   Future<void> _upgradeSpaceToV2(String spaceName,
       {bool upgradeGlobal = false}) async {
@@ -80,19 +103,9 @@ class V2Upgrade {
       'Upgrading space [$spaceName] to database version 2',
     );
 
-    final spaceConfigPath =
-        _dataStore.pathManager.getSpaceConfigPath(spaceName: spaceName);
-    final backupConfigPath = '$spaceConfigPath.old';
-
-    // 1. Backup space.config to space.config.old if not already backed up
-    if (await _dataStore.storage.existsFile(spaceConfigPath) &&
-        !await _dataStore.storage.existsFile(backupConfigPath)) {
-      final content = await _dataStore.storage.readAsString(spaceConfigPath);
-      if (content != null && content.isNotEmpty) {
-        await _dataStore.storage.writeAsString(backupConfigPath, content);
-        Logger.info('Backed up space config to $backupConfigPath');
-      }
-    }
+    final root = _dataStore.instancePath!;
+    final legacyConfigPath = LegacyConfigPaths.spaceJson(root, spaceName);
+    final backupConfigPath = '$legacyConfigPath.old';
 
     final baseConfig = _dataStore.config;
     final migrationInstance = DataStoreImpl(
@@ -180,8 +193,8 @@ class V2Upgrade {
       final content = await _dataStore.storage.readAsString(backupPath);
       if (content == null || content.isEmpty) return;
 
-      final json = jsonDecode(content);
-      final spaceConfig = SpaceConfig.fromJson(json);
+      final spaceConfig = LegacySpaceConfigJson.tryParse(content);
+      if (spaceConfig == null) return;
 
       final key32Old = ChaCha20Poly1305Old.generateKeyFromString(
           _dataStore.config.encryptionConfig?.encryptionKey ??
