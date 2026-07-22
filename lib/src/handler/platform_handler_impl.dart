@@ -1,10 +1,10 @@
 import 'dart:async';
-import 'dart:io' if (dart.library.html) '../Interface/io_stub.dart';
+import 'dart:io' if (dart.library.html) '../interface/io_stub.dart';
 
 import 'package:archive/archive_io.dart';
 import 'package:path/path.dart' as path;
 
-import '../Interface/platform_interface.dart';
+import '../interface/platform_interface.dart';
 import '../handler/logger.dart';
 import 'system_ffi_helper.dart';
 
