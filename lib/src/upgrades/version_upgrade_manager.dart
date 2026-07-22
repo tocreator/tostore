@@ -45,7 +45,6 @@ class VersionUpgradeManager {
       }
 
       // 2. Handle Up-to-date: Version matches exactly.
-      // Still run residual idempotent migrations in case an older build bumped
       if (currentVersion == engineVersion) {
         return;
       }
