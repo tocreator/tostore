@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:path/path.dart' as path;
 import '../core/btree_page.dart';
@@ -24,6 +25,7 @@ import 'legacy_model/pre_v3.dart';
 import 'meta_format_migration.dart';
 import 'migration_format_migration.dart';
 import 'transaction_log_migration.dart';
+import 'weight_format_migration.dart';
 
 /// Version 3 upgrade:
 /// - Bootstraps `_system_table_meta` + internal KV only; migrates 3.1.2 schema
@@ -42,6 +44,8 @@ import 'transaction_log_migration.dart';
 /// - Blocking [MigrationFormatMigration]: `migration_meta` / `task_*` JSON →
 ///   `.tobf` (after WAL/Txn meta; before version bump).
 /// - Bumps version config markers last (after format migrations) for crash resume.
+/// - Async [WeightFormatMigration]: `cache_weights.json` → space-local internal
+///   KV (non-blocking; loss acceptable).
 /// - Cleans up legacy map properties.
 class V3Upgrade {
   final DataStoreImpl _dataStore;
@@ -419,6 +423,16 @@ class V3Upgrade {
 
     Logger.info(
       'Database upgrade to version 3 completed',
+    );
+
+    // Non-blocking: legacy weight JSON → internal KV (formal path never reads JSON).
+    unawaited(
+      WeightFormatMigration.migrateAsync(
+        _dataStore,
+        spaceNames: spaces,
+      ).catchError((Object e) {
+        Logger.warn('WeightFormatMigration async failed', rawError: e);
+      }),
     );
   }
 
