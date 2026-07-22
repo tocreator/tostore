@@ -14,10 +14,10 @@ library;
 
 import 'dart:async';
 
-import 'src/Interface/chain_builder.dart';
-import 'src/Interface/data_store_interface.dart';
-import 'src/Interface/kv_store.dart';
-import 'src/Interface/status_provider.dart';
+import 'src/interface/chain_builder.dart';
+import 'src/interface/data_store_interface.dart';
+import 'src/interface/kv_store.dart';
+import 'src/interface/status_provider.dart';
 import 'src/chain/schema_builder.dart';
 import 'src/chain/stream_query_builder.dart';
 import 'src/core/data_store_impl.dart';
@@ -37,7 +37,7 @@ import 'src/model/table_info.dart';
 import 'src/model/table_schema.dart';
 import 'src/model/transaction_result.dart';
 
-export 'src/Interface/status_provider.dart';
+export 'src/interface/status_provider.dart';
 export 'src/handler/logger.dart' show LogLevel, LogRecord, LogConfig, LogType;
 export 'src/handler/to_crypto.dart';
 export 'src/model/backup_scope.dart';
