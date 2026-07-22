@@ -3,7 +3,7 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
-import '../Interface/storage_interface.dart';
+import '../interface/storage_interface.dart';
 import '../handler/logger.dart';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
