@@ -36,8 +36,8 @@ import 'transaction_log_migration.dart';
 /// - Migrates pending parallel-batch `tablePlan` out of A/B journal into WalMeta,
 ///   then deletes `journal_a.log` / `journal_b.log` (interim JSON; converted below).
 /// - Migrates legacy NDJSON transaction logs to binary ToTX.
-/// - Blocking [MetaFormatMigration]: WAL/Txn `meta.json` → `meta.tobf` (before
-///   version bump so crash mid-migration re-enters V3).
+/// - Blocking [MetaFormatMigration]: WAL/Txn `meta.json` → `meta.tobf` (same V3
+///   pass, before version bump; KeyManager primed for EncryptionScope.full).
 /// - Bumps version config markers last (after format migrations) for crash resume.
 /// - Cleans up legacy map properties.
 class V3Upgrade {
@@ -375,11 +375,13 @@ class V3Upgrade {
     // Must finish before version bump so crash mid-migration re-runs V3.
     await TransactionLogMigration(_dataStore).migrateAllSpaces(spaces);
 
-    // WAL/Txn meta JSON → TOBF (blocking). Requires EncryptionManager keys when
-    // EncryptionScope.full; KeyManager.initialize is idempotent and will run
-    // again later in normal startup.
+    // WAL/Txn meta JSON → TOBF (blocking, before version bump).
+    // KeyManager must be primed so EncryptionScope.full uses EncryptionManager.
     await _dataStore.keyManager.initialize();
-    await MetaFormatMigration.migrateAllSpaces(_dataStore);
+    await MetaFormatMigration.migrateAllSpaces(
+      _dataStore,
+      spaceNames: spaces,
+    );
 
     // Single GlobalConfig write: schema hashes + pageSize + dir high-water + version.
     var updatedGlobal = oldGlobalConfig.copyWith(
@@ -489,8 +491,8 @@ class V3Upgrade {
   /// WAL meta JSON (not fields on [PendingParallelBatch]). Paths are built
   /// under [PathManager.getPageRedoRootPath] — no A/B helpers in PathManager.
   Future<void> _migrateParallelJournalIntoWalMeta(String spaceName) async {
-    // V3 mid-upgrade still uses legacy JSON paths; MetaFormatMigration converts
-    // to .tobf after KeyManager is ready on the next init phase.
+    // V3 mid-upgrade still writes legacy JSON WAL meta; MetaFormatMigration
+    // converts to .tobf later in the same V3 pass (before version bump).
     final walRoot = _dataStore.pathManager.getWalRootPath(spaceName: spaceName);
     final walMetaPath = path.join(walRoot, 'meta.json');
     WalMeta? meta;
