@@ -3,10 +3,12 @@ import 'dart:convert';
 import '../../core/data_store_impl.dart';
 import '../../handler/common.dart';
 import '../../handler/logger.dart';
+import '../../handler/weight_snapshot_codec.dart';
 import '../../model/global_config.dart';
 import '../../model/space_config.dart';
 import '../../model/table_identity.dart';
 import '../../model/transaction_models.dart';
+import '../../model/weight_data.dart';
 
 /// On-disk formats retired by the engine **v3** blocking upgrade.
 ///
@@ -14,7 +16,8 @@ import '../../model/transaction_models.dart';
 /// - Keep this directory; do **not** scatter one-off parsers across upgrades/.
 /// - One file per *source* era that a major upgrade must still read:
 ///   - [pre_v3.dart] — formats before engineVersion 3 (JSON configs, schema
-///     partitions, NDJSON txn logs). Consumed by `V3Upgrade`.
+///     partitions, NDJSON txn logs, cache_weights.json). Consumed by `V3Upgrade`
+///     / format migrations.
 ///   - Future: `pre_v4.dart`, `pre_v7.dart`, … when that upgrade lands.
 /// - Prefer `pre_vN` over open ranges (`v3_to_v6`): each major upgrade owns
 ///   exactly the formats it retires. If v6 must read v3-era TOBF that v6
@@ -485,6 +488,82 @@ final class LegacyTxnJson {
       insertsApplied: asIntMap(obj['insertsApplied']),
       updatesApplied: asIntMap(obj['updatesApplied']),
       deletesApplied: asIntMap(obj['deletesApplied']),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Cache weights (cache_weights.json → internal KV)
+// ---------------------------------------------------------------------------
+
+/// Legacy weight JSON path — construct only inside upgrades/.
+abstract final class LegacyWeightPaths {
+  LegacyWeightPaths._();
+
+  static const String fileName = 'cache_weights.json';
+
+  static String spaceJson(String instancePath, String spaceName) =>
+      pathJoin(instancePath, 'spaces', spaceName, fileName);
+}
+
+/// Parser for pre-KV `cache_weights.json` (consumed only by [WeightFormatMigration]).
+final class LegacyCacheWeightsJson {
+  LegacyCacheWeightsJson._();
+
+  static WeightSnapshot? tryParse(String content) {
+    if (content.trim().isEmpty) return null;
+    try {
+      final decoded = jsonDecode(content);
+      if (decoded is! Map) return null;
+      return fromMap(Map<String, dynamic>.from(decoded));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static WeightSnapshot fromMap(Map<String, dynamic> json) {
+    final tableRecord = <TableUid, WeightData>{};
+    final rawTables = json['tableRecord'];
+    if (rawTables is Map) {
+      rawTables.forEach((key, value) {
+        if (key is! String) return;
+        final entry = _weightDataFromJson(value);
+        if (entry != null) tableRecord[TableUid(key)] = entry;
+      });
+    }
+
+    final indexData = <String, WeightData>{};
+    final rawIndexes = json['indexData'];
+    if (rawIndexes is Map) {
+      rawIndexes.forEach((key, value) {
+        if (key is! String) return;
+        final entry = _weightDataFromJson(value);
+        if (entry != null) indexData[key] = entry;
+      });
+    }
+
+    return WeightSnapshot(
+      tableRecord: tableRecord,
+      indexData: indexData,
+      lastDecayTime: (json['lastDecayTime'] as num?)?.toInt() ?? 0,
+      indexDataKeyFormatIsUid: json['indexDataKeyFormat'] == 'indexUid',
+    );
+  }
+
+  static WeightData? _weightDataFromJson(dynamic value) {
+    Map<String, dynamic>? map;
+    if (value is Map<String, dynamic>) {
+      map = value;
+    } else if (value is Map) {
+      map = Map<String, dynamic>.from(value);
+    }
+    if (map == null) return null;
+    return WeightData(
+      weight: (map['weight'] as num?)?.toInt() ?? 0,
+      accessCount: (map['accessCount'] as num?)?.toInt() ?? 0,
+      lastUpdateTime: (map['lastUpdateTime'] as num?)?.toInt() ?? 0,
+      neverDecay: map['neverDecay'] as bool? ?? false,
+      customWeight: (map['customWeight'] as num?)?.toInt(),
     );
   }
 }
