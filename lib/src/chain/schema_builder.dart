@@ -1,7 +1,7 @@
 import '../core/data_store_impl.dart';
 import '../model/migration_task.dart';
 import '../model/table_schema.dart';
-import '../Interface/future_builder_mixin.dart';
+import '../interface/future_builder_mixin.dart';
 import '../handler/platform_handler.dart';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
