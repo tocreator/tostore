@@ -8,7 +8,7 @@ import '../model/result_type.dart';
 import 'encryption.dart';
 import 'tobf_file_codec.dart';
 
-/// TOBF file shell for WAL / transaction / migration metadata.
+/// TOBF file shell for WAL / transaction / migration / backup metadata.
 ///
 /// When [EncryptionScope.full] is active, the field-tag payload is encrypted
 /// with [EncryptionManager] (user key) before framing — same key domain as
@@ -19,7 +19,8 @@ abstract final class MetaFileCodec {
   /// Soft DoS cap for WAL/Txn/migration-task meta frames.
   static const int maxBodyBytes = 16 * 1024 * 1024;
 
-  /// Soft DoS cap for small engine meta frames (migration_meta, txn partition).
+  /// Soft DoS cap for small engine meta frames (migration_meta, txn partition,
+  /// backup package meta).
   static const int maxBodyBytesSmall = 1 * 1024 * 1024;
 
   static final Uint8List walMetaAad =
@@ -33,6 +34,9 @@ abstract final class MetaFileCodec {
 
   static final Uint8List migrationTaskAad =
       Uint8List.fromList(utf8.encode('tostore.migration.task.v1'));
+
+  static final Uint8List backupMetaAad =
+      Uint8List.fromList(utf8.encode('tostore.backup.meta.v1'));
 
   /// Whether meta body should be encrypted under [EncryptionScope.full].
   static bool shouldEncrypt(EncryptionConfig? encryptionConfig) =>
