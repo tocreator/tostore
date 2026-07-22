@@ -1,5 +1,5 @@
 import 'dart:async';
-import '../Interface/chain_builder.dart';
+import '../interface/chain_builder.dart';
 import '../chain/schema_builder.dart';
 import '../chain/stream_query_builder.dart';
 import '../model/data_store_config.dart';
@@ -12,7 +12,7 @@ import '../model/table_info.dart';
 import '../model/table_schema.dart';
 import '../model/query_result.dart';
 import '../model/backup_scope.dart';
-import '../Interface/kv_store.dart';
+import '../interface/kv_store.dart';
 import 'status_provider.dart';
 
 /// Data store engine interface
