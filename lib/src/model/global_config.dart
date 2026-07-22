@@ -34,7 +34,7 @@ class GlobalConfig {
 
   /// Fast-path flag: true while schema or key migration is still incomplete.
   ///
-  /// Authoritative state is in migration_meta.json (task files + keyMigrationInfo).
+  /// Authoritative state is in migration_meta.tobf (task files + keyMigrationInfo).
   final bool hasMigrationTask;
 
   /// Hash of user-defined table schemas (migration gating).
