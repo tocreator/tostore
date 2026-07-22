@@ -3,7 +3,7 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
-import '../Interface/storage_interface.dart';
+import '../interface/storage_interface.dart';
 import '../handler/binary_schema_codec.dart';
 import '../handler/common.dart';
 import '../handler/encryption.dart';
