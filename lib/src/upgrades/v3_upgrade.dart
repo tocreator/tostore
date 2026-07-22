@@ -22,6 +22,7 @@ import '../model/id_generator.dart';
 import 'config_format_migration.dart';
 import 'legacy_model/pre_v3.dart';
 import 'meta_format_migration.dart';
+import 'migration_format_migration.dart';
 import 'transaction_log_migration.dart';
 
 /// Version 3 upgrade:
@@ -38,6 +39,8 @@ import 'transaction_log_migration.dart';
 /// - Migrates legacy NDJSON transaction logs to binary ToTX.
 /// - Blocking [MetaFormatMigration]: WAL/Txn `meta.json` → `meta.tobf` (same V3
 ///   pass, before version bump; KeyManager primed for EncryptionScope.full).
+/// - Blocking [MigrationFormatMigration]: `migration_meta` / `task_*` JSON →
+///   `.tobf` (after WAL/Txn meta; before version bump).
 /// - Bumps version config markers last (after format migrations) for crash resume.
 /// - Cleans up legacy map properties.
 class V3Upgrade {
@@ -382,6 +385,9 @@ class V3Upgrade {
       _dataStore,
       spaceNames: spaces,
     );
+
+    // Migration meta / tasks JSON → TOBF (blocking, before version bump).
+    await MigrationFormatMigration.migrate(_dataStore);
 
     // Single GlobalConfig write: schema hashes + pageSize + dir high-water + version.
     var updatedGlobal = oldGlobalConfig.copyWith(
