@@ -3512,8 +3512,7 @@ class MigrationManager {
     }
 
     // Check for vector config changes, as this would invalidate existing vector data.
-    if (jsonEncode(oldField.vectorConfig?.toJson()) !=
-        jsonEncode(newField.vectorConfig?.toJson())) {
+    if (oldField.vectorConfig != newField.vectorConfig) {
       Logger.warn(
         'Detected a change in vectorConfig for field "${newField.name}". This is considered a breaking change.',
       );
@@ -4869,9 +4868,7 @@ class MigrationManager {
     if ((a.vectorConfig == null) != (b.vectorConfig == null)) {
       return false;
     }
-    if (a.vectorConfig != null &&
-        jsonEncode(a.vectorConfig!.toJson()) !=
-            jsonEncode(b.vectorConfig!.toJson())) {
+    if (a.vectorConfig != b.vectorConfig) {
       return false;
     }
     return ignoreFields || _sameFieldList(a.fields, b.fields);

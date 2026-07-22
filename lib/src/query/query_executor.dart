@@ -3442,16 +3442,11 @@ class QueryExecutor {
   /// Construct a primary key cursor token for a table.
   static String buildPrimaryKeyCursor(TableContext table, String primaryKeyStr,
       {bool reverse = false}) {
-    final Map<String, dynamic> payload = <String, dynamic>{
-      'v': 1,
-      't': table.tableUid,
-      'm': 'pk',
-      'b': false,
-      'pk': primaryKeyStr,
-      'r': reverse,
-    };
-    final jsonStr = jsonEncode(payload);
-    return base64Url.encode(utf8.encode(jsonStr));
+    return _QueryCursorToken.primaryKey(
+      tableUid: table.tableUid,
+      primaryKey: primaryKeyStr,
+      reverse: reverse,
+    ).encode();
   }
 
   /// Query data batch-by-batch using cursors directly from files (bypassing WriteBuffer and read views).
@@ -3757,36 +3752,75 @@ final class _QueryCursorToken {
   }
 
   String encode() {
-    final Map<String, dynamic> payload = <String, dynamic>{
-      'v': version,
-      't': tableUid,
-      'm': mode == _CursorMode.primaryKey
-          ? 'pk'
-          : (mode == _CursorMode.indexKey ? 'idx' : 'sk'),
-      'b': isBackward,
-      if (querySigHash != null) 's': querySigHash,
-    };
+    final builder = BytesBuilder(copy: false);
+    builder.addByte(0xFE);
+    builder.addByte(version);
+    builder.addByte(mode.index);
+    builder.addByte(isBackward ? 1 : 0);
 
-    if (mode == _CursorMode.primaryKey) {
-      payload['pk'] = primaryKey;
-      payload['r'] = reverse;
-    } else if (mode == _CursorMode.indexKey) {
-      payload['i'] = indexUid;
-      payload['k'] = base64Url.encode(indexKey ?? Uint8List(0));
+    final tBytes = utf8.encode(tableUid);
+    final bdLen = ByteData(2)..setUint16(0, tBytes.length, Endian.big);
+    builder.add(bdLen.buffer.asUint8List());
+    builder.add(tBytes);
+
+    if (querySigHash != null) {
+      builder.addByte(1);
+      final bdata = ByteData(4)..setInt32(0, querySigHash!, Endian.big);
+      builder.add(bdata.buffer.asUint8List());
     } else {
-      payload['f'] = sortFields ?? const <String>[];
-      payload['d'] = sortDesc ?? const <bool>[];
-      payload['k'] = base64Url.encode(sortKey ?? Uint8List(0));
+      builder.addByte(0);
     }
 
-    final jsonStr = jsonEncode(payload);
-    return base64Url.encode(utf8.encode(jsonStr));
+    if (mode == _CursorMode.primaryKey) {
+      builder.addByte(reverse ? 1 : 0);
+      final pkBytes = utf8.encode(primaryKey ?? '');
+      final bd = ByteData(4)..setInt32(0, pkBytes.length, Endian.big);
+      builder.add(bd.buffer.asUint8List());
+      builder.add(pkBytes);
+    } else if (mode == _CursorMode.indexKey) {
+      final iBytes = utf8.encode(indexUid);
+      final bdIdx = ByteData(2)..setUint16(0, iBytes.length, Endian.big);
+      builder.add(bdIdx.buffer.asUint8List());
+      builder.add(iBytes);
+
+      final keyBytes = indexKey ?? Uint8List(0);
+      final bd = ByteData(4)..setInt32(0, keyBytes.length, Endian.big);
+      builder.add(bd.buffer.asUint8List());
+      builder.add(keyBytes);
+    } else {
+      final fields = sortFields ?? const <String>[];
+      builder.addByte(fields.length);
+      for (final f in fields) {
+        final fb = utf8.encode(f);
+        final bd = ByteData(2)..setUint16(0, fb.length, Endian.big);
+        builder.add(bd.buffer.asUint8List());
+        builder.add(fb);
+      }
+      final descs = sortDesc ?? const <bool>[];
+      builder.addByte(descs.length);
+      for (final d in descs) {
+        builder.addByte(d ? 1 : 0);
+      }
+      final keyBytes = sortKey ?? Uint8List(0);
+      final bd = ByteData(4)..setInt32(0, keyBytes.length, Endian.big);
+      builder.add(bd.buffer.asUint8List());
+      builder.add(keyBytes);
+    }
+
+    return base64Url.encode(builder.takeBytes());
   }
 
   static _QueryCursorToken? tryDecode(String? raw) {
     if (raw == null || raw.trim().isEmpty) return null;
     try {
-      final decoded = utf8.decode(base64Url.decode(base64Url.normalize(raw)));
+      final bytes = base64Url.decode(base64Url.normalize(raw));
+      if (bytes.isEmpty) return null;
+
+      if (bytes[0] == 0xFE) {
+        return _tryDecodeBinary(bytes);
+      }
+
+      final decoded = utf8.decode(bytes);
       final obj = jsonDecode(decoded);
       if (obj is! Map) {
         throw DbException([
@@ -3957,56 +3991,115 @@ final class _QueryCursorToken {
       ]);
     }
   }
-}
 
-dynamic _toDeterministicObject(dynamic obj) {
-  if (obj is Map) {
-    final keys = obj.keys.toList();
-    keys.sort((a, b) => a.toString().compareTo(b.toString()));
-    final Map<String, dynamic> sortedMap = {};
-    for (final k in keys) {
-      sortedMap[k.toString()] = _toDeterministicObject(obj[k]);
+  static _QueryCursorToken _tryDecodeBinary(Uint8List bytes) {
+    int offset = 1;
+    if (offset >= bytes.length) {
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devInvalidCursorPayload,
+          message: 'Invalid binary cursor payload',
+          parameterName: 'cursor',
+        ),
+      ]);
     }
-    return sortedMap;
-  } else if (obj is Iterable) {
-    if (obj is Set) {
-      final sortedList = obj.toList()
-        ..sort((a, b) => a.toString().compareTo(b.toString()));
-      return sortedList.map((e) => _toDeterministicObject(e)).toList();
+    final v = bytes[offset++];
+    if (v != _currentVersion) {
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devInvalidCursorPayload,
+          message: 'Unsupported cursor token version: $v',
+          parameterName: 'cursor',
+        ),
+      ]);
     }
-    return obj.map((e) => _toDeterministicObject(e)).toList();
-  } else if (obj is DateTime) {
-    // Normalize all DateTimes to UTC to avoid timezone signature mismatches
-    return obj.toUtc().toIso8601String();
-  } else if (obj is double && (obj.isNaN || obj.isInfinite)) {
-    // jsonEncode throws on NaN/Infinity. Stringify them to ensure safety.
-    return obj.toString();
-  } else if (obj == null || obj is num || obj is bool || obj is String) {
-    return obj;
-  } else {
-    try {
-      // Try calling toJson if the object supports it
-      final dynamic toJsonResult = (obj as dynamic).toJson();
-      return _toDeterministicObject(toJsonResult);
-    } catch (_) {
-      // Safely fall back to string representation to prevent jsonEncode crashes
-      return obj.toString();
+    final modeIndex = bytes[offset++];
+    if (modeIndex < 0 || modeIndex >= _CursorMode.values.length) {
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devInvalidCursorMode,
+          message: 'Unknown binary cursor token mode.',
+          parameterName: 'cursor',
+        ),
+      ]);
     }
+    final mode = _CursorMode.values[modeIndex];
+    final isBackward = bytes[offset++] == 1;
+
+    final tLen = ByteData.sublistView(bytes, offset, offset + 2)
+        .getUint16(0, Endian.big);
+    offset += 2;
+    final tableUid =
+        TableUid(utf8.decode(bytes.sublist(offset, offset + tLen)));
+    offset += tLen;
+
+    final hasSigHash = bytes[offset++] == 1;
+    int? querySigHash;
+    if (hasSigHash) {
+      querySigHash = ByteData.sublistView(bytes, offset, offset + 4)
+          .getInt32(0, Endian.big);
+      offset += 4;
+    }
+
+    String? primaryKey;
+    bool reverse = false;
+    IndexUid indexUid = IndexUid.empty;
+    Uint8List? indexKey;
+    List<String>? sortFields;
+    List<bool>? sortDesc;
+    Uint8List? sortKey;
+
+    if (mode == _CursorMode.primaryKey) {
+      reverse = bytes[offset++] == 1;
+      final pkLen = ByteData.sublistView(bytes, offset, offset + 4)
+          .getInt32(0, Endian.big);
+      offset += 4;
+      primaryKey = utf8.decode(bytes.sublist(offset, offset + pkLen));
+    } else if (mode == _CursorMode.indexKey) {
+      final iLen = ByteData.sublistView(bytes, offset, offset + 2)
+          .getUint16(0, Endian.big);
+      offset += 2;
+      indexUid = IndexUid(utf8.decode(bytes.sublist(offset, offset + iLen)));
+      offset += iLen;
+      final kLen = ByteData.sublistView(bytes, offset, offset + 4)
+          .getInt32(0, Endian.big);
+      offset += 4;
+      indexKey = Uint8List.fromList(bytes.sublist(offset, offset + kLen));
+    } else {
+      final fieldCount = bytes[offset++];
+      sortFields = [];
+      for (int i = 0; i < fieldCount; i++) {
+        final fLen = ByteData.sublistView(bytes, offset, offset + 2)
+            .getUint16(0, Endian.big);
+        offset += 2;
+        sortFields.add(utf8.decode(bytes.sublist(offset, offset + fLen)));
+      }
+      final descCount = bytes[offset++];
+      sortDesc = [];
+      for (int i = 0; i < descCount; i++) {
+        sortDesc.add(bytes[offset++] == 1);
+      }
+      final kLen = ByteData.sublistView(bytes, offset, offset + 4)
+          .getInt32(0, Endian.big);
+      offset += 4;
+      sortKey = Uint8List.fromList(bytes.sublist(offset, offset + kLen));
+    }
+
+    return _QueryCursorToken._(
+      version: v,
+      mode: mode,
+      tableUid: tableUid,
+      primaryKey: primaryKey,
+      reverse: reverse,
+      indexUid: indexUid,
+      indexKey: indexKey,
+      sortFields: sortFields,
+      sortDesc: sortDesc,
+      sortKey: sortKey,
+      isBackward: isBackward,
+      querySigHash: querySigHash,
+    );
   }
-}
-
-String _deterministicJsonStringify(dynamic obj) {
-  return jsonEncode(_toDeterministicObject(obj));
-}
-
-int _fnv1aHash32(String str) {
-  final bytes = utf8.encode(str);
-  int hash = 2166136261;
-  for (final b in bytes) {
-    hash ^= b;
-    hash = (hash * 16777619) & 0xFFFFFFFF;
-  }
-  return hash;
 }
 
 int _buildQuerySignatureHash({
@@ -4014,8 +4107,71 @@ int _buildQuerySignatureHash({
   required Map<String, dynamic>? where,
   required List<String>? orderBy,
 }) {
-  final cleanWhere = _deterministicJsonStringify(where);
-  final cleanOrderBy = jsonEncode(orderBy ?? const <String>[]);
-  final sigStr = '$tableUid|$cleanWhere|$cleanOrderBy';
-  return _fnv1aHash32(sigStr);
+  int hash = 2166136261;
+
+  void hashByte(int b) {
+    hash ^= b;
+    hash = (hash * 16777619) & 0xFFFFFFFF;
+  }
+
+  void hashString(String s) {
+    final codeUnits = s.codeUnits;
+    for (int i = 0; i < codeUnits.length; i++) {
+      final unit = codeUnits[i];
+      if (unit <= 0x7f) {
+        hashByte(unit);
+      } else {
+        hashByte(unit & 0xff);
+        hashByte((unit >> 8) & 0xff);
+      }
+    }
+  }
+
+  void hashObject(dynamic obj) {
+    if (obj == null) {
+      hashByte(0x00);
+    } else if (obj is bool) {
+      hashByte(obj ? 0x01 : 0x02);
+    } else if (obj is int) {
+      hashByte(0x03);
+      hashString(obj.toString());
+    } else if (obj is double) {
+      hashByte(obj.isNaN || obj.isInfinite ? 0x04 : 0x05);
+      hashString(obj.toString());
+    } else if (obj is String) {
+      hashByte(0x06);
+      hashString(obj);
+    } else if (obj is Map) {
+      hashByte(0x07);
+      final sortedKeys = obj.keys.map((k) => k.toString()).toList()..sort();
+      for (final k in sortedKeys) {
+        hashString(k);
+        hashObject(obj[k]);
+      }
+    } else if (obj is List) {
+      hashByte(0x08);
+      for (final item in obj) {
+        hashObject(item);
+      }
+    } else if (obj is DateTime) {
+      hashByte(0x09);
+      hashString(obj.toUtc().toIso8601String());
+    } else {
+      hashByte(0x0A);
+      try {
+        final dynamic toJsonResult = (obj as dynamic).toJson();
+        hashObject(toJsonResult);
+      } catch (_) {
+        hashString(obj.toString());
+      }
+    }
+  }
+
+  hashString(tableUid);
+  hashByte(0x7C);
+  hashObject(where);
+  hashByte(0x7C);
+  hashObject(orderBy);
+
+  return hash;
 }

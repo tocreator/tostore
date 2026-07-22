@@ -6746,11 +6746,7 @@ class DataStoreImpl {
           if (rows.isEmpty) {
             return (
               value: defaultValue,
-              fingerprint: jsonEncode([
-                key,
-                false,
-                null,
-              ]),
+              fingerprint: Object.hash(key, false, null),
               nextRefreshAt: null,
             );
           }
@@ -6762,11 +6758,7 @@ class DataStoreImpl {
             _scheduleExactExpiredKvCleanup(table, key, rawExpiresAt);
             return (
               value: defaultValue,
-              fingerprint: jsonEncode([
-                key,
-                false,
-                null,
-              ]),
+              fingerprint: Object.hash(key, false, null),
               nextRefreshAt: null,
             );
           }
@@ -6774,11 +6766,7 @@ class DataStoreImpl {
           final rawValue = row[_kvValueField];
           return (
             value: _decodeStoredKeyValue(rawValue, key: key) as T?,
-            fingerprint: jsonEncode([
-              key,
-              true,
-              rawValue,
-            ]),
+            fingerprint: Object.hash(key, true, rawValue),
             nextRefreshAt: expiresAt,
           );
         },
@@ -6820,14 +6808,14 @@ class DataStoreImpl {
           }
 
           final values = <String, dynamic>{};
-          final fingerprintParts = <Object?>[];
+          final fingerprintHashes = <int>[];
           DateTime? nextRefreshAt;
           final now = DateTime.now();
           for (final requestedKey in requestedKeys) {
             final row = rowsByKey[requestedKey];
             if (row == null) {
               values[requestedKey] = null;
-              fingerprintParts.add([requestedKey, false, null]);
+              fingerprintHashes.add(Object.hash(requestedKey, false, null));
               continue;
             }
 
@@ -6835,7 +6823,7 @@ class DataStoreImpl {
             final expiresAt = _parseKvDateTime(rawExpiresAt);
             if (expiresAt != null && !expiresAt.isAfter(now)) {
               values[requestedKey] = null;
-              fingerprintParts.add([requestedKey, false, null]);
+              fingerprintHashes.add(Object.hash(requestedKey, false, null));
               _scheduleExactExpiredKvCleanup(table, requestedKey, rawExpiresAt);
               continue;
             }
@@ -6848,12 +6836,12 @@ class DataStoreImpl {
             final rawValue = row[_kvValueField];
             values[requestedKey] =
                 _decodeStoredKeyValue(rawValue, key: requestedKey);
-            fingerprintParts.add([requestedKey, true, rawValue]);
+            fingerprintHashes.add(Object.hash(requestedKey, true, rawValue));
           }
 
           return (
             value: Map<String, dynamic>.unmodifiable(values),
-            fingerprint: jsonEncode(fingerprintParts),
+            fingerprint: Object.hashAll(fingerprintHashes),
             nextRefreshAt: nextRefreshAt,
           );
         },
@@ -6864,7 +6852,7 @@ class DataStoreImpl {
   Stream<T> _watchKvQuery<T>({
     required TableContext table,
     required QueryCondition condition,
-    required Future<({T value, String fingerprint, DateTime? nextRefreshAt})>
+    required Future<({T value, Object fingerprint, DateTime? nextRefreshAt})>
             Function()
         loadSnapshot,
     bool distinct = true,
@@ -6875,7 +6863,7 @@ class DataStoreImpl {
     bool queryPending = false;
     bool needsRefresh = false;
     bool hasEmitted = false;
-    String? lastFingerprint;
+    Object? lastFingerprint;
     late Future<void> Function() emitLatest;
 
     void scheduleRefresh(DateTime? refreshAt) {
