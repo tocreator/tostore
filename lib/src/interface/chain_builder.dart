@@ -8,7 +8,7 @@ import '../model/result_type.dart';
 import '../handler/logger.dart';
 import '../model/table_schema.dart';
 import '../query/query_condition.dart';
-import '../Interface/future_builder_mixin.dart';
+import '../interface/future_builder_mixin.dart';
 import '../model/db_result.dart';
 import '../model/expr.dart';
 import '../model/join_clause.dart';
