@@ -82,7 +82,7 @@ class MigrationTask {
       ? (targetSchemaSnapshot?.name ?? oldSchemaSnapshot?.name)
       : (oldSchemaSnapshot?.name);
 
-  /// create from json
+  /// create from json (legacy upgrade path). On-disk persistence uses MigrationTaskCodec.
   factory MigrationTask.fromJson(Map<String, dynamic> json) {
     final oldSchema = json['oldSchemaSnapshot'] != null
         ? TableSchema.fromJson(
@@ -162,7 +162,7 @@ class MigrationTask {
     );
   }
 
-  /// convert to json
+  /// convert to json (legacy / tooling). On-disk persistence uses MigrationTaskCodec.
   Map<String, dynamic> toJson() => {
         'taskId': taskId,
         'tableUid': tableUid,
@@ -373,6 +373,50 @@ class FieldSchemaUpdate {
   /// check if the property is explicitly set
   bool isExplicitlySet(String propertyName) {
     return _explicitlySet[propertyName] ?? false;
+  }
+
+  /// Engine/codec: which properties were explicitly set (including nulls).
+  Map<String, bool> get explicitlySetFlags =>
+      Map<String, bool>.unmodifiable(_explicitlySet);
+
+  /// Reconstruct from binary codec with explicit-set flags.
+  factory FieldSchemaUpdate.rehydrate({
+    required String name,
+    DataType? type,
+    bool? nullable,
+    dynamic defaultValue,
+    bool? unique,
+    String? comment,
+    int? minLength,
+    int? maxLength,
+    num? minValue,
+    num? maxValue,
+    DefaultValueType? defaultValueType,
+    String? fieldId,
+    VectorFieldConfig? vectorConfig,
+    Map<String, bool>? explicitlySet,
+  }) {
+    final result = FieldSchemaUpdate(
+      name: name,
+      type: type,
+      nullable: nullable,
+      defaultValue: defaultValue,
+      unique: unique,
+      comment: comment,
+      minLength: minLength,
+      maxLength: maxLength,
+      minValue: minValue,
+      maxValue: maxValue,
+      defaultValueType: defaultValueType,
+      fieldId: fieldId,
+      vectorConfig: vectorConfig,
+    );
+    if (explicitlySet != null) {
+      result._explicitlySet
+        ..clear()
+        ..addAll(explicitlySet);
+    }
+    return result;
   }
 
   /// Create a copy of this update with a different name
