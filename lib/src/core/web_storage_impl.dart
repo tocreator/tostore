@@ -5,7 +5,7 @@ import 'dart:typed_data';
 
 import 'package:web/web.dart';
 
-import '../Interface/storage_interface.dart';
+import '../interface/storage_interface.dart';
 import '../handler/common.dart';
 import '../handler/logger.dart';
 import '../model/db_exception.dart';
