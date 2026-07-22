@@ -326,9 +326,12 @@ class V2Upgrade {
 
   /// Upgrade migration metadata from legacy format (v1) to new format (v2+).
   /// Converts dirUsage, taskIndex, currentDirIndex to DirectoryMappingString.
+  /// Still writes JSON; V3 [MigrationFormatMigration] converts to TOBF.
   Future<void> _upgradeMigrationMeta(DataStoreImpl db) async {
     try {
-      final metaPath = db.pathManager.getMigrationMetaPath();
+      // Legacy JSON path (do not use PathManager TOBF path here).
+      final metaPath =
+          pathJoin(db.pathManager.getMigrationsPath(), 'migration_meta.json');
       if (!await db.storage.existsFile(metaPath)) return;
 
       final content = await db.storage.readAsString(metaPath);
