@@ -4,7 +4,7 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
-import '../Interface/storage_interface.dart';
+import '../interface/storage_interface.dart';
 import '../handler/encryption.dart';
 import '../handler/logger.dart';
 import '../handler/parallel_processor.dart';
