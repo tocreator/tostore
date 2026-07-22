@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 import 'package:archive/archive.dart';
-import '../Interface/platform_interface.dart';
+import '../interface/platform_interface.dart';
 import '../handler/logger.dart';
 import '../core/storage_adapter.dart';
 import '../core/lock_manager.dart';
