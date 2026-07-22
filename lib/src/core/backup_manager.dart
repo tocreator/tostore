@@ -1,16 +1,16 @@
-import 'dart:convert';
-
 import 'package:path/path.dart' as p;
 
+import '../handler/backup_metadata_codec.dart';
 import '../handler/common.dart';
 import '../handler/logger.dart';
-import 'data_store_impl.dart';
-import '../model/backup_scope.dart';
-import '../model/backup_metadata.dart';
 import '../handler/platform_handler.dart';
+import '../model/backup_metadata.dart';
+import '../model/backup_scope.dart';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
+import '../upgrades/legacy_model/pre_v3.dart';
+import 'data_store_impl.dart';
 
 /// backup manager
 class BackupManager {
@@ -61,16 +61,21 @@ class BackupManager {
         }
       }
 
-      // Create metadata file with backup information
+      // Create metadata file with backup information (v2: meta.tobf only)
       final meta = BackupMetadata(
         timestamp: timestamp,
         backupFormatVersion: InternalConfig.currentBackupFormatVersion,
         scope: scope,
         compressed: compress,
       );
-      await _dataStore.storage.writeAsString(
-          pathJoin(backupDir, 'meta.json'), jsonEncode(meta.toJson()));
-
+      final metaBytes = BackupMetadataCodec.encodeFile(
+        meta,
+        encryptionConfig: _dataStore.config.encryptionConfig,
+      );
+      await _dataStore.storage.writeAsBytes(
+        pathJoin(backupDir, BackupMetadataCodec.fileName),
+        metaBytes,
+      );
       if (scope == BackupScope.database) {
         // Full database backup: copy the entire database directory (excluding backups dir)
         final dbRootDir = _dataStore.instancePath!;
@@ -161,34 +166,53 @@ class BackupManager {
     }
   }
 
-  /// Read metadata from a backup directory
-  Future<Map<String, dynamic>> readBackupMetadata(String backupPath) async {
-    final metaPath = pathJoin(backupPath, 'meta.json');
-    if (!await _dataStore.storage.existsFile(metaPath)) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.sysIoNotFound,
-          message: 'Backup metadata file not found at path: $metaPath',
-          target: metaPath,
-          operation: 'readBackupMetadata',
-        )
-      ]);
+  /// Whether [backupRoot] contains package metadata (`meta.tobf` or legacy JSON).
+  Future<bool> _hasBackupMeta(String backupRoot) async {
+    if (await _dataStore.storage
+        .existsFile(pathJoin(backupRoot, BackupMetadataCodec.fileName))) {
+      return true;
+    }
+    return await _dataStore.storage
+        .existsFile(pathJoin(backupRoot, LegacyBackupPaths.metaFileName));
+  }
+
+  /// Read metadata from a backup directory.
+  ///
+  /// Prefer `meta.tobf`; fall back to legacy `meta.json` when binary is absent,
+  /// empty, or undecodable (corrupt TOBF + good JSON is recoverable).
+  Future<BackupMetadata> readBackupMetadata(String backupPath) async {
+    final tobfPath = pathJoin(backupPath, BackupMetadataCodec.fileName);
+    if (await _dataStore.storage.existsFile(tobfPath)) {
+      try {
+        final bytes = await _dataStore.storage.readAsBytes(tobfPath);
+        if (bytes.isNotEmpty) {
+          return BackupMetadataCodec.decodeFile(bytes);
+        }
+      } catch (e) {
+        Logger.warn(
+          'Backup meta.tobf unreadable; trying legacy meta.json',
+          rawError: e,
+        );
+      }
     }
 
-    final metaJson = await _dataStore.storage.readAsString(metaPath);
-    if (metaJson == null) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.sysBackupCorrupted,
-          message:
-              'Failed to read backup metadata: file is empty or corrupted.',
-          target: metaPath,
-          operation: 'readBackupMetadata',
-        )
-      ]);
+    final jsonPath = pathJoin(backupPath, LegacyBackupPaths.metaFileName);
+    if (await _dataStore.storage.existsFile(jsonPath)) {
+      final metaJson = await _dataStore.storage.readAsString(jsonPath);
+      final parsed = LegacyBackupMetaJson.tryParse(metaJson ?? '');
+      if (parsed != null) return parsed;
     }
 
-    return jsonDecode(metaJson) as Map<String, dynamic>;
+    throw DbException([
+      GeneralStatus(
+        type: ResultType.sysBackupCorrupted,
+        message: 'Backup metadata missing or corrupted under: $backupPath '
+            '(expected ${BackupMetadataCodec.fileName} or '
+            '${LegacyBackupPaths.metaFileName})',
+        target: backupPath,
+        operation: 'readBackupMetadata',
+      )
+    ]);
   }
 
   /// Clean the database root directory but preserve specific directories
@@ -262,8 +286,12 @@ class BackupManager {
       for (final itemPath in backupItems) {
         final name = _getFileName(itemPath);
 
-        // Skip metadata file and backups directory
-        if (name == 'meta.json' || name == 'backups') continue;
+        // Skip package metadata and backups directory
+        if (name == BackupMetadataCodec.fileName ||
+            name == LegacyBackupPaths.metaFileName ||
+            name == 'backups') {
+          continue;
+        }
 
         final targetPath = pathJoin(dbRootDir, name);
         final isDir = await _isDirectory(itemPath);
@@ -334,7 +362,7 @@ class BackupManager {
       final String originalInput = backupPath;
       final bool inputIsZip = originalInput.toLowerCase().endsWith('.zip');
 
-      // Normalize to a backup root directory that contains meta.json
+      // Normalize to a backup root directory that contains package metadata
       String normalizedRoot = originalInput;
       String? extractedTempDir;
 
@@ -342,9 +370,8 @@ class BackupManager {
         // Extract zip into a temporary directory
         extractedTempDir = await _extractZipBackup(originalInput);
         normalizedRoot = extractedTempDir;
-      } else if (await _dataStore.storage
-          .existsFile(pathJoin(originalInput, 'meta.json'))) {
-        // Accept as backup root if it contains meta.json even when directory APIs are unreliable
+      } else if (await _hasBackupMeta(originalInput)) {
+        // Accept as backup root if it contains meta even when directory APIs are unreliable
         normalizedRoot = originalInput;
       } else if (await _isDirectory(originalInput)) {
         // Already a directory root
@@ -354,29 +381,29 @@ class BackupManager {
           InvalidArgumentStatus(
             type: ResultType.devInvalidArgumentFormat,
             message:
-                'Invalid backup path: $originalInput. Path is neither a zip file nor a directory containing meta.json.',
+                'Invalid backup path: $originalInput. Path is neither a zip '
+                'file nor a directory containing ${BackupMetadataCodec.fileName} '
+                'or ${LegacyBackupPaths.metaFileName}.',
             parameterName: 'backupPath',
             passedValue: originalInput,
           )
         ]);
       }
 
-      // Ensure meta.json exists under normalizedRoot
-      final metaPath = pathJoin(normalizedRoot, 'meta.json');
-      if (!await _dataStore.storage.existsFile(metaPath)) {
+      // Ensure package metadata exists under normalizedRoot
+      if (!await _hasBackupMeta(normalizedRoot)) {
         throw DbException([
           GeneralStatus(
             type: ResultType.sysBackupCorrupted,
             message: 'Backup metadata file not found under: $normalizedRoot',
-            target: metaPath,
+            target: normalizedRoot,
             operation: 'restore',
           )
         ]);
       }
 
       // Read metadata to choose restore scope
-      final metaMap = await readBackupMetadata(normalizedRoot);
-      final metadata = BackupMetadata.fromJson(metaMap);
+      final metadata = await readBackupMetadata(normalizedRoot);
       final dbRootDir = _dataStore.instancePath!;
 
       // Quiesce database IO before deleting/replacing directories to avoid ENOTEMPTY/EBUSY races.
@@ -449,8 +476,10 @@ class BackupManager {
   }
 
   /// Verify backup integrity
-  /// [fast] = true: only do fast verification (zip exists & size threshold, directory exists & meta.json exists)
-  /// [fast] = false: parse BackupMetadata and do more strict structure verification based on scope
+  /// [fast] = true: only do fast verification (zip exists & size threshold,
+  ///   directory exists & package meta exists)
+  /// [fast] = false: parse [BackupMetadata] and do more strict structure
+  ///   verification based on scope
   Future<bool> verifyBackup(String backupPath, {bool fast = true}) async {
     try {
       // Determine backup type
@@ -474,10 +503,13 @@ class BackupManager {
 
           if (fast) return true;
 
-          // Strict: decode zip to check required file exists without full extract
-          // Use platform verify to inspect entries efficiently
+          // Strict: zip must contain meta.tobf or legacy meta.json
+          if (await PlatformHandler.verifyZipFile(backupPath,
+              requiredFile: BackupMetadataCodec.fileName)) {
+            return true;
+          }
           return await PlatformHandler.verifyZipFile(backupPath,
-              requiredFile: 'meta.json');
+              requiredFile: LegacyBackupPaths.metaFileName);
         } catch (e) {
           Logger.error('Zip file verification failed', rawError: e);
           return false;
@@ -485,18 +517,15 @@ class BackupManager {
       }
 
       // For directories, check for essential components
-      final metaPath = pathJoin(backupPath, 'meta.json');
-      if (!await _dataStore.storage.existsFile(metaPath)) {
+      if (!await _hasBackupMeta(backupPath)) {
         Logger.error('Missing metadata file in backup');
         return false;
       }
 
-      // Read metadata to determine backup scope (use BackupMetadata model)
+      // Read metadata to determine backup scope
       if (fast) {
-        // Fast: only check if meta.json can be parsed
         try {
-          final metaMap = await readBackupMetadata(backupPath);
-          BackupMetadata.fromJson(metaMap);
+          await readBackupMetadata(backupPath);
           return true;
         } catch (e) {
           Logger.error('Fast verify: failed to parse metadata', rawError: e);
@@ -504,8 +533,7 @@ class BackupManager {
         }
       }
 
-      final metaMap = await readBackupMetadata(backupPath);
-      final meta = BackupMetadata.fromJson(metaMap);
+      final meta = await readBackupMetadata(backupPath);
 
       // Build standardized paths via PathManager
       final backupSpaceDir =
@@ -598,6 +626,7 @@ class BackupManager {
       final extension = path.split('.').last.toLowerCase();
       final commonFileExtensions = {
         'json',
+        'tobf',
         'txt',
         'dat',
         'idx',
