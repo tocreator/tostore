@@ -1,9 +1,12 @@
 import '../handler/common.dart';
 import 'backup_scope.dart';
 
-/// Structured backup metadata stored as meta.json inside each backup entry
+/// Structured backup metadata stored as `meta.tobf` (v2+) inside each backup.
+///
+/// Legacy packages used `meta.json`; parsing lives in
+/// `upgrades/legacy_model/pre_v3.dart` only.
 class BackupMetadata {
-  final String timestamp; // ISO8601 string
+  final String timestamp; // ISO8601 string (filesystem-safe form)
   final int backupFormatVersion; // backup package format version
   final BackupScope scope; // backup scope
   final bool compressed; // whether the backup entry is a zip archive
@@ -14,50 +17,4 @@ class BackupMetadata {
     required this.scope,
     required this.compressed,
   });
-
-  Map<String, dynamic> toJson() => {
-        'timestamp': timestamp,
-        'backupFormatVersion': backupFormatVersion,
-        'scope': scope.toString().split('.').last,
-        'compressed': compressed,
-      };
-
-  static BackupMetadata fromJson(Map<String, dynamic> json) {
-    final String ts = (json['timestamp'] as String?) ?? '';
-    final int backupFormatVersion = resolveVersionValue(
-        json['backupFormatVersion'], InternalConfig.legacyBackupFormatVersion);
-    final bool comp = (json['compressed'] as bool?) ?? false;
-
-    // Scope: prefer explicit scope; fall back to legacy 'type' (full/partial)
-    final String? scopeStr = json['scope'] as String?;
-    BackupScope scope;
-    if (scopeStr != null) {
-      switch (scopeStr) {
-        case 'database':
-          scope = BackupScope.database;
-          break;
-        case 'currentSpace':
-          scope = BackupScope.currentSpace;
-          break;
-        case 'currentSpaceWithGlobal':
-          scope = BackupScope.currentSpaceWithGlobal;
-          break;
-        default:
-          scope = BackupScope.currentSpaceWithGlobal;
-      }
-    } else {
-      // Legacy compatibility: json['type'] == 'full' => database; otherwise partial
-      final String legacyType = (json['type'] as String?) ?? 'partial';
-      scope = legacyType == 'full'
-          ? BackupScope.database
-          : BackupScope.currentSpaceWithGlobal;
-    }
-
-    return BackupMetadata(
-      timestamp: ts,
-      backupFormatVersion: backupFormatVersion,
-      scope: scope,
-      compressed: comp,
-    );
-  }
 }
