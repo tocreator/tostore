@@ -23,14 +23,14 @@ class MigrationMeta {
   /// get the task directory path
   String getTaskDir(int dirIndex) => 'dir_$dirIndex';
 
-  /// convert to json
+  /// convert to json (legacy / tooling). On-disk persistence uses MigrationMetaCodec.
   Map<String, dynamic> toJson() => {
         'directoryMapping': directoryMapping.toJson(),
         if (keyMigrationInfo != null)
           'keyMigrationInfo': keyMigrationInfo!.toJson(),
       };
 
-  /// create from json
+  /// create from json (legacy upgrade path). On-disk persistence uses MigrationMetaCodec.
   factory MigrationMeta.fromJson(Map<String, dynamic> json) {
     // Handle legacy format (v1) for backward compatibility during upgrade
     if (json.containsKey('dirUsage') || json.containsKey('taskIndex')) {
