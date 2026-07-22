@@ -5,6 +5,8 @@ import 'dart:typed_data';
 
 import '../handler/binary_schema_codec.dart';
 import '../handler/logger.dart';
+import '../handler/migration_meta_codec.dart';
+import '../handler/migration_task_codec.dart';
 import '../model/background_write_entry.dart';
 import '../model/background_write_type.dart';
 import '../model/buffer_entry.dart';
@@ -3606,11 +3608,15 @@ class MigrationManager {
 
     try {
       final metaPath = _dataStore.pathManager.getMigrationMetaPath();
-      final metaContent = await _dataStore.storage.readAsString(metaPath);
-      if (metaContent != null && metaContent.isNotEmpty) {
-        _migrationMetaCache = MigrationMeta.fromJson(jsonDecode(metaContent));
-      } else {
+      if (!await _dataStore.storage.existsFile(metaPath)) {
         _migrationMetaCache = MigrationMeta.initial();
+      } else {
+        final bytes = await _dataStore.storage.readAsBytes(metaPath);
+        if (bytes.isEmpty) {
+          _migrationMetaCache = MigrationMeta.initial();
+        } else {
+          _migrationMetaCache = MigrationMetaCodec.decodeFile(bytes);
+        }
       }
     } catch (e) {
       Logger.warn('Load migration meta failed, use initial', rawError: e);
@@ -3643,8 +3649,11 @@ class MigrationManager {
   Future<void> _saveMigrationMeta(MigrationMeta meta) async {
     try {
       final metaPath = _dataStore.pathManager.getMigrationMetaPath();
-      await _dataStore.storage
-          .writeAsString(metaPath, jsonEncode(meta.toJson()));
+      final bytes = MigrationMetaCodec.encodeFile(
+        meta,
+        encryptionConfig: _dataStore.config.encryptionConfig,
+      );
+      await _dataStore.storage.writeAsBytes(metaPath, bytes);
 
       // Update cache after successful save
       _migrationMetaCache = meta;
@@ -3658,7 +3667,11 @@ class MigrationManager {
   Future<void> _saveMigrationTask(MigrationTask task) async {
     final taskPath =
         _dataStore.pathManager.getMigrationTaskPath(task.dirIndex, task.taskId);
-    await _dataStore.storage.writeAsString(taskPath, jsonEncode(task.toJson()));
+    final bytes = MigrationTaskCodec.encodeFile(
+      task,
+      encryptionConfig: _dataStore.config.encryptionConfig,
+    );
+    await _dataStore.storage.writeAsBytes(taskPath, bytes);
 
     // update meta data with directory mapping
     final meta = await _getOrLoadMigrationMeta();
@@ -3684,9 +3697,11 @@ class MigrationManager {
       }
     }
 
-    // Increment new directory count
-    final newCount = newDirToFileCount[task.dirIndex] ?? 0;
-    newDirToFileCount[task.dirIndex] = newCount + 1;
+    // Increment only for new tasks or cross-directory moves (not in-place updates).
+    if (existingDirIndex == null || existingDirIndex != task.dirIndex) {
+      final newCount = newDirToFileCount[task.dirIndex] ?? 0;
+      newDirToFileCount[task.dirIndex] = newCount + 1;
+    }
 
     final updatedMapping = DirectoryMappingString(
       idToDir: newIdToDir,
@@ -5045,10 +5060,10 @@ class MigrationManager {
           continue;
         }
 
-        final taskContent = await _dataStore.storage.readAsString(taskPath);
+        final taskBytes = await _dataStore.storage.readAsBytes(taskPath);
 
-        if (taskContent != null && taskContent.isNotEmpty) {
-          final task = MigrationTask.fromJson(jsonDecode(taskContent));
+        if (taskBytes.isNotEmpty) {
+          final task = MigrationTaskCodec.decodeFile(taskBytes);
 
           if (task.pendingMigrationSpaces.isNotEmpty) {
             if (_pendingTasks.any((t) => t.taskId == task.taskId)) continue;
@@ -5129,9 +5144,9 @@ class MigrationManager {
           continue;
         }
 
-        final content = await _dataStore.storage.readAsString(taskPath);
-        if (content != null && content.isNotEmpty) {
-          final task = MigrationTask.fromJson(jsonDecode(content));
+        final content = await _dataStore.storage.readAsBytes(taskPath);
+        if (content.isNotEmpty) {
+          final task = MigrationTaskCodec.decodeFile(content);
           if (task.pendingMigrationSpaces.isEmpty) continue;
           if (tableUid != null && task.tableUid != tableUid) continue;
           found.add(taskId);
@@ -5267,9 +5282,9 @@ class MigrationManager {
         );
       }
 
-      final taskContent = await _dataStore.storage.readAsString(taskPath);
+      final taskBytes = await _dataStore.storage.readAsBytes(taskPath);
 
-      if (taskContent == null || taskContent.isEmpty) {
+      if (taskBytes.isEmpty) {
         // File exists but is empty - cleanup mapping
         Logger.warn(
           'Task file is empty: taskId[$taskId], dirIndex[$dirIndex], cleaning up mapping',
@@ -5279,8 +5294,7 @@ class MigrationManager {
       }
 
       // parse task information
-      final taskJson = jsonDecode(taskContent);
-      final task = MigrationTask.fromJson(taskJson);
+      final task = MigrationTaskCodec.decodeFile(taskBytes);
 
       // get processed and pending spaces information
       final allSpaces = await _getAllSpaces();
