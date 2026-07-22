@@ -15,9 +15,16 @@ import '../model/transaction_models.dart';
 
 /// One-shot migration of WAL / transaction meta from JSON → `.tobf`.
 ///
-/// Crash-safe / idempotent:
-/// - Already-valid `.tobf` → only delete residual JSON after decode succeeds.
-/// - JSON present without `.tobf` → write TOBF → verify decode → delete JSON.
+/// Crash-safe / idempotent (safe to re-run after interrupt):
+/// - Valid `.tobf` → delete residual JSON only after decode succeeds.
+/// - Corrupt/partial `.tobf` **with** legacy JSON → delete TOBF, rewrite from
+///   JSON, verify, then delete JSON.
+/// - Corrupt/partial `.tobf` **without** JSON → delete TOBF and continue as
+///   fresh (never hard-fail the upgrade solely due to a half-written frame).
+/// - Unreadable legacy JSON → drop empty residuals / skip poison files and
+///   continue (WalManager / Txn runtime recreate as needed).
+/// - Write-then-verify failure → keep JSON, delete partial TOBF, rethrow so
+///   the next startup retries the same rewrite path.
 /// - Never deletes JSON unless the matching `.tobf` decodes successfully.
 ///
 /// **Call site**: blocking [V3Upgrade] only (before version bump), after
@@ -71,33 +78,44 @@ final class MetaFormatMigration {
     final hasJson = await dataStore.storage.existsFile(jsonPath);
     final hasBakJson = await dataStore.storage.existsFile(bakJsonPath);
 
-    // Primary TOBF present: delete residual JSON only after decode succeeds.
+    var needRewriteFromJson = !hasTobf && (hasJson || hasBakJson);
+
     if (hasTobf) {
       try {
-        await _verifyWalTobf(dataStore, tobfPath);
+        await _tryDecodeWalTobf(dataStore, tobfPath);
+        if (hasJson || hasBakJson) {
+          Logger.warn(
+            'MetaFormatMigration: residual WAL JSON found for space '
+            '[$spaceName]; deleting after TOBF verify',
+          );
+        }
+        await _deleteIfExists(dataStore, jsonPath);
+        await _deleteIfExists(dataStore, bakJsonPath);
+        return;
       } catch (e) {
         if (hasJson || hasBakJson) {
-          Logger.error(
-            'MetaFormatMigration: WAL TOBF corrupt for space [$spaceName]; '
-            'keeping legacy JSON for retry',
+          Logger.warn(
+            'MetaFormatMigration: WAL TOBF corrupt/partial for space '
+            '[$spaceName]; recovering from legacy JSON',
             rawError: e,
           );
-          rethrow;
+          await _deleteIfExists(dataStore, tobfPath);
+          await _deleteIfExists(dataStore, bakTobfPath);
+          needRewriteFromJson = true;
+        } else {
+          Logger.warn(
+            'MetaFormatMigration: WAL TOBF corrupt for space [$spaceName] '
+            'with no legacy JSON; removing and treating as fresh',
+            rawError: e,
+          );
+          await _deleteIfExists(dataStore, tobfPath);
+          await _deleteIfExists(dataStore, bakTobfPath);
+          return;
         }
-        rethrow;
       }
-      if (hasJson || hasBakJson) {
-        Logger.warn(
-          'MetaFormatMigration: residual WAL JSON found for space '
-          '[$spaceName]; deleting after TOBF verify',
-        );
-      }
-      await _deleteIfExists(dataStore, jsonPath);
-      await _deleteIfExists(dataStore, bakJsonPath);
-      return;
     }
 
-    if (!hasJson && !hasBakJson) {
+    if (!needRewriteFromJson) {
       return; // Fresh space: WalManager will create TOBF on first persist.
     }
 
@@ -140,27 +158,17 @@ final class MetaFormatMigration {
     }
 
     if (meta == null) {
-      // Empty residual files only: drop and continue as fresh WAL meta.
-      final primaryEmptyFile = hasJson &&
-          ((await dataStore.storage.readAsString(jsonPath))?.trim().isEmpty ??
-              true);
-      final bakEmptyFile = !hasBakJson ||
-          ((await dataStore.storage.readAsString(bakJsonPath))
-                  ?.trim()
-                  .isEmpty ??
-              true);
-      if (primaryEmptyFile && bakEmptyFile) {
-        await _deleteIfExists(dataStore, jsonPath);
-        await _deleteIfExists(dataStore, bakJsonPath);
-        return;
-      }
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message:
-              'MetaFormatMigration: unreadable WAL JSON for space $spaceName',
-        )
-      ]);
+      // Empty or poison JSON: drop residuals and continue as fresh WAL.
+      // Never hard-fail V3 solely because legacy WAL meta JSON is unreadable.
+      Logger.warn(
+        'MetaFormatMigration: WAL JSON unusable for space [$spaceName]; '
+        'treating as fresh WAL meta',
+      );
+      await _deleteIfExists(dataStore, jsonPath);
+      await _deleteIfExists(dataStore, bakJsonPath);
+      await _deleteIfExists(dataStore, tobfPath);
+      await _deleteIfExists(dataStore, bakTobfPath);
+      return;
     }
 
     final bytes = WalMetaCodec.encodeFile(
@@ -168,7 +176,14 @@ final class MetaFormatMigration {
       encryptionConfig: dataStore.config.encryptionConfig,
     );
     await dataStore.storage.writeAsBytes(tobfPath, bytes, flush: true);
-    await _verifyWalTobf(dataStore, tobfPath);
+    try {
+      await _tryDecodeWalTobf(dataStore, tobfPath);
+    } catch (e) {
+      // Keep JSON; remove partial TOBF so retry rewrites from JSON.
+      await _deleteIfExists(dataStore, tobfPath);
+      await _deleteIfExists(dataStore, bakTobfPath);
+      rethrow;
+    }
 
     // Only persist bak.tobf when primary came from backup recovery.
     if (recoveredFromBackup) {
@@ -196,7 +211,7 @@ final class MetaFormatMigration {
     return WalMeta.fromJson(jsonDecode(content) as Map<String, dynamic>);
   }
 
-  static Future<void> _verifyWalTobf(
+  static Future<void> _tryDecodeWalTobf(
     DataStoreImpl dataStore,
     String tobfPath,
   ) async {
@@ -204,8 +219,7 @@ final class MetaFormatMigration {
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,
-          message:
-              'MetaFormatMigration: WAL TOBF missing after write: $tobfPath',
+          message: 'MetaFormatMigration: WAL TOBF missing: $tobfPath',
         )
       ]);
     }
@@ -214,7 +228,7 @@ final class MetaFormatMigration {
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,
-          message: 'MetaFormatMigration: WAL TOBF empty after write: $tobfPath',
+          message: 'MetaFormatMigration: WAL TOBF empty: $tobfPath',
         )
       ]);
     }
@@ -225,8 +239,7 @@ final class MetaFormatMigration {
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,
-          message:
-              'MetaFormatMigration: WAL TOBF unreadable after write: $tobfPath',
+          message: 'MetaFormatMigration: WAL TOBF unreadable: $tobfPath',
         )
       ]);
     }
@@ -250,82 +263,58 @@ final class MetaFormatMigration {
     // Source of truth: activePartitions ∪ currentPartitionIndex (ring wrap;
     // do NOT directory-scan).
     final partitionsToCheck = <int>{};
+    var needRewriteMainFromJson = !hasMainTobf && hasMainJson;
 
     if (hasMainTobf) {
-      TransactionMainMeta? meta;
       try {
-        meta = TxnMetaCodec.decodeMainFile(
+        final meta = TxnMetaCodec.decodeMainFile(
             await dataStore.storage.readAsBytes(mainTobf));
         partitionsToCheck.addAll(meta.activePartitions);
         partitionsToCheck.add(meta.currentPartitionIndex);
-      } catch (e) {
-        Logger.error(
-          'MetaFormatMigration: txn main TOBF unreadable for space '
-          '[$spaceName]',
-          rawError: e,
-        );
         if (hasMainJson) {
-          throw DbException([
-            GeneralStatus(
-              type: ResultType.engError,
-              message: 'MetaFormatMigration: txn main TOBF corrupt for space '
-                  '$spaceName; legacy JSON retained for retry',
-            )
-          ]);
+          Logger.warn(
+            'MetaFormatMigration: residual txn main JSON for space '
+            '[$spaceName]; deleting after TOBF verify',
+          );
+          await _deleteIfExists(dataStore, mainJson);
         }
-        throw DbException([
-          GeneralStatus(
-            type: ResultType.engError,
-            message: 'MetaFormatMigration: txn main TOBF unreadable for space '
-                '$spaceName',
-          )
-        ]);
+      } catch (e) {
+        if (hasMainJson) {
+          Logger.warn(
+            'MetaFormatMigration: txn main TOBF corrupt/partial for space '
+            '[$spaceName]; recovering from legacy JSON',
+            rawError: e,
+          );
+          await _deleteIfExists(dataStore, mainTobf);
+          needRewriteMainFromJson = true;
+        } else {
+          // No JSON: drop half-written TOBF and continue as fresh main meta.
+          Logger.warn(
+            'MetaFormatMigration: txn main TOBF corrupt for space '
+            '[$spaceName] with no legacy JSON; removing and treating as fresh',
+            rawError: e,
+          );
+          await _deleteIfExists(dataStore, mainTobf);
+          partitionsToCheck.add(0);
+        }
       }
-      // Decode succeeded — safe to drop residual JSON.
-      if (hasMainJson) {
-        Logger.warn(
-          'MetaFormatMigration: residual txn main JSON for space '
-          '[$spaceName]; deleting after TOBF verify',
-        );
-        await _deleteIfExists(dataStore, mainJson);
-      }
-    } else if (hasMainJson) {
+    }
+
+    if (needRewriteMainFromJson) {
       Logger.warn(
         'MetaFormatMigration: migrating txn main meta JSON → TOBF for space '
         '[$spaceName]',
       );
-      final content = await dataStore.storage.readAsString(mainJson);
-      if (content == null || content.isEmpty) {
-        await _deleteIfExists(dataStore, mainJson);
-      } else {
-        final meta = TransactionMainMeta.fromJson(
-            jsonDecode(content) as Map<String, dynamic>);
-        partitionsToCheck.addAll(meta.activePartitions);
-        partitionsToCheck.add(meta.currentPartitionIndex);
-        final bytes = TxnMetaCodec.encodeMainFile(
-          meta,
-          encryptionConfig: dataStore.config.encryptionConfig,
-        );
-        await dataStore.storage.writeAsBytes(mainTobf, bytes, flush: true);
-        try {
-          TxnMetaCodec.decodeMainFile(
-              await dataStore.storage.readAsBytes(mainTobf));
-        } catch (e) {
-          Logger.error(
-            'MetaFormatMigration: txn main TOBF verify failed for space '
-            '[$spaceName]',
-            rawError: e,
-          );
-          throw DbException([
-            GeneralStatus(
-              type: ResultType.engError,
-              message:
-                  'MetaFormatMigration: txn main TOBF unreadable after write '
-                  'for space $spaceName',
-            )
-          ]);
-        }
-        await _deleteIfExists(dataStore, mainJson);
+      final rewritten = await _rewriteTxnMainFromJson(
+        dataStore,
+        spaceName: spaceName,
+        mainTobf: mainTobf,
+        mainJson: mainJson,
+        partitionsToCheck: partitionsToCheck,
+      );
+      if (!rewritten) {
+        // Poison/empty JSON — continue with default partition 0.
+        partitionsToCheck.add(0);
       }
     }
 
@@ -338,6 +327,59 @@ final class MetaFormatMigration {
     );
   }
 
+  /// Returns true when main TOBF was written and verified from JSON.
+  static Future<bool> _rewriteTxnMainFromJson(
+    DataStoreImpl dataStore, {
+    required String spaceName,
+    required String mainTobf,
+    required String mainJson,
+    required Set<int> partitionsToCheck,
+  }) async {
+    final content = await dataStore.storage.readAsString(mainJson);
+    if (content == null || content.trim().isEmpty) {
+      await _deleteIfExists(dataStore, mainJson);
+      return false;
+    }
+
+    late final TransactionMainMeta meta;
+    try {
+      meta = TransactionMainMeta.fromJson(
+          jsonDecode(content) as Map<String, dynamic>);
+    } catch (e) {
+      Logger.warn(
+        'MetaFormatMigration: txn main JSON unreadable for space '
+        '[$spaceName]; treating as fresh',
+        rawError: e,
+      );
+      // Leave poison JSON for inspection; do not block upgrade.
+      return false;
+    }
+
+    partitionsToCheck.addAll(meta.activePartitions);
+    partitionsToCheck.add(meta.currentPartitionIndex);
+
+    final bytes = TxnMetaCodec.encodeMainFile(
+      meta,
+      encryptionConfig: dataStore.config.encryptionConfig,
+    );
+    await dataStore.storage.writeAsBytes(mainTobf, bytes, flush: true);
+    try {
+      TxnMetaCodec.decodeMainFile(
+          await dataStore.storage.readAsBytes(mainTobf));
+    } catch (e) {
+      Logger.error(
+        'MetaFormatMigration: txn main TOBF verify failed for space '
+        '[$spaceName]',
+        rawError: e,
+      );
+      // Keep JSON; remove partial TOBF so next startup rewrites cleanly.
+      await _deleteIfExists(dataStore, mainTobf);
+      rethrow;
+    }
+    await _deleteIfExists(dataStore, mainJson);
+    return true;
+  }
+
   /// Migrate partition metas listed in [knownPartitions] only.
   static Future<void> _migrateTxnPartitionMetas(
     DataStoreImpl dataStore, {
@@ -346,7 +388,7 @@ final class MetaFormatMigration {
   }) async {
     final yieldController = YieldController('meta_format_txn_partitions');
     final indexes = knownPartitions.toList()..sort();
-    DbException? firstError;
+    DbException? retryableError;
 
     for (final partitionIndex in indexes) {
       await yieldController.maybeYield();
@@ -366,48 +408,67 @@ final class MetaFormatMigration {
       final hasTobf = await dataStore.storage.existsFile(tobf);
       final hasJson = await dataStore.storage.existsFile(json);
 
+      var needRewriteFromJson = !hasTobf && hasJson;
+
       if (hasTobf) {
-        // Verify before deleting residual JSON.
         try {
           final bytes = await dataStore.storage.readAsBytes(tobf);
           TxnMetaCodec.decodePartitionFile(bytes);
           if (hasJson) {
             await _deleteIfExists(dataStore, json);
           }
+          continue;
         } catch (e) {
-          Logger.error(
-            'MetaFormatMigration: txn partition TOBF corrupt p$partitionIndex '
-            'space [$spaceName]; keeping JSON if present',
-            rawError: e,
-          );
-          firstError ??= DbException([
-            GeneralStatus(
-              type: ResultType.engError,
-              message: 'MetaFormatMigration: txn partition TOBF corrupt '
-                  'p$partitionIndex space $spaceName',
-            )
-          ]);
+          if (hasJson) {
+            Logger.warn(
+              'MetaFormatMigration: txn partition TOBF corrupt/partial '
+              'p$partitionIndex space [$spaceName]; recovering from JSON',
+              rawError: e,
+            );
+            await _deleteIfExists(dataStore, tobf);
+            needRewriteFromJson = true;
+          } else {
+            // No JSON: drop half-written TOBF and continue (fresh partition).
+            Logger.warn(
+              'MetaFormatMigration: txn partition TOBF corrupt '
+              'p$partitionIndex space [$spaceName]; no legacy JSON — '
+              'removing and continuing',
+              rawError: e,
+            );
+            await _deleteIfExists(dataStore, tobf);
+            continue;
+          }
         }
-        continue;
       }
 
-      if (!hasJson) continue;
+      if (!needRewriteFromJson) continue;
 
       try {
         final content = await dataStore.storage.readAsString(json);
-        if (content == null || content.isEmpty) {
+        if (content == null || content.trim().isEmpty) {
           await _deleteIfExists(dataStore, json);
           continue;
         }
-        final meta = TransactionPartitionMeta.fromJson(
-            jsonDecode(content) as Map<String, dynamic>);
+
+        late final TransactionPartitionMeta meta;
+        try {
+          meta = TransactionPartitionMeta.fromJson(
+              jsonDecode(content) as Map<String, dynamic>);
+        } catch (e) {
+          Logger.warn(
+            'MetaFormatMigration: txn partition JSON unreadable '
+            'p$partitionIndex space [$spaceName]; skipping',
+            rawError: e,
+          );
+          // Leave poison JSON; do not block the rest of V3.
+          continue;
+        }
+
         final bytes = TxnMetaCodec.encodePartitionFile(
           meta,
           encryptionConfig: dataStore.config.encryptionConfig,
         );
         await dataStore.storage.writeAsBytes(tobf, bytes, flush: true);
-        // Disk verify before deleting JSON (sample = every newly written file;
-        // partition metas are tiny so cost is negligible vs data-loss risk).
         final written = await dataStore.storage.readAsBytes(tobf);
         TxnMetaCodec.decodePartitionFile(written);
         await _deleteIfExists(dataStore, json);
@@ -418,12 +479,9 @@ final class MetaFormatMigration {
           rawError: e,
         );
         // Leave JSON; remove possibly corrupt TOBF so retry rewrites cleanly.
-        try {
-          if (await dataStore.storage.existsFile(tobf)) {
-            await dataStore.storage.deleteFile(tobf);
-          }
-        } catch (_) {}
-        firstError ??= DbException.wrap(
+        await _deleteIfExists(dataStore, tobf);
+        // Retryable: JSON still present — surface after sweep so V3 re-runs.
+        retryableError ??= DbException.wrap(
           e,
           fallbackType: ResultType.engError,
           fallbackMessage: 'MetaFormatMigration: txn partition meta failed '
@@ -432,7 +490,7 @@ final class MetaFormatMigration {
       }
     }
 
-    if (firstError != null) throw firstError;
+    if (retryableError != null) throw retryableError;
   }
 
   static Future<void> _deleteIfExists(
