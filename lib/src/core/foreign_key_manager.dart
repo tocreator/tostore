@@ -8,7 +8,7 @@ import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/table_context.dart';
 import 'data_store_impl.dart';
-import '../Interface/chain_builder.dart';
+import '../interface/chain_builder.dart';
 import '../model/table_identity.dart';
 
 /// ForeignKeyManager: Foreign key manager
