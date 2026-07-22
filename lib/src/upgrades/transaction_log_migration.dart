@@ -6,6 +6,7 @@ import 'package:path/path.dart' as path;
 import '../core/data_store_impl.dart';
 import '../handler/logger.dart';
 import '../handler/txn_encoder.dart';
+import '../handler/txn_meta_codec.dart';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
@@ -94,14 +95,36 @@ class TransactionLogMigration {
     if (firstError != null) throw firstError;
   }
 
-  /// Returns active partition indexes from `transactions/meta.json`, or null
-  /// when the meta file is missing or unreadable.
+  /// Returns active partition indexes from legacy `transactions/meta.json`
+  /// (or `.tobf` if already migrated), or null when missing/unreadable.
   Future<Set<int>?> _loadActivePartitions(String spaceName) async {
-    final metaPath =
+    final tobfPath =
         _dataStore.pathManager.getTransactionMainMetaPath(spaceName: spaceName);
-    if (!await _dataStore.storage.existsFile(metaPath)) return null;
+    final jsonPath = path.join(
+      _dataStore.pathManager.getTransactionRootPath(spaceName: spaceName),
+      'meta.json',
+    );
+
     try {
-      final content = await _dataStore.storage.readAsString(metaPath);
+      if (await _dataStore.storage.existsFile(tobfPath)) {
+        final bytes = await _dataStore.storage.readAsBytes(tobfPath);
+        if (bytes.isNotEmpty) {
+          final meta = TxnMetaCodec.decodeMainFile(bytes);
+          final partitions = Set<int>.from(meta.activePartitions);
+          partitions.add(meta.currentPartitionIndex);
+          return partitions;
+        }
+      }
+    } catch (e) {
+      Logger.warn(
+        'v3: failed to parse txn TOBF meta for space $spaceName',
+        rawError: e,
+      );
+    }
+
+    if (!await _dataStore.storage.existsFile(jsonPath)) return null;
+    try {
+      final content = await _dataStore.storage.readAsString(jsonPath);
       if (content == null || content.isEmpty) return null;
       final meta = TransactionMainMeta.fromJson(
           jsonDecode(content) as Map<String, dynamic>);
