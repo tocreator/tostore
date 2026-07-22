@@ -33,8 +33,9 @@ class InternalConfig {
   static const int legacyIndexVersion = 0; // legacy file default value
 
   /// backup package format version used by backup
-  static const int currentBackupFormatVersion = 1;
-  static const int legacyBackupFormatVersion = 1; // legacy file default value
+  /// v1 = legacy `meta.json`; v2 = `meta.tobf` (field-tag + optional full-scope AEAD)
+  static const int currentBackupFormatVersion = 2;
+  static const int legacyBackupFormatVersion = 1; // legacy JSON default
 
   /// Max entries (files/subdirs) per directory.
   ///
