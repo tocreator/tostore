@@ -4,9 +4,9 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as path;
 
-import '../Interface/file_storage_impl_stub.dart'
+import '../interface/file_storage_impl_stub.dart'
     if (dart.library.io) 'file_storage_impl.dart';
-import '../Interface/storage_interface.dart';
+import '../interface/storage_interface.dart';
 import '../handler/logger.dart';
 import '../handler/platform_handler.dart';
 import '../model/data_store_config.dart';
@@ -18,7 +18,7 @@ import 'lock_manager.dart';
 import 'transaction_context.dart';
 // Import platform-specific implementations with conditional imports
 import 'web_storage_impl.dart'
-    if (dart.library.io) '../Interface/web_storage_impl_stub.dart';
+    if (dart.library.io) '../interface/web_storage_impl_stub.dart';
 
 /// Storage adapter to handle platform-specific storage implementations
 class StorageAdapter implements StorageInterface {
