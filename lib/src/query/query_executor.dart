@@ -3816,169 +3816,18 @@ final class _QueryCursorToken {
       final bytes = base64Url.decode(base64Url.normalize(raw));
       if (bytes.isEmpty) return null;
 
-      if (bytes[0] == 0xFE) {
-        return _tryDecodeBinary(bytes);
-      }
-
-      final decoded = utf8.decode(bytes);
-      final obj = jsonDecode(decoded);
-      if (obj is! Map) {
+      // Only binary cursor tokens (magic 0xFE) are accepted.
+      if (bytes[0] != 0xFE) {
         throw DbException([
           InvalidArgumentStatus(
             type: ResultType.devInvalidCursorPayload,
-            message: 'Invalid cursor token payload.',
+            message:
+                'Unsupported cursor token format (expected binary 0xFE prefix).',
             parameterName: 'cursor',
           ),
         ]);
       }
-      final int v = (obj['v'] is int) ? (obj['v'] as int) : -1;
-      if (v != _currentVersion) {
-        throw DbException([
-          InvalidArgumentStatus(
-            type: ResultType.devInvalidCursorPayload,
-            message: 'Unsupported cursor token version: $v',
-            parameterName: 'cursor',
-          ),
-        ]);
-      }
-      final String t = (obj['t'] ?? '').toString();
-      final String m = (obj['m'] ?? '').toString();
-      if (t.isEmpty || m.isEmpty) {
-        throw DbException([
-          InvalidArgumentStatus(
-            type: ResultType.devInvalidCursorPayload,
-            message: 'Invalid cursor token.',
-            parameterName: 'cursor',
-          ),
-        ]);
-      }
-
-      final querySigHash = obj['s'] as int?;
-
-      if (m == 'pk') {
-        final pk = (obj['pk'] ?? '').toString();
-        if (pk.isEmpty) {
-          throw DbException([
-            InvalidArgumentStatus(
-              type: ResultType.devInvalidCursorPayload,
-              message: 'Invalid primary-key cursor token.',
-              parameterName: 'cursor',
-            ),
-          ]);
-        }
-        final bool reverse = obj['r'] == true;
-        final bool isBackward = obj['b'] == true;
-        return _QueryCursorToken.primaryKey(
-          tableUid: TableUid(t),
-          primaryKey: pk,
-          reverse: reverse,
-          isBackward: isBackward,
-          querySigHash: querySigHash,
-        );
-      }
-
-      if (m == 'idx') {
-        final idx = (obj['i'] ?? '').toString();
-        final k = (obj['k'] ?? '').toString();
-        if (idx.isEmpty || k.isEmpty) {
-          throw DbException([
-            InvalidArgumentStatus(
-              type: ResultType.devInvalidCursorPayload,
-              message: 'Invalid index-key cursor token.',
-              parameterName: 'cursor',
-            ),
-          ]);
-        }
-        final keyBytes =
-            Uint8List.fromList(base64Url.decode(base64Url.normalize(k)));
-        if (keyBytes.isEmpty) {
-          throw DbException([
-            InvalidArgumentStatus(
-              type: ResultType.devInvalidCursorPayload,
-              message: 'Invalid index-key cursor token (empty key).',
-              parameterName: 'cursor',
-            ),
-          ]);
-        }
-        final bool isBackward = obj['b'] == true;
-        return _QueryCursorToken.indexKey(
-          tableUid: TableUid(t),
-          indexUid: IndexUid(idx),
-          indexKey: keyBytes,
-          isBackward: isBackward,
-          querySigHash: querySigHash,
-        );
-      }
-
-      if (m == 'sk') {
-        final f = obj['f'];
-        final d = obj['d'];
-        final k = (obj['k'] ?? '').toString();
-        if (f is! List || d is! List || k.isEmpty) {
-          throw DbException([
-            InvalidArgumentStatus(
-              type: ResultType.devInvalidCursorPayload,
-              message: 'Invalid sort-key cursor token.',
-              parameterName: 'cursor',
-              passedValue: null,
-            ),
-          ]);
-        }
-        final fields =
-            f.map((e) => e.toString()).where((e) => e.isNotEmpty).toList();
-        if (fields.isEmpty) {
-          throw DbException([
-            InvalidArgumentStatus(
-              type: ResultType.devInvalidCursorPayload,
-              message: 'Invalid sort-key cursor token (empty fields).',
-              parameterName: 'cursor',
-              passedValue: null,
-            ),
-          ]);
-        }
-        final desc = d.map((e) => e == true).toList(growable: false);
-        if (desc.length != fields.length) {
-          throw DbException([
-            InvalidArgumentStatus(
-              type: ResultType.devInvalidCursorPayload,
-              message:
-                  'Invalid sort-key cursor token (direction length mismatch).',
-              parameterName: 'cursor',
-              passedValue: null,
-            ),
-          ]);
-        }
-        final keyBytes =
-            Uint8List.fromList(base64Url.decode(base64Url.normalize(k)));
-        if (keyBytes.isEmpty) {
-          throw DbException([
-            InvalidArgumentStatus(
-              type: ResultType.devInvalidCursorPayload,
-              message: 'Invalid sort-key cursor token (empty key).',
-              parameterName: 'cursor',
-              passedValue: null,
-            ),
-          ]);
-        }
-        final bool isBackward = obj['b'] == true;
-        return _QueryCursorToken.sortKey(
-          tableUid: TableUid(t),
-          sortFields: fields,
-          sortDesc: desc,
-          sortKey: keyBytes,
-          isBackward: isBackward,
-          querySigHash: querySigHash,
-        );
-      }
-
-      throw DbException([
-        InvalidArgumentStatus(
-          type: ResultType.devInvalidCursorMode,
-          message: 'Unknown cursor token mode.',
-          parameterName: 'cursor',
-          passedValue: null,
-        ),
-      ]);
+      return _tryDecodeBinary(bytes);
     } catch (e) {
       if (e is DbException) rethrow;
       throw DbException([
