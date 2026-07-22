@@ -115,14 +115,12 @@ class FileInfo {
 /// file meta model
 class FileMeta {
   final int version;
-  final FileType type;
   final String name;
   final int fileSizeInBytes;
   final Timestamps timestamps;
 
   FileMeta({
     int? version,
-    required this.type,
     required this.name,
     required this.fileSizeInBytes,
     required this.timestamps,
@@ -130,14 +128,12 @@ class FileMeta {
 
   FileMeta copyWith({
     int? version,
-    FileType? type,
     String? name,
     int? fileSizeInBytes,
     Timestamps? timestamps,
   }) {
     return FileMeta(
       version: version ?? this.version,
-      type: type ?? this.type,
       name: name ?? this.name,
       fileSizeInBytes: fileSizeInBytes ?? this.fileSizeInBytes,
       timestamps: timestamps ?? this.timestamps,
@@ -146,15 +142,13 @@ class FileMeta {
 
   /// deserialize from json
   factory FileMeta.fromJson(Map<String, dynamic> json) {
-    if (json['type'] == null ||
-        json['name'] == null ||
+    if (json['name'] == null ||
         json['fileSizeInBytes'] == null ||
         json['timestamps'] == null) {
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,
           message: 'Missing required fields for FileMeta. Missing fields: ${[
-            if (json['type'] == null) 'type',
             if (json['name'] == null) 'name',
             if (json['fileSizeInBytes'] == null) 'fileSizeInBytes',
             if (json['timestamps'] == null) 'timestamps'
@@ -165,7 +159,6 @@ class FileMeta {
     return FileMeta(
       version: resolveVersionValue(
           json['version'], InternalConfig.legacyTableDataVersion),
-      type: FileType.fromString(json['type'] as String),
       name: json['name'] as String,
       fileSizeInBytes: json['fileSizeInBytes'] is int
           ? json['fileSizeInBytes'] as int
@@ -179,7 +172,6 @@ class FileMeta {
   Map<String, dynamic> toJson() {
     return {
       'version': version,
-      'type': type.key,
       'name': name,
       'fileSizeInBytes': fileSizeInBytes,
       'timestamps': timestamps.toJson(),
@@ -188,7 +180,7 @@ class FileMeta {
 
   @override
   String toString() =>
-      'FileMeta(version: $version, type: ${type.key}, name: $name, fileSizeInBytes: $fileSizeInBytes, timestamps: $timestamps)';
+      'FileMeta(version: $version, name: $name, fileSizeInBytes: $fileSizeInBytes, timestamps: $timestamps)';
 }
 
 /// table data meta model
@@ -448,28 +440,6 @@ class Timestamps {
   @override
   String toString() =>
       'Timestamps(created: ${created.toIso8601String()}, modified: ${modified.toIso8601String()})';
-}
-
-enum FileType {
-  data("data", "dat"),
-  schema("schema", "json"),
-  idx("index", "idx"),
-  log("log", "log"),
-  other("other", "txt");
-
-  final String key;
-  final String ext;
-  const FileType(this.key, this.ext);
-
-  static FileType fromString(String value) {
-    for (final e in FileType.values) {
-      if (e.key == value) return e;
-    }
-    return FileType.other;
-  }
-
-  @override
-  String toString() => key;
 }
 
 /// Stable storage slot metadata for a table field.

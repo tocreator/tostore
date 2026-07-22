@@ -80,15 +80,6 @@ class WebStorageImpl implements StorageInterface {
     }
   }
 
-  /// get file type
-  FileType _getFileType(String path) {
-    if (path.endsWith('.dat')) return FileType.data;
-    if (path.contains('schema.')) return FileType.schema;
-    if (path.endsWith('.idx')) return FileType.idx;
-    if (path.endsWith('.log')) return FileType.log;
-    return FileType.other;
-  }
-
   /// list directory content
   @override
   Future<List<String>> listDirectory(String path,
@@ -1090,7 +1081,6 @@ class WebStorageImpl implements StorageInterface {
     final now = DateTime.now();
     final meta = FileMeta(
       version: 1,
-      type: _getFileType(normalizedPath),
       name: _extractFileName(normalizedPath),
       fileSizeInBytes: bytes.length,
       timestamps: Timestamps(
