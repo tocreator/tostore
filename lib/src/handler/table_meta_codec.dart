@@ -7,6 +7,7 @@ import '../model/table_identity.dart';
 import '../model/table_meta.dart';
 import '../model/table_schema.dart';
 import 'binary_codec.dart';
+import 'binary_map_codec.dart';
 
 /// Stable field IDs for TableSchema binary encoding. Reserved: 20..127.
 abstract final class TableSchemaFieldId {
@@ -117,7 +118,9 @@ abstract final class _DynValueType {
   static const int double_ = 3;
   static const int string_ = 4;
   static const int bytes_ = 5;
-  static const int json_ = 6;
+
+  /// Nested Map/List/other via [BinaryMapCodec] (MessagePack), not JSON text.
+  static const int packed_ = 6;
 }
 
 /// Engine-internal binary codecs for TableSchema / FieldStorageLayout / TableMeta.
@@ -877,11 +880,11 @@ final class TableMetaCodec {
       w.writeBytes(value);
       return;
     }
-    // Fallback: JSON-encode maps/lists/other
+    // Nested Map/List/other: MessagePack (aligns with SchemaBinaryCodec).
     w.writeFieldTag(1, WireType.varint);
-    w.writeVarint(_DynValueType.json_);
+    w.writeVarint(_DynValueType.packed_);
     w.writeFieldTag(2, WireType.lengthDelimited);
-    w.writeString(jsonEncode(value));
+    w.writeBytes(BinaryMapCodec.encodeValue(value));
   }
 
   static dynamic _readDynValue(BinaryReader r) {
@@ -910,8 +913,8 @@ final class TableMetaCodec {
             case _DynValueType.bytes_:
               value = r.readBytes();
               break;
-            case _DynValueType.json_:
-              value = jsonDecode(r.readString());
+            case _DynValueType.packed_:
+              value = BinaryMapCodec.decodeValue(r.readBytes());
               break;
             default:
               r.skipField(wireType);
