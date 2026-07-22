@@ -91,6 +91,37 @@ class TableSchema {
     this.autoIndexes,
   });
 
+  /// Reconstruct a fully persisted schema snapshot (binary codec / migration).
+  factory TableSchema.rehydrate({
+    required String name,
+    required PrimaryKeyConfig primaryKeyConfig,
+    required List<FieldSchema> fields,
+    List<IndexSchema> indexes = const [],
+    List<ForeignKeySchema> foreignKeys = const [],
+    bool isGlobal = false,
+    String? tableId,
+    TableTtlConfig? ttlConfig,
+    TableUid tableUid = TableUid.empty,
+    String? schemaVersion,
+    bool isSystemTable = false,
+    List<IndexSchema>? autoIndexes,
+  }) {
+    return TableSchema._internal(
+      name: name,
+      primaryKeyConfig: primaryKeyConfig,
+      fields: fields,
+      indexes: indexes,
+      foreignKeys: foreignKeys,
+      isGlobal: isGlobal,
+      tableId: tableId,
+      ttlConfig: ttlConfig,
+      tableUid: tableUid,
+      schemaVersion: schemaVersion,
+      isSystemTable: isSystemTable,
+      autoIndexes: autoIndexes,
+    );
+  }
+
   /// Get primary key name
   String get primaryKey => primaryKeyConfig.name;
 
@@ -2143,6 +2174,25 @@ class IndexSchema {
     this.vectorConfig,
     this.indexUid = IndexUid.empty,
   });
+
+  /// Reconstruct a fully persisted index snapshot (binary codec / migration).
+  factory IndexSchema.rehydrate({
+    String? indexName,
+    required List<String> fields,
+    bool unique = false,
+    IndexType type = IndexType.btree,
+    VectorIndexConfig? vectorConfig,
+    IndexUid indexUid = IndexUid.empty,
+  }) {
+    return IndexSchema._internal(
+      indexName: indexName,
+      fields: fields,
+      unique: unique,
+      type: type,
+      vectorConfig: vectorConfig,
+      indexUid: indexUid,
+    );
+  }
 
   /// get actual index name
   String get actualIndexName {
