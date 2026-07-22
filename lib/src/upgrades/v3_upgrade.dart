@@ -21,6 +21,7 @@ import '../model/space_manifest.dart';
 import '../model/id_generator.dart';
 import 'config_format_migration.dart';
 import 'legacy_model/pre_v3.dart';
+import 'meta_format_migration.dart';
 import 'transaction_log_migration.dart';
 
 /// Version 3 upgrade:
@@ -33,8 +34,10 @@ import 'transaction_log_migration.dart';
 /// - Writes per-space [SpaceManifest] into `_system_internal_kv_store`
 ///   (`isGlobal: false`, key [SpaceManifestCodec.internalKvKey]).
 /// - Migrates pending parallel-batch `tablePlan` out of A/B journal into WalMeta,
-///   then deletes `journal_a.log` / `journal_b.log`.
+///   then deletes `journal_a.log` / `journal_b.log` (interim JSON; converted below).
 /// - Migrates legacy NDJSON transaction logs to binary ToTX.
+/// - Blocking [MetaFormatMigration]: WAL/Txn `meta.json` → `meta.tobf` (before
+///   version bump so crash mid-migration re-enters V3).
 /// - Bumps version config markers last (after format migrations) for crash resume.
 /// - Cleans up legacy map properties.
 class V3Upgrade {
@@ -362,6 +365,12 @@ class V3Upgrade {
     // Must finish before version bump so crash mid-migration re-runs V3.
     await TransactionLogMigration(_dataStore).migrateAllSpaces(spaces);
 
+    // WAL/Txn meta JSON → TOBF (blocking). Requires EncryptionManager keys when
+    // EncryptionScope.full; KeyManager.initialize is idempotent and will run
+    // again later in normal startup.
+    await _dataStore.keyManager.initialize();
+    await MetaFormatMigration.migrateAllSpaces(_dataStore);
+
     // Single GlobalConfig write: schema hashes + pageSize + dir high-water + version.
     var updatedGlobal = oldGlobalConfig.copyWith(
       userSchemaHash: userSchemaHash,
@@ -470,8 +479,10 @@ class V3Upgrade {
   /// WAL meta JSON (not fields on [PendingParallelBatch]). Paths are built
   /// under [PathManager.getPageRedoRootPath] — no A/B helpers in PathManager.
   Future<void> _migrateParallelJournalIntoWalMeta(String spaceName) async {
-    final walMetaPath =
-        _dataStore.pathManager.getWalMainMetaPath(spaceName: spaceName);
+    // V3 mid-upgrade still uses legacy JSON paths; MetaFormatMigration converts
+    // to .tobf after KeyManager is ready on the next init phase.
+    final walRoot = _dataStore.pathManager.getWalRootPath(spaceName: spaceName);
+    final walMetaPath = path.join(walRoot, 'meta.json');
     WalMeta? meta;
     Map<String, dynamic>? metaJson;
     if (await _dataStore.storage.existsFile(walMetaPath)) {
