@@ -1,6 +1,6 @@
-import '../Interface/platform_handler_web.dart'
+import '../interface/platform_handler_web.dart'
     if (dart.library.io) 'platform_handler_impl.dart';
-import '../Interface/platform_interface.dart';
+import '../interface/platform_interface.dart';
 
 /// Platform capability detection entry point
 class PlatformHandler {
