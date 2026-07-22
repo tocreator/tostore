@@ -1,7 +1,6 @@
 import '../model/data_store_config.dart';
 import '../handler/common.dart';
 import 'data_store_impl.dart';
-import '../model/meta_info.dart';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
@@ -34,11 +33,6 @@ class PathManager {
   String getGlobalPath({String? rootPath}) {
     final String baseRoot = rootPath ?? _instancePath;
     return pathJoin(baseRoot, 'global');
-  }
-
-  /// get schemas directory path (at root level)
-  String getSchemasPath() {
-    return pathJoin(_instancePath, 'schemas');
   }
 
   /// get backup directory path
@@ -84,22 +78,6 @@ class PathManager {
   String getTempDirPath({String? spaceName}) {
     final spacePath = getSpacePath(spaceName: spaceName);
     return pathJoin(spacePath, 'tmp');
-  }
-
-  /// get schema meta file path (database schema metadata)
-  String getSchemaMetaPath() {
-    return pathJoin(getSchemasPath(), 'schema_meta.${FileType.schema.ext}');
-  }
-
-  /// get schema partition file path
-  String getSchemaPartitionFilePath(int partitionIndex, int dirIndex) {
-    final dirPath = getSchemaPartitionDirPath(dirIndex);
-    return pathJoin(dirPath, 'schema_p$partitionIndex.${FileType.schema.ext}');
-  }
-
-  /// get schema partition directory path
-  String getSchemaPartitionDirPath(int dirIndex) {
-    return pathJoin(getSchemasPath(), 'dir_$dirIndex');
   }
 
   //==================================

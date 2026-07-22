@@ -48,13 +48,23 @@ class V3Upgrade {
 
   V3Upgrade(this._dataStore);
 
+  String _getLegacySchemaMetaPath(String instancePath) {
+    return pathJoin(instancePath, 'schemas', 'schema_meta.json');
+  }
+
+  String _getLegacySchemaPartitionFilePath(
+      String instancePath, int partitionIndex, int dirIndex) {
+    return pathJoin(instancePath, 'schemas', 'dir_$dirIndex',
+        'schema_p$partitionIndex.json');
+  }
+
   Future<void> execute(GlobalConfig oldGlobalConfig,
       {bool skipVersionBump = false}) async {
     Logger.info(
       'Starting database upgrade to version 3',
     );
 
-    final schemaMetaPath = _dataStore.pathManager.getSchemaMetaPath();
+    final schemaMetaPath = _getLegacySchemaMetaPath(_dataStore.instancePath!);
     final schemaMetaPathOld = '$schemaMetaPath.old';
 
     // Recovery from previous crash: restore old schema_meta if present
@@ -177,8 +187,8 @@ class V3Upgrade {
       final tableNames = entry.value;
       final dirIndex = partitionToDir[partitionIndex] ??
           (partitionIndex ~/ _dataStore.maxEntriesPerDir);
-      final partitionPath = _dataStore.pathManager
-          .getSchemaPartitionFilePath(partitionIndex, dirIndex);
+      final partitionPath = _getLegacySchemaPartitionFilePath(
+          _dataStore.instancePath!, partitionIndex, dirIndex);
 
       if (!await _dataStore.storage.existsFile(partitionPath)) {
         continue;
@@ -341,8 +351,8 @@ class V3Upgrade {
     for (final partitionIndex in tablePartitionMap.values.toSet()) {
       final dirIndex = partitionToDir[partitionIndex] ??
           (partitionIndex ~/ _dataStore.maxEntriesPerDir);
-      final partitionPath = _dataStore.pathManager
-          .getSchemaPartitionFilePath(partitionIndex, dirIndex);
+      final partitionPath = _getLegacySchemaPartitionFilePath(
+          _dataStore.instancePath!, partitionIndex, dirIndex);
       if (await _dataStore.storage.existsFile(partitionPath)) {
         await _dataStore.storage.deleteFile(partitionPath);
       }

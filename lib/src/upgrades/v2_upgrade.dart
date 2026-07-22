@@ -230,10 +230,20 @@ class V2Upgrade {
     }
   }
 
+  String _getLegacySchemaMetaPath(String instancePath) {
+    return pathJoin(instancePath, 'schemas', 'schema_meta.json');
+  }
+
+  String _getLegacySchemaPartitionFilePath(
+      String instancePath, int partitionIndex, int dirIndex) {
+    return pathJoin(instancePath, 'schemas', 'dir_$dirIndex',
+        'schema_p$partitionIndex.json');
+  }
+
   /// Upgrade Schema partition directory mapping.
   Future<void> _upgradeSchemaPartitionMapping(DataStoreImpl db) async {
     try {
-      final schemaMetaPath = db.pathManager.getSchemaMetaPath();
+      final schemaMetaPath = _getLegacySchemaMetaPath(db.instancePath!);
       if (!await db.storage.existsFile(schemaMetaPath)) return;
 
       final content = await db.storage.readAsString(schemaMetaPath);
@@ -279,8 +289,8 @@ class V2Upgrade {
 
         // Update partition meta dirIndex if needed
         final legacyDirIndex = pIndex ~/ maxEntriesPerDir;
-        final partitionPath =
-            db.pathManager.getSchemaPartitionFilePath(pIndex, legacyDirIndex);
+        final partitionPath = _getLegacySchemaPartitionFilePath(
+            db.instancePath!, pIndex, legacyDirIndex);
         if (await db.storage.existsFile(partitionPath)) {
           final partitionContent = await db.storage.readAsString(partitionPath);
           if (partitionContent != null) {
