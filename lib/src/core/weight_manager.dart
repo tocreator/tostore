@@ -1,85 +1,24 @@
 import 'dart:async';
-import 'dart:convert';
+
 import '../handler/logger.dart';
+import '../handler/weight_snapshot_codec.dart';
 import '../model/system_table.dart';
 import '../model/table_context.dart';
-import 'data_store_impl.dart';
-import 'crontab_manager.dart';
-import 'yield_controller.dart';
-import 'path_manager.dart';
 import '../model/table_identity.dart';
+import '../model/weight_data.dart';
+import 'crontab_manager.dart';
+import 'data_store_impl.dart';
+import 'yield_controller.dart';
 
-/// Weight type enum
-enum WeightType {
-  /// Table record weight
-  tableRecord,
-
-  /// Index data weight
-  indexData,
-}
-
-/// Weight data model
-class WeightData {
-  /// Weight value (0-100)
-  final int weight;
-
-  /// Access count
-  final int accessCount;
-
-  /// Last update time
-  final int lastUpdateTime;
-
-  /// Whether to never decay
-  final bool neverDecay;
-
-  /// Custom weight (if set, use this value instead of calculated value)
-  final int? customWeight;
-
-  WeightData({
-    this.weight = 0,
-    this.accessCount = 0,
-    required this.lastUpdateTime,
-    this.neverDecay = false,
-    this.customWeight,
-  });
-
-  Map<String, dynamic> toJson() => {
-        'weight': weight,
-        'accessCount': accessCount,
-        'lastUpdateTime': lastUpdateTime,
-        'neverDecay': neverDecay,
-        'customWeight': customWeight,
-      };
-
-  factory WeightData.fromJson(Map<String, dynamic> json) => WeightData(
-        weight: json['weight'] as int? ?? 0,
-        accessCount: json['accessCount'] as int? ?? 0,
-        lastUpdateTime: json['lastUpdateTime'] as int? ?? 0,
-        neverDecay: json['neverDecay'] as bool? ?? false,
-        customWeight: json['customWeight'] as int?,
-      );
-
-  WeightData copyWith({
-    int? weight,
-    int? accessCount,
-    int? lastUpdateTime,
-    bool? neverDecay,
-    int? customWeight,
-  }) =>
-      WeightData(
-        weight: weight ?? this.weight,
-        accessCount: accessCount ?? this.accessCount,
-        lastUpdateTime: lastUpdateTime ?? this.lastUpdateTime,
-        neverDecay: neverDecay ?? this.neverDecay,
-        customWeight: customWeight ?? this.customWeight,
-      );
-}
+export '../model/weight_data.dart';
 
 /// Weight manager
 /// Responsible for managing the weights of table records and index data, supporting weight decay, query, etc.
+///
+/// Persistence: space-local internal KV key [WeightSnapshotCodec.internalKvKey]
+/// (`isGlobal: false`), field-tag binary payload (no JSON).
 class WeightManager {
   final DataStoreImpl _dataStore;
-  final PathManager _pathManager;
 
   /// Table record weights keyed by stable [TableUid].
   final Map<TableUid, WeightData> _tableRecordWeights = {};
@@ -93,8 +32,8 @@ class WeightManager {
   /// High weight index entries (default threshold 70% or higher).
   final Set<String> _highWeightIndexData = {};
 
-  /// File load lock, avoid high concurrency duplicate read
-  final Map<String, Completer<void>> _loadingLocks = {};
+  /// Load lock, avoid high concurrency duplicate read
+  Completer<void>? _loadingLock;
 
   /// Whether initialized
   bool _initialized = false;
@@ -105,28 +44,37 @@ class WeightManager {
   /// Whether weight data has changed since last save
   bool _dirty = false;
 
-  static const _indexDataKeyFormatField = 'indexDataKeyFormat';
-  static const _indexUidKeyFormatValue = 'indexUid';
+  /// Last successful KV persist time (ms epoch). Used for 1h dirty guarantee.
+  int _lastSuccessfulSaveMs = 0;
 
-  /// Lock for saving weights to file
+  /// >0 while WeightManager reads/writes its own KV blob — skip incrementAccess.
+  int _weightMetaIoDepth = 0;
+
+  /// Lock for saving weights
   Future<void>? _saveLock;
 
-  WeightManager(this._dataStore) : _pathManager = _dataStore.pathManager {
-    // Register 24-hour decay callback
+  WeightManager(this._dataStore) {
     CrontabManager.addCallback(ExecuteInterval.hour24, _performDecay);
-    // Register 10-second periodic save
-    CrontabManager.addCallback(ExecuteInterval.seconds10, _periodicSave);
+    CrontabManager.addCallback(ExecuteInterval.seconds30, _periodicSave);
+    CrontabManager.addCallback(ExecuteInterval.hour1, _hourlyGuaranteeSave);
   }
 
   /// Dispose weight manager and deregister crontab callbacks
   void dispose() {
     CrontabManager.removeCallback(ExecuteInterval.hour24, _performDecay);
-    CrontabManager.removeCallback(ExecuteInterval.seconds10, _periodicSave);
+    CrontabManager.removeCallback(ExecuteInterval.seconds30, _periodicSave);
+    CrontabManager.removeCallback(ExecuteInterval.hour1, _hourlyGuaranteeSave);
   }
 
-  /// Get weight file path
-  String _getWeightFilePath({String? spaceName}) {
-    return _pathManager.getWeightFilePath(spaceName: spaceName);
+  bool get _isWeightMetaIo => _weightMetaIoDepth > 0;
+
+  Future<T> _withWeightMetaIo<T>(Future<T> Function() action) async {
+    _weightMetaIoDepth++;
+    try {
+      return await action();
+    } finally {
+      _weightMetaIoDepth--;
+    }
   }
 
   /// Initialize weight manager
@@ -142,83 +90,74 @@ class WeightManager {
     }
   }
 
-  /// Load weight data (lazy loading, with concurrency control)
-  Future<void> _loadWeights({String? spaceName}) async {
-    final filePath = _getWeightFilePath(spaceName: spaceName);
-    final lockKey = filePath;
+  /// Apply a snapshot into memory (e.g. after async V3 legacy import).
+  void applySnapshot(WeightSnapshot snapshot, {bool markDirty = false}) {
+    _tableRecordWeights
+      ..clear()
+      ..addAll(snapshot.tableRecord);
+    _indexDataWeights
+      ..clear()
+      ..addAll(snapshot.indexData);
+    _lastDecayTime = snapshot.lastDecayTime;
+    if (!snapshot.indexDataKeyFormatIsUid) {
+      // Best-effort in-memory legacy key migrate; persist on next save.
+      unawaited(_migrateLegacyIndexDataKeys().then((_) {
+        _onMutation();
+      }));
+    }
+    _rebuildHighWeightCache();
+    if (markDirty) _onMutation();
+  }
 
-    // Check if loading is in progress
-    if (_loadingLocks.containsKey(lockKey)) {
-      // Wait for other threads to load complete
-      await _loadingLocks[lockKey]!.future;
+  /// Load weight data from space-local internal KV
+  Future<void> _loadWeights({String? spaceName}) async {
+    if (_loadingLock != null) {
+      await _loadingLock!.future;
       return;
     }
 
-    // Create load lock
     final completer = Completer<void>();
-    _loadingLocks[lockKey] = completer;
+    _loadingLock = completer;
 
     try {
-      // Check if file exists
-      if (!await _dataStore.storage.existsFile(filePath)) {
-        // File does not exist, initialize weight data
+      final bytes = await _withWeightMetaIo(() async {
+        return await _dataStore.internalKv.get(
+          WeightSnapshotCodec.internalKvKey,
+          isGlobal: false,
+        );
+      });
+
+      if (bytes == null || bytes.isEmpty) {
         await _initializeWeights(spaceName: spaceName);
         completer.complete();
         return;
       }
 
-      // Read file
-      final content = await _dataStore.storage.readAsString(filePath);
-      if (content == null || content.isEmpty) {
-        await _initializeWeights(spaceName: spaceName);
-        completer.complete();
-        return;
-      }
+      final snapshot = WeightSnapshotCodec.decode(bytes);
+      _tableRecordWeights
+        ..clear()
+        ..addAll(snapshot.tableRecord);
+      _indexDataWeights
+        ..clear()
+        ..addAll(snapshot.indexData);
+      _lastDecayTime = snapshot.lastDecayTime;
 
-      // Parse JSON
-      final json = jsonDecode(content) as Map<String, dynamic>;
-
-      // Load table record weights
-      if (json['tableRecord'] is Map) {
-        final tableRecordWeights = json['tableRecord'] as Map<String, dynamic>;
-        for (final entry in tableRecordWeights.entries) {
-          _tableRecordWeights[TableUid(entry.key)] =
-              WeightData.fromJson(entry.value as Map<String, dynamic>);
-        }
-      }
-
-      // Load index data weights
-      if (json['indexData'] is Map) {
-        final indexDataWeights = json['indexData'] as Map<String, dynamic>;
-        for (final entry in indexDataWeights.entries) {
-          _indexDataWeights[entry.key] =
-              WeightData.fromJson(entry.value as Map<String, dynamic>);
-        }
-      }
-
-      // Load last decay time
-      _lastDecayTime = json['lastDecayTime'] as int? ?? 0;
-
-      final indexDataKeyFormatIndexUid =
-          json[_indexDataKeyFormatField] == _indexUidKeyFormatValue;
-      if (!indexDataKeyFormatIndexUid) {
+      if (!snapshot.indexDataKeyFormatIsUid) {
         await _migrateLegacyIndexDataKeys(spaceName: spaceName);
-        // Persist format marker once; avoids re-scanning on every future boot.
         _onMutation();
         await saveWeights(spaceName: spaceName, force: true);
       }
 
-      // Rebuild high weight cache
       _rebuildHighWeightCache();
-
       completer.complete();
     } catch (e) {
       completer.completeError(e);
-      Logger.error('Failed to load weights from file: $filePath', rawError: e);
-      // If loading fails, initialize weight data
+      Logger.error('Failed to load weights from internal KV', rawError: e);
       await _initializeWeights(spaceName: spaceName);
     } finally {
-      _loadingLocks.remove(lockKey);
+      if (identical(_loadingLock, completer)) {
+        _loadingLock = null;
+      }
     }
   }
 
@@ -229,38 +168,29 @@ class WeightManager {
           'WeightManager._initializeWeights',
           checkInterval: 100);
 
-      // Full database table list (globals included); space filter is not applied.
       final allTables = await _dataStore.getTableNames();
-      final systemTables = <String>{};
 
       for (final tableName in allTables) {
         await yieldController.maybeYield();
 
-        // Check if it is a system table
         final isSystemTable = SystemTable.isSystemTable(tableName);
-        if (isSystemTable) {
-          systemTables.add(tableName);
-        }
 
-        // Check if the table exists in the current space
         final existsInSpace =
             await _dataStore.tableExistsInCurrentSpace(tableName);
         if (!existsInSpace) continue;
 
-        // Get table schema
         final schema = await _dataStore.tableMetaManager
             ?.getTableSchemaByName(TableName(tableName));
         if (schema == null) continue;
 
-        // Initialize table record weights
         final tableKey = schema.tableUid;
         if (!_tableRecordWeights.containsKey(tableKey)) {
           int initialWeight = 0;
           if (isSystemTable) {
-            initialWeight = 10; // System table initial weight 10
+            initialWeight = 10;
           }
           if (schema.isGlobal) {
-            initialWeight += 10; // Global table extra 10
+            initialWeight += 10;
           }
 
           _tableRecordWeights[tableKey] = WeightData(
@@ -270,7 +200,6 @@ class WeightManager {
           );
         }
 
-        // Initialize B+Tree index weights (vector index weights are separate).
         final indexes = _dataStore.tableMetaManager?.getBtreeIndexesFor(schema);
         if (indexes == null) return;
         for (final index in indexes) {
@@ -279,10 +208,10 @@ class WeightManager {
           if (!_indexDataWeights.containsKey(indexKey)) {
             int initialWeight = 0;
             if (isSystemTable) {
-              initialWeight = 10; // System table index initial weight 10
+              initialWeight = 10;
             }
             if (schema.isGlobal) {
-              initialWeight += 10; // Global table index extra 10
+              initialWeight += 10;
             }
 
             _indexDataWeights[indexKey] = WeightData(
@@ -316,11 +245,33 @@ class WeightManager {
     }
   }
 
-  /// Save weight data to file (with lock)
+  /// If dirty for a long time under continuous write pressure, force persist.
+  void _hourlyGuaranteeSave() {
+    if (!_dirty) return;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    const hourMs = 60 * 60 * 1000;
+    if (_lastSuccessfulSaveMs > 0 && now - _lastSuccessfulSaveMs < hourMs) {
+      return;
+    }
+    saveWeights(force: true);
+  }
+
+  /// Whether the write buffer is idle enough to absorb a weight KV upsert.
+  bool _isWriteBufferIdleEnough() {
+    final batch = _dataStore.config.writeBatchSize;
+    if (batch <= 0) return true;
+    final threshold = (batch * 0.1).ceil();
+    return _dataStore.writeBufferManager.queueLength <= threshold;
+  }
+
+  /// Save weight snapshot to space-local internal KV.
   Future<void> saveWeights({String? spaceName, bool force = false}) async {
     if (!force && !_dirty) return;
+    if (!force && !_isWriteBufferIdleEnough()) {
+      // Keep dirty; retry on next 30s tick or hourly guarantee.
+      return;
+    }
 
-    // Wait for previous lock if any
     if (_saveLock != null) {
       await _saveLock;
     }
@@ -329,30 +280,28 @@ class WeightManager {
     _saveLock = completer.future;
 
     try {
-      _dirty = false;
-
-      final filePath = _getWeightFilePath(spaceName: spaceName);
-      final json = {
-        'tableRecord': {
-          for (final entry in _tableRecordWeights.entries)
-            entry.key.value: entry.value.toJson(),
-        },
-        'indexData': {
-          for (final entry in _indexDataWeights.entries)
-            entry.key: entry.value.toJson(),
-        },
-        'lastDecayTime': _lastDecayTime,
-        _indexDataKeyFormatField: _indexUidKeyFormatValue,
-      };
-
-      await _dataStore.storage.writeAsString(
-        filePath,
-        jsonEncode(json),
-        flush: true,
+      // Capture dirty state; clear only after successful set.
+      final snapshot = WeightSnapshot(
+        tableRecord: Map<TableUid, WeightData>.from(_tableRecordWeights),
+        indexData: Map<String, WeightData>.from(_indexDataWeights),
+        lastDecayTime: _lastDecayTime,
+        indexDataKeyFormatIsUid: true,
       );
+      final bytes = WeightSnapshotCodec.encode(snapshot);
+
+      await _withWeightMetaIo(() async {
+        await _dataStore.internalKv.set(
+          WeightSnapshotCodec.internalKvKey,
+          bytes,
+          isGlobal: false,
+        );
+      });
+
+      _dirty = false;
+      _lastSuccessfulSaveMs = DateTime.now().millisecondsSinceEpoch;
     } catch (e) {
-      Logger.error('Failed to save weights to file', rawError: e);
-      // Do not throw exception, avoid affecting main process
+      Logger.error('Failed to save weights to internal KV', rawError: e);
+      // Keep _dirty so a later tick/hourly guarantee retries.
     } finally {
       completer.complete();
       if (identical(_saveLock, completer.future)) {
@@ -380,7 +329,8 @@ class WeightManager {
     String identifier, {
     String? spaceName,
   }) async {
-    // High-concurrency optimization: check initialized status synchronously first
+    if (_isWeightMetaIo) return;
+
     if (_initialized) {
       if (type == WeightType.tableRecord ||
           (type == WeightType.indexData && _indexDataWeights.isNotEmpty)) {
@@ -391,12 +341,15 @@ class WeightManager {
 
     // Fallback to async loading if not fully initialized or cache is empty
     await _ensureWeightsLoaded(spaceName: spaceName);
+    if (_isWeightMetaIo) return;
     _syncIncrementAccess(type, identifier, spaceName: spaceName);
   }
 
   /// Internal synchronous increment (assumes weights are loaded)
   void _syncIncrementAccess(WeightType type, String identifier,
       {String? spaceName}) {
+    if (_isWeightMetaIo) return;
+
     final now = DateTime.now().millisecondsSinceEpoch;
 
     if (type == WeightType.tableRecord) {
@@ -533,10 +486,8 @@ class WeightManager {
           : _highWeightIndexData.contains(identifier);
     }
 
-    // Custom threshold, need to calculate
     final weight = await getWeight(type, identifier, spaceName: spaceName);
-    final maxWeight = 100;
-    return weight >= (maxWeight * threshold).round();
+    return weight >= (100 * threshold).round();
   }
 
   /// Index weight cache key: [tableUid]:[indexUid].
@@ -643,9 +594,7 @@ class WeightManager {
         }
       }
 
-      // Sweep orphan keys whose suffix is not a stable uid.
-      final indexCache = _indexDataWeights;
-      final keysToProcess = indexCache.keys.toList(growable: false);
+      final keysToProcess = _indexDataWeights.keys.toList(growable: false);
       for (final key in keysToProcess) {
         await yieldController.maybeYield();
         final colon = key.indexOf(':');
@@ -889,9 +838,15 @@ class WeightManager {
     _dirty = false;
     _lastDecayTime = 0;
 
-    final filePath = _getWeightFilePath(spaceName: spaceName);
-    if (await _dataStore.storage.existsFile(filePath)) {
-      await _dataStore.storage.deleteFile(filePath);
+    try {
+      await _withWeightMetaIo(() async {
+        await _dataStore.internalKv.remove(
+          WeightSnapshotCodec.internalKvKey,
+          isGlobal: false,
+        );
+      });
+    } catch (e) {
+      Logger.warn('Failed to remove weight KV key', rawError: e);
     }
   }
 }
