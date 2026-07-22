@@ -1,6 +1,6 @@
 import 'dart:async';
 
-import '../Interface/compute_provider.dart' as compute_impl;
+import '../interface/compute_provider.dart' as compute_impl;
 import '../handler/logger.dart';
 import '../handler/platform_handler.dart';
 
