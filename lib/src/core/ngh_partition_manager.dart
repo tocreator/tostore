@@ -3,7 +3,7 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
-import '../Interface/storage_interface.dart';
+import '../interface/storage_interface.dart';
 import '../handler/meta_binary_codec.dart';
 import '../handler/parallel_processor.dart';
 import '../model/data_store_config.dart';
