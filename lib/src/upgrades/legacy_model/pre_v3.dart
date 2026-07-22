@@ -4,20 +4,23 @@ import '../../core/data_store_impl.dart';
 import '../../handler/common.dart';
 import '../../handler/logger.dart';
 import '../../handler/weight_snapshot_codec.dart';
+import '../../model/backup_metadata.dart';
+import '../../model/backup_scope.dart';
 import '../../model/global_config.dart';
 import '../../model/space_config.dart';
 import '../../model/table_identity.dart';
 import '../../model/transaction_models.dart';
 import '../../model/weight_data.dart';
 
-/// On-disk formats retired by the engine **v3** blocking upgrade.
+/// On-disk formats retired by the engine **v3** blocking upgrade (plus backup
+/// package v1 JSON still needed for restore compatibility).
 ///
 /// ## Naming convention (`legacy_model/`)
 /// - Keep this directory; do **not** scatter one-off parsers across upgrades/.
 /// - One file per *source* era that a major upgrade must still read:
 ///   - [pre_v3.dart] — formats before engineVersion 3 (JSON configs, schema
-///     partitions, NDJSON txn logs, cache_weights.json). Consumed by `V3Upgrade`
-///     / format migrations.
+///     partitions, NDJSON txn logs, cache_weights.json) and backup `meta.json`.
+///     Consumed by `V3Upgrade` / format migrations / [BackupManager] fallback.
 ///   - Future: `pre_v4.dart`, `pre_v7.dart`, … when that upgrade lands.
 /// - Prefer `pre_vN` over open ranges (`v3_to_v6`): each major upgrade owns
 ///   exactly the formats it retires. If v6 must read v3-era TOBF that v6
@@ -564,6 +567,76 @@ final class LegacyCacheWeightsJson {
       lastUpdateTime: (map['lastUpdateTime'] as num?)?.toInt() ?? 0,
       neverDecay: map['neverDecay'] as bool? ?? false,
       customWeight: (map['customWeight'] as num?)?.toInt(),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Backup package v1 (meta.json → meta.tobf; read fallback only)
+// ---------------------------------------------------------------------------
+
+/// Legacy backup package filenames — construct paths only inside upgrades/ +
+/// [BackupManager] read fallback.
+abstract final class LegacyBackupPaths {
+  LegacyBackupPaths._();
+
+  static const String metaFileName = 'meta.json';
+}
+
+/// Parser for backup package v1 `meta.json` (pre-`meta.tobf`).
+///
+/// Used only when `meta.tobf` is absent / empty / undecodable.
+final class LegacyBackupMetaJson {
+  LegacyBackupMetaJson._();
+
+  static BackupMetadata? tryParse(String content) {
+    if (content.trim().isEmpty) return null;
+    try {
+      final decoded = jsonDecode(content);
+      if (decoded is! Map) return null;
+      return fromMap(Map<String, dynamic>.from(decoded));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  static BackupMetadata fromMap(Map<String, dynamic> json) {
+    final String ts = (json['timestamp'] as String?) ?? '';
+    final int backupFormatVersion = resolveVersionValue(
+      json['backupFormatVersion'],
+      InternalConfig.legacyBackupFormatVersion,
+    );
+    final bool comp = json['compressed'] as bool? ?? false;
+
+    final String? scopeStr = json['scope'] as String?;
+    late final BackupScope scope;
+    if (scopeStr != null) {
+      switch (scopeStr) {
+        case 'database':
+          scope = BackupScope.database;
+          break;
+        case 'currentSpace':
+          scope = BackupScope.currentSpace;
+          break;
+        case 'currentSpaceWithGlobal':
+          scope = BackupScope.currentSpaceWithGlobal;
+          break;
+        default:
+          scope = BackupScope.currentSpaceWithGlobal;
+      }
+    } else {
+      // Legacy compatibility: json['type'] == 'full' => database; otherwise partial
+      final String legacyType = (json['type'] as String?) ?? 'partial';
+      scope = legacyType == 'full'
+          ? BackupScope.database
+          : BackupScope.currentSpaceWithGlobal;
+    }
+
+    return BackupMetadata(
+      timestamp: ts,
+      backupFormatVersion: backupFormatVersion,
+      scope: scope,
+      compressed: comp,
     );
   }
 }
