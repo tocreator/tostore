@@ -8,7 +8,7 @@ import '../model/result_type.dart';
 import 'encryption.dart';
 import 'tobf_file_codec.dart';
 
-/// TOBF file shell for WAL / transaction metadata.
+/// TOBF file shell for WAL / transaction / migration metadata.
 ///
 /// When [EncryptionScope.full] is active, the field-tag payload is encrypted
 /// with [EncryptionManager] (user key) before framing — same key domain as
@@ -16,14 +16,23 @@ import 'tobf_file_codec.dart';
 abstract final class MetaFileCodec {
   MetaFileCodec._();
 
-  /// Soft DoS cap for WAL/Txn meta frames (pending batches can be larger).
+  /// Soft DoS cap for WAL/Txn/migration-task meta frames.
   static const int maxBodyBytes = 16 * 1024 * 1024;
+
+  /// Soft DoS cap for small engine meta frames (migration_meta, txn partition).
+  static const int maxBodyBytesSmall = 1 * 1024 * 1024;
 
   static final Uint8List walMetaAad =
       Uint8List.fromList(utf8.encode('tostore.wal.meta.v1'));
 
   static final Uint8List txnMetaAad =
       Uint8List.fromList(utf8.encode('tostore.txn.meta.v1'));
+
+  static final Uint8List migrationMetaAad =
+      Uint8List.fromList(utf8.encode('tostore.migration.meta.v1'));
+
+  static final Uint8List migrationTaskAad =
+      Uint8List.fromList(utf8.encode('tostore.migration.task.v1'));
 
   /// Whether meta body should be encrypted under [EncryptionScope.full].
   static bool shouldEncrypt(EncryptionConfig? encryptionConfig) =>
@@ -44,10 +53,11 @@ abstract final class MetaFileCodec {
   static Uint8List decodeFile(
     Uint8List frameBytes, {
     required Uint8List aad,
+    int maxBodyLimit = maxBodyBytes,
   }) {
     final decoded = TobfFileCodec.decodeFrameWithHeader(
       frameBytes,
-      maxBodyLimit: maxBodyBytes,
+      maxBodyLimit: maxBodyLimit,
     );
     if (!TobfFileCodec.isEncrypted(decoded.header)) {
       return decoded.body;
