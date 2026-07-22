@@ -1,4 +1,4 @@
-part of '../Interface/chain_builder.dart';
+part of '../interface/chain_builder.dart';
 
 /// delete builder
 class DeleteBuilder extends ChainBuilder<DeleteBuilder>
