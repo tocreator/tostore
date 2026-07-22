@@ -45,14 +45,14 @@ class PathManager {
     return pathJoin(_instancePath, 'migrations');
   }
 
-  /// get migration meta file path (migration metadata)
+  /// get migration meta file path (migration metadata, TOBF)
   String getMigrationMetaPath() {
-    return pathJoin(getMigrationsPath(), 'migration_meta.json');
+    return pathJoin(getMigrationsPath(), 'migration_meta.tobf');
   }
 
-  /// get migration task file path
+  /// get migration task file path (TOBF)
   String getMigrationTaskPath(int dirIndex, String taskId) {
-    return pathJoin(getMigrationsPath(), 'dir_$dirIndex', 'task_$taskId.json');
+    return pathJoin(getMigrationsPath(), 'dir_$dirIndex', 'task_$taskId.tobf');
   }
 
   /// get global config file path (TOBF binary)
