@@ -44,11 +44,20 @@ class WeightManager {
   /// Whether weight data has changed since last save
   bool _dirty = false;
 
+  /// Monotonic mutation counter. Save captures this with the snapshot and only
+  /// clears [_dirty] when it is unchanged (no concurrent mutation after capture).
+  int _dirtySeq = 0;
+
   /// Last successful KV persist time (ms epoch). Used for 1h dirty guarantee.
   int _lastSuccessfulSaveMs = 0;
 
-  /// >0 while WeightManager reads/writes its own KV blob — skip incrementAccess.
+  /// >0 while WeightManager reads/writes its own KV blob.
+  /// Hot path: callers only do a cheap `!= 0` check; detailed skip runs rarely.
   int _weightMetaIoDepth = 0;
+
+  /// Cached space-local internal KV tableUid.value (and index key prefix).
+  String? _spaceInternalKvUidValue;
+  String? _spaceInternalKvIndexPrefix;
 
   /// Lock for saving weights
   Future<void>? _saveLock;
@@ -66,15 +75,34 @@ class WeightManager {
     CrontabManager.removeCallback(ExecuteInterval.hour1, _hourlyGuaranteeSave);
   }
 
-  bool get _isWeightMetaIo => _weightMetaIoDepth > 0;
-
   Future<T> _withWeightMetaIo<T>(Future<T> Function() action) async {
+    await _ensureSpaceInternalKvTableUidCached();
     _weightMetaIoDepth++;
     try {
       return await action();
     } finally {
       _weightMetaIoDepth--;
     }
+  }
+
+  Future<void> _ensureSpaceInternalKvTableUidCached() async {
+    if (_spaceInternalKvUidValue != null) return;
+    final schema = await _dataStore.tableMetaManager?.getTableSchemaByName(
+      TableName(SystemTable.getInternalKeyValueName(false)),
+    );
+    final uid = schema?.tableUid.value;
+    if (uid == null || uid.isEmpty) return;
+    _spaceInternalKvUidValue = uid;
+    _spaceInternalKvIndexPrefix = '$uid:';
+  }
+
+  /// Cold path only (caller already verified [_weightMetaIoDepth] != 0).
+  bool _shouldSkipAccessStat(WeightType type, String identifier) {
+    final uid = _spaceInternalKvUidValue;
+    // Fail-safe: uid unknown → suppress all (preserves self-loop protection).
+    if (uid == null) return true;
+    if (type == WeightType.tableRecord) return identifier == uid;
+    return identifier.startsWith(_spaceInternalKvIndexPrefix!);
   }
 
   /// Initialize weight manager
@@ -106,7 +134,13 @@ class WeightManager {
       }));
     }
     _rebuildHighWeightCache();
-    if (markDirty) _onMutation();
+    if (markDirty) {
+      _onMutation();
+    } else {
+      // Authoritative replace (e.g. just written to KV) — drop stale dirty.
+      _dirty = false;
+      _dirtySeq++;
+    }
   }
 
   /// Load weight data from space-local internal KV
@@ -201,7 +235,7 @@ class WeightManager {
         }
 
         final indexes = _dataStore.tableMetaManager?.getBtreeIndexesFor(schema);
-        if (indexes == null) return;
+        if (indexes == null) continue;
         for (final index in indexes) {
           await yieldController.maybeYield();
           final indexKey = _getIndexDataKey(schema.tableUid, index.indexUid);
@@ -235,6 +269,7 @@ class WeightManager {
   /// Handle data mutation
   void _onMutation() {
     _dirty = true;
+    _dirtySeq++;
     CrontabManager.notifyActivity();
   }
 
@@ -276,11 +311,15 @@ class WeightManager {
       await _saveLock;
     }
 
+    // Prior saver may have cleared dirty / drained the buffer.
+    if (!force && !_dirty) return;
+    if (!force && !_isWriteBufferIdleEnough()) return;
+
     final completer = Completer<void>();
     _saveLock = completer.future;
 
     try {
-      // Capture dirty state; clear only after successful set.
+      final seqAtCapture = _dirtySeq;
       final snapshot = WeightSnapshot(
         tableRecord: Map<TableUid, WeightData>.from(_tableRecordWeights),
         indexData: Map<String, WeightData>.from(_indexDataWeights),
@@ -297,8 +336,11 @@ class WeightManager {
         );
       });
 
-      _dirty = false;
-      _lastSuccessfulSaveMs = DateTime.now().millisecondsSinceEpoch;
+      // Concurrent mutation after capture → keep dirty for a follow-up save.
+      if (_dirtySeq == seqAtCapture) {
+        _dirty = false;
+        _lastSuccessfulSaveMs = DateTime.now().millisecondsSinceEpoch;
+      }
     } catch (e) {
       Logger.error('Failed to save weights to internal KV', rawError: e);
       // Keep _dirty so a later tick/hourly guarantee retries.
@@ -321,6 +363,7 @@ class WeightManager {
     _highWeightTableRecords.clear();
     _highWeightIndexData.clear();
     _dirty = false;
+    _dirtySeq++; // invalidate in-flight save's dirty-clear
   }
 
   /// Increment access count
@@ -329,7 +372,9 @@ class WeightManager {
     String identifier, {
     String? spaceName,
   }) async {
-    if (_isWeightMetaIo) return;
+    if (_weightMetaIoDepth != 0 && _shouldSkipAccessStat(type, identifier)) {
+      return;
+    }
 
     if (_initialized) {
       if (type == WeightType.tableRecord ||
@@ -341,15 +386,16 @@ class WeightManager {
 
     // Fallback to async loading if not fully initialized or cache is empty
     await _ensureWeightsLoaded(spaceName: spaceName);
-    if (_isWeightMetaIo) return;
+    if (_weightMetaIoDepth != 0 && _shouldSkipAccessStat(type, identifier)) {
+      return;
+    }
     _syncIncrementAccess(type, identifier, spaceName: spaceName);
   }
 
-  /// Internal synchronous increment (assumes weights are loaded)
+  /// Internal synchronous increment (assumes weights are loaded).
+  /// Caller must already apply meta-IO skip when needed.
   void _syncIncrementAccess(WeightType type, String identifier,
       {String? spaceName}) {
-    if (_isWeightMetaIo) return;
-
     final now = DateTime.now().millisecondsSinceEpoch;
 
     if (type == WeightType.tableRecord) {
@@ -828,7 +874,7 @@ class WeightManager {
 
     if (changed) {
       _rebuildHighWeightCache();
-      _dirty = true;
+      _onMutation();
     }
   }
 

@@ -53,7 +53,7 @@ abstract final class WeightSnapshotCodec {
   WeightSnapshotCodec._();
 
   /// Internal KV key in space-local `_system_internal_kv_store`.
-  static const String internalKvKey = 'stats.cache_weights';
+  static const String internalKvKey = 'stats.access.weights';
 
   /// Marker value for [WeightSnapshotFieldId.indexDataKeyFormat].
   static const int indexUidKeyFormat = 1;
