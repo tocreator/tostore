@@ -702,6 +702,7 @@ class V3Upgrade {
       tableUid: uid,
       indexDirPath: indexDirPath,
       tableRoot: newPath,
+      indexUidMap: indexUidMap,
     );
   }
 
@@ -833,20 +834,30 @@ class V3Upgrade {
     required TableUid tableUid,
     required String indexDirPath,
     required String tableRoot,
+    required Map<String, String> indexUidMap,
   }) async {
-    if (!await _dataStore.storage.existsDirectory(indexDirPath)) {
+    if (indexUidMap.isEmpty ||
+        !await _dataStore.storage.existsDirectory(indexDirPath)) {
       return;
     }
-    final entries = await _dataStore.storage.listDirectory(indexDirPath);
-    for (final entryPath in entries) {
-      if (!await _dataStore.storage.existsDirectory(entryPath)) {
-        continue;
-      }
-      final indexUid = IndexUid(path.basename(entryPath));
-      final metaPath = path.join(entryPath, 'meta.json');
+    for (final entry in indexUidMap.entries) {
+      final legacyIndexName = entry.key;
+      final indexUid = IndexUid(entry.value);
+
+      var indexSubDir = path.join(indexDirPath, indexUid.value);
+      var metaPath = path.join(indexSubDir, 'meta.json');
+
       if (!await _dataStore.storage.existsFile(metaPath)) {
-        continue;
+        final legacySubDir = path.join(indexDirPath, legacyIndexName);
+        final legacyMetaPath = path.join(legacySubDir, 'meta.json');
+        if (await _dataStore.storage.existsFile(legacyMetaPath)) {
+          indexSubDir = legacySubDir;
+          metaPath = legacyMetaPath;
+        } else {
+          continue;
+        }
       }
+
       try {
         final content = await _dataStore.storage.readAsString(metaPath);
         if (content == null || content.isEmpty) continue;
@@ -888,7 +899,7 @@ class V3Upgrade {
         );
         await _dataStore.storage.deleteFile(metaPath);
 
-        final nghMetaPath = path.join(entryPath, 'ngh', 'meta.json');
+        final nghMetaPath = path.join(indexSubDir, 'ngh', 'meta.json');
         if (await _dataStore.storage.existsFile(nghMetaPath)) {
           await _migrateNghMetaToPage0(
             tableUid,
