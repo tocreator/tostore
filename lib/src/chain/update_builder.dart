@@ -1,4 +1,4 @@
-part of '../Interface/chain_builder.dart';
+part of '../interface/chain_builder.dart';
 
 /// update builder
 class UpdateBuilder extends ChainBuilder<UpdateBuilder>
