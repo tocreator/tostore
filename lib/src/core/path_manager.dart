@@ -67,12 +67,6 @@ class PathManager {
     return pathJoin(spacePath, 'space_config.tobf');
   }
 
-  /// Get weight file path
-  String getWeightFilePath({String? spaceName}) {
-    final spacePath = getSpacePath(spaceName: spaceName);
-    return pathJoin(spacePath, 'cache_weights.json');
-  }
-
   /// get temp directory path under current space
   /// All crash-safe temporary files are placed here to ensure same filesystem/volume.
   String getTempDirPath({String? spaceName}) {
