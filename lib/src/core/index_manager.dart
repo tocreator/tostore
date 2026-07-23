@@ -1365,12 +1365,6 @@ class IndexManager {
       }
       await _persistEmptyIndexMeta(table, schema);
     }
-
-    if (!SystemTable.isSystemTable(table.tableName)) {
-      Logger.info(
-        'Initialized empty indexes for ${table.tableName} (${indexes.length} btree)',
-      );
-    }
   }
 
   /// Create or rebuild a single index.
@@ -3560,8 +3554,9 @@ class IndexManager {
     List<String>? orderBy,
     bool readFromFileOnly = false,
   }) async {
-    final schema =
-        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
+    final schema = table.schema.name.isNotEmpty
+        ? table.schema
+        : await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) return IndexSearchResult.tableScan();
     if (indexUid.isEmpty) return IndexSearchResult.tableScan();
 
