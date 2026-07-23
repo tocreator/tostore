@@ -588,7 +588,7 @@ class DataStoreImpl {
 
     // For system operations during initialization, allow if base initialization is complete
     // This is needed for operations like foreign key system table updates during table creation
-    if (isSystemOp && _baseInitialized && _initializing) {
+    if (isSystemOp && _initializing) {
       return;
     }
 
@@ -857,11 +857,6 @@ class DataStoreImpl {
 
           // NOW initialize KeyManager for ALL instances (including migration instances)
           await _keyManager!.initialize();
-
-          // Initialize WeightManager
-          if (_weightManager != null) {
-            await _weightManager!.initialize();
-          }
         }
 
         // Mark base initialization complete AFTER KeyManager is initialized
@@ -923,6 +918,10 @@ class DataStoreImpl {
         }
 
         if (!isMigrationInstance) {
+          // Initialize WeightManager
+          if (_weightManager != null) {
+            await _weightManager!.initialize();
+          }
           await loadDataToCache();
           CrontabManager.start();
           _ttlCleanupManager.registerCleanupTask();
@@ -2344,14 +2343,6 @@ class DataStoreImpl {
       ));
     }
 
-    final schema =
-        await tableMetaManager?.getTableSchemaByName(TableName(tableName));
-    if (schema == null) {
-      return finish(DbResult.error(
-        type: ResultType.devTableNotFound,
-        message: 'Table $tableName does not exist',
-      ));
-    }
     return await batchUpsert(tableName, [data]);
   }
 
@@ -4146,9 +4137,9 @@ class DataStoreImpl {
     TableSchema? schema;
     try {
       // 1. Get table schema and validate data
-      schema =
-          await tableMetaManager?.getTableSchemaByName(TableName(tableName));
-      if (schema == null || schema.name.isEmpty) {
+      final table = await getTableContext(tableName);
+      schema = table.schema;
+      if (schema.name.isEmpty) {
         Logger.error('Table $tableName does not exist');
         return finish(DbResult.error(
           type: ResultType.devTableNotFound,
@@ -4157,7 +4148,6 @@ class DataStoreImpl {
       }
 
       final TableSchema tableSchema = schema;
-      final table = await getTableContext(tableName);
       final primaryKey = tableSchema.primaryKey;
       // Cache unique indexes for this table once per batch to avoid repeated
       // tableMetaManager lookups inside the hot record loop.
@@ -5006,16 +4996,8 @@ class DataStoreImpl {
       ));
     }
 
-    final TableSchema? schema =
-        await tableMetaManager?.getTableSchemaByName(TableName(tableName));
-    if (schema == null || schema.name.isEmpty) {
-      return finish(DbResult.error(
-        type: ResultType.devTableNotFound,
-        message: 'Table $tableName does not exist',
-      ));
-    }
-
     final table = await getTableContext(tableName);
+    final schema = table.schema;
 
     final uniqueIndexes =
         tableMetaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
