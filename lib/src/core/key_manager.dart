@@ -565,10 +565,8 @@ class KeyManager {
       await future.timeout(timeout);
     } on TimeoutException {
       Logger.warn(
-        'Key migration did not stop within ${timeout.inSeconds}s; '
-        'forcing shutdown flush',
+        'Key migration did not stop within ${timeout.inSeconds}s',
       );
-      await KeyMigrationRunner.pauseForShutdown(_dataStore);
     } catch (_) {}
   }
 

@@ -121,6 +121,13 @@ class MigrationManager {
   // Active executing task Future
   Future<void>? _activeTaskFuture;
 
+  /// Exit at cooperative points when the datastore is closing / switching space.
+  void _throwIfMigrationStopped([String? detail]) {
+    if (!_dataStore.isInitialized) {
+      throw DbClosedException(detail ?? 'Migration stopped');
+    }
+  }
+
   /// Whether schema or key migration work is still pending.
   static bool computeHasPendingMigrationWork({
     required bool hasSchemaTasks,
@@ -418,18 +425,41 @@ class MigrationManager {
   }
 
   /// Stop all active migrations managed by this manager.
+  ///
+  /// Cooperative: cancels space-level work via [stopMigrationForSpace], then
+  /// awaits the active task future (cutover / backup / gaps with no space
+  /// controller yet). Schema cutover is not interrupted mid-flight; the task
+  /// exits at the next cooperative point so checkpoint resume remains valid.
+  ///
+  /// Scheduler cleanup is left to the caller ([DataStoreImpl.close] uses
+  /// [BackgroundWriteScheduler.clearAll]).
   Future<void> stopAllMigrations() async {
-    final spaces = _activeSpaceMigrationTasks.keys.toList();
+    final spaces = {
+      ..._activeControllers.keys,
+      ..._activeSpaceMigrationTasks.keys,
+      ..._activeMigrationInstances.keys,
+    }.toList();
     for (final space in spaces) {
       await stopMigrationForSpace(space);
     }
 
-    final futures = _activeSpaceMigrationTasks.values.toList();
-    if (futures.isNotEmpty) {
-      await Future.wait(futures).catchError((_) => const []);
+    // Covers phases with no space controller (pre-cutover wait, cutover,
+    // backup, between-space gaps). close() already set isInitialized=false.
+    final taskFuture = _activeTaskFuture;
+    if (taskFuture != null) {
+      try {
+        await taskFuture;
+      } catch (e) {
+        if (e is DbClosedException) {
+          Logger.info('Active migration task stopped gracefully');
+        } else {
+          Logger.error('Failed to wait for migration task stop', rawError: e);
+        }
+      }
     }
 
-    // Clear global migration caches to ensure fresh state on next open/switch
+    // Clear global migration caches to ensure fresh state on next open/switch.
+    // Disk task files / checkpoints are retained for resume after re-init.
     _migrationMetaCache = null;
     _currentDirIndexCache = null;
     _pendingTasks.clear();
@@ -3740,8 +3770,10 @@ class MigrationManager {
       // This prevents migration writes from conflicting with WAL replay or missing
       // data that was about to be replayed.
       await _dataStore.parallelJournalManager.waitUntilRecoveryCompleted();
+      _throwIfMigrationStopped();
 
       while (_pendingTasks.isNotEmpty) {
+        _throwIfMigrationStopped();
         final task = _pendingTasks.first;
 
         // Large-scale migration can run for a long time; keep a broad timeout
@@ -3862,6 +3894,7 @@ class MigrationManager {
       final shouldFlushBeforeMigration = currentTask.forceDataMigration ||
           _needRuntimeRecordBridge(sortedOperations, oldSchema);
       if (shouldFlushBeforeMigration) {
+        _throwIfMigrationStopped();
         await _dataStore.saveAllCacheBeforeExit();
       }
       var oldFieldLayout = currentTask.oldFieldLayoutSnapshot;
@@ -3882,9 +3915,13 @@ class MigrationManager {
         _updatePendingTaskInMemory(currentTask);
       }
 
-      // update global table structure first
+      // Cooperative stop only allowed BEFORE schema cutover starts (atomicity).
+      // Once executeSchemaOperations begins, it must run to completion.
       if (!currentTask.isSchemaUpdated &&
           currentTask.targetSchemaSnapshot != null) {
+        _throwIfMigrationStopped(
+          'Migration stopped before schema cutover for ${currentTask.tableName}',
+        );
         final childIndexesToDrop = <TableUid, List<IndexUid>>{};
         currentTableName = await executeSchemaOperations(
           await _requireTableContext(currentTask.tableName),
@@ -3901,6 +3938,8 @@ class MigrationManager {
         _updatePendingTaskInMemory(currentTask);
         _registerRuntimeMigration(currentTask);
       }
+
+      _throwIfMigrationStopped();
 
       // 1. Perform pre-migration backup if configured
       if (_dataStore.config.migrationConfig?.backupBeforeMigrate ?? false) {
@@ -3925,6 +3964,9 @@ class MigrationManager {
         }
 
         if (needNewBackup) {
+          _throwIfMigrationStopped(
+            'Migration stopped before backup for ${currentTask.tableName}',
+          );
           Logger.info(
             'Starting scheduled backup before data migration for table [${currentTask.tableName}]...',
           );
@@ -4003,6 +4045,9 @@ class MigrationManager {
 
       // process data migration for each space
       for (var space in pendingSpaces) {
+        _throwIfMigrationStopped(
+          'Migration stopped before space [$space] for ${currentTask.tableName}',
+        );
         if (_activeTaskProgressCallback != null) {
           final int remainingSpaces =
               pendingSpaces.length - pendingSpaces.indexOf(space);
@@ -4077,6 +4122,12 @@ class MigrationManager {
               // This ensures all buffered legacy-shape writes are safely flushed to disk.
               while (!_dataStore.walManager.isAtOrBefore(
                   cutover, _dataStore.walManager.meta.checkpoint)) {
+                if (migrationController.isCancelled ||
+                    !_dataStore.isInitialized) {
+                  throw DbClosedException(
+                    'Migration stopped while waiting for WAL cutover in space [$space]',
+                  );
+                }
                 await Future.delayed(const Duration(milliseconds: 100));
               }
             }
@@ -4242,6 +4293,9 @@ class MigrationManager {
                         checkInterval: 64);
 
                     for (int i = 0; i < migratedRecords.length; i++) {
+                      if (migrationController.isCancelled) {
+                        return false;
+                      }
                       await yieldController.maybeYield();
                       final be = migratedRecords[i];
                       final pk = be.data[sourcePkName]?.toString() ?? '';

@@ -54,17 +54,6 @@ class KeyMigrationRunner {
     _runToken?.cancel();
   }
 
-  /// Called from [DataStoreImpl.close] / switchSpace before shutting down PJM.
-  static Future<void> pauseForShutdown(DataStoreImpl dataStore) async {
-    requestPause();
-    await _flushSchedulerEntriesOfType(
-      dataStore,
-      BackgroundWriteType.keyMigration,
-      respectPause: false,
-      maxRounds: 64,
-    );
-  }
-
   static void _throwIfPaused() {
     if (isPauseRequested) {
       throw DbClosedException('Key migration paused');
@@ -127,6 +116,7 @@ class KeyMigrationRunner {
         _throwIfPaused();
 
         await _drainBackgroundWrites(primaryInstance);
+        _throwIfPaused();
 
         final migrationInstance = DataStoreImpl(
           dbPath: primaryInstance.config.dbPath,
@@ -290,7 +280,7 @@ class KeyMigrationRunner {
         );
 
         if (isPauseRequested) {
-          await _drainBackgroundWrites(dataStore);
+          // Do not drain: close/cutover clears unpersisted scheduler entries.
           throw DbClosedException('Key migration paused');
         }
 

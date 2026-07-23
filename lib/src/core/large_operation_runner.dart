@@ -55,6 +55,9 @@ class LargeOperationRunner {
   }
 
   /// Cooperatively pause ongoing background tasks for switch space or shutdown.
+  ///
+  /// Scheduler cleanup is left to the caller ([DataStoreImpl.close] uses
+  /// [BackgroundWriteScheduler.clearAll]).
   static Future<void> pauseForShutdown(DataStoreImpl dataStore) async {
     final space = dataStore.currentSpaceName;
     Logger.info('Stopping background large operations for space [$space]...');
@@ -66,12 +69,6 @@ class LargeOperationRunner {
         await task;
       } catch (_) {}
     }
-
-    // Clear pending large operations in the scheduler to avoid stalling shutdown/space-switch
-    await dataStore.backgroundWriteScheduler
-        .clearEntriesOfType(BackgroundWriteType.largeDelete);
-    await dataStore.backgroundWriteScheduler
-        .clearEntriesOfType(BackgroundWriteType.largeUpdate);
 
     Logger.info('Background large operations stopped for space [$space].');
   }
@@ -781,6 +778,7 @@ class LargeOperationRunner {
 
           // Populate scheduler
           for (final record in deletes) {
+            if (token.isCancelled) return false;
             final pk = record[primaryKey].toString();
             final entry = BufferEntry(
               operation: BufferOperationType.delete,
@@ -804,6 +802,7 @@ class LargeOperationRunner {
           }
 
           for (final record in inserts) {
+            if (token.isCancelled) return false;
             final pk = record[primaryKey].toString();
             final entry = BufferEntry(
               operation: BufferOperationType.insert,
@@ -827,6 +826,7 @@ class LargeOperationRunner {
           }
 
           for (final record in updates) {
+            if (token.isCancelled) return false;
             final pk = record[primaryKey].toString();
             final oldRecord =
                 records.firstWhere((r) => r[primaryKey].toString() == pk);
