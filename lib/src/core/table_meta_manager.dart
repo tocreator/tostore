@@ -47,6 +47,12 @@ class TableMetaManager {
   final Map<TableUid, FieldStorageLayout> _tableFieldLayoutCache =
       <TableUid, FieldStorageLayout>{};
 
+  /// Committed meta for `_system_table_meta` itself — survives TreeCache eviction.
+  ///
+  /// Never holds a bootstrap-only stub: only memoryOnly/disk [saveTableMeta] or
+  /// a decoded self-row. Path IO uses [bootstrapTableMetaContext] / fixed uid.
+  TableMeta? _pinnedMetaTableMeta;
+
   /// Per-table cached storage field structure derived from layout + schema.
   final Map<TableUid, List<FieldStructure>> _storageFieldStructCache =
       <TableUid, List<FieldStructure>>{};
@@ -191,6 +197,9 @@ class TableMetaManager {
 
   /// Memory peek only (no I/O). Prefer [getTableMeta] on engine paths.
   TableMeta? _peekTableMeta(TableUid tableUid) {
+    if (tableUid == SystemTable.tableMetaTableUid) {
+      return _pinnedMetaTableMeta ?? _tableMetaCache?.peek(tableUid);
+    }
     return _tableMetaCache?.peek(tableUid);
   }
 
@@ -258,6 +267,10 @@ class TableMetaManager {
     _tableFieldLayoutCache[meta.tableUid] = meta.fieldLayout;
     _storageFieldStructCache.remove(meta.tableUid);
     _cacheTableSchema(meta.tableUid, meta.schema);
+    if (meta.tableUid == SystemTable.tableMetaTableUid ||
+        meta.tableName.value == SystemTable.tableMetaName) {
+      _pinnedMetaTableMeta = meta;
+    }
   }
 
   /// Register [schema] as a full in-memory [TableMeta] visible to [getTableMeta].
@@ -300,6 +313,16 @@ class TableMetaManager {
 
   /// Hard-coded [TableContext] for `_system_table_meta` (no disk read).
   TableContext bootstrapTableMetaContext() {
+    final pinned = _pinnedMetaTableMeta;
+    if (pinned != null) {
+      return TableContext(
+        tableUid: pinned.tableUid,
+        tableName: pinned.tableName,
+        isGlobal: pinned.isGlobal,
+        dirIndex: pinned.dirIndex,
+        schema: pinned.schema,
+      );
+    }
     return TableContext(
       tableUid: SystemTable.tableMetaTableUid,
       tableName: TableName(SystemTable.tableMetaName),
@@ -309,23 +332,18 @@ class TableMetaManager {
     );
   }
 
-  TableMeta _buildBootstrapTableMeta() {
-    final schema = SystemTable.tableMetaTable();
-    final layout = _tableFieldLayoutCache[SystemTable.tableMetaTableUid] ??
-        _createInitialFieldStorageLayout(schema);
-    final now = DateTime.now();
-    final existing = _peekTableMeta(SystemTable.tableMetaTableUid);
-    return TableMeta(
-      tableUid: SystemTable.tableMetaTableUid,
-      tableName: TableName(SystemTable.tableMetaName),
-      isGlobal: true,
-      schema: schema,
-      fieldLayout: layout,
-      dirIndex: SystemTable.tableMetaDirIndex,
-      extra: existing?.extra,
-      createdAt: existing?.createdAt ?? now,
-      updatedAt: existing?.updatedAt ?? now,
-    );
+  /// Ensure physical layout for meta-table IO without registering the table as
+  /// existing (stub ≠ exists).
+  void _ensureMetaTableIoLayout() {
+    final uid = SystemTable.tableMetaTableUid;
+    if (_tableFieldLayoutCache.containsKey(uid)) return;
+    final pinned = _pinnedMetaTableMeta;
+    if (pinned != null) {
+      _tableFieldLayoutCache[uid] = pinned.fieldLayout;
+      return;
+    }
+    _tableFieldLayoutCache[uid] =
+        _createInitialFieldStorageLayout(SystemTable.tableMetaTable());
   }
 
   /// Get [TableContext] by tableUid (asynchronous).
@@ -400,6 +418,9 @@ class TableMetaManager {
     _indexListCache.remove(tableUid);
     _tableFieldLayoutCache.remove(tableUid);
     _storageFieldStructCache.remove(tableUid);
+    if (tableUid == SystemTable.tableMetaTableUid) {
+      _pinnedMetaTableMeta = null;
+    }
   }
 
   /// Current schema cache size in bytes (incremental tracked).
@@ -431,15 +452,24 @@ class TableMetaManager {
 
   /// Load deferred current-space metadata from internal KV.
   Future<void> loadSpaceManifest() async {
-    final bytes = await _dataStore.internalKv.get(
-      SpaceManifestCodec.internalKvKey,
-      isGlobal: false,
-    );
-    if (bytes == null || bytes.isEmpty) {
-      _spaceManifest = SpaceManifest.empty;
-      return;
+    try {
+      final bytes = await _dataStore.internalKv.get(
+        SpaceManifestCodec.internalKvKey,
+        isGlobal: false,
+      );
+      if (bytes == null || bytes.isEmpty) {
+        _spaceManifest = SpaceManifest.empty;
+        return;
+      }
+      _spaceManifest = SpaceManifestCodec.decode(bytes);
+    } on DbException catch (e) {
+      // Bootstrap: `_system_internal_kv_store` may not exist yet.
+      if (e.statuses.any((s) => s.type == ResultType.devTableNotFound)) {
+        _spaceManifest = SpaceManifest.empty;
+        return;
+      }
+      rethrow;
     }
-    _spaceManifest = SpaceManifestCodec.decode(bytes);
   }
 
   /// Get the deferred manifest for the current space (lazy-loaded from KV).
@@ -498,11 +528,23 @@ class TableMetaManager {
   Future<void> saveSpaceManifest() async {
     final manifest = _spaceManifest ?? SpaceManifest.empty;
     final bytes = SpaceManifestCodec.encode(manifest);
-    await _dataStore.internalKv.set(
-      SpaceManifestCodec.internalKvKey,
-      bytes,
-      isGlobal: false,
-    );
+    try {
+      await _dataStore.internalKv.set(
+        SpaceManifestCodec.internalKvKey,
+        bytes,
+        isGlobal: false,
+      );
+    } on DbException catch (e) {
+      // Bootstrap: keep in-memory manifest until internal KV is created.
+      if (e.statuses.any((s) => s.type == ResultType.devTableNotFound)) {
+        Logger.warn(
+          'SpaceManifest not persisted yet: '
+          '${SystemTable.getInternalKeyValueName(false)} unavailable',
+        );
+        return;
+      }
+      rethrow;
+    }
   }
 
   /// Replace the current-space active non-global UID inventory and persist.
@@ -643,6 +685,7 @@ class TableMetaManager {
     _indexListCache.clear();
     _tableFieldLayoutCache.clear();
     _storageFieldStructCache.clear();
+    _pinnedMetaTableMeta = null;
     _metaLoadingFutures.clear();
     _uidByName.clear();
     _nameByUid.clear();
@@ -674,6 +717,7 @@ class TableMetaManager {
     _indexListCache.clear();
     _tableFieldLayoutCache.clear();
     _storageFieldStructCache.clear();
+    _pinnedMetaTableMeta = null;
     _metaLoadingFutures.clear();
   }
 
@@ -693,6 +737,7 @@ class TableMetaManager {
     _indexListCache.clear();
     _tableFieldLayoutCache.clear();
     _storageFieldStructCache.clear();
+    _pinnedMetaTableMeta = null;
     _metaLoadingFutures.clear();
   }
 
@@ -956,21 +1001,20 @@ class TableMetaManager {
       }
     }
 
+    if (schema != null) {
+      final derived = _createInitialFieldStorageLayout(schema);
+      _tableFieldLayoutCache[tableUid] = derived;
+      return derived;
+    }
+
+    // No schema hint: cold load is OK (caller is not mid-decode of this uid).
     final meta = await getTableMeta(tableUid);
     if (meta != null) {
       _tableFieldLayoutCache[tableUid] = meta.fieldLayout;
       return meta.fieldLayout;
     }
 
-    final resolvedSchema = schema ?? await getTableSchema(tableUid);
-    if (resolvedSchema == null) {
-      return const FieldStorageLayout(
-          nextSlotId: 0, slots: <FieldStorageSlot>[]);
-    }
-
-    final derived = _createInitialFieldStorageLayout(resolvedSchema);
-    _tableFieldLayoutCache[tableUid] = derived;
-    return derived;
+    return const FieldStorageLayout(nextSlotId: 0, slots: <FieldStorageSlot>[]);
   }
 
   /// Get stable storage field structure used by the record binary codec.
@@ -1266,6 +1310,8 @@ class TableMetaManager {
     // Self-row: never fabricate existence. Use [bootstrapTableMetaContext] for
     // QueryExecutor I/O; only return meta after save/load registered it.
     if (tableUid == SystemTable.tableMetaTableUid) {
+      final pinned = _pinnedMetaTableMeta;
+      if (pinned != null) return pinned;
       final cached = _tableMetaCache?.get(tableUid);
       if (cached != null) return cached;
       if (_tableMetaCache?.isFullyCached('all') == true) {
@@ -1313,6 +1359,7 @@ class TableMetaManager {
     int? expectEpoch,
   }) async {
     try {
+      _ensureMetaTableIoLayout();
       final rows = await _dataStore.executeQuery(
         bootstrapTableMetaContext(),
         QueryCondition()
@@ -1361,6 +1408,12 @@ class TableMetaManager {
   /// Resolve table uid by name, activating non-global tables in the current space.
   Future<TableUid?> resolveTableUidFromName(TableName tableName) async {
     if (tableName.isEmpty) return null;
+
+    // Fixed identity — do not query self by name (bootstrap / cold path).
+    if (tableName.value == SystemTable.tableMetaName) {
+      return SystemTable.tableMetaTableUid;
+    }
+
     final cached = _peekUidByName(tableName);
     if (cached != null) return cached;
 
@@ -1368,6 +1421,7 @@ class TableMetaManager {
     if (_nameInventoryReady) return null;
 
     try {
+      _ensureMetaTableIoLayout();
       final rows = await _dataStore.executeQuery(
         bootstrapTableMetaContext(),
         QueryCondition()
@@ -1795,11 +1849,19 @@ class TableMetaManager {
       removeCachedTableSchema(tableUid);
 
       if (!meta.isGlobal) {
-        await getSpaceManifest();
-        if (_activeTableUids.contains(tableUid)) {
-          await _updateActiveTableUids((uids) {
-            uids.remove(tableUid);
-          });
+        try {
+          await getSpaceManifest();
+          if (_activeTableUids.contains(tableUid)) {
+            await _updateActiveTableUids((uids) {
+              uids.remove(tableUid);
+            });
+          }
+        } catch (e) {
+          // Bootstrap cleanup must not fail when internal KV is unavailable.
+          Logger.warn(
+            'SpaceManifest update skipped while deleting ${tableName.value}',
+            rawError: e,
+          );
         }
       }
 
@@ -1947,12 +2009,8 @@ class TableMetaManager {
     final yieldController =
         YieldController('TableMetaManager.loadAllTableMetaAsync');
     try {
-      // Ensure bootstrap meta is present without querying self.
-      final bootstrap = _buildBootstrapTableMeta();
-      if (_peekTableMeta(bootstrap.tableUid) == null) {
-        _registerMetaInLookups(bootstrap, updateDirCounts: false);
-        _cacheTableMeta(bootstrap);
-      }
+      // Layout only — do not register bootstrap stub as "table exists".
+      _ensureMetaTableIoLayout();
 
       final rows = await _dataStore.executeQuery(
         bootstrapTableMetaContext(),
