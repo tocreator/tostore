@@ -61,6 +61,12 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
         if (lease == null) return;
 
         try {
+          // Keep aggregation set identical to the foreground query so cursor
+          // signature validation (joins/groupBy/aggs) does not self-mismatch.
+          final combinedAggs = <QueryAggregation>[
+            ...?_aggregations,
+            ..._extraAggregations,
+          ];
           // Directly call the executor to bypass builder overhead and avoid cloning.
           // This warms up the B-Tree Page Cache and Record Cache in ResourceManager.
           await _db.queryExecutor.execute(
@@ -73,7 +79,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
             joins: _joins,
             enableQueryCache: false, // Don't interfere with manual result cache
             onlyCount: false,
-            aggregations: _aggregations,
+            aggregations: combinedAggs.isNotEmpty ? combinedAggs : null,
             groupBy: _groupByFields,
           );
         } finally {
