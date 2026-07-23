@@ -116,11 +116,11 @@ class SystemTable {
   /// get all table schemas
   static List<TableSchema> gettableSchemas = [
     tableMetaTable(),
+    internalKVTable(false),
+    internalKVTable(true),
     _fkReferencesTable(),
     _kVTable(false),
     _kVTable(true),
-    internalKVTable(false),
-    internalKVTable(true),
     _keyMigrationProgressTable(),
   ];
 
