@@ -2,6 +2,8 @@ import 'dart:async';
 
 import '../handler/logger.dart';
 import '../handler/weight_snapshot_codec.dart';
+import '../model/db_exception.dart';
+import '../model/result_type.dart';
 import '../model/system_table.dart';
 import '../model/table_context.dart';
 import '../model/table_identity.dart';
@@ -105,6 +107,11 @@ class WeightManager {
     return identifier.startsWith(_spaceInternalKvIndexPrefix!);
   }
 
+  bool _isInternalKvUnavailable(Object e) {
+    if (e is! DbException) return false;
+    return e.statuses.any((s) => s.type == ResultType.devTableNotFound);
+  }
+
   /// Initialize weight manager
   Future<void> initialize() async {
     if (_initialized) return;
@@ -185,6 +192,12 @@ class WeightManager {
       _rebuildHighWeightCache();
       completer.complete();
     } catch (e) {
+      if (_isInternalKvUnavailable(e)) {
+        // Bootstrap: `_system_internal_kv_store` not created yet — memory only.
+        _rebuildHighWeightCache();
+        completer.complete();
+        return;
+      }
       completer.completeError(e);
       Logger.error('Failed to load weights from internal KV', rawError: e);
       await _initializeWeights(spaceName: spaceName);
@@ -342,6 +355,10 @@ class WeightManager {
         _lastSuccessfulSaveMs = DateTime.now().millisecondsSinceEpoch;
       }
     } catch (e) {
+      if (_isInternalKvUnavailable(e)) {
+        // Bootstrap / missing table: keep dirty for a later retry.
+        return;
+      }
       Logger.error('Failed to save weights to internal KV', rawError: e);
       // Keep _dirty so a later tick/hourly guarantee retries.
     } finally {
@@ -372,6 +389,10 @@ class WeightManager {
     String identifier, {
     String? spaceName,
   }) async {
+    // System-table create runs before WeightManager.initialize and before
+    // `_system_internal_kv_store` exists — skip until the DB is ready.
+    if (!_dataStore.isInitialized) return;
+
     if (_weightMetaIoDepth != 0 && _shouldSkipAccessStat(type, identifier)) {
       return;
     }
@@ -440,6 +461,7 @@ class WeightManager {
     String identifier, {
     String? spaceName,
   }) async {
+    if (!_dataStore.isInitialized && !_initialized) return 0;
     await _ensureWeightsLoaded(spaceName: spaceName);
     final data = type == WeightType.tableRecord
         ? _tableRecordWeights[TableUid(identifier)]
