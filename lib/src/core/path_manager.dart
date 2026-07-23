@@ -4,6 +4,7 @@ import 'data_store_impl.dart';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
+import '../model/system_table.dart';
 import '../model/table_identity.dart';
 
 /// path manager
@@ -83,6 +84,16 @@ class PathManager {
     final uid = tableUid;
     if (dataStore.config.persistenceMode == PersistenceMode.memory) {
       return 'memory://${dataStore.currentSpaceName}/tables/$uid';
+    }
+
+    // Bootstrap: `_system_table_meta` path is fixed (global / dir 0). Never call
+    // getTableMeta here — that would deadlock with cold load of this table.
+    if (uid == SystemTable.tableMetaTableUid) {
+      return pathJoin(
+        pathJoin(_instancePath, 'global'),
+        'tables_${SystemTable.tableMetaDirIndex}',
+        uid.value,
+      );
     }
 
     final meta = await dataStore.tableMetaManager?.getTableMeta(tableUid);
