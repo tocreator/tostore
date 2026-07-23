@@ -956,7 +956,8 @@ class ForeignKeyManager {
     final restrictTables = <String>[];
 
     for (final entry in referencingTables.entries) {
-      final referencingTableName = entry.key;
+      final childTableUid = entry.key;
+      final childTableName = await _nameForUid(childTableUid);
       final fks = entry.value;
 
       for (final fk in fks) {
@@ -979,9 +980,9 @@ class ForeignKeyManager {
           // We use a simple approach: query with limit(1) to check if any record exists
           // where all foreign key fields are not null. This is sufficient for RESTRICT check.
           try {
-            // Get child table schema to understand field types
-            final childSchema = await _dataStore.tableMetaManager!
-                .getTableSchemaByName(TableName(referencingTableName));
+            // Resolve by stable tableUid (rename-safe); name is only for query/API surfaces
+            final childSchema = await _dataStore.tableMetaManager
+                ?.getTableSchema(childTableUid);
             if (childSchema == null) {
               // Table doesn't exist, skip this check
               continue;
@@ -989,7 +990,7 @@ class ForeignKeyManager {
 
             // Query to check if any records exist with non-null foreign key values
             // We use whereNotNull which internally uses 'IS NOT' null syntax
-            final queryBuilder = QueryBuilder(_dataStore, referencingTableName);
+            final queryBuilder = QueryBuilder(_dataStore, childTableName);
 
             // Build condition: check if all foreign key fields are not null
             // For composite foreign keys, we need to check if ALL fields are not null
@@ -1006,8 +1007,8 @@ class ForeignKeyManager {
 
             if (results.data.isNotEmpty) {
               hasRestrict = true;
-              if (!restrictTables.contains(referencingTableName)) {
-                restrictTables.add(referencingTableName);
+              if (!restrictTables.contains(childTableName)) {
+                restrictTables.add(childTableName);
               }
               // Break early if we found a RESTRICT violation
               break;
@@ -1016,11 +1017,11 @@ class ForeignKeyManager {
             // If query fails, assume there might be references and block the clear
             // This is a safety measure - better to block than to allow potentially unsafe clear
             Logger.warn(
-                'Failed to check RESTRICT constraint for $referencingTableName. Blocking clear operation for safety.',
+                'Failed to check RESTRICT constraint for $childTableName. Blocking clear operation for safety.',
                 rawError: e);
             hasRestrict = true;
-            if (!restrictTables.contains(referencingTableName)) {
-              restrictTables.add(referencingTableName);
+            if (!restrictTables.contains(childTableName)) {
+              restrictTables.add(childTableName);
             }
             break;
           }

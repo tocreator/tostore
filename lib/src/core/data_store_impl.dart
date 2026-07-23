@@ -130,6 +130,13 @@ class DataStoreImpl {
   String? get instancePath => _instancePath;
 
   bool get isInitialized => _isInitialized;
+
+  /// True after KeyManager/base engine wiring is ready, before full open.
+  ///
+  /// Internal recovery (schema migration, WAL-adjacent work) may run while this
+  /// is true and [isInitialized] is still false. [close] clears both flags.
+  bool get isBaseInitialized => _baseInitialized;
+
   final bool isMigrationInstance;
 
   CancellationToken _globalQueryCancelToken = CancellationToken();
@@ -911,6 +918,8 @@ class DataStoreImpl {
               tableMetaManager?.loadAllTableMetaAsync().catchError((Object e) {
             Logger.warn('Background table meta load failed', rawError: e);
           }));
+
+          migrationManager?.schedulePendingMigrationWork();
         }
 
         if (!_initCompleter.isCompleted) {

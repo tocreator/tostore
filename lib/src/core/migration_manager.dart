@@ -122,10 +122,31 @@ class MigrationManager {
   Future<void>? _activeTaskFuture;
 
   /// Exit at cooperative points when the datastore is closing / switching space.
+  ///
+  /// Uses [DataStoreImpl.isBaseInitialized] (not [DataStoreImpl.isInitialized]):
+  /// startup schema/data migration runs after base is ready but before the DB is
+  /// marked fully open for external callers.
+  ///
+  /// Throws [DbClosedException] only as internal control-flow. Callers must
+  /// swallow it silently — close/pause is expected, not an error.
   void _throwIfMigrationStopped([String? detail]) {
-    if (!_dataStore.isInitialized) {
+    if (!_dataStore.isBaseInitialized) {
       throw DbClosedException(detail ?? 'Migration stopped');
     }
+  }
+
+  /// Start background processing for any queued schema migration tasks.
+  ///
+  /// Safe to call multiple times; [processMigrationTasks] is single-flight.
+  /// Cooperative stop ([DbClosedException]) is swallowed silently.
+  void schedulePendingMigrationWork() {
+    if (_pendingTasks.isEmpty) return;
+    unawaited(processMigrationTasks().catchError((e) {
+      if (e is DbClosedException) {
+        return MigrationTasksResult(success: false);
+      }
+      throw e;
+    }));
   }
 
   /// Whether schema or key migration work is still pending.
@@ -444,15 +465,14 @@ class MigrationManager {
     }
 
     // Covers phases with no space controller (pre-cutover wait, cutover,
-    // backup, between-space gaps). close() already set isInitialized=false.
+    // backup, between-space gaps). close() already set isBaseInitialized=false.
     final taskFuture = _activeTaskFuture;
     if (taskFuture != null) {
       try {
         await taskFuture;
       } catch (e) {
-        if (e is DbClosedException) {
-          Logger.info('Active migration task stopped gracefully');
-        } else {
+        // Cooperative stop is expected on close — silent.
+        if (e is! DbClosedException) {
           Logger.error('Failed to wait for migration task stop', rawError: e);
         }
       }
@@ -471,7 +491,6 @@ class MigrationManager {
   Future<void> stopMigrationForSpace(String spaceName) async {
     final controller = _activeControllers[spaceName];
     if (controller != null) {
-      Logger.info('Stopping background migration for space [$spaceName]...');
       controller.cancel();
       // Do not remove from _activeControllers yet, let the task finish
     }
@@ -482,9 +501,8 @@ class MigrationManager {
       try {
         await taskFuture;
       } catch (e) {
-        if (e is DbClosedException) {
-          Logger.info('Migration for space [$spaceName] stopped gracefully');
-        } else {
+        // Cooperative stop is expected — silent.
+        if (e is! DbClosedException) {
           Logger.error('Failed to wait for migration task stop', rawError: e);
         }
       }
@@ -942,14 +960,14 @@ class MigrationManager {
           }
         } else {
           Logger.info(
-            'Database migration generated ${allTasks.length} migration tasks, running asynchronously in background.',
+            'Schema migration generated ${allTasks.length} data migration tasks'
+            '${_dataStore.isInitialized ? ', running asynchronously in background' : ', scheduled to run after database open'}.',
           );
-          unawaited(processMigrationTasks().catchError((e) {
-            if (e is DbClosedException) {
-              return MigrationTasksResult(success: false);
-            }
-            throw e;
-          }));
+          // During startup, DataStoreImpl.schedulePendingMigrationWork runs
+          // after isInitialized=true. After open, start immediately.
+          if (_dataStore.isInitialized) {
+            schedulePendingMigrationWork();
+          }
         }
       }
 
@@ -958,7 +976,7 @@ class MigrationManager {
       final duration = endTime.difference(startTime);
 
       Logger.info(
-        'Database migration completed:  Renamed tables [${renamedTables.length}], Updated tables [$tablesUpdated], New tables [$tablesCreated], Deleted tables [$tablesDropped], Total duration [${duration.inMilliseconds}ms]',
+        'Schema migration applied: Renamed tables [${renamedTables.length}], Updated tables [$tablesUpdated], New tables [$tablesCreated], Deleted tables [$tablesDropped], Pending data tasks [${allTasks.length}], Duration [${duration.inMilliseconds}ms]',
       );
     } catch (e) {
       Logger.error('Database migration failed', rawError: e);
@@ -1870,12 +1888,7 @@ class MigrationManager {
 
       // only trigger task processing when startProcessing is true
       if (startProcessing) {
-        unawaited(processMigrationTasks().catchError((e) {
-          if (e is DbClosedException) {
-            return MigrationTasksResult(success: false);
-          }
-          throw e;
-        }));
+        schedulePendingMigrationWork();
       }
 
       return task;
@@ -3853,6 +3866,10 @@ class MigrationManager {
 
       await syncHasMigrationTask();
     } catch (e) {
+      // Close/pause cooperative stop — silent, not a failure to surface.
+      if (e is DbClosedException) {
+        return MigrationTasksResult(success: false);
+      }
       Logger.error('Process migration tasks failed', rawError: e);
       success = false;
       errors.add(e);
@@ -4123,7 +4140,7 @@ class MigrationManager {
               while (!_dataStore.walManager.isAtOrBefore(
                   cutover, _dataStore.walManager.meta.checkpoint)) {
                 if (migrationController.isCancelled ||
-                    !_dataStore.isInitialized) {
+                    !_dataStore.isBaseInitialized) {
                   throw DbClosedException(
                     'Migration stopped while waiting for WAL cutover in space [$space]',
                   );
@@ -4452,9 +4469,7 @@ class MigrationManager {
       }
     } catch (e) {
       if (e is DbClosedException) {
-        Logger.info(
-          'Migration task ${task.taskId} paused',
-        );
+        // Cooperative pause/close — silent; rethrow for outer single-flight.
         rethrow;
       }
       _telemetry.recordTaskFailure(task.taskId, e.toString());
@@ -5148,19 +5163,31 @@ class MigrationManager {
     if (_pendingTasks.isNotEmpty) {
       registerSchemaVersionsFromTasks(_pendingTasks);
 
-      // Reconcile pending tasks for recovered tables to merge or cancel redundant ops
-      final uniqueTableNames = _pendingTasks.map((t) => t.tableName).toSet();
-      for (final tName in uniqueTableNames) {
-        await _reconcilePendingTasksForTable(await _requireTableContext(tName));
+      // Reconcile by stable tableUid (name may be stale after rename / cold cache).
+      final seenTableUids = <String>{};
+      for (final task in List<MigrationTask>.from(_pendingTasks)) {
+        final uid = task.tableUid;
+        if (uid.isEmpty || !seenTableUids.add(uid.value)) continue;
+        try {
+          final table = await _tableContextForUid(uid);
+          if (table == null) {
+            Logger.warn(
+              'Skip reconcile for pending migration taskId[${task.taskId}]: '
+              'tableUid[${uid.value}] meta not found (tableName[${task.tableName}])',
+            );
+            continue;
+          }
+          await _reconcilePendingTasksForTable(table);
+        } catch (e) {
+          Logger.warn(
+            'Failed to reconcile pending migration for tableUid[${uid.value}] '
+            '(tableName[${task.tableName}])',
+            rawError: e,
+          );
+        }
       }
 
       _rebuildRuntimeMigrations();
-      unawaited(processMigrationTasks().catchError((e) {
-        if (e is DbClosedException) {
-          return MigrationTasksResult(success: false);
-        }
-        throw e;
-      }));
     }
   }
 
