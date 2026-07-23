@@ -417,23 +417,13 @@ class QueryExecutor {
       final int? fetchLimit =
           effectiveLimit != null ? effectiveLimit + 1 : null;
 
-      // count() never needs ordering – stripping orderBy forces the fast PK-scan
-      // path (B+Tree Stream Scan) instead of the TopKHeap sorting path.
-      if (onlyCount) {
-        orderBy = null;
-      } else if ((aggregations != null && aggregations.isNotEmpty) &&
-          effectiveLimit == null &&
-          effectiveOffset == 0) {
-        // Unbounded aggregations without offsets are not affected by ordering.
-        orderBy = null;
-      }
-
       final stopwatch = Stopwatch()..start();
       final schema = schemas[tableName]!;
       ConditionRecordMatcher? matcher;
       ConditionRecordMatcher? postJoinMatcher;
 
-      // Decode cursor token if provided.
+      // Decode + validate cursor against the user-facing query identity BEFORE any
+      // internal orderBy stripping (count / unbounded aggregation optimizations).
       final _QueryCursorToken? cursorToken =
           cursor != null ? _QueryCursorToken.tryDecode(cursor) : null;
       if (cursorToken != null) {
@@ -448,14 +438,18 @@ class QueryExecutor {
           ]);
         }
 
-        // Validate query signature hash to prevent mismatched query cursors
         if (cursorToken.querySigHash != null) {
           final currentSigHash = _buildQuerySignatureHash(
-            tableUid: table.tableUid,
+            tableUid: schema.tableUid,
             where: where,
             orderBy: orderBy,
+            joins: joins,
+            groupBy: groupBy,
+            aggregations: aggregations,
           );
-          if (cursorToken.querySigHash != currentSigHash) {
+          // Compare as unsigned 32-bit bit-patterns (FNV hash is not a signed int).
+          if ((cursorToken.querySigHash! & 0xFFFFFFFF) !=
+              (currentSigHash & 0xFFFFFFFF)) {
             throw DbException([
               InvalidArgumentStatus(
                 type: ResultType.devInvalidCursorSignature,
@@ -467,6 +461,17 @@ class QueryExecutor {
             ]);
           }
         }
+      }
+
+      // count() never needs ordering – stripping orderBy forces the fast PK-scan
+      // path (B+Tree Stream Scan) instead of the TopKHeap sorting path.
+      if (onlyCount) {
+        orderBy = null;
+      } else if ((aggregations != null && aggregations.isNotEmpty) &&
+          effectiveLimit == null &&
+          effectiveOffset == 0) {
+        // Unbounded aggregations without offsets are not affected by ordering.
+        orderBy = null;
       }
 
       if (condition != null && !condition.isEmpty) {
@@ -718,6 +723,9 @@ class QueryExecutor {
               orderBy: orderBy,
               lastRecord: lastRec,
               where: where,
+              joins: joins,
+              groupBy: groupBy,
+              aggregations: aggregations,
               isBackward: false,
             );
           }
@@ -731,6 +739,9 @@ class QueryExecutor {
               orderBy: orderBy,
               lastRecord: firstRec,
               where: where,
+              joins: joins,
+              groupBy: groupBy,
+              aggregations: aggregations,
               isBackward: true,
             );
           }
@@ -803,7 +814,10 @@ class QueryExecutor {
   }) async {
     final tableName = table.tableName;
     final schema = decodeSchema ??
-        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
+        (table.schema.name.isNotEmpty
+            ? table.schema
+            : await _dataStore.tableMetaManager
+                ?.getTableSchema(table.tableUid));
     if (schema == null) {
       return PlanExecutionResult([], onlyCount ? 0 : null, null);
     }
@@ -1936,7 +1950,10 @@ class QueryExecutor {
     final tableName = table.tableName;
     try {
       final schema = decodeSchema ??
-          await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
+          (table.schema.name.isNotEmpty
+              ? table.schema
+              : await _dataStore.tableMetaManager
+                  ?.getTableSchema(table.tableUid));
       if (schema == null) {
         return TableScanResult(records: const [], count: onlyCount ? 0 : null);
       }
@@ -1997,11 +2014,7 @@ class QueryExecutor {
         return TableScanResult(records: const []);
       }
 
-      final tblSchema =
-          await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
-      if (tblSchema == null) {
-        return TableScanResult(records: const [], count: onlyCount ? 0 : null);
-      }
+      final tblSchema = schema;
       final pkMatcher =
           ValueMatcher.getMatcher(tblSchema.getPrimaryKeyMatcherType());
       final matcherCondition = matcher?.condition.build();
@@ -3103,13 +3116,19 @@ class QueryExecutor {
     required List<String>? orderBy,
     required Map<String, dynamic> lastRecord,
     required Map<String, dynamic>? where,
+    List<JoinClause>? joins,
+    List<String>? groupBy,
+    List<QueryAggregation>? aggregations,
     bool isBackward = false,
   }) {
     final tableName = table.tableName;
     final sigHash = _buildQuerySignatureHash(
-      tableUid: table.tableUid,
+      tableUid: schema.tableUid,
       where: where,
       orderBy: orderBy,
+      joins: joins,
+      groupBy: groupBy,
+      aggregations: aggregations,
     );
 
     if (mode == _CursorMode.primaryKey) {
@@ -3765,7 +3784,9 @@ final class _QueryCursorToken {
 
     if (querySigHash != null) {
       builder.addByte(1);
-      final bdata = ByteData(4)..setInt32(0, querySigHash!, Endian.big);
+      // FNV signature is an unsigned 32-bit bit-pattern.
+      final bdata = ByteData(4)
+        ..setUint32(0, querySigHash! & 0xFFFFFFFF, Endian.big);
       builder.add(bdata.buffer.asUint8List());
     } else {
       builder.addByte(0);
@@ -3886,7 +3907,7 @@ final class _QueryCursorToken {
     int? querySigHash;
     if (hasSigHash) {
       querySigHash = ByteData.sublistView(bytes, offset, offset + 4)
-          .getInt32(0, Endian.big);
+          .getUint32(0, Endian.big);
       offset += 4;
     }
 
@@ -3955,6 +3976,9 @@ int _buildQuerySignatureHash({
   required TableUid tableUid,
   required Map<String, dynamic>? where,
   required List<String>? orderBy,
+  List<JoinClause>? joins,
+  List<String>? groupBy,
+  List<QueryAggregation>? aggregations,
 }) {
   int hash = 2166136261;
 
@@ -4016,11 +4040,52 @@ int _buildQuerySignatureHash({
     }
   }
 
+  // Normalize empty containers so QueryBuilder / direct execute paths agree.
+  final Map<String, dynamic>? normWhere =
+      (where == null || where.isEmpty) ? null : where;
+  final List<String>? normOrderBy =
+      (orderBy == null || orderBy.isEmpty) ? null : orderBy;
+  final List<String>? normGroupBy =
+      (groupBy == null || groupBy.isEmpty) ? null : groupBy;
+
+  List<Map<String, String>>? joinsFp;
+  if (joins != null && joins.isNotEmpty) {
+    joinsFp = <Map<String, String>>[
+      for (final j in joins)
+        <String, String>{
+          't': j.type.name,
+          'table': j.table,
+          'fk': j.firstKey,
+          'op': j.operator,
+          'sk': j.secondKey,
+        },
+    ];
+  }
+
+  List<Map<String, String>>? aggsFp;
+  if (aggregations != null && aggregations.isNotEmpty) {
+    aggsFp = <Map<String, String>>[
+      for (final a in aggregations)
+        <String, String>{
+          'type': a.type.name,
+          'field': a.field,
+          if (a.alias != null) 'alias': a.alias!,
+        },
+    ];
+  }
+
   hashString(tableUid);
   hashByte(0x7C);
-  hashObject(where);
+  hashObject(normWhere);
   hashByte(0x7C);
-  hashObject(orderBy);
+  hashObject(normOrderBy);
+  hashByte(0x7C);
+  hashObject(joinsFp);
+  hashByte(0x7C);
+  hashObject(normGroupBy);
+  hashByte(0x7C);
+  hashObject(aggsFp);
 
-  return hash;
+  // Unsigned 32-bit FNV bit-pattern (must match setUint32/getUint32 on the wire).
+  return hash & 0xFFFFFFFF;
 }
