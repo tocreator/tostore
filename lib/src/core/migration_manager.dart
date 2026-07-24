@@ -971,7 +971,7 @@ class MigrationManager {
           }
         } else {
           Logger.info(
-            'Schema migration generated ${allTasks.length} data migration tasks'
+            'Schema migration generated ${allTasks.length} migration tasks'
             '${_dataStore.isInitialized ? ', running asynchronously in background' : ', scheduled to run after database open'}.',
           );
           // During startup, DataStoreImpl.schedulePendingMigrationWork runs
