@@ -94,22 +94,24 @@ final class TableTreePartitionManager {
 
     // Tier 2: Match layout dynamically by slot count if they differ (independent of fallback flag)
     if (hasRuntimeMigration && storedFieldCount != null) {
-      final historicSchema = await migrationManager.getTableSchemaBySlotCount(
-          table, storedFieldCount);
-      if (historicSchema != null) {
+      final resolved = await migrationManager.resolveFieldLayoutBySlotCount(
+        table,
+        storedFieldCount,
+      );
+      if (resolved != null) {
         final historicFieldStruct =
             await _dataStore.tableMetaManager?.getStorageFieldStructure(
           tableUid,
-          schema: historicSchema,
+          layoutOverride: resolved.layout,
         );
-        if (historicFieldStruct != null) {
+        if (historicFieldStruct != null && historicFieldStruct.isNotEmpty) {
           final decoded =
               BinarySchemaCodec.decodeRecord(bytes, historicFieldStruct);
           if (decoded != null) {
             return migrationManager.normalizeRecordToLatestSync(
               table,
               decoded,
-              fromVersion: historicSchema.schemaVersion ?? '',
+              fromVersion: resolved.schema?.schemaVersion ?? '',
             );
           }
         }
