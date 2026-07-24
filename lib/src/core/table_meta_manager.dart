@@ -105,6 +105,13 @@ class TableMetaManager {
   /// [DataStoreImpl.currentSpaceName]; cleared on [dispose] / space switch.
   SpaceManifest? _spaceManifest;
 
+  /// Single-flight handle for [loadSpaceManifest] (re-entrancy safe).
+  Future<void>? _spaceManifestLoadFuture;
+
+  /// Bumped on [clearSpaceManifest] so an in-flight load does not repopulate
+  /// a cleared / switched-space manifest.
+  int _spaceManifestEpoch = 0;
+
   /// Serializes [allocateDirIndex] against concurrent creates.
   Future<void> _dirAllocChain = Future.value();
 
@@ -448,15 +455,33 @@ class TableMetaManager {
   /// [DataStoreImpl.currentSpaceName]) so active UIDs are not reused across spaces.
   void clearSpaceManifest() {
     _spaceManifest = null;
+    _spaceManifestEpoch++;
+    _spaceManifestLoadFuture = null;
   }
 
-  /// Load deferred current-space metadata from internal KV.
-  Future<void> loadSpaceManifest() async {
+  /// Load deferred current-space metadata from internal KV (single-flight).
+  Future<void> loadSpaceManifest() {
+    if (_spaceManifest != null) return Future.value();
+    final existing = _spaceManifestLoadFuture;
+    if (existing != null) return existing;
+
+    final epoch = _spaceManifestEpoch;
+    final future = _doLoadSpaceManifest(epoch);
+    _spaceManifestLoadFuture = future;
+    return future.whenComplete(() {
+      if (identical(_spaceManifestLoadFuture, future)) {
+        _spaceManifestLoadFuture = null;
+      }
+    });
+  }
+
+  Future<void> _doLoadSpaceManifest(int epoch) async {
     try {
       final bytes = await _dataStore.internalKv.get(
         SpaceManifestCodec.internalKvKey,
         isGlobal: false,
       );
+      if (epoch != _spaceManifestEpoch) return;
       if (bytes == null || bytes.isEmpty) {
         _spaceManifest = SpaceManifest.empty;
         return;
@@ -465,7 +490,9 @@ class TableMetaManager {
     } on DbException catch (e) {
       // Bootstrap: `_system_internal_kv_store` may not exist yet.
       if (e.statuses.any((s) => s.type == ResultType.devTableNotFound)) {
-        _spaceManifest = SpaceManifest.empty;
+        if (epoch == _spaceManifestEpoch) {
+          _spaceManifest = SpaceManifest.empty;
+        }
         return;
       }
       rethrow;
@@ -478,6 +505,28 @@ class TableMetaManager {
       await loadSpaceManifest();
     }
     return _spaceManifest ?? SpaceManifest.empty;
+  }
+
+  /// Whether [tableUid] is visible in the current space.
+  ///
+  /// Does **not** wait for the full name inventory: uses [getTableMeta] (point
+  /// query when cold) plus [getSpaceManifest] (one KV read). Global tables are
+  /// always visible once meta exists; non-global tables require membership in
+  /// [SpaceManifest.activeTableUids].
+  Future<bool> isTableVisibleInCurrentSpace(TableUid tableUid) async {
+    if (tableUid.isEmpty) return false;
+    final meta = await getTableMeta(tableUid);
+    if (meta == null) return false;
+    if (meta.isGlobal) return true;
+    final manifest = await getSpaceManifest();
+    return manifest.activeTableUids.contains(tableUid);
+  }
+
+  /// Resolve [tableName] then check [isTableVisibleInCurrentSpace].
+  Future<bool> isTableNameVisibleInCurrentSpace(TableName tableName) async {
+    final uid = await getUidByName(tableName);
+    if (uid == null) return false;
+    return isTableVisibleInCurrentSpace(uid);
   }
 
   /// Visible table UIDs in the current space: **all global tables** ∪
@@ -1405,7 +1454,11 @@ class TableMetaManager {
     return meta?.schema;
   }
 
-  /// Resolve table uid by name, activating non-global tables in the current space.
+  /// Resolve table uid by name (pure lookup — no space-manifest side effects).
+  ///
+  /// Cold path: one point query on `_system_table_meta`. Does **not** await
+  /// full name inventory and does **not** activate non-global tables into the
+  /// current space (activation is owned by [saveTableMeta] only).
   Future<TableUid?> resolveTableUidFromName(TableName tableName) async {
     if (tableName.isEmpty) return null;
 
@@ -1431,9 +1484,8 @@ class TableMetaManager {
       if (rows.isEmpty) return null;
 
       final meta = TableMetaCodec.decodeRow(rows.first);
-      if (!meta.isGlobal) {
-        await _ensureActiveInCurrentSpace(meta.tableUid);
-      }
+      // Register before any further await so re-entrant name resolves
+      // (e.g. SpaceManifest → internal KV → getTableContext) hit memory.
       _registerMetaInLookups(meta);
       _cacheTableMeta(meta);
       return meta.tableUid;

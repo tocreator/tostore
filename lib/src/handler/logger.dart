@@ -252,7 +252,11 @@ class Logger {
     if (message != null && status != null) {
       final ctx = message is String ? message : toStringWithAll(message);
       final detail = status.message;
-      text = detail.isNotEmpty ? '$ctx: $detail' : ctx;
+      if (ctx == detail || message is ResultStatus || message is DbException) {
+        text = ctx;
+      } else {
+        text = detail.isNotEmpty ? '$ctx: $detail' : ctx;
+      }
     } else if (status != null) {
       text = status.message;
     } else if (message is String) {

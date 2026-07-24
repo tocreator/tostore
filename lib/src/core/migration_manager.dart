@@ -4054,7 +4054,7 @@ class MigrationManager {
       });
 
       Logger.info(
-        'Preparing to migrate data for ${pendingSpaces.length} spaces',
+        'Preparing to migrate table [${currentTask.tableName}] for ${pendingSpaces.length} spaces',
       );
 
       final taskScopes = await _getMigrationScopesForSchema(oldSchema);
@@ -4115,14 +4115,10 @@ class MigrationManager {
                     await schemaMgr.getUidByName(TableName(currentTableName)) !=
                         null;
               } else {
-                final originalUid =
-                    await schemaMgr.getUidByName(TableName(originalTableName));
-                final currentUid =
-                    await schemaMgr.getUidByName(TableName(currentTableName));
-                final activeUids = await schemaMgr.getActiveUids();
-                exists =
-                    (originalUid != null && activeUids.contains(originalUid)) ||
-                        (currentUid != null && activeUids.contains(currentUid));
+                exists = await schemaMgr.isTableNameVisibleInCurrentSpace(
+                        TableName(originalTableName)) ||
+                    await schemaMgr.isTableNameVisibleInCurrentSpace(
+                        TableName(currentTableName));
               }
             }
 
