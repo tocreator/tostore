@@ -5,9 +5,12 @@ import 'package:path/path.dart' as p;
 import '../handler/encryption.dart';
 import '../handler/meta_binary_codec.dart';
 import '../model/data_store_config.dart';
+import '../model/db_exception.dart';
 import '../model/meta_info.dart';
 import '../model/ngh_index_meta.dart';
 import '../model/parallel_journal_entry.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../model/table_identity.dart';
 import 'btree_page.dart';
 import 'data_store_impl.dart';
@@ -63,7 +66,7 @@ final class TreeMetaPageService {
     int? encryptionKeyId,
     bool flush = true,
   }) async {
-    final pageSize = _dataStore.configuredPageSize;
+    final pageSize = _requireConfiguredPageSize();
     final path =
         await _dataStore.pathManager.getPartitionFilePathByNo(tableUid, 0);
     final local = partitionLocalOverride ??
@@ -135,7 +138,7 @@ final class TreeMetaPageService {
     int? encryptionKeyId,
     bool flush = true,
   }) async {
-    final pageSize = _dataStore.configuredPageSize;
+    final pageSize = _requireConfiguredPageSize();
     final path = await _dataStore.pathManager
         .getIndexPartitionPathByNo(tableUid, indexUid, 0);
     final local = partitionLocalOverride ??
@@ -208,7 +211,7 @@ final class TreeMetaPageService {
     int? encryptionKeyId,
     bool flush = true,
   }) async {
-    final pageSize = _dataStore.configuredPageSize;
+    final pageSize = _requireConfiguredPageSize();
     final path = await _dataStore.pathManager
         .getNghGraphPartitionPath(tableUid, indexUid, 0);
     final local = partitionLocalOverride ??
@@ -435,6 +438,21 @@ final class TreeMetaPageService {
   // ---------------------------------------------------------------------------
   // Internals
   // ---------------------------------------------------------------------------
+
+  /// Page size for writing padded page-0 images. Must never be 0.
+  int _requireConfiguredPageSize() {
+    final pageSize = _dataStore.configuredPageSize;
+    if (pageSize <= 0) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Invalid configured page size: $pageSize. '
+              'GlobalConfig.pageSize must be set before writing tree meta pages.',
+        ),
+      ]);
+    }
+    return pageSize;
+  }
 
   /// Read and decode page 0.
   ///
