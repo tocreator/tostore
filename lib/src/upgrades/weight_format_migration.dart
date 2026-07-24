@@ -5,13 +5,14 @@ import '../handler/weight_snapshot_codec.dart';
 import '../model/data_store_config.dart';
 import 'legacy_model/pre_v3.dart';
 
-/// Async, non-blocking migration of legacy `cache_weights.json` → internal KV.
+/// Async, non-blocking migration of legacy `cache_weights.json` → `access_weights.tobf`.
 ///
 /// - Does **not** block V3 / normal startup.
 /// - Formal [WeightManager] never reads JSON; only this upgrade path does.
 /// - Path + JSON parse live in [LegacyWeightPaths] / [LegacyCacheWeightsJson].
 /// - Parse/write failures are logged and skipped; data loss is acceptable.
-/// - Deletes the legacy file immediately after a successful KV write.
+/// - Deletes the legacy JSON immediately after a successful tobf write.
+/// - Unpublished KV-table experiments are not migrated (never shipped).
 final class WeightFormatMigration {
   WeightFormatMigration._();
 
@@ -52,11 +53,21 @@ final class WeightFormatMigration {
     required String spaceName,
   }) async {
     final jsonPath = LegacyWeightPaths.spaceJson(root, spaceName);
+    final tobfPath = dataStore.pathManager.getAccessWeightsPath(
+      rootPath: root,
+      spaceName: spaceName,
+    );
+
+    // Already on file-backed binary format — just drop leftover JSON if any.
+    if (await dataStore.storage.existsFile(tobfPath)) {
+      await _deleteIfExists(dataStore, jsonPath);
+      return;
+    }
 
     if (!await dataStore.storage.existsFile(jsonPath)) return;
 
     Logger.warn(
-      'WeightFormatMigration: migrating cache_weights.json → KV '
+      'WeightFormatMigration: migrating cache_weights.json → access_weights.tobf '
       'for space [$spaceName]',
     );
 
@@ -69,32 +80,11 @@ final class WeightFormatMigration {
     }
 
     final bytes = WeightSnapshotCodec.encode(snapshot);
+    await dataStore.storage.writeAsBytes(tobfPath, bytes, flush: true);
 
     if (spaceName == dataStore.currentSpaceName) {
-      await dataStore.internalKv.set(
-        WeightSnapshotCodec.internalKvKey,
-        bytes,
-        isGlobal: false,
-      );
       // Best-effort merge into live WeightManager memory.
       dataStore.weightManager?.applySnapshot(snapshot, markDirty: false);
-    } else {
-      final temp = DataStoreImpl(
-        dbPath: dataStore.config.dbPath,
-        dbName: dataStore.config.dbName,
-        config: dataStore.config.copyWith(spaceName: spaceName),
-        isMigrationInstance: true,
-      );
-      try {
-        await temp.initialize(applyActiveSpaceOnDefault: false);
-        await temp.internalKv.set(
-          WeightSnapshotCodec.internalKvKey,
-          bytes,
-          isGlobal: false,
-        );
-      } finally {
-        await temp.close();
-      }
     }
 
     await _deleteIfExists(dataStore, jsonPath);
