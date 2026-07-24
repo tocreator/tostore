@@ -26,7 +26,7 @@ abstract final class WeightDataFieldId {
   static const int customWeight = 5;
 }
 
-/// Decoded in-memory weight snapshot (KV blob payload).
+/// Decoded in-memory weight snapshot (`access_weights.tobf` payload).
 final class WeightSnapshot {
   final Map<TableUid, WeightData> tableRecord;
   final Map<String, WeightData> indexData;
@@ -48,12 +48,12 @@ final class WeightSnapshot {
       );
 }
 
-/// Field-tag codec for [WeightSnapshot] (KV value payload, no TOBF frame).
+/// Field-tag codec for [WeightSnapshot] (space file payload; no outer TOBF frame).
 abstract final class WeightSnapshotCodec {
   WeightSnapshotCodec._();
 
-  /// Internal KV key in space-local `_system_internal_kv_store`.
-  static const String internalKvKey = 'stats.access.weights';
+  /// Space-local file name under `spaces/{space}/`.
+  static const String fileName = 'access_weights.tobf';
 
   /// Marker value for [WeightSnapshotFieldId.indexDataKeyFormat].
   static const int indexUidKeyFormat = 1;
