@@ -1612,12 +1612,17 @@ class MigrationManager {
       bool startProcessing = true,
       bool allowAfterDataMigration = false,
       TableSchema? targetSchemaSnapshot,
+
+      /// Optional pre-delete snapshot. Required when meta was already removed
+      /// (e.g. [DataStoreImpl.dropTable] enqueues cross-space cleanup).
+      TableSchema? oldSchemaSnapshot,
       MigrationWriteMode? writeMode,
       List<IndexUid>? specificIndexUids}) async {
     final latestPending = _findLatestPendingTaskForTableUid(tableUid);
-    final oldSchema = latestPending != null
-        ? latestPending.targetSchemaSnapshot
-        : await _dataStore.tableMetaManager?.getTableSchema(tableUid);
+    final oldSchema = oldSchemaSnapshot ??
+        (latestPending != null
+            ? latestPending.targetSchemaSnapshot
+            : await _dataStore.tableMetaManager?.getTableSchema(tableUid));
 
     TableSchema? targetSchema = targetSchemaSnapshot;
     if (targetSchema != null) {
@@ -1634,7 +1639,7 @@ class MigrationManager {
 
     final tableDisplayName = await _resolveTableDisplayName(
       tableUid,
-      schemaHint: targetSchema,
+      schemaHint: targetSchema ?? oldSchema,
     );
 
     final tableLockResource = _tableLockResource(tableUid);
@@ -4321,10 +4326,12 @@ class MigrationManager {
               await migrationInstance.initialize();
             }
 
-            // Check if table exists under either the old or new name in this space before migration.
+            // Prefer stable tableUid (rename-safe). Fall back to name mapping
+            // for legacy tasks that only recorded names.
             final isGlobalTable = oldSchema?.isGlobal ?? false;
             bool exists = false;
             final schemaMgr = migrationInstance.tableMetaManager;
+            final taskTableUid = TableUid(currentTask.tableUid);
             if (schemaMgr != null) {
               if (isGlobalTable) {
                 exists = await schemaMgr
@@ -4364,7 +4371,8 @@ class MigrationManager {
             }
 
             final migrationTableCtx =
-                await migrationInstance.getTableContext(currentTableName);
+                await schemaMgr?.getTableContext(taskTableUid) ??
+                    await migrationInstance.getTableContext(currentTableName);
 
             await _reconcileSchemaSideEffectsAfterSchemaCutover(
               migrationInstance,

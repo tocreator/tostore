@@ -4034,9 +4034,13 @@ class DataStoreImpl {
         }
 
         if (registerWalOp) {
-          // Add migration task to delete table data in each space
-          await migrationManager?.addMigrationTask(table.tableUid,
-              [const MigrationOperation(type: MigrationType.dropTable)]);
+          // Cross-space cleanup: pass schema snapshot because current-space
+          // meta/dir are already deleted above.
+          await migrationManager?.addMigrationTask(
+            table.tableUid,
+            [const MigrationOperation(type: MigrationType.dropTable)],
+            oldSchemaSnapshot: table.schema,
+          );
         }
 
         // Same rationale as clear(): after the physical drop has completed,
