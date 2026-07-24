@@ -37,6 +37,7 @@ abstract final class MigrationTaskFieldId {
   static const int errors = 18;
   static const int estimateDurationUs = 19;
   static const int referencingChildIndexesToDrop = 20;
+  static const int targetFieldLayoutSnapshot = 21;
   // Reserved 40–63.
 }
 
@@ -151,6 +152,12 @@ final class MigrationTaskCodec {
             sw, task.oldFieldLayoutSnapshot!);
       });
     }
+    if (task.targetFieldLayoutSnapshot != null) {
+      w.writeMessage(MigrationTaskFieldId.targetFieldLayoutSnapshot, (sw) {
+        SchemaBinaryCodec.writeFieldStorageLayout(
+            sw, task.targetFieldLayoutSnapshot!);
+      });
+    }
     if (task.schemaCutoverWalPointer != null) {
       w.writeMessage(MigrationTaskFieldId.schemaCutoverWalPointer, (sw) {
         _writeWalPointer(sw, task.schemaCutoverWalPointer!);
@@ -230,6 +237,7 @@ final class MigrationTaskCodec {
     TableSchema? oldSchema;
     TableSchema? targetSchema;
     FieldStorageLayout? oldFieldLayout;
+    FieldStorageLayout? targetFieldLayout;
     WalPointer? cutover;
     var forceDataMigration = false;
     final spaceCheckpointKeys = <String, String>{};
@@ -285,6 +293,11 @@ final class MigrationTaskCodec {
         case MigrationTaskFieldId.oldFieldLayoutSnapshot:
           r.readMessage((nr, _) {
             oldFieldLayout = SchemaBinaryCodec.readFieldStorageLayout(nr);
+          });
+          break;
+        case MigrationTaskFieldId.targetFieldLayoutSnapshot:
+          r.readMessage((nr, _) {
+            targetFieldLayout = SchemaBinaryCodec.readFieldStorageLayout(nr);
           });
           break;
         case MigrationTaskFieldId.schemaCutoverWalPointer:
@@ -388,6 +401,7 @@ final class MigrationTaskCodec {
       oldSchemaSnapshot: oldSchema,
       targetSchemaSnapshot: targetSchema,
       oldFieldLayoutSnapshot: oldFieldLayout,
+      targetFieldLayoutSnapshot: targetFieldLayout,
       schemaCutoverWalPointer: cutover,
       forceDataMigration: forceDataMigration,
       spaceCheckpointKeys: spaceCheckpointKeys,
