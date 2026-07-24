@@ -496,7 +496,7 @@ final class LegacyTxnJson {
 }
 
 // ---------------------------------------------------------------------------
-// Cache weights (cache_weights.json → internal KV)
+// Cache weights (cache_weights.json → access_weights.tobf)
 // ---------------------------------------------------------------------------
 
 /// Legacy weight JSON path — construct only inside upgrades/.
@@ -509,7 +509,7 @@ abstract final class LegacyWeightPaths {
       pathJoin(instancePath, 'spaces', spaceName, fileName);
 }
 
-/// Parser for pre-KV `cache_weights.json` (consumed only by [WeightFormatMigration]).
+/// Parser for pre-V3 `cache_weights.json` (consumed only by [WeightFormatMigration]).
 final class LegacyCacheWeightsJson {
   LegacyCacheWeightsJson._();
 
