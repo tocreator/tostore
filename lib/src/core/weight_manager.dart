@@ -1,9 +1,9 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import '../handler/logger.dart';
 import '../handler/weight_snapshot_codec.dart';
-import '../model/db_exception.dart';
-import '../model/result_type.dart';
+import '../model/data_store_config.dart';
 import '../model/system_table.dart';
 import '../model/table_context.dart';
 import '../model/table_identity.dart';
@@ -17,8 +17,6 @@ export '../model/weight_data.dart';
 /// Weight manager
 /// Responsible for managing the weights of table records and index data, supporting weight decay, query, etc.
 ///
-/// Persistence: space-local internal KV key [WeightSnapshotCodec.internalKvKey]
-/// (`isGlobal: false`), field-tag binary payload (no JSON).
 class WeightManager {
   final DataStoreImpl _dataStore;
 
@@ -50,16 +48,8 @@ class WeightManager {
   /// clears [_dirty] when it is unchanged (no concurrent mutation after capture).
   int _dirtySeq = 0;
 
-  /// Last successful KV persist time (ms epoch). Used for 1h dirty guarantee.
+  /// Last successful file persist time (ms epoch). Used for 1h dirty guarantee.
   int _lastSuccessfulSaveMs = 0;
-
-  /// >0 while WeightManager reads/writes its own KV blob.
-  /// Hot path: callers only do a cheap `!= 0` check; detailed skip runs rarely.
-  int _weightMetaIoDepth = 0;
-
-  /// Cached space-local internal KV tableUid.value (and index key prefix).
-  String? _spaceInternalKvUidValue;
-  String? _spaceInternalKvIndexPrefix;
 
   /// Lock for saving weights
   Future<void>? _saveLock;
@@ -70,6 +60,9 @@ class WeightManager {
     CrontabManager.addCallback(ExecuteInterval.hour1, _hourlyGuaranteeSave);
   }
 
+  bool get _isMemoryMode =>
+      _dataStore.config.persistenceMode == PersistenceMode.memory;
+
   /// Dispose weight manager and deregister crontab callbacks
   void dispose() {
     CrontabManager.removeCallback(ExecuteInterval.hour24, _performDecay);
@@ -77,40 +70,8 @@ class WeightManager {
     CrontabManager.removeCallback(ExecuteInterval.hour1, _hourlyGuaranteeSave);
   }
 
-  Future<T> _withWeightMetaIo<T>(Future<T> Function() action) async {
-    await _ensureSpaceInternalKvTableUidCached();
-    _weightMetaIoDepth++;
-    try {
-      return await action();
-    } finally {
-      _weightMetaIoDepth--;
-    }
-  }
-
-  Future<void> _ensureSpaceInternalKvTableUidCached() async {
-    if (_spaceInternalKvUidValue != null) return;
-    final schema = await _dataStore.tableMetaManager?.getTableSchemaByName(
-      TableName(SystemTable.getInternalKeyValueName(false)),
-    );
-    final uid = schema?.tableUid.value;
-    if (uid == null || uid.isEmpty) return;
-    _spaceInternalKvUidValue = uid;
-    _spaceInternalKvIndexPrefix = '$uid:';
-  }
-
-  /// Cold path only (caller already verified [_weightMetaIoDepth] != 0).
-  bool _shouldSkipAccessStat(WeightType type, String identifier) {
-    final uid = _spaceInternalKvUidValue;
-    // Fail-safe: uid unknown → suppress all (preserves self-loop protection).
-    if (uid == null) return true;
-    if (type == WeightType.tableRecord) return identifier == uid;
-    return identifier.startsWith(_spaceInternalKvIndexPrefix!);
-  }
-
-  bool _isInternalKvUnavailable(Object e) {
-    if (e is! DbException) return false;
-    return e.statuses.any((s) => s.type == ResultType.devTableNotFound);
-  }
+  String _weightsPath({String? spaceName}) =>
+      _dataStore.pathManager.getAccessWeightsPath(spaceName: spaceName);
 
   /// Initialize weight manager
   Future<void> initialize() async {
@@ -144,13 +105,13 @@ class WeightManager {
     if (markDirty) {
       _onMutation();
     } else {
-      // Authoritative replace (e.g. just written to KV) — drop stale dirty.
+      // Authoritative replace (e.g. just written to file) — drop stale dirty.
       _dirty = false;
       _dirtySeq++;
     }
   }
 
-  /// Load weight data from space-local internal KV
+  /// Load weight data from space-local
   Future<void> _loadWeights({String? spaceName}) async {
     if (_loadingLock != null) {
       await _loadingLock!.future;
@@ -161,12 +122,18 @@ class WeightManager {
     _loadingLock = completer;
 
     try {
-      final bytes = await _withWeightMetaIo(() async {
-        return await _dataStore.internalKv.get(
-          WeightSnapshotCodec.internalKvKey,
-          isGlobal: false,
-        );
-      });
+      Uint8List? bytes;
+      if (!_isMemoryMode) {
+        final path = _weightsPath(spaceName: spaceName);
+        try {
+          if (await _dataStore.storage.existsFile(path)) {
+            final raw = await _dataStore.storage.readAsBytes(path);
+            if (raw.isNotEmpty) bytes = raw;
+          }
+        } catch (e) {
+          Logger.warn('Failed to read access_weights.tobf', rawError: e);
+        }
+      }
 
       if (bytes == null || bytes.isEmpty) {
         await _initializeWeights(spaceName: spaceName);
@@ -192,14 +159,8 @@ class WeightManager {
       _rebuildHighWeightCache();
       completer.complete();
     } catch (e) {
-      if (_isInternalKvUnavailable(e)) {
-        // Bootstrap: `_system_internal_kv_store` not created yet — memory only.
-        _rebuildHighWeightCache();
-        completer.complete();
-        return;
-      }
       completer.completeError(e);
-      Logger.error('Failed to load weights from internal KV', rawError: e);
+      Logger.error('Failed to load weights from file', rawError: e);
       await _initializeWeights(spaceName: spaceName);
     } finally {
       if (identical(_loadingLock, completer)) {
@@ -304,29 +265,16 @@ class WeightManager {
     saveWeights(force: true);
   }
 
-  /// Whether the write buffer is idle enough to absorb a weight KV upsert.
-  bool _isWriteBufferIdleEnough() {
-    final batch = _dataStore.config.writeBatchSize;
-    if (batch <= 0) return true;
-    final threshold = (batch * 0.1).ceil();
-    return _dataStore.writeBufferManager.queueLength <= threshold;
-  }
-
-  /// Save weight snapshot to space-local internal KV.
+  /// Save weight snapshot to space-local
   Future<void> saveWeights({String? spaceName, bool force = false}) async {
     if (!force && !_dirty) return;
-    if (!force && !_isWriteBufferIdleEnough()) {
-      // Keep dirty; retry on next 30s tick or hourly guarantee.
-      return;
-    }
 
     if (_saveLock != null) {
       await _saveLock;
     }
 
-    // Prior saver may have cleared dirty / drained the buffer.
+    // Prior saver may have cleared dirty.
     if (!force && !_dirty) return;
-    if (!force && !_isWriteBufferIdleEnough()) return;
 
     final completer = Completer<void>();
     _saveLock = completer.future;
@@ -341,13 +289,10 @@ class WeightManager {
       );
       final bytes = WeightSnapshotCodec.encode(snapshot);
 
-      await _withWeightMetaIo(() async {
-        await _dataStore.internalKv.set(
-          WeightSnapshotCodec.internalKvKey,
-          bytes,
-          isGlobal: false,
-        );
-      });
+      if (!_isMemoryMode) {
+        final path = _weightsPath(spaceName: spaceName);
+        await _dataStore.storage.writeAsBytes(path, bytes, flush: true);
+      }
 
       // Concurrent mutation after capture → keep dirty for a follow-up save.
       if (_dirtySeq == seqAtCapture) {
@@ -355,11 +300,7 @@ class WeightManager {
         _lastSuccessfulSaveMs = DateTime.now().millisecondsSinceEpoch;
       }
     } catch (e) {
-      if (_isInternalKvUnavailable(e)) {
-        // Bootstrap / missing table: keep dirty for a later retry.
-        return;
-      }
-      Logger.error('Failed to save weights to internal KV', rawError: e);
+      Logger.error('Failed to save weights to file', rawError: e);
       // Keep _dirty so a later tick/hourly guarantee retries.
     } finally {
       completer.complete();
@@ -389,13 +330,8 @@ class WeightManager {
     String identifier, {
     String? spaceName,
   }) async {
-    // System-table create runs before WeightManager.initialize and before
-    // `_system_internal_kv_store` exists — skip until the DB is ready.
+    // System-table create runs before WeightManager.initialize — skip until ready.
     if (!_dataStore.isInitialized) return;
-
-    if (_weightMetaIoDepth != 0 && _shouldSkipAccessStat(type, identifier)) {
-      return;
-    }
 
     if (_initialized) {
       if (type == WeightType.tableRecord ||
@@ -407,14 +343,10 @@ class WeightManager {
 
     // Fallback to async loading if not fully initialized or cache is empty
     await _ensureWeightsLoaded(spaceName: spaceName);
-    if (_weightMetaIoDepth != 0 && _shouldSkipAccessStat(type, identifier)) {
-      return;
-    }
     _syncIncrementAccess(type, identifier, spaceName: spaceName);
   }
 
   /// Internal synchronous increment (assumes weights are loaded).
-  /// Caller must already apply meta-IO skip when needed.
   void _syncIncrementAccess(WeightType type, String identifier,
       {String? spaceName}) {
     final now = DateTime.now().millisecondsSinceEpoch;
@@ -906,15 +838,16 @@ class WeightManager {
     _dirty = false;
     _lastDecayTime = 0;
 
+    if (_isMemoryMode) return;
+
+    final path = _weightsPath(spaceName: spaceName);
     try {
-      await _withWeightMetaIo(() async {
-        await _dataStore.internalKv.remove(
-          WeightSnapshotCodec.internalKvKey,
-          isGlobal: false,
-        );
-      });
+      if (await _dataStore.storage.existsFile(path)) {
+        await _dataStore.storage.deleteFile(path);
+      }
     } catch (e) {
-      Logger.warn('Failed to remove weight KV key', rawError: e);
+      Logger.warn('Failed to delete access_weights file in space [$spaceName]',
+          rawError: e);
     }
   }
 }
