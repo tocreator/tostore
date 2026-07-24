@@ -537,33 +537,59 @@ class MigrationManager {
   /// Abort and remove every pending/running schema migration task for [table]
   /// before a destructive [DataStoreImpl.clear].
   ///
-  /// Also drops buffered [BackgroundWriteType.schemaMigration] entries so a
-  /// late flush cannot resurrect cleared rows.
-  Future<void> reconcileOnClear(TableContext table) async {
-    await _reconcileDestructiveTableLifecycle(table, reason: 'clear');
+  /// Also drops **all** buffered [BackgroundWriteScheduler] entries for the
+  /// table (schema / key migration / large update / large delete) and stops
+  /// producers that could re-enqueue, so a late flush cannot resurrect rows.
+  ///
+  /// Returns `true` when key migration was paused for this table; the caller
+  /// must call [resumeKeyMigrationAfterDestructive] **after** the physical
+  /// clear completes (pause is global — other tables stay stopped until then).
+  Future<bool> reconcileOnClear(TableContext table) async {
+    return _reconcileDestructiveTableLifecycle(table, reason: 'clear');
   }
 
   /// Abort and remove every pending/running schema migration task for [table]
   /// before a destructive [DataStoreImpl.dropTable].
   ///
   /// The subsequent [addMigrationTask] drop op (other spaces) is added separately.
-  Future<void> reconcileOnDrop(TableContext table) async {
-    await _reconcileDestructiveTableLifecycle(table, reason: 'dropTable');
+  ///
+  /// Returns `true` when key migration was paused; call
+  /// [resumeKeyMigrationAfterDestructive] only after the physical drop
+  /// completes (same contract as [reconcileOnClear]).
+  Future<bool> reconcileOnDrop(TableContext table) async {
+    return _reconcileDestructiveTableLifecycle(table, reason: 'dropTable');
   }
 
-  /// Shared clear/drop lifecycle: cooperative abort → drop buffered migration
-  /// writes → delete all in-memory/disk tasks for [table.tableUid].
+  /// Shared clear/drop lifecycle: cooperative abort → stop background producers
+  /// → drop buffered writes of every type → delete all in-memory/disk tasks.
   ///
   /// Abort must run **before** acquiring the table exclusive lock: the rewrite
   /// path may need that same lock to exit after CancellationToken fires.
-  Future<void> _reconcileDestructiveTableLifecycle(
+  ///
+  /// Key migration pause is **global** (the runner walks every table). When
+  /// this returns `true`, callers must call [resumeKeyMigrationAfterDestructive]
+  /// only after the physical clear/drop finishes — otherwise remaining tables
+  /// stay paused forever.
+  Future<bool> _reconcileDestructiveTableLifecycle(
     TableContext table, {
     required String reason,
   }) async {
     final tableUid = table.tableUid;
+    final currentSpace = _dataStore.currentSpaceName;
 
     // 1. Cooperative abort without holding the table lock (avoid deadlock).
     await _abortExecutingTaskForTableUid(tableUid, waitForExit: true);
+
+    // 2. Stop producers that may keep enqueueing writes for this table.
+    final pauseLargeOps = _tableHasRunningLargeOps(tableUid);
+    // KeyMigrationRunner is process-global: pausing stops work for ALL tables.
+    final keyMigrating = KeyMigrationRunner.isTableMigrating(table);
+    if (pauseLargeOps) {
+      await LargeOperationRunner.pauseAndAwait(currentSpace);
+    }
+    if (keyMigrating) {
+      await _dataStore.keyManager.pauseKeyMigration();
+    }
 
     final lockMgr = _dataStore.lockManager;
     final tableLockResource = _tableLockResource(tableUid);
@@ -585,10 +611,11 @@ class MigrationManager {
       }
     }
     try {
-      await _dataStore.backgroundWriteScheduler.clearEntriesForTable(
-        table,
-        BackgroundWriteType.schemaMigration,
-      );
+      // Cancel WAL-backed large ops for this table so they do not resume.
+      await _cancelLargeOpsForTable(tableUid);
+
+      // Drop every buffered background write type (not only schemaMigration).
+      await _dataStore.backgroundWriteScheduler.clearEntriesForTable(table);
 
       final matching = _pendingTasks
           .where((t) => t.tableUid == tableUid)
@@ -612,7 +639,71 @@ class MigrationManager {
       }
     } finally {
       lockMgr?.releaseExclusiveLock(tableLockResource, tableLockOpId);
+      // Resume large ops for other tables (this table's WAL ops were cancelled).
+      if (pauseLargeOps) {
+        unawaited(LargeOperationRunner.runPendingOperations(_dataStore)
+            .catchError((_) {}, test: (e) => e is DbClosedException));
+      }
     }
+    return keyMigrating;
+  }
+
+  /// Resume global key migration after a destructive clear/drop.
+  ///
+  /// Must be paired with a `true` result from [reconcileOnClear] /
+  /// [reconcileOnDrop]. Safe to call with `false` (no-op).
+  void resumeKeyMigrationAfterDestructive(bool wasPaused) {
+    if (!wasPaused) return;
+    unawaited(_dataStore.keyManager
+        .startDeferredKeyMigrationWork()
+        .catchError((_) {}, test: (e) => e is DbClosedException));
+  }
+
+  /// Whether any running large delete/update WAL op targets [tableUid].
+  bool _tableHasRunningLargeOps(TableUid tableUid) {
+    final meta = _dataStore.walManager.meta;
+    for (final op in meta.largeDeletes.values) {
+      if (op.tableUid == tableUid && op.status == 'running') return true;
+    }
+    for (final op in meta.largeUpdates.values) {
+      if (op.tableUid == tableUid && op.status == 'running') return true;
+    }
+    return false;
+  }
+
+  /// Permanently cancel large delete/update WAL ops for [tableUid].
+  Future<void> _cancelLargeOpsForTable(TableUid tableUid) async {
+    final wal = _dataStore.walManager;
+    final meta = wal.meta;
+    final deleteIds = <String>[];
+    for (final entry in meta.largeDeletes.entries) {
+      if (entry.value.tableUid == tableUid) {
+        deleteIds.add(entry.key);
+      }
+    }
+    final updateIds = <String>[];
+    for (final entry in meta.largeUpdates.entries) {
+      if (entry.value.tableUid == tableUid) {
+        updateIds.add(entry.key);
+      }
+    }
+    for (final opId in deleteIds) {
+      await wal.cancelLargeDelete(opId);
+    }
+    for (final opId in updateIds) {
+      await wal.cancelLargeUpdate(opId);
+    }
+  }
+
+  /// Invalidate buffered schema-migration writes for [table].
+  ///
+  /// Safe while data rewrite is serial: the newer task has not enqueued yet
+  /// when older tasks are superseded during [addMigrationTask].
+  Future<void> _purgeSchemaMigrationBackgroundWrites(TableContext table) async {
+    await _dataStore.backgroundWriteScheduler.clearEntriesForTable(
+      table,
+      BackgroundWriteType.schemaMigration,
+    );
   }
 
   /// Request cancel on the active rewrite if it belongs to [tableUid].
@@ -7017,6 +7108,7 @@ class MigrationManager {
     MigrationTask task, {
     required List<IndexUid> updatedSpecificIndexes,
     required String cancelReason,
+    TableContext? table,
   }) async {
     var updatedTask = task.copyWith(specificIndexUids: updatedSpecificIndexes);
 
@@ -7042,7 +7134,23 @@ class MigrationManager {
         );
       }
       await _removePendingTaskCompletely(task, reason: cancelReason);
+      // Drop already-buffered index/table writes from the cancelled task so a
+      // late PJM flush cannot resurrect deleted-index dirty data.
+      final ctx = table ?? await _tableContextForUid(TableUid(task.tableUid));
+      if (ctx != null) {
+        await _purgeSchemaMigrationBackgroundWrites(ctx);
+      }
       return;
+    }
+
+    // IndexUid set shrunk: invalidate buffered writes that still target the
+    // removed indexes (entries freeze specificIndexUids at enqueue time).
+    if (updatedSpecificIndexes.length !=
+        (task.specificIndexUids?.length ?? 0)) {
+      final ctx = table ?? await _tableContextForUid(TableUid(task.tableUid));
+      if (ctx != null) {
+        await _purgeSchemaMigrationBackgroundWrites(ctx);
+      }
     }
 
     await _saveMigrationTask(updatedTask);
@@ -7067,11 +7175,16 @@ class MigrationManager {
   ///
   /// Unlike [_foldRedundantMigrationOperations] (ingress filter for a new task),
   /// this mutates existing tasks after enqueue or disk recovery:
-  /// - dropTable trigger: remove all sibling tasks
+  /// - dropTable trigger: remove all sibling tasks and purge all BWS types
   /// - trim redundant / removed index builds (including started tasks after abort)
   /// - fold older table-rewrite responsibility into the newest table rewrite
+  /// - invalidate older table rewrites on removeField/renameField (record shape)
   /// - invalidate indexOnly tasks when PK layout changes
   /// - merge chained table renames
+  ///
+  /// Whenever older rewrite ownership or index builds are cancelled/downgraded,
+  /// buffered [BackgroundWriteType.schemaMigration] entries for the table are
+  /// purged so PJM cannot flush stale frozen writeMode/index targets.
   Future<void> _reconcilePendingTasksForTable(
     TableContext table, {
     MigrationTask? triggerTask,
@@ -7100,10 +7213,8 @@ class MigrationManager {
         triggerTask.operations.any((op) => op.type == MigrationType.dropTable);
     if (triggerIsDrop) {
       await _abortExecutingTaskForTableUid(table.tableUid, waitForExit: false);
-      await _dataStore.backgroundWriteScheduler.clearEntriesForTable(
-        table,
-        BackgroundWriteType.schemaMigration,
-      );
+      // Clear all write types: siblings may have left key/large entries too.
+      await _dataStore.backgroundWriteScheduler.clearEntriesForTable(table);
       final siblings = _pendingTasks
           .where((t) =>
               t.tableUid == table.tableUid && t.taskId != triggerTask.taskId)
@@ -7173,6 +7284,7 @@ class MigrationManager {
             task,
             updatedSpecificIndexes: filtered,
             cancelReason: 'index reconciliation',
+            table: table,
           );
           final after = _pendingTasks.indexWhere((t) => t.taskId == taskId);
           if (after >= 0) {
@@ -7362,6 +7474,10 @@ class MigrationManager {
 
   /// Newest table-rewrite owns final physical consistency; older table rewrites
   /// are stripped (or deleted). PK name/type changes also invalidate indexOnly.
+  ///
+  /// [removeField] / [renameField] always supersede older table rewrites even
+  /// without deleted-slot compaction — otherwise an older rewrite can enqueue
+  /// stale table/index shapes that PJM would flush after the field is gone.
   Future<void> _reconcileDataRewriteOwnership({
     required TableContext table,
     required MigrationTask triggerTask,
@@ -7376,9 +7492,15 @@ class MigrationManager {
       (op) => op.type == MigrationType.setPrimaryKeyConfig,
     );
 
-    // removeField alone does not invalidate older table rewrite unless the
-    // new task itself forces data migration (e.g. deleted-slot compaction).
-    if (!triggerNeedsTableWrite && !triggerIsPkChange) {
+    final triggerChangesRecordShape = triggerTask.operations.any(
+      (op) =>
+          op.type == MigrationType.removeField ||
+          op.type == MigrationType.renameField,
+    );
+
+    if (!triggerNeedsTableWrite &&
+        !triggerIsPkChange &&
+        !triggerChangesRecordShape) {
       return;
     }
 
@@ -7386,6 +7508,8 @@ class MigrationManager {
         .where((t) =>
             t.tableUid == table.tableUid && t.taskId != triggerTask.taskId)
         .toList(growable: false);
+
+    var didMutateOlder = false;
 
     for (final task in older) {
       final stillPending = _pendingTasks.any((t) => t.taskId == task.taskId);
@@ -7406,10 +7530,15 @@ class MigrationManager {
           _pendingTasks[idx],
           reason: 'primary key change invalidated index-only rewrite',
         );
+        didMutateOlder = true;
         continue;
       }
 
-      if (!triggerNeedsTableWrite || !_taskHasTableWrite(current)) {
+      // Record-shape changes and newer table rewrites both invalidate older
+      // table-data ownership. Index-only older tasks are left to index reconcile.
+      final shouldSupersedeTableWrite =
+          triggerNeedsTableWrite || triggerChangesRecordShape;
+      if (!shouldSupersedeTableWrite || !_taskHasTableWrite(current)) {
         continue;
       }
 
@@ -7425,23 +7554,32 @@ class MigrationManager {
       if (indexes.isEmpty) {
         await _removePendingTaskCompletely(
           current,
-          reason: 'newer table rewrite superseded older table rewrite',
+          reason: triggerChangesRecordShape && !triggerNeedsTableWrite
+              ? 'record-shape change superseded older table rewrite'
+              : 'newer table rewrite superseded older table rewrite',
         );
+        didMutateOlder = true;
         continue;
       }
 
       // Keep still-valid index builds; drop table rewrite responsibility.
+      // Buffered entries freeze writeMode at enqueue — purge scheduler below.
       final downgraded = current.copyWith(
         writeMode: MigrationWriteMode.indexOnly,
         forceDataMigration: false,
       );
       await _saveMigrationTask(downgraded);
       _updatePendingTaskInMemory(downgraded);
+      didMutateOlder = true;
       Logger.info(
         'Downgraded migration task [${current.taskId}] on table '
         '[${current.tableName}] from table rewrite to indexOnly '
         '(newer table rewrite owns data consistency)',
       );
+    }
+
+    if (didMutateOlder) {
+      await _purgeSchemaMigrationBackgroundWrites(table);
     }
   }
 }

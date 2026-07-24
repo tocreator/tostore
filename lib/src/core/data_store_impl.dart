@@ -3256,20 +3256,29 @@ class DataStoreImpl {
         }
       }
 
-      // Abort in-flight / queued schema rewrites before wiping rows; otherwise a
-      // background migration could scan pre-clear snapshots and resurrect data.
-      await migrationManager?.reconcileOnClear(table);
+      // Abort in-flight / queued schema rewrites and purge all background writes
+      // before wiping rows; otherwise a late flush could resurrect cleared data.
+      // Key migration pause is global — always resume in finally after wipe.
+      var keyMigrationPaused = false;
+      try {
+        keyMigrationPaused =
+            await migrationManager?.reconcileOnClear(table) ?? false;
 
-      // clear application layer cache
-      // NOTE: clear() removes table data but keeps schema. Do not invalidate schema cache here,
-      // especially in memory mode where schema may be in-memory only.
-      await cacheManager.invalidateCache(table, invalidateSchema: false);
+        // clear application layer cache
+        // NOTE: clear() removes table data but keeps schema. Do not invalidate schema cache here,
+        // especially in memory mode where schema may be in-memory only.
+        await cacheManager.invalidateCache(table, invalidateSchema: false);
 
-      //  clear partition file deletion, auto-increment ID reset, and related cache cleanup
-      await tableDataManager.clearTable(table);
+        //  clear partition file deletion, auto-increment ID reset, and related cache cleanup
+        await tableDataManager.clearTable(table);
 
-      //  reset index
-      await _indexManager?.resetIndexes(table);
+        //  reset index
+        await _indexManager?.resetIndexes(table);
+      } finally {
+        // Restarts KeyMigrationRunner for remaining tables (and this empty one).
+        migrationManager
+            ?.resumeKeyMigrationAfterDestructive(keyMigrationPaused);
+      }
 
       // Notify watchers that the table has been cleared
       notificationManager.notify(ChangeEvent(
@@ -4007,30 +4016,38 @@ class DataStoreImpl {
 
         // Abort and remove all pending/running schema tasks for this table
         // before physical delete — rewrites must not touch a dropped table.
-        await migrationManager?.reconcileOnDrop(table);
-
-        // Clear table cache and other memory caches
-        await _invalidateTableCaches(table);
-
-        // Deleting a table requires updating statistics
-        await tableDataManager.tableDeleted(table);
-
-        // Get table path
-        String? tablePath;
+        // Key migration pause is global — always resume in finally after drop.
+        var keyMigrationPaused = false;
         try {
-          tablePath = await _pathManager!.getTablePathByUid(table.tableUid);
-        } catch (e) {
-          // skip
-        }
+          keyMigrationPaused =
+              await migrationManager?.reconcileOnDrop(table) ?? false;
 
-        // Delete table structure
-        if (tableMetaManager != null) {
-          await tableMetaManager!.deleteTableMeta(table.tableUid);
-        }
+          // Clear table cache and other memory caches
+          await _invalidateTableCaches(table);
 
-        // Delete table directory and all related files
-        if (tablePath != null && await storage.existsDirectory(tablePath)) {
-          await storage.deleteDirectory(tablePath);
+          // Deleting a table requires updating statistics
+          await tableDataManager.tableDeleted(table);
+
+          // Get table path
+          String? tablePath;
+          try {
+            tablePath = await _pathManager!.getTablePathByUid(table.tableUid);
+          } catch (e) {
+            // skip
+          }
+
+          // Delete table structure
+          if (tableMetaManager != null) {
+            await tableMetaManager!.deleteTableMeta(table.tableUid);
+          }
+
+          // Delete table directory and all related files
+          if (tablePath != null && await storage.existsDirectory(tablePath)) {
+            await storage.deleteDirectory(tablePath);
+          }
+        } finally {
+          migrationManager
+              ?.resumeKeyMigrationAfterDestructive(keyMigrationPaused);
         }
 
         if (registerWalOp) {
