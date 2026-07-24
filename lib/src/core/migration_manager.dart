@@ -535,6 +535,170 @@ class MigrationManager {
     _activeMigrationInstances.remove(spaceName);
   }
 
+  /// Abort and remove every pending/running schema migration task for [table]
+  /// before a destructive [DataStoreImpl.clear].
+  ///
+  /// Also drops buffered [BackgroundWriteType.schemaMigration] entries so a
+  /// late flush cannot resurrect cleared rows.
+  Future<void> reconcileOnClear(TableContext table) async {
+    await _reconcileDestructiveTableLifecycle(table, reason: 'clear');
+  }
+
+  /// Abort and remove every pending/running schema migration task for [table]
+  /// before a destructive [DataStoreImpl.dropTable].
+  ///
+  /// The subsequent [addMigrationTask] drop op (other spaces) is added separately.
+  Future<void> reconcileOnDrop(TableContext table) async {
+    await _reconcileDestructiveTableLifecycle(table, reason: 'dropTable');
+  }
+
+  /// Shared clear/drop lifecycle: cooperative abort → drop buffered migration
+  /// writes → delete all in-memory/disk tasks for [table.tableUid].
+  ///
+  /// Abort must run **before** acquiring the table exclusive lock: the rewrite
+  /// path may need that same lock to exit after CancellationToken fires.
+  Future<void> _reconcileDestructiveTableLifecycle(
+    TableContext table, {
+    required String reason,
+  }) async {
+    final tableUid = table.tableUid;
+
+    // 1. Cooperative abort without holding the table lock (avoid deadlock).
+    await _abortExecutingTaskForTableUid(tableUid, waitForExit: true);
+
+    final lockMgr = _dataStore.lockManager;
+    final tableLockResource = _tableLockResource(tableUid);
+    final tableLockOpId = GlobalIdGenerator.generate('mig_lifecycle_');
+    if (lockMgr != null) {
+      final locked = await lockMgr.acquireExclusiveLock(
+        tableLockResource,
+        tableLockOpId,
+      );
+      if (!locked) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.sysTimeoutLockAcquisition,
+            message:
+                'Timed out waiting to reconcile migration tasks on $reason '
+                'for table [${table.tableName}].',
+          ),
+        ]);
+      }
+    }
+    try {
+      await _dataStore.backgroundWriteScheduler.clearEntriesForTable(
+        table,
+        BackgroundWriteType.schemaMigration,
+      );
+
+      final matching = _pendingTasks
+          .where((t) => t.tableUid == tableUid)
+          .toList(growable: false);
+      for (final task in matching) {
+        await _removePendingTaskCompletely(
+          task,
+          reason: '$reason lifecycle reconciliation',
+        );
+      }
+
+      _activeReadCursors.remove(tableUid);
+      _rebuildRuntimeMigrations(tableUid);
+      await syncHasMigrationTask();
+
+      if (matching.isNotEmpty) {
+        Logger.info(
+          'Cancelled ${matching.length} migration task(s) on $reason '
+          'for table [${table.tableName}] (tableUid=$tableUid)',
+        );
+      }
+    } finally {
+      lockMgr?.releaseExclusiveLock(tableLockResource, tableLockOpId);
+    }
+  }
+
+  /// Request cancel on the active rewrite if it belongs to [tableUid].
+  ///
+  /// When [waitForExit] is true, awaits the active future. Callers that already
+  /// hold the table exclusive lock must pass `false` to avoid deadlock.
+  Future<void> _abortExecutingTaskForTableUid(
+    TableUid tableUid, {
+    bool waitForExit = true,
+  }) async {
+    final activeId = _activeExecutingTaskId;
+    if (activeId == null) return;
+
+    MigrationTask? activeTask;
+    for (final task in _pendingTasks) {
+      if (task.taskId == activeId) {
+        activeTask = task;
+        break;
+      }
+    }
+    if (activeTask == null || activeTask.tableUid != tableUid) {
+      return;
+    }
+
+    for (final controller in _activeControllers.values) {
+      controller.cancel();
+    }
+
+    if (!waitForExit) return;
+
+    final future = _activeTaskFuture;
+    if (future == null) return;
+    try {
+      await future;
+    } catch (e) {
+      // Expected when CancellationToken trips DbClosedException control-flow.
+      if (e is! DbClosedException) {
+        Logger.warn(
+          'Waiting for aborted migration task [$activeId] failed',
+          rawError: e,
+        );
+      }
+    }
+  }
+
+  /// Remove one pending task from memory, runtime maps, schema cache, and disk.
+  Future<void> _removePendingTaskCompletely(
+    MigrationTask task, {
+    required String reason,
+  }) async {
+    _pendingTasks.removeWhere((t) => t.taskId == task.taskId);
+    final oldVer = task.oldSchemaSnapshot?.schemaVersion;
+    if (oldVer != null && oldVer.isNotEmpty) {
+      final stillNeeded = _pendingTasks.any((t) =>
+          t.targetSchemaSnapshot?.schemaVersion == oldVer ||
+          t.oldSchemaSnapshot?.schemaVersion == oldVer);
+      if (!stillNeeded) {
+        _schemaByVersion.remove(oldVer);
+      }
+    }
+    final targetVer = task.targetSchemaSnapshot?.schemaVersion;
+    if (targetVer != null && targetVer.isNotEmpty) {
+      // Keep target schema version if another pending task still references it.
+      final stillNeeded = _pendingTasks.any((t) =>
+          t.targetSchemaSnapshot?.schemaVersion == targetVer ||
+          t.oldSchemaSnapshot?.schemaVersion == targetVer);
+      if (!stillNeeded) {
+        _schemaByVersion.remove(targetVer);
+      }
+    }
+    await _cleanupTask(task);
+    _unregisterRuntimeMigrationForTask(task);
+    Logger.info(
+      'Cancelled migration task [${task.taskId}] on table [${task.tableName}] '
+      'due to $reason',
+    );
+  }
+
+  bool _taskHasTableWrite(MigrationTask task) {
+    if (task.forceDataMigration) return true;
+    final mode = task.writeMode;
+    return mode == MigrationWriteMode.tableOnly ||
+        mode == MigrationWriteMode.tableAndIndex;
+  }
+
   /// Whether a buffered write should be normalized through runtime migration
   /// operations before flush.
   ///
@@ -1552,8 +1716,10 @@ class MigrationManager {
       }
 
       if (oldSchema == null) {
-        // If it's not a system auto-migration and the table doesn't exist, it's an error for updateSchema
-        if (!isAutoGenerated) {
+        // Drop is often enqueued after the current-space meta/dir is already
+        // deleted; pending sibling tasks may also have been cleared by
+        // reconcileOnDrop. Allow drop-only tasks without an old schema.
+        if (!isAutoGenerated && !isDropTable) {
           throw DbException([
             SchemaValidationStatus(
               type: ResultType.devTableNotFound,
@@ -1785,8 +1951,19 @@ class MigrationManager {
 
       task = await _maybeEnableDeletedSlotCompaction(task, sortedOperations);
 
+      // Drop tasks are often enqueued after current-space meta is already gone.
+      // Skip physical table lookups; other spaces are cleaned asynchronously.
+      if (isDropTable) {
+        task = task.copyWith(
+          writeMode: task.writeMode ?? MigrationWriteMode.none,
+          specificIndexUids: task.specificIndexUids ?? const <IndexUid>[],
+          estimateDuration: task.estimateDuration ?? Duration.zero,
+        );
+      }
+
       // Pre-calculate MigrationWriteMode and specificIndexUids upfront if not provided
-      if (task.writeMode == null || task.specificIndexUids == null) {
+      if (!isDropTable &&
+          (task.writeMode == null || task.specificIndexUids == null)) {
         final calcOldSchema = task.oldSchemaSnapshot ?? oldSchema;
         final calcTargetSchema = task.targetSchemaSnapshot ?? targetSchema;
         final currentNeedsTableWrite =
@@ -1815,7 +1992,7 @@ class MigrationManager {
       }
 
       // Calculate and set estimateDuration
-      if (task.estimateDuration == null) {
+      if (!isDropTable && task.estimateDuration == null) {
         final physicalTableCtx = await _requireTableContextByUid(tableUid);
         final recordCount = await _dataStore.tableDataManager
             .getTableRecordCount(physicalTableCtx);
@@ -1828,7 +2005,8 @@ class MigrationManager {
       }
 
       // For the active space, immediately set `isBuilding = true` for target indexes
-      if (task.specificIndexUids != null &&
+      if (!isDropTable &&
+          task.specificIndexUids != null &&
           task.specificIndexUids!.isNotEmpty) {
         final currentSchema = task.targetSchemaSnapshot ?? targetSchema;
         if (currentSchema != null) {
@@ -1870,20 +2048,46 @@ class MigrationManager {
 
       // Reconcile pending tasks for the table to merge or cancel redundant ops
       // (always by tableUid — rename cutover invalidates the pre-rename name).
-      await _reconcilePendingTasksForTable(
-          await _requireTableContextByUid(tableUid));
+      final reconcileTable = await _tableContextForUid(tableUid);
+      if (reconcileTable != null) {
+        await _reconcilePendingTasksForTable(
+          reconcileTable,
+          triggerTask: task,
+        );
+      } else if (isDropTable) {
+        // Meta already deleted in current space; siblings were cleared by
+        // reconcileOnDrop. Still drop any leftover same-uid tasks except self.
+        final leftovers = _pendingTasks
+            .where((t) => t.tableUid == tableUid && t.taskId != task.taskId)
+            .toList(growable: false);
+        for (final sibling in leftovers) {
+          await _removePendingTaskCompletely(
+            sibling,
+            reason: 'dropTable supersede (meta already deleted)',
+          );
+        }
+      } else {
+        await _reconcilePendingTasksForTable(
+          await _requireTableContextByUid(tableUid),
+          triggerTask: task,
+        );
+      }
 
       await syncHasMigrationTask();
 
       final needDataMigration = task.forceDataMigration || needsTableWrite;
 
-      await _invalidatePrimaryInstanceCachesForMigration(
-        tableUid: tableUid,
-        operations: sortedOperations,
-        renameOp: renameOp,
-        needDataMigration: needDataMigration,
-      );
-      _registerRuntimeMigration(task);
+      if (!isDropTable || await _tableContextForUid(tableUid) != null) {
+        await _invalidatePrimaryInstanceCachesForMigration(
+          tableUid: tableUid,
+          operations: sortedOperations,
+          renameOp: renameOp,
+          needDataMigration: needDataMigration,
+        );
+      }
+      if (!isDropTable) {
+        _registerRuntimeMigration(task);
+      }
 
       if (task.oldSchemaSnapshot != null) {
         registerSchemaVersion(task.oldSchemaSnapshot!);
@@ -3830,6 +4034,14 @@ class MigrationManager {
           _unregisterRuntimeMigrationForTask(task);
         } catch (e) {
           if (e is DbClosedException) {
+            // Cooperative abort (clear/drop/reconcile) or datastore close.
+            // If conflict reconcile already removed this task, continue the
+            // queue; otherwise keep it for a later resume after close/re-open.
+            final stillQueued =
+                _pendingTasks.any((t) => t.taskId == task.taskId);
+            if (!stillQueued && _pendingTasks.isNotEmpty) {
+              continue;
+            }
             break;
           }
 
@@ -6752,14 +6964,16 @@ class MigrationManager {
     final isTaskStarted = await _isMigrationTaskPhysicallyStarted(task);
     if (updatedTask.writeMode == MigrationWriteMode.none &&
         !updatedTask.forceDataMigration &&
-        updatedTask.isSchemaUpdated &&
-        !isTaskStarted) {
-      _pendingTasks.removeWhere((t) => t.taskId == task.taskId);
-      await _cleanupTask(task);
-      _unregisterRuntimeMigrationForTask(task);
-      Logger.info(
-        'Cancelled redundant migration task [${task.taskId}] on table [${task.tableName}] due to $cancelReason',
-      );
+        updatedTask.isSchemaUpdated) {
+      // Even if physically started: caller cancels cooperative rewrite when
+      // IndexUids were trimmed to empty (e.g. removeIndex supersede).
+      if (isTaskStarted && task.taskId == _activeExecutingTaskId) {
+        await _abortExecutingTaskForTableUid(
+          TableUid(task.tableUid),
+          waitForExit: false,
+        );
+      }
+      await _removePendingTaskCompletely(task, reason: cancelReason);
       return;
     }
 
@@ -6784,23 +6998,72 @@ class MigrationManager {
   /// Reconcile already-queued pending tasks for one table.
   ///
   /// Unlike [_foldRedundantMigrationOperations] (ingress filter for a new task),
-  /// this mutates existing tasks after enqueue or disk recovery: trims redundant
-  /// index builds and merges chained table renames.
-  Future<void> _reconcilePendingTasksForTable(TableContext table) async {
+  /// this mutates existing tasks after enqueue or disk recovery:
+  /// - dropTable trigger: remove all sibling tasks
+  /// - trim redundant / removed index builds (including started tasks after abort)
+  /// - fold older table-rewrite responsibility into the newest table rewrite
+  /// - invalidate indexOnly tasks when PK layout changes
+  /// - merge chained table renames
+  Future<void> _reconcilePendingTasksForTable(
+    TableContext table, {
+    MigrationTask? triggerTask,
+  }) async {
     final pending = <MigrationTask>[..._pendingTasks];
     if (pending.isEmpty) return;
 
+    // Prefer tableUid for conflict matching (rename-safe).
     MigrationTask? seed;
     for (final task in pending) {
-      if (_taskMatchesTable(task, table, '')) {
+      if (task.tableUid == table.tableUid) {
         seed = task;
         break;
       }
     }
+    seed ??= () {
+      for (final task in pending) {
+        if (_taskMatchesTable(task, table, '')) return task;
+      }
+      return null;
+    }();
     if (seed == null) return;
 
-    final component = _collectLinkedPendingTasks(pending, seed);
-    if (component.length < 2) return;
+    // dropTable supersedes every other task for this tableUid.
+    final triggerIsDrop = triggerTask != null &&
+        triggerTask.operations.any((op) => op.type == MigrationType.dropTable);
+    if (triggerIsDrop) {
+      await _abortExecutingTaskForTableUid(table.tableUid, waitForExit: false);
+      await _dataStore.backgroundWriteScheduler.clearEntriesForTable(
+        table,
+        BackgroundWriteType.schemaMigration,
+      );
+      final siblings = _pendingTasks
+          .where((t) =>
+              t.tableUid == table.tableUid && t.taskId != triggerTask.taskId)
+          .toList(growable: false);
+      for (final sibling in siblings) {
+        await _removePendingTaskCompletely(
+          sibling,
+          reason: 'dropTable supersede',
+        );
+      }
+      _activeReadCursors.remove(table.tableUid);
+      _rebuildRuntimeMigrations(table.tableUid);
+      return;
+    }
+
+    var component = _collectLinkedPendingTasks(pending, seed);
+    // Also include same-tableUid tasks that alias linking might miss.
+    final byUid = <String, MigrationTask>{};
+    for (final task in component) {
+      byUid[task.taskId] = task;
+    }
+    for (final task in pending) {
+      if (task.tableUid == table.tableUid) {
+        byUid[task.taskId] = task;
+      }
+    }
+    component = byUid.values.toList();
+    if (component.length < 2 && triggerTask == null) return;
 
     // Sort by createTime
     component.sort((a, b) {
@@ -6809,90 +7072,98 @@ class MigrationManager {
       return a.taskId.compareTo(b.taskId);
     });
 
-    // 1. Reconcile index builds across chained tasks (newest wins):
-    //    - drop builds for indexes removed by newer tasks
-    //    - deduplicate identical IndexUid builds claimed by newer tasks
+    // 1. Index builds across chained tasks (newest wins), including started tasks
+    //    after cooperative abort when an IndexUid is removed or reclaimed.
     final removedIndexes = <String>{};
     final claimedIndexUids = <String>{};
     for (int i = component.length - 1; i >= 0; i--) {
       final taskId = component[i].taskId;
       final pendingIndex = _pendingTasks.indexWhere((t) => t.taskId == taskId);
       if (pendingIndex < 0) continue;
-      final task = _pendingTasks[pendingIndex];
+      var task = _pendingTasks[pendingIndex];
 
       if (task.specificIndexUids != null &&
           task.specificIndexUids!.isNotEmpty) {
-        final isTaskStarted = await _isMigrationTaskPhysicallyStarted(task);
-        final List<IndexUid> updatedSpecificIndexes;
-        if (isTaskStarted) {
-          updatedSpecificIndexes = task.specificIndexUids!;
-        } else {
-          updatedSpecificIndexes = task.specificIndexUids!
-              .where((idx) =>
-                  !removedIndexes.contains(idx.value) &&
-                  !claimedIndexUids.contains(idx.value))
-              .toList();
-        }
+        final filtered = task.specificIndexUids!
+            .where((idx) =>
+                !removedIndexes.contains(idx.value) &&
+                !claimedIndexUids.contains(idx.value))
+            .toList();
 
-        claimedIndexUids.addAll(
-          updatedSpecificIndexes.map((uid) => uid.value),
-        );
+        if (filtered.length != task.specificIndexUids!.length) {
+          final isTaskStarted = await _isMigrationTaskPhysicallyStarted(task);
+          if (isTaskStarted && task.taskId == _activeExecutingTaskId) {
+            await _abortExecutingTaskForTableUid(table.tableUid,
+                waitForExit: false);
+            final refreshed =
+                _pendingTasks.indexWhere((t) => t.taskId == taskId);
+            if (refreshed < 0) continue;
+            task = _pendingTasks[refreshed];
+          }
 
-        if (updatedSpecificIndexes.length != task.specificIndexUids!.length) {
           await _applyPendingTaskIndexReconcile(
             task,
-            updatedSpecificIndexes: updatedSpecificIndexes,
+            updatedSpecificIndexes: filtered,
             cancelReason: 'index reconciliation',
+          );
+          final after = _pendingTasks.indexWhere((t) => t.taskId == taskId);
+          if (after >= 0) {
+            task = _pendingTasks[after];
+          } else {
+            // Task deleted; still harvest removeIndex / schema-diff markers.
+            _collectRemovedIndexesFromTask(component[i], removedIndexes);
+            continue;
+          }
+        }
+
+        if (task.specificIndexUids != null) {
+          claimedIndexUids.addAll(
+            task.specificIndexUids!.map((uid) => uid.value),
           );
         }
       }
 
-      for (final op in task.operations) {
-        if (op.type == MigrationType.removeIndex && op.indexName != null) {
-          removedIndexes.add(op.indexName!);
-          final schema = task.targetSchemaSnapshot ?? task.oldSchemaSnapshot;
-          if (schema != null) {
-            final idx = _dataStore.tableMetaManager
-                ?.findIndexSchemaByField(schema, op.indexName!);
-            if (idx != null) {
-              _markIndexRemoved(removedIndexes, idx);
-            }
-          }
-        }
-      }
-      if (task.targetSchemaSnapshot != null) {
-        final targetIdxNames = task.targetSchemaSnapshot!
-            .getAllIndexes()
-            .map((idx) => idx.actualIndexName)
-            .toSet();
-        final targetIdxUids = task.targetSchemaSnapshot!
-            .getAllIndexes()
-            .map((idx) => idx.indexUid.value)
-            .toSet();
-        if (task.oldSchemaSnapshot != null) {
-          for (final oldIdx in task.oldSchemaSnapshot!.getAllIndexes()) {
-            if (!targetIdxNames.contains(oldIdx.actualIndexName) &&
-                !targetIdxUids.contains(oldIdx.indexUid.value)) {
-              _markIndexRemoved(removedIndexes, oldIdx);
-            }
-          }
-        }
-      }
+      _collectRemovedIndexesFromTask(task, removedIndexes);
     }
 
-    // Refresh component after index reconciliation
+    // 2. Fold older table-rewrite / invalidate indexOnly on PK change.
+    // Only when a new task just enqueued — never on disk-recovery reconcile,
+    // otherwise the newest pending task would incorrectly supersede siblings.
+    if (triggerTask != null) {
+      await _reconcileDataRewriteOwnership(
+        table: table,
+        triggerTask: triggerTask,
+      );
+    }
+
+    // Refresh component after rewrite ownership changes
     final refreshedPending = <MigrationTask>[..._pendingTasks];
+    MigrationTask? refreshedSeed;
+    for (final task in refreshedPending) {
+      if (task.tableUid == table.tableUid) {
+        refreshedSeed = task;
+        break;
+      }
+    }
+    if (refreshedSeed == null) {
+      _rebuildRuntimeMigrations(table.tableUid);
+      return;
+    }
+
     final refreshedComponent =
-        _collectLinkedPendingTasks(refreshedPending, seed)
+        _collectLinkedPendingTasks(refreshedPending, refreshedSeed)
           ..sort((a, b) {
             final c = a.createTime.compareTo(b.createTime);
             if (c != 0) return c;
             return a.taskId.compareTo(b.taskId);
           });
 
-    // 2. Chained table rename merging
+    // 3. Chained table rename merging
     for (int i = 0; i < refreshedComponent.length - 1; i++) {
-      final taskA = refreshedComponent[i];
+      final taskAId = refreshedComponent[i].taskId;
+      final idxA = _pendingTasks.indexWhere((t) => t.taskId == taskAId);
+      if (idxA < 0) continue;
+      final taskA = _pendingTasks[idxA];
       final renameOpA = _findRenameOperation(taskA.operations);
       if (renameOpA == null || renameOpA.newTableName == null) continue;
 
@@ -6900,7 +7171,10 @@ class MigrationManager {
       if (isTaskAStarted) continue;
 
       for (int j = i + 1; j < refreshedComponent.length; j++) {
-        final taskB = refreshedComponent[j];
+        final taskBId = refreshedComponent[j].taskId;
+        final idxB = _pendingTasks.indexWhere((t) => t.taskId == taskBId);
+        if (idxB < 0) continue;
+        final taskB = _pendingTasks[idxB];
         final renameOpB = _findRenameOperation(taskB.operations);
         if (renameOpB == null || renameOpB.newTableName == null) continue;
 
@@ -6927,7 +7201,7 @@ class MigrationManager {
                 updatedTargetSchemaA.copyWith(name: finalNewName);
           }
 
-          var updatedTaskA = taskA.copyWith(
+          final updatedTaskA = taskA.copyWith(
             operations: updatedOpsA,
             targetSchemaSnapshot: updatedTargetSchemaA,
           );
@@ -6941,13 +7215,14 @@ class MigrationManager {
               .toList();
 
           if (updatedOpsB.isEmpty) {
-            _pendingTasks.removeWhere((t) => t.taskId == taskB.taskId);
-            await _cleanupTask(taskB);
-            _unregisterRuntimeMigrationForTask(taskB);
+            await _removePendingTaskCompletely(
+              taskB,
+              reason: 'chained rename merge',
+            );
           } else {
             final updatedOldSchemaB =
                 taskB.oldSchemaSnapshot?.copyWith(name: finalNewName);
-            var updatedTaskB = taskB.copyWith(
+            final updatedTaskB = taskB.copyWith(
               oldSchemaSnapshot: updatedOldSchemaB,
               operations: updatedOpsB,
             );
@@ -6963,6 +7238,143 @@ class MigrationManager {
     }
 
     _rebuildRuntimeMigrations(table.tableUid);
+  }
+
+  void _collectRemovedIndexesFromTask(
+    MigrationTask task,
+    Set<String> removedIndexes,
+  ) {
+    for (final op in task.operations) {
+      if (op.type == MigrationType.removeIndex && op.indexName != null) {
+        removedIndexes.add(op.indexName!);
+        // Prefer old snapshot (still contains the index) then target.
+        final schemas = <TableSchema?>[
+          task.oldSchemaSnapshot,
+          task.targetSchemaSnapshot,
+        ];
+        for (final schema in schemas) {
+          if (schema == null) continue;
+          final idx = _dataStore.tableMetaManager
+              ?.findIndexSchemaByField(schema, op.indexName!);
+          if (idx != null) {
+            _markIndexRemoved(removedIndexes, idx);
+            break;
+          }
+        }
+        // Also match by fields if provided on the op.
+        if (op.fields != null && op.fields!.isNotEmpty) {
+          for (final schema in schemas) {
+            if (schema == null) continue;
+            for (final idx in schema.getAllIndexes()) {
+              if (_areIndexFieldsEqual(idx.fields, op.fields!)) {
+                _markIndexRemoved(removedIndexes, idx);
+              }
+            }
+          }
+        }
+      }
+    }
+    if (task.targetSchemaSnapshot != null && task.oldSchemaSnapshot != null) {
+      final targetIdxNames = task.targetSchemaSnapshot!
+          .getAllIndexes()
+          .map((idx) => idx.actualIndexName)
+          .toSet();
+      final targetIdxUids = task.targetSchemaSnapshot!
+          .getAllIndexes()
+          .map((idx) => idx.indexUid.value)
+          .toSet();
+      for (final oldIdx in task.oldSchemaSnapshot!.getAllIndexes()) {
+        if (!targetIdxNames.contains(oldIdx.actualIndexName) &&
+            !targetIdxUids.contains(oldIdx.indexUid.value)) {
+          _markIndexRemoved(removedIndexes, oldIdx);
+        }
+      }
+    }
+  }
+
+  /// Newest table-rewrite owns final physical consistency; older table rewrites
+  /// are stripped (or deleted). PK name/type changes also invalidate indexOnly.
+  Future<void> _reconcileDataRewriteOwnership({
+    required TableContext table,
+    required MigrationTask triggerTask,
+  }) async {
+    final triggerNeedsTableWrite = _taskHasTableWrite(triggerTask) ||
+        _needDataMigration(
+          triggerTask.operations,
+          triggerTask.oldSchemaSnapshot,
+        );
+
+    final triggerIsPkChange = triggerTask.operations.any(
+      (op) => op.type == MigrationType.setPrimaryKeyConfig,
+    );
+
+    // removeField alone does not invalidate older table rewrite unless the
+    // new task itself forces data migration (e.g. deleted-slot compaction).
+    if (!triggerNeedsTableWrite && !triggerIsPkChange) {
+      return;
+    }
+
+    final older = _pendingTasks
+        .where((t) =>
+            t.tableUid == table.tableUid && t.taskId != triggerTask.taskId)
+        .toList(growable: false);
+
+    for (final task in older) {
+      final stillPending = _pendingTasks.any((t) => t.taskId == task.taskId);
+      if (!stillPending) continue;
+
+      var current = task;
+      final isStarted = await _isMigrationTaskPhysicallyStarted(current);
+
+      if (triggerIsPkChange &&
+          current.writeMode == MigrationWriteMode.indexOnly) {
+        if (isStarted && current.taskId == _activeExecutingTaskId) {
+          await _abortExecutingTaskForTableUid(table.tableUid,
+              waitForExit: false);
+        }
+        final idx = _pendingTasks.indexWhere((t) => t.taskId == task.taskId);
+        if (idx < 0) continue;
+        await _removePendingTaskCompletely(
+          _pendingTasks[idx],
+          reason: 'primary key change invalidated index-only rewrite',
+        );
+        continue;
+      }
+
+      if (!triggerNeedsTableWrite || !_taskHasTableWrite(current)) {
+        continue;
+      }
+
+      if (isStarted && current.taskId == _activeExecutingTaskId) {
+        await _abortExecutingTaskForTableUid(table.tableUid,
+            waitForExit: false);
+      }
+      final idx = _pendingTasks.indexWhere((t) => t.taskId == task.taskId);
+      if (idx < 0) continue;
+      current = _pendingTasks[idx];
+
+      final indexes = current.specificIndexUids ?? const <IndexUid>[];
+      if (indexes.isEmpty) {
+        await _removePendingTaskCompletely(
+          current,
+          reason: 'newer table rewrite superseded older table rewrite',
+        );
+        continue;
+      }
+
+      // Keep still-valid index builds; drop table rewrite responsibility.
+      final downgraded = current.copyWith(
+        writeMode: MigrationWriteMode.indexOnly,
+        forceDataMigration: false,
+      );
+      await _saveMigrationTask(downgraded);
+      _updatePendingTaskInMemory(downgraded);
+      Logger.info(
+        'Downgraded migration task [${current.taskId}] on table '
+        '[${current.tableName}] from table rewrite to indexOnly '
+        '(newer table rewrite owns data consistency)',
+      );
+    }
   }
 }
 

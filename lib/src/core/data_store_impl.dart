@@ -306,6 +306,28 @@ class DataStoreImpl {
     );
   }
 
+  /// Whether [e] is a missing-table developer error from [getTableContext].
+  bool _isDevTableNotFound(Object e) {
+    return e is DbException &&
+        e.statuses.any((s) => s.type == ResultType.devTableNotFound);
+  }
+
+  /// FK RESTRICT/NO ACTION rejects clear/drop before any child mutation.
+  bool _isFkRestrictBeforeMutation(Object e) {
+    return e is DbException &&
+        e.statuses.any((s) => s.type == ResultType.bizForeignKeyChildRestrict);
+  }
+
+  /// Drop a pending clear/drop WAL table-op that never took effect.
+  Future<void> _abortRegisteredTableOp(String? opId) async {
+    if (opId == null || !config.enableJournal) return;
+    try {
+      await walManager.abortTableOp(opId);
+    } catch (e) {
+      Logger.warn('Abort table op failed', rawError: e);
+    }
+  }
+
   /// Whether we're inside a transaction scope and should rollback on errors
   static bool isInTransactionWithRollback() {
     final String? txId = Zone.current[_txnZoneKey] as String?;
@@ -3195,39 +3217,28 @@ class DataStoreImpl {
       await ensureInitialized();
     }
 
-    final schema =
-        await tableMetaManager?.getTableSchemaByName(TableName(tableName));
-
-    if (schema == null) {
-      Logger.error('Table $tableName does not exist');
-      return finish(DbResult.error(
-        type: ResultType.devTableNotFound,
-        message: 'Table $tableName does not exist',
-      ));
-    }
-
-    final table = await getTableContext(tableName);
-
     String? clearOpId;
-    if (registerWalOp && config.enableJournal) {
-      try {
-        final cutoff = walManager.currentPointer;
-        final opId = GlobalIdGenerator.generate('tbl_clear_');
-        final op = TableOpMeta(
-          opId: opId,
-          tableUid: table.tableUid,
-          type: 'clear',
-          cutoff: cutoff,
-          createdAt: DateTime.now().toIso8601String(),
-        );
-        await walManager.registerTableOp(op);
-        clearOpId = opId;
-      } catch (e) {
-        Logger.warn('Register clear table op failed', rawError: e);
-      }
-    }
-
     try {
+      final table = await getTableContext(tableName);
+
+      if (registerWalOp && config.enableJournal) {
+        try {
+          final cutoff = walManager.currentPointer;
+          final opId = GlobalIdGenerator.generate('tbl_clear_');
+          final op = TableOpMeta(
+            opId: opId,
+            tableUid: table.tableUid,
+            type: 'clear',
+            cutoff: cutoff,
+            createdAt: DateTime.now().toIso8601String(),
+          );
+          await walManager.registerTableOp(op);
+          clearOpId = opId;
+        } catch (e) {
+          Logger.warn('Register clear table op failed', rawError: e);
+        }
+      }
+
       // Handle foreign key cascade operations before clearing the table
       // This ensures data consistency: child records are handled according to foreign key policies
       if (_foreignKeyManager != null) {
@@ -3235,12 +3246,19 @@ class DataStoreImpl {
           await _foreignKeyManager!.handleCascadeClear(table);
         } catch (e) {
           Logger.error('Cascade clear failed', rawError: e);
-          // Convert exception to DbResult for graceful error handling
-          // This allows developers to handle business logic errors (e.g., RESTRICT constraints)
-          // without using try-catch, making the API consistent with insert/update/delete
+          // RESTRICT rejects before mutating children — drop the pending WAL op
+          // so restart will not keep replaying a clear that never started.
+          // Mid-cascade failures keep the op so resume can finish the wipe.
+          if (_isFkRestrictBeforeMutation(e)) {
+            await _abortRegisteredTableOp(clearOpId);
+          }
           return finish(_normalizeCascadeError(e, 'clear'));
         }
       }
+
+      // Abort in-flight / queued schema rewrites before wiping rows; otherwise a
+      // background migration could scan pre-clear snapshots and resurrect data.
+      await migrationManager?.reconcileOnClear(table);
 
       // clear application layer cache
       // NOTE: clear() removes table data but keeps schema. Do not invalidate schema cache here,
@@ -3256,7 +3274,7 @@ class DataStoreImpl {
       // Notify watchers that the table has been cleared
       notificationManager.notify(ChangeEvent(
         type: ChangeType.clear,
-        tableUid: schema.tableUid,
+        tableUid: table.tableUid,
       ));
 
       // If there is no WAL segment newer than the cutoff (i.e. cutoff is at
@@ -3275,6 +3293,16 @@ class DataStoreImpl {
         message: 'Table $tableName cleared successfully',
       ));
     } catch (e) {
+      if (_isDevTableNotFound(e)) {
+        if (isInTransactionWithRollback()) {
+          rethrow;
+        }
+        return finish(DbResult.error(
+          type: ResultType.devTableNotFound,
+          message: 'Table $tableName does not exist',
+          statuses: (e as DbException).statuses,
+        ));
+      }
       Logger.warn('Clear table failed', rawError: e);
       if (isInTransactionWithRollback()) {
         rethrow;
@@ -3921,20 +3949,6 @@ class DataStoreImpl {
         await ensureInitialized();
       }
 
-      // Resolve tableUid
-      final tableUid =
-          await tableMetaManager?.getUidByName(TableName(tableName));
-
-      // Check if table exists
-      final schema = tableUid != null
-          ? await tableMetaManager?.getTableSchema(tableUid)
-          : null;
-      if (schema == null) {
-        return finish(DbResult.error(
-          type: ResultType.devTableNotFound,
-          message: 'Table $tableName does not exist',
-        ));
-      }
       final table = await getTableContext(tableName);
       String? dropOpId;
       if (isMigration) {
@@ -3943,16 +3957,14 @@ class DataStoreImpl {
           'Deleting table $tableName data in space $_currentSpaceName during migration',
         );
 
-        if (tableUid != null) {
-          final tablePath = await _pathManager!.getTablePathByUid(tableUid);
-          if (await storage.existsDirectory(tablePath)) {
-            await storage.deleteDirectory(tablePath);
-            Logger.info(
-              'Deleted data directory for table $tableName in space $_currentSpaceName: $tablePath',
-            );
-          }
-          await tableMetaManager?.deleteTableMeta(tableUid);
+        final tablePath = await _pathManager!.getTablePathByUid(table.tableUid);
+        if (await storage.existsDirectory(tablePath)) {
+          await storage.deleteDirectory(tablePath);
+          Logger.info(
+            'Deleted data directory for table $tableName in space $_currentSpaceName: $tablePath',
+          );
         }
+        await tableMetaManager?.deleteTableMeta(table.tableUid);
 
         return finish(DbResult.success(
           message:
@@ -3983,12 +3995,19 @@ class DataStoreImpl {
             await _foreignKeyManager!.handleCascadeClear(table);
           } catch (e) {
             Logger.error('Cascade drop failed', rawError: e);
+            if (_isFkRestrictBeforeMutation(e)) {
+              await _abortRegisteredTableOp(dropOpId);
+            }
             return finish(_normalizeCascadeError(e, 'drop'));
           }
 
           // Clean up system table entries for the dropped table
           await _foreignKeyManager!.cleanupSystemTableForDroppedTable(table);
         }
+
+        // Abort and remove all pending/running schema tasks for this table
+        // before physical delete — rewrites must not touch a dropped table.
+        await migrationManager?.reconcileOnDrop(table);
 
         // Clear table cache and other memory caches
         await _invalidateTableCaches(table);
@@ -3998,17 +4017,15 @@ class DataStoreImpl {
 
         // Get table path
         String? tablePath;
-        if (tableUid != null) {
-          try {
-            tablePath = await _pathManager!.getTablePathByUid(tableUid);
-          } catch (e) {
-            // skip
-          }
+        try {
+          tablePath = await _pathManager!.getTablePathByUid(table.tableUid);
+        } catch (e) {
+          // skip
         }
 
         // Delete table structure
-        if (tableMetaManager != null && tableUid != null) {
-          await tableMetaManager!.deleteTableMeta(tableUid);
+        if (tableMetaManager != null) {
+          await tableMetaManager!.deleteTableMeta(table.tableUid);
         }
 
         // Delete table directory and all related files
@@ -4016,9 +4033,9 @@ class DataStoreImpl {
           await storage.deleteDirectory(tablePath);
         }
 
-        if (registerWalOp && tableUid != null) {
+        if (registerWalOp) {
           // Add migration task to delete table data in each space
-          await migrationManager?.addMigrationTask(tableUid,
+          await migrationManager?.addMigrationTask(table.tableUid,
               [const MigrationOperation(type: MigrationType.dropTable)]);
         }
 
@@ -4038,7 +4055,7 @@ class DataStoreImpl {
         // Notify watchers that the table has been dropped/cleared
         notificationManager.notify(ChangeEvent(
           type: ChangeType.clear,
-          tableUid: tableUid!,
+          tableUid: table.tableUid,
         ));
 
         return finish(DbResult.success(
@@ -4046,6 +4063,16 @@ class DataStoreImpl {
         ));
       }
     } catch (e) {
+      if (_isDevTableNotFound(e)) {
+        if (isInTransactionWithRollback()) {
+          rethrow;
+        }
+        return finish(DbResult.error(
+          type: ResultType.devTableNotFound,
+          message: 'Table $tableName does not exist',
+          statuses: (e as DbException).statuses,
+        ));
+      }
       Logger.error('Failed to delete table', rawError: e);
       if (isInTransactionWithRollback()) {
         rethrow;

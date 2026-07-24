@@ -1818,6 +1818,18 @@ class WalManager {
     _meta.tableOps[opId] = op.copyWith(completed: true);
     await persistMeta(flush: false);
   }
+
+  /// Remove a pending table-level maintenance op that never took effect.
+  ///
+  /// Used when clear/drop is rejected before destructive work (e.g. FK
+  /// RESTRICT). Must remove rather than [completeTableOp]: completed ops still
+  /// contribute cutoffs that would incorrectly skip valid WAL entries.
+  Future<void> abortTableOp(String opId) async {
+    if (!_config.enableJournal) return;
+    if (!_meta.tableOps.containsKey(opId)) return;
+    _meta.tableOps.remove(opId);
+    await persistMeta(flush: false);
+  }
 }
 
 /// Internal WAL queue entry used by [WalManager] for background persistence.
