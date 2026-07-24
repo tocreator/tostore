@@ -211,8 +211,19 @@ class MigrationManager {
     return _activeReadCursors[table.tableUid];
   }
 
-  Future<TableContext> _requireTableContext(String tableName) =>
-      _dataStore.getTableContext(tableName);
+  /// Prefer this after schema cutover / rename — names may no longer resolve.
+  Future<TableContext> _requireTableContextByUid(TableUid tableUid) async {
+    final ctx = await _tableContextForUid(tableUid);
+    if (ctx != null) return ctx;
+    final display = await _resolveTableDisplayName(tableUid);
+    throw DbException([
+      SchemaValidationStatus(
+        type: ResultType.devTableNotFound,
+        message: 'Table $display does not exist',
+        tableName: display,
+      ),
+    ]);
+  }
 
   Future<TableContext?> _tableContextForUid(TableUid tableUid) async =>
       _dataStore.tableMetaManager?.getTableContext(tableUid);
@@ -1506,7 +1517,7 @@ class MigrationManager {
       final isDropTable =
           sortedOperations.any((op) => op.type == MigrationType.dropTable);
       if (oldSchema != null && !isDropTable) {
-        final indexTableCtx = await _requireTableContext(tableName);
+        final indexTableCtx = await _requireTableContextByUid(tableUid);
         sortedOperations = await _foldRedundantMigrationOperations(
           effectiveSchema: oldSchema,
           operations: sortedOperations,
@@ -1520,8 +1531,6 @@ class MigrationManager {
           return null;
         }
       }
-
-      final targetTableName = renameOp?.newTableName ?? tableName;
 
       FieldStorageLayout? oldFieldLayout;
       if (latestPending != null) {
@@ -1704,7 +1713,7 @@ class MigrationManager {
 
           if (requiresMigration) {
             if (!isAllowed) {
-              final tableCtx = await _requireTableContext(tableName);
+              final tableCtx = await _requireTableContextByUid(tableUid);
               final recordCount = await _dataStore.tableDataManager
                   .getTableRecordCount(tableCtx);
               if (recordCount != 0) {
@@ -1760,7 +1769,7 @@ class MigrationManager {
       if (!task.isSchemaUpdated && task.targetSchemaSnapshot != null) {
         await TransactionContext.runAsSystemOperation(() async {
           await executeSchemaOperations(
-            await _requireTableContext(tableName),
+            await _requireTableContextByUid(tableUid),
             sortedOperations,
             targetSchema: task.targetSchemaSnapshot!,
             tableLockHeldExternally: true,
@@ -1786,8 +1795,7 @@ class MigrationManager {
           oldSchema: calcOldSchema,
           targetSchema: calcTargetSchema,
           sortedOperations: sortedOperations,
-          table: await _requireTableContext(
-              task.currentTableName ?? targetTableName),
+          table: await _requireTableContextByUid(tableUid),
         );
 
         final derivedWriteMode = task.writeMode ??
@@ -1808,8 +1816,7 @@ class MigrationManager {
 
       // Calculate and set estimateDuration
       if (task.estimateDuration == null) {
-        final physicalTableName = task.currentTableName ?? targetTableName;
-        final physicalTableCtx = await _requireTableContext(physicalTableName);
+        final physicalTableCtx = await _requireTableContextByUid(tableUid);
         final recordCount = await _dataStore.tableDataManager
             .getTableRecordCount(physicalTableCtx);
         final derivedWriteMode = task.writeMode ?? MigrationWriteMode.none;
@@ -1825,8 +1832,7 @@ class MigrationManager {
           task.specificIndexUids!.isNotEmpty) {
         final currentSchema = task.targetSchemaSnapshot ?? targetSchema;
         if (currentSchema != null) {
-          final indexTableCtx = await _requireTableContext(
-              task.currentTableName ?? targetTableName);
+          final indexTableCtx = await _requireTableContextByUid(tableUid);
           final allIndexes = <IndexSchema>[
             ...currentSchema.getAllIndexes(),
             ...?_dataStore.indexManager
@@ -1863,16 +1869,16 @@ class MigrationManager {
       _pendingTasks.add(task);
 
       // Reconcile pending tasks for the table to merge or cancel redundant ops
+      // (always by tableUid — rename cutover invalidates the pre-rename name).
       await _reconcilePendingTasksForTable(
-          await _requireTableContext(tableName));
+          await _requireTableContextByUid(tableUid));
 
       await syncHasMigrationTask();
 
       final needDataMigration = task.forceDataMigration || needsTableWrite;
 
       await _invalidatePrimaryInstanceCachesForMigration(
-        originalTableName: tableName,
-        currentTableName: task.currentTableName ?? targetTableName,
+        tableUid: tableUid,
         operations: sortedOperations,
         renameOp: renameOp,
         needDataMigration: needDataMigration,
@@ -2715,8 +2721,9 @@ class MigrationManager {
 
     if (oldSchema.isGlobal != newSchema.isGlobal) {
       final tableName = newSchema.name;
-      final recordCount = await _dataStore.tableDataManager
-          .getTableRecordCount(await _requireTableContext(tableName));
+      final recordCount = await _dataStore.tableDataManager.getTableRecordCount(
+        await _requireTableContextByUid(oldSchema.tableUid),
+      );
 
       if (recordCount != 0) {
         Logger.warn(
@@ -3941,7 +3948,7 @@ class MigrationManager {
         );
         final childIndexesToDrop = <TableUid, List<IndexUid>>{};
         currentTableName = await executeSchemaOperations(
-          await _requireTableContext(currentTask.tableName),
+          await _requireTableContextByUid(TableUid(currentTask.tableUid)),
           sortedOperations,
           targetSchema: currentTask.targetSchemaSnapshot!,
           outDroppedChildIndexes: childIndexesToDrop,
@@ -4025,8 +4032,7 @@ class MigrationManager {
       }
 
       await _invalidatePrimaryInstanceCachesForMigration(
-        originalTableName: originalTableName,
-        currentTableName: currentTableName,
+        tableUid: TableUid(currentTask.tableUid),
         operations: sortedOperations,
         renameOp: renameOp,
         needDataMigration: needDataMigration,
@@ -5041,27 +5047,25 @@ class MigrationManager {
     return allProcessedEntries;
   }
 
-  /// Cleanup task files after completion
+  /// Cleanup task files after completion.
+  ///
+  /// Order matters for concurrent [queryTaskStatus] / recovery:
+  /// remove mapping first (source of truth that the task is gone), then delete
+  /// the file. Crash mid-cleanup may leave an orphan file (harmless GC later),
+  /// but must not leave "in mapping / file missing" which polls treat as warn.
   Future<void> _cleanupTask(MigrationTask task) async {
     try {
-      final taskPath = _dataStore.pathManager
-          .getMigrationTaskPath(task.dirIndex, task.taskId);
-
-      // Check if file exists before attempting to delete
-      final fileExists = await _dataStore.storage.existsFile(taskPath);
-      if (fileExists) {
-        await _dataStore.storage.deleteFile(taskPath);
-      }
-
-      // Always update meta data: remove task from directory mapping
-      // This ensures mapping stays consistent even if file was already deleted
       final meta = await _getOrLoadMigrationMeta();
-
-      // Verify task still exists in mapping before removing
       if (meta.directoryMapping.getDirIndex(task.taskId) != null) {
         final updatedMapping = meta.directoryMapping.removeId(task.taskId);
         final updatedMeta = meta.copyWith(directoryMapping: updatedMapping);
         await _saveMigrationMeta(updatedMeta);
+      }
+
+      final taskPath = _dataStore.pathManager
+          .getMigrationTaskPath(task.dirIndex, task.taskId);
+      if (await _dataStore.storage.existsFile(taskPath)) {
+        await _dataStore.storage.deleteFile(taskPath);
       }
     } catch (e) {
       if (e is DbClosedException) return;
@@ -5502,8 +5506,9 @@ class MigrationManager {
   Future<bool> _requiresDataMigration(
       List<MigrationOperation> operations, TableSchema oldSchema,
       {TableSchema? targetSchema, bool isAllowed = false}) async {
-    final recordCount = await _dataStore.tableDataManager
-        .getTableRecordCount(await _requireTableContext(oldSchema.name));
+    final recordCount = await _dataStore.tableDataManager.getTableRecordCount(
+      await _requireTableContextByUid(oldSchema.tableUid),
+    );
 
     // Check for unique index tightening (both explicit and implicit unique properties)
     if (targetSchema != null) {
@@ -5713,29 +5718,20 @@ class MigrationManager {
   }
 
   Future<void> _invalidatePrimaryInstanceCachesForMigration({
-    required String originalTableName,
-    required String currentTableName,
+    required TableUid tableUid,
     required List<MigrationOperation> operations,
     required MigrationOperation? renameOp,
     required bool needDataMigration,
   }) async {
-    if (renameOp != null) {
-      await _dataStore.cacheManager.invalidateCache(
-        await _requireTableContext(originalTableName),
-        invalidateSchema: false,
-      );
-      await _dataStore.cacheManager.invalidateCache(
-        await _requireTableContext(currentTableName),
-        invalidateSchema: false,
-      );
-      return;
-    }
+    // Always resolve by stable tableUid: rename cutover drops the old name
+    // from inventory, and cache keys are uid-based.
+    final table = await _requireTableContextByUid(tableUid);
 
-    if (needDataMigration) {
-      // Physical table records will be rewritten. Keep the freshly updated
-      // schema cache, but drop all read-side/runtime caches for the table.
+    if (renameOp != null || needDataMigration) {
+      // Physical identity unchanged on rename; drop read-side caches. Keep the
+      // freshly updated schema when data rewrite is pending or name changed.
       await _dataStore.cacheManager.invalidateCache(
-        await _requireTableContext(originalTableName),
+        table,
         invalidateSchema: false,
       );
       return;
@@ -5748,7 +5744,7 @@ class MigrationManager {
 
     if (invalidateRecordViews || invalidateIndexCaches) {
       await _dataStore.cacheManager.invalidateCache(
-        await _requireTableContext(currentTableName),
+        table,
         invalidateSchema: false,
         invalidateQuery: invalidateRecordViews,
         invalidateRecords: invalidateRecordViews,

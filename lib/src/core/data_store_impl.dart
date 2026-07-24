@@ -7187,8 +7187,19 @@ class DataStoreImpl {
 
     final requiresRefresh = referencingTables.isNotEmpty ||
         schemasToRefresh.values.any((schema) => schema.foreignKeys.isNotEmpty);
+
+    // Meta already points at [newTableName]; old name no longer resolves.
+    // Cleanup matches FK rows by the logical name string, so pass a context
+    // that still carries the pre-rename name while keeping the stable uid.
+    final renamedCtx = await getTableContext(newTableName);
     await fkManager.cleanupSystemTableForDroppedTable(
-      await getTableContext(oldTableName),
+      TableContext(
+        tableUid: renamedCtx.tableUid,
+        tableName: TableName(oldTableName),
+        isGlobal: renamedCtx.isGlobal,
+        dirIndex: renamedCtx.dirIndex,
+        schema: renamedCtx.schema,
+      ),
       throwOnError: throwOnError,
     );
 

@@ -1602,7 +1602,8 @@ class TableMetaManager {
           ? meta.tableUid
           : (schema.tableUid.isNotEmpty ? schema.tableUid : TableUid.empty);
 
-      // Resolve update vs create; reallocate tableUid on collision with another table.
+      // Resolve update vs create. Rename keeps the same tableUid; a new uid is
+      // allocated only when creating a table without a preferred identity.
       final preferredName =
           meta.tableName.isNotEmpty ? meta.tableName : TableName(schema.name);
       tableUid = await _resolveTableUidForSave(
@@ -1726,7 +1727,11 @@ class TableMetaManager {
     }
   }
 
-  /// Resolve [preferredUid] for create/update; reallocates on collision with another table.
+  /// Resolve [preferredUid] for create/update.
+  ///
+  /// Rename keeps the same [preferredUid] (stable identity). A new uid is
+  /// allocated only on create when [preferredUid] is empty. If [tableName] is
+  /// already owned by a *different* uid, throws [DbException].
   Future<TableUid> _resolveTableUidForSave({
     required TableUid preferredUid,
     required TableName tableName,
@@ -1737,32 +1742,56 @@ class TableMetaManager {
     }
 
     if (preferredUid.isNotEmpty) {
+      await _ensureTableNameAvailableForUid(preferredUid, tableName);
+
       final invName = _nameByUid[preferredUid];
       if (invName != null) {
-        return invName == tableName
-            ? preferredUid
-            : await _allocateUniqueTableUid();
+        // Same uid — including rename (invName != tableName).
+        return preferredUid;
       }
       final localMeta = _peekTableMeta(preferredUid);
       if (localMeta != null) {
-        return localMeta.tableName == tableName
-            ? preferredUid
-            : await _allocateUniqueTableUid();
+        return preferredUid;
       }
       // Inventory incomplete: probe disk. Ready + absent from [_nameByUid]
       // means the uid is free to claim.
       if (!_nameInventoryReady) {
         final disk = await _doLoadTableMeta(preferredUid);
         if (disk != null) {
-          return disk.tableName == tableName
-              ? preferredUid
-              : await _allocateUniqueTableUid();
+          return preferredUid;
         }
       }
       return preferredUid;
     }
 
+    await _ensureTableNameAvailableForUid(TableUid.empty, tableName);
     return _allocateUniqueTableUid();
+  }
+
+  /// Throws when [tableName] is already bound to a uid other than [ownerUid].
+  ///
+  /// Pass [TableUid.empty] for create paths (any existing binding is a conflict).
+  Future<void> _ensureTableNameAvailableForUid(
+    TableUid ownerUid,
+    TableName tableName,
+  ) async {
+    if (tableName.isEmpty) return;
+
+    TableUid? existing = _peekUidByName(tableName);
+    if (existing == null && !_nameInventoryReady) {
+      existing = await resolveTableUidFromName(tableName);
+    }
+    if (existing == null || existing.isEmpty) return;
+    if (ownerUid.isNotEmpty && existing == ownerUid) return;
+
+    throw DbException([
+      SchemaValidationStatus(
+        type: ResultType.devSchemaTableExists,
+        message:
+            'Cannot use table name [${tableName.value}]: already owned by another table.',
+        tableName: tableName.value,
+      ),
+    ]);
   }
 
   /// Allocate a free [TableUid], preferring [preferred] when unused.
