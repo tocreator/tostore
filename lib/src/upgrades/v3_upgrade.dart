@@ -44,8 +44,8 @@ import 'weight_format_migration.dart';
 /// - Blocking [MigrationFormatMigration]: `migration_meta` / `task_*` JSON →
 ///   `.tobf` (after WAL/Txn meta; before version bump).
 /// - Bumps version config markers last (after format migrations) for crash resume.
-/// - Async [WeightFormatMigration]: `cache_weights.json` → space-local internal
-///   KV (non-blocking; loss acceptable).
+/// - Async [WeightFormatMigration]: `cache_weights.json` → `access_weights.tobf`
+///   (non-blocking; loss acceptable; not WAL-backed).
 /// - Cleans up legacy map properties.
 class V3Upgrade {
   final DataStoreImpl _dataStore;
