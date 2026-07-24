@@ -1728,7 +1728,7 @@ class MigrationManager {
       final needsTableWrite = _needDataMigration(sortedOperations, oldSchema);
 
       // create new migration task
-      final taskId = DateTime.now().microsecondsSinceEpoch.toString();
+      final taskId = GlobalIdGenerator.generate('m');
       final dirIndex = await _getNextDirIndex();
       final spaces = await _getMigrationScopesForSchema(
         targetSchema ?? oldSchema,
@@ -4169,6 +4169,10 @@ class MigrationManager {
 
             // Process data migration in place after schema cutover.
             if (needDataMigration) {
+              Logger.info(
+                'Data migration required for table [${migrationTableCtx.tableName}] '
+                'in space [$space] (task ${currentTask.taskId})',
+              );
               final decodeFieldStructureOverride = oldFieldLayout != null
                   ? _buildFieldStructureFromLayout(oldFieldLayout)
                   : null;
