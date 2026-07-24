@@ -260,9 +260,11 @@ class BackgroundWriteScheduler {
     }
   }
 
-  /// Clear all pending background write entries for the given [table] and [type].
-  Future<void> clearEntriesForTable(
-      TableContext table, BackgroundWriteType type) async {
+  /// Clear all pending background write entries for the given [table] and optional [type].
+  ///
+  /// If [type] is null, purges entries of ALL types for the specified table.
+  Future<void> clearEntriesForTable(TableContext table,
+      [BackgroundWriteType? type]) async {
     final yieldController =
         YieldController('BackgroundWriteScheduler.clearEntriesForTable');
     final tableUid = table.tableUid;
@@ -275,15 +277,26 @@ class BackgroundWriteScheduler {
         await yieldController.maybeYield();
         final existingMap = tableMap[pk];
         if (existingMap != null) {
-          final entry = existingMap.remove(type);
-          if (entry != null) {
-            entry.isValid = false;
+          if (type != null) {
+            final entry = existingMap.remove(type);
+            if (entry != null) {
+              entry.isValid = false;
+            }
+          } else {
+            for (final entry in existingMap.values) {
+              entry.isValid = false;
+            }
+            existingMap.clear();
           }
         }
       }
-      tableMap.removeWhere((pk, existingMap) => existingMap.isEmpty);
-      if (tableMap.isEmpty) {
+      if (type == null) {
         _queue.remove(tableUid);
+      } else {
+        tableMap.removeWhere((pk, existingMap) => existingMap.isEmpty);
+        if (tableMap.isEmpty) {
+          _queue.remove(tableUid);
+        }
       }
     }
 
@@ -297,7 +310,8 @@ class BackgroundWriteScheduler {
           break; // Guard against concurrent clear/truncation
         }
         final entry = _orderedQueue[i];
-        if (entry.tableUid == tableUid && entry.type == type) {
+        if (entry.tableUid == tableUid &&
+            (type == null || entry.type == type)) {
           entry.isValid = false;
         } else {
           remaining.add(entry);
