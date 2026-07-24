@@ -1,5 +1,6 @@
 import '../model/data_store_config.dart';
 import '../handler/common.dart';
+import '../handler/weight_snapshot_codec.dart';
 import 'data_store_impl.dart';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
@@ -66,6 +67,13 @@ class PathManager {
   String getSpaceConfigPath({String? rootPath, String? spaceName}) {
     final spacePath = getSpacePath(rootPath: rootPath, spaceName: spaceName);
     return pathJoin(spacePath, 'space_config.tobf');
+  }
+
+  /// Space-local access-weight snapshot (soft stats; not WAL-backed).
+  /// If [rootPath] is provided, build path from that root; otherwise use instance path.
+  String getAccessWeightsPath({String? rootPath, String? spaceName}) {
+    final spacePath = getSpacePath(rootPath: rootPath, spaceName: spaceName);
+    return pathJoin(spacePath, WeightSnapshotCodec.fileName);
   }
 
   /// get temp directory path under current space
