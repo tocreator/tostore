@@ -848,6 +848,15 @@ class TableMetaManager {
     return FieldStorageLayout(nextSlotId: nextSlotId, slots: slots);
   }
 
+  /// Evolve an **existing persisted** layout toward [nextSchema].
+  ///
+  /// - Matched fields keep their slot ids (rename/type update in place).
+  /// - Unmatched previous slots remain as [FieldStorageSlot.deleted] markers.
+  /// - Brand-new fields are appended with new slot ids.
+  /// - When [existingLayout] is null (create table), builds an initial layout.
+  ///
+  /// Never call [_createInitialFieldStorageLayout] for an existing table that
+  /// already has a stored layout — that drops deletion markers and slot ids.
   FieldStorageLayout evolveFieldStorageLayout({
     FieldStorageLayout? existingLayout,
     required TableSchema nextSchema,
@@ -1018,7 +1027,12 @@ class TableMetaManager {
     return true;
   }
 
-  List<FieldStructure> _buildStorageFieldStructureFromLayout(
+  /// Build codec field structure from a storage layout.
+  ///
+  /// Deleted slots use a synthetic name for in-memory decode maps only; on-disk
+  /// records are nameless positional values. The real deletion marker is
+  /// [FieldStorageSlot.deleted] in layout metadata.
+  List<FieldStructure> buildStorageFieldStructureFromLayout(
     FieldStorageLayout layout,
   ) {
     if (layout.slots.isEmpty) {
@@ -1034,29 +1048,18 @@ class TableMetaManager {
     return List<FieldStructure>.unmodifiable(out);
   }
 
-  /// Get stable storage field layout for a table.
-  Future<FieldStorageLayout> getTableFieldLayout(
-    TableUid tableUid, {
-    TableSchema? schema,
-  }) async {
+  /// Get the **persisted** stable field storage layout for a table.
+  ///
+  /// Always loads from cache / table meta. Never rebuilds from [TableSchema]
+  /// field lists — that would drop deleted-slot markers and break positional
+  /// decode. Schema evolution must go through [evolveFieldStorageLayout] on the
+  /// existing layout (or [layoutOverride] on save).
+  Future<FieldStorageLayout> getTableFieldLayout(TableUid tableUid) async {
     final cached = _tableFieldLayoutCache[tableUid];
     if (cached != null) {
-      if (schema == null) {
-        return cached;
-      }
-      final cachedSchema = _peekTableSchema(tableUid);
-      if (cachedSchema != null && identical(cachedSchema, schema)) {
-        return cached;
-      }
+      return cached;
     }
 
-    if (schema != null) {
-      final derived = _createInitialFieldStorageLayout(schema);
-      _tableFieldLayoutCache[tableUid] = derived;
-      return derived;
-    }
-
-    // No schema hint: cold load is OK (caller is not mid-decode of this uid).
     final meta = await getTableMeta(tableUid);
     if (meta != null) {
       _tableFieldLayoutCache[tableUid] = meta.fieldLayout;
@@ -1067,23 +1070,21 @@ class TableMetaManager {
   }
 
   /// Get stable storage field structure used by the record binary codec.
+  ///
+  /// Structure is derived from the **persisted** field layout (or
+  /// [layoutOverride]), not by projecting the logical schema field list.
   Future<List<FieldStructure>> getStorageFieldStructure(
     TableUid tableUid, {
     TableSchema? schema,
     FieldStorageLayout? layoutOverride,
   }) async {
     if (layoutOverride != null) {
-      return _buildStorageFieldStructureFromLayout(layoutOverride);
-    }
-
-    final resolvedSchema = schema ?? await getTableSchema(tableUid);
-    if (resolvedSchema == null) {
-      return const <FieldStructure>[];
+      return buildStorageFieldStructureFromLayout(layoutOverride);
     }
 
     final cachedSchema = _peekTableSchema(tableUid);
     final useCache = schema == null ||
-        (cachedSchema != null && identical(cachedSchema, resolvedSchema));
+        (cachedSchema != null && identical(cachedSchema, schema));
     if (useCache) {
       final cached = _storageFieldStructCache[tableUid];
       if (cached != null) {
@@ -1091,39 +1092,15 @@ class TableMetaManager {
       }
     }
 
-    final layout = await getTableFieldLayout(tableUid, schema: resolvedSchema);
-    final struct = _buildStorageFieldStructureFromLayout(layout);
+    final layout = await getTableFieldLayout(tableUid);
+    if (layout.slots.isEmpty) {
+      return const <FieldStructure>[];
+    }
+    final struct = buildStorageFieldStructureFromLayout(layout);
     if (useCache) {
       _storageFieldStructCache[tableUid] = struct;
     }
     return struct;
-  }
-
-  /// Persist only table field layout without modifying schema payload.
-  Future<void> saveTableFieldLayout(
-    TableUid tableUid,
-    FieldStorageLayout layout, {
-    TableSchema? schema,
-  }) async {
-    final existing = await getTableMeta(tableUid);
-    final resolvedSchema = schema ?? existing?.schema;
-    final name = _peekNameByUid(tableUid)?.value ?? resolvedSchema?.name;
-    if (existing == null || resolvedSchema == null || name == null) {
-      final logName = name ?? _peekNameByUid(tableUid)?.value ?? 'unknown';
-      throw DbException([
-        SchemaValidationStatus(
-          type: ResultType.devTableNotFound,
-          message: 'Table schema not found for table: $logName',
-          tableName: logName,
-        ),
-      ]);
-    }
-
-    await updateTableMeta(
-      tableUid,
-      schema: resolvedSchema,
-      fieldLayout: layout,
-    );
   }
 
   /// Normalize a decoded record to user schema shape.
@@ -1523,9 +1500,9 @@ class TableMetaManager {
   /// Does not change [TableMeta.dirIndex] (create/allocate only via save).
   Future<TableMeta> updateTableMeta(
     TableUid tableUid, {
-    TableSchema? schema,
     TableName? tableName,
-    FieldStorageLayout? fieldLayout,
+    TableSchema? schema,
+    FieldStorageLayout? layoutOverride,
     TableMetaExtra? extra,
     bool clearExtra = false,
     bool memoryOnly = false,
@@ -1571,7 +1548,7 @@ class TableMetaManager {
       ),
       memoryOnly: memoryOnly,
       fieldRenameHints: fieldRenameHints,
-      layoutOverride: fieldLayout,
+      layoutOverride: layoutOverride,
     );
   }
 
