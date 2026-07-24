@@ -101,7 +101,6 @@ class MigrationManager {
     return _schemaByVersion[schemaVersion];
   }
 
-  static const String _deletedSlotFieldPrefix = '_system_storage_deleted_slot_';
   static const String _globalMigrationScope = '__global__';
 
   // Active partition stream controllers for graceful cancellation
@@ -842,41 +841,53 @@ class MigrationManager {
     return currentRecord;
   }
 
-  /// Symmetrically resolves a historical TableSchema by slot count from pending tasks list.
-  Future<TableSchema?> getTableSchemaBySlotCount(
+  /// Resolve historical field storage layout by on-disk fieldCount (slot total).
+  ///
+  /// Matches pending migration task snapshots first (old then target), so
+  /// deleted-slot layouts and compacted targets remain selectable by totalSlots.
+  /// Falls back to current meta layout when it matches [slotCount].
+  Future<ResolvedFieldLayoutBySlotCount?> resolveFieldLayoutBySlotCount(
     TableContext table,
     int slotCount,
   ) async {
-    final schemaMgr = _dataStore.tableMetaManager;
-    if (schemaMgr == null) return null;
-
     final tableTasks = _pendingTasks.where((t) {
       final currentName = t.currentTableName ??
           _resolveCurrentTableNameFromName(t.tableName, t.operations);
       return t.tableUid == table.tableUid ||
           t.tableName == table.tableName ||
           currentName == table.tableName;
-    });
+    }).toList(growable: false)
+      ..sort((a, b) {
+        final c = b.createTime.compareTo(a.createTime);
+        if (c != 0) return c;
+        return b.taskId.compareTo(a.taskId);
+      });
 
     for (final t in tableTasks) {
-      if (t.oldSchemaSnapshot != null) {
-        final layout = await schemaMgr.getTableFieldLayout(
-          table.tableUid,
+      final oldLayout = t.oldFieldLayoutSnapshot;
+      if (oldLayout != null && oldLayout.totalSlots == slotCount) {
+        return ResolvedFieldLayoutBySlotCount(
+          layout: oldLayout,
           schema: t.oldSchemaSnapshot,
         );
-        if (layout.totalSlots == slotCount) {
-          return t.oldSchemaSnapshot;
-        }
       }
-      if (t.targetSchemaSnapshot != null) {
-        final layout = await schemaMgr.getTableFieldLayout(
-          table.tableUid,
+      final targetLayout = t.targetFieldLayoutSnapshot;
+      if (targetLayout != null && targetLayout.totalSlots == slotCount) {
+        return ResolvedFieldLayoutBySlotCount(
+          layout: targetLayout,
           schema: t.targetSchemaSnapshot,
         );
-        if (layout.totalSlots == slotCount) {
-          return t.targetSchemaSnapshot;
-        }
       }
+    }
+
+    final schemaMgr = _dataStore.tableMetaManager;
+    if (schemaMgr == null) return null;
+    final current = await schemaMgr.getTableFieldLayout(table.tableUid);
+    if (current.totalSlots == slotCount) {
+      return ResolvedFieldLayoutBySlotCount(
+        layout: current,
+        schema: await schemaMgr.getTableSchema(table.tableUid),
+      );
     }
     return null;
   }
@@ -1702,22 +1713,28 @@ class MigrationManager {
       }
 
       FieldStorageLayout? oldFieldLayout;
+      final schemaMgrForLayout = _dataStore.tableMetaManager;
       if (latestPending != null) {
-        final prevLayout = latestPending.oldFieldLayoutSnapshot;
-        if (prevLayout != null && latestPending.targetSchemaSnapshot != null) {
-          final renameHints = _buildFieldRenameHints(latestPending.operations);
-          oldFieldLayout =
-              _dataStore.tableMetaManager?.evolveFieldStorageLayout(
-            existingLayout: prevLayout,
-            nextSchema: latestPending.targetSchemaSnapshot!,
-            renameHints: renameHints,
-          );
+        // Prefer the previous task's atomically persisted target layout
+        // (covers compaction). Fall back to evolve only for legacy tasks.
+        oldFieldLayout = latestPending.targetFieldLayoutSnapshot;
+        if (oldFieldLayout == null) {
+          final prevLayout = latestPending.oldFieldLayoutSnapshot;
+          if (prevLayout != null &&
+              latestPending.targetSchemaSnapshot != null) {
+            final renameHints =
+                _buildFieldRenameHints(latestPending.operations);
+            oldFieldLayout = schemaMgrForLayout?.evolveFieldStorageLayout(
+              existingLayout: prevLayout,
+              nextSchema: latestPending.targetSchemaSnapshot!,
+              renameHints: renameHints,
+            );
+          }
         }
-      } else {
-        oldFieldLayout = oldSchema != null
-            ? await _dataStore.tableMetaManager
-                ?.getTableFieldLayout(tableUid, schema: oldSchema)
-            : null;
+      } else if (!isDropTable) {
+        // Real persisted layout from meta/cache (never schema-derived).
+        oldFieldLayout =
+            await schemaMgrForLayout?.getTableFieldLayout(tableUid);
       }
 
       if (oldSchema == null) {
@@ -1907,6 +1924,37 @@ class MigrationManager {
       // Calculate table write requirement once
       final needsTableWrite = _needDataMigration(sortedOperations, oldSchema);
 
+      // Plan field layout for atomic schema cutover (evolve ± deleted-slot compact).
+      FieldStorageLayout? targetFieldLayout;
+      var enableDeletedSlotCompaction = false;
+      if (!isDropTable && targetSchema != null && schemaMgrForLayout != null) {
+        final renameHints = _buildFieldRenameHints(sortedOperations);
+        final evolvedLayout = schemaMgrForLayout.evolveFieldStorageLayout(
+          existingLayout: oldFieldLayout,
+          nextSchema: targetSchema,
+          renameHints: renameHints,
+        );
+        enableDeletedSlotCompaction = _shouldCompactDeletedSlots(
+          tableUid: tableUid,
+          tableName: tableName,
+          evolvedLayout: evolvedLayout,
+          operations: sortedOperations,
+          sourceLayout: oldFieldLayout,
+        );
+        targetFieldLayout = enableDeletedSlotCompaction
+            ? evolvedLayout.compactDeletedSlots()
+            : evolvedLayout;
+        if (enableDeletedSlotCompaction) {
+          Logger.info(
+            'Table [$tableName] deleted slots ratio reached '
+            '${(evolvedLayout.deletedSlotsRatio * 100).toStringAsFixed(1)}%, '
+            'will atomically persist compacted field layout '
+            '(${evolvedLayout.totalSlots} -> ${targetFieldLayout.totalSlots} slots) '
+            'and enable background rewrite migration.',
+          );
+        }
+      }
+
       // create new migration task
       final taskId = GlobalIdGenerator.generate('m');
       final dirIndex = await _getNextDirIndex();
@@ -1929,7 +1977,9 @@ class MigrationManager {
         oldSchemaSnapshot: oldSchema,
         targetSchemaSnapshot: targetSchema,
         oldFieldLayoutSnapshot: oldFieldLayout,
+        targetFieldLayoutSnapshot: targetFieldLayout,
         schemaCutoverWalPointer: cutoverPointer,
+        forceDataMigration: enableDeletedSlotCompaction,
         writeMode: writeMode,
         specificIndexUids: specificIndexUids,
         referencingChildIndexesToDrop: childIndexesToDrop,
@@ -1937,12 +1987,14 @@ class MigrationManager {
 
       // Schema metadata update is performed synchronously to ensure that subsequent operations
       // can immediately use the new schema. Data migration remains asynchronous.
+      // fieldLayout is passed atomically with schema (evolved or compacted).
       if (!task.isSchemaUpdated && task.targetSchemaSnapshot != null) {
         await TransactionContext.runAsSystemOperation(() async {
           await executeSchemaOperations(
             await _requireTableContextByUid(tableUid),
             sortedOperations,
             targetSchema: task.targetSchemaSnapshot!,
+            fieldLayout: task.targetFieldLayoutSnapshot,
             tableLockHeldExternally: true,
             outDroppedChildIndexes: childIndexesToDrop,
           );
@@ -1953,8 +2005,6 @@ class MigrationManager {
               childIndexesToDrop.isNotEmpty ? childIndexesToDrop : null,
         );
       }
-
-      task = await _maybeEnableDeletedSlotCompaction(task, sortedOperations);
 
       // Drop tasks are often enqueued after current-space meta is already gone.
       // Skip physical table lookups; other spaces are cleaned asynchronously.
@@ -2170,22 +2220,6 @@ class MigrationManager {
     _rebuildRuntimeMigrations(TableUid(task.tableUid));
   }
 
-  List<FieldStructure> _buildFieldStructureFromLayout(
-    FieldStorageLayout layout,
-  ) {
-    if (layout.slots.isEmpty) {
-      return const <FieldStructure>[];
-    }
-    final out = <FieldStructure>[];
-    for (final slot in layout.slots) {
-      final fieldName = slot.deleted
-          ? '$_deletedSlotFieldPrefix${slot.slotId}'
-          : slot.fieldName;
-      out.add(FieldStructure(name: fieldName, typeIndex: slot.typeIndex));
-    }
-    return List<FieldStructure>.unmodifiable(out);
-  }
-
   void _unregisterRuntimeMigrationForTask(MigrationTask task) {
     _rebuildRuntimeMigrations(TableUid(task.tableUid));
   }
@@ -2270,9 +2304,14 @@ class MigrationManager {
       return null;
     }
 
-    final oldFieldStruct = oldestWithSnapshot.oldFieldLayoutSnapshot != null
-        ? _buildFieldStructureFromLayout(
-            oldestWithSnapshot.oldFieldLayoutSnapshot!)
+    final oldLayoutSnap = oldestWithSnapshot.oldFieldLayoutSnapshot;
+    final oldFieldStruct = oldLayoutSnap != null
+        ? (_dataStore.tableMetaManager
+                ?.buildStorageFieldStructureFromLayout(oldLayoutSnap) ??
+            oldSchema.fields
+                .map((f) =>
+                    FieldStructure(name: f.name, typeIndex: f.type.index))
+                .toList(growable: false))
         : oldSchema.fields
             .map((f) => FieldStructure(name: f.name, typeIndex: f.type.index))
             .toList(growable: false);
@@ -2398,6 +2437,7 @@ class MigrationManager {
     TableContext table,
     List<MigrationOperation> operations, {
     required TableSchema targetSchema,
+    FieldStorageLayout? fieldLayout,
     bool tableLockHeldExternally = false,
     Map<TableUid, List<IndexUid>>? outDroppedChildIndexes,
   }) async {
@@ -2471,6 +2511,7 @@ class MigrationManager {
           TableUid(tableUid),
           tableName: TableName(currentTableName),
           schema: schemaToSave,
+          layoutOverride: fieldLayout,
           fieldRenameHints: fieldRenameHints,
         );
       }
@@ -4140,17 +4181,21 @@ class MigrationManager {
       }
       var oldFieldLayout = currentTask.oldFieldLayoutSnapshot;
       if (oldFieldLayout == null && oldSchema != null) {
+        // Prefer real persisted layout; never derive-from-schema (drops deleted slots).
         oldFieldLayout = await _dataStore.tableMetaManager?.getTableFieldLayout(
           TableUid(currentTask.tableUid),
-          schema: oldSchema,
         );
       }
+      var targetFieldLayout = currentTask.targetFieldLayoutSnapshot;
       if ((oldSchema != null && currentTask.oldSchemaSnapshot == null) ||
           (oldFieldLayout != null &&
-              currentTask.oldFieldLayoutSnapshot == null)) {
+              currentTask.oldFieldLayoutSnapshot == null) ||
+          (targetFieldLayout != null &&
+              currentTask.targetFieldLayoutSnapshot == null)) {
         currentTask = currentTask.copyWith(
           oldSchemaSnapshot: oldSchema,
           oldFieldLayoutSnapshot: oldFieldLayout,
+          targetFieldLayoutSnapshot: targetFieldLayout,
         );
         await _saveMigrationTask(currentTask);
         _updatePendingTaskInMemory(currentTask);
@@ -4163,11 +4208,41 @@ class MigrationManager {
         _throwIfMigrationStopped(
           'Migration stopped before schema cutover for ${currentTask.tableName}',
         );
+        // Legacy tasks may lack targetFieldLayoutSnapshot — compute evolve±compact.
+        if (currentTask.targetFieldLayoutSnapshot == null) {
+          final schemaMgr = _dataStore.tableMetaManager;
+          if (schemaMgr != null) {
+            final renameHints = _buildFieldRenameHints(sortedOperations);
+            final evolved = schemaMgr.evolveFieldStorageLayout(
+              existingLayout: currentTask.oldFieldLayoutSnapshot,
+              nextSchema: currentTask.targetSchemaSnapshot!,
+              renameHints: renameHints,
+            );
+            final shouldCompact = _shouldCompactDeletedSlots(
+              tableUid: TableUid(currentTask.tableUid),
+              tableName: currentTableName,
+              evolvedLayout: evolved,
+              operations: sortedOperations,
+              sourceLayout: currentTask.oldFieldLayoutSnapshot,
+              excludeTaskId: currentTask.taskId,
+            );
+            targetFieldLayout =
+                shouldCompact ? evolved.compactDeletedSlots() : evolved;
+            currentTask = currentTask.copyWith(
+              targetFieldLayoutSnapshot: targetFieldLayout,
+              forceDataMigration:
+                  currentTask.forceDataMigration || shouldCompact,
+            );
+            await _saveMigrationTask(currentTask);
+            _updatePendingTaskInMemory(currentTask);
+          }
+        }
         final childIndexesToDrop = <TableUid, List<IndexUid>>{};
         currentTableName = await executeSchemaOperations(
           await _requireTableContextByUid(TableUid(currentTask.tableUid)),
           sortedOperations,
           targetSchema: currentTask.targetSchemaSnapshot!,
+          fieldLayout: currentTask.targetFieldLayoutSnapshot,
           outDroppedChildIndexes: childIndexesToDrop,
         );
         currentTask = currentTask.copyWith(
@@ -4399,9 +4474,10 @@ class MigrationManager {
                 'Data migration required for table [${migrationTableCtx.tableName}] '
                 'in space [$space] (task ${currentTask.taskId})',
               );
-              final decodeFieldStructureOverride = oldFieldLayout != null
-                  ? _buildFieldStructureFromLayout(oldFieldLayout)
-                  : null;
+              final decodeFieldStructureOverride = oldFieldLayout == null
+                  ? null
+                  : _dataStore.tableMetaManager
+                      ?.buildStorageFieldStructureFromLayout(oldFieldLayout);
 
               final int writeBatchSize =
                   max(1, migrationInstance.config.writeBatchSize);
@@ -5626,100 +5702,84 @@ class MigrationManager {
     }
   }
 
-  Future<MigrationTask> _maybeEnableDeletedSlotCompaction(
-    MigrationTask task,
-    List<MigrationOperation> sortedOperations,
-  ) async {
-    if (task.forceDataMigration) {
-      return task;
-    }
-
+  /// Whether deleted-slot compaction should run for this cutover.
+  ///
+  /// Requires removeField, deletedSlotsRatio >= 30%, deletedSlotsCount >= 50,
+  /// and no selectable layout version (this cutover's source layout or any
+  /// same-table pending old/target snapshot) whose totalSlots equals the
+  /// compacted slot count — otherwise fieldCount-based version selection
+  /// would be ambiguous.
+  bool _shouldCompactDeletedSlots({
+    required TableUid tableUid,
+    required String tableName,
+    required FieldStorageLayout evolvedLayout,
+    required List<MigrationOperation> operations,
+    FieldStorageLayout? sourceLayout,
+    String? excludeTaskId,
+  }) {
     var hasRemoveField = false;
-    for (final op in sortedOperations) {
+    for (final op in operations) {
       if (op.type == MigrationType.removeField) {
         hasRemoveField = true;
         break;
       }
     }
     if (!hasRemoveField) {
-      return task;
+      return false;
+    }
+    if (evolvedLayout.totalSlots == 0) {
+      return false;
     }
 
-    final schemaMgr = _dataStore.tableMetaManager;
-    if (schemaMgr == null) {
-      return task;
-    }
-
-    final currentTableName = task.currentTableName ??
-        _resolveCurrentTableNameFromName(task.tableName, task.operations);
-    final currentSchema =
-        await schemaMgr.getTableSchemaByName(TableName(currentTableName));
-    if (currentSchema == null) {
-      return task;
-    }
-
-    final currentLayout = await schemaMgr.getTableFieldLayout(
-      TableUid(task.tableUid),
-      schema: currentSchema,
-    );
-    if (currentLayout.totalSlots == 0) {
-      return task;
-    }
-    final deletedCount = currentLayout.deletedSlotsCount;
-    final totalCount = currentLayout.totalSlots;
-    final targetCompactedSlotsCount = totalCount - deletedCount;
-
-    final hasRatioPass = currentLayout.deletedSlotsRatio >= 0.30;
+    final deletedCount = evolvedLayout.deletedSlotsCount;
+    final targetCompactedSlotsCount = evolvedLayout.totalSlots - deletedCount;
+    final hasRatioPass = evolvedLayout.deletedSlotsRatio >= 0.30;
     final hasCountPass = deletedCount >= 50;
-
     if (!hasRatioPass || !hasCountPass) {
-      return task;
+      return false;
     }
 
-    bool hasCollision = false;
-    for (final t in _pendingTasks) {
-      if (t.taskId == task.taskId) continue;
-      final prevLayout = t.oldFieldLayoutSnapshot;
-      if (prevLayout != null &&
-          prevLayout.totalSlots == targetCompactedSlotsCount) {
-        hasCollision = true;
-        break;
-      }
-      if (t.targetSchemaSnapshot != null) {
-        final targetLayout = await schemaMgr.getTableFieldLayout(
-          TableUid(task.tableUid),
-          schema: t.targetSchemaSnapshot,
-        );
-        if (targetLayout.totalSlots == targetCompactedSlotsCount) {
-          hasCollision = true;
-          break;
-        }
-      }
-    }
-
-    if (hasCollision) {
-      Logger.warn(
-        'Compaction of table [$currentTableName] deferred because target compacted slots count ($targetCompactedSlotsCount) '
-        'collides with another pending task version total slots.',
+    // Source layout is what unre-written rows still use (same totalSlots as
+    // pre-cutover meta for typical remove-only evolves). Compact must not
+    // collapse to that count or Tier2 cannot tell old rows from new ones.
+    if (sourceLayout != null &&
+        sourceLayout.totalSlots == targetCompactedSlotsCount) {
+      Logger.debug(
+        'Compaction of table [$tableName] deferred because target compacted '
+        'slots count ($targetCompactedSlotsCount) collides with this cutover '
+        'source layout totalSlots.',
       );
-      return task;
+      return false;
     }
 
-    final updatedTask = task.copyWith(
-      forceDataMigration: true,
-      oldFieldLayoutSnapshot: task.oldFieldLayoutSnapshot ?? currentLayout,
-    );
-    await _saveMigrationTask(updatedTask);
-    _updatePendingTaskInMemory(updatedTask);
+    for (final t in _pendingTasks) {
+      if (t.tableUid != tableUid) continue;
 
-    Logger.info(
-      'Table [$currentTableName] deleted slots ratio reached '
-      '${(currentLayout.deletedSlotsRatio * 100).toStringAsFixed(1)}%, '
-      'enabled background rewrite migration for task ${task.taskId} '
-      'to purge deleted-slot payload values.',
-    );
+      final oldSlots = t.oldFieldLayoutSnapshot?.totalSlots;
+      if (oldSlots != null && oldSlots == targetCompactedSlotsCount) {
+        Logger.debug(
+          'Compaction of table [$tableName] deferred because target compacted '
+          'slots count ($targetCompactedSlotsCount) collides with pending task '
+          '${t.taskId} oldFieldLayoutSnapshot.totalSlots.',
+        );
+        return false;
+      }
 
-    return updatedTask;
+      // Skip self target while it is being (re)computed for late cutover.
+      if (excludeTaskId != null && t.taskId == excludeTaskId) continue;
+
+      final targetSlots = t.targetFieldLayoutSnapshot?.totalSlots;
+      if (targetSlots != null && targetSlots == targetCompactedSlotsCount) {
+        Logger.debug(
+          'Compaction of table [$tableName] deferred because target compacted '
+          'slots count ($targetCompactedSlotsCount) collides with pending task '
+          '${t.taskId} targetFieldLayoutSnapshot.totalSlots.',
+        );
+        return false;
+      }
+    }
+
+    return true;
   }
 
   /// check if the migration operations require data migration.
@@ -7521,4 +7581,15 @@ class MigrationTasksResult {
   final List<dynamic> errors;
 
   MigrationTasksResult({required this.success, this.errors = const []});
+}
+
+/// Result of resolving a field storage layout by on-disk fieldCount (slot total).
+class ResolvedFieldLayoutBySlotCount {
+  final FieldStorageLayout layout;
+  final TableSchema? schema;
+
+  const ResolvedFieldLayoutBySlotCount({
+    required this.layout,
+    this.schema,
+  });
 }
