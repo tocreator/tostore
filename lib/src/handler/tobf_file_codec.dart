@@ -19,6 +19,11 @@ abstract final class TobfFileCodec {
   static const int maxBodyBytesDefault = 1 * 1024 * 1024;
 
   /// Whether [EncryptionScope.full] is active on the given config.
+  ///
+  /// GlobalConfig and SpaceConfig files are written as plaintext TOBF frames (flags = 0)
+  /// by default or when [encryptionConfig] is null / [EncryptionType.none] / [EncryptionScope.standard].
+  /// Shell encryption (flags = 1) is ONLY enabled when [encryptionScope] is explicitly set
+  /// to [EncryptionScope.full] with a valid non-none [encryptionType].
   static bool shouldEncryptFullScope(EncryptionConfig? encryptionConfig) {
     if (encryptionConfig == null) return false;
     if (encryptionConfig.encryptionType == EncryptionType.none) return false;

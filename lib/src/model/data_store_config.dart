@@ -1102,7 +1102,7 @@ class EncryptionConfig {
   final EncryptionScope encryptionScope;
 
   const EncryptionConfig({
-    this.encryptionType = EncryptionType.xorObfuscation,
+    this.encryptionType = EncryptionType.none,
     this.encodingKey,
     this.encryptionKey,
     this.deviceBinding = false,
