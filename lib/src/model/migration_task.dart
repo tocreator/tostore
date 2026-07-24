@@ -31,6 +31,9 @@ class MigrationTask {
   final TableSchema? targetSchemaSnapshot;
   // snapshot of source field storage layout before any schema operation
   final FieldStorageLayout? oldFieldLayoutSnapshot;
+  // snapshot of field storage layout atomically persisted with schema cutover
+  // (evolved, or compactDeletedSlots() when deleted-slot compaction is enabled)
+  final FieldStorageLayout? targetFieldLayoutSnapshot;
   // WAL boundary pointer captured at schema cutover time
   final WalPointer? schemaCutoverWalPointer;
   // force physical data rewrite even if operations are logically metadata-only
@@ -62,6 +65,7 @@ class MigrationTask {
     this.oldSchemaSnapshot,
     this.targetSchemaSnapshot,
     this.oldFieldLayoutSnapshot,
+    this.targetFieldLayoutSnapshot,
     this.schemaCutoverWalPointer,
     this.forceDataMigration = false,
     this.spaceCheckpointKeys = const <String, String>{},
@@ -123,6 +127,12 @@ class MigrationTask {
               Map<String, dynamic>.from(json['oldFieldLayoutSnapshot'] as Map),
             )
           : null,
+      targetFieldLayoutSnapshot: json['targetFieldLayoutSnapshot'] != null
+          ? FieldStorageLayout.fromJson(
+              Map<String, dynamic>.from(
+                  json['targetFieldLayoutSnapshot'] as Map),
+            )
+          : null,
       schemaCutoverWalPointer: json['schemaCutoverWalPointer'] != null
           ? WalPointer.fromJson(
               Map<String, dynamic>.from(json['schemaCutoverWalPointer'] as Map),
@@ -175,6 +185,7 @@ class MigrationTask {
         'oldSchemaSnapshot': oldSchemaSnapshot?.toJson(),
         'targetSchemaSnapshot': targetSchemaSnapshot?.toJson(),
         'oldFieldLayoutSnapshot': oldFieldLayoutSnapshot?.toJson(),
+        'targetFieldLayoutSnapshot': targetFieldLayoutSnapshot?.toJson(),
         'schemaCutoverWalPointer': schemaCutoverWalPointer?.toJson(),
         if (forceDataMigration) 'forceDataMigration': true,
         if (spaceCheckpointKeys.isNotEmpty)
@@ -259,6 +270,7 @@ class MigrationTask {
     TableSchema? oldSchemaSnapshot,
     TableSchema? targetSchemaSnapshot,
     FieldStorageLayout? oldFieldLayoutSnapshot,
+    FieldStorageLayout? targetFieldLayoutSnapshot,
     WalPointer? schemaCutoverWalPointer,
     bool? forceDataMigration,
     Map<String, String>? spaceCheckpointKeys,
@@ -283,6 +295,8 @@ class MigrationTask {
         targetSchemaSnapshot: targetSchemaSnapshot ?? this.targetSchemaSnapshot,
         oldFieldLayoutSnapshot:
             oldFieldLayoutSnapshot ?? this.oldFieldLayoutSnapshot,
+        targetFieldLayoutSnapshot:
+            targetFieldLayoutSnapshot ?? this.targetFieldLayoutSnapshot,
         schemaCutoverWalPointer:
             schemaCutoverWalPointer ?? this.schemaCutoverWalPointer,
         forceDataMigration: forceDataMigration ?? this.forceDataMigration,
