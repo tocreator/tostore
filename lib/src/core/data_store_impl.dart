@@ -211,12 +211,18 @@ class DataStoreImpl {
   /// Fixed B+Tree / NGH page size for this database (from [GlobalConfig.pageSize]).
   ///
   /// Immutable after first persist / v3 upgrade. Falls back to
-  /// [InternalConfig.defaultPageSize] only before GlobalConfig is loaded or when
-  /// legacy configs have not yet been upgraded.
-  int get configuredPageSize =>
-      _globalConfigCache?.pageSize ?? InternalConfig.defaultPageSize;
+  /// [InternalConfig.defaultPageSize] when GlobalConfig is not loaded or when
+  /// legacy configs still carry `pageSize == 0` (unset). Note: `??` alone is
+  /// insufficient — a loaded cache with pageSize 0 must also fall back.
+  int get configuredPageSize {
+    final ps = _globalConfigCache?.pageSize ?? 0;
+    return ps > 0 ? ps : InternalConfig.defaultPageSize;
+  }
 
   /// True when [GlobalConfig.pageSize] has been persisted for this database.
+  ///
+  /// Uses `?? 0` (not defaultPageSize): unset must stay distinguishable from a
+  /// real configured value so v3 upgrade can sample and write pageSize once.
   bool get hasConfiguredPageSize => (_globalConfigCache?.pageSize ?? 0) > 0;
 
   TableDataManager? _tableDataManager;
