@@ -31,6 +31,7 @@ import 'workload_scheduler.dart';
 import 'write_buffer_manager.dart';
 import 'yield_controller.dart';
 import '../model/table_identity.dart';
+import '../model/system_table.dart';
 
 class ParallelJournalManager {
   final DataStoreImpl _dataStore;
@@ -1636,7 +1637,14 @@ class ParallelJournalManager {
 
   Future<TableContext?> _resolveTableContext(TableUid tableUid) async {
     if (tableUid.isEmpty) return null;
-    return _dataStore.tableMetaManager?.getTableContext(tableUid);
+    final ctx = await _dataStore.tableMetaManager?.getTableContext(tableUid);
+    if (ctx != null) return ctx;
+    // Interrupted v3 may leave meta-row inserts in WAL before the self-row is
+    // readable via getTableMeta; bootstrap context is enough to replay them.
+    if (tableUid == SystemTable.tableMetaTableUid) {
+      return _dataStore.tableMetaManager?.bootstrapTableMetaContext();
+    }
+    return null;
   }
 
   BatchTablePlan? _tablePlanFor(
@@ -1661,6 +1669,9 @@ class ParallelJournalManager {
   Future<TableSchema?> _resolveTableSchema(TableUid tableUid) async {
     final ctx = await _resolveTableContext(tableUid);
     if (ctx == null) return null;
+    // Prefer [TableContext.schema] so bootstrap meta context works when the
+    // self-row is not yet loadable via getTableMeta.
+    if (ctx.schema.name.isNotEmpty) return ctx.schema;
     return _dataStore.tableMetaManager?.getTableSchema(ctx.tableUid);
   }
 
