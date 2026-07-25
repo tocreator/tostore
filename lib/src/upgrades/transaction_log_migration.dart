@@ -63,7 +63,7 @@ class TransactionLogMigration {
 
     // Meta missing/corrupt: fall back to directory scan so unfinished logs
     // are still rewritten before recovery runs.
-    Logger.warn(
+    Logger.debug(
       'v3: transaction meta unavailable for space $spaceName; '
       'falling back to directory scan',
     );
