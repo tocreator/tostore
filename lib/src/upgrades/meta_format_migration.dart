@@ -84,7 +84,7 @@ final class MetaFormatMigration {
       try {
         await _tryDecodeWalTobf(dataStore, tobfPath);
         if (hasJson || hasBakJson) {
-          Logger.warn(
+          Logger.info(
             'MetaFormatMigration: residual WAL JSON found for space '
             '[$spaceName]; deleting after TOBF verify',
           );
@@ -119,7 +119,7 @@ final class MetaFormatMigration {
       return; // Fresh space: WalManager will create TOBF on first persist.
     }
 
-    Logger.warn(
+    Logger.info(
       'MetaFormatMigration: migrating WAL meta JSON → TOBF for space '
       '[$spaceName]',
     );
@@ -272,7 +272,7 @@ final class MetaFormatMigration {
         partitionsToCheck.addAll(meta.activePartitions);
         partitionsToCheck.add(meta.currentPartitionIndex);
         if (hasMainJson) {
-          Logger.warn(
+          Logger.info(
             'MetaFormatMigration: residual txn main JSON for space '
             '[$spaceName]; deleting after TOBF verify',
           );
@@ -301,7 +301,7 @@ final class MetaFormatMigration {
     }
 
     if (needRewriteMainFromJson) {
-      Logger.warn(
+      Logger.info(
         'MetaFormatMigration: migrating txn main meta JSON → TOBF for space '
         '[$spaceName]',
       );
