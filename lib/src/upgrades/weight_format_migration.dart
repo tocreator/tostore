@@ -66,7 +66,7 @@ final class WeightFormatMigration {
 
     if (!await dataStore.storage.existsFile(jsonPath)) return;
 
-    Logger.warn(
+    Logger.info(
       'WeightFormatMigration: migrating cache_weights.json → access_weights.tobf '
       'for space [$spaceName]',
     );
