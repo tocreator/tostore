@@ -60,7 +60,9 @@ class LargeOperationRunner {
   /// [BackgroundWriteScheduler.clearAll]).
   static Future<void> pauseForShutdown(DataStoreImpl dataStore) async {
     final space = dataStore.currentSpaceName;
-    Logger.info('Stopping background large operations for space [$space]...');
+    final hasActive =
+        _activeTokens.containsKey(space) || _activeTasks.containsKey(space);
+    if (!hasActive) return;
     requestPause(space);
 
     final task = _activeTasks[space];
