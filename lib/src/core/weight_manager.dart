@@ -63,8 +63,10 @@ class WeightManager {
   bool get _isMemoryMode =>
       _dataStore.config.persistenceMode == PersistenceMode.memory;
 
-  /// Dispose weight manager and deregister crontab callbacks
-  void dispose() {
+  /// Stop periodic save/decay only (keep in-memory weights for a final flush).
+  /// Call before LockManager.enterMaintenance so crontab writers are not parked
+  /// behind the maintenance barrier for baseLockTimeout.
+  void stopBackgroundTasks() {
     CrontabManager.removeCallback(ExecuteInterval.hour24, _performDecay);
     CrontabManager.removeCallback(ExecuteInterval.seconds30, _periodicSave);
     CrontabManager.removeCallback(ExecuteInterval.hour1, _hourlyGuaranteeSave);
@@ -249,6 +251,7 @@ class WeightManager {
 
   /// Periodic save callback for CrontabManager
   void _periodicSave() {
+    if (!_dataStore.isInitialized) return;
     if (_dirty) {
       saveWeights(force: false);
     }
@@ -256,6 +259,7 @@ class WeightManager {
 
   /// If dirty for a long time under continuous write pressure, force persist.
   void _hourlyGuaranteeSave() {
+    if (!_dataStore.isInitialized) return;
     if (!_dirty) return;
     final now = DateTime.now().millisecondsSinceEpoch;
     const hourMs = 60 * 60 * 1000;
@@ -751,6 +755,7 @@ class WeightManager {
 
   /// Perform weight decay
   Future<void> _performDecay() async {
+    if (!_dataStore.isInitialized) return;
     try {
       final yieldController =
           YieldController('WeightManager._performDecay', checkInterval: 50);
