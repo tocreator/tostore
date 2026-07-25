@@ -15,12 +15,20 @@ class MigrationConfig {
   /// list of table names that are allowed to perform data migration without explicit confirmation
   final List<String> allowedAfterDataMigrationTables;
 
+  /// Max time to wait for cooperative migration stop during close / switchSpace.
+  ///
+  /// After cancel is signaled, unfinished space work is awaited up to this
+  /// duration; on timeout the engine force-clears in-memory migration state so
+  /// close cannot hang indefinitely. Disk checkpoints remain for resume.
+  final Duration stopTimeout;
+
   const MigrationConfig({
     this.backupBeforeMigrate = false,
     this.validateAfterMigrate = true,
     this.batchSize = 1000,
     this.strictMode = false,
     this.allowedAfterDataMigrationTables = const [],
+    this.stopTimeout = const Duration(seconds: 60),
   });
 
   /// Create from json
@@ -33,6 +41,9 @@ class MigrationConfig {
       allowedAfterDataMigrationTables:
           (json['allowedAfterDataMigrationTables'] as List?)?.cast<String>() ??
               const [],
+      stopTimeout: Duration(
+        milliseconds: json['stopTimeoutMs'] as int? ?? 60000,
+      ),
     );
   }
 
@@ -44,6 +55,7 @@ class MigrationConfig {
       'batchSize': batchSize,
       'strictMode': strictMode,
       'allowedAfterDataMigrationTables': allowedAfterDataMigrationTables,
+      'stopTimeoutMs': stopTimeout.inMilliseconds,
     };
   }
 
@@ -54,6 +66,7 @@ class MigrationConfig {
     int? batchSize,
     bool? strictMode,
     List<String>? allowedAfterDataMigrationTables,
+    Duration? stopTimeout,
   }) {
     return MigrationConfig(
       backupBeforeMigrate: backupBeforeMigrate ?? this.backupBeforeMigrate,
@@ -62,6 +75,7 @@ class MigrationConfig {
       strictMode: strictMode ?? this.strictMode,
       allowedAfterDataMigrationTables: allowedAfterDataMigrationTables ??
           this.allowedAfterDataMigrationTables,
+      stopTimeout: stopTimeout ?? this.stopTimeout,
     );
   }
 }
