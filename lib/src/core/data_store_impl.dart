@@ -149,6 +149,10 @@ class DataStoreImpl {
   // Global configuration cache
   GlobalConfig? _globalConfigCache;
 
+  /// Engine version last successfully written to the downgrade-guard JSON stub.
+  /// Process-local: avoids rewriting on every [saveGlobalConfig].
+  int? _downgradeGuardJsonVersion;
+
   String _currentSpaceName = 'default';
   DataStoreConfig? _config;
 
@@ -1237,6 +1241,7 @@ class DataStoreImpl {
       migrationManager?.dispose();
 
       _globalConfigCache = null;
+      _downgradeGuardJsonVersion = null;
       _spaceConfigCache = null;
 
       // Now that we have yielded and called dispose, it is safe to
@@ -7329,9 +7334,29 @@ class DataStoreImpl {
       final bytes = GlobalConfigCodec.encodeFile(config, encrypt: encrypt);
       await storage.writeAsBytes(configPath, bytes);
       _globalConfigCache = config;
+
+      // Version-only JSON stub for older engines (once per version per process).
+      unawaited(ensureDowngradeGuardJson(version: config.version));
     } catch (e) {
       Logger.error('Failed to save global config', rawError: e);
       if (propagateErrors) rethrow;
+    }
+  }
+
+  /// Ensure `global_config.json` holds a version-only downgrade guard.
+  ///
+  /// Skips when [version] is less than 3, or when this process already confirmed
+  /// the stub for [version] ([_downgradeGuardJsonVersion]). On restart, probes
+  /// the existing stub first — matching version avoids a redundant rewrite.
+  Future<void> ensureDowngradeGuardJson({required int version}) async {
+    if (version < 3) return;
+    if (_downgradeGuardJsonVersion == version) return;
+    final ok = await LegacyConfigBootstrap.writeDowngradeGuardJson(
+      this,
+      version: version,
+    );
+    if (ok) {
+      _downgradeGuardJsonVersion = version;
     }
   }
 

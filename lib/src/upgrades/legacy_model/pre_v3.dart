@@ -102,6 +102,58 @@ final class LegacyConfigBootstrap {
     return LegacySpaceConfigJson.tryParseMap(content ?? '');
   }
 
+  /// Overwrite `global_config.json` with a version-only stub.
+  ///
+  /// Older engines that only understand JSON will load [version] and refuse to
+  /// open when it is newer than their [InternalConfig.engineVersion].
+  /// Not a config source for the current engine (truth is `global_config.tobf`).
+  /// Contains no keys, hashes, or directory maps.
+  ///
+  /// No-op when [version] is less than 3 (pre-TOBF eras still need the full JSON).
+  /// Prefer [DataStoreImpl.ensureDowngradeGuardJson] so process-local dedup applies.
+  /// Returns `true` when the stub is already satisfied or the write succeeded.
+  static Future<bool> writeDowngradeGuardJson(
+    DataStoreImpl dataStore, {
+    required int version,
+  }) async {
+    final root = dataStore.instancePath;
+    if (root == null) return false;
+    final jsonPath = LegacyConfigPaths.globalJson(root);
+    try {
+      if (await _isDowngradeGuardCurrentAt(dataStore, jsonPath, version)) {
+        return true;
+      }
+      await dataStore.storage.writeAsString(
+        jsonPath,
+        jsonEncode(<String, dynamic>{'version': version}),
+        flush: true,
+      );
+      return true;
+    } catch (e) {
+      Logger.warn(
+        'Failed to write downgrade-guard $jsonPath (version=$version)',
+        rawError: e,
+      );
+      return false;
+    }
+  }
+
+  /// Whether [jsonPath] is already a version-only stub for [version].
+  ///
+  /// Full legacy JSON (e.g. still carrying `tableDirectoryMap`) is never
+  /// treated as current — caller must overwrite with the stub.
+  static Future<bool> _isDowngradeGuardCurrentAt(
+    DataStoreImpl dataStore,
+    String jsonPath,
+    int version,
+  ) async {
+    if (!await dataStore.storage.existsFile(jsonPath)) return false;
+    final content = await dataStore.storage.readAsString(jsonPath);
+    final map = LegacyGlobalConfigJson.tryParseMap(content ?? '');
+    if (map == null || map.length != 1) return false;
+    return (map['version'] as num?)?.toInt() == version;
+  }
+
   static Future<void> deleteGlobalJson(DataStoreImpl dataStore) async {
     final root = dataStore.instancePath;
     if (root == null) return;

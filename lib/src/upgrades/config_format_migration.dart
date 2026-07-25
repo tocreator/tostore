@@ -1,4 +1,5 @@
 import '../core/data_store_impl.dart';
+import '../handler/common.dart';
 import '../handler/global_config_codec.dart';
 import '../handler/logger.dart';
 import '../handler/space_config_codec.dart';
@@ -16,10 +17,12 @@ import 'legacy_model/pre_v3.dart';
 final class ConfigFormatMigration {
   ConfigFormatMigration._();
 
-  /// Write current space configs as TOBF, verify readable, then delete JSON.
+  /// Write current space configs as TOBF, verify readable, then delete space
+  /// JSON and replace global JSON with a downgrade-guard stub.
   ///
-  /// Never deletes a legacy JSON file unless the matching `*.tobf` exists and
-  /// decodes successfully — prevents silent key/map loss on write failure.
+  /// Never deletes/replaces a legacy JSON file unless the matching `*.tobf`
+  /// exists and decodes successfully — prevents silent key/map loss on write
+  /// failure.
   static Future<void> finalizeTobfAndDeleteJson(
     DataStoreImpl dataStore, {
     required Iterable<String> spaceNames,
@@ -51,7 +54,10 @@ final class ConfigFormatMigration {
 
     final globalTobf = dataStore.pathManager.getGlobalConfigPath();
     await _verifyGlobalTobf(dataStore, globalTobf);
-    await LegacyConfigBootstrap.deleteGlobalJson(dataStore);
+    await LegacyConfigBootstrap.writeDowngradeGuardJson(
+      dataStore,
+      version: InternalConfig.engineVersion,
+    );
   }
 
   static Future<void> _verifySpaceTobf(
