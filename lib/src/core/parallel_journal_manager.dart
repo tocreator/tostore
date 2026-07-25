@@ -71,9 +71,36 @@ class ParallelJournalManager {
 
   /// Wait until background recovery (if any) is completed.
   Future<void> waitUntilRecoveryCompleted() async {
+    final deadline = DateTime.now().add(const Duration(minutes: 2));
     while (_isRecovering) {
+      if (DateTime.now().isAfter(deadline)) {
+        Logger.warn(
+          'waitUntilRecoveryCompleted timed out after 2 minutes; '
+          'clearing recovering flag to unblock drain/migration',
+        );
+        _isRecovering = false;
+        break;
+      }
       await Future<void>.delayed(const Duration(milliseconds: 50));
     }
+  }
+
+  /// First real (non-pseudo) WAL pointer in [batch], if any.
+  static WalPointer? _firstRealWalPointer(List<WriteQueueEntry> batch) {
+    for (final e in batch) {
+      if (e.walPointer.partitionIndex >= 0) return e.walPointer;
+    }
+    return null;
+  }
+
+  /// Last real (non-pseudo) WAL pointer in [batch], if any.
+  static WalPointer? _lastRealWalPointer(List<WriteQueueEntry> batch) {
+    for (var i = batch.length - 1; i >= 0; i--) {
+      if (batch[i].walPointer.partitionIndex >= 0) {
+        return batch[i].walPointer;
+      }
+    }
+    return null;
   }
 
   /// Write backpressure: called by WriteBufferManager before enqueue.
@@ -165,6 +192,12 @@ class ParallelJournalManager {
   ///   that ignores the batchSize early-exit heuristic and flushes until the queue is empty.
   Future<void> flushCompletely() async {
     if (!_running) return;
+
+    // Drain must not silently no-op while recovery holds the flush gate.
+    if (_isRecovering) {
+      await waitUntilRecoveryCompleted();
+      if (!_running) return;
+    }
 
     // Wait for any in-flight flush first to avoid overlapping pumps.
     final existing = _loopFuture;
@@ -314,8 +347,11 @@ class ParallelJournalManager {
       if (before >= targetSize) return;
       if (before <= 0) return;
 
-      await Future.delayed(
-          Duration(milliseconds: rounds == 0 ? 1000 : delayMs));
+      // First window: respect configured latency when it is already short
+      // (e.g. tests with maxFlushLatencyMs=100); keep up to 1s for energy-saving defaults.
+      final windowMs =
+          rounds == 0 ? (delayMs < 1000 ? delayMs : 1000) : delayMs;
+      await Future.delayed(Duration(milliseconds: windowMs));
 
       final after = _bufferManager.queueLength;
       if (after >= targetSize) return;
@@ -344,8 +380,14 @@ class ParallelJournalManager {
     // 1. Guard: If we are in recovery mode, we MUST NOT run a "normal" flush (context == null).
     // Normal flushes would steal records meant for the recovery batch and write them with a new BatchId,
     // breaking idempotency. Only allow flushes explicitly triggered by recovery (context != null).
+    // Drain mode (close / migration durability) must not silently no-op — wait for recovery
+    // then continue, so callers like WAL cutover wait cannot hang forever.
     if (_isRecovering && recoveryBatchContext == null) {
-      return;
+      if (!drainCompletely) {
+        return;
+      }
+      await waitUntilRecoveryCompleted();
+      if (!_running) return;
     }
 
     // If a previous parallel flush batch was left pending (crash or in-run failure),
@@ -450,13 +492,13 @@ class ParallelJournalManager {
             "Executing batch with ${batch.length} normal items$bgSuffix");
 
         firstIteration = false;
-        // Compute WAL pointer range (exclude pseudo pointers where partitionIndex == -1)
-        final startPtr = batch.isNotEmpty
-            ? batch.first.walPointer
-            : const WalPointer(partitionIndex: -1, entrySeq: 0);
-        final endPtr = batch.isNotEmpty
-            ? batch.last.walPointer
-            : const WalPointer(partitionIndex: -1, entrySeq: 0);
+        // Compute WAL pointer range from normal buffer entries only.
+        // Background-only batches have no WAL coverage — never use the
+        // (-1,0) sentinel as start/end (that previously poisoned checkpoint).
+        final startPtr =
+            _firstRealWalPointer(batch) ?? _walManager.meta.checkpoint;
+        final endPtr =
+            _lastRealWalPointer(batch) ?? _walManager.meta.checkpoint;
 
         // Group by table and FINAL operation (derive from current buffer entry to allow coalescing and de-dup per PK)
         // Skip entries for tables that are being cleared to avoid race conditions where clearTable
