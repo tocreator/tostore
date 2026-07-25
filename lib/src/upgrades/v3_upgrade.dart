@@ -32,6 +32,8 @@ import 'weight_format_migration.dart';
 ///   partitions (user + existing system tables) into `TableMeta` rows, then
 ///   renames directories to stable UIDs (no SchemaMeta/routes rewrite).
 /// - Restructures storage directory names from physical table/index names to stable UIDs.
+/// - Primes [GlobalConfig.pageSize] (sample legacy meta.json / default) before
+///   bootstrap createTable so index page0 writes never see pageSize=0.
 /// - Reads legacy meta.json once, writes TableDataMeta/IndexMeta/NghIndexMeta into
 ///   partition-0 page0, then deletes the JSON files (no intermediate JSON rewrite).
 /// - Writes per-space [SpaceManifest] into `_system_internal_kv_store`
@@ -110,10 +112,8 @@ class V3Upgrade {
       }
     }
 
-    // Bootstrap only brand-new engine tables (not present in 3.1.2).
-    await _ensureBootstrapSystemTables();
-
-    // 2. Read legacy JSON config mappings (must stay on disk until finalize).
+    // Read legacy JSON config mappings before bootstrap (needed to sample
+    // btreePageSize). Maps must stay on disk until finalize.
     // Hot-path GlobalConfig model no longer carries tableDirectoryMap — read raw JSON.
     final globalJson =
         await LegacyConfigBootstrap.readGlobalJsonMap(_dataStore);
@@ -125,7 +125,6 @@ class V3Upgrade {
         ? oldGlobalConfig.spaceNames.toList()
         : <String>['default'];
 
-    // Read legacy space configs directory mappings
     final spaceTableDirMaps = <String, Map<String, dynamic>>{};
     for (final spaceName in spaces) {
       final spaceJson = await LegacyConfigBootstrap.readSpaceJsonMap(
@@ -137,6 +136,19 @@ class V3Upgrade {
             spaceJson['tableDirectoryMap'] as Map<String, dynamic>;
       }
     }
+
+    // Lock pageSize before createTable writes system-table index page0.
+    // Legacy GlobalConfig.pageSize is 0 (unset); configuredPageSize alone would
+    // fall back to default, but custom btreePageSize must be sampled first.
+    await _primePageSizeBeforeBootstrap(
+      oldGlobalConfig: oldGlobalConfig,
+      globalTableDirMap: globalTableDirMap,
+      spaceTableDirMaps: spaceTableDirMaps,
+      spaces: spaces,
+    );
+
+    // Bootstrap only brand-new engine tables (not present in 3.1.2).
+    await _ensureBootstrapSystemTables();
 
     // Map to keep track of generated tableUid and indexUids per tableName
     final tableUidMap = <String, String>{};
@@ -289,15 +301,12 @@ class V3Upgrade {
         }
         final actualOldGlobalDirIndex = oldGlobalDirIndex ?? 0;
 
-        final oldGlobalPath = path.join(
-            _dataStore.config.dbPath!,
-            _dataStore.config.dbName,
-            'tables_$actualOldGlobalDirIndex',
-            tableName);
-        final newGlobalPath = path.join(_dataStore.config.dbPath!,
-            _dataStore.config.dbName, 'tables_$finalDirIndex', tableUid);
         await _migrateTableDirectory(
-            oldGlobalPath, newGlobalPath, tableUid, indexUidMap);
+          _globalTableRoot(actualOldGlobalDirIndex, tableName),
+          _globalTableRoot(finalDirIndex, tableUid),
+          tableUid,
+          indexUidMap,
+        );
       } else {
         // Move space table directories across all spaces
         for (final spaceName in spaces) {
@@ -309,22 +318,12 @@ class V3Upgrade {
           }
           final actualOldDirIndex = oldSpaceDirIndex ?? 0;
 
-          final oldSpacePath = path.join(
-              _dataStore.config.dbPath!,
-              _dataStore.config.dbName,
-              'spaces',
-              spaceName,
-              'tables_$actualOldDirIndex',
-              tableName);
-          final newSpacePath = path.join(
-              _dataStore.config.dbPath!,
-              _dataStore.config.dbName,
-              'spaces',
-              spaceName,
-              'tables_$finalDirIndex',
-              tableUid);
           await _migrateTableDirectory(
-              oldSpacePath, newSpacePath, tableUid, indexUidMap);
+            _spaceTableRoot(spaceName, actualOldDirIndex, tableName),
+            _spaceTableRoot(spaceName, finalDirIndex, tableUid),
+            tableUid,
+            indexUidMap,
+          );
         }
       }
     }
@@ -352,7 +351,7 @@ class V3Upgrade {
     }
 
     final resolvedPageSize =
-        _discoveredPageSize ?? InternalConfig.defaultPageSize;
+        _discoveredPageSize ?? _dataStore.configuredPageSize;
 
     // 7. Delete old partition files and schema_meta only after everything succeeds
     for (final partitionIndex in tablePartitionMap.values.toSet()) {
@@ -767,6 +766,145 @@ class V3Upgrade {
         !await _dataStore.storage.existsDirectory(stableNghDir)) {
       await _dataStore.storage.moveDirectory(legacyNghDir, stableNghDir);
     }
+  }
+
+  /// Resolve and persist [GlobalConfig.pageSize] before bootstrap createTable.
+  ///
+  /// Order: already-configured cache → [oldGlobalConfig] → sample legacy
+  /// meta.json (rename-前 paths via directory maps) → [InternalConfig.defaultPageSize].
+  /// Persists only while unset (`copyWith` refuses to change a set pageSize).
+  Future<void> _primePageSizeBeforeBootstrap({
+    required GlobalConfig oldGlobalConfig,
+    required Map<String, dynamic>? globalTableDirMap,
+    required Map<String, Map<String, dynamic>> spaceTableDirMaps,
+    required List<String> spaces,
+  }) async {
+    if (_dataStore.hasConfiguredPageSize) {
+      _discoveredPageSize = _dataStore.configuredPageSize;
+      return;
+    }
+
+    int? sampled;
+    if (oldGlobalConfig.hasConfiguredPageSize) {
+      sampled = oldGlobalConfig.pageSize;
+    } else {
+      sampled = await _samplePageSizeFromLegacyMeta(
+        globalTableDirMap: globalTableDirMap,
+        spaceTableDirMaps: spaceTableDirMaps,
+        spaces: spaces,
+      );
+    }
+
+    final resolved = sampled ?? InternalConfig.defaultPageSize;
+    _discoveredPageSize = resolved;
+
+    final cfg = await _dataStore.getGlobalConfig() ?? oldGlobalConfig;
+    if (!cfg.hasConfiguredPageSize) {
+      await _dataStore.saveGlobalConfig(
+        cfg.copyWith(pageSize: resolved),
+        propagateErrors: true,
+      );
+      Logger.info(
+          'v3: primed GlobalConfig.pageSize=$resolved before bootstrap');
+    }
+  }
+
+  /// Sample btreePageSize from the first available legacy table/index meta.json.
+  /// Map-driven only (no full FS walk); stops at first valid value.
+  Future<int?> _samplePageSizeFromLegacyMeta({
+    required Map<String, dynamic>? globalTableDirMap,
+    required Map<String, Map<String, dynamic>> spaceTableDirMaps,
+    required List<String> spaces,
+  }) async {
+    if (_dataStore.instancePath == null) return null;
+
+    if (globalTableDirMap != null) {
+      for (final entry in globalTableDirMap.entries) {
+        final key = entry.key;
+        if (!key.startsWith('global:')) continue;
+        final tableName = key.substring('global:'.length);
+        if (tableName.isEmpty) continue;
+        final dirIndex = _legacyDirIndex(entry.value) ?? 0;
+        final sampled = await _samplePageSizeFromTableRoot(
+          _globalTableRoot(dirIndex, tableName),
+        );
+        if (sampled != null) return sampled;
+      }
+    }
+
+    for (final spaceName in spaces) {
+      final map = spaceTableDirMaps[spaceName];
+      if (map == null) continue;
+      final prefix = '$spaceName:';
+      for (final entry in map.entries) {
+        final key = entry.key;
+        if (!key.startsWith(prefix)) continue;
+        final tableName = key.substring(prefix.length);
+        if (tableName.isEmpty) continue;
+        final dirIndex = _legacyDirIndex(entry.value) ?? 0;
+        final sampled = await _samplePageSizeFromTableRoot(
+          _spaceTableRoot(spaceName, dirIndex, tableName),
+        );
+        if (sampled != null) return sampled;
+      }
+    }
+    return null;
+  }
+
+  String _globalTableRoot(int dirIndex, String leaf) {
+    return pathJoin(
+      _dataStore.instancePath!,
+      'global',
+      'tables_$dirIndex',
+      leaf,
+    );
+  }
+
+  String _spaceTableRoot(String spaceName, int dirIndex, String leaf) {
+    return pathJoin(
+      _dataStore.instancePath!,
+      'spaces',
+      spaceName,
+      'tables_$dirIndex',
+      leaf,
+    );
+  }
+
+  Future<int?> _samplePageSizeFromTableRoot(String tableRoot) async {
+    final fromData = await _readBtreePageSizeFromMetaJson(
+      path.join(tableRoot, 'data', 'meta.json'),
+    );
+    if (fromData != null) return fromData;
+
+    final indexDir = path.join(tableRoot, 'index');
+    if (!await _dataStore.storage.existsDirectory(indexDir)) return null;
+
+    final children =
+        await _dataStore.storage.listDirectory(indexDir, recursive: false);
+    for (final child in children) {
+      final indexName = path.basename(child);
+      if (indexName.isEmpty || indexName.startsWith('.')) continue;
+      final fromIndex = await _readBtreePageSizeFromMetaJson(
+        path.join(indexDir, indexName, 'meta.json'),
+      );
+      if (fromIndex != null) return fromIndex;
+    }
+    return null;
+  }
+
+  Future<int?> _readBtreePageSizeFromMetaJson(String metaPath) async {
+    if (!await _dataStore.storage.existsFile(metaPath)) return null;
+    try {
+      final content = await _dataStore.storage.readAsString(metaPath);
+      if (content == null || content.isEmpty) return null;
+      final json = jsonDecode(content);
+      if (json is! Map) return null;
+      final sampled = (json['btreePageSize'] as num?)?.toInt();
+      if (sampled != null && sampled > 0) return sampled;
+    } catch (_) {
+      // Ignore corrupt / unreadable meta during sampling.
+    }
+    return null;
   }
 
   int get _upgradePageSize =>
