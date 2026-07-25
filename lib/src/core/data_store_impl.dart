@@ -1161,63 +1161,86 @@ class DataStoreImpl {
 
       // Perform all flushing and shutdown as system operation to bypass transaction locks
       await TransactionContext.runAsSystemOperation(() async {
-        CrontabManager.dispose();
-        if (persistChanges) {
-          // Enter maintenance mode to wait for active transactions to finish
-          try {
-            await lockManager?.enterMaintenance(
-                timeout: config.transactionTimeout);
-          } catch (_) {}
-        }
-
+        // Stop producers BEFORE maintenance/crontab teardown so cooperative
+        // cancel can finish without waiting forever on maintenance barriers.
+        // Do NOT call CrontabManager.dispose() here: it clears ALL DBs' callbacks
+        // and strips the shared LockManager timeout safety-net (reused on
+        // switchSpace). Each manager removes its own callbacks in dispose().
         await _keyManager?.pauseKeyMigration();
         await migrationManager?.stopAllMigrations();
-
         await LargeOperationRunner.pauseForShutdown(this);
+
+        // Stop crontab writers before maintenance drain. Weight periodic save
+        // does not go through ensureInitialized and would otherwise park on
+        // the maintenance barrier for baseLockTimeout (serialize lock errors).
+        _weightManager?.stopBackgroundTasks();
 
         // Clear all background write scheduler entries to prevent flush blocking
         backgroundWriteScheduler.clearAll();
 
-        // Flush and stop write pipelines
+        // Primary instance only: wait for user transactions to drain, then flush.
+        // Migration helper instances share LockManager — entering maintenance
+        // from them deadlocks the parent's stopAllMigrations await.
+        var enteredMaintenance = false;
         try {
-          if (persistChanges) {
-            await parallelJournalManager.flushCompletely();
+          if (persistChanges && !isMigrationInstance) {
+            try {
+              // Only arm maintenance after quiescent succeeds; do not treat a
+              // failed drain as "entered" (would leave barrier up until finally).
+              enteredMaintenance = await lockManager?.enterMaintenance(
+                      timeout: config.transactionTimeout) ??
+                  false;
+            } catch (_) {
+              enteredMaintenance = false;
+            }
           }
-          await parallelJournalManager.drainAndStop();
-        } catch (e) {
-          Logger.warn('Stop journal manager failed', rawError: e);
-        }
 
-        try {
-          await walManager.flushQueueCompletely();
-          if (persistChanges && config.enableJournal) {
-            await walManager.persistMeta(flush: true);
+          // Flush and stop write pipelines
+          try {
+            if (persistChanges) {
+              await parallelJournalManager.flushCompletely();
+            }
+            await parallelJournalManager.drainAndStop();
+          } catch (e) {
+            Logger.warn('Stop journal manager failed', rawError: e);
           }
-        } catch (e) {
-          Logger.warn('Flush WAL failed', rawError: e);
-        }
 
-        // Flush weight data
-        if (_weightManager != null) {
-          if (persistChanges) {
-            await _weightManager!.saveWeights(force: true);
+          try {
+            await walManager.flushQueueCompletely();
+            if (persistChanges && config.enableJournal) {
+              await walManager.persistMeta(flush: true);
+            }
+          } catch (e) {
+            Logger.warn('Flush WAL failed', rawError: e);
           }
-          _weightManager!.dispose();
-        }
 
-        // Persist and dispose data managers via CacheManager
-        await cacheManager.dispose();
-
-        // Final storage flush and close
-        try {
-          await storage.flushAll(closeHandles: true);
-          if (closeStorage) {
-            await storage.close(isMigrationInstance: isMigrationInstance);
+          // Flush weight data
+          if (_weightManager != null) {
+            if (persistChanges) {
+              await _weightManager!.saveWeights(force: true);
+            }
+            _weightManager!.stopBackgroundTasks();
           }
-        } catch (e) {
-          Logger.warn('Storage flush/close failed', rawError: e);
+
+          // Persist and dispose data managers via CacheManager
+          await cacheManager.dispose();
+
+          // Final storage flush and close
+          try {
+            await storage.flushAll(closeHandles: true);
+            if (closeStorage) {
+              await storage.close(isMigrationInstance: isMigrationInstance);
+            }
+          } catch (e) {
+            Logger.warn('Storage flush/close failed', rawError: e);
+          }
         } finally {
-          lockManager?.exitMaintenance();
+          // Always clear maintenance — even if flush/dispose threw — otherwise
+          // switchSpace reuses a LockManager stuck in maintenance and user ops
+          // can stall for baseLockTimeout.
+          if (enteredMaintenance) {
+            lockManager?.exitMaintenance();
+          }
         }
       });
 
