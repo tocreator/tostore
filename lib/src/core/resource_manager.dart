@@ -4,6 +4,7 @@ import 'dart:math';
 import '../handler/logger.dart';
 import '../handler/platform_handler.dart';
 import '../model/data_store_config.dart';
+import '../model/db_exception.dart';
 import '../model/memory_info.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
@@ -311,6 +312,7 @@ class ResourceManager {
 
         await _evictCacheAndCheck(MemoryQuotaType.indexData);
       } catch (e) {
+        if (e is DbClosedException) return;
         Logger.error('An error occurred during cache eviction process',
             rawError: e);
       } finally {
@@ -359,6 +361,7 @@ class ResourceManager {
             'Cache eviction for ${cacheType.name}: freed ${freedMB.toStringAsFixed(2)}MB (${((beforeSize - afterSize) * 100 / beforeSize).toStringAsFixed(1)}%)');
       }
     } catch (e) {
+      if (e is DbClosedException) return;
       Logger.error('Error in cache eviction callback for ${cacheType.name}',
           rawError: e);
     }
@@ -390,7 +393,8 @@ class ResourceManager {
           return tableDataMetaSize + indexMetaSize;
       }
     } catch (e) {
-      Logger.error('Failed to get current cache size for ${cacheType.name}',
+      if (e is DbClosedException) return 0;
+      Logger.warn('Failed to get current cache size for ${cacheType.name}',
           rawError: e);
       return 0;
     }
