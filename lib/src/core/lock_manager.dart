@@ -91,14 +91,56 @@ class LockManager {
         ExecuteInterval.minutes5, _unifiedManagementTask);
   }
 
-  /// Enter maintenance mode: block new lock acquisitions and wait for quiescent state
+  /// Enter maintenance mode: block new (non-system) lock acquisitions after drain.
+  ///
+  /// Order is critical: wait for quiescent **before** arming [_maintenanceMode].
+  /// Arming first deadlocks in-flight work that still needs additional locks
+  /// (holders wait on maintenance; quiescent waits on holders) and parks
+  /// crontab writers for [baseLockTimeout] (e.g. weight save serialize lock).
   Future<bool> enterMaintenance(
       {Duration timeout = const Duration(minutes: 5)}) async {
     if (_maintenanceMode) return true;
-    _maintenanceMode = true;
-    _maintenanceCompleter = Completer<void>();
-    final bool ok = await _waitForQuiescent(timeout: timeout);
-    return ok;
+
+    final int deadline =
+        DateTime.now().millisecondsSinceEpoch + timeout.inMilliseconds;
+
+    // Drain existing locks without blocking further acquires by in-flight work.
+    // Callers should stop background producers (crontab writers) first.
+    while (true) {
+      final int remaining = deadline - DateTime.now().millisecondsSinceEpoch;
+      if (remaining <= 0) {
+        Logger.warn(
+          'enterMaintenance: quiescent wait timed out '
+          '(active=${_activeLocks.length}, ops=${_operationToRequest.length}, '
+          'queues=${_resourceQueues.length})',
+        );
+        return false;
+      }
+
+      final bool drained = await _waitForQuiescent(
+        timeout: Duration(milliseconds: remaining),
+      );
+      if (!drained) {
+        Logger.warn(
+          'enterMaintenance: quiescent wait timed out '
+          '(active=${_activeLocks.length}, ops=${_operationToRequest.length}, '
+          'queues=${_resourceQueues.length})',
+        );
+        return false;
+      }
+
+      _maintenanceMode = true;
+      _maintenanceCompleter = Completer<void>();
+
+      // Tiny race: a lock may sneak in between drain and arm. Drop barrier and retry.
+      if (_activeLocks.isEmpty &&
+          _operationToRequest.isEmpty &&
+          _resourceQueues.isEmpty) {
+        return true;
+      }
+      exitMaintenance();
+      await Future.delayed(const Duration(milliseconds: 10));
+    }
   }
 
   /// Exit maintenance mode and unblock waiting requests
@@ -361,13 +403,8 @@ class LockManager {
     }
     // Intercept during maintenance: user ops wait until maintenance ends;
     // system ops (e.g. migration) bypass and can acquire locks.
-    if (_maintenanceMode && !TransactionContext.isSystemOperation()) {
-      final c = _maintenanceCompleter;
-      if (c != null) {
-        try {
-          await c.future;
-        } catch (_) {}
-      }
+    if (!await _waitOutMaintenanceIfNeeded(operationId, 'shared')) {
+      return false;
     }
     return _acquireLock(resource, operationId, LockType.shared);
   }
@@ -381,15 +418,36 @@ class LockManager {
       return false;
     }
     // Intercept during maintenance: user ops wait; system ops (e.g. migration) bypass.
-    if (_maintenanceMode && !TransactionContext.isSystemOperation()) {
-      final c = _maintenanceCompleter;
-      if (c != null) {
-        try {
-          await c.future;
-        } catch (_) {}
-      }
+    if (!await _waitOutMaintenanceIfNeeded(operationId, 'exclusive')) {
+      return false;
     }
     return _acquireLock(resource, operationId, LockType.exclusive);
+  }
+
+  /// Wait for maintenance to end, with a hard timeout so close/switchSpace
+  /// cannot leave callers blocked forever when maintenance never exits.
+  Future<bool> _waitOutMaintenanceIfNeeded(
+      String operationId, String lockKind) async {
+    if (!_maintenanceMode || TransactionContext.isSystemOperation()) {
+      return true;
+    }
+    final c = _maintenanceCompleter;
+    if (c == null) {
+      return !_maintenanceMode;
+    }
+    try {
+      await c.future.timeout(Duration(milliseconds: baseLockTimeout));
+    } on TimeoutException {
+      Logger.warn(
+        'Timed out waiting for maintenance to end '
+        '($lockKind lock $operationId, timeout=${baseLockTimeout}ms)',
+      );
+      return false;
+    } catch (_) {}
+    if (_maintenanceMode && !TransactionContext.isSystemOperation()) {
+      return false;
+    }
+    return true;
   }
 
   /// Try to acquire a shared lock without waiting
