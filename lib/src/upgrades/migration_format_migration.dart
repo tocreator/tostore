@@ -90,7 +90,7 @@ final class MigrationFormatMigration {
         }
       }
       if (meta != null && hasJson) {
-        Logger.warn(
+        Logger.info(
           'MigrationFormatMigration: residual migration_meta.json found; '
           'deleting after TOBF verify',
         );
@@ -99,7 +99,7 @@ final class MigrationFormatMigration {
     }
 
     if (needRewriteFromJson) {
-      Logger.warn(
+      Logger.info(
         'MigrationFormatMigration: migrating migration_meta.json → .tobf',
       );
       meta = await _loadMetaJson(dataStore, jsonMeta);
@@ -367,7 +367,7 @@ final class MigrationFormatMigration {
 
     if (!needRewriteFromJson) return _TaskMigrateOutcome.ok;
 
-    Logger.warn(
+    Logger.info(
       'MigrationFormatMigration: migrating task_$taskId.json → .tobf',
     );
 
