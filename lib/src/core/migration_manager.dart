@@ -462,29 +462,83 @@ class MigrationManager {
   /// controller yet). Schema cutover is not interrupted mid-flight; the task
   /// exits at the next cooperative point so checkpoint resume remains valid.
   ///
+  /// Waits at most [MigrationConfig.stopTimeout] (default 60s) so close /
+  /// switchSpace cannot hang indefinitely when a task ignores cancel.
+  ///
   /// Scheduler cleanup is left to the caller ([DataStoreImpl.close] uses
   /// [BackgroundWriteScheduler.clearAll]).
   Future<void> stopAllMigrations() async {
+    final timeout = _dataStore.config.migrationConfig?.stopTimeout ??
+        const Duration(seconds: 60);
+    final deadline = DateTime.now().add(timeout);
+
+    Duration remaining() {
+      final left = deadline.difference(DateTime.now());
+      return left.isNegative ? Duration.zero : left;
+    }
+
     final spaces = {
       ..._activeControllers.keys,
       ..._activeSpaceMigrationTasks.keys,
       ..._activeMigrationInstances.keys,
     }.toList();
+
+    // Signal cancel on every space first so awaits below can observe it.
     for (final space in spaces) {
-      await stopMigrationForSpace(space);
+      _activeControllers[space]?.cancel();
+    }
+
+    for (final space in spaces) {
+      final left = remaining();
+      if (left == Duration.zero) {
+        Logger.warn(
+          'Migration stop budget exhausted before space [$space]; '
+          'force-clearing remaining state',
+        );
+        break;
+      }
+      await stopMigrationForSpace(space, timeout: left);
     }
 
     // Covers phases with no space controller (pre-cutover wait, cutover,
     // backup, between-space gaps). close() already set isBaseInitialized=false.
     final taskFuture = _activeTaskFuture;
     if (taskFuture != null) {
+      final left = remaining();
       try {
-        await taskFuture;
+        if (left == Duration.zero) {
+          Logger.warn(
+            'Migration task stop budget exhausted; '
+            'force-clearing in-memory migration state (checkpoints retained)',
+          );
+        } else {
+          await taskFuture.timeout(left);
+        }
+      } on TimeoutException {
+        Logger.warn(
+          'Migration task stop timed out after ${timeout.inSeconds}s; '
+          'force-clearing in-memory migration state (checkpoints retained)',
+        );
       } catch (e) {
         // Cooperative stop is expected on close — silent.
         if (e is! DbClosedException) {
           Logger.error('Failed to wait for migration task stop', rawError: e);
         }
+      }
+    }
+
+    // Force-close any migration instances left after budget exhaustion.
+    for (final entry in Map<String, DataStoreImpl>.from(
+      _activeMigrationInstances,
+    ).entries) {
+      if (entry.value == _dataStore) continue;
+      try {
+        await entry.value.close().timeout(const Duration(seconds: 5));
+      } catch (e) {
+        Logger.warn(
+          'Force-close migration instance for [${entry.key}] failed',
+          rawError: e,
+        );
       }
     }
 
@@ -495,10 +549,22 @@ class MigrationManager {
     _pendingTasks.clear();
     _runtimeMigrations.clear();
     _isProcessingTasks = false;
+    _activeExecutingTaskId = null;
+    _activeTaskFuture = null;
+    _activeControllers.clear();
+    _activeSpaceMigrationTasks.clear();
+    _activeMigrationInstances.clear();
   }
 
   /// Stop any active migration for a specific space (e.g. during space switch).
-  Future<void> stopMigrationForSpace(String spaceName) async {
+  Future<void> stopMigrationForSpace(
+    String spaceName, {
+    Duration? timeout,
+  }) async {
+    final effectiveTimeout = timeout ??
+        _dataStore.config.migrationConfig?.stopTimeout ??
+        const Duration(seconds: 60);
+
     final controller = _activeControllers[spaceName];
     if (controller != null) {
       controller.cancel();
@@ -509,7 +575,12 @@ class MigrationManager {
     final taskFuture = _activeSpaceMigrationTasks[spaceName];
     if (taskFuture != null) {
       try {
-        await taskFuture;
+        await taskFuture.timeout(effectiveTimeout);
+      } on TimeoutException {
+        Logger.warn(
+          'Space migration stop timed out for [$spaceName] after '
+          '${effectiveTimeout.inSeconds}s',
+        );
       } catch (e) {
         // Cooperative stop is expected — silent.
         if (e is! DbClosedException) {
@@ -522,7 +593,11 @@ class MigrationManager {
     final instance = _activeMigrationInstances[spaceName];
     if (instance != null && instance != _dataStore) {
       try {
-        await instance.close();
+        await instance.close().timeout(effectiveTimeout);
+      } on TimeoutException {
+        Logger.warn(
+          'Migration instance close timed out for space [$spaceName]',
+        );
       } catch (e) {
         Logger.error('Failed to close migration instance', rawError: e);
       }
@@ -4123,125 +4198,129 @@ class MigrationManager {
           success: true); // no task to process, consider as success
     }
 
-    _isProcessingTasks = true;
-    bool success = true; // track if all tasks are successful
-    final errors = <dynamic>[];
-    try {
-      // 1. Wait for primary instance recovery to complete before starting migration tasks.
-      // This prevents migration writes from conflicting with WAL replay or missing
-      // data that was about to be replayed.
-      await _dataStore.parallelJournalManager.waitUntilRecoveryCompleted();
-      _throwIfMigrationStopped();
-
-      while (_pendingTasks.isNotEmpty) {
+    // Run as system operation so close/switchSpace maintenance mode does not
+    // park migration lock acquisitions on the maintenance barrier forever.
+    return TransactionContext.runAsSystemOperation(() async {
+      _isProcessingTasks = true;
+      bool success = true; // track if all tasks are successful
+      final errors = <dynamic>[];
+      try {
+        // 1. Wait for primary instance recovery to complete before starting migration tasks.
+        // This prevents migration writes from conflicting with WAL replay or missing
+        // data that was about to be replayed.
+        await _dataStore.parallelJournalManager.waitUntilRecoveryCompleted();
         _throwIfMigrationStopped();
-        final task = _pendingTasks.first;
 
-        // Large-scale migration can run for a long time; keep a broad timeout
-        // only for deadlock/leak protection.
-        const taskTimeout = Duration(hours: 24);
-        try {
-          _activeExecutingTaskId = task.taskId;
-          _activeTaskFuture = _executeMigrationTask(task);
-          final completed = await _activeTaskFuture!
-              .then((_) => true)
-              .timeout(taskTimeout, onTimeout: () {
-            Logger.error(
-              'Task execution timed out: taskId=${task.taskId}, tableName=${task.tableName}',
-            );
+        while (_pendingTasks.isNotEmpty) {
+          _throwIfMigrationStopped();
+          final task = _pendingTasks.first;
 
-            // timeout consider as failed
+          // Large-scale migration can run for a long time; keep a broad timeout
+          // only for deadlock/leak protection.
+          const taskTimeout = Duration(hours: 24);
+          try {
+            _activeExecutingTaskId = task.taskId;
+            _activeTaskFuture = _executeMigrationTask(task);
+            final completed = await _activeTaskFuture!
+                .then((_) => true)
+                .timeout(taskTimeout, onTimeout: () {
+              Logger.error(
+                'Task execution timed out: taskId=${task.taskId}, tableName=${task.tableName}',
+              );
+
+              // timeout consider as failed
+              success = false;
+              errors.add(TimeoutException(
+                  'Migration task execution timed out for ${task.tableName}'));
+              // timeout not remove task, continue to execute next time
+              return false;
+            });
+
+            if (!completed) {
+              break;
+            }
+
+            // task completed successfully, remove and clean up
+            _pendingTasks.removeWhere((t) => t.taskId == task.taskId);
+            if (task.oldSchemaSnapshot?.schemaVersion != null) {
+              _schemaByVersion.remove(task.oldSchemaSnapshot!.schemaVersion!);
+            }
+            await _cleanupTask(task);
+            _unregisterRuntimeMigrationForTask(task);
+          } catch (e) {
+            if (e is DbClosedException) {
+              // Cooperative abort (clear/drop/reconcile) or datastore close.
+              // If conflict reconcile already removed this task, continue the
+              // queue; otherwise keep it for a later resume after close/re-open.
+              final stillQueued =
+                  _pendingTasks.any((t) => t.taskId == task.taskId);
+              if (!stillQueued && _pendingTasks.isNotEmpty) {
+                continue;
+              }
+              break;
+            }
+
+            Logger.error('Migration task execution failed', rawError: e);
+
+            // task execution failed
             success = false;
-            errors.add(TimeoutException(
-                'Migration task execution timed out for ${task.tableName}'));
-            // timeout not remove task, continue to execute next time
-            return false;
-          });
+            errors.add(e);
 
-          if (!completed) {
-            break;
-          }
+            final List<ResultStatus> newErrors = [];
+            if (e is DbException) {
+              newErrors.addAll(e.statuses);
+            } else {
+              newErrors.add(GeneralStatus(
+                type: ResultType.engError,
+                message: e.toString(),
+              ));
+            }
+            final updatedTask = task.copyWith(
+              errors: newErrors,
+            );
+            await _saveMigrationTask(updatedTask);
+            _updatePendingTaskInMemory(updatedTask);
 
-          // task completed successfully, remove and clean up
-          _pendingTasks.removeWhere((t) => t.taskId == task.taskId);
-          if (task.oldSchemaSnapshot?.schemaVersion != null) {
-            _schemaByVersion.remove(task.oldSchemaSnapshot!.schemaVersion!);
-          }
-          await _cleanupTask(task);
-          _unregisterRuntimeMigrationForTask(task);
-        } catch (e) {
-          if (e is DbClosedException) {
-            // Cooperative abort (clear/drop/reconcile) or datastore close.
-            // If conflict reconcile already removed this task, continue the
-            // queue; otherwise keep it for a later resume after close/re-open.
-            final stillQueued =
-                _pendingTasks.any((t) => t.taskId == task.taskId);
-            if (!stillQueued && _pendingTasks.isNotEmpty) {
-              continue;
+            // Keep the task on disk and in memory so startup / the next scheduler
+            // pass can retry idempotent cutover steps after a crash or transient error.
+            _unregisterRuntimeMigrationForTask(task);
+
+            if (e is DbException) {
+              final hasCritical = e.statuses.any((s) => s.type.isCriticalError);
+              if (hasCritical) {
+                rethrow;
+              }
             }
             break;
+          } finally {
+            _activeExecutingTaskId = null;
+            _activeTaskFuture = null;
           }
-
-          Logger.error('Migration task execution failed', rawError: e);
-
-          // task execution failed
-          success = false;
-          errors.add(e);
-
-          final List<ResultStatus> newErrors = [];
-          if (e is DbException) {
-            newErrors.addAll(e.statuses);
-          } else {
-            newErrors.add(GeneralStatus(
-              type: ResultType.engError,
-              message: e.toString(),
-            ));
-          }
-          final updatedTask = task.copyWith(
-            errors: newErrors,
-          );
-          await _saveMigrationTask(updatedTask);
-          _updatePendingTaskInMemory(updatedTask);
-
-          // Keep the task on disk and in memory so startup / the next scheduler
-          // pass can retry idempotent cutover steps after a crash or transient error.
-          _unregisterRuntimeMigrationForTask(task);
-
-          if (e is DbException) {
-            final hasCritical = e.statuses.any((s) => s.type.isCriticalError);
-            if (hasCritical) {
-              rethrow;
-            }
-          }
-          break;
-        } finally {
-          _activeExecutingTaskId = null;
-          _activeTaskFuture = null;
         }
-      }
 
-      await syncHasMigrationTask();
-    } catch (e) {
-      // Close/pause cooperative stop — silent, not a failure to surface.
-      if (e is DbClosedException) {
-        return MigrationTasksResult(success: false);
-      }
-      Logger.error('Process migration tasks failed', rawError: e);
-      success = false;
-      errors.add(e);
-      if (e is DbException) {
-        final hasCritical = e.statuses.any((s) => s.type.isCriticalError);
-        if (hasCritical) {
+        await syncHasMigrationTask();
+      } catch (e) {
+        // Close/pause cooperative stop — silent, not a failure to surface.
+        if (e is DbClosedException) {
+          return MigrationTasksResult(success: false);
+        }
+        Logger.error('Process migration tasks failed', rawError: e);
+        success = false;
+        errors.add(e);
+        if (e is DbException) {
+          final hasCritical = e.statuses.any((s) => s.type.isCriticalError);
+          if (hasCritical) {
+            rethrow;
+          }
+        } else {
           rethrow;
         }
-      } else {
-        rethrow;
+      } finally {
+        _isProcessingTasks = false;
       }
-    } finally {
-      _isProcessingTasks = false;
-    }
 
-    return MigrationTasksResult(success: success, errors: errors);
+      return MigrationTasksResult(success: success, errors: errors);
+    });
   }
 
   /// Execute single migration task across spaces
@@ -4517,6 +4596,11 @@ class MigrationManager {
               Logger.info(
                 'Skip migration for table [$originalTableName] in space [$space]: table mapping not found',
               );
+              // Still clear this space from the task — otherwise pendingSpaces
+              // never drains and the task can never complete.
+              currentTask = currentTask.removePendingSpace(space);
+              await _saveMigrationTask(currentTask);
+              _updatePendingTaskInMemory(currentTask);
               return;
             }
 
@@ -4524,16 +4608,13 @@ class MigrationManager {
             if (cutover != null) {
               // Wait until the WAL checkpoint advances past schemaCutoverWalPointer.
               // This ensures all buffered legacy-shape writes are safely flushed to disk.
-              while (!_dataStore.walManager.isAtOrBefore(
-                  cutover, _dataStore.walManager.meta.checkpoint)) {
-                if (migrationController.isCancelled ||
-                    !_dataStore.isBaseInitialized) {
-                  throw DbClosedException(
-                    'Migration stopped while waiting for WAL cutover in space [$space]',
-                  );
-                }
-                await Future.delayed(const Duration(milliseconds: 100));
-              }
+              // Actively drain WAL/journal — a pure poll can hang forever when nothing
+              // else schedules flush (idle buffer + crontab only watches bg scheduler).
+              await _waitForWalCutover(
+                cutover: cutover,
+                spaceName: space,
+                migrationController: migrationController,
+              );
             }
 
             final migrationTableCtx =
@@ -4885,6 +4966,110 @@ class MigrationManager {
       rethrow;
     } finally {
       _activeTaskProgressCallback = null;
+    }
+  }
+
+  /// Wait until WAL [checkpoint] has caught up to [cutover], actively draining
+  /// queues so idle databases cannot poll forever.
+  Future<void> _waitForWalCutover({
+    required WalPointer cutover,
+    required String spaceName,
+    required CancellationToken migrationController,
+  }) async {
+    final wal = _dataStore.walManager;
+
+    // Journal disabled: cutover/currentPointer stay on in-memory seq space while
+    // checkpoints are not advanced — waiting is meaningless.
+    if (!_dataStore.config.enableJournal) {
+      await _forceDrainWalAndJournal();
+      return;
+    }
+
+    // Pseudo cutover should not block.
+    if (cutover.partitionIndex < 0) {
+      await _forceDrainWalAndJournal();
+      return;
+    }
+
+    // Heal in-memory poisoned checkpoint (legacy bg-only flush sentinel).
+    if (wal.meta.checkpoint.partitionIndex < 0) {
+      Logger.warn(
+        'Healing poisoned WAL checkpoint ${wal.meta.checkpoint} before '
+        'cutover wait in space [$spaceName]',
+      );
+      await _forceDrainWalAndJournal();
+      final healTo = wal.currentPointer.partitionIndex >= 0
+          ? wal.currentPointer
+          : const WalPointer(partitionIndex: 0, entrySeq: 0);
+      await wal.advanceCheckpoint(healTo);
+    }
+
+    if (wal.isAtOrBefore(cutover, wal.meta.checkpoint)) {
+      return;
+    }
+
+    final timeout = _dataStore.config.migrationConfig?.stopTimeout ??
+        const Duration(seconds: 60);
+    final deadline = DateTime.now().add(timeout);
+
+    while (!wal.isAtOrBefore(cutover, wal.meta.checkpoint)) {
+      if (migrationController.isCancelled || !_dataStore.isBaseInitialized) {
+        throw DbClosedException(
+          'Migration stopped while waiting for WAL cutover in space [$spaceName]',
+        );
+      }
+
+      if (DateTime.now().isAfter(deadline)) {
+        Logger.warn(
+          'WAL cutover wait timed out in space [$spaceName]: '
+          'cutover=$cutover checkpoint=${wal.meta.checkpoint}. '
+          'Proceeding after final force flush (buffers idle gap).',
+        );
+        await _forceDrainWalAndJournal();
+        break;
+      }
+
+      await _forceDrainWalAndJournal();
+
+      if (wal.isAtOrBefore(cutover, wal.meta.checkpoint)) {
+        break;
+      }
+
+      // Nothing left in WAL / pending batches but checkpoint still behind:
+      // yield briefly then retry until timeout forces progress.
+      final idle =
+          !wal.hasPendingParallelBatches && wal.pendingQueueLength == 0;
+      await Future.delayed(
+        Duration(milliseconds: idle ? 50 : 20),
+      );
+    }
+
+    if (!wal.isAtOrBefore(cutover, wal.meta.checkpoint)) {
+      Logger.warn(
+        'WAL cutover not confirmed in space [$spaceName] after wait: '
+        'cutover=$cutover checkpoint=${wal.meta.checkpoint}',
+      );
+    }
+  }
+
+  Future<void> _forceDrainWalAndJournal() async {
+    try {
+      await _dataStore.walManager
+          .flushQueueCompletely()
+          .timeout(const Duration(seconds: 15));
+    } on TimeoutException {
+      Logger.warn('WAL queue drain timed out during cutover wait');
+    } catch (e) {
+      Logger.warn('WAL queue drain failed during cutover wait', rawError: e);
+    }
+    try {
+      await _dataStore.parallelJournalManager
+          .flushCompletely()
+          .timeout(const Duration(seconds: 15));
+    } on TimeoutException {
+      Logger.warn('Journal flush timed out during cutover wait');
+    } catch (e) {
+      Logger.warn('Journal flush failed during cutover wait', rawError: e);
     }
   }
 
