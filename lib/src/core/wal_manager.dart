@@ -703,6 +703,19 @@ class WalManager {
         // 3) If both primary and backup are unusable, start with fresh meta
         _meta = loaded ?? WalMeta.initial(startPartitionIndex: 0);
 
+        // Heal checkpoint poisoned by legacy bg-only flushes (sentinel -1).
+        if (_meta.checkpoint.partitionIndex < 0) {
+          Logger.warn(
+            'Healing poisoned WAL checkpoint ${_meta.checkpoint} → (0,0)',
+          );
+          _meta = _meta.copyWith(
+            checkpoint: const WalPointer(partitionIndex: 0, entrySeq: 0),
+          );
+          try {
+            await persistMeta(flush: true);
+          } catch (_) {}
+        }
+
         // Heal primary meta after successfully recovering from backup.
         // Also persist if we loaded a meta but it wasn't valid (implicit heal?)
         // If recovered using backup, force write to primary
@@ -1008,6 +1021,14 @@ class WalManager {
 
   /// Advance checkpoint after a batch has been safely flushed to data files.
   Future<void> advanceCheckpoint(WalPointer pointer) async {
+    // Pseudo pointers (partitionIndex < 0) are used for journal-disabled / bg-only
+    // batches and must never poison the durable checkpoint.
+    if (pointer.partitionIndex < 0) {
+      Logger.warn(
+        'Ignoring advanceCheckpoint with pseudo WAL pointer $pointer',
+      );
+      return;
+    }
     _meta.checkpoint = pointer;
     // After advancing checkpoint, remove table-level ops whose cutoff is
     // older than or equal to the new checkpoint; they can no longer affect
