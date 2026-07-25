@@ -1,6 +1,9 @@
 import 'dart:async';
 import 'dart:math';
 
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import 'logger.dart';
 
 /// A controller to manage and stop parallel tasks.
@@ -130,8 +133,12 @@ class ParallelProcessor {
         var future = tasks[index]();
         if (effectiveTimeout != null) {
           future = future.timeout(effectiveTimeout, onTimeout: () {
-            throw TimeoutException(
-                'Task timed out after $effectiveTimeout', effectiveTimeout);
+            throw DbException([
+              GeneralStatus(
+                type: ResultType.sysTimeout,
+                message: 'Parallel task timed out after $effectiveTimeout',
+              ),
+            ]);
           });
         }
 
