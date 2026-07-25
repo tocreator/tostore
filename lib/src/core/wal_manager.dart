@@ -471,9 +471,9 @@ class WalManager {
   WalPointer _appended = const WalPointer(partitionIndex: 0, entrySeq: 0);
   bool _initialized = false;
   Future<void>? _initFuture;
-  // Approximate size (in characters) of the current WAL partition file.
-  // Initialized lazily from storage on first append, then maintained purely
-  // in memory to avoid per-append getFileSize() calls.
+  // Approximate size in bytes of the current WAL partition file (encoded
+  // binary length on disk). Initialized lazily from storage on first append,
+  // then maintained in memory to avoid per-append getFileSize() calls.
   int _currentPartitionSizeApprox = 0;
   bool _currentPartitionSizeLoaded = false;
 
@@ -819,6 +819,46 @@ class WalManager {
     return currentDir;
   }
 
+  /// Rotate before assigning path/seq when the active partition already meets
+  /// [DataStoreConfig.maxLogPartitionFileSize], so new entries land on a
+  /// writable partition instead of growing an already-full file.
+  Future<void> _ensureWritablePartition() async {
+    if (!_currentPartitionSizeLoaded) {
+      await _ensureCurrentPartitionSizeLoaded();
+    }
+    if (_currentPartitionSizeApprox >= _config.maxLogPartitionFileSize) {
+      await _rotatePartition();
+    }
+  }
+
+  /// Hard + predictive rotation after a flush batch lands on disk.
+  ///
+  /// - Hard: current partition encoded size already >= limit.
+  /// - Predictive: remaining queue for this partition would push us over;
+  ///   rotate so subsequent [append]/[appendBatch] use the next file.
+  /// Already-queued entries keep their assigned path/p/seq (soft overrun).
+  Future<void> _maybeRotateAfterAppend({
+    required int writtenBytes,
+    required int entryCount,
+    required bool wroteToCurrentPartition,
+  }) async {
+    if (wroteToCurrentPartition &&
+        _currentPartitionSizeApprox >= _config.maxLogPartitionFileSize) {
+      await _rotatePartition();
+      return;
+    }
+    if (entryCount <= 0 || _walQueue.isEmpty) return;
+    if (_walQueue.first.pointer.partitionIndex != _current.partitionIndex) {
+      return;
+    }
+    final int avgSize = (writtenBytes / entryCount).ceil();
+    final int estimatedBacklog = _walQueue.length * avgSize;
+    if (_currentPartitionSizeApprox + estimatedBacklog >
+        _config.maxLogPartitionFileSize) {
+      await _rotatePartition();
+    }
+  }
+
   /// Append one WAL entry. Returns its pointer.
   Future<WalPointer> append(Map<String, dynamic> walEntry) async {
     if (!_initialized) {
@@ -834,6 +874,8 @@ class WalManager {
       );
       return WalPointer(partitionIndex: -1, entrySeq: _current.entrySeq);
     }
+
+    await _ensureWritablePartition();
 
     final pIdx = _current.partitionIndex;
     final nextSeq = _current.entrySeq + 1;
@@ -905,18 +947,45 @@ class WalManager {
       return result;
     }
 
-    final int pIdx = _current.partitionIndex;
-    final int dirIndex = _getOrAllocateDirIndexForPartition(pIdx);
-    final String path = _dataStore.pathManager.getWalPartitionLogPath(
+    await _ensureWritablePartition();
+
+    int pIdx = _current.partitionIndex;
+    int dirIndex = _getOrAllocateDirIndexForPartition(pIdx);
+    String path = _dataStore.pathManager.getWalPartitionLogPath(
       dirIndex,
       pIdx,
       spaceName: _dataStore.currentSpaceName,
     );
 
+    // Publish range before the yield loop so a concurrent flush rotate cannot
+    // treat existingStart as uninitialized and drop the first partition.
+    if (_meta.existingStartPartitionIndex < 0 ||
+        _meta.existingEndPartitionIndex < 0) {
+      _meta.existingStartPartitionIndex = pIdx;
+      _meta.existingEndPartitionIndex = pIdx;
+      persistMeta(flush: false);
+    }
+
     final yieldController = YieldController('WalManager.appendBatch');
     final List<WalPointer> pointers = [];
     for (final entry in walEntries) {
       await yieldController.maybeYield();
+      // Flush may hard-rotate while we yielded. Re-bind path/seq to the live
+      // partition — never overwrite _current back onto a retired partition.
+      if (_current.partitionIndex != pIdx ||
+          _currentPartitionSizeApprox >= _config.maxLogPartitionFileSize) {
+        await _ensureWritablePartition();
+        if (_current.partitionIndex != pIdx) {
+          pIdx = _current.partitionIndex;
+          dirIndex = _getOrAllocateDirIndexForPartition(pIdx);
+          path = _dataStore.pathManager.getWalPartitionLogPath(
+            dirIndex,
+            pIdx,
+            spaceName: _dataStore.currentSpaceName,
+          );
+        }
+      }
+
       final int nextSeq = _current.entrySeq + 1;
       _current = WalPointer(partitionIndex: pIdx, entrySeq: nextSeq);
 
@@ -932,15 +1001,6 @@ class WalManager {
       ));
 
       pointers.add(_current);
-    }
-
-    // Initialize existing partition range on first write
-    if (_meta.existingStartPartitionIndex < 0 ||
-        _meta.existingEndPartitionIndex < 0) {
-      _meta.existingStartPartitionIndex = pIdx;
-      _meta.existingEndPartitionIndex = pIdx;
-      // We can persist update meta asynchronously
-      persistMeta(flush: false);
     }
 
     return pointers;
@@ -1223,42 +1283,27 @@ class WalManager {
             offset += chunk.length;
           }
 
+          bool wroteToCurrentPartition = false;
           try {
             await _dataStore.storage.appendBytes(path, combined, flush: false);
 
-            // Correct the approximate size in memory with actual encoded size
-            // Check if we are writing to the current active partition
-            final currentPIdx = _current.partitionIndex;
-            // Cheap check: path ends with partition index specific suffix or compare full path
-            // To be safe and efficient, we recreate the current path.
-            final cDir = _getPartitionDirIndexForExistingPartition(currentPIdx);
-            if (cDir != null) {
-              final cPath = _dataStore.pathManager.getWalPartitionLogPath(
-                  cDir, currentPIdx,
-                  spaceName: _dataStore.currentSpaceName);
-              if (path == cPath) {
-                _currentPartitionSizeApprox += combined.length;
-              }
+            // Track encoded byte size for the active partition only. Prefer
+            // embedded partition index over path rebuild (mapping-safe).
+            final writeP =
+                rawEntries.isNotEmpty ? rawEntries.first['p'] as int? : null;
+            if (writeP != null && writeP == _current.partitionIndex) {
+              _currentPartitionSizeApprox += combined.length;
+              wroteToCurrentPartition = true;
             }
           } catch (e) {
             Logger.error('WAL append batch failed', rawError: e);
           }
 
-          // Predictive Rotation Logic (Moved inside loop to access rawEntries/combined)
-          if (rawEntries.isNotEmpty) {
-            final int avgSize = (combined.length / rawEntries.length).ceil();
-
-            // Only attempt predictive rotation if the queue is exclusively for the current partition.
-            if (_walQueue.isNotEmpty &&
-                _walQueue.first.pointer.partitionIndex ==
-                    _current.partitionIndex) {
-              final int estimatedBacklog = _walQueue.length * avgSize;
-              if (_currentPartitionSizeApprox + estimatedBacklog >
-                  _config.maxLogPartitionFileSize) {
-                await _rotatePartition();
-              }
-            }
-          }
+          await _maybeRotateAfterAppend(
+            writtenBytes: combined.length,
+            entryCount: rawEntries.length,
+            wroteToCurrentPartition: wroteToCurrentPartition,
+          );
         }
 
         // Update appended pointer after this batch.
@@ -1476,7 +1521,8 @@ class WalManager {
   }
 
   /// Force rotation of the current partition.
-  /// Called by the flush loop when checking partition size limits.
+  /// Called when the active partition meets [DataStoreConfig.maxLogPartitionFileSize]
+  /// (hard threshold) or when predictive backlog would exceed it.
   Future<void> _rotatePartition() async {
     final pIdx = _current.partitionIndex;
     final dirIndex = _getOrAllocateDirIndexForPartition(pIdx);
@@ -1489,10 +1535,17 @@ class WalManager {
     // Move to next partition with cycle
     final next = (_current.partitionIndex + 1) % _config.logPartitionCycle;
     _current = WalPointer(partitionIndex: next, entrySeq: 0);
+    // Reset size BEFORE any await. Otherwise a concurrent append's
+    // _ensureWritablePartition can still observe the old partition's byte
+    // count against the new _current and double-rotate.
+    _currentPartitionSizeApprox = 0;
+    _currentPartitionSizeLoaded = true;
 
-    // Update existing partition range [start..end] under cycle
+    // Update existing partition range [start..end] under cycle.
+    // When range was still uninitialized, keep the partition we just left
+    // so recovery can still find its data.
     if (_meta.existingStartPartitionIndex == -1) {
-      _meta.existingStartPartitionIndex = next;
+      _meta.existingStartPartitionIndex = pIdx;
       _meta.existingEndPartitionIndex = next;
     } else {
       // advance end; if overlaps start, advance start by one (drop oldest)
@@ -1523,10 +1576,6 @@ class WalManager {
     try {
       await _dataStore.storage.flushAll(path: path, closeHandles: true);
     } catch (_) {}
-
-    // Reset in-memory size approximation for the new active partition.
-    _currentPartitionSizeApprox = 0;
-    _currentPartitionSizeLoaded = true;
   }
 
   Future<void> persistMeta({bool flush = false, bool backupOld = false}) async {
