@@ -596,14 +596,20 @@ class TableMetaManager {
     }
   }
 
-  /// Replace the current-space active non-global UID inventory and persist.
+  /// Replace the current-space active non-global UID inventory.
   ///
   /// Used by upgrades that rebuild the inventory in bulk.
-  Future<void> replaceActiveTableUids(Iterable<TableUid> uids) async {
+  /// When [persist] is false, only memory is updated (caller durably writes).
+  Future<void> replaceActiveTableUids(
+    Iterable<TableUid> uids, {
+    bool persist = true,
+  }) async {
     _spaceManifest = SpaceManifest(
       activeTableUids: Set<TableUid>.of(uids.where((u) => u.isNotEmpty)),
     );
-    await saveSpaceManifest();
+    if (persist) {
+      await saveSpaceManifest();
+    }
   }
 
   /// Raw non-global active UIDs from the space manifest (no globals).

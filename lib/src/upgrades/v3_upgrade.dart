@@ -7,14 +7,17 @@ import '../core/wal_manager.dart';
 import '../handler/common.dart';
 import '../handler/logger.dart';
 import '../handler/meta_binary_codec.dart';
+import '../handler/table_meta_codec.dart';
 import '../model/db_exception.dart';
 import '../model/global_config.dart';
 import '../model/parallel_journal_entry.dart';
+import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/system_table.dart';
 import '../model/table_schema.dart';
 import '../model/table_identity.dart';
 import '../model/table_meta.dart';
+import '../model/table_context.dart';
 import '../model/meta_info.dart';
 import '../model/ngh_index_meta.dart';
 import '../handler/space_manifest_codec.dart';
@@ -33,7 +36,7 @@ import 'weight_format_migration.dart';
 ///   renames directories to stable UIDs (no SchemaMeta/routes rewrite).
 /// - Restructures storage directory names from physical table/index names to stable UIDs.
 /// - Primes [GlobalConfig.pageSize] (sample legacy meta.json / default) before
-///   bootstrap createTable so index page0 writes never see pageSize=0.
+///   bootstrap so index page0 writes never see pageSize=0.
 /// - Reads legacy meta.json once, writes TableDataMeta/IndexMeta/NghIndexMeta into
 ///   partition-0 page0, then deletes the JSON files (no intermediate JSON rewrite).
 /// - Writes per-space [SpaceManifest] into `_system_internal_kv_store`
@@ -437,31 +440,128 @@ class V3Upgrade {
 
   /// Create `_system_table_meta` + engine-internal KV (space + global).
   Future<void> _ensureBootstrapSystemTables() async {
+    await _dataStore.keyManager.initialize();
+
+    final pendingDurable = <TableMeta>[];
     for (final schema in [
       SystemTable.tableMetaTable(),
       SystemTable.internalKVTable(false),
       SystemTable.internalKVTable(true),
     ]) {
-      if (await _dataStore.tableExists(schema.name)) continue;
-
-      final result = await _dataStore.createTable(schema, isSystemTable: true);
-      if (!result.hasErrors) continue;
-
-      final fatal = result.statuses
-          .where((s) =>
-              s.type != ResultType.success &&
-              s.type != ResultType.devSchemaTableExists)
-          .toList();
-      if (fatal.isNotEmpty) {
-        throw DbException(fatal);
+      final created = await _bootstrapSystemTableMemoryAndShells(schema);
+      if (created != null) {
+        pendingDurable.add(created);
       }
     }
+
+    await _durablyPersistTableMetaRows(pendingDurable);
+  }
+
+  /// Memory-only [TableMeta] + empty index page0. Returns meta when newly
+  /// created in this pass (caller must durably write); `null` if already exists.
+  Future<TableMeta?> _bootstrapSystemTableMemoryAndShells(
+    TableSchema schema,
+  ) async {
+    if (await _dataStore.tableExists(schema.name)) {
+      return null;
+    }
+
+    final schemaMgr = _dataStore.tableMetaManager;
+    if (schemaMgr == null) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'tableMetaManager unavailable during v3 bootstrap',
+        ),
+      ]);
+    }
+
+    final tableSchema = schema.materializeForCreate(isSystemTable: true);
+    final isTableMeta = SystemTable.isTableMetaTable(tableSchema.name);
+    final dirIndex = isTableMeta
+        ? SystemTable.tableMetaDirIndex
+        : await schemaMgr.allocateDirIndex(tableSchema.isGlobal);
+    final layout = schemaMgr.evolveFieldStorageLayout(nextSchema: tableSchema);
+    final now = DateTime.now();
+    final saved = await schemaMgr.saveTableMeta(
+      TableMeta(
+        tableUid: tableSchema.tableUid,
+        tableName: TableName(tableSchema.name),
+        isGlobal: tableSchema.isGlobal,
+        schema: tableSchema,
+        fieldLayout: layout,
+        dirIndex: dirIndex,
+        createdAt: now,
+        updatedAt: now,
+      ),
+      memoryOnly: true,
+      dirIndex: dirIndex,
+      layoutOverride: layout,
+    );
+
+    final tableCtx = TableContext(
+      tableUid: saved.tableUid,
+      tableName: saved.tableName,
+      isGlobal: saved.isGlobal,
+      dirIndex: saved.dirIndex,
+      schema: saved.schema,
+    );
+    final btreeIndexes = schemaMgr.getBtreeIndexesFor(saved.schema);
+    await _dataStore.indexManager?.initializeEmptyTableIndexes(
+      tableCtx,
+      btreeIndexes,
+      tableSchemaOverride: saved.schema,
+    );
+    _dataStore.tableDataManager.tableCreated(tableCtx);
+    return saved;
+  }
+
+  /// Insert missing `_system_table_meta` rows (+ secondary indexes) on disk.
+  ///
+  /// Idempotent: skips UIDs already present in partition files (crash resume).
+  /// Does not touch WriteBuffer (avoids double-apply after journal starts).
+  Future<void> _durablyPersistTableMetaRows(List<TableMeta> metas) async {
+    if (metas.isEmpty) return;
+
+    final schemaMgr = _dataStore.tableMetaManager;
+    if (schemaMgr == null) return;
+
+    final ctx = schemaMgr.bootstrapTableMetaContext();
+    final pks = metas.map((m) => m.tableUid.value).toList(growable: false);
+    final existing = await _dataStore.tableDataManager.queryRecordsBatch(
+      ctx,
+      pks,
+      readFromFileOnly: true,
+    );
+    final existingKeys = <String>{};
+    for (final row in existing.records) {
+      final uid = row[SystemTable.tableMetaUidField]?.toString();
+      if (uid != null && uid.isNotEmpty) {
+        existingKeys.add(uid);
+      }
+    }
+
+    final inserts = <Map<String, dynamic>>[];
+    for (final meta in metas) {
+      if (existingKeys.contains(meta.tableUid.value)) continue;
+      inserts.add(TableMetaCodec.encodeRow(meta));
+    }
+    if (inserts.isEmpty) return;
+
+    await _dataStore.tableDataManager.writeChanges(
+      table: ctx,
+      inserts: inserts,
+      recordCountInsertDelta: inserts.length,
+    );
+    await _dataStore.indexManager?.writeChanges(
+      table: ctx,
+      inserts: inserts,
+    );
   }
 
   /// Persist [SpaceManifest] for [spaceName] via internal KV (`isGlobal: false`).
   ///
-  /// Current space writes on the primary instance; other spaces use a short-lived
-  /// migration [DataStoreImpl] (skips version upgrades) so paths bind correctly.
+  /// Uses durable [writeChanges] (journal may not be running on the primary).
   Future<void> _writeSpaceManifest(
     String spaceName,
     Set<TableUid> activeTableUids,
