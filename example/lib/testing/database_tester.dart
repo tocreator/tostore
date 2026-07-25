@@ -937,14 +937,23 @@ class DatabaseTester {
   }
 
   Future<void> _waitForMigrationTask(ToStore testDb, String taskId) async {
-    final timeout = DateTime.now().add(const Duration(seconds: 15));
-    while (DateTime.now().isBefore(timeout)) {
-      final status = await testDb.queryMigrationTaskStatus(taskId);
-      if (status != null && status.isCompleted) {
-        break;
+    const timeout = Duration(seconds: 120);
+    final deadline = DateTime.now().add(timeout);
+    MigrationStatus? lastStatus;
+    while (DateTime.now().isBefore(deadline)) {
+      lastStatus = await testDb.queryMigrationTaskStatus(taskId);
+      if (lastStatus != null && lastStatus.isCompleted) {
+        return;
       }
       await Future.delayed(const Duration(milliseconds: 50));
     }
+    throw TimeoutException(
+      'Migration task $taskId not completed within ${timeout.inSeconds}s. '
+      'lastStatus: isCompleted=${lastStatus?.isCompleted}, '
+      'pendingSpaces=${lastStatus?.pendingSpaces}, '
+      'processed=${lastStatus?.processedSpacesCount}/'
+      '${lastStatus?.totalSpacesCount}',
+    );
   }
 
   /// CRITICAL TEST: Verifies that complex runtime schema migration (using db.updateSchema and db.createTables)
@@ -1361,7 +1370,14 @@ class DatabaseTester {
             false);
       }
 
-      // 15. Switch space to check multi-space migration correctness
+      // 15. Re-confirm migrations finished, then switch space
+      if (taskIdA != null) {
+        await _waitForMigrationTask(testDb, taskIdA);
+      }
+      if (taskIdB != null) {
+        await _waitForMigrationTask(testDb, taskIdB);
+      }
+
       final switchedToTestSpaceAgain =
           await testDb.switchSpace(spaceName: 'test_space');
       isTestPassed &= _expect('Switching back to test_space should succeed',
