@@ -482,6 +482,11 @@ class WalManager {
   bool _walFlushInProgress = false;
   Future<void>? _walFlushFuture;
 
+  // When set (flushQueueCompletely / close / switchSpace), skip online WAL
+  // tail delays and wake any in-flight wait so drain can proceed immediately.
+  bool _immediateFlushRequested = false;
+  Completer<void>? _walTailWaitWake;
+
   // Directory mapping cache
   DirectoryMapping? _directoryMapping;
   int _currentPartitionDirIndex = 0;
@@ -1219,6 +1224,19 @@ class WalManager {
     _currentPartitionSizeApprox = 0;
   }
 
+  /// Interrupt online WAL tail delay so close/switchSpace/flush can drain now.
+  void _requestImmediateFlush() {
+    _immediateFlushRequested = true;
+    final wake = _walTailWaitWake;
+    if (wake != null && !wake.isCompleted) {
+      wake.complete();
+    }
+  }
+
+  void _clearImmediateFlushRequest() {
+    _immediateFlushRequested = false;
+  }
+
   /// Schedule a background WAL flush if not already running.
   void scheduleFlushIfNeeded() {
     if (!_config.enableJournal) return;
@@ -1252,14 +1270,26 @@ class WalManager {
       bool firstIteration = true;
 
       while (_walQueue.isNotEmpty) {
-        if (!firstIteration && !drainCompletely) {
+        if (!firstIteration && !drainCompletely && !_immediateFlushRequested) {
           final int remaining = _walQueue.length;
           if (remaining < minTail) {
             // For small tails, wait a short delay based on recoveryFlushPolicy
             // before flushing, to avoid writing every tiny batch immediately.
+            // Interruptible when close/switchSpace requests immediate drain.
             final int delayMs = _walTailDelayMs();
             if (delayMs > 0) {
-              await Future.delayed(Duration(milliseconds: delayMs));
+              final wake = Completer<void>();
+              _walTailWaitWake = wake;
+              try {
+                await Future.any<void>([
+                  Future<void>.delayed(Duration(milliseconds: delayMs)),
+                  wake.future,
+                ]);
+              } finally {
+                if (identical(_walTailWaitWake, wake)) {
+                  _walTailWaitWake = null;
+                }
+              }
             }
           }
         }
@@ -1360,6 +1390,8 @@ class WalManager {
   /// Flush all pending WAL entries in the queue (drain mode).
   Future<void> flushQueueCompletely() async {
     if (!_config.enableJournal) return;
+    // Wake any in-flight online WAL tail wait before awaiting that pump.
+    _requestImmediateFlush();
     // Wait for any in-flight WAL flush first.
     final existing = _walFlushFuture;
     if (existing != null) {
@@ -1368,7 +1400,11 @@ class WalManager {
       } catch (_) {}
     }
     // Run drain-mode pump.
-    await _pumpWalFlush(drainCompletely: true);
+    try {
+      await _pumpWalFlush(drainCompletely: true);
+    } finally {
+      _clearImmediateFlushRequest();
+    }
   }
 
   /// Lazily initialize the approximate size for the current WAL partition

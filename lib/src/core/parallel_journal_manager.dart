@@ -45,6 +45,11 @@ class ParallelJournalManager {
   BatchContext? _activeBatchContext;
   bool _isRecovering = false; // Flag to indicate if currently in recovery mode
 
+  // When set (close / switchSpace / flushCompletely), skip online tail-fill
+  // delays and wake any in-flight wait so drain can proceed immediately.
+  bool _immediateFlushRequested = false;
+  Completer<void>? _tailWaitWake;
+
   // ── Write backpressure (measurement-based) ──
   // Measured per-record flush cost from the last completed batch (microseconds).
   int _perRecordFlushUs = 0;
@@ -55,6 +60,19 @@ class ParallelJournalManager {
   /// Minimum total delay (us) below which we skip the await entirely
   /// to avoid micro-delay overhead. 1000us = 1ms.
   static const int _kMinThrottleDelayUs = 1000;
+
+  /// Interrupt online tail-fill wait so close/switchSpace/flush can drain now.
+  void _requestImmediateFlush() {
+    _immediateFlushRequested = true;
+    final wake = _tailWaitWake;
+    if (wake != null && !wake.isCompleted) {
+      wake.complete();
+    }
+  }
+
+  void _clearImmediateFlushRequest() {
+    _immediateFlushRequested = false;
+  }
 
   ParallelJournalManager(
       this._dataStore, this._walManager, this._bufferManager);
@@ -193,10 +211,16 @@ class ParallelJournalManager {
   Future<void> flushCompletely() async {
     if (!_running) return;
 
+    // Wake any in-flight online tail wait before awaiting that pump.
+    _requestImmediateFlush();
+
     // Drain must not silently no-op while recovery holds the flush gate.
     if (_isRecovering) {
       await waitUntilRecoveryCompleted();
-      if (!_running) return;
+      if (!_running) {
+        _clearImmediateFlushRequest();
+        return;
+      }
     }
 
     // Wait for any in-flight flush first to avoid overlapping pumps.
@@ -216,6 +240,7 @@ class ParallelJournalManager {
     } finally {
       _flushInProgress = false;
       _loopFuture = null;
+      _clearImmediateFlushRequest();
     }
   }
 
@@ -230,6 +255,9 @@ class ParallelJournalManager {
     if (!_running && _bufferManager.isEmpty) {
       return;
     }
+
+    // Wake any in-flight online tail wait before awaiting that pump.
+    _requestImmediateFlush();
 
     // Close the trigger, avoid being triggered again by sizeStream
     try {
@@ -258,6 +286,7 @@ class ParallelJournalManager {
       _throttleDelayPerRecordUs = 0;
       _activeBatchContext = null;
       _isRecovering = false;
+      _clearImmediateFlushRequest();
     }
   }
 
@@ -281,6 +310,9 @@ class ParallelJournalManager {
       return;
     }
 
+    // Wake tail wait so stop is not blocked by maxFlushLatencyMs windows.
+    _requestImmediateFlush();
+
     try {
       // Prevent new flush scheduling
       _running = false;
@@ -301,6 +333,7 @@ class ParallelJournalManager {
       _loopFuture = null;
       _flushInProgress = false;
       _activeBatchContext = null;
+      _clearImmediateFlushRequest();
       // Drop all pending buffered writes; caller has decided not to persist these data
       _bufferManager.clearAll();
     }
@@ -329,6 +362,8 @@ class ParallelJournalManager {
   /// - If the queue grows during the wait but still doesn't reach [targetSize],
   ///   wait another window (up to [maxExtraRounds] times).
   /// - If the queue does not grow, return quickly so we flush the tail.
+  /// - If [_immediateFlushRequested] (close / switchSpace / flush), return
+  ///   immediately; the wait is interruptible via [_tailWaitWake].
   ///
   /// This matches "keep waiting 5s while data keeps arriving" for mobile,
   /// without starving durability indefinitely.
@@ -337,12 +372,14 @@ class ParallelJournalManager {
     required int delayMs,
     int maxExtraRounds = 5,
   }) async {
+    if (_immediateFlushRequested) return;
     if (delayMs <= 0) return;
     if (_bufferManager.queueLength >= targetSize) return;
     if (maxExtraRounds < 0) maxExtraRounds = 0;
 
     int rounds = 0;
     while (true) {
+      if (_immediateFlushRequested) return;
       final before = _bufferManager.queueLength;
       if (before >= targetSize) return;
       if (before <= 0) return;
@@ -351,7 +388,19 @@ class ParallelJournalManager {
       // (e.g. tests with maxFlushLatencyMs=100); keep up to 1s for energy-saving defaults.
       final windowMs =
           rounds == 0 ? (delayMs < 1000 ? delayMs : 1000) : delayMs;
-      await Future.delayed(Duration(milliseconds: windowMs));
+      final wake = Completer<void>();
+      _tailWaitWake = wake;
+      try {
+        await Future.any<void>([
+          Future<void>.delayed(Duration(milliseconds: windowMs)),
+          wake.future,
+        ]);
+      } finally {
+        if (identical(_tailWaitWake, wake)) {
+          _tailWaitWake = null;
+        }
+      }
+      if (_immediateFlushRequested) return;
 
       final after = _bufferManager.queueLength;
       if (after >= targetSize) return;
@@ -418,8 +467,9 @@ class ParallelJournalManager {
         // After the first iteration, if the queue length drops below batchSize in normal mode,
         // wait up to maxFlushLatencyMs before flushing the remaining tail, to avoid flushing
         // every tiny batch immediately while still bounding latency.
-        // In drain mode (close/switch space), ignore this and ensure the queue is fully flushed.
-        if (!drainCompletely) {
+        // In drain mode (close/switch space) or when immediate flush is requested,
+        // ignore this and ensure the queue is fully flushed.
+        if (!drainCompletely && !_immediateFlushRequested) {
           final currentSize = _bufferManager.queueLength;
           if (currentSize < batchSize) {
             await _waitTailFillWhileGrowing(
@@ -428,6 +478,12 @@ class ParallelJournalManager {
               maxExtraRounds: 3,
             );
           }
+        }
+
+        // stopWithoutFlush set _running=false and woke the tail wait: exit
+        // before popping more work so remaining buffers can be discarded.
+        if (!_running && !drainCompletely) {
+          break;
         }
 
         // Single-pass guard for recovery batches: process exactly one batch then stop.
