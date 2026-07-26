@@ -244,7 +244,6 @@ class KeyManager {
 
   bool _hasWrappedEncodingKeys(SpaceConfig config) {
     if (config.current.key.isNotEmpty) return true;
-    if (config.previous?.key.isNotEmpty == true) return true;
     return config.historyKeys.any((key) => key.key.isNotEmpty);
   }
 
@@ -282,7 +281,6 @@ class KeyManager {
 
     final updated = config.copyWith(
       current: rewrapInfo(config.current),
-      previous: config.previous == null ? null : rewrapInfo(config.previous!),
       historyKeys: config.historyKeys.map(rewrapInfo).toList(),
     );
 
@@ -291,6 +289,86 @@ class KeyManager {
     }
 
     return (config: updated, errors: errors);
+  }
+
+  /// V2 upgrade only: stash legacy plain encoding keys into [historyKeys],
+  /// mint a fresh [SpaceConfig.current] from the active encodingKey, and persist.
+  ///
+  /// Must run before V3's [initialize] so key-change migration is not scheduled;
+  /// V2 rewrites table data with the new current key itself.
+  Future<void> prepareKeysForV2DataRewrite({
+    required String spaceName,
+    required Map<int, String> legacyPlainEncodingKeysById,
+  }) async {
+    _getEncodingKey();
+    _getEncryptionKey();
+
+    final existing = await _dataStore.getSpaceConfig(
+      nowGetFromFile: true,
+      spaceName: spaceName,
+    );
+
+    final history = <EncryptionKeyInfo>[];
+    void addHistory(int keyId, String plain) {
+      if (plain.isEmpty) return;
+      if (history.any((k) => k.keyId == keyId)) return;
+      history.add(EncryptionKeyInfo(
+        key: _encryptKey(plain, keyId),
+        keyId: keyId,
+      ));
+    }
+
+    for (final entry in legacyPlainEncodingKeysById.entries) {
+      addHistory(entry.key, entry.value);
+    }
+
+    final newKey = _getEncodingKey();
+    var maxKeyId = 0;
+    for (final id in legacyPlainEncodingKeysById.keys) {
+      if (id > maxKeyId) maxKeyId = id;
+    }
+    final newKeyId = newKey.isEmpty ? 0 : maxKeyId + 1;
+    final current = newKey.isEmpty
+        ? const EncryptionKeyInfo(key: '', keyId: 0)
+        : EncryptionKeyInfo(
+            key: _encryptKey(newKey, newKeyId),
+            keyId: newKeyId,
+          );
+
+    final config = SpaceConfig(
+      current: current,
+      historyKeys: history,
+      version: existing?.version,
+      totalTableCount: existing?.totalTableCount ?? 0,
+      totalRecordCount: existing?.totalRecordCount ?? 0,
+      totalDataSizeBytes: existing?.totalDataSizeBytes ?? 0,
+      lastStatisticsTime: existing?.lastStatisticsTime,
+    );
+
+    await _dataStore.saveSpaceConfigToFile(
+      config,
+      spaceName: spaceName,
+      propagateErrors: true,
+    );
+
+    // Keep old keyIds available for decoding pre-rewrite data partitions.
+    final fallbackKeys = <int, Uint8List>{};
+    for (final entry in legacyPlainEncodingKeysById.entries) {
+      if (entry.value.isEmpty) continue;
+      fallbackKeys[entry.key] = EncryptionManager.generateKey(entry.value);
+    }
+    if (newKey.isNotEmpty && newKeyId > 0) {
+      fallbackKeys[newKeyId] = EncryptionManager.generateKey(newKey);
+      EncryptionManager.setCurrentKey(newKey, newKeyId);
+    }
+    if (fallbackKeys.isNotEmpty) {
+      EncryptionManager.setFallbackKeys(fallbackKeys);
+    }
+
+    Logger.info(
+      'V2 key bootstrap for space [$spaceName]: '
+      'current keyId=$newKeyId, history=${history.length}',
+    );
   }
 
   /// initialize KeyManager and start key migration process
@@ -356,15 +434,6 @@ class KeyManager {
       fallbackKeys[spaceConfig.current.keyId] = currentDecodedKey;
     }
 
-    // Add previous key to fallback keys if exists
-    if (spaceConfig.previous != null && spaceConfig.previous!.key.isNotEmpty) {
-      final previousDecodedKey =
-          _decodeKey(spaceConfig.previous!.key, spaceConfig.previous!.keyId);
-      if (previousDecodedKey != null) {
-        fallbackKeys[spaceConfig.previous!.keyId] = previousDecodedKey;
-      }
-    }
-
     // Add history keys to fallback keys
     for (final hist in spaceConfig.historyKeys) {
       if (hist.key.isEmpty) continue;
@@ -427,7 +496,6 @@ class KeyManager {
         final encryptedKey = _encryptKey(newKey, 1);
         return SpaceConfig(
           current: EncryptionKeyInfo(key: encryptedKey, keyId: 1),
-          previous: null,
           version: 0,
         );
       }
@@ -436,7 +504,6 @@ class KeyManager {
       );
       return SpaceConfig(
         current: const EncryptionKeyInfo(key: '', keyId: 0),
-        previous: null,
         version: 0,
       );
     } catch (e) {
@@ -445,7 +512,6 @@ class KeyManager {
           rawError: e);
       return SpaceConfig(
         current: const EncryptionKeyInfo(key: '', keyId: 0),
-        previous: null,
         version: 0,
       );
     }
@@ -520,9 +586,6 @@ class KeyManager {
     }
 
     addIfAbsent(spaceConfig.current);
-    if (spaceConfig.previous != null) {
-      addIfAbsent(spaceConfig.previous!);
-    }
 
     await _dataStore.saveSpaceConfigToFile(
       spaceConfig.copyWith(historyKeys: history),
