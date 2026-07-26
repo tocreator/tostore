@@ -1,7 +1,10 @@
+import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:tostore/tostore.dart';
 
+import 'platform/desktop_window.dart';
 import 'testing/database_tester.dart';
 import 'testing/log_service.dart';
 import 'tostore_example.dart' show ForeignKeyMode, ToStoreExample;
@@ -16,6 +19,7 @@ String _dbResultErrorMessage(DbResult result) {
 /// Simple UI to run examples
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await initDesktopWindow();
 
   // It's crucial to set the log handler *before* any potential errors can occur.
   // This ensures that initialization logs are captured and displayed in the UI.
@@ -82,10 +86,33 @@ class MyApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'ToStore Example',
+      title: 'ToStore Demo',
       theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xff0aa6e8)),
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF006CC3),
+          primary: const Color(0xFF006CC3),
+          surface: Colors.white,
+          surfaceTint: Colors.transparent,
+        ),
         useMaterial3: true,
+        scaffoldBackgroundColor: Colors.white,
+        popupMenuTheme: PopupMenuThemeData(
+          color: Colors.white,
+          surfaceTintColor: Colors.transparent,
+          elevation: 6,
+          shadowColor: Colors.black.withAlpha(25),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(12),
+            side: const BorderSide(color: Color(0xFFE2E8F0), width: 1),
+          ),
+        ),
+        dialogTheme: DialogThemeData(
+          backgroundColor: Colors.white,
+          surfaceTintColor: Colors.transparent,
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+          ),
+        ),
         visualDensity: VisualDensity.adaptivePlatformDensity,
       ),
       home: ToStoreExamplePage(example: example),
@@ -456,25 +483,39 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     }
   }
 
-  Widget _buildActionButton({required String text, VoidCallback? onPressed}) {
+  Widget _buildActionButton({
+    required String text,
+    IconData? icon,
+    VoidCallback? onPressed,
+  }) {
     return ElevatedButton(
       onPressed: onPressed,
       style: ElevatedButton.styleFrom(
         foregroundColor: Colors.white,
         backgroundColor: const Color.fromARGB(255, 10, 150, 210),
         shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(12),
+          borderRadius: BorderRadius.circular(10),
         ),
-        elevation: 2,
-        shadowColor: const Color.fromARGB(102, 6, 126, 177),
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+        elevation: 1.5,
+        shadowColor: const Color.fromARGB(100, 10, 150, 210),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
       ),
-      child: Text(
-        text,
-        textAlign: TextAlign.center,
-        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
-        maxLines: 1,
-        overflow: TextOverflow.visible,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          if (icon != null) ...[
+            Icon(icon, size: 18, color: Colors.white),
+            const SizedBox(width: 6),
+          ],
+          Text(
+            text,
+            textAlign: TextAlign.center,
+            style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14),
+            maxLines: 1,
+            overflow: TextOverflow.visible,
+          ),
+        ],
       ),
     );
   }
@@ -572,11 +613,84 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: Colors.white,
       resizeToAvoidBottomInset: false,
       appBar: AppBar(
-        title: const Text('ToStore Demo'),
+        backgroundColor: Colors.white,
+        surfaceTintColor: Colors.transparent,
+        elevation: 0,
+        // macOS traffic lights sit in the top-left when title bar is hidden.
+        leadingWidth: desktopLeadingWidth > 0 ? desktopLeadingWidth : null,
+        leading: desktopLeadingWidth > 0 ? const SizedBox.shrink() : null,
+        automaticallyImplyLeading: false,
+        titleSpacing: 16,
+        title: wrapWindowDrag(
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Image.asset(
+                'assets/logo-tostore.png',
+                height: 28.0,
+                fit: BoxFit.contain,
+                errorBuilder: (context, error, stackTrace) {
+                  return const Text(
+                    'ToStore',
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      color: Color(0xFF006CC3),
+                    ),
+                  );
+                },
+              ),
+              const SizedBox(width: 12),
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 9, vertical: 3.5),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(
+                    color: const Color(0xFFE2E8F0),
+                    width: 0.8,
+                  ),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Container(
+                      width: 6,
+                      height: 6,
+                      decoration: const BoxDecoration(
+                        color: Color(0xFF10B981),
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                    const SizedBox(width: 5),
+                    const Text(
+                      'DEMO',
+                      style: TextStyle(
+                        fontSize: 10.5,
+                        fontWeight: FontWeight.w700,
+                        color: Color(0xFF006CC3),
+                        letterSpacing: 1.2,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+        bottom: PreferredSize(
+          preferredSize: const Size.fromHeight(1.0),
+          child: Container(
+            color: const Color(0xFFE2E8F0),
+            height: 1.0,
+          ),
+        ),
         actions: [
           _buildMoreActionsButton(),
+          ...buildWindowCaptionActions(),
         ],
       ),
       body: SafeArea(
@@ -646,15 +760,19 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
 
         return Container(
           decoration: BoxDecoration(
-            color: Theme.of(context).colorScheme.surface,
+            color: Colors.white,
             borderRadius: const BorderRadius.only(
               topLeft: Radius.circular(16.0),
               topRight: Radius.circular(16.0),
             ),
+            border: const Border(
+              top: BorderSide(color: Color(0xFFE2E8F0), width: 1),
+            ),
             boxShadow: [
               BoxShadow(
-                blurRadius: 10.0,
-                color: Colors.black.withAlpha(51),
+                blurRadius: 16.0,
+                color: Colors.black.withAlpha(20),
+                offset: const Offset(0, -4),
               ),
             ],
           ),
@@ -681,32 +799,107 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
   }
 
   Widget _buildViewToggle() {
+    final isDataView = _selectedView == AppView.dataView;
     return Padding(
-      padding: const EdgeInsets.all(8.0),
+      padding: const EdgeInsets.only(top: 16.0, bottom: 12.0),
       child: Center(
-        child: ToggleButtons(
-          constraints: const BoxConstraints(
-            minWidth: 110.0,
-            minHeight: 36.0,
+        child: Container(
+          width: 252.0,
+          height: 42.0,
+          padding: const EdgeInsets.all(3.0),
+          decoration: BoxDecoration(
+            color: const Color(0xFFF8FAFC),
+            borderRadius: BorderRadius.circular(21.0),
+            border: Border.all(color: const Color(0xFFE2E8F0), width: 1.0),
           ),
-          isSelected: [
-            _selectedView == AppView.dataView,
-            _selectedView == AppView.tests,
-          ],
-          onPressed: (index) {
-            _pageViewController.animateToPage(
-              index,
-              duration: const Duration(milliseconds: 250),
-              curve: Curves.easeInOut,
-            );
-          },
-          borderRadius: BorderRadius.circular(8),
-          selectedColor: Colors.black,
-          fillColor: const Color.fromARGB(255, 211, 235, 245),
-          children: const [
-            Text('Data View'),
-            Text('Tests'),
-          ],
+          child: Stack(
+            children: [
+              // Sliding Symmetrical White Pill Card
+              AnimatedAlign(
+                alignment:
+                    isDataView ? Alignment.centerLeft : Alignment.centerRight,
+                duration: const Duration(milliseconds: 220),
+                curve: Curves.easeInOutCubic,
+                child: Container(
+                  width: 121.0,
+                  height: 34.0,
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(17.0),
+                    border:
+                        Border.all(color: const Color(0xFFCBD5E1), width: 0.8),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withAlpha(12),
+                        blurRadius: 4,
+                        offset: const Offset(0, 1.5),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+
+              // Interactive Text Buttons
+              Row(
+                children: [
+                  Expanded(
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () {
+                        if (!isDataView) {
+                          _pageViewController.animateToPage(
+                            0,
+                            duration: const Duration(milliseconds: 250),
+                            curve: Curves.easeInOut,
+                          );
+                        }
+                      },
+                      child: Center(
+                        child: Text(
+                          'Data View',
+                          style: TextStyle(
+                            fontSize: 13.5,
+                            fontWeight:
+                                isDataView ? FontWeight.w700 : FontWeight.w600,
+                            color: isDataView
+                                ? const Color.fromARGB(255, 10, 150, 210)
+                                : const Color(0xFF64748B),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                  Expanded(
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTap: () {
+                        if (isDataView) {
+                          _pageViewController.animateToPage(
+                            1,
+                            duration: const Duration(milliseconds: 250),
+                            curve: Curves.easeInOut,
+                          );
+                        }
+                      },
+                      child: Center(
+                        child: Text(
+                          'Tests',
+                          style: TextStyle(
+                            fontSize: 13.5,
+                            fontWeight:
+                                !isDataView ? FontWeight.w700 : FontWeight.w600,
+                            color: !isDataView
+                                ? const Color.fromARGB(255, 10, 150, 210)
+                                : const Color(0xFF64748B),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -746,24 +939,49 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              // Table Selector Dropdown
-              DropdownButton<String>(
-                value: _selectedTable,
-                items: _tableNames.map((String tableName) {
-                  return DropdownMenuItem<String>(
-                    value: tableName,
-                    child: Text(tableName),
-                  );
-                }).toList(),
-                onChanged: (String? newTable) {
-                  if (newTable != null && newTable != _selectedTable) {
-                    setState(() {
-                      _selectedTable = newTable;
-                      _activeFilters.clear();
-                    });
-                    _fetchTableData(resetPage: true);
-                  }
-                },
+              // Table Selector Dropdown Pill
+              Container(
+                height: 36.0,
+                padding: const EdgeInsets.symmetric(horizontal: 10.0),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFF8FAFC),
+                  borderRadius: BorderRadius.circular(8.0),
+                  border:
+                      Border.all(color: const Color(0xFFE2E8F0), width: 1.0),
+                ),
+                child: DropdownButtonHideUnderline(
+                  child: DropdownButton<String>(
+                    value: _selectedTable,
+                    icon: const Icon(
+                      Icons.keyboard_arrow_down_rounded,
+                      size: 20,
+                      color: Color(0xFF64748B),
+                    ),
+                    style: const TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w600,
+                      color: Color(0xFF0F172A),
+                    ),
+                    dropdownColor: Colors.white,
+                    focusColor: Colors.transparent,
+                    borderRadius: BorderRadius.circular(10),
+                    items: _tableNames.map((String tableName) {
+                      return DropdownMenuItem<String>(
+                        value: tableName,
+                        child: Text(tableName),
+                      );
+                    }).toList(),
+                    onChanged: (String? newTable) {
+                      if (newTable != null && newTable != _selectedTable) {
+                        setState(() {
+                          _selectedTable = newTable;
+                          _activeFilters.clear();
+                        });
+                        _fetchTableData(resetPage: true);
+                      }
+                    },
+                  ),
+                ),
               ),
               Text(
                   _isCountLimited
@@ -1246,14 +1464,12 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                 ],
               ),
             ),
+            const SizedBox(height: 20),
             LayoutBuilder(builder: (context, constraints) {
-              final double buttonWidth;
-              // On very narrow screens, use one column. Otherwise, use two.
-              if (constraints.maxWidth < 360) {
-                buttonWidth = constraints.maxWidth;
-              } else {
-                buttonWidth = (constraints.maxWidth - 12) / 2; // 12 is spacing
-              }
+              final double calculatedWidth = (constraints.maxWidth - 12) / 2;
+              final double buttonWidth = constraints.maxWidth < 360
+                  ? constraints.maxWidth
+                  : math.min(calculatedWidth, 220.0);
 
               return Wrap(
                 spacing: 12,
@@ -1268,6 +1484,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                           : 'Run configurable concurrency test',
                       child: _buildActionButton(
                         text: 'Concurrency Test',
+                        icon: Icons.alt_route_rounded,
                         onPressed:
                             !_isDbInitialized || _isTesting || _isWasmBuild
                                 ? null
@@ -1282,6 +1499,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                     width: buttonWidth,
                     child: _buildActionButton(
                       text: 'Run All Tests',
+                      icon: Icons.play_arrow_rounded,
                       onPressed: !_isDbInitialized || _isTesting
                           ? null
                           : () async {
@@ -1381,9 +1599,9 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                                   Center(
                                     child: Container(
                                       width: 40,
-                                      height: 5,
-                                      margin: const EdgeInsets.symmetric(
-                                          vertical: 8),
+                                      height: 4,
+                                      margin: const EdgeInsets.only(
+                                          top: 6, bottom: 2),
                                       decoration: BoxDecoration(
                                         color: Colors.grey.shade300,
                                         borderRadius: BorderRadius.circular(10),
@@ -1393,54 +1611,76 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                                   Expanded(
                                     child: Padding(
                                       padding: const EdgeInsets.fromLTRB(
-                                          16.0, 0, 4, 0),
-                                      child: Row(
-                                        children: [
-                                          const Text('Logs',
-                                              style: TextStyle(
+                                          16.0, 0, 4, 6),
+                                      child: AnimatedBuilder(
+                                        animation: _logPanelController,
+                                        builder: (context, child) {
+                                          final bool isExpanded =
+                                              _logPanelController.size > 0.15;
+                                          return Row(
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.center,
+                                            children: [
+                                              const Text(
+                                                'Logs',
+                                                style: TextStyle(
                                                   fontWeight: FontWeight.bold,
-                                                  fontSize: 16)),
-                                          const Spacer(),
-                                          IconButton(
-                                            icon:
-                                                const Icon(Icons.arrow_upward),
-                                            tooltip: 'Scroll to Top',
-                                            onPressed: _logCanScrollUp
-                                                ? _logScrollToTop
-                                                : null,
-                                          ),
-                                          IconButton(
-                                            icon: const Icon(
-                                                Icons.arrow_downward),
-                                            tooltip: 'Scroll to Bottom',
-                                            onPressed: _logCanScrollDown
-                                                ? _logScrollToBottom
-                                                : null,
-                                          ),
-                                          IconButton(
-                                            icon: const Icon(
-                                                Icons.copy_outlined,
-                                                size: 20),
-                                            tooltip: 'Copy Visible Logs',
-                                            onPressed: _copyVisibleLogs,
-                                          ),
-                                          IconButton(
-                                            icon: const Icon(
-                                                Icons.cleaning_services_rounded,
-                                                size: 20),
-                                            tooltip: 'Clear Logs',
-                                            onPressed: logService.clear,
-                                          ),
-                                          AnimatedBuilder(
-                                            animation: _logPanelController,
-                                            builder: (context, child) {
-                                              final bool isExpanded =
-                                                  _logPanelController.size >
-                                                      0.15;
-                                              return IconButton(
-                                                icon: Icon(isExpanded
-                                                    ? Icons.keyboard_arrow_down
-                                                    : Icons.keyboard_arrow_up),
+                                                  fontSize: 16,
+                                                ),
+                                              ),
+                                              const Spacer(),
+                                              if (isExpanded) ...[
+                                                IconButton(
+                                                  visualDensity:
+                                                      VisualDensity.compact,
+                                                  icon: const Icon(
+                                                      Icons.arrow_upward),
+                                                  tooltip: 'Scroll to Top',
+                                                  onPressed: _logCanScrollUp
+                                                      ? _logScrollToTop
+                                                      : null,
+                                                ),
+                                                IconButton(
+                                                  visualDensity:
+                                                      VisualDensity.compact,
+                                                  icon: const Icon(
+                                                      Icons.arrow_downward),
+                                                  tooltip: 'Scroll to Bottom',
+                                                  onPressed: _logCanScrollDown
+                                                      ? _logScrollToBottom
+                                                      : null,
+                                                ),
+                                                IconButton(
+                                                  visualDensity:
+                                                      VisualDensity.compact,
+                                                  icon: const Icon(
+                                                    Icons.copy_outlined,
+                                                    size: 20,
+                                                  ),
+                                                  tooltip: 'Copy Visible Logs',
+                                                  onPressed: _copyVisibleLogs,
+                                                ),
+                                                IconButton(
+                                                  visualDensity:
+                                                      VisualDensity.compact,
+                                                  icon: const Icon(
+                                                    Icons
+                                                        .cleaning_services_rounded,
+                                                    size: 20,
+                                                  ),
+                                                  tooltip: 'Clear Logs',
+                                                  onPressed: logService.clear,
+                                                ),
+                                              ],
+                                              IconButton(
+                                                visualDensity:
+                                                    VisualDensity.compact,
+                                                icon: Icon(
+                                                  isExpanded
+                                                      ? Icons
+                                                          .keyboard_arrow_down
+                                                      : Icons.keyboard_arrow_up,
+                                                ),
                                                 tooltip: isExpanded
                                                     ? 'Collapse Logs'
                                                     : 'Expand Logs',
@@ -1452,10 +1692,10 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                                                     curve: Curves.easeOut,
                                                   );
                                                 },
-                                              );
-                                            },
-                                          ),
-                                        ],
+                                              ),
+                                            ],
+                                          );
+                                        },
                                       ),
                                     ),
                                   ),
