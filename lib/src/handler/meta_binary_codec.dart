@@ -885,17 +885,29 @@ final class PartitionLocalStats {
     this.lastMaintenanceBatchKey = 0,
   });
 
+  static final BigInt _fnvOffset = BigInt.parse('cbf29ce484222325', radix: 16);
+  static final BigInt _fnvPrime = BigInt.parse('100000001b3', radix: 16);
+  static final BigInt _fnvMask64 = (BigInt.one << 64) - BigInt.one;
+  static final BigInt _fnvMask32 = BigInt.from(0xFFFFFFFF);
+
   /// Stable 64-bit fingerprint of a batch id for partition-local durable markers.
+  ///
+  /// FNV-1a-64. Uses [BigInt] so dart2js never sees non-representable literals;
+  /// result uses the same signed mapping as [PlatformByteData.getInt64].
   static int batchKeyFromId(String batchId) {
     if (batchId.isEmpty) return 0;
-    const int fnvOffset = -3750763034362895579; // 0xcbf29ce484222325
-    const int fnvPrime = 1099511628211; // 0x100000001b3
-    var hash = fnvOffset;
+    var hash = _fnvOffset;
     for (final b in batchId.codeUnits) {
-      hash ^= b;
-      hash = (hash * fnvPrime);
+      hash = (hash ^ BigInt.from(b)) & _fnvMask64;
+      hash = (hash * _fnvPrime) & _fnvMask64;
     }
-    return hash;
+    final lo = (hash & _fnvMask32).toInt();
+    final hi = ((hash >> 32) & _fnvMask32).toInt();
+    // Match PlatformByteData.getInt64 mapping on every platform.
+    if (hi >= 0x80000000) {
+      return (hi - 0x100000000) * 0x100000000 + lo;
+    }
+    return hi * 0x100000000 + lo;
   }
 
   PartitionLocalStats copyWith({

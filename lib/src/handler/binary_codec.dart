@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'platform_byte_data.dart';
+import 'xxhash64.dart';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
@@ -51,18 +52,25 @@ class BinaryWriter {
   }
 
   /// Writes an unsigned Varint (up to 64-bit).
+  ///
+  /// Uses lo/hi uint32 shifting so dart2js never sees a 64-bit mask literal
+  /// (`0xFFFFFFFFFFFFFFFF`) and logical shifts stay well-defined on JS.
   void writeVarint(int value) {
     _ensureCapacity(10);
-    // Treat negative values or large integers properly
-    int val = value & 0xFFFFFFFFFFFFFFFF;
+    // Split into unsigned 32-bit halves (portable across VM and JS).
+    var lo = value & 0xFFFFFFFF;
+    var hi = identical(0, 0.0)
+        ? ((value / 0x100000000).floor() & 0xFFFFFFFF)
+        : ((value >> 32) & 0xFFFFFFFF);
     while (true) {
-      if ((val & ~0x7F) == 0) {
-        _buf[_len++] = val;
-        break;
-      } else {
-        _buf[_len++] = (val & 0x7F) | 0x80;
-        val >>>= 7;
+      if (hi == 0 && (lo & ~0x7F) == 0) {
+        _buf[_len++] = lo;
+        return;
       }
+      _buf[_len++] = (lo & 0x7F) | 0x80;
+      // Unsigned >> 7 across the 64-bit value.
+      lo = ((lo >>> 7) | ((hi & 0x7F) << 25)) & 0xFFFFFFFF;
+      hi >>>= 7;
     }
   }
 
@@ -528,12 +536,11 @@ class TOBFHeader {
   /// High-performance helper that encodes a body payload and returns a full TOBF frame (Header + Body).
   static Uint8List encodeFrame(Uint8List body,
       {int version = 1, int flags = 0}) {
-    final checksum = XXHash64.hash(body);
+    // checksum: 0 is a placeholder; writeHashLE overwrites offset 14..21 with
+    // bit-exact digest bytes (avoids JS Number round-trip via setUint64).
     final header = encode(
-        version: version,
-        flags: flags,
-        bodyLen: body.length,
-        checksum: checksum);
+        version: version, flags: flags, bodyLen: body.length, checksum: 0);
+    XXHash64.writeHashLE(body, ByteData.sublistView(header), 14);
     final frame = Uint8List(length + body.length);
     frame.setRange(0, length, header);
     frame.setRange(length, frame.length, body);
@@ -612,119 +619,4 @@ class WireType {
 
   /// 32-bit fixed size: float, fixed32, sfixed32.
   static const int fixed32 = 5;
-}
-
-/// A highly-optimized 64-bit non-cryptographic hash algorithm (xxHash64)
-/// implemented in pure Dart for VM environments, compatible with Web platforms.
-class XXHash64 {
-  static const int _prime1 = -7046029254386353025; // 0x9E3779B185EBCA87
-  static const int _prime2 = -8796128691651817923; // 0x85EBCA77C2B2AE3D
-  static const int _prime3 = -4417253597405721777; // 0xC2B2AE3D27D4EB4F
-  static const int _prime4 = 2870177450012600261; // 0x27D4EB2F165667C5
-  static const int _prime5 = 1609587929392839123; // 0x165667C57D37B0D3
-
-  static int _rotl64(int val, int shift) {
-    val &= 0xFFFFFFFFFFFFFFFF;
-    return ((val << shift) | (val >>> (64 - shift))) & 0xFFFFFFFFFFFFFFFF;
-  }
-
-  static int _round(int acc, int input) {
-    acc = (acc + (input * _prime2)) & 0xFFFFFFFFFFFFFFFF;
-    acc = _rotl64(acc, 31);
-    acc = (acc * _prime1) & 0xFFFFFFFFFFFFFFFF;
-    return acc;
-  }
-
-  static int _mergeRound(int acc, int val) {
-    val = _round(0, val);
-    acc ^= val;
-    acc = (acc * _prime1) & 0xFFFFFFFFFFFFFFFF;
-    acc = (acc + _prime4) & 0xFFFFFFFFFFFFFFFF;
-    return acc;
-  }
-
-  /// Calculates the 64-bit xxHash of the given [data].
-  static int hash(Uint8List data, [int seed = 0]) {
-    final int len = data.length;
-    int h64 = 0;
-    int pos = 0;
-
-    if (len >= 32) {
-      int v1 = (seed + _prime1 + _prime2) & 0xFFFFFFFFFFFFFFFF;
-      int v2 = (seed + _prime2) & 0xFFFFFFFFFFFFFFFF;
-      int v3 = (seed + 0) & 0xFFFFFFFFFFFFFFFF;
-      int v4 = (seed - _prime1) & 0xFFFFFFFFFFFFFFFF;
-
-      final bd = ByteData.sublistView(data);
-      final int limit = len - 32;
-      while (pos <= limit) {
-        final int p1 = PlatformByteData.getUint64(bd, pos, Endian.little);
-        v1 = _round(v1, p1);
-        pos += 8;
-
-        final int p2 = PlatformByteData.getUint64(bd, pos, Endian.little);
-        v2 = _round(v2, p2);
-        pos += 8;
-
-        final int p3 = PlatformByteData.getUint64(bd, pos, Endian.little);
-        v3 = _round(v3, p3);
-        pos += 8;
-
-        final int p4 = PlatformByteData.getUint64(bd, pos, Endian.little);
-        v4 = _round(v4, p4);
-        pos += 8;
-      }
-
-      h64 = (_rotl64(v1, 1) +
-              _rotl64(v2, 7) +
-              _rotl64(v3, 12) +
-              _rotl64(v4, 18)) &
-          0xFFFFFFFFFFFFFFFF;
-      h64 = _mergeRound(h64, v1);
-      h64 = _mergeRound(h64, v2);
-      h64 = _mergeRound(h64, v3);
-      h64 = _mergeRound(h64, v4);
-    } else {
-      h64 = (seed + _prime5) & 0xFFFFFFFFFFFFFFFF;
-    }
-
-    h64 = (h64 + len) & 0xFFFFFFFFFFFFFFFF;
-
-    // Remaining 8-byte blocks
-    final bd = ByteData.sublistView(data);
-    while (pos + 8 <= len) {
-      final int p = PlatformByteData.getUint64(bd, pos, Endian.little);
-      final int val = _round(0, p);
-      h64 ^= val;
-      h64 = (_rotl64(h64, 27) * _prime1) & 0xFFFFFFFFFFFFFFFF;
-      h64 = (h64 + _prime4) & 0xFFFFFFFFFFFFFFFF;
-      pos += 8;
-    }
-
-    // Remaining 4-byte blocks
-    if (pos + 4 <= len) {
-      final int p = bd.getUint32(pos, Endian.little);
-      h64 ^= (p * _prime1) & 0xFFFFFFFFFFFFFFFF;
-      h64 = (_rotl64(h64, 23) * _prime2) & 0xFFFFFFFFFFFFFFFF;
-      h64 = (h64 + _prime3) & 0xFFFFFFFFFFFFFFFF;
-      pos += 4;
-    }
-
-    // Remaining 1-byte blocks
-    while (pos < len) {
-      final int b = data[pos];
-      h64 ^= (b * _prime5) & 0xFFFFFFFFFFFFFFFF;
-      h64 = (_rotl64(h64, 11) * _prime1) & 0xFFFFFFFFFFFFFFFF;
-      pos++;
-    }
-
-    // Avalanche
-    h64 ^= h64 >>> 33;
-    h64 = (h64 * _prime2) & 0xFFFFFFFFFFFFFFFF;
-    h64 ^= h64 >>> 29;
-    h64 = (h64 * _prime3) & 0xFFFFFFFFFFFFFFFF;
-    h64 ^= h64 >>> 32;
-
-    return h64 & 0xFFFFFFFFFFFFFFFF;
-  }
 }
