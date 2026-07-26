@@ -26,7 +26,7 @@ class KeyMigrationRunner {
 
   static const String taskIdPrefix = 'key_migration';
 
-  /// Tables currently undergoing key migration (for index isBuilding guard).
+  /// Tables currently undergoing key migration (pause / lifecycle guards).
   static final Set<String> _activeTableMigrations = <String>{};
 
   static CancellationToken? _runToken;
@@ -200,14 +200,14 @@ class KeyMigrationRunner {
       _activeTableMigrations.add(table.tableUid);
       try {
         final scope = scopeForTable(dataStore, table);
-        await _purgeTableIndexes(dataStore, table);
-        await dataStore.cacheManager.invalidateCache(table);
-
         final startCursor = await KeyMigrationProgressStore.loadCheckpoint(
           dataStore,
           table: table,
           spaceName: scope,
         );
+        final isResume = startCursor != null && startCursor.isNotEmpty;
+        await _purgeTableIndexes(dataStore, table, isResume: isResume);
+        await dataStore.cacheManager.invalidateCache(table);
 
         await KeyMigrationProgressStore.upsertRunning(
           dataStore,
@@ -281,10 +281,12 @@ class KeyMigrationRunner {
 
         if (isPauseRequested) {
           // Do not drain: close/cutover clears unpersisted scheduler entries.
+          // Keep isBuilding=true so queries stay on tableScan until resume.
           throw DbClosedException('Key migration paused');
         }
 
         await _drainBackgroundWrites(dataStore);
+        await _endIndexBuilds(dataStore, table);
 
         await KeyMigrationProgressStore.markCompleted(
           dataStore,
@@ -349,14 +351,19 @@ class KeyMigrationRunner {
       return;
     }
 
+    final history = [...spaceConfig.historyKeys];
+    if (spaceConfig.current.key.isNotEmpty &&
+        !history.any((k) => k.keyId == spaceConfig.current.keyId)) {
+      history.add(spaceConfig.current);
+    }
+
     await dataStore.saveSpaceConfigToFile(
       spaceConfig.copyWith(
         current: EncryptionKeyInfo(
           key: keyChangeInfo.encryptKey,
           keyId: keyChangeInfo.newKeyId,
         ),
-        previous: spaceConfig.current,
-        historyKeys: const [],
+        historyKeys: history,
       ),
     );
 
@@ -381,7 +388,10 @@ class KeyMigrationRunner {
   }
 
   static Future<void> _purgeTableIndexes(
-      DataStoreImpl dataStore, TableContext table) async {
+    DataStoreImpl dataStore,
+    TableContext table, {
+    required bool isResume,
+  }) async {
     final indexes = <IndexSchema>[
       ...table.schema.getAllIndexes(),
       ...?dataStore.indexManager
@@ -391,12 +401,69 @@ class KeyMigrationRunner {
     final indexManager = dataStore.indexManager;
     if (indexManager == null) return;
 
+    final tableDataMeta =
+        await dataStore.tableDataManager.getTableDataMeta(table.tableUid);
+    final hasRecords = (tableDataMeta?.totalRecords ?? 0) > 0;
+
     for (final index in indexes) {
       if (index.type == IndexType.vector) continue;
-      await indexManager.deletePhysicalIndexArtifacts(
-        table,
-        index.indexUid,
-      );
+      final indexUid = index.indexUid;
+      if (indexUid.isEmpty) continue;
+
+      if (!hasRecords) {
+        if (!isResume) {
+          await indexManager.deletePhysicalIndexArtifacts(table, indexUid);
+          await indexManager.updateIndexMeta(
+            table: table,
+            indexUid: indexUid,
+            updatedMeta: IndexMeta.createEmpty(
+              indexUid: indexUid,
+              tableUid: table.tableUid,
+              isUnique: index.unique,
+              isBuilding: false,
+            ),
+          );
+        }
+        continue;
+      }
+
+      if (!isResume) {
+        // Authority: key migration owns isBuilding for the full rewrite.
+        await indexManager.beginIndexBuild(table, index);
+      } else {
+        final existing =
+            await indexManager.getIndexMeta(table.tableUid, indexUid);
+        if (existing == null || !existing.isBuilding) {
+          await indexManager.updateIndexMeta(
+            table: table,
+            indexUid: indexUid,
+            updatedMeta: (existing != null)
+                ? existing.copyWith(isBuilding: true)
+                : IndexMeta.createEmpty(
+                    indexUid: indexUid,
+                    tableUid: table.tableUid,
+                    isUnique: index.unique,
+                    isBuilding: true,
+                  ),
+          );
+        }
+      }
+    }
+  }
+
+  static Future<void> _endIndexBuilds(
+      DataStoreImpl dataStore, TableContext table) async {
+    final indexManager = dataStore.indexManager;
+    if (indexManager == null) return;
+
+    final indexes = <IndexSchema>[
+      ...table.schema.getAllIndexes(),
+      ...indexManager.getEngineManagedBtreeIndexes(table, table.schema),
+    ];
+    for (final index in indexes) {
+      if (index.type == IndexType.vector) continue;
+      if (index.indexUid.isEmpty) continue;
+      await indexManager.endIndexBuild(table, index.indexUid);
     }
   }
 
