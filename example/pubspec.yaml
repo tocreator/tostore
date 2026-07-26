@@ -30,6 +30,7 @@ dependencies:
   cupertino_icons: ^1.0.8
   path_provider: ^2.1.5
   path: ^1.9.1
+  window_manager: ^0.5.1
 
 dev_dependencies:
   integration_test:
@@ -42,7 +43,30 @@ dev_dependencies:
   # activated in the `analysis_options.yaml` file located at the root of your
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
-  flutter_lints: ^6.0.0
+  flutter_lints: ^5.0.0
+  flutter_launcher_icons: ^0.14.4
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  remove_alpha_ios: true
+  background_color_ios: "#FFFFFF"
+  web:
+    generate: true
+    image_path: assets/app_icon.png
+    background_color: "#FFFFFF"
+    theme_color: "#006cc3"
+  windows:
+    generate: true
+    image_path: assets/app_icon.png
+    icon_size: 256
+  macos:
+    generate: true
+    image_path: assets/app_icon.png
+  image_path: assets/app_icon.png
+  adaptive_icon_background: "#FFFFFF"
+  adaptive_icon_foreground: assets/app_icon_foreground.png
+  adaptive_icon_foreground_inset: 16
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
@@ -55,10 +79,9 @@ flutter:
   # the material Icons class.
   uses-material-design: true
 
-  # To add assets to your application, add an assets section, like this:
-  # assets:
-  #   - images/a_dot_burr.jpeg
-  #   - images/a_dot_ham.jpeg
+  assets:
+    - assets/logo-tostore.png
+
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images
