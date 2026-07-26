@@ -393,7 +393,9 @@ class ResourceManager {
           return tableDataMetaSize + indexMetaSize;
       }
     } catch (e) {
-      if (e is DbClosedException) return 0;
+      if (e is DbClosedException || _dataStore?.isBaseInitialized != true) {
+        return 0;
+      }
       Logger.warn('Failed to get current cache size for ${cacheType.name}',
           rawError: e);
       return 0;
