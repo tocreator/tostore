@@ -23,7 +23,7 @@ class KeyMigrationProgressStore {
 
     await TransactionContext.runAsSystemOperation(() async {
       await dataStore.createTable(
-        SystemTable.gettableSchemas.firstWhere((s) => s.name == tableName),
+        SystemTable.keyMigrationProgressTable(),
         isSystemTable: true,
       );
     });
