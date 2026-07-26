@@ -3810,6 +3810,30 @@ final class _QueryCursorToken {
       builder.add(keyBytes);
     } else {
       final fields = sortFields ?? const <String>[];
+      final descs = sortDesc ?? const <bool>[];
+      // Wire format uses u8 counts — keep encode/decode symmetric so tokens
+      // always round-trip. This is not a query policy cap.
+      if (fields.length != descs.length) {
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidCursorPayload,
+            message:
+                'Cannot encode sort-key cursor: field/direction count mismatch.',
+            parameterName: 'cursor',
+          ),
+        ]);
+      }
+      if (fields.length > 255) {
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidCursorPayload,
+            message:
+                'Cannot encode sort-key cursor: orderBy field count exceeds wire limit (255).',
+            parameterName: 'orderBy',
+            passedValue: fields.length,
+          ),
+        ]);
+      }
       builder.addByte(fields.length);
       for (final f in fields) {
         final fb = utf8.encode(f);
@@ -3817,7 +3841,6 @@ final class _QueryCursorToken {
         builder.add(bd.buffer.asUint8List());
         builder.add(fb);
       }
-      final descs = sortDesc ?? const <bool>[];
       builder.addByte(descs.length);
       for (final d in descs) {
         builder.addByte(d ? 1 : 0);
@@ -3833,8 +3856,9 @@ final class _QueryCursorToken {
 
   static _QueryCursorToken? tryDecode(String? raw) {
     if (raw == null || raw.trim().isEmpty) return null;
+    final token = raw.trim();
     try {
-      final bytes = base64Url.decode(base64Url.normalize(raw));
+      final bytes = base64Url.decode(base64Url.normalize(token));
       if (bytes.isEmpty) return null;
 
       // Only binary cursor tokens (magic 0xFE) are accepted.
@@ -3845,6 +3869,7 @@ final class _QueryCursorToken {
             message:
                 'Unsupported cursor token format (expected binary 0xFE prefix).',
             parameterName: 'cursor',
+            passedValue: {'tokenLength': token.length},
           ),
         ]);
       }
@@ -3856,33 +3881,78 @@ final class _QueryCursorToken {
           type: ResultType.devInvalidCursorPayload,
           message: 'Failed to decode cursor token: $e',
           parameterName: 'cursor',
-          passedValue: null,
+          passedValue: {'tokenLength': token.length},
         ),
       ]);
     }
   }
 
+  static Never _invalidCursorPayload(String message) {
+    throw DbException([
+      InvalidArgumentStatus(
+        type: ResultType.devInvalidCursorPayload,
+        message: message,
+        parameterName: 'cursor',
+      ),
+    ]);
+  }
+
+  /// Ensure `[offset, offset + length)` is inside [bytes].
+  /// Only structural bounds — no business caps that would reject valid tokens.
+  static void _ensureCursorBytes(
+    Uint8List bytes,
+    int offset,
+    int length,
+  ) {
+    if (length < 0 ||
+        offset < 0 ||
+        offset > bytes.length ||
+        length > bytes.length - offset) {
+      _invalidCursorPayload('Invalid binary cursor payload (truncated).');
+    }
+  }
+
+  static int _readCursorUint8(Uint8List bytes, int offset) {
+    _ensureCursorBytes(bytes, offset, 1);
+    return bytes[offset];
+  }
+
+  static int _readCursorUint16(Uint8List bytes, int offset) {
+    _ensureCursorBytes(bytes, offset, 2);
+    return ByteData.sublistView(bytes, offset, offset + 2)
+        .getUint16(0, Endian.big);
+  }
+
+  static int _readCursorInt32(Uint8List bytes, int offset) {
+    _ensureCursorBytes(bytes, offset, 4);
+    return ByteData.sublistView(bytes, offset, offset + 4)
+        .getInt32(0, Endian.big);
+  }
+
+  static int _readCursorUint32(Uint8List bytes, int offset) {
+    _ensureCursorBytes(bytes, offset, 4);
+    return ByteData.sublistView(bytes, offset, offset + 4)
+        .getUint32(0, Endian.big);
+  }
+
+  static Uint8List _readCursorSlice(Uint8List bytes, int offset, int length) {
+    _ensureCursorBytes(bytes, offset, length);
+    return bytes.sublist(offset, offset + length);
+  }
+
+  static String _readCursorUtf8(Uint8List bytes, int offset, int length) {
+    return utf8.decode(_readCursorSlice(bytes, offset, length));
+  }
+
   static _QueryCursorToken _tryDecodeBinary(Uint8List bytes) {
     int offset = 1;
-    if (offset >= bytes.length) {
-      throw DbException([
-        InvalidArgumentStatus(
-          type: ResultType.devInvalidCursorPayload,
-          message: 'Invalid binary cursor payload',
-          parameterName: 'cursor',
-        ),
-      ]);
-    }
+    _ensureCursorBytes(bytes, offset, 3); // version + mode + isBackward
+
     final v = bytes[offset++];
     if (v != _currentVersion) {
-      throw DbException([
-        InvalidArgumentStatus(
-          type: ResultType.devInvalidCursorPayload,
-          message: 'Unsupported cursor token version: $v',
-          parameterName: 'cursor',
-        ),
-      ]);
+      _invalidCursorPayload('Unsupported cursor token version: $v');
     }
+
     final modeIndex = bytes[offset++];
     if (modeIndex < 0 || modeIndex >= _CursorMode.values.length) {
       throw DbException([
@@ -3896,18 +3966,16 @@ final class _QueryCursorToken {
     final mode = _CursorMode.values[modeIndex];
     final isBackward = bytes[offset++] == 1;
 
-    final tLen = ByteData.sublistView(bytes, offset, offset + 2)
-        .getUint16(0, Endian.big);
+    final tLen = _readCursorUint16(bytes, offset);
     offset += 2;
-    final tableUid =
-        TableUid(utf8.decode(bytes.sublist(offset, offset + tLen)));
+    final tableUid = TableUid(_readCursorUtf8(bytes, offset, tLen));
     offset += tLen;
 
-    final hasSigHash = bytes[offset++] == 1;
+    final hasSigHash = _readCursorUint8(bytes, offset) == 1;
+    offset += 1;
     int? querySigHash;
     if (hasSigHash) {
-      querySigHash = ByteData.sublistView(bytes, offset, offset + 4)
-          .getUint32(0, Endian.big);
+      querySigHash = _readCursorUint32(bytes, offset);
       offset += 4;
     }
 
@@ -3920,41 +3988,57 @@ final class _QueryCursorToken {
     Uint8List? sortKey;
 
     if (mode == _CursorMode.primaryKey) {
-      reverse = bytes[offset++] == 1;
-      final pkLen = ByteData.sublistView(bytes, offset, offset + 4)
-          .getInt32(0, Endian.big);
+      reverse = _readCursorUint8(bytes, offset) == 1;
+      offset += 1;
+      final pkLen = _readCursorInt32(bytes, offset);
       offset += 4;
-      primaryKey = utf8.decode(bytes.sublist(offset, offset + pkLen));
+      primaryKey = _readCursorUtf8(bytes, offset, pkLen);
+      offset += pkLen;
     } else if (mode == _CursorMode.indexKey) {
-      final iLen = ByteData.sublistView(bytes, offset, offset + 2)
-          .getUint16(0, Endian.big);
+      final iLen = _readCursorUint16(bytes, offset);
       offset += 2;
-      indexUid = IndexUid(utf8.decode(bytes.sublist(offset, offset + iLen)));
+      indexUid = IndexUid(_readCursorUtf8(bytes, offset, iLen));
       offset += iLen;
-      final kLen = ByteData.sublistView(bytes, offset, offset + 4)
-          .getInt32(0, Endian.big);
+      final kLen = _readCursorInt32(bytes, offset);
       offset += 4;
-      indexKey = Uint8List.fromList(bytes.sublist(offset, offset + kLen));
+      indexKey = Uint8List.fromList(_readCursorSlice(bytes, offset, kLen));
+      offset += kLen;
     } else {
-      final fieldCount = bytes[offset++];
-      sortFields = [];
+      // sortKey: encode writes fieldCount (u8), fields..., descCount (u8),
+      // descs..., keyLen (i32), keyBytes. fieldCount/descCount are the same
+      // wire width as encode (single byte) — do not invent tighter caps.
+      final fieldCount = _readCursorUint8(bytes, offset);
+      offset += 1;
+      sortFields = <String>[];
       for (int i = 0; i < fieldCount; i++) {
-        final fLen = ByteData.sublistView(bytes, offset, offset + 2)
-            .getUint16(0, Endian.big);
+        final fLen = _readCursorUint16(bytes, offset);
         offset += 2;
-        sortFields.add(utf8.decode(bytes.sublist(offset, offset + fLen)));
+        sortFields.add(_readCursorUtf8(bytes, offset, fLen));
+        offset += fLen; // must advance past field name bytes
       }
-      final descCount = bytes[offset++];
-      sortDesc = [];
+
+      final descCount = _readCursorUint8(bytes, offset);
+      offset += 1;
+      // Encode always emits matching counts; mismatch means corruption, not a
+      // legitimate older/newer dialect — safe to reject without false positives.
+      if (descCount != fieldCount) {
+        _invalidCursorPayload(
+          'Invalid sort-key cursor token (field/direction count mismatch).',
+        );
+      }
+      sortDesc = <bool>[];
       for (int i = 0; i < descCount; i++) {
-        sortDesc.add(bytes[offset++] == 1);
+        sortDesc.add(_readCursorUint8(bytes, offset) == 1);
+        offset += 1;
       }
-      final kLen = ByteData.sublistView(bytes, offset, offset + 4)
-          .getInt32(0, Endian.big);
+
+      final kLen = _readCursorInt32(bytes, offset);
       offset += 4;
-      sortKey = Uint8List.fromList(bytes.sublist(offset, offset + kLen));
+      sortKey = Uint8List.fromList(_readCursorSlice(bytes, offset, kLen));
+      offset += kLen;
     }
 
+    // Trailing bytes are ignored for forward compatibility with future fields.
     return _QueryCursorToken._(
       version: v,
       mode: mode,
