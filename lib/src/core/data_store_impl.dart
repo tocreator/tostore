@@ -933,11 +933,13 @@ class DataStoreImpl {
             await _migrateOldStructureIfNeeded();
             _startupProgressCallback?.call(0.4, DbStartupStage.recovering);
 
-            // Key migration runs after schema tasks are recovered (schema before key).
-            await _keyManager!.startDeferredKeyMigrationWork();
-
+            // System tables (incl. key-migration progress) before key rewrite.
             await _startSetupAndUpgrade();
             _startupProgressCallback?.call(0.8, DbStartupStage.optimizing);
+
+            // Key migration after setup so `_system_key_migration` exists
+            // (schema tasks already recovered in migrationManager.initialize).
+            await _keyManager!.startDeferredKeyMigrationWork();
           }
         }
 
@@ -1229,7 +1231,7 @@ class DataStoreImpl {
           try {
             await storage.flushAll(closeHandles: true);
             if (closeStorage) {
-              await storage.close(isMigrationInstance: isMigrationInstance);
+              await storage.close();
             }
           } catch (e) {
             Logger.warn('Storage flush/close failed', rawError: e);
@@ -1440,17 +1442,8 @@ class DataStoreImpl {
           schema: resolvedSchema,
         );
 
-        // Initialize B+Tree index metadata (empty table — no full-table scan).
-        final btreeIndexes =
-            tableMetaManager?.getBtreeIndexesFor(resolvedSchema) ??
-                <IndexSchema>[];
-        await _indexManager?.initializeEmptyTableIndexes(
-          tableCtx,
-          btreeIndexes,
-          tableSchemaOverride: resolvedSchema,
-        );
-
-        // Persist self-row once indexes are ready (bootstrap recursion avoided).
+        // Persist self-row after schema is durable (bootstrap recursion avoided).
+        // Index files/meta are created lazily on first write via writeChanges.
         if (isTableMeta) {
           await tableMetaManager?.saveTableMeta(
             savedMeta,
@@ -3306,8 +3299,9 @@ class DataStoreImpl {
         //  clear partition file deletion, auto-increment ID reset, and related cache cleanup
         await tableDataManager.clearTable(table);
 
-        //  reset index
-        await _indexManager?.resetIndexes(table);
+        // Wipe `{table}/index/` root (data clear does not touch it). Writes
+        // recreate index meta/files on demand — no empty IndexMeta pre-create.
+        await _indexManager?.clearIndexesForTable(table);
       } finally {
         // Restarts KeyMigrationRunner for remaining tables (and this empty one).
         migrationManager
