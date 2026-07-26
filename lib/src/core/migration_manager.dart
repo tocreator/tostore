@@ -170,6 +170,14 @@ class MigrationManager {
     return info != null && info.isRunning;
   }
 
+  /// Whether key migration still owns index rebuild flags (running or failed pending retry).
+  bool ownsKeyMigrationIndexBuilds() {
+    final info = _migrationMetaCache?.keyMigrationInfo;
+    if (info == null) return false;
+    return info.status == KeyMigrationStatus.running ||
+        info.status == KeyMigrationStatus.failed;
+  }
+
   /// Persist key migration metadata and sync [GlobalConfig.hasMigrationTask].
   Future<void> persistKeyMigrationInfo(KeyMigrationInfo info) async {
     final meta = await _getOrLoadMigrationMeta();
@@ -849,12 +857,82 @@ class MigrationManager {
         _schemaByVersion.remove(targetVer);
       }
     }
+    await _clearIndexBuildingFlagsForRemovedTask(task);
     await _cleanupTask(task);
     _unregisterRuntimeMigrationForTask(task);
     Logger.info(
       'Cancelled migration task [${task.taskId}] on table [${task.tableName}] '
       'due to $reason',
     );
+  }
+
+  /// After task removal: clear isBuilding for indexes no longer owned by any
+  /// pending schema rebuild (and not under key migration).
+  Future<void> _clearIndexBuildingFlagsForRemovedTask(
+      MigrationTask task) async {
+    final specific = task.specificIndexUids;
+    if (specific == null || specific.isEmpty) return;
+    final indexManager = _dataStore.indexManager;
+    if (indexManager == null) return;
+    final table = await _tableContextForUid(task.tableUid);
+    if (table == null) return;
+    if (KeyMigrationRunner.isTableMigrating(table) ||
+        ownsKeyMigrationIndexBuilds()) {
+      return;
+    }
+    for (final indexUid in specific) {
+      if (hasPendingIndexBuild(task.tableUid, indexUid)) continue;
+      await indexManager.endIndexBuild(table, indexUid);
+    }
+  }
+
+  /// Active-space authority: mark target indexes building only when the table
+  /// already has persisted rows. Empty tables get empty meta with isBuilding=false.
+  Future<void> _applyIndexBuildingFlagsForActiveSpace(
+    MigrationTask task, {
+    int? recordCountOverride,
+  }) async {
+    if (task.specificIndexUids == null || task.specificIndexUids!.isEmpty) {
+      return;
+    }
+    final indexManager = _dataStore.indexManager;
+    if (indexManager == null) return;
+    final currentSchema = task.targetSchemaSnapshot;
+    if (currentSchema == null) return;
+
+    final indexTableCtx = await _tableContextForUid(task.tableUid);
+    if (indexTableCtx == null) return;
+
+    final recordCount = recordCountOverride ??
+        await _dataStore.tableDataManager.getTableRecordCount(indexTableCtx);
+    final allIndexes = <IndexSchema>[
+      ...currentSchema.getAllIndexes(),
+      ...indexManager.getEngineManagedBtreeIndexes(
+          indexTableCtx, currentSchema),
+    ];
+
+    for (final indexField in task.specificIndexUids!) {
+      final idxSchema = _resolveSpecificIndexSchema(allIndexes, indexField);
+      if (idxSchema.indexUid.isEmpty) continue;
+      if (recordCount > 0) {
+        await indexManager.beginIndexBuild(indexTableCtx, idxSchema);
+      } else {
+        await indexManager.deletePhysicalIndexArtifacts(
+          indexTableCtx,
+          idxSchema.indexUid,
+        );
+        await indexManager.updateIndexMeta(
+          table: indexTableCtx,
+          indexUid: idxSchema.indexUid,
+          updatedMeta: IndexMeta.createEmpty(
+            indexUid: idxSchema.indexUid,
+            tableUid: indexTableCtx.tableUid,
+            isUnique: idxSchema.unique,
+            isBuilding: false,
+          ),
+        );
+      }
+    }
   }
 
   bool _taskHasTableWrite(MigrationTask task) {
@@ -2213,56 +2291,19 @@ class MigrationManager {
       }
 
       // Calculate and set estimateDuration
+      int? activeSpaceRecordCount;
       if (!isDropTable && task.estimateDuration == null) {
         final physicalTableCtx = await _requireTableContextByUid(tableUid);
-        final recordCount = await _dataStore.tableDataManager
+        activeSpaceRecordCount = await _dataStore.tableDataManager
             .getTableRecordCount(physicalTableCtx);
         final derivedWriteMode = task.writeMode ?? MigrationWriteMode.none;
-        final duration =
-            _estimateMigrationDuration(derivedWriteMode, recordCount);
+        final duration = _estimateMigrationDuration(
+            derivedWriteMode, activeSpaceRecordCount);
         task = task.copyWith(
           estimateDuration: duration,
         );
       }
 
-      // For the active space, immediately set `isBuilding = true` for target indexes
-      if (!isDropTable &&
-          task.specificIndexUids != null &&
-          task.specificIndexUids!.isNotEmpty) {
-        final currentSchema = task.targetSchemaSnapshot ?? targetSchema;
-        if (currentSchema != null) {
-          final indexTableCtx = await _requireTableContextByUid(tableUid);
-          final allIndexes = <IndexSchema>[
-            ...currentSchema.getAllIndexes(),
-            ...?_dataStore.indexManager
-                ?.getEngineManagedBtreeIndexes(indexTableCtx, currentSchema),
-          ];
-          for (final indexField in task.specificIndexUids!) {
-            final idxSchema = _resolveSpecificIndexSchema(
-              allIndexes,
-              indexField,
-            );
-            final indexUid = idxSchema.indexUid;
-            await _dataStore.indexManager?.deletePhysicalIndexArtifacts(
-              indexTableCtx,
-              indexUid,
-            );
-            final indexMeta = IndexMeta.createEmpty(
-              indexUid: indexUid,
-              tableUid: indexTableCtx.tableUid,
-              isUnique: idxSchema.unique,
-              isBuilding: true,
-            );
-            await _dataStore.indexManager?.updateIndexMeta(
-              table: indexTableCtx,
-              indexUid: indexUid,
-              updatedMeta: indexMeta,
-            );
-          }
-        }
-      }
-
-      // persist migration task
       await _saveMigrationTask(task);
       _updatePendingTaskInMemory(task);
       _pendingTasks.add(task);
@@ -2292,6 +2333,17 @@ class MigrationManager {
           await _requireTableContextByUid(tableUid),
           triggerTask: task,
         );
+      }
+
+      // After reconcile: only non-empty tables lock target indexes as building.
+      if (!isDropTable) {
+        final latest = _findLatestPendingTaskForTableUid(tableUid);
+        if (latest != null) {
+          await _applyIndexBuildingFlagsForActiveSpace(
+            latest,
+            recordCountOverride: activeSpaceRecordCount,
+          );
+        }
       }
 
       await syncHasMigrationTask();
@@ -4685,11 +4737,13 @@ class MigrationManager {
                   ? currentTask.specificIndexUids
                   : null;
 
-              // Initialize index locks (isBuilding = true) and clean physical files in this space ONLY IF this is the first execution (no checkpoint cursor)
+              // Initialize index locks (isBuilding = true) only when this space
+              // has persisted rows. Empty tables never own isBuilding=true.
               if (migrationInstance.indexManager != null &&
                   currentTask.specificIndexUids != null &&
                   currentTask.specificIndexUids!.isNotEmpty) {
                 final isResume = startCursor != null && startCursor.isNotEmpty;
+                final spaceRecordCount = tableDataMeta?.totalRecords ?? 0;
                 final targetSchema = await migrationInstance.tableMetaManager
                     ?.getTableSchema(migrationTableCtx.tableUid);
                 if (targetSchema != null) {
@@ -4705,36 +4759,54 @@ class MigrationManager {
                       indexField,
                     );
                     final indexUid = idxSchema.indexUid;
-                    if (!isResume) {
-                      // Only delete physical files if starting fresh
-                      await migrationInstance.indexManager!
-                          .deletePhysicalIndexArtifacts(
-                        migrationTableCtx,
-                        indexUid,
-                      );
+                    if (indexUid.isEmpty) continue;
+
+                    if (spaceRecordCount <= 0) {
+                      if (!isResume) {
+                        await migrationInstance.indexManager!
+                            .deletePhysicalIndexArtifacts(
+                          migrationTableCtx,
+                          indexUid,
+                        );
+                        await migrationInstance.indexManager!.updateIndexMeta(
+                          table: migrationTableCtx,
+                          indexUid: indexUid,
+                          updatedMeta: IndexMeta.createEmpty(
+                            indexUid: indexUid,
+                            tableUid: migrationTableCtx.tableUid,
+                            isUnique: idxSchema.unique,
+                            isBuilding: false,
+                          ),
+                        );
+                      }
+                      continue;
                     }
 
-                    // Always ensure/repair metadata as isBuilding = true during ongoing migration
-                    final existingMeta =
-                        await migrationInstance.indexManager!.getIndexMeta(
-                      migrationTableCtx.tableUid,
-                      indexUid,
-                    );
-                    if (existingMeta == null || !existingMeta.isBuilding) {
-                      final resolvedUid = indexUid;
-                      final indexMeta = (existingMeta != null)
-                          ? existingMeta.copyWith(isBuilding: true)
-                          : IndexMeta.createEmpty(
-                              indexUid: resolvedUid,
-                              tableUid: migrationTableCtx.tableUid,
-                              isUnique: idxSchema.unique,
-                              isBuilding: true,
-                            );
-                      await migrationInstance.indexManager!.updateIndexMeta(
-                        table: migrationTableCtx,
-                        indexUid: indexUid,
-                        updatedMeta: indexMeta,
+                    if (!isResume) {
+                      await migrationInstance.indexManager!.beginIndexBuild(
+                        migrationTableCtx,
+                        idxSchema,
                       );
+                    } else {
+                      final existingMeta =
+                          await migrationInstance.indexManager!.getIndexMeta(
+                        migrationTableCtx.tableUid,
+                        indexUid,
+                      );
+                      if (existingMeta == null || !existingMeta.isBuilding) {
+                        await migrationInstance.indexManager!.updateIndexMeta(
+                          table: migrationTableCtx,
+                          indexUid: indexUid,
+                          updatedMeta: (existingMeta != null)
+                              ? existingMeta.copyWith(isBuilding: true)
+                              : IndexMeta.createEmpty(
+                                  indexUid: indexUid,
+                                  tableUid: migrationTableCtx.tableUid,
+                                  isUnique: idxSchema.unique,
+                                  isBuilding: true,
+                                ),
+                        );
+                      }
                     }
                   }
                 }
@@ -4827,9 +4899,9 @@ class MigrationManager {
               if (migrationInstance.indexManager != null &&
                   currentTask.specificIndexUids != null &&
                   currentTask.specificIndexUids!.isNotEmpty) {
-                final unlockSchema = await migrationInstance.tableMetaManager
-                    ?.getTableSchema(migrationTableCtx.tableUid);
                 for (final indexField in currentTask.specificIndexUids!) {
+                  final unlockSchema = await migrationInstance.tableMetaManager
+                      ?.getTableSchema(migrationTableCtx.tableUid);
                   final idxSchema = unlockSchema != null
                       ? _resolveSpecificIndexSchema(
                           <IndexSchema>[
@@ -4842,15 +4914,9 @@ class MigrationManager {
                         )
                       : IndexSchema(indexName: indexField, fields: const []);
                   final indexUid = idxSchema.indexUid;
-                  final existingMeta = await migrationInstance.indexManager!
-                      .getIndexMeta(migrationTableCtx.tableUid, indexUid);
-                  if (existingMeta != null && existingMeta.isBuilding) {
-                    await migrationInstance.indexManager!.updateIndexMeta(
-                      table: migrationTableCtx,
-                      indexUid: indexUid,
-                      updatedMeta: existingMeta.copyWith(isBuilding: false),
-                    );
-                  }
+                  if (indexUid.isEmpty) continue;
+                  await migrationInstance.indexManager!
+                      .endIndexBuild(migrationTableCtx, indexUid);
                 }
               }
 
