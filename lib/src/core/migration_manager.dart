@@ -4660,23 +4660,17 @@ class MigrationManager {
 
             // Prefer stable tableUid (rename-safe). Fall back to name mapping
             // for legacy tasks that only recorded names.
-            final isGlobalTable = oldSchema?.isGlobal ?? false;
+            // Schema is database-wide; non-global *data* is per-space and empty
+            // spaces naturally no-op during migration.
             bool exists = false;
             final schemaMgr = migrationInstance.tableMetaManager;
             final taskTableUid = TableUid(currentTask.tableUid);
             if (schemaMgr != null) {
-              if (isGlobalTable) {
-                exists = await schemaMgr
-                            .getUidByName(TableName(originalTableName)) !=
-                        null ||
-                    await schemaMgr.getUidByName(TableName(currentTableName)) !=
-                        null;
-              } else {
-                exists = await schemaMgr.isTableNameVisibleInCurrentSpace(
-                        TableName(originalTableName)) ||
-                    await schemaMgr.isTableNameVisibleInCurrentSpace(
-                        TableName(currentTableName));
-              }
+              exists = await schemaMgr
+                          .getUidByName(TableName(originalTableName)) !=
+                      null ||
+                  await schemaMgr.getUidByName(TableName(currentTableName)) !=
+                      null;
             }
 
             if (!exists && !SystemTable.isSystemTable(originalTableName)) {
