@@ -45,6 +45,12 @@ class StorageAdapter implements StorageInterface {
   bool _isClosed = false;
   bool get isClosed => _isClosed;
 
+  void _ensureOpen() {
+    if (_isClosed) {
+      throw DbClosedException('Storage adapter is closed');
+    }
+  }
+
   /// Global scheduler and activity tracking (shared across adapters)
   static final Set<StorageAdapter> _instances = <StorageAdapter>{};
   static DateTime? _lastWriteAt;
@@ -267,7 +273,7 @@ class StorageAdapter implements StorageInterface {
       {bool append = false,
       bool flush = true,
       bool closeHandleAfterFlush = false}) async {
-    if (_isClosed) return;
+    _ensureOpen();
     final resource = _getLockResource(path);
     final writeResource = _getWriteLockResource(path);
     final opId = _generateOperationId(_writeOpPrefix);
@@ -344,7 +350,7 @@ class StorageAdapter implements StorageInterface {
   @override
   Future<void> writeAsBytes(String path, Uint8List bytes,
       {bool flush = true, bool closeHandleAfterFlush = false}) async {
-    if (_isClosed) return;
+    _ensureOpen();
     final resource = _getLockResource(path);
     final writeResource = _getWriteLockResource(path);
     final opId = _generateOperationId(_writeOpPrefix);
@@ -415,7 +421,7 @@ class StorageAdapter implements StorageInterface {
 
   @override
   Future<String?> readAsString(String path) async {
-    if (_isClosed) return null;
+    _ensureOpen();
     final resource = _getLockResource(path);
     final opId = _generateOperationId(_readOpPrefix);
 
@@ -436,7 +442,7 @@ class StorageAdapter implements StorageInterface {
 
   @override
   Future<void> deleteFile(String path) async {
-    if (_isClosed) return;
+    // Allowed after close: deleteDatabase / cleanup must still remove files.
     final resource = _getLockResource(path);
     final opId = _generateOperationId(_deleteOpPrefix);
 
@@ -461,14 +467,13 @@ class StorageAdapter implements StorageInterface {
 
   @override
   Future<bool> existsFile(String path) async {
-    if (_isClosed) return false;
     return _storage.existsFile(path);
   }
 
   @override
   Future<List<String>> listDirectory(String path,
       {bool recursive = false}) async {
-    if (_isClosed) return <String>[];
+    _ensureOpen();
     final resource = _getLockResource(path);
     final opId = _generateOperationId(_listOpPrefix);
 
@@ -505,6 +510,7 @@ class StorageAdapter implements StorageInterface {
 
   @override
   Future<DateTime?> getFileCreationTime(String path) async {
+    _ensureOpen();
     final resource = _getLockResource(path);
     final opId = _generateOperationId(_readOpPrefix);
 
@@ -526,6 +532,7 @@ class StorageAdapter implements StorageInterface {
 
   @override
   Future<Uint8List> readAsBytes(String path) async {
+    _ensureOpen();
     final resource = _getLockResource(path);
     final opId = _generateOperationId(_readOpPrefix);
 
@@ -546,6 +553,7 @@ class StorageAdapter implements StorageInterface {
 
   @override
   Future<Uint8List> readAsBytesAt(String path, int start, {int? length}) async {
+    _ensureOpen();
     final resource = _getLockResource(path);
     final opId = _generateOperationId(_readOpPrefix);
 
@@ -568,6 +576,7 @@ class StorageAdapter implements StorageInterface {
   @override
   Future<void> writeAsBytesAt(String path, int start, Uint8List bytes,
       {bool flush = true, bool closeHandleAfterFlush = false}) async {
+    _ensureOpen();
     if (bytes.isEmpty) return;
     if (start < 0) {
       throw DbException([
@@ -618,6 +627,7 @@ class StorageAdapter implements StorageInterface {
   @override
   Future<void> writeManyAsBytesAt(String path, List<ByteWrite> writes,
       {bool flush = true, bool closeHandleAfterFlush = false}) async {
+    _ensureOpen();
     if (writes.isEmpty) return;
     final resource = _getLockResource(path);
     final writeResource = _getWriteLockResource(path);
@@ -658,6 +668,7 @@ class StorageAdapter implements StorageInterface {
 
   @override
   Future<DateTime?> getFileModifiedTime(String path) async {
+    _ensureOpen();
     final resource = _getLockResource(path);
     final opId = _generateOperationId(_readOpPrefix);
 
@@ -681,6 +692,7 @@ class StorageAdapter implements StorageInterface {
 
   @override
   Future<int> getFileSize(String path) async {
+    _ensureOpen();
     final resource = _getLockResource(path);
     final opId = _generateOperationId(_readOpPrefix);
 
@@ -702,6 +714,7 @@ class StorageAdapter implements StorageInterface {
 
   @override
   Future<void> deleteDirectory(String path) async {
+    // Allowed after close: deleteDatabase / space cleanup.
     final resource = _getLockResource(path);
     final opId = _generateOperationId(_deleteOpPrefix);
 
@@ -724,6 +737,7 @@ class StorageAdapter implements StorageInterface {
 
   @override
   Future<void> copyDirectory(String sourcePath, String destinationPath) async {
+    _ensureOpen();
     final sourceResource = _getLockResource(sourcePath);
     final destResource = _getLockResource(destinationPath);
     final opId = _generateOperationId(_writeOpPrefix);
@@ -791,6 +805,7 @@ class StorageAdapter implements StorageInterface {
 
   @override
   Future<void> moveDirectory(String sourcePath, String destinationPath) async {
+    _ensureOpen();
     final sourceResource = _getLockResource(sourcePath);
     final destResource = _getLockResource(destinationPath);
     final opId = _generateOperationId(_writeOpPrefix);
@@ -833,6 +848,7 @@ class StorageAdapter implements StorageInterface {
 
   @override
   Future<void> copyFile(String sourcePath, String destinationPath) async {
+    _ensureOpen();
     final sourceResource = _getLockResource(sourcePath);
     final destResource = _getLockResource(destinationPath);
     final opId = _generateOperationId(_writeOpPrefix);
@@ -900,6 +916,7 @@ class StorageAdapter implements StorageInterface {
 
   @override
   Stream<String> readLinesStream(String path, {int offset = 0}) async* {
+    _ensureOpen();
     final resource = _getLockResource(path);
     final opId = _generateOperationId(_readOpPrefix);
 
@@ -926,6 +943,7 @@ class StorageAdapter implements StorageInterface {
   @override
   Future<void> writeLinesStream(String path, Stream<String> lines,
       {bool append = false}) async {
+    _ensureOpen();
     final resource = _getLockResource(path);
     final opId = _generateOperationId(_writeOpPrefix);
 
@@ -947,12 +965,14 @@ class StorageAdapter implements StorageInterface {
 
   @override
   Future<void> ensureDirectoryExists(String path) async {
+    _ensureOpen();
     return _storage.ensureDirectoryExists(path);
   }
 
   @override
   Future<int> appendBytes(String path, Uint8List bytes,
       {bool flush = true, bool closeHandleAfterFlush = false}) async {
+    _ensureOpen();
     final resource = _getLockResource(path);
     final opId = _generateOperationId(_writeOpPrefix);
     bool acquired = false;
@@ -977,6 +997,7 @@ class StorageAdapter implements StorageInterface {
   @override
   Future<int> appendString(String path, String content,
       {bool flush = true, bool closeHandleAfterFlush = false}) async {
+    _ensureOpen();
     final resource = _getLockResource(path);
     final opId = _generateOperationId(_writeOpPrefix);
     bool acquired = false;
@@ -1000,6 +1021,7 @@ class StorageAdapter implements StorageInterface {
 
   @override
   Future<List<String>> readAsLines(String path, {int offset = 0}) async {
+    _ensureOpen();
     final resource = _getLockResource(path);
     final opId = _generateOperationId(_readOpPrefix);
     bool acquired = false;
@@ -1020,12 +1042,14 @@ class StorageAdapter implements StorageInterface {
 
   @override
   Future<void> flushFile(String path) async {
+    _ensureOpen();
     return _storage.flushFile(path);
   }
 
   @override
   Future<void> flushAll(
       {String? path, List<String>? paths, bool closeHandles = false}) async {
+    // Allowed after close when releasing handles; pool is empty once closed.
     // Prevent concurrent flushes which could thrash IO
     if (_flushInProgress) return;
     _flushInProgress = true;
@@ -1039,11 +1063,13 @@ class StorageAdapter implements StorageInterface {
 
   @override
   Future<void> configureStorage({int? maxOpenHandles}) async {
+    _ensureOpen();
     return _storage.configureStorage(maxOpenHandles: maxOpenHandles);
   }
 
   @override
   Future<void> replaceFileAtomic(String tempPath, String finalPath) async {
+    _ensureOpen();
     // Acquire exclusive lock on final path to serialize atomic replacement
     final resource = _getLockResource(finalPath);
     final opId = _generateOperationId(_writeOpPrefix);

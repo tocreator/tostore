@@ -116,12 +116,7 @@ class FileStorageImpl implements StorageInterface {
 
   Future<RandomAccessFile> _getHandle(String path, FileMode mode) async {
     if (_closed) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message: 'Storage is closed',
-        ),
-      ]);
+      throw DbClosedException('Storage is closed');
     }
     final key = _poolKey(path, mode);
     final file = File(path);

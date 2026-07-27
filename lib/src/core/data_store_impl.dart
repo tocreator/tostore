@@ -708,9 +708,11 @@ class DataStoreImpl {
     _startupProgressCallback?.call(0.0, DbStartupStage.opening);
     try {
       if (_config != null && (reinitialize || _isInitialized)) {
+        // Always close the underlying storage when we are about to rebuild
+        // managers + StorageAdapter below. Leaving it open leaks handle pools
         await close(
             persistChanges: !noPersistOnClose,
-            closeStorage: false,
+            closeStorage: true,
             removeRegistry: false);
       }
       _globalQueryCancelToken = CancellationToken();
@@ -791,6 +793,10 @@ class DataStoreImpl {
       _currentSpaceName = _config!.spaceName;
 
       lockManager = SharedEngineRegistry.getLockManager(_instanceKey);
+      // Close any previous adapter before replacing the field. Covers paths
+      try {
+        await storage.close();
+      } catch (_) {}
       storage = isMemoryMode
           ? StorageAdapter.forStorage(const NoopStorageImpl(),
               lockManager: lockManager!)
@@ -6398,10 +6404,11 @@ class DataStoreImpl {
 
     final oldSpaceName = _currentSpaceName;
     try {
-      // 1. Unified shutdown logic for the current space via close()
-      // closeStorage: false keeps the driver connection alive during space switch.
-      // removeRegistry: false ensures this DataStoreImpl instance stays in the factory cache.
-      await close(closeStorage: false, removeRegistry: false);
+      // 1. Unified shutdown logic for the current space via close().
+      // closeStorage: true releases the handle pool / Web retain so late async
+      // cannot reopen files belonging to the old space (Windows errno 32).
+      // initialize() rebuilds a fresh StorageAdapter afterwards.
+      await close(closeStorage: true, removeRegistry: false);
 
       // 2. Update current space name and config
       _currentSpaceName = spaceName;
