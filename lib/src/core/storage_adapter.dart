@@ -488,13 +488,19 @@ class StorageAdapter implements StorageInterface {
   }
 
   @override
-  Future<void> close({bool isMigrationInstance = false}) async {
+  Future<void> close() async {
     if (_isClosed) return;
     _isClosed = true;
-    if (!isMigrationInstance) {
+    // Always release the backend:
+    // - Native FileStorageImpl: per-adapter handle pool (must close).
+    // - Web WebStorageImpl: shared IndexedDB; refcounted until last retainer.
+    try {
       await _storage.close();
+    } finally {
+      // Unregister even if backend close throws, so global flushAll
+      // does not keep operating on a half-closed adapter.
+      _instances.remove(this);
     }
-    _instances.remove(this);
   }
 
   @override
