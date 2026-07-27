@@ -70,6 +70,8 @@ class MigrationManager {
   int? _currentDirIndexCache;
   // Lock for thread-safe access to cache
   Future<MigrationMeta>? _loadingFuture;
+  // Serializes migration_meta read-modify-write (mapping + keyMigrationInfo).
+  Future<void> _migrationMetaWriteChain = Future<void>.value();
   // Runtime conversion descriptors for tables that are schema-updated but data not fully migrated yet.
   final Map<TableUid, _RuntimeMigrationDescriptor> _runtimeMigrations =
       <TableUid, _RuntimeMigrationDescriptor>{};
@@ -180,16 +182,20 @@ class MigrationManager {
 
   /// Persist key migration metadata and sync [GlobalConfig.hasMigrationTask].
   Future<void> persistKeyMigrationInfo(KeyMigrationInfo info) async {
-    final meta = await _getOrLoadMigrationMeta();
-    await _saveMigrationMeta(meta.copyWith(keyMigrationInfo: info));
+    await _runMigrationMetaWrite(() async {
+      final meta = await _getOrLoadMigrationMeta();
+      await _saveMigrationMeta(meta.copyWith(keyMigrationInfo: info));
+    });
     await syncHasMigrationTask();
   }
 
   /// Remove key migration metadata after successful completion.
   Future<void> clearKeyMigrationInfo() async {
-    final meta = await _getOrLoadMigrationMeta();
-    if (meta.keyMigrationInfo == null) return;
-    await _saveMigrationMeta(meta.copyWith(clearKeyMigrationInfo: true));
+    await _runMigrationMetaWrite(() async {
+      final meta = await _getOrLoadMigrationMeta();
+      if (meta.keyMigrationInfo == null) return;
+      await _saveMigrationMeta(meta.copyWith(clearKeyMigrationInfo: true));
+    });
     await syncHasMigrationTask();
   }
 
@@ -4162,8 +4168,29 @@ class MigrationManager {
     }
   }
 
-  /// Save migration metadata to file and update cache
-  Future<void> _saveMigrationMeta(MigrationMeta meta) async {
+  /// Run [action] exclusively against migration_meta mutations.
+  ///
+  /// Callers that read-modify-write [directoryMapping] / keyMigrationInfo must
+  /// re-load meta inside [action] so concurrent cleanup cannot be overwritten.
+  Future<T> _runMigrationMetaWrite<T>(Future<T> Function() action) async {
+    final previous = _migrationMetaWriteChain;
+    final gate = Completer<void>();
+    _migrationMetaWriteChain = gate.future;
+    try {
+      await previous;
+    } catch (_) {
+      // Prior write failure must not stall the chain.
+    }
+    try {
+      return await action();
+    } finally {
+      gate.complete();
+    }
+  }
+
+  /// Save migration metadata to file and update cache.
+  /// Returns false when the write failed (cache left unchanged).
+  Future<bool> _saveMigrationMeta(MigrationMeta meta) async {
     try {
       final metaPath = _dataStore.pathManager.getMigrationMetaPath();
       final bytes = MigrationMetaCodec.encodeFile(
@@ -4175,8 +4202,10 @@ class MigrationManager {
       // Update cache after successful save
       _migrationMetaCache = meta;
       _updateCurrentDirIndexCache();
+      return true;
     } catch (e) {
       Logger.warn('Save migration meta failed', rawError: e);
+      return false;
     }
   }
 
@@ -4188,45 +4217,51 @@ class MigrationManager {
       task,
       encryptionConfig: _dataStore.config.encryptionConfig,
     );
+    // Task body first; crash before mapping update leaves an orphan file (OK).
     await _dataStore.storage.writeAsBytes(taskPath, bytes);
 
-    // update meta data with directory mapping
-    final meta = await _getOrLoadMigrationMeta();
-    final currentMapping = meta.directoryMapping;
+    // Mapping RMW under the meta write chain using the latest cache snapshot.
+    final saved = await _runMigrationMetaWrite(() async {
+      final meta = await _getOrLoadMigrationMeta();
+      final currentMapping = meta.directoryMapping;
 
-    // Check if task already exists in mapping
-    final existingDirIndex = currentMapping.getDirIndex(task.taskId);
+      final existingDirIndex = currentMapping.getDirIndex(task.taskId);
 
-    // Build updated mapping
-    final newIdToDir = Map<String, int>.from(currentMapping.idToDir);
-    newIdToDir[task.taskId] = task.dirIndex;
+      final newIdToDir = Map<String, int>.from(currentMapping.idToDir);
+      newIdToDir[task.taskId] = task.dirIndex;
 
-    final newDirToFileCount = Map<int, int>.from(currentMapping.dirToFileCount);
+      final newDirToFileCount =
+          Map<int, int>.from(currentMapping.dirToFileCount);
 
-    // If task was moved from another directory, decrement old directory count
-    if (existingDirIndex != null && existingDirIndex != task.dirIndex) {
-      final oldCount = newDirToFileCount[existingDirIndex] ?? 0;
-      if (oldCount > 1) {
-        newDirToFileCount[existingDirIndex] = oldCount - 1;
-      } else {
-        // Remove directory from mapping when count reaches 0
-        newDirToFileCount.remove(existingDirIndex);
+      if (existingDirIndex != null && existingDirIndex != task.dirIndex) {
+        final oldCount = newDirToFileCount[existingDirIndex] ?? 0;
+        if (oldCount > 1) {
+          newDirToFileCount[existingDirIndex] = oldCount - 1;
+        } else {
+          newDirToFileCount.remove(existingDirIndex);
+        }
       }
+
+      if (existingDirIndex == null || existingDirIndex != task.dirIndex) {
+        final newCount = newDirToFileCount[task.dirIndex] ?? 0;
+        newDirToFileCount[task.dirIndex] = newCount + 1;
+      }
+
+      final updatedMapping = DirectoryMappingString(
+        idToDir: newIdToDir,
+        dirToFileCount: newDirToFileCount,
+      );
+
+      return _saveMigrationMeta(
+        meta.copyWith(directoryMapping: updatedMapping),
+      );
+    });
+
+    if (!saved) {
+      Logger.warn(
+        'Failed to persist directory mapping for taskId[${task.taskId}]',
+      );
     }
-
-    // Increment only for new tasks or cross-directory moves (not in-place updates).
-    if (existingDirIndex == null || existingDirIndex != task.dirIndex) {
-      final newCount = newDirToFileCount[task.dirIndex] ?? 0;
-      newDirToFileCount[task.dirIndex] = newCount + 1;
-    }
-
-    final updatedMapping = DirectoryMappingString(
-      idToDir: newIdToDir,
-      dirToFileCount: newDirToFileCount,
-    );
-
-    final updatedMeta = meta.copyWith(directoryMapping: updatedMapping);
-    await _saveMigrationMeta(updatedMeta);
   }
 
   /// Get all space names
@@ -5689,15 +5724,28 @@ class MigrationManager {
   ///
   /// Order matters for concurrent [queryTaskStatus] / recovery:
   /// remove mapping first (source of truth that the task is gone), then delete
-  /// the file. Crash mid-cleanup may leave an orphan file (harmless GC later),
-  /// but must not leave "in mapping / file missing" which polls treat as warn.
+  /// the file. Mapping persist must succeed before delete — otherwise a failed
+  /// meta write would leave "in mapping / file missing". Crash after mapping
+  /// removal may leave an orphan file (harmless GC later).
   Future<void> _cleanupTask(MigrationTask task) async {
     try {
-      final meta = await _getOrLoadMigrationMeta();
-      if (meta.directoryMapping.getDirIndex(task.taskId) != null) {
+      final mappingRemoved = await _runMigrationMetaWrite(() async {
+        final meta = await _getOrLoadMigrationMeta();
+        if (meta.directoryMapping.getDirIndex(task.taskId) == null) {
+          return true;
+        }
         final updatedMapping = meta.directoryMapping.removeId(task.taskId);
-        final updatedMeta = meta.copyWith(directoryMapping: updatedMapping);
-        await _saveMigrationMeta(updatedMeta);
+        return _saveMigrationMeta(
+          meta.copyWith(directoryMapping: updatedMapping),
+        );
+      });
+
+      if (!mappingRemoved) {
+        Logger.warn(
+          'Skip deleting migration task file because mapping update failed: '
+          'taskId[${task.taskId}]',
+        );
+        return;
       }
 
       final taskPath = _dataStore.pathManager
@@ -5761,7 +5809,7 @@ class MigrationManager {
         final fileExists = await _dataStore.storage.existsFile(taskPath);
 
         if (!fileExists) {
-          Logger.warn(
+          Logger.info(
             'Task file not found but exists in mapping: taskId[$taskId], dirIndex[$dirIndex], cleaning up mapping',
           );
           tasksToRemove.add(taskId);
@@ -5786,7 +5834,7 @@ class MigrationManager {
             tasksToRemove.add(taskId);
           }
         } else {
-          Logger.warn(
+          Logger.info(
             'Task file is empty: taskId[$taskId], dirIndex[$dirIndex], cleaning up mapping',
           );
           tasksToRemove.add(taskId);
@@ -5888,24 +5936,26 @@ class MigrationManager {
   /// Clean up orphaned task mappings (tasks that no longer exist)
   Future<void> _cleanupOrphanedMappings(List<String> taskIds) async {
     try {
-      final meta = await _getOrLoadMigrationMeta();
-      var updatedMapping = meta.directoryMapping;
+      await _runMigrationMetaWrite(() async {
+        final meta = await _getOrLoadMigrationMeta();
+        var updatedMapping = meta.directoryMapping;
 
-      // Remove each orphaned task from mapping
-      for (final taskId in taskIds) {
-        updatedMapping = updatedMapping.removeId(taskId);
-      }
+        for (final taskId in taskIds) {
+          updatedMapping = updatedMapping.removeId(taskId);
+        }
 
-      // Only save if mapping changed
-      if (updatedMapping.idToDir.length !=
-          meta.directoryMapping.idToDir.length) {
-        final updatedMeta = meta.copyWith(directoryMapping: updatedMapping);
-        await _saveMigrationMeta(updatedMeta);
-
-        Logger.info(
-          'Cleaned up ${taskIds.length} orphaned task mapping(s)',
-        );
-      }
+        if (updatedMapping.idToDir.length !=
+            meta.directoryMapping.idToDir.length) {
+          final saved = await _saveMigrationMeta(
+            meta.copyWith(directoryMapping: updatedMapping),
+          );
+          if (saved) {
+            Logger.info(
+              'Cleaned up ${taskIds.length} orphaned task mapping(s)',
+            );
+          }
+        }
+      });
     } catch (e) {
       Logger.error('Failed to cleanup orphaned mappings', rawError: e);
     }
@@ -5986,7 +6036,7 @@ class MigrationManager {
       final fileExists = await _dataStore.storage.existsFile(taskPath);
       if (!fileExists) {
         // File doesn't exist but mapping has it - cleanup mapping
-        Logger.warn(
+        Logger.info(
           'Task file not found but exists in mapping: taskId[$taskId], dirIndex[$dirIndex], cleaning up mapping',
         );
         await _cleanupOrphanedMappings([taskId]);
@@ -6006,7 +6056,7 @@ class MigrationManager {
 
       if (taskBytes.isEmpty) {
         // File exists but is empty - cleanup mapping
-        Logger.warn(
+        Logger.info(
           'Task file is empty: taskId[$taskId], dirIndex[$dirIndex], cleaning up mapping',
         );
         await _cleanupOrphanedMappings([taskId]);
