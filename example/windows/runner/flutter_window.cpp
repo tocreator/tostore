@@ -51,6 +51,11 @@ LRESULT
 FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
                               WPARAM const wparam,
                               LPARAM const lparam) noexcept {
+  // Keep title bar text empty (icon only) to prevent visual redundancy with in-app header
+  if (message == WM_SETTEXT) {
+    return Win32Window::MessageHandler(hwnd, message, wparam, reinterpret_cast<LPARAM>(L""));
+  }
+
   // Give Flutter, including plugins, an opportunity to handle window messages.
   if (flutter_controller_) {
     std::optional<LRESULT> result =
