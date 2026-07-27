@@ -31,9 +31,10 @@ import 'transaction_log_migration.dart';
 import 'weight_format_migration.dart';
 
 /// Version 3 upgrade:
-/// - Bootstraps `_system_table_meta` + internal KV only; migrates 3.1.2 schema
-///   partitions (user + existing system tables) into `TableMeta` rows, then
-///   renames directories to stable UIDs (no SchemaMeta/routes rewrite).
+/// - Bootstraps `_system_table_meta` + internal KV + `_system_fk_references` +
+///   `_system_key_migration`; migrates 3.1.2 schema partitions (user + existing
+///   system tables) into `TableMeta` rows via memory + durable writeChanges,
+///   then renames directories to stable UIDs (no SchemaMeta/routes rewrite).
 /// - Restructures storage directory names from physical table/index names to stable UIDs.
 /// - Primes [GlobalConfig.pageSize] (sample legacy meta.json / default) before
 ///   bootstrap so index page0 writes never see pageSize=0.
@@ -47,7 +48,8 @@ import 'weight_format_migration.dart';
 /// - Blocking [MetaFormatMigration]: WAL/Txn `meta.json` → `meta.tobf` (same V3
 ///   pass, before version bump; KeyManager primed for EncryptionScope.full).
 /// - Blocking [MigrationFormatMigration]: `migration_meta` / `task_*` JSON →
-///   `.tobf` (after WAL/Txn meta; before version bump).
+///   `.tobf` (after WAL/Txn meta; before version bump; accepts v1 dirUsage/taskIndex
+///   via [MigrationMeta.fromJson]).
 /// - Bumps version config markers last (after format migrations) for crash resume.
 /// - Async [WeightFormatMigration]: `cache_weights.json` → `access_weights.tobf`
 ///   (non-blocking; loss acceptable; not WAL-backed).
@@ -58,7 +60,50 @@ class V3Upgrade {
   /// Sampled once from legacy table/index meta.json during page0 migration.
   int? _discoveredPageSize;
 
+  /// Legacy artifact paths removed after upgrade completes (non-blocking).
+  final List<String> _pendingLegacyFileDeletes = [];
+  final List<String> _pendingLegacyDirectoryDeletes = [];
+
   V3Upgrade(this._dataStore);
+
+  void _scheduleLegacyFileDelete(String filePath) {
+    if (filePath.isEmpty) return;
+    _pendingLegacyFileDeletes.add(filePath);
+  }
+
+  void _scheduleLegacyDirectoryDelete(String dirPath) {
+    if (dirPath.isEmpty) return;
+    _pendingLegacyDirectoryDeletes.add(dirPath);
+  }
+
+  Future<void> _runLegacyArtifactCleanupAsync() async {
+    for (final filePath in _pendingLegacyFileDeletes) {
+      try {
+        if (await _dataStore.storage.existsFile(filePath)) {
+          await _dataStore.storage.deleteFile(filePath);
+        }
+      } catch (e) {
+        Logger.warn(
+          'v3: async legacy file cleanup failed: $filePath',
+          rawError: e,
+        );
+      }
+    }
+    for (final dirPath in _pendingLegacyDirectoryDeletes) {
+      try {
+        if (await _dataStore.storage.existsDirectory(dirPath)) {
+          await _dataStore.storage.deleteDirectory(dirPath);
+        }
+      } catch (e) {
+        Logger.warn(
+          'v3: async legacy directory cleanup failed: $dirPath',
+          rawError: e,
+        );
+      }
+    }
+    _pendingLegacyFileDeletes.clear();
+    _pendingLegacyDirectoryDeletes.clear();
+  }
 
   String _getLegacySchemaMetaPath(String instancePath) {
     return pathJoin(instancePath, 'schemas', 'schema_meta.json');
@@ -195,7 +240,9 @@ class V3Upgrade {
     for (final tableName in tablePartitionMap.keys) {
       // Brand-new bootstrap tables are not in 3.1.2 partitions.
       if (SystemTable.isTableMetaTable(tableName) ||
-          SystemTable.isInternalKeyValueTable(tableName)) {
+          SystemTable.isInternalKeyValueTable(tableName) ||
+          SystemTable.isFkReferencesTable(tableName) ||
+          tableName == SystemTable.keyMigrationProgressTableName) {
         continue;
       }
       final partitionIndex = tablePartitionMap[tableName]!;
@@ -204,6 +251,7 @@ class V3Upgrade {
           .add(tableName);
     }
 
+    final pendingIngestMetas = <TableMeta>[];
     for (final entry in tablesByPartition.entries) {
       final partitionIndex = entry.key;
       final tableNames = entry.value;
@@ -262,7 +310,7 @@ class V3Upgrade {
           final layout =
               schemaMgr.evolveFieldStorageLayout(nextSchema: upgradedSchema);
           final now = DateTime.now();
-          await schemaMgr.saveTableMeta(
+          final saved = await schemaMgr.saveTableMeta(
             TableMeta(
               tableUid: tableUid,
               tableName: TableName(tableName),
@@ -273,9 +321,11 @@ class V3Upgrade {
               createdAt: tableCreatedAt,
               updatedAt: now,
             ),
+            memoryOnly: true,
             dirIndex: finalDirIndex,
             layoutOverride: layout,
           );
+          pendingIngestMetas.add(saved);
         } catch (e) {
           Logger.error(
               'Failed to upgrade schema for table $tableName in v3 upgrade',
@@ -283,6 +333,7 @@ class V3Upgrade {
         }
       }
     }
+    await _durablyPersistTableMetaRows(pendingIngestMetas);
 
     // Dir high-water is folded into the single GlobalConfig write below.
     final resolvedSystemHash = systemSchemaHash ??
@@ -356,23 +407,18 @@ class V3Upgrade {
     final resolvedPageSize =
         _discoveredPageSize ?? _dataStore.configuredPageSize;
 
-    // 7. Delete old partition files and schema_meta only after everything succeeds
+    // 7. Schedule legacy schema artifact cleanup (async after version bump).
     for (final partitionIndex in tablePartitionMap.values.toSet()) {
       final dirIndex = partitionToDir[partitionIndex] ??
           (partitionIndex ~/ _dataStore.maxEntriesPerDir);
-      final partitionPath = _getLegacySchemaPartitionFilePath(
-          _dataStore.instancePath!, partitionIndex, dirIndex);
-      if (await _dataStore.storage.existsFile(partitionPath)) {
-        await _dataStore.storage.deleteFile(partitionPath);
-      }
+      _scheduleLegacyFileDelete(_getLegacySchemaPartitionFilePath(
+          _dataStore.instancePath!, partitionIndex, dirIndex));
     }
 
-    if (await _dataStore.storage.existsFile(schemaMetaPath)) {
-      await _dataStore.storage.deleteFile(schemaMetaPath);
-    }
-    if (await _dataStore.storage.existsFile(schemaMetaPathOld)) {
-      await _dataStore.storage.deleteFile(schemaMetaPathOld);
-    }
+    _scheduleLegacyFileDelete(schemaMetaPath);
+    _scheduleLegacyFileDelete(schemaMetaPathOld);
+    _scheduleLegacyDirectoryDelete(
+        pathJoin(_dataStore.instancePath!, 'schemas'));
 
     // Migrate in-flight parallel batch plans from A/B journal into WalMeta,
     // then delete legacy journal files.
@@ -436,9 +482,17 @@ class V3Upgrade {
         Logger.warn('WeightFormatMigration async failed', rawError: e);
       }),
     );
+
+    // Non-blocking: schemas/, schema partitions, per-table maxid.txt, etc.
+    unawaited(
+      _runLegacyArtifactCleanupAsync().catchError((Object e) {
+        Logger.warn('v3: legacy artifact async cleanup failed', rawError: e);
+      }),
+    );
   }
 
-  /// Create `_system_table_meta` + engine-internal KV (space + global).
+  /// Create engine bootstrap system tables that must exist before remaining
+  /// system/user tables (meta store, internal KV, FK reverse index, key migration).
   Future<void> _ensureBootstrapSystemTables() async {
     await _dataStore.keyManager.initialize();
 
@@ -447,6 +501,8 @@ class V3Upgrade {
       SystemTable.tableMetaTable(),
       SystemTable.internalKVTable(false),
       SystemTable.internalKVTable(true),
+      SystemTable.fkReferencesTable(),
+      SystemTable.keyMigrationProgressTable(),
     ]) {
       final created = await _bootstrapSystemTableMemoryAndShells(schema);
       if (created != null) {
@@ -506,12 +562,7 @@ class V3Upgrade {
       dirIndex: saved.dirIndex,
       schema: saved.schema,
     );
-    final btreeIndexes = schemaMgr.getBtreeIndexesFor(saved.schema);
-    await _dataStore.indexManager?.initializeEmptyTableIndexes(
-      tableCtx,
-      btreeIndexes,
-      tableSchemaOverride: saved.schema,
-    );
+    // Index files/meta are created lazily on first write via writeChanges.
     _dataStore.tableDataManager.tableCreated(tableCtx);
     return saved;
   }
@@ -825,6 +876,9 @@ class V3Upgrade {
       tableRoot: newPath,
       indexUidMap: indexUidMap,
     );
+
+    // Legacy sidecar unused by btree maxAutoIncrementId — async delete after bump.
+    _scheduleLegacyFileDelete(path.join(newPath, 'maxid.txt'));
   }
 
   Future<void> _moveDirectoryIfNeeded(String oldPath, String newPath) async {
