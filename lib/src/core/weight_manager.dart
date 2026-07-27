@@ -185,10 +185,6 @@ class WeightManager {
 
         final isSystemTable = SystemTable.isSystemTable(tableName);
 
-        final existsInSpace =
-            await _dataStore.tableExistsInCurrentSpace(tableName);
-        if (!existsInSpace) continue;
-
         final schema = await _dataStore.tableMetaManager
             ?.getTableSchemaByName(TableName(tableName));
         if (schema == null) continue;
@@ -572,10 +568,6 @@ class WeightManager {
       final allTables = await _dataStore.getTableNames();
       for (final tableName in allTables) {
         await yieldController.maybeYield();
-
-        final existsInSpace =
-            await _dataStore.tableExistsInCurrentSpace(tableName);
-        if (!existsInSpace) continue;
 
         final schema =
             await schemaMgr.getTableSchemaByName(TableName(tableName));
