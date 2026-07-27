@@ -118,14 +118,18 @@ class SystemTable {
     tableMetaTable(),
     internalKVTable(false),
     internalKVTable(true),
-    _fkReferencesTable(),
+    fkReferencesTable(),
     _kVTable(false),
     _kVTable(true),
-    _keyMigrationProgressTable(),
+    keyMigrationProgressTable(),
   ];
 
   /// Whether [tableName] is the table-meta system table.
   static bool isTableMetaTable(String tableName) => tableName == tableMetaName;
+
+  /// Whether [tableName] is the foreign-key reverse-index system table.
+  static bool isFkReferencesTable(String tableName) =>
+      tableName == _fkReferencesName;
 
   /// Table structure metadata store (binary schema + layout per table).
   ///
@@ -218,7 +222,7 @@ class SystemTable {
   /// Indexes:
   /// - Primary key: (referenced_table, referencing_table, fk_name) for O(1) lookup
   /// - Index on referenced_table: For fast lookup of all tables referencing a given table
-  static TableSchema _fkReferencesTable() => TableSchema(
+  static TableSchema fkReferencesTable() => TableSchema(
         name: _fkReferencesName,
         tableId: 'system_fk_references',
         isGlobal: true, // System table, always global
@@ -288,7 +292,7 @@ class SystemTable {
       );
 
   /// Per-table key migration checkpoint storage (global).
-  static TableSchema _keyMigrationProgressTable() => TableSchema(
+  static TableSchema keyMigrationProgressTable() => TableSchema(
         name: keyMigrationProgressTableName,
         tableId: keyMigrationProgressTableName,
         isGlobal: true,
