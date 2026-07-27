@@ -4178,17 +4178,16 @@ class DataStoreImpl {
 
   /// Get table names.
   ///
-  /// Engine default: full inventory including system tables
-  /// ([onlyUserTables] false). Public [ToStore.getTableNames] defaults to
-  /// user tables only.
+  /// [onlyUserTables] returns only user tables (not system tables).
+  /// [isGlobal] filters by table scope (`true` / `false` / `null` = both).
   Future<List<String>> getTableNames({
-    bool onlyCurrentSpace = false,
+    bool? isGlobal,
     bool onlyUserTables = false,
   }) async {
     if (tableMetaManager == null) return <String>[];
     try {
       return await tableMetaManager!.listAllTables(
-        onlyCurrentSpace: onlyCurrentSpace,
+        isGlobal: isGlobal,
         onlyUserTables: onlyUserTables,
       );
     } catch (e) {
@@ -5992,8 +5991,8 @@ class DataStoreImpl {
       final schemaMgr = tableMetaManager;
       if (schemaMgr == null) return;
 
-      // From tableMetaManager get tables visible in the current space
-      final allTables = await getTableNames(onlyCurrentSpace: true);
+      // From tableMetaManager get all schemas (empty tables skip data load below).
+      final allTables = await getTableNames();
       if (allTables.isEmpty || !_isInitialized) return;
 
       // Sort tables by weight
@@ -6013,9 +6012,7 @@ class DataStoreImpl {
       for (final tableName in selectedTables) {
         if (!_isInitialized) break;
         try {
-          // Check if table exists in current space
-          final tableExistsInSpace = await tableExistsInCurrentSpace(tableName);
-          if (!tableExistsInSpace || !_isInitialized) {
+          if (!_isInitialized) {
             continue;
           }
 
@@ -6165,8 +6162,7 @@ class DataStoreImpl {
     for (final tableName in userTables) {
       if (!_isInitialized) break;
       try {
-        final tableExistsInSpace = await tableExistsInCurrentSpace(tableName);
-        if (!tableExistsInSpace || !_isInitialized) continue;
+        if (!_isInitialized) continue;
 
         final table = await getTableContext(tableName);
         final tableDataMeta =
@@ -7423,17 +7419,6 @@ class DataStoreImpl {
     }
   }
 
-  /// Check if table exists in current space (global or active in this space).
-  Future<bool> tableExistsInCurrentSpace(String tableName) async {
-    if (tableMetaManager == null) return false;
-    final uid = await tableMetaManager!.getUidByName(TableName(tableName));
-    if (uid == null) return false;
-    final active = await tableMetaManager!.getActiveUids(
-      onlyUserTables: false,
-    );
-    return active.contains(uid);
-  }
-
   /// Get information about the current space
   Future<SpaceInfo> getSpaceInfo({bool useCache = true}) async {
     try {
@@ -7452,22 +7437,14 @@ class DataStoreImpl {
         config = await getSpaceConfig();
       }
 
-      final activeUids = await tableMetaManager?.getActiveUids(
-            onlyUserTables: true,
-          ) ??
-          [];
-      final userTables = <String>[];
-      for (final uid in activeUids) {
-        final name = await tableMetaManager?.getNameByUid(TableUid(uid));
-        if (name != null && name.isNotEmpty) {
-          userTables.add(name.value);
-        }
-      }
+      // Schema inventory (user tables). Record/size stats remain space-local
+      // via [SpaceConfig] / path isolation — not a "touched tables" list.
+      final userTables = await getTableNames(onlyUserTables: true);
 
       // Create the SpaceInfo object with user-table information
       return SpaceInfo(
         spaceName: _currentSpaceName,
-        tableCount: userTables.length, // Use actual count of user tables
+        tableCount: userTables.length,
         recordCount: config?.totalRecordCount ?? 0,
         dataSizeBytes: config?.totalDataSizeBytes ?? 0,
         lastStatisticsTime: config?.lastStatisticsTime,
