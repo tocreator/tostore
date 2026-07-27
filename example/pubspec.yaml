@@ -30,7 +30,6 @@ dependencies:
   cupertino_icons: ^1.0.8
   path_provider: ^2.1.5
   path: ^1.9.1
-  window_manager: ^0.5.1
 
 dev_dependencies:
   integration_test:
