@@ -19,6 +19,12 @@ class WebStorageImpl implements StorageInterface {
   static final Map<String, WebStorageImpl> _instances = {};
   IDBDatabase? _db;
   bool _closed = false;
+
+  /// How many [StorageAdapter] (or other) clients currently retain this
+  /// singleton. Native [FileStorageImpl] is per-adapter; web IndexedDB is
+  /// shared under one db name — closing while primary still uses it causes
+  /// `InvalidStateError: The database connection is closing`.
+  int _refCount = 0;
   final Completer<void> _initCompleter = Completer<void>();
 
   // In-memory write buffer to simulate OS page cache on web.
@@ -29,8 +35,15 @@ class WebStorageImpl implements StorageInterface {
   static const String _fileStore = 'files'; // file storage（meta data）
 
   factory WebStorageImpl(String dbName) {
-    return _instances.putIfAbsent(
-        dbName, () => WebStorageImpl._internal(dbName));
+    final existing = _instances[dbName];
+    if (existing != null && !existing._closed) {
+      existing._refCount++;
+      return existing;
+    }
+    final created = WebStorageImpl._internal(dbName);
+    created._refCount = 1;
+    _instances[dbName] = created;
+    return created;
   }
 
   WebStorageImpl._internal(String dbName) {
@@ -360,9 +373,24 @@ class WebStorageImpl implements StorageInterface {
     return result.cast<String>().toList();
   }
 
-  /// close database connection
+  /// Release one retain on this singleton. The IndexedDB connection is closed
+  /// only when the last client releases (or [force] is true).
   @override
-  Future<void> close() async {
+  Future<void> close() => _close(force: false);
+
+  Future<void> _close({required bool force}) async {
+    if (_closed) return;
+
+    if (!force) {
+      if (_refCount > 1) {
+        _refCount--;
+        return;
+      }
+      _refCount = 0;
+    } else {
+      _refCount = 0;
+    }
+
     _closed = true;
     await _initCompleter.future; // ensure database is initialized
 
@@ -383,8 +411,10 @@ class WebStorageImpl implements StorageInterface {
           )
         ]);
       }
+      final name = _db!.name;
       _db!.close();
-      _instances.remove(_db!.name);
+      _db = null;
+      _instances.remove(name);
     } catch (e) {
       Logger.error('Close database failed', rawError: e);
       throw _wrapWebIoError(e, 'close', 'IndexedDB');
@@ -396,7 +426,7 @@ class WebStorageImpl implements StorageInterface {
     try {
       final instance = _instances[dbName];
       if (instance != null) {
-        await instance.close();
+        await instance._close(force: true);
       }
 
       final request = window.indexedDB.deleteDatabase(dbName);
