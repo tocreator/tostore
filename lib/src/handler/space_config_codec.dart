@@ -8,13 +8,12 @@ import 'config_file_codec.dart';
 /// Stable field IDs for [SpaceConfig] binary encoding. Never reuse IDs.
 abstract final class SpaceConfigFieldId {
   static const int current = 1;
-  static const int previous = 2;
-  static const int historyKeys = 3;
-  static const int version = 4;
-  static const int totalTableCount = 5;
-  static const int totalRecordCount = 6;
-  static const int totalDataSizeBytes = 7;
-  static const int lastStatisticsTime = 8;
+  static const int historyKeys = 2;
+  static const int version = 3;
+  static const int totalTableCount = 4;
+  static const int totalRecordCount = 5;
+  static const int totalDataSizeBytes = 6;
+  static const int lastStatisticsTime = 7;
 }
 
 /// Nested [EncryptionKeyInfo] field IDs.
@@ -82,12 +81,6 @@ final class SpaceConfigCodec {
       _writeKeyInfo(sub, config.current);
     });
 
-    if (config.previous != null) {
-      w.writeMessage(SpaceConfigFieldId.previous, (sub) {
-        _writeKeyInfo(sub, config.previous!);
-      });
-    }
-
     for (final hist in config.historyKeys) {
       w.writeMessage(SpaceConfigFieldId.historyKeys, (sub) {
         _writeKeyInfo(sub, hist);
@@ -114,7 +107,6 @@ final class SpaceConfigCodec {
   /// Decode field-tag payload into [SpaceConfig].
   static SpaceConfig decodePayload(Uint8List bytes) {
     EncryptionKeyInfo? current;
-    EncryptionKeyInfo? previous;
     final historyKeys = <EncryptionKeyInfo>[];
     int? version;
     var totalTableCount = 0;
@@ -130,11 +122,6 @@ final class SpaceConfigCodec {
           case SpaceConfigFieldId.current:
             r.readMessage((child, _) {
               current = _readKeyInfo(child);
-            });
-            break;
-          case SpaceConfigFieldId.previous:
-            r.readMessage((child, _) {
-              previous = _readKeyInfo(child);
             });
             break;
           case SpaceConfigFieldId.historyKeys:
@@ -167,7 +154,6 @@ final class SpaceConfigCodec {
 
     return SpaceConfig(
       current: current ?? const EncryptionKeyInfo(key: '', keyId: 0),
-      previous: previous,
       historyKeys: historyKeys,
       version: version,
       totalTableCount: totalTableCount,
