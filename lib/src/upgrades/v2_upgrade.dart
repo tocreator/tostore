@@ -1,17 +1,11 @@
 import 'dart:convert';
 import 'dart:math';
-import 'dart:typed_data';
 import '../handler/common.dart';
 import '../handler/encryption.dart';
 import '../handler/logger.dart';
 import '../handler/chacha20_poly1305_old.dart';
 import '../model/global_config.dart';
-import '../model/data_store_config.dart';
-import '../model/meta_info.dart';
-import '../model/db_exception.dart';
-import '../model/result_status.dart';
-import '../model/result_type.dart';
-import '../model/space_config.dart';
+import '../model/table_meta.dart';
 import '../core/data_store_impl.dart';
 import '../core/workload_scheduler.dart';
 import '../handler/parallel_processor.dart';
@@ -21,9 +15,11 @@ import 'v3_upgrade.dart';
 import '../model/table_identity.dart';
 
 /// Version 2 upgrade handler.
-/// This upgrade adds stable partition directory mapping for table data partitions,
-/// replacing the dynamic calculation `dirIndex = partitionIndex ~/ maxEntriesPerDir`
-/// with persistent metadata-based mapping.
+///
+/// Chains into [V3Upgrade] for schema → `_system_table_meta` / TOBF, then
+/// rewrites legacy JSON table partitions and re-wraps pre-v2 ChaCha keys.
+/// Schema partition mapping / migration_meta JSON shaping are owned by V3
+/// ([LegacySchemaMetaJson], [MigrationMeta.fromJson] + [MigrationFormatMigration]).
 class V2Upgrade {
   final DataStoreImpl _dataStore;
 
@@ -35,12 +31,6 @@ class V2Upgrade {
       'Starting database upgrade to version 2',
     );
 
-    // Upgrade Schema partition mapping (global, not space-specific)
-    await _upgradeSchemaPartitionMapping(_dataStore);
-
-    // Upgrade migration metadata (global, not space-specific)
-    await _upgradeMigrationMeta(_dataStore);
-
     final spaces = oldGlobalConfig.spaceNames.isNotEmpty
         ? oldGlobalConfig.spaceNames.toList()
         : <String>['default'];
@@ -51,13 +41,26 @@ class V2Upgrade {
       await _backupLegacySpaceConfigJson(spaceName);
     }
 
-    // IMMEDIATELY execute version 3 metadata and directory mapping upgrade
-    // so that subsequent data rewriting has correct path resolution via table UIDs.
+    // Decrypt legacy current/previous with Old ChaCha, then let KeyManager stash
+    // them into history and mint a fresh current — must finish before V3's
+    // keyManager.initialize so encoding-key migration is not scheduled.
+    for (final spaceName in spaces) {
+      final root = _dataStore.instancePath;
+      if (root == null) break;
+      final backupPath = '${LegacyConfigPaths.spaceJson(root, spaceName)}.old';
+      final plainById = await _loadLegacyPlainEncodingKeys(backupPath);
+      if (plainById.isEmpty) continue;
+
+      await _dataStore.keyManager.prepareKeysForV2DataRewrite(
+        spaceName: spaceName,
+        legacyPlainEncodingKeysById: plainById,
+      );
+    }
+
+    // Metadata / directory UID upgrade first so data rewrite resolves paths.
     final v3Upgrade = V3Upgrade(_dataStore);
     await v3Upgrade.execute(oldGlobalConfig, skipVersionBump: true);
 
-    // Backup and upgrade encryption keys for each space before migration
-    // This ensures we can recover from backup if migration fails
     final yieldController =
         YieldController('upgrade_v2_execute', checkInterval: 1);
 
@@ -107,6 +110,20 @@ class V2Upgrade {
     final backupConfigPath = '$legacyConfigPath.old';
 
     final baseConfig = _dataStore.config;
+
+    // Primary already wrote wal/meta.tobf (etc.) during V3 via its own
+    // FileStorageImpl pool. Release those handles before a migration instance
+    // opens the same paths — otherwise Windows rename/delete fails (errno 5/32).
+    try {
+      await _dataStore.storage.flushAll(closeHandles: true);
+    } catch (e) {
+      Logger.warn(
+        'Failed to flush primary storage handles before v2 space upgrade '
+        '[$spaceName]',
+        rawError: e,
+      );
+    }
+
     final migrationInstance = DataStoreImpl(
       dbPath: baseConfig.dbPath,
       dbName: baseConfig.dbName,
@@ -117,10 +134,6 @@ class V2Upgrade {
     try {
       // Initialize migration instance
       await migrationInstance.initialize();
-
-      // Load keys from backup and setup fallback in EncoderHandler AFTER initialization
-      // This ensures we have the old keys for decoding while migrating data
-      await _setupFallbackKeysFromBackup(backupConfigPath);
 
       // Load space config for this space
       final spaceConfig = await migrationInstance.getSpaceConfig();
@@ -148,7 +161,8 @@ class V2Upgrade {
           if (schema.isGlobal) {
             if (!upgradeGlobal) continue;
           }
-          // Upgrade table data to new range partition format
+          if (schema.isSystemTable) continue;
+          // After V3: directories are under tableUid; read legacy JSON from that root.
           await _upgradeTableDataToNewFormat(migrationInstance, tableName);
           await yieldController.maybeYield();
         }
@@ -184,217 +198,59 @@ class V2Upgrade {
     }
   }
 
-  /// Load keys from backup and setup fallback in EncoderHandler using old algorithm
-  Future<void> _setupFallbackKeysFromBackup(String backupPath) async {
-    if (!await _dataStore.storage.existsFile(backupPath)) return;
+  /// Decrypt pre-v2 space_config key blobs (ChaCha20Poly1305Old wrapping)
+  /// into plain encoding-key strings keyed by keyId.
+  Future<Map<int, String>> _loadLegacyPlainEncodingKeys(
+      String backupPath) async {
+    final out = <int, String>{};
+    if (!await _dataStore.storage.existsFile(backupPath)) return out;
 
     try {
       final content = await _dataStore.storage.readAsString(backupPath);
-      if (content == null || content.isEmpty) return;
+      if (content == null || content.isEmpty) return out;
 
-      final spaceConfig = LegacySpaceConfigJson.tryParse(content);
-      if (spaceConfig == null) return;
+      final map = LegacySpaceConfigJson.tryParseMap(content);
+      if (map == null) return out;
 
       final key32Old = ChaCha20Poly1305Old.generateKeyFromString(
           _dataStore.config.encryptionConfig?.encryptionKey ??
               'E9n8C7r6y7P8T3ioNkEy');
 
-      final Map<int, Uint8List> fallbackKeys = {};
-
-      void processKey(EncryptionKeyInfo? info) {
-        if (info == null || info.key.isEmpty) return;
+      void processKey(Map<String, dynamic>? info) {
+        if (info == null) return;
+        final key = info['key'] as String? ?? '';
+        final keyId = info['keyId'] as int? ?? 0;
+        if (key.isEmpty) return;
         try {
-          final decoded = base64.decode(info.key);
+          final decoded = base64.decode(key);
           final plain = ChaCha20Poly1305Old.decrypt(
               encryptedData: decoded, key: key32Old);
-          fallbackKeys[info.keyId] = EncryptionManager.generateKey(plain);
+          out[keyId] = plain;
         } catch (e) {
-          // might be already upgraded if we are resuming?
-          // but backup is "v1" config, so it should be old.
           Logger.warn('Failed to decrypt old key from backup', rawError: e);
         }
       }
 
-      processKey(spaceConfig.current);
-      if (spaceConfig.previous != null) {
-        processKey(spaceConfig.previous);
-      }
-
-      if (fallbackKeys.isNotEmpty) {
-        EncryptionManager.setFallbackKeys(fallbackKeys);
-        Logger.info(
-            'Set ${fallbackKeys.length} fallback keys from backup config');
-      }
-    } catch (e) {
-      Logger.error('Failed to setup fallback keys from backup', rawError: e);
-    }
-  }
-
-  String _getLegacySchemaMetaPath(String instancePath) {
-    return pathJoin(instancePath, 'schemas', 'schema_meta.json');
-  }
-
-  String _getLegacySchemaPartitionFilePath(
-      String instancePath, int partitionIndex, int dirIndex) {
-    return pathJoin(instancePath, 'schemas', 'dir_$dirIndex',
-        'schema_p$partitionIndex.json');
-  }
-
-  /// Upgrade Schema partition directory mapping.
-  Future<void> _upgradeSchemaPartitionMapping(DataStoreImpl db) async {
-    try {
-      final schemaMetaPath = _getLegacySchemaMetaPath(db.instancePath!);
-      if (!await db.storage.existsFile(schemaMetaPath)) return;
-
-      final content = await db.storage.readAsString(schemaMetaPath);
-      if (content == null || content.isEmpty) return;
-
-      final json = jsonDecode(content) as Map<String, dynamic>;
-
-      // If directoryMapping already exists and covers all partitions, skip.
-      final existingMapping = json['directoryMapping'] as Map<String, dynamic>?;
-      final tpm = json['tablePartitionMap'] as Map<String, dynamic>? ?? {};
-      final partitions = tpm.values.toSet().toList();
-      bool needUpgrade = false;
-
-      if (existingMapping == null) {
-        needUpgrade = true;
-      } else if (partitions.isEmpty) {
-        needUpgrade = false;
-      } else {
-        final p2d =
-            existingMapping['partitionToDir'] as Map<String, dynamic>? ?? {};
-        // Check if all partitions have mappings
-        for (final pIndex in partitions) {
-          if (!p2d.containsKey(pIndex.toString())) {
-            needUpgrade = true;
-            break;
+      processKey(map['current'] as Map<String, dynamic>?);
+      processKey(map['previous'] as Map<String, dynamic>?);
+      final history = map['historyKeys'];
+      if (history is List) {
+        for (final e in history) {
+          if (e is Map) {
+            processKey(Map<String, dynamic>.from(e));
           }
         }
       }
-
-      if (!needUpgrade) {
-        return;
-      }
-
-      final maxEntriesPerDir = db.maxEntriesPerDir;
-      final Map<String, int> p2d = <String, int>{};
-      final Map<String, int> d2c = <String, int>{};
-
-      for (final pIndex in partitions) {
-        // Legacy algorithm (only used during this one-time upgrade).
-        final dirIndex = (pIndex as int) ~/ maxEntriesPerDir;
-        p2d[pIndex.toString()] = dirIndex;
-        d2c[dirIndex.toString()] = (d2c[dirIndex.toString()] ?? 0) + 1;
-
-        // Update partition meta dirIndex if needed
-        final legacyDirIndex = pIndex ~/ maxEntriesPerDir;
-        final partitionPath = _getLegacySchemaPartitionFilePath(
-            db.instancePath!, pIndex, legacyDirIndex);
-        if (await db.storage.existsFile(partitionPath)) {
-          final partitionContent = await db.storage.readAsString(partitionPath);
-          if (partitionContent != null) {
-            try {
-              final partitionMeta =
-                  SchemaPartitionMeta.fromJson(jsonDecode(partitionContent));
-              if (partitionMeta.dirIndex == null) {
-                final updatedMeta = partitionMeta.copyWith(dirIndex: dirIndex);
-                await db.storage.writeAsString(
-                    partitionPath, jsonEncode(updatedMeta.toJson()));
-              }
-            } catch (_) {}
-          }
-        }
-      }
-
-      final newMapping = {
-        'partitionToDir': p2d,
-        'dirToFileCount': d2c,
-      };
-
-      json['directoryMapping'] = newMapping;
-      await db.storage.writeAsString(schemaMetaPath, jsonEncode(json));
-
-      Logger.info(
-        'Upgraded Schema partition directory mapping',
-      );
     } catch (e) {
-      Logger.error('Failed to upgrade Schema partition mapping', rawError: e);
-      // Do not rethrow here so that other upgrades can continue.
+      Logger.error('Failed to load fallback keys from backup', rawError: e);
     }
+    return out;
   }
 
-  /// Upgrade migration metadata from legacy format (v1) to new format (v2+).
-  /// Converts dirUsage, taskIndex, currentDirIndex to DirectoryMappingString.
-  /// Still writes JSON; V3 [MigrationFormatMigration] converts to TOBF.
-  Future<void> _upgradeMigrationMeta(DataStoreImpl db) async {
-    try {
-      // Legacy JSON path (do not use PathManager TOBF path here).
-      final metaPath =
-          pathJoin(db.pathManager.getMigrationsPath(), 'migration_meta.json');
-      if (!await db.storage.existsFile(metaPath)) return;
-
-      final content = await db.storage.readAsString(metaPath);
-      if (content == null || content.isEmpty) return;
-
-      final json = jsonDecode(content);
-
-      // Check if already upgraded (has directoryMapping, no legacy fields)
-      if (json.containsKey('directoryMapping') &&
-          !json.containsKey('dirUsage') &&
-          !json.containsKey('taskIndex')) {
-        // Already upgraded
-        return;
-      }
-
-      // Convert legacy format to new format
-      final Map<String, int> idToDir = <String, int>{};
-      final Map<int, int> dirToFileCount = <int, int>{};
-
-      // Convert taskIndex to idToDir
-      if (json['taskIndex'] is Map) {
-        final taskIndex = json['taskIndex'] as Map<dynamic, dynamic>;
-        taskIndex.forEach((key, value) {
-          if (key is String && value is int) {
-            idToDir[key] = value;
-          }
-        });
-      }
-
-      // Convert dirUsage to dirToFileCount
-      if (json['dirUsage'] is Map) {
-        final dirUsage = json['dirUsage'] as Map<dynamic, dynamic>;
-        dirUsage.forEach((key, value) {
-          final idx = int.tryParse(key.toString());
-          if (idx != null && value is int) {
-            dirToFileCount[idx] = value;
-          }
-        });
-      }
-
-      // Create new format metadata
-      final newMapping = DirectoryMappingString(
-        idToDir: idToDir,
-        dirToFileCount: dirToFileCount,
-      );
-
-      final newMeta = {
-        'directoryMapping': newMapping.toJson(),
-      };
-
-      await db.storage.writeAsString(metaPath, jsonEncode(newMeta));
-
-      Logger.info(
-        'Upgraded migration metadata to version 2 format',
-      );
-    } catch (e) {
-      Logger.error('Failed to upgrade migration metadata', rawError: e);
-      // Do not rethrow here so that other upgrades can continue.
-    }
-  }
-
-  /// Upgrade table data from old JSON structure to new binary format
-  /// This manually parses old structure to avoid dependency on removed models
+  /// Upgrade table data from old JSON (`main.dat` + `data/partitions`) to btree.
+  ///
+  /// Runs **after** V3: resolve [tableUid] / [TableMeta.dirIndex], locate legacy
+  /// JSON under the post-rename UID root (fallback: leftover `tableName` dirs).
   Future<void> _upgradeTableDataToNewFormat(
       DataStoreImpl db, String tableName) async {
     try {
@@ -410,17 +266,32 @@ class V2Upgrade {
         return;
       }
 
-      // Manually build old table data meta path (old format: main.dat)
-      final tablePath = await _manualGetTablePath(db, tableName);
-      final oldDataMetaPath = pathJoin(tablePath, 'data', 'main.dat');
-
-      // Check if old data meta file exists
-      if (!await db.storage.existsFile(oldDataMetaPath)) {
+      final meta = await db.tableMetaManager?.getTableMeta(tableUid);
+      if (meta == null) {
+        Logger.warn(
+            'Table meta not found for $tableName ($tableUid), skipping');
         return;
       }
 
-      final oldMetaContent = await db.storage.readAsString(oldDataMetaPath);
+      final table = await db.tableMetaManager?.getTableContext(tableUid);
+      if (table == null) {
+        Logger.warn(
+            'TableContext not found for $tableName ($tableUid), skipping');
+        return;
+      }
 
+      final resolved = await _resolveLegacyJsonDataRoot(
+        db,
+        meta: meta,
+        tableName: tableName,
+      );
+      if (resolved == null) {
+        return;
+      }
+      final tableRoot = resolved.root;
+      final oldDataMetaPath = pathJoin(tableRoot, 'data', 'main.dat');
+
+      final oldMetaContent = await db.storage.readAsString(oldDataMetaPath);
       if (oldMetaContent == null || oldMetaContent.isEmpty) {
         Logger.info(
           'No old data meta file found for table: $tableName, skipping',
@@ -428,13 +299,11 @@ class V2Upgrade {
         return;
       }
 
-      // Manually parse old JSON structure (no model dependency)
       final oldMetaJson = jsonDecode(oldMetaContent) as Map<String, dynamic>;
       if (oldMetaJson['meta'] == null) {
         return;
       }
 
-      // Extract old partition information
       final oldPartitions = oldMetaJson['meta']['partitions'] as List<dynamic>?;
       if (oldPartitions == null || oldPartitions.isEmpty) {
         Logger.info(
@@ -443,7 +312,6 @@ class V2Upgrade {
         return;
       }
 
-      // Parse old partition structure
       final oldPartitionMetas = <Map<String, dynamic>>[];
       for (final pJson in oldPartitions) {
         if (pJson is Map<String, dynamic>) {
@@ -452,23 +320,21 @@ class V2Upgrade {
       }
 
       Logger.info(
-        'Found ${oldPartitionMetas.length} old partitions for table: $tableName',
+        'Found ${oldPartitionMetas.length} old partitions for table: $tableName '
+        '(root=$tableRoot, uid=${tableUid.value})',
       );
 
-      // Delete btree partitions written by an earlier partial upgrade / empty stub.
-      // After v3, tree meta lives in partition-0 page0 (no data/meta.json).
+      // Clear post-V3 btree stubs only (`data/btree`), never legacy `data/partitions`.
       final newRangesPath = await db.pathManager.getPartitionsDirPath(tableUid);
       if (await db.storage.existsDirectory(newRangesPath)) {
         await db.storage.deleteDirectory(newRangesPath);
       }
 
-      // delete index root directory
       final indexRootPath = await db.pathManager.getIndexDirPath(tableUid);
       if (await db.storage.existsDirectory(indexRootPath)) {
         await db.storage.deleteDirectory(indexRootPath);
       }
 
-      // Process partitions in parallel batches to avoid memory blowup.
       final int writeBatchSize =
           db.config.writeBatchSize > 0 ? db.config.writeBatchSize : 5000;
 
@@ -478,8 +344,6 @@ class V2Upgrade {
       Future<void> processCurrentBatch() async {
         if (currentBatchMetas.isEmpty) return;
 
-        // 1. Parallel Read with high-priority flush tokens but limited to 70% share
-        // and released immediately after reading to avoid deadlocking with background flushes.
         final lease = await db.workloadScheduler.tryAcquire(
           WorkloadType.flush,
           requestedTokens:
@@ -493,7 +357,12 @@ class V2Upgrade {
 
         try {
           final readTasks = currentBatchMetas.map((partitionMeta) {
-            return () => _parseOldPartitionFile(db, tableName, partitionMeta);
+            return () => _parseOldPartitionFile(
+                  db,
+                  tableName: tableName,
+                  tableRoot: tableRoot,
+                  partitionMeta: partitionMeta,
+                );
           }).toList();
 
           final results =
@@ -501,32 +370,16 @@ class V2Upgrade {
                   readTasks,
                   concurrency: batchConcurrency,
                   label: 'V2Upgrade.readPartitions',
-                  continueOnError: false, // Fail fast on read errors
+                  continueOnError: false,
                   controller: ParallelController(),
                   timeout: const Duration(minutes: 5));
 
-          // Release tokens immediately after reading phase to prioritize tokens for flushing
           lease?.release();
 
-          // Flatten records
           final batchRecords =
               results.expand((r) => r ?? <Map<String, dynamic>>[]).toList();
 
           if (batchRecords.isNotEmpty) {
-            final schema = await db.tableMetaManager
-                ?.getTableSchemaByName(TableName(tableName));
-            if (schema == null) {
-              Logger.warn(
-                'Schema not found for table $tableName, skipping batch',
-              );
-              return;
-            }
-
-            final table = await db.getTableContext(tableName);
-
-            // Use writeChanges directly for migration instances
-            // This bypasses WAL/buffer and writes directly to table partitions
-            // which is safe for migration since we're doing a one-time data transformation
             await db.tableDataManager.writeChanges(
               table: table,
               inserts: batchRecords,
@@ -536,8 +389,7 @@ class V2Upgrade {
               concurrency: null,
             );
 
-            // Also write index changes for the inserted records
-            if (db.indexManager != null && batchRecords.isNotEmpty) {
+            if (db.indexManager != null) {
               await db.indexManager!.writeChanges(
                 table: table,
                 inserts: batchRecords,
@@ -549,14 +401,14 @@ class V2Upgrade {
             }
 
             Logger.debug(
-              'Wrote ${batchRecords.length} records and indexes directly to table $tableName',
+              'Wrote ${batchRecords.length} records and indexes to '
+              '${table.tableUid} ($tableName)',
             );
           }
         } finally {
           lease?.release();
         }
 
-        // Reset batch
         currentBatchMetas.clear();
         currentBatchRecordCount = 0;
         await Future.delayed(Duration.zero);
@@ -566,57 +418,150 @@ class V2Upgrade {
       for (int i = 0; i < oldPartitionMetas.length; i++) {
         final partitionMeta = oldPartitionMetas[i];
 
-        // Try to get count from metadata
         int totalRecords = 0;
         if (partitionMeta['totalRecords'] is int) {
           totalRecords = partitionMeta['totalRecords'] as int;
         } else if (partitionMeta['fileSizeInBytes'] is int) {
           totalRecords = (partitionMeta['fileSizeInBytes'] as int) ~/ 1024;
         } else {
-          // fallback key just in case
           totalRecords = 1000;
         }
 
         currentBatchMetas.add(partitionMeta);
         currentBatchRecordCount += totalRecords;
 
-        // If we have enough records, or this is the last partition, process.
-        // We use >= writeBatchSize to trigger.
         if (currentBatchRecordCount >= writeBatchSize ||
             currentBatchMetas.length >= (heuristicConcurrency * 2)) {
           await processCurrentBatch();
         }
       }
 
-      // Process remaining
       await processCurrentBatch();
 
-      // Migrated data deletion: delete old data meta file and old partitions root directory
       if (await db.storage.existsFile(oldDataMetaPath)) {
         await db.storage.deleteFile(oldDataMetaPath);
       }
-      if (await db.storage
-          .existsDirectory(pathJoin(tablePath, 'data', 'partitions'))) {
-        await db.storage
-            .deleteDirectory(pathJoin(tablePath, 'data', 'partitions'));
+      final legacyPartitionsDir = pathJoin(tableRoot, 'data', 'partitions');
+      if (await db.storage.existsDirectory(legacyPartitionsDir)) {
+        await db.storage.deleteDirectory(legacyPartitionsDir);
       }
+
+      // V3 wrote meta at UID path but left data under logical name — drop leftover.
+      if (resolved.fromLegacyNamePath) {
+        final uidRoot = _tableRootFromMeta(db, meta);
+        if (tableRoot != uidRoot &&
+            await db.storage.existsDirectory(tableRoot)) {
+          final stillHasData = await db.storage
+              .existsFile(pathJoin(tableRoot, 'data', 'main.dat'));
+          if (!stillHasData) {
+            // Best-effort: only remove if we cleared JSON artifacts.
+            final dataDir = pathJoin(tableRoot, 'data');
+            if (await db.storage.existsDirectory(dataDir)) {
+              final children =
+                  await db.storage.listDirectory(dataDir, recursive: false);
+              final meaningful = children.where((p) {
+                final base = p.split(RegExp(r'[\\/]')).last;
+                return base.isNotEmpty && !base.startsWith('.');
+              });
+              if (meaningful.isEmpty) {
+                await db.storage.deleteDirectory(tableRoot);
+              }
+            }
+          }
+        }
+      }
+
       Logger.info(
-        'Table data upgrade preparation completed for table: $tableName (records ready for migration)',
+        'Table data upgrade completed for table: $tableName '
+        '(uid=${tableUid.value})',
       );
     } catch (e) {
       Logger.error('Failed to upgrade table data for table $tableName',
           rawError: e);
-      // Do not rethrow - allow other tables to continue upgrading
     }
   }
 
-  /// Manually parse old partition file structure
-  /// Returns list of records from old JSON partition file
-  /// Uses manual path construction to avoid dependency on old path methods
-  Future<List<Map<String, dynamic>>> _parseOldPartitionFile(DataStoreImpl db,
-      String tableName, Map<String, dynamic> partitionMeta) async {
+  /// Locate pre-v2 JSON data root after V3 directory rename.
+  ///
+  /// 1. `{tables_dirIndex}/{tableUid}/data/main.dat` (normal post-V3)
+  /// 2. Same dirIndex with leftover `{tableName}`
+  /// 3. Scan `tables_0..highWater` for leftover `{tableName}`
+  Future<({String root, bool fromLegacyNamePath})?> _resolveLegacyJsonDataRoot(
+    DataStoreImpl db, {
+    required TableMeta meta,
+    required String tableName,
+  }) async {
+    final uidRoot = _tableRootFromMeta(db, meta);
+    final uidMain = pathJoin(uidRoot, 'data', 'main.dat');
+    if (await db.storage.existsFile(uidMain)) {
+      return (root: uidRoot, fromLegacyNamePath: false);
+    }
+
+    Future<String?> tryNameRoot(int d) async {
+      final parent = meta.isGlobal
+          ? db.pathManager.getGlobalPath()
+          : db.pathManager.getSpacePath();
+      final nameRoot = pathJoin(parent, 'tables_$d', tableName);
+      final mainPath = pathJoin(nameRoot, 'data', 'main.dat');
+      if (await db.storage.existsFile(mainPath)) return nameRoot;
+      return null;
+    }
+
+    final sameDirName = await tryNameRoot(meta.dirIndex);
+    if (sameDirName != null) {
+      Logger.warn(
+        'Legacy main.dat for [$tableName] found under name path $sameDirName; '
+        'UID root $uidRoot has none (V3 move may have been skipped)',
+      );
+      return (root: sameDirName, fromLegacyNamePath: true);
+    }
+
+    final highWater =
+        await _legacyDataDirHighWater(db, isGlobal: meta.isGlobal);
+    final scanMax = max(meta.dirIndex, highWater);
+    for (var d = 0; d <= scanMax; d++) {
+      if (d == meta.dirIndex) continue;
+      final found = await tryNameRoot(d);
+      if (found != null) {
+        Logger.warn(
+          'Legacy main.dat for [$tableName] found under $found; '
+          'expected UID root $uidRoot',
+        );
+        return (root: found, fromLegacyNamePath: true);
+      }
+    }
+
+    Logger.info(
+      'No legacy main.dat for [$tableName] under UID root $uidRoot '
+      '(or leftover name paths); skipping JSON data upgrade',
+    );
+    return null;
+  }
+
+  Future<int> _legacyDataDirHighWater(
+    DataStoreImpl db, {
+    required bool isGlobal,
+  }) async {
+    final cfg = await db.getGlobalConfig();
+    if (cfg == null) return 0;
+    return isGlobal ? cfg.lastGlobalDirIndex : cfg.lastNonGlobalDirIndex;
+  }
+
+  String _tableRootFromMeta(DataStoreImpl db, TableMeta meta) {
+    final parentDir = meta.isGlobal
+        ? db.pathManager.getGlobalPath()
+        : db.pathManager.getSpacePath();
+    return pathJoin(parentDir, 'tables_${meta.dirIndex}', meta.tableUid);
+  }
+
+  /// Parse one legacy JSON partition file under [tableRoot].
+  Future<List<Map<String, dynamic>>> _parseOldPartitionFile(
+    DataStoreImpl db, {
+    required String tableName,
+    required String tableRoot,
+    required Map<String, dynamic> partitionMeta,
+  }) async {
     try {
-      // Extract old partition index and directory index from JSON
       final oldPartitionIndex = partitionMeta['index'] as int?;
 
       if (oldPartitionIndex == null) {
@@ -626,15 +571,10 @@ class V2Upgrade {
         return [];
       }
 
-      // Calculate old directory index if not present (legacy algorithm)
       final dirIndex = oldPartitionIndex ~/ db.maxEntriesPerDir;
-
-      // Manually build old partition file path (old format: p{index}.dat)
-      final tablePath = await _manualGetTablePath(db, tableName);
-      final oldPartitionPath = pathJoin(tablePath, 'data', 'partitions',
+      final oldPartitionPath = pathJoin(tableRoot, 'data', 'partitions',
           'dir_$dirIndex', 'p$oldPartitionIndex.dat');
 
-      // Check if old partition file exists
       if (!await db.storage.existsFile(oldPartitionPath)) {
         return [];
       }
@@ -649,13 +589,9 @@ class V2Upgrade {
         return [];
       }
 
-      // Parse old JSON structure (no model dependency)
       final partitionJson = jsonDecode(decodedString) as Map<String, dynamic>;
 
-      // Extract data records - handle both old formats
       List<dynamic>? data;
-
-      // Try 'data' field first (newer format)
       if (partitionJson.containsKey('data')) {
         data = partitionJson['data'] as List<dynamic>?;
       }
@@ -664,7 +600,6 @@ class V2Upgrade {
         return [];
       }
 
-      // Convert to list of records
       final records = <Map<String, dynamic>>[];
       final yieldController =
           YieldController('V2Upgrade._parseOldPartitionFile');
@@ -676,21 +611,19 @@ class V2Upgrade {
           }
           records.add(item);
         } else if (item is String) {
-          // Try parsing as JSON string
           try {
             final parsed = jsonDecode(item) as Map<String, dynamic>;
             if (parsed['_deleted_'] == true || parsed.isEmpty) {
               continue;
             }
             records.add(parsed);
-          } catch (_) {
-            // Skip invalid entries
-          }
+          } catch (_) {}
         }
       }
 
       Logger.info(
-        'Parsed ${records.length} records from old partition file: $oldPartitionPath (partition index: $oldPartitionIndex)',
+        'Parsed ${records.length} records from old partition file: '
+        '$oldPartitionPath (partition index: $oldPartitionIndex)',
       );
 
       return records;
@@ -698,36 +631,5 @@ class V2Upgrade {
       Logger.error('Failed to parse old partition file', rawError: e);
       return [];
     }
-  }
-
-  Future<String> _manualGetTablePath(DataStoreImpl db, String tableName) async {
-    final tableUid =
-        await db.tableMetaManager?.getUidByName(TableName(tableName));
-    if (tableUid == null) {
-      throw DbException([
-        SchemaValidationStatus(
-          type: ResultType.devTableNotFound,
-          message: 'Table UID not found for table: $tableName',
-          tableName: tableName,
-        )
-      ]);
-    }
-    if (db.config.persistenceMode == PersistenceMode.memory) {
-      return 'memory://${db.currentSpaceName}/tables/$tableUid';
-    }
-    final meta = await db.tableMetaManager?.getTableMeta(tableUid);
-    if (meta == null) {
-      throw DbException([
-        SchemaValidationStatus(
-          type: ResultType.devTableNotFound,
-          message: 'Table meta not found for table: $tableName',
-          tableName: tableName,
-        )
-      ]);
-    }
-    final parentDir = meta.isGlobal
-        ? db.pathManager.getGlobalPath()
-        : db.pathManager.getSpacePath();
-    return pathJoin(parentDir, 'tables_${meta.dirIndex}', tableUid);
   }
 }
