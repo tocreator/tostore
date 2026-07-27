@@ -7,10 +7,7 @@ class SpaceConfig {
   /// current encryption key info
   final EncryptionKeyInfo current;
 
-  /// previous encryption key info (if any)
-  final EncryptionKeyInfo? previous;
-
-  /// history encryption key list
+  /// history encryption key list (all retired keys; latest is always [current])
   final List<EncryptionKeyInfo> historyKeys;
 
   /// Internal engine/storage format version
@@ -30,7 +27,6 @@ class SpaceConfig {
 
   SpaceConfig({
     required this.current,
-    this.previous,
     List<EncryptionKeyInfo>? historyKeys,
     int? version,
     this.totalTableCount = 0,
@@ -41,34 +37,39 @@ class SpaceConfig {
         historyKeys = (historyKeys ?? const []).toList();
 
   factory SpaceConfig.fromJson(Map<String, dynamic> json) {
+    final history = <EncryptionKeyInfo>[];
+    if (json['historyKeys'] != null) {
+      for (final e in json['historyKeys'] as List<dynamic>) {
+        history.add(EncryptionKeyInfo.fromJson(e as Map<String, dynamic>));
+      }
+    }
+    // Legacy JSON only: fold `previous` into history (not part of live model).
+    if (json['previous'] != null) {
+      final prev =
+          EncryptionKeyInfo.fromJson(json['previous'] as Map<String, dynamic>);
+      if (prev.key.isNotEmpty && !history.any((k) => k.keyId == prev.keyId)) {
+        history.add(prev);
+      }
+    }
     return SpaceConfig(
-        current:
-            EncryptionKeyInfo.fromJson(json['current'] as Map<String, dynamic>),
-        previous: json['previous'] != null
-            ? EncryptionKeyInfo.fromJson(
-                json['previous'] as Map<String, dynamic>)
-            : null,
-        historyKeys: json['historyKeys'] != null
-            ? (json['historyKeys'] as List<dynamic>)
-                .map((e) =>
-                    EncryptionKeyInfo.fromJson(e as Map<String, dynamic>))
-                .toList()
-            : null,
-        version: resolveVersionValue(
-            json['version'], InternalConfig.legacyEngineVersion),
-        totalTableCount: json['totalTableCount'] as int? ?? 0,
-        totalRecordCount: json['totalRecordCount'] as int? ?? 0,
-        totalDataSizeBytes: json['totalDataSizeBytes'] as int? ?? 0,
-        lastStatisticsTime: json['lastStatisticsTime'] != null
-            ? DateTime.parse(json['lastStatisticsTime'] as String)
-            : null);
+      current:
+          EncryptionKeyInfo.fromJson(json['current'] as Map<String, dynamic>),
+      historyKeys: history,
+      version: resolveVersionValue(
+          json['version'], InternalConfig.legacyEngineVersion),
+      totalTableCount: json['totalTableCount'] as int? ?? 0,
+      totalRecordCount: json['totalRecordCount'] as int? ?? 0,
+      totalDataSizeBytes: json['totalDataSizeBytes'] as int? ?? 0,
+      lastStatisticsTime: json['lastStatisticsTime'] != null
+          ? DateTime.parse(json['lastStatisticsTime'] as String)
+          : null,
+    );
   }
 
   /// Legacy JSON map helper. On-disk persistence uses [SpaceConfigCodec] (TOBF).
   Map<String, dynamic> toJson() {
     return {
       'current': current.toJson(),
-      'previous': previous?.toJson(),
       'historyKeys': historyKeys.map((e) => e.toJson()).toList(),
       'version': version,
       'totalTableCount': totalTableCount,
@@ -81,7 +82,6 @@ class SpaceConfig {
   /// creator new config
   SpaceConfig copyWith({
     EncryptionKeyInfo? current,
-    EncryptionKeyInfo? previous,
     List<EncryptionKeyInfo>? historyKeys,
     int? version,
     int? totalTableCount,
@@ -91,7 +91,6 @@ class SpaceConfig {
   }) {
     return SpaceConfig(
       current: current ?? this.current,
-      previous: previous ?? this.previous,
       historyKeys: historyKeys ?? this.historyKeys,
       version: version ?? this.version,
       totalTableCount: totalTableCount ?? this.totalTableCount,
@@ -105,7 +104,6 @@ class SpaceConfig {
   List<EncryptionKeyInfo> getAllKeys() {
     return [
       current,
-      if (previous != null) previous!,
       ...historyKeys,
     ]..removeWhere((key) => key.key.isEmpty);
   }
@@ -113,7 +111,6 @@ class SpaceConfig {
   /// Get specific key by keyId
   EncryptionKeyInfo? getKeyById(int keyId) {
     if (current.keyId == keyId) return current;
-    if (previous?.keyId == keyId) return previous;
     for (final key in historyKeys) {
       if (key.keyId == keyId) return key;
     }
