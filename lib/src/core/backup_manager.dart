@@ -406,11 +406,27 @@ class BackupManager {
       final metadata = await readBackupMetadata(normalizedRoot);
       final dbRootDir = _dataStore.instancePath!;
 
-      // Quiesce database IO before deleting/replacing directories to avoid ENOTEMPTY/EBUSY races.
-      // We only need to CLOSE the current instance here; it will be re-opened after files are restored.
+      // Quiesce database IO before deleting/replacing directories to avoid
+      // ENOTEMPTY/EBUSY races. On native, closeStorage:true releases the handle
+      // pool and blocks late async from reopening files (Windows errno 32 on
+      // global/spaces delete). Web keeps IndexedDB open (refcounted) and only
+      // flushes; directory surgery does not need OS handle release there.
+      // StorageAdapter still allows exists/delete/list/copy/ensureDir after close.
       try {
         if (_dataStore.isInitialized) {
-          await _dataStore.close(persistChanges: false, closeStorage: false);
+          final closeStorage = !PlatformHandler.isWeb;
+          await _dataStore.close(
+            persistChanges: false,
+            closeStorage: closeStorage,
+          );
+          if (!closeStorage) {
+            await _dataStore.storage.flushAll(closeHandles: true);
+          }
+          // Release builds race close→delete much harder than debug; give
+          // Windows a brief window to drop share locks after handle close.
+          if (PlatformHandler.isWindows) {
+            await Future<void>.delayed(const Duration(milliseconds: 100));
+          }
         }
       } catch (e) {
         Logger.warn('Close datastore before restore failed', rawError: e);

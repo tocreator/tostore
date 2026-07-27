@@ -41,7 +41,18 @@ class StorageAdapter implements StorageInterface {
   /// Guard against concurrent flushAll executions
   bool _flushInProgress = false;
 
-  /// Guard against I/O after close
+  /// Serializes flushAll so closeHandles:true never silently skips when a
+  /// best-effort burst flush is already running (critical in release timing).
+  Future<void> _flushQueue = Future<void>.value();
+
+  /// Guard against I/O after close.
+  ///
+  /// Business read/write/append/replace throw [DbClosedException] after [close]
+  /// so late async cannot reopen pooled handles or treat empty reads as data.
+  /// Filesystem surgery used by restore/deleteDatabase remains available:
+  /// [existsFile], [existsDirectory], [deleteFile], [deleteDirectory],
+  /// [listDirectory], [ensureDirectoryExists], [copyFile], [copyDirectory],
+  /// [moveDirectory], [flushAll], and [close].
   bool _isClosed = false;
   bool get isClosed => _isClosed;
 
@@ -473,7 +484,7 @@ class StorageAdapter implements StorageInterface {
   @override
   Future<List<String>> listDirectory(String path,
       {bool recursive = false}) async {
-    _ensureOpen();
+    // Allowed after close: restore / cleanup enumerates directories.
     final resource = _getLockResource(path);
     final opId = _generateOperationId(_listOpPrefix);
 
@@ -737,7 +748,7 @@ class StorageAdapter implements StorageInterface {
 
   @override
   Future<void> copyDirectory(String sourcePath, String destinationPath) async {
-    _ensureOpen();
+    // Allowed after close: backup restore copies trees without pooled handles.
     final sourceResource = _getLockResource(sourcePath);
     final destResource = _getLockResource(destinationPath);
     final opId = _generateOperationId(_writeOpPrefix);
@@ -805,7 +816,7 @@ class StorageAdapter implements StorageInterface {
 
   @override
   Future<void> moveDirectory(String sourcePath, String destinationPath) async {
-    _ensureOpen();
+    // Allowed after close: restore / space maintenance may rename trees.
     final sourceResource = _getLockResource(sourcePath);
     final destResource = _getLockResource(destinationPath);
     final opId = _generateOperationId(_writeOpPrefix);
@@ -848,7 +859,7 @@ class StorageAdapter implements StorageInterface {
 
   @override
   Future<void> copyFile(String sourcePath, String destinationPath) async {
-    _ensureOpen();
+    // Allowed after close: backup restore copies files via OS copy (no pool).
     final sourceResource = _getLockResource(sourcePath);
     final destResource = _getLockResource(destinationPath);
     final opId = _generateOperationId(_writeOpPrefix);
@@ -965,7 +976,7 @@ class StorageAdapter implements StorageInterface {
 
   @override
   Future<void> ensureDirectoryExists(String path) async {
-    _ensureOpen();
+    // Allowed after close: restore recreates space/global directories.
     return _storage.ensureDirectoryExists(path);
   }
 
@@ -1049,15 +1060,26 @@ class StorageAdapter implements StorageInterface {
   @override
   Future<void> flushAll(
       {String? path, List<String>? paths, bool closeHandles = false}) async {
-    // Allowed after close when releasing handles; pool is empty once closed.
-    // Prevent concurrent flushes which could thrash IO
-    if (_flushInProgress) return;
-    _flushInProgress = true;
+    // Best-effort burst flushes may coalesce; must-close never skips.
+    if (!closeHandles && _flushInProgress) return;
+
+    final previous = _flushQueue;
+    final gate = Completer<void>();
+    _flushQueue = gate.future;
     try {
-      return await _storage.flushAll(
-          path: path, paths: paths, closeHandles: closeHandles);
+      await previous;
+      if (!closeHandles && _flushInProgress) return;
+      _flushInProgress = true;
+      try {
+        await _storage.flushAll(
+            path: path, paths: paths, closeHandles: closeHandles);
+      } finally {
+        _flushInProgress = false;
+      }
     } finally {
-      _flushInProgress = false;
+      if (!gate.isCompleted) {
+        gate.complete();
+      }
     }
   }
 
