@@ -261,17 +261,24 @@ final class LegacySpaceConfigJson {
   }
 
   static SpaceConfig fromMap(Map<String, dynamic> json) {
+    final history = <EncryptionKeyInfo>[];
+    if (json['historyKeys'] != null) {
+      for (final e in json['historyKeys'] as List<dynamic>) {
+        history.add(EncryptionKeyInfo.fromJson(e as Map<String, dynamic>));
+      }
+    }
+    // Fold legacy `previous` into history (live model has current + history only).
+    if (json['previous'] != null) {
+      final prev =
+          EncryptionKeyInfo.fromJson(json['previous'] as Map<String, dynamic>);
+      if (prev.key.isNotEmpty && !history.any((k) => k.keyId == prev.keyId)) {
+        history.add(prev);
+      }
+    }
     return SpaceConfig(
       current:
           EncryptionKeyInfo.fromJson(json['current'] as Map<String, dynamic>),
-      previous: json['previous'] != null
-          ? EncryptionKeyInfo.fromJson(json['previous'] as Map<String, dynamic>)
-          : null,
-      historyKeys: json['historyKeys'] != null
-          ? (json['historyKeys'] as List<dynamic>)
-              .map((e) => EncryptionKeyInfo.fromJson(e as Map<String, dynamic>))
-              .toList()
-          : null,
+      historyKeys: history,
       version: resolveVersionValue(
           json['version'], InternalConfig.legacyEngineVersion),
       totalTableCount: json['totalTableCount'] as int? ?? 0,
