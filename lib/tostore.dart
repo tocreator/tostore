@@ -1059,14 +1059,18 @@ class ToStore implements DataStoreInterface {
 
   /// Get table names.
   ///
-  /// By default returns **all** tables in the database. Pass
-  /// [onlyCurrentSpace] for globals + tables active in the current space.
+  /// By default returns **all** tables. Pass [isGlobal] to filter:
+  /// `true` = global only, `false` = non-global only, `null` = both.
+  /// Non-global schemas are shared across spaces; only table *data* is
+  /// space-isolated.
   ///
-  /// [onlyCurrentSpace] 为 true 时，返回当前空间中已经使用的所有表，包括全局表。
+  /// 返回 schema 清单中的表名。
+  /// 默认返回全部表。[isGlobal]：`true` 仅全局表，`false` 仅非全局表，`null` 全部。
+  /// 非全局表结构跨空间共享，仅数据按空间隔离。
   @override
-  Future<List<String>> getTableNames({bool onlyCurrentSpace = false}) async {
+  Future<List<String>> getTableNames({bool? isGlobal}) async {
     return await _impl.getTableNames(
-      onlyCurrentSpace: onlyCurrentSpace,
+      isGlobal: isGlobal,
       onlyUserTables: true,
     );
   }
