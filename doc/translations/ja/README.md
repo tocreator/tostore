@@ -1476,30 +1476,23 @@ ToStore は、`ToStore.setLogConfig(...)` を通じて、データベースの�
 > | **`encodingKey`** | データ暗号化キー | 新しい値を設定して再度 `open` | **はい**（時間がかかる） |
 > | **`encryptionKey`** | セキュリティキー、`encodingKey` を保護 | 実行時に `db.rotateEncryptionKey` を呼び出す | **いいえ**（高速） |
 >
-> 機密キーをハードコーディングしないでください。安全なサービスから取得することを推奨します。
+> 機密キーをハードコーディングしないでください。デバイスに紐づける場合は、`encryptionKey` を OS の Keychain / Keystore / セキュアエンクレーブに保存してからエンジンへ渡してください。
 
 ```dart
 final db = await ToStore.open(
   config: DataStoreConfig(
     encryptionConfig: EncryptionConfig(
-      // Supported encryption algorithms: none, xorObfuscation, chacha20Poly1305, aes256Gcm
+      // Supported: none, xorObfuscation, chacha20Poly1305, aes256Gcm
       encryptionType: EncryptionType.chacha20Poly1305,
 
-      // Data encryption key: encrypts data; changing it triggers a full background rewrite of encrypted data
-      encodingKey: 'Your-32-Byte-Long-Encoding-Key...',
+      // Data encryption key: encrypts table/index/log data; changing it triggers a background rewrite
+      encodingKey: 'Your-Encoding-Key...',
 
-      // Security key: protects encodingKey; does not encrypt data directly; rotate online via rotateEncryptionKey
+      // Security key: protects encodingKey; rotate online via db.rotateEncryptionKey
       encryptionKey: 'Your-Secure-Encryption-Key...',
 
-      // Device binding (path-based binding)
-      // When enabled, the key is deeply bound to the database path and device characteristics.
-      // Data cannot be decrypted when moved to a different physical path.
-      // Advantage: better protection if database files are copied directly.
-      // Drawback: if the install path or device characteristics change, data may become unrecoverable.
-      deviceBinding: false,
-
-      // Encryption scope: standard (default, encrypts key table data, index data, and logs)
-      // or full (full encryption, encrypts the entire engine files completely)
+      // standard: critical table data, B-tree indexes, and log payloads
+      // full: encrypts the entire engine files
       encryptionScope: EncryptionScope.standard,
     ),
     // Enable crash recovery logging (Write-Ahead Logging), enabled by default
@@ -1515,7 +1508,9 @@ final db = await ToStore.open(
 **`encryptionKey` のローテーション**（セキュリティ／コンプライアンスの定期ローテーション）：データの再書き込みなし、オンラインで実行可能。
 
 ```dart
-final result = await db.rotateEncryptionKey(oldEncryptionKey, newEncryptionKey);
+// If encryptionKey was never set explicitly, oldKey can be omitted
+final result = await db.rotateEncryptionKey(newKey: 'new-secure-key');
+// Or: await db.rotateEncryptionKey(oldKey: 'old-key', newKey: 'new-key');
 if (result.hasErrors) {
   // 失敗時の処理（oldKey が不正、encodingKey 移行中など）
   return;
