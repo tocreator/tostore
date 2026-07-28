@@ -3,7 +3,7 @@ class SpaceInfo {
   /// Name of the space
   final String spaceName;
 
-  /// Number of user-created tables in this space
+  /// Number of tables in the schema inventory
   final int tableCount;
 
   /// Total number of records across all tables in this space
@@ -15,7 +15,7 @@ class SpaceInfo {
   /// Last time statistics were updated
   final DateTime? lastStatisticsTime;
 
-  /// User-created tables available in this space
+  /// Tables in the schema inventory
   final List<String> tables;
 
   /// Create a new SpaceInfo instance
