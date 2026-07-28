@@ -29,18 +29,6 @@ class DataStoreConfig {
   /// instead of setting this directly in user code.
   final PersistenceMode persistenceMode;
 
-  /// compression level
-  final int compressionLevel;
-
-  /// enable monitoring
-  final bool enableMonitoring;
-
-  /// enable compression
-  final bool enableCompression;
-
-  /// enable auto repair
-  final bool enableAutoRepair;
-
   /// Encryption configuration
   /// If null, will use default encryption settings
   final EncryptionConfig? encryptionConfig;
@@ -163,11 +151,7 @@ class DataStoreConfig {
     this.dbPath,
     required this.dbName,
     required this.spaceName,
-    required this.compressionLevel,
     required this.ignoreUnknownFields,
-    required this.enableMonitoring,
-    required this.enableCompression,
-    required this.enableAutoRepair,
     this.encryptionConfig,
     this.migrationConfig,
     required this.maxPartitionFileSize,
@@ -207,11 +191,7 @@ class DataStoreConfig {
     String? dbPath,
     String dbName = 'default',
     String spaceName = 'default',
-    int compressionLevel = 6,
     bool ignoreUnknownFields = true,
-    bool enableMonitoring = true,
-    bool enableCompression = true,
-    bool enableAutoRepair = true,
     EncryptionConfig? encryptionConfig,
     MigrationConfig? migrationConfig = const MigrationConfig(),
     int? maxPartitionFileSize,
@@ -256,11 +236,7 @@ class DataStoreConfig {
       dbPath: dbPath,
       dbName: dbName,
       spaceName: spaceName,
-      compressionLevel: compressionLevel,
       ignoreUnknownFields: ignoreUnknownFields,
-      enableMonitoring: enableMonitoring,
-      enableCompression: enableCompression,
-      enableAutoRepair: enableAutoRepair,
       encryptionConfig: encryptionConfig,
       migrationConfig: migrationConfig,
       maxPartitionFileSize: resolvedMaxPartition,
@@ -610,13 +586,9 @@ class DataStoreConfig {
       dbPath: json['dbPath'] as String?,
       dbName: json['dbName'] as String? ?? 'default',
       spaceName: json['spaceName'] as String? ?? 'default',
-      compressionLevel: json['compressionLevel'] as int? ?? 6,
       ignoreUnknownFields: json['ignoreUnknownFields'] as bool? ?? true,
       transactionTimeout:
           Duration(milliseconds: json['transactionTimeout'] as int? ?? 300000),
-      enableMonitoring: json['enableMonitoring'] as bool? ?? true,
-      enableCompression: json['enableCompression'] as bool? ?? true,
-      enableAutoRepair: json['enableAutoRepair'] as bool? ?? true,
       encryptionConfig: parsedEncryptionConfig,
       migrationConfig: json['migrationConfig'] != null
           ? MigrationConfig.fromJson(
@@ -671,12 +643,8 @@ class DataStoreConfig {
       'dbPath': dbPath,
       'dbName': dbName,
       'spaceName': spaceName,
-      'compressionLevel': compressionLevel,
       'ignoreUnknownFields': ignoreUnknownFields,
       'transactionTimeout': transactionTimeout.inMilliseconds,
-      'enableMonitoring': enableMonitoring,
-      'enableCompression': enableCompression,
-      'enableAutoRepair': enableAutoRepair,
       if (encryptionConfig != null)
         'encryptionConfig': encryptionConfig!.toJson(),
       'migrationConfig': migrationConfig?.toJson(),
@@ -717,12 +685,8 @@ class DataStoreConfig {
     String? dbPath,
     String? dbName,
     String? spaceName,
-    int? compressionLevel,
     bool? ignoreUnknownFields,
     Duration? transactionTimeout,
-    bool? enableMonitoring,
-    bool? enableCompression,
-    bool? enableAutoRepair,
     EncryptionConfig? encryptionConfig,
     MigrationConfig? migrationConfig,
     int? maxPartitionFileSize,
@@ -758,12 +722,8 @@ class DataStoreConfig {
       dbPath: dbPath ?? this.dbPath,
       dbName: dbName ?? this.dbName,
       spaceName: spaceName ?? this.spaceName,
-      compressionLevel: compressionLevel ?? this.compressionLevel,
       ignoreUnknownFields: ignoreUnknownFields ?? this.ignoreUnknownFields,
       transactionTimeout: transactionTimeout ?? this.transactionTimeout,
-      enableMonitoring: enableMonitoring ?? this.enableMonitoring,
-      enableCompression: enableCompression ?? this.enableCompression,
-      enableAutoRepair: enableAutoRepair ?? this.enableAutoRepair,
       encryptionConfig: encryptionConfig ?? this.encryptionConfig,
       migrationConfig: migrationConfig ?? this.migrationConfig,
       maxPartitionFileSize: maxPartitionFileSize ?? this.maxPartitionFileSize,
@@ -929,7 +889,7 @@ enum RecoveryFlushPolicy {
 
 /// Encryption type enumeration for data encoding and encryption
 enum EncryptionType {
-  /// No encryption, only compression (highest performance)
+  /// No encryption (highest performance)
   none,
 
   /// XOR obfuscation (lightweight, fast, provides basic privacy protection)
