@@ -114,9 +114,10 @@ abstract class DataStoreInterface {
 
   /// Get table names.
   ///
-  /// By default returns **all** tables in the database. Pass
-  /// [onlyCurrentSpace] for globals + tables active in the current space.
-  Future<List<String>> getTableNames({bool onlyCurrentSpace = false});
+  /// By default returns **all** tables. Pass [isGlobal] to filter
+  /// (`true` / `false` / `null` = both). Non-global schemas are shared across
+  /// spaces; only table data is space-isolated.
+  Future<List<String>> getTableNames({bool? isGlobal});
 
   /// Perform approximate nearest neighbor (ANN) vector similarity search
   Future<List<VectorSearchResult>> vectorSearch(
