@@ -4,7 +4,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:tostore/tostore.dart';
 
-import 'platform/desktop_window.dart';
 import 'testing/database_tester.dart';
 import 'testing/log_service.dart';
 import 'tostore_example.dart' show ForeignKeyMode, ToStoreExample;
@@ -19,7 +18,6 @@ String _dbResultErrorMessage(DbResult result) {
 /// Simple UI to run examples
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await initDesktopWindow();
 
   // It's crucial to set the log handler *before* any potential errors can occur.
   // This ensures that initialization logs are captured and displayed in the UI.
@@ -86,7 +84,7 @@ class MyApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: '',
+      title: 'ToStore Demo',
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(
           seedColor: const Color(0xFF006CC3),
@@ -619,67 +617,61 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         backgroundColor: Colors.white,
         surfaceTintColor: Colors.transparent,
         elevation: 0,
-        // macOS traffic lights sit in the top-left when title bar is hidden.
-        leadingWidth: desktopLeadingWidth > 0 ? desktopLeadingWidth : null,
-        leading: desktopLeadingWidth > 0 ? const SizedBox.shrink() : null,
         automaticallyImplyLeading: false,
         titleSpacing: 16,
-        title: wrapWindowDrag(
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.center,
-            children: [
-              Image.asset(
-                'assets/logo-tostore.png',
-                height: 28.0,
-                fit: BoxFit.contain,
-                errorBuilder: (context, error, stackTrace) {
-                  return const Text(
-                    'ToStore',
-                    style: TextStyle(
-                      fontWeight: FontWeight.bold,
-                      color: Color(0xFF006CC3),
-                    ),
-                  );
-                },
-              ),
-              const SizedBox(width: 12),
-              Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 9, vertical: 3.5),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(20),
-                  border: Border.all(
-                    color: const Color(0xFFE2E8F0),
-                    width: 0.8,
+        title: Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            Image.asset(
+              'assets/logo-tostore.png',
+              height: 28.0,
+              fit: BoxFit.contain,
+              errorBuilder: (context, error, stackTrace) {
+                return const Text(
+                  'ToStore',
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    color: Color(0xFF006CC3),
                   ),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Container(
-                      width: 6,
-                      height: 6,
-                      decoration: const BoxDecoration(
-                        color: Color(0xFF10B981),
-                        shape: BoxShape.circle,
-                      ),
-                    ),
-                    const SizedBox(width: 5),
-                    const Text(
-                      'DEMO',
-                      style: TextStyle(
-                        fontSize: 10.5,
-                        fontWeight: FontWeight.w700,
-                        color: Color(0xFF006CC3),
-                        letterSpacing: 1.2,
-                      ),
-                    ),
-                  ],
+                );
+              },
+            ),
+            const SizedBox(width: 12),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 3.5),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(20),
+                border: Border.all(
+                  color: const Color(0xFFE2E8F0),
+                  width: 0.8,
                 ),
               ),
-            ],
-          ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    width: 6,
+                    height: 6,
+                    decoration: const BoxDecoration(
+                      color: Color(0xFF10B981),
+                      shape: BoxShape.circle,
+                    ),
+                  ),
+                  const SizedBox(width: 5),
+                  const Text(
+                    'DEMO',
+                    style: TextStyle(
+                      fontSize: 10.5,
+                      fontWeight: FontWeight.w700,
+                      color: Color(0xFF006CC3),
+                      letterSpacing: 1.2,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
         ),
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(1.0),
@@ -690,7 +682,6 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         ),
         actions: [
           _buildMoreActionsButton(),
-          ...buildWindowCaptionActions(),
         ],
       ),
       body: SafeArea(
