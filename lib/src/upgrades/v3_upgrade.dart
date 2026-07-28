@@ -20,8 +20,6 @@ import '../model/table_meta.dart';
 import '../model/table_context.dart';
 import '../model/meta_info.dart';
 import '../model/ngh_index_meta.dart';
-import '../handler/space_manifest_codec.dart';
-import '../model/space_manifest.dart';
 import '../model/id_generator.dart';
 import 'config_format_migration.dart';
 import 'legacy_model/pre_v3.dart';
@@ -40,8 +38,6 @@ import 'weight_format_migration.dart';
 ///   bootstrap so index page0 writes never see pageSize=0.
 /// - Reads legacy meta.json once, writes TableDataMeta/IndexMeta/NghIndexMeta into
 ///   partition-0 page0, then deletes the JSON files (no intermediate JSON rewrite).
-/// - Writes per-space [SpaceManifest] into `_system_internal_kv_store`
-///   (`isGlobal: false`, key [SpaceManifestCodec.internalKvKey]).
 /// - Migrates pending parallel-batch `tablePlan` out of A/B journal into WalMeta,
 ///   then deletes `journal_a.log` / `journal_b.log` (interim JSON; converted below).
 /// - Migrates legacy NDJSON transaction logs to binary ToTX.
@@ -382,32 +378,10 @@ class V3Upgrade {
       }
     }
 
-    // 5. Write SpaceManifest into each space's internal KV (isGlobal: false).
-    for (final spaceName in spaces) {
-      final spaceTableUids = <TableUid>{};
-      final map = spaceTableDirMaps[spaceName];
-      if (map != null) {
-        for (final key in map.keys) {
-          final prefix = '$spaceName:';
-          if (!key.startsWith(prefix)) continue;
-          final tableName = key.substring(prefix.length);
-          final isGlobal = tableIsGlobalMap[tableName] ?? false;
-          if (isGlobal) {
-            continue; // global tables are excluded from space statistics
-          }
-          final tableUid = tableUidMap[tableName];
-          if (tableUid != null) {
-            spaceTableUids.add(TableUid(tableUid));
-          }
-        }
-      }
-      await _writeSpaceManifest(spaceName, spaceTableUids);
-    }
-
     final resolvedPageSize =
         _discoveredPageSize ?? _dataStore.configuredPageSize;
 
-    // 7. Schedule legacy schema artifact cleanup (async after version bump).
+    // 5. Schedule legacy schema artifact cleanup (async after version bump).
     for (final partitionIndex in tablePartitionMap.values.toSet()) {
       final dirIndex = partitionToDir[partitionIndex] ??
           (partitionIndex ~/ _dataStore.maxEntriesPerDir);
@@ -608,50 +582,6 @@ class V3Upgrade {
       table: ctx,
       inserts: inserts,
     );
-  }
-
-  /// Persist [SpaceManifest] for [spaceName] via internal KV (`isGlobal: false`).
-  ///
-  /// Uses durable [writeChanges] (journal may not be running on the primary).
-  Future<void> _writeSpaceManifest(
-    String spaceName,
-    Set<TableUid> activeTableUids,
-  ) async {
-    if (spaceName == _dataStore.currentSpaceName) {
-      final mgr = _dataStore.tableMetaManager;
-      if (mgr != null) {
-        await mgr.replaceActiveTableUids(activeTableUids);
-      } else {
-        await _dataStore.internalKv.set(
-          SpaceManifestCodec.internalKvKey,
-          SpaceManifestCodec.encode(
-            SpaceManifest(activeTableUids: activeTableUids),
-          ),
-          isGlobal: false,
-        );
-      }
-      return;
-    }
-
-    final bytes = SpaceManifestCodec.encode(
-      SpaceManifest(activeTableUids: activeTableUids),
-    );
-    final temp = DataStoreImpl(
-      dbPath: _dataStore.config.dbPath,
-      dbName: _dataStore.config.dbName,
-      config: _dataStore.config.copyWith(spaceName: spaceName),
-      isMigrationInstance: true,
-    );
-    try {
-      await temp.initialize(applyActiveSpaceOnDefault: false);
-      await temp.internalKv.set(
-        SpaceManifestCodec.internalKvKey,
-        bytes,
-        isGlobal: false,
-      );
-    } finally {
-      await temp.close();
-    }
   }
 
   /// Lift `BatchStart.tablePlan` from remnant A/B journals into
