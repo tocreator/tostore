@@ -1474,30 +1474,23 @@ ToStore puede enrutar los registros del ciclo de vida de la base de datos a la c
 > | **`encodingKey`** | Clave de cifrado de datos | Establecer nuevo valor y volver a `open` | **Sí** (lento) |
 > | **`encryptionKey`** | Clave de seguridad; protege `encodingKey` | Llamar `db.rotateEncryptionKey` en tiempo de ejecución | **No** (rápido) |
 >
-> Nunca codifique claves sensibles; se recomienda obtenerlas de un servicio seguro.
+> Nunca codifique claves sensibles. Para vincularlas al dispositivo, guarde `encryptionKey` en el Keychain / Keystore / enclave seguro del SO y páselo al motor.
 
 ```dart
 final db = await ToStore.open(
   config: DataStoreConfig(
     encryptionConfig: EncryptionConfig(
-      // Supported encryption algorithms: none, xorObfuscation, chacha20Poly1305, aes256Gcm
+      // Supported: none, xorObfuscation, chacha20Poly1305, aes256Gcm
       encryptionType: EncryptionType.chacha20Poly1305,
 
-      // Data encryption key: encrypts data; changing it triggers a full background rewrite of encrypted data
-      encodingKey: 'Your-32-Byte-Long-Encoding-Key...',
+      // Data encryption key: encrypts table/index/log data; changing it triggers a background rewrite
+      encodingKey: 'Your-Encoding-Key...',
 
-      // Security key: protects encodingKey; does not encrypt data directly; rotate online via rotateEncryptionKey
+      // Security key: protects encodingKey; rotate online via db.rotateEncryptionKey
       encryptionKey: 'Your-Secure-Encryption-Key...',
 
-      // Device binding (path-based binding)
-      // When enabled, the key is deeply bound to the database path and device characteristics.
-      // Data cannot be decrypted when moved to a different physical path.
-      // Advantage: better protection if database files are copied directly.
-      // Drawback: if the install path or device characteristics change, data may become unrecoverable.
-      deviceBinding: false,
-
-      // Encryption scope: standard (default, encrypts key table data, index data, and logs)
-      // or full (full encryption, encrypts the entire engine files completely)
+      // standard: critical table data, B-tree indexes, and log payloads
+      // full: encrypts the entire engine files
       encryptionScope: EncryptionScope.standard,
     ),
     // Enable crash recovery logging (Write-Ahead Logging), enabled by default
@@ -1513,7 +1506,9 @@ final db = await ToStore.open(
 **Rotar `encryptionKey`** (rotación periódica por seguridad/cumplimiento): sin reescritura de datos; se ejecuta en línea.
 
 ```dart
-final result = await db.rotateEncryptionKey(oldEncryptionKey, newEncryptionKey);
+// If encryptionKey was never set explicitly, oldKey can be omitted
+final result = await db.rotateEncryptionKey(newKey: 'new-secure-key');
+// Or: await db.rotateEncryptionKey(oldKey: 'old-key', newKey: 'new-key');
 if (result.hasErrors) {
   // Manejar error (oldKey incorrecto, migración de encodingKey en curso, etc.)
   return;
