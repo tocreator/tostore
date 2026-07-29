@@ -62,13 +62,6 @@ class PathManager {
     return pathJoin(_instancePath, 'global_config.tobf');
   }
 
-  /// get space config path (TOBF binary)
-  /// If [rootPath] is provided, build path from that root; otherwise use instance path
-  String getSpaceConfigPath({String? rootPath, String? spaceName}) {
-    final spacePath = getSpacePath(rootPath: rootPath, spaceName: spaceName);
-    return pathJoin(spacePath, 'space_config.tobf');
-  }
-
   /// Space-local access-weight snapshot (soft stats; not WAL-backed).
   /// If [rootPath] is provided, build path from that root; otherwise use instance path.
   String getAccessWeightsPath({String? rootPath, String? spaceName}) {
