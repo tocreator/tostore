@@ -1058,18 +1058,16 @@ class IndexManager {
 
   /// Whether an authoritative source currently owns a full index rebuild.
   ///
-  /// Only [MigrationManager] (schema index rebuild) and [KeyMigrationRunner]
-  /// may set `isBuilding = true`. Query / write paths must never invent it.
+  /// Only [MigrationManager] (schema index rebuild) may set `isBuilding = true`.
+  /// Key migration uses sync overwrite and does not take isBuilding ownership;
+  /// [KeyMigrationRunner.isTableMigrating] still blocks clearing/query invent.
+  /// Query / write paths must never invent isBuilding.
   bool isIndexBuildOwned(TableContext table, IndexUid indexUid) {
     final migrationMgr = _dataStore.migrationManager;
-    if (migrationMgr != null) {
-      if (table.tableUid.isNotEmpty &&
-          migrationMgr.hasPendingIndexBuild(table.tableUid, indexUid)) {
-        return true;
-      }
-      if (migrationMgr.ownsKeyMigrationIndexBuilds()) {
-        return true;
-      }
+    if (migrationMgr != null &&
+        table.tableUid.isNotEmpty &&
+        migrationMgr.hasPendingIndexBuild(table.tableUid, indexUid)) {
+      return true;
     }
     return KeyMigrationRunner.isTableMigrating(table);
   }
