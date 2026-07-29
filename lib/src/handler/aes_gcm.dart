@@ -6,6 +6,7 @@ import '../model/db_exception.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
 import 'platform_byte_data.dart';
+import 'sha256.dart';
 
 /// Optimized Manual AES-GCM Implementation
 /// Compliant with NIST SP 800-38D
@@ -44,6 +45,14 @@ class AESGCM {
     210,
     54
   ]);
+
+  /// Generate a 32-byte key from a string using the unified SHA-256 KDF.
+  ///
+  /// Prefer [SHA256.stringToBytes] at call sites that are not AES-specific.
+  static Uint8List generateKeyFromString(String userKey) {
+    if (userKey.isEmpty) return defaultKey;
+    return SHA256.stringToBytes(userKey);
+  }
 
   static Uint8List encrypt({
     required String plaintext,
@@ -98,7 +107,8 @@ class AESGCM {
     _generateNonceInto(nonce);
 
     final j0 = Uint32List(4);
-    final nonceData = nonce.buffer.asByteData();
+    // Must respect [nonce] view offset (not buffer base).
+    final nonceData = ByteData.sublistView(nonce);
     j0[0] = nonceData.getUint32(0);
     j0[1] = nonceData.getUint32(4);
     j0[2] = nonceData.getUint32(8);
@@ -198,7 +208,8 @@ class AESGCM {
 
     // 4. Verify Tag
     final j0 = Uint32List(4);
-    final nonceData = nonce.buffer.asByteData();
+    // Must respect [nonce] view offset (not buffer base).
+    final nonceData = ByteData.sublistView(nonce);
     j0[0] = nonceData.getUint32(0);
     j0[1] = nonceData.getUint32(4);
     j0[2] = nonceData.getUint32(8);
@@ -637,7 +648,7 @@ class AESGCM {
     int nb = 4;
     final w = Uint32List(nb * (nr + 1));
 
-    final keyData = key.buffer.asByteData();
+    final keyData = ByteData.sublistView(key);
     for (int i = 0; i < nk; i++) {
       w[i] = keyData.getUint32(i * 4);
     }
