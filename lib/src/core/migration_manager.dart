@@ -172,14 +172,6 @@ class MigrationManager {
     return info != null && info.isRunning;
   }
 
-  /// Whether key migration still owns index rebuild flags (running or failed pending retry).
-  bool ownsKeyMigrationIndexBuilds() {
-    final info = _migrationMetaCache?.keyMigrationInfo;
-    if (info == null) return false;
-    return info.status == KeyMigrationStatus.running ||
-        info.status == KeyMigrationStatus.failed;
-  }
-
   /// Persist key migration metadata and sync [GlobalConfig.hasMigrationTask].
   Future<void> persistKeyMigrationInfo(KeyMigrationInfo info) async {
     await _runMigrationMetaWrite(() async {
@@ -677,7 +669,17 @@ class MigrationManager {
       await LargeOperationRunner.pauseAndAwait(currentSpace);
     }
     if (keyMigrating) {
-      await _dataStore.keyManager.pauseKeyMigration();
+      final paused = await _dataStore.keyManager.pauseKeyMigration();
+      if (!paused) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message:
+                'Cannot $reason while encodingKey migration is still running '
+                '(pause timed out). Retry after migration yields.',
+          ),
+        ]);
+      }
     }
 
     final lockMgr = _dataStore.lockManager;
@@ -873,7 +875,7 @@ class MigrationManager {
   }
 
   /// After task removal: clear isBuilding for indexes no longer owned by any
-  /// pending schema rebuild (and not under key migration).
+  /// pending schema rebuild (skip while key migration is rewriting the table).
   Future<void> _clearIndexBuildingFlagsForRemovedTask(
       MigrationTask task) async {
     final specific = task.specificIndexUids;
@@ -882,8 +884,7 @@ class MigrationManager {
     if (indexManager == null) return;
     final table = await _tableContextForUid(task.tableUid);
     if (table == null) return;
-    if (KeyMigrationRunner.isTableMigrating(table) ||
-        ownsKeyMigrationIndexBuilds()) {
+    if (KeyMigrationRunner.isTableMigrating(table)) {
       return;
     }
     for (final indexUid in specific) {
@@ -2699,7 +2700,17 @@ class MigrationManager {
 
       keyMigrating = KeyMigrationRunner.isTableMigrating(table);
       if (keyMigrating) {
-        await _dataStore.keyManager.pauseKeyMigration();
+        final paused = await _dataStore.keyManager.pauseKeyMigration();
+        if (!paused) {
+          throw DbException([
+            GeneralStatus(
+              type: ResultType.engError,
+              message:
+                  'Cannot apply schema cutover while encodingKey migration is '
+                  'still running (pause timed out).',
+            ),
+          ]);
+        }
       }
 
       // 2. Clear pending background write scheduler entries for this table
