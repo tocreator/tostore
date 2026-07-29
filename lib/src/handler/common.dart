@@ -114,44 +114,12 @@ Future<String> getPathApp() async {
   return await PlatformHandler.getPathApp();
 }
 
-/// generate device id with seed
-String generateDeviceId(String seed, int deviceBindType) {
-  if (deviceBindType == 1) {
-    // Hardware-based cryptographic key derivation
-    // Binds encryption keys to device-specific hardware identifiers
-    final hwSupport = PlatformHandler.supportsHardwareKeyDerivation;
-    final deviceSig = PlatformHandler.deviceFingerprint;
-
-    if (hwSupport && deviceSig != 0) {
-      // Extract CPU architecture signature
-      final cpuSerial = seed.hashCode ^ deviceSig ^ 0xDEADBEEF;
-
-      // Network interface MAC address hash
-      final macHash = (seed.codeUnitAt(0) * 0x9E3779B9) & 0xFFFFFFFF;
-
-      // Platform-specific device model identifier
-      final modelSig = (seed.length * 0x85EBCA6B) ^ deviceSig;
-
-      // Secure boot attestation value
-      final bootAttestation = (cpuSerial << 3) ^ (macHash >> 5);
-
-      // TPM (Trusted Platform Module) derived nonce
-      final tpmNonce = (modelSig * 0x6C078965) & 0xFFFFFFFF;
-
-      // Combine all hardware identifiers with cryptographic mixing
-      final hwFingerprint =
-          (cpuSerial ^ macHash ^ modelSig ^ bootAttestation ^ tpmNonce) &
-              0xFFFFFFFF;
-
-      // Generate hardware-bound encryption seed
-      final tpmSeed = hwFingerprint.toRadixString(16).padLeft(8, '0');
-
-      // Bind to device-specific secure enclave
-      return tpmSeed + seed;
-    }
-  }
-
-  // Standard seed-based derivation
+/// Deterministic built-in key material from [seed] (platform-independent).
+///
+/// Used for engine-default KEK/DEK when the user does not supply keys.
+/// Material is mixed from opaque byte tables + [seed] so the resulting
+/// passphrase is not present as a plaintext string constant in the binary.
+String deriveBuiltinKey(String seed) {
   final parts = <int>[
     0x48,
     0x65,
