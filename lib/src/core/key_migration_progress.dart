@@ -86,6 +86,25 @@ class KeyMigrationProgressStore {
     );
   }
 
+  /// True when this table/space already finished key rewrite for the current run.
+  static Future<bool> isCompleted(
+    DataStoreImpl dataStore, {
+    required TableContext table,
+    required String spaceName,
+  }) async {
+    final progressTable = await _progressTableContext(dataStore);
+    if (progressTable == null) return false;
+    final pk = progressKey(table.tableUid, spaceName);
+    final rows = await dataStore.queryBy(
+      progressTable,
+      SystemTable.keyMigrationProgressKeyField,
+      pk,
+    );
+    if (rows.isEmpty) return false;
+    final status = rows.first[SystemTable.keyMigrationStatusField]?.toString();
+    return status == 'completed';
+  }
+
   static Future<void> clearAll(DataStoreImpl dataStore) async {
     await TransactionContext.runAsSystemOperation(() async {
       await dataStore.clear(SystemTable.keyMigrationProgressTableName);
