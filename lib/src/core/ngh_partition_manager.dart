@@ -477,12 +477,9 @@ final class NghPartitionManager {
       return map.putIfAbsent(pNo, () => _NghPartitionStats());
     }
 
-    // Determine whether to use encryption:
-    // encryptVectorIndex must be true AND encryptionType must not be none.
+    // Vector pages encrypt under EncryptionScope.full (or legacy encryptVectorIndex).
     final encCfg = _dataStore.config.encryptionConfig;
-    final bool encrypt = encCfg != null &&
-        encCfg.encryptVectorIndex &&
-        encCfg.encryptionType != EncryptionType.none;
+    final bool encrypt = encCfg?.shouldEncryptVectorIndex ?? false;
 
     // ── Encode & stage graph pages ──
     for (final entry in dirtyGraphPages.entries) {
@@ -872,9 +869,7 @@ final class NghPartitionManager {
   ) async {
     final tableUid = table.tableUid;
     final encCfg = _dataStore.config.encryptionConfig;
-    final bool encrypt = encCfg != null &&
-        encCfg.encryptVectorIndex &&
-        encCfg.encryptionType != EncryptionType.none;
+    final bool encrypt = encCfg?.shouldEncryptVectorIndex ?? false;
     final path =
         await _dataStore.pathManager.getNghCodebookPath(tableUid, indexUid);
     await _dataStore.storage.ensureDirectoryExists(p.dirname(path));
