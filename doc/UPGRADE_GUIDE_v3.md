@@ -96,7 +96,6 @@ final db = await ToStore.open(
       encryptionType: EncryptionType.xorObfuscation,  // or aes256Gcm for AES
       encodingKey: 'YourEncodingKey',
       encryptionKey: 'YourEncryptionKey',
-      deviceBinding: false,  // set true for path-bound keys
     ),
   ),
 );
@@ -104,7 +103,6 @@ final db = await ToStore.open(
 
 - **encryptionType**: `EncryptionType.none` (no encryption), `xorObfuscation` (lightweight obfuscation), `chacha20Poly1305`, or `aes256Gcm`.
 - **encodingKey** / **encryptionKey**: Same role as in v2.x; optional — keys are derived by default when not provided.
-- **deviceBinding**: When true, keys are bound to the device path.
 
 ### 4. Deprecated APIs
 
@@ -258,7 +256,6 @@ final db = await ToStore.open(
       encryptionType: EncryptionType.xorObfuscation,  // 或 aes256Gcm 使用 AES
       encodingKey: 'YourEncodingKey',
       encryptionKey: 'YourEncryptionKey',
-      deviceBinding: false,  // 设为 true 可启用路径绑定密钥
     ),
   ),
 );
@@ -266,7 +263,6 @@ final db = await ToStore.open(
 
 - **encryptionType**：`EncryptionType.none`（不加密）、`xorObfuscation`（轻量混淆）、`chacha20Poly1305` 或 `aes256Gcm`。
 - **encodingKey** / **encryptionKey**：与 v2.x 作用相同；可选，不传时默认派生。
-- **deviceBinding**：为 true 时密钥与该设备路径特征绑定。
 
 
 ### 4. 已弃用的 API
