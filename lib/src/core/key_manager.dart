@@ -1,170 +1,99 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:typed_data';
 
-import '../handler/chacha20_poly1305.dart';
 import '../handler/encryption.dart';
+import '../handler/global_config_codec.dart';
 import '../handler/logger.dart';
+import '../model/applied_encryption.dart';
+import '../model/data_store_config.dart';
 import '../model/db_exception.dart';
 import '../model/db_result.dart';
-import '../model/data_store_config.dart';
+import '../model/encryption_domain.dart';
+import '../model/global_config.dart';
 import '../model/key_migration_info.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
-import '../model/space_config.dart';
+import 'crontab_manager.dart';
 import 'data_store_impl.dart';
 import 'key_migration_progress.dart';
 import 'key_migration_runner.dart';
 
-/// Manages the logic for migrating encryption keys.
-/// When the encryptionKey in DataStoreConfig changes,
-/// it reads the old key (through the StorageAdapter interface, i.e., DataStoreImpl.storage),
-/// encrypts the current encryptionKey using ChaCha20Poly1305, and saves it to the key file.
-/// It also performs data migration (calls EncoderHandler to re-encode/decode data files).
+/// Manages encoding/encryption keys and encodingKey migration.
+///
+/// - [encryptionKey] (KEK): protects GlobalConfig shell only; rotation does not
+///   rewrite table/index data.
+/// - [encodingKey] (DEK): stored plaintext in [AppliedEncryption] inside
+///   GlobalConfig; changes trigger background [KeyMigrationRunner].
 class KeyManager {
   final DataStoreImpl _dataStore;
 
-  // Cached generated keys from encryption config
   String? _cachedEncodingKey;
   String? _cachedEncryptionKey;
   bool _keyMigrationScheduled = false;
   Future<void>? _keyMigrationFuture;
   KeyChangeInfo? _deferredKeyChangeInfo;
+  DateTime? _lastHistoryPurgeDay;
+
+  /// Low-frequency watch for WAL / page-redo / txn natural turnover.
+  /// Registered only while rewrite is done and those domains remain open.
+  bool _naturalTurnoverWatchRegistered = false;
+  bool _naturalTurnoverPollInFlight = false;
+  Future<void>? _naturalTurnoverPollFuture;
+  late final String _naturalTurnoverLeaseId =
+      'key_natural_${identityHashCode(_dataStore)}';
 
   KeyManager(DataStoreImpl dataStore) : _dataStore = dataStore;
 
   /// Get effective encryption config (use default if not provided)
   EncryptionConfig _getEncryptionConfig() {
-    final config = _dataStore.config;
-    return config.encryptionConfig ?? const EncryptionConfig();
+    return _dataStore.config.encryptionConfig ?? const EncryptionConfig();
   }
 
   /// Get effective encryption key
   String _getEncryptionKey() {
-    if (_cachedEncryptionKey != null) {
-      return _cachedEncryptionKey!;
-    }
-
-    final encryptionConfig = _getEncryptionConfig();
-    // Use instancePath (final resolved path) instead of config.dbPath which may be null
-    final dbPath = _dataStore.instancePath ?? _dataStore.config.dbPath;
-    _cachedEncryptionKey = encryptionConfig.generateEncryptionKey(dbPath);
-    return _cachedEncryptionKey!;
+    return _cachedEncryptionKey ??=
+        _getEncryptionConfig().resolveEncryptionKey();
   }
 
-  /// Get effective encoding key
   String _getEncodingKey() {
-    if (_cachedEncodingKey != null) {
-      return _cachedEncodingKey!;
-    }
-
-    final encryptionConfig = _getEncryptionConfig();
-    // Use instancePath (final resolved path) instead of config.dbPath which may be null
-    final dbPath = _dataStore.instancePath ?? _dataStore.config.dbPath;
-    _cachedEncodingKey = encryptionConfig.generateEncodingKey(dbPath);
-    return _cachedEncodingKey!;
+    return _cachedEncodingKey ??= _getEncryptionConfig().resolveEncodingKey();
   }
 
-  /// Get effective encryption type
-  EncryptionType _getEncryptionType() {
-    return _getEncryptionConfig().encryptionType;
-  }
+  EncryptionType _getEncryptionType() => _getEncryptionConfig().encryptionType;
 
-  /// Get effective encryption scope
-  EncryptionScope _getEncryptionScope() {
-    return _getEncryptionConfig().encryptionScope;
-  }
+  EncryptionScope _getEncryptionScope() =>
+      _getEncryptionConfig().encryptionScope;
 
-  /// Generate AAD (Additional Authenticated Data) for key encryption
-  /// This prevents key reuse across different databases or key versions
-  Uint8List _generateAAD(int keyId) {
-    // This ensures AAD is deterministic and verifiable
-    final aadString = 'keyId:$keyId';
-    return Uint8List.fromList(utf8.encode(aadString));
-  }
-
-  /// Encrypt a plain key using the encryption key from config
-  /// AAD includes dbPath and keyId to ensure key is bound to specific database instance and version
-  String _encryptKey(String plainKey, int keyId) {
-    return _encryptKeyWithEncryptionKey(plainKey, keyId, _getEncryptionKey());
-  }
-
-  String _encryptKeyWithEncryptionKey(
-    String plainKey,
-    int keyId,
-    String encryptionKey,
-  ) {
-    final aad = _generateAAD(keyId);
-    final encryptedBytes = ChaCha20Poly1305.encrypt(
-      plaintext: plainKey,
-      key: ChaCha20Poly1305.generateKeyFromString(encryptionKey),
-      aad: aad,
-    );
-    return base64.encode(encryptedBytes);
-  }
-
-  String? _decodePlainKeyWithEncryptionKey(
-    String encodedKey,
-    int keyId,
-    String encryptionKey,
-  ) {
-    try {
-      final encodedBytes = base64.decode(encodedKey);
-      final aad = _generateAAD(keyId);
-      return ChaCha20Poly1305.decrypt(
-        encryptedData: encodedBytes,
-        key: ChaCha20Poly1305.generateKeyFromString(encryptionKey),
-        aad: aad,
-      );
-    } catch (e) {
-      return null;
-    }
-  }
-
-  /// Decode an encrypted key
-  /// Supports backward compatibility: tries with AAD first, then without AAD if keyId is not provided
-  dynamic _decodeKey(String encodedKey, int keyId, {bool isPlaintext = false}) {
-    final decrypted = _decodePlainKeyWithEncryptionKey(
-      encodedKey,
-      keyId,
-      _getEncryptionKey(),
-    );
-    if (decrypted == null) {
-      return null;
-    }
-    if (isPlaintext) {
-      return decrypted;
-    }
-    return EncryptionManager.generateKey(decrypted);
-  }
-
-  /// Rotate the master [encryptionKey] that wraps stored [encodingKey] blobs.
+  /// Rotate the master [encryptionKey] that protects GlobalConfig.
   ///
-  /// Re-wraps space config in every space: decrypt with [oldKey], encrypt with [newKey].
-  /// Does not rewrite table data. Updates in-memory config to [newKey].
+  /// Does not rewrite table data. When [oldKey] is null/empty, the engine
+  /// built-in [defaultEncryptionKey] is used (null → user-key transition).
   Future<DbResult> rotateEncryptionKey({
-    required String oldKey,
+    String? oldKey,
     required String newKey,
   }) async {
-    if (oldKey.isEmpty || newKey.isEmpty) {
+    final effectiveOld =
+        (oldKey == null || oldKey.isEmpty) ? defaultEncryptionKey : oldKey;
+
+    if (newKey.isEmpty) {
       return DbResult.batch(
         statuses: [
           InvalidArgumentStatus(
             type: ResultType.devInvalidArgumentMissing,
-            message: 'oldKey and newKey must be non-empty',
-            parameterName: oldKey.isEmpty ? 'oldKey' : 'newKey',
-            passedValue: oldKey.isEmpty ? oldKey : newKey,
+            message: 'newKey must be non-empty',
+            parameterName: 'newKey',
+            passedValue: newKey,
           ),
         ],
         failedCount: 1,
       );
     }
-    if (oldKey == newKey) {
+    if (effectiveOld == newKey) {
       return DbResult.batch(
         statuses: [
           InvalidArgumentStatus(
             type: ResultType.devInvalidArgumentFormat,
-            message: 'newKey must differ from oldKey',
+            message: 'newKey must differ from the effective old key',
             parameterName: 'newKey',
             passedValue: newKey,
           ),
@@ -184,46 +113,27 @@ class KeyManager {
     }
 
     try {
-      final spaces = await _dataStore.listSpaces();
-      final rotatedBySpace = <String, SpaceConfig>{};
-
-      for (final spaceName in spaces) {
-        final spaceConfig = await _dataStore.getSpaceConfig(
-          nowGetFromFile: true,
-          spaceName: spaceName,
-        );
-        if (spaceConfig == null || !_hasWrappedEncodingKeys(spaceConfig)) {
-          continue;
-        }
-
-        final rewrapResult = _rewrapSpaceConfig(spaceConfig, oldKey, newKey);
-        if (rewrapResult.config == null) {
-          return DbResult.batch(
-            statuses: rewrapResult.errors,
-            failedCount: rewrapResult.errors.length,
-          );
-        }
-        rotatedBySpace[spaceName] = rewrapResult.config!;
-      }
-
-      if (rotatedBySpace.isEmpty) {
+      final configPath = _dataStore.pathManager.getGlobalConfigPath();
+      if (!await _dataStore.storage.existsFile(configPath)) {
         return DbResult.error(
-          type: ResultType.devInvalidArgumentFormat,
-          message:
-              'oldKey failed to decrypt stored encodingKey; verify the key and retry',
+          type: ResultType.engError,
+          message: 'GlobalConfig missing; cannot rotate encryptionKey',
         );
       }
 
-      for (final entry in rotatedBySpace.entries) {
-        await _dataStore.saveSpaceConfigToFile(
-          entry.value,
-          spaceName: entry.key,
-          propagateErrors: true,
-        );
-      }
+      final bytes = await _dataStore.storage.readAsBytes(configPath);
+      final decoded = GlobalConfigCodec.decodeFileWithFallback(
+        bytes,
+        preferredKey: effectiveOld,
+        fallbackKeys: [
+          defaultEncryptionKey,
+        ],
+      );
 
       _cachedEncryptionKey = newKey;
       _dataStore.updateEncryptionKeyInConfig(newKey);
+      await _dataStore.saveGlobalConfig(decoded.config, propagateErrors: true);
+
       Logger.info('encryptionKey rotated successfully');
       return DbResult.success(
         message: 'encryptionKey rotated successfully',
@@ -242,60 +152,8 @@ class KeyManager {
     }
   }
 
-  bool _hasWrappedEncodingKeys(SpaceConfig config) {
-    if (config.current.key.isNotEmpty) return true;
-    return config.historyKeys.any((key) => key.key.isNotEmpty);
-  }
-
-  ({SpaceConfig? config, List<ResultStatus> errors}) _rewrapSpaceConfig(
-    SpaceConfig config,
-    String oldKey,
-    String newKey,
-  ) {
-    final errors = <ResultStatus>[];
-
-    EncryptionKeyInfo rewrapInfo(EncryptionKeyInfo info) {
-      if (info.key.isEmpty) return info;
-
-      final plain = _decodePlainKeyWithEncryptionKey(
-        info.key,
-        info.keyId,
-        oldKey,
-      );
-      if (plain == null) {
-        errors.add(
-          GeneralStatus(
-            type: ResultType.devInvalidArgumentFormat,
-            message:
-                'oldKey failed to decrypt encodingKey blob (keyId=${info.keyId})',
-          ),
-        );
-        return info;
-      }
-
-      return EncryptionKeyInfo(
-        key: _encryptKeyWithEncryptionKey(plain, info.keyId, newKey),
-        keyId: info.keyId,
-      );
-    }
-
-    final updated = config.copyWith(
-      current: rewrapInfo(config.current),
-      historyKeys: config.historyKeys.map(rewrapInfo).toList(),
-    );
-
-    if (errors.isNotEmpty) {
-      return (config: null, errors: errors);
-    }
-
-    return (config: updated, errors: errors);
-  }
-
-  /// V2 upgrade only: stash legacy plain encoding keys into [historyKeys],
-  /// mint a fresh [SpaceConfig.current] from the active encodingKey, and persist.
-  ///
-  /// Must run before V3's [initialize] so key-change migration is not scheduled;
-  /// V2 rewrites table data with the new current key itself.
+  /// V2 upgrade only: stash legacy plain encoding keys into GlobalConfig
+  /// [AppliedEncryption], mint a fresh current key, and persist.
   Future<void> prepareKeysForV2DataRewrite({
     required String spaceName,
     required Map<int, String> legacyPlainEncodingKeysById,
@@ -303,19 +161,11 @@ class KeyManager {
     _getEncodingKey();
     _getEncryptionKey();
 
-    final existing = await _dataStore.getSpaceConfig(
-      nowGetFromFile: true,
-      spaceName: spaceName,
-    );
-
     final history = <EncryptionKeyInfo>[];
     void addHistory(int keyId, String plain) {
       if (plain.isEmpty) return;
       if (history.any((k) => k.keyId == keyId)) return;
-      history.add(EncryptionKeyInfo(
-        key: _encryptKey(plain, keyId),
-        keyId: keyId,
-      ));
+      history.add(EncryptionKeyInfo(key: plain, keyId: keyId));
     }
 
     for (final entry in legacyPlainEncodingKeysById.entries) {
@@ -330,28 +180,11 @@ class KeyManager {
     final newKeyId = newKey.isEmpty ? 0 : maxKeyId + 1;
     final current = newKey.isEmpty
         ? const EncryptionKeyInfo(key: '', keyId: 0)
-        : EncryptionKeyInfo(
-            key: _encryptKey(newKey, newKeyId),
-            keyId: newKeyId,
-          );
+        : EncryptionKeyInfo(key: newKey, keyId: newKeyId);
 
-    final config = SpaceConfig(
-      current: current,
-      historyKeys: history,
-      version: existing?.version,
-      totalTableCount: existing?.totalTableCount ?? 0,
-      totalRecordCount: existing?.totalRecordCount ?? 0,
-      totalDataSizeBytes: existing?.totalDataSizeBytes ?? 0,
-      lastStatisticsTime: existing?.lastStatisticsTime,
-    );
+    final applied = AppliedEncryption(current: current, historyKeys: history);
+    await _saveAppliedEncryption(applied);
 
-    await _dataStore.saveSpaceConfigToFile(
-      config,
-      spaceName: spaceName,
-      propagateErrors: true,
-    );
-
-    // Keep old keyIds available for decoding pre-rewrite data partitions.
     final fallbackKeys = <int, Uint8List>{};
     for (final entry in legacyPlainEncodingKeysById.entries) {
       if (entry.value.isEmpty) continue;
@@ -371,10 +204,8 @@ class KeyManager {
     );
   }
 
-  /// initialize KeyManager and start key migration process
+  /// Initialize KeyManager and detect encodingKey changes.
   Future<void> initialize() async {
-    // Generate keys from encryption config
-    // This ensures keys are available for the rest of initialization
     _getEncodingKey();
     _getEncryptionKey();
 
@@ -382,22 +213,24 @@ class KeyManager {
     EncryptionManager.setEncryptionType(_getEncryptionType());
     EncryptionManager.setEncryptionScope(_getEncryptionScope());
 
-    // Try to get existing space configuration to determine the correct keyId
-    SpaceConfig? spaceConfig = await _dataStore.getSpaceConfig();
+    var applied = await _loadOrCreateAppliedEncryption();
 
-    if (spaceConfig == null) {
-      spaceConfig = await createKeySpaceConfig();
-      await _dataStore.saveSpaceConfigToFile(spaceConfig);
-    }
-
-    // Set EncoderHandler's encoding configuration and keys first
     KeyChangeInfo? keyChangeInfo;
     try {
-      // This will handle key comparison and setup fallback keys including new key if changed
-      keyChangeInfo = await updateEncoderHandlerKeys(spaceConfig);
+      keyChangeInfo = await updateEncoderHandlerKeys(applied);
     } catch (e) {
       Logger.error('Failed to set Encoder key', rawError: e);
     }
+
+    // Switch to none: clear incomplete migration checkpoints; keep history keys.
+    // Do not schedule encodingKey rewrite under none.
+    if (_getEncryptionType() == EncryptionType.none) {
+      await _clearIncompleteKeyMigrationCheckpoints();
+      unawaited(_maybePurgeHistoryKeys());
+      return;
+    }
+
+    unawaited(_maybePurgeHistoryKeys());
 
     if (_dataStore.isMigrationInstance) {
       return;
@@ -411,6 +244,7 @@ class KeyManager {
   /// Start or resume key migration after [MigrationManager.initialize] has recovered schema tasks.
   Future<void> startDeferredKeyMigrationWork() async {
     if (_dataStore.isMigrationInstance) return;
+    if (_getEncryptionType() == EncryptionType.none) return;
 
     final pendingChange = _deferredKeyChangeInfo;
     _deferredKeyChangeInfo = null;
@@ -420,49 +254,72 @@ class KeyManager {
     } else {
       await _resumeKeyMigrationIfNeeded();
     }
+    await _syncNaturalTurnoverWatch();
+  }
+
+  Future<AppliedEncryption> _loadOrCreateAppliedEncryption() async {
+    final global = await _dataStore.getGlobalConfig() ?? GlobalConfig();
+    final existing = global.appliedEncryption;
+    if (existing != null &&
+        (existing.current.key.isNotEmpty || existing.current.keyId > 0)) {
+      return existing;
+    }
+
+    final created = await createAppliedEncryption();
+    await _saveAppliedEncryption(created);
+    return created;
+  }
+
+  Future<void> _saveAppliedEncryption(AppliedEncryption applied) async {
+    final global = await _dataStore.getGlobalConfig() ?? GlobalConfig();
+    await _dataStore.saveGlobalConfig(
+      global.copyWith(appliedEncryption: applied),
+      propagateErrors: true,
+    );
   }
 
   Future<KeyChangeInfo?> updateEncoderHandlerKeys(
-      SpaceConfig spaceConfig) async {
+    AppliedEncryption applied, {
+    KeyMigrationInfo? runningMigration,
+  }) async {
     final newKey = _getEncodingKey();
     final fallbackKeys = <int, Uint8List>{};
 
-    // Add current key to fallback keys
-    final currentDecodedKey =
-        _decodeKey(spaceConfig.current.key, spaceConfig.current.keyId);
-    if (currentDecodedKey != null) {
-      fallbackKeys[spaceConfig.current.keyId] = currentDecodedKey;
+    for (final info in applied.getAllKeys()) {
+      fallbackKeys[info.keyId] = EncryptionManager.generateKey(info.key);
     }
 
-    // Add history keys to fallback keys
-    for (final hist in spaceConfig.historyKeys) {
-      if (hist.key.isEmpty) continue;
-      final decoded = _decodeKey(hist.key, hist.keyId);
-      if (decoded != null) {
-        fallbackKeys[hist.keyId] = decoded;
-      }
+    final encryptionType = _getEncryptionType();
+    if (encryptionType == EncryptionType.none) {
+      EncryptionManager.setFallbackKeys(fallbackKeys);
+      return null;
     }
 
-    String? currentPlain;
-    if (spaceConfig.current.key.isNotEmpty) {
-      try {
-        currentPlain = _decodeKey(
-          spaceConfig.current.key,
-          spaceConfig.current.keyId,
-          isPlaintext: true,
-        );
-      } catch (e) {
-        Logger.error('Failed to decrypt current key', rawError: e);
-      }
+    final running = runningMigration ??
+        await _dataStore.migrationManager?.getKeyMigrationInfo();
+
+    // In-flight migration: AppliedEncryption.current already holds the target
+    // DEK (KEK-protected); match config against that — never read DEK from meta.
+    if (running != null &&
+        running.isRunning &&
+        newKey.isNotEmpty &&
+        applied.current.keyId == running.targetKeyId &&
+        applied.current.key == newKey) {
+      fallbackKeys[running.targetKeyId] = EncryptionManager.generateKey(newKey);
+      EncryptionManager.setFallbackKeys(fallbackKeys);
+      EncryptionManager.setCurrentKey(newKey, running.targetKeyId);
+      return null;
     }
+
+    final currentPlain =
+        applied.current.key.isNotEmpty ? applied.current.key : null;
 
     final bool keyChanged = currentPlain != newKey;
-    int keyIdToUse = spaceConfig.current.keyId;
+    int keyIdToUse = applied.current.keyId;
     KeyChangeInfo? keyChangeInfo;
 
     if (keyChanged && newKey.isNotEmpty) {
-      // Key has changed, add new key to fallback keys with incremented keyId
-      final newKeyId = spaceConfig.current.keyId + 1;
+      final newKeyId = _nextKeyId(applied, running);
       final newDecodedKey = EncryptionManager.generateKey(newKey);
       fallbackKeys[newKeyId] = newDecodedKey;
       keyIdToUse = newKeyId;
@@ -473,46 +330,80 @@ class KeyManager {
         hasChanged: true,
         newKey: newDecodedKey,
         newKeyId: newKeyId,
-        encryptKey: _encryptKey(newKey, newKeyId),
+        plainEncodingKey: newKey,
       );
     }
 
     EncryptionManager.setFallbackKeys(fallbackKeys);
 
-    final encryptionType = _getEncryptionType();
-    if (encryptionType != EncryptionType.none && newKey.isNotEmpty) {
+    if (newKey.isNotEmpty) {
       EncryptionManager.setCurrentKey(newKey, keyIdToUse);
     }
 
     return keyChangeInfo;
   }
 
-  // when spaceConfig is null,then create key spaceConfig
-  Future<SpaceConfig> createKeySpaceConfig() async {
+  /// Create initial AppliedEncryption for a new database.
+  Future<AppliedEncryption> createAppliedEncryption() async {
     final newKey = _getEncodingKey();
-    try {
-      if (newKey.isNotEmpty) {
-        // Use keyId 1 for initial key creation
-        final encryptedKey = _encryptKey(newKey, 1);
-        return SpaceConfig(
-          current: EncryptionKeyInfo(key: encryptedKey, keyId: 1),
-          version: 0,
-        );
-      }
-      Logger.info(
-        'No encoding key provided; creating space config with an empty key.',
-      );
-      return SpaceConfig(
-        current: const EncryptionKeyInfo(key: '', keyId: 0),
-        version: 0,
-      );
-    } catch (e) {
-      Logger.error(
-          'Failed to create or encrypt key during first-time initialization',
-          rawError: e);
-      return SpaceConfig(
-        current: const EncryptionKeyInfo(key: '', keyId: 0),
-        version: 0,
+    if (newKey.isEmpty) {
+      return AppliedEncryption.empty();
+    }
+    return AppliedEncryption(
+      current: EncryptionKeyInfo(key: newKey, keyId: 1),
+    );
+  }
+
+  int _nextKeyId(AppliedEncryption applied, KeyMigrationInfo? running) {
+    var maxId = applied.current.keyId;
+    for (final k in applied.historyKeys) {
+      if (k.keyId > maxId) maxId = k.keyId;
+    }
+    if (running != null && running.targetKeyId > maxId) {
+      maxId = running.targetKeyId;
+    }
+    return maxId + 1;
+  }
+
+  /// Promote target DEK to [AppliedEncryption.current] at migration start.
+  Future<void> _persistTargetAsCurrent(KeyChangeInfo info) async {
+    final global = await _dataStore.getGlobalConfig() ?? GlobalConfig();
+    final applied = global.appliedEncryption ?? AppliedEncryption.empty();
+
+    if (applied.current.keyId == info.newKeyId &&
+        applied.current.key == info.plainEncodingKey) {
+      await _refreshFallbackKeys(applied);
+      return;
+    }
+
+    final history = [...applied.historyKeys];
+    if (applied.current.key.isNotEmpty &&
+        applied.current.keyId != info.newKeyId &&
+        !history.any((k) => k.keyId == applied.current.keyId)) {
+      history.add(applied.current);
+    }
+
+    final promoted = AppliedEncryption(
+      current: EncryptionKeyInfo(
+        key: info.plainEncodingKey,
+        keyId: info.newKeyId,
+      ),
+      historyKeys: history,
+    );
+    await _saveAppliedEncryption(promoted);
+    await _refreshFallbackKeys(promoted);
+  }
+
+  Future<void> _refreshFallbackKeys(AppliedEncryption applied) async {
+    final fallbackKeys = <int, Uint8List>{};
+    for (final info in applied.getAllKeys()) {
+      fallbackKeys[info.keyId] = EncryptionManager.generateKey(info.key);
+    }
+    EncryptionManager.setFallbackKeys(fallbackKeys);
+    if (applied.current.key.isNotEmpty) {
+      EncryptionManager.setCurrentKey(
+        applied.current.key,
+        applied.current.keyId,
       );
     }
   }
@@ -521,24 +412,53 @@ class KeyManager {
     final migrationManager = _dataStore.migrationManager;
     if (migrationManager == null) return;
 
-    final existing = await migrationManager.getKeyMigrationInfo();
-    if (existing != null && existing.isRunning) {
-      if (existing.targetKeyId != info.newKeyId) {
-        await _supersedeKeyMigration(info);
+    var existing = await migrationManager.getKeyMigrationInfo();
+    if (existing != null &&
+        (existing.isRunning || existing.status == KeyMigrationStatus.failed)) {
+      if (existing.status == KeyMigrationStatus.failed) {
+        existing = existing.copyWith(status: KeyMigrationStatus.running);
+        await migrationManager.persistKeyMigrationInfo(existing);
+      }
+
+      final applied = (await _dataStore.getGlobalConfig())?.appliedEncryption;
+      // Target DEK lives only in AppliedEncryption (GlobalConfig / KEK shell).
+      final matchesTarget = applied != null &&
+          applied.current.keyId == existing.targetKeyId &&
+          applied.current.key == info.plainEncodingKey;
+
+      if (matchesTarget) {
+        final resumeInfo = KeyChangeInfo(
+          hasChanged: true,
+          newKey: EncryptionManager.generateKey(info.plainEncodingKey),
+          newKeyId: existing.targetKeyId,
+          plainEncodingKey: info.plainEncodingKey,
+        );
+        await _persistTargetAsCurrent(resumeInfo);
+        if (existing.snapshots == null) {
+          final snapshots =
+              await KeyMigrationRunner.captureNaturalSnapshots(_dataStore);
+          await migrationManager.persistKeyMigrationInfo(
+            existing.copyWith(snapshots: snapshots),
+          );
+        }
+        _scheduleKeyMigrationRun(resumeInfo);
         return;
       }
-      _scheduleKeyMigrationRun(info);
+
+      await _supersedeKeyMigration(info);
       return;
     }
 
-    // Clear any stale migration progress records from previous runs before starting a new one
     await KeyMigrationProgressStore.clearAll(_dataStore);
+    // Promote DEK into GlobalConfig before any rewrite / meta persist.
+    await _persistTargetAsCurrent(info);
 
+    final snapshots =
+        await KeyMigrationRunner.captureNaturalSnapshots(_dataStore);
     await migrationManager.persistKeyMigrationInfo(
-      KeyMigrationInfo(
+      KeyMigrationInfo.start(
         targetKeyId: info.newKeyId,
-        status: KeyMigrationStatus.running,
-        createdAt: DateTime.now().toIso8601String(),
+        snapshots: snapshots,
       ),
     );
     _scheduleKeyMigrationRun(info);
@@ -548,24 +468,48 @@ class KeyManager {
     final migrationManager = _dataStore.migrationManager;
     if (migrationManager == null) return;
 
-    final info = await migrationManager.getKeyMigrationInfo();
-    if (info == null || !info.isRunning) return;
+    var info = await migrationManager.getKeyMigrationInfo();
+    if (info == null) return;
 
-    if (info.targetKeyId != EncryptionManager.getCurrentKeyId()) {
+    // Transient runner failures must not strand the DB: retry on next open.
+    if (info.status == KeyMigrationStatus.failed) {
       Logger.warn(
-        'Stale key migration meta (targetKeyId=${info.targetKeyId}, '
-        'current=${EncryptionManager.getCurrentKeyId()}); abandoning resume',
+        'Retrying previously failed encodingKey migration '
+        '(targetKeyId=${info.targetKeyId})',
+      );
+      info = info.copyWith(status: KeyMigrationStatus.running);
+      await migrationManager.persistKeyMigrationInfo(info);
+      await migrationManager.syncHasMigrationTask();
+    }
+
+    if (!info.isRunning) return;
+
+    // Rewrite already finished; only natural-turnover domains remain.
+    final rewriteDone = info.isDomainDone(EncryptionDomain.tableData) &&
+        info.isDomainDone(EncryptionDomain.btreeIndex);
+    if (rewriteDone && !info.allDomainsComplete) {
+      await KeyMigrationRunner.refreshNaturalTurnoverAndMaybeComplete(
+        _dataStore,
       );
       return;
     }
 
-    final resumeInfo = _buildKeyChangeInfoForKeyId(info.targetKeyId);
+    final resumeInfo = await _buildResumeKeyChangeInfo(info);
     if (resumeInfo == null) {
       Logger.error(
-        'Cannot resume key migration: failed to rebuild KeyChangeInfo',
+        'Cannot resume key migration for keyId ${info.targetKeyId}: '
+        'target encodingKey material missing; marking failed',
       );
+      await migrationManager.persistKeyMigrationInfo(
+        info.copyWith(status: KeyMigrationStatus.failed),
+      );
+      await migrationManager.syncHasMigrationTask();
+      // Do not throw: startup must remain openable; failed status is explicit.
       return;
     }
+
+    // Ensure AppliedEncryption + EncryptionManager match the in-flight target.
+    await _persistTargetAsCurrent(resumeInfo);
 
     Logger.info(
       'Resuming key migration for keyId ${info.targetKeyId}',
@@ -574,63 +518,265 @@ class KeyManager {
   }
 
   Future<void> _supersedeKeyMigration(KeyChangeInfo info) async {
-    final spaceConfig = await _dataStore.getSpaceConfig();
     final migrationManager = _dataStore.migrationManager;
-    if (spaceConfig == null || migrationManager == null) return;
-
-    final history = [...spaceConfig.historyKeys];
-    void addIfAbsent(EncryptionKeyInfo keyInfo) {
-      if (keyInfo.key.isEmpty) return;
-      if (history.any((k) => k.keyId == keyInfo.keyId)) return;
-      history.add(keyInfo);
-    }
-
-    addIfAbsent(spaceConfig.current);
-
-    await _dataStore.saveSpaceConfigToFile(
-      spaceConfig.copyWith(historyKeys: history),
-    );
-    await updateEncoderHandlerKeys(
-      (await _dataStore.getSpaceConfig()) ?? spaceConfig,
-    );
+    if (migrationManager == null) return;
 
     await KeyMigrationProgressStore.clearAll(_dataStore);
     await migrationManager.clearKeyMigrationInfo();
+
+    await _persistTargetAsCurrent(info);
+
+    final snapshots =
+        await KeyMigrationRunner.captureNaturalSnapshots(_dataStore);
     await migrationManager.persistKeyMigrationInfo(
-      KeyMigrationInfo(
+      KeyMigrationInfo.start(
         targetKeyId: info.newKeyId,
-        status: KeyMigrationStatus.running,
-        createdAt: DateTime.now().toIso8601String(),
+        snapshots: snapshots,
       ),
     );
     _scheduleKeyMigrationRun(info);
   }
 
-  KeyChangeInfo? _buildKeyChangeInfoForKeyId(int keyId) {
-    final plain = _getEncodingKey();
-    if (plain.isEmpty) return null;
+  /// Rebuild [KeyChangeInfo] from AppliedEncryption (KEK-protected GlobalConfig).
+  Future<KeyChangeInfo?> _buildResumeKeyChangeInfo(
+    KeyMigrationInfo info,
+  ) async {
+    final global = await _dataStore.getGlobalConfig();
+    final applied = global?.appliedEncryption;
+    if (applied == null) return null;
+
+    String? plain;
+    if (applied.current.keyId == info.targetKeyId &&
+        applied.current.key.isNotEmpty) {
+      plain = applied.current.key;
+    } else {
+      final hist = applied.getKeyById(info.targetKeyId);
+      if (hist != null && hist.key.isNotEmpty) {
+        plain = hist.key;
+      }
+    }
+
+    if (plain == null || plain.isEmpty) return null;
+
     return KeyChangeInfo(
       hasChanged: true,
       newKey: EncryptionManager.generateKey(plain),
-      newKeyId: keyId,
-      encryptKey: _encryptKey(plain, keyId),
+      newKeyId: info.targetKeyId,
+      plainEncodingKey: plain,
     );
   }
 
-  /// Cooperative pause for close / switchSpace; retains checkpoint for resume.
-  Future<void> pauseKeyMigration({
+  Future<void> _clearIncompleteKeyMigrationCheckpoints() async {
+    final migrationManager = _dataStore.migrationManager;
+    final info = await migrationManager?.getKeyMigrationInfo();
+    if (info != null &&
+        (info.status == KeyMigrationStatus.running ||
+            info.status == KeyMigrationStatus.failed)) {
+      await KeyMigrationProgressStore.clearAll(_dataStore);
+      await migrationManager?.clearKeyMigrationInfo();
+      await migrationManager?.syncHasMigrationTask();
+      Logger.info(
+        'Cleared incomplete key-migration checkpoints after switch to none',
+      );
+    }
+  }
+
+  Future<void> _maybePurgeHistoryKeys() async {
+    final now = DateTime.now().toUtc();
+    final day = DateTime.utc(now.year, now.month, now.day);
+    if (_lastHistoryPurgeDay == day) return;
+    _lastHistoryPurgeDay = day;
+
+    final global = await _dataStore.getGlobalConfig();
+    final applied = global?.appliedEncryption;
+    if (applied == null) return;
+
+    final purged = applied.purgeEligibleHistory(now: now);
+    if (identical(purged, applied) ||
+        purged.historyKeys.length == applied.historyKeys.length) {
+      return;
+    }
+    await _saveAppliedEncryption(purged);
+    Logger.info(
+      'Purged ${applied.historyKeys.length - purged.historyKeys.length} '
+      'expired history encoding keys',
+    );
+  }
+
+  /// Cooperative pause for close / switchSpace / destructive ops.
+  ///
+  /// Returns `true` when the rewrite runner has stopped (or was idle).
+  /// Returns `false` on timeout — callers must **not** open another space or
+  /// tear down storage while the runner may still hold file handles.
+  ///
+  /// **Migration helper instances must no-op**: their [DataStoreImpl.close]
+  /// must not cancel the primary [KeyMigrationRunner] token (otherwise each
+  /// finished other-space helper would abort the multi-space run).
+  ///
+  /// Stops the natural-turnover crontab watch. Callers that keep the session
+  /// should later run [startDeferredKeyMigrationWork], which re-arms the watch.
+  Future<bool> pauseKeyMigration({
     Duration timeout = const Duration(seconds: 120),
   }) async {
+    if (_dataStore.isMigrationInstance) {
+      return true;
+    }
+
+    _stopNaturalTurnoverWatch();
+    await _awaitNaturalTurnoverPollIdle(
+      timeout: const Duration(seconds: 30),
+    );
+
     KeyMigrationRunner.requestPause();
     final future = _keyMigrationFuture;
-    if (future == null) return;
+    if (future == null) return true;
+
     try {
       await future.timeout(timeout);
+      return true;
     } on TimeoutException {
       Logger.warn(
         'Key migration did not stop within ${timeout.inSeconds}s',
       );
+      // Pause was requested; when the runner eventually exits, resume if this
+      // primary session is still open (e.g. switchSpace aborted on timeout).
+      unawaited(future.whenComplete(() {
+        if (_dataStore.isMigrationInstance) return;
+        if (!_dataStore.isInitialized && !_dataStore.isBaseInitialized) {
+          return;
+        }
+        unawaited(startDeferredKeyMigrationWork());
+      }));
+      return false;
+    } catch (_) {
+      return true;
+    }
+  }
+
+  Future<void> _awaitNaturalTurnoverPollIdle({
+    required Duration timeout,
+  }) async {
+    final poll = _naturalTurnoverPollFuture;
+    if (poll == null) return;
+    try {
+      await poll.timeout(timeout);
+    } on TimeoutException {
+      Logger.warn(
+        'Natural-turnover poll did not finish within ${timeout.inSeconds}s',
+      );
     } catch (_) {}
+  }
+
+  /// Start or stop the low-frequency natural-turnover poller based on meta.
+  ///
+  /// Safe to call before [DataStoreImpl.isInitialized] becomes true (startup
+  /// arms the watch; ticks no-op until the DB is initialized).
+  Future<void> _syncNaturalTurnoverWatch() async {
+    if (_dataStore.isMigrationInstance) {
+      _stopNaturalTurnoverWatch();
+      return;
+    }
+    if (_getEncryptionType() == EncryptionType.none) {
+      _stopNaturalTurnoverWatch();
+      return;
+    }
+
+    final info = await _dataStore.migrationManager?.getKeyMigrationInfo();
+    if (info == null || !info.isRunning) {
+      _stopNaturalTurnoverWatch();
+      return;
+    }
+
+    final rewriteDone = info.isDomainDone(EncryptionDomain.tableData) &&
+        info.isDomainDone(EncryptionDomain.btreeIndex);
+    if (rewriteDone && !info.allDomainsComplete) {
+      _ensureNaturalTurnoverWatch();
+    } else {
+      _stopNaturalTurnoverWatch();
+    }
+  }
+
+  void _ensureNaturalTurnoverWatch() {
+    if (_naturalTurnoverWatchRegistered) return;
+    if (_dataStore.isMigrationInstance) return;
+    CrontabManager.addCallback(
+      ExecuteInterval.minutes5,
+      _onNaturalTurnoverTick,
+    );
+    CrontabManager.acquireBackgroundWorkLease(_naturalTurnoverLeaseId);
+    _naturalTurnoverWatchRegistered = true;
+    Logger.info(
+      'Started 5-minute natural-turnover watch for encodingKey migration',
+    );
+  }
+
+  void _stopNaturalTurnoverWatch() {
+    if (!_naturalTurnoverWatchRegistered) return;
+    CrontabManager.removeCallback(
+      ExecuteInterval.minutes5,
+      _onNaturalTurnoverTick,
+    );
+    CrontabManager.releaseBackgroundWorkLease(_naturalTurnoverLeaseId);
+    _naturalTurnoverWatchRegistered = false;
+  }
+
+  void _onNaturalTurnoverTick() {
+    if (!_naturalTurnoverWatchRegistered) return;
+    // Startup may arm the watch before isInitialized; skip tick, keep watch.
+    if (!_dataStore.isInitialized) return;
+    unawaited(_pollNaturalTurnover());
+  }
+
+  Future<void> _pollNaturalTurnover() async {
+    if (_naturalTurnoverPollInFlight) return;
+    _naturalTurnoverPollInFlight = true;
+    final done = Completer<void>();
+    _naturalTurnoverPollFuture = done.future;
+    try {
+      if (!_dataStore.isInitialized) return;
+
+      final migrationManager = _dataStore.migrationManager;
+      final info = await migrationManager?.getKeyMigrationInfo();
+      if (info == null || !info.isRunning) {
+        _stopNaturalTurnoverWatch();
+        return;
+      }
+
+      final rewriteDone = info.isDomainDone(EncryptionDomain.tableData) &&
+          info.isDomainDone(EncryptionDomain.btreeIndex);
+      if (!rewriteDone) {
+        // Table rewrite still in progress — runner owns progress.
+        return;
+      }
+      if (info.allDomainsComplete) {
+        _stopNaturalTurnoverWatch();
+        return;
+      }
+
+      await KeyMigrationRunner.refreshNaturalTurnoverAndMaybeComplete(
+        _dataStore,
+      );
+
+      final after = await migrationManager?.getKeyMigrationInfo();
+      if (after == null || !after.isRunning || after.allDomainsComplete) {
+        _stopNaturalTurnoverWatch();
+      }
+    } catch (e) {
+      if (e is DbClosedException) {
+        _stopNaturalTurnoverWatch();
+        return;
+      }
+      Logger.warn(
+        'Natural-turnover poll for encodingKey migration failed',
+        rawError: e,
+      );
+    } finally {
+      _naturalTurnoverPollInFlight = false;
+      if (!done.isCompleted) done.complete();
+      if (identical(_naturalTurnoverPollFuture, done.future)) {
+        _naturalTurnoverPollFuture = null;
+      }
+    }
   }
 
   void _scheduleKeyMigrationRun(KeyChangeInfo info) {
@@ -653,9 +799,27 @@ class KeyManager {
       // Silent
     } catch (e) {
       Logger.error('Key migration failed', rawError: e);
+      final migrationManager = _dataStore.migrationManager;
+      final existing = await migrationManager?.getKeyMigrationInfo();
+      if (existing != null) {
+        await migrationManager?.persistKeyMigrationInfo(
+          existing.copyWith(status: KeyMigrationStatus.failed),
+        );
+      }
     } finally {
       _keyMigrationScheduled = false;
       _keyMigrationFuture = null;
+      await _syncNaturalTurnoverWatch();
     }
+  }
+
+  /// Mark [domain] complete on the running key migration (if any).
+  Future<void> markEncryptionDomainDone(EncryptionDomain domain) async {
+    final migrationManager = _dataStore.migrationManager;
+    if (migrationManager == null) return;
+    final info = await migrationManager.getKeyMigrationInfo();
+    if (info == null || !info.isRunning) return;
+    if (info.isDomainDone(domain)) return;
+    await migrationManager.persistKeyMigrationInfo(info.markDomainDone(domain));
   }
 }
