@@ -72,6 +72,11 @@ class ChaCha20Poly1305 {
         )
       ]);
     }
+    // asUint32List requires 4-byte-aligned offsets; copy when needed.
+    // Aligned inputs keep the same buffer (bit-identical online path).
+    if (key.offsetInBytes % 4 != 0) {
+      key = Uint8List.fromList(key);
+    }
     aad ??= Uint8List(0);
 
     final input = plaintext;
@@ -141,6 +146,14 @@ class ChaCha20Poly1305 {
         )
       ]);
     }
+    // asUint32List requires 4-byte-aligned offsets; copy when needed.
+    // Aligned inputs keep the same buffer (bit-identical online path).
+    if (key.offsetInBytes % 4 != 0) {
+      key = Uint8List.fromList(key);
+    }
+    if (encryptedData.offsetInBytes % 4 != 0) {
+      encryptedData = Uint8List.fromList(encryptedData);
+    }
     aad ??= Uint8List(0);
 
     final nonce = Uint8List.view(
@@ -179,10 +192,11 @@ class ChaCha20Poly1305 {
     }
   }
 
-  /// Generate a 32-byte key from a string using SHA256
+  /// Generate a 32-byte key from a string using the unified SHA-256 KDF.
+  ///
+  /// Prefer [SHA256.stringToBytes] at call sites that are not ChaCha-specific.
   static Uint8List generateKeyFromString(String userKey) {
     if (userKey.isEmpty) return defaultKey;
-    // Use SHA256 to generate 32-byte key
     return SHA256.stringToBytes(userKey);
   }
 
@@ -724,7 +738,7 @@ class ChaCha20Poly1305 {
   // --- Poly1305 Core (Optimized) ---
 
   static Uint8List _poly1305Mac(Uint8List msg, Uint8List aad, Uint8List key) {
-    final k = key.buffer.asByteData();
+    final k = ByteData.sublistView(key);
     int r0 = k.getUint32(0, Endian.little) & 0x03FFFFFF;
     int r1 = ((k.getUint32(0, Endian.little) >> 26) |
             (k.getUint32(4, Endian.little) << 6)) &
