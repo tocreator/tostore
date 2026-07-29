@@ -24,6 +24,9 @@ class TransactionManager {
   bool get _isMemoryMode => _config.persistenceMode == PersistenceMode.memory;
 
   TransactionMainMeta? _mainMetaCache;
+
+  /// Latest loaded transaction main meta (may be null before initialize).
+  TransactionMainMeta? get mainMeta => _mainMetaCache;
   final Map<int, TransactionPartitionMeta> _partitionMetaCache = {};
   final Set<String> _activeTransactions = <String>{};
 
