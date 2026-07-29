@@ -10,12 +10,10 @@ import '../interface/kv_store.dart';
 import '../interface/noop_storage_impl.dart';
 import '../interface/status_provider.dart';
 import '../handler/common.dart';
-import '../handler/config_file_codec.dart';
 import '../handler/global_config_codec.dart';
 import '../handler/logger.dart';
 import '../handler/parallel_processor.dart';
 import '../handler/platform_handler.dart';
-import '../handler/space_config_codec.dart';
 import '../handler/value_matcher.dart';
 import '../upgrades/legacy_model/pre_v3.dart';
 import '../model/backup_scope.dart';
@@ -36,7 +34,7 @@ import '../model/migration_task.dart';
 import '../model/query_result.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
-import '../model/space_config.dart';
+import '../model/space_stats.dart';
 import '../model/space_info.dart';
 import '../model/system_table.dart';
 import '../model/table_context.dart';
@@ -172,7 +170,6 @@ class DataStoreImpl {
   KeyManager? _keyManager;
   WeightManager? _weightManager;
   late StorageAdapter storage;
-  SpaceConfig? _spaceConfigCache;
   TableMetaManager? tableMetaManager;
   PathManager? _pathManager;
   LockManager? lockManager;
@@ -522,82 +519,8 @@ class DataStoreImpl {
     });
   }
 
-  // Helper method to load the space configuration from space_config.tobf and update the cache
-  Future<SpaceConfig?> getSpaceConfig({
-    bool nowGetFromFile = false,
-    String? spaceName,
-  }) async {
-    final resolvedSpaceName = spaceName ?? _currentSpaceName;
-    final shouldUseCurrentCache = spaceName == null;
-    if (!nowGetFromFile && shouldUseCurrentCache && _spaceConfigCache != null) {
-      return _spaceConfigCache;
-    }
-
-    final spaceFilePath =
-        pathManager.getSpaceConfigPath(spaceName: resolvedSpaceName);
-
-    try {
-      if (await storage.existsFile(spaceFilePath)) {
-        final bytes = await storage.readAsBytes(spaceFilePath);
-        if (bytes.isNotEmpty) {
-          final parsed = SpaceConfigCodec.decodeFile(bytes);
-          if (shouldUseCurrentCache) {
-            _spaceConfigCache = parsed;
-          }
-          return parsed;
-        }
-      }
-
-      // Pre-v3: read JSON into memory only — do NOT write TOBF or delete JSON.
-      // `tableDirectoryMap` must remain on disk until V3Upgrade consumes it.
-      final legacy = await LegacyConfigBootstrap.readSpaceConfig(
-        this,
-        spaceName: resolvedSpaceName,
-      );
-      if (legacy != null) {
-        if (shouldUseCurrentCache) {
-          _spaceConfigCache = legacy;
-        }
-        return legacy;
-      }
-
-      // Only auto-create for the current space; callers reading another space
-      // should not implicitly mutate that space.
-      if (_keyManager != null && shouldUseCurrentCache) {
-        final spaceConfig = await _keyManager!.createKeySpaceConfig();
-        await saveSpaceConfigToFile(spaceConfig);
-        return spaceConfig;
-      }
-      return null;
-    } catch (e) {
-      Logger.error('Failed to parse init config', rawError: e);
-      return null;
-    }
-  }
-
-  /// Save space config to file
-  Future<void> saveSpaceConfigToFile(
-    SpaceConfig config, {
-    String? spaceName,
-    bool propagateErrors = false,
-  }) async {
-    try {
-      final resolvedSpaceName = spaceName ?? _currentSpaceName;
-      final spaceFilePath =
-          pathManager.getSpaceConfigPath(spaceName: resolvedSpaceName);
-
-      final encrypt = ConfigFileCodec.shouldEncrypt(_config?.encryptionConfig);
-      final bytes = SpaceConfigCodec.encodeFile(config, encrypt: encrypt);
-      await storage.ensureDirectoryExists(path.dirname(spaceFilePath));
-      await storage.writeAsBytes(spaceFilePath, bytes);
-      if (resolvedSpaceName == _currentSpaceName) {
-        _spaceConfigCache = config;
-      }
-    } catch (e) {
-      Logger.error('Failed to save space config', rawError: e);
-      if (propagateErrors) rethrow;
-    }
-  }
+  /// Space aggregates — owned by [TableDataManager] (InternalKv + live deltas).
+  Future<SpaceStats> getSpaceStats() => tableDataManager.getSpaceStats();
 
   /// Get database version
   Future<int> getVersion() async {
@@ -822,7 +745,6 @@ class DataStoreImpl {
       if (!isMemoryMode) {
         await Future.wait([
           getGlobalConfig(),
-          getSpaceConfig(),
           _resourceManager!.initialize(_config!, this),
           Future(() async => await transactionManager!.initialize()),
         ]);
@@ -855,8 +777,6 @@ class DataStoreImpl {
         if (active != null && active != 'default') {
           _config = _config!.copyWith(spaceName: active);
           _currentSpaceName = active;
-          _spaceConfigCache = null;
-          await getSpaceConfig(nowGetFromFile: true);
         }
       }
 
@@ -950,6 +870,16 @@ class DataStoreImpl {
         }
 
         _isInitialized = true;
+
+        // Space stats: lazy hydrate in TableDataManager (non-blocking).
+        if (!isMigrationInstance) {
+          unawaited(tableDataManager
+              .ensureSpaceStatsHydrated()
+              .catchError((Object e) {
+            Logger.warn('Background space stats hydrate failed', rawError: e);
+          }));
+        }
+
         _startupProgressCallback?.call(1.0, DbStartupStage.ready);
 
         // Background: full TableMeta cache + reconcile dir high-water.
@@ -1174,7 +1104,13 @@ class DataStoreImpl {
         // Do NOT call CrontabManager.dispose() here: it clears ALL DBs' callbacks
         // and strips the shared LockManager timeout safety-net (reused on
         // switchSpace). Each manager removes its own callbacks in dispose().
-        await _keyManager?.pauseKeyMigration();
+        final keyPaused = await _keyManager?.pauseKeyMigration() ?? true;
+        if (!keyPaused) {
+          Logger.warn(
+            'Key migration did not pause before close; continuing shutdown, '
+            'but Windows file locks may linger until the runner exits',
+          );
+        }
         await migrationManager?.stopAllMigrations();
         await LargeOperationRunner.pauseForShutdown(this);
 
@@ -1273,7 +1209,6 @@ class DataStoreImpl {
 
       _globalConfigCache = null;
       _downgradeGuardJsonVersion = null;
-      _spaceConfigCache = null;
 
       // Now that we have yielded and called dispose, it is safe to
       // nullify manager references for GC. This satisfies the requirement
@@ -6135,8 +6070,8 @@ class DataStoreImpl {
     final schemaMgr = tableMetaManager;
     if (schemaMgr == null || !_isInitialized) return;
 
-    final spaceConfig = await getSpaceConfig();
-    final spaceUsageBytes = spaceConfig?.totalDataSizeBytes ?? 0;
+    final spaceStats = await getSpaceStats();
+    final spaceUsageBytes = spaceStats.totalDataSizeBytes;
     const maxRecordsSafetyCap = 200000;
 
     if (spaceUsageBytes >= prewarmBudgetBytes) {
@@ -6400,6 +6335,19 @@ class DataStoreImpl {
 
     final oldSpaceName = _currentSpaceName;
     try {
+      // Pause key migration on the primary before tearing down space files.
+      // Helper (isMigrationInstance) close must not cancel this runner — that is
+      // enforced inside KeyManager.pauseKeyMigration.
+      final paused = await _keyManager?.pauseKeyMigration() ?? true;
+      if (!paused) {
+        Logger.warn(
+          'Space switch aborted: encodingKey migration did not pause in time '
+          '(oldSpace=[$oldSpaceName], target=[$spaceName]). '
+          'Refusing to open another space while file handles may still be held.',
+        );
+        return false;
+      }
+
       // 1. Unified shutdown logic for the current space via close().
       // closeStorage: true releases the handle pool / Web retain so late async
       // cannot reopen files belonging to the old space (Windows errno 32).
@@ -7314,9 +7262,21 @@ class DataStoreImpl {
         final bytes = await storage.readAsBytes(configPath);
         if (bytes.isEmpty) return null;
 
-        final config = GlobalConfigCodec.decodeFile(bytes);
-        _globalConfigCache = config;
-        return config;
+        final preferred = _resolveEncryptionKeyForGlobalConfig();
+        final decoded = GlobalConfigCodec.decodeFileWithFallback(
+          bytes,
+          preferredKey: preferred,
+          fallbackKeys: [
+            defaultEncryptionKey,
+          ],
+        );
+        _globalConfigCache = decoded.config;
+
+        // Auto-rewrap when opened with a newer encryptionKey than on disk.
+        if (decoded.usedKey != preferred) {
+          await saveGlobalConfig(decoded.config, propagateErrors: false);
+        }
+        return decoded.config;
       }
 
       // Pre-v3: read JSON into memory only — do NOT write TOBF or delete JSON.
@@ -7331,6 +7291,11 @@ class DataStoreImpl {
       Logger.error('Failed to get global config', rawError: e);
       return null;
     }
+  }
+
+  String _resolveEncryptionKeyForGlobalConfig() {
+    final enc = _config?.encryptionConfig ?? const EncryptionConfig();
+    return enc.resolveEncryptionKey();
   }
 
   /// Save global configuration
@@ -7350,8 +7315,13 @@ class DataStoreImpl {
         path.dirname(configPath),
       );
 
-      final encrypt = ConfigFileCodec.shouldEncrypt(_config?.encryptionConfig);
-      final bytes = GlobalConfigCodec.encodeFile(config, encrypt: encrypt);
+      final bytes = GlobalConfigCodec.encodeFile(
+        config,
+        encryptionKey: _resolveEncryptionKeyForGlobalConfig(),
+        algorithm: ConfigCryptoAlgorithm.fromEncryptionType(
+          _config?.encryptionConfig?.encryptionType,
+        ),
+      );
       await storage.writeAsBytes(configPath, bytes);
       _globalConfigCache = config;
 
@@ -7422,32 +7392,27 @@ class DataStoreImpl {
   /// Get information about the current space
   Future<SpaceInfo> getSpaceInfo({bool useCache = true}) async {
     try {
-      // Get space configuration
-      var config = await getSpaceConfig();
+      var stats = await getSpaceStats();
 
-      // Check if statistics are stale (older than 1 hour) or if cache is disabled
-      final currentTime = DateTime.now();
-      final lastStatsTime = config?.lastStatisticsTime ?? DateTime(2000);
-      final statsDuration = currentTime.difference(lastStatsTime);
-
-      if (!useCache || statsDuration.inHours > 1) {
-        // Schedule statistics recalculation and wait for it to complete
+      // Full meta reconcile only when caller opts out of cache.
+      // Day-to-day totals come from incremental counters; avoid O(tables)
+      // meta scans on large spaces (e.g. tens of thousands of tables).
+      if (!useCache) {
         await tableDataManager.recalculateAllStatistics();
-        // Reload the space config from file to get the updated stats
-        config = await getSpaceConfig();
+        // Memory already holds absolute totals; do not re-read KV baseline.
+        stats = await getSpaceStats();
       }
 
       // Schema inventory (user tables). Record/size stats remain space-local
-      // via [SpaceConfig] / path isolation — not a "touched tables" list.
+      // via [SpaceStats] / path isolation — not a "touched tables" list.
       final userTables = await getTableNames(onlyUserTables: true);
 
-      // Create the SpaceInfo object with user-table information
       return SpaceInfo(
         spaceName: _currentSpaceName,
         tableCount: userTables.length,
-        recordCount: config?.totalRecordCount ?? 0,
-        dataSizeBytes: config?.totalDataSizeBytes ?? 0,
-        lastStatisticsTime: config?.lastStatisticsTime,
+        recordCount: stats.totalRecordCount,
+        dataSizeBytes: stats.totalDataSizeBytes,
+        lastStatisticsTime: stats.lastStatisticsTime,
         tables: userTables,
       );
     } catch (e) {
@@ -7562,10 +7527,13 @@ class DataStoreImpl {
     );
   }
 
-  /// Rotate the master [encryptionKey] that wraps stored [encodingKey] blobs.
+  /// Rotate the master [encryptionKey] that protects GlobalConfig.
   ///
-  /// Returns [DbResult]. On success, [DbResult.data] contains rotated space names.
-  Future<DbResult> rotateEncryptionKey(String oldKey, String newKey) async {
+  /// When [oldKey] is null/empty, the engine built-in default KEK is used.
+  Future<DbResult> rotateEncryptionKey({
+    String? oldKey,
+    required String newKey,
+  }) async {
     await ensureInitialized();
     return keyManager.rotateEncryptionKey(oldKey: oldKey, newKey: newKey);
   }
