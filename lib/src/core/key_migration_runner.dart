@@ -1,20 +1,21 @@
 import 'dart:async';
 import 'dart:typed_data';
 
-import '../handler/encryption.dart';
 import '../handler/logger.dart';
+import '../model/applied_encryption.dart';
 import '../model/db_exception.dart';
 import '../model/background_write_entry.dart';
+import '../model/encryption_domain.dart';
 import '../model/migration_write_mode.dart';
 import '../model/background_write_type.dart';
 import '../model/buffer_entry.dart';
 import '../model/cancellation_token.dart';
 import '../model/key_migration_info.dart';
-import '../model/meta_info.dart';
-import '../model/space_config.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../model/system_table.dart';
 import '../model/table_context.dart';
-import '../model/table_schema.dart' show IndexSchema, IndexType, TableSchema;
+import '../model/table_schema.dart' show TableSchema;
 import 'data_store_impl.dart';
 import 'key_migration_progress.dart';
 import 'yield_controller.dart';
@@ -81,11 +82,21 @@ class KeyMigrationRunner {
       await primaryInstance.parallelJournalManager.waitUntilRecoveryCompleted();
       await KeyMigrationProgressStore.ensureTable(primaryInstance);
 
+      // Ensure domain flags + natural-turnover snapshots exist.
+      await _ensureMigrationInfoPrimed(primaryInstance, targetKeyId);
+
       // Flush only leftover schema-migration scheduler entries (not entire DB idle).
       await _flushSchedulerEntriesOfType(
         primaryInstance,
         BackgroundWriteType.schemaMigration,
       );
+      _throwIfPaused();
+
+      await _rewriteMigrationMetaDomain(primaryInstance);
+      _throwIfPaused();
+
+      // Page0 table/index meta (incl. empty trees with meta but no leaves).
+      await _rewriteTableAndIndexMetaDomains(primaryInstance);
       _throwIfPaused();
 
       await _migrateTables(
@@ -96,7 +107,8 @@ class KeyMigrationRunner {
       );
       _throwIfPaused();
 
-      // Non-global tables: active space on primary.
+      // Non-global tables on the primary's *current* space (may be user space,
+      // not "default" — e.g. mobile stays on login space; default may never open).
       await _migrateTables(
         primaryInstance,
         targetKeyId: targetKeyId,
@@ -105,7 +117,8 @@ class KeyMigrationRunner {
       );
       _throwIfPaused();
 
-      // Non-global tables: other spaces via migration instances.
+      // Every other named space (including "default" when it is not current)
+      // via short-lived migration instances.
       final globalConfig = await primaryInstance.getGlobalConfig();
       final spaces = globalConfig?.spaceNames.toList() ??
           [primaryInstance.currentSpaceName];
@@ -136,10 +149,14 @@ class KeyMigrationRunner {
           );
           await _drainBackgroundWrites(migrationInstance);
         } finally {
+          // Helper close must NOT cancel the primary KeyMigrationRunner token
+          // (KeyManager.pauseKeyMigration no-ops for isMigrationInstance).
           await migrationInstance.close();
         }
       }
 
+      await _markDataRewriteDomainsDone(primaryInstance);
+      await _refreshNaturalTurnoverDomains(primaryInstance);
       await _finalizeKeyMigration(primaryInstance, keyChangeInfo);
     } on DbClosedException {
       Logger.info(
@@ -149,12 +166,10 @@ class KeyMigrationRunner {
       Logger.error('Key migration runner failed', rawError: e);
       final migrationManager = primaryInstance.migrationManager;
       if (migrationManager != null) {
+        final existing = await migrationManager.getKeyMigrationInfo();
         await migrationManager.persistKeyMigrationInfo(
-          KeyMigrationInfo(
-            targetKeyId: targetKeyId,
-            status: KeyMigrationStatus.failed,
-            createdAt: DateTime.now().toIso8601String(),
-          ),
+          (existing ?? KeyMigrationInfo.start(targetKeyId: targetKeyId))
+              .copyWith(status: KeyMigrationStatus.failed),
         );
         await migrationManager.syncHasMigrationTask();
       }
@@ -162,6 +177,328 @@ class KeyMigrationRunner {
     } finally {
       _runToken = null;
     }
+  }
+
+  static Future<void> _ensureMigrationInfoPrimed(
+    DataStoreImpl dataStore,
+    int targetKeyId,
+  ) async {
+    final migrationManager = dataStore.migrationManager;
+    if (migrationManager == null) return;
+
+    final existing = await migrationManager.getKeyMigrationInfo();
+    if (existing != null &&
+        existing.isRunning &&
+        existing.targetKeyId == targetKeyId) {
+      if (existing.snapshots != null) return;
+      final snapshots = await captureNaturalSnapshots(dataStore);
+      await migrationManager.persistKeyMigrationInfo(
+        existing.copyWith(snapshots: snapshots),
+      );
+      return;
+    }
+
+    final snapshots = await captureNaturalSnapshots(dataStore);
+    await migrationManager.persistKeyMigrationInfo(
+      KeyMigrationInfo.start(
+        targetKeyId: targetKeyId,
+        snapshots: snapshots,
+      ),
+    );
+  }
+
+  /// Capture WAL / txn / page-redo watermarks for natural-turnover domains.
+  static Future<KeyMigrationDomainSnapshots> captureNaturalSnapshots(
+    DataStoreImpl dataStore,
+  ) async {
+    String? walCheckpoint;
+    try {
+      final walMeta = dataStore.walManager.meta;
+      walCheckpoint =
+          '${walMeta.checkpoint.partitionIndex}:${walMeta.checkpoint.entrySeq}';
+    } catch (_) {
+      // Leave null — refresh must not treat missing capture as "done".
+    }
+
+    final txnParts = <int>[];
+    try {
+      final main = dataStore.transactionManager?.mainMeta;
+      if (main != null) {
+        txnParts.addAll(main.activePartitions);
+      }
+    } catch (_) {}
+
+    final redoBatches = <String>[];
+    try {
+      for (final batch in dataStore.walManager.meta.pendingBatches) {
+        if (batch.batchId.isNotEmpty) {
+          redoBatches.add(batch.batchId);
+        }
+      }
+    } catch (_) {}
+
+    return KeyMigrationDomainSnapshots(
+      walCheckpointAtStart: walCheckpoint,
+      txnActivePartitionsAtStart: txnParts,
+      pageRedoBatchIdsAtStart: redoBatches,
+    );
+  }
+
+  static Future<void> _rewriteMigrationMetaDomain(
+      DataStoreImpl dataStore) async {
+    final info = await dataStore.migrationManager?.getKeyMigrationInfo();
+    if (info != null && info.isDomainDone(EncryptionDomain.migrationMeta)) {
+      return;
+    }
+    // Persist current meta (re-encrypts under full scope with new encoding key).
+    final migrationManager = dataStore.migrationManager;
+    if (migrationManager != null && info != null) {
+      await migrationManager.persistKeyMigrationInfo(info);
+    }
+    await _markDomainDone(dataStore, EncryptionDomain.migrationMeta);
+  }
+
+  /// Re-encrypt partition page0 [TableDataMeta] / [IndexMeta] under the current
+  /// encodingKey. Required for empty trees (meta present, no leaf data) that
+  /// the table-data rewrite path skips.
+  static Future<void> _rewriteTableAndIndexMetaDomains(
+    DataStoreImpl primaryInstance,
+  ) async {
+    final migrationManager = primaryInstance.migrationManager;
+    final info = await migrationManager?.getKeyMigrationInfo();
+    final tableMetaDone =
+        info?.isDomainDone(EncryptionDomain.tableMeta) ?? false;
+    final indexMetaDone =
+        info?.isDomainDone(EncryptionDomain.indexMeta) ?? false;
+    if (tableMetaDone && indexMetaDone) return;
+
+    Future<void> rewriteOn(
+      DataStoreImpl dataStore, {
+      required bool migrateGlobal,
+      required bool migrateNonGlobal,
+    }) async {
+      await _rewritePage0MetaForTables(
+        dataStore,
+        migrateGlobal: migrateGlobal,
+        migrateNonGlobal: migrateNonGlobal,
+        rewriteTableMeta: !tableMetaDone,
+        rewriteIndexMeta: !indexMetaDone,
+      );
+    }
+
+    await rewriteOn(
+      primaryInstance,
+      migrateGlobal: true,
+      migrateNonGlobal: true,
+    );
+    _throwIfPaused();
+
+    final globalConfig = await primaryInstance.getGlobalConfig();
+    final spaces =
+        globalConfig?.spaceNames.toList() ?? [primaryInstance.currentSpaceName];
+    final activeSpace = primaryInstance.currentSpaceName;
+
+    for (final space in spaces) {
+      if (space == activeSpace) continue;
+      _throwIfPaused();
+
+      final migrationInstance = DataStoreImpl(
+        dbPath: primaryInstance.config.dbPath,
+        dbName: primaryInstance.config.dbName,
+        config: primaryInstance.config.copyWith(spaceName: space),
+        isMigrationInstance: true,
+      );
+      try {
+        await migrationInstance.initialize();
+        _throwIfPaused();
+        await rewriteOn(
+          migrationInstance,
+          migrateGlobal: false,
+          migrateNonGlobal: true,
+        );
+      } finally {
+        // See multi-space table loop: helper close must not pause the primary run.
+        await migrationInstance.close();
+      }
+    }
+
+    if (!tableMetaDone) {
+      await _markDomainDone(primaryInstance, EncryptionDomain.tableMeta);
+    }
+    if (!indexMetaDone) {
+      await _markDomainDone(primaryInstance, EncryptionDomain.indexMeta);
+    }
+  }
+
+  static Future<void> _rewritePage0MetaForTables(
+    DataStoreImpl dataStore, {
+    required bool migrateGlobal,
+    required bool migrateNonGlobal,
+    required bool rewriteTableMeta,
+    required bool rewriteIndexMeta,
+  }) async {
+    if (!rewriteTableMeta && !rewriteIndexMeta) return;
+
+    final tableNames = await dataStore.getTableNames();
+    final yieldController = YieldController(
+      'KeyMigrationRunner.rewritePage0Meta',
+      checkInterval: 8,
+    );
+
+    for (final tableName in tableNames) {
+      _throwIfPaused();
+      await yieldController.maybeYield();
+
+      if (tableName == SystemTable.keyMigrationProgressTableName) continue;
+
+      final tableUid =
+          await dataStore.tableMetaManager?.getUidByName(TableName(tableName));
+      if (tableUid == null) continue;
+      final table = await dataStore.tableMetaManager?.getTableContext(tableUid);
+      if (table == null) continue;
+
+      if (table.isGlobal && !migrateGlobal) continue;
+      if (!table.isGlobal && !migrateNonGlobal) continue;
+
+      if (rewriteTableMeta) {
+        final meta =
+            await dataStore.tableDataManager.getTableDataMeta(table.tableUid);
+        if (meta != null) {
+          await dataStore.tableDataManager.updateTableDataMeta(
+            table,
+            meta,
+            flush: true,
+            persistToDisk: true,
+            acquireLock: true,
+          );
+        }
+      }
+
+      if (rewriteIndexMeta) {
+        final indexes =
+            dataStore.tableMetaManager?.getBtreeIndexesFor(table.schema) ??
+                const [];
+        for (final index in indexes) {
+          _throwIfPaused();
+          await yieldController.maybeYield();
+          if (index.indexUid.isEmpty) continue;
+          final indexMeta =
+              await dataStore.treeMetaPageService.readIndexGlobalMeta(
+            table.tableUid,
+            index.indexUid,
+          );
+          if (indexMeta == null) continue;
+          await dataStore.treeMetaPageService.persistIndexGlobalMeta(
+            tableUid: table.tableUid,
+            indexUid: index.indexUid,
+            meta: indexMeta,
+            flush: true,
+          );
+        }
+      }
+    }
+  }
+
+  static Future<void> _markDataRewriteDomainsDone(
+      DataStoreImpl dataStore) async {
+    await _markDomainDone(dataStore, EncryptionDomain.tableData);
+    await _markDomainDone(dataStore, EncryptionDomain.btreeIndex);
+
+    // Soft: vector pages rewritten with MigrationWriteMode.tableAndIndex when
+    // present; explicit NGH full-scan deferred.
+    await _markDomainDone(dataStore, EncryptionDomain.vectorIndex);
+  }
+
+  static Future<void> _refreshNaturalTurnoverDomains(
+      DataStoreImpl dataStore) async {
+    final migrationManager = dataStore.migrationManager;
+    if (migrationManager == null) return;
+    var info = await migrationManager.getKeyMigrationInfo();
+    if (info == null) return;
+
+    // Snapshots must exist; do not treat missing as complete.
+    if (info.snapshots == null) {
+      final snapshots = await captureNaturalSnapshots(dataStore);
+      info = info.copyWith(snapshots: snapshots);
+      await migrationManager.persistKeyMigrationInfo(info);
+    }
+
+    final snapshots = info.snapshots!;
+
+    // WAL: done only when start watermark was captured and checkpoint advanced.
+    if (!info.isDomainDone(EncryptionDomain.wal)) {
+      var walDone = false;
+      if (snapshots.walCheckpointAtStart != null) {
+        try {
+          final walMeta = dataStore.walManager.meta;
+          final current =
+              '${walMeta.checkpoint.partitionIndex}:${walMeta.checkpoint.entrySeq}';
+          walDone = current != snapshots.walCheckpointAtStart;
+        } catch (_) {
+          // Keep waiting — do not mark done on read failure.
+        }
+      }
+      if (walDone) {
+        info = info.markDomainDone(EncryptionDomain.wal);
+      }
+    }
+
+    // pageRedoLog: shrink start batch ids against current pending set.
+    if (!info.isDomainDone(EncryptionDomain.pageRedoLog)) {
+      final remaining = [...snapshots.pageRedoBatchIdsAtStart];
+      if (remaining.isEmpty) {
+        info = info.markDomainDone(EncryptionDomain.pageRedoLog);
+      } else {
+        try {
+          final current = dataStore.walManager.meta.pendingBatches
+              .map((b) => b.batchId)
+              .where((id) => id.isNotEmpty)
+              .toSet();
+          remaining.removeWhere((id) => !current.contains(id));
+        } catch (_) {
+          // Keep remaining as-is on failure.
+        }
+        info = info.copyWith(
+          snapshots: snapshots.copyWith(pageRedoBatchIdsAtStart: remaining),
+        );
+        if (remaining.isEmpty) {
+          info = info.markDomainDone(EncryptionDomain.pageRedoLog);
+        }
+      }
+    }
+
+    // transactionLog: shrink activePartitions snapshot against current set.
+    if (!info.isDomainDone(EncryptionDomain.transactionLog)) {
+      final remaining = [...snapshots.txnActivePartitionsAtStart];
+      try {
+        final current =
+            dataStore.transactionManager?.mainMeta?.activePartitions.toSet() ??
+                <int>{};
+        remaining.removeWhere((p) => !current.contains(p));
+      } catch (_) {
+        // Keep remaining on failure — do not clear.
+      }
+      info = info.copyWith(
+        snapshots: (info.snapshots ?? snapshots)
+            .copyWith(txnActivePartitionsAtStart: remaining),
+      );
+      if (remaining.isEmpty) {
+        info = info.markDomainDone(EncryptionDomain.transactionLog);
+      }
+    }
+
+    await migrationManager.persistKeyMigrationInfo(info);
+  }
+
+  static Future<void> _markDomainDone(
+    DataStoreImpl dataStore,
+    EncryptionDomain domain,
+  ) async {
+    final migrationManager = dataStore.migrationManager;
+    if (migrationManager == null) return;
+    final info = await migrationManager.getKeyMigrationInfo();
+    if (info == null || info.isDomainDone(domain)) return;
+    await migrationManager.persistKeyMigrationInfo(info.markDomainDone(domain));
   }
 
   static Future<void> _migrateTables(
@@ -187,8 +524,13 @@ class KeyMigrationRunner {
       if (table.isGlobal && !migrateGlobal) continue;
       if (!table.isGlobal && !migrateNonGlobal) continue;
 
-      if (await _isTableAlreadyMigrated(dataStore, table, targetKeyId)) {
-        final scope = scopeForTable(dataStore, table);
+      final scope = scopeForTable(dataStore, table);
+
+      // Empty leaf tree: page0 meta already handled by tableMeta/indexMeta
+      // domains; nothing left for tableData/btreeIndex rewrite.
+      final tableDataMeta =
+          await dataStore.tableDataManager.getTableDataMeta(table.tableUid);
+      if (tableDataMeta == null || tableDataMeta.btreeFirstLeaf.isNull) {
         await KeyMigrationProgressStore.markCompleted(
           dataStore,
           table: table,
@@ -197,16 +539,22 @@ class KeyMigrationRunner {
         continue;
       }
 
+      // Only skip when progress store already records completed for this run.
+      if (await KeyMigrationProgressStore.isCompleted(
+        dataStore,
+        table: table,
+        spaceName: scope,
+      )) {
+        continue;
+      }
+
       _activeTableMigrations.add(table.tableUid);
       try {
-        final scope = scopeForTable(dataStore, table);
         final startCursor = await KeyMigrationProgressStore.loadCheckpoint(
           dataStore,
           table: table,
           spaceName: scope,
         );
-        final isResume = startCursor != null && startCursor.isNotEmpty;
-        await _purgeTableIndexes(dataStore, table, isResume: isResume);
         await dataStore.cacheManager.invalidateCache(table);
 
         await KeyMigrationProgressStore.upsertRunning(
@@ -281,12 +629,11 @@ class KeyMigrationRunner {
 
         if (isPauseRequested) {
           // Do not drain: close/cutover clears unpersisted scheduler entries.
-          // Keep isBuilding=true so queries stay on tableScan until resume.
+          // Indexes remain complete under mixed keyIds + fallbackKeys.
           throw DbClosedException('Key migration paused');
         }
 
         await _drainBackgroundWrites(dataStore);
-        await _endIndexBuilds(dataStore, table);
 
         await KeyMigrationProgressStore.markCompleted(
           dataStore,
@@ -324,16 +671,23 @@ class KeyMigrationRunner {
     }
   }
 
-  /// Drain this instance's key-migration scheduler queue (per-table boundary).
+  /// Drain key-migration scheduler queue; incomplete drain must not mark tables done.
   static Future<void> _drainBackgroundWrites(DataStoreImpl dataStore) async {
     var rounds = 0;
-    while (!dataStore.backgroundWriteScheduler.isEmpty) {
-      if (isPauseRequested) break;
+    while (dataStore.backgroundWriteScheduler
+        .hasPendingEntriesOfType(BackgroundWriteType.keyMigration)) {
+      if (isPauseRequested) {
+        throw DbClosedException('Key migration paused');
+      }
       if (++rounds > 512) {
-        Logger.warn(
-          'Background write drain hit round limit; scheduler may still have entries',
-        );
-        break;
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message:
+                'Key migration drain hit round limit with pending keyMigration '
+                'scheduler entries; refusing to mark table completed',
+          ),
+        ]);
       }
       await dataStore.parallelJournalManager.flushCompletely();
     }
@@ -343,128 +697,123 @@ class KeyMigrationRunner {
     DataStoreImpl dataStore,
     KeyChangeInfo keyChangeInfo,
   ) async {
-    final spaceConfig = await dataStore.getSpaceConfig();
-    if (spaceConfig == null) {
+    final global = await dataStore.getGlobalConfig();
+    if (global == null) {
       Logger.error(
-        'Space config missing when finalizing key migration',
+        'GlobalConfig missing when finalizing key migration',
       );
       return;
     }
 
-    final history = [...spaceConfig.historyKeys];
-    if (spaceConfig.current.key.isNotEmpty &&
-        !history.any((k) => k.keyId == spaceConfig.current.keyId)) {
-      history.add(spaceConfig.current);
+    final migrationManager = dataStore.migrationManager;
+    final info = await migrationManager?.getKeyMigrationInfo();
+    final allDone = info?.allDomainsComplete ?? false;
+
+    final applied = global.appliedEncryption ?? AppliedEncryption.empty();
+    final history = [...applied.historyKeys];
+
+    // Early promote: current should already be the target. Legacy path still
+    // moves a mismatched current into history.
+    if (applied.current.key.isNotEmpty &&
+        applied.current.keyId != keyChangeInfo.newKeyId &&
+        !history.any((k) => k.keyId == applied.current.keyId)) {
+      history.add(applied.current);
     }
 
-    await dataStore.saveSpaceConfigToFile(
-      spaceConfig.copyWith(
-        current: EncryptionKeyInfo(
-          key: keyChangeInfo.encryptKey,
-          keyId: keyChangeInfo.newKeyId,
+    final completedAt = allDone ? DateTime.now().toUtc() : null;
+    final newCurrent = EncryptionKeyInfo(
+      key: keyChangeInfo.plainEncodingKey,
+      keyId: keyChangeInfo.newKeyId,
+      migrationCompletedAt: completedAt,
+    );
+
+    final stampedHistory = history.map((k) {
+      if (completedAt != null &&
+          k.keyId < keyChangeInfo.newKeyId &&
+          k.migrationCompletedAt == null) {
+        return k.copyWith(migrationCompletedAt: completedAt);
+      }
+      return k;
+    }).toList();
+
+    await dataStore.saveGlobalConfig(
+      global.copyWith(
+        appliedEncryption: AppliedEncryption(
+          current: newCurrent,
+          historyKeys: stampedHistory,
         ),
-        historyKeys: history,
       ),
+      propagateErrors: true,
     );
 
     await KeyMigrationProgressStore.clearAll(dataStore);
 
-    final migrationManager = dataStore.migrationManager;
     if (migrationManager != null) {
-      await migrationManager.persistKeyMigrationInfo(
-        KeyMigrationInfo(
-          targetKeyId: keyChangeInfo.newKeyId,
-          status: KeyMigrationStatus.completed,
-          createdAt: DateTime.now().toIso8601String(),
-        ),
-      );
-      await migrationManager.clearKeyMigrationInfo();
-      await migrationManager.syncHasMigrationTask();
-    }
-
-    Logger.info(
-      'Key migration completed for keyId ${keyChangeInfo.newKeyId}',
-    );
-  }
-
-  static Future<void> _purgeTableIndexes(
-    DataStoreImpl dataStore,
-    TableContext table, {
-    required bool isResume,
-  }) async {
-    final indexes = <IndexSchema>[
-      ...table.schema.getAllIndexes(),
-      ...?dataStore.indexManager
-          ?.getEngineManagedBtreeIndexes(table, table.schema),
-    ];
-
-    final indexManager = dataStore.indexManager;
-    if (indexManager == null) return;
-
-    final tableDataMeta =
-        await dataStore.tableDataManager.getTableDataMeta(table.tableUid);
-    final hasRecords = (tableDataMeta?.totalRecords ?? 0) > 0;
-
-    for (final index in indexes) {
-      if (index.type == IndexType.vector) continue;
-      final indexUid = index.indexUid;
-      if (indexUid.isEmpty) continue;
-
-      if (!hasRecords) {
-        if (!isResume) {
-          await indexManager.deletePhysicalIndexArtifacts(table, indexUid);
-          await indexManager.updateIndexMeta(
-            table: table,
-            indexUid: indexUid,
-            updatedMeta: IndexMeta.createEmpty(
-              indexUid: indexUid,
-              tableUid: table.tableUid,
-              isUnique: index.unique,
-              isBuilding: false,
-            ),
+      if (allDone) {
+        if (info != null) {
+          await migrationManager.persistKeyMigrationInfo(
+            info.copyWith(status: KeyMigrationStatus.completed),
           );
         }
-        continue;
-      }
-
-      if (!isResume) {
-        // Authority: key migration owns isBuilding for the full rewrite.
-        await indexManager.beginIndexBuild(table, index);
+        await migrationManager.clearKeyMigrationInfo();
+        await migrationManager.syncHasMigrationTask();
+        Logger.info(
+          'Key migration fully completed for keyId ${keyChangeInfo.newKeyId}',
+        );
       } else {
-        final existing =
-            await indexManager.getIndexMeta(table.tableUid, indexUid);
-        if (existing == null || !existing.isBuilding) {
-          await indexManager.updateIndexMeta(
-            table: table,
-            indexUid: indexUid,
-            updatedMeta: (existing != null)
-                ? existing.copyWith(isBuilding: true)
-                : IndexMeta.createEmpty(
-                    indexUid: indexUid,
-                    tableUid: table.tableUid,
-                    isUnique: index.unique,
-                    isBuilding: true,
-                  ),
-          );
-        }
+        // Keep running until natural-turnover domains finish.
+        Logger.info(
+          'Key migration rewrite done for keyId ${keyChangeInfo.newKeyId}; '
+          'waiting for natural-turnover domains',
+        );
+        await migrationManager.syncHasMigrationTask();
       }
     }
   }
 
-  static Future<void> _endIndexBuilds(
-      DataStoreImpl dataStore, TableContext table) async {
-    final indexManager = dataStore.indexManager;
-    if (indexManager == null) return;
+  /// Public entry for resume path: refresh natural domains and stamp completedAt.
+  static Future<void> refreshNaturalTurnoverAndMaybeComplete(
+    DataStoreImpl dataStore,
+  ) async {
+    await _refreshNaturalTurnoverDomains(dataStore);
+    final info = await dataStore.migrationManager?.getKeyMigrationInfo();
+    if (info == null || !info.allDomainsComplete) return;
 
-    final indexes = <IndexSchema>[
-      ...table.schema.getAllIndexes(),
-      ...indexManager.getEngineManagedBtreeIndexes(table, table.schema),
-    ];
-    for (final index in indexes) {
-      if (index.type == IndexType.vector) continue;
-      if (index.indexUid.isEmpty) continue;
-      await indexManager.endIndexBuild(table, index.indexUid);
-    }
+    final global = await dataStore.getGlobalConfig();
+    final applied = global?.appliedEncryption;
+    if (global == null || applied == null) return;
+
+    final completedAt = DateTime.now().toUtc();
+    final current = applied.current.keyId == info.targetKeyId
+        ? applied.current.copyWith(migrationCompletedAt: completedAt)
+        : applied.current;
+
+    final stampedHistory = applied.historyKeys.map((k) {
+      if (k.keyId < info.targetKeyId && k.migrationCompletedAt == null) {
+        return k.copyWith(migrationCompletedAt: completedAt);
+      }
+      return k;
+    }).toList();
+
+    await dataStore.saveGlobalConfig(
+      global.copyWith(
+        appliedEncryption: applied.copyWith(
+          current: current,
+          historyKeys: stampedHistory,
+        ),
+      ),
+      propagateErrors: true,
+    );
+
+    await KeyMigrationProgressStore.clearAll(dataStore);
+    await dataStore.migrationManager?.persistKeyMigrationInfo(
+      info.copyWith(status: KeyMigrationStatus.completed),
+    );
+    await dataStore.migrationManager?.clearKeyMigrationInfo();
+    await dataStore.migrationManager?.syncHasMigrationTask();
+    Logger.info(
+      'Key migration natural-turnover completed for keyId ${info.targetKeyId}',
+    );
   }
 
   static String scopeForTable(DataStoreImpl dataStore, TableContext table) {
@@ -477,48 +826,6 @@ class KeyMigrationRunner {
     }
     return dataStore?.currentSpaceName ?? 'default';
   }
-
-  static Future<bool> _isTableAlreadyMigrated(
-    DataStoreImpl dataStore,
-    TableContext table,
-    int targetKeyId,
-  ) async {
-    try {
-      final tableDataMeta =
-          await dataStore.tableDataManager.getTableDataMeta(table.tableUid);
-      if (tableDataMeta == null || tableDataMeta.btreeFirstLeaf.isNull) {
-        return true;
-      }
-      final firstLeaf = tableDataMeta.btreeFirstLeaf;
-      final lastLeaf = tableDataMeta.btreeLastLeaf;
-      final btreePageSize = dataStore.configuredPageSize;
-
-      Future<bool> checkPage(TreePagePtr leaf) async {
-        if (leaf.isNull) return true;
-        final path = await dataStore.pathManager
-            .getPartitionFilePathByNo(table.tableUid, leaf.partitionNo);
-        final fileSize = await dataStore.storage.getFileSize(path);
-        final offset = leaf.pageNo * btreePageSize + 20;
-        if (fileSize < offset + 32) return false;
-        final bytes = await dataStore.storage.readAsBytesAt(
-          path,
-          offset,
-          length: 32,
-        );
-        return EncryptionManager.parseKeyId(bytes) == targetKeyId;
-      }
-
-      if (!await checkPage(firstLeaf)) return false;
-      if (lastLeaf != firstLeaf) {
-        return await checkPage(lastLeaf);
-      }
-      return true;
-    } catch (e) {
-      Logger.warn('Could not probe key migration state for ${table.tableName}',
-          rawError: e);
-      return false;
-    }
-  }
 }
 
 /// Key change payload passed into the migration runner.
@@ -526,12 +833,14 @@ class KeyChangeInfo {
   final bool hasChanged;
   final Uint8List newKey;
   final int newKeyId;
-  final String encryptKey;
+
+  /// Plaintext encodingKey to persist in [AppliedEncryption.current].
+  final String plainEncodingKey;
 
   KeyChangeInfo({
     required this.hasChanged,
     required this.newKey,
     required this.newKeyId,
-    required this.encryptKey,
+    required this.plainEncodingKey,
   });
 }
