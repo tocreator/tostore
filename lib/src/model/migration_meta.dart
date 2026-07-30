@@ -23,15 +23,8 @@ class MigrationMeta {
   /// get the task directory path
   String getTaskDir(int dirIndex) => 'dir_$dirIndex';
 
-  /// convert to json (legacy / tooling). On-disk persistence uses MigrationMetaCodec.
-  Map<String, dynamic> toJson() => {
-        'directoryMapping': directoryMapping.toJson(),
-        if (keyMigrationInfo != null)
-          'keyMigrationInfo': keyMigrationInfo!.toJson(),
-      };
-
   /// create from json (legacy upgrade path). On-disk persistence uses MigrationMetaCodec.
-  factory MigrationMeta.fromJson(Map<String, dynamic> json) {
+  factory MigrationMeta.fromJsonLegacy(Map<String, dynamic> json) {
     // Handle legacy format (v1) for backward compatibility during upgrade
     if (json.containsKey('dirUsage') || json.containsKey('taskIndex')) {
       // Legacy format: convert to new format
@@ -64,7 +57,6 @@ class MigrationMeta {
           idToDir: idToDir,
           dirToFileCount: dirToFileCount,
         ),
-        keyMigrationInfo: _parseKeyMigrationInfo(json),
       );
     }
 
@@ -74,14 +66,7 @@ class MigrationMeta {
           ? DirectoryMappingString.fromJson(
               json['directoryMapping'] as Map<String, dynamic>)
           : DirectoryMappingString(),
-      keyMigrationInfo: _parseKeyMigrationInfo(json),
     );
-  }
-
-  static KeyMigrationInfo? _parseKeyMigrationInfo(Map<String, dynamic> json) {
-    final raw = json['keyMigrationInfo'];
-    if (raw is! Map<String, dynamic>) return null;
-    return KeyMigrationInfo.fromJson(raw);
   }
 
   /// create a copy and modify some fields
