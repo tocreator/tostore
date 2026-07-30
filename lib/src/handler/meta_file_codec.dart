@@ -8,11 +8,11 @@ import '../model/result_type.dart';
 import 'encryption.dart';
 import 'tobf_file_codec.dart';
 
-/// TOBF file shell for WAL / transaction / migration / backup metadata.
+/// TOBF file shell for WAL / transaction / migration / backup / space metadata.
 ///
 /// When [EncryptionScope.full] is active, the field-tag payload is encrypted
-/// with [EncryptionManager] (user key) before framing — same key domain as
-/// ToWL/ToTX logs. Config files continue to use ConfigVault separately.
+/// with [EncryptionManager] (user encodingKey) before framing.
+/// GlobalConfig uses an independent encryptionKey shell via [GlobalConfigCodec].
 abstract final class MetaFileCodec {
   MetaFileCodec._();
 
