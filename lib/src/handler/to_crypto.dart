@@ -51,8 +51,7 @@ class ToCrypto {
           )
         ]);
       }
-      final keyBytes = Uint8List.fromList(utf8.encode(key));
-      return keyBytes.length == 32 ? keyBytes : SHA256.hash(keyBytes);
+      return SHA256.stringToBytes(key);
     }
     if (key is Uint8List) {
       if (key.isEmpty) {
