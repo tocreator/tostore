@@ -135,6 +135,12 @@ abstract class DataStoreInterface {
   Future<bool> switchSpace(
       {String spaceName = 'default', bool keepActive = true});
 
+  /// Rotate encryption key
+  Future<DbResult> rotateEncryptionKey({
+    String? oldKey,
+    required String newKey,
+  });
+
   /// flush data
   Future<void> flush({bool flushStorage = true});
 
