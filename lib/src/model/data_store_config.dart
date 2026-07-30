@@ -1,6 +1,4 @@
-import 'dart:convert';
 import 'dart:math';
-import 'dart:typed_data';
 
 import '../handler/common.dart';
 import '../handler/platform_handler.dart';
@@ -577,7 +575,6 @@ class DataStoreConfig {
         encryptionType: encryptionType,
         encodingKey: json['encodingKey'] as String?,
         encryptionKey: json['encryptionKey'] as String?,
-        deviceBinding: false,
       );
     }
 
@@ -1006,54 +1003,33 @@ extension EncryptionScopeExtension on EncryptionScope {
   }
 }
 
+/// Engine built-in KEK when [EncryptionConfig.encryptionKey] is null.
+///
+/// Protects GlobalConfig (incl. AppliedEncryption). Rotating this key does not
+String get defaultEncryptionKey => deriveBuiltinKey('encryption_v1');
+
+/// Engine built-in DEK seed when [EncryptionConfig.encodingKey] is null.
+String get defaultEncodingKey => deriveBuiltinKey('encoding_v1');
+
 /// Encryption configuration for data store
-/// Supports device binding (path-based) for enhanced security
 class EncryptionConfig {
   /// Encryption type for data encoding
   /// Used for encrypting table data, log files, index data, and other critical privacy data
   final EncryptionType encryptionType;
 
-  /// Encoding key for encoding/decoding data
-  /// Used for encrypting table data, log files (WAL), index data, and other critical privacy data
-  /// If null, will be auto-generated based on device binding or default key
+  /// Encoding key for encoding/decoding data (DEK).
+  /// If null, [defaultEncodingKey] is used.
   final String? encodingKey;
 
-  /// Encryption key for encrypting the encodingKey and other critical information
-  /// Used to protect the encodingKey and other sensitive metadata
-  /// If null, will be auto-generated based on device binding or default key
+  /// Security key protecting encodingKey and other critical information (KEK).
+  /// If null, [defaultEncryptionKey] is used.
+  /// Rotate online via `rotateEncryptionKey` — does not rewrite table data.
   final String? encryptionKey;
-
-  /// Device binding (path-based binding)
-  /// When enabled, keys will be derived from database path, making data encrypted on one device
-  /// unable to be decrypted on another device or after path changes
-  ///
-  /// Implementation: Uses database path binding internally
-  ///
-  /// Suitable scenarios:
-  /// - Mobile apps (Android/iOS) where database paths are relatively stable
-  /// - Single-device applications where data should not be portable
-  ///
-  /// Warning: Do NOT use in scenarios where database path may change:
-  /// - Application data migration between devices
-  /// - System updates that may change app storage paths
-  /// - Factory reset or app reinstallation
-  /// - Custom ROM or ROOT modifications
-  ///
-  /// If database path changes, encrypted data will become undecryptable.
-  /// For portable data scenarios, leave this as false and provide explicit keys.
-  final bool deviceBinding;
 
   /// Whether to encrypt vector index data (NGH graph pages, PQ codes, raw vectors).
   ///
-  /// Defaults to `false` for maximum vector search performance.
-  /// Vector embeddings are derived mathematical representations that are extremely
-  /// difficult to reverse-engineer into original data. The original sensitive data
-  /// is protected by table-level encryption.
-  ///
-  /// Set to `true` only when strict compliance requirements mandate full encryption
-  /// of all stored data including derived embeddings. Enabling this will add
-  /// encryption/decryption overhead to every vector index page read/write operation,
-  /// which can significantly impact search latency.
+  /// **Deprecated:** conflicts with [EncryptionScope.full]. Prefer `encryptionScope: full`.
+  @Deprecated('Use EncryptionScope.full instead')
   final bool encryptVectorIndex;
 
   /// The encryption scope configures how much of the database engine is encrypted.
@@ -1065,80 +1041,33 @@ class EncryptionConfig {
     this.encryptionType = EncryptionType.none,
     this.encodingKey,
     this.encryptionKey,
-    this.deviceBinding = false,
+    @Deprecated('Use EncryptionScope.full instead')
     this.encryptVectorIndex = false,
     this.encryptionScope = EncryptionScope.standard,
   });
 
-  /// Generate encoding key based on configuration
-  /// Returns the encoding key for encrypting table data, logs, indexes, and other critical data
-  String generateEncodingKey(String? dbPath) {
+  /// Effective encoding key (user or built-in default).
+  String resolveEncodingKey() {
     if (encodingKey != null && encodingKey!.isNotEmpty) {
       return encodingKey!;
     }
-
-    if (deviceBinding && dbPath != null && dbPath.isNotEmpty) {
-      return _deriveKeyFromPath(dbPath, 'encoding');
-    }
-
-    return generateDeviceId('encoding_v1', deviceBinding ? 1 : 0);
+    return defaultEncodingKey;
   }
 
-  /// Generate encryption key based on configuration
-  /// Returns the encryption key for protecting the encodingKey and other sensitive metadata
-  String generateEncryptionKey(String? dbPath) {
+  /// Effective encryption key (user or built-in default).
+  String resolveEncryptionKey() {
     if (encryptionKey != null && encryptionKey!.isNotEmpty) {
       return encryptionKey!;
     }
-
-    if (deviceBinding && dbPath != null && dbPath.isNotEmpty) {
-      return _deriveKeyFromPath(dbPath, 'encryption');
-    }
-
-    return generateDeviceId('encryption_v1', deviceBinding ? 1 : 0);
+    return defaultEncryptionKey;
   }
 
-  /// Derive key from database path
-  String _deriveKeyFromPath(String dbPath, String purpose) {
-    // Normalize path to handle different path separators
-    final normalizedPath = dbPath.replaceAll(RegExp(r'[/\\]+'), '/');
-
-    // Combine path and purpose
-    final combined = 'path:$normalizedPath|purpose:$purpose';
-
-    // Derive key from combined string
-    return _deriveKeyFromString(combined);
-  }
-
-  /// Derive a deterministic key from a string
-  /// Uses a simple but effective key derivation function
-  String _deriveKeyFromString(String input) {
-    // Use UTF-8 encoding
-    final inputBytes = utf8.encode(input);
-
-    // Create a 32-byte key using deterministic key derivation
-    final keyBytes = Uint8List(32);
-    int hash = 0;
-
-    for (int i = 0; i < inputBytes.length; i++) {
-      hash = ((hash << 5) - hash) + inputBytes[i];
-      hash = hash & hash; // Convert to 32-bit integer
-    }
-
-    // Fill key bytes with deterministic values based on input
-    for (int i = 0; i < 32; i++) {
-      final index = (i * 7 + hash) % inputBytes.length;
-      keyBytes[i] = (inputBytes[index] ^ (i * 13 + 41) ^ hash) & 0xFF;
-      hash = ((hash << 3) - hash) + keyBytes[i];
-    }
-
-    // Convert to base64 string
-    final base64Str = base64Encode(keyBytes);
-    // Take first 24 characters for key (similar length to default keys)
-    return base64Str.substring(
-      0,
-      base64Str.length > 24 ? 24 : base64Str.length,
-    );
+  /// True when vector pages should be encrypted (full scope, or legacy flag).
+  bool get shouldEncryptVectorIndex {
+    if (encryptionType == EncryptionType.none) return false;
+    if (encryptionScope == EncryptionScope.full) return true;
+    // ignore: deprecated_member_use_from_same_package
+    return encryptVectorIndex;
   }
 
   /// Create from JSON
@@ -1151,9 +1080,7 @@ class EncryptionConfig {
           : EncryptionType.xorObfuscation,
       encodingKey: json['encodingKey'] as String?,
       encryptionKey: json['encryptionKey'] as String?,
-      deviceBinding: json['deviceBinding'] as bool? ??
-          json['pathBinding'] as bool? ??
-          false, // Backward compatibility
+      // ignore: deprecated_member_use_from_same_package
       encryptVectorIndex: json['encryptVectorIndex'] as bool? ?? false,
       encryptionScope: json['encryptionScope'] != null
           ? EncryptionScopeExtension.fromConfigString(
@@ -1169,8 +1096,6 @@ class EncryptionConfig {
       'encryptionType': encryptionType.toConfigString(),
       if (encodingKey != null) 'encodingKey': encodingKey,
       if (encryptionKey != null) 'encryptionKey': encryptionKey,
-      'deviceBinding': deviceBinding,
-      'encryptVectorIndex': encryptVectorIndex,
       'encryptionScope': encryptionScope.toConfigString(),
     };
   }
@@ -1180,15 +1105,14 @@ class EncryptionConfig {
     EncryptionType? encryptionType,
     String? encodingKey,
     String? encryptionKey,
-    bool? deviceBinding,
-    bool? encryptVectorIndex,
+    @Deprecated('Use EncryptionScope.full instead') bool? encryptVectorIndex,
     EncryptionScope? encryptionScope,
   }) {
     return EncryptionConfig(
       encryptionType: encryptionType ?? this.encryptionType,
       encodingKey: encodingKey ?? this.encodingKey,
       encryptionKey: encryptionKey ?? this.encryptionKey,
-      deviceBinding: deviceBinding ?? this.deviceBinding,
+      // ignore: deprecated_member_use_from_same_package
       encryptVectorIndex: encryptVectorIndex ?? this.encryptVectorIndex,
       encryptionScope: encryptionScope ?? this.encryptionScope,
     );
@@ -1198,7 +1122,6 @@ class EncryptionConfig {
   String toString() {
     return 'EncryptionConfig('
         'encryptionType: $encryptionType, '
-        'deviceBinding: $deviceBinding, '
         'encryptionScope: $encryptionScope)';
   }
 }
