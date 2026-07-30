@@ -6,8 +6,8 @@ import '../model/data_store_config.dart';
 /// Shared TOBF file-shell encode/decode (frame + checksum + flags).
 ///
 /// Encryption of the body is the caller's responsibility:
-/// - Config files: ConfigVault ChaCha via [ConfigFileCodec]
-/// - WAL/Txn meta: [EncryptionManager] via [MetaFileCodec] when
+/// - GlobalConfig: encryptionKey (KEK) via [GlobalConfigCodec]
+/// - WAL / Txn / migration meta: [EncryptionManager] via [MetaFileCodec] when
 ///   [EncryptionScope.full]
 abstract final class TobfFileCodec {
   TobfFileCodec._();
@@ -20,10 +20,10 @@ abstract final class TobfFileCodec {
 
   /// Whether [EncryptionScope.full] is active on the given config.
   ///
-  /// GlobalConfig and SpaceConfig files are written as plaintext TOBF frames (flags = 0)
-  /// by default or when [encryptionConfig] is null / [EncryptionType.none] / [EncryptionScope.standard].
-  /// Shell encryption (flags = 1) is ONLY enabled when [encryptionScope] is explicitly set
-  /// to [EncryptionScope.full] with a valid non-none [encryptionType].
+  /// Engine meta shells use plaintext TOBF frames when [encryptionConfig] is
+  /// null / [EncryptionType.none] / [EncryptionScope.standard]. Shell encryption
+  /// is enabled only for [EncryptionScope.full] with non-none type.
+  /// GlobalConfig is always encrypted separately via encryptionKey (see GlobalConfigCodec).
   static bool shouldEncryptFullScope(EncryptionConfig? encryptionConfig) {
     if (encryptionConfig == null) return false;
     if (encryptionConfig.encryptionType == EncryptionType.none) return false;
