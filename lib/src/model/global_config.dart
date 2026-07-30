@@ -1,4 +1,5 @@
 import '../handler/common.dart';
+import 'applied_encryption.dart';
 
 /// global config model
 class GlobalConfig {
@@ -57,6 +58,9 @@ class GlobalConfig {
   /// Occupancy of [lastNonGlobalDirIndex] (0 = unused / empty DB).
   final int lastNonGlobalDirEntries;
 
+  /// Database-wide encoding keyring (protected by encryptionKey file shell).
+  final AppliedEncryption? appliedEncryption;
+
   GlobalConfig({
     int? version,
     int? userVersion,
@@ -71,6 +75,7 @@ class GlobalConfig {
     this.lastGlobalDirEntries = 0,
     this.lastNonGlobalDirIndex = 0,
     this.lastNonGlobalDirEntries = 0,
+    this.appliedEncryption,
   })  : version = version ?? InternalConfig.engineVersion,
         userVersion = userVersion ?? 0,
         maxEntriesPerDir =
@@ -80,55 +85,6 @@ class GlobalConfig {
 
   /// True when [pageSize] was persisted (legacy files may have 0 until v3).
   bool get hasConfiguredPageSize => pageSize > 0;
-
-  /// create from json (legacy / tooling). On-disk persistence uses GlobalConfigCodec.
-  factory GlobalConfig.fromJson(Map<String, dynamic> json) {
-    final rawPageSize = json['pageSize'];
-    return GlobalConfig(
-      version: resolveVersionValue(
-          json['version'], InternalConfig.legacyEngineVersion),
-      userVersion: resolveVersionValue(json['userVersion'], 0),
-      maxEntriesPerDir: resolveVersionValue(
-          json['maxEntriesPerDir'], InternalConfig.defaultMaxEntriesPerDir),
-      // Missing key → 0 (unset), must NOT default here or v3 loses the signal
-      // to sample page size from existing table meta.
-      pageSize: rawPageSize == null ? 0 : (rawPageSize as num).toInt(),
-      spaceNames: (json['spaceNames'] as List<dynamic>?)
-              ?.map((e) => e as String)
-              .toSet() ??
-          {'default'},
-      activeSpace: json['activeSpace'] as String? ?? 'default',
-      hasMigrationTask: json['hasMigrationTask'] as bool? ?? false,
-      userSchemaHash: json['userSchemaHash'] as String?,
-      systemSchemaHash: json['systemSchemaHash'] as String?,
-      lastGlobalDirIndex: (json['lastGlobalDirIndex'] as num?)?.toInt() ?? 0,
-      lastGlobalDirEntries:
-          (json['lastGlobalDirEntries'] as num?)?.toInt() ?? 0,
-      lastNonGlobalDirIndex:
-          (json['lastNonGlobalDirIndex'] as num?)?.toInt() ?? 0,
-      lastNonGlobalDirEntries:
-          (json['lastNonGlobalDirEntries'] as num?)?.toInt() ?? 0,
-    );
-  }
-
-  /// convert to json (legacy / tooling). On-disk persistence uses GlobalConfigCodec.
-  Map<String, dynamic> toJson() {
-    return {
-      'version': version,
-      'userVersion': userVersion,
-      'maxEntriesPerDir': maxEntriesPerDir,
-      if (pageSize > 0) 'pageSize': pageSize,
-      'spaceNames': spaceNames.toList(),
-      if (activeSpace != null) 'activeSpace': activeSpace!,
-      'hasMigrationTask': hasMigrationTask,
-      if (userSchemaHash != null) 'userSchemaHash': userSchemaHash,
-      if (systemSchemaHash != null) 'systemSchemaHash': systemSchemaHash,
-      'lastGlobalDirIndex': lastGlobalDirIndex,
-      'lastGlobalDirEntries': lastGlobalDirEntries,
-      'lastNonGlobalDirIndex': lastNonGlobalDirIndex,
-      'lastNonGlobalDirEntries': lastNonGlobalDirEntries,
-    };
-  }
 
   /// create a copy and modify some fields
   /// [clearActiveSpace] when true, sets [activeSpace] to null (e.g. for logout).
@@ -152,6 +108,8 @@ class GlobalConfig {
     int? lastGlobalDirEntries,
     int? lastNonGlobalDirIndex,
     int? lastNonGlobalDirEntries,
+    AppliedEncryption? appliedEncryption,
+    bool clearAppliedEncryption = false,
   }) {
     final int nextPageSize;
     if (hasConfiguredPageSize) {
@@ -178,6 +136,9 @@ class GlobalConfig {
           lastNonGlobalDirIndex ?? this.lastNonGlobalDirIndex,
       lastNonGlobalDirEntries:
           lastNonGlobalDirEntries ?? this.lastNonGlobalDirEntries,
+      appliedEncryption: clearAppliedEncryption
+          ? null
+          : (appliedEncryption ?? this.appliedEncryption),
     );
   }
 
