@@ -1,10 +1,6 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
-import '../model/db_exception.dart';
-import '../model/result_status.dart';
-import '../model/result_type.dart';
-
 /// SHA256 standard implementation
 class SHA256 {
   // 64 constant words for the SHA-256 algorithm, taken from the standard.
@@ -180,41 +176,17 @@ class SHA256 {
     return ((x >> n) | (x << (32 - n))) & 0xffffffff;
   }
 
-  /// Convert a string to a SHA-256 hash.
+  /// SHA-256(UTF-8([input])) → 32 bytes.
+  ///
+  /// Also the unified passphrase → AEAD key for ChaCha20-Poly1305 / AES-256-GCM /
+  /// GlobalConfig KEK shell.
   static Uint8List stringToBytes(String input) {
     final bytes = utf8.encode(input);
     return hash(Uint8List.fromList(bytes));
   }
 
-  /// Convert a SHA-256 hash to a hexadecimal string.
-  static String stringToHex(String input) {
-    return stringToBytes(input)
-        .map((b) => b.toRadixString(16).padLeft(2, '0'))
-        .join();
-  }
-
-  /// Convert a Uint8List to string
-  static String bytesToHex(Uint8List input) {
-    final bytes = hash(input);
-    return bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
-  }
-
-  /// Convert a hexadecimal string to a Uint8List.
-  static Uint8List hexToBytes(String hex) {
-    if (hex.length % 2 != 0) {
-      throw DbException([
-        InvalidArgumentStatus(
-          type: ResultType.engError,
-          message: 'Hex string must have an even length',
-          parameterName: 'hex',
-          passedValue: hex,
-        )
-      ]);
-    }
-    final result = Uint8List(hex.length ~/ 2);
-    for (int i = 0; i < hex.length; i += 2) {
-      result[i ~/ 2] = int.parse(hex.substring(i, i + 2), radix: 16);
-    }
-    return result;
+  /// SHA-256([input]) then lowercase hex (e.g. schema fingerprints).
+  static String hashToHex(Uint8List input) {
+    return hash(input).map((b) => b.toRadixString(16).padLeft(2, '0')).join();
   }
 }
