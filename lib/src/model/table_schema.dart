@@ -1395,7 +1395,7 @@ class TableSchema {
 
     // Calculate hash value
     final bytes = byteBuffer.toBytes();
-    return SHA256.bytesToHex(bytes);
+    return SHA256.hashToHex(bytes);
   }
 
   /// Add primary key configuration to buffer
