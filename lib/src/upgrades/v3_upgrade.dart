@@ -22,6 +22,7 @@ import '../model/meta_info.dart';
 import '../model/ngh_index_meta.dart';
 import '../model/id_generator.dart';
 import 'config_format_migration.dart';
+import 'applied_encryption_bootstrap.dart';
 import 'legacy_model/pre_v3.dart';
 import 'meta_format_migration.dart';
 import 'migration_format_migration.dart';
@@ -404,6 +405,10 @@ class V3Upgrade {
     // Must finish before version bump so crash mid-migration re-runs V3.
     await TransactionLogMigration(_dataStore).migrateAllSpaces(spaces);
 
+    // Harvest SpaceConfig keyrings into GlobalConfig.appliedEncryption before
+    // KeyManager init / JSON deletion (deviceBinding path KEK tried as fallback).
+    await AppliedEncryptionBootstrap.ensureAppliedEncryption(_dataStore);
+
     // WAL/Txn meta JSON → TOBF (blocking, before version bump).
     // KeyManager must be primed so EncryptionScope.full uses EncryptionManager.
     await _dataStore.keyManager.initialize();
@@ -416,6 +421,7 @@ class V3Upgrade {
     await MigrationFormatMigration.migrate(_dataStore);
 
     // Single GlobalConfig write: schema hashes + pageSize + dir high-water + version.
+    final applied = (await _dataStore.getGlobalConfig())?.appliedEncryption;
     var updatedGlobal = oldGlobalConfig.copyWith(
       userSchemaHash: userSchemaHash,
       systemSchemaHash: resolvedSystemHash,
@@ -424,11 +430,9 @@ class V3Upgrade {
       lastGlobalDirEntries: lastGlobalDirEntries,
       lastNonGlobalDirIndex: lastNonGlobalDirIndex,
       lastNonGlobalDirEntries: lastNonGlobalDirEntries,
+      appliedEncryption: applied,
     );
     if (!skipVersionBump) {
-      for (final spaceName in spaces) {
-        await _upgradeSpaceVersion(spaceName);
-      }
       updatedGlobal = updatedGlobal.setVersion(InternalConfig.engineVersion);
     }
     await _dataStore.saveGlobalConfig(
@@ -436,8 +440,8 @@ class V3Upgrade {
       propagateErrors: true,
     );
 
-    // After tableDirectoryMap has been consumed: ensure TOBF on disk, then
-    // delete legacy JSON. Must not run earlier or maps are permanently lost.
+    // After tableDirectoryMap has been consumed: verify GlobalConfig TOBF,
+    // then delete legacy space JSON (stats move to InternalKv post-init).
     await ConfigFormatMigration.finalizeTobfAndDeleteJson(
       _dataStore,
       spaceNames: spaces,
@@ -1215,28 +1219,6 @@ class V3Upgrade {
     } catch (e) {
       Logger.warn('v3: failed to migrate NGH meta to page 0 for $indexUid',
           rawError: e);
-    }
-  }
-
-  Future<void> _upgradeSpaceVersion(String spaceName) async {
-    final config = await _dataStore.getSpaceConfig(spaceName: spaceName);
-    if (config == null) {
-      return;
-    }
-
-    try {
-      if (config.version >= InternalConfig.engineVersion) {
-        return;
-      }
-      await _dataStore.saveSpaceConfigToFile(
-        config.copyWith(version: InternalConfig.engineVersion),
-        spaceName: spaceName,
-        propagateErrors: true,
-      );
-    } catch (e) {
-      Logger.warn('Skip upgrading space [$spaceName] config to v3',
-          rawError: e);
-      rethrow;
     }
   }
 
