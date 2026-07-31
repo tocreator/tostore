@@ -4,6 +4,7 @@ import '../handler/common.dart';
 import '../handler/encryption.dart';
 import '../handler/logger.dart';
 import '../handler/chacha20_poly1305_old.dart';
+import '../model/data_store_config.dart';
 import '../model/global_config.dart';
 import '../model/table_meta.dart';
 import '../core/data_store_impl.dart';
@@ -11,6 +12,7 @@ import '../core/workload_scheduler.dart';
 import '../handler/parallel_processor.dart';
 import '../core/yield_controller.dart';
 import 'legacy_model/pre_v3.dart';
+import 'applied_encryption_bootstrap.dart';
 import 'v3_upgrade.dart';
 import '../model/table_identity.dart';
 
@@ -135,18 +137,6 @@ class V2Upgrade {
       // Initialize migration instance
       await migrationInstance.initialize();
 
-      // Load space config for this space
-      final spaceConfig = await migrationInstance.getSpaceConfig();
-      if (spaceConfig != null &&
-          spaceConfig.version >= InternalConfig.engineVersion) {
-        // Already upgraded
-        await migrationInstance.close();
-        if (await _dataStore.storage.existsFile(backupConfigPath)) {
-          await _dataStore.storage.deleteFile(backupConfigPath);
-        }
-        return;
-      }
-
       // Upgrade all tables (globals gated by upgradeGlobal below)
       final tableNames =
           await migrationInstance.tableMetaManager?.listAllTables() ??
@@ -165,20 +155,6 @@ class V2Upgrade {
           // After V3: directories are under tableUid; read legacy JSON from that root.
           await _upgradeTableDataToNewFormat(migrationInstance, tableName);
           await yieldController.maybeYield();
-        }
-      }
-
-      // After successful upgrade for this space, bump SpaceConfig.version
-      final updatedSpaceConfig = await migrationInstance.getSpaceConfig();
-      if (updatedSpaceConfig != null) {
-        final withVersion =
-            updatedSpaceConfig.copyWith(version: InternalConfig.engineVersion);
-
-        if (spaceName == _dataStore.currentSpaceName) {
-          // Keep main instance cache in sync for current space
-          await _dataStore.saveSpaceConfigToFile(withVersion);
-        } else {
-          await migrationInstance.saveSpaceConfigToFile(withVersion);
         }
       }
 
@@ -212,9 +188,19 @@ class V2Upgrade {
       final map = LegacySpaceConfigJson.tryParseMap(content);
       if (map == null) return out;
 
-      final key32Old = ChaCha20Poly1305Old.generateKeyFromString(
-          _dataStore.config.encryptionConfig?.encryptionKey ??
-              'E9n8C7r6y7P8T3ioNkEy');
+      final keyCandidates = <String>[
+        if (_dataStore.config.encryptionConfig?.encryptionKey != null &&
+            _dataStore.config.encryptionConfig!.encryptionKey!.isNotEmpty)
+          _dataStore.config.encryptionConfig!.encryptionKey!,
+        defaultEncryptionKey,
+        LegacyPathKeyDerivation.historicalV2DefaultEncryptionKey(),
+      ];
+      final dbPath = _dataStore.instancePath ?? _dataStore.config.dbPath;
+      if (dbPath != null && dbPath.isNotEmpty) {
+        keyCandidates.add(
+          LegacyPathKeyDerivation.deriveKeyFromPath(dbPath, 'encryption'),
+        );
+      }
 
       void processKey(Map<String, dynamic>? info) {
         if (info == null) return;
@@ -223,9 +209,16 @@ class V2Upgrade {
         if (key.isEmpty) return;
         try {
           final decoded = base64.decode(key);
-          final plain = ChaCha20Poly1305Old.decrypt(
-              encryptedData: decoded, key: key32Old);
-          out[keyId] = plain;
+          for (final kek in keyCandidates) {
+            try {
+              final key32Old = ChaCha20Poly1305Old.generateKeyFromString(kek);
+              final plain = ChaCha20Poly1305Old.decrypt(
+                  encryptedData: decoded, key: key32Old);
+              out[keyId] = plain;
+              return;
+            } catch (_) {}
+          }
+          Logger.warn('Failed to decrypt old key from backup');
         } catch (e) {
           Logger.warn('Failed to decrypt old key from backup', rawError: e);
         }
