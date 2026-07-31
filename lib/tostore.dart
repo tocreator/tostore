@@ -1147,27 +1147,31 @@ class ToStore implements DataStoreInterface {
   /// Rotate [EncryptionConfig.encryptionKey].
   ///
   /// Use when your security policy requires rotating the master encryption key.
-  /// [oldKey] must be the key currently in use; [newKey] takes effect for this
-  /// instance immediately and is saved for subsequent [open] calls.
+  /// [oldKey] is the key currently in use; pass `null` to use the engine
+  /// built-in default (first-time move from unset → explicit key).
+  /// [newKey] takes effect immediately and should be passed on the next [open].
   ///
-  /// Does not re-encrypt existing table, index, or log data. To rotate the data
-  /// encryption key, change [EncryptionConfig.encodingKey] instead — the engine
-  /// migrates data automatically.
-  /// Returns [DbResult] for graceful error handling in production. On success.
+  /// Does not rewrite table, index, or log data. To rotate the data encryption
+  /// key, change [EncryptionConfig.encodingKey] instead — the engine migrates
+  /// data automatically.
   ///
   /// 轮换 [EncryptionConfig.encryptionKey]。
   ///
   /// 用于按安全策略定期更换主加密密钥。[oldKey] 为当前正在使用的密钥；
-  /// [newKey] 立即对本实例生效，并保存以供后续 [open] 使用。
+  /// 传 `null` 表示使用引擎内置默认密钥（从未配置 → 首次配置）。
+  /// [newKey] 立即对本实例生效，并应在下次 [open] 时传入。
   ///
   /// 不会重新加密已有的表、索引与日志数据。若要更换数据加密密钥，
   /// 请修改 [EncryptionConfig.encodingKey]，引擎会自动迁移数据。
-  ///
-  /// 应用重启后，请在 [open] 时将 [newKey] 作为 [EncryptionConfig.encryptionKey] 传入。
-  ///
-  /// 返回 [DbResult] 方便在生产环境处理错误。
-  Future<DbResult> rotateEncryptionKey(String oldKey, String newKey) async {
-    final result = await _impl.rotateEncryptionKey(oldKey, newKey);
+  @override
+  Future<DbResult> rotateEncryptionKey({
+    String? oldKey,
+    required String newKey,
+  }) async {
+    final result = await _impl.rotateEncryptionKey(
+      oldKey: oldKey,
+      newKey: newKey,
+    );
     DbException.checkDeveloperError(result);
     return result;
   }
