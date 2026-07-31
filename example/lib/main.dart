@@ -133,6 +133,9 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
   static const bool _isWasmBuild =
       bool.fromEnvironment('FLUTTER_WEB_USE_SKWASM');
 
+  /// Shared content column width for app bar, body, and log panel content.
+  static const double _kContentMaxWidth = 1200.0;
+
   final TextEditingController _searchController = TextEditingController();
   late final PageController _pageViewController;
 
@@ -618,60 +621,79 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         surfaceTintColor: Colors.transparent,
         elevation: 0,
         automaticallyImplyLeading: false,
-        titleSpacing: 16,
-        title: Row(
-          crossAxisAlignment: CrossAxisAlignment.center,
-          children: [
-            Image.asset(
-              'assets/logo-tostore.png',
-              height: 28.0,
-              fit: BoxFit.contain,
-              errorBuilder: (context, error, stackTrace) {
-                return const Text(
-                  'ToStore',
-                  style: TextStyle(
-                    fontWeight: FontWeight.bold,
-                    color: Color(0xFF006CC3),
+        titleSpacing: 0,
+        title: const SizedBox.shrink(),
+        flexibleSpace: SafeArea(
+          bottom: false,
+          child: Center(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: _kContentMaxWidth),
+              child: SizedBox(
+                width: double.infinity,
+                height: kToolbarHeight,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.center,
+                    children: [
+                      Image.asset(
+                        'assets/logo-tostore.png',
+                        height: 36.0,
+                        fit: BoxFit.contain,
+                        errorBuilder: (context, error, stackTrace) {
+                          return const Text(
+                            'ToStore',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              color: Color(0xFF006CC3),
+                            ),
+                          );
+                        },
+                      ),
+                      const SizedBox(width: 12),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 10, vertical: 4),
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(20),
+                          border: Border.all(
+                            color: const Color(0xFFE2E8F0),
+                            width: 0.8,
+                          ),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Container(
+                              width: 6.5,
+                              height: 6.5,
+                              decoration: const BoxDecoration(
+                                color: Color(0xFF10B981),
+                                shape: BoxShape.circle,
+                              ),
+                            ),
+                            const SizedBox(width: 5),
+                            const Text(
+                              'DEMO',
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w700,
+                                color: Color(0xFF006CC3),
+                                letterSpacing: 1.2,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const Spacer(),
+                      _buildMoreActionsButton(),
+                    ],
                   ),
-                );
-              },
-            ),
-            const SizedBox(width: 12),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 3.5),
-              decoration: BoxDecoration(
-                color: Colors.white,
-                borderRadius: BorderRadius.circular(20),
-                border: Border.all(
-                  color: const Color(0xFFE2E8F0),
-                  width: 0.8,
                 ),
               ),
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Container(
-                    width: 6,
-                    height: 6,
-                    decoration: const BoxDecoration(
-                      color: Color(0xFF10B981),
-                      shape: BoxShape.circle,
-                    ),
-                  ),
-                  const SizedBox(width: 5),
-                  const Text(
-                    'DEMO',
-                    style: TextStyle(
-                      fontSize: 10.5,
-                      fontWeight: FontWeight.w700,
-                      color: Color(0xFF006CC3),
-                      letterSpacing: 1.2,
-                    ),
-                  ),
-                ],
-              ),
             ),
-          ],
+          ),
         ),
         bottom: PreferredSize(
           preferredSize: const Size.fromHeight(1.0),
@@ -680,9 +702,6 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
             height: 1.0,
           ),
         ),
-        actions: [
-          _buildMoreActionsButton(),
-        ],
       ),
       body: SafeArea(
         top: false,
@@ -691,7 +710,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
             // Main Content
             Center(
               child: ConstrainedBox(
-                constraints: const BoxConstraints(maxWidth: 1200),
+                constraints: const BoxConstraints(maxWidth: _kContentMaxWidth),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.stretch,
                   children: [
@@ -749,25 +768,41 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
           _sheetScrollController?.addListener(_logScrollListener);
         }
 
-        return Container(
-          decoration: BoxDecoration(
-            color: Colors.white,
-            borderRadius: const BorderRadius.only(
-              topLeft: Radius.circular(16.0),
-              topRight: Radius.circular(16.0),
-            ),
-            border: const Border(
-              top: BorderSide(color: Color(0xFFE2E8F0), width: 1),
-            ),
-            boxShadow: [
-              BoxShadow(
-                blurRadius: 16.0,
-                color: Colors.black.withAlpha(20),
-                offset: const Offset(0, -4),
+        // Outer layer keeps shadow (unclipped); ClipRRect restores top
+        // rounded corners so opaque log content cannot square them off.
+        const panelRadius = BorderRadius.only(
+          topLeft: Radius.circular(16.0),
+          topRight: Radius.circular(16.0),
+        );
+        return Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: _kContentMaxWidth),
+            child: Container(
+              width: double.infinity,
+              decoration: BoxDecoration(
+                borderRadius: panelRadius,
+                boxShadow: [
+                  BoxShadow(
+                    blurRadius: 16.0,
+                    color: Colors.black.withAlpha(20),
+                    offset: const Offset(0, -4),
+                  ),
+                ],
               ),
-            ],
+              child: ClipRRect(
+                borderRadius: panelRadius,
+                child: Container(
+                  decoration: const BoxDecoration(
+                    color: Colors.white,
+                    border: Border(
+                      top: BorderSide(color: Color(0xFFE2E8F0), width: 1),
+                    ),
+                  ),
+                  child: _buildLogPanel(scrollController),
+                ),
+              ),
+            ),
           ),
-          child: _buildLogPanel(scrollController),
         );
       },
     );
