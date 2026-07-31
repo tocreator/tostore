@@ -33,6 +33,7 @@ class KeyManager {
   Future<void>? _keyMigrationFuture;
   KeyChangeInfo? _deferredKeyChangeInfo;
   DateTime? _lastHistoryPurgeDay;
+  DateTime? _lastPauseCompletedAt;
 
   /// Low-frequency watch for WAL / page-redo / txn natural turnover.
   /// Registered only while rewrite is done and those domains remain open.
@@ -615,10 +616,23 @@ class KeyManager {
   ///
   /// Stops the natural-turnover crontab watch. Callers that keep the session
   /// should later run [startDeferredKeyMigrationWork], which re-arms the watch.
+  ///
+  /// [skipIfRecentlyPaused]: when true and a pause completed within 2s with no
+  /// active runner (e.g. switchSpace then close), skip the second 30s poll wait.
   Future<bool> pauseKeyMigration({
     Duration timeout = const Duration(seconds: 120),
+    bool skipIfRecentlyPaused = false,
   }) async {
     if (_dataStore.isMigrationInstance) {
+      return true;
+    }
+
+    if (skipIfRecentlyPaused &&
+        _lastPauseCompletedAt != null &&
+        _keyMigrationFuture == null &&
+        DateTime.now().difference(_lastPauseCompletedAt!) <
+            const Duration(seconds: 2)) {
+      _stopNaturalTurnoverWatch();
       return true;
     }
 
@@ -629,10 +643,14 @@ class KeyManager {
 
     KeyMigrationRunner.requestPause();
     final future = _keyMigrationFuture;
-    if (future == null) return true;
+    if (future == null) {
+      _lastPauseCompletedAt = DateTime.now();
+      return true;
+    }
 
     try {
       await future.timeout(timeout);
+      _lastPauseCompletedAt = DateTime.now();
       return true;
     } on TimeoutException {
       Logger.warn(
@@ -649,6 +667,7 @@ class KeyManager {
       }));
       return false;
     } catch (_) {
+      _lastPauseCompletedAt = DateTime.now();
       return true;
     }
   }
