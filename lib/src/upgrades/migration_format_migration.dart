@@ -30,8 +30,6 @@ import '../model/result_type.dart';
 /// - Partial TOBF left by a failed verify is deleted before rethrow so the
 ///   next run always prefers residual JSON.
 ///
-/// Legacy JSON parsing lives only here (and v1→v2 shaping in [MigrationMeta.fromJson])
-/// so runtime [MigrationManager] stays free of JSON paths.
 ///
 /// **Call site**: blocking [V3Upgrade] only (before version bump), after
 /// [KeyManager.initialize] and [MetaFormatMigration].
@@ -414,7 +412,7 @@ final class MigrationFormatMigration {
       if (content == null || content.isEmpty) return null;
       final decoded = jsonDecode(content);
       if (decoded is! Map) return null;
-      return MigrationMeta.fromJson(Map<String, dynamic>.from(decoded));
+      return MigrationMeta.fromJsonLegacy(Map<String, dynamic>.from(decoded));
     } catch (e) {
       Logger.warn(
         'MigrationFormatMigration: failed to parse migration_meta.json',
