@@ -2,100 +2,46 @@ import '../core/data_store_impl.dart';
 import '../handler/common.dart';
 import '../handler/global_config_codec.dart';
 import '../handler/logger.dart';
-import '../handler/space_config_codec.dart';
+import '../model/data_store_config.dart';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
 import 'legacy_model/pre_v3.dart';
 
-/// Finalize GlobalConfig / SpaceConfig TOBF files and delete legacy JSON.
+/// Finalize GlobalConfig TOBF and delete legacy space/global JSON.
 ///
 /// **Only** call from [V3Upgrade] after `tableDirectoryMap` /
 /// `directoryUsageMap` have been fully consumed. Premature JSON deletion
-/// (or early TOBF rewrite that drops those fields) causes irreversible
-/// table-directory loss on 3.1.2 databases.
+/// causes irreversible table-directory loss on 3.1.2 databases.
+///
+/// Space aggregate stats live in InternalKv (`stats.space.v1`) after init.
+/// Legacy `space_config.json` is deleted here once directory maps are consumed;
+/// its counters are not migrated (incremental stats / explicit reconcile).
 final class ConfigFormatMigration {
   ConfigFormatMigration._();
 
-  /// Write current space configs as TOBF, verify readable, then delete space
-  /// JSON and replace global JSON with a downgrade-guard stub.
+  /// Verify GlobalConfig TOBF, delete space JSON, write downgrade-guard stub.
   ///
-  /// Never deletes/replaces a legacy JSON file unless the matching `*.tobf`
-  /// exists and decodes successfully — prevents silent key/map loss on write
-  /// failure.
+  /// Never deletes/replaces a legacy JSON file unless GlobalConfig TOBF
+  /// exists and decodes successfully.
   static Future<void> finalizeTobfAndDeleteJson(
     DataStoreImpl dataStore, {
     required Iterable<String> spaceNames,
   }) async {
+    final globalTobf = dataStore.pathManager.getGlobalConfigPath();
+    await _verifyGlobalTobf(dataStore, globalTobf);
+
     for (final spaceName in spaceNames) {
-      final config = await dataStore.getSpaceConfig(spaceName: spaceName);
-      if (config == null) {
-        // Do not delete JSON when we could not load a domain model to rewrite.
-        Logger.warn(
-          'ConfigFormatMigration: skip space [$spaceName] — no readable config',
-        );
-        continue;
-      }
-
-      await dataStore.saveSpaceConfigToFile(
-        config,
-        spaceName: spaceName,
-        propagateErrors: true,
-      );
-
-      final tobfPath =
-          dataStore.pathManager.getSpaceConfigPath(spaceName: spaceName);
-      await _verifySpaceTobf(dataStore, tobfPath);
       await LegacyConfigBootstrap.deleteSpaceJson(
         dataStore,
         spaceName: spaceName,
       );
     }
 
-    final globalTobf = dataStore.pathManager.getGlobalConfigPath();
-    await _verifyGlobalTobf(dataStore, globalTobf);
     await LegacyConfigBootstrap.writeDowngradeGuardJson(
       dataStore,
       version: InternalConfig.engineVersion,
     );
-  }
-
-  static Future<void> _verifySpaceTobf(
-    DataStoreImpl dataStore,
-    String tobfPath,
-  ) async {
-    if (!await dataStore.storage.existsFile(tobfPath)) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message:
-              'ConfigFormatMigration: space TOBF missing after write: $tobfPath',
-        )
-      ]);
-    }
-    final bytes = await dataStore.storage.readAsBytes(tobfPath);
-    if (bytes.isEmpty) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message:
-              'ConfigFormatMigration: space TOBF empty after write: $tobfPath',
-        )
-      ]);
-    }
-    try {
-      SpaceConfigCodec.decodeFile(bytes);
-    } catch (e) {
-      Logger.error('ConfigFormatMigration: space TOBF decode failed',
-          rawError: e);
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message:
-              'ConfigFormatMigration: space TOBF unreadable after write: $tobfPath',
-        )
-      ]);
-    }
   }
 
   static Future<void> _verifyGlobalTobf(
@@ -122,7 +68,12 @@ final class ConfigFormatMigration {
       ]);
     }
     try {
-      GlobalConfigCodec.decodeFile(bytes);
+      GlobalConfigCodec.decodeFile(
+        bytes,
+        encryptionKey:
+            dataStore.config.encryptionConfig?.resolveEncryptionKey() ??
+                defaultEncryptionKey,
+      );
     } catch (e) {
       Logger.error('ConfigFormatMigration: global TOBF decode failed',
           rawError: e);
