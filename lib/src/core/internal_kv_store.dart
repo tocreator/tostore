@@ -26,7 +26,6 @@ class InternalKvStore {
   InternalKvStore(this._db);
 
   Future<TableContext> _table({required bool isGlobal}) async {
-    await _db.ensureInitialized();
     final tableName = SystemTable.getInternalKeyValueName(isGlobal);
     return _db.getTableContext(tableName);
   }
@@ -34,10 +33,15 @@ class InternalKvStore {
   /// Point-get by primary key. Returns `null` when the key is absent.
   Future<Uint8List?> get(String key, {bool isGlobal = false}) async {
     _validateKey(key);
-    final table = await _table(isGlobal: isGlobal);
-    final row = await _db.queryById(table, key);
-    if (row == null) return null;
-    return _asBytes(row[SystemTable.keyValueValueField]);
+    try {
+      if (_db.tableMetaManager == null) return null;
+      final table = await _table(isGlobal: isGlobal);
+      final row = await _db.queryById(table, key);
+      if (row == null) return null;
+      return _asBytes(row[SystemTable.keyValueValueField]);
+    } on DbClosedException {
+      return null;
+    }
   }
 
   /// Upsert a blob value for [key] (primary-key conflict overwrites).
@@ -49,19 +53,24 @@ class InternalKvStore {
     bool isGlobal = false,
   }) async {
     _validateKey(key);
+    if (_db.tableMetaManager == null) {
+      throw DbClosedException();
+    }
     final tableName = SystemTable.getInternalKeyValueName(isGlobal);
-    await _db.ensureInitialized();
+    try {
+      final row = <String, dynamic>{
+        SystemTable.keyValueKeyField: key,
+        SystemTable.keyValueValueField: value,
+        SystemTable.keyValueUpdatedAtField: DateTime.now().toIso8601String(),
+      };
 
-    final row = <String, dynamic>{
-      SystemTable.keyValueKeyField: key,
-      SystemTable.keyValueValueField: value,
-      SystemTable.keyValueUpdatedAtField: DateTime.now().toIso8601String(),
-    };
-
-    final result = await TransactionContext.runAsSystemOperation(() async {
-      return await _db.upsert(tableName, row);
-    });
-    _throwIfFailed(result);
+      final result = await TransactionContext.runAsSystemOperation(() async {
+        return await _db.upsert(tableName, row);
+      });
+      _throwIfFailed(result);
+    } on DbClosedException {
+      return;
+    }
   }
 
   /// Delete by primary key. Internally uses [DataStoreImpl.deleteInternal].
@@ -71,6 +80,7 @@ class InternalKvStore {
   Future<void> remove(String key, {bool isGlobal = false}) async {
     if (key.isEmpty) return;
     try {
+      if (_db.tableMetaManager == null) return;
       final table = await _table(isGlobal: isGlobal);
       final condition = QueryCondition()
         ..where(SystemTable.keyValueKeyField, '=', key);
@@ -78,8 +88,6 @@ class InternalKvStore {
       final result = await TransactionContext.runAsSystemOperation(() async {
         return await _db.deleteInternal(table, condition);
       });
-      // deleteInternal already returns success when no row matches; only
-      // surface real write failures via log.
       if (result.hasErrors) {
         Logger.warn(
           'Internal KV remove failed for key "$key" '
