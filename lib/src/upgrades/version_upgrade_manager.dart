@@ -7,7 +7,7 @@ import '../model/result_type.dart';
 import 'v2_upgrade.dart';
 import 'v3_upgrade.dart';
 
-/// Manage database major version upgrades (GlobalConfig/SpaceConfig/table data).
+/// Manage database major version upgrades (GlobalConfig / table data).
 /// Each major upgrade should be implemented in separate files under upgrades/
 /// to avoid polluting business logic and keep upgrade logic organized.
 class VersionUpgradeManager {
