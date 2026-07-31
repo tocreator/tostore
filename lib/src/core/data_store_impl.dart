@@ -107,6 +107,10 @@ class DataStoreImpl {
   Completer<void> _initCompleter = Completer<void>();
   bool _isInitialized = false;
   bool _initializing = false;
+
+  /// Set at the start of [close]; cleared when [initialize] begins.
+  /// Used by best-effort paths (SpaceStats) to skip InternalKv during teardown.
+  bool _closing = false;
   StartupProgressCallback? _startupProgressCallback;
   final String _instanceKey;
   final Future<void> Function(DataStoreImpl db)? _onConfigure;
@@ -134,6 +138,13 @@ class DataStoreImpl {
   /// Internal recovery (schema migration, WAL-adjacent work) may run while this
   /// is true and [isInitialized] is still false. [close] clears both flags.
   bool get isBaseInitialized => _baseInitialized;
+
+  /// True from [close] entry until the next [initialize] starts.
+  ///
+  /// Best-effort modules (SpaceStats) must not touch InternalKv while this is
+  /// true. Durable InternalKv writers should finish before close or during the
+  /// ordered close flush while managers are still alive.
+  bool get isClosing => _closing;
 
   final bool isMigrationInstance;
 
@@ -544,6 +555,9 @@ class DataStoreImpl {
   /// For internal/system operations during initialization, this method allows
   /// operations to proceed if base initialization is complete and we're still initializing.
   /// External user operations must wait for full initialization to complete.
+  ///
+  /// After [close] resets [_initCompleter] with nothing initializing, waiting
+  /// would hang forever — throw [DbClosedException] instead.
   Future<void> ensureInitialized() async {
     // Check if this is a system/internal operation (e.g., updating system tables during table creation)
     final isSystemOp = TransactionContext.isSystemOperation();
@@ -560,9 +574,18 @@ class DataStoreImpl {
       return;
     }
 
-    // For all other operations (external user operations or operations after initialization),
-    // wait for full initialization to complete
-    if (!_isInitialized && !_initCompleter.isCompleted) {
+    if (_isInitialized) return;
+
+    // Close finished (or not yet opened): Completer is incomplete and nobody
+    // is running initialize — never park on that future.
+    if (!_initializing && !_initCompleter.isCompleted) {
+      throw DbClosedException();
+    }
+
+    // Mid-close: flags cleared but previous Completer still completed — do not
+    // await; callers in the close flush window proceed (managers may still
+    // exist). Late work after Completer reset hits the branch above.
+    if (!_initCompleter.isCompleted) {
       await _initCompleter.future;
     }
   }
@@ -628,6 +651,7 @@ class DataStoreImpl {
     }
 
     _initializing = true;
+    _closing = false;
     _startupProgressCallback?.call(0.0, DbStartupStage.opening);
     try {
       if (_config != null && (reinitialize || _isInitialized)) {
@@ -637,6 +661,10 @@ class DataStoreImpl {
             persistChanges: !noPersistOnClose,
             closeStorage: true,
             removeRegistry: false);
+        // close() clears _initializing and resets _initCompleter; restore so
+        // mid-init system ops do not hit DbClosedException from ensureInitialized.
+        _initializing = true;
+        _closing = false;
       }
       _globalQueryCancelToken = CancellationToken();
       // Ensure this instance is re-registered after successful initialization
@@ -1086,6 +1114,11 @@ class DataStoreImpl {
   }) async {
     if (!_isInitialized && !_baseInitialized) return;
 
+    // Mark closing before clearing init flags so SpaceStats skips InternalKv
+    // while journal flush / teardown still runs.
+    _closing = true;
+    _tableDataManager?.suppressSpaceStatsKvPersistence();
+
     // Immediately mark as uninitialized to block new operations
     _isInitialized = false;
     _baseInitialized = false;
@@ -1104,7 +1137,10 @@ class DataStoreImpl {
         // Do NOT call CrontabManager.dispose() here: it clears ALL DBs' callbacks
         // and strips the shared LockManager timeout safety-net (reused on
         // switchSpace). Each manager removes its own callbacks in dispose().
-        final keyPaused = await _keyManager?.pauseKeyMigration() ?? true;
+        final keyPaused = await _keyManager?.pauseKeyMigration(
+              skipIfRecentlyPaused: true,
+            ) ??
+            true;
         if (!keyPaused) {
           Logger.warn(
             'Key migration did not pause before close; continuing shutdown, '
@@ -1169,6 +1205,18 @@ class DataStoreImpl {
           // Persist and dispose data managers via CacheManager
           await cacheManager.dispose();
 
+          // Clear activeSpace while storage is still open (before close below).
+          if (!keepActiveSpace) {
+            try {
+              final globalConfig = await getGlobalConfig();
+              if (globalConfig != null && globalConfig.activeSpace != null) {
+                await saveGlobalConfig(globalConfig.clearActiveSpace());
+              }
+            } catch (e) {
+              Logger.error('Clear activeSpace on close failed', rawError: e);
+            }
+          }
+
           // Final storage flush and close
           try {
             await storage.flushAll(closeHandles: true);
@@ -1187,18 +1235,6 @@ class DataStoreImpl {
           }
         }
       });
-
-      // Clear active space if requested
-      if (!keepActiveSpace) {
-        try {
-          final globalConfig = await getGlobalConfig();
-          if (globalConfig != null && globalConfig.activeSpace != null) {
-            await saveGlobalConfig(globalConfig.clearActiveSpace());
-          }
-        } catch (e) {
-          Logger.error('Clear activeSpace on close failed', rawError: e);
-        }
-      }
 
       // Cleanup remaining non-storage managers and stop background tasks
       readViewManager.dispose();
