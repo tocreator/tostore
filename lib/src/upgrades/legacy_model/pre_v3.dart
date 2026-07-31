@@ -4,10 +4,10 @@ import '../../core/data_store_impl.dart';
 import '../../handler/common.dart';
 import '../../handler/logger.dart';
 import '../../handler/weight_snapshot_codec.dart';
+import '../../model/applied_encryption.dart';
 import '../../model/backup_metadata.dart';
 import '../../model/backup_scope.dart';
 import '../../model/global_config.dart';
-import '../../model/space_config.dart';
 import '../../model/table_identity.dart';
 import '../../model/transaction_models.dart';
 import '../../model/weight_data.dart';
@@ -63,18 +63,6 @@ final class LegacyConfigBootstrap {
     if (!await dataStore.storage.existsFile(jsonPath)) return null;
     final content = await dataStore.storage.readAsString(jsonPath);
     return LegacyGlobalConfigJson.tryParse(content ?? '');
-  }
-
-  static Future<SpaceConfig?> readSpaceConfig(
-    DataStoreImpl dataStore, {
-    required String spaceName,
-  }) async {
-    final root = dataStore.instancePath;
-    if (root == null) return null;
-    final jsonPath = LegacyConfigPaths.spaceJson(root, spaceName);
-    if (!await dataStore.storage.existsFile(jsonPath)) return null;
-    final content = await dataStore.storage.readAsString(jsonPath);
-    return LegacySpaceConfigJson.tryParse(content ?? '');
   }
 
   /// Raw JSON map (preserves `tableDirectoryMap` / `directoryUsageMap`).
@@ -238,16 +226,6 @@ final class LegacyGlobalConfigJson {
 final class LegacySpaceConfigJson {
   LegacySpaceConfigJson._();
 
-  static SpaceConfig? tryParse(String content) {
-    final map = tryParseMap(content);
-    if (map == null) return null;
-    try {
-      return fromMap(map);
-    } catch (_) {
-      return null;
-    }
-  }
-
   /// Raw map so V3 can read `tableDirectoryMap` (dropped from the live model).
   static Map<String, dynamic>? tryParseMap(String content) {
     if (content.isEmpty) return null;
@@ -260,34 +238,27 @@ final class LegacySpaceConfigJson {
     }
   }
 
-  static SpaceConfig fromMap(Map<String, dynamic> json) {
-    final history = <EncryptionKeyInfo>[];
-    if (json['historyKeys'] != null) {
-      for (final e in json['historyKeys'] as List<dynamic>) {
-        history.add(EncryptionKeyInfo.fromJson(e as Map<String, dynamic>));
+  /// Extract legacy wrapped encoding-key entries from space_config JSON.
+  static List<EncryptionKeyInfo> extractKeyInfos(Map<String, dynamic> json) {
+    final keys = <EncryptionKeyInfo>[];
+    void add(Map<String, dynamic>? info) {
+      if (info == null) return;
+      final parsed = EncryptionKeyInfo.fromJson(info);
+      if (parsed.key.isEmpty) return;
+      if (keys.any((k) => k.keyId == parsed.keyId)) return;
+      keys.add(parsed);
+    }
+
+    add(json['current'] as Map<String, dynamic>?);
+    add(json['previous'] as Map<String, dynamic>?);
+    if (json['historyKeys'] is List) {
+      for (final e in json['historyKeys'] as List) {
+        if (e is Map) {
+          add(Map<String, dynamic>.from(e));
+        }
       }
     }
-    // Fold legacy `previous` into history (live model has current + history only).
-    if (json['previous'] != null) {
-      final prev =
-          EncryptionKeyInfo.fromJson(json['previous'] as Map<String, dynamic>);
-      if (prev.key.isNotEmpty && !history.any((k) => k.keyId == prev.keyId)) {
-        history.add(prev);
-      }
-    }
-    return SpaceConfig(
-      current:
-          EncryptionKeyInfo.fromJson(json['current'] as Map<String, dynamic>),
-      historyKeys: history,
-      version: resolveVersionValue(
-          json['version'], InternalConfig.legacyEngineVersion),
-      totalTableCount: json['totalTableCount'] as int? ?? 0,
-      totalRecordCount: json['totalRecordCount'] as int? ?? 0,
-      totalDataSizeBytes: json['totalDataSizeBytes'] as int? ?? 0,
-      lastStatisticsTime: json['lastStatisticsTime'] != null
-          ? DateTime.parse(json['lastStatisticsTime'] as String)
-          : null,
-    );
+    return keys;
   }
 }
 
