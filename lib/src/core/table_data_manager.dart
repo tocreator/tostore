@@ -133,8 +133,10 @@ class TableDataManager {
   bool _needSaveStats = false;
   bool _persistingSpaceStats = false;
 
+  /// Close/teardown: discard SpaceStats KV I/O (stats are best-effort).
+  bool _spaceStatsKvSuppressed = false;
+
   // Throttling state for lightweight meta persistence
-  DateTime _lastStatsPersistTime = DateTime.fromMillisecondsSinceEpoch(0);
   DateTime _lastMaxIdFlushTime = DateTime.fromMillisecondsSinceEpoch(0);
 
   // --- End: Intelligent Polling Methods ---
@@ -192,6 +194,16 @@ class TableDataManager {
     // Initialize auto-increment ID generator and set periodic check task
     CrontabManager.addCallback(
         ExecuteInterval.seconds3, TimeBasedIdGenerator.periodicPoolCheck);
+    // SpaceStats → InternalKv off the journal/close hot path (best-effort).
+    CrontabManager.addCallback(
+        ExecuteInterval.seconds30, _onSpaceStatsPersistTick);
+  }
+
+  void _onSpaceStatsPersistTick() {
+    if (!_needSaveStats || !_canPersistSpaceStatsKv) return;
+    unawaited(_persistSpaceStatsToKv().catchError((Object e) {
+      Logger.warn('Periodic space stats persist failed', rawError: e);
+    }));
   }
 
   // -------------------- Table record cache APIs --------------------
@@ -523,7 +535,7 @@ class TableDataManager {
     return 64;
   }
 
-  /// Persist runtime metadata (statistics and max IDs) with throttling.
+  /// Persist runtime metadata (max IDs) with throttling.
   /// When [force] is true, persist immediately if anything is dirty.
   Future<void> persistRuntimeMetaIfNeeded({bool force = false}) async {
     // Memory mode must not persist any metadata/config to storage.
@@ -542,17 +554,6 @@ class TableDataManager {
         if (due) {
           await flushMaxIds();
           _lastMaxIdFlushTime = DateTime.now();
-        }
-      }
-
-      // Save statistics if needed
-      if (_needSaveStats) {
-        final bool due = force ||
-            now.difference(_lastStatsPersistTime).inMilliseconds >=
-                minIntervalMs;
-        if (due) {
-          await _persistSpaceStatsToKv();
-          _lastStatsPersistTime = DateTime.now();
         }
       }
     } catch (e) {
@@ -596,16 +597,35 @@ class TableDataManager {
     return _spaceStatsSnapshot();
   }
 
+  /// Whether SpaceStats may touch InternalKv (steady open only).
+  bool get _canPersistSpaceStatsKv =>
+      !_spaceStatsKvSuppressed &&
+      _dataStore.isInitialized &&
+      !_dataStore.isClosing &&
+      !_dataStore.parallelJournalManager.isInRecoveryMode;
+
+  /// Called from [DataStoreImpl.close]: drop best-effort SpaceStats KV work so
+  /// close/switchSpace never blocks on InternalKv → tableMeta.
+  void suppressSpaceStatsKvPersistence() {
+    _spaceStatsKvSuppressed = true;
+    _needSaveStats = false;
+    _persistingSpaceStats = false;
+    _spaceStatsHydrateFuture = null;
+  }
+
   /// Single-flight: load KV baseline once per manager lifetime.
   ///
-  /// Does **not** require [_dataStore.isInitialized]. Mid-init callers (after
-  /// system tables exist) must still see persisted totals; only the baseline
-  /// apply is one-shot so later KV reads never clobber live deltas.
+  /// Only runs while the engine is fully open — never during close/re-init.
   Future<void> ensureSpaceStatsHydrated() async {
-    if (_spaceStatsHydrated) return;
+    if (_spaceStatsHydrated || _spaceStatsKvSuppressed) return;
 
     if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
       _spaceStatsHydrated = true;
+      return;
+    }
+
+    // Steady-state only: avoid InternalKv during close / before ready.
+    if (!_dataStore.isInitialized || _dataStore.isClosing) {
       return;
     }
 
@@ -615,14 +635,17 @@ class TableDataManager {
 
   Future<void> _hydrateSpaceStatsFromKv() async {
     try {
-      // System zone: InternalKv.ensureInitialized allows progress while
-      // `_initializing` (otherwise awaiting initCompleter can deadlock).
+      if (!_canPersistSpaceStatsKv) {
+        _spaceStatsHydrateFuture = null;
+        return;
+      }
       final bytes = await TransactionContext.runAsSystemOperation(() async {
         return await _dataStore.internalKv.get(
           SpaceStats.kvKey,
           isGlobal: false,
         );
       });
+      if (_spaceStatsKvSuppressed) return;
       if (!_spaceStatsHydrated) {
         final stats =
             bytes == null ? SpaceStats.empty : SpaceStatsCodec.decode(bytes);
@@ -632,12 +655,12 @@ class TableDataManager {
         _lastStatisticsTime = stats.lastStatisticsTime;
         _spaceStatsHydrated = true;
       }
+    } on DbClosedException {
+      _spaceStatsHydrateFuture = null;
     } catch (e) {
       Logger.warn('Failed to hydrate space stats from InternalKv', rawError: e);
-      // Allow retry until a successful apply. Only fail-open permanently after
-      // the engine is fully up (system tables should exist by then).
       _spaceStatsHydrateFuture = null;
-      if (_dataStore.isInitialized) {
+      if (_dataStore.isInitialized && !_dataStore.isClosing) {
         _spaceStatsHydrated = true;
       }
     }
@@ -729,6 +752,9 @@ class TableDataManager {
   }
 
   Future<void> _persistSpaceStatsToKv() async {
+    if (!_canPersistSpaceStatsKv) {
+      return;
+    }
     if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
       _needSaveStats = false;
       return;
@@ -737,9 +763,9 @@ class TableDataManager {
     _persistingSpaceStats = true;
     try {
       await ensureSpaceStatsHydrated();
+      if (!_canPersistSpaceStatsKv) return;
       _lastStatisticsTime = DateTime.now();
       final snapshot = _spaceStatsSnapshot();
-      // System zone so InternalKv.set can run before `_isInitialized`.
       await TransactionContext.runAsSystemOperation(() async {
         await _dataStore.internalKv.set(
           SpaceStats.kvKey,
@@ -749,6 +775,8 @@ class TableDataManager {
       });
       _foldSpaceStatsDeltaIntoBaseline();
       _needSaveStats = false;
+    } on DbClosedException {
+      // Shutdown race — stats are best-effort.
     } catch (e) {
       Logger.error('Failed to save space stats', rawError: e);
     } finally {
@@ -893,10 +921,14 @@ class TableDataManager {
   Future<void> dispose({bool persistChanges = true}) async {
     CrontabManager.removeCallback(
         ExecuteInterval.seconds3, TimeBasedIdGenerator.periodicPoolCheck);
+    CrontabManager.removeCallback(
+        ExecuteInterval.seconds30, _onSpaceStatsPersistTick);
 
     try {
       if (persistChanges) {
-        // Persist runtime metadata (max IDs, statistics) one last time.
+        // Persist runtime metadata (max IDs) one last time.
+        // SpaceStats intentionally skipped — close/switchSpace must not block
+        // on InternalKv; periodic tick / recalculate covers durability.
         await persistRuntimeMetaIfNeeded(force: true);
 
         // Save ID range information for all tables
@@ -1378,13 +1410,14 @@ class TableDataManager {
             // Memory mode: Removal from primary cache
             removeTableRecord(table, recordId);
 
-            if (_contributesToSpaceStats(table)) {
-              final current = _tableRecordCounts[table.tableUid] ?? 0;
-              if (current > 0) {
-                _tableRecordCounts[table.tableUid] = current - 1;
-                _deltaRecordCount--;
-                _needSaveStats = true;
-              }
+            // Per-table count cache applies to all tables (incl. system KV).
+            final current = _tableRecordCounts[table.tableUid] ?? 0;
+            if (current > 0) {
+              _tableRecordCounts[table.tableUid] = current - 1;
+            }
+            if (_contributesToSpaceStats(table) && current > 0) {
+              _deltaRecordCount--;
+              _needSaveStats = true;
             }
 
             // Memory mode: Index erasure (newData is null)
@@ -1394,12 +1427,13 @@ class TableDataManager {
                   overrideSchema: schema, force: true);
             }
           } else {
-            if (operation == BufferOperationType.insert &&
-                _contributesToSpaceStats(table)) {
+            if (operation == BufferOperationType.insert) {
               _tableRecordCounts[table.tableUid] =
                   (_tableRecordCounts[table.tableUid] ?? 0) + 1;
-              _deltaRecordCount++;
-              _needSaveStats = true;
+              if (_contributesToSpaceStats(table)) {
+                _deltaRecordCount++;
+                _needSaveStats = true;
+              }
             }
             // Memory mode: Update primary cache
             cacheTableRecord(table, recordId, r, schema, force: true);
@@ -1548,25 +1582,31 @@ class TableDataManager {
     return (successRecordIds: successIds, failedRecordIds: failedIds);
   }
 
-  /// Update the record count cache based on the operation.
+  /// Update the per-table record count cache based on the operation.
+  ///
+  /// Always maintains [_tableRecordCounts] (used by [getTableRecordCount] /
+  /// `db.kv.count()`), including system tables. SpaceStats deltas only apply
+  /// to user tables via [_contributesToSpaceStats].
   Future<void> updateTableRecordCount(
       TableContext table, BufferOperationType op) async {
-    if (!_contributesToSpaceStats(table)) return;
-
     // Ensure loaded first so we start from a valid base
     await _ensureRecordCountLoaded(table);
 
     if (op == BufferOperationType.insert) {
       _tableRecordCounts[table.tableUid] =
           (_tableRecordCounts[table.tableUid] ?? 0) + 1;
-      _deltaRecordCount++;
-      _needSaveStats = true;
+      if (_contributesToSpaceStats(table)) {
+        _deltaRecordCount++;
+        _needSaveStats = true;
+      }
     } else if (op == BufferOperationType.delete) {
       final current = _tableRecordCounts[table.tableUid] ?? 0;
       if (current > 0) {
         _tableRecordCounts[table.tableUid] = current - 1;
-        _deltaRecordCount--;
-        _needSaveStats = true;
+        if (_contributesToSpaceStats(table)) {
+          _deltaRecordCount--;
+          _needSaveStats = true;
+        }
       }
     }
   }
@@ -1580,8 +1620,6 @@ class TableDataManager {
     int insertDelta = 0,
     int deleteDelta = 0,
   }) async {
-    if (!_contributesToSpaceStats(table)) return;
-
     final int delta = insertDelta - deleteDelta;
     if (delta == 0) return;
 
@@ -1589,8 +1627,10 @@ class TableDataManager {
 
     final current = _tableRecordCounts[table.tableUid] ?? 0;
     _tableRecordCounts[table.tableUid] = max(0, current + delta);
-    _deltaRecordCount += delta;
-    _needSaveStats = true;
+    if (_contributesToSpaceStats(table)) {
+      _deltaRecordCount += delta;
+      _needSaveStats = true;
+    }
   }
 
   Future<List<Map<String, dynamic>>> _prepareDeleteBufferRecords({
@@ -2786,6 +2826,9 @@ class TableDataManager {
                 'Failed to update stats during clearTable for ${table.tableName}',
                 rawError: e);
           }
+
+          // Always zero per-table count cache (system KV included).
+          _tableRecordCounts[table.tableUid] = 0;
 
           await _dataStore.writeBufferManager.clearTable(table);
 
