@@ -32,6 +32,7 @@ import 'write_buffer_manager.dart';
 import 'yield_controller.dart';
 import '../model/table_identity.dart';
 import '../model/system_table.dart';
+import '../model/space_stats.dart';
 
 class ParallelJournalManager {
   final DataStoreImpl _dataStore;
@@ -166,18 +167,26 @@ class ParallelJournalManager {
     // recovery pump cannot interleave with unrelated WAL-replayed queue entries.
     List<_WalRange>? excludeRanges;
     List<Future<void> Function()> recoveryFlushTasks = const [];
-    if (_walManager.hasPendingParallelBatches) {
-      final reconciled = await _reconcileWithParallelJournal();
-      excludeRanges = reconciled.excludeRanges;
-      recoveryFlushTasks = reconciled.flushTasks;
-    }
-    // Then recover remaining WAL entries into in-memory buffer/queue
-    await _recoverFromWal(excludeRanges: excludeRanges);
+    try {
+      if (_walManager.hasPendingParallelBatches) {
+        final reconciled = await _reconcileWithParallelJournal();
+        excludeRanges = reconciled.excludeRanges;
+        recoveryFlushTasks = reconciled.flushTasks;
+      }
+      // Then recover remaining WAL entries into in-memory buffer/queue
+      await _recoverFromWal(excludeRanges: excludeRanges);
 
-    if (recoveryFlushTasks.isNotEmpty) {
-      _executeRecoveryFlushChain(recoveryFlushTasks);
-    } else if (_isRecovering) {
-      _isRecovering = false;
+      if (recoveryFlushTasks.isNotEmpty) {
+        _executeRecoveryFlushChain(recoveryFlushTasks);
+      } else if (_isRecovering) {
+        _isRecovering = false;
+      }
+    } catch (e) {
+      // Never leave [_isRecovering] stuck if chain was not started.
+      if (_isRecovering && recoveryFlushTasks.isEmpty) {
+        _isRecovering = false;
+      }
+      rethrow;
     }
 
     if (!_dataStore.config.enableJournal) {
@@ -342,6 +351,9 @@ class ParallelJournalManager {
   void scheduleFlushIfNeeded() {
     if (!_running) return;
     if (_flushInProgress) return;
+    // Recovery owns the pump; scheduling a normal flush only sets
+    // _flushInProgress and immediately no-ops inside _pumpFlush.
+    if (_isRecovering) return;
 
     final hasNormalData = !_bufferManager.isEmpty;
     final hasBackgroundWriteData = !_dataStore.backgroundWriteScheduler.isEmpty;
@@ -541,11 +553,17 @@ class ParallelJournalManager {
           break;
         }
 
-        final bgSuffix = backgroundRecordsCount > 0
-            ? " and $backgroundRecordsCount background write items"
-            : "";
-        Logger.debug(
-            "Executing batch with ${batch.length} normal items$bgSuffix");
+        // Mute trailing SpaceStats KV singleton only: length short-circuit then
+        // O(1) recordId == const key (InternalKv pk). No extra state.
+        final quietSpaceStatsLog =
+            batch.length == 1 && batch.first.recordId == SpaceStats.kvKey;
+        if (!quietSpaceStatsLog) {
+          final bgSuffix = backgroundRecordsCount > 0
+              ? " and $backgroundRecordsCount background write items"
+              : "";
+          Logger.debug(
+              "Executing batch with ${batch.length} normal items$bgSuffix");
+        }
 
         firstIteration = false;
         // Compute WAL pointer range from normal buffer entries only.
@@ -1171,11 +1189,13 @@ class ParallelJournalManager {
             _throttleDelayPerRecordUs = 0;
           }
 
-          final now = DateTime.now();
-          final at =
-              '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}.${now.millisecond.toString().padLeft(3, '0')}';
-          Logger.debug(
-              'Batch flush completed: items=${batch.length}, tables=${grouped.length}, records=$totalBatchUniqueRecords, remaining=${_bufferManager.queueLength}, cost=${batchSw.elapsedMilliseconds}ms, at: $at');
+          if (!quietSpaceStatsLog) {
+            final now = DateTime.now();
+            final at =
+                '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}.${now.millisecond.toString().padLeft(3, '0')}';
+            Logger.debug(
+                'Batch flush completed: items=${batch.length}, tables=${grouped.length}, records=$totalBatchUniqueRecords, remaining=${_bufferManager.queueLength}, cost=${batchSw.elapsedMilliseconds}ms, at: $at');
+          }
 
           // Trigger resource check after significant data writes
           if (batch.length >= (_dataStore.config.writeBatchSize * 0.8)) {
