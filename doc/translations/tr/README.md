@@ -338,6 +338,16 @@ Uygulama kodunda yinelenen mantıktan kaçınarak ortak doğrulama kurallarını
 
 Ayrıca `unique: true` otomatik olarak tek alanlı benzersiz bir dizin oluşturur. `createIndex: true` ve yabancı anahtarlar otomatik olarak tek alanlı normal dizinler oluşturur. Bileşik dizinlere, adlandırılmış dizinlere veya vektör dizinlere ihtiyaç duyduğunuzda `indexes` kullanın.
 
+### <a id="schema-evolution"></a>Şema gelişimi (Schema Evolution)
+
+Motor yapısal değişiklikleri (tablo/alan ekleme, silme veya yeniden adlandırma, öznitelik güncellemeleri, dizin değişiklikleri vb.) otomatik algılar ve veri geçişini tamamlar — manuel sürüm yönetimi veya geçiş betikleri gerekmez. Bildirimsel `schemas`, `ToStore.open()` sırasında evrilir; çalışma zamanında `updateSchema` da kullanılabilir — **iş mantığına şeffaf**, okuma/yazma kesintisizdir.
+
+#### <a id="promote-primary-key"></a>Benzersiz alanı birincil anahtara yükseltme
+
+Mevcut **benzersiz ve null olmayan** bir alanı birincil anahtara yükseltebilirsiniz (yeniden adlandırma isteğe bağlı; mevcut veriyle; işe şeffaf). **`setPrimaryKeyConfig` ile birlikte değiştirmeyin**.
+
+- **Mobil (bildirimsel `schemas`)**: `ToStore.open()` sırasında otomatik algılanır. Hedef birincil anahtar **mutlaka** `PrimaryKeyType.none` olmalıdır (değerler kaynak benzersiz alandan gelir; diğer otomatik üretim türleri desteklenmez). Adlar aynıysa ad eşleşmesi yeterlidir; yeniden adlandırmada `fromFieldId` kaynağın `fieldId` değeri olmalıdır.
+- **Sunucu (çalışma zamanı)**: `updateSchema(...).promoteFieldToPrimaryKey(sourceFieldName: ..., targetPrimaryKeyName: ...)` çağırın. `targetPrimaryKeyName` isteğe bağlıdır; verilmezse kaynak alan adı korunur.
 
 ### Bir Entegrasyon Yöntemi Seçme
 
@@ -366,11 +376,6 @@ final db = await ToStore.open(
 // Multi-space architecture - isolate data for different users
 await db.switchSpace(spaceName: 'user_123');
 ```
-
-### Şema Gelişimi
-
-`ToStore.open()` sırasında motor, `schemas`'daki tablo ve alanların eklenmesi, kaldırılması, yeniden adlandırılması veya değiştirilmesi gibi yapısal değişikliklerin yanı sıra dizin değişikliklerini de otomatik olarak algılar ve ardından gerekli geçiş çalışmasını tamamlar. Veritabanı sürüm numaralarını manuel olarak korumanıza veya geçiş komut dosyaları yazmanıza gerek yoktur.
-
 
 ### Başlangıç İlerlemesini Takip Etme
 
@@ -438,9 +443,14 @@ final result = await db.updateSchema('users')
   .removeField('deprecated_field')         // Remove field
   .addField('created_at', type: DataType.datetime)  // Add field
   .removeIndex(fields: ['age'])            // Remove index
-  .setPrimaryKeyConfig(                    // Change PK type; existing data must be empty or a warning will be issued
+  .setPrimaryKeyConfig(                    // Change auto-generated PK strategy; avoid when the table already has data
     const PrimaryKeyConfig(type: PrimaryKeyType.shortCode)
   );
+// Promote a unique field to PK (see promote-primary-key section; do not chain with the above):
+// await db.updateSchema('users').promoteFieldToPrimaryKey(
+//   sourceFieldName: 'user_id',
+//   targetPrimaryKeyName: 'uid', // optional; omit to keep the source field name
+// );
 
 // Monitor migration progress
 final taskId = result.taskId;
