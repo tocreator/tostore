@@ -338,6 +338,16 @@ const appSchemas = [userSchema];
 
 또한 `unique: true`은 단일 필드 고유 인덱스를 자동으로 생성합니다. `createIndex: true` 및 외래 키는 자동으로 단일 필드 일반 인덱스를 생성합니다. 복합 인덱스, 명명된 인덱스 또는 벡터 인덱스가 필요한 경우 `indexes`을 사용하세요.
 
+### <a id="schema-evolution"></a>스키마 진화 (Schema Evolution)
+
+엔진은 테이블 구조 변경(테이블/필드 추가·삭제·이름 변경, 속성 조정, 인덱스 변경 등)을 자동으로 감지하고 데이터 마이그레이션을 완료합니다. 수동 버전 관리나 마이그레이션 스크립트가 필요 없습니다. 선언적 `schemas`는 `ToStore.open()` 시 진화하고, 런타임에는 `updateSchema`로도 변경할 수 있습니다——**비즈니스에 투명**하며 읽기/쓰기는 중단되지 않습니다.
+
+#### <a id="promote-primary-key"></a>고유 필드를 기본 키로 승격
+
+기존 **고유·비 null** 필드를 기본 키로 승격할 수 있습니다(이름 변경 가능; 데이터가 있어도 가능; 비즈니스 투명). **`setPrimaryKeyConfig`와 동시에 변경하지 마세요**.
+
+- **모바일(선언적 `schemas`)**: `ToStore.open()` 시 자동 감지. 대상 기본 키는 반드시 `PrimaryKeyType.none`(값은 원본 고유 필드에서 가져오며, 다른 자동 생성 유형은 지원하지 않음). 이름이 같으면 이름 매칭으로 충분하고, 이름 변경 시 `fromFieldId`에 원본 필드의 `fieldId`를 지정합니다.
+- **서버(런타임)**: `updateSchema(...).promoteFieldToPrimaryKey(sourceFieldName: ..., targetPrimaryKeyName: ...)` 호출. `targetPrimaryKeyName`은 선택 사항이며, 생략하면 원본 필드명을 유지합니다.
 
 ### 통합 방법 선택
 
@@ -366,11 +376,6 @@ final db = await ToStore.open(
 // Multi-space architecture - isolate data for different users
 await db.switchSpace(spaceName: 'user_123');
 ```
-
-### 스키마 진화
-
-`ToStore.open()` 중에 엔진은 인덱스 변경은 물론 테이블과 필드 추가, 제거, 이름 바꾸기, 변경 등 `schemas`의 구조적 변경 사항을 자동으로 감지한 다음 필요한 마이그레이션 작업을 완료합니다. 데이터베이스 버전 번호를 수동으로 유지 관리하거나 마이그레이션 스크립트를 작성할 필요가 없습니다.
-
 
 ### 시작 진행 추적
 
@@ -438,9 +443,14 @@ final result = await db.updateSchema('users')
   .removeField('deprecated_field')         // Remove field
   .addField('created_at', type: DataType.datetime)  // Add field
   .removeIndex(fields: ['age'])            // Remove index
-  .setPrimaryKeyConfig(                    // Change PK type; existing data must be empty or a warning will be issued
+  .setPrimaryKeyConfig(                    // Change auto-generated PK strategy; avoid when the table already has data
     const PrimaryKeyConfig(type: PrimaryKeyType.shortCode)
   );
+// Promote a unique field to PK (see promote-primary-key section; do not chain with the above):
+// await db.updateSchema('users').promoteFieldToPrimaryKey(
+//   sourceFieldName: 'user_id',
+//   targetPrimaryKeyName: 'uid', // optional; omit to keep the source field name
+// );
 
 // Monitor migration progress
 final taskId = result.taskId;
