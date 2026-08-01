@@ -338,6 +338,16 @@ Vous pouvez écrire des règles de validation communes directement dans `FieldSc
 
 De plus, `unique: true` crée automatiquement un index unique à champ unique. `createIndex: true` et les clés étrangères créent automatiquement des index normaux à champ unique. Utilisez `indexes` lorsque vous avez besoin d'index composites, d'index nommés ou d'index vectoriels.
 
+### <a id="schema-evolution"></a>Évolution du schéma (Schema Evolution)
+
+Le moteur détecte automatiquement les changements structurels (ajout, suppression ou renommage de tables/champs, ajustements d'attributs, changements d'index, etc.) et réalise la migration des données — sans versionnage manuel ni scripts. Les `schemas` déclaratifs évoluent à `ToStore.open()` ; à l'exécution, utilisez aussi `updateSchema` — **transparent pour le métier**, lectures et écritures sans interruption.
+
+#### <a id="promote-primary-key"></a>Promouvoir un champ unique en clé primaire
+
+Vous pouvez promouvoir un champ existant **unique et non null** en clé primaire (renommage optionnel ; avec données existantes ; transparent pour le métier). **Ne combinez pas** avec `setPrimaryKeyConfig`.
+
+- **Mobile (`schemas` déclaratifs)** : Détection automatique à `ToStore.open()`. La clé primaire cible **doit** être `PrimaryKeyType.none` (valeurs issues du champ unique source ; les autres types auto-générés ne sont pas pris en charge). Si les noms correspondent, le nom suffit ; pour renommer, renseignez le `fieldId` source dans `fromFieldId`.
+- **Serveur (runtime)** : Appelez `updateSchema(...).promoteFieldToPrimaryKey(sourceFieldName: ..., targetPrimaryKeyName: ...)`. `targetPrimaryKeyName` est optionnel ; omettez-le pour conserver le nom du champ source.
 
 ### Choisir une méthode d'intégration
 
@@ -366,11 +376,6 @@ final db = await ToStore.open(
 // Multi-space architecture - isolate data for different users
 await db.switchSpace(spaceName: 'user_123');
 ```
-
-### Évolution du schéma
-
-Pendant `ToStore.open()`, le moteur détecte automatiquement les modifications structurelles dans `schemas`, telles que l'ajout, la suppression, le renommage ou la modification de tables et de champs, ainsi que les modifications d'index, puis effectue le travail de migration nécessaire. Vous n'avez pas besoin de gérer manuellement les numéros de version de la base de données ni d'écrire des scripts de migration.
-
 
 ### Suivi de la progression du démarrage
 
@@ -438,9 +443,14 @@ final result = await db.updateSchema('users')
   .removeField('deprecated_field')         // Remove field
   .addField('created_at', type: DataType.datetime)  // Add field
   .removeIndex(fields: ['age'])            // Remove index
-  .setPrimaryKeyConfig(                    // Change PK type; existing data must be empty or a warning will be issued
+  .setPrimaryKeyConfig(                    // Change auto-generated PK strategy; avoid when the table already has data
     const PrimaryKeyConfig(type: PrimaryKeyType.shortCode)
   );
+// Promote a unique field to PK (see promote-primary-key section; do not chain with the above):
+// await db.updateSchema('users').promoteFieldToPrimaryKey(
+//   sourceFieldName: 'user_id',
+//   targetPrimaryKeyName: 'uid', // optional; omit to keep the source field name
+// );
 
 // Monitor migration progress
 final taskId = result.taskId;
