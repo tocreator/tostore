@@ -339,8 +339,6 @@ const appSchemas = [userSchema];
 
   > 所有主键默认以 `text`（String）类型存储。
 
-  
-
 ### 约束与自动校验
 
 通过 `FieldSchema` 将常见的校验规则直接下沉到引擎层，避免在应用层重复实现逻辑：
@@ -356,8 +354,16 @@ const appSchemas = [userSchema];
 
 其中，`unique: true` 及会自动生成单字段唯一索引，`createIndex: true` 、外键会自动生成单字段普通索引；`indexes` 更适合定义组合索引、命名索引或向量索引。
 
+### <a id="schema-evolution"></a>表结构自动演进 (Schema Evolution)
 
+引擎自动识别表结构变动（如表/字段的增删、重命名及属性调整、索引的增删改等）并完成数据迁移，无需开发者手动维护数据库版本或编写迁移脚本。声明式 `schemas` 在 `ToStore.open()` 时演进，运行时亦可 `updateSchema` 在线变更——**业务无感知**，读写不中断。
 
+#### <a id="promote-primary-key"></a>唯一字段升级为主键
+
+可将已有**唯一且非空**字段升级为主键（可重命名；有数据亦可，业务无感知）。**勿与** `setPrimaryKeyConfig` **同时变更**。
+
+- **移动端（声明式 `schemas`）**：`ToStore.open()` 时自动识别。目标主键必须设为 `PrimaryKeyType.none`（由原唯一字段取值，不支持其它自动生成类型）；主键名与源字段相同即可按名称匹配，若需重命名则在 `fromFieldId` 填写源字段的 `fieldId`。
+- **服务端（运行时）**：调用 `updateSchema(...).promoteFieldToPrimaryKey(sourceFieldName: ..., targetPrimaryKeyName: ...)`；`targetPrimaryKeyName` 可选，省略则沿用源字段名。
 
 ### 选择接入方式
 
@@ -386,11 +392,6 @@ final db = await ToStore.open(
 // 多空间架构 - 隔离不同用户数据
 await db.switchSpace(spaceName: 'user_123');
 ```
-
-### 表结构自动演进 (Schema Evolution)
-
-在 `ToStore.open()` 阶段，引擎会自动识别 `schemas` 的结构变动（如表/字段的增删、重命名及属性调整、索引的增删改等）并完成数据迁移，无需开发者手动维护数据库版本或编写迁移脚本。
-
 
 ### 追踪启动进度
 
@@ -460,10 +461,15 @@ final result = await db.updateSchema('users')
   .removeField('deprecated_field')         // 删除字段
   .addField('created_at', type: DataType.datetime)  // 添加字段
   .removeIndex(fields: ['age'])            // 删除索引
-  .setPrimaryKeyConfig(                    // 更改主键类型，注意必须数据为空，不然会警告迁移数据
+  .setPrimaryKeyConfig(                    // 更改自动生成主键策略；表中已有数据时请避免
     const PrimaryKeyConfig(type: PrimaryKeyType.shortCode)
   );
-    
+// 服务端运行时：将唯一字段升级为主键（可重命名；勿与 setPrimaryKeyConfig 同链）：
+// await db.updateSchema('users').promoteFieldToPrimaryKey(
+//   sourceFieldName: 'user_id',
+//   targetPrimaryKeyName: 'uid', // 可选；省略则沿用源字段名
+// );
+
 // 监控迁移进度
 final taskId = result.taskId;
 if (taskId != null) {
