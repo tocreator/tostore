@@ -338,6 +338,16 @@ Você pode escrever regras de validação comuns diretamente em `FieldSchema`, e
 
 Além disso, `unique: true` cria automaticamente um índice exclusivo de campo único. `createIndex: true` e chaves estrangeiras criam automaticamente índices normais de campo único. Use `indexes` quando precisar de índices compostos, índices nomeados ou índices vetoriais.
 
+### <a id="schema-evolution"></a>Evolução do esquema (Schema Evolution)
+
+O mecanismo detecta automaticamente mudanças estruturais (adição, remoção ou renomeação de tabelas/campos, ajustes de atributos, mudanças de índices etc.) e conclui a migração de dados—sem versionamento manual nem scripts. Os `schemas` declarativos evoluem em `ToStore.open()`; em tempo de execução também use `updateSchema`—**transparente para o negócio**, sem interromper leituras nem escritas.
+
+#### <a id="promote-primary-key"></a>Promover um campo único a chave primária
+
+É possível promover um campo existente **único e não nulo** a chave primária (renomeação opcional; com dados existentes; transparente para o negócio). **Não combine** com `setPrimaryKeyConfig`.
+
+- **Mobile (`schemas` declarativos)**: Detectado automaticamente em `ToStore.open()`. A chave primária de destino **deve** ser `PrimaryKeyType.none` (valores vêm do campo único de origem; outros tipos auto-gerados não são suportados). Se o nome coincidir, basta o nome; para renomear, informe o `fieldId` de origem em `fromFieldId`.
+- **Servidor (runtime)**: Chame `updateSchema(...).promoteFieldToPrimaryKey(sourceFieldName: ..., targetPrimaryKeyName: ...)`. `targetPrimaryKeyName` é opcional; omita para manter o nome do campo de origem.
 
 ### Escolhendo um método de integração
 
@@ -366,11 +376,6 @@ final db = await ToStore.open(
 // Multi-space architecture - isolate data for different users
 await db.switchSpace(spaceName: 'user_123');
 ```
-
-### Evolução do esquema
-
-Durante `ToStore.open()`, o mecanismo detecta automaticamente alterações estruturais em `schemas`, como adicionar, remover, renomear ou alterar tabelas e campos, bem como alterações de índice, e então conclui o trabalho de migração necessário. Você não precisa manter manualmente os números de versão do banco de dados ou escrever scripts de migração.
-
 
 ### Acompanhar o Progresso de Inicialização
 
@@ -438,9 +443,14 @@ final result = await db.updateSchema('users')
   .removeField('deprecated_field')         // Remove field
   .addField('created_at', type: DataType.datetime)  // Add field
   .removeIndex(fields: ['age'])            // Remove index
-  .setPrimaryKeyConfig(                    // Change PK type; existing data must be empty or a warning will be issued
+  .setPrimaryKeyConfig(                    // Change auto-generated PK strategy; avoid when the table already has data
     const PrimaryKeyConfig(type: PrimaryKeyType.shortCode)
   );
+// Promote a unique field to PK (see promote-primary-key section; do not chain with the above):
+// await db.updateSchema('users').promoteFieldToPrimaryKey(
+//   sourceFieldName: 'user_id',
+//   targetPrimaryKeyName: 'uid', // optional; omit to keep the source field name
+// );
 
 // Monitor migration progress
 final taskId = result.taskId;
