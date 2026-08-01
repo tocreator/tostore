@@ -338,6 +338,16 @@ const appSchemas = [userSchema];
 
 Кроме того, `unique: true` автоматически создает уникальный индекс из одного поля. `createIndex: true` и внешние ключи автоматически создают нормальные индексы с одним полем. Используйте `indexes`, когда вам нужны составные индексы, именованные индексы или векторные индексы.
 
+### <a id="schema-evolution"></a>Эволюция схемы (Schema Evolution)
+
+Движок автоматически обнаруживает изменения структуры (добавление, удаление или переименование таблиц/полей, изменение атрибутов, индексов и т. д.) и выполняет миграцию данных — без ручного версионирования и скриптов. Декларативные `schemas` эволюционируют при `ToStore.open()`; во время выполнения также доступен `updateSchema` — **прозрачно для бизнеса**, чтение и запись не прерываются.
+
+#### <a id="promote-primary-key"></a>Повышение уникального поля до первичного ключа
+
+Можно повысить существующее **уникальное и не-null** поле до первичного ключа (с переименованием; при наличии данных; прозрачно для бизнеса). **Не сочетайте** с `setPrimaryKeyConfig`.
+
+- **Мобильный (декларативные `schemas`)**: Автоопределение при `ToStore.open()`. Целевой первичный ключ **должен** быть `PrimaryKeyType.none` (значения берутся из исходного уникального поля; другие автогенерируемые типы не поддерживаются). При совпадении имён достаточно имени; для переименования укажите `fieldId` исходного поля в `fromFieldId`.
+- **Сервер (runtime)**: Вызовите `updateSchema(...).promoteFieldToPrimaryKey(sourceFieldName: ..., targetPrimaryKeyName: ...)`. `targetPrimaryKeyName` необязателен; без него сохраняется имя исходного поля.
 
 ### Выбор метода интеграции
 
@@ -366,11 +376,6 @@ final db = await ToStore.open(
 // Multi-space architecture - isolate data for different users
 await db.switchSpace(spaceName: 'user_123');
 ```
-
-### Эволюция схемы
-
-Во время `ToStore.open()` механизм автоматически обнаруживает структурные изменения в `schemas`, такие как добавление, удаление, переименование или изменение таблиц и полей, а также изменения индексов, а затем выполняет необходимую работу по миграции. Вам не нужно вручную поддерживать номера версий базы данных или писать сценарии миграции.
-
 
 ### Отслеживание прогресса запуска
 
@@ -438,9 +443,14 @@ final result = await db.updateSchema('users')
   .removeField('deprecated_field')         // Remove field
   .addField('created_at', type: DataType.datetime)  // Add field
   .removeIndex(fields: ['age'])            // Remove index
-  .setPrimaryKeyConfig(                    // Change PK type; existing data must be empty or a warning will be issued
+  .setPrimaryKeyConfig(                    // Change auto-generated PK strategy; avoid when the table already has data
     const PrimaryKeyConfig(type: PrimaryKeyType.shortCode)
   );
+// Promote a unique field to PK (see promote-primary-key section; do not chain with the above):
+// await db.updateSchema('users').promoteFieldToPrimaryKey(
+//   sourceFieldName: 'user_id',
+//   targetPrimaryKeyName: 'uid', // optional; omit to keep the source field name
+// );
 
 // Monitor migration progress
 final taskId = result.taskId;
