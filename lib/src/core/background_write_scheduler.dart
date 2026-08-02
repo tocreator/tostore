@@ -260,14 +260,11 @@ class BackgroundWriteScheduler {
     }
   }
 
-  /// Clear all pending background write entries for the given [table] and optional [type].
-  ///
-  /// If [type] is null, purges entries of ALL types for the specified table.
-  Future<void> clearEntriesForTable(TableContext table,
+  /// Clear pending background write entries for [tableUid] and optional [type].
+  Future<void> clearEntriesForTableUid(TableUid tableUid,
       [BackgroundWriteType? type]) async {
     final yieldController =
         YieldController('BackgroundWriteScheduler.clearEntriesForTable');
-    final tableUid = table.tableUid;
 
     // 1. Remove from _queue maps
     final tableMap = _queue[tableUid];
