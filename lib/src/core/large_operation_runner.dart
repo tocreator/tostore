@@ -208,14 +208,15 @@ class LargeOperationRunner {
             if (await dataStore.tableExists(tempConflictTableName)) {
               final conflictTable =
                   await dataStore.getTableContext(tempConflictTableName);
-              final conflictRecords = await dataStore.executeQuery(
+              final conflictRecords = (await dataStore.queryExecutor.execute(
                 conflictTable,
-                QueryCondition.fromMap({
+                condition: QueryCondition.fromMap({
                   'primaryKey': {
                     'IN': records.map((r) => r[primaryKey].toString()).toList()
                   }
                 }),
-              );
+              ))
+                  .records;
               skipMap = {
                 for (final cr in conflictRecords)
                   cr['primaryKey'].toString(): (cr['skipFlag'] as num).toInt()
@@ -437,14 +438,15 @@ class LargeOperationRunner {
             if (await dataStore.tableExists(tempConflictTableName)) {
               final conflictTable =
                   await dataStore.getTableContext(tempConflictTableName);
-              final conflictRecords = await dataStore.executeQuery(
+              final conflictRecords = (await dataStore.queryExecutor.execute(
                 conflictTable,
-                QueryCondition.fromMap({
+                condition: QueryCondition.fromMap({
                   'primaryKey': {
                     'IN': records.map((r) => r[primaryKey].toString()).toList()
                   }
                 }),
-              );
+              ))
+                  .records;
               for (final cr in conflictRecords) {
                 final pk = cr['primaryKey'].toString();
                 skipMap[pk] = (cr['skipFlag'] as num).toInt();
