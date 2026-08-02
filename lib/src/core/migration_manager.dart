@@ -33,6 +33,7 @@ import 'data_store_impl.dart';
 import 'key_migration_progress.dart';
 import 'key_migration_runner.dart';
 import 'large_operation_runner.dart';
+import 'promote_primary_key.dart';
 import 'transaction_context.dart';
 import 'yield_controller.dart';
 
@@ -75,6 +76,87 @@ class MigrationManager {
   // Runtime conversion descriptors for tables that are schema-updated but data not fully migrated yet.
   final Map<TableUid, _RuntimeMigrationDescriptor> _runtimeMigrations =
       <TableUid, _RuntimeMigrationDescriptor>{};
+
+  /// Active promote-to-PK shadow dual-path descriptors (hot-path gated).
+  final Map<TableUid, PromoteRuntimeDescriptor> _promoteRuntimes =
+      <TableUid, PromoteRuntimeDescriptor>{};
+
+  /// Returns promote runtime if [tableUid] is mid promoteFieldToPrimaryKey.
+  PromoteRuntimeDescriptor? getPromoteRuntime(TableUid tableUid) =>
+      _promoteRuntimes[tableUid];
+
+  /// Logical target schema overlay while promote is active (old meta may
+  /// already include sibling field changes; PK promote lives only on shadow).
+  TableSchema? getPromoteTargetSchema(TableUid tableUid) =>
+      _promoteRuntimes[tableUid]?.targetSchema;
+
+  bool hasActivePromote(TableUid tableUid) =>
+      _promoteRuntimes.containsKey(tableUid);
+
+  Future<TableContext?> getPromoteShadowTableContext(
+      TableUid logicalTableUid) async {
+    final desc = _promoteRuntimes[logicalTableUid];
+    if (desc == null) return null;
+    return _dataStore.tableMetaManager?.getTableContext(desc.shadowTableUid);
+  }
+
+  void _registerPromoteRuntime(MigrationTask task) {
+    if (!task.isPromotePrimaryKeyTask) return;
+    final shadowUid = task.shadowTableUid;
+    final oldSchema = task.oldSchemaSnapshot;
+    final targetSchema = task.targetSchemaSnapshot;
+    if (shadowUid == null || oldSchema == null || targetSchema == null) {
+      return;
+    }
+    MigrationOperation? promoteOp;
+    for (final op in task.operations) {
+      if (op.type == MigrationType.promoteFieldToPrimaryKey) {
+        promoteOp = op;
+        break;
+      }
+    }
+    final sourceFieldName = promoteOp?.fieldName;
+    if (sourceFieldName == null) return;
+
+    _promoteRuntimes[task.tableUid] = PromoteRuntimeDescriptor(
+      taskId: task.taskId,
+      tableUid: task.tableUid,
+      shadowTableUid: shadowUid,
+      oldSchema: oldSchema,
+      targetSchema: targetSchema,
+      operations: task.operations,
+      sourceFieldName: sourceFieldName,
+      sourceFieldId: promoteOp?.sourceFieldId,
+      sourceUniqueIndexUid:
+          findSourceUniqueIndexUid(oldSchema, sourceFieldName),
+    );
+  }
+
+  void _clearPromoteRuntime(TableUid tableUid) {
+    _promoteRuntimes.remove(tableUid);
+  }
+
+  /// Child schemas that FK-reference [parent] (for promote PK validation).
+  Future<List<TableSchema>> _collectPromoteReferencingSchemas(
+    TableContext parent,
+  ) async {
+    final fkManager = _dataStore.foreignKeyManager;
+    final schemaMgr = _dataStore.tableMetaManager;
+    if (fkManager == null || schemaMgr == null) return const [];
+    final refs = await fkManager.findReferencingTables(parent);
+    if (refs.isEmpty) return const [];
+    final out = <TableSchema>[];
+    final yieldController = YieldController(
+      'MigrationManager.collectPromoteReferencingSchemas',
+      checkInterval: 32,
+    );
+    for (final uid in refs.keys) {
+      await yieldController.maybeYield();
+      final schema = await schemaMgr.getTableSchema(uid);
+      if (schema != null) out.add(schema);
+    }
+    return out;
+  }
 
   // Cache of versioned table schemas for active migrations keyed by schemaVersion
   final Map<String, TableSchema> _schemaByVersion = {};
@@ -706,7 +788,8 @@ class MigrationManager {
       await _cancelLargeOpsForTable(tableUid);
 
       // Drop every buffered background write type (not only schemaMigration).
-      await _dataStore.backgroundWriteScheduler.clearEntriesForTable(table);
+      await _dataStore.backgroundWriteScheduler
+          .clearEntriesForTableUid(tableUid);
 
       final matching = _pendingTasks
           .where((t) => t.tableUid == tableUid)
@@ -791,8 +874,8 @@ class MigrationManager {
   /// Safe while data rewrite is serial: the newer task has not enqueued yet
   /// when older tasks are superseded during [addMigrationTask].
   Future<void> _purgeSchemaMigrationBackgroundWrites(TableContext table) async {
-    await _dataStore.backgroundWriteScheduler.clearEntriesForTable(
-      table,
+    await _dataStore.backgroundWriteScheduler.clearEntriesForTableUid(
+      table.tableUid,
       BackgroundWriteType.schemaMigration,
     );
   }
@@ -845,6 +928,11 @@ class MigrationManager {
     MigrationTask task, {
     required String reason,
   }) async {
+    // Drop promote dual-write overlay + orphan shadow before removing the task.
+    // Sibling schema applied to the logical table is not rolled back.
+    if (task.shadowTableUid != null || hasActivePromote(task.tableUid)) {
+      await _cleanupPromoteShadowArtifacts(task);
+    }
     _pendingTasks.removeWhere((t) => t.taskId == task.taskId);
     final oldVer = task.oldSchemaSnapshot?.schemaVersion;
     if (oldVer != null && oldVer.isNotEmpty) {
@@ -872,6 +960,73 @@ class MigrationManager {
       'Cancelled migration task [${task.taskId}] on table [${task.tableName}] '
       'due to $reason',
     );
+  }
+
+  /// Clear promote runtime and delete shadow meta/directories across scopes.
+  ///
+  /// Does not reverse sibling cutover already applied to the logical table.
+  Future<void> _cleanupPromoteShadowArtifacts(MigrationTask task) async {
+    _clearPromoteRuntime(task.tableUid);
+    final shadowUid = task.shadowTableUid;
+    if (shadowUid == null) return;
+
+    final schema = task.targetSchemaSnapshot ?? task.oldSchemaSnapshot;
+    final scopes = await _getMigrationScopesForSchema(schema);
+    for (final space in scopes) {
+      final isGlobal = space == _globalMigrationScope;
+      final reusePrimary = isGlobal || _dataStore.currentSpaceName == space;
+      final instance = reusePrimary
+          ? _dataStore
+          : DataStoreImpl(
+              dbPath: _dataStore.config.dbPath,
+              dbName: _dataStore.config.dbName,
+              config: _dataStore.config.copyWith(spaceName: space),
+              isMigrationInstance: true,
+            );
+      try {
+        if (!reusePrimary) {
+          await instance.initialize();
+        }
+        try {
+          await instance.writeBufferManager.clearTableByUid(shadowUid);
+          await instance.backgroundWriteScheduler
+              .clearEntriesForTableUid(shadowUid);
+        } catch (e) {
+          Logger.warn(
+            'Failed clearing promote shadow buffers for ${shadowUid.value} '
+            'space=$space task=${task.taskId}',
+            rawError: e,
+          );
+        }
+        try {
+          final shadowPath =
+              await instance.pathManager.getTablePathByUid(shadowUid);
+          if (await instance.storage.existsDirectory(shadowPath)) {
+            await instance.storage.deleteDirectory(shadowPath);
+          }
+        } catch (e) {
+          Logger.warn(
+            'Failed deleting promote shadow directory for ${shadowUid.value} '
+            'space=$space task=${task.taskId}',
+            rawError: e,
+          );
+        }
+      } finally {
+        if (!reusePrimary) {
+          await instance.close();
+        }
+      }
+    }
+
+    try {
+      await _dataStore.tableMetaManager?.deleteTableMeta(shadowUid);
+    } catch (e) {
+      Logger.warn(
+        'Failed deleting promote shadow meta for ${shadowUid.value} '
+        'task=${task.taskId}',
+        rawError: e,
+      );
+    }
   }
 
   /// After task removal: clear isBuilding for indexes no longer owned by any
@@ -1904,6 +2059,32 @@ class MigrationManager {
       schemaHint: targetSchema ?? oldSchema,
     );
 
+    // Scheme A: no concurrent schema task while promote dual-write is active.
+    if (hasActivePromote(tableUid)) {
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.devMigrationPromoteLargeOpNotAllowed,
+          message:
+              'Table [$tableDisplayName] is running promoteFieldToPrimaryKey. '
+              'Wait until that migration completes before applying further '
+              'schema changes.',
+          tableName: tableDisplayName,
+        ),
+      ]);
+    }
+
+    // Promote-only: probe non-emptiness BEFORE the exclusive table lock —
+    // queries/flushes under that lock deadlock or see empty buffers.
+    // Non-promote paths skip this entirely (no extra I/O / scans).
+    final promoteRequested = _containsPromotePrimaryKeyOp(operations);
+    var promoteNonEmptyHint = false;
+    if (promoteRequested) {
+      promoteNonEmptyHint = await _probePromoteNonEmptyHint(
+        tableUid,
+        schema: targetSchema ?? oldSchema,
+      );
+    }
+
     final tableLockResource = _tableLockResource(tableUid);
     final tableLockOpId = GlobalIdGenerator.generate('add_migration_');
     final lockMgr = _dataStore.lockManager;
@@ -1946,7 +2127,7 @@ class MigrationManager {
       }
 
       final isDropTable =
-          sortedOperations.any((op) => op.type == MigrationType.dropTable);
+          _containsMigrationType(sortedOperations, MigrationType.dropTable);
       if (oldSchema != null && !isDropTable) {
         final indexTableCtx = await _requireTableContextByUid(tableUid);
         sortedOperations = await _foldRedundantMigrationOperations(
@@ -1962,6 +2143,12 @@ class MigrationManager {
           return null;
         }
       }
+
+      // Reuse pre-lock promoteRequested: fold never inserts promote ops, so
+      // non-promote tasks skip a second full scan. Re-check after fold only
+      // when promote was present (fold may drop redundant ops).
+      final hasPromoteOp =
+          promoteRequested && _containsPromotePrimaryKeyOp(sortedOperations);
 
       FieldStorageLayout? oldFieldLayout;
       final schemaMgrForLayout = _dataStore.tableMetaManager;
@@ -2145,6 +2332,23 @@ class MigrationManager {
               isAllowed = true;
             }
           }
+          // Promote is an explicit migration declaration.
+          if (hasPromoteOp) {
+            isAllowed = true;
+            if (_containsMigrationType(
+                sortedOperations, MigrationType.setPrimaryKeyConfig)) {
+              throw DbException([
+                SchemaValidationStatus(
+                  type: ResultType.devInvalidSchemaPrimaryKey,
+                  message:
+                      'Cannot combine promoteFieldToPrimaryKey with setPrimaryKeyConfig '
+                      'on table "$tableName". Use promote alone (sibling field/index '
+                      'ops are allowed).',
+                  tableName: tableName,
+                ),
+              ]);
+            }
+          }
 
           final requiresMigration = await _requiresDataMigration(
               sortedOperations, oldSchema,
@@ -2192,7 +2396,9 @@ class MigrationManager {
           operations: sortedOperations,
           sourceLayout: oldFieldLayout,
         );
-        targetFieldLayout = enableDeletedSlotCompaction
+        // Promote physically re-encodes on a fresh shadow (or empty cutover);
+        // never keep the promoted source field as a deleted leading slot.
+        targetFieldLayout = (enableDeletedSlotCompaction || hasPromoteOp)
             ? evolvedLayout.compactDeletedSlots()
             : evolvedLayout;
         if (enableDeletedSlotCompaction) {
@@ -2216,6 +2422,19 @@ class MigrationManager {
 
       final childIndexesToDrop = <TableUid, List<IndexUid>>{};
 
+      // Promote-only: enrich old PK config (SchemaBuilder may omit it).
+      // Non-promote: keep the existing list instance — no map/alloc.
+      if (hasPromoteOp && oldSchema != null) {
+        sortedOperations = _enrichPromoteOperationsWithOldPk(
+          sortedOperations,
+          oldSchema,
+        );
+      }
+
+      // Use pre-lock hint; under the exclusive lock counts/queries are unreliable.
+      final promoteWithData =
+          hasPromoteOp && !isDropTable && promoteNonEmptyHint;
+
       var task = MigrationTask(
         taskId: taskId,
         tableUid: tableUid,
@@ -2234,27 +2453,126 @@ class MigrationManager {
         writeMode: writeMode,
         specificIndexUids: specificIndexUids,
         referencingChildIndexesToDrop: childIndexesToDrop,
+        promotePhase: promoteWithData ? PromotePhase.creating : null,
       );
 
-      // Schema metadata update is performed synchronously to ensure that subsequent operations
-      // can immediately use the new schema. Data migration remains asynchronous.
-      // fieldLayout is passed atomically with schema (evolved or compacted).
+      // Promote with data: apply sibling schema/layout to the logical (old)
+      // table WITHOUT PK promote and WITHOUT deleted-slot compaction, then
+      // create a shadow with the full target schema. Online path dual-writes
+      // old-first; queries read only the old table until swap.
+      // Empty-table promote (or non-promote): normal schema cutover on logical table.
       if (!task.isSchemaUpdated && task.targetSchemaSnapshot != null) {
-        await TransactionContext.runAsSystemOperation(() async {
-          await executeSchemaOperations(
-            await _requireTableContextByUid(tableUid),
-            sortedOperations,
-            targetSchema: task.targetSchemaSnapshot!,
-            fieldLayout: task.targetFieldLayoutSnapshot,
-            tableLockHeldExternally: true,
-            outDroppedChildIndexes: childIndexesToDrop,
+        if (promoteWithData) {
+          final siblingOps =
+              siblingOperationsExcludingPromote(sortedOperations);
+          // Old working schema keeps auto PK + source unique field; only
+          // sibling field/index/FK/TTL/rename changes are applied.
+          var oldWorkingSchema = oldSchema!;
+          FieldStorageLayout? oldWorkingLayout = oldFieldLayout;
+          if (siblingOps.isNotEmpty) {
+            oldWorkingSchema = _predictTargetSchema(
+              oldSchema,
+              siblingOps,
+              isAutoGenerated: isAutoGenerated,
+            );
+            oldWorkingSchema = oldWorkingSchema
+                .copyWith(
+                  tableUid: tableUid,
+                  primaryKeyConfig: oldSchema.primaryKeyConfig,
+                  schemaVersion: GlobalIdGenerator.generate('s'),
+                )
+                .generateAutoIndexes(oldSchema: oldSchema);
+
+            // Never compactDeletedSlots on the old working table during promote.
+            oldWorkingLayout = schemaMgrForLayout?.evolveFieldStorageLayout(
+              existingLayout: oldFieldLayout,
+              nextSchema: oldWorkingSchema,
+              renameHints: _buildFieldRenameHints(siblingOps),
+            );
+
+            // Persist via normal cutover ritual (FK sync, rename side effects,
+            // BWS/large-op pause) — but with sibling-only ops + oldWorking schema.
+            final logicalCtx = await _requireTableContextByUid(tableUid);
+            await TransactionContext.runAsSystemOperation(() async {
+              await executeSchemaOperations(
+                logicalCtx,
+                siblingOps,
+                targetSchema: oldWorkingSchema,
+                fieldLayout: oldWorkingLayout,
+                tableLockHeldExternally: true,
+              );
+            });
+            // executeSchemaOperations only invalidates on table rename; sibling
+            // field/layout changes still need schema cache drop here.
+            await _dataStore.cacheManager.invalidateCache(
+              logicalCtx,
+              invalidateSchema: true,
+            );
+          }
+
+          final shadowSchema = task.targetSchemaSnapshot!
+              .copyWith(
+                name: promoteShadowTableName(taskId),
+                tableUid: TableUid.empty,
+                tableId: promoteShadowTableName(taskId),
+              )
+              .materializeForCreate(isSystemTable: true);
+          final createResult = await _dataStore.createTable(
+            shadowSchema,
+            isSystemTable: true,
           );
-        });
-        task = task.copyWith(
-          isSchemaUpdated: true,
-          referencingChildIndexesToDrop:
-              childIndexesToDrop.isNotEmpty ? childIndexesToDrop : null,
-        );
+          if (!createResult.isSuccess) {
+            throw DbException([
+              GeneralStatus(
+                type: ResultType.engError,
+                message:
+                    'Failed to create promote shadow table for "$tableName": '
+                    '${createResult.message}',
+              ),
+            ]);
+          }
+          // Shadow is created with an initial layout (no deleted slots). Align
+          // the task snapshot to that physical encoding — evolve snapshots may
+          // still carry the promoted source field as a deleted slot.
+          final shadowLayout = await _dataStore.tableMetaManager
+              ?.getTableFieldLayout(shadowSchema.tableUid);
+          task = task.copyWith(
+            isSchemaUpdated: true,
+            shadowTableUid: shadowSchema.tableUid,
+            promotePhase: PromotePhase.backfilling,
+            // Dual-write + shadow backfill — not in-place table/index rewrite.
+            writeMode: MigrationWriteMode.none,
+            specificIndexUids: const <IndexUid>[],
+            // Old snapshot becomes working schema (siblings applied, PK unchanged).
+            oldSchemaSnapshot: oldWorkingSchema,
+            oldFieldLayoutSnapshot: oldWorkingLayout ?? oldFieldLayout,
+            targetFieldLayoutSnapshot:
+                shadowLayout ?? task.targetFieldLayoutSnapshot,
+          );
+          _registerPromoteRuntime(task);
+          Logger.info(
+            'Promote shadow table created for [$tableName] '
+            '(logical=${tableUid.value}, shadow=${shadowSchema.tableUid.value}).',
+          );
+        } else {
+          await TransactionContext.runAsSystemOperation(() async {
+            await executeSchemaOperations(
+              await _requireTableContextByUid(tableUid),
+              sortedOperations,
+              targetSchema: task.targetSchemaSnapshot!,
+              fieldLayout: task.targetFieldLayoutSnapshot,
+              tableLockHeldExternally: true,
+              outDroppedChildIndexes: childIndexesToDrop,
+            );
+          });
+          task = task.copyWith(
+            isSchemaUpdated: true,
+            referencingChildIndexesToDrop:
+                childIndexesToDrop.isNotEmpty ? childIndexesToDrop : null,
+            clearPromotePhase: true,
+            clearShadowTableUid: true,
+          );
+        }
       }
 
       // Drop tasks are often enqueued after current-space meta is already gone.
@@ -2267,9 +2585,16 @@ class MigrationManager {
         );
       }
 
-      // Pre-calculate MigrationWriteMode and specificIndexUids upfront if not provided
-      if (!isDropTable &&
+      // Promote never uses in-place table/index rewrite ownership. Empty promote
+      // is schema cutover only; with-data promote is shadow backfill + swap.
+      if (hasPromoteOp && !isDropTable) {
+        task = task.copyWith(
+          writeMode: MigrationWriteMode.none,
+          specificIndexUids: const <IndexUid>[],
+        );
+      } else if (!isDropTable &&
           (task.writeMode == null || task.specificIndexUids == null)) {
+        // Pre-calculate MigrationWriteMode and specificIndexUids upfront
         final calcOldSchema = task.oldSchemaSnapshot ?? oldSchema;
         final calcTargetSchema = task.targetSchemaSnapshot ?? targetSchema;
         final currentNeedsTableWrite =
@@ -2303,9 +2628,13 @@ class MigrationManager {
         final physicalTableCtx = await _requireTableContextByUid(tableUid);
         activeSpaceRecordCount = await _dataStore.tableDataManager
             .getTableRecordCount(physicalTableCtx);
-        final derivedWriteMode = task.writeMode ?? MigrationWriteMode.none;
-        final duration = _estimateMigrationDuration(
-            derivedWriteMode, activeSpaceRecordCount);
+        // Promote-with-data cost ≈ full row rewrite (shadow insert); estimate
+        // with tableAndIndex rates without claiming rewrite writeMode.
+        final estimateMode = promoteWithData
+            ? MigrationWriteMode.tableAndIndex
+            : (task.writeMode ?? MigrationWriteMode.none);
+        final duration =
+            _estimateMigrationDuration(estimateMode, activeSpaceRecordCount);
         task = task.copyWith(
           estimateDuration: duration,
         );
@@ -2343,7 +2672,8 @@ class MigrationManager {
       }
 
       // After reconcile: only non-empty tables lock target indexes as building.
-      if (!isDropTable) {
+      // Promote (shadow dual-write / empty cutover) must not mark old indexes.
+      if (!isDropTable && !hasPromoteOp) {
         final latest = _findLatestPendingTaskForTableUid(tableUid);
         if (latest != null) {
           await _applyIndexBuildingFlagsForActiveSpace(
@@ -2355,7 +2685,10 @@ class MigrationManager {
 
       await syncHasMigrationTask();
 
-      final needDataMigration = task.forceDataMigration || needsTableWrite;
+      // Promote still needs read-cache drop (overlay / PK shape changed) even
+      // though writeMode stays none and no in-place rewrite is scheduled.
+      final needDataMigration =
+          hasPromoteOp || task.forceDataMigration || needsTableWrite;
 
       if (!isDropTable || await _tableContextForUid(tableUid) != null) {
         await _invalidatePrimaryInstanceCachesForMigration(
@@ -2576,10 +2909,12 @@ class MigrationManager {
 
   void _rebuildRuntimeMigrations([TableUid? affectedTableUid]) {
     final currentSpaceName = _dataStore.currentSpaceName;
+    // Promote tasks use [_promoteRuntimes], not the in-place rewrite bridge.
     final pending = <MigrationTask>[
       for (final task in _pendingTasks)
-        if (task.pendingMigrationSpaces.contains(currentSpaceName) ||
-            task.pendingMigrationSpaces.contains(_globalMigrationScope))
+        if (!task.isPromotePrimaryKeyTask &&
+            (task.pendingMigrationSpaces.contains(currentSpaceName) ||
+                task.pendingMigrationSpaces.contains(_globalMigrationScope)))
           task,
     ];
 
@@ -2714,12 +3049,12 @@ class MigrationManager {
       }
 
       // 2. Clear pending background write scheduler entries for this table
-      await _dataStore.backgroundWriteScheduler
-          .clearEntriesForTable(table, BackgroundWriteType.largeUpdate);
-      await _dataStore.backgroundWriteScheduler
-          .clearEntriesForTable(table, BackgroundWriteType.largeDelete);
-      await _dataStore.backgroundWriteScheduler
-          .clearEntriesForTable(table, BackgroundWriteType.keyMigration);
+      await _dataStore.backgroundWriteScheduler.clearEntriesForTableUid(
+          table.tableUid, BackgroundWriteType.largeUpdate);
+      await _dataStore.backgroundWriteScheduler.clearEntriesForTableUid(
+          table.tableUid, BackgroundWriteType.largeDelete);
+      await _dataStore.backgroundWriteScheduler.clearEntriesForTableUid(
+          table.tableUid, BackgroundWriteType.keyMigration);
 
       final currentTableName = targetSchema.name;
       final fieldRenameHints = _buildFieldRenameHints(operations);
@@ -3116,6 +3451,9 @@ class MigrationManager {
       List<MigrationOperation> operations, TableSchema? oldSchema) {
     if (oldSchema == null) return false;
     for (final operation in operations) {
+      if (operation.type == MigrationType.promoteFieldToPrimaryKey) {
+        return true;
+      }
       if (operation.type == MigrationType.modifyField) {
         // Only migrate data if field definition changes affect storage or constraints
         final update = operation.fieldUpdate!;
@@ -3238,16 +3576,46 @@ class MigrationManager {
     }
     final operations = <MigrationOperation>[];
 
+    // Prefer promote detection before field/PK diffs to avoid mis-splitting
+    // into removeField + setPrimaryKeyConfig (which non-empty tables reject).
+    final promoteDetection = detectPromoteFieldToPrimaryKey(
+      normalizedOldSchema,
+      normalizedNewSchema,
+    );
+    if (promoteDetection != null) {
+      operations.add(buildPromoteOperation(
+        oldSchema: normalizedOldSchema,
+        detection: promoteDetection,
+      ));
+    }
+
     // Check field changes
     await _compareFields(normalizedOldSchema, normalizedNewSchema, operations);
 
-    // check primary key config change
-    if (_isPrimaryKeyConfigChanged(normalizedOldSchema, normalizedNewSchema)) {
+    // check primary key config change (skipped when promote already captured it)
+    if (promoteDetection == null &&
+        _isPrimaryKeyConfigChanged(normalizedOldSchema, normalizedNewSchema)) {
       operations.add(MigrationOperation(
         type: MigrationType.setPrimaryKeyConfig,
         primaryKeyConfig: newSchema.primaryKeyConfig,
         oldPrimaryKeyConfig: oldSchema.primaryKeyConfig,
       ));
+    }
+
+    // Drop redundant removeField for the promoted source field.
+    if (promoteDetection != null) {
+      final sourceName = promoteDetection.sourceField.name;
+      operations.removeWhere((op) =>
+          op.type == MigrationType.removeField && op.fieldName == sourceName);
+      // Unique index solely on the promoted field is subsumed by new PK.
+      operations.removeWhere((op) =>
+          op.type == MigrationType.removeIndex &&
+          ((op.fields != null &&
+                  op.fields!.length == 1 &&
+                  op.fields!.first == sourceName) ||
+              (op.index != null &&
+                  op.index!.fields.length == 1 &&
+                  op.index!.fields.first == sourceName)));
     }
 
     if (_isTtlConfigChanged(
@@ -4574,11 +4942,15 @@ class MigrationManager {
       final needsTableWrite = _needDataMigration(sortedOperations, oldSchema);
       final specificIndexUids =
           currentTask.specificIndexUids ?? const <IndexUid>[];
-      final needDataMigration =
-          currentTask.writeMode != MigrationWriteMode.none &&
+      final isPromoteShadowBackfill = currentTask.isPromotePrimaryKeyTask &&
+          currentTask.shadowTableUid != null;
+      // Promote shadow backfill is not in-place rewrite (writeMode stays none),
+      // but still needs cache invalidation before dual-write / backfill.
+      final needDataMigration = isPromoteShadowBackfill ||
+          (currentTask.writeMode != MigrationWriteMode.none &&
               (currentTask.forceDataMigration ||
                   needsTableWrite ||
-                  specificIndexUids.isNotEmpty);
+                  specificIndexUids.isNotEmpty));
 
       if (renameOp == null && needDataMigration && oldSchema == null) {
         throw DbException([
@@ -4730,6 +5102,30 @@ class MigrationManager {
                 currentTask.tableName,
                 isMigration: true,
               );
+            }
+
+            // Promote-to-PK: backfill old → shadow via upsert; never
+            // in-place rewrite the old working table.
+            if (currentTask.isPromotePrimaryKeyTask &&
+                currentTask.shadowTableUid != null &&
+                !shouldDropTable) {
+              await _backfillPromoteSpace(
+                migrationInstance: migrationInstance,
+                currentTask: currentTask,
+                space: space,
+                oldSchema: oldSchema,
+                oldFieldLayout: oldFieldLayout,
+                migrationController: migrationController,
+                onTaskUpdated: (updated) async {
+                  currentTask = updated;
+                  await _saveMigrationTask(currentTask);
+                  _updatePendingTaskInMemory(currentTask);
+                },
+              );
+              currentTask = currentTask.removePendingSpace(space);
+              await _saveMigrationTask(currentTask);
+              _updatePendingTaskInMemory(currentTask);
+              return;
             }
 
             // Process data migration in place after schema cutover.
@@ -5026,6 +5422,11 @@ class MigrationManager {
 
       // If we've processed all spaces, the task is finished
       if (currentTask.pendingMigrationSpaces.isEmpty) {
+        if (currentTask.isPromotePrimaryKeyTask &&
+            currentTask.shadowTableUid != null) {
+          currentTask = await _finalizePromoteSwap(currentTask);
+        }
+
         // Record task completion stats
         final duration = taskStopwatch.elapsed;
         _telemetry.recordTaskCompletion(currentTask, duration);
@@ -5635,11 +6036,125 @@ class MigrationManager {
     return true;
   }
 
+  /// Early-exit scan — prefer over repeated `.any` on hot migration paths.
+  bool _containsMigrationType(
+    List<MigrationOperation> operations,
+    MigrationType type,
+  ) {
+    for (final op in operations) {
+      if (op.type == type) return true;
+    }
+    return false;
+  }
+
+  bool _containsPromotePrimaryKeyOp(List<MigrationOperation> operations) =>
+      _containsMigrationType(
+        operations,
+        MigrationType.promoteFieldToPrimaryKey,
+      );
+
+  /// Pre-lock emptiness probe for promote shadow-path selection.
+  ///
+  /// Checks **all** migration scopes for non-global tables (shared meta +
+  /// per-space data). Current-space-only probes would falsely take the empty
+  /// cutover path and corrupt other spaces that still hold old-PK rows.
+  ///
+  /// Relies on persisted/buffer record counts — no query scan.
+  Future<bool> _probePromoteNonEmptyHint(
+    TableUid tableUid, {
+    TableSchema? schema,
+  }) async {
+    try {
+      final scopes = await _getMigrationScopesForSchema(schema);
+      for (final space in scopes) {
+        if (await _probePromoteNonEmptyInSpace(tableUid, space)) {
+          return true;
+        }
+      }
+      return false;
+    } catch (_) {
+      // Fail safe: prefer shadow path when probe is unreliable.
+      return true;
+    }
+  }
+
+  /// True when [tableUid] has committed or buffered rows in [space].
+  Future<bool> _probePromoteNonEmptyInSpace(
+    TableUid tableUid,
+    String space,
+  ) async {
+    final isGlobal = space == _globalMigrationScope;
+    final reusePrimary = isGlobal || _dataStore.currentSpaceName == space;
+    final instance = reusePrimary
+        ? _dataStore
+        : DataStoreImpl(
+            dbPath: _dataStore.config.dbPath,
+            dbName: _dataStore.config.dbName,
+            config: _dataStore.config.copyWith(spaceName: space),
+            isMigrationInstance: true,
+          );
+    try {
+      if (!reusePrimary) {
+        await instance.initialize();
+      }
+      final probeCtx =
+          await instance.tableMetaManager?.getTableContext(tableUid);
+      if (probeCtx == null) {
+        // Meta missing in this space — treat as empty for data dirs.
+        return false;
+      }
+      final diskCount =
+          await instance.tableDataManager.getTableRecordCount(probeCtx);
+      if (diskCount > 0) return true;
+      return instance.writeBufferManager
+          .getBufferedInsertKeys(probeCtx)
+          .isNotEmpty;
+    } finally {
+      if (!reusePrimary) {
+        await instance.close();
+      }
+    }
+  }
+
+  /// Fill [MigrationOperation.oldPrimaryKeyConfig] on promote ops when omitted.
+  /// Returns the original list when nothing needs enrichment.
+  List<MigrationOperation> _enrichPromoteOperationsWithOldPk(
+    List<MigrationOperation> operations,
+    TableSchema oldSchema,
+  ) {
+    var needsEnrich = false;
+    for (final op in operations) {
+      if (op.type == MigrationType.promoteFieldToPrimaryKey &&
+          op.oldPrimaryKeyConfig == null) {
+        needsEnrich = true;
+        break;
+      }
+    }
+    if (!needsEnrich) return operations;
+
+    return [
+      for (final op in operations)
+        if (op.type == MigrationType.promoteFieldToPrimaryKey &&
+            op.oldPrimaryKeyConfig == null)
+          MigrationOperation(
+            type: op.type,
+            fieldName: op.fieldName,
+            sourceFieldId: op.sourceFieldId,
+            primaryKeyConfig: op.primaryKeyConfig,
+            oldPrimaryKeyConfig: oldSchema.primaryKeyConfig,
+            discardOldPrimaryKey: op.discardOldPrimaryKey ?? true,
+          )
+        else
+          op,
+    ];
+  }
+
   /// Sort operations to ensure they are executed in correct order
   List<MigrationOperation> _sortOperations(
       List<MigrationOperation> operations) {
     // Define operation type priority
     final typePriority = {
+      MigrationType.promoteFieldToPrimaryKey: 0,
       MigrationType.setPrimaryKeyConfig: 1,
       MigrationType.setTableTtlConfig: 2,
       MigrationType.addIndex: 3,
@@ -5659,6 +6174,393 @@ class MigrationManager {
         (typePriority[a.type] ?? 99).compareTo(typePriority[b.type] ?? 99));
 
     return operations;
+  }
+
+  /// Backfill one space for promoteFieldToPrimaryKey (old → shadow via upsert).
+  ///
+  /// Old table is the source of truth. Concurrent online dual-writes already
+  /// upsert the shadow; this scan catches remaining rows. Uses batchUpsert
+  /// (idempotent) instead of point-query skip + batchInsert.
+  Future<void> _backfillPromoteSpace({
+    required DataStoreImpl migrationInstance,
+    required MigrationTask currentTask,
+    required String space,
+    required TableSchema? oldSchema,
+    required FieldStorageLayout? oldFieldLayout,
+    required CancellationToken migrationController,
+    required Future<void> Function(MigrationTask updated) onTaskUpdated,
+  }) async {
+    final shadowUid = currentTask.shadowTableUid;
+    final targetSchema = currentTask.targetSchemaSnapshot;
+    if (shadowUid == null || targetSchema == null || oldSchema == null) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Promote backfill missing shadow/target/old schema for task '
+              '${currentTask.taskId}',
+        ),
+      ]);
+    }
+
+    final oldCtx = await migrationInstance.tableMetaManager?.getTableContext(
+          currentTask.tableUid,
+        ) ??
+        await _requireTableContextByUid(currentTask.tableUid);
+    final shadowCtx =
+        await migrationInstance.tableMetaManager?.getTableContext(shadowUid);
+    if (shadowCtx == null) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Promote shadow table meta not found: ${shadowUid.value} '
+              '(task ${currentTask.taskId})',
+        ),
+      ]);
+    }
+
+    final decodeFieldStructureOverride = oldFieldLayout == null
+        ? null
+        : _dataStore.tableMetaManager
+            ?.buildStorageFieldStructureFromLayout(oldFieldLayout);
+
+    final startCursor = currentTask.checkpointKeyForSpace(space);
+    final writeBatchSize = max(1, migrationInstance.config.writeBatchSize);
+    final targetPk = targetSchema.primaryKey;
+    final shadowTableName = shadowCtx.tableName.value;
+    final promoteDesc = getPromoteRuntime(currentTask.tableUid);
+    if (promoteDesc == null) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Promote runtime missing during backfill for task '
+              '${currentTask.taskId}',
+        ),
+      ]);
+    }
+
+    Logger.info(
+      'Promote backfill start: table=${oldCtx.tableName} space=$space '
+      'task=${currentTask.taskId}',
+    );
+
+    Future<bool> processRecords(List<Map<String, dynamic>> records) async {
+      if (migrationController.isCancelled) return false;
+      if (records.isEmpty) return true;
+
+      await migrationInstance.backgroundWriteScheduler.waitIfCongested(
+        writeBatchSize,
+        migrationInstance.writeBufferManager.queueLength,
+        cancellationToken: migrationController,
+      );
+      if (migrationController.isCancelled) return false;
+
+      final yieldController = YieldController(
+        'MigrationManager.promoteBackfill',
+        checkInterval: 64,
+      );
+
+      // Old-working rows already include sibling ops; promote PK reshape only
+      // (same as online dual-write mirror).
+      final toUpsert = <Map<String, dynamic>>[];
+      for (final raw in records) {
+        await yieldController.maybeYield();
+        if (migrationController.isCancelled) return false;
+        final transformed = Map<String, dynamic>.from(raw);
+        transformPromoteOldToNewInPlace(transformed, promoteDesc);
+        final pkValue = transformed[targetPk]?.toString();
+        if (pkValue == null || pkValue.isEmpty) continue;
+        toUpsert.add(transformed);
+      }
+
+      if (toUpsert.isNotEmpty) {
+        try {
+          final upsertResult = await migrationInstance.batchUpsert(
+            shadowTableName,
+            toUpsert,
+            allowPartialErrors: true,
+            returnResultDetails: false,
+            enablePromoteDualWrite: false,
+          );
+          // Business-only: tolerate (often dual-write race). Otherwise throw
+          // with the original statuses — never synthesize a generic type.
+          if (upsertResult.hasErrors) {
+            final statuses = upsertResult.statuses;
+            final businessOnly = statuses.isNotEmpty &&
+                statuses.every((s) =>
+                    s.type == ResultType.success || s.type.isBusinessError);
+            if (!businessOnly && statuses.isNotEmpty) {
+              throw DbException(statuses);
+            }
+          }
+        } on DbClosedException {
+          // Shutdown / cooperative cancel — stop without wrapping.
+          return false;
+        }
+      }
+      return true;
+    }
+
+    await migrationInstance.queryExecutor.queryEachBatch(
+      oldCtx,
+      batchSize: 1000,
+      checkpointCursor: startCursor,
+      cancellationToken: migrationController,
+      decodeSchema: oldSchema,
+      decodeFieldStructureOverride: decodeFieldStructureOverride,
+      onBatch: (records, currentCursor, nextCursor) async {
+        final ok = await processRecords(records);
+        if (!ok) return false;
+        // Advance checkpoint when the batch did not hard-fail. Business-only
+        // upsert conflicts are tolerated; DbClosed stops without advancing
+        // further batches (ok == false above).
+        if (nextCursor != null) {
+          await onTaskUpdated(currentTask.copyWith(
+            spaceCheckpointKeys: {
+              ...currentTask.spaceCheckpointKeys,
+              space: nextCursor,
+            },
+          ));
+        }
+        return true;
+      },
+    );
+
+    if (migrationController.isCancelled) {
+      throw DbClosedException('Promote backfill stopped for space [$space]');
+    }
+    await migrationInstance.parallelJournalManager.flushCompletely();
+  }
+
+  /// Discard in-memory work for the doomed old (logical) table before its
+  /// directory is deleted. Key-migration / large-op BWS entries on the old
+  /// tree must not block promote swap — those files are going away.
+  Future<void> _discardDoomedPromoteLogicalBuffers(
+    DataStoreImpl instance,
+    TableUid logicalUid,
+  ) async {
+    await instance.writeBufferManager.clearTableByUid(logicalUid);
+    await instance.backgroundWriteScheduler.clearEntriesForTableUid(logicalUid);
+  }
+
+  /// Swap one space's shadow directory onto the logical table path.
+  ///
+  /// Idempotent for crash restart:
+  /// - shadow gone + logical present → already swapped; no-op
+  /// - both gone → empty space never materialized dirs (or already cleaned); no-op
+  /// - shadow present → delete logical (if any) then move shadow → logical
+  Future<void> _swapPromoteDirectoriesForInstance({
+    required DataStoreImpl instance,
+    required TableUid logicalUid,
+    required TableUid shadowUid,
+    required String space,
+    required String taskId,
+  }) async {
+    final logicalPath =
+        await instance.pathManager.getTablePathByUid(logicalUid);
+    final shadowPath = await instance.pathManager.getTablePathByUid(shadowUid);
+
+    final shadowExists = await instance.storage.existsDirectory(shadowPath);
+    final logicalExists = await instance.storage.existsDirectory(logicalPath);
+
+    if (!shadowExists) {
+      if (logicalExists) {
+        Logger.info(
+          'Promote swap space=$space task=$taskId: shadow already applied '
+          '(logical present at $logicalPath); skipping',
+        );
+        return;
+      }
+      // No dirs: space had no persisted rows / never created trees. First write
+      // after meta cutover will create the logical directory.
+      Logger.info(
+        'Promote swap space=$space task=$taskId: no shadow/logical dirs at '
+        'shadow=$shadowPath logical=$logicalPath; skipping',
+      );
+      return;
+    }
+
+    if (logicalExists) {
+      await instance.storage.deleteDirectory(logicalPath);
+    }
+    await instance.storage.moveDirectory(shadowPath, logicalPath);
+    Logger.info(
+      'Promote swap moved shadow → logical for space=$space task=$taskId',
+    );
+  }
+
+  /// Atomically swap shadow files onto the logical tableUid and drop shadow meta.
+  ///
+  /// Locking rule: never call [ParallelJournalManager.flushCompletely] while
+  /// holding the logical/shadow table exclusive locks — PJM re-acquires those
+  /// locks and would deadlock (LockManager is not reentrant).
+  ///
+  /// Space rule: process spaces strictly one-by-one (open → flush → swap →
+  /// close). Keeping many migration [DataStoreImpl] instances open at once
+  /// retains file handles across spaces and can fail delete/move with sharing
+  /// violations (especially on Windows).
+  Future<MigrationTask> _finalizePromoteSwap(MigrationTask task) async {
+    final shadowUid = task.shadowTableUid;
+    final targetSchema = task.targetSchemaSnapshot;
+    final targetLayout = task.targetFieldLayoutSnapshot;
+    if (shadowUid == null || targetSchema == null) {
+      return task;
+    }
+
+    var updated = task.copyWith(promotePhase: PromotePhase.swapping);
+    await _saveMigrationTask(updated);
+    _updatePendingTaskInMemory(updated);
+
+    final scopes = await _getMigrationScopesForSchema(targetSchema);
+    final lockMgr = _dataStore.lockManager;
+    // Stable order avoids ABBA with any other dual-lock path.
+    final lockResources = <String>[
+      _tableLockResource(task.tableUid),
+      _tableLockResource(shadowUid),
+    ]..sort();
+
+    // Only retry when shadow business buffers raced into the flush→lock gap.
+    const maxAttempts = 3;
+    for (var attempt = 0; attempt < maxAttempts; attempt++) {
+      // Quiesce primary writers before touching directories.
+      await _dataStore.parallelJournalManager.flushCompletely();
+
+      final heldLocks = <String, String>{}; // resource -> opId
+      var retryForShadow = false;
+      try {
+        if (lockMgr != null) {
+          for (final resource in lockResources) {
+            final opId = GlobalIdGenerator.generate('promote_swap_');
+            final locked = await lockMgr.acquireExclusiveLock(resource, opId);
+            if (!locked) {
+              throw DbException([
+                GeneralStatus(
+                  type: ResultType.sysTimeoutLockAcquisition,
+                  message:
+                      'Timed out acquiring exclusive lock for promote swap on '
+                      '${task.tableName}',
+                ),
+              ]);
+            }
+            heldLocks[resource] = opId;
+          }
+        }
+
+        for (final space in scopes) {
+          final isGlobal = space == _globalMigrationScope;
+          final reusePrimary = isGlobal || _dataStore.currentSpaceName == space;
+          final instance = reusePrimary
+              ? _dataStore
+              : DataStoreImpl(
+                  dbPath: _dataStore.config.dbPath,
+                  dbName: _dataStore.config.dbName,
+                  config: _dataStore.config.copyWith(spaceName: space),
+                  isMigrationInstance: true,
+                );
+          try {
+            if (!reusePrimary) {
+              await instance.initialize();
+              await instance.parallelJournalManager.flushCompletely();
+            }
+
+            await _discardDoomedPromoteLogicalBuffers(
+              instance,
+              task.tableUid,
+            );
+
+            // Shadow must be durable. Table lock blocks new primary writers;
+            // secondary spaces are migration-only. Retry only on shadow WBM dirt.
+            if (instance.writeBufferManager.hasPendingWritesForUid(shadowUid)) {
+              Logger.info(
+                'Promote swap retry ${attempt + 1}/$maxAttempts for '
+                '${task.tableName} space=$space: shadow write buffer dirty',
+              );
+              retryForShadow = true;
+              break;
+            }
+
+            await _swapPromoteDirectoriesForInstance(
+              instance: instance,
+              logicalUid: task.tableUid,
+              shadowUid: shadowUid,
+              space: space,
+              taskId: task.taskId,
+            );
+          } finally {
+            if (!reusePrimary) {
+              // Release this space's file handles before opening the next.
+              await instance.close();
+            }
+          }
+        }
+
+        if (retryForShadow) {
+          continue;
+        }
+
+        final logicalName = task.oldSchemaSnapshot?.name ?? targetSchema.name;
+        final finalSchema = targetSchema.copyWith(
+          name: logicalName,
+          tableUid: task.tableUid,
+          primaryKeyConfig:
+              targetSchema.primaryKeyConfig.copyWith(clearFromFieldId: true),
+        );
+        // Prefer live shadow layout; after crash it may already be deleted —
+        // fall back to task snapshot so meta cutover stays idempotent.
+        final shadowMeta =
+            await _dataStore.tableMetaManager?.getTableMeta(shadowUid);
+        final shadowLayout = shadowMeta?.fieldLayout ??
+            await _dataStore.tableMetaManager?.getTableFieldLayout(shadowUid);
+        final layoutToApply =
+            (shadowLayout != null && shadowLayout.totalSlots > 0)
+                ? shadowLayout
+                : (targetLayout?.compactDeletedSlots() ?? targetLayout);
+        await _dataStore.tableMetaManager?.updateTableMeta(
+          task.tableUid,
+          schema: finalSchema,
+          layoutOverride: layoutToApply,
+        );
+
+        if (shadowMeta != null) {
+          await _dataStore.tableMetaManager?.deleteTableMeta(shadowUid);
+        }
+
+        _clearPromoteRuntime(task.tableUid);
+        final logicalCtx = await _tableContextForUid(task.tableUid);
+        if (logicalCtx != null) {
+          await _dataStore.cacheManager.invalidateCache(logicalCtx);
+        }
+
+        updated = updated.copyWith(
+          promotePhase: PromotePhase.done,
+          clearShadowTableUid: true,
+          targetSchemaSnapshot: finalSchema,
+          targetFieldLayoutSnapshot: layoutToApply,
+        );
+        await _saveMigrationTask(updated);
+        _updatePendingTaskInMemory(updated);
+
+        Logger.info(
+          'Promote swap completed for table [$logicalName] '
+          '(task ${task.taskId})',
+        );
+        return updated;
+      } finally {
+        if (lockMgr != null) {
+          for (final entry in heldLocks.entries) {
+            lockMgr.releaseExclusiveLock(entry.key, entry.value);
+          }
+        }
+      }
+    }
+
+    throw DbException([
+      GeneralStatus(
+        type: ResultType.engError,
+        message: 'Promote swap gave up after $maxAttempts attempts for '
+            'table [${task.tableName}] (task ${task.taskId}): '
+            'shadow write buffer stayed dirty across flush/lock.',
+      ),
+    ]);
   }
 
   /// Apply migration operations to records
@@ -5826,10 +6728,19 @@ class MigrationManager {
         if (taskBytes.isNotEmpty) {
           final task = MigrationTaskCodec.decodeFile(taskBytes);
 
-          if (task.pendingMigrationSpaces.isNotEmpty) {
+          // Promote swap may leave pendingMigrationSpaces empty while
+          // shadowTableUid is still set (crash between last-space drain and
+          // finalize). Keep those tasks queued until finalize clears shadow.
+          final awaitingPromoteFinalize = task.shadowTableUid != null;
+          if (task.pendingMigrationSpaces.isNotEmpty ||
+              awaitingPromoteFinalize) {
             if (_pendingTasks.any((t) => t.taskId == task.taskId)) continue;
             Logger.info(
-              'Found unfinished migration task: taskId[${task.taskId}], table[${task.tableName}], remaining spaces[${task.pendingMigrationSpaces.length}]',
+              awaitingPromoteFinalize && task.pendingMigrationSpaces.isEmpty
+                  ? 'Found promote task awaiting finalize: taskId[${task.taskId}], '
+                      'table[${task.tableName}], shadow=${task.shadowTableUid!.value}'
+                  : 'Found unfinished migration task: taskId[${task.taskId}], '
+                      'table[${task.tableName}], remaining spaces[${task.pendingMigrationSpaces.length}]',
             );
             _pendingTasks.add(task);
           } else {
@@ -5883,6 +6794,11 @@ class MigrationManager {
       }
 
       _rebuildRuntimeMigrations();
+      for (final task in _pendingTasks) {
+        if (task.isPromotePrimaryKeyTask && task.shadowTableUid != null) {
+          _registerPromoteRuntime(task);
+        }
+      }
     }
   }
 
@@ -5893,7 +6809,9 @@ class MigrationManager {
     final found = <String>[];
 
     for (final task in _pendingTasks) {
-      if (task.pendingMigrationSpaces.isEmpty) continue;
+      if (task.pendingMigrationSpaces.isEmpty && task.shadowTableUid == null) {
+        continue;
+      }
       if (tableUid != null && task.tableUid != tableUid) continue;
       found.add(task.taskId);
     }
@@ -5920,7 +6838,10 @@ class MigrationManager {
         final content = await _dataStore.storage.readAsBytes(taskPath);
         if (content.isNotEmpty) {
           final task = MigrationTaskCodec.decodeFile(content);
-          if (task.pendingMigrationSpaces.isEmpty) continue;
+          if (task.pendingMigrationSpaces.isEmpty &&
+              task.shadowTableUid == null) {
+            continue;
+          }
           if (tableUid != null && task.tableUid != tableUid) continue;
           found.add(taskId);
         } else {
@@ -6387,6 +7308,48 @@ class MigrationManager {
             return true;
           }
           break;
+        case MigrationType.promoteFieldToPrimaryKey:
+          final sourceName = op.fieldName;
+          final targetPk = op.primaryKeyConfig;
+          if (sourceName == null || targetPk == null) {
+            throw DbException([
+              SchemaValidationStatus(
+                type: ResultType.devInvalidSchemaPrimaryKey,
+                message:
+                    'promoteFieldToPrimaryKey operation is missing source field '
+                    'or target primary key config for table "${oldSchema.name}".',
+                tableName: oldSchema.name,
+              ),
+            ]);
+          }
+          // Emptiness for validation must be all-scope aware (shared meta).
+          var promoteRecordCount = recordCount;
+          if (promoteRecordCount == 0) {
+            final anyData = await _probePromoteNonEmptyHint(
+              oldSchema.tableUid,
+              schema: oldSchema,
+            );
+            if (anyData) promoteRecordCount = 1;
+          }
+          final parentCtx = await _requireTableContextByUid(oldSchema.tableUid);
+          final referencingSchemas =
+              await _collectPromoteReferencingSchemas(parentCtx);
+          validatePromoteFieldToPrimaryKey(
+            oldSchema: oldSchema,
+            sourceFieldName: sourceName,
+            targetPk: targetPk,
+            recordCount: promoteRecordCount,
+            referencingSchemas: referencingSchemas,
+          );
+          // Promote is an explicit data-migration declaration; no allowAfterDataMigration.
+          if (promoteRecordCount > 0) {
+            Logger.warn(
+              'Data migration required: promoteFieldToPrimaryKey '
+              '"$sourceName" -> PK "${targetPk.name}" on "${oldSchema.name}".',
+            );
+            return true;
+          }
+          break;
         default:
           break;
       }
@@ -6690,6 +7653,22 @@ class MigrationManager {
           break;
         case MigrationType.setTableTtlConfig:
           result = result.copyWith(ttlConfig: op.ttlConfig);
+          break;
+        case MigrationType.promoteFieldToPrimaryKey:
+          final sourceName = op.fieldName;
+          final targetPk = op.primaryKeyConfig;
+          if (sourceName != null && targetPk != null) {
+            result = result.copyWith(
+              primaryKeyConfig: targetPk,
+              fields: result.fields
+                  .where((f) => f.name != sourceName)
+                  .toList(growable: false),
+              indexes: result.indexes
+                  .where((idx) => !(idx.fields.length == 1 &&
+                      idx.fields.first == sourceName))
+                  .toList(growable: false),
+            );
+          }
           break;
       }
     }
@@ -7170,6 +8149,12 @@ class MigrationManager {
           folded.add(op);
           break;
 
+        case MigrationType.promoteFieldToPrimaryKey:
+          // Promote is never folded away: physical rewrite is required whenever
+          // the op is still pending (empty-table fast path is handled earlier).
+          folded.add(op);
+          break;
+
         case MigrationType.dropTable:
           if (_hasPendingDropTaskForTable(tableUid)) {
             break;
@@ -7520,7 +8505,8 @@ class MigrationManager {
     if (triggerIsDrop) {
       await _abortExecutingTaskForTableUid(table.tableUid, waitForExit: false);
       // Clear all write types: siblings may have left key/large entries too.
-      await _dataStore.backgroundWriteScheduler.clearEntriesForTable(table);
+      await _dataStore.backgroundWriteScheduler
+          .clearEntriesForTableUid(table.tableUid);
       final siblings = _pendingTasks
           .where((t) =>
               t.tableUid == table.tableUid && t.taskId != triggerTask.taskId)
@@ -7788,14 +8774,20 @@ class MigrationManager {
     required TableContext table,
     required MigrationTask triggerTask,
   }) async {
-    final triggerNeedsTableWrite = _taskHasTableWrite(triggerTask) ||
+    // Promote replaces physical table data via shadow swap (writeMode stays
+    // none) — still supersedes older in-place table rewrites.
+    final triggerIsPromote = triggerTask.isPromotePrimaryKeyTask;
+    final triggerNeedsTableWrite = triggerIsPromote ||
+        _taskHasTableWrite(triggerTask) ||
         _needDataMigration(
           triggerTask.operations,
           triggerTask.oldSchemaSnapshot,
         );
 
     final triggerIsPkChange = triggerTask.operations.any(
-      (op) => op.type == MigrationType.setPrimaryKeyConfig,
+      (op) =>
+          op.type == MigrationType.setPrimaryKeyConfig ||
+          op.type == MigrationType.promoteFieldToPrimaryKey,
     );
 
     final triggerChangesRecordShape = triggerTask.operations.any(
