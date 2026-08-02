@@ -620,6 +620,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
               onlyCount: onlyCount,
               aggregations: combinedAggs.isNotEmpty ? combinedAggs : null,
               groupBy: _groupByFields,
+              applyPromoteResultTransform: true,
             ) ??
         const ExecuteResult.empty();
 
