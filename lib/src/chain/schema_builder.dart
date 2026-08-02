@@ -175,6 +175,38 @@ class SchemaBuilder with FutureBuilderMixin<SchemaUpdateResult> {
     return this;
   }
 
+  /// Promote a unique non-null field to primary key via async shadow-table rewrite.
+  ///
+  /// Does not require [allowAfterDataMigration] — promote itself declares data migration.
+  /// Must not be combined with [setPrimaryKeyConfig] in the same builder chain.
+  SchemaBuilder promoteFieldToPrimaryKey({
+    required String sourceFieldName,
+    String? targetPrimaryKeyName,
+  }) {
+    if (_operations.any((op) => op.type == MigrationType.setPrimaryKeyConfig)) {
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.devInvalidSchemaPrimaryKey,
+          message:
+              'Cannot call promoteFieldToPrimaryKey together with setPrimaryKeyConfig '
+              'on table "$_tableName".',
+          tableName: _tableName,
+          field: sourceFieldName,
+        ),
+      ]);
+    }
+    _operations.add(MigrationOperation(
+      type: MigrationType.promoteFieldToPrimaryKey,
+      fieldName: sourceFieldName,
+      primaryKeyConfig: PrimaryKeyConfig(
+        name: targetPrimaryKeyName ?? sourceFieldName,
+        type: PrimaryKeyType.none,
+      ),
+      discardOldPrimaryKey: true,
+    ));
+    return this;
+  }
+
   /// Set table-level TTL config
   SchemaBuilder setTtlConfig(TableTtlConfig config) {
     _operations.add(MigrationOperation(
