@@ -102,7 +102,7 @@ class IndexManager {
     return asUid;
   }
 
-  /// Compat-only: map a legacy logical indexName / field alias → stable uid.
+  /// Compat-only: map a legacy logical indexName / field alias to stable uid.
   ///
   /// Invoked only after an IndexUid lookup returned empty.
   IndexUid _resolveIndexUidFromIndexName(
@@ -155,7 +155,7 @@ class IndexManager {
       }
     }
 
-    // Miss as IndexUid → compat as indexName.
+    // Miss as IndexUid -> compat as indexName.
     return schemaMgr.findIndexSchemaByField(schema, indexUid.value);
   }
 
@@ -1075,7 +1075,7 @@ class IndexManager {
   /// Authority-only: begin a full index rebuild (delete artifacts + isBuilding).
   ///
   /// Callers: schema migration / key migration. Empty tables should not call
-  /// this — leave meta absent; [writeChanges] synthesizes empty meta on demand.
+  /// this - leave meta absent; [writeChanges] synthesizes empty meta on demand.
   Future<void> beginIndexBuild(
     TableContext table,
     IndexSchema indexSchema,
@@ -1110,7 +1110,7 @@ class IndexManager {
 
   /// Get index metadata by [indexUid].
   ///
-  /// 1. Load by IndexUid only (cache / disk) — O(1) hot path.
+  /// 1. Load by IndexUid only (cache / disk) - O(1) hot path.
   /// 2. Only when that returns empty: treat the token as indexName, resolve a
   ///    different uid, and load once more (legacy compat).
   Future<IndexMeta?> getIndexMeta(
@@ -1125,7 +1125,7 @@ class IndexManager {
     final table = await _dataStore.tableMetaManager?.getTableContext(tableUid);
     if (table == null) return null;
     final resolved = _resolveIndexUidFromIndexName(table, indexUid.value);
-    // Same uid ⇒ the IndexUid path already missed; do not retry.
+    // Same uid -> the IndexUid path already missed; do not retry.
     if (resolved.isEmpty || resolved == indexUid) return null;
     return _loadIndexMetaCached(tableUid, resolved);
   }
@@ -1359,7 +1359,7 @@ class IndexManager {
   /// [TableDataManager.clearTable] only removes the data partition directory;
   /// indexes live under `{table}/index/` and must be cleared separately.
   /// Deletes that root once (not per-index) and clears memory caches. Does
-  /// **not** recreate empty [IndexMeta] — the next [writeChanges] synthesizes
+  /// **not** recreate empty [IndexMeta] - the next [writeChanges] synthesizes
   /// meta on demand.
   Future<void> clearIndexesForTable(TableContext table) async {
     try {
@@ -1620,6 +1620,7 @@ class IndexManager {
               fields: c.fields,
               value: c.value,
               indexName: c.indexName,
+              existingPrimaryKey: existing,
             );
           }
         }
@@ -1665,6 +1666,7 @@ class IndexManager {
                   fields: constraint.fields,
                   value: constraint.value,
                   indexName: constraint.indexName,
+                  existingPrimaryKey: existingPk,
                 );
               }
             }
@@ -1785,6 +1787,9 @@ class IndexManager {
               fields: constraint.fields,
               value: constraint.value,
               indexName: constraint.indexName,
+              existingPrimaryKey: (existingPk != null && existingPk.isNotEmpty)
+                  ? existingPk
+                  : null,
             );
           }
         }
@@ -2246,11 +2251,12 @@ class IndexManager {
       return null;
     }
 
-    final records = await _dataStore.executeQuery(
+    final records = (await _dataStore.queryExecutor.execute(
       table,
-      condition,
+      condition: condition,
       limit: 2,
-    );
+    ))
+        .records;
     for (final record in records) {
       final pk = record[schema.primaryKey]?.toString();
       if (pk == null || pk.isEmpty) {
@@ -2550,7 +2556,7 @@ class IndexManager {
     await _dataStore.storage.moveDirectory(legacyPath, stablePath);
   }
 
-  /// Migrate vector nodeId↔PK mapping B+Tree dirs from legacy logical names.
+  /// Migrate vector nodeId->PK mapping B+Tree dirs from legacy logical names.
   Future<void> _migrateLegacyMappingIndexDirectoriesIfNeeded(
     TableContext table, {
     required IndexUid indexUid,
@@ -2618,7 +2624,7 @@ class IndexManager {
 
   /// Helper to encode index key from record.
   ///
-  /// B+Tree keys remain memcomparable field tuples — [indexUid] selects which
+  /// B+Tree keys remain memcomparable field tuples - [indexUid] selects which
   /// index tree to write, not what goes into [MemComparableKey.encodeTuple].
   Uint8List? encodeIndexKeyFromRecord({
     required TableSchema schema,
