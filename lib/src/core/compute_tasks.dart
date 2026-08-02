@@ -713,6 +713,10 @@ Map<String, dynamic> applyMigrationOperationsSync(
           record.remove(oldPk.name);
         }
         break;
+      case MigrationType.promoteFieldToPrimaryKey:
+        // Handled by transformPromoteOldToNewInPlace (dual-write / backfill);
+        // no in-place rewrite on the old working table.
+        break;
       default:
         // Other operations (indexes, renameTable, TTL, etc.) do not affect record payload directly
         break;
