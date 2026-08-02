@@ -78,6 +78,7 @@ import 'notification_manager.dart';
 import 'overflow_manager.dart';
 import 'parallel_journal_manager.dart';
 import 'path_manager.dart';
+import 'promote_primary_key.dart';
 import 'read_view_manager.dart';
 import 'resource_manager.dart';
 import 'table_meta_manager.dart';
@@ -225,7 +226,7 @@ class DataStoreImpl {
   /// Immutable after first persist / v3 upgrade. Falls back to
   /// [InternalConfig.defaultPageSize] when GlobalConfig is not loaded or when
   /// legacy configs still carry `pageSize == 0` (unset). Note: `??` alone is
-  /// insufficient — a loaded cache with pageSize 0 must also fall back.
+  /// insufficient - a loaded cache with pageSize 0 must also fall back.
   int get configuredPageSize {
     final ps = _globalConfigCache?.pageSize ?? 0;
     return ps > 0 ? ps : InternalConfig.defaultPageSize;
@@ -530,7 +531,7 @@ class DataStoreImpl {
     });
   }
 
-  /// Space aggregates — owned by [TableDataManager] (InternalKv + live deltas).
+  /// Space aggregates - owned by [TableDataManager] (InternalKv + live deltas).
   Future<SpaceStats> getSpaceStats() => tableDataManager.getSpaceStats();
 
   /// Get database version
@@ -557,7 +558,7 @@ class DataStoreImpl {
   /// External user operations must wait for full initialization to complete.
   ///
   /// After [close] resets [_initCompleter] with nothing initializing, waiting
-  /// would hang forever — throw [DbClosedException] instead.
+  /// would hang forever - throw [DbClosedException] instead.
   Future<void> ensureInitialized() async {
     // Check if this is a system/internal operation (e.g., updating system tables during table creation)
     final isSystemOp = TransactionContext.isSystemOperation();
@@ -577,12 +578,12 @@ class DataStoreImpl {
     if (_isInitialized) return;
 
     // Close finished (or not yet opened): Completer is incomplete and nobody
-    // is running initialize — never park on that future.
+    // is running initialize - never park on that future.
     if (!_initializing && !_initCompleter.isCompleted) {
       throw DbClosedException();
     }
 
-    // Mid-close: flags cleared but previous Completer still completed — do not
+    // Mid-close: flags cleared but previous Completer still completed - do not
     // await; callers in the close flush window proceed (managers may still
     // exist). Late work after Completer reset hits the branch above.
     if (!_initCompleter.isCompleted) {
@@ -1159,7 +1160,7 @@ class DataStoreImpl {
         backgroundWriteScheduler.clearAll();
 
         // Primary instance only: wait for user transactions to drain, then flush.
-        // Migration helper instances share LockManager — entering maintenance
+        // Migration helper instances share LockManager - entering maintenance
         // from them deadlocks the parent's stopAllMigrations await.
         var enteredMaintenance = false;
         try {
@@ -1227,7 +1228,7 @@ class DataStoreImpl {
             Logger.warn('Storage flush/close failed', rawError: e);
           }
         } finally {
-          // Always clear maintenance — even if flush/dispose threw — otherwise
+          // Always clear maintenance - even if flush/dispose threw - otherwise
           // switchSpace reuses a LockManager stuck in maintenance and user ops
           // can stall for baseLockTimeout.
           if (enteredMaintenance) {
@@ -1306,7 +1307,7 @@ class DataStoreImpl {
       await ensureInitialized();
     }
 
-    // Privilege is caller-asserted only — never inferred from table name.
+    // Privilege is caller-asserted only - never inferred from table name.
     final tableSchema =
         schema.materializeForCreate(isSystemTable: isSystemTable);
     final tableUid = tableSchema.tableUid;
@@ -1649,8 +1650,11 @@ class DataStoreImpl {
   ///
   /// [retryOnPkConflict] is an internal flag to avoid infinite recursion when
   /// automatically retrying once after fixing a sequential primary key conflict.
+  /// [enablePromoteDualWrite] user-facing default true; engine/migration must
+  /// pass false to avoid promote old->shadow recursion.
   Future<DbResult> insert(String tableName, Map<String, dynamic> data,
-      {bool retryOnPkConflict = false}) async {
+      {bool retryOnPkConflict = false,
+      bool enablePromoteDualWrite = true}) async {
     DbResult finish(DbResult r) => _returnOrThrowIfTxn(r, 'insert', tableName);
     // Need to be fully initialized
     if (!_isInitialized) {
@@ -1671,10 +1675,19 @@ class DataStoreImpl {
 
     Map<String, dynamic>? validData;
     TableContext? table;
+    PromoteRuntimeDescriptor? promoteDesc;
 
     try {
       // 1. Data validation
       table = await getTableContext(tableName);
+      promoteDesc = _promoteRuntimeForDualWrite(
+        table.tableUid,
+        enablePromoteDualWrite: enablePromoteDualWrite,
+      );
+      if (promoteDesc != null) {
+        // User data is target-shaped; old table is the write authority.
+        _promoteRemapRecordNewToOld(data, promoteDesc);
+      }
       final schema = table.schema;
 
       final validationErrors = <String>[];
@@ -1747,7 +1760,9 @@ class DataStoreImpl {
                   table, providedId);
             }
             if (!retryOnPkConflict) {
-              return await insert(tableName, data, retryOnPkConflict: true);
+              return await insert(tableName, data,
+                  retryOnPkConflict: true,
+                  enablePromoteDualWrite: enablePromoteDualWrite);
             }
           }
 
@@ -1816,7 +1831,9 @@ class DataStoreImpl {
               );
             } catch (_) {}
 
-            return await insert(tableName, data, retryOnPkConflict: true);
+            return await insert(tableName, data,
+                retryOnPkConflict: true,
+                enablePromoteDualWrite: enablePromoteDualWrite);
           }
         }
 
@@ -1864,10 +1881,17 @@ class DataStoreImpl {
         record: orderedValidData,
       ));
 
-      // Return string type primary key value
-      final primaryKeyValue = validData[schema.primaryKey];
+      if (promoteDesc != null) {
+        await _promoteMirrorUpsertToShadow(promoteDesc, [orderedValidData]);
+      }
+
+      // Old-table success is authoritative; user-facing PK is O(1) field read
+      // of the source unique field (already remapped new->old above).
+      final primaryKeyValue = promoteDesc != null
+          ? _promoteUserFacingSuccessKey(orderedValidData, promoteDesc)
+          : validData[schema.primaryKey]?.toString();
       return finish(DbResult.success(
-        successKey: primaryKeyValue?.toString(),
+        successKey: primaryKeyValue,
         message: 'Insert successful',
       ));
     } catch (e) {
@@ -2301,23 +2325,26 @@ class DataStoreImpl {
     return merged;
   }
 
-  /// Execute query
-  Future<List<Map<String, dynamic>>> executeQuery(
+  /// User-facing query helper.
+  ///
+  /// Opt-in promote result reshape ([applyPromoteResultTransform]: true).
+  /// Engine / migration / system paths must call [queryExecutor].execute
+  /// directly (default keeps old-working row shape).
+  Future<List<Map<String, dynamic>>> executeUserQuery(
     TableContext table,
     QueryCondition condition, {
     List<String>? orderBy,
     int? limit,
     int? offset,
   }) async {
-    // Execute query using QueryExecutor (optimizer runs inside executor).
-    final result = await _queryExecutor?.execute(
-          table,
-          condition: condition,
-          orderBy: orderBy,
-          limit: limit,
-          offset: offset,
-        ) ??
-        const ExecuteResult.empty();
+    final result = await queryExecutor.execute(
+      table,
+      condition: condition,
+      orderBy: orderBy,
+      limit: limit,
+      offset: offset,
+      applyPromoteResultTransform: true,
+    );
     return result.records;
   }
 
@@ -2466,6 +2493,9 @@ class DataStoreImpl {
   }
 
   /// update record
+  ///
+  /// [enablePromoteDualWrite] user-facing default true; engine/migration must
+  /// pass false to avoid promote old->shadow recursion.
   Future<DbResult> updateInternal(
     TableContext table,
     Map<String, dynamic> data,
@@ -2480,6 +2510,7 @@ class DataStoreImpl {
     String? checkpointOpId,
     String? checkpointCursor,
     bool returnResultDetails = true,
+    bool enablePromoteDualWrite = true,
   }) async {
     final tableName = table.tableName;
     DbResult finish(DbResult r) => _returnOrThrowIfTxn(r, 'update', tableName);
@@ -2521,6 +2552,14 @@ class DataStoreImpl {
     try {
       // validate data
       final schema = table.schema;
+      final promoteDesc = _promoteRuntimeForDualWrite(
+        table.tableUid,
+        enablePromoteDualWrite: enablePromoteDualWrite,
+      );
+      if (promoteDesc != null) {
+        remapPromoteConditionNewToOld(condition, promoteDesc);
+        _promoteRemapRecordNewToOld(data, promoteDesc);
+      }
       Map<String, dynamic>? validData;
       try {
         validData = await _validateAndProcessUpdateData(schema, data, table);
@@ -2715,6 +2754,9 @@ class DataStoreImpl {
 
       // If inside a transaction and this is a heavy update path, we should defer execution
       if (!isOptimizableQuery) {
+        if (promoteDesc != null) {
+          return finish(_promoteRejectLargeOp(tableName, 'update'));
+        }
         if (returnResultDetails) {
           return finish(DbResult.error(
             type: ResultType.devLargeScaleOperationBypassRequired,
@@ -2780,8 +2822,14 @@ class DataStoreImpl {
         // find matching records (for optimizable queries)
         // Use a large internal limit when limit is null to avoid default QueryLimit (e.g. 1000)
         final int effectiveLimit = limit ?? 1000000000;
-        final records = await executeQuery(table, condition,
-            orderBy: orderBy, limit: effectiveLimit, offset: offset);
+        final records = (await queryExecutor.execute(
+          table,
+          condition: condition,
+          orderBy: orderBy,
+          limit: effectiveLimit,
+          offset: offset,
+        ))
+            .records;
         if (records.isEmpty) {
           return finish(DbResult.error(
             type: ResultType.bizRecordNotFound,
@@ -2853,6 +2901,23 @@ class DataStoreImpl {
         final List<String> failedKeys = [];
         int successCount = 0;
         int failedCount = 0;
+        final promoteUpdated =
+            promoteDesc != null ? <Map<String, dynamic>>[] : null;
+        final hasNotify = notificationManager.hasListeners(table.tableUid);
+
+        // Mirror successful old-working rows before returning; skip when the
+        // active transaction will abort and roll back those writes.
+        Future<DbResult> finishWithPromoteMirror(DbResult r) async {
+          final String? activeTxId = Zone.current[_txnZoneKey] as String?;
+          final bool rollbackOnError =
+              Zone.current[_txnRollbackOnErrorKey] as bool? ?? true;
+          if (activeTxId != null && rollbackOnError && r.hasErrors) {
+            promoteUpdated?.clear();
+          } else {
+            await _promoteFlushMirrorWritten(promoteDesc, promoteUpdated);
+          }
+          return finish(r);
+        }
 
         // Row-level locks for target records
         final lockMgr = lockManager;
@@ -2932,7 +2997,7 @@ class DataStoreImpl {
                   failedCount++;
                   continue;
                 }
-                return finish(DbResult.error(
+                return finishWithPromoteMirror(DbResult.error(
                   type: e.constraintResultType,
                   message: e.message,
                   failedKeys: returnResultDetails ? [recordKey] : const [],
@@ -2969,7 +3034,7 @@ class DataStoreImpl {
                   failedCount++;
                   continue;
                 }
-                return finish(DbResult.error(
+                return finishWithPromoteMirror(DbResult.error(
                   type: ResultType.bizForeignKeyViolation,
                   message: e.toString(),
                   failedKeys: returnResultDetails ? [recordKey] : const [],
@@ -3015,7 +3080,7 @@ class DataStoreImpl {
             if (continueOnPartialErrors) {
               continue;
             }
-            return finish(DbResult.error(
+            return finishWithPromoteMirror(DbResult.error(
               type: uniqueViolation?.constraintResultType ??
                   ResultType.bizUniqueViolation,
               message:
@@ -3046,7 +3111,7 @@ class DataStoreImpl {
                   continue;
                 }
                 // release unique locks before returning
-                return finish(DbResult.error(
+                return finishWithPromoteMirror(DbResult.error(
                   type: ResultType.engError,
                   message: 'Lock conflict on primary key $recordKey',
                 ));
@@ -3105,7 +3170,7 @@ class DataStoreImpl {
             schemaVersion: table.schema.schemaVersion ?? '',
           );
 
-          if (notificationManager.hasListeners(table.tableUid)) {
+          if (hasNotify) {
             notificationManager.notify(ChangeEvent(
               type: ChangeType.update,
               tableUid: table.tableUid,
@@ -3114,11 +3179,20 @@ class DataStoreImpl {
             ));
           }
 
-          // Add to success keys list
+          // Add to success keys list (user-facing PK when promote is active).
           if (returnResultDetails) {
-            successKeys.add(recordKey);
+            successKeys.add(
+              promoteDesc != null
+                  ? _promoteUserFacingSuccessKey(
+                      updatedRecord,
+                      promoteDesc,
+                      alternateRecord: record,
+                    )
+                  : recordKey,
+            );
           }
           successCount++;
+          promoteUpdated?.add(updatedRecord);
         }
 
         // Non-transaction: release locks immediately; transaction: release by commit/rollback
@@ -3135,7 +3209,7 @@ class DataStoreImpl {
         // If there are both successful and failed records
         if (successCount > 0 && failedCount > 0) {
           if (!returnResultDetails) {
-            return finish(DbResult(
+            return finishWithPromoteMirror(DbResult(
               statuses: const [],
               successKeys: const [],
               failedKeys: const [],
@@ -3143,7 +3217,7 @@ class DataStoreImpl {
               failedCount: failedCount,
             ));
           }
-          return finish(DbResult.batch(
+          return finishWithPromoteMirror(DbResult.batch(
             successKeys: successKeys,
             failedKeys: failedKeys,
             message:
@@ -3153,7 +3227,7 @@ class DataStoreImpl {
           if (partialUniqueFailedKeys != null) {
             final int partialFailedCount = partialUniqueFailedKeys.length;
             if (!returnResultDetails) {
-              return finish(DbResult(
+              return finishWithPromoteMirror(DbResult(
                 statuses: const [],
                 successKeys: const [],
                 failedKeys: const [],
@@ -3161,7 +3235,7 @@ class DataStoreImpl {
                 failedCount: partialFailedCount,
               ));
             }
-            return finish(DbResult.batch(
+            return finishWithPromoteMirror(DbResult.batch(
               successKeys: successKeys,
               failedKeys: partialUniqueFailedKeys,
               message:
@@ -3169,7 +3243,7 @@ class DataStoreImpl {
             ));
           }
           if (!returnResultDetails) {
-            return finish(DbResult(
+            return finishWithPromoteMirror(DbResult(
               statuses: const [],
               successKeys: const [],
               failedKeys: const [],
@@ -3177,7 +3251,7 @@ class DataStoreImpl {
               failedCount: 0,
             ));
           }
-          return finish(DbResult.success(
+          return finishWithPromoteMirror(DbResult.success(
             successKeys: successKeys,
             message:
                 'Update successful, affected ${successKeys.length} records',
@@ -3214,7 +3288,10 @@ class DataStoreImpl {
   /// Returns [DbResult] to allow graceful error handling for business logic errors
   /// (e.g., RESTRICT foreign key constraints) instead of throwing exceptions
   /// This is consistent with other business operations (insert, update, delete)
-  Future<DbResult> clear(String tableName, {bool registerWalOp = true}) async {
+  ///
+  /// [enablePromoteDualWrite] when true (default), also clears the promote shadow.
+  Future<DbResult> clear(String tableName,
+      {bool registerWalOp = true, bool enablePromoteDualWrite = true}) async {
     DbResult finish(DbResult r) => _returnOrThrowIfTxn(r, 'clear', tableName);
 
     if (registerWalOp) {
@@ -3250,7 +3327,7 @@ class DataStoreImpl {
           await _foreignKeyManager!.handleCascadeClear(table);
         } catch (e) {
           Logger.error('Cascade clear failed', rawError: e);
-          // RESTRICT rejects before mutating children — drop the pending WAL op
+          // RESTRICT rejects before mutating children - drop the pending WAL op
           // so restart will not keep replaying a clear that never started.
           // Mid-cascade failures keep the op so resume can finish the wipe.
           if (_isFkRestrictBeforeMutation(e)) {
@@ -3262,7 +3339,7 @@ class DataStoreImpl {
 
       // Abort in-flight / queued schema rewrites and purge all background writes
       // before wiping rows; otherwise a late flush could resurrect cleared data.
-      // Key migration pause is global — always resume in finally after wipe.
+      // Key migration pause is global - always resume in finally after wipe.
       var keyMigrationPaused = false;
       try {
         keyMigrationPaused =
@@ -3277,8 +3354,16 @@ class DataStoreImpl {
         await tableDataManager.clearTable(table);
 
         // Wipe `{table}/index/` root (data clear does not touch it). Writes
-        // recreate index meta/files on demand — no empty IndexMeta pre-create.
+        // recreate index meta/files on demand - no empty IndexMeta pre-create.
         await _indexManager?.clearIndexesForTable(table);
+
+        final promoteDesc = _promoteRuntimeForDualWrite(
+          table.tableUid,
+          enablePromoteDualWrite: enablePromoteDualWrite,
+        );
+        if (promoteDesc != null) {
+          await _promoteMirrorClearShadow(promoteDesc);
+        }
       } finally {
         // Restarts KeyMigrationRunner for remaining tables (and this empty one).
         migrationManager
@@ -3344,6 +3429,7 @@ class DataStoreImpl {
     String? checkpointOpId,
     String? checkpointCursor,
     bool returnResultDetails = true,
+    bool enablePromoteDualWrite = true,
   }) async {
     final tableName = table.tableName;
     DbResult finish(DbResult r) => _returnOrThrowIfTxn(r, 'delete', tableName);
@@ -3384,7 +3470,8 @@ class DataStoreImpl {
 
         // Use clear() for better performance when deleting all records
         // clear() now returns DbResult for graceful error handling
-        final clearResult = await clear(tableName);
+        final clearResult = await clear(tableName,
+            enablePromoteDualWrite: enablePromoteDualWrite);
         if (!clearResult.hasErrors) {
           return finish(DbResult.success(
             message: 'All records in table $tableName have been deleted',
@@ -3410,6 +3497,13 @@ class DataStoreImpl {
 
       // get table schema
       final schema = table.schema;
+      final promoteDesc = _promoteRuntimeForDualWrite(
+        table.tableUid,
+        enablePromoteDualWrite: enablePromoteDualWrite,
+      );
+      if (promoteDesc != null) {
+        remapPromoteConditionNewToOld(condition, promoteDesc);
+      }
 
       final conditionMap = condition.build();
 
@@ -3491,12 +3585,22 @@ class DataStoreImpl {
       }
 
       // when table record count is less than threshold or this is an optimizable query, use regular method
+      if (!isOptimizableQuery && promoteDesc != null) {
+        return finish(_promoteRejectLargeOp(tableName, 'delete'));
+      }
+
       if (isOptimizableQuery) {
         // standard method: get all records
         // Use a large internal limit when limit is null to avoid default QueryLimit (e.g. 1000)
         final int effectiveLimit = limit ?? 1000000000;
-        final recordsToDelete = await executeQuery(table, condition,
-            orderBy: orderBy, limit: effectiveLimit, offset: offset);
+        final recordsToDelete = (await queryExecutor.execute(
+          table,
+          condition: condition,
+          orderBy: orderBy,
+          limit: effectiveLimit,
+          offset: offset,
+        ))
+            .records;
 
         if (recordsToDelete.isEmpty) {
           return finish(DbResult.success(
@@ -3558,8 +3662,11 @@ class DataStoreImpl {
           }
         }
 
-        // Collect successful primary keys
+        // Collect successful keys. Engine internals (locks / write-set / cache)
+        // always use old-table PK; user-facing successKeys use promote source
+        // field when active - collected directly, no post-pass remap.
         final List<String> successKeys = [];
+        final List<String> deletedOldPks = [];
         int successCount = 0;
 
         // Row-level locks for delete
@@ -3570,14 +3677,14 @@ class DataStoreImpl {
             YieldController('DataStoreImpl._deleteInternal.loop');
         for (var i = 0; i < recordsToDelete.length; i++) {
           final record = recordsToDelete[i];
-          final pkValue = record[primaryKey]?.toString();
-          if (pkValue == null) {
+          final oldPk = record[primaryKey]?.toString();
+          if (oldPk == null) {
             continue;
           }
           // Acquire lock per record with unique operation id per resource
           if (lockMgr != null) {
             try {
-              final res = 'row:$tableName:pk:$pkValue';
+              final res = 'row:$tableName:pk:$oldPk';
               final opId = GlobalIdGenerator.generate('delete_row_');
               final ok = await lockMgr.acquireExclusiveLock(res, opId);
               if (ok) {
@@ -3588,15 +3695,19 @@ class DataStoreImpl {
               }
             } catch (_) {}
           }
-          // Add to success keys
-          if (txId == null || returnResultDetails) {
-            successKeys.add(pkValue);
+          deletedOldPks.add(oldPk);
+          if (returnResultDetails) {
+            successKeys.add(
+              promoteDesc != null
+                  ? _promoteUserFacingSuccessKey(record, promoteDesc)
+                  : oldPk,
+            );
           }
           successCount++;
 
           // Register write-set for SSI conflict detection
           if (txId != null) {
-            transactionManager?.registerWriteKey(txId, table, pkValue);
+            transactionManager?.registerWriteKey(txId, table, oldPk);
           }
 
           await yieldController.maybeYield();
@@ -3615,7 +3726,7 @@ class DataStoreImpl {
 
         // Remove from record cache only when not in a transaction
         if (txId == null) {
-          await tableDataManager.removeTableRecords(table, successKeys);
+          await tableDataManager.removeTableRecords(table, deletedOldPks);
         }
 
         // Add records to delete buffer instead of directly writing to file
@@ -3633,6 +3744,10 @@ class DataStoreImpl {
               oldRecord: record,
             ));
           }
+        }
+
+        if (promoteDesc != null && successCount > 0) {
+          await _promoteMirrorDeleteFromShadow(promoteDesc, recordsToDelete);
         }
 
         if (!returnResultDetails) {
@@ -4020,8 +4135,8 @@ class DataStoreImpl {
         }
 
         // Abort and remove all pending/running schema tasks for this table
-        // before physical delete — rewrites must not touch a dropped table.
-        // Key migration pause is global — always resume in finally after drop.
+        // before physical delete rewrites must not touch a dropped table.
+        // Key migration pause is global always resume in finally after drop.
         var keyMigrationPaused = false;
         try {
           keyMigrationPaused =
@@ -4169,9 +4284,16 @@ class DataStoreImpl {
 
   /// batch insert data
   /// [allowPartialErrors] if true, continue processing remaining records even if some fail
+  /// [enablePromoteDualWrite] user-facing default true; pass false when caller
+  /// owns promote mirroring (e.g. [batchUpsert]) or when writing the shadow table.
+  /// [promoteResultKeyDesc] when dual-write is disabled but caller still wants
+  /// user-facing success keys (O(1) per success row in the existing loop).
   Future<DbResult> batchInsert(
       String tableName, List<Map<String, dynamic>> records,
-      {bool allowPartialErrors = true, bool returnResultDetails = true}) async {
+      {bool allowPartialErrors = true,
+      bool returnResultDetails = true,
+      bool enablePromoteDualWrite = true,
+      PromoteRuntimeDescriptor? promoteResultKeyDesc}) async {
     DbResult finish(DbResult r) =>
         _returnOrThrowIfTxn(r, 'batchInsert', tableName);
     await ensureInitialized();
@@ -4206,6 +4328,39 @@ class DataStoreImpl {
           type: ResultType.devTableNotFound,
           message: 'Table $tableName does not exist',
         ));
+      }
+
+      final promoteDesc = _promoteRuntimeForDualWrite(
+        table.tableUid,
+        enablePromoteDualWrite: enablePromoteDualWrite,
+      );
+      final promoteKeyDesc = promoteDesc ?? promoteResultKeyDesc;
+      if (promoteDesc != null) {
+        final remapYield = YieldController(
+          'DataStoreImpl.batchInsert.promoteRemap',
+          checkInterval: 256,
+        );
+        for (final record in records) {
+          await remapYield.maybeYield();
+          _promoteRemapRecordNewToOld(record, promoteDesc);
+        }
+      }
+      // Collect successful rows for shadow mirror when dual-write is enabled.
+      final promoteWritten =
+          promoteDesc != null ? <Map<String, dynamic>>[] : null;
+
+      // Mirror successful old-working rows before returning; skip when the
+      // active transaction will abort and roll back those writes.
+      Future<DbResult> finishWithPromoteMirror(DbResult r) async {
+        final String? activeTxId = Zone.current[_txnZoneKey] as String?;
+        final bool rollbackOnError =
+            Zone.current[_txnRollbackOnErrorKey] as bool? ?? true;
+        if (activeTxId != null && rollbackOnError && r.hasErrors) {
+          promoteWritten?.clear();
+        } else {
+          await _promoteFlushMirrorWritten(promoteDesc, promoteWritten);
+        }
+        return finish(r);
       }
 
       final TableSchema tableSchema = schema;
@@ -4556,16 +4711,26 @@ class DataStoreImpl {
             );
 
             if (bufferResult.successRecordIds.isNotEmpty) {
-              if (returnResultDetails) {
-                successKeys.addAll(bufferResult.successRecordIds);
-              }
               successCount += bufferResult.successRecordIds.length;
 
-              if (notificationManager.hasListeners(tableSchema.tableUid)) {
+              final hasNotify =
+                  notificationManager.hasListeners(tableSchema.tableUid);
+              if (promoteKeyDesc != null ||
+                  promoteWritten != null ||
+                  hasNotify) {
                 final successSet = bufferResult.successRecordIds.toSet();
                 for (final record in batchRecordsForBuffer) {
                   final pkVal = record[primaryKey]?.toString();
-                  if (pkVal != null && successSet.contains(pkVal)) {
+                  if (pkVal == null || !successSet.contains(pkVal)) continue;
+                  if (returnResultDetails) {
+                    successKeys.add(
+                      promoteKeyDesc != null
+                          ? _promoteUserFacingSuccessKey(record, promoteKeyDesc)
+                          : pkVal,
+                    );
+                  }
+                  promoteWritten?.add(record);
+                  if (hasNotify) {
                     notificationManager.notify(ChangeEvent(
                       type: ChangeType.insert,
                       tableUid: tableSchema.tableUid,
@@ -4573,6 +4738,8 @@ class DataStoreImpl {
                     ));
                   }
                 }
+              } else if (returnResultDetails) {
+                successKeys.addAll(bufferResult.successRecordIds);
               }
             }
 
@@ -4834,7 +5001,7 @@ class DataStoreImpl {
                     if (!allowPartialErrors) {
                       // Flush pending successful records to avoid leaving reservations behind.
                       await flushBatch();
-                      return finish(DbResult.error(
+                      return finishWithPromoteMirror(DbResult.error(
                         type: e.constraintResultType,
                         message: e.message,
                         failedKeys: returnResultDetails ? failedKeys : const [],
@@ -4854,7 +5021,7 @@ class DataStoreImpl {
                   if (batchRecordsForBuffer.length >= bufferBatchSize) {
                     final bool hadFlushFailures = await flushBatch();
                     if (hadFlushFailures && !allowPartialErrors) {
-                      return finish(DbResult.error(
+                      return finishWithPromoteMirror(DbResult.error(
                         type: ResultType.engError,
                         message: 'Error processing record: WAL append failed',
                         failedKeys: returnResultDetails ? failedKeys : const [],
@@ -4887,7 +5054,7 @@ class DataStoreImpl {
               if (!allowPartialErrors) {
                 // Flush pending successful records to avoid leaving reservations behind.
                 await flushBatch();
-                return finish(DbResult.error(
+                return finishWithPromoteMirror(DbResult.error(
                   type: ResultType.engError,
                   message: 'Error processing record: $e',
                   failedKeys: returnResultDetails ? failedKeys : const [],
@@ -4898,7 +5065,7 @@ class DataStoreImpl {
 
           final bool hadFlushFailures = await flushBatch();
           if (hadFlushFailures && !allowPartialErrors) {
-            return finish(DbResult.error(
+            return finishWithPromoteMirror(DbResult.error(
               type: ResultType.engError,
               message: 'Error processing record: WAL append failed',
               failedKeys: returnResultDetails ? failedKeys : const [],
@@ -4909,15 +5076,19 @@ class DataStoreImpl {
         }
 
         if (returnResultDetails) {
-          // Fill success statuses
+          // Fill success statuses (match on user-facing keys when promote active)
           final successSet = successKeys.toSet();
           for (int i = 0; i < records.length; i++) {
-            final pkVal = records[i][primaryKey]?.toString() ?? '';
-            if (pkVal.isNotEmpty && successSet.contains(pkVal)) {
+            final oldPk = records[i][primaryKey]?.toString() ?? '';
+            if (oldPk.isEmpty) continue;
+            final displayPk = promoteKeyDesc != null
+                ? _promoteUserFacingSuccessKey(records[i], promoteKeyDesc)
+                : oldPk;
+            if (successSet.contains(displayPk)) {
               batchStatuses.add(SuccessStatus(
                 message: 'Record inserted successfully',
                 index: i,
-                primaryKey: pkVal,
+                primaryKey: displayPk,
               ));
             }
           }
@@ -4936,7 +5107,7 @@ class DataStoreImpl {
             message =
                 '$message. Example validation errors: ${preview.join(" | ")}$suffix';
           }
-          return finish(DbResult.error(
+          return finishWithPromoteMirror(DbResult.error(
             type: ResultType.bizValidationFailed,
             message: message,
             failedKeys: returnResultDetails ? failedKeys : const [],
@@ -4958,7 +5129,7 @@ class DataStoreImpl {
             message =
                 '$message. Example validation errors: ${preview.join(" | ")}$suffix';
           }
-          return finish(DbResult.error(
+          return finishWithPromoteMirror(DbResult.error(
             type: ResultType.bizValidationFailed,
             message: message,
             failedKeys: returnResultDetails ? failedKeys : const [],
@@ -4968,7 +5139,7 @@ class DataStoreImpl {
 
         // Return result
         if (invalidRecords.isEmpty) {
-          return finish(DbResult(
+          return finishWithPromoteMirror(DbResult(
             statuses: returnResultDetails ? batchStatuses : const [],
             successKeys: returnResultDetails ? successKeys : const [],
             failedKeys: const [],
@@ -4988,7 +5159,7 @@ class DataStoreImpl {
             message =
                 '$message. Example validation errors: ${preview.join(" | ")}$suffix';
           }
-          return finish(DbResult(
+          return finishWithPromoteMirror(DbResult(
             statuses: returnResultDetails ? batchStatuses : const [],
             successKeys: returnResultDetails ? successKeys : const [],
             failedKeys: returnResultDetails ? failedKeys : const [],
@@ -5035,9 +5206,14 @@ class DataStoreImpl {
   /// Batch upsert: each record must contain all non-nullable fields + pk or all fields
   /// of at least one unique index. No where support.
   /// Optimized to use batch index probing for high throughput.
+  ///
+  /// [enablePromoteDualWrite] user-facing default true; pass false for shadow
+  /// backfill / mirror writes to prevent promote dual-write recursion.
   Future<DbResult> batchUpsert(
       String tableName, List<Map<String, dynamic>> records,
-      {bool allowPartialErrors = true, bool returnResultDetails = true}) async {
+      {bool allowPartialErrors = true,
+      bool returnResultDetails = true,
+      bool enablePromoteDualWrite = true}) async {
     DbResult finish(DbResult r) =>
         _returnOrThrowIfTxn(r, 'batchUpsert', tableName);
     await ensureInitialized();
@@ -5059,6 +5235,20 @@ class DataStoreImpl {
 
     final table = await getTableContext(tableName);
     final schema = table.schema;
+    final promoteDesc = _promoteRuntimeForDualWrite(
+      table.tableUid,
+      enablePromoteDualWrite: enablePromoteDualWrite,
+    );
+    if (promoteDesc != null) {
+      final remapYield = YieldController(
+        'DataStoreImpl.batchUpsert.promoteRemap',
+        checkInterval: 256,
+      );
+      for (final record in records) {
+        await remapYield.maybeYield();
+        _promoteRemapRecordNewToOld(record, promoteDesc);
+      }
+    }
 
     final uniqueIndexes =
         tableMetaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
@@ -5153,22 +5343,63 @@ class DataStoreImpl {
       }
 
       // 3. Batch Update for existing records
+      // Promote mirror is owned once at this layer - nested batchUpdate /
+      // batchInsert disable dual-write; pass promoteResultKeyDesc so success
+      // keys are still O(1) user-facing reads without a post-mirror remap.
+      // When promote is active, always collect keys so mirror can filter to
+      // successful rows only (even if caller skipped returnResultDetails).
+      final trackKeys = returnResultDetails || promoteDesc != null;
+
+      Future<void> mirrorSuccessfulPromoteRows(List<String> userKeys) async {
+        if (promoteDesc == null || userKeys.isEmpty) return;
+        final successSet = userKeys.toSet();
+        final toMirror = <Map<String, dynamic>>[];
+        final mirrorYield = YieldController(
+          'DataStoreImpl.batchUpsert.promoteMirrorFilter',
+          checkInterval: 256,
+        );
+        for (final rec in validatedRecords) {
+          await mirrorYield.maybeYield();
+          final userPk = _promoteUserFacingSuccessKey(rec, promoteDesc);
+          if (userPk.isNotEmpty && successSet.contains(userPk)) {
+            toMirror.add(rec);
+          }
+        }
+        if (toMirror.isNotEmpty) {
+          await _promoteMirrorUpsertToShadow(promoteDesc, toMirror);
+        }
+      }
+
       if (toUpdate.isNotEmpty) {
         final upResult = await batchUpdate(
           tableName,
           toUpdate,
           allowPartialErrors: allowPartialErrors,
-          returnResultDetails: returnResultDetails,
+          returnResultDetails: trackKeys,
+          enablePromoteDualWrite: false,
+          promoteResultKeyDesc: promoteDesc,
         );
         if (!upResult.hasErrors || allowPartialErrors) {
-          if (returnResultDetails) {
+          if (trackKeys) {
             successKeys.addAll(upResult.successKeys);
             failedKeys.addAll(upResult.failedKeys);
           }
           successCount += upResult.successCount;
           failedCount += upResult.failedCount;
         } else {
-          return finish(upResult);
+          // Prior sub-batches may already have landed on the old table.
+          await mirrorSuccessfulPromoteRows(upResult.successKeys);
+          return finish(
+            returnResultDetails
+                ? upResult
+                : DbResult(
+                    statuses: upResult.statuses,
+                    successKeys: const [],
+                    failedKeys: const [],
+                    successCount: upResult.successCount,
+                    failedCount: upResult.failedCount,
+                  ),
+          );
         }
       }
 
@@ -5178,18 +5409,35 @@ class DataStoreImpl {
           tableName,
           toInsert,
           allowPartialErrors: allowPartialErrors,
-          returnResultDetails: returnResultDetails,
+          returnResultDetails: trackKeys,
+          enablePromoteDualWrite: false,
+          promoteResultKeyDesc: promoteDesc,
         );
-        if (returnResultDetails) {
+        if (trackKeys) {
           successKeys.addAll(insResult.successKeys);
           failedKeys.addAll(insResult.failedKeys);
         }
         successCount += insResult.successCount;
         failedCount += insResult.failedCount;
         if (!allowPartialErrors && insResult.hasErrors) {
-          return finish(insResult);
+          await mirrorSuccessfulPromoteRows(successKeys);
+          return finish(
+            returnResultDetails
+                ? insResult
+                : DbResult(
+                    statuses: insResult.statuses,
+                    successKeys: const [],
+                    failedKeys: const [],
+                    successCount: insResult.successCount,
+                    failedCount: insResult.failedCount,
+                  ),
+          );
         }
       }
+
+      // Online dual-write: old table already written above; mirror only
+      // successful rows to the shadow (never re-write the old table).
+      await mirrorSuccessfulPromoteRows(successKeys);
 
       String message = 'Batch upsert completed';
       if (failedCount > 0) {
@@ -5234,9 +5482,17 @@ class DataStoreImpl {
   }
 
   /// batch update data based on primary keys or unique identifiers.
+  ///
+  /// [enablePromoteDualWrite] user-facing default true; pass false when caller
+  /// owns promote mirroring (e.g. [batchUpsert]) or when writing the shadow.
+  /// [promoteResultKeyDesc] when dual-write is disabled but caller still wants
+  /// user-facing success keys (O(1) per success row in the existing loop).
   Future<DbResult> batchUpdate(
       String tableName, List<Map<String, dynamic>> records,
-      {bool allowPartialErrors = true, bool returnResultDetails = true}) async {
+      {bool allowPartialErrors = true,
+      bool returnResultDetails = true,
+      bool enablePromoteDualWrite = true,
+      PromoteRuntimeDescriptor? promoteResultKeyDesc}) async {
     DbResult finish(DbResult r) =>
         _returnOrThrowIfTxn(r, 'batchUpdate', tableName);
     await ensureInitialized();
@@ -5268,6 +5524,38 @@ class DataStoreImpl {
 
     final String? txId = Zone.current[_txnZoneKey] as String?;
     final table = await getTableContext(tableName);
+    final promoteDesc = _promoteRuntimeForDualWrite(
+      table.tableUid,
+      enablePromoteDualWrite: enablePromoteDualWrite,
+    );
+    final promoteKeyDesc = promoteDesc ?? promoteResultKeyDesc;
+    if (promoteDesc != null) {
+      final remapYield = YieldController(
+        'DataStoreImpl.batchUpdate.promoteRemap',
+        checkInterval: 256,
+      );
+      for (final record in records) {
+        await remapYield.maybeYield();
+        _promoteRemapRecordNewToOld(record, promoteDesc);
+      }
+    }
+    final promoteWritten =
+        promoteDesc != null ? <Map<String, dynamic>>[] : null;
+
+    // Mirror successful old-working rows before returning; skip when the
+    // active transaction will abort and roll back those writes.
+    Future<DbResult> finishWithPromoteMirror(DbResult r) async {
+      final String? activeTxId = Zone.current[_txnZoneKey] as String?;
+      final bool rollbackOnError =
+          Zone.current[_txnRollbackOnErrorKey] as bool? ?? true;
+      if (activeTxId != null && rollbackOnError && r.hasErrors) {
+        promoteWritten?.clear();
+      } else {
+        await _promoteFlushMirrorWritten(promoteDesc, promoteWritten);
+      }
+      return finish(r);
+    }
+
     final primaryKey = schema.primaryKey;
     final allUniqueIndexes =
         tableMetaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
@@ -5398,6 +5686,7 @@ class DataStoreImpl {
         YieldController('DataStoreImpl.batchUpdate.batch', checkInterval: 1);
     final executionYield =
         YieldController('DataStoreImpl.batchUpdate.execute', checkInterval: 50);
+    final hasNotify = notificationManager.hasListeners(schema.tableUid);
 
     try {
       // Process in batches to maintain UI responsiveness and manage memory
@@ -5420,11 +5709,12 @@ class DataStoreImpl {
         if (pkList.isEmpty) continue;
 
         // 4. Bulk Fetch Existing Records
-        final results = await executeQuery(
+        final results = (await queryExecutor.execute(
           table,
-          QueryCondition()..whereIn(primaryKey, pkList),
+          condition: QueryCondition()..whereIn(primaryKey, pkList),
           limit: pkList.length,
-        );
+        ))
+            .records;
 
         // Convert results to a map for O(1) lookup
         final Map<String, Map<String, dynamic>> resultsMap = {
@@ -5450,7 +5740,7 @@ class DataStoreImpl {
               failedCount++;
             }
           }
-          return finish(DbResult.error(
+          return finishWithPromoteMirror(DbResult.error(
             type: ResultType.bizRecordNotFound,
             message: 'Some records not found during batchUpdate',
             failedKeys: returnResultDetails ? failedKeys : const [],
@@ -5525,7 +5815,7 @@ class DataStoreImpl {
             }
             failedCount++;
             if (!allowPartialErrors) {
-              return finish(DbResult.error(
+              return finishWithPromoteMirror(DbResult.error(
                 type: ResultType.bizValidationFailed,
                 message: 'Data validation failed for record $pkVal',
                 failedKeys: returnResultDetails ? failedKeys : const [],
@@ -5555,7 +5845,7 @@ class DataStoreImpl {
             }
             failedCount++;
             if (!allowPartialErrors) {
-              return finish(DbResult.error(
+              return finishWithPromoteMirror(DbResult.error(
                 type: ResultType.bizValidationFailed,
                 message: preparedRecord.fieldConstraintErrors.join("; "),
                 failedKeys: returnResultDetails ? failedKeys : const [],
@@ -5570,7 +5860,15 @@ class DataStoreImpl {
           if (updatedRecord == null) continue;
           if (changedFields.isEmpty) {
             if (returnResultDetails) {
-              successKeys.add(pkVal);
+              successKeys.add(
+                promoteKeyDesc != null
+                    ? _promoteUserFacingSuccessKey(
+                        updatedRecord,
+                        promoteKeyDesc,
+                        alternateRecord: existingRecord,
+                      )
+                    : pkVal,
+              );
             }
             successCount++;
             continue;
@@ -5647,7 +5945,7 @@ class DataStoreImpl {
                     );
                   } catch (_) {}
                 }
-                return finish(DbResult.error(
+                return finishWithPromoteMirror(DbResult.error(
                   type: violationType,
                   message: violationMessage,
                   failedKeys: returnResultDetails ? failedKeys : const [],
@@ -5731,7 +6029,7 @@ class DataStoreImpl {
                   );
                 } catch (_) {}
               }
-              return finish(DbResult.error(
+              return finishWithPromoteMirror(DbResult.error(
                 type: violation.constraintResultType,
                 message: violation.message,
                 failedKeys: returnResultDetails ? failedKeys : const [],
@@ -5795,7 +6093,7 @@ class DataStoreImpl {
                     );
                   } catch (_) {}
                 }
-                return finish(DbResult.error(
+                return finishWithPromoteMirror(DbResult.error(
                   type: ResultType.bizForeignKeyViolation,
                   message: e.toString(),
                   failedKeys: returnResultDetails ? failedKeys : const [],
@@ -5835,7 +6133,17 @@ class DataStoreImpl {
           );
 
           if (returnResultDetails) {
-            successKeys.addAll(commitResult.successRecordIds);
+            if (promoteKeyDesc != null) {
+              final successSet = commitResult.successRecordIds.toSet();
+              for (final rec in recordsToCommit) {
+                final pkVal = rec[primaryKey]?.toString();
+                if (pkVal == null || !successSet.contains(pkVal)) continue;
+                successKeys
+                    .add(_promoteUserFacingSuccessKey(rec, promoteKeyDesc));
+              }
+            } else {
+              successKeys.addAll(commitResult.successRecordIds);
+            }
           }
           successCount += commitResult.successRecordIds.length;
 
@@ -5858,39 +6166,46 @@ class DataStoreImpl {
           }
 
           if (commitResult.successRecordIds.isNotEmpty &&
-              notificationManager.hasListeners(schema.tableUid)) {
+              (promoteWritten != null || hasNotify)) {
             final successSet = commitResult.successRecordIds.toSet();
             for (int k = 0; k < recordsToCommit.length; k++) {
               if (successSet.contains(commitPkVals[k])) {
-                notificationManager.notify(ChangeEvent(
-                  type: ChangeType.update,
-                  tableUid: schema.tableUid,
-                  record: recordsToCommit[k],
-                  oldRecord: oldRecordsToCommit[k],
-                ));
+                promoteWritten?.add(recordsToCommit[k]);
+                if (hasNotify) {
+                  notificationManager.notify(ChangeEvent(
+                    type: ChangeType.update,
+                    tableUid: schema.tableUid,
+                    record: recordsToCommit[k],
+                    oldRecord: oldRecordsToCommit[k],
+                  ));
+                }
               }
             }
           }
         }
       }
 
-      // Fill success statuses
+      // Fill success statuses (match on user-facing keys when promote active)
       if (returnResultDetails) {
         final successSet = successKeys.toSet();
         for (int i = 0; i < records.length; i++) {
-          final pkVal = records[i][primaryKey]?.toString() ?? '';
-          if (pkVal.isNotEmpty && successSet.contains(pkVal)) {
+          final oldPk = records[i][primaryKey]?.toString() ?? '';
+          if (oldPk.isEmpty) continue;
+          final displayPk = promoteKeyDesc != null
+              ? _promoteUserFacingSuccessKey(records[i], promoteKeyDesc)
+              : oldPk;
+          if (successSet.contains(displayPk)) {
             batchStatuses.add(SuccessStatus(
               message: 'Record updated successfully',
               index: i,
-              primaryKey: pkVal,
+              primaryKey: displayPk,
             ));
           }
         }
       }
 
       if (successCount > 0 && failedCount > 0) {
-        return finish(DbResult(
+        return finishWithPromoteMirror(DbResult(
           statuses: returnResultDetails ? batchStatuses : const [],
           successKeys: returnResultDetails ? successKeys : const [],
           failedKeys: returnResultDetails ? failedKeys : const [],
@@ -5898,7 +6213,7 @@ class DataStoreImpl {
           failedCount: failedCount,
         ));
       } else if (successCount > 0) {
-        return finish(DbResult(
+        return finishWithPromoteMirror(DbResult(
           statuses: returnResultDetails ? batchStatuses : const [],
           successKeys: returnResultDetails ? successKeys : const [],
           failedKeys: const [],
@@ -5906,7 +6221,7 @@ class DataStoreImpl {
           failedCount: 0,
         ));
       } else {
-        return finish(DbResult.error(
+        return finishWithPromoteMirror(DbResult.error(
           type: ResultType.bizRecordNotFound,
           message: 'No records were updated',
           failedKeys: returnResultDetails ? failedKeys : const [],
@@ -6082,9 +6397,10 @@ class DataStoreImpl {
           continue;
         }
 
-        await executeQuery(
+        await queryExecutor.execute(
           table,
-          QueryCondition()..where(SystemTable.keyValueKeyField, '>=', ''),
+          condition: QueryCondition()
+            ..where(SystemTable.keyValueKeyField, '>=', ''),
           limit: maxRecordsSafetyCap,
         );
         currentPrewarmedBytes += estimatedBytes;
@@ -6150,9 +6466,9 @@ class DataStoreImpl {
           break;
         }
 
-        await executeQuery(
+        await queryExecutor.execute(
           table,
-          QueryCondition()..where(schema.primaryKey, '>=', ''),
+          condition: QueryCondition()..where(schema.primaryKey, '>=', ''),
           limit: maxRecordsSafetyCap,
         );
         await yieldController.maybeYield();
@@ -6285,11 +6601,12 @@ class DataStoreImpl {
       }
       final condition = QueryCondition()..where(schema.primaryKey, '=', id);
 
-      final results = await executeQuery(
+      final results = (await queryExecutor.execute(
         table,
-        condition,
+        condition: condition,
         limit: 1,
-      );
+      ))
+          .records;
       return results.isEmpty ? null : results.first;
     } catch (e) {
       Logger.error('Query by id failed', rawError: e);
@@ -6311,7 +6628,11 @@ class DataStoreImpl {
       }
       final condition = QueryCondition()..where(field, '=', value);
 
-      return await executeQuery(table, condition);
+      return (await queryExecutor.execute(
+        table,
+        condition: condition,
+      ))
+          .records;
     } catch (e) {
       Logger.error('Query by field failed', rawError: e);
       rethrow;
@@ -6372,7 +6693,7 @@ class DataStoreImpl {
     final oldSpaceName = _currentSpaceName;
     try {
       // Pause key migration on the primary before tearing down space files.
-      // Helper (isMigrationInstance) close must not cancel this runner — that is
+      // Helper (isMigrationInstance) close must not cancel this runner - that is
       // enforced inside KeyManager.pauseKeyMigration.
       final paused = await _keyManager?.pauseKeyMigration() ?? true;
       if (!paused) {
@@ -6628,11 +6949,12 @@ class DataStoreImpl {
 
     final tableName = SystemTable.getKeyValueName(isGlobal);
     final table = await getTableContext(tableName);
-    final result = await executeQuery(
+    final result = (await queryExecutor.execute(
       table,
-      QueryCondition()..where(_kvKeyField, '=', key),
+      condition: QueryCondition()..where(_kvKeyField, '=', key),
       limit: 1,
-    );
+    ))
+        .records;
     if (result.isEmpty) {
       return null;
     }
@@ -6656,7 +6978,11 @@ class DataStoreImpl {
       condition.whereStartsWith(_kvKeyField, prefix);
     }
 
-    final rows = await executeQuery(table, condition);
+    final rows = (await queryExecutor.execute(
+      table,
+      condition: condition,
+    ))
+        .records;
     final now = DateTime.now();
     final keys = <String>[];
 
@@ -6676,11 +7002,12 @@ class DataStoreImpl {
     await ensureInitialized();
     final tableName = SystemTable.getKeyValueName(isGlobal);
     final table = await getTableContext(tableName);
-    final result = await executeQuery(
+    final result = (await queryExecutor.execute(
       table,
-      QueryCondition()..where(_kvKeyField, '=', key),
+      condition: QueryCondition()..where(_kvKeyField, '=', key),
       limit: 1,
-    );
+    ))
+        .records;
     if (result.isEmpty) return false;
 
     final row = result.first;
@@ -6720,11 +7047,12 @@ class DataStoreImpl {
     await ensureInitialized();
     final tableName = SystemTable.getKeyValueName(isGlobal);
     final table = await getTableContext(tableName);
-    final result = await executeQuery(
+    final result = (await queryExecutor.execute(
       table,
-      QueryCondition()..where(_kvKeyField, '=', key),
+      condition: QueryCondition()..where(_kvKeyField, '=', key),
       limit: 1,
-    );
+    ))
+        .records;
     if (result.isEmpty) return null;
 
     final row = result.first;
@@ -6796,7 +7124,11 @@ class DataStoreImpl {
         condition: condition,
         distinct: distinct,
         loadSnapshot: () async {
-          final rows = await executeQuery(table, condition);
+          final rows = (await queryExecutor.execute(
+            table,
+            condition: condition,
+          ))
+              .records;
           if (rows.isEmpty) {
             return (
               value: defaultValue,
@@ -6852,7 +7184,11 @@ class DataStoreImpl {
         condition: condition,
         distinct: distinct,
         loadSnapshot: () async {
-          final rows = await executeQuery(table, condition);
+          final rows = (await queryExecutor.execute(
+            table,
+            condition: condition,
+          ))
+              .records;
           final rowsByKey = <String, Map<String, dynamic>>{};
           for (final row in rows) {
             final rowKey = row[_kvKeyField];
@@ -7114,7 +7450,14 @@ class DataStoreImpl {
 
   /// get table schema by name (user-facing entry point)
   Future<TableSchema?> getTableSchema(String tableName) async {
-    return tableMetaManager?.getTableSchemaByName(TableName(tableName));
+    final schema =
+        await tableMetaManager?.getTableSchemaByName(TableName(tableName));
+    if (schema == null) return null;
+    final target = migrationManager?.getPromoteTargetSchema(schema.tableUid);
+    if (target == null) return schema;
+    // Overlay target shape; keep the logical user-facing table name.
+    if (target.name == schema.name) return target;
+    return target.copyWith(name: schema.name);
   }
 
   /// Get table info
@@ -7122,7 +7465,8 @@ class DataStoreImpl {
   Future<TableInfo?> getTableInfo(String tableName) async {
     await ensureInitialized();
     final table = await getTableContext(tableName);
-    final schema = table.schema;
+    // User-facing schema overlay during promote (engine TableContext stays old).
+    final schema = await getTableSchema(tableName) ?? table.schema;
     final part0Path =
         await pathManager.getPartitionFilePathByNo(table.tableUid, 0);
     DateTime? createdAt;
@@ -7143,6 +7487,230 @@ class DataStoreImpl {
       isGlobal: schema.isGlobal,
       lastModified: tableDataManager.getLastModifiedTime(table),
       createdAt: createdAt,
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // promoteFieldToPrimaryKey dual-write helpers (old table is source of truth)
+  // ---------------------------------------------------------------------------
+
+  PromoteRuntimeDescriptor? _promoteRuntimeForDualWrite(
+    TableUid tableUid, {
+    required bool enablePromoteDualWrite,
+  }) {
+    // Hard gate: engine/migration callers must pass false. Never rely on
+    // "shadow uid not in map" alone - a single missed flag would recurse.
+    if (!enablePromoteDualWrite) return null;
+    return migrationManager?.getPromoteRuntime(tableUid);
+  }
+
+  /// Remap user-facing record keys to old working shape (in-place).
+  void _promoteRemapRecordNewToOld(
+    Map<String, dynamic> record,
+    PromoteRuntimeDescriptor desc,
+  ) {
+    transformPromoteNewToOldInPlace(record, desc);
+  }
+
+  /// Upsert transformed old-table rows onto the promote shadow table.
+  ///
+  /// Does not own user-facing success keys - callers read the source-field
+  /// value (O(1)) from the already-successful old-table record.
+  ///
+  /// Failure policy (old table write already succeeded):
+  /// - [DbClosedException] / closing: silent return
+  /// - business-only errors: warn, do not interrupt the caller
+  /// - eng / sys / dev errors: throw [DbException]
+  Future<void> _promoteMirrorUpsertToShadow(
+    PromoteRuntimeDescriptor desc,
+    List<Map<String, dynamic>> oldRecords,
+  ) async {
+    if (oldRecords.isEmpty) return;
+    if (isClosing) return;
+    final shadowName = promoteShadowTableName(desc.taskId);
+    final payloads = <Map<String, dynamic>>[];
+    final yieldController = YieldController(
+      'DataStoreImpl.promoteMirrorUpsert',
+      checkInterval: 128,
+    );
+    for (final old in oldRecords) {
+      await yieldController.maybeYield();
+      final row = Map<String, dynamic>.from(old);
+      transformPromoteOldToNewInPlace(row, desc);
+      payloads.add(row);
+    }
+    try {
+      // allowPartialErrors: a single business conflict must not abort the
+      // whole mirror batch; hard failures are classified below.
+      final result = await batchUpsert(
+        shadowName,
+        payloads,
+        allowPartialErrors: true,
+        returnResultDetails: false,
+        enablePromoteDualWrite: false,
+      );
+      _promoteThrowIfNonBusinessFailure(result);
+    } on DbClosedException {
+      // Shutdown: old write may already be durable; do not surface noise.
+    } catch (e) {
+      _promoteRethrowUnlessBusinessOrClosed(e);
+    }
+  }
+
+  /// Flush collected successful old-working rows to the promote shadow, then
+  /// clear [written] only after mirror completes without a hard failure.
+  Future<void> _promoteFlushMirrorWritten(
+    PromoteRuntimeDescriptor? desc,
+    List<Map<String, dynamic>>? written,
+  ) async {
+    if (desc == null || written == null || written.isEmpty) return;
+    final batch = List<Map<String, dynamic>>.from(written);
+    await _promoteMirrorUpsertToShadow(desc, batch);
+    written.clear();
+  }
+
+  /// User-facing success key from an old-working record (O(1) field read).
+  ///
+  /// After new->old remap the value lives under [PromoteRuntimeDescriptor.sourceFieldName].
+  /// Never falls back to the old auto PK - that would leak the internal identity.
+  String _promoteUserFacingSuccessKey(
+    Map<String, dynamic> oldWorkingRecord,
+    PromoteRuntimeDescriptor desc, {
+    Map<String, dynamic>? alternateRecord,
+  }) {
+    return promoteUserFacingPkFromOldRecord(oldWorkingRecord, desc) ??
+        (alternateRecord != null
+            ? promoteUserFacingPkFromOldRecord(alternateRecord, desc)
+            : null) ??
+        '';
+  }
+
+  /// Delete matching rows from the promote shadow table by target PK.
+  ///
+  /// Same failure policy as [_promoteMirrorUpsertToShadow].
+  Future<void> _promoteMirrorDeleteFromShadow(
+    PromoteRuntimeDescriptor desc,
+    List<Map<String, dynamic>> oldRecords,
+  ) async {
+    if (oldRecords.isEmpty) return;
+    if (isClosing) return;
+    final shadowCtx =
+        await migrationManager?.getPromoteShadowTableContext(desc.tableUid);
+    if (shadowCtx == null) {
+      return;
+    }
+
+    final targetPk = desc.targetPkName;
+    // Per-record collection: check roughly every 64 items.
+    final collectYield = YieldController(
+      'DataStoreImpl.promoteMirrorDelete.collect',
+      checkInterval: 64,
+    );
+    final pkValues = <String>[];
+    for (final old in oldRecords) {
+      await collectYield.maybeYield();
+      final v = old[desc.sourceFieldName] ?? old[targetPk];
+      if (v != null) pkValues.add(v.toString());
+    }
+    if (pkValues.isEmpty) return;
+
+    // Each iteration already sends 500 keys; check every chunk.
+    final chunkYield = YieldController(
+      'DataStoreImpl.promoteMirrorDelete.chunk',
+      checkInterval: 1,
+    );
+    const chunkSize = 500;
+    try {
+      for (var i = 0; i < pkValues.length; i += chunkSize) {
+        await chunkYield.maybeYield();
+        final end = min(i + chunkSize, pkValues.length);
+        final chunk = pkValues.sublist(i, end);
+        final result = await deleteInternal(
+          shadowCtx,
+          QueryCondition().where(targetPk, 'IN', chunk),
+          allowAll: false,
+          returnResultDetails: false,
+          enablePromoteDualWrite: false,
+        );
+        _promoteThrowIfNonBusinessFailure(result);
+      }
+    } on DbClosedException {
+      // Shutdown: silent.
+    } catch (e) {
+      _promoteRethrowUnlessBusinessOrClosed(e);
+    }
+  }
+
+  /// Clear shadow table data when the logical table is cleared mid-promote.
+  Future<void> _promoteMirrorClearShadow(
+    PromoteRuntimeDescriptor desc,
+  ) async {
+    if (isClosing) return;
+    final shadowCtx =
+        await migrationManager?.getPromoteShadowTableContext(desc.tableUid);
+    if (shadowCtx == null) {
+      return;
+    }
+    try {
+      // Direct physical clear - never route through clear()/deleteInternal
+      // user dual-write (would recurse onto the same shadow).
+      await cacheManager.invalidateCache(shadowCtx, invalidateSchema: false);
+      await tableDataManager.clearTable(shadowCtx);
+      await _indexManager?.clearIndexesForTable(shadowCtx);
+    } on DbClosedException {
+      // Shutdown: silent.
+    } catch (e) {
+      _promoteRethrowUnlessBusinessOrClosed(e);
+    }
+  }
+
+  /// Skip business-only failures; otherwise throw with the original statuses.
+  ///
+  /// [returnResultDetails] is false for promote mirrors (no PK lists needed).
+  /// Error [ResultType]s still arrive on [DbResult.statuses] for hard-fail
+  /// paths; when statuses are empty we do not invent a generic type.
+  void _promoteThrowIfNonBusinessFailure(DbResult result) {
+    if (!result.hasErrors) return;
+    final statuses = result.statuses;
+    if (statuses.isEmpty) return;
+    if (_promoteIsBusinessOnlyStatuses(statuses)) return;
+    throw DbException(statuses);
+  }
+
+  /// Swallow [DbClosedException] and business-only [DbException]; otherwise
+  /// rethrow the original exception unchanged.
+  void _promoteRethrowUnlessBusinessOrClosed(Object e) {
+    if (e is DbClosedException) return;
+    if (e is DbException && _promoteIsBusinessOnlyStatuses(e.statuses)) {
+      return;
+    }
+    throw e;
+  }
+
+  bool _promoteIsBusinessOnlyStatuses(List<ResultStatus> statuses) {
+    if (statuses.isEmpty) return false;
+    return statuses.every(
+      (s) => s.type == ResultType.success || s.type.isBusinessError,
+    );
+  }
+
+  DbResult _promoteRejectLargeOp(String tableName, String op) {
+    return DbResult.error(
+      type: ResultType.devMigrationPromoteLargeOpNotAllowed,
+      message:
+          'Table "$tableName" is running promoteFieldToPrimaryKey; $op with a '
+          'non-optimizable (large-range) condition may cause memory exhaustion. '
+          'Narrow the query scope or wait until promote completes, then retry.',
+      statuses: [
+        SchemaValidationStatus(
+          type: ResultType.devMigrationPromoteLargeOpNotAllowed,
+          message:
+              'Table "$tableName" is running promoteFieldToPrimaryKey; $op with a '
+              'non-optimizable (large-range) condition may cause memory exhaustion. '
+              'Narrow the query scope or wait until promote completes, then retry.',
+          tableName: tableName,
+        ),
+      ],
     );
   }
 
@@ -7315,7 +7883,7 @@ class DataStoreImpl {
         return decoded.config;
       }
 
-      // Pre-v3: read JSON into memory only — do NOT write TOBF or delete JSON.
+      // Pre-v3: read JSON into memory only - do NOT write TOBF or delete JSON.
       // `tableDirectoryMap` must remain on disk until V3Upgrade consumes it.
       final legacy = await LegacyConfigBootstrap.readGlobalConfig(this);
       if (legacy != null) {
@@ -7373,7 +7941,7 @@ class DataStoreImpl {
   ///
   /// Skips when [version] is less than 3, or when this process already confirmed
   /// the stub for [version] ([_downgradeGuardJsonVersion]). On restart, probes
-  /// the existing stub first — matching version avoids a redundant rewrite.
+  /// the existing stub first - matching version avoids a redundant rewrite.
   Future<void> ensureDowngradeGuardJson({required int version}) async {
     if (version < 3) return;
     if (_downgradeGuardJsonVersion == version) return;
@@ -7440,7 +8008,7 @@ class DataStoreImpl {
       }
 
       // Schema inventory (user tables). Record/size stats remain space-local
-      // via [SpaceStats] / path isolation — not a "touched tables" list.
+      // via [SpaceStats] / path isolation - not a "touched tables" list.
       final userTables = await getTableNames(onlyUserTables: true);
 
       return SpaceInfo(
