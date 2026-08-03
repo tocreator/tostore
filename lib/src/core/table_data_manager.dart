@@ -2830,7 +2830,7 @@ class TableDataManager {
           // Always zero per-table count cache (system KV included).
           _tableRecordCounts[table.tableUid] = 0;
 
-          await _dataStore.writeBufferManager.clearTable(table);
+          await _dataStore.writeBufferManager.clearTableByUid(table.tableUid);
 
           // 2. directly delete the entire partition directory
           bool deletedDir = false;
@@ -3335,7 +3335,7 @@ class TableDataManager {
     // legacy buffers removed
 
     // Clear WAL-driven table-level write buffer and queue to prevent subsequent writes
-    _dataStore.writeBufferManager.clearTable(table);
+    _dataStore.writeBufferManager.clearTableByUid(table.tableUid);
 
     // Clean up other caches
     _tableDataMetaCache.remove(table.tableUid);
