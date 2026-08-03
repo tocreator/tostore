@@ -442,11 +442,12 @@ class TtlCleanupManager {
       for (final entry in entries) {
         await yieldController.maybeYield();
 
-        final rows = await _dataStore.executeQuery(
+        final rows = (await _dataStore.queryExecutor.execute(
           table,
-          QueryCondition()..where(pkName, '=', entry.primaryKey),
+          condition: QueryCondition()..where(pkName, '=', entry.primaryKey),
           limit: 1,
-        );
+        ))
+            .records;
         if (rows.isEmpty) {
           await _removeKvExpiryIndexEntry(table, entry.keyBytes);
           continue;
