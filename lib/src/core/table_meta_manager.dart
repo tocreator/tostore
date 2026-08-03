@@ -21,7 +21,7 @@ import 'transaction_context.dart';
 import 'tree_cache.dart';
 import 'yield_controller.dart';
 
-/// Table meta manager — stores metadata in `_system_table_meta`.
+/// Table meta manager - stores metadata in `_system_table_meta`.
 class TableMetaManager {
   final DataStoreImpl _dataStore;
 
@@ -45,7 +45,7 @@ class TableMetaManager {
   final Map<TableUid, FieldStorageLayout> _tableFieldLayoutCache =
       <TableUid, FieldStorageLayout>{};
 
-  /// Committed meta for `_system_table_meta` itself — survives TreeCache eviction.
+  /// Committed meta for `_system_table_meta` itself - survives TreeCache eviction.
   ///
   /// Never holds a bootstrap-only stub: only memoryOnly/disk [saveTableMeta] or
   /// a decoded self-row. Path IO uses [bootstrapTableMetaContext] / fixed uid.
@@ -60,7 +60,7 @@ class TableMetaManager {
 
   static const String _deletedSlotFieldPrefix = '_system_storage_deleted_slot_';
 
-  /// Name→uid inventory for **all** tables in the database.
+  /// Name->UID inventory for **all** tables in the database.
   ///
   /// After [loadAllTableMetaAsync] completes this is the complete lightweight
   /// listing source and is **not** cleared by TreeCache eviction of full
@@ -69,7 +69,7 @@ class TableMetaManager {
   /// still isolated per space via paths; schema inventory is database-wide.
   final Map<TableName, TableUid> _uidByName = {};
 
-  /// Uid→name reverse inventory (same scope / lifetime as [_uidByName]).
+  /// UID->name reverse inventory (same scope / lifetime as [_uidByName]).
   final Map<TableUid, TableName> _nameByUid = {};
 
   /// Global table UIDs in the name inventory.
@@ -81,10 +81,10 @@ class TableMetaManager {
   final Map<TableUid, int> _dirIndexByUid = {};
 
   /// True once startup [loadAllTableMetaAsync] (or memory-mode registration)
-  /// finished building the **lightweight** name↔uid inventory.
+  /// finished building the **lightweight** name->UID inventory.
   ///
   /// This is **not** "all [TableMeta] are in TreeCache". After quota eviction the
-  /// inventory stays complete while the cache may be partial — full-meta reads
+  /// inventory stays complete while the cache may be partial - full-meta reads
   /// must still hit `_system_table_meta` on cache miss (see [getTableMeta]).
   bool _nameInventoryReady = false;
 
@@ -104,7 +104,7 @@ class TableMetaManager {
 
   TableMetaManager(this._dataStore);
 
-  /// Whether the lightweight name↔uid inventory is complete for listing.
+  /// Whether the lightweight name->UID inventory is complete for listing.
   bool get isNameInventoryReady => _nameInventoryReady;
 
   /// Mark name inventory complete (e.g. memory-mode startup after all schemas
@@ -117,7 +117,7 @@ class TableMetaManager {
   /// Set TreeCache `all` flag only when every inventoried uid is still hot.
   ///
   /// [_nameInventoryReady] may be true while this stays false (eviction left a
-  /// partial cache) — miss paths must then query the system table.
+  /// partial cache) - miss paths must then query the system table.
   void _syncTableMetaFullyCachedFlag() {
     final cache = _ensureTableMetaCache();
     if (!_nameInventoryReady || _nameByUid.isEmpty) {
@@ -131,11 +131,11 @@ class TableMetaManager {
     cache.setFullyCached('all', true);
   }
 
-  /// Resolve tableUid from tableName (inventory → system table when cold).
+  /// Resolve tableUid from tableName (inventory - system table when cold).
   Future<TableUid?> getUidByName(TableName tableName) =>
       resolveTableUidFromName(tableName);
 
-  /// Resolve tableName from tableUid (inventory first; cold → [getTableMeta]).
+  /// Resolve tableName from tableUid (inventory first; cold - [getTableMeta]).
   Future<TableName?> getNameByUid(TableUid tableUid) async {
     if (tableUid.isEmpty) return null;
     final inv = _nameByUid[tableUid];
@@ -145,13 +145,13 @@ class TableMetaManager {
     return meta?.tableName;
   }
 
-  /// Memory-only name→uid peek. Do not use for existence / correctness.
+  /// Memory-only name->UID peek. Do not use for existence / correctness.
   TableUid? _peekUidByName(TableName tableName) {
     if (tableName.isEmpty) return null;
     return _uidByName[tableName];
   }
 
-  /// Memory-only uid→name peek (logs / best-effort display only).
+  /// Memory-only UID->name peek (logs / best-effort display only).
   TableName? _peekNameByUid(TableUid tableUid) {
     if (tableUid.isEmpty) return null;
     return _nameByUid[tableUid] ?? _tableMetaCache?.peek(tableUid)?.tableName;
@@ -327,7 +327,7 @@ class TableMetaManager {
   }
 
   /// Ensure physical layout for meta-table IO without registering the table as
-  /// existing (stub ≠ exists).
+  /// existing (stub - exists).
   void _ensureMetaTableIoLayout() {
     final uid = SystemTable.tableMetaTableUid;
     if (_tableFieldLayoutCache.containsKey(uid)) return;
@@ -342,7 +342,7 @@ class TableMetaManager {
 
   /// Get [TableContext] by tableUid (asynchronous).
   ///
-  /// Uses [getTableMeta]: memory → fully-cached miss = absent → else system table.
+  /// Uses [getTableMeta]: memory - fully-cached miss = absent - else system table.
   Future<TableContext?> getTableContext(TableUid tableUid) async {
     if (tableUid.isEmpty) return null;
     var uid = tableUid;
@@ -675,7 +675,7 @@ class TableMetaManager {
   /// - When [existingLayout] is null (create table), builds an initial layout.
   ///
   /// Never call [_createInitialFieldStorageLayout] for an existing table that
-  /// already has a stored layout — that drops deletion markers and slot ids.
+  /// already has a stored layout - that drops deletion markers and slot ids.
   FieldStorageLayout evolveFieldStorageLayout({
     FieldStorageLayout? existingLayout,
     required TableSchema nextSchema,
@@ -704,7 +704,7 @@ class TableMetaManager {
       }
     }
 
-    // renameHints: oldName → newName; invert to newName → oldName for match.
+    // renameHints: oldName -> newName; invert to newName -> oldName for match.
     final newToOld = _invertRenameHints(renameHints);
 
     for (final field in nextSchema.fields) {
@@ -763,7 +763,7 @@ class TableMetaManager {
     return FieldStorageLayout(nextSlotId: nextSlotId, slots: slots);
   }
 
-  /// Invert old→new rename hints to new→old (last write wins on duplicate new).
+  /// Invert old->new rename hints to new->old (last write wins on duplicate new).
   static Map<String, String> _invertRenameHints(
     Map<String, String> renameHints,
   ) {
@@ -776,7 +776,7 @@ class TableMetaManager {
     return out;
   }
 
-  /// Walk new→old chain to the oldest name; stops on cycles.
+  /// Walk new->old chain to the oldest name; stops on cycles.
   static String? _resolveOriginalFieldName(
     String fieldName,
     Map<String, String> newToOld,
@@ -870,7 +870,7 @@ class TableMetaManager {
   /// Get the **persisted** stable field storage layout for a table.
   ///
   /// Always loads from cache / table meta. Never rebuilds from [TableSchema]
-  /// field lists — that would drop deleted-slot markers and break positional
+  /// field lists - that would drop deleted-slot markers and break positional
   /// decode. Schema evolution must go through [evolveFieldStorageLayout] on the
   /// existing layout (or [layoutOverride] on save).
   Future<FieldStorageLayout> getTableFieldLayout(TableUid tableUid) async {
@@ -1139,15 +1139,15 @@ class TableMetaManager {
     await _dataStore.saveGlobalConfig(updated);
   }
 
-  /// Load [TableMeta] by stable uid — the single entry for meta / routing.
+  /// Load [TableMeta] by stable uid - the single entry for meta / routing.
   ///
   /// 1. Hot [TreeCache] (LRU)
-  /// 2. If [_nameInventoryReady] and uid absent from [_nameByUid] → absent
+  /// 2. If [_nameInventoryReady] and uid absent from [_nameByUid] - absent
   /// 3. Else query `_system_table_meta` (cold start, partial inventory, or
   ///    inventory hit but cache miss after eviction)
   ///
   /// Note: [TreeCache.isFullyCached](`all`) alone is **not** used for the
-  /// negative short-circuit — loadAll may set it after mid-load eviction left
+  /// negative short-circuit - loadAll may set it after mid-load eviction left
   /// the TreeCache incomplete while the lightweight inventory is complete.
   Future<TableMeta?> getTableMeta(TableUid tableUid) async {
     if (tableUid.isEmpty) return null;
@@ -1196,7 +1196,7 @@ class TableMetaManager {
 
   /// Load one meta row from `_system_table_meta`.
   ///
-  /// Empty result → `null`. IO/decode errors → [DbException].
+  /// Empty result - `null`. IO/decode errors - [DbException].
   /// When [expectEpoch] mismatches [_cacheEpoch], the decoded meta is returned
   /// but not written into caches (invalidate/dispose raced the load).
   Future<TableMeta?> _doLoadTableMeta(
@@ -1205,12 +1205,13 @@ class TableMetaManager {
   }) async {
     try {
       _ensureMetaTableIoLayout();
-      final rows = await _dataStore.executeQuery(
+      final rows = (await _dataStore.queryExecutor.execute(
         bootstrapTableMetaContext(),
-        QueryCondition()
+        condition: QueryCondition()
           ..where(SystemTable.tableMetaUidField, '=', tableUid.value),
         limit: 1,
-      );
+      ))
+          .records;
       if (rows.isEmpty) return null;
 
       final meta = TableMetaCodec.decodeRow(rows.first);
@@ -1250,7 +1251,7 @@ class TableMetaManager {
     return meta?.schema;
   }
 
-  /// Resolve table uid by name (pure lookup — no space-manifest side effects).
+  /// Resolve table uid by name (pure lookup - no space-manifest side effects).
   ///
   /// Cold path: one point query on `_system_table_meta`. Does **not** await
   /// full name inventory and does **not** activate non-global tables into the
@@ -1258,7 +1259,7 @@ class TableMetaManager {
   Future<TableUid?> resolveTableUidFromName(TableName tableName) async {
     if (tableName.isEmpty) return null;
 
-    // Fixed identity — do not query self by name (bootstrap / cold path).
+    // Fixed identity - do not query self by name (bootstrap / cold path).
     if (tableName.value == SystemTable.tableMetaName) {
       return SystemTable.tableMetaTableUid;
     }
@@ -1266,22 +1267,23 @@ class TableMetaManager {
     final cached = _peekUidByName(tableName);
     if (cached != null) return cached;
 
-    // Full inventory: name miss ⇒ table does not exist (no IO).
+    // Full inventory: name miss - table does not exist (no IO).
     if (_nameInventoryReady) return null;
 
     try {
       _ensureMetaTableIoLayout();
-      final rows = await _dataStore.executeQuery(
+      final rows = (await _dataStore.queryExecutor.execute(
         bootstrapTableMetaContext(),
-        QueryCondition()
+        condition: QueryCondition()
           ..where(SystemTable.tableMetaNameField, '=', tableName.value),
         limit: 1,
-      );
+      ))
+          .records;
       if (rows.isEmpty) return null;
 
       final meta = TableMetaCodec.decodeRow(rows.first);
       // Register before any further await so re-entrant name resolves
-      // (e.g. internal KV → getTableContext) hit memory.
+      // (e.g. internal KV -> getTableContext) hit memory.
       _registerMetaInLookups(meta);
       _cacheTableMeta(meta);
       return meta.tableUid;
@@ -1302,7 +1304,7 @@ class TableMetaManager {
   /// Patch an existing [TableMeta] row (schema / name / layout / extra).
   ///
   /// Loads current meta, applies only provided fields, then persists via
-  /// [saveTableMeta]. Does not create tables; missing uid → [DbException].
+  /// [saveTableMeta]. Does not create tables; missing uid - [DbException].
   /// Does not change [TableMeta.dirIndex] (create/allocate only via save).
   Future<TableMeta> updateTableMeta(
     TableUid tableUid, {
@@ -1365,7 +1367,7 @@ class TableMetaManager {
   ///
   /// Disk write succeeds first; memory inventory/cache is updated only after.
   /// Create path retries only on primary-key (`table_uid`) conflicts with a
-  /// fresh uid — unique/name conflicts and other errors are not retried.
+  /// fresh uid - unique/name conflicts and other errors are not retried.
   Future<TableMeta> saveTableMeta(
     TableMeta meta, {
     bool memoryOnly = false,
@@ -1432,7 +1434,7 @@ class TableMetaManager {
 
       // Dir index: keep existing, or allocate. Bootstrap table is fixed at 0.
       // allocateDirIndex / caller-supplied dirIndex already bump under-capacity
-      // maps — skip a second increment in _registerMetaInLookups for new tables.
+      // maps - skip a second increment in _registerMetaInLookups for new tables.
       if (tableUid == SystemTable.tableMetaTableUid) {
         resolvedDirIndex = SystemTable.tableMetaDirIndex;
         dirPreCounted = false;
@@ -1516,7 +1518,7 @@ class TableMetaManager {
 
       final invName = _nameByUid[preferredUid];
       if (invName != null) {
-        // Same uid — including rename (invName != tableName).
+        // Same uid - including rename (invName != tableName).
         return preferredUid;
       }
       final localMeta = _peekTableMeta(preferredUid);
@@ -1585,7 +1587,7 @@ class TableMetaManager {
         continue;
       }
 
-      // Inventory complete ⇒ candidate not listed is free. Otherwise probe disk.
+      // Inventory complete - candidate not listed is free. Otherwise probe disk.
       if (_nameInventoryReady) {
         return candidate;
       }
@@ -1646,7 +1648,7 @@ class TableMetaManager {
       final newUid = await _allocateUniqueTableUid();
       Logger.warn(
         'tableUid PK collision on persist for ${current.tableName}; '
-        'reallocating ${current.tableUid} → $newUid',
+        'reallocating ${current.tableUid} -> $newUid',
       );
 
       current = current.copyWith(
@@ -1695,7 +1697,7 @@ class TableMetaManager {
         return false;
       }
 
-      // Disk succeeded — drop memory inventory / caches.
+      // Disk succeeded - drop memory inventory / caches.
       _unregisterMetaFromLookups(meta);
       removeCachedTableSchema(tableUid);
 
@@ -1718,7 +1720,7 @@ class TableMetaManager {
   ///
   ///
   /// Awaits the one-shot name inventory when cold (joins
-  /// [loadAllTableMetaAsync]) — never starts a second full-table scan.
+  /// [loadAllTableMetaAsync]) - never starts a second full-table scan.
   Future<List<String>> listAllTables({
     bool onlyUserTables = false,
     bool? isGlobal,
@@ -1827,13 +1829,15 @@ class TableMetaManager {
     final yieldController =
         YieldController('TableMetaManager.loadAllTableMetaAsync');
     try {
-      // Layout only — do not register bootstrap stub as "table exists".
+      // Layout only - do not register bootstrap stub as "table exists".
       _ensureMetaTableIoLayout();
 
-      final rows = await _dataStore.executeQuery(
+      final rows = (await _dataStore.queryExecutor.execute(
         bootstrapTableMetaContext(),
-        QueryCondition()..where(SystemTable.tableMetaUidField, '>=', ''),
-      );
+        condition: QueryCondition()
+          ..where(SystemTable.tableMetaUidField, '>=', ''),
+      ))
+          .records;
 
       for (final row in rows) {
         await yieldController.maybeYield();
@@ -1859,7 +1863,7 @@ class TableMetaManager {
   }
 
   /// Align GlobalConfig dir high-water with lightweight inventory
-  /// ([_dirIndexByUid] / [_globalTableUids]) — survives TreeCache eviction.
+  /// ([_dirIndexByUid] / [_globalTableUids]) - survives TreeCache eviction.
   Future<void> _reconcileDirHighWaterFromMeta() async {
     var maxGlobal = -1;
     var maxNonGlobal = -1;
