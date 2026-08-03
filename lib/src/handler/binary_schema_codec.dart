@@ -60,9 +60,11 @@ class BinarySchemaCodec {
       if (fieldCount > maxFieldCount) {
         return null;
       }
-      if (fieldCount > fieldStructure.length) {
-        // Stored payload has more fields than expected.
-        // Caller may retry with a legacy/old layout decoder.
+      // Require exact slot-count match. A shorter payload must NOT be mapped
+      // onto a longer structure prefix — that silently shifts values into
+      // deleted/leading slots (e.g. promote swap layout mismatch).
+      if (fieldCount != fieldStructure.length) {
+        // Caller may retry with a historic layout or active-slot-only structure.
         return null;
       }
 
