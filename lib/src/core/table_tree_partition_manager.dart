@@ -127,7 +127,46 @@ final class TableTreePartitionManager {
       }
     }
 
-    // Tier 4: Bottom-line fallback decoding with the provided layout
+    // Tier 3.5: Payload encoded without deleted slots (fieldCount == active
+    // slots) while current structure still includes deleted markers — e.g.
+    // promote shadow rows after an evolve layout was incorrectly applied.
+    // Synthetic names match TableMetaManager deleted-slot encode convention.
+    // Must run BEFORE append-only prefix fallback so leading deleted slots
+    // are never silently filled from a compacted payload.
+    if (storedFieldCount != null && storedFieldCount < fieldStruct.length) {
+      final activeStruct = <FieldStructure>[
+        for (final f in fieldStruct)
+          if (!f.name.startsWith('_system_storage_deleted_slot_')) f,
+      ];
+      if (activeStruct.length == storedFieldCount) {
+        final activeDecoded =
+            BinarySchemaCodec.decodeRecord(bytes, activeStruct);
+        if (activeDecoded != null) {
+          return activeDecoded;
+        }
+      }
+
+      // Tier 4a: Append-only evolution (addField). New slots are always
+      // appended by evolveFieldStorageLayout; shorter on-disk payloads map
+      // onto the structure prefix. Refuse if the prefix contains deleted
+      // markers (would shift values — promote/compaction must use 3.5).
+      final prefix = fieldStruct.sublist(0, storedFieldCount);
+      var deletedInPrefix = false;
+      for (final f in prefix) {
+        if (f.name.startsWith('_system_storage_deleted_slot_')) {
+          deletedInPrefix = true;
+          break;
+        }
+      }
+      if (!deletedInPrefix) {
+        final prefixDecoded = BinarySchemaCodec.decodeRecord(bytes, prefix);
+        if (prefixDecoded != null) {
+          return prefixDecoded;
+        }
+      }
+    }
+
+    // Tier 4b: Exact-match fallback with the provided layout
     final fallbackDecoded = BinarySchemaCodec.decodeRecord(bytes, fieldStruct);
     if (fallbackDecoded != null) {
       return fallbackDecoded;
