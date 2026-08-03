@@ -387,6 +387,13 @@ class WriteBufferManager {
   bool get isEmpty => _writeQueue.isEmpty;
   int get queueLength => _writeQueue.length;
 
+  /// True when [tableUid] still has not-yet-flushed buffer records.
+  bool hasPendingWritesForUid(TableUid tableUid) {
+    final buf = _buffersByTableUid[tableUid];
+    if (buf == null) return false;
+    return buf.records.isNotEmpty;
+  }
+
   /// Get the length of the pending cleanup queue (for monitoring)
   int get pendingCleanupCount => _pendingCleanupQueue.length;
 
@@ -1200,8 +1207,8 @@ class WriteBufferManager {
   }
 
   /// Clear buffers and queued entries for a specific table (best effort)
-  Future<void> clearTable(TableContext table) async {
-    final tableUid = table.tableUid;
+  /// Clear buffers and queued entries for [tableUid] (best effort).
+  Future<void> clearTableByUid(TableUid tableUid) async {
     _buffersByTableUid.remove(tableUid);
     // From pending cleanup queue, remove entries for this table
     _pendingCleanupQueue.removeWhere((item) => item.entry.tableUid == tableUid);
