@@ -56,6 +56,7 @@ abstract final class PrimaryKeyConfigFieldId {
   static const int type = 2;
   static const int sequentialConfig = 3;
   static const int isOrdered = 4;
+  static const int fromFieldId = 5;
   // Reserved 10–15.
 }
 
@@ -539,6 +540,11 @@ abstract final class SchemaBinaryCodec {
       w.writeFieldTag(PrimaryKeyConfigFieldId.isOrdered, WireType.varint);
       w.writeBool(config.isOrdered!);
     }
+    if (config.fromFieldId != null) {
+      w.writeFieldTag(
+          PrimaryKeyConfigFieldId.fromFieldId, WireType.lengthDelimited);
+      w.writeString(config.fromFieldId!);
+    }
   }
 
   static PrimaryKeyConfig readPrimaryKeyConfig(BinaryReader r) {
@@ -546,6 +552,7 @@ abstract final class SchemaBinaryCodec {
     var type = PrimaryKeyType.sequential;
     SequentialIdConfig? sequentialConfig;
     bool? isOrdered;
+    String? fromFieldId;
 
     while (!r.isEOF) {
       final (fid, wireType) = r.readFieldTag();
@@ -568,6 +575,9 @@ abstract final class SchemaBinaryCodec {
         case PrimaryKeyConfigFieldId.isOrdered:
           isOrdered = r.readBool();
           break;
+        case PrimaryKeyConfigFieldId.fromFieldId:
+          fromFieldId = r.readString();
+          break;
         default:
           r.skipField(wireType);
           break;
@@ -579,6 +589,7 @@ abstract final class SchemaBinaryCodec {
       type: type,
       sequentialConfig: sequentialConfig,
       isOrdered: isOrdered,
+      fromFieldId: fromFieldId,
     );
   }
 
