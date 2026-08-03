@@ -38,6 +38,8 @@ abstract final class MigrationTaskFieldId {
   static const int estimateDurationUs = 19;
   static const int referencingChildIndexesToDrop = 20;
   static const int targetFieldLayoutSnapshot = 21;
+  static const int shadowTableUid = 22;
+  static const int promotePhase = 23;
   // Reserved 40–63.
 }
 
@@ -69,6 +71,8 @@ abstract final class MigrationOperationFieldId {
   static const int foreignKey = 15;
   static const int foreignKeyName = 16;
   static const int oldForeignKey = 17;
+  static const int sourceFieldId = 18;
+  static const int discardOldPrimaryKey = 19;
   // Reserved 30–39.
 }
 
@@ -220,6 +224,16 @@ final class MigrationTaskCodec {
         });
       });
     }
+    if (task.shadowTableUid != null) {
+      w.writeFieldTag(
+          MigrationTaskFieldId.shadowTableUid, WireType.lengthDelimited);
+      w.writeString(task.shadowTableUid!.value);
+    }
+    if (task.promotePhase != null) {
+      w.writeFieldTag(
+          MigrationTaskFieldId.promotePhase, WireType.lengthDelimited);
+      w.writeString(task.promotePhase!);
+    }
 
     return w.view;
   }
@@ -250,6 +264,8 @@ final class MigrationTaskCodec {
     Duration? estimateDuration;
     Map<TableUid, List<IndexUid>>? childDrops;
     var sawChildDrops = false;
+    TableUid? shadowTableUid;
+    String? promotePhase;
 
     while (!r.isEOF) {
       final (fieldId, wireType) = r.readFieldTag();
@@ -382,6 +398,12 @@ final class MigrationTaskCodec {
             }
           });
           break;
+        case MigrationTaskFieldId.shadowTableUid:
+          shadowTableUid = TableUid(r.readString());
+          break;
+        case MigrationTaskFieldId.promotePhase:
+          promotePhase = r.readString();
+          break;
         default:
           r.skipField(wireType);
           break;
@@ -412,6 +434,8 @@ final class MigrationTaskCodec {
       estimateDuration: estimateDuration,
       referencingChildIndexesToDrop:
           sawChildDrops ? (childDrops ?? const {}) : null,
+      shadowTableUid: shadowTableUid,
+      promotePhase: promotePhase,
     );
   }
 
@@ -548,6 +572,16 @@ final class MigrationTaskCodec {
         SchemaBinaryCodec.writeForeignKeySchema(sw, op.oldForeignKey!);
       });
     }
+    if (op.sourceFieldId != null) {
+      w.writeFieldTag(
+          MigrationOperationFieldId.sourceFieldId, WireType.lengthDelimited);
+      w.writeString(op.sourceFieldId!);
+    }
+    if (op.discardOldPrimaryKey != null) {
+      w.writeFieldTag(
+          MigrationOperationFieldId.discardOldPrimaryKey, WireType.varint);
+      w.writeBool(op.discardOldPrimaryKey!);
+    }
   }
 
   static MigrationOperation _readOperation(BinaryReader r) {
@@ -569,6 +603,8 @@ final class MigrationTaskCodec {
     ForeignKeySchema? foreignKey;
     String? foreignKeyName;
     ForeignKeySchema? oldForeignKey;
+    String? sourceFieldId;
+    bool? discardOldPrimaryKey;
 
     while (!r.isEOF) {
       final (fid, wireType) = r.readFieldTag();
@@ -648,6 +684,12 @@ final class MigrationTaskCodec {
             oldForeignKey = SchemaBinaryCodec.readForeignKeySchema(nr);
           });
           break;
+        case MigrationOperationFieldId.sourceFieldId:
+          sourceFieldId = r.readString();
+          break;
+        case MigrationOperationFieldId.discardOldPrimaryKey:
+          discardOldPrimaryKey = r.readBool();
+          break;
         default:
           r.skipField(wireType);
           break;
@@ -672,6 +714,8 @@ final class MigrationTaskCodec {
       foreignKey: foreignKey,
       foreignKeyName: foreignKeyName,
       oldForeignKey: oldForeignKey,
+      sourceFieldId: sourceFieldId,
+      discardOldPrimaryKey: discardOldPrimaryKey,
     );
   }
 
