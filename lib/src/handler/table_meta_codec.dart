@@ -56,6 +56,7 @@ abstract final class PrimaryKeyConfigFieldId {
   static const int type = 2;
   static const int sequentialConfig = 3;
   static const int isOrdered = 4;
+  static const int fromFieldId = 5;
 }
 
 abstract final class SequentialIdConfigFieldId {
@@ -540,6 +541,11 @@ final class TableMetaCodec {
       w.writeFieldTag(PrimaryKeyConfigFieldId.isOrdered, WireType.varint);
       w.writeBool(pk.isOrdered!);
     }
+    if (pk.fromFieldId != null) {
+      w.writeFieldTag(
+          PrimaryKeyConfigFieldId.fromFieldId, WireType.lengthDelimited);
+      w.writeString(pk.fromFieldId!);
+    }
   }
 
   static PrimaryKeyConfig _readPrimaryKeyConfig(BinaryReader r) {
@@ -547,6 +553,7 @@ final class TableMetaCodec {
     PrimaryKeyType type = PrimaryKeyType.sequential;
     SequentialIdConfig? sequentialConfig;
     bool? isOrdered;
+    String? fromFieldId;
 
     while (!r.isEOF) {
       final (fid, wireType) = r.readFieldTag();
@@ -589,6 +596,9 @@ final class TableMetaCodec {
         case PrimaryKeyConfigFieldId.isOrdered:
           isOrdered = r.readBool();
           break;
+        case PrimaryKeyConfigFieldId.fromFieldId:
+          fromFieldId = r.readString();
+          break;
         default:
           r.skipField(wireType);
       }
@@ -599,6 +609,7 @@ final class TableMetaCodec {
       type: type,
       sequentialConfig: sequentialConfig,
       isOrdered: isOrdered,
+      fromFieldId: fromFieldId,
     );
   }
 
