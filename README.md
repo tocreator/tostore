@@ -338,6 +338,16 @@ You can write common validation rules directly into `FieldSchema`, avoiding dupl
 
 In addition, `unique: true` automatically creates a single-field unique index. `createIndex: true` and foreign keys automatically create single-field normal indexes. Use `indexes` when you need composite indexes, named indexes, or vector indexes.
 
+### Schema Evolution
+
+The engine automatically detects structural changes (adding, removing, or renaming tables/fields, attribute updates, index changes, and more) and completes data migration—no manual database versioning or migration scripts. Declarative `schemas` evolve on `ToStore.open()`; runtime changes use `updateSchema`—**transparent to business logic**, with uninterrupted reads and writes.
+
+#### Promote a Unique Field to Primary Key
+
+Promote an existing **unique, non-null** field to primary key (optional rename; works with existing data; business-transparent). **Do not** combine with `setPrimaryKeyConfig`.
+
+- **Mobile (declarative `schemas`)**: Detected automatically on `ToStore.open()`. The target primary key **must** use `PrimaryKeyType.none` (values come from the source unique field; other auto-generated PK types are not supported). Matching names are enough; for a rename, set `fromFieldId` to the source field's `fieldId`.
+- **Server (runtime)**: Call `updateSchema(...).promoteFieldToPrimaryKey(sourceFieldName: ..., targetPrimaryKeyName: ...)`. `targetPrimaryKeyName` is optional; omit it to keep the source field name.
 
 ### Choosing an Integration Method
 
@@ -366,11 +376,6 @@ final db = await ToStore.open(
 // Multi-space architecture - isolate data for different users
 await db.switchSpace(spaceName: 'user_123');
 ```
-
-### Schema Evolution
-
-During `ToStore.open()`, the engine automatically detects structural changes in `schemas`, such as adding, removing, renaming, or changing tables and fields, as well as index changes, and then completes the necessary migration work. You do not need to manually maintain database version numbers or write migration scripts.
-
 
 ### Tracking Startup Progress
 
@@ -438,9 +443,14 @@ final result = await db.updateSchema('users')
   .removeField('deprecated_field')         // Remove field
   .addField('created_at', type: DataType.datetime)  // Add field
   .removeIndex(fields: ['age'])            // Remove index
-  .setPrimaryKeyConfig(                    // Change PK type; existing data must be empty or a warning will be issued
+  .setPrimaryKeyConfig(                    // Change auto-generated PK strategy; avoid when the table already has data
     const PrimaryKeyConfig(type: PrimaryKeyType.shortCode)
   );
+// Promote a unique field to PK (see "Promote a Unique Field to Primary Key"; do not chain with the above):
+// await db.updateSchema('users').promoteFieldToPrimaryKey(
+//   sourceFieldName: 'user_id',
+//   targetPrimaryKeyName: 'uid', // optional; omit to keep the source field name
+// );
 
 // Monitor migration progress
 final taskId = result.taskId;
