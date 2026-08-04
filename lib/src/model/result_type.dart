@@ -134,6 +134,11 @@ enum ResultType {
       'Duplicate field name in table schema'),
   devInvalidSchemaIndexField(30018, 'DEV_INVALID_SCHEMA_INDEX_FIELD',
       'Index references non-existent field'),
+  devMigrationPromoteLargeOpNotAllowed(
+      30019,
+      'DEV_MIGRATION_PROMOTE_LARGE_OP_NOT_ALLOWED',
+      'Table is running promoteFieldToPrimaryKey; large-scale data operations '
+          'are not supported — narrow the scope or wait until promote completes'),
 
   // "SYS_" - System Error (50-79)
   sysTransactionAborted(
