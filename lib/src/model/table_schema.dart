@@ -2514,11 +2514,17 @@ class PrimaryKeyConfig {
   /// Whether primary key is ordered
   final bool? isOrdered;
 
+  /// When promoting a regular field to primary key with rename, the source
+  /// field's stable [FieldSchema.fieldId]. Used only for declarative schema
+  /// diff detection; cleared after promote cutover metadata is applied.
+  final String? fromFieldId;
+
   const PrimaryKeyConfig({
     this.name = 'id',
     this.type = PrimaryKeyType.sequential,
     this.sequentialConfig,
     this.isOrdered,
+    this.fromFieldId,
   });
 
   PrimaryKeyConfig copyWith({
@@ -2526,12 +2532,15 @@ class PrimaryKeyConfig {
     String? name,
     SequentialIdConfig? sequentialConfig,
     bool? isOrdered,
+    String? fromFieldId,
+    bool clearFromFieldId = false,
   }) {
     return PrimaryKeyConfig(
       type: type ?? this.type,
       name: name ?? this.name,
       sequentialConfig: sequentialConfig ?? this.sequentialConfig,
       isOrdered: isOrdered ?? this.isOrdered,
+      fromFieldId: clearFromFieldId ? null : (fromFieldId ?? this.fromFieldId),
     );
   }
 
@@ -2585,6 +2594,7 @@ class PrimaryKeyConfig {
       if (sequentialConfig != null)
         'sequentialConfig': sequentialConfig!.toJson(),
       if (isOrdered != null) 'isOrdered': isOrdered,
+      if (fromFieldId != null) 'fromFieldId': fromFieldId,
     };
   }
 
@@ -2619,6 +2629,7 @@ class PrimaryKeyConfig {
               ? const SequentialIdConfig()
               : null),
       isOrdered: json['isOrdered'] as bool?,
+      fromFieldId: json['fromFieldId'] as String?,
     );
   }
 }
