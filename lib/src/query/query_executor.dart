@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import '../core/compute/batch_match_runner.dart';
 import '../core/data_store_impl.dart';
 import '../core/index_manager.dart';
+import '../core/promote_primary_key.dart';
 import '../core/transaction_context.dart';
 import '../core/tree_cache.dart';
 import '../core/workload_scheduler.dart';
@@ -77,6 +78,12 @@ class QueryExecutor {
     List<QueryAggregation>? aggregations,
     List<String>? groupBy,
     bool readFromFileOnly = false,
+
+    /// When true, reshape promote result rows from old-working -> user-facing
+    /// target schema. Default false: engine/migration/system paths operate on
+    /// the physical old table and must not transform. User-facing entry points
+    /// ([QueryBuilder], [DataStoreImpl.executeUserQuery]) pass true explicitly.
+    bool applyPromoteResultTransform = false,
   }) async {
     final schemaMgr = _dataStore.tableMetaManager;
     if (schemaMgr == null) {
@@ -91,6 +98,20 @@ class QueryExecutor {
 
     final tableName = table.tableName;
     final schema = table.schema;
+
+    // Promote dual-write era: queries read only the old working table.
+    // Remap user-facing field names, then convert result rows to target shape.
+    final promoteDesc =
+        _dataStore.migrationManager?.getPromoteRuntime(table.tableUid);
+    var effectiveOrderBy = orderBy;
+    var effectiveGroupBy = groupBy;
+    if (promoteDesc != null) {
+      if (condition != null && !condition.isEmpty) {
+        remapPromoteConditionNewToOld(condition, promoteDesc);
+      }
+      effectiveOrderBy = remapPromoteOrderByNewToOld(orderBy, promoteDesc);
+      effectiveGroupBy = remapPromoteFieldListNewToOld(groupBy, promoteDesc);
+    }
 
     final schemas = <String, TableSchema>{tableName: schema};
     if (condition != null && !condition.isEmpty) {
@@ -130,18 +151,18 @@ class QueryExecutor {
     final plan = await optimizer.optimize(
       table,
       where,
-      orderBy: orderBy,
+      orderBy: effectiveOrderBy,
       limit: limit,
       offset: offset,
     );
 
-    return _executeWithPlan(
+    final result = await _executeWithPlan(
       plan,
       table,
       schemas: schemas,
       condition: condition,
       where: where,
-      orderBy: orderBy,
+      orderBy: effectiveOrderBy,
       limit: limit,
       offset: offset,
       cursor: cursor,
@@ -150,9 +171,24 @@ class QueryExecutor {
       queryCacheExpiry: queryCacheExpiry,
       onlyCount: onlyCount,
       aggregations: aggregations,
-      groupBy: groupBy,
+      groupBy: effectiveGroupBy,
       readFromFileOnly: readFromFileOnly,
     );
+
+    if (promoteDesc != null &&
+        applyPromoteResultTransform &&
+        !onlyCount &&
+        result.records.isNotEmpty) {
+      final yieldController = YieldController(
+        'QueryExecutor.promoteResultTransform',
+        checkInterval: 64,
+      );
+      for (final row in result.records) {
+        await yieldController.maybeYield();
+        transformPromoteOldToNewInPlace(row, promoteDesc);
+      }
+    }
+    return result;
   }
 
   /// Prefix unqualified where-clause fields with main table name for JOIN queries.
@@ -463,7 +499,7 @@ class QueryExecutor {
         }
       }
 
-      // count() never needs ordering – stripping orderBy forces the fast PK-scan
+      // count() never needs ordering - stripping orderBy forces the fast PK-scan
       // path (B+Tree Stream Scan) instead of the TopKHeap sorting path.
       if (onlyCount) {
         orderBy = null;
@@ -642,7 +678,7 @@ class QueryExecutor {
 
       // Final sort: single place after offset/joins, before limit truncation.
       // mergeConsistency does not sort; buffer-unordered inserts can break order for custom PK.
-      // One _applySort here covers both single-table (buffer merge) and join/union—no redundant sort.
+      // One _applySort here covers both single-table (buffer merge) and join/union redundant sort.
       final bool needPostSort = effectiveOrderBy.isNotEmpty;
 
       if (needPostSort) {
@@ -1456,7 +1492,7 @@ class QueryExecutor {
         rightKey.contains('.') ? rightKey.split('.').last : rightKey;
     List<Map<String, dynamic>> rightRecords;
 
-    // Real routing (dirIndex / isGlobal / uid) — never fabricate from schema alone.
+    // Real routing (dirIndex / isGlobal / uid) - never fabricate from schema alone.
     TableContext rightTable;
     try {
       rightTable = await _dataStore.getTableContext(rightTableName);
@@ -3811,7 +3847,7 @@ final class _QueryCursorToken {
     } else {
       final fields = sortFields ?? const <String>[];
       final descs = sortDesc ?? const <bool>[];
-      // Wire format uses u8 counts — keep encode/decode symmetric so tokens
+      // Wire format uses u8 counts - keep encode/decode symmetric so tokens
       // always round-trip. This is not a query policy cap.
       if (fields.length != descs.length) {
         throw DbException([
@@ -3898,7 +3934,7 @@ final class _QueryCursorToken {
   }
 
   /// Ensure `[offset, offset + length)` is inside [bytes].
-  /// Only structural bounds — no business caps that would reject valid tokens.
+  /// Only structural bounds - no business caps that would reject valid tokens.
   static void _ensureCursorBytes(
     Uint8List bytes,
     int offset,
@@ -4006,7 +4042,7 @@ final class _QueryCursorToken {
     } else {
       // sortKey: encode writes fieldCount (u8), fields..., descCount (u8),
       // descs..., keyLen (i32), keyBytes. fieldCount/descCount are the same
-      // wire width as encode (single byte) — do not invent tighter caps.
+      // wire width as encode (single byte) - do not invent tighter caps.
       final fieldCount = _readCursorUint8(bytes, offset);
       offset += 1;
       sortFields = <String>[];
@@ -4020,7 +4056,7 @@ final class _QueryCursorToken {
       final descCount = _readCursorUint8(bytes, offset);
       offset += 1;
       // Encode always emits matching counts; mismatch means corruption, not a
-      // legitimate older/newer dialect — safe to reject without false positives.
+      // legitimate older/newer dialect - safe to reject without false positives.
       if (descCount != fieldCount) {
         _invalidCursorPayload(
           'Invalid sort-key cursor token (field/direction count mismatch).',
