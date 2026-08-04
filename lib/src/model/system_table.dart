@@ -342,14 +342,13 @@ class SystemTable {
         name: getKeyValueName(isGlobal),
         tableId: isGlobal ? 'global_kv_store' : 'kv_store',
         isGlobal: isGlobal,
-        primaryKeyConfig: const PrimaryKeyConfig(),
+        primaryKeyConfig: const PrimaryKeyConfig(
+          name: keyValueKeyField,
+          type: PrimaryKeyType.none,
+          // Declarative promote detection when upgrading from legacy layout.
+          fromFieldId: keyValueKeyField,
+        ),
         fields: [
-          const FieldSchema(
-              name: keyValueKeyField,
-              fieldId: keyValueKeyField,
-              type: DataType.text,
-              nullable: false,
-              unique: true),
           const FieldSchema(
               name: keyValueValueField,
               fieldId: keyValueValueField,
@@ -366,7 +365,6 @@ class SystemTable {
           ),
         ],
         indexes: const [
-          IndexSchema(fields: [keyValueKeyField], unique: true),
           IndexSchema(fields: [keyValueUpdatedAtField]),
         ],
       );
