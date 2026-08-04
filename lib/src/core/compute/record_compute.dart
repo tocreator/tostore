@@ -22,11 +22,19 @@ Map<String, dynamic>? validateAndProcessRecordPure({
   bool hasResolvedPrimaryKey = false,
   Object? resolvedPrimaryKey,
   bool ignoreUnknownFields = true,
+
+  /// Shared batch timestamp for [DefaultValueType.currentTimestamp] defaults.
+  /// Avoids N× DateTime.now() in large batchInsert prepares.
+  DateTime? batchTimestamp,
+
+  /// When non-null, skips the per-record length/range constraint scan.
+  /// Pass the chunk-level result from the caller for batchInsert prepare.
+  bool? schemaNeedsConstraintPass,
 }) {
   try {
     final primaryKey = schema.primaryKey;
-    final fieldMapLocal =
-        fieldMap ?? {for (final f in schema.fields) f.name: f};
+    final fields = schema.fields;
+    final fieldMapLocal = fieldMap ?? {for (final f in fields) f.name: f};
 
     if (!ignoreUnknownFields) {
       for (final key in data.keys) {
@@ -42,7 +50,28 @@ Map<String, dynamic>? validateAndProcessRecordPure({
         }
       }
     }
+
+    // Most app schemas only use nullable + type conversion. Skip the second
+    // validateData pass when no length/range constraints are configured.
+    final bool needsConstraintPass;
+    if (schemaNeedsConstraintPass != null) {
+      needsConstraintPass = schemaNeedsConstraintPass;
+    } else {
+      var needs = false;
+      for (final field in fields) {
+        if (field.maxLength != null ||
+            field.minLength != null ||
+            field.minValue != null ||
+            field.maxValue != null) {
+          needs = true;
+          break;
+        }
+      }
+      needsConstraintPass = needs;
+    }
+
     final result = <String, dynamic>{};
+    final errors = validationErrors;
 
     // 1. Primary key handling.
     if (!data.containsKey(primaryKey) || data[primaryKey] == null) {
@@ -75,19 +104,33 @@ Map<String, dynamic>? validateAndProcessRecordPure({
         ]);
       }
 
-      result[primaryKey] =
-          schema.primaryKeyConfig.convertPrimaryKey(providedId);
+      // Auto-generated PKs are already strings from the ID pool — avoid
+      // convertPrimaryKey overhead on the batchInsert hot path.
+      if (skipPrimaryKeyFormatCheck && providedId is String) {
+        result[primaryKey] = providedId;
+      } else {
+        result[primaryKey] =
+            schema.primaryKeyConfig.convertPrimaryKey(providedId);
+      }
     }
 
-    // 2. Defaults, expressions, and type conversion.
-    for (final field in schema.fields) {
+    // Lazily materialize shared timestamp strings/ints once per record batch.
+    String? sharedNowIso;
+    int? sharedNowMs;
+    String resolveNowIso() =>
+        sharedNowIso ??= (batchTimestamp ?? DateTime.now()).toIso8601String();
+    int resolveNowMs() => sharedNowMs ??=
+        (batchTimestamp ?? DateTime.now()).millisecondsSinceEpoch;
+
+    // 2. Defaults, expressions, type conversion, and not-null in one pass.
+    for (final field in fields) {
       if (field.name == primaryKey) continue;
 
       final raw = data[field.name];
       dynamic value = raw;
       if (raw is ExprNode) {
         if (raw is TimestampExpr) {
-          value = DateTime.now().toIso8601String();
+          value = resolveNowIso();
         } else if (raw is Constant) {
           value = raw.value;
         } else if (raw is FieldRef) {
@@ -103,19 +146,51 @@ Map<String, dynamic>? validateAndProcessRecordPure({
             value = 0;
           }
         }
+      } else if (value == null &&
+          field.defaultValueType == DefaultValueType.currentTimestamp) {
+        if (field.type == DataType.integer) {
+          value = resolveNowMs();
+        } else if (field.type == DataType.bigInt) {
+          value = BigInt.from(resolveNowMs());
+        } else {
+          value = resolveNowIso();
+        }
       }
 
-      result[field.name] = field.convertValue(value);
+      final converted = field.convertValue(value);
+      result[field.name] = converted;
+
+      if (converted == null && !field.nullable) {
+        final msg =
+            'Field ${field.name} is required and cannot be null (table $tableName)';
+        if (errors != null) {
+          errors.add(msg);
+          return null;
+        }
+        throw DbException([
+          ConstraintStatus(
+            type: ResultType.bizNotNullViolation,
+            message: msg,
+            tableName: tableName,
+            fields: [field.name],
+          )
+        ]);
+      }
     }
 
-    // 3. Schema validation and constraint application.
+    if (!needsConstraintPass) {
+      return result;
+    }
+
+    // 3. Full constraint pass only when schema declares length/range limits.
     final validatedResult = schema.validateData(
       result,
       applyConstraints: true,
       errors: validationErrors,
       trustedConvertedValues: true,
-      fieldMap: fieldMap,
+      fieldMap: fieldMapLocal,
       ignoreUnknownFields: ignoreUnknownFields,
+      mutateInPlace: true,
     );
     if (validatedResult == null) {
       Logger.debug(
