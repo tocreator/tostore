@@ -52,6 +52,11 @@ class MigrationTask {
   final Duration? estimateDuration;
   // child table index uids that need to be dropped in each space (childTableUid -> indexUids)
   final Map<TableUid, List<IndexUid>>? referencingChildIndexesToDrop;
+  // Shadow table uid for promoteFieldToPrimaryKey (separate physical tree).
+  final TableUid? shadowTableUid;
+  // Promote swap phase marker for crash-safe directory rename recovery.
+  // null | creating | backfilling | swapping | done
+  final String? promotePhase;
 
   const MigrationTask({
     required this.taskId,
@@ -75,7 +80,13 @@ class MigrationTask {
     this.errors,
     this.estimateDuration,
     this.referencingChildIndexesToDrop,
+    this.shadowTableUid,
+    this.promotePhase,
   });
+
+  /// True when this task uses the promote-to-PK shadow table protocol.
+  bool get isPromotePrimaryKeyTask =>
+      operations.any((op) => op.type == MigrationType.promoteFieldToPrimaryKey);
 
   /// Compatibility getter for tableName (returns old table name, falls back to target or uid)
   TableName get tableName => TableName(
@@ -169,6 +180,10 @@ class MigrationTask {
                   ),
                 )
               : null,
+      shadowTableUid: json['shadowTableUid'] != null
+          ? TableUid(json['shadowTableUid'] as String)
+          : null,
+      promotePhase: json['promotePhase'] as String?,
     );
   }
 
@@ -200,6 +215,8 @@ class MigrationTask {
         if (referencingChildIndexesToDrop != null)
           'referencingChildIndexesToDrop': referencingChildIndexesToDrop!
               .map((k, v) => MapEntry(k.value, v.map((e) => e.value).toList())),
+        if (shadowTableUid != null) 'shadowTableUid': shadowTableUid!.value,
+        if (promotePhase != null) 'promotePhase': promotePhase,
       };
 
   String? checkpointKeyForSpace(String spaceName) =>
@@ -280,6 +297,10 @@ class MigrationTask {
     List<ResultStatus>? errors,
     Duration? estimateDuration,
     Map<TableUid, List<IndexUid>>? referencingChildIndexesToDrop,
+    TableUid? shadowTableUid,
+    String? promotePhase,
+    bool clearShadowTableUid = false,
+    bool clearPromotePhase = false,
   }) =>
       MigrationTask(
         taskId: taskId ?? this.taskId,
@@ -308,6 +329,11 @@ class MigrationTask {
         estimateDuration: estimateDuration ?? this.estimateDuration,
         referencingChildIndexesToDrop:
             referencingChildIndexesToDrop ?? this.referencingChildIndexesToDrop,
+        shadowTableUid: clearShadowTableUid
+            ? null
+            : (shadowTableUid ?? this.shadowTableUid),
+        promotePhase:
+            clearPromotePhase ? null : (promotePhase ?? this.promotePhase),
       );
 }
 
@@ -328,6 +354,9 @@ enum MigrationType {
   addForeignKey,
   removeForeignKey,
   modifyForeignKey,
+
+  /// Promote a unique non-null field to primary key via shadow-table rewrite.
+  promoteFieldToPrimaryKey,
 }
 
 /// model for field update, allow explicit distinction of whether a value is set
@@ -540,6 +569,13 @@ class MigrationOperation {
   final String? foreignKeyName;
   final ForeignKeySchema? oldForeignKey;
 
+  /// Source field stable id for [MigrationType.promoteFieldToPrimaryKey].
+  /// [fieldName] holds the source field name; [primaryKeyConfig] is the target PK.
+  final String? sourceFieldId;
+
+  /// Always true for promote: old auto-generated PK column is discarded.
+  final bool? discardOldPrimaryKey;
+
   const MigrationOperation({
     required this.type,
     this.field,
@@ -558,6 +594,8 @@ class MigrationOperation {
     this.foreignKey,
     this.foreignKeyName,
     this.oldForeignKey,
+    this.sourceFieldId,
+    this.discardOldPrimaryKey,
   });
 
   Map<String, dynamic> toJson() {
@@ -579,6 +617,9 @@ class MigrationOperation {
       'foreignKey': foreignKey?.toJson(),
       'foreignKeyName': foreignKeyName,
       'oldForeignKey': oldForeignKey?.toJson(),
+      if (sourceFieldId != null) 'sourceFieldId': sourceFieldId,
+      if (discardOldPrimaryKey != null)
+        'discardOldPrimaryKey': discardOldPrimaryKey,
     };
   }
 
@@ -622,6 +663,8 @@ class MigrationOperation {
       oldForeignKey: json['oldForeignKey'] != null
           ? ForeignKeySchema.fromJson(json['oldForeignKey'])
           : null,
+      sourceFieldId: json['sourceFieldId'] as String?,
+      discardOldPrimaryKey: json['discardOldPrimaryKey'] as bool?,
     );
   }
 }
