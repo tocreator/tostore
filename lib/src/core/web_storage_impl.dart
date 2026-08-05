@@ -1046,7 +1046,8 @@ class WebStorageImpl implements StorageInterface {
       for (final pth in paths) {
         final normalized = _normalizePath(pth);
         await _flushPath(normalized);
-        await yieldController.maybeYield();
+        final y1 = yieldController.maybeYield();
+        if (y1 != null) await y1;
       }
       return;
     }
@@ -1061,7 +1062,8 @@ class WebStorageImpl implements StorageInterface {
       if (entry.value.dirty) {
         await _flushPath(entry.key);
       }
-      await yieldController.maybeYield();
+      final y2 = yieldController.maybeYield();
+      if (y2 != null) await y2;
     }
   }
 
