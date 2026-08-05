@@ -665,11 +665,16 @@ class WriteBufferManager {
         YieldController('WriteBufferManager.addInsertBatch');
     final batchSize = _dataStore.config.writeBatchSize;
     final backpressureCap = batchSize > 0 ? batchSize * 2 : 20000;
-    const int emitChunk = 1000;
+    // Larger chunk reduces await frequency on the batchInsert hot path.
+    const int emitChunk = 5000;
+    final tableUid = table.tableUid;
+    final bgScheduler = _dataStore.backgroundWriteScheduler;
+    final bool bgMaybeActive = !bgScheduler.isEmpty;
 
     for (int i = 0; i < recordIds.length; i++) {
-      await yieldController.maybeYield();
-      if (i % emitChunk == 0) {
+      final y = yieldController.maybeYieldSync();
+      if (y != null) await y;
+      if (i % emitChunk == 0 && _writeQueue.length > backpressureCap) {
         await _dataStore.parallelJournalManager.waitIfThrottled(emitChunk);
         await _dataStore.parallelJournalManager.waitUntilQueueBelow(
           backpressureCap,
@@ -679,39 +684,41 @@ class WriteBufferManager {
       final recordId = recordIds[i];
       final entry = entries[i];
       final uniqueKeys = uniqueKeysList[i];
+
+      // Fast path for brand-new primary keys (the batchInsert auto-PK case):
+      // skip prior-delete coalesce and unique-key cleanup.
       final prior = buf.records[recordId];
       BufferEntry effectiveEntry = entry;
-
-      if (prior != null && prior.operation == BufferOperationType.delete) {
-        effectiveEntry = BufferEntry(
-          data: entry.data,
-          operation: BufferOperationType.update,
-          timestamp: entry.timestamp,
-          walPointer: entry.walPointer,
-          transactionId: prior.transactionId ?? entry.transactionId,
-          oldValues: prior.oldValues ?? prior.data,
-          schemaVersion: entry.schemaVersion,
-        );
-      }
-
-      // Store entry (INSERT). If a prior entry exists, remove its unique keys to prevent leaks.
-      final existingKeys = buf.recordIdToUniqueKeys.remove(recordId);
-      if (existingKeys != null) {
-        for (final uk in existingKeys) {
-          final internalKey = uk.internalKey;
-          final set = buf.uniqueIndexEntries[uk.indexUid];
-          set?.remove(internalKey);
-          if (set != null && set.isEmpty) {
-            buf.uniqueIndexEntries.remove(uk.indexUid);
-          }
-          final ownersByKey = buf.uniqueKeyOwners[uk.indexUid];
-          final owners = ownersByKey?[internalKey];
-          owners?.remove(recordId);
-          if (owners != null && owners.isEmpty) {
-            ownersByKey?.remove(internalKey);
-          }
-          if (ownersByKey != null && ownersByKey.isEmpty) {
-            buf.uniqueKeyOwners.remove(uk.indexUid);
+      if (prior != null) {
+        if (prior.operation == BufferOperationType.delete) {
+          effectiveEntry = BufferEntry(
+            data: entry.data,
+            operation: BufferOperationType.update,
+            timestamp: entry.timestamp,
+            walPointer: entry.walPointer,
+            transactionId: prior.transactionId ?? entry.transactionId,
+            oldValues: prior.oldValues ?? prior.data,
+            schemaVersion: entry.schemaVersion,
+          );
+        }
+        final existingKeys = buf.recordIdToUniqueKeys.remove(recordId);
+        if (existingKeys != null) {
+          for (final uk in existingKeys) {
+            final internalKey = uk.internalKey;
+            final set = buf.uniqueIndexEntries[uk.indexUid];
+            set?.remove(internalKey);
+            if (set != null && set.isEmpty) {
+              buf.uniqueIndexEntries.remove(uk.indexUid);
+            }
+            final ownersByKey = buf.uniqueKeyOwners[uk.indexUid];
+            final owners = ownersByKey?[internalKey];
+            owners?.remove(recordId);
+            if (owners != null && owners.isEmpty) {
+              ownersByKey?.remove(internalKey);
+            }
+            if (ownersByKey != null && ownersByKey.isEmpty) {
+              buf.uniqueKeyOwners.remove(uk.indexUid);
+            }
           }
         }
       }
@@ -727,47 +734,33 @@ class WriteBufferManager {
         buf.recordIdToUniqueKeys[recordId] = uniqueKeys;
         for (final uk in uniqueKeys) {
           final internalKey = uk.internalKey;
-
-          var set = buf.uniqueIndexEntries[uk.indexUid];
-          if (set == null) {
-            set = <dynamic>{};
-            buf.uniqueIndexEntries[uk.indexUid] = set;
-          }
-          set.add(internalKey);
-
-          var ownersByKey = buf.uniqueKeyOwners[uk.indexUid];
-          if (ownersByKey == null) {
-            ownersByKey = <dynamic, Set<String>>{};
-            buf.uniqueKeyOwners[uk.indexUid] = ownersByKey;
-          }
-          var owners = ownersByKey[internalKey];
-          if (owners == null) {
-            owners = <String>{};
-            ownersByKey[internalKey] = owners;
-          }
-          owners.add(recordId);
+          buf.uniqueIndexEntries
+              .putIfAbsent(uk.indexUid, () => <dynamic>{})
+              .add(internalKey);
+          buf.uniqueKeyOwners
+              .putIfAbsent(uk.indexUid, () => <dynamic, Set<String>>{})
+              .putIfAbsent(internalKey, () => <String>{})
+              .add(recordId);
         }
       }
 
       final wp = effectiveEntry.walPointer;
       if (wp == null) {
-        // Should never happen for modern batch paths; skip enqueue to preserve queue integrity.
         Logger.warn(
           'Batch insert missing walPointer: table=${table.tableName} pk=$recordId, skipping enqueue',
         );
         continue;
       }
-      // Invalidate any pending background write entries for this primary key.
-      _dataStore.backgroundWriteScheduler.handleOnlineWrite(table, recordId);
+      // Skip bg-invalidation probe when the background scheduler has no work.
+      if (bgMaybeActive) {
+        bgScheduler.handleOnlineWrite(table, recordId);
+      }
       _writeQueue.add(WriteQueueEntry(
-        tableUid: table.tableUid,
+        tableUid: tableUid,
         recordId: recordId,
         operationType: effectiveEntry.operation,
         walPointer: wp,
       ));
-      if ((i + 1) % emitChunk == 0 || i == recordIds.length - 1) {
-        _emitSizeChanged();
-      }
     }
 
     _emitSizeChanged();
