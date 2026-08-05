@@ -347,7 +347,8 @@ class KeyMigrationRunner {
 
     for (final tableName in tableNames) {
       _throwIfPaused();
-      await yieldController.maybeYield();
+      final y1 = yieldController.maybeYield();
+      if (y1 != null) await y1;
 
       if (tableName == SystemTable.keyMigrationProgressTableName) continue;
 
@@ -380,7 +381,8 @@ class KeyMigrationRunner {
                 const [];
         for (final index in indexes) {
           _throwIfPaused();
-          await yieldController.maybeYield();
+          final y2 = yieldController.maybeYield();
+          if (y2 != null) await y2;
           if (index.indexUid.isEmpty) continue;
           final indexMeta =
               await dataStore.treeMetaPageService.readIndexGlobalMeta(
@@ -596,7 +598,8 @@ class KeyMigrationRunner {
 
             for (final record in records) {
               if (isPauseRequested) return false;
-              await yieldController.maybeYield();
+              final y3 = yieldController.maybeYield();
+              if (y3 != null) await y3;
               final pk = record[pkName]?.toString() ?? '';
               if (pk.isEmpty) continue;
 
