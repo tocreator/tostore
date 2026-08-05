@@ -108,7 +108,7 @@ class YieldController {
   /// - If budget is exceeded, yields to the event loop (`Future.delayed`).
   /// - Updates the adaptive interval based on throughput.
   Future<void> maybeYield() async {
-    final f = _maybeYieldSync();
+    final f = maybeYieldSync();
     if (f != null) await f;
   }
 
@@ -129,7 +129,7 @@ class YieldController {
   ///
   /// This eliminates async/await overhead for the common case where no yield
   /// is needed, which can save significant time in loops with millions of iterations.
-  Future<void>? _maybeYieldSync() {
+  Future<void>? maybeYieldSync() {
     if (!_enabled) return null;
 
     _iterationsSinceCheck++;
