@@ -1840,7 +1840,8 @@ class TableMetaManager {
           .records;
 
       for (final row in rows) {
-        await yieldController.maybeYield();
+        final y1 = yieldController.maybeYield();
+        if (y1 != null) await y1;
         final meta = TableMetaCodec.decodeRow(row);
         // Skip per-row dir increments; rebuild once after the scan.
         _registerMetaInLookups(meta, updateDirCounts: false);
