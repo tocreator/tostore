@@ -985,9 +985,11 @@ class WalManager {
     }
 
     final yieldController = YieldController('WalManager.appendBatch');
-    final List<WalPointer> pointers = [];
-    for (final entry in walEntries) {
-      await yieldController.maybeYield();
+    final List<WalPointer> pointers =
+        List<WalPointer>.filled(walEntries.length, _current, growable: false);
+    for (int i = 0; i < walEntries.length; i++) {
+      final y = yieldController.maybeYieldSync();
+      if (y != null) await y;
       // Flush may hard-rotate while we yielded. Re-bind path/seq to the live
       // partition — never overwrite _current back onto a retired partition.
       if (_current.partitionIndex != pIdx ||
@@ -1007,18 +1009,20 @@ class WalManager {
       final int nextSeq = _current.entrySeq + 1;
       _current = WalPointer(partitionIndex: pIdx, entrySeq: nextSeq);
 
-      // Embed physical WAL pointer into the entry itself for fast recovery.
-      final entryWithPtr = Map<String, dynamic>.from(entry)
-        ..['p'] = pIdx
-        ..['seq'] = nextSeq;
+      // Mutate the freshly-built entry in place — callers of appendBatch own
+      // these maps and do not reuse them after enqueue. Avoids Map.from of
+      // every record (which previously re-copied the full 'data' payload).
+      final entry = walEntries[i];
+      entry['p'] = pIdx;
+      entry['seq'] = nextSeq;
 
       _walQueue.add(_QueuedWalEntry(
         path: path,
-        rawEntry: entryWithPtr,
+        rawEntry: entry,
         pointer: _current,
       ));
 
-      pointers.add(_current);
+      pointers[i] = _current;
     }
 
     return pointers;
