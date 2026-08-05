@@ -41,7 +41,8 @@ Future<BatchIdentifierValidationResult> validateIdentifierChunk(
   );
 
   for (final record in request.records) {
-    await yieldController.maybeYield();
+    final y1 = yieldController.maybeYield();
+    if (y1 != null) await y1;
     results.add(
       IdentifierValidationRecordResult(
         error: validateRecordIdentifierPure(
