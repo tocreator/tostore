@@ -90,7 +90,7 @@ Future<BatchInsertPrepareResult> prepareBatchInsertChunk(
   final batchTs = request.batchTimestamp ?? DateTime.now();
 
   for (int i = 0; i < request.records.length; i++) {
-    final y = yieldController.maybeYieldSync();
+    final y = yieldController.maybeYield();
     if (y != null) await y;
     final errors = <String>[];
     Map<String, dynamic>? validData;
