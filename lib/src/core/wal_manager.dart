@@ -907,9 +907,10 @@ class WalManager {
     // Embed physical WAL pointer into the entry itself so that recovery can
     // efficiently determine the last WAL pointer by reading only the tail of
     // the last partition file.
-    final entryWithPtr = Map<String, dynamic>.from(walEntry)
-      ..['p'] = pIdx
-      ..['seq'] = nextSeq;
+    // Mutate in place — same ownership contract as appendBatch: callers own
+    // the map and must not reuse it after enqueue.
+    walEntry['p'] = pIdx;
+    walEntry['seq'] = nextSeq;
 
     final dirIndex = _getOrAllocateDirIndexForPartition(pIdx);
     final path = _dataStore.pathManager.getWalPartitionLogPath(
@@ -922,7 +923,7 @@ class WalManager {
     // writing synchronously per entry.
     _walQueue.add(_QueuedWalEntry(
       path: path,
-      rawEntry: entryWithPtr,
+      rawEntry: walEntry,
       pointer: _current,
     ));
 
