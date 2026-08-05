@@ -162,8 +162,12 @@ class DataStoreImpl {
 
   /// True when long-running leaf scans should stop (close / switchSpace /
   /// global query cancel). Checked on each leaf page boundary.
+  ///
+  /// Do NOT gate on [isInitialized]: setup/migration/recovery scan table and
+  /// index leaves before `_isInitialized` flips true. Aborting those scans
+  /// silently yields empty results and breaks schema migration tests.
   bool get shouldAbortBackgroundScan =>
-      !_isInitialized || _closing || _globalQueryCancelToken.isCancelled;
+      _closing || _globalQueryCancelToken.isCancelled;
 
   // Global configuration cache
   GlobalConfig? _globalConfigCache;
@@ -6263,8 +6267,8 @@ class DataStoreImpl {
 
   /// Cancel-aware wait for the in-flight prewarm task.
   ///
-  /// Caller must already have set [shouldAbortBackgroundScan] (via
-  /// `_isInitialized=false` / `_closing` / cancel token) so leaf scans exit.
+  /// Caller must already have set [shouldAbortBackgroundScan] (via `_closing`
+  /// / cancel token) so leaf scans exit cooperatively.
   Future<void> _stopAndAwaitPrewarm({
     Duration timeout = const Duration(seconds: 3),
   }) async {
