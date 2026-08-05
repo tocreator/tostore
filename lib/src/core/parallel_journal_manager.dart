@@ -964,8 +964,10 @@ class ParallelJournalManager {
                     } else {
                       idxUpdates.add(IndexRecordUpdate(
                         primaryKey: pk,
-                        newValues: Map<String, dynamic>.from(be.data),
-                        oldValues: Map<String, dynamic>.from(oldVals),
+                        // Share buffer maps by ref; index delta compute copies
+                        // before any mutate.
+                        newValues: be.data,
+                        oldValues: oldVals,
                       ));
                     }
                   }
@@ -989,8 +991,8 @@ class ParallelJournalManager {
                           } else {
                             idxUpdates.add(IndexRecordUpdate(
                               primaryKey: pk,
-                              newValues: Map<String, dynamic>.from(be.data),
-                              oldValues: Map<String, dynamic>.from(oldVals),
+                              newValues: be.data,
+                              oldValues: oldVals,
                             ));
                           }
                         } else if (be.operation == BufferOperationType.delete) {
@@ -1072,8 +1074,8 @@ class ParallelJournalManager {
                             } else {
                               specUps.add(IndexRecordUpdate(
                                 primaryKey: pk,
-                                newValues: Map<String, dynamic>.from(be.data),
-                                oldValues: Map<String, dynamic>.from(oldVals),
+                                newValues: be.data,
+                                oldValues: oldVals,
                               ));
                             }
                           } else if (be.operation ==
