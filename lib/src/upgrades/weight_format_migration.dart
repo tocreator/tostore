@@ -35,7 +35,8 @@ final class WeightFormatMigration {
         YieldController('weight_format_migration', checkInterval: 1);
 
     for (final spaceName in spaces) {
-      await yieldController.maybeYield();
+      final y1 = yieldController.maybeYield();
+      if (y1 != null) await y1;
       try {
         await _migrateSpace(dataStore, root: root, spaceName: spaceName);
       } catch (e) {
