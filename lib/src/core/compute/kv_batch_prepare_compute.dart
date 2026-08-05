@@ -49,7 +49,8 @@ Future<KeyValueBatchPrepareResult> prepareKeyValueBatchChunk(
   final yieldController = YieldController('Compute.kv.prepare');
 
   for (final item in request.items) {
-    await yieldController.maybeYield();
+    final y1 = yieldController.maybeYield();
+    if (y1 != null) await y1;
     records.add({
       request.keyField: item.key,
       request.valueField: jsonEncode(item.value),
