@@ -712,7 +712,8 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
 
       final yieldController = YieldController('QueryBuilder.distinct');
       for (final r in results) {
-        await yieldController.maybeYield();
+        final y1 = yieldController.maybeYield();
+        if (y1 != null) await y1;
         final sig = fieldsToCheck.map((f) => r[f]?.toString() ?? '').join('|');
         if (!seen.containsKey(sig)) {
           seen[sig] = true;
@@ -727,7 +728,8 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       final passedGroups = <Map<String, dynamic>>[];
       final yieldController = YieldController('QueryBuilder.having');
       for (final groupRow in results) {
-        await yieldController.maybeYield();
+        final y2 = yieldController.maybeYield();
+        if (y2 != null) await y2;
         if (_havingCondition!.matches(groupRow)) {
           passedGroups.add(groupRow);
         }
