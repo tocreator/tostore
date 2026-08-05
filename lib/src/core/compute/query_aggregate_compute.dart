@@ -24,7 +24,8 @@ Future<QueryAggregationPartial> aggregateQueryChunk(
       YieldController('Compute.aggregateQueryChunk', checkInterval: 128);
 
   for (final record in request.records) {
-    await yieldController.maybeYield();
+    final y1 = yieldController.maybeYield();
+    if (y1 != null) await y1;
     aggregator.accumulate(record);
   }
 
