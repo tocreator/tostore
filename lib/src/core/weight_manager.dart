@@ -181,7 +181,8 @@ class WeightManager {
       final allTables = await _dataStore.getTableNames();
 
       for (final tableName in allTables) {
-        await yieldController.maybeYield();
+        final y1 = yieldController.maybeYield();
+        if (y1 != null) await y1;
 
         final isSystemTable = SystemTable.isSystemTable(tableName);
 
@@ -209,7 +210,8 @@ class WeightManager {
         final indexes = _dataStore.tableMetaManager?.getBtreeIndexesFor(schema);
         if (indexes == null) continue;
         for (final index in indexes) {
-          await yieldController.maybeYield();
+          final y2 = yieldController.maybeYield();
+          if (y2 != null) await y2;
           final indexKey = _getIndexDataKey(schema.tableUid, index.indexUid);
           if (!_indexDataWeights.containsKey(indexKey)) {
             int initialWeight = 0;
@@ -567,7 +569,8 @@ class WeightManager {
     try {
       final allTables = await _dataStore.getTableNames();
       for (final tableName in allTables) {
-        await yieldController.maybeYield();
+        final y3 = yieldController.maybeYield();
+        if (y3 != null) await y3;
 
         final schema =
             await schemaMgr.getTableSchemaByName(TableName(tableName));
@@ -576,7 +579,8 @@ class WeightManager {
         final tableUid = schema.tableUid;
         final indexes = schemaMgr.getBtreeIndexesFor(schema);
         for (final index in indexes) {
-          await yieldController.maybeYield();
+          final y4 = yieldController.maybeYield();
+          if (y4 != null) await y4;
           if (index.indexUid.isEmpty) continue;
 
           final legacyNames = <String>{
@@ -592,7 +596,8 @@ class WeightManager {
 
       final keysToProcess = _indexDataWeights.keys.toList(growable: false);
       for (final key in keysToProcess) {
-        await yieldController.maybeYield();
+        final y5 = yieldController.maybeYield();
+        if (y5 != null) await y5;
         final colon = key.indexOf(':');
         if (colon <= 0 || colon >= key.length - 1) continue;
 
@@ -683,7 +688,8 @@ class WeightManager {
 
     final candidates = <K, WeightData>{};
     for (final entry in cache.entries) {
-      await yieldController.maybeYield();
+      final y6 = yieldController.maybeYield();
+      if (y6 != null) await y6;
       if (!entry.value.neverDecay && entry.value.accessCount > 0) {
         candidates[entry.key] = entry.value;
       }
@@ -702,7 +708,8 @@ class WeightManager {
       final maxAccessCount = top50.first.value.accessCount;
       if (maxAccessCount > 0) {
         for (final entry in top50) {
-          await yieldController.maybeYield();
+          final y7 = yieldController.maybeYield();
+          if (y7 != null) await y7;
 
           final data = entry.value;
           final score = (data.accessCount * 100 / maxAccessCount).round();
@@ -726,7 +733,8 @@ class WeightManager {
           : bottom50.first.value.accessCount;
       if (maxAccessCount > 0) {
         for (final entry in bottom50) {
-          await yieldController.maybeYield();
+          final y8 = yieldController.maybeYield();
+          if (y8 != null) await y8;
 
           final data = entry.value;
           final score = (data.accessCount * 100 / maxAccessCount).round();
