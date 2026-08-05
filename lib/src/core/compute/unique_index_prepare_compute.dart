@@ -59,7 +59,7 @@ Future<UniqueIndexPrepareResult> prepareUniqueIndexChunk(
   final yieldController = YieldController('Compute.uniqueIndex.prepare');
 
   for (int i = 0; i < request.records.length; i++) {
-    final y = yieldController.maybeYieldSync();
+    final y = yieldController.maybeYield();
     if (y != null) await y;
 
     final changedFields = request.changedFieldsByRecord?[i];
