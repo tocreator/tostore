@@ -209,7 +209,9 @@ class TableDataManager {
 
   // -------------------- Table record cache APIs --------------------
   /// Get a cached record by [pk] if present.
-  /// Returns a defensive copy to avoid external mutation of cached value.
+  ///
+  /// Returns the cached map by reference (no copy). Callers must not mutate
+  /// the result in place — treat it as read-only or copy before writing.
   Map<String, dynamic>? getCachedTableRecord(TableContext table, String pk) {
     return _tableRecordCache.get([table.tableUid, pk]);
   }
@@ -1094,13 +1096,13 @@ class TableDataManager {
       final map =
           byTable.putIfAbsent(table.tableUid, () => <String, TxnDeferredOp>{});
 
-      final rec = Map<String, dynamic>.from(data);
-
       // Handle insert-then-update in same transaction: merge operations correctly.
       final existingOp = map[recordId];
       Map<String, dynamic>? mergedOldValues = oldValues;
       BufferOperationType finalOpType = operationType;
-      Map<String, dynamic> finalData = rec;
+      // Copy only the map we will retain. Merge paths copy existingOp.data and
+      // overlay [data]; non-merge paths take ownership via Map.from(data).
+      late final Map<String, dynamic> finalData;
 
       if (existingOp != null) {
         if (existingOp.type == BufferOperationType.delete &&
@@ -1137,8 +1139,12 @@ class TableDataManager {
           finalOpType = BufferOperationType.insert;
           finalData = Map<String, dynamic>.from(existingOp.data);
           finalData.addAll(data); // Insert data overlays deleted record
+        } else {
+          // Other combinations: take ownership of the latest operation data.
+          finalData = Map<String, dynamic>.from(data);
         }
-        // For other combinations, use the latest operation.
+      } else {
+        finalData = Map<String, dynamic>.from(data);
       }
 
       _trackTransactionBufferBatch(
@@ -1158,15 +1164,12 @@ class TableDataManager {
 
       // Register unique keys with WriteBufferManager for conflict detection
       if (uniqueKeyRefs != null && uniqueKeyRefs.isNotEmpty) {
-        final pkVal = rec[schema.primaryKey]?.toString();
-        if (pkVal != null) {
-          _dataStore.writeBufferManager.addTransactionUniqueKeys(
-            transactionId: currentTxId,
-            table: table,
-            recordId: pkVal,
-            uniqueKeys: uniqueKeyRefs,
-          );
-        }
+        _dataStore.writeBufferManager.addTransactionUniqueKeys(
+          transactionId: currentTxId,
+          table: table,
+          recordId: recordId,
+          uniqueKeys: uniqueKeyRefs,
+        );
       }
       return;
     }
@@ -2561,8 +2564,9 @@ class TableDataManager {
             if (txOp.type == BufferOperationType.delete) {
               return null;
             }
-            final txRecord = Map<String, dynamic>.from(txOp.data);
-            txRecord.remove('_oldValues');
+            // TxnDeferredOp stores oldValues separately; data is shared by ref
+            // (same as buffer read path). Legacy guard if _oldValues was embedded.
+            final txRecord = _visibleTxnRecord(txOp.data);
             if (!isDeletedRecord(txRecord)) {
               return txRecord;
             }
@@ -2711,9 +2715,7 @@ class TableDataManager {
         if (txOp != null &&
             txOp.type != BufferOperationType.delete &&
             !isDeletedRecord(txOp.data)) {
-          final txRecord = Map<String, dynamic>.from(txOp.data);
-          txRecord.remove('_oldValues');
-          yield txRecord;
+          yield _visibleTxnRecord(txOp.data);
         }
       }
     } finally {
@@ -3144,13 +3146,8 @@ class TableDataManager {
       }
     }
 
-    // Defensive copy for transactional deferred records
-    Map<String, dynamic> visibleTxnRecord(Map<String, dynamic> src) {
-      final out = Map<String, dynamic>.from(src);
-      out.remove('_oldValues');
-      return out;
-    }
-
+    // Share txn deferred maps by reference (oldValues live on TxnDeferredOp).
+    // See [_visibleTxnRecord].
     if (!onlyMergeTransaction) {
       // --- PHASE 1: Efficient Update/Delete (Lookup from Disk Results) ---
       // Instead of scanning the whole buffer for updates, we scan the specific records we retrieved.
@@ -3224,7 +3221,7 @@ class TableDataManager {
               if (op.type == BufferOperationType.delete) {
                 baseRecords.remove(pk);
               } else {
-                baseRecords[pk] = visibleTxnRecord(op.data);
+                baseRecords[pk] = _visibleTxnRecord(op.data);
               }
             }
           }
@@ -3247,10 +3244,11 @@ class TableDataManager {
 
               if (baseRecords.containsKey(pk)) continue;
 
-              if (op.type != BufferOperationType.delete &&
-                  (matcher == null ||
-                      matcher.matches(visibleTxnRecord(op.data)))) {
-                baseRecords[pk] = visibleTxnRecord(op.data);
+              if (op.type != BufferOperationType.delete) {
+                final visible = _visibleTxnRecord(op.data);
+                if (matcher == null || matcher.matches(visible)) {
+                  baseRecords[pk] = visible;
+                }
               }
             }
           } else {
@@ -3268,10 +3266,11 @@ class TableDataManager {
               if (baseRecords.containsKey(pk)) continue;
 
               // New insert logic
-              if (op.type != BufferOperationType.delete &&
-                  (matcher == null ||
-                      matcher.matches(visibleTxnRecord(op.data)))) {
-                baseRecords[pk] = visibleTxnRecord(op.data);
+              if (op.type != BufferOperationType.delete) {
+                final visible = _visibleTxnRecord(op.data);
+                if (matcher == null || matcher.matches(visible)) {
+                  baseRecords[pk] = visible;
+                }
               }
             }
           }
@@ -4671,6 +4670,18 @@ bool isDeletedRecord(Map<String, dynamic> record) {
 
   // For backward compatibility: empty object is also considered a deleted record
   return record.isEmpty;
+}
+
+/// Visible view of a transactional deferred record.
+///
+/// [TxnDeferredOp.oldValues] is stored separately; [data] is shared by
+/// reference (same contract as buffer reads). Only copy when a legacy
+/// embedded `_oldValues` key is present.
+Map<String, dynamic> _visibleTxnRecord(Map<String, dynamic> src) {
+  if (!src.containsKey('_oldValues')) return src;
+  final out = Map<String, dynamic>.from(src);
+  out.remove('_oldValues');
+  return out;
 }
 
 class TxSnapshot {
