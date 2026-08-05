@@ -2263,7 +2263,8 @@ class DataStoreImpl {
         YieldController('DataStoreImpl._prepareKeyValueBatchRecords');
     for (final result in results) {
       for (final record in result.records) {
-        await mergeYield.maybeYield();
+        final y1 = mergeYield.maybeYield();
+        if (y1 != null) await y1;
         records.add(record);
       }
     }
@@ -2838,7 +2839,8 @@ class DataStoreImpl {
         if (hasForeignKeys) {
           final yieldController = YieldController('db_update_fk');
           for (final record in records) {
-            await yieldController.maybeYield();
+            final y2 = yieldController.maybeYield();
+            if (y2 != null) await y2;
             // Merge existing record with update data
             final mergedData = Map<String, dynamic>.from(record);
             mergedData.addAll(validData);
@@ -2953,7 +2955,8 @@ class DataStoreImpl {
         }
 
         for (int recordIndex = 0; recordIndex < records.length; recordIndex++) {
-          await yieldController.maybeYield();
+          final y3 = yieldController.maybeYield();
+          if (y3 != null) await y3;
           final record = records[recordIndex];
           final recordKey = record[primaryKey]?.toString() ?? '';
           if (recordKey.isEmpty) {
@@ -3617,7 +3620,8 @@ class DataStoreImpl {
         if (_foreignKeyManager != null) {
           final yieldController = YieldController('db_delete_fk');
           for (final record in recordsToDelete) {
-            await yieldController.maybeYield();
+            final y4 = yieldController.maybeYield();
+            if (y4 != null) await y4;
             final pkValue = record[primaryKey];
             if (pkValue != null) {
               // Phase 1: Always check RESTRICT/NO ACTION constraints immediately (even in transaction)
@@ -3703,7 +3707,8 @@ class DataStoreImpl {
             transactionManager?.registerWriteKey(txId, table, oldPk);
           }
 
-          await yieldController.maybeYield();
+          final y5 = yieldController.maybeYield();
+          if (y5 != null) await y5;
         }
 
         // Not in transaction: release locks immediately; in transaction: release by commit/rollback
@@ -4334,7 +4339,8 @@ class DataStoreImpl {
           checkInterval: 256,
         );
         for (final record in records) {
-          await remapYield.maybeYield();
+          final y6 = remapYield.maybeYield();
+          if (y6 != null) await y6;
           _promoteRemapRecordNewToOld(record, promoteDesc);
         }
       }
@@ -4543,7 +4549,7 @@ class DataStoreImpl {
                     final out = List<UniqueViolation?>.filled(recs.length, null,
                         growable: false);
                     for (int off = 0; off < recs.length; off += chunkSize) {
-                      final y = yieldController.maybeYieldSync();
+                      final y = yieldController.maybeYield();
                       if (y != null) await y;
                       final int to = (off + chunkSize < recs.length)
                           ? off + chunkSize
@@ -4574,7 +4580,8 @@ class DataStoreImpl {
                       YieldController('DataStore.batchInsert.flush.filter');
 
                   for (int i = 0; i < batchRecordsForBuffer.length; i++) {
-                    await filterYield.maybeYield();
+                    final y7 = filterYield.maybeYield();
+                    if (y7 != null) await y7;
                     final vio = vios[i];
                     final rec = batchRecordsForBuffer[i];
                     final refs = batchUniqueRefsForBuffer[i];
@@ -4646,7 +4653,8 @@ class DataStoreImpl {
                 final failYield =
                     YieldController('DataStore.batchInsert.flush.failAll');
                 for (final rec in batchRecordsForBuffer) {
-                  await failYield.maybeYield();
+                  final y8 = failYield.maybeYield();
+                  if (y8 != null) await y8;
                   final rid = rec[primaryKey]?.toString() ?? '';
                   if (rid.isEmpty) continue;
                   try {
@@ -4752,7 +4760,7 @@ class DataStoreImpl {
             final int j = start + offset;
             final record = currentRecords[offset];
             final preparedRecord = preparedRecords[offset];
-            final loopYield = yieldController.maybeYieldSync();
+            final loopYield = yieldController.maybeYield();
             if (loopYield != null) await loopYield;
 
             final bool isAutoPk = autoPkRecords.contains(record);
@@ -5211,7 +5219,8 @@ class DataStoreImpl {
         checkInterval: 256,
       );
       for (final record in records) {
-        await remapYield.maybeYield();
+        final y9 = remapYield.maybeYield();
+        if (y9 != null) await y9;
         _promoteRemapRecordNewToOld(record, promoteDesc);
       }
     }
@@ -5240,7 +5249,8 @@ class DataStoreImpl {
         checkInterval: 1024,
       );
       for (int i = 0; i < records.length; i++) {
-        await validationResultYield.maybeYield();
+        final y10 = validationResultYield.maybeYield();
+        if (y10 != null) await y10;
         final record = records[i];
         final err = identifierResults[i].error;
         if (err != null) {
@@ -5325,7 +5335,8 @@ class DataStoreImpl {
           checkInterval: 256,
         );
         for (final rec in validatedRecords) {
-          await mirrorYield.maybeYield();
+          final y11 = mirrorYield.maybeYield();
+          if (y11 != null) await y11;
           final userPk = _promoteUserFacingSuccessKey(rec, promoteDesc);
           if (userPk.isNotEmpty && successSet.contains(userPk)) {
             toMirror.add(rec);
@@ -5501,7 +5512,8 @@ class DataStoreImpl {
         checkInterval: 256,
       );
       for (final record in records) {
-        await remapYield.maybeYield();
+        final y12 = remapYield.maybeYield();
+        if (y12 != null) await y12;
         _promoteRemapRecordNewToOld(record, promoteDesc);
       }
     }
@@ -5545,7 +5557,8 @@ class DataStoreImpl {
     );
 
     for (int i = 0; i < records.length; i++) {
-      await identifierSplitYield.maybeYield();
+      final y13 = identifierSplitYield.maybeYield();
+      if (y13 != null) await y13;
       final record = records[i];
       final pkVal = record[primaryKey]?.toString();
 
@@ -5570,7 +5583,8 @@ class DataStoreImpl {
       );
 
       for (int i = 0; i < recordsNeedingIdentifierValidation.length; i++) {
-        await identifierResultYield.maybeYield();
+        final y14 = identifierResultYield.maybeYield();
+        if (y14 != null) await y14;
         final record = recordsNeedingIdentifierValidation[i];
         final err = identifierResults[i].error;
         if (err != null) {
@@ -5659,7 +5673,8 @@ class DataStoreImpl {
       const int batchSize = 1000;
 
       for (int i = 0; i < finalRecords.length; i += batchSize) {
-        await batchYield.maybeYield();
+        final y15 = batchYield.maybeYield();
+        if (y15 != null) await y15;
         final int end = (i + batchSize < finalRecords.length)
             ? i + batchSize
             : finalRecords.length;
@@ -5751,7 +5766,8 @@ class DataStoreImpl {
             continue;
           }
 
-          await executionYield.maybeYield();
+          final y16 = executionYield.maybeYield();
+          if (y16 != null) await y16;
           final preparedRecord = preparedRecords[recordIndex];
           if (preparedRecord.missingExistingRecord) {
             if (allowPartialErrors) {
@@ -6337,12 +6353,14 @@ class DataStoreImpl {
                 index.indexUid,
                 meta: indexMeta,
               );
-              await yieldController.maybeYield();
+              final y17 = yieldController.maybeYield();
+              if (y17 != null) await y17;
             }
           }
 
           // Yield control to the event loop to prevent UI freezing during a long prewarm process.
-          await yieldController.maybeYield();
+          final y18 = yieldController.maybeYield();
+          if (y18 != null) await y18;
         } catch (e) {
           // If already closing/closed, suppress errors from missing managers
           if (shouldAbortBackgroundScan) break;
@@ -6419,7 +6437,8 @@ class DataStoreImpl {
           limit: maxRecordsSafetyCap,
         );
         currentPrewarmedBytes += estimatedBytes;
-        await yieldController.maybeYield();
+        final y19 = yieldController.maybeYield();
+        if (y19 != null) await y19;
       } catch (e) {
         if (shouldAbortBackgroundScan) {
           return maxPrewarmBytes - currentPrewarmedBytes;
@@ -6488,7 +6507,8 @@ class DataStoreImpl {
           condition: QueryCondition()..where(schema.primaryKey, '>=', ''),
           limit: maxRecordsSafetyCap,
         );
-        await yieldController.maybeYield();
+        final y20 = yieldController.maybeYield();
+        if (y20 != null) await y20;
 
         final indexes = schemaMgr.getBtreeIndexesFor(schema);
         for (final index in indexes) {
@@ -6506,11 +6526,13 @@ class DataStoreImpl {
             endKeyExclusive: Uint8List(0),
             limit: maxRecordsSafetyCap,
           );
-          await yieldController.maybeYield();
+          final y21 = yieldController.maybeYield();
+          if (y21 != null) await y21;
         }
 
         currentPrewarmedBytes += estimatedBytes;
-        await yieldController.maybeYield();
+        final y22 = yieldController.maybeYield();
+        if (y22 != null) await y22;
       } catch (e) {
         if (shouldAbortBackgroundScan) break;
         Logger.warn('Prewarm user table failed for $tableName', rawError: e);
@@ -6536,7 +6558,8 @@ class DataStoreImpl {
       if (indexMeta != null) {
         total += indexMeta.totalSizeInBytes;
       }
-      await yieldController.maybeYield();
+      final y23 = yieldController.maybeYield();
+      if (y23 != null) await y23;
     }
     return total;
   }
@@ -6590,7 +6613,8 @@ class DataStoreImpl {
     final normalTables = <String>[];
     final yieldController = YieldController('DataStoreImpl._prioritizeTables');
     for (final tableName in allTables) {
-      await yieldController.maybeYield();
+      final y24 = yieldController.maybeYield();
+      if (y24 != null) await y24;
       // Check if it's a global table
       final uid = await tableMetaManager?.getUidByName(TableName(tableName));
       final isGlobal = uid != null
@@ -7551,7 +7575,8 @@ class DataStoreImpl {
       checkInterval: 128,
     );
     for (final old in oldRecords) {
-      await yieldController.maybeYield();
+      final y25 = yieldController.maybeYield();
+      if (y25 != null) await y25;
       final row = Map<String, dynamic>.from(old);
       transformPromoteOldToNewInPlace(row, desc);
       payloads.add(row);
@@ -7625,7 +7650,8 @@ class DataStoreImpl {
     );
     final pkValues = <String>[];
     for (final old in oldRecords) {
-      await collectYield.maybeYield();
+      final y26 = collectYield.maybeYield();
+      if (y26 != null) await y26;
       final v = old[desc.sourceFieldName] ?? old[targetPk];
       if (v != null) pkValues.add(v.toString());
     }
@@ -7639,7 +7665,8 @@ class DataStoreImpl {
     const chunkSize = 500;
     try {
       for (var i = 0; i < pkValues.length; i += chunkSize) {
-        await chunkYield.maybeYield();
+        final y27 = chunkYield.maybeYield();
+        if (y27 != null) await y27;
         final end = min(i + chunkSize, pkValues.length);
         final chunk = pkValues.sublist(i, end);
         final result = await deleteInternal(
