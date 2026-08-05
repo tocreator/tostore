@@ -440,7 +440,8 @@ class TtlCleanupManager {
       final yieldController =
           YieldController('TtlCleanupManager._runKvCleanupBatch');
       for (final entry in entries) {
-        await yieldController.maybeYield();
+        final y1 = yieldController.maybeYield();
+        if (y1 != null) await y1;
 
         final rows = (await _dataStore.queryExecutor.execute(
           table,
@@ -540,7 +541,8 @@ class TtlCleanupManager {
       var activeKvTables = systemKvTables;
 
       while (activePlans.isNotEmpty || activeKvTables.isNotEmpty) {
-        await yieldController.maybeYield();
+        final y2 = yieldController.maybeYield();
+        if (y2 != null) await y2;
 
         final lease = await _dataStore.workloadScheduler.tryAcquire(
           WorkloadType.maintenance,
