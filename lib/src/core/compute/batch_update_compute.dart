@@ -110,7 +110,8 @@ Future<BatchUpdatePrepareResult> prepareBatchUpdateChunk(
   final yieldController = YieldController('Compute.batchUpdate.prepare');
 
   for (int i = 0; i < request.records.length; i++) {
-    await yieldController.maybeYield();
+    final y1 = yieldController.maybeYield();
+    if (y1 != null) await y1;
 
     final record = request.records[i];
     final existingRecord = request.existingRecords[i];
@@ -286,7 +287,8 @@ Future<UniformUpdatePrepareResult> prepareUniformUpdateChunk(
   final yieldController = YieldController('Compute.updateInternal.prepare');
 
   for (final record in request.existingRecords) {
-    await yieldController.maybeYield();
+    final y2 = yieldController.maybeYield();
+    if (y2 != null) await y2;
 
     final updatedRecord = <String, dynamic>{};
     updatedRecord[primaryKey] = record[primaryKey];
