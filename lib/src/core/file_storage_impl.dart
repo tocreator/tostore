@@ -109,7 +109,8 @@ class FileStorageImpl implements StorageInterface {
           });
         } catch (_) {}
 
-        await yieldController.maybeYield();
+        final y1 = yieldController.maybeYield();
+        if (y1 != null) await y1;
       }
     } catch (_) {}
   }
@@ -882,7 +883,8 @@ class FileStorageImpl implements StorageInterface {
               });
             }
           }
-          await yieldController.maybeYield();
+          final y2 = yieldController.maybeYield();
+          if (y2 != null) await y2;
         }
       } else if (path == null) {
         // Snapshot current handles to avoid concurrent modification during eviction/open
@@ -904,7 +906,8 @@ class FileStorageImpl implements StorageInterface {
               _handleLengths.remove(key);
             }
           });
-          await yieldController.maybeYield();
+          final y3 = yieldController.maybeYield();
+          if (y3 != null) await y3;
         }
       } else {
         final normalized = p.canonicalize(path);
