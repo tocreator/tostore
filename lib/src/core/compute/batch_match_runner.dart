@@ -109,7 +109,8 @@ class ConditionBatchMatcher {
         final matchCountToTake = min(result.matchedIndices.length,
             maxMatchCount - matchedIndices.length);
         for (int j = 0; j < matchCountToTake; j++) {
-          await mergeYieldController.maybeYield();
+          final y1 = mergeYieldController.maybeYield();
+          if (y1 != null) await y1;
           matchedIndices.add(range.start + result.matchedIndices[j]);
         }
       }
@@ -169,7 +170,8 @@ class ConditionBatchMatcher {
         completedAllRecords = false;
       }
       for (final matchedIndex in result.matchedIndices) {
-        await mergeYieldController.maybeYield();
+        final y2 = mergeYieldController.maybeYield();
+        if (y2 != null) await y2;
         matchedIndices.add(range.start + matchedIndex);
       }
     }
