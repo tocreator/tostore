@@ -148,7 +148,8 @@ class VectorIndexManager {
       }
 
       for (int i = 0; i < result.vectors.length; i++) {
-        await mergeYield.maybeYield();
+        final y1 = mergeYield.maybeYield();
+        if (y1 != null) await y1;
         vectors.add(result.vectors[i]);
         primaryKeys.add(result.primaryKeys[i]);
       }
@@ -202,7 +203,8 @@ class VectorIndexManager {
     );
     for (final result in results) {
       for (final code in result.codes) {
-        await mergeYield.maybeYield();
+        final y2 = mergeYield.maybeYield();
+        if (y2 != null) await y2;
         pqCodes.add(code);
       }
     }
@@ -277,7 +279,8 @@ class VectorIndexManager {
           await ComputeManager.computeBatch(tasks, enableIsolate: useIsolate);
       for (final result in results) {
         for (final sample in result.vectors) {
-          await mergeYield.maybeYield();
+          final y3 = mergeYield.maybeYield();
+          if (y3 != null) await y3;
           samples.add(sample);
           if (samples.length >= maxSamples) {
             break;
@@ -330,7 +333,8 @@ class VectorIndexManager {
     );
 
     for (final idx in vectorIndexes) {
-      await yc.maybeYield();
+      final y4 = yc.maybeYield();
+      if (y4 != null) await y4;
       final indexUid = idx.indexUid;
       final fieldName = idx.fields.first; // vector index is single-field
       FieldSchema? fieldSchema;
@@ -422,7 +426,8 @@ class VectorIndexManager {
           budgetMs: 30,
         );
         for (var di = 0; di < deletes.length; di++) {
-          await delYc.maybeYield();
+          final y5 = delYc.maybeYield();
+          if (y5 != null) await y5;
           final record = deletes[di];
           final pk = record[pkName]?.toString();
           if (pk == null) continue;
@@ -583,7 +588,8 @@ class VectorIndexManager {
       budgetMs: 40,
     );
     for (int i = 0; i < sortedByNode.length; i++) {
-      await searchYc.maybeYield();
+      final y6 = searchYc.maybeYield();
+      if (y6 != null) await y6;
       final pk = pks[i];
       if (pk == null) continue;
       entries.add(VectorSearchResult(
@@ -864,7 +870,8 @@ class VectorIndexManager {
         budgetMs: 20,
       );
       for (int i = 0; i < n; i++) {
-        await flatYc.maybeYield();
+        final y7 = flatYc.maybeYield();
+        if (y7 != null) await y7;
         flatSamples.setRange(i * dim, (i + 1) * dim, samples[i]);
       }
       // Acquire flush workload lease (flush has priority in scheduler)
@@ -892,7 +899,8 @@ class VectorIndexManager {
           budgetMs: 15,
         );
         for (int m = 0; m < subspaces; m++) {
-          await subYc.maybeYield();
+          final y8 = subYc.maybeYield();
+          if (y8 != null) await y8;
           // Extract the specific column (sub-vectors) for this subspace
           final subSamples = Float32List(n * subDim);
           final subStart = m * subDim;
@@ -999,7 +1007,8 @@ class VectorIndexManager {
       budgetMs: 40,
     );
     for (final idx in vectorIndexes) {
-      await yc.maybeYield();
+      final y9 = yc.maybeYield();
+      if (y9 != null) await y9;
       final indexUid = idx.indexUid;
       var meta = _vectorCache.getMeta(table, indexUid);
       meta ??= await _loadMeta(table, indexUid);
@@ -1071,7 +1080,8 @@ class VectorIndexManager {
     final yc = YieldController('VectorIndexManager.reorder', checkInterval: 50);
 
     while (queue.isNotEmpty) {
-      await yc.maybeYield();
+      final y10 = yc.maybeYield();
+      if (y10 != null) await y10;
       final current = queue.removeFirst();
       bfsOrder.add(current);
 
@@ -1089,18 +1099,27 @@ class VectorIndexManager {
 
     // Add any unvisited nodes (disconnected components)
     for (int i = 0; i < totalNodes; i++) {
-      if (i > 0 && i % 50000 == 0) await yc.maybeYield();
+      if (i > 0 && i % 50000 == 0) {
+        final y11 = yc.maybeYield();
+        if (y11 != null) await y11;
+      }
       if (!isVisited(i)) bfsOrder.add(i);
     }
 
     // Phase 2: Build old→new ID mapping (Int32List: 4GB for 10^9 nodes)
     final oldToNew = Int32List(totalNodes);
     for (int i = 0; i < totalNodes; i++) {
-      if (i > 0 && i % 50000 == 0) await yc.maybeYield();
+      if (i > 0 && i % 50000 == 0) {
+        final y12 = yc.maybeYield();
+        if (y12 != null) await y12;
+      }
       oldToNew[i] = -1;
     }
     for (int newId = 0; newId < bfsOrder.length; newId++) {
-      if (newId > 0 && newId % 50000 == 0) await yc.maybeYield();
+      if (newId > 0 && newId % 50000 == 0) {
+        final y13 = yc.maybeYield();
+        if (y13 != null) await y13;
+      }
       oldToNew[bfsOrder[newId]] = newId;
     }
 
@@ -1113,7 +1132,8 @@ class VectorIndexManager {
     final localRawCache = <int, NghRawVectorPage>{};
 
     for (int newId = 0; newId < bfsOrder.length; newId++) {
-      await yc.maybeYield();
+      final y14 = yc.maybeYield();
+      if (y14 != null) await y14;
       final oldId = bfsOrder[newId];
 
       // Read old graph node
@@ -1248,7 +1268,8 @@ class VectorIndexManager {
     final pk2nidDeltas = <DataBlockEntry>[];
 
     for (int newId = 0; newId < bfsOrder.length; newId++) {
-      await yc.maybeYield();
+      final y15 = yc.maybeYield();
+      if (y15 != null) await y15;
       final oldId = bfsOrder[newId];
       if (oldToNew[oldId] < 0) continue;
 
@@ -1408,7 +1429,8 @@ class VectorIndexManager {
     );
 
     for (int i = 0; i < pks.length; i++) {
-      await mapYc.maybeYield();
+      final y16 = mapYc.maybeYield();
+      if (y16 != null) await y16;
       final nodeId = isDelete ? deleteNodeIds![i] : startNodeId + i;
       final pk = pks[i];
       final nodeIdKey = _encodeNodeIdKey(nodeId);
