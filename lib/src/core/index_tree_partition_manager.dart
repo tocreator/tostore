@@ -2198,6 +2198,7 @@ final class IndexTreePartitionManager {
 
     void schedulePrefetch(TreePagePtr p) {
       if (p.isNull) return;
+      if (_dataStore.shouldAbortBackgroundScan) return;
       if (prefetched.isNotEmpty) return;
       final k = keyOfPtr(p);
       prefetched[k] = _readLeaf(
@@ -2211,7 +2212,26 @@ final class IndexTreePartitionManager {
       );
     }
 
+    Future<void> drainPrefetch() async {
+      if (prefetched.isEmpty) return;
+      final pending = prefetched.values.toList(growable: false);
+      prefetched.clear();
+      for (final f in pending) {
+        try {
+          await f;
+        } catch (_) {}
+      }
+    }
+
     while (!leafPtr.isNull && remaining > 0) {
+      if (_dataStore.shouldAbortBackgroundScan) {
+        await drainPrefetch();
+        return IndexSearchResult(
+          primaryKeys: out,
+          entries: entriesOut.isEmpty ? null : entriesOut,
+          lastKey: lastKey,
+        );
+      }
       await yc.maybeYield();
       final leaf = await getLeaf(leafPtr);
       if (leaf.keys.isEmpty) {

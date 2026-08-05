@@ -2793,6 +2793,7 @@ final class TableTreePartitionManager {
 
     void schedulePrefetch(TreePagePtr p) {
       if (p.isNull) return;
+      if (_dataStore.shouldAbortBackgroundScan) return;
       // Keep at most one prefetched page to avoid memory/IO bursts.
       if (prefetched.isNotEmpty) return;
       final k = keyOfPtr(p);
@@ -2806,7 +2807,22 @@ final class TableTreePartitionManager {
       );
     }
 
+    Future<void> drainPrefetch() async {
+      if (prefetched.isEmpty) return;
+      final pending = prefetched.values.toList(growable: false);
+      prefetched.clear();
+      for (final f in pending) {
+        try {
+          await f;
+        } catch (_) {}
+      }
+    }
+
     while (!ptr.isNull && remaining > 0) {
+      if (_dataStore.shouldAbortBackgroundScan) {
+        await drainPrefetch();
+        return;
+      }
       await yc.maybeYield();
       final leaf = await getLeaf(ptr);
       if (leaf.keys.isEmpty) {
@@ -3018,6 +3034,7 @@ final class TableTreePartitionManager {
 
     void schedulePrefetch(TreePagePtr p) {
       if (p.isNull) return;
+      if (_dataStore.shouldAbortBackgroundScan) return;
       if (prefetched.isNotEmpty) return;
       final k = keyOfPtr(p);
       prefetched[k] = _readLeafPage(
@@ -3030,7 +3047,22 @@ final class TableTreePartitionManager {
       );
     }
 
+    Future<void> drainPrefetch() async {
+      if (prefetched.isEmpty) return;
+      final pending = prefetched.values.toList(growable: false);
+      prefetched.clear();
+      for (final f in pending) {
+        try {
+          await f;
+        } catch (_) {}
+      }
+    }
+
     while (!ptr.isNull && remaining > 0) {
+      if (_dataStore.shouldAbortBackgroundScan) {
+        await drainPrefetch();
+        return;
+      }
       await yc.maybeYield();
       final leaf = await getLeaf(ptr);
       if (leaf.keys.isEmpty) {

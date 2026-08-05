@@ -156,6 +156,15 @@ class DataStoreImpl {
   bool _isGlobalPrewarming = false;
   bool get isGlobalPrewarming => _isGlobalPrewarming;
 
+  /// In-flight cache prewarm task. Close/switchSpace awaits this after cancel
+  /// so full-table scans cannot race storage handle teardown.
+  Future<void>? _prewarmFuture;
+
+  /// True when long-running leaf scans should stop (close / switchSpace /
+  /// global query cancel). Checked on each leaf page boundary.
+  bool get shouldAbortBackgroundScan =>
+      !_isInitialized || _closing || _globalQueryCancelToken.isCancelled;
+
   // Global configuration cache
   GlobalConfig? _globalConfigCache;
 
@@ -1125,6 +1134,11 @@ class DataStoreImpl {
     _baseInitialized = false;
     _globalQueryCancelToken.cancel();
     await Future.delayed(Duration.zero);
+
+    // Stop cache prewarm before maintenance / handle close. Without this,
+    // 100k+ full-table/index scans keep shared locks + file handle queues
+    // busy and switchSpace/close stalls for seconds.
+    await _stopAndAwaitPrewarm();
 
     try {
       // Stop background triggers first to prevent new work from entering pipelines
@@ -6221,7 +6235,48 @@ class DataStoreImpl {
     }
     _isGlobalPrewarming = true;
 
-    _executePrewarm();
+    // Fire-and-forget, but keep a handle so close/switchSpace can await stop.
+    final task = _executePrewarm();
+    _prewarmFuture = task;
+    unawaited(task.whenComplete(() {
+      if (identical(_prewarmFuture, task)) {
+        _prewarmFuture = null;
+      }
+    }));
+  }
+
+  /// Cancel-aware wait for the in-flight prewarm task.
+  ///
+  /// Caller must already have set [shouldAbortBackgroundScan] (via
+  /// `_isInitialized=false` / `_closing` / cancel token) so leaf scans exit.
+  Future<void> _stopAndAwaitPrewarm({
+    Duration timeout = const Duration(seconds: 3),
+  }) async {
+    final future = _prewarmFuture;
+    if (future == null) {
+      _isGlobalPrewarming = false;
+      return;
+    }
+    try {
+      await future.timeout(timeout);
+    } on TimeoutException {
+      Logger.warn(
+        'Cache prewarm did not stop within ${timeout.inMilliseconds}ms '
+        'during close/switchSpace; continuing shutdown',
+      );
+    } catch (e) {
+      // Errors inside prewarm are logged there; ignore here.
+      if (_isInitialized) {
+        Logger.warn('Await prewarm stop failed', rawError: e);
+      }
+    } finally {
+      // If the task timed out, force the flag so later init can start fresh.
+      // The orphaned future's finally will also clear _isGlobalPrewarming.
+      _isGlobalPrewarming = false;
+      if (identical(_prewarmFuture, future)) {
+        _prewarmFuture = null;
+      }
+    }
   }
 
   Future<void> _executePrewarm() async {
@@ -6231,11 +6286,11 @@ class DataStoreImpl {
 
       // From tableMetaManager get all schemas (empty tables skip data load below).
       final allTables = await getTableNames();
-      if (allTables.isEmpty || !_isInitialized) return;
+      if (allTables.isEmpty || shouldAbortBackgroundScan) return;
 
       // Sort tables by weight
       final prioritizedTables = await _prioritizeTablesByWeight(allTables);
-      if (!_isInitialized) return;
+      if (shouldAbortBackgroundScan) return;
 
       final yieldController =
           YieldController('DataStoreImpl._executePrewarm', checkInterval: 1);
@@ -6248,9 +6303,9 @@ class DataStoreImpl {
       // If total table count is small, prewarm all tables to avoid missing hot
       // tables when weight data is incomplete.
       for (final tableName in selectedTables) {
-        if (!_isInitialized) break;
+        if (shouldAbortBackgroundScan) break;
         try {
-          if (!_isInitialized) {
+          if (shouldAbortBackgroundScan) {
             continue;
           }
 
@@ -6271,7 +6326,7 @@ class DataStoreImpl {
                 .getBtreeIndexesFor(schema)
                 .where((index) => index.type == IndexType.btree);
             for (final index in indexes) {
-              if (!_isInitialized) break;
+              if (shouldAbortBackgroundScan) break;
               final indexMeta = await _indexManager?.getIndexMeta(
                   table.tableUid, index.indexUid);
               if (indexMeta == null || indexMeta.btreeFirstLeaf.isNull) {
@@ -6290,12 +6345,14 @@ class DataStoreImpl {
           await yieldController.maybeYield();
         } catch (e) {
           // If already closing/closed, suppress errors from missing managers
-          if (!_isInitialized) break;
+          if (shouldAbortBackgroundScan) break;
 
           Logger.error('Load table data failed: $tableName', rawError: e);
           continue; // Continue load other tables
         }
       }
+
+      if (shouldAbortBackgroundScan) return;
 
       final effectivePrewarmThresholdMB =
           await _resourceManager!.initializeEffectivePrewarmThresholdMB();
@@ -6306,6 +6363,8 @@ class DataStoreImpl {
       remainingPrewarmBytes = await _prewarmKvStore(
         maxPrewarmBytes: remainingPrewarmBytes,
       );
+
+      if (shouldAbortBackgroundScan) return;
 
       await _prewarmUserTables(
         prioritizedTables: prioritizedTables,
@@ -6335,12 +6394,16 @@ class DataStoreImpl {
         YieldController('DataStoreImpl._prewarmKvStore', checkInterval: 1);
 
     for (final tableName in kvTables) {
-      if (!_isInitialized) return maxPrewarmBytes - currentPrewarmedBytes;
+      if (shouldAbortBackgroundScan) {
+        return maxPrewarmBytes - currentPrewarmedBytes;
+      }
       try {
         final table = await getTableContext(tableName);
         final tableDataMeta =
             await tableDataManager.getTableDataMeta(table.tableUid);
-        if (!_isInitialized) return maxPrewarmBytes - currentPrewarmedBytes;
+        if (shouldAbortBackgroundScan) {
+          return maxPrewarmBytes - currentPrewarmedBytes;
+        }
         if (tableDataMeta == null || tableDataMeta.totalRecords <= 0) continue;
 
         final indexBytes = await _estimateTableIndexBytes(table);
@@ -6358,7 +6421,9 @@ class DataStoreImpl {
         currentPrewarmedBytes += estimatedBytes;
         await yieldController.maybeYield();
       } catch (e) {
-        if (!_isInitialized) return maxPrewarmBytes - currentPrewarmedBytes;
+        if (shouldAbortBackgroundScan) {
+          return maxPrewarmBytes - currentPrewarmedBytes;
+        }
         Logger.warn('Prewarm KV store failed for $tableName', rawError: e);
       }
     }
@@ -6372,7 +6437,7 @@ class DataStoreImpl {
     required int prewarmBudgetBytes,
   }) async {
     final schemaMgr = tableMetaManager;
-    if (schemaMgr == null || !_isInitialized) return;
+    if (schemaMgr == null || shouldAbortBackgroundScan) return;
 
     final spaceStats = await getSpaceStats();
     final spaceUsageBytes = spaceStats.totalDataSizeBytes;
@@ -6399,9 +6464,9 @@ class DataStoreImpl {
     var currentPrewarmedBytes = 0;
 
     for (final tableName in userTables) {
-      if (!_isInitialized) break;
+      if (shouldAbortBackgroundScan) break;
       try {
-        if (!_isInitialized) continue;
+        if (shouldAbortBackgroundScan) continue;
 
         final table = await getTableContext(tableName);
         final tableDataMeta =
@@ -6427,7 +6492,7 @@ class DataStoreImpl {
 
         final indexes = schemaMgr.getBtreeIndexesFor(schema);
         for (final index in indexes) {
-          if (!_isInitialized) break;
+          if (shouldAbortBackgroundScan) break;
           final indexMeta =
               await _indexManager?.getIndexMeta(table.tableUid, index.indexUid);
           if (indexMeta == null || indexMeta.btreeFirstLeaf.isNull) continue;
@@ -6447,7 +6512,7 @@ class DataStoreImpl {
         currentPrewarmedBytes += estimatedBytes;
         await yieldController.maybeYield();
       } catch (e) {
-        if (!_isInitialized) break;
+        if (shouldAbortBackgroundScan) break;
         Logger.warn('Prewarm user table failed for $tableName', rawError: e);
       }
     }
