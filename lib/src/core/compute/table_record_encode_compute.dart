@@ -25,8 +25,8 @@ class TableRecordEncodeResult {
 
 /// Encode a chunk of table records using the mature BinarySchemaCodec path.
 ///
-/// This intentionally preserves the existing write path behavior: the primary
-/// key is removed before values-only encoding, and no storage state is touched.
+/// Primary key is nullified during encode (stored separately as the B+Tree
+/// key) without copying each record map.
 Future<TableRecordEncodeResult> encodeTableRecordChunk(
   TableRecordEncodeRequest request,
 ) async {
@@ -36,11 +36,10 @@ Future<TableRecordEncodeResult> encodeTableRecordChunk(
   for (final record in request.records) {
     final y1 = yieldController.maybeYield();
     if (y1 != null) await y1;
-    final valuesOnly = Map<String, dynamic>.from(record);
-    valuesOnly.remove(request.primaryKeyField);
     encoded.add(BinarySchemaCodec.encodeRecord(
-      valuesOnly,
+      record,
       request.fieldStructure,
+      nullifyField: request.primaryKeyField,
     ));
   }
 
