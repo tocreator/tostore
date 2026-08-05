@@ -332,7 +332,8 @@ class IndexManager {
         YieldController('IndexManager._prepareIndexWriteDeltasBatch');
     for (final result in results) {
       for (final delta in result.deltas) {
-        await mergeYield.maybeYield();
+        final y1 = mergeYield.maybeYield();
+        if (y1 != null) await y1;
         deltas.add(delta);
       }
     }
@@ -1831,7 +1832,7 @@ class IndexManager {
         checkInterval: 1024,
       );
       for (int i = 0; i < records.length; i++) {
-        final y = changedFieldsYield.maybeYieldSync();
+        final y = changedFieldsYield.maybeYield();
         if (y != null) await y;
         final pk = records[i][primaryKey]?.toString();
         if (pk == null) {
@@ -1853,7 +1854,7 @@ class IndexManager {
 
       for (int i = 0; i < records.length; i++) {
         final r = records[i];
-        final y = yieldController.maybeYieldSync();
+        final y = yieldController.maybeYield();
         if (y != null) await y;
         final pkValue = r[primaryKey];
         if (pkValue != null) {
@@ -1908,7 +1909,7 @@ class IndexManager {
         if (isMemoryMode) {
           final set = <String>{};
           for (final pk in pkList) {
-            final y = yieldController.maybeYieldSync();
+            final y = yieldController.maybeYield();
             if (y != null) await y;
             if (_dataStore.tableDataManager.hasLiveTableRecord(table, pk)) {
               set.add(pk);
@@ -1923,7 +1924,7 @@ class IndexManager {
 
         if (existing.isNotEmpty) {
           for (int i = 0; i < records.length; i++) {
-            final y = yieldController.maybeYieldSync();
+            final y = yieldController.maybeYield();
             if (y != null) await y;
             if (violations[i] != null) continue;
             final pk = records[i][primaryKey]?.toString();
@@ -1989,7 +1990,7 @@ class IndexManager {
       final Map<dynamic, int> batchSeen = {};
 
       for (int i = 0; i < records.length; i++) {
-        final y = yieldController.maybeYieldSync();
+        final y = yieldController.maybeYield();
         if (y != null) await y;
         if (violations[i] != null) continue;
         final canKey = preparedEntries[i].canonicalKey;
@@ -2044,7 +2045,8 @@ class IndexManager {
       if (isMemoryMode) {
         _registerIndexComparator(table, indexUid, schema);
         for (int i = 0; i < records.length; i++) {
-          await yieldController.maybeYield();
+          final y2 = yieldController.maybeYield();
+          if (y2 != null) await y2;
           if (violations[i] != null) continue;
           final canKey = preparedEntries[i].canonicalKey;
           if (canKey == null) continue;
@@ -2092,7 +2094,8 @@ class IndexManager {
         }
 
         for (int i = 0; i < records.length; i++) {
-          await yieldController.maybeYield();
+          final y3 = yieldController.maybeYield();
+          if (y3 != null) await y3;
           if (violations[i] != null) continue;
           final r = records[i];
           final recordId = r[primaryKey]?.toString();
@@ -2126,7 +2129,8 @@ class IndexManager {
       final keyBytes = <Uint8List>[];
 
       for (int i = 0; i < records.length; i++) {
-        await yieldController.maybeYield();
+        final y4 = yieldController.maybeYield();
+        if (y4 != null) await y4;
         if (violations[i] != null) continue;
         final encodedKeyBytes = preparedEntries[i].encodedKeyBytes;
         if (encodedKeyBytes == null) continue;
@@ -3131,7 +3135,8 @@ class IndexManager {
           final yieldController = YieldController('index_search_composite_in');
 
           for (final item in items) {
-            await yieldController.maybeYield();
+            final y5 = yieldController.maybeYield();
+            if (y5 != null) await y5;
             if (remaining == 0) break;
 
             if (meta.isUnique) {
@@ -3494,7 +3499,8 @@ class IndexManager {
             final prefixKey = <dynamic>[table.tableUid, indexUid, ...nativeVal];
             final yc = YieldController('IndexManager.hotspotPopulateNonUnique');
             for (final pk in validatedPks) {
-              await yc.maybeYield();
+              final y6 = yc.maybeYield();
+              if (y6 != null) await y6;
               _indexDataCache.put(
                 <dynamic>[...prefixKey, pk],
                 true,
@@ -3735,7 +3741,8 @@ class IndexManager {
           final nativeVal = item.$2;
           final prefix = item.$3;
 
-          await yieldController.maybeYield();
+          final y7 = yieldController.maybeYield();
+          if (y7 != null) await y7;
           if (remaining == 0) break;
 
           final endBound = upperBoundExclusiveForPrefix(prefix);
@@ -3851,7 +3858,8 @@ class IndexManager {
                     final yc = YieldController(
                         'IndexManager.hotspotPopulateNonUniqueIn');
                     for (final pk in validatedPks) {
-                      await yc.maybeYield();
+                      final y8 = yc.maybeYield();
+                      if (y8 != null) await y8;
                       _indexDataCache.put(
                         <dynamic>[...prefixKey, pk],
                         true,
