@@ -127,7 +127,8 @@ class TransactionManager {
         });
         final yieldController = YieldController('txn_cleanup_deferred');
         for (final tx in toPurge) {
-          await yieldController.maybeYield();
+          final y1 = yieldController.maybeYield();
+          if (y1 != null) await y1;
           _txnHeavyDeletes.remove(tx);
           _txnHeavyUpdates.remove(tx);
           _txnCascadeDeletes.remove(tx);
@@ -150,7 +151,8 @@ class TransactionManager {
             _mainMetaCache!.activePartitions.isNotEmpty) {
           final yieldController = YieldController('txn_cleanup_partitions');
           for (final p in List<int>.from(_mainMetaCache!.activePartitions)) {
-            await yieldController.maybeYield();
+            final y2 = yieldController.maybeYield();
+            if (y2 != null) await y2;
             await _maybeCleanupPartition(p);
           }
         }
@@ -415,7 +417,8 @@ class TransactionManager {
           final table = entry.key;
           final ops = entry.value;
           for (final op in ops) {
-            await yieldController.maybeYield();
+            final y3 = yieldController.maybeYield();
+            if (y3 != null) await y3;
             final rec = Map<String, dynamic>.from(op.data);
 
             // Embed unique key refs if present (for recovery application)
@@ -675,7 +678,8 @@ class TransactionManager {
             migrationManager.hasRuntimeMigrationForTable(tableCtx);
 
         for (int i = startIdx; i < recs.length; i += batchSize) {
-          await yieldController.maybeYield();
+          final y4 = yieldController.maybeYield();
+          if (y4 != null) await y4;
           final end =
               (i + batchSize < recs.length) ? i + batchSize : recs.length;
 
@@ -745,7 +749,8 @@ class TransactionManager {
             migrationManager.hasRuntimeMigrationForTable(tableCtx);
 
         for (int i = startIdx; i < recs.length; i += batchSize) {
-          await yieldController.maybeYield();
+          final y5 = yieldController.maybeYield();
+          if (y5 != null) await y5;
           final end =
               (i + batchSize < recs.length) ? i + batchSize : recs.length;
 
@@ -818,7 +823,8 @@ class TransactionManager {
         final startIdx = progress['deletes']![tableUid] ?? 0;
         const int batchSize = 1000;
         for (int i = startIdx; i < recs.length; i += batchSize) {
-          await yieldController.maybeYield();
+          final y6 = yieldController.maybeYield();
+          if (y6 != null) await y6;
           final end =
               (i + batchSize < recs.length) ? i + batchSize : recs.length;
           final batch = <Map<String, dynamic>>[];
@@ -828,7 +834,8 @@ class TransactionManager {
           final hasRuntimeMigration = migrationManager != null &&
               migrationManager.hasRuntimeMigrationForTable(tableCtx);
           for (int j = i; j < end; j++) {
-            await yieldController.maybeYield();
+            final y7 = yieldController.maybeYield();
+            if (y7 != null) await y7;
             final rec = Map<String, dynamic>.from(recs[j]);
             rec.remove('_oldValues'); // delete: old values not used
             final normalizedRec = (hasRuntimeMigration)
@@ -867,7 +874,8 @@ class TransactionManager {
           getDeferredCascadeDeletes(commitPlan.transactionId);
       if (cascadeDeletes.isNotEmpty && _dataStore.foreignKeyManager != null) {
         for (final cd in cascadeDeletes) {
-          await yieldController.maybeYield();
+          final y8 = yieldController.maybeYield();
+          if (y8 != null) await y8;
           final tableContext =
               await _dataStore.tableMetaManager?.getTableContext(cd.tableUid);
           if (tableContext == null) continue;
@@ -893,7 +901,8 @@ class TransactionManager {
           getDeferredCascadeUpdates(commitPlan.transactionId);
       if (cascadeUpdates.isNotEmpty && _dataStore.foreignKeyManager != null) {
         for (final cu in cascadeUpdates) {
-          await yieldController.maybeYield();
+          final y9 = yieldController.maybeYield();
+          if (y9 != null) await y9;
           final tableContext =
               await _dataStore.tableMetaManager?.getTableContext(cu.tableUid);
           if (tableContext == null) continue;
@@ -919,7 +928,8 @@ class TransactionManager {
       // Execute deferred heavy delete plans (commit-time, idempotent via internal checkpoints)
       if (commitPlan.heavyDeletes.isNotEmpty) {
         for (final hd in commitPlan.heavyDeletes) {
-          await yieldController.maybeYield();
+          final y10 = yieldController.maybeYield();
+          if (y10 != null) await y10;
           final table =
               await _dataStore.tableMetaManager?.getTableContext(hd.tableUid);
           if (table == null) continue;
@@ -946,7 +956,8 @@ class TransactionManager {
       // Execute deferred heavy update plans (commit-time, idempotent via internal checkpoints)
       if (commitPlan.heavyUpdates.isNotEmpty) {
         for (final hu in commitPlan.heavyUpdates) {
-          await yieldController.maybeYield();
+          final y11 = yieldController.maybeYield();
+          if (y11 != null) await y11;
           final table =
               await _dataStore.tableMetaManager?.getTableContext(hu.tableUid);
           if (table == null) continue;
@@ -1245,7 +1256,8 @@ class TransactionManager {
         if (keys.isEmpty) continue;
         final yieldController = YieldController('txn_ssi_check');
         for (final k in keys) {
-          await yieldController.maybeYield();
+          final y12 = yieldController.maybeYield();
+          if (y12 != null) await y12;
           // Use TreeCache: key format [tableUid, pk]
           final lastMs = _recentCommittedWrites.get([tableUid, k]);
           if (lastMs != null && lastMs > startMs) {
@@ -1453,7 +1465,8 @@ class TransactionManager {
     final partitions = List<int>.from(_mainMetaCache!.activePartitions);
     final yieldController = YieldController('txn_stream_unfinished');
     for (final p in partitions) {
-      await yieldController.maybeYield();
+      final y13 = yieldController.maybeYield();
+      if (y13 != null) await y13;
 
       try {
         final pDirIndex = _dirIndexForPartition(p);
@@ -1465,7 +1478,8 @@ class TransactionManager {
         final finished = <String>{};
         final events = await _readTxnLogEvents(statusPath, p);
         for (final ev in events) {
-          await yieldController.maybeYield();
+          final y14 = yieldController.maybeYield();
+          if (y14 != null) await y14;
           final id = ev.transactionId;
           if (ev.event == TxnLogEventType.begin) {
             begins.add(id);
@@ -1476,7 +1490,8 @@ class TransactionManager {
         }
 
         for (final id in begins) {
-          await yieldController.maybeYield();
+          final y15 = yieldController.maybeYield();
+          if (y15 != null) await y15;
           if (!finished.contains(id)) {
             yield id;
           }
