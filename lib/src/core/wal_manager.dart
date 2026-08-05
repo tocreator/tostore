@@ -563,7 +563,8 @@ class WalManager {
     );
     for (final result in results) {
       for (final chunk in result.encodedChunks) {
-        await mergeYield.maybeYield();
+        final y1 = mergeYield.maybeYield();
+        if (y1 != null) await y1;
         encodedChunks.add(chunk);
       }
     }
@@ -988,7 +989,7 @@ class WalManager {
     final List<WalPointer> pointers =
         List<WalPointer>.filled(walEntries.length, _current, growable: false);
     for (int i = 0; i < walEntries.length; i++) {
-      final y = yieldController.maybeYieldSync();
+      final y = yieldController.maybeYield();
       if (y != null) await y;
       // Flush may hard-rotate while we yielded. Re-bind path/seq to the live
       // partition — never overwrite _current back onto a retired partition.
@@ -1084,7 +1085,8 @@ class WalManager {
         'WalManager.clearWalPartitionsAndResetMeta',
         checkInterval: 1);
     for (final p in toDelete) {
-      await yieldController.maybeYield();
+      final y2 = yieldController.maybeYield();
+      if (y2 != null) await y2;
       final dirIndex = partitionToDirIndex[p]!;
       final path = _dataStore.pathManager.getWalPartitionLogPath(dirIndex, p,
           spaceName: _dataStore.currentSpaceName);
@@ -1167,7 +1169,8 @@ class WalManager {
 
       // Delete partition files that still have mapping entries
       for (final entry in partitionToDirIndex.entries) {
-        await yieldController.maybeYield();
+        final y3 = yieldController.maybeYield();
+        if (y3 != null) await y3;
         final p = entry.key;
         final dirIndex = entry.value;
         final path = _dataStore.pathManager.getWalPartitionLogPath(dirIndex, p,
@@ -1319,7 +1322,8 @@ class WalManager {
 
         final yieldController = YieldController('WalManager._pumpWalFlush');
         for (final entry in byPath.entries) {
-          await yieldController.maybeYield();
+          final y4 = yieldController.maybeYield();
+          if (y4 != null) await y4;
           final String path = entry.key;
           final List<Map<String, dynamic>> rawEntries = entry.value;
 
