@@ -483,7 +483,8 @@ final class NghPartitionManager {
 
     // ── Encode & stage graph pages ──
     for (final entry in dirtyGraphPages.entries) {
-      await yc.maybeYield();
+      final y1 = yc.maybeYield();
+      if (y1 != null) await y1;
       final ptr = entry.key;
       final page = entry.value;
       final payload = page.encodePayload();
@@ -506,7 +507,8 @@ final class NghPartitionManager {
 
     // ── Encode & stage PQ-code pages ──
     for (final entry in dirtyPqCodePages.entries) {
-      await yc.maybeYield();
+      final y2 = yc.maybeYield();
+      if (y2 != null) await y2;
       final ptr = entry.key;
       final page = entry.value;
       final payload = page.encodePayload();
@@ -528,7 +530,8 @@ final class NghPartitionManager {
 
     // ── Encode & stage raw-vector pages ──
     for (final entry in dirtyRawVectorPages.entries) {
-      await yc.maybeYield();
+      final y3 = yc.maybeYield();
+      if (y3 != null) await y3;
       final ptr = entry.key;
       final page = entry.value;
       final payload = page.encodePayload();
@@ -590,7 +593,8 @@ final class NghPartitionManager {
 
       final tasks = <Future<void> Function()>[];
       for (final e in staged.entries) {
-        await flushYc.maybeYield();
+        final y4 = flushYc.maybeYield();
+        if (y4 != null) await y4;
         final path = e.key;
         final offsets = e.value.keys.toList(growable: false)..sort();
         final writes = <ByteWrite>[
@@ -777,7 +781,8 @@ final class NghPartitionManager {
     );
     // Find any partition with a free page
     for (final entry in heads.entries) {
-      await yc.maybeYield();
+      final y5 = yc.maybeYield();
+      if (y5 != null) await y5;
       final partitionNo = entry.key;
       final headPageNo = entry.value;
       if (headPageNo < NghIndexMeta.firstDataPageNo) continue;
@@ -1161,7 +1166,8 @@ final class NghPartitionManager {
     NghDataCategory category,
   ) async {
     for (final entry in statsMap.entries) {
-      await yc.maybeYield();
+      final y6 = yc.maybeYield();
+      if (y6 != null) await y6;
       final pNo = entry.key;
       final stats = entry.value;
 
