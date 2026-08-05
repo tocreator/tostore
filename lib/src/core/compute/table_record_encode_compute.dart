@@ -34,7 +34,8 @@ Future<TableRecordEncodeResult> encodeTableRecordChunk(
   final yieldController = YieldController('Compute.tableRecord.encode');
 
   for (final record in request.records) {
-    await yieldController.maybeYield();
+    final y1 = yieldController.maybeYield();
+    if (y1 != null) await y1;
     final valuesOnly = Map<String, dynamic>.from(record);
     valuesOnly.remove(request.primaryKeyField);
     encoded.add(BinarySchemaCodec.encodeRecord(
