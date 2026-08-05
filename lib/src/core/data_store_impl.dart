@@ -2003,49 +2003,28 @@ class DataStoreImpl {
       return const <BatchInsertPreparedRecord>[];
     }
 
-    final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
-      itemCount: records.length,
-      estimateAverageItemBytes: () =>
-          ComputeBatchPlanner.estimateAverageItemBytes(
-        records,
-        tableDataManager.estimateRecordSizeBytes,
-      ),
-    );
-    final useIsolate = dispatchPlan.useIsolate;
-    final actualTaskCount = dispatchPlan.actualTaskCount;
-
+    // PERFORMANCE: batchInsert prepare is Map-allocation dominated. Shipping
+    // records through isolates doubles the cost (structured-clone in + out)
+    // and routinely exceeds the pure CPU work. Always prepare on the current
+    // isolate with YieldController; keep the planner only for chunk sizing if
+    // we later re-enable isolate for pathological CPU-heavy schemas.
     final skipPrimaryKeyFormatChecks = List<bool>.generate(
         records.length, (i) => autoPkRecords.contains(records[i]),
         growable: false);
 
-    final tasks =
-        <ComputeTask<BatchInsertPrepareRequest, BatchInsertPrepareResult>>[];
-    for (final range
-        in ComputeBatchPlanner.splitRange(records.length, actualTaskCount)) {
-      tasks.add(
-        ComputeTask(
-          function: prepareBatchInsertChunk,
-          message: BatchInsertPrepareRequest(
-            schema: schema,
-            table: table,
-            records: records.sublist(range.start, range.end),
-            uniqueIndexes: uniqueIndexes,
-            skipPrimaryKeyFormatChecks:
-                skipPrimaryKeyFormatChecks.sublist(range.start, range.end),
-            ignoreUnknownFields: _config?.ignoreUnknownFields ?? true,
-          ),
-        ),
-      );
-    }
-
-    final results =
-        await ComputeManager.computeBatch(tasks, enableIsolate: useIsolate);
-
-    final merged = <BatchInsertPreparedRecord>[];
-    for (final result in results) {
-      merged.addAll(result.records);
-    }
-    return merged;
+    final batchTimestamp = DateTime.now();
+    final result = await prepareBatchInsertChunk(
+      BatchInsertPrepareRequest(
+        schema: schema,
+        tableName: table.tableName,
+        records: records,
+        uniqueIndexes: uniqueIndexes,
+        skipPrimaryKeyFormatChecks: skipPrimaryKeyFormatChecks,
+        ignoreUnknownFields: _config?.ignoreUnknownFields ?? true,
+        batchTimestamp: batchTimestamp,
+      ),
+    );
+    return result.records;
   }
 
   Future<List<IdentifierValidationRecordResult>>
@@ -4479,45 +4458,15 @@ class DataStoreImpl {
       }
 
       try {
-        // Keep buffer/WAL flushes small, but let the pure-compute prepare stage
-        // use larger memory-aware windows so it can be split across isolates.
+        // Prepare + reserve + flush in windows of [bufferBatchSize].
+        // Prepare now runs on the current isolate (no Map isolate transfer), so
+        // avoid the old memory-aware adaptive planner / system-memory probe that
+        // only existed to size isolate tasks.
         const int bufferBatchSize = 100000;
-        const int directPrepareBatchItemThreshold = 500;
-        int? averageRecordBytes;
-
-        int resolveAverageRecordBytes() {
-          return averageRecordBytes ??=
-              ComputeBatchPlanner.estimateAverageItemBytes(
-            recordsToProcess,
-            tableDataManager.estimateRecordSizeBytes,
-          );
-        }
 
         int start = 0;
         while (start < recordsToProcess.length) {
-          final int remainingRecordCount = recordsToProcess.length - start;
-          final int prepareBatchSize;
-          if (remainingRecordCount <= directPrepareBatchItemThreshold) {
-            prepareBatchSize = remainingRecordCount;
-          } else {
-            final remainingDispatchPlan = ComputeBatchPlanner.planTaskExecution(
-              itemCount: remainingRecordCount,
-              estimateAverageItemBytes: resolveAverageRecordBytes,
-            );
-            final effectiveAverageRecordBytes =
-                remainingDispatchPlan.sampledAverageItemBytes
-                    ? remainingDispatchPlan.averageItemBytes
-                    : resolveAverageRecordBytes();
-            prepareBatchSize =
-                await ComputeBatchPlanner.estimateAdaptiveBatchItemCount(
-              totalItemCount: remainingRecordCount,
-              averageItemBytes: effectiveAverageRecordBytes,
-              maxBatchItemCount:
-                  bufferBatchSize * remainingDispatchPlan.actualTaskCount,
-            );
-          }
-          final int end =
-              min(start + max(1, prepareBatchSize), recordsToProcess.length);
+          final int end = min(start + bufferBatchSize, recordsToProcess.length);
           final currentRecords = recordsToProcess.sublist(start, end);
           final preparedRecords = await _prepareBatchInsertRecords(
             tableSchema,
@@ -4525,6 +4474,15 @@ class DataStoreImpl {
             currentRecords,
             uniqueIndexesForTable,
             autoPkRecords,
+          );
+
+          // Pre-materialize unique refs once for the whole chunk so the reserve
+          // loop does not allocate UniqueKeyRef per record on the happy path.
+          final preparedUniqueRefs = List<List<UniqueKeyRef>>.generate(
+            preparedRecords.length,
+            (i) =>
+                _materializeUniqueKeyRefs(preparedRecords[i].plannedUniqueRefs),
+            growable: false,
           );
 
           final yieldController =
@@ -4571,7 +4529,8 @@ class DataStoreImpl {
                     final out = List<UniqueViolation?>.filled(recs.length, null,
                         growable: false);
                     for (int off = 0; off < recs.length; off += chunkSize) {
-                      await yieldController.maybeYield();
+                      final y = yieldController.maybeYieldSync();
+                      if (y != null) await y;
                       final int to = (off + chunkSize < recs.length)
                           ? off + chunkSize
                           : recs.length;
@@ -4774,11 +4733,13 @@ class DataStoreImpl {
 
           final recordErrors = <String>[];
 
+          // Process prepared records: reserve unique keys and enqueue for flush.
           for (int offset = 0; offset < currentRecords.length; offset++) {
             final int j = start + offset;
             final record = currentRecords[offset];
             final preparedRecord = preparedRecords[offset];
-            await yieldController.maybeYield();
+            final loopYield = yieldController.maybeYieldSync();
+            if (loopYield != null) await loopYield;
 
             final bool isAutoPk = autoPkRecords.contains(record);
 
@@ -4897,28 +4858,27 @@ class DataStoreImpl {
                 }
 
                 // Plan unique locks + refs for atomic check+reserve
-                final planIns = UniquePlan(
-                  (!triedPkConflictRetry &&
-                          _preparedInsertUniqueRefsStillMatch(
-                            preparedRecord,
-                            validData,
-                            primaryKey,
-                          ))
-                      ? _materializeUniqueKeyRefs(
-                          preparedRecord.plannedUniqueRefs,
-                        )
-                      : planUniqueForInsert(
-                          table,
-                          tableSchema,
-                          validData,
-                          uniqueIndexes: uniqueIndexesForTable,
-                        ).refs,
-                );
+                final List<UniqueKeyRef> uniqueRefs;
+                if (!triedPkConflictRetry &&
+                    _preparedInsertUniqueRefsStillMatch(
+                      preparedRecord,
+                      validData,
+                      primaryKey,
+                    )) {
+                  uniqueRefs = preparedUniqueRefs[offset];
+                } else {
+                  uniqueRefs = planUniqueForInsert(
+                    table,
+                    tableSchema,
+                    validData,
+                    uniqueIndexes: uniqueIndexesForTable,
+                  ).refs;
+                }
 
                 // Reservation based: try reserve unique keys first
                 final recordId = validData[primaryKey].toString();
                 try {
-                  batchContext.tryReserve(recordId, planIns.refs);
+                  batchContext.tryReserve(recordId, uniqueRefs);
                 } catch (e) {
                   if (e is UniqueViolation) {
                     final bool isPkConflict = e.indexName == 'pk';
@@ -5015,19 +4975,11 @@ class DataStoreImpl {
 
                 try {
                   batchRecordsForBuffer.add(validData);
-                  batchUniqueRefsForBuffer.add(planIns.refs);
+                  batchUniqueRefsForBuffer.add(uniqueRefs);
                   batchOriginalById[recordId] = record;
 
-                  if (batchRecordsForBuffer.length >= bufferBatchSize) {
-                    final bool hadFlushFailures = await flushBatch();
-                    if (hadFlushFailures && !allowPartialErrors) {
-                      return finishWithPromoteMirror(DbResult.error(
-                        type: ResultType.engError,
-                        message: 'Error processing record: WAL append failed',
-                        failedKeys: returnResultDetails ? failedKeys : const [],
-                      ));
-                    }
-                  }
+                  // Flush is deferred to the end of the prepare window
+                  // (window size == bufferBatchSize) to avoid mid-loop double work.
 
                   finishedRecord = true;
                 } catch (e) {
