@@ -230,7 +230,8 @@ final class MigrationFormatMigration {
     DbException? firstTaskError;
 
     for (final entry in entries.entries) {
-      await yieldController.maybeYield();
+      final y1 = yieldController.maybeYield();
+      if (y1 != null) await y1;
       try {
         final outcome = await _migrateOneTask(
           dataStore,
