@@ -52,7 +52,8 @@ class OldStructureMigrationHandler {
       // migrate each space one by one
       for (final spaceName in allSpaces) {
         Logger.info('Starting to migrate space: $spaceName');
-        await yieldController.maybeYield();
+        final y1 = yieldController.maybeYield();
+        if (y1 != null) await y1;
 
         // create a migration instance for a specific space
         final migrationInstance = DataStoreImpl(
@@ -174,7 +175,8 @@ class OldStructureMigrationHandler {
           YieldController('migrate_old_tables', checkInterval: 1);
       // migrate each table one by one
       for (final tableName in tableNames) {
-        await yieldController.maybeYield();
+        final y2 = yieldController.maybeYield();
+        if (y2 != null) await y2;
         await _migrateTable(tableName, oldPath, isGlobal, dataStore);
 
         // clean old table files and directories
@@ -296,7 +298,8 @@ class OldStructureMigrationHandler {
                 // continue to process the next line
               }
             }
-            await yieldController.maybeYield();
+            final y3 = yieldController.maybeYield();
+            if (y3 != null) await y3;
           }
 
           // write all collected records in batch
