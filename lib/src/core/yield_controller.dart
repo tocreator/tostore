@@ -14,14 +14,19 @@ import 'dart:math' as math;
 /// 4. **Low Latency**: Supports immediate yielding (min interval = 1) for
 ///    extremely heavy workloads.
 ///
-/// Usage:
+/// Usage (required fast-path pattern — do **not** wrap in an `async` helper):
 /// ```dart
 /// final yieldController = YieldController('batch_process');
 /// for (final item in heavyList) {
 ///   // process item
-///   await yieldController.maybeYield();
+///   final y = yieldController.maybeYield();
+///   if (y != null) await y;
 /// }
 /// ```
+///
+/// Returning `Future?` (instead of an `async` method) avoids Future/microtask
+/// overhead on the common path where no yield is needed. Always null-check
+/// before `await`; discarding the Future silently skips the yield.
 /// Global settings for YieldController
 class YieldControllerSettings {
   /// Whether yielding is enabled in the current isolate.
@@ -103,33 +108,20 @@ class YieldController {
 
   /// Checks if the time budget has been exceeded and yields if necessary.
   ///
+  /// Returns `null` if no yield is needed (fast path — no Future / no await).
+  /// Returns a `Future` only when yielding is actually required.
+  ///
+  /// **Required call pattern** (skipping the null-check drops the yield):
+  /// ```dart
+  /// final y = yieldController.maybeYield();
+  /// if (y != null) await y;
+  /// ```
+  ///
   /// Optimized for hot loops:
   /// - Only checks `Stopwatch` every [_currentCheckInterval] iterations.
   /// - If budget is exceeded, yields to the event loop (`Future.delayed`).
   /// - Updates the adaptive interval based on throughput.
-  Future<void> maybeYield() async {
-    final f = maybeYieldSync();
-    if (f != null) await f;
-  }
-
-  /// Synchronous fast-path version of [maybeYield].
-  ///
-  /// Returns `null` if no yield is needed (fast path - no async overhead).
-  /// Returns a `Future` only when yielding is actually required.
-  ///
-  /// Usage for maximum performance in tight loops:
-  /// ```dart
-  /// final yieldController = YieldController('batch_process');
-  /// for (final item in heavyList) {
-  ///   // process item
-  ///   final f = yieldController.maybeYieldSync();
-  ///   if (f != null) await f;
-  /// }
-  /// ```
-  ///
-  /// This eliminates async/await overhead for the common case where no yield
-  /// is needed, which can save significant time in loops with millions of iterations.
-  Future<void>? maybeYieldSync() {
+  Future<void>? maybeYield() {
     if (!_enabled) return null;
 
     _iterationsSinceCheck++;
