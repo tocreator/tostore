@@ -1188,7 +1188,15 @@ class MigrationManager {
     }).toList()
       ..sort((a, b) => a.createTime.compareTo(b.createTime));
 
-    var currentRecord = Map<String, dynamic>.from(record);
+    // Copy-on-write: return the original reference when no migration ops apply.
+    // Critical for getBufferedRecordForRead identical() short-circuit.
+    var currentRecord = record;
+    var owned = false;
+    void ensureOwned() {
+      if (owned) return;
+      currentRecord = Map<String, dynamic>.from(currentRecord);
+      owned = true;
+    }
 
     if (fromVersion.isEmpty) {
       bool shouldApply = false;
@@ -1213,6 +1221,8 @@ class MigrationManager {
           }
         }
         if (shouldApply) {
+          // applyMigrationOperationsSync mutates in place.
+          ensureOwned();
           currentRecord = applyMigrationOperationsSync(
             currentRecord,
             task.operations,
@@ -1234,6 +1244,7 @@ class MigrationManager {
       }
 
       if (startUpgrading) {
+        ensureOwned();
         currentRecord = applyMigrationOperationsSync(
           currentRecord,
           task.operations,
