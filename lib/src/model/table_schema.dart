@@ -975,14 +975,18 @@ class TableSchema {
     bool trustedConvertedValues = false,
     Map<String, FieldSchema>? fieldMap,
     bool ignoreUnknownFields = true,
+
+    /// When true, mutate [data] in place instead of copying.
+    /// Safe only when the caller owns a freshly built map (e.g. insert prepare).
+    bool mutateInPlace = false,
   }) {
     try {
       // In batch scenarios, callers can build and pass a shared fieldMap to avoid
       // reconstructing it for every record; for non-batch calls we build a local map here.
       final fieldMapLocal = fieldMap ?? {for (final f in fields) f.name: f};
 
-      // Create a new result Map
-      var result = Map<String, dynamic>.from(data);
+      // Create a new result Map (or reuse caller's map to avoid a full copy).
+      var result = mutateInPlace ? data : Map<String, dynamic>.from(data);
 
       // First handle primary key field
       final primaryKeyName = primaryKeyConfig.name;
@@ -1760,7 +1764,12 @@ class FieldSchema {
     return _convertValueInternal(value);
   }
 
-  /// Type conversion (internal method)
+  /// Type conversion (internal method).
+  ///
+  /// Hot path: values already in the declared Dart/storage form return immediately
+  /// (no re-parse). This matters for batchInsert prepare where typed app records
+  /// are the common case — especially [DataType.datetime] strings, where
+  /// `DateTime.parse` + `toIso8601String` previously dominated CPU.
   dynamic _convertValueInternal(dynamic value) {
     if (value == null) return null;
 
@@ -1817,10 +1826,8 @@ class FieldSchema {
         }
         return null;
       case DataType.text:
-        String? rawString;
-        if (value is String) {
-          rawString = value;
-        } else if (value is DateTime) {
+        if (value is String) return value.trim();
+        if (value is DateTime) {
           try {
             return value.toIso8601String();
           } catch (e) {
@@ -1828,12 +1835,8 @@ class FieldSchema {
                 rawError: e);
             return null;
           }
-        } else {
-          rawString = value?.toString();
         }
-
-        if (rawString == null) return null;
-
+        final rawString = value.toString();
         return rawString.trim();
       case DataType.blob:
         if (value is Uint8List) return value;
@@ -1853,17 +1856,11 @@ class FieldSchema {
         if (value is BigInt) return value != BigInt.zero;
         return null;
       case DataType.datetime:
-        if (value == null) return null;
+        // Storage form is ISO-8601 String. Trust already-string values:
+        // re-parse+serialize is O(chars) per cell and dominated batchInsert
+        // prepare when apps pass datetime strings (or shared batch timestamps).
+        if (value is String) return value;
         if (value is DateTime) return value.toIso8601String();
-        if (value is String) {
-          try {
-            return DateTime.parse(value).toIso8601String();
-          } catch (e) {
-            Logger.warn('Failed to parse DateTime from string: $value',
-                rawError: e);
-            return null;
-          }
-        }
         if (value is int) {
           try {
             return DateTime.fromMillisecondsSinceEpoch(value).toIso8601String();
