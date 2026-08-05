@@ -48,7 +48,8 @@ final class MetaFormatMigration {
     final yieldController =
         YieldController('meta_format_migration', checkInterval: 1);
     for (final spaceName in spaces) {
-      await yieldController.maybeYield();
+      final y1 = yieldController.maybeYield();
+      if (y1 != null) await y1;
       await migrateSpace(dataStore, spaceName: spaceName);
     }
   }
@@ -391,7 +392,8 @@ final class MetaFormatMigration {
     DbException? retryableError;
 
     for (final partitionIndex in indexes) {
-      await yieldController.maybeYield();
+      final y2 = yieldController.maybeYield();
+      if (y2 != null) await y2;
       final dirIndex = partitionIndex ~/ dataStore.maxEntriesPerDir;
       final partitionDir = dataStore.pathManager.getTransactionPartitionDirPath(
         dirIndex,
