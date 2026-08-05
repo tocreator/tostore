@@ -151,7 +151,8 @@ class MigrationManager {
       checkInterval: 32,
     );
     for (final uid in refs.keys) {
-      await yieldController.maybeYield();
+      final y1 = yieldController.maybeYield();
+      if (y1 != null) await y1;
       final schema = await schemaMgr.getTableSchema(uid);
       if (schema != null) out.add(schema);
     }
@@ -436,7 +437,8 @@ class MigrationManager {
 
       // Update task checkpoints atomically per task
       for (final entry in progressMap.entries) {
-        await yieldController.maybeYield();
+        final y2 = yieldController.maybeYield();
+        if (y2 != null) await y2;
         final taskId = entry.key;
         final progress = entry.value;
 
@@ -5295,7 +5297,8 @@ class MigrationManager {
                       if (migrationController.isCancelled) {
                         return false;
                       }
-                      await yieldController.maybeYield();
+                      final y3 = yieldController.maybeYield();
+                      if (y3 != null) await y3;
                       final be = migratedRecords[i];
                       final pk = be.data[sourcePkName]?.toString() ?? '';
 
@@ -6263,7 +6266,8 @@ class MigrationManager {
       // (same as online dual-write mirror).
       final toUpsert = <Map<String, dynamic>>[];
       for (final raw in records) {
-        await yieldController.maybeYield();
+        final y4 = yieldController.maybeYield();
+        if (y4 != null) await y4;
         if (migrationController.isCancelled) return false;
         final transformed = Map<String, dynamic>.from(raw);
         transformPromoteOldToNewInPlace(transformed, promoteDesc);
