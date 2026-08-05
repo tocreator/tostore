@@ -614,7 +614,8 @@ class ParallelJournalManager {
 
         // Process business writes (as the "newer" data, overwriting migration)
         for (final e in batch) {
-          await yieldController.maybeYield();
+          final y1 = yieldController.maybeYield();
+          if (y1 != null) await y1;
           final tableContext = await _tableContextFromUid(e.tableUid);
           if (tableContext == null) continue;
           tableEpochs.putIfAbsent(
@@ -873,7 +874,8 @@ class ParallelJournalManager {
 
                   // 3) Symmetrically upgrade records to current active version and classify
                   for (final be in unifiedPkMap.values) {
-                    await yieldController.maybeYield();
+                    final y2 = yieldController.maybeYield();
+                    if (y2 != null) await y2;
                     var currentData = be.data;
                     if (migrationManager != null &&
                         be.schemaVersion.isNotEmpty &&
@@ -918,7 +920,8 @@ class ParallelJournalManager {
                         missingOld,
                       );
                       for (final r in olds.records) {
-                        await yieldController.maybeYield();
+                        final y3 = yieldController.maybeYield();
+                        if (y3 != null) await y3;
                         final pk = r[pkName]?.toString();
                         if (pk == null || pk.isEmpty) continue;
 
@@ -1374,7 +1377,8 @@ class ParallelJournalManager {
           'ParallelJournalManager._recoverFromWal.partition',
           checkInterval: 1);
       while (true) {
-        await partitionYieldController.maybeYield();
+        final y4 = partitionYieldController.maybeYield();
+        if (y4 != null) await y4;
         final dirIndex = _walManager.getPartitionDirIndex(p);
         final path = dirIndex != null
             ? _dataStore.pathManager.getWalPartitionLogPath(dirIndex, p,
@@ -1422,7 +1426,8 @@ class ParallelJournalManager {
               YieldController('ParallelJournalManager._recoverFromWal');
 
           for (final entry in entries) {
-            await yieldController.maybeYield();
+            final y5 = yieldController.maybeYield();
+            if (y5 != null) await y5;
             seq++;
             if (first && seq <= toSkip) continue;
 
@@ -2077,7 +2082,8 @@ class ParallelJournalManager {
           final yieldController =
               YieldController('ParallelJournalManager._collectBatchWalChanges');
           for (final entry in entries) {
-            await yieldController.maybeYield();
+            final y6 = yieldController.maybeYield();
+            if (y6 != null) await y6;
             seq++;
             if (first && seq < toSkip) continue;
 
@@ -2344,7 +2350,8 @@ class ParallelJournalManager {
         'ParallelJournalManager._replayPageRedoLog.parse',
         checkInterval: yieldInterval);
     while (pos < bytes.length) {
-      await parseYc.maybeYield();
+      final y7 = parseYc.maybeYield();
+      if (y7 != null) await y7;
       final rec = PageRedoLogCodec.decodeRecord(bytes, pos);
       if (rec == null) break;
       pos = rec.nextStart;
@@ -2370,7 +2377,8 @@ class ParallelJournalManager {
         'ParallelJournalManager._replayPageRedoLog.write',
         checkInterval: 5);
     for (final e in byPartition.entries) {
-      await writeYc.maybeYield();
+      final y8 = writeYc.maybeYield();
+      if (y8 != null) await y8;
       final key = e.key;
       final pages = e.value;
       if (pages.isEmpty) continue;
@@ -2467,7 +2475,8 @@ class ParallelJournalManager {
         checkInterval: 5,
       );
       for (final rec in treeMeta.values) {
-        await metaYc.maybeYield();
+        final y9 = metaYc.maybeYield();
+        if (y9 != null) await y9;
         try {
           final tableContext =
               await _tableContextFromUid(TableUid(rec.tableUid));
