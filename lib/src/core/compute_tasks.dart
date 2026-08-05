@@ -316,7 +316,8 @@ Future<BatchTableSimilarityResult> calculateBatchTableSimilarity(
       budgetMs: request.yieldDurationMs);
 
   for (final req in request.requests) {
-    await yieldController.maybeYield();
+    final y1 = yieldController.maybeYield();
+    if (y1 != null) await y1;
     final result = await calculateTableSimilarity(req);
     results.add(result);
   }
@@ -506,7 +507,8 @@ Future<BatchFieldSimilarityResult> calculateBatchFieldSimilarity(
       budgetMs: request.yieldDurationMs);
 
   for (final req in request.requests) {
-    await yieldController.maybeYield();
+    final y2 = yieldController.maybeYield();
+    if (y2 != null) await y2;
     final result = await calculateFieldSimilarity(req);
     results.add(result);
   }
@@ -854,7 +856,8 @@ Future<MigrationRecordProcessResult> processMigrationRecords(
     final timestamp = DateTime.now();
 
     for (final record in request.records) {
-      await yieldController.maybeYield();
+      final y3 = yieldController.maybeYield();
+      if (y3 != null) await y3;
 
       final transformed = applyMigrationOperationsSync(
         Map<String, dynamic>.from(record),
@@ -1253,7 +1256,8 @@ Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
       if (request.isHighGeneration && sequence + request.count <= maxSequence) {
         // Efficient batch generation method
         for (int i = 0; i < request.count; i++) {
-          await yieldController.maybeYield();
+          final y4 = yieldController.maybeYield();
+          if (y4 != null) await y4;
           sequence += 1;
 
           // Calculate timestamp ID
@@ -1286,7 +1290,8 @@ Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
 
         // Generate ID
         for (int i = 0; i < request.count; i++) {
-          await yieldController.maybeYield();
+          final y5 = yieldController.maybeYield();
+          if (y5 != null) await y5;
           // Increase sequence number
           sequence +=
               request.useRandomStep && step > 1 ? random.nextInt(step) + 1 : 1;
@@ -1325,7 +1330,8 @@ Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
       if (request.isHighGeneration && sequence + request.count <= maxSequence) {
         // Efficient batch generation method
         for (int i = 0; i < request.count; i++) {
-          await yieldController.maybeYield();
+          final y6 = yieldController.maybeYield();
+          if (y6 != null) await y6;
           sequence += 1;
 
           // Calculate date prefixed ID
@@ -1366,7 +1372,8 @@ Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
 
         // Generate ID
         for (int i = 0; i < request.count; i++) {
-          await yieldController.maybeYield();
+          final y7 = yieldController.maybeYield();
+          if (y7 != null) await y7;
           // Increase sequence number
           sequence +=
               request.useRandomStep && step > 1 ? random.nextInt(step) + 1 : 1;
@@ -1535,7 +1542,8 @@ Future<BatchWalEncodeResult> batchEncodeWal(
 
   // 2. Encode each entry
   for (final entry in request.entries) {
-    await yieldController.maybeYield();
+    final y8 = yieldController.maybeYield();
+    if (y8 != null) await y8;
     // WalEncoder.encodeAsLine checks partition 'p' inside the entry
     final encoded = WalEncoder.encodeAsLine(entry);
     results.add(encoded);
@@ -1683,7 +1691,8 @@ Future<BatchBTreePageEncodeResult> batchEncodeBTreePages(
   );
 
   for (int i = 0; i < pages.length; i++) {
-    await yieldController.maybeYield();
+    final y9 = yieldController.maybeYield();
+    if (y9 != null) await y9;
     final p = pages[i];
     if (p.typeIndex < 0 || p.typeIndex >= BTreePageType.values.length) {
       throw DbException([
@@ -2366,7 +2375,8 @@ Future<BatchPqEncodeResult> batchPqEncode(BatchPqEncodeRequest request) async {
     return code;
   }, growable: false);
 
-  await yc.maybeYield(); // single yield after batch
+  final y10 = yc.maybeYield(); // single yield after batch
+  if (y10 != null) await y10;
   return BatchPqEncodeResult(codes);
 }
 
