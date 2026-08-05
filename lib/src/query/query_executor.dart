@@ -184,7 +184,8 @@ class QueryExecutor {
         checkInterval: 64,
       );
       for (final row in result.records) {
-        await yieldController.maybeYield();
+        final y1 = yieldController.maybeYield();
+        if (y1 != null) await y1;
         transformPromoteOldToNewInPlace(row, promoteDesc);
       }
     }
@@ -667,7 +668,8 @@ class QueryExecutor {
           final yieldController =
               YieldController('QueryExecutor._postJoinFilter');
           for (final r in results) {
-            await yieldController.maybeYield();
+            final y2 = yieldController.maybeYield();
+            if (y2 != null) await y2;
             if (postJoinMatcher.matches(r)) {
               filtered.add(r);
             }
@@ -897,7 +899,8 @@ class QueryExecutor {
               YieldController('QueryExecutor._executeQueryPlan.cacheCopy');
 
           for (var record in queryResult) {
-            await yieldController.maybeYield();
+            final y3 = yieldController.maybeYield();
+            if (y3 != null) await y3;
             resultMap[record[schema.primaryKey].toString()] =
                 Map<String, dynamic>.from(record);
           }
@@ -1383,7 +1386,8 @@ class QueryExecutor {
       for (final records in branchResults) {
         final list = records ?? const <Map<String, dynamic>>[];
         for (final r in list) {
-          await yieldController.maybeYield();
+          final y4 = yieldController.maybeYield();
+          if (y4 != null) await y4;
           final pk = r[tblSchema.primaryKey]?.toString();
           if (pk == null || pk.isEmpty) continue;
           resultByPk[pk] = r;
@@ -1463,7 +1467,8 @@ class QueryExecutor {
     final yieldControllerKeys =
         YieldController('QueryExecutor._performJoin.keys');
     for (final r in leftRecords) {
-      await yieldControllerKeys.maybeYield();
+      final y5 = yieldControllerKeys.maybeYield();
+      if (y5 != null) await y5;
       final k = r[leftKeyName];
       if (k != null) leftJoinKeys.add(k);
     }
@@ -1592,7 +1597,8 @@ class QueryExecutor {
       final yieldBuild =
           YieldController('QueryExecutor._performJoin.rightLookup');
       for (final rr in rightRecords) {
-        await yieldBuild.maybeYield();
+        final y6 = yieldBuild.maybeYield();
+        if (y6 != null) await y6;
         final val = rightValGetter(rr);
         final key = canonicalizeKey(val);
         rightLookup.putIfAbsent(key, () => []).add(rr);
@@ -1635,7 +1641,8 @@ class QueryExecutor {
     // Handle Join Logic
     if (joinType == 'inner') {
       for (final lr in leftRecords) {
-        await yieldController.maybeYield();
+        final y7 = yieldController.maybeYield();
+        if (y7 != null) await y7;
         final lVal = leftValGetter(lr);
 
         if (isEquality && rightLookup != null) {
@@ -1643,14 +1650,16 @@ class QueryExecutor {
           final matches = rightLookup[lKey];
           if (matches != null) {
             for (final mr in matches) {
-              await yieldController.maybeYield();
+              final y8 = yieldController.maybeYield();
+              if (y8 != null) await y8;
               mergeAndAdd(lr, mr, true);
             }
           }
         } else {
           // Fallback to O(N*M) for non-equality or failed lookup
           for (final rr in rightRecords) {
-            await yieldController.maybeYield();
+            final y9 = yieldController.maybeYield();
+            if (y9 != null) await y9;
             final rVal = rightValGetter(rr);
             if (_evaluateJoinMatch(matcher, lVal, operator, rVal)) {
               mergeAndAdd(lr, rr, true);
@@ -1660,7 +1669,8 @@ class QueryExecutor {
       }
     } else if (joinType == 'left') {
       for (final lr in leftRecords) {
-        await yieldController.maybeYield();
+        final y10 = yieldController.maybeYield();
+        if (y10 != null) await y10;
         final lVal = leftValGetter(lr);
         bool hasMatch = false;
 
@@ -1675,7 +1685,8 @@ class QueryExecutor {
           }
         } else {
           for (final rr in rightRecords) {
-            await yieldController.maybeYield();
+            final y11 = yieldController.maybeYield();
+            if (y11 != null) await y11;
             final rVal = rightValGetter(rr);
             if (_evaluateJoinMatch(matcher, lVal, operator, rVal)) {
               hasMatch = true;
@@ -1695,7 +1706,8 @@ class QueryExecutor {
       if (isEquality) {
         leftLookupMap = {};
         for (final lr in leftRecords) {
-          await yieldController.maybeYield();
+          final y12 = yieldController.maybeYield();
+          if (y12 != null) await y12;
           final val = leftValGetter(lr);
           final key = canonicalizeKey(val);
           leftLookupMap.putIfAbsent(key, () => []).add(lr);
@@ -1703,7 +1715,8 @@ class QueryExecutor {
       }
 
       for (final rr in rightRecords) {
-        await yieldController.maybeYield();
+        final y13 = yieldController.maybeYield();
+        if (y13 != null) await y13;
         final rVal = rightValGetter(rr);
         bool hasMatch = false;
 
@@ -1713,13 +1726,15 @@ class QueryExecutor {
           if (matches != null) {
             hasMatch = true;
             for (final ml in matches) {
-              await yieldController.maybeYield();
+              final y14 = yieldController.maybeYield();
+              if (y14 != null) await y14;
               mergeAndAdd(ml, rr, false);
             }
           }
         } else {
           for (final lr in leftRecords) {
-            await yieldController.maybeYield();
+            final y15 = yieldController.maybeYield();
+            if (y15 != null) await y15;
             final lVal = leftValGetter(lr);
             if (_evaluateJoinMatch(matcher, lVal, operator, rVal)) {
               hasMatch = true;
@@ -2124,7 +2139,8 @@ class QueryExecutor {
         }
 
         while (shouldContinue()) {
-          await yieldController.maybeYield();
+          final y16 = yieldController.maybeYield();
+          if (y16 != null) await y16;
           if (!_dataStore.isInitialized) break;
 
           loops++;
@@ -2227,7 +2243,8 @@ class QueryExecutor {
               final matchedVirtualYieldController =
                   YieldController('QueryExecutor._performIndexScan.virtual');
               for (final matchedIndex in matchedVirtualIndices) {
-                await matchedVirtualYieldController.maybeYield();
+                final y17 = matchedVirtualYieldController.maybeYield();
+                if (y17 != null) await y17;
                 final virtualRec = virtualRecords[matchedIndex];
                 if (filter != null && !filter(virtualRec)) {
                   continue;
@@ -2312,7 +2329,8 @@ class QueryExecutor {
                 final matchedCandidateYieldController = YieldController(
                     'QueryExecutor._performIndexScan.candidates');
                 for (final matchedIndex in matchedCandidateIndices) {
-                  await matchedCandidateYieldController.maybeYield();
+                  final y18 = matchedCandidateYieldController.maybeYield();
+                  if (y18 != null) await y18;
                   final rec = candidateRecords[matchedIndex];
                   if (filter != null && !filter(rec)) {
                     continue;
@@ -2480,7 +2498,8 @@ class QueryExecutor {
 
       int loops = 0;
       while (true) {
-        await yieldController.maybeYield();
+        final y19 = yieldController.maybeYield();
+        if (y19 != null) await y19;
         loops++;
         if (loops > maxLoops) break;
 
@@ -2565,7 +2584,8 @@ class QueryExecutor {
             final matchedCandidateYieldController = YieldController(
                 'QueryExecutor._performIndexScan.topKCandidates');
             for (final matchedIndex in matchedCandidateIndices) {
-              await matchedCandidateYieldController.maybeYield();
+              final y20 = matchedCandidateYieldController.maybeYield();
+              if (y20 != null) await y20;
               final rec = candidateRecords[matchedIndex];
               if (filter != null && !filter(rec)) {
                 continue;
@@ -2668,7 +2688,8 @@ class QueryExecutor {
       // Process possible sort direction information in orderBy
       final yieldController = YieldController('QueryExecutor._applySort');
       for (int i = 0; i < orderBy.length; i++) {
-        await yieldController.maybeYield();
+        final y21 = yieldController.maybeYield();
+        if (y21 != null) await y21;
         String field = orderBy[i];
 
         // 1. Field with "-" prefix indicates descending order
@@ -2692,7 +2713,8 @@ class QueryExecutor {
       }
 
       // Offload sorting to isolate
-      await yieldController.maybeYield(); // Keep the yield
+      final y22 = yieldController.maybeYield(); // Keep the yield
+      if (y22 != null) await y22;
       data = await ValueMatcher.sortMapList(
           data, sortFields, sortDirections, schemas, tableName);
       return data;
