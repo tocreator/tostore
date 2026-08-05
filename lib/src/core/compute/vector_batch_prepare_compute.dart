@@ -41,7 +41,8 @@ Future<VectorBatchPrepareResult> prepareVectorBatchChunk(
   );
 
   for (final record in request.records) {
-    await yieldController.maybeYield();
+    final y1 = yieldController.maybeYield();
+    if (y1 != null) await y1;
 
     final values = _extractVectorValues(record[request.fieldName]);
     if (values == null) continue;
