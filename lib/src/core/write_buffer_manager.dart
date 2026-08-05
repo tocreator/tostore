@@ -672,7 +672,7 @@ class WriteBufferManager {
     final bool bgMaybeActive = !bgScheduler.isEmpty;
 
     for (int i = 0; i < recordIds.length; i++) {
-      final y = yieldController.maybeYieldSync();
+      final y = yieldController.maybeYield();
       if (y != null) await y;
       if (i % emitChunk == 0 && _writeQueue.length > backpressureCap) {
         await _dataStore.parallelJournalManager.waitIfThrottled(emitChunk);
@@ -824,7 +824,8 @@ class WriteBufferManager {
     }
 
     while (_writeQueue.isNotEmpty) {
-      await yieldControl.maybeYield();
+      final y1 = yieldControl.maybeYield();
+      if (y1 != null) await y1;
       final head = _writeQueue.first;
       // Treat pseudo pointers as immediately removable.
       if (head.walPointer.partitionIndex < 0) {
@@ -941,7 +942,8 @@ class WriteBufferManager {
     }
 
     for (final e in batch) {
-      await yieldControl.maybeYield();
+      final y2 = yieldControl.maybeYield();
+      if (y2 != null) await y2;
       if (hasActiveViews && flushMarker != null) {
         _pendingCleanupQueue.add(_PendingCleanup(e, flushMarker));
       } else {
@@ -978,7 +980,8 @@ class WriteBufferManager {
         final yieldControl =
             YieldController('WriteBufferManager.purgeAllPending');
         while (_pendingCleanupQueue.isNotEmpty) {
-          await yieldControl.maybeYield();
+          final y3 = yieldControl.maybeYield();
+          if (y3 != null) await y3;
           _cleanupSingle(_pendingCleanupQueue.removeFirst().entry);
         }
         return;
@@ -992,7 +995,8 @@ class WriteBufferManager {
 
       final yieldControl = YieldController('WriteBufferManager.purgePending');
       while (_pendingCleanupQueue.isNotEmpty) {
-        await yieldControl.maybeYield();
+        final y4 = yieldControl.maybeYield();
+        if (y4 != null) await y4;
         final head = _pendingCleanupQueue.first;
 
         // Check if oldestSnapshot is newer than flushMarker
@@ -1148,7 +1152,8 @@ class WriteBufferManager {
     // We convert to list to iterate reversed. This is O(N) copy but N is queue size (small-ish).
     final activeList = _writeQueue.toList();
     for (int i = activeList.length - 1; i >= 0; i--) {
-      await yieldControl.maybeYield();
+      final y5 = yieldControl.maybeYield();
+      if (y5 != null) await y5;
       final e = activeList[i];
       if (!processEntry(e.tableUid, e.recordId, e.walPointer)) {
         // If processEntry returned false, it means we hit 'since' or limit.
@@ -1163,7 +1168,8 @@ class WriteBufferManager {
     // Pending items are older than Active items.
     final pendingList = _pendingCleanupQueue.toList();
     for (int i = pendingList.length - 1; i >= 0; i--) {
-      await yieldControl.maybeYield();
+      final y6 = yieldControl.maybeYield();
+      if (y6 != null) await y6;
       final item = pendingList[i];
       if (!processEntry(
           item.entry.tableUid, item.entry.recordId, item.entry.walPointer)) {
@@ -1213,7 +1219,8 @@ class WriteBufferManager {
     // Cleanup transaction unique keys for this table
     final yieldController = YieldController('buf_clear_table_txn');
     for (final tables in _txnBuffers.values) {
-      await yieldController.maybeYield();
+      final y7 = yieldController.maybeYield();
+      if (y7 != null) await y7;
       tables.remove(tableUid);
     }
 
@@ -1359,7 +1366,8 @@ class WriteBufferManager {
       for (final iEntry in buf.uniqueKeyOwners.entries) {
         final indexUid = iEntry.key;
         for (final kEntry in iEntry.value.entries) {
-          await yieldController.maybeYield();
+          final y8 = yieldController.maybeYield();
+          if (y8 != null) await y8;
           final internalKey = _toInternalKey(kEntry.key);
           _removeTxFromGlobalIndex(
               transactionId, tableUid, indexUid, internalKey);
@@ -1682,7 +1690,8 @@ class WriteBufferManager {
     const int emitChunk = 1000;
 
     for (int i = 0; i < recordIds.length; i++) {
-      await yieldController.maybeYield();
+      final y9 = yieldController.maybeYield();
+      if (y9 != null) await y9;
       if (i % emitChunk == 0) {
         await _dataStore.parallelJournalManager.waitIfThrottled(emitChunk);
         await _dataStore.parallelJournalManager.waitUntilQueueBelow(
@@ -1834,7 +1843,8 @@ class WriteBufferManager {
     const int emitChunk = 1000;
 
     for (int i = 0; i < recordIds.length; i++) {
-      await yieldController.maybeYield();
+      final y10 = yieldController.maybeYield();
+      if (y10 != null) await y10;
       if (i % emitChunk == 0) {
         await _dataStore.parallelJournalManager.waitIfThrottled(emitChunk);
         await _dataStore.parallelJournalManager.waitUntilQueueBelow(
