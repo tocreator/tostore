@@ -385,7 +385,8 @@ class TableDataManager {
     final yieldController =
         YieldController('TableDataManager.removeTableRecords');
     for (final pk in pks) {
-      await yieldController.maybeYield();
+      final y1 = yieldController.maybeYield();
+      if (y1 != null) await y1;
       _tableRecordCache.remove([table.tableUid, pk]);
     }
   }
@@ -727,7 +728,8 @@ class TableDataManager {
       final yieldController =
           YieldController('TableDataManager.recalculateAllStatistics');
       for (final meta in metaList) {
-        await yieldController.maybeYield();
+        final y2 = yieldController.maybeYield();
+        if (y2 != null) await y2;
         if (meta != null) {
           totalRecords += meta.totalRecords;
           totalSize += meta.totalSizeInBytes;
@@ -936,7 +938,8 @@ class TableDataManager {
         final idGenKeys = List<String>.from(_idGenerators.keys);
         final yieldController = YieldController('TableDataManager.dispose');
         for (final tableUid in idGenKeys) {
-          await yieldController.maybeYield();
+          final y3 = yieldController.maybeYield();
+          if (y3 != null) await y3;
           final ctx = await _tableContextFromUid(TableUid(tableUid));
           if (ctx != null) await _saveIdRange(ctx);
         }
@@ -981,7 +984,8 @@ class TableDataManager {
       if (_maxIdsDirty.isEmpty) return;
       final yieldController = YieldController('TableDataManager.flushMaxIds');
       for (final entry in _maxIdsDirty.entries.toList()) {
-        await yieldController.maybeYield();
+        final y4 = yieldController.maybeYield();
+        if (y4 != null) await y4;
         if (!entry.value) continue; // Skip unchanged
 
         final tableUid = entry.key;
@@ -1352,7 +1356,8 @@ class TableDataManager {
       final yieldController = YieldController('TableDataManager._addBatch.tx');
 
       for (int i = 0; i < records.length; i++) {
-        await yieldController.maybeYield();
+        final y5 = yieldController.maybeYield();
+        if (y5 != null) await y5;
         final r = records[i];
         final recordId = r[pkName]?.toString();
         if (recordId == null || recordId.isEmpty) {
@@ -1398,7 +1403,8 @@ class TableDataManager {
       _registerTableComparator(table, schema);
 
       for (int i = 0; i < records.length; i++) {
-        await yieldController.maybeYield();
+        final y6 = yieldController.maybeYield();
+        if (y6 != null) await y6;
         final r = records[i];
         final recordId = r[pkName]?.toString();
         if (recordId == null || recordId.isEmpty) {
@@ -1468,7 +1474,7 @@ class TableDataManager {
     final validBatchOldValues = <Map<String, dynamic>?>[];
 
     for (int i = 0; i < records.length; i++) {
-      final y = yieldController.maybeYieldSync();
+      final y = yieldController.maybeYield();
       if (y != null) await y;
       final r = records[i];
       final recordId = r[pkName]?.toString();
@@ -1525,7 +1531,7 @@ class TableDataManager {
     final finalUniqueKeysList = <List<UniqueKeyRef>>[];
 
     for (int i = 0; i < validBatchRecordIds.length; i++) {
-      final y = yieldController.maybeYieldSync();
+      final y = yieldController.maybeYield();
       if (y != null) await y;
       final recordId = validBatchRecordIds[i];
       final r = validBatchRecords[i];
@@ -1684,7 +1690,8 @@ class TableDataManager {
     );
     for (final result in results) {
       for (final record in result.trimmedRecords) {
-        await mergeYield.maybeYield();
+        final y7 = mergeYield.maybeYield();
+        if (y7 != null) await y7;
         trimmedRecords.add(record);
       }
     }
@@ -1875,7 +1882,8 @@ class TableDataManager {
             final deleted = <String>{};
 
             for (final op in defOps.values) {
-              await yieldController.maybeYield();
+              final y8 = yieldController.maybeYield();
+              if (y8 != null) await y8;
               if (op.type == BufferOperationType.insert) {
                 final k = op.data[pkName]?.toString();
                 if (k != null && k.isNotEmpty) inserted.add(k);
@@ -2502,7 +2510,8 @@ class TableDataManager {
           [],
         );
         for (final r in overlay) {
-          await yieldController.maybeYield();
+          final y9 = yieldController.maybeYield();
+          if (y9 != null) await y9;
           if (!isDeletedRecord(r)) yield r;
         }
         return;
@@ -2582,7 +2591,8 @@ class TableDataManager {
           encryptionKey: customKey,
           encryptionKeyId: customKeyId,
         )) {
-          await yieldController.maybeYield();
+          final y10 = yieldController.maybeYield();
+          if (y10 != null) await y10;
           final merged = applyOverlay(record);
           if (merged != null) {
             yield merged;
@@ -2634,7 +2644,8 @@ class TableDataManager {
         }();
 
         await for (final record in controller.stream) {
-          await yieldController.maybeYield();
+          final y11 = yieldController.maybeYield();
+          if (y11 != null) await y11;
           yield record;
         }
       }
@@ -2663,7 +2674,8 @@ class TableDataManager {
           continue;
         }
 
-        await yieldController.maybeYield();
+        final y12 = yieldController.maybeYield();
+        if (y12 != null) await y12;
 
         bool shadowedByDelete = false;
         if (currentTxId != null) {
@@ -2691,7 +2703,8 @@ class TableDataManager {
           continue;
         }
 
-        await yieldController.maybeYield();
+        final y13 = yieldController.maybeYield();
+        if (y13 != null) await y13;
 
         final defOps = _txnDeferredOps[currentTxId]?[table.tableUid];
         final txOp = defOps?[key];
@@ -3025,7 +3038,8 @@ class TableDataManager {
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
       )) {
-        await yc.maybeYield();
+        final y14 = yc.maybeYield();
+        if (y14 != null) await y14;
         batch.add(r);
         if (batch.length >= batchSize) {
           await flushBatch();
@@ -3085,7 +3099,8 @@ class TableDataManager {
     final yieldController =
         YieldController('TableDataManager.mergeConsistency');
     for (final r in records) {
-      await yieldController.maybeYield();
+      final y15 = yieldController.maybeYield();
+      if (y15 != null) await y15;
       final pk = r[primaryKey]?.toString();
       if (pk == null || pk.isEmpty) continue;
       baseRecords[pk] = r;
@@ -3177,7 +3192,8 @@ class TableDataManager {
       }
 
       for (final key in keys) {
-        await yieldController.maybeYield();
+        final y16 = yieldController.maybeYield();
+        if (y16 != null) await y16;
         if (performEarlyBreak && hasReachedTarget()) break;
 
         if (keyPredicate != null && !keyPredicate(key)) continue;
@@ -3222,7 +3238,8 @@ class TableDataManager {
           // Otherwise iterate all deferred ops (heavy path).
           if (explicitTxInsertKeys != null) {
             for (final pk in explicitTxInsertKeys) {
-              await yieldController.maybeYield();
+              final y17 = yieldController.maybeYield();
+              if (y17 != null) await y17;
               if (performEarlyBreak && hasReachedTarget()) break;
 
               final op = defOps[pk];
@@ -3239,7 +3256,8 @@ class TableDataManager {
           } else {
             // Iterate values (Iterable) is cheaper than converting to list
             for (final op in defOps.values) {
-              await yieldController.maybeYield();
+              final y18 = yieldController.maybeYield();
+              if (y18 != null) await y18;
               // Check limit again strictly inside loop
               if (performEarlyBreak && hasReachedTarget()) break;
 
@@ -3276,7 +3294,8 @@ class TableDataManager {
 
             final snapshotList = baseRecords.entries.toList(growable: false);
             for (final entry in snapshotList) {
-              await yieldController.maybeYield();
+              final y19 = yieldController.maybeYield();
+              if (y19 != null) await y19;
               if (hdMatcher.matches(entry.value)) {
                 baseRecords.remove(entry.key);
               }
@@ -3301,7 +3320,8 @@ class TableDataManager {
             // Iterate keys first to avoid concurrent modification of baseRecords during update
 
             for (final k in baseRecords.keys) {
-              await yieldController.maybeYield();
+              final y20 = yieldController.maybeYield();
+              if (y20 != null) await y20;
               if (hmMatcher.matches(baseRecords[k]!)) {
                 baseRecords[k] = Map<String, dynamic>.from(baseRecords[k]!);
                 baseRecords[k]!.addAll(plan.updateData);
@@ -3329,14 +3349,16 @@ class TableDataManager {
         estimateRecordBytes: estimateRecordSizeBytes,
       );
       for (final matchedIndex in matchResult.matchedIndices) {
-        await yieldController.maybeYield();
+        final y21 = yieldController.maybeYield();
+        if (y21 != null) await y21;
         results.add(recordValues[matchedIndex]);
       }
       return results;
     }
 
     for (final r in recordValues) {
-      await yieldController.maybeYield();
+      final y22 = yieldController.maybeYield();
+      if (y22 != null) await y22;
       if (matcher != null && !matcher.matches(r)) continue;
       results.add(r);
       if (trackReadKeys) {
@@ -4540,7 +4562,8 @@ class TableDataManager {
       for (final local in locals) {
         final list = local ?? const <Map<String, dynamic>>[];
         for (final r in list) {
-          await yieldControllerMerge.maybeYield();
+          final y23 = yieldControllerMerge.maybeYield();
+          if (y23 != null) await y23;
           globalTop.offer(r);
         }
       }
@@ -4631,7 +4654,8 @@ class TableDataManager {
       'TableDataManager.calculateAggregateResultBatch.merge',
     );
     for (final partial in partials) {
-      await mergeYield.maybeYield();
+      final y24 = mergeYield.maybeYield();
+      if (y24 != null) await y24;
       aggregator.mergePartial(partial);
     }
     return aggregator.result;
