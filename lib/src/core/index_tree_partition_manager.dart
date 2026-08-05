@@ -521,7 +521,8 @@ final class IndexTreePartitionManager {
     final yc = YieldController('IndexTreePartitionManager.writeChanges',
         checkInterval: 300);
     for (final d in deltas) {
-      await yc.maybeYield();
+      final y1 = yc.maybeYield();
+      if (y1 != null) await y1;
       final key = ByteKey(d.key);
       final existing = ops[key];
       if (existing == null) {
@@ -935,7 +936,8 @@ final class IndexTreePartitionManager {
     }
 
     for (final e in entries) {
-      await yc.maybeYield();
+      final y2 = yc.maybeYield();
+      if (y2 != null) await y2;
       final keyBytes = e.key.bytes;
       final val = e.value;
       final isDelete = val.isNotEmpty && val[0] == 1;
@@ -1117,7 +1119,8 @@ final class IndexTreePartitionManager {
         }
 
         for (int i = 0; i < bytesList.length; i++) {
-          await stageYc.maybeYield();
+          final y3 = stageYc.maybeYield();
+          if (y3 != null) await y3;
           final ptr = pendingPtrs[i];
           final stats = getStats(ptr.partitionNo);
           stats.path ??=
@@ -1137,7 +1140,8 @@ final class IndexTreePartitionManager {
         final batch = Map<TreePagePtr, LeafPage>.from(dirtyLeaves);
         dirtyLeaves.clear();
         for (final entry in batch.entries) {
-          await stageYc.maybeYield();
+          final y4 = stageYc.maybeYield();
+          if (y4 != null) await y4;
           final ptr = entry.key;
           final leaf = entry.value;
           final payloadLength = leaf.estimatePayloadSize();
@@ -1214,7 +1218,8 @@ final class IndexTreePartitionManager {
         final batch = Map<TreePagePtr, InternalPage>.from(dirtyInternals);
         dirtyInternals.clear();
         for (final entry in batch.entries) {
-          await stageYc.maybeYield();
+          final y5 = stageYc.maybeYield();
+          if (y5 != null) await y5;
           final ptr = entry.key;
           final node = entry.value;
           final payloadLength = node.estimatePayloadSize();
@@ -1306,7 +1311,8 @@ final class IndexTreePartitionManager {
     final int pageSize = _dataStore.configuredPageSize;
 
     for (final entry in partitionStats.entries) {
-      await yc.maybeYield();
+      final y6 = yc.maybeYield();
+      if (y6 != null) await y6;
       final pNo = entry.key;
       final stats = entry.value;
 
@@ -1535,7 +1541,8 @@ final class IndexTreePartitionManager {
 
       final tasks = <Future<void> Function()>[];
       for (final e in staged.entries) {
-        await flushYc.maybeYield();
+        final y7 = flushYc.maybeYield();
+        if (y7 != null) await y7;
         final path = e.key;
         final durable = partitionStats.values
             .any((s) => s.path == path && s.alreadyDurableForBatch);
@@ -1554,7 +1561,8 @@ final class IndexTreePartitionManager {
         final scheduler = _dataStore.workloadScheduler;
         if (scheduler.globalMax <= 0 || tasks.length <= 1) {
           for (final t in tasks) {
-            await flushYc.maybeYield();
+            final y8 = flushYc.maybeYield();
+            if (y8 != null) await y8;
             await t();
           }
         } else {
@@ -1762,7 +1770,8 @@ final class IndexTreePartitionManager {
         checkInterval: 30);
 
     while (!ptr.isNull && visited < maxVisitedLeaves && merged < maxMerges) {
-      await yc.maybeYield();
+      final y9 = yc.maybeYield();
+      if (y9 != null) await y9;
       final leaf = await _readLeaf(table, indexUid, meta, ptr,
           encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
       visited++;
@@ -2094,7 +2103,8 @@ final class IndexTreePartitionManager {
         'IndexTreePartitionManager.existsUniqueKeysBatch',
         checkInterval: 200);
     for (final e in leafToKeys.entries) {
-      await yc.maybeYield();
+      final y10 = yc.maybeYield();
+      if (y10 != null) await y10;
       final parts = e.key.split(':');
       final ptr = TreePagePtr(int.parse(parts[0]), int.parse(parts[1]));
       final leaf = await _readLeaf(table, resolvedUid, meta, ptr,
@@ -2232,7 +2242,8 @@ final class IndexTreePartitionManager {
           lastKey: lastKey,
         );
       }
-      await yc.maybeYield();
+      final y11 = yc.maybeYield();
+      if (y11 != null) await y11;
       final leaf = await getLeaf(leafPtr);
       if (leaf.keys.isEmpty) {
         leafPtr = reverse ? leaf.prev : leaf.next;
@@ -2345,11 +2356,13 @@ final class IndexTreePartitionManager {
     final yc = YieldController('IndexTreePartitionManager.getAllDecodedEntries',
         checkInterval: 50);
     while (!ptr.isNull) {
-      await yc.maybeYield();
+      final y12 = yc.maybeYield();
+      if (y12 != null) await y12;
       final leaf = await _readLeaf(table, resolvedUid, meta, ptr,
           encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
       for (int i = 0; i < leaf.keys.length; i++) {
-        await yc.maybeYield();
+        final y13 = yc.maybeYield();
+        if (y13 != null) await y13;
         final k = leaf.keys[i];
         final v = leaf.values[i];
         final pk = _extractPk(meta, k, v);
