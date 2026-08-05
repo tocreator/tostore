@@ -246,7 +246,8 @@ class LargeOperationRunner {
 
           for (final matchedIndex in matchResult.matchedIndices) {
             if (token.isCancelled) return false;
-            await yieldController.maybeYield();
+            final y1 = yieldController.maybeYield();
+            if (y1 != null) await y1;
 
             final record = records[matchedIndex];
             final pkValue = record[primaryKey];
@@ -534,7 +535,8 @@ class LargeOperationRunner {
               matchedIndex < matchedRecords.length;
               matchedIndex++) {
             if (token.isCancelled) return false;
-            await applyYieldController.maybeYield();
+            final y2 = applyYieldController.maybeYield();
+            if (y2 != null) await y2;
 
             final record = matchedRecords[matchedIndex];
             var updatedRecord =
