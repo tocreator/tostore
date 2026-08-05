@@ -544,6 +544,7 @@ class TxnEncoder {
     Map<String, dynamic> record,
     TxnTableCodecContext? ctx,
   ) {
+    // One ownership copy to strip meta keys without mutating caller's map.
     final rec = Map<String, dynamic>.from(record);
     final uniqueKeys = rec.remove('_uniqueKeys');
     final oldValues = rec.remove('_oldValues');
@@ -553,9 +554,12 @@ class TxnEncoder {
     final pk = rec[pkName];
 
     if (ctx != null && ctx.hasSchemaSlots) {
-      final valuesOnly = Map<String, dynamic>.from(rec)..remove(pkName);
-      final rowBytes =
-          BinarySchemaCodec.encodeRecord(valuesOnly, ctx.fieldStructure);
+      // Nullify PK in encode (stored separately) — no second Map.from.
+      final rowBytes = BinarySchemaCodec.encodeRecord(
+        rec,
+        ctx.fieldStructure,
+        nullifyField: pkName,
+      );
       w.writeFieldTag(_fRowEncoding, WireType.varint);
       w.writeVarint(_rowEncodingSchema);
       w.writeFieldTag(_fPk, WireType.lengthDelimited);
@@ -580,7 +584,11 @@ class TxnEncoder {
       }
     }
 
-    if (oldValues is Map) {
+    if (oldValues is Map<String, dynamic>) {
+      w.writeFieldTag(_fOldValues, WireType.lengthDelimited);
+      // encodeMap is read-only — no defensive copy.
+      w.writeBytes(BinaryMapCodec.encodeMap(oldValues));
+    } else if (oldValues is Map) {
       w.writeFieldTag(_fOldValues, WireType.lengthDelimited);
       w.writeBytes(
           BinaryMapCodec.encodeMap(Map<String, dynamic>.from(oldValues)));
