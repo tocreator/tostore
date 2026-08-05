@@ -162,14 +162,6 @@ class IndexManager {
   String _indexLockKey(TableUid tableUid, IndexUid indexUid) =>
       'index:$tableUid:$indexUid';
 
-  int _estimateUniqueIndexPrepareRecordBytes(
-    Map<String, dynamic> record,
-    IndexSchema index,
-  ) {
-    return _dataStore.tableDataManager.estimateRecordSizeBytes(record) +
-        (index.fields.length * 64);
-  }
-
   int _estimateIndexDeltaRecordBytes(
     Map<String, dynamic> record,
     List<String> fields,
@@ -357,48 +349,18 @@ class IndexManager {
       return const <PreparedUniqueIndexEntry>[];
     }
 
-    final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
-      itemCount: records.length,
-      estimateAverageItemBytes: () =>
-          ComputeBatchPlanner.estimateAverageItemBytes(
-        records,
-        (record) => _estimateUniqueIndexPrepareRecordBytes(record, index),
+    // PERFORMANCE: unique-key encoding is lighter than isolate Map transfer.
+    // Running on the current isolate avoids cloning every record for each
+    // unique index during checkUniqueConstraintsBatch (batchInsert hot path).
+    final result = await prepareUniqueIndexChunk(
+      UniqueIndexPrepareRequest(
+        schema: schema,
+        index: index,
+        records: records,
+        changedFieldsByRecord: changedFieldsByRecord,
       ),
     );
-    final useIsolate = dispatchPlan.useIsolate;
-    final actualTaskCount = dispatchPlan.actualTaskCount;
-
-    final tasks =
-        <ComputeTask<UniqueIndexPrepareRequest, UniqueIndexPrepareResult>>[];
-    for (final range
-        in ComputeBatchPlanner.splitRange(records.length, actualTaskCount)) {
-      tasks.add(
-        ComputeTask(
-          function: prepareUniqueIndexChunk,
-          message: UniqueIndexPrepareRequest(
-            schema: schema,
-            index: index,
-            records: records.sublist(range.start, range.end),
-            changedFieldsByRecord:
-                changedFieldsByRecord?.sublist(range.start, range.end),
-          ),
-        ),
-      );
-    }
-
-    final results =
-        await ComputeManager.computeBatch(tasks, enableIsolate: useIsolate);
-
-    final merged = <PreparedUniqueIndexEntry>[];
-    final mergeYield =
-        YieldController('IndexManager._prepareUniqueIndexEntriesBatch');
-    for (final result in results) {
-      for (final entry in result.entries) {
-        await mergeYield.maybeYield();
-        merged.add(entry);
-      }
-    }
-    return merged;
+    return result.entries;
   }
 
   IndexManager(this._dataStore) {
@@ -1827,6 +1789,10 @@ class IndexManager {
       TableSchema? schemaOverride,
       bool resolveInPlace = false,
       bool skipBufferCheck = false,
+
+      /// When true, skip primary-key existence probes (safe for auto-generated
+      /// sequential/timestamp PKs already reserved in the write buffer).
+      bool skipPrimaryKeyCheck = false,
       Map<String, Set<String>>? changedFieldsMap}) async {
     if (records.isEmpty) return const <UniqueViolation?>[];
 
@@ -1865,7 +1831,8 @@ class IndexManager {
         checkInterval: 1024,
       );
       for (int i = 0; i < records.length; i++) {
-        await changedFieldsYield.maybeYield();
+        final y = changedFieldsYield.maybeYieldSync();
+        if (y != null) await y;
         final pk = records[i][primaryKey]?.toString();
         if (pk == null) {
           continue;
@@ -1880,13 +1847,14 @@ class IndexManager {
 
     // 1) Primary key uniqueness (only for INSERTs with custom PKs).
     // 1) Primary key check (only if not an update of the same record)
-    if (!isUpdate) {
+    if (!isUpdate && !skipPrimaryKeyCheck) {
       final pkList = <String>[];
       final pkSeen = <String>{};
 
       for (int i = 0; i < records.length; i++) {
         final r = records[i];
-        await yieldController.maybeYield();
+        final y = yieldController.maybeYieldSync();
+        if (y != null) await y;
         final pkValue = r[primaryKey];
         if (pkValue != null) {
           final pk = pkValue.toString();
@@ -1940,7 +1908,8 @@ class IndexManager {
         if (isMemoryMode) {
           final set = <String>{};
           for (final pk in pkList) {
-            await yieldController.maybeYield();
+            final y = yieldController.maybeYieldSync();
+            if (y != null) await y;
             if (_dataStore.tableDataManager.hasLiveTableRecord(table, pk)) {
               set.add(pk);
             }
@@ -1954,7 +1923,8 @@ class IndexManager {
 
         if (existing.isNotEmpty) {
           for (int i = 0; i < records.length; i++) {
-            await yieldController.maybeYield();
+            final y = yieldController.maybeYieldSync();
+            if (y != null) await y;
             if (violations[i] != null) continue;
             final pk = records[i][primaryKey]?.toString();
             if (pk == null || pk.isEmpty) continue;
@@ -2019,7 +1989,8 @@ class IndexManager {
       final Map<dynamic, int> batchSeen = {};
 
       for (int i = 0; i < records.length; i++) {
-        await yieldController.maybeYield();
+        final y = yieldController.maybeYieldSync();
+        if (y != null) await y;
         if (violations[i] != null) continue;
         final canKey = preparedEntries[i].canonicalKey;
         if (canKey == null) continue;
