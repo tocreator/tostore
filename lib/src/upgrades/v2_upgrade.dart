@@ -70,7 +70,8 @@ class V2Upgrade {
     for (final spaceName in spaces) {
       await _upgradeSpaceToV2(spaceName, upgradeGlobal: !globalUpgraded);
       globalUpgraded = true;
-      await yieldController.maybeYield();
+      final y1 = yieldController.maybeYield();
+      if (y1 != null) await y1;
     }
 
     // After all spaces upgraded successfully, bump GlobalConfig.version
@@ -154,7 +155,8 @@ class V2Upgrade {
           if (schema.isSystemTable) continue;
           // After V3: directories are under tableUid; read legacy JSON from that root.
           await _upgradeTableDataToNewFormat(migrationInstance, tableName);
-          await yieldController.maybeYield();
+          final y2 = yieldController.maybeYield();
+          if (y2 != null) await y2;
         }
       }
 
@@ -597,7 +599,8 @@ class V2Upgrade {
       final yieldController =
           YieldController('V2Upgrade._parseOldPartitionFile');
       for (final item in data) {
-        yieldController.maybeYield();
+        final y3 = yieldController.maybeYield();
+        if (y3 != null) await y3;
         if (item is Map<String, dynamic>) {
           if (item['_deleted_'] == true || item.isEmpty) {
             continue;
