@@ -30,8 +30,9 @@ class BinarySchemaCodec {
   /// [fieldStructure] - Ordered list of fields (from schema)
   static Uint8List encodeRecord(
     Map<String, dynamic> record,
-    List<FieldStructure> fieldStructure,
-  ) {
+    List<FieldStructure> fieldStructure, {
+    String? nullifyField,
+  }) {
     final buffer = BytesBuilder(copy: false);
     final fieldCount = fieldStructure.length.clamp(0, maxFieldCount);
     buffer.add(_u16be(fieldCount));
@@ -39,7 +40,9 @@ class BinarySchemaCodec {
     // Encode values in field order
     for (int i = 0; i < fieldCount; i++) {
       final field = fieldStructure[i];
-      final value = record[field.name];
+      final value = (nullifyField != null && field.name == nullifyField)
+          ? null
+          : record[field.name];
       _writeValue(buffer, value);
     }
 
