@@ -214,7 +214,8 @@ class BackgroundWriteScheduler {
       if (tableMap != null) {
         final pks = tableMap.keys.toList();
         for (final pk in pks) {
-          await yieldController.maybeYield();
+          final y1 = yieldController.maybeYield();
+          if (y1 != null) await y1;
           final existingMap = tableMap[pk];
           if (existingMap != null) {
             final entry = existingMap.remove(type);
@@ -236,7 +237,8 @@ class BackgroundWriteScheduler {
       final List<BackgroundWriteEntry> remaining = [];
       final originalLength = _orderedQueue.length;
       for (var i = _headIndex; i < originalLength; i++) {
-        await yieldController.maybeYield();
+        final y2 = yieldController.maybeYield();
+        if (y2 != null) await y2;
         if (i >= _orderedQueue.length) {
           break; // Guard against concurrent clear/truncation
         }
@@ -271,7 +273,8 @@ class BackgroundWriteScheduler {
     if (tableMap != null) {
       final pks = tableMap.keys.toList();
       for (final pk in pks) {
-        await yieldController.maybeYield();
+        final y3 = yieldController.maybeYield();
+        if (y3 != null) await y3;
         final existingMap = tableMap[pk];
         if (existingMap != null) {
           if (type != null) {
@@ -302,7 +305,8 @@ class BackgroundWriteScheduler {
       final List<BackgroundWriteEntry> remaining = [];
       final originalLength = _orderedQueue.length;
       for (var i = _headIndex; i < originalLength; i++) {
-        await yieldController.maybeYield();
+        final y4 = yieldController.maybeYield();
+        if (y4 != null) await y4;
         if (i >= _orderedQueue.length) {
           break; // Guard against concurrent clear/truncation
         }
