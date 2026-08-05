@@ -134,7 +134,8 @@ class ReadViewManager {
         YieldController('ReadViewManager._cleanupExpiredHead');
 
     while (_orderedViews.isNotEmpty) {
-      await yieldController.maybeYield();
+      final y1 = yieldController.maybeYield();
+      if (y1 != null) await y1;
       final head = _orderedViews.first;
       final age = now.difference(head.createdAt).inSeconds;
 
