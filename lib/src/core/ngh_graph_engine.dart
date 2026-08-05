@@ -185,7 +185,10 @@ class NghGraphEngine {
 
     int steps = 0;
     while (candidateHeap.isNotEmpty) {
-      if (steps++ % 16 == 0) await yc.maybeYield();
+      if (steps++ % 16 == 0) {
+        final y1 = yc.maybeYield();
+        if (y1 != null) await y1;
+      }
 
       //  Safety: stop if traversal grows beyond 2×N (degenerate graph); normal search exits earlier.
       if (visited.length >= maxVisited) break;
@@ -318,7 +321,8 @@ class NghGraphEngine {
     var currentMeta = meta;
 
     for (int i = 0; i < vectors.length; i++) {
-      await yc.maybeYield();
+      final y2 = yc.maybeYield();
+      if (y2 != null) await y2;
       final vector = vectors[i];
       final pqCode = pqCodes[i];
       final nodeId = currentMeta.nextNodeId;
@@ -382,7 +386,8 @@ class NghGraphEngine {
 
       // 5. Add reverse edges (bidirectional)
       for (final neighborId in neighborIds) {
-        await yc.maybeYield();
+        final y3 = yc.maybeYield();
+        if (y3 != null) await y3;
         currentMeta = await _addReverseEdge(
           table,
           indexUid,
@@ -422,7 +427,8 @@ class NghGraphEngine {
     final yc = YieldController('NghGraphEngine.deleteBatch', checkInterval: 50);
 
     for (final nodeId in nodeIds) {
-      await yc.maybeYield();
+      final y4 = yc.maybeYield();
+      if (y4 != null) await y4;
       final partitionNo = meta.graphPartitionForNode(nodeId, _pageSize);
       final pageNo = meta.graphLocalPageForNode(nodeId, _pageSize);
       final slot = meta.graphSlotForNode(nodeId, _pageSize);
@@ -861,7 +867,10 @@ class NghGraphEngine {
 
     int steps = 0;
     while (candidateHeap.isNotEmpty) {
-      if (steps++ % 16 == 0) await yc.maybeYield();
+      if (steps++ % 16 == 0) {
+        final y5 = yc.maybeYield();
+        if (y5 != null) await y5;
+      }
 
       final currentId = candidateHeap.popId();
       final currentDist = candidateHeap.lastPoppedDist;
@@ -985,7 +994,8 @@ class NghGraphEngine {
               dirtyGraphPages: dirtyGraph, compactedCount: compactedCount);
         }
         pagesVisited++;
-        await yc.maybeYield();
+        final y6 = yc.maybeYield();
+        if (y6 != null) await y6;
 
         final cacheKey = pNo << 20 | pgNo;
         var page = localCache[cacheKey];
@@ -1001,7 +1011,8 @@ class NghGraphEngine {
           // Check each neighbor: if it's deleted, try to replace it
           bool nodeDirty = false;
           for (int n = 0; n < node.actualDegree; n++) {
-            await yc.maybeYield();
+            final y7 = yc.maybeYield();
+            if (y7 != null) await y7;
             final neighborId = node.neighbors[n];
             final isDeleted = await _isNodeDeleted(
                 table, indexUid, meta, neighborId,
