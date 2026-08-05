@@ -55,7 +55,8 @@ Future<BatchMatchResult> matchConditionChunk(
   );
 
   for (int i = 0; i < request.records.length; i++) {
-    await yieldController.maybeYield();
+    final y1 = yieldController.maybeYield();
+    if (y1 != null) await y1;
     final record = request.records[i];
     if (_isDeletedRecordPure(record)) {
       continue;
