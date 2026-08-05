@@ -410,7 +410,8 @@ class TreeCache<T> {
 
       // Query weights (best-effort).
       for (final g in groups) {
-        await yieldController.maybeYield();
+        final y1 = yieldController.maybeYield();
+        if (y1 != null) await y1;
         if (weightQueryCallback == null) {
           g.cachedWeight = 0;
         } else {
@@ -446,7 +447,8 @@ class TreeCache<T> {
         _setFullyCached(g.groupPath, false);
 
         while (need > 0 && g.lruHead != null) {
-          await yieldController.maybeYield();
+          final y2 = yieldController.maybeYield();
+          if (y2 != null) await y2;
 
           final entry = g.lruHead!;
 
@@ -1547,7 +1549,8 @@ final class _BPlusTree<K, V> {
         // Even if 'leaf' is concurrently modified (shrunk), we iterate our snapshot.
         while (i < len) {
           if (yieldController != null) {
-            await yieldController.maybeYield();
+            final y3 = yieldController.maybeYield();
+            if (y3 != null) await y3;
           }
 
           final k = currentKeys[i];
@@ -1591,7 +1594,8 @@ final class _BPlusTree<K, V> {
 
       while (i >= 0) {
         if (yieldController != null) {
-          await yieldController.maybeYield();
+          final y4 = yieldController.maybeYield();
+          if (y4 != null) await y4;
         }
 
         final k = currentKeys[i];
