@@ -687,7 +687,8 @@ class TransactionManager {
           final List<List<UniqueKeyRef>> uniqueKeysList = [];
 
           for (int j = i; j < end; j++) {
-            final rec = Map<String, dynamic>.from(recs[j]);
+            // Take ownership of plan maps: strip embedded meta in place.
+            final rec = recs[j];
             rec.remove('_oldValues'); // inserts do not use oldValues
             final uks = rec.remove('_uniqueKeys') as List?;
             final normalizedRec = (hasRuntimeMigration)
@@ -761,7 +762,8 @@ class TransactionManager {
           final pkName = schema.primaryKey;
 
           for (int j = i; j < end; j++) {
-            final rec = Map<String, dynamic>.from(recs[j]);
+            // Take ownership of plan maps: strip embedded meta in place.
+            final rec = recs[j];
             final old = rec.remove('_oldValues') as Map<String, dynamic>?;
             final uks = rec.remove('_uniqueKeys') as List?;
             final normalizedRec = (hasRuntimeMigration)
@@ -836,7 +838,8 @@ class TransactionManager {
           for (int j = i; j < end; j++) {
             final y7 = yieldController.maybeYield();
             if (y7 != null) await y7;
-            final rec = Map<String, dynamic>.from(recs[j]);
+            // Take ownership of plan maps: strip embedded meta in place.
+            final rec = recs[j];
             rec.remove('_oldValues'); // delete: old values not used
             final normalizedRec = (hasRuntimeMigration)
                 ? migrationManager.normalizeRecordToLatestSync(tableCtx, rec,
