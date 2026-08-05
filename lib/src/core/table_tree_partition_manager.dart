@@ -278,7 +278,8 @@ final class TableTreePartitionManager {
 
     for (final result in results) {
       for (final encoded in result.encodedRecords) {
-        await mergeYield.maybeYield();
+        final y1 = mergeYield.maybeYield();
+        if (y1 != null) await y1;
         merged.add(encoded);
       }
     }
@@ -742,15 +743,18 @@ final class TableTreePartitionManager {
     final yc = YieldController('TableTreePartitionManager.writeChanges',
         checkInterval: 200);
     for (final r in inserts) {
-      await yc.maybeYield();
+      final y2 = yc.maybeYield();
+      if (y2 != null) await y2;
       addOp(r, _OpType.put, isInsert: true);
     }
     for (final r in updates) {
-      await yc.maybeYield();
+      final y3 = yc.maybeYield();
+      if (y3 != null) await y3;
       addOp(r, _OpType.put, isInsert: false);
     }
     for (final r in deletes) {
-      await yc.maybeYield();
+      final y4 = yc.maybeYield();
+      if (y4 != null) await y4;
       addOp(r, _OpType.del);
     }
     if (ops.isEmpty) return;
@@ -1158,7 +1162,8 @@ final class TableTreePartitionManager {
 
     final putOps = <_TableOp>[];
     for (final op in opList) {
-      await yc.maybeYield();
+      final y5 = yc.maybeYield();
+      if (y5 != null) await y5;
       if (op.type == _OpType.put) {
         putOps.add(op);
       }
@@ -1166,7 +1171,8 @@ final class TableTreePartitionManager {
     if (putOps.isNotEmpty) {
       final putRecords = <Map<String, dynamic>>[];
       for (final op in putOps) {
-        await yc.maybeYield();
+        final y6 = yc.maybeYield();
+        if (y6 != null) await y6;
         putRecords.add(op.record);
       }
       final encodedRecords = await _encodeRecordPayloadsForWrite(
@@ -1176,7 +1182,8 @@ final class TableTreePartitionManager {
       );
 
       for (int i = 0; i < putOps.length; i++) {
-        await yc.maybeYield();
+        final y7 = yc.maybeYield();
+        if (y7 != null) await y7;
         final op = putOps[i];
         final encoded = encodedRecords[i];
         preEncoded[op.pk] = encoded;
@@ -1204,7 +1211,8 @@ final class TableTreePartitionManager {
       );
     }
     for (final op in opList) {
-      await yc.maybeYield();
+      final y8 = yc.maybeYield();
+      if (y8 != null) await y8;
       final keyBytes = op.pkBytes;
 
       TreePagePtr leafPtr;
@@ -1459,7 +1467,8 @@ final class TableTreePartitionManager {
         }
 
         for (int i = 0; i < bytesList.length; i++) {
-          await stageYc.maybeYield();
+          final y9 = stageYc.maybeYield();
+          if (y9 != null) await y9;
           final ptr = pendingPtrs[i];
           final stats = getStats(ptr.partitionNo);
           stats.path ??= await _partitionFilePath(table, meta, ptr.partitionNo);
@@ -1478,7 +1487,8 @@ final class TableTreePartitionManager {
       // Encode in chunks to bound peak memory. Use exact payload-size
       // estimates first; split paths still validate actual payload bytes.
       for (final entry in dirtyLeaves.entries) {
-        await stageYc.maybeYield();
+        final y10 = stageYc.maybeYield();
+        if (y10 != null) await y10;
         final ptr = entry.key;
         final leaf = entry.value;
         final payloadLength = leaf.estimatePayloadSize();
@@ -1548,7 +1558,8 @@ final class TableTreePartitionManager {
       }
 
       for (final entry in dirtyInternals.entries) {
-        await stageYc.maybeYield();
+        final y11 = stageYc.maybeYield();
+        if (y11 != null) await y11;
         final ptr = entry.key;
         final node = entry.value;
         final payloadLength = node.estimatePayloadSize();
@@ -1637,7 +1648,8 @@ final class TableTreePartitionManager {
     final int pageSize = _dataStore.configuredPageSize;
 
     for (final entry in partitionStats.entries) {
-      await yc.maybeYield();
+      final y12 = yc.maybeYield();
+      if (y12 != null) await y12;
       final pNo = entry.key;
       final stats = entry.value;
 
@@ -1832,7 +1844,8 @@ final class TableTreePartitionManager {
 
       final tasks = <Future<void> Function()>[];
       for (final e in staged.entries) {
-        await flushYc.maybeYield();
+        final y13 = flushYc.maybeYield();
+        if (y13 != null) await y13;
         final path = e.key;
         // Skip partition files already durable for this batch (crash recovery).
         final durable = partitionStats.values
@@ -1853,7 +1866,8 @@ final class TableTreePartitionManager {
         // Fallback: if scheduler is disabled/misconfigured, run sequentially.
         if (scheduler.globalMax <= 0 || tasks.length <= 1) {
           for (final t in tasks) {
-            await flushYc.maybeYield();
+            final y14 = flushYc.maybeYield();
+            if (y14 != null) await y14;
             await t();
           }
         } else {
@@ -2064,7 +2078,8 @@ final class TableTreePartitionManager {
         checkInterval: 30);
 
     while (!ptr.isNull && visited < maxVisitedLeaves && merged < maxMerges) {
-      await yc.maybeYield();
+      final y15 = yc.maybeYield();
+      if (y15 != null) await y15;
       final leaf = await _readLeafPage(table, meta, ptr,
           encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
       visited++;
@@ -2330,7 +2345,8 @@ final class TableTreePartitionManager {
     final yc = YieldController('TableTreePartitionManager.queryRecordsBatch',
         checkInterval: 100);
     for (final e in leafToIndexes.entries) {
-      await yc.maybeYield();
+      final y16 = yc.maybeYield();
+      if (y16 != null) await y16;
       final parts = e.key.split(':');
       final ptr = TreePagePtr(int.parse(parts[0]), int.parse(parts[1]));
       final leaf = await _readLeafPage(table, meta, ptr,
@@ -2395,7 +2411,8 @@ final class TableTreePartitionManager {
         'TableTreePartitionManager.existingPrimaryKeysBatch',
         checkInterval: 200);
     for (final pk in primaryKeys) {
-      await yc.maybeYield();
+      final y17 = yc.maybeYield();
+      if (y17 != null) await y17;
       final keyBytes = schema.encodePrimaryKeyComponent(pk);
       var leafPtr = await _locateLeafForKey(table, meta, keyBytes);
       if (leafPtr.isNull) leafPtr = (meta.btreeFirstLeaf);
@@ -2481,7 +2498,8 @@ final class TableTreePartitionManager {
     }
 
     for (int pageNo = fromPage; pageNo < toPage; pageNo++) {
-      await yc.maybeYield();
+      final y18 = yc.maybeYield();
+      if (y18 != null) await y18;
       final ptr = TreePagePtr(partitionNo, pageNo);
       final pageOffsetInRange = (pageNo - fromPage) * pageSize;
       if (pageOffsetInRange >= rawRange.length) {
@@ -2603,7 +2621,8 @@ final class TableTreePartitionManager {
 
     for (int pageNo = TableDataMeta.firstDataPageNo;
         pageNo < snapshotPageCount;) {
-      await yc.maybeYield();
+      final y19 = yc.maybeYield();
+      if (y19 != null) await y19;
       final pageLimit = min(pagesPerBatch, snapshotPageCount - pageNo);
       final batchFuture = pending ?? loadBatch(pageNo);
       pending = null;
@@ -2676,7 +2695,8 @@ final class TableTreePartitionManager {
         'TableTreePartitionManager.loadPartitionDataByNo',
         checkInterval: 50);
     for (int pageNo = 1; pageNo < pageCount; pageNo++) {
-      await yc.maybeYield();
+      final y20 = yc.maybeYield();
+      if (y20 != null) await y20;
       final ptr = TreePagePtr(partitionNo, pageNo);
       final leaf = await _readLeafPage(
         table,
@@ -2823,7 +2843,8 @@ final class TableTreePartitionManager {
         await drainPrefetch();
         return;
       }
-      await yc.maybeYield();
+      final y21 = yc.maybeYield();
+      if (y21 != null) await y21;
       final leaf = await getLeaf(ptr);
       if (leaf.keys.isEmpty) {
         ptr = reverse ? leaf.prev : leaf.next;
@@ -3063,7 +3084,8 @@ final class TableTreePartitionManager {
         await drainPrefetch();
         return;
       }
-      await yc.maybeYield();
+      final y22 = yc.maybeYield();
+      if (y22 != null) await y22;
       final leaf = await getLeaf(ptr);
       if (leaf.keys.isEmpty) {
         ptr = reverse ? leaf.prev : leaf.next;
