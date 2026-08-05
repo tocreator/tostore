@@ -67,7 +67,8 @@ Future<IndexDeltaPrepareResult> prepareIndexDeltaChunk(
   switch (request.operationKind) {
     case IndexDeltaOperationKind.insert:
       for (final record in request.records) {
-        await yieldController.maybeYield();
+        final y1 = yieldController.maybeYield();
+        if (y1 != null) await y1;
         final pk = record[request.primaryKeyField]?.toString();
         if (pk == null || pk.isEmpty) continue;
 
@@ -92,7 +93,8 @@ Future<IndexDeltaPrepareResult> prepareIndexDeltaChunk(
 
     case IndexDeltaOperationKind.delete:
       for (final record in request.records) {
-        await yieldController.maybeYield();
+        final y2 = yieldController.maybeYield();
+        if (y2 != null) await y2;
         final pk = record[request.primaryKeyField]?.toString();
         if (pk == null || pk.isEmpty) continue;
 
@@ -111,7 +113,8 @@ Future<IndexDeltaPrepareResult> prepareIndexDeltaChunk(
     case IndexDeltaOperationKind.update:
       final indexedFields = request.fields.toSet();
       for (final update in request.updates) {
-        await yieldController.maybeYield();
+        final y3 = yieldController.maybeYield();
+        if (y3 != null) await y3;
         final pk = update.primaryKey.toString();
         if (pk.isEmpty) continue;
 
