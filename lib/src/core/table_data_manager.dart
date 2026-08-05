@@ -23,6 +23,7 @@ import '../model/table_identity.dart';
 import '../model/table_schema.dart';
 import '../model/table_context.dart';
 import '../model/transaction_models.dart';
+import '../model/wal_pointer.dart';
 import '../query/query_condition.dart';
 import '../query/query_executor.dart';
 import 'compute/batch_match_runner.dart';
@@ -1457,13 +1458,9 @@ class TableDataManager {
     }
 
     // 3. Persistent Path: WAL + Write Buffer
-    final recordIds = <String>[];
-    final entries = <BufferEntry>[];
-    final finalUniqueKeysList = <List<UniqueKeyRef>>[];
     final yieldController =
         YieldController('TableDataManager._addBatch.persistent');
 
-    // Prepare WAL entries for batching
     final walEntries = <Map<String, dynamic>>[];
     final validBatchRecords = <Map<String, dynamic>>[];
     final validBatchRecordIds = <String>[];
@@ -1471,7 +1468,8 @@ class TableDataManager {
     final validBatchOldValues = <Map<String, dynamic>?>[];
 
     for (int i = 0; i < records.length; i++) {
-      await yieldController.maybeYield();
+      final y = yieldController.maybeYieldSync();
+      if (y != null) await y;
       final r = records[i];
       final recordId = r[pkName]?.toString();
       if (recordId == null || recordId.isEmpty) {
@@ -1479,18 +1477,23 @@ class TableDataManager {
       }
 
       final oldR = oldRecordsMap != null ? oldRecordsMap[recordId] : null;
-      final walData = r;
       final walOldValues =
           operation == BufferOperationType.update ? oldR : null;
 
-      walEntries.add({
+      // Build WAL envelope once; appendBatch mutates p/seq in place.
+      final walEntry = <String, dynamic>{
         'op': operation.index,
         'table': table.tableUid,
         'ts': tsIso,
-        if (currentTxId != null) 'txId': currentTxId,
-        'data': walData,
-        if (walOldValues != null) 'oldValues': walOldValues,
-      });
+        'data': r,
+      };
+      if (currentTxId != null) {
+        walEntry['txId'] = currentTxId;
+      }
+      if (walOldValues != null) {
+        walEntry['oldValues'] = walOldValues;
+      }
+      walEntries.add(walEntry);
 
       validBatchRecords.add(r);
       validBatchRecordIds.add(recordId);
@@ -1498,86 +1501,89 @@ class TableDataManager {
       validBatchOldValues.add(walOldValues);
     }
 
-    if (walEntries.isNotEmpty) {
-      try {
-        // High-performance batch WAL queuing
-        final pointers = await _dataStore.walManager.appendBatch(walEntries);
+    if (walEntries.isEmpty) {
+      return (successRecordIds: successIds, failedRecordIds: failedIds);
+    }
 
-        for (int i = 0; i < validBatchRecordIds.length; i++) {
-          final recordId = validBatchRecordIds[i];
-          final r = validBatchRecords[i];
-          final oldR = validBatchOldValues[i];
+    late final List<WalPointer> pointers;
+    try {
+      pointers = await _dataStore.walManager.appendBatch(walEntries);
+    } catch (e) {
+      Logger.error('Persistent batch WAL append failed: ${table.tableName}',
+          rawError: e);
+      return (
+        successRecordIds: const <String>[],
+        failedRecordIds: records
+            .map((r) => r[pkName]?.toString() ?? '')
+            .where((id) => id.isNotEmpty)
+            .toList()
+      );
+    }
 
-          entries.add(BufferEntry(
-            data: r,
-            operation: operation,
-            timestamp: ts,
-            transactionId: currentTxId,
-            walPointer: pointers[i],
-            oldValues: oldR,
-            schemaVersion: schemaVersion,
-          ));
-          recordIds.add(recordId);
-          if (operation != BufferOperationType.delete) {
-            finalUniqueKeysList.add(validBatchUniqueKeys[i]);
-          }
+    final recordIds = <String>[];
+    final entries = <BufferEntry>[];
+    final finalUniqueKeysList = <List<UniqueKeyRef>>[];
 
-          if (operation == BufferOperationType.update) {
-            cacheTableRecord(table, recordId, r, schema);
-            await _dataStore.indexManager?.updateIndexDataCache(
-              table,
-              recordId,
-              oldR,
-              r,
-              overrideSchema: schema,
-            );
-          } else if (operation == BufferOperationType.delete) {
-            removeTableRecord(table, recordId);
-            await _dataStore.indexManager?.updateIndexDataCache(
-              table,
-              recordId,
-              r,
-              null,
-              overrideSchema: schema,
-            );
-          }
-        }
-      } catch (e) {
-        Logger.error('Persistent batch WAL append failed: ${table.tableName}',
-            rawError: e);
-        // Fallback or fail whole batch? Fail whole batch for consistency.
-        return (
-          successRecordIds: const <String>[],
-          failedRecordIds: records
-              .map((r) => r[pkName]?.toString() ?? '')
-              .where((id) => id.isNotEmpty)
-              .toList()
+    for (int i = 0; i < validBatchRecordIds.length; i++) {
+      final y = yieldController.maybeYieldSync();
+      if (y != null) await y;
+      final recordId = validBatchRecordIds[i];
+      final r = validBatchRecords[i];
+      final oldR = validBatchOldValues[i];
+
+      entries.add(BufferEntry(
+        data: r,
+        operation: operation,
+        timestamp: ts,
+        transactionId: currentTxId,
+        walPointer: pointers[i],
+        oldValues: oldR,
+        schemaVersion: schemaVersion,
+      ));
+      recordIds.add(recordId);
+      if (operation != BufferOperationType.delete) {
+        finalUniqueKeysList.add(validBatchUniqueKeys[i]);
+      }
+
+      if (operation == BufferOperationType.update) {
+        cacheTableRecord(table, recordId, r, schema);
+        await _dataStore.indexManager?.updateIndexDataCache(
+          table,
+          recordId,
+          oldR,
+          r,
+          overrideSchema: schema,
+        );
+      } else if (operation == BufferOperationType.delete) {
+        removeTableRecord(table, recordId);
+        await _dataStore.indexManager?.updateIndexDataCache(
+          table,
+          recordId,
+          r,
+          null,
+          overrideSchema: schema,
         );
       }
     }
 
-    if (recordIds.isNotEmpty) {
-      if (operation == BufferOperationType.insert) {
-        await _dataStore.writeBufferManager.addInsertBatch(
-            table: table,
-            recordIds: recordIds,
-            entries: entries,
-            uniqueKeysList: finalUniqueKeysList);
-      } else if (operation == BufferOperationType.update) {
-        await _dataStore.writeBufferManager.addUpdateBatch(
-            table: table,
-            recordIds: recordIds,
-            entries: entries,
-            uniqueKeysList: finalUniqueKeysList);
-      } else if (operation == BufferOperationType.delete) {
-        // For batch delete, we use the standard batch processor which handles
-        // tombstone entries and buffer merging.
-        await _dataStore.writeBufferManager.addDeleteBatch(
-            table: table, recordIds: recordIds, entries: entries);
-      }
-      successIds.addAll(recordIds);
-      _markSpaceStatsDirty(table);
+    if (operation == BufferOperationType.insert) {
+      await _dataStore.writeBufferManager.addInsertBatch(
+          table: table,
+          recordIds: recordIds,
+          entries: entries,
+          uniqueKeysList: finalUniqueKeysList);
+    } else if (operation == BufferOperationType.update) {
+      await _dataStore.writeBufferManager.addUpdateBatch(
+          table: table,
+          recordIds: recordIds,
+          entries: entries,
+          uniqueKeysList: finalUniqueKeysList);
+    } else if (operation == BufferOperationType.delete) {
+      await _dataStore.writeBufferManager
+          .addDeleteBatch(table: table, recordIds: recordIds, entries: entries);
     }
+    successIds.addAll(recordIds);
+    _markSpaceStatsDirty(table);
 
     return (successRecordIds: successIds, failedRecordIds: failedIds);
   }
@@ -2283,21 +2289,40 @@ class TableDataManager {
       final pkMatcher =
           ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
 
-      // v2+ global B+Tree: take max key from the global leaf tail (O(logN)+O(1) IO).
-      if (fileMeta != null) {
-        try {
-          final last = await _dataStore.tableTreePartitionManager
-              ?.scanRecordsByPrimaryKeyRange(
-            table: table,
-            startKeyInclusive: Uint8List(0),
-            endKeyExclusive: Uint8List(0),
-            reverse: true,
-            limit: 1,
-          );
-          if (last != null && last.isNotEmpty) {
-            maxFromPartitions = last.first[schema.primaryKey];
-          }
-        } catch (_) {}
+      // Fast path for empty tables: skip B+Tree reverse scan (can cost 100ms+
+      // on cold storage) when metadata already proves there are no records.
+      final bool tableEmptyOnDisk =
+          fileMeta == null || fileMeta.totalRecords <= 0;
+
+      if (!tableEmptyOnDisk) {
+        // Prefer cached maxAutoIncrementId when present — avoids a leaf scan.
+        // !tableEmptyOnDisk implies fileMeta != null && totalRecords > 0.
+        final cachedMetaMax = fileMeta.maxAutoIncrementId;
+        if (cachedMetaMax != null &&
+            cachedMetaMax.isNotEmpty &&
+            cachedMetaMax != '0') {
+          maxFromPartitions = cachedMetaMax;
+        } else {
+          // v2+ global B+Tree: take max key from the global leaf tail.
+          try {
+            final last = await _dataStore.tableTreePartitionManager
+                ?.scanRecordsByPrimaryKeyRange(
+              table: table,
+              startKeyInclusive: Uint8List(0),
+              endKeyExclusive: Uint8List(0),
+              reverse: true,
+              limit: 1,
+            );
+            if (last != null && last.isNotEmpty) {
+              maxFromPartitions = last.first[schema.primaryKey];
+            }
+          } catch (_) {}
+        }
+      } else if (fileMeta?.maxAutoIncrementId != null &&
+          fileMeta!.maxAutoIncrementId!.isNotEmpty) {
+        // Empty on disk but meta remembers the high-water mark (e.g. after clear
+        // that preserves auto-inc, or WAL-recovered max).
+        maxFromPartitions = fileMeta.maxAutoIncrementId;
       }
 
       // Also consider buffered inserts recovered from WAL (in-memory buffer)
