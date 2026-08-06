@@ -12,6 +12,7 @@ import '../model/table_schema.dart';
 import '../model/unique_violation.dart';
 import '../model/wal_pointer.dart';
 import 'crontab_manager.dart';
+import 'cpu_work_chunk.dart';
 import 'data_store_impl.dart';
 import 'yield_controller.dart';
 
@@ -661,12 +662,14 @@ class WriteBufferManager {
     );
 
     final buf = _ensureTable(table);
-    final yieldController =
-        YieldController('WriteBufferManager.addInsertBatch');
+    final yieldController = YieldController(
+      'WriteBufferManager.addInsertBatch',
+      minCheckInterval: EngineCpuChunk.hotPathMinCheckInterval,
+    );
     final batchSize = _dataStore.config.writeBatchSize;
     final backpressureCap = batchSize > 0 ? batchSize * 2 : 20000;
-    // Larger chunk reduces await frequency on the batchInsert hot path.
-    const int emitChunk = 5000;
+    // Align backpressure checks with light CPU chunks (avoid over-await).
+    final int emitChunk = EngineCpuChunk.sizeFor(CpuChunkKind.light);
     final tableUid = table.tableUid;
     final bgScheduler = _dataStore.backgroundWriteScheduler;
     final bool bgMaybeActive = !bgScheduler.isEmpty;
@@ -1683,11 +1686,13 @@ class WriteBufferManager {
     }
 
     final buf = _ensureTable(table);
-    final yieldController =
-        YieldController('WriteBufferManager.addUpdateBatch');
+    final yieldController = YieldController(
+      'WriteBufferManager.addUpdateBatch',
+      minCheckInterval: EngineCpuChunk.hotPathMinCheckInterval,
+    );
     final batchSize = _dataStore.config.writeBatchSize;
     final backpressureCap = batchSize > 0 ? batchSize * 2 : 20000;
-    const int emitChunk = 1000;
+    final int emitChunk = EngineCpuChunk.sizeFor(CpuChunkKind.light);
 
     for (int i = 0; i < recordIds.length; i++) {
       final y9 = yieldController.maybeYield();
@@ -1836,11 +1841,13 @@ class WriteBufferManager {
     );
 
     final buf = _ensureTable(table);
-    final yieldController =
-        YieldController('WriteBufferManager.addDeleteBatch');
+    final yieldController = YieldController(
+      'WriteBufferManager.addDeleteBatch',
+      minCheckInterval: EngineCpuChunk.hotPathMinCheckInterval,
+    );
     final batchSize = _dataStore.config.writeBatchSize;
     final backpressureCap = batchSize > 0 ? batchSize * 2 : 20000;
-    const int emitChunk = 1000;
+    final int emitChunk = EngineCpuChunk.sizeFor(CpuChunkKind.light);
 
     for (int i = 0; i < recordIds.length; i++) {
       final y10 = yieldController.maybeYield();
