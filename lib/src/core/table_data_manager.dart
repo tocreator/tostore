@@ -40,6 +40,7 @@ import 'weight_manager.dart';
 import 'workload_scheduler.dart';
 import 'write_buffer_manager.dart';
 import 'yield_controller.dart';
+import 'cpu_work_chunk.dart';
 
 /// table data manager - schedule data read/write, backup, index update, etc.
 class TableDataManager {
@@ -1356,159 +1357,166 @@ class TableDataManager {
         pkName,
       );
 
-      final yieldController = YieldController('TableDataManager._addBatch.tx');
+      await EngineCpuChunk.forEachRange(
+        length: records.length,
+        kind: CpuChunkKind.medium,
+        process: (start, end) {
+          for (int i = start; i < end; i++) {
+            final r = records[i];
+            final recordId = r[pkName]?.toString();
+            if (recordId == null || recordId.isEmpty) {
+              // Cannot report failed key reliably here.
+              continue;
+            }
 
-      for (int i = 0; i < records.length; i++) {
-        final y5 = yieldController.maybeYield();
-        if (y5 != null) await y5;
-        final r = records[i];
-        final recordId = r[pkName]?.toString();
-        if (recordId == null || recordId.isEmpty) {
-          // Cannot report failed key reliably here.
-          continue;
-        }
+            final uniqueRefs = uniqueKeyRefsList[i];
+            final oldR = oldRecordsMap != null ? oldRecordsMap[recordId] : null;
 
-        final uniqueRefs = uniqueKeyRefsList[i];
-        final oldR = oldRecordsMap != null ? oldRecordsMap[recordId] : null;
+            try {
+              map[recordId] = TxnDeferredOp(
+                operation,
+                Map<String, dynamic>.from(r),
+                uniqueKeyRefs: uniqueRefs,
+                oldValues: oldR,
+              );
 
-        try {
-          map[recordId] = TxnDeferredOp(
-            operation,
-            Map<String, dynamic>.from(r),
-            uniqueKeyRefs: uniqueRefs,
-            oldValues: oldR,
-          );
-
-          // Register unique keys with WriteBufferManager for cross-txn conflict detection.
-          if (uniqueRefs.isNotEmpty) {
-            _dataStore.writeBufferManager.addTransactionUniqueKeys(
-              transactionId: currentTxId,
-              table: table,
-              recordId: recordId,
-              uniqueKeys: uniqueRefs,
-            );
+              // Register unique keys with WriteBufferManager for cross-txn conflict detection.
+              if (uniqueRefs.isNotEmpty) {
+                _dataStore.writeBufferManager.addTransactionUniqueKeys(
+                  transactionId: currentTxId,
+                  table: table,
+                  recordId: recordId,
+                  uniqueKeys: uniqueRefs,
+                );
+              }
+              successIds.add(recordId);
+            } catch (e) {
+              Logger.warn(
+                  'Txn deferred batch op failed: ${table.tableName} pk=$recordId',
+                  rawError: e);
+              failedIds.add(recordId);
+            }
           }
-          successIds.add(recordId);
-        } catch (e) {
-          Logger.warn(
-              'Txn deferred batch op failed: ${table.tableName} pk=$recordId',
-              rawError: e);
-          failedIds.add(recordId);
-        }
-      }
+        },
+      );
       return (successRecordIds: successIds, failedRecordIds: failedIds);
     }
 
     // 2. Memory Mode Path: Direct cache writes (no WAL/IO)
     if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
-      final yieldController =
-          YieldController('TableDataManager._addBatch.memory');
       _registerTableComparator(table, schema);
 
-      for (int i = 0; i < records.length; i++) {
-        final y6 = yieldController.maybeYield();
-        if (y6 != null) await y6;
-        final r = records[i];
-        final recordId = r[pkName]?.toString();
-        if (recordId == null || recordId.isEmpty) {
-          continue;
-        }
-        try {
-          final oldR = oldRecordsMap != null ? oldRecordsMap[recordId] : null;
-
-          if (operation == BufferOperationType.delete) {
-            // Memory mode: Removal from primary cache
-            removeTableRecord(table, recordId);
-
-            // Per-table count cache applies to all tables (incl. system KV).
-            final current = _tableRecordCounts[table.tableUid] ?? 0;
-            if (current > 0) {
-              _tableRecordCounts[table.tableUid] = current - 1;
+      await EngineCpuChunk.forEachRangeAsync(
+        length: records.length,
+        kind: CpuChunkKind.medium,
+        process: (start, end) async {
+          for (int i = start; i < end; i++) {
+            final r = records[i];
+            final recordId = r[pkName]?.toString();
+            if (recordId == null || recordId.isEmpty) {
+              continue;
             }
-            if (_contributesToSpaceStats(table) && current > 0) {
-              _deltaRecordCount--;
-              _needSaveStats = true;
-            }
+            try {
+              final oldR =
+                  oldRecordsMap != null ? oldRecordsMap[recordId] : null;
 
-            // Memory mode: Index erasure (newData is null)
-            if (_dataStore.indexManager != null) {
-              await _dataStore.indexManager!.updateIndexDataCache(
-                  table, recordId, r, null,
-                  overrideSchema: schema, force: true);
-            }
-          } else {
-            if (operation == BufferOperationType.insert) {
-              _tableRecordCounts[table.tableUid] =
-                  (_tableRecordCounts[table.tableUid] ?? 0) + 1;
-              if (_contributesToSpaceStats(table)) {
-                _deltaRecordCount++;
-                _needSaveStats = true;
+              if (operation == BufferOperationType.delete) {
+                // Memory mode: Removal from primary cache
+                removeTableRecord(table, recordId);
+
+                // Per-table count cache applies to all tables (incl. system KV).
+                final current = _tableRecordCounts[table.tableUid] ?? 0;
+                if (current > 0) {
+                  _tableRecordCounts[table.tableUid] = current - 1;
+                }
+                if (_contributesToSpaceStats(table) && current > 0) {
+                  _deltaRecordCount--;
+                  _needSaveStats = true;
+                }
+
+                // Memory mode: Index erasure (newData is null)
+                if (_dataStore.indexManager != null) {
+                  await _dataStore.indexManager!.updateIndexDataCache(
+                      table, recordId, r, null,
+                      overrideSchema: schema, force: true);
+                }
+              } else {
+                if (operation == BufferOperationType.insert) {
+                  _tableRecordCounts[table.tableUid] =
+                      (_tableRecordCounts[table.tableUid] ?? 0) + 1;
+                  if (_contributesToSpaceStats(table)) {
+                    _deltaRecordCount++;
+                    _needSaveStats = true;
+                  }
+                }
+                // Memory mode: Update primary cache
+                cacheTableRecord(table, recordId, r, schema, force: true);
+
+                // Memory mode: Index update
+                if (_dataStore.indexManager != null) {
+                  await _dataStore.indexManager!.updateIndexDataCache(
+                      table, recordId, oldR, r,
+                      overrideSchema: schema, force: true);
+                }
               }
-            }
-            // Memory mode: Update primary cache
-            cacheTableRecord(table, recordId, r, schema, force: true);
-
-            // Memory mode: Index update
-            if (_dataStore.indexManager != null) {
-              await _dataStore.indexManager!.updateIndexDataCache(
-                  table, recordId, oldR, r,
-                  overrideSchema: schema, force: true);
+              successIds.add(recordId);
+            } catch (e) {
+              Logger.warn(
+                  'Memory batch op failed: ${table.tableName} pk=$recordId',
+                  rawError: e);
+              failedIds.add(recordId);
             }
           }
-          successIds.add(recordId);
-        } catch (e) {
-          Logger.warn('Memory batch op failed: ${table.tableName} pk=$recordId',
-              rawError: e);
-          failedIds.add(recordId);
-        }
-      }
+        },
+      );
 
       return (successRecordIds: successIds, failedRecordIds: failedIds);
     }
 
     // 3. Persistent Path: WAL + Write Buffer
-    final yieldController =
-        YieldController('TableDataManager._addBatch.persistent');
-
     final walEntries = <Map<String, dynamic>>[];
     final validBatchRecords = <Map<String, dynamic>>[];
     final validBatchRecordIds = <String>[];
     final validBatchUniqueKeys = <List<UniqueKeyRef>>[];
     final validBatchOldValues = <Map<String, dynamic>?>[];
 
-    for (int i = 0; i < records.length; i++) {
-      final y = yieldController.maybeYield();
-      if (y != null) await y;
-      final r = records[i];
-      final recordId = r[pkName]?.toString();
-      if (recordId == null || recordId.isEmpty) {
-        continue;
-      }
+    await EngineCpuChunk.forEachRange(
+      length: records.length,
+      kind: CpuChunkKind.medium,
+      process: (start, end) {
+        for (int i = start; i < end; i++) {
+          final r = records[i];
+          final recordId = r[pkName]?.toString();
+          if (recordId == null || recordId.isEmpty) {
+            continue;
+          }
 
-      final oldR = oldRecordsMap != null ? oldRecordsMap[recordId] : null;
-      final walOldValues =
-          operation == BufferOperationType.update ? oldR : null;
+          final oldR = oldRecordsMap != null ? oldRecordsMap[recordId] : null;
+          final walOldValues =
+              operation == BufferOperationType.update ? oldR : null;
 
-      // Build WAL envelope once; appendBatch mutates p/seq in place.
-      final walEntry = <String, dynamic>{
-        'op': operation.index,
-        'table': table.tableUid,
-        'ts': tsIso,
-        'data': r,
-      };
-      if (currentTxId != null) {
-        walEntry['txId'] = currentTxId;
-      }
-      if (walOldValues != null) {
-        walEntry['oldValues'] = walOldValues;
-      }
-      walEntries.add(walEntry);
+          // Build WAL envelope once; appendBatch mutates p/seq in place.
+          final walEntry = <String, dynamic>{
+            'op': operation.index,
+            'table': table.tableUid,
+            'ts': tsIso,
+            'data': r,
+          };
+          if (currentTxId != null) {
+            walEntry['txId'] = currentTxId;
+          }
+          if (walOldValues != null) {
+            walEntry['oldValues'] = walOldValues;
+          }
+          walEntries.add(walEntry);
 
-      validBatchRecords.add(r);
-      validBatchRecordIds.add(recordId);
-      validBatchUniqueKeys.add(uniqueKeyRefsList[i]);
-      validBatchOldValues.add(walOldValues);
-    }
+          validBatchRecords.add(r);
+          validBatchRecordIds.add(recordId);
+          validBatchUniqueKeys.add(uniqueKeyRefsList[i]);
+          validBatchOldValues.add(walOldValues);
+        }
+      },
+    );
 
     if (walEntries.isEmpty) {
       return (successRecordIds: successIds, failedRecordIds: failedIds);
@@ -1533,47 +1541,51 @@ class TableDataManager {
     final entries = <BufferEntry>[];
     final finalUniqueKeysList = <List<UniqueKeyRef>>[];
 
-    for (int i = 0; i < validBatchRecordIds.length; i++) {
-      final y = yieldController.maybeYield();
-      if (y != null) await y;
-      final recordId = validBatchRecordIds[i];
-      final r = validBatchRecords[i];
-      final oldR = validBatchOldValues[i];
+    await EngineCpuChunk.forEachRangeAsync(
+      length: validBatchRecordIds.length,
+      kind: CpuChunkKind.medium,
+      process: (start, end) async {
+        for (int i = start; i < end; i++) {
+          final recordId = validBatchRecordIds[i];
+          final r = validBatchRecords[i];
+          final oldR = validBatchOldValues[i];
 
-      entries.add(BufferEntry(
-        data: r,
-        operation: operation,
-        timestamp: ts,
-        transactionId: currentTxId,
-        walPointer: pointers[i],
-        oldValues: oldR,
-        schemaVersion: schemaVersion,
-      ));
-      recordIds.add(recordId);
-      if (operation != BufferOperationType.delete) {
-        finalUniqueKeysList.add(validBatchUniqueKeys[i]);
-      }
+          entries.add(BufferEntry(
+            data: r,
+            operation: operation,
+            timestamp: ts,
+            transactionId: currentTxId,
+            walPointer: pointers[i],
+            oldValues: oldR,
+            schemaVersion: schemaVersion,
+          ));
+          recordIds.add(recordId);
+          if (operation != BufferOperationType.delete) {
+            finalUniqueKeysList.add(validBatchUniqueKeys[i]);
+          }
 
-      if (operation == BufferOperationType.update) {
-        cacheTableRecord(table, recordId, r, schema);
-        await _dataStore.indexManager?.updateIndexDataCache(
-          table,
-          recordId,
-          oldR,
-          r,
-          overrideSchema: schema,
-        );
-      } else if (operation == BufferOperationType.delete) {
-        removeTableRecord(table, recordId);
-        await _dataStore.indexManager?.updateIndexDataCache(
-          table,
-          recordId,
-          r,
-          null,
-          overrideSchema: schema,
-        );
-      }
-    }
+          if (operation == BufferOperationType.update) {
+            cacheTableRecord(table, recordId, r, schema);
+            await _dataStore.indexManager?.updateIndexDataCache(
+              table,
+              recordId,
+              oldR,
+              r,
+              overrideSchema: schema,
+            );
+          } else if (operation == BufferOperationType.delete) {
+            removeTableRecord(table, recordId);
+            await _dataStore.indexManager?.updateIndexDataCache(
+              table,
+              recordId,
+              r,
+              null,
+              overrideSchema: schema,
+            );
+          }
+        }
+      },
+    );
 
     if (operation == BufferOperationType.insert) {
       await _dataStore.writeBufferManager.addInsertBatch(
