@@ -96,6 +96,7 @@ import 'weight_manager.dart';
 import 'workload_scheduler.dart';
 import 'write_buffer_manager.dart';
 import 'yield_controller.dart';
+import 'cpu_work_chunk.dart';
 
 /// Core storage engine implementation
 class DataStoreImpl {
@@ -4509,8 +4510,10 @@ class DataStoreImpl {
             growable: false,
           );
 
-          final yieldController =
-              YieldController('DataStoreImpl.batchInsert.loop');
+          final yieldController = YieldController(
+            'DataStoreImpl.batchInsert.loop',
+            minCheckInterval: EngineCpuChunk.hotPathMinCheckInterval,
+          );
 
           // Optimization: Create batch context to hoist table/buffer lookups out of the record loop
           final batchContext =
@@ -4580,8 +4583,10 @@ class DataStoreImpl {
                   final keepRecords = <Map<String, dynamic>>[];
                   final keepRefs = <List<UniqueKeyRef>>[];
                   final keepOriginalById = <String, Map<String, dynamic>>{};
-                  final filterYield =
-                      YieldController('DataStore.batchInsert.flush.filter');
+                  final filterYield = YieldController(
+                    'DataStore.batchInsert.flush.filter',
+                    minCheckInterval: EngineCpuChunk.hotPathMinCheckInterval,
+                  );
 
                   for (int i = 0; i < batchRecordsForBuffer.length; i++) {
                     final y7 = filterYield.maybeYield();
@@ -4654,8 +4659,10 @@ class DataStoreImpl {
                 Logger.warn('Batch unique disk check failed', rawError: e);
                 // Safety: if we cannot validate uniqueness reliably, treat as failure to avoid corruption.
                 // We conservatively fail all pending records in this flush batch.
-                final failYield =
-                    YieldController('DataStore.batchInsert.flush.failAll');
+                final failYield = YieldController(
+                  'DataStore.batchInsert.flush.failAll',
+                  minCheckInterval: EngineCpuChunk.hotPathMinCheckInterval,
+                );
                 for (final rec in batchRecordsForBuffer) {
                   final y8 = failYield.maybeYield();
                   if (y8 != null) await y8;
