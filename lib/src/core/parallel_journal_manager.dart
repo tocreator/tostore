@@ -29,6 +29,7 @@ import 'storage_adapter.dart';
 import 'wal_manager.dart';
 import 'workload_scheduler.dart';
 import 'write_buffer_manager.dart';
+import 'cpu_work_chunk.dart';
 import 'yield_controller.dart';
 import '../model/table_identity.dart';
 import '../model/system_table.dart';
@@ -585,9 +586,6 @@ class ParallelJournalManager {
         final Map<TableUid, List<BackgroundWriteEntry>> bgLargeUpdatesByTable =
             {};
 
-        final yieldController =
-            YieldController('ParallelJournalManager._pumpFlush');
-
         // Calculate the target checkpoint for each table in this batch
         final Map<TableUid, String> targetCheckpoints = {};
         final flushCheckpointMap = <String, BgTaskProgress>{};
@@ -612,69 +610,84 @@ class ParallelJournalManager {
           );
         }
 
-        // Process business writes (as the "newer" data, overwriting migration)
-        for (final e in batch) {
-          final y1 = yieldController.maybeYield();
-          if (y1 != null) await y1;
-          final tableContext = await _tableContextFromUid(e.tableUid);
-          if (tableContext == null) continue;
-          tableEpochs.putIfAbsent(
-              e.tableUid, () => _bufferManager.getClearEpoch(tableContext));
+        // Process business writes (as the "newer" data, overwriting migration).
+        // Chunked so dual-pressure with batchInsert does not collapse yield interval.
+        await EngineCpuChunk.forEachRangeAsync(
+          length: batch.length,
+          kind: CpuChunkKind.medium,
+          process: (start, end) async {
+            for (int i = start; i < end; i++) {
+              final e = batch[i];
+              final tableContext = await _tableContextFromUid(e.tableUid);
+              if (tableContext == null) continue;
+              tableEpochs.putIfAbsent(
+                  e.tableUid, () => _bufferManager.getClearEpoch(tableContext));
 
-          final be = _bufferManager.getBufferedRecord(tableContext, e.recordId);
-          if (be == null) continue;
+              final be =
+                  _bufferManager.getBufferedRecord(tableContext, e.recordId);
+              if (be == null) continue;
 
-          BufferEntry effectiveEntry = be;
-          final migrationManager = _dataStore.migrationManager;
-          if (migrationManager != null &&
-              migrationManager.hasRuntimeMigrationForTable(tableContext) &&
-              migrationManager.shouldNormalizeBufferedWrite(
-                tableContext,
-                be.walPointer,
-              )) {
-            final normalizedData = migrationManager.normalizeRecordToLatestSync(
-              tableContext,
-              be.data,
-              fromVersion: be.schemaVersion,
-            );
-            final normalizedOldValues = be.oldValues != null
-                ? migrationManager.normalizeRecordToLatestSync(
+              BufferEntry effectiveEntry = be;
+              final migrationManager = _dataStore.migrationManager;
+              if (migrationManager != null &&
+                  migrationManager.hasRuntimeMigrationForTable(tableContext) &&
+                  migrationManager.shouldNormalizeBufferedWrite(
                     tableContext,
-                    be.oldValues!,
-                    fromVersion: be.schemaVersion,
-                  )
-                : null;
-            effectiveEntry = be.copyWith(
-                data: normalizedData, oldValues: normalizedOldValues);
-          }
+                    be.walPointer,
+                  )) {
+                final normalizedData =
+                    migrationManager.normalizeRecordToLatestSync(
+                  tableContext,
+                  be.data,
+                  fromVersion: be.schemaVersion,
+                );
+                final normalizedOldValues = be.oldValues != null
+                    ? migrationManager.normalizeRecordToLatestSync(
+                        tableContext,
+                        be.oldValues!,
+                        fromVersion: be.schemaVersion,
+                      )
+                    : null;
+                effectiveEntry = be.copyWith(
+                    data: normalizedData, oldValues: normalizedOldValues);
+              }
 
-          // Check if table is being cleared - if so, skip this entry to avoid race condition
-          if (_dataStore.tableDataManager.isTableBeingCleared(tableContext)) {
-            continue;
-          }
+              // Check if table is being cleared - if so, skip this entry to avoid race condition
+              if (_dataStore.tableDataManager
+                  .isTableBeingCleared(tableContext)) {
+                continue;
+              }
 
-          // Business write ALWAYS overwrites migration data for the same PK
-          final pkMap = tablePkMap.putIfAbsent(e.tableUid, () => {});
-          pkMap[e.recordId] = effectiveEntry;
+              // Business write ALWAYS overwrites migration data for the same PK
+              final pkMap = tablePkMap.putIfAbsent(e.tableUid, () => {});
+              pkMap[e.recordId] = effectiveEntry;
 
-          entriesByTable.putIfAbsent(e.tableUid, () => []).add(e);
-        }
+              entriesByTable.putIfAbsent(e.tableUid, () => []).add(e);
+            }
+          },
+        );
 
         // 3. Finalize 'grouped' structure from the coalesced PK maps
         final Map<TableUid, Map<BufferOperationType, Map<String, BufferEntry>>>
             grouped = {};
         int totalBatchUniqueRecords = 0;
 
-        tablePkMap.forEach((table, pkMap) {
+        for (final tableEntry in tablePkMap.entries) {
+          final table = tableEntry.key;
+          final pkMap = tableEntry.value;
+          totalBatchUniqueRecords += pkMap.length;
           final byOp = grouped.putIfAbsent(
               table, () => <BufferOperationType, Map<String, BufferEntry>>{});
-          pkMap.forEach((pk, entry) {
-            final mapByOp = byOp.putIfAbsent(
-                entry.operation, () => <String, BufferEntry>{});
-            mapByOp[pk] = entry;
-            totalBatchUniqueRecords++;
-          });
-        });
+          await EngineCpuChunk.forEachIterable(
+            pkMap.entries,
+            (e) {
+              final mapByOp = byOp.putIfAbsent(
+                  e.value.operation, () => <String, BufferEntry>{});
+              mapByOp[e.key] = e.value;
+            },
+            kind: CpuChunkKind.light,
+          );
+        }
 
         final journaling = _dataStore.config.enableJournal;
         // Register pending batch in WAL meta (multi-batch)
@@ -722,9 +735,8 @@ class ParallelJournalManager {
             }
 
             // Calculate ops for timeout: records * (1 + indexCount)
-            int tableRecordCount = 0;
-            grouped[tableUid]
-                ?.forEach((_, map) => tableRecordCount += map.length);
+            // pkMap length == sum of per-op maps (same unique PKs).
+            int tableRecordCount = tablePkMap[tableUid]?.length ?? 0;
 
             final bgRecords = bgEntriesByTable[tableUid] ?? [];
             tableRecordCount += bgRecords.length;
@@ -848,8 +860,14 @@ class ParallelJournalManager {
                   final migrationManager = _dataStore.migrationManager;
 
                   // Extract and separate valid background write data
-                  final activeBgEntries =
-                      tableBgEntries.where((e) => e.isValid).toList();
+                  final activeBgEntries = <BackgroundWriteEntry>[];
+                  await EngineCpuChunk.forEachIndexed(
+                    tableBgEntries,
+                    (_, e) {
+                      if (e.isValid) activeBgEntries.add(e);
+                    },
+                    kind: CpuChunkKind.light,
+                  );
 
                   // 1) Unified pk-map coalescing (overwrite background with business writes)
                   final Map<String, BufferEntry> unifiedPkMap = {};
@@ -871,45 +889,42 @@ class ParallelJournalManager {
                   final insertRecords = <Map<String, dynamic>>[];
                   final updateRecords = <Map<String, dynamic>>[];
                   final deleteRecords = <Map<String, dynamic>>[];
-
-                  // 3) Symmetrically upgrade records to current active version and classify
-                  for (final be in unifiedPkMap.values) {
-                    final y2 = yieldController.maybeYield();
-                    if (y2 != null) await y2;
-                    var currentData = be.data;
-                    if (migrationManager != null &&
-                        be.schemaVersion.isNotEmpty &&
-                        migrationManager
-                            .hasRuntimeMigrationForTable(tableContext)) {
-                      currentData =
-                          migrationManager.normalizeRecordToLatestSync(
-                        tableContext,
-                        be.data,
-                        fromVersion: be.schemaVersion,
-                      );
-                    }
-
-                    if (be.operation == BufferOperationType.insert ||
-                        be.operation == BufferOperationType.rewrite) {
-                      insertRecords.add(currentData);
-                    } else if (be.operation == BufferOperationType.update) {
-                      updateRecords.add(currentData);
-                    } else if (be.operation == BufferOperationType.delete) {
-                      deleteRecords.add(currentData);
-                    }
-                  }
-
-                  // 4) Identify missing old values for index updates
                   final missingOld = <String>[];
-                  for (final be in unifiedPkMap.values) {
-                    if (be.operation == BufferOperationType.update &&
-                        be.oldValues == null) {
-                      final pk = be.data[pkName]?.toString();
-                      if (pk != null && pk.isNotEmpty) {
-                        missingOld.add(pk);
+
+                  // 3) Upgrade + classify + collect missing old PKs in one chunked pass
+                  await EngineCpuChunk.forEachIterable(
+                    unifiedPkMap.values,
+                    (be) {
+                      var currentData = be.data;
+                      if (migrationManager != null &&
+                          be.schemaVersion.isNotEmpty &&
+                          migrationManager
+                              .hasRuntimeMigrationForTable(tableContext)) {
+                        currentData =
+                            migrationManager.normalizeRecordToLatestSync(
+                          tableContext,
+                          be.data,
+                          fromVersion: be.schemaVersion,
+                        );
                       }
-                    }
-                  }
+
+                      if (be.operation == BufferOperationType.insert ||
+                          be.operation == BufferOperationType.rewrite) {
+                        insertRecords.add(currentData);
+                      } else if (be.operation == BufferOperationType.update) {
+                        updateRecords.add(currentData);
+                        if (be.oldValues == null) {
+                          final pk = be.data[pkName]?.toString();
+                          if (pk != null && pk.isNotEmpty) {
+                            missingOld.add(pk);
+                          }
+                        }
+                      } else if (be.operation == BufferOperationType.delete) {
+                        deleteRecords.add(currentData);
+                      }
+                    },
+                    kind: CpuChunkKind.medium,
+                  );
 
                   final oldByPk = <String, Map<String, dynamic>>{};
                   if (missingOld.isNotEmpty) {
@@ -919,25 +934,27 @@ class ParallelJournalManager {
                         tableContext,
                         missingOld,
                       );
-                      for (final r in olds.records) {
-                        final y3 = yieldController.maybeYield();
-                        if (y3 != null) await y3;
-                        final pk = r[pkName]?.toString();
-                        if (pk == null || pk.isEmpty) continue;
+                      await EngineCpuChunk.forEachIndexed(
+                        olds.records,
+                        (_, r) {
+                          final pk = r[pkName]?.toString();
+                          if (pk == null || pk.isEmpty) return;
 
-                        var normalizedRecord = r;
-                        if (migrationManager != null &&
-                            migrationManager
-                                .hasRuntimeMigrationForTable(tableContext)) {
-                          normalizedRecord =
-                              migrationManager.normalizeRecordToLatestSync(
-                            tableContext,
-                            r,
-                            fromVersion: '',
-                          );
-                        }
-                        oldByPk[pk] = normalizedRecord;
-                      }
+                          var normalizedRecord = r;
+                          if (migrationManager != null &&
+                              migrationManager
+                                  .hasRuntimeMigrationForTable(tableContext)) {
+                            normalizedRecord =
+                                migrationManager.normalizeRecordToLatestSync(
+                              tableContext,
+                              r,
+                              fromVersion: '',
+                            );
+                          }
+                          oldByPk[pk] = normalizedRecord;
+                        },
+                        kind: CpuChunkKind.medium,
+                      );
                     } catch (_) {}
                   }
 
@@ -949,28 +966,40 @@ class ParallelJournalManager {
                       {};
 
                   // Normal business writes
-                  for (final be in inserts) {
-                    idxInserts.add(be.data);
-                  }
-                  for (final be in deletes) {
-                    idxDeletes.add(be.data);
-                  }
-                  for (final be in updates) {
-                    final pk = be.data[pkName]?.toString();
-                    if (pk == null || pk.isEmpty) continue;
-                    final oldVals = be.oldValues ?? oldByPk[pk];
-                    if (oldVals == null) {
+                  await EngineCpuChunk.forEachIndexed(
+                    inserts,
+                    (_, be) {
                       idxInserts.add(be.data);
-                    } else {
-                      idxUpdates.add(IndexRecordUpdate(
-                        primaryKey: pk,
-                        // Share buffer maps by ref; index delta compute copies
-                        // before any mutate.
-                        newValues: be.data,
-                        oldValues: oldVals,
-                      ));
-                    }
-                  }
+                    },
+                    kind: CpuChunkKind.light,
+                  );
+                  await EngineCpuChunk.forEachIndexed(
+                    deletes,
+                    (_, be) {
+                      idxDeletes.add(be.data);
+                    },
+                    kind: CpuChunkKind.light,
+                  );
+                  await EngineCpuChunk.forEachIndexed(
+                    updates,
+                    (_, be) {
+                      final pk = be.data[pkName]?.toString();
+                      if (pk == null || pk.isEmpty) return;
+                      final oldVals = be.oldValues ?? oldByPk[pk];
+                      if (oldVals == null) {
+                        idxInserts.add(be.data);
+                      } else {
+                        idxUpdates.add(IndexRecordUpdate(
+                          primaryKey: pk,
+                          // Share buffer maps by ref; index delta compute copies
+                          // before any mutate.
+                          newValues: be.data,
+                          oldValues: oldVals,
+                        ));
+                      }
+                    },
+                    kind: CpuChunkKind.light,
+                  );
 
                   // Background writes (merged into global if specIdxs is empty)
                   for (final bgEntry in activeBgEntries) {
