@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
@@ -20,7 +20,7 @@ typedef TreeCacheWeightQueryCallback = Future<int?> Function(
 /// markers cannot express (e.g. a global "fully loaded" flag).
 typedef TreeCacheEvictedCallback = void Function(int removedCount);
 
-/// A high-performance hierarchical cache built on a custom B+Tree.
+/// A high-performance hierarchical cache.
 ///
 /// Key model:
 /// - Accepts either a scalar key (e.g. `String`) or a `List` path key.
@@ -30,8 +30,12 @@ typedef TreeCacheEvictedCallback = void Function(int removedCount);
 /// - **Group partitioning** (controlled by [groupDepth]) provides O(1) prefix removal
 ///   for prefixes aligned to group boundaries (e.g. `[table]`, `[table, index]`,
 ///   `[table, index, partition]`).
-/// - Within each group, a B+Tree provides O(log n) point lookup and fast range scans.
-/// - Eviction uses **group-level weights** (optional) + **entry-level LRU**.
+/// - Within each group, a **point Map** provides near-O(1) equality get/put/remove.
+/// - A **lazy B+Tree ordered view** is rebuilt on demand for [scanRange] (shared
+///   [_CacheEntry] references — values are never duplicated). Once warm, inserts
+///   and removes keep the view in sync incrementally.
+/// - Eviction uses **group-level weights** (optional) + **entry-level LRU** when
+///   [enableLru] is true.
 class TreeCache<T> {
   final TreeCacheSizeCalculator<T> sizeCalculator;
 
@@ -64,6 +68,12 @@ class TreeCache<T> {
   /// Not invoked for single-entry [remove] / [clear] (callers own those).
   final TreeCacheEvictedCallback? onEvicted;
 
+  /// When `false`, skips LRU list maintenance and automatic/manual eviction.
+  ///
+  /// Use for caches that must stay resident and need Map-like equality speed
+  /// (e.g. pending unique-check buffers, transaction SSI indexes).
+  final bool enableLru;
+
   final String debugLabel;
 
   int _estimatedTotalSizeBytes = 0;
@@ -92,6 +102,7 @@ class TreeCache<T> {
     this.comparatorFactory,
     this.weightQueryCallback,
     this.onEvicted,
+    this.enableLru = true,
     String? debugLabel,
   })  : maxByteThreshold = math.max(maxByteThreshold, minByteThreshold),
         debugLabel = debugLabel ?? 'TreeCache' {
@@ -164,7 +175,7 @@ class TreeCache<T> {
     final k = _normalizeKey(key);
     final group = _getGroupForKey(k, create: false);
     if (group == null) return null;
-    final entry = group.tree.get(k);
+    final entry = group.pointGet(k);
     if (entry == null) return null;
     if (updateStats) {
       group.touch(entry);
@@ -176,7 +187,7 @@ class TreeCache<T> {
     final k = _normalizeKey(key);
     final group = _getGroupForKey(k, create: false);
     if (group == null) return false;
-    return group.tree.containsKey(k);
+    return group.pointGet(k) != null;
   }
 
   void put(dynamic key, T value, {int? size}) {
@@ -184,7 +195,7 @@ class TreeCache<T> {
     final group = _getGroupForKey(k, create: true)!;
 
     final int newSize = _sanitizeSize(size ?? sizeCalculator(value));
-    final existing = group.tree.findForInsert(k);
+    final existing = group.pointGet(k);
     if (existing != null) {
       final int oldSize = existing.sizeBytes;
       existing.value = value;
@@ -194,11 +205,13 @@ class TreeCache<T> {
         group.totalBytes += diff;
         _estimatedTotalSizeBytes += diff;
       }
+      // In-place value update keeps ordered-view keys valid.
       group.touch(existing);
     } else {
       final entry = _CacheEntry<T>(k, value, newSize);
-      group.tree.insertPrepared(k, entry);
+      group.pointInsert(k, entry);
       group.attachNew(entry);
+      group.syncOrderedInsert(entry);
       group.totalBytes += newSize;
       group.entryCount++;
       _estimatedTotalSizeBytes += newSize;
@@ -226,7 +239,7 @@ class TreeCache<T> {
           ? (sizes[rawKey] ?? sizeCalculator(e.value))
           : sizeCalculator(e.value));
 
-      final existing = group.tree.findForInsert(k);
+      final existing = group.pointGet(k);
       if (existing != null) {
         final oldSize = existing.sizeBytes;
         existing.value = e.value;
@@ -236,13 +249,12 @@ class TreeCache<T> {
           group.totalBytes += diff;
           _estimatedTotalSizeBytes += diff;
         }
-        // For batch operations, we still "touch" to keep LRU sane,
-        // but we avoid any extra global work (cleanup check is done once).
         group.touch(existing);
       } else {
         final entry = _CacheEntry<T>(k, e.value, newSize);
-        group.tree.insertPrepared(k, entry);
+        group.pointInsert(k, entry);
         group.attachNew(entry);
+        group.syncOrderedInsert(entry);
         group.totalBytes += newSize;
         group.entryCount++;
         _estimatedTotalSizeBytes += newSize;
@@ -265,9 +277,10 @@ class TreeCache<T> {
     // 1) Try exact remove.
     final group = _getGroupForKey(p, create: false);
     if (group != null) {
-      final removed = group.tree.remove(p);
+      final removed = group.pointRemove(p);
       if (removed != null) {
         group.detach(removed);
+        group.syncOrderedRemove(removed);
         group.totalBytes -= removed.sizeBytes;
         group.entryCount--;
         _estimatedTotalSizeBytes -= removed.sizeBytes;
@@ -307,18 +320,20 @@ class TreeCache<T> {
 
     final group = _groupsRoot.remove(oldGroupKey);
     if (group == null) return;
+    if (group is! _Group<T>) {
+      _groupsRoot[oldGroupKey] = group;
+      return;
+    }
 
     // Update group path
     group.groupPath[0] = newGroupKey;
 
-    // Update all entry keys in-place
-    var curr = group.lruHead;
-    while (curr != null) {
-      if (curr.key.isNotEmpty) {
-        curr.key[0] = newGroupKey;
+    // Update all entry keys in-place (point-store keys are suffix-only).
+    group.forEachEntry((entry) {
+      if (entry.key.isNotEmpty) {
+        entry.key[0] = newGroupKey;
       }
-      curr = curr.lruNext;
-    }
+    });
 
     _groupsRoot[newGroupKey] = group;
 
@@ -346,6 +361,10 @@ class TreeCache<T> {
   /// - For prefix scans, pass a group prefix as [startKey] (e.g. `[table]` or
   ///   `[table, index]`) and set [endKey] to null; stop condition can be implemented
   ///   in [onEntry] by returning false.
+  ///
+  /// The first scan after Map-only mutations may rebuild the ordered B+Tree view;
+  /// once warm, subsequent inserts/removes keep the view in sync incrementally.
+  /// Call [prepareOrderedViews] after bulk loads to pay rebuild cost up-front.
   Future<void> scanRange(
     dynamic startKey,
     dynamic endKey, {
@@ -363,14 +382,14 @@ class TreeCache<T> {
     try {
       final yieldController =
           YieldController('TreeCache.scanRange:$debugLabel');
-      await group.tree.scanRange(
+      final tree = await group.ensureOrdered(yieldController);
+      await tree.scanRange(
         start,
         end,
         reverse: reverse,
         limit: limit,
         yieldController: yieldController,
         onEntry: (k, entry) {
-          // Skip tombstoned/removed entries are not possible here since we physically remove.
           return onEntry(k, entry.value);
         },
       );
@@ -382,9 +401,34 @@ class TreeCache<T> {
     }
   }
 
+  /// Rebuild dirty ordered views for all groups (with [YieldController]).
+  ///
+  /// Use after bulk [put]/[putAll] when a range scan is expected soon, so the
+  /// first [scanRange] stays near steady-state cost.
+  Future<void> prepareOrderedViews() async {
+    final groups = <_Group<T>>[];
+    _collectGroups(_groupsRoot, depth: 1, out: groups);
+    if (groups.isEmpty) return;
+
+    final yieldController =
+        YieldController('TreeCache.prepareOrdered:$debugLabel');
+    for (final g in groups) {
+      if (g.entryCount <= 0) continue;
+      if (!g.orderedDirty && g.ordered != null) continue;
+      final y = yieldController.maybeYield();
+      if (y != null) await y;
+      await g.ensureOrdered(yieldController);
+    }
+  }
+
   Future<void> cleanup({double removeRatio = 0.3}) async {
+    if (!enableLru) return;
     if (removeRatio <= 0) return;
     if (removeRatio > 1) removeRatio = 1;
+
+    // Under min: skip entirely (memory-pressure may call often). Mid-eviction
+    // does not re-check the floor — ratio target only, avoid per-entry cost.
+    if (_estimatedTotalSizeBytes <= minByteThreshold) return;
 
     // Lock to prevent concurrent cleanups.
     if (_cleanupLock != null) {
@@ -452,16 +496,21 @@ class TreeCache<T> {
 
           final entry = g.lruHead!;
 
-          final removedEntry = g.tree.remove(entry.key);
+          final removedEntry = g.pointRemove(entry.key);
           if (removedEntry == null) {
-            // Inconsistent; detach defensively and continue.
+            // Stale LRU node (not in point map). Drop from LRU only —
+            // do NOT count as a successful eviction or touch byte counters.
             g.detach(entry);
-            need--;
-            removedTotal++;
             continue;
           }
 
+          // Guard: LRU head key may resolve to a different live entry object
+          // (e.g. replaced value). Always detach the map-removed instance.
+          if (!identical(entry, removedEntry)) {
+            g.detach(entry);
+          }
           g.detach(removedEntry);
+          g.syncOrderedRemove(removedEntry);
           g.totalBytes -= removedEntry.sizeBytes;
           g.entryCount--;
           _estimatedTotalSizeBytes -= removedEntry.sizeBytes;
@@ -536,6 +585,7 @@ class TreeCache<T> {
           groupPath: groupPath,
           groupDepth: groupDepth,
           firstSuffixComparator: firstSuffixComparator,
+          enableLru: enableLru,
         );
         map[comp] = group;
         return group;
@@ -750,6 +800,7 @@ class TreeCache<T> {
   }
 
   void _maybeScheduleCleanup() {
+    if (!enableLru) return;
     if (maxByteThreshold <= 0) return;
     if (_estimatedTotalSizeBytes <= maxByteThreshold) return;
     if (_cleanupLock != null) return;
@@ -783,7 +834,23 @@ final class _Group<T> {
   List<dynamic> groupPath;
   final int groupDepth;
   final Comparator<dynamic> firstSuffixComparator;
-  final _BPlusTree<List<dynamic>, _CacheEntry<T>> tree;
+  final bool enableLru;
+
+  /// Exact group key: `key.length == groupDepth` (e.g. scalar `tableUid`).
+  ///
+  /// TableSchemaCache / TableMetaCache put a single value per group with no
+  /// suffix; this slot is required so get/remove/cleanup can find it.
+  _CacheEntry<T>? exactEntry;
+
+  /// Single-suffix hot path: `key.length == groupDepth + 1`.
+  final Map<Object?, _CacheEntry<T>> flat = <Object?, _CacheEntry<T>>{};
+
+  /// Multi-suffix nested maps (lazily allocated). Leaves are [_CacheEntry].
+  Map<Object?, dynamic>? deep;
+
+  /// Lazy ordered view for [TreeCache.scanRange]. Null when dirty/unused.
+  _BPlusTree<List<dynamic>, _CacheEntry<T>>? ordered;
+  bool orderedDirty = true;
 
   int totalBytes = 0;
   int entryCount = 0;
@@ -797,52 +864,273 @@ final class _Group<T> {
     required this.groupPath,
     required this.groupDepth,
     required this.firstSuffixComparator,
-  }) : tree = _BPlusTree<List<dynamic>, _CacheEntry<T>>(
-          order: 64,
-          compare: (a, b) {
-            // Compare only the suffix after group prefix.
-            //
-            // Hot-path optimization:
-            // - Most cache keys are short (1-3 suffix components).
-            // - Avoid loop/branch overhead by specializing common lengths.
-            final int al = a.length;
-            final int bl = b.length;
-            final int base = groupDepth;
+    required this.enableLru,
+  });
 
-            // If either key is shorter than the group prefix, treat it as smaller.
-            if (al <= base) return (bl <= base) ? 0 : -1;
-            if (bl <= base) return 1;
+  Comparator<List<dynamic>> get _pathCompare => (a, b) {
+        // Compare only the suffix after group prefix.
+        //
+        // Hot-path optimization:
+        // - Most cache keys are short (1-3 suffix components).
+        // - Avoid loop/branch overhead by specializing common lengths.
+        final int al = a.length;
+        final int bl = b.length;
+        final int base = groupDepth;
 
-            // Compare first suffix component with custom comparator.
-            int c = firstSuffixComparator(a[base], b[base]);
-            if (c != 0) return c;
+        // If either key is shorter than the group prefix, treat it as smaller.
+        if (al <= base) return (bl <= base) ? 0 : -1;
+        if (bl <= base) return 1;
 
-            // Common case: exactly one suffix component.
-            if (al == base + 1 || bl == base + 1) {
-              if (al == bl) return 0;
-              return al < bl ? -1 : 1;
-            }
+        // Compare first suffix component with custom comparator.
+        int c = firstSuffixComparator(a[base], b[base]);
+        if (c != 0) return c;
 
-            // Common case: exactly two suffix components.
-            if (al == base + 2 && bl == base + 2) {
-              c = TreeCache.compareNative(a[base + 1], b[base + 1]);
-              if (c != 0) return c;
-              return 0;
-            }
+        // Common case: exactly one suffix component.
+        if (al == base + 1 || bl == base + 1) {
+          if (al == bl) return 0;
+          return al < bl ? -1 : 1;
+        }
 
-            // Fallback: compare remaining components.
-            int i = base + 1;
-            while (i < al && i < bl) {
-              c = TreeCache.compareNative(a[i], b[i]);
-              if (c != 0) return c;
-              i++;
-            }
-            if (al == bl) return 0;
-            return al < bl ? -1 : 1;
-          },
+        // Common case: exactly two suffix components.
+        if (al == base + 2 && bl == base + 2) {
+          c = TreeCache.compareNative(a[base + 1], b[base + 1]);
+          if (c != 0) return c;
+          return 0;
+        }
+
+        // Fallback: compare remaining components.
+        int i = base + 1;
+        while (i < al && i < bl) {
+          c = TreeCache.compareNative(a[i], b[i]);
+          if (c != 0) return c;
+          i++;
+        }
+        if (al == bl) return 0;
+        return al < bl ? -1 : 1;
+      };
+
+  _CacheEntry<T>? pointGet(List<dynamic> key) {
+    final int base = groupDepth;
+    final int len = key.length;
+    if (len < base) return null;
+    if (len == base) return exactEntry;
+    if (len == base + 1) {
+      return flat[key[base]];
+    }
+    final d = deep;
+    if (d == null) return null;
+    dynamic node = d;
+    for (int i = base; i < len; i++) {
+      if (node is! Map<Object?, dynamic>) return null;
+      node = node[key[i]];
+      if (node == null) return null;
+    }
+    return node is _CacheEntry<T> ? node : null;
+  }
+
+  void pointInsert(List<dynamic> key, _CacheEntry<T> entry) {
+    final int base = groupDepth;
+    final int len = key.length;
+    if (len < base) return;
+    if (len == base) {
+      exactEntry = entry;
+      // Clear legacy misplaced deep leaf from older builds (wrote deep[key0]
+      // when len == groupDepth). Avoid duplicate visible entries.
+      final d = deep;
+      if (d != null) {
+        d.remove(key[base - 1]);
+        if (d.isEmpty) deep = null;
+      }
+      return;
+    }
+    if (len == base + 1) {
+      flat[key[base]] = entry;
+      return;
+    }
+    var map = deep;
+    if (map == null) {
+      map = <Object?, dynamic>{};
+      deep = map;
+    }
+    for (int i = base; i < len - 1; i++) {
+      final comp = key[i];
+      final next = map![comp];
+      if (next is Map<Object?, dynamic>) {
+        map = next;
+      } else {
+        final child = <Object?, dynamic>{};
+        map[comp] = child;
+        map = child;
+      }
+    }
+    map![key[len - 1]] = entry;
+  }
+
+  _CacheEntry<T>? pointRemove(List<dynamic> key) {
+    final int base = groupDepth;
+    final int len = key.length;
+    if (len < base) return null;
+    if (len == base) {
+      final removed = exactEntry;
+      exactEntry = null;
+      return removed;
+    }
+    if (len == base + 1) {
+      return flat.remove(key[base]);
+    }
+    final d = deep;
+    if (d == null) return null;
+
+    final stack = <Map<Object?, dynamic>>[];
+    final keys = <Object?>[];
+    Map<Object?, dynamic> map = d;
+    for (int i = base; i < len - 1; i++) {
+      stack.add(map);
+      final comp = key[i];
+      keys.add(comp);
+      final next = map[comp];
+      if (next is! Map<Object?, dynamic>) return null;
+      map = next;
+    }
+    final last = key[len - 1];
+    final removed = map.remove(last);
+    if (removed is! _CacheEntry<T>) return null;
+
+    // Prune empty nested maps.
+    for (int i = stack.length - 1; i >= 0; i--) {
+      final m = (i == stack.length - 1) ? map : stack[i + 1];
+      if (m.isNotEmpty) break;
+      stack[i].remove(keys[i]);
+    }
+    if (d.isEmpty) deep = null;
+    return removed;
+  }
+
+  void syncOrderedInsert(_CacheEntry<T> entry) {
+    final tree = ordered;
+    if (!orderedDirty && tree != null) {
+      tree.put(entry.key, entry);
+    }
+  }
+
+  void syncOrderedRemove(_CacheEntry<T> entry) {
+    final tree = ordered;
+    if (!orderedDirty && tree != null) {
+      tree.remove(entry.key);
+    }
+  }
+
+  Future<_BPlusTree<List<dynamic>, _CacheEntry<T>>> ensureOrdered(
+    YieldController yieldController,
+  ) async {
+    if (!orderedDirty && ordered != null) return ordered!;
+
+    final tree = _BPlusTree<List<dynamic>, _CacheEntry<T>>(
+      order: 64,
+      compare: _pathCompare,
+    );
+
+    final entries = <_CacheEntry<T>>[];
+    final exact = exactEntry;
+    if (exact != null) entries.add(exact);
+    if (flat.isNotEmpty) {
+      entries.addAll(flat.values);
+    }
+    final d = deep;
+    if (d != null) {
+      _collectDeepEntries(d, entries);
+    }
+
+    if (entries.length > 4096) {
+      final yCollect = yieldController.maybeYield();
+      if (yCollect != null) await yCollect;
+    }
+
+    final int base = groupDepth;
+    final bool allSingleSuffix =
+        entries.isEmpty || entries.every((e) => e.key.length == base + 1);
+
+    List<_CacheEntry<T>> sorted = entries;
+    if (entries.length > 1) {
+      if (allSingleSuffix) {
+        // Decorate-sort: compare cached suffix only (avoids repeated List indexing).
+        final cmp0 = firstSuffixComparator;
+        final n = entries.length;
+        final suffixes = List<dynamic>.filled(n, null, growable: false);
+        for (int i = 0; i < n; i++) {
+          suffixes[i] = entries[i].key[base];
+        }
+        final orderIdx = List<int>.generate(n, (i) => i, growable: false);
+        orderIdx.sort((a, b) => cmp0(suffixes[a], suffixes[b]));
+        sorted = List<_CacheEntry<T>>.generate(
+          n,
+          (i) => entries[orderIdx[i]],
+          growable: false,
         );
+      } else {
+        final cmp = _pathCompare;
+        entries.sort((a, b) => cmp(a.key, b.key));
+        sorted = entries;
+      }
+    }
+
+    if (entries.length > 4096) {
+      final ySort = yieldController.maybeYield();
+      if (ySort != null) await ySort;
+    }
+
+    tree.bulkLoadSorted(sorted, (e) => e.key);
+
+    if (entries.length > 4096) {
+      final yLoad = yieldController.maybeYield();
+      if (yLoad != null) await yLoad;
+    }
+
+    ordered = tree;
+    orderedDirty = false;
+    return tree;
+  }
+
+  void _collectDeepEntries(
+    Map<Object?, dynamic> node,
+    List<_CacheEntry<T>> out,
+  ) {
+    for (final v in node.values) {
+      if (v is _CacheEntry<T>) {
+        out.add(v);
+      } else if (v is Map<Object?, dynamic>) {
+        _collectDeepEntries(v, out);
+      }
+    }
+  }
+
+  void forEachEntry(void Function(_CacheEntry<T> entry) fn) {
+    final exact = exactEntry;
+    if (exact != null) fn(exact);
+    for (final e in flat.values) {
+      fn(e);
+    }
+    final d = deep;
+    if (d != null) {
+      _forEachDeep(d, fn);
+    }
+  }
+
+  void _forEachDeep(
+    Map<Object?, dynamic> node,
+    void Function(_CacheEntry<T> entry) fn,
+  ) {
+    for (final v in node.values) {
+      if (v is _CacheEntry<T>) {
+        fn(v);
+      } else if (v is Map<Object?, dynamic>) {
+        _forEachDeep(v, fn);
+      }
+    }
+  }
 
   void attachNew(_CacheEntry<T> e) {
+    if (!enableLru) return;
     if (lruTail == null) {
       lruHead = e;
       lruTail = e;
@@ -855,6 +1143,7 @@ final class _Group<T> {
   }
 
   void touch(_CacheEntry<T> e) {
+    if (!enableLru) return;
     if (identical(e, lruTail)) return;
     final p = e.lruPrev;
     final n = e.lruNext;
@@ -870,6 +1159,7 @@ final class _Group<T> {
   }
 
   void detach(_CacheEntry<T> e) {
+    if (!enableLru) return;
     final p = e.lruPrev;
     final n = e.lruNext;
     if (p != null) p.lruNext = n;
@@ -952,6 +1242,101 @@ final class _BPlusTree<K, V> {
   }
 
   int get length => _length;
+
+  /// Bottom-up bulk load from a **pre-sorted** value list.
+  ///
+  /// [keyOf] extracts the tree key from each value. Much faster than N
+  /// sequential [put]s for rebuilding an ordered view after Map-only mutations.
+  void bulkLoadSorted(List<V> sorted, K Function(V item) keyOf) {
+    _root = _BPlusLeaf<K, V>();
+    _length = 0;
+    _fingerLeaf = null;
+    _fingerKey = null;
+    _preparedValid = false;
+    if (sorted.isEmpty) return;
+
+    final leaves = <_BPlusLeaf<K, V>>[];
+    _BPlusLeaf<K, V>? prev;
+    final int n = sorted.length;
+    final int leafCap = _maxKeys;
+
+    for (int i = 0; i < n;) {
+      int remaining = n - i;
+      int take = math.min(leafCap, remaining);
+      // Avoid a tiny trailing leaf when remainder is 1 after a full leaf:
+      // prefer slightly smaller previous fill (keeps leaf chain dense).
+      if (remaining > leafCap && remaining - leafCap == 1 && leafCap > 1) {
+        take = leafCap - 1;
+      }
+
+      final leaf = _BPlusLeaf<K, V>();
+      final end = i + take;
+      for (int j = i; j < end; j++) {
+        final item = sorted[j];
+        leaf.keys.add(keyOf(item));
+        leaf.values.add(item);
+      }
+      if (prev != null) {
+        prev.next = leaf;
+        leaf.prev = prev;
+      }
+      prev = leaf;
+      leaves.add(leaf);
+      i = end;
+    }
+
+    _length = n;
+    _fingerLeaf = leaves.first;
+    _fingerKey = leaves.first.keys.first;
+
+    if (leaves.length == 1) {
+      _root = leaves.first;
+      return;
+    }
+
+    // Build internal levels bottom-up. Each internal holds up to [order] children.
+    List<_BPlusNode<K, V>> level = List<_BPlusNode<K, V>>.from(leaves);
+    while (level.length > 1) {
+      final nextLevel = <_BPlusNode<K, V>>[];
+      for (int i = 0; i < level.length;) {
+        int remaining = level.length - i;
+        int take = math.min(order, remaining);
+        // Never leave a single-child internal orphan (breaks upper-bound routing).
+        if (remaining > order && remaining - order == 1 && order > 1) {
+          take = order - 1;
+        }
+
+        // Absorb a final singleton into the previous internal when possible.
+        if (take == 1 && nextLevel.isNotEmpty) {
+          final prevNode = nextLevel.last;
+          if (prevNode is _BPlusInternal<K, V> &&
+              prevNode.children.length < order) {
+            final child = level[i];
+            prevNode.children.add(child);
+            final minKey = _minKeyOfNode(child);
+            if (minKey != null) prevNode.keys.add(minKey);
+            i++;
+            continue;
+          }
+        }
+
+        final node = _BPlusInternal<K, V>();
+        final end = i + take;
+        for (int j = i; j < end; j++) {
+          final child = level[j];
+          node.children.add(child);
+          if (j > i) {
+            final minKey = _minKeyOfNode(child);
+            if (minKey != null) node.keys.add(minKey);
+          }
+        }
+        nextLevel.add(node);
+        i = end;
+      }
+      level = nextLevel;
+    }
+    _root = level.first;
+  }
 
   bool containsKey(K key) {
     // Fast path: finger search without value retrieval or LRU updates.

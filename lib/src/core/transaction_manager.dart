@@ -196,6 +196,7 @@ class TransactionManager {
       maxByteThreshold: maxBytes,
       minByteThreshold: 10 * 1024 * 1024, // 10MB minimum
       groupDepth: 1, // Group by tableUid
+      enableLru: false, // Must stay resident; equality-critical SSI path
       debugLabel: 'RecentCommittedWrites',
     );
 

@@ -52,9 +52,9 @@ class YieldController {
   /// 8ms (120fps) frame.
   static const int defaultBudgetMs = 8;
 
-  /// Minimum check interval. Set to 1 to ensure that even single items exceeding
-  /// the budget can trigger a yield immediately.
-  static const int _minCheckInterval = 1;
+  /// Absolute minimum check interval. Set to 1 to ensure that even single items
+  /// exceeding the budget can trigger a yield immediately.
+  static const int absoluteMinCheckInterval = 1;
 
   /// Maximum check interval cap to prevent unresponsiveness.
   static const int _maxCheckInterval = 10000;
@@ -69,6 +69,9 @@ class YieldController {
   final int _budgetMs;
   final String _topic;
   final bool _enabled;
+
+  /// Per-instance floor for adaptive interval (clamps learning / dual-pressure collapse).
+  final int _minCheckInterval;
 
   /// The current dynamic check interval (number of iterations between time checks).
   int _currentCheckInterval;
@@ -86,16 +89,21 @@ class YieldController {
   ///           and retrieve learned optimization states for this specific task.
   /// [budgetMs] - The time budget in milliseconds before yielding (default: 6ms).
   /// [checkInterval] - Initial check interval used only if no learned history exists.
+  /// [minCheckInterval] - Floor for adaptive interval. Use a higher value on
+  ///   dual-pressure hot paths (batchInsert + flush) to avoid Future.delayed avalanche.
   YieldController(
     this._topic, {
     int? budgetMs,
     int checkInterval = 256,
+    int minCheckInterval = absoluteMinCheckInterval,
   })  : _budgetMs = budgetMs ?? globalSettings.targetBudgetMs,
         _enabled = globalSettings.enabled,
-        // Initialize with learned interval if available, otherwise use default
-        _currentCheckInterval = _topicIntervals.containsKey(_topic)
-            ? _topicIntervals[_topic]!
-            : checkInterval {
+        _minCheckInterval =
+            math.max(absoluteMinCheckInterval, minCheckInterval),
+        _currentCheckInterval = math.max(
+          _topicIntervals[_topic] ?? checkInterval,
+          math.max(absoluteMinCheckInterval, minCheckInterval),
+        ) {
     if (!_enabled) {
       return;
     }
@@ -172,7 +180,7 @@ class YieldController {
     // Target 80% of budget to provide a safety margin
     int calculatedInterval = (_budgetMs * 0.8 / timePerItem).floor();
 
-    // Clamp to valid range
+    // Clamp to valid range (instance floor prevents dual-pressure avalanche)
     if (calculatedInterval < _minCheckInterval) {
       calculatedInterval = _minCheckInterval;
     }
@@ -189,11 +197,14 @@ class YieldController {
     for (final s in _recentSamples) {
       sum += s;
     }
-    final int smoothedInterval = (sum / _smoothingSampleSize).round();
+    final int smoothedInterval = math.max(
+      _minCheckInterval,
+      (sum / _smoothingSampleSize).round(),
+    );
 
     _currentCheckInterval = smoothedInterval;
 
-    // Persist learned interval for future instances
+    // Persist learned interval for future instances (already floored)
     _topicIntervals[_topic] = smoothedInterval;
   }
 
