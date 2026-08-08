@@ -132,11 +132,32 @@ class TableDataManager {
   DateTime? _lastStatisticsTime;
   bool _spaceStatsHydrated = false;
   Future<void>? _spaceStatsHydrateFuture;
+
+  /// Single-flight for the expensive full scan only (policy checks are cheap).
+  Future<void>? _recalculateAllStatisticsFuture;
+
+  /// Whether the hour24 SpaceStats reconcile cron was registered.
+  bool _spaceStatsReconcileCronRegistered = false;
   bool _needSaveStats = false;
   bool _persistingSpaceStats = false;
 
   /// Close/teardown: discard SpaceStats KV I/O (stats are best-effort).
   bool _spaceStatsKvSuppressed = false;
+
+  static const Duration _spaceStatsReconcileStartupDelay =
+      Duration(seconds: 10);
+
+  /// True when SpaceStats background work must stop without logging.
+  bool get _isSpaceStatsWorkAborted =>
+      _spaceStatsKvSuppressed ||
+      !_dataStore.isInitialized ||
+      _dataStore.isClosing;
+
+  /// Auto full-reconcile intervals by `_system_table_meta` row count
+  /// (system tables are few; no user-only filter). `null` interval = disabled.
+  static const int _spaceStatsReconcileDisableTableCount = 5000;
+  static const int _spaceStatsReconcileDailyMaxTables = 50;
+  static const int _spaceStatsReconcileWeeklyMaxTables = 500;
 
   // Throttling state for lightweight meta persistence
   DateTime _lastMaxIdFlushTime = DateTime.fromMillisecondsSinceEpoch(0);
@@ -199,13 +220,45 @@ class TableDataManager {
     // SpaceStats → InternalKv off the journal/close hot path (best-effort).
     CrontabManager.addCallback(
         ExecuteInterval.seconds30, _onSpaceStatsPersistTick);
+    // Register daily reconcile only after startup settles (avoids open contention).
+    unawaited(_registerSpaceStatsReconcileCronDelayed());
   }
 
   void _onSpaceStatsPersistTick() {
     if (!_needSaveStats || !_canPersistSpaceStatsKv) return;
-    unawaited(_persistSpaceStatsToKv().catchError((Object e) {
-      Logger.warn('Periodic space stats persist failed', rawError: e);
-    }));
+    unawaited(
+        _persistSpaceStatsToKv().catchError(_onSpaceStatsBackgroundError));
+  }
+
+  void _onSpaceStatsReconcileTick() {
+    if (_isSpaceStatsWorkAborted) return;
+    unawaited(
+        _maybeReconcileSpaceStats().catchError(_onSpaceStatsBackgroundError));
+  }
+
+  /// Swallow close/switchSpace races; log only unexpected failures.
+  void _onSpaceStatsBackgroundError(Object e, [StackTrace? _]) {
+    if (_isSpaceStatsWorkAborted || e is DbClosedException) return;
+    Logger.warn('Space stats background work failed', rawError: e);
+  }
+
+  /// One-shot: wait startup delay, then register hour24 and run first check.
+  Future<void> _registerSpaceStatsReconcileCronDelayed() async {
+    await Future.delayed(_spaceStatsReconcileStartupDelay);
+    if (_isSpaceStatsWorkAborted || _spaceStatsReconcileCronRegistered) return;
+    if (_dataStore.config.persistenceMode == PersistenceMode.memory) return;
+
+    CrontabManager.addCallback(
+        ExecuteInterval.hour24, _onSpaceStatsReconcileTick);
+    _spaceStatsReconcileCronRegistered = true;
+    _onSpaceStatsReconcileTick();
+  }
+
+  void _unregisterSpaceStatsReconcileCron() {
+    if (!_spaceStatsReconcileCronRegistered) return;
+    CrontabManager.removeCallback(
+        ExecuteInterval.hour24, _onSpaceStatsReconcileTick);
+    _spaceStatsReconcileCronRegistered = false;
   }
 
   // -------------------- Table record cache APIs --------------------
@@ -616,6 +669,8 @@ class TableDataManager {
     _needSaveStats = false;
     _persistingSpaceStats = false;
     _spaceStatsHydrateFuture = null;
+    _recalculateAllStatisticsFuture = null;
+    _unregisterSpaceStatsReconcileCron();
   }
 
   /// Single-flight: load KV baseline once per manager lifetime.
@@ -663,12 +718,69 @@ class TableDataManager {
     } on DbClosedException {
       _spaceStatsHydrateFuture = null;
     } catch (e) {
-      Logger.warn('Failed to hydrate space stats from InternalKv', rawError: e);
       _spaceStatsHydrateFuture = null;
-      if (_dataStore.isInitialized && !_dataStore.isClosing) {
-        _spaceStatsHydrated = true;
+      if (_isSpaceStatsWorkAborted || e is DbClosedException) {
+        // close / switchSpace race — silent.
+      } else {
+        Logger.warn('Failed to hydrate space stats from InternalKv',
+            rawError: e);
+        if (_dataStore.isInitialized && !_dataStore.isClosing) {
+          _spaceStatsHydrated = true;
+        }
       }
     }
+  }
+
+  /// Full-reconcile cadence by table-meta row count. `null` = auto reconcile off.
+  static Duration? spaceStatsReconcileInterval(int tableCount) {
+    if (tableCount <= _spaceStatsReconcileDailyMaxTables) {
+      return const Duration(days: 1);
+    }
+    if (tableCount <= _spaceStatsReconcileWeeklyMaxTables) {
+      return const Duration(days: 7);
+    }
+    if (tableCount > _spaceStatsReconcileDisableTableCount) return null;
+    return const Duration(days: 30);
+  }
+
+  /// One-shot (missing index baseline) or due periodic drift reconcile.
+  ///
+  /// Concurrent callers may race the cheap policy checks; the full scan is
+  /// coalesced by [_recalculateAllStatisticsFuture].
+  Future<void> _maybeReconcileSpaceStats() async {
+    if (_isSpaceStatsWorkAborted) return;
+    if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
+      return;
+    }
+
+    await ensureSpaceStatsHydrated();
+    if (_isSpaceStatsWorkAborted || !_spaceStatsHydrated) return;
+
+    // One-shot: never full-reconciled. Covers upgrades where JSON/table meta
+    // can supply table-data size but index occupancy was never aggregated.
+    // Sticky via [_lastStatisticsTime] so true zero-index spaces do not loop.
+    if (_lastStatisticsTime == null) {
+      await recalculateAllStatistics();
+      return;
+    }
+
+    final tableMetaManager = _dataStore.tableMetaManager;
+    if (tableMetaManager == null) return;
+
+    // O(1) `_system_table_meta` row count (includes a handful of system tables).
+    // Exact user-only filtering is not worth an inventory walk for cadence.
+    final tableCount = await getTableRecordCount(
+      tableMetaManager.bootstrapTableMetaContext(),
+    );
+    if (_isSpaceStatsWorkAborted) return;
+    final interval = spaceStatsReconcileInterval(tableCount);
+    if (interval == null) return;
+
+    final last = _lastStatisticsTime;
+    if (last == null) return;
+    if (DateTime.now().difference(last) < interval) return;
+
+    await recalculateAllStatistics();
   }
 
   void _foldSpaceStatsDeltaIntoBaseline() {
@@ -735,14 +847,29 @@ class TableDataManager {
   }
 
   /// Full meta reconcile (expensive). Replaces baseline, clears deltas, persists.
-  Future<void> recalculateAllStatistics() async {
+  Future<void> recalculateAllStatistics() {
+    final existing = _recalculateAllStatisticsFuture;
+    if (existing != null) return existing;
+    final future = _recalculateAllStatisticsBody();
+    _recalculateAllStatisticsFuture = future;
+    return future.whenComplete(() {
+      if (identical(_recalculateAllStatisticsFuture, future)) {
+        _recalculateAllStatisticsFuture = null;
+      }
+    });
+  }
+
+  Future<void> _recalculateAllStatisticsBody() async {
     try {
+      if (_isSpaceStatsWorkAborted) return;
+
       // Get all table data metadata (only user tables, excluding system tables)
       final tableMetaManager = _dataStore.tableMetaManager;
       if (tableMetaManager == null) return;
 
       final tableNames =
           await tableMetaManager.listAllTables(onlyUserTables: true);
+      if (_isSpaceStatsWorkAborted) return;
 
       int totalRecordCount = 0;
       int totalTableDataSize = 0;
@@ -755,13 +882,18 @@ class TableDataManager {
         minTokens: 1,
         label: 'TableDataManager.recalculateAllStatistics',
       );
+      if (_isSpaceStatsWorkAborted) {
+        statsLease?.release();
+        return;
+      }
       final int statsConc = (statsLease?.asConcurrency(0.3) ?? 1);
       final aggList = await ParallelProcessor.execute<
           ({int records, int tableBytes, int indexBytes})?>(
         tableNames.map((name) {
           return () async {
+            if (_isSpaceStatsWorkAborted) return null;
             final uid = await tableMetaManager.getUidByName(TableName(name));
-            if (uid == null) return null;
+            if (_isSpaceStatsWorkAborted || uid == null) return null;
             final ctx = await tableMetaManager.getTableContext(uid);
             if (ctx == null) return null;
             final meta = await getTableDataMeta(ctx.tableUid);
@@ -790,6 +922,8 @@ class TableDataManager {
         }
       }
 
+      if (_isSpaceStatsWorkAborted) return;
+
       _baselineRecordCount = totalRecordCount;
       _baselineTableDataSizeBytes = totalTableDataSize;
       _baselineIndexDataSizeBytes = totalIndexDataSize;
@@ -797,13 +931,17 @@ class TableDataManager {
       _deltaTableDataSizeBytes = 0;
       _deltaIndexDataSizeBytes = 0;
       _spaceStatsHydrated = true;
+      // Stamp only on full reconcile (index baseline included, may be 0).
       _lastStatisticsTime = DateTime.now();
 
       await _persistSpaceStatsToKv();
 
       Logger.debug(
           'Table statistics calculation completed: record count=$totalRecordCount, table data=${totalTableDataSize / 1024 / 1024}MB, index data=${totalIndexDataSize / 1024 / 1024}MB');
+    } on DbClosedException {
+      // close / switchSpace race — best-effort, no log.
     } catch (e) {
+      if (_isSpaceStatsWorkAborted || e is DbClosedException) return;
       Logger.error('Failed to calculate table statistics', rawError: e);
     }
   }
@@ -821,7 +959,6 @@ class TableDataManager {
     try {
       await ensureSpaceStatsHydrated();
       if (!_canPersistSpaceStatsKv) return;
-      _lastStatisticsTime = DateTime.now();
       final snapshot = _spaceStatsSnapshot();
       await TransactionContext.runAsSystemOperation(() async {
         await _dataStore.internalKv.set(
@@ -835,6 +972,7 @@ class TableDataManager {
     } on DbClosedException {
       // Shutdown race — stats are best-effort.
     } catch (e) {
+      if (_isSpaceStatsWorkAborted || e is DbClosedException) return;
       Logger.error('Failed to save space stats', rawError: e);
     } finally {
       _persistingSpaceStats = false;
@@ -980,6 +1118,7 @@ class TableDataManager {
         ExecuteInterval.seconds3, TimeBasedIdGenerator.periodicPoolCheck);
     CrontabManager.removeCallback(
         ExecuteInterval.seconds30, _onSpaceStatsPersistTick);
+    _unregisterSpaceStatsReconcileCron();
 
     try {
       if (persistChanges) {
@@ -1026,6 +1165,7 @@ class TableDataManager {
       _lastStatisticsTime = null;
       _spaceStatsHydrated = false;
       _spaceStatsHydrateFuture = null;
+      _recalculateAllStatisticsFuture = null;
       _needSaveStats = false;
     } catch (e) {
       Logger.error('Failed to dispose TableDataManager', rawError: e);
