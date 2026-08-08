@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import '../handler/logger.dart';
 import '../handler/txn_encoder.dart';
 import '../handler/txn_meta_codec.dart';
@@ -37,8 +39,10 @@ class TransactionManager {
   // Track per-transaction write-set for SSI: txId -> { tableUid -> Set<pk> }
   final Map<String, Map<String, Set<String>>> _txnWriteSets =
       <String, Map<String, Set<String>>>{};
+  // Active serializable transactions: txId -> startedAtMs (watermark source)
+  final Map<String, int> _activeSsiStartMs = <String, int>{};
   // Recently committed write index for SSI: [tableUid, pk] -> lastCommitTimeMillis
-  // Using TreeCache for automatic LRU eviction in large-scale data scenarios
+  // Retained only while SSI txs are active; trimmed by oldest startMs + FIFO cap
   late final TreeCache<int> _recentCommittedWrites;
 
   // In-memory log size cache to avoid frequent filesystem size calls
@@ -70,6 +74,9 @@ class TransactionManager {
   bool _cleanupRunning = false;
   Function()? _cleanupCallback;
 
+  /// Serializes SSI index merge/clear/watermark trim (FIFO auto-evict is internal).
+  Future<void>? _ssiIndexLock;
+
   /// Dispose transaction manager and remove crontab callbacks
   void dispose() {
     if (_cleanupCallback != null) {
@@ -81,6 +88,7 @@ class TransactionManager {
     _activeTransactions.clear();
     _txnStatusCache.clear();
     _txnWriteSets.clear();
+    _activeSsiStartMs.clear();
     _recentCommittedWrites.clear();
     _logSizeCache?.clear();
     _txnHeavyDeletes.clear();
@@ -102,6 +110,12 @@ class TransactionManager {
         if (_txnStatusCache.length > 20000) {
           _txnStatusCache.clear();
         }
+      } catch (_) {}
+
+      // SSI index: drop entries older than oldest active SSI start (safe reclaim).
+      // Capacity bounding is TreeCache fifo auto-eviction on put — do not duplicate.
+      try {
+        await _withSsiIndexLock(_trimSsiIndexByWatermark);
       } catch (_) {}
 
       // Drop large log size cache to bound memory
@@ -184,20 +198,18 @@ class TransactionManager {
     }
     _mainMetaCache ??= TransactionMainMeta();
 
-    // Initialize TreeCache for recent committed writes (SSI index)
-    // Key format: [tableUid, pk], Value: lastCommitTimeMillis (int)
-    // Using TreeCache for automatic LRU eviction in large-scale data scenarios
+    // SSI recent-committed write index: [tableUid, pk] -> lastCommitTimeMillis
+    // Capacity: TreeCache fifo auto-evict. Safe reclaim: periodic watermark trim.
     final resourceManager = _dataStore.resourceManager;
     final cacheSize = resourceManager?.getMetaCacheSize() ?? (32 * 1024 * 1024);
-    // Allocate 10% of meta cache for transaction SSI index
+    // Allocate up to 10% of meta cache; floor keeps small devices responsive
     final int maxBytes = (cacheSize * 0.10).toInt();
     _recentCommittedWrites = TreeCache<int>(
-      sizeCalculator: (_) => 8, // int timestamp = 8 bytes
+      sizeCalculator: (_) => 64, // fallback; put() passes key-aware size
       maxByteThreshold: maxBytes,
       minByteThreshold: 10 * 1024 * 1024, // 10MB minimum
       groupDepth: 1, // Group by tableUid
-      evictionMode:
-          TreeCacheEvictionMode.none, // Resident; equality-critical SSI path
+      evictionMode: TreeCacheEvictionMode.fifo,
       debugLabel: 'RecentCommittedWrites',
     );
 
@@ -265,7 +277,7 @@ class TransactionManager {
       // No persistence / recovery artifacts in memory mode.
       _activeTransactions.remove(transactionId);
       _txnStatusCache[transactionId] = true;
-      _txnWriteSets.remove(transactionId);
+      await _mergeWriteSetIntoSsiIndex(transactionId);
       _txnHeavyDeletes.remove(transactionId);
       _txnHeavyUpdates.remove(transactionId);
       _txnCascadeDeletes.remove(transactionId);
@@ -354,20 +366,7 @@ class TransactionManager {
     _activeTransactions.remove(transactionId);
     // Update cache for quick visibility checks
     _txnStatusCache[transactionId] = true;
-    // Merge this tx's write-set into recent committed index
-    try {
-      final writesByTable = _txnWriteSets.remove(transactionId);
-      if (writesByTable != null) {
-        final nowMs = DateTime.now().millisecondsSinceEpoch;
-        writesByTable.forEach((tableUid, keys) {
-          for (final k in keys) {
-            // Use TreeCache: key format [tableUid, pk], value: timestamp
-            // TreeCache automatically handles LRU eviction when size exceeds threshold
-            _recentCommittedWrites.put([tableUid, k], nowMs);
-          }
-        });
-      }
-    } catch (_) {}
+    await _mergeWriteSetIntoSsiIndex(transactionId);
 
     // Opportunistic cleanup of caches to avoid growth
     if (_activeTransactions.isEmpty) {
@@ -1108,6 +1107,7 @@ class TransactionManager {
       _activeTransactions.remove(transactionId);
       _txnStatusCache[transactionId] = false;
       _txnWriteSets.remove(transactionId);
+      await _releaseSsiWatcher(transactionId);
       _txnHeavyDeletes.remove(transactionId);
       _txnHeavyUpdates.remove(transactionId);
       _txnCascadeDeletes.remove(transactionId);
@@ -1144,6 +1144,7 @@ class TransactionManager {
     // Update cache for quick visibility checks
     _txnStatusCache[transactionId] = false;
     _txnWriteSets.remove(transactionId);
+    await _releaseSsiWatcher(transactionId);
 
     // Opportunistic cleanup of caches to avoid growth
     if (_activeTransactions.isEmpty) {
@@ -1168,6 +1169,118 @@ class TransactionManager {
     } catch (_) {
       // Ignore errors during cleanup
     }
+  }
+
+  /// Register an active serializable transaction for SSI write-index retention.
+  void registerActiveSsiTransaction(String txId, int startedAtMs) {
+    _activeSsiStartMs[txId] = startedAtMs;
+  }
+
+  /// Unregister SSI watcher (idempotent). Safe from commit/rollback/finally.
+  void unregisterActiveSsiTransaction(String txId) {
+    _activeSsiStartMs.remove(txId);
+  }
+
+  /// Oldest active SSI start time, or null when no SSI transaction is open.
+  int? get oldestActiveSsiStartMs {
+    if (_activeSsiStartMs.isEmpty) return null;
+    int? oldest;
+    for (final ms in _activeSsiStartMs.values) {
+      if (oldest == null || ms < oldest) oldest = ms;
+    }
+    return oldest;
+  }
+
+  /// Estimate bytes for one SSI index entry (value + key path overhead).
+  int _estimateSsiWriteIndexEntryBytes(String tableUid, String pk) {
+    // int timestamp + List/entry overhead + UTF-16-ish string payloads
+    return 64 + (tableUid.length + pk.length) * 2;
+  }
+
+  Future<void> _withSsiIndexLock(Future<void> Function() action) async {
+    while (_ssiIndexLock != null) {
+      await _ssiIndexLock;
+    }
+    final completer = Completer<void>();
+    _ssiIndexLock = completer.future;
+    try {
+      await action();
+    } finally {
+      completer.complete();
+      if (identical(_ssiIndexLock, completer.future)) {
+        _ssiIndexLock = null;
+      }
+    }
+  }
+
+  /// Unregister SSI watcher; O(1) clear index when nobody is watching.
+  Future<void> _releaseSsiWatcher(String txId) async {
+    unregisterActiveSsiTransaction(txId);
+    if (_activeSsiStartMs.isNotEmpty) return;
+    try {
+      await _withSsiIndexLock(() async {
+        if (_activeSsiStartMs.isEmpty && _recentCommittedWrites.length > 0) {
+          _recentCommittedWrites.clear();
+        }
+      });
+    } catch (_) {}
+  }
+
+  /// Merge committed write-set into SSI index when other SSI txs are watching.
+  ///
+  /// Only publishes keys on the commit path. Capacity eviction is TreeCache
+  /// fifo (`_maybeScheduleCleanup` on put). Safe stale reclaim is periodic
+  /// watermark trim — not duplicated here.
+  Future<void> _mergeWriteSetIntoSsiIndex(String transactionId) async {
+    unregisterActiveSsiTransaction(transactionId);
+    try {
+      await _withSsiIndexLock(() async {
+        final writesByTable = _txnWriteSets.remove(transactionId);
+        if (_activeSsiStartMs.isEmpty) {
+          if (_recentCommittedWrites.length > 0) {
+            _recentCommittedWrites.clear();
+          }
+          return;
+        }
+        if (writesByTable == null || writesByTable.isEmpty) return;
+
+        final nowMs = DateTime.now().millisecondsSinceEpoch;
+        final yieldController = YieldController('txn_ssi_merge_writes');
+        for (final entry in writesByTable.entries) {
+          final tableUid = entry.key;
+          for (final k in entry.value) {
+            final y = yieldController.maybeYield();
+            if (y != null) await y;
+            // put() may trigger TreeCache fifo auto-eviction when over budget
+            _recentCommittedWrites.put(
+              [tableUid, k],
+              nowMs,
+              size: _estimateSsiWriteIndexEntryBytes(tableUid, k),
+            );
+          }
+        }
+      });
+    } catch (_) {}
+  }
+
+  /// Drop index entries that cannot affect any open SSI transaction.
+  ///
+  /// Conflict rule: `lastCommitMs > txStartMs`. Thus `commitMs <= oldestStart`
+  /// is safe to delete. This is not the same as fifo (fifo may drop keys still
+  /// needed by a long-lived SSI reader).
+  Future<void> _trimSsiIndexByWatermark() async {
+    if (_activeSsiStartMs.isEmpty) {
+      if (_recentCommittedWrites.length > 0) {
+        _recentCommittedWrites.clear();
+      }
+      return;
+    }
+    final watermark = oldestActiveSsiStartMs;
+    if (watermark == null) return;
+    await _recentCommittedWrites.removeWhere(
+      (_, commitMs) => commitMs <= watermark,
+      yieldLabel: 'txn_ssi_watermark_trim',
+    );
   }
 
   /// Register a write key (table, primaryKey) for current transaction (used by SSI)

@@ -87,7 +87,7 @@ class TreeCache<T> {
 
   /// Eviction policy (default [TreeCacheEvictionMode.lru]).
   ///
-  /// - [TreeCacheEvictionMode.none]: resident Map-like cache (SSI / pending buffers).
+  /// - [TreeCacheEvictionMode.none]: resident Map-like cache (pending buffers).
   /// - [TreeCacheEvictionMode.lru]: touch on get/put-update moves to MRU end.
   /// - [TreeCacheEvictionMode.fifo]: order by first insert only; get does not reorder.
   final TreeCacheEvictionMode evictionMode;
@@ -337,6 +337,72 @@ class TreeCache<T> {
     _fullyCachedRoot.clear();
     _estimatedTotalSizeBytes = 0;
     _totalEntries = 0;
+  }
+
+  /// Remove entries matching [test], yielding periodically to avoid UI jank.
+  ///
+  /// Returns the number of removed entries. Safe for large caches: matches are
+  /// collected and removed per group (no full-cache snapshot).
+  ///
+  /// Does not invalidate fully-cached markers for partial group removals
+  /// (same as single-entry [remove]). Callers that need marker invalidation
+  /// should clear markers explicitly.
+  Future<int> removeWhere(
+    bool Function(List<dynamic> key, T value) test, {
+    String? yieldLabel,
+  }) async {
+    if (_totalEntries <= 0) return 0;
+
+    final groups = <_Group<T>>[];
+    _collectGroups(_groupsRoot, depth: 1, out: groups);
+    if (groups.isEmpty) return 0;
+
+    final yieldController = YieldController(
+      yieldLabel ?? 'TreeCache.removeWhere:$debugLabel',
+    );
+    int removedTotal = 0;
+
+    for (final g in groups) {
+      if (g.entryCount <= 0) continue;
+
+      final matches = <_CacheEntry<T>>[];
+      g.forEachEntry((entry) {
+        if (test(entry.key, entry.value)) {
+          matches.add(entry);
+        }
+      });
+      if (matches.isEmpty) continue;
+
+      for (final entry in matches) {
+        final y = yieldController.maybeYield();
+        if (y != null) await y;
+
+        final removedEntry = g.pointRemove(entry.key);
+        if (removedEntry == null) continue;
+        if (!identical(entry, removedEntry)) {
+          g.detach(entry);
+        }
+        g.detach(removedEntry);
+        g.syncOrderedRemove(removedEntry);
+        g.totalBytes -= removedEntry.sizeBytes;
+        g.entryCount--;
+        _estimatedTotalSizeBytes -= removedEntry.sizeBytes;
+        _totalEntries--;
+        removedTotal++;
+      }
+
+      if (g.entryCount <= 0 && g.pinCount <= 0) {
+        _removeEmptyGroup(g.groupPath);
+      }
+    }
+
+    if (removedTotal > 0) {
+      Logger.debug(
+        '[$debugLabel] removeWhere removed=$removedTotal '
+        'entries=$_totalEntries bytes=$_estimatedTotalSizeBytes',
+      );
+    }
+    return removedTotal;
   }
 
   /// Rename group prefix from [oldGroupKey] to [newGroupKey] in O(1) group move.

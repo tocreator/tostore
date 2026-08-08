@@ -3913,6 +3913,14 @@ class DataStoreImpl {
     await ensureInitialized();
     final txId = await transactionManager!.beginTransaction();
     final started = DateTime.now();
+    final effectiveIsolation =
+        isolation ?? config.defaultTransactionIsolationLevel;
+    final bool isSerializable =
+        effectiveIsolation == TransactionIsolationLevel.serializable;
+    if (isSerializable) {
+      transactionManager!
+          .registerActiveSsiTransaction(txId, started.millisecondsSinceEpoch);
+    }
     bool logFlushed = false;
     try {
       final result = await runZoned(() async {
@@ -3922,8 +3930,7 @@ class DataStoreImpl {
             tableDataManager.ensureTransactionWithinResourceLimits(txId);
             await Future.sync(action);
             // If SSI, check conflicts before applying commit
-            if ((isolation ?? config.defaultTransactionIsolationLevel) ==
-                TransactionIsolationLevel.serializable) {
+            if (isSerializable) {
               final readKeys = TransactionContext.getReadKeys();
               final conflicts = await transactionManager!
                   .checkSerializableConflictsTransactional(
@@ -4000,8 +4007,7 @@ class DataStoreImpl {
         // track touched paths during this transaction
         TransactionContext.touchedPathsKey: <String>{},
         TransactionContext.currentTxIdKey: txId,
-        TransactionContext.isolationLevelKey:
-            isolation ?? config.defaultTransactionIsolationLevel,
+        TransactionContext.isolationLevelKey: effectiveIsolation,
         TransactionContext.acquiredExclusiveLocksKey: <String, String>{},
         TransactionContext.readKeysKey: <TableUid, Set<String>>{},
       });
@@ -4047,6 +4053,11 @@ class DataStoreImpl {
         finishedAt: finished,
         statuses: statuses,
       );
+    } finally {
+      // Idempotent: commit/rollback already unregister; covers early failures.
+      if (isSerializable) {
+        transactionManager?.unregisterActiveSsiTransaction(txId);
+      }
     }
   }
 
