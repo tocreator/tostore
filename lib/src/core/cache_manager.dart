@@ -2,7 +2,6 @@ import 'dart:async';
 
 import '../handler/logger.dart';
 import '../model/table_context.dart';
-import '../model/table_statistics.dart';
 import 'data_store_impl.dart';
 import 'resource_manager.dart';
 
@@ -10,9 +9,6 @@ import 'resource_manager.dart';
 ///
 final class CacheManager {
   final DataStoreImpl _dataStore;
-
-  // Lightweight stats cache
-  final Map<String, TableStatistics> _statsCache = <String, TableStatistics>{};
 
   // Coalesced query-cache invalidation (generation bump in QueryExecutor).
   final Set<String> _pendingQueryInvalidations = <String>{};
@@ -122,16 +118,6 @@ final class CacheManager {
     });
   }
 
-  // -------------------- Statistics cache --------------------
-
-  void cacheStatistics(TableContext table, TableStatistics stats) {
-    _statsCache[table.tableUid] = stats;
-  }
-
-  TableStatistics? getStatistics(TableContext table) {
-    return _statsCache[table.tableUid];
-  }
-
   // -------------------- Space / lifecycle --------------------
 
   /// Clear in-memory caches synchronously (used on close).
@@ -149,7 +135,6 @@ final class CacheManager {
     _dataStore.indexTreePartitionManager?.clearPageCacheSync();
     _dataStore.weightManager?.clearMemory();
     _dataStore.clearAllTtlPlanCache();
-    _statsCache.clear();
 
     Logger.debug('Clear all cache');
   }
@@ -173,8 +158,6 @@ final class CacheManager {
   }) async {
     final tableName = table.tableName;
     try {
-      _statsCache.remove(table.tableUid);
-
       if (invalidateRecords) {
         await _dataStore.tableDataManager.clearTableRecordsForTable(table);
       } else if (invalidateRecordCount) {

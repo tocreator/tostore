@@ -3,9 +3,6 @@ class SpaceInfo {
   /// Name of the space
   final String spaceName;
 
-  /// Number of tables in the schema inventory
-  final int tableCount;
-
   /// Total number of records across all tables in this space
   final int totalRecordCount;
 
@@ -18,13 +15,9 @@ class SpaceInfo {
   /// Last time statistics were updated
   final DateTime? lastStatisticsTime;
 
-  /// Tables in the schema inventory
-  final List<String> tables;
-
   /// Create a new SpaceInfo instance
   const SpaceInfo({
     required this.spaceName,
-    this.tableCount = 0,
     int totalRecordCount = 0,
     @Deprecated('Use totalRecordCount instead') int? recordCount,
     int totalTableDataSizeBytes = 0,
@@ -32,7 +25,6 @@ class SpaceInfo {
     @Deprecated('Use totalTableDataSizeBytes or totalSizeBytes instead')
     int? dataSizeBytes,
     this.lastStatisticsTime,
-    this.tables = const [],
   })  : totalRecordCount = recordCount ?? totalRecordCount,
         totalTableDataSizeBytes = dataSizeBytes ?? totalTableDataSizeBytes;
 
@@ -52,7 +44,6 @@ class SpaceInfo {
   Map<String, dynamic> toJson() {
     return {
       'spaceName': spaceName,
-      'tableCount': tableCount,
       'totalRecordCount': totalRecordCount,
       'totalTableDataSizeBytes': totalTableDataSizeBytes,
       'totalIndexDataSizeBytes': totalIndexDataSizeBytes,
@@ -61,7 +52,6 @@ class SpaceInfo {
       'recordCount': totalRecordCount,
       'dataSizeBytes': totalTableDataSizeBytes,
       'lastStatisticsTime': lastStatisticsTime?.toIso8601String(),
-      'tables': tables,
     };
   }
 }

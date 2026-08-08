@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
+
 import 'package:path/path.dart' as path;
+
 import '../core/btree_page.dart';
 import '../core/data_store_impl.dart';
 import '../core/wal_manager.dart';
@@ -10,19 +12,18 @@ import '../handler/meta_binary_codec.dart';
 import '../handler/table_meta_codec.dart';
 import '../model/db_exception.dart';
 import '../model/global_config.dart';
+import '../model/id_generator.dart';
+import '../model/meta_info.dart';
+import '../model/ngh_index_meta.dart';
 import '../model/parallel_journal_entry.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/system_table.dart';
-import '../model/table_schema.dart';
 import '../model/table_identity.dart';
 import '../model/table_meta.dart';
-import '../model/table_context.dart';
-import '../model/meta_info.dart';
-import '../model/ngh_index_meta.dart';
-import '../model/id_generator.dart';
-import 'config_format_migration.dart';
+import '../model/table_schema.dart';
 import 'applied_encryption_bootstrap.dart';
+import 'config_format_migration.dart';
 import 'legacy_model/pre_v3.dart';
 import 'meta_format_migration.dart';
 import 'migration_format_migration.dart';
@@ -159,7 +160,7 @@ class V3Upgrade {
 
     // Read legacy JSON config mappings before bootstrap (needed to sample
     // btreePageSize). Maps must stay on disk until finalize.
-    // Hot-path GlobalConfig model no longer carries tableDirectoryMap — read raw JSON.
+    // Hot-path GlobalConfig model no longer carries tableDirectoryMap - read raw JSON.
     final globalJson =
         await LegacyConfigBootstrap.readGlobalJsonMap(_dataStore);
     final globalTableDirMap = globalJson != null
@@ -451,7 +452,7 @@ class V3Upgrade {
       'Database upgrade to version 3 completed',
     );
 
-    // Non-blocking: legacy weight JSON → internal KV (formal path never reads JSON).
+    // Non-blocking: legacy weight JSON - internal KV (formal path never reads JSON).
     unawaited(
       WeightFormatMigration.migrateAsync(
         _dataStore,
@@ -533,15 +534,7 @@ class V3Upgrade {
       layoutOverride: layout,
     );
 
-    final tableCtx = TableContext(
-      tableUid: saved.tableUid,
-      tableName: saved.tableName,
-      isGlobal: saved.isGlobal,
-      dirIndex: saved.dirIndex,
-      schema: saved.schema,
-    );
     // Index files/meta are created lazily on first write via writeChanges.
-    _dataStore.tableDataManager.tableCreated(tableCtx);
     return saved;
   }
 
@@ -677,7 +670,7 @@ class V3Upgrade {
       }
     }
 
-    // Remnant A/B files only — page_redo_* stays under the same root.
+    // Remnant A/B files only - page_redo_* stays under the same root.
     final redoRoot =
         _dataStore.pathManager.getParallelJournalRootPath(spaceName: spaceName);
     try {
@@ -811,7 +804,7 @@ class V3Upgrade {
       indexUidMap: indexUidMap,
     );
 
-    // Legacy sidecar unused by btree maxAutoIncrementId — async delete after bump.
+    // Legacy sidecar unused by btree maxAutoIncrementId - async delete after bump.
     _scheduleLegacyFileDelete(path.join(newPath, 'maxid.txt'));
   }
 
@@ -858,8 +851,8 @@ class V3Upgrade {
 
   /// Resolve and persist [GlobalConfig.pageSize] before bootstrap createTable.
   ///
-  /// Order: already-configured cache → [oldGlobalConfig] → sample legacy
-  /// meta.json (rename-前 paths via directory maps) → [InternalConfig.defaultPageSize].
+  /// Order: already-configured cache [oldGlobalConfig] sample legacy
+  /// meta.json (rename-→ paths via directory maps) → [InternalConfig.defaultPageSize].
   /// Persists only while unset (`copyWith` refuses to change a set pageSize).
   Future<void> _primePageSizeBeforeBootstrap({
     required GlobalConfig oldGlobalConfig,
@@ -1226,7 +1219,7 @@ class V3Upgrade {
   ///
   /// jsonDecode nested maps are often `Map<dynamic, dynamic>`, so a strict
   /// `is Map<String, dynamic>` check would miss valid entries and fall back
-  /// to dirIndex 0 — looking up the wrong table directory.
+  /// to dirIndex 0 - looking up the wrong table directory.
   static int? _legacyDirIndex(dynamic entry) {
     if (entry is! Map) return null;
     final raw = entry['dirIndex'];

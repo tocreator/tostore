@@ -5,11 +5,10 @@ import 'binary_codec.dart';
 
 /// Stable field IDs for [SpaceStats] KV payload. Never reuse IDs.
 abstract final class SpaceStatsFieldId {
-  static const int totalTableCount = 1;
-  static const int totalRecordCount = 2;
-  static const int totalTableDataSizeBytes = 3;
+  static const int totalRecordCount = 1;
+  static const int totalTableDataSizeBytes = 2;
+  static const int totalIndexDataSizeBytes = 3;
   static const int lastStatisticsTime = 4;
-  static const int totalIndexDataSizeBytes = 5;
 }
 
 /// Binary payload codec for [SpaceStats] (InternalKv value, no file shell).
@@ -17,10 +16,8 @@ final class SpaceStatsCodec {
   SpaceStatsCodec._();
 
   static Uint8List encode(SpaceStats stats) {
-    final w = BinaryWriter(initialCapacity: 56);
+    final w = BinaryWriter(initialCapacity: 48);
 
-    w.writeFieldTag(SpaceStatsFieldId.totalTableCount, WireType.varint);
-    w.writeVarint(stats.totalTableCount);
     w.writeFieldTag(SpaceStatsFieldId.totalRecordCount, WireType.varint);
     w.writeVarint(stats.totalRecordCount);
     w.writeFieldTag(SpaceStatsFieldId.totalTableDataSizeBytes, WireType.varint);
@@ -37,7 +34,6 @@ final class SpaceStatsCodec {
   }
 
   static SpaceStats decode(Uint8List bytes) {
-    var totalTableCount = 0;
     var totalRecordCount = 0;
     var totalTableDataSizeBytes = 0;
     var totalIndexDataSizeBytes = 0;
@@ -48,9 +44,6 @@ final class SpaceStatsCodec {
       while (!r.isEOF) {
         final (fieldId, wireType) = r.readFieldTag();
         switch (fieldId) {
-          case SpaceStatsFieldId.totalTableCount:
-            totalTableCount = r.readVarint();
-            break;
           case SpaceStatsFieldId.totalRecordCount:
             totalRecordCount = r.readVarint();
             break;
@@ -72,7 +65,6 @@ final class SpaceStatsCodec {
     }
 
     return SpaceStats(
-      totalTableCount: totalTableCount,
       totalRecordCount: totalRecordCount,
       totalTableDataSizeBytes: totalTableDataSizeBytes,
       totalIndexDataSizeBytes: totalIndexDataSizeBytes,

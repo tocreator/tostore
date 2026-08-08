@@ -119,15 +119,13 @@ class TableDataManager {
   //
   // Model: effective = baseline + sessionDelta
   // - baseline: loaded once from KV (or set by full recalculate / persist fold)
-  // - delta: user-table create/insert/delete/clear in this session
+  // - delta: user-table insert/delete/clear / size deltas in this session
   // KV is never re-applied after first hydrate (avoids stale disk clobbering
   // live memory). System/internal tables never touch these counters.
   // ---------------------------------------------------------------------------
-  int _baselineTableCount = 0;
   int _baselineRecordCount = 0;
   int _baselineTableDataSizeBytes = 0;
   int _baselineIndexDataSizeBytes = 0;
-  int _deltaTableCount = 0;
   int _deltaRecordCount = 0;
   int _deltaTableDataSizeBytes = 0;
   int _deltaIndexDataSizeBytes = 0;
@@ -584,8 +582,6 @@ class TableDataManager {
 
   // -------------------- SpaceStats (KV-backed aggregates) --------------------
 
-  int get _effectiveTableCount =>
-      max(0, _baselineTableCount + _deltaTableCount);
   int get _effectiveRecordCount =>
       max(0, _baselineRecordCount + _deltaRecordCount);
   int get _effectiveTableDataSizeBytes =>
@@ -594,7 +590,6 @@ class TableDataManager {
       max(0, _baselineIndexDataSizeBytes + _deltaIndexDataSizeBytes);
 
   SpaceStats _spaceStatsSnapshot() => SpaceStats(
-        totalTableCount: _effectiveTableCount,
         totalRecordCount: _effectiveRecordCount,
         totalTableDataSizeBytes: _effectiveTableDataSizeBytes,
         totalIndexDataSizeBytes: _effectiveIndexDataSizeBytes,
@@ -659,7 +654,6 @@ class TableDataManager {
       if (!_spaceStatsHydrated) {
         final stats =
             bytes == null ? SpaceStats.empty : SpaceStatsCodec.decode(bytes);
-        _baselineTableCount = stats.totalTableCount;
         _baselineRecordCount = stats.totalRecordCount;
         _baselineTableDataSizeBytes = stats.totalTableDataSizeBytes;
         _baselineIndexDataSizeBytes = stats.totalIndexDataSizeBytes;
@@ -678,11 +672,9 @@ class TableDataManager {
   }
 
   void _foldSpaceStatsDeltaIntoBaseline() {
-    _baselineTableCount = _effectiveTableCount;
     _baselineRecordCount = _effectiveRecordCount;
     _baselineTableDataSizeBytes = _effectiveTableDataSizeBytes;
     _baselineIndexDataSizeBytes = _effectiveIndexDataSizeBytes;
-    _deltaTableCount = 0;
     _deltaRecordCount = 0;
     _deltaTableDataSizeBytes = 0;
     _deltaIndexDataSizeBytes = 0;
@@ -752,7 +744,6 @@ class TableDataManager {
       final tableNames =
           await tableMetaManager.listAllTables(onlyUserTables: true);
 
-      int tableCount = tableNames.length;
       int totalRecordCount = 0;
       int totalTableDataSize = 0;
       int totalIndexDataSize = 0;
@@ -799,11 +790,9 @@ class TableDataManager {
         }
       }
 
-      _baselineTableCount = tableCount;
       _baselineRecordCount = totalRecordCount;
       _baselineTableDataSizeBytes = totalTableDataSize;
       _baselineIndexDataSizeBytes = totalIndexDataSize;
-      _deltaTableCount = 0;
       _deltaRecordCount = 0;
       _deltaTableDataSizeBytes = 0;
       _deltaIndexDataSizeBytes = 0;
@@ -813,7 +802,7 @@ class TableDataManager {
       await _persistSpaceStatsToKv();
 
       Logger.debug(
-          'Table statistics calculation completed: table count=$tableCount, record count=$totalRecordCount, table data=${totalTableDataSize / 1024 / 1024}MB, index data=${totalIndexDataSize / 1024 / 1024}MB');
+          'Table statistics calculation completed: record count=$totalRecordCount, table data=${totalTableDataSize / 1024 / 1024}MB, index data=${totalIndexDataSize / 1024 / 1024}MB');
     } catch (e) {
       Logger.error('Failed to calculate table statistics', rawError: e);
     }
@@ -1028,11 +1017,9 @@ class TableDataManager {
       _tablePartitionSizes.clear();
       _tableFlushingFlags.clear();
       _pkComparators.clear();
-      _baselineTableCount = 0;
       _baselineRecordCount = 0;
       _baselineTableDataSizeBytes = 0;
       _baselineIndexDataSizeBytes = 0;
-      _deltaTableCount = 0;
       _deltaRecordCount = 0;
       _deltaTableDataSizeBytes = 0;
       _deltaIndexDataSizeBytes = 0;
@@ -1855,11 +1842,6 @@ class TableDataManager {
     );
   }
 
-  /// get total table count
-  int getTotalTableCount() {
-    return _effectiveTableCount;
-  }
-
   /// get total record count
   int getTotalRecordCount() {
     return _effectiveRecordCount;
@@ -1885,16 +1867,7 @@ class TableDataManager {
     _needSaveStats = true;
   }
 
-  /// table created, update stats
-  /// Only counts user tables, excluding system tables
-  void tableCreated(TableContext table) {
-    if (!_contributesToSpaceStats(table)) return;
-    _deltaTableCount++;
-    _needSaveStats = true;
-  }
-
-  /// table deleted, update stats
-  /// Only counts user tables, excluding system tables
+  /// table deleted
   Future<void> tableDeleted(TableContext table) async {
     try {
       if (!_contributesToSpaceStats(table)) return;
@@ -1909,7 +1882,6 @@ class TableDataManager {
         _deltaIndexDataSizeBytes -= indexBytes;
       }
 
-      _deltaTableCount--;
       _tableRecordCounts.remove(table.tableUid);
       _needSaveStats = true;
     } catch (e) {

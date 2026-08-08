@@ -1,6 +1,4 @@
 import '../model/table_identity.dart';
-import '../model/table_context.dart';
-import 'cost_estimator.dart';
 
 /// query plan
 class QueryPlan {
@@ -21,21 +19,6 @@ class QueryPlan {
   @override
   String toString() {
     return 'QueryPlan(operation: ${operation.toString()}, naturalOrderBy: $naturalOrderBy)';
-  }
-
-  /// estimate execution cost
-  double estimateCost(CostEstimator estimator) {
-    return estimator.estimateCost(this);
-  }
-
-  /// get estimated number of rows
-  int estimatedRows(CostEstimator estimator, TableContext table) {
-    final v = operation.value;
-    if (v is Map<String, dynamic>) {
-      final where = v['where'] as Map<String, dynamic>?;
-      return estimator.estimateCardinality(table, where);
-    }
-    return estimator.estimateCardinality(table, null);
   }
 
   /// get query plan description

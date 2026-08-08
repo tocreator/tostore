@@ -1455,9 +1455,6 @@ class DataStoreImpl {
               .updateSystemTableForTable(tableCtx, resolvedSchema);
         }
 
-        // New table created successfully, call table creation statistics method
-        tableDataManager.tableCreated(tableCtx);
-
         if (!resolvedSchema.isSystemTable) {
           Logger.info(
             'Table ${resolvedSchema.name} created successfully${resolvedSchema.isGlobal ? ' (global)' : ' (space)'}',
@@ -8074,18 +8071,12 @@ class DataStoreImpl {
         stats = await getSpaceStats();
       }
 
-      // Schema inventory (user tables). Record/size stats remain space-local
-      // via [SpaceStats] / path isolation - not a "touched tables" list.
-      final userTables = await getTableNames(onlyUserTables: true);
-
       return SpaceInfo(
         spaceName: _currentSpaceName,
-        tableCount: userTables.length,
         totalRecordCount: stats.totalRecordCount,
         totalTableDataSizeBytes: stats.totalTableDataSizeBytes,
         totalIndexDataSizeBytes: stats.totalIndexDataSizeBytes,
         lastStatisticsTime: stats.lastStatisticsTime,
-        tables: userTables,
       );
     } catch (e) {
       Logger.error('Failed to get space info', rawError: e);
