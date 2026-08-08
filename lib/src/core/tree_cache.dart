@@ -1,4 +1,4 @@
-﻿import 'dart:async';
+import 'dart:async';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
@@ -20,6 +20,22 @@ typedef TreeCacheWeightQueryCallback = Future<int?> Function(
 /// markers cannot express (e.g. a global "fully loaded" flag).
 typedef TreeCacheEvictedCallback = void Function(int removedCount);
 
+/// Per-instance eviction policy for [TreeCache].
+///
+/// Chosen once at construction; hot paths use derived `final bool` gates only
+/// (no per-op `switch` on this enum).
+enum TreeCacheEvictionMode {
+  /// No order list; [TreeCache.cleanup] / auto-eviction are no-ops (resident).
+  none,
+
+  /// Access/write moves entry to MRU end; cleanup pops from the oldest head.
+  lru,
+
+  /// Insertion-order (FIFO): get does not reorder; in-place put keeps position;
+  /// cleanup pops from the oldest head (earliest [TreeCache.put] first).
+  fifo,
+}
+
 /// A high-performance hierarchical cache.
 ///
 /// Key model:
@@ -34,8 +50,9 @@ typedef TreeCacheEvictedCallback = void Function(int removedCount);
 /// - A **lazy B+Tree ordered view** is rebuilt on demand for [scanRange] (shared
 ///   [_CacheEntry] references — values are never duplicated). Once warm, inserts
 ///   and removes keep the view in sync incrementally.
-/// - Eviction uses **group-level weights** (optional) + **entry-level LRU** when
-///   [enableLru] is true.
+/// - Eviction (when [evictionMode] is not [TreeCacheEvictionMode.none]) uses
+///   optional **group-level weights** + an **entry-level order list**
+///   ([TreeCacheEvictionMode.lru] or [TreeCacheEvictionMode.fifo]).
 class TreeCache<T> {
   final TreeCacheSizeCalculator<T> sizeCalculator;
 
@@ -68,11 +85,18 @@ class TreeCache<T> {
   /// Not invoked for single-entry [remove] / [clear] (callers own those).
   final TreeCacheEvictedCallback? onEvicted;
 
-  /// When `false`, skips LRU list maintenance and automatic/manual eviction.
+  /// Eviction policy (default [TreeCacheEvictionMode.lru]).
   ///
-  /// Use for caches that must stay resident and need Map-like equality speed
-  /// (e.g. pending unique-check buffers, transaction SSI indexes).
-  final bool enableLru;
+  /// - [TreeCacheEvictionMode.none]: resident Map-like cache (SSI / pending buffers).
+  /// - [TreeCacheEvictionMode.lru]: touch on get/put-update moves to MRU end.
+  /// - [TreeCacheEvictionMode.fifo]: order by first insert only; get does not reorder.
+  final TreeCacheEvictionMode evictionMode;
+
+  /// Derived once: maintain per-group eviction order list (`lru` / `fifo`).
+  final bool _orderEnabled;
+
+  /// Derived once: move-to-tail on touch (`lru` only).
+  final bool _reorderOnTouch;
 
   final String debugLabel;
 
@@ -102,9 +126,11 @@ class TreeCache<T> {
     this.comparatorFactory,
     this.weightQueryCallback,
     this.onEvicted,
-    this.enableLru = true,
+    this.evictionMode = TreeCacheEvictionMode.lru,
     String? debugLabel,
   })  : maxByteThreshold = math.max(maxByteThreshold, minByteThreshold),
+        _orderEnabled = evictionMode != TreeCacheEvictionMode.none,
+        _reorderOnTouch = evictionMode == TreeCacheEvictionMode.lru,
         debugLabel = debugLabel ?? 'TreeCache' {
     if (groupDepth <= 0) {
       throw DbException([
@@ -422,7 +448,7 @@ class TreeCache<T> {
   }
 
   Future<void> cleanup({double removeRatio = 0.3}) async {
-    if (!enableLru) return;
+    if (!_orderEnabled) return;
     if (removeRatio <= 0) return;
     if (removeRatio > 1) removeRatio = 1;
 
@@ -490,21 +516,21 @@ class TreeCache<T> {
         // Eviction invalidates full-cache marker for this group.
         _setFullyCached(g.groupPath, false);
 
-        while (need > 0 && g.lruHead != null) {
+        while (need > 0 && g.orderHead != null) {
           final y2 = yieldController.maybeYield();
           if (y2 != null) await y2;
 
-          final entry = g.lruHead!;
+          final entry = g.orderHead!;
 
           final removedEntry = g.pointRemove(entry.key);
           if (removedEntry == null) {
-            // Stale LRU node (not in point map). Drop from LRU only —
+            // Stale order-list node (not in point map). Drop from list only —
             // do NOT count as a successful eviction or touch byte counters.
             g.detach(entry);
             continue;
           }
 
-          // Guard: LRU head key may resolve to a different live entry object
+          // Guard: order head key may resolve to a different live entry object
           // (e.g. replaced value). Always detach the map-removed instance.
           if (!identical(entry, removedEntry)) {
             g.detach(entry);
@@ -585,7 +611,8 @@ class TreeCache<T> {
           groupPath: groupPath,
           groupDepth: groupDepth,
           firstSuffixComparator: firstSuffixComparator,
-          enableLru: enableLru,
+          orderEnabled: _orderEnabled,
+          reorderOnTouch: _reorderOnTouch,
         );
         map[comp] = group;
         return group;
@@ -800,7 +827,7 @@ class TreeCache<T> {
   }
 
   void _maybeScheduleCleanup() {
-    if (!enableLru) return;
+    if (!_orderEnabled) return;
     if (maxByteThreshold <= 0) return;
     if (_estimatedTotalSizeBytes <= maxByteThreshold) return;
     if (_cleanupLock != null) return;
@@ -819,14 +846,16 @@ class TreeCache<T> {
   }
 }
 
-// -------------------- Internal: group + entry + LRU --------------------
+// -------------------- Internal: group + entry + eviction order list --------------------
 
 final class _CacheEntry<T> {
   List<dynamic> key;
   T value;
   int sizeBytes;
-  _CacheEntry<T>? lruPrev;
-  _CacheEntry<T>? lruNext;
+
+  /// Eviction-order list links (oldest ← head … tail → newest).
+  _CacheEntry<T>? orderPrev;
+  _CacheEntry<T>? orderNext;
   _CacheEntry(this.key, this.value, this.sizeBytes);
 }
 
@@ -834,7 +863,12 @@ final class _Group<T> {
   List<dynamic> groupPath;
   final int groupDepth;
   final Comparator<dynamic> firstSuffixComparator;
-  final bool enableLru;
+
+  /// Maintain eviction order list (`lru` / `fifo`). Derived once from mode.
+  final bool orderEnabled;
+
+  /// Move-to-tail on [touch] (`lru` only). Derived once from mode.
+  final bool reorderOnTouch;
 
   /// Exact group key: `key.length == groupDepth` (e.g. scalar `tableUid`).
   ///
@@ -857,14 +891,16 @@ final class _Group<T> {
   int pinCount = 0;
   int? cachedWeight;
 
-  _CacheEntry<T>? lruHead;
-  _CacheEntry<T>? lruTail;
+  /// Eviction order: head = oldest (evict first), tail = newest.
+  _CacheEntry<T>? orderHead;
+  _CacheEntry<T>? orderTail;
 
   _Group({
     required this.groupPath,
     required this.groupDepth,
     required this.firstSuffixComparator,
-    required this.enableLru,
+    required this.orderEnabled,
+    required this.reorderOnTouch,
   });
 
   Comparator<List<dynamic>> get _pathCompare => (a, b) {
@@ -1130,44 +1166,45 @@ final class _Group<T> {
   }
 
   void attachNew(_CacheEntry<T> e) {
-    if (!enableLru) return;
-    if (lruTail == null) {
-      lruHead = e;
-      lruTail = e;
+    if (!orderEnabled) return;
+    if (orderTail == null) {
+      orderHead = e;
+      orderTail = e;
       return;
     }
-    e.lruPrev = lruTail;
-    e.lruNext = null;
-    lruTail!.lruNext = e;
-    lruTail = e;
+    e.orderPrev = orderTail;
+    e.orderNext = null;
+    orderTail!.orderNext = e;
+    orderTail = e;
   }
 
   void touch(_CacheEntry<T> e) {
-    if (!enableLru) return;
-    if (identical(e, lruTail)) return;
-    final p = e.lruPrev;
-    final n = e.lruNext;
-    if (p != null) p.lruNext = n;
-    if (n != null) n.lruPrev = p;
-    if (identical(e, lruHead)) lruHead = n;
+    // Single predictable gate: only LRU reorders; fifo/none return here.
+    if (!reorderOnTouch) return;
+    if (identical(e, orderTail)) return;
+    final p = e.orderPrev;
+    final n = e.orderNext;
+    if (p != null) p.orderNext = n;
+    if (n != null) n.orderPrev = p;
+    if (identical(e, orderHead)) orderHead = n;
 
-    e.lruPrev = lruTail;
-    e.lruNext = null;
-    if (lruTail != null) lruTail!.lruNext = e;
-    lruTail = e;
-    lruHead ??= e;
+    e.orderPrev = orderTail;
+    e.orderNext = null;
+    if (orderTail != null) orderTail!.orderNext = e;
+    orderTail = e;
+    orderHead ??= e;
   }
 
   void detach(_CacheEntry<T> e) {
-    if (!enableLru) return;
-    final p = e.lruPrev;
-    final n = e.lruNext;
-    if (p != null) p.lruNext = n;
-    if (n != null) n.lruPrev = p;
-    if (identical(e, lruHead)) lruHead = n;
-    if (identical(e, lruTail)) lruTail = p;
-    e.lruPrev = null;
-    e.lruNext = null;
+    if (!orderEnabled) return;
+    final p = e.orderPrev;
+    final n = e.orderNext;
+    if (p != null) p.orderNext = n;
+    if (n != null) n.orderPrev = p;
+    if (identical(e, orderHead)) orderHead = n;
+    if (identical(e, orderTail)) orderTail = p;
+    e.orderPrev = null;
+    e.orderNext = null;
   }
 }
 

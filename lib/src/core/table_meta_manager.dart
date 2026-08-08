@@ -1141,7 +1141,7 @@ class TableMetaManager {
 
   /// Load [TableMeta] by stable uid - the single entry for meta / routing.
   ///
-  /// 1. Hot [TreeCache] (LRU)
+  /// 1. Hot [TreeCache] (default LRU eviction)
   /// 2. If [_nameInventoryReady] and uid absent from [_nameByUid] - absent
   /// 3. Else query `_system_table_meta` (cold start, partial inventory, or
   ///    inventory hit but cache miss after eviction)
