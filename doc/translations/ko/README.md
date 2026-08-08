@@ -1289,13 +1289,14 @@ final txResult2 = await db.transaction(() async {
 - **테이블 관리**
   - `createTable(schema)`: 단일 테이블을 수동으로 생성합니다. 모듈 로딩 또는 주문형 런타임 테이블 생성에 유용합니다.
   - `getTableSchema(tableName)`: 정의된 스키마 정보를 검색합니다. 자동화된 유효성 검사 또는 UI 모델 생성에 유용합니다.
-  - `getTableInfo(tableName)`: 레코드 수, 인덱스 수, 데이터 파일 크기, 생성 시간 및 테이블이 전역인지 여부를 포함한 런타임 테이블 통계를 검색합니다.
+  - `getTableNames({isGlobal})`: 전역 schema 목록의 사용자 테이블 이름을 조회합니다. 선택 `isGlobal`: `true` 전역만, `false` 비전역만, 생략 시 모두. 비전역 스키마는 공간 간에 공유되며 데이터만 격리됩니다.
+  - `getTableInfo(tableName)`: 런타임 통계(`totalRecordCount`, `totalTableDataSizeBytes`, `totalIndexDataSizeBytes`, `indexCount`, 생성 시간, 전역 여부)를 조회합니다.
   - `clear(tableName)`: 스키마, 인덱스, 내부/외부 키 제약 조건을 안전하게 유지하면서 모든 테이블 데이터를 지웁니다.
   - `dropTable(tableName)`: 테이블과 해당 스키마를 완전히 삭제합니다. 되돌릴 수 없음
 - **공간 관리**
   - `currentSpaceName`: 현재 활성 공간을 실시간으로 가져옵니다.
   - `listSpaces()`: 현재 데이터베이스 인스턴스에 할당된 모든 공간을 나열합니다.
-  - `getSpaceInfo(useCache: true)`: 현재 공간을 감사합니다. `useCache: false`을 사용하여 캐시를 우회하고 실시간 상태를 읽습니다.
+  - `getSpaceInfo(useCache: true)`: 공간 로컬 집계(`totalRecordCount`, 테이블/인덱스 데이터 크기). `useCache: false`로 메타에서 재계산.
   - `deleteSpace(spaceName)`: `default` 및 현재 활성 공간을 제외한 특정 공간 및 해당 공간의 모든 데이터를 삭제합니다.
 - **인스턴스 검색**
   - `config`: 인스턴스에 대한 최종 유효 `DataStoreConfig` 스냅샷을 검사합니다.
@@ -1313,11 +1314,13 @@ final txResult2 = await db.transaction(() async {
 ```dart
 
 final spaces = await db.listSpaces();
+final tableNames = await db.getTableNames();
 final spaceInfo = await db.getSpaceInfo(useCache: false);
 final tableSchema = await db.getTableSchema('users');
 final tableInfo = await db.getTableInfo('users');
 
 print('spaces: $spaces');
+print('tables: $tableNames');
 print(spaceInfo.toJson());
 print(tableSchema?.toJson());
 print(tableInfo?.toJson());

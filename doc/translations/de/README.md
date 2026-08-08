@@ -1287,13 +1287,14 @@ Die folgenden APIs decken die Datenbankverwaltung, Diagnose und Wartung für die
 - **Tischverwaltung**
   - `createTable(schema)`: eine einzelne Tabelle manuell erstellen; Nützlich zum Laden von Modulen oder zum Erstellen von Laufzeittabellen bei Bedarf
   - `getTableSchema(tableName)`: Rufen Sie die definierten Schemainformationen ab; nützlich für die automatisierte Validierung oder UI-Modellgenerierung
-  - `getTableInfo(tableName)`: Laufzeittabellenstatistiken abrufen, einschließlich Datensatzanzahl, Indexanzahl, Datendateigröße, Erstellungszeit und ob die Tabelle global ist
+  - `getTableNames({isGlobal})`: Tabellennamen im globalen Schema-Inventar auflisten (Benutzertabellen). Optional `isGlobal`: `true` nur global, `false` nur nicht-global, weglassen = beide. Nicht-globale Schemas sind raumübergreifend geteilt; nur Daten sind raumisoliert.
+  - `getTableInfo(tableName)`: Laufzeitstatistiken abrufen (`totalRecordCount`, `totalTableDataSizeBytes`, `totalIndexDataSizeBytes`, `indexCount`, Erstellungszeit, ob global)
   - `clear(tableName)`: Alle Tabellendaten löschen und dabei Schema, Indizes und interne/externe Schlüsseleinschränkungen sicher beibehalten
   - `dropTable(tableName)`: Eine Tabelle und ihr Schema vollständig zerstören; nicht reversibel
 - **Raumverwaltung**
   - `currentSpaceName`: Erhalten Sie den aktuell aktiven Bereich in Echtzeit
   - `listSpaces()`: Listet alle zugewiesenen Bereiche in der aktuellen Datenbankinstanz auf
-  - `getSpaceInfo(useCache: true)`: Prüfen Sie den aktuellen Bereich; Verwenden Sie `useCache: false`, um den Cache zu umgehen und den Echtzeitstatus zu lesen
+  - `getSpaceInfo(useCache: true)`: raumlokale Aggregate (`totalRecordCount`, Tabellen-/Indexdatengröße). `useCache: false` für Meta-Reconcile.
   - `deleteSpace(spaceName)`: Löschen Sie einen bestimmten Bereich und alle seine Daten, außer `default` und den aktuell aktiven Bereich
 - **Instanzerkennung**
   - `config`: Überprüfen Sie den endgültigen gültigen `DataStoreConfig` Snapshot für die Instanz
@@ -1311,11 +1312,13 @@ Die folgenden APIs decken die Datenbankverwaltung, Diagnose und Wartung für die
 ```dart
 
 final spaces = await db.listSpaces();
+final tableNames = await db.getTableNames();
 final spaceInfo = await db.getSpaceInfo(useCache: false);
 final tableSchema = await db.getTableSchema('users');
 final tableInfo = await db.getTableInfo('users');
 
 print('spaces: $spaces');
+print('tables: $tableNames');
 print(spaceInfo.toJson());
 print(tableSchema?.toJson());
 print(tableInfo?.toJson());

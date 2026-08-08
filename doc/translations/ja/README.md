@@ -1289,13 +1289,14 @@ final txResult2 = await db.transaction(() async {
 - **テーブル管理**
   - `createTable(schema)`: 単一のテーブルを手動で作成します。モジュールのロードまたはオンデマンドのランタイムテーブル作成に役立ちます
   - `getTableSchema(tableName)`: 定義されたスキーマ情報を取得します。自動検証または UI モデル生成に役立ちます
-  - `getTableInfo(tableName)`: レコード数、インデックス数、データ ファイル サイズ、作成時間、テーブルがグローバルかどうかなどの実行時テーブル統計を取得します。
+  - `getTableNames({isGlobal})`: グローバル schema 一覧のユーザー表名を取得。任意の `isGlobal`: `true` グローバルのみ、`false` 非グローバルのみ、省略で両方。非グローバル表構造はスペース間で共有され、データのみ隔離。
+  - `getTableInfo(tableName)`: 実行時統計（`totalRecordCount`、`totalTableDataSizeBytes`、`totalIndexDataSizeBytes`、`indexCount`、作成時間、グローバル可否）を取得します。
   - `clear(tableName)`: スキーマ、インデックス、内部/外部キー制約を安全に保持しながら、すべてのテーブル データをクリアします
   - `dropTable(tableName)`: テーブルとそのスキーマを完全に破棄します。可逆的ではない
 - **スペース管理**
   - `currentSpaceName`: 現在のアクティブなスペースをリアルタイムで取得します
   - `listSpaces()`: 現在のデータベース インスタンスに割り当てられているすべてのスペースをリストします。
-  - `getSpaceInfo(useCache: true)`: 現在のスペースを監査します。 `useCache: false` を使用してキャッシュをバイパスし、リアルタイム状態を読み取ります
+  - `getSpaceInfo(useCache: true)`: スペース局所の集計（`totalRecordCount`、表/インデックスデータサイズ）。`useCache: false` でメタから再計算。
   - `deleteSpace(spaceName)`: `default` と現在のアクティブ スペースを除く、特定のスペースとそのすべてのデータを削除します
 - **インスタンスの検出**
   - `config`: インスタンスの最終的な有効な `DataStoreConfig` スナップショットを検査します。
@@ -1313,11 +1314,13 @@ final txResult2 = await db.transaction(() async {
 ```dart
 
 final spaces = await db.listSpaces();
+final tableNames = await db.getTableNames();
 final spaceInfo = await db.getSpaceInfo(useCache: false);
 final tableSchema = await db.getTableSchema('users');
 final tableInfo = await db.getTableInfo('users');
 
 print('spaces: $spaces');
+print('tables: $tableNames');
 print(spaceInfo.toJson());
 print(tableSchema?.toJson());
 print(tableInfo?.toJson());

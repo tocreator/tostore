@@ -14,14 +14,14 @@ library;
 
 import 'dart:async';
 
-import 'src/interface/chain_builder.dart';
-import 'src/interface/data_store_interface.dart';
-import 'src/interface/kv_store.dart';
-import 'src/interface/status_provider.dart';
 import 'src/chain/schema_builder.dart';
 import 'src/chain/stream_query_builder.dart';
 import 'src/core/data_store_impl.dart';
 import 'src/handler/logger.dart';
+import 'src/interface/chain_builder.dart';
+import 'src/interface/data_store_interface.dart';
+import 'src/interface/kv_store.dart';
+import 'src/interface/status_provider.dart';
 import 'src/model/backup_scope.dart';
 import 'src/model/data_store_config.dart';
 import 'src/model/db_exception.dart';
@@ -37,15 +37,15 @@ import 'src/model/table_info.dart';
 import 'src/model/table_schema.dart';
 import 'src/model/transaction_result.dart';
 
-export 'src/interface/status_provider.dart';
 export 'src/handler/logger.dart' show LogLevel, LogRecord, LogConfig, LogType;
 export 'src/handler/to_crypto.dart';
+export 'src/interface/status_provider.dart';
 export 'src/model/backup_scope.dart';
 export 'src/model/config_info.dart';
 export 'src/model/data_store_config.dart';
 export 'src/model/db_exception.dart';
-export 'src/model/db_startup_stage.dart';
 export 'src/model/db_result.dart';
+export 'src/model/db_startup_stage.dart';
 export 'src/model/expr.dart';
 export 'src/model/memory_info.dart';
 export 'src/model/migration_config.dart';
@@ -1076,27 +1076,19 @@ class ToStore implements DataStoreInterface {
   }
 
   /// Get table information including:
-  /// - Record count
-  /// - Cache count
-  /// - File size
-  /// - Index count
-  /// - Schema
-  /// - Last modified time
-  /// - Created time
-  /// - Global flag
+  /// - [TableInfo.totalRecordCount]
+  /// - [TableInfo.totalTableDataSizeBytes] / [TableInfo.totalIndexDataSizeBytes]
+  /// - [TableInfo.indexCount] (number of indexes)
+  /// - Schema, last modified time, created time, global flag
   ///
   /// [tableName] The name of the table to retrieve info for.
   /// Returns [TableInfo] containing metadata, or null if not found.
   ///
   /// 获取表信息，包括：
-  /// - 记录数量
-  /// - 缓存数量
-  /// - 文件大小
-  /// - 索引数量
-  /// - 表结构
-  /// - 最后修改时间
-  /// - 创建时间
-  /// - 是否全局表
+  /// - [TableInfo.totalRecordCount] 记录总数
+  /// - [TableInfo.totalTableDataSizeBytes] / [TableInfo.totalIndexDataSizeBytes]
+  /// - [TableInfo.indexCount] 索引个数
+  /// - 表结构、最后修改时间、创建时间、是否全局表
   ///
   /// [tableName] 要获取信息的表名。
   /// 返回包含元数据的 [TableInfo]，若未找到则返回 null。
@@ -1277,13 +1269,15 @@ class ToStore implements DataStoreInterface {
     return _impl.migrationManager!.queryTaskStatus(taskId);
   }
 
-  /// Get information about the current space
-  /// Returns detailed information about the current working space
-  /// [useCache] Whether to use cached data. Defaults to true. Set to false to get the latest data.
+  /// Get space-local aggregates for the current working space:
+  /// [SpaceInfo.totalRecordCount], [SpaceInfo.totalTableDataSizeBytes],
+  /// [SpaceInfo.totalIndexDataSizeBytes] (and [SpaceInfo.totalSizeBytes]).
   ///
-  /// 获取当前空间的信息
-  /// 返回当前工作空间的详细信息
-  /// [useCache] 是否使用缓存数据，默认为true。设置为false可获取最新数据。
+  /// [useCache] Whether to use cached aggregates. Defaults to true.
+  /// Set to false to fully reconcile from table/index meta.
+  ///
+  /// 获取当前空间的本地聚合统计：记录总数、表数据体积、索引数据体积。
+  /// [useCache] 是否使用缓存聚合，默认为 true；false 时从元数据全量重算。
   @override
   Future<SpaceInfo> getSpaceInfo({bool useCache = true}) async {
     return await _impl.getSpaceInfo(useCache: useCache);

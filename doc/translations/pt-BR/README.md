@@ -1287,13 +1287,14 @@ As APIs a seguir cobrem administração de banco de dados, diagnóstico e manute
 - **Gerenciamento de mesa**
   - `createTable(schema)`: cria uma única tabela manualmente; útil para carregamento de módulo ou criação de tabela de tempo de execução sob demanda
   - `getTableSchema(tableName)`: recupera as informações do esquema definido; útil para validação automatizada ou geração de modelo de UI
-  - `getTableInfo(tableName)`: recupera estatísticas da tabela de tempo de execução, incluindo contagem de registros, contagem de índices, tamanho do arquivo de dados, tempo de criação e se a tabela é global
+  - `getTableNames({isGlobal})`: lista nomes de tabelas do inventário de schema global (tabelas de usuário). Opcional `isGlobal`: `true` só globais, `false` só não globais, omitir = ambas. Schemas não globais são compartilhados entre espaços; apenas os dados são isolados.
+  - `getTableInfo(tableName)`: estatísticas de runtime (`totalRecordCount`, `totalTableDataSizeBytes`, `totalIndexDataSizeBytes`, `indexCount`, criação, se é global)
   - `clear(tableName)`: limpe todos os dados da tabela enquanto retém com segurança o esquema, os índices e as restrições de chave internas/externas
   - `dropTable(tableName)`: destrói completamente uma tabela e seu esquema; não reversível
 - **Gerenciamento de espaço**
   - `currentSpaceName`: obtenha o espaço ativo atual em tempo real
   - `listSpaces()`: lista todos os espaços alocados na instância atual do banco de dados
-  - `getSpaceInfo(useCache: true)`: audita o espaço atual; use `useCache: false` para ignorar o cache e ler o estado em tempo real
+  - `getSpaceInfo(useCache: true)`: agregados locais do espaço (`totalRecordCount`, tamanho de dados de tabela/índice). Use `useCache: false` para reconciliar a partir do meta.
   - `deleteSpace(spaceName)`: exclui um espaço específico e todos os seus dados, exceto `default` e o espaço ativo atual
 - **Descoberta de instância**
   - `config`: inspeciona o instantâneo `DataStoreConfig` efetivo final da instância
@@ -1311,11 +1312,13 @@ As APIs a seguir cobrem administração de banco de dados, diagnóstico e manute
 ```dart
 
 final spaces = await db.listSpaces();
+final tableNames = await db.getTableNames();
 final spaceInfo = await db.getSpaceInfo(useCache: false);
 final tableSchema = await db.getTableSchema('users');
 final tableInfo = await db.getTableInfo('users');
 
 print('spaces: $spaces');
+print('tables: $tableNames');
 print(spaceInfo.toJson());
 print(tableSchema?.toJson());
 print(tableInfo?.toJson());

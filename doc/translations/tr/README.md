@@ -1287,13 +1287,14 @@ Aşağıdaki API'ler, eklenti tarzı geliştirme, yönetici panelleri ve operasy
 - **Masa Yönetimi**
   - `createTable(schema)`: manuel olarak tek bir tablo oluşturun; modül yükleme veya isteğe bağlı çalışma zamanı tablosu oluşturma için kullanışlıdır
   - `getTableSchema(tableName)`: tanımlanmış şema bilgilerini alır; otomatik doğrulama veya kullanıcı arayüzü modeli oluşturma için kullanışlıdır
-  - `getTableInfo(tableName)`: kayıt sayısı, dizin sayısı, veri dosyası boyutu, oluşturma süresi ve tablonun genel olup olmadığı dahil olmak üzere çalışma zamanı tablosu istatistiklerini alın
+  - `getTableNames({isGlobal})`: genel schema envanterindeki kullanıcı tablo adlarını listeler. İsteğe bağlı `isGlobal`: `true` yalnızca global, `false` yalnızca global olmayan, atlanırsa ikisi. Global olmayan şemalar alanlar arasında paylaşılır; yalnızca veri izole edilir.
+  - `getTableInfo(tableName)`: çalışma zamanı istatistikleri (`totalRecordCount`, `totalTableDataSizeBytes`, `totalIndexDataSizeBytes`, `indexCount`, oluşturma, global mi)
   - `clear(tableName)`: şemayı, dizinleri ve dahili/harici anahtar kısıtlamalarını güvenli bir şekilde korurken tüm tablo verilerini temizleyin
   - `dropTable(tableName)`: bir tabloyu ve şemasını tamamen yok edin; geri döndürülemez
 - **Alan Yönetimi**
   - `currentSpaceName`: mevcut aktif alanı gerçek zamanlı olarak alın
   - `listSpaces()`: geçerli veritabanı örneğindeki tüm ayrılmış alanları listeler
-  - `getSpaceInfo(useCache: true)`: mevcut alanı denetleyin; önbelleği atlamak ve gerçek zamanlı durumu okumak için `useCache: false` kullanın
+  - `getSpaceInfo(useCache: true)`: alan-yerel toplamlar (`totalRecordCount`, tablo/indeks veri boyutu). Meta'dan yeniden hesap için `useCache: false`.
   - `deleteSpace(spaceName)`: belirli bir alanı ve `default` ve mevcut aktif alan hariç tüm verilerini silin
 - **Örnek Keşfi**
   - `config`: örneğin son etkili `DataStoreConfig` anlık görüntüsünü inceleyin
@@ -1311,11 +1312,13 @@ Aşağıdaki API'ler, eklenti tarzı geliştirme, yönetici panelleri ve operasy
 ```dart
 
 final spaces = await db.listSpaces();
+final tableNames = await db.getTableNames();
 final spaceInfo = await db.getSpaceInfo(useCache: false);
 final tableSchema = await db.getTableSchema('users');
 final tableInfo = await db.getTableInfo('users');
 
 print('spaces: $spaces');
+print('tables: $tableNames');
 print(spaceInfo.toJson());
 print(tableSchema?.toJson());
 print(tableInfo?.toJson());

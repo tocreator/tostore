@@ -1287,13 +1287,14 @@ final txResult2 = await db.transaction(() async {
 - **Управление столом**
   - `createTable(schema)`: создать одну таблицу вручную; полезно для загрузки модулей или создания таблицы времени выполнения по требованию.
   - `getTableSchema(tableName)`: получить информацию об определенной схеме; полезно для автоматической проверки или создания модели пользовательского интерфейса.
-  - `getTableInfo(tableName)`: получение статистики таблицы времени выполнения, включая количество записей, количество индексов, размер файла данных, время создания и является ли таблица глобальной.
+  - `getTableNames({isGlobal})`: список имён таблиц в глобальном инвентаре schema (пользовательские таблицы). Опционально `isGlobal`: `true` только глобальные, `false` только неглобальные, опустить = обе. Неглобальные схемы общие для пространств; изолируются только данные.
+  - `getTableInfo(tableName)`: статистика рантайма (`totalRecordCount`, `totalTableDataSizeBytes`, `totalIndexDataSizeBytes`, `indexCount`, время создания, глобальность)
   - `clear(tableName)`: очистить все данные таблицы, безопасно сохранив схему, индексы и ограничения внутренних/внешних ключей.
   - `dropTable(tableName)`: полностью уничтожить таблицу и ее схему; не обратимый
 - **Управление пространством**
   - `currentSpaceName`: узнать текущее активное пространство в реальном времени.
   - `listSpaces()`: вывести список всех выделенных пространств в текущем экземпляре базы данных.
-  - `getSpaceInfo(useCache: true)`: аудит текущего пространства; используйте `useCache: false` для обхода кеша и чтения состояния в реальном времени
+  - `getSpaceInfo(useCache: true)`: локальные агрегаты пространства (`totalRecordCount`, размер данных таблиц/индексов). `useCache: false` для пересчёта из meta.
   - `deleteSpace(spaceName)`: удалить определенное пространство и все его данные, кроме `default` и текущего активного пространства.
 - **Обнаружение экземпляров**
   - `config`: проверьте окончательный эффективный снимок `DataStoreConfig` для экземпляра.
@@ -1311,11 +1312,13 @@ final txResult2 = await db.transaction(() async {
 ```dart
 
 final spaces = await db.listSpaces();
+final tableNames = await db.getTableNames();
 final spaceInfo = await db.getSpaceInfo(useCache: false);
 final tableSchema = await db.getTableSchema('users');
 final tableInfo = await db.getTableInfo('users');
 
 print('spaces: $spaces');
+print('tables: $tableNames');
 print(spaceInfo.toJson());
 print(tableSchema?.toJson());
 print(tableInfo?.toJson());

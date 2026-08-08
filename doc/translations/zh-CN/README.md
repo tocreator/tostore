@@ -1313,13 +1313,14 @@ final txResult2 = await db.transaction(() async {
 - **表维护 (Table Management)**
   - `createTable(schema)`：手动创建单张表。适合运行时按需建表或模块化加载场景。
   - `getTableSchema(tableName)`：获取已定义的表结构信息。常用于自动化校验或 UI 模型生成。
-  - `getTableInfo(tableName)`：获取表运行时的统计信息。包含记录总数、索引数量、数据文件大小、创建时间、是否为全局表等核心指标。
+  - `getTableNames({isGlobal})`：获取全局 schema 清单中的用户表名。可选 `isGlobal`：`true` 仅全局表，`false` 仅非全局表，省略则全部。非全局表结构跨空间共享，仅数据按空间隔离。
+  - `getTableInfo(tableName)`：获取表运行时统计（`totalRecordCount`、`totalTableDataSizeBytes`、`totalIndexDataSizeBytes`、`indexCount`、创建时间、是否全局表等）。
   - `clear(tableName)`：清空全表数据。此操作会重置数据，但会安全保留表结构、索引定义和内外键约束。
   - `dropTable(tableName)`：彻底销毁表。删除所有数据及对应的模式定义，不可撤销。
 - **空间管理 (Space Management)**
   - `currentSpaceName`：实时获取当前实例所处的活跃空间。
   - `listSpaces()`：获取当前数据库实例下所有已分配的空间列表。
-  - `getSpaceInfo(useCache: true)`：空间审计。查看当前空间下的表总量、数据总体量等；`useCache: false` 可穿透缓存读取实时状态。
+  - `getSpaceInfo(useCache: true)`：查看当前空间的本地聚合统计（记录总数、表/索引数据体积）。`useCache: false` 时可从元数据全量重算。
   - `deleteSpace(spaceName)`：销毁指定空间及其完整数据（`default` 及当前活跃空间除外）。
 - **实例元信息 (Instance Discovery)**
   - `config`：查看当前实例最终生效的 `DataStoreConfig` 配置快照。
@@ -1337,11 +1338,13 @@ final txResult2 = await db.transaction(() async {
 ```dart
 
 final spaces = await db.listSpaces();
+final tableNames = await db.getTableNames();
 final spaceInfo = await db.getSpaceInfo(useCache: false);
 final tableSchema = await db.getTableSchema('users');
 final tableInfo = await db.getTableInfo('users');
 
 print('spaces: $spaces');
+print('tables: $tableNames');
 print(spaceInfo.toJson());
 print(tableSchema?.toJson());
 print(tableInfo?.toJson());

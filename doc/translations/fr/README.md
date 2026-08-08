@@ -1287,13 +1287,14 @@ Les API suivantes couvrent l'administration, les diagnostics et la maintenance d
 - **Gestion des tables**
   - `createTable(schema)` : créer une seule table manuellement ; utile pour le chargement de modules ou la création de tables d'exécution à la demande
   - `getTableSchema(tableName)` : récupérer les informations du schéma défini ; utile pour la validation automatisée ou la génération de modèles d'interface utilisateur
-  - `getTableInfo(tableName)` : récupère les statistiques de la table d'exécution, y compris le nombre d'enregistrements, le nombre d'index, la taille du fichier de données, l'heure de création et si la table est globale
+  - `getTableNames({isGlobal})` : liste les noms de tables de l'inventaire de schéma global (tables utilisateur). Optionnel `isGlobal` : `true` globales seulement, `false` non globales seulement, omis = les deux. Les schémas non globaux sont partagés entre espaces ; seules les données sont isolées.
+  - `getTableInfo(tableName)` : statistiques d'exécution (`totalRecordCount`, `totalTableDataSizeBytes`, `totalIndexDataSizeBytes`, `indexCount`, création, global ou non)
   - `clear(tableName)` : effacez toutes les données de la table tout en conservant en toute sécurité le schéma, les index et les contraintes de clés internes/externes
   - `dropTable(tableName)` : détruire complètement une table et son schéma ; non réversible
 - **Gestion de l'espace**
   - `currentSpaceName` : obtenez l'espace actif actuel en temps réel
   - `listSpaces()` : liste tous les espaces alloués dans l'instance de base de données actuelle
-  - `getSpaceInfo(useCache: true)` : auditer l'espace actuel ; utilisez `useCache: false` pour contourner le cache et lire l'état en temps réel
+  - `getSpaceInfo(useCache: true)` : agrégats locaux de l'espace (`totalRecordCount`, taille données table/index). Utilisez `useCache: false` pour réconcilier depuis les métas.
   - `deleteSpace(spaceName)` : supprime un espace spécifique et toutes ses données, sauf `default` et l'espace actif actuel
 - **Découverte d'instance**
   - `config` : inspectez l'instantané final effectif `DataStoreConfig` pour l'instance
@@ -1311,11 +1312,13 @@ Les API suivantes couvrent l'administration, les diagnostics et la maintenance d
 ```dart
 
 final spaces = await db.listSpaces();
+final tableNames = await db.getTableNames();
 final spaceInfo = await db.getSpaceInfo(useCache: false);
 final tableSchema = await db.getTableSchema('users');
 final tableInfo = await db.getTableInfo('users');
 
 print('spaces: $spaces');
+print('tables: $tableNames');
 print(spaceInfo.toJson());
 print(tableSchema?.toJson());
 print(tableInfo?.toJson());

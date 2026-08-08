@@ -1287,13 +1287,14 @@ The following APIs cover database administration, diagnostics, and maintenance f
 - **Table Management**
   - `createTable(schema)`: create a single table manually; useful for module loading or on-demand runtime table creation
   - `getTableSchema(tableName)`: retrieve the defined schema information; useful for automated validation or UI model generation
-  - `getTableInfo(tableName)`: retrieve runtime table statistics, including record count, index count, data file size, creation time, and whether the table is global
+  - `getTableNames({isGlobal})`: list table names in the global schema inventory (user tables). Optional `isGlobal`: `true` = global only, `false` = non-global only, omitted = both. Non-global schemas are shared across spaces; only data is space-isolated.
+  - `getTableInfo(tableName)`: retrieve runtime table statistics (`totalRecordCount`, `totalTableDataSizeBytes`, `totalIndexDataSizeBytes`, `indexCount`, creation time, whether the table is global)
   - `clear(tableName)`: clear all table data while safely retaining schema, indexes, and internal/external key constraints
   - `dropTable(tableName)`: completely destroy a table and its schema; not reversible
 - **Space Management**
   - `currentSpaceName`: get the current active space in real time
   - `listSpaces()`: list all allocated spaces in the current database instance
-  - `getSpaceInfo(useCache: true)`: audit the current space; use `useCache: false` to bypass cache and read real-time state
+  - `getSpaceInfo(useCache: true)`: space-local aggregates (`totalRecordCount`, table/index data size). Use `useCache: false` to reconcile from meta.
   - `deleteSpace(spaceName)`: delete a specific space and all of its data, except `default` and the current active space
 - **Instance Discovery**
   - `config`: inspect the final effective `DataStoreConfig` snapshot for the instance
@@ -1311,11 +1312,13 @@ The following APIs cover database administration, diagnostics, and maintenance f
 ```dart
 
 final spaces = await db.listSpaces();
+final tableNames = await db.getTableNames();
 final spaceInfo = await db.getSpaceInfo(useCache: false);
 final tableSchema = await db.getTableSchema('users');
 final tableInfo = await db.getTableInfo('users');
 
 print('spaces: $spaces');
+print('tables: $tableNames');
 print(spaceInfo.toJson());
 print(tableSchema?.toJson());
 print(tableInfo?.toJson());
