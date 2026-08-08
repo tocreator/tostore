@@ -335,7 +335,7 @@ final class NghPartitionManager {
       final nghBudget = (indexBudget * 0.15).round();
       // Use single-cache budget so preloaded data fits in each of graph/pq
       // caches and is not evicted by cleanup (each cache has max nghBudget).
-      if (meta.totalSizeInBytes <= 0 || meta.totalSizeInBytes > nghBudget) {
+      if (meta.totalSizeBytes <= 0 || meta.totalSizeBytes > nghBudget) {
         return;
       }
 
@@ -553,12 +553,20 @@ final class NghPartitionManager {
 
     // Apply meta deltas before staging page0 so graph partition 0 embeds the
     // same NghIndexMeta that callers will cache (no wipe-before-persist window).
+    final sizeDeltaSum = await _computePartitionSizeDeltaSum(
+      [graphStats, pqStats, rawStats],
+      pageSize,
+    );
     final now = DateTime.now();
     final updatedMeta = meta.copyWith(
       totalVectors: max(0, meta.totalVectors + vectorsDelta),
       deletedCount: max(0, meta.deletedCount + deletedDelta),
+      totalSizeBytes: max(0, meta.totalSizeBytes + sizeDeltaSum),
       timestamps: meta.timestamps.copyWith(modified: now),
     );
+    if (sizeDeltaSum != 0) {
+      _dataStore.tableDataManager.applyIndexDataSizeDelta(table, sizeDeltaSum);
+    }
 
     // ── Stage per-partition meta pages (pageNo=0) ──
     await _stagePartitionMeta(graphStats, pageSize, updatedMeta, stageWrite, yc,
@@ -1156,6 +1164,62 @@ final class NghPartitionManager {
     );
   }
 
+  /// Best-effort size delta across touched NGH partition files (O(touched)).
+  Future<int> _computePartitionSizeDeltaSum(
+    List<Map<int, _NghPartitionStats>> statsMaps,
+    int pageSize,
+  ) async {
+    var sum = 0;
+    for (final statsMap in statsMaps) {
+      for (final entry in statsMap.entries) {
+        final stats = entry.value;
+        if (stats.path == null) continue;
+        await _ensureNghPartitionHeaderLoaded(
+          stats,
+          partitionNo: entry.key,
+          pageSize: pageSize,
+        );
+        final computedSize = (stats.maxPageNoWritten + 1) * pageSize;
+        final newSize = max(stats.oldFileSizeInBytes, computedSize);
+        sum += newSize - stats.oldFileSizeInBytes;
+      }
+    }
+    return sum;
+  }
+
+  Future<void> _ensureNghPartitionHeaderLoaded(
+    _NghPartitionStats stats, {
+    required int partitionNo,
+    required int pageSize,
+  }) async {
+    if (stats.headerLoaded || stats.path == null) return;
+    try {
+      final raw0 = await _dataStore.storage
+          .readAsBytesAt(stats.path!, 0, length: pageSize);
+      if (raw0.isNotEmpty) {
+        final local =
+            _dataStore.treeMetaPageService.parsePartitionLocalFromPageBytes(
+          raw0,
+          partitionNo: partitionNo,
+          pageType: BTreePageType.nghMeta,
+        );
+        if (local != null) {
+          stats.oldTotalEntries = local.totalEntryCount;
+          stats.oldFileSizeInBytes = local.totalSizeBytes;
+          stats.freeListHeadPageNo = local.freeListHeadPageNo;
+          stats.freePageCount = local.freePageCount;
+        }
+      }
+    } catch (_) {
+      try {
+        stats.oldFileSizeInBytes =
+            await _dataStore.storage.getFileSize(stats.path!);
+      } catch (_) {}
+    } finally {
+      stats.headerLoaded = true;
+    }
+  }
+
   /// Stage per-file meta pages (pageNo=0) for each touched partition.
   Future<void> _stagePartitionMeta(
     Map<int, _NghPartitionStats> statsMap,
@@ -1173,34 +1237,11 @@ final class NghPartitionManager {
 
       if (stats.path == null) continue;
 
-      // Try to load existing meta page
-      if (!stats.headerLoaded) {
-        try {
-          final raw0 = await _dataStore.storage
-              .readAsBytesAt(stats.path!, 0, length: pageSize);
-          if (raw0.isNotEmpty) {
-            final local =
-                _dataStore.treeMetaPageService.parsePartitionLocalFromPageBytes(
-              raw0,
-              partitionNo: pNo,
-              pageType: BTreePageType.nghMeta,
-            );
-            if (local != null) {
-              stats.oldTotalEntries = local.totalEntries;
-              stats.oldFileSizeInBytes = local.fileSizeInBytes;
-              stats.freeListHeadPageNo = local.freeListHeadPageNo;
-              stats.freePageCount = local.freePageCount;
-            }
-          }
-        } catch (_) {
-          try {
-            stats.oldFileSizeInBytes =
-                await _dataStore.storage.getFileSize(stats.path!);
-          } catch (_) {}
-        } finally {
-          stats.headerLoaded = true;
-        }
-      }
+      await _ensureNghPartitionHeaderLoaded(
+        stats,
+        partitionNo: pNo,
+        pageSize: pageSize,
+      );
 
       final newEntries = max(0, stats.oldTotalEntries + stats.entriesDelta);
       final computedSize = (stats.maxPageNoWritten + 1) * pageSize;
@@ -1222,8 +1263,8 @@ final class NghPartitionManager {
         partitionLocal: PartitionLocalStats(
           partitionNo: pNo,
           dataCategory: category.index,
-          totalEntries: newEntries,
-          fileSizeInBytes: newSize,
+          totalEntryCount: newEntries,
+          totalSizeBytes: newSize,
           freeListHeadPageNo: stats.freeListHeadPageNo,
           freePageCount: stats.freePageCount,
         ),

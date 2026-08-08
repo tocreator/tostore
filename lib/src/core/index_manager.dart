@@ -1608,10 +1608,10 @@ class IndexManager {
 
           // Get index metadata
           final meta = await getIndexMeta(table.tableUid, indexUid);
-          if (meta == null || meta.isBuilding || meta.totalEntries <= 0) {
+          if (meta == null || meta.isBuilding || meta.totalEntryCount <= 0) {
             final tableDataMeta = await _dataStore.tableDataManager
                 .getTableDataMeta(table.tableUid);
-            if (tableDataMeta == null || tableDataMeta.totalRecords <= 0) {
+            if (tableDataMeta == null || tableDataMeta.totalRecordCount <= 0) {
               // Verified empty table on disk; no persistent conflict possible.
               continue;
             }
@@ -2083,12 +2083,12 @@ class IndexManager {
 
       // 2.2 Disk path using BinaryFuseFilter + grouped point lookups (existence-only).
       final meta = await getIndexMeta(table.tableUid, indexUid);
-      if (meta == null || meta.isBuilding || meta.totalEntries <= 0) {
+      if (meta == null || meta.isBuilding || meta.totalEntryCount <= 0) {
         // Fast path for brand new tables: if meta is missing or index is empty,
         // and the table data metadata also indicates 0 records, we can skip the heavy disk scan.
         final tableDataMeta =
             await _dataStore.tableDataManager.getTableDataMeta(table.tableUid);
-        if (tableDataMeta == null || tableDataMeta.totalRecords <= 0) {
+        if (tableDataMeta == null || tableDataMeta.totalRecordCount <= 0) {
           // Verified empty table on disk; no persistent conflict possible.
           continue;
         }
@@ -2580,6 +2580,31 @@ class IndexManager {
   ) async {
     if (indexUid.isEmpty) return;
     final resolved = _resolveIndexUid(table, indexUid.value);
+
+    // Subtract from SpaceStats before deleting artifacts (O(1) via cached meta).
+    try {
+      final indexSchema = _dataStore.tableMetaManager
+          ?.findIndexSchemaByUid(table.schema, resolved);
+      if (indexSchema?.type == IndexType.vector) {
+        final ngh = await _dataStore.vectorIndexManager
+            ?.getNghIndexMeta(table, resolved);
+        if (ngh != null && ngh.totalSizeBytes != 0) {
+          _dataStore.tableDataManager
+              .applyIndexDataSizeDelta(table, -ngh.totalSizeBytes);
+        }
+      } else {
+        final meta = await getIndexMeta(table.tableUid, resolved);
+        if (meta != null && meta.totalSizeBytes != 0) {
+          _dataStore.tableDataManager
+              .applyIndexDataSizeDelta(table, -meta.totalSizeBytes);
+        }
+      }
+    } catch (e) {
+      Logger.warn(
+          'Failed to adjust space index size for ${table.tableName}.${_indexLogLabel(table, resolved)}',
+          rawError: e);
+    }
+
     _invalidateIndexCache(table, resolved);
 
     try {
@@ -2910,13 +2935,13 @@ class IndexManager {
       // In memory mode, the primary index store is [_indexDataCache], so B+Tree
       // pointers/entry counts may be unset or stale. We still allow searching.
       if (!isMemoryMode &&
-          (effectiveMeta.totalEntries <= 0 ||
+          (effectiveMeta.totalEntryCount <= 0 ||
               effectiveMeta.btreeFirstLeaf.isNull)) {
         final tableDataMeta =
             await _dataStore.tableDataManager.getTableDataMeta(
           table.tableUid,
         );
-        final persistedTableRecords = tableDataMeta?.totalRecords ?? 0;
+        final persistedTableRecords = tableDataMeta?.totalRecordCount ?? 0;
         if (persistedTableRecords > 0) {
           Logger.warn(
             'Index ${table.tableName}.'

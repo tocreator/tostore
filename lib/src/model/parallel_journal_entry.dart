@@ -7,34 +7,35 @@ class BatchTablePlan {
   final bool willUpdateTableDataMeta;
   final List<IndexUid> indexes;
   final bool willUpdateIndexMeta;
-  final int? baseTotalRecords;
-  final int? baseTotalSizeInBytes;
-  final Map<IndexUid, int>? baseIndexTotalEntries;
-  final Map<IndexUid, int>? baseIndexTotalSizeInBytes;
+  final int? baseTotalRecordCount;
+  final int? baseTotalSizeBytes;
+  final Map<IndexUid, int>? baseIndexTotalEntryCount;
+  final Map<IndexUid, int>? baseIndexTotalSizeBytes;
 
   const BatchTablePlan({
     required this.willUpdateTableDataMeta,
     required this.indexes,
     required this.willUpdateIndexMeta,
-    this.baseTotalRecords,
-    this.baseTotalSizeInBytes,
-    this.baseIndexTotalEntries,
-    this.baseIndexTotalSizeInBytes,
+    this.baseTotalRecordCount,
+    this.baseTotalSizeBytes,
+    this.baseIndexTotalEntryCount,
+    this.baseIndexTotalSizeBytes,
   });
 
   Map<String, dynamic> toJson() => {
         'willUpdateTableDataMeta': willUpdateTableDataMeta,
         'indexes': indexes.map((e) => e.value).toList(),
         'willUpdateIndexMeta': willUpdateIndexMeta,
-        if (baseTotalRecords != null) 'baseTotalRecords': baseTotalRecords,
-        if (baseTotalSizeInBytes != null)
-          'baseTotalSizeInBytes': baseTotalSizeInBytes,
-        if (baseIndexTotalEntries != null)
-          'baseIndexTotalEntries':
-              baseIndexTotalEntries!.map((k, v) => MapEntry(k.value, v)),
-        if (baseIndexTotalSizeInBytes != null)
-          'baseIndexTotalSizeInBytes':
-              baseIndexTotalSizeInBytes!.map((k, v) => MapEntry(k.value, v)),
+        if (baseTotalRecordCount != null)
+          'baseTotalRecordCount': baseTotalRecordCount,
+        if (baseTotalSizeBytes != null)
+          'baseTotalSizeBytes': baseTotalSizeBytes,
+        if (baseIndexTotalEntryCount != null)
+          'baseIndexTotalEntryCount':
+              baseIndexTotalEntryCount!.map((k, v) => MapEntry(k.value, v)),
+        if (baseIndexTotalSizeBytes != null)
+          'baseIndexTotalSizeBytes':
+              baseIndexTotalSizeBytes!.map((k, v) => MapEntry(k.value, v)),
       };
 
   static BatchTablePlan fromJson(Map<String, dynamic> json) {
@@ -51,12 +52,16 @@ class BatchTablePlan {
           .map((e) => IndexUid(e.toString()))
           .toList(),
       willUpdateIndexMeta: json['willUpdateIndexMeta'] as bool? ?? false,
-      baseTotalRecords: json['baseTotalRecords'] as int?,
-      baseTotalSizeInBytes: json['baseTotalSizeInBytes'] as int?,
-      baseIndexTotalEntries:
-          mapIndexTotals(json['baseIndexTotalEntries'] as Map?),
-      baseIndexTotalSizeInBytes:
-          mapIndexTotals(json['baseIndexTotalSizeInBytes'] as Map?),
+      baseTotalRecordCount: (json['baseTotalRecordCount'] as int?) ??
+          (json['baseTotalRecords'] as int?),
+      baseTotalSizeBytes: (json['baseTotalSizeBytes'] as int?) ??
+          (json['baseTotalSizeInBytes'] as int?),
+      baseIndexTotalEntryCount: mapIndexTotals(
+          (json['baseIndexTotalEntryCount'] ?? json['baseIndexTotalEntries'])
+              as Map?),
+      baseIndexTotalSizeBytes: mapIndexTotals(
+          (json['baseIndexTotalSizeBytes'] ?? json['baseIndexTotalSizeInBytes'])
+              as Map?),
     );
   }
 }

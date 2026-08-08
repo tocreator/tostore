@@ -1,11 +1,11 @@
 /// table statistics
 class TableStatistics {
   final Map<String, FieldStatistics> fieldStats;
-  final int totalRows;
+  final int totalRecordCount;
 
   TableStatistics({
     required this.fieldStats,
-    required this.totalRows,
+    required this.totalRecordCount,
   });
 
   /// from json
@@ -14,7 +14,8 @@ class TableStatistics {
       fieldStats: (json['fieldStats'] as Map<String, dynamic>).map(
         (key, value) => MapEntry(key, FieldStatistics.fromJson(value)),
       ),
-      totalRows: json['totalRows'] as int,
+      totalRecordCount: (json['totalRecordCount'] as int?) ??
+          (json['totalRows'] as int? ?? 0),
     );
   }
 
@@ -24,7 +25,7 @@ class TableStatistics {
       'fieldStats': fieldStats.map(
         (key, value) => MapEntry(key, value.toJson()),
       ),
-      'totalRows': totalRows,
+      'totalRecordCount': totalRecordCount,
     };
   }
 }

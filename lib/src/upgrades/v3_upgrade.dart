@@ -643,7 +643,7 @@ class V3Upgrade {
 
         final needsPlan = plans.isEmpty ||
             plans.values.every((p) =>
-                p.baseTotalRecords == null && p.baseTotalSizeInBytes == null);
+                p.baseTotalRecordCount == null && p.baseTotalSizeBytes == null);
         if (needsPlan && journalFile != null && journalFile.isNotEmpty) {
           final fromJournal = await _readLegacyBatchStartTablePlans(
             spaceName: spaceName,

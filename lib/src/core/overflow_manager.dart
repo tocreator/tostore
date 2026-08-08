@@ -264,8 +264,8 @@ final class OverflowManager {
       // 5. Update meta.
       final newMeta = PartitionMetaPage(
         partitionNo: meta.partitionNo,
-        totalEntries: meta.totalEntries,
-        fileSizeInBytes: meta.fileSizeInBytes,
+        totalEntryCount: meta.totalEntryCount,
+        totalSizeBytes: meta.totalSizeBytes,
         freeListHeadPageNo:
             pageNos.first, // The first page in our reconstructed chain
         freePageCount: meta.freePageCount + pageNos.length,
@@ -452,8 +452,8 @@ final class OverflowManager {
 
     final meta = PartitionMetaPage(
       partitionNo: partitionNo,
-      totalEntries: 0,
-      fileSizeInBytes: pageSize,
+      totalEntryCount: 0,
+      totalSizeBytes: pageSize,
       freeListHeadPageNo: -1,
       freePageCount: 0,
     );
@@ -590,7 +590,7 @@ final class OverflowManager {
     }
 
     // 2. Allocate new pages if needed.
-    int currentFileSize = meta.fileSizeInBytes;
+    int currentFileSize = meta.totalSizeBytes;
     while (result.length < count) {
       final pn = currentFileSize ~/ pageSize;
       result.add(pn);
@@ -600,8 +600,8 @@ final class OverflowManager {
     // 3. Update meta once.
     final updatedMeta = PartitionMetaPage(
       partitionNo: meta.partitionNo,
-      totalEntries: meta.totalEntries,
-      fileSizeInBytes: currentFileSize,
+      totalEntryCount: meta.totalEntryCount,
+      totalSizeBytes: currentFileSize,
       freeListHeadPageNo: currentFreeHead,
       freePageCount: currentFreeCount,
     );

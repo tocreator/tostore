@@ -98,7 +98,7 @@ class NghIndexMeta {
   final int rawVectorNextPageNo;
 
   /// Total size of all partition files in bytes (best-effort).
-  final int totalSizeInBytes;
+  final int totalSizeBytes;
 
   // ===================== nodeId ↔ PK B+Tree Mapping ============
 
@@ -212,7 +212,7 @@ class NghIndexMeta {
     this.pqCodeNextPageNo = firstDataPageNo,
     this.rawVectorPartitionCount = 1,
     this.rawVectorNextPageNo = firstDataPageNo,
-    this.totalSizeInBytes = 0,
+    this.totalSizeBytes = 0,
     this.nodeIdToPkMeta,
     this.pkToNodeIdMeta,
     Map<int, int>? graphFreeListHeads,
@@ -300,7 +300,7 @@ class NghIndexMeta {
     int? pqCodeNextPageNo,
     int? rawVectorPartitionCount,
     int? rawVectorNextPageNo,
-    int? totalSizeInBytes,
+    int? totalSizeBytes,
     IndexMeta? nodeIdToPkMeta,
     IndexMeta? pkToNodeIdMeta,
     Map<int, int>? graphFreeListHeads,
@@ -334,7 +334,7 @@ class NghIndexMeta {
       rawVectorPartitionCount:
           rawVectorPartitionCount ?? this.rawVectorPartitionCount,
       rawVectorNextPageNo: rawVectorNextPageNo ?? this.rawVectorNextPageNo,
-      totalSizeInBytes: totalSizeInBytes ?? this.totalSizeInBytes,
+      totalSizeBytes: totalSizeBytes ?? this.totalSizeBytes,
       nodeIdToPkMeta: nodeIdToPkMeta ?? this.nodeIdToPkMeta,
       pkToNodeIdMeta: pkToNodeIdMeta ?? this.pkToNodeIdMeta,
       graphFreeListHeads: graphFreeListHeads ?? this.graphFreeListHeads,
@@ -380,7 +380,10 @@ class NghIndexMeta {
           (json['rawVectorPartitionCount'] as num?)?.toInt() ?? 1,
       rawVectorNextPageNo:
           (json['rawVectorNextPageNo'] as num?)?.toInt() ?? firstDataPageNo,
-      totalSizeInBytes: (json['totalSizeInBytes'] as num?)?.toInt() ?? 0,
+      totalSizeBytes:
+          ((json['totalSizeBytes'] ?? json['totalSizeInBytes']) as num?)
+                  ?.toInt() ??
+              0,
       nodeIdToPkMeta: json['nodeIdToPkMeta'] != null
           ? IndexMeta.fromJson(json['nodeIdToPkMeta'] as Map<String, dynamic>)
           : null,
@@ -421,7 +424,7 @@ class NghIndexMeta {
       'pqCodeNextPageNo': pqCodeNextPageNo,
       'rawVectorPartitionCount': rawVectorPartitionCount,
       'rawVectorNextPageNo': rawVectorNextPageNo,
-      'totalSizeInBytes': totalSizeInBytes,
+      'totalSizeBytes': totalSizeBytes,
       if (nodeIdToPkMeta != null) 'nodeIdToPkMeta': nodeIdToPkMeta!.toJson(),
       if (pkToNodeIdMeta != null) 'pkToNodeIdMeta': pkToNodeIdMeta!.toJson(),
       'graphFreeListHeads': _serializeIntIntMap(graphFreeListHeads),

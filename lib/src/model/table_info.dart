@@ -6,12 +6,15 @@ class TableInfo {
   final String tableName;
 
   /// total record count
-  final int totalRecords;
+  final int totalRecordCount;
 
-  /// file size in bytes
-  final int fileSizeInBytes;
+  /// table-data file size in bytes
+  final int totalTableDataSizeBytes;
 
-  /// index count
+  /// index-data file size in bytes
+  final int totalIndexDataSizeBytes;
+
+  /// index count (number of indexes, not entry count)
   final int indexCount;
 
   /// table schema
@@ -28,32 +31,53 @@ class TableInfo {
 
   const TableInfo({
     required this.tableName,
-    required this.totalRecords,
-    required this.fileSizeInBytes,
+    int totalRecordCount = 0,
+    @Deprecated('Use totalRecordCount instead') int? totalRecords,
+    int totalTableDataSizeBytes = 0,
+    this.totalIndexDataSizeBytes = 0,
+    @Deprecated('Use totalTableDataSizeBytes instead') int? fileSizeInBytes,
     required this.indexCount,
     required this.schema,
     required this.isGlobal,
     this.lastModified,
     this.createdAt,
-  });
+  })  : totalRecordCount = totalRecords ?? totalRecordCount,
+        totalTableDataSizeBytes = fileSizeInBytes ?? totalTableDataSizeBytes;
 
-  /// get formatted file size
+  /// Convenience: table data + index data.
+  int get totalSizeBytes => totalTableDataSizeBytes + totalIndexDataSizeBytes;
+
+  /// Deprecated: use [totalRecordCount].
+  @Deprecated('Use totalRecordCount instead')
+  int get totalRecords => totalRecordCount;
+
+  /// Deprecated: previously table-data only; use [totalTableDataSizeBytes].
+  @Deprecated('Use totalTableDataSizeBytes instead')
+  int get fileSizeInBytes => totalTableDataSizeBytes;
+
+  /// get formatted total size (table + index)
   String get formattedFileSize {
-    if (fileSizeInBytes < 1024) return '$fileSizeInBytes B';
-    if (fileSizeInBytes < 1024 * 1024) {
-      return '${(fileSizeInBytes / 1024).toStringAsFixed(2)} KB';
+    final bytes = totalSizeBytes;
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) {
+      return '${(bytes / 1024).toStringAsFixed(2)} KB';
     }
-    if (fileSizeInBytes < 1024 * 1024 * 1024) {
-      return '${(fileSizeInBytes / (1024 * 1024)).toStringAsFixed(2)} MB';
+    if (bytes < 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(2)} MB';
     }
-    return '${(fileSizeInBytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
   }
 
   /// convert to json
   Map<String, dynamic> toJson() => {
         'tableName': tableName,
-        'totalRecords': totalRecords,
-        'fileSizeInBytes': fileSizeInBytes,
+        'totalRecordCount': totalRecordCount,
+        'totalTableDataSizeBytes': totalTableDataSizeBytes,
+        'totalIndexDataSizeBytes': totalIndexDataSizeBytes,
+        'totalSizeBytes': totalSizeBytes,
+        // Legacy keys for older consumers.
+        'totalRecords': totalRecordCount,
+        'fileSizeInBytes': totalTableDataSizeBytes,
         'formattedFileSize': formattedFileSize,
         'indexCount': indexCount,
         'schema': schema.toJson(),

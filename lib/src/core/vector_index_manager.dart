@@ -607,6 +607,11 @@ class VectorIndexManager {
   // Meta Persistence
   // =====================================================================
 
+  /// Public read of NGH index meta (coalesced disk load).
+  Future<NghIndexMeta?> getNghIndexMeta(
+          TableContext table, IndexUid indexUid) =>
+      _loadMeta(table, indexUid);
+
   /// Load meta from disk with coalesce: concurrent callers share a single I/O.
   Future<NghIndexMeta?> _loadMeta(TableContext table, IndexUid indexUid) {
     final loadKey = '${table.tableUid}/$indexUid';

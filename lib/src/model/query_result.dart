@@ -47,7 +47,11 @@ class QueryResult<T> {
   final bool hasPrev;
 
   /// Estimated total number of records in the entire table (buffer-aware).
-  final int? tableTotalCount;
+  final int? totalRecordCount;
+
+  /// Deprecated: use [totalRecordCount].
+  @Deprecated('Use totalRecordCount instead')
+  int? get tableTotalCount => totalRecordCount;
 
   /// Query execution time in milliseconds.
   final int? executionTimeMs;
@@ -65,7 +69,7 @@ class QueryResult<T> {
     this.nextCursorToken,
     this.hasMore = false,
     this.hasPrev = false,
-    this.tableTotalCount,
+    this.totalRecordCount,
     this.executionTimeMs,
     Future<QueryResult<T>> Function()? nextPageExecutor,
     Future<QueryResult<T>> Function()? prevPageExecutor,
@@ -83,7 +87,7 @@ class QueryResult<T> {
         data: const [],
         hasMore: false,
         hasPrev: hasPrev,
-        tableTotalCount: tableTotalCount,
+        totalRecordCount: totalRecordCount,
         message: exec == null
             ? 'Pagination executor not initialized (e.g. deserialized from JSON).'
             : 'No more results available.',
@@ -103,7 +107,7 @@ class QueryResult<T> {
         data: const [],
         hasMore: hasMore,
         hasPrev: false,
-        tableTotalCount: tableTotalCount,
+        totalRecordCount: totalRecordCount,
         message: exec == null
             ? 'Pagination executor not initialized (e.g. deserialized from JSON).'
             : 'No previous results available.',
@@ -122,7 +126,7 @@ class QueryResult<T> {
     String? nextCursorToken,
     bool hasMore = false,
     bool hasPrev = false,
-    int? tableTotalCount,
+    int? totalRecordCount,
     int? executionTimeMs,
     Future<QueryResult<T>> Function()? nextPageExecutor,
     Future<QueryResult<T>> Function()? prevPageExecutor,
@@ -135,7 +139,7 @@ class QueryResult<T> {
       nextCursorToken: nextCursorToken ?? nextCursor,
       hasMore: hasMore,
       hasPrev: hasPrev,
-      tableTotalCount: tableTotalCount,
+      totalRecordCount: totalRecordCount,
       executionTimeMs: executionTimeMs,
       nextPageExecutor: nextPageExecutor,
       prevPageExecutor: prevPageExecutor,
@@ -166,7 +170,7 @@ class QueryResult<T> {
   /// Override toString for easy debugging
   @override
   String toString() {
-    return 'QueryResult{code: ${type.code} (${type.codeKey}), message: $message, data: $data, prevCursorToken: $prevCursorToken, nextCursorToken: $nextCursorToken, hasMore: $hasMore, hasPrev: $hasPrev, tableTotalCount: $tableTotalCount}';
+    return 'QueryResult{code: ${type.code} (${type.codeKey}), message: $message, data: $data, prevCursorToken: $prevCursorToken, nextCursorToken: $nextCursorToken, hasMore: $hasMore, hasPrev: $hasPrev, totalRecordCount: $totalRecordCount}';
   }
 
   /// for serialization
@@ -182,7 +186,9 @@ class QueryResult<T> {
       if (nextCursorToken != null) 'nextCursor': nextCursorToken,
       'hasMore': hasMore,
       'hasPrev': hasPrev,
-      if (tableTotalCount != null) 'tableTotalCount': tableTotalCount,
+      if (totalRecordCount != null) 'totalRecordCount': totalRecordCount,
+      // Legacy key for older consumers.
+      if (totalRecordCount != null) 'tableTotalCount': totalRecordCount,
       if (executionTimeMs != null) 'executionTimeMs': executionTimeMs,
     };
   }
@@ -203,7 +209,8 @@ class QueryResult<T> {
       nextCursorToken: json['nextCursor'] as String?,
       hasMore: json['hasMore'] == true,
       hasPrev: json['hasPrev'] == true,
-      tableTotalCount: json['tableTotalCount'] as int?,
+      totalRecordCount: (json['totalRecordCount'] as int?) ??
+          (json['tableTotalCount'] as int?),
       executionTimeMs: json['executionTimeMs'] as int?,
     );
   }

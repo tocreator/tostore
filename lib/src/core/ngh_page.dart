@@ -42,10 +42,10 @@ final class NghPartitionMetaPage {
   final int dataCategory;
 
   /// Total entries (nodes / vectors / codebook pages) in this file.
-  final int totalEntries;
+  final int totalEntryCount;
 
   /// Actual file size in bytes.
-  final int fileSizeInBytes;
+  final int totalSizeBytes;
 
   /// Freelist head pageNo within this file (-1 = empty).
   final int freeListHeadPageNo;
@@ -56,8 +56,8 @@ final class NghPartitionMetaPage {
   const NghPartitionMetaPage({
     required this.partitionNo,
     this.dataCategory = 0,
-    this.totalEntries = 0,
-    this.fileSizeInBytes = 0,
+    this.totalEntryCount = 0,
+    this.totalSizeBytes = 0,
     this.freeListHeadPageNo = -1,
     this.freePageCount = 0,
   });
@@ -69,8 +69,8 @@ final class NghPartitionMetaPage {
     bd.setUint16(6, dataCategory, Endian.little);
     bd.setInt32(8, partitionNo, Endian.little);
     bd.setInt32(12, 0, Endian.little); // reserved
-    PlatformByteData.setInt64(bd, 16, totalEntries, Endian.little);
-    PlatformByteData.setInt64(bd, 24, fileSizeInBytes, Endian.little);
+    PlatformByteData.setInt64(bd, 16, totalEntryCount, Endian.little);
+    PlatformByteData.setInt64(bd, 24, totalSizeBytes, Endian.little);
     bd.setInt32(32, freeListHeadPageNo, Endian.little);
     bd.setInt32(36, freePageCount, Endian.little);
     // [40..127] reserved
@@ -92,8 +92,8 @@ final class NghPartitionMetaPage {
     return NghPartitionMetaPage(
       partitionNo: pNo,
       dataCategory: cat,
-      totalEntries: total < 0 ? 0 : total,
-      fileSizeInBytes: size < 0 ? 0 : size,
+      totalEntryCount: total < 0 ? 0 : total,
+      totalSizeBytes: size < 0 ? 0 : size,
       freeListHeadPageNo: freeHead,
       freePageCount: freeCount < 0 ? 0 : freeCount,
     );

@@ -5174,7 +5174,7 @@ class MigrationManager {
                   .getTableDataMeta(migrationTableCtx.tableUid);
               if (tableDataMeta != null) {
                 _telemetry.setCurrentSpaceExpectedRecords(
-                    currentTask.taskId, tableDataMeta.totalRecords);
+                    currentTask.taskId, tableDataMeta.totalRecordCount);
               }
 
               final startCursor = currentTask.checkpointKeyForSpace(space);
@@ -5192,7 +5192,7 @@ class MigrationManager {
                   currentTask.specificIndexUids != null &&
                   currentTask.specificIndexUids!.isNotEmpty) {
                 final isResume = startCursor != null && startCursor.isNotEmpty;
-                final spaceRecordCount = tableDataMeta?.totalRecords ?? 0;
+                final spaceRecordCount = tableDataMeta?.totalRecordCount ?? 0;
                 final targetSchema = await migrationInstance.tableMetaManager
                     ?.getTableSchema(migrationTableCtx.tableUid);
                 if (targetSchema != null) {
@@ -7023,7 +7023,7 @@ class MigrationManager {
         pendingSpaces: pendingSpaces,
         processedSpacesCount: processedSpaces,
         totalSpacesCount: allSpaces.length,
-        totalRecordsProcessed: stats?.totalRecords ?? 0,
+        totalRecordsProcessed: stats?.totalRecordCount ?? 0,
         throughput: stats?.calculateThroughput() ?? 0.0,
         currentSpaceProgress: stats?.calculateCurrentSpaceProgress() ?? 0.0,
         errors: task.errors ?? const [],
@@ -8940,7 +8940,7 @@ class _MigrationTelemetry {
 
   void recordRecordsProcessed(String taskId, int count) {
     final s = _stats.putIfAbsent(taskId, () => _TaskStats(taskId));
-    s.totalRecords += count;
+    s.totalRecordCount += count;
     s.currentSpaceProcessedRecords += count;
   }
 
@@ -8963,7 +8963,7 @@ class _MigrationTelemetry {
     if (s == null) return 'No stats';
     final throughput = s.calculateThroughput();
     return 'Duration: ${s.duration?.inMilliseconds ?? 0}ms, '
-        'Records: ${s.totalRecords}, '
+        'Records: ${s.totalRecordCount}, '
         'Throughput: ${throughput.toStringAsFixed(1)} rec/s, '
         'Success: ${s.success}';
   }
@@ -8976,7 +8976,7 @@ class _TaskStats {
   String? lastError;
   DateTime? endTime;
   DateTime? startTime;
-  int totalRecords = 0;
+  int totalRecordCount = 0;
   int currentSpaceExpectedRecords = 0;
   int currentSpaceProcessedRecords = 0;
 
@@ -8988,7 +8988,7 @@ class _TaskStats {
     final end = endTime ?? DateTime.now();
     final elapsedMs = end.difference(start).inMilliseconds;
     if (elapsedMs <= 0) return 0.0;
-    return (totalRecords / (elapsedMs / 1000.0));
+    return (totalRecordCount / (elapsedMs / 1000.0));
   }
 
   double calculateCurrentSpaceProgress() {

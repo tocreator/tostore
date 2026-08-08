@@ -477,7 +477,9 @@ final class IndexTreePartitionManager {
         readFromFileOnly: readFromFileOnly,
       );
       final looksValid = leaf.next.isNull &&
-          (leaf.keys.isNotEmpty || !leaf.prev.isNull || meta.totalEntries <= 0);
+          (leaf.keys.isNotEmpty ||
+              !leaf.prev.isNull ||
+              meta.totalEntryCount <= 0);
       if (looksValid) {
         return lastLeaf;
       }
@@ -591,8 +593,8 @@ final class IndexTreePartitionManager {
             encryptionKeyId: encryptionKeyId,
           );
           if (local != null) {
-            stats.oldTotalEntries = local.totalEntries;
-            stats.oldFileSizeInBytes = local.fileSizeInBytes;
+            stats.oldTotalEntries = local.totalEntryCount;
+            stats.oldFileSizeInBytes = local.totalSizeBytes;
             stats.oldFreeListHeadPageNo = local.freeListHeadPageNo;
             stats.oldFreePageCount = local.freePageCount;
             stats.oldFlushBatchKey = local.lastFlushBatchKey;
@@ -1336,8 +1338,8 @@ final class IndexTreePartitionManager {
               encryptionKeyId: encryptionKeyId,
             );
             if (local != null) {
-              stats.oldTotalEntries = local.totalEntries;
-              stats.oldFileSizeInBytes = local.fileSizeInBytes;
+              stats.oldTotalEntries = local.totalEntryCount;
+              stats.oldFileSizeInBytes = local.totalSizeBytes;
               stats.oldFreeListHeadPageNo = local.freeListHeadPageNo;
               stats.oldFreePageCount = local.freePageCount;
               stats.oldFlushBatchKey = local.lastFlushBatchKey;
@@ -1393,8 +1395,8 @@ final class IndexTreePartitionManager {
             pageType: BTreePageType.meta,
             partitionLocal: PartitionLocalStats(
               partitionNo: pNo,
-              totalEntries: newEntries,
-              fileSizeInBytes: newSize,
+              totalEntryCount: newEntries,
+              totalSizeBytes: newSize,
               freeListHeadPageNo: stats.freeListHeadPageNo,
               freePageCount: stats.freePageCount,
             ).withBatchMarkers(
@@ -1420,10 +1422,13 @@ final class IndexTreePartitionManager {
 
     final now = DateTime.now();
     final updatedMeta = meta.copyWith(
-      totalEntries: max(0, meta.totalEntries + entriesDeltaSum),
-      totalSizeInBytes: max(0, meta.totalSizeInBytes + sizeDeltaSum),
+      totalEntryCount: max(0, meta.totalEntryCount + entriesDeltaSum),
+      totalSizeBytes: max(0, meta.totalSizeBytes + sizeDeltaSum),
       timestamps: Timestamps(created: meta.timestamps.created, modified: now),
     );
+    if (sizeDeltaSum != 0) {
+      _dataStore.tableDataManager.applyIndexDataSizeDelta(table, sizeDeltaSum);
+    }
 
     // Partition 0 page 0 carries index-global metadata + local partition stats.
     // Local size must use the same rule as the loop above: btreeNextPageNo only
@@ -1450,8 +1455,8 @@ final class IndexTreePartitionManager {
               encryptionKeyId: encryptionKeyId,
             );
             if (local != null) {
-              p0Stats.oldTotalEntries = local.totalEntries;
-              p0Stats.oldFileSizeInBytes = local.fileSizeInBytes;
+              p0Stats.oldTotalEntries = local.totalEntryCount;
+              p0Stats.oldFileSizeInBytes = local.totalSizeBytes;
               p0Stats.oldFreeListHeadPageNo = local.freeListHeadPageNo;
               p0Stats.oldFreePageCount = local.freePageCount;
               p0Stats.oldFlushBatchKey = local.lastFlushBatchKey;
@@ -1497,8 +1502,8 @@ final class IndexTreePartitionManager {
           pageType: BTreePageType.meta,
           partitionLocal: PartitionLocalStats(
             partitionNo: 0,
-            totalEntries: p0NewEntries,
-            fileSizeInBytes: p0NewSize,
+            totalEntryCount: p0NewEntries,
+            totalSizeBytes: p0NewSize,
             freeListHeadPageNo: p0Stats.freeListHeadPageNo,
             freePageCount: p0Stats.freePageCount,
           ).withBatchMarkers(
@@ -1619,10 +1624,10 @@ final class IndexTreePartitionManager {
       final now = DateTime.now();
       final at =
           '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}.${now.millisecond.toString().padLeft(3, '0')}';
-      final totalEntries = max(0, meta.totalEntries + entriesDeltaSum);
-      final totalSize = max(0, meta.totalSizeInBytes + sizeDeltaSum);
+      final totalEntryCount = max(0, meta.totalEntryCount + entriesDeltaSum);
+      final totalSize = max(0, meta.totalSizeBytes + sizeDeltaSum);
       Logger.debug(
-          'Index persistence: table=$tableName, partitions=${meta.btreePartitionCount}, index=$indexLogName, batchEntries=$totalDeltas, totalEntries=$totalEntries, totalSize=${(totalSize / 1024 / 1024).toStringAsFixed(2)}MB, concurrency=${concurrency ?? 1}, cost=${sw.elapsedMilliseconds}ms, at: $at');
+          'Index persistence: table=$tableName, partitions=${meta.btreePartitionCount}, index=$indexLogName, batchEntries=$totalDeltas, totalEntryCount=$totalEntryCount, totalSize=${(totalSize / 1024 / 1024).toStringAsFixed(2)}MB, concurrency=${concurrency ?? 1}, cost=${sw.elapsedMilliseconds}ms, at: $at');
     }
   }
 
@@ -1674,8 +1679,8 @@ final class IndexTreePartitionManager {
             encryptionKeyId: encryptionKeyId,
           );
           if (local != null) {
-            s.oldFileSizeInBytes = local.fileSizeInBytes;
-            s.oldTotalEntries = local.totalEntries;
+            s.oldFileSizeInBytes = local.totalSizeBytes;
+            s.oldTotalEntries = local.totalEntryCount;
             s.oldFlushBatchKey = local.lastFlushBatchKey;
             s.oldMaintBatchKey = local.lastMaintenanceBatchKey;
             s.freeListHeadPageNo = local.freeListHeadPageNo;
@@ -1896,8 +1901,8 @@ final class IndexTreePartitionManager {
         final newSize = max(s.oldFileSizeInBytes, actualSize);
         final local = PartitionLocalStats(
           partitionNo: pNo,
-          totalEntries: s.oldTotalEntries,
-          fileSizeInBytes: newSize,
+          totalEntryCount: s.oldTotalEntries,
+          totalSizeBytes: newSize,
           freeListHeadPageNo: s.freeListHeadPageNo,
           freePageCount: s.freePageCount,
         ).withBatchMarkers(

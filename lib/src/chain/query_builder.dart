@@ -490,7 +490,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       nextCursor: result.nextCursor,
       hasMore: result.hasMore,
       hasPrev: result.hasPrev,
-      tableTotalCount: result.tableTotalCount,
+      totalRecordCount: result.totalRecordCount,
       executionTimeMs: result.executionTimeMs,
       nextPageExecutor: result.hasMore ? nextPageExecutor : null,
       prevPageExecutor: result.hasPrev ? prevPageExecutor : null,
@@ -641,7 +641,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
         hasMore: result.hasMore,
         hasPrev: result.hasPrev,
         executionTimeMs: result.executionTimeMs,
-        tableTotalCount: result.tableTotalCount,
+        totalRecordCount: result.totalRecordCount,
       );
     }
 
@@ -745,7 +745,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       hasMore: result.hasMore,
       hasPrev: result.hasPrev,
       executionTimeMs: result.executionTimeMs,
-      tableTotalCount: result.tableTotalCount,
+      totalRecordCount: result.totalRecordCount,
       count: result.count ?? results.length,
       aggregateResult: result.aggregateResult,
     );

@@ -30,7 +30,7 @@ class IntegrityChecker {
       if (fileMeta == null) {
         return false;
       }
-      if (fileMeta.totalRecords == 0) {
+      if (fileMeta.totalRecordCount == 0) {
         return true; // Empty table is valid
       }
 
@@ -115,7 +115,7 @@ class IntegrityChecker {
 
       if (fileMeta.btreePartitionCount == 0) {
         // Empty table
-        return fileMeta.totalRecords == 0 && fileMeta.totalSizeInBytes == 0;
+        return fileMeta.totalRecordCount == 0 && fileMeta.totalSizeBytes == 0;
       }
 
       // For large-scale data, only validate first and last partition meta pages
@@ -184,9 +184,9 @@ class IntegrityChecker {
                 'PartitionLocalStats.partitionNo mismatch: expected=$pNo actual=${local.partitionNo}');
             return false;
           }
-          if (local.fileSizeInBytes > actualSize) {
+          if (local.totalSizeBytes > actualSize) {
             Logger.error(
-                'PartitionLocalStats.fileSizeInBytes exceeds actual file size: pNo=$pNo hdr=${local.fileSizeInBytes} actual=$actualSize');
+                'PartitionLocalStats.totalSizeBytes exceeds actual file size: pNo=$pNo hdr=${local.totalSizeBytes} actual=$actualSize');
             return false;
           }
         } catch (e) {
@@ -213,7 +213,7 @@ class IntegrityChecker {
 
       final fileMeta =
           await _dataStore.tableDataManager.getTableDataMeta(table.tableUid);
-      if (fileMeta == null || fileMeta.totalRecords == 0) {
+      if (fileMeta == null || fileMeta.totalRecordCount == 0) {
         return true; // Empty table is valid
       }
 
@@ -344,7 +344,7 @@ class IntegrityChecker {
 
       final fileMeta =
           await _dataStore.tableDataManager.getTableDataMeta(table.tableUid);
-      if (fileMeta == null || fileMeta.totalRecords == 0) {
+      if (fileMeta == null || fileMeta.totalRecordCount == 0) {
         return true; // Empty table is valid
       }
 
@@ -485,7 +485,7 @@ class IntegrityChecker {
           await _dataStore.tableDataManager.getTableDataMeta(table.tableUid);
 
       // check if it is a new table (no meta data or meta data has no records)
-      final isNewTable = fileMeta == null || fileMeta.totalRecords <= 0;
+      final isNewTable = fileMeta == null || fileMeta.totalRecordCount <= 0;
 
       if (isNewTable) {
         Logger.info(

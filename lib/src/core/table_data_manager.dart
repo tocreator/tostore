@@ -19,9 +19,9 @@ import '../model/query_aggregation.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/space_stats.dart';
+import '../model/table_context.dart';
 import '../model/table_identity.dart';
 import '../model/table_schema.dart';
-import '../model/table_context.dart';
 import '../model/transaction_models.dart';
 import '../model/wal_pointer.dart';
 import '../query/query_condition.dart';
@@ -31,6 +31,7 @@ import 'compute/compute_batch_planner.dart';
 import 'compute/delete_batch_prepare_compute.dart';
 import 'compute/query_aggregate_compute.dart';
 import 'compute_manager.dart';
+import 'cpu_work_chunk.dart';
 import 'crontab_manager.dart';
 import 'data_store_impl.dart';
 import 'resource_manager.dart';
@@ -40,7 +41,6 @@ import 'weight_manager.dart';
 import 'workload_scheduler.dart';
 import 'write_buffer_manager.dart';
 import 'yield_controller.dart';
-import 'cpu_work_chunk.dart';
 
 /// table data manager - schedule data read/write, backup, index update, etc.
 class TableDataManager {
@@ -125,10 +125,12 @@ class TableDataManager {
   // ---------------------------------------------------------------------------
   int _baselineTableCount = 0;
   int _baselineRecordCount = 0;
-  int _baselineDataSizeBytes = 0;
+  int _baselineTableDataSizeBytes = 0;
+  int _baselineIndexDataSizeBytes = 0;
   int _deltaTableCount = 0;
   int _deltaRecordCount = 0;
-  int _deltaDataSizeBytes = 0;
+  int _deltaTableDataSizeBytes = 0;
+  int _deltaIndexDataSizeBytes = 0;
   DateTime? _lastStatisticsTime;
   bool _spaceStatsHydrated = false;
   Future<void>? _spaceStatsHydrateFuture;
@@ -586,13 +588,16 @@ class TableDataManager {
       max(0, _baselineTableCount + _deltaTableCount);
   int get _effectiveRecordCount =>
       max(0, _baselineRecordCount + _deltaRecordCount);
-  int get _effectiveDataSizeBytes =>
-      max(0, _baselineDataSizeBytes + _deltaDataSizeBytes);
+  int get _effectiveTableDataSizeBytes =>
+      max(0, _baselineTableDataSizeBytes + _deltaTableDataSizeBytes);
+  int get _effectiveIndexDataSizeBytes =>
+      max(0, _baselineIndexDataSizeBytes + _deltaIndexDataSizeBytes);
 
   SpaceStats _spaceStatsSnapshot() => SpaceStats(
         totalTableCount: _effectiveTableCount,
         totalRecordCount: _effectiveRecordCount,
-        totalDataSizeBytes: _effectiveDataSizeBytes,
+        totalTableDataSizeBytes: _effectiveTableDataSizeBytes,
+        totalIndexDataSizeBytes: _effectiveIndexDataSizeBytes,
         lastStatisticsTime: _lastStatisticsTime,
       );
 
@@ -656,7 +661,8 @@ class TableDataManager {
             bytes == null ? SpaceStats.empty : SpaceStatsCodec.decode(bytes);
         _baselineTableCount = stats.totalTableCount;
         _baselineRecordCount = stats.totalRecordCount;
-        _baselineDataSizeBytes = stats.totalDataSizeBytes;
+        _baselineTableDataSizeBytes = stats.totalTableDataSizeBytes;
+        _baselineIndexDataSizeBytes = stats.totalIndexDataSizeBytes;
         _lastStatisticsTime = stats.lastStatisticsTime;
         _spaceStatsHydrated = true;
       }
@@ -674,10 +680,12 @@ class TableDataManager {
   void _foldSpaceStatsDeltaIntoBaseline() {
     _baselineTableCount = _effectiveTableCount;
     _baselineRecordCount = _effectiveRecordCount;
-    _baselineDataSizeBytes = _effectiveDataSizeBytes;
+    _baselineTableDataSizeBytes = _effectiveTableDataSizeBytes;
+    _baselineIndexDataSizeBytes = _effectiveIndexDataSizeBytes;
     _deltaTableCount = 0;
     _deltaRecordCount = 0;
-    _deltaDataSizeBytes = 0;
+    _deltaTableDataSizeBytes = 0;
+    _deltaIndexDataSizeBytes = 0;
   }
 
   /// Space aggregate stats cover user tables only — never system/internal KV.
@@ -691,6 +699,49 @@ class TableDataManager {
     _needSaveStats = true;
   }
 
+  /// O(1) incremental adjust for persisted table-data size deltas.
+  void applyTableDataSizeDelta(TableContext table, int sizeDelta) {
+    if (sizeDelta == 0 || !_contributesToSpaceStats(table)) return;
+    _deltaTableDataSizeBytes += sizeDelta;
+    _needSaveStats = true;
+  }
+
+  /// O(1) incremental adjust for persisted index-data size deltas.
+  void applyIndexDataSizeDelta(TableContext table, int sizeDelta) {
+    if (sizeDelta == 0 || !_contributesToSpaceStats(table)) return;
+    _deltaIndexDataSizeBytes += sizeDelta;
+    _needSaveStats = true;
+  }
+
+  /// Sum index file sizes for one table (B+Tree + vector/NGH).
+  Future<int> sumTableIndexDataSizeBytes(TableContext table) async {
+    final indexManager = _dataStore.indexManager;
+    final schemaMgr = _dataStore.tableMetaManager;
+    if (indexManager == null || schemaMgr == null) return 0;
+
+    var total = 0;
+    final yieldController = YieldController(
+        'TableDataManager.sumTableIndexDataSizeBytes',
+        checkInterval: 2);
+    for (final index in schemaMgr.getBtreeIndexesFor(table.schema)) {
+      final meta =
+          await indexManager.getIndexMeta(table.tableUid, index.indexUid);
+      if (meta != null) total += meta.totalSizeBytes;
+      final y = yieldController.maybeYield();
+      if (y != null) await y;
+    }
+    final vectorMgr = _dataStore.vectorIndexManager;
+    if (vectorMgr != null) {
+      for (final index in schemaMgr.getVectorIndexesFor(table.schema)) {
+        final ngh = await vectorMgr.getNghIndexMeta(table, index.indexUid);
+        if (ngh != null) total += ngh.totalSizeBytes;
+        final y = yieldController.maybeYield();
+        if (y != null) await y;
+      }
+    }
+    return total;
+  }
+
   /// Full meta reconcile (expensive). Replaces baseline, clears deltas, persists.
   Future<void> recalculateAllStatistics() async {
     try {
@@ -702,8 +753,9 @@ class TableDataManager {
           await tableMetaManager.listAllTables(onlyUserTables: true);
 
       int tableCount = tableNames.length;
-      int totalRecords = 0;
-      int totalSize = 0;
+      int totalRecordCount = 0;
+      int totalTableDataSize = 0;
+      int totalIndexDataSize = 0;
 
       final statsLease = await _dataStore.workloadScheduler.tryAcquire(
         WorkloadType.maintenance,
@@ -713,14 +765,21 @@ class TableDataManager {
         label: 'TableDataManager.recalculateAllStatistics',
       );
       final int statsConc = (statsLease?.asConcurrency(0.3) ?? 1);
-      final metaList = await ParallelProcessor.execute<TableDataMeta?>(
+      final aggList = await ParallelProcessor.execute<
+          ({int records, int tableBytes, int indexBytes})?>(
         tableNames.map((name) {
           return () async {
             final uid = await tableMetaManager.getUidByName(TableName(name));
             if (uid == null) return null;
             final ctx = await tableMetaManager.getTableContext(uid);
             if (ctx == null) return null;
-            return getTableDataMeta(ctx.tableUid);
+            final meta = await getTableDataMeta(ctx.tableUid);
+            final indexBytes = await sumTableIndexDataSizeBytes(ctx);
+            return (
+              records: meta?.totalRecordCount ?? 0,
+              tableBytes: meta?.totalSizeBytes ?? 0,
+              indexBytes: indexBytes,
+            );
           };
         }).toList(),
         concurrency: statsConc,
@@ -730,28 +789,31 @@ class TableDataManager {
 
       final yieldController =
           YieldController('TableDataManager.recalculateAllStatistics');
-      for (final meta in metaList) {
+      for (final agg in aggList) {
         final y2 = yieldController.maybeYield();
         if (y2 != null) await y2;
-        if (meta != null) {
-          totalRecords += meta.totalRecords;
-          totalSize += meta.totalSizeInBytes;
+        if (agg != null) {
+          totalRecordCount += agg.records;
+          totalTableDataSize += agg.tableBytes;
+          totalIndexDataSize += agg.indexBytes;
         }
       }
 
       _baselineTableCount = tableCount;
-      _baselineRecordCount = totalRecords;
-      _baselineDataSizeBytes = totalSize;
+      _baselineRecordCount = totalRecordCount;
+      _baselineTableDataSizeBytes = totalTableDataSize;
+      _baselineIndexDataSizeBytes = totalIndexDataSize;
       _deltaTableCount = 0;
       _deltaRecordCount = 0;
-      _deltaDataSizeBytes = 0;
+      _deltaTableDataSizeBytes = 0;
+      _deltaIndexDataSizeBytes = 0;
       _spaceStatsHydrated = true;
       _lastStatisticsTime = DateTime.now();
 
       await _persistSpaceStatsToKv();
 
       Logger.debug(
-          'Table statistics calculation completed: table count=$tableCount, record count=$totalRecords, data size=${totalSize / 1024 / 1024}MB');
+          'Table statistics calculation completed: table count=$tableCount, record count=$totalRecordCount, table data=${totalTableDataSize / 1024 / 1024}MB, index data=${totalIndexDataSize / 1024 / 1024}MB');
     } catch (e) {
       Logger.error('Failed to calculate table statistics', rawError: e);
     }
@@ -968,10 +1030,12 @@ class TableDataManager {
       _pkComparators.clear();
       _baselineTableCount = 0;
       _baselineRecordCount = 0;
-      _baselineDataSizeBytes = 0;
+      _baselineTableDataSizeBytes = 0;
+      _baselineIndexDataSizeBytes = 0;
       _deltaTableCount = 0;
       _deltaRecordCount = 0;
-      _deltaDataSizeBytes = 0;
+      _deltaTableDataSizeBytes = 0;
+      _deltaIndexDataSizeBytes = 0;
       _lastStatisticsTime = null;
       _spaceStatsHydrated = false;
       _spaceStatsHydrateFuture = null;
@@ -1801,9 +1865,19 @@ class TableDataManager {
     return _effectiveRecordCount;
   }
 
-  /// get total data size (bytes)
-  int getTotalDataSizeBytes() {
-    return _effectiveDataSizeBytes;
+  /// get total table-data size (bytes)
+  int getTotalTableDataSizeBytes() {
+    return _effectiveTableDataSizeBytes;
+  }
+
+  /// get total index-data size (bytes)
+  int getTotalIndexDataSizeBytes() {
+    return _effectiveIndexDataSizeBytes;
+  }
+
+  /// get total size (table + index, bytes)
+  int getTotalSizeBytes() {
+    return _effectiveTableDataSizeBytes + _effectiveIndexDataSizeBytes;
   }
 
   /// mark stats data need to be updated
@@ -1827,8 +1901,12 @@ class TableDataManager {
 
       final meta = await getTableDataMeta(table.tableUid);
       if (meta != null) {
-        _deltaRecordCount -= meta.totalRecords;
-        _deltaDataSizeBytes -= meta.totalSizeInBytes;
+        _deltaRecordCount -= meta.totalRecordCount;
+        _deltaTableDataSizeBytes -= meta.totalSizeBytes;
+      }
+      final indexBytes = await sumTableIndexDataSizeBytes(table);
+      if (indexBytes != 0) {
+        _deltaIndexDataSizeBytes -= indexBytes;
       }
 
       _deltaTableCount--;
@@ -1866,7 +1944,7 @@ class TableDataManager {
   /// Internal helper to actually load record count from metadata.
   Future<void> _doLoadRecordCount(TableContext table) async {
     final meta = await getTableDataMeta(table.tableUid);
-    _tableRecordCounts[table.tableUid] = meta?.totalRecords ?? 0;
+    _tableRecordCounts[table.tableUid] = meta?.totalRecordCount ?? 0;
   }
 
   /// get table record count by table name
@@ -1923,36 +2001,6 @@ class TableDataManager {
     // The final count is the stored count, plus pending inserts, minus pending deletes,
     // plus current transaction's deferred delta. Clamp to >= 0 to avoid negative results.
     return max(0, count);
-  }
-
-  /// get table file size
-  Future<int> getTableFileSize(TableContext table) async {
-    final tableUid = table.tableUid;
-    if (!_fileSizes.containsKey(tableUid)) {
-      final meta = await getTableDataMeta(table.tableUid);
-      return meta?.totalSizeInBytes ?? 0;
-    }
-    return _fileSizes[tableUid] ?? 0;
-  }
-
-  /// update table file size and modified time
-  Future<void> updateFileSize(TableContext table, int size) async {
-    final tableUid = table.tableUid;
-    _fileSizes[tableUid] = size;
-    _lastModifiedTimes[tableUid] = DateTime.now();
-  }
-
-  /// check if file is modified
-  bool isFileModified(TableContext table, DateTime lastReadTime) {
-    final tableUid = table.tableUid;
-    final lastModified = _lastModifiedTimes[tableUid];
-    return lastModified == null || lastModified.isAfter(lastReadTime);
-  }
-
-  /// get file last modified time
-  DateTime? getLastModifiedTime(TableContext table) {
-    final tableUid = table.tableUid;
-    return _lastModifiedTimes[tableUid];
   }
 
   String _tableDataMetaLockResource(TableUid tableUid) =>
@@ -2112,8 +2160,6 @@ class TableDataManager {
           encryptionKeyId: encryptionKeyId,
         );
       }
-
-      updateFileSize(table, meta.totalSizeInBytes);
     } catch (e) {
       Logger.error('Failed to update table data meta', rawError: e);
       rethrow;
@@ -2315,11 +2361,11 @@ class TableDataManager {
       // Fast path for empty tables: skip B+Tree reverse scan (can cost 100ms+
       // on cold storage) when metadata already proves there are no records.
       final bool tableEmptyOnDisk =
-          fileMeta == null || fileMeta.totalRecords <= 0;
+          fileMeta == null || fileMeta.totalRecordCount <= 0;
 
       if (!tableEmptyOnDisk) {
         // Prefer cached maxAutoIncrementId when present — avoids a leaf scan.
-        // !tableEmptyOnDisk implies fileMeta != null && totalRecords > 0.
+        // !tableEmptyOnDisk implies fileMeta != null && totalRecordCount > 0.
         final cachedMetaMax = fileMeta.maxAutoIncrementId;
         if (cachedMetaMax != null &&
             cachedMetaMax.isNotEmpty &&
@@ -2868,10 +2914,14 @@ class TableDataManager {
             if (_contributesToSpaceStats(table)) {
               final fileMeta = await getTableDataMeta(table.tableUid);
               if (fileMeta != null) {
-                _deltaRecordCount -= fileMeta.totalRecords;
-                _deltaDataSizeBytes -= fileMeta.totalSizeInBytes;
-                _needSaveStats = true;
+                _deltaRecordCount -= fileMeta.totalRecordCount;
+                _deltaTableDataSizeBytes -= fileMeta.totalSizeBytes;
               }
+              final indexBytes = await sumTableIndexDataSizeBytes(table);
+              if (indexBytes != 0) {
+                _deltaIndexDataSizeBytes -= indexBytes;
+              }
+              _needSaveStats = true;
             }
           } catch (e) {
             Logger.warn(
@@ -4161,7 +4211,7 @@ class TableDataManager {
     TableDataMeta? fileMeta;
     if (!isMemoryMode) {
       fileMeta = await getTableDataMeta(table.tableUid);
-      if (fileMeta == null || fileMeta.totalRecords <= 0) {
+      if (fileMeta == null || fileMeta.totalRecordCount <= 0) {
         return TableScanResult(
           records: const [],
           count: onlyCount ? 0 : null,

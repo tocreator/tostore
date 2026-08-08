@@ -7,8 +7,9 @@ import 'binary_codec.dart';
 abstract final class SpaceStatsFieldId {
   static const int totalTableCount = 1;
   static const int totalRecordCount = 2;
-  static const int totalDataSizeBytes = 3;
+  static const int totalTableDataSizeBytes = 3;
   static const int lastStatisticsTime = 4;
+  static const int totalIndexDataSizeBytes = 5;
 }
 
 /// Binary payload codec for [SpaceStats] (InternalKv value, no file shell).
@@ -16,14 +17,16 @@ final class SpaceStatsCodec {
   SpaceStatsCodec._();
 
   static Uint8List encode(SpaceStats stats) {
-    final w = BinaryWriter(initialCapacity: 48);
+    final w = BinaryWriter(initialCapacity: 56);
 
     w.writeFieldTag(SpaceStatsFieldId.totalTableCount, WireType.varint);
     w.writeVarint(stats.totalTableCount);
     w.writeFieldTag(SpaceStatsFieldId.totalRecordCount, WireType.varint);
     w.writeVarint(stats.totalRecordCount);
-    w.writeFieldTag(SpaceStatsFieldId.totalDataSizeBytes, WireType.varint);
-    w.writeVarint(stats.totalDataSizeBytes);
+    w.writeFieldTag(SpaceStatsFieldId.totalTableDataSizeBytes, WireType.varint);
+    w.writeVarint(stats.totalTableDataSizeBytes);
+    w.writeFieldTag(SpaceStatsFieldId.totalIndexDataSizeBytes, WireType.varint);
+    w.writeVarint(stats.totalIndexDataSizeBytes);
 
     if (stats.lastStatisticsTime != null) {
       w.writeFieldTag(SpaceStatsFieldId.lastStatisticsTime, WireType.fixed64);
@@ -36,7 +39,8 @@ final class SpaceStatsCodec {
   static SpaceStats decode(Uint8List bytes) {
     var totalTableCount = 0;
     var totalRecordCount = 0;
-    var totalDataSizeBytes = 0;
+    var totalTableDataSizeBytes = 0;
+    var totalIndexDataSizeBytes = 0;
     DateTime? lastStatisticsTime;
 
     if (bytes.isNotEmpty) {
@@ -50,8 +54,11 @@ final class SpaceStatsCodec {
           case SpaceStatsFieldId.totalRecordCount:
             totalRecordCount = r.readVarint();
             break;
-          case SpaceStatsFieldId.totalDataSizeBytes:
-            totalDataSizeBytes = r.readVarint();
+          case SpaceStatsFieldId.totalTableDataSizeBytes:
+            totalTableDataSizeBytes = r.readVarint();
+            break;
+          case SpaceStatsFieldId.totalIndexDataSizeBytes:
+            totalIndexDataSizeBytes = r.readVarint();
             break;
           case SpaceStatsFieldId.lastStatisticsTime:
             lastStatisticsTime =
@@ -67,7 +74,8 @@ final class SpaceStatsCodec {
     return SpaceStats(
       totalTableCount: totalTableCount,
       totalRecordCount: totalRecordCount,
-      totalDataSizeBytes: totalDataSizeBytes,
+      totalTableDataSizeBytes: totalTableDataSizeBytes,
+      totalIndexDataSizeBytes: totalIndexDataSizeBytes,
       lastStatisticsTime: lastStatisticsTime,
     );
   }

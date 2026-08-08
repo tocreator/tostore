@@ -16,7 +16,7 @@ class CostEstimator {
   /// estimate query plan cost
   double estimateCost(QueryPlan plan) {
     double totalCost = 0.0;
-    int estimatedRows = _statistics.totalRows;
+    int estimatedRows = _statistics.totalRecordCount;
 
     final operation = plan.operation;
     switch (operation.type) {
@@ -97,10 +97,10 @@ class CostEstimator {
     Map<String, dynamic>? where,
   ) {
     if (where == null || where.isEmpty) {
-      return _statistics.totalRows;
+      return _statistics.totalRecordCount;
     }
 
-    var cardinality = _statistics.totalRows;
+    var cardinality = _statistics.totalRecordCount;
 
     for (var entry in where.entries) {
       final fieldStats = _statistics.fieldStats[entry.key];

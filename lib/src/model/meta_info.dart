@@ -187,8 +187,8 @@ class FileMeta {
 class TableDataMeta {
   final int version;
   final TableUid tableUid;
-  final int totalSizeInBytes;
-  final int totalRecords;
+  final int totalSizeBytes;
+  final int totalRecordCount;
   final Timestamps timestamps;
 
   /// Maximum auto-increment primary key value for sequential primary key tables.
@@ -222,8 +222,8 @@ class TableDataMeta {
   TableDataMeta({
     int? version,
     required this.tableUid,
-    required this.totalSizeInBytes,
-    required this.totalRecords,
+    required this.totalSizeBytes,
+    required this.totalRecordCount,
     required this.timestamps,
     this.maxAutoIncrementId,
     required this.btreeNextPageNo,
@@ -251,8 +251,8 @@ class TableDataMeta {
     final timestamp = now ?? DateTime.now();
     return TableDataMeta(
       tableUid: tableUid,
-      totalSizeInBytes: 0,
-      totalRecords: 0,
+      totalSizeBytes: 0,
+      totalRecordCount: 0,
       timestamps: Timestamps(created: timestamp, modified: timestamp),
       btreeNextPageNo: firstDataPageNo,
       btreePartitionCount: partitionCount,
@@ -266,8 +266,8 @@ class TableDataMeta {
   TableDataMeta copyWith({
     int? version,
     TableUid? tableUid,
-    int? totalSizeInBytes,
-    int? totalRecords,
+    int? totalSizeBytes,
+    int? totalRecordCount,
     Timestamps? timestamps,
     String? maxAutoIncrementId,
     int? btreeNextPageNo,
@@ -280,8 +280,8 @@ class TableDataMeta {
     return TableDataMeta(
       version: version ?? this.version,
       tableUid: tableUid ?? this.tableUid,
-      totalSizeInBytes: totalSizeInBytes ?? this.totalSizeInBytes,
-      totalRecords: totalRecords ?? this.totalRecords,
+      totalSizeBytes: totalSizeBytes ?? this.totalSizeBytes,
+      totalRecordCount: totalRecordCount ?? this.totalRecordCount,
       timestamps: timestamps ?? this.timestamps,
       maxAutoIncrementId: maxAutoIncrementId ?? this.maxAutoIncrementId,
       btreeNextPageNo: btreeNextPageNo ?? this.btreeNextPageNo,
@@ -302,9 +302,11 @@ class TableDataMeta {
     TableUid? tableUidFallback,
   }) {
     final resolvedUid = _resolveTableUidFromJson(json, tableUidFallback);
+    final totalSizeRaw = json['totalSizeBytes'] ?? json['totalSizeInBytes'];
+    final totalRecordRaw = json['totalRecordCount'] ?? json['totalRecords'];
     if (resolvedUid == null ||
-        json['totalSizeInBytes'] == null ||
-        json['totalRecords'] == null ||
+        totalSizeRaw == null ||
+        totalRecordRaw == null ||
         json['timestamps'] == null ||
         json['btreeNextPageNo'] == null ||
         json['btreePartitionCount'] == null ||
@@ -318,8 +320,8 @@ class TableDataMeta {
           message:
               'Missing required fields for TableDataMeta. Missing fields: ${[
             if (resolvedUid == null) 'tableUid',
-            if (json['totalSizeInBytes'] == null) 'totalSizeInBytes',
-            if (json['totalRecords'] == null) 'totalRecords',
+            if (totalSizeRaw == null) 'totalSizeBytes',
+            if (totalRecordRaw == null) 'totalRecordCount',
             if (json['timestamps'] == null) 'timestamps',
             if (json['btreeNextPageNo'] == null) 'btreeNextPageNo',
             if (json['btreePartitionCount'] == null) 'btreePartitionCount',
@@ -336,12 +338,10 @@ class TableDataMeta {
       version:
           resolveVersionValue(json['version'], InternalConfig.tableDataVersion),
       tableUid: TableUid.parse(resolvedUid),
-      totalSizeInBytes: json['totalSizeInBytes'] is int
-          ? json['totalSizeInBytes'] as int
-          : int.parse('${json['totalSizeInBytes']}'),
-      totalRecords: json['totalRecords'] is int
-          ? json['totalRecords'] as int
-          : int.parse('${json['totalRecords']}'),
+      totalSizeBytes:
+          totalSizeRaw is int ? totalSizeRaw : int.parse('$totalSizeRaw'),
+      totalRecordCount:
+          totalRecordRaw is int ? totalRecordRaw : int.parse('$totalRecordRaw'),
       timestamps:
           Timestamps.fromJson(json['timestamps'] as Map<String, dynamic>),
       maxAutoIncrementId: json['maxAutoIncrementId'] as String?,
@@ -362,8 +362,8 @@ class TableDataMeta {
     return {
       'version': version,
       'tableUid': tableUid,
-      'totalSizeInBytes': totalSizeInBytes,
-      'totalRecords': totalRecords,
+      'totalSizeBytes': totalSizeBytes,
+      'totalRecordCount': totalRecordCount,
       'timestamps': timestamps.toJson(),
       if (maxAutoIncrementId != null) 'maxAutoIncrementId': maxAutoIncrementId,
       'btreeNextPageNo': btreeNextPageNo,
@@ -377,7 +377,7 @@ class TableDataMeta {
 
   @override
   String toString() =>
-      'TableDataMeta(version: $version, tableUid: $tableUid, totalSizeInBytes: $totalSizeInBytes, totalRecords: $totalRecords, btreePartitionCount: $btreePartitionCount, btreeHeight: $btreeHeight, btreeRoot: $btreeRoot)';
+      'TableDataMeta(version: $version, tableUid: $tableUid, totalSizeBytes: $totalSizeBytes, totalRecordCount: $totalRecordCount, btreePartitionCount: $btreePartitionCount, btreeHeight: $btreeHeight, btreeRoot: $btreeRoot)';
 }
 
 /// timestamp info
@@ -745,10 +745,10 @@ class IndexMeta {
   final bool isBuilding;
 
   /// total size of all partitions in bytes
-  final int totalSizeInBytes;
+  final int totalSizeBytes;
 
   /// total number of entries in the index
-  final int totalEntries;
+  final int totalEntryCount;
 
   /// timestamps
   final Timestamps timestamps;
@@ -783,8 +783,8 @@ class IndexMeta {
     required this.isUnique,
     this.isBuilding = false,
     required this.timestamps,
-    this.totalSizeInBytes = 0,
-    this.totalEntries = 0,
+    this.totalSizeBytes = 0,
+    this.totalEntryCount = 0,
     required this.btreeNextPageNo,
     required this.btreePartitionCount,
     required this.btreeRoot,
@@ -813,8 +813,8 @@ class IndexMeta {
       isUnique: isUnique,
       isBuilding: isBuilding,
       timestamps: Timestamps(created: timestamp, modified: timestamp),
-      totalSizeInBytes: 0,
-      totalEntries: 0,
+      totalSizeBytes: 0,
+      totalEntryCount: 0,
       btreeNextPageNo: firstDataPageNo,
       btreePartitionCount: partitionCount,
       btreeRoot: TreePagePtr.nullPtr,
@@ -831,8 +831,8 @@ class IndexMeta {
     bool? isUnique,
     bool? isBuilding,
     Timestamps? timestamps,
-    int? totalSizeInBytes,
-    int? totalEntries,
+    int? totalSizeBytes,
+    int? totalEntryCount,
     int? btreeNextPageNo,
     int? btreePartitionCount,
     TreePagePtr? btreeRoot,
@@ -847,8 +847,8 @@ class IndexMeta {
       isUnique: isUnique ?? this.isUnique,
       isBuilding: isBuilding ?? this.isBuilding,
       timestamps: timestamps ?? this.timestamps,
-      totalSizeInBytes: totalSizeInBytes ?? this.totalSizeInBytes,
-      totalEntries: totalEntries ?? this.totalEntries,
+      totalSizeBytes: totalSizeBytes ?? this.totalSizeBytes,
+      totalEntryCount: totalEntryCount ?? this.totalEntryCount,
       btreeNextPageNo: btreeNextPageNo ?? this.btreeNextPageNo,
       btreePartitionCount: btreePartitionCount ?? this.btreePartitionCount,
       btreeRoot: btreeRoot ?? this.btreeRoot,
@@ -905,8 +905,14 @@ class IndexMeta {
       isBuilding: json['isBuilding'] as bool? ?? false,
       timestamps:
           Timestamps.fromJson(json['timestamps'] as Map<String, dynamic>),
-      totalSizeInBytes: (json['totalSizeInBytes'] as num?)?.toInt() ?? 0,
-      totalEntries: (json['totalEntries'] as num?)?.toInt() ?? 0,
+      totalSizeBytes:
+          ((json['totalSizeBytes'] ?? json['totalSizeInBytes']) as num?)
+                  ?.toInt() ??
+              0,
+      totalEntryCount:
+          ((json['totalEntryCount'] ?? json['totalEntries']) as num?)
+                  ?.toInt() ??
+              0,
       btreeNextPageNo: (json['btreeNextPageNo'] as num).toInt(),
       btreePartitionCount: (json['btreePartitionCount'] as num).toInt(),
       btreeRoot:
@@ -926,8 +932,8 @@ class IndexMeta {
       'tableUid': tableUid,
       'isUnique': isUnique,
       'isBuilding': isBuilding,
-      'totalSizeInBytes': totalSizeInBytes,
-      'totalEntries': totalEntries,
+      'totalSizeBytes': totalSizeBytes,
+      'totalEntryCount': totalEntryCount,
       'timestamps': timestamps.toJson(),
       'btreeNextPageNo': btreeNextPageNo,
       'btreePartitionCount': btreePartitionCount,
@@ -940,7 +946,7 @@ class IndexMeta {
 
   @override
   String toString() {
-    return 'IndexMeta(version: $version, indexUid: $indexUid, tableUid: $tableUid, isBuilding: $isBuilding, totalSizeInBytes: $totalSizeInBytes, totalEntries: $totalEntries, btreePartitionCount: $btreePartitionCount, btreeHeight: $btreeHeight, btreeRoot: $btreeRoot)';
+    return 'IndexMeta(version: $version, indexUid: $indexUid, tableUid: $tableUid, isBuilding: $isBuilding, totalSizeBytes: $totalSizeBytes, totalEntryCount: $totalEntryCount, btreePartitionCount: $btreePartitionCount, btreeHeight: $btreeHeight, btreeRoot: $btreeRoot)';
   }
 }
 

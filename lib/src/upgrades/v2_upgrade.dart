@@ -1,20 +1,21 @@
 import 'dart:convert';
 import 'dart:math';
+
+import '../core/data_store_impl.dart';
+import '../core/workload_scheduler.dart';
+import '../core/yield_controller.dart';
+import '../handler/chacha20_poly1305_old.dart';
 import '../handler/common.dart';
 import '../handler/encryption.dart';
 import '../handler/logger.dart';
-import '../handler/chacha20_poly1305_old.dart';
+import '../handler/parallel_processor.dart';
 import '../model/data_store_config.dart';
 import '../model/global_config.dart';
-import '../model/table_meta.dart';
-import '../core/data_store_impl.dart';
-import '../core/workload_scheduler.dart';
-import '../handler/parallel_processor.dart';
-import '../core/yield_controller.dart';
-import 'legacy_model/pre_v3.dart';
-import 'applied_encryption_bootstrap.dart';
-import 'v3_upgrade.dart';
 import '../model/table_identity.dart';
+import '../model/table_meta.dart';
+import 'applied_encryption_bootstrap.dart';
+import 'legacy_model/pre_v3.dart';
+import 'v3_upgrade.dart';
 
 /// Version 2 upgrade handler.
 ///
@@ -413,17 +414,17 @@ class V2Upgrade {
       for (int i = 0; i < oldPartitionMetas.length; i++) {
         final partitionMeta = oldPartitionMetas[i];
 
-        int totalRecords = 0;
+        int totalRecordCount = 0;
         if (partitionMeta['totalRecords'] is int) {
-          totalRecords = partitionMeta['totalRecords'] as int;
+          totalRecordCount = partitionMeta['totalRecords'] as int;
         } else if (partitionMeta['fileSizeInBytes'] is int) {
-          totalRecords = (partitionMeta['fileSizeInBytes'] as int) ~/ 1024;
+          totalRecordCount = (partitionMeta['fileSizeInBytes'] as int) ~/ 1024;
         } else {
-          totalRecords = 1000;
+          totalRecordCount = 1000;
         }
 
         currentBatchMetas.add(partitionMeta);
-        currentBatchRecordCount += totalRecords;
+        currentBatchRecordCount += totalRecordCount;
 
         if (currentBatchRecordCount >= writeBatchSize ||
             currentBatchMetas.length >= (heuristicConcurrency * 2)) {

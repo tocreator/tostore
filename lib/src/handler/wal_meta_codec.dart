@@ -49,10 +49,10 @@ abstract final class BatchTablePlanFieldId {
   static const int willUpdateTableDataMeta = 1;
   static const int indexes = 2;
   static const int willUpdateIndexMeta = 3;
-  static const int baseTotalRecords = 4;
-  static const int baseTotalSizeInBytes = 5;
-  static const int baseIndexTotalEntries = 6;
-  static const int baseIndexTotalSizeInBytes = 7;
+  static const int baseTotalRecordCount = 4;
+  static const int baseTotalSizeBytes = 5;
+  static const int baseIndexTotalEntryCount = 6;
+  static const int baseIndexTotalSizeBytes = 7;
 }
 
 abstract final class IndexIntEntryFieldId {
@@ -417,18 +417,19 @@ final class WalMetaCodec {
     }
     w.writeFieldTag(BatchTablePlanFieldId.willUpdateIndexMeta, WireType.varint);
     w.writeBool(plan.willUpdateIndexMeta);
-    if (plan.baseTotalRecords != null) {
-      w.writeFieldTag(BatchTablePlanFieldId.baseTotalRecords, WireType.varint);
-      w.writeZigZag64(plan.baseTotalRecords!);
-    }
-    if (plan.baseTotalSizeInBytes != null) {
+    if (plan.baseTotalRecordCount != null) {
       w.writeFieldTag(
-          BatchTablePlanFieldId.baseTotalSizeInBytes, WireType.varint);
-      w.writeZigZag64(plan.baseTotalSizeInBytes!);
+          BatchTablePlanFieldId.baseTotalRecordCount, WireType.varint);
+      w.writeZigZag64(plan.baseTotalRecordCount!);
     }
-    if (plan.baseIndexTotalEntries != null) {
-      for (final e in plan.baseIndexTotalEntries!.entries) {
-        w.writeMessage(BatchTablePlanFieldId.baseIndexTotalEntries, (sw) {
+    if (plan.baseTotalSizeBytes != null) {
+      w.writeFieldTag(
+          BatchTablePlanFieldId.baseTotalSizeBytes, WireType.varint);
+      w.writeZigZag64(plan.baseTotalSizeBytes!);
+    }
+    if (plan.baseIndexTotalEntryCount != null) {
+      for (final e in plan.baseIndexTotalEntryCount!.entries) {
+        w.writeMessage(BatchTablePlanFieldId.baseIndexTotalEntryCount, (sw) {
           sw.writeFieldTag(
               IndexIntEntryFieldId.indexUid, WireType.lengthDelimited);
           sw.writeString(e.key.value);
@@ -437,9 +438,9 @@ final class WalMetaCodec {
         });
       }
     }
-    if (plan.baseIndexTotalSizeInBytes != null) {
-      for (final e in plan.baseIndexTotalSizeInBytes!.entries) {
-        w.writeMessage(BatchTablePlanFieldId.baseIndexTotalSizeInBytes, (sw) {
+    if (plan.baseIndexTotalSizeBytes != null) {
+      for (final e in plan.baseIndexTotalSizeBytes!.entries) {
+        w.writeMessage(BatchTablePlanFieldId.baseIndexTotalSizeBytes, (sw) {
           sw.writeFieldTag(
               IndexIntEntryFieldId.indexUid, WireType.lengthDelimited);
           sw.writeString(e.key.value);
@@ -454,10 +455,10 @@ final class WalMetaCodec {
     var willUpdateTableDataMeta = true;
     final indexes = <IndexUid>[];
     var willUpdateIndexMeta = false;
-    int? baseTotalRecords;
-    int? baseTotalSizeInBytes;
-    Map<IndexUid, int>? baseIndexTotalEntries;
-    Map<IndexUid, int>? baseIndexTotalSizeInBytes;
+    int? baseTotalRecordCount;
+    int? baseTotalSizeBytes;
+    Map<IndexUid, int>? baseIndexTotalEntryCount;
+    Map<IndexUid, int>? baseIndexTotalSizeBytes;
 
     while (!r.isEOF) {
       final (fieldId, wireType) = r.readFieldTag();
@@ -471,27 +472,27 @@ final class WalMetaCodec {
         case BatchTablePlanFieldId.willUpdateIndexMeta:
           willUpdateIndexMeta = r.readBool();
           break;
-        case BatchTablePlanFieldId.baseTotalRecords:
-          baseTotalRecords = r.readZigZag64();
+        case BatchTablePlanFieldId.baseTotalRecordCount:
+          baseTotalRecordCount = r.readZigZag64();
           break;
-        case BatchTablePlanFieldId.baseTotalSizeInBytes:
-          baseTotalSizeInBytes = r.readZigZag64();
+        case BatchTablePlanFieldId.baseTotalSizeBytes:
+          baseTotalSizeBytes = r.readZigZag64();
           break;
-        case BatchTablePlanFieldId.baseIndexTotalEntries:
+        case BatchTablePlanFieldId.baseIndexTotalEntryCount:
           r.readMessage((sr, _) {
-            baseIndexTotalEntries ??= <IndexUid, int>{};
+            baseIndexTotalEntryCount ??= <IndexUid, int>{};
             final entry = _readIndexIntEntry(sr);
             if (entry != null) {
-              baseIndexTotalEntries![entry.$1] = entry.$2;
+              baseIndexTotalEntryCount![entry.$1] = entry.$2;
             }
           });
           break;
-        case BatchTablePlanFieldId.baseIndexTotalSizeInBytes:
+        case BatchTablePlanFieldId.baseIndexTotalSizeBytes:
           r.readMessage((sr, _) {
-            baseIndexTotalSizeInBytes ??= <IndexUid, int>{};
+            baseIndexTotalSizeBytes ??= <IndexUid, int>{};
             final entry = _readIndexIntEntry(sr);
             if (entry != null) {
-              baseIndexTotalSizeInBytes![entry.$1] = entry.$2;
+              baseIndexTotalSizeBytes![entry.$1] = entry.$2;
             }
           });
           break;
@@ -505,10 +506,10 @@ final class WalMetaCodec {
       willUpdateTableDataMeta: willUpdateTableDataMeta,
       indexes: indexes,
       willUpdateIndexMeta: willUpdateIndexMeta,
-      baseTotalRecords: baseTotalRecords,
-      baseTotalSizeInBytes: baseTotalSizeInBytes,
-      baseIndexTotalEntries: baseIndexTotalEntries,
-      baseIndexTotalSizeInBytes: baseIndexTotalSizeInBytes,
+      baseTotalRecordCount: baseTotalRecordCount,
+      baseTotalSizeBytes: baseTotalSizeBytes,
+      baseIndexTotalEntryCount: baseIndexTotalEntryCount,
+      baseIndexTotalSizeBytes: baseIndexTotalSizeBytes,
     );
   }
 

@@ -710,8 +710,8 @@ class ParallelJournalManager {
             final tableDataMeta = await _dataStore.tableDataManager
                 .getTableDataMeta(tableContext.tableUid);
             final indexUids = <IndexUid>[];
-            final baseIndexTotalEntries = <IndexUid, int>{};
-            final baseIndexTotalSizeInBytes = <IndexUid, int>{};
+            final baseIndexTotalEntryCount = <IndexUid, int>{};
+            final baseIndexTotalSizeBytes = <IndexUid, int>{};
 
             if (schema != null) {
               // B+Tree indexes only (vector indexes have separate meta).
@@ -727,9 +727,10 @@ class ParallelJournalManager {
                 final idxMeta = await _dataStore.indexManager
                     ?.getIndexMeta(tableContext.tableUid, idx.indexUid);
                 if (idxMeta != null) {
-                  baseIndexTotalEntries[idx.indexUid] = idxMeta.totalEntries;
-                  baseIndexTotalSizeInBytes[idx.indexUid] =
-                      idxMeta.totalSizeInBytes;
+                  baseIndexTotalEntryCount[idx.indexUid] =
+                      idxMeta.totalEntryCount;
+                  baseIndexTotalSizeBytes[idx.indexUid] =
+                      idxMeta.totalSizeBytes;
                 }
               }
             }
@@ -747,10 +748,10 @@ class ParallelJournalManager {
               willUpdateTableDataMeta: true,
               indexes: indexUids,
               willUpdateIndexMeta: indexUids.isNotEmpty,
-              baseTotalRecords: tableDataMeta?.totalRecords,
-              baseTotalSizeInBytes: tableDataMeta?.totalSizeInBytes,
-              baseIndexTotalEntries: baseIndexTotalEntries,
-              baseIndexTotalSizeInBytes: baseIndexTotalSizeInBytes,
+              baseTotalRecordCount: tableDataMeta?.totalRecordCount,
+              baseTotalSizeBytes: tableDataMeta?.totalSizeBytes,
+              baseIndexTotalEntryCount: baseIndexTotalEntryCount,
+              baseIndexTotalSizeBytes: baseIndexTotalSizeBytes,
             );
           } catch (_) {}
         }
@@ -1708,8 +1709,8 @@ class ParallelJournalManager {
   Future<void> _restoreTableBaseTotals(
       TableUid tableUid, BatchTablePlan? plan) async {
     if (plan == null ||
-        plan.baseTotalRecords == null ||
-        plan.baseTotalSizeInBytes == null) {
+        plan.baseTotalRecordCount == null ||
+        plan.baseTotalSizeBytes == null) {
       return;
     }
     final tableContext = await _resolveTableContext(tableUid);
@@ -1719,8 +1720,8 @@ class ParallelJournalManager {
           .getTableDataMeta(tableContext.tableUid);
       if (meta == null) return;
       final updated = meta.copyWith(
-        totalRecords: plan.baseTotalRecords!,
-        totalSizeInBytes: plan.baseTotalSizeInBytes!,
+        totalRecordCount: plan.baseTotalRecordCount!,
+        totalSizeBytes: plan.baseTotalSizeBytes!,
         timestamps: Timestamps(
             created: meta.timestamps.created, modified: DateTime.now()),
       );
@@ -1742,8 +1743,8 @@ class ParallelJournalManager {
     BatchTablePlan? plan,
   ) async {
     if (plan == null) return;
-    final baseEntries = plan.baseIndexTotalEntries?[indexUid];
-    final baseSize = plan.baseIndexTotalSizeInBytes?[indexUid];
+    final baseEntries = plan.baseIndexTotalEntryCount?[indexUid];
+    final baseSize = plan.baseIndexTotalSizeBytes?[indexUid];
     if (baseEntries == null || baseSize == null) return;
     final tableContext = await _resolveTableContext(tableUid);
     if (tableContext == null) return;
@@ -1752,8 +1753,8 @@ class ParallelJournalManager {
           await _dataStore.indexManager?.getIndexMeta(tableUid, indexUid);
       if (idxMeta == null) return;
       final updated = idxMeta.copyWith(
-        totalEntries: baseEntries,
-        totalSizeInBytes: baseSize,
+        totalEntryCount: baseEntries,
+        totalSizeBytes: baseSize,
         timestamps: Timestamps(
             created: idxMeta.timestamps.created, modified: DateTime.now()),
       );
@@ -2210,8 +2211,8 @@ class ParallelJournalManager {
     final tableDataMeta = await _dataStore.tableDataManager
         .getTableDataMeta(tableContext.tableUid);
     final indexUids = <IndexUid>[];
-    final baseIndexTotalEntries = <IndexUid, int>{};
-    final baseIndexTotalSizeInBytes = <IndexUid, int>{};
+    final baseIndexTotalEntryCount = <IndexUid, int>{};
+    final baseIndexTotalSizeBytes = <IndexUid, int>{};
     try {
       final btreeIndexes = <IndexSchema>[
         ...?_dataStore.tableMetaManager?.getBtreeIndexesFor(schema),
@@ -2223,8 +2224,8 @@ class ParallelJournalManager {
         final idxMeta = await _dataStore.indexManager
             ?.getIndexMeta(tableContext.tableUid, idx.indexUid);
         if (idxMeta != null) {
-          baseIndexTotalEntries[idx.indexUid] = idxMeta.totalEntries;
-          baseIndexTotalSizeInBytes[idx.indexUid] = idxMeta.totalSizeInBytes;
+          baseIndexTotalEntryCount[idx.indexUid] = idxMeta.totalEntryCount;
+          baseIndexTotalSizeBytes[idx.indexUid] = idxMeta.totalSizeBytes;
         }
       }
     } catch (_) {}
@@ -2234,10 +2235,10 @@ class ParallelJournalManager {
         willUpdateTableDataMeta: true,
         indexes: indexUids,
         willUpdateIndexMeta: indexUids.isNotEmpty,
-        baseTotalRecords: tableDataMeta?.totalRecords,
-        baseTotalSizeInBytes: tableDataMeta?.totalSizeInBytes,
-        baseIndexTotalEntries: baseIndexTotalEntries,
-        baseIndexTotalSizeInBytes: baseIndexTotalSizeInBytes,
+        baseTotalRecordCount: tableDataMeta?.totalRecordCount,
+        baseTotalSizeBytes: tableDataMeta?.totalSizeBytes,
+        baseIndexTotalEntryCount: baseIndexTotalEntryCount,
+        baseIndexTotalSizeBytes: baseIndexTotalSizeBytes,
       ),
     };
 

@@ -666,7 +666,9 @@ final class TableTreePartitionManager {
         readFromFileOnly: readFromFileOnly,
       );
       final looksValid = leaf.next.isNull &&
-          (leaf.keys.isNotEmpty || !leaf.prev.isNull || meta.totalRecords <= 0);
+          (leaf.keys.isNotEmpty ||
+              !leaf.prev.isNull ||
+              meta.totalRecordCount <= 0);
       if (looksValid) {
         return lastLeaf;
       }
@@ -697,9 +699,9 @@ final class TableTreePartitionManager {
     final tableName = table.tableName;
     final tableUid = table.tableUid;
     final sw = Stopwatch()..start();
-    final totalRecords = inserts.length + updates.length + deletes.length;
+    final totalRecordCount = inserts.length + updates.length + deletes.length;
 
-    if (totalRecords == 0) {
+    if (totalRecordCount == 0) {
       return;
     }
 
@@ -805,8 +807,8 @@ final class TableTreePartitionManager {
             encryptionKeyId: encryptionKeyId,
           );
           if (local != null) {
-            stats.oldTotalEntries = local.totalEntries;
-            stats.oldFileSizeInBytes = local.fileSizeInBytes;
+            stats.oldTotalEntries = local.totalEntryCount;
+            stats.oldFileSizeInBytes = local.totalSizeBytes;
             stats.oldFreeListHeadPageNo = local.freeListHeadPageNo;
             stats.oldFreePageCount = local.freePageCount;
             stats.oldFlushBatchKey = local.lastFlushBatchKey;
@@ -1673,8 +1675,8 @@ final class TableTreePartitionManager {
               encryptionKeyId: encryptionKeyId,
             );
             if (local != null) {
-              stats.oldTotalEntries = local.totalEntries;
-              stats.oldFileSizeInBytes = local.fileSizeInBytes;
+              stats.oldTotalEntries = local.totalEntryCount;
+              stats.oldFileSizeInBytes = local.totalSizeBytes;
               stats.oldFreeListHeadPageNo = local.freeListHeadPageNo;
               stats.oldFreePageCount = local.freePageCount;
               stats.oldFlushBatchKey = local.lastFlushBatchKey;
@@ -1726,8 +1728,8 @@ final class TableTreePartitionManager {
             pageType: BTreePageType.meta,
             partitionLocal: PartitionLocalStats(
               partitionNo: pNo,
-              totalEntries: newEntries,
-              fileSizeInBytes: newSize,
+              totalEntryCount: newEntries,
+              totalSizeBytes: newSize,
               freeListHeadPageNo: stats.freeListHeadPageNo,
               freePageCount: stats.freePageCount,
             ).withBatchMarkers(
@@ -1753,10 +1755,13 @@ final class TableTreePartitionManager {
 
     final now = DateTime.now();
     final updatedMeta = meta.copyWith(
-      totalRecords: max(0, meta.totalRecords + recordsDeltaSum),
-      totalSizeInBytes: max(0, meta.totalSizeInBytes + sizeDeltaSum),
+      totalRecordCount: max(0, meta.totalRecordCount + recordsDeltaSum),
+      totalSizeBytes: max(0, meta.totalSizeBytes + sizeDeltaSum),
       timestamps: Timestamps(created: meta.timestamps.created, modified: now),
     );
+    if (sizeDeltaSum != 0) {
+      _dataStore.tableDataManager.applyTableDataSizeDelta(table, sizeDeltaSum);
+    }
 
     // Partition 0 page 0 carries tree-global metadata + local partition stats.
     // Local size must use the same rule as the loop above: btreeNextPageNo only
@@ -1801,8 +1806,8 @@ final class TableTreePartitionManager {
           pageType: BTreePageType.meta,
           partitionLocal: PartitionLocalStats(
             partitionNo: 0,
-            totalEntries: p0NewEntries,
-            fileSizeInBytes: p0NewSize,
+            totalEntryCount: p0NewEntries,
+            totalSizeBytes: p0NewSize,
             freeListHeadPageNo: p0Stats.freeListHeadPageNo,
             freePageCount: p0Stats.freePageCount,
           ).withBatchMarkers(
@@ -1919,14 +1924,14 @@ final class TableTreePartitionManager {
     );
 
     // Log persistence statistics
-    if (InternalConfig.showLoggerInternalLabel && totalRecords > 0) {
+    if (InternalConfig.showLoggerInternalLabel && totalRecordCount > 0) {
       final now = DateTime.now();
       final at =
           '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}.${now.millisecond.toString().padLeft(3, '0')}';
-      final totalRecordsAfter = updatedMeta.totalRecords;
-      final totalSizeAfter = updatedMeta.totalSizeInBytes;
+      final totalRecordsAfter = updatedMeta.totalRecordCount;
+      final totalSizeAfter = updatedMeta.totalSizeBytes;
       Logger.debug(
-          'Table persistence: table=$tableName, partitions=${updatedMeta.btreePartitionCount}, batchRecords=$totalRecords, totalRecords=$totalRecordsAfter, totalSize=${(totalSizeAfter / 1024 / 1024).toStringAsFixed(2)}MB, concurrency=${concurrency ?? 1}, cost=${sw.elapsedMilliseconds}ms, at: $at');
+          'Table persistence: table=$tableName, partitions=${updatedMeta.btreePartitionCount}, batchRecords=$totalRecordCount, totalRecordCount=$totalRecordsAfter, totalSize=${(totalSizeAfter / 1024 / 1024).toStringAsFixed(2)}MB, concurrency=${concurrency ?? 1}, cost=${sw.elapsedMilliseconds}ms, at: $at');
     }
   }
 
@@ -1983,8 +1988,8 @@ final class TableTreePartitionManager {
             encryptionKeyId: encryptionKeyId,
           );
           if (local != null) {
-            s.oldFileSizeInBytes = local.fileSizeInBytes;
-            s.oldTotalEntries = local.totalEntries;
+            s.oldFileSizeInBytes = local.totalSizeBytes;
+            s.oldTotalEntries = local.totalEntryCount;
             s.oldFlushBatchKey = local.lastFlushBatchKey;
             s.oldMaintBatchKey = local.lastMaintenanceBatchKey;
             s.freeListHeadPageNo = local.freeListHeadPageNo;
@@ -2212,8 +2217,8 @@ final class TableTreePartitionManager {
         final newSize = max(s.oldFileSizeInBytes, actualSize);
         final local = PartitionLocalStats(
           partitionNo: pNo,
-          totalEntries: s.oldTotalEntries,
-          fileSizeInBytes: newSize,
+          totalEntryCount: s.oldTotalEntries,
+          totalSizeBytes: newSize,
           freeListHeadPageNo: s.freeListHeadPageNo,
           freePageCount: s.freePageCount,
         ).withBatchMarkers(

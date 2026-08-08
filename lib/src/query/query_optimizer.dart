@@ -87,13 +87,14 @@ class QueryOptimizer {
             : limit;
         final int need = max(1, effOffset + max(1, effLimit));
 
-        final int totalRows = await _estimateTotalRows(table);
+        final int totalRecordCount = await _estimateTotalRows(table);
         final fieldSel = _estimateFieldSelectivity(
           schema: schema,
           where: tableWhere,
-          totalRows: totalRows,
+          totalRecordCount: totalRecordCount,
         );
-        final double overallSel = _combineSelectivity(fieldSel, totalRows);
+        final double overallSel =
+            _combineSelectivity(fieldSel, totalRecordCount);
 
         final sortPlan = QueryPlan(
           QueryOperation(
@@ -113,7 +114,7 @@ class QueryOptimizer {
           schema: schema,
           orderBy: orderBy,
           need: need,
-          totalRows: totalRows,
+          totalRecordCount: totalRecordCount,
           overallSelectivity: overallSel,
           fieldSelectivity: fieldSel,
         );
@@ -124,7 +125,7 @@ class QueryOptimizer {
           schema: schema,
           orderBy: orderBy,
           need: need,
-          totalRows: totalRows,
+          totalRecordCount: totalRecordCount,
           overallSelectivity: overallSel,
           fieldSelectivity: fieldSel,
         );
@@ -654,15 +655,15 @@ class QueryOptimizer {
   Map<String, double> _estimateFieldSelectivity({
     required TableSchema schema,
     required Map<String, dynamic> where,
-    required int totalRows,
+    required int totalRecordCount,
   }) {
     if (where.isEmpty) return const <String, double>{};
 
     // A conservative default for equality on non-unique fields.
     // We adapt to table size to model the "rare match" risk for large datasets.
     double nonUniqueEqSel() {
-      final s = 1.0 / max(100.0, sqrt(totalRows.toDouble()));
-      final lower = 1.0 / totalRows;
+      final s = 1.0 / max(100.0, sqrt(totalRecordCount.toDouble()));
+      final lower = 1.0 / totalRecordCount;
       const upper = 0.1;
       if (lower > upper) return lower;
       return s.clamp(lower, upper);
@@ -689,7 +690,7 @@ class QueryOptimizer {
 
     double eqSel(String field) {
       if (isUniqueSingleField(field)) {
-        return 1.0 / totalRows;
+        return 1.0 / totalRecordCount;
       }
       return nonUniqueEqSel();
     }
@@ -750,13 +751,14 @@ class QueryOptimizer {
     return out;
   }
 
-  double _combineSelectivity(Map<String, double> fieldSel, int totalRows) {
+  double _combineSelectivity(
+      Map<String, double> fieldSel, int totalRecordCount) {
     if (fieldSel.isEmpty) return 1.0;
     double sel = 1.0;
     for (final v in fieldSel.values) {
       sel *= v.clamp(0.0, 1.0);
     }
-    final double minSel = 1.0 / max(1, totalRows);
+    final double minSel = 1.0 / max(1, totalRecordCount);
     return sel.clamp(minSel, 1.0);
   }
 
@@ -857,7 +859,7 @@ class QueryOptimizer {
     required TableSchema schema,
     required List<String> orderBy,
     required int need,
-    required int totalRows,
+    required int totalRecordCount,
     required double overallSelectivity,
     required Map<String, double> fieldSelectivity,
   }) {
@@ -866,10 +868,10 @@ class QueryOptimizer {
       plan: plan,
       schema: schema,
       fieldSelectivity: fieldSelectivity,
-    ).clamp(1.0 / max(1, totalRows), 1.0);
+    ).clamp(1.0 / max(1, totalRecordCount), 1.0);
 
     final double rangeSize =
-        (totalRows * rangeSel).clamp(1.0, totalRows.toDouble());
+        (totalRecordCount * rangeSel).clamp(1.0, totalRecordCount.toDouble());
 
     final bool canStream = _canStreamInRequestedOrder(
       table: table,
@@ -884,8 +886,8 @@ class QueryOptimizer {
     }
 
     // Selectivity within the access range.
-    final double condSel =
-        (overallSelectivity / rangeSel).clamp(1.0 / max(1, totalRows), 1.0);
+    final double condSel = (overallSelectivity / rangeSel)
+        .clamp(1.0 / max(1, totalRecordCount), 1.0);
 
     final double expectedScan = (need / condSel).clamp(1.0, rangeSize);
     return expectedScan;

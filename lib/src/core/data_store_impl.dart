@@ -6,16 +6,15 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as path;
 
-import '../interface/kv_store.dart';
-import '../interface/noop_storage_impl.dart';
-import '../interface/status_provider.dart';
 import '../handler/common.dart';
 import '../handler/global_config_codec.dart';
 import '../handler/logger.dart';
 import '../handler/parallel_processor.dart';
 import '../handler/platform_handler.dart';
 import '../handler/value_matcher.dart';
-import '../upgrades/legacy_model/pre_v3.dart';
+import '../interface/kv_store.dart';
+import '../interface/noop_storage_impl.dart';
+import '../interface/status_provider.dart';
 import '../model/backup_scope.dart';
 import '../model/buffer_entry.dart';
 import '../model/cancellation_token.dart';
@@ -34,8 +33,8 @@ import '../model/migration_task.dart';
 import '../model/query_result.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
-import '../model/space_stats.dart';
 import '../model/space_info.dart';
+import '../model/space_stats.dart';
 import '../model/system_table.dart';
 import '../model/table_context.dart';
 import '../model/table_identity.dart';
@@ -49,6 +48,7 @@ import '../model/unique_violation.dart';
 import '../query/query_condition.dart';
 import '../query/query_executor.dart';
 import '../query/query_optimizer.dart';
+import '../upgrades/legacy_model/pre_v3.dart';
 import '../upgrades/old_structure_migration_handler.dart';
 import '../upgrades/version_upgrade_manager.dart';
 import 'background_write_scheduler.dart';
@@ -64,6 +64,7 @@ import 'compute/kv_batch_prepare_compute.dart';
 import 'compute/record_compute.dart';
 import 'compute/unique_ref_compute.dart';
 import 'compute_manager.dart';
+import 'cpu_work_chunk.dart';
 import 'crontab_manager.dart';
 import 'foreign_key_manager.dart';
 import 'index_manager.dart';
@@ -81,14 +82,14 @@ import 'path_manager.dart';
 import 'promote_primary_key.dart';
 import 'read_view_manager.dart';
 import 'resource_manager.dart';
-import 'table_meta_manager.dart';
 import 'shared_engine_registry.dart';
 import 'storage_adapter.dart';
 import 'table_data_manager.dart';
+import 'table_meta_manager.dart';
 import 'table_tree_partition_manager.dart';
-import 'tree_meta_page_service.dart';
 import 'transaction_context.dart';
 import 'transaction_manager.dart';
+import 'tree_meta_page_service.dart';
 import 'ttl_cleanup_manager.dart';
 import 'vector_index_manager.dart';
 import 'wal_manager.dart';
@@ -96,7 +97,6 @@ import 'weight_manager.dart';
 import 'workload_scheduler.dart';
 import 'write_buffer_manager.dart';
 import 'yield_controller.dart';
-import 'cpu_work_chunk.dart';
 
 /// Core storage engine implementation
 class DataStoreImpl {
@@ -2686,8 +2686,8 @@ class DataStoreImpl {
         // - size < 30% of record cache size
         const int minSmallTableBytes = 5 * 1024 * 1024; // 5MB
         if (tableDataMeta == null ||
-            tableDataMeta.totalSizeInBytes < minSmallTableBytes ||
-            tableDataMeta.totalSizeInBytes < recordCacheSize * 0.3) {
+            tableDataMeta.totalSizeBytes < minSmallTableBytes ||
+            tableDataMeta.totalSizeBytes < recordCacheSize * 0.3) {
           isOptimizableQuery = true;
         }
 
@@ -3520,8 +3520,8 @@ class DataStoreImpl {
         // - size < 30% of record cache size
         const int minSmallTableBytes = 5 * 1024 * 1024; // 5MB
         if (tableDataMeta == null ||
-            tableDataMeta.totalSizeInBytes < minSmallTableBytes ||
-            tableDataMeta.totalSizeInBytes < recordCacheSize * 0.3) {
+            tableDataMeta.totalSizeBytes < minSmallTableBytes ||
+            tableDataMeta.totalSizeBytes < recordCacheSize * 0.3) {
           isOptimizableQuery = true;
         }
 
@@ -4386,7 +4386,7 @@ class DataStoreImpl {
           await tableDataManager.getTableDataMeta(table.tableUid);
       // We can safely skip disk unique checks if there is no committed data.
       final bool hasCommittedData =
-          tableDataMeta != null && tableDataMeta.totalRecords > 0;
+          tableDataMeta != null && tableDataMeta.totalRecordCount > 0;
       final bool skipDiskUniqueChecks = !hasCommittedData;
       final pkMatcher =
           ValueMatcher.getMatcher(tableSchema.getPrimaryKeyMatcherType());
@@ -6433,10 +6433,12 @@ class DataStoreImpl {
         if (shouldAbortBackgroundScan) {
           return maxPrewarmBytes - currentPrewarmedBytes;
         }
-        if (tableDataMeta == null || tableDataMeta.totalRecords <= 0) continue;
+        if (tableDataMeta == null || tableDataMeta.totalRecordCount <= 0) {
+          continue;
+        }
 
         final indexBytes = await _estimateTableIndexBytes(table);
-        final estimatedBytes = tableDataMeta.totalSizeInBytes + indexBytes;
+        final estimatedBytes = tableDataMeta.totalSizeBytes + indexBytes;
         if (currentPrewarmedBytes + estimatedBytes > maxPrewarmBytes) {
           continue;
         }
@@ -6470,7 +6472,7 @@ class DataStoreImpl {
     if (schemaMgr == null || shouldAbortBackgroundScan) return;
 
     final spaceStats = await getSpaceStats();
-    final spaceUsageBytes = spaceStats.totalDataSizeBytes;
+    final spaceUsageBytes = spaceStats.totalSizeBytes;
     const maxRecordsSafetyCap = 200000;
 
     if (spaceUsageBytes >= prewarmBudgetBytes) {
@@ -6501,15 +6503,17 @@ class DataStoreImpl {
         final table = await getTableContext(tableName);
         final tableDataMeta =
             await tableDataManager.getTableDataMeta(table.tableUid);
-        if (tableDataMeta == null || tableDataMeta.totalRecords <= 0) continue;
+        if (tableDataMeta == null || tableDataMeta.totalRecordCount <= 0) {
+          continue;
+        }
 
         final schema = table.schema;
 
         final indexBytes = await _estimateTableIndexBytes(table);
-        final estimatedBytes = tableDataMeta.totalSizeInBytes + indexBytes;
+        final estimatedBytes = tableDataMeta.totalSizeBytes + indexBytes;
 
         if (currentPrewarmedBytes + estimatedBytes > prewarmBudgetBytes ||
-            tableDataMeta.totalRecords > maxRecordsSafetyCap) {
+            tableDataMeta.totalRecordCount > maxRecordsSafetyCap) {
           break;
         }
 
@@ -6567,7 +6571,7 @@ class DataStoreImpl {
       final indexMeta =
           await _indexManager?.getIndexMeta(table.tableUid, index.indexUid);
       if (indexMeta != null) {
-        total += indexMeta.totalSizeInBytes;
+        total += indexMeta.totalSizeBytes;
       }
       final y23 = yieldController.maybeYield();
       if (y23 != null) await y23;
@@ -7519,25 +7523,33 @@ class DataStoreImpl {
     final table = await getTableContext(tableName);
     // User-facing schema overlay during promote (engine TableContext stays old).
     final schema = await getTableSchema(tableName) ?? table.schema;
-    final part0Path =
-        await pathManager.getPartitionFilePathByNo(table.tableUid, 0);
+
     DateTime? createdAt;
-    if (await storage.existsFile(part0Path)) {
-      createdAt = await storage.getFileCreationTime(part0Path);
+
+    final tableDataMeta =
+        await tableDataManager.getTableDataMeta(table.tableUid);
+    createdAt = tableDataMeta?.timestamps.created;
+    if (createdAt == null) {
+      final part0Path =
+          await pathManager.getPartitionFilePathByNo(table.tableUid, 0);
+      if (await storage.existsFile(part0Path)) {
+        createdAt = await storage.getFileCreationTime(part0Path);
+      }
     }
-    createdAt ??= (await tableDataManager.getTableDataMeta(table.tableUid))
-        ?.timestamps
-        .created;
-    final totalRecords = await tableDataManager.getTableRecordCount(table);
-    final fileSize = await tableDataManager.getTableFileSize(table);
+    final lastModified = tableDataMeta?.timestamps.modified;
+    final tableDataSize = tableDataMeta?.totalSizeBytes ?? 0;
+    final totalRecordCount = await tableDataManager.getTableRecordCount(table);
+    final indexDataSize =
+        await tableDataManager.sumTableIndexDataSizeBytes(table);
     return TableInfo(
       tableName: tableName,
-      totalRecords: totalRecords,
-      fileSizeInBytes: fileSize,
+      totalRecordCount: totalRecordCount,
+      totalTableDataSizeBytes: tableDataSize,
+      totalIndexDataSizeBytes: indexDataSize,
       indexCount: schema.indexes.length,
       schema: schema,
       isGlobal: schema.isGlobal,
-      lastModified: tableDataManager.getLastModifiedTime(table),
+      lastModified: lastModified,
       createdAt: createdAt,
     );
   }
@@ -8069,8 +8081,9 @@ class DataStoreImpl {
       return SpaceInfo(
         spaceName: _currentSpaceName,
         tableCount: userTables.length,
-        recordCount: stats.totalRecordCount,
-        dataSizeBytes: stats.totalDataSizeBytes,
+        totalRecordCount: stats.totalRecordCount,
+        totalTableDataSizeBytes: stats.totalTableDataSizeBytes,
+        totalIndexDataSizeBytes: stats.totalIndexDataSizeBytes,
         lastStatisticsTime: stats.lastStatisticsTime,
         tables: userTables,
       );

@@ -7,8 +7,11 @@ class SpaceStats {
   /// Total records across user tables in this space.
   final int totalRecordCount;
 
-  /// Total data file size of user tables (bytes).
-  final int totalDataSizeBytes;
+  /// Total table-data file size of user tables (bytes).
+  final int totalTableDataSizeBytes;
+
+  /// Total index-data file size of user tables (bytes).
+  final int totalIndexDataSizeBytes;
 
   /// Last full-reconcile time; null means never reconciled.
   final DateTime? lastStatisticsTime;
@@ -16,9 +19,13 @@ class SpaceStats {
   const SpaceStats({
     this.totalTableCount = 0,
     this.totalRecordCount = 0,
-    this.totalDataSizeBytes = 0,
+    this.totalTableDataSizeBytes = 0,
+    this.totalIndexDataSizeBytes = 0,
     this.lastStatisticsTime,
   });
+
+  /// Convenience: table data + index data.
+  int get totalSizeBytes => totalTableDataSizeBytes + totalIndexDataSizeBytes;
 
   static const SpaceStats empty = SpaceStats();
 
@@ -28,14 +35,18 @@ class SpaceStats {
   SpaceStats copyWith({
     int? totalTableCount,
     int? totalRecordCount,
-    int? totalDataSizeBytes,
+    int? totalTableDataSizeBytes,
+    int? totalIndexDataSizeBytes,
     DateTime? lastStatisticsTime,
     bool clearLastStatisticsTime = false,
   }) {
     return SpaceStats(
       totalTableCount: totalTableCount ?? this.totalTableCount,
       totalRecordCount: totalRecordCount ?? this.totalRecordCount,
-      totalDataSizeBytes: totalDataSizeBytes ?? this.totalDataSizeBytes,
+      totalTableDataSizeBytes:
+          totalTableDataSizeBytes ?? this.totalTableDataSizeBytes,
+      totalIndexDataSizeBytes:
+          totalIndexDataSizeBytes ?? this.totalIndexDataSizeBytes,
       lastStatisticsTime: clearLastStatisticsTime
           ? null
           : (lastStatisticsTime ?? this.lastStatisticsTime),

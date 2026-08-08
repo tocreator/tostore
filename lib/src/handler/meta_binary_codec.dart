@@ -29,8 +29,8 @@ abstract final class TreePagePtrFieldId {
 abstract final class TableDataMetaFieldId {
   static const int version = 1;
   static const int tableUid = 2;
-  static const int totalSizeInBytes = 3;
-  static const int totalRecords = 4;
+  static const int totalSizeBytes = 3;
+  static const int totalRecordCount = 4;
   static const int timestamps = 5;
   static const int maxAutoIncrementId = 6;
 
@@ -51,8 +51,8 @@ abstract final class IndexMetaFieldId {
   static const int tableUid = 3;
   static const int isUnique = 4;
   static const int isBuilding = 5;
-  static const int totalSizeInBytes = 6;
-  static const int totalEntries = 7;
+  static const int totalSizeBytes = 6;
+  static const int totalEntryCount = 7;
   static const int timestamps = 8;
 
   /// Legacy — ignored; page size lives in [GlobalConfig].
@@ -94,7 +94,7 @@ abstract final class NghIndexMetaFieldId {
   static const int pqCodeNextPageNo = 28;
   static const int rawVectorPartitionCount = 29;
   static const int rawVectorNextPageNo = 30;
-  static const int totalSizeInBytes = 31;
+  static const int totalSizeBytes = 31;
   static const int nodeIdToPkMeta = 32;
   static const int pkToNodeIdMeta = 33;
   static const int graphFreeListHeads = 34;
@@ -197,10 +197,10 @@ final class TableDataMetaCodec {
     w.writeVarint(meta.version);
     w.writeFieldTag(TableDataMetaFieldId.tableUid, WireType.lengthDelimited);
     w.writeString(meta.tableUid.value);
-    w.writeFieldTag(TableDataMetaFieldId.totalSizeInBytes, WireType.varint);
-    w.writeVarint(meta.totalSizeInBytes);
-    w.writeFieldTag(TableDataMetaFieldId.totalRecords, WireType.varint);
-    w.writeVarint(meta.totalRecords);
+    w.writeFieldTag(TableDataMetaFieldId.totalSizeBytes, WireType.varint);
+    w.writeVarint(meta.totalSizeBytes);
+    w.writeFieldTag(TableDataMetaFieldId.totalRecordCount, WireType.varint);
+    w.writeVarint(meta.totalRecordCount);
     w.writeFieldTag(TableDataMetaFieldId.timestamps, WireType.lengthDelimited);
     w.writeBytes(TimestampsCodec.encode(meta.timestamps));
     if (meta.maxAutoIncrementId != null) {
@@ -232,8 +232,8 @@ final class TableDataMetaCodec {
     final reader = BinaryReader(bytes);
     int version = InternalConfig.tableDataVersion;
     TableUid? tableUid = tableUidFallback;
-    int totalSizeInBytes = 0;
-    int totalRecords = 0;
+    int totalSizeBytes = 0;
+    int totalRecordCount = 0;
     Timestamps? timestamps;
     String? maxAutoIncrementId;
     int btreeNextPageNo = TableDataMeta.firstDataPageNo;
@@ -252,11 +252,11 @@ final class TableDataMetaCodec {
         case TableDataMetaFieldId.tableUid:
           tableUid = TableUid(reader.readString());
           break;
-        case TableDataMetaFieldId.totalSizeInBytes:
-          totalSizeInBytes = reader.readVarint();
+        case TableDataMetaFieldId.totalSizeBytes:
+          totalSizeBytes = reader.readVarint();
           break;
-        case TableDataMetaFieldId.totalRecords:
-          totalRecords = reader.readVarint();
+        case TableDataMetaFieldId.totalRecordCount:
+          totalRecordCount = reader.readVarint();
           break;
         case TableDataMetaFieldId.timestamps:
           timestamps = TimestampsCodec.decode(reader.readBytes());
@@ -303,8 +303,8 @@ final class TableDataMetaCodec {
     return TableDataMeta(
       version: version,
       tableUid: resolvedUid,
-      totalSizeInBytes: totalSizeInBytes,
-      totalRecords: totalRecords,
+      totalSizeBytes: totalSizeBytes,
+      totalRecordCount: totalRecordCount,
       timestamps: timestamps,
       maxAutoIncrementId: maxAutoIncrementId,
       btreeNextPageNo: btreeNextPageNo,
@@ -330,10 +330,10 @@ final class IndexMetaCodec {
     w.writeBool(meta.isUnique);
     w.writeFieldTag(IndexMetaFieldId.isBuilding, WireType.varint);
     w.writeBool(meta.isBuilding);
-    w.writeFieldTag(IndexMetaFieldId.totalSizeInBytes, WireType.varint);
-    w.writeVarint(meta.totalSizeInBytes);
-    w.writeFieldTag(IndexMetaFieldId.totalEntries, WireType.varint);
-    w.writeVarint(meta.totalEntries);
+    w.writeFieldTag(IndexMetaFieldId.totalSizeBytes, WireType.varint);
+    w.writeVarint(meta.totalSizeBytes);
+    w.writeFieldTag(IndexMetaFieldId.totalEntryCount, WireType.varint);
+    w.writeVarint(meta.totalEntryCount);
     w.writeFieldTag(IndexMetaFieldId.timestamps, WireType.lengthDelimited);
     w.writeBytes(TimestampsCodec.encode(meta.timestamps));
     w.writeFieldTag(IndexMetaFieldId.btreeNextPageNo, WireType.varint);
@@ -362,8 +362,8 @@ final class IndexMetaCodec {
     TableUid? tableUid = tableUidFallback;
     bool isUnique = false;
     bool isBuilding = false;
-    int totalSizeInBytes = 0;
-    int totalEntries = 0;
+    int totalSizeBytes = 0;
+    int totalEntryCount = 0;
     Timestamps? timestamps;
     int btreeNextPageNo = IndexMeta.firstDataPageNo;
     int btreePartitionCount = 1;
@@ -390,11 +390,11 @@ final class IndexMetaCodec {
         case IndexMetaFieldId.isBuilding:
           isBuilding = reader.readBool();
           break;
-        case IndexMetaFieldId.totalSizeInBytes:
-          totalSizeInBytes = reader.readVarint();
+        case IndexMetaFieldId.totalSizeBytes:
+          totalSizeBytes = reader.readVarint();
           break;
-        case IndexMetaFieldId.totalEntries:
-          totalEntries = reader.readVarint();
+        case IndexMetaFieldId.totalEntryCount:
+          totalEntryCount = reader.readVarint();
           break;
         case IndexMetaFieldId.timestamps:
           timestamps = TimestampsCodec.decode(reader.readBytes());
@@ -445,8 +445,8 @@ final class IndexMetaCodec {
       isUnique: isUnique,
       isBuilding: isBuilding,
       timestamps: timestamps,
-      totalSizeInBytes: totalSizeInBytes,
-      totalEntries: totalEntries,
+      totalSizeBytes: totalSizeBytes,
+      totalEntryCount: totalEntryCount,
       btreeNextPageNo: btreeNextPageNo,
       btreePartitionCount: btreePartitionCount,
       btreeRoot: btreeRoot,
@@ -509,8 +509,8 @@ final class NghIndexMetaCodec {
     w.writeVarint(meta.rawVectorPartitionCount);
     w.writeFieldTag(NghIndexMetaFieldId.rawVectorNextPageNo, WireType.varint);
     w.writeVarint(meta.rawVectorNextPageNo);
-    w.writeFieldTag(NghIndexMetaFieldId.totalSizeInBytes, WireType.varint);
-    w.writeVarint(meta.totalSizeInBytes);
+    w.writeFieldTag(NghIndexMetaFieldId.totalSizeBytes, WireType.varint);
+    w.writeVarint(meta.totalSizeBytes);
     if (meta.nodeIdToPkMeta != null) {
       w.writeFieldTag(
           NghIndexMetaFieldId.nodeIdToPkMeta, WireType.lengthDelimited);
@@ -562,7 +562,7 @@ final class NghIndexMetaCodec {
     int pqCodeNextPageNo = NghIndexMeta.firstDataPageNo;
     int rawVectorPartitionCount = 1;
     int rawVectorNextPageNo = NghIndexMeta.firstDataPageNo;
-    int totalSizeInBytes = 0;
+    int totalSizeBytes = 0;
     IndexMeta? nodeIdToPkMeta;
     IndexMeta? pkToNodeIdMeta;
     Map<int, int> graphFreeListHeads = const {};
@@ -654,8 +654,8 @@ final class NghIndexMetaCodec {
         case NghIndexMetaFieldId.rawVectorNextPageNo:
           rawVectorNextPageNo = reader.readVarint();
           break;
-        case NghIndexMetaFieldId.totalSizeInBytes:
-          totalSizeInBytes = reader.readVarint();
+        case NghIndexMetaFieldId.totalSizeBytes:
+          totalSizeBytes = reader.readVarint();
           break;
         case NghIndexMetaFieldId.nodeIdToPkMeta:
           nodeIdToPkMeta = IndexMetaCodec.decode(reader.readBytes());
@@ -719,7 +719,7 @@ final class NghIndexMetaCodec {
       pqCodeNextPageNo: pqCodeNextPageNo,
       rawVectorPartitionCount: rawVectorPartitionCount,
       rawVectorNextPageNo: rawVectorNextPageNo,
-      totalSizeInBytes: totalSizeInBytes,
+      totalSizeBytes: totalSizeBytes,
       nodeIdToPkMeta: nodeIdToPkMeta,
       pkToNodeIdMeta: pkToNodeIdMeta,
       graphFreeListHeads: graphFreeListHeads,
@@ -833,8 +833,8 @@ final class TreeGlobalMetaBlobCodec {
 /// |   7 |   1 | reserved |
 /// |   8 |   4 | partitionNo |
 /// |  12 |   4 | reserved |
-/// |  16 |   8 | totalEntries |
-/// |  24 |   8 | fileSizeInBytes |
+/// |  16 |   8 | totalEntryCount |
+/// |  24 |   8 | totalSizeBytes |
 /// |  32 |   4 | freeListHeadPageNo |
 /// |  36 |   4 | freePageCount |
 /// |  40 |   8 | lastFlushBatchKey |
@@ -860,8 +860,8 @@ final class PartitionLocalStats {
   }
 
   final int partitionNo;
-  final int totalEntries;
-  final int fileSizeInBytes;
+  final int totalEntryCount;
+  final int totalSizeBytes;
   final int freeListHeadPageNo;
   final int freePageCount;
 
@@ -876,8 +876,8 @@ final class PartitionLocalStats {
 
   const PartitionLocalStats({
     required this.partitionNo,
-    this.totalEntries = 0,
-    this.fileSizeInBytes = 0,
+    this.totalEntryCount = 0,
+    this.totalSizeBytes = 0,
     this.freeListHeadPageNo = -1,
     this.freePageCount = 0,
     this.dataCategory = 0,
@@ -912,8 +912,8 @@ final class PartitionLocalStats {
 
   PartitionLocalStats copyWith({
     int? partitionNo,
-    int? totalEntries,
-    int? fileSizeInBytes,
+    int? totalEntryCount,
+    int? totalSizeBytes,
     int? freeListHeadPageNo,
     int? freePageCount,
     int? dataCategory,
@@ -922,8 +922,8 @@ final class PartitionLocalStats {
   }) {
     return PartitionLocalStats(
       partitionNo: partitionNo ?? this.partitionNo,
-      totalEntries: totalEntries ?? this.totalEntries,
-      fileSizeInBytes: fileSizeInBytes ?? this.fileSizeInBytes,
+      totalEntryCount: totalEntryCount ?? this.totalEntryCount,
+      totalSizeBytes: totalSizeBytes ?? this.totalSizeBytes,
       freeListHeadPageNo: freeListHeadPageNo ?? this.freeListHeadPageNo,
       freePageCount: freePageCount ?? this.freePageCount,
       dataCategory: dataCategory ?? this.dataCategory,
@@ -978,8 +978,8 @@ final class PartitionLocalStats {
     bd.setUint8(7, 0); // reserved
     bd.setInt32(8, partitionNo, Endian.little);
     bd.setInt32(12, 0, Endian.little); // reserved
-    PlatformByteData.setInt64(bd, 16, totalEntries, Endian.little);
-    PlatformByteData.setInt64(bd, 24, fileSizeInBytes, Endian.little);
+    PlatformByteData.setInt64(bd, 16, totalEntryCount, Endian.little);
+    PlatformByteData.setInt64(bd, 24, totalSizeBytes, Endian.little);
     bd.setInt32(32, freeListHeadPageNo, Endian.little);
     bd.setInt32(36, freePageCount, Endian.little);
     PlatformByteData.setInt64(bd, 40, lastFlushBatchKey, Endian.little);
@@ -1004,8 +1004,8 @@ final class PartitionLocalStats {
     return PartitionLocalStats(
       dataCategory: bd.getUint8(6),
       partitionNo: bd.getInt32(8, Endian.little),
-      totalEntries: PlatformByteData.getInt64(bd, 16, Endian.little),
-      fileSizeInBytes: PlatformByteData.getInt64(bd, 24, Endian.little),
+      totalEntryCount: PlatformByteData.getInt64(bd, 16, Endian.little),
+      totalSizeBytes: PlatformByteData.getInt64(bd, 24, Endian.little),
       freeListHeadPageNo: bd.getInt32(32, Endian.little),
       freePageCount: bd.getInt32(36, Endian.little),
       lastFlushBatchKey: PlatformByteData.getInt64(bd, 40, Endian.little),
@@ -1022,8 +1022,8 @@ final class PartitionLocalStats {
       PartitionMetaPage page) {
     return PartitionLocalStats(
       partitionNo: page.partitionNo,
-      totalEntries: page.totalEntries,
-      fileSizeInBytes: page.fileSizeInBytes,
+      totalEntryCount: page.totalEntryCount,
+      totalSizeBytes: page.totalSizeBytes,
       freeListHeadPageNo: page.freeListHeadPageNo,
       freePageCount: page.freePageCount,
     );
@@ -1035,8 +1035,8 @@ final class PartitionLocalStats {
     return PartitionLocalStats(
       partitionNo: page.partitionNo,
       dataCategory: page.dataCategory,
-      totalEntries: page.totalEntries,
-      fileSizeInBytes: page.fileSizeInBytes,
+      totalEntryCount: page.totalEntryCount,
+      totalSizeBytes: page.totalSizeBytes,
       freeListHeadPageNo: page.freeListHeadPageNo,
       freePageCount: page.freePageCount,
     );

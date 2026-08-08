@@ -610,16 +610,16 @@ class QueryExecutor {
         int finalCount = (planResult.count ?? 0) + bufferResults.length;
 
         stopwatch.stop();
-        int? tableTotalCount;
+        int? totalRecordCount;
         try {
-          tableTotalCount =
+          totalRecordCount =
               await _dataStore.tableDataManager.getTableRecordCount(table);
         } catch (_) {}
         return ExecuteResult(
           records: const [],
           count: finalCount,
           executionTimeMs: stopwatch.elapsedMilliseconds,
-          tableTotalCount: tableTotalCount,
+          totalRecordCount: totalRecordCount,
         );
       }
 
@@ -805,9 +805,9 @@ class QueryExecutor {
       }
 
       // Use getTableRecordCount for accurate, buffer-aware record count (O(1) approach).
-      int? tableTotalCount;
+      int? totalRecordCount;
       try {
-        tableTotalCount =
+        totalRecordCount =
             await _dataStore.tableDataManager.getTableRecordCount(table);
       } catch (_) {}
 
@@ -820,7 +820,7 @@ class QueryExecutor {
         hasMore: hasMore,
         hasPrev: hasPrev,
         executionTimeMs: stopwatch.elapsedMilliseconds,
-        tableTotalCount: tableTotalCount,
+        totalRecordCount: totalRecordCount,
       );
     } catch (e) {
       Logger.error('query execution failed', rawError: e);
@@ -3685,7 +3685,7 @@ class ExecuteResult {
   final bool hasPrev;
 
   final int? executionTimeMs;
-  final int? tableTotalCount;
+  final int? totalRecordCount;
   final int? count;
   final dynamic aggregateResult;
 
@@ -3696,7 +3696,7 @@ class ExecuteResult {
     this.hasMore = false,
     this.hasPrev = false,
     this.executionTimeMs,
-    this.tableTotalCount,
+    this.totalRecordCount,
     this.count,
     this.aggregateResult,
   });
@@ -3708,7 +3708,7 @@ class ExecuteResult {
         hasMore = false,
         hasPrev = false,
         executionTimeMs = null,
-        tableTotalCount = null,
+        totalRecordCount = null,
         count = null,
         aggregateResult = null;
 }
