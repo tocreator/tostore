@@ -7,20 +7,20 @@ import '../handler/logger.dart';
 import '../handler/memcomparable.dart';
 import '../handler/parallel_processor.dart';
 import '../handler/value_matcher.dart';
-import '../model/db_exception.dart';
-import '../model/result_status.dart';
-import '../model/result_type.dart';
 import '../model/data_block_entry.dart';
 import '../model/data_store_config.dart';
+import '../model/db_exception.dart';
 import '../model/id_generator.dart';
 import '../model/index_entry.dart';
 import '../model/index_search.dart';
 import '../model/meta_info.dart';
 import '../model/parallel_journal_entry.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../model/system_table.dart';
-import '../model/table_schema.dart';
 import '../model/table_context.dart';
 import '../model/table_identity.dart';
+import '../model/table_schema.dart';
 import '../model/unique_violation.dart';
 import '../query/query_condition.dart';
 import 'compute/compute_batch_planner.dart';
@@ -374,7 +374,7 @@ class IndexManager {
 
     // Initialize index data cache
     _indexDataCache = TreeCache<dynamic>(
-      sizeCalculator: _estimateIndexDataSize,
+      sizeCalculator: _indexDataCacheSizeBytes,
       maxByteThreshold: (maxBytes * 0.70).toInt(),
       minByteThreshold: 150 * 1024 * 1024,
       groupDepth: 2,
@@ -433,6 +433,13 @@ class IndexManager {
     if (value is String) return value.length; // Unique index PK
     if (value is bool) return 1; // Non-unique marker (PK is in key)
     return 8; // Fallback
+  }
+
+  /// Prefer SpaceStats disk average; fallback to lightweight estimate.
+  int _indexDataCacheSizeBytes(dynamic value) {
+    final avg = _dataStore.tableDataManager.averageIndexEntrySizeBytes;
+    if (avg != null && avg > 0) return avg;
+    return _estimateIndexDataSize(value);
   }
 
   int _estimateIndexMetaSize(IndexMeta meta) {
@@ -2588,15 +2595,21 @@ class IndexManager {
       if (indexSchema?.type == IndexType.vector) {
         final ngh = await _dataStore.vectorIndexManager
             ?.getNghIndexMeta(table, resolved);
-        if (ngh != null && ngh.totalSizeBytes != 0) {
-          _dataStore.tableDataManager
-              .applyIndexDataSizeDelta(table, -ngh.totalSizeBytes);
+        if (ngh != null) {
+          _dataStore.tableDataManager.applyIndexOccupancyDelta(
+            table,
+            sizeDelta: -ngh.totalSizeBytes,
+            entryDelta: -ngh.totalVectors,
+          );
         }
       } else {
         final meta = await getIndexMeta(table.tableUid, resolved);
-        if (meta != null && meta.totalSizeBytes != 0) {
-          _dataStore.tableDataManager
-              .applyIndexDataSizeDelta(table, -meta.totalSizeBytes);
+        if (meta != null) {
+          _dataStore.tableDataManager.applyIndexOccupancyDelta(
+            table,
+            sizeDelta: -meta.totalSizeBytes,
+            entryDelta: -meta.totalEntryCount,
+          );
         }
       }
     } catch (e) {

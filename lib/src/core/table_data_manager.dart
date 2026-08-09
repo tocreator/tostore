@@ -126,12 +126,23 @@ class TableDataManager {
   int _baselineRecordCount = 0;
   int _baselineTableDataSizeBytes = 0;
   int _baselineIndexDataSizeBytes = 0;
+  int _baselineIndexEntryCount = 0;
   int _deltaRecordCount = 0;
   int _deltaTableDataSizeBytes = 0;
   int _deltaIndexDataSizeBytes = 0;
+  int _deltaIndexEntryCount = 0;
   DateTime? _lastStatisticsTime;
   bool _spaceStatsHydrated = false;
   Future<void>? _spaceStatsHydrateFuture;
+
+  /// Disk-based average sizes refreshed on SpaceStats persist / hydrate /
+  /// full reconcile. Hot paths read these only (no per-call division).
+  int? _cachedAvgTableRecordSizeBytes;
+  int? _cachedAvgIndexEntrySizeBytes;
+
+  /// Upgrade: old KV lacked [SpaceStats.totalIndexEntryCount] while index bytes
+  /// were already tracked — force one full reconcile to seed the denominator.
+  bool _indexEntryBaselinePending = false;
 
   /// Single-flight for the expensive full scan only (policy checks are cheap).
   Future<void>? _recalculateAllStatisticsFuture;
@@ -206,7 +217,7 @@ class TableDataManager {
     // Reserve a portion for range-partition caches (blocks + sparse index).
     final int maxBytes = max(1, (tableQuota * 0.55).toInt());
     _tableRecordCache = TreeCache<Map<String, dynamic>>(
-      sizeCalculator: estimateRecordSizeBytes,
+      sizeCalculator: _tableRecordCacheSizeBytes,
       maxByteThreshold: maxBytes,
       minByteThreshold: 50 * 1024 * 1024,
       comparatorFactory: _tableRecordComparatorFactory,
@@ -335,7 +346,7 @@ class TableDataManager {
       _tableRecordCache.put(
         [tableUid, pk],
         record,
-        size: estimateRecordSizeBytes(record),
+        size: _tableRecordCacheSizeBytes(record),
       );
     }
   }
@@ -380,8 +391,8 @@ class TableDataManager {
       }
 
       final value = r;
-      final size = estimateRecordSizeBytes(value);
-      _tableRecordCache.put(key, value, size: size);
+      _tableRecordCache.put(key, value,
+          size: _tableRecordCacheSizeBytes(value));
     }
   }
 
@@ -641,13 +652,45 @@ class TableDataManager {
       max(0, _baselineTableDataSizeBytes + _deltaTableDataSizeBytes);
   int get _effectiveIndexDataSizeBytes =>
       max(0, _baselineIndexDataSizeBytes + _deltaIndexDataSizeBytes);
+  int get _effectiveIndexEntryCount =>
+      max(0, _baselineIndexEntryCount + _deltaIndexEntryCount);
+
+  /// Cached disk-based average table-record size (bytes). Null until first
+  /// hydrate / persist refresh or when record count is 0.
+  int? get averageTableRecordSizeBytes => _cachedAvgTableRecordSizeBytes;
+
+  /// Cached disk-based average index-entry size (bytes). Null until first
+  /// hydrate / persist refresh or when index entry count is 0.
+  int? get averageIndexEntrySizeBytes => _cachedAvgIndexEntrySizeBytes;
 
   SpaceStats _spaceStatsSnapshot() => SpaceStats(
         totalRecordCount: _effectiveRecordCount,
         totalTableDataSizeBytes: _effectiveTableDataSizeBytes,
         totalIndexDataSizeBytes: _effectiveIndexDataSizeBytes,
+        totalIndexEntryCount: _effectiveIndexEntryCount,
         lastStatisticsTime: _lastStatisticsTime,
       );
+
+  /// Refresh memory-cached averages from effective counters.
+  ///
+  /// Call sites are intentionally narrow:
+  /// - KV hydrate (cold start, before first dirty persist)
+  /// - [_persistSpaceStatsToKv] (30s cadence / recalculate persist)
+  void _refreshCachedAveragesFromEffective() {
+    final rc = _effectiveRecordCount;
+    _cachedAvgTableRecordSizeBytes =
+        rc <= 0 ? null : _effectiveTableDataSizeBytes ~/ rc;
+    final iec = _effectiveIndexEntryCount;
+    _cachedAvgIndexEntrySizeBytes =
+        iec <= 0 ? null : _effectiveIndexDataSizeBytes ~/ iec;
+  }
+
+  /// TreeCache size: prefer SpaceStats disk average; fallback to estimate.
+  int _tableRecordCacheSizeBytes(Map<String, dynamic> record) {
+    final avg = _cachedAvgTableRecordSizeBytes;
+    if (avg != null && avg > 0) return avg;
+    return estimateRecordSizeBytes(record);
+  }
 
   /// Live space aggregates (baseline + session delta). Hydrates KV once.
   Future<SpaceStats> getSpaceStats() async {
@@ -712,8 +755,14 @@ class TableDataManager {
         _baselineRecordCount = stats.totalRecordCount;
         _baselineTableDataSizeBytes = stats.totalTableDataSizeBytes;
         _baselineIndexDataSizeBytes = stats.totalIndexDataSizeBytes;
+        _baselineIndexEntryCount = stats.totalIndexEntryCount;
         _lastStatisticsTime = stats.lastStatisticsTime;
         _spaceStatsHydrated = true;
+        if (stats.totalIndexEntryCount == 0 &&
+            stats.totalIndexDataSizeBytes > 0) {
+          _indexEntryBaselinePending = true;
+        }
+        _refreshCachedAveragesFromEffective();
       }
     } on DbClosedException {
       _spaceStatsHydrateFuture = null;
@@ -725,6 +774,7 @@ class TableDataManager {
         Logger.warn('Failed to hydrate space stats from InternalKv',
             rawError: e);
         if (_dataStore.isInitialized && !_dataStore.isClosing) {
+          // Empty baseline; averages stay null until first persist refresh.
           _spaceStatsHydrated = true;
         }
       }
@@ -761,6 +811,14 @@ class TableDataManager {
     // Sticky via [_lastStatisticsTime] so true zero-index spaces do not loop.
     if (_lastStatisticsTime == null) {
       await recalculateAllStatistics();
+      _indexEntryBaselinePending = false;
+      return;
+    }
+
+    // One-shot: KV from before totalIndexEntryCount existed.
+    if (_indexEntryBaselinePending) {
+      await recalculateAllStatistics();
+      _indexEntryBaselinePending = false;
       return;
     }
 
@@ -787,9 +845,11 @@ class TableDataManager {
     _baselineRecordCount = _effectiveRecordCount;
     _baselineTableDataSizeBytes = _effectiveTableDataSizeBytes;
     _baselineIndexDataSizeBytes = _effectiveIndexDataSizeBytes;
+    _baselineIndexEntryCount = _effectiveIndexEntryCount;
     _deltaRecordCount = 0;
     _deltaTableDataSizeBytes = 0;
     _deltaIndexDataSizeBytes = 0;
+    _deltaIndexEntryCount = 0;
   }
 
   /// Space aggregate stats cover user tables only — never system/internal KV.
@@ -810,27 +870,52 @@ class TableDataManager {
     _needSaveStats = true;
   }
 
-  /// O(1) incremental adjust for persisted index-data size deltas.
-  void applyIndexDataSizeDelta(TableContext table, int sizeDelta) {
-    if (sizeDelta == 0 || !_contributesToSpaceStats(table)) return;
-    _deltaIndexDataSizeBytes += sizeDelta;
+  /// O(1) incremental adjust for persisted index occupancy
+  /// (file size bytes + B+Tree `totalEntryCount` / NGH `totalVectors`).
+  void applyIndexOccupancyDelta(
+    TableContext table, {
+    int sizeDelta = 0,
+    int entryDelta = 0,
+  }) {
+    if (!_contributesToSpaceStats(table)) return;
+    if (sizeDelta == 0 && entryDelta == 0) return;
+    if (sizeDelta != 0) _deltaIndexDataSizeBytes += sizeDelta;
+    if (entryDelta != 0) _deltaIndexEntryCount += entryDelta;
     _needSaveStats = true;
   }
 
   /// Sum index file sizes for one table (B+Tree + vector/NGH).
   Future<int> sumTableIndexDataSizeBytes(TableContext table) async {
+    final totals = await _sumTableIndexOccupancy(table);
+    return totals.sizeBytes;
+  }
+
+  /// Sum index entry counts for one table (B+Tree entries + NGH vectors).
+  Future<int> sumTableIndexEntryCount(TableContext table) async {
+    final totals = await _sumTableIndexOccupancy(table);
+    return totals.entryCount;
+  }
+
+  Future<({int sizeBytes, int entryCount})> _sumTableIndexOccupancy(
+      TableContext table) async {
     final indexManager = _dataStore.indexManager;
     final schemaMgr = _dataStore.tableMetaManager;
-    if (indexManager == null || schemaMgr == null) return 0;
+    if (indexManager == null || schemaMgr == null) {
+      return (sizeBytes: 0, entryCount: 0);
+    }
 
-    var total = 0;
+    var sizeBytes = 0;
+    var entryCount = 0;
     final yieldController = YieldController(
-        'TableDataManager.sumTableIndexDataSizeBytes',
+        'TableDataManager._sumTableIndexOccupancy',
         checkInterval: 2);
     for (final index in schemaMgr.getBtreeIndexesFor(table.schema)) {
       final meta =
           await indexManager.getIndexMeta(table.tableUid, index.indexUid);
-      if (meta != null) total += meta.totalSizeBytes;
+      if (meta != null) {
+        sizeBytes += meta.totalSizeBytes;
+        entryCount += meta.totalEntryCount;
+      }
       final y = yieldController.maybeYield();
       if (y != null) await y;
     }
@@ -838,12 +923,15 @@ class TableDataManager {
     if (vectorMgr != null) {
       for (final index in schemaMgr.getVectorIndexesFor(table.schema)) {
         final ngh = await vectorMgr.getNghIndexMeta(table, index.indexUid);
-        if (ngh != null) total += ngh.totalSizeBytes;
+        if (ngh != null) {
+          sizeBytes += ngh.totalSizeBytes;
+          entryCount += ngh.totalVectors;
+        }
         final y = yieldController.maybeYield();
         if (y != null) await y;
       }
     }
-    return total;
+    return (sizeBytes: sizeBytes, entryCount: entryCount);
   }
 
   /// Full meta reconcile (expensive). Replaces baseline, clears deltas, persists.
@@ -874,6 +962,7 @@ class TableDataManager {
       int totalRecordCount = 0;
       int totalTableDataSize = 0;
       int totalIndexDataSize = 0;
+      int totalIndexEntryCount = 0;
 
       final statsLease = await _dataStore.workloadScheduler.tryAcquire(
         WorkloadType.maintenance,
@@ -888,7 +977,7 @@ class TableDataManager {
       }
       final int statsConc = (statsLease?.asConcurrency(0.3) ?? 1);
       final aggList = await ParallelProcessor.execute<
-          ({int records, int tableBytes, int indexBytes})?>(
+          ({int records, int tableBytes, int indexBytes, int indexEntries})?>(
         tableNames.map((name) {
           return () async {
             if (_isSpaceStatsWorkAborted) return null;
@@ -897,11 +986,12 @@ class TableDataManager {
             final ctx = await tableMetaManager.getTableContext(uid);
             if (ctx == null) return null;
             final meta = await getTableDataMeta(ctx.tableUid);
-            final indexBytes = await sumTableIndexDataSizeBytes(ctx);
+            final indexOcc = await _sumTableIndexOccupancy(ctx);
             return (
               records: meta?.totalRecordCount ?? 0,
               tableBytes: meta?.totalSizeBytes ?? 0,
-              indexBytes: indexBytes,
+              indexBytes: indexOcc.sizeBytes,
+              indexEntries: indexOcc.entryCount,
             );
           };
         }).toList(),
@@ -919,6 +1009,7 @@ class TableDataManager {
           totalRecordCount += agg.records;
           totalTableDataSize += agg.tableBytes;
           totalIndexDataSize += agg.indexBytes;
+          totalIndexEntryCount += agg.indexEntries;
         }
       }
 
@@ -927,17 +1018,20 @@ class TableDataManager {
       _baselineRecordCount = totalRecordCount;
       _baselineTableDataSizeBytes = totalTableDataSize;
       _baselineIndexDataSizeBytes = totalIndexDataSize;
+      _baselineIndexEntryCount = totalIndexEntryCount;
       _deltaRecordCount = 0;
       _deltaTableDataSizeBytes = 0;
       _deltaIndexDataSizeBytes = 0;
+      _deltaIndexEntryCount = 0;
       _spaceStatsHydrated = true;
       // Stamp only on full reconcile (index baseline included, may be 0).
       _lastStatisticsTime = DateTime.now();
 
+      // Averages refresh inside persist (single owner) — do not refresh here.
       await _persistSpaceStatsToKv();
 
       Logger.debug(
-          'Table statistics calculation completed: record count=$totalRecordCount, table data=${totalTableDataSize / 1024 / 1024}MB, index data=${totalIndexDataSize / 1024 / 1024}MB');
+          'Table statistics calculation completed: record count=$totalRecordCount, table data=${totalTableDataSize / 1024 / 1024}MB, index data=${totalIndexDataSize / 1024 / 1024}MB, index entries=$totalIndexEntryCount');
     } on DbClosedException {
       // close / switchSpace race — best-effort, no log.
     } catch (e) {
@@ -950,15 +1044,18 @@ class TableDataManager {
     if (!_canPersistSpaceStatsKv) {
       return;
     }
-    if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
-      _needSaveStats = false;
-      return;
-    }
     if (_persistingSpaceStats) return;
     _persistingSpaceStats = true;
     try {
       await ensureSpaceStatsHydrated();
       if (!_canPersistSpaceStatsKv) return;
+      // Refresh averages on the persist cadence (also for memory mode).
+      _refreshCachedAveragesFromEffective();
+      if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
+        _foldSpaceStatsDeltaIntoBaseline();
+        _needSaveStats = false;
+        return;
+      }
       final snapshot = _spaceStatsSnapshot();
       await TransactionContext.runAsSystemOperation(() async {
         await _dataStore.internalKv.set(
@@ -1159,9 +1256,14 @@ class TableDataManager {
       _baselineRecordCount = 0;
       _baselineTableDataSizeBytes = 0;
       _baselineIndexDataSizeBytes = 0;
+      _baselineIndexEntryCount = 0;
       _deltaRecordCount = 0;
       _deltaTableDataSizeBytes = 0;
       _deltaIndexDataSizeBytes = 0;
+      _deltaIndexEntryCount = 0;
+      _cachedAvgTableRecordSizeBytes = null;
+      _cachedAvgIndexEntrySizeBytes = null;
+      _indexEntryBaselinePending = false;
       _lastStatisticsTime = null;
       _spaceStatsHydrated = false;
       _spaceStatsHydrateFuture = null;
@@ -1997,6 +2099,11 @@ class TableDataManager {
     return _effectiveIndexDataSizeBytes;
   }
 
+  /// get total index entry count (B+Tree entries + NGH vectors)
+  int getTotalIndexEntryCount() {
+    return _effectiveIndexEntryCount;
+  }
+
   /// get total size (table + index, bytes)
   int getTotalSizeBytes() {
     return _effectiveTableDataSizeBytes + _effectiveIndexDataSizeBytes;
@@ -2017,9 +2124,12 @@ class TableDataManager {
         _deltaRecordCount -= meta.totalRecordCount;
         _deltaTableDataSizeBytes -= meta.totalSizeBytes;
       }
-      final indexBytes = await sumTableIndexDataSizeBytes(table);
-      if (indexBytes != 0) {
-        _deltaIndexDataSizeBytes -= indexBytes;
+      final indexOcc = await _sumTableIndexOccupancy(table);
+      if (indexOcc.sizeBytes != 0) {
+        _deltaIndexDataSizeBytes -= indexOcc.sizeBytes;
+      }
+      if (indexOcc.entryCount != 0) {
+        _deltaIndexEntryCount -= indexOcc.entryCount;
       }
 
       _tableRecordCounts.remove(table.tableUid);
@@ -3029,9 +3139,12 @@ class TableDataManager {
                 _deltaRecordCount -= fileMeta.totalRecordCount;
                 _deltaTableDataSizeBytes -= fileMeta.totalSizeBytes;
               }
-              final indexBytes = await sumTableIndexDataSizeBytes(table);
-              if (indexBytes != 0) {
-                _deltaIndexDataSizeBytes -= indexBytes;
+              final indexOcc = await _sumTableIndexOccupancy(table);
+              if (indexOcc.sizeBytes != 0) {
+                _deltaIndexDataSizeBytes -= indexOcc.sizeBytes;
+              }
+              if (indexOcc.entryCount != 0) {
+                _deltaIndexEntryCount -= indexOcc.entryCount;
               }
               _needSaveStats = true;
             }

@@ -1426,9 +1426,11 @@ final class IndexTreePartitionManager {
       totalSizeBytes: max(0, meta.totalSizeBytes + sizeDeltaSum),
       timestamps: Timestamps(created: meta.timestamps.created, modified: now),
     );
-    if (sizeDeltaSum != 0) {
-      _dataStore.tableDataManager.applyIndexDataSizeDelta(table, sizeDeltaSum);
-    }
+    _dataStore.tableDataManager.applyIndexOccupancyDelta(
+      table,
+      sizeDelta: sizeDeltaSum,
+      entryDelta: entriesDeltaSum,
+    );
 
     // Partition 0 page 0 carries index-global metadata + local partition stats.
     // Local size must use the same rule as the loop above: btreeNextPageNo only

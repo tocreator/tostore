@@ -8,7 +8,8 @@ abstract final class SpaceStatsFieldId {
   static const int totalRecordCount = 1;
   static const int totalTableDataSizeBytes = 2;
   static const int totalIndexDataSizeBytes = 3;
-  static const int lastStatisticsTime = 4;
+  static const int totalIndexEntryCount = 4;
+  static const int lastStatisticsTime = 5;
 }
 
 /// Binary payload codec for [SpaceStats] (InternalKv value, no file shell).
@@ -16,7 +17,7 @@ final class SpaceStatsCodec {
   SpaceStatsCodec._();
 
   static Uint8List encode(SpaceStats stats) {
-    final w = BinaryWriter(initialCapacity: 48);
+    final w = BinaryWriter(initialCapacity: 56);
 
     w.writeFieldTag(SpaceStatsFieldId.totalRecordCount, WireType.varint);
     w.writeVarint(stats.totalRecordCount);
@@ -24,6 +25,8 @@ final class SpaceStatsCodec {
     w.writeVarint(stats.totalTableDataSizeBytes);
     w.writeFieldTag(SpaceStatsFieldId.totalIndexDataSizeBytes, WireType.varint);
     w.writeVarint(stats.totalIndexDataSizeBytes);
+    w.writeFieldTag(SpaceStatsFieldId.totalIndexEntryCount, WireType.varint);
+    w.writeVarint(stats.totalIndexEntryCount);
 
     if (stats.lastStatisticsTime != null) {
       w.writeFieldTag(SpaceStatsFieldId.lastStatisticsTime, WireType.fixed64);
@@ -37,6 +40,7 @@ final class SpaceStatsCodec {
     var totalRecordCount = 0;
     var totalTableDataSizeBytes = 0;
     var totalIndexDataSizeBytes = 0;
+    var totalIndexEntryCount = 0;
     DateTime? lastStatisticsTime;
 
     if (bytes.isNotEmpty) {
@@ -53,6 +57,9 @@ final class SpaceStatsCodec {
           case SpaceStatsFieldId.totalIndexDataSizeBytes:
             totalIndexDataSizeBytes = r.readVarint();
             break;
+          case SpaceStatsFieldId.totalIndexEntryCount:
+            totalIndexEntryCount = r.readVarint();
+            break;
           case SpaceStatsFieldId.lastStatisticsTime:
             lastStatisticsTime =
                 DateTime.fromMillisecondsSinceEpoch(r.readFixed64());
@@ -68,6 +75,7 @@ final class SpaceStatsCodec {
       totalRecordCount: totalRecordCount,
       totalTableDataSizeBytes: totalTableDataSizeBytes,
       totalIndexDataSizeBytes: totalIndexDataSizeBytes,
+      totalIndexEntryCount: totalIndexEntryCount,
       lastStatisticsTime: lastStatisticsTime,
     );
   }

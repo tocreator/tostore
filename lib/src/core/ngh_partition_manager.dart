@@ -564,9 +564,11 @@ final class NghPartitionManager {
       totalSizeBytes: max(0, meta.totalSizeBytes + sizeDeltaSum),
       timestamps: meta.timestamps.copyWith(modified: now),
     );
-    if (sizeDeltaSum != 0) {
-      _dataStore.tableDataManager.applyIndexDataSizeDelta(table, sizeDeltaSum);
-    }
+    _dataStore.tableDataManager.applyIndexOccupancyDelta(
+      table,
+      sizeDelta: sizeDeltaSum,
+      entryDelta: vectorsDelta,
+    );
 
     // ── Stage per-partition meta pages (pageNo=0) ──
     await _stagePartitionMeta(graphStats, pageSize, updatedMeta, stageWrite, yc,
