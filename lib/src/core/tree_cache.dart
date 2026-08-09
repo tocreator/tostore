@@ -247,6 +247,38 @@ class TreeCache<T> {
     _maybeScheduleCleanup();
   }
 
+  /// Insert only when [key] is absent (reservation / CAS-style).
+  ///
+  /// - Absent: inserts [value], returns `null` (caller owns the slot).
+  /// - Present: leaves the entry unchanged and returns the existing value
+  ///   (caller compares with self-id for unique-index "same record" cases).
+  ///
+  /// Unlike [put], never overwrites. Hot path does a single normalize + group
+  /// + [pointGet] (no separate get-then-put double lookup).
+  T? putIfAbsent(dynamic key, T value, {int? size}) {
+    final k = _normalizeKey(key);
+    final group = _getGroupForKey(k, create: true)!;
+
+    final existing = group.pointGet(k);
+    if (existing != null) {
+      // Do not touch/reorder: reservation probes must not inflate LRU rank.
+      return existing.value;
+    }
+
+    final int newSize = _sanitizeSize(size ?? sizeCalculator(value));
+    final entry = _CacheEntry<T>(k, value, newSize);
+    group.pointInsert(k, entry);
+    group.attachNew(entry);
+    group.syncOrderedInsert(entry);
+    group.totalBytes += newSize;
+    group.entryCount++;
+    _estimatedTotalSizeBytes += newSize;
+    _totalEntries++;
+
+    _maybeScheduleCleanup();
+    return null;
+  }
+
   /// Batch insert/update.
   ///
   /// [sizes] is optional; when provided, it must use the same keys as [entries].
