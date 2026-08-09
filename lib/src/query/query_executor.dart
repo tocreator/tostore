@@ -2666,7 +2666,7 @@ class QueryExecutor {
       table: table,
       condition: matcherCondition,
       records: records,
-      estimateRecordBytes: _estimateRecordSizeBytes,
+      estimateRecordBytes: _dataStore.tableDataManager.resolveRecordSizeBytes,
     );
     return matchResult.matchedIndices;
   }
@@ -3431,6 +3431,10 @@ class QueryExecutor {
 
   int _estimateQueryResultSizeBytes(List<Map<String, dynamic>> records) {
     if (records.isEmpty) return 0;
+    final spaceAvg = _dataStore.tableDataManager.averageTableRecordSizeBytes;
+    if (spaceAvg != null && spaceAvg > 0) {
+      return spaceAvg * records.length;
+    }
     const int sample = 6;
     final int take = min(sample, records.length);
     int sum = 0;

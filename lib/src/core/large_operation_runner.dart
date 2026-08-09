@@ -237,7 +237,7 @@ class LargeOperationRunner {
             condition: conditionMap,
             records: records,
             estimateRecordBytes:
-                dataStore.tableDataManager.estimateRecordSizeBytes,
+                dataStore.tableDataManager.resolveRecordSizeBytes,
             maxMatchCount: remainingMatchBudget,
           );
 
@@ -472,7 +472,7 @@ class LargeOperationRunner {
             condition: conditionMap,
             records: records,
             estimateRecordBytes:
-                dataStore.tableDataManager.estimateRecordSizeBytes,
+                dataStore.tableDataManager.resolveRecordSizeBytes,
             maxMatchCount: remainingMatchBudget,
           );
 

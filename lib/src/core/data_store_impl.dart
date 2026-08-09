@@ -2057,10 +2057,7 @@ class DataStoreImpl {
     final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
       itemCount: records.length,
       estimateAverageItemBytes: () =>
-          ComputeBatchPlanner.estimateAverageItemBytes(
-        records,
-        tableDataManager.estimateRecordSizeBytes,
-      ),
+          tableDataManager.estimateAverageRecordBytesForBatch(records),
     );
     final useIsolate = dispatchPlan.useIsolate;
     final actualTaskCount = dispatchPlan.actualTaskCount;
@@ -2143,8 +2140,12 @@ class DataStoreImpl {
 
     final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
       itemCount: records.length,
-      estimateAverageItemBytes: () =>
-          _estimateAverageUpdatePrepareBytes(records, existingRecords),
+      estimateAverageItemBytes: () {
+        final avg = tableDataManager.averageTableRecordSizeBytes;
+        // new + existing typical working set for update prepare.
+        if (avg != null && avg > 0) return avg * 2;
+        return _estimateAverageUpdatePrepareBytes(records, existingRecords);
+      },
     );
     final useIsolate = dispatchPlan.useIsolate;
     final actualTaskCount = dispatchPlan.actualTaskCount;
@@ -2286,10 +2287,7 @@ class DataStoreImpl {
     final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
       itemCount: existingRecords.length,
       estimateAverageItemBytes: () =>
-          ComputeBatchPlanner.estimateAverageItemBytes(
-        existingRecords,
-        tableDataManager.estimateRecordSizeBytes,
-      ),
+          tableDataManager.estimateAverageRecordBytesForBatch(existingRecords),
     );
     final useIsolate = dispatchPlan.useIsolate;
     final actualTaskCount = dispatchPlan.actualTaskCount;
@@ -8358,7 +8356,7 @@ class DataStoreImpl {
           table: table,
           condition: op.condition,
           records: records,
-          estimateRecordBytes: tableDataManager.estimateRecordSizeBytes,
+          estimateRecordBytes: tableDataManager.resolveRecordSizeBytes,
         );
         for (final idx in matchResult.matchedIndices) {
           final rec = records[idx];
@@ -8373,7 +8371,7 @@ class DataStoreImpl {
           table: table,
           condition: op.condition,
           records: records, // new values
-          estimateRecordBytes: tableDataManager.estimateRecordSizeBytes,
+          estimateRecordBytes: tableDataManager.resolveRecordSizeBytes,
         );
         for (final idx in matchResult.matchedIndices) {
           final rec = records[idx];
@@ -8405,7 +8403,7 @@ class DataStoreImpl {
           table: table,
           condition: op.condition,
           records: records,
-          estimateRecordBytes: tableDataManager.estimateRecordSizeBytes,
+          estimateRecordBytes: tableDataManager.resolveRecordSizeBytes,
         );
         for (final idx in matchResult.matchedIndices) {
           final rec = records[idx];
@@ -8420,7 +8418,7 @@ class DataStoreImpl {
           table: table,
           condition: op.condition,
           records: records,
-          estimateRecordBytes: tableDataManager.estimateRecordSizeBytes,
+          estimateRecordBytes: tableDataManager.resolveRecordSizeBytes,
         );
         for (final idx in matchResult.matchedIndices) {
           final rec = records[idx];
@@ -8437,7 +8435,7 @@ class DataStoreImpl {
           table: table,
           condition: op.condition,
           records: oldRecords,
-          estimateRecordBytes: tableDataManager.estimateRecordSizeBytes,
+          estimateRecordBytes: tableDataManager.resolveRecordSizeBytes,
         );
 
         final matchedOldIndicesSet = matchOldResult.matchedIndices.toSet();
@@ -8464,7 +8462,7 @@ class DataStoreImpl {
           table: table,
           condition: op.condition,
           records: records, // new values
-          estimateRecordBytes: tableDataManager.estimateRecordSizeBytes,
+          estimateRecordBytes: tableDataManager.resolveRecordSizeBytes,
         );
 
         for (final idx in matchNewResult.matchedIndices) {

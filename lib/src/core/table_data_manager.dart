@@ -135,10 +135,14 @@ class TableDataManager {
   bool _spaceStatsHydrated = false;
   Future<void>? _spaceStatsHydrateFuture;
 
-  /// Disk-based average sizes refreshed on SpaceStats persist / hydrate /
-  /// full reconcile. Hot paths read these only (no per-call division).
+  /// Space-wide averages: refreshed on SpaceStats hydrate / persist only.
   int? _cachedAvgTableRecordSizeBytes;
   int? _cachedAvgIndexEntrySizeBytes;
+
+  /// Last flush averages: O(1) overwrite when a flush reports net growth.
+  /// Prefer these over space-wide for resolve paths (recent shape wins).
+  int? _lastFlushAvgTableRecordSizeBytes;
+  int? _lastFlushAvgIndexEntrySizeBytes;
 
   /// Upgrade: old KV lacked [SpaceStats.totalIndexEntryCount] while index bytes
   /// were already tracked — force one full reconcile to seed the denominator.
@@ -217,7 +221,7 @@ class TableDataManager {
     // Reserve a portion for range-partition caches (blocks + sparse index).
     final int maxBytes = max(1, (tableQuota * 0.55).toInt());
     _tableRecordCache = TreeCache<Map<String, dynamic>>(
-      sizeCalculator: _tableRecordCacheSizeBytes,
+      sizeCalculator: resolveRecordSizeBytes,
       maxByteThreshold: maxBytes,
       minByteThreshold: 50 * 1024 * 1024,
       comparatorFactory: _tableRecordComparatorFactory,
@@ -346,7 +350,7 @@ class TableDataManager {
       _tableRecordCache.put(
         [tableUid, pk],
         record,
-        size: _tableRecordCacheSizeBytes(record),
+        size: resolveRecordSizeBytes(record),
       );
     }
   }
@@ -391,8 +395,7 @@ class TableDataManager {
       }
 
       final value = r;
-      _tableRecordCache.put(key, value,
-          size: _tableRecordCacheSizeBytes(value));
+      _tableRecordCache.put(key, value, size: resolveRecordSizeBytes(value));
     }
   }
 
@@ -655,13 +658,13 @@ class TableDataManager {
   int get _effectiveIndexEntryCount =>
       max(0, _baselineIndexEntryCount + _deltaIndexEntryCount);
 
-  /// Cached disk-based average table-record size (bytes). Null until first
-  /// hydrate / persist refresh or when record count is 0.
-  int? get averageTableRecordSizeBytes => _cachedAvgTableRecordSizeBytes;
+  /// Resolved table-record average (O(1)): last flush, else space-wide.
+  int? get averageTableRecordSizeBytes =>
+      _lastFlushAvgTableRecordSizeBytes ?? _cachedAvgTableRecordSizeBytes;
 
-  /// Cached disk-based average index-entry size (bytes). Null until first
-  /// hydrate / persist refresh or when index entry count is 0.
-  int? get averageIndexEntrySizeBytes => _cachedAvgIndexEntrySizeBytes;
+  /// Resolved index-entry average (O(1)): last flush, else space-wide.
+  int? get averageIndexEntrySizeBytes =>
+      _lastFlushAvgIndexEntrySizeBytes ?? _cachedAvgIndexEntrySizeBytes;
 
   SpaceStats _spaceStatsSnapshot() => SpaceStats(
         totalRecordCount: _effectiveRecordCount,
@@ -685,11 +688,26 @@ class TableDataManager {
         iec <= 0 ? null : _effectiveIndexDataSizeBytes ~/ iec;
   }
 
-  /// TreeCache size: prefer SpaceStats disk average; fallback to estimate.
-  int _tableRecordCacheSizeBytes(Map<String, dynamic> record) {
-    final avg = _cachedAvgTableRecordSizeBytes;
+  /// Prefer last-flush / space-wide average (O(1)); else per-record estimate.
+  ///
+  /// Used by TreeCache quota and isolate-dispatch heuristics. Disk average is
+  /// not exact Dart-heap size — acceptable for scheduling / eviction only.
+  int resolveRecordSizeBytes(Map<String, dynamic> record) {
+    final avg = averageTableRecordSizeBytes;
     if (avg != null && avg > 0) return avg;
     return estimateRecordSizeBytes(record);
+  }
+
+  /// O(1) resolved average when warm; otherwise sample [records].
+  int estimateAverageRecordBytesForBatch(
+    List<Map<String, dynamic>> records,
+  ) {
+    final avg = averageTableRecordSizeBytes;
+    if (avg != null && avg > 0) return avg;
+    return ComputeBatchPlanner.estimateAverageItemBytes(
+      records,
+      estimateRecordSizeBytes,
+    );
   }
 
   /// Live space aggregates (baseline + session delta). Hydrates KV once.
@@ -863,15 +881,30 @@ class TableDataManager {
     _needSaveStats = true;
   }
 
-  /// O(1) incremental adjust for persisted table-data size deltas.
-  void applyTableDataSizeDelta(TableContext table, int sizeDelta) {
-    if (sizeDelta == 0 || !_contributesToSpaceStats(table)) return;
-    _deltaTableDataSizeBytes += sizeDelta;
-    _needSaveStats = true;
+  /// O(1) table-data flush occupancy: SpaceStats size delta + last-flush avg.
+  ///
+  /// Last-flush average updates only on net growth
+  /// ([recordDelta] > 0 and [sizeDelta] > 0).
+  void applyTableOccupancyDelta(
+    TableContext table, {
+    int sizeDelta = 0,
+    int recordDelta = 0,
+  }) {
+    if (!_contributesToSpaceStats(table)) return;
+    if (sizeDelta == 0 && recordDelta == 0) return;
+    if (sizeDelta != 0) {
+      _deltaTableDataSizeBytes += sizeDelta;
+      _needSaveStats = true;
+    }
+    if (recordDelta > 0 && sizeDelta > 0) {
+      _lastFlushAvgTableRecordSizeBytes = sizeDelta ~/ recordDelta;
+    }
   }
 
   /// O(1) incremental adjust for persisted index occupancy
   /// (file size bytes + B+Tree `totalEntryCount` / NGH `totalVectors`).
+  ///
+  /// Also refreshes last-flush index-entry average on net growth.
   void applyIndexOccupancyDelta(
     TableContext table, {
     int sizeDelta = 0,
@@ -881,6 +914,9 @@ class TableDataManager {
     if (sizeDelta == 0 && entryDelta == 0) return;
     if (sizeDelta != 0) _deltaIndexDataSizeBytes += sizeDelta;
     if (entryDelta != 0) _deltaIndexEntryCount += entryDelta;
+    if (entryDelta > 0 && sizeDelta > 0) {
+      _lastFlushAvgIndexEntrySizeBytes = sizeDelta ~/ entryDelta;
+    }
     _needSaveStats = true;
   }
 
@@ -1263,6 +1299,8 @@ class TableDataManager {
       _deltaIndexEntryCount = 0;
       _cachedAvgTableRecordSizeBytes = null;
       _cachedAvgIndexEntrySizeBytes = null;
+      _lastFlushAvgTableRecordSizeBytes = null;
+      _lastFlushAvgIndexEntrySizeBytes = null;
       _indexEntryBaselinePending = false;
       _lastStatisticsTime = null;
       _spaceStatsHydrated = false;
@@ -1964,10 +2002,7 @@ class TableDataManager {
     final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
       itemCount: records.length,
       estimateAverageItemBytes: () =>
-          ComputeBatchPlanner.estimateAverageItemBytes(
-        records,
-        estimateRecordSizeBytes,
-      ),
+          estimateAverageRecordBytesForBatch(records),
     );
     final useIsolate = dispatchPlan.useIsolate;
     final actualTaskCount = dispatchPlan.actualTaskCount;
@@ -3632,7 +3667,7 @@ class TableDataManager {
         table: tableContext,
         condition: matcher.condition.build(),
         records: recordValues,
-        estimateRecordBytes: estimateRecordSizeBytes,
+        estimateRecordBytes: resolveRecordSizeBytes,
       );
       for (final matchedIndex in matchResult.matchedIndices) {
         final y21 = yieldController.maybeYield();
@@ -4905,10 +4940,7 @@ class TableDataManager {
     final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
       itemCount: records.length,
       estimateAverageItemBytes: () =>
-          ComputeBatchPlanner.estimateAverageItemBytes(
-        records,
-        estimateRecordSizeBytes,
-      ),
+          estimateAverageRecordBytesForBatch(records),
     );
     final useIsolate = dispatchPlan.useIsolate;
     final actualTaskCount = dispatchPlan.actualTaskCount;

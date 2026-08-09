@@ -243,11 +243,8 @@ final class TableTreePartitionManager {
     final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
       itemCount: records.length,
       minUsefulTaskItems: _recordEncodeMinUsefulTaskItems,
-      estimateAverageItemBytes: () =>
-          ComputeBatchPlanner.estimateAverageItemBytes(
-        records,
-        _dataStore.tableDataManager.estimateRecordSizeBytes,
-      ),
+      estimateAverageItemBytes: () => _dataStore.tableDataManager
+          .estimateAverageRecordBytesForBatch(records),
     );
 
     final actualTaskCount = dispatchPlan.actualTaskCount;
@@ -1759,9 +1756,11 @@ final class TableTreePartitionManager {
       totalSizeBytes: max(0, meta.totalSizeBytes + sizeDeltaSum),
       timestamps: Timestamps(created: meta.timestamps.created, modified: now),
     );
-    if (sizeDeltaSum != 0) {
-      _dataStore.tableDataManager.applyTableDataSizeDelta(table, sizeDeltaSum);
-    }
+    _dataStore.tableDataManager.applyTableOccupancyDelta(
+      table,
+      sizeDelta: sizeDeltaSum,
+      recordDelta: recordsDeltaSum,
+    );
 
     // Partition 0 page 0 carries tree-global metadata + local partition stats.
     // Local size must use the same rule as the loop above: btreeNextPageNo only
