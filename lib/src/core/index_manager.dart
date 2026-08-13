@@ -3435,11 +3435,14 @@ class IndexManager {
             final List<String> cachedPks = cacheResult.primaryKeys;
 
             final List<String> pks = List.of(cachedPks);
-            // Sort PKs naturally (lexicographical for strings/encoded)
-            pks.sort();
-            if (reverse) {
-              pks.sort((a, b) => b.compareTo(a));
-            }
+            // Sort by typed primary-key order (length-first for sequential PKs),
+            // matching on-disk / TreeCache non-unique leaf order ¡ª not String.compareTo.
+            final pkMatcher =
+                ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
+            pks.sort((a, b) {
+              final c = pkMatcher(a, b);
+              return reverse ? -c : c;
+            });
 
             final out = <String>[];
             final localPrefix = encodePrefix(condition.value);

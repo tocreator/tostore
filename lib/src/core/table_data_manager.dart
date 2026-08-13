@@ -4294,26 +4294,17 @@ class TableDataManager {
       // Defensive: always treat deleted/tombstone as non-visible.
       if (isDeletedRecord(r)) return false;
 
-      // Check Real-time WriteBuffer to filter out pending deletes.
-      // This prevents "page gaps" where disk records are counted towards limit
-      // but later removed during mergeConsistency.
+      // Check Real-time WriteBuffer to filter out pending deletes / apply overlays.
       Map<String, dynamic> evalRecord = r;
       if (!readFromFileOnly) {
         final pk = r[primaryKey]?.toString();
         if (pk != null) {
-          if (onlyCount) {
-            // Skip if in buffer for onlyCount fast path to avoid double counting
-            if (bufferMgr.getBufferedRecordForRead(tableContext, pk) != null) {
+          final be = bufferMgr.getBufferedRecordForRead(tableContext, pk);
+          if (be != null) {
+            if (be.operation == BufferOperationType.delete) {
               return false;
             }
-          } else {
-            final be = bufferMgr.getBufferedRecordForRead(tableContext, pk);
-            if (be != null) {
-              if (be.operation == BufferOperationType.delete) {
-                return false;
-              }
-              evalRecord = be.data;
-            }
+            evalRecord = be.data;
           }
         }
       }
