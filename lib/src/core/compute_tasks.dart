@@ -19,7 +19,6 @@ import '../model/table_schema.dart';
 import '../model/wal_pointer.dart';
 import 'btree_page.dart';
 import 'page_redo_log_codec.dart';
-import 'table_data_manager.dart';
 import 'yield_controller.dart';
 
 /// Table similarity calculation request
@@ -649,13 +648,8 @@ class MigrationRecordProcessResult {
 Map<String, dynamic> applyMigrationOperationsSync(
   Map<String, dynamic> record,
   List<MigrationOperation> operations,
-  TableSchema? oldSchema, {
-  bool skipDeleted = true,
-}) {
-  if (skipDeleted && isDeletedRecord(record)) {
-    return record;
-  }
-
+  TableSchema? oldSchema,
+) {
   for (final operation in operations) {
     switch (operation.type) {
       case MigrationType.addField:
@@ -861,7 +855,6 @@ Future<MigrationRecordProcessResult> processMigrationRecords(
         Map<String, dynamic>.from(record),
         request.operations,
         request.oldSchema,
-        skipDeleted: true,
       );
 
       migratedEntries.add(BufferEntry(

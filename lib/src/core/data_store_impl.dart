@@ -1437,6 +1437,10 @@ class DataStoreImpl {
           schema: resolvedSchema,
         );
 
+        // Empty committed meta in memory: first insert skips disk unique probes
+        // without a separate negative-cache. Persist happens on first flush.
+        tableDataManager.seedEmptyTableDataMeta(tableCtx);
+
         // Persist self-row after schema is durable (bootstrap recursion avoided).
         // Index files/meta are created lazily on first write via writeChanges.
         if (isTableMeta) {

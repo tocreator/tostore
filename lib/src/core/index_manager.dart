@@ -7,6 +7,7 @@ import '../handler/logger.dart';
 import '../handler/memcomparable.dart';
 import '../handler/parallel_processor.dart';
 import '../handler/value_matcher.dart';
+import '../model/buffer_entry.dart';
 import '../model/data_block_entry.dart';
 import '../model/data_store_config.dart';
 import '../model/db_exception.dart';
@@ -831,106 +832,113 @@ class IndexManager {
     return <dynamic>[...groupPrefix, ...decoded];
   }
 
-  /// Memory-mode index scan based on [_indexDataCache].
+  static bool _isDiskIndexFileUsable(IndexMeta meta) =>
+      meta.totalEntryCount > 0 && !meta.btreeFirstLeaf.isNull;
+
+  static Uint8List _upperBoundExclusiveForPrefix(Uint8List prefix) {
+    final out = Uint8List(prefix.length + 1 + 4);
+    out.setRange(0, prefix.length, prefix);
+    out[prefix.length] = 0xFF;
+    return out;
+  }
+
+  /// Shared TreeCache index-range scan for memory / pending / txn sources.
   ///
-  /// This reuses the historical "full cache scan" semantics to keep cursor paging
-  /// consistent between forward/reverse scans, by applying start/end bounds using
-  /// MemComparable encoded keys inside the scan callback (not via TreeCache seek).
-  Future<IndexSearchResult> _scanIndexDataCacheRange({
+  /// Bounds are enforced with MemComparable-encoded keys inside [onEntry]
+  /// (same semantics as the historical full-cache scan).
+  ///
+  /// Delete visibility is NOT applied here: pending/txn index trees already
+  /// drop keys on delete. File/memory [base] hits are filtered in
+  /// [_mergePendingTxnIndexKeys].
+  Future<({List<IndexSearchEntry> entries, Uint8List? lastKey})>
+      _scanTreeCacheIndexRange({
+    required TreeCache<dynamic> cache,
+    required List<dynamic> groupPrefix,
     required TableContext table,
     required IndexUid indexUid,
+    required TableSchema schema,
     required Uint8List startKeyInclusive,
     required Uint8List endKeyExclusive,
     required bool reverse,
     required bool isUnique,
     int? limit,
     int? offset,
-    required TableSchema schema,
+    bool ensureBufferComparators = false,
   }) async {
-    // OPTIMIZATION: Decode bounds to seek in TreeCache.
-    final prefixKey = <dynamic>[table.tableUid, indexUid];
     List<dynamic>? rangeStart;
     List<dynamic>? rangeEnd;
     try {
       if (startKeyInclusive.isNotEmpty) {
-        rangeStart = _nativeTreeCacheSeekKey(prefixKey, startKeyInclusive);
+        rangeStart = _nativeTreeCacheSeekKey(groupPrefix, startKeyInclusive);
       }
       if (endKeyExclusive.isNotEmpty) {
-        rangeEnd = _nativeTreeCacheSeekKey(prefixKey, endKeyExclusive);
+        rangeEnd = _nativeTreeCacheSeekKey(groupPrefix, endKeyExclusive);
       }
     } catch (_) {
       rangeStart = null;
       rangeEnd = null;
     }
 
+    bool seekMatchesPrefix(List<dynamic>? seek) {
+      if (seek == null) return true;
+      if (seek.length < groupPrefix.length) return false;
+      for (int i = 0; i < groupPrefix.length; i++) {
+        if (seek[i] != groupPrefix[i]) return false;
+      }
+      return true;
+    }
+
+    if (!seekMatchesPrefix(rangeStart)) rangeStart = null;
+    if (!seekMatchesPrefix(rangeEnd)) rangeEnd = null;
+
+    if (ensureBufferComparators) {
+      _dataStore.writeBufferManager.bufferTrees
+          .ensureComparators(table, schema);
+    }
     _registerIndexComparator(table, indexUid, schema);
 
-    int scannedCount = 0;
-    int addedCount = 0;
-
-    final results = <String>[];
-    final entries = <IndexSearchEntry>[];
-    Uint8List? lastKey;
-
-    // Safety check on bounds validity vs prefix.
-    if (rangeStart != null &&
-        (rangeStart.length < 2 ||
-            rangeStart[0] != table.tableUid ||
-            rangeStart[1] != indexUid)) {
-      rangeStart = null;
-    }
-    if (rangeEnd != null &&
-        (rangeEnd.length < 2 ||
-            rangeEnd[0] != table.tableUid ||
-            rangeEnd[1] != indexUid)) {
-      rangeEnd = null;
-    }
-
-    // Resolve index schema for encoding key components (truncateText for non-unique).
     final indexSchema = _findBtreeIndexSchema(schema, indexUid, table: table) ??
         IndexSchema(indexName: '', fields: const []);
-    final resolvedIndexSchema = indexSchema;
-    final int fieldCount = resolvedIndexSchema.fields.length;
-    final bool truncateText = !isUnique;
+    final fieldCount = indexSchema.fields.length;
+    final truncateText = !isUnique;
+    final need = limit ?? (1 << 30);
 
-    await _indexDataCache.scanRange(
-      rangeStart ?? prefixKey,
+    final out = <IndexSearchEntry>[];
+    var scannedCount = 0;
+    Uint8List? lastKey;
+
+    await cache.scanRange(
+      rangeStart ?? groupPrefix,
       rangeEnd,
       reverse: reverse,
       onEntry: (key, val) {
-        if (key.length < 2 || key[0] != table.tableUid || key[1] != indexUid) {
-          return false;
+        if (key.length < groupPrefix.length) return false;
+        for (int i = 0; i < groupPrefix.length; i++) {
+          if (key[i] != groupPrefix[i]) return false;
         }
 
-        final keyValues =
-            key.sublist(2); // index field native values + pk? (non-unique)
-
-        // Safety: if schema mismatch, keep scanning but skip this entry.
+        final keyValues = key.sublist(groupPrefix.length);
         if (fieldCount <= 0 || keyValues.length < fieldCount) return true;
 
-        // Always encode key for cursor paging (fields..., [pk]).
         final comps = <Uint8List>[];
         for (int i = 0; i < fieldCount; i++) {
           final c = schema.encodeFieldComponentToMemComparable(
-            resolvedIndexSchema.fields[i],
+            indexSchema.fields[i],
             keyValues[i],
             truncateText: truncateText,
           );
           if (c == null) return true;
           comps.add(c);
         }
-
         if (!isUnique) {
           final pkRaw = keyValues.isNotEmpty ? keyValues.last : null;
           if (pkRaw != null) {
             comps.add(schema.encodePrimaryKeyComponent(pkRaw.toString()));
           }
         }
-
         if (comps.isEmpty) return true;
         final encodedKey = MemComparableKey.encodeTuple(comps);
 
-        // Apply inclusive/exclusive bounds (same as old full-cache logic).
         if (startKeyInclusive.isNotEmpty) {
           if (MemComparableKey.compare(encodedKey, startKeyInclusive) < 0) {
             return reverse ? false : true;
@@ -943,7 +951,6 @@ class IndexManager {
         }
 
         lastKey = encodedKey;
-
         scannedCount++;
         if (offset != null && scannedCount <= offset) return true;
 
@@ -953,22 +960,45 @@ class IndexManager {
         } else {
           pk = key.isNotEmpty ? key.last?.toString() : null;
         }
+        if (pk == null || pk.isEmpty) return true;
 
-        if (pk != null && pk.isNotEmpty) {
-          results.add(pk);
-          entries.add(IndexSearchEntry(primaryKey: pk, keyBytes: encodedKey));
-          addedCount++;
-        }
-
-        if (limit != null && addedCount >= limit) return false;
-        return true;
+        out.add(IndexSearchEntry(primaryKey: pk, keyBytes: encodedKey));
+        return out.length < need;
       },
     );
 
+    return (entries: out, lastKey: lastKey);
+  }
+
+  /// Memory-mode index scan based on [_indexDataCache].
+  Future<IndexSearchResult> _scanIndexDataCacheRange({
+    required TableContext table,
+    required IndexUid indexUid,
+    required Uint8List startKeyInclusive,
+    required Uint8List endKeyExclusive,
+    required bool reverse,
+    required bool isUnique,
+    int? limit,
+    int? offset,
+    required TableSchema schema,
+  }) async {
+    final scanned = await _scanTreeCacheIndexRange(
+      cache: _indexDataCache,
+      groupPrefix: <dynamic>[table.tableUid, indexUid],
+      table: table,
+      indexUid: indexUid,
+      schema: schema,
+      startKeyInclusive: startKeyInclusive,
+      endKeyExclusive: endKeyExclusive,
+      reverse: reverse,
+      isUnique: isUnique,
+      limit: limit,
+      offset: offset,
+    );
     return IndexSearchResult(
-      primaryKeys: results,
-      entries: entries.isEmpty ? null : entries,
-      lastKey: lastKey,
+      primaryKeys: [for (final e in scanned.entries) e.primaryKey],
+      entries: scanned.entries.isEmpty ? null : scanned.entries,
+      lastKey: scanned.lastKey,
     );
   }
 
@@ -982,16 +1012,17 @@ class IndexManager {
     int? limit,
     int? offset,
     bool readFromFileOnly = false,
+    bool skipFileSource = false,
   }) async {
     final isMemoryMode =
         _dataStore.config.persistenceMode == PersistenceMode.memory;
     final IndexSearchResult base;
-    if (!isMemoryMode) {
+    if (skipFileSource && !isMemoryMode) {
+      base = IndexSearchResult.empty();
+    } else if (!isMemoryMode) {
       // Missing/empty disk meta means skip the file source only -- pending/txn
       // trees are still fused below.
-      final fileUsable =
-          meta.totalEntryCount > 0 && !meta.btreeFirstLeaf.isNull;
-      if (fileUsable) {
+      if (_isDiskIndexFileUsable(meta)) {
         base = await _dataStore.indexTreePartitionManager?.searchByKeyRange(
               table: table,
               indexUid: indexUid,
@@ -1050,8 +1081,8 @@ class IndexManager {
 
   /// Range-fuse pending/txn index trees with a file/memory [base] page.
   ///
-  /// Uses MemComparable-decoded seek keys + early-stop (same as
-  /// [_scanIndexDataCacheRange]). Output is a k-way merge by encoded index key.
+  /// Delete overlay applies only to [base] (file/memory) hits: pending/txn
+  /// index trees already remove keys on delete.
   Future<IndexSearchResult> _mergePendingTxnIndexKeys({
     required TableContext table,
     required IndexUid indexUid,
@@ -1067,104 +1098,29 @@ class IndexManager {
     final trees = _dataStore.writeBufferManager.bufferTrees;
     final isUnique = meta.isUnique;
     final need = limit ?? (1 << 30);
+    // Offset only when file base was empty (pending-only page). When base
+    // already applied offset, pending scan must not skip again.
+    final int? pendingOffset = base.isEmpty ? offset : null;
 
     Future<List<IndexSearchEntry>> scanBufferIndex(
       TreeCache<dynamic> cache,
       List<dynamic> groupPrefix,
     ) async {
-      List<dynamic>? rangeStart;
-      List<dynamic>? rangeEnd;
-      try {
-        if (startKeyInclusive.isNotEmpty) {
-          rangeStart = _nativeTreeCacheSeekKey(groupPrefix, startKeyInclusive);
-        }
-        if (endKeyExclusive.isNotEmpty) {
-          rangeEnd = _nativeTreeCacheSeekKey(groupPrefix, endKeyExclusive);
-        }
-      } catch (_) {
-        rangeStart = null;
-        rangeEnd = null;
-      }
-
-      trees.ensureComparators(table, schema);
-      _registerIndexComparator(table, indexUid, schema);
-      final indexSchema =
-          _findBtreeIndexSchema(schema, indexUid, table: table) ??
-              IndexSchema(indexName: '', fields: const []);
-      final fieldCount = indexSchema.fields.length;
-      final truncateText = !isUnique;
-
-      final out = <IndexSearchEntry>[];
-      var scannedCount = 0;
-      // Oversample for deletes/hidden PKs; hard-stop via onEntry.
-      final scanCap = limit == null ? null : (limit * 4 + 8 + (offset ?? 0));
-
-      await cache.scanRange(
-        rangeStart ?? groupPrefix,
-        rangeEnd,
+      final scanned = await _scanTreeCacheIndexRange(
+        cache: cache,
+        groupPrefix: groupPrefix,
+        table: table,
+        indexUid: indexUid,
+        schema: schema,
+        startKeyInclusive: startKeyInclusive,
+        endKeyExclusive: endKeyExclusive,
         reverse: reverse,
-        limit: scanCap,
-        onEntry: (key, val) {
-          if (key.length < groupPrefix.length) return false;
-          for (int i = 0; i < groupPrefix.length; i++) {
-            if (key[i] != groupPrefix[i]) return false;
-          }
-
-          final keyValues = key.sublist(groupPrefix.length);
-          if (fieldCount <= 0 || keyValues.length < fieldCount) return true;
-
-          final comps = <Uint8List>[];
-          for (int i = 0; i < fieldCount; i++) {
-            final c = schema.encodeFieldComponentToMemComparable(
-              indexSchema.fields[i],
-              keyValues[i],
-              truncateText: truncateText,
-            );
-            if (c == null) return true;
-            comps.add(c);
-          }
-          if (!isUnique) {
-            final pkRaw = keyValues.isNotEmpty ? keyValues.last : null;
-            if (pkRaw != null) {
-              comps.add(schema.encodePrimaryKeyComponent(pkRaw.toString()));
-            }
-          }
-          if (comps.isEmpty) return true;
-          final encodedKey = MemComparableKey.encodeTuple(comps);
-
-          if (startKeyInclusive.isNotEmpty) {
-            if (MemComparableKey.compare(encodedKey, startKeyInclusive) < 0) {
-              return reverse ? false : true;
-            }
-          }
-          if (endKeyExclusive.isNotEmpty) {
-            if (MemComparableKey.compare(encodedKey, endKeyExclusive) >= 0) {
-              return reverse ? true : false;
-            }
-          }
-
-          scannedCount++;
-          // Offset only applies when file base was empty (pending-only page).
-          // When base already applied offset, pending scan uses the same
-          // start/end cursor bounds and must not skip again.
-          if (base.isEmpty && offset != null && scannedCount <= offset) {
-            return true;
-          }
-
-          String? pk;
-          if (isUnique) {
-            pk = val is String ? val : val?.toString();
-          } else {
-            pk = key.isNotEmpty ? key.last?.toString() : null;
-          }
-          if (pk == null || pk.isEmpty) return true;
-          if (_isPrimaryKeyHiddenByDeleteOverlay(table, pk)) return true;
-
-          out.add(IndexSearchEntry(primaryKey: pk, keyBytes: encodedKey));
-          return out.length < need;
-        },
+        isUnique: isUnique,
+        limit: need,
+        offset: pendingOffset,
+        ensureBufferComparators: true,
       );
-      return out;
+      return scanned.entries;
     }
 
     final pendingEntries = await scanBufferIndex(
@@ -1181,20 +1137,44 @@ class IndexManager {
       );
     }
 
-    List<IndexSearchEntry> baseEntries;
+    List<IndexSearchEntry> rawBaseEntries;
     if (base.entries != null && base.entries!.isNotEmpty) {
-      baseEntries = base.entries!;
+      rawBaseEntries = base.entries!;
     } else if (base.primaryKeys.isEmpty) {
-      baseEntries = const [];
+      rawBaseEntries = const [];
     } else {
       // File path without keyBytes: keep relative order, merge as lowest priority.
-      baseEntries = [
+      rawBaseEntries = [
         for (final pk in base.primaryKeys)
           IndexSearchEntry(primaryKey: pk, keyBytes: Uint8List(0)),
       ];
     }
 
-    if (pendingEntries.isEmpty && txnEntries.isEmpty) return base;
+    // File/memory hits: drop deletes and index keys invalidated by updates.
+    final baseEntries = <IndexSearchEntry>[
+      for (final e in rawBaseEntries)
+        if (!_isFileIndexHitStaleUnderOverlay(
+          table: table,
+          meta: meta,
+          schema: schema,
+          pk: e.primaryKey,
+          fileKeyBytes: e.keyBytes,
+          startKeyInclusive: startKeyInclusive,
+          endKeyExclusive: endKeyExclusive,
+        ))
+          e,
+    ];
+
+    if (pendingEntries.isEmpty && txnEntries.isEmpty) {
+      if (baseEntries.length == rawBaseEntries.length) return base;
+      return IndexSearchResult(
+        primaryKeys: [for (final e in baseEntries) e.primaryKey],
+        entries: baseEntries.isEmpty ? null : baseEntries,
+        lastKey: baseEntries.isEmpty ? base.lastKey : baseEntries.last.keyBytes,
+        requiresTableScan: base.requiresTableScan,
+        indexWasUsed: base.indexWasUsed,
+      );
+    }
 
     final merged = _kWayMergeIndexEntries(
       sources: [txnEntries, pendingEntries, baseEntries],
@@ -1208,6 +1188,151 @@ class IndexManager {
       lastKey: merged.isEmpty ? base.lastKey : merged.last.keyBytes,
       requiresTableScan: base.requiresTableScan,
       indexWasUsed: base.indexWasUsed,
+    );
+  }
+
+  /// When the disk index file source is unusable, decide empty / tableScan /
+  /// or `null` to fall through and fuse pending/txn trees.
+  ///
+  /// Call only after [isBuilding] heal, and only when
+  /// `!_isDiskIndexFileUsable(meta)`.
+  Future<IndexSearchResult?> _gateUnusableDiskIndexSearch({
+    required TableContext table,
+    required IndexUid indexUid,
+    required TableSchema schema,
+    required bool readFromFileOnly,
+    required bool metaWasMissing,
+  }) async {
+    if (readFromFileOnly) {
+      return IndexSearchResult.empty();
+    }
+
+    final tableDataMeta =
+        await _dataStore.tableDataManager.getTableDataMeta(table.tableUid);
+    final persistedTableRecords = tableDataMeta?.totalRecordCount ?? 0;
+    if (persistedTableRecords > 0) {
+      if (!metaWasMissing) {
+        Logger.warn(
+          'Index ${table.tableName}.'
+          '${_indexLogLabel(table, indexUid, schema: schema)} '
+          'appears empty while table has $persistedTableRecords persisted '
+          'records; falling back to table scan (rebuild only via schema '
+          'migration or key migration)',
+        );
+      }
+      return IndexSearchResult.tableScan();
+    }
+
+    if (metaWasMissing) {
+      final hasPending =
+          _dataStore.writeBufferManager.hasPendingWritesForUid(table.tableUid);
+      final txId = TransactionContext.getCurrentTransactionId();
+      final hasTxn = txId != null &&
+          !TransactionContext.isApplyingCommit() &&
+          _dataStore.tableDataManager.hasDeferredOps(txId);
+      if (!hasPending && !hasTxn) {
+        return IndexSearchResult.empty();
+      }
+    }
+    // Empty disk index + no persisted rows: fall through so pending/txn fuse
+    // can serve unflushed inserts ("insert then query before flush").
+    return null;
+  }
+
+  /// Unique point lookup: buffer probe → file point → pending/txn fuse only.
+  ///
+  /// After a file miss, does not re-scan the file source.
+  Future<IndexSearchResult> _searchUniquePointLogical({
+    required TableContext table,
+    required IndexUid indexUid,
+    required IndexMeta meta,
+    required TableSchema schema,
+    required Uint8List encodedPrefix,
+    required dynamic probeKey,
+    required List<dynamic> nativeVal,
+    bool reverse = false,
+    bool readFromFileOnly = false,
+    bool populateHotspot = true,
+  }) async {
+    if (!readFromFileOnly) {
+      final bufferId = _probeBufferForUniqueIndex(table, indexUid, probeKey);
+      if (bufferId != null) {
+        return IndexSearchResult(
+          primaryKeys: <String>[bufferId],
+          entries: [
+            IndexSearchEntry(primaryKey: bufferId, keyBytes: encodedPrefix),
+          ],
+          indexWasUsed: true,
+        );
+      }
+    }
+
+    final isMemoryMode =
+        _dataStore.config.persistenceMode == PersistenceMode.memory;
+    if (isMemoryMode) {
+      final compositeKey = <dynamic>[table.tableUid, indexUid, ...nativeVal];
+      final pkValue = _indexDataCache.get(compositeKey);
+      if (pkValue is String && pkValue.isNotEmpty) {
+        return IndexSearchResult(
+          primaryKeys: <String>[pkValue],
+          entries: [
+            IndexSearchEntry(primaryKey: pkValue, keyBytes: encodedPrefix),
+          ],
+        );
+      }
+      return IndexSearchResult.empty();
+    }
+
+    if (_isDiskIndexFileUsable(meta)) {
+      final pk = await _lookupUniquePrimaryKeyLogical(
+        table: table,
+        indexUid: indexUid,
+        meta: meta,
+        uniqueKey: encodedPrefix,
+      );
+      if (pk != null) {
+        // File hit may be covered by delete, or an update that moved the key.
+        if (_isFileIndexHitStaleUnderOverlay(
+          table: table,
+          meta: meta,
+          schema: schema,
+          pk: pk,
+          fileKeyBytes: encodedPrefix,
+          startKeyInclusive: encodedPrefix,
+          endKeyExclusive: _upperBoundExclusiveForPrefix(encodedPrefix),
+        )) {
+          // Stale file owner: still try pending/txn fuse below.
+        } else {
+          // Never poison hotspot from file-only reads (no pending fuse context).
+          if (populateHotspot &&
+              !readFromFileOnly &&
+              !(_dataStore.resourceManager?.isLowMemoryMode ?? false)) {
+            _indexDataCache.put([table.tableUid, indexUid, ...nativeVal], pk);
+          }
+          return IndexSearchResult(
+            primaryKeys: <String>[pk],
+            entries: [
+              IndexSearchEntry(primaryKey: pk, keyBytes: encodedPrefix),
+            ],
+          );
+        }
+      }
+    }
+
+    if (readFromFileOnly) return IndexSearchResult.empty();
+
+    // File already checked (or unusable): fuse pending/txn only.
+    return _searchIndexByKeyRangeLogical(
+      table: table,
+      indexUid: indexUid,
+      meta: meta,
+      startKeyInclusive: encodedPrefix,
+      endKeyExclusive: _upperBoundExclusiveForPrefix(encodedPrefix),
+      reverse: reverse,
+      limit: 1,
+      offset: null,
+      readFromFileOnly: false,
+      skipFileSource: true,
     );
   }
 
@@ -1294,6 +1419,90 @@ class IndexManager {
       primaryKey,
       transactionId: transactionId,
     );
+  }
+
+  String? _effectiveOverlayTransactionId(String? transactionId) {
+    final txId = transactionId ?? TransactionContext.getCurrentTransactionId();
+    if (txId == null || TransactionContext.isApplyingCommit()) return null;
+    return txId;
+  }
+
+  /// Whether a file/memory index hit is stale under pending/txn overlay.
+  ///
+  /// - delete → stale
+  /// - update/insert → re-encode live index key; stale when it no longer matches
+  ///   [fileKeyBytes] (or, when file key is empty, no longer falls in the query
+  ///   range)
+  /// - no overlay → not stale
+  bool _isFileIndexHitStaleUnderOverlay({
+    required TableContext table,
+    required IndexMeta meta,
+    required TableSchema schema,
+    required String pk,
+    required Uint8List fileKeyBytes,
+    required Uint8List startKeyInclusive,
+    required Uint8List endKeyExclusive,
+    String? transactionId,
+  }) {
+    final overlay = _dataStore.writeBufferManager.bufferTrees.getVisibleRecord(
+      table,
+      pk,
+      transactionId: _effectiveOverlayTransactionId(transactionId),
+    );
+    if (overlay == null) return false;
+    if (overlay.operation == BufferOperationType.delete) return true;
+
+    final liveKey = encodeIndexKeyFromRecord(
+      schema: schema,
+      meta: meta,
+      record: overlay.data,
+      pkValue: pk,
+      table: table,
+    );
+    if (liveKey == null) return true;
+
+    if (fileKeyBytes.isNotEmpty) {
+      return MemComparableKey.compare(liveKey, fileKeyBytes) != 0;
+    }
+    if (startKeyInclusive.isNotEmpty &&
+        MemComparableKey.compare(liveKey, startKeyInclusive) < 0) {
+      return true;
+    }
+    if (endKeyExclusive.isNotEmpty &&
+        MemComparableKey.compare(liveKey, endKeyExclusive) >= 0) {
+      return true;
+    }
+    return false;
+  }
+
+  /// Disk unique-index owner [existingPk] still owns [uniqueKeyBytes] after overlay.
+  ///
+  /// Used by uniqueness checks: delete or key-changing update clears ownership.
+  bool _uniqueDiskOwnerStillOwnsKey({
+    required TableContext table,
+    required IndexMeta meta,
+    required TableSchema schema,
+    required String existingPk,
+    required Uint8List uniqueKeyBytes,
+    String? transactionId,
+  }) {
+    final overlay = _dataStore.writeBufferManager.bufferTrees.getVisibleRecord(
+      table,
+      existingPk,
+      transactionId: _effectiveOverlayTransactionId(transactionId),
+    );
+    if (overlay == null) return true;
+    if (overlay.operation == BufferOperationType.delete) return false;
+
+    final liveKey = encodeIndexKeyFromRecord(
+      schema: schema,
+      meta: meta,
+      record: overlay.data,
+      pkValue: existingPk,
+      table: table,
+    );
+    if (liveKey == null) return false;
+    return MemComparableKey.compare(liveKey, uniqueKeyBytes) == 0;
   }
 
   /// Whether an authoritative source currently owns a full index rebuild.
@@ -1598,9 +1807,10 @@ class IndexManager {
   ///
   /// [TableDataManager.clearTable] only removes the data partition directory;
   /// indexes live under `{table}/index/` and must be cleared separately.
-  /// Deletes that root once (not per-index) and clears memory caches. Does
-  /// **not** recreate empty [IndexMeta] - the next [writeChanges] synthesizes
-  /// meta on demand.
+  /// Deletes that root once (not per-index) and clears memory caches, then
+  /// pre-seeds empty [IndexMeta] in memory (no disk write) so post-clear
+  /// [getIndexMeta] / unique checks do not repeatedly [existsFile]-probe
+  /// missing partition-0 paths. [writeChanges] still persists meta on first flush.
   Future<void> clearIndexesForTable(TableContext table) async {
     try {
       _dataStore.vectorIndexManager?.clearCacheForTable(table.tableUid);
@@ -1617,6 +1827,28 @@ class IndexManager {
       if (await _dataStore.storage.existsDirectory(indexDir)) {
         await _dataStore.storage.deleteDirectory(indexDir);
       }
+
+      // Pre-seed empty IndexMeta so subsequent unique/index lookups do not
+      // existsFile-probe missing partition-0 files after clear.
+      final schema = table.schema;
+      final allIndexes = <IndexSchema>[
+        ...?_dataStore.tableMetaManager?.getAllIndexesFor(schema),
+        ...getEngineManagedBtreeIndexes(table, schema),
+      ];
+      for (final index in allIndexes) {
+        final indexUid = _indexUidFromSchema(index);
+        if (indexUid.isEmpty) continue;
+        _indexMetaCache.put(
+          [table.tableUid, indexUid],
+          IndexMeta.createEmpty(
+            indexUid: indexUid,
+            tableUid: table.tableUid,
+            isUnique: index.unique,
+            isBuilding: false,
+          ),
+        );
+      }
+
       Logger.debug('Cleared index directory for table ${table.tableName}');
     } catch (e) {
       Logger.error(
@@ -1665,6 +1897,18 @@ class IndexManager {
         return values;
       }
 
+      // Empty committed table: skip ALL disk unique I/O (PK + indexes).
+      // Buffer reservation already covers unflushed conflicts. Hoisted before
+      // existsPrimaryKey so first-install / pre-flush inserts do not repeatedly
+      // existsFile-probe a missing partition-0 meta file.
+      var skipDiskUniqueChecks = false;
+      if (!isMemoryMode) {
+        final tableDataMeta =
+            await _dataStore.tableDataManager.getTableDataMeta(table.tableUid);
+        skipDiskUniqueChecks =
+            tableDataMeta == null || tableDataMeta.totalRecordCount <= 0;
+      }
+
       // 1. Consolidate all unique constraints to check.
       final constraints = <_UniqueConstraint>[];
 
@@ -1707,7 +1951,7 @@ class IndexManager {
               indexName: IndexName('pk'),
             );
           }
-        } else {
+        } else if (!skipDiskUniqueChecks) {
           // 1) Persisted check: use tree-partitioned table data.
           try {
             final exists = await _dataStore.tableTreePartitionManager
@@ -1855,6 +2099,11 @@ class IndexManager {
         return null;
       }
 
+      // Empty on-disk table: buffer/reservation already checked; no index I/O.
+      if (skipDiskUniqueChecks) {
+        return null;
+      }
+
       // 3. Execute disk checks using existsUniqueKeysBatch (fast BinaryFuseFilter + grouped I/O)
       try {
         // Group constraints by stable index uid for batch processing
@@ -1874,12 +2123,6 @@ class IndexManager {
           // Get index metadata
           final meta = await getIndexMeta(table.tableUid, indexUid);
           if (meta == null || meta.isBuilding || meta.totalEntryCount <= 0) {
-            final tableDataMeta = await _dataStore.tableDataManager
-                .getTableDataMeta(table.tableUid);
-            if (tableDataMeta == null || tableDataMeta.totalRecordCount <= 0) {
-              // Verified empty table on disk; no persistent conflict possible.
-              continue;
-            }
             for (final constraint in indexConstraints) {
               final existingPk = await _findExistingPrimaryKeyByConstraint(
                 table: table,
@@ -1993,9 +2236,12 @@ class IndexManager {
                 'value=${constraint.value}',
               );
             } else {
-              if (_isPrimaryKeyHiddenByDeleteOverlay(
-                table,
-                existingPk,
+              if (!_uniqueDiskOwnerStillOwnsKey(
+                table: table,
+                meta: meta,
+                schema: schema,
+                existingPk: existingPk,
+                uniqueKeyBytes: positiveKeyBytes[j],
                 transactionId: currentTxId,
               )) {
                 continue;
@@ -2113,6 +2359,15 @@ class IndexManager {
 
     // 1) Primary key uniqueness (only for INSERTs with custom PKs).
     // 1) Primary key check (only if not an update of the same record)
+    // Empty committed table: skip disk PK probes (buffer/intra-batch still run).
+    var skipDiskUniqueChecks = false;
+    if (!isMemoryMode) {
+      final tableDataMeta =
+          await _dataStore.tableDataManager.getTableDataMeta(table.tableUid);
+      skipDiskUniqueChecks =
+          tableDataMeta == null || tableDataMeta.totalRecordCount <= 0;
+    }
+
     if (!isUpdate && !skipPrimaryKeyCheck) {
       final pkList = <String>[];
       final pkSeen = <String>{};
@@ -2181,6 +2436,8 @@ class IndexManager {
             }
           }
           existing = set;
+        } else if (skipDiskUniqueChecks) {
+          existing = const <String>{};
         } else {
           existing = await _dataStore.tableTreePartitionManager
                   ?.existingPrimaryKeysBatch(table, pkList) ??
@@ -2346,18 +2603,14 @@ class IndexManager {
         continue;
       }
 
+      // Empty on-disk table: buffer/intra-batch already checked; no index I/O.
+      if (skipDiskUniqueChecks) {
+        continue;
+      }
+
       // 2.2 Disk path using BinaryFuseFilter + grouped point lookups (existence-only).
       final meta = await getIndexMeta(table.tableUid, indexUid);
       if (meta == null || meta.isBuilding || meta.totalEntryCount <= 0) {
-        // Fast path for brand new tables: if meta is missing or index is empty,
-        // and the table data metadata also indicates 0 records, we can skip the heavy disk scan.
-        final tableDataMeta =
-            await _dataStore.tableDataManager.getTableDataMeta(table.tableUid);
-        if (tableDataMeta == null || tableDataMeta.totalRecordCount <= 0) {
-          // Verified empty table on disk; no persistent conflict possible.
-          continue;
-        }
-
         for (int i = 0; i < records.length; i++) {
           final y3 = yieldController.maybeYield();
           if (y3 != null) await y3;
@@ -2446,9 +2699,12 @@ class IndexManager {
           final recordId = records[i][primaryKey]?.toString();
           if (isUpdate && existingPk == recordId) continue;
 
-          if (!_isPrimaryKeyHiddenByDeleteOverlay(
-            table,
-            existingPk,
+          if (_uniqueDiskOwnerStillOwnsKey(
+            table: table,
+            meta: meta,
+            schema: schema,
+            existingPk: existingPk,
+            uniqueKeyBytes: positiveKeyBytes[j],
             transactionId: txId,
           )) {
             final canKey = preparedEntries[i].canonicalKey;
@@ -3192,44 +3448,17 @@ class IndexManager {
       var meta = await getIndexMeta(table.tableUid, indexUid);
       final bool isMemoryMode =
           _dataStore.config.persistenceMode == PersistenceMode.memory;
+      final bool metaWasMissing = meta == null;
 
-      // Disk index meta missing: skip file source only. Still search pending/txn
-      // index trees unless readFromFileOnly or there is nothing buffer-side and
-      // no persisted rows that would require a table-scan fallback.
-      if (meta == null) {
-        if (readFromFileOnly) {
-          return IndexSearchResult.empty();
-        }
-        if (!isMemoryMode) {
-          final tableDataMeta =
-              await _dataStore.tableDataManager.getTableDataMeta(
-            table.tableUid,
-          );
-          final persistedTableRecords = tableDataMeta?.totalRecordCount ?? 0;
-          if (persistedTableRecords > 0) {
-            // Index file never existed but table has disk rows -- cannot serve
-            // those via an empty index; fall back to table scan.
-            return IndexSearchResult.tableScan();
-          }
-          final hasPending = _dataStore.writeBufferManager
-              .hasPendingWritesForUid(table.tableUid);
-          final txId = TransactionContext.getCurrentTransactionId();
-          final hasTxn = txId != null &&
-              !TransactionContext.isApplyingCommit() &&
-              _dataStore.tableDataManager.hasDeferredOps(txId);
-          if (!hasPending && !hasTxn) {
-            return IndexSearchResult.empty();
-          }
-        }
-        meta = IndexMeta.createEmpty(
-          indexUid: indexUid,
-          tableUid: table.tableUid,
-          isUnique: indexSchema.unique,
-        );
-      }
+      // Disk index meta missing: use an empty shell so pending/txn fuse can run.
+      // Gate (empty / tableScan / fall-through) runs after isBuilding heal.
+      meta ??= IndexMeta.createEmpty(
+        indexUid: indexUid,
+        tableUid: table.tableUid,
+        isUnique: indexSchema.unique,
+      );
 
-      var effectiveMeta = meta;
-      if (!isMemoryMode && effectiveMeta.isBuilding) {
+      if (!isMemoryMode && meta.isBuilding) {
         if (isIndexBuildOwned(table, indexUid)) {
           return IndexSearchResult.tableScan();
         }
@@ -3240,47 +3469,27 @@ class IndexManager {
           '(no schema/key migration owns this rebuild)',
         );
         await endIndexBuild(table, indexUid);
-        effectiveMeta = (await getIndexMeta(table.tableUid, indexUid)) ??
-            effectiveMeta.copyWith(isBuilding: false);
+        meta = (await getIndexMeta(table.tableUid, indexUid)) ??
+            meta.copyWith(isBuilding: false);
       }
       // In memory mode, the primary index store is [_indexDataCache], so B+Tree
       // pointers/entry counts may be unset or stale. We still allow searching.
-      if (!isMemoryMode &&
-          (effectiveMeta.totalEntryCount <= 0 ||
-              effectiveMeta.btreeFirstLeaf.isNull)) {
-        final tableDataMeta =
-            await _dataStore.tableDataManager.getTableDataMeta(
-          table.tableUid,
+      if (!isMemoryMode && !_isDiskIndexFileUsable(meta)) {
+        final gated = await _gateUnusableDiskIndexSearch(
+          table: table,
+          indexUid: indexUid,
+          schema: schema,
+          readFromFileOnly: readFromFileOnly,
+          metaWasMissing: metaWasMissing,
         );
-        final persistedTableRecords = tableDataMeta?.totalRecordCount ?? 0;
-        if (persistedTableRecords > 0) {
-          Logger.warn(
-            'Index ${table.tableName}.'
-            '${_indexLogLabel(table, indexUid, schema: schema)} '
-            'appears empty while table has $persistedTableRecords persisted '
-            'records; falling back to table scan (rebuild only via schema '
-            'migration or key migration)',
-          );
-          return IndexSearchResult.tableScan();
-        }
-        // Disk index is empty AND no persisted rows. Do NOT return empty here:
-        // pending/txn index TreeCaches may still hold unflushed entries (the
-        // common "insert then query before flush" case). Fall through so
-        // _searchIndexByKeyRangeLogical can fuse those sources.
-        if (readFromFileOnly) {
-          return IndexSearchResult.empty();
-        }
+        if (gated != null) return gated;
       }
 
-      Uint8List upperBoundExclusiveForPrefix(Uint8List prefix) {
-        final out = Uint8List(prefix.length + 1 + 4);
-        out.setRange(0, prefix.length, prefix);
-        out[prefix.length] = 0xFF;
-        return out;
-      }
+      Uint8List upperBoundExclusiveForPrefix(Uint8List prefix) =>
+          _upperBoundExclusiveForPrefix(prefix);
 
       final fields = indexSchema.fields;
-      final bool isUnique = effectiveMeta.isUnique;
+      final bool isUnique = meta.isUnique;
       final bool truncateText = !isUnique;
 
       List<dynamic>? normalizeValues(dynamic v, int n) {
@@ -3412,24 +3621,25 @@ class IndexManager {
           }
 
           if (meta.isUnique) {
+            if (hasCursorKey) {
+              // Unique point + cursor: at most one key; cursor means already past it.
+              return IndexSearchResult.empty();
+            }
             final probeKey = prefixValues.isEmpty
                 ? last.value
                 : <dynamic>[...prefixValues, last.value];
-            final bufferId = _probeBufferForUniqueIndex(
-              table,
-              indexUid,
-              probeKey,
+            final nativeVal = <dynamic>[...prefixValues, last.value];
+            return await _searchUniquePointLogical(
+              table: table,
+              indexUid: indexUid,
+              meta: meta,
+              schema: schema,
+              encodedPrefix: prefix,
+              probeKey: probeKey,
+              nativeVal: nativeVal,
+              reverse: reverse,
+              readFromFileOnly: readFromFileOnly,
             );
-            if (bufferId != null &&
-                !_isPrimaryKeyHiddenByDeleteOverlay(table, bufferId)) {
-              return IndexSearchResult(
-                primaryKeys: [bufferId],
-                entries: [
-                  IndexSearchEntry(primaryKey: bufferId, keyBytes: prefix)
-                ],
-                indexWasUsed: true,
-              );
-            }
           }
 
           return await _searchIndexByKeyRangeLogical(
@@ -3482,24 +3692,44 @@ class IndexManager {
             if (remaining == 0) break;
 
             if (meta.isUnique) {
+              final start = applyCursorStart(item.$2);
+              final end = applyCursorEnd(upperBoundExclusiveForPrefix(item.$2));
+              if (end.isNotEmpty && MemComparableKey.compare(start, end) >= 0) {
+                continue;
+              }
+              if (MemComparableKey.compare(start, item.$2) > 0) continue;
+
               final probeKey = prefixValues.isEmpty
                   ? item.$1
                   : <dynamic>[...prefixValues, item.$1];
-              final bufferId = _probeBufferForUniqueIndex(
-                table,
-                indexUid,
-                probeKey,
+              final nativeVal = <dynamic>[...prefixValues, item.$1];
+              final point = await _searchUniquePointLogical(
+                table: table,
+                indexUid: indexUid,
+                meta: meta,
+                schema: schema,
+                encodedPrefix: item.$2,
+                probeKey: probeKey,
+                nativeVal: nativeVal,
+                reverse: reverse,
+                readFromFileOnly: readFromFileOnly,
               );
-              if (bufferId != null) {
-                out.add(bufferId);
-                entriesOut.add(
-                    IndexSearchEntry(primaryKey: bufferId, keyBytes: item.$2));
+              if (point.primaryKeys.isNotEmpty) {
+                out.addAll(point.primaryKeys);
+                if (point.entries != null) {
+                  entriesOut.addAll(point.entries!);
+                } else {
+                  for (final pk in point.primaryKeys) {
+                    entriesOut.add(
+                        IndexSearchEntry(primaryKey: pk, keyBytes: item.$2));
+                  }
+                }
                 if (remaining > 0) {
-                  remaining--;
+                  remaining -= point.primaryKeys.length;
                   if (remaining <= 0) break;
                 }
-                continue;
               }
+              continue;
             }
 
             final start = applyCursorStart(item.$2);
@@ -3786,64 +4016,22 @@ class IndexManager {
 
         if (isUnique) {
           if (hasCursorKey) return IndexSearchResult.empty();
-
-          // Unflushed unique keys live in pending/txn index TreeCaches.
-          if (!readFromFileOnly) {
-            final bufferId = _probeBufferForUniqueIndex(
-              table,
-              indexUid,
-              nativeVal.length == 1 ? nativeVal.first : nativeVal,
-            );
-            if (bufferId != null &&
-                !_isPrimaryKeyHiddenByDeleteOverlay(table, bufferId)) {
-              return IndexSearchResult(
-                primaryKeys: <String>[bufferId],
-                entries: [
-                  IndexSearchEntry(primaryKey: bufferId, keyBytes: prefix),
-                ],
-              );
-            }
+          // Unique yields at most one row; offset>0 means skip it.
+          if (effectiveOffset != null && effectiveOffset > 0) {
+            return IndexSearchResult.empty();
           }
 
-          // Memory mode: unique index must be served from _indexDataCache
-          // (already checked above via checkCache).
-          if (isMemoryMode) return IndexSearchResult.empty();
-
-          final pk = await _lookupUniquePrimaryKeyLogical(
+          return await _searchUniquePointLogical(
             table: table,
             indexUid: indexUid,
             meta: meta,
-            uniqueKey: prefix,
+            schema: schema,
+            encodedPrefix: prefix,
+            probeKey: nativeVal.length == 1 ? nativeVal.first : nativeVal,
+            nativeVal: nativeVal,
+            reverse: reverse,
+            readFromFileOnly: readFromFileOnly,
           );
-          if (pk != null) {
-            if (_isPrimaryKeyHiddenByDeleteOverlay(table, pk)) {
-              return IndexSearchResult.empty();
-            }
-
-            // Hotspot populate: Use Native Key (if not disabled)
-            if (!(_dataStore.resourceManager?.isLowMemoryMode ?? false)) {
-              _indexDataCache.put([table.tableUid, indexUid, ...nativeVal], pk);
-            }
-
-            return IndexSearchResult(primaryKeys: <String>[pk]);
-          }
-
-          // File miss: still range-search pending/txn index trees.
-          if (!readFromFileOnly) {
-            final end = upperBoundExclusiveForPrefix(prefix);
-            return await _searchIndexByKeyRangeLogical(
-              table: table,
-              indexUid: indexUid,
-              meta: meta,
-              startKeyInclusive: prefix,
-              endKeyExclusive: end,
-              reverse: reverse,
-              limit: limit ?? 1,
-              offset: effectiveOffset,
-              readFromFileOnly: false,
-            );
-          }
-          return IndexSearchResult.empty();
         }
 
         final end = upperBoundExclusiveForPrefix(prefix);
@@ -3866,25 +4054,15 @@ class IndexManager {
           readFromFileOnly: readFromFileOnly,
         );
 
-        final validatedPks = <String>[];
-        final validatedEntries =
-            res.entries != null ? <IndexSearchEntry>[] : null;
-        for (int i = 0; i < res.primaryKeys.length; i++) {
-          final pk = res.primaryKeys[i];
-          if (!_isPrimaryKeyHiddenByDeleteOverlay(table, pk)) {
-            validatedPks.add(pk);
-            if (validatedEntries != null) {
-              validatedEntries.add(res.entries![i]);
-            }
-          }
-        }
-
-        if (limit == null && offset == null && !hasCursorKey) {
-          // Hotspot populate (non-unique): cache one entry per visible PK.
+        if (limit == null &&
+            offset == null &&
+            !hasCursorKey &&
+            !readFromFileOnly) {
+          // Hotspot populate (non-unique): fused visible PKs only.
           if (!(_dataStore.resourceManager?.isLowMemoryMode ?? false)) {
             final prefixKey = <dynamic>[table.tableUid, indexUid, ...nativeVal];
             final yc = YieldController('IndexManager.hotspotPopulateNonUnique');
-            for (final pk in validatedPks) {
+            for (final pk in res.primaryKeys) {
               final y6 = yc.maybeYield();
               if (y6 != null) await y6;
               _indexDataCache.put(
@@ -3896,13 +4074,7 @@ class IndexManager {
           }
         }
 
-        return IndexSearchResult(
-          primaryKeys: validatedPks,
-          entries: validatedEntries,
-          lastKey: res.lastKey,
-          requiresTableScan: res.requiresTableScan,
-          indexWasUsed: res.indexWasUsed,
-        );
+        return res;
       }
 
       // BETWEEN (inclusive).
@@ -4158,102 +4330,30 @@ class IndexManager {
               // For unique index, if cursor > prefix, 'start' will be > 'prefix', so we skip.
               if (MemComparableKey.compare(start, prefix) > 0) continue;
 
-              final probeKey =
-                  nativeVal.length == 1 ? nativeVal.first : nativeVal;
-
-              // Unflushed unique keys live in pending/txn index TreeCaches.
-              if (!readFromFileOnly) {
-                final bufferId = _probeBufferForUniqueIndex(
-                  table,
-                  indexUid,
-                  probeKey,
-                );
-                if (bufferId != null &&
-                    !_isPrimaryKeyHiddenByDeleteOverlay(table, bufferId)) {
-                  out.add(bufferId);
-                  entriesOut.add(
-                      IndexSearchEntry(primaryKey: bufferId, keyBytes: prefix));
-                  if (remaining > 0) remaining--;
-                  continue;
-                }
-              }
-
-              // Memory mode: serve unique lookup from _indexDataCache only.
-              if (isMemoryMode) {
-                final compositeKey = <dynamic>[
-                  table.tableUid,
-                  indexUid,
-                  ...nativeVal
-                ];
-                final pkValue = _indexDataCache.get(compositeKey);
-                if (pkValue is String &&
-                    pkValue.isNotEmpty &&
-                    !_isPrimaryKeyHiddenByDeleteOverlay(table, pkValue)) {
-                  out.add(pkValue);
-                  entriesOut.add(
-                      IndexSearchEntry(primaryKey: pkValue, keyBytes: prefix));
-                  if (remaining > 0) remaining--;
-                } else if (pkValue is String && pkValue.isNotEmpty) {
-                  _indexDataCache.remove(compositeKey);
-                }
-                continue;
-              }
-
-              final pk = await _lookupUniquePrimaryKeyLogical(
+              final point = await _searchUniquePointLogical(
                 table: table,
                 indexUid: indexUid,
                 meta: meta,
-                uniqueKey: prefix,
+                schema: schema,
+                encodedPrefix: prefix,
+                probeKey: nativeVal.length == 1 ? nativeVal.first : nativeVal,
+                nativeVal: nativeVal,
+                reverse: reverse,
+                readFromFileOnly: readFromFileOnly,
               );
-              if (pk != null) {
-                if (!_isPrimaryKeyHiddenByDeleteOverlay(table, pk)) {
-                  out.add(pk);
+              if (point.primaryKeys.isNotEmpty) {
+                final pk = point.primaryKeys.first;
+                out.add(pk);
+                if (point.entries != null && point.entries!.isNotEmpty) {
+                  entriesOut.add(point.entries!.first);
+                } else {
                   entriesOut
                       .add(IndexSearchEntry(primaryKey: pk, keyBytes: prefix));
-                  if (!(_dataStore.resourceManager?.isLowMemoryMode ?? false)) {
-                    final compositeKey = [
-                      table.tableUid,
-                      indexUid,
-                      ...nativeVal
-                    ];
-                    _indexDataCache.put(compositeKey, pk);
-                  }
-                  if (remaining > 0) remaining--;
                 }
-                continue;
-              }
-
-              // File miss: fuse pending/txn index trees for this IN bucket.
-              if (!readFromFileOnly) {
-                final res = await _searchIndexByKeyRangeLogical(
-                  table: table,
-                  indexUid: indexUid,
-                  meta: meta,
-                  startKeyInclusive: start,
-                  endKeyExclusive: end,
-                  reverse: reverse,
-                  limit: remaining > 0 ? remaining : 1,
-                  offset: null,
-                  readFromFileOnly: false,
-                );
-                for (int i = 0; i < res.primaryKeys.length; i++) {
-                  final foundPk = res.primaryKeys[i];
-                  if (_isPrimaryKeyHiddenByDeleteOverlay(table, foundPk)) {
-                    continue;
-                  }
-                  out.add(foundPk);
-                  if (res.entries != null && i < res.entries!.length) {
-                    entriesOut.add(res.entries![i]);
-                  } else {
-                    entriesOut.add(IndexSearchEntry(
-                        primaryKey: foundPk, keyBytes: prefix));
-                  }
-                  if (remaining > 0) remaining--;
-                  break; // unique: at most one
-                }
+                if (remaining > 0) remaining--;
               }
             } else {
-              // Range Scan
+              // Range Scan -- fuses file + pending/txn unless readFromFileOnly.
               final res = await _searchIndexByKeyRangeLogical(
                 table: table,
                 indexUid: indexUid,
@@ -4266,62 +4366,35 @@ class IndexManager {
                 readFromFileOnly: readFromFileOnly,
               );
 
-              // Hotspot populate: Populate cache if we did a full bucket scan (no cursor)
-              if (!usedCache &&
+              // Hotspot: only full-bucket fused results. Never cache file-only
+              // (skips pending merge) or limit-truncated pages -- both poison
+              // later cache hits with incomplete/stale PKs.
+              if (!readFromFileOnly &&
                   !hasCursorKey &&
-                  !(_dataStore.resourceManager?.isLowMemoryMode ?? false)) {
-                final validatedPks = <String>[];
-                final validatedEntries =
-                    res.entries != null ? <IndexSearchEntry>[] : null;
-                for (int i = 0; i < res.primaryKeys.length; i++) {
-                  final pk = res.primaryKeys[i];
-                  if (!_isPrimaryKeyHiddenByDeleteOverlay(table, pk)) {
-                    validatedPks.add(pk);
-                    if (validatedEntries != null) {
-                      validatedEntries.add(res.entries![i]);
-                    }
-                  }
+                  need < 0 &&
+                  !(_dataStore.resourceManager?.isLowMemoryMode ?? false) &&
+                  res.primaryKeys.isNotEmpty) {
+                final prefixKey = <dynamic>[
+                  table.tableUid,
+                  indexUid,
+                  ...nativeVal
+                ];
+                final yc =
+                    YieldController('IndexManager.hotspotPopulateNonUniqueIn');
+                for (final pk in res.primaryKeys) {
+                  final y8 = yc.maybeYield();
+                  if (y8 != null) await y8;
+                  _indexDataCache.put(
+                    <dynamic>[...prefixKey, pk],
+                    true,
+                    size: pk.length + 1,
+                  );
                 }
+              }
 
-                if (validatedPks.isNotEmpty) {
-                  if (isUnique) {
-                    _indexDataCache.put(
-                        [table.tableUid, indexUid, ...nativeVal],
-                        validatedPks.first);
-                  } else {
-                    final prefixKey = <dynamic>[
-                      table.tableUid,
-                      indexUid,
-                      ...nativeVal
-                    ];
-                    final yc = YieldController(
-                        'IndexManager.hotspotPopulateNonUniqueIn');
-                    for (final pk in validatedPks) {
-                      final y8 = yc.maybeYield();
-                      if (y8 != null) await y8;
-                      _indexDataCache.put(
-                        <dynamic>[...prefixKey, pk],
-                        true,
-                        size: pk.length + 1,
-                      );
-                    }
-                  }
-                }
-                out.addAll(validatedPks);
-                if (validatedEntries != null) {
-                  entriesOut.addAll(validatedEntries);
-                }
-              } else {
-                // Filter logically deleted records for results consistency
-                for (int i = 0; i < res.primaryKeys.length; i++) {
-                  final pk = res.primaryKeys[i];
-                  if (!_isPrimaryKeyHiddenByDeleteOverlay(table, pk)) {
-                    out.add(pk);
-                    if (res.entries != null) {
-                      entriesOut.add(res.entries![i]);
-                    }
-                  }
-                }
+              out.addAll(res.primaryKeys);
+              if (res.entries != null) {
+                entriesOut.addAll(res.entries!);
               }
 
               if (remaining > 0) {

@@ -1,6 +1,5 @@
 import 'dart:typed_data';
 
-import '../core/table_data_manager.dart';
 import '../core/compute_manager.dart';
 import '../handler/logger.dart';
 import '../model/table_schema.dart';
@@ -457,9 +456,6 @@ class ConditionRecordMatcher {
 
   /// matches the record against the prepared condition tree.
   bool matches(Map<String, dynamic> record) {
-    if (isDeletedRecord(record)) {
-      return false;
-    }
     // Handle the dummy evaluator for empty conditions
     if (_rootNode.children.isEmpty && _matchers.isEmpty) {
       return true;

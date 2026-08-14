@@ -295,17 +295,20 @@ class TableDataManager {
     return _tableRecordCache.containsKey([table.tableUid, pk]);
   }
 
-  /// Check if a record exists in the table record cache and is NOT a tombstone.
+  /// Check if a record exists in the table record cache.
   ///
-  /// This is safer than [hasTableRecord] for uniqueness/existence checks.
-  /// Uses TreeCache.peek() to avoid polluting access stats during hot validation loops.
+  /// Deletes live in the write buffer as [BufferOperationType.delete], not as
+  /// cached tombstone rows -- presence here means a live cached row.
   bool hasLiveTableRecord(TableContext table, String pk) {
-    final rec = _tableRecordCache.get([table.tableUid, pk], updateStats: false);
-    return rec != null && !isDeletedRecord(rec);
+    return _tableRecordCache.containsKey([table.tableUid, pk]);
   }
 
-  /// Returns true when the record is hidden by a delete overlay in the current
-  /// visibility context, even if the physical row still exists on disk.
+  /// Returns true when the record is hidden by a pending/txn **delete** overlay,
+  /// even if the physical row still exists on disk (pre-flush).
+  ///
+  /// Only for PK-existence / delete visibility. Index key validity under
+  /// updates belongs in IndexManager (`_isFileIndexHitStaleUnderOverlay` /
+  /// `_uniqueDiskOwnerStillOwnsKey`), not here.
   bool isRecordHiddenByDeleteOverlay(TableContext table, String pk,
       {String? transactionId}) {
     final tableUid = table.tableUid;
@@ -316,8 +319,7 @@ class TableDataManager {
       final txOp = _dataStore.writeBufferManager.bufferTrees
           .getTxnRecord(currentTxId, tableUid, pk);
       if (txOp != null) {
-        return txOp.operation == BufferOperationType.delete ||
-            isDeletedRecord(txOp.data);
+        return txOp.operation == BufferOperationType.delete;
       }
     }
 
@@ -327,8 +329,7 @@ class TableDataManager {
       return false;
     }
 
-    return bufferEntry.operation == BufferOperationType.delete ||
-        isDeletedRecord(bufferEntry.data);
+    return bufferEntry.operation == BufferOperationType.delete;
   }
 
   /// Cache a single table record
@@ -337,11 +338,6 @@ class TableDataManager {
       {bool force = false}) {
     final tableUid = table.tableUid;
     if (_tableRecordCache.maxByteThreshold <= 0) {
-      return;
-    }
-
-    if (isDeletedRecord(record)) {
-      _tableRecordCache.remove([tableUid, pk]);
       return;
     }
 
@@ -390,7 +386,6 @@ class TableDataManager {
     for (final r in records) {
       final pk = r[primaryKey]?.toString();
       if (pk == null || pk.isEmpty) continue;
-      if (isDeletedRecord(r)) continue;
 
       final key = [tableUid, pk];
 
@@ -2291,16 +2286,47 @@ class TableDataManager {
     }
   }
 
+  /// Seed an empty in-memory [TableDataMeta] without touching disk.
+  ///
+  /// Call after [DataStoreImpl.createTable] so the first insert never pays a
+  /// partition-0 existsFile miss. First flush still persists via
+  /// [updateTableDataMeta] / writeChanges.
+  void seedEmptyTableDataMeta(
+    TableContext table, {
+    int partitionCount = 1,
+  }) {
+    final empty = TableDataMeta.createEmpty(
+      tableUid: table.tableUid,
+      partitionCount: partitionCount,
+    );
+    _tableDataMetaCache.put(
+      table.tableUid,
+      empty,
+      size: _estimateTableDataMetaSize(empty),
+    );
+  }
+
   /// Internal method to perform the actual file load
   Future<TableDataMeta?> _doLoadTableDataMeta(TableUid tableUid) async {
     try {
       final meta =
           await _dataStore.treeMetaPageService.readTableGlobalMeta(tableUid);
-      if (meta == null) {
-        return null;
+      if (meta != null) {
+        _tableDataMetaCache.put(tableUid, meta);
+        return meta;
       }
-      _tableDataMetaCache.put(tableUid, meta);
-      return meta;
+
+      // Disk miss: publish empty meta into the positive cache (same pattern as
+      // IndexMeta memory-mode synthesize / clearIndexesForTable pre-seed).
+      final raced = _tableDataMetaCache.get(tableUid);
+      if (raced != null) return raced;
+      final empty = TableDataMeta.createEmpty(tableUid: tableUid);
+      _tableDataMetaCache.put(
+        tableUid,
+        empty,
+        size: _estimateTableDataMetaSize(empty),
+      );
+      return empty;
     } catch (e) {
       Logger.error('Failed to get table data meta', rawError: e);
       rethrow;
@@ -2800,11 +2826,7 @@ class TableDataManager {
             }
             // BufferEntry.oldValues is separate; data is shared by ref.
             // Legacy guard if _oldValues was embedded in data.
-            final txRecord = _visibleTxnRecord(txOp.data);
-            if (!isDeletedRecord(txRecord)) {
-              return txRecord;
-            }
-            return null;
+            return _visibleTxnRecord(txOp.data);
           }
         }
 
@@ -2818,16 +2840,10 @@ class TableDataManager {
           if (bufferEntry.operation == BufferOperationType.delete) {
             return null;
           }
-          if (!isDeletedRecord(bufferEntry.data)) {
-            return bufferEntry.data;
-          }
-          return null;
+          return bufferEntry.data;
         }
 
-        if (!isDeletedRecord(record)) {
-          return record;
-        }
-        return null;
+        return record;
       }
 
       // Skip file stream when disk is empty; pending/txn inserts still emit below.
@@ -2859,10 +2875,6 @@ class TableDataManager {
           final pkMatcher =
               ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
 
-          bool recordPredicate(Map<String, dynamic> r) {
-            return !isDeletedRecord(r);
-          }
-
           final controller = StreamController<Map<String, dynamic>>();
 
           () async {
@@ -2874,7 +2886,6 @@ class TableDataManager {
                 pkMatcher: pkMatcher,
                 reverse: false,
                 limit: null,
-                recordPredicate: recordPredicate,
                 startKeyInclusive: Uint8List(0),
                 endKeyExclusive: Uint8List(0),
                 rangeMin: null,
@@ -2913,8 +2924,7 @@ class TableDataManager {
         tableContext,
         onEntry: (pk, entry) {
           if (processedKeys.contains(pk)) return true;
-          if (entry.operation == BufferOperationType.delete ||
-              isDeletedRecord(entry.data)) {
+          if (entry.operation == BufferOperationType.delete) {
             return true;
           }
           if (currentTxId != null) {
@@ -2940,8 +2950,7 @@ class TableDataManager {
           table,
           onEntry: (pk, entry) {
             if (processedKeys.contains(pk)) return true;
-            if (entry.operation == BufferOperationType.delete ||
-                isDeletedRecord(entry.data)) {
+            if (entry.operation == BufferOperationType.delete) {
               return true;
             }
             txnExtra.add(_visibleTxnRecord(entry.data));
@@ -3177,8 +3186,8 @@ class TableDataManager {
                 rawError: e);
           }
 
-          // 7. clean other caches
-          _tableDataMetaCache.remove(table.tableUid);
+          // 7. clean other caches (keep empty TableDataMeta in cache so the
+          // next insert does not re-probe disk for a known-empty table).
           _fileSizes.remove(table.tableUid);
           _lastModifiedTimes.remove(table.tableUid);
           _checkedOrderedRange.remove(table.tableUid);
@@ -3473,8 +3482,7 @@ class TableDataManager {
       if (useTxn) {
         final tx = trees.getTxnRecord(txId, table.tableUid, pk);
         if (tx != null) {
-          if (tx.operation == BufferOperationType.delete ||
-              isDeletedRecord(tx.data)) {
+          if (tx.operation == BufferOperationType.delete) {
             continue;
           }
           visible = _visibleTxnRecord(tx.data);
@@ -3483,8 +3491,7 @@ class TableDataManager {
       if (visible == null) {
         final pending = trees.getPendingRecord(table.tableUid, pk);
         if (pending != null) {
-          if (pending.operation == BufferOperationType.delete ||
-              isDeletedRecord(pending.data)) {
+          if (pending.operation == BufferOperationType.delete) {
             continue;
           }
           visible = pending.data;
@@ -3539,8 +3546,7 @@ class TableDataManager {
             }
             skipCursorKey = false;
           }
-          if (entry.operation == BufferOperationType.delete ||
-              isDeletedRecord(entry.data)) {
+          if (entry.operation == BufferOperationType.delete) {
             return true;
           }
           final row = _visibleTxnRecord(entry.data);
@@ -3694,8 +3700,7 @@ class TableDataManager {
       if (useTxn) {
         final tx = trees.getTxnRecord(txId, table.tableUid, pk);
         if (tx != null) {
-          if (tx.operation == BufferOperationType.delete ||
-              isDeletedRecord(tx.data)) {
+          if (tx.operation == BufferOperationType.delete) {
             continue;
           }
           visible = _visibleTxnRecord(tx.data);
@@ -3704,8 +3709,7 @@ class TableDataManager {
       if (visible == null) {
         final pending = trees.getPendingRecord(table.tableUid, pk);
         if (pending != null) {
-          if (pending.operation == BufferOperationType.delete ||
-              isDeletedRecord(pending.data)) {
+          if (pending.operation == BufferOperationType.delete) {
             continue;
           }
           visible = pending.data;
@@ -3964,8 +3968,7 @@ class TableDataManager {
         entry ??=
             _dataStore.writeBufferManager.getBufferedRecordForRead(table, pk);
         if (entry != null) {
-          if (entry.operation != BufferOperationType.delete &&
-              !isDeletedRecord(entry.data)) {
+          if (entry.operation != BufferOperationType.delete) {
             results.add(fromTxn ? _visibleTxnRecord(entry.data) : entry.data);
           }
           continue;
@@ -4038,7 +4041,6 @@ class TableDataManager {
     required MatcherFunction pkMatcher,
     required bool reverse,
     required int? limit,
-    required bool Function(Map<String, dynamic>) recordPredicate,
     required Uint8List startKeyInclusive,
     required Uint8List endKeyExclusive,
     dynamic rangeMin,
@@ -4047,6 +4049,9 @@ class TableDataManager {
     bool includeMax = true,
     String? cursorPk,
     bool decodeRecord = true,
+
+    /// Applied after overlay, before [onRecord]. Skip row when false.
+    bool Function(Map<String, dynamic>)? acceptRow,
     required bool Function(Map<String, dynamic>) onRecord,
     TableSchema? decodeSchema,
     List<FieldStructure>? decodeFieldStructureOverride,
@@ -4064,6 +4069,11 @@ class TableDataManager {
     final hasPending = !readFromFileOnly &&
         _dataStore.writeBufferManager.hasPendingWritesForUid(table.tableUid);
     final needBufferFuse = hasPending || useTxn;
+
+    bool deliver(Map<String, dynamic> row) {
+      if (acceptRow != null && !acceptRow(row)) return true;
+      return onRecord(row);
+    }
 
     final String? cursor =
         cursorPk != null && cursorPk.isNotEmpty ? cursorPk : null;
@@ -4112,8 +4122,7 @@ class TableDataManager {
       if (useTxn) {
         final tx = trees.getTxnRecord(txId, table.tableUid, pk);
         if (tx != null) {
-          if (tx.operation == BufferOperationType.delete ||
-              isDeletedRecord(tx.data)) {
+          if (tx.operation == BufferOperationType.delete) {
             return null;
           }
           return _visibleTxnRecord(tx.data);
@@ -4122,14 +4131,12 @@ class TableDataManager {
       if (hasPending) {
         final pending = trees.getPendingRecord(table.tableUid, pk);
         if (pending != null) {
-          if (pending.operation == BufferOperationType.delete ||
-              isDeletedRecord(pending.data)) {
+          if (pending.operation == BufferOperationType.delete) {
             return null;
           }
           return pending.data;
         }
       }
-      if (isDeletedRecord(row)) return null;
       return row;
     }
 
@@ -4146,7 +4153,6 @@ class TableDataManager {
           endKeyExclusive: endKeyExclusive,
           reverse: reverse,
           limit: baseLimit,
-          recordPredicate: recordPredicate,
           onRecord: onBase,
           decodeRecord: decodeRecord,
           decodeSchema: decodeSchema,
@@ -4178,11 +4184,9 @@ class TableDataManager {
         limit: null,
         onEntry: (path, value) {
           final rec = value;
-          if (isDeletedRecord(rec)) return true;
           final dynamic pkNative = rec[primaryKey];
           if (pkNative == null) return true;
           if (!checkRange(pkNative)) return true;
-          if (!recordPredicate(rec)) return true;
           if (!onBase(rec)) return false;
           if (baseLimit != null) {
             yielded++;
@@ -4196,7 +4200,7 @@ class TableDataManager {
     // File/memory only -- no pending/txn fusion.
     if (!needBufferFuse) {
       await forEachBase(
-        onBase: onRecord,
+        onBase: deliver,
         baseLimit: limit,
         fileOnly: readFromFileOnly,
       );
@@ -4222,7 +4226,8 @@ class TableDataManager {
         matcher: (row) {
           final pkNative = row[primaryKey];
           if (pkNative == null || !checkRange(pkNative)) return false;
-          return recordPredicate(row);
+          // Sole filter point for this path -- do not re-run via deliver().
+          return acceptRow == null || acceptRow(row);
         },
         limit: limit,
         reverse: reverse,
@@ -4261,8 +4266,7 @@ class TableDataManager {
             }
             skipCursorKey = false;
           }
-          if (entry.operation == BufferOperationType.delete ||
-              isDeletedRecord(entry.data)) {
+          if (entry.operation == BufferOperationType.delete) {
             return true;
           }
           final row = _visibleTxnRecord(entry.data);
@@ -4281,7 +4285,6 @@ class TableDataManager {
             }
             return true;
           }
-          if (!recordPredicate(row)) return true;
           out.add(row);
           return true;
         },
@@ -4327,7 +4330,7 @@ class TableDataManager {
         onBase: (r) {
           final visible = resolveOverlay(r);
           if (visible == null) return true;
-          return onRecord(visible);
+          return deliver(visible);
         },
         baseLimit: limit,
         fileOnly: true,
@@ -4343,7 +4346,7 @@ class TableDataManager {
     bool emit(Map<String, dynamic> row) {
       final pk = row[primaryKey]?.toString();
       if (pk == null || pk.isEmpty || !seen.add(pk)) return true;
-      return onRecord(row);
+      return deliver(row);
     }
 
     bool flushBuffersBefore(dynamic filePk) {
@@ -4430,54 +4433,6 @@ class TableDataManager {
     }
   }
 
-  Future<List<Map<String, dynamic>>> _scanRecordsByPrimaryKeyRangeLogical({
-    required TableContext table,
-    required TableSchema schema,
-    required String primaryKey,
-    required MatcherFunction pkMatcher,
-    required bool reverse,
-    required int? limit,
-    required bool Function(Map<String, dynamic>) recordPredicate,
-    required Uint8List startKeyInclusive,
-    required Uint8List endKeyExclusive,
-    dynamic rangeMin,
-    dynamic rangeMax,
-    bool includeMin = true,
-    bool includeMax = true,
-    String? cursorPk,
-    bool decodeRecord = true,
-    TableSchema? decodeSchema,
-    List<FieldStructure>? decodeFieldStructureOverride,
-    bool readFromFileOnly = false,
-  }) async {
-    final out = <Map<String, dynamic>>[];
-    await _forEachRecordByPrimaryKeyRangeLogical(
-      table: table,
-      schema: schema,
-      primaryKey: primaryKey,
-      pkMatcher: pkMatcher,
-      reverse: reverse,
-      limit: limit,
-      recordPredicate: recordPredicate,
-      startKeyInclusive: startKeyInclusive,
-      endKeyExclusive: endKeyExclusive,
-      rangeMin: rangeMin,
-      rangeMax: rangeMax,
-      includeMin: includeMin,
-      includeMax: includeMax,
-      cursorPk: cursorPk,
-      decodeRecord: decodeRecord,
-      decodeSchema: decodeSchema,
-      decodeFieldStructureOverride: decodeFieldStructureOverride,
-      readFromFileOnly: readFromFileOnly,
-      onRecord: (r) {
-        out.add(r);
-        return true;
-      },
-    );
-    return out;
-  }
-
   Future<TableScanResult> searchTableData(
     TableContext table,
     ConditionRecordMatcher? matcher, {
@@ -4504,35 +4459,18 @@ class TableDataManager {
     final pkMatcher =
         ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
 
-    final bufferMgr = _dataStore.writeBufferManager;
-    final tableContext = table;
-
-    bool recordMatches(Map<String, dynamic> r) {
-      // Defensive: always treat deleted/tombstone as non-visible.
-      if (isDeletedRecord(r)) return false;
-
-      // Check Real-time WriteBuffer to filter out pending deletes / apply overlays.
-      Map<String, dynamic> evalRecord = r;
-      if (!readFromFileOnly) {
-        final pk = r[primaryKey]?.toString();
-        if (pk != null) {
-          final be = bufferMgr.getBufferedRecordForRead(tableContext, pk);
-          if (be != null) {
-            if (be.operation == BufferOperationType.delete) {
-              return false;
-            }
-            evalRecord = be.data;
-          }
-        }
-      }
-
-      if (filter != null && !filter(evalRecord)) return false;
-      if (matcher != null && !matcher.matches(evalRecord)) return false;
+    // Row predicate for residual conditions (after overlay). Applied at most
+    // once per visible row via acceptRow / PK-point paths.
+    bool rowMatches(Map<String, dynamic> r) {
+      if (filter != null && !filter(r)) return false;
+      if (matcher != null && !matcher.matches(r)) return false;
       return true;
     }
 
-    // Assign to local val so that it satisfies function pointer constraints
-    final bool Function(Map<String, dynamic>) recordPredicate = recordMatches;
+    // Decode non-PK columns only when residual filter/matcher needs them.
+    final bool needsFullDecode = filter != null ||
+        (matcher != null && matcher.fields.any((f) => f != primaryKey));
+    // needsPostFilter is decided after PK range pushdown (below).
 
     // Parse Sort Order first as it is needed by fast paths
     bool isPkOrder = true;
@@ -4612,7 +4550,7 @@ class TableDataManager {
       if (onlyCount) {
         int filteredCount = 0;
         for (final r in recs) {
-          if (recordMatches(r)) {
+          if (rowMatches(r)) {
             filteredCount++;
           }
         }
@@ -4631,7 +4569,7 @@ class TableDataManager {
 
       final filtered = <Map<String, dynamic>>[];
       for (final r in recs) {
-        if (recordMatches(r)) {
+        if (rowMatches(r)) {
           filtered.add(r);
         }
       }
@@ -4811,6 +4749,24 @@ class TableDataManager {
       pkCondIsIndexableRange = (rangeMin != null || rangeMax != null);
     }
 
+    // Skip rematch only when every matcher predicate was pushed into the PK
+    // byte-range / checkRange bounds. LIKE/IN/!=/OR/non-PK still need rowMatches.
+    // (Do NOT use "PK-only fields" alone -- that broke getKeys(prefix:).)
+    bool matcherFullyCoveredByPkRangePushdown() {
+      if (matcher == null) return true;
+      if (hasOr) return false;
+      if (matcher.fields.any((f) => f != primaryKey)) return false;
+      if (pkCond == null || !pkCondIsIndexableRange) return false;
+      const coveredOps = {'>', '>=', '<', '<=', 'BETWEEN'};
+      for (final op in pkCond.keys) {
+        if (!coveredOps.contains(op.toUpperCase())) return false;
+      }
+      return true;
+    }
+
+    final bool needsPostFilter = filter != null ||
+        (matcher != null && !matcherFullyCoveredByPkRangePushdown());
+
     // Build PK byte-range for partition scans (empty bounds => full scan).
     Uint8List startKeyBytes = Uint8List(0);
     Uint8List endKeyBytes = Uint8List(0);
@@ -4859,6 +4815,12 @@ class TableDataManager {
 
     // PK-ordered scan: can stop early at offset+limit.
     if (isPkOrder) {
+      // acceptRow filters after overlay; storage limit only when every in-range
+      // row is accepted (otherwise stop via onRecord after enough matches).
+      final int? scanLimit =
+          needsPostFilter ? null : ((needCount < 0) ? null : needCount);
+      final acceptRow = needsPostFilter ? rowMatches : null;
+
       if (onlyCount) {
         int totalCount = 0;
         await _forEachRecordByPrimaryKeyRangeLogical(
@@ -4867,8 +4829,7 @@ class TableDataManager {
           primaryKey: primaryKey,
           pkMatcher: pkMatcher,
           reverse: reverse,
-          limit: (needCount < 0) ? null : needCount,
-          recordPredicate: recordPredicate,
+          limit: scanLimit,
           startKeyInclusive: startKeyBytes,
           endKeyExclusive: endKeyBytes,
           rangeMin: rangeMin,
@@ -4876,13 +4837,14 @@ class TableDataManager {
           includeMin: includeMin,
           includeMax: includeMax,
           cursorPk: cursorPk.isNotEmpty ? cursorPk : null,
-          decodeRecord: (filter != null ||
-              (matcher != null && matcher.fields.any((f) => f != primaryKey))),
+          decodeRecord: needsFullDecode,
           decodeSchema: decodeSchema,
           decodeFieldStructureOverride: decodeFieldStructureOverride,
           readFromFileOnly: readFromFileOnly,
+          acceptRow: acceptRow,
           onRecord: (r) {
             totalCount++;
+            if (needCount >= 0 && totalCount >= needCount) return false;
             return true;
           },
         );
@@ -4893,14 +4855,14 @@ class TableDataManager {
         return TableScanResult(records: const [], count: finalCount);
       } else if (aggregations != null && aggregations.isNotEmpty) {
         final agg = QueryAggregator(aggregations, groupBy: groupBy);
+        var accepted = 0;
         await _forEachRecordByPrimaryKeyRangeLogical(
           table: table,
           schema: schema,
           primaryKey: primaryKey,
           pkMatcher: pkMatcher,
           reverse: reverse,
-          limit: (needCount < 0) ? null : needCount,
-          recordPredicate: recordPredicate,
+          limit: scanLimit,
           startKeyInclusive: startKeyBytes,
           endKeyExclusive: endKeyBytes,
           rangeMin: rangeMin,
@@ -4911,21 +4873,24 @@ class TableDataManager {
           decodeSchema: decodeSchema,
           decodeFieldStructureOverride: decodeFieldStructureOverride,
           readFromFileOnly: readFromFileOnly,
+          acceptRow: acceptRow,
           onRecord: (r) {
             agg.accumulate(r);
+            accepted++;
+            if (needCount >= 0 && accepted >= needCount) return false;
             return true;
           },
         );
         return TableScanResult(records: const [], aggregateResult: agg.result);
       } else {
-        final out = await _scanRecordsByPrimaryKeyRangeLogical(
+        final out = <Map<String, dynamic>>[];
+        await _forEachRecordByPrimaryKeyRangeLogical(
           table: table,
           schema: schema,
           primaryKey: primaryKey,
           pkMatcher: pkMatcher,
           reverse: reverse,
-          limit: (needCount < 0) ? null : needCount,
-          recordPredicate: recordPredicate,
+          limit: scanLimit,
           startKeyInclusive: startKeyBytes,
           endKeyExclusive: endKeyBytes,
           rangeMin: rangeMin,
@@ -4936,6 +4901,12 @@ class TableDataManager {
           decodeSchema: decodeSchema,
           decodeFieldStructureOverride: decodeFieldStructureOverride,
           readFromFileOnly: readFromFileOnly,
+          acceptRow: acceptRow,
+          onRecord: (r) {
+            out.add(r);
+            if (needCount >= 0 && out.length >= needCount) return false;
+            return true;
+          },
         );
         return TableScanResult(
           records: out,
@@ -4977,14 +4948,13 @@ class TableDataManager {
     final out = <Map<String, dynamic>>[];
     if (needCount <= 0) {
       // No limit provided: fall back to full collection (may be large).
-      out.addAll(await _scanRecordsByPrimaryKeyRangeLogical(
+      await _forEachRecordByPrimaryKeyRangeLogical(
         table: table,
         schema: schema,
         primaryKey: primaryKey,
         pkMatcher: pkMatcher,
         reverse: false,
         limit: null,
-        recordPredicate: recordPredicate,
         startKeyInclusive: startKeyBytes,
         endKeyExclusive: endKeyBytes,
         rangeMin: rangeMin,
@@ -4995,7 +4965,12 @@ class TableDataManager {
         decodeSchema: decodeSchema,
         decodeFieldStructureOverride: decodeFieldStructureOverride,
         readFromFileOnly: readFromFileOnly,
-      ));
+        acceptRow: needsPostFilter ? rowMatches : null,
+        onRecord: (r) {
+          out.add(r);
+          return true;
+        },
+      );
       // Note: Sorting is handled by the upper layer (QueryExecutor._applySort),
       // so we skip sorting here to avoid redundant operations and improve performance.
       // Only need to handle reverse partition scanning based on sort direction.
@@ -5052,7 +5027,6 @@ class TableDataManager {
           pkMatcher: pkMatcher,
           reverse: false,
           limit: null,
-          recordPredicate: recordPredicate,
           startKeyInclusive: startKeyBytes,
           endKeyExclusive: endKeyBytes,
           rangeMin: rangeMin,
@@ -5063,6 +5037,7 @@ class TableDataManager {
           decodeSchema: decodeSchema,
           decodeFieldStructureOverride: decodeFieldStructureOverride,
           readFromFileOnly: readFromFileOnly,
+          acceptRow: needsPostFilter ? rowMatches : null,
           onRecord: (r) {
             localTop.offer(r);
             return true;
@@ -5194,17 +5169,6 @@ class TableDataManager {
     }
     return aggregator.result;
   }
-}
-
-/// Check if a record is a deleted record (marked with _deleted_:true flag)
-bool isDeletedRecord(Map<String, dynamic> record) {
-  // Check for explicit deletion marker (preferred method)
-  if (record['_deleted_'] == true) {
-    return true;
-  }
-
-  // For backward compatibility: empty object is also considered a deleted record
-  return record.isEmpty;
 }
 
 /// Visible view of a transactional deferred record.

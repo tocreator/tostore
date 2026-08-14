@@ -58,9 +58,6 @@ Future<BatchMatchResult> matchConditionChunk(
     final y1 = yieldController.maybeYield();
     if (y1 != null) await y1;
     final record = request.records[i];
-    if (_isDeletedRecordPure(record)) {
-      continue;
-    }
 
     liveRecordCount++;
     if (matcher.matches(record)) {
@@ -80,11 +77,4 @@ Future<BatchMatchResult> matchConditionChunk(
     liveRecordCount: liveRecordCount,
     completedAllRecords: completedAllRecords,
   );
-}
-
-bool _isDeletedRecordPure(Map<String, dynamic> record) {
-  if (record['_deleted_'] == true) {
-    return true;
-  }
-  return record.isEmpty;
 }
