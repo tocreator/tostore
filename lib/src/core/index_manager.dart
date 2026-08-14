@@ -1909,6 +1909,12 @@ class IndexManager {
             tableDataMeta == null || tableDataMeta.totalRecordCount <= 0;
       }
 
+      // Online insert after tryReserveUniques uses skipBufferCheck=true.
+      // With no committed rows there is nothing left to validate here.
+      if (skipDiskUniqueChecks && skipBufferCheck && !isMemoryMode) {
+        return null;
+      }
+
       // 1. Consolidate all unique constraints to check.
       final constraints = <_UniqueConstraint>[];
 

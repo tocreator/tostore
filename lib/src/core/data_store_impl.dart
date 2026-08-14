@@ -1792,7 +1792,8 @@ class DataStoreImpl {
       }
 
       // 4. Validate foreign key constraints after reservation
-      final bool hasForeignKeys = _foreignKeyManager != null;
+      final bool hasForeignKeys = _foreignKeyManager != null &&
+          schema.foreignKeys.any((fk) => fk.enabled);
       if (hasForeignKeys) {
         try {
           await _foreignKeyManager!.validateForeignKeyConstraints(
