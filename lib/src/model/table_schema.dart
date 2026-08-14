@@ -1768,7 +1768,7 @@ class FieldSchema {
   ///
   /// Hot path: values already in the declared Dart/storage form return immediately
   /// (no re-parse). This matters for batchInsert prepare where typed app records
-  /// are the common case — especially [DataType.datetime] strings, where
+  /// are the common case -- especially [DataType.datetime] strings, where
   /// `DateTime.parse` + `toIso8601String` previously dominated CPU.
   dynamic _convertValueInternal(dynamic value) {
     if (value == null) return null;
@@ -3152,7 +3152,7 @@ class VectorIndexConfig {
 
   /// Search expansion factor (ef_search).
   ///
-  /// Controls the search quality–speed trade-off. Higher values improve
+  /// Controls the search quality--speed trade-off. Higher values improve
   /// recall at the cost of latency. Standard ANN terminology.
   final int? efSearch;
 
@@ -3162,7 +3162,7 @@ class VectorIndexConfig {
   /// Typical range: 64-256.
   final int? constructionEf;
 
-  /// Diversity parameter for Robust Prune (α >= 1.0).
+  /// Diversity parameter for Robust Prune (alpha >= 1.0).
   ///
   /// Higher values produce more diverse neighbor selections, improving recall
   /// for high-dimensional data. Default 1.2.

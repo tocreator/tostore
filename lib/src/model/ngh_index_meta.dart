@@ -26,7 +26,7 @@ class NghIndexMeta {
   /// Owning table unique identifier.
   final TableUid tableUid;
 
-  /// Vector dimensionality (128–4096).
+  /// Vector dimensionality (128--4096).
   final int dimensions;
 
   /// Distance metric used for similarity computation.
@@ -49,7 +49,7 @@ class NghIndexMeta {
   /// Expansion factor for construction (ef_construction).
   final int constructionEf;
 
-  /// Diversity parameter for Robust Prune (α ≥ 1.0).
+  /// Diversity parameter for Robust Prune (alpha >= 1.0).
   final double pruneAlpha;
 
   // ===================== PQ Parameters ========================
@@ -57,7 +57,7 @@ class NghIndexMeta {
   /// Number of PQ sub-spaces (M). Each sub-vector is quantised independently.
   final int pqSubspaces;
 
-  /// Centroids per sub-space (K). Fixed at 256 → 1 byte per sub-code.
+  /// Centroids per sub-space (K). Fixed at 256 -> 1 byte per sub-code.
   final int pqCentroids;
 
   /// Whether the PQ codebook has been trained.
@@ -100,25 +100,25 @@ class NghIndexMeta {
   /// Total size of all partition files in bytes (best-effort).
   final int totalSizeBytes;
 
-  // ===================== nodeId ↔ PK B+Tree Mapping ============
+  // ===================== nodeId <-> PK B+Tree Mapping ============
 
-  /// B+Tree index meta for nodeId → PK forward lookup.
+  /// B+Tree index meta for nodeId -> PK forward lookup.
   /// Stored under [nid2pkIndexUid] (derived from [indexUid]).
   final IndexMeta? nodeIdToPkMeta;
 
-  /// B+Tree index meta for PK → nodeId reverse lookup.
+  /// B+Tree index meta for PK -> nodeId reverse lookup.
   /// Stored under [pk2nidIndexUid] (derived from [indexUid]).
   final IndexMeta? pkToNodeIdMeta;
 
-  /// Stable virtual B+Tree uid for nodeId → PK mapping.
+  /// Stable virtual B+Tree uid for nodeId -> PK mapping.
   IndexUid get nid2pkIndexUid => IndexUid('${indexUid.value}__nid2pk');
 
-  /// Stable virtual B+Tree uid for PK → nodeId mapping.
+  /// Stable virtual B+Tree uid for PK -> nodeId mapping.
   IndexUid get pk2nidIndexUid => IndexUid('${indexUid.value}__pk2nid');
 
   // ===================== Free-List State ======================
 
-  /// Graph partition free-list heads (partitionNo → headPageNo, -1 = empty).
+  /// Graph partition free-list heads (partitionNo -> headPageNo, -1 = empty).
   final Map<int, int> graphFreeListHeads;
 
   /// PQ-code partition free-list heads.
@@ -143,7 +143,7 @@ class NghIndexMeta {
   int vectorsPerPqPage(int pageSize) =>
       NghPageSizer.vectorsPerPqPage(pageSize, pqSubspaces);
 
-  /// Bytes per raw vector: dimensions × bytesPerElement.
+  /// Bytes per raw vector: dimensions x bytesPerElement.
   int get rawVectorEntrySize => dimensions * _bytesPerElement;
 
   /// Number of raw vectors that fit in one raw-vector page.
@@ -181,7 +181,7 @@ class NghIndexMeta {
   /// Snapshot of the per-partition file size limit used when this meta was created.
   int get maxPartitionFileSizeBytes => _maxPartitionFileSize;
 
-  /// Placeholder — the actual limit is injected from [DataStoreConfig].
+  /// Placeholder -- the actual limit is injected from [DataStoreConfig].
   /// We store a snapshot so the meta is self-contained.
   final int _maxPartitionFileSize;
 
@@ -434,7 +434,7 @@ class NghIndexMeta {
     };
   }
 
-  // ===================== Node → Page Mapping ===================
+  // ===================== Node -> Page Mapping ===================
 
   /// Compute the graph partition file number for a given [nodeId].
   int graphPartitionForNode(int nodeId, int pageSize) {

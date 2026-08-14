@@ -59,7 +59,7 @@ final class PageRedoPageRecord extends PageRedoLogRecord {
 /// Legacy decode-only: structure pointers without totals.
 ///
 /// Written by older engines before global meta lived in page0. There is **no**
-/// public encode API anymore — new writers must use [PageRedoPageRecord].
+/// public encode API anymore -- new writers must use [PageRedoPageRecord].
 final class PageRedoTreeMetaRecord extends PageRedoLogRecord {
   final PageRedoTreeKind treeKind;
   final TableUid tableUid;

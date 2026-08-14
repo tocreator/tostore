@@ -5,7 +5,7 @@ import '../handler/weight_snapshot_codec.dart';
 import '../model/data_store_config.dart';
 import 'legacy_model/pre_v3.dart';
 
-/// Async, non-blocking migration of legacy `cache_weights.json` → `access_weights.tobf`.
+/// Async, non-blocking migration of legacy `cache_weights.json` -> `access_weights.tobf`.
 ///
 /// - Does **not** block V3 / normal startup.
 /// - Formal [WeightManager] never reads JSON; only this upgrade path does.
@@ -59,7 +59,7 @@ final class WeightFormatMigration {
       spaceName: spaceName,
     );
 
-    // Already on file-backed binary format — just drop leftover JSON if any.
+    // Already on file-backed binary format -- just drop leftover JSON if any.
     if (await dataStore.storage.existsFile(tobfPath)) {
       await _deleteIfExists(dataStore, jsonPath);
       return;
@@ -68,14 +68,14 @@ final class WeightFormatMigration {
     if (!await dataStore.storage.existsFile(jsonPath)) return;
 
     Logger.info(
-      'WeightFormatMigration: migrating cache_weights.json → access_weights.tobf '
+      'WeightFormatMigration: migrating cache_weights.json -> access_weights.tobf '
       'for space [$spaceName]',
     );
 
     final content = await dataStore.storage.readAsString(jsonPath);
     final snapshot = LegacyCacheWeightsJson.tryParse(content ?? '');
     if (snapshot == null) {
-      // Empty/corrupt — drop leftover file.
+      // Empty/corrupt -- drop leftover file.
       await _deleteIfExists(dataStore, jsonPath);
       return;
     }

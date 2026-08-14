@@ -3,6 +3,7 @@ import '../model/background_write_type.dart';
 import '../model/cancellation_token.dart';
 import '../model/table_context.dart';
 import '../model/table_identity.dart';
+import 'resource_manager.dart';
 import 'yield_controller.dart';
 
 /// A background write scheduler that manages pending background write operations
@@ -37,16 +38,55 @@ class BackgroundWriteScheduler {
     return false;
   }
 
-  /// Wait if the scheduler is congested to prevent memory overflow.
-  /// Congestion threshold is defined as: writeBatchSize * 2 - normalQueueLength.
-  Future<void> waitIfCongested(int writeBatchSize, int normalQueueLength,
-      {CancellationToken? cancellationToken}) async {
-    final threshold = writeBatchSize * 2 - normalQueueLength;
-    while (queueLength > threshold) {
-      if (cancellationToken?.isCancelled == true) {
-        return;
+  /// Wait when system memory is under pressure so flush/eviction can catch up.
+  ///
+  /// - Pure [isMemoryMode]: no-op. Waiting cannot free committed in-memory
+  ///   data; callers rely on critical write rejection instead.
+  /// - File mode + [ResourceStatus.warning]: wait until combined backlog
+  ///   (this queue + [normalQueueLength]) is <= [writeBatchSize].
+  /// - File mode + [ResourceStatus.critical]: pause until status recovers
+  ///   or [cancellationToken] fires (flush may still free memory).
+  /// - [ResourceStatus.normal]: return immediately (soft rate matching is
+  ///   handled by write-buffer enqueue backpressure).
+  Future<void> waitIfCongested({
+    required int writeBatchSize,
+    required int normalQueueLength,
+    required bool isMemoryMode,
+    required ResourceStatus Function() getMemoryStatus,
+    Future<void> Function()? refreshResourceStatus,
+    CancellationToken? cancellationToken,
+  }) async {
+    if (isMemoryMode) return;
+    // Hot path: most calls see normal -- avoid entering the wait loop at all.
+    if (getMemoryStatus() == ResourceStatus.normal) return;
+
+    final target = writeBatchSize > 0 ? writeBatchSize : 5000;
+
+    while (true) {
+      if (cancellationToken?.isCancelled == true) return;
+
+      final status = getMemoryStatus();
+      // Re-check inside: status may recover to normal after flush/eviction.
+      if (status == ResourceStatus.normal) return;
+
+      if (status == ResourceStatus.critical) {
+        if (refreshResourceStatus != null) {
+          await refreshResourceStatus();
+        }
+        if (cancellationToken?.isCancelled == true) return;
+        await Future.delayed(const Duration(milliseconds: 5000));
+        continue;
       }
-      await Future.delayed(const Duration(milliseconds: 100));
+
+      // warning
+      final combined = queueLength + normalQueueLength;
+      if (combined <= target) return;
+
+      if (refreshResourceStatus != null) {
+        await refreshResourceStatus();
+      }
+      if (cancellationToken?.isCancelled == true) return;
+      await Future.delayed(const Duration(milliseconds: 1000));
     }
   }
 

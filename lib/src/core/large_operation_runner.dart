@@ -16,9 +16,10 @@ import '../model/table_schema.dart';
 import '../query/query_condition.dart';
 import 'compute/batch_match_runner.dart';
 import 'data_store_impl.dart';
+import 'resource_manager.dart';
 import 'wal_manager.dart';
 import 'yield_controller.dart';
-import 'write_buffer_manager.dart';
+import '../model/data_store_config.dart';
 
 /// Runner that processes large delete and update operations asynchronously in the background.
 ///
@@ -195,8 +196,16 @@ class LargeOperationRunner {
           if (token.isCancelled) return false;
 
           await dataStore.backgroundWriteScheduler.waitIfCongested(
-            writeBatchSize,
-            dataStore.writeBufferManager.queueLength,
+            writeBatchSize: writeBatchSize,
+            normalQueueLength: dataStore.writeBufferManager.queueLength,
+            isMemoryMode:
+                dataStore.config.persistenceMode == PersistenceMode.memory,
+            getMemoryStatus: () =>
+                dataStore.resourceManager?.memoryStatus ??
+                ResourceStatus.normal,
+            refreshResourceStatus: () =>
+                dataStore.resourceManager?.triggerImmediateCheck() ??
+                Future<void>.value(),
             cancellationToken: token,
           );
 
@@ -425,8 +434,16 @@ class LargeOperationRunner {
           if (token.isCancelled) return false;
 
           await dataStore.backgroundWriteScheduler.waitIfCongested(
-            writeBatchSize,
-            dataStore.writeBufferManager.queueLength,
+            writeBatchSize: writeBatchSize,
+            normalQueueLength: dataStore.writeBufferManager.queueLength,
+            isMemoryMode:
+                dataStore.config.persistenceMode == PersistenceMode.memory,
+            getMemoryStatus: () =>
+                dataStore.resourceManager?.memoryStatus ??
+                ResourceStatus.normal,
+            refreshResourceStatus: () =>
+                dataStore.resourceManager?.triggerImmediateCheck() ??
+                Future<void>.value(),
             cancellationToken: token,
           );
 
@@ -527,6 +544,16 @@ class LargeOperationRunner {
           final deletes = <Map<String, dynamic>>[];
           final inserts = <Map<String, dynamic>>[];
           final cacheKeysToRemove = <String>{};
+          // PKs reserved in this chunk but not yet handed to scheduler.
+          final chunkReservedPks = <String>{};
+
+          Future<void> releaseChunkReservations() async {
+            await dataStore.writeBufferManager.releaseReservedUniquesForPks(
+              table: table,
+              recordIds: chunkReservedPks,
+            );
+            chunkReservedPks.clear();
+          }
 
           final applyYieldController =
               YieldController('LargeUpdateRunner.process');
@@ -534,7 +561,10 @@ class LargeOperationRunner {
           for (int matchedIndex = 0;
               matchedIndex < matchedRecords.length;
               matchedIndex++) {
-            if (token.isCancelled) return false;
+            if (token.isCancelled) {
+              await releaseChunkReservations();
+              return false;
+            }
             final y2 = applyYieldController.maybeYield();
             if (y2 != null) await y2;
 
@@ -559,26 +589,21 @@ class LargeOperationRunner {
                 updatedRecord = mergedRecord;
               }
             }
-            List<UniqueKeyRef>? reservedKeys;
+            List<List<dynamic>>? reservedKeys;
             // Verify unique constraints
             if (uniqueFieldsToCheck.isNotEmpty &&
                 dataStore.indexManager != null &&
                 !isPrimaryKeyUpdate) {
-              final planUpd = dataStore.planUniqueForUpdate(
-                table,
-                schema,
-                updatedRecord,
-                validData.keys.toSet(),
-              );
-
               try {
-                reservedKeys =
-                    dataStore.writeBufferManager.tryReserveUniqueKeys(
+                reservedKeys = dataStore.writeBufferManager.tryReserveUniques(
                   table: table,
+                  schema: schema,
                   recordId: pkValueStr,
-                  uniqueKeys: planUpd.refs,
+                  data: updatedRecord,
                   isUpdate: true,
+                  changedFields: validData.keys.toSet(),
                 );
+                chunkReservedPks.add(pkValueStr);
               } catch (e) {
                 Logger.error(
                     'Unique constraint check failed in heavy update reserve',
@@ -589,6 +614,7 @@ class LargeOperationRunner {
                       rawError: e);
                   continue;
                 }
+                await releaseChunkReservations();
                 rethrow;
               }
 
@@ -614,14 +640,14 @@ class LargeOperationRunner {
                   ]);
                 }
               } catch (e) {
-                if (reservedKeys != null) {
-                  try {
-                    dataStore.writeBufferManager.releaseReservedUniqueKeys(
-                      table: table,
-                      recordId: pkValueStr,
-                    );
-                  } catch (_) {}
-                }
+                try {
+                  dataStore.writeBufferManager.releaseReservedUniques(
+                    table: table,
+                    recordId: pkValueStr,
+                    rollbackKeys: reservedKeys,
+                  );
+                } catch (_) {}
+                chunkReservedPks.remove(pkValueStr);
                 Logger.error('Unique constraint check failed in heavy update',
                     rawError: e);
                 if (op.continueOnPartialErrors) {
@@ -630,6 +656,7 @@ class LargeOperationRunner {
                       rawError: e);
                   continue;
                 }
+                await releaseChunkReservations();
                 rethrow;
               }
             }
@@ -638,21 +665,17 @@ class LargeOperationRunner {
             if (isPrimaryKeyUpdate) {
               final newPkVal = updatedRecord[primaryKey]?.toString();
               if (newPkVal != null && newPkVal != pkValueStr) {
-                final planIns = dataStore.planUniqueForInsert(
-                  table,
-                  schema,
-                  updatedRecord,
-                );
-
-                List<UniqueKeyRef>? pkReservedKeys;
+                List<List<dynamic>>? pkReservedKeys;
                 try {
                   pkReservedKeys =
-                      dataStore.writeBufferManager.tryReserveUniqueKeys(
+                      dataStore.writeBufferManager.tryReserveUniques(
                     table: table,
+                    schema: schema,
                     recordId: newPkVal,
-                    uniqueKeys: planIns.refs,
+                    data: updatedRecord,
                     isUpdate: false,
                   );
+                  chunkReservedPks.add(newPkVal);
                 } catch (e) {
                   Logger.error(
                       'Unique constraint check failed in primary key update reserve',
@@ -663,6 +686,7 @@ class LargeOperationRunner {
                         rawError: e);
                     continue;
                   }
+                  await releaseChunkReservations();
                   rethrow;
                 }
 
@@ -688,14 +712,14 @@ class LargeOperationRunner {
                     ]);
                   }
                 } catch (e) {
-                  if (pkReservedKeys != null) {
-                    try {
-                      dataStore.writeBufferManager.releaseReservedUniqueKeys(
-                        table: table,
-                        recordId: newPkVal,
-                      );
-                    } catch (_) {}
-                  }
+                  try {
+                    dataStore.writeBufferManager.releaseReservedUniques(
+                      table: table,
+                      recordId: newPkVal,
+                      rollbackKeys: pkReservedKeys,
+                    );
+                  } catch (_) {}
+                  chunkReservedPks.remove(newPkVal);
                   Logger.error(
                       'Unique constraint check failed in primary key update',
                       rawError: e);
@@ -705,6 +729,7 @@ class LargeOperationRunner {
                         rawError: e);
                     continue;
                   }
+                  await releaseChunkReservations();
                   rethrow;
                 }
 
@@ -717,9 +742,17 @@ class LargeOperationRunner {
                       oldPkValues: pkValueStr,
                     );
                   } catch (e) {
+                    dataStore.writeBufferManager.releaseReservedUniques(
+                      table: table,
+                      recordId: newPkVal,
+                      rollbackKeys: pkReservedKeys,
+                    );
+                    chunkReservedPks.remove(newPkVal);
                     Logger.error(
                         'RESTRICT constraint check failed in primary key update',
                         rawError: e);
+                    if (op.continueOnPartialErrors) continue;
+                    await releaseChunkReservations();
                     rethrow;
                   }
 
@@ -730,8 +763,16 @@ class LargeOperationRunner {
                       newPkValues: newPkVal,
                     );
                   } catch (e) {
+                    dataStore.writeBufferManager.releaseReservedUniques(
+                      table: table,
+                      recordId: newPkVal,
+                      rollbackKeys: pkReservedKeys,
+                    );
+                    chunkReservedPks.remove(newPkVal);
                     Logger.error('Cascade update failed in heavy update',
                         rawError: e);
+                    if (op.continueOnPartialErrors) continue;
+                    await releaseChunkReservations();
                     rethrow;
                   }
                 }
@@ -756,8 +797,33 @@ class LargeOperationRunner {
                   operation: ForeignKeyOperation.update,
                 );
               } catch (e) {
+                if (reservedKeys != null) {
+                  dataStore.writeBufferManager.releaseReservedUniques(
+                    table: table,
+                    recordId: pkValueStr,
+                    rollbackKeys: reservedKeys,
+                  );
+                  chunkReservedPks.remove(pkValueStr);
+                }
+                // PK-change path reserved under newPk
+                final newPkVal = updatedRecord[primaryKey]?.toString();
+                if (isPrimaryKeyUpdate &&
+                    newPkVal != null &&
+                    newPkVal != pkValueStr) {
+                  dataStore.writeBufferManager.releaseReservedUniques(
+                    table: table,
+                    recordId: newPkVal,
+                  );
+                  chunkReservedPks.remove(newPkVal);
+                  deletes.remove(record);
+                  inserts.remove(updatedRecord);
+                } else {
+                  updates.remove(updatedRecord);
+                }
                 Logger.error('Foreign key check failed in heavy update',
                     rawError: e);
+                if (op.continueOnPartialErrors) continue;
+                await releaseChunkReservations();
                 rethrow;
               }
             }
@@ -784,7 +850,10 @@ class LargeOperationRunner {
 
           // Populate scheduler
           for (final record in deletes) {
-            if (token.isCancelled) return false;
+            if (token.isCancelled) {
+              await releaseChunkReservations();
+              return false;
+            }
             final pk = record[primaryKey].toString();
             final entry = BufferEntry(
               operation: BufferOperationType.delete,
@@ -808,7 +877,10 @@ class LargeOperationRunner {
           }
 
           for (final record in inserts) {
-            if (token.isCancelled) return false;
+            if (token.isCancelled) {
+              await releaseChunkReservations();
+              return false;
+            }
             final pk = record[primaryKey].toString();
             final entry = BufferEntry(
               operation: BufferOperationType.insert,
@@ -829,10 +901,15 @@ class LargeOperationRunner {
               ),
               pk,
             );
+            // Handed to scheduler/flush; do not release here.
+            chunkReservedPks.remove(pk);
           }
 
           for (final record in updates) {
-            if (token.isCancelled) return false;
+            if (token.isCancelled) {
+              await releaseChunkReservations();
+              return false;
+            }
             final pk = record[primaryKey].toString();
             final oldRecord =
                 records.firstWhere((r) => r[primaryKey].toString() == pk);
@@ -859,6 +936,7 @@ class LargeOperationRunner {
               ),
               pk,
             );
+            chunkReservedPks.remove(pk);
           }
 
           dataStore.parallelJournalManager.scheduleFlushIfNeeded();

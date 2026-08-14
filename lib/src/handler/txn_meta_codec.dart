@@ -9,7 +9,7 @@ import 'meta_file_codec.dart';
 abstract final class TxnMainMetaFieldId {
   static const int currentPartitionIndex = 1;
   static const int activePartitions = 2;
-  // Reserved 10–15 for future top-level fields.
+  // Reserved 10--15 for future top-level fields.
 }
 
 abstract final class TxnPartitionMetaFieldId {
@@ -17,7 +17,7 @@ abstract final class TxnPartitionMetaFieldId {
   static const int totalCount = 2;
   static const int committedCount = 3;
   static const int rolledBackCount = 4;
-  // Reserved 10–15 for future top-level fields.
+  // Reserved 10--15 for future top-level fields.
 }
 
 /// Field-tag + TOBF codec for transaction main / partition meta.

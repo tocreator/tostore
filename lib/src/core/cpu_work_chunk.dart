@@ -20,19 +20,19 @@ enum CpuChunkKind {
 
 /// Platform-aware CPU work chunking for flush / batchInsert hot paths.
 ///
-/// Goal: keep each synchronous stretch short enough that ~10–20 concurrent
+/// Goal: keep each synchronous stretch short enough that ~10--20 concurrent
 /// chunks (via [ParallelProcessor] / workload tokens) still leave headroom
 /// for the UI frame budget, without over-splitting into startup thrash.
 class EngineCpuChunk {
   EngineCpuChunk._();
 
-  /// Hard floor for light work — smaller chunks cost more than they save.
+  /// Hard floor for light work -- smaller chunks cost more than they save.
   static const int minLightChunk = 512;
 
   /// Absolute floor for any kind.
   static const int minChunk = 64;
 
-  /// Hot-path [YieldController] floor — prevents dual-pressure avalanche to 1–10.
+  /// Hot-path [YieldController] floor -- prevents dual-pressure avalanche to 1--10.
   static const int hotPathMinCheckInterval = 64;
 
   /// Resolve chunk size for [kind] (mobile/web halved, server doubled).

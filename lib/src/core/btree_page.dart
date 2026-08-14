@@ -39,7 +39,7 @@ enum BTreePageType {
   /// IMPORTANT: appended at end to preserve on-disk enum indices.
   overflow,
 
-  // ── NGH Vector Index Page Types ──
+  // -- NGH Vector Index Page Types --
 
   /// NGH per-file metadata page (pageNo=0 in each partition file).
   nghMeta,
@@ -259,7 +259,7 @@ final class BTreePageIO {
 
   /// Decode payload from an already-validated header + contiguous payload bytes.
   ///
-  /// Used by bootstrap two-phase IO (header → payloadLen) when
+  /// Used by bootstrap two-phase IO (header -> payloadLen) when
   /// [GlobalConfig.pageSize] is not yet known. Prefer a single full-page read
   /// via [BTreePageIO.parsePageBytes] once page size is configured.
   static ({BTreePageType type, Uint8List encodedPayload})

@@ -27,7 +27,7 @@ import 'tree_meta_page.dart';
 /// taken from [EncryptionManager.getCurrentEncodingState] at call time (main-isolate
 /// global state, including [EncoderConfig.fallbackKeys] for decoding older pages).
 /// This service does not run in compute isolates; batch data-page encode uses a
-/// separate [EncoderConfig] snapshot — page-0 meta in the same [writeChanges] should
+/// separate [EncoderConfig] snapshot -- page-0 meta in the same [writeChanges] should
 /// pass the same [encryptionKey] / [encryptionKeyId] as sibling B+Tree pages when a
 /// non-default key is required.
 final class TreeMetaPageService {
@@ -38,7 +38,7 @@ final class TreeMetaPageService {
   TreeMetaPageService(this._dataStore);
 
   // ---------------------------------------------------------------------------
-  // Global meta — table
+  // Global meta -- table
   // ---------------------------------------------------------------------------
 
   Future<TableDataMeta?> readTableGlobalMeta(TableUid tableUid) async {
@@ -104,7 +104,7 @@ final class TreeMetaPageService {
   }
 
   // ---------------------------------------------------------------------------
-  // Global meta — index B+Tree
+  // Global meta -- index B+Tree
   // ---------------------------------------------------------------------------
 
   Future<IndexMeta?> readIndexGlobalMeta(
@@ -177,7 +177,7 @@ final class TreeMetaPageService {
   }
 
   // ---------------------------------------------------------------------------
-  // Global meta — NGH vector (stored on graph partition 0 page 0)
+  // Global meta -- NGH vector (stored on graph partition 0 page 0)
   // ---------------------------------------------------------------------------
 
   Future<NghIndexMeta?> readNghGlobalMeta(
@@ -256,7 +256,7 @@ final class TreeMetaPageService {
   /// Read partition-local stats from page 0.
   ///
   /// Prefers a single full-page IO when [DataStoreImpl.hasConfiguredPageSize];
-  /// otherwise falls back to two-phase IO (header → payload) for upgrade /
+  /// otherwise falls back to two-phase IO (header -> payload) for upgrade /
   /// bootstrap before GlobalConfig.pageSize is known.
   Future<PartitionLocalStats?> readPartitionLocal({
     required String path,
@@ -371,7 +371,7 @@ final class TreeMetaPageService {
 
     // Redo is only valid when backed by a pending batch in WAL meta.
     // Prefer explicit BatchContext, else active flush/maintenance batch.
-    // Do NOT invent an unregistered batchId — recovery cannot discover it.
+    // Do NOT invent an unregistered batchId -- recovery cannot discover it.
     final resolvedBatchId = _resolveRegisteredBatchId(batchContext);
     if (resolvedBatchId != null &&
         pageRedoTreeKind != null &&
@@ -398,7 +398,7 @@ final class TreeMetaPageService {
 
   /// Batch id usable for page redo: must already be in WAL `pendingBatches`
   /// (or currently active under that registration). Empty / invented ids are
-  /// rejected — orphan `page_redo_*.log` files are not a recovery signal.
+  /// rejected -- orphan `page_redo_*.log` files are not a recovery signal.
   String? _resolveRegisteredBatchId(BatchContext? batchContext) {
     if (!_config.enableJournal) return null;
     if (batchContext != null && batchContext.batchId.isNotEmpty) {
@@ -460,7 +460,7 @@ final class TreeMetaPageService {
   ///
   /// - When [DataStoreImpl.hasConfiguredPageSize]: one IO of the full padded
   ///   page (normal path; page size is immutable and known).
-  /// - Otherwise: two-phase IO (fixed header → [BTreePageHeader.payloadLen])
+  /// - Otherwise: two-phase IO (fixed header -> [BTreePageHeader.payloadLen])
   ///   so v3 / bootstrap can decode meta before GlobalConfig.pageSize exists.
   Future<TreeMetaPagePayload?> _readPayload({
     required String partitionPath,

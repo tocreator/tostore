@@ -100,9 +100,9 @@ class Logger {
   };
 
   static final Map<LogLevel, String> _emojis = {
-    LogLevel.warn: "\u{1F4A1}", // 💡
-    LogLevel.error: "\u{1F534}", // 🔴
-    LogLevel.critical: "\u{1F525}", // 🔥
+    LogLevel.warn: "\u{1F4A1}", // [i]
+    LogLevel.error: "\u{1F534}", // [!]
+    LogLevel.critical: "\u{1F525}", // [!!]
   };
 
   static final Map<LogLevel, String> _consoleLabels = {

@@ -294,12 +294,12 @@ class DataStoreConfig {
       return 256 * 1024 * 1024; // 256MB
     } else if (isServer) {
       // Server: 1GB baseline (low-spec VPS/containers), scale to 4GB on
-      // wider machines. Use real core count — not recommendedConcurrency
+      // wider machines. Use real core count -- not recommendedConcurrency
       // (which floors at 8 on servers and would oversize tiny boxes).
       final cores = PlatformHandler.processorCores;
       const int base = 1024 * 1024 * 1024; // 1GB
       const int maxSize = 4 * 1024 * 1024 * 1024; // 4GB
-      // +192MB per core (up to 16) => +3GB max → 1-4GB range.
+      // +192MB per core (up to 16) => +3GB max -> 1-4GB range.
       final int scaled = base + (min(max(cores, 1), 16) * 192 * 1024 * 1024);
       return min(max(scaled, base), maxSize);
     } else {
@@ -307,7 +307,7 @@ class DataStoreConfig {
     }
   }
 
-  /// Default WAL/txn/redo log segment size — intentionally small and
+  /// Default WAL/txn/redo log segment size -- intentionally small and
   /// independent of data partition size.
   static int _getDefaultMaxLogPartitionFileSize(bool isServer) {
     if (PlatformHandler.isWeb) {
@@ -1023,7 +1023,7 @@ class EncryptionConfig {
 
   /// Security key protecting encodingKey and other critical information (KEK).
   /// If null, [defaultEncryptionKey] is used.
-  /// Rotate online via `rotateEncryptionKey` — does not rewrite table data.
+  /// Rotate online via `rotateEncryptionKey` -- does not rewrite table data.
   final String? encryptionKey;
 
   /// Whether to encrypt vector index data (NGH graph pages, PQ codes, raw vectors).

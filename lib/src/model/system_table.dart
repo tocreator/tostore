@@ -51,7 +51,7 @@ class SystemTable {
   static const String keyValueExpiryIndexName = '_system_kv_expiry';
 
   /// Stable uid for the engine-managed KV expiry index (immutable across renames).
-  /// Pre-generated opaque id — do not use semantic names in paths.
+  /// Pre-generated opaque id -- do not use semantic names in paths.
   static const IndexUid keyValueExpiryIndexUid = IndexUid('i00907llpssrl6q');
 
   /// get user-facing key-value store table name
@@ -372,7 +372,7 @@ class SystemTable {
   /// Engine-internal key-value store table.
   ///
   /// [key] is the primary key ([PrimaryKeyType.none]) so point lookups hit the
-  /// primary B-tree directly — no secondary unique index on key.
+  /// primary B-tree directly -- no secondary unique index on key.
   /// No TTL fields: intended for durable engine metadata / config / stats.
   static TableSchema internalKVTable(bool isGlobal) => TableSchema(
         name: getInternalKeyValueName(isGlobal),

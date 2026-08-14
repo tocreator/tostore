@@ -22,11 +22,8 @@ import '../model/space_stats.dart';
 import '../model/table_context.dart';
 import '../model/table_identity.dart';
 import '../model/table_schema.dart';
-import '../model/transaction_models.dart';
 import '../model/wal_pointer.dart';
-import '../query/query_condition.dart';
 import '../query/query_executor.dart';
-import 'compute/batch_match_runner.dart';
 import 'compute/compute_batch_planner.dart';
 import 'compute/delete_batch_prepare_compute.dart';
 import 'compute/query_aggregate_compute.dart';
@@ -39,7 +36,6 @@ import 'transaction_context.dart';
 import 'tree_cache.dart';
 import 'weight_manager.dart';
 import 'workload_scheduler.dart';
-import 'write_buffer_manager.dart';
 import 'yield_controller.dart';
 
 /// table data manager - schedule data read/write, backup, index update, etc.
@@ -82,10 +78,14 @@ class TableDataManager {
   late final TreeCache<Map<String, dynamic>> _tableRecordCache;
 
   // -------------------- Transactional structures --------------------
-  // Per-transaction deferred ops (insert/update/delete) not written until commit
-  // txId -> tableUid -> pk -> TxnDeferredOp
-  final Map<String, Map<String, Map<String, TxnDeferredOp>>> _txnDeferredOps =
-      {};
+  // Txn deferred ops live in WriteBufferManager.bufferTrees (txn TreeCaches).
+  // This set is an O(1) presence index for:
+  // - hasDeferredOps / getDeferredOps early-out
+  // - query merge / count overlays (skip txn scan when current tx has no ops)
+  // - selective TTL cleanup of *inactive* txIds (must not wipe active txns)
+  // Bulk teardown (dispose) should clear txn TreeCaches as a whole -- do not
+  // iterate this set for prefix-removes.
+  final Set<String> _txnIdsWithOps = <String>{};
 
   // Lightweight accounting for transaction data retained in memory. Record
   // sizes are sampled only, so normal-resource transactions remain unbounded.
@@ -115,7 +115,7 @@ class TableDataManager {
   CentralServerClient? _centralClient;
 
   // ---------------------------------------------------------------------------
-  // SpaceStats (InternalKv `stats.space.v1`) — owned entirely here.
+  // SpaceStats (InternalKv `stats.space.v1`) -- owned entirely here.
   //
   // Model: effective = baseline + sessionDelta
   // - baseline: loaded once from KV (or set by full recalculate / persist fold)
@@ -145,7 +145,7 @@ class TableDataManager {
   int? _lastFlushAvgIndexEntrySizeBytes;
 
   /// Upgrade: old KV lacked [SpaceStats.totalIndexEntryCount] while index bytes
-  /// were already tracked — force one full reconcile to seed the denominator.
+  /// were already tracked -- force one full reconcile to seed the denominator.
   bool _indexEntryBaselinePending = false;
 
   /// Single-flight for the expensive full scan only (policy checks are cheap).
@@ -183,7 +183,11 @@ class TableDataManager {
   final Map<String, Comparator<dynamic>> _pkComparators = {};
 
   /// Factory to provide comparators for TreeCache based on path (Table Record Cache)
-  Comparator<dynamic> _tableRecordComparatorFactory(List<dynamic> path) {
+  Comparator<dynamic> _tableRecordComparatorFactory(
+    List<dynamic> path, {
+    int suffixIndex = 0,
+  }) {
+    if (suffixIndex > 0) return TreeCache.compareNative;
     if (path.isNotEmpty) {
       final tableUid = path[0] as String;
       return _pkComparators[tableUid] ?? TreeCache.compareNative;
@@ -232,7 +236,7 @@ class TableDataManager {
     // Initialize auto-increment ID generator and set periodic check task
     CrontabManager.addCallback(
         ExecuteInterval.seconds3, TimeBasedIdGenerator.periodicPoolCheck);
-    // SpaceStats → InternalKv off the journal/close hot path (best-effort).
+    // SpaceStats -> InternalKv off the journal/close hot path (best-effort).
     CrontabManager.addCallback(
         ExecuteInterval.seconds30, _onSpaceStatsPersistTick);
     // Register daily reconcile only after startup settles (avoids open contention).
@@ -280,7 +284,7 @@ class TableDataManager {
   /// Get a cached record by [pk] if present.
   ///
   /// Returns the cached map by reference (no copy). Callers must not mutate
-  /// the result in place — treat it as read-only or copy before writing.
+  /// the result in place -- treat it as read-only or copy before writing.
   Map<String, dynamic>? getCachedTableRecord(TableContext table, String pk) {
     return _tableRecordCache.get([table.tableUid, pk]);
   }
@@ -309,9 +313,10 @@ class TableDataManager {
         transactionId ?? TransactionContext.getCurrentTransactionId();
 
     if (currentTxId != null) {
-      final txOp = _txnDeferredOps[currentTxId]?[tableUid]?[pk];
+      final txOp = _dataStore.writeBufferManager.bufferTrees
+          .getTxnRecord(currentTxId, tableUid, pk);
       if (txOp != null) {
-        return txOp.type == BufferOperationType.delete ||
+        return txOp.operation == BufferOperationType.delete ||
             isDeletedRecord(txOp.data);
       }
     }
@@ -417,14 +422,15 @@ class TableDataManager {
         final pk = r[primaryKey]?.toString();
         if (pk == null) continue;
 
-        // Only cache if the record is NOT marked as deleted in the global write buffer.
+        // Only cache if the record is NOT superseded by a live write-buffer entry.
+        // Caching disk rows while pending insert/update exists pollutes the
+        // read-through cache with stale values under concurrent flush.
         final bufferEntry =
             _dataStore.writeBufferManager.getBufferedRecordForRead(
           table,
           pk,
         );
-        if (bufferEntry != null &&
-            bufferEntry.operation == BufferOperationType.delete) {
+        if (bufferEntry != null) {
           continue;
         }
 
@@ -666,6 +672,17 @@ class TableDataManager {
   int? get averageIndexEntrySizeBytes =>
       _lastFlushAvgIndexEntrySizeBytes ?? _cachedAvgIndexEntrySizeBytes;
 
+  /// Approximate bytes of all index entries attributable to one record.
+  ///
+  /// Uses space-wide `totalIndexDataSizeBytes / totalRecordCount` when warm.
+  int? get estimateIndexBytesPerRecord {
+    final rc = _effectiveRecordCount;
+    if (rc <= 0) return null;
+    final bytes = _effectiveIndexDataSizeBytes;
+    if (bytes <= 0) return null;
+    return bytes ~/ rc;
+  }
+
   SpaceStats _spaceStatsSnapshot() => SpaceStats(
         totalRecordCount: _effectiveRecordCount,
         totalTableDataSizeBytes: _effectiveTableDataSizeBytes,
@@ -691,7 +708,7 @@ class TableDataManager {
   /// Prefer last-flush / space-wide average (O(1)); else per-record estimate.
   ///
   /// Used by TreeCache quota and isolate-dispatch heuristics. Disk average is
-  /// not exact Dart-heap size — acceptable for scheduling / eviction only.
+  /// not exact Dart-heap size -- acceptable for scheduling / eviction only.
   int resolveRecordSizeBytes(Map<String, dynamic> record) {
     final avg = averageTableRecordSizeBytes;
     if (avg != null && avg > 0) return avg;
@@ -724,7 +741,7 @@ class TableDataManager {
       !_dataStore.parallelJournalManager.isInRecoveryMode;
 
   /// Called from [DataStoreImpl.close]: drop best-effort SpaceStats KV work so
-  /// close/switchSpace never blocks on InternalKv → tableMeta.
+  /// close/switchSpace never blocks on InternalKv -> tableMeta.
   void suppressSpaceStatsKvPersistence() {
     _spaceStatsKvSuppressed = true;
     _needSaveStats = false;
@@ -736,7 +753,7 @@ class TableDataManager {
 
   /// Single-flight: load KV baseline once per manager lifetime.
   ///
-  /// Only runs while the engine is fully open — never during close/re-init.
+  /// Only runs while the engine is fully open -- never during close/re-init.
   Future<void> ensureSpaceStatsHydrated() async {
     if (_spaceStatsHydrated || _spaceStatsKvSuppressed) return;
 
@@ -787,7 +804,7 @@ class TableDataManager {
     } catch (e) {
       _spaceStatsHydrateFuture = null;
       if (_isSpaceStatsWorkAborted || e is DbClosedException) {
-        // close / switchSpace race — silent.
+        // close / switchSpace race -- silent.
       } else {
         Logger.warn('Failed to hydrate space stats from InternalKv',
             rawError: e);
@@ -870,7 +887,7 @@ class TableDataManager {
     _deltaIndexEntryCount = 0;
   }
 
-  /// Space aggregate stats cover user tables only — never system/internal KV.
+  /// Space aggregate stats cover user tables only -- never system/internal KV.
   /// Prefer [TableSchema.isSystemTable] (O(1)); name-set lookup is unnecessary
   /// on the per-record hot path when contexts carry a correct schema flag.
   bool _contributesToSpaceStats(TableContext table) =>
@@ -1063,13 +1080,13 @@ class TableDataManager {
       // Stamp only on full reconcile (index baseline included, may be 0).
       _lastStatisticsTime = DateTime.now();
 
-      // Averages refresh inside persist (single owner) — do not refresh here.
+      // Averages refresh inside persist (single owner) -- do not refresh here.
       await _persistSpaceStatsToKv();
 
       Logger.debug(
           'Table statistics calculation completed: record count=$totalRecordCount, table data=${totalTableDataSize / 1024 / 1024}MB, index data=${totalIndexDataSize / 1024 / 1024}MB, index entries=$totalIndexEntryCount');
     } on DbClosedException {
-      // close / switchSpace race — best-effort, no log.
+      // close / switchSpace race -- best-effort, no log.
     } catch (e) {
       if (_isSpaceStatsWorkAborted || e is DbClosedException) return;
       Logger.error('Failed to calculate table statistics', rawError: e);
@@ -1103,7 +1120,7 @@ class TableDataManager {
       _foldSpaceStatsDeltaIntoBaseline();
       _needSaveStats = false;
     } on DbClosedException {
-      // Shutdown race — stats are best-effort.
+      // Shutdown race -- stats are best-effort.
     } catch (e) {
       if (_isSpaceStatsWorkAborted || e is DbClosedException) return;
       Logger.error('Failed to save space stats', rawError: e);
@@ -1256,7 +1273,7 @@ class TableDataManager {
     try {
       if (persistChanges) {
         // Persist runtime metadata (max IDs) one last time.
-        // SpaceStats intentionally skipped — close/switchSpace must not block
+        // SpaceStats intentionally skipped -- close/switchSpace must not block
         // on InternalKv; periodic tick / recalculate covers durability.
         await persistRuntimeMetaIfNeeded(force: true);
 
@@ -1276,7 +1293,8 @@ class TableDataManager {
       _tableRecordCounts.clear();
       _recordCountLoadingFutures.clear();
       _metaLoadingFutures.clear();
-      _txnDeferredOps.clear();
+      _dataStore.writeBufferManager.clearAllTransactionBuffers();
+      _txnIdsWithOps.clear();
       _txnResourceEstimates.clear();
       _maxIds.clear();
       _maxIdsDirty.clear();
@@ -1403,7 +1421,6 @@ class TableDataManager {
     TableContext table,
     Map<String, dynamic> data,
     BufferOperationType operationType, {
-    List<UniqueKeyRef>? uniqueKeyRefs,
     Map<String, dynamic>? oldValues,
     String? transactionId,
     required String schemaVersion,
@@ -1422,87 +1439,33 @@ class TableDataManager {
     final String? currentTxId =
         transactionId ?? TransactionContext.getCurrentTransactionId();
     if (currentTxId != null && !TransactionContext.isApplyingCommit()) {
-      // Transaction-aware deferred operations
-      final byTable = _txnDeferredOps.putIfAbsent(
-          currentTxId, () => <String, Map<String, TxnDeferredOp>>{});
-      final map =
-          byTable.putIfAbsent(table.tableUid, () => <String, TxnDeferredOp>{});
+      final finalData = Map<String, dynamic>.from(data);
+      final entry = BufferEntry(
+        data: finalData,
+        operation: operationType,
+        timestamp: DateTime.now(),
+        walPointer: null,
+        transactionId: currentTxId,
+        oldValues: oldValues,
+        schemaVersion: schemaVersion,
+      );
 
-      // Handle insert-then-update in same transaction: merge operations correctly.
-      final existingOp = map[recordId];
-      Map<String, dynamic>? mergedOldValues = oldValues;
-      BufferOperationType finalOpType = operationType;
-      // Copy only the map we will retain. Merge paths copy existingOp.data and
-      // overlay [data]; non-merge paths take ownership via Map.from(data).
-      late final Map<String, dynamic> finalData;
-
-      if (existingOp != null) {
-        if (existingOp.type == BufferOperationType.delete &&
-            operationType == BufferOperationType.update) {
-          throw DbException([
-            ConstraintStatus(
-              type: ResultType.bizRecordNotFound,
-              tableName: table.tableName,
-              fields: [primaryKey],
-              conflictingKeys: [recordId],
-              message:
-                  'Cannot update record $recordId in table ${table.tableName} because it has already been deleted in the current transaction',
-            ),
-          ]);
-        }
-        if (existingOp.type == BufferOperationType.insert &&
-            operationType == BufferOperationType.update) {
-          // Insert then update: merge into a single insert with final data.
-          // Since the record hasn't been committed yet, we should treat it as an insert
-          // with the final updated data. This avoids index deletion complexity.
-          finalOpType = BufferOperationType.insert;
-          mergedOldValues = null; // Insert doesn't need oldValues
-          // Merge: start with insert data, then overlay update data (update may have partial fields)
-          finalData = Map<String, dynamic>.from(existingOp.data);
-          finalData.addAll(data); // Update data overlays insert data
-        } else if (existingOp.type == BufferOperationType.update &&
-            operationType == BufferOperationType.update) {
-          // Update then update: preserve the original oldValues from first update.
-          mergedOldValues = existingOp.oldValues ?? oldValues;
-          finalData = Map<String, dynamic>.from(existingOp.data);
-          finalData.addAll(data); // Update data overlays first update data
-        } else if (existingOp.type == BufferOperationType.delete &&
-            operationType == BufferOperationType.insert) {
-          finalOpType = BufferOperationType.insert;
-          finalData = Map<String, dynamic>.from(existingOp.data);
-          finalData.addAll(data); // Insert data overlays deleted record
-        } else {
-          // Other combinations: take ownership of the latest operation data.
-          finalData = Map<String, dynamic>.from(data);
-        }
-      } else {
-        finalData = Map<String, dynamic>.from(data);
-      }
+      // PK overlay + txn index trees (merge/cancel handled inside applyRecord).
+      // Unique reservation is expected at call sites before addToBuffer.
+      _dataStore.writeBufferManager.applyTxnRecord(
+        transactionId: currentTxId,
+        table: table,
+        recordId: recordId,
+        entry: entry,
+      );
 
       _trackTransactionBufferBatch(
         currentTxId,
         [finalData],
-        mergedOldValues != null ? {recordId: mergedOldValues} : null,
+        oldValues != null ? {recordId: oldValues} : null,
         primaryKey,
       );
-
-      // We already checked recordId is not null above
-      map[recordId] = TxnDeferredOp(
-        finalOpType,
-        finalData,
-        uniqueKeyRefs: uniqueKeyRefs,
-        oldValues: mergedOldValues,
-      );
-
-      // Register unique keys with WriteBufferManager for conflict detection
-      if (uniqueKeyRefs != null && uniqueKeyRefs.isNotEmpty) {
-        _dataStore.writeBufferManager.addTransactionUniqueKeys(
-          transactionId: currentTxId,
-          table: table,
-          recordId: recordId,
-          uniqueKeys: uniqueKeyRefs,
-        );
-      }
+      _txnIdsWithOps.add(currentTxId);
       return;
     }
 
@@ -1608,7 +1571,6 @@ class TableDataManager {
       table: table,
       recordId: recordId,
       entry: entry,
-      uniqueKeys: uniqueKeyRefs ?? const <UniqueKeyRef>[],
     );
 
     // Update full index cache (Real-time population)
@@ -1653,7 +1615,6 @@ class TableDataManager {
     required List<Map<String, dynamic>> records,
     required BufferOperationType operation,
     required TableSchema schema,
-    required List<List<UniqueKeyRef>> uniqueKeyRefsList,
     Map<String, Map<String, dynamic>>? oldRecordsMap,
     String? transactionId,
     DateTime? timestamp,
@@ -1675,12 +1636,8 @@ class TableDataManager {
     final successIds = <String>[];
     final failedIds = <String>[];
 
-    // 1. Transaction Path: Defer operations until commit
+    // 1. Transaction Path: Defer operations into txn TreeCaches until commit
     if (currentTxId != null && !applyingCommit) {
-      final byTable = _txnDeferredOps.putIfAbsent(
-          currentTxId, () => <String, Map<String, TxnDeferredOp>>{});
-      final map =
-          byTable.putIfAbsent(table.tableUid, () => <String, TxnDeferredOp>{});
       _trackTransactionBufferBatch(
         currentTxId,
         records,
@@ -1700,26 +1657,25 @@ class TableDataManager {
               continue;
             }
 
-            final uniqueRefs = uniqueKeyRefsList[i];
             final oldR = oldRecordsMap != null ? oldRecordsMap[recordId] : null;
 
             try {
-              map[recordId] = TxnDeferredOp(
-                operation,
-                Map<String, dynamic>.from(r),
-                uniqueKeyRefs: uniqueRefs,
+              final entry = BufferEntry(
+                data: Map<String, dynamic>.from(r),
+                operation: operation,
+                timestamp: ts,
+                walPointer: null,
+                transactionId: currentTxId,
                 oldValues: oldR,
+                schemaVersion: schemaVersion,
               );
-
-              // Register unique keys with WriteBufferManager for cross-txn conflict detection.
-              if (uniqueRefs.isNotEmpty) {
-                _dataStore.writeBufferManager.addTransactionUniqueKeys(
-                  transactionId: currentTxId,
-                  table: table,
-                  recordId: recordId,
-                  uniqueKeys: uniqueRefs,
-                );
-              }
+              // Unique reservation is expected at call sites before addBatchToBuffer.
+              _dataStore.writeBufferManager.applyTxnRecord(
+                transactionId: currentTxId,
+                table: table,
+                recordId: recordId,
+                entry: entry,
+              );
               successIds.add(recordId);
             } catch (e) {
               Logger.warn(
@@ -1730,6 +1686,9 @@ class TableDataManager {
           }
         },
       );
+      if (successIds.isNotEmpty) {
+        _txnIdsWithOps.add(currentTxId);
+      }
       return (successRecordIds: successIds, failedRecordIds: failedIds);
     }
 
@@ -1790,11 +1749,22 @@ class TableDataManager {
                       overrideSchema: schema, force: true);
                 }
               }
+              // Drop reserve bookkeeping; unique leaves stay as memory locks.
+              _dataStore.writeBufferManager.commitReservedUniques(
+                table: table,
+                recordId: recordId,
+                transactionId: currentTxId,
+              );
               successIds.add(recordId);
             } catch (e) {
               Logger.warn(
                   'Memory batch op failed: ${table.tableName} pk=$recordId',
                   rawError: e);
+              _dataStore.writeBufferManager.releaseReservedUniques(
+                table: table,
+                recordId: recordId,
+                transactionId: currentTxId,
+              );
               failedIds.add(recordId);
             }
           }
@@ -1808,7 +1778,6 @@ class TableDataManager {
     final walEntries = <Map<String, dynamic>>[];
     final validBatchRecords = <Map<String, dynamic>>[];
     final validBatchRecordIds = <String>[];
-    final validBatchUniqueKeys = <List<UniqueKeyRef>>[];
     final validBatchOldValues = <Map<String, dynamic>?>[];
 
     await EngineCpuChunk.forEachRange(
@@ -1843,7 +1812,6 @@ class TableDataManager {
 
           validBatchRecords.add(r);
           validBatchRecordIds.add(recordId);
-          validBatchUniqueKeys.add(uniqueKeyRefsList[i]);
           validBatchOldValues.add(walOldValues);
         }
       },
@@ -1868,9 +1836,12 @@ class TableDataManager {
       );
     }
 
+    // Persistent / applying-commit: never write txn trees here.
+    // Commit apply must land in pending (tx overlays are cleared after commit).
+    final String? bufferTxId = applyingCommit ? null : currentTxId;
+
     final recordIds = <String>[];
     final entries = <BufferEntry>[];
-    final finalUniqueKeysList = <List<UniqueKeyRef>>[];
 
     await EngineCpuChunk.forEachRangeAsync(
       length: validBatchRecordIds.length,
@@ -1885,15 +1856,12 @@ class TableDataManager {
             data: r,
             operation: operation,
             timestamp: ts,
-            transactionId: currentTxId,
+            transactionId: bufferTxId,
             walPointer: pointers[i],
             oldValues: oldR,
             schemaVersion: schemaVersion,
           ));
           recordIds.add(recordId);
-          if (operation != BufferOperationType.delete) {
-            finalUniqueKeysList.add(validBatchUniqueKeys[i]);
-          }
 
           if (operation == BufferOperationType.update) {
             cacheTableRecord(table, recordId, r, schema);
@@ -1920,16 +1888,18 @@ class TableDataManager {
 
     if (operation == BufferOperationType.insert) {
       await _dataStore.writeBufferManager.addInsertBatch(
-          table: table,
-          recordIds: recordIds,
-          entries: entries,
-          uniqueKeysList: finalUniqueKeysList);
+        table: table,
+        recordIds: recordIds,
+        entries: entries,
+        installAllIndexes: applyingCommit,
+      );
     } else if (operation == BufferOperationType.update) {
       await _dataStore.writeBufferManager.addUpdateBatch(
-          table: table,
-          recordIds: recordIds,
-          entries: entries,
-          uniqueKeysList: finalUniqueKeysList);
+        table: table,
+        recordIds: recordIds,
+        entries: entries,
+        installAllIndexes: applyingCommit,
+      );
     } else if (operation == BufferOperationType.delete) {
       await _dataStore.writeBufferManager
           .addDeleteBatch(table: table, recordIds: recordIds, entries: entries);
@@ -2076,8 +2046,6 @@ class TableDataManager {
         records: trimmedRecords,
         operation: BufferOperationType.delete,
         schema: schema,
-        uniqueKeyRefsList:
-            List.filled(trimmedRecords.length, const <UniqueKeyRef>[]),
         schemaVersion: schemaVersion,
       );
     }
@@ -2097,7 +2065,6 @@ class TableDataManager {
     Map<String, dynamic> data,
     BufferOperationType operationType, {
     required BufferEntry entry,
-    List<UniqueKeyRef>? uniqueKeyRefs,
     Map<String, dynamic>? oldValues,
     bool updateStats = true,
   }) async {
@@ -2114,7 +2081,6 @@ class TableDataManager {
       table: table,
       recordId: recordId,
       entry: entry, // Use the recovered entry directly
-      uniqueKeys: uniqueKeyRefs ?? const <UniqueKeyRef>[],
       updateStats: updateStats,
     );
   }
@@ -2214,45 +2180,26 @@ class TableDataManager {
     // Transaction overlay: include deferred inserts/deletes (read-your-writes) for current tx.
     // Skip during applyCommit to avoid double counting when promotion already enters WAL/buffer.
     final String? txId = TransactionContext.getCurrentTransactionId();
-    if (txId != null && !TransactionContext.isApplyingCommit()) {
-      final defOps = _txnDeferredOps[txId]?[table.tableUid];
-      if (defOps != null && defOps.isNotEmpty) {
-        try {
-          final schema = table.schema;
-          final pkName = schema.primaryKey;
-          if (pkName.isNotEmpty) {
-            // Track unique primary keys to avoid double counting the same record.
-            final inserted = <String>{};
-            final yieldController =
-                YieldController('TableDataManager.getTableRecordCount');
-
-            // defOps is Map<String, TxnDeferredOp>
-            // We just need to tally inserts - deletes
-            // Since Map already deduplicates by PK for the txn, we just iterate values.
-            final deleted = <String>{};
-
-            for (final op in defOps.values) {
-              final y8 = yieldController.maybeYield();
-              if (y8 != null) await y8;
-              if (op.type == BufferOperationType.insert) {
-                final k = op.data[pkName]?.toString();
-                if (k != null && k.isNotEmpty) inserted.add(k);
-              } else if (op.type == BufferOperationType.delete) {
-                final k = op.data[pkName]?.toString();
-                if (k != null) {
-                  // If we inserted it in this txn, remove it (net zero change for this key)
-                  // If not inserted in this txn, it's a delete of an existing record (net -1)
-                  if (!inserted.remove(k)) {
-                    deleted.add(k);
-                  }
-                }
-              }
+    if (txId != null &&
+        !TransactionContext.isApplyingCommit() &&
+        _txnIdsWithOps.contains(txId)) {
+      try {
+        var inserted = 0;
+        var deleted = 0;
+        await _dataStore.writeBufferManager.bufferTrees.forEachTxnRecord(
+          txId,
+          table,
+          onEntry: (pk, entry) {
+            if (entry.operation == BufferOperationType.insert) {
+              inserted++;
+            } else if (entry.operation == BufferOperationType.delete) {
+              deleted++;
             }
-
-            count += inserted.length - deleted.length;
-          }
-        } catch (_) {}
-      }
+            return true;
+          },
+        );
+        count += inserted - deleted;
+      } catch (_) {}
     }
 
     // The final count is the stored count, plus pending inserts, minus pending deletes,
@@ -2621,7 +2568,7 @@ class TableDataManager {
           fileMeta == null || fileMeta.totalRecordCount <= 0;
 
       if (!tableEmptyOnDisk) {
-        // Prefer cached maxAutoIncrementId when present — avoids a leaf scan.
+        // Prefer cached maxAutoIncrementId when present -- avoids a leaf scan.
         // !tableEmptyOnDisk implies fileMeta != null && totalRecordCount > 0.
         final cachedMetaMax = fileMeta.maxAutoIncrementId;
         if (cachedMetaMax != null &&
@@ -2654,8 +2601,8 @@ class TableDataManager {
       // Also consider buffered inserts recovered from WAL (in-memory buffer)
       dynamic maxFromBuffer;
       try {
-        maxFromBuffer = _dataStore.writeBufferManager
-            .getMaxPrimaryKey(table, schema.primaryKey, pkMatcher);
+        maxFromBuffer = await _dataStore.writeBufferManager
+            .getMaxPrimaryKey(table, schema.primaryKey);
       } catch (_) {}
 
       // Combine candidates: take the maximum of partition max, buffer max, and current memory value
@@ -2817,23 +2764,11 @@ class TableDataManager {
     final bool isMemoryMode =
         _dataStore.config.persistenceMode == PersistenceMode.memory;
 
-    // Fast path for empty tables (no partitions yet): only merge buffer/txn overlay.
+    // Empty disk does not mean empty result: pending/txn may still have rows.
+    bool diskEmpty = false;
     if (!isMemoryMode) {
       final fileMeta = await getTableDataMeta(table.tableUid);
-      if (fileMeta == null || fileMeta.btreeFirstLeaf.isNull) {
-        final yieldController =
-            YieldController('TableDataManager.streamRecords_empty');
-        final overlay = await mergeConsistency(
-          table,
-          [],
-        );
-        for (final r in overlay) {
-          final y9 = yieldController.maybeYield();
-          if (y9 != null) await y9;
-          if (!isDeletedRecord(r)) yield r;
-        }
-        return;
-      }
+      diskEmpty = fileMeta == null || fileMeta.btreeFirstLeaf.isNull;
     }
 
     final yieldController =
@@ -2855,7 +2790,25 @@ class TableDataManager {
 
         processedKeys.add(pk);
 
-        // Check buffer for updates/deletes (O(1) lookup)
+        // Txn overlay wins over pending buffer (read-your-writes).
+        if (currentTxId != null) {
+          final txOp = _dataStore.writeBufferManager.bufferTrees
+              .getTxnRecord(currentTxId, table.tableUid, pk);
+          if (txOp != null) {
+            if (txOp.operation == BufferOperationType.delete) {
+              return null;
+            }
+            // BufferEntry.oldValues is separate; data is shared by ref.
+            // Legacy guard if _oldValues was embedded in data.
+            final txRecord = _visibleTxnRecord(txOp.data);
+            if (!isDeletedRecord(txRecord)) {
+              return txRecord;
+            }
+            return null;
+          }
+        }
+
+        // Check pending buffer for updates/deletes (O(1) lookup)
         final bufferEntry =
             _dataStore.writeBufferManager.getBufferedRecordForRead(
           tableContext,
@@ -2871,166 +2824,134 @@ class TableDataManager {
           return null;
         }
 
-        // Check transaction for updates/deletes (O(1) lookup)
-        if (currentTxId != null) {
-          final defOps = _txnDeferredOps[currentTxId]?[table.tableUid];
-          final txOp = defOps?[pk];
-          if (txOp != null) {
-            if (txOp.type == BufferOperationType.delete) {
-              return null;
-            }
-            // TxnDeferredOp stores oldValues separately; data is shared by ref
-            // (same as buffer read path). Legacy guard if _oldValues was embedded.
-            final txRecord = _visibleTxnRecord(txOp.data);
-            if (!isDeletedRecord(txRecord)) {
-              return txRecord;
-            }
-            return null;
-          }
-        }
-
         if (!isDeletedRecord(record)) {
           return record;
         }
         return null;
       }
 
-      if (!isMemoryMode) {
-        // File mode: stream from global B+Tree leaf chain.
-        final rangeManager = _dataStore.tableTreePartitionManager;
-        if (rangeManager == null) {
-          return;
-        }
-        await for (final record in rangeManager.streamRecordsByPrimaryKeyRange(
-          table: table,
-          startKeyInclusive: Uint8List(0),
-          endKeyExclusive: Uint8List(0),
-          reverse: false,
-          limit: null,
-          encryptionKey: customKey,
-          encryptionKeyId: customKeyId,
-        )) {
-          final y10 = yieldController.maybeYield();
-          if (y10 != null) await y10;
-          final merged = applyOverlay(record);
-          if (merged != null) {
-            yield merged;
-          }
-        }
-      } else {
-        // Memory mode: use logical TreeCache range scan + StreamController to preserve streaming semantics.
-        final pkMatcher =
-            ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
-
-        bool recordPredicate(Map<String, dynamic> r) {
-          // For streamRecords we only need to skip tombstones here;
-          // buffer/txn deletes are handled in overlay logic.
-          return !isDeletedRecord(r);
-        }
-
-        final controller = StreamController<Map<String, dynamic>>();
-
-        () async {
-          try {
-            await _forEachRecordByPrimaryKeyRangeLogical(
+      // Skip file stream when disk is empty; pending/txn inserts still emit below.
+      if (!diskEmpty || isMemoryMode) {
+        if (!isMemoryMode) {
+          // File mode: stream from global B+Tree leaf chain.
+          final rangeManager = _dataStore.tableTreePartitionManager;
+          if (rangeManager != null) {
+            await for (final record
+                in rangeManager.streamRecordsByPrimaryKeyRange(
               table: table,
-              schema: schema,
-              primaryKey: primaryKey,
-              pkMatcher: pkMatcher,
-              reverse: false,
-              limit: null,
-              recordPredicate: recordPredicate,
               startKeyInclusive: Uint8List(0),
               endKeyExclusive: Uint8List(0),
-              rangeMin: null,
-              rangeMax: null,
-              includeMin: true,
-              includeMax: true,
-              cursorPk: null,
-              onRecord: (r) {
-                final merged = applyOverlay(r);
-                if (merged != null) {
-                  controller.add(merged);
-                }
-                return true;
-              },
-            );
-          } catch (e, stack) {
-            controller.addError(e, stack);
-          } finally {
-            await controller.close();
-          }
-        }();
-
-        await for (final record in controller.stream) {
-          final y11 = yieldController.maybeYield();
-          if (y11 != null) await y11;
-          yield record;
-        }
-      }
-
-      // After streaming base records, yield buffer/transaction inserts that weren't in base stream.
-      final bufferInsertKeys = _dataStore.writeBufferManager
-          .getBufferedInsertKeys(tableContext, reverse: false);
-
-      final Set<String> txInsertKeys = <String>{};
-      if (currentTxId != null) {
-        final defOps = _txnDeferredOps[currentTxId]?[table.tableUid];
-        if (defOps != null) {
-          for (final op in defOps.values) {
-            if (op.type != BufferOperationType.delete) {
-              final pk = op.data[primaryKey]?.toString();
-              if (pk != null && pk.isNotEmpty) {
-                txInsertKeys.add(pk);
+              reverse: false,
+              limit: null,
+              encryptionKey: customKey,
+              encryptionKeyId: customKeyId,
+            )) {
+              final y10 = yieldController.maybeYield();
+              if (y10 != null) await y10;
+              final merged = applyOverlay(record);
+              if (merged != null) {
+                yield merged;
               }
             }
           }
-        }
-      }
+        } else {
+          // Memory mode: use logical TreeCache range scan + StreamController.
+          final pkMatcher =
+              ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
 
-      for (final key in bufferInsertKeys) {
-        if (processedKeys.contains(key)) {
-          continue;
-        }
+          bool recordPredicate(Map<String, dynamic> r) {
+            return !isDeletedRecord(r);
+          }
 
-        final y12 = yieldController.maybeYield();
-        if (y12 != null) await y12;
+          final controller = StreamController<Map<String, dynamic>>();
 
-        bool shadowedByDelete = false;
-        if (currentTxId != null) {
-          final defOps = _txnDeferredOps[currentTxId]?[table.tableUid];
-          final txOp = defOps?[key];
-          if (txOp != null && txOp.type == BufferOperationType.delete) {
-            shadowedByDelete = true;
+          () async {
+            try {
+              await _forEachRecordByPrimaryKeyRangeLogical(
+                table: table,
+                schema: schema,
+                primaryKey: primaryKey,
+                pkMatcher: pkMatcher,
+                reverse: false,
+                limit: null,
+                recordPredicate: recordPredicate,
+                startKeyInclusive: Uint8List(0),
+                endKeyExclusive: Uint8List(0),
+                rangeMin: null,
+                rangeMax: null,
+                includeMin: true,
+                includeMax: true,
+                cursorPk: null,
+                onRecord: (r) {
+                  final merged = applyOverlay(r);
+                  if (merged != null) {
+                    controller.add(merged);
+                  }
+                  return true;
+                },
+              );
+            } catch (e, stack) {
+              controller.addError(e, stack);
+            } finally {
+              await controller.close();
+            }
+          }();
+
+          await for (final record in controller.stream) {
+            final y11 = yieldController.maybeYield();
+            if (y11 != null) await y11;
+            yield record;
           }
         }
-        if (shadowedByDelete) continue;
-
-        final entry = _dataStore.writeBufferManager.getBufferedRecordForRead(
-          tableContext,
-          key,
-        );
-        if (entry != null &&
-            entry.operation != BufferOperationType.delete &&
-            !isDeletedRecord(entry.data)) {
-          yield entry.data;
-        }
       }
 
-      for (final key in txInsertKeys) {
-        if (processedKeys.contains(key)) {
-          continue;
-        }
+      // After streaming base records, yield pending/txn inserts not already seen.
+      // Single PK-ordered TreeCache scan (no intermediate key-list + re-get).
+      final trees = _dataStore.writeBufferManager.bufferTrees;
+      final pendingExtra = <Map<String, dynamic>>[];
+      await trees.forEachPendingRecord(
+        tableContext,
+        onEntry: (pk, entry) {
+          if (processedKeys.contains(pk)) return true;
+          if (entry.operation == BufferOperationType.delete ||
+              isDeletedRecord(entry.data)) {
+            return true;
+          }
+          if (currentTxId != null) {
+            final txOp = trees.getTxnRecord(currentTxId, table.tableUid, pk);
+            if (txOp != null && txOp.operation == BufferOperationType.delete) {
+              return true;
+            }
+          }
+          pendingExtra.add(entry.data);
+          return true;
+        },
+      );
+      for (final row in pendingExtra) {
+        final y12 = yieldController.maybeYield();
+        if (y12 != null) await y12;
+        yield row;
+      }
 
-        final y13 = yieldController.maybeYield();
-        if (y13 != null) await y13;
-
-        final defOps = _txnDeferredOps[currentTxId]?[table.tableUid];
-        final txOp = defOps?[key];
-        if (txOp != null &&
-            txOp.type != BufferOperationType.delete &&
-            !isDeletedRecord(txOp.data)) {
-          yield _visibleTxnRecord(txOp.data);
+      if (currentTxId != null && _txnIdsWithOps.contains(currentTxId)) {
+        final txnExtra = <Map<String, dynamic>>[];
+        await trees.forEachTxnRecord(
+          currentTxId,
+          table,
+          onEntry: (pk, entry) {
+            if (processedKeys.contains(pk)) return true;
+            if (entry.operation == BufferOperationType.delete ||
+                isDeletedRecord(entry.data)) {
+              return true;
+            }
+            txnExtra.add(_visibleTxnRecord(entry.data));
+            return true;
+          },
+        );
+        for (final row in txnExtra) {
+          final y13 = yieldController.maybeYield();
+          if (y13 != null) await y13;
+          yield row;
         }
       }
     } finally {
@@ -3055,10 +2976,11 @@ class TableDataManager {
     return RegExp(r'^[0-9A-Za-z]+$').hasMatch(str);
   }
 
-  /// Rollback: remove placeholders and drop deferred ops.
+  /// Rollback: drop txn TreeCache ops and resource estimates.
   Future<void> applyTransactionRollback(String txId) async {
-    _txnDeferredOps.remove(txId);
+    _txnIdsWithOps.remove(txId);
     _txnResourceEstimates.remove(txId);
+    _dataStore.writeBufferManager.clearTransactionBuffers(txId);
   }
 
   String _tableLockResource(TableContext table) =>
@@ -3190,6 +3112,7 @@ class TableDataManager {
           }
 
           // Always zero per-table count cache (system KV included).
+          await clearTableRecordsForTable(table);
           _tableRecordCounts[table.tableUid] = 0;
 
           await _dataStore.writeBufferManager.clearTableByUid(table.tableUid);
@@ -3392,306 +3315,6 @@ class TableDataManager {
     return _tableDataMetaCache.estimatedTotalSizeBytes;
   }
 
-  /// Merges uncommitted data (WAL buffer and transaction overlays) into the results.
-  /// [onlyMergeTransaction] indicates if the input [records] already contains all possible committed records
-  /// for the query context (e.g. all point-lookup keys were found). In such cases, we can skip
-  /// scanning buffers for NEW inserts.
-  Future<List<Map<String, dynamic>>> mergeConsistency(
-    TableContext table,
-    List<Map<String, dynamic>> records, {
-    ConditionRecordMatcher? matcher,
-    bool Function(String)? keyPredicate,
-    int? limit,
-    List<String>? orderBy,
-    bool Function(Map<String, dynamic>)? filter,
-    bool reverse = false,
-    bool onlyMergeTransaction = false,
-    Iterable<String>? explicitInsertKeys,
-    Iterable<String>? explicitTxInsertKeys,
-  }) async {
-    final schema = table.schema;
-    final tableContext = table;
-    final primaryKey = schema.primaryKey;
-    final baseRecords = <String, Map<String, dynamic>>{};
-
-    final String? currentTxId = TransactionContext.getCurrentTransactionId();
-    final bool trackReadKeys = currentTxId != null &&
-        TransactionContext.getCurrentIsolationLevel() ==
-            TransactionIsolationLevel.serializable;
-
-    // Convert input list to Map<PK, Record> for O(1) access
-    final yieldController =
-        YieldController('TableDataManager.mergeConsistency');
-    for (final r in records) {
-      final y15 = yieldController.maybeYield();
-      if (y15 != null) await y15;
-      final pk = r[primaryKey]?.toString();
-      if (pk == null || pk.isEmpty) continue;
-      baseRecords[pk] = r;
-    }
-
-    // Optimization: Calculate target count for early break
-    final int targetCollectCount = (limit != null) ? limit : -1;
-    // Track how many items we pulled from buffer (for reverse optimization logic)
-    int addedFromBufferCount = 0;
-
-    // Determine optimization strategy
-    bool performEarlyBreak = false;
-    if (limit != null && limit > 0) {
-      performEarlyBreak = true;
-    }
-
-    bool hasReachedTarget() {
-      if (!performEarlyBreak) return false;
-      // If doing a reverse scan (for DESC sort), we treat buffer as "newer/better".
-      // We must not stop until we have collected 'limit' items FROM THE BUFFER
-      // (or buffer runs out), ignoring how many "old" disk items we have.
-      if (reverse) {
-        return addedFromBufferCount >= targetCollectCount;
-      }
-      return baseRecords.length >= targetCollectCount;
-    }
-
-    // Helper: Apply buffer entry if it's a NEW INSERT (Phase 2)
-    void applyBufferInsert(String pk, BufferEntry be) {
-      // If we already handled it as update, skip
-      if (baseRecords.containsKey(pk)) return;
-
-      if (be.operation != BufferOperationType.delete &&
-          (matcher == null || matcher.matches(be.data))) {
-        // It's a new record that matches.
-        // Check valid limit
-        if (!performEarlyBreak || !hasReachedTarget()) {
-          baseRecords[pk] = be.data;
-          addedFromBufferCount++;
-        }
-      }
-    }
-
-    // Share txn deferred maps by reference (oldValues live on TxnDeferredOp).
-    // See [_visibleTxnRecord].
-    if (!onlyMergeTransaction) {
-      // --- PHASE 1: Efficient Update/Delete (Lookup from Disk Results) ---
-      // Instead of scanning the whole buffer for updates, we scan the specific records we retrieved.
-      // This is O(disk_records), avoiding O(buffer_size) scan for this part.
-
-      // We iterate a snapshot of initial keys because baseRecords might change.
-      final initialKeys = baseRecords.keys.toList(growable: false);
-      for (final pk in initialKeys) {
-        final be = _dataStore.writeBufferManager.getBufferedRecordForRead(
-          tableContext,
-          pk,
-        );
-        if (be != null) {
-          if (be.operation == BufferOperationType.delete) {
-            baseRecords.remove(pk);
-          } else {
-            baseRecords[pk] = be.data;
-          }
-        }
-      }
-
-      // handle insert buffer
-      Iterable<String> keys;
-      if (explicitInsertKeys != null) {
-        keys = explicitInsertKeys;
-      } else {
-        final candidates =
-            _dataStore.migrationManager?.getRuntimeReadTableCandidates(table) ??
-                const <String>[];
-        if (candidates.isEmpty) {
-          keys = _dataStore.writeBufferManager
-              .getBufferedInsertKeys(tableContext, reverse: reverse);
-        } else {
-          final allInsertKeys = <String>[];
-          allInsertKeys.addAll(_dataStore.writeBufferManager
-              .getBufferedInsertKeys(tableContext, reverse: reverse));
-          keys = allInsertKeys;
-        }
-      }
-
-      for (final key in keys) {
-        final y16 = yieldController.maybeYield();
-        if (y16 != null) await y16;
-        if (performEarlyBreak && hasReachedTarget()) break;
-
-        if (keyPredicate != null && !keyPredicate(key)) continue;
-
-        final entry = _dataStore.writeBufferManager.getBufferedRecordForRead(
-          tableContext,
-          key,
-        );
-        if (entry == null) continue;
-
-        final rec = entry.data;
-        if (filter != null && !filter(rec)) continue;
-
-        applyBufferInsert(key, entry);
-      }
-    }
-
-    // 2.3 Transaction Deferred Ops (if any)
-    if (currentTxId != null) {
-      final defOps = _txnDeferredOps[currentTxId]?[table.tableUid];
-      if (defOps != null && defOps.isNotEmpty) {
-        // Phase 3.1: Efficient Update/Delete (Lookup from baseRecords)
-        if (baseRecords.isNotEmpty) {
-          final snapshotKeys = baseRecords.keys.toList(growable: false);
-          for (final pk in snapshotKeys) {
-            final op = defOps[pk];
-            if (op != null) {
-              if (op.type == BufferOperationType.delete) {
-                baseRecords.remove(pk);
-              } else {
-                baseRecords[pk] = _visibleTxnRecord(op.data);
-              }
-            }
-          }
-        }
-
-        // Phase 3.2: Collect New Inserts (Scan defOps)
-        // We only need to scan for inserts if we haven't reached the target count.
-        // This is a major optimization: if limit is met, we skip the O(M) scan entirely.
-        if (!performEarlyBreak || !hasReachedTarget()) {
-          // If explicit tx keys provided (optimized stream path), use them.
-          // Otherwise iterate all deferred ops (heavy path).
-          if (explicitTxInsertKeys != null) {
-            for (final pk in explicitTxInsertKeys) {
-              final y17 = yieldController.maybeYield();
-              if (y17 != null) await y17;
-              if (performEarlyBreak && hasReachedTarget()) break;
-
-              final op = defOps[pk];
-              if (op == null) continue;
-
-              if (baseRecords.containsKey(pk)) continue;
-
-              if (op.type != BufferOperationType.delete) {
-                final visible = _visibleTxnRecord(op.data);
-                if (matcher == null || matcher.matches(visible)) {
-                  baseRecords[pk] = visible;
-                }
-              }
-            }
-          } else {
-            // Iterate values (Iterable) is cheaper than converting to list
-            for (final op in defOps.values) {
-              final y18 = yieldController.maybeYield();
-              if (y18 != null) await y18;
-              // Check limit again strictly inside loop
-              if (performEarlyBreak && hasReachedTarget()) break;
-
-              final pk = op.data[primaryKey]?.toString();
-              if (pk == null) continue;
-
-              // If already in baseRecords, it was handled in Phase 3.1
-              if (baseRecords.containsKey(pk)) continue;
-
-              // New insert logic
-              if (op.type != BufferOperationType.delete) {
-                final visible = _visibleTxnRecord(op.data);
-                if (matcher == null || matcher.matches(visible)) {
-                  baseRecords[pk] = visible;
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-
-    if (currentTxId != null) {
-      // 3.2 Deferred heavy delete conditions
-      try {
-        final plans = _dataStore.transactionManager
-                ?.getDeferredHeavyDeletes(currentTxId) ??
-            const <HeavyDeletePlan>[];
-        if (plans.isNotEmpty) {
-          for (final plan in plans) {
-            if (plan.tableUid != tableContext.tableUid) continue;
-            final qc = QueryCondition.fromMap(plan.condition);
-            final hdMatcher = ConditionRecordMatcher.prepare(
-                qc, {table.tableUid: schema}, table.tableUid);
-
-            final snapshotList = baseRecords.entries.toList(growable: false);
-            for (final entry in snapshotList) {
-              final y19 = yieldController.maybeYield();
-              if (y19 != null) await y19;
-              if (hdMatcher.matches(entry.value)) {
-                baseRecords.remove(entry.key);
-              }
-            }
-          }
-        }
-      } catch (_) {}
-
-      // 3.3 Deferred heavy updates
-      try {
-        final plans = _dataStore.transactionManager
-                ?.getDeferredHeavyUpdates(currentTxId) ??
-            const <HeavyUpdatePlan>[];
-        if (plans.isNotEmpty) {
-          for (final plan in plans) {
-            if (plan.tableUid != tableContext.tableUid) continue;
-            // We need to apply updates to all matching records in baseRecords
-            final qc = QueryCondition.fromMap(plan.condition);
-            final hmMatcher = ConditionRecordMatcher.prepare(
-                qc, {table.tableUid: schema}, table.tableUid);
-
-            // Iterate keys first to avoid concurrent modification of baseRecords during update
-
-            for (final k in baseRecords.keys) {
-              final y20 = yieldController.maybeYield();
-              if (y20 != null) await y20;
-              if (hmMatcher.matches(baseRecords[k]!)) {
-                baseRecords[k] = Map<String, dynamic>.from(baseRecords[k]!);
-                baseRecords[k]!.addAll(plan.updateData);
-              }
-            }
-          }
-        }
-      } catch (_) {}
-    }
-
-    // 4. Apply query matcher and (optionally) register read-set keys (SSI only)
-    if (matcher == null && !trackReadKeys) {
-      return baseRecords.values.toList();
-    }
-
-    final results = <Map<String, dynamic>>[];
-    // Snapshot values to avoid concurrent modification if yielding
-    final recordValues = baseRecords.values.toList(growable: false);
-    if (matcher != null && !trackReadKeys && recordValues.length > 1000) {
-      final matchResult = await ConditionBatchMatcher.matchRecordIndices(
-        schema: schema,
-        table: tableContext,
-        condition: matcher.condition.build(),
-        records: recordValues,
-        estimateRecordBytes: resolveRecordSizeBytes,
-      );
-      for (final matchedIndex in matchResult.matchedIndices) {
-        final y21 = yieldController.maybeYield();
-        if (y21 != null) await y21;
-        results.add(recordValues[matchedIndex]);
-      }
-      return results;
-    }
-
-    for (final r in recordValues) {
-      final y22 = yieldController.maybeYield();
-      if (y22 != null) await y22;
-      if (matcher != null && !matcher.matches(r)) continue;
-      results.add(r);
-      if (trackReadKeys) {
-        final k = r[primaryKey]?.toString();
-        if (k != null && k.isNotEmpty) {
-          TransactionContext.registerReadKey(table.tableUid, k);
-        }
-      }
-    }
-    return results;
-  }
-
   /// Removes a record from any of the in-memory buffers.
   void removeRecordFromBuffer(TableContext table, String recordId) {
     _dataStore.writeBufferManager.removeRecord(table, recordId);
@@ -3699,11 +3322,10 @@ class TableDataManager {
 
   /// Removes all data and metadata for a table from the manager.
   Future<void> removeTable(TableContext table) async {
-    // Clean up all in-memory buffers and caches
-    // legacy buffers removed
+    await clearTableRecordsForTable(table);
 
     // Clear WAL-driven table-level write buffer and queue to prevent subsequent writes
-    _dataStore.writeBufferManager.clearTableByUid(table.tableUid);
+    await _dataStore.writeBufferManager.clearTableByUid(table.tableUid);
 
     // Clean up other caches
     _tableDataMetaCache.remove(table.tableUid);
@@ -3727,14 +3349,15 @@ class TableDataManager {
       required Set<String> Function() getActiveTxIds}) async {
     try {
       final active = getActiveTxIds();
-      // Build union of txIds from both maps, then remove active ones; single pass removals
       final inactive = <String>{
-        ..._txnDeferredOps.keys,
+        ..._txnIdsWithOps,
+        ..._txnResourceEstimates.keys,
       }..removeWhere((tx) => active.contains(tx));
 
       for (final tx in inactive) {
-        _txnDeferredOps.remove(tx);
+        _txnIdsWithOps.remove(tx);
         _txnResourceEstimates.remove(tx);
+        _dataStore.writeBufferManager.clearTransactionBuffers(tx);
       }
     } catch (e) {
       Logger.warn('cleanupTransactionalState failed', rawError: e);
@@ -3743,32 +3366,366 @@ class TableDataManager {
 
   /// Remove specific transaction state (called by rollback/cleanup)
   Future<void> clearTransactionState(String transactionId) async {
-    _txnDeferredOps.remove(transactionId);
+    _txnIdsWithOps.remove(transactionId);
     _txnResourceEstimates.remove(transactionId);
-    // Also clear from WriteBufferManager unique key tracking
-    await _dataStore.writeBufferManager
-        .removeTransactionUniqueKeys(transactionId);
+    _dataStore.writeBufferManager.clearTransactionBuffers(transactionId);
   }
 
   /// Check if there are deferred ops for a transaction
   bool hasDeferredOps(String transactionId) {
-    return _txnDeferredOps.containsKey(transactionId);
+    return _txnIdsWithOps.contains(transactionId);
   }
 
-  /// Get deferred ops for transaction (internal/recovery use only)
+  /// Get deferred ops for transaction (internal/recovery use only).
   ///
-  /// Returns an Iterable view to avoid expensive list copying.
-  /// Caller must process immediately or aware that underlying map must not change.
-  Map<String, Iterable<TxnDeferredOp>>? getDeferredOps(String transactionId) {
-    final ops = _txnDeferredOps[transactionId];
-    if (ops == null) return null;
-    // Return defensive copy of the map structure, but use Iterable for values
-    // to avoid O(N) list allocation.
-    final result = <String, Iterable<TxnDeferredOp>>{};
-    ops.forEach((tableName, pkMap) {
-      result[tableName] = pkMap.values;
-    });
+  /// Keys are tableUid strings; values are BufferEntry lists from txn TreeCaches.
+  Future<Map<String, List<BufferEntry>>?> getDeferredOps(
+      String transactionId) async {
+    if (!_txnIdsWithOps.contains(transactionId)) return null;
+    final collected = await _dataStore.writeBufferManager.bufferTrees
+        .collectTxnOps(transactionId);
+    if (collected.isEmpty) return null;
+    final result = <String, List<BufferEntry>>{};
+    for (final entry in collected.entries) {
+      result[entry.key] = entry.value.values.toList(growable: false);
+    }
     return result;
+  }
+
+  /// Merge pending + current-txn TreeCache overlays into [base] query results.
+  ///
+  /// Visibility: txn > pending > file. Deletes hide lower layers.
+  ///
+  /// When [pkOrdered] and [limit] are set (normal PK pagination), this uses
+  /// TreeCache [scanRange] with early-stop -- O(limit) not O(pending size).
+  Future<List<Map<String, dynamic>>> mergeBufferAndTxnConsistency(
+    TableContext table,
+    List<Map<String, dynamic>> base, {
+    bool Function(Map<String, dynamic>)? matcher,
+    bool Function(Map<String, dynamic>)? filter,
+    int? limit,
+    bool reverse = false,
+    bool pkOrdered = true,
+    dynamic afterPrimaryKey,
+  }) async {
+    if (pkOrdered && limit != null && limit > 0) {
+      return _mergePkOrderedPage(
+        table,
+        base,
+        matcher: matcher,
+        filter: filter,
+        limit: limit,
+        reverse: reverse,
+        afterPrimaryKey: afterPrimaryKey,
+      );
+    }
+
+    // Non-PK / unbounded: point-overlay the base page only (O(|base|)).
+    // Do NOT full-scan pending trees -- that destroys latency at scale.
+    return _pointOverlayBaseRows(
+      table,
+      base,
+      matcher: matcher,
+      filter: filter,
+      limit: limit,
+      reverse: reverse,
+    );
+  }
+
+  /// PK-ordered page merge: point-overlay [base] + ranged pending/txn scans.
+  ///
+  /// Uses TreeCache [scanRange] seek (`startPk`) + early-stop -- never full-walks
+  /// the pending tree for a limit=N page.
+  Future<List<Map<String, dynamic>>> _mergePkOrderedPage(
+    TableContext table,
+    List<Map<String, dynamic>> base, {
+    bool Function(Map<String, dynamic>)? matcher,
+    bool Function(Map<String, dynamic>)? filter,
+    required int limit,
+    required bool reverse,
+    dynamic afterPrimaryKey,
+  }) async {
+    final schema = table.schema;
+    final pkName = schema.primaryKey;
+    final pkMatcher =
+        ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
+    final trees = _dataStore.writeBufferManager.bufferTrees;
+    final txId = TransactionContext.getCurrentTransactionId();
+    final applyingCommit = TransactionContext.isApplyingCommit();
+    final useTxn =
+        txId != null && !applyingCommit && _txnIdsWithOps.contains(txId);
+
+    bool acceptPredicates(Map<String, dynamic> row) {
+      if (matcher != null && !matcher(row)) return false;
+      // Cursor is applied via scan seek ([afterPrimaryKey]), not by filtering
+      // from the tree head -- that was the O(n) regression.
+      if (filter != null && !filter(row)) return false;
+      return true;
+    }
+
+    // 1) Point-overlay base rows (O(|base|) gets).
+    final baseRows = <Map<String, dynamic>>[];
+    for (final row in base) {
+      final pk = row[pkName]?.toString();
+      if (pk == null || pk.isEmpty) continue;
+
+      Map<String, dynamic>? visible;
+      if (useTxn) {
+        final tx = trees.getTxnRecord(txId, table.tableUid, pk);
+        if (tx != null) {
+          if (tx.operation == BufferOperationType.delete ||
+              isDeletedRecord(tx.data)) {
+            continue;
+          }
+          visible = _visibleTxnRecord(tx.data);
+        }
+      }
+      if (visible == null) {
+        final pending = trees.getPendingRecord(table.tableUid, pk);
+        if (pending != null) {
+          if (pending.operation == BufferOperationType.delete ||
+              isDeletedRecord(pending.data)) {
+            continue;
+          }
+          visible = pending.data;
+        } else {
+          visible = row;
+        }
+      }
+      if (!acceptPredicates(visible)) continue;
+      final pkVal = visible[pkName];
+      if (afterPrimaryKey != null && pkVal != null) {
+        final c = pkMatcher(pkVal, afterPrimaryKey);
+        if (reverse ? c >= 0 : c <= 0) continue;
+      }
+      baseRows.add(visible);
+    }
+
+    if (baseRows.length > 1) {
+      baseRows.sort((a, b) {
+        final c = pkMatcher(a[pkName], b[pkName]);
+        return reverse ? -c : c;
+      });
+    }
+
+    // 2) Ranged scan: seek to cursor, early-stop after [limit] visible rows.
+    //    ASC: startPk=cursor (LowerBound), end=null
+    //    DESC: startPk=null, endPk=cursor (LastLE) -- never walk from group max.
+    Future<List<Map<String, dynamic>>> scanBufferSource({
+      required Future<void> Function({
+        dynamic startPk,
+        dynamic endPk,
+        bool reverse,
+        int? limit,
+        required bool Function(String pk, BufferEntry entry) onEntry,
+      }) forEach,
+    }) async {
+      final out = <Map<String, dynamic>>[];
+      var skipCursorKey = afterPrimaryKey != null;
+      // Oversample slightly so deletes/tombstones skipped mid-scan still fill
+      // the page; hard stop is still onEntry returning false.
+      final scanCap = limit * 4 + 8;
+      await forEach(
+        startPk: reverse ? null : afterPrimaryKey,
+        endPk: reverse ? afterPrimaryKey : null,
+        reverse: reverse,
+        limit: scanCap,
+        onEntry: (pk, entry) {
+          if (skipCursorKey) {
+            final c = pkMatcher(entry.data[pkName] ?? pk, afterPrimaryKey);
+            if (c == 0) {
+              skipCursorKey = false;
+              return true;
+            }
+            skipCursorKey = false;
+          }
+          if (entry.operation == BufferOperationType.delete ||
+              isDeletedRecord(entry.data)) {
+            return true;
+          }
+          final row = _visibleTxnRecord(entry.data);
+          if (!acceptPredicates(row)) return true;
+          out.add(row);
+          return out.length < limit;
+        },
+      );
+      return out;
+    }
+
+    final pendingRows = await scanBufferSource(
+      forEach: ({startPk, endPk, reverse = false, limit, required onEntry}) {
+        return trees.forEachPendingRecord(
+          table,
+          startPk: startPk,
+          endPk: endPk,
+          reverse: reverse,
+          limit: limit,
+          onEntry: onEntry,
+        );
+      },
+    );
+
+    List<Map<String, dynamic>> txnRows = const [];
+    if (useTxn) {
+      txnRows = await scanBufferSource(
+        forEach: ({startPk, endPk, reverse = false, limit, required onEntry}) {
+          return trees.forEachTxnRecord(
+            txId,
+            table,
+            startPk: startPk,
+            endPk: endPk,
+            reverse: reverse,
+            limit: limit,
+            onEntry: onEntry,
+          );
+        },
+      );
+    }
+
+    // Fast path: no file base and single buffer source.
+    if (baseRows.isEmpty && txnRows.isEmpty) {
+      if (pendingRows.length > limit) {
+        return pendingRows.sublist(0, limit);
+      }
+      return pendingRows;
+    }
+    if (baseRows.isEmpty && pendingRows.isEmpty) {
+      if (txnRows.length > limit) return txnRows.sublist(0, limit);
+      return txnRows;
+    }
+
+    // 3) K-way merge by PK (txn > pending > base on equal key).
+    return _kWayMergeByPk(
+      sources: [txnRows, pendingRows, baseRows],
+      pkName: pkName,
+      pkMatcher: pkMatcher,
+      reverse: reverse,
+      limit: limit,
+    );
+  }
+
+  List<Map<String, dynamic>> _kWayMergeByPk({
+    required List<List<Map<String, dynamic>>> sources,
+    required String pkName,
+    required MatcherFunction pkMatcher,
+    required bool reverse,
+    required int limit,
+  }) {
+    final idxs = List<int>.filled(sources.length, 0);
+    final out = <Map<String, dynamic>>[];
+    final seen = <String>{};
+
+    while (out.length < limit) {
+      int bestSrc = -1;
+      dynamic bestPk;
+      for (int s = 0; s < sources.length; s++) {
+        final list = sources[s];
+        var i = idxs[s];
+        // Skip exhausted / already-emitted keys in this source.
+        while (i < list.length) {
+          final pk = list[i][pkName]?.toString();
+          if (pk == null || seen.contains(pk)) {
+            i++;
+            idxs[s] = i;
+            continue;
+          }
+          break;
+        }
+        idxs[s] = i;
+        if (i >= list.length) continue;
+        final pkVal = list[i][pkName];
+        if (bestSrc < 0) {
+          bestSrc = s;
+          bestPk = pkVal;
+          continue;
+        }
+        final c = pkMatcher(pkVal, bestPk);
+        final better = reverse ? c > 0 : c < 0;
+        // On equal PK, lower source index wins (txn=0 > pending=1 > base=2).
+        if (better || (c == 0 && s < bestSrc)) {
+          bestSrc = s;
+          bestPk = pkVal;
+        }
+      }
+      if (bestSrc < 0) break;
+      final row = sources[bestSrc][idxs[bestSrc]];
+      final pk = row[pkName]?.toString();
+      if (pk != null) seen.add(pk);
+      idxs[bestSrc]++;
+      // Advance other sources past the same PK (dedupe).
+      for (int s = 0; s < sources.length; s++) {
+        if (s == bestSrc) continue;
+        final list = sources[s];
+        var i = idxs[s];
+        if (i < list.length && list[i][pkName]?.toString() == pk) {
+          idxs[s] = i + 1;
+        }
+      }
+      out.add(row);
+    }
+    return out;
+  }
+
+  /// Point-get overlay for each base row only -- O(|base|).
+  Future<List<Map<String, dynamic>>> _pointOverlayBaseRows(
+    TableContext table,
+    List<Map<String, dynamic>> base, {
+    bool Function(Map<String, dynamic>)? matcher,
+    bool Function(Map<String, dynamic>)? filter,
+    int? limit,
+    bool reverse = false,
+  }) async {
+    final schema = table.schema;
+    final pkName = schema.primaryKey;
+    final trees = _dataStore.writeBufferManager.bufferTrees;
+    final txId = TransactionContext.getCurrentTransactionId();
+    final applyingCommit = TransactionContext.isApplyingCommit();
+    final useTxn =
+        txId != null && !applyingCommit && _txnIdsWithOps.contains(txId);
+    final pkMatcher =
+        ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
+
+    final out = <Map<String, dynamic>>[];
+    for (final row in base) {
+      final pk = row[pkName]?.toString();
+      if (pk == null || pk.isEmpty) continue;
+
+      Map<String, dynamic>? visible;
+      if (useTxn) {
+        final tx = trees.getTxnRecord(txId, table.tableUid, pk);
+        if (tx != null) {
+          if (tx.operation == BufferOperationType.delete ||
+              isDeletedRecord(tx.data)) {
+            continue;
+          }
+          visible = _visibleTxnRecord(tx.data);
+        }
+      }
+      if (visible == null) {
+        final pending = trees.getPendingRecord(table.tableUid, pk);
+        if (pending != null) {
+          if (pending.operation == BufferOperationType.delete ||
+              isDeletedRecord(pending.data)) {
+            continue;
+          }
+          visible = pending.data;
+        } else {
+          visible = row;
+        }
+      }
+      if (matcher != null && !matcher(visible)) continue;
+      if (filter != null && !filter(visible)) continue;
+      out.add(visible);
+      if (limit != null && out.length >= limit) break;
+    }
+
+    if (reverse && out.length > 1) {
+      out.sort((a, b) {
+        final c = pkMatcher(a[pkName], b[pkName]);
+        return -c;
+      });
+    }
+    return out;
   }
 
   /// Reject a transaction only when memory pressure makes its retained data
@@ -3978,39 +3935,76 @@ class TableDataManager {
     if (keys.isEmpty) return TableScanResult(records: []);
 
     final schema = decodeSchema ?? table.schema;
+    final pkName = schema.primaryKey;
 
     final results = <Map<String, dynamic>>[];
     final missingKeys = <dynamic>[];
     final uniqueKeys = keys.toSet().toList();
 
-    // 1. Try Cache
+    // 0. Pending/txn TreeCache point lookup (txn > pending). Resolved PKs --
+    // including deletes -- must not fall through to stale cache/disk rows.
     if (!readFromFileOnly) {
+      final trees = _dataStore.writeBufferManager.bufferTrees;
+      final txId = TransactionContext.getCurrentTransactionId();
+      final useTxn = txId != null &&
+          !TransactionContext.isApplyingCommit() &&
+          _txnIdsWithOps.contains(txId);
+
       for (final key in uniqueKeys) {
         final pk = key.toString();
-        final cached = _tableRecordCache.get([table.tableUid, pk]);
-        if (cached != null) {
-          results.add(cached);
-        } else {
-          missingKeys.add(key);
+        BufferEntry? entry;
+        var fromTxn = false;
+        if (useTxn) {
+          final tx = trees.getTxnRecord(txId, table.tableUid, pk);
+          if (tx != null) {
+            entry = tx;
+            fromTxn = true;
+          }
         }
+        entry ??=
+            _dataStore.writeBufferManager.getBufferedRecordForRead(table, pk);
+        if (entry != null) {
+          if (entry.operation != BufferOperationType.delete &&
+              !isDeletedRecord(entry.data)) {
+            results.add(fromTxn ? _visibleTxnRecord(entry.data) : entry.data);
+          }
+          continue;
+        }
+        missingKeys.add(key);
       }
     } else {
       missingKeys.addAll(uniqueKeys);
     }
 
+    // 1. Try Cache
+    final stillMissing = <dynamic>[];
+    if (!readFromFileOnly) {
+      for (final key in missingKeys) {
+        final pk = key.toString();
+        final cached = _tableRecordCache.get([table.tableUid, pk]);
+        if (cached != null) {
+          results.add(cached);
+        } else {
+          stillMissing.add(key);
+        }
+      }
+    } else {
+      stillMissing.addAll(missingKeys);
+    }
+
     // 2. Try Disk
-    if (missingKeys.isNotEmpty) {
+    if (stillMissing.isNotEmpty) {
       final pkMatcher =
           ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
       if (_dataStore.tableTreePartitionManager == null) {
-        return TableScanResult(records: []);
+        return TableScanResult(records: results);
       }
       final diskResults =
           await _dataStore.tableTreePartitionManager?.queryRecordsBatch(
         table: table,
-        primaryKey: schema.primaryKey,
+        primaryKey: pkName,
         keyComparator: pkMatcher,
-        keys: missingKeys,
+        keys: stillMissing,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
         schemaOverride: schema,
@@ -4018,7 +4012,7 @@ class TableDataManager {
         readFromFileOnly: readFromFileOnly,
       );
       if (diskResults == null) {
-        return TableScanResult(records: []);
+        return TableScanResult(records: results);
       }
 
       // Read-Through: Cache the results fetched from disk (Asynchronously)
@@ -4060,83 +4054,35 @@ class TableDataManager {
   }) async {
     final isMemoryMode =
         _dataStore.config.persistenceMode == PersistenceMode.memory;
+    final trees = _dataStore.writeBufferManager.bufferTrees;
+    final txId = TransactionContext.getCurrentTransactionId();
+    final applyingCommit = TransactionContext.isApplyingCommit();
+    final useTxn = !readFromFileOnly &&
+        txId != null &&
+        !applyingCommit &&
+        _txnIdsWithOps.contains(txId);
+    final hasPending = !readFromFileOnly &&
+        _dataStore.writeBufferManager.hasPendingWritesForUid(table.tableUid);
+    final needBufferFuse = hasPending || useTxn;
 
-    if (!isMemoryMode) {
-      await _dataStore.tableTreePartitionManager
-          ?.forEachRecordByPrimaryKeyRange(
-        table: table,
-        startKeyInclusive: startKeyInclusive,
-        endKeyExclusive: endKeyExclusive,
-        reverse: reverse,
-        limit: limit,
-        recordPredicate: recordPredicate,
-        onRecord: (r) => onRecord(r),
-        decodeRecord: decodeRecord,
-        decodeSchema: decodeSchema,
-        decodeFieldStructureOverride: decodeFieldStructureOverride,
-        readFromFileOnly: readFromFileOnly,
-      );
-      return;
-    }
-
-    _registerTableComparator(table, schema);
-
-    int yielded = 0;
-    final int? hardLimit = limit;
     final String? cursor =
         cursorPk != null && cursorPk.isNotEmpty ? cursorPk : null;
 
     dynamic lowBoundPk = rangeMin;
     dynamic highBoundPk = rangeMax;
-
     if (cursor != null) {
       if (!reverse) {
-        // ASC: start from max(rangeMin, cursor) after
         if (lowBoundPk == null) {
           lowBoundPk = cursor;
         } else if (pkMatcher(lowBoundPk, cursor) < 0) {
           lowBoundPk = cursor;
         }
       } else {
-        // DESC: start from min(rangeMax, cursor) before
         if (highBoundPk == null) {
           highBoundPk = cursor;
         } else if (pkMatcher(highBoundPk, cursor) > 0) {
           highBoundPk = cursor;
         }
-      }
-    }
-
-    // Calculate the physical start and end keys for TreeCache, only used to limit the B+Tree scan range
-    late final List<dynamic> startKeyPath;
-    List<dynamic>? endKeyPath;
-
-    if (!reverse) {
-      // ASC: start from lowBoundPk (if any) until highBoundPk (if any)
-      if (lowBoundPk != null) {
-        startKeyPath = [table.tableUid, lowBoundPk];
-      } else {
-        startKeyPath = [table.tableUid];
-      }
-
-      if (highBoundPk != null) {
-        endKeyPath = [table.tableUid, highBoundPk];
-      } else {
-        endKeyPath = null;
-      }
-    } else {
-      // DESC: start from rangeMin (if any, otherwise tableName prefix)
-      // end at highBoundPk (the smaller value of rangeMax/cursor)
-      if (lowBoundPk != null) {
-        startKeyPath = [table.tableUid, lowBoundPk];
-      } else {
-        startKeyPath = [table.tableUid];
-      }
-
-      if (highBoundPk != null) {
-        endKeyPath = [table.tableUid, highBoundPk];
-      } else {
-        endKeyPath = null;
       }
     }
 
@@ -4160,34 +4106,328 @@ class TableDataManager {
       return true;
     }
 
-    await _tableRecordCache.scanRange(
-      startKeyPath,
-      endKeyPath,
-      reverse: reverse,
-      limit: null,
-      onEntry: (path, value) {
-        final rec = value;
-        if (isDeletedRecord(rec)) return true;
+    Map<String, dynamic>? resolveOverlay(Map<String, dynamic> row) {
+      final pk = row[primaryKey]?.toString();
+      if (pk == null || pk.isEmpty) return null;
+      if (useTxn) {
+        final tx = trees.getTxnRecord(txId, table.tableUid, pk);
+        if (tx != null) {
+          if (tx.operation == BufferOperationType.delete ||
+              isDeletedRecord(tx.data)) {
+            return null;
+          }
+          return _visibleTxnRecord(tx.data);
+        }
+      }
+      if (hasPending) {
+        final pending = trees.getPendingRecord(table.tableUid, pk);
+        if (pending != null) {
+          if (pending.operation == BufferOperationType.delete ||
+              isDeletedRecord(pending.data)) {
+            return null;
+          }
+          return pending.data;
+        }
+      }
+      if (isDeletedRecord(row)) return null;
+      return row;
+    }
 
-        final dynamic pkNative = rec[primaryKey];
-        if (pkNative == null) return true;
+    Future<void> forEachBase({
+      required bool Function(Map<String, dynamic>) onBase,
+      int? baseLimit,
+      required bool fileOnly,
+    }) async {
+      if (!isMemoryMode) {
+        await _dataStore.tableTreePartitionManager
+            ?.forEachRecordByPrimaryKeyRange(
+          table: table,
+          startKeyInclusive: startKeyInclusive,
+          endKeyExclusive: endKeyExclusive,
+          reverse: reverse,
+          limit: baseLimit,
+          recordPredicate: recordPredicate,
+          onRecord: onBase,
+          decodeRecord: decodeRecord,
+          decodeSchema: decodeSchema,
+          decodeFieldStructureOverride: decodeFieldStructureOverride,
+          readFromFileOnly: fileOnly,
+        );
+        return;
+      }
 
-        if (!checkRange(pkNative)) return true;
-        if (!recordPredicate(rec)) return true;
+      _registerTableComparator(table, schema);
+      late final List<dynamic> startKeyPath;
+      List<dynamic>? endKeyPath;
+      if (lowBoundPk != null) {
+        startKeyPath = [table.tableUid, lowBoundPk];
+      } else {
+        startKeyPath = [table.tableUid];
+      }
+      if (highBoundPk != null) {
+        endKeyPath = [table.tableUid, highBoundPk];
+      } else {
+        endKeyPath = null;
+      }
 
-        if (!onRecord(rec)) {
-          return false;
+      var yielded = 0;
+      await _tableRecordCache.scanRange(
+        startKeyPath,
+        endKeyPath,
+        reverse: reverse,
+        limit: null,
+        onEntry: (path, value) {
+          final rec = value;
+          if (isDeletedRecord(rec)) return true;
+          final dynamic pkNative = rec[primaryKey];
+          if (pkNative == null) return true;
+          if (!checkRange(pkNative)) return true;
+          if (!recordPredicate(rec)) return true;
+          if (!onBase(rec)) return false;
+          if (baseLimit != null) {
+            yielded++;
+            if (yielded >= baseLimit) return false;
+          }
+          return true;
+        },
+      );
+    }
+
+    // File/memory only -- no pending/txn fusion.
+    if (!needBufferFuse) {
+      await forEachBase(
+        onBase: onRecord,
+        baseLimit: limit,
+        fileOnly: readFromFileOnly,
+      );
+      return;
+    }
+
+    // Limited PK page: same seek+scanCap fuse as [_mergePkOrderedPage].
+    // Never preload the whole pending group (that was the 600--1000ms PK path).
+    if (limit != null && limit > 0) {
+      final scanCap = limit * 4 + 8;
+      final base = <Map<String, dynamic>>[];
+      await forEachBase(
+        onBase: (r) {
+          base.add(r);
+          return base.length < scanCap;
+        },
+        baseLimit: scanCap,
+        fileOnly: true,
+      );
+      final merged = await _mergePkOrderedPage(
+        table,
+        base,
+        matcher: (row) {
+          final pkNative = row[primaryKey];
+          if (pkNative == null || !checkRange(pkNative)) return false;
+          return recordPredicate(row);
+        },
+        limit: limit,
+        reverse: reverse,
+        afterPrimaryKey: cursor,
+      );
+      for (final r in merged) {
+        if (!onRecord(r)) break;
+      }
+      return;
+    }
+
+    // Unbounded scan: range-seek pending/txn (not whole table group), then
+    // stream-merge with file. Stop buffer walk once past the far range bound.
+    Future<List<Map<String, dynamic>>> scanBufferSource({
+      required Future<void> Function({
+        dynamic startPk,
+        dynamic endPk,
+        bool reverse,
+        int? limit,
+        required bool Function(String pk, BufferEntry entry) onEntry,
+      }) forEach,
+    }) async {
+      final out = <Map<String, dynamic>>[];
+      var skipCursorKey = cursor != null;
+      await forEach(
+        startPk: reverse ? null : lowBoundPk,
+        endPk: reverse ? highBoundPk : highBoundPk,
+        reverse: reverse,
+        limit: null,
+        onEntry: (pk, entry) {
+          if (skipCursorKey) {
+            final c = pkMatcher(entry.data[primaryKey] ?? pk, cursor);
+            if (c == 0) {
+              skipCursorKey = false;
+              return true;
+            }
+            skipCursorKey = false;
+          }
+          if (entry.operation == BufferOperationType.delete ||
+              isDeletedRecord(entry.data)) {
+            return true;
+          }
+          final row = _visibleTxnRecord(entry.data);
+          final pkNative = row[primaryKey];
+          if (pkNative == null) return true;
+          if (!checkRange(pkNative)) {
+            if (reverse &&
+                rangeMin != null &&
+                pkMatcher(pkNative, rangeMin) < 0) {
+              return false;
+            }
+            if (!reverse &&
+                rangeMax != null &&
+                pkMatcher(pkNative, rangeMax) > 0) {
+              return false;
+            }
+            return true;
+          }
+          if (!recordPredicate(row)) return true;
+          out.add(row);
+          return true;
+        },
+      );
+      return out;
+    }
+
+    final pendingRows = hasPending
+        ? await scanBufferSource(
+            forEach: (
+                {startPk, endPk, reverse = false, limit, required onEntry}) {
+              return trees.forEachPendingRecord(
+                table,
+                startPk: startPk,
+                endPk: endPk,
+                reverse: reverse,
+                limit: limit,
+                onEntry: onEntry,
+              );
+            },
+          )
+        : const <Map<String, dynamic>>[];
+
+    final txnRows = useTxn
+        ? await scanBufferSource(
+            forEach: (
+                {startPk, endPk, reverse = false, limit, required onEntry}) {
+              return trees.forEachTxnRecord(
+                txId,
+                table,
+                startPk: startPk,
+                endPk: endPk,
+                reverse: reverse,
+                limit: limit,
+                onEntry: onEntry,
+              );
+            },
+          )
+        : const <Map<String, dynamic>>[];
+
+    if (pendingRows.isEmpty && txnRows.isEmpty) {
+      await forEachBase(
+        onBase: (r) {
+          final visible = resolveOverlay(r);
+          if (visible == null) return true;
+          return onRecord(visible);
+        },
+        baseLimit: limit,
+        fileOnly: true,
+      );
+      return;
+    }
+
+    var ti = 0;
+    var pi = 0;
+    final seen = <String>{};
+    var continueScan = true;
+
+    bool emit(Map<String, dynamic> row) {
+      final pk = row[primaryKey]?.toString();
+      if (pk == null || pk.isEmpty || !seen.add(pk)) return true;
+      return onRecord(row);
+    }
+
+    bool flushBuffersBefore(dynamic filePk) {
+      while (continueScan) {
+        final t = ti < txnRows.length ? txnRows[ti] : null;
+        final p = pi < pendingRows.length ? pendingRows[pi] : null;
+        if (t == null && p == null) return true;
+
+        Map<String, dynamic>? best;
+        var bestSrc = -1;
+        if (t != null) {
+          best = t;
+          bestSrc = 0;
+        }
+        if (p != null) {
+          if (best == null) {
+            best = p;
+            bestSrc = 1;
+          } else {
+            final c = pkMatcher(p[primaryKey], best[primaryKey]);
+            final better = reverse ? c > 0 : c < 0;
+            if (better) {
+              best = p;
+              bestSrc = 1;
+            }
+          }
         }
 
-        if (hardLimit != null) {
-          yielded++;
-          if (yielded >= hardLimit) {
-            return false;
+        if (filePk != null) {
+          final c = pkMatcher(best![primaryKey], filePk);
+          final isBefore = reverse ? c > 0 : c < 0;
+          if (!isBefore) {
+            if (c == 0) {
+              if (bestSrc == 0) {
+                ti++;
+              } else {
+                pi++;
+              }
+              if (!emit(best)) {
+                continueScan = false;
+                return false;
+              }
+              continue;
+            }
+            return true;
           }
+        }
+
+        if (bestSrc == 0) {
+          ti++;
+        } else {
+          pi++;
+        }
+        if (!emit(best!)) {
+          continueScan = false;
+          return false;
+        }
+      }
+      return false;
+    }
+
+    await forEachBase(
+      onBase: (r) {
+        if (!continueScan) return false;
+        final pkVal = r[primaryKey];
+        if (pkVal == null) return true;
+        if (!flushBuffersBefore(pkVal)) return false;
+        final pkStr = pkVal.toString();
+        if (seen.contains(pkStr)) return true;
+        final visible = resolveOverlay(r);
+        if (visible == null) return true;
+        if (!emit(visible)) {
+          continueScan = false;
+          return false;
         }
         return true;
       },
+      baseLimit: null,
+      fileOnly: true,
     );
+
+    if (continueScan) {
+      flushBuffersBefore(null);
+    }
   }
 
   Future<List<Map<String, dynamic>>> _scanRecordsByPrimaryKeyRangeLogical({
@@ -4210,29 +4450,6 @@ class TableDataManager {
     List<FieldStructure>? decodeFieldStructureOverride,
     bool readFromFileOnly = false,
   }) async {
-    final rangeMgr = _dataStore.tableTreePartitionManager;
-    if (rangeMgr == null) {
-      return [];
-    }
-    final isMemoryMode =
-        _dataStore.config.persistenceMode == PersistenceMode.memory;
-
-    if (!isMemoryMode) {
-      return rangeMgr.scanRecordsByPrimaryKeyRange(
-        table: table,
-        startKeyInclusive: startKeyInclusive,
-        endKeyExclusive: endKeyExclusive,
-        reverse: reverse,
-        limit: limit,
-        recordPredicate: recordPredicate,
-        decodeSchema: decodeSchema,
-        decodeFieldStructureOverride: decodeFieldStructureOverride,
-        readFromFileOnly: readFromFileOnly,
-      );
-    }
-
-    _registerTableComparator(table, schema);
-
     final out = <Map<String, dynamic>>[];
     await _forEachRecordByPrimaryKeyRangeLogical(
       table: table,
@@ -4462,11 +4679,19 @@ class TableDataManager {
     TableDataMeta? fileMeta;
     if (!isMemoryMode) {
       fileMeta = await getTableDataMeta(table.tableUid);
+      // Do NOT early-return on empty disk: pending/txn TreeCaches may still
+      // hold visible inserts that must be merged into the scan result.
       if (fileMeta == null || fileMeta.totalRecordCount <= 0) {
-        return TableScanResult(
-          records: const [],
-          count: onlyCount ? 0 : null,
-        );
+        final hasPending = _dataStore.writeBufferManager
+            .hasPendingWritesForUid(table.tableUid);
+        final txId = TransactionContext.getCurrentTransactionId();
+        final hasTxn = txId != null && _txnIdsWithOps.contains(txId);
+        if (!hasPending && !hasTxn) {
+          return TableScanResult(
+            records: const [],
+            count: onlyCount ? 0 : null,
+          );
+        }
       }
     }
 
@@ -4984,7 +5209,7 @@ bool isDeletedRecord(Map<String, dynamic> record) {
 
 /// Visible view of a transactional deferred record.
 ///
-/// [TxnDeferredOp.oldValues] is stored separately; [data] is shared by
+/// [BufferEntry.oldValues] is stored separately; [data] is shared by
 /// reference (same contract as buffer reads). Only copy when a legacy
 /// embedded `_oldValues` key is present.
 Map<String, dynamic> _visibleTxnRecord(Map<String, dynamic> src) {
@@ -5003,17 +5228,6 @@ class TxSnapshot {
     required this.updates,
     required this.deletes,
   });
-}
-
-/// Deferred operation structure for transactions
-class TxnDeferredOp {
-  final BufferOperationType type;
-  final Map<String, dynamic> data;
-  final List<UniqueKeyRef>? uniqueKeyRefs;
-  final Map<String, dynamic>? oldValues;
-
-  const TxnDeferredOp(this.type, this.data,
-      {this.uniqueKeyRefs, this.oldValues});
 }
 
 class _TransactionResourceEstimate {

@@ -10,14 +10,14 @@ import '../model/result_type.dart';
 //
 // PQ divides a D-dimensional vector into M sub-vectors of D/M dimensions each.
 // Each sub-vector is independently quantised to K centroids (K=256, 1 byte).
-// This gives 32× compression (float32→uint8) while enabling fast Asymmetric
+// This gives 32x compression (float32->uint8) while enabling fast Asymmetric
 // Distance Computation (ADC) during search.
 // ============================================================================
 
-/// Trained PQ codebook: M sub-spaces × K centroids × (D/M) dimensions.
+/// Trained PQ codebook: M sub-spaces x K centroids x (D/M) dimensions.
 ///
 /// Layout: centroids[m * K * subDim + k * subDim + d] = float32
-/// where m ∈ [0,M), k ∈ [0,K), d ∈ [0,subDim).
+/// where m in [0,M), k in [0,K), d in [0,subDim).
 class PqCodebook {
   /// Number of sub-spaces (M).
   final int subspaces;
@@ -28,7 +28,7 @@ class PqCodebook {
   /// Dimensions per sub-space (D / M).
   final int subDimensions;
 
-  /// Flat centroid data: M × K × subDim float32 values.
+  /// Flat centroid data: M x K x subDim float32 values.
   final Float32List data;
 
   PqCodebook({
@@ -38,7 +38,7 @@ class PqCodebook {
     required this.data,
   });
 
-  /// Total vector dimensions: M × subDim.
+  /// Total vector dimensions: M x subDim.
   int get dimensions => subspaces * subDimensions;
 
   /// Get centroid vector for sub-space [m], centroid [k].
@@ -65,11 +65,11 @@ class VectorQuantizer {
   int get subDimensions => codebook.subDimensions;
   int get centroids => codebook.centroids;
 
-  /// Total vector dimensions: M × subDim.
+  /// Total vector dimensions: M x subDim.
   int get dimensions => codebook.dimensions;
 
   // =====================================================================
-  // Training — K-means per sub-space
+  // Training -- K-means per sub-space
   // =====================================================================
 
   /// Train a PQ codebook from sample vectors.
@@ -77,11 +77,11 @@ class VectorQuantizer {
   /// Runs K-means independently on each sub-space. Should be executed in an
   /// isolate for large sample sets via [ComputeManager].
   ///
-  /// [samples]    — training vectors (each must be [dimensions]-dimensional).
-  /// [dimensions] — total vector dimensions D.
-  /// [subspaces]  — number of sub-spaces M. Must evenly divide D.
-  /// [numCentroids] — centroids per sub-space K (default 256).
-  /// [iterations] — K-means iterations (default 20).
+  /// [samples]    -- training vectors (each must be [dimensions]-dimensional).
+  /// [dimensions] -- total vector dimensions D.
+  /// [subspaces]  -- number of sub-spaces M. Must evenly divide D.
+  /// [numCentroids] -- centroids per sub-space K (default 256).
+  /// [iterations] -- K-means iterations (default 20).
   static Future<PqCodebook> train({
     required List<Float32List> samples,
     required int dimensions,
@@ -368,7 +368,7 @@ class VectorQuantizer {
   }
 
   // =====================================================================
-  // Encoding — Vector → PQ Code
+  // Encoding -- Vector -> PQ Code
   // =====================================================================
 
   /// Encode a single vector to its PQ code (M bytes).
@@ -398,8 +398,8 @@ class VectorQuantizer {
 
   /// Pre-compute the distance lookup table for a query vector.
   ///
-  /// Returns a float32 table of shape [M × K] where
-  /// table[m * K + k] = L2²(query_sub_m, centroid[m][k]).
+  /// Returns a float32 table of shape [M x K] where
+  /// table[m * K + k] = L2^2(query_sub_m, centroid[m][k]).
   ///
   /// This is computed ONCE per query, then reused for all candidate comparisons.
   Float32List buildDistanceTable(Float32List query) {
@@ -424,9 +424,9 @@ class VectorQuantizer {
     return table;
   }
 
-  /// Compute approximate L2² distance using pre-computed distance table.
+  /// Compute approximate L2^2 distance using pre-computed distance table.
   ///
-  /// This is the hot inner loop during beam search — must be as fast as possible.
+  /// This is the hot inner loop during beam search -- must be as fast as possible.
   /// Cost: M additions + M table lookups. Uses incremental offset to eliminate
   /// the per-subspace multiplication (`m * centroids`).
   double adcDistance(Float32List distTable, Uint8List pqCode) {
@@ -471,7 +471,7 @@ class VectorQuantizer {
   /// Assumes vectors are pre-normalised; falls back to L2 distance which
   /// is monotonically equivalent to cosine for unit vectors.
   Float32List buildDistanceTableCosine(Float32List query) {
-    // For normalised vectors: L2² = 2 - 2·cos(θ), so ranking is equivalent.
+    // For normalised vectors: L2^2 = 2 - 2*cos(theta), so ranking is equivalent.
     return buildDistanceTable(query);
   }
 

@@ -62,7 +62,6 @@ import 'compute/batch_update_compute.dart';
 import 'compute/compute_batch_planner.dart';
 import 'compute/kv_batch_prepare_compute.dart';
 import 'compute/record_compute.dart';
-import 'compute/unique_ref_compute.dart';
 import 'compute_manager.dart';
 import 'cpu_work_chunk.dart';
 import 'crontab_manager.dart';
@@ -792,17 +791,6 @@ class DataStoreImpl {
           Future(() async => await transactionManager!.initialize()),
         ]);
       } else {
-        // In memory mode, register full TableMeta so getTableSchema/getTableMeta
-        // see the same source of truth (not schema-only TreeCache).
-        if (isMemoryMode && tableMetaManager != null) {
-          for (final s in SystemTable.gettableSchemas) {
-            await tableMetaManager!.registerTableSchemaInMemory(s);
-          }
-          for (final s in _userSchemas) {
-            await tableMetaManager!.registerTableSchemaInMemory(s);
-          }
-          tableMetaManager!.markNameInventoryReady();
-        }
         await Future.wait([
           _resourceManager!.initialize(_config!, this),
           Future(() async => await transactionManager!.initialize()),
@@ -852,6 +840,19 @@ class DataStoreImpl {
         ...SystemTable.gettableSchemas,
         ..._userSchemas,
       ]);
+
+      // Memory mode: register TableMeta only after managers above exist.
+      // registerTableSchemaInMemory -> saveTableMeta may call getTableMeta,
+      // which must not touch a null queryExecutor.
+      if (isMemoryMode && tableMetaManager != null) {
+        for (final s in SystemTable.gettableSchemas) {
+          await tableMetaManager!.registerTableSchemaInMemory(s);
+        }
+        for (final s in _userSchemas) {
+          await tableMetaManager!.registerTableSchemaInMemory(s);
+        }
+        tableMetaManager!.markNameInventoryReady();
+      }
 
       // Mark all operations from this point as system operations during initialization
       // This allows internal operations (like updating system tables, resuming pending ops)
@@ -1197,10 +1198,7 @@ class DataStoreImpl {
 
           // Flush and stop write pipelines
           try {
-            if (persistChanges) {
-              await parallelJournalManager.flushCompletely();
-            }
-            await parallelJournalManager.drainAndStop();
+            await parallelJournalManager.stop(flush: persistChanges);
           } catch (e) {
             Logger.warn('Stop journal manager failed', rawError: e);
           }
@@ -1736,9 +1734,6 @@ class DataStoreImpl {
         ));
       }
 
-      // 2. Plan unique locks + refs once; acquire locks then reuse refs for buffer
-      final planIns = planUniqueForInsert(table, schema, validData);
-
       final recordId = validData[schema.primaryKey].toString();
 
       // Check and record conflicts for running large background operations
@@ -1752,10 +1747,11 @@ class DataStoreImpl {
 
       // 3. Reservation based: try reserve unique keys first to lock the buffer
       try {
-        writeBufferManager.tryReserveUniqueKeys(
+        writeBufferManager.tryReserveUniques(
           table: table,
+          schema: schema,
           recordId: recordId,
-          uniqueKeys: planIns.refs,
+          data: validData,
           transactionId: txId,
         );
       } catch (e) {
@@ -1803,7 +1799,7 @@ class DataStoreImpl {
         } catch (e) {
           // Rollback reservation on FK failure
           try {
-            writeBufferManager.releaseReservedUniqueKeys(
+            writeBufferManager.releaseReservedUniques(
               table: table,
               recordId: recordId,
               transactionId: txId,
@@ -1840,7 +1836,7 @@ class DataStoreImpl {
           if (!retryOnPkConflict) {
             // Rollback reservation before retrying
             try {
-              writeBufferManager.releaseReservedUniqueKeys(
+              writeBufferManager.releaseReservedUniques(
                 table: table,
                 recordId: recordId,
                 transactionId: txId,
@@ -1855,7 +1851,7 @@ class DataStoreImpl {
 
         // Rollback reservation on disk conflict
         try {
-          writeBufferManager.releaseReservedUniqueKeys(
+          writeBufferManager.releaseReservedUniques(
             table: table,
             recordId: recordId,
             transactionId: txId,
@@ -1880,13 +1876,11 @@ class DataStoreImpl {
         orderedValidData[field.name] = validData[field.name];
       }
 
-      // 7. Add to write queue (insert operation) using planned refs (no extra parsing)
-      final uniqueRefs = planIns.refs;
+      // 7. Add to write queue (insert operation)
       await tableDataManager.addToBuffer(
         table,
         orderedValidData,
         BufferOperationType.insert,
-        uniqueKeyRefs: uniqueRefs,
         transactionId: txId,
         schemaVersion: table.schema.schemaVersion ?? '',
       );
@@ -1912,6 +1906,21 @@ class DataStoreImpl {
       ));
     } catch (e) {
       Logger.error('Insert failed', rawError: e);
+
+      try {
+        // Roll back unique pre-reserve if apply never committed them.
+        if (table != null && validData != null) {
+          final schema = table.schema;
+          final rid = validData[schema.primaryKey]?.toString();
+          if (rid != null && rid.isNotEmpty) {
+            writeBufferManager.releaseReservedUniques(
+              table: table,
+              recordId: rid,
+              transactionId: txId,
+            );
+          }
+        }
+      } catch (_) {}
 
       try {
         // Clear cache
@@ -2179,30 +2188,6 @@ class DataStoreImpl {
     return merged;
   }
 
-  List<UniqueKeyRef> _materializeUniqueKeyRefs(
-    List<PlannedUniqueKeyRef> plannedRefs,
-  ) {
-    if (plannedRefs.isEmpty) {
-      return const <UniqueKeyRef>[];
-    }
-    return List<UniqueKeyRef>.generate(
-      plannedRefs.length,
-      (index) => UniqueKeyRef(
-        plannedRefs[index].indexUid,
-        plannedRefs[index].compositeKey,
-      ),
-      growable: false,
-    );
-  }
-
-  bool _preparedInsertUniqueRefsStillMatch(
-    BatchInsertPreparedRecord preparedRecord,
-    Map<String, dynamic> validData,
-    String primaryKey,
-  ) {
-    return preparedRecord.preparedPrimaryKeyValue == validData[primaryKey];
-  }
-
   int _estimateKeyValueBatchItemBytes(KeyValueBatchItem item) {
     final keyBytes = max(1, calculateUtf8Length(item.key));
     final valueBytes = max(1, calculateUtf8Length(toStringWithAll(item.value)));
@@ -2340,48 +2325,6 @@ class DataStoreImpl {
       applyPromoteResultTransform: true,
     );
     return result.records;
-  }
-
-  UniquePlan planUniqueForInsert(
-      TableContext table, TableSchema schema, Map<String, dynamic> data,
-      {List<IndexSchema>? uniqueIndexes}) {
-    final refs = <UniqueKeyRef>[];
-    final pk = schema.primaryKey;
-    final pkVal = data[pk];
-    if (pkVal != null) {
-      // Primary key uniqueness is enforced via table range partitions (no pk index).
-      refs.add(UniqueKeyRef(IndexUid('pk'), pkVal.toString()));
-    }
-
-    final allIndexes = uniqueIndexes ??
-        tableMetaManager?.getUniqueIndexesFor(schema) ??
-        <IndexSchema>[];
-    for (final idx in allIndexes) {
-      // use actualIndexName which handles both explicit and implicit names
-      final canKey = schema.createCanonicalIndexKey(idx.fields, data);
-      if (canKey != null) {
-        refs.add(UniqueKeyRef(idx.indexUid, canKey));
-      }
-    }
-    return UniquePlan(refs);
-  }
-
-  UniquePlan planUniqueForUpdate(TableContext table, TableSchema schema,
-      Map<String, dynamic> updatedRecord, Set<String> changedFields) {
-    final refs = <UniqueKeyRef>[];
-    final allIndexes =
-        tableMetaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
-    for (final idx in allIndexes) {
-      // Check if any field in the unique index is changed
-      if (idx.fields.any((f) => changedFields.contains(f))) {
-        final canKey =
-            schema.createCanonicalIndexKey(idx.fields, updatedRecord);
-        if (canKey != null) {
-          refs.add(UniqueKeyRef(idx.indexUid, canKey));
-        }
-      }
-    }
-    return UniquePlan(refs);
   }
 
   /// Upsert one record: update-first by pk or unique key, then insert if not found.
@@ -2967,22 +2910,19 @@ class DataStoreImpl {
 
           bool ok = true;
           UniqueViolation? uniqueViolation;
-          UniquePlan? planUpd;
-          List<UniqueKeyRef>? oldUniqueKeys;
+          List<List<dynamic>>? oldUniqueKeys;
 
           if (fieldsToCheck.isNotEmpty) {
-            // Plan unique + refs for update
-            planUpd = planUniqueForUpdate(
-                table, schema, updatedRecord, changedFields);
-
             // 1. Try reserve unique keys first to lock the buffer
             try {
-              oldUniqueKeys = writeBufferManager.tryReserveUniqueKeys(
+              oldUniqueKeys = writeBufferManager.tryReserveUniques(
                 table: table,
+                schema: schema,
                 recordId: recordKey,
-                uniqueKeys: planUpd.refs,
+                data: updatedRecord,
                 transactionId: txId,
                 isUpdate: true,
+                changedFields: changedFields,
               );
             } catch (e) {
               if (e is UniqueViolation) {
@@ -3013,11 +2953,11 @@ class DataStoreImpl {
               } catch (e) {
                 // Rollback reservation on FK failure
                 try {
-                  writeBufferManager.releaseReservedUniqueKeys(
+                  writeBufferManager.releaseReservedUniques(
                     table: table,
                     recordId: recordKey,
                     transactionId: txId,
-                    restoreKeys: oldUniqueKeys,
+                    rollbackKeys: oldUniqueKeys,
                   );
                 } catch (_) {}
 
@@ -3058,11 +2998,11 @@ class DataStoreImpl {
             if (!ok) {
               // Rollback reservation on disk conflict
               try {
-                writeBufferManager.releaseReservedUniqueKeys(
+                writeBufferManager.releaseReservedUniques(
                   table: table,
                   recordId: recordKey,
                   transactionId: txId,
-                  restoreKeys: oldUniqueKeys,
+                  rollbackKeys: oldUniqueKeys,
                 );
               } catch (_) {}
             }
@@ -3092,11 +3032,11 @@ class DataStoreImpl {
               final opId = GlobalIdGenerator.generate('update_row_');
               final ok = await lockMgr.acquireExclusiveLock(res, opId);
               if (!ok) {
-                writeBufferManager.releaseReservedUniqueKeys(
+                writeBufferManager.releaseReservedUniques(
                   table: table,
                   recordId: recordKey,
                   transactionId: txId,
-                  restoreKeys: oldUniqueKeys,
+                  rollbackKeys: oldUniqueKeys,
                 );
                 if (continueOnPartialErrors) {
                   // release unique locks before continuing
@@ -3116,7 +3056,23 @@ class DataStoreImpl {
               if (txId != null) {
                 TransactionContext.registerExclusiveLock(res, opId);
               }
-            } catch (_) {}
+            } catch (_) {
+              // Lock threw after reserve: must not leave unique slots behind.
+              writeBufferManager.releaseReservedUniques(
+                table: table,
+                recordId: recordKey,
+                transactionId: txId,
+                rollbackKeys: oldUniqueKeys,
+              );
+              if (continueOnPartialErrors) {
+                if (returnResultDetails) {
+                  failedKeys.add(recordKey);
+                }
+                failedCount++;
+                continue;
+              }
+              rethrow;
+            }
           }
 
           // Register write-set for SSI conflict detection
@@ -3124,8 +3080,7 @@ class DataStoreImpl {
             transactionManager?.registerWriteKey(txId, table, recordKey);
           }
 
-          // update write queue using planned refs
-          final uniqueRefsUpd = planUpd?.refs ?? const <UniqueKeyRef>[];
+          // update write queue
           final Set<String> indexFields = <String>{primaryKey};
           final bool pkChanged = isPrimaryKeyUpdate &&
               record[primaryKey] != null &&
@@ -3156,15 +3111,24 @@ class DataStoreImpl {
               oldValues[k] = record[k];
             }
           }
-          await tableDataManager.addToBuffer(
-            table,
-            updatedRecord,
-            BufferOperationType.update,
-            uniqueKeyRefs: uniqueRefsUpd,
-            oldValues: oldValues.isEmpty ? null : oldValues,
-            transactionId: txId,
-            schemaVersion: table.schema.schemaVersion ?? '',
-          );
+          try {
+            await tableDataManager.addToBuffer(
+              table,
+              updatedRecord,
+              BufferOperationType.update,
+              oldValues: oldValues.isEmpty ? null : oldValues,
+              transactionId: txId,
+              schemaVersion: table.schema.schemaVersion ?? '',
+            );
+          } catch (e) {
+            writeBufferManager.releaseReservedUniques(
+              table: table,
+              recordId: recordKey,
+              transactionId: txId,
+              rollbackKeys: oldUniqueKeys,
+            );
+            rethrow;
+          }
 
           if (hasNotify) {
             notificationManager.notify(ChangeEvent(
@@ -3341,16 +3305,9 @@ class DataStoreImpl {
         keyMigrationPaused =
             await migrationManager?.reconcileOnClear(table) ?? false;
 
-        // clear application layer cache
-        // NOTE: clear() removes table data but keeps schema. Do not invalidate schema cache here,
-        // especially in memory mode where schema may be in-memory only.
+        // NOTE: clear() removes table data but keeps schema (esp. memory mode).
         await cacheManager.invalidateCache(table, invalidateSchema: false);
-
-        //  clear partition file deletion, auto-increment ID reset, and related cache cleanup
         await tableDataManager.clearTable(table);
-
-        // Wipe `{table}/index/` root (data clear does not touch it). Writes
-        // recreate index meta/files on demand - no empty IndexMeta pre-create.
         await _indexManager?.clearIndexesForTable(table);
 
         final promoteDesc = _promoteRuntimeForDualWrite(
@@ -4151,8 +4108,8 @@ class DataStoreImpl {
           keyMigrationPaused =
               await migrationManager?.reconcileOnDrop(table) ?? false;
 
-          // Clear table cache and other memory caches
-          await _invalidateTableCaches(table);
+          // Clear table memory caches and table-manager state (not disk wipe).
+          await cacheManager.invalidateCache(table, removeTableState: true);
 
           // Deleting a table requires updating statistics
           await tableDataManager.tableDeleted(table);
@@ -4327,9 +4284,12 @@ class DataStoreImpl {
     final String? txId = Zone.current[_txnZoneKey] as String?;
 
     TableSchema? schema;
+    TableContext? tableForRelease;
+    final Set<String> reservedNotBuffered = <String>{};
     try {
       // 1. Get table schema and validate data
       final table = await getTableContext(tableName);
+      tableForRelease = table;
       schema = table.schema;
       if (schema.name.isEmpty) {
         Logger.error('Table $tableName does not exist');
@@ -4507,15 +4467,6 @@ class DataStoreImpl {
             autoPkRecords,
           );
 
-          // Pre-materialize unique refs once for the whole chunk so the reserve
-          // loop does not allocate UniqueKeyRef per record on the happy path.
-          final preparedUniqueRefs = List<List<UniqueKeyRef>>.generate(
-            preparedRecords.length,
-            (i) =>
-                _materializeUniqueKeyRefs(preparedRecords[i].plannedUniqueRefs),
-            growable: false,
-          );
-
           final yieldController = YieldController(
             'DataStoreImpl.batchInsert.loop',
             minCheckInterval: EngineCpuChunk.hotPathMinCheckInterval,
@@ -4523,11 +4474,10 @@ class DataStoreImpl {
 
           // Optimization: Create batch context to hoist table/buffer lookups out of the record loop
           final batchContext =
-              writeBufferManager.createBatchCheckContext(table, txId);
+              writeBufferManager.createBatchReserveContext(table, txId);
 
           // Collect valid records for a single bulk enqueue into WAL + buffer + cache.
           final batchRecordsForBuffer = <Map<String, dynamic>>[];
-          final batchUniqueRefsForBuffer = <List<UniqueKeyRef>>[];
           final batchOriginalById = <String, Map<String, dynamic>>{};
 
           Future<bool> flushBatch() async {
@@ -4587,7 +4537,6 @@ class DataStoreImpl {
 
                 if (vios.isNotEmpty) {
                   final keepRecords = <Map<String, dynamic>>[];
-                  final keepRefs = <List<UniqueKeyRef>>[];
                   final keepOriginalById = <String, Map<String, dynamic>>{};
                   final filterYield = YieldController(
                     'DataStore.batchInsert.flush.filter',
@@ -4599,12 +4548,10 @@ class DataStoreImpl {
                     if (y7 != null) await y7;
                     final vio = vios[i];
                     final rec = batchRecordsForBuffer[i];
-                    final refs = batchUniqueRefsForBuffer[i];
                     final rid = rec[primaryKey]?.toString() ?? '';
 
                     if (vio == null) {
                       keepRecords.add(rec);
-                      keepRefs.add(refs);
                       if (rid.isNotEmpty) {
                         keepOriginalById[rid] = batchOriginalById[rid] ?? rec;
                       }
@@ -4614,12 +4561,13 @@ class DataStoreImpl {
                     // Conflict with committed data: drop this record.
                     if (rid.isNotEmpty) {
                       try {
-                        writeBufferManager.releaseReservedUniqueKeys(
+                        writeBufferManager.releaseReservedUniques(
                           table: table,
                           recordId: rid,
                           transactionId: txId,
                         );
                       } catch (_) {}
+                      reservedNotBuffered.remove(rid);
 
                       final orig = batchOriginalById[rid];
                       if (orig != null) {
@@ -4654,9 +4602,6 @@ class DataStoreImpl {
                   batchRecordsForBuffer
                     ..clear()
                     ..addAll(keepRecords);
-                  batchUniqueRefsForBuffer
-                    ..clear()
-                    ..addAll(keepRefs);
                   batchOriginalById
                     ..clear()
                     ..addAll(keepOriginalById);
@@ -4675,12 +4620,13 @@ class DataStoreImpl {
                   final rid = rec[primaryKey]?.toString() ?? '';
                   if (rid.isEmpty) continue;
                   try {
-                    writeBufferManager.releaseReservedUniqueKeys(
+                    writeBufferManager.releaseReservedUniques(
                       table: table,
                       recordId: rid,
                       transactionId: txId,
                     );
                   } catch (_) {}
+                  reservedNotBuffered.remove(rid);
                   final orig = batchOriginalById[rid];
                   if (orig != null) invalidRecords.add(orig);
                   if (returnResultDetails) {
@@ -4689,7 +4635,6 @@ class DataStoreImpl {
                   failedCount++;
                 }
                 batchRecordsForBuffer.clear();
-                batchUniqueRefsForBuffer.clear();
                 batchOriginalById.clear();
               }
             }
@@ -4703,12 +4648,14 @@ class DataStoreImpl {
               records: batchRecordsForBuffer,
               operation: BufferOperationType.insert,
               schema: tableSchema,
-              uniqueKeyRefsList: batchUniqueRefsForBuffer,
               transactionId: txId,
               schemaVersion: tableSchema.schemaVersion ?? '',
             );
 
             if (bufferResult.successRecordIds.isNotEmpty) {
+              for (final id in bufferResult.successRecordIds) {
+                reservedNotBuffered.remove(id);
+              }
               successCount += bufferResult.successRecordIds.length;
 
               final hasNotify =
@@ -4746,12 +4693,13 @@ class DataStoreImpl {
               hadFailures = true;
               for (final failedId in bufferResult.failedRecordIds) {
                 try {
-                  writeBufferManager.releaseReservedUniqueKeys(
+                  writeBufferManager.releaseReservedUniques(
                     table: table,
                     recordId: failedId,
                     transactionId: txId,
                   );
                 } catch (_) {}
+                reservedNotBuffered.remove(failedId);
                 final orig = batchOriginalById[failedId];
                 if (orig != null) invalidRecords.add(orig);
                 if (failedId.isNotEmpty) {
@@ -4764,7 +4712,6 @@ class DataStoreImpl {
             }
 
             batchRecordsForBuffer.clear();
-            batchUniqueRefsForBuffer.clear();
             batchOriginalById.clear();
 
             return hadFailures;
@@ -4896,28 +4843,16 @@ class DataStoreImpl {
                   }
                 }
 
-                // Plan unique locks + refs for atomic check+reserve
-                final List<UniqueKeyRef> uniqueRefs;
-                if (!triedPkConflictRetry &&
-                    _preparedInsertUniqueRefsStillMatch(
-                      preparedRecord,
-                      validData,
-                      primaryKey,
-                    )) {
-                  uniqueRefs = preparedUniqueRefs[offset];
-                } else {
-                  uniqueRefs = planUniqueForInsert(
-                    table,
-                    tableSchema,
-                    validData,
-                    uniqueIndexes: uniqueIndexesForTable,
-                  ).refs;
-                }
-
-                // Reservation based: try reserve unique keys first
+                // Reservation based: try reserve unique keys first (schema+data)
                 final recordId = validData[primaryKey].toString();
                 try {
-                  batchContext.tryReserve(recordId, uniqueRefs);
+                  batchContext.tryReserve(
+                    recordId,
+                    validData,
+                    isUpdate: false,
+                    schema: tableSchema,
+                  );
+                  reservedNotBuffered.add(recordId);
                 } catch (e) {
                   if (e is UniqueViolation) {
                     final bool isPkConflict = e.indexName == 'pk';
@@ -5014,7 +4949,6 @@ class DataStoreImpl {
 
                 try {
                   batchRecordsForBuffer.add(validData);
-                  batchUniqueRefsForBuffer.add(uniqueRefs);
                   batchOriginalById[recordId] = record;
 
                   // Flush is deferred to the end of the prepare window
@@ -5024,7 +4958,7 @@ class DataStoreImpl {
                 } catch (e) {
                   // Release reservation on unexpected error
                   try {
-                    writeBufferManager.releaseReservedUniqueKeys(
+                    writeBufferManager.releaseReservedUniques(
                       table: table,
                       recordId: recordId,
                       transactionId: txId,
@@ -5191,6 +5125,19 @@ class DataStoreImpl {
         failedCount: dbEx.statuses.length,
         failedKeys: returnResultDetails ? failedKeys : const [],
       ));
+    } finally {
+      // Early returns (!allowPartialErrors) skip catch -- still release orphans.
+      // Successes already committed bookkeeping -> release is a no-op for them.
+      if (tableForRelease != null && reservedNotBuffered.isNotEmpty) {
+        try {
+          await writeBufferManager.releaseReservedUniquesForPks(
+            table: tableForRelease,
+            recordIds: reservedNotBuffered,
+            transactionId: txId,
+          );
+        } catch (_) {}
+        reservedNotBuffered.clear();
+      }
     }
   }
 
@@ -5560,6 +5507,8 @@ class DataStoreImpl {
     int successCount = 0;
     int failedCount = 0;
     final batchStatuses = <ResultStatus>[];
+    // Reserved but not yet successfully buffered released on abort.
+    final Set<String> outstandingReservedPks = <String>{};
 
     // 1. Identification & Resolution Phase
     // Pre-process records to ensure every record has a primary key.
@@ -5747,15 +5696,14 @@ class DataStoreImpl {
 
         // 6. Optimization: Create batch context to hoist table/buffer lookups
         final batchContext =
-            writeBufferManager.createBatchCheckContext(table, txId);
+            writeBufferManager.createBatchReserveContext(table, txId);
 
         // 7. Pipeline Stage 1: Batch Merge and Validate
         final List<Map<String, dynamic>> candidateMergedRecords = [];
         final List<String> candidatePkVals = [];
         final List<Map<String, dynamic>> candidateOldRecords = [];
         final Map<String, Set<String>> candidateChangedFieldsMap = {};
-        final List<List<UniqueKeyRef>> candidateReservationRefs = [];
-        final List<List<UniqueKeyRef>> candidateCurrentUniqueRefs = [];
+        final List<bool> candidateNeedsReserve = [];
         final preparedRecords = await _prepareBatchUpdateRecords(
           schema,
           table,
@@ -5877,12 +5825,10 @@ class DataStoreImpl {
           candidatePkVals.add(pkVal);
           candidateOldRecords.add(existingRecord);
           candidateChangedFieldsMap[pkVal] = changedFields.toSet();
-          candidateReservationRefs.add(
-            _materializeUniqueKeyRefs(preparedRecord.reservationUniqueRefs),
-          );
-          candidateCurrentUniqueRefs.add(
-            _materializeUniqueKeyRefs(preparedRecord.currentUniqueRefs),
-          );
+          // Planned refs only indicate whether unique indexes are affected;
+          // actual reserve uses schema+data (no UniqueKeyRef materialization).
+          candidateNeedsReserve
+              .add(preparedRecord.reservationUniqueRefs.isNotEmpty);
         }
 
         if (candidateMergedRecords.isEmpty) continue;
@@ -5893,19 +5839,25 @@ class DataStoreImpl {
         final List<String> readyPkVals = [];
         final List<Map<String, dynamic>> readyOldRecords = [];
         final Map<String, Set<String>> readyChangedFieldsMap = {};
-        final Map<String, List<UniqueKeyRef>> reservedRefsMap = {};
-        final List<List<UniqueKeyRef>> readyCurrentUniqueRefs = [];
+        final Set<String> reservedPkSet = {};
 
         for (int j = 0; j < candidateMergedRecords.length; j++) {
           final pkVal = candidatePkVals[j];
           final updatedRecord = candidateMergedRecords[j];
           final changedFields = candidateChangedFieldsMap[pkVal]!;
-          final refsToReserve = candidateReservationRefs[j];
+          final needsReserve = candidateNeedsReserve[j];
 
-          if (refsToReserve.isNotEmpty) {
+          if (needsReserve) {
             try {
-              batchContext.tryReserve(pkVal, refsToReserve);
-              reservedRefsMap[pkVal] = refsToReserve;
+              batchContext.tryReserve(
+                pkVal,
+                updatedRecord,
+                isUpdate: true,
+                changedFields: changedFields,
+                schema: schema,
+              );
+              reservedPkSet.add(pkVal);
+              outstandingReservedPks.add(pkVal);
             } catch (e) {
               if (returnResultDetails) {
                 failedKeys.add(pkVal);
@@ -5935,15 +5887,12 @@ class DataStoreImpl {
               }
               if (!allowPartialErrors) {
                 // Rollback all reservations in this sub-batch before returning
-                for (final rPk in reservedRefsMap.keys) {
-                  try {
-                    writeBufferManager.releaseReservedUniqueKeys(
-                      table: table,
-                      recordId: rPk,
-                      transactionId: txId,
-                    );
-                  } catch (_) {}
-                }
+                await writeBufferManager.releaseReservedUniquesForPks(
+                  table: table,
+                  recordIds: reservedPkSet,
+                  transactionId: txId,
+                );
+                outstandingReservedPks.removeAll(reservedPkSet);
                 return finishWithPromoteMirror(DbResult.error(
                   type: violationType,
                   message: violationMessage,
@@ -5959,7 +5908,6 @@ class DataStoreImpl {
           readyPkVals.add(pkVal);
           readyOldRecords.add(candidateOldRecords[j]);
           readyChangedFieldsMap[pkVal] = changedFields;
-          readyCurrentUniqueRefs.add(candidateCurrentUniqueRefs[j]);
         }
 
         if (readyForDiskCheck.isEmpty) continue;
@@ -5979,7 +5927,6 @@ class DataStoreImpl {
         // 10. Pipeline Stage 4: Validation and Commit
         final List<Map<String, dynamic>> recordsToCommit = [];
         final List<Map<String, dynamic>> oldRecordsToCommit = [];
-        final List<List<UniqueKeyRef>> batchUniqueKeyRefs = [];
         final List<String> commitPkVals = [];
 
         for (int j = 0; j < readyForDiskCheck.length; j++) {
@@ -6007,27 +5954,23 @@ class DataStoreImpl {
               ));
             }
             // Rollback reservation for this specific record on disk conflict
-            if (reservedRefsMap.containsKey(pkVal)) {
-              try {
-                writeBufferManager.releaseReservedUniqueKeys(
-                  table: table,
-                  recordId: pkVal,
-                  transactionId: txId,
-                );
-              } catch (_) {}
+            if (reservedPkSet.contains(pkVal)) {
+              writeBufferManager.releaseReservedUniques(
+                table: table,
+                recordId: pkVal,
+                transactionId: txId,
+              );
+              outstandingReservedPks.remove(pkVal);
             }
 
             if (!allowPartialErrors) {
               // Rollback all other reservations in this sub-batch
-              for (final rPk in reservedRefsMap.keys) {
-                try {
-                  writeBufferManager.releaseReservedUniqueKeys(
-                    table: table,
-                    recordId: rPk,
-                    transactionId: txId,
-                  );
-                } catch (_) {}
-              }
+              await writeBufferManager.releaseReservedUniquesForPks(
+                table: table,
+                recordIds: reservedPkSet,
+                transactionId: txId,
+              );
+              outstandingReservedPks.removeAll(reservedPkSet);
               return finishWithPromoteMirror(DbResult.error(
                 type: violation.constraintResultType,
                 message: violation.message,
@@ -6040,7 +5983,6 @@ class DataStoreImpl {
 
           final updatedRecord = readyForDiskCheck[j];
           final existingRecord = readyOldRecords[j];
-          final currentUniqueRefs = readyCurrentUniqueRefs[j];
 
           // 10.1: Foreign Key Checks
           if (_foreignKeyManager != null) {
@@ -6072,26 +6014,22 @@ class DataStoreImpl {
                   ));
                 }
               }
-              if (reservedRefsMap.containsKey(pkVal)) {
-                try {
-                  writeBufferManager.releaseReservedUniqueKeys(
-                    table: table,
-                    recordId: pkVal,
-                    transactionId: txId,
-                  );
-                } catch (_) {}
+              if (reservedPkSet.contains(pkVal)) {
+                writeBufferManager.releaseReservedUniques(
+                  table: table,
+                  recordId: pkVal,
+                  transactionId: txId,
+                );
+                outstandingReservedPks.remove(pkVal);
               }
               if (!allowPartialErrors) {
                 // Rollback all reservations
-                for (final rPk in reservedRefsMap.keys) {
-                  try {
-                    writeBufferManager.releaseReservedUniqueKeys(
-                      table: table,
-                      recordId: rPk,
-                      transactionId: txId,
-                    );
-                  } catch (_) {}
-                }
+                await writeBufferManager.releaseReservedUniquesForPks(
+                  table: table,
+                  recordIds: reservedPkSet,
+                  transactionId: txId,
+                );
+                outstandingReservedPks.removeAll(reservedPkSet);
                 return finishWithPromoteMirror(DbResult.error(
                   type: ResultType.bizForeignKeyViolation,
                   message: e.toString(),
@@ -6105,7 +6043,6 @@ class DataStoreImpl {
 
           recordsToCommit.add(updatedRecord);
           oldRecordsToCommit.add(existingRecord);
-          batchUniqueKeyRefs.add(currentUniqueRefs);
           commitPkVals.add(pkVal);
         }
 
@@ -6125,7 +6062,6 @@ class DataStoreImpl {
             records: recordsToCommit,
             operation: BufferOperationType.update,
             schema: schema,
-            uniqueKeyRefsList: batchUniqueKeyRefs,
             oldRecordsMap: oldRecordsMap,
             transactionId: txId,
             schemaVersion: schema.schemaVersion ?? '',
@@ -6145,6 +6081,7 @@ class DataStoreImpl {
             }
           }
           successCount += commitResult.successRecordIds.length;
+          outstandingReservedPks.removeAll(commitResult.successRecordIds);
 
           if (commitResult.failedRecordIds.isNotEmpty) {
             for (final fId in commitResult.failedRecordIds) {
@@ -6152,14 +6089,13 @@ class DataStoreImpl {
                 failedKeys.add(fId);
               }
               failedCount++;
-              if (reservedRefsMap.containsKey(fId)) {
-                try {
-                  writeBufferManager.releaseReservedUniqueKeys(
-                    table: table,
-                    recordId: fId,
-                    transactionId: txId,
-                  );
-                } catch (_) {}
+              if (reservedPkSet.contains(fId)) {
+                writeBufferManager.releaseReservedUniques(
+                  table: table,
+                  recordId: fId,
+                  transactionId: txId,
+                );
+                outstandingReservedPks.remove(fId);
               }
             }
           }
@@ -6241,6 +6177,20 @@ class DataStoreImpl {
             : const [],
         failedCount: dbEx.statuses.length,
       ));
+    } finally {
+      // Covers early returns (!allowPartialErrors) that never hit catch:
+      // only still-outstanding (not yet buffered/committed) pks are released;
+      // commitReservedUniques already cleared bookkeeping for successes -> no-op.
+      if (outstandingReservedPks.isNotEmpty) {
+        try {
+          await writeBufferManager.releaseReservedUniquesForPks(
+            table: table,
+            recordIds: outstandingReservedPks,
+            transactionId: txId,
+          );
+        } catch (_) {}
+        outstandingReservedPks.clear();
+      }
     }
   }
 
@@ -7918,11 +7868,6 @@ class DataStoreImpl {
         throwOnError: throwOnError,
       );
     }
-  }
-
-  /// Invalidate all caches for table
-  Future<void> _invalidateTableCaches(TableContext table) async {
-    await cacheManager.invalidateCache(table, removeTableState: true);
   }
 
   /// Get global configuration

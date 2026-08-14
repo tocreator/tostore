@@ -236,7 +236,7 @@ class UpdateBuilder extends ChainBuilder<UpdateBuilder>
   /// When skipped, only [DbResult.successCount] and [DbResult.failedCount] are available.
   ///
   /// 跳过收集成功/失败的主键列表和状态详情。
-  /// 适用于大范围范围查询的批量更新场景（如 `.where('id', '>', 5)`），
+  /// 适用于大范围范围查询的批量更新场景（如 `.where('id', '>', 5)`），
   /// 能够显著提升性能并避免内存开销。
   /// 跳过后仅 [DbResult.successCount] 和 [DbResult.failedCount] 可用。
   UpdateBuilder skipResultDetails() {

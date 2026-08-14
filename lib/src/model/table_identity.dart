@@ -90,7 +90,7 @@ extension type const IndexUid(String value) implements String {
   /// Whether [value] matches engine-issued stable index uid shape.
   ///
   /// Stable ids are `GlobalIdGenerator.
-  /// body (length 15)  Logical names fromgenerate("i")` — `'i'` + 14-char Base36
+  /// body (length 15)  Logical names fromgenerate("i")` -- `'i'` + 14-char Base36
   /// `IndexSchema.actualIndexName` always use `idx_` / `uniq_` and are excluded.
   bool get looksLikeStableUid {
     if (isEmpty) return false;

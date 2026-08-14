@@ -113,7 +113,7 @@ class DbException implements Exception {
   @override
   String toString() {
     final buf = StringBuffer();
-    buf.write('🛑 DbException:');
+    buf.write('[STOP] DbException:');
     for (final status in statuses) {
       buf.write(
           '\n   - [Index ${status.index}] [${status.codeKey}] (Code ${status.code}): ${status.message}');

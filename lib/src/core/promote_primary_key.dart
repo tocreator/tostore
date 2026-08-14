@@ -151,7 +151,7 @@ bool isPrimaryKeyCapableDataType(DataType type) {
   }
 }
 
-/// Detect promote intent from old→new declarative schemas.
+/// Detect promote intent from old->new declarative schemas.
 ///
 /// Returns null when the change is not a promote.
 PromoteDetection? detectPromoteFieldToPrimaryKey(
@@ -388,7 +388,7 @@ List<MigrationOperation> siblingOperationsExcludingPromote(
   }).toList(growable: false);
 }
 
-/// Apply only the promote PK reshape in-place (old working → target shape).
+/// Apply only the promote PK reshape in-place (old working -> target shape).
 ///
 /// Sibling field changes must already be reflected in [record] (old working
 /// schema). Used by online dual-write mirror and promote backfill.
@@ -416,9 +416,9 @@ void transformPromoteOldToNewInPlace(
   }
 }
 
-/// Apply only the promote PK reverse reshape in-place (target → old working).
+/// Apply only the promote PK reverse reshape in-place (target -> old working).
 ///
-/// Does not invent the old auto PK — leave it absent so the old-table insert
+/// Does not invent the old auto PK -- leave it absent so the old-table insert
 /// path generates it. Strips a user-supplied target-PK-as-only-key into the
 /// source field slot.
 void transformPromoteNewToOldInPlace(

@@ -2,141 +2,115 @@ import 'dart:async';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
-import '../handler/logger.dart';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
 import 'yield_controller.dart';
 
-typedef TreeCacheSizeCalculator<T> = int Function(T value);
+/// Optional per-suffix comparator after the group prefix.
 typedef TreeCacheComparatorFactory = Comparator<dynamic> Function(
-    List<dynamic> groupPath);
-typedef TreeCacheWeightQueryCallback = Future<int?> Function(
-    List<dynamic> groupPath);
+  List<dynamic> groupPath, {
+  int suffixIndex,
+});
 
-/// Invoked once after [TreeCache.cleanup] actually removes entries.
-///
-/// Use for cache-level invariants that group-path [TreeCache.setFullyCached]
-/// markers cannot express (e.g. a global "fully loaded" flag).
-typedef TreeCacheEvictedCallback = void Function(int removedCount);
+typedef TreeCacheSizeCalculator<T> = int Function(T value);
 
-/// Per-instance eviction policy for [TreeCache].
-///
-/// Chosen once at construction; hot paths use derived `final bool` gates only
-/// (no per-op `switch` on this enum).
+/// Eviction policy. [none] keeps Map-speed hot paths (no order list / bytes).
+/// [lru] / [fifo] maintain a per-group order list for [cleanup].
 enum TreeCacheEvictionMode {
-  /// No order list; [TreeCache.cleanup] / auto-eviction are no-ops (resident).
   none,
-
-  /// Access/write moves entry to MRU end; cleanup pops from the oldest head.
   lru,
-
-  /// Insertion-order (FIFO): get does not reorder; in-place put keeps position;
-  /// cleanup pops from the oldest head (earliest [TreeCache.put] first).
   fifo,
 }
 
-/// A high-performance hierarchical cache.
+typedef TreeCacheEvictedCallback = void Function(int removedCount);
+typedef TreeCacheBeforeCleanupCallback = FutureOr<bool> Function();
+typedef TreeCacheWeightQueryCallback = Future<int?> Function(
+  List<dynamic> groupPath,
+);
+
+/// Hierarchical path-key cache (point Map + lazy ordered range view).
 ///
-/// Key model:
-/// - Accepts either a scalar key (e.g. `String`) or a `List` path key.
-/// - Internally, all keys are normalized to a `List` path.
+/// - [TreeCacheEvictionMode.none]: Map-speed resident store (e.g. buffer trees)
+/// - [lru]/[fifo]: side order-list + byte ledger for [cleanup]
+/// - Ordered view is lazy (first [scanRange] / [ensureOrdered] / [prepareOrderedViews])
+/// - Flat LRU leaves use [_LiveFlat] so get+touch needs one Hash probe
 ///
-/// Performance model:
-/// - **Group partitioning** (controlled by [groupDepth]) provides O(1) prefix removal
-///   for prefixes aligned to group boundaries (e.g. `[table]`, `[table, index]`,
-///   `[table, index, partition]`).
-/// - Within each group, a **point Map** provides near-O(1) equality get/put/remove.
-/// - A **lazy B+Tree ordered view** is rebuilt on demand for [scanRange] (shared
-///   [_CacheEntry] references — values are never duplicated). Once warm, inserts
-///   and removes keep the view in sync incrementally.
-/// - Eviction (when [evictionMode] is not [TreeCacheEvictionMode.none]) uses
-///   optional **group-level weights** + an **entry-level order list**
-///   ([TreeCacheEvictionMode.lru] or [TreeCacheEvictionMode.fifo]).
+/// Gate: `bin/tree_cache_benchmark.dart` (Buffer shapes <= ~1.2x Nested Map in none mode).
 class TreeCache<T> {
-  final TreeCacheSizeCalculator<T> sizeCalculator;
-
-  /// Effective max threshold (will be clamped to >= [minByteThreshold]).
-  final int maxByteThreshold;
-
-  /// Minimum threshold guardrail (prevents extremely small cache sizes).
-  final int minByteThreshold;
-
-  /// Group depth for hierarchical operations:
-  /// - 1: group by first component (e.g. tableUid)
-  /// - 2: group by first 2 components (e.g. tableUid + indexUid)
-  /// - 3: group by first 3 components (e.g. tableUid + indexUid + partitionNo)
-  ///
-  /// Prefix removals whose path length is `<= [groupDepth]` can be executed without
-  /// scanning entries (O(number of affected groups)).
   final int groupDepth;
 
-  /// Factory to provide the comparator for the **first component after group prefix**.
-  /// For example:
-  /// - groupDepth=1 (table records): comparator for PK based on [tableName]
-  /// - groupDepth=2 (index data): comparator for first index field based on [tableUid, indexUid]
+  /// Default component comparator when [comparatorFactory] is null.
+  final Comparator<dynamic> compare;
+
+  /// Typed suffix comparators (index / PK order). Null -> [compare] for all.
   final TreeCacheComparatorFactory? comparatorFactory;
 
-  /// Optional group-level weight callback used by eviction.
-  final TreeCacheWeightQueryCallback? weightQueryCallback;
+  final TreeCacheSizeCalculator<T>? sizeCalculator;
 
-  /// Optional hook after a cleanup pass that removed at least one entry.
-  ///
-  /// Not invoked for single-entry [remove] / [clear] (callers own those).
-  final TreeCacheEvictedCallback? onEvicted;
-
-  /// Eviction policy (default [TreeCacheEvictionMode.lru]).
-  ///
-  /// - [TreeCacheEvictionMode.none]: resident Map-like cache (pending buffers).
-  /// - [TreeCacheEvictionMode.lru]: touch on get/put-update moves to MRU end.
-  /// - [TreeCacheEvictionMode.fifo]: order by first insert only; get does not reorder.
   final TreeCacheEvictionMode evictionMode;
-
-  /// Derived once: maintain per-group eviction order list (`lru` / `fifo`).
-  final bool _orderEnabled;
-
-  /// Derived once: move-to-tail on touch (`lru` only).
-  final bool _reorderOnTouch;
 
   final String debugLabel;
 
-  int _estimatedTotalSizeBytes = 0;
-  int _totalEntries = 0;
+  final TreeCacheEvictedCallback? onEvicted;
+  final TreeCacheBeforeCleanupCallback? beforeCleanup;
+  final TreeCacheWeightQueryCallback? weightQueryCallback;
 
-  /// Nested group map (depth = [groupDepth]).
-  /// - depth=1: `Map<k0, _Group>`
-  /// - depth=2: `Map<k0, Map<k1, _Group>>`
-  /// - depth=3: `Map<k0, Map<k1, Map<k2, _Group>>>`
+  /// True for [lru]/[fifo]: order list + byte ledger.
+  final bool _orderEnabled;
+
+  /// Move-to-MRU on get/put-update ([lru] only).
+  final bool _reorderOnTouch;
+
+  int _maxByteThreshold;
+  int _minByteThreshold;
+  int _estimatedTotalSizeBytes = 0;
+
+  /// Nested group map (depth = [groupDepth]). Leaves are [_Group].
   final Map<Object?, dynamic> _groupsRoot = <Object?, dynamic>{};
 
-  /// Fully-cached markers (nested map by prefix path).
+  /// Nested fully-cached markers for prefix completeness.
   final Map<Object?, dynamic> _fullyCachedRoot = <Object?, dynamic>{};
 
-  Future<void>? _cleanupLock;
+  int _totalEntries = 0;
 
-  /// Cooldown timestamp to prevent cleanup storms.
-  /// After a cleanup completes, we wait at least 5 seconds before triggering another.
+  Future<void>? _cleanupLock;
   DateTime _lastCleanupTime = DateTime.fromMillisecondsSinceEpoch(0);
 
+  /// Group finger -- skips nested HashMap probes on steady same-group traffic.
+  Object? _f0;
+  Object? _f1;
+  Object? _f2;
+  _Group<T>? _fingerGroup;
+
+  /// 0 = invalid; else matches [groupDepth] of the fingered group.
+  int _fingerDepth = 0;
+
   TreeCache({
-    required this.sizeCalculator,
-    required int maxByteThreshold,
-    required this.minByteThreshold,
     this.groupDepth = 1,
+    Comparator<dynamic>? compare,
     this.comparatorFactory,
-    this.weightQueryCallback,
-    this.onEvicted,
+    this.sizeCalculator,
     this.evictionMode = TreeCacheEvictionMode.lru,
-    String? debugLabel,
-  })  : maxByteThreshold = math.max(maxByteThreshold, minByteThreshold),
+    this.debugLabel = 'TreeCache',
+    this.onEvicted,
+    this.beforeCleanup,
+    this.weightQueryCallback,
+    int maxByteThreshold = 1,
+    int minByteThreshold = 1,
+  })  : compare = compare ?? compareNative,
         _orderEnabled = evictionMode != TreeCacheEvictionMode.none,
         _reorderOnTouch = evictionMode == TreeCacheEvictionMode.lru,
-        debugLabel = debugLabel ?? 'TreeCache' {
-    if (groupDepth <= 0) {
+        _minByteThreshold = minByteThreshold < 1 ? 1 : minByteThreshold,
+        _maxByteThreshold = math.max(
+          maxByteThreshold,
+          minByteThreshold < 1 ? 1 : minByteThreshold,
+        ) {
+    if (groupDepth < 1 || groupDepth > 3) {
       throw DbException([
         InvalidArgumentStatus(
           type: ResultType.engError,
-          message: 'groupDepth must be >= 1',
+          message: 'TreeCache groupDepth must be 1..3',
           parameterName: 'groupDepth',
           passedValue: groupDepth,
         )
@@ -144,18 +118,82 @@ class TreeCache<T> {
     }
   }
 
-  int get estimatedTotalSizeBytes => _estimatedTotalSizeBytes;
   int get length => _totalEntries;
 
-  /// Default comparator for dynamic values used in keys.
-  ///
-  /// Notes:
-  /// - Supports `null`, `bool`, `num`, `String`, `Uint8List`.
-  /// - Treats the string `'\uffff'` as a MAX sentinel (always greatest).
-  /// - Provides deterministic ordering across mixed types.
+  bool get isEmpty => _totalEntries <= 0;
+
+  int get estimatedTotalSizeBytes => _estimatedTotalSizeBytes;
+
+  int get maxByteThreshold => _maxByteThreshold;
+
+  int get minByteThreshold => _minByteThreshold;
+
+  void updateByteThreshold({int? max, int? min}) {
+    if (min != null) _minByteThreshold = min < 1 ? 1 : min;
+    if (max != null) _maxByteThreshold = max;
+    if (_maxByteThreshold < _minByteThreshold) {
+      _maxByteThreshold = _minByteThreshold;
+    }
+  }
+
+  /// Entry count for an exact group key (`key` length == [groupDepth]).
+  int groupEntryCount(dynamic key) {
+    final k = _normalizeKey(key);
+    if (k.length != groupDepth) return 0;
+    return _getGroupForKey(k, create: false)?.entryCount ?? 0;
+  }
+
+  bool hasGroupEntries(dynamic key) => groupEntryCount(key) > 0;
+
+  bool isFullyCached(dynamic keyOrPrefix) {
+    final p = _normalizeKey(keyOrPrefix);
+    return _isFullyCached(p);
+  }
+
+  void setFullyCached(dynamic keyOrPrefix, bool isFullyCached) {
+    final p = _normalizeKey(keyOrPrefix);
+    _setFullyCached(p, isFullyCached);
+  }
+
+  void _clearFinger() {
+    _f0 = null;
+    _f1 = null;
+    _f2 = null;
+    _fingerGroup = null;
+    _fingerDepth = 0;
+  }
+
+  int _resolveSize(int? size, T value) {
+    if (size != null && size > 0) return size;
+    final calc = sizeCalculator;
+    if (calc != null) {
+      final n = calc(value);
+      return n <= 0 ? 1 : n;
+    }
+    return 1;
+  }
+
+  void _applyGroupByteDelta(_Group<T> g, int beforeBytes) {
+    if (!_orderEnabled) return;
+    final diff = g.totalBytes - beforeBytes;
+    if (diff == 0) return;
+    _estimatedTotalSizeBytes += diff;
+    if (_estimatedTotalSizeBytes < 0) _estimatedTotalSizeBytes = 0;
+  }
+
+  /// After a successful single-entry remove: debit totals and drop empty group.
+  void _afterPointRemoved(_Group<T> g, {int? beforeBytes}) {
+    _totalEntries--;
+    if (_totalEntries < 0) _totalEntries = 0;
+    if (beforeBytes != null) _applyGroupByteDelta(g, beforeBytes);
+    if (g.entryCount <= 0 && g.pinCount <= 0) {
+      _removeEmptyGroup(g.groupPath);
+    }
+  }
+
+  /// Default comparator for dynamic key components.
   static int compareNative(dynamic a, dynamic b) {
     if (identical(a, b)) return 0;
-    // Sentinel MAX for common range scans.
     if (a is String && a == '\uffff') {
       return (b is String && b == '\uffff') ? 0 : 1;
     }
@@ -179,7 +217,6 @@ class TreeCache<T> {
       return a.length < b.length ? -1 : 1;
     }
 
-    // Mixed types: compare by a stable type rank, then string fallback.
     int rank(dynamic v) {
       if (v == null) return 0;
       if (v is bool) return 1;
@@ -195,190 +232,574 @@ class TreeCache<T> {
     return a.toString().compareTo(b.toString());
   }
 
-  T? peek(dynamic key) => get(key, updateStats: false);
+  // ---------------------------------------------------------------------------
+  // Point ops -- specialized hot paths for BufferTreeStore + page/meta caches
+  // ---------------------------------------------------------------------------
 
-  T? get(dynamic key, {bool updateStats = true}) {
-    final k = _normalizeKey(key);
+  /// Accept List path or scalar (meta caches use tableUid alone).
+  @pragma('vm:prefer-inline')
+  List _keyList(dynamic key) {
+    if (key is List) return key;
+    return <dynamic>[key];
+  }
+
+  /// Same as [get] with touch/updateStats disabled.
+  @pragma('vm:prefer-inline')
+  T? peek(dynamic key) => get(key, touch: false);
+
+  /// Point lookup. [touch]/[updateStats] only matter when [evictionMode] is [lru].
+  @pragma('vm:prefer-inline')
+  T? get(dynamic key, {bool touch = true, bool? updateStats}) {
+    final k = _keyList(key);
+    final gd = groupDepth;
+    final len = k.length;
+    final doTouch = _reorderOnTouch && (updateStats ?? touch);
+
+    // Meta / schema: scalar or [groupKey] -> exact slot
+    if (len == gd) {
+      if (gd == 1) {
+        final g = _groupOfDepth1(k[0]);
+        if (g == null || !g.hasExact) return null;
+        if (doTouch) g.touchExact();
+        return g.exact;
+      }
+      if (gd == 2) {
+        final g = _groupOfDepth2(k[0], k[1]);
+        if (g == null || !g.hasExact) return null;
+        if (doTouch) g.touchExact();
+        return g.exact;
+      }
+      if (gd == 3) {
+        final g = _groupOfDepth3(k[0], k[1], k[2]);
+        if (g == null || !g.hasExact) return null;
+        if (doTouch) g.touchExact();
+        return g.exact;
+      }
+    }
+
+    // pendingRecord / tableRecord: [tableUid, pk]
+    if (gd == 1 && len == 2) {
+      final g = _groupOfDepth1(k[0]);
+      if (g == null) return null;
+      return g.getFlat(k[1], touch: doTouch);
+    }
+    // table page: [tableUid, partitionNo, pageNo]
+    if (gd == 1 && len == 3) {
+      final g = _groupOfDepth1(k[0]);
+      if (g == null) return null;
+      final v = g.getDeep2(k[1], k[2]);
+      if (v != null && doTouch) g.touchDeep2(k[1], k[2]);
+      return v;
+    }
+    // txnRecord: [txId, tableUid, pk]
+    if (gd == 2 && len == 3) {
+      final g = _groupOfDepth2(k[0], k[1]);
+      if (g == null) return null;
+      return g.getFlat(k[2], touch: doTouch);
+    }
+    // pendingIndex / index page: [tableUid, indexUid, ...]
+    if (gd == 2 && len == 4) {
+      final g = _groupOfDepth2(k[0], k[1]);
+      if (g == null) return null;
+      final v = g.getDeep2(k[2], k[3]);
+      if (v != null && doTouch) g.touchDeep2(k[2], k[3]);
+      return v;
+    }
+    // txn flat after depth-3 group (rare) / txnIndex deep
+    if (gd == 3 && len == 4) {
+      final g = _groupOfDepth3(k[0], k[1], k[2]);
+      if (g == null) return null;
+      return g.getFlat(k[3], touch: doTouch);
+    }
+    // txnIndex: [txId, tableUid, indexUid, field, pk]
+    if (gd == 3 && len == 5) {
+      final g = _groupOfDepth3(k[0], k[1], k[2]);
+      if (g == null) return null;
+      final v = g.getDeep2(k[3], k[4]);
+      if (v != null && doTouch) g.touchDeep2(k[3], k[4]);
+      return v;
+    }
+
     final group = _getGroupForKey(k, create: false);
     if (group == null) return null;
-    final entry = group.pointGet(k);
-    if (entry == null) return null;
-    if (updateStats) {
-      group.touch(entry);
-    }
-    return entry.value;
+    final v = group.pointGet(k);
+    if (v != null && doTouch) group.touchPath(k);
+    return v;
   }
 
+  @pragma('vm:prefer-inline')
   bool containsKey(dynamic key) {
-    final k = _normalizeKey(key);
+    final k = _keyList(key);
+    final gd = groupDepth;
+    final len = k.length;
+
+    if (len == gd) {
+      if (gd == 1) {
+        final g = _groupOfDepth1(k[0]);
+        return g != null && g.hasExact;
+      }
+      if (gd == 2) {
+        final g = _groupOfDepth2(k[0], k[1]);
+        return g != null && g.hasExact;
+      }
+      if (gd == 3) {
+        final g = _groupOfDepth3(k[0], k[1], k[2]);
+        return g != null && g.hasExact;
+      }
+    }
+    if (gd == 1 && len == 2) {
+      final g = _groupOfDepth1(k[0]);
+      if (g == null) return false;
+      return g.containsFlat(k[1]);
+    }
+    if (gd == 1 && len == 3) {
+      final g = _groupOfDepth1(k[0]);
+      if (g == null) return false;
+      return g.containsDeep2(k[1], k[2]);
+    }
+    if (gd == 2 && len == 3) {
+      final g = _groupOfDepth2(k[0], k[1]);
+      if (g == null) return false;
+      return g.containsFlat(k[2]);
+    }
+    if (gd == 2 && len == 4) {
+      final g = _groupOfDepth2(k[0], k[1]);
+      if (g == null) return false;
+      return g.containsDeep2(k[2], k[3]);
+    }
+    if (gd == 3 && len == 4) {
+      final g = _groupOfDepth3(k[0], k[1], k[2]);
+      if (g == null) return false;
+      return g.containsFlat(k[3]);
+    }
+    if (gd == 3 && len == 5) {
+      final g = _groupOfDepth3(k[0], k[1], k[2]);
+      if (g == null) return false;
+      return g.containsDeep2(k[3], k[4]);
+    }
+
     final group = _getGroupForKey(k, create: false);
     if (group == null) return false;
-    return group.pointGet(k) != null;
+    return group.pointContains(k);
   }
 
+  @pragma('vm:prefer-inline')
   void put(dynamic key, T value, {int? size}) {
-    final k = _normalizeKey(key);
-    final group = _getGroupForKey(k, create: true)!;
+    final k = _keyList(key);
+    final gd = groupDepth;
+    final len = k.length;
 
-    final int newSize = _sanitizeSize(size ?? sizeCalculator(value));
-    final existing = group.pointGet(k);
-    if (existing != null) {
-      final int oldSize = existing.sizeBytes;
-      existing.value = value;
-      existing.sizeBytes = newSize;
-      final diff = newSize - oldSize;
-      if (diff != 0) {
-        group.totalBytes += diff;
-        _estimatedTotalSizeBytes += diff;
+    if (!_orderEnabled) {
+      // none: Map-speed -- no size/order/bytes.
+      if (len == gd) {
+        if (gd == 1) {
+          final g = _groupOfDepth1Create(k[0]);
+          if (g.putExactNone(value)) _totalEntries++;
+          return;
+        }
+        if (gd == 2) {
+          final g = _groupOfDepth2Create(k[0], k[1]);
+          if (g.putExactNone(value)) _totalEntries++;
+          return;
+        }
+        if (gd == 3) {
+          final g = _groupOfDepth3Create(k[0], k[1], k[2]);
+          if (g.putExactNone(value)) _totalEntries++;
+          return;
+        }
       }
-      // In-place value update keeps ordered-view keys valid.
-      group.touch(existing);
-    } else {
-      final entry = _CacheEntry<T>(k, value, newSize);
-      group.pointInsert(k, entry);
-      group.attachNew(entry);
-      group.syncOrderedInsert(entry);
-      group.totalBytes += newSize;
-      group.entryCount++;
-      _estimatedTotalSizeBytes += newSize;
-      _totalEntries++;
+      if (gd == 1 && len == 2) {
+        final g = _groupOfDepth1Create(k[0]);
+        if (g.putFlatNone(k[1], value)) _totalEntries++;
+        return;
+      }
+      if (gd == 1 && len == 3) {
+        final g = _groupOfDepth1Create(k[0]);
+        if (g.putDeep2None(k[1], k[2], value)) _totalEntries++;
+        return;
+      }
+      if (gd == 2 && len == 3) {
+        final g = _groupOfDepth2Create(k[0], k[1]);
+        if (g.putFlatNone(k[2], value)) _totalEntries++;
+        return;
+      }
+      if (gd == 2 && len == 4) {
+        final g = _groupOfDepth2Create(k[0], k[1]);
+        if (g.putDeep2None(k[2], k[3], value)) _totalEntries++;
+        return;
+      }
+      if (gd == 3 && len == 4) {
+        final g = _groupOfDepth3Create(k[0], k[1], k[2]);
+        if (g.putFlatNone(k[3], value)) _totalEntries++;
+        return;
+      }
+      if (gd == 3 && len == 5) {
+        final g = _groupOfDepth3Create(k[0], k[1], k[2]);
+        if (g.putDeep2None(k[3], k[4], value)) _totalEntries++;
+        return;
+      }
+      final group = _getGroupForKey(k, create: true)!;
+      final before = group.entryCount;
+      group.pointPut(k, value);
+      if (group.entryCount > before) _totalEntries++;
+      return;
     }
 
+    final sz = _resolveSize(size, value);
+    if (len == gd) {
+      final group = _getGroupForKey(k, create: true)!;
+      final beforeBytes = group.totalBytes;
+      final isNew = group.putExact(value, key: k, sizeBytes: sz);
+      if (isNew) _totalEntries++;
+      _applyGroupByteDelta(group, beforeBytes);
+      _maybeScheduleCleanup();
+      return;
+    }
+    if (gd == 1 && len == 2) {
+      final g = _groupOfDepth1Create(k[0]);
+      final beforeBytes = g.totalBytes;
+      final isNew = g.putFlat(k[1], value, sizeBytes: sz);
+      if (isNew) _totalEntries++;
+      _applyGroupByteDelta(g, beforeBytes);
+      _maybeScheduleCleanup();
+      return;
+    }
+    if (gd == 1 && len == 3) {
+      final g = _groupOfDepth1Create(k[0]);
+      final beforeBytes = g.totalBytes;
+      final isNew = g.putDeep2(k[1], k[2], value, sizeBytes: sz);
+      if (isNew) _totalEntries++;
+      _applyGroupByteDelta(g, beforeBytes);
+      _maybeScheduleCleanup();
+      return;
+    }
+    if (gd == 2 && len == 3) {
+      final g = _groupOfDepth2Create(k[0], k[1]);
+      final beforeBytes = g.totalBytes;
+      final isNew = g.putFlat(k[2], value, sizeBytes: sz);
+      if (isNew) _totalEntries++;
+      _applyGroupByteDelta(g, beforeBytes);
+      _maybeScheduleCleanup();
+      return;
+    }
+    if (gd == 2 && len == 4) {
+      final g = _groupOfDepth2Create(k[0], k[1]);
+      final beforeBytes = g.totalBytes;
+      final isNew = g.putDeep2(k[2], k[3], value, sizeBytes: sz);
+      if (isNew) _totalEntries++;
+      _applyGroupByteDelta(g, beforeBytes);
+      _maybeScheduleCleanup();
+      return;
+    }
+    if (gd == 3 && len == 4) {
+      final g = _groupOfDepth3Create(k[0], k[1], k[2]);
+      final beforeBytes = g.totalBytes;
+      final isNew = g.putFlat(k[3], value, sizeBytes: sz);
+      if (isNew) _totalEntries++;
+      _applyGroupByteDelta(g, beforeBytes);
+      _maybeScheduleCleanup();
+      return;
+    }
+    if (gd == 3 && len == 5) {
+      final g = _groupOfDepth3Create(k[0], k[1], k[2]);
+      final beforeBytes = g.totalBytes;
+      final isNew = g.putDeep2(k[3], k[4], value, sizeBytes: sz);
+      if (isNew) _totalEntries++;
+      _applyGroupByteDelta(g, beforeBytes);
+      _maybeScheduleCleanup();
+      return;
+    }
+
+    final group = _getGroupForKey(k, create: true)!;
+    final beforeBytes = group.totalBytes;
+    final before = group.entryCount;
+    group.pointPut(k, value, sizeBytes: sz);
+    if (group.entryCount > before) _totalEntries++;
+    _applyGroupByteDelta(group, beforeBytes);
     _maybeScheduleCleanup();
   }
 
-  /// Insert only when [key] is absent (reservation / CAS-style).
-  ///
-  /// - Absent: inserts [value], returns `null` (caller owns the slot).
-  /// - Present: leaves the entry unchanged and returns the existing value
-  ///   (caller compares with self-id for unique-index "same record" cases).
-  ///
-  /// Unlike [put], never overwrites. Hot path does a single normalize + group
-  /// + [pointGet] (no separate get-then-put double lookup).
+  /// Insert only when absent. Returns existing value, or `null` if inserted.
   T? putIfAbsent(dynamic key, T value, {int? size}) {
-    final k = _normalizeKey(key);
-    final group = _getGroupForKey(k, create: true)!;
-
-    final existing = group.pointGet(k);
-    if (existing != null) {
-      // Do not touch/reorder: reservation probes must not inflate LRU rank.
-      return existing.value;
-    }
-
-    final int newSize = _sanitizeSize(size ?? sizeCalculator(value));
-    final entry = _CacheEntry<T>(k, value, newSize);
-    group.pointInsert(k, entry);
-    group.attachNew(entry);
-    group.syncOrderedInsert(entry);
-    group.totalBytes += newSize;
-    group.entryCount++;
-    _estimatedTotalSizeBytes += newSize;
-    _totalEntries++;
-
-    _maybeScheduleCleanup();
+    // containsKey distinguishes stored nulls from missing keys.
+    if (containsKey(key)) return peek(key);
+    put(key, value, size: size);
     return null;
   }
 
-  /// Batch insert/update.
-  ///
-  /// [sizes] is optional; when provided, it must use the same keys as [entries].
+  void _maybeScheduleCleanup() {
+    if (!_orderEnabled) return;
+    if (_maxByteThreshold <= 0) return;
+    if (_estimatedTotalSizeBytes <= _maxByteThreshold) return;
+    if (_cleanupLock != null) return;
+    final now = DateTime.now();
+    if (now.difference(_lastCleanupTime).inSeconds < 5) return;
+    // ignore: discarded_futures
+    cleanup();
+  }
+
+  @pragma('vm:prefer-inline')
+  void remove(dynamic keyOrPrefix) {
+    final k = _keyList(keyOrPrefix);
+    final gd = groupDepth;
+    final len = k.length;
+
+    if (len > gd) {
+      if (!_orderEnabled) {
+        // none: no byte ledger.
+        if (gd == 1 && len == 2) {
+          final g = _groupOfDepth1(k[0]);
+          if (g == null || !g.removeFlatNone(k[1])) return;
+          _afterPointRemoved(g);
+          return;
+        }
+        if (gd == 1 && len == 3) {
+          final g = _groupOfDepth1(k[0]);
+          if (g == null || !g.removeDeep2None(k[1], k[2])) return;
+          _afterPointRemoved(g);
+          return;
+        }
+        if (gd == 2 && len == 3) {
+          final g = _groupOfDepth2(k[0], k[1]);
+          if (g == null || !g.removeFlatNone(k[2])) return;
+          _afterPointRemoved(g);
+          return;
+        }
+        if (gd == 2 && len == 4) {
+          final g = _groupOfDepth2(k[0], k[1]);
+          if (g == null || !g.removeDeep2None(k[2], k[3])) return;
+          _afterPointRemoved(g);
+          return;
+        }
+        if (gd == 3 && len == 4) {
+          final g = _groupOfDepth3(k[0], k[1], k[2]);
+          if (g == null || !g.removeFlatNone(k[3])) return;
+          _afterPointRemoved(g);
+          return;
+        }
+        if (gd == 3 && len == 5) {
+          final g = _groupOfDepth3(k[0], k[1], k[2]);
+          if (g == null || !g.removeDeep2None(k[3], k[4])) return;
+          _afterPointRemoved(g);
+          return;
+        }
+        final group = _getGroupForKey(k, create: false);
+        if (group != null && group.pointRemove(k)) {
+          _afterPointRemoved(group);
+        }
+        return;
+      }
+
+      if (gd == 1 && len == 2) {
+        final g = _groupOfDepth1(k[0]);
+        if (g == null) return;
+        final beforeBytes = g.totalBytes;
+        if (!g.removeFlat(k[1])) return;
+        _afterPointRemoved(g, beforeBytes: beforeBytes);
+        return;
+      }
+      if (gd == 1 && len == 3) {
+        final g = _groupOfDepth1(k[0]);
+        if (g == null) return;
+        final beforeBytes = g.totalBytes;
+        if (!g.removeDeep2(k[1], k[2])) return;
+        _afterPointRemoved(g, beforeBytes: beforeBytes);
+        return;
+      }
+      if (gd == 2 && len == 3) {
+        final g = _groupOfDepth2(k[0], k[1]);
+        if (g == null) return;
+        final beforeBytes = g.totalBytes;
+        if (!g.removeFlat(k[2])) return;
+        _afterPointRemoved(g, beforeBytes: beforeBytes);
+        return;
+      }
+      if (gd == 2 && len == 4) {
+        final g = _groupOfDepth2(k[0], k[1]);
+        if (g == null) return;
+        final beforeBytes = g.totalBytes;
+        if (!g.removeDeep2(k[2], k[3])) return;
+        _afterPointRemoved(g, beforeBytes: beforeBytes);
+        return;
+      }
+      if (gd == 3 && len == 4) {
+        final g = _groupOfDepth3(k[0], k[1], k[2]);
+        if (g == null) return;
+        final beforeBytes = g.totalBytes;
+        if (!g.removeFlat(k[3])) return;
+        _afterPointRemoved(g, beforeBytes: beforeBytes);
+        return;
+      }
+      if (gd == 3 && len == 5) {
+        final g = _groupOfDepth3(k[0], k[1], k[2]);
+        if (g == null) return;
+        final beforeBytes = g.totalBytes;
+        if (!g.removeDeep2(k[3], k[4])) return;
+        _afterPointRemoved(g, beforeBytes: beforeBytes);
+        return;
+      }
+
+      final group = _getGroupForKey(k, create: false);
+      if (group != null) {
+        final beforeBytes = group.totalBytes;
+        if (group.pointRemove(k)) {
+          _afterPointRemoved(group, beforeBytes: beforeBytes);
+        }
+      }
+      return;
+    }
+
+    if (k.isEmpty) {
+      clear();
+      return;
+    }
+
+    // Exact entry first (meta caches), else prefix group remove.
+    if (len == gd) {
+      final group = _getGroupForKey(k, create: false);
+      if (group != null) {
+        if (!_orderEnabled) {
+          if (group.removeExactNone()) {
+            _afterPointRemoved(group);
+            return;
+          }
+        } else {
+          final beforeBytes = group.totalBytes;
+          if (group.removeExact()) {
+            _afterPointRemoved(group, beforeBytes: beforeBytes);
+            return;
+          }
+        }
+      }
+    }
+
+    if (len <= gd) {
+      final removed = _removeGroupsByPrefix(k);
+      _totalEntries -= removed;
+      if (_totalEntries < 0) _totalEntries = 0;
+      _removeFullyCachedPrefix(k);
+    }
+  }
+
+  /// Batch insert/update. Uses [put] so hot-path specializations stay shared.
   void putAll(
     Map<dynamic, T> entries, {
     Map<dynamic, int>? sizes,
   }) {
     if (entries.isEmpty) return;
-
     for (final e in entries.entries) {
-      final dynamic rawKey = e.key;
-      final k = _normalizeKey(rawKey);
-      final group = _getGroupForKey(k, create: true)!;
-
-      final int newSize = _sanitizeSize(sizes != null
-          ? (sizes[rawKey] ?? sizeCalculator(e.value))
-          : sizeCalculator(e.value));
-
-      final existing = group.pointGet(k);
-      if (existing != null) {
-        final oldSize = existing.sizeBytes;
-        existing.value = e.value;
-        existing.sizeBytes = newSize;
-        final diff = newSize - oldSize;
-        if (diff != 0) {
-          group.totalBytes += diff;
-          _estimatedTotalSizeBytes += diff;
-        }
-        group.touch(existing);
-      } else {
-        final entry = _CacheEntry<T>(k, e.value, newSize);
-        group.pointInsert(k, entry);
-        group.attachNew(entry);
-        group.syncOrderedInsert(entry);
-        group.totalBytes += newSize;
-        group.entryCount++;
-        _estimatedTotalSizeBytes += newSize;
-        _totalEntries++;
-      }
+      final rawKey = e.key;
+      put(rawKey, e.value, size: sizes?[rawKey]);
     }
-
-    _maybeScheduleCleanup();
   }
 
-  /// Remove an entry or a prefix subtree.
-  ///
-  /// Semantics:
-  /// - If [keyOrPrefix] is a scalar: removes that single key.
-  /// - If it's a `List`: tries to remove the exact key first. If not found and
-  ///   prefix length `<= [groupDepth]`, removes the aligned prefix groups.
-  void remove(dynamic keyOrPrefix) {
-    final p = _normalizeKey(keyOrPrefix);
+  /// Rename group prefix from [oldGroupKey] to [newGroupKey] in O(1) group move.
+  /// Only supported when [groupDepth] == 1.
+  void renameGroup(dynamic oldGroupKey, dynamic newGroupKey) {
+    if (oldGroupKey == newGroupKey) return;
+    if (groupDepth != 1) return;
 
-    // 1) Try exact remove.
-    final group = _getGroupForKey(p, create: false);
-    if (group != null) {
-      final removed = group.pointRemove(p);
-      if (removed != null) {
-        group.detach(removed);
-        group.syncOrderedRemove(removed);
-        group.totalBytes -= removed.sizeBytes;
-        group.entryCount--;
-        _estimatedTotalSizeBytes -= removed.sizeBytes;
-        _totalEntries--;
-
-        // Do NOT invalidate fully-cached marker on single-entry removals.
-
-        if (group.entryCount <= 0 && group.pinCount <= 0) {
-          _removeEmptyGroup(group.groupPath);
-        }
-        return;
-      }
-    }
-
-    // 2) Prefix remove (only optimized for prefixes aligned to group boundaries).
-    if (p.length <= groupDepth) {
-      _removeGroupsByPrefix(p);
-      // Clear fully-cached markers under the same prefix.
-      _removeFullyCachedPrefix(p);
+    final group = _groupsRoot.remove(oldGroupKey);
+    if (group == null) return;
+    if (group is! _Group<T>) {
+      _groupsRoot[oldGroupKey] = group;
       return;
     }
 
-    // 3) Fallback: no-op for deep prefixes (not used by current hot paths).
+    group.groupPath[0] = newGroupKey;
+    group.rewriteGroupKeyInOrderNodes(newGroupKey);
+    _groupsRoot[newGroupKey] = group;
+    if (_f0 == oldGroupKey) {
+      _f0 = newGroupKey;
+    }
+
+    final isMarked = _isFullyCached(<dynamic>[oldGroupKey]);
+    if (isMarked) {
+      _setFullyCached(<dynamic>[oldGroupKey], false);
+      _setFullyCached(<dynamic>[newGroupKey], true);
+    }
   }
 
   void clear() {
     _groupsRoot.clear();
     _fullyCachedRoot.clear();
-    _estimatedTotalSizeBytes = 0;
     _totalEntries = 0;
+    _estimatedTotalSizeBytes = 0;
+    _clearFinger();
   }
 
-  /// Remove entries matching [test], yielding periodically to avoid UI jank.
+  /// Inclusive range scan (async + yielding).
   ///
-  /// Returns the number of removed entries. Safe for large caches: matches are
-  /// collected and removed per group (no full-cache snapshot).
-  ///
-  /// Does not invalidate fully-cached markers for partial group removals
-  /// (same as single-entry [remove]). Callers that need marker invalidation
-  /// should clear markers explicitly.
+  /// Short prefixes fan out across matching groups.
+  Future<void> scanRange(
+    dynamic startKey,
+    dynamic endKey, {
+    bool reverse = false,
+    int? limit,
+    required bool Function(List<dynamic> path, T value) onEntry,
+  }) async {
+    final start = _normalizeKey(startKey);
+    final end = endKey == null ? null : _normalizeKey(endKey);
+
+    final groups = <_Group<T>>[];
+    if (start.length >= groupDepth) {
+      final g = _getGroupForKey(start, create: false);
+      if (g != null) groups.add(g);
+    } else {
+      _collectGroupsUnderPrefix(start, out: groups);
+    }
+    if (groups.isEmpty) return;
+
+    for (final g in groups) {
+      g.pinCount++;
+    }
+
+    try {
+      var remaining = limit;
+      var stop = false;
+      final int groupCount = groups.length;
+      final yieldController =
+          YieldController('TreeCache.scanRange:$debugLabel');
+      var sinceYield = 0;
+
+      for (int gi = 0; gi < groupCount; gi++) {
+        final group = groups[reverse ? (groupCount - 1 - gi) : gi];
+        if (stop || (remaining != null && remaining <= 0)) return;
+        if (group.entryCount <= 0) continue;
+
+        final List<dynamic> localStart =
+            start.length >= groupDepth ? start : group.groupPath;
+        final emitted = group.scanRange(
+          localStart,
+          end,
+          reverse: reverse,
+          limit: remaining,
+          onEntry: (path, value) {
+            final cont = onEntry(path, value);
+            if (!cont) stop = true;
+            return cont;
+          },
+        );
+        sinceYield += emitted;
+        if (remaining != null) remaining = remaining - emitted;
+        if (stop) return;
+        if (sinceYield >= 4096) {
+          sinceYield = 0;
+          final y = yieldController.maybeYield();
+          if (y != null) await y;
+        }
+      }
+    } finally {
+      for (final g in groups) {
+        g.pinCount--;
+        if (g.pinCount <= 0 && g.entryCount <= 0) {
+          _removeEmptyGroup(g.groupPath);
+        }
+      }
+    }
+  }
+
+  /// Remove entries matching [test], yielding periodically.
   Future<int> removeWhere(
     bool Function(List<dynamic> key, T value) test, {
     String? yieldLabel,
@@ -392,183 +813,87 @@ class TreeCache<T> {
     final yieldController = YieldController(
       yieldLabel ?? 'TreeCache.removeWhere:$debugLabel',
     );
-    int removedTotal = 0;
+    var removedTotal = 0;
 
     for (final g in groups) {
       if (g.entryCount <= 0) continue;
 
-      final matches = <_CacheEntry<T>>[];
-      g.forEachEntry((entry) {
-        if (test(entry.key, entry.value)) {
-          matches.add(entry);
-        }
+      final matches = <List<dynamic>>[];
+      g.forEachEntry((path, value) {
+        if (test(path, value)) matches.add(path);
       });
       if (matches.isEmpty) continue;
 
-      for (final entry in matches) {
+      for (final path in matches) {
         final y = yieldController.maybeYield();
         if (y != null) await y;
 
-        final removedEntry = g.pointRemove(entry.key);
-        if (removedEntry == null) continue;
-        if (!identical(entry, removedEntry)) {
-          g.detach(entry);
-        }
-        g.detach(removedEntry);
-        g.syncOrderedRemove(removedEntry);
-        g.totalBytes -= removedEntry.sizeBytes;
-        g.entryCount--;
-        _estimatedTotalSizeBytes -= removedEntry.sizeBytes;
-        _totalEntries--;
+        final beforeBytes = g.totalBytes;
+        if (!g.pointRemove(path)) continue;
+        _afterPointRemoved(g, beforeBytes: _orderEnabled ? beforeBytes : null);
         removedTotal++;
       }
-
-      if (g.entryCount <= 0 && g.pinCount <= 0) {
-        _removeEmptyGroup(g.groupPath);
-      }
-    }
-
-    if (removedTotal > 0) {
-      Logger.debug(
-        '[$debugLabel] removeWhere removed=$removedTotal '
-        'entries=$_totalEntries bytes=$_estimatedTotalSizeBytes',
-      );
     }
     return removedTotal;
   }
 
-  /// Rename group prefix from [oldGroupKey] to [newGroupKey] in O(1) group move.
-  void renameGroup(dynamic oldGroupKey, dynamic newGroupKey) {
-    if (oldGroupKey == newGroupKey) return;
-    if (groupDepth != 1) return;
-
-    final group = _groupsRoot.remove(oldGroupKey);
-    if (group == null) return;
-    if (group is! _Group<T>) {
-      _groupsRoot[oldGroupKey] = group;
-      return;
-    }
-
-    // Update group path
-    group.groupPath[0] = newGroupKey;
-
-    // Update all entry keys in-place (point-store keys are suffix-only).
-    group.forEachEntry((entry) {
-      if (entry.key.isNotEmpty) {
-        entry.key[0] = newGroupKey;
-      }
-    });
-
-    _groupsRoot[newGroupKey] = group;
-
-    // Update fully cached markers
-    final isMarked = _isFullyCached(<dynamic>[oldGroupKey]);
-    if (isMarked) {
-      _setFullyCached(<dynamic>[oldGroupKey], false);
-      _setFullyCached(<dynamic>[newGroupKey], true);
+  /// Force materialize ordered vectors for all groups.
+  void ensureOrdered() {
+    final groups = <_Group<T>>[];
+    _collectGroups(_groupsRoot, depth: 1, out: groups);
+    for (final g in groups) {
+      if (g.entryCount > 0) g.ensureOrdered();
     }
   }
 
-  bool isFullyCached(dynamic keyOrPrefix) {
-    final p = _normalizeKey(keyOrPrefix);
-    return _isFullyCached(p);
-  }
-
-  void setFullyCached(dynamic keyOrPrefix, bool isFullyCached) {
-    final p = _normalizeKey(keyOrPrefix);
-    _setFullyCached(p, isFullyCached);
-  }
-
-  /// Scan a range (inclusive) inside a single group.
+  /// Materialize ordered views for all groups (async + yield).
   ///
-  /// - If [endKey] is null, scans until the end of the group.
-  /// - For prefix scans, pass a group prefix as [startKey] (e.g. `[table]` or
-  ///   `[table, index]`) and set [endKey] to null; stop condition can be implemented
-  ///   in [onEntry] by returning false.
-  ///
-  /// The first scan after Map-only mutations may rebuild the ordered B+Tree view;
-  /// once warm, subsequent inserts/removes keep the view in sync incrementally.
-  /// Call [prepareOrderedViews] after bulk loads to pay rebuild cost up-front.
-  Future<void> scanRange(
-    dynamic startKey,
-    dynamic endKey, {
-    bool reverse = false,
-    int? limit,
-    required bool Function(List<dynamic> path, T value) onEntry,
-  }) async {
-    final List<dynamic> start = _normalizeKey(startKey);
-    final List<dynamic>? end = endKey == null ? null : _normalizeKey(endKey);
-
-    final group = _getGroupForKey(start, create: false);
-    if (group == null) return;
-
-    group.pinCount++;
-    try {
-      final yieldController =
-          YieldController('TreeCache.scanRange:$debugLabel');
-      final tree = await group.ensureOrdered(yieldController);
-      await tree.scanRange(
-        start,
-        end,
-        reverse: reverse,
-        limit: limit,
-        yieldController: yieldController,
-        onEntry: (k, entry) {
-          return onEntry(k, entry.value);
-        },
-      );
-    } finally {
-      group.pinCount--;
-      if (group.pinCount <= 0 && group.entryCount <= 0) {
-        _removeEmptyGroup(group.groupPath);
-      }
-    }
-  }
-
-  /// Rebuild dirty ordered views for all groups (with [YieldController]).
-  ///
-  /// Use after bulk [put]/[putAll] when a range scan is expected soon, so the
-  /// first [scanRange] stays near steady-state cost.
+  /// Yields between large groups so UI threads stay responsive after bulk loads.
   Future<void> prepareOrderedViews() async {
     final groups = <_Group<T>>[];
     _collectGroups(_groupsRoot, depth: 1, out: groups);
     if (groups.isEmpty) return;
-
     final yieldController =
-        YieldController('TreeCache.prepareOrdered:$debugLabel');
+        YieldController('TreeCache.prepareOrderedViews:$debugLabel');
     for (final g in groups) {
       if (g.entryCount <= 0) continue;
-      if (!g.orderedDirty && g.ordered != null) continue;
       final y = yieldController.maybeYield();
       if (y != null) await y;
-      await g.ensureOrdered(yieldController);
+      g.ensureOrdered();
     }
   }
 
+  /// Evict oldest entries until roughly [removeRatio] of entries are gone
+  /// (or order lists empty). No-op when [evictionMode] is [none].
   Future<void> cleanup({double removeRatio = 0.3}) async {
     if (!_orderEnabled) return;
     if (removeRatio <= 0) return;
     if (removeRatio > 1) removeRatio = 1;
+    if (_estimatedTotalSizeBytes <= _minByteThreshold) return;
 
-    // Under min: skip entirely (memory-pressure may call often). Mid-eviction
-    // does not re-check the floor — ratio target only, avoid per-entry cost.
-    if (_estimatedTotalSizeBytes <= minByteThreshold) return;
-
-    // Lock to prevent concurrent cleanups.
     if (_cleanupLock != null) {
       await _cleanupLock;
       return;
     }
-
     final completer = Completer<void>();
     _cleanupLock = completer.future;
 
     try {
+      if (beforeCleanup != null) {
+        try {
+          final proceed = await beforeCleanup!();
+          if (!proceed) {
+            _lastCleanupTime = DateTime.now();
+            return;
+          }
+        } catch (_) {}
+        if (_estimatedTotalSizeBytes <= _minByteThreshold) return;
+        if (_estimatedTotalSizeBytes <= _maxByteThreshold) return;
+      }
       if (_totalEntries <= 0) return;
 
-      final int targetRemove =
-          math.max(1, (_totalEntries * removeRatio).ceil());
-      int removedTotal = 0;
+      final targetRemove = math.max(1, (_totalEntries * removeRatio).ceil());
+      var removedTotal = 0;
 
       final groups = <_Group<T>>[];
       _collectGroups(_groupsRoot, depth: 1, out: groups);
@@ -576,7 +901,6 @@ class TreeCache<T> {
 
       final yieldController = YieldController('TreeCache.cleanup:$debugLabel');
 
-      // Query weights (best-effort).
       for (final g in groups) {
         final y1 = yieldController.maybeYield();
         if (y1 != null) await y1;
@@ -591,140 +915,234 @@ class TreeCache<T> {
         }
       }
 
-      // Sort groups by weight ASC (lowest first).
       groups.sort((a, b) {
-        final wa = a.cachedWeight ?? 0;
-        final wb = b.cachedWeight ?? 0;
-        final c = wa.compareTo(wb);
+        final c = (a.cachedWeight ?? 0).compareTo(b.cachedWeight ?? 0);
         if (c != 0) return c;
-        // Tie-break: larger groups first to converge faster.
         return b.entryCount.compareTo(a.entryCount);
       });
 
       for (final g in groups) {
         if (removedTotal >= targetRemove) break;
         if (g.entryCount <= 0) continue;
-
-        final int groupTarget =
-            math.max(1, (g.entryCount * removeRatio).ceil());
-        int need = math.min(groupTarget, targetRemove - removedTotal);
-
-        if (need <= 0) continue;
-
-        // Eviction invalidates full-cache marker for this group.
-        _setFullyCached(g.groupPath, false);
-
+        var need = math.min(
+          math.max(1, (g.entryCount * removeRatio).ceil()),
+          targetRemove - removedTotal,
+        );
+        var removedInGroup = 0;
         while (need > 0 && g.orderHead != null) {
           final y2 = yieldController.maybeYield();
           if (y2 != null) await y2;
 
-          final entry = g.orderHead!;
-
-          final removedEntry = g.pointRemove(entry.key);
-          if (removedEntry == null) {
-            // Stale order-list node (not in point map). Drop from list only —
-            // do NOT count as a successful eviction or touch byte counters.
-            g.detach(entry);
-            continue;
-          }
-
-          // Guard: order head key may resolve to a different live entry object
-          // (e.g. replaced value). Always detach the map-removed instance.
-          if (!identical(entry, removedEntry)) {
-            g.detach(entry);
-          }
-          g.detach(removedEntry);
-          g.syncOrderedRemove(removedEntry);
-          g.totalBytes -= removedEntry.sizeBytes;
-          g.entryCount--;
-          _estimatedTotalSizeBytes -= removedEntry.sizeBytes;
-          _totalEntries--;
-
+          final beforeBytes = g.totalBytes;
+          final ok = g.evictOrderHead();
+          if (!ok) continue;
+          _afterPointRemoved(g, beforeBytes: beforeBytes);
           need--;
           removedTotal++;
-          if (removedTotal >= targetRemove) break;
+          removedInGroup++;
         }
-
-        if (g.entryCount <= 0 && g.pinCount <= 0) {
-          _removeEmptyGroup(g.groupPath);
+        if (removedInGroup > 0) {
+          _setFullyCached(g.groupPath, false);
         }
       }
 
       if (removedTotal > 0) {
-        Logger.debug(
-          '[$debugLabel] cleanup removed=$removedTotal target=$targetRemove '
-          'entries=$_totalEntries bytes=$_estimatedTotalSizeBytes',
-        );
-        // After group-path markers are cleared: notify for global invariants.
         try {
           onEvicted?.call(removedTotal);
-        } catch (e) {
-          Logger.warn(
-            '[$debugLabel] onEvicted callback failed',
-            rawError: e,
-          );
-        }
+        } catch (_) {}
       }
-      // Update cooldown timestamp AFTER cleanup completes.
       _lastCleanupTime = DateTime.now();
     } finally {
-      completer.complete();
       if (identical(_cleanupLock, completer.future)) {
         _cleanupLock = null;
       }
+      completer.complete();
     }
   }
 
-  // -------------------- Internal: groups --------------------
-
-  List<dynamic> _normalizeKey(dynamic key) {
-    if (key is List) return key;
-    return <dynamic>[key];
+  _Group<T> _newGroup(List<dynamic> groupPath) {
+    return _Group<T>(
+      groupPath: groupPath,
+      groupDepth: groupDepth,
+      compare: compare,
+      comparatorFactory: comparatorFactory,
+      orderEnabled: _orderEnabled,
+      reorderOnTouch: _reorderOnTouch,
+    );
   }
 
-  int _sanitizeSize(int size) => size <= 0 ? 1 : size;
+  // ---------------------------------------------------------------------------
+  // Group finger + create
+  // ---------------------------------------------------------------------------
 
-  _Group<T>? _getGroupForKey(
-    List<dynamic> key, {
-    required bool create,
-  }) {
-    if (key.isEmpty) return null;
+  @pragma('vm:prefer-inline')
+  _Group<T>? _groupOfDepth1(Object? a) {
+    if (_fingerDepth == 1 && a == _f0) return _fingerGroup;
+    final g = _groupsRoot[a];
+    final typed = g is _Group<T> ? g : null;
+    _f0 = a;
+    _fingerGroup = typed;
+    _fingerDepth = 1;
+    return typed;
+  }
+
+  @pragma('vm:prefer-inline')
+  _Group<T> _groupOfDepth1Create(Object? a) {
+    if (_fingerDepth == 1 && a == _f0 && _fingerGroup != null) {
+      return _fingerGroup!;
+    }
+    final existing = _groupsRoot[a];
+    if (existing is _Group<T>) {
+      _f0 = a;
+      _fingerGroup = existing;
+      _fingerDepth = 1;
+      return existing;
+    }
+    final created = _newGroup(<dynamic>[a]);
+    _groupsRoot[a] = created;
+    _f0 = a;
+    _fingerGroup = created;
+    _fingerDepth = 1;
+    return created;
+  }
+
+  @pragma('vm:prefer-inline')
+  _Group<T>? _groupOfDepth2(Object? a, Object? b) {
+    if (_fingerDepth == 2 && a == _f0 && b == _f1) return _fingerGroup;
+    final mid = _groupsRoot[a];
+    if (mid is! Map<Object?, dynamic>) {
+      _f0 = a;
+      _f1 = b;
+      _fingerGroup = null;
+      _fingerDepth = 2;
+      return null;
+    }
+    final g = mid[b];
+    final typed = g is _Group<T> ? g : null;
+    _f0 = a;
+    _f1 = b;
+    _fingerGroup = typed;
+    _fingerDepth = 2;
+    return typed;
+  }
+
+  @pragma('vm:prefer-inline')
+  _Group<T> _groupOfDepth2Create(Object? a, Object? b) {
+    if (_fingerDepth == 2 && a == _f0 && b == _f1 && _fingerGroup != null) {
+      return _fingerGroup!;
+    }
+    var mid = _groupsRoot[a];
+    if (mid is! Map<Object?, dynamic>) {
+      mid = <Object?, dynamic>{};
+      _groupsRoot[a] = mid;
+    }
+    final existing = mid[b];
+    if (existing is _Group<T>) {
+      _f0 = a;
+      _f1 = b;
+      _fingerGroup = existing;
+      _fingerDepth = 2;
+      return existing;
+    }
+    final created = _newGroup(<dynamic>[a, b]);
+    mid[b] = created;
+    _f0 = a;
+    _f1 = b;
+    _fingerGroup = created;
+    _fingerDepth = 2;
+    return created;
+  }
+
+  @pragma('vm:prefer-inline')
+  _Group<T>? _groupOfDepth3(Object? a, Object? b, Object? c) {
+    if (_fingerDepth == 3 && a == _f0 && b == _f1 && c == _f2) {
+      return _fingerGroup;
+    }
+    final mid1 = _groupsRoot[a];
+    if (mid1 is! Map<Object?, dynamic>) {
+      _f0 = a;
+      _f1 = b;
+      _f2 = c;
+      _fingerGroup = null;
+      _fingerDepth = 3;
+      return null;
+    }
+    final mid2 = mid1[b];
+    if (mid2 is! Map<Object?, dynamic>) {
+      _f0 = a;
+      _f1 = b;
+      _f2 = c;
+      _fingerGroup = null;
+      _fingerDepth = 3;
+      return null;
+    }
+    final g = mid2[c];
+    final typed = g is _Group<T> ? g : null;
+    _f0 = a;
+    _f1 = b;
+    _f2 = c;
+    _fingerGroup = typed;
+    _fingerDepth = 3;
+    return typed;
+  }
+
+  @pragma('vm:prefer-inline')
+  _Group<T> _groupOfDepth3Create(Object? a, Object? b, Object? c) {
+    if (_fingerDepth == 3 &&
+        a == _f0 &&
+        b == _f1 &&
+        c == _f2 &&
+        _fingerGroup != null) {
+      return _fingerGroup!;
+    }
+    var mid1 = _groupsRoot[a];
+    if (mid1 is! Map<Object?, dynamic>) {
+      mid1 = <Object?, dynamic>{};
+      _groupsRoot[a] = mid1;
+    }
+    var mid2 = mid1[b];
+    if (mid2 is! Map<Object?, dynamic>) {
+      mid2 = <Object?, dynamic>{};
+      mid1[b] = mid2;
+    }
+    final existing = mid2[c];
+    if (existing is _Group<T>) {
+      _f0 = a;
+      _f1 = b;
+      _f2 = c;
+      _fingerGroup = existing;
+      _fingerDepth = 3;
+      return existing;
+    }
+    final created = _newGroup(<dynamic>[a, b, c]);
+    mid2[c] = created;
+    _f0 = a;
+    _f1 = b;
+    _f2 = c;
+    _fingerGroup = created;
+    _fingerDepth = 3;
+    return created;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Group map walk (fallback)
+  // ---------------------------------------------------------------------------
+
+  _Group<T>? _getGroupForKey(List<dynamic> key, {required bool create}) {
     if (key.length < groupDepth) return null;
 
-    Map<Object?, dynamic> map = _groupsRoot;
-    for (int depth = 0; depth < groupDepth; depth++) {
-      final comp = key[depth];
-      if (depth == groupDepth - 1) {
-        final existing = map[comp];
-        if (existing is _Group<T>) return existing;
-        if (!create) return null;
-
-        final groupPath = key.sublist(0, groupDepth);
-        final Comparator<dynamic> firstSuffixComparator =
-            comparatorFactory != null
-                ? comparatorFactory!(groupPath)
-                : compareNative;
-
-        final group = _Group<T>(
-          groupPath: groupPath,
-          groupDepth: groupDepth,
-          firstSuffixComparator: firstSuffixComparator,
-          orderEnabled: _orderEnabled,
-          reorderOnTouch: _reorderOnTouch,
-        );
-        map[comp] = group;
-        return group;
-      }
-
-      final next = map[comp];
-      if (next is Map<Object?, dynamic>) {
-        map = next;
-      } else {
-        if (!create) return null;
-        final child = <Object?, dynamic>{};
-        map[comp] = child;
-        map = child;
-      }
+    if (groupDepth == 1) {
+      return create ? _groupOfDepth1Create(key[0]) : _groupOfDepth1(key[0]);
+    }
+    if (groupDepth == 2) {
+      return create
+          ? _groupOfDepth2Create(key[0], key[1])
+          : _groupOfDepth2(key[0], key[1]);
+    }
+    if (groupDepth == 3) {
+      return create
+          ? _groupOfDepth3Create(key[0], key[1], key[2])
+          : _groupOfDepth3(key[0], key[1], key[2]);
     }
     return null;
   }
@@ -734,123 +1152,148 @@ class TreeCache<T> {
     required int depth,
     required List<_Group<T>> out,
   }) {
-    if (groupDepth == 1) {
-      for (final v in node.values) {
-        if (v is _Group<T>) out.add(v);
-      }
-      return;
-    }
-
     if (depth == groupDepth) {
       for (final v in node.values) {
         if (v is _Group<T>) out.add(v);
       }
       return;
     }
-
     for (final v in node.values) {
-      if (v is Map<Object?, dynamic>) {
-        _collectGroups(v, depth: depth + 1, out: out);
-      } else if (v is _Group<T>) {
+      if (v is _Group<T>) {
         out.add(v);
+      } else if (v is Map<Object?, dynamic>) {
+        _collectGroups(v, depth: depth + 1, out: out);
       }
     }
+  }
+
+  void _collectGroupsUnderPrefix(
+    List<dynamic> prefix, {
+    required List<_Group<T>> out,
+  }) {
+    if (prefix.isEmpty) {
+      _collectGroups(_groupsRoot, depth: 1, out: out);
+      return;
+    }
+    Map<Object?, dynamic> node = _groupsRoot;
+    for (int i = 0; i < prefix.length; i++) {
+      final next = node[prefix[i]];
+      if (next == null) return;
+      if (next is _Group<T>) {
+        out.add(next);
+        return;
+      }
+      if (next is! Map<Object?, dynamic>) return;
+      node = next;
+    }
+    _collectGroups(node, depth: prefix.length + 1, out: out);
+  }
+
+  int _removeGroupsByPrefix(List<dynamic> prefix) {
+    if (prefix.isEmpty) {
+      final groups = <_Group<T>>[];
+      _collectGroups(_groupsRoot, depth: 1, out: groups);
+      var n = 0;
+      for (final g in groups) {
+        n += g.entryCount;
+      }
+      _groupsRoot.clear();
+      _clearFinger();
+      return n;
+    }
+
+    if (prefix.length == 1 && groupDepth == 1) {
+      final g = _groupsRoot.remove(prefix[0]);
+      if (_f0 == prefix[0]) _clearFinger();
+      if (g is _Group<T>) {
+        if (_orderEnabled) {
+          _estimatedTotalSizeBytes -= g.totalBytes;
+          if (_estimatedTotalSizeBytes < 0) _estimatedTotalSizeBytes = 0;
+        }
+        return g.entryCount;
+      }
+      return 0;
+    }
+
+    // Walk to parent of last component.
+    if (prefix.length > groupDepth) return 0;
+
+    Map<Object?, dynamic> map = _groupsRoot;
+    final stack = <Map<Object?, dynamic>>[];
+    for (int i = 0; i < prefix.length - 1; i++) {
+      stack.add(map);
+      final next = map[prefix[i]];
+      if (next is! Map<Object?, dynamic>) return 0;
+      map = next;
+    }
+    final last = prefix.last;
+    final removedNode = map.remove(last);
+    var n = 0;
+    if (removedNode is _Group<T>) {
+      n = removedNode.entryCount;
+      if (_orderEnabled) {
+        _estimatedTotalSizeBytes -= removedNode.totalBytes;
+        if (_estimatedTotalSizeBytes < 0) _estimatedTotalSizeBytes = 0;
+      }
+    } else if (removedNode is Map<Object?, dynamic>) {
+      final groups = <_Group<T>>[];
+      _collectGroups(removedNode, depth: prefix.length + 1, out: groups);
+      for (final g in groups) {
+        n += g.entryCount;
+        if (_orderEnabled) {
+          _estimatedTotalSizeBytes -= g.totalBytes;
+        }
+      }
+      if (_orderEnabled && _estimatedTotalSizeBytes < 0) {
+        _estimatedTotalSizeBytes = 0;
+      }
+    }
+    // Prune empty parents.
+    for (int i = stack.length - 1; i >= 0; i--) {
+      final parent = stack[i];
+      final key = prefix[i];
+      final child = parent[key];
+      if (child is Map<Object?, dynamic> && child.isEmpty) {
+        parent.remove(key);
+      } else {
+        break;
+      }
+    }
+    _clearFinger();
+    return n;
   }
 
   void _removeEmptyGroup(List<dynamic> groupPath) {
     if (groupPath.isEmpty) return;
+    if (groupDepth == 1) {
+      final g = _groupsRoot[groupPath[0]];
+      if (g is _Group<T> && g.pinCount > 0) return;
+      _groupsRoot.remove(groupPath[0]);
+      if (_f0 == groupPath[0]) _clearFinger();
+      return;
+    }
     Map<Object?, dynamic> map = _groupsRoot;
     final stack = <Map<Object?, dynamic>>[];
-    final keys = <Object?>[];
-
-    for (int depth = 0; depth < groupDepth; depth++) {
+    for (int i = 0; i < groupPath.length - 1; i++) {
       stack.add(map);
-      final comp = groupPath[depth];
-      keys.add(comp);
-      if (depth == groupDepth - 1) break;
-      final next = map[comp];
-      if (next is Map<Object?, dynamic>) {
-        map = next;
-      } else {
-        return;
-      }
-    }
-
-    // Check for pinCount before removing.
-    final potentialGroup = stack.last[keys.last];
-    if (potentialGroup is _Group<T> && potentialGroup.pinCount > 0) {
-      return;
-    }
-
-    // Remove leaf group.
-    stack.last.remove(keys.last);
-
-    // Prune empty maps upwards.
-    for (int i = stack.length - 1; i > 0; i--) {
-      final m = stack[i];
-      if (m.isNotEmpty) break;
-      stack[i - 1].remove(keys[i - 1]);
-    }
-  }
-
-  void _removeGroupsByPrefix(List<dynamic> prefix) {
-    if (prefix.isEmpty) return;
-
-    // Remove entire cache.
-    if (prefix.length == 1 && groupDepth == 1) {
-      final g = _groupsRoot.remove(prefix[0]);
-      if (g is _Group<T>) {
-        _estimatedTotalSizeBytes -= g.totalBytes;
-        _totalEntries -= g.entryCount;
-      } else if (g is Map<Object?, dynamic>) {
-        final tmp = <_Group<T>>[];
-        _collectGroups(g, depth: 2, out: tmp);
-        for (final gg in tmp) {
-          _estimatedTotalSizeBytes -= gg.totalBytes;
-          _totalEntries -= gg.entryCount;
-        }
-      }
-      return;
-    }
-
-    // Prefix aligns to a group boundary or higher.
-    final int cutoff = math.min(prefix.length, groupDepth);
-
-    Map<Object?, dynamic> map = _groupsRoot;
-    final stack = <Map<Object?, dynamic>>[];
-    final keys = <Object?>[];
-
-    for (int i = 0; i < cutoff - 1; i++) {
-      final comp = prefix[i];
-      final next = map[comp];
+      final next = map[groupPath[i]];
       if (next is! Map<Object?, dynamic>) return;
-      stack.add(map);
-      keys.add(comp);
       map = next;
     }
-
-    final Object? lastKey = prefix[cutoff - 1];
-    final removed = map.remove(lastKey);
-    if (removed == null) return;
-
-    if (removed is _Group<T>) {
-      _estimatedTotalSizeBytes -= removed.totalBytes;
-      _totalEntries -= removed.entryCount;
-    } else if (removed is Map<Object?, dynamic>) {
-      final tmp = <_Group<T>>[];
-      _collectGroups(removed, depth: cutoff + 1, out: tmp);
-      for (final g in tmp) {
-        _estimatedTotalSizeBytes -= g.totalBytes;
-        _totalEntries -= g.entryCount;
+    final leaf = map[groupPath.last];
+    if (leaf is _Group<T> && leaf.pinCount > 0) return;
+    map.remove(groupPath.last);
+    for (int i = stack.length - 1; i >= 0; i--) {
+      final parent = stack[i];
+      final key = groupPath[i];
+      final child = parent[key];
+      if (child is Map<Object?, dynamic> && child.isEmpty) {
+        parent.remove(key);
+      } else {
+        break;
       }
     }
-
-    // Prune empty maps upwards.
-    for (int i = stack.length - 1; i >= 0; i--) {
-      final m = (i == stack.length - 1) ? map : stack[i + 1];
-      if (m.isNotEmpty) break;
-      stack[i].remove(keys[i]);
-    }
+    _clearFinger();
   }
 
   // -------------------- Internal: fully cached markers --------------------
@@ -888,7 +1331,6 @@ class TreeCache<T> {
       return;
     }
 
-    // Remove marker and prune.
     Map<Object?, dynamic> map = _fullyCachedRoot;
     final stack = <Map<Object?, dynamic>>[];
     final keys = <Object?>[];
@@ -914,7 +1356,10 @@ class TreeCache<T> {
   }
 
   void _removeFullyCachedPrefix(List<dynamic> prefix) {
-    if (prefix.isEmpty) return;
+    if (prefix.isEmpty) {
+      _fullyCachedRoot.clear();
+      return;
+    }
     Map<Object?, dynamic> map = _fullyCachedRoot;
     for (int i = 0; i < prefix.length - 1; i++) {
       final next = map[prefix[i]];
@@ -924,133 +1369,733 @@ class TreeCache<T> {
     map.remove(prefix.last);
   }
 
-  void _maybeScheduleCleanup() {
-    if (!_orderEnabled) return;
-    if (maxByteThreshold <= 0) return;
-    if (_estimatedTotalSizeBytes <= maxByteThreshold) return;
-    if (_cleanupLock != null) return;
-
-    // Cooldown: avoid cleanup storms when cleanup cannot free enough bytes
-    // to drop below threshold (e.g., when few large entries remain).
-    // Wait at least 5 seconds after last cleanup before triggering another.
-    final now = DateTime.now();
-    if (now.difference(_lastCleanupTime).inSeconds < 5) {
-      return;
-    }
-
-    // Best-effort: do not await; cleanup yields to avoid UI jank.
-    // ignore: discarded_futures
-    cleanup();
+  /// Cold-path key normalize (fullyCached / groupEntryCount / scanRange).
+  /// Hot point ops use [_keyList] to avoid copying typed lists.
+  List<dynamic> _normalizeKey(dynamic key) {
+    if (key is List<dynamic>) return key;
+    if (key is List) return List<dynamic>.from(key);
+    return <dynamic>[key];
   }
 }
 
-// -------------------- Internal: group + entry + eviction order list --------------------
+// -----------------------------------------------------------------------------
+// Eviction order node (side structure; point maps still store plain T in none)
+// -----------------------------------------------------------------------------
 
-final class _CacheEntry<T> {
-  List<dynamic> key;
-  T value;
+final class _OrderNode {
+  final List<dynamic> key;
   int sizeBytes;
+  _OrderNode? prev;
+  _OrderNode? next;
 
-  /// Eviction-order list links (oldest ← head … tail → newest).
-  _CacheEntry<T>? orderPrev;
-  _CacheEntry<T>? orderNext;
-  _CacheEntry(this.key, this.value, this.sizeBytes);
+  _OrderNode(this.key, this.sizeBytes);
 }
 
+/// Order-mode flat leaf: value + order node (one HashMap probe on get+touch).
+final class _LiveFlat<T> {
+  T value;
+  final _OrderNode order;
+
+  _LiveFlat(this.value, this.order);
+}
+
+// -----------------------------------------------------------------------------
+// Group
+// -----------------------------------------------------------------------------
+
 final class _Group<T> {
-  List<dynamic> groupPath;
+  final List<dynamic> groupPath;
   final int groupDepth;
-  final Comparator<dynamic> firstSuffixComparator;
-
-  /// Maintain eviction order list (`lru` / `fifo`). Derived once from mode.
+  final Comparator<dynamic> compare;
+  final TreeCacheComparatorFactory? comparatorFactory;
   final bool orderEnabled;
-
-  /// Move-to-tail on [touch] (`lru` only). Derived once from mode.
   final bool reorderOnTouch;
 
-  /// Exact group key: `key.length == groupDepth` (e.g. scalar `tableUid`).
-  ///
-  /// TableSchemaCache / TableMetaCache put a single value per group with no
-  /// suffix; this slot is required so get/remove/cleanup can find it.
-  _CacheEntry<T>? exactEntry;
+  /// Exact group key: `key.length == groupDepth`.
+  T? exact;
+  bool _hasExact = false;
 
-  /// Single-suffix hot path: `key.length == groupDepth + 1`.
-  final Map<Object?, _CacheEntry<T>> flat = <Object?, _CacheEntry<T>>{};
+  bool get hasExact => _hasExact;
 
-  /// Multi-suffix nested maps (lazily allocated). Leaves are [_CacheEntry].
+  /// Single-suffix: `key.length == groupDepth + 1` (none-mode plain [T]).
+  final Map<Object?, T> flat = <Object?, T>{};
+
+  /// Order-mode single-suffix store (avoids second HashMap on get+touch).
+  Map<Object?, _LiveFlat<T>>? flatLive;
+
+  /// Multi-suffix nested maps; leaves are [T].
   Map<Object?, dynamic>? deep;
 
-  /// Lazy ordered view for [TreeCache.scanRange]. Null when dirty/unused.
-  _BPlusTree<List<dynamic>, _CacheEntry<T>>? ordered;
-  bool orderedDirty = true;
-
-  int totalBytes = 0;
   int entryCount = 0;
-  int pinCount = 0;
+  int totalBytes = 0;
   int? cachedWeight;
+  int pinCount = 0;
 
-  /// Eviction order: head = oldest (evict first), tail = newest.
-  _CacheEntry<T>? orderHead;
-  _CacheEntry<T>? orderTail;
+  /// Single-suffix ordered view (suffix components only).
+  List<Object?>? orderedFlat;
+
+  /// Multi-suffix / mixed ordered view (full paths).
+  List<List<dynamic>>? orderedPaths;
+
+  bool dirty = true;
+
+  /// When true, prefer [orderedPaths] (deep or exact present / mixed).
+  bool _orderedNeedsPaths = false;
+
+  /// Eviction order: head = oldest.
+  _OrderNode? orderHead;
+  _OrderNode? orderTail;
+
+  /// Deep2 field -> pk -> order node (flat uses [_LiveFlat] instead).
+  Map<Object?, Map<Object?, _OrderNode>>? deep2Order;
+
+  /// Exact-key order node (`key.length == groupDepth`).
+  _OrderNode? exactOrder;
+
+  /// Deep path order tree (>2 suffixes); leaves are [_OrderNode].
+  Map<Object?, dynamic>? deepPathOrder;
 
   _Group({
     required this.groupPath,
     required this.groupDepth,
-    required this.firstSuffixComparator,
+    required this.compare,
+    required this.comparatorFactory,
     required this.orderEnabled,
     required this.reorderOnTouch,
   });
 
-  Comparator<List<dynamic>> get _pathCompare => (a, b) {
-        // Compare only the suffix after group prefix.
-        //
-        // Hot-path optimization:
-        // - Most cache keys are short (1-3 suffix components).
-        // - Avoid loop/branch overhead by specializing common lengths.
-        final int al = a.length;
-        final int bl = b.length;
-        final int base = groupDepth;
+  Comparator<dynamic> _suffixComparator(int suffixIndex) {
+    if (comparatorFactory != null) {
+      return comparatorFactory!(groupPath, suffixIndex: suffixIndex);
+    }
+    return compare;
+  }
 
-        // If either key is shorter than the group prefix, treat it as smaller.
-        if (al <= base) return (bl <= base) ? 0 : -1;
-        if (bl <= base) return 1;
+  int comparePaths(List<dynamic> a, List<dynamic> b) {
+    final int base = groupDepth;
+    final int al = a.length;
+    final int bl = b.length;
+    if (al <= base) return (bl <= base) ? 0 : -1;
+    if (bl <= base) return 1;
 
-        // Compare first suffix component with custom comparator.
-        int c = firstSuffixComparator(a[base], b[base]);
-        if (c != 0) return c;
+    if (al == base + 2 && bl == base + 2) {
+      final c0 = _suffixComparator(0)(a[base], b[base]);
+      if (c0 != 0) return c0;
+      return _suffixComparator(1)(a[base + 1], b[base + 1]);
+    }
 
-        // Common case: exactly one suffix component.
-        if (al == base + 1 || bl == base + 1) {
-          if (al == bl) return 0;
-          return al < bl ? -1 : 1;
+    var c = _suffixComparator(0)(a[base], b[base]);
+    if (c != 0) return c;
+    if (al == base + 1 || bl == base + 1) {
+      if (al == bl) return 0;
+      return al < bl ? -1 : 1;
+    }
+    var i = base + 1;
+    var suffixIdx = 1;
+    while (i < al && i < bl) {
+      c = _suffixComparator(suffixIdx)(a[i], b[i]);
+      if (c != 0) return c;
+      i++;
+      suffixIdx++;
+    }
+    if (al == bl) return 0;
+    return al < bl ? -1 : 1;
+  }
+
+  // ---- order list ----
+
+  /// After [TreeCache.renameGroup], rewrite group component on order keys.
+  void rewriteGroupKeyInOrderNodes(Object? newGroupKey) {
+    if (!orderEnabled) {
+      // Ordered path vectors (if any) still carry the old group prefix.
+      final paths = orderedPaths;
+      if (paths != null) {
+        for (final p in paths) {
+          if (p.isNotEmpty) p[0] = newGroupKey;
         }
+      }
+      return;
+    }
+    var node = orderHead;
+    while (node != null) {
+      if (node.key.isNotEmpty) node.key[0] = newGroupKey;
+      node = node.next;
+    }
+    final paths = orderedPaths;
+    if (paths != null) {
+      for (final p in paths) {
+        if (p.isNotEmpty) p[0] = newGroupKey;
+      }
+    }
+  }
 
-        // Common case: exactly two suffix components.
-        if (al == base + 2 && bl == base + 2) {
-          c = TreeCache.compareNative(a[base + 1], b[base + 1]);
-          if (c != 0) return c;
-          return 0;
+  void attachNew(_OrderNode e) {
+    if (!orderEnabled) return;
+    if (orderTail == null) {
+      orderHead = e;
+      orderTail = e;
+      return;
+    }
+    e.prev = orderTail;
+    e.next = null;
+    orderTail!.next = e;
+    orderTail = e;
+  }
+
+  void touchNode(_OrderNode e) {
+    if (!reorderOnTouch) return;
+    if (identical(e, orderTail)) return;
+    final p = e.prev;
+    final n = e.next;
+    if (p != null) p.next = n;
+    if (n != null) n.prev = p;
+    if (identical(e, orderHead)) orderHead = n;
+    e.prev = orderTail;
+    e.next = null;
+    if (orderTail != null) orderTail!.next = e;
+    orderTail = e;
+    orderHead ??= e;
+  }
+
+  void detachNode(_OrderNode e) {
+    if (!orderEnabled) return;
+    final p = e.prev;
+    final n = e.next;
+    if (p != null) p.next = n;
+    if (n != null) n.prev = p;
+    if (identical(e, orderHead)) orderHead = n;
+    if (identical(e, orderTail)) orderTail = p;
+    e.prev = null;
+    e.next = null;
+  }
+
+  @pragma('vm:prefer-inline')
+  void touchFlat(Object? suffix) {
+    final live = flatLive?[suffix];
+    if (live != null) touchNode(live.order);
+  }
+
+  @pragma('vm:prefer-inline')
+  void touchDeep2(Object? s0, Object? s1) {
+    final n = deep2Order?[s0]?[s1];
+    if (n != null) touchNode(n);
+  }
+
+  void touchExact() {
+    final n = exactOrder;
+    if (n != null) touchNode(n);
+  }
+
+  void touchPath(List<dynamic> key) {
+    if (!reorderOnTouch) return;
+    final base = groupDepth;
+    final len = key.length;
+    if (len == base) {
+      final n = exactOrder;
+      if (n != null) touchNode(n);
+      return;
+    }
+    if (len == base + 1) {
+      touchFlat(key[base]);
+      return;
+    }
+    if (len == base + 2) {
+      touchDeep2(key[base], key[base + 1]);
+      return;
+    }
+    if (len > base + 2) {
+      final n = _lookupDeepPathOrder(key);
+      if (n != null) touchNode(n);
+    }
+  }
+
+  /// Pop oldest order node and remove from point store. Returns false if stale.
+  bool evictOrderHead() {
+    final node = orderHead;
+    if (node == null) return false;
+    final removed = pointRemove(node.key);
+    if (!removed) {
+      // Stale order node -- drop from list only.
+      _unlinkOrderOnly(node);
+      return false;
+    }
+    return true;
+  }
+
+  void _unlinkOrderOnly(_OrderNode node) {
+    detachNode(node);
+    final key = node.key;
+    final base = groupDepth;
+    if (key.length == base) {
+      if (identical(exactOrder, node)) exactOrder = null;
+    } else if (key.length == base + 1) {
+      flatLive?.remove(key[base]);
+    } else if (key.length == base + 2) {
+      final m = deep2Order?[key[base]];
+      m?.remove(key[base + 1]);
+      if (m != null && m.isEmpty) deep2Order?.remove(key[base]);
+    } else if (key.length > base + 2) {
+      // Index drop only -- node already detached; do not adjust totalBytes.
+      _dropDeepPathOrderIndex(key);
+    }
+  }
+
+  void _dropDeepPathOrderIndex(List<dynamic> key) {
+    final root = deepPathOrder;
+    if (root == null) return;
+    final base = groupDepth;
+    final stack = <Map<Object?, dynamic>>[];
+    final keys = <Object?>[];
+    Map<Object?, dynamic> map = root;
+    for (int i = base; i < key.length - 1; i++) {
+      stack.add(map);
+      final comp = key[i];
+      keys.add(comp);
+      final next = map[comp];
+      if (next is! Map<Object?, dynamic>) return;
+      map = next;
+    }
+    map.remove(key[key.length - 1]);
+    for (int i = stack.length - 1; i >= 0; i--) {
+      final m = (i == stack.length - 1) ? map : stack[i + 1];
+      if (m.isNotEmpty) break;
+      stack[i].remove(keys[i]);
+    }
+    if (root.isEmpty) deepPathOrder = null;
+  }
+
+  void _noteExactOrder(List<dynamic> key, int sizeBytes,
+      {required bool isNew}) {
+    if (!orderEnabled) return;
+    if (!isNew) {
+      final n = exactOrder;
+      if (n != null) {
+        totalBytes += sizeBytes - n.sizeBytes;
+        n.sizeBytes = sizeBytes;
+        if (reorderOnTouch) touchNode(n);
+      }
+      return;
+    }
+    final node = _OrderNode(List<dynamic>.from(key), sizeBytes);
+    exactOrder = node;
+    totalBytes += sizeBytes;
+    attachNew(node);
+  }
+
+  void _removeExactOrder() {
+    if (!orderEnabled) return;
+    final n = exactOrder;
+    if (n == null) return;
+    exactOrder = null;
+    totalBytes -= n.sizeBytes;
+    if (totalBytes < 0) totalBytes = 0;
+    detachNode(n);
+  }
+
+  _OrderNode? _lookupDeepPathOrder(List<dynamic> key) {
+    final root = deepPathOrder;
+    if (root == null) return null;
+    final base = groupDepth;
+    dynamic node = root;
+    for (int i = base; i < key.length; i++) {
+      if (node is! Map<Object?, dynamic>) return null;
+      node = node[key[i]];
+      if (node == null) return null;
+    }
+    return node is _OrderNode ? node : null;
+  }
+
+  void _noteDeepPathOrder(List<dynamic> key, int sizeBytes,
+      {required bool isNew}) {
+    if (!orderEnabled) return;
+    final base = groupDepth;
+    var map = deepPathOrder;
+    if (map == null) {
+      map = <Object?, dynamic>{};
+      deepPathOrder = map;
+    }
+    for (int i = base; i < key.length - 1; i++) {
+      final comp = key[i];
+      final next = map![comp];
+      if (next is Map<Object?, dynamic>) {
+        map = next;
+      } else {
+        final child = <Object?, dynamic>{};
+        map[comp] = child;
+        map = child;
+      }
+    }
+    final last = key[key.length - 1];
+    if (!isNew) {
+      final existing = map![last];
+      if (existing is _OrderNode) {
+        totalBytes += sizeBytes - existing.sizeBytes;
+        existing.sizeBytes = sizeBytes;
+        if (reorderOnTouch) touchNode(existing);
+      }
+      return;
+    }
+    final node = _OrderNode(List<dynamic>.from(key), sizeBytes);
+    map![last] = node;
+    totalBytes += sizeBytes;
+    attachNew(node);
+  }
+
+  void _removeDeepPathOrder(List<dynamic> key) {
+    if (!orderEnabled) return;
+    final root = deepPathOrder;
+    if (root == null) return;
+    final base = groupDepth;
+    final stack = <Map<Object?, dynamic>>[];
+    final keys = <Object?>[];
+    Map<Object?, dynamic> map = root;
+    for (int i = base; i < key.length - 1; i++) {
+      stack.add(map);
+      final comp = key[i];
+      keys.add(comp);
+      final next = map[comp];
+      if (next is! Map<Object?, dynamic>) return;
+      map = next;
+    }
+    final last = key[key.length - 1];
+    final node = map[last];
+    if (node is! _OrderNode) return;
+    map.remove(last);
+    totalBytes -= node.sizeBytes;
+    if (totalBytes < 0) totalBytes = 0;
+    detachNode(node);
+    for (int i = stack.length - 1; i >= 0; i--) {
+      final m = (i == stack.length - 1) ? map : stack[i + 1];
+      if (m.isNotEmpty) break;
+      stack[i].remove(keys[i]);
+    }
+    if (root.isEmpty) deepPathOrder = null;
+  }
+
+  void _noteDeep2Order(
+    Object? s0,
+    Object? s1,
+    int sizeBytes, {
+    required bool isNew,
+  }) {
+    if (!orderEnabled) return;
+    final outer = deep2Order ??= <Object?, Map<Object?, _OrderNode>>{};
+    final inner = outer[s0] ?? <Object?, _OrderNode>{};
+    outer[s0] = inner;
+    var node = inner[s1];
+    if (node == null) {
+      final key = List<dynamic>.from(groupPath)
+        ..add(s0)
+        ..add(s1);
+      node = _OrderNode(key, sizeBytes);
+      inner[s1] = node;
+      attachNew(node);
+      totalBytes += sizeBytes;
+    } else {
+      totalBytes += sizeBytes - node.sizeBytes;
+      node.sizeBytes = sizeBytes;
+      touchNode(node);
+    }
+  }
+
+  void _removeDeep2Order(Object? s0, Object? s1) {
+    if (!orderEnabled) return;
+    final inner = deep2Order?[s0];
+    if (inner == null) return;
+    final node = inner.remove(s1);
+    if (inner.isEmpty) deep2Order?.remove(s0);
+    if (node == null) return;
+    totalBytes -= node.sizeBytes;
+    if (totalBytes < 0) totalBytes = 0;
+    detachNode(node);
+  }
+
+  // ---- point store ----
+
+  bool putExactNone(T value) {
+    final was = _hasExact;
+    exact = value;
+    _hasExact = true;
+    _orderedNeedsPaths = true;
+    if (!was) {
+      entryCount++;
+      dirty = true;
+      return true;
+    }
+    dirty = true;
+    return false;
+  }
+
+  bool removeExactNone() {
+    if (!_hasExact) return false;
+    exact = null;
+    _hasExact = false;
+    entryCount--;
+    dirty = true;
+    return true;
+  }
+
+  /// Order-mode exact put. [key] must be length == [groupDepth].
+  bool putExact(T value, {required List<dynamic> key, int sizeBytes = 0}) {
+    final was = _hasExact;
+    exact = value;
+    _hasExact = true;
+    _orderedNeedsPaths = true;
+    dirty = true;
+    if (!was) entryCount++;
+    if (orderEnabled) {
+      _noteExactOrder(key, sizeBytes <= 0 ? 1 : sizeBytes, isNew: !was);
+    }
+    return !was;
+  }
+
+  bool removeExact() {
+    if (!_hasExact) return false;
+    exact = null;
+    _hasExact = false;
+    entryCount--;
+    dirty = true;
+    _removeExactOrder();
+    return true;
+  }
+
+  /// none-mode flat put: no order / size / length-branch tax beyond HashMap.
+  @pragma('vm:prefer-inline')
+  bool putFlatNone(Object? suffix, T value) {
+    final before = flat.length;
+    flat[suffix] = value;
+    if (flat.length == before) return false;
+    entryCount++;
+    dirty = true;
+    return true;
+  }
+
+  @pragma('vm:prefer-inline')
+  bool removeFlatNone(Object? suffix) {
+    if (flat.remove(suffix) == null) return false;
+    entryCount--;
+    dirty = true;
+    return true;
+  }
+
+  @pragma('vm:prefer-inline')
+  T? getFlat(Object? suffix, {required bool touch}) {
+    if (!orderEnabled) return flat[suffix];
+    final live = flatLive?[suffix];
+    if (live == null) return null;
+    if (touch) touchNode(live.order);
+    return live.value;
+  }
+
+  @pragma('vm:prefer-inline')
+  bool containsFlat(Object? suffix) {
+    if (!orderEnabled) return flat.containsKey(suffix);
+    return flatLive?.containsKey(suffix) ?? false;
+  }
+
+  @pragma('vm:prefer-inline')
+  bool putDeep2None(Object? s0, Object? s1, T value) {
+    _orderedNeedsPaths = true;
+    var d = deep;
+    if (d == null) {
+      d = <Object?, dynamic>{};
+      deep = d;
+    }
+    final existingInner = d[s0];
+    final Map<Object?, dynamic> leaf;
+    if (existingInner is Map<Object?, dynamic>) {
+      leaf = existingInner;
+    } else {
+      leaf = <Object?, dynamic>{};
+      d[s0] = leaf;
+    }
+    final before = leaf.length;
+    leaf[s1] = value;
+    if (leaf.length == before) return false;
+    entryCount++;
+    dirty = true;
+    return true;
+  }
+
+  @pragma('vm:prefer-inline')
+  bool removeDeep2None(Object? s0, Object? s1) {
+    final d = deep;
+    if (d == null) return false;
+    final inner = d[s0];
+    if (inner is! Map<Object?, dynamic>) return false;
+    if (inner.remove(s1) == null) return false;
+    entryCount--;
+    dirty = true;
+    if (inner.isEmpty) {
+      d.remove(s0);
+      if (d.isEmpty) deep = null;
+    }
+    return true;
+  }
+
+  /// Returns true when [suffix] was newly inserted.
+  @pragma('vm:prefer-inline')
+  bool putFlat(Object? suffix, T value, {int sizeBytes = 0}) {
+    if (!orderEnabled) {
+      return putFlatNone(suffix, value);
+    }
+
+    final sz = sizeBytes <= 0 ? 1 : sizeBytes;
+    final map = flatLive ??= <Object?, _LiveFlat<T>>{};
+    final existing = map[suffix];
+    if (existing != null) {
+      existing.value = value;
+      totalBytes += sz - existing.order.sizeBytes;
+      existing.order.sizeBytes = sz;
+      touchNode(existing.order);
+      return false;
+    }
+    final key = List<dynamic>.from(groupPath)..add(suffix);
+    final order = _OrderNode(key, sz);
+    map[suffix] = _LiveFlat<T>(value, order);
+    attachNew(order);
+    totalBytes += sz;
+    entryCount++;
+    dirty = true;
+    return true;
+  }
+
+  @pragma('vm:prefer-inline')
+  bool removeFlat(Object? suffix) {
+    if (!orderEnabled) {
+      return removeFlatNone(suffix);
+    }
+    final live = flatLive?.remove(suffix);
+    if (live == null) return false;
+    entryCount--;
+    totalBytes -= live.order.sizeBytes;
+    if (totalBytes < 0) totalBytes = 0;
+    detachNode(live.order);
+    dirty = true;
+    return true;
+  }
+
+  /// Two-suffix deep leaf: index marker `[..., field, pk]`.
+  @pragma('vm:prefer-inline')
+  T? getDeep2(Object? s0, Object? s1) {
+    final d = deep;
+    if (d == null) return null;
+    final inner = d[s0];
+    if (inner is! Map<Object?, dynamic>) return null;
+    final v = inner[s1];
+    if (v is Map) return null;
+    return v as T?;
+  }
+
+  @pragma('vm:prefer-inline')
+  bool containsDeep2(Object? s0, Object? s1) {
+    final d = deep;
+    if (d == null) return false;
+    final inner = d[s0];
+    if (inner is! Map<Object?, dynamic>) return false;
+    final v = inner[s1];
+    return v != null || inner.containsKey(s1);
+  }
+
+  /// Returns true when newly inserted.
+  @pragma('vm:prefer-inline')
+  bool putDeep2(Object? s0, Object? s1, T value, {int sizeBytes = 0}) {
+    if (!orderEnabled) {
+      return putDeep2None(s0, s1, value);
+    }
+    _orderedNeedsPaths = true;
+    var d = deep;
+    if (d == null) {
+      d = <Object?, dynamic>{};
+      deep = d;
+    }
+    final existingInner = d[s0];
+    final Map<Object?, dynamic> leaf;
+    if (existingInner is Map<Object?, dynamic>) {
+      leaf = existingInner;
+    } else {
+      leaf = <Object?, dynamic>{};
+      d[s0] = leaf;
+    }
+
+    final before = leaf.length;
+    leaf[s1] = value;
+    final isNew = leaf.length > before;
+    if (isNew) {
+      entryCount++;
+      dirty = true;
+    }
+    _noteDeep2Order(s0, s1, sizeBytes <= 0 ? 1 : sizeBytes, isNew: isNew);
+    return isNew;
+  }
+
+  @pragma('vm:prefer-inline')
+  bool removeDeep2(Object? s0, Object? s1) {
+    if (!orderEnabled) {
+      return removeDeep2None(s0, s1);
+    }
+    final d = deep;
+    if (d == null) return false;
+    final inner = d[s0];
+    if (inner is! Map<Object?, dynamic>) return false;
+    if (inner.remove(s1) == null) return false;
+    entryCount--;
+    dirty = true;
+    _removeDeep2Order(s0, s1);
+    if (inner.isEmpty) {
+      d.remove(s0);
+      if (d.isEmpty) deep = null;
+    }
+    return true;
+  }
+
+  /// Visit every live entry with its full path key.
+  void forEachEntry(void Function(List<dynamic> path, T value) fn) {
+    if (_hasExact) {
+      fn(List<dynamic>.from(groupPath), exact as T);
+    }
+    if (orderEnabled) {
+      final live = flatLive;
+      if (live != null) {
+        for (final e in live.entries) {
+          final path = List<dynamic>.from(groupPath)..add(e.key);
+          fn(path, e.value.value);
         }
+      }
+    } else {
+      for (final e in flat.entries) {
+        final path = List<dynamic>.from(groupPath)..add(e.key);
+        fn(path, e.value);
+      }
+    }
+    final d = deep;
+    if (d != null) {
+      _forEachDeep(d, List<dynamic>.from(groupPath), fn);
+    }
+  }
 
-        // Fallback: compare remaining components.
-        int i = base + 1;
-        while (i < al && i < bl) {
-          c = TreeCache.compareNative(a[i], b[i]);
-          if (c != 0) return c;
-          i++;
-        }
-        if (al == bl) return 0;
-        return al < bl ? -1 : 1;
-      };
+  void _forEachDeep(
+    Map<Object?, dynamic> node,
+    List<dynamic> prefix,
+    void Function(List<dynamic> path, T value) fn,
+  ) {
+    for (final e in node.entries) {
+      final next = List<dynamic>.from(prefix)..add(e.key);
+      final v = e.value;
+      if (v is Map<Object?, dynamic>) {
+        _forEachDeep(v, next, fn);
+      } else {
+        fn(next, v as T);
+      }
+    }
+  }
 
-  _CacheEntry<T>? pointGet(List<dynamic> key) {
+  T? pointGet(List<dynamic> key) {
     final int base = groupDepth;
     final int len = key.length;
     if (len < base) return null;
-    if (len == base) return exactEntry;
-    if (len == base + 1) {
-      return flat[key[base]];
-    }
+    if (len == base) return _hasExact ? exact : null;
+    if (len == base + 1) return getFlat(key[base], touch: false);
     final d = deep;
     if (d == null) return null;
     dynamic node = d;
@@ -1059,28 +2104,56 @@ final class _Group<T> {
       node = node[key[i]];
       if (node == null) return null;
     }
-    return node is _CacheEntry<T> ? node : null;
+    // Leaf is T stored directly (cannot distinguish Map vs T if T is Map --
+    // engine values are not Maps of this shape; BufferEntry etc. are fine).
+    if (node is Map<Object?, dynamic>) return null;
+    return node as T?;
   }
 
-  void pointInsert(List<dynamic> key, _CacheEntry<T> entry) {
+  bool pointContains(List<dynamic> key) {
+    final int base = groupDepth;
+    final int len = key.length;
+    if (len < base) return false;
+    if (len == base) return _hasExact;
+    if (len == base + 1) return containsFlat(key[base]);
+    final d = deep;
+    if (d == null) return false;
+    dynamic node = d;
+    for (int i = base; i < len; i++) {
+      if (node is! Map<Object?, dynamic>) return false;
+      node = node[key[i]];
+      if (node == null) return false;
+    }
+    return node is! Map<Object?, dynamic>;
+  }
+
+  void pointPut(List<dynamic> key, T value, {int sizeBytes = 0}) {
     final int base = groupDepth;
     final int len = key.length;
     if (len < base) return;
+    final sz = sizeBytes <= 0 ? 1 : sizeBytes;
+
     if (len == base) {
-      exactEntry = entry;
-      // Clear legacy misplaced deep leaf from older builds (wrote deep[key0]
-      // when len == groupDepth). Avoid duplicate visible entries.
-      final d = deep;
-      if (d != null) {
-        d.remove(key[base - 1]);
-        if (d.isEmpty) deep = null;
+      if (orderEnabled) {
+        putExact(value, key: key, sizeBytes: sz);
+      } else {
+        putExactNone(value);
       }
       return;
     }
+
     if (len == base + 1) {
-      flat[key[base]] = entry;
+      putFlat(key[base], value, sizeBytes: sz);
       return;
     }
+
+    if (len == base + 2) {
+      putDeep2(key[base], key[base + 1], value, sizeBytes: sz);
+      return;
+    }
+
+    // Deep multi-suffix (>2).
+    _orderedNeedsPaths = true;
     var map = deep;
     if (map == null) {
       map = <Object?, dynamic>{};
@@ -1097,24 +2170,35 @@ final class _Group<T> {
         map = child;
       }
     }
-    map![key[len - 1]] = entry;
+    final last = key[len - 1];
+    final existed = map!.containsKey(last) && map[last] is! Map;
+    map[last] = value;
+    dirty = true;
+    if (!existed) entryCount++;
+    if (orderEnabled) {
+      _noteDeepPathOrder(key, sz, isNew: !existed);
+    }
   }
 
-  _CacheEntry<T>? pointRemove(List<dynamic> key) {
+  bool pointRemove(List<dynamic> key) {
     final int base = groupDepth;
     final int len = key.length;
-    if (len < base) return null;
-    if (len == base) {
-      final removed = exactEntry;
-      exactEntry = null;
-      return removed;
-    }
-    if (len == base + 1) {
-      return flat.remove(key[base]);
-    }
-    final d = deep;
-    if (d == null) return null;
+    if (len < base) return false;
 
+    if (len == base) {
+      return orderEnabled ? removeExact() : removeExactNone();
+    }
+
+    if (len == base + 1) {
+      return removeFlat(key[base]);
+    }
+
+    if (len == base + 2) {
+      return removeDeep2(key[base], key[base + 1]);
+    }
+
+    final d = deep;
+    if (d == null) return false;
     final stack = <Map<Object?, dynamic>>[];
     final keys = <Object?>[];
     Map<Object?, dynamic> map = d;
@@ -1123,1048 +2207,194 @@ final class _Group<T> {
       final comp = key[i];
       keys.add(comp);
       final next = map[comp];
-      if (next is! Map<Object?, dynamic>) return null;
+      if (next is! Map<Object?, dynamic>) return false;
       map = next;
     }
     final last = key[len - 1];
-    final removed = map.remove(last);
-    if (removed is! _CacheEntry<T>) return null;
-
-    // Prune empty nested maps.
+    if (!map.containsKey(last) || map[last] is Map) return false;
+    map.remove(last);
+    entryCount--;
+    dirty = true;
+    _removeDeepPathOrder(key);
     for (int i = stack.length - 1; i >= 0; i--) {
       final m = (i == stack.length - 1) ? map : stack[i + 1];
       if (m.isNotEmpty) break;
       stack[i].remove(keys[i]);
     }
     if (d.isEmpty) deep = null;
-    return removed;
+    return true;
   }
 
-  void syncOrderedInsert(_CacheEntry<T> entry) {
-    final tree = ordered;
-    if (!orderedDirty && tree != null) {
-      tree.put(entry.key, entry);
+  // ---- ordered / range ----
+
+  void ensureOrdered() {
+    if (!dirty && (orderedFlat != null || orderedPaths != null)) return;
+
+    final usePaths = _orderedNeedsPaths || _hasExact || deep != null;
+    if (!usePaths) {
+      final Iterable<Object?> keyIter =
+          orderEnabled ? (flatLive?.keys ?? const <Object?>[]) : flat.keys;
+      final keys = keyIter.toList(growable: true);
+      keys.sort(_suffixComparator(0));
+      orderedFlat = keys;
+      orderedPaths = null;
+      dirty = false;
+      return;
     }
-  }
 
-  void syncOrderedRemove(_CacheEntry<T> entry) {
-    final tree = ordered;
-    if (!orderedDirty && tree != null) {
-      tree.remove(entry.key);
+    final paths = <List<dynamic>>[];
+    if (_hasExact) {
+      paths.add(List<dynamic>.from(groupPath));
     }
-  }
-
-  Future<_BPlusTree<List<dynamic>, _CacheEntry<T>>> ensureOrdered(
-    YieldController yieldController,
-  ) async {
-    if (!orderedDirty && ordered != null) return ordered!;
-
-    final tree = _BPlusTree<List<dynamic>, _CacheEntry<T>>(
-      order: 64,
-      compare: _pathCompare,
-    );
-
-    final entries = <_CacheEntry<T>>[];
-    final exact = exactEntry;
-    if (exact != null) entries.add(exact);
-    if (flat.isNotEmpty) {
-      entries.addAll(flat.values);
+    if (orderEnabled) {
+      final live = flatLive;
+      if (live != null) {
+        for (final e in live.entries) {
+          paths.add(List<dynamic>.from(groupPath)..add(e.key));
+        }
+      }
+    } else {
+      for (final e in flat.entries) {
+        paths.add(List<dynamic>.from(groupPath)..add(e.key));
+      }
     }
     final d = deep;
     if (d != null) {
-      _collectDeepEntries(d, entries);
+      _collectDeepPaths(d, List<dynamic>.from(groupPath), paths);
     }
-
-    if (entries.length > 4096) {
-      final yCollect = yieldController.maybeYield();
-      if (yCollect != null) await yCollect;
-    }
-
-    final int base = groupDepth;
-    final bool allSingleSuffix =
-        entries.isEmpty || entries.every((e) => e.key.length == base + 1);
-
-    List<_CacheEntry<T>> sorted = entries;
-    if (entries.length > 1) {
-      if (allSingleSuffix) {
-        // Decorate-sort: compare cached suffix only (avoids repeated List indexing).
-        final cmp0 = firstSuffixComparator;
-        final n = entries.length;
-        final suffixes = List<dynamic>.filled(n, null, growable: false);
-        for (int i = 0; i < n; i++) {
-          suffixes[i] = entries[i].key[base];
-        }
-        final orderIdx = List<int>.generate(n, (i) => i, growable: false);
-        orderIdx.sort((a, b) => cmp0(suffixes[a], suffixes[b]));
-        sorted = List<_CacheEntry<T>>.generate(
-          n,
-          (i) => entries[orderIdx[i]],
-          growable: false,
-        );
-      } else {
-        final cmp = _pathCompare;
-        entries.sort((a, b) => cmp(a.key, b.key));
-        sorted = entries;
-      }
-    }
-
-    if (entries.length > 4096) {
-      final ySort = yieldController.maybeYield();
-      if (ySort != null) await ySort;
-    }
-
-    tree.bulkLoadSorted(sorted, (e) => e.key);
-
-    if (entries.length > 4096) {
-      final yLoad = yieldController.maybeYield();
-      if (yLoad != null) await yLoad;
-    }
-
-    ordered = tree;
-    orderedDirty = false;
-    return tree;
+    paths.sort(comparePaths);
+    orderedPaths = paths;
+    orderedFlat = null;
+    dirty = false;
+    _orderedNeedsPaths = usePaths;
   }
 
-  void _collectDeepEntries(
+  void _collectDeepPaths(
     Map<Object?, dynamic> node,
-    List<_CacheEntry<T>> out,
+    List<dynamic> prefix,
+    List<List<dynamic>> out,
   ) {
-    for (final v in node.values) {
-      if (v is _CacheEntry<T>) {
-        out.add(v);
-      } else if (v is Map<Object?, dynamic>) {
-        _collectDeepEntries(v, out);
-      }
-    }
-  }
-
-  void forEachEntry(void Function(_CacheEntry<T> entry) fn) {
-    final exact = exactEntry;
-    if (exact != null) fn(exact);
-    for (final e in flat.values) {
-      fn(e);
-    }
-    final d = deep;
-    if (d != null) {
-      _forEachDeep(d, fn);
-    }
-  }
-
-  void _forEachDeep(
-    Map<Object?, dynamic> node,
-    void Function(_CacheEntry<T> entry) fn,
-  ) {
-    for (final v in node.values) {
-      if (v is _CacheEntry<T>) {
-        fn(v);
-      } else if (v is Map<Object?, dynamic>) {
-        _forEachDeep(v, fn);
-      }
-    }
-  }
-
-  void attachNew(_CacheEntry<T> e) {
-    if (!orderEnabled) return;
-    if (orderTail == null) {
-      orderHead = e;
-      orderTail = e;
-      return;
-    }
-    e.orderPrev = orderTail;
-    e.orderNext = null;
-    orderTail!.orderNext = e;
-    orderTail = e;
-  }
-
-  void touch(_CacheEntry<T> e) {
-    // Single predictable gate: only LRU reorders; fifo/none return here.
-    if (!reorderOnTouch) return;
-    if (identical(e, orderTail)) return;
-    final p = e.orderPrev;
-    final n = e.orderNext;
-    if (p != null) p.orderNext = n;
-    if (n != null) n.orderPrev = p;
-    if (identical(e, orderHead)) orderHead = n;
-
-    e.orderPrev = orderTail;
-    e.orderNext = null;
-    if (orderTail != null) orderTail!.orderNext = e;
-    orderTail = e;
-    orderHead ??= e;
-  }
-
-  void detach(_CacheEntry<T> e) {
-    if (!orderEnabled) return;
-    final p = e.orderPrev;
-    final n = e.orderNext;
-    if (p != null) p.orderNext = n;
-    if (n != null) n.orderPrev = p;
-    if (identical(e, orderHead)) orderHead = n;
-    if (identical(e, orderTail)) orderTail = p;
-    e.orderPrev = null;
-    e.orderNext = null;
-  }
-}
-
-// -------------------- Internal: B+Tree (high fanout) --------------------
-
-abstract class _BPlusNode<K, V> {
-  bool get isLeaf;
-}
-
-final class _BPlusLeaf<K, V> extends _BPlusNode<K, V> {
-  @override
-  bool get isLeaf => true;
-
-  final List<K> keys = <K>[];
-  final List<V> values = <V>[];
-  _BPlusLeaf<K, V>? next;
-  _BPlusLeaf<K, V>? prev;
-}
-
-final class _BPlusInternal<K, V> extends _BPlusNode<K, V> {
-  @override
-  bool get isLeaf => false;
-
-  final List<K> keys = <K>[];
-  final List<_BPlusNode<K, V>> children = <_BPlusNode<K, V>>[];
-}
-
-final class _BPlusTree<K, V> {
-  final int order; // max children per internal node
-  final Comparator<K> compare;
-  final bool rebalanceOnDelete;
-
-  // Scratch buffers to avoid per-op allocations on hot paths.
-  final List<_BPlusInternal<K, V>> _scratchPath = <_BPlusInternal<K, V>>[];
-  final List<int> _scratchIdxPath = <int>[];
-
-  late final int _maxKeys;
-  late final int _minLeafKeys;
-  late final int _minInternalChildren;
-
-  _BPlusNode<K, V> _root = _BPlusLeaf<K, V>();
-  int _length = 0;
-
-  // Prepared insert state (set by [findForInsert], consumed by [insertPrepared]).
-  _BPlusLeaf<K, V>? _preparedLeaf;
-  int _preparedPos = 0;
-  bool _preparedNeedPath = false;
-  bool _preparedValid = false;
-
-  // Finger (sequential) optimization for hot get/contains loops.
-  _BPlusLeaf<K, V>? _fingerLeaf;
-  K? _fingerKey;
-
-  _BPlusTree({
-    required this.order,
-    required this.compare,
-    this.rebalanceOnDelete = false,
-  }) {
-    if (order < 4) {
-      throw DbException([
-        InvalidArgumentStatus(
-          type: ResultType.engError,
-          message: 'order must be >= 4',
-          parameterName: 'order',
-          passedValue: order,
-        )
-      ]);
-    }
-    _maxKeys = order - 1;
-    _minLeafKeys = (_maxKeys + 1) ~/ 2;
-    _minInternalChildren = (order + 1) ~/ 2;
-  }
-
-  int get length => _length;
-
-  /// Bottom-up bulk load from a **pre-sorted** value list.
-  ///
-  /// [keyOf] extracts the tree key from each value. Much faster than N
-  /// sequential [put]s for rebuilding an ordered view after Map-only mutations.
-  void bulkLoadSorted(List<V> sorted, K Function(V item) keyOf) {
-    _root = _BPlusLeaf<K, V>();
-    _length = 0;
-    _fingerLeaf = null;
-    _fingerKey = null;
-    _preparedValid = false;
-    if (sorted.isEmpty) return;
-
-    final leaves = <_BPlusLeaf<K, V>>[];
-    _BPlusLeaf<K, V>? prev;
-    final int n = sorted.length;
-    final int leafCap = _maxKeys;
-
-    for (int i = 0; i < n;) {
-      int remaining = n - i;
-      int take = math.min(leafCap, remaining);
-      // Avoid a tiny trailing leaf when remainder is 1 after a full leaf:
-      // prefer slightly smaller previous fill (keeps leaf chain dense).
-      if (remaining > leafCap && remaining - leafCap == 1 && leafCap > 1) {
-        take = leafCap - 1;
-      }
-
-      final leaf = _BPlusLeaf<K, V>();
-      final end = i + take;
-      for (int j = i; j < end; j++) {
-        final item = sorted[j];
-        leaf.keys.add(keyOf(item));
-        leaf.values.add(item);
-      }
-      if (prev != null) {
-        prev.next = leaf;
-        leaf.prev = prev;
-      }
-      prev = leaf;
-      leaves.add(leaf);
-      i = end;
-    }
-
-    _length = n;
-    _fingerLeaf = leaves.first;
-    _fingerKey = leaves.first.keys.first;
-
-    if (leaves.length == 1) {
-      _root = leaves.first;
-      return;
-    }
-
-    // Build internal levels bottom-up. Each internal holds up to [order] children.
-    List<_BPlusNode<K, V>> level = List<_BPlusNode<K, V>>.from(leaves);
-    while (level.length > 1) {
-      final nextLevel = <_BPlusNode<K, V>>[];
-      for (int i = 0; i < level.length;) {
-        int remaining = level.length - i;
-        int take = math.min(order, remaining);
-        // Never leave a single-child internal orphan (breaks upper-bound routing).
-        if (remaining > order && remaining - order == 1 && order > 1) {
-          take = order - 1;
-        }
-
-        // Absorb a final singleton into the previous internal when possible.
-        if (take == 1 && nextLevel.isNotEmpty) {
-          final prevNode = nextLevel.last;
-          if (prevNode is _BPlusInternal<K, V> &&
-              prevNode.children.length < order) {
-            final child = level[i];
-            prevNode.children.add(child);
-            final minKey = _minKeyOfNode(child);
-            if (minKey != null) prevNode.keys.add(minKey);
-            i++;
-            continue;
-          }
-        }
-
-        final node = _BPlusInternal<K, V>();
-        final end = i + take;
-        for (int j = i; j < end; j++) {
-          final child = level[j];
-          node.children.add(child);
-          if (j > i) {
-            final minKey = _minKeyOfNode(child);
-            if (minKey != null) node.keys.add(minKey);
-          }
-        }
-        nextLevel.add(node);
-        i = end;
-      }
-      level = nextLevel;
-    }
-    _root = level.first;
-  }
-
-  bool containsKey(K key) {
-    // Fast path: finger search without value retrieval or LRU updates.
-    final fingerLeaf = _fingerLeaf;
-    final fingerKey = _fingerKey;
-    if (fingerLeaf != null && fingerKey != null) {
-      final fk = fingerLeaf.keys;
-      if (fk.isNotEmpty && compare(fingerKey, key) <= 0) {
-        // Try current finger leaf.
-        final last = fk.last;
-        if (compare(key, last) <= 0) {
-          final idx = _lowerBound(fk, key);
-          _fingerKey = key;
-          if (idx < fk.length && compare(fk[idx], key) == 0) {
-            return true;
-          }
-          return false;
-        }
-
-        // Try one hop to next leaf.
-        final next = fingerLeaf.next;
-        if (next != null && next.keys.isNotEmpty) {
-          final nk = next.keys;
-          if (compare(key, nk.last) <= 0) {
-            final idx = _lowerBound(nk, key);
-            _fingerLeaf = next;
-            _fingerKey = key;
-            if (idx < nk.length && compare(nk[idx], key) == 0) {
-              return true;
-            }
-            return false;
-          }
-        }
-      }
-    }
-
-    var node = _root;
-    while (!node.isLeaf) {
-      final inl = node as _BPlusInternal<K, V>;
-      final idx = _childIndex(inl.keys, key);
-      node = inl.children[idx];
-    }
-    final leaf = node as _BPlusLeaf<K, V>;
-    final idx = _lowerBound(leaf.keys, key);
-    _fingerLeaf = leaf;
-    _fingerKey = key;
-    return idx < leaf.keys.length && compare(leaf.keys[idx], key) == 0;
-  }
-
-  V? get(K key) {
-    // Fast path: finger search for monotonic forward access patterns.
-    final fingerLeaf = _fingerLeaf;
-    final fingerKey = _fingerKey;
-    if (fingerLeaf != null && fingerKey != null) {
-      final fk = fingerLeaf.keys;
-      if (fk.isNotEmpty && compare(fingerKey, key) <= 0) {
-        // Try current finger leaf (most common case: sequential gets).
-        final last = fk.last;
-        if (compare(key, last) <= 0) {
-          final idx = _lowerBound(fk, key);
-          _fingerKey = key;
-          if (idx < fk.length && compare(fk[idx], key) == 0) {
-            return fingerLeaf.values[idx];
-          }
-          return null;
-        }
-
-        // Try one hop to next leaf (handles boundary crossing).
-        final next = fingerLeaf.next;
-        if (next != null && next.keys.isNotEmpty) {
-          final nk = next.keys;
-          if (compare(key, nk.last) <= 0) {
-            final idx = _lowerBound(nk, key);
-            _fingerLeaf = next;
-            _fingerKey = key;
-            if (idx < nk.length && compare(nk[idx], key) == 0) {
-              return next.values[idx];
-            }
-            return null;
-          }
-        }
-      }
-    }
-
-    var node = _root;
-    while (!node.isLeaf) {
-      final inl = node as _BPlusInternal<K, V>;
-      final idx = _childIndex(inl.keys, key);
-      node = inl.children[idx];
-    }
-    final leaf = node as _BPlusLeaf<K, V>;
-    final idx = _lowerBound(leaf.keys, key);
-    _fingerLeaf = leaf;
-    _fingerKey = key;
-    if (idx < leaf.keys.length && compare(leaf.keys[idx], key) == 0) {
-      return leaf.values[idx];
-    }
-    return null;
-  }
-
-  void put(K key, V value) {
-    // Fast path: finger-based locality for monotonic inserts/updates.
-    final fingerLeaf = _fingerLeaf;
-    final fingerKey = _fingerKey;
-    _BPlusLeaf<K, V>? leaf;
-    int? pos;
-
-    if (fingerLeaf != null && fingerKey != null) {
-      final fk = fingerLeaf.keys;
-      if (fk.isNotEmpty && compare(fingerKey, key) <= 0) {
-        // Try current finger leaf.
-        // CHANGE: Handle append case (key > last).
-        // If key <= last, we are inside.
-        // If key > last, we might be appending to this leaf IF
-        if (fk.isNotEmpty && compare(fingerKey, key) <= 0) {
-          // Try current finger leaf.
-          if (compare(key, fk.last) <= 0) {
-            final idx = _lowerBound(fk, key);
-            if (idx < fk.length && compare(fk[idx], key) == 0) {
-              fingerLeaf.values[idx] = value;
-              _fingerLeaf = fingerLeaf;
-              _fingerKey = key;
-              return;
-            }
-            leaf = fingerLeaf;
-            pos = idx;
-          } else {
-            // Try one hop to next leaf.
-            final next = fingerLeaf.next;
-            if (next != null && next.keys.isNotEmpty) {
-              final nextFirst = next.keys.first;
-              // If key < nextFirst, we append to current leaf (or split current leaf).
-              if (compare(key, nextFirst) < 0) {
-                leaf = fingerLeaf;
-                pos = fk.length;
-              } else {
-                // key >= nextFirst. Try next leaf.
-                final nk = next.keys;
-                if (nk.isNotEmpty && compare(key, nk.last) <= 0) {
-                  pos = _lowerBound(nk, key);
-                  if (pos < nk.length && compare(nk[pos], key) == 0) {
-                    next.values[pos] = value;
-                    _fingerLeaf = next;
-                    _fingerKey = key;
-                    return;
-                  }
-                  leaf = next;
-                } else {
-                  // Even > next.last.
-                  // If next is rightmost, we append to next.
-                  if (next.next == null ||
-                      (next.next!.keys.isNotEmpty &&
-                          compare(key, next.next!.keys.first) < 0)) {
-                    leaf = next;
-                    pos = nk.length;
-                  }
-                }
-              }
-            } else {
-              // No next leaf (or empty), so we append to current.
-              leaf = fingerLeaf;
-              pos = fk.length;
-            }
-          }
-        }
-      }
-    }
-
-    // Fallback: full descent.
-    if (leaf == null || pos == null) {
-      var node = _root;
-      while (!node.isLeaf) {
-        final inl = node as _BPlusInternal<K, V>;
-        final idx = _childIndex(inl.keys, key);
-        node = inl.children[idx];
-      }
-      leaf = node as _BPlusLeaf<K, V>;
-      pos = _lowerBound(leaf.keys, key);
-    }
-
-    final leafFinal = leaf;
-    final posFinal = pos;
-
-    if (posFinal < leafFinal.keys.length &&
-        compare(leafFinal.keys[posFinal], key) == 0) {
-      leafFinal.values[posFinal] = value;
-      _fingerLeaf = leafFinal;
-      _fingerKey = key;
-      return;
-    }
-
-    final bool willOverflow = leafFinal.keys.length >= _maxKeys;
-    final bool needMinUpdate = posFinal == 0 && !identical(_root, leafFinal);
-
-    if (!willOverflow && !needMinUpdate) {
-      if (posFinal == leafFinal.keys.length) {
-        leafFinal.keys.add(key);
-        leafFinal.values.add(value);
+    for (final e in node.entries) {
+      final nextPrefix = List<dynamic>.from(prefix)..add(e.key);
+      final v = e.value;
+      if (v is Map<Object?, dynamic>) {
+        _collectDeepPaths(v, nextPrefix, out);
       } else {
-        leafFinal.keys.insert(posFinal, key);
-        leafFinal.values.insert(posFinal, value);
+        out.add(nextPrefix);
       }
-      _length++;
-      _fingerLeaf = leafFinal;
-      _fingerKey = key;
-      return;
-    }
-
-    // Slow path with stacks for correctness when split/min-update is required.
-    _scratchPath.clear();
-    _scratchIdxPath.clear();
-    final leaf2 = _findLeaf(key, path: _scratchPath, idxPath: _scratchIdxPath);
-    final pos2 = _lowerBound(leaf2.keys, key);
-    if (pos2 < leaf2.keys.length && compare(leaf2.keys[pos2], key) == 0) {
-      leaf2.values[pos2] = value;
-      _fingerLeaf = leaf2;
-      _fingerKey = key;
-      return;
-    }
-
-    if (pos2 == leaf2.keys.length) {
-      leaf2.keys.add(key);
-      leaf2.values.add(value);
-    } else {
-      leaf2.keys.insert(pos2, key);
-      leaf2.values.insert(pos2, value);
-    }
-    _length++;
-    _fingerLeaf = leaf2;
-    _fingerKey = key;
-
-    if (pos2 == 0) {
-      _refreshAncestorsMinKey(path: _scratchPath, idxPath: _scratchIdxPath);
-    }
-
-    if (leaf2.keys.length > _maxKeys) {
-      _splitLeaf(leaf2, path: _scratchPath, idxPath: _scratchIdxPath);
     }
   }
 
-  /// Locate [key] and prepare for a potential insert.
-  ///
-  /// - If found, returns the existing value.
-  /// - If not found, returns null and stores a cheap insertion hint used by [insertPrepared].
-  V? findForInsert(K key) {
-    // Fast path: finger-based locality for monotonic inserts/updates.
-    final fingerLeaf = _fingerLeaf;
-    final fingerKey = _fingerKey;
-    if (fingerLeaf != null && fingerKey != null) {
-      final fk = fingerLeaf.keys;
-      if (fk.isNotEmpty && compare(fingerKey, key) <= 0) {
-        // Try current finger leaf.
-        if (compare(key, fk.last) <= 0) {
-          final pos = _lowerBound(fk, key);
-          _preparedLeaf = fingerLeaf;
-          _preparedPos = pos;
-          _preparedNeedPath = fk.length >= _maxKeys ||
-              (pos == 0 && !identical(_root, fingerLeaf));
-          _preparedValid = true;
-          _fingerKey = key;
-          if (pos < fk.length && compare(fk[pos], key) == 0) {
-            return fingerLeaf.values[pos];
-          }
-          return null;
-        }
-
-        // Try one hop to next leaf or append.
-        final next = fingerLeaf.next;
-        if (next != null && next.keys.isNotEmpty) {
-          final nextFirst = next.keys.first;
-          if (compare(key, nextFirst) < 0) {
-            // Append to current fingerLeaf
-            _preparedLeaf = fingerLeaf;
-            _preparedPos = fk.length;
-            _preparedNeedPath = fk.length >=
-                _maxKeys; // Appending never updates min key unless we split
-            _preparedValid = true;
-            _fingerKey = key;
-            return null;
-          }
-
-          final nk = next.keys;
-          if (compare(key, nk.last) <= 0) {
-            final pos = _lowerBound(nk, key);
-            _preparedLeaf = next;
-            _preparedPos = pos;
-            _preparedNeedPath =
-                nk.length >= _maxKeys || (pos == 0 && !identical(_root, next));
-            _preparedValid = true;
-            _fingerLeaf = next;
-            _fingerKey = key;
-            if (pos < nk.length && compare(nk[pos], key) == 0) {
-              return next.values[pos];
-            }
-            return null;
-          } else {
-            // Check if appending to next?
-            if (next.next == null ||
-                (next.next!.keys.isNotEmpty &&
-                    compare(key, next.next!.keys.first) < 0)) {
-              _preparedLeaf = next;
-              _preparedPos = nk.length;
-              _preparedNeedPath = nk.length >= _maxKeys;
-              _preparedValid = true;
-              _fingerLeaf = next;
-              _fingerKey = key;
-              return null;
-            }
-          }
-        } else {
-          // No next leaf, so append to current!
-          _preparedLeaf = fingerLeaf;
-          _preparedPos = fk.length;
-          _preparedNeedPath = fk.length >= _maxKeys;
-          _preparedValid = true;
-          _fingerKey = key;
-          return null;
-        }
-      }
-    }
-
-    var node = _root;
-    while (!node.isLeaf) {
-      final inl = node as _BPlusInternal<K, V>;
-      final idx = _childIndex(inl.keys, key);
-      node = inl.children[idx];
-    }
-    final leaf = node as _BPlusLeaf<K, V>;
-    final pos = _lowerBound(leaf.keys, key);
-
-    _preparedLeaf = leaf;
-    _preparedPos = pos;
-    _preparedNeedPath =
-        leaf.keys.length >= _maxKeys || (pos == 0 && !identical(_root, leaf));
-    _preparedValid = true;
-    _fingerLeaf = leaf;
-    _fingerKey = key;
-
-    if (pos < leaf.keys.length && compare(leaf.keys[pos], key) == 0) {
-      return leaf.values[pos];
-    }
-    return null;
-  }
-
-  /// Insert [value] for [key] using the last hint from [findForInsert].
-  ///
-  /// This avoids a second full tree search for the common case (no split, no min-key update).
-  void insertPrepared(K key, V value) {
-    if (!_preparedValid || _preparedLeaf == null) {
-      put(key, value);
-      return;
-    }
-
-    final leaf = _preparedLeaf!;
-    final pos = _preparedPos;
-    _preparedValid = false;
-
-    if (!_preparedNeedPath) {
-      if (pos == leaf.keys.length) {
-        leaf.keys.add(key);
-        leaf.values.add(value);
-      } else {
-        leaf.keys.insert(pos, key);
-        leaf.values.insert(pos, value);
-      }
-      _length++;
-      _fingerLeaf = leaf;
-      _fingerKey = key;
-      return;
-    }
-
-    // Slow path: we need parent path (split or min-key update). Use scratch buffers.
-    _scratchPath.clear();
-    _scratchIdxPath.clear();
-    final leaf2 = _findLeaf(key, path: _scratchPath, idxPath: _scratchIdxPath);
-    final pos2 = _lowerBound(leaf2.keys, key);
-    if (pos2 < leaf2.keys.length && compare(leaf2.keys[pos2], key) == 0) {
-      // Race-safe fallback: treat as overwrite.
-      leaf2.values[pos2] = value;
-      return;
-    }
-
-    if (pos2 == leaf2.keys.length) {
-      leaf2.keys.add(key);
-      leaf2.values.add(value);
-    } else {
-      leaf2.keys.insert(pos2, key);
-      leaf2.values.insert(pos2, value);
-    }
-    _length++;
-    _fingerLeaf = leaf2;
-    _fingerKey = key;
-
-    if (pos2 == 0 && _scratchPath.isNotEmpty) {
-      _refreshAncestorsMinKey(path: _scratchPath, idxPath: _scratchIdxPath);
-    }
-
-    if (leaf2.keys.length > _maxKeys) {
-      _splitLeaf(leaf2, path: _scratchPath, idxPath: _scratchIdxPath);
-    }
-  }
-
-  V? remove(K key) {
-    if (!rebalanceOnDelete) {
-      // [Optimization] Lazy delete: do not rebalance or update separators.
-      // Separator keys can safely remain stale-smaller after deletions (min key only increases),
-      // and we refresh separators on insert-at-front paths.
-      final fingerLeaf = _fingerLeaf;
-      final fingerKey = _fingerKey;
-      if (fingerLeaf != null && fingerKey != null) {
-        final fk = fingerLeaf.keys;
-        if (fk.isNotEmpty && compare(fingerKey, key) <= 0) {
-          // Try current finger leaf.
-          if (compare(key, fk.last) <= 0) {
-            final idx = _lowerBound(fk, key);
-            _fingerKey = key;
-            if (idx < fk.length && compare(fk[idx], key) == 0) {
-              // Optimize removal based on position.
-              final values = fingerLeaf.values;
-              final removedValue = values[idx];
-
-              // Always use removeAt to maintain sorted order (critical for binary search).
-              // The previous swap-then-removeLast optimization broke B+Tree invariant.
-              if (idx == fk.length - 1) {
-                fk.removeLast();
-                values.removeLast();
-              } else {
-                fk.removeAt(idx);
-                values.removeAt(idx);
-              }
-              _length--;
-              // Clear finger to avoid pointing to deleted entry.
-              _fingerLeaf = null;
-              _fingerKey = null;
-              return removedValue;
-            }
-            return null;
-          }
-
-          // Try one hop to next leaf.
-          final next = fingerLeaf.next;
-          if (next != null && next.keys.isNotEmpty) {
-            final nk = next.keys;
-            if (compare(key, nk.last) <= 0) {
-              final idx = _lowerBound(nk, key);
-              _fingerLeaf = next;
-              _fingerKey = key;
-              if (idx < nk.length && compare(nk[idx], key) == 0) {
-                final values = next.values;
-                final removedValue = values[idx];
-
-                // Always use removeAt to maintain sorted order (critical for binary search).
-                if (idx == nk.length - 1) {
-                  nk.removeLast();
-                  values.removeLast();
-                } else {
-                  nk.removeAt(idx);
-                  values.removeAt(idx);
-                }
-                _length--;
-                // Clear finger to avoid pointing to deleted entry.
-                _fingerLeaf = null;
-                _fingerKey = null;
-                return removedValue;
-              }
-              return null;
-            }
-          }
-        }
-      }
-
-      var node = _root;
-      while (!node.isLeaf) {
-        final inl = node as _BPlusInternal<K, V>;
-        final idx = _childIndex(inl.keys, key);
-        node = inl.children[idx];
-      }
-      final leaf = node as _BPlusLeaf<K, V>;
-
-      final pos = _lowerBound(leaf.keys, key);
-      if (pos >= leaf.keys.length || compare(leaf.keys[pos], key) != 0) {
-        return null;
-      }
-
-      // Removal strategy:
-      // - End: removeLast (O(1))
-      // - Other positions: removeAt to preserve sorted order (required for binary search)
-      final keys = leaf.keys;
-      final values = leaf.values;
-      final removedValue = values[pos];
-
-      // Always use removeAt to maintain sorted order (critical for binary search).
-      // The previous swap-then-removeLast optimization broke the B+Tree sorted invariant,
-      // causing _lowerBound to return wrong indices and get() to miss existing entries.
-      if (pos == keys.length - 1) {
-        keys.removeLast();
-        values.removeLast();
-      } else {
-        keys.removeAt(pos);
-        values.removeAt(pos);
-      }
-
-      _length--;
-      // Clear finger to avoid pointing to deleted entry.
-      // Update to a valid key if leaf still has entries, otherwise clear.
-      if (keys.isNotEmpty) {
-        _fingerLeaf = leaf;
-        _fingerKey =
-            pos > 0 ? keys[math.min(pos - 1, keys.length - 1)] : keys.first;
-      } else {
-        _fingerLeaf = null;
-        _fingerKey = null;
-      }
-      return removedValue;
-    }
-
-    // Strict delete path (keeps tree dense; higher CPU cost).
-    _scratchPath.clear();
-    _scratchIdxPath.clear();
-    final leaf = _findLeaf(key, path: _scratchPath, idxPath: _scratchIdxPath);
-
-    final pos = _lowerBound(leaf.keys, key);
-    if (pos >= leaf.keys.length || compare(leaf.keys[pos], key) != 0) {
-      return null;
-    }
-
-    // Optimize removal: same strategy as lazy delete path.
-    final keys = leaf.keys;
-    final values = leaf.values;
-    final removedValue = values[pos];
-
-    // Always use removeAt to maintain sorted order (critical for binary search).
-    if (pos == keys.length - 1) {
-      keys.removeLast();
-      values.removeLast();
-    } else {
-      keys.removeAt(pos);
-      values.removeAt(pos);
-    }
-    _length--;
-
-    // Clear finger to avoid pointing to deleted entry.
-    if (keys.isNotEmpty) {
-      _fingerLeaf = leaf;
-      _fingerKey =
-          pos > 0 ? keys[math.min(pos - 1, keys.length - 1)] : keys.first;
-    } else {
-      _fingerLeaf = null;
-      _fingerKey = null;
-    }
-
-    if (identical(_root, leaf)) {
-      return removedValue;
-    }
-
-    // If we removed the smallest key of this leaf, the subtree minimum may change.
-    // We must refresh separators up the path (not only the direct parent) to keep
-    // navigation correct when the affected leaf is in a non-leftmost subtree.
-    if (pos == 0 && leaf.keys.isNotEmpty) {
-      _refreshAncestorsMinKey(path: _scratchPath, idxPath: _scratchIdxPath);
-    }
-
-    if (leaf.keys.length < _minLeafKeys) {
-      _rebalanceLeaf(leaf, path: _scratchPath, idxPath: _scratchIdxPath);
-    }
-
-    return removedValue;
-  }
-
-  Future<void> scanRange(
-    K start,
-    K? end, {
-    bool reverse = false,
+  /// Returns number of entries emitted.
+  int scanRange(
+    List<dynamic> start,
+    List<dynamic>? end, {
+    required bool reverse,
     int? limit,
-    required bool Function(K key, V value) onEntry,
-    YieldController? yieldController,
-  }) async {
-    if (_length <= 0) return;
-    if (limit != null && limit <= 0) return;
+    required bool Function(List<dynamic> path, T value) onEntry,
+  }) {
+    ensureOrdered();
+    var emitted = 0;
+    var remaining = limit;
+
+    if (orderedFlat != null &&
+        !_orderedNeedsPaths &&
+        !_hasExact &&
+        deep == null) {
+      // Fast single-suffix scan.
+      final ordered = orderedFlat!;
+      if (ordered.isEmpty) return 0;
+      final Object? startSuffix =
+          start.length > groupDepth ? start[groupDepth] : null;
+      final Object? endSuffix =
+          (end != null && end.length > groupDepth && _prefixMatchesGroup(end))
+              ? end[groupDepth]
+              : null;
+
+      final path = List<dynamic>.from(groupPath)..add(null);
+
+      if (!reverse) {
+        var i = startSuffix == null ? 0 : _lowerBoundFlat(startSuffix);
+        for (; i < ordered.length; i++) {
+          if (remaining != null && remaining <= 0) break;
+          final s = ordered[i];
+          final v = getFlat(s, touch: false);
+          if (v == null) continue;
+          if (endSuffix != null && _suffixComparator(0)(s, endSuffix) > 0) {
+            break;
+          }
+          path[groupDepth] = s;
+          emitted++;
+          if (!onEntry(path, v)) break;
+          if (remaining != null) remaining--;
+        }
+      } else {
+        var i = endSuffix == null
+            ? ordered.length - 1
+            : _upperBoundFlat(endSuffix) - 1;
+        final lo = startSuffix == null ? 0 : _lowerBoundFlat(startSuffix);
+        for (; i >= lo; i--) {
+          if (remaining != null && remaining <= 0) break;
+          final s = ordered[i];
+          final v = getFlat(s, touch: false);
+          if (v == null) continue;
+          path[groupDepth] = s;
+          emitted++;
+          if (!onEntry(path, v)) break;
+          if (remaining != null) remaining--;
+        }
+      }
+      return emitted;
+    }
+
+    // Path-ordered scan.
+    final paths = orderedPaths;
+    if (paths == null || paths.isEmpty) return 0;
 
     if (!reverse) {
-      final startPos = _seekLowerBound(start);
-      var leaf = startPos.leaf;
-      var i = startPos.index;
-      int produced = 0;
-
-      while (leaf != null) {
-        // Snapshot keys and values to avoid concurrent modification issues (index shifts)
-        // caused by background cleanup/eviction while yielding.
-        final currentKeys = leaf.keys.toList(growable: false);
-        final currentValues = leaf.values.toList(growable: false);
-        final len = currentKeys.length;
-
-        // Note: We use the local 'len' and snapshot lists.
-        // Even if 'leaf' is concurrently modified (shrunk), we iterate our snapshot.
-        while (i < len) {
-          if (yieldController != null) {
-            final y3 = yieldController.maybeYield();
-            if (y3 != null) await y3;
-          }
-
-          final k = currentKeys[i];
-          if (end != null && compare(k, end) > 0) return;
-          final v = currentValues[i];
-          if (!onEntry(k, v)) return;
-          produced++;
-          if (limit != null && produced >= limit) return;
-          i++;
-        }
-        leaf = leaf.next;
-        i = 0;
+      var i = _lowerBoundPaths(start);
+      for (; i < paths.length; i++) {
+        if (remaining != null && remaining <= 0) break;
+        final p = paths[i];
+        if (end != null && comparePaths(p, end) > 0) break;
+        final v = pointGet(p);
+        if (v == null) continue;
+        emitted++;
+        if (!onEntry(p, v)) break;
+        if (remaining != null) remaining--;
       }
-      return;
+    } else {
+      var i = end == null ? paths.length - 1 : _upperBoundPaths(end) - 1;
+      final lo = _lowerBoundPaths(start);
+      for (; i >= lo; i--) {
+        if (remaining != null && remaining <= 0) break;
+        final p = paths[i];
+        final v = pointGet(p);
+        if (v == null) continue;
+        emitted++;
+        if (!onEntry(p, v)) break;
+        if (remaining != null) remaining--;
+      }
     }
-
-    // Reverse scan: start from end bound (or rightmost).
-    final endPos = end == null ? _seekLast() : _seekLastLE(end);
-    var leaf = endPos.leaf;
-    var i = endPos.index;
-    int produced = 0;
-
-    while (leaf != null) {
-      // Snapshot keys and values to avoid concurrent modification issues.
-      final currentKeys = leaf.keys.toList(growable: false);
-      final currentValues = leaf.values.toList(growable: false);
-
-      // Clamp 'i' to the current snapshot length if the leaf was modified
-      // between the seek and this snapshot (unlikely given sync seek, but safe).
-      // Actually seek is sync, so i is valid for the leaf AT THAT MOMENT.
-      // But if we loop: next iteration 'leaf = leaf.prev', we enter loop.
-      // We snapshot. 'i' is 'leaf.keys.length - 1'.
-      // If leaf grew/shrank?
-      // For reverse, we calculate 'i' for standard iteration as length-1.
-      // For the first leaf (found by seek), 'i' is derived from seek.
-
-      // Safety check for the first leaf if concurrent modification happened (though unlikely to shrink exactly here)
-      if (i >= currentKeys.length) {
-        i = currentKeys.length - 1;
-      }
-
-      while (i >= 0) {
-        if (yieldController != null) {
-          final y4 = yieldController.maybeYield();
-          if (y4 != null) await y4;
-        }
-
-        final k = currentKeys[i];
-        if (compare(k, start) < 0) return;
-        final v = currentValues[i];
-        if (!onEntry(k, v)) return;
-        produced++;
-        if (limit != null && produced >= limit) return;
-        i--;
-      }
-      leaf = leaf.prev;
-      if (leaf == null) return;
-      // For subsequent leaves, start at the end.
-      // Note: We access leaf.keys.length directly here.
-      // Strictly speaking, we should snapshot first, then set i = len - 1.
-      // But we set i here, then loop loops back to snapshot.
-      // So 'leaf.keys.length' might be unstable?
-      // Better to set i = -1 (flag) and handle "start at end" inside the loop?
-      // Or just accept that 'i' is just an initial capacity guess and we re-clamp?
-      // Let's rely on snapshot.length in the next iteration.
-      i = leaf.keys.length - 1;
-    }
+    return emitted;
   }
 
-  // -------------------- Internal: navigation --------------------
-
-  _BPlusLeaf<K, V> _findLeaf(
-    K key, {
-    required List<_BPlusInternal<K, V>> path,
-    required List<int> idxPath,
-  }) {
-    var node = _root;
-    while (!node.isLeaf) {
-      final inl = node as _BPlusInternal<K, V>;
-      final idx = _childIndex(inl.keys, key);
-      path.add(inl);
-      idxPath.add(idx);
-      node = inl.children[idx];
+  bool _prefixMatchesGroup(List<dynamic> key) {
+    if (key.length < groupDepth) return false;
+    for (int i = 0; i < groupDepth; i++) {
+      if (key[i] != groupPath[i]) return false;
     }
-    return node as _BPlusLeaf<K, V>;
+    return true;
   }
 
-  int _childIndex(List<K> keys, K key) {
-    // Upper-bound: first keys[mid] > key
-    int lo = 0;
-    int hi = keys.length;
+  int _lowerBoundFlat(Object? key) {
+    final a = orderedFlat!;
+    final cmp = _suffixComparator(0);
+    var lo = 0;
+    var hi = a.length;
     while (lo < hi) {
       final mid = (lo + hi) >> 1;
-      if (compare(keys[mid], key) <= 0) {
+      if (cmp(a[mid], key) < 0) {
         lo = mid + 1;
       } else {
         hi = mid;
@@ -2173,12 +2403,14 @@ final class _BPlusTree<K, V> {
     return lo;
   }
 
-  int _lowerBound(List<K> keys, K key) {
-    int lo = 0;
-    int hi = keys.length;
+  int _upperBoundFlat(Object? key) {
+    final a = orderedFlat!;
+    final cmp = _suffixComparator(0);
+    var lo = 0;
+    var hi = a.length;
     while (lo < hi) {
       final mid = (lo + hi) >> 1;
-      if (compare(keys[mid], key) < 0) {
+      if (cmp(a[mid], key) <= 0) {
         lo = mid + 1;
       } else {
         hi = mid;
@@ -2187,304 +2419,33 @@ final class _BPlusTree<K, V> {
     return lo;
   }
 
-  ({_BPlusLeaf<K, V>? leaf, int index}) _seekLowerBound(K key) {
-    final path = <_BPlusInternal<K, V>>[];
-    final idxPath = <int>[];
-    final leaf = _findLeaf(key, path: path, idxPath: idxPath);
-    final idx = _lowerBound(leaf.keys, key);
-    if (idx < leaf.keys.length) {
-      return (leaf: leaf, index: idx);
-    }
-    return (leaf: leaf.next, index: 0);
-  }
-
-  ({_BPlusLeaf<K, V>? leaf, int index}) _seekLast() {
-    var node = _root;
-    while (!node.isLeaf) {
-      final inl = node as _BPlusInternal<K, V>;
-      node = inl.children.last;
-    }
-    final leaf = node as _BPlusLeaf<K, V>;
-    return (leaf: leaf, index: leaf.keys.length - 1);
-  }
-
-  ({_BPlusLeaf<K, V>? leaf, int index}) _seekLastLE(K key) {
-    final path = <_BPlusInternal<K, V>>[];
-    final idxPath = <int>[];
-    final leaf = _findLeaf(key, path: path, idxPath: idxPath);
-    int lo = 0;
-    int hi = leaf.keys.length;
-    // upperBound (<= key): first > key, then -1
+  int _lowerBoundPaths(List<dynamic> key) {
+    final a = orderedPaths!;
+    var lo = 0;
+    var hi = a.length;
     while (lo < hi) {
       final mid = (lo + hi) >> 1;
-      if (compare(leaf.keys[mid], key) <= 0) {
+      if (comparePaths(a[mid], key) < 0) {
         lo = mid + 1;
       } else {
         hi = mid;
       }
     }
-    final idx = lo - 1;
-    if (idx >= 0) return (leaf: leaf, index: idx);
-    // Go to previous leaf.
-    final prev = leaf.prev;
-    if (prev == null) return (leaf: null, index: -1);
-    return (leaf: prev, index: prev.keys.length - 1);
+    return lo;
   }
 
-  // -------------------- Internal: split --------------------
-
-  void _splitLeaf(
-    _BPlusLeaf<K, V> leaf, {
-    required List<_BPlusInternal<K, V>> path,
-    required List<int> idxPath,
-  }) {
-    final int mid = leaf.keys.length >> 1;
-    final right = _BPlusLeaf<K, V>();
-    right.keys.addAll(leaf.keys.sublist(mid));
-    right.values.addAll(leaf.values.sublist(mid));
-    leaf.keys.removeRange(mid, leaf.keys.length);
-    leaf.values.removeRange(mid, leaf.values.length);
-
-    // Link leaves.
-    right.next = leaf.next;
-    if (right.next != null) right.next!.prev = right;
-    right.prev = leaf;
-    leaf.next = right;
-
-    final sepKey = right.keys.first;
-
-    if (path.isEmpty) {
-      final root = _BPlusInternal<K, V>();
-      root.children.add(leaf);
-      root.children.add(right);
-      root.keys.add(sepKey);
-      _root = root;
-      return;
-    }
-
-    final parent = path.last;
-    final int leafIdx = idxPath.last;
-    parent.children.insert(leafIdx + 1, right);
-    parent.keys.insert(leafIdx, sepKey);
-
-    if (parent.keys.length > _maxKeys) {
-      _splitInternal(parent, path: path, idxPath: idxPath);
-    }
-  }
-
-  void _splitInternal(
-    _BPlusInternal<K, V> node, {
-    required List<_BPlusInternal<K, V>> path,
-    required List<int> idxPath,
-  }) {
-    final int childrenLen = node.children.length;
-    final int splitChildIndex = (childrenLen / 2).ceil();
-    final K sepKey = node.keys[splitChildIndex - 1];
-
-    final right = _BPlusInternal<K, V>();
-    right.children.addAll(node.children.sublist(splitChildIndex));
-    right.keys.addAll(node.keys.sublist(splitChildIndex));
-
-    node.children.removeRange(splitChildIndex, node.children.length);
-    node.keys.removeRange(splitChildIndex - 1, node.keys.length);
-
-    if (path.length == 1) {
-      // node is root
-      final root = _BPlusInternal<K, V>();
-      root.children.add(node);
-      root.children.add(right);
-      root.keys.add(sepKey);
-      _root = root;
-      return;
-    }
-
-    final parent = path[path.length - 2];
-    final int nodeIdx = idxPath[idxPath.length - 2];
-    parent.children.insert(nodeIdx + 1, right);
-    parent.keys.insert(nodeIdx, sepKey);
-
-    if (parent.keys.length > _maxKeys) {
-      // Pop one level and continue.
-      path.removeLast();
-      idxPath.removeLast();
-      _splitInternal(parent, path: path, idxPath: idxPath);
-    }
-  }
-
-  // -------------------- Internal: delete rebalance --------------------
-
-  void _rebalanceLeaf(
-    _BPlusLeaf<K, V> leaf, {
-    required List<_BPlusInternal<K, V>> path,
-    required List<int> idxPath,
-  }) {
-    if (path.isEmpty) return;
-    final parent = path.last;
-    final int idx = idxPath.last;
-
-    final _BPlusLeaf<K, V>? left =
-        idx > 0 ? parent.children[idx - 1] as _BPlusLeaf<K, V>? : null;
-    final _BPlusLeaf<K, V>? right = (idx + 1 < parent.children.length)
-        ? parent.children[idx + 1] as _BPlusLeaf<K, V>?
-        : null;
-
-    // Borrow from left.
-    if (left != null && left.keys.length > _minLeafKeys) {
-      leaf.keys.insert(0, left.keys.removeLast());
-      leaf.values.insert(0, left.values.removeLast());
-      // Update separator for this leaf.
-      parent.keys[idx - 1] = leaf.keys.first;
-      return;
-    }
-
-    // Borrow from right.
-    if (right != null && right.keys.length > _minLeafKeys) {
-      leaf.keys.add(right.keys.removeAt(0));
-      leaf.values.add(right.values.removeAt(0));
-      // Update separator for right leaf.
-      parent.keys[idx] = right.keys.first;
-      return;
-    }
-
-    // Merge.
-    if (left != null) {
-      // Merge leaf into left.
-      left.keys.addAll(leaf.keys);
-      left.values.addAll(leaf.values);
-      // Fix links.
-      left.next = leaf.next;
-      if (leaf.next != null) leaf.next!.prev = left;
-
-      // Remove child + separator key.
-      parent.children.removeAt(idx);
-      parent.keys.removeAt(idx - 1);
-
-      _rebalanceInternalAfterChildRemoved(path: path, idxPath: idxPath);
-      return;
-    }
-
-    if (right != null) {
-      // Merge right into leaf.
-      leaf.keys.addAll(right.keys);
-      leaf.values.addAll(right.values);
-      leaf.next = right.next;
-      if (right.next != null) right.next!.prev = leaf;
-
-      parent.children.removeAt(idx + 1);
-      parent.keys.removeAt(idx);
-
-      _rebalanceInternalAfterChildRemoved(path: path, idxPath: idxPath);
-    }
-  }
-
-  void _rebalanceInternalAfterChildRemoved({
-    required List<_BPlusInternal<K, V>> path,
-    required List<int> idxPath,
-  }) {
-    // Collapse root if needed.
-    if (path.isEmpty) return;
-    final parent = path.last;
-    if (identical(parent, _root)) {
-      if (parent.children.length == 1) {
-        _root = parent.children.first;
+  int _upperBoundPaths(List<dynamic> key) {
+    final a = orderedPaths!;
+    var lo = 0;
+    var hi = a.length;
+    while (lo < hi) {
+      final mid = (lo + hi) >> 1;
+      if (comparePaths(a[mid], key) <= 0) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
       }
-      return;
     }
-
-    if (parent.children.length >= _minInternalChildren) return;
-
-    // Rebalance internal node using B-tree rotation/merge.
-    final grand = path[path.length - 2];
-    final int parentIdx = idxPath[idxPath.length - 2];
-
-    final left = parentIdx > 0
-        ? grand.children[parentIdx - 1] as _BPlusInternal<K, V>?
-        : null;
-    final leftSepIdx = parentIdx - 1;
-    final right = (parentIdx + 1 < grand.children.length)
-        ? grand.children[parentIdx + 1] as _BPlusInternal<K, V>?
-        : null;
-
-    // Borrow from left.
-    if (left != null && left.children.length > _minInternalChildren) {
-      final borrowedChild = left.children.removeLast();
-      final borrowedSep = left.keys.removeLast(); // min key of borrowed child
-
-      final oldParentSep = grand.keys[leftSepIdx];
-      // Parent receives borrowed child at front.
-      parent.children.insert(0, borrowedChild);
-      parent.keys.insert(0, oldParentSep);
-      // Grand separator becomes borrowedSep.
-      grand.keys[leftSepIdx] = borrowedSep;
-      return;
-    }
-
-    // Borrow from right.
-    if (right != null && right.children.length > _minInternalChildren) {
-      final borrowedChild = right.children.removeAt(0);
-      final newGrandSep = right.keys.removeAt(0);
-
-      final oldGrandSep = grand.keys[parentIdx];
-      parent.children.add(borrowedChild);
-      parent.keys.add(oldGrandSep);
-      grand.keys[parentIdx] = newGrandSep;
-      return;
-    }
-
-    // Merge.
-    if (left != null) {
-      final sep = grand.keys[leftSepIdx];
-      left.keys.add(sep);
-      left.keys.addAll(parent.keys);
-      left.children.addAll(parent.children);
-      grand.children.removeAt(parentIdx);
-      grand.keys.removeAt(leftSepIdx);
-
-      // Pop one level and continue.
-      path.removeLast();
-      idxPath.removeLast();
-      _rebalanceInternalAfterChildRemoved(path: path, idxPath: idxPath);
-      return;
-    }
-
-    if (right != null) {
-      final sep = grand.keys[parentIdx];
-      parent.keys.add(sep);
-      parent.keys.addAll(right.keys);
-      parent.children.addAll(right.children);
-      grand.children.removeAt(parentIdx + 1);
-      grand.keys.removeAt(parentIdx);
-
-      path.removeLast();
-      idxPath.removeLast();
-      _rebalanceInternalAfterChildRemoved(path: path, idxPath: idxPath);
-    }
-  }
-
-  void _refreshAncestorsMinKey({
-    required List<_BPlusInternal<K, V>> path,
-    required List<int> idxPath,
-  }) {
-    // When a leaf's minimum key changes, update separators on the path.
-    for (int level = path.length - 1; level >= 0; level--) {
-      final parent = path[level];
-      final int childIdx = idxPath[level];
-      if (childIdx <= 0) continue;
-      final child = parent.children[childIdx];
-      final K? newMin = _minKeyOfNode(child);
-      if (newMin == null) continue;
-      parent.keys[childIdx - 1] = newMin;
-    }
-  }
-
-  K? _minKeyOfNode(_BPlusNode<K, V> node) {
-    var n = node;
-    while (!n.isLeaf) {
-      final inl = n as _BPlusInternal<K, V>;
-      n = inl.children.first;
-    }
-    final leaf = n as _BPlusLeaf<K, V>;
-    if (leaf.keys.isEmpty) return null;
-    return leaf.keys.first;
+    return lo;
   }
 }

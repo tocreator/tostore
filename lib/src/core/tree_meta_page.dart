@@ -13,7 +13,7 @@ abstract final class TreeMetaPageFieldId {
 
 /// Extensible page-0 payload for B+Tree / NGH partition files.
 ///
-/// Every partition file stores [partitionLocal] (field 1) — see
+/// Every partition file stores [partitionLocal] (field 1) -- see
 /// [PartitionLocalStats] for the append-only blob evolution rules.
 /// Partition 0 additionally stores [treeGlobalMeta] (field 2).
 final class TreeMetaPagePayload {
@@ -44,9 +44,9 @@ final class TreeMetaPagePayload {
 
   /// Decode a plain (post-decryption) page-0 payload.
   ///
-  /// Hot path: [payloadMagic] (`TMP1`) match → decode fields. O(1) reject of
+  /// Hot path: [payloadMagic] (`TMP1`) match -> decode fields. O(1) reject of
   /// legacy pages without probing fixed layouts first.
-  /// Miss → [_tryDecodeLegacyPayload] (PartitionMetaPage / NghPartitionMetaPage).
+  /// Miss -> [_tryDecodeLegacyPayload] (PartitionMetaPage / NghPartitionMetaPage).
   static TreeMetaPagePayload? tryDecodePlainPayload(Uint8List bytes) {
     if (bytes.length < 4) return null;
     final reader = BinaryReader(bytes);

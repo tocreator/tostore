@@ -1443,7 +1443,7 @@ class GlobalIdGenerator {
 
   // Base36 charset: digits first, then lowercase letters.
   static const String _base36Chars = '0123456789abcdefghijklmnopqrstuvwxyz';
-  // Pre-computed code-unit tables — avoids repeated String indexing in the hot path.
+  // Pre-computed code-unit tables -- avoids repeated String indexing in the hot path.
   static final List<int> _base36Units =
       _base36Chars.codeUnits.toList(growable: false);
 
@@ -1488,22 +1488,22 @@ class GlobalIdGenerator {
     final List<int> buf =
         totalLen <= 128 ? _outBuf : List<int>.filled(totalLen, 0x30);
 
-    // ── prefix ──────────────────────────────────────────────────────────────
+    // -- prefix --------------------------------------------------------------
     for (int i = 0; i < pLen; i++) {
       buf[i] = prefix.codeUnitAt(i);
     }
 
-    // ── default lead (empty prefix only) ────────────────────────────────────
+    // -- default lead (empty prefix only) ------------------------------------
     if (leadLen == 1) {
       buf[0] = 0x61; // 'a'
     }
 
-    // ── suffix (write before body so pos cursor starts cleanly at bodyEnd) ──
+    // -- suffix (write before body so pos cursor starts cleanly at bodyEnd) --
     for (int i = 0; i < sLen; i++) {
       buf[bodyEnd + i] = suffix!.codeUnitAt(i);
     }
 
-    // ── body: right-to-left into [bodyStart .. bodyEnd-1] ───────────────────
+    // -- body: right-to-left into [bodyStart .. bodyEnd-1] -------------------
     int pos = bodyEnd;
     BigInt body = id;
     final BigInt base = BigInt.from(36);
@@ -1515,7 +1515,7 @@ class GlobalIdGenerator {
       body = q;
     } while (body > BigInt.zero);
 
-    // ── zero-pad remaining body slots ───────────────────────────────────────
+    // -- zero-pad remaining body slots ---------------------------------------
     while (pos > bodyStart) {
       buf[pos - 1] = 0x30; // '0'
       pos--;
@@ -1529,7 +1529,7 @@ class GlobalIdGenerator {
         (DateTime.now().millisecondsSinceEpoch ~/ 1000) - _epochStartSeconds;
 
     if (timestamp < _lastTimestampSec) {
-      // Clock went backwards — typically an NTP step correction.
+      // Clock went backwards -- typically an NTP step correction.
       // Force monotonicity.
       timestamp = _lastTimestampSec;
     }

@@ -43,13 +43,13 @@ import 'weight_format_migration.dart';
 /// - Migrates pending parallel-batch `tablePlan` out of A/B journal into WalMeta,
 ///   then deletes `journal_a.log` / `journal_b.log` (interim JSON; converted below).
 /// - Migrates legacy NDJSON transaction logs to binary ToTX.
-/// - Blocking [MetaFormatMigration]: WAL/Txn `meta.json` → `meta.tobf` (same V3
+/// - Blocking [MetaFormatMigration]: WAL/Txn `meta.json` -> `meta.tobf` (same V3
 ///   pass, before version bump; KeyManager primed for EncryptionScope.full).
-/// - Blocking [MigrationFormatMigration]: `migration_meta` / `task_*` JSON →
+/// - Blocking [MigrationFormatMigration]: `migration_meta` / `task_*` JSON ->
 ///   `.tobf` (after WAL/Txn meta; before version bump; accepts v1 dirUsage/taskIndex
 ///   via [MigrationMeta.fromJson]).
 /// - Bumps version config markers last (after format migrations) for crash resume.
-/// - Async [WeightFormatMigration]: `cache_weights.json` → `access_weights.tobf`
+/// - Async [WeightFormatMigration]: `cache_weights.json` -> `access_weights.tobf`
 ///   (non-blocking; loss acceptable; not WAL-backed).
 /// - Cleans up legacy map properties.
 class V3Upgrade {
@@ -337,7 +337,7 @@ class V3Upgrade {
     final resolvedSystemHash = systemSchemaHash ??
         TableSchema.generateSchemasHash(SystemTable.gettableSchemas);
 
-    // 4. Move physical folders; migrate legacy meta.json → partition-0 page0.
+    // 4. Move physical folders; migrate legacy meta.json -> partition-0 page0.
     for (final tableName in tableUidMap.keys) {
       final tableUid = tableUidMap[tableName]!;
       final isGlobal = tableIsGlobalMap[tableName] ?? false;
@@ -410,7 +410,7 @@ class V3Upgrade {
     // KeyManager init / JSON deletion (deviceBinding path KEK tried as fallback).
     await AppliedEncryptionBootstrap.ensureAppliedEncryption(_dataStore);
 
-    // WAL/Txn meta JSON → TOBF (blocking, before version bump).
+    // WAL/Txn meta JSON -> TOBF (blocking, before version bump).
     // KeyManager must be primed so EncryptionScope.full uses EncryptionManager.
     await _dataStore.keyManager.initialize();
     await MetaFormatMigration.migrateAllSpaces(
@@ -418,7 +418,7 @@ class V3Upgrade {
       spaceNames: spaces,
     );
 
-    // Migration meta / tasks JSON → TOBF (blocking, before version bump).
+    // Migration meta / tasks JSON -> TOBF (blocking, before version bump).
     await MigrationFormatMigration.migrate(_dataStore);
 
     // Single GlobalConfig write: schema hashes + pageSize + dir high-water + version.
@@ -586,7 +586,7 @@ class V3Upgrade {
   ///
   /// Remnant-only: `journalFile` / `recoverStartOffset` are read from the raw
   /// WAL meta JSON (not fields on [PendingParallelBatch]). Paths are built
-  /// under [PathManager.getPageRedoRootPath] — no A/B helpers in PathManager.
+  /// under [PathManager.getPageRedoRootPath] -- no A/B helpers in PathManager.
   Future<void> _migrateParallelJournalIntoWalMeta(String spaceName) async {
     // V3 mid-upgrade still writes legacy JSON WAL meta; MetaFormatMigration
     // converts to .tobf later in the same V3 pass (before version bump).
@@ -744,7 +744,7 @@ class V3Upgrade {
       return;
     }
 
-    // Rename/move the table directory (name → stable tableUid).
+    // Rename/move the table directory (name -> stable tableUid).
     // Resume-safe: if already under [newPath], only finish meta migration.
     if (oldExists && !newExists) {
       await _dataStore.storage.moveDirectory(oldPath, newPath);
@@ -756,8 +756,8 @@ class V3Upgrade {
     final uid = TableUid(tableUid);
     final indexDirPath = path.join(newPath, 'index');
 
-    // Rename index / mapping / NGH trees to stable indexUid — no JSON rewrite.
-    // Meta is migrated once: legacy meta.json → partition-0 page0 → delete JSON.
+    // Rename index / mapping / NGH trees to stable indexUid -- no JSON rewrite.
+    // Meta is migrated once: legacy meta.json -> partition-0 page0 -> delete JSON.
     if (await _dataStore.storage.existsDirectory(indexDirPath)) {
       for (final indexName in indexUidMap.keys) {
         final indexUid = indexUidMap[indexName]!;
@@ -852,7 +852,7 @@ class V3Upgrade {
   /// Resolve and persist [GlobalConfig.pageSize] before bootstrap createTable.
   ///
   /// Order: already-configured cache [oldGlobalConfig] sample legacy
-  /// meta.json (rename-→ paths via directory maps) → [InternalConfig.defaultPageSize].
+  /// meta.json (rename--> paths via directory maps) -> [InternalConfig.defaultPageSize].
   /// Persists only while unset (`copyWith` refuses to change a set pageSize).
   Future<void> _primePageSizeBeforeBootstrap({
     required GlobalConfig oldGlobalConfig,

@@ -24,7 +24,7 @@ Map<String, dynamic>? validateAndProcessRecordPure({
   bool ignoreUnknownFields = true,
 
   /// Shared batch timestamp for [DefaultValueType.currentTimestamp] defaults.
-  /// Avoids N× DateTime.now() in large batchInsert prepares.
+  /// Avoids Nx DateTime.now() in large batchInsert prepares.
   DateTime? batchTimestamp,
 
   /// When non-null, skips the per-record length/range constraint scan.
@@ -104,7 +104,7 @@ Map<String, dynamic>? validateAndProcessRecordPure({
         ]);
       }
 
-      // Auto-generated PKs are already strings from the ID pool — avoid
+      // Auto-generated PKs are already strings from the ID pool -- avoid
       // convertPrimaryKey overhead on the batchInsert hot path.
       if (skipPrimaryKeyFormatCheck && providedId is String) {
         result[primaryKey] = providedId;

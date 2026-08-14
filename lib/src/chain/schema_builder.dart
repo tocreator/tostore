@@ -177,7 +177,7 @@ class SchemaBuilder with FutureBuilderMixin<SchemaUpdateResult> {
 
   /// Promote a unique non-null field to primary key via async shadow-table rewrite.
   ///
-  /// Does not require [allowAfterDataMigration] — promote itself declares data migration.
+  /// Does not require [allowAfterDataMigration] -- promote itself declares data migration.
   /// Must not be combined with [setPrimaryKeyConfig] in the same builder chain.
   SchemaBuilder promoteFieldToPrimaryKey({
     required String sourceFieldName,

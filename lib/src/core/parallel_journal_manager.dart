@@ -12,11 +12,15 @@ import '../interface/storage_interface.dart';
 import '../model/background_write_entry.dart';
 import '../model/background_write_type.dart';
 import '../model/buffer_entry.dart';
+import '../model/data_store_config.dart';
+import '../model/db_exception.dart';
 import '../model/id_generator.dart';
 import '../model/index_entry.dart';
 import '../model/meta_info.dart';
 import '../model/migration_write_mode.dart';
 import '../model/parallel_journal_entry.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../model/space_stats.dart';
 import '../model/system_table.dart';
 import '../model/table_context.dart';
@@ -29,6 +33,7 @@ import 'data_store_impl.dart';
 import 'io_concurrency_planner.dart';
 import 'migration_manager.dart';
 import 'page_redo_log_codec.dart';
+import 'resource_manager.dart';
 import 'storage_adapter.dart';
 import 'wal_manager.dart';
 import 'workload_scheduler.dart';
@@ -47,12 +52,15 @@ class ParallelJournalManager {
   BatchContext? _activeBatchContext;
   bool _isRecovering = false; // Flag to indicate if currently in recovery mode
 
+  /// True while a flush pump turn is executing (after queue pop, before turn ends).
+  bool get isFlushInProgress => _flushInProgress;
+
   // When set (close / switchSpace / flushCompletely), skip online tail-fill
   // delays and wake any in-flight wait so drain can proceed immediately.
   bool _immediateFlushRequested = false;
   Completer<void>? _tailWaitWake;
 
-  // ── Write backpressure (measurement-based) ──
+  // -- Write backpressure (measurement-based) --
   // Measured per-record flush cost from the last completed batch (microseconds).
   int _perRecordFlushUs = 0;
   // Active throttle delay per record (us); 0 when not congested.
@@ -123,10 +131,11 @@ class ParallelJournalManager {
     return null;
   }
 
-  /// Write backpressure: called by WriteBufferManager before enqueue.
+  /// Soft write backpressure: called by WriteBufferManager before enqueue.
   ///
   /// Hot path cost: 1 multiply + 1 compare. Skips await when delay < 1ms.
   /// [count] = 1 for single addRecord, or N for periodic batch checks.
+  /// Prefer [applyEnqueueBackpressure] which avoids await on the hot path.
   Future<void> waitIfThrottled([int count = 1]) {
     if (_throttleDelayPerRecordUs < _kMinThrottleDelayUs) {
       return Future<void>.value();
@@ -136,8 +145,7 @@ class ParallelJournalManager {
   }
 
   /// Hard backpressure: wait until write queue length is at or below [cap].
-  /// Used by batch insert to avoid unbounded buffer growth when insert rate
-  /// exceeds flush rate. Polls [pollInterval] until condition is met or [timeout].
+  /// Polls [pollInterval] until condition is met or [timeout].
   /// [timeout] prevents deadlock if flush is stuck; null = no timeout.
   Future<void> waitUntilQueueBelow(
     int cap, {
@@ -149,6 +157,61 @@ class ParallelJournalManager {
     while (_running && _bufferManager.queueLength > cap) {
       if (stopAt != null && DateTime.now().isAfter(stopAt)) break;
       await Future.delayed(pollInterval);
+    }
+  }
+
+  /// Enqueue-path backpressure for [WriteBufferManager].
+  ///
+  /// Returns `null` on the hot path (memory mode / no soft delay / normal
+  /// Returns a [Future] only when soft delay or hard resource wait is needed.
+  Future<void>? applyEnqueueBackpressure([int count = 1]) {
+    // Soft throttle off + memory normal -> never await on the enqueue hot path.
+    if (_throttleDelayPerRecordUs < _kMinThrottleDelayUs) {
+      final rm = _dataStore.resourceManager;
+      if (rm == null || rm.memoryStatus == ResourceStatus.normal) {
+        return null;
+      }
+    }
+
+    // Rare: only consulted when soft/queue/status already indicate pressure.
+    if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
+      return null;
+    }
+    return _applyEnqueueBackpressureSlow(count);
+  }
+
+  Future<void> _applyEnqueueBackpressureSlow(int count) async {
+    await waitIfThrottled(count);
+
+    final rm = _dataStore.resourceManager;
+    if (rm == null) return;
+
+    final batchSize = _dataStore.config.writeBatchSize;
+    final congested = batchSize > 0 && _bufferManager.queueLength > batchSize;
+
+    // When congested under "normal", still probe so a stale status cannot
+    // miss the transition to warning. ResourceManager is >=2s throttled.
+    if (congested || rm.memoryStatus != ResourceStatus.normal) {
+      await rm.triggerImmediateCheck();
+    }
+
+    if (rm.isWriteBlocked) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.sysResourceExhaustedMemory,
+          message:
+              'Write buffer enqueue blocked: system memory is critically low.',
+          operation: 'applyEnqueueBackpressure',
+        ),
+      ]);
+    }
+
+    if (rm.memoryStatus == ResourceStatus.warning) {
+      final target = batchSize > 0 ? batchSize : 5000;
+      await waitUntilQueueBelow(
+        target,
+        timeout: const Duration(seconds: 120),
+      );
     }
   }
 
@@ -212,12 +275,10 @@ class ParallelJournalManager {
     } catch (_) {}
   }
 
-  /// Flush all pending write buffers to disk without shutting down the journal manager.
+  /// Flush all pending write buffers to disk without shutting down the journal.
   ///
-  /// - Used in maintenance flows (backup, migration, "save all cache") where we need
-  ///   a strong durability point but will continue to accept new writes afterwards.
-  /// - Waits for any in-flight flush loop to complete, then runs a drain-mode pump
-  ///   that ignores the batchSize early-exit heuristic and flushes until the queue is empty.
+  /// Used in maintenance flows (backup checkpoint, migration, "save all") where
+  /// a durability point is required but the DB keeps accepting writes.
   Future<void> flushCompletely() async {
     if (!_running) return;
 
@@ -254,30 +315,38 @@ class ParallelJournalManager {
     }
   }
 
-  /// Drain all pending write buffers to disk and shut down the journal manager.
+  /// Shut down the journal manager.
   ///
-  /// Used for database close or switch space etc.:
-  /// - Force flush all data in `_writeQueue` to table files/indexes until the queue is empty;
-  /// - Wait for the currently running flush to complete, then execute a "complete flush" (ignore the early-exit rule);
-  /// - After completion, close the timer and subscription, and set `_running` to false.
-  Future<void> drainAndStop() async {
-    // If not running and the queue is empty, no need to do anything
+  /// - [flush] `true`: drain pending writes to disk, then stop (close / switchSpace
+  ///   when persisting). Does **not** clear pending/txn trees -- flush reads them.
+  /// - [flush] `false`: stop without draining and [WriteBufferManager.clearAll]
+  ///   (discard unpersisted state, e.g. backup/restore).
+  Future<void> stop({bool flush = true}) async {
+    if (flush) {
+      await _stopAfterFlush();
+    } else {
+      await _stopDiscardingBuffers();
+    }
+  }
+
+  Future<void> _stopAfterFlush() async {
     if (!_running && _bufferManager.isEmpty) {
       return;
     }
 
-    // Wake any in-flight online tail wait before awaiting that pump.
     _requestImmediateFlush();
 
-    // Close the trigger, avoid being triggered again by sizeStream
     try {
-      _running = true; // Ensure the while condition of _pumpFlush is met
+      _running = true;
       try {
         await _bufSizeSub?.cancel();
       } catch (_) {}
       _bufSizeSub = null;
 
-      // Wait for the possibly running previous flush to complete
+      if (_isRecovering) {
+        await waitUntilRecoveryCompleted();
+      }
+
       final fut = _loopFuture;
       if (fut != null) {
         try {
@@ -300,14 +369,7 @@ class ParallelJournalManager {
     }
   }
 
-  /// Stop journal manager without flushing pending buffers to table files.
-  ///
-  /// Used for scenarios like backup/restore where "discard unpersisted data":
-  /// - Close trigger and flush loop;
-  /// - Wait for the possibly running flush task to complete naturally;
-  /// - Clear memory buffers to avoid subsequent errors accessing closed TableDataManager/storage.
-  Future<void> stopWithoutFlush() async {
-    // Fast path: already stopped and queue empty
+  Future<void> _stopDiscardingBuffers() async {
     if (!_running && _bufferManager.isEmpty) {
       try {
         await _bufSizeSub?.cancel();
@@ -324,7 +386,6 @@ class ParallelJournalManager {
     _requestImmediateFlush();
 
     try {
-      // Prevent new flush scheduling
       _running = false;
       // Cancel subscription so sizeStream no longer triggers new flush
       try {
@@ -442,7 +503,7 @@ class ParallelJournalManager {
     // 1. Guard: If we are in recovery mode, we MUST NOT run a "normal" flush (context == null).
     // Normal flushes would steal records meant for the recovery batch and write them with a new BatchId,
     // breaking idempotency. Only allow flushes explicitly triggered by recovery (context != null).
-    // Drain mode (close / migration durability) must not silently no-op — wait for recovery
+    // Drain mode (close / migration durability) must not silently no-op -- wait for recovery
     // then continue, so callers like WAL cutover wait cannot hang forever.
     if (_isRecovering && recoveryBatchContext == null) {
       if (!drainCompletely) {
@@ -456,16 +517,6 @@ class ParallelJournalManager {
     // reconcile it first to guarantee durability and prevent overlapping batches.
     // The check above (isRecovering) handles the recursion case, but we keep the explicit
     // recoveryBatchContext check for clarity and safety.
-    if (_dataStore.config.enableJournal &&
-        _walManager.hasPendingParallelBatches &&
-        recoveryBatchContext == null) {
-      // After checkpoint advanced by recovery, drop already-committed queue entries
-      // so we don't keep reprocessing persisted WAL operations.
-      await _bufferManager.cleanupCommittedUpTo(
-        _walManager.meta.checkpoint,
-        _dataStore.config.logPartitionCycle,
-      );
-    }
 
     final batchSize = batchSizeOverride ?? _dataStore.config.writeBatchSize;
     bool firstIteration = true;
@@ -493,7 +544,7 @@ class ParallelJournalManager {
           }
         }
 
-        // stopWithoutFlush set _running=false and woke the tail wait: exit
+        // stop(flush: false) set _running=false and woke the tail wait: exit
         // before popping more work so remaining buffers can be discarded.
         if (!_running && !drainCompletely) {
           break;
@@ -568,7 +619,7 @@ class ParallelJournalManager {
 
         firstIteration = false;
         // Compute WAL pointer range from normal buffer entries only.
-        // Background-only batches have no WAL coverage — never use the
+        // Background-only batches have no WAL coverage -- never use the
         // (-1,0) sentinel as start/end (that previously poisoned checkpoint).
         final startPtr =
             _firstRealWalPointer(batch) ?? _walManager.meta.checkpoint;
@@ -1146,21 +1197,34 @@ class ParallelJournalManager {
 
                   // Cleanup in-memory buffers for this table IMMEDIATELY after it is written.
                   if (tableQueueItems.isNotEmpty) {
-                    await _bufferManager.cleanupAfterBatch(tableQueueItems);
+                    final flushedWalByPk = <String, WalPointer?>{};
+                    for (final e in unifiedPkMap.entries) {
+                      flushedWalByPk[e.key] = e.value.walPointer;
+                    }
+                    final indexPathsByPk =
+                        await _bufferManager.collectFlushIndexPathsByPk(
+                      table: tableContext,
+                      schema: schema,
+                      flushedByPk: unifiedPkMap,
+                    );
+                    await _bufferManager.cleanupAfterBatch(
+                      tableQueueItems,
+                      flushedWalByPk: flushedWalByPk,
+                      indexPathsByPk: indexPathsByPk,
+                    );
                   }
 
-                  // Release unique key reservations for large update operations to prevent memory leaks and blocking
+                  // Release unique key reservations for large update operations.
+                  // Always release (even if !isValid): invalidation must not leave orphans.
                   final largeUpdates = bgLargeUpdatesByTable[tableUid];
                   if (largeUpdates != null && largeUpdates.isNotEmpty) {
                     for (final bgEntry in largeUpdates) {
-                      if (bgEntry.isValid) {
-                        try {
-                          _bufferManager.releaseReservedUniqueKeys(
-                            table: tableContext,
-                            recordId: bgEntry.primaryKey,
-                          );
-                        } catch (_) {}
-                      }
+                      try {
+                        _bufferManager.releaseReservedUniques(
+                          table: tableContext,
+                          recordId: bgEntry.primaryKey,
+                        );
+                      } catch (_) {}
                     }
                   }
                 },
@@ -1212,7 +1276,7 @@ class ParallelJournalManager {
           // Clear map reference to release memory immediately for GC optimization
           bgLargeUpdatesByTable.clear();
 
-          // ── Backpressure: measure per-record flush cost ──
+          // -- Backpressure: measure per-record flush cost --
           final batchElapsedUs = batchSw.elapsedMicroseconds;
           if (batch.isNotEmpty) {
             _perRecordFlushUs = batchElapsedUs ~/ batch.length;
@@ -1265,13 +1329,7 @@ class ParallelJournalManager {
 
           // If this was a recovery flush, check if we can clear the recovering flag
           if (recoveryBatchContext != null) {
-            // After checkpoint advanced by recovery, drop already-committed queue entries
-            // that might have been added by _recoverFromWal during the recovery window.
-            await _bufferManager.cleanupCommittedUpTo(
-              _walManager.meta.checkpoint,
-              _dataStore.config.logPartitionCycle,
-            );
-
+            // Flushed-evict enqueue + drain/idle clear handled by cleanupAfterBatch.
             if (_walManager.meta.pendingBatches.isEmpty) {
               _isRecovering = false;
               scheduleFlushIfNeeded(); // Trigger non-batch WAL write queue
@@ -1306,11 +1364,11 @@ class ParallelJournalManager {
   void _onBufferSizeChanged(int size) {
     if (!_running) return;
 
-    // ── Backpressure: O(1) — scale delay by queue backlog level ──
+    // Soft backpressure: O(1) -- scale delay by queue backlog level.
     // When congested (queue > batchSize) and we have a measurement,
     // throttle delay scales with backlog: multiplier = queue ~/ batchSize.
-    // At 2x batchSize → 2x per-record cost, at 3x → 3x, etc.
-    // When not congested or no measurement yet, throttle is 0 (disabled).
+    // Hard memory backpressure is applied separately via
+    // [applyEnqueueBackpressure] using ResourceManager status (not x2 caps).
     final batchSize = _dataStore.config.writeBatchSize;
     if (size > batchSize && _perRecordFlushUs > 0) {
       _throttleDelayPerRecordUs = _perRecordFlushUs * (size ~/ batchSize);
@@ -1558,15 +1616,12 @@ class ParallelJournalManager {
               schemaVersion: entry['schemaVersion'] as String? ?? '',
             );
             final walPtr = WalPointer(partitionIndex: p, entrySeq: seq);
-            final uniqueRefs =
-                await _computeUniqueKeyRefs(TableUid(resolvedTable), data);
             final tableContext = await _resolveTableContext(resolvedTable);
             if (tableContext == null) continue;
             await _bufferManager.addRecord(
               table: tableContext,
               recordId: recordId,
               entry: be.copyWith(walPointer: walPtr),
-              uniqueKeys: uniqueRefs,
             );
           }
         } catch (_) {}
@@ -1911,15 +1966,11 @@ class ParallelJournalManager {
           schemaVersion: schema.schemaVersion ?? '',
         );
 
-        final uniqueKeys =
-            await _computeUniqueKeyRefs(tableContext.tableUid, op.data);
-
         await _dataStore.tableDataManager.recoverRecordToBuffer(
           tableContext,
           op.data,
           op.op,
           entry: be,
-          uniqueKeyRefs: uniqueKeys,
           oldValues: op.oldValues,
           updateStats: true,
         );
@@ -1988,7 +2039,7 @@ class ParallelJournalManager {
 
   /// Restore base totals for every table/index in the pending batch so a
   /// subsequent reflush does not double-count. Partition markers only gate
-  /// per-file IO inside writeChanges — never whole-tree skip here.
+  /// per-file IO inside writeChanges -- never whole-tree skip here.
   Future<void> _repairUnflushedTablesAndIndexes({
     required Set<TableUid> batchTables,
     required _BatchWalData walData,
@@ -2304,12 +2355,12 @@ class ParallelJournalManager {
   /// 2. Open a short-lived maintenance batch via [beginMaintenanceBatch], then
   ///    [completeMaintenanceBatch] in `finally`
   ///
-  /// Does **not** reuse [activeBatchContext] from an in-flight flush batch —
+  /// Does **not** reuse [activeBatchContext] from an in-flight flush batch --
   /// ad-hoc page-0 writes must not share redo / recovery scope with unrelated
   /// flush work.
   ///
   /// Skips opening a new batch when journal is off, during recovery, or when
-  /// [table] cannot be resolved — [action] still runs (`batchContext` may be
+  /// [table] cannot be resolved -- [action] still runs (`batchContext` may be
   /// null; caller should force `flush: true` for single page writes).
   ///
   /// [action] receives `(ctx, ownedBatch)`. When [ownedBatch] is true the
@@ -2352,7 +2403,7 @@ class ParallelJournalManager {
   ///
   /// Consistency: for **flush**, metadata may be restored to "before batch"
   /// totals then [_pumpFlush] re-runs the batch. For **maintenance**, redo is
-  /// the commit image — keep replayed pages as-is; do not roll totals back to
+  /// the commit image -- keep replayed pages as-is; do not roll totals back to
   /// base (there is no WAL reflush to rebuild them).
   Future<void> _replayPageRedoLogIfExists(String batchId) async {
     final redoPath = _dataStore.pathManager
@@ -2499,7 +2550,7 @@ class ParallelJournalManager {
 
     // Legacy TreeMetaRecord: only apply when partition-0 page0 was NOT restored
     // in this redo (old logs before global meta lived in page0). New write path
-    // embeds full meta in page0 images — applying TreeMetaRecord after p0 would
+    // embeds full meta in page0 images -- applying TreeMetaRecord after p0 would
     // overwrite restored totals with a stale cache RMW.
     if (treeMeta.isNotEmpty) {
       final metaYc = YieldController(
@@ -2612,31 +2663,6 @@ class ParallelJournalManager {
         await _dataStore.storage.flushAll(path: walMetaPath);
       } catch (_) {}
     } catch (_) {}
-  }
-
-  Future<List<UniqueKeyRef>> _computeUniqueKeyRefs(
-      TableUid tableUid, Map<String, dynamic> data) async {
-    final refs = <UniqueKeyRef>[];
-    try {
-      final schema =
-          await _dataStore.tableMetaManager?.getTableSchema(tableUid);
-      if (schema == null) return refs;
-
-      // Unique indexes from schema (implicit/explicit)
-      final allIndexes =
-          _dataStore.tableMetaManager?.getUniqueIndexesFor(schema) ??
-              <IndexSchema>[];
-      for (final idx in allIndexes) {
-        // Skip primary key check usually not needed if getAllIndexes doesn't include it or if we handle it
-        if (idx.fields.length == 1 && idx.fields.first == schema.primaryKey) {
-          continue;
-        }
-        final ck = schema.createCanonicalIndexKey(idx.fields, data);
-        if (ck == null) continue;
-        refs.add(UniqueKeyRef(idx.indexUid, ck));
-      }
-    } catch (_) {}
-    return refs;
   }
 }
 

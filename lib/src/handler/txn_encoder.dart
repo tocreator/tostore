@@ -554,7 +554,7 @@ class TxnEncoder {
     final pk = rec[pkName];
 
     if (ctx != null && ctx.hasSchemaSlots) {
-      // Nullify PK in encode (stored separately) — no second Map.from.
+      // Nullify PK in encode (stored separately) -- no second Map.from.
       final rowBytes = BinarySchemaCodec.encodeRecord(
         rec,
         ctx.fieldStructure,
@@ -586,7 +586,7 @@ class TxnEncoder {
 
     if (oldValues is Map<String, dynamic>) {
       w.writeFieldTag(_fOldValues, WireType.lengthDelimited);
-      // encodeMap is read-only — no defensive copy.
+      // encodeMap is read-only -- no defensive copy.
       w.writeBytes(BinaryMapCodec.encodeMap(oldValues));
     } else if (oldValues is Map) {
       w.writeFieldTag(_fOldValues, WireType.lengthDelimited);

@@ -130,7 +130,7 @@ abstract final class _DynValueType {
 final class TableMetaCodec {
   TableMetaCodec._();
 
-  // ── TableSchema ──────────────────────────────────────────────────────────
+  // -- TableSchema ----------------------------------------------------------
 
   static Uint8List encodeTableSchema(TableSchema schema) {
     final w = BinaryWriter(initialCapacity: 512);
@@ -290,7 +290,7 @@ final class TableMetaCodec {
     );
   }
 
-  // ── FieldSchema ──────────────────────────────────────────────────────────
+  // -- FieldSchema ----------------------------------------------------------
 
   static void _writeFieldSchema(BinaryWriter w, FieldSchema f) {
     w.writeFieldTag(FieldSchemaFieldId.name, WireType.lengthDelimited);
@@ -439,7 +439,7 @@ final class TableMetaCodec {
     );
   }
 
-  // ── IndexSchema ──────────────────────────────────────────────────────────
+  // -- IndexSchema ----------------------------------------------------------
 
   static void _writeIndexSchema(BinaryWriter w, IndexSchema i) {
     if (i.indexName != null) {
@@ -515,7 +515,7 @@ final class TableMetaCodec {
     ).copyWith(indexUid: indexUid);
   }
 
-  // ── PrimaryKeyConfig ─────────────────────────────────────────────────────
+  // -- PrimaryKeyConfig -----------------------------------------------------
 
   static void _writePrimaryKeyConfig(BinaryWriter w, PrimaryKeyConfig pk) {
     w.writeFieldTag(PrimaryKeyConfigFieldId.name, WireType.lengthDelimited);
@@ -613,7 +613,7 @@ final class TableMetaCodec {
     );
   }
 
-  // ── ForeignKeySchema ─────────────────────────────────────────────────────
+  // -- ForeignKeySchema -----------------------------------------------------
 
   static void _writeForeignKeySchema(BinaryWriter w, ForeignKeySchema fk) {
     if (fk.name != null) {
@@ -714,7 +714,7 @@ final class TableMetaCodec {
     );
   }
 
-  // ── TTL / Vector configs ─────────────────────────────────────────────────
+  // -- TTL / Vector configs -------------------------------------------------
 
   static void _writeTtlConfig(BinaryWriter w, TableTtlConfig c) {
     w.writeFieldTag(TableTtlConfigFieldId.ttlMs, WireType.varint);
@@ -848,7 +848,7 @@ final class TableMetaCodec {
     );
   }
 
-  // ── Dynamic default value ────────────────────────────────────────────────
+  // -- Dynamic default value ------------------------------------------------
 
   static void _writeDynValue(BinaryWriter w, dynamic value) {
     if (value == null) {
@@ -938,7 +938,7 @@ final class TableMetaCodec {
     return value;
   }
 
-  // ── FieldStorageLayout ───────────────────────────────────────────────────
+  // -- FieldStorageLayout ---------------------------------------------------
 
   static Uint8List encodeFieldStorageLayout(FieldStorageLayout layout) {
     final w = BinaryWriter(initialCapacity: 256);
@@ -1039,7 +1039,7 @@ final class TableMetaCodec {
     );
   }
 
-  // ── TableMeta ↔ system-table row ─────────────────────────────────────────
+  // -- TableMeta <-> system-table row -----------------------------------------
 
   /// Encode [TableMeta] as a row map for `_system_table_meta` insert/upsert.
   static Map<String, dynamic> encodeRow(TableMeta meta) {

@@ -65,7 +65,7 @@ class PendingParallelBatch {
           ((v as Map?) ?? const {}).cast<String, dynamic>());
     });
 
-    // Legacy: tables list without plans — synthesize empty plans so keys exist.
+    // Legacy: tables list without plans -- synthesize empty plans so keys exist.
     if (tablePlans.isEmpty) {
       final tables = ((json['tables'] as List?) ?? const <dynamic>[])
           .map((e) => e.toString())
@@ -712,7 +712,7 @@ class WalManager {
         // Heal checkpoint poisoned by legacy bg-only flushes (sentinel -1).
         if (_meta.checkpoint.partitionIndex < 0) {
           Logger.warn(
-            'Healing poisoned WAL checkpoint ${_meta.checkpoint} → (0,0)',
+            'Healing poisoned WAL checkpoint ${_meta.checkpoint} -> (0,0)',
           );
           _meta = _meta.copyWith(
             checkpoint: const WalPointer(partitionIndex: 0, entrySeq: 0),
@@ -907,7 +907,7 @@ class WalManager {
     // Embed physical WAL pointer into the entry itself so that recovery can
     // efficiently determine the last WAL pointer by reading only the tail of
     // the last partition file.
-    // Mutate in place — same ownership contract as appendBatch: callers own
+    // Mutate in place -- same ownership contract as appendBatch: callers own
     // the map and must not reuse it after enqueue.
     walEntry['p'] = pIdx;
     walEntry['seq'] = nextSeq;
@@ -993,7 +993,7 @@ class WalManager {
       final y = yieldController.maybeYield();
       if (y != null) await y;
       // Flush may hard-rotate while we yielded. Re-bind path/seq to the live
-      // partition — never overwrite _current back onto a retired partition.
+      // partition -- never overwrite _current back onto a retired partition.
       if (_current.partitionIndex != pIdx ||
           _currentPartitionSizeApprox >= _config.maxLogPartitionFileSize) {
         await _ensureWritablePartition();
@@ -1011,7 +1011,7 @@ class WalManager {
       final int nextSeq = _current.entrySeq + 1;
       _current = WalPointer(partitionIndex: pIdx, entrySeq: nextSeq);
 
-      // Mutate the freshly-built entry in place — callers of appendBatch own
+      // Mutate the freshly-built entry in place -- callers of appendBatch own
       // these maps and do not reuse them after enqueue. Avoids Map.from of
       // every record (which previously re-copied the full 'data' payload).
       final entry = walEntries[i];
@@ -1135,8 +1135,8 @@ class WalManager {
       }
 
       // Only partitions on [start, checkpoint) within [start..end] are obsolete.
-      // Scan directoryMapping keys instead of walking every index in the ring —
-      // when start=0 and checkpoint≈899999 that would iterate ~900k slots even
+      // Scan directoryMapping keys instead of walking every index in the ring --
+      // when start=0 and checkpoint~=899999 that would iterate ~900k slots even
       // though almost none have files or mapping entries.
       bool isInExistingRange(int p) {
         if (start <= end) return p >= start && p <= end;

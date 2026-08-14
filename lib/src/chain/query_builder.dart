@@ -344,7 +344,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   /// Efficient existence check.
   ///
   /// For simple single-table queries, this uses a count-only execution plan with
-  /// a limit of 1 so the engine can short‑circuit as soon as the first match is
+  /// a limit of 1 so the engine can short-circuit as soon as the first match is
   /// found. For join queries, it falls back to fetching at most one record.
   Future<bool> exists() async {
     // No conditions, no joins: use table data metadata for O(1) check.
@@ -520,13 +520,13 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   /// while a re-query is in progress, incoming change notifications
   /// are coalesced via a boolean flag instead of spawning new queries.
   /// This keeps overhead at zero (no Timer, no extra allocations) and
-  /// is self-adaptive — the slower the query, the more events are batched.
+  /// is self-adaptive -- the slower the query, the more events are batched.
   Stream<List<Map<String, dynamic>>> watch() {
     // Create a controller to manage the stream
     late StreamController<List<Map<String, dynamic>>> controller;
     StreamSubscription? subscription;
 
-    // Debounce state – shared between the onListen closure and the
+    // Debounce state -- shared between the onListen closure and the
     // notification callback.  Only accessed on the main isolate so no
     // synchronisation is needed.
     bool queryPending = false;
@@ -552,7 +552,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
           table.tableUid,
           queryCondition,
           (event) async {
-            // A query is already in flight — just mark that the result
+            // A query is already in flight -- just mark that the result
             // will be stale so we re-query once it finishes.
             if (queryPending) {
               needsRefresh = true;

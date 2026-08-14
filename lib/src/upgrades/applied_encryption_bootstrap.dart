@@ -10,11 +10,11 @@ import '../model/data_store_config.dart';
 import '../model/global_config.dart';
 import 'legacy_model/pre_v3.dart';
 
-/// Blocking upgrade: move SpaceConfig JSON keyring → [GlobalConfig.appliedEncryption].
+/// Blocking upgrade: move SpaceConfig JSON keyring -> [GlobalConfig.appliedEncryption].
 ///
-/// Handles legacy JSON space_config key blobs (ChaCha wrap ± AAD / old cipher)
+/// Handles legacy JSON space_config key blobs (ChaCha wrap +/- AAD / old cipher)
 /// and deviceBinding path-derived KEK fallback when no explicit encryptionKey.
-/// Unpublished TOBF keyring layouts are not read — keys live only in GlobalConfig.
+/// Unpublished TOBF keyring layouts are not read -- keys live only in GlobalConfig.
 abstract final class AppliedEncryptionBootstrap {
   AppliedEncryptionBootstrap._();
 
@@ -195,7 +195,7 @@ abstract final class LegacyPathKeyDerivation {
   /// Historical v2 default KEK, rebuilt from XOR'd bytes so the passphrase
   /// is not present as a plaintext string constant in the binary.
   static String historicalV2DefaultEncryptionKey() {
-    // XOR mask 0x5A — must round-trip to the pre-v3 engine default KEK.
+    // XOR mask 0x5A -- must round-trip to the pre-v3 engine default KEK.
     const masked = <int>[
       0x1F,
       0x63,

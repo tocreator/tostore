@@ -16,8 +16,10 @@ import '../model/result_type.dart';
 import '../model/system_table.dart';
 import '../model/table_context.dart';
 import '../model/table_schema.dart' show TableSchema;
+import '../model/data_store_config.dart';
 import 'data_store_impl.dart';
 import 'key_migration_progress.dart';
+import 'resource_manager.dart';
 import 'yield_controller.dart';
 import '../model/table_identity.dart';
 
@@ -108,7 +110,7 @@ class KeyMigrationRunner {
       _throwIfPaused();
 
       // Non-global tables on the primary's *current* space (may be user space,
-      // not "default" — e.g. mobile stays on login space; default may never open).
+      // not "default" -- e.g. mobile stays on login space; default may never open).
       await _migrateTables(
         primaryInstance,
         targetKeyId: targetKeyId,
@@ -217,7 +219,7 @@ class KeyMigrationRunner {
       walCheckpoint =
           '${walMeta.checkpoint.partitionIndex}:${walMeta.checkpoint.entrySeq}';
     } catch (_) {
-      // Leave null — refresh must not treat missing capture as "done".
+      // Leave null -- refresh must not treat missing capture as "done".
     }
 
     final txnParts = <int>[];
@@ -437,7 +439,7 @@ class KeyMigrationRunner {
               '${walMeta.checkpoint.partitionIndex}:${walMeta.checkpoint.entrySeq}';
           walDone = current != snapshots.walCheckpointAtStart;
         } catch (_) {
-          // Keep waiting — do not mark done on read failure.
+          // Keep waiting -- do not mark done on read failure.
         }
       }
       if (walDone) {
@@ -478,7 +480,7 @@ class KeyMigrationRunner {
                 <int>{};
         remaining.removeWhere((p) => !current.contains(p));
       } catch (_) {
-        // Keep remaining on failure — do not clear.
+        // Keep remaining on failure -- do not clear.
       }
       info = info.copyWith(
         snapshots: (info.snapshots ?? snapshots)
@@ -577,8 +579,16 @@ class KeyMigrationRunner {
             if (isPauseRequested) return false;
 
             await dataStore.backgroundWriteScheduler.waitIfCongested(
-              writeBatchSize,
-              dataStore.writeBufferManager.queueLength,
+              writeBatchSize: writeBatchSize,
+              normalQueueLength: dataStore.writeBufferManager.queueLength,
+              isMemoryMode:
+                  dataStore.config.persistenceMode == PersistenceMode.memory,
+              getMemoryStatus: () =>
+                  dataStore.resourceManager?.memoryStatus ??
+                  ResourceStatus.normal,
+              refreshResourceStatus: () =>
+                  dataStore.resourceManager?.triggerImmediateCheck() ??
+                  Future<void>.value(),
               cancellationToken: _runToken,
             );
 

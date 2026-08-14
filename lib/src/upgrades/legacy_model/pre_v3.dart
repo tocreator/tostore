@@ -18,10 +18,10 @@ import '../../model/weight_data.dart';
 /// ## Naming convention (`legacy_model/`)
 /// - Keep this directory; do **not** scatter one-off parsers across upgrades/.
 /// - One file per *source* era that a major upgrade must still read:
-///   - [pre_v3.dart] — formats before engineVersion 3 (JSON configs, schema
+///   - [pre_v3.dart] -- formats before engineVersion 3 (JSON configs, schema
 ///     partitions, NDJSON txn logs, cache_weights.json) and backup `meta.json`.
 ///     Consumed by `V3Upgrade` / format migrations / [BackupManager] fallback.
-///   - Future: `pre_v4.dart`, `pre_v7.dart`, … when that upgrade lands.
+///   - Future: `pre_v4.dart`, `pre_v7.dart`, ... when that upgrade lands.
 /// - Prefer `pre_vN` over open ranges (`v3_to_v6`): each major upgrade owns
 ///   exactly the formats it retires. If v6 must read v3-era TOBF that v6
 ///   itself replaces, put those parsers in `pre_v6.dart`.
@@ -33,7 +33,7 @@ import '../../model/weight_data.dart';
 // Config paths + bootstrap (global_config.json / space_config.json)
 // ---------------------------------------------------------------------------
 
-/// Legacy JSON config filenames — construct paths only inside upgrades/.
+/// Legacy JSON config filenames -- construct paths only inside upgrades/.
 abstract final class LegacyConfigPaths {
   LegacyConfigPaths._();
 
@@ -129,7 +129,7 @@ final class LegacyConfigBootstrap {
   /// Whether [jsonPath] is already a version-only stub for [version].
   ///
   /// Full legacy JSON (e.g. still carrying `tableDirectoryMap`) is never
-  /// treated as current — caller must overwrite with the stub.
+  /// treated as current -- caller must overwrite with the stub.
   static Future<bool> _isDowngradeGuardCurrentAt(
     DataStoreImpl dataStore,
     String jsonPath,
@@ -200,7 +200,7 @@ final class LegacyGlobalConfigJson {
       userVersion: resolveVersionValue(json['userVersion'], 0),
       maxEntriesPerDir: resolveVersionValue(
           json['maxEntriesPerDir'], InternalConfig.defaultMaxEntriesPerDir),
-      // Missing key → 0 (unset), must NOT default here or v3 loses the signal
+      // Missing key -> 0 (unset), must NOT default here or v3 loses the signal
       // to sample page size from existing table meta.
       pageSize: rawPageSize == null ? 0 : (rawPageSize as num).toInt(),
       spaceNames: (json['spaceNames'] as List<dynamic>?)
@@ -268,7 +268,7 @@ final class LegacySpaceConfigJson {
 
 /// Hand-parsers for 3.1.2-era schema JSON (`schema_meta.json` + partition files).
 ///
-/// Do **not** use current SchemaMeta.fromJson — the on-disk shape used
+/// Do **not** use current SchemaMeta.fromJson -- the on-disk shape used
 /// `tablePartitionMap` / `directoryMapping` / `tableSchemas` keyed by tableName.
 final class LegacySchemaMetaJson {
   LegacySchemaMetaJson._();
@@ -526,10 +526,10 @@ final class LegacyTxnJson {
 }
 
 // ---------------------------------------------------------------------------
-// Cache weights (cache_weights.json → access_weights.tobf)
+// Cache weights (cache_weights.json -> access_weights.tobf)
 // ---------------------------------------------------------------------------
 
-/// Legacy weight JSON path — construct only inside upgrades/.
+/// Legacy weight JSON path -- construct only inside upgrades/.
 abstract final class LegacyWeightPaths {
   LegacyWeightPaths._();
 
@@ -602,10 +602,10 @@ final class LegacyCacheWeightsJson {
 }
 
 // ---------------------------------------------------------------------------
-// Backup package v1 (meta.json → meta.tobf; read fallback only)
+// Backup package v1 (meta.json -> meta.tobf; read fallback only)
 // ---------------------------------------------------------------------------
 
-/// Legacy backup package filenames — construct paths only inside upgrades/ +
+/// Legacy backup package filenames -- construct paths only inside upgrades/ +
 /// [BackupManager] read fallback.
 abstract final class LegacyBackupPaths {
   LegacyBackupPaths._();

@@ -88,7 +88,7 @@ class PathManager {
     }
 
     // Bootstrap: `_system_table_meta` path is fixed (global / dir 0). Never call
-    // getTableMeta here — that would deadlock with cold load of this table.
+    // getTableMeta here -- that would deadlock with cold load of this table.
     if (uid == SystemTable.tableMetaTableUid) {
       return pathJoin(
         pathJoin(_instancePath, 'global'),

@@ -22,7 +22,7 @@ class WebStorageImpl implements StorageInterface {
 
   /// How many [StorageAdapter] (or other) clients currently retain this
   /// singleton. Native [FileStorageImpl] is per-adapter; web IndexedDB is
-  /// shared under one db name — closing while primary still uses it causes
+  /// shared under one db name -- closing while primary still uses it causes
   /// `InvalidStateError: The database connection is closing`.
   int _refCount = 0;
   final Completer<void> _initCompleter = Completer<void>();

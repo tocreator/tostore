@@ -1612,6 +1612,53 @@ class DatabaseTester {
           _expect('Multi-update: final age matches', finalRecord?['age'], 21);
       isTestPassed &= _expect('Multi-update: username (id) preserved',
           finalRecord?['username'], multiUpdateUser);
+
+      // 5. Failed insert after reserve must release slots (no orphan unique lock)
+      const String orphanUser = 'orphan_reserve_probe';
+      final owner = await db.insert('users', {
+        'username': orphanUser,
+        'email': 'orphan_owner@test.com',
+        'age': 40,
+      });
+      isTestPassed &=
+          _expect('Orphan probe owner insert succeeds', !owner.hasErrors, true);
+
+      final blocked = await db.insert('users', {
+        'username': orphanUser,
+        'email': 'orphan_blocked@test.com',
+        'age': 41,
+      });
+      isTestPassed &=
+          _expect('Duplicate username insert blocked', blocked.hasErrors, true);
+
+      await db.delete('users').where('username', '=', orphanUser);
+
+      final reused = await db.insert('users', {
+        'username': orphanUser,
+        'email': 'orphan_reused@test.com',
+        'age': 42,
+      });
+      isTestPassed &= _expect(
+          'After delete, username reusable (no orphan reserve)',
+          !reused.hasErrors,
+          true);
+
+      // 6. Concurrent same PK: exactly one success
+      final c1 = db.insert('users', {
+        'id': 99001,
+        'username': 'concurrent_pk_a',
+        'email': 'c_pk_a@test.com',
+      });
+      final c2 = db.insert('users', {
+        'id': 99001,
+        'username': 'concurrent_pk_b',
+        'email': 'c_pk_b@test.com',
+      });
+      final concurrent = await Future.wait([c1, c2]);
+      final okCount = concurrent.where((r) => !r.hasErrors).length;
+      final failCount = concurrent.where((r) => r.hasErrors).length;
+      isTestPassed &= _expect('Concurrent same PK: one success', okCount, 1);
+      isTestPassed &= _expect('Concurrent same PK: one failure', failCount, 1);
     } catch (e, s) {
       isTestPassed = false;
       _failTest('Exception in _testBufferPipelineRobustness: $e\n$s');

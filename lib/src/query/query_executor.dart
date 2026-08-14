@@ -590,25 +590,6 @@ class QueryExecutor {
       );
 
       if (onlyCount) {
-        if (readFromFileOnly) {
-          stopwatch.stop();
-          return ExecuteResult(
-            records: const [],
-            count: planResult.count ?? 0,
-            executionTimeMs: stopwatch.elapsedMilliseconds,
-          );
-        }
-        // For count queries, we must merge the WriteBuffer content to account for
-        // uncommitted inserts/updates that were NOT in the persistent index/table scan.
-        final bufferResults =
-            await _dataStore.tableDataManager.mergeConsistency(
-          table,
-          const [], // base results empty for count
-          matcher: matcher,
-          limit: effectiveLimit,
-        );
-        int finalCount = (planResult.count ?? 0) + bufferResults.length;
-
         stopwatch.stop();
         int? totalRecordCount;
         try {
@@ -617,7 +598,7 @@ class QueryExecutor {
         } catch (_) {}
         return ExecuteResult(
           records: const [],
-          count: finalCount,
+          count: planResult.count ?? 0,
           executionTimeMs: stopwatch.elapsedMilliseconds,
           totalRecordCount: totalRecordCount,
         );
@@ -679,8 +660,6 @@ class QueryExecutor {
       }
 
       // Final sort: single place after offset/joins, before limit truncation.
-      // mergeConsistency does not sort; buffer-unordered inserts can break order for custom PK.
-      // One _applySort here covers both single-table (buffer merge) and join/union redundant sort.
       final bool needPostSort = effectiveOrderBy.isNotEmpty;
 
       if (needPostSort) {
@@ -904,23 +883,29 @@ class QueryExecutor {
             resultMap[record[schema.primaryKey].toString()] =
                 Map<String, dynamic>.from(record);
           }
-          final updatedResults = resultMap.values.toList();
-          final filteredResults = await _dataStore.tableDataManager
-              .mergeConsistency(table, updatedResults,
-                  matcher: matcher, limit: limit);
+          // Cache hit still needs live pending/txn visibility via normal
+          // search paths -- re-run through table logical fuse by treating
+          // cached rows as a PK-ordered base page.
+          final updatedResults =
+              await _dataStore.tableDataManager.mergeBufferAndTxnConsistency(
+            table,
+            resultMap.values.toList(),
+            limit: limit,
+            pkOrdered: true,
+          );
           if (onlyCount) {
-            return PlanExecutionResult(const [], filteredResults.length, null);
+            return PlanExecutionResult(const [], updatedResults.length, null);
           }
           if (aggregations != null && aggregations.isNotEmpty) {
             final aggRes =
                 await _dataStore.tableDataManager.calculateAggregateResultBatch(
-              filteredResults,
+              updatedResults,
               aggregations,
               groupBy: groupBy,
             );
             return PlanExecutionResult(const [], null, aggRes);
           }
-          return PlanExecutionResult(filteredResults);
+          return PlanExecutionResult(updatedResults);
         }
       }
     }
@@ -1053,134 +1038,12 @@ class QueryExecutor {
       }
 
       if (onlyCount) {
-        if (readFromFileOnly) {
-          return PlanExecutionResult(const [], totalCount ?? 0, null);
-        }
-        // The tree scan only counts flushed (committed) records.
-        // Unflushed write-buffer records must also be counted for consistency.
-        final bufferMerged = await _dataStore.tableDataManager.mergeConsistency(
-          table,
-          const <Map<String, dynamic>>[],
-          matcher: matcher,
-          limit: limit,
-        );
-        final bufferCount = bufferMerged.length;
-        final treeCount = totalCount ?? 0;
-        return PlanExecutionResult(const [], treeCount + bufferCount, null);
+        // Counts already include pending/txn via table/index logical fusion.
+        return PlanExecutionResult(const [], totalCount ?? 0, null);
       }
 
       if (aggregations != null && aggregations.isNotEmpty) {
         return PlanExecutionResult(const [], null, aggregateResult);
-      }
-
-      final bool hasSorting = orderBy != null && orderBy.isNotEmpty;
-      bool isPkSort = true;
-      if (hasSorting) {
-        final parsed = _parseSortField(orderBy.first);
-        if (parsed.field != schema.primaryKey) {
-          isPkSort = false;
-        }
-      }
-
-      // Determine sort direction for buffer scan (assuming PK-ish order in buffer)
-      bool reverseBuffer = false;
-
-      if (hasSorting) {
-        final parsed = _parseSortField(orderBy.first);
-        if (parsed.descending) {
-          reverseBuffer = true;
-        }
-      }
-
-      // Create filter for cursor-based pagination to apply during buffer scan
-      bool Function(Map<String, dynamic>)? bufferFilter;
-      if (cursorFilter != null) {
-        bufferFilter = cursorFilter;
-      } else if (cursorToken != null) {
-        final pivotValues = <Object?>[];
-        final matchers = <MatcherFunction>[];
-        final fields = <String>[];
-
-        try {
-          if (cursorToken.mode == _CursorMode.primaryKey) {
-            fields.add(schema.primaryKey);
-            pivotValues.add(cursorToken.primaryKey);
-            // ValueMatcher handles String vs Int comparison if needed (e.g. pkNumericString)
-            matchers.add(
-                ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType()));
-          } else if (cursorToken.mode == _CursorMode.indexKey) {
-            // Decode index key tuple to native values
-            pivotValues
-                .addAll(MemComparableKey.decodeTuple(cursorToken.indexKey!));
-
-            final idxUid = cursorToken.indexUid;
-            final idx = _dataStore.tableMetaManager
-                ?.findIndexSchemaByUid(schema, idxUid);
-
-            if (idx != null) {
-              for (var f in idx.fields) {
-                fields.add(f);
-                matchers.add(
-                    ValueMatcher.getMatcher(schema.getFieldMatcherType(f)));
-              }
-              if (!idx.unique) {
-                fields.add(schema.primaryKey);
-                matchers.add(
-                    ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType()));
-              }
-            }
-          }
-
-          if (pivotValues.isNotEmpty &&
-              pivotValues.length == matchers.length &&
-              pivotValues.length == fields.length) {
-            bufferFilter = (record) {
-              // Component-wise comparison
-              int cmp = 0;
-              for (int i = 0; i < pivotValues.length; i++) {
-                final val = record[fields[i]];
-                // If field is missing, treat as null? ValueMatcher handles null.
-                cmp = matchers[i](val, pivotValues[i]);
-                if (cmp != 0) break;
-              }
-
-              // Cursor token represents the LAST returned record.
-              // We want records AFTER the cursor.
-              // ASC: Record > Cursor  (cmp > 0)
-              // DESC: Record < Cursor (cmp < 0)
-              return reverseBuffer ? cmp < 0 : cmp > 0;
-            };
-          }
-        } catch (e) {
-          // Log warning but safe fallthrough (buffer records won't be pre-filtered,
-          // will be filtered by query plan merge later presumably, or just returning extra records is safeish)
-          Logger.warn('Failed to build buffer cursor filter', rawError: e);
-        }
-      }
-
-      final int? bufferMergeLimit;
-      if (isPkSort && limit != null) {
-        // If cursor is used, we only need 'limit' records AFTER the cursor.
-        // Without cursor, we might need offset + limit.
-        if (cursorToken != null) {
-          bufferMergeLimit = limit;
-        } else {
-          bufferMergeLimit = (offset ?? 0) + limit;
-        }
-      } else {
-        bufferMergeLimit = null;
-      }
-
-      if (!readFromFileOnly) {
-        results = await _dataStore.tableDataManager.mergeConsistency(
-          table,
-          results,
-          matcher: matcher,
-          limit: bufferMergeLimit,
-          orderBy: orderBy,
-          filter: bufferFilter,
-          reverse: reverseBuffer, // Pass reverse flag
-        );
       }
 
       // Cache query results (skip if already full-table cached)
@@ -1539,15 +1402,11 @@ class QueryExecutor {
             queryCacheExpiry: queryCacheExpiry);
         rightRecords = rightPlanResult.records;
       } else {
-        // Fallback: perform raw scan then apply overlays manually
+        // Fallback: raw table scan
         final int localViewId = _dataStore.readViewManager.registerReadView();
         try {
           final scanRes = await _performTableScan(rightTable, null);
           rightRecords = scanRes.records;
-          rightRecords = await _dataStore.tableDataManager.mergeConsistency(
-            rightTable,
-            rightRecords,
-          );
         } finally {
           _dataStore.readViewManager.releaseReadView(localViewId);
         }
@@ -2076,31 +1935,21 @@ class QueryExecutor {
       final List<String> ob = orderBy ?? const <String>[];
       final bool hasOrderBy = ob.isNotEmpty;
       bool orderByAligned = true;
+      // May flip when full-equality cover makes PK-only orderBy free via leaf order.
+      var effectiveReverse = reverse;
       if (hasOrderBy) {
         try {
           final spec = _resolveIndexSpecForCursor(schema, indexUid);
-          if (ob.length > spec.fields.length) {
-            orderByAligned = false;
-          } else {
-            bool? firstIsDesc;
-            for (int i = 0; i < ob.length; i++) {
-              final parsed = _parseSortField(ob[i]);
-              final f = parsed.field.contains('.')
-                  ? parsed.field.split('.').last
-                  : parsed.field;
-              if (f != spec.fields[i]) {
-                orderByAligned = false;
-                break;
-              }
-              if (i == 0) {
-                firstIsDesc = parsed.descending;
-              } else if (firstIsDesc != parsed.descending) {
-                // Mixed directions cannot be satisfied by a single index scan.
-                orderByAligned = false;
-                break;
-              }
-            }
-          }
+          final alignment = _resolveIndexOrderByAlignment(
+            schema: tblSchema,
+            indexFields: spec.fields,
+            isUnique: spec.isUnique,
+            orderBy: ob,
+            indexCondition: indexCondition,
+            callerReverse: reverse,
+          );
+          orderByAligned = alignment.aligned;
+          effectiveReverse = alignment.reverse;
         } catch (_) {
           orderByAligned = false;
         }
@@ -2166,7 +2015,7 @@ class QueryExecutor {
             limit: batch,
             offset: null,
             startAfterKey: resumeKey,
-            reverse: reverse,
+            reverse: effectiveReverse,
             orderBy: orderBy,
             readFromFileOnly: readFromFileOnly,
           );
@@ -2212,14 +2061,6 @@ class QueryExecutor {
 
               // Early break when target count reached
               if (targetNeed > 0 && outCount >= targetNeed) break;
-
-              // Skip if in buffer for onlyCount fast path to avoid double counting
-              if (onlyCount &&
-                  _dataStore.writeBufferManager
-                          .getBufferedRecordForRead(table, pk) !=
-                      null) {
-                continue;
-              }
 
               // Decode index key to get field values for matching
               final decoded = MemComparableKey.decodeTuple(entry.keyBytes);
@@ -2300,20 +2141,12 @@ class QueryExecutor {
                   continue;
                 }
 
-                // Skip if in buffer for onlyCount
-                if (onlyCount) {
-                  if (_dataStore.writeBufferManager
-                          .getBufferedRecordForRead(table, pk) !=
-                      null) {
-                    continue;
-                  }
-                } else {
-                  final be = _dataStore.writeBufferManager
-                      .getBufferedRecordForRead(table, pk);
-                  if (be != null &&
-                      be.operation == BufferOperationType.delete) {
-                    continue;
-                  }
+                // Hide pending deletes; queryRecordsBatch already resolved
+                // pending/txn inserts and overlays.
+                final be = _dataStore.writeBufferManager
+                    .getBufferedRecordForRead(table, pk);
+                if (be != null && be.operation == BufferOperationType.delete) {
+                  continue;
                 }
                 candidateRecords.add(rec);
               }
@@ -2512,7 +2345,7 @@ class QueryExecutor {
           limit: batch,
           offset: null,
           startAfterKey: resumeKey,
-          reverse: reverse,
+          reverse: effectiveReverse,
           orderBy: orderBy,
           readFromFileOnly: readFromFileOnly,
         );
@@ -2556,19 +2389,10 @@ class QueryExecutor {
             final rec = recordByPk[pk];
             if (rec == null) continue;
 
-            // Skip if in buffer for onlyCount
-            if (onlyCount) {
-              if (_dataStore.writeBufferManager
-                      .getBufferedRecordForRead(table, pk) !=
-                  null) {
-                continue;
-              }
-            } else {
-              final be = _dataStore.writeBufferManager
-                  .getBufferedRecordForRead(table, pk);
-              if (be != null && be.operation == BufferOperationType.delete) {
-                continue;
-              }
+            final be = _dataStore.writeBufferManager
+                .getBufferedRecordForRead(table, pk);
+            if (be != null && be.operation == BufferOperationType.delete) {
+              continue;
             }
             candidateRecords.add(rec);
           }
@@ -2774,6 +2598,121 @@ class QueryExecutor {
       }
     }
     return (isPkOrder: isPkOrder, reverse: reverse);
+  }
+
+  /// Whether [indexCondition] fully equality-covers every field of a non-unique
+  /// index. In that case the leaf order inside the bucket is primary-key order
+  /// (ASC; DESC via reverse scan) -- free, no TopK.
+  bool _isFullEqualityIndexCover({
+    required List<String> indexFields,
+    required bool isUnique,
+    required IndexCondition condition,
+  }) {
+    if (isUnique || indexFields.isEmpty) return false;
+
+    final comps = condition.components;
+    if (comps == null || comps.isEmpty) {
+      // Compact form from [_buildIndexConditionForSchema]:
+      // - single-field: equals(value)
+      // - multi-field all-eq: equals([v1, v2, ...])
+      if (condition.operator.toUpperCase() != '=') return false;
+      if (indexFields.length == 1) return true;
+      final v = condition.value;
+      return v is List && v.length == indexFields.length;
+    }
+    if (comps.length != indexFields.length) return false;
+    for (int i = 0; i < comps.length; i++) {
+      if (comps[i].field != indexFields[i]) return false;
+      if (comps[i].operator.toUpperCase() != '=') return false;
+    }
+    return true;
+  }
+
+  /// Resolve whether [orderBy] can be satisfied by streaming this index scan.
+  ///
+  /// Special case (performance-critical): non-unique index + full equality cover
+  /// -> leaf order is (fields..., pk). Ordering by PK alone (or fields + PK) is
+  /// then aligned and must use Case A early-stop -- never Case B full-bucket TopK.
+  ({bool aligned, bool reverse}) _resolveIndexOrderByAlignment({
+    required TableSchema schema,
+    required List<String> indexFields,
+    required bool isUnique,
+    required List<String> orderBy,
+    required IndexCondition indexCondition,
+    required bool callerReverse,
+  }) {
+    if (orderBy.isEmpty) {
+      return (aligned: true, reverse: callerReverse);
+    }
+
+    final pkName = schema.primaryKey;
+    final parsed = <({String field, bool descending})>[];
+    for (final raw in orderBy) {
+      final p = _parseSortField(raw);
+      parsed.add((
+        field: _normalizeCursorFieldName(p.field),
+        descending: p.descending,
+      ));
+    }
+
+    // 1) Standard: orderBy is a prefix of index fields, uniform direction.
+    if (parsed.length <= indexFields.length) {
+      bool? firstDesc;
+      var prefixOk = true;
+      for (int i = 0; i < parsed.length; i++) {
+        if (parsed[i].field != indexFields[i]) {
+          prefixOk = false;
+          break;
+        }
+        if (i == 0) {
+          firstDesc = parsed[i].descending;
+        } else if (firstDesc != parsed[i].descending) {
+          prefixOk = false;
+          break;
+        }
+      }
+      if (prefixOk) {
+        return (
+          aligned: true,
+          reverse: firstDesc ?? callerReverse,
+        );
+      }
+    }
+
+    // 2) Full equality cover on non-unique index: PK leaf order is free.
+    final fullEq = _isFullEqualityIndexCover(
+      indexFields: indexFields,
+      isUnique: isUnique,
+      condition: indexCondition,
+    );
+    if (!fullEq) {
+      return (aligned: false, reverse: callerReverse);
+    }
+
+    // 2a) orderBy = PK only.
+    if (parsed.length == 1 && parsed[0].field == pkName) {
+      return (aligned: true, reverse: parsed[0].descending);
+    }
+
+    // 2b) orderBy = index fields... + trailing PK, uniform direction.
+    if (parsed.length == indexFields.length + 1 &&
+        parsed.last.field == pkName) {
+      final dir = parsed.first.descending;
+      for (int i = 0; i < indexFields.length; i++) {
+        if (parsed[i].field != indexFields[i]) {
+          return (aligned: false, reverse: callerReverse);
+        }
+        if (parsed[i].descending != dir) {
+          return (aligned: false, reverse: callerReverse);
+        }
+      }
+      if (parsed.last.descending != dir) {
+        return (aligned: false, reverse: callerReverse);
+      }
+      return (aligned: true, reverse: dir);
+    }
+
+    return (aligned: false, reverse: callerReverse);
   }
 
   /// Default ordering when caller does not provide [orderBy].

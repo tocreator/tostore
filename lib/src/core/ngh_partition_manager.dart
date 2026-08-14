@@ -28,9 +28,9 @@ import '../model/table_identity.dart';
 // NGH vector index partition files.
 //
 // Three independent file series per index:
-//   graph/  — graph pages (neighbor lists)
-//   pqcode/ — PQ code pages (quantised vectors)
-//   rawvec/ — raw vector pages (full-precision vectors)
+//   graph/  -- graph pages (neighbor lists)
+//   pqcode/ -- PQ code pages (quantised vectors)
+//   rawvec/ -- raw vector pages (full-precision vectors)
 //
 // Each file series has its own partition rotation and free-list.
 // ============================================================================
@@ -84,8 +84,8 @@ final class _NghPartitionStats {
 final class NghPartitionManager {
   final DataStoreImpl _dataStore;
 
-  // ── Page Caches ──
-  // Graph pages are accessed randomly during beam search → LRU cache critical.
+  // -- Page Caches --
+  // Graph pages are accessed randomly during beam search -> LRU cache critical.
   late final TreeCache<NghGraphPage> _graphPageCache;
 
   // PQ code pages are scanned sequentially; caching still helps for warm queries.
@@ -132,7 +132,7 @@ final class NghPartitionManager {
   }
 
   // =====================================================================
-  // Page Reading (with cache hierarchy: local → instance → disk)
+  // Page Reading (with cache hierarchy: local -> instance -> disk)
   // =====================================================================
 
   /// Read a graph page from cache or disk.
@@ -421,7 +421,7 @@ final class NghPartitionManager {
   }
 
   // =====================================================================
-  // Batch Write Changes — Core Flush Pipeline
+  // Batch Write Changes -- Core Flush Pipeline
   // =====================================================================
 
   /// Apply a batch of vector deltas to the NGH index.
@@ -430,10 +430,10 @@ final class NghPartitionManager {
   /// All pages are first staged into an in-memory map, then flushed once at the
   /// end to minimise I/O syscalls and avoid write amplification.
   ///
-  /// [dirtyGraphPages]     — graph pages modified by the graph engine.
-  /// [dirtyPqCodePages]    — PQ-code pages modified during encoding.
-  /// [dirtyRawVectorPages] — raw-vector pages modified during insertion.
-  /// [meta]                — current NGH index metadata (may be mutated for partition rotation).
+  /// [dirtyGraphPages]     -- graph pages modified by the graph engine.
+  /// [dirtyPqCodePages]    -- PQ-code pages modified during encoding.
+  /// [dirtyRawVectorPages] -- raw-vector pages modified during insertion.
+  /// [meta]                -- current NGH index metadata (may be mutated for partition rotation).
   Future<NghIndexMeta> writeChanges({
     required TableContext table,
     required IndexUid indexUid,
@@ -461,7 +461,7 @@ final class NghPartitionManager {
       budgetMs: yieldBudgetMs,
     );
 
-    // Staged writes: path → (offset → bytes)
+    // Staged writes: path -> (offset -> bytes)
     final staged = <String, Map<int, Uint8List>>{};
 
     void stageWrite(String path, int offset, Uint8List bytes) {
@@ -481,7 +481,7 @@ final class NghPartitionManager {
     final encCfg = _dataStore.config.encryptionConfig;
     final bool encrypt = encCfg?.shouldEncryptVectorIndex ?? false;
 
-    // ── Encode & stage graph pages ──
+    // -- Encode & stage graph pages --
     for (final entry in dirtyGraphPages.entries) {
       final y1 = yc.maybeYield();
       if (y1 != null) await y1;
@@ -505,7 +505,7 @@ final class NghPartitionManager {
           .put([tableUid, indexUid, ptr.partitionNo, ptr.pageNo], page);
     }
 
-    // ── Encode & stage PQ-code pages ──
+    // -- Encode & stage PQ-code pages --
     for (final entry in dirtyPqCodePages.entries) {
       final y2 = yc.maybeYield();
       if (y2 != null) await y2;
@@ -528,7 +528,7 @@ final class NghPartitionManager {
           .put([tableUid, indexUid, ptr.partitionNo, ptr.pageNo], page);
     }
 
-    // ── Encode & stage raw-vector pages ──
+    // -- Encode & stage raw-vector pages --
     for (final entry in dirtyRawVectorPages.entries) {
       final y3 = yc.maybeYield();
       if (y3 != null) await y3;
@@ -570,7 +570,7 @@ final class NghPartitionManager {
       entryDelta: vectorsDelta,
     );
 
-    // ── Stage per-partition meta pages (pageNo=0) ──
+    // -- Stage per-partition meta pages (pageNo=0) --
     await _stagePartitionMeta(graphStats, pageSize, updatedMeta, stageWrite, yc,
         NghDataCategory.graph);
     await _stagePartitionMeta(
@@ -594,7 +594,7 @@ final class NghPartitionManager {
       );
     }
 
-    // ── Flush all staged writes ──
+    // -- Flush all staged writes --
     if (staged.isNotEmpty) {
       final flushYc = YieldController(
         'NghPartitionManager.writeChanges.flush',
@@ -811,7 +811,7 @@ final class NghPartitionManager {
         final fp = FreePage.tryDecodePayload(parsed.encodedPayload);
         if (fp == null) continue;
 
-        // Cycle safety: self-referencing head → reset
+        // Cycle safety: self-referencing head -> reset
         if (fp.nextFreePageNo == headPageNo) {
           heads[partitionNo] = -1;
           continue;
@@ -915,7 +915,7 @@ final class NghPartitionManager {
         GeneralStatus(
           type: ResultType.engError,
           message:
-              'Codebook sub-space size (${codebook.centroidsPerSubspace} × ${codebook.subspaceDimensions} × 4 bytes) exceeds page capacity',
+              'Codebook sub-space size (${codebook.centroidsPerSubspace} x ${codebook.subspaceDimensions} x 4 bytes) exceeds page capacity',
         ),
       ]);
     }
@@ -971,7 +971,7 @@ final class NghPartitionManager {
           GeneralStatus(
             type: ResultType.engError,
             message:
-                'Codebook sub-space size ($centroidsPerSubspace × $subspaceDimensions × 4 bytes) exceeds page capacity',
+                'Codebook sub-space size ($centroidsPerSubspace x $subspaceDimensions x 4 bytes) exceeds page capacity',
           ),
         ]);
       }

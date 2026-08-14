@@ -107,7 +107,7 @@ class WeightManager {
     if (markDirty) {
       _onMutation();
     } else {
-      // Authoritative replace (e.g. just written to file) — drop stale dirty.
+      // Authoritative replace (e.g. just written to file) -- drop stale dirty.
       _dirty = false;
       _dirtySeq++;
     }
@@ -296,7 +296,7 @@ class WeightManager {
         await _dataStore.storage.writeAsBytes(path, bytes, flush: true);
       }
 
-      // Concurrent mutation after capture → keep dirty for a follow-up save.
+      // Concurrent mutation after capture -> keep dirty for a follow-up save.
       if (_dirtySeq == seqAtCapture) {
         _dirty = false;
         _lastSuccessfulSaveMs = DateTime.now().millisecondsSinceEpoch;
@@ -332,7 +332,7 @@ class WeightManager {
     String identifier, {
     String? spaceName,
   }) async {
-    // System-table create runs before WeightManager.initialize — skip until ready.
+    // System-table create runs before WeightManager.initialize -- skip until ready.
     if (!_dataStore.isInitialized) return;
 
     if (_initialized) {

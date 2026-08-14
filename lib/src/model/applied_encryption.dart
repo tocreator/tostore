@@ -96,8 +96,8 @@ class AppliedEncryption {
   /// Watermark = max keyId among keys (current + history) whose
   /// [EncryptionKeyInfo.migrationCompletedAt] is at least [retention] ago.
   /// Once a later key fully completed that long ago, every history entry with
-  /// `keyId ≤ watermark` (except [current]) is purged — including entries that
-  /// never received their own `migrationCompletedAt` — because a completed
+  /// `keyId <= watermark` (except [current]) is purged -- including entries that
+  /// never received their own `migrationCompletedAt` -- because a completed
   /// migration rewrote all ciphertext past those older keyIds.
   static const Duration historyRetention = Duration(days: 30);
 

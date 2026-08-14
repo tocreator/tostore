@@ -77,9 +77,9 @@ export 'src/query/query_condition.dart';
 /// - 每个实例拥有独立的文件存储、缓存、索引和事务
 class ToStore implements DataStoreInterface {
   /// Create independent instances with different database paths
-  /// [dbPath] Database root path. On Android/iOS: REQUIRED — provide a persistent app
+  /// [dbPath] Database root path. On Android/iOS: REQUIRED -- provide a persistent app
   /// directory (e.g., using path_provider's getApplicationDocumentsDirectory()).
-  /// On desktop/server: optional — if omitted, a standard OS application data
+  /// On desktop/server: optional -- if omitted, a standard OS application data
   /// directory will be used.
   /// [dbName] Database name for quickly creating different database instances (will be stored in dbPath/dbName/)
   /// [config] Database configuration
@@ -139,7 +139,7 @@ class ToStore implements DataStoreInterface {
   /// [dbName] Database name (instances are stored in dbPath/dbName/).
   /// [config] Database configuration.
   /// [schemas] Initial table schemas for automatic migration.
-  /// [onStartupProgress] Callback for tracking startup progress (0.0–1.0) and the current stage.
+  /// [onStartupProgress] Callback for tracking startup progress (0.0--1.0) and the current stage.
   /// [onConfigure] Callback invoked when the database is being configured.
   /// [onCreate] Callback invoked when the database is first created.
   /// [onOpen] Callback invoked when the database is successfully opened.
@@ -156,7 +156,7 @@ class ToStore implements DataStoreInterface {
   /// [dbName] 数据库名称（实例存储在 dbPath/dbName/ 目录下）。
   /// [config] 数据库配置。
   /// [schemas] 初始表结构定义，用于自动化迁移。
-  /// [onStartupProgress] 启动进度回调，参数为当前进度（0.0–1.0）和所处阶段。
+  /// [onStartupProgress] 启动进度回调，参数为当前进度（0.0--1.0）和所处阶段。
   /// [onConfigure] 数据库配置时的回调。
   /// [onCreate] 数据库首次创建时的回调。
   /// [onOpen] 数据库打开成功后的回调。
@@ -260,7 +260,7 @@ class ToStore implements DataStoreInterface {
   ///   over the corresponding fields in this config.
   /// - [reinitialize]: When true, force a re-open of the database (close then open).
   /// - [noPersistOnClose]: Used together with `reinitialize`. When true, do NOT persist pending
-  /// - [onStartupProgress]: Callback for tracking startup progress (0.0–1.0) and the current stage.
+  /// - [onStartupProgress]: Callback for tracking startup progress (0.0--1.0) and the current stage.
   ///
   /// Examples:
   /// ```dart
@@ -279,7 +279,7 @@ class ToStore implements DataStoreInterface {
   /// - config：数据库配置；当同时传入 dbPath/dbName 时，以参数值覆盖配置中的同名字段。
   /// - reinitialize：为 true 时强制重新初始化（先关闭后打开）。
   /// - noPersistOnClose：与 reinitialize 配合；为 true 时关闭阶段不落盘缓冲数据，直接清理缓存
-  /// - onStartupProgress：启动进度回调，参数为当前进度（0.0–1.0）和所处阶段。
+  /// - onStartupProgress：启动进度回调，参数为当前进度（0.0--1.0）和所处阶段。
   ///
   /// Examples:
   /// ```dart
@@ -562,13 +562,13 @@ class ToStore implements DataStoreInterface {
   /// Returns an [UpdateBuilder] to specify conditions and execute the update.
   ///
   /// chain methods on [UpdateBuilder]:
-  /// - `.where(field, op, value)` — filter condition
-  /// - `.skipResultDetails()` — skip collecting success/failure primary key lists
+  /// - `.where(field, op, value)` -- filter condition
+  /// - `.skipResultDetails()` -- skip collecting success/failure primary key lists
   ///     and status details. Use for large-scale range updates (e.g. `.where('id', '>', 5)`)
   ///     to improve performance and avoid memory overhead.
   ///     After skipping, only [DbResult.successCount] and [DbResult.failedCount] are available.
-  /// - `.allowUpdateAll()` — allow updating all records without a condition
-  /// - `.allowPartialErrors()` — continue on partial record failures
+  /// - `.allowUpdateAll()` -- allow updating all records without a condition
+  /// - `.allowPartialErrors()` -- continue on partial record failures
   ///
   /// Example:
   /// ```dart
@@ -598,13 +598,13 @@ class ToStore implements DataStoreInterface {
   /// 返回 [UpdateBuilder] 用于指定条件并执行更新。
   ///
   /// [UpdateBuilder] 链式方法：
-  /// - `.where(field, op, value)` — 筛选条件
-  /// - `.skipResultDetails()` — 跳过收集成功/失败的主键列表和状态详情。
+  /// - `.where(field, op, value)` -- 筛选条件
+  /// - `.skipResultDetails()` -- 跳过收集成功/失败的主键列表和状态详情。
   ///     适用于大范围范围查询的批量更新场景（如 `.where('id', '>', 5)`），
   ///     能够显著提升性能并避免内存开销。
   ///     跳过后仅 [DbResult.successCount] 和 [DbResult.failedCount] 可用。
-  /// - `.allowUpdateAll()` — 允许无条件更新全部记录
-  /// - `.allowPartialErrors()` — 部分记录失败时继续执行
+  /// - `.allowUpdateAll()` -- 允许无条件更新全部记录
+  /// - `.allowPartialErrors()` -- 部分记录失败时继续执行
   @override
   UpdateBuilder update(String tableName,
       [Map<String, dynamic> data = const {}]) {
@@ -946,13 +946,13 @@ class ToStore implements DataStoreInterface {
   /// Returns a [DeleteBuilder] to specify conditions and execute deletion.
   ///
   /// chain methods on [DeleteBuilder]:
-  /// - `.where(field, op, value)` — filter condition
-  /// - `.skipResultDetails()` — skip collecting success/failure primary key lists
+  /// - `.where(field, op, value)` -- filter condition
+  /// - `.skipResultDetails()` -- skip collecting success/failure primary key lists
   ///     and status details. Use for large-scale range deletes (e.g. `.where('id', '>', 5)`)
   ///     to improve performance and avoid memory overhead.
   ///     After skipping, only [DbResult.successCount] and [DbResult.failedCount] are available.
-  /// - `.allowDeleteAll()` — allow deleting all records without a condition
-  /// - `.allowPartialErrors()` — continue on partial record failures
+  /// - `.allowDeleteAll()` -- allow deleting all records without a condition
+  /// - `.allowPartialErrors()` -- continue on partial record failures
   ///
   /// Example:
   /// ```dart
@@ -976,13 +976,13 @@ class ToStore implements DataStoreInterface {
   /// 返回 [DeleteBuilder] 用于指定条件并执行删除。
   ///
   /// [DeleteBuilder] 链式方法：
-  /// - `.where(field, op, value)` — 筛选条件
-  /// - `.skipResultDetails()` — 跳过收集成功/失败的主键列表和状态详情。
+  /// - `.where(field, op, value)` -- 筛选条件
+  /// - `.skipResultDetails()` -- 跳过收集成功/失败的主键列表和状态详情。
   ///     适用于大范围范围查询的批量删除场景（如 `.where('id', '>', 5)`），
   ///     能够显著提升性能并避免内存开销。
   ///     跳过后仅 [DbResult.successCount] 和 [DbResult.failedCount] 可用。
-  /// - `.allowDeleteAll()` — 允许无条件删除全部记录
-  /// - `.allowPartialErrors()` — 部分记录失败时继续执行
+  /// - `.allowDeleteAll()` -- 允许无条件删除全部记录
+  /// - `.allowPartialErrors()` -- 部分记录失败时继续执行
   @override
   DeleteBuilder delete(String tableName) {
     _checkSystemTableAccess(
@@ -1027,7 +1027,7 @@ class ToStore implements DataStoreInterface {
     return result;
   }
 
-  /// Check if a table has been defined in the current database (space‑agnostic).
+  /// Check if a table has been defined in the current database (space-agnostic).
   ///
   /// This method only checks whether the table structure exists and can be used,
   /// not whether the table contains any rows.
@@ -1140,17 +1140,17 @@ class ToStore implements DataStoreInterface {
   ///
   /// Use when your security policy requires rotating the master encryption key.
   /// [oldKey] is the key currently in use; pass `null` to use the engine
-  /// built-in default (first-time move from unset → explicit key).
+  /// built-in default (first-time move from unset -> explicit key).
   /// [newKey] takes effect immediately and should be passed on the next [open].
   ///
   /// Does not rewrite table, index, or log data. To rotate the data encryption
-  /// key, change [EncryptionConfig.encodingKey] instead — the engine migrates
+  /// key, change [EncryptionConfig.encodingKey] instead -- the engine migrates
   /// data automatically.
   ///
   /// 轮换 [EncryptionConfig.encryptionKey]。
   ///
   /// 用于按安全策略定期更换主加密密钥。[oldKey] 为当前正在使用的密钥；
-  /// 传 `null` 表示使用引擎内置默认密钥（从未配置 → 首次配置）。
+  /// 传 `null` 表示使用引擎内置默认密钥（从未配置 -> 首次配置）。
   /// [newKey] 立即对本实例生效，并应在下次 [open] 时传入。
   ///
   /// 不会重新加密已有的表、索引与日志数据。若要更换数据加密密钥，

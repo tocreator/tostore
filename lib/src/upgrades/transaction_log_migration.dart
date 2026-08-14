@@ -267,7 +267,7 @@ class TransactionLogMigration {
       await _dataStore.storage.deleteFile(backupPath);
     }
     await _dataStore.storage.copyFile(logPath, backupPath);
-    // flush:true → StorageAdapter temp write + replaceFileAtomic
+    // flush:true -> StorageAdapter temp write + replaceFileAtomic
     await _dataStore.storage.writeAsBytes(logPath, rewritten, flush: true);
 
     // Drop plaintext backup only after a verified rewrite.

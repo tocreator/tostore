@@ -20,7 +20,7 @@ class VersionUpgradeManager {
     try {
       final globalConfig = await _dataStore.getGlobalConfig();
       if (globalConfig == null) {
-        // No global config yet – treat as fresh database, nothing to upgrade.
+        // No global config yet -- treat as fresh database, nothing to upgrade.
         return;
       }
 

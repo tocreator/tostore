@@ -14,7 +14,7 @@ import 'workload_scheduler.dart';
 import 'yield_controller.dart';
 
 // ============================================================================
-// NGH Graph Engine — Vamana Graph Construction & Beam Search
+// NGH Graph Engine -- Vamana Graph Construction & Beam Search
 //
 // Responsibilities:
 //   1. Greedy search with ADC pre-filtering (beam search)
@@ -52,7 +52,7 @@ class _SearchCandidate implements Comparable<_SearchCandidate> {
   int compareTo(_SearchCandidate other) => distance.compareTo(other.distance);
 }
 
-/// NGH Graph Engine — core graph construction and search algorithms.
+/// NGH Graph Engine -- core graph construction and search algorithms.
 class NghGraphEngine {
   final NghPartitionManager _partitionManager;
 
@@ -61,7 +61,7 @@ class NghGraphEngine {
   int get _pageSize => _partitionManager.configuredPageSize;
 
   // =====================================================================
-  // Search — Beam Search with ADC + Full-Vector Re-ranking
+  // Search -- Beam Search with ADC + Full-Vector Re-ranking
   // =====================================================================
 
   /// Perform ANN search: beam search using PQ ADC, then re-rank with full vectors.
@@ -82,7 +82,7 @@ class NghGraphEngine {
     if (meta.totalVectors == 0 || meta.medoidNodeId < 0) return const [];
 
     final efRaw = efSearch ?? meta.efSearch;
-    // When topK is small, use a smaller ef to reduce beam steps and I/O without hurting recall for top‑K.
+    // When topK is small, use a smaller ef to reduce beam steps and I/O without hurting recall for top-K.
     final ef = min(efRaw, max(topK * 5, 32));
     final yc = YieldController('NghGraphEngine.search', checkInterval: 100);
 
@@ -159,7 +159,7 @@ class NghGraphEngine {
   }) async {
     //  Visited set: bounded so we don't run unbounded in degenerate graphs.
     final visited = HashSet<int>();
-    //  Safety cap only: allow up to 2× totalVectors so recall stays high (95%+); just prevent runaway (e.g. 10× N).
+    //  Safety cap only: allow up to 2x totalVectors so recall stays high (95%+); just prevent runaway (e.g. 10x N).
     //  In a well-built graph we early-terminate long before this; cap is not hit and recall is unchanged.
     final int maxVisited =
         min(ef * meta.maxDegree * 3, meta.totalVectors * 2 + 256);
@@ -190,7 +190,7 @@ class NghGraphEngine {
         if (y1 != null) await y1;
       }
 
-      //  Safety: stop if traversal grows beyond 2×N (degenerate graph); normal search exits earlier.
+      //  Safety: stop if traversal grows beyond 2xN (degenerate graph); normal search exits earlier.
       if (visited.length >= maxVisited) break;
 
       final currentId = candidateHeap.popId();
@@ -223,7 +223,7 @@ class NghGraphEngine {
         visited.add(nId);
 
         // Piggyback deletion check: if neighbour is on the SAME graph page,
-        // we already have the page loaded — zero extra I/O.
+        // we already have the page loaded -- zero extra I/O.
         final nPartition = meta.graphPartitionForNode(nId, _pageSize);
         final nPage = meta.graphLocalPageForNode(nId, _pageSize);
         final nSlot = meta.graphSlotForNode(nId, _pageSize);
@@ -234,7 +234,7 @@ class NghGraphEngine {
           }
         }
         // For neighbours on OTHER graph pages, skip the per-neighbor I/O
-        // for deletion check — rare false positives (deleted nodes) just get
+        // for deletion check -- rare false positives (deleted nodes) just get
         // a bad distance and naturally fall out of the result heap.
 
         final pqP = meta.pqPartitionForNode(nId, _pageSize);
@@ -294,7 +294,7 @@ class NghGraphEngine {
   }
 
   // =====================================================================
-  // Insertion — Incremental Vamana Insert
+  // Insertion -- Incremental Vamana Insert
   // =====================================================================
 
   /// Insert a batch of vectors into the graph.
@@ -412,7 +412,7 @@ class NghGraphEngine {
   }
 
   // =====================================================================
-  // Deletion — Tombstone Marking
+  // Deletion -- Tombstone Marking
   // =====================================================================
 
   /// Mark nodes as deleted (tombstone). Actual cleanup is deferred to maintenance.
@@ -454,10 +454,10 @@ class NghGraphEngine {
   }
 
   // =====================================================================
-  // Robust Prune — Diverse Neighbor Selection
+  // Robust Prune -- Diverse Neighbor Selection
   // =====================================================================
 
-  /// Select up to R diverse neighbors from candidates using α-rule.
+  /// Select up to R diverse neighbors from candidates using alpha-rule.
   Future<List<int>> _robustPrune(
     TableContext table,
     IndexUid indexUid,
@@ -766,7 +766,7 @@ class NghGraphEngine {
     return meta;
   }
 
-  /// Add reverse edge: neighborId → nodeId.
+  /// Add reverse edge: neighborId -> nodeId.
   /// If neighbor is already at max degree, apply Robust Prune.
   Future<NghIndexMeta> _addReverseEdge(
     TableContext table,
@@ -957,7 +957,7 @@ class NghGraphEngine {
   }
 
   // =====================================================================
-  // Background Maintenance — Tombstone Compaction
+  // Background Maintenance -- Tombstone Compaction
   // =====================================================================
 
   /// Compact tombstoned nodes by repairing neighbor connections.
@@ -1132,14 +1132,14 @@ class NghCompactResult {
 }
 
 // ============================================================================
-// Fixed-Size Binary Heap — Zero-GC Search Primitive
+// Fixed-Size Binary Heap -- Zero-GC Search Primitive
 // ============================================================================
 
 /// A fixed-capacity binary heap storing (nodeId, distance) pairs.
 ///
 /// Avoids GC-triggering allocations during the beam-search hot loop.
-/// - [maxHeap] = false → min-heap (for candidate exploration queue).
-/// - [maxHeap] = true  → max-heap (for result eviction, worst-first).
+/// - [maxHeap] = false -> min-heap (for candidate exploration queue).
+/// - [maxHeap] = true  -> max-heap (for result eviction, worst-first).
 ///
 /// All operations are O(log capacity) with zero object allocation.
 class _FixedHeap {

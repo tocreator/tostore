@@ -3,6 +3,7 @@ import 'dart:async';
 import '../handler/binary_schema_codec.dart';
 import '../handler/logger.dart';
 import '../handler/table_meta_codec.dart';
+import '../model/data_store_config.dart';
 import '../model/db_exception.dart';
 import '../model/db_result.dart';
 import '../model/global_config.dart';
@@ -1203,6 +1204,10 @@ class TableMetaManager {
     TableUid tableUid, {
     int? expectEpoch,
   }) async {
+    // Pure memory DBs have no durable meta table; treat miss as absent.
+    if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
+      return null;
+    }
     try {
       _ensureMetaTableIoLayout();
       final rows = (await _dataStore.queryExecutor.execute(

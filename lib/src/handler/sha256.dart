@@ -176,9 +176,9 @@ class SHA256 {
     return ((x >> n) | (x << (32 - n))) & 0xffffffff;
   }
 
-  /// SHA-256(UTF-8([input])) → 32 bytes.
+  /// SHA-256(UTF-8([input])) -> 32 bytes.
   ///
-  /// Also the unified passphrase → AEAD key for ChaCha20-Poly1305 / AES-256-GCM /
+  /// Also the unified passphrase -> AEAD key for ChaCha20-Poly1305 / AES-256-GCM /
   /// GlobalConfig KEK shell.
   static Uint8List stringToBytes(String input) {
     final bytes = utf8.encode(input);

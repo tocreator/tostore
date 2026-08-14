@@ -16,7 +16,6 @@ import 'data_store_impl.dart';
 // common utilities may be used by callers; keep imports minimal here
 import 'transaction_context.dart';
 import 'tree_cache.dart';
-import 'write_buffer_manager.dart';
 import 'yield_controller.dart';
 
 /// Transaction manager: append-only per-partition logs with compact meta
@@ -113,7 +112,7 @@ class TransactionManager {
       } catch (_) {}
 
       // SSI index: drop entries older than oldest active SSI start (safe reclaim).
-      // Capacity bounding is TreeCache fifo auto-eviction on put — do not duplicate.
+      // Capacity bounding is TreeCache fifo auto-eviction on put -- do not duplicate.
       try {
         await _withSsiIndexLock(_trimSsiIndexByWatermark);
       } catch (_) {}
@@ -283,8 +282,7 @@ class TransactionManager {
       _txnCascadeDeletes.remove(transactionId);
       _txnCascadeUpdates.remove(transactionId);
       try {
-        await _dataStore.writeBufferManager
-            .removeTransactionUniqueKeys(transactionId);
+        await _dataStore.tableDataManager.clearTransactionState(transactionId);
       } catch (_) {}
       return;
     }
@@ -391,7 +389,8 @@ class TransactionManager {
   /// Build commit plan from in-memory deferred operations
   Future<TransactionCommitPlan> buildCommitPlan(String transactionId) async {
     try {
-      final defOps = _dataStore.tableDataManager.getDeferredOps(transactionId);
+      final defOps =
+          await _dataStore.tableDataManager.getDeferredOps(transactionId);
       final heavyDeletes = getDeferredHeavyDeletes(transactionId);
       final heavyUpdates = getDeferredHeavyUpdates(transactionId);
 
@@ -422,24 +421,19 @@ class TransactionManager {
             if (y3 != null) await y3;
             final rec = Map<String, dynamic>.from(op.data);
 
-            // Embed unique key refs if present (for recovery application)
-            if (op.uniqueKeyRefs != null && op.uniqueKeyRefs!.isNotEmpty) {
-              rec['_uniqueKeys'] =
-                  op.uniqueKeyRefs!.map((e) => e.toJson()).toList();
-            }
-
-            // Embed old values if present (for updates)
+            // Embed old values if present (for updates). Unique keys are
+            // re-derived from deferred BufferEntry data at apply time.
             if (op.oldValues != null) {
               rec['_oldValues'] = op.oldValues;
             }
 
-            if (op.type == BufferOperationType.insert) {
+            if (op.operation == BufferOperationType.insert) {
               final list = inserts.putIfAbsent(table, () => []);
               list.add(rec);
-            } else if (op.type == BufferOperationType.update) {
+            } else if (op.operation == BufferOperationType.update) {
               final list = updates.putIfAbsent(table, () => []);
               list.add(rec);
-            } else if (op.type == BufferOperationType.delete) {
+            } else if (op.operation == BufferOperationType.delete) {
               final list = deletes.putIfAbsent(table, () => []);
               list.add(rec);
             }
@@ -685,22 +679,16 @@ class TransactionManager {
               (i + batchSize < recs.length) ? i + batchSize : recs.length;
 
           final List<Map<String, dynamic>> records = [];
-          final List<List<UniqueKeyRef>> uniqueKeysList = [];
 
           for (int j = i; j < end; j++) {
             // Take ownership of plan maps: strip embedded meta in place.
             final rec = recs[j];
             rec.remove('_oldValues'); // inserts do not use oldValues
-            final uks = rec.remove('_uniqueKeys') as List?;
+            rec.remove('_uniqueKeys'); // legacy commit-plan field; ignore
             final normalizedRec = (hasRuntimeMigration)
                 ? migrationManager.normalizeRecordToLatestSync(tableCtx, rec,
                     fromVersion: '')
                 : rec;
-            uniqueKeysList.add(uks
-                    ?.map(
-                        (e) => UniqueKeyRef.fromJson(e as Map<String, dynamic>))
-                    .toList() ??
-                const <UniqueKeyRef>[]);
             records.add(normalizedRec);
           }
 
@@ -709,7 +697,6 @@ class TransactionManager {
             records: records,
             operation: BufferOperationType.insert,
             schema: schema,
-            uniqueKeyRefsList: uniqueKeysList,
             transactionId: commitPlan.transactionId,
             schemaVersion: schema.schemaVersion ?? '',
           );
@@ -757,7 +744,6 @@ class TransactionManager {
               (i + batchSize < recs.length) ? i + batchSize : recs.length;
 
           final List<Map<String, dynamic>> records = [];
-          final List<List<UniqueKeyRef>> uniqueKeysList = [];
           final Map<String, Map<String, dynamic>> oldRecordsMap = {};
 
           final pkName = schema.primaryKey;
@@ -766,7 +752,7 @@ class TransactionManager {
             // Take ownership of plan maps: strip embedded meta in place.
             final rec = recs[j];
             final old = rec.remove('_oldValues') as Map<String, dynamic>?;
-            final uks = rec.remove('_uniqueKeys') as List?;
+            rec.remove('_uniqueKeys'); // legacy commit-plan field; ignore
             final normalizedRec = (hasRuntimeMigration)
                 ? migrationManager.normalizeRecordToLatestSync(tableCtx, rec,
                     fromVersion: '')
@@ -781,11 +767,6 @@ class TransactionManager {
               oldRecordsMap[rId] = normalizedOld;
             }
 
-            uniqueKeysList.add(uks
-                    ?.map(
-                        (e) => UniqueKeyRef.fromJson(e as Map<String, dynamic>))
-                    .toList() ??
-                const <UniqueKeyRef>[]);
             records.add(normalizedRec);
           }
 
@@ -794,7 +775,6 @@ class TransactionManager {
             records: records,
             operation: BufferOperationType.update,
             schema: schema,
-            uniqueKeyRefsList: uniqueKeysList,
             oldRecordsMap: oldRecordsMap,
             transactionId: commitPlan.transactionId,
             schemaVersion: schema.schemaVersion ?? '',
@@ -1113,8 +1093,7 @@ class TransactionManager {
       _txnCascadeDeletes.remove(transactionId);
       _txnCascadeUpdates.remove(transactionId);
       try {
-        await _dataStore.writeBufferManager
-            .removeTransactionUniqueKeys(transactionId);
+        await _dataStore.tableDataManager.clearTransactionState(transactionId);
       } catch (_) {}
       return;
     }
@@ -1162,10 +1141,9 @@ class TransactionManager {
     _txnCascadeDeletes.remove(transactionId);
     _txnCascadeUpdates.remove(transactionId);
 
-    // Ensure unique key reservations are cleaned up to prevent memory leaks
+    // Ensure txn TreeCaches / unique reservations are cleaned up
     try {
-      await _dataStore.writeBufferManager
-          .removeTransactionUniqueKeys(transactionId);
+      await _dataStore.tableDataManager.clearTransactionState(transactionId);
     } catch (_) {
       // Ignore errors during cleanup
     }
@@ -1230,7 +1208,7 @@ class TransactionManager {
   ///
   /// Only publishes keys on the commit path. Capacity eviction is TreeCache
   /// fifo (`_maybeScheduleCleanup` on put). Safe stale reclaim is periodic
-  /// watermark trim — not duplicated here.
+  /// watermark trim -- not duplicated here.
   Future<void> _mergeWriteSetIntoSsiIndex(String transactionId) async {
     unregisterActiveSsiTransaction(transactionId);
     try {
@@ -1402,6 +1380,9 @@ class TransactionManager {
   bool isActive(String txId) {
     return _activeTransactions.contains(txId);
   }
+
+  /// Whether any in-memory transaction has not yet committed/rolled back.
+  bool get hasActiveTransactions => _activeTransactions.isNotEmpty;
 
   /// Get cached commit status if present (no IO). Returns true/false or null if unknown.
   bool? getCachedCommitStatus(String txId) => _txnStatusCache[txId];

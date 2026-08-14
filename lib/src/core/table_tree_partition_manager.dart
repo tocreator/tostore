@@ -128,7 +128,7 @@ final class TableTreePartitionManager {
     }
 
     // Tier 3.5: Payload encoded without deleted slots (fieldCount == active
-    // slots) while current structure still includes deleted markers — e.g.
+    // slots) while current structure still includes deleted markers -- e.g.
     // promote shadow rows after an evolve layout was incorrectly applied.
     // Synthetic names match TableMetaManager deleted-slot encode convention.
     // Must run BEFORE append-only prefix fallback so leading deleted slots
@@ -149,7 +149,7 @@ final class TableTreePartitionManager {
       // Tier 4a: Append-only evolution (addField). New slots are always
       // appended by evolveFieldStorageLayout; shorter on-disk payloads map
       // onto the structure prefix. Refuse if the prefix contains deleted
-      // markers (would shift values — promote/compaction must use 3.5).
+      // markers (would shift values -- promote/compaction must use 3.5).
       final prefix = fieldStruct.sublist(0, storedFieldCount);
       var deletedInPrefix = false;
       for (final f in prefix) {

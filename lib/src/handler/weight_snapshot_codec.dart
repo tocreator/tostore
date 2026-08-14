@@ -10,7 +10,7 @@ abstract final class WeightSnapshotFieldId {
   static const int indexData = 2;
   static const int lastDecayTime = 3;
   static const int indexDataKeyFormat = 4;
-  // Reserved 20–31.
+  // Reserved 20--31.
 }
 
 abstract final class WeightEntryFieldId {

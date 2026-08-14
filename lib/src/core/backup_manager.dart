@@ -422,7 +422,7 @@ class BackupManager {
           if (!closeStorage) {
             await _dataStore.storage.flushAll(closeHandles: true);
           }
-          // Release builds race close→delete much harder than debug; give
+          // Release builds race close->delete much harder than debug; give
           // Windows a brief window to drop share locks after handle close.
           if (PlatformHandler.isWindows) {
             await Future<void>.delayed(const Duration(milliseconds: 100));

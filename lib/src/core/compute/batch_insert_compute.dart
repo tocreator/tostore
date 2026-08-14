@@ -11,7 +11,7 @@ import 'unique_ref_compute.dart';
 class BatchInsertPrepareRequest {
   final TableSchema schema;
 
-  /// Display name only — avoids shipping the full [TableContext] across isolates.
+  /// Display name only -- avoids shipping the full [TableContext] across isolates.
   final TableName tableName;
   final List<Map<String, dynamic>> records;
   final List<IndexSchema> uniqueIndexes;
@@ -86,7 +86,7 @@ Future<BatchInsertPrepareResult> prepareBatchInsertChunk(
   }
   final results = <BatchInsertPreparedRecord>[];
   final yieldController = YieldController('Compute.batchInsert.prepare');
-  // One clock reading for the whole chunk — defaults stay consistent and cheap.
+  // One clock reading for the whole chunk -- defaults stay consistent and cheap.
   final batchTs = request.batchTimestamp ?? DateTime.now();
 
   for (int i = 0; i < request.records.length; i++) {

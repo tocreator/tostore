@@ -186,7 +186,7 @@ final class GlobalConfigCodec {
     );
   }
 
-  /// Field-tag serialization only — never write this to disk directly.
+  /// Field-tag serialization only -- never write this to disk directly.
   static Uint8List _encodeFields(GlobalConfig config) {
     final w = BinaryWriter(initialCapacity: 128);
     w.writeFieldTag(GlobalConfigFieldId.version, WireType.varint);
@@ -246,7 +246,7 @@ final class GlobalConfigCodec {
     return w.view;
   }
 
-  /// Field-tag deserialization only — input must already be decrypted.
+  /// Field-tag deserialization only -- input must already be decrypted.
   static GlobalConfig _decodeFields(Uint8List bytes) {
     if (bytes.isEmpty) return GlobalConfig();
 
@@ -370,7 +370,7 @@ final class GlobalConfigCodec {
     );
   }
 
-  /// Decode with preferred + fallback KEKs (null→user key auto-migration).
+  /// Decode with preferred + fallback KEKs (null->user key auto-migration).
   static ({GlobalConfig config, String usedKey}) decodeFileWithFallback(
     Uint8List frameBytes, {
     required String preferredKey,
@@ -435,7 +435,7 @@ final class GlobalConfigCodec {
 
     final algorithm = ConfigCryptoAlgorithm.fromId(body[0]);
     // Materialize ciphertext at offset 0. Body may be a TOBF zero-copy view,
-    // and algId shifts the AEAD payload to an unaligned offset — ChaCha's
+    // and algId shifts the AEAD payload to an unaligned offset -- ChaCha's
     // asUint32List path requires 4-byte alignment; AES-GCM mis-reads nonce
     // when buffer.asByteData() ignores view offset.
     final cipher = Uint8List.fromList(

@@ -16,7 +16,7 @@ import 'transaction_context.dart';
 ///
 /// Not user-facing. Backed by normal table CRUD
 /// (`upsert` / `queryById` / `deleteInternal`).
-/// Values are opaque [Uint8List] — callers own serialization.
+/// Values are opaque [Uint8List] -- callers own serialization.
 ///
 /// Key naming: use a short module prefix to avoid collisions, e.g.
 /// `meta.`, `cfg.`, `stats.` (prefer [tableUid] over tableName in keys).
@@ -76,7 +76,7 @@ class InternalKvStore {
   /// Delete by primary key. Internally uses [DataStoreImpl.deleteInternal].
   ///
   /// Idempotent: missing key is a silent no-op. Engine-internal cleanup must
-  /// not interrupt callers — write failures are logged, not thrown.
+  /// not interrupt callers -- write failures are logged, not thrown.
   Future<void> remove(String key, {bool isGlobal = false}) async {
     if (key.isEmpty) return;
     try {

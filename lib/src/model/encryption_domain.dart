@@ -20,17 +20,17 @@ enum EncryptionDomain {
   /// `migration_meta.tobf` under full scope.
   migrationMeta,
 
-  /// WAL partitions — natural turnover via checkpoint watermark.
+  /// WAL partitions -- natural turnover via checkpoint watermark.
   wal,
 
-  /// Parallel-journal page redo logs — natural turnover.
+  /// Parallel-journal page redo logs -- natural turnover.
   pageRedoLog,
 
-  /// Transaction log partitions — natural turnover via activePartitions diff.
+  /// Transaction log partitions -- natural turnover via activePartitions diff.
   transactionLog,
 }
 
-/// Classification helpers — keep switches exhaustive (no default).
+/// Classification helpers -- keep switches exhaustive (no default).
 abstract final class EncryptionDomainPolicy {
   EncryptionDomainPolicy._();
 
@@ -85,7 +85,7 @@ abstract final class EncryptionDomainPolicy {
     }
   }
 
-  /// Meta-style domains: domain-level done flag; incomplete → whole-domain rewrite.
+  /// Meta-style domains: domain-level done flag; incomplete -> whole-domain rewrite.
   static bool isCoarseMetaDomain(EncryptionDomain domain) {
     switch (domain) {
       case EncryptionDomain.tableMeta:

@@ -1,6 +1,6 @@
 import 'dart:typed_data';
 
-/// Official XXH64 — Web backend.
+/// Official XXH64 -- Web backend.
 ///
 /// Uses [BigInt] so dart2js never sees non-representable integer literals, while
 /// still producing bit-exact XXH64 digests. Performance is secondary on Web.

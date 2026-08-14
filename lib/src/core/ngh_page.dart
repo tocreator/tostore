@@ -14,11 +14,11 @@ import 'btree_page.dart';
 // to NGH vector index storage.
 //
 // Page types:
-//   nghMeta      — per-partition-file metadata (pageNo=0)
-//   nghGraph     — fixed-slot graph nodes with neighbor lists
-//   nghPqCode    — densely packed PQ codes
-//   nghRawVector — full-precision vectors for re-ranking
-//   nghCodebook  — trained PQ centroid vectors
+//   nghMeta      -- per-partition-file metadata (pageNo=0)
+//   nghGraph     -- fixed-slot graph nodes with neighbor lists
+//   nghPqCode    -- densely packed PQ codes
+//   nghRawVector -- full-precision vectors for re-ranking
+//   nghCodebook  -- trained PQ centroid vectors
 // ============================================================================
 
 // ============================================================================
@@ -101,7 +101,7 @@ final class NghPartitionMetaPage {
 }
 
 // ============================================================================
-// NGH Graph Page — Fixed-Slot Neighbor Lists
+// NGH Graph Page -- Fixed-Slot Neighbor Lists
 // ============================================================================
 
 /// Node flags stored in the first byte of each graph slot.
@@ -113,12 +113,12 @@ abstract final class NghNodeFlags {
 /// A single graph node within an [NghGraphPage].
 ///
 /// Fixed-size slot layout:
-///   [flags:u8][actualDegree:u8][neighbors: maxDegree × u32]
+///   [flags:u8][actualDegree:u8][neighbors: maxDegree x u32]
 final class NghGraphNode {
   /// Node status flags (see [NghNodeFlags]).
   int flags;
 
-  /// Actual number of valid neighbors (≤ maxDegree).
+  /// Actual number of valid neighbors (<= maxDegree).
   int actualDegree;
 
   /// Neighbor node IDs. Length == maxDegree; only first [actualDegree] valid.
@@ -222,7 +222,7 @@ final class NghGraphPage {
 }
 
 // ============================================================================
-// NGH PQ-Code Page — Dense Quantisation Codes
+// NGH PQ-Code Page -- Dense Quantisation Codes
 // ============================================================================
 
 /// A page of densely packed PQ codes.
@@ -231,13 +231,13 @@ final class NghGraphPage {
 ///   [vectorCount:u16][pqSubspaces:u16]
 ///   [code_0: M bytes][code_1: M bytes]...
 ///
-/// Total payload = 4 + vectorCount × M bytes.
+/// Total payload = 4 + vectorCount x M bytes.
 final class NghPqCodePage {
   /// Number of PQ sub-spaces (M); each code is M bytes.
   final int pqSubspaces;
 
   /// Packed PQ codes; each entry is [pqSubspaces] bytes.
-  /// Total length = vectorCount × pqSubspaces.
+  /// Total length = vectorCount x pqSubspaces.
   final Uint8List codes;
 
   /// Number of vectors stored in this page.
@@ -260,7 +260,7 @@ final class NghPqCodePage {
   }
 
   /// Get PQ code for the vector at [index] within this page.
-  /// Returns a view (zero-copy) — safe for Uint8List on all platforms.
+  /// Returns a view (zero-copy) -- safe for Uint8List on all platforms.
   Uint8List getCode(int index) {
     final off = index * pqSubspaces;
     return Uint8List.view(codes.buffer, codes.offsetInBytes + off, pqSubspaces);
@@ -307,14 +307,14 @@ final class NghPqCodePage {
 }
 
 // ============================================================================
-// NGH Raw-Vector Page — Full-Precision Vectors
+// NGH Raw-Vector Page -- Full-Precision Vectors
 // ============================================================================
 
 /// A page of full-precision raw vectors for re-ranking.
 ///
 /// Payload layout:
 ///   [vectorCount:u16][dimensions:u16][precision:u8][padding:u24]
-///   [vec_0: D × bytesPerElem][vec_1: D × bytesPerElem]...
+///   [vec_0: D x bytesPerElem][vec_1: D x bytesPerElem]...
 final class NghRawVectorPage {
   final int dimensions;
 
@@ -322,7 +322,7 @@ final class NghRawVectorPage {
   final int precisionIndex;
 
   /// Raw bytes for all vectors, packed contiguously.
-  /// Length = vectorCount × dimensions × bytesPerElement.
+  /// Length = vectorCount x dimensions x bytesPerElement.
   final Uint8List data;
 
   /// Number of vectors in this page.
@@ -378,17 +378,17 @@ final class NghRawVectorPage {
     final result = Float32List(dimensions);
     final bd = ByteData.sublistView(data, off, off + vectorSize);
     if (precisionIndex == 1) {
-      // float32 → float32
+      // float32 -> float32
       for (int i = 0; i < dimensions; i++) {
         result[i] = bd.getFloat32(i * 4, Endian.little);
       }
     } else if (precisionIndex == 0) {
-      // float64 → float32
+      // float64 -> float32
       for (int i = 0; i < dimensions; i++) {
         result[i] = bd.getFloat64(i * 8, Endian.little).toDouble();
       }
     } else {
-      // int8 → float32 (de-quantize: value / 127.0)
+      // int8 -> float32 (de-quantize: value / 127.0)
       for (int i = 0; i < dimensions; i++) {
         result[i] = data[off + i].toSigned(8) / 127.0;
       }
@@ -411,7 +411,7 @@ final class NghRawVectorPage {
         bd.setFloat64(i * 8, vec[i].toDouble(), Endian.little);
       }
     } else {
-      // float32 → int8 quantize (clamp to [-1, 1], scale to [-127, 127])
+      // float32 -> int8 quantize (clamp to [-1, 1], scale to [-127, 127])
       for (int i = 0; i < dimensions; i++) {
         final clamped = vec[i].clamp(-1.0, 1.0);
         data[off + i] = (clamped * 127.0).round().toSigned(8).toUnsigned(8);
@@ -458,17 +458,17 @@ final class NghRawVectorPage {
 }
 
 // ============================================================================
-// NGH Codebook Page — PQ Centroid Vectors
+// NGH Codebook Page -- PQ Centroid Vectors
 // ============================================================================
 
 /// Stores PQ codebook for one or more sub-spaces.
 ///
 /// Payload layout:
-///   [subspaceStart:u16] — first sub-space index stored in this page
-///   [subspaceCount:u16] — number of sub-spaces in this page
-///   [centroidsPerSubspace:u16] — K (typically 256)
-///   [subspaceDimensions:u16]   — D/M (dimensions per sub-space)
-///   [centroids: subspaceCount × K × (D/M) × 4 bytes (float32)]
+///   [subspaceStart:u16] -- first sub-space index stored in this page
+///   [subspaceCount:u16] -- number of sub-spaces in this page
+///   [centroidsPerSubspace:u16] -- K (typically 256)
+///   [subspaceDimensions:u16]   -- D/M (dimensions per sub-space)
+///   [centroids: subspaceCount x K x (D/M) x 4 bytes (float32)]
 final class NghCodebookPage {
   /// First sub-space index (for multi-page codebooks).
   final int subspaceStart;
@@ -484,7 +484,7 @@ final class NghCodebookPage {
 
   /// Centroid data, packed as float32.
   /// Layout: [sub0_cent0 ... sub0_centK-1][sub1_cent0 ...]...
-  /// Total: subspaceCount × centroidsPerSubspace × subspaceDimensions floats.
+  /// Total: subspaceCount x centroidsPerSubspace x subspaceDimensions floats.
   final Float32List centroids;
 
   NghCodebookPage({
@@ -503,7 +503,7 @@ final class NghCodebookPage {
   }
 
   Uint8List encodePayload() {
-    final headerLen = 8; // 4 × u16
+    final headerLen = 8; // 4 x u16
     final floatCount =
         subspaceCount * centroidsPerSubspace * subspaceDimensions;
     final dataBytes = floatCount * 4;

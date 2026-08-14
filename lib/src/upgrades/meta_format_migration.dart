@@ -13,17 +13,17 @@ import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/transaction_models.dart';
 
-/// One-shot migration of WAL / transaction meta from JSON → `.tobf`.
+/// One-shot migration of WAL / transaction meta from JSON -> `.tobf`.
 ///
 /// Crash-safe / idempotent (safe to re-run after interrupt):
-/// - Valid `.tobf` → delete residual JSON only after decode succeeds.
-/// - Corrupt/partial `.tobf` **with** legacy JSON → delete TOBF, rewrite from
+/// - Valid `.tobf` -> delete residual JSON only after decode succeeds.
+/// - Corrupt/partial `.tobf` **with** legacy JSON -> delete TOBF, rewrite from
 ///   JSON, verify, then delete JSON.
-/// - Corrupt/partial `.tobf` **without** JSON → delete TOBF and continue as
+/// - Corrupt/partial `.tobf` **without** JSON -> delete TOBF and continue as
 ///   fresh (never hard-fail the upgrade solely due to a half-written frame).
-/// - Unreadable legacy JSON → drop empty residuals / skip poison files and
+/// - Unreadable legacy JSON -> drop empty residuals / skip poison files and
 ///   continue (WalManager / Txn runtime recreate as needed).
-/// - Write-then-verify failure → keep JSON, delete partial TOBF, rethrow so
+/// - Write-then-verify failure -> keep JSON, delete partial TOBF, rethrow so
 ///   the next startup retries the same rewrite path.
 /// - Never deletes JSON unless the matching `.tobf` decodes successfully.
 ///
@@ -121,7 +121,7 @@ final class MetaFormatMigration {
     }
 
     Logger.info(
-      'MetaFormatMigration: migrating WAL meta JSON → TOBF for space '
+      'MetaFormatMigration: migrating WAL meta JSON -> TOBF for space '
       '[$spaceName]',
     );
 
@@ -261,7 +261,7 @@ final class MetaFormatMigration {
     final hasMainTobf = await dataStore.storage.existsFile(mainTobf);
     final hasMainJson = await dataStore.storage.existsFile(mainJson);
 
-    // Source of truth: activePartitions ∪ currentPartitionIndex (ring wrap;
+    // Source of truth: activePartitions U currentPartitionIndex (ring wrap;
     // do NOT directory-scan).
     final partitionsToCheck = <int>{};
     var needRewriteMainFromJson = !hasMainTobf && hasMainJson;
@@ -303,7 +303,7 @@ final class MetaFormatMigration {
 
     if (needRewriteMainFromJson) {
       Logger.info(
-        'MetaFormatMigration: migrating txn main meta JSON → TOBF for space '
+        'MetaFormatMigration: migrating txn main meta JSON -> TOBF for space '
         '[$spaceName]',
       );
       final rewritten = await _rewriteTxnMainFromJson(
@@ -314,7 +314,7 @@ final class MetaFormatMigration {
         partitionsToCheck: partitionsToCheck,
       );
       if (!rewritten) {
-        // Poison/empty JSON — continue with default partition 0.
+        // Poison/empty JSON -- continue with default partition 0.
         partitionsToCheck.add(0);
       }
     }
@@ -433,7 +433,7 @@ final class MetaFormatMigration {
             // No JSON: drop half-written TOBF and continue (fresh partition).
             Logger.warn(
               'MetaFormatMigration: txn partition TOBF corrupt '
-              'p$partitionIndex space [$spaceName]; no legacy JSON — '
+              'p$partitionIndex space [$spaceName]; no legacy JSON -- '
               'removing and continuing',
               rawError: e,
             );
@@ -482,7 +482,7 @@ final class MetaFormatMigration {
         );
         // Leave JSON; remove possibly corrupt TOBF so retry rewrites cleanly.
         await _deleteIfExists(dataStore, tobf);
-        // Retryable: JSON still present — surface after sweep so V3 re-runs.
+        // Retryable: JSON still present -- surface after sweep so V3 re-runs.
         retryableError ??= DbException.wrap(
           e,
           fallbackType: ResultType.engError,

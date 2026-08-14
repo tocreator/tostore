@@ -37,7 +37,7 @@ class VectorIndexManager {
   late final NghGraphEngine _graphEngine;
   late final VectorCache _vectorCache;
 
-  /// In-flight meta loads — prevents parallel readers from each hitting disk.
+  /// In-flight meta loads -- prevents parallel readers from each hitting disk.
   /// Key: "$tableUid/$indexUid", value: the single in-progress Future.
   final Map<String, Future<NghIndexMeta?>> _metaLoadingFutures = {};
 
@@ -298,13 +298,13 @@ class VectorIndexManager {
   }
 
   // =====================================================================
-  // Write Changes — Called by ParallelJournalManager during flush
+  // Write Changes -- Called by ParallelJournalManager during flush
   // =====================================================================
 
   /// Apply vector index changes for a table during the flush pipeline.
   ///
   /// Extracts vector fields from records, encodes them, inserts into the
-  /// NGH graph, and flushes dirty pages to disk — all batched.
+  /// NGH graph, and flushes dirty pages to disk -- all batched.
   Future<void> writeChanges({
     required TableContext table,
     List<Map<String, dynamic>> inserts = const [],
@@ -356,7 +356,7 @@ class VectorIndexManager {
       // Ensure mapping B+Tree metas are initialised
       meta = _ensureMappingMetas(meta, table);
 
-      // ── Process inserts ──
+      // -- Process inserts --
       if (inserts.isNotEmpty) {
         final preparedVectors = await _prepareInsertVectorsBatch(
           records: inserts,
@@ -398,7 +398,7 @@ class VectorIndexManager {
             concurrency: concurrency,
           );
 
-          // Write nodeId ↔ PK dual B+Tree mappings (persistent, not in memory)
+          // Write nodeId <-> PK dual B+Tree mappings (persistent, not in memory)
           meta = await _writeMappings(
             table: table,
             meta: meta,
@@ -414,12 +414,12 @@ class VectorIndexManager {
         }
       }
 
-      // ── Process deletes ──
+      // -- Process deletes --
       if (deletes.isNotEmpty) {
         final nodeIdsToDelete = <int>[];
         final deletePks = <String>[];
 
-        // Reverse lookup: PK → nodeId via B+Tree (disk, no memory map)
+        // Reverse lookup: PK -> nodeId via B+Tree (disk, no memory map)
         final delYc = YieldController(
           'VectorIndexManager.writeChanges.deletes',
           checkInterval: 20,
@@ -479,7 +479,7 @@ class VectorIndexManager {
   }
 
   // =====================================================================
-  // vectorSearch — Public Search API
+  // vectorSearch -- Public Search API
   // =====================================================================
 
   /// Perform approximate nearest neighbor search on a vector field.
@@ -564,7 +564,7 @@ class VectorIndexManager {
       lease?.release();
     }
 
-    // Map nodeId → PK via persistent B+Tree (batch lookup to reduce leaf reads).
+    // Map nodeId -> PK via persistent B+Tree (batch lookup to reduce leaf reads).
     if (results.isEmpty) return const [];
     // Sort by nodeId to exploit B+Tree leaf locality for batch lookup.
     final sortedByNode = List<NghSearchResult>.from(results)
@@ -633,7 +633,7 @@ class VectorIndexManager {
       var loadedFromLegacyPath = false;
 
       if (diskLoad == null) {
-        // Stable data meta missing — fall back to deprecated logical-name directory.
+        // Stable data meta missing -- fall back to deprecated logical-name directory.
         final idx = _dataStore.tableMetaManager
             ?.findIndexSchemaByUid(table.schema, indexUid);
         final schemaLegacyName = idx?.actualIndexName;
@@ -852,7 +852,7 @@ class VectorIndexManager {
       return existing;
     }
 
-    // Need to train — collect sample vectors from inserts
+    // Need to train -- collect sample vectors from inserts
     final samples = await _collectTrainingSamplesBatch(
       inserts: inserts,
       fieldName: fieldName,
@@ -1052,7 +1052,7 @@ class VectorIndexManager {
   ///
   /// Nodes visited in the same search neighbourhood are placed on the same
   /// or adjacent pages, dramatically improving disk I/O during beam search.
-  /// This is a heavyweight maintenance operation — run it infrequently
+  /// This is a heavyweight maintenance operation -- run it infrequently
   /// (e.g. after large bulk imports) using [WorkloadType.maintenance] tokens.
   ///
   /// Returns `true` if reordering was performed.
@@ -1111,7 +1111,7 @@ class VectorIndexManager {
       if (!isVisited(i)) bfsOrder.add(i);
     }
 
-    // Phase 2: Build old→new ID mapping (Int32List: 4GB for 10^9 nodes)
+    // Phase 2: Build old->new ID mapping (Int32List: 4GB for 10^9 nodes)
     final oldToNew = Int32List(totalNodes);
     for (int i = 0; i < totalNodes; i++) {
       if (i > 0 && i % 50000 == 0) {
@@ -1190,7 +1190,7 @@ class VectorIndexManager {
       dirtyGraph[NghPagePtr(NghDataCategory.graph, newPartition, newPage)] =
           targetPage;
 
-      // Copy PQ code: old slot → new slot
+      // Copy PQ code: old slot -> new slot
       final oldPqPartition =
           meta.pqPartitionForNode(oldId, _dataStore.configuredPageSize);
       final oldPqPage =
@@ -1218,7 +1218,7 @@ class VectorIndexManager {
       dirtyPq[NghPagePtr(NghDataCategory.pqCode, newPqPartition, newPqPage)] =
           targetPq;
 
-      // Copy raw vector: old slot → new slot
+      // Copy raw vector: old slot -> new slot
       final oldRawPartition =
           meta.rawVectorPartitionForNode(oldId, _dataStore.configuredPageSize);
       final oldRawPage =
@@ -1266,7 +1266,7 @@ class VectorIndexManager {
       dirtyRawVectorPages: dirtyRaw,
     );
 
-    // Phase 5: Rebuild nodeId ↔ PK mapping with new IDs
+    // Phase 5: Rebuild nodeId <-> PK mapping with new IDs
     // Requires reading old mappings and writing new ones
     meta = _ensureMappingMetas(meta, table);
     final nid2pkDeltas = <DataBlockEntry>[];
@@ -1377,7 +1377,7 @@ class VectorIndexManager {
   }
 
   // =====================================================================
-  // nodeId ↔ PK Persistent B+Tree Mapping
+  // nodeId <-> PK Persistent B+Tree Mapping
   // =====================================================================
 
   /// Ensure mapping B+Tree IndexMeta objects exist in [meta].
@@ -1409,7 +1409,7 @@ class VectorIndexManager {
     return meta;
   }
 
-  /// Batch-write nodeId ↔ PK mappings to dual B+Trees.
+  /// Batch-write nodeId <-> PK mappings to dual B+Trees.
   ///
   /// For inserts: [startNodeId] is the first allocated nodeId, [pks] aligned.
   /// For deletes: [deleteNodeIds] and [pks] aligned; [startNodeId] is ignored.
@@ -1447,14 +1447,14 @@ class VectorIndexManager {
         nid2pkDeltas.add(DataBlockEntry(nodeIdKey, deleteVal));
         pk2nidDeltas.add(DataBlockEntry(pkKey, deleteVal));
       } else {
-        // Insert value: [0][utf8(value)] — compatible with lookupUniquePrimaryKey
+        // Insert value: [0][utf8(value)] -- compatible with lookupUniquePrimaryKey
         nid2pkDeltas.add(DataBlockEntry(nodeIdKey, _encodeUniqueValue(pk)));
         pk2nidDeltas
             .add(DataBlockEntry(pkKey, _encodeUniqueValue(nodeId.toString())));
       }
     }
 
-    // Write both mappings in parallel — no data dependency between them.
+    // Write both mappings in parallel -- no data dependency between them.
     var nid2pkMeta = meta.nodeIdToPkMeta!;
     var pk2nidMeta = meta.pkToNodeIdMeta!;
 
@@ -1574,13 +1574,13 @@ class VectorIndexManager {
   double _distanceToScore(double distance, VectorDistanceMetric metric) {
     switch (metric) {
       case VectorDistanceMetric.l2:
-        // L2 distance → score: 1 / (1 + distance)
+        // L2 distance -> score: 1 / (1 + distance)
         return 1.0 / (1.0 + distance);
       case VectorDistanceMetric.innerProduct:
         // Inner product was negated for min-heap; negate back and sigmoid
         return 1.0 / (1.0 + exp(-(-distance)));
       case VectorDistanceMetric.cosine:
-        // Cosine distance = 1 - similarity → score = 1 - distance
+        // Cosine distance = 1 - similarity -> score = 1 - distance
         return (1.0 - distance).clamp(0.0, 1.0);
     }
   }

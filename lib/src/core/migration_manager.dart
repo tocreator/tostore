@@ -11,6 +11,7 @@ import '../model/background_write_entry.dart';
 import '../model/background_write_type.dart';
 import '../model/buffer_entry.dart';
 import '../model/cancellation_token.dart';
+import '../model/data_store_config.dart';
 import '../model/db_exception.dart';
 import '../model/id_generator.dart';
 import '../model/key_migration_info.dart';
@@ -34,6 +35,7 @@ import 'key_migration_progress.dart';
 import 'key_migration_runner.dart';
 import 'large_operation_runner.dart';
 import 'promote_primary_key.dart';
+import 'resource_manager.dart';
 import 'transaction_context.dart';
 import 'yield_controller.dart';
 
@@ -212,7 +214,7 @@ class MigrationManager {
   /// marked fully open for external callers.
   ///
   /// Throws [DbClosedException] only as internal control-flow. Callers must
-  /// swallow it silently — close/pause is expected, not an error.
+  /// swallow it silently -- close/pause is expected, not an error.
   void _throwIfMigrationStopped([String? detail]) {
     if (!_dataStore.isBaseInitialized) {
       throw DbClosedException(detail ?? 'Migration stopped');
@@ -299,7 +301,7 @@ class MigrationManager {
     return _activeReadCursors[table.tableUid];
   }
 
-  /// Prefer this after schema cutover / rename — names may no longer resolve.
+  /// Prefer this after schema cutover / rename -- names may no longer resolve.
   Future<TableContext> _requireTableContextByUid(TableUid tableUid) async {
     final ctx = await _tableContextForUid(tableUid);
     if (ctx != null) return ctx;
@@ -610,7 +612,7 @@ class MigrationManager {
           'force-clearing in-memory migration state (checkpoints retained)',
         );
       } catch (e) {
-        // Cooperative stop is expected on close — silent.
+        // Cooperative stop is expected on close -- silent.
         if (e is! DbClosedException) {
           Logger.error('Failed to wait for migration task stop', rawError: e);
         }
@@ -672,7 +674,7 @@ class MigrationManager {
           '${effectiveTimeout.inSeconds}s',
         );
       } catch (e) {
-        // Cooperative stop is expected — silent.
+        // Cooperative stop is expected -- silent.
         if (e is! DbClosedException) {
           Logger.error('Failed to wait for migration task stop', rawError: e);
         }
@@ -708,7 +710,7 @@ class MigrationManager {
   ///
   /// Returns `true` when key migration was paused for this table; the caller
   /// must call [resumeKeyMigrationAfterDestructive] **after** the physical
-  /// clear completes (pause is global — other tables stay stopped until then).
+  /// clear completes (pause is global -- other tables stay stopped until then).
   Future<bool> reconcileOnClear(TableContext table) async {
     return _reconcileDestructiveTableLifecycle(table, reason: 'clear');
   }
@@ -725,15 +727,15 @@ class MigrationManager {
     return _reconcileDestructiveTableLifecycle(table, reason: 'dropTable');
   }
 
-  /// Shared clear/drop lifecycle: cooperative abort → stop background producers
-  /// → drop buffered writes of every type → delete all in-memory/disk tasks.
+  /// Shared clear/drop lifecycle: cooperative abort -> stop background producers
+  /// -> drop buffered writes of every type -> delete all in-memory/disk tasks.
   ///
   /// Abort must run **before** acquiring the table exclusive lock: the rewrite
   /// path may need that same lock to exit after CancellationToken fires.
   ///
   /// Key migration pause is **global** (the runner walks every table). When
   /// this returns `true`, callers must call [resumeKeyMigrationAfterDestructive]
-  /// only after the physical clear/drop finishes — otherwise remaining tables
+  /// only after the physical clear/drop finishes -- otherwise remaining tables
   /// stay paused forever.
   Future<bool> _reconcileDestructiveTableLifecycle(
     TableContext table, {
@@ -1122,7 +1124,7 @@ class MigrationManager {
       return false;
     }
 
-    // Alias / pre-rename name on context → normalize through migration ops.
+    // Alias / pre-rename name on context -> normalize through migration ops.
     var canonical = descriptor.oldSchema.name;
     for (final op in descriptor.operations) {
       if (op.type == MigrationType.renameTable && op.newTableName != null) {
@@ -1322,7 +1324,7 @@ class MigrationManager {
     try {
       final targetSchemas = <TableSchema>[];
 
-      // System schemas: trusted engine definitions — do not strip engine fields.
+      // System schemas: trusted engine definitions -- do not strip engine fields.
       for (final schema in systemSchemas) {
         final reservedSystemTableNames = SystemTable.systemTableNames;
         final systemSchema = schema.copyWith(isSystemTable: true);
@@ -2086,7 +2088,7 @@ class MigrationManager {
       ]);
     }
 
-    // Promote-only: probe non-emptiness BEFORE the exclusive table lock —
+    // Promote-only: probe non-emptiness BEFORE the exclusive table lock --
     // queries/flushes under that lock deadlock or see empty buffers.
     // Non-promote paths skip this entirely (no extra I/O / scans).
     final promoteRequested = _containsPromotePrimaryKeyOp(operations);
@@ -2392,7 +2394,7 @@ class MigrationManager {
       // Calculate table write requirement once
       final needsTableWrite = _needDataMigration(sortedOperations, oldSchema);
 
-      // Plan field layout for atomic schema cutover (evolve ± deleted-slot compact).
+      // Plan field layout for atomic schema cutover (evolve +/- deleted-slot compact).
       FieldStorageLayout? targetFieldLayout;
       var enableDeletedSlotCompaction = false;
       if (!isDropTable && targetSchema != null && schemaMgrForLayout != null) {
@@ -2436,7 +2438,7 @@ class MigrationManager {
       final childIndexesToDrop = <TableUid, List<IndexUid>>{};
 
       // Promote-only: enrich old PK config (SchemaBuilder may omit it).
-      // Non-promote: keep the existing list instance — no map/alloc.
+      // Non-promote: keep the existing list instance -- no map/alloc.
       if (hasPromoteOp && oldSchema != null) {
         sortedOperations = _enrichPromoteOperationsWithOldPk(
           sortedOperations,
@@ -2504,7 +2506,7 @@ class MigrationManager {
             );
 
             // Persist via normal cutover ritual (FK sync, rename side effects,
-            // BWS/large-op pause) — but with sibling-only ops + oldWorking schema.
+            // BWS/large-op pause) -- but with sibling-only ops + oldWorking schema.
             final logicalCtx = await _requireTableContextByUid(tableUid);
             await TransactionContext.runAsSystemOperation(() async {
               await executeSchemaOperations(
@@ -2545,7 +2547,7 @@ class MigrationManager {
             ]);
           }
           // Shadow is created with an initial layout (no deleted slots). Align
-          // the task snapshot to that physical encoding — evolve snapshots may
+          // the task snapshot to that physical encoding -- evolve snapshots may
           // still carry the promoted source field as a deleted slot.
           final shadowLayout = await _dataStore.tableMetaManager
               ?.getTableFieldLayout(shadowSchema.tableUid);
@@ -2553,7 +2555,7 @@ class MigrationManager {
             isSchemaUpdated: true,
             shadowTableUid: shadowSchema.tableUid,
             promotePhase: PromotePhase.backfilling,
-            // Dual-write + shadow backfill — not in-place table/index rewrite.
+            // Dual-write + shadow backfill -- not in-place table/index rewrite.
             writeMode: MigrationWriteMode.none,
             specificIndexUids: const <IndexUid>[],
             // Old snapshot becomes working schema (siblings applied, PK unchanged).
@@ -2641,7 +2643,7 @@ class MigrationManager {
         final physicalTableCtx = await _requireTableContextByUid(tableUid);
         activeSpaceRecordCount = await _dataStore.tableDataManager
             .getTableRecordCount(physicalTableCtx);
-        // Promote-with-data cost ≈ full row rewrite (shadow insert); estimate
+        // Promote-with-data cost ~= full row rewrite (shadow insert); estimate
         // with tableAndIndex rates without claiming rewrite writeMode.
         final estimateMode = promoteWithData
             ? MigrationWriteMode.tableAndIndex
@@ -2658,7 +2660,7 @@ class MigrationManager {
       _pendingTasks.add(task);
 
       // Reconcile pending tasks for the table to merge or cancel redundant ops
-      // (always by tableUid — rename cutover invalidates the pre-rename name).
+      // (always by tableUid -- rename cutover invalidates the pre-rename name).
       final reconcileTable = await _tableContextForUid(tableUid);
       if (reconcileTable != null) {
         await _reconcilePendingTasksForTable(
@@ -4779,7 +4781,7 @@ class MigrationManager {
 
         await syncHasMigrationTask();
       } catch (e) {
-        // Close/pause cooperative stop — silent, not a failure to surface.
+        // Close/pause cooperative stop -- silent, not a failure to surface.
         if (e is DbClosedException) {
           return MigrationTasksResult(success: false);
         }
@@ -4857,7 +4859,7 @@ class MigrationManager {
         _throwIfMigrationStopped(
           'Migration stopped before schema cutover for ${currentTask.tableName}',
         );
-        // Legacy tasks may lack targetFieldLayoutSnapshot — compute evolve±compact.
+        // Legacy tasks may lack targetFieldLayoutSnapshot -- compute evolve+/-compact.
         if (currentTask.targetFieldLayoutSnapshot == null) {
           final schemaMgr = _dataStore.tableMetaManager;
           if (schemaMgr != null) {
@@ -5073,7 +5075,7 @@ class MigrationManager {
               Logger.info(
                 'Skip migration for table [$originalTableName] in space [$space]: table mapping not found',
               );
-              // Still clear this space from the task — otherwise pendingSpaces
+              // Still clear this space from the task -- otherwise pendingSpaces
               // never drains and the task can never complete.
               currentTask = currentTask.removePendingSpace(space);
               await _saveMigrationTask(currentTask);
@@ -5085,7 +5087,7 @@ class MigrationManager {
             if (cutover != null) {
               // Wait until the WAL checkpoint advances past schemaCutoverWalPointer.
               // This ensures all buffered legacy-shape writes are safely flushed to disk.
-              // Actively drain WAL/journal — a pure poll can hang forever when nothing
+              // Actively drain WAL/journal -- a pure poll can hang forever when nothing
               // else schedules flush (idle buffer + crontab only watches bg scheduler).
               await _waitForWalCutover(
                 cutover: cutover,
@@ -5117,7 +5119,7 @@ class MigrationManager {
               );
             }
 
-            // Promote-to-PK: backfill old → shadow via upsert; never
+            // Promote-to-PK: backfill old -> shadow via upsert; never
             // in-place rewrite the old working table.
             if (currentTask.isPromotePrimaryKeyTask &&
                 currentTask.shadowTableUid != null &&
@@ -5277,11 +5279,21 @@ class MigrationManager {
                     return false;
                   }
 
-                  // Memory threshold backpressure control with cancellation detection
+                  // Resource-status backpressure (file mode warning/critical only)
                   await migrationInstance.backgroundWriteScheduler
                       .waitIfCongested(
-                    writeBatchSize,
-                    migrationInstance.writeBufferManager.queueLength,
+                    writeBatchSize: writeBatchSize,
+                    normalQueueLength:
+                        migrationInstance.writeBufferManager.queueLength,
+                    isMemoryMode: migrationInstance.config.persistenceMode ==
+                        PersistenceMode.memory,
+                    getMemoryStatus: () =>
+                        migrationInstance.resourceManager?.memoryStatus ??
+                        ResourceStatus.normal,
+                    refreshResourceStatus: () =>
+                        migrationInstance.resourceManager
+                            ?.triggerImmediateCheck() ??
+                        Future<void>.value(),
                     cancellationToken: migrationController,
                   );
 
@@ -5464,7 +5476,7 @@ class MigrationManager {
       }
     } catch (e) {
       if (e is DbClosedException) {
-        // Cooperative pause/close — silent; rethrow for outer single-flight.
+        // Cooperative pause/close -- silent; rethrow for outer single-flight.
         rethrow;
       }
       _telemetry.recordTaskFailure(task.taskId, e.toString());
@@ -5500,7 +5512,7 @@ class MigrationManager {
     final wal = _dataStore.walManager;
 
     // Journal disabled: cutover/currentPointer stay on in-memory seq space while
-    // checkpoints are not advanced — waiting is meaningless.
+    // checkpoints are not advanced -- waiting is meaningless.
     if (!_dataStore.config.enableJournal) {
       await _forceDrainWalAndJournal();
       return;
@@ -6050,7 +6062,7 @@ class MigrationManager {
     return true;
   }
 
-  /// Early-exit scan — prefer over repeated `.any` on hot migration paths.
+  /// Early-exit scan -- prefer over repeated `.any` on hot migration paths.
   bool _containsMigrationType(
     List<MigrationOperation> operations,
     MigrationType type,
@@ -6073,7 +6085,7 @@ class MigrationManager {
   /// per-space data). Current-space-only probes would falsely take the empty
   /// cutover path and corrupt other spaces that still hold old-PK rows.
   ///
-  /// Relies on persisted/buffer record counts — no query scan.
+  /// Relies on persisted/buffer record counts -- no query scan.
   Future<bool> _probePromoteNonEmptyHint(
     TableUid tableUid, {
     TableSchema? schema,
@@ -6114,15 +6126,14 @@ class MigrationManager {
       final probeCtx =
           await instance.tableMetaManager?.getTableContext(tableUid);
       if (probeCtx == null) {
-        // Meta missing in this space — treat as empty for data dirs.
+        // Meta missing in this space -- treat as empty for data dirs.
         return false;
       }
       final diskCount =
           await instance.tableDataManager.getTableRecordCount(probeCtx);
       if (diskCount > 0) return true;
       return instance.writeBufferManager
-          .getBufferedInsertKeys(probeCtx)
-          .isNotEmpty;
+          .hasPendingWritesForUid(probeCtx.tableUid);
     } finally {
       if (!reusePrimary) {
         await instance.close();
@@ -6190,7 +6201,7 @@ class MigrationManager {
     return operations;
   }
 
-  /// Backfill one space for promoteFieldToPrimaryKey (old → shadow via upsert).
+  /// Backfill one space for promoteFieldToPrimaryKey (old -> shadow via upsert).
   ///
   /// Old table is the source of truth. Concurrent online dual-writes already
   /// upsert the shadow; this scan catches remaining rows. Uses batchUpsert
@@ -6262,8 +6273,16 @@ class MigrationManager {
       if (records.isEmpty) return true;
 
       await migrationInstance.backgroundWriteScheduler.waitIfCongested(
-        writeBatchSize,
-        migrationInstance.writeBufferManager.queueLength,
+        writeBatchSize: writeBatchSize,
+        normalQueueLength: migrationInstance.writeBufferManager.queueLength,
+        isMemoryMode:
+            migrationInstance.config.persistenceMode == PersistenceMode.memory,
+        getMemoryStatus: () =>
+            migrationInstance.resourceManager?.memoryStatus ??
+            ResourceStatus.normal,
+        refreshResourceStatus: () =>
+            migrationInstance.resourceManager?.triggerImmediateCheck() ??
+            Future<void>.value(),
         cancellationToken: migrationController,
       );
       if (migrationController.isCancelled) return false;
@@ -6297,7 +6316,7 @@ class MigrationManager {
             enablePromoteDualWrite: false,
           );
           // Business-only: tolerate (often dual-write race). Otherwise throw
-          // with the original statuses — never synthesize a generic type.
+          // with the original statuses -- never synthesize a generic type.
           if (upsertResult.hasErrors) {
             final statuses = upsertResult.statuses;
             final businessOnly = statuses.isNotEmpty &&
@@ -6308,7 +6327,7 @@ class MigrationManager {
             }
           }
         } on DbClosedException {
-          // Shutdown / cooperative cancel — stop without wrapping.
+          // Shutdown / cooperative cancel -- stop without wrapping.
           return false;
         }
       }
@@ -6348,7 +6367,7 @@ class MigrationManager {
 
   /// Discard in-memory work for the doomed old (logical) table before its
   /// directory is deleted. Key-migration / large-op BWS entries on the old
-  /// tree must not block promote swap — those files are going away.
+  /// tree must not block promote swap -- those files are going away.
   Future<void> _discardDoomedPromoteLogicalBuffers(
     DataStoreImpl instance,
     TableUid logicalUid,
@@ -6360,9 +6379,9 @@ class MigrationManager {
   /// Swap one space's shadow directory onto the logical table path.
   ///
   /// Idempotent for crash restart:
-  /// - shadow gone + logical present → already swapped; no-op
-  /// - both gone → empty space never materialized dirs (or already cleaned); no-op
-  /// - shadow present → delete logical (if any) then move shadow → logical
+  /// - shadow gone + logical present -> already swapped; no-op
+  /// - both gone -> empty space never materialized dirs (or already cleaned); no-op
+  /// - shadow present -> delete logical (if any) then move shadow -> logical
   Future<void> _swapPromoteDirectoriesForInstance({
     required DataStoreImpl instance,
     required TableUid logicalUid,
@@ -6399,17 +6418,17 @@ class MigrationManager {
     }
     await instance.storage.moveDirectory(shadowPath, logicalPath);
     Logger.info(
-      'Promote swap moved shadow → logical for space=$space task=$taskId',
+      'Promote swap moved shadow -> logical for space=$space task=$taskId',
     );
   }
 
   /// Atomically swap shadow files onto the logical tableUid and drop shadow meta.
   ///
   /// Locking rule: never call [ParallelJournalManager.flushCompletely] while
-  /// holding the logical/shadow table exclusive locks — PJM re-acquires those
+  /// holding the logical/shadow table exclusive locks -- PJM re-acquires those
   /// locks and would deadlock (LockManager is not reentrant).
   ///
-  /// Space rule: process spaces strictly one-by-one (open → flush → swap →
+  /// Space rule: process spaces strictly one-by-one (open -> flush -> swap ->
   /// close). Keeping many migration [DataStoreImpl] instances open at once
   /// retains file handles across spaces and can fail delete/move with sharing
   /// violations (especially on Windows).
@@ -6433,7 +6452,7 @@ class MigrationManager {
       _tableLockResource(shadowUid),
     ]..sort();
 
-    // Only retry when shadow business buffers raced into the flush→lock gap.
+    // Only retry when shadow business buffers raced into the flush->lock gap.
     const maxAttempts = 3;
     for (var attempt = 0; attempt < maxAttempts; attempt++) {
       // Quiesce primary writers before touching directories.
@@ -6519,7 +6538,7 @@ class MigrationManager {
           primaryKeyConfig:
               targetSchema.primaryKeyConfig.copyWith(clearFromFieldId: true),
         );
-        // Prefer live shadow layout; after crash it may already be deleted —
+        // Prefer live shadow layout; after crash it may already be deleted --
         // fall back to task snapshot so meta cutover stays idempotent.
         final shadowMeta =
             await _dataStore.tableMetaManager?.getTableMeta(shadowUid);
@@ -6646,7 +6665,7 @@ class MigrationManager {
   ///
   /// Order matters for concurrent [queryTaskStatus] / recovery:
   /// remove mapping first (source of truth that the task is gone), then delete
-  /// the file. Mapping persist must succeed before delete — otherwise a failed
+  /// the file. Mapping persist must succeed before delete -- otherwise a failed
   /// meta write would leave "in mapping / file missing". Crash after mapping
   /// removal may leave an orphan file (harmless GC later).
   Future<void> _cleanupTask(MigrationTask task) async {
@@ -7040,7 +7059,7 @@ class MigrationManager {
   /// Requires removeField, deletedSlotsRatio >= 30%, deletedSlotsCount >= 50,
   /// and no selectable layout version (this cutover's source layout or any
   /// same-table pending old/target snapshot) whose totalSlots equals the
-  /// compacted slot count — otherwise fieldCount-based version selection
+  /// compacted slot count -- otherwise fieldCount-based version selection
   /// would be ambiguous.
   bool _shouldCompactDeletedSlots({
     required TableUid tableUid,
@@ -8614,7 +8633,7 @@ class MigrationManager {
     }
 
     // 2. Fold older table-rewrite / invalidate indexOnly on PK change.
-    // Only when a new task just enqueued — never on disk-recovery reconcile,
+    // Only when a new task just enqueued -- never on disk-recovery reconcile,
     // otherwise the newest pending task would incorrectly supersede siblings.
     if (triggerTask != null) {
       await _reconcileDataRewriteOwnership(
@@ -8783,14 +8802,14 @@ class MigrationManager {
   /// are stripped (or deleted). PK name/type changes also invalidate indexOnly.
   ///
   /// [removeField] / [renameField] always supersede older table rewrites even
-  /// without deleted-slot compaction — otherwise an older rewrite can enqueue
+  /// without deleted-slot compaction -- otherwise an older rewrite can enqueue
   /// stale table/index shapes that PJM would flush after the field is gone.
   Future<void> _reconcileDataRewriteOwnership({
     required TableContext table,
     required MigrationTask triggerTask,
   }) async {
     // Promote replaces physical table data via shadow swap (writeMode stays
-    // none) — still supersedes older in-place table rewrites.
+    // none) -- still supersedes older in-place table rewrites.
     final triggerIsPromote = triggerTask.isPromotePrimaryKeyTask;
     final triggerNeedsTableWrite = triggerIsPromote ||
         _taskHasTableWrite(triggerTask) ||
@@ -8876,7 +8895,7 @@ class MigrationManager {
       }
 
       // Keep still-valid index builds; drop table rewrite responsibility.
-      // Buffered entries freeze writeMode at enqueue — purge scheduler below.
+      // Buffered entries freeze writeMode at enqueue -- purge scheduler below.
       final downgraded = current.copyWith(
         writeMode: MigrationWriteMode.indexOnly,
         forceDataMigration: false,

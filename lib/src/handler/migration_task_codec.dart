@@ -40,7 +40,7 @@ abstract final class MigrationTaskFieldId {
   static const int targetFieldLayoutSnapshot = 21;
   static const int shadowTableUid = 22;
   static const int promotePhase = 23;
-  // Reserved 40–63.
+  // Reserved 40--63.
 }
 
 abstract final class SpaceCheckpointFieldId {
@@ -73,7 +73,7 @@ abstract final class MigrationOperationFieldId {
   static const int oldForeignKey = 17;
   static const int sourceFieldId = 18;
   static const int discardOldPrimaryKey = 19;
-  // Reserved 30–39.
+  // Reserved 30--39.
 }
 
 abstract final class FieldSchemaUpdateFieldId {

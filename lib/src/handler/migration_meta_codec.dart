@@ -12,7 +12,7 @@ import 'meta_file_codec.dart';
 abstract final class MigrationMetaFieldId {
   static const int directoryMapping = 1;
   static const int keyMigrationInfo = 2;
-  // Reserved 20–31.
+  // Reserved 20--31.
 }
 
 abstract final class MigrationDirMappingFieldId {
@@ -36,7 +36,7 @@ abstract final class KeyMigrationInfoFieldId {
   static const int createdAtUs = 3;
   static const int domainCompleted = 4;
   static const int snapshots = 5;
-  // Reserved 10–15.
+  // Reserved 10--15.
 }
 
 abstract final class DomainCompletedEntryFieldId {

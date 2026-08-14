@@ -14,7 +14,7 @@ import 'dart:math' as math;
 /// 4. **Low Latency**: Supports immediate yielding (min interval = 1) for
 ///    extremely heavy workloads.
 ///
-/// Usage (required fast-path pattern — do **not** wrap in an `async` helper):
+/// Usage (required fast-path pattern -- do **not** wrap in an `async` helper):
 /// ```dart
 /// final yieldController = YieldController('batch_process');
 /// for (final item in heavyList) {
@@ -116,7 +116,7 @@ class YieldController {
 
   /// Checks if the time budget has been exceeded and yields if necessary.
   ///
-  /// Returns `null` if no yield is needed (fast path — no Future / no await).
+  /// Returns `null` if no yield is needed (fast path -- no Future / no await).
   /// Returns a `Future` only when yielding is actually required.
   ///
   /// **Required call pattern** (skipping the null-check drops the yield):

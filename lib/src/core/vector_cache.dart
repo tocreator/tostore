@@ -7,7 +7,7 @@ import 'tree_cache.dart';
 import 'vector_quantizer.dart';
 
 // ============================================================================
-// Vector Cache — Hot PQ Codes, Codebooks, and Prefetch Queue
+// Vector Cache -- Hot PQ Codes, Codebooks, and Prefetch Queue
 //
 // Tier 1 of the cold/hot separation:
 //   - PQ codes: compact (M bytes/vector), always-resident for ADC search
@@ -21,7 +21,7 @@ import 'vector_quantizer.dart';
 /// Hot cache for PQ codes and codebooks, keyed by [tableUid, indexUid].
 class VectorCache {
   /// PQ code cache: key = [tableUid, indexUid, nodeId], value = Uint8List (M bytes).
-  /// This is the most performance-critical cache — every ADC distance check
+  /// This is the most performance-critical cache -- every ADC distance check
   /// does a lookup here instead of reading a full page from disk.
   late final TreeCache<Uint8List> _pqCodeCache;
 
@@ -43,7 +43,7 @@ class VectorCache {
 
     _codebookCache = TreeCache<PqCodebook>(
       sizeCalculator: (cb) => cb.data.lengthInBytes + 64,
-      maxByteThreshold: 64 * 1024 * 1024, // 64MB — codebooks are small
+      maxByteThreshold: 64 * 1024 * 1024, // 64MB -- codebooks are small
       minByteThreshold: 32 * 1024 * 1024,
       groupDepth: 1, // [tableUid]
       debugLabel: 'VectorCodebookCache',
@@ -51,7 +51,7 @@ class VectorCache {
 
     _metaCache = TreeCache<NghIndexMeta>(
       sizeCalculator: (_) => 512, // small fixed-size
-      maxByteThreshold: 64 * 1024 * 1024, // 64MB — codebooks are small
+      maxByteThreshold: 64 * 1024 * 1024, // 64MB -- codebooks are small
       minByteThreshold: 32 * 1024 * 1024,
       groupDepth: 1, // [tableUid]
       debugLabel: 'VectorMetaCache',
@@ -59,7 +59,7 @@ class VectorCache {
   }
 
   // =====================================================================
-  // PQ Code Cache — Per-Vector Fast Access
+  // PQ Code Cache -- Per-Vector Fast Access
   // =====================================================================
 
   /// Get cached PQ code for a node.
@@ -82,7 +82,7 @@ class VectorCache {
   }
 
   // =====================================================================
-  // Codebook Cache — Per-Index
+  // Codebook Cache -- Per-Index
   // =====================================================================
 
   /// Get cached codebook for an index.
@@ -101,7 +101,7 @@ class VectorCache {
   }
 
   // =====================================================================
-  // Meta Cache — Per-Index
+  // Meta Cache -- Per-Index
   // =====================================================================
 
   /// Get cached NghIndexMeta.

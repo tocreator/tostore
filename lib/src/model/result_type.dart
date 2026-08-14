@@ -138,7 +138,7 @@ enum ResultType {
       30019,
       'DEV_MIGRATION_PROMOTE_LARGE_OP_NOT_ALLOWED',
       'Table is running promoteFieldToPrimaryKey; large-scale data operations '
-          'are not supported — narrow the scope or wait until promote completes'),
+          'are not supported -- narrow the scope or wait until promote completes'),
 
   // "SYS_" - System Error (50-79)
   sysTransactionAborted(

@@ -1,8 +1,7 @@
 import 'dart:collection';
-import 'dart:async';
-import '../model/wal_pointer.dart';
-import 'crontab_manager.dart'; // Import CrontabManager
 
+import '../model/wal_pointer.dart';
+import 'crontab_manager.dart';
 import 'data_store_impl.dart';
 import 'yield_controller.dart';
 
@@ -25,15 +24,12 @@ final class ReadView extends LinkedListEntry<ReadView> {
   String toString() => 'ReadView(id: $id, snapshot: $snapshotPointer)';
 }
 
-/// ReadViewManager: tracks active read views to determine delayed cleanup boundaries
+/// Tracks active read views so flushed pending-buffer eviction can wait until
+/// queries that still need file+buffer merge have finished.
 ///
-/// In high-concurrency scenarios, multiple queries may simultaneously read data from files.
-/// After the flush task is completed, buffer data cannot be immediately deleted,
-/// as these queries may still need this data for merging.
-///
-/// Optimization: uses [LinkedList] to maintain read views in time order,
-/// implements O(1) retrieval of the oldest snapshot.
-/// Assuming WAL pointers increase monotonically with time, the earliest created view has the oldest snapshot.
+/// Uses [LinkedList] ordered by creation time (head = oldest) for O(1) oldest
+/// snapshot / createdAt. Does not raise buffer thresholds -- pending trees use
+/// [TreeCacheEvictionMode.none] and a flushed-evict queue instead.
 class ReadViewManager {
   final DataStoreImpl _dataStore;
 
@@ -51,7 +47,6 @@ class ReadViewManager {
   int _nextViewId = 0;
 
   ReadViewManager(this._dataStore) {
-    // Auto-start periodic cleanup on instantiation
     CrontabManager.addCallback(ExecuteInterval.seconds10, _periodicCleanup);
   }
 
@@ -61,14 +56,12 @@ class ReadViewManager {
     CrontabManager.removeCallback(ExecuteInterval.seconds10, _periodicCleanup);
   }
 
-  /// Periodic cleanup callback
+  /// Periodic: expire zombie views, then drain flushed-evict + idle clear.
   Future<void> _periodicCleanup() async {
-    await _cleanupExpiredHead();
-    // After cleaning expired views, try to purge pending buffer cleanups
-    // This is the ONLY place where purgePendingCleanups is triggered automatically,
-    // avoiding per-request overhead and potential recursion.
-    // The WriteBufferManager has its own guard (_isPurging) to handle concurrency.
-    await _dataStore.writeBufferManager.purgePendingCleanups();
+    if (hasActiveViews) {
+      await _cleanupExpiredHead();
+    }
+    _notifyBufferDrain();
   }
 
   int get _walCycle => _dataStore.config.logPartitionCycle;
@@ -78,7 +71,6 @@ class ReadViewManager {
   /// Call this method before reading data from files to ensure that new data written during this period
   /// is not immediately cleaned up but remains in the buffer for merging.
   int registerReadView() {
-    // Simple local increment is much faster than GlobalIdGenerator strings
     final id = _nextViewId++;
     final view = ReadView(
       id: id,
@@ -86,34 +78,35 @@ class ReadViewManager {
       walCycle: _walCycle,
     );
 
-    // Append to tail, maintain time order
     _orderedViews.add(view);
     _viewMap[id] = view;
-
     return id;
   }
 
   /// Release a read view.
   ///
-  /// Must be called after the query is completed to release the read view,
-  /// otherwise the buffer data will not be recycled.
+  /// Hot path (vast majority): release a non-oldest view -> unlink and return.
+  /// Tier / buffer work only when the oldest (or last) view ends.
   void releaseReadView(int viewId) {
     final view = _viewMap.remove(viewId);
-    if (view != null) {
-      view.unlink();
-    }
+    if (view == null) return;
+
+    final bool wasOldest = identical(_orderedViews.first, view);
+    view.unlink();
+
+    if (!wasOldest) return;
+    _notifyBufferDrain();
+  }
+
+  void _notifyBufferDrain() {
+    try {
+      _dataStore.writeBufferManager.tryDrainAndIdleClear();
+    } catch (_) {}
   }
 
   /// Get the oldest active read view pointer (cleanup boundary).
-  ///
-  /// Returns the oldest active read view pointer (cleanup boundary).
-  /// Utilizes the LinkedList's ordered nature to directly check the head, with O(1) complexity.
-  ///
-  /// [OPTIMIZATION]: Reverted to Synchronous O(1).
-  /// No longer triggers cleanup side-effects to prevent recursion and blocking.
   WalPointer? getOldestActiveSnapshot() {
     if (_orderedViews.isEmpty) return null;
-    // Returns the oldest active read view pointer (cleanup boundary).
     return _orderedViews.first.snapshotPointer;
   }
 
@@ -123,35 +116,33 @@ class ReadViewManager {
   /// Get the number of active read views (for monitoring)
   int get activeViewCount => _orderedViews.length;
 
+  /// Oldest active view creation time (O(1) head), or null if none.
+  DateTime? get oldestCreatedAt =>
+      _orderedViews.isEmpty ? null : _orderedViews.first.createdAt;
+
   /// Clean up expired read views (only head)
   ///
   /// [OPTIMIZATION]
   /// Uses [YieldController] to prevent blocking the main thread (UI jank).
   /// Executed periodically by timer, NOT by user queries.
   Future<void> _cleanupExpiredHead() async {
-    final now = DateTime.now();
+    if (_orderedViews.isEmpty) return;
+
     final yieldController =
         YieldController('ReadViewManager._cleanupExpiredHead');
+    final now = DateTime.now();
 
     while (_orderedViews.isNotEmpty) {
-      final y1 = yieldController.maybeYield();
-      if (y1 != null) await y1;
-      final head = _orderedViews.first;
-      final age = now.difference(head.createdAt).inSeconds;
+      final y = yieldController.maybeYield();
+      if (y != null) await y;
 
-      if (age > _viewTimeoutSeconds) {
-        head.unlink();
-        _viewMap.remove(head.id);
-      } else {
-        break;
-      }
+      final oldest = _orderedViews.first;
+      final age = now.difference(oldest.createdAt).inSeconds;
+
+      if (age < _viewTimeoutSeconds) break;
+
+      _viewMap.remove(oldest.id);
+      oldest.unlink();
     }
-  }
-
-  /// Clear all read views (for closing the database)
-  void clearAll() {
-    dispose();
-    _orderedViews.clear();
-    _viewMap.clear();
   }
 }

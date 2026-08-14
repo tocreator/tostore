@@ -68,7 +68,7 @@ class KeyManager {
   /// Rotate the master [encryptionKey] that protects GlobalConfig.
   ///
   /// Does not rewrite table data. When [oldKey] is null/empty, the engine
-  /// built-in [defaultEncryptionKey] is used (null → user-key transition).
+  /// built-in [defaultEncryptionKey] is used (null -> user-key transition).
   Future<DbResult> rotateEncryptionKey({
     String? oldKey,
     required String newKey,
@@ -300,7 +300,7 @@ class KeyManager {
         await _dataStore.migrationManager?.getKeyMigrationInfo();
 
     // In-flight migration: AppliedEncryption.current already holds the target
-    // DEK (KEK-protected); match config against that — never read DEK from meta.
+    // DEK (KEK-protected); match config against that -- never read DEK from meta.
     if (running != null &&
         running.isRunning &&
         newKey.isNotEmpty &&
@@ -607,7 +607,7 @@ class KeyManager {
   /// Cooperative pause for close / switchSpace / destructive ops.
   ///
   /// Returns `true` when the rewrite runner has stopped (or was idle).
-  /// Returns `false` on timeout — callers must **not** open another space or
+  /// Returns `false` on timeout -- callers must **not** open another space or
   /// tear down storage while the runner may still hold file handles.
   ///
   /// **Migration helper instances must no-op**: their [DataStoreImpl.close]
@@ -764,7 +764,7 @@ class KeyManager {
       final rewriteDone = info.isDomainDone(EncryptionDomain.tableData) &&
           info.isDomainDone(EncryptionDomain.btreeIndex);
       if (!rewriteDone) {
-        // Table rewrite still in progress — runner owns progress.
+        // Table rewrite still in progress -- runner owns progress.
         return;
       }
       if (info.allDomainsComplete) {

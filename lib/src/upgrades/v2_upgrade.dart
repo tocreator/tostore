@@ -19,7 +19,7 @@ import 'v3_upgrade.dart';
 
 /// Version 2 upgrade handler.
 ///
-/// Chains into [V3Upgrade] for schema → `_system_table_meta` / TOBF, then
+/// Chains into [V3Upgrade] for schema -> `_system_table_meta` / TOBF, then
 /// rewrites legacy JSON table partitions and re-wraps pre-v2 ChaCha keys.
 /// Schema partition mapping / migration_meta JSON shaping are owned by V3
 /// ([LegacySchemaMetaJson], [MigrationMeta.fromJson] + [MigrationFormatMigration]).
@@ -45,7 +45,7 @@ class V2Upgrade {
     }
 
     // Decrypt legacy current/previous with Old ChaCha, then let KeyManager stash
-    // them into history and mint a fresh current — must finish before V3's
+    // them into history and mint a fresh current -- must finish before V3's
     // keyManager.initialize so encoding-key migration is not scheduled.
     for (final spaceName in spaces) {
       final root = _dataStore.instancePath;
@@ -117,7 +117,7 @@ class V2Upgrade {
 
     // Primary already wrote wal/meta.tobf (etc.) during V3 via its own
     // FileStorageImpl pool. Release those handles before a migration instance
-    // opens the same paths — otherwise Windows rename/delete fails (errno 5/32).
+    // opens the same paths -- otherwise Windows rename/delete fails (errno 5/32).
     try {
       await _dataStore.storage.flushAll(closeHandles: true);
     } catch (e) {
@@ -442,7 +442,7 @@ class V2Upgrade {
         await db.storage.deleteDirectory(legacyPartitionsDir);
       }
 
-      // V3 wrote meta at UID path but left data under logical name — drop leftover.
+      // V3 wrote meta at UID path but left data under logical name -- drop leftover.
       if (resolved.fromLegacyNamePath) {
         final uidRoot = _tableRootFromMeta(db, meta);
         if (tableRoot != uidRoot &&

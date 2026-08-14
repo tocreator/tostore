@@ -34,7 +34,7 @@ abstract final class TableDataMetaFieldId {
   static const int timestamps = 5;
   static const int maxAutoIncrementId = 6;
 
-  /// Legacy — ignored; page size lives in [GlobalConfig].
+  /// Legacy -- ignored; page size lives in [GlobalConfig].
   static const int btreePageSize = 10;
   static const int btreeNextPageNo = 11;
   static const int btreePartitionCount = 12;
@@ -55,7 +55,7 @@ abstract final class IndexMetaFieldId {
   static const int totalEntryCount = 7;
   static const int timestamps = 8;
 
-  /// Legacy — ignored; page size lives in [GlobalConfig].
+  /// Legacy -- ignored; page size lives in [GlobalConfig].
   static const int btreePageSize = 10;
   static const int btreeNextPageNo = 11;
   static const int btreePartitionCount = 12;
@@ -86,7 +86,7 @@ abstract final class NghIndexMetaFieldId {
   static const int medoidNodeId = 22;
   static const int nextNodeId = 23;
 
-  /// Legacy — ignored; page size lives in [GlobalConfig].
+  /// Legacy -- ignored; page size lives in [GlobalConfig].
   static const int nghPageSize = 24;
   static const int graphPartitionCount = 25;
   static const int graphNextPageNo = 26;
@@ -265,7 +265,7 @@ final class TableDataMetaCodec {
           maxAutoIncrementId = reader.readString();
           break;
         case TableDataMetaFieldId.btreePageSize:
-          reader.readVarint(); // legacy field — ignore
+          reader.readVarint(); // legacy field -- ignore
           break;
         case TableDataMetaFieldId.btreeNextPageNo:
           btreeNextPageNo = reader.readVarint();
@@ -400,7 +400,7 @@ final class IndexMetaCodec {
           timestamps = TimestampsCodec.decode(reader.readBytes());
           break;
         case IndexMetaFieldId.btreePageSize:
-          reader.readVarint(); // legacy field — ignore
+          reader.readVarint(); // legacy field -- ignore
           break;
         case IndexMetaFieldId.btreeNextPageNo:
           btreeNextPageNo = reader.readVarint();
@@ -634,7 +634,7 @@ final class NghIndexMetaCodec {
           nextNodeId = reader.readVarint();
           break;
         case NghIndexMetaFieldId.nghPageSize:
-          reader.readVarint(); // legacy field — ignore
+          reader.readVarint(); // legacy field -- ignore
           break;
         case NghIndexMetaFieldId.graphPartitionCount:
           graphPartitionCount = reader.readVarint();
@@ -812,7 +812,7 @@ final class TreeGlobalMetaBlobCodec {
 ///
 /// Fixed layout for the hot path (every partition open). Extensibility rules:
 ///
-/// 1. **Append only** — new fields go after [payloadSize]; never reorder,
+/// 1. **Append only** -- new fields go after [payloadSize]; never reorder,
 ///    shrink, or repurpose existing offsets.
 /// 2. **Bump [payloadVersion]** when appending; update [payloadSize] to the
 ///    new encode length. Keep [minPayloadSize] at the v1 size (56) forever.
@@ -821,7 +821,7 @@ final class TreeGlobalMetaBlobCodec {
 ///    writers (forward compatible).
 /// 4. **Writers** always emit exactly [payloadSize] for the current version.
 /// 5. **Breaking** layout changes need a new magic (e.g. `PLS2`), not a soft
-///    version bump — avoid dual on-disk PLS layouts inside `PLS1`.
+///    version bump -- avoid dual on-disk PLS layouts inside `PLS1`.
 ///
 /// Current layout (`payloadVersion == 1`, little-endian):
 ///

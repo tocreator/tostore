@@ -1,6 +1,6 @@
 import 'dart:typed_data';
 
-/// Official XXH64 — VM / native backend (64-bit `int` arithmetic).
+/// Official XXH64 -- VM / native backend (64-bit `int` arithmetic).
 ///
 /// Primes and the uint64 mask may appear as negative [int] values when the
 /// high bit is set (Dart fixed-width / two's-complement literals). Arithmetic

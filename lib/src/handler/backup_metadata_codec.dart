@@ -12,7 +12,7 @@ abstract final class BackupMetadataFieldId {
   static const int backupFormatVersion = 2;
   static const int scope = 3;
   static const int compressed = 4;
-  // Reserved 20–31.
+  // Reserved 20--31.
 }
 
 /// Wire values for [BackupScope]. Never reuse.

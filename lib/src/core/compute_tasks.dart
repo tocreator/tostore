@@ -1,28 +1,26 @@
 import 'dart:async';
 import 'dart:math';
-
 import 'dart:typed_data';
 
-import '../model/db_exception.dart';
-import '../model/result_status.dart';
-import '../model/result_type.dart';
-
+import '../core/vector_quantizer.dart';
 import '../handler/encryption.dart';
 import '../handler/logger.dart';
 import '../handler/value_matcher.dart';
+import '../handler/wal_encoder.dart';
+import '../model/buffer_entry.dart';
 import '../model/data_store_config.dart';
+import '../model/db_exception.dart';
 import '../model/encoder_config.dart';
 import '../model/migration_task.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../model/table_identity.dart';
 import '../model/table_schema.dart';
-import '../core/vector_quantizer.dart';
-import '../handler/wal_encoder.dart';
+import '../model/wal_pointer.dart';
 import 'btree_page.dart';
 import 'page_redo_log_codec.dart';
 import 'table_data_manager.dart';
 import 'yield_controller.dart';
-import '../model/buffer_entry.dart';
-import '../model/wal_pointer.dart';
 
 /// Table similarity calculation request
 class TableSimilarityRequest {
@@ -1603,7 +1601,7 @@ final class BTreePageEncodeItem {
 final class BatchBTreePageEncodeRequest {
   final int pageSize;
 
-  /// Null means: DataStoreConfig.encryptionConfig == null → do NOT wrap with EncoderHandler header.
+  /// Null means: DataStoreConfig.encryptionConfig == null -> do NOT wrap with EncoderHandler header.
   final int? encryptionTypeIndex;
 
   /// Full encoder state so isolates can use the same active key / keyId.
@@ -1887,7 +1885,7 @@ class PqTrainRequestFlat {
   });
 }
 
-/// Train PQ codebook (Flattened) — runs in isolate for large sample sets.
+/// Train PQ codebook (Flattened) -- runs in isolate for large sample sets.
 Future<PqTrainResult> trainPqCodebookFlat(PqTrainRequestFlat request) async {
   final dimensions = request.dimensions;
   final subspaces = request.subspaces;
@@ -2226,12 +2224,12 @@ Future<PqSubspaceResult> trainPqSubspace(PqTrainSubspaceRequest request) async {
         final val = centroids[cOff + d];
         norm += val * val;
       }
-      centroidNorms[c] = norm * 0.5; // We maximize (x·c - 0.5|c|^2)
+      centroidNorms[c] = norm * 0.5; // We maximize (x.c - 0.5|c|^2)
     }
 
     // 2. Assignment Step
-    // Maximize: x·c - 0.5|c|^2
-    // Equivalent to Minimizing: |x|^2 - 2x·c + |c|^2
+    // Maximize: x.c - 0.5|c|^2
+    // Equivalent to Minimizing: |x|^2 - 2x.c + |c|^2
 
     // We can't easily optimize the dot product with generic SIMD in Dart
     // without loop unrolling or manual intrinsics, but basic loop is okay.
@@ -2342,7 +2340,7 @@ class BatchPqEncodeResult {
   BatchPqEncodeResult(this.codes);
 }
 
-/// Batch PQ encode — runs in isolate for large batches.
+/// Batch PQ encode -- runs in isolate for large batches.
 Future<BatchPqEncodeResult> batchPqEncode(BatchPqEncodeRequest request) async {
   final subspaces = request.subspaces;
   final centroids = request.centroids;

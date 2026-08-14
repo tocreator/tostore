@@ -16,16 +16,16 @@ import '../model/migration_task.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
 
-/// One-shot migration of migration_meta / migration tasks from JSON → `.tobf`.
+/// One-shot migration of migration_meta / migration tasks from JSON -> `.tobf`.
 ///
 /// Crash-safe / idempotent (safe to re-run after interrupt):
-/// - Valid `.tobf` with non-empty mapping → migrate **only** mapped tasks
+/// - Valid `.tobf` with non-empty mapping -> migrate **only** mapped tasks
 ///   (no directory scan).
-/// - Valid `.tobf` with **empty** mapping → one cheap check: if any `dir_*`
+/// - Valid `.tobf` with **empty** mapping -> one cheap check: if any `dir_*`
 ///   exists, scan once for orphan tasks (crash before meta update).
-/// - Corrupt/partial `.tobf` **with** legacy JSON → delete TOBF, rewrite from
+/// - Corrupt/partial `.tobf` **with** legacy JSON -> delete TOBF, rewrite from
 ///   JSON, verify, then delete JSON.
-/// - Both meta files unreadable / missing → scan once to rebuild mapping.
+/// - Both meta files unreadable / missing -> scan once to rebuild mapping.
 /// - Never deletes JSON unless the matching `.tobf` decodes successfully.
 /// - Partial TOBF left by a failed verify is deleted before rethrow so the
 ///   next run always prefers residual JSON.
@@ -98,7 +98,7 @@ final class MigrationFormatMigration {
 
     if (needRewriteFromJson) {
       Logger.info(
-        'MigrationFormatMigration: migrating migration_meta.json → .tobf',
+        'MigrationFormatMigration: migrating migration_meta.json -> .tobf',
       );
       meta = await _loadMetaJson(dataStore, jsonMeta);
       if (meta == null) {
@@ -215,7 +215,7 @@ final class MigrationFormatMigration {
     );
   }
 
-  /// Migrate tasks listed in [meta.directoryMapping] only — no directory scan.
+  /// Migrate tasks listed in [meta.directoryMapping] only -- no directory scan.
   static Future<void> _migrateTasks(
     DataStoreImpl dataStore,
     MigrationMeta meta,
@@ -330,7 +330,7 @@ final class MigrationFormatMigration {
     final hasJson = await dataStore.storage.existsFile(jsonPath);
 
     if (!hasTobf && !hasJson) {
-      // Mapping ghost — nothing on disk.
+      // Mapping ghost -- nothing on disk.
       return _TaskMigrateOutcome.dropped;
     }
 
@@ -367,7 +367,7 @@ final class MigrationFormatMigration {
     if (!needRewriteFromJson) return _TaskMigrateOutcome.ok;
 
     Logger.info(
-      'MigrationFormatMigration: migrating task_$taskId.json → .tobf',
+      'MigrationFormatMigration: migrating task_$taskId.json -> .tobf',
     );
 
     final task = await _loadTaskJson(dataStore, jsonPath);

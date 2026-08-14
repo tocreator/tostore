@@ -23,7 +23,7 @@ abstract final class WalMetaFieldId {
   static const int directoryMapping = 8;
   static const int lastRecoveredPointer = 9;
   static const int lastRecoveredTailFileSize = 10;
-  // Reserved 20–31 for future top-level fields.
+  // Reserved 20--31 for future top-level fields.
 }
 
 abstract final class WalPointerFieldId {
@@ -256,7 +256,7 @@ final class WalMetaCodec {
     );
   }
 
-  /// Encode full on-disk file bytes (TOBF ± EncryptionManager).
+  /// Encode full on-disk file bytes (TOBF +/- EncryptionManager).
   static Uint8List encodeFile(
     WalMeta meta, {
     required EncryptionConfig? encryptionConfig,

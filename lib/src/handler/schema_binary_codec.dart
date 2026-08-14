@@ -20,7 +20,7 @@ abstract final class TableSchemaFieldId {
   static const int schemaVersion = 10;
   static const int isSystemTable = 11;
   static const int autoIndexes = 12;
-  // Reserved 20–31.
+  // Reserved 20--31.
 }
 
 abstract final class FieldSchemaFieldId {
@@ -38,7 +38,7 @@ abstract final class FieldSchemaFieldId {
   static const int fieldId = 12;
   static const int vectorConfig = 13;
   static const int defaultValueType = 14;
-  // Reserved 20–31.
+  // Reserved 20--31.
 }
 
 abstract final class IndexSchemaFieldId {
@@ -48,7 +48,7 @@ abstract final class IndexSchemaFieldId {
   static const int type = 4;
   static const int vectorConfig = 5;
   static const int indexUid = 6;
-  // Reserved 20–31.
+  // Reserved 20--31.
 }
 
 abstract final class PrimaryKeyConfigFieldId {
@@ -57,7 +57,7 @@ abstract final class PrimaryKeyConfigFieldId {
   static const int sequentialConfig = 3;
   static const int isOrdered = 4;
   static const int fromFieldId = 5;
-  // Reserved 10–15.
+  // Reserved 10--15.
 }
 
 abstract final class SequentialIdConfigFieldId {
@@ -130,7 +130,7 @@ abstract final class SchemaBinaryCodec {
     return BinaryMapCodec.decodeValue(r.readBytes());
   }
 
-  // ── TableSchema ──────────────────────────────────────────────────────────
+  // -- TableSchema ----------------------------------------------------------
 
   static void writeTableSchema(BinaryWriter w, TableSchema schema) {
     w.writeFieldTag(TableSchemaFieldId.name, WireType.lengthDelimited);
@@ -298,7 +298,7 @@ abstract final class SchemaBinaryCodec {
     return readTableSchema(BinaryReader(bytes));
   }
 
-  // ── FieldSchema ──────────────────────────────────────────────────────────
+  // -- FieldSchema ----------------------------------------------------------
 
   static void writeFieldSchema(BinaryWriter w, FieldSchema field) {
     w.writeFieldTag(FieldSchemaFieldId.name, WireType.lengthDelimited);
@@ -447,7 +447,7 @@ abstract final class SchemaBinaryCodec {
     );
   }
 
-  // ── IndexSchema ──────────────────────────────────────────────────────────
+  // -- IndexSchema ----------------------------------------------------------
 
   static void writeIndexSchema(BinaryWriter w, IndexSchema index) {
     if (index.indexName != null) {
@@ -524,7 +524,7 @@ abstract final class SchemaBinaryCodec {
     );
   }
 
-  // ── PrimaryKeyConfig ─────────────────────────────────────────────────────
+  // -- PrimaryKeyConfig -----------------------------------------------------
 
   static void writePrimaryKeyConfig(BinaryWriter w, PrimaryKeyConfig config) {
     w.writeFieldTag(PrimaryKeyConfigFieldId.name, WireType.lengthDelimited);
@@ -634,7 +634,7 @@ abstract final class SchemaBinaryCodec {
     );
   }
 
-  // ── TableTtlConfig ───────────────────────────────────────────────────────
+  // -- TableTtlConfig -------------------------------------------------------
 
   static void writeTableTtlConfig(BinaryWriter w, TableTtlConfig config) {
     w.writeFieldTag(TableTtlConfigFieldId.ttlMs, WireType.varint);
@@ -666,7 +666,7 @@ abstract final class SchemaBinaryCodec {
     return TableTtlConfig(ttlMs: ttlMs, sourceField: sourceField);
   }
 
-  // ── Vector configs ───────────────────────────────────────────────────────
+  // -- Vector configs -------------------------------------------------------
 
   static void writeVectorFieldConfig(BinaryWriter w, VectorFieldConfig config) {
     w.writeFieldTag(VectorFieldConfigFieldId.dimensions, WireType.varint);
@@ -790,7 +790,7 @@ abstract final class SchemaBinaryCodec {
     );
   }
 
-  // ── ForeignKeySchema ─────────────────────────────────────────────────────
+  // -- ForeignKeySchema -----------------------------------------------------
 
   static void writeForeignKeySchema(BinaryWriter w, ForeignKeySchema fk) {
     if (fk.name != null) {
@@ -900,7 +900,7 @@ abstract final class SchemaBinaryCodec {
     );
   }
 
-  // ── FieldStorageLayout ───────────────────────────────────────────────────
+  // -- FieldStorageLayout ---------------------------------------------------
 
   static void writeFieldStorageLayout(
       BinaryWriter w, FieldStorageLayout layout) {
