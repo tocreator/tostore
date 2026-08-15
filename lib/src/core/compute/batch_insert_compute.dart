@@ -5,7 +5,6 @@ import '../../model/table_identity.dart';
 import '../../model/table_schema.dart';
 import '../yield_controller.dart';
 import 'record_compute.dart';
-import 'unique_ref_compute.dart';
 
 /// Pure-compute request for a batchInsert preparation chunk.
 class BatchInsertPrepareRequest {
@@ -14,7 +13,6 @@ class BatchInsertPrepareRequest {
   /// Display name only -- avoids shipping the full [TableContext] across isolates.
   final TableName tableName;
   final List<Map<String, dynamic>> records;
-  final List<IndexSchema> uniqueIndexes;
   final List<bool> skipPrimaryKeyFormatChecks;
   final bool ignoreUnknownFields;
 
@@ -25,7 +23,6 @@ class BatchInsertPrepareRequest {
     required this.schema,
     required this.tableName,
     required this.records,
-    required this.uniqueIndexes,
     required this.skipPrimaryKeyFormatChecks,
     this.ignoreUnknownFields = true,
     this.batchTimestamp,
@@ -36,14 +33,12 @@ class BatchInsertPrepareRequest {
 class BatchInsertPreparedRecord {
   final Map<String, dynamic>? validData;
   final Object? preparedPrimaryKeyValue;
-  final List<PlannedUniqueKeyRef> plannedUniqueRefs;
   final List<String> validationErrors;
   final List<Map<String, dynamic>>? validationStatusesJson;
 
   BatchInsertPreparedRecord({
     required this.validData,
     required this.preparedPrimaryKeyValue,
-    required this.plannedUniqueRefs,
     required this.validationErrors,
     this.validationStatusesJson,
   });
@@ -113,19 +108,11 @@ Future<BatchInsertPrepareResult> prepareBatchInsertChunk(
     } catch (e) {
       errors.add(e.toString());
     }
-    final plannedUniqueRefs = validData == null
-        ? const <PlannedUniqueKeyRef>[]
-        : planInsertUniqueRefsPure(
-            schema: request.schema,
-            uniqueIndexes: request.uniqueIndexes,
-            data: validData,
-          );
     results.add(
       BatchInsertPreparedRecord(
         validData: validData,
         preparedPrimaryKeyValue:
             validData == null ? null : validData[request.schema.primaryKey],
-        plannedUniqueRefs: plannedUniqueRefs,
         validationErrors: errors,
         validationStatusesJson: validationStatusesJson,
       ),

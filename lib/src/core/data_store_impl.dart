@@ -2037,7 +2037,6 @@ class DataStoreImpl {
     TableSchema schema,
     TableContext table,
     List<Map<String, dynamic>> records,
-    List<IndexSchema> uniqueIndexes,
     Set<Map<String, dynamic>> autoPkRecords,
   ) async {
     if (records.isEmpty) {
@@ -2059,7 +2058,6 @@ class DataStoreImpl {
         schema: schema,
         tableName: table.tableName,
         records: records,
-        uniqueIndexes: uniqueIndexes,
         skipPrimaryKeyFormatChecks: skipPrimaryKeyFormatChecks,
         ignoreUnknownFields: _config?.ignoreUnknownFields ?? true,
         batchTimestamp: batchTimestamp,
@@ -2148,7 +2146,6 @@ class DataStoreImpl {
     TableContext table,
     List<Map<String, dynamic>> records,
     List<Map<String, dynamic>?> existingRecords,
-    List<IndexSchema> uniqueIndexes,
   ) async {
     if (records.isEmpty) {
       return const <BatchUpdatePreparedRecord>[];
@@ -2187,7 +2184,6 @@ class DataStoreImpl {
             table: table,
             records: records.sublist(range.start, range.end),
             existingRecords: existingRecords.sublist(range.start, range.end),
-            uniqueIndexes: uniqueIndexes,
             ignoreUnknownFields: _config?.ignoreUnknownFields ?? true,
           ),
         ),
@@ -4489,7 +4485,6 @@ class DataStoreImpl {
             tableSchema,
             table,
             currentRecords,
-            uniqueIndexesForTable,
             autoPkRecords,
           );
 
@@ -5743,13 +5738,11 @@ class DataStoreImpl {
         final List<String> candidatePkVals = [];
         final List<Map<String, dynamic>> candidateOldRecords = [];
         final Map<String, Set<String>> candidateChangedFieldsMap = {};
-        final List<bool> candidateNeedsReserve = [];
         final preparedRecords = await _prepareBatchUpdateRecords(
           schema,
           table,
           subBatch,
           existingRecords,
-          allUniqueIndexes,
         );
 
         for (int recordIndex = 0;
@@ -5865,10 +5858,6 @@ class DataStoreImpl {
           candidatePkVals.add(pkVal);
           candidateOldRecords.add(existingRecord);
           candidateChangedFieldsMap[pkVal] = changedFields.toSet();
-          // Planned refs only indicate whether unique indexes are affected;
-          // actual reserve uses schema+data (no UniqueKeyRef materialization).
-          candidateNeedsReserve
-              .add(preparedRecord.reservationUniqueRefs.isNotEmpty);
         }
 
         if (candidateMergedRecords.isEmpty) continue;
@@ -5880,12 +5869,17 @@ class DataStoreImpl {
         final List<Map<String, dynamic>> readyOldRecords = [];
         final Map<String, Set<String>> readyChangedFieldsMap = {};
         final Set<String> reservedPkSet = {};
+        // Hoist once per sub-batch: unique field names that can trigger reserve.
+        final Set<String> uniqueFieldNames = <String>{
+          for (final idx in allUniqueIndexes) ...idx.fields,
+        };
 
         for (int j = 0; j < candidateMergedRecords.length; j++) {
           final pkVal = candidatePkVals[j];
           final updatedRecord = candidateMergedRecords[j];
           final changedFields = candidateChangedFieldsMap[pkVal]!;
-          final needsReserve = candidateNeedsReserve[j];
+          final needsReserve = uniqueFieldNames.isNotEmpty &&
+              changedFields.any(uniqueFieldNames.contains);
 
           if (needsReserve) {
             try {

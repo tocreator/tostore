@@ -7,7 +7,6 @@ import '../../model/table_context.dart';
 import '../../model/table_schema.dart';
 import '../yield_controller.dart';
 import 'record_compute.dart';
-import 'unique_ref_compute.dart';
 
 /// Pure-compute request for a batchUpdate preparation chunk.
 class BatchUpdatePrepareRequest {
@@ -15,7 +14,6 @@ class BatchUpdatePrepareRequest {
   final TableContext table;
   final List<Map<String, dynamic>> records;
   final List<Map<String, dynamic>?> existingRecords;
-  final List<IndexSchema> uniqueIndexes;
   final bool ignoreUnknownFields;
 
   BatchUpdatePrepareRequest({
@@ -23,7 +21,6 @@ class BatchUpdatePrepareRequest {
     required this.table,
     required this.records,
     required this.existingRecords,
-    required this.uniqueIndexes,
     this.ignoreUnknownFields = true,
   });
 }
@@ -34,8 +31,6 @@ class BatchUpdatePreparedRecord {
   final bool validationFailed;
   final Map<String, dynamic>? updatedRecord;
   final List<String> changedFields;
-  final List<PlannedUniqueKeyRef> reservationUniqueRefs;
-  final List<PlannedUniqueKeyRef> currentUniqueRefs;
   final List<String> fieldConstraintErrors;
   final List<Map<String, dynamic>>? validationStatusesJson;
 
@@ -44,8 +39,6 @@ class BatchUpdatePreparedRecord {
     required this.validationFailed,
     required this.updatedRecord,
     required this.changedFields,
-    required this.reservationUniqueRefs,
-    required this.currentUniqueRefs,
     required this.fieldConstraintErrors,
     this.validationStatusesJson,
   });
@@ -88,7 +81,6 @@ class UniformUpdatePrepareResult {
   const UniformUpdatePrepareResult({required this.records});
 }
 
-/// Prepare a chunk of batchUpdate records using only pure computation.
 Future<BatchUpdatePrepareResult> prepareBatchUpdateChunk(
   BatchUpdatePrepareRequest request,
 ) async {
@@ -122,8 +114,6 @@ Future<BatchUpdatePrepareResult> prepareBatchUpdateChunk(
           validationFailed: false,
           updatedRecord: null,
           changedFields: const <String>[],
-          reservationUniqueRefs: const <PlannedUniqueKeyRef>[],
-          currentUniqueRefs: const <PlannedUniqueKeyRef>[],
           fieldConstraintErrors: const <String>[],
         ),
       );
@@ -160,8 +150,6 @@ Future<BatchUpdatePrepareResult> prepareBatchUpdateChunk(
           validationFailed: true,
           updatedRecord: null,
           changedFields: const <String>[],
-          reservationUniqueRefs: const <PlannedUniqueKeyRef>[],
-          currentUniqueRefs: const <PlannedUniqueKeyRef>[],
           fieldConstraintErrors: fieldConstraintErrors,
           validationStatusesJson: validationStatusesJson,
         ),
@@ -235,35 +223,12 @@ Future<BatchUpdatePrepareResult> prepareBatchUpdateChunk(
       }
     }
 
-    final reservationUniqueRefs = changedFields.isEmpty
-        ? const <PlannedUniqueKeyRef>[]
-        : planUpdateUniqueRefsPure(
-            schema: request.schema,
-            uniqueIndexes: request.uniqueIndexes,
-            updatedRecord: updatedRecord,
-            changedFields: changedFields,
-            includePrimaryKey: false,
-            changedOnly: true,
-          );
-    final currentUniqueRefs = changedFields.isEmpty
-        ? const <PlannedUniqueKeyRef>[]
-        : planUpdateUniqueRefsPure(
-            schema: request.schema,
-            uniqueIndexes: request.uniqueIndexes,
-            updatedRecord: updatedRecord,
-            changedFields: const <String>[],
-            includePrimaryKey: true,
-            changedOnly: false,
-          );
-
     results.add(
       BatchUpdatePreparedRecord(
         missingExistingRecord: false,
         validationFailed: false,
         updatedRecord: updatedRecord,
         changedFields: changedFields,
-        reservationUniqueRefs: reservationUniqueRefs,
-        currentUniqueRefs: currentUniqueRefs,
         fieldConstraintErrors: fieldConstraintErrors,
         validationStatusesJson: validationStatusesJson,
       ),
