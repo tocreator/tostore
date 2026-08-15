@@ -304,7 +304,8 @@ A seconda dell'intervallo di `code` / `codeKey` e della sottoclasse specifica di
   | `22001`<br>`devTableNotFound` | Tabella non trovata (Errore dello sviluppatore) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `22003`<br>`devIndexNotFound` | Indice non trovato (Errore dello sviluppatore) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `22004`<br>`devSpaceNotFound` | Spazio non trovato (Errore dello sviluppatore) | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `23001`<br>`devLargeScaleOperationBypassRequired` | Salto dei dettagli richiesto per evitare OOM (Errore dello sviluppatore) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `23001`<br>`devLargeScaleOperationRequired` | Large-scale data operation requires `allowLargeScaleOperation()` (Developer Error) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `23002`<br>`devLargeScaleOperationNotAllowedInTransaction` | Large-scale data operation is not allowed inside a transaction (Developer Error) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `24001`<br>`devEngineIncompatible` | **Critico**: Versione del motore incompatibile | <ul><li>`primaryKey`: `null`</li></ul> |
   | `50003`<br>`sysTransactionLimitExceeded` | I dati memorizzati nel buffer della transazione superano il limite sicuro sotto pressione di memoria (Errore di sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `50004`<br>`sysMigrationBatchExecutionFailed` | Errore di esecuzione del batch di migrazione (Errore di sistema) | <ul><li>`primaryKey`: `null`</li></ul> |
@@ -494,7 +495,8 @@ Fare riferimento alla tabella seguente per l'instradamento e l'analisi dello sta
 | **22003** | `DEV_NOT_FOUND_INDEX` | `ResultType.devIndexNotFound` | Errore dello Sviluppatore | Indice non trovato |
 | **22004** | `DEV_NOT_FOUND_SPACE` | `ResultType.devSpaceNotFound` | Errore dello Sviluppatore | Spazio non trovato |
 | **22005** | `DEV_NOT_FOUND_FIELD` | `ResultType.devFieldNotFound` | Errore dello Sviluppatore | Campo non trovato |
-| **23001** | `DEV_LARGE_SCALE_OPERATION_REQUIRED_BYPASS` | `ResultType.devLargeScaleOperationBypassRequired` | Errore dello Sviluppatore | L'operazione su larga scala richiede di omettere i dettagli per prevenire OOM |
+| **23001** | `DEV_LARGE_SCALE_OPERATION_REQUIRED` | `ResultType.devLargeScaleOperationRequired` | Errore dello Sviluppatore | Large-scale data operation requires `allowLargeScaleOperation()` to prevent OOM |
+| **23002** | `DEV_LARGE_SCALE_OPERATION_NOT_ALLOWED_IN_TRANSACTION` | `ResultType.devLargeScaleOperationNotAllowedInTransaction` | Developer Error | Large-scale data operation is not allowed inside a transaction |
 | **24001** | `DEV_ENGINE_INCOMPATIBLE` | `ResultType.devEngineIncompatible` | Errore dello Sviluppatore | **Critico**: Versione del motore incompatibile |
 | **30000** | `DEV_INVALID_SCHEMA` | `ResultType.devInvalidSchema` | Errore dello Sviluppatore | Definizione dello schema della tabella non valida |
 | **30001** | `DEV_INVALID_SCHEMA_TABLE_NAME` | `ResultType.devInvalidSchemaTableName` | Errore dello Sviluppatore | Convalida del nome della tabella non riuscita |

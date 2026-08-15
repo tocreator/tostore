@@ -22,9 +22,9 @@ import '../model/migration_write_mode.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/system_table.dart';
-import '../model/table_schema.dart';
 import '../model/table_context.dart';
 import '../model/table_identity.dart';
+import '../model/table_schema.dart';
 import '../model/wal_pointer.dart';
 import 'backup_manager.dart';
 import 'compute_manager.dart';
@@ -445,15 +445,9 @@ class MigrationManager {
         final progress = entry.value;
 
         if (taskId.startsWith('large_delete_')) {
-          final op = _dataStore.walManager.meta.largeDeletes[taskId];
-          if (op != null) {
-            final nextDeletedSoFar = op.deletedSoFar + progress.count;
-            await _dataStore.walManager.updateLargeDeleteCheckpoint(
-              opId: taskId,
-              deletedSoFar: nextDeletedSoFar,
-              checkpointCursor: progress.checkpointKey,
-            );
-            final tableCtx = await _tableContextForUid(op.tableUid);
+          final tableUid = LargeOperationRunner.tableUidForOpId(taskId);
+          if (tableUid != null) {
+            final tableCtx = await _tableContextForUid(tableUid);
             if (tableCtx != null) {
               await _dataStore.tableDataManager.updateTableRecordCountDelta(
                 tableCtx,
@@ -466,15 +460,9 @@ class MigrationManager {
         }
 
         if (taskId.startsWith('large_update_')) {
-          final op = _dataStore.walManager.meta.largeUpdates[taskId];
-          if (op != null) {
-            final nextUpdatedSoFar = op.updatedSoFar + progress.count;
-            await _dataStore.walManager.updateLargeUpdateCheckpoint(
-              opId: taskId,
-              updatedSoFar: nextUpdatedSoFar,
-              checkpointCursor: progress.checkpointKey,
-            );
-            final tableCtx = await _tableContextForUid(op.tableUid);
+          final tableUid = LargeOperationRunner.tableUidForOpId(taskId);
+          if (tableUid != null) {
+            final tableCtx = await _tableContextForUid(tableUid);
             if (tableCtx != null) {
               await _dataStore.cacheManager.invalidateCache(tableCtx);
             }
@@ -788,9 +776,6 @@ class MigrationManager {
       }
     }
     try {
-      // Cancel WAL-backed large ops for this table so they do not resume.
-      await _cancelLargeOpsForTable(tableUid);
-
       // Drop every buffered background write type (not only schemaMigration).
       await _dataStore.backgroundWriteScheduler
           .clearEntriesForTableUid(tableUid);
@@ -817,11 +802,6 @@ class MigrationManager {
       }
     } finally {
       lockMgr?.releaseExclusiveLock(tableLockResource, tableLockOpId);
-      // Resume large ops for other tables (this table's WAL ops were cancelled).
-      if (pauseLargeOps) {
-        unawaited(LargeOperationRunner.runPendingOperations(_dataStore)
-            .catchError((_) {}, test: (e) => e is DbClosedException));
-      }
     }
     return keyMigrating;
   }
@@ -837,40 +817,9 @@ class MigrationManager {
         .catchError((_) {}, test: (e) => e is DbClosedException));
   }
 
-  /// Whether any running large delete/update WAL op targets [tableUid].
+  /// Whether any running large-scale data operation targets [tableUid].
   bool _tableHasRunningLargeOps(TableUid tableUid) {
-    final meta = _dataStore.walManager.meta;
-    for (final op in meta.largeDeletes.values) {
-      if (op.tableUid == tableUid && op.status == 'running') return true;
-    }
-    for (final op in meta.largeUpdates.values) {
-      if (op.tableUid == tableUid && op.status == 'running') return true;
-    }
-    return false;
-  }
-
-  /// Permanently cancel large delete/update WAL ops for [tableUid].
-  Future<void> _cancelLargeOpsForTable(TableUid tableUid) async {
-    final wal = _dataStore.walManager;
-    final meta = wal.meta;
-    final deleteIds = <String>[];
-    for (final entry in meta.largeDeletes.entries) {
-      if (entry.value.tableUid == tableUid) {
-        deleteIds.add(entry.key);
-      }
-    }
-    final updateIds = <String>[];
-    for (final entry in meta.largeUpdates.entries) {
-      if (entry.value.tableUid == tableUid) {
-        updateIds.add(entry.key);
-      }
-    }
-    for (final opId in deleteIds) {
-      await wal.cancelLargeDelete(opId);
-    }
-    for (final opId in updateIds) {
-      await wal.cancelLargeUpdate(opId);
-    }
+    return LargeOperationRunner.isTableOperationRunning(tableUid);
   }
 
   /// Invalidate buffered schema-migration writes for [table].
@@ -1360,10 +1309,7 @@ class MigrationManager {
       }
 
       // Get all existing tables
-      var existingTables = await _dataStore.getTableNames();
-      existingTables = existingTables
-          .where((t) => !t.startsWith('_system_temp_op_conflict_'))
-          .toList();
+      final existingTables = await _dataStore.getTableNames();
 
       final allTasks = <MigrationTask>[];
 
@@ -3041,12 +2987,10 @@ class MigrationManager {
 
     final currentSpace = _dataStore.currentSpaceName;
     bool keyMigrating = false;
-    bool backgroundPaused = false;
 
     try {
-      // 1. Pause background tasks to isolate schema cutover
+      // 1. Pause large-scale data ops to isolate schema cutover
       await LargeOperationRunner.pauseAndAwait(currentSpace);
-      backgroundPaused = true;
 
       keyMigrating = KeyMigrationRunner.isTableMigrating(table);
       if (keyMigrating) {
@@ -3130,10 +3074,6 @@ class MigrationManager {
       }
       return currentTableName;
     } finally {
-      if (backgroundPaused) {
-        unawaited(LargeOperationRunner.runPendingOperations(_dataStore)
-            .catchError((_) {}, test: (e) => e is DbClosedException));
-      }
       if (keyMigrating) {
         unawaited(_dataStore.keyManager
             .startDeferredKeyMigrationWork()

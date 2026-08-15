@@ -347,8 +347,6 @@ class TransactionLogMigration {
       inserts: await norm(plan.inserts),
       updates: await norm(plan.updates),
       deletes: await norm(plan.deletes),
-      heavyDeletes: plan.heavyDeletes,
-      heavyUpdates: plan.heavyUpdates,
     );
   }
 

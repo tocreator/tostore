@@ -4,6 +4,7 @@ import 'dart:math';
 import '../handler/logger.dart';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../model/background_write_entry.dart';
 import '../model/migration_write_mode.dart';
 import '../model/background_write_type.dart';
@@ -12,29 +13,115 @@ import '../model/cancellation_token.dart';
 import '../model/change_event.dart';
 import '../model/expr.dart';
 import '../model/foreign_key_operation.dart';
+import '../model/table_identity.dart';
 import '../model/table_schema.dart';
 import '../query/query_condition.dart';
 import 'compute/batch_match_runner.dart';
 import 'data_store_impl.dart';
 import 'resource_manager.dart';
-import 'wal_manager.dart';
 import 'yield_controller.dart';
 import '../model/data_store_config.dart';
 
-/// Runner that processes large delete and update operations asynchronously in the background.
+/// In-memory request for a single large-scale data delete (not persisted to WAL).
+class LargeDeleteRequest {
+  final String opId;
+  final TableUid tableUid;
+  final Map<String, dynamic> condition;
+  final List<String>? orderBy;
+  final int? limit;
+  final int? offset;
+
+  const LargeDeleteRequest({
+    required this.opId,
+    required this.tableUid,
+    required this.condition,
+    this.orderBy,
+    this.limit,
+    this.offset,
+  });
+}
+
+/// In-memory request for a single large-scale data update (not persisted to WAL).
+class LargeUpdateRequest {
+  final String opId;
+  final TableUid tableUid;
+  final Map<String, dynamic> condition;
+  final Map<String, dynamic> updateData;
+  final List<String>? orderBy;
+  final int? limit;
+  final int? offset;
+  final bool continueOnPartialErrors;
+
+  const LargeUpdateRequest({
+    required this.opId,
+    required this.tableUid,
+    required this.condition,
+    required this.updateData,
+    this.orderBy,
+    this.limit,
+    this.offset,
+    this.continueOnPartialErrors = false,
+  });
+}
+
+/// Outcome of a user-awaited large-scale data operation.
 ///
-/// It scans for running operations in the WAL metadata and sequentially processes them batch-by-batch
-/// without blocking the caller's main thread. It respects cooperative cancellation tokens for space switching
-/// and shutdown.
+/// Errors are returned here instead of thrown so cooperative pause/shutdown and
+/// other non-user waiters never see uncaught exceptions. User call sites convert
+/// this into [DbResult] for the caller.
+class LargeOperationOutcome {
+  final int successCount;
+  final List<ResultStatus> errorStatuses;
+
+  const LargeOperationOutcome._({
+    required this.successCount,
+    required this.errorStatuses,
+  });
+
+  factory LargeOperationOutcome.ok(int successCount) => LargeOperationOutcome._(
+        successCount: successCount,
+        errorStatuses: const [],
+      );
+
+  factory LargeOperationOutcome.fail(
+    List<ResultStatus> errorStatuses, {
+    int successCount = 0,
+  }) =>
+      LargeOperationOutcome._(
+        successCount: successCount,
+        errorStatuses: errorStatuses,
+      );
+
+  bool get hasErrors => errorStatuses.isNotEmpty;
+}
+
+/// Blocking large-scale data operation executor.
+///
+/// Processes delete/update batches via [BackgroundWriteScheduler] and awaits drain
+/// until disk writes for the operation complete. Intended to be **awaited by user
+/// write APIs** that convert [LargeOperationOutcome] into [DbResult].
+/// Cooperative pause/shutdown waiters must not rely on thrown exceptions.
 class LargeOperationRunner {
   LargeOperationRunner._();
 
   static final Map<String, CancellationToken> _activeTokens = {};
   static final Map<String, Future<void>> _activeTasks = {};
   static final Set<String> _runningOpIds = {};
+  static final Map<String, TableUid> _opTableUids = {};
 
-  /// Check if a specific large operation is currently running.
+  /// Check if a specific large-scale data operation is currently running.
   static bool isOperationRunning(String opId) => _runningOpIds.contains(opId);
+
+  /// Check if any large-scale data operation is running for [tableUid].
+  static bool isTableOperationRunning(TableUid tableUid) {
+    for (final uid in _opTableUids.values) {
+      if (uid == tableUid) return true;
+    }
+    return false;
+  }
+
+  /// Resolve table uid for a running [opId] (e.g. MigrationManager flush callbacks).
+  static TableUid? tableUidForOpId(String opId) => _opTableUids[opId];
 
   /// Request cooperative pause for all tasks in a specific space.
   static void requestPause(String spaceName) {
@@ -44,8 +131,10 @@ class LargeOperationRunner {
   /// Request cooperative pause for all tasks in a specific space and wait for them to finish.
   static Future<bool> pauseAndAwait(String spaceName) async {
     final token = _activeTokens[spaceName];
-    if (token == null) return false;
-    token.cancel();
+    if (token == null && !_activeTasks.containsKey(spaceName)) {
+      return false;
+    }
+    token?.cancel();
     final task = _activeTasks[spaceName];
     if (task != null) {
       try {
@@ -55,7 +144,7 @@ class LargeOperationRunner {
     return true;
   }
 
-  /// Cooperatively pause ongoing background tasks for switch space or shutdown.
+  /// Cooperatively pause ongoing large-scale data operations for switch space or shutdown.
   ///
   /// Scheduler cleanup is left to the caller ([DataStoreImpl.close] uses
   /// [BackgroundWriteScheduler.clearAll]).
@@ -73,127 +162,185 @@ class LargeOperationRunner {
       } catch (_) {}
     }
 
-    Logger.info('Background large operations stopped for space [$space].');
+    Logger.info('Large-scale data operations stopped for space [$space].');
   }
 
-  /// Run or resume pending large delete/update operations for the given [dataStore] space.
-  static Future<void> runPendingOperations(DataStoreImpl dataStore) async {
+  /// Run one large-scale data delete; blocks until batches drained to disk.
+  ///
+  /// Returns [LargeOperationOutcome] (never throws for business/interrupt failures).
+  static Future<LargeOperationOutcome> runLargeDelete(
+    DataStoreImpl dataStore,
+    LargeDeleteRequest op,
+  ) async {
     final space = dataStore.currentSpaceName;
-    if (_activeTasks.containsKey(space)) {
-      return;
-    }
+    return _withSpaceLock(space, (token) async {
+      _runningOpIds.add(op.opId);
+      _opTableUids[op.opId] = op.tableUid;
+      try {
+        final count = await _executeLargeDelete(dataStore, op, token);
+        return LargeOperationOutcome.ok(count);
+      } on DbClosedException catch (e) {
+        Logger.info(
+            'Large-scale data delete interrupted by database close (opId: ${op.opId}).');
+        return LargeOperationOutcome.fail([
+          GeneralStatus(
+            type: ResultType.sysDbClosed,
+            message: e.toString(),
+          ),
+        ]);
+      } on DbException catch (e) {
+        Logger.error('Large-scale data delete failed (opId: ${op.opId})',
+            rawError: e);
+        return LargeOperationOutcome.fail(e.statuses);
+      } catch (e) {
+        Logger.error('Large-scale data delete failed (opId: ${op.opId})',
+            rawError: e);
+        return LargeOperationOutcome.fail(
+          DbException.wrap(
+            e,
+            fallbackMessage: 'Large-scale data delete failed',
+          ).statuses,
+        );
+      } finally {
+        _runningOpIds.remove(op.opId);
+        _opTableUids.remove(op.opId);
+      }
+    });
+  }
 
-    final completer = Completer<void>();
-    _activeTasks[space] = completer.future;
+  /// Run one large-scale data update; blocks until batches drained.
+  ///
+  /// Returns [LargeOperationOutcome] (never throws for business/interrupt failures).
+  static Future<LargeOperationOutcome> runLargeUpdate(
+    DataStoreImpl dataStore,
+    LargeUpdateRequest op,
+  ) async {
+    final space = dataStore.currentSpaceName;
+    return _withSpaceLock(space, (token) async {
+      _runningOpIds.add(op.opId);
+      _opTableUids[op.opId] = op.tableUid;
+      try {
+        final count = await _executeLargeUpdate(dataStore, op, token);
+        return LargeOperationOutcome.ok(count);
+      } on DbClosedException catch (e) {
+        Logger.info(
+            'Large-scale data update interrupted by database close (opId: ${op.opId}).');
+        return LargeOperationOutcome.fail([
+          GeneralStatus(
+            type: ResultType.sysDbClosed,
+            message: e.toString(),
+          ),
+        ]);
+      } on DbException catch (e) {
+        Logger.error('Large-scale data update failed (opId: ${op.opId})',
+            rawError: e);
+        return LargeOperationOutcome.fail(e.statuses);
+      } catch (e) {
+        Logger.error('Large-scale data update failed (opId: ${op.opId})',
+            rawError: e);
+        return LargeOperationOutcome.fail(
+          DbException.wrap(
+            e,
+            fallbackMessage: 'Large-scale data update failed',
+          ).statuses,
+        );
+      } finally {
+        _runningOpIds.remove(op.opId);
+        _opTableUids.remove(op.opId);
+      }
+    });
+  }
+
+  /// Serialize large-scale data operations: one active op at a time per [spaceName].
+  static Future<T> _withSpaceLock<T>(
+    String spaceName,
+    Future<T> Function(CancellationToken token) action,
+  ) async {
+    final previous = _activeTasks[spaceName];
+    final gate = Completer<void>();
+    _activeTasks[spaceName] = gate.future;
+
+    if (previous != null) {
+      try {
+        await previous;
+      } catch (_) {}
+    }
 
     final token = CancellationToken();
-    _activeTokens[space] = token;
-
-    unawaited(() async {
-      try {
-        await _executePendingLoop(dataStore, token);
-      } catch (e) {
-        if (e is DbClosedException) {
-          Logger.info(
-              'Pending large operations for space $space cancelled due to database close');
-          return;
-        }
-        Logger.error('Error running pending operations for space $space',
-            rawError: e);
-      } finally {
-        _activeTokens.remove(space);
-        _activeTasks.remove(space);
-        completer.complete();
+    _activeTokens[spaceName] = token;
+    try {
+      return await action(token);
+    } finally {
+      if (identical(_activeTokens[spaceName], token)) {
+        _activeTokens.remove(spaceName);
       }
-    }());
-  }
-
-  static Future<void> _executePendingLoop(
-    DataStoreImpl dataStore,
-    CancellationToken token,
-  ) async {
-    final spaceName = dataStore.currentSpaceName;
-
-    while (!token.isCancelled) {
-      final meta = dataStore.walManager.meta;
-      final pendingDeletes = meta.largeDeletes.values
-          .where((op) =>
-              op.status == 'running' &&
-              ((op.spaceName == '__global__' &&
-                      !dataStore.isMigrationInstance) ||
-                  op.spaceName == spaceName))
-          .toList();
-
-      final pendingUpdates = meta.largeUpdates.values
-          .where((op) =>
-              op.status == 'running' &&
-              ((op.spaceName == '__global__' &&
-                      !dataStore.isMigrationInstance) ||
-                  op.spaceName == spaceName))
-          .toList();
-
-      final allOps = [];
-      allOps.addAll(pendingDeletes);
-      allOps.addAll(pendingUpdates);
-
-      if (allOps.isEmpty) {
-        break;
+      if (identical(_activeTasks[spaceName], gate.future)) {
+        _activeTasks.remove(spaceName);
       }
-
-      // Sort by creation time to ensure FIFO serial scheduling
-      allOps.sort((a, b) => a.createdAt.compareTo(b.createdAt));
-
-      final activeOp = allOps.first;
-      if (activeOp is LargeDeleteMeta) {
-        await _runLargeDelete(dataStore, activeOp, token);
-      } else if (activeOp is LargeUpdateMeta) {
-        await _runLargeUpdate(dataStore, activeOp, token);
+      if (!gate.isCompleted) {
+        gate.complete();
       }
-
-      // Briefly yield to event loop before checking the next operation
-      await Future.delayed(Duration.zero);
     }
   }
 
-  static Future<void> _runLargeDelete(
+  static void _throwIfInterrupted(
     DataStoreImpl dataStore,
-    LargeDeleteMeta op,
+    CancellationToken token,
+    String opKind,
+  ) {
+    // Cooperative stop uses DbClosedException as control-flow (same as migration).
+    if (!dataStore.isInitialized || dataStore.isClosing) {
+      throw DbClosedException(
+        'Large-scale data $opKind was interrupted because the database is closed; '
+        'caller must retry the operation.',
+      );
+    }
+    if (token.isCancelled) {
+      throw DbClosedException(
+        'Large-scale data $opKind was interrupted; caller must retry the operation.',
+      );
+    }
+  }
+
+  static Future<int> _executeLargeDelete(
+    DataStoreImpl dataStore,
+    LargeDeleteRequest op,
     CancellationToken token,
   ) async {
-    if (token.isCancelled) return;
-    _runningOpIds.add(op.opId);
+    _throwIfInterrupted(dataStore, token, 'delete');
 
-    final tempConflictTableName = '_system_temp_op_conflict_${op.opId}';
+    final table =
+        await dataStore.tableMetaManager?.getTableContext(op.tableUid);
+    if (table == null) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.devTableNotFound,
+          message:
+              'Large-scale data delete failed: table not found (tableUid: ${op.tableUid.value}, opId: ${op.opId}).',
+        ),
+      ]);
+    }
+
+    Logger.info(
+        'Starting large-scale data delete for table [${table.tableName}] (opId: ${op.opId}).');
+
+    final schema = table.schema;
+    final primaryKey = schema.primaryKey;
+    int deletedCount = 0;
+    int skippedForOffset = 0;
+    final offsetBudget = op.offset ?? 0;
+    final conditionMap = op.condition;
+    final writeBatchSize = dataStore.config.writeBatchSize;
 
     try {
-      final table =
-          await dataStore.tableMetaManager?.getTableContext(op.tableUid);
-      if (table == null) {
-        Logger.warn(
-            'Background delete skipped: table not found (opId: ${op.opId}).');
-        await dataStore.dropTable(tempConflictTableName, registerWalOp: false);
-        await dataStore.walManager.completeLargeDelete(op.opId);
-        return;
-      }
-
-      Logger.info(
-          'Starting/resuming background delete for table [${table.tableName}] (opId: ${op.opId}).');
-
-      final schema = table.schema;
-      final primaryKey = schema.primaryKey;
-      int deletedCount = op.deletedSoFar;
-      final conditionMap = op.condition;
-      final writeBatchSize = dataStore.config.writeBatchSize;
-
       await dataStore.queryExecutor.queryEachBatch(
         table,
         batchSize: writeBatchSize,
-        checkpointCursor: op.checkpointCursor,
         cancellationToken: token,
         orderBy: op.orderBy,
         condition: QueryCondition.fromMap(conditionMap),
         onBatch: (records, currentCursor, nextCursor) async {
-          if (token.isCancelled) return false;
+          _throwIfInterrupted(dataStore, token, 'delete');
 
           await dataStore.backgroundWriteScheduler.waitIfCongested(
             writeBatchSize: writeBatchSize,
@@ -209,37 +356,21 @@ class LargeOperationRunner {
             cancellationToken: token,
           );
 
+          _throwIfInterrupted(dataStore, token, 'delete');
+
           if (records.isEmpty) return true;
 
-          // 1. Fetch skip flags from the temporary conflict table
-          Map<String, int> skipMap = {};
-          try {
-            if (await dataStore.tableExists(tempConflictTableName)) {
-              final conflictTable =
-                  await dataStore.getTableContext(tempConflictTableName);
-              final conflictRecords = (await dataStore.queryExecutor.execute(
-                conflictTable,
-                condition: QueryCondition.fromMap({
-                  'primaryKey': {
-                    'IN': records.map((r) => r[primaryKey].toString()).toList()
-                  }
-                }),
-              ))
-                  .records;
-              skipMap = {
-                for (final cr in conflictRecords)
-                  cr['primaryKey'].toString(): (cr['skipFlag'] as num).toInt()
-              };
-            }
-          } catch (_) {}
-
-          final remainingMatchBudget =
+          final remainingOffset = max(0, offsetBudget - skippedForOffset);
+          final remainingLimit =
               op.limit == null ? null : max(0, op.limit! - deletedCount);
-          if (op.limit != null && remainingMatchBudget == 0) {
+          if (remainingLimit != null && remainingLimit == 0) {
             return false;
           }
 
-          // 2. Perform batch index matching
+          final remainingMatchBudget =
+              remainingLimit == null ? null : remainingOffset + remainingLimit;
+
+          // Perform batch index matching
           final matchResult = await ConditionBatchMatcher.matchRecordIndices(
             schema: schema,
             table: table,
@@ -251,10 +382,10 @@ class LargeOperationRunner {
           );
 
           final deletes = <Map<String, dynamic>>[];
-          final yieldController = YieldController('LargeDeleteRunner.process');
+          final yieldController = YieldController('LargeScaleDelete.process');
 
           for (final matchedIndex in matchResult.matchedIndices) {
-            if (token.isCancelled) return false;
+            _throwIfInterrupted(dataStore, token, 'delete');
             final y1 = yieldController.maybeYield();
             if (y1 != null) await y1;
 
@@ -263,11 +394,16 @@ class LargeOperationRunner {
             if (pkValue == null) continue;
             final pkValueStr = pkValue.toString();
 
-            if (skipMap[pkValueStr] == 1) {
-              continue; // Skip entirely
+            if (skippedForOffset < offsetBudget) {
+              skippedForOffset++;
+              continue;
             }
 
-            // 3. Foreign Key Checks and Cascades
+            if (op.limit != null && deletedCount >= op.limit!) {
+              return false;
+            }
+
+            // Foreign Key Checks and Cascades
             if (dataStore.foreignKeyManager != null) {
               try {
                 await dataStore.foreignKeyManager!
@@ -276,7 +412,8 @@ class LargeOperationRunner {
                   deletedPkValues: pkValue,
                 );
               } catch (e) {
-                Logger.error('RESTRICT constraint check failed in heavy delete',
+                Logger.error(
+                    'RESTRICT constraint check failed in large-scale data delete',
                     rawError: e);
                 rethrow;
               }
@@ -288,7 +425,7 @@ class LargeOperationRunner {
                   skipRestrictCheck: true,
                 );
               } catch (e) {
-                Logger.error('Cascade delete failed in heavy delete',
+                Logger.error('Cascade delete failed in large-scale data delete',
                     rawError: e);
                 rethrow;
               }
@@ -319,9 +456,9 @@ class LargeOperationRunner {
             entryVersion = '';
           }
 
-          // 4. Populate scheduler for batch flushing
+          // Populate scheduler for batch flushing
           for (final record in deletes) {
-            if (token.isCancelled) return false;
+            _throwIfInterrupted(dataStore, token, 'delete');
             final pkValueStr = record[primaryKey].toString();
             final entry = BufferEntry(
               operation: BufferOperationType.delete,
@@ -337,7 +474,6 @@ class LargeOperationRunner {
                 type: BackgroundWriteType.largeDelete,
                 mode: MigrationWriteMode.tableAndIndex,
                 entry: entry,
-                // Assign nextCursor to currentCursor to forward checkpoint correctly
                 currentCursor: nextCursor,
                 nextCursor: nextCursor,
               ),
@@ -350,88 +486,82 @@ class LargeOperationRunner {
         },
       );
 
-      if (token.isCancelled) return;
+      _throwIfInterrupted(dataStore, token, 'delete');
 
       // Drain all enqueued background write records for this task to disk
       await _drainOpBackgroundWrites(dataStore, op.opId, token);
 
-      if (token.isCancelled) return;
+      _throwIfInterrupted(dataStore, token, 'delete');
 
-      // Drop conflict table and complete operation in WAL
-      try {
-        await dataStore.dropTable(tempConflictTableName, registerWalOp: false);
-        await dataStore.walManager.completeLargeDelete(op.opId);
-        Logger.info(
-            'Background delete completed for table [${table.tableName}] (opId: ${op.opId}).');
-      } catch (_) {}
+      Logger.info(
+          'Large-scale data delete completed for table [${table.tableName}] '
+          '(opId: ${op.opId}, count: $deletedCount).');
+      return deletedCount;
     } catch (e) {
-      Logger.error('Large delete failed for ${op.opId}', rawError: e);
-      try {
-        await dataStore.dropTable(tempConflictTableName, registerWalOp: false);
-        await dataStore.walManager.cancelLargeDelete(op.opId);
-      } catch (_) {}
+      if (e is! DbClosedException) {
+        Logger.error('Large-scale data delete failed for ${op.opId}',
+            rawError: e);
+      }
       rethrow;
-    } finally {
-      _runningOpIds.remove(op.opId);
     }
   }
 
-  static Future<void> _runLargeUpdate(
+  static Future<int> _executeLargeUpdate(
     DataStoreImpl dataStore,
-    LargeUpdateMeta op,
+    LargeUpdateRequest op,
     CancellationToken token,
   ) async {
-    if (token.isCancelled) return;
-    _runningOpIds.add(op.opId);
+    _throwIfInterrupted(dataStore, token, 'update');
 
-    final tempConflictTableName = '_system_temp_op_conflict_${op.opId}';
+    final table =
+        await dataStore.tableMetaManager?.getTableContext(op.tableUid);
+    if (table == null) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.devTableNotFound,
+          message:
+              'Large-scale data update failed: table not found (tableUid: ${op.tableUid.value}, opId: ${op.opId}).',
+        ),
+      ]);
+    }
 
-    try {
-      final table =
-          await dataStore.tableMetaManager?.getTableContext(op.tableUid);
-      if (table == null) {
-        Logger.warn(
-            'Background update skipped: table not found (opId: ${op.opId}).');
-        await dataStore.dropTable(tempConflictTableName, registerWalOp: false);
-        await dataStore.walManager.completeLargeUpdate(op.opId);
-        return;
-      }
+    Logger.info(
+        'Starting large-scale data update for table [${table.tableName}] (opId: ${op.opId}).');
 
-      Logger.info(
-          'Starting/resuming background update for table [${table.tableName}] (opId: ${op.opId}).');
+    final schema = table.schema;
+    final primaryKey = schema.primaryKey;
+    int updatedCount = 0;
+    int skippedForOffset = 0;
+    final offsetBudget = op.offset ?? 0;
+    final conditionMap = op.condition;
+    final validData = op.updateData;
+    final writeBatchSize = dataStore.config.writeBatchSize;
 
-      final schema = table.schema;
-      final primaryKey = schema.primaryKey;
-      int updatedCount = op.updatedSoFar;
-      final conditionMap = op.condition;
-      final validData = op.updateData;
-      final writeBatchSize = dataStore.config.writeBatchSize;
+    final isPrimaryKeyUpdate = validData.containsKey(primaryKey);
+    final insertedPrimaryKeysThisUpdate = <String>{};
 
-      final isPrimaryKeyUpdate = validData.containsKey(primaryKey);
-      final insertedPrimaryKeysThisUpdate = <String>{};
-
-      final Set<String> uniqueFieldsToCheck = <String>{};
-      if (dataStore.indexManager != null) {
-        final allIndexes =
-            dataStore.tableMetaManager?.getUniqueIndexesFor(schema) ??
-                <IndexSchema>[];
-        for (final index in allIndexes) {
-          if (index.fields.any(
-              (f) => validData.containsKey(f) && validData[f] is ExprNode)) {
-            uniqueFieldsToCheck.addAll(index.fields);
-          }
+    final Set<String> uniqueFieldsToCheck = <String>{};
+    if (dataStore.indexManager != null) {
+      final allIndexes =
+          dataStore.tableMetaManager?.getUniqueIndexesFor(schema) ??
+              <IndexSchema>[];
+      for (final index in allIndexes) {
+        if (index.fields
+            .any((f) => validData.containsKey(f) && validData[f] is ExprNode)) {
+          uniqueFieldsToCheck.addAll(index.fields);
         }
       }
+    }
 
+    try {
       await dataStore.queryExecutor.queryEachBatch(
         table,
         batchSize: writeBatchSize,
-        checkpointCursor: op.checkpointCursor,
         cancellationToken: token,
         orderBy: op.orderBy,
         condition: QueryCondition.fromMap(conditionMap),
         onBatch: (records, currentCursor, nextCursor) async {
-          if (token.isCancelled) return false;
+          _throwIfInterrupted(dataStore, token, 'update');
 
           await dataStore.backgroundWriteScheduler.waitIfCongested(
             writeBatchSize: writeBatchSize,
@@ -447,42 +577,21 @@ class LargeOperationRunner {
             cancellationToken: token,
           );
 
+          _throwIfInterrupted(dataStore, token, 'update');
+
           if (records.isEmpty) return true;
 
-          // 1. Fetch skip flags from the temporary conflict table
-          Map<String, int> skipMap = {};
-          Map<String, List<String>> conflictFieldsMap = {};
-          try {
-            if (await dataStore.tableExists(tempConflictTableName)) {
-              final conflictTable =
-                  await dataStore.getTableContext(tempConflictTableName);
-              final conflictRecords = (await dataStore.queryExecutor.execute(
-                conflictTable,
-                condition: QueryCondition.fromMap({
-                  'primaryKey': {
-                    'IN': records.map((r) => r[primaryKey].toString()).toList()
-                  }
-                }),
-              ))
-                  .records;
-              for (final cr in conflictRecords) {
-                final pk = cr['primaryKey'].toString();
-                skipMap[pk] = (cr['skipFlag'] as num).toInt();
-                final fields = cr['conflictFields'] as String?;
-                if (fields != null && fields.isNotEmpty) {
-                  conflictFieldsMap[pk] = fields.split(',');
-                }
-              }
-            }
-          } catch (_) {}
-
-          final remainingMatchBudget =
+          final remainingOffset = max(0, offsetBudget - skippedForOffset);
+          final remainingLimit =
               op.limit == null ? null : max(0, op.limit! - updatedCount);
-          if (op.limit != null && remainingMatchBudget == 0) {
+          if (remainingLimit != null && remainingLimit == 0) {
             return false;
           }
 
-          // 2. Perform batch index matching
+          final remainingMatchBudget =
+              remainingLimit == null ? null : remainingOffset + remainingLimit;
+
+          // Perform batch index matching
           final matchResult = await ConditionBatchMatcher.matchRecordIndices(
             schema: schema,
             table: table,
@@ -494,9 +603,7 @@ class LargeOperationRunner {
           );
 
           final matchedRecords = <Map<String, dynamic>>[];
-          final matchedIndexSet = matchResult.matchedIndices.toSet();
 
-          // First add records matched by ConditionBatchMatcher
           for (final matchedIndex in matchResult.matchedIndices) {
             final candidate = records[matchedIndex];
             final candidatePk = candidate[primaryKey]?.toString();
@@ -504,29 +611,15 @@ class LargeOperationRunner {
                 insertedPrimaryKeysThisUpdate.contains(candidatePk)) {
               continue;
             }
-            if (op.limit != null && updatedCount >= op.limit!) {
+            if (skippedForOffset < offsetBudget) {
+              skippedForOffset++;
               continue;
             }
-            updatedCount++;
-            matchedRecords.add(candidate);
-          }
-
-          // Safely catch up on records that were modified online (skipFlag == 2)
-          // but no longer match the condition filter, preventing them from being leaked.
-          for (var idx = 0; idx < records.length; idx++) {
-            if (matchedIndexSet.contains(idx)) continue;
-            final candidate = records[idx];
-            final candidatePk = candidate[primaryKey]?.toString();
-            if (candidatePk != null && skipMap[candidatePk] == 2) {
-              if (insertedPrimaryKeysThisUpdate.contains(candidatePk)) {
-                continue;
-              }
-              if (op.limit != null && updatedCount >= op.limit!) {
-                continue;
-              }
-              updatedCount++;
-              matchedRecords.add(candidate);
+            if (op.limit != null &&
+                updatedCount + matchedRecords.length >= op.limit!) {
+              break;
             }
+            matchedRecords.add(candidate);
           }
 
           if (matchedRecords.isEmpty) return true;
@@ -543,7 +636,6 @@ class LargeOperationRunner {
           final updates = <Map<String, dynamic>>[];
           final deletes = <Map<String, dynamic>>[];
           final inserts = <Map<String, dynamic>>[];
-          final cacheKeysToRemove = <String>{};
           // PKs reserved in this chunk but not yet handed to scheduler.
           final chunkReservedPks = <String>{};
 
@@ -556,17 +648,23 @@ class LargeOperationRunner {
           }
 
           final applyYieldController =
-              YieldController('LargeUpdateRunner.process');
+              YieldController('LargeScaleUpdate.process');
 
           for (int matchedIndex = 0;
               matchedIndex < matchedRecords.length;
               matchedIndex++) {
-            if (token.isCancelled) {
+            if (token.isCancelled ||
+                !dataStore.isInitialized ||
+                dataStore.isClosing) {
               await releaseChunkReservations();
-              return false;
+              _throwIfInterrupted(dataStore, token, 'update');
             }
             final y2 = applyYieldController.maybeYield();
             if (y2 != null) await y2;
+
+            if (op.limit != null && updatedCount >= op.limit!) {
+              break;
+            }
 
             final record = matchedRecords[matchedIndex];
             var updatedRecord =
@@ -575,20 +673,6 @@ class LargeOperationRunner {
             if (pkValue == null) continue;
             final pkValueStr = pkValue.toString();
 
-            final skipFlag = skipMap[pkValueStr];
-            if (skipFlag == 1) continue; // Skip entirely
-            if (skipFlag == 2) {
-              final skipFields = conflictFieldsMap[pkValueStr];
-              if (skipFields != null && skipFields.isNotEmpty) {
-                final mergedRecord = Map<String, dynamic>.from(record);
-                updatedRecord.forEach((k, v) {
-                  if (!skipFields.contains(k)) {
-                    mergedRecord[k] = v;
-                  }
-                });
-                updatedRecord = mergedRecord;
-              }
-            }
             List<List<dynamic>>? reservedKeys;
             // Verify unique constraints
             if (uniqueFieldsToCheck.isNotEmpty &&
@@ -606,7 +690,7 @@ class LargeOperationRunner {
                 chunkReservedPks.add(pkValueStr);
               } catch (e) {
                 Logger.error(
-                    'Unique constraint check failed in heavy update reserve',
+                    'Unique constraint check failed in large-scale data update reserve',
                     rawError: e);
                 if (op.continueOnPartialErrors) {
                   Logger.warn(
@@ -648,7 +732,8 @@ class LargeOperationRunner {
                   );
                 } catch (_) {}
                 chunkReservedPks.remove(pkValueStr);
-                Logger.error('Unique constraint check failed in heavy update',
+                Logger.error(
+                    'Unique constraint check failed in large-scale data update',
                     rawError: e);
                 if (op.continueOnPartialErrors) {
                   Logger.warn(
@@ -769,7 +854,8 @@ class LargeOperationRunner {
                       rollbackKeys: pkReservedKeys,
                     );
                     chunkReservedPks.remove(newPkVal);
-                    Logger.error('Cascade update failed in heavy update',
+                    Logger.error(
+                        'Cascade update failed in large-scale data update',
                         rawError: e);
                     if (op.continueOnPartialErrors) continue;
                     await releaseChunkReservations();
@@ -820,13 +906,16 @@ class LargeOperationRunner {
                 } else {
                   updates.remove(updatedRecord);
                 }
-                Logger.error('Foreign key check failed in heavy update',
+                Logger.error(
+                    'Foreign key check failed in large-scale data update',
                     rawError: e);
                 if (op.continueOnPartialErrors) continue;
                 await releaseChunkReservations();
                 rethrow;
               }
             }
+
+            updatedCount++;
 
             if (dataStore.notificationManager.hasListeners(schema.tableUid)) {
               dataStore.notificationManager.notify(ChangeEvent(
@@ -839,7 +928,6 @@ class LargeOperationRunner {
 
             dataStore.tableDataManager
                 .removeRecordFromBuffer(table, pkValueStr);
-            cacheKeysToRemove.add(pkValueStr);
           }
 
           var entryVersion = schema.schemaVersion ?? '';
@@ -850,9 +938,11 @@ class LargeOperationRunner {
 
           // Populate scheduler
           for (final record in deletes) {
-            if (token.isCancelled) {
+            if (token.isCancelled ||
+                !dataStore.isInitialized ||
+                dataStore.isClosing) {
               await releaseChunkReservations();
-              return false;
+              _throwIfInterrupted(dataStore, token, 'update');
             }
             final pk = record[primaryKey].toString();
             final entry = BufferEntry(
@@ -877,9 +967,11 @@ class LargeOperationRunner {
           }
 
           for (final record in inserts) {
-            if (token.isCancelled) {
+            if (token.isCancelled ||
+                !dataStore.isInitialized ||
+                dataStore.isClosing) {
               await releaseChunkReservations();
-              return false;
+              _throwIfInterrupted(dataStore, token, 'update');
             }
             final pk = record[primaryKey].toString();
             final entry = BufferEntry(
@@ -906,9 +998,11 @@ class LargeOperationRunner {
           }
 
           for (final record in updates) {
-            if (token.isCancelled) {
+            if (token.isCancelled ||
+                !dataStore.isInitialized ||
+                dataStore.isClosing) {
               await releaseChunkReservations();
-              return false;
+              _throwIfInterrupted(dataStore, token, 'update');
             }
             final pk = record[primaryKey].toString();
             final oldRecord =
@@ -944,27 +1038,22 @@ class LargeOperationRunner {
         },
       );
 
-      if (token.isCancelled) return;
+      _throwIfInterrupted(dataStore, token, 'update');
 
       await _drainOpBackgroundWrites(dataStore, op.opId, token);
 
-      if (token.isCancelled) return;
+      _throwIfInterrupted(dataStore, token, 'update');
 
-      try {
-        await dataStore.dropTable(tempConflictTableName, registerWalOp: false);
-        await dataStore.walManager.completeLargeUpdate(op.opId);
-        Logger.info(
-            'Background update completed for table [${table.tableName}] (opId: ${op.opId}).');
-      } catch (_) {}
+      Logger.info(
+          'Large-scale data update completed for table [${table.tableName}] '
+          '(opId: ${op.opId}, count: $updatedCount).');
+      return updatedCount;
     } catch (e) {
-      Logger.error('Large update failed for ${op.opId}', rawError: e);
-      try {
-        await dataStore.dropTable(tempConflictTableName, registerWalOp: false);
-        await dataStore.walManager.cancelLargeUpdate(op.opId);
-      } catch (_) {}
+      if (e is! DbClosedException) {
+        Logger.error('Large-scale data update failed for ${op.opId}',
+            rawError: e);
+      }
       rethrow;
-    } finally {
-      _runningOpIds.remove(op.opId);
     }
   }
 
@@ -978,11 +1067,16 @@ class LargeOperationRunner {
             .hasPendingEntriesOfType(BackgroundWriteType.largeDelete) ||
         dataStore.backgroundWriteScheduler
             .hasPendingEntriesOfType(BackgroundWriteType.largeUpdate)) {
-      if (token.isCancelled) break;
+      _throwIfInterrupted(dataStore, token, 'operation drain');
       if (++rounds > 512) {
-        Logger.warn(
-            'Background write drain hit round limit for operation $opId');
-        break;
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.sysTimeout,
+            message: 'Large-scale data operation drain timed out for $opId '
+                'with pending largeDelete/largeUpdate scheduler entries; '
+                'caller must retry the operation.',
+          ),
+        ]);
       }
       await dataStore.parallelJournalManager.flushCompletely();
     }

@@ -294,7 +294,7 @@ class TtlCleanupManager {
           return const _TtlBatchResult(deleted: 0, ok: false);
         }
 
-        final deletedCount = r.successKeys.length;
+        final deletedCount = r.successCount;
 
         // Best-effort cleanup of TTL index entries for internal source.
         // We rely on IndexSearchResult.indexKeys being aligned with primaryKeys.
@@ -367,7 +367,7 @@ class TtlCleanupManager {
         return const _TtlBatchResult(deleted: 0, ok: false);
       }
 
-      return _TtlBatchResult(deleted: r.successKeys.length, ok: true);
+      return _TtlBatchResult(deleted: r.successCount, ok: true);
     } catch (e) {
       Logger.warn('TTL cleanup batch failed on $tableName', rawError: e);
       return const _TtlBatchResult(deleted: 0, ok: false);
@@ -486,13 +486,13 @@ class TtlCleanupManager {
           return const _TtlBatchResult(deleted: 0, ok: false);
         }
 
-        if (deleteResult.successKeys.isNotEmpty) {
-          deletedCount += deleteResult.successKeys.length;
+        if (deleteResult.successCount > 0) {
+          deletedCount += deleteResult.successCount;
         }
 
         await _removeKvExpiryIndexEntry(table, entry.keyBytes);
 
-        if (deleteResult.successKeys.isNotEmpty) {
+        if (deleteResult.successCount > 0) {
           final currentKeyBytes =
               await _dataStore.indexManager?.encodeInternalKvExpiryIndexKey(
             table,

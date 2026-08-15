@@ -8,7 +8,6 @@ import '../model/table_identity.dart';
 import '../model/table_op_meta.dart';
 import '../model/wal_pointer.dart';
 import 'binary_codec.dart';
-import 'binary_map_codec.dart';
 import 'meta_file_codec.dart';
 
 /// Stable field IDs for [WalMeta] binary encoding. Never reuse IDs.
@@ -17,12 +16,10 @@ abstract final class WalMetaFieldId {
   static const int existingStartPartitionIndex = 2;
   static const int existingEndPartitionIndex = 3;
   static const int pendingBatches = 4;
-  static const int largeDeletes = 5;
-  static const int largeUpdates = 6;
-  static const int tableOps = 7;
-  static const int directoryMapping = 8;
-  static const int lastRecoveredPointer = 9;
-  static const int lastRecoveredTailFileSize = 10;
+  static const int tableOps = 5;
+  static const int directoryMapping = 6;
+  static const int lastRecoveredPointer = 7;
+  static const int lastRecoveredTailFileSize = 8;
   // Reserved 20--31 for future top-level fields.
 }
 
@@ -58,36 +55,6 @@ abstract final class BatchTablePlanFieldId {
 abstract final class IndexIntEntryFieldId {
   static const int indexUid = 1;
   static const int value = 2;
-}
-
-abstract final class LargeDeleteFieldId {
-  static const int opId = 1;
-  static const int tableUid = 2;
-  static const int spaceName = 3;
-  static const int condition = 4;
-  static const int orderBy = 5;
-  static const int limit = 6;
-  static const int offset = 7;
-  static const int checkpointCursor = 8;
-  static const int deletedSoFar = 9;
-  static const int status = 10;
-  static const int createdAt = 11;
-}
-
-abstract final class LargeUpdateFieldId {
-  static const int opId = 1;
-  static const int tableUid = 2;
-  static const int spaceName = 3;
-  static const int condition = 4;
-  static const int updateData = 5;
-  static const int orderBy = 6;
-  static const int limit = 7;
-  static const int offset = 8;
-  static const int checkpointCursor = 9;
-  static const int updatedSoFar = 10;
-  static const int status = 11;
-  static const int createdAt = 12;
-  static const int continueOnPartialErrors = 13;
 }
 
 abstract final class TableOpFieldId {
@@ -134,16 +101,6 @@ final class WalMetaCodec {
         _writePendingBatch(sw, batch);
       });
     }
-    for (final op in meta.largeDeletes.values) {
-      w.writeMessage(WalMetaFieldId.largeDeletes, (sw) {
-        _writeLargeDelete(sw, op);
-      });
-    }
-    for (final op in meta.largeUpdates.values) {
-      w.writeMessage(WalMetaFieldId.largeUpdates, (sw) {
-        _writeLargeUpdate(sw, op);
-      });
-    }
     for (final op in meta.tableOps.values) {
       w.writeMessage(WalMetaFieldId.tableOps, (sw) {
         _writeTableOp(sw, op);
@@ -179,8 +136,6 @@ final class WalMetaCodec {
     var existingStart = -1;
     var existingEnd = -1;
     final pendingBatches = <PendingParallelBatch>[];
-    final largeDeletes = <String, LargeDeleteMeta>{};
-    final largeUpdates = <String, LargeUpdateMeta>{};
     final tableOps = <String, TableOpMeta>{};
     DirectoryMapping? directoryMapping;
     WalPointer? lastRecoveredPointer;
@@ -203,18 +158,6 @@ final class WalMetaCodec {
         case WalMetaFieldId.pendingBatches:
           r.readMessage((sr, _) {
             pendingBatches.add(_readPendingBatch(sr));
-          });
-          break;
-        case WalMetaFieldId.largeDeletes:
-          r.readMessage((sr, _) {
-            final op = _readLargeDelete(sr);
-            if (op.opId.isNotEmpty) largeDeletes[op.opId] = op;
-          });
-          break;
-        case WalMetaFieldId.largeUpdates:
-          r.readMessage((sr, _) {
-            final op = _readLargeUpdate(sr);
-            if (op.opId.isNotEmpty) largeUpdates[op.opId] = op;
           });
           break;
         case WalMetaFieldId.tableOps:
@@ -247,8 +190,6 @@ final class WalMetaCodec {
       existingStartPartitionIndex: existingStart,
       existingEndPartitionIndex: existingEnd,
       pendingBatches: pendingBatches,
-      largeDeletes: largeDeletes,
-      largeUpdates: largeUpdates,
       tableOps: tableOps,
       directoryMapping: directoryMapping,
       lastRecoveredPointer: lastRecoveredPointer,
@@ -532,246 +473,6 @@ final class WalMetaCodec {
     }
     if (indexUid == null || indexUid.isEmpty || value == null) return null;
     return (indexUid, value);
-  }
-
-  static void _writeLargeDelete(BinaryWriter w, LargeDeleteMeta op) {
-    w.writeFieldTag(LargeDeleteFieldId.opId, WireType.lengthDelimited);
-    w.writeString(op.opId);
-    w.writeFieldTag(LargeDeleteFieldId.tableUid, WireType.lengthDelimited);
-    w.writeString(op.tableUid.value);
-    w.writeFieldTag(LargeDeleteFieldId.spaceName, WireType.lengthDelimited);
-    w.writeString(op.spaceName);
-    w.writeFieldTag(LargeDeleteFieldId.condition, WireType.lengthDelimited);
-    w.writeBytes(BinaryMapCodec.encodeMap(op.condition));
-    if (op.orderBy != null) {
-      for (final o in op.orderBy!) {
-        w.writeFieldTag(LargeDeleteFieldId.orderBy, WireType.lengthDelimited);
-        w.writeString(o);
-      }
-    }
-    if (op.limit != null) {
-      w.writeFieldTag(LargeDeleteFieldId.limit, WireType.varint);
-      w.writeZigZag64(op.limit!);
-    }
-    if (op.offset != null) {
-      w.writeFieldTag(LargeDeleteFieldId.offset, WireType.varint);
-      w.writeZigZag64(op.offset!);
-    }
-    if (op.checkpointCursor != null) {
-      w.writeFieldTag(
-          LargeDeleteFieldId.checkpointCursor, WireType.lengthDelimited);
-      w.writeString(op.checkpointCursor!);
-    }
-    w.writeFieldTag(LargeDeleteFieldId.deletedSoFar, WireType.varint);
-    w.writeZigZag64(op.deletedSoFar);
-    w.writeFieldTag(LargeDeleteFieldId.status, WireType.lengthDelimited);
-    w.writeString(op.status);
-    w.writeFieldTag(LargeDeleteFieldId.createdAt, WireType.lengthDelimited);
-    w.writeString(op.createdAt);
-  }
-
-  static LargeDeleteMeta _readLargeDelete(BinaryReader r) {
-    var opId = '';
-    var tableUid = TableUid.empty;
-    var spaceName = '__global__';
-    var condition = <String, dynamic>{};
-    List<String>? orderBy;
-    int? limit;
-    int? offset;
-    String? checkpointCursor;
-    var deletedSoFar = 0;
-    var status = 'running';
-    var createdAt = '';
-
-    while (!r.isEOF) {
-      final (fieldId, wireType) = r.readFieldTag();
-      switch (fieldId) {
-        case LargeDeleteFieldId.opId:
-          opId = r.readString();
-          break;
-        case LargeDeleteFieldId.tableUid:
-          tableUid = TableUid(r.readString());
-          break;
-        case LargeDeleteFieldId.spaceName:
-          spaceName = r.readString();
-          break;
-        case LargeDeleteFieldId.condition:
-          condition =
-              BinaryMapCodec.decodeMap(r.readBytes()) ?? <String, dynamic>{};
-          break;
-        case LargeDeleteFieldId.orderBy:
-          orderBy ??= <String>[];
-          orderBy.add(r.readString());
-          break;
-        case LargeDeleteFieldId.limit:
-          limit = r.readZigZag64();
-          break;
-        case LargeDeleteFieldId.offset:
-          offset = r.readZigZag64();
-          break;
-        case LargeDeleteFieldId.checkpointCursor:
-          checkpointCursor = r.readString();
-          break;
-        case LargeDeleteFieldId.deletedSoFar:
-          deletedSoFar = r.readZigZag64();
-          break;
-        case LargeDeleteFieldId.status:
-          status = r.readString();
-          break;
-        case LargeDeleteFieldId.createdAt:
-          createdAt = r.readString();
-          break;
-        default:
-          r.skipField(wireType);
-          break;
-      }
-    }
-
-    if (createdAt.isEmpty) {
-      createdAt = DateTime.now().toIso8601String();
-    }
-
-    return LargeDeleteMeta(
-      opId: opId,
-      tableUid: tableUid,
-      spaceName: spaceName,
-      condition: condition,
-      orderBy: orderBy,
-      limit: limit,
-      offset: offset,
-      checkpointCursor: checkpointCursor,
-      deletedSoFar: deletedSoFar,
-      status: status,
-      createdAt: createdAt,
-    );
-  }
-
-  static void _writeLargeUpdate(BinaryWriter w, LargeUpdateMeta op) {
-    w.writeFieldTag(LargeUpdateFieldId.opId, WireType.lengthDelimited);
-    w.writeString(op.opId);
-    w.writeFieldTag(LargeUpdateFieldId.tableUid, WireType.lengthDelimited);
-    w.writeString(op.tableUid.value);
-    w.writeFieldTag(LargeUpdateFieldId.spaceName, WireType.lengthDelimited);
-    w.writeString(op.spaceName);
-    w.writeFieldTag(LargeUpdateFieldId.condition, WireType.lengthDelimited);
-    w.writeBytes(BinaryMapCodec.encodeMap(op.condition));
-    w.writeFieldTag(LargeUpdateFieldId.updateData, WireType.lengthDelimited);
-    w.writeBytes(BinaryMapCodec.encodeMap(op.updateData));
-    if (op.orderBy != null) {
-      for (final o in op.orderBy!) {
-        w.writeFieldTag(LargeUpdateFieldId.orderBy, WireType.lengthDelimited);
-        w.writeString(o);
-      }
-    }
-    if (op.limit != null) {
-      w.writeFieldTag(LargeUpdateFieldId.limit, WireType.varint);
-      w.writeZigZag64(op.limit!);
-    }
-    if (op.offset != null) {
-      w.writeFieldTag(LargeUpdateFieldId.offset, WireType.varint);
-      w.writeZigZag64(op.offset!);
-    }
-    if (op.checkpointCursor != null) {
-      w.writeFieldTag(
-          LargeUpdateFieldId.checkpointCursor, WireType.lengthDelimited);
-      w.writeString(op.checkpointCursor!);
-    }
-    w.writeFieldTag(LargeUpdateFieldId.updatedSoFar, WireType.varint);
-    w.writeZigZag64(op.updatedSoFar);
-    w.writeFieldTag(LargeUpdateFieldId.status, WireType.lengthDelimited);
-    w.writeString(op.status);
-    w.writeFieldTag(LargeUpdateFieldId.createdAt, WireType.lengthDelimited);
-    w.writeString(op.createdAt);
-    w.writeFieldTag(
-        LargeUpdateFieldId.continueOnPartialErrors, WireType.varint);
-    w.writeBool(op.continueOnPartialErrors);
-  }
-
-  static LargeUpdateMeta _readLargeUpdate(BinaryReader r) {
-    var opId = '';
-    var tableUid = TableUid.empty;
-    var spaceName = '__global__';
-    var condition = <String, dynamic>{};
-    var updateData = <String, dynamic>{};
-    List<String>? orderBy;
-    int? limit;
-    int? offset;
-    String? checkpointCursor;
-    var updatedSoFar = 0;
-    var status = 'running';
-    var createdAt = '';
-    var continueOnPartialErrors = false;
-
-    while (!r.isEOF) {
-      final (fieldId, wireType) = r.readFieldTag();
-      switch (fieldId) {
-        case LargeUpdateFieldId.opId:
-          opId = r.readString();
-          break;
-        case LargeUpdateFieldId.tableUid:
-          tableUid = TableUid(r.readString());
-          break;
-        case LargeUpdateFieldId.spaceName:
-          spaceName = r.readString();
-          break;
-        case LargeUpdateFieldId.condition:
-          condition =
-              BinaryMapCodec.decodeMap(r.readBytes()) ?? <String, dynamic>{};
-          break;
-        case LargeUpdateFieldId.updateData:
-          updateData =
-              BinaryMapCodec.decodeMap(r.readBytes()) ?? <String, dynamic>{};
-          break;
-        case LargeUpdateFieldId.orderBy:
-          orderBy ??= <String>[];
-          orderBy.add(r.readString());
-          break;
-        case LargeUpdateFieldId.limit:
-          limit = r.readZigZag64();
-          break;
-        case LargeUpdateFieldId.offset:
-          offset = r.readZigZag64();
-          break;
-        case LargeUpdateFieldId.checkpointCursor:
-          checkpointCursor = r.readString();
-          break;
-        case LargeUpdateFieldId.updatedSoFar:
-          updatedSoFar = r.readZigZag64();
-          break;
-        case LargeUpdateFieldId.status:
-          status = r.readString();
-          break;
-        case LargeUpdateFieldId.createdAt:
-          createdAt = r.readString();
-          break;
-        case LargeUpdateFieldId.continueOnPartialErrors:
-          continueOnPartialErrors = r.readBool();
-          break;
-        default:
-          r.skipField(wireType);
-          break;
-      }
-    }
-
-    if (createdAt.isEmpty) {
-      createdAt = DateTime.now().toIso8601String();
-    }
-
-    return LargeUpdateMeta(
-      opId: opId,
-      tableUid: tableUid,
-      spaceName: spaceName,
-      condition: condition,
-      updateData: updateData,
-      orderBy: orderBy,
-      limit: limit,
-      offset: offset,
-      checkpointCursor: checkpointCursor,
-      updatedSoFar: updatedSoFar,
-      status: status,
-      createdAt: createdAt,
-      continueOnPartialErrors: continueOnPartialErrors,
-    );
   }
 
   static void _writeTableOp(BinaryWriter w, TableOpMeta op) {

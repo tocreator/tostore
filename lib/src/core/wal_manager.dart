@@ -115,201 +115,6 @@ class PendingParallelBatch {
   }
 }
 
-/// Large delete operation metadata for WAL meta (single-table delete with checkpoint)
-class LargeDeleteMeta {
-  final String opId;
-  final TableUid tableUid;
-  final String spaceName;
-  final Map<String, dynamic> condition; // includes where map
-  final List<String>? orderBy;
-  final int? limit;
-  final int? offset;
-  String? checkpointCursor; // Cursor checkpoint for queryEachBatch
-  int deletedSoFar; // cumulative deleted rows (for limit semantics across crashes)
-  String status; // 'running' | 'completed'
-  final String createdAt; // ISO8601
-
-  LargeDeleteMeta({
-    required this.opId,
-    required this.tableUid,
-    required this.spaceName,
-    required this.condition,
-    this.orderBy,
-    this.limit,
-    this.offset,
-    this.checkpointCursor,
-    required this.deletedSoFar,
-    required this.status,
-    required this.createdAt,
-  });
-
-  Map<String, dynamic> toJson() => {
-        'opId': opId,
-        'tableUid': tableUid,
-        'spaceName': spaceName,
-        'condition': condition,
-        if (orderBy != null) 'orderBy': orderBy,
-        if (limit != null) 'limit': limit,
-        if (offset != null) 'offset': offset,
-        if (checkpointCursor != null) 'checkpointCursor': checkpointCursor,
-        'deletedSoFar': deletedSoFar,
-        'status': status,
-        'createdAt': createdAt,
-      };
-
-  static LargeDeleteMeta fromJson(Map<String, dynamic> json) {
-    return LargeDeleteMeta(
-      opId: (json['opId'] as String?) ?? '',
-      tableUid: TableUid(
-          (json['tableUid'] ?? json['table'] ?? json['tableName']) as String),
-      spaceName: (json['spaceName'] as String?) ?? '__global__',
-      condition:
-          ((json['condition'] as Map?) ?? const {}).cast<String, dynamic>(),
-      orderBy: (json['orderBy'] as List?)?.map((e) => e.toString()).toList(),
-      limit: (json['limit'] as num?)?.toInt(),
-      offset: (json['offset'] as num?)?.toInt(),
-      checkpointCursor: json['checkpointCursor'] as String?,
-      deletedSoFar: (json['deletedSoFar'] as num?)?.toInt() ?? 0,
-      status: (json['status'] as String?) ?? 'running',
-      createdAt:
-          (json['createdAt'] as String?) ?? DateTime.now().toIso8601String(),
-    );
-  }
-
-  LargeDeleteMeta copyWith({
-    String? opId,
-    TableUid? tableUid,
-    String? spaceName,
-    Map<String, dynamic>? condition,
-    List<String>? orderBy,
-    int? limit,
-    int? offset,
-    String? checkpointCursor,
-    int? deletedSoFar,
-    String? status,
-    String? createdAt,
-  }) {
-    return LargeDeleteMeta(
-      opId: opId ?? this.opId,
-      tableUid: tableUid ?? this.tableUid,
-      spaceName: spaceName ?? this.spaceName,
-      condition: condition ?? this.condition,
-      orderBy: orderBy ?? this.orderBy,
-      limit: limit ?? this.limit,
-      offset: offset ?? this.offset,
-      checkpointCursor: checkpointCursor ?? this.checkpointCursor,
-      deletedSoFar: deletedSoFar ?? this.deletedSoFar,
-      status: status ?? this.status,
-      createdAt: createdAt ?? this.createdAt,
-    );
-  }
-}
-
-/// Large update operation metadata for WAL meta (single-table update with checkpoint)
-class LargeUpdateMeta {
-  final String opId;
-  final TableUid tableUid;
-  final String spaceName;
-  final Map<String, dynamic> condition; // includes where map
-  final Map<String, dynamic> updateData; // data to update
-  final List<String>? orderBy;
-  final int? limit;
-  final int? offset;
-  String? checkpointCursor; // Cursor checkpoint for queryEachBatch
-  int updatedSoFar; // cumulative updated rows (for limit semantics across crashes)
-  String status; // 'running' | 'completed'
-  final String createdAt; // ISO8601
-  final bool continueOnPartialErrors;
-
-  LargeUpdateMeta({
-    required this.opId,
-    required this.tableUid,
-    required this.spaceName,
-    required this.condition,
-    required this.updateData,
-    this.orderBy,
-    this.limit,
-    this.offset,
-    this.checkpointCursor,
-    required this.updatedSoFar,
-    required this.status,
-    required this.createdAt,
-    this.continueOnPartialErrors = false,
-  });
-
-  Map<String, dynamic> toJson() => {
-        'opId': opId,
-        'tableUid': tableUid,
-        'spaceName': spaceName,
-        'condition': condition,
-        'updateData': updateData,
-        if (orderBy != null) 'orderBy': orderBy,
-        if (limit != null) 'limit': limit,
-        if (offset != null) 'offset': offset,
-        if (checkpointCursor != null) 'checkpointCursor': checkpointCursor,
-        'updatedSoFar': updatedSoFar,
-        'status': status,
-        'createdAt': createdAt,
-        'continueOnPartialErrors': continueOnPartialErrors,
-      };
-
-  static LargeUpdateMeta fromJson(Map<String, dynamic> json) {
-    return LargeUpdateMeta(
-      opId: (json['opId'] as String?) ?? '',
-      tableUid: TableUid(
-          (json['tableUid'] ?? json['table'] ?? json['tableName']) as String),
-      spaceName: (json['spaceName'] as String?) ?? '__global__',
-      condition:
-          ((json['condition'] as Map?) ?? const {}).cast<String, dynamic>(),
-      updateData:
-          ((json['updateData'] as Map?) ?? const {}).cast<String, dynamic>(),
-      orderBy: (json['orderBy'] as List?)?.map((e) => e.toString()).toList(),
-      limit: (json['limit'] as num?)?.toInt(),
-      offset: (json['offset'] as num?)?.toInt(),
-      checkpointCursor: json['checkpointCursor'] as String?,
-      updatedSoFar: (json['updatedSoFar'] as num?)?.toInt() ?? 0,
-      status: (json['status'] as String?) ?? 'running',
-      createdAt:
-          (json['createdAt'] as String?) ?? DateTime.now().toIso8601String(),
-      continueOnPartialErrors:
-          (json['continueOnPartialErrors'] as bool?) ?? false,
-    );
-  }
-
-  LargeUpdateMeta copyWith({
-    String? opId,
-    TableUid? tableUid,
-    String? spaceName,
-    Map<String, dynamic>? condition,
-    Map<String, dynamic>? updateData,
-    List<String>? orderBy,
-    int? limit,
-    int? offset,
-    String? checkpointCursor,
-    int? updatedSoFar,
-    String? status,
-    String? createdAt,
-    bool? continueOnPartialErrors,
-  }) {
-    return LargeUpdateMeta(
-      opId: opId ?? this.opId,
-      tableUid: tableUid ?? this.tableUid,
-      spaceName: spaceName ?? this.spaceName,
-      condition: condition ?? this.condition,
-      updateData: updateData ?? this.updateData,
-      orderBy: orderBy ?? this.orderBy,
-      limit: limit ?? this.limit,
-      offset: offset ?? this.offset,
-      checkpointCursor: checkpointCursor ?? this.checkpointCursor,
-      updatedSoFar: updatedSoFar ?? this.updatedSoFar,
-      status: status ?? this.status,
-      createdAt: createdAt ?? this.createdAt,
-      continueOnPartialErrors:
-          continueOnPartialErrors ?? this.continueOnPartialErrors,
-    );
-  }
-}
-
 /// WAL main metadata
 class WalMeta {
   WalPointer checkpoint;
@@ -317,10 +122,6 @@ class WalMeta {
   int existingEndPartitionIndex; // inclusive
   // Pending batches for parallel recovery (supports multiple, flush/maintenance)
   List<PendingParallelBatch> pendingBatches;
-  // Running large delete operations keyed by opId
-  Map<String, LargeDeleteMeta> largeDeletes;
-  // Running large update operations keyed by opId
-  Map<String, LargeUpdateMeta> largeUpdates;
   // Table-level maintenance operations (clear/drop) tracked for recovery.
   Map<String, TableOpMeta> tableOps;
 
@@ -339,8 +140,6 @@ class WalMeta {
     required this.existingStartPartitionIndex,
     required this.existingEndPartitionIndex,
     required this.pendingBatches,
-    required this.largeDeletes,
-    required this.largeUpdates,
     required this.tableOps,
     this.directoryMapping,
     this.lastRecoveredPointer,
@@ -353,8 +152,6 @@ class WalMeta {
     int? existingStartPartitionIndex,
     int? existingEndPartitionIndex,
     List<PendingParallelBatch>? pendingBatches,
-    Map<String, LargeDeleteMeta>? largeDeletes,
-    Map<String, LargeUpdateMeta>? largeUpdates,
     Map<String, TableOpMeta>? tableOps,
     DirectoryMapping? directoryMapping,
     WalPointer? lastRecoveredPointer,
@@ -367,8 +164,6 @@ class WalMeta {
       existingEndPartitionIndex:
           existingEndPartitionIndex ?? this.existingEndPartitionIndex,
       pendingBatches: pendingBatches ?? this.pendingBatches,
-      largeDeletes: largeDeletes ?? this.largeDeletes,
-      largeUpdates: largeUpdates ?? this.largeUpdates,
       tableOps: tableOps ?? this.tableOps,
       directoryMapping: directoryMapping ?? this.directoryMapping,
       lastRecoveredPointer: lastRecoveredPointer ?? this.lastRecoveredPointer,
@@ -382,8 +177,6 @@ class WalMeta {
         'existingStartPartitionIndex': existingStartPartitionIndex,
         'existingEndPartitionIndex': existingEndPartitionIndex,
         'pendingBatches': pendingBatches.map((e) => e.toJson()).toList(),
-        'largeDeletes': largeDeletes.map((k, v) => MapEntry(k, v.toJson())),
-        'largeUpdates': largeUpdates.map((k, v) => MapEntry(k, v.toJson())),
         'tableOps': tableOps.map((k, v) => MapEntry(k, v.toJson())),
         if (directoryMapping != null)
           'directoryMapping': directoryMapping!.toJson(),
@@ -399,8 +192,6 @@ class WalMeta {
         existingStartPartitionIndex: -1,
         existingEndPartitionIndex: -1,
         pendingBatches: <PendingParallelBatch>[],
-        largeDeletes: <String, LargeDeleteMeta>{},
-        largeUpdates: <String, LargeUpdateMeta>{},
         tableOps: <String, TableOpMeta>{},
       );
 
@@ -421,18 +212,6 @@ class WalMeta {
           .map((e) => PendingParallelBatch.fromJson(
               ((e as Map?) ?? const {}).cast<String, dynamic>()))
           .toList(),
-      largeDeletes:
-          ((json['largeDeletes'] as Map?) ?? const <String, dynamic>{}).map(
-              (k, v) => MapEntry(
-                  k.toString(),
-                  LargeDeleteMeta.fromJson(
-                      ((v as Map?) ?? const {}).cast<String, dynamic>()))),
-      largeUpdates:
-          ((json['largeUpdates'] as Map?) ?? const <String, dynamic>{}).map(
-              (k, v) => MapEntry(
-                  k.toString(),
-                  LargeUpdateMeta.fromJson(
-                      ((v as Map?) ?? const {}).cast<String, dynamic>()))),
       tableOps: ((json['tableOps'] as Map?) ?? const <String, dynamic>{}).map(
         (k, v) => MapEntry(
           k.toString(),
@@ -1107,8 +886,6 @@ class WalManager {
       existingStartPartitionIndex: -1,
       existingEndPartitionIndex: -1,
       pendingBatches: _meta.pendingBatches,
-      largeDeletes: _meta.largeDeletes,
-      largeUpdates: _meta.largeUpdates,
       tableOps: _meta.tableOps,
       directoryMapping: null,
       lastRecoveredPointer: null,
@@ -1760,142 +1537,6 @@ class WalManager {
   /// Remove a pending parallel batch by id
   Future<void> removePendingParallelBatch(String batchId) async {
     _meta.pendingBatches.removeWhere((b) => b.batchId == batchId);
-    await persistMeta(flush: false);
-  }
-
-  /// Begin a large delete operation; opId should be globally unique and generated by caller.
-  Future<void> beginLargeDelete({
-    required String opId,
-    required TableUid tableUid,
-    required String spaceName,
-    required Map<String, dynamic> condition,
-    List<String>? orderBy,
-    int? limit,
-    int? offset,
-    String? checkpointCursor,
-  }) async {
-    if (!_config.enableJournal) return;
-    if (!_initialized) {
-      await initializeAndRecover();
-    }
-    _meta.largeDeletes[opId] = LargeDeleteMeta(
-      opId: opId,
-      tableUid: tableUid,
-      spaceName: spaceName,
-      condition: condition,
-      orderBy: orderBy,
-      limit: limit,
-      offset: offset,
-      checkpointCursor: checkpointCursor,
-      deletedSoFar: 0,
-      status: 'running',
-      createdAt: DateTime.now().toIso8601String(),
-    );
-    await persistMeta(flush: false);
-  }
-
-  /// Update checkpoint for a running large delete operation.
-  Future<void> updateLargeDeleteCheckpoint({
-    required String opId,
-    required int deletedSoFar,
-    String? checkpointCursor,
-  }) async {
-    if (!_config.enableJournal) return;
-    final m = _meta.largeDeletes[opId];
-    if (m == null) return;
-    m.deletedSoFar = deletedSoFar;
-    m.checkpointCursor = checkpointCursor;
-    await persistMeta(flush: false);
-  }
-
-  /// Complete and remove a large delete operation from WAL meta.
-  Future<void> completeLargeDelete(String opId) async {
-    if (!_config.enableJournal) return;
-    final m = _meta.largeDeletes[opId];
-    if (m == null) return;
-    m.status = 'completed';
-    // Remove to keep meta compact
-    _meta.largeDeletes.remove(opId);
-    await persistMeta(flush: false);
-  }
-
-  /// Begin a large update operation; opId should be globally unique and generated by caller.
-  Future<void> beginLargeUpdate({
-    required String opId,
-    required TableUid tableUid,
-    required String spaceName,
-    required Map<String, dynamic> condition,
-    required Map<String, dynamic> updateData,
-    List<String>? orderBy,
-    int? limit,
-    int? offset,
-    String? checkpointCursor,
-    bool continueOnPartialErrors = false,
-  }) async {
-    if (!_config.enableJournal) return;
-    if (!_initialized) {
-      await initializeAndRecover();
-    }
-    _meta.largeUpdates[opId] = LargeUpdateMeta(
-      opId: opId,
-      tableUid: tableUid,
-      spaceName: spaceName,
-      condition: condition,
-      updateData: updateData,
-      orderBy: orderBy,
-      limit: limit,
-      offset: offset,
-      checkpointCursor: checkpointCursor,
-      updatedSoFar: 0,
-      status: 'running',
-      createdAt: DateTime.now().toIso8601String(),
-      continueOnPartialErrors: continueOnPartialErrors,
-    );
-    await persistMeta(flush: false);
-  }
-
-  /// Update checkpoint for a running large update operation.
-  Future<void> updateLargeUpdateCheckpoint({
-    required String opId,
-    required int updatedSoFar,
-    String? checkpointCursor,
-  }) async {
-    if (!_config.enableJournal) return;
-    final m = _meta.largeUpdates[opId];
-    if (m == null) return;
-    m.updatedSoFar = updatedSoFar;
-    m.checkpointCursor = checkpointCursor;
-    await persistMeta(flush: false);
-  }
-
-  /// Complete and remove a large update operation from WAL meta.
-  Future<void> completeLargeUpdate(String opId) async {
-    if (!_config.enableJournal) return;
-    final m = _meta.largeUpdates[opId];
-    if (m == null) return;
-    m.status = 'completed';
-    // Remove to keep meta compact
-    _meta.largeUpdates.remove(opId);
-    await persistMeta(flush: false);
-  }
-
-  /// Cancel and remove a large update operation from WAL meta (e.g., on transaction rollback).
-  Future<void> cancelLargeUpdate(String opId) async {
-    if (!_config.enableJournal) return;
-    final m = _meta.largeUpdates[opId];
-    if (m == null) return;
-    // Remove immediately without marking as completed
-    _meta.largeUpdates.remove(opId);
-    await persistMeta(flush: false);
-  }
-
-  /// Cancel and remove a large delete operation from WAL meta.
-  Future<void> cancelLargeDelete(String opId) async {
-    if (!_config.enableJournal) return;
-    final m = _meta.largeDeletes[opId];
-    if (m == null) return;
-    // Remove immediately without marking as completed
-    _meta.largeDeletes.remove(opId);
     await persistMeta(flush: false);
   }
 

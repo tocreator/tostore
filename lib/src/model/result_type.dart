@@ -81,10 +81,12 @@ enum ResultType {
   devIndexNotFound(22003, 'DEV_NOT_FOUND_INDEX', 'Index not found'),
   devSpaceNotFound(22004, 'DEV_NOT_FOUND_SPACE', 'Space not found'),
   devFieldNotFound(22005, 'DEV_NOT_FOUND_FIELD', 'Field not found'),
-  devLargeScaleOperationBypassRequired(
-      23001,
-      'DEV_LARGE_SCALE_OPERATION_REQUIRED_BYPASS',
-      'Large-scale operation requires skipping result details to prevent OOM'),
+  devLargeScaleOperationRequired(23001, 'DEV_LARGE_SCALE_OPERATION_REQUIRED',
+      'Large-scale data operation requires allowLargeScaleOperation() to prevent OOM'),
+  devLargeScaleOperationNotAllowedInTransaction(
+      23002,
+      'DEV_LARGE_SCALE_OPERATION_NOT_ALLOWED_IN_TRANSACTION',
+      'Large-scale data operations are not allowed inside a transaction'),
   devEngineIncompatible(
       24001, 'DEV_ENGINE_INCOMPATIBLE', 'Engine version incompatible',
       isCritical: true),

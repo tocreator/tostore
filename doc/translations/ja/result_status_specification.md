@@ -304,7 +304,8 @@ Dart/Flutterでは、`ResultStatus`と`ResultType`は、手動の範囲チェッ
   | `22001`<br>`devTableNotFound` | テーブルが見つかりません（開発者エラー） | <ul><li>`primaryKey`: `null`</li></ul> |
   | `22003`<br>`devIndexNotFound` | インデックスが見つかりません（開発者エラー） | <ul><li>`primaryKey`: `null`</li></ul> |
   | `22004`<br>`devSpaceNotFound` | スペースが見つかりません（開発者エラー） | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `23001`<br>`devLargeScaleOperationBypassRequired` | OOM防止のため結果詳細のスキップが必要（開発者エラー） | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `23001`<br>`devLargeScaleOperationRequired` | 大規模データ操作には `allowLargeScaleOperation()` が必要（開発者エラー） | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `23002`<br>`devLargeScaleOperationNotAllowedInTransaction` | Large-scale data operation is not allowed inside a transaction (Developer Error) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `24001`<br>`devEngineIncompatible` | **重大**: エンジンバージョン不整合（開発者エラー） | <ul><li>`primaryKey`: `null`</li></ul> |
   | `50003`<br>`sysTransactionLimitExceeded` | メモリ逼迫時にトランザクションのバッファデータが安全な上限を超過（システムエラー） | <ul><li>`primaryKey`: `null`</li></ul> |
   | `50004`<br>`sysMigrationBatchExecutionFailed` | 重大な移行バッチ実行の失敗（システムエラー） | <ul><li>`primaryKey`: `null`</li></ul> |
@@ -494,7 +495,8 @@ try {
 | **22003** | `DEV_NOT_FOUND_INDEX` | `ResultType.devIndexNotFound` | 開発者エラー | インデックスが見つかりません |
 | **22004** | `DEV_NOT_FOUND_SPACE` | `ResultType.devSpaceNotFound` | 開発者エラー | スペースが見つかりません |
 | **22005** | `DEV_NOT_FOUND_FIELD` | `ResultType.devFieldNotFound` | 開発者エラー | フィールドが見つかりません |
-| **23001** | `DEV_LARGE_SCALE_OPERATION_REQUIRED_BYPASS` | `ResultType.devLargeScaleOperationBypassRequired` | 開発者エラー | OOM防止のため結果詳細のスキップが必要 |
+| **23001** | `DEV_LARGE_SCALE_OPERATION_REQUIRED` | `ResultType.devLargeScaleOperationRequired` | 開発者エラー | 大規模データ操作には `allowLargeScaleOperation()` が必要（OOM防止） |
+| **23002** | `DEV_LARGE_SCALE_OPERATION_NOT_ALLOWED_IN_TRANSACTION` | `ResultType.devLargeScaleOperationNotAllowedInTransaction` | Developer Error | Large-scale data operation is not allowed inside a transaction |
 | **24001** | `DEV_ENGINE_INCOMPATIBLE` | `ResultType.devEngineIncompatible` | 開発者エラー | **重大**: エンジンバージョン不整合 |
 | **30000** | `DEV_INVALID_SCHEMA` | `ResultType.devInvalidSchema` | 開発者エラー | 無効なテーブルスキーマ定義 |
 | **30001** | `DEV_INVALID_SCHEMA_TABLE_NAME` | `ResultType.devInvalidSchemaTableName` | 開発者エラー | テーブル名検証エラー |

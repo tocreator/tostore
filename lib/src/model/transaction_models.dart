@@ -183,42 +183,6 @@ class TransactionMainMeta {
   }
 }
 
-/// Heavy delete plan descriptor for deferred execution at commit time
-class HeavyDeletePlan {
-  final TableUid tableUid;
-  final Map<String, dynamic> condition; // normalized QueryCondition.build()
-  final List<String>? orderBy;
-  final int? limit;
-  final int? offset;
-
-  const HeavyDeletePlan({
-    required this.tableUid,
-    required this.condition,
-    this.orderBy,
-    this.limit,
-    this.offset,
-  });
-}
-
-/// Heavy update plan descriptor for deferred execution at commit time
-class HeavyUpdatePlan {
-  final TableUid tableUid;
-  final Map<String, dynamic> condition; // normalized QueryCondition.build()
-  final Map<String, dynamic> updateData; // data to update
-  final List<String>? orderBy;
-  final int? limit;
-  final int? offset;
-
-  const HeavyUpdatePlan({
-    required this.tableUid,
-    required this.condition,
-    required this.updateData,
-    this.orderBy,
-    this.limit,
-    this.offset,
-  });
-}
-
 /// Compact commit plan persisted at commit time for crash recovery.
 ///
 /// Disk encoding is binary ([TxnEncoder]); this model stays Map-based in memory.
@@ -230,16 +194,11 @@ class TransactionCommitPlan {
       updates; // table -> records (full)
   final Map<String, List<Map<String, dynamic>>>
       deletes; // table -> records (full)
-  final List<HeavyDeletePlan> heavyDeletes; // deferred heavy delete tasks
-  final List<HeavyUpdatePlan> heavyUpdates; // deferred heavy update tasks
 
   TransactionCommitPlan({
     required this.transactionId,
     required this.inserts,
     required this.updates,
     required this.deletes,
-    List<HeavyDeletePlan>? heavyDeletes,
-    List<HeavyUpdatePlan>? heavyUpdates,
-  })  : heavyDeletes = heavyDeletes ?? const <HeavyDeletePlan>[],
-        heavyUpdates = heavyUpdates ?? const <HeavyUpdatePlan>[];
+  });
 }

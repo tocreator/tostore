@@ -42,7 +42,6 @@ import '../model/table_info.dart';
 import '../model/table_meta.dart';
 import '../model/table_op_meta.dart';
 import '../model/table_schema.dart';
-import '../model/transaction_models.dart';
 import '../model/transaction_result.dart';
 import '../model/unique_violation.dart';
 import '../query/query_condition.dart';
@@ -57,7 +56,6 @@ import 'cache_manager.dart';
 import 'compaction_manager.dart';
 import 'compute/batch_identifier_compute.dart';
 import 'compute/batch_insert_compute.dart';
-import 'compute/batch_match_runner.dart';
 import 'compute/batch_update_compute.dart';
 import 'compute/compute_batch_planner.dart';
 import 'compute/kv_batch_prepare_compute.dart';
@@ -890,8 +888,6 @@ class DataStoreImpl {
           await parallelJournalManager.start();
 
           if (!isMigrationInstance) {
-            await LargeOperationRunner.runPendingOperations(this);
-
             // Recover unfinished transactions (commit plans or rollbacks)
             await transactionManager!.recoverUnfinishedTransactionsOnStartup();
 
@@ -1749,17 +1745,6 @@ class DataStoreImpl {
 
       final recordId = validData[schema.primaryKey].toString();
 
-      // Check and record conflicts for running large background operations
-      if ((walManager.meta.largeDeletes.isNotEmpty ||
-              walManager.meta.largeUpdates.isNotEmpty) &&
-          !tableName.startsWith('_system_temp_op_conflict_')) {
-        await _checkAndRecordConflictsForBatch(
-          table,
-          [validData],
-          action: 'insert',
-        );
-      }
-
       // 3. Reservation based: try reserve unique keys first to lock the buffer
       try {
         writeBufferManager.tryReserveUniques(
@@ -2441,7 +2426,13 @@ class DataStoreImpl {
     );
   }
 
-  /// update record
+  /// Engine-facing update.
+  ///
+  /// Defaults allow large-scale ops ([allowLargeScaleOperation] true) while
+  /// still collecting per-row details on the normal path ([returnResultDetails]
+  /// true). Public builders must pass [allowLargeScaleOperation] false unless
+  /// the user chained [UpdateBuilder.allowLargeScaleOperation]. Large-scale
+  /// path never returns primary-key lists (only [DbResult.successCount]).
   ///
   /// [enablePromoteDualWrite] user-facing default true; engine/migration must
   /// pass false to avoid promote old->shadow recursion.
@@ -2454,11 +2445,8 @@ class DataStoreImpl {
     int? offset,
     bool allowAll = false,
     bool continueOnPartialErrors = false,
-    // Optional checkpoint to resume heavy update from a previous cursor and updated count
-    int? checkpointUpdatedSoFar,
-    String? checkpointOpId,
-    String? checkpointCursor,
     bool returnResultDetails = true,
+    bool allowLargeScaleOperation = true,
     bool enablePromoteDualWrite = true,
   }) async {
     final tableName = table.tableName;
@@ -2628,143 +2616,133 @@ class DataStoreImpl {
 
       // Check if condition is an equality on primary key or unique field - this can be optimized
       bool isOptimizableQuery = false;
-      // If resuming a large update from checkpoint, force heavy path (disable optimizable branch)
-      if (checkpointOpId == null) {
-        // Small table heuristics: always optimize when
-        // - table data meta is unknown or size invalid
-        // - size < 5MB (unconditional minimum threshold)
-        // - size < 30% of record cache size
-        const int minSmallTableBytes = 5 * 1024 * 1024; // 5MB
-        if (tableDataMeta == null ||
-            tableDataMeta.totalSizeBytes < minSmallTableBytes ||
-            tableDataMeta.totalSizeBytes < recordCacheSize * 0.3) {
-          isOptimizableQuery = true;
-        }
-
-        if (!isOptimizableQuery) {
-          // Analyze condition to check if it's a primary key/unique/index-driven operation
-          if (!condition.isEmpty) {
-            // Heuristic 2: primary key queries for equality-like ops only (=, IN, BETWEEN)
-            if (conditionMap.containsKey(primaryKey)) {
-              final pkCond = conditionMap[primaryKey];
-              if (pkCond is Map<String, dynamic>) {
-                const supportedOps = ['=', 'IN', 'BETWEEN'];
-                for (final op in supportedOps) {
-                  if (pkCond.containsKey(op)) {
-                    isOptimizableQuery = true;
-                    break;
-                  }
-                }
-              } else {
-                // Direct equality value
-                isOptimizableQuery = true;
-              }
-            }
-
-            // Heuristic 3: unique field equality or IN (range operators are excluded)
-            if (!isOptimizableQuery) {
-              final uniqueFieldNames = <String>{};
-              final allIndexes =
-                  tableMetaManager?.getUniqueIndexesFor(schema) ??
-                      <IndexSchema>[];
-              for (final index in allIndexes) {
-                if (index.fields.length == 1) {
-                  uniqueFieldNames.add(index.fields[0]);
-                }
-              }
-              for (final fname in uniqueFieldNames) {
-                if (conditionMap.containsKey(fname)) {
-                  final v = conditionMap[fname];
-                  if (v is Map<String, dynamic>) {
-                    if (v.containsKey('=') || v.containsKey('IN')) {
-                      isOptimizableQuery = true;
-                      break;
-                    }
-                  } else {
-                    isOptimizableQuery = true;
-                    break;
-                  }
-                }
-              }
-            }
-          }
-
-          // If limit is not null and less than 200000, set isOptimizableQuery to true
-          if (limit != null && limit < 200000) {
-            isOptimizableQuery = true;
-            if (offset != null && offset > 200000) {
-              isOptimizableQuery = false;
-            }
-          }
-        }
-      } else {
-        isOptimizableQuery = false;
+      // Small table heuristics: always optimize when
+      // - table data meta is unknown or size invalid
+      // - size < 5MB (unconditional minimum threshold)
+      // - size < 30% of record cache size
+      const int minSmallTableBytes = 50 * 1024 * 1024; // 50MB
+      if (tableDataMeta == null ||
+          tableDataMeta.totalSizeBytes < minSmallTableBytes ||
+          tableDataMeta.totalSizeBytes < recordCacheSize * 0.3) {
+        isOptimizableQuery = true;
       }
 
-      // If inside a transaction and this is a heavy update path, we should defer execution
+      if (!isOptimizableQuery) {
+        // Analyze condition to check if it's a primary key/unique/index-driven operation
+        if (!condition.isEmpty) {
+          // Heuristic 2: primary key queries for equality-like ops only (=, IN, BETWEEN)
+          if (conditionMap.containsKey(primaryKey)) {
+            final pkCond = conditionMap[primaryKey];
+            if (pkCond is Map<String, dynamic>) {
+              const supportedOps = ['=', 'IN', 'BETWEEN'];
+              for (final op in supportedOps) {
+                if (pkCond.containsKey(op)) {
+                  isOptimizableQuery = true;
+                  break;
+                }
+              }
+            } else {
+              // Direct equality value
+              isOptimizableQuery = true;
+            }
+          }
+
+          // Heuristic 3: unique field equality or IN (range operators are excluded)
+          if (!isOptimizableQuery) {
+            final uniqueFieldNames = <String>{};
+            final allIndexes = tableMetaManager?.getUniqueIndexesFor(schema) ??
+                <IndexSchema>[];
+            for (final index in allIndexes) {
+              if (index.fields.length == 1) {
+                uniqueFieldNames.add(index.fields[0]);
+              }
+            }
+            for (final fname in uniqueFieldNames) {
+              if (conditionMap.containsKey(fname)) {
+                final v = conditionMap[fname];
+                if (v is Map<String, dynamic>) {
+                  if (v.containsKey('=') || v.containsKey('IN')) {
+                    isOptimizableQuery = true;
+                    break;
+                  }
+                } else {
+                  isOptimizableQuery = true;
+                  break;
+                }
+              }
+            }
+          }
+        }
+
+        // If limit is not null and less than 200000, set isOptimizableQuery to true
+        if (limit != null && limit < 200000) {
+          isOptimizableQuery = true;
+          if (offset != null && offset > 200000) {
+            isOptimizableQuery = false;
+          }
+        }
+      }
+
+      // Large-scale data update path: engine defaults allow; public API must opt in
       if (!isOptimizableQuery) {
         if (promoteDesc != null) {
           return finish(_promoteRejectLargeOp(tableName, 'update'));
         }
-        if (returnResultDetails) {
+        if (!allowLargeScaleOperation) {
+          const message =
+              'This is a large-scale data update operation. To prevent memory overflow, you must explicitly call allowLargeScaleOperation(). The operation will run in background batches and block until completion; success/failure primary keys and per-row status details are not returned. If interrupted, already-persisted changes are kept and you must retry to continue.';
+          Logger.warn(message);
           return finish(DbResult.error(
-            type: ResultType.devLargeScaleOperationBypassRequired,
-            message:
-                'This is a large-scale update operation. To prevent memory overflow, you must explicitly call skipResultDetails() to bypass detailed results collection.',
+            type: ResultType.devLargeScaleOperationRequired,
+            message: message,
           ));
         }
-        // Heavy update branch
-        if (txId != null && !TransactionContext.isApplyingCommit()) {
-          // Defer heavy update within transaction: record plan only and return success
-          final hu = HeavyUpdatePlan(
-            tableUid: table.tableUid,
-            condition: conditionMap,
-            updateData: validData,
-            orderBy: orderBy,
-            limit: limit,
-            offset: offset,
-          );
-          transactionManager?.registerDeferredHeavyUpdate(txId, hu);
-          return finish(DbResult.success(
-            message: 'Deferred heavy update recorded in transaction',
+        // Large-scale ops are not supported in transactions (would buffer unbounded work).
+        // Returning DbResult.error triggers transaction rollback when rollbackOnError is set.
+        if (txId != null) {
+          const message =
+              'Large-scale data update is not allowed inside a transaction. '
+              'Run it outside the transaction with allowLargeScaleOperation().';
+          Logger.warn(message);
+          return finish(DbResult.error(
+            type: ResultType.devLargeScaleOperationNotAllowedInTransaction,
+            message: message,
           ));
         }
 
-        // Heavy update execution path (not in transaction or during commit).
-        // Instead of running queryEachBatch synchronously, we register it as a WAL large update operation
-        // and delegate actual processing to the background LargeOperationRunner.
-        final largeUpdateOpId =
-            checkpointOpId ?? GlobalIdGenerator.generate('large_update_');
-
-        if (checkpointOpId == null) {
-          await walManager.beginLargeUpdate(
+        final largeUpdateOpId = GlobalIdGenerator.generate('large_update_');
+        final outcome = await LargeOperationRunner.runLargeUpdate(
+          this,
+          LargeUpdateRequest(
             opId: largeUpdateOpId,
             tableUid: table.tableUid,
-            spaceName: schema.isGlobal ? '__global__' : currentSpaceName,
             condition: conditionMap,
             updateData: validData,
             orderBy: orderBy,
             limit: limit,
             offset: offset,
             continueOnPartialErrors: continueOnPartialErrors,
-          );
+          ),
+        );
+        if (outcome.hasErrors) {
+          return finish(DbResult.batch(
+            statuses: outcome.errorStatuses,
+            successCount: outcome.successCount,
+            failedCount: outcome.errorStatuses.length,
+            hasErrors: true,
+          ));
         }
 
-        // Ensure system temporary table exists for conflict tracking
-        final tempConflictTableName =
-            '_system_temp_op_conflict_$largeUpdateOpId';
-        if (!await tableExists(tempConflictTableName)) {
-          await _createSystemTempOpConflictTable(
-              largeUpdateOpId, schema.isGlobal);
-        }
-
-        // Trigger background runner asynchronously
-        unawaited(LargeOperationRunner.runPendingOperations(this)
-            .catchError((_) {}, test: (e) => e is DbClosedException));
-
-        return finish(DbResult.success(
-          message:
-              'Large update operation started asynchronously in the background (opId: $largeUpdateOpId).',
+        return finish(DbResult(
+          statuses: [
+            SuccessStatus(
+              message:
+                  'Large-scale data update completed (${outcome.successCount} records).',
+            ),
+          ],
+          successCount: outcome.successCount,
+          failedCount: 0,
+          hasErrors: false,
         ));
       } else {
         // Optimizable query path: use regular method
@@ -2896,20 +2874,6 @@ class DataStoreImpl {
           validData,
           records,
         );
-
-        // Check and record conflicts for running large background operations
-        if ((walManager.meta.largeDeletes.isNotEmpty ||
-                walManager.meta.largeUpdates.isNotEmpty) &&
-            !tableName.startsWith('_system_temp_op_conflict_')) {
-          final newRecords =
-              preparedRecords.map((x) => x.updatedRecord).toList();
-          await _checkAndRecordConflictsForBatch(
-            table,
-            newRecords,
-            action: 'update',
-            oldRecords: records,
-          );
-        }
 
         for (int recordIndex = 0; recordIndex < records.length; recordIndex++) {
           final y3 = yieldController.maybeYield();
@@ -3383,7 +3347,13 @@ class DataStoreImpl {
     }
   }
 
-  /// delete record
+  /// Engine-facing delete. Defaults allow large-scale ops ([allowLargeScaleOperation]
+  /// true) while still collecting per-row details on the normal path
+  /// ([returnResultDetails] true). Public builders must pass
+  /// [allowLargeScaleOperation] false unless the user chained
+  /// [DeleteBuilder.allowLargeScaleOperation]. Large-scale path never returns
+  /// primary-key lists (only [DbResult.successCount]), regardless of
+  /// [returnResultDetails].
   Future<DbResult> deleteInternal(
     TableContext table,
     QueryCondition condition, {
@@ -3391,11 +3361,8 @@ class DataStoreImpl {
     int? limit,
     int? offset,
     bool allowAll = false,
-    // Optional checkpoint to resume heavy delete from a previous cursor and deleted count
-    int? checkpointDeletedSoFar,
-    String? checkpointOpId,
-    String? checkpointCursor,
     bool returnResultDetails = true,
+    bool allowLargeScaleOperation = true,
     bool enablePromoteDualWrite = true,
   }) async {
     final tableName = table.tableName;
@@ -3478,86 +3445,134 @@ class DataStoreImpl {
 
       // Check if condition is an equality on primary key or unique field - this can be optimized
       bool isOptimizableQuery = false;
-      // If resuming a large delete from checkpoint, force heavy path (disable optimizable branch)
-      if (checkpointOpId == null) {
-        // Small table heuristics: always optimize when
-        // - table data meta is unknown or size invalid
-        // - size < 5MB (unconditional minimum threshold)
-        // - size < 30% of record cache size
-        const int minSmallTableBytes = 5 * 1024 * 1024; // 5MB
-        if (tableDataMeta == null ||
-            tableDataMeta.totalSizeBytes < minSmallTableBytes ||
-            tableDataMeta.totalSizeBytes < recordCacheSize * 0.3) {
+      // Small table heuristics: always optimize when
+      // - table data meta is unknown or size invalid
+      // - size < 5MB (unconditional minimum threshold)
+      // - size < 30% of record cache size
+      const int minSmallTableBytes = 50 * 1024 * 1024; // 50MB
+      if (tableDataMeta == null ||
+          tableDataMeta.totalSizeBytes < minSmallTableBytes ||
+          tableDataMeta.totalSizeBytes < recordCacheSize * 0.3) {
+        isOptimizableQuery = true;
+      }
+
+      if (!isOptimizableQuery) {
+        // Analyze condition to check if it's a primary key/unique/index-driven operation
+        if (!condition.isEmpty) {
+          // Heuristic 2: primary key queries for equality-like ops only (=, IN, BETWEEN)
+          if (conditionMap.containsKey(primaryKey)) {
+            final pkCond = conditionMap[primaryKey];
+            if (pkCond is Map<String, dynamic>) {
+              const supportedOps = ['=', 'IN', 'BETWEEN'];
+              for (final op in supportedOps) {
+                if (pkCond.containsKey(op)) {
+                  isOptimizableQuery = true;
+                  break;
+                }
+              }
+            } else {
+              // Direct equality value
+              isOptimizableQuery = true;
+            }
+          }
+
+          // Heuristic 3: unique field equality or IN (range operators are excluded)
+          if (!isOptimizableQuery) {
+            final uniqueFieldNames = <String>{};
+            final allIndexes = tableMetaManager?.getUniqueIndexesFor(schema) ??
+                <IndexSchema>[];
+            for (final index in allIndexes) {
+              if (index.fields.length == 1) {
+                uniqueFieldNames.add(index.fields[0]);
+              }
+            }
+            for (final fname in uniqueFieldNames) {
+              if (conditionMap.containsKey(fname)) {
+                final v = conditionMap[fname];
+                if (v is Map<String, dynamic>) {
+                  if (v.containsKey('=') || v.containsKey('IN')) {
+                    isOptimizableQuery = true;
+                    break;
+                  }
+                } else {
+                  isOptimizableQuery = true;
+                  break;
+                }
+              }
+            }
+          }
+        }
+
+        // If limit is not null and less than 200000, set isOptimizableQuery to true
+        if (limit != null && limit < 200000) {
           isOptimizableQuery = true;
-        }
-
-        if (!isOptimizableQuery) {
-          // Analyze condition to check if it's a primary key/unique/index-driven operation
-          if (!condition.isEmpty) {
-            // Heuristic 2: primary key queries for equality-like ops only (=, IN, BETWEEN)
-            if (conditionMap.containsKey(primaryKey)) {
-              final pkCond = conditionMap[primaryKey];
-              if (pkCond is Map<String, dynamic>) {
-                const supportedOps = ['=', 'IN', 'BETWEEN'];
-                for (final op in supportedOps) {
-                  if (pkCond.containsKey(op)) {
-                    isOptimizableQuery = true;
-                    break;
-                  }
-                }
-              } else {
-                // Direct equality value
-                isOptimizableQuery = true;
-              }
-            }
-
-            // Heuristic 3: unique field equality or IN (range operators are excluded)
-            if (!isOptimizableQuery) {
-              final uniqueFieldNames = <String>{};
-              final allIndexes =
-                  tableMetaManager?.getUniqueIndexesFor(schema) ??
-                      <IndexSchema>[];
-              for (final index in allIndexes) {
-                if (index.fields.length == 1) {
-                  uniqueFieldNames.add(index.fields[0]);
-                }
-              }
-              for (final fname in uniqueFieldNames) {
-                if (conditionMap.containsKey(fname)) {
-                  final v = conditionMap[fname];
-                  if (v is Map<String, dynamic>) {
-                    if (v.containsKey('=') || v.containsKey('IN')) {
-                      isOptimizableQuery = true;
-                      break;
-                    }
-                  } else {
-                    isOptimizableQuery = true;
-                    break;
-                  }
-                }
-              }
-            }
-          }
-
-          // If limit is not null and less than 200000, set isOptimizableQuery to true
-          if (limit != null && limit < 200000) {
-            isOptimizableQuery = true;
-            if (offset != null && offset > 200000) {
-              isOptimizableQuery = false;
-            }
+          if (offset != null && offset > 200000) {
+            isOptimizableQuery = false;
           }
         }
-      } else {
-        isOptimizableQuery = false;
       }
 
-      // when table record count is less than threshold or this is an optimizable query, use regular method
-      if (!isOptimizableQuery && promoteDesc != null) {
-        return finish(_promoteRejectLargeOp(tableName, 'delete'));
+      // Large-scale data delete path: engine defaults allow; public API must opt in
+      if (!isOptimizableQuery) {
+        if (promoteDesc != null) {
+          return finish(_promoteRejectLargeOp(tableName, 'delete'));
+        }
+        if (!allowLargeScaleOperation) {
+          const message =
+              'This is a large-scale data delete operation. To prevent memory overflow, you must explicitly call allowLargeScaleOperation(). The operation will run in background batches and block until completion; success/failure primary keys and per-row status details are not returned. If interrupted, already-persisted changes are kept and you must retry to continue.';
+          Logger.warn(message);
+          return finish(DbResult.error(
+            type: ResultType.devLargeScaleOperationRequired,
+            message: message,
+          ));
+        }
+        if (txId != null) {
+          const message =
+              'Large-scale data delete is not allowed inside a transaction. '
+              'Run it outside the transaction with allowLargeScaleOperation().';
+          Logger.warn(message);
+          return finish(DbResult.error(
+            type: ResultType.devLargeScaleOperationNotAllowedInTransaction,
+            message: message,
+          ));
+        }
+
+        final largeDeleteOpId = GlobalIdGenerator.generate('large_delete_');
+        final outcome = await LargeOperationRunner.runLargeDelete(
+          this,
+          LargeDeleteRequest(
+            opId: largeDeleteOpId,
+            tableUid: table.tableUid,
+            condition: conditionMap,
+            orderBy: orderBy,
+            limit: limit,
+            offset: offset,
+          ),
+        );
+        if (outcome.hasErrors) {
+          return finish(DbResult.batch(
+            statuses: outcome.errorStatuses,
+            successCount: outcome.successCount,
+            failedCount: outcome.errorStatuses.length,
+            hasErrors: true,
+          ));
+        }
+
+        return finish(DbResult(
+          statuses: [
+            SuccessStatus(
+              message:
+                  'Large-scale data delete completed (${outcome.successCount} records).',
+            ),
+          ],
+          successCount: outcome.successCount,
+          failedCount: 0,
+          hasErrors: false,
+        ));
       }
 
-      if (isOptimizableQuery) {
-        // standard method: get all records
+      // Optimizable path: get all matching records
+      {
         // Use a large internal limit when limit is null to avoid default QueryLimit (e.g. 1000)
         final int effectiveLimit = limit ?? 1000000000;
         final recordsToDelete = (await queryExecutor.execute(
@@ -3574,17 +3589,6 @@ class DataStoreImpl {
             message: 'No records found to delete',
             successKeys: [],
           ));
-        }
-
-        // Check and record conflicts for running large background operations
-        if ((walManager.meta.largeDeletes.isNotEmpty ||
-                walManager.meta.largeUpdates.isNotEmpty) &&
-            !tableName.startsWith('_system_temp_op_conflict_')) {
-          await _checkAndRecordConflictsForBatch(
-            table,
-            recordsToDelete,
-            action: 'delete',
-          );
         }
 
         // Handle foreign key constraints: RESTRICT must be checked immediately, CASCADE can be deferred
@@ -3734,61 +3738,6 @@ class DataStoreImpl {
         return finish(DbResult.success(
           successKeys: successKeys,
           message: 'Successfully deleted ${successKeys.length} records',
-        ));
-      } else {
-        if (returnResultDetails) {
-          return finish(DbResult.error(
-            type: ResultType.devLargeScaleOperationBypassRequired,
-            message:
-                'This is a large-scale delete operation. To prevent memory overflow, you must explicitly call skipResultDetails() to bypass detailed results collection.',
-          ));
-        }
-        // Heavy delete branch
-        if (txId != null && !TransactionContext.isApplyingCommit()) {
-          // Defer heavy delete within transaction: record plan only and return success
-          final hd = HeavyDeletePlan(
-            tableUid: table.tableUid,
-            condition: conditionMap,
-            orderBy: orderBy,
-            limit: limit,
-            offset: offset,
-          );
-          transactionManager?.registerDeferredHeavyDelete(txId, hd);
-          return finish(DbResult.success(
-            message: 'Deferred heavy delete recorded in transaction',
-          ));
-        }
-
-        final largeDeleteOpId =
-            checkpointOpId ?? GlobalIdGenerator.generate('large_delete_');
-
-        if (checkpointOpId == null) {
-          await walManager.beginLargeDelete(
-            opId: largeDeleteOpId,
-            tableUid: table.tableUid,
-            spaceName: schema.isGlobal ? '__global__' : currentSpaceName,
-            condition: conditionMap,
-            orderBy: orderBy,
-            limit: limit,
-            offset: offset,
-          );
-        }
-
-        // Ensure system temporary table exists for conflict tracking
-        final tempConflictTableName =
-            '_system_temp_op_conflict_$largeDeleteOpId';
-        if (!await tableExists(tempConflictTableName)) {
-          await _createSystemTempOpConflictTable(
-              largeDeleteOpId, schema.isGlobal);
-        }
-
-        // Trigger background runner asynchronously
-        unawaited(LargeOperationRunner.runPendingOperations(this)
-            .catchError((_) {}, test: (e) => e is DbClosedException));
-
-        return finish(DbResult.success(
-          message:
-              'Large delete operation started asynchronously in the background (opId: $largeDeleteOpId).',
         ));
       }
     } catch (e) {
@@ -4351,12 +4300,6 @@ class DataStoreImpl {
 
       final TableSchema tableSchema = schema;
       final primaryKey = tableSchema.primaryKey;
-      // Snapshot once before the flush loop: hot path only reads this bool.
-      // Evaluate isEmpty first so the common "no large ops" path skips startsWith.
-      final bool needLargeOpConflictCheck =
-          (walManager.meta.largeDeletes.isNotEmpty ||
-                  walManager.meta.largeUpdates.isNotEmpty) &&
-              !tableName.startsWith('_system_temp_op_conflict_');
       // Cache unique indexes for this table once per batch to avoid repeated
       // tableMetaManager lookups inside the hot record loop.
       final uniqueIndexesForTable =
@@ -4662,14 +4605,6 @@ class DataStoreImpl {
 
             if (batchRecordsForBuffer.isEmpty) {
               return false;
-            }
-
-            if (needLargeOpConflictCheck) {
-              await _checkAndRecordConflictsForBatch(
-                table,
-                batchRecordsForBuffer,
-                action: 'insert',
-              );
             }
 
             final bufferResult = await tableDataManager.addBatchToBuffer(
@@ -5530,12 +5465,6 @@ class DataStoreImpl {
     final primaryKey = schema.primaryKey;
     final allUniqueIndexes =
         tableMetaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
-    // Snapshot once before the sub-batch loop: hot path only reads this bool.
-    // Evaluate isEmpty first so the common "no large ops" path skips startsWith.
-    final bool needLargeOpConflictCheck =
-        (walManager.meta.largeDeletes.isNotEmpty ||
-                walManager.meta.largeUpdates.isNotEmpty) &&
-            !tableName.startsWith('_system_temp_op_conflict_');
 
     final successKeys = <String>[];
     final failedKeys = <String>[];
@@ -6082,15 +6011,6 @@ class DataStoreImpl {
 
         // 10.2: Single atomic batch commit to TableDataManager
         if (recordsToCommit.isNotEmpty) {
-          if (needLargeOpConflictCheck) {
-            await _checkAndRecordConflictsForBatch(
-              table,
-              recordsToCommit,
-              action: 'update',
-              oldRecords: oldRecordsToCommit,
-            );
-          }
-
           final Map<String, Map<String, dynamic>> oldRecordsMap = {};
           for (int k = 0; k < recordsToCommit.length; k++) {
             final rec = recordsToCommit[k];
@@ -7761,19 +7681,18 @@ class DataStoreImpl {
   }
 
   DbResult _promoteRejectLargeOp(String tableName, String op) {
+    final message =
+        'Table "$tableName" is running promoteFieldToPrimaryKey; $op with a '
+        'non-optimizable (large-scale data) condition may cause memory exhaustion. '
+        'Narrow the query scope or wait until promote completes, then retry.';
+    Logger.warn(message);
     return DbResult.error(
       type: ResultType.devMigrationPromoteLargeOpNotAllowed,
-      message:
-          'Table "$tableName" is running promoteFieldToPrimaryKey; $op with a '
-          'non-optimizable (large-range) condition may cause memory exhaustion. '
-          'Narrow the query scope or wait until promote completes, then retry.',
+      message: message,
       statuses: [
         SchemaValidationStatus(
           type: ResultType.devMigrationPromoteLargeOpNotAllowed,
-          message:
-              'Table "$tableName" is running promoteFieldToPrimaryKey; $op with a '
-              'non-optimizable (large-range) condition may cause memory exhaustion. '
-              'Narrow the query scope or wait until promote completes, then retry.',
+          message: message,
           tableName: tableName,
         ),
       ],
@@ -8267,222 +8186,6 @@ class DataStoreImpl {
       }
     }
     return result;
-  }
-
-  /// Creates a system temporary table for operational conflict tracking.
-  Future<void> _createSystemTempOpConflictTable(
-      String opId, bool isGlobal) async {
-    final tempTableName = '_system_temp_op_conflict_$opId';
-    final tempSchema = TableSchema(
-      name: tempTableName,
-      primaryKeyConfig: const PrimaryKeyConfig(
-        name: 'primaryKey',
-        type: PrimaryKeyType.none,
-      ),
-      fields: const [
-        FieldSchema(
-          name: 'skipFlag',
-          type: DataType.integer,
-          nullable: false,
-        ),
-        FieldSchema(
-          name: 'conflictFields',
-          type: DataType.text,
-          nullable: true,
-        ),
-      ],
-      isGlobal: isGlobal,
-    );
-    final createResult = await createTable(tempSchema, isSystemTable: true);
-    if (createResult.hasErrors) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message:
-              'Failed to create conflict temporary table for operation $opId: ${createResult.statuses.isNotEmpty ? createResult.statuses.first.message : "unknown error"}',
-        ),
-      ]);
-    }
-  }
-
-  /// Performs conflict checks and writes flags to corresponding system conflict tables for multiple records.
-  Future<void> _checkAndRecordConflictsForBatch(
-    TableContext table,
-    List<Map<String, dynamic>> records, {
-    required String action, // 'insert', 'update', 'delete'
-    List<Map<String, dynamic>>? oldRecords, // required for 'update'
-  }) async {
-    if (walManager.meta.largeDeletes.isEmpty &&
-        walManager.meta.largeUpdates.isEmpty) {
-      return;
-    }
-    final tableName = table.tableName;
-    if (tableName.startsWith('_system_temp_op_conflict_')) return;
-    if (records.isEmpty) return;
-
-    final schema = table.schema;
-    if (schema.name.isEmpty) return;
-    final primaryKey = schema.primaryKey;
-
-    // Scan running largeDeletes
-    for (final op in walManager.meta.largeDeletes.values) {
-      if (op.status == 'completed') continue;
-      final isSpaceMatch = schema.isGlobal
-          ? op.spaceName == '__global__'
-          : op.spaceName == currentSpaceName;
-      if (!isSpaceMatch) continue;
-      if (!await tableMetaManager!
-          .tableFieldMatches(op.tableUid, table.tableUid)) {
-        continue;
-      }
-
-      final conflictTable = '_system_temp_op_conflict_${op.opId}';
-
-      if (action == 'insert') {
-        final matchResult = await ConditionBatchMatcher.matchRecordIndices(
-          schema: schema,
-          table: table,
-          condition: op.condition,
-          records: records,
-          estimateRecordBytes: tableDataManager.resolveRecordSizeBytes,
-        );
-        for (final idx in matchResult.matchedIndices) {
-          final rec = records[idx];
-          final pk = rec[primaryKey]?.toString();
-          if (pk != null) {
-            await _writeConflictFlag(conflictTable, pk, 1, null);
-          }
-        }
-      } else if (action == 'update') {
-        final matchResult = await ConditionBatchMatcher.matchRecordIndices(
-          schema: schema,
-          table: table,
-          condition: op.condition,
-          records: records, // new values
-          estimateRecordBytes: tableDataManager.resolveRecordSizeBytes,
-        );
-        for (final idx in matchResult.matchedIndices) {
-          final rec = records[idx];
-          final pk = rec[primaryKey]?.toString();
-          if (pk != null) {
-            await _writeConflictFlag(conflictTable, pk, 1, null);
-          }
-        }
-      }
-    }
-
-    // Scan running largeUpdates
-    for (final op in walManager.meta.largeUpdates.values) {
-      if (op.status == 'completed') continue;
-      final isSpaceMatch = schema.isGlobal
-          ? op.spaceName == '__global__'
-          : op.spaceName == currentSpaceName;
-      if (!isSpaceMatch) continue;
-      if (!await tableMetaManager!
-          .tableFieldMatches(op.tableUid, table.tableUid)) {
-        continue;
-      }
-
-      final conflictTable = '_system_temp_op_conflict_${op.opId}';
-
-      if (action == 'insert') {
-        final matchResult = await ConditionBatchMatcher.matchRecordIndices(
-          schema: schema,
-          table: table,
-          condition: op.condition,
-          records: records,
-          estimateRecordBytes: tableDataManager.resolveRecordSizeBytes,
-        );
-        for (final idx in matchResult.matchedIndices) {
-          final rec = records[idx];
-          final pk = rec[primaryKey]?.toString();
-          if (pk != null) {
-            await _writeConflictFlag(conflictTable, pk, 1, null);
-          }
-        }
-      } else if (action == 'delete') {
-        final matchResult = await ConditionBatchMatcher.matchRecordIndices(
-          schema: schema,
-          table: table,
-          condition: op.condition,
-          records: records,
-          estimateRecordBytes: tableDataManager.resolveRecordSizeBytes,
-        );
-        for (final idx in matchResult.matchedIndices) {
-          final rec = records[idx];
-          final pk = rec[primaryKey]?.toString();
-          if (pk != null) {
-            await _writeConflictFlag(conflictTable, pk, 1, null);
-          }
-        }
-      } else if (action == 'update') {
-        if (oldRecords == null || oldRecords.length != records.length) continue;
-
-        final matchOldResult = await ConditionBatchMatcher.matchRecordIndices(
-          schema: schema,
-          table: table,
-          condition: op.condition,
-          records: oldRecords,
-          estimateRecordBytes: tableDataManager.resolveRecordSizeBytes,
-        );
-
-        final matchedOldIndicesSet = matchOldResult.matchedIndices.toSet();
-
-        for (final idx in matchOldResult.matchedIndices) {
-          final oldRec = oldRecords[idx];
-          final newRec = records[idx];
-          final pk = oldRec[primaryKey]?.toString();
-          if (pk != null) {
-            final overlap = <String>[];
-            for (final key in newRec.keys) {
-              if (newRec[key] != oldRec[key] &&
-                  op.updateData.containsKey(key)) {
-                overlap.add(key);
-              }
-            }
-            // Always record conflict skipFlag = 2 even if overlap is empty, to enable incremental catch-up processing
-            await _writeConflictFlag(conflictTable, pk, 2, overlap.join(','));
-          }
-        }
-
-        final matchNewResult = await ConditionBatchMatcher.matchRecordIndices(
-          schema: schema,
-          table: table,
-          condition: op.condition,
-          records: records, // new values
-          estimateRecordBytes: tableDataManager.resolveRecordSizeBytes,
-        );
-
-        for (final idx in matchNewResult.matchedIndices) {
-          if (matchedOldIndicesSet.contains(idx)) continue;
-          final rec = records[idx];
-          final pk = rec[primaryKey]?.toString();
-          if (pk != null) {
-            await _writeConflictFlag(conflictTable, pk, 1, null);
-          }
-        }
-      }
-    }
-  }
-
-  /// Writes conflict flag to the conflict system temporary table.
-  Future<void> _writeConflictFlag(
-    String conflictTable,
-    String recordId,
-    int skipFlag,
-    String? conflictFields,
-  ) async {
-    try {
-      final data = {
-        'primaryKey': recordId,
-        'skipFlag': skipFlag,
-        if (conflictFields != null) 'conflictFields': conflictFields,
-      };
-      await upsert(conflictTable, data);
-    } catch (e) {
-      Logger.error('Failed to write conflict flag to $conflictTable',
-          rawError: e);
-    }
   }
 }
 

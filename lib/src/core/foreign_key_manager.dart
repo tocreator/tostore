@@ -4,9 +4,11 @@ import '../model/table_schema.dart';
 import '../model/foreign_key_operation.dart';
 import '../model/system_table.dart';
 import '../model/db_exception.dart';
+import '../model/db_result.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/table_context.dart';
+import '../query/query_condition.dart';
 import 'data_store_impl.dart';
 import '../interface/chain_builder.dart';
 import '../model/table_identity.dart';
@@ -1066,19 +1068,17 @@ class ForeignKeyManager {
           // 2. When parent table is cleared, all referenced records are removed
           // 3. Therefore, all child records referencing the parent table should be deleted
           try {
-            // Build query to find all child records with non-null foreign key values
-            // that reference the parent table
-            final deleteBuilder = DeleteBuilder(_dataStore, childTableName);
-            for (int i = 0; i < fk.fields.length; i++) {
-              final fkField = fk.fields[i];
-              // Delete all records where this foreign key field is not null
-              // This ensures we delete all records that reference the parent table
-              // Use whereNotNull instead of where(field, '!=', null) because
-              // in SQL, != NULL doesn't match any values (NULL comparisons return NULL, not true/false)
-              deleteBuilder.whereNotNull(fkField);
+            // Engine path: deleteInternal defaults allow large-scale (clear may
+            // wipe large child tables). whereNotNull matches rows that still
+            // reference the parent (SQL != NULL is never true).
+            final childTable = await _dataStore.getTableContext(childTableName);
+            final condition = QueryCondition();
+            for (final fkField in fk.fields) {
+              condition.whereNotNull(fkField);
             }
-            // Use allowDeleteAll() to allow deleting all matching records
-            await deleteBuilder.allowDeleteAll().future;
+            final result =
+                await _dataStore.deleteInternal(childTable, condition);
+            _throwIfEngineWriteFailed(result);
           } catch (e) {
             Logger.error(
                 'Failed to cascade delete from $childTableName during clear',
@@ -1088,21 +1088,23 @@ class ForeignKeyManager {
         } else if (fk.onDelete == ForeignKeyCascadeAction.setNull) {
           // Set to NULL: set all foreign key fields to null
           try {
-            // Build update to set all foreign key fields to null
             final updateData = <String, dynamic>{};
             for (final fkField in fk.fields) {
               updateData[fkField] = null;
             }
 
-            final updateBuilder =
-                UpdateBuilder(_dataStore, childTableName, updateData);
-            for (int i = 0; i < fk.fields.length; i++) {
-              final fkField = fk.fields[i];
-              // Use whereNotNull instead of where(field, '!=', null) because
-              // in SQL, != NULL doesn't match any values (NULL comparisons return NULL, not true/false)
-              updateBuilder.whereNotNull(fkField);
+            final childTable = await _dataStore.getTableContext(childTableName);
+            final condition = QueryCondition();
+            for (final fkField in fk.fields) {
+              condition.whereNotNull(fkField);
             }
-            await updateBuilder.future;
+            final result = await _dataStore.updateInternal(
+              childTable,
+              updateData,
+              condition,
+            );
+            // No matching children is a no-op during clear.
+            _throwIfEngineWriteFailed(result, ignoreNotFound: true);
           } catch (e) {
             Logger.error(
                 'Failed to set foreign key to NULL in $childTableName during clear',
@@ -1122,7 +1124,6 @@ class ForeignKeyManager {
               continue;
             }
 
-            // Build update to set all foreign key fields to their default values
             final updateData = <String, dynamic>{};
             for (final fkField in fk.fields) {
               final field = childSchema.fields.firstWhere(
@@ -1140,15 +1141,17 @@ class ForeignKeyManager {
               updateData[fkField] = field.getDefaultValue();
             }
 
-            final updateBuilder =
-                UpdateBuilder(_dataStore, childTableName, updateData);
-            for (int i = 0; i < fk.fields.length; i++) {
-              final fkField = fk.fields[i];
-              // Use whereNotNull instead of where(field, '!=', null) because
-              // in SQL, != NULL doesn't match any values (NULL comparisons return NULL, not true/false)
-              updateBuilder.whereNotNull(fkField);
+            final childTable = await _dataStore.getTableContext(childTableName);
+            final condition = QueryCondition();
+            for (final fkField in fk.fields) {
+              condition.whereNotNull(fkField);
             }
-            await updateBuilder.future;
+            final result = await _dataStore.updateInternal(
+              childTable,
+              updateData,
+              condition,
+            );
+            _throwIfEngineWriteFailed(result, ignoreNotFound: true);
           } catch (e) {
             Logger.error(
                 'Failed to set foreign key to default in $childTableName during clear',
@@ -1307,7 +1310,7 @@ class ForeignKeyManager {
         queryBuilder.where(entry.key, '=', entry.value);
       }
       // Only select primary key to save memory
-      // We rely on DeleteBuilder for actual deletion, but we need PKs for recursion
+      // We rely on deleteInternal for actual deletion, but we need PKs for recursion
       final childResults = await queryBuilder.limit(batchSize).future;
 
       if (childResults.data.isEmpty) {
@@ -1379,15 +1382,16 @@ class ForeignKeyManager {
       // Now delete the current batch of child records
       // Use batch delete by ID for efficiency and safety (we know these IDs exist and have processed their children)
       try {
-        final deleteBuilder = DeleteBuilder(_dataStore, childTableName);
-        // Use WHERE IN clause for batch delete
-        if (childPkValues.length == 1) {
-          deleteBuilder.where(childSchema.primaryKey, '=', childPkValues[0]);
-        } else {
-          deleteBuilder.where(childSchema.primaryKey, 'IN', childPkValues);
-        }
-        final deleteResult = await deleteBuilder.future;
-        totalDeleted += deleteResult.successKeys.length;
+        final childTable = await _dataStore.getTableContext(childTableName);
+        final deleteCondition = childPkValues.length == 1
+            ? (QueryCondition()
+              ..where(childSchema.primaryKey, '=', childPkValues[0]))
+            : (QueryCondition()
+              ..where(childSchema.primaryKey, 'IN', childPkValues));
+        final deleteResult =
+            await _dataStore.deleteInternal(childTable, deleteCondition);
+        _throwIfEngineWriteFailed(deleteResult);
+        totalDeleted += deleteResult.successCount;
       } catch (e) {
         // If deletion fails, propagate error to trigger transaction rollback
         Logger.error(
@@ -1560,16 +1564,15 @@ class ForeignKeyManager {
     }
 
     // Directly batch update without querying first (more efficient)
-    final updateBuilder = UpdateBuilder(_dataStore, childTableName, updateData);
-    for (final entry in condition.entries) {
-      updateBuilder.where(entry.key, '=', entry.value);
-    }
+    final childTable = await _dataStore.getTableContext(childTableName);
+    final updateResult = await _dataStore.updateInternal(
+      childTable,
+      updateData,
+      _conditionEquals(condition),
+    );
+    _throwIfEngineWriteFailed(updateResult, ignoreNotFound: true);
 
-    // Execute batch update
-    final updateResult = await updateBuilder.future;
-
-    // Return the number of updated records
-    return updateResult.successKeys.length;
+    return updateResult.successCount;
   }
 
   /// Set the foreign key field to NULL
@@ -1631,12 +1634,13 @@ class ForeignKeyManager {
     }
 
     // Use batch update instead of querying first (more efficient)
-    final updateBuilder = UpdateBuilder(_dataStore, childTableName, updateData);
-    for (final entry in condition.entries) {
-      updateBuilder.where(entry.key, '=', entry.value);
-    }
-
-    await updateBuilder.future;
+    final childTable = await _dataStore.getTableContext(childTableName);
+    final updateResult = await _dataStore.updateInternal(
+      childTable,
+      updateData,
+      _conditionEquals(condition),
+    );
+    _throwIfEngineWriteFailed(updateResult, ignoreNotFound: true);
   }
 
   /// Set the foreign key field to default value
@@ -1708,13 +1712,13 @@ class ForeignKeyManager {
       updateData[fieldName] = defaultValues[fieldName];
     }
 
-    // Use batch update instead of querying first (more efficient)
-    final updateBuilder = UpdateBuilder(_dataStore, childTableName, updateData);
-    for (final entry in condition.entries) {
-      updateBuilder.where(entry.key, '=', entry.value);
-    }
-
-    await updateBuilder.future;
+    final childTable = await _dataStore.getTableContext(childTableName);
+    final updateResult = await _dataStore.updateInternal(
+      childTable,
+      updateData,
+      _conditionEquals(condition),
+    );
+    _throwIfEngineWriteFailed(updateResult, ignoreNotFound: true);
   }
 
   /// Find all tables that reference the given table (with reverse mapping cache for O(1) lookup)
@@ -1849,13 +1853,16 @@ class ForeignKeyManager {
             }
 
             if (updateData.isNotEmpty) {
-              final updateBuilder =
-                  UpdateBuilder(_dataStore, fkTableName, updateData);
-              updateBuilder
-                  .where('referencing_table', '=', tableName)
-                  .where('referenced_table', '=', fk.referencedTable)
-                  .where('fk_name', '=', fk.actualName);
-              await updateBuilder.future;
+              final fkTable = await _dataStore.getTableContext(fkTableName);
+              final result = await _dataStore.updateInternal(
+                fkTable,
+                updateData,
+                QueryCondition()
+                  ..where('referencing_table', '=', tableName)
+                  ..where('referenced_table', '=', fk.referencedTable)
+                  ..where('fk_name', '=', fk.actualName),
+              );
+              _throwIfEngineWriteFailed(result, ignoreNotFound: true);
             }
           }
           // If no update needed, skip
@@ -1873,13 +1880,16 @@ class ForeignKeyManager {
           // This FK was removed from schema, delete it
           final existingRecord = existingFkMap[existingFkName];
           if (existingRecord != null) {
-            final deleteBuilder = DeleteBuilder(_dataStore, fkTableName);
-            deleteBuilder
-                .where('referencing_table', '=', tableName)
-                .where(
+            final fkTable = await _dataStore.getTableContext(fkTableName);
+            final result = await _dataStore.deleteInternal(
+              fkTable,
+              QueryCondition()
+                ..where('referencing_table', '=', tableName)
+                ..where(
                     'referenced_table', '=', existingRecord['referenced_table'])
-                .where('fk_name', '=', existingFkName);
-            await deleteBuilder.future;
+                ..where('fk_name', '=', existingFkName),
+            );
+            _throwIfEngineWriteFailed(result);
           }
         }
       }
@@ -1930,11 +1940,14 @@ class ForeignKeyManager {
       // Use OR condition to delete both cases:
       // 1. Records where this table references others (referencing_table = tableName)
       // 2. Records where others reference this table (referenced_table = tableName)
-      final deleteBuilder = DeleteBuilder(_dataStore, fkTableName);
-      deleteBuilder
-          .where('referencing_table', '=', tableName)
-          .orWhere('referenced_table', '=', tableName);
-      await deleteBuilder.future;
+      final fkTable = await _dataStore.getTableContext(fkTableName);
+      final result = await _dataStore.deleteInternal(
+        fkTable,
+        QueryCondition()
+          ..where('referencing_table', '=', tableName)
+          ..orWhere('referenced_table', '=', tableName),
+      );
+      _throwIfEngineWriteFailed(result);
 
       // Invalidate cache to force reload
       invalidateCache();
@@ -1979,5 +1992,30 @@ class ForeignKeyManager {
     }
 
     return condition;
+  }
+
+  QueryCondition _conditionEquals(Map<String, dynamic> map) {
+    final condition = QueryCondition();
+    for (final entry in map.entries) {
+      condition.where(entry.key, '=', entry.value);
+    }
+    return condition;
+  }
+
+  /// Propagate engine write failures as [DbException] (txn rollback / clear).
+  ///
+  /// [ignoreNotFound]: cascade setNull/setDefault may find no matching children.
+  void _throwIfEngineWriteFailed(
+    DbResult result, {
+    bool ignoreNotFound = false,
+  }) {
+    if (!result.hasErrors) return;
+    if (ignoreNotFound &&
+        (result.firstType == ResultType.bizRecordNotFound ||
+            result.statuses
+                .every((s) => s.type == ResultType.bizRecordNotFound))) {
+      return;
+    }
+    throw DbException(result.statuses);
   }
 }

@@ -3,7 +3,6 @@ import 'dart:typed_data';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
-import '../model/table_identity.dart';
 import '../model/transaction_models.dart';
 import 'binary_codec.dart';
 import 'binary_map_codec.dart';
@@ -114,8 +113,6 @@ class TxnEncoder {
   static const int _fInserts = 2;
   static const int _fUpdates = 3;
   static const int _fDeletes = 4;
-  static const int _fHeavyDeletes = 5;
-  static const int _fHeavyUpdates = 6;
 
   // ---- Table group ----
   static const int _fTableUid = 1;
@@ -131,14 +128,6 @@ class TxnEncoder {
   // ---- Unique key ----
   static const int _fIndexUid = 1;
   static const int _fCompositeKey = 2;
-
-  // ---- Heavy delete/update ----
-  static const int _fHeavyTableUid = 1;
-  static const int _fCondition = 2;
-  static const int _fOrderBy = 3;
-  static const int _fLimit = 4;
-  static const int _fOffset = 5;
-  static const int _fUpdateData = 6;
 
   // ---- String->int map entry ----
   static const int _fMapEntry = 1;
@@ -420,14 +409,6 @@ class TxnEncoder {
       w.writeFieldTag(_fDeletes, WireType.lengthDelimited);
       w.writeBytes(group);
     }
-    for (final hd in plan.heavyDeletes) {
-      w.writeFieldTag(_fHeavyDeletes, WireType.lengthDelimited);
-      w.writeBytes(_encodeHeavyDelete(hd));
-    }
-    for (final hu in plan.heavyUpdates) {
-      w.writeFieldTag(_fHeavyUpdates, WireType.lengthDelimited);
-      w.writeBytes(_encodeHeavyUpdate(hu));
-    }
     return Uint8List.fromList(w.view);
   }
 
@@ -440,9 +421,6 @@ class TxnEncoder {
     final inserts = <String, List<Map<String, dynamic>>>{};
     final updates = <String, List<Map<String, dynamic>>>{};
     final deletes = <String, List<Map<String, dynamic>>>{};
-    final heavyDeletes = <HeavyDeletePlan>[];
-    final heavyUpdates = <HeavyUpdatePlan>[];
-
     while (!r.isEOF) {
       final (fieldId, wireType) = r.readFieldTag();
       switch (fieldId) {
@@ -470,14 +448,6 @@ class TxnEncoder {
             deletes.putIfAbsent(g.$1, () => []).addAll(g.$2);
           }
           break;
-        case _fHeavyDeletes:
-          final hd = _decodeHeavyDelete(r.readBytes());
-          if (hd != null) heavyDeletes.add(hd);
-          break;
-        case _fHeavyUpdates:
-          final hu = _decodeHeavyUpdate(r.readBytes());
-          if (hu != null) heavyUpdates.add(hu);
-          break;
         default:
           r.skipField(wireType);
       }
@@ -489,8 +459,6 @@ class TxnEncoder {
       inserts: inserts,
       updates: updates,
       deletes: deletes,
-      heavyDeletes: heavyDeletes,
-      heavyUpdates: heavyUpdates,
     );
   }
 
@@ -717,147 +685,6 @@ class TxnEncoder {
       'indexUid': indexUid,
       'compositeKey': compositeKey,
     };
-  }
-
-  static Uint8List _encodeHeavyDelete(HeavyDeletePlan hd) {
-    final w = BinaryWriter(initialCapacity: 128);
-    w.writeFieldTag(_fHeavyTableUid, WireType.lengthDelimited);
-    w.writeString(hd.tableUid.value);
-    w.writeFieldTag(_fCondition, WireType.lengthDelimited);
-    w.writeBytes(BinaryMapCodec.encodeMap(hd.condition));
-    if (hd.orderBy != null) {
-      for (final col in hd.orderBy!) {
-        w.writeFieldTag(_fOrderBy, WireType.lengthDelimited);
-        w.writeString(col);
-      }
-    }
-    if (hd.limit != null) {
-      w.writeFieldTag(_fLimit, WireType.varint);
-      w.writeZigZag64(hd.limit!);
-    }
-    if (hd.offset != null) {
-      w.writeFieldTag(_fOffset, WireType.varint);
-      w.writeZigZag64(hd.offset!);
-    }
-    return Uint8List.fromList(w.view);
-  }
-
-  static HeavyDeletePlan? _decodeHeavyDelete(Uint8List data) {
-    final r = BinaryReader(data);
-    String? tableUid;
-    Map<String, dynamic>? condition;
-    final orderBy = <String>[];
-    int? limit;
-    int? offset;
-    bool hasLimit = false;
-    bool hasOffset = false;
-    while (!r.isEOF) {
-      final (fieldId, wireType) = r.readFieldTag();
-      switch (fieldId) {
-        case _fHeavyTableUid:
-          tableUid = r.readString();
-          break;
-        case _fCondition:
-          condition = BinaryMapCodec.decodeMap(r.readBytes());
-          break;
-        case _fOrderBy:
-          orderBy.add(r.readString());
-          break;
-        case _fLimit:
-          limit = r.readZigZag64();
-          hasLimit = true;
-          break;
-        case _fOffset:
-          offset = r.readZigZag64();
-          hasOffset = true;
-          break;
-        default:
-          r.skipField(wireType);
-      }
-    }
-    if (tableUid == null || condition == null) return null;
-    return HeavyDeletePlan(
-      tableUid: TableUid(tableUid),
-      condition: condition,
-      orderBy: orderBy.isEmpty ? null : orderBy,
-      limit: hasLimit ? limit : null,
-      offset: hasOffset ? offset : null,
-    );
-  }
-
-  static Uint8List _encodeHeavyUpdate(HeavyUpdatePlan hu) {
-    final w = BinaryWriter(initialCapacity: 128);
-    w.writeFieldTag(_fHeavyTableUid, WireType.lengthDelimited);
-    w.writeString(hu.tableUid.value);
-    w.writeFieldTag(_fCondition, WireType.lengthDelimited);
-    w.writeBytes(BinaryMapCodec.encodeMap(hu.condition));
-    w.writeFieldTag(_fUpdateData, WireType.lengthDelimited);
-    w.writeBytes(BinaryMapCodec.encodeMap(hu.updateData));
-    if (hu.orderBy != null) {
-      for (final col in hu.orderBy!) {
-        w.writeFieldTag(_fOrderBy, WireType.lengthDelimited);
-        w.writeString(col);
-      }
-    }
-    if (hu.limit != null) {
-      w.writeFieldTag(_fLimit, WireType.varint);
-      w.writeZigZag64(hu.limit!);
-    }
-    if (hu.offset != null) {
-      w.writeFieldTag(_fOffset, WireType.varint);
-      w.writeZigZag64(hu.offset!);
-    }
-    return Uint8List.fromList(w.view);
-  }
-
-  static HeavyUpdatePlan? _decodeHeavyUpdate(Uint8List data) {
-    final r = BinaryReader(data);
-    String? tableUid;
-    Map<String, dynamic>? condition;
-    Map<String, dynamic>? updateData;
-    final orderBy = <String>[];
-    int? limit;
-    int? offset;
-    bool hasLimit = false;
-    bool hasOffset = false;
-    while (!r.isEOF) {
-      final (fieldId, wireType) = r.readFieldTag();
-      switch (fieldId) {
-        case _fHeavyTableUid:
-          tableUid = r.readString();
-          break;
-        case _fCondition:
-          condition = BinaryMapCodec.decodeMap(r.readBytes());
-          break;
-        case _fUpdateData:
-          updateData = BinaryMapCodec.decodeMap(r.readBytes());
-          break;
-        case _fOrderBy:
-          orderBy.add(r.readString());
-          break;
-        case _fLimit:
-          limit = r.readZigZag64();
-          hasLimit = true;
-          break;
-        case _fOffset:
-          offset = r.readZigZag64();
-          hasOffset = true;
-          break;
-        default:
-          r.skipField(wireType);
-      }
-    }
-    if (tableUid == null || condition == null || updateData == null) {
-      return null;
-    }
-    return HeavyUpdatePlan(
-      tableUid: TableUid(tableUid),
-      condition: condition,
-      updateData: updateData,
-      orderBy: orderBy.isEmpty ? null : orderBy,
-      limit: hasLimit ? limit : null,
-      offset: hasOffset ? offset : null,
-    );
   }
 
   static Uint8List _encodeStringIntMap(Map<String, int> map) {

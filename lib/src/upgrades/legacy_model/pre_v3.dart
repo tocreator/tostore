@@ -434,37 +434,6 @@ final class LegacyTxnJson {
       inserts: _tableRecordsMap(json['inserts']),
       updates: _tableRecordsMap(json['updates']),
       deletes: _tableRecordsMap(json['deletes']),
-      heavyDeletes: (json['heavyDeletes'] as List?)
-              ?.map((e) =>
-                  heavyDeleteFromJson((e as Map).cast<String, dynamic>()))
-              .toList() ??
-          const <HeavyDeletePlan>[],
-      heavyUpdates: (json['heavyUpdates'] as List?)
-              ?.map((e) =>
-                  heavyUpdateFromJson((e as Map).cast<String, dynamic>()))
-              .toList() ??
-          const <HeavyUpdatePlan>[],
-    );
-  }
-
-  static HeavyDeletePlan heavyDeleteFromJson(Map<String, dynamic> json) {
-    return HeavyDeletePlan(
-      tableUid: TableUid((json['tableUid'] ?? json['tableName']) as String),
-      condition: (json['condition'] as Map).cast<String, dynamic>(),
-      orderBy: (json['orderBy'] as List?)?.cast<String>(),
-      limit: (json['limit'] as num?)?.toInt(),
-      offset: (json['offset'] as num?)?.toInt(),
-    );
-  }
-
-  static HeavyUpdatePlan heavyUpdateFromJson(Map<String, dynamic> json) {
-    return HeavyUpdatePlan(
-      tableUid: TableUid((json['tableUid'] ?? json['tableName']) as String),
-      condition: (json['condition'] as Map).cast<String, dynamic>(),
-      updateData: (json['updateData'] as Map).cast<String, dynamic>(),
-      orderBy: (json['orderBy'] as List?)?.cast<String>(),
-      limit: (json['limit'] as num?)?.toInt(),
-      offset: (json['offset'] as num?)?.toInt(),
     );
   }
 

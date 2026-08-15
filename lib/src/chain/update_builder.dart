@@ -9,8 +9,8 @@ class UpdateBuilder extends ChainBuilder<UpdateBuilder>
   bool _allowAll = false;
   // add flag to indicate whether to continue on partial errors
   bool _continueOnPartialErrors = false;
-  // add flag to indicate whether to skip result details
-  bool _skipResultDetails = false;
+  // Public API: large-scale must be opted in; also skips per-row result details
+  bool _allowLargeScaleOperation = false;
 
   UpdateBuilder(super.db, super.tableName,
       [Map<String, dynamic> data = const {}])
@@ -230,17 +230,24 @@ class UpdateBuilder extends ChainBuilder<UpdateBuilder>
     return this;
   }
 
-  /// Skips collecting success/failure primary key lists and status details in the returned result.
-  /// Use this when performing large-scale range-based updates (e.g. `.where('id', '>', 5)`)
-  /// to improve performance and avoid memory overhead.
-  /// When skipped, only [DbResult.successCount] and [DbResult.failedCount] are available.
+  /// Allows a large-scale data update that would otherwise be rejected to prevent OOM.
   ///
-  /// 跳过收集成功/失败的主键列表和状态详情。
-  /// 适用于大范围范围查询的批量更新场景（如 `.where('id', '>', 5)`），
-  /// 能够显著提升性能并避免内存开销。
-  /// 跳过后仅 [DbResult.successCount] 和 [DbResult.failedCount] 可用。
-  UpdateBuilder skipResultDetails() {
-    _skipResultDetails = true;
+  /// When the engine detects a large-scale data operation, it must be explicitly
+  /// allowed via this method. The operation runs in background batches through the
+  /// unified write scheduler and **blocks until completion** before returning.
+  /// The result includes [DbResult.successCount] only -- success/failure primary
+  /// keys and per-row status details are not returned.
+  /// Not allowed inside a transaction (rejected via [DbResult] / rollback).
+  /// If the process is interrupted unexpectedly, already-persisted changes are
+  /// kept; the caller must retry to continue.
+  ///
+  /// 允许大规模数据更新（否则会因防 OOM 被拒绝）。
+  /// 引擎判定为大规模数据操作时必须显式调用本方法。操作经统一写调度分批执行，
+  /// **阻塞等待全部完成后才返回**；仅返回 [DbResult.successCount]，不返回成功/失败
+  /// 主键列表与逐条状态。事务内不允许（拒绝并触发回滚）。
+  /// 若执行期间意外中断，已落盘部分保留，需用户自行重试继续。
+  UpdateBuilder allowLargeScaleOperation() {
+    _allowLargeScaleOperation = true;
     _onChanged();
     return this;
   }
@@ -256,7 +263,10 @@ class UpdateBuilder extends ChainBuilder<UpdateBuilder>
       offset: _offset,
       allowAll: _allowAll,
       continueOnPartialErrors: _continueOnPartialErrors,
-      returnResultDetails: !_skipResultDetails,
+      // User-facing: gate large-scale unless explicitly allowed; no PK details
+      // when allowed (matches large-path contract).
+      allowLargeScaleOperation: _allowLargeScaleOperation,
+      returnResultDetails: !_allowLargeScaleOperation,
     );
     final result = await _future!;
     DbException.checkDeveloperError(result);

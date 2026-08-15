@@ -563,10 +563,12 @@ class ToStore implements DataStoreInterface {
   ///
   /// chain methods on [UpdateBuilder]:
   /// - `.where(field, op, value)` -- filter condition
-  /// - `.skipResultDetails()` -- skip collecting success/failure primary key lists
-  ///     and status details. Use for large-scale range updates (e.g. `.where('id', '>', 5)`)
-  ///     to improve performance and avoid memory overhead.
-  ///     After skipping, only [DbResult.successCount] and [DbResult.failedCount] are available.
+  /// - `.allowLargeScaleOperation()` -- explicitly allow a large-scale data update
+  ///     that would otherwise be rejected to prevent OOM. Runs in background batches
+  ///     via the unified write scheduler and **blocks until completion**. Returns
+  ///     [DbResult.successCount] only (no success/failure primary keys or per-row
+  ///     status details). Not allowed inside a transaction (rejected with rollback).
+  ///     If interrupted, already-persisted changes are kept; retry to continue.
   /// - `.allowUpdateAll()` -- allow updating all records without a condition
   /// - `.allowPartialErrors()` -- continue on partial record failures
   ///
@@ -585,9 +587,9 @@ class ToStore implements DataStoreInterface {
   ///         .where('status', '=', 'inactive')
   ///         .allowPartialErrors();
   ///
-  /// // Skip result details for large-scale range updates to save memory
+  /// // Explicitly allow large-scale data update (blocks until complete)
   /// await db.update('users', {'status': 'inactive'})
-  ///         .skipResultDetails()
+  ///         .allowLargeScaleOperation()
   ///         .where('last_login', '<', expiredDate);
   /// ```
   ///
@@ -599,10 +601,10 @@ class ToStore implements DataStoreInterface {
   ///
   /// [UpdateBuilder] 链式方法：
   /// - `.where(field, op, value)` -- 筛选条件
-  /// - `.skipResultDetails()` -- 跳过收集成功/失败的主键列表和状态详情。
-  ///     适用于大范围范围查询的批量更新场景（如 `.where('id', '>', 5)`），
-  ///     能够显著提升性能并避免内存开销。
-  ///     跳过后仅 [DbResult.successCount] 和 [DbResult.failedCount] 可用。
+  /// - `.allowLargeScaleOperation()` -- 显式允许大规模数据更新（否则防 OOM 拒绝）。
+  ///     经统一写调度分批执行并**阻塞等待完成**；仅返回 [DbResult.successCount]，
+  ///     不返回成功/失败主键与逐条状态。事务内不允许（拒绝并触发回滚）。
+  ///     中断后已落盘部分保留，需自行重试继续。
   /// - `.allowUpdateAll()` -- 允许无条件更新全部记录
   /// - `.allowPartialErrors()` -- 部分记录失败时继续执行
   @override
@@ -947,26 +949,22 @@ class ToStore implements DataStoreInterface {
   ///
   /// chain methods on [DeleteBuilder]:
   /// - `.where(field, op, value)` -- filter condition
-  /// - `.skipResultDetails()` -- skip collecting success/failure primary key lists
-  ///     and status details. Use for large-scale range deletes (e.g. `.where('id', '>', 5)`)
-  ///     to improve performance and avoid memory overhead.
-  ///     After skipping, only [DbResult.successCount] and [DbResult.failedCount] are available.
+  /// - `.allowLargeScaleOperation()` -- explicitly allow a large-scale data delete
+  ///     that would otherwise be rejected to prevent OOM. Runs in background batches
+  ///     via the unified write scheduler and **blocks until completion**. Returns
+  ///     [DbResult.successCount] only (no success/failure primary keys or per-row
+  ///     status details). Not allowed inside a transaction (rejected with rollback).
+  ///     If interrupted, already-persisted changes are kept; retry to continue.
   /// - `.allowDeleteAll()` -- allow deleting all records without a condition
-  /// - `.allowPartialErrors()` -- continue on partial record failures
   ///
   /// Example:
   /// ```dart
   /// await db.delete('users')
   ///         .where('id', '=', 1);
   ///
-  /// // To continue on partial errors:
+  /// // Explicitly allow large-scale data delete (blocks until complete)
   /// await db.delete('users')
-  ///         .where('id', '>', 100)
-  ///         .allowPartialErrors();
-  ///
-  /// // Skip result details for large-scale range deletes to save memory
-  /// await db.delete('users')
-  ///         .skipResultDetails()
+  ///         .allowLargeScaleOperation()
   ///         .where('created_at', '<', expiredDate);
   /// ```
   ///
@@ -977,12 +975,11 @@ class ToStore implements DataStoreInterface {
   ///
   /// [DeleteBuilder] 链式方法：
   /// - `.where(field, op, value)` -- 筛选条件
-  /// - `.skipResultDetails()` -- 跳过收集成功/失败的主键列表和状态详情。
-  ///     适用于大范围范围查询的批量删除场景（如 `.where('id', '>', 5)`），
-  ///     能够显著提升性能并避免内存开销。
-  ///     跳过后仅 [DbResult.successCount] 和 [DbResult.failedCount] 可用。
+  /// - `.allowLargeScaleOperation()` -- 显式允许大规模数据删除（否则防 OOM 拒绝）。
+  ///     经统一写调度分批执行并**阻塞等待完成**；仅返回 [DbResult.successCount]，
+  ///     不返回成功/失败主键与逐条状态。事务内不允许（拒绝并触发回滚）。
+  ///     中断后已落盘部分保留，需自行重试继续。
   /// - `.allowDeleteAll()` -- 允许无条件删除全部记录
-  /// - `.allowPartialErrors()` -- 部分记录失败时继续执行
   @override
   DeleteBuilder delete(String tableName) {
     _checkSystemTableAccess(

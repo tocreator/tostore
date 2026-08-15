@@ -2440,7 +2440,8 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         try {
           final result = await widget.example.db
               .delete(_selectedTable)
-              .where(field, op, value);
+              .where(field, op, value)
+              .allowLargeScaleOperation();
 
           logService.add(
               'Custom delete affected ${result.successCount} record(s).',

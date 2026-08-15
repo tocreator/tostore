@@ -304,7 +304,8 @@ Dart/Flutter'da `ResultStatus` ve `ResultType`, manuel aralık kontrolleri veya 
   | `22001`<br>`devTableNotFound` | Tablo bulunamadı (Geliştirici Hatası) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `22003`<br>`devIndexNotFound` | Dizin bulunamadı (Geliştirici Hatası) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `22004`<br>`devSpaceNotFound` | Alan bulunamadı (Geliştirici Hatası) | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `23001`<br>`devLargeScaleOperationBypassRequired` | OOM'yi önlemek için ayrıntıları atlamak gerekiyor (Geliştirici Hatası) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `23001`<br>`devLargeScaleOperationRequired` | Large-scale data operation requires `allowLargeScaleOperation()` (Developer Error) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `23002`<br>`devLargeScaleOperationNotAllowedInTransaction` | Large-scale data operation is not allowed inside a transaction (Developer Error) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `24001`<br>`devEngineIncompatible` | **Kritik**: Motor sürümü uyumsuz | <ul><li>`primaryKey`: `null`</li></ul> |
   | `50003`<br>`sysTransactionLimitExceeded` | İşlem arabelleğindeki veriler bellek baskısı altında güvenli sınırı aşıyor (Sistem Hatası) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `50004`<br>`sysMigrationBatchExecutionFailed` | Toplu geçiş yürütmesi başarısız oldu (Sistem Hatası) | <ul><li>`primaryKey`: `null`</li></ul> |
@@ -494,7 +495,8 @@ Tam durum yönlendirmesi ve ayrıştırması için aşağıdaki tabloya bakın:
 | **22003** | `DEV_NOT_FOUND_INDEX` | `ResultType.devIndexNotFound` | Geliştirici Hatası | Dizin bulunamadı |
 | **22004** | `DEV_NOT_FOUND_SPACE` | `ResultType.devSpaceNotFound` | Geliştirici Hatası | Alan bulunamadı |
 | **22005** | `DEV_NOT_FOUND_FIELD` | `ResultType.devFieldNotFound` | Geliştirici Hatası | Alan bulunamadı |
-| **23001** | `DEV_LARGE_SCALE_OPERATION_REQUIRED_BYPASS` | `ResultType.devLargeScaleOperationBypassRequired` | Geliştirici Hatası | Büyük ölçekli işlem, OOM'yi önlemek için sonuç ayrıntılarının atlanmasını gerektirir |
+| **23001** | `DEV_LARGE_SCALE_OPERATION_REQUIRED` | `ResultType.devLargeScaleOperationRequired` | Geliştirici Hatası | Large-scale data operation requires `allowLargeScaleOperation()` to prevent OOM |
+| **23002** | `DEV_LARGE_SCALE_OPERATION_NOT_ALLOWED_IN_TRANSACTION` | `ResultType.devLargeScaleOperationNotAllowedInTransaction` | Developer Error | Large-scale data operation is not allowed inside a transaction |
 | **24001** | `DEV_ENGINE_INCOMPATIBLE` | `ResultType.devEngineIncompatible` | Geliştirici Hatası | **Kritik**: Motor sürümü uyumsuz |
 | **30000** | `DEV_INVALID_SCHEMA` | `ResultType.devInvalidSchema` | Geliştirici Hatası | Geçersiz tablo şeması tanımı |
 | **30001** | `DEV_INVALID_SCHEMA_TABLE_NAME` | `ResultType.devInvalidSchemaTableName` | Geliştirici Hatası | Tablo adı doğrulaması başarısız |

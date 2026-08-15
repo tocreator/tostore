@@ -40,11 +40,11 @@
 
 ToStore, AGI çağı ve uç zeka senaryoları için tasarlanmış modern bir veri motorudur. Kendi kendini yönlendiren (Self-Routing) düğüm mimarisi üzerine kurulu olan bu sistem, düğümlere yüksek özerklik ve esnek yatay ölçeklenebilirlik sağlarken performansı veri ölçeğinden mantıksal olarak ayırır.
 
-Çalışma zamanı modellemesi ve engelsiz yürütme yolları, mimari evrimi her zaman çevrimiçi ve iş operasyonlarına tamamen şeffaf tutar — bildirimsel şema değişiklikleri, veri kodlama anahtarı rotasyonu ve büyük ölçekli veri yeniden yapılandırması kesintisiz olarak gerçekleşir. Ajan ve otomatik işletim senaryolarında ToStore sürekli gelişirken hizmetler kesintisiz kalır.
+Çalışma zamanı modellemesi ve engelsiz yürütme yolları, mimari evrimi her zaman çevrimiçi ve iş operasyonlarına tamamen şeffaf tutar — bildirimsel şema değişiklikleri, veri kodlama anahtarı rotasyonu ve büyük ölçekli veri yeniden yapılandırması kesintisiz olarak gerçekleşir. Ajan ve otomatik işletime yönelik olarak, onların özerk evrimini ve sürekli yinelemesini hizmeti kesmeden destekler.
 
 İlişkisel yapılandırılmış verileri, yüksek boyutlu vektörleri ve yapılandırılmamış verileri yerel olarak destekleyen birleşik bir veri motoru; ACID işlemleri, karmaşık ilişkisel sorgular (JOIN'ler, basamaklı yabancı anahtarlar), tablo düzeyinde TTL, toplama işlemlerinin yanı sıra dağıtık birincil anahtar algoritmaları, atomik ifadeler, şifreleme, çoklu alan yalıtımı ve otomatik kurtarma gibi kurumsal düzeyde veritabanı yetenekleri sunar.
 
-Bilgi işlem uç zekaya doğru kaymaya devam ettikçe, cihazlar artık yalnızca "içerik ekranları" değil, yerel üretimden, çevre algılamasından, gerçek zamanlı karar alma ve veri koordinasyonundan sorumlu akıllı düğümlerdir. ToStore, uca büyük veri kümeleri ve karmaşık yerel yapay zeka üretimi için dağıtık yetenekler sunar. Uç ve bulut düğümleri arasındaki derin akıllı işbirliği, çok modlu etkileşim, anlamsal vektörler, uzamsal modelleme ve benzer senaryolar için güvenilir bir veri temeli sağlar.
+Bilgi işlem uç zekaya doğru kaymaya devam ettikçe, cihazlar artık yalnızca "içerik ekranları" değil, yerel üretimden, çevre algılamasından, gerçek zamanlı karar alma ve veri koordinasyonundan sorumlu akıllı düğümlerdir. ToStore, uca büyük veri kümeleri ve karmaşık yerel yapay zeka üretimi için dağıtık yetenekler sunar. Uç ve bulut düğümleri arasındaki derin akıllı işbirliği, çok modlu etkileşim, anlamsal vektörler, uzamsal modelleme, uç özerk işbirliği ve benzer senaryolar için güvenilir bir veri temeli sağlar.
 
 ## <a id="key-features"></a>Temel Özellikler
 

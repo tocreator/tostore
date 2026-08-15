@@ -309,7 +309,8 @@
   | **Code**: `22001`<br>`ResultType.devTableNotFound` | **级别**：开发者错误<br>执行 Query 或写入时，传入了尚未创建的非物理表名。 | <ul><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `22003`<br>`ResultType.devIndexNotFound` | **级别**：开发者错误<br>执行 ForceIndex 查询时，指定了根本没有在 Schema 中建立的索引。 | <ul><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `22004`<br>`ResultType.devSpaceNotFound` | **级别**：开发者错误<br>试图操作或删除一个不存在 Space（命名空间/数据库文件路径）时触发。 | <ul><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `23001`<br>`ResultType.devLargeScaleOperationBypassRequired` | **级别**：开发者错误<br>超大规模写入/更新操作需调用 `skipResultDetails()` 开启防 OOM 旁路模式。 | <ul><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `23001`<br>`ResultType.devLargeScaleOperationRequired` | **级别**：开发者错误<br>大规模数据操作需显式调用 `allowLargeScaleOperation()`（防 OOM；允许后阻塞分批完成，仅返回成功数；中断需自行重试）。 | <ul><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `23002`<br>`ResultType.devLargeScaleOperationNotAllowedInTransaction` | **级别**：开发者错误<br>事务内不允许大规模数据操作；该错误会使当前事务失败并回滚。 | <ul><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `24001`<br>`ResultType.devEngineIncompatible` | **级别**：**致命错误**<br>库配置或数据文件与当前引擎版本不兼容，强制拦截抛出。 | <ul><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `50003`<br>`ResultType.sysTransactionLimitExceeded` | **级别**：系统错误<br>内存压力下事务缓冲数据超过安全限制。 | <ul><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `50004`<br>`ResultType.sysMigrationBatchExecutionFailed` | **级别**：系统错误<br>批量表结构迁移物理执行失败。 | <ul><li>`primaryKey`: `null`</li></ul> |
@@ -499,7 +500,8 @@ try {
 | **22003** | `DEV_NOT_FOUND_INDEX` | `ResultType.devIndexNotFound` | 开发者错误 | 指定查询引用的索引不存在 |
 | **22004** | `DEV_NOT_FOUND_SPACE` | `ResultType.devSpaceNotFound` | 开发者错误 | 指定的存储空间（Space）在物理或逻辑上不存在 |
 | **22005** | `DEV_NOT_FOUND_FIELD` | `ResultType.devFieldNotFound` | 开发者错误 | 传入了表中未定义的未知字段 |
-| **23001** | `DEV_LARGE_SCALE_OPERATION_REQUIRED_BYPASS` | `ResultType.devLargeScaleOperationBypassRequired` | 开发者错误 | 超大规模写入/更新操作需调用 `skipResultDetails()` 开启防 OOM 旁路模式 |
+| **23001** | `DEV_LARGE_SCALE_OPERATION_REQUIRED` | `ResultType.devLargeScaleOperationRequired` | 开发者错误 | 大规模数据操作需显式调用 `allowLargeScaleOperation()`（防 OOM） |
+| **23002** | `DEV_LARGE_SCALE_OPERATION_NOT_ALLOWED_IN_TRANSACTION` | `ResultType.devLargeScaleOperationNotAllowedInTransaction` | 开发者错误 | 事务内不允许大规模数据操作 |
 | **24001** | `DEV_ENGINE_INCOMPATIBLE` | `ResultType.devEngineIncompatible` | **致命错误** | 库配置或数据文件与当前引擎版本不兼容，强制拦截抛出 |
 | **30000** | `DEV_INVALID_SCHEMA` | `ResultType.devInvalidSchema` | 开发者错误 | 表的 Schema 结构定义配置不正确 |
 | **30001** | `DEV_INVALID_SCHEMA_TABLE_NAME` | `ResultType.devInvalidSchemaTableName` | 开发者错误 | Schema 表名包含非法字符或超过长度限制 |

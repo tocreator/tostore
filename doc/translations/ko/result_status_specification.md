@@ -304,7 +304,8 @@ Dart/Flutter에서 `ResultStatus`와 `ResultType`은 수동 범위 체크나 문
   | `22001`<br>`devTableNotFound` | 테이블을 찾을 수 없음(개발자 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `22003`<br>`devIndexNotFound` | 인덱스를 찾을 수 없음(개발자 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `22004`<br>`devSpaceNotFound` | 스페이스를 찾을 수 없음(개발자 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `23001`<br>`devLargeScaleOperationBypassRequired` | OOM 방지를 위해 결과 상세 건너뛰기 필요(개발자 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `23001`<br>`devLargeScaleOperationRequired` | 대규모 데이터 작업에 `allowLargeScaleOperation()` 필요(개발자 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `23002`<br>`devLargeScaleOperationNotAllowedInTransaction` | Large-scale data operation is not allowed inside a transaction (Developer Error) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `24001`<br>`devEngineIncompatible` | **심각**: 엔진 버전 불일치(개발자 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `50003`<br>`sysTransactionLimitExceeded` | 메모리 압박 상태에서 트랜잭션 버퍼 데이터가 안전 한도를 초과함(시스템 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `50004`<br>`sysMigrationBatchExecutionFailed` | 마이그레이션 배치 실행 실패(시스템 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
@@ -494,7 +495,8 @@ try {
 | **22003** | `DEV_NOT_FOUND_INDEX` | `ResultType.devIndexNotFound` | 개발자 오류 | 인덱스를 찾을 수 없음 |
 | **22004** | `DEV_NOT_FOUND_SPACE` | `ResultType.devSpaceNotFound` | 개발자 오류 | 스페이스를 찾을 수 없음 |
 | **22005** | `DEV_NOT_FOUND_FIELD` | `ResultType.devFieldNotFound` | 개발자 오류 | 필드를 찾을 수 없음 |
-| **23001** | `DEV_LARGE_SCALE_OPERATION_REQUIRED_BYPASS` | `ResultType.devLargeScaleOperationBypassRequired` | 개발자 오류 | OOM 방지를 위해 결과 상세 건너뛰기 필요 |
+| **23001** | `DEV_LARGE_SCALE_OPERATION_REQUIRED` | `ResultType.devLargeScaleOperationRequired` | 개발자 오류 | 대규모 데이터 작업에 `allowLargeScaleOperation()` 필요(OOM 방지) |
+| **23002** | `DEV_LARGE_SCALE_OPERATION_NOT_ALLOWED_IN_TRANSACTION` | `ResultType.devLargeScaleOperationNotAllowedInTransaction` | Developer Error | Large-scale data operation is not allowed inside a transaction |
 | **24001** | `DEV_ENGINE_INCOMPATIBLE` | `ResultType.devEngineIncompatible` | 개발자 오류 | **심각**: 엔진 버전 불일치 |
 | **30000** | `DEV_INVALID_SCHEMA` | `ResultType.devInvalidSchema` | 개발자 오류 | 유효하지 않은 테이블 스키마 정의 |
 | **30001** | `DEV_INVALID_SCHEMA_TABLE_NAME` | `ResultType.devInvalidSchemaTableName` | 개발者 오류 | 테이블 이름 검증 오류 |

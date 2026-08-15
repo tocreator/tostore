@@ -40,11 +40,11 @@
 
 ToStore is a modern data engine designed for the AGI era and edge intelligence scenarios. Built on a Self-Routing node architecture, it gives nodes high autonomy and elastic horizontal scalability while logically decoupling performance from data scale.
 
-Runtime modeling and non-blocking execution paths keep architecture evolution always online and fully transparent to business operations—declarative schema changes, data encoding key rotation, and massive data refactoring all happen seamlessly online. In Agent and automated O&M scenarios, ToStore evolves continuously while services remain uninterrupted.
+Runtime modeling and non-blocking execution paths keep architecture evolution always online and fully transparent to business operations—declarative schema changes, data encoding key rotation, and massive data refactoring all happen seamlessly online. Built for Agent and automated O&M, it underpins their autonomous evolution and continuous iteration without interrupting service.
 
 A unified data engine natively supporting relational structured data, high-dimensional vectors, and unstructured data, with enterprise-grade database capabilities including ACID transactions, complex relational queries (JOINs, cascading foreign keys), table-level TTL, aggregations, as well as distributed primary key algorithms, atomic expressions, encryption, multi-space isolation, and self-healing recovery.
 
-As computing continues shifting toward edge intelligence, devices are no longer just "content displays". They are intelligent nodes responsible for local generation, environmental awareness, real-time decision-making, and coordinated data flows. ToStore gives the edge distributed capabilities strong enough for massive datasets and complex local AI generation. Deep intelligent collaboration between edge and cloud nodes provides a reliable data foundation for multi-modal interaction, semantic vectors, spatial modeling, and similar scenarios.
+As computing continues shifting toward edge intelligence, devices are no longer just "content displays". They are intelligent nodes responsible for local generation, environmental awareness, real-time decision-making, and coordinated data flows. ToStore gives the edge distributed capabilities strong enough for massive datasets and complex local AI generation. Deep intelligent collaboration between edge and cloud nodes provides a reliable data foundation for multi-modal interaction, semantic vectors, spatial modeling, edge autonomous collaboration, and similar scenarios.
 
 ## Key Features
 

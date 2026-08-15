@@ -304,7 +304,8 @@
   | `22001`<br>`devTableNotFound` | Таблица не найдена (Ошибка разработчика) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `22003`<br>`devIndexNotFound` | Индекс не найден (Ошибка разработчика) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `22004`<br>`devSpaceNotFound` | Пространство (Space) не найдено (Ошибка разработчика) | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `23001`<br>`devLargeScaleOperationBypassRequired` | Требуется пропуск деталей для предотвращения OOM (Ошибка разработчика) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `23001`<br>`devLargeScaleOperationRequired` | Large-scale data operation requires `allowLargeScaleOperation()` (Developer Error) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `23002`<br>`devLargeScaleOperationNotAllowedInTransaction` | Large-scale data operation is not allowed inside a transaction (Developer Error) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `24001`<br>`devEngineIncompatible` | **Критично**: Версия ядра несовместима | <ul><li>`primaryKey`: `null`</li></ul> |
   | `50003`<br>`sysTransactionLimitExceeded` | Буферизованные данные транзакции превышают безопасный предел при нехватке памяти (Системная ошибка) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `50004`<br>`sysMigrationBatchExecutionFailed` | Сбой выполнения пакета миграции (Системная ошибка) | <ul><li>`primaryKey`: `null`</li></ul> |
@@ -494,7 +495,8 @@ try {
 | **22003** | `DEV_NOT_FOUND_INDEX` | `ResultType.devIndexNotFound` | Ошибка разработчика | Индекс не найден |
 | **22004** | `DEV_NOT_FOUND_SPACE` | `ResultType.devSpaceNotFound` | Ошибка разработчика | Пространство не найдено |
 | **22005** | `DEV_NOT_FOUND_FIELD` | `ResultType.devFieldNotFound` | Ошибка разработчика | Поле не найдено |
-| **23001** | `DEV_LARGE_SCALE_OPERATION_REQUIRED_BYPASS` | `ResultType.devLargeScaleOperationBypassRequired` | Ошибка разработчика | Крупномасштабная операция требует пропуска деталей для предотвращения OOM |
+| **23001** | `DEV_LARGE_SCALE_OPERATION_REQUIRED` | `ResultType.devLargeScaleOperationRequired` | Ошибка разработчика | Large-scale data operation requires `allowLargeScaleOperation()` to prevent OOM |
+| **23002** | `DEV_LARGE_SCALE_OPERATION_NOT_ALLOWED_IN_TRANSACTION` | `ResultType.devLargeScaleOperationNotAllowedInTransaction` | Developer Error | Large-scale data operation is not allowed inside a transaction |
 | **24001** | `DEV_ENGINE_INCOMPATIBLE` | `ResultType.devEngineIncompatible` | Ошибка разработчика | **Критично**: Версия ядра несовместима |
 | **30000** | `DEV_INVALID_SCHEMA` | `ResultType.devInvalidSchema` | Ошибка разработчика | Недопустимое определение схемы таблицы |
 | **30001** | `DEV_INVALID_SCHEMA_TABLE_NAME` | `ResultType.devInvalidSchemaTableName` | Ошибка разработчика | Ошибка валидации имени таблицы |

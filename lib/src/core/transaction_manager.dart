@@ -10,7 +10,6 @@ import '../model/table_context.dart';
 import '../model/table_identity.dart';
 import '../model/table_schema.dart';
 import '../model/transaction_models.dart';
-import '../query/query_condition.dart';
 import 'crontab_manager.dart';
 import 'data_store_impl.dart';
 // common utilities may be used by callers; keep imports minimal here
@@ -47,14 +46,6 @@ class TransactionManager {
   // In-memory log size cache to avoid frequent filesystem size calls
   Map<String, int>? _logSizeCache;
 
-  // Deferred heavy delete plans per transaction
-  final Map<String, List<HeavyDeletePlan>> _txnHeavyDeletes =
-      <String, List<HeavyDeletePlan>>{};
-
-  // Deferred heavy update plans per transaction
-  final Map<String, List<HeavyUpdatePlan>> _txnHeavyUpdates =
-      <String, List<HeavyUpdatePlan>>{};
-
   // Deferred cascade delete operations per transaction
   // Structure: Map<txId, List<CascadeDeleteOp>>
   // Each CascadeDeleteOp represents a table record deletion that requires cascade delete
@@ -90,8 +81,6 @@ class TransactionManager {
     _activeSsiStartMs.clear();
     _recentCommittedWrites.clear();
     _logSizeCache?.clear();
-    _txnHeavyDeletes.clear();
-    _txnHeavyUpdates.clear();
     _txnCascadeDeletes.clear();
     _txnCascadeUpdates.clear();
   }
@@ -122,18 +111,12 @@ class TransactionManager {
         _logSizeCache!.clear();
       }
 
-      // Clear deferred heavy deletes for inactive transactions
+      // Clear deferred cascade ops for inactive transactions
       try {
         final active = Set<String>.from(_activeTransactions);
         final toPurge = <String>[];
-        _txnHeavyDeletes.forEach((tx, _) {
-          if (!active.contains(tx)) toPurge.add(tx);
-        });
-        _txnHeavyUpdates.forEach((tx, _) {
-          if (!active.contains(tx) && !toPurge.contains(tx)) toPurge.add(tx);
-        });
         _txnCascadeDeletes.forEach((tx, _) {
-          if (!active.contains(tx) && !toPurge.contains(tx)) toPurge.add(tx);
+          if (!active.contains(tx)) toPurge.add(tx);
         });
         _txnCascadeUpdates.forEach((tx, _) {
           if (!active.contains(tx) && !toPurge.contains(tx)) toPurge.add(tx);
@@ -142,8 +125,6 @@ class TransactionManager {
         for (final tx in toPurge) {
           final y1 = yieldController.maybeYield();
           if (y1 != null) await y1;
-          _txnHeavyDeletes.remove(tx);
-          _txnHeavyUpdates.remove(tx);
           _txnCascadeDeletes.remove(tx);
           _txnCascadeUpdates.remove(tx);
         }
@@ -277,8 +258,6 @@ class TransactionManager {
       _activeTransactions.remove(transactionId);
       _txnStatusCache[transactionId] = true;
       await _mergeWriteSetIntoSsiIndex(transactionId);
-      _txnHeavyDeletes.remove(transactionId);
-      _txnHeavyUpdates.remove(transactionId);
       _txnCascadeDeletes.remove(transactionId);
       _txnCascadeUpdates.remove(transactionId);
       try {
@@ -381,9 +360,6 @@ class TransactionManager {
         _logSizeCache!.clear();
       }
     }
-    // Always clear deferred heavy deletes and updates for this tx
-    _txnHeavyDeletes.remove(transactionId);
-    _txnHeavyUpdates.remove(transactionId);
   }
 
   /// Build commit plan from in-memory deferred operations
@@ -391,19 +367,13 @@ class TransactionManager {
     try {
       final defOps =
           await _dataStore.tableDataManager.getDeferredOps(transactionId);
-      final heavyDeletes = getDeferredHeavyDeletes(transactionId);
-      final heavyUpdates = getDeferredHeavyUpdates(transactionId);
 
-      if ((defOps == null || defOps.isEmpty) &&
-          heavyDeletes.isEmpty &&
-          heavyUpdates.isEmpty) {
+      if (defOps == null || defOps.isEmpty) {
         return TransactionCommitPlan(
           transactionId: transactionId,
           inserts: const {},
           updates: const {},
           deletes: const {},
-          heavyDeletes: const <HeavyDeletePlan>[],
-          heavyUpdates: const <HeavyUpdatePlan>[],
         );
       }
 
@@ -411,32 +381,30 @@ class TransactionManager {
       final updates = <String, List<Map<String, dynamic>>>{};
       final deletes = <String, List<Map<String, dynamic>>>{};
 
-      if (defOps != null) {
-        final yieldController = YieldController('txn_build_commit_plan');
-        for (final entry in defOps.entries) {
-          final table = entry.key;
-          final ops = entry.value;
-          for (final op in ops) {
-            final y3 = yieldController.maybeYield();
-            if (y3 != null) await y3;
-            final rec = Map<String, dynamic>.from(op.data);
+      final yieldController = YieldController('txn_build_commit_plan');
+      for (final entry in defOps.entries) {
+        final table = entry.key;
+        final ops = entry.value;
+        for (final op in ops) {
+          final y3 = yieldController.maybeYield();
+          if (y3 != null) await y3;
+          final rec = Map<String, dynamic>.from(op.data);
 
-            // Embed old values if present (for updates). Unique keys are
-            // re-derived from deferred BufferEntry data at apply time.
-            if (op.oldValues != null) {
-              rec['_oldValues'] = op.oldValues;
-            }
+          // Embed old values if present (for updates). Unique keys are
+          // re-derived from deferred BufferEntry data at apply time.
+          if (op.oldValues != null) {
+            rec['_oldValues'] = op.oldValues;
+          }
 
-            if (op.operation == BufferOperationType.insert) {
-              final list = inserts.putIfAbsent(table, () => []);
-              list.add(rec);
-            } else if (op.operation == BufferOperationType.update) {
-              final list = updates.putIfAbsent(table, () => []);
-              list.add(rec);
-            } else if (op.operation == BufferOperationType.delete) {
-              final list = deletes.putIfAbsent(table, () => []);
-              list.add(rec);
-            }
+          if (op.operation == BufferOperationType.insert) {
+            final list = inserts.putIfAbsent(table, () => []);
+            list.add(rec);
+          } else if (op.operation == BufferOperationType.update) {
+            final list = updates.putIfAbsent(table, () => []);
+            list.add(rec);
+          } else if (op.operation == BufferOperationType.delete) {
+            final list = deletes.putIfAbsent(table, () => []);
+            list.add(rec);
           }
         }
       }
@@ -446,8 +414,6 @@ class TransactionManager {
         inserts: inserts,
         updates: updates,
         deletes: deletes,
-        heavyDeletes: heavyDeletes,
-        heavyUpdates: heavyUpdates,
       );
     } catch (_) {
       return TransactionCommitPlan(
@@ -455,8 +421,6 @@ class TransactionManager {
         inserts: const {},
         updates: const {},
         deletes: const {},
-        heavyDeletes: const <HeavyDeletePlan>[],
-        heavyUpdates: const <HeavyUpdatePlan>[],
       );
     }
   }
@@ -909,63 +873,6 @@ class TransactionManager {
         }
       }
 
-      // Execute deferred heavy delete plans (commit-time, idempotent via internal checkpoints)
-      if (commitPlan.heavyDeletes.isNotEmpty) {
-        for (final hd in commitPlan.heavyDeletes) {
-          final y10 = yieldController.maybeYield();
-          if (y10 != null) await y10;
-          final table =
-              await _dataStore.tableMetaManager?.getTableContext(hd.tableUid);
-          if (table == null) continue;
-          final tableName = table.tableName;
-          try {
-            final qc = QueryCondition.fromMap(hd.condition);
-            await _dataStore.deleteInternal(
-              table,
-              qc,
-              orderBy: hd.orderBy,
-              limit: hd.limit,
-              offset: hd.offset,
-              allowAll: false,
-            );
-          } catch (e) {
-            Logger.warn(
-                'Heavy delete during applyCommitPlan failed on $tableName',
-                rawError: e);
-            rethrow;
-          }
-        }
-      }
-
-      // Execute deferred heavy update plans (commit-time, idempotent via internal checkpoints)
-      if (commitPlan.heavyUpdates.isNotEmpty) {
-        for (final hu in commitPlan.heavyUpdates) {
-          final y11 = yieldController.maybeYield();
-          if (y11 != null) await y11;
-          final table =
-              await _dataStore.tableMetaManager?.getTableContext(hu.tableUid);
-          if (table == null) continue;
-          final tableName = table.tableName;
-          try {
-            final qc = QueryCondition.fromMap(hu.condition);
-            await _dataStore.updateInternal(
-              table,
-              hu.updateData,
-              qc,
-              orderBy: hu.orderBy,
-              limit: hu.limit,
-              offset: hu.offset,
-              allowAll: false,
-            );
-          } catch (e) {
-            Logger.warn(
-                'Heavy update during applyCommitPlan failed on $tableName',
-                rawError: e);
-            rethrow;
-          }
-        }
-      }
-
       // Final checkpoint before flush
       await _persistPlanProgress(commitPlan.transactionId, progress['inserts']!,
           progress['updates']!, progress['deletes']!);
@@ -1088,8 +995,6 @@ class TransactionManager {
       _txnStatusCache[transactionId] = false;
       _txnWriteSets.remove(transactionId);
       await _releaseSsiWatcher(transactionId);
-      _txnHeavyDeletes.remove(transactionId);
-      _txnHeavyUpdates.remove(transactionId);
       _txnCascadeDeletes.remove(transactionId);
       _txnCascadeUpdates.remove(transactionId);
       try {
@@ -1134,9 +1039,6 @@ class TransactionManager {
         _txnWriteSets.clear();
       }
     }
-    // Clear deferred heavy deletes and updates for this tx
-    _txnHeavyDeletes.remove(transactionId);
-    _txnHeavyUpdates.remove(transactionId);
     // Clear deferred cascade operations for this tx
     _txnCascadeDeletes.remove(transactionId);
     _txnCascadeUpdates.remove(transactionId);
@@ -1269,32 +1171,6 @@ class TransactionManager {
       final set = byTable.putIfAbsent(table.tableUid, () => <String>{});
       set.add(primaryKey);
     } catch (_) {}
-  }
-
-  /// Register a deferred heavy delete plan for a transaction
-  void registerDeferredHeavyDelete(String txId, HeavyDeletePlan plan) {
-    final list = _txnHeavyDeletes.putIfAbsent(txId, () => <HeavyDeletePlan>[]);
-    list.add(plan);
-  }
-
-  /// Get deferred heavy delete plans for a transaction
-  List<HeavyDeletePlan> getDeferredHeavyDeletes(String txId) {
-    final list = _txnHeavyDeletes[txId];
-    if (list == null) return const <HeavyDeletePlan>[];
-    return List<HeavyDeletePlan>.from(list);
-  }
-
-  /// Register a deferred heavy update plan for a transaction
-  void registerDeferredHeavyUpdate(String txId, HeavyUpdatePlan plan) {
-    final list = _txnHeavyUpdates.putIfAbsent(txId, () => <HeavyUpdatePlan>[]);
-    list.add(plan);
-  }
-
-  /// Get deferred heavy update plans for a transaction
-  List<HeavyUpdatePlan> getDeferredHeavyUpdates(String txId) {
-    final list = _txnHeavyUpdates[txId];
-    if (list == null) return const <HeavyUpdatePlan>[];
-    return List<HeavyUpdatePlan>.from(list);
   }
 
   /// Register a deferred cascade delete operation for a transaction
@@ -1684,8 +1560,6 @@ class TransactionManager {
       inserts: await _normalizeCommitPlanTableMap(plan.inserts),
       updates: await _normalizeCommitPlanTableMap(plan.updates),
       deletes: await _normalizeCommitPlanTableMap(plan.deletes),
-      heavyDeletes: plan.heavyDeletes,
-      heavyUpdates: plan.heavyUpdates,
     );
   }
 }
