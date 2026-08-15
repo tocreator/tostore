@@ -1788,30 +1788,29 @@ class TableMetaManager {
   }
 
   /// Update user-defined table schema hash in [GlobalConfig].
-  Future<void> updateUserSchemaHash(List<TableSchema> schemas) async {
-    if (schemas.isEmpty) return;
-    try {
-      final hash = TableSchema.generateSchemasHash(schemas);
-      final existing = await _dataStore.getGlobalConfig() ?? GlobalConfig();
-      await _dataStore.saveGlobalConfig(
-        existing.copyWith(userSchemaHash: hash),
-      );
-    } catch (e) {
-      Logger.error('Failed to update user schema hash', rawError: e);
-    }
-  }
 
-  /// Update system table schema hash in [GlobalConfig].
-  Future<void> updateSystemSchemaHash(List<TableSchema> schemas) async {
-    if (schemas.isEmpty) return;
+  /// Persist system and/or user schema hashes in a single [GlobalConfig] write.
+  Future<void> updateSchemaHashes({
+    List<TableSchema>? systemSchemas,
+    List<TableSchema>? userSchemas,
+  }) async {
+    final updateSystem = systemSchemas != null && systemSchemas.isNotEmpty;
+    final updateUser = userSchemas != null && userSchemas.isNotEmpty;
+    if (!updateSystem && !updateUser) return;
+
     try {
-      final hash = TableSchema.generateSchemasHash(schemas);
       final existing = await _dataStore.getGlobalConfig() ?? GlobalConfig();
       await _dataStore.saveGlobalConfig(
-        existing.copyWith(systemSchemaHash: hash),
+        existing.copyWith(
+          systemSchemaHash: updateSystem
+              ? TableSchema.generateSchemasHash(systemSchemas)
+              : null,
+          userSchemaHash:
+              updateUser ? TableSchema.generateSchemasHash(userSchemas) : null,
+        ),
       );
     } catch (e) {
-      Logger.error('Failed to update system schema hash', rawError: e);
+      Logger.error('Failed to update schema hashes', rawError: e);
     }
   }
 

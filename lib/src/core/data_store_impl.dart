@@ -1041,8 +1041,6 @@ class DataStoreImpl {
           }
         }
 
-        await tableMetaManager?.updateSystemSchemaHash(systemSchemas);
-
         // Create user tables
         if (userSchemas.isNotEmpty) {
           final userTablesResult = await createTables(userSchemas);
@@ -1056,8 +1054,14 @@ class DataStoreImpl {
               throw DbException(userFatalErrors);
             }
           }
-          await tableMetaManager?.updateUserSchemaHash(userSchemas);
         }
+
+        // Single durability barrier: meta rows sit in the write buffer
+        await _flushPendingWrites();
+        await tableMetaManager?.updateSchemaHashes(
+          systemSchemas: systemSchemas,
+          userSchemas: userSchemas.isNotEmpty ? userSchemas : null,
+        );
 
         // Call creation callback
         await _onCreate?.call(this);
@@ -1081,13 +1085,10 @@ class DataStoreImpl {
           },
         );
 
-        if (systemSchemaChanged) {
-          await tableMetaManager?.updateSystemSchemaHash(systemSchemas);
-        }
-
-        if (userSchemaChanged) {
-          await tableMetaManager?.updateUserSchemaHash(userSchemas);
-        }
+        await tableMetaManager?.updateSchemaHashes(
+          systemSchemas: systemSchemaChanged ? systemSchemas : null,
+          userSchemas: userSchemaChanged ? userSchemas : null,
+        );
       }
     } catch (e) {
       Logger.error('Setup and upgrade failed', rawError: e);
@@ -1099,6 +1100,14 @@ class DataStoreImpl {
     if (!_isInitialized) {
       await ensureInitialized();
     }
+    await _flushPendingWrites(flushStorage: flushStorage);
+  }
+
+  /// Drain write buffer + WAL queue (+ optional storage fsync).
+  ///
+  /// Unlike [flush], this does not call [ensureInitialized], so it is safe
+  /// during bootstrap while [_isInitialized] is still false.
+  Future<void> _flushPendingWrites({bool flushStorage = true}) async {
     await TransactionContext.runAsSystemOperation(() async {
       try {
         await parallelJournalManager.flushCompletely();
