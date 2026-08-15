@@ -1741,7 +1741,9 @@ class DataStoreImpl {
       final recordId = validData[schema.primaryKey].toString();
 
       // Check and record conflicts for running large background operations
-      if (!tableName.startsWith('_system_temp_op_conflict_')) {
+      if ((walManager.meta.largeDeletes.isNotEmpty ||
+              walManager.meta.largeUpdates.isNotEmpty) &&
+          !tableName.startsWith('_system_temp_op_conflict_')) {
         await _checkAndRecordConflictsForBatch(
           table,
           [validData],
@@ -2891,7 +2893,9 @@ class DataStoreImpl {
         );
 
         // Check and record conflicts for running large background operations
-        if (!tableName.startsWith('_system_temp_op_conflict_')) {
+        if ((walManager.meta.largeDeletes.isNotEmpty ||
+                walManager.meta.largeUpdates.isNotEmpty) &&
+            !tableName.startsWith('_system_temp_op_conflict_')) {
           final newRecords =
               preparedRecords.map((x) => x.updatedRecord).toList();
           await _checkAndRecordConflictsForBatch(
@@ -3568,7 +3572,9 @@ class DataStoreImpl {
         }
 
         // Check and record conflicts for running large background operations
-        if (!tableName.startsWith('_system_temp_op_conflict_')) {
+        if ((walManager.meta.largeDeletes.isNotEmpty ||
+                walManager.meta.largeUpdates.isNotEmpty) &&
+            !tableName.startsWith('_system_temp_op_conflict_')) {
           await _checkAndRecordConflictsForBatch(
             table,
             recordsToDelete,
@@ -4340,6 +4346,12 @@ class DataStoreImpl {
 
       final TableSchema tableSchema = schema;
       final primaryKey = tableSchema.primaryKey;
+      // Snapshot once before the flush loop: hot path only reads this bool.
+      // Evaluate isEmpty first so the common "no large ops" path skips startsWith.
+      final bool needLargeOpConflictCheck =
+          (walManager.meta.largeDeletes.isNotEmpty ||
+                  walManager.meta.largeUpdates.isNotEmpty) &&
+              !tableName.startsWith('_system_temp_op_conflict_');
       // Cache unique indexes for this table once per batch to avoid repeated
       // tableMetaManager lookups inside the hot record loop.
       final uniqueIndexesForTable =
@@ -4646,6 +4658,14 @@ class DataStoreImpl {
 
             if (batchRecordsForBuffer.isEmpty) {
               return false;
+            }
+
+            if (needLargeOpConflictCheck) {
+              await _checkAndRecordConflictsForBatch(
+                table,
+                batchRecordsForBuffer,
+                action: 'insert',
+              );
             }
 
             final bufferResult = await tableDataManager.addBatchToBuffer(
@@ -5506,6 +5526,12 @@ class DataStoreImpl {
     final primaryKey = schema.primaryKey;
     final allUniqueIndexes =
         tableMetaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
+    // Snapshot once before the sub-batch loop: hot path only reads this bool.
+    // Evaluate isEmpty first so the common "no large ops" path skips startsWith.
+    final bool needLargeOpConflictCheck =
+        (walManager.meta.largeDeletes.isNotEmpty ||
+                walManager.meta.largeUpdates.isNotEmpty) &&
+            !tableName.startsWith('_system_temp_op_conflict_');
 
     final successKeys = <String>[];
     final failedKeys = <String>[];
@@ -6053,6 +6079,15 @@ class DataStoreImpl {
 
         // 10.2: Single atomic batch commit to TableDataManager
         if (recordsToCommit.isNotEmpty) {
+          if (needLargeOpConflictCheck) {
+            await _checkAndRecordConflictsForBatch(
+              table,
+              recordsToCommit,
+              action: 'update',
+              oldRecords: oldRecordsToCommit,
+            );
+          }
+
           final Map<String, Map<String, dynamic>> oldRecordsMap = {};
           for (int k = 0; k < recordsToCommit.length; k++) {
             final rec = recordsToCommit[k];
@@ -8274,13 +8309,13 @@ class DataStoreImpl {
     required String action, // 'insert', 'update', 'delete'
     List<Map<String, dynamic>>? oldRecords, // required for 'update'
   }) async {
-    final tableName = table.tableName;
-    if (tableName.startsWith('_system_temp_op_conflict_')) return;
-    if (records.isEmpty) return;
     if (walManager.meta.largeDeletes.isEmpty &&
         walManager.meta.largeUpdates.isEmpty) {
       return;
     }
+    final tableName = table.tableName;
+    if (tableName.startsWith('_system_temp_op_conflict_')) return;
+    if (records.isEmpty) return;
 
     final schema = table.schema;
     if (schema.name.isEmpty) return;
