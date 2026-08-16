@@ -27,6 +27,9 @@ abstract class ResultStatus {
   /// Whether this status is a Business Error
   bool get isBusinessError => type.isBusinessError;
 
+  /// Whether this maps to [ConstraintStatus] (same range as [isBusinessError])
+  bool get isConstraintError => type.isConstraintError;
+
   /// Whether this status is a Developer Error
   bool get isDeveloperError => type.isDeveloperError;
 
@@ -55,7 +58,96 @@ abstract class ResultStatus {
     };
   }
 
-  /// Create a specific ResultStatus instance from JSON
+  /// Build the concrete subclass that matches engine routing rules.
+  ///
+  /// Routing (must stay aligned with `doc/result_status_specification.md` §4):
+  /// - `0` → [SuccessStatus]
+  /// - `10000`–`19999` → [ConstraintStatus]
+  /// - `30000`–`39999` → [SchemaValidationStatus]
+  /// - `[20000,20999]` except `20005`/`20006`, plus `22004` → [InvalidArgumentStatus]
+  /// - `50001`/`50002` → [TransactionOperationStatus]
+  /// - otherwise → [GeneralStatus]
+  factory ResultStatus.forType({
+    required ResultType type,
+    required String message,
+    int index = 0,
+    String? primaryKey,
+    String tableName = '',
+    String? constraintName,
+    List<String> fields = const [],
+    List<dynamic> conflictingKeys = const [],
+    String? referencedTable,
+    String? field,
+    dynamic wrongValue,
+    String parameterName = '',
+    dynamic passedValue,
+    String txId = '',
+    String? target,
+    String? operation,
+  }) {
+    if (type == ResultType.success) {
+      return SuccessStatus(
+        message: message,
+        index: index,
+        primaryKey: primaryKey,
+      );
+    }
+    if (type.isConstraintError) {
+      return ConstraintStatus(
+        type: type,
+        message: message,
+        index: index,
+        tableName: tableName,
+        constraintName: constraintName,
+        fields: fields,
+        conflictingKeys: conflictingKeys,
+        primaryKey: primaryKey,
+        referencedTable: referencedTable,
+      );
+    }
+    if (type.code >= 30000 && type.code < 40000) {
+      return SchemaValidationStatus(
+        type: type,
+        message: message,
+        index: index,
+        tableName: tableName,
+        field: field,
+        wrongValue: wrongValue,
+      );
+    }
+    if ((type.code >= 20000 &&
+            type.code < 21000 &&
+            type.code != 20005 &&
+            type.code != 20006) ||
+        type.code == 22004) {
+      return InvalidArgumentStatus(
+        type: type,
+        message: message,
+        index: index,
+        parameterName: parameterName,
+        passedValue: passedValue,
+        primaryKey: primaryKey,
+      );
+    }
+    if (type.code == 50001 || type.code == 50002) {
+      return TransactionOperationStatus(
+        type: type,
+        message: message,
+        index: index,
+        txId: txId,
+      );
+    }
+    return GeneralStatus(
+      type: type,
+      message: message,
+      index: index,
+      primaryKey: primaryKey,
+      target: target,
+      operation: operation,
+    );
+  }
+
+  /// Create a specific [ResultStatus] instance from JSON (subclass by code range).
   factory ResultStatus.fromJson(Map<String, dynamic> json,
       {int? indexOverride}) {
     final codeValue = json['code'] as int? ?? 99001;
@@ -63,68 +155,25 @@ abstract class ResultStatus {
     final message = json['message'] as String? ?? '';
     final index = indexOverride ?? json['index'] as int? ?? 0;
 
-    if (type == ResultType.success) {
-      return SuccessStatus(
-        message: message,
-        index: index,
-        primaryKey: json['primaryKey']?.toString(),
-      );
-    } else if (type.code == 10001 ||
-        type.code == 12002 ||
-        (type.code >= 11000 && type.code < 12000)) {
-      return ConstraintStatus(
-        type: type,
-        message: message,
-        index: index,
-        tableName: json['tableName'] as String? ?? '',
-        constraintName: json['constraintName'] as String?,
-        fields: List<String>.from(json['fields'] as List? ?? []),
-        conflictingKeys:
-            List<dynamic>.from(json['conflictingKeys'] as List? ?? []),
-        primaryKey: json['primaryKey']?.toString(),
-        referencedTable: json['referencedTable']?.toString(),
-      );
-    } else if (type.code >= 30000 && type.code < 31000) {
-      return SchemaValidationStatus(
-        type: type,
-        message: message,
-        index: index,
-        tableName: json['tableName'] as String? ?? '',
-        field: json['field'] as String?,
-        wrongValue: json['wrongValue'],
-      );
-    } else if ((type.code >= 20000 &&
-            type.code < 21000 &&
-            type.code != 20006 &&
-            type.code != 20007 &&
-            type.code != 20008 &&
-            type.code != 20009) ||
-        type.code == 22005) {
-      return InvalidArgumentStatus(
-        type: type,
-        message: message,
-        index: index,
-        parameterName: json['parameterName'] as String? ?? '',
-        passedValue: json['passedValue'],
-        primaryKey: json['primaryKey']?.toString(),
-      );
-    } else if (type.code == 50001 || type.code == 50002) {
-      return TransactionOperationStatus(
-        type: type,
-        message: message,
-        index: index,
-        txId: json['txId'] as String? ?? '',
-      );
-    } else {
-      return GeneralStatus(
-        type: type,
-        message: message,
-        index: index,
-        primaryKey: json['primaryKey']?.toString(),
-        target: json['target']?.toString(),
-        operation: json['operation']?.toString(),
-      );
-    }
+    return ResultStatus.forType(
+      type: type,
+      message: message,
+      index: index,
+      primaryKey: json['primaryKey']?.toString(),
+      tableName: json['tableName'] as String? ?? '',
+      constraintName: json['constraintName'] as String?,
+      fields: List<String>.from(json['fields'] as List? ?? []),
+      conflictingKeys:
+          List<dynamic>.from(json['conflictingKeys'] as List? ?? []),
+      referencedTable: json['referencedTable']?.toString(),
+      field: json['field'] as String?,
+      wrongValue: json['wrongValue'],
+      parameterName: json['parameterName'] as String? ?? '',
+      passedValue: json['passedValue'],
+      txId: json['txId'] as String? ?? '',
+      target: json['target']?.toString(),
+      operation: json['operation']?.toString(),
+    );
   }
 }
 

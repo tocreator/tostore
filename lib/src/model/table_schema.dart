@@ -223,8 +223,13 @@ class TableSchema {
   }
 
   /// Dynamically generate implicit indexes and inherit indexUids from oldSchema if matches are found.
-  TableSchema generateAutoIndexes({TableSchema? oldSchema}) {
+  TableSchema generateAutoIndexes({
+    TableSchema? oldSchema,
+    Map<String, String>? fieldRenames,
+    Map<String, String>? indexRenames,
+  }) {
     final usedIndexUids = <String>{};
+    final claimedOldIndexUids = <String>{};
 
     IndexUid nextUniqueIndexUid() {
       const maxAttempts = 8;
@@ -248,70 +253,149 @@ class TableSchema {
       return nextUniqueIndexUid();
     }
 
-    final implicitIndexes = _computeRawImplicitIndexes();
-    final List<IndexSchema> populatedAutoIndexes = [];
-
-    for (final implicit in implicitIndexes) {
-      IndexSchema resolvedImplicit = implicit;
-      if (oldSchema != null) {
-        IndexSchema? matchedOldIdx;
-        for (final idx in oldSchema.indexes) {
-          if (idx.actualIndexName == implicit.actualIndexName ||
-              _areIndexFieldsAndTypesEqual(idx, implicit)) {
-            matchedOldIdx = idx;
+    // Build effective field rename map
+    final effectiveFieldRenames = <String, String>{};
+    if (fieldRenames != null) {
+      effectiveFieldRenames.addAll(fieldRenames);
+    }
+    if (oldSchema != null) {
+      for (final newField in fields) {
+        if (effectiveFieldRenames.containsValue(newField.name)) continue;
+        for (final oldField in oldSchema.fields) {
+          if (oldField.name == newField.name) continue;
+          if (newField.fieldId != null &&
+              oldField.fieldId != null &&
+              newField.fieldId == oldField.fieldId) {
+            effectiveFieldRenames[oldField.name] = newField.name;
             break;
           }
         }
-        if (matchedOldIdx == null && oldSchema.autoIndexes != null) {
-          for (final idx in oldSchema.autoIndexes!) {
-            if (idx.actualIndexName == implicit.actualIndexName ||
-                _areIndexFieldsAndTypesEqual(idx, implicit)) {
-              matchedOldIdx = idx;
-              break;
+      }
+    }
+
+    final allOldIndexes = oldSchema != null
+        ? [
+            ...oldSchema.indexes,
+            if (oldSchema.autoIndexes != null) ...oldSchema.autoIndexes!,
+          ]
+        : const <IndexSchema>[];
+
+    IndexSchema? findMatchingOldIndex(IndexSchema candidate) {
+      if (allOldIndexes.isEmpty) return null;
+
+      // 1. Exact indexUid match (if candidate already has a non-empty indexUid)
+      if (candidate.indexUid.isNotEmpty) {
+        for (final oldIdx in allOldIndexes) {
+          if (oldIdx.indexUid == candidate.indexUid &&
+              !claimedOldIndexUids.contains(oldIdx.indexUid.value)) {
+            return oldIdx;
+          }
+        }
+      }
+
+      // 2. Explicit index rename match via indexRenames
+      if (indexRenames != null && indexRenames.isNotEmpty) {
+        for (final entry in indexRenames.entries) {
+          final fromOldName = entry.key;
+          final toNewName = entry.value;
+          if (candidate.actualIndexName == toNewName ||
+              candidate.indexName == toNewName) {
+            for (final oldIdx in allOldIndexes) {
+              if ((oldIdx.actualIndexName == fromOldName ||
+                      oldIdx.indexName == fromOldName) &&
+                  oldIdx.indexUid.isNotEmpty &&
+                  !claimedOldIndexUids.contains(oldIdx.indexUid.value)) {
+                return oldIdx;
+              }
             }
           }
         }
-        if (matchedOldIdx != null && matchedOldIdx.indexUid.isNotEmpty) {
-          resolvedImplicit =
-              implicit.copyWith(indexUid: matchedOldIdx.indexUid);
+      }
+
+      // 3. Exact actualIndexName match (and same index type & uniqueness)
+      for (final oldIdx in allOldIndexes) {
+        if (oldIdx.actualIndexName == candidate.actualIndexName &&
+            oldIdx.type == candidate.type &&
+            oldIdx.unique == candidate.unique &&
+            oldIdx.indexUid.isNotEmpty &&
+            !claimedOldIndexUids.contains(oldIdx.indexUid.value)) {
+          return oldIdx;
         }
       }
-      resolvedImplicit = resolvedImplicit.copyWith(
-        indexUid: claimOrAllocate(resolvedImplicit.indexUid),
-      );
-      populatedAutoIndexes.add(resolvedImplicit);
+
+      // 4. Exact fields and types match
+      for (final oldIdx in allOldIndexes) {
+        if (_areIndexFieldsAndTypesEqual(oldIdx, candidate) &&
+            oldIdx.indexUid.isNotEmpty &&
+            !claimedOldIndexUids.contains(oldIdx.indexUid.value)) {
+          return oldIdx;
+        }
+      }
+
+      // 5. Rename-aware fields and types match (using effectiveFieldRenames)
+      if (effectiveFieldRenames.isNotEmpty) {
+        for (final oldIdx in allOldIndexes) {
+          if (oldIdx.type != candidate.type ||
+              oldIdx.unique != candidate.unique ||
+              oldIdx.indexUid.isEmpty ||
+              claimedOldIndexUids.contains(oldIdx.indexUid.value)) {
+            continue;
+          }
+
+          if (oldIdx.fields.length != candidate.fields.length) continue;
+
+          var fieldsMatch = true;
+          for (int i = 0; i < oldIdx.fields.length; i++) {
+            final mappedName =
+                effectiveFieldRenames[oldIdx.fields[i]] ?? oldIdx.fields[i];
+            if (mappedName != candidate.fields[i]) {
+              fieldsMatch = false;
+              break;
+            }
+          }
+
+          if (fieldsMatch) {
+            return oldIdx;
+          }
+        }
+      }
+
+      return null;
     }
 
+    // Process explicit indexes first so declared explicit indexes take priority
     final List<IndexSchema> populatedExplicitIndexes = [];
     for (final explicit in indexes) {
       IndexSchema resolvedExplicit = explicit;
-      if (resolvedExplicit.indexUid.isEmpty && oldSchema != null) {
-        IndexSchema? matchedOldIdx;
-        for (final idx in oldSchema.indexes) {
-          if (idx.actualIndexName == explicit.actualIndexName ||
-              _areIndexFieldsAndTypesEqual(idx, explicit)) {
-            matchedOldIdx = idx;
-            break;
-          }
-        }
-        if (matchedOldIdx == null && oldSchema.autoIndexes != null) {
-          for (final idx in oldSchema.autoIndexes!) {
-            if (idx.actualIndexName == explicit.actualIndexName ||
-                _areIndexFieldsAndTypesEqual(idx, explicit)) {
-              matchedOldIdx = idx;
-              break;
-            }
-          }
-        }
-        if (matchedOldIdx != null && matchedOldIdx.indexUid.isNotEmpty) {
-          resolvedExplicit =
-              explicit.copyWith(indexUid: matchedOldIdx.indexUid);
+      if (oldSchema != null) {
+        final matched = findMatchingOldIndex(resolvedExplicit);
+        if (matched != null && matched.indexUid.isNotEmpty) {
+          resolvedExplicit = explicit.copyWith(indexUid: matched.indexUid);
+          claimedOldIndexUids.add(matched.indexUid.value);
         }
       }
       resolvedExplicit = resolvedExplicit.copyWith(
         indexUid: claimOrAllocate(resolvedExplicit.indexUid),
       );
       populatedExplicitIndexes.add(resolvedExplicit);
+    }
+
+    // Process implicit indexes
+    final implicitIndexes = _computeRawImplicitIndexes();
+    final List<IndexSchema> populatedAutoIndexes = [];
+    for (final implicit in implicitIndexes) {
+      IndexSchema resolvedImplicit = implicit;
+      if (oldSchema != null) {
+        final matched = findMatchingOldIndex(resolvedImplicit);
+        if (matched != null && matched.indexUid.isNotEmpty) {
+          resolvedImplicit = implicit.copyWith(indexUid: matched.indexUid);
+          claimedOldIndexUids.add(matched.indexUid.value);
+        }
+      }
+      resolvedImplicit = resolvedImplicit.copyWith(
+        indexUid: claimOrAllocate(resolvedImplicit.indexUid),
+      );
+      populatedAutoIndexes.add(resolvedImplicit);
     }
 
     return copyWith(
@@ -340,6 +424,13 @@ class TableSchema {
 
     for (final field in fields) {
       if (field.name == primaryKey) continue;
+      // Complex / vector columns cannot use B+Tree implicits from unique/createIndex.
+      if (field.type == DataType.vector ||
+          field.type == DataType.blob ||
+          field.type == DataType.json ||
+          field.type == DataType.array) {
+        continue;
+      }
 
       if (field.unique) {
         final alreadyHasUniqueIndex = indexes.any((i) =>
@@ -587,6 +678,66 @@ class TableSchema {
       ]);
     }
 
+    // Validate field types and constraints for complex types
+    for (final field in fields) {
+      if (field.type == DataType.vector) {
+        final dims = field.vectorConfig?.dimensions;
+        if (dims == null || dims <= 0) {
+          throw DbException([
+            SchemaValidationStatus(
+              type: ResultType.devInvalidSchemaIndexType,
+              message:
+                  'Field "${field.name}" in table "$name" is DataType.vector but must define vectorConfig.dimensions > 0.',
+              tableName: name,
+              field: field.name,
+              wrongValue: {'dimensions': dims},
+            )
+          ]);
+        }
+      } else if (field.vectorConfig != null) {
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.devInvalidSchemaFieldName,
+            message:
+                'Field "${field.name}" in table "$name" has vectorConfig but type is ${field.type.name}, not DataType.vector.',
+            tableName: name,
+            field: field.name,
+            wrongValue: {'type': field.type.name},
+          )
+        ]);
+      }
+
+      if (field.type == DataType.vector ||
+          field.type == DataType.blob ||
+          field.type == DataType.json ||
+          field.type == DataType.array) {
+        if (field.unique) {
+          throw DbException([
+            SchemaValidationStatus(
+              type: ResultType.devInvalidSchemaIndexType,
+              message:
+                  'Field "${field.name}" in table "$name" is of type ${field.type.name} and cannot have a unique constraint. Complex, binary, and vector types do not support unique constraints.',
+              tableName: name,
+              field: field.name,
+              wrongValue: field.type.name,
+            )
+          ]);
+        }
+        if (field.createIndex) {
+          throw DbException([
+            SchemaValidationStatus(
+              type: ResultType.devInvalidSchemaIndexType,
+              message:
+                  'Field "${field.name}" in table "$name" is of type ${field.type.name} and cannot automatically create a B-tree index. Complex, binary, and vector types do not support B-tree indexing.',
+              tableName: name,
+              field: field.name,
+              wrongValue: field.type.name,
+            )
+          ]);
+        }
+      }
+    }
+
     // Validate index configuration
     for (final index in indexes) {
       validateIndexFields(index);
@@ -819,6 +970,18 @@ class TableSchema {
     final bool usesInternalTtlSource = ttlConfig != null &&
         (ttlConfig!.sourceField == null || ttlConfig!.sourceField!.isEmpty);
 
+    if (index.fields.isEmpty) {
+      throw DbException([
+        SchemaValidationStatus(
+          type: ResultType.devInvalidSchemaIndexField,
+          message:
+              'Index "${index.actualIndexName}" in table "$name" must specify at least one field.',
+          tableName: name,
+          field: index.actualIndexName,
+        )
+      ]);
+    }
+
     // Primary-key-only index is redundant:
     // table data itself is range-partitioned by primary key.
     if (_isPrimaryKeyOnlyIndex(index)) {
@@ -828,6 +991,7 @@ class TableSchema {
       // do not return false, because this is just a warning, should not block the table creation
     }
 
+    // 1. Validate that all indexed fields exist
     for (final fieldName in index.fields) {
       // Check if the field is the primary key
       if (fieldName == primaryKeyName) {
@@ -852,6 +1016,157 @@ class TableSchema {
             wrongValue: fieldName,
           )
         ]);
+      }
+    }
+
+    // 2. Validate index type compatibility
+    if (index.type == IndexType.vector) {
+      if (index.fields.length != 1) {
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.devInvalidSchemaIndexType,
+            message:
+                'Vector index "${index.actualIndexName}" in table "$name" can only be created on a single field, but ${index.fields.length} fields were specified (${index.fields.join(', ')}).',
+            tableName: name,
+            field: index.fields.join(','),
+            wrongValue: index.fields.length,
+          )
+        ]);
+      }
+
+      if (index.unique) {
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.devInvalidSchemaIndexType,
+            message:
+                'Vector index "${index.actualIndexName}" in table "$name" cannot be unique. Vector indices do not support unique constraints.',
+            tableName: name,
+            field: index.fields.first,
+            wrongValue: true,
+          )
+        ]);
+      }
+
+      final targetFieldName = index.fields.first;
+      if (targetFieldName == primaryKeyName) {
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.devInvalidSchemaIndexType,
+            message:
+                'Vector index "${index.actualIndexName}" in table "$name" cannot be built on the primary key "$targetFieldName".',
+            tableName: name,
+            field: targetFieldName,
+            wrongValue: {'indexType': index.type.name},
+          )
+        ]);
+      }
+
+      FieldSchema? targetField;
+      for (final f in fields) {
+        if (f.name == targetFieldName) {
+          targetField = f;
+          break;
+        }
+      }
+      if (targetField == null) {
+        // Existence already checked above; keep defensive.
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.devInvalidSchemaIndexField,
+            message:
+                'Vector index "${index.actualIndexName}" in table "$name" references non-existent field "$targetFieldName".',
+            tableName: name,
+            field: targetFieldName,
+          )
+        ]);
+      }
+
+      if (targetField.type != DataType.vector) {
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.devInvalidSchemaIndexType,
+            message:
+                'Vector index "${index.actualIndexName}" in table "$name" requires field "$targetFieldName" to be of type DataType.vector, but got ${targetField.type.name}.',
+            tableName: name,
+            field: targetFieldName,
+            wrongValue: targetField.type.name,
+          )
+        ]);
+      }
+
+      final fieldVectorConfig = targetField.vectorConfig;
+      if (fieldVectorConfig == null || fieldVectorConfig.dimensions <= 0) {
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.devInvalidSchemaIndexType,
+            message:
+                'Vector field "$targetFieldName" in table "$name" must define valid vectorConfig with dimensions > 0 to support vector indexing.',
+            tableName: name,
+            field: targetFieldName,
+            wrongValue: fieldVectorConfig?.dimensions,
+          )
+        ]);
+      }
+
+      final vecIdxConfig = index.vectorConfig;
+      if (vecIdxConfig != null) {
+        if (vecIdxConfig.maxDegree != null && vecIdxConfig.maxDegree! <= 0) {
+          throw DbException([
+            SchemaValidationStatus(
+              type: ResultType.devInvalidSchemaIndexType,
+              message:
+                  'Vector index "${index.actualIndexName}" in table "$name" has invalid maxDegree ${vecIdxConfig.maxDegree}. maxDegree must be greater than 0.',
+              tableName: name,
+              field: targetFieldName,
+              wrongValue: vecIdxConfig.maxDegree,
+            )
+          ]);
+        }
+        if (vecIdxConfig.efSearch != null && vecIdxConfig.efSearch! <= 0) {
+          throw DbException([
+            SchemaValidationStatus(
+              type: ResultType.devInvalidSchemaIndexType,
+              message:
+                  'Vector index "${index.actualIndexName}" in table "$name" has invalid efSearch ${vecIdxConfig.efSearch}. efSearch must be greater than 0.',
+              tableName: name,
+              field: targetFieldName,
+              wrongValue: vecIdxConfig.efSearch,
+            )
+          ]);
+        }
+      }
+    } else if (index.type == IndexType.btree) {
+      for (final fieldName in index.fields) {
+        if (fieldName == primaryKeyName ||
+            (fieldName == internalTtlIngestTsMsField &&
+                usesInternalTtlSource)) {
+          continue;
+        }
+        FieldSchema? targetField;
+        for (final f in fields) {
+          if (f.name == fieldName) {
+            targetField = f;
+            break;
+          }
+        }
+        if (targetField != null) {
+          final t = targetField.type;
+          if (t == DataType.vector ||
+              t == DataType.blob ||
+              t == DataType.json ||
+              t == DataType.array) {
+            throw DbException([
+              SchemaValidationStatus(
+                type: ResultType.devInvalidSchemaIndexType,
+                message:
+                    'B-tree index "${index.actualIndexName}" in table "$name" cannot be created on field "$fieldName" of type ${t.name}. Complex, binary, and vector types do not support B-tree indexing.',
+                tableName: name,
+                field: fieldName,
+                wrongValue: t.name,
+              )
+            ]);
+          }
+        }
       }
     }
 
@@ -2564,8 +2879,11 @@ class PrimaryKeyConfig {
     return DataType.text;
   }
 
-  /// Convert value to primary key type
-  dynamic convertPrimaryKey(dynamic value) {
+  /// Convert value to primary key type.
+  ///
+  /// [tableName] is required for user-facing [ConstraintStatus] diagnostics
+  /// (same pattern as [FieldSchema.checkConstraints]).
+  dynamic convertPrimaryKey(dynamic value, {required String tableName}) {
     if (value == null) return null;
     if (value is String) {
       return value;
@@ -2574,11 +2892,13 @@ class PrimaryKeyConfig {
       return value.toString();
     } catch (e) {
       throw DbException([
-        InvalidArgumentStatus(
+        ConstraintStatus(
           type: ResultType.bizTypeCastFailed,
-          message: 'Failed to convert value to primary key type: $value',
-          parameterName: name,
-          passedValue: value,
+          message:
+              'Failed to convert value to primary key type for table "$tableName": $value',
+          tableName: tableName,
+          fields: [name],
+          conflictingKeys: [value],
         )
       ]);
     }

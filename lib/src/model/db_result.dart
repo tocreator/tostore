@@ -164,10 +164,10 @@ class DbResult {
     final effectiveStatuses = statuses ??
         [
           if (failedKeys.isEmpty)
-            GeneralStatus(type: type, message: message)
+            ResultStatus.forType(type: type, message: message)
           else
             for (int i = 0; i < failedKeys.length; i++)
-              GeneralStatus(
+              ResultStatus.forType(
                 type: type,
                 message: '$message (Key: ${failedKeys[i]})',
                 index: i,

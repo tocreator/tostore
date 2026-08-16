@@ -58,7 +58,7 @@ Tüm `ResultStatus` türleri, JSON olarak serileştirildiğinde aşağıdaki 4 t
 | :--- | :--- | :--- |
 | `index` | `int` | Toplu işlemlerdeki sıra dizini. Tekli işlemler için bu değer `0` olarak sabitlenmiştir. |
 | `code` | `int` | Sayısal durum kodu (başarı için `0`, istisna için 5 basamaklı sayı). |
-| `codeKey` | `String` | Anlamsal durum belirteç anahtarı, örneğin `CONSTRAINT_VIOLATION_UNIQUE`. |
+| `codeKey` | `String` | Anlamsal durum belirteç anahtarı, örneğin `BIZ_CONSTRAINT_UNIQUE`. |
 | `message` | `String` | İnsan tarafından okunabilir durum ayrıntısı açıklaması. |
 
 ### 3.2 Bellek İçi Yardımcı Özellikler (Getters)
@@ -68,6 +68,7 @@ Dart/Flutter'da `ResultStatus` ve `ResultType`, manuel aralık kontrolleri veya 
 | Özellik | Tür | Açıklama |
 | :--- | :--- | :--- |
 | `isBusinessError` | `bool` | Bunun bir **İş Mantığı Hatası** olup olmadığını belirtir (örneğin kısıt çakışması, tür dönüştürme hatası; aralık `10000 - 19999`). |
+| `isConstraintError` | `bool` | **ConstraintStatus** ile eşleşip eşleşmediğini belirtir (`isBusinessError` ile aynı sayısal aralık: `10000 - 19999`). |
 | `isDeveloperError` | `bool` | Bunun bir **Geliştirici Hatası** olup olmadığını belirtir (örneğin geçersiz Şema, parametre uyuşmazlığı, tablo bulunamadı; aralık `20000 - 49999`). |
 | `isSystemError` | `bool` | Bunun bir **Sistem Hatası** olup olmadığını belirtir (örneğin kilit zaman aşımı, disk dolu, dosya kilidi; aralık `50000 - 79999`). |
 | `isEngineError` | `bool` | Bunun bir **Motor Hatası** olup olmadığını belirtir (aralık `99000 - 99999`). |
@@ -104,7 +105,7 @@ Dart/Flutter'da `ResultStatus` ve `ResultType`, manuel aralık kontrolleri veya 
 
 ### 4.2 ConstraintStatus (Veri Bütünlüğü ve Kısıt Çakışmaları)
 
-- **Kategori Aralığı**: `[10000, 19999]` arasındaki `code` değerleri (esas olarak doğrulama ve bütünlük kısıtı çakışmaları).
+- **Kategori Aralığı**: `[10000, 19999]` arasındaki `code` değerleri (tüm İş Mantığı Hatası yaprak kodları: doğrulama, bütünlük kısıtları ve kayıt bulunamadı). `ResultType.isConstraintError` ile uyumlu.
 - **Özel Alan Tanımı**:
 
   | Alan | Tür | Ayrıntılar |
@@ -135,7 +136,7 @@ Dart/Flutter'da `ResultStatus` ve `ResultType`, manuel aralık kontrolleri veya 
   | `11010`<br>`bizValueLessThanMinLength` | Değer uzunluğu minimum kısıtından az | <ul><li>`tableName`: Etkilenen tablo</li><li>`constraintName`: `null`</li><li>`fields`: Sınırı ihlal eden alanlar, örneğin `["code"]`</li><li>`conflictingKeys`: Minimum değerden kısa değerler, örneğin `["ab"]`</li><li>`primaryKey`: Kayıt birincil anahtarı (varsa)</li></ul> |
   | `11011`<br>`bizValueLessThanMinValue` | Sayısal değer minimum kısıtından az | <ul><li>`tableName`: Etkilenen tablo</li><li>`constraintName`: `null`</li><li>`fields`: Sınırı ihlal eden alanlar, örneğin `["age"]`</li><li>`conflictingKeys`: Minimum değerden küçük değerler, örneğin `[-5]`</li><li>`primaryKey`: Kayıt birincil anahtarı (varsa)</li></ul> |
   | `11012`<br>`bizValueExceedsMaxValue` | Sayısal değer maksimum kısıtını aşıyor | <ul><li>`tableName`: Etkilenen tablo</li><li>`constraintName`: `null`</li><li>`fields`: Sınırı ihlal eden alanlar, örneğin `["score"]`</li><li>`conflictingKeys`: Maksimum değeri aşan değerler, örneğin `[105]`</li><li>`primaryKey`: Kayıt birincil anahtarı (varsa)</li></ul> |
-  | `12002`<br>`bizRecordNotFound` | Kaynak mevcut değil / Kayıt bulunamadı | <ul><li>`tableName`: Etkilenen tablo</li><li>`constraintName`: `null`</li><li>`fields`: Arama hedef alanları, örneğin `["id"]`</li><li>`conflictingKeys`: Bulunamayan hedef anahtarlar, örneğin `["non_exist_id"]`</li><li>`primaryKey`: Eksik anahtarın değeri, örneğin `"non_exist_id"`</li></ul> |
+  | `12001`<br>`bizRecordNotFound` | Kaynak mevcut değil / Kayıt bulunamadı | <ul><li>`tableName`: Etkilenen tablo</li><li>`constraintName`: `null`</li><li>`fields`: Arama hedef alanları, örneğin `["id"]`</li><li>`conflictingKeys`: Bulunamayan hedef anahtarlar, örneğin `["non_exist_id"]`</li><li>`primaryKey`: Eksik anahtarın değeri, örneğin `"non_exist_id"`</li></ul> |
 
 - **JSON Örneği** (Yabancı anahtarın üst kaydı mevcut değil hatası):
   ```json
@@ -157,7 +158,7 @@ Dart/Flutter'da `ResultStatus` ve `ResultType`, manuel aralık kontrolleri veya 
 
 ### 4.3 SchemaValidationStatus (Tablo Şeması Doğrulama ve Uyumsuz Geçiş)
 
-- **Kategori Aralığı**: `[30000, 39999]` arasındaki `code` değerleri (şema yapılandırma doğrulama hataları ve fiziksel geçiş uyuşmazlıkları).
+- **Kategori Aralığı**: `[30000, 39999]` — `30000–30013` statik şema doğrulama, `31001–31006` geçiş korumaları.
 - **Özel Alan Tanımı**:
 
   | Alan | Tür | Ayrıntılar |
@@ -173,27 +174,29 @@ Dart/Flutter'da `ResultStatus` ve `ResultType`, manuel aralık kontrolleri veya 
   | `30000`<br>`devInvalidSchema` | Geçersiz tablo şeması tanımı | <ul><li>`tableName`: Tablo adı</li><li>`field`: `null`</li><li>`wrongValue`: Geçersiz yapılandırma eşlemesi veya `null`</li></ul> |
   | `30001`<br>`devInvalidSchemaTableName` | Tablo adı doğrulaması başarısız (geçersiz karakterler veya çok uzun) | <ul><li>`tableName`: Hatalı isim</li><li>`field`: `null`</li><li>`wrongValue`: Hatalı dize</li></ul> |
   | `30002`<br>`devInvalidSchemaFieldName` | Alan adı doğrulaması başarısız (geçersiz karakterler) | <ul><li>`tableName`: Tablo adı</li><li>`field`: Hatalı alan adı</li><li>`wrongValue`: Hatalı dize</li></ul> |
-  | `30003`<br>`devInvalidSchemaPrimaryKey` | Birincil anahtar doğrulaması başarısız (eksik veya geçersiz biçim) | <ul><li>`tableName`: Tablo adı</li><li>`field`: `"primaryKey"` veya birincil anahtar alan adı</li><li>`wrongValue`: Birincil anahtar yapılandırma ayrıntıları</li></ul> |
-  | `30004`<br>`devInvalidSchemaIndexLimit` | Tablo dizin sayısı 16 olan sistem sınırını aşıyor | <ul><li>`tableName`: Tablo adı</li><li>`field`: `null`</li><li>`wrongValue`: Dizin yapılandırmaları listesi</li></ul> |
-  | `30005`<br>`devSchemaTableExists` | Tablo zaten mevcut | <ul><li>`tableName`: Tablo adı</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
-  | `30006`<br>`devSchemaFieldExists` | Şema yükseltme: zaten mevcut olan bir alan eklenmeye çalışılıyor | <ul><li>`tableName`: Tablo adı</li><li>`field`: Çakışan alan adı</li><li>`wrongValue`: `null`</li></ul> |
-  | `30007`<br>`devSchemaIndexExists` | Şema yükseltme: zaten mevcut olan bir dizin eklenmeye çalışılıyor | <ul><li>`tableName`: Tablo adı</li><li>`field`: Dizin adı</li><li>`wrongValue`: `null`</li></ul> |
+  | `30003`<br>`devInvalidSchemaDuplicateFieldName` | Tablo şemasında yinelenen alan adı | <ul><li>`tableName`: Tablo adı</li><li>`field`: Yinelenen alan adı</li><li>`wrongValue`: `null`</li></ul> |
+  | `30004`<br>`devInvalidSchemaPrimaryKey` | Birincil anahtar doğrulaması başarısız (eksik veya geçersiz biçim) | <ul><li>`tableName`: Tablo adı</li><li>`field`: `"primaryKey"` veya birincil anahtar alan adı</li><li>`wrongValue`: Birincil anahtar yapılandırma ayrıntıları</li></ul> |
+  | `30005`<br>`devInvalidSchemaIndexLimit` | Tablo dizin sayısı 16 olan sistem sınırını aşıyor | <ul><li>`tableName`: Tablo adı</li><li>`field`: `null`</li><li>`wrongValue`: Dizin yapılandırmaları listesi</li></ul> |
+  | `30006`<br>`devInvalidSchemaIndexField` | Dizin mevcut olmayan bir alana başvuruyor | <ul><li>`tableName`: Tablo adı</li><li>`field`: Dizin adı</li><li>`wrongValue`: Uyuşmazlığa neden olan alan adı</li></ul> |
+  | `30007`<br>`devInvalidSchemaIndexType` | Dizin türü alan veri türü veya yapılandırmasıyla uyumsuz | <ul><li>`tableName`: Tablo adı</li><li>`field`: Dizin/alan adı</li><li>`wrongValue`: Çakışma bilgisi, örn. `{ "indexType": "btree", "fieldType": "vector" }`</li></ul> |
   | `30008`<br>`devInvalidSchemaForeignKey` | Yabancı anahtar tanımı geçersiz (örneğin sütun eşleşmesi yok) | <ul><li>`tableName`: Tablo adı</li><li>`field`: Yabancı anahtar adı</li><li>`wrongValue`: Yabancı anahtar yapılandırma ayrıntıları</li></ul> |
   | `30009`<br>`devInvalidSchemaSpaceMismatch` | Küresel/Alana özgü sınır uyuşmazlığı | <ul><li>`tableName`: Tablo adı</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
-  | `30010`<br>`devMigrationNotAllowedWithData` | Geçiş veri değişikliği gerektiriyor ancak açıkça izin verilmemiş | <ul><li>`tableName`: Tablo adı</li><li>`field`: `null`</li><li>`wrongValue`: Geçiş yükseltme farkları eşlemesi</li></ul> |
-  | `30011`<br>`devMigrationUnsafeTypeConversion` | Fiziksel geçiş: alan için desteklenmeyen tür dönüşümü | <ul><li>`tableName`: Tablo adı</li><li>`field`: Alan adı</li><li>`wrongValue`: Çakışan türler eşlemesi, örneğin `{ "from": "text", "to": "integer" }`</li></ul> |
-  | `30013`<br>`devMigrationCannotAddNonNullField` | Boş olmayan tabloya varsayılan değer olmadan null olamaz alan eklenemez | <ul><li>`tableName`: Tablo adı</li><li>`field`: Hatalı alan adı</li><li>`wrongValue`: Geçiş parametreleri, örneğin `{ "nullable": false, "defaultValue": null }`</li></ul> |
-  | `30014`<br>`devMigrationNullableToNonNullNotAllowed` | Fiziksel geçiş: alanı null olabilir durumdan null olamaz duruma getirme | <ul><li>`tableName`: Tablo adı</li><li>`field`: Alan adı</li><li>`wrongValue`: Geçiş parametreleri, 30013 ile aynı</li></ul> |
-  | `30015`<br>`devMigrationUniqueTighteningNotAllowed` | Fiziksel geçiş: alan kısıtlamasını UNIQUE olarak sıkılaştırma | <ul><li>`tableName`: Tablo adı</li><li>`field`: Alan adı</li><li>`wrongValue`: Benzersizlik kısıtlamasına neden olan dizin tanımı</li></ul> |
-  | `30016`<br>`devInvalidSchemaTtlConfig` | TTL yapılandırma doğrulaması başarısız oldu | <ul><li>`tableName`: Tablo adı</li><li>`field`: TTL zaman damgası alanı</li><li>`wrongValue`: Geçersiz TTL yapılandırma eşlemesi, örneğin, `{ "enabled": true, "fieldName": "expire_at" }`</li></ul> |
-  | `30017`<br>`devInvalidSchemaDuplicateFieldName` | Tablo şemasında yinelenen alan adı | <ul><li>`tableName`: Tablo adı</li><li>`field`: Yinelenen alan adı</li><li>`wrongValue`: `null`</li></ul> |
-  | `30018`<br>`devInvalidSchemaIndexField` | Dizin mevcut olmayan bir alana başvuruyor | <ul><li>`tableName`: Tablo adı</li><li>`field`: Dizin adı</li><li>`wrongValue`: Uyuşmazlığa neden olan alan adı</li></ul> |
+  | `30010`<br>`devInvalidSchemaTtlConfig` | TTL yapılandırma doğrulaması başarısız oldu | <ul><li>`tableName`: Tablo adı</li><li>`field`: TTL zaman damgası alanı</li><li>`wrongValue`: Geçersiz TTL yapılandırma eşlemesi, örneğin, `{ "enabled": true, "fieldName": "expire_at" }`</li></ul> |
+  | `30011`<br>`devSchemaTableExists` | Tablo zaten mevcut | <ul><li>`tableName`: Tablo adı</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
+  | `30012`<br>`devSchemaFieldExists` | Şema yükseltme: zaten mevcut olan bir alan eklenmeye çalışılıyor | <ul><li>`tableName`: Tablo adı</li><li>`field`: Çakışan alan adı</li><li>`wrongValue`: `null`</li></ul> |
+  | `30013`<br>`devSchemaIndexExists` | Şema yükseltme: zaten mevcut olan bir dizin eklenmeye çalışılıyor | <ul><li>`tableName`: Tablo adı</li><li>`field`: Dizin adı</li><li>`wrongValue`: `null`</li></ul> |
+  | `31001`<br>`devMigrationNotAllowedWithData` | Geçiş veri değişikliği gerektiriyor ancak açıkça izin verilmemiş | <ul><li>`tableName`: Tablo adı</li><li>`field`: `null`</li><li>`wrongValue`: Geçiş yükseltme farkları eşlemesi</li></ul> |
+  | `31002`<br>`devMigrationUnsafeTypeConversion` | Fiziksel geçiş: alan için desteklenmeyen tür dönüşümü | <ul><li>`tableName`: Tablo adı</li><li>`field`: Alan adı</li><li>`wrongValue`: Çakışan türler eşlemesi, örneğin `{ "from": "text", "to": "integer" }`</li></ul> |
+  | `31003`<br>`devMigrationCannotAddNonNullField` | Boş olmayan tabloya varsayılan değer olmadan null olamaz alan eklenemez | <ul><li>`tableName`: Tablo adı</li><li>`field`: Hatalı alan adı</li><li>`wrongValue`: Geçiş parametreleri, örneğin `{ "nullable": false, "defaultValue": null }`</li></ul> |
+  | `31004`<br>`devMigrationNullableToNonNullNotAllowed` | Fiziksel geçiş: alanı null olabilir durumdan null olamaz duruma getirme | <ul><li>`tableName`: Tablo adı</li><li>`field`: Alan adı</li><li>`wrongValue`: Geçiş parametreleri, 31003 ile aynı</li></ul> |
+  | `31005`<br>`devMigrationUniqueTighteningNotAllowed` | Fiziksel geçiş: alan kısıtlamasını UNIQUE olarak sıkılaştırma | <ul><li>`tableName`: Tablo adı</li><li>`field`: Alan adı</li><li>`wrongValue`: Benzersizlik kısıtlamasına neden olan dizin tanımı</li></ul> |
+  | `31006`<br>`devMigrationPromoteLargeOpNotAllowed` | promoteFieldToPrimaryKey sırasında büyük ölçekli işlemler engellenir | <ul><li>`tableName`: Tablo adı</li><li>`field`: `null`</li><li>`wrongValue`: Promote aşaması / görev id (varsa)</li></ul> |
 
 - **JSON Örneği** (Boş olmayan tabloya varsayılan değer olmadan null olamaz alan ekleme hatası):
   ```json
   {
     "index": 0,
-    "code": 30013,
+    "code": 31003,
     "codeKey": "DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD",
     "message": "Cannot add non-nullable field \"phone\" without a default value to non-empty table \"users\". This operation is physically impossible and would fail during data write.",
     "tableName": "users",
@@ -209,7 +212,7 @@ Dart/Flutter'da `ResultStatus` ve `ResultType`, manuel aralık kontrolleri veya 
 
 ### 4.4 InvalidArgumentStatus (API Argümanları ve İmleç Sayfalama Doğrulaması)
 
-- **Kategori Aralığı**: `[20000, 20999]` arasındaki `code` değerleri (API parametreleri, sorgu yapıları veya sayfalama belirteçlerinin doğrulama hataları).
+- **Kategori Aralığı**: `[20000, 20999]` arasındaki `code` değerleri (**hariç** `20005` / `20006`), **artı** `22004` (`devFieldNotFound`). `20005` / `20006` ve diğer `2200x` bulunamadı kodları GeneralStatus (§4.6) kullanır.
 - **Özel Alan Tanımı**:
 
   | Alan | Tür | Ayrıntılar |
@@ -225,26 +228,26 @@ Dart/Flutter'da `ResultStatus` ve `ResultType`, manuel aralık kontrolleri veya 
   | `20001`<br>`devInvalidArgumentFormat` | Argüman biçim hatası | <ul><li>`parameterName`: Geçersiz argüman adı</li><li>`passedValue`: İletilen değer, örneğin `"twenty"`</li><li>`primaryKey`: Kayıt birincil anahtarı (varsa)</li></ul> |
   | `20002`<br>`devInvalidArgumentType` | Argüman türü uyuşmazlığı | <ul><li>`parameterName`: Parametre adı</li><li>`passedValue`: İletilen değer, örneğin `{"foo": "bar"}` (String beklendiğinde)</li><li>`primaryKey`: Kayıt birincil anahtarı (varsa)</li></ul> |
   | `20003`<br>`devInvalidArgumentMissing` | Gerekli argüman eksik | <ul><li>`parameterName`: Eksik parametre adı, örneğin `"dbPath"`</li><li>`passedValue`: `null`</li><li>`primaryKey`: Kayıt birincil anahtarı (varsa)</li></ul> |
-  | `20005`<br>`devInvalidPrimaryKeyFormat` | Geçersiz birincil anahtar biçimi | <ul><li>`parameterName`: `"primaryKey"` veya birincil anahtar alanı</li><li>`passedValue`: Geçersiz birincil anahtar değeri, örneğin, `"invalid_id_value"`</li><li>`primaryKey`: Geçersiz birincil anahtar değeri</li></ul> |
-  | `20010`<br>`devVectorDimensionMismatch` | Vektör boyutları uyuşmuyor | <ul><li>`parameterName`: `"other"`</li><li>`passedValue`: Hatalı boyut boyutu</li><li>`primaryKey`: `null`</li></ul> |
-  | `20011`<br>`devIndexFieldMissing` | İmleç için kayıtta gerekli dizin alanı eksik | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: Eksik dizin alanı</li><li>`primaryKey`: `null`</li></ul> |
-  | `20201`<br>`devInvalidCursorPagination` | İmleç sayfalama ve ofset (offset) birbirini dışlar | <ul><li>`parameterName`: `"cursor"` / `"offset"`</li><li>`passedValue`: Çakışan sayfalama parametreleri</li><li>`primaryKey`: `null`</li></ul> |
-  | `20202`<br>`devInvalidCursorTable` | İmleç hedef tabloyla eşleşmiyor | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: İmleç belirteci</li><li>`primaryKey`: `null`</li></ul> |
-  | `20203`<br>`devInvalidCursorSignature` | Uyuşmayan imleç imzası (tahrif edilmiş) | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: İmleç belirteci</li><li>`primaryKey`: `null`</li></ul> |
-  | `20204`<br>`devInvalidCursorOrderBy` | İmleç orderBy yapılandırması geçersiz veya uyuşmuyor | <ul><li>`parameterName`: `"orderBy"`</li><li>`passedValue`: OrderBy listesi, örneğin `["-age", "id"]`</li><li>`primaryKey`: `null`</li></ul> |
-  | `20205`<br>`devInvalidCursorMode` | İmleç belirteç modu uyuşmazlığı | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: Belirteç modu, örneğin, `"sortKey"`</li><li>`primaryKey`: `null`</li></ul> |
-  | `20206`<br>`devInvalidCursorPayload` | Geçersiz imleç yükü (kod çözülemez) | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: `null`</li><li>`primaryKey`: `null`</li></ul> |
-  | `20301`<br>`devInvalidQuerySelectField` | Sorgu seçme alanı String veya QueryAggregation olmalıdır | <ul><li>`parameterName`: `"select"`</li><li>`passedValue`: Geçersiz seçme alanı tanımı</li><li>`primaryKey`: `null`</li></ul> |
-  | `20302`<br>`devInvalidQueryForeignKeyJoin` | Otomatik birleştirme için yabancı anahtar ilişkisi yok | <ul><li>`parameterName`: `"join"` / `"tableName"`</li><li>`passedValue`: İlişkisi olmayan hedef tablo</li><li>`primaryKey`: `null`</li></ul> |
-  | `20303`<br>`devInvalidQueryFieldAlias` | Sorgu alanı takma adı biçimi geçersiz | <ul><li>`parameterName`: `"alias"`</li><li>`passedValue`: Geçersiz takma ad dizesi</li><li>`primaryKey`: `null`</li></ul> |
-  | `20304`<br>`devInvalidExpression` | Geçersiz ifade yapılandırması veya yürütme istisnası | <ul><li>`parameterName`: Hata yönü (örneğin `"arguments"`, `"functionName"`, `"node"`)</li><li>`passedValue`: Geçersiz değer veya sayı</li><li>`primaryKey`: `null`</li></ul> |
-  | `22005`<br>`devFieldNotFound` | Alan bulunamadı | <ul><li>`parameterName`: Bilinmeyen alan adı, örneğin `"extra"`</li><li>`passedValue`: Alan için iletilen girdi değeri</li><li>`primaryKey`: Kayıt birincil anahtarı (varsa)</li></ul> |
+  | `20004`<br>`devInvalidPrimaryKeyFormat` | Geçersiz birincil anahtar biçimi | <ul><li>`parameterName`: `"primaryKey"` veya birincil anahtar alanı</li><li>`passedValue`: Geçersiz birincil anahtar değeri, örneğin, `"invalid_id_value"`</li><li>`primaryKey`: Geçersiz birincil anahtar değeri</li></ul> |
+  | `20007`<br>`devVectorDimensionMismatch` | Vektör boyutları uyuşmuyor | <ul><li>`parameterName`: `"other"`</li><li>`passedValue`: Hatalı boyut boyutu</li><li>`primaryKey`: `null`</li></ul> |
+  | `20008`<br>`devIndexFieldMissing` | İmleç için kayıtta gerekli dizin alanı eksik | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: Eksik dizin alanı</li><li>`primaryKey`: `null`</li></ul> |
+  | `20101`<br>`devInvalidCursorPagination` | İmleç sayfalama ve ofset (offset) birbirini dışlar | <ul><li>`parameterName`: `"cursor"` / `"offset"`</li><li>`passedValue`: Çakışan sayfalama parametreleri</li><li>`primaryKey`: `null`</li></ul> |
+  | `20102`<br>`devInvalidCursorTable` | İmleç hedef tabloyla eşleşmiyor | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: İmleç belirteci</li><li>`primaryKey`: `null`</li></ul> |
+  | `20103`<br>`devInvalidCursorSignature` | Uyuşmayan imleç imzası (tahrif edilmiş) | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: İmleç belirteci</li><li>`primaryKey`: `null`</li></ul> |
+  | `20104`<br>`devInvalidCursorOrderBy` | İmleç orderBy yapılandırması geçersiz veya uyuşmuyor | <ul><li>`parameterName`: `"orderBy"`</li><li>`passedValue`: OrderBy listesi, örneğin `["-age", "id"]`</li><li>`primaryKey`: `null`</li></ul> |
+  | `20105`<br>`devInvalidCursorMode` | İmleç belirteç modu uyuşmazlığı | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: Belirteç modu, örneğin, `"sortKey"`</li><li>`primaryKey`: `null`</li></ul> |
+  | `20106`<br>`devInvalidCursorPayload` | Geçersiz imleç yükü (kod çözülemez) | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: `null`</li><li>`primaryKey`: `null`</li></ul> |
+  | `20201`<br>`devInvalidQuerySelectField` | Sorgu seçme alanı String veya QueryAggregation olmalıdır | <ul><li>`parameterName`: `"select"`</li><li>`passedValue`: Geçersiz seçme alanı tanımı</li><li>`primaryKey`: `null`</li></ul> |
+  | `20202`<br>`devInvalidQueryForeignKeyJoin` | Otomatik birleştirme için yabancı anahtar ilişkisi yok | <ul><li>`parameterName`: `"join"` / `"tableName"`</li><li>`passedValue`: İlişkisi olmayan hedef tablo</li><li>`primaryKey`: `null`</li></ul> |
+  | `20203`<br>`devInvalidQueryFieldAlias` | Sorgu alanı takma adı biçimi geçersiz | <ul><li>`parameterName`: `"alias"`</li><li>`passedValue`: Geçersiz takma ad dizesi</li><li>`primaryKey`: `null`</li></ul> |
+  | `20204`<br>`devInvalidExpression` | Geçersiz ifade yapılandırması veya yürütme istisnası | <ul><li>`parameterName`: Hata yönü (örneğin `"arguments"`, `"functionName"`, `"node"`)</li><li>`passedValue`: Geçersiz değer veya sayı</li><li>`primaryKey`: `null`</li></ul> |
+  | `22004`<br>`devFieldNotFound` | Alan bulunamadı | <ul><li>`parameterName`: Bilinmeyen alan adı, örneğin `"extra"`</li><li>`passedValue`: Alan için iletilen girdi değeri</li><li>`primaryKey`: Kayıt birincil anahtarı (varsa)</li></ul> |
 
 - **JSON Örneği** (İmleç sıralama alanları mevcut sorgu sıralama alanlarıyla eşleşmiyor hatası):
   ```json
   {
     "index": 0,
-    "code": 20204,
+    "code": 20104,
     "codeKey": "DEV_INVALID_CURSOR_ORDERBY",
     "message": "Cursor orderBy fields do not match current query orderBy.",
     "parameterName": "orderBy",
@@ -257,7 +260,7 @@ Dart/Flutter'da `ResultStatus` ve `ResultType`, manuel aralık kontrolleri veya 
 
 ### 4.5 TransactionOperationStatus (İşlem Çakışması ve İptali)
 
-- **Kategori Aralığı**: `[50000, 50999]` arasındaki `code` değerleri (işlem geri alma, açıkça iptal veya serileştirilebilirlik çakışmaları).
+- **Kategori Aralığı**: yalnızca `50001` (`sysTransactionAborted`) ve `50002` (`sysTransactionConflict`). Diğer `500xx` kodları (örn. `50003` / `50004`) GeneralStatus (§4.6) kullanır.
 - **Özel Alan Tanımı**:
 
   | Alan | Tür | Ayrıntılar |
@@ -286,7 +289,7 @@ Dart/Flutter'da `ResultStatus` ve `ResultType`, manuel aralık kontrolleri veya 
 
 ### 4.6 GeneralStatus (Genel ve Sistem Düzeyinde İstisnalar)
 
-- **Kategori Aralığı**: Diğer tüm durum kodları için geri dönüş (düşük seviyeli G/Ç, donanım hataları, sistem zaman aşımları vb.).
+- **Kategori Aralığı**: §§4.1–4.5 dışında kalan kodlar için yedek — `20005` / `20006`, `22001`–`22003`, `230xx` / `240xx`, kalan `50xxx`–`53xxx` ve `99001` dahil.
 - **Özel Alan Tanımı**:
 
   | Alan | Tür | Ayrıntılar |
@@ -299,11 +302,11 @@ Dart/Flutter'da `ResultStatus` ve `ResultType`, manuel aralık kontrolleri veya 
 
   | Kod ve ResultType | Senaryo / Seviye | Alan Kılavuzu |
   | :--- | :--- | :--- |
-  | `20007`<br>`devIndexOutOfBounds` | Dizin veya aralık sınırların dışında (Geliştirici Hatası) | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `20008`<br>`devUnsupportedOperation` | İşlem mevcut bağlamda desteklenmiyor (Geliştirici Hatası) | <ul><li>`primaryKey`: `null`</li><li>`target`: Hedef tablo/kaynak (varsa)</li><li>`operation`: Yöntem adı (varsa)</li></ul> |
+  | `20005`<br>`devIndexOutOfBounds` | Dizin veya aralık sınırların dışında (Geliştirici Hatası) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `20006`<br>`devUnsupportedOperation` | İşlem mevcut bağlamda desteklenmiyor (Geliştirici Hatası) | <ul><li>`primaryKey`: `null`</li><li>`target`: Hedef tablo/kaynak (varsa)</li><li>`operation`: Yöntem adı (varsa)</li></ul> |
   | `22001`<br>`devTableNotFound` | Tablo bulunamadı (Geliştirici Hatası) | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `22003`<br>`devIndexNotFound` | Dizin bulunamadı (Geliştirici Hatası) | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `22004`<br>`devSpaceNotFound` | Alan bulunamadı (Geliştirici Hatası) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `22002`<br>`devIndexNotFound` | Dizin bulunamadı (Geliştirici Hatası) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `22003`<br>`devSpaceNotFound` | Alan bulunamadı (Geliştirici Hatası) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `23001`<br>`devLargeScaleOperationRequired` | Large-scale data operation requires `allowLargeScaleOperation()` (Developer Error) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `23002`<br>`devLargeScaleOperationNotAllowedInTransaction` | Large-scale data operation is not allowed inside a transaction (Developer Error) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `24001`<br>`devEngineIncompatible` | **Kritik**: Motor sürümü uyumsuz | <ul><li>`primaryKey`: `null`</li></ul> |
@@ -472,50 +475,52 @@ Tam durum yönlendirmesi ve ayrıştırması için aşağıdaki tabloya bakın:
 | **11010** | `BIZ_CONSTRAINT_MIN_LENGTH` | `ResultType.bizValueLessThanMinLength` | İş Mantığı Hatası | Değer uzunluğu minimum kısıtından az |
 | **11011** | `BIZ_CONSTRAINT_MIN_VALUE` | `ResultType.bizValueLessThanMinValue` | İş Mantığı Hatası | Sayısal değer minimum kısıtından az |
 | **11012** | `BIZ_CONSTRAINT_MAX_VALUE` | `ResultType.bizValueExceedsMaxValue` | İş Mantığı Hatası | Sayısal değer maksimum kısıtını aşıyor |
-| **12002** | `BIZ_NOT_FOUND_RECORD` | `ResultType.bizRecordNotFound` | İş Mantığı Hatası | Kaynak mevcut değil / Kayıt bulunamadı |
+| **12001** | `BIZ_NOT_FOUND_RECORD` | `ResultType.bizRecordNotFound` | İş Mantığı Hatası | Kaynak mevcut değil / Kayıt bulunamadı |
 | **20001** | `DEV_INVALID_ARGUMENT_FORMAT` | `ResultType.devInvalidArgumentFormat` | Geliştirici Hatası | Argüman biçim hatası |
 | **20002** | `DEV_INVALID_ARGUMENT_TYPE` | `ResultType.devInvalidArgumentType` | Geliştirici Hatası | Argüman türü uyuşmazlığı |
 | **20003** | `DEV_INVALID_ARGUMENT_MISSING` | `ResultType.devInvalidArgumentMissing` | Geliştirici Hatası | Gerekli argüman eksik |
-| **20005** | `DEV_INVALID_PRIMARY_KEY_FORMAT` | `ResultType.devInvalidPrimaryKeyFormat` | Geliştirici Hatası | Geçersiz birincil anahtar biçimi |
-| **20007** | `DEV_INDEX_OUT_OF_BOUNDS` | `ResultType.devIndexOutOfBounds` | Geliştirici Hatası | Dizin veya aralık sınırların dışında |
-| **20008** | `DEV_UNSUPPORTED_OPERATION` | `ResultType.devUnsupportedOperation` | Geliştirici Hatası | İşlem mevcut bağlamda desteklenmiyor |
-| **20010** | `DEV_VECTOR_DIMENSION_MISMATCH` | `ResultType.devVectorDimensionMismatch` | Geliştirici Hatası | Vektör boyutları uyuşmuyor |
-| **20011** | `DEV_INDEX_FIELD_MISSING` | `ResultType.devIndexFieldMissing` | Geliştirici Hatası | İmleç için kayıtta gerekli dizin alanı eksik |
-| **20201** | `DEV_INVALID_CURSOR_PAGINATION` | `ResultType.devInvalidCursorPagination` | Geliştirici Hatası | İmleç sayfalama ve ofset birbirini dışlar |
-| **20202** | `DEV_INVALID_CURSOR_TABLE` | `ResultType.devInvalidCursorTable` | Geliştirici Hatası | İmleç hedef tabloyla eşleşmiyor |
-| **20203** | `DEV_INVALID_CURSOR_SIGNATURE` | `ResultType.devInvalidCursorSignature` | Geliştirici Hatası | Uyuşmayan imleç imzası (tahrif edilmiş) |
-| **20204** | `DEV_INVALID_CURSOR_ORDERBY` | `ResultType.devInvalidCursorOrderBy` | Geliştirici Hatası | İmleç orderBy yapılandırması geçersiz veya uyuşmuyor |
-| **20205** | `DEV_INVALID_CURSOR_MODE` | `ResultType.devInvalidCursorMode` | Geliştirici Hatası | İmleç belirteç modu uyuşmazlığı |
-| **20206** | `DEV_INVALID_CURSOR_PAYLOAD` | `ResultType.devInvalidCursorPayload` | Geliştirici Hatası | Geçersiz imleç yükü (kod çözülemez) |
-| **20301** | `DEV_INVALID_QUERY_SELECT_FIELD` | `ResultType.devInvalidQuerySelectField` | Geliştirici Hatası | Sorgu seçme alanı String veya QueryAggregation olmalıdır |
-| **20302** | `DEV_INVALID_QUERY_FOREIGN_KEY_JOIN` | `ResultType.devInvalidQueryForeignKeyJoin` | Geliştirici Hatası | Otomatik birleştirme için yabancı anahtar ilişkisi yok |
-| **20303** | `DEV_INVALID_QUERY_FIELD_ALIAS` | `ResultType.devInvalidQueryFieldAlias` | Geliştirici Hatası | Sorgu alanı takma adı biçimi geçersiz |
-| **20304** | `DEV_INVALID_EXPRESSION` | `ResultType.devInvalidExpression` | Geliştirici Hatası | Geçersiz ifade yapılandırması veya yürütme istisnası |
+| **20004** | `DEV_INVALID_PRIMARY_KEY_FORMAT` | `ResultType.devInvalidPrimaryKeyFormat` | Geliştirici Hatası | Geçersiz birincil anahtar biçimi |
+| **20005** | `DEV_INDEX_OUT_OF_BOUNDS` | `ResultType.devIndexOutOfBounds` | Geliştirici Hatası | Dizin veya aralık sınırların dışında |
+| **20006** | `DEV_UNSUPPORTED_OPERATION` | `ResultType.devUnsupportedOperation` | Geliştirici Hatası | İşlem mevcut bağlamda desteklenmiyor |
+| **20007** | `DEV_VECTOR_DIMENSION_MISMATCH` | `ResultType.devVectorDimensionMismatch` | Geliştirici Hatası | Vektör boyutları uyuşmuyor |
+| **20008** | `DEV_INDEX_FIELD_MISSING` | `ResultType.devIndexFieldMissing` | Geliştirici Hatası | İmleç için kayıtta gerekli dizin alanı eksik |
+| **20101** | `DEV_INVALID_CURSOR_PAGINATION` | `ResultType.devInvalidCursorPagination` | Geliştirici Hatası | İmleç sayfalama ve ofset birbirini dışlar |
+| **20102** | `DEV_INVALID_CURSOR_TABLE` | `ResultType.devInvalidCursorTable` | Geliştirici Hatası | İmleç hedef tabloyla eşleşmiyor |
+| **20103** | `DEV_INVALID_CURSOR_SIGNATURE` | `ResultType.devInvalidCursorSignature` | Geliştirici Hatası | Uyuşmayan imleç imzası (tahrif edilmiş) |
+| **20104** | `DEV_INVALID_CURSOR_ORDERBY` | `ResultType.devInvalidCursorOrderBy` | Geliştirici Hatası | İmleç orderBy yapılandırması geçersiz veya uyuşmuyor |
+| **20105** | `DEV_INVALID_CURSOR_MODE` | `ResultType.devInvalidCursorMode` | Geliştirici Hatası | İmleç belirteç modu uyuşmazlığı |
+| **20106** | `DEV_INVALID_CURSOR_PAYLOAD` | `ResultType.devInvalidCursorPayload` | Geliştirici Hatası | Geçersiz imleç yükü (kod çözülemez) |
+| **20201** | `DEV_INVALID_QUERY_SELECT_FIELD` | `ResultType.devInvalidQuerySelectField` | Geliştirici Hatası | Sorgu seçme alanı String veya QueryAggregation olmalıdır |
+| **20202** | `DEV_INVALID_QUERY_FOREIGN_KEY_JOIN` | `ResultType.devInvalidQueryForeignKeyJoin` | Geliştirici Hatası | Otomatik birleştirme için yabancı anahtar ilişkisi yok |
+| **20203** | `DEV_INVALID_QUERY_FIELD_ALIAS` | `ResultType.devInvalidQueryFieldAlias` | Geliştirici Hatası | Sorgu alanı takma adı biçimi geçersiz |
+| **20204** | `DEV_INVALID_EXPRESSION` | `ResultType.devInvalidExpression` | Geliştirici Hatası | Geçersiz ifade yapılandırması veya yürütme istisnası |
 | **22001** | `DEV_NOT_FOUND_TABLE` | `ResultType.devTableNotFound` | Geliştirici Hatası | Tablo bulunamadı |
-| **22003** | `DEV_NOT_FOUND_INDEX` | `ResultType.devIndexNotFound` | Geliştirici Hatası | Dizin bulunamadı |
-| **22004** | `DEV_NOT_FOUND_SPACE` | `ResultType.devSpaceNotFound` | Geliştirici Hatası | Alan bulunamadı |
-| **22005** | `DEV_NOT_FOUND_FIELD` | `ResultType.devFieldNotFound` | Geliştirici Hatası | Alan bulunamadı |
+| **22002** | `DEV_NOT_FOUND_INDEX` | `ResultType.devIndexNotFound` | Geliştirici Hatası | Dizin bulunamadı |
+| **22003** | `DEV_NOT_FOUND_SPACE` | `ResultType.devSpaceNotFound` | Geliştirici Hatası | Alan bulunamadı |
+| **22004** | `DEV_NOT_FOUND_FIELD` | `ResultType.devFieldNotFound` | Geliştirici Hatası | Alan bulunamadı |
 | **23001** | `DEV_LARGE_SCALE_OPERATION_REQUIRED` | `ResultType.devLargeScaleOperationRequired` | Geliştirici Hatası | Large-scale data operation requires `allowLargeScaleOperation()` to prevent OOM |
 | **23002** | `DEV_LARGE_SCALE_OPERATION_NOT_ALLOWED_IN_TRANSACTION` | `ResultType.devLargeScaleOperationNotAllowedInTransaction` | Developer Error | Large-scale data operation is not allowed inside a transaction |
 | **24001** | `DEV_ENGINE_INCOMPATIBLE` | `ResultType.devEngineIncompatible` | Geliştirici Hatası | **Kritik**: Motor sürümü uyumsuz |
 | **30000** | `DEV_INVALID_SCHEMA` | `ResultType.devInvalidSchema` | Geliştirici Hatası | Geçersiz tablo şeması tanımı |
 | **30001** | `DEV_INVALID_SCHEMA_TABLE_NAME` | `ResultType.devInvalidSchemaTableName` | Geliştirici Hatası | Tablo adı doğrulaması başarısız |
 | **30002** | `DEV_INVALID_SCHEMA_FIELD_NAME` | `ResultType.devInvalidSchemaFieldName` | Geliştirici Hatası | Alan adı doğrulaması başarısız |
-| **30003** | `DEV_INVALID_SCHEMA_PRIMARY_KEY` | `ResultType.devInvalidSchemaPrimaryKey` | Geliştirici Hatası | Birincil anahtar doğrulaması başarısız |
-| **30004** | `DEV_INVALID_SCHEMA_INDEX_LIMIT` | `ResultType.devInvalidSchemaIndexLimit` | Geliştirici Hatası | Dizin sayısı doğrulaması başarısız |
-| **30005** | `DEV_SCHEMA_TABLE_EXISTS` | `ResultType.devSchemaTableExists` | Geliştirici Hatası | Tablo zaten mevcut |
-| **30006** | `DEV_SCHEMA_FIELD_EXISTS` | `ResultType.devSchemaFieldExists` | Geliştirici Hatası | Alan zaten mevcut |
-| **30007** | `DEV_SCHEMA_INDEX_EXISTS` | `ResultType.devSchemaIndexExists` | Geliştirici Hatası | Dizin zaten mevcut |
+| **30003** | `DEV_INVALID_SCHEMA_DUPLICATE_FIELD_NAME` | `ResultType.devInvalidSchemaDuplicateFieldName` | Geliştirici Hatası | Tablo şemasında yinelenen alan adı |
+| **30004** | `DEV_INVALID_SCHEMA_PRIMARY_KEY` | `ResultType.devInvalidSchemaPrimaryKey` | Geliştirici Hatası | Birincil anahtar doğrulaması başarısız |
+| **30005** | `DEV_INVALID_SCHEMA_INDEX_LIMIT` | `ResultType.devInvalidSchemaIndexLimit` | Geliştirici Hatası | Dizin sayısı doğrulaması başarısız |
+| **30006** | `DEV_INVALID_SCHEMA_INDEX_FIELD` | `ResultType.devInvalidSchemaIndexField` | Geliştirici Hatası | Dizin mevcut olmayan bir alana başvuruyor |
+| **30007** | `DEV_INVALID_SCHEMA_INDEX_TYPE` | `ResultType.devInvalidSchemaIndexType` | Geliştirici Hatası | Dizin türü alan veri türü veya yapılandırmasıyla uyumsuz |
 | **30008** | `DEV_INVALID_SCHEMA_FOREIGN_KEY` | `ResultType.devInvalidSchemaForeignKey` | Geliştirici Hatası | Yabancı anahtar tanımı geçersiz |
 | **30009** | `DEV_INVALID_SCHEMA_SPACE_MISMATCH` | `ResultType.devInvalidSchemaSpaceMismatch` | Geliştirici Hatası | Küresel/Alana özgü sınır uyuşmazlığı |
-| **30010** | `DEV_MIGRATION_NOT_ALLOWED_WITH_DATA` | `ResultType.devMigrationNotAllowedWithData` | Geliştirici Hatası | Geçiş veri değişikliği gerektiriyor ancak açıkça izin verilmemiş |
-| **30011** | `DEV_MIGRATION_UNSAFE_TYPE_CONVERSION` | `ResultType.devMigrationUnsafeTypeConversion` | Geliştirici Hatası | Alan için desteklenmeyen veri türü değişikliği |
-| **30013** | `DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD` | `ResultType.devMigrationCannotAddNonNullField` | Geliştirici Hatası | Varsayılan değer olmadan null olamaz alan eklenmesine izin verilmez |
-| **30014** | `DEV_MIGRATION_NULLABLE_TO_NON_NULL_NOT_ALLOWED` | `ResultType.devMigrationNullableToNonNullNotAllowed` | Geliştirici Hatası | Alanın null olabilir durumdan null olamaz duruma getirilmesine izin verilmez |
-| **30015** | `DEV_MIGRATION_UNIQUE_TIGHTENING_NOT_ALLOWED` | `ResultType.devMigrationUniqueTighteningNotAllowed` | Geliştirici Hatası | UNIQUE olarak sıkılaştırmaya izin verilmez |
-| **30016** | `DEV_INVALID_SCHEMA_TTL_CONFIG` | `ResultType.devInvalidSchemaTtlConfig` | Geliştirici Hatası | TTL yapılandırma doğrulaması başarısız oldu |
-| **30017** | `DEV_INVALID_SCHEMA_DUPLICATE_FIELD_NAME` | `ResultType.devInvalidSchemaDuplicateFieldName` | Geliştirici Hatası | Tablo şemasında yinelenen alan adı |
-| **30018** | `DEV_INVALID_SCHEMA_INDEX_FIELD` | `ResultType.devInvalidSchemaIndexField` | Geliştirici Hatası | Dizin mevcut olmayan bir alana başvuruyor |
+| **30010** | `DEV_INVALID_SCHEMA_TTL_CONFIG` | `ResultType.devInvalidSchemaTtlConfig` | Geliştirici Hatası | TTL yapılandırma doğrulaması başarısız oldu |
+| **30011** | `DEV_SCHEMA_TABLE_EXISTS` | `ResultType.devSchemaTableExists` | Geliştirici Hatası | Tablo zaten mevcut |
+| **30012** | `DEV_SCHEMA_FIELD_EXISTS` | `ResultType.devSchemaFieldExists` | Geliştirici Hatası | Alan zaten mevcut |
+| **30013** | `DEV_SCHEMA_INDEX_EXISTS` | `ResultType.devSchemaIndexExists` | Geliştirici Hatası | Dizin zaten mevcut |
+| **31001** | `DEV_MIGRATION_NOT_ALLOWED_WITH_DATA` | `ResultType.devMigrationNotAllowedWithData` | Geliştirici Hatası | Geçiş veri değişikliği gerektiriyor ancak açıkça izin verilmemiş |
+| **31002** | `DEV_MIGRATION_UNSAFE_TYPE_CONVERSION` | `ResultType.devMigrationUnsafeTypeConversion` | Geliştirici Hatası | Alan için desteklenmeyen veri türü değişikliği |
+| **31003** | `DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD` | `ResultType.devMigrationCannotAddNonNullField` | Geliştirici Hatası | Varsayılan değer olmadan null olamaz alan eklenmesine izin verilmez |
+| **31004** | `DEV_MIGRATION_NULLABLE_TO_NON_NULL_NOT_ALLOWED` | `ResultType.devMigrationNullableToNonNullNotAllowed` | Geliştirici Hatası | Alanın null olabilir durumdan null olamaz duruma getirilmesine izin verilmez |
+| **31005** | `DEV_MIGRATION_UNIQUE_TIGHTENING_NOT_ALLOWED` | `ResultType.devMigrationUniqueTighteningNotAllowed` | Geliştirici Hatası | UNIQUE olarak sıkılaştırmaya izin verilmez |
+| **31006** | `DEV_MIGRATION_PROMOTE_LARGE_OP_NOT_ALLOWED` | `ResultType.devMigrationPromoteLargeOpNotAllowed` | Geliştirici Hatası | promoteFieldToPrimaryKey sırasında büyük ölçekli işlemler engellenir |
 | **50001** | `SYS_TRANSACTION_ABORTED` | `ResultType.sysTransactionAborted` | Sistem Hatası | İşlem iptal edildi |
 | **50002** | `SYS_TRANSACTION_CONFLICT` | `ResultType.sysTransactionConflict` | Sistem Hatası | İşlem çakışması |
 | **50003** | `SYS_TRANSACTION_LIMIT_EXCEEDED` | `ResultType.sysTransactionLimitExceeded` | Sistem Hatası | İşlem, bellek baskısı altında güvenli bellek sınırını aşıyor |

@@ -117,6 +117,42 @@ class SchemaBuilder with FutureBuilderMixin<SchemaUpdateResult> {
     IndexType type = IndexType.btree,
     VectorIndexConfig? vectorConfig,
   }) {
+    if (fields.isEmpty) {
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devInvalidArgumentMissing,
+          message:
+              'Must provide at least one field to create an index on table "$_tableName".',
+          parameterName: 'fields',
+        ),
+      ]);
+    }
+    if (type == IndexType.vector) {
+      if (fields.length != 1) {
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.devInvalidSchemaIndexType,
+            message:
+                'Vector index on table "$_tableName" can only be created on a single field, but ${fields.length} fields were specified (${fields.join(', ')}).',
+            tableName: _tableName,
+            field: fields.join(','),
+            wrongValue: fields.length,
+          ),
+        ]);
+      }
+      if (unique == true) {
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.devInvalidSchemaIndexType,
+            message:
+                'Vector index on table "$_tableName" cannot be unique. Vector indices do not support unique constraints.',
+            tableName: _tableName,
+            field: fields.first,
+            wrongValue: true,
+          ),
+        ]);
+      }
+    }
     _operations.add(MigrationOperation(
       type: MigrationType.addIndex,
       index: IndexSchema(

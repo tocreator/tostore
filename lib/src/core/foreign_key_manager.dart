@@ -412,8 +412,8 @@ class ForeignKeyManager {
       if (refField == referencedSchema.primaryKey) {
         // Use primary key conversion to ensure type consistency
         // Primary keys are always stored as strings
-        convertedValue =
-            referencedSchema.primaryKeyConfig.convertPrimaryKey(fkValue);
+        convertedValue = referencedSchema.primaryKeyConfig
+            .convertPrimaryKey(fkValue, tableName: fk.referencedTable);
       } else {
         // For non-primary key fields, find the field schema and convert
         final refFieldSchema = referencedSchema.fields.firstWhere(
@@ -1201,8 +1201,8 @@ class ForeignKeyManager {
           name: fieldName,
           type: childSchema.primaryKeyConfig.getDefaultDataType(),
         );
-        convertedCondition[fieldName] =
-            childSchema.primaryKeyConfig.convertPrimaryKey(value);
+        convertedCondition[fieldName] = childSchema.primaryKeyConfig
+            .convertPrimaryKey(value, tableName: childTableName);
       } else {
         fieldSchema = childSchema.fields.firstWhere(
           (f) => f.name == fieldName,
@@ -1283,7 +1283,7 @@ class ForeignKeyManager {
             // Primary key field - use primary key conversion
             convertedCondition[fieldName] = childSchemaForConversion
                 .primaryKeyConfig
-                .convertPrimaryKey(value);
+                .convertPrimaryKey(value, tableName: childTableName);
           } else {
             fieldSchema = childSchemaForConversion.fields.firstWhere(
               (f) => f.name == fieldName,

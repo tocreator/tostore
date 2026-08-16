@@ -1,4 +1,4 @@
-# ToStore ResultStatus 自动化诊断与状态解析规范文档
+﻿# ToStore ResultStatus 自动化诊断与状态解析规范文档
 
 为了方便自动化运维、AI 智能体代理、自动化测试脚本以及客户端程序精准识别数据库的各种运行结果和异常状态，ToStore 在新版本中引入了结构化的 `ResultStatus` 体系。
 
@@ -61,7 +61,7 @@
 | ----------- | --------- | ----------------------------------------- |
 | `index`     | `int`     | 在批量操作中的记录序号/索引。若是单条操作，则固定为 `0`            |
 | `code`      | `int`     | 数字状态码（0 代表成功，5 位数字代表异常）                   |
-| `codeKey`   | `String`  | 语义化状态标识符，例如 `CONSTRAINT_VIOLATION_UNIQUE` |
+| `codeKey`   | `String`  | 语义化状态标识符，例如 `BIZ_CONSTRAINT_UNIQUE` |
 | `message`   | `String`  | 人类可读的状态详情描述信息                             |
 
 ### 3.2 内存便捷判定只读属性 (In-Memory Helper Getters)
@@ -71,6 +71,7 @@
 | 属性名 (Property) | 类型 (Type) | 属性含义 (Description) |
 | --- | --- | --- |
 | `isBusinessError` | `bool` | 是否属于 **业务错误**（如约束冲突、格式强转失败等，数值区间 `10000 - 19999`） |
+| `isConstraintError` | `bool` | 是否映射为 **ConstraintStatus**（与 `isBusinessError` 同区间：`10000 - 19999`） |
 | `isDeveloperError` | `bool` | 是否属于 **开发者错误**（如无效 Schema、传参不合法、表不存在等，数值区间 `20000 - 49999`） |
 | `isSystemError` | `bool` | 是否属于 **系统错误**（如锁获取超时、磁盘已满、物理文件锁等，数值区间 `50000 - 79999`） |
 | `isEngineError` | `bool` | 是否属于 **底层引擎错误**（数值区间 `99000 - 99999`） |
@@ -108,7 +109,7 @@
 
 ### 4.2 ConstraintStatus（数据完整性与约束冲突状态）
 
-- **大类范围**：`code` 处于区间 `[10000, 19999]` 之间（主要为数据校验与完整性冲突）。
+- **大类范围**：`code` 处于区间 `[10000, 19999]`（全部业务错误叶子码：数据校验、完整性约束、记录未找到）。与 `ResultType.isConstraintError` 一致。
 - **专属字段定义**：
 
   | 专属字段 (Field)      | 类型 (Type)       | 字段含义及通用填充规则 (Details)                                                                                   |
@@ -139,7 +140,7 @@
   | `11010`<br>`bizValueLessThanMinLength` | 值长度小于 Schema 约束设定的最小长度 | <ul><li>`tableName`: 触发错误的表名</li><li>`constraintName`: `null`</li><li>`fields`: 违反最小长度限制的字段，例如 `["code"]`</li><li>`conflictingKeys`: 导致长度不足的具体值，例如 `["ab"]`</li><li>`primaryKey`: 操作的记录主键（如有）</li></ul> |
   | `11011`<br>`bizValueLessThanMinValue` | 数值小于 Schema 约束设定的最小值 | <ul><li>`tableName`: 触发错误的表名</li><li>`constraintName`: `null`</li><li>`fields`: 违反最小值限制的字段，例如 `["age"]`</li><li>`conflictingKeys`: 导致小于最小值的具体值，例如 `[-5]`</li><li>`primaryKey`: 操作的记录主键（如有）</li></ul> |
   | `11012`<br>`bizValueExceedsMaxValue` | 数值大于 Schema 约束设定的最大值 | <ul><li>`tableName`: 触发错误的表名</li><li>`constraintName`: `null`</li><li>`fields`: 违反最大值限制的字段，例如 `["score"]`</li><li>`conflictingKeys`: 导致超过最大值的具体值，例如 `[105]`</li><li>`primaryKey`: 操作的记录主键（如有）</li></ul> |
-  | `12002`<br>`bizRecordNotFound` | 目标记录不存在 / 指定的主键值未找到 | <ul><li>`tableName`: 操作的表名</li><li>`constraintName`: `null`</li><li>`fields`: 被查询定位的字段列表，例如 `["id"]`</li><li>`conflictingKeys`: 试图定位但未找到的键值，例如 `["non_exist_id"]`</li><li>`primaryKey`: 未找到的记录主键 `"non_exist_id"`</li></ul> | |
+  | `12001`<br>`bizRecordNotFound` | 目标记录不存在 / 指定的主键值未找到 | <ul><li>`tableName`: 操作的表名</li><li>`constraintName`: `null`</li><li>`fields`: 被查询定位的字段列表，例如 `["id"]`</li><li>`conflictingKeys`: 试图定位但未找到的键值，例如 `["non_exist_id"]`</li><li>`primaryKey`: 未找到的记录主键 `"non_exist_id"`</li></ul> | |
 
 - **JSON 反序列化样例**（外键父项不存在冲突）：
   ```json
@@ -161,7 +162,7 @@
 
 ### 4.3 SchemaValidationStatus（数据库表结构校验与不兼容迁移状态）
 
-- **大类范围**：`code` 处于区间 `[30000, 39999]` 之间（主要为 Schema 静态校验错误以及表结构版本物理迁移不兼容错误）。
+- **大类范围**：`code` 处于区间 `[30000, 39999]`（`30000–30013` 为 Schema 静态校验，`31001–31006` 为迁移防护）。
 - **专属字段定义**：
 
   | 专属字段 (Field) | 类型 (Type) | 字段含义及填充规则 (Details)                                                                     |
@@ -177,27 +178,29 @@
   | `30000`<br>`devInvalidSchema` | 表的 Schema 结构定义配置不正确 | <ul><li>`tableName`: 数据库表名</li><li>`field`: `null`</li><li>`wrongValue`: 无效的配置 Map，或 `null`</li></ul> |
   | `30001`<br>`devInvalidSchemaTableName` | Schema 表名包含非法字符或超过长度限制 | <ul><li>`tableName`: 非法的表名</li><li>`field`: `null`</li><li>`wrongValue`: 非法的表名值</li></ul> |
   | `30002`<br>`devInvalidSchemaFieldName` | Schema 字段名包含非法字符 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 非法的字段名</li><li>`wrongValue`: 非法的字段名值</li></ul> |
-  | `30003`<br>`devInvalidSchemaPrimaryKey` | Schema 主键配置格式非法或缺失 | <ul><li>`tableName`: 数据库表名</li><li>`field`: `"primaryKey"` 或 主键字段名</li><li>`wrongValue`: 无效的主键配置定义</li></ul> |
-  | `30004`<br>`devInvalidSchemaIndexLimit` | 该表配置的索引数超出了 16 个的系统限制 | <ul><li>`tableName`: 数据库表名</li><li>`field`: `null`</li><li>`wrongValue`: 超限的索引配置列表</li></ul> |
-  | `30005`<br>`devSchemaTableExists` | 创建表冲突，目标表已经存在 | <ul><li>`tableName`: 数据库表名</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
-  | `30006`<br>`devSchemaFieldExists` | 结构升级中，添加了已经存在的同名字段 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 冲突的字段名</li><li>`wrongValue`: `null`</li></ul> |
-  | `30007`<br>`devSchemaIndexExists` | 追加了同名的索引配置 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 索引名称</li><li>`wrongValue`: `null`</li></ul> |
+  | `30003`<br>`devInvalidSchemaDuplicateFieldName` | 字段重复配置冲突 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 重复的字段名</li><li>`wrongValue`: `null`</li></ul> |
+  | `30004`<br>`devInvalidSchemaPrimaryKey` | Schema 主键配置格式非法或缺失 | <ul><li>`tableName`: 数据库表名</li><li>`field`: `"primaryKey"` 或 主键字段名</li><li>`wrongValue`: 无效的主键配置定义</li></ul> |
+  | `30005`<br>`devInvalidSchemaIndexLimit` | 该表配置的索引数超出了 16 个的系统限制 | <ul><li>`tableName`: 数据库表名</li><li>`field`: `null`</li><li>`wrongValue`: 超限的索引配置列表</li></ul> |
+  | `30006`<br>`devInvalidSchemaIndexField` | 索引指向了表中并不存在的字段名 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 索引名称</li><li>`wrongValue`: 索引指向的但在表结构中未定义的非法字段名</li></ul> |
+  | `30007`<br>`devInvalidSchemaIndexType` | 索引类型与字段数据类型或配置不兼容 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 索引/字段名</li><li>`wrongValue`: 冲突类型信息，如 `{ "indexType": "btree", "fieldType": "vector" }`</li></ul> |
   | `30008`<br>`devInvalidSchemaForeignKey` | 外键定义格式非法（如自引用、字段数不对应） | <ul><li>`tableName`: 数据库表名</li><li>`field`: 外键名称</li><li>`wrongValue`: 无效的外键配置定义</li></ul> |
   | `30009`<br>`devInvalidSchemaSpaceMismatch` | 全局表/Space空间表范围定义越界或冲突 | <ul><li>`tableName`: 数据库表名</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
-  | `30010`<br>`devMigrationNotAllowedWithData` | 结构物理迁移要求对已有数据表进行列修改/删除等有损物理变动，但调用未显式授权允许物理迁移 | <ul><li>`tableName`: 数据库表名</li><li>`field`: `null`</li><li>`wrongValue`: 进行迁移的升级差异集</li></ul> |
-  | `30011`<br>`devMigrationUnsafeTypeConversion` | 物理迁移：不支持且极高风险的数据类型转换操作 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 字段名</li><li>`wrongValue`: 迁移时发生转换冲突的类型参数，如 `{ "from": "text", "to": "integer" }`</li></ul> |
-  | `30013`<br>`devMigrationCannotAddNonNullField` | 无法对已有数据的表追加不带 default 值的非空 (NOT NULL) 字段 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 试图添加的非空字段名</li><li>`wrongValue`: 冲突的迁移参数，如 `{ "nullable": false, "defaultValue": null }`</li></ul> |
-  | `30014`<br>`devMigrationNullableToNonNullNotAllowed` | 物理迁移：在非空表上将字段从 Null 改为 Non-Null 且无默认值 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 字段名</li><li>`wrongValue`: 冲突的迁移参数，同 30013</li></ul> |
-  | `30015`<br>`devMigrationUniqueTighteningNotAllowed` | 物理迁移：将非空表上的字段收紧为 UNIQUE，强制拦截抛出 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 字段名</li><li>`wrongValue`: 导致收紧唯一性的索引定义</li></ul> |
-  | `30016`<br>`devInvalidSchemaTtlConfig` | 表的 TTL（数据生存周期）配置项非法 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 生效的 TTL 字段名</li><li>`wrongValue`: 无效的 TTL 配置 Map，如 `{ "enabled": true, "fieldName": "expire_at" }`</li></ul> |
-  | `30017`<br>`devInvalidSchemaDuplicateFieldName` | 字段重复配置冲突 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 重复的字段名</li><li>`wrongValue`: `null`</li></ul> |
-  | `30018`<br>`devInvalidSchemaIndexField` | 索引指向了表中并不存在的字段名 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 索引名称</li><li>`wrongValue`: 索引指向的但在表结构中未定义的非法字段名</li></ul> |
+  | `30010`<br>`devInvalidSchemaTtlConfig` | 表的 TTL（数据生存周期）配置项非法 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 生效的 TTL 字段名</li><li>`wrongValue`: 无效的 TTL 配置 Map，如 `{ "enabled": true, "fieldName": "expire_at" }`</li></ul> |
+  | `30011`<br>`devSchemaTableExists` | 创建表冲突，目标表已经存在 | <ul><li>`tableName`: 数据库表名</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
+  | `30012`<br>`devSchemaFieldExists` | 结构升级中，添加了已经存在的同名字段 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 冲突的字段名</li><li>`wrongValue`: `null`</li></ul> |
+  | `30013`<br>`devSchemaIndexExists` | 追加了同名的索引配置 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 索引名称</li><li>`wrongValue`: `null`</li></ul> |
+  | `31001`<br>`devMigrationNotAllowedWithData` | 结构物理迁移要求对已有数据表进行列修改/删除等有损物理变动，但调用未显式授权允许物理迁移 | <ul><li>`tableName`: 数据库表名</li><li>`field`: `null`</li><li>`wrongValue`: 进行迁移的升级差异集</li></ul> |
+  | `31002`<br>`devMigrationUnsafeTypeConversion` | 物理迁移：不支持且极高风险的数据类型转换操作 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 字段名</li><li>`wrongValue`: 迁移时发生转换冲突的类型参数，如 `{ "from": "text", "to": "integer" }`</li></ul> |
+  | `31003`<br>`devMigrationCannotAddNonNullField` | 无法对已有数据的表追加不带 default 值的非空 (NOT NULL) 字段 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 试图添加的非空字段名</li><li>`wrongValue`: 冲突的迁移参数，如 `{ "nullable": false, "defaultValue": null }`</li></ul> |
+  | `31004`<br>`devMigrationNullableToNonNullNotAllowed` | 物理迁移：在非空表上将字段从 Null 改为 Non-Null 且无默认值 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 字段名</li><li>`wrongValue`: 冲突的迁移参数，同 31003</li></ul> |
+  | `31005`<br>`devMigrationUniqueTighteningNotAllowed` | 物理迁移：将非空表上的字段收紧为 UNIQUE，强制拦截抛出 | <ul><li>`tableName`: 数据库表名</li><li>`field`: 字段名</li><li>`wrongValue`: 导致收紧唯一性的索引定义</li></ul> |
+  | `31006`<br>`devMigrationPromoteLargeOpNotAllowed` | 正在执行 promoteFieldToPrimaryKey 时不允许大规模数据操作 | <ul><li>`tableName`: 数据库表名</li><li>`field`: `null`</li><li>`wrongValue`: promote 阶段/任务 id（如有）</li></ul> |
 
 - **JSON 反序列化样例**（对已有数据的表强加非空且无默认值字段）：
   ```json
   {
     "index": 0,
-    "code": 30013,
+    "code": 31003,
     "codeKey": "DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD",
     "message": "Cannot add non-nullable field \"phone\" without a default value to non-empty table \"users\". This operation is physically impossible and would fail during data write.",
     "tableName": "users",
@@ -213,7 +216,7 @@
 
 ### 4.4 InvalidArgumentStatus（接口传参及游标分页校验异常）
 
-- **大类范围**：`code` 处于区间 `[20000, 20999]` 之间（主要为 API 接口的入参格式、传参类型或分页游标不合法校验错误）。
+- **大类范围**：`code` 处于区间 `[20000, 20999]`（**排除** `20005` / `20006`），**另含** `22004`（`devFieldNotFound`）。`20005` / `20006` 及其他 `2200x` 未找到类码见 GeneralStatus（§4.6）。
 - **专属字段定义**：
 
   | 专属字段 (Field)    | 类型 (Type) | 字段含义及填充规则 (Details)                                                                   |
@@ -229,27 +232,27 @@
   | **Code**: `20001`<br>`ResultType.devInvalidArgumentFormat` | 传参值格式错误（如非法的 key 格式） | <ul><li>`parameterName`: 非法传参的参数名 (如 `"id"`, `"age"`)</li><li>`passedValue`: 传入的非法格式值，如 `"twenty"`</li><li>`primaryKey`: 操作的记录主键（如有）</li></ul> |
   | **Code**: `20002`<br>`ResultType.devInvalidArgumentType` | 参数的数据类型不匹配（期待数字传入字符串等） | <ul><li>`parameterName`: 参数名</li><li>`passedValue`: 传入的非法类型对象，如 `{"foo": "bar"}`（被期望为 String 时）</li><li>`primaryKey`: 操作的记录主键（如有）</li></ul> |
   | **Code**: `20003`<br>`ResultType.devInvalidArgumentMissing` | 必填的接口入参未传入 | <ul><li>`parameterName`: 缺失的必填参数名 (如 `"dbPath"`)</li><li>`passedValue`: `null` (代表该值未传)</li><li>`primaryKey`: 操作的记录主键（如有）</li></ul> |
-  | **Code**: `20005`<br>`ResultType.devInvalidPrimaryKeyFormat` | 主键的值格式不符合主键策略（例如自增主键传入了非法的自定义字符串） | <ul><li>`parameterName`: `"primaryKey"` 或 主键字段名</li><li>`passedValue`: 传入的非法主键值，例如 `"invalid_id_value"`</li><li>`primaryKey`: 传入的非法主键值</li></ul> |
+  | **Code**: `20004`<br>`ResultType.devInvalidPrimaryKeyFormat` | 主键的值格式不符合主键策略（例如自增主键传入了非法的自定义字符串） | <ul><li>`parameterName`: `"primaryKey"` 或 主键字段名</li><li>`passedValue`: 传入的非法主键值，例如 `"invalid_id_value"`</li><li>`primaryKey`: 传入的非法主键值</li></ul> |
 
-  | **Code**: `20010`<br>`ResultType.devVectorDimensionMismatch` | 向量计算或比较时维度不匹配（如点积、距离计算等） | <ul><li>`parameterName`: `"other"`</li><li>`passedValue`: 传入向量的非法维度值</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `20011`<br>`ResultType.devIndexFieldMissing` | 从最后一包记录计算游标时，记录中缺失必要的索引字段（用于游标计算续读） | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: 缺失的字段名</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `20201`<br>`ResultType.devInvalidCursorPagination` | 分页冲突（游标分页和 Offset 分页不能同时配置） | <ul><li>`parameterName`: `"cursor"` / `"offset"`</li><li>`passedValue`: 冲突的分页配置对象</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `20202`<br>`ResultType.devInvalidCursorTable` | 游标包含的表与当前查询表不一致 | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: 游标字符串 (指出游标和当前表不相符)</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `20203`<br>`ResultType.devInvalidCursorSignature` | 游标签名哈希校验失败（游标已被篡改） | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: 游标值 (指出签名校验已被损坏或篡改)</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `20204`<br>`ResultType.devInvalidCursorOrderBy` | 游标的 orderBy 配置不合规或与原查询不匹配 | <ul><li>`parameterName`: `"orderBy"`</li><li>`passedValue`: 传入的 orderBy 配置数组，如 `["-age", "id"]`</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `20205`<br>`ResultType.devInvalidCursorMode` | 游标 Token 模式不匹配 | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: 当前尝试读取的游标模式字符串，如 `"sortKey"`</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `20206`<br>`ResultType.devInvalidCursorPayload` | 无法解码或反序列化的非法游标载荷 | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: `null` (代表不可解析的乱码或非法游标 Payload)</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `20301`<br>`ResultType.devInvalidQuerySelectField` | 查询 Select 字段非法（不是 String 或 QueryAggregation） | <ul><li>`parameterName`: `"select"`</li><li>`passedValue`: 传入的非法的查询投影字段值</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `20302`<br>`ResultType.devInvalidQueryForeignKeyJoin` | 自动 Join 时两表之间未定义外键关系 | <ul><li>`parameterName`: `"join"` / `"tableName"`</li><li>`passedValue`: 试图进行自动 Join 的未定义关联的另一张表名</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `20303`<br>`ResultType.devInvalidQueryFieldAlias` | 查询字段的别名命名格式不正确 | <ul><li>`parameterName`: `"alias"`</li><li>`passedValue`: 非法的查询别名定义</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `20304`<br>`ResultType.devInvalidExpression` | 表达式配置或求值执行异常（如内置函数参数不符、未知函数等） | <ul><li>`parameterName`: 异常维度（如 `"arguments"`, `"functionName"`, `"node"`)</li><li>`passedValue`: 非法值或参数长度</li><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `22005`<br>`ResultType.devFieldNotFound` | 传入了表中未定义的未知字段 | <ul><li>`parameterName`: 未知或不存在的字段名 (如 `"extra"`)</li><li>`passedValue`: 传入的未知字段值</li><li>`primaryKey`: 操作 of the record primary key (if any)</li></ul> |
+  | **Code**: `20007`<br>`ResultType.devVectorDimensionMismatch` | 向量计算或比较时维度不匹配（如点积、距离计算等） | <ul><li>`parameterName`: `"other"`</li><li>`passedValue`: 传入向量的非法维度值</li><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `20008`<br>`ResultType.devIndexFieldMissing` | 从最后一包记录计算游标时，记录中缺失必要的索引字段（用于游标计算续读） | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: 缺失的字段名</li><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `20101`<br>`ResultType.devInvalidCursorPagination` | 分页冲突（游标分页和 Offset 分页不能同时配置） | <ul><li>`parameterName`: `"cursor"` / `"offset"`</li><li>`passedValue`: 冲突的分页配置对象</li><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `20102`<br>`ResultType.devInvalidCursorTable` | 游标包含的表与当前查询表不一致 | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: 游标字符串 (指出游标和当前表不相符)</li><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `20103`<br>`ResultType.devInvalidCursorSignature` | 游标签名哈希校验失败（游标已被篡改） | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: 游标值 (指出签名校验已被损坏或篡改)</li><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `20104`<br>`ResultType.devInvalidCursorOrderBy` | 游标的 orderBy 配置不合规或与原查询不匹配 | <ul><li>`parameterName`: `"orderBy"`</li><li>`passedValue`: 传入的 orderBy 配置数组，如 `["-age", "id"]`</li><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `20105`<br>`ResultType.devInvalidCursorMode` | 游标 Token 模式不匹配 | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: 当前尝试读取的游标模式字符串，如 `"sortKey"`</li><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `20106`<br>`ResultType.devInvalidCursorPayload` | 无法解码或反序列化的非法游标载荷 | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: `null` (代表不可解析的乱码或非法游标 Payload)</li><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `20201`<br>`ResultType.devInvalidQuerySelectField` | 查询 Select 字段非法（不是 String 或 QueryAggregation） | <ul><li>`parameterName`: `"select"`</li><li>`passedValue`: 传入的非法的查询投影字段值</li><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `20202`<br>`ResultType.devInvalidQueryForeignKeyJoin` | 自动 Join 时两表之间未定义外键关系 | <ul><li>`parameterName`: `"join"` / `"tableName"`</li><li>`passedValue`: 试图进行自动 Join 的未定义关联的另一张表名</li><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `20203`<br>`ResultType.devInvalidQueryFieldAlias` | 查询字段的别名命名格式不正确 | <ul><li>`parameterName`: `"alias"`</li><li>`passedValue`: 非法的查询别名定义</li><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `20204`<br>`ResultType.devInvalidExpression` | 表达式配置或求值执行异常（如内置函数参数不符、未知函数等） | <ul><li>`parameterName`: 异常维度（如 `"arguments"`, `"functionName"`, `"node"`)</li><li>`passedValue`: 非法值或参数长度</li><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `22004`<br>`ResultType.devFieldNotFound` | 传入了表中未定义的未知字段 | <ul><li>`parameterName`: 未知或不存在的字段名 (如 `"extra"`)</li><li>`passedValue`: 传入的未知字段值</li><li>`primaryKey`: 操作 of the record primary key (if any)</li></ul> |
 
 - **JSON 反序列化样例**（分页游标的排序条件与查询要求的排序条件冲突）：
   ```json
   {
     "index": 0,
-    "code": 20204,
+    "code": 20104,
     "codeKey": "DEV_INVALID_CURSOR_ORDERBY",
     "message": "Cursor orderBy fields do not match current query orderBy.",
     "parameterName": "orderBy",
@@ -262,7 +265,7 @@
 
 ### 4.5 TransactionOperationStatus（事务冲突与回滚异常状态）
 
-- **大类范围**：`code` 处于区间 `[50000, 50999]` 之间（主要为事务主动回滚、被动中止或并发更新导致的序列化冲突）。
+- **大类范围**：仅 `50001`（`sysTransactionAborted`）与 `50002`（`sysTransactionConflict`）。其余 `500xx`（如 `50003` / `50004`）见 GeneralStatus（§4.6）。
 - **专属字段定义**：
 
   | 专属字段 (Field) | 类型 (Type) | 字段含义及填充规则 (Details)                                     |
@@ -291,7 +294,7 @@
 
 ### 4.6 GeneralStatus（通用及系统级异常状态）
 
-- **大类范围**：除以上情况外，未归属于上述四个子类的所有其他状态码，均作为通用异常输出（主要为底层物理限制、系统故障、无权限访问或未知硬件错误）。
+- **大类范围**：不属于 §4.1–4.5 的其余状态码回退至此——包括 `20005` / `20006`、`22001`–`22003`、`230xx` / `240xx`、其余 `50xxx`–`53xxx`，以及 `99001`。
 - **专属字段定义**：
 
   | 专属字段 (Field) | 类型 (Type) | 字段含义及填充规则 (Details) |
@@ -304,11 +307,11 @@
 
   | 状态与内存类型<br>(Identity & Type) | 级别分类与典型触发场景<br>(Level & Trigger) | 专属字段填充规范 (Field Guidelines) |
   | :--- | :--- | :--- |
-  | **Code**: `20007`<br>`ResultType.devIndexOutOfBounds` | **级别**：开发者错误<br>索引或范围超限错误（如越界读写缓冲区）。 | <ul><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `20008`<br>`ResultType.devUnsupportedOperation` | **级别**：开发者错误<br>当前上下文不支持的操作（不支持该平台、未实现等）。 | <ul><li>`primaryKey`: `null`</li><li>`target`: 操作的资源名/表名（如有）</li><li>`operation`: 不支持的具体操作方法名（如有）</li></ul> |
+  | **Code**: `20005`<br>`ResultType.devIndexOutOfBounds` | **级别**：开发者错误<br>索引或范围超限错误（如越界读写缓冲区）。 | <ul><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `20006`<br>`ResultType.devUnsupportedOperation` | **级别**：开发者错误<br>当前上下文不支持的操作（不支持该平台、未实现等）。 | <ul><li>`primaryKey`: `null`</li><li>`target`: 操作的资源名/表名（如有）</li><li>`operation`: 不支持的具体操作方法名（如有）</li></ul> |
   | **Code**: `22001`<br>`ResultType.devTableNotFound` | **级别**：开发者错误<br>执行 Query 或写入时，传入了尚未创建的非物理表名。 | <ul><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `22003`<br>`ResultType.devIndexNotFound` | **级别**：开发者错误<br>执行 ForceIndex 查询时，指定了根本没有在 Schema 中建立的索引。 | <ul><li>`primaryKey`: `null`</li></ul> |
-  | **Code**: `22004`<br>`ResultType.devSpaceNotFound` | **级别**：开发者错误<br>试图操作或删除一个不存在 Space（命名空间/数据库文件路径）时触发。 | <ul><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `22002`<br>`ResultType.devIndexNotFound` | **级别**：开发者错误<br>执行 ForceIndex 查询时，指定了根本没有在 Schema 中建立的索引。 | <ul><li>`primaryKey`: `null`</li></ul> |
+  | **Code**: `22003`<br>`ResultType.devSpaceNotFound` | **级别**：开发者错误<br>试图操作或删除一个不存在 Space（命名空间/数据库文件路径）时触发。 | <ul><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `23001`<br>`ResultType.devLargeScaleOperationRequired` | **级别**：开发者错误<br>大规模数据操作需显式调用 `allowLargeScaleOperation()`（防 OOM；允许后阻塞分批完成，仅返回成功数；中断需自行重试）。 | <ul><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `23002`<br>`ResultType.devLargeScaleOperationNotAllowedInTransaction` | **级别**：开发者错误<br>事务内不允许大规模数据操作；该错误会使当前事务失败并回滚。 | <ul><li>`primaryKey`: `null`</li></ul> |
   | **Code**: `24001`<br>`ResultType.devEngineIncompatible` | **级别**：**致命错误**<br>库配置或数据文件与当前引擎版本不兼容，强制拦截抛出。 | <ul><li>`primaryKey`: `null`</li></ul> |
@@ -477,50 +480,52 @@ try {
 | **11010** | `BIZ_CONSTRAINT_MIN_LENGTH` | `ResultType.bizValueLessThanMinLength` | 业务错误 | 值长度小于 Schema 约束设定的最小长度 |
 | **11011** | `BIZ_CONSTRAINT_MIN_VALUE` | `ResultType.bizValueLessThanMinValue` | 业务错误 | 数值小于 Schema 约束设定的最小值 |
 | **11012** | `BIZ_CONSTRAINT_MAX_VALUE` | `ResultType.bizValueExceedsMaxValue` | 业务错误 | 数值大于 Schema 约束设定的最大值 |
-| **12002** | `BIZ_NOT_FOUND_RECORD` | `ResultType.bizRecordNotFound` | 业务错误 | 目标记录不存在 / 指定的主键值未找到 |
+| **12001** | `BIZ_NOT_FOUND_RECORD` | `ResultType.bizRecordNotFound` | 业务错误 | 目标记录不存在 / 指定的主键值未找到 |
 | **20001** | `DEV_INVALID_ARGUMENT_FORMAT` | `ResultType.devInvalidArgumentFormat` | 开发者错误 | 传参值格式错误（如非法的 key 格式） |
 | **20002** | `DEV_INVALID_ARGUMENT_TYPE` | `ResultType.devInvalidArgumentType` | 开发者错误 | 参数的数据类型不匹配（期待数字传入字符串等） |
 | **20003** | `DEV_INVALID_ARGUMENT_MISSING` | `ResultType.devInvalidArgumentMissing` | 开发者错误 | 必填的接口入参未传入 |
-| **20005** | `DEV_INVALID_PRIMARY_KEY_FORMAT` | `ResultType.devInvalidPrimaryKeyFormat` | 开发者错误 | 主键的值格式不符合主键策略（例如自增主键传入了非法的自定义字符串） |
-| **20007** | `DEV_INDEX_OUT_OF_BOUNDS` | `ResultType.devIndexOutOfBounds` | 开发者错误 | 索引或范围超限错误（如越界读写缓冲区） |
-| **20008** | `DEV_UNSUPPORTED_OPERATION` | `ResultType.devUnsupportedOperation` | 开发者错误 | 当前上下文不支持的操作（不支持该平台、未实现等） |
-| **20010** | `DEV_VECTOR_DIMENSION_MISMATCH` | `ResultType.devVectorDimensionMismatch` | 开发者错误 | 向量计算或比较时维度不匹配（如点积、距离计算等） |
-| **20011** | `DEV_INDEX_FIELD_MISSING` | `ResultType.devIndexFieldMissing` | 开发者错误 | 从最后一包记录计算游标时，记录中缺失必要的索引字段（用于游标计算续读） |
-| **20201** | `DEV_INVALID_CURSOR_PAGINATION` | `ResultType.devInvalidCursorPagination` | 开发者错误 | 分页冲突（游标分页和 Offset 分页不能同时配置） |
-| **20202** | `DEV_INVALID_CURSOR_TABLE` | `ResultType.devInvalidCursorTable` | 开发者错误 | 游标包含的表与当前查询表不一致 |
-| **20203** | `DEV_INVALID_CURSOR_SIGNATURE` | `ResultType.devInvalidCursorSignature` | 开发者错误 | 游标签名哈希校验失败（游标已被篡改） |
-| **20204** | `DEV_INVALID_CURSOR_ORDERBY` | `ResultType.devInvalidCursorOrderBy` | 开发者错误 | 游标的 orderBy 配置不合规或与原查询不匹配 |
-| **20205** | `DEV_INVALID_CURSOR_MODE` | `ResultType.devInvalidCursorMode` | 开发者错误 | 游标 Token 模式不匹配 |
-| **20206** | `DEV_INVALID_CURSOR_PAYLOAD` | `ResultType.devInvalidCursorPayload` | 开发者错误 | 无法解码或反序列化的非法游标载荷 |
-| **20301** | `DEV_INVALID_QUERY_SELECT_FIELD` | `ResultType.devInvalidQuerySelectField` | 开发者错误 | 查询 Select 字段非法（不是 String 或 QueryAggregation） |
-| **20302** | `DEV_INVALID_QUERY_FOREIGN_KEY_JOIN` | `ResultType.devInvalidQueryForeignKeyJoin` | 开发者错误 | 自动 Join 时两表之间未定义外键关系 |
-| **20303** | `DEV_INVALID_QUERY_FIELD_ALIAS` | `ResultType.devInvalidQueryFieldAlias` | 开发者错误 | 查询字段的别名命名格式不正确 |
-| **20304** | `DEV_INVALID_EXPRESSION` | `ResultType.devInvalidExpression` | 开发者错误 | 表达式配置或求值执行异常（如内置函数参数不符、未知函数等） |
+| **20004** | `DEV_INVALID_PRIMARY_KEY_FORMAT` | `ResultType.devInvalidPrimaryKeyFormat` | 开发者错误 | 主键的值格式不符合主键策略（例如自增主键传入了非法的自定义字符串） |
+| **20005** | `DEV_INDEX_OUT_OF_BOUNDS` | `ResultType.devIndexOutOfBounds` | 开发者错误 | 索引或范围超限错误（如越界读写缓冲区） |
+| **20006** | `DEV_UNSUPPORTED_OPERATION` | `ResultType.devUnsupportedOperation` | 开发者错误 | 当前上下文不支持的操作（不支持该平台、未实现等） |
+| **20007** | `DEV_VECTOR_DIMENSION_MISMATCH` | `ResultType.devVectorDimensionMismatch` | 开发者错误 | 向量计算或比较时维度不匹配（如点积、距离计算等） |
+| **20008** | `DEV_INDEX_FIELD_MISSING` | `ResultType.devIndexFieldMissing` | 开发者错误 | 从最后一包记录计算游标时，记录中缺失必要的索引字段（用于游标计算续读） |
+| **20101** | `DEV_INVALID_CURSOR_PAGINATION` | `ResultType.devInvalidCursorPagination` | 开发者错误 | 分页冲突（游标分页和 Offset 分页不能同时配置） |
+| **20102** | `DEV_INVALID_CURSOR_TABLE` | `ResultType.devInvalidCursorTable` | 开发者错误 | 游标包含的表与当前查询表不一致 |
+| **20103** | `DEV_INVALID_CURSOR_SIGNATURE` | `ResultType.devInvalidCursorSignature` | 开发者错误 | 游标签名哈希校验失败（游标已被篡改） |
+| **20104** | `DEV_INVALID_CURSOR_ORDERBY` | `ResultType.devInvalidCursorOrderBy` | 开发者错误 | 游标的 orderBy 配置不合规或与原查询不匹配 |
+| **20105** | `DEV_INVALID_CURSOR_MODE` | `ResultType.devInvalidCursorMode` | 开发者错误 | 游标 Token 模式不匹配 |
+| **20106** | `DEV_INVALID_CURSOR_PAYLOAD` | `ResultType.devInvalidCursorPayload` | 开发者错误 | 无法解码或反序列化的非法游标载荷 |
+| **20201** | `DEV_INVALID_QUERY_SELECT_FIELD` | `ResultType.devInvalidQuerySelectField` | 开发者错误 | 查询 Select 字段非法（不是 String 或 QueryAggregation） |
+| **20202** | `DEV_INVALID_QUERY_FOREIGN_KEY_JOIN` | `ResultType.devInvalidQueryForeignKeyJoin` | 开发者错误 | 自动 Join 时两表之间未定义外键关系 |
+| **20203** | `DEV_INVALID_QUERY_FIELD_ALIAS` | `ResultType.devInvalidQueryFieldAlias` | 开发者错误 | 查询字段的别名命名格式不正确 |
+| **20204** | `DEV_INVALID_EXPRESSION` | `ResultType.devInvalidExpression` | 开发者错误 | 表达式配置或求值执行异常（如内置函数参数不符、未知函数等） |
 | **22001** | `DEV_NOT_FOUND_TABLE` | `ResultType.devTableNotFound` | 开发者错误 | 要操作的数据库表名称不存在 |
-| **22003** | `DEV_NOT_FOUND_INDEX` | `ResultType.devIndexNotFound` | 开发者错误 | 指定查询引用的索引不存在 |
-| **22004** | `DEV_NOT_FOUND_SPACE` | `ResultType.devSpaceNotFound` | 开发者错误 | 指定的存储空间（Space）在物理或逻辑上不存在 |
-| **22005** | `DEV_NOT_FOUND_FIELD` | `ResultType.devFieldNotFound` | 开发者错误 | 传入了表中未定义的未知字段 |
+| **22002** | `DEV_NOT_FOUND_INDEX` | `ResultType.devIndexNotFound` | 开发者错误 | 指定查询引用的索引不存在 |
+| **22003** | `DEV_NOT_FOUND_SPACE` | `ResultType.devSpaceNotFound` | 开发者错误 | 指定的存储空间（Space）在物理或逻辑上不存在 |
+| **22004** | `DEV_NOT_FOUND_FIELD` | `ResultType.devFieldNotFound` | 开发者错误 | 传入了表中未定义的未知字段 |
 | **23001** | `DEV_LARGE_SCALE_OPERATION_REQUIRED` | `ResultType.devLargeScaleOperationRequired` | 开发者错误 | 大规模数据操作需显式调用 `allowLargeScaleOperation()`（防 OOM） |
 | **23002** | `DEV_LARGE_SCALE_OPERATION_NOT_ALLOWED_IN_TRANSACTION` | `ResultType.devLargeScaleOperationNotAllowedInTransaction` | 开发者错误 | 事务内不允许大规模数据操作 |
 | **24001** | `DEV_ENGINE_INCOMPATIBLE` | `ResultType.devEngineIncompatible` | **致命错误** | 库配置或数据文件与当前引擎版本不兼容，强制拦截抛出 |
 | **30000** | `DEV_INVALID_SCHEMA` | `ResultType.devInvalidSchema` | 开发者错误 | 表的 Schema 结构定义配置不正确 |
 | **30001** | `DEV_INVALID_SCHEMA_TABLE_NAME` | `ResultType.devInvalidSchemaTableName` | 开发者错误 | Schema 表名包含非法字符或超过长度限制 |
 | **30002** | `DEV_INVALID_SCHEMA_FIELD_NAME` | `ResultType.devInvalidSchemaFieldName` | 开发者错误 | Schema 字段名包含非法字符 |
-| **30003** | `DEV_INVALID_SCHEMA_PRIMARY_KEY` | `ResultType.devInvalidSchemaPrimaryKey` | 开发者错误 | Schema 主键配置格式非法或缺失 |
-| **30004** | `DEV_INVALID_SCHEMA_INDEX_LIMIT` | `ResultType.devInvalidSchemaIndexLimit` | 开发者错误 | 该表配置的索引数超出了 16 个的系统限制 |
-| **30005** | `DEV_SCHEMA_TABLE_EXISTS` | `ResultType.devSchemaTableExists` | 开发者错误 | 创建表冲突，目标表已经存在 |
-| **30006** | `DEV_SCHEMA_FIELD_EXISTS` | `ResultType.devSchemaFieldExists` | 开发者错误 | 结构升级中，添加了已经存在的同名字段 |
-| **30007** | `DEV_SCHEMA_INDEX_EXISTS` | `ResultType.devSchemaIndexExists` | 开发者错误 | 追加了同名的索引配置 |
+| **30003** | `DEV_INVALID_SCHEMA_DUPLICATE_FIELD_NAME` | `ResultType.devInvalidSchemaDuplicateFieldName` | 开发者错误 | 字段重复配置冲突 |
+| **30004** | `DEV_INVALID_SCHEMA_PRIMARY_KEY` | `ResultType.devInvalidSchemaPrimaryKey` | 开发者错误 | Schema 主键配置格式非法或缺失 |
+| **30005** | `DEV_INVALID_SCHEMA_INDEX_LIMIT` | `ResultType.devInvalidSchemaIndexLimit` | 开发者错误 | 该表配置的索引数超出了 16 个的系统限制 |
+| **30006** | `DEV_INVALID_SCHEMA_INDEX_FIELD` | `ResultType.devInvalidSchemaIndexField` | 开发者错误 | 索引指向了表中并不存在的字段名 |
+| **30007** | `DEV_INVALID_SCHEMA_INDEX_TYPE` | `ResultType.devInvalidSchemaIndexType` | 开发者错误 | 索引类型与字段数据类型或配置不兼容 |
 | **30008** | `DEV_INVALID_SCHEMA_FOREIGN_KEY` | `ResultType.devInvalidSchemaForeignKey` | 开发者错误 | 外键定义格式非法（如自引用、字段数不对应） |
 | **30009** | `DEV_INVALID_SCHEMA_SPACE_MISMATCH` | `ResultType.devInvalidSchemaSpaceMismatch` | 开发者错误 | 跨 Space 表关系校验冲突 |
-| **30010** | `DEV_MIGRATION_NOT_ALLOWED_WITH_DATA` | `ResultType.devMigrationNotAllowedWithData` | **致命错误** | 结构迁移需要物理变更字段但未被显式允许（`allowPhysicalMigration=false`） |
-| **30011** | `DEV_MIGRATION_UNSAFE_TYPE_CONVERSION` | `ResultType.devMigrationUnsafeTypeConversion` | **致命错误** | 物理迁移：不支持且极高风险的数据类型转换操作 |
-| **30013** | `DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD` | `ResultType.devMigrationCannotAddNonNullField` | **致命错误** | 无法对已有数据的表追加不带 default 值的非空 (NOT NULL) 字段 |
-| **30014** | `DEV_MIGRATION_NULLABLE_TO_NON_NULL_NOT_ALLOWED` | `ResultType.devMigrationNullableToNonNullNotAllowed` | **致命错误** | 物理迁移：在非空表上将字段从 Null 改为 Non-Null 且无默认值 |
-| **30015** | `DEV_MIGRATION_UNIQUE_TIGHTENING_NOT_ALLOWED` | `ResultType.devMigrationUniqueTighteningNotAllowed` | **致命错误** | 物理迁移：将非空表上的字段收紧为 UNIQUE，强制拦截抛出 |
-| **30016** | `DEV_INVALID_SCHEMA_TTL_CONFIG` | `ResultType.devInvalidSchemaTtlConfig` | 开发者错误 | 表的 TTL（数据生存周期）配置项非法 |
-| **30017** | `DEV_INVALID_SCHEMA_DUPLICATE_FIELD_NAME` | `ResultType.devInvalidSchemaDuplicateFieldName` | 开发者错误 | 字段重复配置冲突 |
-| **30018** | `DEV_INVALID_SCHEMA_INDEX_FIELD` | `ResultType.devInvalidSchemaIndexField` | 开发者错误 | 索引指向了表中并不存在的字段名 |
+| **30010** | `DEV_INVALID_SCHEMA_TTL_CONFIG` | `ResultType.devInvalidSchemaTtlConfig` | 开发者错误 | 表的 TTL（数据生存周期）配置项非法 |
+| **30011** | `DEV_SCHEMA_TABLE_EXISTS` | `ResultType.devSchemaTableExists` | 开发者错误 | 创建表冲突，目标表已经存在 |
+| **30012** | `DEV_SCHEMA_FIELD_EXISTS` | `ResultType.devSchemaFieldExists` | 开发者错误 | 结构升级中，添加了已经存在的同名字段 |
+| **30013** | `DEV_SCHEMA_INDEX_EXISTS` | `ResultType.devSchemaIndexExists` | 开发者错误 | 追加了同名的索引配置 |
+| **31001** | `DEV_MIGRATION_NOT_ALLOWED_WITH_DATA` | `ResultType.devMigrationNotAllowedWithData` | **致命错误** | 结构迁移需要物理变更字段但未被显式允许（`allowPhysicalMigration=false`） |
+| **31002** | `DEV_MIGRATION_UNSAFE_TYPE_CONVERSION` | `ResultType.devMigrationUnsafeTypeConversion` | **致命错误** | 物理迁移：不支持且极高风险的数据类型转换操作 |
+| **31003** | `DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD` | `ResultType.devMigrationCannotAddNonNullField` | **致命错误** | 无法对已有数据的表追加不带 default 值的非空 (NOT NULL) 字段 |
+| **31004** | `DEV_MIGRATION_NULLABLE_TO_NON_NULL_NOT_ALLOWED` | `ResultType.devMigrationNullableToNonNullNotAllowed` | **致命错误** | 物理迁移：在非空表上将字段从 Null 改为 Non-Null 且无默认值 |
+| **31005** | `DEV_MIGRATION_UNIQUE_TIGHTENING_NOT_ALLOWED` | `ResultType.devMigrationUniqueTighteningNotAllowed` | **致命错误** | 物理迁移：将非空表上的字段收紧为 UNIQUE，强制拦截抛出 |
+| **31006** | `DEV_MIGRATION_PROMOTE_LARGE_OP_NOT_ALLOWED` | `ResultType.devMigrationPromoteLargeOpNotAllowed` | 开发者错误 | 正在执行 promoteFieldToPrimaryKey 时不允许大规模数据操作 |
 | **50001** | `SYS_TRANSACTION_ABORTED` | `ResultType.sysTransactionAborted` | 系统错误 | 事务主动回滚或被强制中止 |
 | **50002** | `SYS_TRANSACTION_CONFLICT` | `ResultType.sysTransactionConflict` | 系统错误 | 并发事务修改了同一实体导致版本冲突 |
 | **50003** | `SYS_TRANSACTION_LIMIT_EXCEEDED` | `ResultType.sysTransactionLimitExceeded` | 系统错误 | 事务在内存压力下超过安全内存限制 |

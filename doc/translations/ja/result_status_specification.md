@@ -58,7 +58,7 @@
 | :--- | :--- | :--- |
 | `index` | `int` | バッチ操作におけるシーケンスインデックス。単一操作の場合、これは`0`に固定されます。 |
 | `code` | `int` | 数値ステータスコード（成功時は`0`、例外時は5桁の数字）。 |
-| `codeKey` | `String` | セマンティック状態識別子キー（例: `CONSTRAINT_VIOLATION_UNIQUE`）。 |
+| `codeKey` | `String` | セマンティック状態識別子キー（例: `BIZ_CONSTRAINT_UNIQUE`）。 |
 | `message` | `String` | 人間が読めるステータス詳細の説明。 |
 
 ### 3.2 メモリ内判定用の便利なゲッター (In-Memory Helper Getters)
@@ -68,6 +68,7 @@ Dart/Flutterでは、`ResultStatus`と`ResultType`は、手動の範囲チェッ
 | プロパティ | タイプ | 説明 |
 | :--- | :--- | :--- |
 | `isBusinessError` | `bool` | **ビジネスエラー**であるかどうか（制約違反、キャスト失敗など。範囲: `10000 - 19999`）。 |
+| `isConstraintError` | `bool` | **ConstraintStatus** に対応するかどうか（`isBusinessError` と同じ数値範囲: `10000 - 19999`）。 |
 | `isDeveloperError` | `bool` | **開発者エラー**であるかどうか（無効なスキーマ、パラメータ不一致、テーブル未検出など。範囲: `20000 - 49999`）。 |
 | `isSystemError` | `bool` | **システムエラー**であるかどうか（ロックタイムアウト、ディスクフル、ファイルロックなど。範囲: `50000 - 79999`）。 |
 | `isEngineError` | `bool` | **エンジンエラー**であるかどうか（範囲: `99000 - 99999`）。 |
@@ -104,7 +105,7 @@ Dart/Flutterでは、`ResultStatus`と`ResultType`は、手動の範囲チェッ
 
 ### 4.2 ConstraintStatus（データ整合性と制約衝突状態）
 
-- **カテゴリ範囲**: `code`が`[10000, 19999]`の範囲（主にデータ検証および整合性制約の競合）。
+- **カテゴリ範囲**: `code`が`[10000, 19999]`の範囲（ビジネスエラーの全リーフコード：検証、整合性制約、レコード未検出）。`ResultType.isConstraintError` と一致。
 - **専用フィールド定義**:
 
   | フィールド | タイプ | 詳細 |
@@ -135,7 +136,7 @@ Dart/Flutterでは、`ResultStatus`と`ResultType`は、手動の範囲チェッ
   | `11010`<br>`bizValueLessThanMinLength` | 値の長さがスキーマ制限未満です | <ul><li>`tableName`: 対象テーブル</li><li>`constraintName`: `null`</li><li>`fields`: 制約に違反したフィールド、例 `["code"]`</li><li>`conflictingKeys`: 最小値より短い値、例 `["ab"]`</li><li>`primaryKey`: レコードの主キー（存在する場合）</li></ul> |
   | `11011`<br>`bizValueLessThanMinValue` | 数値がスキーマ制限未満です | <ul><li>`tableName`: 対象テーブル</li><li>`constraintName`: `null`</li><li>`fields`: 制約に違反したフィールド、例 `["age"]`</li><li>`conflictingKeys`: 最小値未満の値、例 `[-5]`</li><li>`primaryKey`: レコードの主キー（存在する場合）</li></ul> |
   | `11012`<br>`bizValueExceedsMaxValue` | 数値がスキーマ制限を超えています | <ul><li>`tableName`: 対象テーブル</li><li>`constraintName`: `null`</li><li>`fields`: 制約に違反したフィールド、例 `["score"]`</li><li>`conflictingKeys`: 最大値を超える値、例 `[105]`</li><li>`primaryKey`: レコードの主キー（存在する場合）</li></ul> |
-  | `12002`<br>`bizRecordNotFound` | リソースが存在しない / レコード未検出 | <ul><li>`tableName`: 対象テーブル</li><li>`constraintName`: `null`</li><li>`fields`: 検索対象フィールド、例 `["id"]`</li><li>`conflictingKeys`: 検出されなかったターゲットキー、例 `["non_exist_id"]`</li><li>`primaryKey`: 不足しているキーの値、例 `"non_exist_id"`</li></ul> |
+  | `12001`<br>`bizRecordNotFound` | リソースが存在しない / レコード未検出 | <ul><li>`tableName`: 対象テーブル</li><li>`constraintName`: `null`</li><li>`fields`: 検索対象フィールド、例 `["id"]`</li><li>`conflictingKeys`: 検出されなかったターゲットキー、例 `["non_exist_id"]`</li><li>`primaryKey`: 不足しているキーの値、例 `"non_exist_id"`</li></ul> |
 
 - **JSON 物理表現例**（外キーの親レコードが存在しないエラー）:
   ```json
@@ -157,7 +158,7 @@ Dart/Flutterでは、`ResultStatus`と`ResultType`は、手動の範囲チェッ
 
 ### 4.3 SchemaValidationStatus（テーブルスキーマ検証および不互換移行状態）
 
-- **カテゴリ範囲**: `code`が`[30000, 39999]`の範囲（スキーマ構成検証エラーおよび物理的移行不整合）。
+- **カテゴリ範囲**: `code`が`[30000, 39999]` — `30000–30013` 静的スキーマ検証、`31001–31006` 移行ガード。
 - **専用フィールド定義**:
 
   | フィールド | タイプ | 詳細 |
@@ -173,27 +174,29 @@ Dart/Flutterでは、`ResultStatus`と`ResultType`は、手動の範囲チェッ
   | `30000`<br>`devInvalidSchema` | 無効なテーブルスキーマ定義 | <ul><li>`tableName`: テーブル名</li><li>`field`: `null`</li><li>`wrongValue`: 無効な設定マップ、または `null`</li></ul> |
   | `30001`<br>`devInvalidSchemaTableName` | テーブル名検証エラー（無効な文字または長すぎ） | <ul><li>`tableName`: 違反している名前</li><li>`field`: `null`</li><li>`wrongValue`: 違反している文字列</li></ul> |
   | `30002`<br>`devInvalidSchemaFieldName` | フィールド名検証エラー（無効な文字） | <ul><li>`tableName`: テーブル名</li><li>`field`: 違反しているフィールド名</li><li>`wrongValue`: 違反している文字列</li></ul> |
-  | `30003`<br>`devInvalidSchemaPrimaryKey` | 主キー検証エラー（欠落または無効な形式） | <ul><li>`tableName`: テーブル名</li><li>`field`: `"primaryKey"` または主キーフィールド名</li><li>`wrongValue`: 主キーの設定詳細</li></ul> |
-  | `30004`<br>`devInvalidSchemaIndexLimit` | テーブルのインデックス数がシステム制限（16個）を超過 | <ul><li>`tableName`: テーブル名</li><li>`field`: `null`</li><li>`wrongValue`: インデックス設定リスト</li></ul> |
-  | `30005`<br>`devSchemaTableExists` | テーブルは既に存在します | <ul><li>`tableName`: テーブル名</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
-  | `30006`<br>`devSchemaFieldExists` | スキーマアップグレード: 既に存在するフィールドを追加しようとしました | <ul><li>`tableName`: テーブル名</li><li>`field`: 競合するフィールド名</li><li>`wrongValue`: `null`</li></ul> |
-  | `30007`<br>`devSchemaIndexExists` | スキーマアップグレード: 既に存在するインデックスを追加しようとしました | <ul><li>`tableName`: テーブル名</li><li>`field`: インデックス名</li><li>`wrongValue`: `null`</li></ul> |
+  | `30003`<br>`devInvalidSchemaDuplicateFieldName` | テーブルスキーマ内の重複するフィールド名 | <ul><li>`tableName`: テーブル名</li><li>`field`: 重複するフィールド名</li><li>`wrongValue`: `null`</li></ul> |
+  | `30004`<br>`devInvalidSchemaPrimaryKey` | 主キー検証エラー（欠落または無効な形式） | <ul><li>`tableName`: テーブル名</li><li>`field`: `"primaryKey"` または主キーフィールド名</li><li>`wrongValue`: 主キーの設定詳細</li></ul> |
+  | `30005`<br>`devInvalidSchemaIndexLimit` | テーブルのインデックス数がシステム制限（16個）を超過 | <ul><li>`tableName`: テーブル名</li><li>`field`: `null`</li><li>`wrongValue`: インデックス設定リスト</li></ul> |
+  | `30006`<br>`devInvalidSchemaIndexField` | インデックスが存在しないフィールドを参照しています | <ul><li>`tableName`: テーブル名</li><li>`field`: インデックス名</li><li>`wrongValue`: 不一致を引き起こすフィールド名</li></ul> |
+  | `30007`<br>`devInvalidSchemaIndexType` | インデックス種別がフィールドのデータ型または設定と互換性がありません | <ul><li>`tableName`: テーブル名</li><li>`field`: インデックス/フィールド名</li><li>`wrongValue`: 衝突情報、例 `{ "indexType": "btree", "fieldType": "vector" }`</li></ul> |
   | `30008`<br>`devInvalidSchemaForeignKey` | 外キー定義が無効（列の不一致など） | <ul><li>`tableName`: テーブル名</li><li>`field`: 外キー名</li><li>`wrongValue`: 外キーの設定詳細</li></ul> |
   | `30009`<br>`devInvalidSchemaSpaceMismatch` | グローバル/スペース固有の境界の不一致 | <ul><li>`tableName`: テーブル名</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
-  | `30010`<br>`devMigrationNotAllowedWithData` | 移行にはデータ変更が必要ですが、明示的に許可されていません | <ul><li>`tableName`: テーブル名</li><li>`field`: `null`</li><li>`wrongValue`: 移行アップグレードの差分マップ</li></ul> |
-  | `30011`<br>`devMigrationUnsafeTypeConversion` | 物理移行: フィールドのサポートされていない型変換 | <ul><li>`tableName`: テーブル名</li><li>`field`: フィールド名</li><li>`wrongValue`: 競合する型のマップ、例 `{ "from": "text", "to": "integer" }`</li></ul> |
-  | `30013`<br>`devMigrationCannotAddNonNullField` | データがあるテーブルにデフォルト値なしで非NULLフィールドを追加できません | <ul><li>`tableName`: テーブル名</li><li>`field`: 違反しているフィールド名</li><li>`wrongValue`: 移行パラメータ、例 `{ "nullable": false, "defaultValue": null }`</li></ul> |
-  | `30014`<br>`devMigrationNullableToNonNullNotAllowed` | 物理移行: フィールドをNULL許容から非NULLに変更 | <ul><li>`tableName`: テーブル名</li><li>`field`: フィールド名</li><li>`wrongValue`: 移行パラメータ（30013と同様）</li></ul> |
-  | `30015`<br>`devMigrationUniqueTighteningNotAllowed` | 物理移行: フィールド制約をUNIQUEに引き締め | <ul><li>`tableName`: テーブル名</li><li>`field`: フィールド名</li><li>`wrongValue`: 一意性制約を引き起こすインデックス定義</li></ul> |
-  | `30016`<br>`devInvalidSchemaTtlConfig` | TTL構成の検証に失敗しました | <ul><li>`tableName`: テーブル名</li><li>`field`: TTLタイムスタンプフィールド</li><li>`wrongValue`: 無効なTTL設定マップ、例 `{ "enabled": true, "fieldName": "expire_at" }`</li></ul> |
-  | `30017`<br>`devInvalidSchemaDuplicateFieldName` | テーブルスキーマ内の重複するフィールド名 | <ul><li>`tableName`: テーブル名</li><li>`field`: 重複するフィールド名</li><li>`wrongValue`: `null`</li></ul> |
-  | `30018`<br>`devInvalidSchemaIndexField` | インデックスが存在しないフィールドを参照しています | <ul><li>`tableName`: テーブル名</li><li>`field`: インデックス名</li><li>`wrongValue`: 不一致を引き起こすフィールド名</li></ul> |
+  | `30010`<br>`devInvalidSchemaTtlConfig` | TTL構成の検証に失敗しました | <ul><li>`tableName`: テーブル名</li><li>`field`: TTLタイムスタンプフィールド</li><li>`wrongValue`: 無効なTTL設定マップ、例 `{ "enabled": true, "fieldName": "expire_at" }`</li></ul> |
+  | `30011`<br>`devSchemaTableExists` | テーブルは既に存在します | <ul><li>`tableName`: テーブル名</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
+  | `30012`<br>`devSchemaFieldExists` | スキーマアップグレード: 既に存在するフィールドを追加しようとしました | <ul><li>`tableName`: テーブル名</li><li>`field`: 競合するフィールド名</li><li>`wrongValue`: `null`</li></ul> |
+  | `30013`<br>`devSchemaIndexExists` | スキーマアップグレード: 既に存在するインデックスを追加しようとしました | <ul><li>`tableName`: テーブル名</li><li>`field`: インデックス名</li><li>`wrongValue`: `null`</li></ul> |
+  | `31001`<br>`devMigrationNotAllowedWithData` | 移行にはデータ変更が必要ですが、明示的に許可されていません | <ul><li>`tableName`: テーブル名</li><li>`field`: `null`</li><li>`wrongValue`: 移行アップグレードの差分マップ</li></ul> |
+  | `31002`<br>`devMigrationUnsafeTypeConversion` | 物理移行: フィールドのサポートされていない型変換 | <ul><li>`tableName`: テーブル名</li><li>`field`: フィールド名</li><li>`wrongValue`: 競合する型のマップ、例 `{ "from": "text", "to": "integer" }`</li></ul> |
+  | `31003`<br>`devMigrationCannotAddNonNullField` | データがあるテーブルにデフォルト値なしで非NULLフィールドを追加できません | <ul><li>`tableName`: テーブル名</li><li>`field`: 違反しているフィールド名</li><li>`wrongValue`: 移行パラメータ、例 `{ "nullable": false, "defaultValue": null }`</li></ul> |
+  | `31004`<br>`devMigrationNullableToNonNullNotAllowed` | 物理移行: フィールドをNULL許容から非NULLに変更 | <ul><li>`tableName`: テーブル名</li><li>`field`: フィールド名</li><li>`wrongValue`: 移行パラメータ（31003と同様）</li></ul> |
+  | `31005`<br>`devMigrationUniqueTighteningNotAllowed` | 物理移行: フィールド制約をUNIQUEに引き締め | <ul><li>`tableName`: テーブル名</li><li>`field`: フィールド名</li><li>`wrongValue`: 一意性制約を引き起こすインデックス定義</li></ul> |
+  | `31006`<br>`devMigrationPromoteLargeOpNotAllowed` | promoteFieldToPrimaryKey 実行中は大規模データ操作が許可されません | <ul><li>`tableName`: テーブル名</li><li>`field`: `null`</li><li>`wrongValue`: promote フェーズ/タスク id（あれば）</li></ul> |
 
 - **JSON 物理表現例**（データのあるテーブルにデフォルト値なしで非NULLフィールドを追加するエラー）:
   ```json
   {
     "index": 0,
-    "code": 30013,
+    "code": 31003,
     "codeKey": "DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD",
     "message": "Cannot add non-nullable field \"phone\" without a default value to non-empty table \"users\". This operation is physically impossible and would fail during data write.",
     "tableName": "users",
@@ -209,7 +212,7 @@ Dart/Flutterでは、`ResultStatus`と`ResultType`は、手動の範囲チェッ
 
 ### 4.4 InvalidArgumentStatus（API 引数およびカーソルページング検証例外）
 
-- **カテゴリ範囲**: `code`が`[20000, 20999]`の範囲（APIパラメータ、クエリ構造、またはページングトークンの検証エラー）。
+- **カテゴリ範囲**: `code`が`[20000, 20999]`（**除外** `20005` / `20006`）、**加えて** `22004`（`devFieldNotFound`）。`20005` / `20006` およびその他の `2200x` 未検出コードは GeneralStatus（§4.6）を使用。
 - **専用フィールド定義**:
 
   | フィールド | タイプ | 詳細 |
@@ -225,26 +228,26 @@ Dart/Flutterでは、`ResultStatus`と`ResultType`は、手動の範囲チェッ
   | `20001`<br>`devInvalidArgumentFormat` | 引数の形式エラー | <ul><li>`parameterName`: 無効なパラメータ名</li><li>`passedValue`: 渡された値、例 `"twenty"`</li><li>`primaryKey`: レコードの主キー（存在する場合）</li></ul> |
   | `20002`<br>`devInvalidArgumentType` | 引数の型不一致 | <ul><li>`parameterName`: パラメータ名</li><li>`passedValue`: 渡された値、例 `{"foo": "bar"}` (Stringが期待された場合)</li><li>`primaryKey`: レコードの主キー（存在する場合）</li></ul> |
   | `20003`<br>`devInvalidArgumentMissing` | 必須引数が欠落しています | <ul><li>`parameterName`: 欠落しているパラメータ名、例 `"dbPath"`</li><li>`passedValue`: `null`</li><li>`primaryKey`: レコードの主キー（存在する場合）</li></ul> |
-  | `20005`<br>`devInvalidPrimaryKeyFormat` | 無効な主キー形式 | <ul><li>`parameterName`: `"primaryKey"` または主キーフィールド</li><li>`passedValue`: 無効な主キー値、例 `"invalid_id_value"`</li><li>`primaryKey`: 無効な主キー値</li></ul> |
-  | `20010`<br>`devVectorDimensionMismatch` | ベクトルの次元不一致 | <ul><li>`parameterName`: `"other"`</li><li>`passedValue`: 違反している次元サイズ</li><li>`primaryKey`: `null`</li></ul> |
-  | `20011`<br>`devIndexFieldMissing` | カーソル用レコードで必要なインデックスフィールドが欠落 | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: 欠落しているインデックスフィールド</li><li>`primaryKey`: `null`</li></ul> |
-  | `20201`<br>`devInvalidCursorPagination` | カーソルページングとオフセットは相互に排他的です | <ul><li>`parameterName`: `"cursor"` / `"offset"`</li><li>`passedValue`: 競合するページングパラメータ</li><li>`primaryKey`: `null`</li></ul> |
-  | `20202`<br>`devInvalidCursorTable` | カーソルがターゲットテーブルと一致しません | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: カーソルトークン</li><li>`primaryKey`: `null`</li></ul> |
-  | `20203`<br>`devInvalidCursorSignature` | カーソルの署名不一致（改ざん） | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: カーソルトーク</li><li>`primaryKey`: `null`</li></ul> |
-  | `20204`<br>`devInvalidCursorOrderBy` | カーソルのorderBy構成が無効または不一致 | <ul><li>`parameterName`: `"orderBy"`</li><li>`passedValue`: orderByリスト、例 `["-age", "id"]`</li><li>`primaryKey`: `null`</li></ul> |
-  | `20205`<br>`devInvalidCursorMode` | カーソルトークンモードの不一致 | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: トークンモード、例 `"sortKey"`</li><li>`primaryKey`: `null`</li></ul> |
-  | `20206`<br>`devInvalidCursorPayload` | 無効なカーソルペイロード（デコード不可） | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: `null`</li><li>`primaryKey`: `null`</li></ul> |
-  | `20301`<br>`devInvalidQuerySelectField` | クエリ選択フィールドはStringまたはQueryAggregationである必要があります | <ul><li>`parameterName`: `"select"`</li><li>`passedValue`: 無効な選択フィールド定義</li><li>`primaryKey`: `null`</li></ul> |
-  | `20302`<br>`devInvalidQueryForeignKeyJoin` | 自動結合用の外キー関係が存在しません | <ul><li>`parameterName`: `"join"` / `"tableName"`</li><li>`passedValue`: 関係を欠くターゲットテーブル</li><li>`primaryKey`: `null`</li></ul> |
-  | `20303`<br>`devInvalidQueryFieldAlias` | クエリフィールドのエイリアス形式が無効です | <ul><li>`parameterName`: `"alias"`</li><li>`passedValue`: 無効なエイリアス文字列</li><li>`primaryKey`: `null`</li></ul> |
-  | `20304`<br>`devInvalidExpression` | 無効な式構成または実行例外 | <ul><li>`parameterName`: エラーの側面（例: `"arguments"`、`"functionName"`、`"node"`）</li><li>`passedValue`: 無効な値またはカウント</li><li>`primaryKey`: `null`</li></ul> |
-  | `22005`<br>`devFieldNotFound` | フィールドが見つかりません | <ul><li>`parameterName`: 未知のフィールド名、例 `"extra"`</li><li>`passedValue`: 渡されたフィールドの値</li><li>`primaryKey`: レコードの主キー（存在する場合）</li></ul> |
+  | `20004`<br>`devInvalidPrimaryKeyFormat` | 無効な主キー形式 | <ul><li>`parameterName`: `"primaryKey"` または主キーフィールド</li><li>`passedValue`: 無効な主キー値、例 `"invalid_id_value"`</li><li>`primaryKey`: 無効な主キー値</li></ul> |
+  | `20007`<br>`devVectorDimensionMismatch` | ベクトルの次元不一致 | <ul><li>`parameterName`: `"other"`</li><li>`passedValue`: 違反している次元サイズ</li><li>`primaryKey`: `null`</li></ul> |
+  | `20008`<br>`devIndexFieldMissing` | カーソル用レコードで必要なインデックスフィールドが欠落 | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: 欠落しているインデックスフィールド</li><li>`primaryKey`: `null`</li></ul> |
+  | `20101`<br>`devInvalidCursorPagination` | カーソルページングとオフセットは相互に排他的です | <ul><li>`parameterName`: `"cursor"` / `"offset"`</li><li>`passedValue`: 競合するページングパラメータ</li><li>`primaryKey`: `null`</li></ul> |
+  | `20102`<br>`devInvalidCursorTable` | カーソルがターゲットテーブルと一致しません | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: カーソルトークン</li><li>`primaryKey`: `null`</li></ul> |
+  | `20103`<br>`devInvalidCursorSignature` | カーソルの署名不一致（改ざん） | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: カーソルトーク</li><li>`primaryKey`: `null`</li></ul> |
+  | `20104`<br>`devInvalidCursorOrderBy` | カーソルのorderBy構成が無効または不一致 | <ul><li>`parameterName`: `"orderBy"`</li><li>`passedValue`: orderByリスト、例 `["-age", "id"]`</li><li>`primaryKey`: `null`</li></ul> |
+  | `20105`<br>`devInvalidCursorMode` | カーソルトークンモードの不一致 | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: トークンモード、例 `"sortKey"`</li><li>`primaryKey`: `null`</li></ul> |
+  | `20106`<br>`devInvalidCursorPayload` | 無効なカーソルペイロード（デコード不可） | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: `null`</li><li>`primaryKey`: `null`</li></ul> |
+  | `20201`<br>`devInvalidQuerySelectField` | クエリ選択フィールドはStringまたはQueryAggregationである必要があります | <ul><li>`parameterName`: `"select"`</li><li>`passedValue`: 無効な選択フィールド定義</li><li>`primaryKey`: `null`</li></ul> |
+  | `20202`<br>`devInvalidQueryForeignKeyJoin` | 自動結合用の外キー関係が存在しません | <ul><li>`parameterName`: `"join"` / `"tableName"`</li><li>`passedValue`: 関係を欠くターゲットテーブル</li><li>`primaryKey`: `null`</li></ul> |
+  | `20203`<br>`devInvalidQueryFieldAlias` | クエリフィールドのエイリアス形式が無効です | <ul><li>`parameterName`: `"alias"`</li><li>`passedValue`: 無効なエイリアス文字列</li><li>`primaryKey`: `null`</li></ul> |
+  | `20204`<br>`devInvalidExpression` | 無効な式構成または実行例外 | <ul><li>`parameterName`: エラーの側面（例: `"arguments"`、`"functionName"`、`"node"`）</li><li>`passedValue`: 無効な値またはカウント</li><li>`primaryKey`: `null`</li></ul> |
+  | `22004`<br>`devFieldNotFound` | フィールドが見つかりません | <ul><li>`parameterName`: 未知のフィールド名、例 `"extra"`</li><li>`passedValue`: 渡されたフィールドの値</li><li>`primaryKey`: レコードの主キー（存在する場合）</li></ul> |
 
 - **JSON 物理表現例**（カーソルのソート順がクエリのソート順と競合するエラー）:
   ```json
   {
     "index": 0,
-    "code": 20204,
+    "code": 20104,
     "codeKey": "DEV_INVALID_CURSOR_ORDERBY",
     "message": "Cursor orderBy fields do not match current query orderBy.",
     "parameterName": "orderBy",
@@ -257,7 +260,7 @@ Dart/Flutterでは、`ResultStatus`と`ResultType`は、手動の範囲チェッ
 
 ### 4.5 TransactionOperationStatus（トランザクション競合およびアボート）
 
-- **カテゴリ範囲**: `code`が`[50000, 50999]`の範囲（トランザクションのロールバック、明示的なアボート、またはシリアライザビリティ競合）。
+- **カテゴリ範囲**: `50001`（`sysTransactionAborted`）と `50002`（`sysTransactionConflict`）のみ。その他の `500xx`（例: `50003` / `50004`）は GeneralStatus（§4.6）を使用。
 - **専用フィールド定義**:
 
   | フィールド | タイプ | 詳細 |
@@ -286,7 +289,7 @@ Dart/Flutterでは、`ResultStatus`と`ResultType`は、手動の範囲チェッ
 
 ### 4.6 GeneralStatus（一般およびシステムレベルの例外状態）
 
-- **カテゴリ範囲**: 他のすべてのステータスコードのフォールバック（低レベルIO、ハードウェアエラー、システムタイムアウトなど）。
+- **カテゴリ範囲**: §§4.1–4.5 以外のコードのフォールバック — `20005` / `20006`、`22001`–`22003`、`230xx` / `240xx`、残りの `50xxx`–`53xxx`、および `99001` を含む。
 - **専用フィールド定義**:
 
   | フィールド | タイプ | 詳細 |
@@ -299,11 +302,11 @@ Dart/Flutterでは、`ResultStatus`と`ResultType`は、手動の範囲チェッ
 
   | コードとメモリ内タイプ | シナリオ / レベル | フィールドガイドライン |
   | :--- | :--- | :--- |
-  | `20007`<br>`devIndexOutOfBounds` | インデックスまたは範囲が境界外（開発者エラー） | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `20008`<br>`devUnsupportedOperation` | 現在のコンテキストでは操作がサポートされていません（開発者エラー） | <ul><li>`primaryKey`: `null`</li><li>`target`: ターゲットテーブル/リソース（存在する場合）</li><li>`operation`: メソッド名（存在する場合）</li></ul> |
+  | `20005`<br>`devIndexOutOfBounds` | インデックスまたは範囲が境界外（開発者エラー） | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `20006`<br>`devUnsupportedOperation` | 現在のコンテキストでは操作がサポートされていません（開発者エラー） | <ul><li>`primaryKey`: `null`</li><li>`target`: ターゲットテーブル/リソース（存在する場合）</li><li>`operation`: メソッド名（存在する場合）</li></ul> |
   | `22001`<br>`devTableNotFound` | テーブルが見つかりません（開発者エラー） | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `22003`<br>`devIndexNotFound` | インデックスが見つかりません（開発者エラー） | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `22004`<br>`devSpaceNotFound` | スペースが見つかりません（開発者エラー） | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `22002`<br>`devIndexNotFound` | インデックスが見つかりません（開発者エラー） | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `22003`<br>`devSpaceNotFound` | スペースが見つかりません（開発者エラー） | <ul><li>`primaryKey`: `null`</li></ul> |
   | `23001`<br>`devLargeScaleOperationRequired` | 大規模データ操作には `allowLargeScaleOperation()` が必要（開発者エラー） | <ul><li>`primaryKey`: `null`</li></ul> |
   | `23002`<br>`devLargeScaleOperationNotAllowedInTransaction` | Large-scale data operation is not allowed inside a transaction (Developer Error) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `24001`<br>`devEngineIncompatible` | **重大**: エンジンバージョン不整合（開発者エラー） | <ul><li>`primaryKey`: `null`</li></ul> |
@@ -472,50 +475,52 @@ try {
 | **11010** | `BIZ_CONSTRAINT_MIN_LENGTH` | `ResultType.bizValueLessThanMinLength` | ビジネスエラー | 値の長さがスキーマ制限未満です |
 | **11011** | `BIZ_CONSTRAINT_MIN_VALUE` | `ResultType.bizValueLessThanMinValue` | ビジネスエラー | 数値がスキーマ制限未満です |
 | **11012** | `BIZ_CONSTRAINT_MAX_VALUE` | `ResultType.bizValueExceedsMaxValue` | ビジネスエラー | 数値がスキーマ制限を超えています |
-| **12002** | `BIZ_NOT_FOUND_RECORD` | `ResultType.bizRecordNotFound` | ビジネスエラー | リソースが存在しない / レコード未検出 |
+| **12001** | `BIZ_NOT_FOUND_RECORD` | `ResultType.bizRecordNotFound` | ビジネスエラー | リソースが存在しない / レコード未検出 |
 | **20001** | `DEV_INVALID_ARGUMENT_FORMAT` | `ResultType.devInvalidArgumentFormat` | 開発者エラー | 引数の形式エラー |
 | **20002** | `DEV_INVALID_ARGUMENT_TYPE` | `ResultType.devInvalidArgumentType` | 開発者エラー | 引数の型不一致 |
 | **20003** | `DEV_INVALID_ARGUMENT_MISSING` | `ResultType.devInvalidArgumentMissing` | 開発者エラー | 必須引数が欠落しています |
-| **20005** | `DEV_INVALID_PRIMARY_KEY_FORMAT` | `ResultType.devInvalidPrimaryKeyFormat` | 開発者エラー | 无效的PrimaryKey形式 |
-| **20007** | `DEV_INDEX_OUT_OF_BOUNDS` | `ResultType.devIndexOutOfBounds` | 開発者エラー | インデックスまたは範囲が境界外 |
-| **20008** | `DEV_UNSUPPORTED_OPERATION` | `ResultType.devUnsupportedOperation` | 開発者エラー | 現在のコンテキストでは操作がサポートされていません |
-| **20010** | `DEV_VECTOR_DIMENSION_MISMATCH` | `ResultType.devVectorDimensionMismatch` | 開発者エラー | ベクトルの次元不一致 |
-| **20011** | `DEV_INDEX_FIELD_MISSING` | `ResultType.devIndexFieldMissing` | 開発者エラー | カーソル用レコードで必要なインデックスフィールドが欠落 |
-| **20201** | `DEV_INVALID_CURSOR_PAGINATION` | `ResultType.devInvalidCursorPagination` | 開発者エラー | カーソルページングとオフセットは相互に排ethelessです |
-| **20202** | `DEV_INVALID_CURSOR_TABLE` | `ResultType.devInvalidCursorTable` | 開発者エラー | カーソルがターゲットテーブルと一致しません |
-| **20203** | `DEV_INVALID_CURSOR_SIGNATURE` | `ResultType.devInvalidCursorSignature` | 開発者エラー | カーソルの署名不一致（改ざん） |
-| **20204** | `DEV_INVALID_CURSOR_ORDERBY` | `ResultType.devInvalidCursorOrderBy` | 開発者エラー | カーソルのorderBy構成が無効または不一致 |
-| **20205** | `DEV_INVALID_CURSOR_MODE` | `ResultType.devInvalidCursorMode` | 開発者エラー | カーソルトークンモードの不一致 |
-| **20206** | `DEV_INVALID_CURSOR_PAYLOAD` | `ResultType.devInvalidCursorPayload` | 開発者エラー | 无效的カーソルペイロード（デコード不可） |
-| **20301** | `DEV_INVALID_QUERY_SELECT_FIELD` | `ResultType.devInvalidQuerySelectField` | 開発者エラー | クエリ選択フィールドはStringまたはQueryAggregationである必要があります |
-| **20302** | `DEV_INVALID_QUERY_FOREIGN_KEY_JOIN` | `ResultType.devInvalidQueryForeignKeyJoin` | 開発者エラー | 自動結合用の外キー関係が存在しません |
-| **20303** | `DEV_INVALID_QUERY_FIELD_ALIAS` | `ResultType.devInvalidQueryFieldAlias` | 開発者エラー | クエリフィールドのエイリアス形式が無効です |
-| **20304** | `DEV_INVALID_EXPRESSION` | `ResultType.devInvalidExpression` | 開発者エラー | 無効な式構成または実行例外 |
+| **20004** | `DEV_INVALID_PRIMARY_KEY_FORMAT` | `ResultType.devInvalidPrimaryKeyFormat` | 開発者エラー | 无效的PrimaryKey形式 |
+| **20005** | `DEV_INDEX_OUT_OF_BOUNDS` | `ResultType.devIndexOutOfBounds` | 開発者エラー | インデックスまたは範囲が境界外 |
+| **20006** | `DEV_UNSUPPORTED_OPERATION` | `ResultType.devUnsupportedOperation` | 開発者エラー | 現在のコンテキストでは操作がサポートされていません |
+| **20007** | `DEV_VECTOR_DIMENSION_MISMATCH` | `ResultType.devVectorDimensionMismatch` | 開発者エラー | ベクトルの次元不一致 |
+| **20008** | `DEV_INDEX_FIELD_MISSING` | `ResultType.devIndexFieldMissing` | 開発者エラー | カーソル用レコードで必要なインデックスフィールドが欠落 |
+| **20101** | `DEV_INVALID_CURSOR_PAGINATION` | `ResultType.devInvalidCursorPagination` | 開発者エラー | カーソルページングとオフセットは相互に排ethelessです |
+| **20102** | `DEV_INVALID_CURSOR_TABLE` | `ResultType.devInvalidCursorTable` | 開発者エラー | カーソルがターゲットテーブルと一致しません |
+| **20103** | `DEV_INVALID_CURSOR_SIGNATURE` | `ResultType.devInvalidCursorSignature` | 開発者エラー | カーソルの署名不一致（改ざん） |
+| **20104** | `DEV_INVALID_CURSOR_ORDERBY` | `ResultType.devInvalidCursorOrderBy` | 開発者エラー | カーソルのorderBy構成が無効または不一致 |
+| **20105** | `DEV_INVALID_CURSOR_MODE` | `ResultType.devInvalidCursorMode` | 開発者エラー | カーソルトークンモードの不一致 |
+| **20106** | `DEV_INVALID_CURSOR_PAYLOAD` | `ResultType.devInvalidCursorPayload` | 開発者エラー | 无效的カーソルペイロード（デコード不可） |
+| **20201** | `DEV_INVALID_QUERY_SELECT_FIELD` | `ResultType.devInvalidQuerySelectField` | 開発者エラー | クエリ選択フィールドはStringまたはQueryAggregationである必要があります |
+| **20202** | `DEV_INVALID_QUERY_FOREIGN_KEY_JOIN` | `ResultType.devInvalidQueryForeignKeyJoin` | 開発者エラー | 自動結合用の外キー関係が存在しません |
+| **20203** | `DEV_INVALID_QUERY_FIELD_ALIAS` | `ResultType.devInvalidQueryFieldAlias` | 開発者エラー | クエリフィールドのエイリアス形式が無効です |
+| **20204** | `DEV_INVALID_EXPRESSION` | `ResultType.devInvalidExpression` | 開発者エラー | 無効な式構成または実行例外 |
 | **22001** | `DEV_NOT_FOUND_TABLE` | `ResultType.devTableNotFound` | 開発者エラー | テーブルが見つかりません |
-| **22003** | `DEV_NOT_FOUND_INDEX` | `ResultType.devIndexNotFound` | 開発者エラー | インデックスが見つかりません |
-| **22004** | `DEV_NOT_FOUND_SPACE` | `ResultType.devSpaceNotFound` | 開発者エラー | スペースが見つかりません |
-| **22005** | `DEV_NOT_FOUND_FIELD` | `ResultType.devFieldNotFound` | 開発者エラー | フィールドが見つかりません |
+| **22002** | `DEV_NOT_FOUND_INDEX` | `ResultType.devIndexNotFound` | 開発者エラー | インデックスが見つかりません |
+| **22003** | `DEV_NOT_FOUND_SPACE` | `ResultType.devSpaceNotFound` | 開発者エラー | スペースが見つかりません |
+| **22004** | `DEV_NOT_FOUND_FIELD` | `ResultType.devFieldNotFound` | 開発者エラー | フィールドが見つかりません |
 | **23001** | `DEV_LARGE_SCALE_OPERATION_REQUIRED` | `ResultType.devLargeScaleOperationRequired` | 開発者エラー | 大規模データ操作には `allowLargeScaleOperation()` が必要（OOM防止） |
 | **23002** | `DEV_LARGE_SCALE_OPERATION_NOT_ALLOWED_IN_TRANSACTION` | `ResultType.devLargeScaleOperationNotAllowedInTransaction` | Developer Error | Large-scale data operation is not allowed inside a transaction |
 | **24001** | `DEV_ENGINE_INCOMPATIBLE` | `ResultType.devEngineIncompatible` | 開発者エラー | **重大**: エンジンバージョン不整合 |
 | **30000** | `DEV_INVALID_SCHEMA` | `ResultType.devInvalidSchema` | 開発者エラー | 無効なテーブルスキーマ定義 |
 | **30001** | `DEV_INVALID_SCHEMA_TABLE_NAME` | `ResultType.devInvalidSchemaTableName` | 開発者エラー | テーブル名検証エラー |
 | **30002** | `DEV_INVALID_SCHEMA_FIELD_NAME` | `ResultType.devInvalidSchemaFieldName` | 開発者エラー | フィールド名検証エラー |
-| **30003** | `DEV_INVALID_SCHEMA_PRIMARY_KEY` | `ResultType.devInvalidSchemaPrimaryKey` | 開発者エラー | 主キー検証エラー |
-| **30004** | `DEV_INVALID_SCHEMA_INDEX_LIMIT` | `ResultType.devInvalidSchemaIndexLimit` | 開発者エラー | インデックス数検証エラー |
-| **30005** | `DEV_SCHEMA_TABLE_EXISTS` | `ResultType.devSchemaTableExists` | 開発者エラー | テーブルは既に存在します |
-| **30006** | `DEV_SCHEMA_FIELD_EXISTS` | `ResultType.devSchemaFieldExists` | 開発者エラー | フィールドは既に存在します |
-| **30007** | `DEV_SCHEMA_INDEX_EXISTS` | `ResultType.devSchemaIndexExists` | 開発者エラー | インデックスは既に存在します |
+| **30003** | `DEV_INVALID_SCHEMA_DUPLICATE_FIELD_NAME` | `ResultType.devInvalidSchemaDuplicateFieldName` | 開発者エラー | テーブルスキーマ内の重複するフィールド名 |
+| **30004** | `DEV_INVALID_SCHEMA_PRIMARY_KEY` | `ResultType.devInvalidSchemaPrimaryKey` | 開発者エラー | 主キー検証エラー |
+| **30005** | `DEV_INVALID_SCHEMA_INDEX_LIMIT` | `ResultType.devInvalidSchemaIndexLimit` | 開発者エラー | インデックス数検証エラー |
+| **30006** | `DEV_INVALID_SCHEMA_INDEX_FIELD` | `ResultType.devInvalidSchemaIndexField` | 開発者エラー | インデックスが存在しないフィールドを参照しています |
+| **30007** | `DEV_INVALID_SCHEMA_INDEX_TYPE` | `ResultType.devInvalidSchemaIndexType` | 開発者エラー | インデックス種別がフィールドのデータ型または設定と互換性がありません |
 | **30008** | `DEV_INVALID_SCHEMA_FOREIGN_KEY` | `ResultType.devInvalidSchemaForeignKey` | 開発者エラー | 外キー定義が無効 |
 | **30009** | `DEV_INVALID_SCHEMA_SPACE_MISMATCH` | `ResultType.devInvalidSchemaSpaceMismatch` | 開発者エラー | グローバル/スペース固有の境界の不一致 |
-| **30010** | `DEV_MIGRATION_NOT_ALLOWED_WITH_DATA` | `ResultType.devMigrationNotAllowedWithData` | 開発者エラー | 移行にはデータ変更が必要ですが、明示的に許可されていません |
-| **30011** | `DEV_MIGRATION_UNSAFE_TYPE_CONVERSION` | `ResultType.devMigrationUnsafeTypeConversion` | 開発者エラー | サポートされていない型変換 |
-| **30013** | `DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD` | `ResultType.devMigrationCannotAddNonNullField` | 開発者エラー | データがあるテーブルにデフォルト値なしで非NULLフィールドを追加できません |
-| **30014** | `DEV_MIGRATION_NULLABLE_TO_NON_NULL_NOT_ALLOWED` | `ResultType.devMigrationNullableToNonNullNotAllowed` | 開発者エラー | フィールドをNULL許容から非NULLに変更できません |
-| **30015** | `DEV_MIGRATION_UNIQUE_TIGHTENING_NOT_ALLOWED` | `ResultType.devMigrationUniqueTighteningNotAllowed` | 開発者エラー | フィールド制約をUNIQUEに引き締めできません |
-| **30016** | `DEV_INVALID_SCHEMA_TTL_CONFIG` | `ResultType.devInvalidSchemaTtlConfig` | 開発者エラー | TTL構成の検証に失敗しました |
-| **30017** | `DEV_INVALID_SCHEMA_DUPLICATE_FIELD_NAME` | `ResultType.devInvalidSchemaDuplicateFieldName` | 開発者エラー | テーブルスキーマ内の重複するフィールド名 |
-| **30018** | `DEV_INVALID_SCHEMA_INDEX_FIELD` | `ResultType.devInvalidSchemaIndexField` | 開発者エラー | インデックスが存在しないフィールドを参照しています |
+| **30010** | `DEV_INVALID_SCHEMA_TTL_CONFIG` | `ResultType.devInvalidSchemaTtlConfig` | 開発者エラー | TTL構成の検証に失敗しました |
+| **30011** | `DEV_SCHEMA_TABLE_EXISTS` | `ResultType.devSchemaTableExists` | 開発者エラー | テーブルは既に存在します |
+| **30012** | `DEV_SCHEMA_FIELD_EXISTS` | `ResultType.devSchemaFieldExists` | 開発者エラー | フィールドは既に存在します |
+| **30013** | `DEV_SCHEMA_INDEX_EXISTS` | `ResultType.devSchemaIndexExists` | 開発者エラー | インデックスは既に存在します |
+| **31001** | `DEV_MIGRATION_NOT_ALLOWED_WITH_DATA` | `ResultType.devMigrationNotAllowedWithData` | 開発者エラー | 移行にはデータ変更が必要ですが、明示的に許可されていません |
+| **31002** | `DEV_MIGRATION_UNSAFE_TYPE_CONVERSION` | `ResultType.devMigrationUnsafeTypeConversion` | 開発者エラー | サポートされていない型変換 |
+| **31003** | `DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD` | `ResultType.devMigrationCannotAddNonNullField` | 開発者エラー | データがあるテーブルにデフォルト値なしで非NULLフィールドを追加できません |
+| **31004** | `DEV_MIGRATION_NULLABLE_TO_NON_NULL_NOT_ALLOWED` | `ResultType.devMigrationNullableToNonNullNotAllowed` | 開発者エラー | フィールドをNULL許容から非NULLに変更できません |
+| **31005** | `DEV_MIGRATION_UNIQUE_TIGHTENING_NOT_ALLOWED` | `ResultType.devMigrationUniqueTighteningNotAllowed` | 開発者エラー | フィールド制約をUNIQUEに引き締めできません |
+| **31006** | `DEV_MIGRATION_PROMOTE_LARGE_OP_NOT_ALLOWED` | `ResultType.devMigrationPromoteLargeOpNotAllowed` | 開発者エラー | promoteFieldToPrimaryKey 実行中は大規模データ操作が許可されません |
 | **50001** | `SYS_TRANSACTION_ABORTED` | `ResultType.sysTransactionAborted` | システムエラー | トランザクションがアボートされました |
 | **50002** | `SYS_TRANSACTION_CONFLICT` | `ResultType.sysTransactionConflict` | systemエラー | トランザクション競合 |
 | **50003** | `SYS_TRANSACTION_LIMIT_EXCEEDED` | `ResultType.sysTransactionLimitExceeded` | システムエラー | メモリ逼迫時にトランザクションが安全なメモリ上限を超過 |

@@ -1407,7 +1407,10 @@ class TableMetaManager {
       final current = _peekTableMeta(tableUid) ?? await getTableMeta(tableUid);
       // Avoid recursive bootstrap for the meta table itself during first save.
       final currentSchema = current?.schema;
-      schema = schema.generateAutoIndexes(oldSchema: currentSchema);
+      schema = schema.generateAutoIndexes(
+        oldSchema: currentSchema,
+        fieldRenames: fieldRenameHints,
+      );
 
       if (schema.schemaVersion == null || schema.schemaVersion!.isEmpty) {
         final preserved = currentSchema?.schemaVersion;

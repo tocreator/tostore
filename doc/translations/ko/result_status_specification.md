@@ -58,7 +58,7 @@ ToStore의 모든 클래스 코드 매핑 정의는 다음과 같습니다:
 | :--- | :--- | :--- |
 | `index` | `int` | 배치 작업의 순서 인덱스. 단일 작업의 경우 `0`으로 고정됩니다. |
 | `code` | `int` | 숫자 상태 코드(성공 시 `0`, 예외 시 5자리 숫자). |
-| `codeKey` | `String` | 의미론적 상태 식별자 키(예: `CONSTRAINT_VIOLATION_UNIQUE`). |
+| `codeKey` | `String` | 의미론적 상태 식별자 키(예: `BIZ_CONSTRAINT_UNIQUE`). |
 | `message` | `String` | 사람이 읽을 수 있는 상태 상세 설명. |
 
 ### 3.2 메모리 내 판단용 편리한 Getter (In-Memory Helper Getters)
@@ -68,6 +68,7 @@ Dart/Flutter에서 `ResultStatus`와 `ResultType`은 수동 범위 체크나 문
 | 속성 | 유형 | 설명 |
 | :--- | :--- | :--- |
 | `isBusinessError` | `bool` | **비즈니스 오류**인지 여부(제약 조건 위반, 캐스팅 실패 등. 범위: `10000 - 19999`). |
+| `isConstraintError` | `bool` | **ConstraintStatus**에 매핑되는지 여부(`isBusinessError`와 동일한 숫자 범위: `10000 - 19999`). |
 | `isDeveloperError` | `bool` | **개발자 오류**인지 여부(잘못된 스키마, 매개변수 불일치, 테이블 미검출 등. 범위: `20000 - 49999`). |
 | `isSystemError` | `bool` | **시스템 오류**인지 여부(락 타임아웃, 디스크 풀, 파일 잠금 등. 범위: `50000 - 79999`). |
 | `isEngineError` | `bool` | **엔진 오류**인지 여부(범위: `99000 - 99999`). |
@@ -104,7 +105,7 @@ Dart/Flutter에서 `ResultStatus`와 `ResultType`은 수동 범위 체크나 문
 
 ### 4.2 ConstraintStatus (데이터 무결성 및 제약 조건 충돌 상태)
 
-- **범주 범위**: `code`가 `[10000, 19999]` 범위(주로 데이터 검증 및 무결성 제약 조건 충돌).
+- **범주 범위**: `code`가 `[10000, 19999]` 범위(비즈니스 오류의 모든 리프 코드: 검증, 무결성 제약, 레코드 미검출). `ResultType.isConstraintError`와 일치.
 - **전용 필드 정의**:
 
   | 필드 | 유형 | 상세 내용 |
@@ -135,7 +136,7 @@ Dart/Flutter에서 `ResultStatus`와 `ResultType`은 수동 범위 체크나 문
   | `11010`<br>`bizValueLessThanMinLength` | 값의 길이가 스키마 제한 미만입니다 | <ul><li>`tableName`: 대상 테이블</li><li>`constraintName`: `null`</li><li>`fields`: 제약 조건 위반 필드, 예 `["code"]`</li><li>`conflictingKeys`: 최소값보다 짧은 값, 예 `["ab"]`</li><li>`primaryKey`: 레코드 주키(존재하는 경우)</li></ul> |
   | `11011`<br>`bizValueLessThanMinValue` | 숫자가 스키마 제한 미만입니다 | <ul><li>`tableName`: 대상 테이블</li><li>`constraintName`: `null`</li><li>`fields`: 제약 조건 위반 필드, 예 `["age"]`</li><li>`conflictingKeys`: 최소값 미만의 값, 예 `[-5]`</li><li>`primaryKey`: 레코드 주키(존재하는 경우)</li></ul> |
   | `11012`<br>`bizValueExceedsMaxValue` | 숫자가 스키마 제한을 초과합니다 | <ul><li>`tableName`: 대상 테이블</li><li>`constraintName`: `null`</li><li>`fields`: 제약 조건 위반 필드, 예 `["score"]`</li><li>`conflictingKeys`: 최대값 초과한 값, 예 `[105]`</li><li>`primaryKey`: 레코드 주키(존재하는 경우)</li></ul> |
-  | `12002`<br>`bizRecordNotFound` | 리소스가 존재하지 않음 / 레코드 미검출 | <ul><li>`tableName`: 대상 테이블</li><li>`constraintName`: `null`</li><li>`fields`: 검색 대상 필드, 예 `["id"]`</li><li>`conflictingKeys`: 검출되지 않은 대상 키, 예 `["non_exist_id"]`</li><li>`primaryKey`: 누락된 키의 값, 예 `"non_exist_id"`</li></ul> |
+  | `12001`<br>`bizRecordNotFound` | 리소스가 존재하지 않음 / 레코드 미검출 | <ul><li>`tableName`: 대상 테이블</li><li>`constraintName`: `null`</li><li>`fields`: 검색 대상 필드, 예 `["id"]`</li><li>`conflictingKeys`: 검출되지 않은 대상 키, 예 `["non_exist_id"]`</li><li>`primaryKey`: 누락된 키의 값, 예 `"non_exist_id"`</li></ul> |
 
 - **JSON 물리 표현 예** (외래키 부모 레코드가 존재하지 않는 오류):
   ```json
@@ -157,7 +158,7 @@ Dart/Flutter에서 `ResultStatus`와 `ResultType`은 수동 범위 체크나 문
 
 ### 4.3 SchemaValidationStatus (테이블 스키마 검증 및 호환 불가 마이그레이션 상태)
 
-- **범주 범위**: `code`가 `[30000, 39999]` 범위(스키마 구성 검증 오류 및 물리적 마이그레이션 불일치).
+- **범주 범위**: `code`가 `[30000, 39999]` — `30000–30013` 정적 스키마 검증, `31001–31006` 마이그레이션 가드.
 - **전용 필드 정의**:
 
   | 필드 | 유형 | 상세 내용 |
@@ -173,27 +174,29 @@ Dart/Flutter에서 `ResultStatus`와 `ResultType`은 수동 범위 체크나 문
   | `30000`<br>`devInvalidSchema` | 유효하지 않은 테이블 스키마 정의 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: `null`</li><li>`wrongValue`: 무효한 설정 맵, 또는 `null`</li></ul> |
   | `30001`<br>`devInvalidSchemaTableName` | 테이블 이름 검증 오류(잘못된 문자 또는 너무 긺) | <ul><li>`tableName`: 위배되는 이름</li><li>`field`: `null`</li><li>`wrongValue`: 위배되는 문자열</li></ul> |
   | `30002`<br>`devInvalidSchemaFieldName` | 필드 이름 검증 오류(잘못된 문자) | <ul><li>`tableName`: 테이블 이름</li><li>`field`: 위배되는 필드 이름</li><li>`wrongValue`: 위배되는 문자열</li></ul> |
-  | `30003`<br>`devInvalidSchemaPrimaryKey` | 주키 검증 오류(누락 또는 유효하지 않은 형식) | <ul><li>`tableName`: 테이블 이름</li><li>`field`: `"primaryKey"` 또는 주키 필드 이름</li><li>`wrongValue`: 주키 설정 상세</li></ul> |
-  | `30004`<br>`devInvalidSchemaIndexLimit` | 테이블의 인덱스 수가 시스템 제한(16개) 초과 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: `null`</li><li>`wrongValue`: 인덱스 설정 목록</li></ul> |
-  | `30005`<br>`devSchemaTableExists` | 테이블이 이미 존재합니다 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
-  | `30006`<br>`devSchemaFieldExists` | 스키마 업그레이드: 이미 존재하는 필드를 추가하려 함 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: 충돌하는 필드 이름</li><li>`wrongValue`: `null`</li></ul> |
-  | `30007`<br>`devSchemaIndexExists` | 스키마 업그레이드: 이미 존재하는 인덱스를 추가하려 함 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: 인덱스 이름</li><li>`wrongValue`: `null`</li></ul> |
+  | `30003`<br>`devInvalidSchemaDuplicateFieldName` | 테이블 스키마 내 중복된 필드 이름 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: 중복된 필드 이름</li><li>`wrongValue`: `null`</li></ul> |
+  | `30004`<br>`devInvalidSchemaPrimaryKey` | 주키 검증 오류(누락 또는 유효하지 않은 형식) | <ul><li>`tableName`: 테이블 이름</li><li>`field`: `"primaryKey"` 또는 주키 필드 이름</li><li>`wrongValue`: 주키 설정 상세</li></ul> |
+  | `30005`<br>`devInvalidSchemaIndexLimit` | 테이블의 인덱스 수가 시스템 제한(16개) 초과 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: `null`</li><li>`wrongValue`: 인덱스 설정 목록</li></ul> |
+  | `30006`<br>`devInvalidSchemaIndexField` | 인덱스가 존재하지 않는 필드를 참조합니다 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: 인덱스 이름</li><li>`wrongValue`: 불일치 유발 필드 이름</li></ul> |
+  | `30007`<br>`devInvalidSchemaIndexType` | 인덱스 유형이 필드 데이터 유형 또는 구성과 호환되지 않음 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: 인덱스/필드 이름</li><li>`wrongValue`: 충돌 정보, 예 `{ "indexType": "btree", "fieldType": "vector" }`</li></ul> |
   | `30008`<br>`devInvalidSchemaForeignKey` | 외래키 정의가 무효(열 불일치 등) | <ul><li>`tableName`: 테이블 이름</li><li>`field`: 외래키 이름</li><li>`wrongValue`: 외래키 설정 상세</li></ul> |
   | `30009`<br>`devInvalidSchemaSpaceMismatch` | 글로벌/스페이스 고유의 경계 불일치 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
-  | `30010`<br>`devMigrationNotAllowedWithData` | 마이그레이션에 데이터 변경이 필요하지만 명시적으로 허용되지 않음 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: `null`</li><li>`wrongValue`: 마이그레이션 업그레이드 차분 맵</li></ul> |
-  | `30011`<br>`devMigrationUnsafeTypeConversion` | 물리 마이그레이션: 필드의 지원되지 않는 유형 변환 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: 필드 이름</li><li>`wrongValue`: 충돌하는 유형 맵, 예 `{ "from": "text", "to": "integer" }`</li></ul> |
-  | `30013`<br>`devMigrationCannotAddNonNullField` | 데이터가 있는 테이블에 기본값 없이 비NULL 필드를 추가할 수 없음 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: 위배되는 필드 이름</li><li>`wrongValue`: 마이그레이션 매개변수, 예 `{ "nullable": false, "defaultValue": null }`</li></ul> |
-  | `30014`<br>`devMigrationNullableToNonNullNotAllowed` | 물리 마이그레이션: 필드를 NULL 허용에서 비NULL로 변경 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: 필드 이름</li><li>`wrongValue`: 마이그레이션 매개변수(30013과 동일)</li></ul> |
-  | `30015`<br>`devMigrationUniqueTighteningNotAllowed` | 물리 마이그레이션: 필드 제약 조건을 UNIQUE로 강화 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: 필드 이름</li><li>`wrongValue`: 고유성 제약을 유발하는 인덱스 정의</li></ul> |
-  | `30016`<br>`devInvalidSchemaTtlConfig` | TTL 구성 검증 실패 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: TTL 타임스탬프 필드</li><li>`wrongValue`: 무효한 TTL 설정 맵, 예 `{ "enabled": true, "fieldName": "expire_at" }`</li></ul> |
-  | `30017`<br>`devInvalidSchemaDuplicateFieldName` | 테이블 스키마 내 중복된 필드 이름 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: 중복된 필드 이름</li><li>`wrongValue`: `null`</li></ul> |
-  | `30018`<br>`devInvalidSchemaIndexField` | 인덱스가 존재하지 않는 필드를 참조합니다 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: 인덱스 이름</li><li>`wrongValue`: 불일치 유발 필드 이름</li></ul> |
+  | `30010`<br>`devInvalidSchemaTtlConfig` | TTL 구성 검증 실패 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: TTL 타임스탬프 필드</li><li>`wrongValue`: 무효한 TTL 설정 맵, 예 `{ "enabled": true, "fieldName": "expire_at" }`</li></ul> |
+  | `30011`<br>`devSchemaTableExists` | 테이블이 이미 존재합니다 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
+  | `30012`<br>`devSchemaFieldExists` | 스키마 업그레이드: 이미 존재하는 필드를 추가하려 함 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: 충돌하는 필드 이름</li><li>`wrongValue`: `null`</li></ul> |
+  | `30013`<br>`devSchemaIndexExists` | 스키마 업그레이드: 이미 존재하는 인덱스를 추가하려 함 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: 인덱스 이름</li><li>`wrongValue`: `null`</li></ul> |
+  | `31001`<br>`devMigrationNotAllowedWithData` | 마이그레이션에 데이터 변경이 필요하지만 명시적으로 허용되지 않음 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: `null`</li><li>`wrongValue`: 마이그레이션 업그레이드 차분 맵</li></ul> |
+  | `31002`<br>`devMigrationUnsafeTypeConversion` | 물리 마이그레이션: 필드의 지원되지 않는 유형 변환 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: 필드 이름</li><li>`wrongValue`: 충돌하는 유형 맵, 예 `{ "from": "text", "to": "integer" }`</li></ul> |
+  | `31003`<br>`devMigrationCannotAddNonNullField` | 데이터가 있는 테이블에 기본값 없이 비NULL 필드를 추가할 수 없음 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: 위배되는 필드 이름</li><li>`wrongValue`: 마이그레이션 매개변수, 예 `{ "nullable": false, "defaultValue": null }`</li></ul> |
+  | `31004`<br>`devMigrationNullableToNonNullNotAllowed` | 물리 마이그레이션: 필드를 NULL 허용에서 비NULL로 변경 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: 필드 이름</li><li>`wrongValue`: 마이그레이션 매개변수(31003과 동일)</li></ul> |
+  | `31005`<br>`devMigrationUniqueTighteningNotAllowed` | 물리 마이그레이션: 필드 제약 조건을 UNIQUE로 강화 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: 필드 이름</li><li>`wrongValue`: 고유성 제약을 유발하는 인덱스 정의</li></ul> |
+  | `31006`<br>`devMigrationPromoteLargeOpNotAllowed` | promoteFieldToPrimaryKey 실행 중에는 대규모 데이터 작업이 허용되지 않음 | <ul><li>`tableName`: 테이블 이름</li><li>`field`: `null`</li><li>`wrongValue`: promote 단계/작업 id（있는 경우）</li></ul> |
 
 - **JSON 물리 표현 예** (데이터가 있는 테이블에 기본값 없이 비NULL 필드를 추가하는 오류):
   ```json
   {
     "index": 0,
-    "code": 30013,
+    "code": 31003,
     "codeKey": "DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD",
     "message": "Cannot add non-nullable field \"phone\" without a default value to non-empty table \"users\". This operation is physically impossible and would fail during data write.",
     "tableName": "users",
@@ -209,7 +212,7 @@ Dart/Flutter에서 `ResultStatus`와 `ResultType`은 수동 범위 체크나 문
 
 ### 4.4 InvalidArgumentStatus (API 인수 및 커서 페이지네이션 검증 예외)
 
-- **범주 범위**: `code`가 `[20000, 20999]` 범위(API 매개변수, 쿼리 구조 또는 페이지네이션 토큰 검증 오류).
+- **범주 범위**: `code`가 `[20000, 20999]`(**제외** `20005` / `20006`), **추가** `22004`(`devFieldNotFound`). `20005` / `20006` 및 기타 `2200x` 미검출 코드는 GeneralStatus(§4.6)를 사용.
 - **전용 필드 정의**:
 
   | 필드 | 유형 | 상세 내용 |
@@ -225,26 +228,26 @@ Dart/Flutter에서 `ResultStatus`와 `ResultType`은 수동 범위 체크나 문
   | `20001`<br>`devInvalidArgumentFormat` | 인수 형식 오류 | <ul><li>`parameterName`: 무효한 매개변수 이름</li><li>`passedValue`: 전달된 값, 예 `"twenty"`</li><li>`primaryKey`: 레코드 주키(존재하는 경우)</li></ul> |
   | `20002`<br>`devInvalidArgumentType` | 인수 형식 불일치 | <ul><li>`parameterName`: 매개변수 이름</li><li>`passedValue`: 전달된 값, 예 `{"foo": "bar"}` (String이 기대된 경우)</li><li>`primaryKey`: 레코드 주키(존재하는 경우)</li></ul> |
   | `20003`<br>`devInvalidArgumentMissing` | 필수 인수가 누락되었습니다 | <ul><li>`parameterName`: 누락된 매개변수 이름, 예 `"dbPath"`</li><li>`passedValue`: `null`</li><li>`primaryKey`: 레코드 주키(존재하는 경우)</li></ul> |
-  | `20005`<br>`devInvalidPrimaryKeyFormat` | 무효한 주키 형식 | <ul><li>`parameterName`: `"primaryKey"` 또는 주키 필드</li><li>`passedValue`: 무효한 주키 값, 예 `"invalid_id_value"`</li><li>`primaryKey`: 무효한 주키 값</li></ul> |
-  | `20010`<br>`devVectorDimensionMismatch` | 벡터 차원 불일치 | <ul><li>`parameterName`: `"other"`</li><li>`passedValue`: 위배되는 차원 크기</li><li>`primaryKey`: `null`</li></ul> |
-  | `20011`<br>`devIndexFieldMissing` | 커서용 레코드에서 필요한 인덱스 필드 누락 | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: 누락된 인덱스 필드</li><li>`primaryKey`: `null`</li></ul> |
-  | `20201`<br>`devInvalidCursorPagination` | 커서 페이지네이션과 오프셋은 상호 배타적입니다 | <ul><li>`parameterName`: `"cursor"` / `"offset"`</li><li>`passedValue`: 충돌하는 페이지네이션 매개변수</li><li>`primaryKey`: `null`</li></ul> |
-  | `20202`<br>`devInvalidCursorTable` | 커서가 대상 테이블과 일치하지 않습니다 | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: 커서 토큰</li><li>`primaryKey`: `null`</li></ul> |
-  | `20203`<br>`devInvalidCursorSignature` | 커서 서명 불일치(변조됨) | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: 커서 토큰</li><li>`primaryKey`: `null`</li></ul> |
-  | `20204`<br>`devInvalidCursorOrderBy` | 커서 orderBy 구성이 무효 또는 불일치 | <ul><li>`parameterName`: `"orderBy"`</li><li>`passedValue`: orderBy 목록, 예 `["-age", "id"]`</li><li>`primaryKey`: `null`</li></ul> |
-  | `20205`<br>`devInvalidCursorMode` | 커서 토큰 모드 불일치 | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: 토큰 모드, 예 `"sortKey"`</li><li>`primaryKey`: `null`</li></ul> |
-  | `20206`<br>`devInvalidCursorPayload` | 무효한 커서 페이로드(디코드 불가) | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: `null`</li><li>`primaryKey`: `null`</li></ul> |
-  | `20301`<br>`devInvalidQuerySelectField` | 쿼리 선택 필드는 String 또는 QueryAggregation이어야 합니다 | <ul><li>`parameterName`: `"select"`</li><li>`passedValue`: 무효한 선택 필드 정의</li><li>`primaryKey`: `null`</li></ul> |
-  | `20302`<br>`devInvalidQueryForeignKeyJoin` | 자동 조인용 외래키 관계가 존재하지 않습니다 | <ul><li>`parameterName`: `"join"` / `"tableName"`</li><li>`passedValue`: 관계가 없는 대상 테이블</li><li>`primaryKey`: `null`</li></ul> |
-  | `20303`<br>`devInvalidQueryFieldAlias` | 쿼리 필드 에일리어스 형식이 무효입니다 | <ul><li>`parameterName`: `"alias"`</li><li>`passedValue`: 무효한 에일리어스 문자열</li><li>`primaryKey`: `null`</li></ul> |
-  | `20304`<br>`devInvalidExpression` | 무효한 식 구성 또는 실행 예외 | <ul><li>`parameterName`: 에러 측면(예: `"arguments"`, `"functionName"`, `"node"`)</li><li>`passedValue`: 무효한 값 또는 카운트</li><li>`primaryKey`: `null`</li></ul> |
-  | `22005`<br>`devFieldNotFound` | 필드를 찾을 수 없습니다 | <ul><li>`parameterName`: 알 수 없는 필드 이름, 예 `"extra"`</li><li>`passedValue`: 전달된 필드의 값</li><li>`primaryKey`: 레코드 주키(존재하는 경우)</li></ul> |
+  | `20004`<br>`devInvalidPrimaryKeyFormat` | 무효한 주키 형식 | <ul><li>`parameterName`: `"primaryKey"` 또는 주키 필드</li><li>`passedValue`: 무효한 주키 값, 예 `"invalid_id_value"`</li><li>`primaryKey`: 무효한 주키 값</li></ul> |
+  | `20007`<br>`devVectorDimensionMismatch` | 벡터 차원 불일치 | <ul><li>`parameterName`: `"other"`</li><li>`passedValue`: 위배되는 차원 크기</li><li>`primaryKey`: `null`</li></ul> |
+  | `20008`<br>`devIndexFieldMissing` | 커서용 레코드에서 필요한 인덱스 필드 누락 | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: 누락된 인덱스 필드</li><li>`primaryKey`: `null`</li></ul> |
+  | `20101`<br>`devInvalidCursorPagination` | 커서 페이지네이션과 오프셋은 상호 배타적입니다 | <ul><li>`parameterName`: `"cursor"` / `"offset"`</li><li>`passedValue`: 충돌하는 페이지네이션 매개변수</li><li>`primaryKey`: `null`</li></ul> |
+  | `20102`<br>`devInvalidCursorTable` | 커서가 대상 테이블과 일치하지 않습니다 | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: 커서 토큰</li><li>`primaryKey`: `null`</li></ul> |
+  | `20103`<br>`devInvalidCursorSignature` | 커서 서명 불일치(변조됨) | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: 커서 토큰</li><li>`primaryKey`: `null`</li></ul> |
+  | `20104`<br>`devInvalidCursorOrderBy` | 커서 orderBy 구성이 무효 또는 불일치 | <ul><li>`parameterName`: `"orderBy"`</li><li>`passedValue`: orderBy 목록, 예 `["-age", "id"]`</li><li>`primaryKey`: `null`</li></ul> |
+  | `20105`<br>`devInvalidCursorMode` | 커서 토큰 모드 불일치 | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: 토큰 모드, 예 `"sortKey"`</li><li>`primaryKey`: `null`</li></ul> |
+  | `20106`<br>`devInvalidCursorPayload` | 무효한 커서 페이로드(디코드 불가) | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: `null`</li><li>`primaryKey`: `null`</li></ul> |
+  | `20201`<br>`devInvalidQuerySelectField` | 쿼리 선택 필드는 String 또는 QueryAggregation이어야 합니다 | <ul><li>`parameterName`: `"select"`</li><li>`passedValue`: 무효한 선택 필드 정의</li><li>`primaryKey`: `null`</li></ul> |
+  | `20202`<br>`devInvalidQueryForeignKeyJoin` | 자동 조인용 외래키 관계가 존재하지 않습니다 | <ul><li>`parameterName`: `"join"` / `"tableName"`</li><li>`passedValue`: 관계가 없는 대상 테이블</li><li>`primaryKey`: `null`</li></ul> |
+  | `20203`<br>`devInvalidQueryFieldAlias` | 쿼리 필드 에일리어스 형식이 무효입니다 | <ul><li>`parameterName`: `"alias"`</li><li>`passedValue`: 무효한 에일리어스 문자열</li><li>`primaryKey`: `null`</li></ul> |
+  | `20204`<br>`devInvalidExpression` | 무효한 식 구성 또는 실행 예외 | <ul><li>`parameterName`: 에러 측면(예: `"arguments"`, `"functionName"`, `"node"`)</li><li>`passedValue`: 무효한 값 또는 카운트</li><li>`primaryKey`: `null`</li></ul> |
+  | `22004`<br>`devFieldNotFound` | 필드를 찾을 수 없습니다 | <ul><li>`parameterName`: 알 수 없는 필드 이름, 예 `"extra"`</li><li>`passedValue`: 전달된 필드의 값</li><li>`primaryKey`: 레코드 주키(존재하는 경우)</li></ul> |
 
 - **JSON 물리 표현 예** (커서의 정렬 순서가 쿼리의 정렬 순서와 충돌하는 오류):
   ```json
   {
     "index": 0,
-    "code": 20204,
+    "code": 20104,
     "codeKey": "DEV_INVALID_CURSOR_ORDERBY",
     "message": "Cursor orderBy fields do not match current query orderBy.",
     "parameterName": "orderBy",
@@ -257,7 +260,7 @@ Dart/Flutter에서 `ResultStatus`와 `ResultType`은 수동 범위 체크나 문
 
 ### 4.5 TransactionOperationStatus (트랜잭션 충돌 및 중단)
 
-- **범주 범위**: `code`가 `[50000, 50999]` 범위(트랜잭션 롤백, 명시적 중단 또는 직렬화 가능성 충돌).
+- **범주 범위**: `50001`(`sysTransactionAborted`) 및 `50002`(`sysTransactionConflict`)만. 기타 `500xx`(예: `50003` / `50004`)는 GeneralStatus(§4.6)를 사용.
 - **전용 필드 정의**:
 
   | 필드 | 유형 | 상세 내용 |
@@ -286,7 +289,7 @@ Dart/Flutter에서 `ResultStatus`와 `ResultType`은 수동 범위 체크나 문
 
 ### 4.6 GeneralStatus (일반 및 시스템 수준 예외 상태)
 
-- **범주 범위**: 다른 모든 상태 코드의 폴백(저수준 I/O, 하드웨어 오류, 시스템 타임아웃 등).
+- **범주 범위**: §§4.1–4.5에 속하지 않는 코드의 폴백 — `20005` / `20006`, `22001`–`22003`, `230xx` / `240xx`, 나머지 `50xxx`–`53xxx`, `99001` 포함.
 - **전용 필드 정의**:
 
   | 필드 | 유형 | 상세 내용 |
@@ -299,11 +302,11 @@ Dart/Flutter에서 `ResultStatus`와 `ResultType`은 수동 범위 체크나 문
 
   | 코드 및 메모리 내 유형 | 시나리오 / 레벨 | 필드 가이드라인 |
   | :--- | :--- | :--- |
-  | `20007`<br>`devIndexOutOfBounds` | 인덱스 또는 범위가 곙계 외(개발자 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `20008`<br>`devUnsupportedOperation` | 현재 컨텍스트에서는 작업이 지원되지 않음(개발자 오류) | <ul><li>`primaryKey`: `null`</li><li>`target`: 대상 테이블/리소스(존재 시)</li><li>`operation`: 메서드 이름(존재 시)</li></ul> |
+  | `20005`<br>`devIndexOutOfBounds` | 인덱스 또는 범위가 곙계 외(개발자 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `20006`<br>`devUnsupportedOperation` | 현재 컨텍스트에서는 작업이 지원되지 않음(개발자 오류) | <ul><li>`primaryKey`: `null`</li><li>`target`: 대상 테이블/리소스(존재 시)</li><li>`operation`: 메서드 이름(존재 시)</li></ul> |
   | `22001`<br>`devTableNotFound` | 테이블을 찾을 수 없음(개발자 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `22003`<br>`devIndexNotFound` | 인덱스를 찾을 수 없음(개발자 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `22004`<br>`devSpaceNotFound` | 스페이스를 찾을 수 없음(개발자 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `22002`<br>`devIndexNotFound` | 인덱스를 찾을 수 없음(개발자 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `22003`<br>`devSpaceNotFound` | 스페이스를 찾을 수 없음(개발자 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `23001`<br>`devLargeScaleOperationRequired` | 대규모 데이터 작업에 `allowLargeScaleOperation()` 필요(개발자 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `23002`<br>`devLargeScaleOperationNotAllowedInTransaction` | Large-scale data operation is not allowed inside a transaction (Developer Error) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `24001`<br>`devEngineIncompatible` | **심각**: 엔진 버전 불일치(개발자 오류) | <ul><li>`primaryKey`: `null`</li></ul> |
@@ -472,50 +475,52 @@ try {
 | **11010** | `BIZ_CONSTRAINT_MIN_LENGTH` | `ResultType.bizValueLessThanMinLength` | 비즈니스 오류 | 값의 길이가 스키마 제한 미만입니다 |
 | **11011** | `BIZ_CONSTRAINT_MIN_VALUE` | `ResultType.bizValueLessThanMinValue` | 비즈니스 오류 | 숫자가 스키마 제한 미만입니다 |
 | **11012** | `BIZ_CONSTRAINT_MAX_VALUE` | `ResultType.bizValueExceedsMaxValue` | 비즈니스 오류 | 숫자가 스키마 제한을 초과합니다 |
-| **12002** | `BIZ_NOT_FOUND_RECORD` | `ResultType.bizRecordNotFound` | 비즈니스 오류 | 리소스가 존재하지 않음 / 레코드 미검출 |
+| **12001** | `BIZ_NOT_FOUND_RECORD` | `ResultType.bizRecordNotFound` | 비즈니스 오류 | 리소스가 존재하지 않음 / 레코드 미검출 |
 | **20001** | `DEV_INVALID_ARGUMENT_FORMAT` | `ResultType.devInvalidArgumentFormat` | 개발자 오류 | 인수 형식 오류 |
 | **20002** | `DEV_INVALID_ARGUMENT_TYPE` | `ResultType.devInvalidArgumentType` | 개발자 오류 | 인수 형식 불일치 |
 | **20003** | `DEV_INVALID_ARGUMENT_MISSING` | `ResultType.devInvalidArgumentMissing` | 개발자 오류 | 필수 인수가 누락되었습니다 |
-| **20005** | `DEV_INVALID_PRIMARY_KEY_FORMAT` | `ResultType.devInvalidPrimaryKeyFormat` | 개발자 오류 | 무효한 PrimaryKey 형식 |
-| **20007** | `DEV_INDEX_OUT_OF_BOUNDS` | `ResultType.devIndexOutOfBounds` | 개발자 오류 | 인덱스 또는 범위가 경계 외 |
-| **20008** | `DEV_UNSUPPORTED_OPERATION` | `ResultType.devUnsupportedOperation` | 개발자 오류 | 현재 컨텍스트에서는 작업이 지원되지 않음 |
-| **20010** | `DEV_VECTOR_DIMENSION_MISMATCH` | `ResultType.devVectorDimensionMismatch` | 개발자 오류 | 벡터 차원 불일치 |
-| **20011** | `DEV_INDEX_FIELD_MISSING` | `ResultType.devIndexFieldMissing` | 개발자 오류 | 커서용 레코드에서 필요한 인덱스 필드 누락 |
-| **20201** | `DEV_INVALID_CURSOR_PAGINATION` | `ResultType.devInvalidCursorPagination` | 개발자 오류 | 커서 페이지네이션과 오프셋은 상호 배타적입니다 |
-| **20202** | `DEV_INVALID_CURSOR_TABLE` | `ResultType.devInvalidCursorTable` | 개발자 오류 | 커서가 대상 테이블과 일치하지 않습니다 |
-| **20203** | `DEV_INVALID_CURSOR_SIGNATURE` | `ResultType.devInvalidCursorSignature` | 개발자 오류 | 커서 서명 불일치(변조됨) |
-| **20204** | `DEV_INVALID_CURSOR_ORDERBY` | `ResultType.devInvalidCursorOrderBy` | 개발자 오류 | 커서 orderBy 구성이 무효 또는 불일치 |
-| **20205** | `DEV_INVALID_CURSOR_MODE` | `ResultType.devInvalidCursorMode` | 개발자 오류 | 커서 토큰 모드 불일치 |
-| **20206** | `DEV_INVALID_CURSOR_PAYLOAD` | `ResultType.devInvalidCursorPayload` | 개발자 오류 | 무효한 커서 페이로드(디코드 불가) |
-| **20301** | `DEV_INVALID_QUERY_SELECT_FIELD` | `ResultType.devInvalidQuerySelectField` | 개발자 오류 | 쿼리 선택 필드는 String 또는 QueryAggregation이어야 합니다 |
-| **20302** | `DEV_INVALID_QUERY_FOREIGN_KEY_JOIN` | `ResultType.devInvalidQueryForeignKeyJoin` | 개발자 오류 | 자동 조인용 외래키 관계가 존재하지 않습니다 |
-| **20303** | `DEV_INVALID_QUERY_FIELD_ALIAS` | `ResultType.devInvalidQueryFieldAlias` | 개발자 오류 | 쿼리 필드 에일리어스 형식이 무효입니다 |
-| **20304** | `DEV_INVALID_EXPRESSION` | `ResultType.devInvalidExpression` | 개발자 오류 | 무효한 식 구성 또는 실행 예외 |
+| **20004** | `DEV_INVALID_PRIMARY_KEY_FORMAT` | `ResultType.devInvalidPrimaryKeyFormat` | 개발자 오류 | 무효한 PrimaryKey 형식 |
+| **20005** | `DEV_INDEX_OUT_OF_BOUNDS` | `ResultType.devIndexOutOfBounds` | 개발자 오류 | 인덱스 또는 범위가 경계 외 |
+| **20006** | `DEV_UNSUPPORTED_OPERATION` | `ResultType.devUnsupportedOperation` | 개발자 오류 | 현재 컨텍스트에서는 작업이 지원되지 않음 |
+| **20007** | `DEV_VECTOR_DIMENSION_MISMATCH` | `ResultType.devVectorDimensionMismatch` | 개발자 오류 | 벡터 차원 불일치 |
+| **20008** | `DEV_INDEX_FIELD_MISSING` | `ResultType.devIndexFieldMissing` | 개발자 오류 | 커서용 레코드에서 필요한 인덱스 필드 누락 |
+| **20101** | `DEV_INVALID_CURSOR_PAGINATION` | `ResultType.devInvalidCursorPagination` | 개발자 오류 | 커서 페이지네이션과 오프셋은 상호 배타적입니다 |
+| **20102** | `DEV_INVALID_CURSOR_TABLE` | `ResultType.devInvalidCursorTable` | 개발자 오류 | 커서가 대상 테이블과 일치하지 않습니다 |
+| **20103** | `DEV_INVALID_CURSOR_SIGNATURE` | `ResultType.devInvalidCursorSignature` | 개발자 오류 | 커서 서명 불일치(변조됨) |
+| **20104** | `DEV_INVALID_CURSOR_ORDERBY` | `ResultType.devInvalidCursorOrderBy` | 개발자 오류 | 커서 orderBy 구성이 무효 또는 불일치 |
+| **20105** | `DEV_INVALID_CURSOR_MODE` | `ResultType.devInvalidCursorMode` | 개발자 오류 | 커서 토큰 모드 불일치 |
+| **20106** | `DEV_INVALID_CURSOR_PAYLOAD` | `ResultType.devInvalidCursorPayload` | 개발자 오류 | 무효한 커서 페이로드(디코드 불가) |
+| **20201** | `DEV_INVALID_QUERY_SELECT_FIELD` | `ResultType.devInvalidQuerySelectField` | 개발자 오류 | 쿼리 선택 필드는 String 또는 QueryAggregation이어야 합니다 |
+| **20202** | `DEV_INVALID_QUERY_FOREIGN_KEY_JOIN` | `ResultType.devInvalidQueryForeignKeyJoin` | 개발자 오류 | 자동 조인용 외래키 관계가 존재하지 않습니다 |
+| **20203** | `DEV_INVALID_QUERY_FIELD_ALIAS` | `ResultType.devInvalidQueryFieldAlias` | 개발자 오류 | 쿼리 필드 에일리어스 형식이 무효입니다 |
+| **20204** | `DEV_INVALID_EXPRESSION` | `ResultType.devInvalidExpression` | 개발자 오류 | 무효한 식 구성 또는 실행 예외 |
 | **22001** | `DEV_NOT_FOUND_TABLE` | `ResultType.devTableNotFound` | 개발자 오류 | 테이블을 찾을 수 없음 |
-| **22003** | `DEV_NOT_FOUND_INDEX` | `ResultType.devIndexNotFound` | 개발자 오류 | 인덱스를 찾을 수 없음 |
-| **22004** | `DEV_NOT_FOUND_SPACE` | `ResultType.devSpaceNotFound` | 개발자 오류 | 스페이스를 찾을 수 없음 |
-| **22005** | `DEV_NOT_FOUND_FIELD` | `ResultType.devFieldNotFound` | 개발자 오류 | 필드를 찾을 수 없음 |
+| **22002** | `DEV_NOT_FOUND_INDEX` | `ResultType.devIndexNotFound` | 개발자 오류 | 인덱스를 찾을 수 없음 |
+| **22003** | `DEV_NOT_FOUND_SPACE` | `ResultType.devSpaceNotFound` | 개발자 오류 | 스페이스를 찾을 수 없음 |
+| **22004** | `DEV_NOT_FOUND_FIELD` | `ResultType.devFieldNotFound` | 개발자 오류 | 필드를 찾을 수 없음 |
 | **23001** | `DEV_LARGE_SCALE_OPERATION_REQUIRED` | `ResultType.devLargeScaleOperationRequired` | 개발자 오류 | 대규모 데이터 작업에 `allowLargeScaleOperation()` 필요(OOM 방지) |
 | **23002** | `DEV_LARGE_SCALE_OPERATION_NOT_ALLOWED_IN_TRANSACTION` | `ResultType.devLargeScaleOperationNotAllowedInTransaction` | Developer Error | Large-scale data operation is not allowed inside a transaction |
 | **24001** | `DEV_ENGINE_INCOMPATIBLE` | `ResultType.devEngineIncompatible` | 개발자 오류 | **심각**: 엔진 버전 불일치 |
 | **30000** | `DEV_INVALID_SCHEMA` | `ResultType.devInvalidSchema` | 개발자 오류 | 유효하지 않은 테이블 스키마 정의 |
 | **30001** | `DEV_INVALID_SCHEMA_TABLE_NAME` | `ResultType.devInvalidSchemaTableName` | 개발者 오류 | 테이블 이름 검증 오류 |
 | **30002** | `DEV_INVALID_SCHEMA_FIELD_NAME` | `ResultType.devInvalidSchemaFieldName` | 개발자 오류 | 필드 이름 검증 오류 |
-| **30003** | `DEV_INVALID_SCHEMA_PRIMARY_KEY` | `ResultType.devInvalidSchemaPrimaryKey` | 개발자 오류 | 주키 검증 오류 |
-| **30004** | `DEV_INVALID_SCHEMA_INDEX_LIMIT` | `ResultType.devInvalidSchemaIndexLimit` | 개발자 오류 | 인덱스 수 검증 오류 |
-| **30005** | `DEV_SCHEMA_TABLE_EXISTS` | `ResultType.devSchemaTableExists` | 개발자 오류 | 테이블이 이미 존재합니다 |
-| **30006** | `DEV_SCHEMA_FIELD_EXISTS` | `ResultType.devSchemaFieldExists` | 개발자 오류 | 필드가 이미 존재합니다 |
-| **30007** | `DEV_SCHEMA_INDEX_EXISTS` | `ResultType.devSchemaIndexExists` | 개발자 오류 | 인덱스가 이미 존재합니다 |
+| **30003** | `DEV_INVALID_SCHEMA_DUPLICATE_FIELD_NAME` | `ResultType.devInvalidSchemaDuplicateFieldName` | 개발자 오류 | 테이블 스키마 내 중복된 필드 이름 |
+| **30004** | `DEV_INVALID_SCHEMA_PRIMARY_KEY` | `ResultType.devInvalidSchemaPrimaryKey` | 개발자 오류 | 주키 검증 오류 |
+| **30005** | `DEV_INVALID_SCHEMA_INDEX_LIMIT` | `ResultType.devInvalidSchemaIndexLimit` | 개발자 오류 | 인덱스 수 검증 오류 |
+| **30006** | `DEV_INVALID_SCHEMA_INDEX_FIELD` | `ResultType.devInvalidSchemaIndexField` | 개발자 오류 | 인덱스가 존재하지 않는 필드를 참조합니다 |
+| **30007** | `DEV_INVALID_SCHEMA_INDEX_TYPE` | `ResultType.devInvalidSchemaIndexType` | 개발자 오류 | 인덱스 유형이 필드 데이터 유형 또는 구성과 호환되지 않음 |
 | **30008** | `DEV_INVALID_SCHEMA_FOREIGN_KEY` | `ResultType.devInvalidSchemaForeignKey` | 개발자 오류 | 외래키 정의가 무효 |
 | **30009** | `DEV_INVALID_SCHEMA_SPACE_MISMATCH` | `ResultType.devInvalidSchemaSpaceMismatch` | 개발자 오류 | 글로벌/스페이스 고유의 경계 불일치 |
-| **30010** | `DEV_MIGRATION_NOT_ALLOWED_WITH_DATA` | `ResultType.devMigrationNotAllowedWithData` | 개발자 오류 | 마이그레이션에 데이터 변경이 필요하지만 명시적으로 허용되지 않음 |
-| **30011** | `DEV_MIGRATION_UNSAFE_TYPE_CONVERSION` | `ResultType.devMigrationUnsafeTypeConversion` | 개발자 오류 | 지원되지 않는 유형 변환 |
-| **30013** | `DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD` | `ResultType.devMigrationCannotAddNonNullField` | 개발자 오류 | 데이터가 있는 테이블에 기본값 없이 비NULL 필드를 추가할 수 없음 |
-| **30014** | `DEV_MIGRATION_NULLABLE_TO_NON_NULL_NOT_ALLOWED` | `ResultType.devMigrationNullableToNonNullNotAllowed` | 개발자 오류 | 필드를 NULL 허용에서 비NULL로 변경할 수 없음 |
-| **30015** | `DEV_MIGRATION_UNIQUE_TIGHTENING_NOT_ALLOWED` | `ResultType.devMigrationUniqueTighteningNotAllowed` | 개발자 오류 | 필드 제약 조건을 UNIQUE로 강화할 수 없음 |
-| **30016** | `DEV_INVALID_SCHEMA_TTL_CONFIG` | `ResultType.devInvalidSchemaTtlConfig` | 개발자 오류 | TTL 구성 검증 실패 |
-| **30017** | `DEV_INVALID_SCHEMA_DUPLICATE_FIELD_NAME` | `ResultType.devInvalidSchemaDuplicateFieldName` | 개발자 오류 | 테이블 스키마 내 중복된 필드 이름 |
-| **30018** | `DEV_INVALID_SCHEMA_INDEX_FIELD` | `ResultType.devInvalidSchemaIndexField` | 개발자 오류 | 인덱스가 존재하지 않는 필드를 참조합니다 |
+| **30010** | `DEV_INVALID_SCHEMA_TTL_CONFIG` | `ResultType.devInvalidSchemaTtlConfig` | 개발자 오류 | TTL 구성 검증 실패 |
+| **30011** | `DEV_SCHEMA_TABLE_EXISTS` | `ResultType.devSchemaTableExists` | 개발자 오류 | 테이블이 이미 존재합니다 |
+| **30012** | `DEV_SCHEMA_FIELD_EXISTS` | `ResultType.devSchemaFieldExists` | 개발자 오류 | 필드가 이미 존재합니다 |
+| **30013** | `DEV_SCHEMA_INDEX_EXISTS` | `ResultType.devSchemaIndexExists` | 개발자 오류 | 인덱스가 이미 존재합니다 |
+| **31001** | `DEV_MIGRATION_NOT_ALLOWED_WITH_DATA` | `ResultType.devMigrationNotAllowedWithData` | 개발자 오류 | 마이그레이션에 데이터 변경이 필요하지만 명시적으로 허용되지 않음 |
+| **31002** | `DEV_MIGRATION_UNSAFE_TYPE_CONVERSION` | `ResultType.devMigrationUnsafeTypeConversion` | 개발자 오류 | 지원되지 않는 유형 변환 |
+| **31003** | `DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD` | `ResultType.devMigrationCannotAddNonNullField` | 개발자 오류 | 데이터가 있는 테이블에 기본값 없이 비NULL 필드를 추가할 수 없음 |
+| **31004** | `DEV_MIGRATION_NULLABLE_TO_NON_NULL_NOT_ALLOWED` | `ResultType.devMigrationNullableToNonNullNotAllowed` | 개발자 오류 | 필드를 NULL 허용에서 비NULL로 변경할 수 없음 |
+| **31005** | `DEV_MIGRATION_UNIQUE_TIGHTENING_NOT_ALLOWED` | `ResultType.devMigrationUniqueTighteningNotAllowed` | 개발자 오류 | 필드 제약 조건을 UNIQUE로 강화할 수 없음 |
+| **31006** | `DEV_MIGRATION_PROMOTE_LARGE_OP_NOT_ALLOWED` | `ResultType.devMigrationPromoteLargeOpNotAllowed` | 개발자 오류 | promoteFieldToPrimaryKey 실행 중에는 대규모 데이터 작업이 허용되지 않음 |
 | **50001** | `SYS_TRANSACTION_ABORTED` | `ResultType.sysTransactionAborted` | 시스템 오류 | 트랜잭션이 중단되었습니다 |
 | **50002** | `SYS_TRANSACTION_CONFLICT` | `ResultType.sysTransactionConflict` | 시스템 오류 | 트랜잭션 충돌 |
 | **50003** | `SYS_TRANSACTION_LIMIT_EXCEEDED` | `ResultType.sysTransactionLimitExceeded` | 시스템 오류 | 메모리 압박 상태에서 트랜잭션이 안전 메모리 한도를 초과함 |

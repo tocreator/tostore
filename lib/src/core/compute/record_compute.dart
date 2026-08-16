@@ -109,8 +109,8 @@ Map<String, dynamic>? validateAndProcessRecordPure({
       if (skipPrimaryKeyFormatCheck && providedId is String) {
         result[primaryKey] = providedId;
       } else {
-        result[primaryKey] =
-            schema.primaryKeyConfig.convertPrimaryKey(providedId);
+        result[primaryKey] = schema.primaryKeyConfig
+            .convertPrimaryKey(providedId, tableName: tableName);
       }
     }
 

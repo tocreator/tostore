@@ -27,42 +27,9 @@ void main() async {
       final message = log.message;
       final type = log.level;
 
-      // 1. Suppress expected Non-Nullable Constraint warnings
-      if (type == LogLevel.warn &&
-          (message.contains('Field email is required and cannot be null') ||
-              message.contains('Data validation failed for table users'))) {
+      // Filter out expected test-induced calculation fallback logs
+      if (message.contains('Division by zero in expression')) {
         return;
-      }
-
-      // 2. Suppress expected Unique Constraint Violations (New Format)
-      if (message.contains('CONSTRAINT_VIOLATION_UNIQUE')) {
-        // Only suppress if it contains specific test data values
-        if (message.contains("value 'tx_user1'") || // Transaction test
-            message.contains("value 'tx_user4'") || // Transaction test
-            message.contains("value 'upsert_user'") || // Upsert test
-            message.contains(
-                "value 'buffer_test_user'") || // Buffer robustness test
-            message.contains("value '3'") || // Edge case test
-            message
-                .contains("value '4'") || // Edge case test (potential artifact)
-            message.contains("value '8'")) {
-          // Edge case test (potential artifact)
-          return;
-        }
-      }
-
-      // 3. Suppress expected Foreign Key and Transaction warnings
-      if (message.contains('Conflicting values: [99999]') ||
-          message.contains(
-              'Referenced by records in child table "comments" via foreign key') ||
-          message.contains(
-              '"users": Referenced by records in child tables (comments) with RESTRICT/NO ACTION policy.') ||
-          message.contains('Division by zero in expression. Returning 0.') ||
-          message.contains(
-              'Table users has primary key conflict, update auto increment start:') ||
-          message.contains(
-              '(uniq_username) with value: tx_user1 (Existing PK: 1) (Key: 5)')) {
-        return; // Suppress expected foreign key constraint test errors
       }
 
       logService.add(message, type, true);

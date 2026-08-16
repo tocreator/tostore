@@ -4730,7 +4730,8 @@ class DataStoreImpl {
                       record.containsKey(primaryKey) &&
                       record[primaryKey] != null) {
                     validData[primaryKey] = tableSchema.primaryKeyConfig
-                        .convertPrimaryKey(record[primaryKey]);
+                        .convertPrimaryKey(record[primaryKey],
+                            tableName: tableName);
                   }
                 }
 

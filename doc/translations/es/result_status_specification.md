@@ -58,7 +58,7 @@ Todos los tipos de `ResultStatus`, cuando se serializan a JSON, contienen los si
 | :--- | :--- | :--- |
 | `index` | `int` | Índice de secuencia en operaciones por lotes. Para operaciones individuales, este valor se fija en `0`. |
 | `code` | `int` | Código de estado numérico (`0` para éxito, número de 5 dígitos para excepciones). |
-| `codeKey` | `String` | Clave del identificador semántico del estado, por ejemplo, `CONSTRAINT_VIOLATION_UNIQUE`. |
+| `codeKey` | `String` | Clave del identificador semántico del estado, por ejemplo, `BIZ_CONSTRAINT_UNIQUE`. |
 | `message` | `String` | Descripción detallada del estado legible por humanos. |
 
 ### 3.2 Getters Auxiliares en Memoria
@@ -68,6 +68,7 @@ En Dart/Flutter, `ResultStatus` y `ResultType` encapsulan propiedades de solo le
 | Propiedad | Tipo | Descripción |
 | :--- | :--- | :--- |
 | `isBusinessError` | `bool` | Indica si se trata de un **Error de Negocio** (por ejemplo, conflicto de restricciones, fallo de conversión de tipo; rango `10000 - 19999`). |
+| `isConstraintError` | `bool` | Indica si se mapea a **ConstraintStatus** (mismo rango numérico que `isBusinessError`: `10000 - 19999`). |
 | `isDeveloperError` | `bool` | Indica si se trata de un **Error de Desarrollador** (por ejemplo, esquema no válido, discrepancia de parámetros, tabla no encontrada; rango `20000 - 49999`). |
 | `isSystemError` | `bool` | Indica si se trata de un **Error de Sistema** (por ejemplo, tiempo de espera de bloqueo, disco lleno, bloqueo de archivos; rango `50000 - 79999`). |
 | `isEngineError` | `bool` | Indica si se trata de un **Error de Motor** (rango `99000 - 99999`). |
@@ -104,7 +105,7 @@ Dependiendo del rango de `code` / `codeKey` y la subclase específica de `Result
 
 ### 4.2 ConstraintStatus (Integridad de datos & conflictos de restricciones)
 
-- **Rango de Categoría**: `code` dentro de `[10000, 19999]` (principalmente conflictos de validación y restricciones de integridad).
+- **Rango de Categoría**: `code` dentro de `[10000, 19999]` (todos los códigos hoja de Error de Negocio: validación, restricciones de integridad y registro no encontrado). Coincide con `ResultType.isConstraintError`.
 - **Definición de Campo Dedicado**:
 
   | Campo | Tipo | Detalles |
@@ -135,7 +136,7 @@ Dependiendo del rango de `code` / `codeKey` y la subclase específica de `Result
   | `11010`<br>`bizValueLessThanMinLength` | La longitud del valor es menor que la restricción mínima | <ul><li>`tableName`: Tabla afectada</li><li>`constraintName`: `null`</li><li>`fields`: Campos que violan el límite, por ejemplo, `["code"]`</li><li>`conflictingKeys`: Valores más cortos que el mínimo, por ejemplo, `["ab"]`</li><li>`primaryKey`: Clave primaria del registro (si existe)</li></ul> |
   | `11011`<br>`bizValueLessThanMinValue` | El valor numérico es menor que la restricción mínima | <ul><li>`tableName`: Tabla afectada</li><li>`constraintName`: `null`</li><li>`fields`: Campos que violan el límite, por ejemplo, `["age"]`</li><li>`conflictingKeys`: Valores menores que el mínimo, por ejemplo, `[-5]`</li><li>`primaryKey`: Clave primaria del registro (si existe)</li></ul> |
   | `11012`<br>`bizValueExceedsMaxValue` | El valor numérico supera la restricción máxima | <ul><li>`tableName`: Tabla afectada</li><li>`constraintName`: `null`</li><li>`fields`: Campos que violan el límite, por ejemplo, `["score"]`</li><li>`conflictingKeys`: Valores que exceden el máximo, por ejemplo, `[105]`</li><li>`primaryKey`: Clave primaria del registro (si existe)</li></ul> |
-  | `12002`<br>`bizRecordNotFound` | El recurso no existe / Registro no encontrado | <ul><li>`tableName`: Tabla afectada</li><li>`constraintName`: `null`</li><li>`fields`: Campos de búsqueda objetivo, por ejemplo, `["id"]`</li><li>`conflictingKeys`: Claves objetivo no encontradas, por ejemplo, `["non_exist_id"]`</li><li>`primaryKey`: Valor de la clave faltante, por ejemplo, `"non_exist_id"`</li></ul> |
+  | `12001`<br>`bizRecordNotFound` | El recurso no existe / Registro no encontrado | <ul><li>`tableName`: Tabla afectada</li><li>`constraintName`: `null`</li><li>`fields`: Campos de búsqueda objetivo, por ejemplo, `["id"]`</li><li>`conflictingKeys`: Claves objetivo no encontradas, por ejemplo, `["non_exist_id"]`</li><li>`primaryKey`: Valor de la clave faltante, por ejemplo, `"non_exist_id"`</li></ul> |
 
 - **Ejemplo JSON** (El registro principal de la clave externa no existe):
   ```json
@@ -157,7 +158,7 @@ Dependiendo del rango de `code` / `codeKey` y la subclase específica de `Result
 
 ### 4.3 SchemaValidationStatus (Validación de esquema de tabla & migración incompatible)
 
-- **Rango de Categoría**: `code` dentro de `[30000, 39999]` (errores de validación de configuración de esquema e incoherencias de migración física).
+- **Rango de Categoría**: `code` dentro de `[30000, 39999]` — `30000–30013` validación estática de esquema, `31001–31006` protecciones de migración.
 - **Definición de Campo Dedicado**:
 
   | Campo | Tipo | Detalles |
@@ -173,27 +174,29 @@ Dependiendo del rango de `code` / `codeKey` y la subclase específica de `Result
   | `30000`<br>`devInvalidSchema` | Definición de esquema de tabla no válida | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: `null`</li><li>`wrongValue`: Map de configuración no válida, o `null`</li></ul> |
   | `30001`<br>`devInvalidSchemaTableName` | Fallo de validación del nombre de la tabla (caracteres no válidos o demasiado largo) | <ul><li>`tableName`: Nombre no válido</li><li>`field`: `null`</li><li>`wrongValue`: Cadena no válida</li></ul> |
   | `30002`<br>`devInvalidSchemaFieldName` | Fallo de validación del nombre del campo (caracteres no válidos) | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: Nombre del campo no válido</li><li>`wrongValue`: Cadena no válida</li></ul> |
-  | `30003`<br>`devInvalidSchemaPrimaryKey` | Fallo de validación de la clave primaria (faltante o formato no válido) | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: `"primaryKey"` o nombre del campo de clave primaria</li><li>`wrongValue`: Detalles de configuración de clave primaria</li></ul> |
-  | `30004`<br>`devInvalidSchemaIndexLimit` | El número de índices de tabla supera el límite del sistema de 16 | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: `null`</li><li>`wrongValue`: Lista de configuraciones de índices</li></ul> |
-  | `30005`<br>`devSchemaTableExists` | La tabla ya existe | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
-  | `30006`<br>`devSchemaFieldExists` | Actualización de esquema: agregar un campo que ya existe | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: Nombre del campo en conflicto</li><li>`wrongValue`: `null`</li></ul> |
-  | `30007`<br>`devSchemaIndexExists` | Actualización de esquema: agregar un índice que ya existe | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: Nombre del índice</li><li>`wrongValue`: `null`</li></ul> |
+  | `30003`<br>`devInvalidSchemaDuplicateFieldName` | Nombre de campo duplicado en el esquema de la tabla | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: Nombre de campo duplicado</li><li>`wrongValue`: `null`</li></ul> |
+  | `30004`<br>`devInvalidSchemaPrimaryKey` | Fallo de validación de la clave primaria (faltante o formato no válido) | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: `"primaryKey"` o nombre del campo de clave primaria</li><li>`wrongValue`: Detalles de configuración de clave primaria</li></ul> |
+  | `30005`<br>`devInvalidSchemaIndexLimit` | El número de índices de tabla supera el límite del sistema de 16 | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: `null`</li><li>`wrongValue`: Lista de configuraciones de índices</li></ul> |
+  | `30006`<br>`devInvalidSchemaIndexField` | El índice hace referencia a un campo que no existe | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: Nombre del índice</li><li>`wrongValue`: Nombre del campo que causa la discrepancia</li></ul> |
+  | `30007`<br>`devInvalidSchemaIndexType` | Tipo de índice incompatible con el tipo de datos o la configuración del campo | <ul><li>`tableName`: Nombre de tabla</li><li>`field`: Nombre de índice/campo</li><li>`wrongValue`: Info de conflicto, p. ej. `{ "indexType": "btree", "fieldType": "vector" }`</li></ul> |
   | `30008`<br>`devInvalidSchemaForeignKey` | Definición de clave externa no válida (por ejemplo, discrepancia de columnas) | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: Nombre de la clave externa</li><li>`wrongValue`: Detalles de configuración de clave externa</li></ul> |
   | `30009`<br>`devInvalidSchemaSpaceMismatch` | Discrepancia de límite global/específico del espacio | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
-  | `30010`<br>`devMigrationNotAllowedWithData` | La migración requiere la modificación de datos y no fue explícitamente permitida | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: `null`</li><li>`wrongValue`: Map de diferencias de actualización de migración</li></ul> |
-  | `30011`<br>`devMigrationUnsafeTypeConversion` | Migración física: conversión de tipo no admitida para el campo | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: Nombre del campo</li><li>`wrongValue`: Map de tipos en conflicto, por ejemplo `{ "from": "text", "to": "integer" }`</li></ul> |
-  | `30013`<br>`devMigrationCannotAddNonNullField` | No se puede agregar un campo no-nullable sin un valor predeterminado a una tabla no vacía | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: Nombre del campo no válido</li><li>`wrongValue`: Parámetros de migración, por ejemplo `{ "nullable": false, "defaultValue": null }`</li></ul> |
-  | `30014`<br>`devMigrationNullableToNonNullNotAllowed` | Migración física: cambiar un campo de nullable a no-nullable | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: Nombre del campo</li><li>`wrongValue`: Parámetros de migración, idéntico a 30013</li></ul> |
-  | `30015`<br>`devMigrationUniqueTighteningNotAllowed` | Migración física: endurecimiento de la restricción del campo a UNIQUE | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: Nombre del campo</li><li>`wrongValue`: Definición del índice que causa la restricción única</li></ul> |
-  | `30016`<br>`devInvalidSchemaTtlConfig` | Fallo de validación de la configuración TTL | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: Campo de marca de tiempo TTL</li><li>`wrongValue`: Map de configuración TTL no válida, por ejemplo, `{ "enabled": true, "fieldName": "expire_at" }`</li></ul> |
-  | `30017`<br>`devInvalidSchemaDuplicateFieldName` | Nombre de campo duplicado en el esquema de la tabla | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: Nombre de campo duplicado</li><li>`wrongValue`: `null`</li></ul> |
-  | `30018`<br>`devInvalidSchemaIndexField` | El índice hace referencia a un campo que no existe | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: Nombre del índice</li><li>`wrongValue`: Nombre del campo que causa la discrepancia</li></ul> |
+  | `30010`<br>`devInvalidSchemaTtlConfig` | Fallo de validación de la configuración TTL | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: Campo de marca de tiempo TTL</li><li>`wrongValue`: Map de configuración TTL no válida, por ejemplo, `{ "enabled": true, "fieldName": "expire_at" }`</li></ul> |
+  | `30011`<br>`devSchemaTableExists` | La tabla ya existe | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
+  | `30012`<br>`devSchemaFieldExists` | Actualización de esquema: agregar un campo que ya existe | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: Nombre del campo en conflicto</li><li>`wrongValue`: `null`</li></ul> |
+  | `30013`<br>`devSchemaIndexExists` | Actualización de esquema: agregar un índice que ya existe | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: Nombre del índice</li><li>`wrongValue`: `null`</li></ul> |
+  | `31001`<br>`devMigrationNotAllowedWithData` | La migración requiere la modificación de datos y no fue explícitamente permitida | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: `null`</li><li>`wrongValue`: Map de diferencias de actualización de migración</li></ul> |
+  | `31002`<br>`devMigrationUnsafeTypeConversion` | Migración física: conversión de tipo no admitida para el campo | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: Nombre del campo</li><li>`wrongValue`: Map de tipos en conflicto, por ejemplo `{ "from": "text", "to": "integer" }`</li></ul> |
+  | `31003`<br>`devMigrationCannotAddNonNullField` | No se puede agregar un campo no-nullable sin un valor predeterminado a una tabla no vacía | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: Nombre del campo no válido</li><li>`wrongValue`: Parámetros de migración, por ejemplo `{ "nullable": false, "defaultValue": null }`</li></ul> |
+  | `31004`<br>`devMigrationNullableToNonNullNotAllowed` | Migración física: cambiar un campo de nullable a no-nullable | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: Nombre del campo</li><li>`wrongValue`: Parámetros de migración, idéntico a 31003</li></ul> |
+  | `31005`<br>`devMigrationUniqueTighteningNotAllowed` | Migración física: endurecimiento de la restricción del campo a UNIQUE | <ul><li>`tableName`: Nombre de la tabla</li><li>`field`: Nombre del campo</li><li>`wrongValue`: Definición del índice que causa la restricción única</li></ul> |
+  | `31006`<br>`devMigrationPromoteLargeOpNotAllowed` | Operaciones a gran escala bloqueadas durante promoteFieldToPrimaryKey | <ul><li>`tableName`: Nombre de tabla</li><li>`field`: `null`</li><li>`wrongValue`: Fase promote / id de tarea (si existe)</li></ul> |
 
 - **Ejemplo JSON** (Agregar un campo no-nullable sin valor predeterminado a una tabla no vacía):
   ```json
   {
     "index": 0,
-    "code": 30013,
+    "code": 31003,
     "codeKey": "DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD",
     "message": "Cannot add non-nullable field \"phone\" without a default value to non-empty table \"users\". This operation is physically impossible and would fail during data write.",
     "tableName": "users",
@@ -209,7 +212,7 @@ Dependiendo del rango de `code` / `codeKey` y la subclase específica de `Result
 
 ### 4.4 InvalidArgumentStatus (Argumentos de API & validación de paginación por cursor)
 
-- **Rango de Categoría**: `code` dentro de `[20000, 20999]` (fallos de validación de parámetros de API, estructuras de consulta o tokens de paginación).
+- **Rango de Categoría**: `code` dentro de `[20000, 20999]` **excluyendo** `20005` / `20006`, **más** `22004` (`devFieldNotFound`). Los códigos `20005` / `20006` y otros `2200x` de no encontrado usan GeneralStatus (§4.6).
 - **Definición de Campo Dedicado**:
 
   | Campo | Tipo | Detalles |
@@ -225,26 +228,26 @@ Dependiendo del rango de `code` / `codeKey` y la subclase específica de `Result
   | `20001`<br>`devInvalidArgumentFormat` | Error de formato de argumento | <ul><li>`parameterName`: Nombre del argumento no válido</li><li>`passedValue`: Valor pasado, por ejemplo, `"twenty"`</li><li>`primaryKey`: Clave primaria del registro (si existe)</li></ul> |
   | `20002`<br>`devInvalidArgumentType` | Discrepancia de tipo de argumento | <ul><li>`parameterName`: Nombre del parámetro</li><li>`passedValue`: Valor pasado, por ejemplo `{"foo": "bar"}` (cuando se espera String)</li><li>`primaryKey`: Clave primaria del registro (si existe)</li></ul> |
   | `20003`<br>`devInvalidArgumentMissing` | Falta el argumento requerido | <ul><li>`parameterName`: Nombre del parámetro faltante, por ejemplo, `"dbPath"`</li><li>`passedValue`: `null`</li><li>`primaryKey`: Clave primaria del registro (si existe)</li></ul> |
-  | `20005`<br>`devInvalidPrimaryKeyFormat` | Formato de clave primaria no válido | <ul><li>`parameterName`: `"primaryKey"` o campo de clave primaria</li><li>`passedValue`: Valor de clave primaria no válido, por ejemplo, `"invalid_id_value"`</li><li>`primaryKey`: Valor de clave primaria no válido</li></ul> |
-  | `20010`<br>`devVectorDimensionMismatch` | Discrepancia en las dimensiones del vector | <ul><li>`parameterName`: `"other"`</li><li>`passedValue`: Tamaño de la dimensión no válida</li><li>`primaryKey`: `null`</li></ul> |
-  | `20011`<br>`devIndexFieldMissing` | Falta el campo de índice requerido en el registro para el cursor | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: Campo de índice faltante</li><li>`primaryKey`: `null`</li></ul> |
-  | `20201`<br>`devInvalidCursorPagination` | La paginación por cursor y el offset son mutuamente excluyentes | <ul><li>`parameterName`: `"cursor"` / `"offset"`</li><li>`passedValue`: Parámetros de paginación en conflicto</li><li>`primaryKey`: `null`</li></ul> |
-  | `20202`<br>`devInvalidCursorTable` | El cursor no coincide con la tabla objetivo | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: Token de cursor</li><li>`primaryKey`: `null`</li></ul> |
-  | `20203`<br>`devInvalidCursorSignature` | Discrepancia en la firma del cursor (manipulado) | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: Token de cursor</li><li>`primaryKey`: `null`</li></ul> |
-  | `20204`<br>`devInvalidCursorOrderBy` | Configuración orderBy del cursor no válida o no coincidente | <ul><li>`parameterName`: `"orderBy"`</li><li>`passedValue`: Lista orderBy, por ejemplo `["-age", "id"]`</li><li>`primaryKey`: `null`</li></ul> |
-  | `20205`<br>`devInvalidCursorMode` | Discrepancia en el modo del token de cursor | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: Modo del token, por ejemplo, `"sortKey"`</li><li>`primaryKey`: `null`</li></ul> |
-  | `20206`<br>`devInvalidCursorPayload` | Carga útil del cursor no válida (no descodificable) | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: `null`</li><li>`primaryKey`: `null`</li></ul> |
-  | `20301`<br>`devInvalidQuerySelectField` | El campo de selección de consulta debe ser String o QueryAggregation | <ul><li>`parameterName`: `"select"`</li><li>`passedValue`: Definición de campo select no válida</li><li>`primaryKey`: `null`</li></ul> |
-  | `20302`<br>`devInvalidQueryForeignKeyJoin` | No hay relación de clave externa para el auto-join | <ul><li>`parameterName`: `"join"` / `"tableName"`</li><li>`passedValue`: Tabla objetivo sin relación</li><li>`primaryKey`: `null`</li></ul> |
-  | `20303`<br>`devInvalidQueryFieldAlias` | Formato de alias de campo de consulta no válido | <ul><li>`parameterName`: `"alias"`</li><li>`passedValue`: Cadena de alias no válida</li><li>`primaryKey`: `null`</li></ul> |
-  | `20304`<br>`devInvalidExpression` | Configuración de expresión no válida o excepción de ejecución | <ul><li>`parameterName`: Aspecto del error (por ejemplo, `"arguments"`, `"functionName"`, `"node"`)</li><li>`passedValue`: Valor o recuento no válido</li><li>`primaryKey`: `null`</li></ul> |
-  | `22005`<br>`devFieldNotFound` | Campo no encontrado | <ul><li>`parameterName`: Nombre de campo desconocido, por ejemplo, `"extra"`</li><li>`passedValue`: Valor de entrada pasado para el campo</li><li>`primaryKey`: Clave primaria del registro (si existe)</li></ul> |
+  | `20004`<br>`devInvalidPrimaryKeyFormat` | Formato de clave primaria no válido | <ul><li>`parameterName`: `"primaryKey"` o campo de clave primaria</li><li>`passedValue`: Valor de clave primaria no válido, por ejemplo, `"invalid_id_value"`</li><li>`primaryKey`: Valor de clave primaria no válido</li></ul> |
+  | `20007`<br>`devVectorDimensionMismatch` | Discrepancia en las dimensiones del vector | <ul><li>`parameterName`: `"other"`</li><li>`passedValue`: Tamaño de la dimensión no válida</li><li>`primaryKey`: `null`</li></ul> |
+  | `20008`<br>`devIndexFieldMissing` | Falta el campo de índice requerido en el registro para el cursor | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: Campo de índice faltante</li><li>`primaryKey`: `null`</li></ul> |
+  | `20101`<br>`devInvalidCursorPagination` | La paginación por cursor y el offset son mutuamente excluyentes | <ul><li>`parameterName`: `"cursor"` / `"offset"`</li><li>`passedValue`: Parámetros de paginación en conflicto</li><li>`primaryKey`: `null`</li></ul> |
+  | `20102`<br>`devInvalidCursorTable` | El cursor no coincide con la tabla objetivo | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: Token de cursor</li><li>`primaryKey`: `null`</li></ul> |
+  | `20103`<br>`devInvalidCursorSignature` | Discrepancia en la firma del cursor (manipulado) | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: Token de cursor</li><li>`primaryKey`: `null`</li></ul> |
+  | `20104`<br>`devInvalidCursorOrderBy` | Configuración orderBy del cursor no válida o no coincidente | <ul><li>`parameterName`: `"orderBy"`</li><li>`passedValue`: Lista orderBy, por ejemplo `["-age", "id"]`</li><li>`primaryKey`: `null`</li></ul> |
+  | `20105`<br>`devInvalidCursorMode` | Discrepancia en el modo del token de cursor | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: Modo del token, por ejemplo, `"sortKey"`</li><li>`primaryKey`: `null`</li></ul> |
+  | `20106`<br>`devInvalidCursorPayload` | Carga útil del cursor no válida (no descodificable) | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: `null`</li><li>`primaryKey`: `null`</li></ul> |
+  | `20201`<br>`devInvalidQuerySelectField` | El campo de selección de consulta debe ser String o QueryAggregation | <ul><li>`parameterName`: `"select"`</li><li>`passedValue`: Definición de campo select no válida</li><li>`primaryKey`: `null`</li></ul> |
+  | `20202`<br>`devInvalidQueryForeignKeyJoin` | No hay relación de clave externa para el auto-join | <ul><li>`parameterName`: `"join"` / `"tableName"`</li><li>`passedValue`: Tabla objetivo sin relación</li><li>`primaryKey`: `null`</li></ul> |
+  | `20203`<br>`devInvalidQueryFieldAlias` | Formato de alias de campo de consulta no válido | <ul><li>`parameterName`: `"alias"`</li><li>`passedValue`: Cadena de alias no válida</li><li>`primaryKey`: `null`</li></ul> |
+  | `20204`<br>`devInvalidExpression` | Configuración de expresión no válida o excepción de ejecución | <ul><li>`parameterName`: Aspecto del error (por ejemplo, `"arguments"`, `"functionName"`, `"node"`)</li><li>`passedValue`: Valor o recuento no válido</li><li>`primaryKey`: `null`</li></ul> |
+  | `22004`<br>`devFieldNotFound` | Campo no encontrado | <ul><li>`parameterName`: Nombre de campo desconocido, por ejemplo, `"extra"`</li><li>`passedValue`: Valor de entrada pasado para el campo</li><li>`primaryKey`: Clave primaria del registro (si existe)</li></ul> |
 
 - **Ejemplo JSON** (Los campos orderBy del cursor no coinciden con la consulta actual orderBy):
   ```json
   {
     "index": 0,
-    "code": 20204,
+    "code": 20104,
     "codeKey": "DEV_INVALID_CURSOR_ORDERBY",
     "message": "Cursor orderBy fields do not match current query orderBy.",
     "parameterName": "orderBy",
@@ -257,7 +260,7 @@ Dependiendo del rango de `code` / `codeKey` y la subclase específica de `Result
 
 ### 4.5 TransactionOperationStatus (Conflicto y aborto de transacción)
 
-- **Rango de Categoría**: `code` dentro de `[50000, 50999]` (rollback de transacción, aborto explícito o conflictos de serializabilidad).
+- **Rango de Categoría**: solo `50001` (`sysTransactionAborted`) y `50002` (`sysTransactionConflict`). Otros códigos `500xx` (p. ej. `50003` / `50004`) usan GeneralStatus (§4.6).
 - **Definición de Campo Dedicado**:
 
   | Campo | Tipo | Detalles |
@@ -286,7 +289,7 @@ Dependiendo del rango de `code` / `codeKey` y la subclase específica de `Result
 
 ### 4.6 GeneralStatus (Excepciones genéricas y a nivel de sistema)
 
-- **Rango de Categoría**: Fallback para cualquier otro código de estado (E/S de bajo nivel, errores de hardware, tiempos de espera del sistema, etc.).
+- **Rango de Categoría**: Fallback para códigos no cubiertos por §§4.1–4.5 — incluidos `20005` / `20006`, `22001`–`22003`, `230xx` / `240xx`, resto de `50xxx`–`53xxx` y `99001`.
 - **Definición de Campo Dedicado**:
 
   | Campo | Tipo | Detalles |
@@ -299,11 +302,11 @@ Dependiendo del rango de `code` / `codeKey` y la subclase específica de `Result
 
   | Código & ResultType | Escenario / Nivel | Directrices de Campos |
   | :--- | :--- | :--- |
-  | `20007`<br>`devIndexOutOfBounds` | El índice o rango está fuera de los límites (Error de desarrollador) | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `20008`<br>`devUnsupportedOperation` | La operación no es compatible en el contexto actual (Error de desarrollador) | <ul><li>`primaryKey`: `null`</li><li>`target`: Tabla/recurso objetivo (si existe)</li><li>`operation`: Nombre del método (si existe)</li></ul> |
+  | `20005`<br>`devIndexOutOfBounds` | El índice o rango está fuera de los límites (Error de desarrollador) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `20006`<br>`devUnsupportedOperation` | La operación no es compatible en el contexto actual (Error de desarrollador) | <ul><li>`primaryKey`: `null`</li><li>`target`: Tabla/recurso objetivo (si existe)</li><li>`operation`: Nombre del método (si existe)</li></ul> |
   | `22001`<br>`devTableNotFound` | Tabla no encontrada (Error de desarrollador) | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `22003`<br>`devIndexNotFound` | Índice no encontrado (Error de desarrollador) | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `22004`<br>`devSpaceNotFound` | Espacio no encontrado (Error de desarrollador) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `22002`<br>`devIndexNotFound` | Índice no encontrado (Error de desarrollador) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `22003`<br>`devSpaceNotFound` | Espacio no encontrado (Error de desarrollador) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `23001`<br>`devLargeScaleOperationRequired` | Large-scale data operation requires `allowLargeScaleOperation()` (Developer Error) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `23002`<br>`devLargeScaleOperationNotAllowedInTransaction` | Large-scale data operation is not allowed inside a transaction (Developer Error) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `24001`<br>`devEngineIncompatible` | **Crítico**: Versión del motor incompatible | <ul><li>`primaryKey`: `null`</li></ul> |
@@ -472,50 +475,52 @@ Consulte la siguiente tabla para conocer el enrutamiento y análisis de estado e
 | **11010** | `BIZ_CONSTRAINT_MIN_LENGTH` | `ResultType.bizValueLessThanMinLength` | Error de Negocio | La longitud del valor es menor que la restricción mínima |
 | **11011** | `BIZ_CONSTRAINT_MIN_VALUE` | `ResultType.bizValueLessThanMinValue` | Error de Negocio | El valor numérico es menor que la restricción mínima |
 | **11012** | `BIZ_CONSTRAINT_MAX_VALUE` | `ResultType.bizValueExceedsMaxValue` | Error de Negocio | El valor numérico supera la restricción máxima |
-| **12002** | `BIZ_NOT_FOUND_RECORD` | `ResultType.bizRecordNotFound` | Error de Negocio | El recurso no existe / Registro no encontrado |
+| **12001** | `BIZ_NOT_FOUND_RECORD` | `ResultType.bizRecordNotFound` | Error de Negocio | El recurso no existe / Registro no encontrado |
 | **20001** | `DEV_INVALID_ARGUMENT_FORMAT` | `ResultType.devInvalidArgumentFormat` | Error de Desarrollador | Error de formato de argumento |
 | **20002** | `DEV_INVALID_ARGUMENT_TYPE` | `ResultType.devInvalidArgumentType` | Error de Desarrollador | Discrepancia de tipo de argumento |
 | **20003** | `DEV_INVALID_ARGUMENT_MISSING` | `ResultType.devInvalidArgumentMissing` | Error de Desarrollador | Falta el argumento requerido |
-| **20005** | `DEV_INVALID_PRIMARY_KEY_FORMAT` | `ResultType.devInvalidPrimaryKeyFormat` | Error de Desarrollador | Formato de clave primaria no válido |
-| **20007** | `DEV_INDEX_OUT_OF_BOUNDS` | `ResultType.devIndexOutOfBounds` | Error de Desarrollador | El índice o rango está fuera de los límites |
-| **20008** | `DEV_UNSUPPORTED_OPERATION` | `ResultType.devUnsupportedOperation` | Error de Desarrollador | La operación no es compatible en el contexto actual |
-| **20010** | `DEV_VECTOR_DIMENSION_MISMATCH` | `ResultType.devVectorDimensionMismatch` | Error de Desarrollador | Discrepancia en las dimensiones del vector |
-| **20011** | `DEV_INDEX_FIELD_MISSING` | `ResultType.devIndexFieldMissing` | Error de Desarrollador | Falta el campo de índice requerido en el registro para el cursor |
-| **20201** | `DEV_INVALID_CURSOR_PAGINATION` | `ResultType.devInvalidCursorPagination` | Error de Desarrollador | La paginación por cursor y el offset son mutuamente excluyentes |
-| **20202** | `DEV_INVALID_CURSOR_TABLE` | `ResultType.devInvalidCursorTable` | Error de Desarrollador | El cursor no coincide con la tabla objetivo |
-| **20203** | `DEV_INVALID_CURSOR_SIGNATURE` | `ResultType.devInvalidCursorSignature` | Error de Desarrollador | Discrepancia en la firma del cursor (manipulado) |
-| **20204** | `DEV_INVALID_CURSOR_ORDERBY` | `ResultType.devInvalidCursorOrderBy` | Error de Desarrollador | Configuración orderBy del cursor no válida o no coincidente |
-| **20205** | `DEV_INVALID_CURSOR_MODE` | `ResultType.devInvalidCursorMode` | Error de Desarrollador | Discrepancia en el modo del token de cursor |
-| **20206** | `DEV_INVALID_CURSOR_PAYLOAD` | `ResultType.devInvalidCursorPayload` | Error de Desarrollador | Carga útil del cursor no válida (no descodificable) |
-| **20301** | `DEV_INVALID_QUERY_SELECT_FIELD` | `ResultType.devInvalidQuerySelectField` | Error de Desarrollador | El campo de selección de consulta debe ser String o QueryAggregation |
-| **20302** | `DEV_INVALID_QUERY_FOREIGN_KEY_JOIN` | `ResultType.devInvalidQueryForeignKeyJoin` | Error de Desarrollador | No hay relación de clave externa para el auto-join |
-| **20303** | `DEV_INVALID_QUERY_FIELD_ALIAS` | `ResultType.devInvalidQueryFieldAlias` | Error de Desarrollador | Formato de alias de campo de consulta no válido |
-| **20304** | `DEV_INVALID_EXPRESSION` | `ResultType.devInvalidExpression` | Error de Desarrollador | Configuración de expresión no válida o excepción de ejecución |
+| **20004** | `DEV_INVALID_PRIMARY_KEY_FORMAT` | `ResultType.devInvalidPrimaryKeyFormat` | Error de Desarrollador | Formato de clave primaria no válido |
+| **20005** | `DEV_INDEX_OUT_OF_BOUNDS` | `ResultType.devIndexOutOfBounds` | Error de Desarrollador | El índice o rango está fuera de los límites |
+| **20006** | `DEV_UNSUPPORTED_OPERATION` | `ResultType.devUnsupportedOperation` | Error de Desarrollador | La operación no es compatible en el contexto actual |
+| **20007** | `DEV_VECTOR_DIMENSION_MISMATCH` | `ResultType.devVectorDimensionMismatch` | Error de Desarrollador | Discrepancia en las dimensiones del vector |
+| **20008** | `DEV_INDEX_FIELD_MISSING` | `ResultType.devIndexFieldMissing` | Error de Desarrollador | Falta el campo de índice requerido en el registro para el cursor |
+| **20101** | `DEV_INVALID_CURSOR_PAGINATION` | `ResultType.devInvalidCursorPagination` | Error de Desarrollador | La paginación por cursor y el offset son mutuamente excluyentes |
+| **20102** | `DEV_INVALID_CURSOR_TABLE` | `ResultType.devInvalidCursorTable` | Error de Desarrollador | El cursor no coincide con la tabla objetivo |
+| **20103** | `DEV_INVALID_CURSOR_SIGNATURE` | `ResultType.devInvalidCursorSignature` | Error de Desarrollador | Discrepancia en la firma del cursor (manipulado) |
+| **20104** | `DEV_INVALID_CURSOR_ORDERBY` | `ResultType.devInvalidCursorOrderBy` | Error de Desarrollador | Configuración orderBy del cursor no válida o no coincidente |
+| **20105** | `DEV_INVALID_CURSOR_MODE` | `ResultType.devInvalidCursorMode` | Error de Desarrollador | Discrepancia en el modo del token de cursor |
+| **20106** | `DEV_INVALID_CURSOR_PAYLOAD` | `ResultType.devInvalidCursorPayload` | Error de Desarrollador | Carga útil del cursor no válida (no descodificable) |
+| **20201** | `DEV_INVALID_QUERY_SELECT_FIELD` | `ResultType.devInvalidQuerySelectField` | Error de Desarrollador | El campo de selección de consulta debe ser String o QueryAggregation |
+| **20202** | `DEV_INVALID_QUERY_FOREIGN_KEY_JOIN` | `ResultType.devInvalidQueryForeignKeyJoin` | Error de Desarrollador | No hay relación de clave externa para el auto-join |
+| **20203** | `DEV_INVALID_QUERY_FIELD_ALIAS` | `ResultType.devInvalidQueryFieldAlias` | Error de Desarrollador | Formato de alias de campo de consulta no válido |
+| **20204** | `DEV_INVALID_EXPRESSION` | `ResultType.devInvalidExpression` | Error de Desarrollador | Configuración de expresión no válida o excepción de ejecución |
 | **22001** | `DEV_NOT_FOUND_TABLE` | `ResultType.devTableNotFound` | Error de Desarrollador | Tabla no encontrada |
-| **22003** | `DEV_NOT_FOUND_INDEX` | `ResultType.devIndexNotFound` | Error de Desarrollador | Índice no encontrado |
-| **22004** | `DEV_NOT_FOUND_SPACE` | `ResultType.devSpaceNotFound` | Error de Desarrollador | Espacio no encontrado |
-| **22005** | `DEV_NOT_FOUND_FIELD` | `ResultType.devFieldNotFound` | Error de Desarrollador | Campo no encontrado |
+| **22002** | `DEV_NOT_FOUND_INDEX` | `ResultType.devIndexNotFound` | Error de Desarrollador | Índice no encontrado |
+| **22003** | `DEV_NOT_FOUND_SPACE` | `ResultType.devSpaceNotFound` | Error de Desarrollador | Espacio no encontrado |
+| **22004** | `DEV_NOT_FOUND_FIELD` | `ResultType.devFieldNotFound` | Error de Desarrollador | Campo no encontrado |
 | **23001** | `DEV_LARGE_SCALE_OPERATION_REQUIRED` | `ResultType.devLargeScaleOperationRequired` | Error de Desarrollador | Large-scale data operation requires `allowLargeScaleOperation()` to prevent OOM |
 | **23002** | `DEV_LARGE_SCALE_OPERATION_NOT_ALLOWED_IN_TRANSACTION` | `ResultType.devLargeScaleOperationNotAllowedInTransaction` | Developer Error | Large-scale data operation is not allowed inside a transaction |
 | **24001** | `DEV_ENGINE_INCOMPATIBLE` | `ResultType.devEngineIncompatible` | Error de Desarrollador | **Crítico**: Versión del motor incompatible |
 | **30000** | `DEV_INVALID_SCHEMA` | `ResultType.devInvalidSchema` | Error de Desarrollador | Definición de esquema de tabla no válida |
 | **30001** | `DEV_INVALID_SCHEMA_TABLE_NAME` | `ResultType.devInvalidSchemaTableName` | Error de Desarrollador | Fallo de validación del nombre de la tabla |
 | **30002** | `DEV_INVALID_SCHEMA_FIELD_NAME` | `ResultType.devInvalidSchemaFieldName` | Error de Desarrollador | Fallo de validación del nombre del campo |
-| **30003** | `DEV_INVALID_SCHEMA_PRIMARY_KEY` | `ResultType.devInvalidSchemaPrimaryKey` | Error de Desarrollador | Fallo de validación de la clave primaria |
-| **30004** | `DEV_INVALID_SCHEMA_INDEX_LIMIT` | `ResultType.devInvalidSchemaIndexLimit` | Error de Desarrollador | Fallo de validación del número de índices |
-| **30005** | `DEV_SCHEMA_TABLE_EXISTS` | `ResultType.devSchemaTableExists` | Error de Desarrollador | La tabla ya existe |
-| **30006** | `DEV_SCHEMA_FIELD_EXISTS` | `ResultType.devSchemaFieldExists` | Error de Desarrollador | El campo ya existe |
-| **30007** | `DEV_SCHEMA_INDEX_EXISTS` | `ResultType.devSchemaIndexExists` | Error de Desarrollador | El índice ya existe |
+| **30003** | `DEV_INVALID_SCHEMA_DUPLICATE_FIELD_NAME` | `ResultType.devInvalidSchemaDuplicateFieldName` | Error de Desarrollador | Nombre de campo duplicado en el esquema de la tabla |
+| **30004** | `DEV_INVALID_SCHEMA_PRIMARY_KEY` | `ResultType.devInvalidSchemaPrimaryKey` | Error de Desarrollador | Fallo de validación de la clave primaria |
+| **30005** | `DEV_INVALID_SCHEMA_INDEX_LIMIT` | `ResultType.devInvalidSchemaIndexLimit` | Error de Desarrollador | Fallo de validación del número de índices |
+| **30006** | `DEV_INVALID_SCHEMA_INDEX_FIELD` | `ResultType.devInvalidSchemaIndexField` | Error de Desarrollador | El índice hace referencia a un campo que no existe |
+| **30007** | `DEV_INVALID_SCHEMA_INDEX_TYPE` | `ResultType.devInvalidSchemaIndexType` | Error de desarrollador | Tipo de índice incompatible con el tipo de datos o la configuración del campo |
 | **30008** | `DEV_INVALID_SCHEMA_FOREIGN_KEY` | `ResultType.devInvalidSchemaForeignKey` | Error de Desarrollador | Definición de clave externa no válida |
 | **30009** | `DEV_INVALID_SCHEMA_SPACE_MISMATCH` | `ResultType.devInvalidSchemaSpaceMismatch` | Error de Desarrollador | Discrepancia de límite global/específico del espacio |
-| **30010** | `DEV_MIGRATION_NOT_ALLOWED_WITH_DATA` | `ResultType.devMigrationNotAllowedWithData` | Error de Desarrollador | La migración requiere la modificación de datos y no fue explícitamente permitida |
-| **30011** | `DEV_MIGRATION_UNSAFE_TYPE_CONVERSION` | `ResultType.devMigrationUnsafeTypeConversion` | Error de Desarrollador | Tipo de cambio no admitido para el campo |
-| **30013** | `DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD` | `ResultType.devMigrationCannotAddNonNullField` | Error de Desarrollador | No se permite agregar un campo no-nullable sin un valor predeterminado |
-| **30014** | `DEV_MIGRATION_NULLABLE_TO_NON_NULL_NOT_ALLOWED` | `ResultType.devMigrationNullableToNonNullNotAllowed` | Error de Desarrollador | No se permite cambiar un campo de nullable a no-nullable |
-| **30015** | `DEV_MIGRATION_UNIQUE_TIGHTENING_NOT_ALLOWED` | `ResultType.devMigrationUniqueTighteningNotAllowed` | Error de Desarrollador | No se permite el endurecimiento a UNIQUE |
-| **30016** | `DEV_INVALID_SCHEMA_TTL_CONFIG` | `ResultType.devInvalidSchemaTtlConfig` | Error de Desarrollador | Fallo de validación de la configuración TTL |
-| **30017** | `DEV_INVALID_SCHEMA_DUPLICATE_FIELD_NAME` | `ResultType.devInvalidSchemaDuplicateFieldName` | Error de Desarrollador | Nombre de campo duplicado en el esquema de la tabla |
-| **30018** | `DEV_INVALID_SCHEMA_INDEX_FIELD` | `ResultType.devInvalidSchemaIndexField` | Error de Desarrollador | El índice hace referencia a un campo que no existe |
+| **30010** | `DEV_INVALID_SCHEMA_TTL_CONFIG` | `ResultType.devInvalidSchemaTtlConfig` | Error de Desarrollador | Fallo de validación de la configuración TTL |
+| **30011** | `DEV_SCHEMA_TABLE_EXISTS` | `ResultType.devSchemaTableExists` | Error de Desarrollador | La tabla ya existe |
+| **30012** | `DEV_SCHEMA_FIELD_EXISTS` | `ResultType.devSchemaFieldExists` | Error de Desarrollador | El campo ya existe |
+| **30013** | `DEV_SCHEMA_INDEX_EXISTS` | `ResultType.devSchemaIndexExists` | Error de Desarrollador | El índice ya existe |
+| **31001** | `DEV_MIGRATION_NOT_ALLOWED_WITH_DATA` | `ResultType.devMigrationNotAllowedWithData` | Error de Desarrollador | La migración requiere la modificación de datos y no fue explícitamente permitida |
+| **31002** | `DEV_MIGRATION_UNSAFE_TYPE_CONVERSION` | `ResultType.devMigrationUnsafeTypeConversion` | Error de Desarrollador | Tipo de cambio no admitido para el campo |
+| **31003** | `DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD` | `ResultType.devMigrationCannotAddNonNullField` | Error de Desarrollador | No se permite agregar un campo no-nullable sin un valor predeterminado |
+| **31004** | `DEV_MIGRATION_NULLABLE_TO_NON_NULL_NOT_ALLOWED` | `ResultType.devMigrationNullableToNonNullNotAllowed` | Error de Desarrollador | No se permite cambiar un campo de nullable a no-nullable |
+| **31005** | `DEV_MIGRATION_UNIQUE_TIGHTENING_NOT_ALLOWED` | `ResultType.devMigrationUniqueTighteningNotAllowed` | Error de Desarrollador | No se permite el endurecimiento a UNIQUE |
+| **31006** | `DEV_MIGRATION_PROMOTE_LARGE_OP_NOT_ALLOWED` | `ResultType.devMigrationPromoteLargeOpNotAllowed` | Error de desarrollador | Operaciones a gran escala bloqueadas durante promoteFieldToPrimaryKey |
 | **50001** | `SYS_TRANSACTION_ABORTED` | `ResultType.sysTransactionAborted` | Error de Sistema | Transacción abortada |
 | **50002** | `SYS_TRANSACTION_CONFLICT` | `ResultType.sysTransactionConflict` | Error de Sistema | Conflicto de transacción |
 | **50003** | `SYS_TRANSACTION_LIMIT_EXCEEDED` | `ResultType.sysTransactionLimitExceeded` | Error de Sistema | La transacción supera el límite seguro de memoria bajo presión de memoria |

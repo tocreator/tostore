@@ -1,15 +1,28 @@
 /// Database operation result status type
 /// 0 represents complete success
 /// Class Code represents the first 2 digits of the 5-digit code
+///
+/// Contiguous leaf ranges (best-practice layout; not compatibility-bound):
+/// - BIZ 10xxx validation, 11xxx constraints, 12xxx not-found
+/// - DEV 200xx args, 201xx cursor, 202xx query, 220xx resource not-found,
+///       230xx large-scale, 240xx engine compat, 300xx schema, 310xx migration
+/// - SYS 50xxx txn, 51xxx timeout, 52xxx resource, 53xxx IO
+/// - ENG 99xxx
 enum ResultType {
   /// Operation successful
   success(0, 'SUCCESS', 'Operation successful'),
 
-  // "BIZ_" - Business Error (10-19)
+  // ===========================================================================
+  // BIZ_ — Business Error (10-19)
+  // ===========================================================================
+
+  // 100xx — Validation
   bizValidationFailed(10000, 'BIZ_VALIDATION_FAILED', 'Data validation failed'),
   bizNotNullViolation(
       10001, 'BIZ_NOT_NULL_VIOLATION', 'Not null constraint violation'),
   bizTypeCastFailed(10002, 'BIZ_VALIDATION_TYPE_CAST', 'Type cast failed'),
+
+  // 110xx — Integrity constraints
   bizPrimaryKeyViolation(
       11001, 'BIZ_CONSTRAINT_PRIMARY_KEY', 'Primary key conflict'),
   bizUniqueViolation(
@@ -38,9 +51,15 @@ enum ResultType {
       11011, 'BIZ_CONSTRAINT_MIN_VALUE', 'Value is less than min value'),
   bizValueExceedsMaxValue(
       11012, 'BIZ_CONSTRAINT_MAX_VALUE', 'Value exceeds max value'),
-  bizRecordNotFound(12002, 'BIZ_NOT_FOUND_RECORD', 'Resource does not exist'),
 
-  // "DEV_" - Developer Error (20-49)
+  // 120xx — Business not-found
+  bizRecordNotFound(12001, 'BIZ_NOT_FOUND_RECORD', 'Resource does not exist'),
+
+  // ===========================================================================
+  // DEV_ — Developer Error (20-49)
+  // ===========================================================================
+
+  // 200xx — Invalid arguments / API misuse
   devInvalidArgumentFormat(
       20001, 'DEV_INVALID_ARGUMENT_FORMAT', 'Argument format error'),
   devInvalidArgumentType(
@@ -48,101 +67,121 @@ enum ResultType {
   devInvalidArgumentMissing(
       20003, 'DEV_INVALID_ARGUMENT_MISSING', 'Required argument is missing'),
   devInvalidPrimaryKeyFormat(
-      20005, 'DEV_INVALID_PRIMARY_KEY_FORMAT', 'Invalid primary key format'),
+      20004, 'DEV_INVALID_PRIMARY_KEY_FORMAT', 'Invalid primary key format'),
   devIndexOutOfBounds(
-      20007, 'DEV_INDEX_OUT_OF_BOUNDS', 'Index or range is out of bounds'),
-  devUnsupportedOperation(20008, 'DEV_UNSUPPORTED_OPERATION',
+      20005, 'DEV_INDEX_OUT_OF_BOUNDS', 'Index or range is out of bounds'),
+  devUnsupportedOperation(20006, 'DEV_UNSUPPORTED_OPERATION',
       'Operation is not supported in the current context'),
   devVectorDimensionMismatch(
-      20010, 'DEV_VECTOR_DIMENSION_MISMATCH', 'Vector dimensions mismatch'),
-  devIndexFieldMissing(20011, 'DEV_INDEX_FIELD_MISSING',
+      20007, 'DEV_VECTOR_DIMENSION_MISMATCH', 'Vector dimensions mismatch'),
+  devIndexFieldMissing(20008, 'DEV_INDEX_FIELD_MISSING',
       'Required index field is missing in record'),
-  devInvalidCursorPagination(20201, 'DEV_INVALID_CURSOR_PAGINATION',
+
+  // 201xx — Cursor pagination
+  devInvalidCursorPagination(20101, 'DEV_INVALID_CURSOR_PAGINATION',
       'Cursor pagination and offset are mutually exclusive'),
   devInvalidCursorTable(
-      20202, 'DEV_INVALID_CURSOR_TABLE', 'Cursor does not match target table'),
+      20102, 'DEV_INVALID_CURSOR_TABLE', 'Cursor does not match target table'),
   devInvalidCursorSignature(
-      20203, 'DEV_INVALID_CURSOR_SIGNATURE', 'Mismatched cursor signature'),
-  devInvalidCursorOrderBy(20204, 'DEV_INVALID_CURSOR_ORDERBY',
+      20103, 'DEV_INVALID_CURSOR_SIGNATURE', 'Mismatched cursor signature'),
+  devInvalidCursorOrderBy(20104, 'DEV_INVALID_CURSOR_ORDERBY',
       'Cursor orderBy configuration invalid or mismatched'),
   devInvalidCursorMode(
-      20205, 'DEV_INVALID_CURSOR_MODE', 'Cursor token mode mismatch'),
+      20105, 'DEV_INVALID_CURSOR_MODE', 'Cursor token mode mismatch'),
   devInvalidCursorPayload(
-      20206, 'DEV_INVALID_CURSOR_PAYLOAD', 'Invalid cursor payload'),
-  devInvalidQuerySelectField(20301, 'DEV_INVALID_QUERY_SELECT_FIELD',
+      20106, 'DEV_INVALID_CURSOR_PAYLOAD', 'Invalid cursor payload'),
+
+  // 202xx — Query construction
+  devInvalidQuerySelectField(20201, 'DEV_INVALID_QUERY_SELECT_FIELD',
       'Query select field must be String or QueryAggregation'),
-  devInvalidQueryForeignKeyJoin(20302, 'DEV_INVALID_QUERY_FOREIGN_KEY_JOIN',
+  devInvalidQueryForeignKeyJoin(20202, 'DEV_INVALID_QUERY_FOREIGN_KEY_JOIN',
       'No foreign key relationship for auto join'),
-  devInvalidQueryFieldAlias(20303, 'DEV_INVALID_QUERY_FIELD_ALIAS',
+  devInvalidQueryFieldAlias(20203, 'DEV_INVALID_QUERY_FIELD_ALIAS',
       'Query field alias format invalid'),
-  devInvalidExpression(20304, 'DEV_INVALID_EXPRESSION',
+  devInvalidExpression(20204, 'DEV_INVALID_EXPRESSION',
       'Invalid expression configuration or execution'),
+
+  // 220xx — Resource not found (developer)
   devTableNotFound(22001, 'DEV_NOT_FOUND_TABLE', 'Table not found'),
-  devIndexNotFound(22003, 'DEV_NOT_FOUND_INDEX', 'Index not found'),
-  devSpaceNotFound(22004, 'DEV_NOT_FOUND_SPACE', 'Space not found'),
-  devFieldNotFound(22005, 'DEV_NOT_FOUND_FIELD', 'Field not found'),
+  devIndexNotFound(22002, 'DEV_NOT_FOUND_INDEX', 'Index not found'),
+  devSpaceNotFound(22003, 'DEV_NOT_FOUND_SPACE', 'Space not found'),
+  devFieldNotFound(22004, 'DEV_NOT_FOUND_FIELD', 'Field not found'),
+
+  // 230xx — Large-scale operation guards
   devLargeScaleOperationRequired(23001, 'DEV_LARGE_SCALE_OPERATION_REQUIRED',
       'Large-scale data operation requires allowLargeScaleOperation() to prevent OOM'),
   devLargeScaleOperationNotAllowedInTransaction(
       23002,
       'DEV_LARGE_SCALE_OPERATION_NOT_ALLOWED_IN_TRANSACTION',
       'Large-scale data operations are not allowed inside a transaction'),
+
+  // 240xx — Engine compatibility
   devEngineIncompatible(
       24001, 'DEV_ENGINE_INCOMPATIBLE', 'Engine version incompatible',
       isCritical: true),
+
+  // 300xx — Schema definition validation (static)
   devInvalidSchema(
       30000, 'DEV_INVALID_SCHEMA', 'Invalid table schema definition'),
   devInvalidSchemaTableName(
       30001, 'DEV_INVALID_SCHEMA_TABLE_NAME', 'Table name validation failed'),
   devInvalidSchemaFieldName(
       30002, 'DEV_INVALID_SCHEMA_FIELD_NAME', 'Field name validation failed'),
+  devInvalidSchemaDuplicateFieldName(
+      30003,
+      'DEV_INVALID_SCHEMA_DUPLICATE_FIELD_NAME',
+      'Duplicate field name in table schema'),
   devInvalidSchemaPrimaryKey(
-      30003, 'DEV_INVALID_SCHEMA_PRIMARY_KEY', 'Primary key validation failed'),
+      30004, 'DEV_INVALID_SCHEMA_PRIMARY_KEY', 'Primary key validation failed'),
   devInvalidSchemaIndexLimit(
-      30004, 'DEV_INVALID_SCHEMA_INDEX_LIMIT', 'Index count validation failed'),
-  devSchemaTableExists(
-      30005, 'DEV_SCHEMA_TABLE_EXISTS', 'Table already exists'),
-  devSchemaFieldExists(
-      30006, 'DEV_SCHEMA_FIELD_EXISTS', 'Field already exists'),
-  devSchemaIndexExists(
-      30007, 'DEV_SCHEMA_INDEX_EXISTS', 'Index already exists'),
+      30005, 'DEV_INVALID_SCHEMA_INDEX_LIMIT', 'Index count validation failed'),
+  devInvalidSchemaIndexField(30006, 'DEV_INVALID_SCHEMA_INDEX_FIELD',
+      'Index references non-existent field'),
+  devInvalidSchemaIndexType(30007, 'DEV_INVALID_SCHEMA_INDEX_TYPE',
+      'Index type is incompatible with field data type or configuration'),
   devInvalidSchemaForeignKey(30008, 'DEV_INVALID_SCHEMA_FOREIGN_KEY',
       'Foreign key definition invalid'),
   devInvalidSchemaSpaceMismatch(30009, 'DEV_INVALID_SCHEMA_SPACE_MISMATCH',
       'Global/Space-specific boundary mismatch'),
-  devMigrationNotAllowedWithData(30010, 'DEV_MIGRATION_NOT_ALLOWED_WITH_DATA',
+  devInvalidSchemaTtlConfig(30010, 'DEV_INVALID_SCHEMA_TTL_CONFIG',
+      'TTL configuration validation failed'),
+  devSchemaTableExists(
+      30011, 'DEV_SCHEMA_TABLE_EXISTS', 'Table already exists'),
+  devSchemaFieldExists(
+      30012, 'DEV_SCHEMA_FIELD_EXISTS', 'Field already exists'),
+  devSchemaIndexExists(
+      30013, 'DEV_SCHEMA_INDEX_EXISTS', 'Index already exists'),
+
+  // 310xx — Schema migration guards (runtime / physical)
+  devMigrationNotAllowedWithData(31001, 'DEV_MIGRATION_NOT_ALLOWED_WITH_DATA',
       'Migration requires data modification and was not explicitly allowed'),
   devMigrationUnsafeTypeConversion(
-      30011,
+      31002,
       'DEV_MIGRATION_UNSAFE_TYPE_CONVERSION',
       'Unsupported data type change for field'),
   devMigrationCannotAddNonNullField(
-      30013,
+      31003,
       'DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD',
       'Cannot add non-nullable field without a default value'),
   devMigrationNullableToNonNullNotAllowed(
-      30014,
+      31004,
       'DEV_MIGRATION_NULLABLE_TO_NON_NULL_NOT_ALLOWED',
       'Changing field from nullable to non-nullable is not allowed'),
   devMigrationUniqueTighteningNotAllowed(
-      30015,
+      31005,
       'DEV_MIGRATION_UNIQUE_TIGHTENING_NOT_ALLOWED',
       'Changing field from non-unique to unique is not allowed'),
-  devInvalidSchemaTtlConfig(30016, 'DEV_INVALID_SCHEMA_TTL_CONFIG',
-      'TTL configuration validation failed'),
-  devInvalidSchemaDuplicateFieldName(
-      30017,
-      'DEV_INVALID_SCHEMA_DUPLICATE_FIELD_NAME',
-      'Duplicate field name in table schema'),
-  devInvalidSchemaIndexField(30018, 'DEV_INVALID_SCHEMA_INDEX_FIELD',
-      'Index references non-existent field'),
   devMigrationPromoteLargeOpNotAllowed(
-      30019,
+      31006,
       'DEV_MIGRATION_PROMOTE_LARGE_OP_NOT_ALLOWED',
       'Table is running promoteFieldToPrimaryKey; large-scale data operations '
           'are not supported -- narrow the scope or wait until promote completes'),
 
-  // "SYS_" - System Error (50-79)
+  // ===========================================================================
+  // SYS_ — System Error (50-79)
+  // ===========================================================================
+
+  // 500xx — Transaction
   sysTransactionAborted(
       50001, 'SYS_TRANSACTION_ABORTED', 'Transaction aborted'),
   sysTransactionConflict(
@@ -154,16 +193,22 @@ enum ResultType {
       'SYS_MIGRATION_BATCH_EXECUTION_FAILED',
       'Batch migration execution failed',
       isCritical: true),
+
+  // 510xx — Timeout / closed
   sysTimeoutLockAcquisition(
       51001, 'SYS_TIMEOUT_LOCK_ACQUISITION', 'Lock acquisition timeout'),
   sysTimeout(51002, 'SYS_TIMEOUT', 'Operation timeout'),
   sysDbClosed(51003, 'SYS_DB_CLOSED', 'Database is closed'),
+
+  // 520xx — Resource exhaustion
   sysResourceExhaustedMemory(
       52001, 'SYS_RESOURCE_EXHAUSTED_MEMORY', 'Memory resource exhausted',
       isCritical: true),
   sysResourceExhausted(
       52002, 'SYS_RESOURCE_EXHAUSTED', 'System resources exhausted',
       isCritical: true),
+
+  // 530xx — IO / storage
   sysIoNotFound(
       53001, 'SYS_IO_NOT_FOUND', 'Physical file or path does not exist'),
   sysIoPermissionDenied(
@@ -187,7 +232,9 @@ enum ResultType {
       'Data stream formatting or parsing failed'),
   sysIoGeneric(53099, 'SYS_IO_GENERIC', 'Generic system IO error'),
 
-  // "ENG_" - Engine Error (99)
+  // ===========================================================================
+  // ENG_ — Engine Error (99)
+  // ===========================================================================
   engError(99001, 'ENG_ERROR', 'Engine error');
 
   /// Status code value
@@ -226,9 +273,9 @@ enum ResultType {
     return ResultType.engError;
   }
 
-  /// Determine if it is a constraint error
-  bool get isConstraintError =>
-      code == 10001 || (code >= 11000 && code < 12000);
+  /// Whether this maps to [ConstraintStatus] (BIZ validation / constraints /
+  /// record not-found: `10000`–`19999`).
+  bool get isConstraintError => code >= 10000 && code < 20000;
 
   /// Whether the error belongs to Business Error (10-19)
   bool get isBusinessError => code >= 10000 && code < 20000;

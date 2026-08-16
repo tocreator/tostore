@@ -2007,12 +2007,11 @@ class MigrationManager {
       // Snapshot is already sanitized at migrate/create boundaries.
       // Runtime updateSchema does not pass a snapshot.
       // schemaVersion bumps only when a migration task is added.
-      targetSchema = targetSchema
-          .copyWith(
-            tableUid: tableUid,
-            schemaVersion: GlobalIdGenerator.generate("s"),
-          )
-          .generateAutoIndexes(oldSchema: oldSchema);
+      // Note: generateAutoIndexes is deferred until sortedOperations are parsed below.
+      targetSchema = targetSchema.copyWith(
+        tableUid: tableUid,
+        schemaVersion: GlobalIdGenerator.generate("s"),
+      );
     }
 
     final tableDisplayName = await _resolveTableDisplayName(
@@ -2070,6 +2069,9 @@ class MigrationManager {
           _sortOperations(List<MigrationOperation>.from(operations));
       final renameOp = _findRenameOperation(sortedOperations);
 
+      var fieldRenames = _buildFieldRenameHints(sortedOperations);
+      var indexRenames = _buildIndexRenameHints(sortedOperations);
+
       final tableName =
           oldSchema?.name ?? targetSchema?.name ?? tableDisplayName;
 
@@ -2103,6 +2105,9 @@ class MigrationManager {
         if (sortedOperations.isEmpty) {
           return null;
         }
+        // Fold may drop redundant rename ops; rebuild maps from the final list.
+        fieldRenames = _buildFieldRenameHints(sortedOperations);
+        indexRenames = _buildIndexRenameHints(sortedOperations);
       }
 
       // Reuse pre-lock promoteRequested: fold never inserts promote ops, so
@@ -2210,7 +2215,17 @@ class MigrationManager {
                   tableUid: tableUid,
                   schemaVersion: GlobalIdGenerator.generate("s"),
                 )
-                .generateAutoIndexes(oldSchema: oldSchema);
+                .generateAutoIndexes(
+                  oldSchema: oldSchema,
+                  fieldRenames: fieldRenames,
+                  indexRenames: indexRenames,
+                );
+          } else {
+            targetSchema = targetSchema.generateAutoIndexes(
+              oldSchema: oldSchema,
+              fieldRenames: fieldRenames,
+              indexRenames: indexRenames,
+            );
           }
           final reservedSystemTableNames = SystemTable.systemTableNames;
           final allowSystemSchema = targetSchema.isSystemTable;
@@ -2442,7 +2457,11 @@ class MigrationManager {
                   primaryKeyConfig: oldSchema.primaryKeyConfig,
                   schemaVersion: GlobalIdGenerator.generate('s'),
                 )
-                .generateAutoIndexes(oldSchema: oldSchema);
+                .generateAutoIndexes(
+                  oldSchema: oldSchema,
+                  fieldRenames: _buildFieldRenameHints(siblingOps),
+                  indexRenames: _buildIndexRenameHints(siblingOps),
+                );
 
             // Never compactDeletedSlots on the old working table during promote.
             oldWorkingLayout = schemaMgrForLayout?.evolveFieldStorageLayout(
@@ -3097,6 +3116,21 @@ class MigrationManager {
           operation.fieldName != null &&
           operation.newName != null) {
         hints[operation.fieldName!] = operation.newName!;
+      }
+    }
+    return hints;
+  }
+
+  /// old indexName/actualIndexName -> new name (for stable indexUid inheritance).
+  Map<String, String> _buildIndexRenameHints(
+    List<MigrationOperation> operations,
+  ) {
+    final hints = <String, String>{};
+    for (final operation in operations) {
+      if (operation.type == MigrationType.renameIndex &&
+          operation.indexName != null &&
+          operation.newName != null) {
+        hints[operation.indexName!] = operation.newName!;
       }
     }
     return hints;

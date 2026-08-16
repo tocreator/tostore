@@ -58,7 +58,7 @@
 | :--- | :--- | :--- |
 | `index` | `int` | Индекс последовательности в пакетных операциях. Для одиночных операций зафиксирован как `0`. |
 | `code` | `int` | Числовой код состояния (`0` для успеха, 5-значное число для исключения). |
-| `codeKey` | `String` | Ключ семантического идентификатора состояния, например, `CONSTRAINT_VIOLATION_UNIQUE`. |
+| `codeKey` | `String` | Ключ семантического идентификатора состояния, например, `BIZ_CONSTRAINT_UNIQUE`. |
 | `message` | `String` | Человекочитаемое описание деталей состояния. |
 
 ### 3.2 Вспомогательные Геттеры в Памяти
@@ -68,6 +68,7 @@
 | Свойство | Тип | Описание |
 | :--- | :--- | :--- |
 | `isBusinessError` | `bool` | Является ли это **Бизнес-ошибкой** (например, конфликт ограничений, сбой приведения типов; диапазон `10000 - 19999`). |
+| `isConstraintError` | `bool` | Соответствует ли **ConstraintStatus** (тот же числовой диапазон, что и `isBusinessError`: `10000 - 19999`). |
 | `isDeveloperError` | `bool` | Является ли это **Ошибкой разработчика** (например, недопустимая схема, несоответствие параметров, таблица не найдена; диапазон `20000 - 49999`). |
 | `isSystemError` | `bool` | Является ли это **Системной ошибкой** (например, таймаут блокировки, диск заполнен, блокировка файла; диапазон `50000 - 79999`). |
 | `isEngineError` | `bool` | Является ли это **Ошибкой ядра** (диапазон `99000 - 99999`). |
@@ -104,7 +105,7 @@
 
 ### 4.2 ConstraintStatus (Целостность данных и конфликты ограничений)
 
-- **Диапазон категорий**: `code` внутри `[10000, 19999]` (в основном конфликты валидации и ограничений целостности).
+- **Диапазон категорий**: `code` внутри `[10000, 19999]` (все листовые коды бизнес-ошибок: валидация, ограничения целостности и запись не найдена). Соответствует `ResultType.isConstraintError`.
 - **Определение выделенного поля**:
 
   | Поле | Тип | Детали |
@@ -135,7 +136,7 @@
   | `11010`<br>`bizValueLessThanMinLength` | Длина значения меньше ограничения схемы | <ul><li>`tableName`: Затронутая таблица</li><li>`constraintName`: `null`</li><li>`fields`: Поля, нарушившие лимит, например `["code"]`</li><li>`conflictingKeys`: Значения короче минимума, например `["ab"]`</li><li>`primaryKey`: Первичный ключ записи (при наличии)</li></ul> |
   | `11011`<br>`bizValueLessThanMinValue` | Числовое значение меньше ограничения схемы | <ul><li>`tableName`: Затронутая таблица</li><li>`constraintName`: `null`</li><li>`fields`: Поля, нарушившие лимит, например `["age"]`</li><li>`conflictingKeys`: Значения меньше минимума, например `[-5]`</li><li>`primaryKey`: Первичный ключ записи (при наличии)</li></ul> |
   | `11012`<br>`bizValueExceedsMaxValue` | Числовое значение превышает ограничение схемы | <ul><li>`tableName`: Затронутая таблица</li><li>`constraintName`: `null`</li><li>`fields`: Поля, нарушившие лимит, например `["score"]`</li><li>`conflictingKeys`: Значения, превышающие максимум, например `[105]`</li><li>`primaryKey`: Первичный ключ записи (при наличии)</li></ul> |
-  | `12002`<br>`bizRecordNotFound` | Ресурс не существует / Запись не найдена | <ul><li>`tableName`: Затронутая таблица</li><li>`constraintName`: `null`</li><li>`fields`: Поля поиска цели, например `["id"]`</li><li>`conflictingKeys`: Ненайденные целевые ключи, например `["non_exist_id"]`</li><li>`primaryKey`: Значение отсутствующего ключа, например `"non_exist_id"`</li></ul> |
+  | `12001`<br>`bizRecordNotFound` | Ресурс не существует / Запись не найдена | <ul><li>`tableName`: Затронутая таблица</li><li>`constraintName`: `null`</li><li>`fields`: Поля поиска цели, например `["id"]`</li><li>`conflictingKeys`: Ненайденные целевые ключи, например `["non_exist_id"]`</li><li>`primaryKey`: Значение отсутствующего ключа, например `"non_exist_id"`</li></ul> |
 
 - **Пример JSON** (Родительская запись внешнего ключа не существует):
   ```json
@@ -157,7 +158,7 @@
 
 ### 4.3 SchemaValidationStatus (Валидация схемы таблицы и несовместимая миграция)
 
-- **Диапазон категорий**: `code` внутри `[30000, 39999]` (ошибки валидации конфигурации схемы и несоответствия физической миграции).
+- **Диапазон категорий**: `code` внутри `[30000, 39999]` — `30000–30013` статическая проверка схемы, `31001–31006` защиты миграции.
 - **Определение выделенного поля**:
 
   | Поле | Тип | Детали |
@@ -173,27 +174,29 @@
   | `30000`<br>`devInvalidSchema` | Недопустимое определение схемы таблицы | <ul><li>`tableName`: Имя таблицы</li><li>`field`: `null`</li><li>`wrongValue`: Недопустимая карта конфигурации или `null`</li></ul> |
   | `30001`<br>`devInvalidSchemaTableName` | Ошибка валидации имени таблицы (недопустимые символы или слишком длинное) | <ul><li>`tableName`: Нарушающее правила имя</li><li>`field`: `null`</li><li>`wrongValue`: Нарушающая правила строка</li></ul> |
   | `30002`<br>`devInvalidSchemaFieldName` | Ошибка валидации имени поля (недопустимые символы) | <ul><li>`tableName`: Имя таблицы</li><li>`field`: Нарушающее правила имя поля</li><li>`wrongValue`: Нарушающая правила строка</li></ul> |
-  | `30003`<br>`devInvalidSchemaPrimaryKey` | Ошибка валидации первичного ключа (отсутствует или неверный формат) | <ul><li>`tableName`: Имя таблицы</li><li>`field`: `"primaryKey"` или имя поля первичного ключа</li><li>`wrongValue`: Детали конфигурации первичного ключа</li></ul> |
-  | `30004`<br>`devInvalidSchemaIndexLimit` | Количество индексов таблицы превышает системный лимит в 16 | <ul><li>`tableName`: Имя таблицы</li><li>`field`: `null`</li><li>`wrongValue`: Список конфигураций индексов</li></ul> |
-  | `30005`<br>`devSchemaTableExists` | Таблица уже существует | <ul><li>`tableName`: Имя таблицы</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
-  | `30006`<br>`devSchemaFieldExists` | Обновление схемы: добавление поля, которое уже существует | <ul><li>`tableName`: Имя таблицы</li><li>`field`: Конфликтующее имя поля</li><li>`wrongValue`: `null`</li></ul> |
-  | `30007`<br>`devSchemaIndexExists` | Обновление схемы: добавление индекса, который уже существует | <ul><li>`tableName`: Имя таблицы</li><li>`field`: Имя индекса</li><li>`wrongValue`: `null`</li></ul> |
+  | `30003`<br>`devInvalidSchemaDuplicateFieldName` | Дублирующееся имя поля в схеме таблицы | <ul><li>`tableName`: Имя таблицы</li><li>`field`: Дублирующееся имя поля</li><li>`wrongValue`: `null`</li></ul> |
+  | `30004`<br>`devInvalidSchemaPrimaryKey` | Ошибка валидации первичного ключа (отсутствует или неверный формат) | <ul><li>`tableName`: Имя таблицы</li><li>`field`: `"primaryKey"` или имя поля первичного ключа</li><li>`wrongValue`: Детали конфигурации первичного ключа</li></ul> |
+  | `30005`<br>`devInvalidSchemaIndexLimit` | Количество индексов таблицы превышает системный лимит в 16 | <ul><li>`tableName`: Имя таблицы</li><li>`field`: `null`</li><li>`wrongValue`: Список конфигураций индексов</li></ul> |
+  | `30006`<br>`devInvalidSchemaIndexField` | Индекс ссылается на несуществующее поле | <ul><li>`tableName`: Имя таблицы</li><li>`field`: Имя индекса</li><li>`wrongValue`: Имя поля, вызывающее несоответствие</li></ul> |
+  | `30007`<br>`devInvalidSchemaIndexType` | Тип индекса несовместим с типом данных или конфигурацией поля | <ul><li>`tableName`: Имя таблицы</li><li>`field`: Имя индекса/поля</li><li>`wrongValue`: Информация о конфликте, напр. `{ "indexType": "btree", "fieldType": "vector" }`</li></ul> |
   | `30008`<br>`devInvalidSchemaForeignKey` | Недопустимое определение внешнего ключа (например, несоответствие столбцов) | <ul><li>`tableName`: Имя таблицы</li><li>`field`: Имя внешнего ключа</li><li>`wrongValue`: Детали конфигурации внешнего ключа</li></ul> |
   | `30009`<br>`devInvalidSchemaSpaceMismatch` | Глобальное/Специфичное для пространства несоответствие границ | <ul><li>`tableName`: Имя таблицы</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
-  | `30010`<br>`devMigrationNotAllowedWithData` | Миграция требует изменения данных и не была явно разрешена | <ul><li>`tableName`: Имя таблицы</li><li>`field`: `null`</li><li>`wrongValue`: Карта различий обновления миграции</li></ul> |
-  | `30011`<br>`devMigrationUnsafeTypeConversion` | Физическая миграция: неподдерживаемое преобразование типов для поля | <ul><li>`tableName`: Имя таблицы</li><li>`field`: Имя поля</li><li>`wrongValue`: Карта конфликтующих типов, например `{ "from": "text", "to": "integer" }`</li></ul> |
-  | `30013`<br>`devMigrationCannotAddNonNullField` | Невозможно добавить поле non-nullable без значения по умолчанию в непустую таблицу | <ul><li>`tableName`: Имя таблицы</li><li>`field`: Нарушающее правила имя поля</li><li>`wrongValue`: Параметры миграции, например `{ "nullable": false, "defaultValue": null }`</li></ul> |
-  | `30014`<br>`devMigrationNullableToNonNullNotAllowed` | Физическая миграция: изменение поля с nullable на non-nullable | <ul><li>`tableName`: Имя таблицы</li><li>`field`: Имя поля</li><li>`wrongValue`: Параметры миграции, аналогично 30013</li></ul> |
-  | `30015`<br>`devMigrationUniqueTighteningNotAllowed` | Физическая миграция: ужесточение ограничения поля до UNIQUE | <ul><li>`tableName`: Имя таблицы</li><li>`field`: Имя поля</li><li>`wrongValue`: Определение индекса, вызывающее ограничение уникальности</li></ul> |
-  | `30016`<br>`devInvalidSchemaTtlConfig` | Ошибка валидации конфигурации TTL | <ul><li>`tableName`: Имя таблицы</li><li>`field`: Поле временной метки TTL</li><li>`wrongValue`: Недопустимая карта конфигурации TTL, например, `{ "enabled": true, "fieldName": "expire_at" }`</li></ul> |
-  | `30017`<br>`devInvalidSchemaDuplicateFieldName` | Дублирующееся имя поля в схеме таблицы | <ul><li>`tableName`: Имя таблицы</li><li>`field`: Дублирующееся имя поля</li><li>`wrongValue`: `null`</li></ul> |
-  | `30018`<br>`devInvalidSchemaIndexField` | Индекс ссылается на несуществующее поле | <ul><li>`tableName`: Имя таблицы</li><li>`field`: Имя индекса</li><li>`wrongValue`: Имя поля, вызывающее несоответствие</li></ul> |
+  | `30010`<br>`devInvalidSchemaTtlConfig` | Ошибка валидации конфигурации TTL | <ul><li>`tableName`: Имя таблицы</li><li>`field`: Поле временной метки TTL</li><li>`wrongValue`: Недопустимая карта конфигурации TTL, например, `{ "enabled": true, "fieldName": "expire_at" }`</li></ul> |
+  | `30011`<br>`devSchemaTableExists` | Таблица уже существует | <ul><li>`tableName`: Имя таблицы</li><li>`field`: `null`</li><li>`wrongValue`: `null`</li></ul> |
+  | `30012`<br>`devSchemaFieldExists` | Обновление схемы: добавление поля, которое уже существует | <ul><li>`tableName`: Имя таблицы</li><li>`field`: Конфликтующее имя поля</li><li>`wrongValue`: `null`</li></ul> |
+  | `30013`<br>`devSchemaIndexExists` | Обновление схемы: добавление индекса, который уже существует | <ul><li>`tableName`: Имя таблицы</li><li>`field`: Имя индекса</li><li>`wrongValue`: `null`</li></ul> |
+  | `31001`<br>`devMigrationNotAllowedWithData` | Миграция требует изменения данных и не была явно разрешена | <ul><li>`tableName`: Имя таблицы</li><li>`field`: `null`</li><li>`wrongValue`: Карта различий обновления миграции</li></ul> |
+  | `31002`<br>`devMigrationUnsafeTypeConversion` | Физическая миграция: неподдерживаемое преобразование типов для поля | <ul><li>`tableName`: Имя таблицы</li><li>`field`: Имя поля</li><li>`wrongValue`: Карта конфликтующих типов, например `{ "from": "text", "to": "integer" }`</li></ul> |
+  | `31003`<br>`devMigrationCannotAddNonNullField` | Невозможно добавить поле non-nullable без значения по умолчанию в непустую таблицу | <ul><li>`tableName`: Имя таблицы</li><li>`field`: Нарушающее правила имя поля</li><li>`wrongValue`: Параметры миграции, например `{ "nullable": false, "defaultValue": null }`</li></ul> |
+  | `31004`<br>`devMigrationNullableToNonNullNotAllowed` | Физическая миграция: изменение поля с nullable на non-nullable | <ul><li>`tableName`: Имя таблицы</li><li>`field`: Имя поля</li><li>`wrongValue`: Параметры миграции, аналогично 31003</li></ul> |
+  | `31005`<br>`devMigrationUniqueTighteningNotAllowed` | Физическая миграция: ужесточение ограничения поля до UNIQUE | <ul><li>`tableName`: Имя таблицы</li><li>`field`: Имя поля</li><li>`wrongValue`: Определение индекса, вызывающее ограничение уникальности</li></ul> |
+  | `31006`<br>`devMigrationPromoteLargeOpNotAllowed` | Масштабные операции запрещены во время promoteFieldToPrimaryKey | <ul><li>`tableName`: Имя таблицы</li><li>`field`: `null`</li><li>`wrongValue`: Фаза promote / id задачи (если есть)</li></ul> |
 
 - **Пример JSON** (Добавление non-nullable поля без значения по умолчанию в непустую таблицу):
   ```json
   {
     "index": 0,
-    "code": 30013,
+    "code": 31003,
     "codeKey": "DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD",
     "message": "Cannot add non-nullable field \"phone\" without a default value to non-empty table \"users\". This operation is physically impossible and would fail during data write.",
     "tableName": "users",
@@ -209,7 +212,7 @@
 
 ### 4.4 InvalidArgumentStatus (Аргументы API и валидация пагинации курсора)
 
-- **Диапазон категорий**: `code` внутри `[20000, 20999]` (ошибки валидации параметров API, структур запросов или токенов пагинации).
+- **Диапазон категорий**: `code` внутри `[20000, 20999]` **исключая** `20005` / `20006`, **плюс** `22004` (`devFieldNotFound`). Коды `20005` / `20006` и другие `2200x` not-found используют GeneralStatus (§4.6).
 - **Определение выделенного поля**:
 
   | Поле | Тип | Детали |
@@ -225,26 +228,26 @@
   | `20001`<br>`devInvalidArgumentFormat` | Ошибка формата аргумента | <ul><li>`parameterName`: Имя недопустимого аргумента</li><li>`passedValue`: Переданное значение, например `"twenty"`</li><li>`primaryKey`: Первичный ключ записи (при наличии)</li></ul> |
   | `20002`<br>`devInvalidArgumentType` | Несоответствие типа аргумента | <ul><li>`parameterName`: Имя параметра</li><li>`passedValue`: Переданное значение, например `{"foo": "bar"}` (когда ожидается String)</li><li>`primaryKey`: Первичный ключ записи (при наличии)</li></ul> |
   | `20003`<br>`devInvalidArgumentMissing` | Обязательный аргумент отсутствует | <ul><li>`parameterName`: Имя отсутствующего параметра, например `"dbPath"`</li><li>`passedValue`: `null`</li><li>`primaryKey`: Первичный ключ записи (при наличии)</li></ul> |
-  | `20005`<br>`devInvalidPrimaryKeyFormat` | Недопустимый формат первичного ключа | <ul><li>`parameterName`: `"primaryKey"` или поле первичного ключа</li><li>`passedValue`: Недопустимое значение первичного ключа, например, `"invalid_id_value"`</li><li>`primaryKey`: Недопустимое значение первичного ключа</li></ul> |
-  | `20010`<br>`devVectorDimensionMismatch` | Несоответствие размерностей векторов | <ul><li>`parameterName`: `"other"`</li><li>`passedValue`: Нарушающий правила размер размерности</li><li>`primaryKey`: `null`</li></ul> |
-  | `20011`<br>`devIndexFieldMissing` | В записи для курсора отсутствует обязательное поле индекса | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: Отсутствующее поле индекса</li><li>`primaryKey`: `null`</li></ul> |
-  | `20201`<br>`devInvalidCursorPagination` | Пагинация курсора и смещение (offset) взаимно исключают друг друга | <ul><li>`parameterName`: `"cursor"` / `"offset"`</li><li>`passedValue`: Конфликтующие параметры пагинации</li><li>`primaryKey`: `null`</li></ul> |
-  | `20202`<br>`devInvalidCursorTable` | Курсор не соответствует целевой таблице | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: Токен курсора</li><li>`primaryKey`: `null`</li></ul> |
-  | `20203`<br>`devInvalidCursorSignature` | Несоответствие подписи курсора (изменено) | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: Токен курсора</li><li>`primaryKey`: `null`</li></ul> |
-  | `20204`<br>`devInvalidCursorOrderBy` | Конфигурация orderBy курсора недопустима или не соответствует запросу | <ul><li>`parameterName`: `"orderBy"`</li><li>`passedValue`: Список orderBy, например `["-age", "id"]`</li><li>`primaryKey`: `null`</li></ul> |
-  | `20205`<br>`devInvalidCursorMode` | Несоответствие режима токена курсора | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: Режим токена, например, `"sortKey"`</li><li>`primaryKey`: `null`</li></ul> |
-  | `20206`<br>`devInvalidCursorPayload` | Недопустимая полезная нагрузка курсора (не поддается декодированию) | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: `null`</li><li>`primaryKey`: `null`</li></ul> |
-  | `20301`<br>`devInvalidQuerySelectField` | Поле выборки запроса (select) должно быть String или QueryAggregation | <ul><li>`parameterName`: `"select"`</li><li>`passedValue`: Недопустимое определение поля select</li><li>`primaryKey`: `null`</li></ul> |
-  | `20302`<br>`devInvalidQueryForeignKeyJoin` | Отсутствует связь по внешнему ключу для автоматического объединения (join) | <ul><li>`parameterName`: `"join"` / `"tableName"`</li><li>`passedValue`: Целевая таблица без связи</li><li>`primaryKey`: `null`</li></ul> |
-  | `20303`<br>`devInvalidQueryFieldAlias` | Недопустимый формат псевдонима поля запроса | <ul><li>`parameterName`: `"alias"`</li><li>`passedValue`: Недопустимая строка псевдонима</li><li>`primaryKey`: `null`</li></ul> |
-  | `20304`<br>`devInvalidExpression` | Недопустимая конфигурация выражения или исключение выполнения | <ul><li>`parameterName`: Аспект ошибки (например, `"arguments"`, `"functionName"`, `"node"`)</li><li>`passedValue`: Недопустимое значение или количество</li><li>`primaryKey`: `null`</li></ul> |
-  | `22005`<br>`devFieldNotFound` | Поле не найдено | <ul><li>`parameterName`: Неизвестное имя поля, например `"extra"`</li><li>`passedValue`: Входное значение, переданное для поля</li><li>`primaryKey`: Первичный ключ записи (при наличии)</li></ul> |
+  | `20004`<br>`devInvalidPrimaryKeyFormat` | Недопустимый формат первичного ключа | <ul><li>`parameterName`: `"primaryKey"` или поле первичного ключа</li><li>`passedValue`: Недопустимое значение первичного ключа, например, `"invalid_id_value"`</li><li>`primaryKey`: Недопустимое значение первичного ключа</li></ul> |
+  | `20007`<br>`devVectorDimensionMismatch` | Несоответствие размерностей векторов | <ul><li>`parameterName`: `"other"`</li><li>`passedValue`: Нарушающий правила размер размерности</li><li>`primaryKey`: `null`</li></ul> |
+  | `20008`<br>`devIndexFieldMissing` | В записи для курсора отсутствует обязательное поле индекса | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: Отсутствующее поле индекса</li><li>`primaryKey`: `null`</li></ul> |
+  | `20101`<br>`devInvalidCursorPagination` | Пагинация курсора и смещение (offset) взаимно исключают друг друга | <ul><li>`parameterName`: `"cursor"` / `"offset"`</li><li>`passedValue`: Конфликтующие параметры пагинации</li><li>`primaryKey`: `null`</li></ul> |
+  | `20102`<br>`devInvalidCursorTable` | Курсор не соответствует целевой таблице | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: Токен курсора</li><li>`primaryKey`: `null`</li></ul> |
+  | `20103`<br>`devInvalidCursorSignature` | Несоответствие подписи курсора (изменено) | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: Токен курсора</li><li>`primaryKey`: `null`</li></ul> |
+  | `20104`<br>`devInvalidCursorOrderBy` | Конфигурация orderBy курсора недопустима или не соответствует запросу | <ul><li>`parameterName`: `"orderBy"`</li><li>`passedValue`: Список orderBy, например `["-age", "id"]`</li><li>`primaryKey`: `null`</li></ul> |
+  | `20105`<br>`devInvalidCursorMode` | Несоответствие режима токена курсора | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: Режим токена, например, `"sortKey"`</li><li>`primaryKey`: `null`</li></ul> |
+  | `20106`<br>`devInvalidCursorPayload` | Недопустимая полезная нагрузка курсора (не поддается декодированию) | <ul><li>`parameterName`: `"cursor"`</li><li>`passedValue`: `null`</li><li>`primaryKey`: `null`</li></ul> |
+  | `20201`<br>`devInvalidQuerySelectField` | Поле выборки запроса (select) должно быть String или QueryAggregation | <ul><li>`parameterName`: `"select"`</li><li>`passedValue`: Недопустимое определение поля select</li><li>`primaryKey`: `null`</li></ul> |
+  | `20202`<br>`devInvalidQueryForeignKeyJoin` | Отсутствует связь по внешнему ключу для автоматического объединения (join) | <ul><li>`parameterName`: `"join"` / `"tableName"`</li><li>`passedValue`: Целевая таблица без связи</li><li>`primaryKey`: `null`</li></ul> |
+  | `20203`<br>`devInvalidQueryFieldAlias` | Недопустимый формат псевдонима поля запроса | <ul><li>`parameterName`: `"alias"`</li><li>`passedValue`: Недопустимая строка псевдонима</li><li>`primaryKey`: `null`</li></ul> |
+  | `20204`<br>`devInvalidExpression` | Недопустимая конфигурация выражения или исключение выполнения | <ul><li>`parameterName`: Аспект ошибки (например, `"arguments"`, `"functionName"`, `"node"`)</li><li>`passedValue`: Недопустимое значение или количество</li><li>`primaryKey`: `null`</li></ul> |
+  | `22004`<br>`devFieldNotFound` | Поле не найдено | <ul><li>`parameterName`: Неизвестное имя поля, например `"extra"`</li><li>`passedValue`: Входное значение, переданное для поля</li><li>`primaryKey`: Первичный ключ записи (при наличии)</li></ul> |
 
 - **Пример JSON** (Поля orderBy курсора не соответствуют orderBy текущего запроса):
   ```json
   {
     "index": 0,
-    "code": 20204,
+    "code": 20104,
     "codeKey": "DEV_INVALID_CURSOR_ORDERBY",
     "message": "Cursor orderBy fields do not match current query orderBy.",
     "parameterName": "orderBy",
@@ -257,7 +260,7 @@
 
 ### 4.5 TransactionOperationStatus (Конфликт и прерывание транзакции)
 
-- **Диапазон категорий**: `code` внутри `[50000, 50999]` (откат транзакции, явное прерывание или конфликты сериализуемости).
+- **Диапазон категорий**: только `50001` (`sysTransactionAborted`) и `50002` (`sysTransactionConflict`). Остальные коды `500xx` (напр. `50003` / `50004`) используют GeneralStatus (§4.6).
 - **Определение выделенного поля**:
 
   | Поле | Тип | Детали |
@@ -286,7 +289,7 @@
 
 ### 4.6 GeneralStatus (Общие системные исключения)
 
-- **Диапазон категорий**: Резервный вариант для любых других кодов состояний (низкоуровневый ввод-вывод, аппаратные ошибки, системные таймауты и т. д.).
+- **Диапазон категорий**: запасной вариант для кодов вне §§4.1–4.5 — включая `20005` / `20006`, `22001`–`22003`, `230xx` / `240xx`, остальные `50xxx`–`53xxx` и `99001`.
 - **Определение выделенного поля**:
 
   | Поле | Тип | Детали |
@@ -299,11 +302,11 @@
 
   | Код и ResultType | Сценарий / Уровень | Руководство по полям |
   | :--- | :--- | :--- |
-  | `20007`<br>`devIndexOutOfBounds` | Индекс или диапазон вне границ (Ошибка разработчика) | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `20008`<br>`devUnsupportedOperation` | Операция не поддерживается в текущем контексте (Ошибка разработчика) | <ul><li>`primaryKey`: `null`</li><li>`target`: Целевая таблица/ресурс (при наличии)</li><li>`operation`: Имя метода (при наличии)</li></ul> |
+  | `20005`<br>`devIndexOutOfBounds` | Индекс или диапазон вне границ (Ошибка разработчика) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `20006`<br>`devUnsupportedOperation` | Операция не поддерживается в текущем контексте (Ошибка разработчика) | <ul><li>`primaryKey`: `null`</li><li>`target`: Целевая таблица/ресурс (при наличии)</li><li>`operation`: Имя метода (при наличии)</li></ul> |
   | `22001`<br>`devTableNotFound` | Таблица не найдена (Ошибка разработчика) | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `22003`<br>`devIndexNotFound` | Индекс не найден (Ошибка разработчика) | <ul><li>`primaryKey`: `null`</li></ul> |
-  | `22004`<br>`devSpaceNotFound` | Пространство (Space) не найдено (Ошибка разработчика) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `22002`<br>`devIndexNotFound` | Индекс не найден (Ошибка разработчика) | <ul><li>`primaryKey`: `null`</li></ul> |
+  | `22003`<br>`devSpaceNotFound` | Пространство (Space) не найдено (Ошибка разработчика) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `23001`<br>`devLargeScaleOperationRequired` | Large-scale data operation requires `allowLargeScaleOperation()` (Developer Error) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `23002`<br>`devLargeScaleOperationNotAllowedInTransaction` | Large-scale data operation is not allowed inside a transaction (Developer Error) | <ul><li>`primaryKey`: `null`</li></ul> |
   | `24001`<br>`devEngineIncompatible` | **Критично**: Версия ядра несовместима | <ul><li>`primaryKey`: `null`</li></ul> |
@@ -472,50 +475,52 @@ try {
 | **11010** | `BIZ_CONSTRAINT_MIN_LENGTH` | `ResultType.bizValueLessThanMinLength` | Бизнес-ошибка | Длина значения меньше ограничения схемы |
 | **11011** | `BIZ_CONSTRAINT_MIN_VALUE` | `ResultType.bizValueLessThanMinValue` | Бизнес-ошибка | Числовое значение меньше ограничения схемы |
 | **11012** | `BIZ_CONSTRAINT_MAX_VALUE` | `ResultType.bizValueExceedsMaxValue` | Бизнес-ошибка | Числовое значение превышает ограничение схемы |
-| **12002** | `BIZ_NOT_FOUND_RECORD` | `ResultType.bizRecordNotFound` | Бизнес-ошибка | Ресурс не существует / Запись не найдена |
+| **12001** | `BIZ_NOT_FOUND_RECORD` | `ResultType.bizRecordNotFound` | Бизнес-ошибка | Ресурс не существует / Запись не найдена |
 | **20001** | `DEV_INVALID_ARGUMENT_FORMAT` | `ResultType.devInvalidArgumentFormat` | Ошибка разработчика | Ошибка формата аргумента |
 | **20002** | `DEV_INVALID_ARGUMENT_TYPE` | `ResultType.devInvalidArgumentType` | Ошибка разработчика | Несоответствие типа аргумента |
 | **20003** | `DEV_INVALID_ARGUMENT_MISSING` | `ResultType.devInvalidArgumentMissing` | Ошибка разработчика | Обязательный аргумент отсутствует |
-| **20005** | `DEV_INVALID_PRIMARY_KEY_FORMAT` | `ResultType.devInvalidPrimaryKeyFormat` | Ошибка разработчика | Недопустимый формат первичного ключа |
-| **20007** | `DEV_INDEX_OUT_OF_BOUNDS` | `ResultType.devIndexOutOfBounds` | Ошибка разработчика | Индекс или диапазон вне границ |
-| **20008** | `DEV_UNSUPPORTED_OPERATION` | `ResultType.devUnsupportedOperation` | Ошибка разработчика | Операция не поддерживается в текущем контексте |
-| **20010** | `DEV_VECTOR_DIMENSION_MISMATCH` | `ResultType.devVectorDimensionMismatch` | Ошибка разработчика | Несоответствие размерностей векторов |
-| **20011** | `DEV_INDEX_FIELD_MISSING` | `ResultType.devIndexFieldMissing` | Ошибка разработчика | В записи для курсора отсутствует обязательное поле индекса |
-| **20201** | `DEV_INVALID_CURSOR_PAGINATION` | `ResultType.devInvalidCursorPagination` | Ошибка разработчика | Пагинация курсора и смещение взаимно исключают друг друга |
-| **20202** | `DEV_INVALID_CURSOR_TABLE` | `ResultType.devInvalidCursorTable` | Ошибка разработчика | Курсор не соответствует целевой таблице |
-| **20203** | `DEV_INVALID_CURSOR_SIGNATURE` | `ResultType.devInvalidCursorSignature` | Ошибка разработчика | Несоответствие подписи курсора (изменено) |
-| **20204** | `DEV_INVALID_CURSOR_ORDERBY` | `ResultType.devInvalidCursorOrderBy` | Ошибка разработчика | Конфигурация orderBy курсора недопустима или не соответствует запросу |
-| **20205** | `DEV_INVALID_CURSOR_MODE` | `ResultType.devInvalidCursorMode` | Ошибка разработчика | Несоответствие режима токена курсора |
-| **20206** | `DEV_INVALID_CURSOR_PAYLOAD` | `ResultType.devInvalidCursorPayload` | Ошибка разработчика | Недопустимая полезная нагрузка курсора (не поддается декодированию) |
-| **20301** | `DEV_INVALID_QUERY_SELECT_FIELD` | `ResultType.devInvalidQuerySelectField` | Ошибка разработчика | Поле выборки запроса должно быть String или QueryAggregation |
-| **20302** | `DEV_INVALID_QUERY_FOREIGN_KEY_JOIN` | `ResultType.devInvalidQueryForeignKeyJoin` | Ошибка разработчика | Отсутствует связь по внешнему ключу для автоматического объединения |
-| **20303** | `DEV_INVALID_QUERY_FIELD_ALIAS` | `ResultType.devInvalidQueryFieldAlias` | Ошибка разработчика | Недопустимый формат псевдонима поля запроса |
-| **20304** | `DEV_INVALID_EXPRESSION` | `ResultType.devInvalidExpression` | Ошибка разработчика | Недопустимая конфигурация выражения или исключение выполнения |
+| **20004** | `DEV_INVALID_PRIMARY_KEY_FORMAT` | `ResultType.devInvalidPrimaryKeyFormat` | Ошибка разработчика | Недопустимый формат первичного ключа |
+| **20005** | `DEV_INDEX_OUT_OF_BOUNDS` | `ResultType.devIndexOutOfBounds` | Ошибка разработчика | Индекс или диапазон вне границ |
+| **20006** | `DEV_UNSUPPORTED_OPERATION` | `ResultType.devUnsupportedOperation` | Ошибка разработчика | Операция не поддерживается в текущем контексте |
+| **20007** | `DEV_VECTOR_DIMENSION_MISMATCH` | `ResultType.devVectorDimensionMismatch` | Ошибка разработчика | Несоответствие размерностей векторов |
+| **20008** | `DEV_INDEX_FIELD_MISSING` | `ResultType.devIndexFieldMissing` | Ошибка разработчика | В записи для курсора отсутствует обязательное поле индекса |
+| **20101** | `DEV_INVALID_CURSOR_PAGINATION` | `ResultType.devInvalidCursorPagination` | Ошибка разработчика | Пагинация курсора и смещение взаимно исключают друг друга |
+| **20102** | `DEV_INVALID_CURSOR_TABLE` | `ResultType.devInvalidCursorTable` | Ошибка разработчика | Курсор не соответствует целевой таблице |
+| **20103** | `DEV_INVALID_CURSOR_SIGNATURE` | `ResultType.devInvalidCursorSignature` | Ошибка разработчика | Несоответствие подписи курсора (изменено) |
+| **20104** | `DEV_INVALID_CURSOR_ORDERBY` | `ResultType.devInvalidCursorOrderBy` | Ошибка разработчика | Конфигурация orderBy курсора недопустима или не соответствует запросу |
+| **20105** | `DEV_INVALID_CURSOR_MODE` | `ResultType.devInvalidCursorMode` | Ошибка разработчика | Несоответствие режима токена курсора |
+| **20106** | `DEV_INVALID_CURSOR_PAYLOAD` | `ResultType.devInvalidCursorPayload` | Ошибка разработчика | Недопустимая полезная нагрузка курсора (не поддается декодированию) |
+| **20201** | `DEV_INVALID_QUERY_SELECT_FIELD` | `ResultType.devInvalidQuerySelectField` | Ошибка разработчика | Поле выборки запроса должно быть String или QueryAggregation |
+| **20202** | `DEV_INVALID_QUERY_FOREIGN_KEY_JOIN` | `ResultType.devInvalidQueryForeignKeyJoin` | Ошибка разработчика | Отсутствует связь по внешнему ключу для автоматического объединения |
+| **20203** | `DEV_INVALID_QUERY_FIELD_ALIAS` | `ResultType.devInvalidQueryFieldAlias` | Ошибка разработчика | Недопустимый формат псевдонима поля запроса |
+| **20204** | `DEV_INVALID_EXPRESSION` | `ResultType.devInvalidExpression` | Ошибка разработчика | Недопустимая конфигурация выражения или исключение выполнения |
 | **22001** | `DEV_NOT_FOUND_TABLE` | `ResultType.devTableNotFound` | Ошибка разработчика | Таблица не найдена |
-| **22003** | `DEV_NOT_FOUND_INDEX` | `ResultType.devIndexNotFound` | Ошибка разработчика | Индекс не найден |
-| **22004** | `DEV_NOT_FOUND_SPACE` | `ResultType.devSpaceNotFound` | Ошибка разработчика | Пространство не найдено |
-| **22005** | `DEV_NOT_FOUND_FIELD` | `ResultType.devFieldNotFound` | Ошибка разработчика | Поле не найдено |
+| **22002** | `DEV_NOT_FOUND_INDEX` | `ResultType.devIndexNotFound` | Ошибка разработчика | Индекс не найден |
+| **22003** | `DEV_NOT_FOUND_SPACE` | `ResultType.devSpaceNotFound` | Ошибка разработчика | Пространство не найдено |
+| **22004** | `DEV_NOT_FOUND_FIELD` | `ResultType.devFieldNotFound` | Ошибка разработчика | Поле не найдено |
 | **23001** | `DEV_LARGE_SCALE_OPERATION_REQUIRED` | `ResultType.devLargeScaleOperationRequired` | Ошибка разработчика | Large-scale data operation requires `allowLargeScaleOperation()` to prevent OOM |
 | **23002** | `DEV_LARGE_SCALE_OPERATION_NOT_ALLOWED_IN_TRANSACTION` | `ResultType.devLargeScaleOperationNotAllowedInTransaction` | Developer Error | Large-scale data operation is not allowed inside a transaction |
 | **24001** | `DEV_ENGINE_INCOMPATIBLE` | `ResultType.devEngineIncompatible` | Ошибка разработчика | **Критично**: Версия ядра несовместима |
 | **30000** | `DEV_INVALID_SCHEMA` | `ResultType.devInvalidSchema` | Ошибка разработчика | Недопустимое определение схемы таблицы |
 | **30001** | `DEV_INVALID_SCHEMA_TABLE_NAME` | `ResultType.devInvalidSchemaTableName` | Ошибка разработчика | Ошибка валидации имени таблицы |
 | **30002** | `DEV_INVALID_SCHEMA_FIELD_NAME` | `ResultType.devInvalidSchemaFieldName` | Ошибка разработчика | Ошибка валидации имени поля |
-| **30003** | `DEV_INVALID_SCHEMA_PRIMARY_KEY` | `ResultType.devInvalidSchemaPrimaryKey` | Ошибка разработчика | Ошибка валидации первичного ключа |
-| **30004** | `DEV_INVALID_SCHEMA_INDEX_LIMIT` | `ResultType.devInvalidSchemaIndexLimit` | Ошибка разработчика | Ошибка валидации количества индексов |
-| **30005** | `DEV_SCHEMA_TABLE_EXISTS` | `ResultType.devSchemaTableExists` | Ошибка разработчика | Таблица уже существует |
-| **30006** | `DEV_SCHEMA_FIELD_EXISTS` | `ResultType.devSchemaFieldExists` | Ошибка разработчика | Поле уже существует |
-| **30007** | `DEV_SCHEMA_INDEX_EXISTS` | `ResultType.devSchemaIndexExists` | Ошибка разработчика | Индекс уже существует |
+| **30003** | `DEV_INVALID_SCHEMA_DUPLICATE_FIELD_NAME` | `ResultType.devInvalidSchemaDuplicateFieldName` | Ошибка разработчика | Дублирующееся имя поля в схеме таблицы |
+| **30004** | `DEV_INVALID_SCHEMA_PRIMARY_KEY` | `ResultType.devInvalidSchemaPrimaryKey` | Ошибка разработчика | Ошибка валидации первичного ключа |
+| **30005** | `DEV_INVALID_SCHEMA_INDEX_LIMIT` | `ResultType.devInvalidSchemaIndexLimit` | Ошибка разработчика | Ошибка валидации количества индексов |
+| **30006** | `DEV_INVALID_SCHEMA_INDEX_FIELD` | `ResultType.devInvalidSchemaIndexField` | Ошибка разработчика | Индекс ссылается на несуществующее поле |
+| **30007** | `DEV_INVALID_SCHEMA_INDEX_TYPE` | `ResultType.devInvalidSchemaIndexType` | Ошибка разработчика | Тип индекса несовместим с типом данных или конфигурацией поля |
 | **30008** | `DEV_INVALID_SCHEMA_FOREIGN_KEY` | `ResultType.devInvalidSchemaForeignKey` | Ошибка разработчика | Недопустимое определение внешнего ключа |
 | **30009** | `DEV_INVALID_SCHEMA_SPACE_MISMATCH` | `ResultType.devInvalidSchemaSpaceMismatch` | Ошибка разработчика | Глобальное/Специфичное для пространства несоответствие границ |
-| **30010** | `DEV_MIGRATION_NOT_ALLOWED_WITH_DATA` | `ResultType.devMigrationNotAllowedWithData` | Ошибка разработчика | Миграция требует изменения данных и не была явно разрешена |
-| **30011** | `DEV_MIGRATION_UNSAFE_TYPE_CONVERSION` | `ResultType.devMigrationUnsafeTypeConversion` | Ошибка разработчика | Неподдерживаемое изменение типа данных для поля |
-| **30013** | `DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD` | `ResultType.devMigrationCannotAddNonNullField` | Ошибка разработчика | Добавление non-nullable поля без значения по умолчанию не допускается |
-| **30014** | `DEV_MIGRATION_NULLABLE_TO_NON_NULL_NOT_ALLOWED` | `ResultType.devMigrationNullableToNonNullNotAllowed` | Ошибка разработчика | Изменение поля с nullable на non-nullable не допускается |
-| **30015** | `DEV_MIGRATION_UNIQUE_TIGHTENING_NOT_ALLOWED` | `ResultType.devMigrationUniqueTighteningNotAllowed` | Ошибка разработчика | Ужесточение до UNIQUE не допускается |
-| **30016** | `DEV_INVALID_SCHEMA_TTL_CONFIG` | `ResultType.devInvalidSchemaTtlConfig` | Ошибка разработчика | Ошибка валидации конфигурации TTL |
-| **30017** | `DEV_INVALID_SCHEMA_DUPLICATE_FIELD_NAME` | `ResultType.devInvalidSchemaDuplicateFieldName` | Ошибка разработчика | Дублирующееся имя поля в схеме таблицы |
-| **30018** | `DEV_INVALID_SCHEMA_INDEX_FIELD` | `ResultType.devInvalidSchemaIndexField` | Ошибка разработчика | Индекс ссылается на несуществующее поле |
+| **30010** | `DEV_INVALID_SCHEMA_TTL_CONFIG` | `ResultType.devInvalidSchemaTtlConfig` | Ошибка разработчика | Ошибка валидации конфигурации TTL |
+| **30011** | `DEV_SCHEMA_TABLE_EXISTS` | `ResultType.devSchemaTableExists` | Ошибка разработчика | Таблица уже существует |
+| **30012** | `DEV_SCHEMA_FIELD_EXISTS` | `ResultType.devSchemaFieldExists` | Ошибка разработчика | Поле уже существует |
+| **30013** | `DEV_SCHEMA_INDEX_EXISTS` | `ResultType.devSchemaIndexExists` | Ошибка разработчика | Индекс уже существует |
+| **31001** | `DEV_MIGRATION_NOT_ALLOWED_WITH_DATA` | `ResultType.devMigrationNotAllowedWithData` | Ошибка разработчика | Миграция требует изменения данных и не была явно разрешена |
+| **31002** | `DEV_MIGRATION_UNSAFE_TYPE_CONVERSION` | `ResultType.devMigrationUnsafeTypeConversion` | Ошибка разработчика | Неподдерживаемое изменение типа данных для поля |
+| **31003** | `DEV_MIGRATION_CANNOT_ADD_NON_NULL_FIELD` | `ResultType.devMigrationCannotAddNonNullField` | Ошибка разработчика | Добавление non-nullable поля без значения по умолчанию не допускается |
+| **31004** | `DEV_MIGRATION_NULLABLE_TO_NON_NULL_NOT_ALLOWED` | `ResultType.devMigrationNullableToNonNullNotAllowed` | Ошибка разработчика | Изменение поля с nullable на non-nullable не допускается |
+| **31005** | `DEV_MIGRATION_UNIQUE_TIGHTENING_NOT_ALLOWED` | `ResultType.devMigrationUniqueTighteningNotAllowed` | Ошибка разработчика | Ужесточение до UNIQUE не допускается |
+| **31006** | `DEV_MIGRATION_PROMOTE_LARGE_OP_NOT_ALLOWED` | `ResultType.devMigrationPromoteLargeOpNotAllowed` | Ошибка разработчика | Масштабные операции запрещены во время promoteFieldToPrimaryKey |
 | **50001** | `SYS_TRANSACTION_ABORTED` | `ResultType.sysTransactionAborted` | Системная ошибка | Транзакция прервана |
 | **50002** | `SYS_TRANSACTION_CONFLICT` | `ResultType.sysTransactionConflict` | Системная ошибка | Конфликт транзакции |
 | **50003** | `SYS_TRANSACTION_LIMIT_EXCEEDED` | `ResultType.sysTransactionLimitExceeded` | Системная ошибка | Транзакция превышает безопасный предел памяти при нехватке памяти |

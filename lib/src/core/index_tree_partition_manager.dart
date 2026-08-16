@@ -4,13 +4,13 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
-import '../interface/storage_interface.dart';
 import '../handler/common.dart';
 import '../handler/encryption.dart';
 import '../handler/logger.dart';
 import '../handler/memcomparable.dart';
 import '../handler/meta_binary_codec.dart';
 import '../handler/parallel_processor.dart';
+import '../interface/storage_interface.dart';
 import '../model/data_block_entry.dart';
 import '../model/data_store_config.dart';
 import '../model/db_exception.dart';
@@ -21,6 +21,7 @@ import '../model/parallel_journal_entry.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/table_context.dart';
+import '../model/table_identity.dart';
 import 'btree_page.dart';
 import 'compute/btree_page_encode_batch_runner.dart';
 import 'compute_tasks.dart';
@@ -30,7 +31,6 @@ import 'storage_adapter.dart';
 import 'tree_cache.dart';
 import 'workload_scheduler.dart';
 import 'yield_controller.dart';
-import '../model/table_identity.dart';
 
 /// New baseline implementation: paged global leaf-chain B+Tree per index.
 ///
@@ -1047,6 +1047,10 @@ final class IndexTreePartitionManager {
       } catch (_) {}
     }
 
+    // Pages touched by this batch's entries (leaf + internal), excluding meta/free.
+    int targetLeafPages = 0;
+    int targetInternalPages = 0;
+
     // ---- Encode dirty pages into staged writes (once per page) ----
     if (dirtyLeaves.isNotEmpty || dirtyInternals.isNotEmpty) {
       final stageYc = YieldController(
@@ -1195,6 +1199,7 @@ final class IndexTreePartitionManager {
               pageNo: ptr.pageNo,
               payload: leftPayload,
             ));
+            targetLeafPages++;
             pendingPtrs.add(rightLeafPtr);
             pending.add(BTreePageEncodeItem(
               typeIndex: BTreePageType.leaf.index,
@@ -1202,6 +1207,7 @@ final class IndexTreePartitionManager {
               pageNo: rightLeafPtr.pageNo,
               payload: rightPayload,
             ));
+            targetLeafPages++;
           } else {
             pendingPtrs.add(ptr);
             pending.add(BTreePageEncodeItem.leaf(
@@ -1209,6 +1215,7 @@ final class IndexTreePartitionManager {
               pageNo: ptr.pageNo,
               page: leaf,
             ));
+            targetLeafPages++;
           }
           if (pending.length >= chunkSize) {
             await flushEncodeChunk();
@@ -1283,6 +1290,7 @@ final class IndexTreePartitionManager {
               pageNo: ptr.pageNo,
               payload: leftPayload,
             ));
+            targetInternalPages++;
             pendingPtrs.add(rightNodePtr);
             pending.add(BTreePageEncodeItem(
               typeIndex: BTreePageType.internal.index,
@@ -1290,6 +1298,7 @@ final class IndexTreePartitionManager {
               pageNo: rightNodePtr.pageNo,
               payload: rightPayload,
             ));
+            targetInternalPages++;
           } else {
             pendingPtrs.add(ptr);
             pending.add(BTreePageEncodeItem.internal(
@@ -1297,6 +1306,7 @@ final class IndexTreePartitionManager {
               pageNo: ptr.pageNo,
               page: node,
             ));
+            targetInternalPages++;
           }
           if (pending.length >= chunkSize) {
             await flushEncodeChunk();
@@ -1628,8 +1638,9 @@ final class IndexTreePartitionManager {
           '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}.${now.millisecond.toString().padLeft(3, '0')}';
       final totalEntryCount = max(0, meta.totalEntryCount + entriesDeltaSum);
       final totalSize = max(0, meta.totalSizeBytes + sizeDeltaSum);
+      final targetPages = targetLeafPages + targetInternalPages;
       Logger.debug(
-          'Index persistence: table=$tableName, partitions=${meta.btreePartitionCount}, index=$indexLogName, batchEntries=$totalDeltas, totalEntryCount=$totalEntryCount, totalSize=${(totalSize / 1024 / 1024).toStringAsFixed(2)}MB, concurrency=${concurrency ?? 1}, cost=${sw.elapsedMilliseconds}ms, at: $at');
+          'Index persistence: table=$tableName, partitions=${meta.btreePartitionCount}, index=$indexLogName, batchEntries=$totalDeltas, targetPages=$targetPages (leaves=$targetLeafPages, internals=$targetInternalPages), totalEntryCount=$totalEntryCount, totalSize=${(totalSize / 1024 / 1024).toStringAsFixed(2)}MB, concurrency=${concurrency ?? 1}, cost=${sw.elapsedMilliseconds}ms, at: $at');
     }
   }
 
