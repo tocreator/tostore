@@ -1765,6 +1765,7 @@ class ForeignKeyManager {
     TableSchema schema, {
     bool throwOnError = false,
   }) async {
+    if (schema.foreignKeys.isEmpty) return;
     final tableName = table.tableName;
     try {
       final fkTableName = SystemTable.getFkReferencesName();

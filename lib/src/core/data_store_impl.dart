@@ -1412,7 +1412,10 @@ class DataStoreImpl {
         final isTableMeta = SystemTable.isTableMetaTable(tableSchema.name);
         final dirIndex = isTableMeta
             ? SystemTable.tableMetaDirIndex
-            : await tableMetaManager!.allocateDirIndex(tableSchema.isGlobal);
+            : await tableMetaManager!.allocateDirIndex(
+                tableSchema.isGlobal,
+                persist: false,
+              );
         final layout =
             tableMetaManager!.evolveFieldStorageLayout(nextSchema: tableSchema);
         final now = DateTime.now();
@@ -1457,7 +1460,9 @@ class DataStoreImpl {
         }
 
         // Auto-create indexes for foreign keys
-        if (_foreignKeyManager != null && !resolvedSchema.isSystemTable) {
+        if (_foreignKeyManager != null &&
+            !resolvedSchema.isSystemTable &&
+            resolvedSchema.foreignKeys.isNotEmpty) {
           await _foreignKeyManager!
               .updateSystemTableForTable(tableCtx, resolvedSchema);
         }
@@ -7887,13 +7892,16 @@ class DataStoreImpl {
   ///
   /// When [propagateErrors] is true, failures are rethrown (required for v3
   /// finalize so legacy JSON is never deleted after a failed TOBF write).
+  /// When [persist] is false, updates in-memory cache only without disk IO.
   Future<void> saveGlobalConfig(
     GlobalConfig config, {
     bool propagateErrors = false,
+    bool persist = true,
   }) async {
     try {
-      // Update memory cache only after successful disk write when propagating,
-      // so a failed upgrade write cannot leave cache ahead of durable state.
+      _globalConfigCache = config;
+      if (!persist) return;
+
       final configPath = pathManager.getGlobalConfigPath();
 
       await storage.ensureDirectoryExists(
@@ -7908,7 +7916,6 @@ class DataStoreImpl {
         ),
       );
       await storage.writeAsBytes(configPath, bytes);
-      _globalConfigCache = config;
 
       // Version-only JSON stub for older engines (once per version per process).
       unawaited(ensureDowngradeGuardJson(version: config.version));

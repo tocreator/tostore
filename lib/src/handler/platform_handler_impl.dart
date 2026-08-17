@@ -433,45 +433,43 @@ class PlatformHandlerImpl implements PlatformInterface {
     return memoryMB;
   }
 
+  static final Map<String, int> _cachedDiskFreeSpaceMB = {};
+  static DateTime? _lastDiskFreeSpaceFetch;
+  static const _diskFetchTimeout = Duration(seconds: 5);
+
   /// Get available disk space in MB for the given path
   @override
   Future<int> getDiskFreeSpaceMB(String path) async {
+    final now = DateTime.now();
+    if (_lastDiskFreeSpaceFetch != null &&
+        now.difference(_lastDiskFreeSpaceFetch!) < _diskFetchTimeout &&
+        _cachedDiskFreeSpaceMB.containsKey(path)) {
+      return _cachedDiskFreeSpaceMB[path]!;
+    }
+
     try {
       // Try FFI first (extremely fast, <1ms)
       int freeMB = SystemFfiHelper.getDiskFreeSpaceMB(path);
-      if (freeMB > 0) return freeMB;
-
-      // Fallback
-      int fallbackMB;
-      if (isWindows) {
-        fallbackMB = await _getWindowsDiskFreeSpace(path);
-      } else {
-        fallbackMB = await _getPosixDiskFreeSpace(path);
+      if (freeMB > 0) {
+        _cachedDiskFreeSpaceMB[path] = freeMB;
+        _lastDiskFreeSpaceFetch = now;
+        return freeMB;
       }
 
-      if (fallbackMB > 0) return fallbackMB;
+      // Posix Fallback
+      if (!isWindows) {
+        final fallbackMB = await _getPosixDiskFreeSpace(path);
+        if (fallbackMB > 0) {
+          _cachedDiskFreeSpaceMB[path] = fallbackMB;
+          _lastDiskFreeSpaceFetch = now;
+          return fallbackMB;
+        }
+      }
     } catch (e) {
-      Logger.error('Failed to get disk free space for $path', rawError: e);
+      Logger.warn('Failed to get disk free space for $path', rawError: e);
     }
     // Safe default: 10GB if all detection methods fail or are unsupported
     return 10240;
-  }
-
-  /// Get Windows disk free space (fallback)
-  Future<int> _getWindowsDiskFreeSpace(String pathStr) async {
-    try {
-      // Use PowerShell to get free space
-      final result = await Process.run('powershell', [
-        '-Command',
-        '(([WmiSearcher]"Select FreeSpace from Win32_LogicalDisk where DeviceID=\'${pathStr.substring(0, 2)}\'").Get() | Select-Object -First 1).FreeSpace / 1MB'
-      ]);
-
-      if (result.exitCode == 0 && result.stdout != null) {
-        final val = double.tryParse((result.stdout as String).trim());
-        if (val != null) return val.round();
-      }
-    } catch (_) {}
-    return 0;
   }
 
   /// Get Posix disk free space (fallback)
@@ -598,76 +596,29 @@ class PlatformHandlerImpl implements PlatformInterface {
     }
   }
 
-  /// Get Windows system memory
+  /// Get Windows system memory (fallback when FFI fails)
   Future<int> _getWindowsMemory() async {
     try {
-      // Fallback: Use PowerShell to get system memory information
-      final result = await Process.run('powershell', [
-        '-Command',
-        '(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory/1MB'
-      ]).timeout(const Duration(seconds: 2));
-
-      if (result.exitCode == 0 && result.stdout != null) {
-        // Parse the result (PowerShell returns MB value with decimal point)
-        final memoryMB = double.tryParse((result.stdout as String).trim());
-        if (memoryMB != null && memoryMB > 0) {
-          return memoryMB.round();
-        }
-      }
-
-      // If the command fails, try to get environment variable
       final memEnv = Platform.environment['MEMORYSIZE'];
       if (memEnv != null) {
-        // Try to parse the environment variable value (usually in "xxxx MB" format)
         final memMatch = RegExp(r'(\d+)').firstMatch(memEnv);
         if (memMatch != null) {
           return int.tryParse(memMatch.group(1) ?? '4096') ?? 4096;
         }
       }
-
-      // Return an estimate based on core count if unable to retrieve
       return processorCores * 1024;
     } catch (e) {
       return 8192; // 8GB as default value
     }
   }
 
-  /// Get Windows available memory
+  /// Get Windows available memory (fallback when FFI fails)
   Future<int> _getWindowsAvailableMemory() async {
     try {
-      // Fallback: Use PowerShell to get available memory information
-      final result = await Process.run('powershell', [
-        '-Command',
-        '(Get-Counter "\\Memory\\Available MBytes").CounterSamples[0].CookedValue'
-      ]).timeout(const Duration(seconds: 2));
-
-      if (result.exitCode == 0 && result.stdout != null) {
-        final memoryMB = double.tryParse((result.stdout as String).trim());
-        if (memoryMB != null && memoryMB > 0) {
-          return memoryMB.round();
-        }
-      }
-
-      // Backup method: calculate available memory from system information
-      final fallbackResult = await Process.run('powershell', [
-        '-Command',
-        '(Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory/1KB'
-      ]).timeout(const Duration(seconds: 2));
-
-      if (fallbackResult.exitCode == 0 && fallbackResult.stdout != null) {
-        final memoryKB =
-            double.tryParse((fallbackResult.stdout as String).trim());
-        if (memoryKB != null && memoryKB > 0) {
-          return (memoryKB / 1024).round(); // Convert to MB
-        }
-      }
-
-      // If all fail, return 25% of total memory as an estimate
       final totalMemory = await _getWindowsMemory();
-      return totalMemory ~/ 4;
+      return (totalMemory * 0.5).round();
     } catch (e) {
-      final totalMemory = await _getWindowsMemory();
-      return totalMemory ~/ 4; // Return 1/4 of total memory as default value
+      return 4096;
     }
   }
 

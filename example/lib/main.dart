@@ -1604,7 +1604,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                                   Expanded(
                                     child: Padding(
                                       padding: const EdgeInsets.fromLTRB(
-                                          16.0, 0, 4, 6),
+                                          16.0, 0, 12, 6),
                                       child: AnimatedBuilder(
                                         animation: _logPanelController,
                                         builder: (context, child) {
@@ -2606,11 +2606,10 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     return IconButton(
       style: IconButton.styleFrom(
         shape: const CircleBorder(),
-        visualDensity: VisualDensity.compact,
         tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-        minimumSize: const Size(36, 36),
-        maximumSize: const Size(36, 36),
-        padding: EdgeInsets.zero,
+        minimumSize: const Size(40, 40),
+        maximumSize: const Size(40, 40),
+        padding: const EdgeInsets.all(8),
       ),
       icon: Icon(icon, size: iconSize),
       tooltip: tooltip,

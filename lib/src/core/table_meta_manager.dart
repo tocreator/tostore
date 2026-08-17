@@ -1043,11 +1043,14 @@ class TableMetaManager {
   /// Prefers under-capacity dirs rebuilt after [loadAllTableMetaAsync].
   /// Otherwise advances [GlobalConfig] high-water
   /// (`last*DirIndex` / `last*DirEntries`) with no extra KV IO.
-  Future<int> allocateDirIndex(bool isGlobal) {
+  /// [persist]: when false, updates in-memory GlobalConfig cache only to avoid
+  /// redundant disk rewrites during batch table creation (flushed in updateSchemaHashes).
+  Future<int> allocateDirIndex(bool isGlobal, {bool persist = true}) {
     final done = Completer<int>();
     _dirAllocChain = _dirAllocChain.then((_) async {
       try {
-        done.complete(await _allocateDirIndexUnlocked(isGlobal));
+        done.complete(
+            await _allocateDirIndexUnlocked(isGlobal, persist: persist));
       } catch (e, st) {
         done.completeError(e, st);
       }
@@ -1055,7 +1058,10 @@ class TableMetaManager {
     return done.future;
   }
 
-  Future<int> _allocateDirIndexUnlocked(bool isGlobal) async {
+  Future<int> _allocateDirIndexUnlocked(
+    bool isGlobal, {
+    bool persist = true,
+  }) async {
     final usage = isGlobal ? _globalDirCounts : _nonGlobalDirCounts;
     final max = _dataStore.maxEntriesPerDir;
 
@@ -1079,6 +1085,7 @@ class TableMetaManager {
         isGlobal: isGlobal,
         dirIndex: selectedDir,
         entriesInDir: next > max ? max : next,
+        persist: persist,
       );
       return selectedDir;
     }
@@ -1105,7 +1112,7 @@ class TableMetaManager {
             lastNonGlobalDirIndex: index,
             lastNonGlobalDirEntries: entries,
           );
-    await _dataStore.saveGlobalConfig(updated);
+    await _dataStore.saveGlobalConfig(updated, persist: persist);
 
     if (entries < max) {
       usage[index] = entries;
@@ -1118,6 +1125,7 @@ class TableMetaManager {
     required bool isGlobal,
     required int dirIndex,
     required int entriesInDir,
+    bool persist = true,
   }) async {
     final config = await _dataStore.getGlobalConfig() ?? GlobalConfig();
     final lastIndex =
@@ -1137,7 +1145,7 @@ class TableMetaManager {
             lastNonGlobalDirIndex: dirIndex,
             lastNonGlobalDirEntries: entriesInDir,
           );
-    await _dataStore.saveGlobalConfig(updated);
+    await _dataStore.saveGlobalConfig(updated, persist: persist);
   }
 
   /// Load [TableMeta] by stable uid - the single entry for meta / routing.
@@ -1833,6 +1841,7 @@ class TableMetaManager {
   }
 
   Future<void> _doLoadAllTableMetaAsync() async {
+    if (_nameInventoryReady && _nameByUid.isNotEmpty) return;
     final yieldController =
         YieldController('TableMetaManager.loadAllTableMetaAsync');
     try {

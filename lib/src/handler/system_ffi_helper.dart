@@ -97,7 +97,7 @@ class SystemFfiHelper {
     return 0;
   }
 
-  static int _getWindowsDiskFreeSpace(String path) {
+  static int _getWindowsDiskFreeSpace(String rawPath) {
     if (_kernel32 == null) return 0;
     final func = _kernel32!.lookupFunction<
         Int32 Function(
@@ -105,17 +105,46 @@ class SystemFfiHelper {
         int Function(Pointer<Utf16>, Pointer<Uint64>, Pointer<Uint64>,
             Pointer<Uint64>)>('GetDiskFreeSpaceExW');
 
-    final pathPtr = path.toNativeUtf16();
     final freeAvailable = calloc<Uint64>();
     final totalBytes = calloc<Uint64>();
     final totalFree = calloc<Uint64>();
 
     try {
-      if (func(pathPtr, freeAvailable, totalBytes, totalFree) != 0) {
-        return (freeAvailable.value / (1024 * 1024)).round();
+      final normalized = rawPath.replaceAll('/', '\\').trim();
+      final candidates = <String>[];
+      if (normalized.isNotEmpty) {
+        candidates.add(normalized);
+        // Extract drive root, e.g. "E:\" or "C:\"
+        final driveMatch = RegExp(r'^[a-zA-Z]:\\?').firstMatch(normalized);
+        if (driveMatch != null) {
+          final drive = driveMatch.group(0)!;
+          final root = drive.endsWith('\\') ? drive : '$drive\\';
+          if (!candidates.contains(root)) {
+            candidates.add(root);
+          }
+        }
       }
+
+      for (final cand in candidates) {
+        final pathPtr = cand.toNativeUtf16();
+        try {
+          if (func(pathPtr, freeAvailable, totalBytes, totalFree) != 0) {
+            final mb = (freeAvailable.value / (1024 * 1024)).round();
+            if (mb > 0) return mb;
+          }
+        } finally {
+          calloc.free(pathPtr);
+        }
+      }
+
+      // Final fallback: pass nullptr (uses current drive)
+      if (func(nullptr, freeAvailable, totalBytes, totalFree) != 0) {
+        final mb = (freeAvailable.value / (1024 * 1024)).round();
+        if (mb > 0) return mb;
+      }
+    } catch (_) {
+      // Ignore
     } finally {
-      calloc.free(pathPtr);
       calloc.free(freeAvailable);
       calloc.free(totalBytes);
       calloc.free(totalFree);
