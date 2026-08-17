@@ -137,7 +137,7 @@ await db.removeValue('current_user');
 
 > [!TIP]
 > **Benötigen Sie weitere Key-Value-Funktionen?**
-> Für fortgeschrittene Operationen wie typsicheres Lesen (`getInt`, `getBool`), atomares Inkrementieren, Präfixsuche und Key-Space-Exploration lesen Sie bitte [**Fortgeschrittene Key-Value-Operationen (db.kv)**](#kv-advanced).
+> Für fortgeschrittene Operationen wie typsicheres Lesen (`getInt`, `getBool`), atomares Inkrementieren, Präfixsuche, **verkettete paginierte Datensatzabfragen** (`db.kv.query()`) und Key-Space-Exploration lesen Sie bitte [**Fortgeschrittene Key-Value-Operationen (db.kv)**](#kv-advanced).
 
 #### Beispiel für die automatische Aktualisierung der Flutter-Benutzeroberfläche
 In Flutter erhalten Sie mit `StreamBuilder` plus `watchValue` einen sehr prägnanten reaktiven Aktualisierungsfluss:
@@ -481,7 +481,7 @@ ToStore bietet eine Vielzahl erweiterter Funktionen für komplexe Geschäftsszen
 
 ### <a id="kv-advanced"></a>Fortgeschrittene Key-Value-Operationen (db.kv)
 
-Für komplexere Key-Value-Szenarien wird empfohlen, den Namespace `db.kv` zu verwenden. Er bietet einen vollständigen Satz von APIs mit Speicherplatzisolierung, globaler Freigabe und mehreren Datentypen.
+Für komplexere Key-Value-Szenarien wird empfohlen, den Namespace `db.kv` zu verwenden. Er bietet einen vollständigen Satz von APIs mit Speicherplatzisolierung, globaler Freigabe, mehreren Datentypen sowie verketteten komplexen Abfragen und Filtern (z. B. `db.kv.query().prefix(...).orderBy...().limit(...)` für Paginierung, Sortierung, Ablauf-Filter usw.).
 
 - **Grundlegender Zugriff (Basic Access)**
   ```dart
@@ -527,10 +527,78 @@ Für komplexere Key-Value-Szenarien wird empfohlen, den Namespace `db.kv` zu ver
   await db.kv.setIncrement('stock_count', amount: -5);
   ```
 
+- **Verkettete Datensatzabfragen (db.kv.query)**
+  Verkettete API ähnlich zu `db.query()` zum Abfragen von Key-Value-**Datensätzen** (inkl. dekodiertem `value`) mit Paginierung. Im Gegensatz zu `getKeys` (nur Schlüsselnamen) liefert dies vollständige Datensätze.
+
+
+  ```dart
+  // Erste Seite: nach Präfix filtern, nach Update-Zeit absteigend, 20 pro Seite
+  final page = await db.kv.query()
+      .prefix('setting_')
+      .orderByUpdatedAtDesc() // oder orderByKeyAsc / orderByKeyDesc / orderByUpdatedAtAsc
+      .limit(20);
+
+  for (final record in page.data) {
+    // record enthält: key, value, updated_at, expires_at
+    print('${record['key']} = ${record['value']}');
+  }
+
+  // Empfohlen: mit next() / prev() blättern (wie bei Tabellenabfragen, am einfachsten)
+  if (page.hasMore) {
+    final page2 = await page.next();
+    print('Nächste Seite: ${page2.data.length}');
+    if (page2.hasPrev) {
+      final back = await page2.prev();
+      print('Vorherige Seite: ${back.data.length}');
+    }
+  }
+
+  // Offset-Paginierung (schließt sich mit cursor aus; für tiefes Blättern besser next() oben)
+  final byOffset = await db.kv.query()
+      .orderByKeyAsc()
+      .limit(20)
+      .offset(20);
+
+  // Gesamtzahl der Treffer (ohne prefix: O(1)-Metadatenstatistik)
+  final total = await db.kv.query().prefix('setting_').count();
+
+  // Ersten Treffer holen
+  final first = await db.kv.query().prefix('setting_').orderByKeyAsc().first();
+
+  // Globaler KV-Bereich
+  final globalPage = await db.kv.query(isGlobal: true).limit(50);
+
+  // Standardmäßig werden abgelaufene Datensätze ausgefiltert; für noch nicht bereinigte:
+  final withExpired = await db.kv.query()
+      .includeExpired()
+      .limit(20);
+  ```
+
+  Häufige Kettenmethoden:
+
+  | Methode | Beschreibung |
+  | --- | --- |
+  | `prefix(String)` | Nach Key-Präfix filtern |
+  | `orderByKeyAsc` / `orderByKeyDesc` | Nach Key (Primärschlüssel) sortieren |
+  | `orderByUpdatedAtAsc` / `orderByUpdatedAtDesc` | Nach `updated_at` sortieren |
+  | `limit(n)` | Max. Einträge pro Seite (explizit angeben empfohlen) |
+  | `offset(n)` | Offset-Paginierung (löscht cursor) |
+  | `cursor(token)` | Nur Sonderfälle: Paginierungs-Token über Prozesse/Netzwerke |
+  | `includeExpired([true])` | Abgelaufene, noch nicht bereinigte Datensätze einschließen |
+  | `count()` | Treffer zählen |
+  | `first()` | Ersten Datensatz zurückgeben (ändert limit des Builders nicht) |
+
+  Abfrageergebnis `QueryResult`: Alltagspaginierung mit `hasMore` / `hasPrev` + `next()` / `prev()`; `nextCursorToken` / `prevCursorToken` nur für client-/server- oder netzwerkübergreifende Übertragung u. Ä. (wie bei Tabellenabfragen).
+
 - **Erkundung & Verwaltung (Discovery & Management)**
   ```dart
-  // Alle Schlüssel abrufen, die mit 'setting_' beginnen
+  // Nur Schlüsselnamen auflisten (ohne value); optional prefix / limit / offset
   final keys = await db.kv.getKeys(prefix: 'setting_');
+  final pageKeys = await db.kv.getKeys(
+    prefix: 'setting_',
+    limit: 100,
+    offset: 0,
+  );
 
   // Gesamtzahl der Schlüssel im aktuellen Bereich zählen
   final count = await db.kv.count();
@@ -963,10 +1031,10 @@ if (page1.hasMore) {
 ```
 
 ##### Fortgeschrittenes Szenario: Zustandlose Token-basierte Cursor-Paginierung (Token-based Cursor)
-Wenn Sie Client-Server-APIs entwickeln oder den Paginierungsstatus über Prozesse oder Netzwerke hinweg serialisieren müssen, können Sie Cursor-Token verwenden.
+Für die Alltagspaginierung in der App bevorzugen Sie die oben genannten `next()` / `prev()`. Cursor-Token nur bei Client-Server-APIs oder wenn der Paginierungsstatus über Prozesse/Netzwerke serialisiert werden muss:
 * Die erste Abfrage gibt die Token-Strings `nextCursorToken` und `prevCursorToken` zurück.
 * Die nachfolgende Abfrage übergibt das Token über `.cursor(token)` für eine gezielte Positionierung (Seek).
-* **Hinweis**: `cursor` und `offset` schließen sich gegenseitig aus. Der Aufruf von `cursor()` löscht automatisch einen zuvor gesetzten `offset` und umgekehrt.
+* **Hinweis**: `cursor` und `offset` schließen sich gegenseitig aus; das Setzen des einen löscht das andere.
 
 ```dart
 // Erste Abfrage (z. B. auf der API-Serverseite)

@@ -6949,8 +6949,20 @@ class DataStoreImpl {
     return _decodeStoredKeyValue(row[_kvValueField], key: key);
   }
 
-  /// Get all keys in the specified space, optionally filtered by prefix.
-  Future<List<String>> getKeys({String? prefix, bool isGlobal = false}) async {
+  /// Get key names in the specified space, optionally filtered by prefix.
+  ///
+  /// This enumerates key **names** only -- it does not return values.
+  /// To query key-value records with pagination/cursors, use [KvStore.query].
+  ///
+  /// When [limit] is omitted, [DataStoreConfig.defaultQueryLimit] applies
+  /// (and may warn if results are truncated). Pass an explicit [limit] for
+  /// bounded scans.
+  Future<List<String>> getKeys({
+    String? prefix,
+    int? limit,
+    int? offset,
+    bool isGlobal = false,
+  }) async {
     await ensureInitialized();
     final tableName = SystemTable.getKeyValueName(isGlobal);
     final table = await getTableContext(tableName);
@@ -6962,6 +6974,9 @@ class DataStoreImpl {
     final rows = (await queryExecutor.execute(
       table,
       condition: condition,
+      orderBy: [_kvKeyField],
+      limit: limit,
+      offset: offset,
     ))
         .records;
     final now = DateTime.now();
@@ -7427,6 +7442,29 @@ class DataStoreImpl {
           rawError: e);
       return rawValue;
     }
+  }
+
+  /// Map a raw KV store row to a user-facing record with decoded [value].
+  Map<String, dynamic> mapUserFacingKvRecord(Map<String, dynamic> row) {
+    final key = row[_kvKeyField]?.toString() ?? '';
+    return <String, dynamic>{
+      _kvKeyField: key,
+      _kvValueField: _decodeStoredKeyValue(row[_kvValueField], key: key),
+      _kvUpdatedAtField: row[_kvUpdatedAtField],
+      _kvExpiresAtField: row[_kvExpiresAtField],
+    };
+  }
+
+  /// Whether a raw KV row is past its [expires_at] (used by [KvQueryBuilder]).
+  bool isKvRecordExpired(Map<String, dynamic> row, {DateTime? now}) {
+    return _isKvRowExpired(row, now: now);
+  }
+
+  /// Schedule lazy cleanup for an expired raw KV row (used by [KvQueryBuilder]).
+  void scheduleExpiredKvCleanup(TableContext table, Map<String, dynamic> row) {
+    final key = row[_kvKeyField]?.toString();
+    if (key == null || key.isEmpty) return;
+    _scheduleExactExpiredKvCleanup(table, key, row[_kvExpiresAtField]);
   }
 
   /// get table schema by name (user-facing entry point)

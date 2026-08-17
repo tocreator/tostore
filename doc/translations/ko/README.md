@@ -137,7 +137,7 @@ await db.removeValue('current_user');
 
 > [!TIP]
 > **더 많은 키-값 기능이 필요하십니까?**
-> 타입 안정성이 보장된 읽기(`getInt`, `getBool`), 원자적 증가, 접두사 검색, 키 공간 탐색 등 고급 작업은 [**키-값 고급 작업 (db.kv)**](#kv-advanced)을 참조하십시오.
+> 타입 안정성이 보장된 읽기(`getInt`, `getBool`), 원자적 증가, 접두사 검색, **체이닝 페이지 단위 레코드 쿼리**(`db.kv.query()`) 등 고급 작업은 [**키-값 고급 작업 (db.kv)**](#kv-advanced)을 참조하십시오.
 
 #### Flutter UI 자동 새로고침 예시
 Flutter에서 `StreamBuilder`과 `watchValue`은 매우 간결한 반응형 새로 고침 흐름을 제공합니다.
@@ -481,9 +481,7 @@ ToStore는 복잡한 비즈니스 시나리오를 위한 풍부한 고급 기능
 
 ### <a id="kv-advanced"></a>키-값 고급 작업 (db.kv)
 
-### <a id="kv-advanced"></a>키-값 고급 작업 (db.kv)
-
-더 복잡한 Key-Value 시나리오의 경우 `db.kv` 네임스페이스를 사용하는 것이 좋습니다. 공간 격리, 글로벌 공유 및 다양한 데이터 타입을 지원하는 완전한 API 세트를 제공합니다.
+더 복잡한 Key-Value 시나리오의 경우 `db.kv` 네임스페이스를 사용하는 것이 좋습니다. 공간 격리, 글로벌 공유, 다양한 데이터 타입, 그리고 체이닝 복합 쿼리/필터(예: `db.kv.query().prefix(...).orderBy...().limit(...)`로 페이지 매김, 정렬, 만료 필터 등)를 지원하는 완전한 API 세트를 제공합니다.
 
 - **기본 액세스 (Basic Access)**
   ```dart
@@ -529,10 +527,78 @@ ToStore는 복잡한 비즈니스 시나리오를 위한 풍부한 고급 기능
   await db.kv.setIncrement('stock_count', amount: -5);
   ```
 
+- **체이닝 레코드 쿼리 (db.kv.query)**
+  `db.query()`와 유사한 체이닝 API로, 키-값**레코드**(디코딩된 `value` 포함)를 조회하며 페이지 매김을 지원합니다. `getKeys`(키 이름만)와 달리 전체 레코드를 반환합니다.
+
+
+  ```dart
+  // 첫 페이지: 접두사 필터, 업데이트 시간 내림차순, 페이지당 20건
+  final page = await db.kv.query()
+      .prefix('setting_')
+      .orderByUpdatedAtDesc() // 또는 orderByKeyAsc / orderByKeyDesc / orderByUpdatedAtAsc
+      .limit(20);
+
+  for (final record in page.data) {
+    // record 포함: key, value, updated_at, expires_at
+    print('${record['key']} = ${record['value']}');
+  }
+
+  // 권장: next() / prev()로 페이지 이동(테이블 쿼리와 동일, 가장 간편)
+  if (page.hasMore) {
+    final page2 = await page.next();
+    print('다음 페이지: ${page2.data.length}');
+    if (page2.hasPrev) {
+      final back = await page2.prev();
+      print('이전 페이지: ${back.data.length}');
+    }
+  }
+
+  // Offset 페이지 매김(cursor와 상호 배타; 깊은 페이지 이동에는 위의 next() 권장)
+  final byOffset = await db.kv.query()
+      .orderByKeyAsc()
+      .limit(20)
+      .offset(20);
+
+  // 조건에 맞는 레코드 총개수(prefix 없으면 O(1) 메타데이터 집계)
+  final total = await db.kv.query().prefix('setting_').count();
+
+  // 첫 번째 일치 레코드 가져오기
+  final first = await db.kv.query().prefix('setting_').orderByKeyAsc().first();
+
+  // 전역 KV 공간
+  final globalPage = await db.kv.query(isGlobal: true).limit(50);
+
+  // 기본은 만료된 레코드를 제외; 아직 정리되지 않은 만료 항목을 포함할 때:
+  final withExpired = await db.kv.query()
+      .includeExpired()
+      .limit(20);
+  ```
+
+  자주 쓰는 체이닝 메서드:
+
+  | 메서드 | 설명 |
+  | --- | --- |
+  | `prefix(String)` | key 접두사로 필터 |
+  | `orderByKeyAsc` / `orderByKeyDesc` | key(기본 키)로 정렬 |
+  | `orderByUpdatedAtAsc` / `orderByUpdatedAtDesc` | `updated_at`으로 정렬 |
+  | `limit(n)` | 페이지당 최대 건수(항상 명시 권장) |
+  | `offset(n)` | 오프셋 페이지 매김(cursor 제거) |
+  | `cursor(token)` | 특수 시나리오 전용: 프로세스/네트워크로 페이지 Token 전달 |
+  | `includeExpired([true])` | 만료되었으나 아직 정리되지 않은 레코드 포함 여부 |
+  | `count()` | 일치 건수 집계 |
+  | `first()` | 첫 번째 레코드 반환(원본 builder의 limit에 영향 없음) |
+
+  쿼리 결과 `QueryResult`: 일상적인 페이지 이동은 `hasMore` / `hasPrev` + `next()` / `prev()`; `nextCursorToken` / `prevCursorToken`은 크로스엔드 전송 등 특수 시나리오용(사용법은 테이블 쿼리와 동일).
+
 - **키 공간 탐색 및 관리 (Discovery & Management)**
   ```dart
-  // 'setting_'으로 시작하는 모든 키 가져오기
+  // 키 이름만 열거(value 미포함); 선택적으로 prefix / limit / offset
   final keys = await db.kv.getKeys(prefix: 'setting_');
+  final pageKeys = await db.kv.getKeys(
+    prefix: 'setting_',
+    limit: 100,
+    offset: 0,
+  );
 
   // 현재 공간의 총 키-값 쌍 개수 확인
   final count = await db.kv.count();
@@ -965,10 +1031,11 @@ if (page1.hasMore) {
 ```
 
 ##### 고급 시나리오: 무상태 토큰 페이지 매김 (Token-based Cursor)
-클라이언트-서버 간 API 개발을 진행하거나, 프로세스 또는 네트워크 전송 간에 페이지 매김 상태를 직렬화해야 하는 경우 커서 토큰을 사용할 수 있습니다.
-* 첫 번째 쿼리는 `nextCursorToken` 및 `prevCursorToken` 문자열을 반환합니다.
-* 다음 쿼리 시 `.cursor(token)`을 통해 토큰을 전달하여 탐색(seek)합니다.
-* **주의**: `cursor`와 `offset`은 상호 배타적인 매개변수입니다. `cursor()`를 호출하면 기존에 설정된 `offset`이 자동으로 초기화되며, 반대도 마찬가지입니다.
+일상적인 앱 내 페이지 이동에는 위의 `next()` / `prev()`를 우선 사용하십시오. 커서 토큰은 클라이언트-서버 API 또는 프로세스/네트워크 간에 페이지 매김 상태를 직렬화해야 할 때만 사용합니다:
+* 첫 번째 쿼리는 `nextCursorToken` / `prevCursorToken` 문자열을 반환합니다.
+* 다음 쿼리에서 `.cursor(token)`으로 토큰을 전달하여 seek합니다.
+* **주의**: `cursor`와 `offset`은 상호 배타적입니다. 하나를 설정하면 다른 쪽이 지워집니다.
+
 
 ```dart
 // 초기 쿼리 (예: API 서버 측)

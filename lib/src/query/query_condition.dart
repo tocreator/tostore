@@ -642,9 +642,15 @@ class QueryCondition {
     return where(field, 'NOT LIKE', '%$value%');
   }
 
-  /// Starts with condition
+  /// Starts with condition (literal prefix; `%` / `_` in [prefix] are escaped).
+  ///
+  /// Still emitted as a `LIKE` predicate so query plans/results stay consistent.
+  /// Engine path can push a simple escaped prefix LIKE down to a PK/index range.
   QueryCondition whereStartsWith(String field, String prefix) {
-    return where(field, 'LIKE', '$prefix%');
+    if (prefix.isEmpty) {
+      return where(field, 'LIKE', '%');
+    }
+    return where(field, 'LIKE', '${ValueMatcher.escapeLikeLiteral(prefix)}%');
   }
 
   /// Ends with condition

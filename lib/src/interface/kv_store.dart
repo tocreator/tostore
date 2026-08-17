@@ -1,8 +1,9 @@
 import 'dart:async';
 
+import '../chain/kv_query_builder.dart';
+import '../core/data_store_impl.dart';
 import '../model/db_result.dart';
 import '../model/system_table.dart';
-import '../core/data_store_impl.dart';
 
 /// Namespace for Key-Value storage operations.
 /// 键值对存储操作命名空间。
@@ -14,6 +15,29 @@ class KvStore {
   /// Get the table name for KV storage.
   /// 获取键值对存储的表名。
   String _getTableName(bool isGlobal) => SystemTable.getKeyValueName(isGlobal);
+
+  /// Query key-value **records** with chain filters and pagination.
+  ///
+  /// Returns decoded records (`key`, `value`, `updated_at`, `expires_at`).
+  /// Prefer [QueryResult.next] / [QueryResult.prev] for paging (same as
+  /// `db.query()`). Use `nextCursorToken` / `.cursor(token)` only when
+  /// transferring pagination state across processes or over the network.
+  ///
+  /// 链式查询键值**记录**（含 value），支持 limit / offset 与 `next()`/`prev()` 翻页。
+  ///
+  /// Example:
+  /// ```dart
+  /// final page = await db.kv.query(isGlobal: true)
+  ///     .prefix('demo_')
+  ///     .orderByUpdatedAtDesc()
+  ///     .limit(20);
+  /// if (page.hasMore) {
+  ///   final page2 = await page.next();
+  /// }
+  /// ```
+  KvQueryBuilder query({bool isGlobal = false}) {
+    return KvQueryBuilder(_db, isGlobal: isGlobal);
+  }
 
   /// Set a key-value pair.
   /// 设置一个键值对。
@@ -176,18 +200,32 @@ class KvStore {
     return null;
   }
 
-  /// Get all keys in the specified space, optionally filtered by prefix.
-  /// 获取指定空间中的所有键，可选择按前缀过滤。
+  /// Enumerate key **names** in the specified space (does not return values).
+  ///
+  /// Optionally filter by [prefix]. Use [limit] / [offset] for bounded scans;
+  /// when [limit] is omitted, [DataStoreConfig.defaultQueryLimit] applies.
+  ///
+  /// To query key-value records with cursors and sorting, use [query] instead.
+  ///
+  /// 枚举键名（不含 value）。需要查记录并翻页/排序时请用 [query]。
   ///
   /// Parameters:
   /// - [prefix]: Optional prefix to filter keys.
+  /// - [limit]: Optional max number of keys to return.
+  /// - [offset]: Optional offset for key-name pagination.
   /// - [isGlobal]: Whether to scan the global space.
-  ///
-  /// 参数说明：
-  /// - [prefix]: 可选的键前缀过滤条件。
-  /// - [isGlobal]: 是否在全局空间中扫描。
-  Future<List<String>> getKeys({String? prefix, bool isGlobal = false}) {
-    return _db.getKeys(prefix: prefix, isGlobal: isGlobal);
+  Future<List<String>> getKeys({
+    String? prefix,
+    int? limit,
+    int? offset,
+    bool isGlobal = false,
+  }) {
+    return _db.getKeys(
+      prefix: prefix,
+      limit: limit,
+      offset: offset,
+      isGlobal: isGlobal,
+    );
   }
 
   /// Check if a key exists and is not expired.

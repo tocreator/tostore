@@ -1701,14 +1701,7 @@ class QueryExecutor {
   }
 
   bool _isPrefixLikePattern(String pattern) {
-    if (pattern.isEmpty || !pattern.endsWith('%')) {
-      return false;
-    }
-    if (pattern.startsWith('%') || pattern.startsWith('_')) {
-      return false;
-    }
-    final wildcardIndex = pattern.indexOf('%');
-    return wildcardIndex == pattern.length - 1 && !pattern.contains('_');
+    return ValueMatcher.isOptimizablePrefixLikePattern(pattern);
   }
 
   IndexFieldCondition? _parseIndexFieldCondition(String field, dynamic raw) {

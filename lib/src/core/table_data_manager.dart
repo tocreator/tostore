@@ -4723,6 +4723,10 @@ class TableDataManager {
     bool includeMax = true;
     bool pkCondIsIndexableRange = false;
 
+    // True when a PK LIKE was rewritten into an exact covering range
+    // (simple prefix `lit%` or exact `lit`, escape-aware).
+    bool pkLikeFullyCoveredByRange = false;
+
     if (pkCond != null) {
       // Range operators.
       if (pkCond.containsKey('>')) {
@@ -4746,20 +4750,81 @@ class TableDataManager {
         includeMin = true;
         includeMax = true;
       }
+
+      // Prefix / exact LIKE on PK -> byte-range (same idea as index prefix LIKE).
+      // Escape-aware: whereStartsWith emits \% \_ so keys with '_' stay literal.
+      final likePat = pkCond['LIKE'] ?? pkCond['like'];
+      if (likePat is String) {
+        final parsed = ValueMatcher.parseOptimizablePrefixLike(likePat);
+        if (parsed != null &&
+            (parsed.isExact || parsed.literalPrefix.isNotEmpty)) {
+          final lit = parsed.literalPrefix;
+          // Intersect with any existing range bounds using string compare via
+          // the PK matcher (native values).
+          void tightenMin(dynamic cand, {required bool inclusive}) {
+            if (rangeMin == null) {
+              rangeMin = cand;
+              includeMin = inclusive;
+              return;
+            }
+            final c = pkMatcher(cand, rangeMin);
+            if (c > 0) {
+              rangeMin = cand;
+              includeMin = inclusive;
+            } else if (c == 0) {
+              includeMin = includeMin && inclusive;
+            }
+          }
+
+          void tightenMax(dynamic cand, {required bool inclusive}) {
+            if (rangeMax == null) {
+              rangeMax = cand;
+              includeMax = inclusive;
+              return;
+            }
+            final c = pkMatcher(cand, rangeMax);
+            if (c < 0) {
+              rangeMax = cand;
+              includeMax = inclusive;
+            } else if (c == 0) {
+              includeMax = includeMax && inclusive;
+            }
+          }
+
+          if (parsed.isExact) {
+            tightenMin(lit, inclusive: true);
+            tightenMax(lit, inclusive: true);
+            pkLikeFullyCoveredByRange = true;
+          } else {
+            tightenMin(lit, inclusive: true);
+            final next = ValueMatcher.incrementUtf16Prefix(lit);
+            if (next != null) {
+              tightenMax(next, inclusive: false);
+              pkLikeFullyCoveredByRange = true;
+            } else {
+              // Cannot form exclusive upper bound; keep >= lit and post-filter.
+              pkLikeFullyCoveredByRange = false;
+            }
+          }
+        }
+      }
+
       pkCondIsIndexableRange = (rangeMin != null || rangeMax != null);
     }
 
     // Skip rematch only when every matcher predicate was pushed into the PK
-    // byte-range / checkRange bounds. LIKE/IN/!=/OR/non-PK still need rowMatches.
-    // (Do NOT use "PK-only fields" alone -- that broke getKeys(prefix:).)
+    // byte-range / checkRange bounds. IN/!=/OR/non-PK/non-prefix LIKE still
+    // need rowMatches. (Do NOT use "PK-only fields" alone.)
     bool matcherFullyCoveredByPkRangePushdown() {
       if (matcher == null) return true;
       if (hasOr) return false;
       if (matcher.fields.any((f) => f != primaryKey)) return false;
       if (pkCond == null || !pkCondIsIndexableRange) return false;
-      const coveredOps = {'>', '>=', '<', '<=', 'BETWEEN'};
+      const coveredOps = {'>', '>=', '<', '<=', 'BETWEEN', 'LIKE'};
       for (final op in pkCond.keys) {
-        if (!coveredOps.contains(op.toUpperCase())) return false;
+        final up = op.toUpperCase();
+        if (!coveredOps.contains(up)) return false;
+        if (up == 'LIKE' && !pkLikeFullyCoveredByRange) return false;
       }
       return true;
     }

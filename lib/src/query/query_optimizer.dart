@@ -1,6 +1,7 @@
 import 'dart:math';
 
 import '../handler/logger.dart';
+import '../handler/value_matcher.dart';
 import '../core/data_store_impl.dart';
 import '../model/table_context.dart';
 import '../model/table_schema.dart';
@@ -249,12 +250,7 @@ class QueryOptimizer {
     }
 
     bool isPrefixLike(String pattern) {
-      if (pattern.isEmpty) return false;
-      // Must start with literal
-      if (pattern.startsWith('%')) return false;
-      if (pattern.startsWith('_')) return false;
-      // We can optimize anything with a fixed prefix
-      return true;
+      return ValueMatcher.isOptimizablePrefixLikePattern(pattern);
     }
 
     bool isEqualityOrIn(dynamic v) {
@@ -681,11 +677,7 @@ class QueryOptimizer {
     }
 
     bool isPrefixLike(String pattern) {
-      if (pattern.isEmpty) return false;
-      if (!pattern.endsWith('%')) return false;
-      if (pattern.startsWith('%')) return false;
-      if (pattern.contains('_')) return false;
-      return pattern.indexOf('%') == pattern.length - 1;
+      return ValueMatcher.isOptimizablePrefixLikePattern(pattern);
     }
 
     double eqSel(String field) {

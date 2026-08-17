@@ -137,7 +137,7 @@ await db.removeValue('current_user');
 
 > [!TIP]
 > **Besoin de plus de fonctionnalités clé-valeur ?**
-> Pour les opérations avancées telles que la lecture sécurisée des types (`getInt`, `getBool`), l'incrémentation atomique, la recherche par préfixe et l'exploration de l'espace de clés, veuillez consulter [**Opérations clé-valeur avancées (db.kv)**](#kv-advanced).
+> Pour les opérations avancées telles que la lecture sécurisée des types (`getInt`, `getBool`), l'incrémentation atomique, la recherche par préfixe, les **requêtes chaînées paginées d'enregistrements** (`db.kv.query()`) et l'exploration de l'espace de clés, veuillez consulter [**Opérations clé-valeur avancées (db.kv)**](#kv-advanced).
 
 #### Exemple d'actualisation automatique de l'interface utilisateur Flutter
 Dans Flutter, `StreamBuilder` plus `watchValue` vous offre un flux de rafraîchissement réactif très concis :
@@ -481,7 +481,7 @@ ToStore fournit un riche ensemble de fonctionnalités avancées pour des scénar
 
 ### <a id="kv-advanced"></a>Opérations avancées Clé-Valeur (db.kv)
 
-Pour des scénarios Clé-Valeur plus complexes, il est recommandé d'utiliser l'espace de noms `db.kv`. Il fournit un ensemble complet d'API avec isolation d'espace, partage global et plusieurs types de données.
+Pour des scénarios Clé-Valeur plus complexes, il est recommandé d'utiliser l'espace de noms `db.kv`. Il fournit un ensemble complet d'API avec isolation d'espace, partage global, plusieurs types de données, ainsi que des requêtes et filtres complexes chaînés (par ex. `db.kv.query().prefix(...).orderBy...().limit(...)` pour la pagination, le tri, le filtrage d'expiration, etc.).
 
 - **Accès de base (Basic Access)**
   ```dart
@@ -527,10 +527,78 @@ Pour des scénarios Clé-Valeur plus complexes, il est recommandé d'utiliser l'
   await db.kv.setIncrement('stock_count', amount: -5);
   ```
 
+- **Requêtes chaînées d'enregistrements (db.kv.query)**
+  API chaînée similaire à `db.query()` pour interroger des **enregistrements** clé-valeur (avec `value` décodé) et prendre en charge la pagination. Contrairement à `getKeys` (noms de clés uniquement), cela renvoie des enregistrements complets.
+
+
+  ```dart
+  // Première page : filtrer par préfixe, trier par updated_at décroissant, 20 par page
+  final page = await db.kv.query()
+      .prefix('setting_')
+      .orderByUpdatedAtDesc() // ou orderByKeyAsc / orderByKeyDesc / orderByUpdatedAtAsc
+      .limit(20);
+
+  for (final record in page.data) {
+    // record contient : key, value, updated_at, expires_at
+    print('${record['key']} = ${record['value']}');
+  }
+
+  // Recommandé : paginer avec next() / prev() (comme les requêtes de table, le plus simple)
+  if (page.hasMore) {
+    final page2 = await page.next();
+    print('Page suivante : ${page2.data.length}');
+    if (page2.hasPrev) {
+      final back = await page2.prev();
+      print('Page précédente : ${back.data.length}');
+    }
+  }
+
+  // Pagination par offset (exclut cursor ; pour le deep paging préférer next() ci-dessus)
+  final byOffset = await db.kv.query()
+      .orderByKeyAsc()
+      .limit(20)
+      .offset(20);
+
+  // Nombre total d'enregistrements correspondants (sans prefix : stats métadonnées O(1))
+  final total = await db.kv.query().prefix('setting_').count();
+
+  // Récupérer le premier enregistrement correspondant
+  final first = await db.kv.query().prefix('setting_').orderByKeyAsc().first();
+
+  // Espace KV global
+  final globalPage = await db.kv.query(isGlobal: true).limit(50);
+
+  // Par défaut les expirés sont filtrés ; pour inclure ceux non encore nettoyés :
+  final withExpired = await db.kv.query()
+      .includeExpired()
+      .limit(20);
+  ```
+
+  Méthodes chaînées courantes :
+
+  | Méthode | Description |
+  | --- | --- |
+  | `prefix(String)` | Filtrer par préfixe de key |
+  | `orderByKeyAsc` / `orderByKeyDesc` | Trier par key (clé primaire) |
+  | `orderByUpdatedAtAsc` / `orderByUpdatedAtDesc` | Trier par `updated_at` |
+  | `limit(n)` | Nombre max d'éléments par page (à spécifier explicitement de préférence) |
+  | `offset(n)` | Pagination par décalage (efface cursor) |
+  | `cursor(token)` | Cas spéciaux uniquement : jeton de pagination inter-processus/réseau |
+  | `includeExpired([true])` | Inclure les enregistrements expirés non encore nettoyés |
+  | `count()` | Compter les correspondances |
+  | `first()` | Renvoyer le premier enregistrement (n'altère pas le limit du builder) |
+
+  Résultat `QueryResult` : pour la pagination courante, utiliser `hasMore` / `hasPrev` + `next()` / `prev()` ; `nextCursorToken` / `prevCursorToken` uniquement pour le transfert cross-end, etc. (comme les requêtes de table).
+
 - **Découverte & Gestion (Discovery & Management)**
   ```dart
-  // Obtenir toutes les clés commençant par 'setting_'
+  // Énumérer uniquement les noms de clés (sans value) ; prefix / limit / offset optionnels
   final keys = await db.kv.getKeys(prefix: 'setting_');
+  final pageKeys = await db.kv.getKeys(
+    prefix: 'setting_',
+    limit: 100,
+    offset: 0,
+  );
 
   // Compter le nombre total de clés dans l'espace actuel
   final count = await db.kv.count();
@@ -548,7 +616,7 @@ Pour des scénarios Clé-Valeur plus complexes, il est recommandé d'utiliser l'
   // Obtenir la durée restante
   Duration? ttl = await db.kv.getTtl('token');
 
-  // Mettre à jour le TTL pour una clé existante (expire dans 7 jours)
+  // Mettre à jour le TTL pour une clé existante (expire dans 7 jours)
   await db.kv.setTtl('token', Duration(days: 7));
   ```
 
@@ -963,10 +1031,10 @@ if (page1.hasMore) {
 ```
 
 ##### Scénario avancé : Pagination par jeton sans état (Token-based Cursor)
-Si vous développez des API client-serveur ou si vous devez sérialiser l'état de la pagination entre des processus ou sur un réseau, vous pouvez utiliser des jetons de curseur (tokens).
+Pour la pagination courante dans l'app, préférez `next()` / `prev()` ci-dessus. Utilisez les jetons de curseur uniquement pour les API client-serveur ou lors de la sérialisation de l'état de pagination entre processus/réseaux :
 * La requête initiale renvoie les chaînes de jetons `nextCursorToken` et `prevCursorToken`.
 * La requête suivante transmet le jeton via `.cursor(token)` pour se positionner directement (seek).
-* **Remarque** : `cursor` et `offset` sont mutuellement exclusifs. Appeler `cursor()` effacera automatiquement tout `offset` défini, et vice-versa.
+* **Remarque** : `cursor` et `offset` sont mutuellement exclusifs ; en définir un efface l'autre.
 
 ```dart
 // Requête initiale (par exemple, côté serveur API)

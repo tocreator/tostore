@@ -137,7 +137,7 @@ await db.removeValue('current_user');
 
 > [!TIP]
 > **Precisa de mais recursos de valor-chave?**
-> Para operações avançadas, como leitura segura de tipos (`getInt`, `getBool`), incremento atômico, pesquisa de prefixo e exploração de espaço de chave, consulte [**Operações avançadas de valor-chave (db.kv)**](#kv-advanced).
+> Para operações avançadas, como leitura segura de tipos (`getInt`, `getBool`), incremento atômico, pesquisa de prefixo, **consultas encadeadas paginadas de registros** (`db.kv.query()`), consulte [**Operações avançadas de valor-chave (db.kv)**](#kv-advanced).
 
 #### Exemplo de atualização automática da interface do Flutter
 No Flutter, `StreamBuilder` mais `watchValue` oferece um fluxo de atualização reativa muito conciso:
@@ -480,7 +480,7 @@ ToStore fornece um rico conjunto de recursos avançados para cenários de negóc
 
 ### <a id="kv-advanced"></a>Operações Avançadas de Valor-Chave (db.kv)
 
-Para cenários de valor-chave mais complexos, recomenda-se usar o namespace `db.kv`. Ele fornece um conjunto completo de APIs com isolamento de espaço, compartilhamento global e diversos tipos de dados.
+Para cenários de valor-chave mais complexos, recomenda-se usar o namespace `db.kv`. Ele fornece um conjunto completo de APIs com isolamento de espaço, compartilhamento global, diversos tipos de dados, e consultas/filtros complexos encadeados (ex.: `db.kv.query().prefix(...).orderBy...().limit(...)` para paginação, ordenação, filtro de expiração etc.).
 
 - **Acesso Básico (Basic Access)**
   ```dart
@@ -526,10 +526,78 @@ Para cenários de valor-chave mais complexos, recomenda-se usar o namespace `db.
   await db.kv.setIncrement('stock_count', amount: -5);
   ```
 
+- **Consulta encadeada de registros (db.kv.query)**
+  API encadeada semelhante a `db.query()`, para consultar **registros** chave-valor (incluindo o `value` decodificado), com suporte a paginação. Diferente de `getKeys` (apenas nomes de chave), isto retorna registros completos.
+
+
+  ```dart
+  // Página inicial: filtrar por prefixo, ordenar por data de atualização desc, 20 por página
+  final page = await db.kv.query()
+      .prefix('setting_')
+      .orderByUpdatedAtDesc() // ou orderByKeyAsc / orderByKeyDesc / orderByUpdatedAtAsc
+      .limit(20);
+
+  for (final record in page.data) {
+    // record contém: key, value, updated_at, expires_at
+    print('${record['key']} = ${record['value']}');
+  }
+
+  // Recomendado: paginar com next() / prev() (igual às consultas de tabela, mais simples)
+  if (page.hasMore) {
+    final page2 = await page.next();
+    print('Próxima página: ${page2.data.length}');
+    if (page2.hasPrev) {
+      final back = await page2.prev();
+      print('Página anterior: ${back.data.length}');
+    }
+  }
+
+  // Paginação por Offset (mutuamente exclusiva com cursor; para páginas profundas prefira next() acima)
+  final byOffset = await db.kv.query()
+      .orderByKeyAsc()
+      .limit(20)
+      .offset(20);
+
+  // Total de registros que correspondem (sem prefix é agregação de metadados O(1))
+  final total = await db.kv.query().prefix('setting_').count();
+
+  // Obter o primeiro registro correspondente
+  final first = await db.kv.query().prefix('setting_').orderByKeyAsc().first();
+
+  // Espaço KV global
+  final globalPage = await db.kv.query(isGlobal: true).limit(50);
+
+  // Por padrão filtra registros expirados; para incluir expirados ainda não limpos:
+  final withExpired = await db.kv.query()
+      .includeExpired()
+      .limit(20);
+  ```
+
+  Métodos encadeados comuns:
+
+  | Método | Descrição |
+  | --- | --- |
+  | `prefix(String)` | Filtrar por prefixo da key |
+  | `orderByKeyAsc` / `orderByKeyDesc` | Ordenar por key (chave primária) |
+  | `orderByUpdatedAtAsc` / `orderByUpdatedAtDesc` | Ordenar por `updated_at` |
+  | `limit(n)` | Máximo de itens nesta página (recomendado especificar sempre) |
+  | `offset(n)` | Paginação por deslocamento (limpa o cursor) |
+  | `cursor(token)` | Apenas cenários especiais: passar Token de paginação entre processos/rede |
+  | `includeExpired([true])` | Incluir registros expirados ainda não limpos |
+  | `count()` | Contar itens correspondentes |
+  | `first()` | Retornar o primeiro registro (não afeta o limit do builder original) |
+
+  Resultado da consulta `QueryResult`: na paginação diária use `hasMore` / `hasPrev` + `next()` / `prev()`; `nextCursorToken` / `prevCursorToken` apenas para transmissão entre pontas e cenários especiais (uso igual às consultas de tabela).
+
 - **Exploração & Gerenciamento (Discovery & Management)**
   ```dart
-  // Obter todas as chaves que começam com 'setting_'
+  // Enumerar apenas nomes de chave (sem value); opcional prefix / limit / offset
   final keys = await db.kv.getKeys(prefix: 'setting_');
+  final pageKeys = await db.kv.getKeys(
+    prefix: 'setting_',
+    limit: 100,
+    offset: 0,
+  );
 
   // Contar o total de chaves no espaço atual
   final count = await db.kv.count();
@@ -963,10 +1031,11 @@ if (page1.hasMore) {
 ```
 
 ##### Cenário Avançado: Paginação por Token Sem Estado (Token-based Cursor)
-Se você estiver desenvolvendo APIs cliente-servidor ou precisar serializar o estado da paginação entre processos ou redes, você pode usar tokens de cursor.
+Para a paginação cotidiana no app, prefira `next()` / `prev()` acima. Use tokens de cursor apenas em APIs cliente-servidor ou ao serializar o estado de paginação entre processos/redes:
 * A consulta inicial retorna as strings `nextCursorToken` e `prevCursorToken`.
-* A consulta subsequente passa o token via `.cursor(token)` para posicionamento (seek).
-* **Nota**: `cursor` e `offset` são mutuamente exclusivos. Chamar `cursor()` limpará automaticamente qualquer `offset` definido, e vice-versa.
+* A consulta seguinte passa o token via `.cursor(token)` para seek.
+* **Nota**: `cursor` e `offset` são mutuamente exclusivos; definir um limpa o outro.
+
 
 ```dart
 // Consulta inicial (por exemplo, no lado do servidor API)

@@ -151,7 +151,7 @@ await db.removeValue('current_user');
 
 > [!TIP]
 > **需要更多键值对功能？**
-> 诸如强类型读取（`getInt`、`getBool`）、原子自增、前缀检索、键空间探索等进阶操作，请参阅 [**键值对进阶操作 (db.kv)**](#kv-advanced)。
+> 诸如强类型读取（`getInt`、`getBool`）、原子自增、前缀检索、**链式分页查询记录**（`db.kv.query()`）等进阶操作，请参阅 [**键值对进阶操作 (db.kv)**](#kv-advanced)。
 
 #### Flutter UI 自动监听刷新示例
 在 Flutter 中，利用 `StreamBuilder` 配合 `watchValue` 可以实现极其简洁的响应式刷新：
@@ -502,7 +502,7 @@ ToStore 提供了丰富的进阶功能，满足各种复杂业务场景需求：
 
 ### <a id="kv-advanced"></a>键值对进阶操作 (db.kv)
 
-对于更复杂的 Key-Value 场景，建议使用 `db.kv` 命名空间。它提供了完整的 API 集，支持空间隔离、全局共享及多种数据类型。
+对于更复杂的 Key-Value 场景，建议使用 `db.kv` 命名空间。它提供了完整的 API 集，支持空间隔离、全局共享、多种数据类型，以及链式复杂查询与过滤（如 `db.kv.query().prefix(...).orderBy...().limit(...)` 分页、排序、过期过滤等）。
 
 - **基础存取 (Basic Access)**
   ```dart
@@ -548,10 +548,78 @@ ToStore 提供了丰富的进阶功能，满足各种复杂业务场景需求：
   await db.kv.setIncrement('stock_count', amount: -5);
   ```
 
-- **键空间管理与探索 (Discovery & Management)**
+- **链式查询记录 (db.kv.query)**
+  类似 `db.query()` 的链式 API，用于查询键值**记录**（含解码后的 `value`），并支持分页。
+
+
   ```dart
-  // 获取所有前缀以 'setting_' 开头的键名
+  // 首页：按前缀过滤，按更新时间倒序，每页 20 条
+  final page = await db.kv.query()
+      .prefix('setting_')
+      .orderByUpdatedAtDesc() // 或 orderByKeyAsc / orderByKeyDesc / orderByUpdatedAtAsc
+      .limit(20);
+
+  for (final record in page.data) {
+    // record 含: key, value, updated_at, expires_at
+    print('${record['key']} = ${record['value']}');
+  }
+
+  // 推荐：用 next() / prev() 翻页（与表查询一致，最简便）
+  if (page.hasMore) {
+    final page2 = await page.next();
+    print('下一页: ${page2.data.length}');
+    if (page2.hasPrev) {
+      final back = await page2.prev();
+      print('上一页: ${back.data.length}');
+    }
+  }
+
+  // Offset 分页（与 cursor 互斥；深度翻页更推荐上面的 next()）
+  final byOffset = await db.kv.query()
+      .orderByKeyAsc()
+      .limit(20)
+      .offset(20);
+
+  // 匹配条件的记录总数（无 prefix 时为 O(1) 元数据统计）
+  final total = await db.kv.query().prefix('setting_').count();
+
+  // 取第一条匹配记录
+  final first = await db.kv.query().prefix('setting_').orderByKeyAsc().first();
+
+  // 全局 KV 空间
+  final globalPage = await db.kv.query(isGlobal: true).limit(50);
+
+  // 默认会过滤已过期记录；需要包含未清理的过期项时：
+  final withExpired = await db.kv.query()
+      .includeExpired()
+      .limit(20);
+  ```
+
+  常用链式方法：
+
+  | 方法 | 说明 |
+  | --- | --- |
+  | `prefix(String)` | 按 key 前缀过滤 |
+  | `orderByKeyAsc` / `orderByKeyDesc` | 按 key（主键）排序 |
+  | `orderByUpdatedAtAsc` / `orderByUpdatedAtDesc` | 按 `updated_at` 排序 |
+  | `limit(n)` | 本页最大条数（建议始终显式指定） |
+  | `offset(n)` | 偏移分页（会清除 cursor） |
+  | `cursor(token)` | 仅特殊场景：跨进程/网络传入分页 Token |
+  | `includeExpired([true])` | 是否包含已过期但尚未清理的记录 |
+  | `count()` | 统计匹配条数 |
+  | `first()` | 返回第一条记录（不影响原 builder 的 limit） |
+
+  查询结果 `QueryResult`：日常翻页用 `hasMore` / `hasPrev` + `next()` / `prev()`；`nextCursorToken` / `prevCursorToken` 仅用于跨端传输等特殊场景（用法与表查询一致）。
+
+- **键名枚举与空间管理 (Discovery & Management)**
+  ```dart
+  // 仅枚举 key 名（不含 value）；可选 prefix / limit / offset
   final keys = await db.kv.getKeys(prefix: 'setting_');
+  final pageKeys = await db.kv.getKeys(
+    prefix: 'setting_',
+    limit: 100,
+    offset: 0,
+  );
 
   // 统计当前空间内的键值对总数
   final count = await db.kv.count();
@@ -986,10 +1054,10 @@ if (page1.hasMore) {
 ```
 
 ##### 高级场景：无状态令牌分页 (Token-based Cursor)
-如果您在进行前后端分离的 API 开发，或者需要在进程、网络传输间序列化分页状态，可以使用游标 Token。
-* 首次查询返回 `nextCursorToken` 和 `prevCursorToken` 字符串。
+日常 App 内翻页请优先使用上方的 `next()` / `prev()`。仅在前后端分离、跨进程或需经网络序列化分页状态时，才使用游标 Token：
+* 首次查询返回 `nextCursorToken` / `prevCursorToken` 字符串。
 * 下次查询通过 `.cursor(token)` 传入 Token 进行 seek。
-* **注意**：`cursor` 与 `offset` 属于互斥参数，调用 `cursor()` 将会自动清除已设置的 `offset`，反之亦然。
+* **注意**：`cursor` 与 `offset` 互斥；调用其一会清除另一个。
 
 ```dart
 // 首次查询（例如在 API 服务端）

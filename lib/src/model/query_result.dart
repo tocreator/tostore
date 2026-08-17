@@ -20,10 +20,16 @@ class QueryResult<T> {
   final String message;
 
   /// Cursor/keyset pagination: opaque token for the previous page.
+  ///
+  /// Prefer [prev] for in-process pagination. Use this token when transferring
+  /// pagination state across processes or over the network.
   final String? prevCursorToken;
 
   /// Cursor/keyset pagination: opaque token for the next page.
-  /// - Non-null only when cursor pagination is used and there are more results.
+  ///
+  /// Prefer [next] for in-process pagination. Use this token when transferring
+  /// pagination state across processes or over the network.
+  /// Non-null only when cursor pagination is used and there are more results.
   final String? nextCursorToken;
 
   /// Legacy getter for backward compatibility.

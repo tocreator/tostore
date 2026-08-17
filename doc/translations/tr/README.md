@@ -137,7 +137,7 @@ await db.removeValue('current_user');
 
 > [!TIP]
 > **Daha fazla anahtar-değer özelliğine mi ihtiyacınız var?**
-> Tür açısından güvenli okuma (`getInt`, `getBool`), atomik artırma, önek arama ve anahtar alanı keşfi gibi gelişmiş işlemler için lütfen [**Gelişmiş Anahtar-Değer İşlemleri (db.kv)**](#kv-advanced) bölümüne bakın.
+> Tür açısından güvenli okuma (`getInt`, `getBool`), atomik artırma, önek arama, **zincirlenmiş sayfalı kayıt sorguları** (`db.kv.query()`) gibi gelişmiş işlemler için lütfen [**Gelişmiş Anahtar-Değer İşlemleri (db.kv)**](#kv-advanced) bölümüne bakın.
 
 #### Flutter Kullanıcı Arayüzü Otomatik Yenileme Örneği
 Flutter'da, `StreamBuilder` plus `watchValue` size çok kısa bir reaktif yenileme akışı sağlar:
@@ -481,7 +481,7 @@ ToStore, karmaşık iş senaryoları için zengin bir dizi gelişmiş yetenek sa
 
 ### <a id="kv-advanced"></a>Gelişmiş Anahtar-Değer İşlemleri (db.kv)
 
-Daha karmaşık anahtar-değer senaryoları için `db.kv` ad alanının kullanılması önerilir. Alan izolasyonu, küresel paylaşım ve çeşitli veri türleri ile tam bir API seti sunar.
+Daha karmaşık anahtar-değer senaryoları için `db.kv` ad alanının kullanılması önerilir. Alan izolasyonu, küresel paylaşım, çeşitli veri türleri ve zincirlenmiş karmaşık sorgular/filtreler (ör. sayfalama, sıralama, süre sonu filtresi için `db.kv.query().prefix(...).orderBy...().limit(...)`) ile tam bir API seti sunar.
 
 - **Temel Erişim (Basic Access)**
   ```dart
@@ -527,10 +527,78 @@ Daha karmaşık anahtar-değer senaryoları için `db.kv` ad alanının kullanı
   await db.kv.setIncrement('stock_count', amount: -5);
   ```
 
+- **Zincirlenmiş kayıt sorgusu (db.kv.query)**
+  `db.query()` benzeri zincir API; anahtar-değer **kayıtlarını** (çözülmüş `value` dahil) sorgular ve sayfalamayı destekler. `getKeys`'ten (yalnızca anahtar adları) farklı olarak tam kayıtlar döndürür.
+
+
+  ```dart
+  // İlk sayfa: önek filtresi, güncelleme zamanına göre azalan, sayfa başına 20
+  final page = await db.kv.query()
+      .prefix('setting_')
+      .orderByUpdatedAtDesc() // veya orderByKeyAsc / orderByKeyDesc / orderByUpdatedAtAsc
+      .limit(20);
+
+  for (final record in page.data) {
+    // record içerir: key, value, updated_at, expires_at
+    print('${record['key']} = ${record['value']}');
+  }
+
+  // Önerilen: next() / prev() ile sayfalama (tablo sorguları ile aynı, en basit yol)
+  if (page.hasMore) {
+    final page2 = await page.next();
+    print('Sonraki sayfa: ${page2.data.length}');
+    if (page2.hasPrev) {
+      final back = await page2.prev();
+      print('Önceki sayfa: ${back.data.length}');
+    }
+  }
+
+  // Offset sayfalama (cursor ile karşılıklı dışlayıcı; derin sayfalama için yukarıdaki next() tercih edilir)
+  final byOffset = await db.kv.query()
+      .orderByKeyAsc()
+      .limit(20)
+      .offset(20);
+
+  // Eşleşen kayıt sayısı (prefix yoksa O(1) meta veri toplamı)
+  final total = await db.kv.query().prefix('setting_').count();
+
+  // İlk eşleşen kaydı al
+  final first = await db.kv.query().prefix('setting_').orderByKeyAsc().first();
+
+  // Küresel KV alanı
+  final globalPage = await db.kv.query(isGlobal: true).limit(50);
+
+  // Varsayılan olarak süresi dolmuş kayıtlar filtrelenir; henüz temizlenmemiş süre dolmuşları dahil etmek için:
+  final withExpired = await db.kv.query()
+      .includeExpired()
+      .limit(20);
+  ```
+
+  Sık kullanılan zincir yöntemleri:
+
+  | Yöntem | Açıklama |
+  | --- | --- |
+  | `prefix(String)` | key önekine göre filtrele |
+  | `orderByKeyAsc` / `orderByKeyDesc` | key (birincil anahtar) ile sırala |
+  | `orderByUpdatedAtAsc` / `orderByUpdatedAtDesc` | `updated_at` ile sırala |
+  | `limit(n)` | Bu sayfadaki en fazla kayıt (her zaman açıkça belirtmeniz önerilir) |
+  | `offset(n)` | Ofset sayfalama (cursor'ı temizler) |
+  | `cursor(token)` | Yalnızca özel senaryolar: süreçler/ağ üzerinden sayfalama Token'ı geçirme |
+  | `includeExpired([true])` | Süresi dolmuş ama henüz temizlenmemiş kayıtları dahil et |
+  | `count()` | Eşleşen kayıt sayısını hesapla |
+  | `first()` | İlk kaydı döndür (orijinal builder'ın limit'ini etkilemez) |
+
+  Sorgu sonucu `QueryResult`: günlük sayfalama için `hasMore` / `hasPrev` + `next()` / `prev()`; `nextCursorToken` / `prevCursorToken` yalnızca uçtan uca aktarım gibi özel senaryolar içindir (kullanım tablo sorguları ile aynı).
+
 - **Keşif ve Yönetim (Discovery & Management)**
   ```dart
-  // 'setting_' ile başlayan tüm anahtarları al
+  // Yalnızca anahtar adlarını numaralandır (value içermez); isteğe bağlı prefix / limit / offset
   final keys = await db.kv.getKeys(prefix: 'setting_');
+  final pageKeys = await db.kv.getKeys(
+    prefix: 'setting_',
+    limit: 100,
+    offset: 0,
+  );
 
   // Mevcut alandaki toplam anahtar sayısını say
   final count = await db.kv.count();
@@ -963,10 +1031,10 @@ if (page1.hasMore) {
 ```
 
 ##### Gelişmiş Senaryo: Durumsuz Belirteç Tabanlı İmleç Sayfalama (Token-based Cursor)
-İstemci-sunucu API'leri geliştiriyorsanız veya sayfalama durumunu süreçler veya ağlar arasında serileştirmeniz gerekiyorsa imleç belirteçlerini (token) kullanabilirsiniz.
-* İlk sorgu `nextCursorToken` ve `prevCursorToken` belirteç dizelerini döndürür.
-* Sonraki sorgu, doğrudan konumlanmak (seek) için `.cursor(token)` aracılığıyla belirteci iletir.
-* **Not**: `cursor` ve `offset` birbirini dışlar. `cursor()` çağrısı, önceden ayarlanmış tüm `offset` değerlerini otomatik olarak temizler ve tersi de geçerlidir.
+Uygulama içi günlük sayfalama için yukarıdaki `next()` / `prev()` yöntemlerini tercih edin. İmleç belirteçlerini yalnızca istemci-sunucu API'lerinde veya sayfalama durumunu süreçler/ağlar arasında serileştirmeniz gerektiğinde kullanın:
+* İlk sorgu `nextCursorToken` / `prevCursorToken` dizelerini döndürür.
+* Sonraki sorgu, seek için `.cursor(token)` ile belirteci iletir.
+* **Not**: `cursor` ve `offset` birbirini dışlar; birini ayarlamak diğerini temizler.
 
 ```dart
 // İlk sorgu (örneğin, API sunucu tarafında)

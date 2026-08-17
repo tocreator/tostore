@@ -137,7 +137,7 @@ await db.removeValue('current_user');
 
 > [!TIP]
 > **より多くの鍵値ペア機能が必要ですか？**
-> 型安全な読み取り（`getInt`、`getBool`）、アトミックインクリメント、プレフィックス検索、キー空間探索などの高度な操作については、[**鍵値ペアの高度な操作 (db.kv)**](#kv-advanced) を参照してください。
+> 型安全な読み取り（`getInt`、`getBool`）、アトミックインクリメント、プレフィックス検索、**チェーン式のページネーション付きレコードクエリ**（`db.kv.query()`）などの高度な操作については、[**鍵値ペアの高度な操作 (db.kv)**](#kv-advanced) を参照してください。
 
 #### Flutter UI 自動更新の例
 Flutter では、`StreamBuilder` と `watchValue` により、非常に簡潔なリアクティブな更新フローが得られます。
@@ -481,9 +481,7 @@ ToStore は、複雑なビジネス シナリオに対応する高度な機能�
 
 ### <a id="kv-advanced"></a>鍵値ペアの高度な操作 (db.kv)
 
-### <a id="kv-advanced"></a>鍵值ペアの高度な操作 (db.kv)
-
-より複雑な Key-Value シナリオでは、`db.kv` 名前空間の使用をお勧めします。これは、スペースの分離、グローバル共有、および複数のデータ型をサポートする完全な API セットを提供します。
+より複雑な Key-Value シナリオでは、`db.kv` 名前空間の使用をお勧めします。これは、スペースの分離、グローバル共有、複数のデータ型、およびチェーン式の複雑なクエリ／フィルタ（例: `db.kv.query().prefix(...).orderBy...().limit(...)` によるページネーション、ソート、期限切れフィルタなど）をサポートする完全な API セットを提供します。
 
 - **基本的なアクセス (Basic Access)**
   ```dart
@@ -529,10 +527,78 @@ ToStore は、複雑なビジネス シナリオに対応する高度な機能�
   await db.kv.setIncrement('stock_count', amount: -5);
   ```
 
+- **チェーン式レコードクエリ (db.kv.query)**
+  `db.query()` に類似したチェーン API で、キー値**レコード**（デコード済みの `value` を含む）をクエリし、ページネーションをサポートします。`getKeys`（キー名のみ）とは異なり、完全なレコードを返します。
+
+
+  ```dart
+  // 最初のページ: プレフィックスでフィルタ、更新日時の降順、1ページあたり 20 件
+  final page = await db.kv.query()
+      .prefix('setting_')
+      .orderByUpdatedAtDesc() // または orderByKeyAsc / orderByKeyDesc / orderByUpdatedAtAsc
+      .limit(20);
+
+  for (final record in page.data) {
+    // record には: key, value, updated_at, expires_at が含まれる
+    print('${record['key']} = ${record['value']}');
+  }
+
+  // 推奨: next() / prev() でページ送り（テーブルクエリと同様、最も簡単）
+  if (page.hasMore) {
+    final page2 = await page.next();
+    print('次のページ: ${page2.data.length}');
+    if (page2.hasPrev) {
+      final back = await page2.prev();
+      print('前のページ: ${back.data.length}');
+    }
+  }
+
+  // Offset ページネーション（cursor と排他; 深いページ送りには上の next() を推奨）
+  final byOffset = await db.kv.query()
+      .orderByKeyAsc()
+      .limit(20)
+      .offset(20);
+
+  // 条件に一致するレコード総数（prefix なしの場合は O(1) メタデータ集計）
+  final total = await db.kv.query().prefix('setting_').count();
+
+  // 最初の一致レコードを取得
+  final first = await db.kv.query().prefix('setting_').orderByKeyAsc().first();
+
+  // グローバル KV 空間
+  final globalPage = await db.kv.query(isGlobal: true).limit(50);
+
+  // デフォルトでは期限切れレコードを除外; 未クリーンアップの期限切れを含める場合:
+  final withExpired = await db.kv.query()
+      .includeExpired()
+      .limit(20);
+  ```
+
+  よく使うチェーンメソッド:
+
+  | メソッド | 説明 |
+  | --- | --- |
+  | `prefix(String)` | key プレフィックスでフィルタ |
+  | `orderByKeyAsc` / `orderByKeyDesc` | key（主キー）でソート |
+  | `orderByUpdatedAtAsc` / `orderByUpdatedAtDesc` | `updated_at` でソート |
+  | `limit(n)` | 1ページあたりの最大件数（常に明示することを推奨） |
+  | `offset(n)` | オフセットページネーション（cursor をクリア） |
+  | `cursor(token)` | 特殊ケースのみ: プロセス／ネットワーク間でページネーション Token を渡す |
+  | `includeExpired([true])` | 期限切れだが未クリーンアップのレコードを含めるか |
+  | `count()` | 一致件数を集計 |
+  | `first()` | 最初のレコードを返す（元の builder の limit には影響しない） |
+
+  クエリ結果 `QueryResult`: 日常のページ送りは `hasMore` / `hasPrev` + `next()` / `prev()`; `nextCursorToken` / `prevCursorToken` はクロスエンド転送などの特殊シナリオ向け（用法はテーブルクエリと同じ）。
+
 - **キー空間の探索と管理 (Discovery & Management)**
   ```dart
-  // 'setting_' で始まるすべてのキーを取得
+  // キー名のみを列挙（value は含まない）; 任意で prefix / limit / offset
   final keys = await db.kv.getKeys(prefix: 'setting_');
+  final pageKeys = await db.kv.getKeys(
+    prefix: 'setting_',
+    limit: 100,
+    offset: 0,
+  );
 
   // 現在の空間内のキー値ペアの総数を取得
   final count = await db.kv.count();
@@ -965,10 +1031,11 @@ if (page1.hasMore) {
 ```
 
 ##### 高度なシナリオ: ステートレス トークン ページネーション (Token-based Cursor)
-クライアント・サーバー間の API 開発を行っている場合や、プロセス間やネットワーク間でページネーションの状態をシリアライズして転送する必要がある場合は、カーソル トークンを使用できます。
-* 初回クエリは `nextCursorToken` および `prevCursorToken` 文字列を返します。
-* 次回クエリでは、`.cursor(token)` を介してトークンを渡してシークします。
-* **注意**: `cursor` と `offset` は互いに排他的なパラメータです。`cursor()` を呼び出すと設定された `offset` が自动的にクリアされ、その逆も同様です。
+日常のアプリ内ページングでは、上記の `next()` / `prev()` を優先してください。カーソル トークンは、クライアント・サーバー API や、プロセス／ネットワーク間でページネーション状態をシリアライズする必要がある場合にのみ使用します：
+* 初回クエリは `nextCursorToken` / `prevCursorToken` 文字列を返します。
+* 次回クエリでは `.cursor(token)` を介してトークンを渡し、seek します。
+* **注意**: `cursor` と `offset` は互いに排他的です。一方を設定すると他方がクリアされます。
+
 
 ```dart
 // 初回クエリ（例: API サーバー側）

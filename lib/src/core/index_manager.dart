@@ -3864,41 +3864,30 @@ class IndexManager {
 
         if (lastOp == 'LIKE' && last.value is String) {
           final pattern = last.value as String;
-          final firstPercent = pattern.indexOf('%');
-          final prefixEnd = (firstPercent > 0)
-              ? firstPercent
-              : (firstPercent == -1 && pattern.isNotEmpty ? pattern.length : 0);
-          if (prefixEnd <= 0) {
+          final parsed = ValueMatcher.parseOptimizablePrefixLike(pattern);
+          if (parsed == null ||
+              (!parsed.isExact && parsed.literalPrefix.isEmpty)) {
             return IndexSearchResult.tableScan();
           }
-          final fieldPrefix = pattern.substring(0, prefixEnd);
-
-          String? incrementString(String s) {
-            if (s.isEmpty) return null;
-            final codeUnits = List<int>.from(s.codeUnits);
-            for (int i = codeUnits.length - 1; i >= 0; i--) {
-              if (codeUnits[i] < 0xFFFF) {
-                codeUnits[i]++;
-                return String.fromCharCodes(codeUnits);
-              }
-              codeUnits.removeLast();
-            }
-            return null;
-          }
+          final fieldPrefix = parsed.literalPrefix;
 
           final startPrefix = encodeCompositeValues(fieldPrefix);
           if (startPrefix == null) return IndexSearchResult.empty();
 
-          final nextPrefix = incrementString(fieldPrefix);
           Uint8List endBound;
-          if (nextPrefix != null) {
-            final endPrefix = encodeCompositeValues(nextPrefix);
-            if (endPrefix == null) return IndexSearchResult.empty();
-            endBound = endPrefix;
+          if (parsed.isExact) {
+            endBound = upperBoundExclusiveForPrefix(startPrefix);
           } else {
-            final prefixUpper = encodePrefixUpperBound();
-            if (prefixUpper == null) return IndexSearchResult.empty();
-            endBound = prefixUpper;
+            final nextPrefix = ValueMatcher.incrementUtf16Prefix(fieldPrefix);
+            if (nextPrefix != null) {
+              final endPrefix = encodeCompositeValues(nextPrefix);
+              if (endPrefix == null) return IndexSearchResult.empty();
+              endBound = endPrefix;
+            } else {
+              final prefixUpper = encodePrefixUpperBound();
+              if (prefixUpper == null) return IndexSearchResult.empty();
+              endBound = prefixUpper;
+            }
           }
 
           final start = applyCursorStart(startPrefix);
@@ -4177,34 +4166,22 @@ class IndexManager {
       // Prefix LIKE: use index range scan [prefix, nextPrefix) so only matching keys are read (same cost as equality).
       if (opUpper == 'LIKE' && condition.value is String) {
         final pattern = condition.value as String;
-
-        final firstPercent = pattern.indexOf('%');
-        final prefixEnd = (firstPercent > 0)
-            ? firstPercent
-            : (firstPercent == -1 && pattern.isNotEmpty ? pattern.length : 0);
-        if (prefixEnd <= 0) {
+        final parsed = ValueMatcher.parseOptimizablePrefixLike(pattern);
+        if (parsed == null ||
+            (!parsed.isExact && parsed.literalPrefix.isEmpty)) {
           return IndexSearchResult.tableScan();
         }
-        final prefix = pattern.substring(0, prefixEnd);
-
-        String? incrementString(String s) {
-          if (s.isEmpty) return null;
-          final codeUnits = List<int>.from(s.codeUnits);
-          for (int i = codeUnits.length - 1; i >= 0; i--) {
-            if (codeUnits[i] < 0xFFFF) {
-              codeUnits[i]++;
-              return String.fromCharCodes(codeUnits);
-            }
-            codeUnits.removeLast();
-          }
-          return null;
-        }
+        final prefix = parsed.literalPrefix;
 
         // Single-field index: encode full key. Composite: encode first field only for range.
         Uint8List? startBytes = encodePrefix(prefix);
         Uint8List? endBytes;
-        if (prefix.isNotEmpty) {
-          final nextPrefix = incrementString(prefix);
+        if (parsed.isExact) {
+          if (startBytes != null) {
+            endBytes = upperBoundExclusiveForPrefix(startBytes);
+          }
+        } else if (prefix.isNotEmpty) {
+          final nextPrefix = ValueMatcher.incrementUtf16Prefix(prefix);
           if (nextPrefix != null) {
             endBytes = encodePrefix(nextPrefix);
           }
@@ -4219,8 +4196,10 @@ class IndexManager {
           );
           if (c0 != null) {
             startBytes = MemComparableKey.encodeTuple([c0]);
-            if (prefix.isNotEmpty) {
-              final nextPrefix = incrementString(prefix);
+            if (parsed.isExact) {
+              endBytes = upperBoundExclusiveForPrefix(startBytes);
+            } else if (prefix.isNotEmpty) {
+              final nextPrefix = ValueMatcher.incrementUtf16Prefix(prefix);
               if (nextPrefix != null) {
                 final c0End = schema.encodeFieldComponentToMemComparable(
                   fields[0],

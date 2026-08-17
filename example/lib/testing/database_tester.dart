@@ -1671,6 +1671,7 @@ class DatabaseTester {
   Future<bool> _testBasicCrud() async {
     log.add('--- Testing: Basic CRUD Operations ---', LogLevel.debug);
     bool isTestPassed = true;
+    _WatchEventCollector<List<Map<String, dynamic>>>? watchCollector;
     try {
       await _clearTablesSafely();
 
@@ -1724,6 +1725,19 @@ class DatabaseTester {
         'age': updatedAge,
       };
 
+      // Attach watch listener before write operations to verify all stream callbacks.
+      watchCollector = _WatchEventCollector<List<Map<String, dynamic>>>(
+        db.query('users').where('username', '=', username).watch(),
+      );
+
+      // Verify event 0: initial query state before insert must be empty.
+      final initialWatchData = await watchCollector.waitForEventAt(0);
+      isTestPassed &= _expect(
+        'Watch stream initial emission should be empty',
+        initialWatchData?.isEmpty ?? false,
+        true,
+      );
+
       // Prime cached miss queries so insert must invalidate and rebuild them.
       isTestPassed &= await _expectCachedUserQueryTwice(
         description: 'Pre-insert username index query should be empty',
@@ -1749,6 +1763,23 @@ class DatabaseTester {
       if (!isTestPassed || insertResult.firstPrimaryKey == null) return false;
 
       final userId = insertResult.firstPrimaryKey;
+
+      // Verify event 1: watch callback after insert.
+      final insertedWatchData = await watchCollector.waitForEventAt(1);
+      isTestPassed &= _expect(
+        'Watch stream emission after insert should contain 1 row',
+        insertedWatchData?.length,
+        1,
+      );
+      if (insertedWatchData != null && insertedWatchData.isNotEmpty) {
+        final row = insertedWatchData.first;
+        isTestPassed &=
+            _expect('Watch insert event username', row['username'], username);
+        isTestPassed &=
+            _expect('Watch insert event email', row['email'], email);
+        isTestPassed &=
+            _expect('Watch insert event age', row['age'], insertedAge);
+      }
 
       // Read twice after insert to ensure repeated cached queries stay correct.
       isTestPassed &= await _expectCachedUserQueryTwice(
@@ -1777,6 +1808,20 @@ class DatabaseTester {
           _expect('Update should be successful', !updateResult.hasErrors, true);
       isTestPassed &=
           _expect('Update should affect 1 row', updateResult.successCount, 1);
+
+      // Verify event 2: watch callback after update.
+      final updatedWatchData = await watchCollector.waitForEventAt(2);
+      isTestPassed &= _expect(
+        'Watch stream emission after update should contain 1 row',
+        updatedWatchData?.length,
+        1,
+      );
+      if (updatedWatchData != null && updatedWatchData.isNotEmpty) {
+        final row = updatedWatchData.first;
+        isTestPassed &=
+            _expect('Watch update event age', row['age'], updatedAge);
+      }
+
       isTestPassed &= await _expectCachedUserQueryTwice(
         description: 'Updated user should return latest data by primary key',
         field: 'id',
@@ -1807,6 +1852,15 @@ class DatabaseTester {
           _expect('Delete should be successful', !deleteResult.hasErrors, true);
       isTestPassed &=
           _expect('Delete should affect 1 row', deleteResult.successCount, 1);
+
+      // Verify event 3: watch callback after delete.
+      final deletedWatchData = await watchCollector.waitForEventAt(3);
+      isTestPassed &= _expect(
+        'Watch stream emission after delete should be empty',
+        deletedWatchData?.isEmpty ?? false,
+        true,
+      );
+
       isTestPassed &= await _expectCachedUserQueryTwice(
         description: 'Deleted user primary key query should stay empty',
         field: 'id',
@@ -1830,6 +1884,8 @@ class DatabaseTester {
     } catch (e, s) {
       isTestPassed = false;
       _failTest('Exception in _testBasicCrud: $e\n$s');
+    } finally {
+      await watchCollector?.cancel();
     }
     return isTestPassed;
   }
@@ -3636,6 +3692,19 @@ class DatabaseTester {
           _expect(
               'getKeys contains pref_2', keysResult.contains('pref_2'), true);
 
+      // 3b. kv.query() record listing with limit
+      final queryPage =
+          await kv.query().prefix('pref_').orderByKeyAsc().limit(10);
+      isTestPassed = isTestPassed &&
+          _expect('kv.query prefix page length', queryPage.data.length, 2);
+      isTestPassed = isTestPassed &&
+          _expect('kv.query first key', queryPage.data.first['key'], 'pref_1');
+      isTestPassed = isTestPassed &&
+          _expect('kv.query first value', queryPage.data.first['value'], 1);
+      final queryCount = await kv.query().prefix('pref_').count();
+      isTestPassed =
+          isTestPassed && _expect('kv.query().prefix.count()', queryCount, 2);
+
       // 4. Atomic Increment
       await kv.set('counter', 10);
       await kv.setIncrement('counter', amount: 5);
@@ -3673,21 +3742,98 @@ class DatabaseTester {
 
       // 7. Watch (Single and Many) - Skipped on Wasm due to Record/Stream compatibility issues
       if (!_isWasmBuild) {
-        final watchStream = kv.watch<String>('test_string');
-        final watchFirst =
-            await watchStream.first.timeout(const Duration(seconds: 1));
-        isTestPassed = isTestPassed &&
-            _expect('watch("test_string") first emission', watchFirst, 'hello');
+        _WatchEventCollector<String?>? singleWatchCollector;
+        _WatchEventCollector<Map<String, dynamic>>? multiWatchCollector;
+        try {
+          // (a) Single key watch full lifecycle: initial -> update -> remove
+          singleWatchCollector = _WatchEventCollector<String?>(
+            kv.watch<String>('watch_single_key'),
+          );
 
-        final watchManyStream = kv.watchValues(['test_string', 'test_int']);
-        final watchManyFirst =
-            await watchManyStream.first.timeout(const Duration(seconds: 1));
-        isTestPassed = isTestPassed &&
-            _expect('watchValues first emission test_string',
-                watchManyFirst['test_string'], 'hello');
-        isTestPassed = isTestPassed &&
-            _expect('watchValues first emission test_int',
-                watchManyFirst['test_int'], 123);
+          // Event 0: key not set yet, initial emission is null
+          final singleInitial = await singleWatchCollector.waitForEventAt(0);
+          isTestPassed = isTestPassed &&
+              _expect('kv.watch initial emission on missing key', singleInitial,
+                  null);
+
+          // Event 1: insert value
+          await kv.set('watch_single_key', 'val_v1');
+          final singleInserted = await singleWatchCollector.waitForEventAt(1);
+          isTestPassed = isTestPassed &&
+              _expect(
+                  'kv.watch emission on insert/set', singleInserted, 'val_v1');
+
+          // Event 2: update value
+          await kv.set('watch_single_key', 'val_v2');
+          final singleUpdated = await singleWatchCollector.waitForEventAt(2);
+          isTestPassed = isTestPassed &&
+              _expect('kv.watch emission on update', singleUpdated, 'val_v2');
+
+          // Event 3: delete key
+          await kv.remove('watch_single_key');
+          final singleDeleted = await singleWatchCollector.waitForEventAt(3);
+          isTestPassed = isTestPassed &&
+              _expect('kv.watch emission on remove', singleDeleted, null);
+
+          // (b) Multi-keys watch full lifecycle
+          multiWatchCollector = _WatchEventCollector<Map<String, dynamic>>(
+            kv.watchValues(['watch_m1', 'watch_m2']),
+          );
+
+          // Event 0: initial snapshot with all nulls
+          final multiInitial = await multiWatchCollector.waitForEventAt(0);
+          isTestPassed = isTestPassed &&
+              _expect('kv.watchValues initial emission', multiInitial, {
+                'watch_m1': null,
+                'watch_m2': null,
+              });
+
+          // Event 1: set key 1
+          await kv.set('watch_m1', 'm1_val');
+          final multiEvent1 = await multiWatchCollector.waitForEventAt(1);
+          isTestPassed = isTestPassed &&
+              _expect(
+                  'kv.watchValues emission after setting key 1', multiEvent1, {
+                'watch_m1': 'm1_val',
+                'watch_m2': null,
+              });
+
+          // Event 2: set key 2
+          await kv.set('watch_m2', 888);
+          final multiEvent2 = await multiWatchCollector.waitForEventAt(2);
+          isTestPassed = isTestPassed &&
+              _expect(
+                  'kv.watchValues emission after setting key 2', multiEvent2, {
+                'watch_m1': 'm1_val',
+                'watch_m2': 888,
+              });
+
+          // Event 3: update key 2
+          await kv.set('watch_m2', 999);
+          final multiEvent3 = await multiWatchCollector.waitForEventAt(3);
+          isTestPassed = isTestPassed &&
+              _expect(
+                  'kv.watchValues emission after updating key 2', multiEvent3, {
+                'watch_m1': 'm1_val',
+                'watch_m2': 999,
+              });
+
+          // Event 4: remove key 1
+          await kv.remove('watch_m1');
+          final multiEvent4 = await multiWatchCollector.waitForEventAt(4);
+          isTestPassed = isTestPassed &&
+              _expect(
+                  'kv.watchValues emission after removing key 1', multiEvent4, {
+                'watch_m1': null,
+                'watch_m2': 999,
+              });
+
+          // Clean up key 2
+          await kv.remove('watch_m2');
+        } finally {
+          await singleWatchCollector?.cancel();
+          await multiWatchCollector?.cancel();
+        }
       }
 
       // 8. Removal
@@ -3728,5 +3874,45 @@ class DatabaseTester {
       _failTest('Exception in _testKvStoreOperations: $e\n$s');
     }
     return isTestPassed;
+  }
+}
+
+/// Helper class for capturing stream emissions deterministically in tests.
+class _WatchEventCollector<T> {
+  final List<T> events = [];
+  final StreamSubscription<T> _sub;
+  Completer<void>? _signal;
+
+  _WatchEventCollector(Stream<T> stream) : _sub = stream.listen(null) {
+    _sub.onData((data) {
+      events.add(data);
+      final s = _signal;
+      if (s != null && !s.isCompleted) {
+        s.complete();
+      }
+    });
+  }
+
+  /// Waits until the event at [index] is received, or until [timeout] expires.
+  Future<T?> waitForEventAt(
+    int index, {
+    Duration timeout = const Duration(seconds: 3),
+  }) async {
+    final stop = DateTime.now().add(timeout);
+    while (events.length <= index) {
+      final remaining = stop.difference(DateTime.now());
+      if (remaining.isNegative) return null;
+      _signal = Completer<void>();
+      try {
+        await _signal!.future.timeout(remaining);
+      } catch (_) {
+        return null;
+      }
+    }
+    return events[index];
+  }
+
+  Future<void> cancel() async {
+    await _sub.cancel();
   }
 }

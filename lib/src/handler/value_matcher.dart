@@ -314,15 +314,98 @@ class ValueMatcher {
     return matcher(value, start) >= 0 && matcher(value, end) <= 0;
   }
 
+  /// Escape `%`, `_`, and `\` so [literal] is matched as plain text in LIKE.
+  ///
+  /// Backslash is the escape character (same as [matchesLike]).
+  static String escapeLikeLiteral(String literal) {
+    return literal
+        .replaceAll(r'\', r'\\')
+        .replaceAll('%', r'\%')
+        .replaceAll('_', r'\_');
+  }
+
+  /// Next UTF-16 string after [s] for exclusive prefix upper bounds.
+  ///
+  /// Returns null when [s] is empty or cannot be incremented (all 0xFFFF).
+  static String? incrementUtf16Prefix(String s) {
+    if (s.isEmpty) return null;
+    final codeUnits = List<int>.from(s.codeUnits);
+    for (int i = codeUnits.length - 1; i >= 0; i--) {
+      if (codeUnits[i] < 0xFFFF) {
+        codeUnits[i]++;
+        return String.fromCharCodes(codeUnits);
+      }
+      codeUnits.removeLast();
+    }
+    return null;
+  }
+
+  /// Result of parsing an optimizable prefix LIKE pattern.
+  ///
+  /// [literalPrefix] is the unescaped text before a single trailing `%`.
+  /// When [isExact] is true, the pattern has no wildcards (exact match).
+  static ({String literalPrefix, bool isExact})? parseOptimizablePrefixLike(
+      String pattern) {
+    if (pattern.isEmpty) return null;
+    final buf = StringBuffer();
+    var i = 0;
+    while (i < pattern.length) {
+      final c = pattern[i];
+      if (c == r'\' && i + 1 < pattern.length) {
+        buf.write(pattern[i + 1]);
+        i += 2;
+        continue;
+      }
+      if (c == '%' || c == '_') {
+        // Optimizable prefix: only a single trailing unescaped '%'.
+        if (c == '%' && i == pattern.length - 1) {
+          return (literalPrefix: buf.toString(), isExact: false);
+        }
+        return null;
+      }
+      buf.write(c);
+      i++;
+    }
+    // No wildcards => exact match (degenerate prefix).
+    return (literalPrefix: buf.toString(), isExact: true);
+  }
+
+  /// Whether [pattern] is a prefix LIKE that can use range scan (escape-aware).
+  static bool isOptimizablePrefixLikePattern(String pattern) {
+    final parsed = parseOptimizablePrefixLike(pattern);
+    if (parsed == null) return false;
+    // LIKE '%' matches everything — not a selective prefix range.
+    if (!parsed.isExact && parsed.literalPrefix.isEmpty) return false;
+    return true;
+  }
+
   static bool matchesLike(String value, String pattern) {
     try {
-      // Escape special regex characters, then convert SQL wildcards to regex.
-      final regexPattern = pattern
-          .replaceAllMapped(RegExp(r'([\\.$*+?()\[\]{}|^])'),
-              (match) => '\\${match.group(1)}')
-          .replaceAll('%', '.*')
-          .replaceAll('_', '.');
-      return RegExp('^$regexPattern\$').hasMatch(value);
+      // Backslash escapes the next character (\% \_ \\). Unescaped %/_ are
+      // SQL wildcards. Remaining characters are matched literally.
+      final regex = StringBuffer();
+      var i = 0;
+      while (i < pattern.length) {
+        final c = pattern[i];
+        if (c == r'\' && i + 1 < pattern.length) {
+          regex.write(RegExp.escape(pattern[i + 1]));
+          i += 2;
+          continue;
+        }
+        if (c == '%') {
+          regex.write('.*');
+          i++;
+          continue;
+        }
+        if (c == '_') {
+          regex.write('.');
+          i++;
+          continue;
+        }
+        regex.write(RegExp.escape(c));
+        i++;
+      }
+      return RegExp('^$regex\$').hasMatch(value);
     } catch (e) {
       Logger.warn('Invalid LIKE pattern: $pattern', rawError: e);
       return false;

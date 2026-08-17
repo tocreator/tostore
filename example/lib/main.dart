@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
@@ -125,10 +126,16 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     'posts',
     'comments',
     'embeddings',
-    'settings'
+    'settings',
+    _kKvSpaceLabel,
+    _kKvGlobalLabel,
   ];
   String _selectedTable = 'users';
   bool _hasVectorSupport = false;
+
+  bool get _isKvMode =>
+      _selectedTable == _kKvSpaceLabel || _selectedTable == _kKvGlobalLabel;
+  bool get _isKvGlobal => _selectedTable == _kKvGlobalLabel;
   List<Map<String, dynamic>> _tableData = [];
   List<String> _tableColumns = [];
   int _currentPage = 1;
@@ -190,6 +197,11 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
   Future<void> _fetchTableData({bool resetPage = false, String? cursor}) async {
     if (!_isDbInitialized) return;
 
+    if (_isKvMode) {
+      await _fetchKvData(resetPage: resetPage, cursor: cursor);
+      return;
+    }
+
     setState(() {
       _isDataLoading = true;
       if (resetPage) {
@@ -227,7 +239,11 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         final field = filter['field'] as String;
         final op = filter['operator'] as String;
         final value = filter['value'];
-        dataQuery = dataQuery.where(field, op, value);
+        if (op == 'startsWith' || op == 'prefix') {
+          dataQuery = dataQuery.whereStartsWith(field, value?.toString() ?? '');
+        } else {
+          dataQuery = dataQuery.where(field, op, value);
+        }
       }
 
       // Apply sorting
@@ -243,6 +259,8 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
 
       // Get defaultQueryLimit to detect if count might be limited
       final int defaultQueryLimit = widget.example.db.config.defaultQueryLimit;
+
+      late final QueryResult<Map<String, dynamic>> result;
 
       if (_paginationMode == PaginationMode.offset) {
         // Get total count for pagination (only needed in offset mode)
@@ -269,7 +287,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
           return;
         }
 
-        final result = await dataQuery.limit(_pageSize).offset(offset);
+        result = await dataQuery.limit(_pageSize).offset(offset);
         if (!mounted) return;
         setState(() {
           _tableData = result.data;
@@ -285,7 +303,12 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
           final field = filter['field'] as String;
           final op = filter['operator'] as String;
           final value = filter['value'];
-          countQuery = countQuery.where(field, op, value);
+          if (op == 'startsWith' || op == 'prefix') {
+            countQuery =
+                countQuery.whereStartsWith(field, value?.toString() ?? '');
+          } else {
+            countQuery = countQuery.where(field, op, value);
+          }
         }
         // Apply same sorting for consistency (though count doesn't need it)
         if (_sortColumn != null) {
@@ -308,7 +331,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
           q = q.cursor(cursor);
         }
 
-        final result = await q;
+        result = await q;
         if (!mounted) return;
 
         setState(() {
@@ -324,6 +347,19 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
           _tableColumns = _tableData.first.keys.toList();
         }
       });
+
+      final filterHint = _activeFilters.isEmpty
+          ? 'no filter'
+          : '${_activeFilters.length} filter(s)';
+      final modeHint = _paginationMode == PaginationMode.cursor
+          ? 'cursor'
+          : 'offset page $_currentPage';
+      final elapsedMs = result.executionTimeMs;
+      logService.add(
+          'Query table "$_selectedTable" ($modeHint, $filterHint): '
+          'fetched ${_tableData.length} records / $_totalRecords total '
+          'in ${elapsedMs ?? '?'}ms',
+          LogLevel.info);
     } catch (e, s) {
       logService.add('Error fetching table data: $e', LogLevel.error);
       logService.add('Stacktrace: $s', LogLevel.error);
@@ -333,6 +369,140 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         _pageInputController.text = _currentPage.toString();
       });
     }
+  }
+
+  /// Loads KV records via [KvStore.query] (limit/offset/cursor; not getKeys + N gets).
+  Future<void> _fetchKvData({bool resetPage = false, String? cursor}) async {
+    final previousNextCursor = _nextCursor;
+    final previousPrevCursor = _prevCursor;
+
+    setState(() {
+      _isDataLoading = true;
+      if (resetPage) {
+        _currentPage = 1;
+        _selectedRows.clear();
+        _sortColumn = null;
+        _nextCursor = null;
+        _prevCursor = null;
+      }
+    });
+
+    try {
+      final isGlobal = _isKvGlobal;
+      final kv = widget.example.db.kv;
+      _tableColumns = const ['key', 'value', 'updated_at'];
+      _primaryKey = 'key';
+      _hasVectorSupport = false;
+      _isCountLimited = false;
+
+      String? prefix;
+      for (final filter in _activeFilters) {
+        if (filter['field'] == 'key' &&
+            (filter['operator'] == 'startsWith' ||
+                filter['operator'] == 'prefix')) {
+          final v = filter['value'];
+          if (v != null && v.toString().isNotEmpty) {
+            prefix = v.toString();
+            break;
+          }
+        }
+      }
+
+      var countQuery = kv.query(isGlobal: isGlobal);
+      if (prefix != null) {
+        countQuery = countQuery.prefix(prefix);
+      }
+      _totalRecords = await countQuery.count();
+      _totalPages = (_totalRecords / _pageSize).ceil();
+      if (_totalPages == 0) _totalPages = 1;
+
+      var dataQuery = kv.query(isGlobal: isGlobal);
+      if (prefix != null) {
+        dataQuery = dataQuery.prefix(prefix);
+      }
+      if (_sortColumn == 'updated_at') {
+        dataQuery = _sortAscending
+            ? dataQuery.orderByUpdatedAtAsc()
+            : dataQuery.orderByUpdatedAtDesc();
+      } else if (_sortColumn == 'key' && !_sortAscending) {
+        dataQuery = dataQuery.orderByKeyDesc();
+      } else {
+        dataQuery = dataQuery.orderByKeyAsc();
+      }
+      dataQuery = dataQuery.limit(_pageSize);
+
+      final useCursor = _paginationMode == PaginationMode.cursor &&
+          cursor != null &&
+          cursor.isNotEmpty &&
+          !resetPage;
+      if (useCursor) {
+        if (cursor == previousNextCursor) {
+          _currentPage++;
+        } else if (cursor == previousPrevCursor && _currentPage > 1) {
+          _currentPage--;
+        }
+        dataQuery = dataQuery.cursor(cursor);
+      } else {
+        if (_currentPage > _totalPages) _currentPage = _totalPages;
+        if (_currentPage < 1) _currentPage = 1;
+        dataQuery = dataQuery.offset((_currentPage - 1) * _pageSize);
+      }
+
+      final result = await dataQuery;
+      if (result.hasErrors) {
+        logService.add('KV query failed: ${result.message}', LogLevel.error);
+      }
+      final rows = result.data.map((record) {
+        return <String, dynamic>{
+          'key': record['key'],
+          'value': _formatKvDisplayValue(record['value']),
+          'updated_at': record['updated_at'],
+        };
+      }).toList();
+
+      if (!mounted) return;
+      setState(() {
+        _tableData = rows;
+        if (_paginationMode == PaginationMode.cursor) {
+          _nextCursor = result.nextCursorToken;
+          _prevCursor = result.prevCursorToken;
+        } else {
+          _prevCursor = _currentPage > 1 ? 'prev' : null;
+          _nextCursor = _currentPage < _totalPages ? 'next' : null;
+        }
+      });
+
+      final scope = isGlobal ? 'global' : 'space';
+      final prefixHint = prefix == null ? 'no prefix' : 'prefix=$prefix';
+      final modeHint = useCursor ? 'cursor' : 'offset page $_currentPage';
+      final elapsedMs = result.executionTimeMs;
+      logService.add(
+          'Query KV ($scope, $prefixHint, $modeHint): '
+          'fetched ${rows.length} records / $_totalRecords total '
+          'in ${elapsedMs ?? '?'}ms',
+          LogLevel.info);
+    } catch (e, s) {
+      logService.add('Error fetching KV data: $e', LogLevel.error);
+      logService.add('Stacktrace: $s', LogLevel.error);
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isDataLoading = false;
+          _pageInputController.text = _currentPage.toString();
+        });
+      }
+    }
+  }
+
+  void _showBriefSnackBar(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        duration: const Duration(seconds: 2),
+      ),
+    );
   }
 
   void _onLogsChanged() {
@@ -991,54 +1161,88 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
             spacing: 8.0,
             runSpacing: 8.0,
             children: [
-              ElevatedButton.icon(
-                onPressed: _isDataLoading ? null : _showAddDataDialog,
-                icon: const Icon(Icons.add, size: 16),
-                label: const Text('Add'),
-                style: ElevatedButton.styleFrom(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
-                  backgroundColor: const Color.fromARGB(255, 10, 150, 210),
-                  foregroundColor: Colors.white,
-                  textStyle: const TextStyle(fontSize: 14),
-                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                  visualDensity: VisualDensity.compact,
+              if (_isKvMode) ...[
+                ElevatedButton.icon(
+                  onPressed: _isDataLoading ? null : _showKvBatchAddDialog,
+                  icon: const Icon(Icons.add, size: 16),
+                  label: const Text('Batch Add'),
+                  style: ElevatedButton.styleFrom(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
+                    backgroundColor: const Color.fromARGB(255, 10, 150, 210),
+                    foregroundColor: Colors.white,
+                    textStyle: const TextStyle(fontSize: 14),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    visualDensity: VisualDensity.compact,
+                  ),
                 ),
-              ),
-              ElevatedButton.icon(
-                onPressed: _selectedRows.isEmpty || _isDataLoading
-                    ? null
-                    : _showBatchUpdateDialog,
-                icon: const Icon(Icons.edit, size: 16),
-                label: const Text('Modify'),
-                style: ElevatedButton.styleFrom(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
-                  backgroundColor:
-                      _selectedRows.isEmpty ? Colors.grey : Colors.green,
-                  foregroundColor: Colors.white,
-                  textStyle: const TextStyle(fontSize: 14),
-                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                  visualDensity: VisualDensity.compact,
+                ElevatedButton.icon(
+                  onPressed: _selectedRows.isEmpty || _isDataLoading
+                      ? null
+                      : _confirmDeleteSelected,
+                  icon: const Icon(Icons.delete, size: 16),
+                  label: Text('Del(${_selectedRows.length})'),
+                  style: ElevatedButton.styleFrom(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
+                    backgroundColor:
+                        _selectedRows.isEmpty ? Colors.grey : Colors.red,
+                    foregroundColor: Colors.white,
+                    textStyle: const TextStyle(fontSize: 14),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    visualDensity: VisualDensity.compact,
+                  ),
                 ),
-              ),
-              ElevatedButton.icon(
-                onPressed: _selectedRows.isEmpty || _isDataLoading
-                    ? null
-                    : _confirmDeleteSelected,
-                icon: const Icon(Icons.delete, size: 16),
-                label: Text('Del(${_selectedRows.length})'),
-                style: ElevatedButton.styleFrom(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
-                  backgroundColor:
-                      _selectedRows.isEmpty ? Colors.grey : Colors.red,
-                  foregroundColor: Colors.white,
-                  textStyle: const TextStyle(fontSize: 14),
-                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                  visualDensity: VisualDensity.compact,
+              ] else ...[
+                ElevatedButton.icon(
+                  onPressed: _isDataLoading ? null : _showAddDataDialog,
+                  icon: const Icon(Icons.add, size: 16),
+                  label: const Text('Add'),
+                  style: ElevatedButton.styleFrom(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
+                    backgroundColor: const Color.fromARGB(255, 10, 150, 210),
+                    foregroundColor: Colors.white,
+                    textStyle: const TextStyle(fontSize: 14),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    visualDensity: VisualDensity.compact,
+                  ),
                 ),
-              ),
+                ElevatedButton.icon(
+                  onPressed: _selectedRows.isEmpty || _isDataLoading
+                      ? null
+                      : _showBatchUpdateDialog,
+                  icon: const Icon(Icons.edit, size: 16),
+                  label: const Text('Modify'),
+                  style: ElevatedButton.styleFrom(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
+                    backgroundColor:
+                        _selectedRows.isEmpty ? Colors.grey : Colors.green,
+                    foregroundColor: Colors.white,
+                    textStyle: const TextStyle(fontSize: 14),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    visualDensity: VisualDensity.compact,
+                  ),
+                ),
+                ElevatedButton.icon(
+                  onPressed: _selectedRows.isEmpty || _isDataLoading
+                      ? null
+                      : _confirmDeleteSelected,
+                  icon: const Icon(Icons.delete, size: 16),
+                  label: Text('Del(${_selectedRows.length})'),
+                  style: ElevatedButton.styleFrom(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
+                    backgroundColor:
+                        _selectedRows.isEmpty ? Colors.grey : Colors.red,
+                    foregroundColor: Colors.white,
+                    textStyle: const TextStyle(fontSize: 14),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    visualDensity: VisualDensity.compact,
+                  ),
+                ),
+              ],
               PopupMenuButton<String>(
                 icon: Icon(
                   Icons.more_horiz_outlined,
@@ -1046,7 +1250,11 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                 ),
                 tooltip: 'Advanced Actions',
                 onSelected: (value) {
-                  if (value == 'filter') {
+                  if (value == 'kv_set') {
+                    _showKvSetDialog();
+                  } else if (value == 'kv_get') {
+                    _showKvGetDialog();
+                  } else if (value == 'filter') {
                     _showFilterDialog();
                   } else if (value == 'custom_delete') {
                     _showCustomDeleteDialog();
@@ -1057,48 +1265,74 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                   }
                 },
                 itemBuilder: (context) => [
-                  const PopupMenuItem(
-                    value: 'filter',
-                    child: Row(
-                      children: [
-                        Icon(Icons.filter_alt_outlined, size: 18),
-                        SizedBox(width: 8),
-                        Text('Filter Data'),
-                      ],
-                    ),
-                  ),
-                  const PopupMenuDivider(),
-                  const PopupMenuItem(
-                    value: 'custom_delete',
-                    child: Row(
-                      children: [
-                        Icon(Icons.playlist_remove, size: 18),
-                        SizedBox(width: 8),
-                        Text('Custom Delete'),
-                      ],
-                    ),
-                  ),
-                  if (_hasVectorSupport) const PopupMenuDivider(),
-                  if (_hasVectorSupport)
+                  if (_isKvMode) ...[
                     const PopupMenuItem(
-                      value: 'vector_search',
+                      value: 'kv_set',
                       child: Row(
                         children: [
-                          Icon(Icons.query_stats,
-                              size: 18, color: Color(0xff0aa6e8)),
+                          Icon(Icons.edit_note, size: 18, color: Colors.green),
                           SizedBox(width: 8),
-                          Text('Vector Search'),
+                          Text('Set Key'),
                         ],
                       ),
                     ),
+                    const PopupMenuItem(
+                      value: 'kv_get',
+                      child: Row(
+                        children: [
+                          Icon(Icons.search, size: 18, color: Colors.indigo),
+                          SizedBox(width: 8),
+                          Text('Get Key'),
+                        ],
+                      ),
+                    ),
+                    const PopupMenuDivider(),
+                  ],
+                  PopupMenuItem(
+                    value: 'filter',
+                    child: Row(
+                      children: [
+                        const Icon(Icons.filter_alt_outlined, size: 18),
+                        const SizedBox(width: 8),
+                        Text(
+                            _isKvMode ? 'Filter by Key Prefix' : 'Filter Data'),
+                      ],
+                    ),
+                  ),
+                  if (!_isKvMode) ...[
+                    const PopupMenuDivider(),
+                    const PopupMenuItem(
+                      value: 'custom_delete',
+                      child: Row(
+                        children: [
+                          Icon(Icons.playlist_remove, size: 18),
+                          SizedBox(width: 8),
+                          Text('Custom Delete'),
+                        ],
+                      ),
+                    ),
+                    if (_hasVectorSupport) const PopupMenuDivider(),
+                    if (_hasVectorSupport)
+                      const PopupMenuItem(
+                        value: 'vector_search',
+                        child: Row(
+                          children: [
+                            Icon(Icons.query_stats,
+                                size: 18, color: Color(0xff0aa6e8)),
+                            SizedBox(width: 8),
+                            Text('Vector Search'),
+                          ],
+                        ),
+                      ),
+                  ],
                   const PopupMenuDivider(),
-                  const PopupMenuItem(
+                  PopupMenuItem(
                     value: 'clear_current_table',
                     child: Row(
                       children: [
-                        Icon(Icons.cleaning_services_rounded, size: 18),
-                        SizedBox(width: 8),
-                        Text('Clear Table'),
+                        const Icon(Icons.cleaning_services_rounded, size: 18),
+                        const SizedBox(width: 8),
+                        Text(_isKvMode ? 'Clear KV' : 'Clear Table'),
                       ],
                     ),
                   ),
@@ -2181,18 +2415,32 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
       });
 
       try {
-        final result = await widget.example.db
-            .delete(_selectedTable)
-            .whereIn(_primaryKey!, _selectedRows.toList());
-
-        logService.add(
-            'Deleted ${result.successCount} of ${_selectedRows.length} records.',
-            !result.hasErrors ? LogLevel.info : LogLevel.warn);
-
-        if (result.failedCount > 0) {
+        if (_isKvMode) {
+          final keys = _selectedRows.map((e) => e.toString()).toList();
+          final result = await widget.example.db.kv
+              .removeKeys(keys, isGlobal: _isKvGlobal);
           logService.add(
-              'Failed to delete ${result.failedCount} records. Error: ${_dbResultErrorMessage(result)}',
-              LogLevel.error);
+              'Removed ${result.successCount} of ${keys.length} KV key(s).',
+              !result.hasErrors ? LogLevel.info : LogLevel.warn);
+          if (result.failedCount > 0) {
+            logService.add(
+                'Failed to remove ${result.failedCount} KV key(s). Error: ${_dbResultErrorMessage(result)}',
+                LogLevel.error);
+          }
+        } else {
+          final result = await widget.example.db
+              .delete(_selectedTable)
+              .whereIn(_primaryKey!, _selectedRows.toList());
+
+          logService.add(
+              'Deleted ${result.successCount} of ${_selectedRows.length} records.',
+              !result.hasErrors ? LogLevel.info : LogLevel.warn);
+
+          if (result.failedCount > 0) {
+            logService.add(
+                'Failed to delete ${result.failedCount} records. Error: ${_dbResultErrorMessage(result)}',
+                LogLevel.error);
+          }
         }
       } catch (e, s) {
         logService.add('Failed to delete data: $e', LogLevel.error);
@@ -2205,6 +2453,14 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
   }
 
   Future<void> _showEditRowDialog(Map<String, dynamic> rowData) async {
+    if (_isKvMode) {
+      await _showKvSetDialog(
+        initialKey: rowData['key']?.toString(),
+        initialValue: rowData['value']?.toString(),
+      );
+      return;
+    }
+
     final schema = await widget.example.db.getTableSchema(_selectedTable);
     if (schema == null) {
       logService.add('Cannot edit row: Schema not found for $_selectedTable.',
@@ -2459,6 +2715,57 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
   }
 
   Future<void> _showFilterDialog() async {
+    if (_isKvMode) {
+      final prefixController = TextEditingController(
+        text: _activeFilters.isNotEmpty
+            ? (_activeFilters.first['value']?.toString() ?? '')
+            : '',
+      );
+      final prefix = await showDialog<String>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Filter KV by Key Prefix'),
+          content: TextField(
+            controller: prefixController,
+            decoration: const InputDecoration(
+              labelText: 'Key prefix',
+              hintText: _kKvDefaultKeyPrefix,
+              border: OutlineInputBorder(),
+            ),
+            autofocus: true,
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(''),
+              child: const Text('Clear Filter'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancel'),
+            ),
+            ElevatedButton(
+              onPressed: () =>
+                  Navigator.of(context).pop(prefixController.text.trim()),
+              child: const Text('Apply'),
+            ),
+          ],
+        ),
+      );
+      prefixController.dispose();
+      if (!mounted || prefix == null) return;
+      setState(() {
+        if (prefix.isEmpty) {
+          _activeFilters = [];
+        } else {
+          _activeFilters = [
+            {'field': 'key', 'operator': 'prefix', 'value': prefix},
+          ];
+        }
+      });
+      await _fetchTableData(resetPage: true);
+      return;
+    }
+
     final schema = await widget.example.db.getTableSchema(_selectedTable);
     if (schema == null) {
       logService.add('Cannot filter: Schema not found for $_selectedTable.',
@@ -2488,9 +2795,11 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        title: const Text('Confirm Clear Table'),
-        content: const Text(
-          'Are you sure you want to clear the current table?',
+        title: Text(_isKvMode ? 'Confirm Clear KV' : 'Confirm Clear Table'),
+        content: Text(
+          _isKvMode
+              ? 'Are you sure you want to clear all key-value pairs in ${_isKvGlobal ? 'global' : 'current space'} KV store?'
+              : 'Are you sure you want to clear the current table?',
         ),
         actions: [
           TextButton(
@@ -2510,17 +2819,207 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     if (confirmed ?? false) {
       setState(() {
         _isDataLoading = true;
-        _lastOperationInfo = 'Clearing current table...';
+        _lastOperationInfo =
+            _isKvMode ? 'Clearing KV store...' : 'Clearing current table...';
       });
 
       try {
-        await widget.example.db.clear(_selectedTable);
-        logService.add('Cleared table $_selectedTable.', LogLevel.info);
+        if (_isKvMode) {
+          await widget.example.db.kv.clear(isGlobal: _isKvGlobal);
+          logService.add(
+              'Cleared ${_isKvGlobal ? 'global' : 'space'} KV store.',
+              LogLevel.info);
+        } else {
+          await widget.example.db.clear(_selectedTable);
+          logService.add('Cleared table $_selectedTable.', LogLevel.info);
+        }
       } catch (e, s) {
         logService.add('Failed to clear table: $e', LogLevel.error);
         logService.add('Stacktrace: $s', LogLevel.error);
       }
       await _fetchTableData(resetPage: true);
+    }
+  }
+
+  Future<void> _showKvBatchAddDialog() async {
+    final result = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (context) => KvBatchAddDialog(
+        isGlobal: _isKvGlobal,
+        defaultPrefix: _kKvDefaultKeyPrefix,
+      ),
+    );
+    if (!mounted || result == null) return;
+
+    final count = result['count'] as int;
+    final prefix = result['prefix'] as String;
+    if (count <= 0) return;
+
+    setState(() {
+      _isTesting = true;
+      _isDataLoading = true;
+      _lastOperationInfo = 'Adding $count KV pairs...';
+    });
+
+    final sw = Stopwatch()..start();
+    try {
+      const chunkSize = 500;
+      var written = 0;
+      for (var start = 1; start <= count; start += chunkSize) {
+        final end = math.min(start + chunkSize - 1, count);
+        final items = <String, dynamic>{};
+        for (var i = start; i <= end; i++) {
+          final key = '$prefix${i.toString().padLeft(3, '0')}';
+          items[key] = 'batch_value_${i.toString().padLeft(3, '0')}';
+        }
+        final r =
+            await widget.example.db.kv.setMany(items, isGlobal: _isKvGlobal);
+        if (r.hasErrors) {
+          logService.add('KV batch partial error: ${_dbResultErrorMessage(r)}',
+              LogLevel.warn);
+        }
+        written += items.length;
+      }
+      sw.stop();
+      logService.add(
+          'KV batch add: $written pairs in ${sw.elapsedMilliseconds}ms '
+          '(${_isKvGlobal ? 'global' : 'space'}, prefix=$prefix)',
+          LogLevel.info);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content:
+                Text('Added $written KV pairs in ${sw.elapsedMilliseconds}ms'),
+            backgroundColor: Colors.green,
+          ),
+        );
+      }
+    } catch (e, s) {
+      logService.add('Failed KV batch add: $e', LogLevel.error);
+      logService.add('Stacktrace: $s', LogLevel.error);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Failed to add KV data. Check logs.'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isTesting = false;
+        });
+      }
+      await _fetchTableData(resetPage: true);
+    }
+  }
+
+  Future<void> _showKvSetDialog(
+      {String? initialKey, String? initialValue}) async {
+    final result = await showDialog<Map<String, dynamic>>(
+      context: context,
+      builder: (context) => KvSetDialog(
+        isGlobal: _isKvGlobal,
+        initialKey: initialKey,
+        initialValue: initialValue,
+      ),
+    );
+    if (!mounted || result == null) return;
+
+    final key = (result['key'] as String).trim();
+    final value = result['value'];
+    if (key.isEmpty) return;
+
+    setState(() {
+      _isDataLoading = true;
+      _lastOperationInfo = 'Setting KV key "$key"...';
+    });
+
+    final sw = Stopwatch()..start();
+    try {
+      final r =
+          await widget.example.db.kv.set(key, value, isGlobal: _isKvGlobal);
+      sw.stop();
+      if (!r.hasErrors) {
+        logService.add(
+            'KV set "$key" = ${_formatKvDisplayValue(value)} '
+            '(${_isKvGlobal ? 'global' : 'space'}) in ${sw.elapsedMilliseconds}ms',
+            LogLevel.info);
+        _showBriefSnackBar('Set "$key" in ${sw.elapsedMilliseconds}ms');
+      } else {
+        logService.add(
+            'KV set failed: ${_dbResultErrorMessage(r)}', LogLevel.error);
+      }
+    } catch (e, s) {
+      logService.add('Failed KV set: $e', LogLevel.error);
+      logService.add('Stacktrace: $s', LogLevel.error);
+    }
+
+    await _fetchTableData();
+  }
+
+  Future<void> _showKvGetDialog() async {
+    final keyController = TextEditingController();
+    final key = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text('Get KV (${_isKvGlobal ? 'global' : 'space'})'),
+        content: TextField(
+          controller: keyController,
+          decoration: InputDecoration(
+            labelText: 'Key',
+            hintText: '${_kKvDefaultKeyPrefix}001',
+            border: const OutlineInputBorder(),
+          ),
+          autofocus: true,
+          onSubmitted: (v) => Navigator.of(context).pop(v.trim()),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () =>
+                Navigator.of(context).pop(keyController.text.trim()),
+            child: const Text('Get'),
+          ),
+        ],
+      ),
+    );
+    keyController.dispose();
+    if (!mounted || key == null || key.isEmpty) return;
+
+    final sw = Stopwatch()..start();
+    try {
+      final value = await widget.example.db.kv.get(key, isGlobal: _isKvGlobal);
+      sw.stop();
+      final display = value == null
+          ? '(not found / expired)'
+          : _formatKvDisplayValue(value);
+      logService.add(
+          'KV get "$key" => $display (${_isKvGlobal ? 'global' : 'space'}) '
+          'in ${sw.elapsedMilliseconds}ms',
+          LogLevel.info);
+      _showBriefSnackBar('Get "$key" in ${sw.elapsedMilliseconds}ms');
+      if (!mounted) return;
+      await showDialog<void>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: Text('KV Get: $key (${sw.elapsedMilliseconds}ms)'),
+          content: SelectableText(display),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Close'),
+            ),
+          ],
+        ),
+      );
+    } catch (e, s) {
+      logService.add('Failed KV get: $e', LogLevel.error);
+      logService.add('Stacktrace: $s', LogLevel.error);
     }
   }
 
@@ -2657,6 +3156,203 @@ class _LogPanelHeaderDelegate extends SliverPersistentHeaderDelegate {
   @override
   bool shouldRebuild(covariant _LogPanelHeaderDelegate oldDelegate) {
     return oldDelegate.height != height || oldDelegate.child != child;
+  }
+}
+
+/// Dialog to batch-add demo key-value pairs via KvStore.setMany.
+class KvBatchAddDialog extends StatefulWidget {
+  const KvBatchAddDialog({
+    super.key,
+    required this.isGlobal,
+    this.defaultPrefix = _kKvDefaultKeyPrefix,
+  });
+
+  final bool isGlobal;
+  final String defaultPrefix;
+
+  @override
+  State<KvBatchAddDialog> createState() => _KvBatchAddDialogState();
+}
+
+class _KvBatchAddDialogState extends State<KvBatchAddDialog> {
+  final _formKey = GlobalKey<FormState>();
+  late final TextEditingController _countController;
+  late final TextEditingController _prefixController;
+
+  @override
+  void initState() {
+    super.initState();
+    _countController = TextEditingController(text: '10000');
+    _prefixController = TextEditingController(text: widget.defaultPrefix);
+  }
+
+  @override
+  void dispose() {
+    _countController.dispose();
+    _prefixController.dispose();
+    super.dispose();
+  }
+
+  void _onSubmit() {
+    if (!_formKey.currentState!.validate()) return;
+    Navigator.of(context).pop({
+      'count': int.parse(_countController.text.trim()),
+      'prefix': _prefixController.text.trim(),
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text('Batch Add KV (${widget.isGlobal ? 'global' : 'space'})'),
+      content: Form(
+        key: _formKey,
+        child: SizedBox(
+          width: 360,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextFormField(
+                controller: _countController,
+                decoration: const InputDecoration(
+                  labelText: 'Count',
+                  border: OutlineInputBorder(),
+                ),
+                keyboardType: TextInputType.number,
+                inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+                validator: (v) {
+                  final n = int.tryParse(v?.trim() ?? '');
+                  if (n == null || n <= 0) return 'Enter a positive count';
+                  if (n > 100000) return 'Max 100000 per batch';
+                  return null;
+                },
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
+                controller: _prefixController,
+                decoration: const InputDecoration(
+                  labelText: 'Key prefix',
+                  hintText: _kKvDefaultKeyPrefix,
+                  border: OutlineInputBorder(),
+                  helperText: 'Keys: prefix001, prefix002, ...',
+                ),
+                validator: (v) {
+                  if (v == null || v.trim().isEmpty) {
+                    return 'Prefix is required';
+                  }
+                  return null;
+                },
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        ElevatedButton(
+          onPressed: _onSubmit,
+          child: const Text('Add'),
+        ),
+      ],
+    );
+  }
+}
+
+/// Dialog to set a single key-value pair via KvStore.set.
+class KvSetDialog extends StatefulWidget {
+  const KvSetDialog({
+    super.key,
+    required this.isGlobal,
+    this.initialKey,
+    this.initialValue,
+  });
+
+  final bool isGlobal;
+  final String? initialKey;
+  final String? initialValue;
+
+  @override
+  State<KvSetDialog> createState() => _KvSetDialogState();
+}
+
+class _KvSetDialogState extends State<KvSetDialog> {
+  final _formKey = GlobalKey<FormState>();
+  late final TextEditingController _keyController;
+  late final TextEditingController _valueController;
+
+  @override
+  void initState() {
+    super.initState();
+    _keyController = TextEditingController(text: widget.initialKey ?? '');
+    _valueController = TextEditingController(text: widget.initialValue ?? '');
+  }
+
+  @override
+  void dispose() {
+    _keyController.dispose();
+    _valueController.dispose();
+    super.dispose();
+  }
+
+  void _onSubmit() {
+    if (!_formKey.currentState!.validate()) return;
+    Navigator.of(context).pop({
+      'key': _keyController.text.trim(),
+      'value': _parseKvInputValue(_valueController.text),
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text('Set KV (${widget.isGlobal ? 'global' : 'space'})'),
+      content: Form(
+        key: _formKey,
+        child: SizedBox(
+          width: 400,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextFormField(
+                controller: _keyController,
+                decoration: const InputDecoration(
+                  labelText: 'Key',
+                  border: OutlineInputBorder(),
+                ),
+                validator: (v) {
+                  if (v == null || v.trim().isEmpty) return 'Key is required';
+                  return null;
+                },
+              ),
+              const SizedBox(height: 12),
+              TextFormField(
+                controller: _valueController,
+                decoration: const InputDecoration(
+                  labelText: 'Value',
+                  border: OutlineInputBorder(),
+                  helperText:
+                      'Plain text, or JSON (e.g. 123, true, {"a":1}, [1,2])',
+                ),
+                maxLines: 4,
+              ),
+            ],
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        ElevatedButton(
+          onPressed: _onSubmit,
+          child: const Text('Set'),
+        ),
+      ],
+    );
   }
 }
 
@@ -3588,8 +4284,10 @@ class _CustomDeleteDialogState extends State<CustomDeleteDialog> {
 
   FieldSchema? _getSelectedFieldSchema() {
     if (_selectedField == widget.schema.primaryKeyConfig.name) {
-      // Create a pseudo-schema for the primary key for type conversion
-      return FieldSchema(name: _selectedField!, type: DataType.integer);
+      return FieldSchema(
+        name: _selectedField!,
+        type: widget.schema.primaryKeyConfig.getDefaultDataType(),
+      );
     }
     return widget.schema.fields.firstWhere((f) => f.name == _selectedField);
   }
@@ -3793,11 +4491,21 @@ class _FilterDialogState extends State<FilterDialog> {
     if (_formKey.currentState!.validate()) {
       final newFilters = _filters.map((f) {
         final fieldSchema = _getFieldSchema(f.field);
+        final raw = f.valueController.text;
+        // LIKE / startsWith patterns must stay strings (e.g. "123%", "user_2@...").
+        // Never int.tryParse them — that turns "123%" into null for integer PKs.
+        final dynamic value;
+        if (f.operator == 'LIKE' ||
+            f.operator == 'startsWith' ||
+            f.operator == 'prefix') {
+          value = raw;
+        } else {
+          value = _convertValue(raw, fieldSchema?.type ?? DataType.text);
+        }
         return {
           'field': f.field,
           'operator': f.operator,
-          'value': _convertValue(
-              f.valueController.text, fieldSchema?.type ?? DataType.text),
+          'value': value,
         };
       }).toList();
       Navigator.of(context).pop(newFilters);
@@ -3806,8 +4514,11 @@ class _FilterDialogState extends State<FilterDialog> {
 
   FieldSchema? _getFieldSchema(String fieldName) {
     if (fieldName == widget.schema.primaryKeyConfig.name) {
-      // Create a pseudo-schema for the primary key for type conversion
-      return FieldSchema(name: fieldName, type: DataType.integer);
+      // PK storage type is text for all PrimaryKeyType variants in the engine.
+      return FieldSchema(
+        name: fieldName,
+        type: widget.schema.primaryKeyConfig.getDefaultDataType(),
+      );
     }
     try {
       return widget.schema.fields.firstWhere((f) => f.name == fieldName);
@@ -3921,7 +4632,16 @@ class _FilterDialogState extends State<FilterDialog> {
                       flex: 3,
                       child: DropdownButtonFormField<String>(
                         initialValue: filter.operator,
-                        items: ['=', '!=', '>', '>=', '<', '<=', 'LIKE']
+                        items: [
+                          '=',
+                          '!=',
+                          '>',
+                          '>=',
+                          '<',
+                          '<=',
+                          'LIKE',
+                          'startsWith',
+                        ]
                             .map((op) =>
                                 DropdownMenuItem(value: op, child: Text(op)))
                             .toList(),
@@ -3948,9 +4668,15 @@ class _FilterDialogState extends State<FilterDialog> {
                 flex: 5,
                 child: TextFormField(
                   controller: filter.valueController,
-                  decoration: const InputDecoration(
-                    border: OutlineInputBorder(),
+                  decoration: InputDecoration(
+                    border: const OutlineInputBorder(),
                     labelText: 'Value',
+                    helperText: filter.operator == 'startsWith'
+                        ? 'Literal prefix (no % needed; _ is literal)'
+                        : filter.operator == 'LIKE'
+                            ? r'SQL LIKE: escape _/% as \_ \%'
+                            : null,
+                    helperMaxLines: 2,
                   ),
                   validator: (value) {
                     if (value == null || value.isEmpty) {
@@ -4101,5 +4827,32 @@ class _VectorSearchDialogState extends State<VectorSearchDialog> {
         ),
       ],
     );
+  }
+}
+
+/// Pseudo table labels for the system key-value store (not real table names).
+/// Listing uses [KvStore.getKeys]/[KvStore.get] because system tables cannot
+/// be queried via [ToStore.query].
+const String _kKvSpaceLabel = 'KV (space)';
+const String _kKvGlobalLabel = 'KV (global)';
+const String _kKvDefaultKeyPrefix = 'demo_kv_';
+
+dynamic _parseKvInputValue(String raw) {
+  final trimmed = raw.trim();
+  if (trimmed.isEmpty) return '';
+  try {
+    return jsonDecode(trimmed);
+  } catch (_) {
+    return raw;
+  }
+}
+
+String _formatKvDisplayValue(dynamic value) {
+  if (value == null) return 'null';
+  if (value is String) return value;
+  try {
+    return jsonEncode(value);
+  } catch (_) {
+    return value.toString();
   }
 }
