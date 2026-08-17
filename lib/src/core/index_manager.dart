@@ -1196,6 +1196,10 @@ class IndexManager {
   ///
   /// Call only after [isBuilding] heal, and only when
   /// `!_isDiskIndexFileUsable(meta)`.
+  ///
+  /// Under parallel table+index flush, table meta may already show persisted
+  /// rows while index meta is still empty; pending/txn overlays remain until
+  /// cleanupAfterBatch, so prefer fuse over tableScan in that window.
   Future<IndexSearchResult?> _gateUnusableDiskIndexSearch({
     required TableContext table,
     required IndexUid indexUid,
@@ -1207,10 +1211,23 @@ class IndexManager {
       return IndexSearchResult.empty();
     }
 
+    final hasPending =
+        _dataStore.writeBufferManager.hasPendingWritesForUid(table.tableUid);
+    final txId = TransactionContext.getCurrentTransactionId();
+    final hasTxn = txId != null &&
+        !TransactionContext.isApplyingCommit() &&
+        _dataStore.tableDataManager.hasDeferredOps(txId);
+
+    // Buffer/txn can still serve lookups while disk index meta catches up.
+    if (hasPending || hasTxn) {
+      return null;
+    }
+
     final tableDataMeta =
         await _dataStore.tableDataManager.getTableDataMeta(table.tableUid);
     final persistedTableRecords = tableDataMeta?.totalRecordCount ?? 0;
     if (persistedTableRecords > 0) {
+      // True inconsistency: persisted rows, empty index, no live overlay.
       if (!metaWasMissing) {
         Logger.warn(
           'Index ${table.tableName}.'
@@ -1224,15 +1241,7 @@ class IndexManager {
     }
 
     if (metaWasMissing) {
-      final hasPending =
-          _dataStore.writeBufferManager.hasPendingWritesForUid(table.tableUid);
-      final txId = TransactionContext.getCurrentTransactionId();
-      final hasTxn = txId != null &&
-          !TransactionContext.isApplyingCommit() &&
-          _dataStore.tableDataManager.hasDeferredOps(txId);
-      if (!hasPending && !hasTxn) {
-        return IndexSearchResult.empty();
-      }
+      return IndexSearchResult.empty();
     }
     // Empty disk index + no persisted rows: fall through so pending/txn fuse
     // can serve unflushed inserts ("insert then query before flush").
@@ -1304,10 +1313,23 @@ class IndexManager {
           // Stale file owner: still try pending/txn fuse below.
         } else {
           // Never poison hotspot from file-only reads (no pending fuse context).
+          // Populate off the query path (same pattern as row-cache disk warm).
           if (populateHotspot &&
               !readFromFileOnly &&
               !(_dataStore.resourceManager?.isLowMemoryMode ?? false)) {
-            _indexDataCache.put([table.tableUid, indexUid, ...nativeVal], pk);
+            final cacheKey = <dynamic>[table.tableUid, indexUid, ...nativeVal];
+            final tableCtx = table;
+            final pkForCache = pk;
+            scheduleMicrotask(() {
+              final bufferEntry =
+                  _dataStore.writeBufferManager.getBufferedRecordForRead(
+                tableCtx,
+                pkForCache,
+              );
+              if (bufferEntry == null) {
+                _indexDataCache.put(cacheKey, pkForCache);
+              }
+            });
           }
           return IndexSearchResult(
             primaryKeys: <String>[pk],
@@ -3927,15 +3949,28 @@ class IndexManager {
           final compositePrefix = <dynamic>[table.tableUid, indexUid, ...comps];
 
           if (isUnique) {
+            final probeKey = comps.length == 1 ? comps.first : comps;
+
+            // Pending/txn unique ownership wins over hotspot.
+            if (!readFromFileOnly) {
+              final bufferId =
+                  _probeBufferForUniqueIndex(table, indexUid, probeKey);
+              if (bufferId != null) {
+                return IndexSearchResult(primaryKeys: [bufferId]);
+              }
+            }
+
             final val = _indexDataCache.get(compositePrefix);
             if (val == null) {
               // Memory mode must not fall back to disk; cache miss means "not found".
               return isMemoryMode ? IndexSearchResult.empty() : null;
             }
-            if (val is String) {
-              return IndexSearchResult(primaryKeys: [val]);
+            if (val is! String || val.isEmpty) {
+              return IndexSearchResult.empty();
             }
-            return IndexSearchResult.empty();
+            // Hotspot is write-path maintained for already-cached keys; unique
+            // ownership probe above covers pending insert/update/delete.
+            return IndexSearchResult(primaryKeys: [val]);
           }
         }
 

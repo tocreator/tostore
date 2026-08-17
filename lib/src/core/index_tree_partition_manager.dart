@@ -157,6 +157,58 @@ final class IndexTreePartitionManager {
     }
   }
 
+  /// Authoritative publish after writeChanges mutates a page.
+  void _publishLeafPage(
+    String tableUid,
+    IndexUid indexUid,
+    TreePagePtr ptr,
+    LeafPage leaf,
+  ) {
+    if (ptr.isNull) return;
+    _leafPageCache.put([tableUid, indexUid, ptr.partitionNo, ptr.pageNo], leaf);
+  }
+
+  void _publishInternalPage(
+    String tableUid,
+    IndexUid indexUid,
+    TreePagePtr ptr,
+    InternalPage page,
+  ) {
+    if (ptr.isNull) return;
+    _internalPageCache
+        .put([tableUid, indexUid, ptr.partitionNo, ptr.pageNo], page);
+  }
+
+  void _evictCachedPage(String tableUid, IndexUid indexUid, TreePagePtr ptr) {
+    if (ptr.isNull) return;
+    final key = [tableUid, indexUid, ptr.partitionNo, ptr.pageNo];
+    _leafPageCache.remove(key);
+    _internalPageCache.remove(key);
+  }
+
+  /// File-read populate: never overwrite a page published by writeChanges.
+  void _offerLeafPageFromFile(
+    String tableUid,
+    IndexUid indexUid,
+    TreePagePtr ptr,
+    LeafPage leaf,
+  ) {
+    if (ptr.isNull || leaf.keys.isEmpty) return;
+    _leafPageCache
+        .putIfAbsent([tableUid, indexUid, ptr.partitionNo, ptr.pageNo], leaf);
+  }
+
+  void _offerInternalPageFromFile(
+    String tableUid,
+    IndexUid indexUid,
+    TreePagePtr ptr,
+    InternalPage page,
+  ) {
+    if (ptr.isNull || page.children.isEmpty) return;
+    _internalPageCache
+        .putIfAbsent([tableUid, indexUid, ptr.partitionNo, ptr.pageNo], page);
+  }
+
   /// Prewarm boundary leaf pages (first/last) for a B+Tree index.
   ///
   /// Returns an approximate number of bytes loaded into the page cache.
@@ -283,13 +335,14 @@ final class IndexTreePartitionManager {
       );
       final leaf = LeafPage.tryDecodePayload(payload) ?? LeafPage.empty();
 
-      // Cache the page (both local and instance-level)
+      // Cache the page (both local and instance-level).
+      // Instance put is putIfAbsent -- never stomp writeChanges-published pages.
       if (leaf.keys.isNotEmpty) {
         if (localCache != null) {
           localCache[keyOfPtr(ptr)] = leaf;
         }
         if (!readFromFileOnly) {
-          _leafPageCache.put(cacheKey, leaf);
+          _offerLeafPageFromFile(tableUid, indexUid, ptr, leaf);
         }
       }
       return leaf;
@@ -359,13 +412,14 @@ final class IndexTreePartitionManager {
       final page =
           InternalPage.tryDecodePayload(payload) ?? InternalPage.empty();
 
-      // Cache the page (both local and instance-level)
+      // Cache the page (both local and instance-level).
+      // Instance put is putIfAbsent -- never stomp writeChanges-published pages.
       if (page.children.isNotEmpty) {
         if (localCache != null) {
           localCache[keyOfPtr(ptr)] = page;
         }
         if (!readFromFileOnly) {
-          _internalPageCache.put(cacheKey, page);
+          _offerInternalPageFromFile(tableUid, indexUid, ptr, page);
         }
       }
       return page;
@@ -627,6 +681,10 @@ final class IndexTreePartitionManager {
 
     Future<void> pushFreePage(TreePagePtr ptr) async {
       if (ptr.pageNo <= 0) return;
+      // Drop stale cached pages before freelist rewrite.
+      leafCache.remove(keyOfPtr(ptr));
+      internalCache.remove(keyOfPtr(ptr));
+      _evictCachedPage(tableUid, indexUid, ptr);
       await ensurePartitionHeaderLoaded(ptr.partitionNo);
       final stats = getStats(ptr.partitionNo);
       stats.path ??=
@@ -724,6 +782,7 @@ final class IndexTreePartitionManager {
     void markLeafDirty(TreePagePtr ptr, LeafPage leaf) {
       leafCache[keyOfPtr(ptr)] = leaf;
       dirtyLeaves[ptr] = leaf;
+      _publishLeafPage(tableUid, indexUid, ptr, leaf);
       final stats = getStats(ptr.partitionNo);
       stats.maxPageNoWritten = max(stats.maxPageNoWritten, ptr.pageNo);
     }
@@ -731,6 +790,7 @@ final class IndexTreePartitionManager {
     void markInternalDirty(TreePagePtr ptr, InternalPage node) {
       internalCache[keyOfPtr(ptr)] = node;
       dirtyInternals[ptr] = node;
+      _publishInternalPage(tableUid, indexUid, ptr, node);
       final stats = getStats(ptr.partitionNo);
       stats.maxPageNoWritten = max(stats.maxPageNoWritten, ptr.pageNo);
     }
@@ -1713,6 +1773,7 @@ final class IndexTreePartitionManager {
 
     Future<void> pushFree(TreePagePtr pagePtr) async {
       if (pagePtr.pageNo <= 0) return;
+      _evictCachedPage(table.tableUid, indexUid, pagePtr);
       await ensureHeaderLoaded(pagePtr.partitionNo);
       final s = getStats(pagePtr.partitionNo);
       s.path ??=
@@ -1863,6 +1924,7 @@ final class IndexTreePartitionManager {
             table, indexUid, meta, oldRightNext.partitionNo);
         stageWrite(pth, oldRightNext.pageNo * _dataStore.configuredPageSize,
             encodeLeaf(oldRightNext, nextLeaf));
+        _publishLeafPage(table.tableUid, indexUid, oldRightNext, nextLeaf);
       }
 
       parent.setEntry(i, leaf.highKey, ptr);
@@ -1884,12 +1946,14 @@ final class IndexTreePartitionManager {
             parentPath,
             parentFrame.ptr.pageNo * _dataStore.configuredPageSize,
             encodeInternal(parentFrame.ptr, parent));
+        _publishInternalPage(table.tableUid, indexUid, parentFrame.ptr, parent);
       }
 
       final leftPath =
           await _partitionFilePath(table, indexUid, meta, ptr.partitionNo);
       stageWrite(leftPath, ptr.pageNo * _dataStore.configuredPageSize,
           encodeLeaf(ptr, leaf));
+      _publishLeafPage(table.tableUid, indexUid, ptr, leaf);
       await pushFree(rightPtr);
 
       if (meta.btreeLastLeaf == rightPtr) {

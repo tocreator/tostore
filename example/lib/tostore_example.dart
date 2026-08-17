@@ -643,6 +643,8 @@ class ToStoreExample {
     }
   }
 
+  final Random _sharedRandom = Random();
+
   /// Generates a single mock data record based on a table's schema.
   ///
   Map<String, dynamic> _generateRecord(
@@ -651,17 +653,18 @@ class ToStoreExample {
     Map<String, dynamic>? foreignKeyValues,
     Map<String, ForeignKeyMode>? foreignKeyModes,
     Map<String, List<dynamic>>? foreignKeyIdLists,
+    Set<String>? foreignKeyFields,
+    Random? random,
   }) {
     final record = <String, dynamic>{};
-    final random = Random();
+    final rng = random ?? _sharedRandom;
 
-    // Build foreign key field set for fast lookup
-    final foreignKeyFields = <String>{};
-    for (final fk in schema.foreignKeys) {
-      if (fk.enabled) {
-        foreignKeyFields.addAll(fk.fields);
-      }
-    }
+    // Build foreign key field set for fast lookup if not provided
+    final fkFields = foreignKeyFields ??
+        {
+          for (final fk in schema.foreignKeys)
+            if (fk.enabled) ...fk.fields
+        };
 
     for (final field in schema.fields) {
       // We don't generate data for the primary key if it's auto-incrementing.
@@ -671,7 +674,7 @@ class ToStoreExample {
       }
 
       // If the field is a foreign key field
-      if (foreignKeyFields.contains(field.name)) {
+      if (fkFields.contains(field.name)) {
         final mode = foreignKeyModes?[field.name] ?? ForeignKeyMode.fixed;
         final idList = foreignKeyIdLists?[field.name];
 
@@ -679,7 +682,7 @@ class ToStoreExample {
             idList != null &&
             idList.isNotEmpty) {
           // Random mode: select a random ID from the ID list
-          record[field.name] = idList[random.nextInt(idList.length)];
+          record[field.name] = idList[rng.nextInt(idList.length)];
         } else if (foreignKeyValues != null &&
             foreignKeyValues.containsKey(field.name)) {
           // Fixed mode: use the provided fixed value
@@ -716,7 +719,7 @@ class ToStoreExample {
         continue;
       }
       if (field.name.contains('age')) {
-        record[field.name] = random.nextInt(100);
+        record[field.name] = rng.nextInt(100);
         continue;
       }
 
@@ -727,13 +730,13 @@ class ToStoreExample {
           break;
         case DataType.bigInt:
         case DataType.integer:
-          record[field.name] = random.nextInt(10000);
+          record[field.name] = rng.nextInt(10000);
           break;
         case DataType.double:
-          record[field.name] = random.nextDouble() * 1000;
+          record[field.name] = rng.nextDouble() * 1000;
           break;
         case DataType.boolean:
-          record[field.name] = random.nextBool();
+          record[field.name] = rng.nextBool();
           break;
         case DataType.datetime:
           break;
@@ -743,8 +746,8 @@ class ToStoreExample {
             final dims = field.vectorConfig!.dimensions;
             final values = List<double>.generate(dims, (_) {
               // Gaussian approximation using Box-Muller transform
-              final u1 = random.nextDouble();
-              final u2 = random.nextDouble();
+              final u1 = rng.nextDouble();
+              final u2 = rng.nextDouble();
               final z = sqrt(-2.0 * log(u1)) * cos(2.0 * pi * u2);
               return z;
             });
@@ -771,6 +774,7 @@ class ToStoreExample {
   }
 
   /// Adds a specified number of example records to a given table using batch inserts.
+  /// Optimized for 1M+ ultra-large dataset insertions to avoid memory-IO dual pressure.
   Future<int> addExamples(
     String tableName,
     int count, {
@@ -792,14 +796,22 @@ class ToStoreExample {
     final totalStopwatch = Stopwatch()..start();
     final dbStopwatch = Stopwatch();
     int processedCount = 0;
-    // Chunk size for data generation to avoid OOM
-    const int batchSize = 200000;
+
+    // Optimized batch size (100,000 items) to maximize B-Tree page merge & split efficiency
+    // while keeping Dart heap within safe boundaries (~30MB per batch).
+    const int batchSize = 100000;
+
+    // Cache foreign key fields once for the entire batch operation
+    final fkFields = {
+      for (final fk in schema.foreignKeys)
+        if (fk.enabled) ...fk.fields
+    };
 
     while (processedCount < count) {
       final currentBatchSize = min(batchSize, count - processedCount);
       final records = <Map<String, dynamic>>[];
 
-      // Generate data for current chunk only
+      // 1. Generate data for current 100k chunk
       for (var i = 0; i < currentBatchSize; i++) {
         records.add(_generateRecord(
           schema,
@@ -807,13 +819,18 @@ class ToStoreExample {
           foreignKeyValues: foreignKeyValues,
           foreignKeyModes: foreignKeyModes,
           foreignKeyIdLists: foreignKeyIdLists,
+          foreignKeyFields: fkFields,
+          random: _sharedRandom,
         ));
       }
 
-      // Insert current chunk (measure pure database time)
+      // 2. Insert current chunk (measure pure database time)
       dbStopwatch.start();
       final result = await db.batchInsert(tableName, records);
       dbStopwatch.stop();
+
+      // Free records immediately to let Dart GC reclaim memory before flush & next round
+      records.clear();
 
       if (result.hasErrors) {
         logService.add(
@@ -826,9 +843,6 @@ class ToStoreExample {
 
       // Yield to keep UI responsive
       await Future.delayed(Duration.zero);
-
-      // Clear records to free memory
-      records.clear();
 
       logService.add('Progress: $processedCount/$count records inserted...',
           LogLevel.info, true);
@@ -863,6 +877,12 @@ class ToStoreExample {
     // the primary key itself.
     final baseIndex = await _resolveExampleBaseIndex(tableName, schema);
 
+    // Cache foreign key fields once for the entire generation
+    final fkFields = {
+      for (final fk in schema.foreignKeys)
+        if (fk.enabled) ...fk.fields
+    };
+
     // Pre-generate data to measure insert performance accurately (excluding data generation time)
     final records = <Map<String, dynamic>>[];
     for (var i = 0; i < count; i++) {
@@ -872,6 +892,8 @@ class ToStoreExample {
         foreignKeyValues: foreignKeyValues,
         foreignKeyModes: foreignKeyModes,
         foreignKeyIdLists: foreignKeyIdLists,
+        foreignKeyFields: fkFields,
+        random: _sharedRandom,
       ));
       // Yield periodically during generation to keep UI responsive
       if (i > 0 && i % 1000 == 0) {
