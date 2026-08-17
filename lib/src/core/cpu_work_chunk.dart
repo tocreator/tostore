@@ -148,4 +148,94 @@ class EngineCpuChunk {
       }
     }
   }
+
+  /// In-place sort that matches [List.sort] ordering, with yields between
+  /// chunk sorts / merge steps so ~100k key compares do not stall the UI.
+  ///
+  /// Small lists (or yield disabled) use a single [List.sort].
+  static Future<void> sortWithYield<T>(
+    List<T> list,
+    Comparator<T> compare, {
+    CpuChunkKind kind = CpuChunkKind.medium,
+    int? chunkSize,
+    bool yieldBetweenChunks = true,
+  }) async {
+    final int n = list.length;
+    if (n <= 1) return;
+
+    final int cs = math.max(1, chunkSize ?? sizeFor(kind));
+    final bool shouldYield =
+        yieldBetweenChunks && YieldController.globalSettings.enabled;
+
+    if (!shouldYield || n <= cs) {
+      list.sort(compare);
+      return;
+    }
+
+    // Phase 1: sort fixed-size runs.
+    for (int start = 0; start < n; start += cs) {
+      final int end = math.min(start + cs, n);
+      if (end - start > 1) {
+        final chunk = list.sublist(start, end);
+        chunk.sort(compare);
+        list.setRange(start, end, chunk);
+      }
+      if (end < n) {
+        await Future<void>.delayed(Duration.zero);
+      }
+    }
+
+    // Phase 2: bottom-up merge (ping-pong list <-> aux).
+    final aux = List<T>.filled(n, list.first);
+    var resultInList = true;
+    for (int width = cs; width < n; width *= 2) {
+      final List<T> src = resultInList ? list : aux;
+      final List<T> dst = resultInList ? aux : list;
+      for (int left = 0; left < n; left += 2 * width) {
+        final int mid = math.min(left + width, n);
+        final int right = math.min(left + 2 * width, n);
+        _mergeSortedRuns(src, dst, left, mid, right, compare);
+        await Future<void>.delayed(Duration.zero);
+      }
+      resultInList = !resultInList;
+    }
+
+    if (!resultInList) {
+      await forEachRange(
+        length: n,
+        kind: kind,
+        chunkSize: cs,
+        yieldBetweenChunks: true,
+        process: (start, end) {
+          list.setRange(start, end, aux, start);
+        },
+      );
+    }
+  }
+
+  static void _mergeSortedRuns<T>(
+    List<T> src,
+    List<T> dst,
+    int left,
+    int mid,
+    int right,
+    Comparator<T> compare,
+  ) {
+    var i = left;
+    var j = mid;
+    var k = left;
+    while (i < mid && j < right) {
+      if (compare(src[i], src[j]) <= 0) {
+        dst[k++] = src[i++];
+      } else {
+        dst[k++] = src[j++];
+      }
+    }
+    while (i < mid) {
+      dst[k++] = src[i++];
+    }
+    while (j < right) {
+      dst[k++] = src[j++];
+    }
+  }
 }

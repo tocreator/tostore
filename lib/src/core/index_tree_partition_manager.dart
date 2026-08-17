@@ -25,6 +25,7 @@ import '../model/table_identity.dart';
 import 'btree_page.dart';
 import 'compute/btree_page_encode_batch_runner.dart';
 import 'compute_tasks.dart';
+import 'cpu_work_chunk.dart';
 import 'data_store_impl.dart';
 import 'page_redo_log_codec.dart';
 import 'storage_adapter.dart';
@@ -549,7 +550,11 @@ final class IndexTreePartitionManager {
     if (ops.isEmpty) return;
 
     final entries = ops.entries.toList(growable: false);
-    entries.sort((a, b) => MemComparableKey.compare(a.key.bytes, b.key.bytes));
+    await EngineCpuChunk.sortWithYield(
+      entries,
+      (a, b) => MemComparableKey.compare(a.key.bytes, b.key.bytes),
+      kind: CpuChunkKind.medium,
+    );
 
     // Stage writes per path (last-write-wins per offset).
     final Map<String, Map<int, Uint8List>> staged = {};

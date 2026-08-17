@@ -27,6 +27,7 @@ import 'compute/compute_batch_planner.dart';
 import 'compute/table_record_encode_compute.dart';
 import 'compute_manager.dart';
 import 'compute_tasks.dart';
+import 'cpu_work_chunk.dart';
 import 'data_store_impl.dart';
 import 'overflow_manager.dart';
 import 'page_redo_log_codec.dart';
@@ -758,9 +759,13 @@ final class TableTreePartitionManager {
     }
     if (ops.isEmpty) return;
 
-    // Sort by key to minimize page churn.
+    // Sort by key to minimize page churn (chunked: 100k compares must not stall UI).
     final opList = ops.values.toList(growable: false);
-    opList.sort((a, b) => MemComparableKey.compare(a.pkBytes, b.pkBytes));
+    await EngineCpuChunk.sortWithYield(
+      opList,
+      (a, b) => MemComparableKey.compare(a.pkBytes, b.pkBytes),
+      kind: CpuChunkKind.medium,
+    );
 
     // ---- Write staging (per-path, last-write-wins per offset) ----
     final Map<String, Map<int, Uint8List>> staged = {};
@@ -1160,20 +1165,16 @@ final class TableTreePartitionManager {
     int totalOverflowChunks = 0;
 
     final putOps = <_TableOp>[];
+    final putRecords = <Map<String, dynamic>>[];
     for (final op in opList) {
       final y5 = yc.maybeYield();
       if (y5 != null) await y5;
       if (op.type == _OpType.put) {
         putOps.add(op);
+        putRecords.add(op.record);
       }
     }
     if (putOps.isNotEmpty) {
-      final putRecords = <Map<String, dynamic>>[];
-      for (final op in putOps) {
-        final y6 = yc.maybeYield();
-        if (y6 != null) await y6;
-        putRecords.add(op.record);
-      }
       final encodedRecords = await _encodeRecordPayloadsForWrite(
         records: putRecords,
         primaryKeyField: schema.primaryKey,

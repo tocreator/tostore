@@ -3208,10 +3208,6 @@ class IndexManager {
     TableSchema? schemaOverride,
     List<IndexSchema>? targetIndexesOverride,
   }) async {
-    // Snapshot inputs to allow yielding and avoid concurrent modification
-    final insertsCopy = List<Map<String, dynamic>>.from(inserts);
-    final updatesCopy = List<IndexRecordUpdate>.from(updates);
-    final deletesCopy = List<Map<String, dynamic>>.from(deletes);
     final schema = schemaOverride ??
         await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) return;
@@ -3246,8 +3242,8 @@ class IndexManager {
         vectorTargets.isNotEmpty && _dataStore.vectorIndexManager != null
             ? _dataStore.vectorIndexManager!.writeChanges(
                 table: table,
-                inserts: insertsCopy,
-                deletes: deletesCopy,
+                inserts: inserts,
+                deletes: deletes,
                 batchContext: batchContext,
                 concurrency: concurrency,
                 schemaOverride: schema,
@@ -3323,9 +3319,9 @@ class IndexManager {
           isInternalKvExpiryIndex: isInternalKvExpiryIndex,
           isInternalTtlIndex: isInternalTtlIndex,
           batchIngestIso: batchIngestIso,
-          inserts: insertsCopy,
-          deletes: deletesCopy,
-          updates: updatesCopy,
+          inserts: inserts,
+          deletes: deletes,
+          updates: updates,
         );
 
         if (deltas.isEmpty) {

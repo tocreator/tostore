@@ -1623,57 +1623,38 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                                               ),
                                               const Spacer(),
                                               if (isExpanded) ...[
-                                                IconButton(
-                                                  visualDensity:
-                                                      VisualDensity.compact,
-                                                  icon: const Icon(
-                                                      Icons.arrow_upward),
+                                                _buildLogPanelIconButton(
+                                                  icon: Icons.arrow_upward,
                                                   tooltip: 'Scroll to Top',
                                                   onPressed: _logCanScrollUp
                                                       ? _logScrollToTop
                                                       : null,
                                                 ),
-                                                IconButton(
-                                                  visualDensity:
-                                                      VisualDensity.compact,
-                                                  icon: const Icon(
-                                                      Icons.arrow_downward),
+                                                _buildLogPanelIconButton(
+                                                  icon: Icons.arrow_downward,
                                                   tooltip: 'Scroll to Bottom',
                                                   onPressed: _logCanScrollDown
                                                       ? _logScrollToBottom
                                                       : null,
                                                 ),
-                                                IconButton(
-                                                  visualDensity:
-                                                      VisualDensity.compact,
-                                                  icon: const Icon(
-                                                    Icons.copy_outlined,
-                                                    size: 20,
-                                                  ),
+                                                _buildLogPanelIconButton(
+                                                  icon: Icons.copy_outlined,
+                                                  iconSize: 20,
                                                   tooltip: 'Copy Visible Logs',
                                                   onPressed: _copyVisibleLogs,
                                                 ),
-                                                IconButton(
-                                                  visualDensity:
-                                                      VisualDensity.compact,
-                                                  icon: const Icon(
-                                                    Icons
-                                                        .cleaning_services_rounded,
-                                                    size: 20,
-                                                  ),
+                                                _buildLogPanelIconButton(
+                                                  icon: Icons
+                                                      .cleaning_services_rounded,
+                                                  iconSize: 20,
                                                   tooltip: 'Clear Logs',
                                                   onPressed: logService.clear,
                                                 ),
                                               ],
-                                              IconButton(
-                                                visualDensity:
-                                                    VisualDensity.compact,
-                                                icon: Icon(
-                                                  isExpanded
-                                                      ? Icons
-                                                          .keyboard_arrow_down
-                                                      : Icons.keyboard_arrow_up,
-                                                ),
+                                              _buildLogPanelIconButton(
+                                                icon: isExpanded
+                                                    ? Icons.keyboard_arrow_down
+                                                    : Icons.keyboard_arrow_up,
                                                 tooltip: isExpanded
                                                     ? 'Collapse Logs'
                                                     : 'Expand Logs',
@@ -2611,6 +2592,29 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         content: Text('Copied selected log to clipboard.'),
         duration: Duration(seconds: 2),
       ),
+    );
+  }
+
+  /// Log panel toolbar IconButtons: square hit target + CircleBorder so hover
+  /// overlay stays circular (M3 default + compact density otherwise flattens it).
+  Widget _buildLogPanelIconButton({
+    required IconData icon,
+    required String tooltip,
+    required VoidCallback? onPressed,
+    double? iconSize,
+  }) {
+    return IconButton(
+      style: IconButton.styleFrom(
+        shape: const CircleBorder(),
+        visualDensity: VisualDensity.compact,
+        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        minimumSize: const Size(36, 36),
+        maximumSize: const Size(36, 36),
+        padding: EdgeInsets.zero,
+      ),
+      icon: Icon(icon, size: iconSize),
+      tooltip: tooltip,
+      onPressed: onPressed,
     );
   }
 

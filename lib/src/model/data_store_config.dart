@@ -1,8 +1,8 @@
 import 'dart:math';
 
 import '../handler/common.dart';
-import '../handler/platform_handler.dart';
 import '../handler/logger.dart';
+import '../handler/platform_handler.dart';
 import 'migration_config.dart';
 
 /// data store config
@@ -448,10 +448,10 @@ class DataStoreConfig {
     final int cores = PlatformHandler.processorCores;
 
     // Scale factor based on cores: more cores = more parallel flush capacity
-    // For mobile, each core contributes 50k
-    // For desktop/server, each core contributes 100k
+    // For mobile, each core contributes 10k
+    // For desktop/server, each core contributes 20k
     final int coreFactor =
-        (PlatformHandler.isMobile || PlatformHandler.isWeb) ? 50000 : 100000;
+        (PlatformHandler.isMobile || PlatformHandler.isWeb) ? 10000 : 20000;
 
     // Base batch size (e.g., 50k) + per-core bonus
     int targetBatchSize = 50000 + (cores * coreFactor);
@@ -468,14 +468,14 @@ class DataStoreConfig {
       // Web: very conservative due to browser main-thread and memory limits
       return (targetBatchSize / 10).round().clamp(1000, 10000);
     } else if (PlatformHandler.isMobile) {
-      // Mobile: 100k - 200k
-      return targetBatchSize.clamp(100000, 200000);
+      // Mobile: 50k - 100k
+      return targetBatchSize.clamp(50000, 100000);
     } else if (isServer) {
-      // Server: 200k - 1M (High throughput focus)
-      return targetBatchSize.clamp(200000, 1000000);
+      // Server: 100k - 500k (High throughput focus)
+      return targetBatchSize.clamp(100000, 500000);
     } else {
-      // Desktop: 100k - 200k
-      return targetBatchSize.clamp(100000, 200000);
+      // Desktop: 50k - 100k
+      return targetBatchSize.clamp(50000, 100000);
     }
   }
 

@@ -501,27 +501,40 @@ class WriteBufferManager {
     if (batch.isEmpty) return;
 
     final byTable = <TableUid, Set<String>>{};
-    for (final e in batch) {
-      byTable.putIfAbsent(e.tableUid, () => <String>{}).add(e.recordId);
-    }
+    await EngineCpuChunk.forEachIndexed(
+      batch,
+      (_, e) {
+        byTable.putIfAbsent(e.tableUid, () => <String>{}).add(e.recordId);
+      },
+      kind: CpuChunkKind.light,
+    );
     final flushAt = DateTime.now();
     final walByPk = flushedWalByPk ?? const <String, WalPointer?>{};
     final pathsByPk = indexPathsByPk ?? const <String, List<List<dynamic>>>{};
 
     // Last queue wal per pk (fallback when flush snapshot map omits a key).
     final queueWalByPk = <String, WalPointer>{};
-    for (final q in batch) {
-      queueWalByPk[q.recordId] = q.walPointer;
-    }
+    await EngineCpuChunk.forEachIndexed(
+      batch,
+      (_, q) {
+        queueWalByPk[q.recordId] = q.walPointer;
+      },
+      kind: CpuChunkKind.light,
+    );
 
     for (final entry in byTable.entries) {
       final tableUid = entry.key;
       final tableWal = <String, WalPointer?>{};
       final tablePaths = <String, List<List<dynamic>>>{};
-      for (final pk in entry.value) {
-        tableWal[pk] = walByPk.containsKey(pk) ? walByPk[pk] : queueWalByPk[pk];
-        tablePaths[pk] = pathsByPk[pk] ?? const <List<dynamic>>[];
-      }
+      await EngineCpuChunk.forEachIterable(
+        entry.value,
+        (pk) {
+          tableWal[pk] =
+              walByPk.containsKey(pk) ? walByPk[pk] : queueWalByPk[pk];
+          tablePaths[pk] = pathsByPk[pk] ?? const <List<dynamic>>[];
+        },
+        kind: CpuChunkKind.light,
+      );
       // onIdle on every schedule: only the flight that actually runs drain/direct
       // invokes it; sibling no-ops are fine (idle clear is idempotent).
       trees.scheduleFlushedEvict(

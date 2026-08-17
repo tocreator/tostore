@@ -443,30 +443,20 @@ class ParallelJournalManager {
   /// without starving durability indefinitely.
   Future<void> _waitTailFillWhileGrowing({
     required int targetSize,
-    required int delayMs,
-    int maxExtraRounds = 5,
   }) async {
     if (_immediateFlushRequested) return;
-    if (delayMs <= 0) return;
     if (_bufferManager.queueLength >= targetSize) return;
-    if (maxExtraRounds < 0) maxExtraRounds = 0;
 
-    int rounds = 0;
     while (true) {
       if (_immediateFlushRequested) return;
       final before = _bufferManager.queueLength;
       if (before >= targetSize) return;
       if (before <= 0) return;
-
-      // First window: respect configured latency when it is already short
-      // (e.g. tests with maxFlushLatencyMs=100); keep up to 1s for energy-saving defaults.
-      final windowMs =
-          rounds == 0 ? (delayMs < 1000 ? delayMs : 1000) : delayMs;
       final wake = Completer<void>();
       _tailWaitWake = wake;
       try {
         await Future.any<void>([
-          Future<void>.delayed(Duration(milliseconds: windowMs)),
+          Future<void>.delayed(Duration(milliseconds: 1000)),
           wake.future,
         ]);
       } finally {
@@ -482,11 +472,6 @@ class ParallelJournalManager {
       // If no growth in this window, flush now (tail is stable).
       if (after <= before) return;
 
-      // If data is still coming in but we are below target, extend the wait.
-      if (after > before && rounds < maxExtraRounds) {
-        rounds++;
-        continue;
-      }
       return;
     }
   }
@@ -520,7 +505,6 @@ class ParallelJournalManager {
 
     final batchSize = batchSizeOverride ?? _dataStore.config.writeBatchSize;
     bool firstIteration = true;
-    final int delayMs = _dataStore.config.maxFlushLatencyMs;
 
     while (_running &&
         (!_bufferManager.isEmpty ||
@@ -538,8 +522,6 @@ class ParallelJournalManager {
           if (currentSize < batchSize) {
             await _waitTailFillWhileGrowing(
               targetSize: batchSize,
-              delayMs: delayMs,
-              maxExtraRounds: 3,
             );
           }
         }
@@ -935,7 +917,13 @@ class ParallelJournalManager {
                   // Then overwrite with normal business writes (newer)
                   final businessPkMap = tablePkMap[tableUid];
                   if (businessPkMap != null) {
-                    unifiedPkMap.addAll(businessPkMap);
+                    await EngineCpuChunk.forEachIterable(
+                      businessPkMap.entries,
+                      (e) {
+                        unifiedPkMap[e.key] = e.value;
+                      },
+                      kind: CpuChunkKind.light,
+                    );
                   }
 
                   final insertRecords = <Map<String, dynamic>>[];
@@ -1198,9 +1186,13 @@ class ParallelJournalManager {
                   // Cleanup in-memory buffers for this table IMMEDIATELY after it is written.
                   if (tableQueueItems.isNotEmpty) {
                     final flushedWalByPk = <String, WalPointer?>{};
-                    for (final e in unifiedPkMap.entries) {
-                      flushedWalByPk[e.key] = e.value.walPointer;
-                    }
+                    await EngineCpuChunk.forEachIterable(
+                      unifiedPkMap.entries,
+                      (e) {
+                        flushedWalByPk[e.key] = e.value.walPointer;
+                      },
+                      kind: CpuChunkKind.light,
+                    );
                     final indexPathsByPk =
                         await _bufferManager.collectFlushIndexPathsByPk(
                       table: tableContext,
