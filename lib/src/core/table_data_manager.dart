@@ -3924,6 +3924,96 @@ class TableDataManager {
     }
   }
 
+  /// Resolves a single record from live memory tiers: Txn > WriteBuffer > _tableRecordCache.
+  ///
+  /// Returns:
+  /// - `(found: true, record: data)`: Found live record in memory.
+  /// - `(found: true, record: null)`: Found tombstone/delete in memory (record does not exist).
+  /// - `(found: false, record: null)`: Not present in memory (must query disk/storage).
+  ({bool found, Map<String, dynamic>? record}) _resolveRecordFromMemory(
+    TableContext table,
+    String pk, {
+    bool readFromFileOnly = false,
+  }) {
+    if (readFromFileOnly) return (found: false, record: null);
+
+    // 0. Pending / Txn Check (ACID consistency)
+    final trees = _dataStore.writeBufferManager.bufferTrees;
+    final txId = TransactionContext.getCurrentTransactionId();
+    final useTxn = txId != null &&
+        !TransactionContext.isApplyingCommit() &&
+        _txnIdsWithOps.contains(txId);
+
+    BufferEntry? entry;
+    var fromTxn = false;
+    if (useTxn) {
+      final tx = trees.getTxnRecord(txId, table.tableUid, pk);
+      if (tx != null) {
+        entry = tx;
+        fromTxn = true;
+      }
+    }
+    entry ??= _dataStore.writeBufferManager.getBufferedRecordForRead(table, pk);
+    if (entry != null) {
+      if (entry.operation == BufferOperationType.delete) {
+        return (found: true, record: null);
+      }
+      return (
+        found: true,
+        record: fromTxn ? _visibleTxnRecord(entry.data) : entry.data,
+      );
+    }
+
+    // 1. Hotspot / Row Cache Check
+    final cached = _tableRecordCache.get([table.tableUid, pk]);
+    if (cached != null) {
+      return (found: true, record: cached);
+    }
+
+    return (found: false, record: null);
+  }
+
+  /// Fast single primary key point lookup.
+  /// Checks memory tier (Txn > WriteBuffer > _tableRecordCache) with zero collection overhead,
+  /// and falls back to disk only on cache miss.
+  Future<Map<String, dynamic>?> getRecordByPrimaryKey(
+    TableContext table,
+    dynamic key, {
+    Uint8List? encryptionKey,
+    int? encryptionKeyId,
+    bool readFromFileOnly = false,
+    TableSchema? decodeSchema,
+    List<FieldStructure>? decodeFieldStructureOverride,
+  }) async {
+    if (key == null) return null;
+    final pk = key.toString();
+    if (pk.isEmpty) return null;
+
+    final mem = _resolveRecordFromMemory(
+      table,
+      pk,
+      readFromFileOnly: readFromFileOnly,
+    );
+    if (mem.found) {
+      return mem.record;
+    }
+
+    // Fall back to disk
+    final batchRes = await queryRecordsBatch(
+      table,
+      [key],
+      encryptionKey: encryptionKey,
+      encryptionKeyId: encryptionKeyId,
+      readFromFileOnly: readFromFileOnly,
+      decodeSchema: decodeSchema,
+      decodeFieldStructureOverride: decodeFieldStructureOverride,
+    );
+    if (batchRes.records.isNotEmpty) {
+      return batchRes.records.first;
+    }
+    return null;
+  }
+
   /// Batch query with full consistency checking (Txn > Cache > Buffer > Disk).
   /// Batch query. Note: Returns results from Cache and Disk (Committed data).
   /// [isConsistent] in the result indicates if all requested keys were found in the committed state.
@@ -3942,57 +4032,24 @@ class TableDataManager {
     final pkName = schema.primaryKey;
 
     final results = <Map<String, dynamic>>[];
-    final missingKeys = <dynamic>[];
+    final stillMissing = <dynamic>[];
     final uniqueKeys = keys.toSet().toList();
 
-    // 0. Pending/txn TreeCache point lookup (txn > pending). Resolved PKs --
-    // including deletes -- must not fall through to stale cache/disk rows.
-    if (!readFromFileOnly) {
-      final trees = _dataStore.writeBufferManager.bufferTrees;
-      final txId = TransactionContext.getCurrentTransactionId();
-      final useTxn = txId != null &&
-          !TransactionContext.isApplyingCommit() &&
-          _txnIdsWithOps.contains(txId);
-
-      for (final key in uniqueKeys) {
-        final pk = key.toString();
-        BufferEntry? entry;
-        var fromTxn = false;
-        if (useTxn) {
-          final tx = trees.getTxnRecord(txId, table.tableUid, pk);
-          if (tx != null) {
-            entry = tx;
-            fromTxn = true;
-          }
+    // 0. Resolve from memory tiers (Txn > WriteBuffer > _tableRecordCache)
+    for (final key in uniqueKeys) {
+      final pk = key.toString();
+      final mem = _resolveRecordFromMemory(
+        table,
+        pk,
+        readFromFileOnly: readFromFileOnly,
+      );
+      if (mem.found) {
+        if (mem.record != null) {
+          results.add(mem.record!);
         }
-        entry ??=
-            _dataStore.writeBufferManager.getBufferedRecordForRead(table, pk);
-        if (entry != null) {
-          if (entry.operation != BufferOperationType.delete) {
-            results.add(fromTxn ? _visibleTxnRecord(entry.data) : entry.data);
-          }
-          continue;
-        }
-        missingKeys.add(key);
+      } else {
+        stillMissing.add(key);
       }
-    } else {
-      missingKeys.addAll(uniqueKeys);
-    }
-
-    // 1. Try Cache
-    final stillMissing = <dynamic>[];
-    if (!readFromFileOnly) {
-      for (final key in missingKeys) {
-        final pk = key.toString();
-        final cached = _tableRecordCache.get([table.tableUid, pk]);
-        if (cached != null) {
-          results.add(cached);
-        } else {
-          stillMissing.add(key);
-        }
-      }
-    } else {
-      stillMissing.addAll(missingKeys);
     }
 
     // 2. Try Disk

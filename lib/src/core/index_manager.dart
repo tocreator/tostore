@@ -1248,6 +1248,73 @@ class IndexManager {
     return null;
   }
 
+  /// Fast single unique key lookup to primary key string.
+  /// Encodes value and delegates directly to _searchUniquePointLogical, returning matched PK.
+  Future<String?> lookupUniquePrimaryKey(
+    TableContext table,
+    IndexUid indexUid,
+    dynamic value, {
+    bool readFromFileOnly = false,
+  }) async {
+    final schema = table.schema.name.isNotEmpty
+        ? table.schema
+        : await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
+    if (schema == null || indexUid.isEmpty) return null;
+
+    // 0. Probe writeBuffer & Hotspot Cache FIRST (bypasses getIndexMeta async IO on cache hit)
+    if (!readFromFileOnly) {
+      final bufferId = _probeBufferForUniqueIndex(table, indexUid, value);
+      if (bufferId != null) {
+        return bufferId;
+      }
+
+      _registerIndexComparator(table, indexUid, schema);
+      final compositeKey = <dynamic>[table.tableUid, indexUid, value];
+      final pkValue = _indexDataCache.get(compositeKey);
+      if (pkValue is String && pkValue.isNotEmpty) {
+        if (!_isPrimaryKeyHiddenByDeleteOverlay(table, pkValue)) {
+          return pkValue;
+        }
+      }
+    }
+
+    final indexSchema = _findBtreeIndexSchema(schema, indexUid, table: table);
+    if (indexSchema == null || indexSchema.fields.isEmpty) return null;
+
+    final fieldName = indexSchema.fields.first;
+    final encoded = schema.encodeFieldComponentToMemComparable(
+      fieldName,
+      value,
+      truncateText: false,
+    );
+    if (encoded == null) return null;
+
+    final tupleBytes = MemComparableKey.encodeTuple([encoded]);
+
+    var meta = await getIndexMeta(table.tableUid, indexUid);
+    meta ??= IndexMeta.createEmpty(
+      indexUid: indexUid,
+      tableUid: table.tableUid,
+      isUnique: true,
+    );
+
+    final res = await _searchUniquePointLogical(
+      table: table,
+      indexUid: indexUid,
+      meta: meta,
+      schema: schema,
+      encodedPrefix: tupleBytes,
+      probeKey: value,
+      nativeVal: [value],
+      readFromFileOnly: readFromFileOnly,
+    );
+
+    if (res.primaryKeys.isNotEmpty) {
+      return res.primaryKeys.first;
+    }
+    return null;
+  }
+
   /// Unique point lookup: buffer probe → file point → pending/txn fuse only.
   ///
   /// After a file miss, does not re-scan the file source.
@@ -1276,10 +1343,11 @@ class IndexManager {
       }
     }
 
-    final isMemoryMode =
-        _dataStore.config.persistenceMode == PersistenceMode.memory;
-    if (isMemoryMode) {
-      final compositeKey = <dynamic>[table.tableUid, indexUid, ...nativeVal];
+    _registerIndexComparator(table, indexUid, schema);
+
+    // 1. Hotspot / Memory Cache probe
+    final compositeKey = <dynamic>[table.tableUid, indexUid, ...nativeVal];
+    if (!readFromFileOnly) {
       final pkValue = _indexDataCache.get(compositeKey);
       if (pkValue is String && pkValue.isNotEmpty) {
         return IndexSearchResult(
@@ -1289,6 +1357,9 @@ class IndexManager {
           ],
         );
       }
+    }
+
+    if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
       return IndexSearchResult.empty();
     }
 

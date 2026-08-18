@@ -103,6 +103,112 @@ class QueryExecutor {
     // Remap user-facing field names, then convert result rows to target shape.
     final promoteDesc =
         _dataStore.migrationManager?.getPromoteRuntime(table.tableUid);
+
+    // =========================================================================
+    // FAST PATH: O(1) Single Point Equality Lookup (Tier-1 Acceleration)
+    // Completely bypasses AST normalization, optimizer planning, matcher compilation,
+    // cursor signature calculation, ReadView lifecycle, and post-sorting.
+    // =========================================================================
+    if (!onlyCount &&
+        (aggregations == null || aggregations.isEmpty) &&
+        (groupBy == null || groupBy.isEmpty) &&
+        (joins == null || joins.isEmpty) &&
+        (offset == null || offset <= 0) &&
+        (cursor == null || cursor.isEmpty) &&
+        (limit == null || limit >= 1) &&
+        condition != null &&
+        !condition.isEmpty) {
+      final singleEq = condition.extractSingleEquality();
+      if (singleEq != null) {
+        var fieldName = singleEq.field.contains('.')
+            ? singleEq.field.split('.').last
+            : singleEq.field;
+        final rawVal = singleEq.value;
+
+        // Dual-write remapping if under promote migration
+        if (promoteDesc != null) {
+          fieldName = promoteDesc.remapFieldNameNewToOld(fieldName);
+        }
+
+        // 1. Primary Key Fast Path
+        if (fieldName == schema.primaryKey) {
+          final pk = rawVal?.toString();
+          if (pk != null && pk.isNotEmpty) {
+            final rec = await _dataStore.tableDataManager.getRecordByPrimaryKey(
+              table,
+              pk,
+              readFromFileOnly: readFromFileOnly,
+            );
+            if (rec != null) {
+              final Map<String, dynamic> resultRow;
+              if (promoteDesc != null && applyPromoteResultTransform) {
+                resultRow = Map<String, dynamic>.from(rec);
+                transformPromoteOldToNewInPlace(resultRow, promoteDesc);
+              } else {
+                resultRow = rec;
+              }
+              return ExecuteResult(
+                records: [resultRow],
+                count: 1,
+                hasMore: false,
+                hasPrev: false,
+                executionTimeMs: 0,
+              );
+            } else {
+              return const ExecuteResult(
+                records: [],
+                count: 0,
+                hasMore: false,
+                hasPrev: false,
+                executionTimeMs: 0,
+              );
+            }
+          }
+        }
+
+        // 2. Single-column Unique Index Fast Path
+        final matchingIndex = _findFastUniqueIndex(schema, fieldName);
+        if (matchingIndex != null) {
+          final pk = await _indexManager.lookupUniquePrimaryKey(
+            table,
+            matchingIndex.indexUid,
+            rawVal,
+            readFromFileOnly: readFromFileOnly,
+          );
+          if (pk != null && pk.isNotEmpty) {
+            final rec = await _dataStore.tableDataManager.getRecordByPrimaryKey(
+              table,
+              pk,
+              readFromFileOnly: readFromFileOnly,
+            );
+            if (rec != null) {
+              final Map<String, dynamic> resultRow;
+              if (promoteDesc != null && applyPromoteResultTransform) {
+                resultRow = Map<String, dynamic>.from(rec);
+                transformPromoteOldToNewInPlace(resultRow, promoteDesc);
+              } else {
+                resultRow = rec;
+              }
+              return ExecuteResult(
+                records: [resultRow],
+                count: 1,
+                hasMore: false,
+                hasPrev: false,
+                executionTimeMs: 0,
+              );
+            }
+          }
+          return const ExecuteResult(
+            records: [],
+            count: 0,
+            hasMore: false,
+            hasPrev: false,
+            executionTimeMs: 0,
+          );
+        }
+      }
+    }
+
     var effectiveOrderBy = orderBy;
     var effectiveGroupBy = groupBy;
     if (promoteDesc != null) {
@@ -190,6 +296,20 @@ class QueryExecutor {
       }
     }
     return result;
+  }
+
+  IndexSchema? _findFastUniqueIndex(TableSchema schema, String fieldName) {
+    final uniqueIndexes = _dataStore.tableMetaManager
+            ?.getUniqueIndexesFor(schema) ??
+        (schema.autoIndexes != null && schema.autoIndexes!.isNotEmpty
+            ? [...schema.indexes, ...schema.autoIndexes!].where((i) => i.unique)
+            : schema.indexes.where((i) => i.unique));
+    for (final idx in uniqueIndexes) {
+      if (idx.fields.length == 1 && idx.fields.first == fieldName) {
+        return idx;
+      }
+    }
+    return null;
   }
 
   /// Prefix unqualified where-clause fields with main table name for JOIN queries.
@@ -660,7 +780,8 @@ class QueryExecutor {
       }
 
       // Final sort: single place after offset/joins, before limit truncation.
-      final bool needPostSort = effectiveOrderBy.isNotEmpty;
+      final bool needPostSort =
+          effectiveOrderBy.isNotEmpty && results.length > 1;
 
       if (needPostSort) {
         // For index cursor mode, validate orderBy matches index key order.
@@ -2144,12 +2265,23 @@ class QueryExecutor {
                 candidateRecords.add(rec);
               }
 
-              final matchedCandidateIndices = await _matchRecordIndicesIfNeeded(
-                schema: tblSchema,
-                table: table,
-                matcherCondition: matcherCondition,
-                records: candidateRecords,
-              );
+              final idxFields = indexSchema?.fields;
+              final bool isCoveredByIndexScan = matcher == null ||
+                  (idxFields != null &&
+                      matcher.fields.isNotEmpty &&
+                      matcher.fields.every((f) =>
+                          idxFields.contains(f) || f == tblSchema.primaryKey) &&
+                      (matcherCondition == null ||
+                          !matcherCondition.containsKey('OR')));
+
+              final matchedCandidateIndices = isCoveredByIndexScan
+                  ? null
+                  : await _matchRecordIndicesIfNeeded(
+                      schema: tblSchema,
+                      table: table,
+                      matcherCondition: matcherCondition,
+                      records: candidateRecords,
+                    );
 
               if (matchedCandidateIndices != null) {
                 final matchedCandidateYieldController = YieldController(
@@ -2390,12 +2522,23 @@ class QueryExecutor {
             candidateRecords.add(rec);
           }
 
-          final matchedCandidateIndices = await _matchRecordIndicesIfNeeded(
-            schema: tblSchema,
-            table: table,
-            matcherCondition: matcherCondition,
-            records: candidateRecords,
-          );
+          final idxFields = indexSchema?.fields;
+          final bool isCoveredByIndexScan = matcher == null ||
+              (idxFields != null &&
+                  matcher.fields.isNotEmpty &&
+                  matcher.fields.every((f) =>
+                      idxFields.contains(f) || f == tblSchema.primaryKey) &&
+                  (matcherCondition == null ||
+                      !matcherCondition.containsKey('OR')));
+
+          final matchedCandidateIndices = isCoveredByIndexScan
+              ? null
+              : await _matchRecordIndicesIfNeeded(
+                  schema: tblSchema,
+                  table: table,
+                  matcherCondition: matcherCondition,
+                  records: candidateRecords,
+                );
 
           if (matchedCandidateIndices != null) {
             final matchedCandidateYieldController = YieldController(

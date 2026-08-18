@@ -839,4 +839,44 @@ class QueryCondition {
       return null;
     }
   }
+
+  /// Fast check if this query condition is a single equality condition:
+  /// `where field = value` or `where field == value` (with no other conditions, no OR).
+  ///
+  /// Returns a record `(field: String, value: dynamic)?` if it matches, or null otherwise.
+  ({String field, dynamic value})? extractSingleEquality() {
+    ConditionNode? leaf;
+    if (_root.type == NodeType.leaf) {
+      leaf = _root;
+    } else if (_root.type == NodeType.and) {
+      if (_root.children.length == 1) {
+        final c1 = _root.children.first;
+        if (c1.type == NodeType.leaf) {
+          leaf = c1;
+        } else if (c1.type == NodeType.and &&
+            c1.children.length == 1 &&
+            c1.children.first.type == NodeType.leaf) {
+          leaf = c1.children.first;
+        }
+      }
+    }
+
+    if (leaf == null || leaf.condition.isEmpty) return null;
+    final cond = leaf.condition;
+    if (cond.length != 1) return null;
+
+    final entry = cond.entries.first;
+    final field = entry.key;
+    if (field == 'AND' || field == 'OR') return null;
+
+    final rawVal = entry.value;
+    if (rawVal is Map) {
+      if (rawVal.length == 1 && rawVal.containsKey('=')) {
+        return (field: field, value: rawVal['=']);
+      }
+      return null;
+    } else {
+      return (field: field, value: rawVal);
+    }
+  }
 }
