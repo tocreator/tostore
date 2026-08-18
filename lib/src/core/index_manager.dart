@@ -2,10 +2,8 @@ import 'dart:async';
 import 'dart:math';
 import 'dart:typed_data';
 
-import '../handler/common.dart';
 import '../handler/logger.dart';
 import '../handler/memcomparable.dart';
-import '../handler/parallel_processor.dart';
 import '../handler/value_matcher.dart';
 import '../model/buffer_entry.dart';
 import '../model/data_block_entry.dart';
@@ -29,7 +27,6 @@ import 'compute/index_delta_prepare_compute.dart';
 import 'compute/unique_index_prepare_compute.dart';
 import 'compute_manager.dart';
 import 'data_store_impl.dart';
-import 'io_concurrency_planner.dart';
 import 'key_migration_runner.dart';
 import 'table_data_manager.dart';
 import 'transaction_context.dart';
@@ -3349,121 +3346,81 @@ class IndexManager {
       return;
     }
 
-    // Budget for B+Tree indexes only.
-    final bool hasExplicitBudget = (concurrency != null && concurrency > 0);
-    final IndexWriteBudget? budget = hasExplicitBudget
-        ? IoConcurrencyPlanner.planIndexWriteBudget(
-            budgetTokens: concurrency,
-            indexCount: btreeTargets.length,
-            minPartitionTokensPerIndex:
-                btreeTargets.any((i) => !i.unique) ? 2 : 1,
-          )
-        : null;
-
-    final idxTasks = <Future<void> Function()>[];
+    final yieldController =
+        YieldController('IndexManager.writeChanges.indexes', checkInterval: 1);
 
     for (final idx in btreeTargets) {
+      final yIdx = yieldController.maybeYield();
+      if (yIdx != null) await yIdx;
+
       final indexUid = _indexUidFromSchema(idx);
       final indexName = idx.actualIndexName;
       // Skip indexes that are already fully flushed (used during recovery)
       if (skipIndexes != null && skipIndexes.contains(indexUid)) {
         continue;
       }
-      idxTasks.add(() async {
-        final tableUid = table.tableUid;
-        var meta = await getIndexMeta(table.tableUid, indexUid);
-        // If index metadata doesn't exist, create it in memory only (avoid extra IO)
-        if (meta == null) {
-          meta = IndexMeta.createEmpty(
-            indexUid: indexUid,
-            tableUid: tableUid,
-            isUnique: idx.unique,
-            isBuilding: false,
-          );
-          // Only cache in memory, don't write to file yet to avoid extra IO
-          _indexMetaCache.put([tableUid, indexUid], meta);
-        }
 
-        final bool isUnique = meta.isUnique;
-        final fields = idx.fields;
-
-        // Internal TTL virtual index: single-field index on `_system_ingest_ts_ms`
-        // when table-level TTL uses the internal ingest-time source (sourceField == null/empty).
-        // Internal TTL index is only written on INSERT; UPDATE/DELETE skips it.
-        final bool usesInternalTtlSource = schema.ttlConfig != null &&
-            (schema.ttlConfig!.sourceField == null ||
-                schema.ttlConfig!.sourceField!.isEmpty);
-        final bool isInternalTtlIndex = usesInternalTtlSource &&
-            fields.length == 1 &&
-            fields.first == TableSchema.internalTtlIngestTsMsField;
-        final bool isInternalKvExpiryIndex =
-            _isInternalKvExpiryIndex(table, indexUid);
-
-        // Per-index, per-batch ingest timestamp for internal TTL index INSERTs.
-        final String? batchIngestIso =
-            isInternalTtlIndex ? DateTime.now().toIso8601String() : null;
-        final deltas = await _prepareIndexWriteDeltasBatch(
-          schema: schema,
-          table: table,
-          indexName: indexName,
-          primaryKeyField: pkName,
-          fields: fields,
-          isUnique: isUnique,
-          isInternalKvExpiryIndex: isInternalKvExpiryIndex,
-          isInternalTtlIndex: isInternalTtlIndex,
-          batchIngestIso: batchIngestIso,
-          inserts: inserts,
-          deletes: deletes,
-          updates: updates,
-        );
-
-        if (deltas.isEmpty) {
-          return;
-        }
-        await _dataStore.indexTreePartitionManager?.writeChanges(
-          table: table,
+      final tableUid = table.tableUid;
+      var meta = await getIndexMeta(table.tableUid, indexUid);
+      // If index metadata doesn't exist, create it in memory only (avoid extra IO)
+      if (meta == null) {
+        meta = IndexMeta.createEmpty(
           indexUid: indexUid,
-          indexMeta: meta,
-          deltas: deltas,
-          batchContext: batchContext,
-          // If caller provided a total token budget, we pass a per-index token cap.
-          // Otherwise, let partition manager auto-acquire based on actual touched partitions.
-          concurrency:
-              hasExplicitBudget ? budget!.partitionTokensPerIndex : null,
-          encryptionKey: encryptionKey,
-          encryptionKeyId: encryptionKeyId,
+          tableUid: tableUid,
+          isUnique: idx.unique,
+          isBuilding: false,
         );
-      });
-    }
+        // Only cache in memory, don't write to file yet to avoid extra IO
+        _indexMetaCache.put([tableUid, indexUid], meta);
+      }
 
-    if (idxTasks.isEmpty) {
-      if (vectorFuture != null) await vectorFuture;
-      return;
-    }
+      final bool isUnique = meta.isUnique;
+      final fields = idx.fields;
 
-    // Execute B+Tree index tasks in parallel with the already-running vector future.
-    final int idxLevelConcurrency =
-        hasExplicitBudget ? min(idxTasks.length, budget!.indexConcurrency) : 1;
+      // Internal TTL virtual index: single-field index on `_system_ingest_ts_ms`
+      // when table-level TTL uses the internal ingest-time source (sourceField == null/empty).
+      // Internal TTL index is only written on INSERT; UPDATE/DELETE skips it.
+      final bool usesInternalTtlSource = schema.ttlConfig != null &&
+          (schema.ttlConfig!.sourceField == null ||
+              schema.ttlConfig!.sourceField!.isEmpty);
+      final bool isInternalTtlIndex = usesInternalTtlSource &&
+          fields.length == 1 &&
+          fields.first == TableSchema.internalTtlIngestTsMsField;
+      final bool isInternalKvExpiryIndex =
+          _isInternalKvExpiryIndex(table, indexUid);
 
-    // Dynamic timeout based on writeBatchSize AND maxPartitionFileSize.
-    final int batchSize = _dataStore.config.writeBatchSize;
-    final int maxFileSize = _dataStore.config.maxPartitionFileSize;
-    final timeout = Duration(
-        seconds: 30 + (batchSize / 50).ceil() + (maxFileSize ~/ (100 * 1024)));
+      // Per-index, per-batch ingest timestamp for internal TTL index INSERTs.
+      final String? batchIngestIso =
+          isInternalTtlIndex ? DateTime.now().toIso8601String() : null;
+      final deltas = await _prepareIndexWriteDeltasBatch(
+        schema: schema,
+        table: table,
+        indexName: indexName,
+        primaryKeyField: pkName,
+        fields: fields,
+        isUnique: isUnique,
+        isInternalKvExpiryIndex: isInternalKvExpiryIndex,
+        isInternalTtlIndex: isInternalTtlIndex,
+        batchIngestIso: batchIngestIso,
+        inserts: inserts,
+        deletes: deletes,
+        updates: updates,
+      );
 
-    if (InternalConfig.showLoggerInternalLabel) {
-      Logger.debug(
-        'Index persistence: table=${table.tableName}, btreeIndexes=${idxTasks.length}, concurrency=$idxLevelConcurrency, timeout=$timeout',
+      if (deltas.isEmpty) {
+        continue;
+      }
+      await _dataStore.indexTreePartitionManager?.writeChanges(
+        table: table,
+        indexUid: indexUid,
+        indexMeta: meta,
+        deltas: deltas,
+        batchContext: batchContext,
+        concurrency: concurrency,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
       );
     }
-
-    await ParallelProcessor.execute<void>(
-      idxTasks,
-      concurrency: idxLevelConcurrency,
-      label: 'IndexManager.writeChanges',
-      continueOnError: false,
-      timeout: timeout,
-    );
 
     // Await vector index write that was dispatched in parallel with B+Tree tasks.
     if (vectorFuture != null) await vectorFuture;

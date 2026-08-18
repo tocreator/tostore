@@ -268,7 +268,7 @@ class DataStoreConfig {
       enableTransactionCleanup: enableTransactionCleanup,
       transactionCleanupIntervalMs: transactionCleanupIntervalMs ?? 600000,
       transactionMetaTtlMs: transactionMetaTtlMs ?? 600000,
-      ttlCleanupIntervalMs: max(ttlCleanupIntervalMs ?? 300000, 300000),
+      ttlCleanupIntervalMs: max(ttlCleanupIntervalMs ?? 60000, 60000),
       defaultQueryLimit: defaultQueryLimit ?? 1000,
       maxQueryOffset: maxQueryOffset ?? 10000,
       yieldDurationMs:
@@ -375,15 +375,15 @@ class DataStoreConfig {
 
     if (isServer) {
       // Server: IO is highly parallelizable; clamp to avoid FD exhaustion
-      baseIo = cpuConcurrent * 4;
+      baseIo = cpuConcurrent * 2;
       minIo = 32;
       maxIo = 256;
     } else if (PlatformHandler.isDesktop) {
-      baseIo = cpuConcurrent * 3;
+      baseIo = cpuConcurrent * 2;
       minIo = 12;
       maxIo = 64;
     } else if (PlatformHandler.isMobile) {
-      baseIo = cpuConcurrent * 3;
+      baseIo = cpuConcurrent * 2;
       minIo = 12;
       maxIo = 64;
     } else {
@@ -468,14 +468,14 @@ class DataStoreConfig {
       // Web: very conservative due to browser main-thread and memory limits
       return (targetBatchSize / 10).round().clamp(1000, 10000);
     } else if (PlatformHandler.isMobile) {
-      // Mobile: 50k - 100k
-      return targetBatchSize.clamp(50000, 100000);
+      // Mobile: 50k - 200k
+      return targetBatchSize.clamp(50000, 200000);
     } else if (isServer) {
       // Server: 100k - 500k (High throughput focus)
       return targetBatchSize.clamp(100000, 500000);
     } else {
-      // Desktop: 50k - 100k
-      return targetBatchSize.clamp(50000, 100000);
+      // Desktop: 50k - 200k
+      return targetBatchSize.clamp(50000, 200000);
     }
   }
 
@@ -752,7 +752,7 @@ class DataStoreConfig {
           transactionCleanupIntervalMs ?? this.transactionCleanupIntervalMs,
       transactionMetaTtlMs: transactionMetaTtlMs ?? this.transactionMetaTtlMs,
       ttlCleanupIntervalMs:
-          max(ttlCleanupIntervalMs ?? this.ttlCleanupIntervalMs, 300000),
+          max(ttlCleanupIntervalMs ?? this.ttlCleanupIntervalMs, 60000),
       defaultQueryLimit: defaultQueryLimit ?? this.defaultQueryLimit,
       maxQueryOffset: maxQueryOffset ?? this.maxQueryOffset,
       yieldDurationMs: yieldDurationMs ?? this.yieldDurationMs,

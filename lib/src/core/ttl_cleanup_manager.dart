@@ -4,18 +4,17 @@ import 'dart:typed_data';
 
 import '../handler/logger.dart';
 import '../handler/memcomparable.dart';
-import '../handler/parallel_processor.dart';
 import '../model/data_block_entry.dart';
 import '../model/index_search.dart';
 import '../model/system_table.dart';
-import '../model/table_schema.dart';
 import '../model/table_context.dart';
+import '../model/table_identity.dart';
+import '../model/table_schema.dart';
 import '../query/query_condition.dart';
 import 'crontab_manager.dart';
 import 'data_store_impl.dart';
 import 'workload_scheduler.dart';
 import 'yield_controller.dart';
-import '../model/table_identity.dart';
 
 class _TtlCleanupPlan {
   final TableUid tableUid;
@@ -55,12 +54,15 @@ class TtlCleanupManager {
   /// Timer for startup one-shot trigger
   Timer? _startupTimer;
 
+  /// Timer for fast retry after yielding to foreground writes
+  Timer? _retryTimer;
+
   TtlCleanupManager(this._dataStore);
 
   void registerCleanupTask() {
     try {
       if (_cleanupRegistered) return;
-      CrontabManager.addCallback(ExecuteInterval.minutes5, _onScheduleTick);
+      CrontabManager.addCallback(ExecuteInterval.minutes1, _onScheduleTick);
       _cleanupRegistered = true;
 
       // One-shot delayed trigger shortly after startup so short-lived/mobile
@@ -75,16 +77,28 @@ class TtlCleanupManager {
   void unregisterCleanupTask() {
     _startupTimer?.cancel();
     _startupTimer = null;
+    _retryTimer?.cancel();
+    _retryTimer = null;
 
     if (_cleanupRegistered) {
       try {
         CrontabManager.removeCallback(
-            ExecuteInterval.minutes5, _onScheduleTick);
+            ExecuteInterval.minutes1, _onScheduleTick);
       } catch (_) {}
       _cleanupRegistered = false;
     }
     _cleanupRunning = false;
     _lastCleanupMs = 0;
+  }
+
+  void _scheduleRetryAfterYield() {
+    _retryTimer?.cancel();
+    if (_dataStore.isClosing) return;
+    _retryTimer = Timer(const Duration(seconds: 10), () {
+      _retryTimer = null;
+      if (_dataStore.isClosing) return;
+      _onScheduleTick();
+    });
   }
 
   void invalidatePlanCache() {
@@ -122,7 +136,7 @@ class TtlCleanupManager {
   }
 
   void _onScheduleTick() {
-    if (!_dataStore.isInitialized) return;
+    if (!_dataStore.isInitialized || _dataStore.isClosing) return;
     if (_cleanupRunning) return;
     final now = DateTime.now().millisecondsSinceEpoch;
     if (now - _lastCleanupMs < _dataStore.config.ttlCleanupIntervalMs) {
@@ -173,65 +187,41 @@ class TtlCleanupManager {
       return Map<String, _TtlCleanupPlan>.from(_planCache);
     }
 
-    WorkloadLease? lease;
     try {
-      lease = await _dataStore.workloadScheduler.tryAcquire(
-        WorkloadType.maintenance,
-        requestedTokens: _dataStore.workloadScheduler
-            .capacityTokens(WorkloadType.maintenance),
-        minTokens: 1,
-        label: 'ttl-plan-scan',
-      );
+      final newPlans = <String, _TtlCleanupPlan>{};
+      final yieldController = YieldController(
+          'TtlCleanupManager.refreshPlanCache',
+          checkInterval: 1);
+      for (final table in tables) {
+        final y = yieldController.maybeYield();
+        if (y != null) await y;
 
-      final int maxParallel =
-          max(1, min(_dataStore.config.maxIoConcurrency, 8));
-      final int concurrency =
-          (lease?.asConcurrency(2.0) ?? 1).clamp(1, maxParallel);
+        final schema = await _dataStore.tableMetaManager
+            ?.getTableSchemaByName(TableName(table));
+        final ttl = schema?.ttlConfig;
+        if (schema == null || ttl == null) continue;
 
-      final tasks = tables
-          .map<Future<_TtlCleanupPlan?> Function()>(
-            (table) => () async {
-              final schema = await _dataStore.tableMetaManager
-                  ?.getTableSchemaByName(TableName(table));
-              final ttl = schema?.ttlConfig;
-              if (schema == null || ttl == null) return null;
+        final sourceField =
+            (ttl.sourceField == null || ttl.sourceField!.isEmpty)
+                ? _systemIngestTsMsField
+                : ttl.sourceField!;
 
-              final sourceField =
-                  (ttl.sourceField == null || ttl.sourceField!.isEmpty)
-                      ? _systemIngestTsMsField
-                      : ttl.sourceField!;
-
-              return _TtlCleanupPlan(
-                tableUid: schema.tableUid,
-                ttlMs: ttl.ttlMs,
-                sourceField: sourceField,
-              );
-            },
-          )
-          .toList(growable: false);
-
-      final results = await ParallelProcessor.execute<_TtlCleanupPlan?>(
-        tasks,
-        label: 'ttl-plan-scan',
-        concurrency: concurrency,
-        continueOnError: true,
-      );
+        newPlans[schema.tableUid.value] = _TtlCleanupPlan(
+          tableUid: schema.tableUid,
+          ttlMs: ttl.ttlMs,
+          sourceField: sourceField,
+        );
+      }
 
       _planCache
         ..clear()
-        ..addEntries(
-          results.whereType<_TtlCleanupPlan>().map(
-                (plan) => MapEntry(plan.tableUid, plan),
-              ),
-        );
+        ..addAll(newPlans);
       _planCacheRefreshedMs = nowMs;
       _planCacheFullyLoaded = true;
       return Map<String, _TtlCleanupPlan>.from(_planCache);
     } catch (e) {
       Logger.warn('Refresh TTL plan cache failed', rawError: e);
       return Map<String, _TtlCleanupPlan>.from(_planCache);
-    } finally {
-      lease?.release();
     }
   }
 
@@ -369,6 +359,9 @@ class TtlCleanupManager {
 
       return _TtlBatchResult(deleted: r.successCount, ok: true);
     } catch (e) {
+      if (_dataStore.isClosing) {
+        return const _TtlBatchResult(deleted: 0, ok: false);
+      }
       Logger.warn('TTL cleanup batch failed on $tableName', rawError: e);
       return const _TtlBatchResult(deleted: 0, ok: false);
     }
@@ -442,6 +435,7 @@ class TtlCleanupManager {
       for (final entry in entries) {
         final y1 = yieldController.maybeYield();
         if (y1 != null) await y1;
+        if (_dataStore.isClosing) break;
 
         final rows = (await _dataStore.queryExecutor.execute(
           table,
@@ -480,6 +474,9 @@ class TtlCleanupManager {
           limit: 1,
         );
         if (!deleteResult.isSuccess) {
+          if (_dataStore.isClosing) {
+            return const _TtlBatchResult(deleted: 0, ok: false);
+          }
           Logger.warn(
             'KV TTL cleanup delete failed on $tableName pk=${entry.primaryKey}: ${deleteResult.message}',
           );
@@ -515,12 +512,16 @@ class TtlCleanupManager {
 
       return _TtlBatchResult(deleted: deletedCount, ok: true);
     } catch (e) {
+      if (_dataStore.isClosing) {
+        return const _TtlBatchResult(deleted: 0, ok: false);
+      }
       Logger.warn('KV TTL cleanup batch failed on $tableName', rawError: e);
       return const _TtlBatchResult(deleted: 0, ok: false);
     }
   }
 
   Future<void> _runCleanupCycle() async {
+    if (_dataStore.isClosing) return;
     bool cycleHasBacklog = false;
     CrontabManager.acquireBackgroundWorkLease(_backgroundLeaseId);
     try {
@@ -528,7 +529,7 @@ class TtlCleanupManager {
       final systemKvTables = await _systemKvTableContexts();
       if (plans.isEmpty && systemKvTables.isEmpty) return;
 
-      const int batchSize = 1000;
+      const int batchSize = 500;
       final int cycleStartMs = DateTime.now().millisecondsSinceEpoch;
       final DateTime cycleNow = DateTime.now();
       final yieldController = YieldController(
@@ -543,133 +544,119 @@ class TtlCleanupManager {
       while (activePlans.isNotEmpty || activeKvTables.isNotEmpty) {
         final y2 = yieldController.maybeYield();
         if (y2 != null) await y2;
+        if (_dataStore.isClosing) break;
 
         final lease = await _dataStore.workloadScheduler.tryAcquire(
           WorkloadType.maintenance,
-          requestedTokens: _dataStore.workloadScheduler
-              .capacityTokens(WorkloadType.maintenance),
+          requestedTokens: 1,
           minTokens: 1,
           label: 'ttl-cleanup-round-$round',
         );
 
         if (lease == null) break;
 
-        final int maxParallel =
-            max(1, min(_dataStore.config.maxIoConcurrency, 8));
-        final int concurrency = lease.asConcurrency(2.0).clamp(1, maxParallel);
-
         try {
           int roundDeleted = 0;
           final nextPlans = <_TtlCleanupPlan>[];
           final nextKvTables = <TableContext>[];
+          bool yieldedToForeground = false;
 
-          if (activePlans.isNotEmpty) {
-            final tasks = activePlans
-                .map<Future<_TtlBatchResult> Function()>(
-                  (plan) => () => _runCleanupBatch(
-                        plan,
-                        cycleNow,
-                        batchSize: batchSize,
-                      ),
-                )
-                .toList(growable: false);
+          final int writeBatchSize = _dataStore.config.writeBatchSize;
+          final int foregroundBusyThreshold =
+              writeBatchSize > 0 ? (writeBatchSize * 0.2).ceil() : 0;
 
-            final roundResults =
-                await ParallelProcessor.execute<_TtlBatchResult>(
-              tasks,
-              label: 'ttl-cleanup-user-round-$round',
-              concurrency: concurrency,
-              continueOnError: true,
+          // 1. Process user table TTL plans sequentially
+          for (final plan in activePlans) {
+            final y = yieldController.maybeYield();
+            if (y != null) await y;
+            if (_dataStore.isClosing) break;
+
+            // Preemptive backpressure: yield immediately if foreground writes are queueing
+            if (foregroundBusyThreshold > 0 &&
+                _dataStore.writeBufferManager.queueLength >=
+                    foregroundBusyThreshold) {
+              yieldedToForeground = true;
+              nextPlans.add(plan);
+              break;
+            }
+
+            final result = await _runCleanupBatch(
+              plan,
+              cycleNow,
+              batchSize: batchSize,
             );
 
-            for (int i = 0; i < roundResults.length; i++) {
-              final result = roundResults[i];
-              final plan = activePlans[i];
+            if (result.ok && result.deleted > 0) {
+              roundDeleted += result.deleted;
+              totalDeleted += result.deleted;
+              final resolvedName = await _dataStore.tableMetaManager
+                      ?.resolveTableNameFromField(plan.tableUid) ??
+                  TableName(plan.tableUid.value);
+              Logger.info(
+                'TTL cleanup deleted ${result.deleted} rows from table $resolvedName',
+              );
+            }
 
-              if (result == null || !result.ok) {
-                continue;
-              }
-
-              final deleted = result.deleted;
-              if (deleted > 0) {
-                roundDeleted += deleted;
-                totalDeleted += deleted;
-                final resolvedName = await _dataStore.tableMetaManager
-                        ?.resolveTableNameFromField(plan.tableUid) ??
-                    TableName(plan.tableUid.value);
-                Logger.info(
-                  'TTL cleanup deleted $deleted rows from table $resolvedName',
-                );
-              }
-
-              if (deleted >= batchSize) {
-                nextPlans.add(plan);
-              }
+            if (result.deleted >= batchSize) {
+              nextPlans.add(plan);
             }
           }
 
-          if (activeKvTables.isNotEmpty) {
-            final tasks = activeKvTables
-                .map<Future<_TtlBatchResult> Function()>(
-                  (table) => () => _runKvCleanupBatch(
-                        table,
-                        cycleNow,
-                        batchSize: batchSize,
-                      ),
-                )
-                .toList(growable: false);
+          // 2. Process system KV tables sequentially
+          if (!yieldedToForeground && !_dataStore.isClosing) {
+            for (final table in activeKvTables) {
+              final y = yieldController.maybeYield();
+              if (y != null) await y;
 
-            final kvResults = await ParallelProcessor.execute<_TtlBatchResult>(
-              tasks,
-              label: 'ttl-cleanup-kv-round-$round',
-              concurrency: concurrency,
-              continueOnError: true,
-            );
-
-            for (int i = 0; i < kvResults.length; i++) {
-              final result = kvResults[i];
-              final table = activeKvTables[i];
-
-              if (result == null || !result.ok) {
-                continue;
+              // Preemptive backpressure: yield immediately if foreground writes are queueing
+              if (foregroundBusyThreshold > 0 &&
+                  _dataStore.writeBufferManager.queueLength >=
+                      foregroundBusyThreshold) {
+                yieldedToForeground = true;
+                nextKvTables.add(table);
+                break;
               }
 
-              final deleted = result.deleted;
-              if (deleted > 0) {
-                roundDeleted += deleted;
-                totalDeleted += deleted;
+              final result = await _runKvCleanupBatch(
+                table,
+                cycleNow,
+                batchSize: batchSize,
+              );
+
+              if (result.ok && result.deleted > 0) {
+                roundDeleted += result.deleted;
+                totalDeleted += result.deleted;
                 Logger.info(
-                  'KV TTL cleanup deleted $deleted rows from table ${table.tableName}',
+                  'KV TTL cleanup deleted ${result.deleted} rows from table ${table.tableName}',
                 );
               }
 
-              if (deleted >= batchSize) {
+              if (result.deleted >= batchSize) {
                 nextKvTables.add(table);
               }
             }
           }
 
-          // Check write buffer pressure and intelligently decide whether to continue this cleanup cycle.
-          final int writeBatchSize = _dataStore.config.writeBatchSize;
-          final int queueLen = _dataStore.writeBufferManager.queueLength;
-          final int flushThreshold =
-              writeBatchSize > 0 ? (writeBatchSize / 10).ceil() : 0;
           final bool hasBacklog =
               nextPlans.isNotEmpty || nextKvTables.isNotEmpty;
-          final bool ioBusy = flushThreshold > 0 && queueLen >= flushThreshold;
 
-          if (roundDeleted <= 0) {
+          if (yieldedToForeground) {
+            // Write buffer is under pressure: yield to foreground writes,
+            // reset last cleanup time and schedule a 10s fast retry
             activePlans = const <_TtlCleanupPlan>[];
             activeKvTables = const <TableContext>[];
-          } else if (hasBacklog && !ioBusy) {
-            // There is still TTL backlog and the write buffer is not busy:
-            // continue another cleanup round and keep CrontabManager active.
+            _lastCleanupMs = 0;
+            _scheduleRetryAfterYield();
+          } else if (roundDeleted <= 0) {
+            activePlans = const <_TtlCleanupPlan>[];
+            activeKvTables = const <TableContext>[];
+          } else if (hasBacklog) {
+            // There is still TTL backlog and write buffer is clean:
+            // continue next gentle round and notify crontab activity
             activePlans = nextPlans;
             activeKvTables = nextKvTables;
             CrontabManager.notifyActivity();
           } else {
-            // Write buffer is under pressure or there is no backlog: yield to
-            // foreground writes and end this cleanup cycle.
             activePlans = const <_TtlCleanupPlan>[];
             activeKvTables = const <TableContext>[];
           }
@@ -693,15 +680,10 @@ class TtlCleanupManager {
         );
       }
     } catch (e) {
-      if (_dataStore.isInitialized) {
+      if (_dataStore.isInitialized && !_dataStore.isClosing) {
         Logger.warn('TTL cleanup cycle failed', rawError: e);
       }
     } finally {
-      // If this cycle did not see any backlog, it is safe to release the
-      // background lease and allow CrontabManager to enter idle-sleep.
-      // When backlog is detected, we intentionally keep the lease so future
-      // idle-stop checks will keep the scheduler active until a backlog-free
-      // cycle occurs.
       if (!cycleHasBacklog) {
         CrontabManager.releaseBackgroundWorkLease(_backgroundLeaseId);
       }

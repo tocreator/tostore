@@ -2841,6 +2841,25 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     }
   }
 
+  /// Next sequential index for demo KV keys with [prefix].
+  ///
+  /// One `orderByKeyDesc` seek: 8-digit suffixes make string max == numeric max.
+  /// Skips a few non-numeric keys (e.g. leftover `prefix~`) without a count scan.
+  Future<int> _nextKvBatchStart(String prefix) async {
+    final page = await widget.example.db.kv
+        .query(isGlobal: _isKvGlobal)
+        .prefix(prefix)
+        .orderByKeyDesc()
+        .limit(1);
+    for (final row in page.data) {
+      final key = row['key']?.toString() ?? '';
+      if (!key.startsWith(prefix)) continue;
+      final parsed = int.tryParse(key.substring(prefix.length));
+      if (parsed != null && parsed > 0) return parsed + 1;
+    }
+    return 1;
+  }
+
   Future<void> _showKvBatchAddDialog() async {
     final result = await showDialog<Map<String, dynamic>>(
       context: context,
@@ -2863,14 +2882,15 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
 
     final sw = Stopwatch()..start();
     try {
+      final startIndex = await _nextKvBatchStart(prefix);
+      final endIndex = startIndex + count - 1;
       const chunkSize = 500;
       var written = 0;
-      for (var start = 1; start <= count; start += chunkSize) {
-        final end = math.min(start + chunkSize - 1, count);
+      for (var start = startIndex; start <= endIndex; start += chunkSize) {
+        final end = math.min(start + chunkSize - 1, endIndex);
         final items = <String, dynamic>{};
         for (var i = start; i <= end; i++) {
-          final key = '$prefix${i.toString().padLeft(3, '0')}';
-          items[key] = 'batch_value_${i.toString().padLeft(3, '0')}';
+          items[_kvBatchKey(prefix, i)] = 'batch_value_${_kvBatchIndexPart(i)}';
         }
         final r =
             await widget.example.db.kv.setMany(items, isGlobal: _isKvGlobal);
@@ -2878,12 +2898,14 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
           logService.add('KV batch partial error: ${_dbResultErrorMessage(r)}',
               LogLevel.warn);
         }
-        written += items.length;
+        written += end - start + 1;
       }
       sw.stop();
       logService.add(
           'KV batch add: $written pairs in ${sw.elapsedMilliseconds}ms '
-          '(${_isKvGlobal ? 'global' : 'space'}, prefix=$prefix)',
+          '(${_isKvGlobal ? 'global' : 'space'}, prefix=$prefix, '
+          'keys ${_kvBatchKey(prefix, startIndex)}..'
+          '${_kvBatchKey(prefix, endIndex)})',
           LogLevel.info);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -2969,7 +2991,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
           controller: keyController,
           decoration: InputDecoration(
             labelText: 'Key',
-            hintText: '${_kKvDefaultKeyPrefix}001',
+            hintText: _kvBatchKey(_kKvDefaultKeyPrefix, 1),
             border: const OutlineInputBorder(),
           ),
           autofocus: true,
@@ -3234,7 +3256,7 @@ class _KvBatchAddDialogState extends State<KvBatchAddDialog> {
                   labelText: 'Key prefix',
                   hintText: _kKvDefaultKeyPrefix,
                   border: OutlineInputBorder(),
-                  helperText: 'Keys: prefix001, prefix002, ...',
+                  helperText: 'Continues from max key, e.g. prefix00000001',
                 ),
                 validator: (v) {
                   if (v == null || v.trim().isEmpty) {
@@ -4836,6 +4858,15 @@ class _VectorSearchDialogState extends State<VectorSearchDialog> {
 const String _kKvSpaceLabel = 'KV (space)';
 const String _kKvGlobalLabel = 'KV (global)';
 const String _kKvDefaultKeyPrefix = 'demo_kv_';
+
+/// Fixed-width numeric suffix so key DESC order matches numeric max.
+const int _kKvBatchIndexWidth = 8;
+
+String _kvBatchIndexPart(int index) =>
+    index.toString().padLeft(_kKvBatchIndexWidth, '0');
+
+String _kvBatchKey(String prefix, int index) =>
+    '$prefix${_kvBatchIndexPart(index)}';
 
 dynamic _parseKvInputValue(String raw) {
   final trimmed = raw.trim();

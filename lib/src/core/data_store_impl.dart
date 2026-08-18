@@ -4423,7 +4423,7 @@ class DataStoreImpl {
         // Prepare now runs on the current isolate (no Map isolate transfer), so
         // avoid the old memory-aware adaptive planner / system-memory probe that
         // only existed to size isolate tasks.
-        const int bufferBatchSize = 100000;
+        const int bufferBatchSize = 1000;
 
         int start = 0;
         while (start < recordsToProcess.length) {

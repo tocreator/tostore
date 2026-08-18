@@ -5,7 +5,6 @@ import 'dart:typed_data';
 import '../handler/binary_schema_codec.dart';
 import '../handler/logger.dart';
 import '../handler/memcomparable.dart';
-import '../handler/parallel_processor.dart';
 import '../handler/space_stats_codec.dart';
 import '../handler/topk_heap.dart';
 import '../handler/value_matcher.dart';
@@ -35,7 +34,6 @@ import 'resource_manager.dart';
 import 'transaction_context.dart';
 import 'tree_cache.dart';
 import 'weight_manager.dart';
-import 'workload_scheduler.dart';
 import 'yield_controller.dart';
 
 /// table data manager - schedule data read/write, backup, index update, etc.
@@ -1012,53 +1010,25 @@ class TableDataManager {
       int totalIndexDataSize = 0;
       int totalIndexEntryCount = 0;
 
-      final statsLease = await _dataStore.workloadScheduler.tryAcquire(
-        WorkloadType.maintenance,
-        requestedTokens: _dataStore.workloadScheduler
-            .capacityTokens(WorkloadType.maintenance),
-        minTokens: 1,
-        label: 'TableDataManager.recalculateAllStatistics',
-      );
-      if (_isSpaceStatsWorkAborted) {
-        statsLease?.release();
-        return;
-      }
-      final int statsConc = (statsLease?.asConcurrency(0.3) ?? 1);
-      final aggList = await ParallelProcessor.execute<
-          ({int records, int tableBytes, int indexBytes, int indexEntries})?>(
-        tableNames.map((name) {
-          return () async {
-            if (_isSpaceStatsWorkAborted) return null;
-            final uid = await tableMetaManager.getUidByName(TableName(name));
-            if (_isSpaceStatsWorkAborted || uid == null) return null;
-            final ctx = await tableMetaManager.getTableContext(uid);
-            if (ctx == null) return null;
-            final meta = await getTableDataMeta(ctx.tableUid);
-            final indexOcc = await _sumTableIndexOccupancy(ctx);
-            return (
-              records: meta?.totalRecordCount ?? 0,
-              tableBytes: meta?.totalSizeBytes ?? 0,
-              indexBytes: indexOcc.sizeBytes,
-              indexEntries: indexOcc.entryCount,
-            );
-          };
-        }).toList(),
-        concurrency: statsConc,
-        label: 'TableDataManager._calculateTableStatistics',
-      );
-      statsLease?.release();
-
       final yieldController =
           YieldController('TableDataManager.recalculateAllStatistics');
-      for (final agg in aggList) {
+      for (final name in tableNames) {
+        if (_isSpaceStatsWorkAborted) break;
         final y2 = yieldController.maybeYield();
         if (y2 != null) await y2;
-        if (agg != null) {
-          totalRecordCount += agg.records;
-          totalTableDataSize += agg.tableBytes;
-          totalIndexDataSize += agg.indexBytes;
-          totalIndexEntryCount += agg.indexEntries;
+
+        final uid = await tableMetaManager.getUidByName(TableName(name));
+        if (_isSpaceStatsWorkAborted || uid == null) continue;
+        final ctx = await tableMetaManager.getTableContext(uid);
+        if (ctx == null) continue;
+        final meta = await getTableDataMeta(ctx.tableUid);
+        final indexOcc = await _sumTableIndexOccupancy(ctx);
+        if (meta != null) {
+          totalRecordCount += meta.totalRecordCount;
+          totalTableDataSize += meta.totalSizeBytes;
         }
+        totalIndexDataSize += indexOcc.sizeBytes;
+        totalIndexEntryCount += indexOcc.entryCount;
       }
 
       if (_isSpaceStatsWorkAborted) return;
@@ -5122,88 +5092,32 @@ class TableDataManager {
     }
 
     // Maintain a bounded global topK heap of size <= needCount.
-    // For performance, compute a local topK per partition in parallel, then merge.
     final globalTop =
         TopKHeap<Map<String, dynamic>>(k: needCount, compare: compareRecords);
 
-    WorkloadLease? lease;
-    try {
-      lease = await _dataStore.workloadScheduler.tryAcquire(
-        WorkloadType.query,
-        requestedTokens:
-            _dataStore.workloadScheduler.capacityTokens(WorkloadType.query),
-        minTokens: 1,
-        label: 'TableDataManager.searchTableData.topK',
-      );
-      final int queryConcurrency = (lease?.asConcurrency(0.3) ?? 1);
-
-      final tasks = <Future<List<Map<String, dynamic>>> Function()>[];
-      // New global B+Tree: build a single task scanning the global leaf chain.
-      tasks.add(() async {
-        final localTop = TopKHeap<Map<String, dynamic>>(
-            k: needCount, compare: compareRecords);
-        await _forEachRecordByPrimaryKeyRangeLogical(
-          table: table,
-          schema: schema,
-          primaryKey: primaryKey,
-          pkMatcher: pkMatcher,
-          reverse: false,
-          limit: null,
-          startKeyInclusive: startKeyBytes,
-          endKeyExclusive: endKeyBytes,
-          rangeMin: rangeMin,
-          rangeMax: rangeMax,
-          includeMin: includeMin,
-          includeMax: includeMax,
-          cursorPk: cursorPk.isNotEmpty ? cursorPk : null,
-          decodeSchema: decodeSchema,
-          decodeFieldStructureOverride: decodeFieldStructureOverride,
-          readFromFileOnly: readFromFileOnly,
-          acceptRow: needsPostFilter ? rowMatches : null,
-          onRecord: (r) {
-            localTop.offer(r);
-            return true;
-          },
-        );
-        return localTop.toSortedList();
-      });
-
-      if (tasks.isEmpty) {
-        return TableScanResult(records: [], count: onlyCount ? 0 : null);
-      }
-
-      final effectiveConcurrency = min(queryConcurrency, tasks.length);
-
-      // Fast timeout estimation: Base 60s + (TotalMaxBytes / 2MB/s / concurrency)
-      // Since tasks.length is 1 for global leaf chain scan, we must use btreePartitionCount to estimate total bytes.
-      final partitionCount = fileMeta?.btreePartitionCount ?? 1;
-      final estTotalBytes =
-          partitionCount * _dataStore.config.maxPartitionFileSize * 1.5;
-      final timeoutSeconds =
-          60 + (estTotalBytes / (2097152 * effectiveConcurrency)).ceil();
-
-      final locals =
-          await ParallelProcessor.execute<List<Map<String, dynamic>>>(
-        tasks,
-        concurrency: effectiveConcurrency,
-        label: 'TableDataManager.searchTableData.topK',
-        timeout: Duration(seconds: timeoutSeconds),
-      );
-
-      // Merge local topK candidates into global topK heap.
-      final yieldControllerMerge =
-          YieldController('TableDataManager.searchTableData.merge');
-      for (final local in locals) {
-        final list = local ?? const <Map<String, dynamic>>[];
-        for (final r in list) {
-          final y23 = yieldControllerMerge.maybeYield();
-          if (y23 != null) await y23;
-          globalTop.offer(r);
-        }
-      }
-    } finally {
-      lease?.release();
-    }
+    await _forEachRecordByPrimaryKeyRangeLogical(
+      table: table,
+      schema: schema,
+      primaryKey: primaryKey,
+      pkMatcher: pkMatcher,
+      reverse: false,
+      limit: null,
+      startKeyInclusive: startKeyBytes,
+      endKeyExclusive: endKeyBytes,
+      rangeMin: rangeMin,
+      rangeMax: rangeMax,
+      includeMin: includeMin,
+      includeMax: includeMax,
+      cursorPk: cursorPk.isNotEmpty ? cursorPk : null,
+      decodeSchema: decodeSchema,
+      decodeFieldStructureOverride: decodeFieldStructureOverride,
+      readFromFileOnly: readFromFileOnly,
+      acceptRow: needsPostFilter ? rowMatches : null,
+      onRecord: (r) {
+        globalTop.offer(r);
+        return true;
+      },
+    );
 
     final sortedList = globalTop.toSortedList();
     if (onlyCount) {
