@@ -96,11 +96,11 @@ class ParallelJournalManager {
     if (PlatformHandler.isWeb) {
       return 1 * 1024 * 1024; // 1MB
     } else if (PlatformHandler.isMobile) {
-      return 20 * 1024 * 1024; // 20MB
+      return 30 * 1024 * 1024; // 30MB
     } else if (PlatformHandler.isServerEnvironment) {
       return 80 * 1024 * 1024; // 80MB
     } else {
-      return 20 * 1024 * 1024; // Desktop: 20MB
+      return 30 * 1024 * 1024; // Desktop: 30MB
     }
   }
 
@@ -113,11 +113,11 @@ class ParallelJournalManager {
     if (PlatformHandler.isWeb) {
       return calculated.clamp(500, 10000);
     } else if (PlatformHandler.isMobile) {
-      return calculated.clamp(10000, 100000);
+      return calculated.clamp(50000, 200000);
     } else if (PlatformHandler.isServerEnvironment) {
       return calculated.clamp(50000, 500000);
     } else {
-      return calculated.clamp(20000, 100000);
+      return calculated.clamp(50000, 200000);
     }
   }
 

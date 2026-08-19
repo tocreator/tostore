@@ -218,16 +218,22 @@ class TableDataManager {
       debugLabel: 'TableDataMetaCache',
     );
 
+    final bool isMemoryMode =
+        _dataStore.config.persistenceMode == PersistenceMode.memory;
     final int tableQuota =
         mem?.getTableDataCacheSize() ?? (128 * 1024 * 1024); // Default 128MB
     // Reserve a portion for range-partition caches (blocks + sparse index).
     final int maxBytes = max(1, (tableQuota * 0.55).toInt());
+    // Memory mode: TableRecordCache is the primary row store (no disk tier).
+    // Disable quota eviction to avoid silent data loss under memory pressure.
     _tableRecordCache = TreeCache<Map<String, dynamic>>(
       sizeCalculator: resolveRecordSizeBytes,
-      maxByteThreshold: maxBytes,
-      minByteThreshold: 50 * 1024 * 1024,
+      maxByteThreshold: isMemoryMode ? 1 : maxBytes,
+      minByteThreshold: isMemoryMode ? 1 : 50 * 1024 * 1024,
       comparatorFactory: _tableRecordComparatorFactory,
-      weightQueryCallback: _queryTableRecordWeight,
+      weightQueryCallback: isMemoryMode ? null : _queryTableRecordWeight,
+      evictionMode:
+          isMemoryMode ? TreeCacheEvictionMode.none : TreeCacheEvictionMode.lru,
       debugLabel: 'TableRecordCache',
     );
 
@@ -480,6 +486,9 @@ class TableDataManager {
 
   /// Evict a ratio of table record cache entries under memory pressure.
   Future<void> evictTableRecordCache({double ratio = 0.3}) async {
+    if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
+      return;
+    }
     await _tableRecordCache.cleanup(removeRatio: ratio);
   }
 

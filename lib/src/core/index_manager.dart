@@ -370,14 +370,18 @@ class IndexManager {
     final indexMetaCacheSize =
         (metaCacheSize * 0.25).toInt(); // 25% of meta cache
 
+    final bool isMemoryMode =
+        _dataStore.config.persistenceMode == PersistenceMode.memory;
     // Initialize index data cache
     _indexDataCache = TreeCache<dynamic>(
       sizeCalculator: _indexDataCacheSizeBytes,
-      maxByteThreshold: (maxBytes * 0.70).toInt(),
-      minByteThreshold: 150 * 1024 * 1024,
+      maxByteThreshold: isMemoryMode ? 1 : (maxBytes * 0.70).toInt(),
+      minByteThreshold: isMemoryMode ? 1 : 150 * 1024 * 1024,
       groupDepth: 2,
       comparatorFactory: _indexComparatorFactory,
-      weightQueryCallback: _queryIndexDataWeight,
+      weightQueryCallback: isMemoryMode ? null : _queryIndexDataWeight,
+      evictionMode:
+          isMemoryMode ? TreeCacheEvictionMode.none : TreeCacheEvictionMode.lru,
       debugLabel: 'IndexDataCache',
     );
 

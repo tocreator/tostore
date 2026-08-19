@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import '../handler/logger.dart';
+import '../model/data_store_config.dart';
 import '../model/table_context.dart';
 import 'data_store_impl.dart';
 import 'resource_manager.dart';
@@ -22,8 +23,12 @@ final class CacheManager {
     final mm = _dataStore.resourceManager;
     if (mm == null) return;
 
+    final bool isMemoryMode =
+        _dataStore.config.persistenceMode == PersistenceMode.memory;
+
     // Table data (hot records + B+Tree pages)
     mm.registerCacheEvictionCallback(MemoryQuotaType.tableData, () async {
+      if (isMemoryMode) return;
       try {
         // Evict record cache first
         await _dataStore.tableDataManager.evictTableRecordCache(ratio: 0.3);
@@ -40,6 +45,7 @@ final class CacheManager {
 
     // Index data (data cache + B+Tree pages + NGH vector pages)
     mm.registerCacheEvictionCallback(MemoryQuotaType.indexData, () async {
+      if (isMemoryMode) return;
       try {
         // Evict B+Tree page cache
         await _dataStore.indexTreePartitionManager?.evictPageCache(ratio: 0.3);

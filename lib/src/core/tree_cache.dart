@@ -1434,8 +1434,23 @@ final class _Group<T> {
   /// Single-suffix ordered view (suffix components only).
   List<Object?>? orderedFlat;
 
+  /// Delta added suffixes since [orderedFlat] was last materialized.
+  final List<Object?> _deltaFlatAdded = <Object?>[];
+
+  /// Delta removed suffixes since [orderedFlat] was last materialized.
+  final Set<Object?> _deltaFlatRemoved = <Object?>{};
+
   /// Multi-suffix / mixed ordered view (full paths).
   List<List<dynamic>>? orderedPaths;
+
+  /// Delta added paths since [orderedPaths] was last materialized.
+  final List<List<dynamic>> _deltaPathsAdded = <List<dynamic>>[];
+
+  /// Delta removed path signatures since [orderedPaths] was last materialized.
+  final Set<String> _deltaPathsRemoved = <String>{};
+
+  /// Delta removed path list for fast bisection removal.
+  final List<List<dynamic>> _deltaPathsRemovedList = <List<dynamic>>[];
 
   bool dirty = true;
 
@@ -1455,6 +1470,9 @@ final class _Group<T> {
   /// Deep path order tree (>2 suffixes); leaves are [_OrderNode].
   Map<Object?, dynamic>? deepPathOrder;
 
+  Comparator<dynamic>? _cachedCmp0;
+  Comparator<dynamic>? _cachedCmp1;
+
   _Group({
     required this.groupPath,
     required this.groupDepth,
@@ -1465,10 +1483,29 @@ final class _Group<T> {
   });
 
   Comparator<dynamic> _suffixComparator(int suffixIndex) {
+    if (suffixIndex == 0) {
+      return _cachedCmp0 ??= (comparatorFactory != null
+          ? comparatorFactory!(groupPath, suffixIndex: 0)
+          : compare);
+    }
+    if (suffixIndex == 1) {
+      return _cachedCmp1 ??= (comparatorFactory != null
+          ? comparatorFactory!(groupPath, suffixIndex: 1)
+          : compare);
+    }
     if (comparatorFactory != null) {
       return comparatorFactory!(groupPath, suffixIndex: suffixIndex);
     }
     return compare;
+  }
+
+  String _pathSignature(List<dynamic> path) {
+    final base = groupDepth;
+    final len = path.length;
+    if (len == base + 1) return '${path[base]}';
+    if (len == base + 2) return '${path[base]}\x00${path[base + 1]}';
+    if (len <= base) return '';
+    return path.sublist(base).join('\x00');
   }
 
   int comparePaths(List<dynamic> a, List<dynamic> b) {
@@ -1866,7 +1903,13 @@ final class _Group<T> {
     flat[suffix] = value;
     if (flat.length == before) return false;
     entryCount++;
-    dirty = true;
+    if (orderedFlat != null && !dirty) {
+      if (!_deltaFlatRemoved.remove(suffix)) {
+        _deltaFlatAdded.add(suffix);
+      }
+    } else {
+      dirty = true;
+    }
     return true;
   }
 
@@ -1874,7 +1917,11 @@ final class _Group<T> {
   bool removeFlatNone(Object? suffix) {
     if (flat.remove(suffix) == null) return false;
     entryCount--;
-    dirty = true;
+    if (orderedFlat != null && !dirty) {
+      _deltaFlatRemoved.add(suffix);
+    } else {
+      dirty = true;
+    }
     return true;
   }
 
@@ -1913,7 +1960,17 @@ final class _Group<T> {
     leaf[s1] = value;
     if (leaf.length == before) return false;
     entryCount++;
-    dirty = true;
+    if (orderedPaths != null && !dirty) {
+      final sig = '$s0\x00$s1';
+      if (!_deltaPathsRemoved.remove(sig)) {
+        final path = List<dynamic>.from(groupPath)
+          ..add(s0)
+          ..add(s1);
+        _deltaPathsAdded.add(path);
+      }
+    } else {
+      dirty = true;
+    }
     return true;
   }
 
@@ -1925,7 +1982,18 @@ final class _Group<T> {
     if (inner is! Map<Object?, dynamic>) return false;
     if (inner.remove(s1) == null) return false;
     entryCount--;
-    dirty = true;
+    if (orderedPaths != null && !dirty) {
+      final sig = '$s0\x00$s1';
+      _deltaPathsRemoved.add(sig);
+      if (_deltaPathsRemovedList.length < 32) {
+        final path = List<dynamic>.from(groupPath)
+          ..add(s0)
+          ..add(s1);
+        _deltaPathsRemovedList.add(path);
+      }
+    } else {
+      dirty = true;
+    }
     if (inner.isEmpty) {
       d.remove(s0);
       if (d.isEmpty) deep = null;
@@ -1956,7 +2024,13 @@ final class _Group<T> {
     attachNew(order);
     totalBytes += sz;
     entryCount++;
-    dirty = true;
+    if (orderedFlat != null && !dirty) {
+      if (!_deltaFlatRemoved.remove(suffix)) {
+        _deltaFlatAdded.add(suffix);
+      }
+    } else {
+      dirty = true;
+    }
     return true;
   }
 
@@ -1971,7 +2045,11 @@ final class _Group<T> {
     totalBytes -= live.order.sizeBytes;
     if (totalBytes < 0) totalBytes = 0;
     detachNode(live.order);
-    dirty = true;
+    if (orderedFlat != null && !dirty) {
+      _deltaFlatRemoved.add(suffix);
+    } else {
+      dirty = true;
+    }
     return true;
   }
 
@@ -2023,7 +2101,17 @@ final class _Group<T> {
     final isNew = leaf.length > before;
     if (isNew) {
       entryCount++;
-      dirty = true;
+      if (orderedPaths != null && !dirty) {
+        final sig = '$s0\x00$s1';
+        if (!_deltaPathsRemoved.remove(sig)) {
+          final path = List<dynamic>.from(groupPath)
+            ..add(s0)
+            ..add(s1);
+          _deltaPathsAdded.add(path);
+        }
+      } else {
+        dirty = true;
+      }
     }
     _noteDeep2Order(s0, s1, sizeBytes <= 0 ? 1 : sizeBytes, isNew: isNew);
     return isNew;
@@ -2040,7 +2128,18 @@ final class _Group<T> {
     if (inner is! Map<Object?, dynamic>) return false;
     if (inner.remove(s1) == null) return false;
     entryCount--;
-    dirty = true;
+    if (orderedPaths != null && !dirty) {
+      final sig = '$s0\x00$s1';
+      _deltaPathsRemoved.add(sig);
+      if (_deltaPathsRemovedList.length < 32) {
+        final path = List<dynamic>.from(groupPath)
+          ..add(s0)
+          ..add(s1);
+        _deltaPathsRemovedList.add(path);
+      }
+    } else {
+      dirty = true;
+    }
     _removeDeep2Order(s0, s1);
     if (inner.isEmpty) {
       d.remove(s0);
@@ -2228,45 +2327,403 @@ final class _Group<T> {
   // ---- ordered / range ----
 
   void ensureOrdered() {
-    if (!dirty && (orderedFlat != null || orderedPaths != null)) return;
-
     final usePaths = _orderedNeedsPaths || _hasExact || deep != null;
     if (!usePaths) {
-      final Iterable<Object?> keyIter =
-          orderEnabled ? (flatLive?.keys ?? const <Object?>[]) : flat.keys;
-      final keys = keyIter.toList(growable: true);
-      keys.sort(_suffixComparator(0));
-      orderedFlat = keys;
-      orderedPaths = null;
-      dirty = false;
+      if (orderedFlat == null || dirty) {
+        final Iterable<Object?> keyIter =
+            orderEnabled ? (flatLive?.keys ?? const <Object?>[]) : flat.keys;
+        final keys = keyIter.toList(growable: true);
+        keys.sort(_suffixComparator(0));
+        orderedFlat = keys;
+        _deltaFlatAdded.clear();
+        _deltaFlatRemoved.clear();
+        orderedPaths = null;
+        dirty = false;
+        return;
+      }
+
+      if (_deltaFlatAdded.isEmpty && _deltaFlatRemoved.isEmpty) {
+        return;
+      }
+
+      final cmp = _suffixComparator(0);
+
+      // Fast bisection insert for small addition-only batches
+      if (_deltaFlatRemoved.isEmpty && _deltaFlatAdded.length <= 16) {
+        for (final k in _deltaFlatAdded) {
+          final idx = _lowerBoundFlat(k);
+          if (idx < orderedFlat!.length && cmp(orderedFlat![idx], k) == 0) {
+            continue;
+          }
+          orderedFlat!.insert(idx, k);
+        }
+        _deltaFlatAdded.clear();
+        return;
+      }
+
+      // Fast bisection remove for small deletion-only batches
+      if (_deltaFlatAdded.isEmpty && _deltaFlatRemoved.length <= 16) {
+        for (final k in _deltaFlatRemoved) {
+          final idx = _lowerBoundFlat(k);
+          if (idx < orderedFlat!.length && cmp(orderedFlat![idx], k) == 0) {
+            orderedFlat!.removeAt(idx);
+          }
+        }
+        _deltaFlatRemoved.clear();
+        return;
+      }
+
+      if (_deltaFlatAdded.isNotEmpty) {
+        _deltaFlatAdded.sort(cmp);
+        // Deduplicate _deltaFlatAdded if consecutive duplicates exist
+        var uniqueCount = 1;
+        for (var d = 1; d < _deltaFlatAdded.length; d++) {
+          if (cmp(_deltaFlatAdded[d], _deltaFlatAdded[uniqueCount - 1]) != 0) {
+            _deltaFlatAdded[uniqueCount++] = _deltaFlatAdded[d];
+          }
+        }
+        if (uniqueCount < _deltaFlatAdded.length) {
+          _deltaFlatAdded.length = uniqueCount;
+        }
+      }
+
+      final oldBase = orderedFlat!;
+      final newCap =
+          oldBase.length + _deltaFlatAdded.length - _deltaFlatRemoved.length;
+      final merged =
+          List<Object?>.filled(newCap > 0 ? newCap : 0, null, growable: true);
+
+      var i = 0, j = 0, k = 0;
+      final n = oldBase.length;
+      final m = _deltaFlatAdded.length;
+
+      if (_deltaFlatRemoved.isEmpty) {
+        while (i < n && j < m) {
+          final oldKey = oldBase[i];
+          final newKey = _deltaFlatAdded[j];
+          final c = cmp(oldKey, newKey);
+          if (c < 0) {
+            if (k < merged.length) {
+              merged[k++] = oldKey;
+            } else {
+              merged.add(oldKey);
+            }
+            i++;
+          } else if (c > 0) {
+            if (k < merged.length) {
+              merged[k++] = newKey;
+            } else {
+              merged.add(newKey);
+            }
+            j++;
+          } else {
+            if (k < merged.length) {
+              merged[k++] = oldKey;
+            } else {
+              merged.add(oldKey);
+            }
+            i++;
+            j++;
+          }
+        }
+        if (i < n) {
+          final count = n - i;
+          if (k + count <= merged.length) {
+            merged.setRange(k, k + count, oldBase, i);
+            k += count;
+          } else {
+            while (i < n) {
+              merged.add(oldBase[i++]);
+            }
+            k = merged.length;
+          }
+        }
+        if (j < m) {
+          final count = m - j;
+          if (k + count <= merged.length) {
+            merged.setRange(k, k + count, _deltaFlatAdded, j);
+            k += count;
+          } else {
+            while (j < m) {
+              merged.add(_deltaFlatAdded[j++]);
+            }
+            k = merged.length;
+          }
+        }
+      } else {
+        while (i < n && j < m) {
+          final oldKey = oldBase[i];
+          if (_deltaFlatRemoved.contains(oldKey)) {
+            i++;
+            continue;
+          }
+          final newKey = _deltaFlatAdded[j];
+          final c = cmp(oldKey, newKey);
+          if (c < 0) {
+            if (k < merged.length) {
+              merged[k++] = oldKey;
+            } else {
+              merged.add(oldKey);
+            }
+            i++;
+          } else if (c > 0) {
+            if (k < merged.length) {
+              merged[k++] = newKey;
+            } else {
+              merged.add(newKey);
+            }
+            j++;
+          } else {
+            if (k < merged.length) {
+              merged[k++] = oldKey;
+            } else {
+              merged.add(oldKey);
+            }
+            i++;
+            j++;
+          }
+        }
+
+        while (i < n) {
+          final oldKey = oldBase[i++];
+          if (!_deltaFlatRemoved.contains(oldKey)) {
+            if (k < merged.length) {
+              merged[k++] = oldKey;
+            } else {
+              merged.add(oldKey);
+            }
+          }
+        }
+
+        while (j < m) {
+          final newKey = _deltaFlatAdded[j++];
+          if (k < merged.length) {
+            merged[k++] = newKey;
+          } else {
+            merged.add(newKey);
+          }
+        }
+      }
+
+      if (k < merged.length) {
+        merged.length = k;
+      }
+
+      orderedFlat = merged;
+      _deltaFlatAdded.clear();
+      _deltaFlatRemoved.clear();
       return;
     }
 
-    final paths = <List<dynamic>>[];
-    if (_hasExact) {
-      paths.add(List<dynamic>.from(groupPath));
-    }
-    if (orderEnabled) {
-      final live = flatLive;
-      if (live != null) {
-        for (final e in live.entries) {
+    if (orderedPaths == null || dirty) {
+      final paths = <List<dynamic>>[];
+      if (_hasExact) {
+        paths.add(List<dynamic>.from(groupPath));
+      }
+      if (orderEnabled) {
+        final live = flatLive;
+        if (live != null) {
+          for (final e in live.entries) {
+            paths.add(List<dynamic>.from(groupPath)..add(e.key));
+          }
+        }
+      } else {
+        for (final e in flat.entries) {
           paths.add(List<dynamic>.from(groupPath)..add(e.key));
         }
       }
-    } else {
-      for (final e in flat.entries) {
-        paths.add(List<dynamic>.from(groupPath)..add(e.key));
+      final d = deep;
+      if (d != null) {
+        _collectDeepPaths(d, List<dynamic>.from(groupPath), paths);
+      }
+      paths.sort(comparePaths);
+      orderedPaths = paths;
+      orderedFlat = null;
+      _deltaPathsAdded.clear();
+      _deltaPathsRemoved.clear();
+      _deltaPathsRemovedList.clear();
+      dirty = false;
+      _orderedNeedsPaths = usePaths;
+      return;
+    }
+
+    if (_deltaPathsAdded.isEmpty && _deltaPathsRemoved.isEmpty) {
+      return;
+    }
+
+    // Fast bisection insert for small addition-only batches
+    if (_deltaPathsRemoved.isEmpty && _deltaPathsAdded.length <= 16) {
+      for (final p in _deltaPathsAdded) {
+        final idx = _lowerBoundPaths(p);
+        if (idx < orderedPaths!.length &&
+            comparePaths(orderedPaths![idx], p) == 0) {
+          continue;
+        }
+        orderedPaths!.insert(idx, p);
+      }
+      _deltaPathsAdded.clear();
+      return;
+    }
+
+    // Fast bisection remove for small deletion-only batches
+    if (_deltaPathsAdded.isEmpty &&
+        _deltaPathsRemoved.length <= 16 &&
+        _deltaPathsRemovedList.length == _deltaPathsRemoved.length) {
+      for (final p in _deltaPathsRemovedList) {
+        final idx = _lowerBoundPaths(p);
+        if (idx < orderedPaths!.length &&
+            comparePaths(orderedPaths![idx], p) == 0) {
+          orderedPaths!.removeAt(idx);
+        }
+      }
+      _deltaPathsRemoved.clear();
+      _deltaPathsRemovedList.clear();
+      return;
+    }
+
+    if (_deltaPathsAdded.isNotEmpty) {
+      _deltaPathsAdded.sort(comparePaths);
+      var uniqueCount = 1;
+      for (var d = 1; d < _deltaPathsAdded.length; d++) {
+        if (comparePaths(
+                _deltaPathsAdded[d], _deltaPathsAdded[uniqueCount - 1]) !=
+            0) {
+          _deltaPathsAdded[uniqueCount++] = _deltaPathsAdded[d];
+        }
+      }
+      if (uniqueCount < _deltaPathsAdded.length) {
+        _deltaPathsAdded.length = uniqueCount;
       }
     }
-    final d = deep;
-    if (d != null) {
-      _collectDeepPaths(d, List<dynamic>.from(groupPath), paths);
+
+    final oldBase = orderedPaths!;
+    final newCap =
+        oldBase.length + _deltaPathsAdded.length - _deltaPathsRemoved.length;
+    final merged = List<List<dynamic>>.filled(
+        newCap > 0 ? newCap : 0, const <dynamic>[],
+        growable: true);
+
+    var i = 0, j = 0, k = 0;
+    final n = oldBase.length;
+    final m = _deltaPathsAdded.length;
+
+    if (_deltaPathsRemoved.isEmpty) {
+      while (i < n && j < m) {
+        final oldPath = oldBase[i];
+        final newPath = _deltaPathsAdded[j];
+        final c = comparePaths(oldPath, newPath);
+        if (c < 0) {
+          if (k < merged.length) {
+            merged[k++] = oldPath;
+          } else {
+            merged.add(oldPath);
+          }
+          i++;
+        } else if (c > 0) {
+          if (k < merged.length) {
+            merged[k++] = newPath;
+          } else {
+            merged.add(newPath);
+          }
+          j++;
+        } else {
+          if (k < merged.length) {
+            merged[k++] = oldPath;
+          } else {
+            merged.add(oldPath);
+          }
+          i++;
+          j++;
+        }
+      }
+      if (i < n) {
+        final count = n - i;
+        if (k + count <= merged.length) {
+          merged.setRange(k, k + count, oldBase, i);
+          k += count;
+        } else {
+          while (i < n) {
+            merged.add(oldBase[i++]);
+          }
+          k = merged.length;
+        }
+      }
+      if (j < m) {
+        final count = m - j;
+        if (k + count <= merged.length) {
+          merged.setRange(k, k + count, _deltaPathsAdded, j);
+          k += count;
+        } else {
+          while (j < m) {
+            merged.add(_deltaPathsAdded[j++]);
+          }
+          k = merged.length;
+        }
+      }
+    } else {
+      while (i < n && j < m) {
+        final oldPath = oldBase[i];
+        final oldSig = _pathSignature(oldPath);
+        if (_deltaPathsRemoved.contains(oldSig)) {
+          i++;
+          continue;
+        }
+        final newPath = _deltaPathsAdded[j];
+        final c = comparePaths(oldPath, newPath);
+        if (c < 0) {
+          if (k < merged.length) {
+            merged[k++] = oldPath;
+          } else {
+            merged.add(oldPath);
+          }
+          i++;
+        } else if (c > 0) {
+          if (k < merged.length) {
+            merged[k++] = newPath;
+          } else {
+            merged.add(newPath);
+          }
+          j++;
+        } else {
+          if (k < merged.length) {
+            merged[k++] = oldPath;
+          } else {
+            merged.add(oldPath);
+          }
+          i++;
+          j++;
+        }
+      }
+
+      while (i < n) {
+        final oldPath = oldBase[i++];
+        final oldSig = _pathSignature(oldPath);
+        if (!_deltaPathsRemoved.contains(oldSig)) {
+          if (k < merged.length) {
+            merged[k++] = oldPath;
+          } else {
+            merged.add(oldPath);
+          }
+        }
+      }
+
+      while (j < m) {
+        final newPath = _deltaPathsAdded[j++];
+        if (k < merged.length) {
+          merged[k++] = newPath;
+        } else {
+          merged.add(newPath);
+        }
+      }
     }
-    paths.sort(comparePaths);
-    orderedPaths = paths;
-    orderedFlat = null;
-    dirty = false;
-    _orderedNeedsPaths = usePaths;
+
+    if (k < merged.length) {
+      merged.length = k;
+    }
+
+    orderedPaths = merged;
+    _deltaPathsAdded.clear();
+    _deltaPathsRemoved.clear();
   }
 
   void _collectDeepPaths(
