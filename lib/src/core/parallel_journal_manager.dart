@@ -5,6 +5,7 @@ import 'package:path/path.dart' as p;
 
 import '../handler/encryption.dart';
 import '../handler/logger.dart';
+import '../handler/platform_handler.dart';
 import '../handler/value_matcher.dart';
 import '../interface/storage_interface.dart';
 import '../model/background_write_entry.dart';
@@ -12,6 +13,7 @@ import '../model/background_write_type.dart';
 import '../model/buffer_entry.dart';
 import '../model/data_store_config.dart';
 import '../model/db_exception.dart';
+import '../model/flush_pressure_state.dart';
 import '../model/id_generator.dart';
 import '../model/index_entry.dart';
 import '../model/meta_info.dart';
@@ -48,24 +50,167 @@ class ParallelJournalManager {
   BatchContext? _activeBatchContext;
   bool _isRecovering = false; // Flag to indicate if currently in recovery mode
 
+  /// Number of records currently popped from queue and being actively flushed to disk.
+  int _inFlightFlushCount = 0;
+
+  /// Count of active large batch operations (e.g. batchInsert/batchUpsert/batchUpdate).
+  int _activeBatchOperationCount = 0;
+
+  /// Sampled average total bytes per record (table data + all indexes).
+  int _averageRecordSizeBytes = 200;
+
+  /// Timestamp (ms) when [_averageRecordSizeBytes] was last persisted to GlobalConfig.
+  int _lastAverageRecordSavedAtMs = 0;
+
+  /// Waiters suspended during [FlushPressureState.busy] waiting for flush release.
+  final List<Completer<void>> _busyWaiters = <Completer<void>>[];
+
   /// True while a flush pump turn is executing (after queue pop, before turn ends).
   bool get isFlushInProgress => _flushInProgress;
+
+  /// Current number of records in-flight being written to disk.
+  int get inFlightFlushCount => _inFlightFlushCount;
+
+  /// Current number of active batch client operations.
+  int get activeBatchOperationCount => _activeBatchOperationCount;
+
+  /// Register the start of an active batch operation.
+  void beginBatchOperation() {
+    _activeBatchOperationCount++;
+  }
+
+  /// Unregister an active batch operation.
+  void endBatchOperation() {
+    if (_activeBatchOperationCount > 0) {
+      _activeBatchOperationCount--;
+    }
+  }
 
   // When set (close / switchSpace / flushCompletely), skip online tail-fill
   // delays and wake any in-flight wait so drain can proceed immediately.
   bool _immediateFlushRequested = false;
   Completer<void>? _tailWaitWake;
 
-  // -- Write backpressure (measurement-based) --
-  // Measured per-record flush cost from the last completed batch (microseconds).
-  int _perRecordFlushUs = 0;
-  // Active throttle delay per record (us); 0 when not congested.
-  // Set by _onBufferSizeChanged (1 compare + 1 assign), read by waitIfThrottled.
-  int _throttleDelayPerRecordUs = 0;
+  /// Target flush batch bytes per platform.
+  static int _getTargetFlushBatchBytes() {
+    if (PlatformHandler.isWeb) {
+      return 1 * 1024 * 1024; // 1MB
+    } else if (PlatformHandler.isMobile) {
+      return 20 * 1024 * 1024; // 20MB
+    } else if (PlatformHandler.isServerEnvironment) {
+      return 80 * 1024 * 1024; // 80MB
+    } else {
+      return 20 * 1024 * 1024; // Desktop: 20MB
+    }
+  }
 
-  /// Minimum total delay (us) below which we skip the await entirely
-  /// to avoid micro-delay overhead. 1000us = 1ms.
-  static const int _kMinThrottleDelayUs = 1000;
+  /// Dynamically calculated writeBatchSize based on target bytes and average record size.
+  int get effectiveWriteBatchSize {
+    final int targetBytes = _getTargetFlushBatchBytes();
+    final int avgBytes =
+        _averageRecordSizeBytes > 0 ? _averageRecordSizeBytes : 200;
+    final int calculated = targetBytes ~/ avgBytes;
+    if (PlatformHandler.isWeb) {
+      return calculated.clamp(500, 10000);
+    } else if (PlatformHandler.isMobile) {
+      return calculated.clamp(10000, 100000);
+    } else if (PlatformHandler.isServerEnvironment) {
+      return calculated.clamp(50000, 500000);
+    } else {
+      return calculated.clamp(20000, 100000);
+    }
+  }
+
+  /// Total records pending persistence: queued in buffer + actively in-flight flushing.
+  int get totalPending => _bufferManager.queueLength + _inFlightFlushCount;
+
+  /// Flush busy threshold calculated from 30% of ResourceManager memory threshold.
+  /// Clamped between 3x and 10x [effectiveWriteBatchSize].
+  int get busyThreshold {
+    final rm = _dataStore.resourceManager;
+    final int memoryThresholdMB = rm != null ? rm.memoryThresholdInMB : 256;
+    final int avgBytes =
+        _averageRecordSizeBytes > 0 ? _averageRecordSizeBytes : 200;
+    final int availableBytes = (memoryThresholdMB * 0.30 * 1024 * 1024).toInt();
+    final int maxPendingByMemory = availableBytes ~/ avgBytes;
+    final int currentBatchSize = effectiveWriteBatchSize;
+    return maxPendingByMemory.clamp(
+        currentBatchSize * 3, currentBatchSize * 10);
+  }
+
+  /// Current flush pressure state.
+  FlushPressureState get pressureState {
+    final pending = totalPending;
+    if (pending == 0) return FlushPressureState.idle;
+    if (pending <= busyThreshold) return FlushPressureState.normal;
+    return FlushPressureState.busy;
+  }
+
+  /// Notify suspended busy waiters when a flush batch finishes.
+  void _notifyBusyWaiters() {
+    if (_busyWaiters.isEmpty) return;
+    final waiters = List<Completer<void>>.from(_busyWaiters);
+    _busyWaiters.clear();
+    for (final w in waiters) {
+      if (!w.isCompleted) {
+        w.complete();
+      }
+    }
+  }
+
+  /// Suspend caller until total pending drops below [busyThreshold] or timeout.
+  Future<void> _waitUntilPressureRelieved({
+    Duration timeout = const Duration(seconds: 120),
+  }) async {
+    if (pressureState != FlushPressureState.busy) return;
+    final deadline = DateTime.now().add(timeout);
+
+    while (_running && pressureState == FlushPressureState.busy) {
+      if (DateTime.now().isAfter(deadline)) break;
+      final c = Completer<void>();
+      _busyWaiters.add(c);
+      try {
+        await Future.any<void>([
+          Future<void>.delayed(const Duration(milliseconds: 50)),
+          c.future,
+        ]);
+      } finally {
+        _busyWaiters.remove(c);
+      }
+    }
+  }
+
+  /// Update running average record size using an authoritative sample from table persistence delta.
+  void recordFlushRecordSizeSample(int sampleBytes) {
+    if (sampleBytes <= 0) return;
+    final clamped = sampleBytes.clamp(32, 100 * 1024 * 1024);
+    _averageRecordSizeBytes =
+        ((_averageRecordSizeBytes * 0.7) + (clamped * 0.3)).round();
+
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    const int oneDayMs = 24 * 60 * 60 * 1000;
+    if (nowMs - _lastAverageRecordSavedAtMs > oneDayMs) {
+      _lastAverageRecordSavedAtMs = nowMs;
+      unawaited(_saveAverageRecordSizeToGlobalConfig());
+    }
+  }
+
+  /// Asynchronously persist updated average record size to GlobalConfig (at most once per 24 hours).
+  Future<void> _saveAverageRecordSizeToGlobalConfig() async {
+    try {
+      final currentCfg = await _dataStore.getGlobalConfig();
+      if (currentCfg != null) {
+        final updated = currentCfg.copyWith(
+          averageRecordSizeBytes: _averageRecordSizeBytes,
+          lastAverageRecordSavedAtMs: _lastAverageRecordSavedAtMs,
+        );
+        await _dataStore.saveGlobalConfig(updated);
+      }
+    } catch (e) {
+      Logger.debug(
+          'Failed to persist averageRecordSizeBytes to GlobalConfig: $e');
+    }
+  }
 
   /// Interrupt online tail-fill wait so close/switchSpace/flush can drain now.
   void _requestImmediateFlush() {
@@ -127,49 +272,19 @@ class ParallelJournalManager {
     return null;
   }
 
-  /// Soft write backpressure: called by WriteBufferManager before enqueue.
-  ///
-  /// Hot path cost: 1 multiply + 1 compare. Skips await when delay < 1ms.
-  /// [count] = 1 for single addRecord, or N for periodic batch checks.
-  /// Prefer [applyEnqueueBackpressure] which avoids await on the hot path.
-  Future<void> waitIfThrottled([int count = 1]) {
-    if (_throttleDelayPerRecordUs < _kMinThrottleDelayUs) {
-      return Future<void>.value();
-    }
-    final totalUs = _throttleDelayPerRecordUs * count;
-    return Future<void>.delayed(Duration(microseconds: totalUs));
-  }
-
-  /// Hard backpressure: wait until write queue length is at or below [cap].
-  /// Polls [pollInterval] until condition is met or [timeout].
-  /// [timeout] prevents deadlock if flush is stuck; null = no timeout.
-  Future<void> waitUntilQueueBelow(
-    int cap, {
-    Duration pollInterval = const Duration(milliseconds: 20),
-    Duration? timeout,
-  }) async {
-    if (cap <= 0 || _bufferManager.queueLength <= cap) return;
-    final stopAt = timeout != null ? DateTime.now().add(timeout) : null;
-    while (_running && _bufferManager.queueLength > cap) {
-      if (stopAt != null && DateTime.now().isAfter(stopAt)) break;
-      await Future.delayed(pollInterval);
-    }
-  }
-
   /// Enqueue-path backpressure for [WriteBufferManager].
   ///
-  /// Returns `null` on the hot path (memory mode / no soft delay / normal
-  /// Returns a [Future] only when soft delay or hard resource wait is needed.
+  /// Returns `null` on the hot path (normal pressure state / healthy system memory).
+  /// Returns a [Future] only when flush is busy or hard resource wait is needed.
   Future<void>? applyEnqueueBackpressure([int count = 1]) {
-    // Soft throttle off + memory normal -> never await on the enqueue hot path.
-    if (_throttleDelayPerRecordUs < _kMinThrottleDelayUs) {
+    // Fast-path: When pressure is normal or idle and memory status is healthy,
+    // execute pure-sync zero await to guarantee maximum throughput.
+    if (pressureState != FlushPressureState.busy) {
       final rm = _dataStore.resourceManager;
       if (rm == null || rm.memoryStatus == ResourceStatus.normal) {
         return null;
       }
     }
-
-    // Rare: only consulted when soft/queue/status already indicate pressure.
     if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
       return null;
     }
@@ -177,37 +292,40 @@ class ParallelJournalManager {
   }
 
   Future<void> _applyEnqueueBackpressureSlow(int count) async {
-    await waitIfThrottled(count);
-
     final rm = _dataStore.resourceManager;
-    if (rm == null) return;
+    if (rm != null) {
+      if (pressureState == FlushPressureState.busy ||
+          rm.memoryStatus != ResourceStatus.normal) {
+        await rm.triggerImmediateCheck();
+      }
 
-    final batchSize = _dataStore.config.writeBatchSize;
-    final congested = batchSize > 0 && _bufferManager.queueLength > batchSize;
+      if (rm.isWriteBlocked) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.sysResourceExhaustedMemory,
+            message:
+                'Write buffer enqueue blocked: system memory is critically low.',
+            operation: 'applyEnqueueBackpressure',
+          ),
+        ]);
+      }
 
-    // When congested under "normal", still probe so a stale status cannot
-    // miss the transition to warning. ResourceManager is >=2s throttled.
-    if (congested || rm.memoryStatus != ResourceStatus.normal) {
-      await rm.triggerImmediateCheck();
+      if (rm.memoryStatus == ResourceStatus.warning) {
+        scheduleFlushIfNeeded();
+        final wake = _tailWaitWake;
+        if (wake != null && !wake.isCompleted) {
+          wake.complete();
+        }
+      }
     }
 
-    if (rm.isWriteBlocked) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.sysResourceExhaustedMemory,
-          message:
-              'Write buffer enqueue blocked: system memory is critically low.',
-          operation: 'applyEnqueueBackpressure',
-        ),
-      ]);
-    }
-
-    if (rm.memoryStatus == ResourceStatus.warning) {
-      final target = batchSize > 0 ? batchSize : 5000;
-      await waitUntilQueueBelow(
-        target,
-        timeout: const Duration(seconds: 120),
-      );
+    if (pressureState == FlushPressureState.busy) {
+      scheduleFlushIfNeeded();
+      final wake = _tailWaitWake;
+      if (wake != null && !wake.isCompleted) {
+        wake.complete();
+      }
+      await _waitUntilPressureRelieved(timeout: const Duration(seconds: 60));
     }
   }
 
@@ -215,12 +333,14 @@ class ParallelJournalManager {
     if (_running) return;
     _running = true;
 
-    // Initial per-record flush estimate from config, so throttling works
-    // immediately before the first real measurement arrives.
-    // e.g. mobile: 5000ms * 1000 / 100K = 50us per record.
-    final bs = _dataStore.config.writeBatchSize;
-    _perRecordFlushUs =
-        bs > 0 ? _dataStore.config.maxFlushLatencyMs * 1000 ~/ bs : 50;
+    // Load initial average record size from persisted GlobalConfig to avoid SpaceStats cold IO.
+    try {
+      final globalCfg = await _dataStore.getGlobalConfig();
+      if (globalCfg != null && globalCfg.averageRecordSizeBytes > 0) {
+        _averageRecordSizeBytes = globalCfg.averageRecordSizeBytes;
+        _lastAverageRecordSavedAtMs = globalCfg.lastAverageRecordSavedAtMs;
+      }
+    } catch (_) {}
 
     // Reconcile incomplete pending batches: load flush WAL ranges into buffer
     // first; do not start recovery flush until _recoverFromWal finishes, so the
@@ -357,10 +477,10 @@ class ParallelJournalManager {
       _running = false;
       _loopFuture = null;
       _flushInProgress = false;
-      _perRecordFlushUs = 0;
-      _throttleDelayPerRecordUs = 0;
       _activeBatchContext = null;
       _isRecovering = false;
+      _inFlightFlushCount = 0;
+      _notifyBusyWaiters();
       _clearImmediateFlushRequest();
     }
   }
@@ -374,6 +494,8 @@ class ParallelJournalManager {
       _loopFuture = null;
       _flushInProgress = false;
       _activeBatchContext = null;
+      _inFlightFlushCount = 0;
+      _notifyBusyWaiters();
       _bufferManager.clearAll();
       return;
     }
@@ -400,6 +522,8 @@ class ParallelJournalManager {
       _loopFuture = null;
       _flushInProgress = false;
       _activeBatchContext = null;
+      _inFlightFlushCount = 0;
+      _notifyBusyWaiters();
       _clearImmediateFlushRequest();
       // Drop all pending buffered writes; caller has decided not to persist these data
       _bufferManager.clearAll();
@@ -428,31 +552,25 @@ class ParallelJournalManager {
 
   /// Tail-wait strategy for normal online flush:
   ///
-  /// If the queue is below [targetSize], wait in [delayMs] windows.
-  /// - If the queue grows during the wait but still doesn't reach [targetSize],
-  ///   wait another window (up to [maxExtraRounds] times).
-  /// - If the queue does not grow, return quickly so we flush the tail.
-  /// - If [_immediateFlushRequested] (close / switchSpace / flush), return
-  ///   immediately; the wait is interruptible via [_tailWaitWake].
-  ///
-  /// This matches "keep waiting 5s while data keeps arriving" for mobile,
-  /// without starving durability indefinitely.
+  /// Intelligently yields to active batch operations and continuously growing writes.
   Future<void> _waitTailFillWhileGrowing({
     required int targetSize,
   }) async {
     if (_immediateFlushRequested) return;
-    if (_bufferManager.queueLength >= targetSize) return;
 
-    while (true) {
+    while (_running) {
       if (_immediateFlushRequested) return;
       final before = _bufferManager.queueLength;
-      if (before >= targetSize) return;
-      if (before <= 0) return;
+      if (before <= 0 && _inFlightFlushCount <= 0) return;
+
+      // If pressure is already busy, flush immediately to relieve backpressure.
+      if (pressureState == FlushPressureState.busy) return;
+
       final wake = Completer<void>();
       _tailWaitWake = wake;
       try {
         await Future.any<void>([
-          Future<void>.delayed(Duration(milliseconds: 1000)),
+          Future<void>.delayed(const Duration(milliseconds: 1000)),
           wake.future,
         ]);
       } finally {
@@ -463,12 +581,18 @@ class ParallelJournalManager {
       if (_immediateFlushRequested) return;
 
       final after = _bufferManager.queueLength;
-      if (after >= targetSize) return;
+      // If busy threshold reached, trigger flush now.
+      if (pressureState == FlushPressureState.busy) return;
 
-      // If no growth in this window, flush now (tail is stable).
-      if (after <= before) return;
+      // If active batch operations are in-flight and state is normal, yield and keep waiting.
+      if (_activeBatchOperationCount > 0) {
+        continue;
+      }
 
-      return;
+      // When writes stabilize (data did not grow in 1s window), flush immediately!
+      if (after <= before) {
+        return;
+      }
     }
   }
 
@@ -499,7 +623,7 @@ class ParallelJournalManager {
     // The check above (isRecovering) handles the recursion case, but we keep the explicit
     // recoveryBatchContext check for clarity and safety.
 
-    final batchSize = batchSizeOverride ?? _dataStore.config.writeBatchSize;
+    final batchSize = batchSizeOverride ?? effectiveWriteBatchSize;
     bool firstIteration = true;
 
     while (_running &&
@@ -572,6 +696,7 @@ class ParallelJournalManager {
           }
         }
 
+        _inFlightFlushCount = batch.length;
         backgroundRecordsCount = bgEntries.length;
 
         if (batch.isEmpty && bgEntries.isEmpty) {
@@ -1193,28 +1318,21 @@ class ParallelJournalManager {
         // Clear map reference to release memory immediately for GC optimization
         bgLargeUpdatesByTable.clear();
 
-        // -- Backpressure: measure per-record flush cost --
-        final batchElapsedUs = batchSw.elapsedMicroseconds;
-        if (batch.isNotEmpty) {
-          _perRecordFlushUs = batchElapsedUs ~/ batch.length;
-        }
-        // Reset throttle if queue is no longer congested after flush,
-        // so remaining operations don't wait unnecessarily.
-        if (_throttleDelayPerRecordUs > 0 &&
-            _bufferManager.queueLength <= _dataStore.config.writeBatchSize) {
-          _throttleDelayPerRecordUs = 0;
-        }
+        // Reset inFlightFlushCount and notify waiters immediately after physical data & index writes,
+        // so front-end batchInsert is unblocked without waiting for checkpoint advancement.
+        _inFlightFlushCount = 0;
+        _notifyBusyWaiters();
 
         if (!quietSpaceStatsLog) {
           final now = DateTime.now();
           final at =
               '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}.${now.millisecond.toString().padLeft(3, '0')}';
           Logger.debug(
-              'Batch flush completed: items=${batch.length}, tables=${grouped.length}, records=$totalBatchUniqueRecords, remaining=${_bufferManager.queueLength}, cost=${batchSw.elapsedMilliseconds}ms, at: $at');
+              'Batch flush completed: items=${batch.length}, tables=${grouped.length}, records=$totalBatchUniqueRecords, avgRecordBytes=$_averageRecordSizeBytes, state=${pressureState.name}, totalPending=$totalPending, remaining=${_bufferManager.queueLength}, cost=${batchSw.elapsedMilliseconds}ms, at: $at');
         }
 
         // Trigger resource check after significant data writes
-        if (batch.length >= (_dataStore.config.writeBatchSize * 0.8)) {
+        if (batch.length >= (effectiveWriteBatchSize * 0.8)) {
           _dataStore.resourceManager?.triggerImmediateCheck();
         }
 
@@ -1262,6 +1380,8 @@ class ParallelJournalManager {
         }
         await _dataStore.tableDataManager.persistRuntimeMetaIfNeeded();
       } catch (e) {
+        _inFlightFlushCount = 0;
+        _notifyBusyWaiters();
         if (!_running) {
           break;
         }
@@ -1283,19 +1403,15 @@ class ParallelJournalManager {
   void _onBufferSizeChanged(int size) {
     if (!_running) return;
 
-    // Soft backpressure: O(1) -- scale delay by queue backlog level.
-    // When congested (queue > batchSize) and we have a measurement,
-    // throttle delay scales with backlog: multiplier = queue ~/ batchSize.
-    // Hard memory backpressure is applied separately via
-    // [applyEnqueueBackpressure] using ResourceManager status (not x2 caps).
-    final batchSize = _dataStore.config.writeBatchSize;
-    if (size > batchSize && _perRecordFlushUs > 0) {
-      _throttleDelayPerRecordUs = _perRecordFlushUs * (size ~/ batchSize);
-    } else {
-      _throttleDelayPerRecordUs = 0;
+    // If newly enqueued writes cause busy state, immediately wake tail-wait to pump flush.
+    if (pressureState == FlushPressureState.busy) {
+      final wake = _tailWaitWake;
+      if (wake != null && !wake.isCompleted) {
+        wake.complete();
+      }
     }
 
-    if (size <= 0) {
+    if (size <= 0 && _inFlightFlushCount <= 0) {
       return;
     }
     // Whenever the buffer becomes non-empty, trigger a flush pump if not running.

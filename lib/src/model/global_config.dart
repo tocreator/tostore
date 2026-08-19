@@ -61,6 +61,13 @@ class GlobalConfig {
   /// Database-wide encoding keyring (protected by encryptionKey file shell).
   final AppliedEncryption? appliedEncryption;
 
+  /// Sampled average total bytes per record (table data + all indexes).
+  /// Used for dynamic writeBatchSize calculation across app launches.
+  final int averageRecordSizeBytes;
+
+  /// Timestamp (ms) when [averageRecordSizeBytes] was last persisted.
+  final int lastAverageRecordSavedAtMs;
+
   GlobalConfig({
     int? version,
     int? userVersion,
@@ -76,12 +83,16 @@ class GlobalConfig {
     this.lastNonGlobalDirIndex = 0,
     this.lastNonGlobalDirEntries = 0,
     this.appliedEncryption,
+    int? averageRecordSizeBytes,
+    int? lastAverageRecordSavedAtMs,
   })  : version = version ?? InternalConfig.engineVersion,
         userVersion = userVersion ?? 0,
         maxEntriesPerDir =
             maxEntriesPerDir ?? InternalConfig.defaultMaxEntriesPerDir,
         pageSize = pageSize ?? InternalConfig.defaultPageSize,
-        spaceNames = spaceNames ?? {'default'};
+        spaceNames = spaceNames ?? {'default'},
+        averageRecordSizeBytes = averageRecordSizeBytes ?? 0,
+        lastAverageRecordSavedAtMs = lastAverageRecordSavedAtMs ?? 0;
 
   /// True when [pageSize] was persisted (legacy files may have 0 until v3).
   bool get hasConfiguredPageSize => pageSize > 0;
@@ -110,6 +121,8 @@ class GlobalConfig {
     int? lastNonGlobalDirEntries,
     AppliedEncryption? appliedEncryption,
     bool clearAppliedEncryption = false,
+    int? averageRecordSizeBytes,
+    int? lastAverageRecordSavedAtMs,
   }) {
     final int nextPageSize;
     if (hasConfiguredPageSize) {
@@ -139,6 +152,10 @@ class GlobalConfig {
       appliedEncryption: clearAppliedEncryption
           ? null
           : (appliedEncryption ?? this.appliedEncryption),
+      averageRecordSizeBytes:
+          averageRecordSizeBytes ?? this.averageRecordSizeBytes,
+      lastAverageRecordSavedAtMs:
+          lastAverageRecordSavedAtMs ?? this.lastAverageRecordSavedAtMs,
     );
   }
 

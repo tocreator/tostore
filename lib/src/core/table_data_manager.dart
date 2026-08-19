@@ -907,7 +907,9 @@ class TableDataManager {
       _needSaveStats = true;
     }
     if (recordDelta > 0 && sizeDelta > 0) {
-      _lastFlushAvgTableRecordSizeBytes = sizeDelta ~/ recordDelta;
+      final sampleAvg = sizeDelta ~/ recordDelta;
+      _lastFlushAvgTableRecordSizeBytes = sampleAvg;
+      _dataStore.parallelJournalManager.recordFlushRecordSizeSample(sampleAvg);
     }
   }
 

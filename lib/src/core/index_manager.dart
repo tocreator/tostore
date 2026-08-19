@@ -4146,7 +4146,7 @@ class IndexManager {
             MemComparableKey.compare(start, endEffective) >= 0) {
           return IndexSearchResult.empty();
         }
-        return _searchIndexByKeyRangeLogical(
+        return await _searchIndexByKeyRangeLogical(
           table: table,
           indexUid: indexUid,
           meta: meta,
@@ -4191,7 +4191,7 @@ class IndexManager {
           return IndexSearchResult.empty();
         }
 
-        return _searchIndexByKeyRangeLogical(
+        return await _searchIndexByKeyRangeLogical(
           table: table,
           indexUid: indexUid,
           meta: meta,

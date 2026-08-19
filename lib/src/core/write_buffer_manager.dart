@@ -289,8 +289,6 @@ class WriteBufferManager {
 
     _emitSizeChanged();
     CrontabManager.notifyActivity();
-    // ignore: discarded_futures
-    trees.pendingRecordCache.prepareOrderedViews();
   }
 
   Future<void> addUpdateBatch({

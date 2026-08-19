@@ -66,6 +66,8 @@ abstract final class GlobalConfigFieldId {
   static const int lastNonGlobalDirIndex = 12;
   static const int lastNonGlobalDirEntries = 13;
   static const int appliedEncryption = 14;
+  static const int averageRecordSizeBytes = 15;
+  static const int lastAverageRecordSavedAtMs = 16;
 }
 
 /// Nested [AppliedEncryption] / [EncryptionKeyInfo] field IDs.
@@ -243,6 +245,17 @@ final class GlobalConfigCodec {
       });
     }
 
+    if (config.averageRecordSizeBytes > 0) {
+      w.writeFieldTag(
+          GlobalConfigFieldId.averageRecordSizeBytes, WireType.varint);
+      w.writeVarint(config.averageRecordSizeBytes);
+    }
+    if (config.lastAverageRecordSavedAtMs > 0) {
+      w.writeFieldTag(
+          GlobalConfigFieldId.lastAverageRecordSavedAtMs, WireType.fixed64);
+      w.writeFixed64(config.lastAverageRecordSavedAtMs);
+    }
+
     return w.view;
   }
 
@@ -266,6 +279,8 @@ final class GlobalConfigCodec {
     var lastNonGlobalDirEntries = 0;
     var sawActiveSpace = false;
     AppliedEncryption? appliedEncryption;
+    var averageRecordSizeBytes = 0;
+    var lastAverageRecordSavedAtMs = 0;
 
     while (!r.isEOF) {
       final (fieldId, wireType) = r.readFieldTag();
@@ -315,6 +330,12 @@ final class GlobalConfigCodec {
             appliedEncryption = _readAppliedEncryption(child);
           });
           break;
+        case GlobalConfigFieldId.averageRecordSizeBytes:
+          averageRecordSizeBytes = r.readVarint();
+          break;
+        case GlobalConfigFieldId.lastAverageRecordSavedAtMs:
+          lastAverageRecordSavedAtMs = r.readFixed64();
+          break;
         default:
           r.skipField(wireType);
           break;
@@ -336,6 +357,8 @@ final class GlobalConfigCodec {
       lastNonGlobalDirIndex: lastNonGlobalDirIndex,
       lastNonGlobalDirEntries: lastNonGlobalDirEntries,
       appliedEncryption: appliedEncryption,
+      averageRecordSizeBytes: averageRecordSizeBytes,
+      lastAverageRecordSavedAtMs: lastAverageRecordSavedAtMs,
     );
   }
 

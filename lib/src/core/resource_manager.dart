@@ -33,6 +33,9 @@ class ResourceManager {
   /// Memory configuration threshold, default is 75% of available system memory
   int _memoryThresholdInMB = 0;
 
+  /// Configured memory threshold in megabytes
+  int get memoryThresholdInMB => _memoryThresholdInMB;
+
   /// Allocation ratios for various caches
   static const double _tableDataCacheRatio = 0.45; // Table data cache 45%
   static const double _indexCacheRatio = 0.30; // Index cache 30%
@@ -443,9 +446,6 @@ class ResourceManager {
 
   /// Get table data and index all meta cache size limit
   int getMetaCacheSize() => _metaCacheSize;
-
-  /// Get memory threshold (MB)
-  int getMemoryThresholdMB() => _memoryThresholdInMB;
 
   int? _effectivePrewarmThresholdMB;
 

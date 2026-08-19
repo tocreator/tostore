@@ -4256,6 +4256,7 @@ class DataStoreImpl {
     TableSchema? schema;
     TableContext? tableForRelease;
     final Set<String> reservedNotBuffered = <String>{};
+    parallelJournalManager.beginBatchOperation();
     try {
       // 1. Get table schema and validate data
       final table = await getTableContext(tableName);
@@ -5096,6 +5097,7 @@ class DataStoreImpl {
         failedKeys: returnResultDetails ? failedKeys : const [],
       ));
     } finally {
+      parallelJournalManager.endBatchOperation();
       // Early returns (!allowPartialErrors) skip catch -- still release orphans.
       // Successes already committed bookkeeping -> release is a no-op for them.
       if (tableForRelease != null && reservedNotBuffered.isNotEmpty) {
@@ -5169,6 +5171,7 @@ class DataStoreImpl {
 
     final validationErrorsForResult = <String>[];
 
+    parallelJournalManager.beginBatchOperation();
     try {
       // 1. Bulk validation (O(N) CPU)
       final validatedRecords = <Map<String, dynamic>>[];
@@ -5389,6 +5392,8 @@ class DataStoreImpl {
         statuses: returnResultDetails ? dbEx.statuses : const [],
         failedCount: dbEx.statuses.length,
       ));
+    } finally {
+      parallelJournalManager.endBatchOperation();
     }
   }
 
@@ -5604,6 +5609,7 @@ class DataStoreImpl {
         YieldController('DataStoreImpl.batchUpdate.execute', checkInterval: 50);
     final hasNotify = notificationManager.hasListeners(schema.tableUid);
 
+    parallelJournalManager.beginBatchOperation();
     try {
       // Process in batches to maintain UI responsiveness and manage memory
       const int batchSize = 1000;
@@ -6147,6 +6153,7 @@ class DataStoreImpl {
         failedCount: dbEx.statuses.length,
       ));
     } finally {
+      parallelJournalManager.endBatchOperation();
       // Covers early returns (!allowPartialErrors) that never hit catch:
       // only still-outstanding (not yet buffered/committed) pks are released;
       // commitReservedUniques already cleared bookkeeping for successes -> no-op.
