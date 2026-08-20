@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:path/path.dart' as path;
 
@@ -250,6 +251,7 @@ class V3Upgrade {
     }
 
     final pendingIngestMetas = <TableMeta>[];
+    final pendingFkMetas = <TableMeta>[];
     for (final entry in tablesByPartition.entries) {
       final partitionIndex = entry.key;
       final tableNames = entry.value;
@@ -324,6 +326,9 @@ class V3Upgrade {
             layoutOverride: layout,
           );
           pendingIngestMetas.add(saved);
+          if (!isSys && upgradedSchema.foreignKeys.isNotEmpty) {
+            pendingFkMetas.add(saved);
+          }
         } catch (e) {
           Logger.error(
               'Failed to upgrade schema for table $tableName in v3 upgrade',
@@ -332,6 +337,9 @@ class V3Upgrade {
       }
     }
     await _durablyPersistTableMetaRows(pendingIngestMetas);
+    if (pendingFkMetas.isNotEmpty) {
+      await _durablyPersistFkReferencesRows(pendingFkMetas);
+    }
 
     // Dir high-water is folded into the single GlobalConfig write below.
     final resolvedSystemHash = systemSchemaHash ??
@@ -579,6 +587,81 @@ class V3Upgrade {
       table: ctx,
       inserts: inserts,
     );
+  }
+
+  /// Insert missing `_system_fk_references` rows (+ secondary indexes) on disk.
+  ///
+  /// Idempotent: skips foreign keys already present in the system table (crash resume).
+  Future<void> _durablyPersistFkReferencesRows(List<TableMeta> fkMetas) async {
+    if (fkMetas.isEmpty) return;
+
+    final schemaMgr = _dataStore.tableMetaManager;
+    if (schemaMgr == null) return;
+
+    final fkTableName = SystemTable.getFkReferencesName();
+    final fkTableUid = await schemaMgr.getUidByName(TableName(fkTableName));
+    if (fkTableUid == null) return;
+
+    final fkCtx = await schemaMgr.getTableContext(fkTableUid);
+    if (fkCtx == null) return;
+
+    final existingRecords = await _dataStore.tableTreePartitionManager
+            ?.scanRecordsByPrimaryKeyRange(
+          table: fkCtx,
+          startKeyInclusive: Uint8List(0),
+          endKeyExclusive: Uint8List(0),
+          reverse: false,
+          limit: null,
+          readFromFileOnly: true,
+        ) ??
+        const <Map<String, dynamic>>[];
+
+    final existingKeys = <String>{};
+    for (final row in existingRecords) {
+      final ref = row['referenced_table']?.toString() ?? '';
+      final citing = row['referencing_table']?.toString() ?? '';
+      final name = row['fk_name']?.toString() ?? '';
+      if (ref.isNotEmpty && citing.isNotEmpty && name.isNotEmpty) {
+        existingKeys.add('$ref|$citing|$name');
+      }
+    }
+
+    final inserts = <Map<String, dynamic>>[];
+    var currentId = existingRecords.length + 1;
+    for (final meta in fkMetas) {
+      for (final fk in meta.schema.foreignKeys) {
+        final key =
+            '${fk.referencedTable}|${meta.tableName.value}|${fk.actualName}';
+        if (existingKeys.contains(key)) continue;
+        existingKeys.add(key);
+
+        inserts.add({
+          fkCtx.schema.primaryKey: (currentId++).toString(),
+          'referenced_table': fk.referencedTable,
+          'referencing_table': meta.tableName.value,
+          'fk_name': fk.actualName,
+          'fk_fields': jsonEncode(fk.fields),
+          'ref_fields': jsonEncode(fk.referencedFields),
+          'on_delete': fk.onDelete.toString().split('.').last,
+          'on_update': fk.onUpdate.toString().split('.').last,
+          'enabled': fk.enabled,
+        });
+      }
+    }
+
+    if (inserts.isEmpty) return;
+
+    await _dataStore.tableDataManager.writeChanges(
+      table: fkCtx,
+      inserts: inserts,
+      recordCountInsertDelta: inserts.length,
+    );
+    await _dataStore.indexManager?.writeChanges(
+      table: fkCtx,
+      inserts: inserts,
+    );
+
+    _dataStore.foreignKeyManager?.invalidateCache();
   }
 
   /// Lift `BatchStart.tablePlan` from remnant A/B journals into

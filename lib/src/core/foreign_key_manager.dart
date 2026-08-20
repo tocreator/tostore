@@ -97,23 +97,13 @@ class ForeignKeyManager {
   /// Internal method to load cache
   Future<void> _loadCache() async {
     try {
-      // Try to load from system table first (fast path for large databases)
+      // Fast path: load only from system table (O(m) where m is foreign key count)
       final loaded = await _loadCacheFromSystemTable();
 
       if (!loaded) {
-        // System table doesn't exist or is empty
-        // This happens on:
-        // 1. First installation - no foreign keys defined yet
-        // 2. Upgrade from version without foreign key support - no foreign keys in old version
-        //
-        // In both cases, we don't need to scan all tables because:
-        // - First installation: no foreign keys exist, scanning is unnecessary
-        // - Upgrade: old version had no foreign key support, so no foreign keys exist
-        //
-        // Foreign keys will be added to system table incrementally when users:
-        // - Create tables with foreign keys
-        // - Modify table schemas to add foreign keys
-        // These operations call updateSystemTableForTable() to update the system table
+        // System table doesn't exist or is empty (first install / no foreign keys defined).
+        // Set empty map immediately without scanning table schemas, avoiding performance penalties
+        // in databases with thousands of tables.
         _referencingTablesCache =
             <TableUid, Map<TableUid, List<ForeignKeySchema>>>{};
         _cacheNeedsRebuild = false;
