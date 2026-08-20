@@ -352,7 +352,7 @@ class SystemTable {
           const FieldSchema(
               name: keyValueValueField,
               fieldId: keyValueValueField,
-              type: DataType.text),
+              type: DataType.dynamic),
           const FieldSchema(
               name: keyValueUpdatedAtField,
               fieldId: keyValueUpdatedAtField,

@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:collection';
-import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
@@ -58,7 +57,6 @@ import 'compute/batch_identifier_compute.dart';
 import 'compute/batch_insert_compute.dart';
 import 'compute/batch_update_compute.dart';
 import 'compute/compute_batch_planner.dart';
-import 'compute/kv_batch_prepare_compute.dart';
 import 'compute/record_compute.dart';
 import 'compute_manager.dart';
 import 'cpu_work_chunk.dart';
@@ -2188,77 +2186,6 @@ class DataStoreImpl {
       merged.addAll(result.records);
     }
     return merged;
-  }
-
-  int _estimateKeyValueBatchItemBytes(KeyValueBatchItem item) {
-    final keyBytes = max(1, calculateUtf8Length(item.key));
-    final valueBytes = max(1, calculateUtf8Length(toStringWithAll(item.value)));
-    return keyBytes + valueBytes + 128;
-  }
-
-  Future<List<Map<String, dynamic>>> _prepareKeyValueBatchRecords(
-    Map<String, dynamic> items, {
-    required String nowIso,
-    required String? expiresAtIso,
-  }) async {
-    if (items.isEmpty) {
-      return const <Map<String, dynamic>>[];
-    }
-
-    final kvItems = items.entries
-        .map(
-          (entry) => KeyValueBatchItem(
-            key: entry.key,
-            value: entry.value,
-          ),
-        )
-        .toList(growable: false);
-
-    final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
-      itemCount: kvItems.length,
-      estimateAverageItemBytes: () =>
-          ComputeBatchPlanner.estimateAverageItemBytes(
-        kvItems,
-        _estimateKeyValueBatchItemBytes,
-      ),
-    );
-    final useIsolate = dispatchPlan.useIsolate;
-    final actualTaskCount = dispatchPlan.actualTaskCount;
-
-    final tasks = <ComputeTask<KeyValueBatchPrepareRequest,
-        KeyValueBatchPrepareResult>>[];
-    for (final range
-        in ComputeBatchPlanner.splitRange(kvItems.length, actualTaskCount)) {
-      tasks.add(
-        ComputeTask(
-          function: prepareKeyValueBatchChunk,
-          message: KeyValueBatchPrepareRequest(
-            items: kvItems.sublist(range.start, range.end),
-            keyField: _kvKeyField,
-            valueField: _kvValueField,
-            updatedAtField: _kvUpdatedAtField,
-            expiresAtField: _kvExpiresAtField,
-            nowIso: nowIso,
-            expiresAtIso: expiresAtIso,
-          ),
-        ),
-      );
-    }
-
-    final results =
-        await ComputeManager.computeBatch(tasks, enableIsolate: useIsolate);
-
-    final records = <Map<String, dynamic>>[];
-    final mergeYield =
-        YieldController('DataStoreImpl._prepareKeyValueBatchRecords');
-    for (final result in results) {
-      for (final record in result.records) {
-        final y1 = mergeYield.maybeYield();
-        if (y1 != null) await y1;
-        records.add(record);
-      }
-    }
-    return records;
   }
 
   Future<List<UniformUpdatePreparedRecord>> prepareUniformUpdateRecords(
@@ -6845,7 +6772,7 @@ class DataStoreImpl {
     // Build data for upsert
     final data = {
       _kvKeyField: key,
-      _kvValueField: jsonEncode(value),
+      _kvValueField: value,
       _kvUpdatedAtField: now.toIso8601String(),
       _kvExpiresAtField: expiresAtIso,
     };
@@ -6922,11 +6849,22 @@ class DataStoreImpl {
     final expiresAtIso = expiresAt?.toIso8601String() ??
         (ttl != null ? now.add(ttl).toIso8601String() : null);
 
-    final records = await _prepareKeyValueBatchRecords(
-      items,
-      nowIso: nowIso,
-      expiresAtIso: expiresAtIso,
+    final records = <Map<String, dynamic>>[];
+    final yieldController = YieldController(
+      'DataStoreImpl.setValueMany',
+      checkInterval: 1024,
     );
+    for (final entry in items.entries) {
+      final y = yieldController.maybeYield();
+      if (y != null) await y;
+      records.add({
+        _kvKeyField: entry.key,
+        _kvValueField: entry.value,
+        _kvUpdatedAtField: nowIso,
+        _kvExpiresAtField: expiresAtIso,
+      });
+    }
+
     return await batchUpsert(tableName, records,
         allowPartialErrors: allowPartialErrors);
   }
@@ -6953,7 +6891,7 @@ class DataStoreImpl {
       return null;
     }
 
-    return _decodeStoredKeyValue(row[_kvValueField], key: key);
+    return _decodeLegacyKvValueIfNeeded(row[_kvValueField]);
   }
 
   /// Get key names in the specified space, optionally filtered by prefix.
@@ -7153,8 +7091,9 @@ class DataStoreImpl {
           }
 
           final rawValue = row[_kvValueField];
+          final decodedValue = _decodeLegacyKvValueIfNeeded(rawValue);
           return (
-            value: _decodeStoredKeyValue(rawValue, key: key) as T?,
+            value: decodedValue as T?,
             fingerprint: Object.hash(key, true, rawValue),
             nextRefreshAt: expiresAt,
           );
@@ -7227,8 +7166,7 @@ class DataStoreImpl {
             }
 
             final rawValue = row[_kvValueField];
-            values[requestedKey] =
-                _decodeStoredKeyValue(rawValue, key: requestedKey);
+            values[requestedKey] = _decodeLegacyKvValueIfNeeded(rawValue);
             fingerprintHashes.add(Object.hash(requestedKey, true, rawValue));
           }
 
@@ -7435,28 +7373,19 @@ class DataStoreImpl {
     }
   }
 
-  dynamic _decodeStoredKeyValue(dynamic rawValue, {required String key}) {
-    if (rawValue == null) {
-      return null;
-    }
-
-    try {
-      final encodedValue = rawValue is String ? rawValue : rawValue.toString();
-      return jsonDecode(encodedValue);
-    } catch (e) {
-      Logger.warn(
-          'Failed to parse value for key "$key" as JSON. Returning raw value. This may indicate that the value was not set using `setValue`.',
-          rawError: e);
+  dynamic _decodeLegacyKvValueIfNeeded(dynamic rawValue) {
+    if (_globalConfigCache?.hasLegacyJsonKv != true) {
       return rawValue;
     }
+    return LegacyKvDecoder.decode(rawValue);
   }
 
-  /// Map a raw KV store row to a user-facing record with decoded [value].
+  /// Map a raw KV store row to a user-facing record with [value].
   Map<String, dynamic> mapUserFacingKvRecord(Map<String, dynamic> row) {
     final key = row[_kvKeyField]?.toString() ?? '';
     return <String, dynamic>{
       _kvKeyField: key,
-      _kvValueField: _decodeStoredKeyValue(row[_kvValueField], key: key),
+      _kvValueField: _decodeLegacyKvValueIfNeeded(row[_kvValueField]),
       _kvUpdatedAtField: row[_kvUpdatedAtField],
       _kvExpiresAtField: row[_kvExpiresAtField],
     };
@@ -7572,6 +7501,10 @@ class DataStoreImpl {
       if (y25 != null) await y25;
       final row = Map<String, dynamic>.from(old);
       transformPromoteOldToNewInPlace(row, desc);
+      if (SystemTable.isKeyValueTable(desc.targetSchema.name)) {
+        row[SystemTable.keyValueValueField] =
+            _decodeLegacyKvValueIfNeeded(row[SystemTable.keyValueValueField]);
+      }
       payloads.add(row);
     }
     try {

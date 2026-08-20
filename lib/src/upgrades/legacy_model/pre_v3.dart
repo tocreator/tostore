@@ -639,3 +639,18 @@ final class LegacyBackupMetaJson {
     );
   }
 }
+
+/// Legacy KV store decoder for pre-v3 records where values were serialized via jsonEncode.
+final class LegacyKvDecoder {
+  LegacyKvDecoder._();
+
+  /// Decodes a legacy json-encoded KV value string into native Dart objects.
+  static dynamic decode(dynamic rawValue) {
+    if (rawValue is! String) return rawValue;
+    try {
+      return jsonDecode(rawValue);
+    } catch (_) {
+      return rawValue;
+    }
+  }
+}

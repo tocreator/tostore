@@ -79,7 +79,9 @@ class V2Upgrade {
     // Prefer config already updated by v3 (pageSize, etc.).
     final currentGlobal = await _dataStore.getGlobalConfig() ?? oldGlobalConfig;
     await _dataStore.saveGlobalConfig(
-      currentGlobal.setVersion(InternalConfig.engineVersion),
+      currentGlobal
+          .setVersion(InternalConfig.engineVersion)
+          .copyWith(hasLegacyJsonKv: true),
     );
 
     Logger.info(

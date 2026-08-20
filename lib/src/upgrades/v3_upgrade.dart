@@ -440,6 +440,7 @@ class V3Upgrade {
       lastNonGlobalDirIndex: lastNonGlobalDirIndex,
       lastNonGlobalDirEntries: lastNonGlobalDirEntries,
       appliedEncryption: applied,
+      hasLegacyJsonKv: true,
     );
     if (!skipVersionBump) {
       updatedGlobal = updatedGlobal.setVersion(InternalConfig.engineVersion);

@@ -68,6 +68,7 @@ abstract final class GlobalConfigFieldId {
   static const int appliedEncryption = 14;
   static const int averageRecordSizeBytes = 15;
   static const int lastAverageRecordSavedAtMs = 16;
+  static const int hasLegacyJsonKv = 17;
 }
 
 /// Nested [AppliedEncryption] / [EncryptionKeyInfo] field IDs.
@@ -255,6 +256,10 @@ final class GlobalConfigCodec {
           GlobalConfigFieldId.lastAverageRecordSavedAtMs, WireType.fixed64);
       w.writeFixed64(config.lastAverageRecordSavedAtMs);
     }
+    if (config.hasLegacyJsonKv) {
+      w.writeFieldTag(GlobalConfigFieldId.hasLegacyJsonKv, WireType.varint);
+      w.writeBool(true);
+    }
 
     return w.view;
   }
@@ -281,6 +286,7 @@ final class GlobalConfigCodec {
     AppliedEncryption? appliedEncryption;
     var averageRecordSizeBytes = 0;
     var lastAverageRecordSavedAtMs = 0;
+    var hasLegacyJsonKv = false;
 
     while (!r.isEOF) {
       final (fieldId, wireType) = r.readFieldTag();
@@ -336,6 +342,9 @@ final class GlobalConfigCodec {
         case GlobalConfigFieldId.lastAverageRecordSavedAtMs:
           lastAverageRecordSavedAtMs = r.readFixed64();
           break;
+        case GlobalConfigFieldId.hasLegacyJsonKv:
+          hasLegacyJsonKv = r.readBool();
+          break;
         default:
           r.skipField(wireType);
           break;
@@ -359,6 +368,7 @@ final class GlobalConfigCodec {
       appliedEncryption: appliedEncryption,
       averageRecordSizeBytes: averageRecordSizeBytes,
       lastAverageRecordSavedAtMs: lastAverageRecordSavedAtMs,
+      hasLegacyJsonKv: hasLegacyJsonKv,
     );
   }
 

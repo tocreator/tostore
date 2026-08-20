@@ -68,6 +68,9 @@ class GlobalConfig {
   /// Timestamp (ms) when [averageRecordSizeBytes] was last persisted.
   final int lastAverageRecordSavedAtMs;
 
+  /// True when database was upgraded from legacy version and KV store has legacy JSON strings.
+  final bool hasLegacyJsonKv;
+
   GlobalConfig({
     int? version,
     int? userVersion,
@@ -85,6 +88,7 @@ class GlobalConfig {
     this.appliedEncryption,
     int? averageRecordSizeBytes,
     int? lastAverageRecordSavedAtMs,
+    this.hasLegacyJsonKv = false,
   })  : version = version ?? InternalConfig.engineVersion,
         userVersion = userVersion ?? 0,
         maxEntriesPerDir =
@@ -123,6 +127,7 @@ class GlobalConfig {
     bool clearAppliedEncryption = false,
     int? averageRecordSizeBytes,
     int? lastAverageRecordSavedAtMs,
+    bool? hasLegacyJsonKv,
   }) {
     final int nextPageSize;
     if (hasConfiguredPageSize) {
@@ -156,6 +161,7 @@ class GlobalConfig {
           averageRecordSizeBytes ?? this.averageRecordSizeBytes,
       lastAverageRecordSavedAtMs:
           lastAverageRecordSavedAtMs ?? this.lastAverageRecordSavedAtMs,
+      hasLegacyJsonKv: hasLegacyJsonKv ?? this.hasLegacyJsonKv,
     );
   }
 

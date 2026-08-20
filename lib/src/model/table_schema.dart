@@ -428,7 +428,8 @@ class TableSchema {
       if (field.type == DataType.vector ||
           field.type == DataType.blob ||
           field.type == DataType.json ||
-          field.type == DataType.array) {
+          field.type == DataType.array ||
+          field.type == DataType.dynamic) {
         continue;
       }
 
@@ -710,7 +711,8 @@ class TableSchema {
       if (field.type == DataType.vector ||
           field.type == DataType.blob ||
           field.type == DataType.json ||
-          field.type == DataType.array) {
+          field.type == DataType.array ||
+          field.type == DataType.dynamic) {
         if (field.unique) {
           throw DbException([
             SchemaValidationStatus(
@@ -1154,7 +1156,8 @@ class TableSchema {
           if (t == DataType.vector ||
               t == DataType.blob ||
               t == DataType.json ||
-              t == DataType.array) {
+              t == DataType.array ||
+              t == DataType.dynamic) {
             throw DbException([
               SchemaValidationStatus(
                 type: ResultType.devInvalidSchemaIndexType,
@@ -2249,6 +2252,8 @@ class FieldSchema {
           }
         }
         return null;
+      case DataType.dynamic:
+        return value;
     }
   }
 
@@ -2431,6 +2436,8 @@ class FieldSchema {
             value is Uint8List;
       case DataType.json:
         return value is Map;
+      case DataType.dynamic:
+        return true;
     }
   }
 
@@ -2731,6 +2738,9 @@ enum DataType {
 
   /// JSON object or structured data. For flexible or schema-less extension fields.
   json,
+
+  /// Dynamic or untyped data. Holds arbitrary Dart objects (int, double, bool, String, Map, List, Uint8List, etc.) without forced type conversions.
+  dynamic,
 }
 
 /// index type enum

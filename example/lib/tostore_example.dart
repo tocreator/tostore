@@ -766,7 +766,9 @@ class ToStoreExample {
         case DataType.array:
         // Skip array for mock data generation
         case DataType.json:
-          // Skip json for mock data generation
+        // Skip json for mock data generation
+        case DataType.dynamic:
+          // Skip dynamic for mock data generation
           break;
       }
     }

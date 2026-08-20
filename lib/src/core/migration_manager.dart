@@ -26,6 +26,7 @@ import '../model/table_context.dart';
 import '../model/table_identity.dart';
 import '../model/table_schema.dart';
 import '../model/wal_pointer.dart';
+import '../upgrades/legacy_model/pre_v3.dart';
 import 'backup_manager.dart';
 import 'compute_manager.dart';
 import 'compute_tasks.dart';
@@ -289,9 +290,19 @@ class MigrationManager {
       keyMigrationInfo: meta.keyMigrationInfo,
     );
 
-    if (globalConfig.hasMigrationTask != hasPending) {
+    final shouldClearLegacyKv = globalConfig.hasLegacyJsonKv &&
+        !_pendingTasks.any((t) =>
+            t.isPromotePrimaryKeyTask &&
+            t.promotePhase != PromotePhase.done &&
+            SystemTable.isKeyValueTable(t.tableName));
+
+    if (globalConfig.hasMigrationTask != hasPending || shouldClearLegacyKv) {
       await _dataStore.saveGlobalConfig(
-        globalConfig.copyWith(hasMigrationTask: hasPending),
+        globalConfig.copyWith(
+          hasMigrationTask: hasPending,
+          hasLegacyJsonKv:
+              shouldClearLegacyKv ? false : globalConfig.hasLegacyJsonKv,
+        ),
       );
     }
   }
@@ -4334,8 +4345,13 @@ class MigrationManager {
     bool isDangerous = false;
     String reason = '';
 
+    // Converting TO dynamic is always safe and non-destructive.
+    if (newType == DataType.dynamic) {
+      return;
+    }
+
     // General rule: Converting from a less restrictive type to a more restrictive one is dangerous.
-    // e.g., Text -> Integer, Blob -> Anything, Vector -> Anything (except itself)
+    // e.g., Text -> Integer, Blob -> Anything, Vector -> Anything (except itself), Dynamic -> Specific type
 
     if (newType == DataType.integer ||
         newType == DataType.double ||
@@ -4345,7 +4361,8 @@ class MigrationManager {
           oldType == DataType.blob ||
           oldType == DataType.vector ||
           oldType == DataType.json ||
-          oldType == DataType.array) {
+          oldType == DataType.array ||
+          oldType == DataType.dynamic) {
         isDangerous = true;
         reason = 'cannot be reliably converted to a numeric or date type.';
       }
@@ -4357,10 +4374,11 @@ class MigrationManager {
       reason = 'would discard all existing vector embedding data.';
     }
 
-    // Changing from blob, json, or array to an incompatible type is dangerous.
+    // Changing from blob, json, array, or dynamic to an incompatible type is dangerous.
     if ((oldType == DataType.blob ||
             oldType == DataType.json ||
-            oldType == DataType.array) &&
+            oldType == DataType.array ||
+            oldType == DataType.dynamic) &&
         (newType != oldType && newType != DataType.text)) {
       isDangerous = true;
       reason =
@@ -6268,6 +6286,7 @@ class MigrationManager {
 
       // Old-working rows already include sibling ops; promote PK reshape only
       // (same as online dual-write mirror).
+      final isKvTable = SystemTable.isKeyValueTable(currentTask.tableName);
       final toUpsert = <Map<String, dynamic>>[];
       for (final raw in records) {
         final y4 = yieldController.maybeYield();
@@ -6275,6 +6294,10 @@ class MigrationManager {
         if (migrationController.isCancelled) return false;
         final transformed = Map<String, dynamic>.from(raw);
         transformPromoteOldToNewInPlace(transformed, promoteDesc);
+        if (isKvTable) {
+          transformed[SystemTable.keyValueValueField] = LegacyKvDecoder.decode(
+              transformed[SystemTable.keyValueValueField]);
+        }
         final pkValue = transformed[targetPk]?.toString();
         if (pkValue == null || pkValue.isEmpty) continue;
         toUpsert.add(transformed);
@@ -7242,26 +7265,33 @@ class MigrationManager {
             }
             // Type change requires migration
             if (fieldUpdate.type != null && oldField.type != fieldUpdate.type) {
-              if (recordCount > 0 && !isAllowed) {
-                throw DbException([
-                  SchemaValidationStatus(
-                    type: ResultType.devMigrationUnsafeTypeConversion,
-                    message:
-                        'Changing field "${fieldUpdate.name}" type from ${oldField.type} to ${fieldUpdate.type} '
-                        'is not allowed on non-empty table "${oldSchema.name}" without explicit data migration allowance.',
-                    tableName: oldSchema.name,
-                    field: fieldUpdate.name,
-                    wrongValue: {
-                      'oldType': oldField.type.name,
-                      'newType': fieldUpdate.type?.name,
-                    },
-                  )
-                ]);
+              // Conversion TO DataType.dynamic is always safe and non-destructive
+              if (fieldUpdate.type == DataType.dynamic) {
+                Logger.info(
+                  'Field "${fieldUpdate.name}" widened to dynamic on table "${oldSchema.name}".',
+                );
+              } else {
+                if (recordCount > 0 && !isAllowed) {
+                  throw DbException([
+                    SchemaValidationStatus(
+                      type: ResultType.devMigrationUnsafeTypeConversion,
+                      message:
+                          'Changing field "${fieldUpdate.name}" type from ${oldField.type} to ${fieldUpdate.type} '
+                          'is not allowed on non-empty table "${oldSchema.name}" without explicit data migration allowance.',
+                      tableName: oldSchema.name,
+                      field: fieldUpdate.name,
+                      wrongValue: {
+                        'oldType': oldField.type.name,
+                        'newType': fieldUpdate.type?.name,
+                      },
+                    )
+                  ]);
+                }
+                Logger.warn(
+                  'Data migration required: changing field "${fieldUpdate.name}" type from ${oldField.type} to ${fieldUpdate.type}.',
+                );
+                return true;
               }
-              Logger.warn(
-                'Data migration required: changing field "${fieldUpdate.name}" type from ${oldField.type} to ${fieldUpdate.type}.',
-              );
-              return true;
             }
             // from non-unique to unique
             if (!oldField.unique && (fieldUpdate.unique == true)) {
