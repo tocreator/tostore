@@ -7381,7 +7381,7 @@ class MigrationManager {
           );
           // Promote is an explicit data-migration declaration; no allowAfterDataMigration.
           if (promoteRecordCount > 0) {
-            Logger.warn(
+            Logger.debug(
               'Data migration required: promoteFieldToPrimaryKey '
               '"$sourceName" -> PK "${targetPk.name}" on "${oldSchema.name}".',
             );
