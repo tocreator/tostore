@@ -54,7 +54,6 @@ import 'backup_manager.dart';
 import 'cache_manager.dart';
 import 'compaction_manager.dart';
 import 'compute/batch_identifier_compute.dart';
-import 'compute/batch_insert_compute.dart';
 import 'compute/batch_update_compute.dart';
 import 'compute/compute_batch_planner.dart';
 import 'compute/record_compute.dart';
@@ -2019,39 +2018,6 @@ class DataStoreImpl {
       resolvedPrimaryKey: resolvedPrimaryKey,
       ignoreUnknownFields: _config?.ignoreUnknownFields ?? true,
     );
-  }
-
-  Future<List<BatchInsertPreparedRecord>> _prepareBatchInsertRecords(
-    TableSchema schema,
-    TableContext table,
-    List<Map<String, dynamic>> records,
-    Set<Map<String, dynamic>> autoPkRecords,
-  ) async {
-    if (records.isEmpty) {
-      return const <BatchInsertPreparedRecord>[];
-    }
-
-    // PERFORMANCE: batchInsert prepare is Map-allocation dominated. Shipping
-    // records through isolates doubles the cost (structured-clone in + out)
-    // and routinely exceeds the pure CPU work. Always prepare on the current
-    // isolate with YieldController; keep the planner only for chunk sizing if
-    // we later re-enable isolate for pathological CPU-heavy schemas.
-    final skipPrimaryKeyFormatChecks = List<bool>.generate(
-        records.length, (i) => autoPkRecords.contains(records[i]),
-        growable: false);
-
-    final batchTimestamp = DateTime.now();
-    final result = await prepareBatchInsertChunk(
-      BatchInsertPrepareRequest(
-        schema: schema,
-        tableName: table.tableName,
-        records: records,
-        skipPrimaryKeyFormatChecks: skipPrimaryKeyFormatChecks,
-        ignoreUnknownFields: _config?.ignoreUnknownFields ?? true,
-        batchTimestamp: batchTimestamp,
-      ),
-    );
-    return result.records;
   }
 
   Future<List<IdentifierValidationRecordResult>>
@@ -4353,16 +4319,35 @@ class DataStoreImpl {
         // only existed to size isolate tasks.
         const int bufferBatchSize = 1000;
 
+        // Single-pass pipeline: Validate, check foreign keys, reserve uniques, and buffer
         int start = 0;
+        final batchTimestamp = DateTime.now();
+
+        // Hoist schema constraint pass check once for the entire batch
+        var needsConstraintPass = false;
+        for (final field in tableSchema.fields) {
+          if (field.maxLength != null ||
+              field.minLength != null ||
+              field.minValue != null ||
+              field.maxValue != null) {
+            needsConstraintPass = true;
+            break;
+          }
+        }
+
         while (start < recordsToProcess.length) {
           final int end = min(start + bufferBatchSize, recordsToProcess.length);
           final currentRecords = recordsToProcess.sublist(start, end);
-          final preparedRecords = await _prepareBatchInsertRecords(
-            tableSchema,
-            table,
-            currentRecords,
-            autoPkRecords,
-          );
+
+          // Batch Foreign Key validation: 1:1 aligned directly on currentRecords (zero interim lists)
+          final List<DbException?>? batchFkViolations = hasForeignKeys
+              ? await _foreignKeyManager!.validateForeignKeyConstraintsBatch(
+                  table: table,
+                  records: currentRecords,
+                  operation: ForeignKeyOperation.insert,
+                  schemaOverride: tableSchema,
+                )
+              : null;
 
           final yieldController = YieldController(
             'DataStoreImpl.batchInsert.loop',
@@ -4620,7 +4605,6 @@ class DataStoreImpl {
           for (int offset = 0; offset < currentRecords.length; offset++) {
             final int j = start + offset;
             final record = currentRecords[offset];
-            final preparedRecord = preparedRecords[offset];
             final loopYield = yieldController.maybeYield();
             if (loopYield != null) await loopYield;
 
@@ -4632,40 +4616,27 @@ class DataStoreImpl {
 
               while (!finishedRecord) {
                 Map<String, dynamic>? validData;
+                List<Map<String, dynamic>>? validationStatusesJson;
                 recordErrors.clear();
-                if (triedPkConflictRetry) {
-                  // Conflict retries are rare; keep them on the mature local path.
-                  try {
-                    validData = await _validateAndProcessData(
-                      tableSchema,
-                      record,
-                      table,
-                      skipPrimaryKeyFormatCheck: isAutoPk,
-                      validationErrors: recordErrors,
-                      fieldMap: fieldMapForValidation,
-                    );
-                  } on DbException catch (e) {
-                    recordErrors.addAll(e.statuses.map((s) => s.message));
-                    if (returnResultDetails) {
-                      for (final s in e.statuses) {
-                        batchStatuses.add(ResultStatus.fromJson(s.toJson(),
-                            indexOverride: j));
-                      }
-                    }
-                  }
-                } else {
-                  validData = preparedRecord.validData;
-                  recordErrors.addAll(preparedRecord.validationErrors);
 
-                  // Auto-generated PKs may be reassigned after an earlier conflict.
-                  if (validData != null &&
-                      isAutoPk &&
-                      record.containsKey(primaryKey) &&
-                      record[primaryKey] != null) {
-                    validData[primaryKey] = tableSchema.primaryKeyConfig
-                        .convertPrimaryKey(record[primaryKey],
-                            tableName: tableName);
-                  }
+                try {
+                  validData = validateAndProcessRecordPure(
+                    schema: tableSchema,
+                    data: record,
+                    tableName: table.tableName,
+                    skipPrimaryKeyFormatCheck: isAutoPk,
+                    validationErrors: recordErrors,
+                    fieldMap: fieldMapForValidation,
+                    ignoreUnknownFields: _config?.ignoreUnknownFields ?? true,
+                    batchTimestamp: batchTimestamp,
+                    schemaNeedsConstraintPass: needsConstraintPass,
+                  );
+                } on DbException catch (e) {
+                  recordErrors.addAll(e.statuses.map((s) => s.message));
+                  validationStatusesJson =
+                      e.statuses.map((s) => s.toJson()).toList();
+                } catch (e) {
+                  recordErrors.add(e.toString());
                 }
 
                 if (validData == null) {
@@ -4682,40 +4653,51 @@ class DataStoreImpl {
                     validationErrorsForResult
                         .add('$prefix: ${recordErrors.join("; ")}');
                   }
-                  if (!triedPkConflictRetry) {
-                    if (returnResultDetails) {
-                      if (preparedRecord.validationStatusesJson != null) {
-                        for (final sJson
-                            in preparedRecord.validationStatusesJson!) {
-                          batchStatuses.add(
-                              ResultStatus.fromJson(sJson, indexOverride: j));
-                        }
-                      } else {
-                        batchStatuses.add(GeneralStatus(
-                          type: ResultType.bizValidationFailed,
-                          message: recordErrors.isNotEmpty
-                              ? recordErrors.join("; ")
-                              : 'Data validation failed',
-                          index: j,
-                        ));
+                  if (returnResultDetails) {
+                    if (validationStatusesJson != null) {
+                      for (final sJson in validationStatusesJson) {
+                        batchStatuses.add(
+                            ResultStatus.fromJson(sJson, indexOverride: j));
                       }
+                    } else {
+                      batchStatuses.add(GeneralStatus(
+                        type: ResultType.bizValidationFailed,
+                        message: recordErrors.isNotEmpty
+                            ? recordErrors.join("; ")
+                            : 'Data validation failed',
+                        index: j,
+                      ));
                     }
                   }
                   finishedRecord = true;
                   break;
                 }
 
-                // Validate foreign key constraints (skip when table has no enabled FKs)
+                // Validate foreign key constraints (using batch results, zero-await hot path)
                 if (hasForeignKeys) {
-                  try {
-                    await _foreignKeyManager!.validateForeignKeyConstraints(
-                      table: table,
-                      data: validData,
-                      operation: ForeignKeyOperation.insert,
-                    );
-                  } catch (e) {
-                    Logger.error('Foreign key constraint validation failed',
-                        rawError: e);
+                  DbException? fkVio;
+                  if (!triedPkConflictRetry && batchFkViolations != null) {
+                    fkVio = batchFkViolations[offset];
+                  } else {
+                    try {
+                      await _foreignKeyManager!.validateForeignKeyConstraints(
+                        table: table,
+                        data: validData,
+                        operation: ForeignKeyOperation.insert,
+                      );
+                    } on DbException catch (e) {
+                      fkVio = e;
+                    } catch (e) {
+                      fkVio = DbException([
+                        GeneralStatus(
+                          type: ResultType.bizForeignKeyViolation,
+                          message: e.toString(),
+                        )
+                      ]);
+                    }
+                  }
+
+                  if (fkVio != null) {
                     invalidRecords.add(record);
                     final failedKey = validData[primaryKey]?.toString() ?? '';
                     if (returnResultDetails && failedKey.isNotEmpty) {
@@ -4723,17 +4705,9 @@ class DataStoreImpl {
                     }
                     failedCount++;
                     if (returnResultDetails) {
-                      if (e is DbException) {
-                        for (final s in e.statuses) {
-                          batchStatuses.add(ResultStatus.fromJson(s.toJson(),
-                              indexOverride: j));
-                        }
-                      } else {
-                        batchStatuses.add(GeneralStatus(
-                          type: ResultType.bizForeignKeyViolation,
-                          message: e.toString(),
-                          index: j,
-                        ));
+                      for (final s in fkVio.statuses) {
+                        batchStatuses.add(ResultStatus.fromJson(s.toJson(),
+                            indexOverride: j));
                       }
                     }
                     finishedRecord = true;
@@ -4899,20 +4873,31 @@ class DataStoreImpl {
         }
 
         if (returnResultDetails) {
-          // Fill success statuses (match on user-facing keys when promote active)
-          final successSet = successKeys.toSet();
-          for (int i = 0; i < records.length; i++) {
-            final oldPk = records[i][primaryKey]?.toString() ?? '';
-            if (oldPk.isEmpty) continue;
-            final displayPk = promoteKeyDesc != null
-                ? _promoteUserFacingSuccessKey(records[i], promoteKeyDesc)
-                : oldPk;
-            if (successSet.contains(displayPk)) {
+          if (failedCount == 0 && successKeys.length == records.length) {
+            // Fast-path: 100% success rate -- zero toSet() and zero hash lookup overhead
+            for (int i = 0; i < records.length; i++) {
               batchStatuses.add(SuccessStatus(
                 message: 'Record inserted successfully',
                 index: i,
-                primaryKey: displayPk,
+                primaryKey: successKeys[i],
               ));
+            }
+          } else {
+            // Partial success / fail-allowed path
+            final successSet = successKeys.toSet();
+            for (int i = 0; i < records.length; i++) {
+              final oldPk = records[i][primaryKey]?.toString() ?? '';
+              if (oldPk.isEmpty) continue;
+              final displayPk = promoteKeyDesc != null
+                  ? _promoteUserFacingSuccessKey(records[i], promoteKeyDesc)
+                  : oldPk;
+              if (successSet.contains(displayPk)) {
+                batchStatuses.add(SuccessStatus(
+                  message: 'Record inserted successfully',
+                  index: i,
+                  primaryKey: displayPk,
+                ));
+              }
             }
           }
         }

@@ -828,7 +828,8 @@ class ToStoreExample {
 
       // 2. Insert current chunk (measure pure database time)
       dbStopwatch.start();
-      final result = await db.batchInsert(tableName, records);
+      final result =
+          await db.batchInsert(tableName, records, returnResultDetails: false);
       dbStopwatch.stop();
 
       // Free records immediately to let Dart GC reclaim memory before flush & next round

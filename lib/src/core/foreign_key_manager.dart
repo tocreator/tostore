@@ -238,6 +238,157 @@ class ForeignKeyManager {
     }
   }
 
+  /// Batch validate foreign key constraints for high-throughput batch operations (e.g. batchInsert)
+  Future<List<DbException?>> validateForeignKeyConstraintsBatch({
+    required TableContext table,
+    required List<Map<String, dynamic>> records,
+    required ForeignKeyOperation operation,
+    TableSchema? schemaOverride,
+  }) async {
+    if (records.isEmpty) return const <DbException?>[];
+    final schema = schemaOverride ??
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
+    if (schema == null || schema.foreignKeys.isEmpty) {
+      return List<DbException?>.filled(records.length, null, growable: false);
+    }
+
+    final activeFks = schema.foreignKeys.where((fk) => fk.enabled).toList();
+    if (activeFks.isEmpty) {
+      return List<DbException?>.filled(records.length, null, growable: false);
+    }
+
+    final violations =
+        List<DbException?>.filled(records.length, null, growable: false);
+
+    for (final fk in activeFks) {
+      final referencedTableCtx =
+          await _dataStore.getTableContext(fk.referencedTable);
+      final referencedSchema = referencedTableCtx.schema;
+      if (referencedSchema.name.isEmpty) {
+        final err = DbException([
+          SchemaValidationStatus(
+            type: ResultType.devTableNotFound,
+            message:
+                'Cannot validate foreign key "${fk.actualName}" on table "${table.tableName}": Referenced table "${fk.referencedTable}" does not exist.',
+            tableName: fk.referencedTable,
+          )
+        ]);
+        for (int i = 0; i < records.length; i++) {
+          violations[i] ??= err;
+        }
+        return violations;
+      }
+
+      // Check simple single-column PK foreign key (most common pattern)
+      final bool isSinglePkFk = fk.fields.length == 1 &&
+          fk.referencedFields.first == referencedSchema.primaryKey;
+
+      if (isSinglePkFk) {
+        final fkField = fk.fields.first;
+        final fkValuesToRecords = <String, List<int>>{};
+        for (int i = 0; i < records.length; i++) {
+          if (violations[i] != null) continue;
+          final r = records[i];
+          final rawVal = r[fkField];
+          if (rawVal == null) {
+            final fieldSchema =
+                schema.fields.firstWhere((f) => f.name == fkField);
+            if (!fieldSchema.nullable) {
+              violations[i] = DbException([
+                ConstraintStatus(
+                  type: ResultType.bizNotNullViolation,
+                  message:
+                      'Foreign key field "$fkField" in table "${table.tableName}" cannot be null',
+                  tableName: table.tableName,
+                  fields: [fkField],
+                )
+              ]);
+            }
+            continue;
+          }
+          final convPk = referencedSchema.primaryKeyConfig.convertPrimaryKey(
+            rawVal,
+            tableName: fk.referencedTable,
+          );
+          if (convPk != null && convPk.toString().isNotEmpty) {
+            fkValuesToRecords.putIfAbsent(convPk.toString(), () => []).add(i);
+          }
+        }
+
+        if (fkValuesToRecords.isNotEmpty) {
+          final pksToCheck = fkValuesToRecords.keys.toList();
+          final existingSet = <String>{};
+
+          // 1. Check in-memory buffer / primary cache (instant memory speed)
+          for (final pk in pksToCheck) {
+            if (_dataStore.tableDataManager
+                .hasLiveTableRecord(referencedTableCtx, pk)) {
+              existingSet.add(pk);
+            }
+          }
+
+          // 2. Check disk B-Tree if needed
+          final missingFromMem =
+              pksToCheck.where((pk) => !existingSet.contains(pk)).toList();
+          if (missingFromMem.isNotEmpty) {
+            final diskExisting = await _dataStore.tableTreePartitionManager
+                    ?.existingPrimaryKeysBatch(
+                        referencedTableCtx, missingFromMem,
+                        schemaOverride: referencedSchema) ??
+                const <String>{};
+            existingSet.addAll(diskExisting);
+          }
+
+          // Mark violations for missing PKs
+          for (final entry in fkValuesToRecords.entries) {
+            if (!existingSet.contains(entry.key)) {
+              final err = DbException([
+                ConstraintStatus(
+                  type: ResultType.bizForeignKeyParentNotExist,
+                  message:
+                      'Foreign key constraint violation on table "${table.tableName}" (Constraint: "${fk.actualName}"): '
+                      'Referenced record does not exist in table "${fk.referencedTable}" for field "$fkField". '
+                      'Conflicting value: ${entry.key}',
+                  tableName: table.tableName,
+                  constraintName: fk.actualName,
+                  fields: [fkField],
+                  conflictingKeys: [entry.key],
+                  referencedTable: fk.referencedTable,
+                )
+              ]);
+              for (final idx in entry.value) {
+                violations[idx] ??= err;
+              }
+            }
+          }
+        }
+      } else {
+        // Fallback for composite or secondary-field foreign keys (still hoists table schema)
+        for (int i = 0; i < records.length; i++) {
+          if (violations[i] != null) continue;
+          try {
+            await validateForeignKeyConstraints(
+              table: table,
+              data: records[i],
+              operation: operation,
+            );
+          } on DbException catch (e) {
+            violations[i] = e;
+          } catch (e) {
+            violations[i] = DbException([
+              GeneralStatus(
+                type: ResultType.bizForeignKeyViolation,
+                message: e.toString(),
+              )
+            ]);
+          }
+        }
+      }
+    }
+
+    return violations;
+  }
+
   /// Check foreign key constraints (when inserting/updating)
   ///
   /// Validate that the record to be inserted or updated satisfies all foreign key constraints

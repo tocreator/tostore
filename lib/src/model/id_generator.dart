@@ -162,6 +162,26 @@ class SequentialIdGenerator implements IdGenerator {
 
     _updateRequestStats(count);
 
+    // Fast-path: single-node sequential increment (pure synchronous mathematical range allocation)
+    if (!isDistributed && !config.useRandomIncrement) {
+      final inc = config.increment;
+      final result = List<String>.generate(count, (i) {
+        _currentId += inc;
+        return _currentId.toString();
+      }, growable: false);
+      return result;
+    }
+
+    if (!isDistributed && config.useRandomIncrement) {
+      final result = <String>[];
+      for (int i = 0; i < count; i++) {
+        _currentId += _random.nextInt(config.increment) + 1;
+        result.add(_currentId.toString());
+      }
+      return result;
+    }
+
+    // Distributed / pool-backed path
     final result = <String>[];
     while (result.length < count && _idPool.isNotEmpty) {
       result.add(_idPool.removeFirst());
@@ -173,26 +193,11 @@ class SequentialIdGenerator implements IdGenerator {
     final expectedPoolSize = _calculateExpectedPoolSize(effectiveRecentTotal);
     final targetSize = expectedPoolSize + (count - result.length);
 
-    _refillIdPool(targetSize, effectiveRecentTotal);
+    // Directly await refill rather than un-awaited fire with 10ms polling loops
+    await _refillIdPool(targetSize, effectiveRecentTotal);
 
-    final remainingCount = count - result.length;
-    final timeout = Duration(
-      seconds: 5 + ((remainingCount ~/ 1000) * 5),
-    );
-    final startTime = DateTime.now();
-    final endTime = startTime.add(timeout);
-
-    while (result.length < count) {
-      if (DateTime.now().isAfter(endTime)) {
-        Logger.warn(
-            'SequentialIdGenerator getId timeout: Request=$count, Retrieved=${result.length}, Timeout=${timeout.inSeconds}s');
-        break;
-      }
-      if (_idPool.isNotEmpty) {
-        result.add(_idPool.removeFirst());
-      } else {
-        await Future.delayed(const Duration(milliseconds: 10));
-      }
+    while (result.length < count && _idPool.isNotEmpty) {
+      result.add(_idPool.removeFirst());
     }
 
     if (result.isEmpty) {
@@ -823,35 +828,14 @@ class TimeBasedIdGenerator implements IdGenerator {
     // Calculate the number of IDs needed
     final targetSize = expectedPoolSize + (count - result.length);
 
-    // Calculate reasonable timeout time - base time 5 seconds + 5 seconds per 1000 IDs
-    final remainingCount = count - result.length;
-    final timeout = Duration(
-      seconds: 5 + ((remainingCount ~/ 1000) * 5),
-    );
-    // Record start time
-    final startTime = DateTime.now();
-    final endTime = startTime.add(timeout);
-
     try {
-      // Start asynchronous pool refill, no waiting
-      // This will start ID generation process in the background
-      _refillIdPool(targetSize, effectiveRecentTotal);
+      // Directly await refill to avoid un-awaited timer polling
+      await _refillIdPool(targetSize, effectiveRecentTotal);
 
-      // Get remaining required IDs from pool with timeout check
-      while (result.length < count) {
-        // Timeout check: If it has exceeded the set time, exit loop
-        if (DateTime.now().isAfter(endTime)) {
-          Logger.warn(
-              'Get ID timeout: Table=$tableUid, Request=$count, Retrieved=${result.length}, Timeout=${timeout.inSeconds} seconds');
-          break; // Exit loop, return retrieved IDs
-        }
-        // Directly get latest queue state from _idPools
-        if (_idPools[tableUid]?.isNotEmpty ?? false) {
-          result.add(_idPools[tableUid]!.removeFirst());
-        } else {
-          // Briefly wait to yield CPU, avoid tight loop
-          await Future.delayed(const Duration(milliseconds: 10));
-        }
+      // Drain remaining required IDs from pool
+      while (
+          result.length < count && (_idPools[tableUid]?.isNotEmpty ?? false)) {
+        result.add(_idPools[tableUid]!.removeFirst());
       }
     } catch (e) {
       Logger.error('ID pool fill or get failed', rawError: e);

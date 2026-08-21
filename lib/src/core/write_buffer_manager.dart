@@ -674,6 +674,7 @@ class WriteBufferManager {
     required String recordId,
     String? transactionId,
   }) {
+    if (_lastReserveRollback.isEmpty) return;
     _lastReserveRollback.remove(
       _reserveKey(table.tableUid, recordId, transactionId),
     );
@@ -793,7 +794,9 @@ class BufferBatchReserveContext {
       changedFields: changedFields,
       transactionId: transactionId,
     );
-    _rollbacks.add(paths);
+    if (paths.isNotEmpty) {
+      _rollbacks.add(paths);
+    }
     return paths;
   }
 
@@ -801,6 +804,10 @@ class BufferBatchReserveContext {
     for (final paths in _rollbacks) {
       _buf.bufferTrees.rollbackReserved(paths, transactionId: transactionId);
     }
+    _rollbacks.clear();
+  }
+
+  void clear() {
     _rollbacks.clear();
   }
 }

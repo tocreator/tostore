@@ -1194,7 +1194,7 @@ class TableDataManager {
       }
 
       // Save ID range (if needed)
-      await _saveIdRange(table);
+      _saveIdRange(table);
 
       return ids.first;
     } catch (e) {
@@ -1229,7 +1229,7 @@ class TableDataManager {
       }
 
       // Save ID range (if needed)
-      await _saveIdRange(table);
+      _saveIdRange(table);
 
       return ids;
     } catch (e) {
@@ -1260,7 +1260,7 @@ class TableDataManager {
           final y3 = yieldController.maybeYield();
           if (y3 != null) await y3;
           final ctx = await _tableContextFromUid(TableUid(tableUid));
-          if (ctx != null) await _saveIdRange(ctx);
+          if (ctx != null) _saveIdRange(ctx);
         }
       }
 
@@ -1818,49 +1818,69 @@ class TableDataManager {
 
     final recordIds = <String>[];
     final entries = <BufferEntry>[];
-
-    await EngineCpuChunk.forEachRangeAsync(
-      length: validBatchRecordIds.length,
-      kind: CpuChunkKind.medium,
-      process: (start, end) async {
-        for (int i = start; i < end; i++) {
-          final recordId = validBatchRecordIds[i];
-          final r = validBatchRecords[i];
-          final oldR = validBatchOldValues[i];
-
-          entries.add(BufferEntry(
-            data: r,
-            operation: operation,
-            timestamp: ts,
-            transactionId: bufferTxId,
-            walPointer: pointers[i],
-            oldValues: oldR,
-            schemaVersion: schemaVersion,
-          ));
-          recordIds.add(recordId);
-
-          if (operation == BufferOperationType.update) {
-            cacheTableRecord(table, recordId, r, schema);
-            await _dataStore.indexManager?.updateIndexDataCache(
-              table,
-              recordId,
-              oldR,
-              r,
-              overrideSchema: schema,
-            );
-          } else if (operation == BufferOperationType.delete) {
-            removeTableRecord(table, recordId);
-            await _dataStore.indexManager?.updateIndexDataCache(
-              table,
-              recordId,
-              r,
-              null,
-              overrideSchema: schema,
-            );
+    if (operation == BufferOperationType.insert) {
+      await EngineCpuChunk.forEachRange(
+        length: validBatchRecordIds.length,
+        kind: CpuChunkKind.medium,
+        process: (start, end) {
+          for (int i = start; i < end; i++) {
+            entries.add(BufferEntry(
+              data: validBatchRecords[i],
+              operation: operation,
+              timestamp: ts,
+              transactionId: bufferTxId,
+              walPointer: pointers[i],
+              oldValues: null,
+              schemaVersion: schemaVersion,
+            ));
+            recordIds.add(validBatchRecordIds[i]);
           }
-        }
-      },
-    );
+        },
+      );
+    } else {
+      await EngineCpuChunk.forEachRangeAsync(
+        length: validBatchRecordIds.length,
+        kind: CpuChunkKind.medium,
+        process: (start, end) async {
+          for (int i = start; i < end; i++) {
+            final recordId = validBatchRecordIds[i];
+            final r = validBatchRecords[i];
+            final oldR = validBatchOldValues[i];
+
+            entries.add(BufferEntry(
+              data: r,
+              operation: operation,
+              timestamp: ts,
+              transactionId: bufferTxId,
+              walPointer: pointers[i],
+              oldValues: oldR,
+              schemaVersion: schemaVersion,
+            ));
+            recordIds.add(recordId);
+
+            if (operation == BufferOperationType.update) {
+              cacheTableRecord(table, recordId, r, schema);
+              await _dataStore.indexManager?.updateIndexDataCache(
+                table,
+                recordId,
+                oldR,
+                r,
+                overrideSchema: schema,
+              );
+            } else if (operation == BufferOperationType.delete) {
+              removeTableRecord(table, recordId);
+              await _dataStore.indexManager?.updateIndexDataCache(
+                table,
+                recordId,
+                r,
+                null,
+                overrideSchema: schema,
+              );
+            }
+          }
+        },
+      );
+    }
 
     if (operation == BufferOperationType.insert) {
       await _dataStore.writeBufferManager.addInsertBatch(
@@ -2474,7 +2494,7 @@ class TableDataManager {
   }
 
   /// save id range info
-  Future<void> _saveIdRange(TableContext table) async {
+  void _saveIdRange(TableContext table) {
     if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
       return;
     }
