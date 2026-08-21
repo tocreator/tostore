@@ -5,6 +5,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:tostore/tostore.dart';
 
+import 'testing/benchmark_dialog.dart';
+import 'testing/benchmark_models.dart';
+import 'testing/benchmark_runner.dart';
 import 'testing/database_tester.dart';
 import 'testing/log_service.dart';
 import 'tostore_example.dart' show ForeignKeyMode, ToStoreExample;
@@ -113,6 +116,9 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
   bool _isInitializing = true;
   bool _isTesting = false; // Add state to track if a test is running
   bool _isAtBottom = true; // Assume we start at the bottom
+
+  BenchmarkSummary? _lastBenchmarkSummary;
+  BenchmarkConfig _benchmarkConfig = const BenchmarkConfig();
 
   AppView _selectedView = AppView.dataView;
 
@@ -1691,6 +1697,22 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                   SizedBox(
                     width: buttonWidth,
                     child: Tooltip(
+                      message: 'Run standardized performance benchmark suite',
+                      child: _buildActionButton(
+                        text: 'Benchmark Test',
+                        icon: Icons.speed_rounded,
+                        onPressed: !_isDbInitialized || _isTesting
+                            ? null
+                            : () {
+                                _checkAndExpandLogPanel();
+                                _showBenchmarkDialog();
+                              },
+                      ),
+                    ),
+                  ),
+                  SizedBox(
+                    width: buttonWidth,
+                    child: Tooltip(
                       message: _isWasmBuild
                           ? 'Concurrency Test is unavailable on WebAssembly builds'
                           : 'Run configurable concurrency test',
@@ -2200,6 +2222,52 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         ];
       },
     );
+  }
+
+  Future<void> _showBenchmarkDialog() async {
+    final config = await showDialog<BenchmarkConfig>(
+      context: context,
+      barrierDismissible: true,
+      builder: (context) => BenchmarkDialog(
+        lastSummary: _lastBenchmarkSummary,
+        initialConfig: _benchmarkConfig,
+      ),
+    );
+    if (!mounted || config == null) return;
+
+    _benchmarkConfig = config;
+    _updateOperationInfo('Starting Benchmark Suite...');
+    setState(() {
+      _isTesting = true;
+    });
+    BenchmarkSummary? resultSummary;
+    try {
+      final runner = BenchmarkRunner(
+        widget.example.db,
+        logService,
+        _updateOperationInfo,
+      );
+      resultSummary = await runner.runBenchmark(config);
+      if (mounted) {
+        setState(() {
+          _lastBenchmarkSummary = resultSummary;
+        });
+      }
+    } catch (e) {
+      logService.add('Benchmark failed: $e', LogLevel.error);
+      _updateOperationInfo('❌ Benchmark Failed');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isTesting = false;
+        });
+        _fetchTableData(resetPage: true);
+        if (resultSummary != null) {
+          // Auto open results dialog upon completion
+          _showBenchmarkDialog();
+        }
+      }
+    }
   }
 
   Future<void> _showConcurrencyTestDialog() async {
