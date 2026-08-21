@@ -589,34 +589,19 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     final dbPath = await widget.example.getDbPath();
 
     final stopwatch = Stopwatch()..start();
-    try {
-      await widget.example.initialize(dbPath: dbPath);
-      stopwatch.stop();
-      if (mounted) {
-        setState(() {
-          _isDbInitialized = true;
-          _isInitializing = false;
-          _lastOperationInfo =
-              'DB Initialized: ${stopwatch.elapsedMilliseconds}ms';
-          _selectedSpace = widget.example.db.currentSpaceName ?? 'default';
-        });
-        // Fetch data if the data view is active
-        if (_selectedView == AppView.dataView) {
-          await _fetchTableData(resetPage: true);
-        }
-      }
-    } catch (e, s) {
-      stopwatch.stop();
-      logService.add(
-          '!!!!!! DATABASE INITIALIZATION FAILED !!!!!!', LogLevel.error);
-      logService.add('Error: $e', LogLevel.error);
-      logService.add('StackTrace: $s', LogLevel.error);
-      if (mounted) {
-        setState(() {
-          _isDbInitialized = false;
-          _isInitializing = false;
-          _lastOperationInfo = 'DB Initialization FAILED!';
-        });
+    await widget.example.initialize(dbPath: dbPath);
+    stopwatch.stop();
+    if (mounted) {
+      setState(() {
+        _isDbInitialized = true;
+        _isInitializing = false;
+        _lastOperationInfo =
+            'DB Initialized: ${stopwatch.elapsedMilliseconds}ms';
+        _selectedSpace = widget.example.db.currentSpaceName ?? 'default';
+      });
+      // Fetch data if the data view is active
+      if (_selectedView == AppView.dataView) {
+        await _fetchTableData(resetPage: true);
       }
     }
   }
