@@ -62,7 +62,7 @@ class IndexManager {
   /// Drop all in-memory state for one index (data cache, meta, matchers, page cache).
   void _invalidateIndexCache(TableContext table, IndexUid indexUid) {
     if (indexUid.isEmpty) return;
-    _indexMetaCache.remove([table.tableUid, indexUid]);
+    _indexMetaCache.removePoint2(table.tableUid, indexUid);
     _indexDataCache.remove([table.tableUid, indexUid]);
     _indexFieldMatchers.remove('${table.tableUid}:$indexUid');
     _metaLoadingFutures.remove(_getMetaLoadingKey(table.tableUid, indexUid));
@@ -73,7 +73,7 @@ class IndexManager {
   /// Invalidate cached [IndexMeta] after external partition-0 rewrite (redo replay).
   void invalidateIndexMetaCache(TableUid tableUid, IndexUid indexUid) {
     if (indexUid.isEmpty) return;
-    _indexMetaCache.remove([tableUid, indexUid]);
+    _indexMetaCache.removePoint2(tableUid, indexUid);
     _metaLoadingFutures.remove(_getMetaLoadingKey(tableUid, indexUid));
   }
 
@@ -1249,6 +1249,31 @@ class IndexManager {
     return null;
   }
 
+  /// Fast synchronous single unique key lookup to primary key string.
+  /// Probes writeBuffer and hot index cache only; never hits disk.
+  String? lookupUniquePrimaryKeySync(
+    TableContext table,
+    IndexUid indexUid,
+    dynamic value,
+  ) {
+    final schema = table.schema;
+    if (schema.name.isEmpty || indexUid.isEmpty) return null;
+
+    final bufferId = _probeBufferForUniqueIndex(table, indexUid, value);
+    if (bufferId != null) {
+      return bufferId;
+    }
+
+    _registerIndexComparator(table, indexUid, schema);
+    final pkValue = _indexDataCache.getPoint3(table.tableUid, indexUid, value);
+    if (pkValue is String && pkValue.isNotEmpty) {
+      if (!_isPrimaryKeyHiddenByDeleteOverlay(table, pkValue)) {
+        return pkValue;
+      }
+    }
+    return null;
+  }
+
   /// Fast single unique key lookup to primary key string.
   /// Encodes value and delegates directly to _searchUniquePointLogical, returning matched PK.
   Future<String?> lookupUniquePrimaryKey(
@@ -1270,8 +1295,8 @@ class IndexManager {
       }
 
       _registerIndexComparator(table, indexUid, schema);
-      final compositeKey = <dynamic>[table.tableUid, indexUid, value];
-      final pkValue = _indexDataCache.get(compositeKey);
+      final pkValue =
+          _indexDataCache.getPoint3(table.tableUid, indexUid, value);
       if (pkValue is String && pkValue.isNotEmpty) {
         if (!_isPrimaryKeyHiddenByDeleteOverlay(table, pkValue)) {
           return pkValue;
@@ -1347,9 +1372,15 @@ class IndexManager {
     _registerIndexComparator(table, indexUid, schema);
 
     // 1. Hotspot / Memory Cache probe
-    final compositeKey = <dynamic>[table.tableUid, indexUid, ...nativeVal];
     if (!readFromFileOnly) {
-      final pkValue = _indexDataCache.get(compositeKey);
+      final dynamic pkValue;
+      if (nativeVal.length == 1) {
+        pkValue = _indexDataCache.getPoint3(
+            table.tableUid, indexUid, nativeVal.first);
+      } else {
+        final compositeKey = <dynamic>[table.tableUid, indexUid, ...nativeVal];
+        pkValue = _indexDataCache.get(compositeKey);
+      }
       if (pkValue is String && pkValue.isNotEmpty) {
         return IndexSearchResult(
           primaryKeys: <String>[pkValue],
@@ -1678,7 +1709,7 @@ class IndexManager {
     TableUid tableUid,
     IndexUid indexUid,
   ) async {
-    final cached = _indexMetaCache.get([tableUid, indexUid]);
+    final cached = _indexMetaCache.getPoint2(tableUid, indexUid);
     if (cached != null) {
       return cached;
     }
@@ -1772,7 +1803,7 @@ class IndexManager {
         indexUid,
       );
       if (meta != null) {
-        _indexMetaCache.put([tableUid, indexUid], meta);
+        _indexMetaCache.putPoint2(tableUid, indexUid, meta);
         return meta;
       }
 
@@ -1804,7 +1835,7 @@ class IndexManager {
             isUnique: idx.unique,
             isBuilding: false,
           );
-          _indexMetaCache.put([tableUid, indexUid], synthesized);
+          _indexMetaCache.putPoint2(tableUid, indexUid, synthesized);
           return synthesized;
         }
       } catch (_) {
@@ -1889,7 +1920,7 @@ class IndexManager {
         );
       }
 
-      _indexMetaCache.put([tableUid, resolvedUid], meta);
+      _indexMetaCache.putPoint2(tableUid, resolvedUid, meta);
       return meta;
     } catch (e) {
       Logger.error('Failed to update index metadata', rawError: e);
@@ -1932,8 +1963,9 @@ class IndexManager {
       for (final index in allIndexes) {
         final indexUid = _indexUidFromSchema(index);
         if (indexUid.isEmpty) continue;
-        _indexMetaCache.put(
-          [table.tableUid, indexUid],
+        _indexMetaCache.putPoint2(
+          table.tableUid,
+          indexUid,
           IndexMeta.createEmpty(
             indexUid: indexUid,
             tableUid: table.tableUid,
@@ -2178,8 +2210,11 @@ class IndexManager {
           if (vals == null) continue;
 
           _registerIndexComparator(table, c.indexUid, schema);
-          final cacheKey = <dynamic>[table.tableUid, c.indexUid, ...vals];
-          final existing = _indexDataCache.get(cacheKey);
+          final existing = vals.length == 1
+              ? _indexDataCache.getPoint3(
+                  table.tableUid, c.indexUid, vals.first)
+              : _indexDataCache
+                  .get(<dynamic>[table.tableUid, c.indexUid, ...vals]);
           if (existing is String && existing.isNotEmpty) {
             // Update: same record reusing its own unique value is OK.
             if (isUpdate &&
@@ -2682,8 +2717,10 @@ class IndexManager {
                   : null);
           if (vals == null) continue;
 
-          final cacheKey = <dynamic>[table.tableUid, indexUid, ...vals];
-          final existingPk = _indexDataCache.get(cacheKey);
+          final existingPk = vals.length == 1
+              ? _indexDataCache.getPoint3(table.tableUid, indexUid, vals.first)
+              : _indexDataCache
+                  .get(<dynamic>[table.tableUid, indexUid, ...vals]);
           if (existingPk is String &&
               existingPk.isNotEmpty &&
               existingPk != recordId) {
@@ -3375,7 +3412,7 @@ class IndexManager {
           isBuilding: false,
         );
         // Only cache in memory, don't write to file yet to avoid extra IO
-        _indexMetaCache.put([tableUid, indexUid], meta);
+        _indexMetaCache.putPoint2(tableUid, indexUid, meta);
       }
 
       final bool isUnique = meta.isUnique;

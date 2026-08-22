@@ -293,10 +293,10 @@ class BufferTreeStore {
   // -------------------- Point lookups --------------------
 
   BufferEntry? getPendingRecord(TableUid tableUid, String pk) =>
-      pendingRecordCache.peek([tableUid, pk]);
+      pendingRecordCache.peekPoint2(tableUid, pk);
 
   BufferEntry? getTxnRecord(String txId, TableUid tableUid, String pk) =>
-      txnRecordCache.peek([txId, tableUid, pk]);
+      txnRecordCache.peekPoint3(txId, tableUid, pk);
 
   BufferEntry? getVisibleRecord(
     TableContext table,
@@ -480,11 +480,12 @@ class BufferTreeStore {
       );
     }
 
-    final recordKey = isTxn
-        ? <dynamic>[transactionId, tableUid, pk]
-        : <dynamic>[tableUid, pk];
     final cache = isTxn ? txnRecordCache : pendingRecordCache;
-    cache.put(recordKey, effective);
+    if (isTxn) {
+      cache.putPoint3(transactionId, tableUid, pk, effective);
+    } else {
+      cache.putPoint2(tableUid, pk, effective);
+    }
     return effective;
   }
 
@@ -521,10 +522,11 @@ class BufferTreeStore {
     final tableUid = plan.tableUid;
     final isTxn = transactionId != null;
     final recordCache = isTxn ? txnRecordCache : pendingRecordCache;
-    recordCache.put(
-      isTxn ? <dynamic>[transactionId, tableUid, pk] : <dynamic>[tableUid, pk],
-      entry,
-    );
+    if (isTxn) {
+      recordCache.putPoint3(transactionId, tableUid, pk, entry);
+    } else {
+      recordCache.putPoint2(tableUid, pk, entry);
+    }
     applyIndexWritePlan(
       plan: plan,
       pk: pk,
@@ -582,10 +584,12 @@ class BufferTreeStore {
   }) {
     final prior = getVisibleRecord(table, pk, transactionId: transactionId);
     if (prior == null) {
-      final key = transactionId != null
-          ? <dynamic>[transactionId, table.tableUid, pk]
-          : <dynamic>[table.tableUid, pk];
-      (transactionId != null ? txnRecordCache : pendingRecordCache).remove(key);
+      final cache = transactionId != null ? txnRecordCache : pendingRecordCache;
+      if (transactionId != null) {
+        cache.removePoint3(transactionId, table.tableUid, pk);
+      } else {
+        cache.removePoint2(table.tableUid, pk);
+      }
       return;
     }
     _removeRecordAndIndexes(
@@ -622,10 +626,12 @@ class BufferTreeStore {
       transactionId: transactionId,
       isUnique: true,
     );
-    final key = transactionId != null
-        ? <dynamic>[transactionId, table.tableUid, pk]
-        : <dynamic>[table.tableUid, pk];
-    (transactionId != null ? txnRecordCache : pendingRecordCache).remove(key);
+    final cache = transactionId != null ? txnRecordCache : pendingRecordCache;
+    if (transactionId != null) {
+      cache.removePoint3(transactionId, table.tableUid, pk);
+    } else {
+      cache.removePoint2(table.tableUid, pk);
+    }
   }
 
   // -------------------- Index maintenance --------------------
@@ -1350,13 +1356,12 @@ class BufferTreeStore {
       final y = yc.maybeYield();
       if (y != null) await y;
 
-      final key = <dynamic>[tableUid, pk];
-      final live = pendingRecordCache.peek(key);
+      final live = pendingRecordCache.peekPoint2(tableUid, pk);
       if (live == null) continue;
       // Keep when a newer enqueue replaced this row after the flush snapshot.
       if (live.walPointer != task.flushedWalByPk[pk]) continue;
 
-      pendingRecordCache.remove(key);
+      pendingRecordCache.removePoint2(tableUid, pk);
 
       final paths = task.indexPathsByPk[pk];
       if (paths == null || paths.isEmpty) continue;

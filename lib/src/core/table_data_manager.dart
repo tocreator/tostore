@@ -290,13 +290,13 @@ class TableDataManager {
   /// Returns the cached map by reference (no copy). Callers must not mutate
   /// the result in place -- treat it as read-only or copy before writing.
   Map<String, dynamic>? getCachedTableRecord(TableContext table, String pk) {
-    return _tableRecordCache.get([table.tableUid, pk]);
+    return _tableRecordCache.getPoint2(table.tableUid, pk);
   }
 
   /// Check if a record exists in the table record cache (O(1) fast check).
   /// Note: This returns true even for tombstones (deleted records) if they are in the cache.
   bool hasTableRecord(TableContext table, String pk) {
-    return _tableRecordCache.containsKey([table.tableUid, pk]);
+    return _tableRecordCache.containsPoint2(table.tableUid, pk);
   }
 
   /// Check if a record exists in the table record cache.
@@ -304,7 +304,7 @@ class TableDataManager {
   /// Deletes live in the write buffer as [BufferOperationType.delete], not as
   /// cached tombstone rows -- presence here means a live cached row.
   bool hasLiveTableRecord(TableContext table, String pk) {
-    return _tableRecordCache.containsKey([table.tableUid, pk]);
+    return _tableRecordCache.containsPoint2(table.tableUid, pk);
   }
 
   /// Returns true when the record is hidden by a pending/txn **delete** overlay,
@@ -346,14 +346,15 @@ class TableDataManager {
     }
 
     // [Cache Optimization] Use Fast O(1) checks
-    final bool alreadyInCache = _tableRecordCache.containsKey([tableUid, pk]);
+    final bool alreadyInCache = _tableRecordCache.containsPoint2(tableUid, pk);
 
     if (alreadyInCache || force || _dataStore.isGlobalPrewarming) {
       // Lazy registration of comparator
       _registerTableComparator(table, schema);
 
-      _tableRecordCache.put(
-        [tableUid, pk],
+      _tableRecordCache.putPoint2(
+        tableUid,
+        pk,
         record,
         size: resolveRecordSizeBytes(record),
       );
@@ -391,15 +392,18 @@ class TableDataManager {
       final pk = r[primaryKey]?.toString();
       if (pk == null || pk.isEmpty) continue;
 
-      final key = [tableUid, pk];
-
       // If not forced/prewarming, we only update if it's already there
       if (doNotCache) {
-        if (!_tableRecordCache.containsKey(key)) continue;
+        if (!_tableRecordCache.containsPoint2(tableUid, pk)) continue;
       }
 
       final value = r;
-      _tableRecordCache.put(key, value, size: resolveRecordSizeBytes(value));
+      _tableRecordCache.putPoint2(
+        tableUid,
+        pk,
+        value,
+        size: resolveRecordSizeBytes(value),
+      );
     }
   }
 
@@ -451,7 +455,7 @@ class TableDataManager {
   /// Remove a cached table record (if present).
 
   void removeTableRecord(TableContext table, String pk) {
-    _tableRecordCache.remove([table.tableUid, pk]);
+    _tableRecordCache.removePoint2(table.tableUid, pk);
   }
 
   /// Remove multiple cached table records.
@@ -462,7 +466,7 @@ class TableDataManager {
     for (final pk in pks) {
       final y1 = yieldController.maybeYield();
       if (y1 != null) await y1;
-      _tableRecordCache.remove([table.tableUid, pk]);
+      _tableRecordCache.removePoint2(table.tableUid, pk);
     }
   }
 
@@ -472,6 +476,7 @@ class TableDataManager {
 
     // Also remove from record count cache
     _tableRecordCounts.remove(table.tableUid);
+    _dataStore.queryExecutor.invalidateQueryCacheForTable(table);
   }
 
   /// Remove record count cache for a table.
@@ -1581,6 +1586,7 @@ class TableDataManager {
     }
 
     _markSpaceStatsDirty(table);
+    _dataStore.queryExecutor.invalidateQueryCacheForTable(table);
   }
 
   /// Unified internal batch processor for high-throughput writes.
@@ -1902,6 +1908,7 @@ class TableDataManager {
     }
     successIds.addAll(recordIds);
     _markSpaceStatsDirty(table);
+    _dataStore.queryExecutor.invalidateQueryCacheForTable(table);
 
     return (successRecordIds: successIds, failedRecordIds: failedIds);
   }
@@ -2131,6 +2138,8 @@ class TableDataManager {
 
       _tableRecordCounts.remove(table.tableUid);
       _needSaveStats = true;
+      _dataStore.queryExecutor.invalidateQueryCacheForTable(table);
+      _dataStore.queryExecutor.invalidatePlanCacheForTable(table.tableUid);
     } catch (e) {
       Logger.error('Failed to update table deleted stats', rawError: e);
     }
@@ -3966,12 +3975,30 @@ class TableDataManager {
     }
 
     // 1. Hotspot / Row Cache Check
-    final cached = _tableRecordCache.get([table.tableUid, pk]);
+    final cached = _tableRecordCache.getPoint2(table.tableUid, pk);
     if (cached != null) {
       return (found: true, record: cached);
     }
 
     return (found: false, record: null);
+  }
+
+  /// Fast synchronous single primary key point lookup.
+  /// Checks memory tier (Txn > WriteBuffer > _tableRecordCache) with zero collection overhead.
+  /// Never hits disk; returns null if not present in memory.
+  Map<String, dynamic>? getRecordByPrimaryKeySync(
+    TableContext table,
+    dynamic key,
+  ) {
+    if (key == null) return null;
+    final pk = key is String ? key : key.toString();
+    if (pk.isEmpty) return null;
+
+    final mem = _resolveRecordFromMemory(table, pk);
+    if (mem.found) {
+      return mem.record;
+    }
+    return null;
   }
 
   /// Fast single primary key point lookup.

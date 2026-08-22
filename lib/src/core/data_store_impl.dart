@@ -53,11 +53,7 @@ import 'background_write_scheduler.dart';
 import 'backup_manager.dart';
 import 'cache_manager.dart';
 import 'compaction_manager.dart';
-import 'compute/batch_identifier_compute.dart';
-import 'compute/batch_update_compute.dart';
-import 'compute/compute_batch_planner.dart';
 import 'compute/record_compute.dart';
-import 'compute_manager.dart';
 import 'cpu_work_chunk.dart';
 import 'crontab_manager.dart';
 import 'foreign_key_manager.dart';
@@ -1671,6 +1667,11 @@ class DataStoreImpl {
     return context;
   }
 
+  /// Synchronously obtain the TableContext of this table from memory cache.
+  TableContext? getTableContextSync(String tableName) {
+    return tableMetaManager?.getTableContextByNameSync(tableName);
+  }
+
   /// Insert data complete process
   ///
   /// [retryOnPkConflict] is an internal flag to avoid infinite recursion when
@@ -2018,185 +2019,6 @@ class DataStoreImpl {
       resolvedPrimaryKey: resolvedPrimaryKey,
       ignoreUnknownFields: _config?.ignoreUnknownFields ?? true,
     );
-  }
-
-  Future<List<IdentifierValidationRecordResult>>
-      _validateRecordIdentifiersBatch(
-    TableSchema schema,
-    List<Map<String, dynamic>> records,
-    List<IndexSchema> uniqueIndexes, {
-    required bool checkRequiredFields,
-  }) async {
-    if (records.isEmpty) {
-      return const <IdentifierValidationRecordResult>[];
-    }
-
-    final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
-      itemCount: records.length,
-      estimateAverageItemBytes: () =>
-          tableDataManager.estimateAverageRecordBytesForBatch(records),
-    );
-    final useIsolate = dispatchPlan.useIsolate;
-    final actualTaskCount = dispatchPlan.actualTaskCount;
-
-    final tasks = <ComputeTask<BatchIdentifierValidationRequest,
-        BatchIdentifierValidationResult>>[];
-    for (final range
-        in ComputeBatchPlanner.splitRange(records.length, actualTaskCount)) {
-      tasks.add(
-        ComputeTask(
-          function: validateIdentifierChunk,
-          message: BatchIdentifierValidationRequest(
-            schema: schema,
-            records: records.sublist(range.start, range.end),
-            uniqueIndexes: uniqueIndexes,
-            checkRequiredFields: checkRequiredFields,
-          ),
-        ),
-      );
-    }
-
-    final results =
-        await ComputeManager.computeBatch(tasks, enableIsolate: useIsolate);
-
-    final merged = <IdentifierValidationRecordResult>[];
-    for (final result in results) {
-      merged.addAll(result.records);
-    }
-    return merged;
-  }
-
-  int _estimateAverageUpdatePrepareBytes(
-    List<Map<String, dynamic>> records,
-    List<Map<String, dynamic>?> existingRecords,
-  ) {
-    if (records.isEmpty) return 0;
-
-    final sampledIndices = <int>{
-      0,
-      if (records.length > 1) 1,
-      if (records.length > 2) records.length - 2,
-      if (records.length > 3) records.length - 1,
-    };
-
-    int total = 0;
-    int count = 0;
-    for (final index in sampledIndices) {
-      final currentRecordBytes =
-          max(1, tableDataManager.estimateRecordSizeBytes(records[index]));
-      final existingRecord = existingRecords[index];
-      final existingRecordBytes = existingRecord == null
-          ? 0
-          : max(1, tableDataManager.estimateRecordSizeBytes(existingRecord));
-      total += currentRecordBytes + existingRecordBytes;
-      count++;
-    }
-
-    return count == 0 ? 0 : max(1, (total / count).ceil());
-  }
-
-  Future<List<BatchUpdatePreparedRecord>> _prepareBatchUpdateRecords(
-    TableSchema schema,
-    TableContext table,
-    List<Map<String, dynamic>> records,
-    List<Map<String, dynamic>?> existingRecords,
-  ) async {
-    if (records.isEmpty) {
-      return const <BatchUpdatePreparedRecord>[];
-    }
-    if (records.length != existingRecords.length) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message:
-              '_prepareBatchUpdateRecords length mismatch. Records length (${records.length}) does not match existing records list length (${existingRecords.length}).',
-        )
-      ]);
-    }
-
-    final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
-      itemCount: records.length,
-      estimateAverageItemBytes: () {
-        final avg = tableDataManager.averageTableRecordSizeBytes;
-        // new + existing typical working set for update prepare.
-        if (avg != null && avg > 0) return avg * 2;
-        return _estimateAverageUpdatePrepareBytes(records, existingRecords);
-      },
-    );
-    final useIsolate = dispatchPlan.useIsolate;
-    final actualTaskCount = dispatchPlan.actualTaskCount;
-
-    final tasks =
-        <ComputeTask<BatchUpdatePrepareRequest, BatchUpdatePrepareResult>>[];
-    for (final range
-        in ComputeBatchPlanner.splitRange(records.length, actualTaskCount)) {
-      tasks.add(
-        ComputeTask(
-          function: prepareBatchUpdateChunk,
-          message: BatchUpdatePrepareRequest(
-            schema: schema,
-            table: table,
-            records: records.sublist(range.start, range.end),
-            existingRecords: existingRecords.sublist(range.start, range.end),
-            ignoreUnknownFields: _config?.ignoreUnknownFields ?? true,
-          ),
-        ),
-      );
-    }
-
-    final results =
-        await ComputeManager.computeBatch(tasks, enableIsolate: useIsolate);
-
-    final merged = <BatchUpdatePreparedRecord>[];
-    for (final result in results) {
-      merged.addAll(result.records);
-    }
-    return merged;
-  }
-
-  Future<List<UniformUpdatePreparedRecord>> prepareUniformUpdateRecords(
-    TableSchema schema,
-    TableContext table,
-    Map<String, dynamic> validData,
-    List<Map<String, dynamic>> existingRecords,
-  ) async {
-    if (existingRecords.isEmpty) {
-      return const <UniformUpdatePreparedRecord>[];
-    }
-
-    final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
-      itemCount: existingRecords.length,
-      estimateAverageItemBytes: () =>
-          tableDataManager.estimateAverageRecordBytesForBatch(existingRecords),
-    );
-    final useIsolate = dispatchPlan.useIsolate;
-    final actualTaskCount = dispatchPlan.actualTaskCount;
-
-    final tasks = <ComputeTask<UniformUpdatePrepareRequest,
-        UniformUpdatePrepareResult>>[];
-    for (final range in ComputeBatchPlanner.splitRange(
-        existingRecords.length, actualTaskCount)) {
-      tasks.add(
-        ComputeTask(
-          function: prepareUniformUpdateChunk,
-          message: UniformUpdatePrepareRequest(
-            schema: schema,
-            table: table,
-            validData: validData,
-            existingRecords: existingRecords.sublist(range.start, range.end),
-          ),
-        ),
-      );
-    }
-
-    final results =
-        await ComputeManager.computeBatch(tasks, enableIsolate: useIsolate);
-
-    final merged = <UniformUpdatePreparedRecord>[];
-    for (final result in results) {
-      merged.addAll(result.records);
-    }
-    return merged;
   }
 
   /// User-facing query helper.
@@ -2766,13 +2588,6 @@ class DataStoreImpl {
           }
         }
 
-        final preparedRecords = await prepareUniformUpdateRecords(
-          schema,
-          table,
-          validData,
-          records,
-        );
-
         for (int recordIndex = 0; recordIndex < records.length; recordIndex++) {
           final y3 = yieldController.maybeYield();
           if (y3 != null) await y3;
@@ -2782,7 +2597,11 @@ class DataStoreImpl {
             continue; // Skip records without primary key
           }
 
-          final updatedRecord = preparedRecords[recordIndex].updatedRecord;
+          final updatedRecord = applyUniformUpdatePure(
+            schema: schema,
+            validData: validData,
+            existingRecord: record,
+          );
 
           bool ok = true;
           UniqueViolation? uniqueViolation;
@@ -5085,14 +4904,8 @@ class DataStoreImpl {
 
     parallelJournalManager.beginBatchOperation();
     try {
-      // 1. Bulk validation (O(N) CPU)
+      // 1. Bulk validation (O(N) CPU, single-pass pure synchronous)
       final validatedRecords = <Map<String, dynamic>>[];
-      final identifierResults = await _validateRecordIdentifiersBatch(
-        schema,
-        records,
-        uniqueIndexes,
-        checkRequiredFields: true,
-      );
       final validationResultYield = YieldController(
         'DataStoreImpl.batchUpsert.validationResults',
         checkInterval: 1024,
@@ -5101,7 +4914,12 @@ class DataStoreImpl {
         final y10 = validationResultYield.maybeYield();
         if (y10 != null) await y10;
         final record = records[i];
-        final err = identifierResults[i].error;
+        final err = validateRecordIdentifierPure(
+          schema: schema,
+          data: record,
+          uniqueIndexes: uniqueIndexes,
+          checkRequiredFields: true,
+        );
         if (err != null) {
           final failedKey = record[pk]?.toString() ?? 'index=$i';
           if (returnResultDetails) {
@@ -5402,13 +5220,10 @@ class DataStoreImpl {
     // If a record only has a unique identifier, resolve its PK via IndexManager.
     final List<Map<String, dynamic>> withPk = [];
     final List<Map<String, dynamic>> needsResolution = [];
-    final List<Map<String, dynamic>> recordsNeedingIdentifierValidation = [];
-    final List<int> recordsNeedingIdentifierValidationIndices = [];
     final identifierSplitYield = YieldController(
       'DataStoreImpl.batchUpdate.identify',
       checkInterval: 2048,
     );
-
     for (int i = 0; i < records.length; i++) {
       final y13 = identifierSplitYield.maybeYield();
       if (y13 != null) await y13;
@@ -5418,32 +5233,14 @@ class DataStoreImpl {
       if (pkVal != null && pkVal.isNotEmpty) {
         withPk.add(record);
       } else {
-        recordsNeedingIdentifierValidation.add(record);
-        recordsNeedingIdentifierValidationIndices.add(i);
-      }
-    }
-
-    if (recordsNeedingIdentifierValidation.isNotEmpty) {
-      final identifierResults = await _validateRecordIdentifiersBatch(
-        schema,
-        recordsNeedingIdentifierValidation,
-        allUniqueIndexes,
-        checkRequiredFields: false,
-      );
-      final identifierResultYield = YieldController(
-        'DataStoreImpl.batchUpdate.identifierResults',
-        checkInterval: 1024,
-      );
-
-      for (int i = 0; i < recordsNeedingIdentifierValidation.length; i++) {
-        final y14 = identifierResultYield.maybeYield();
-        if (y14 != null) await y14;
-        final record = recordsNeedingIdentifierValidation[i];
-        final err = identifierResults[i].error;
+        final err = validateRecordIdentifierPure(
+          schema: schema,
+          data: record,
+          uniqueIndexes: allUniqueIndexes,
+          checkRequiredFields: false,
+        );
         if (err != null) {
-          final originalIndex = recordsNeedingIdentifierValidationIndices[i];
-          final failedKey =
-              record[primaryKey]?.toString() ?? 'missing_identifier';
+          final failedKey = pkVal ?? 'missing_identifier';
           if (returnResultDetails) {
             failedKeys.add(failedKey);
           }
@@ -5451,7 +5248,7 @@ class DataStoreImpl {
           if (!allowPartialErrors) {
             return finish(DbResult.error(
               type: ResultType.bizValidationFailed,
-              message: 'Validation failed for record $originalIndex: $err',
+              message: 'Validation failed for record $i: $err',
               failedKeys: returnResultDetails ? failedKeys : const [],
             ));
           }
@@ -5586,63 +5383,94 @@ class DataStoreImpl {
         final batchContext =
             writeBufferManager.createBatchReserveContext(table, txId);
 
-        // 7. Pipeline Stage 1: Batch Merge and Validate
-        final List<Map<String, dynamic>> candidateMergedRecords = [];
-        final List<String> candidatePkVals = [];
-        final List<Map<String, dynamic>> candidateOldRecords = [];
-        final Map<String, Set<String>> candidateChangedFieldsMap = {};
-        final preparedRecords = await _prepareBatchUpdateRecords(
-          schema,
-          table,
-          subBatch,
-          existingRecords,
-        );
+        // Pre-probe foreign keys once per subBatch if foreign keys are enabled (1:1 aligned, zero await in loop)
+        final bool hasActiveForeignKeys = _foreignKeyManager != null &&
+            schema.foreignKeys.any((fk) => fk.enabled);
+        final List<DbException?>? batchFkViolations = hasActiveForeignKeys
+            ? await _foreignKeyManager!.validateForeignKeyConstraintsBatch(
+                table: table,
+                records: subBatch,
+                operation: ForeignKeyOperation.update,
+                schemaOverride: schema,
+              )
+            : null;
 
+        // Hoist once per sub-batch: unique field names and field map
+        final Set<String> uniqueFieldNames = <String>{
+          for (final idx in allUniqueIndexes) ...idx.fields,
+        };
+        final Map<String, FieldSchema> fieldMap = {
+          for (final field in schema.fields) field.name: field,
+        };
+
+        final List<Map<String, dynamic>> recordsToCommit = [];
+        final List<Map<String, dynamic>> oldRecordsToCommit = [];
+        final List<String> commitPkVals = [];
+        final Set<String> reservedPkSet = {};
+
+        // Track items with unique index modifications that require disk checks
+        final List<Map<String, dynamic>> recordsForUniqueDiskCheck = [];
+        final List<int> commitIndicesForUniqueCheck = [];
+        final Map<String, Set<String>> uniqueChangedFieldsMap = {};
+
+        // Single-Pass Pipeline: validate -> evaluate expressions -> check FK -> reserve uniques -> collect commit
         for (int recordIndex = 0;
             recordIndex < subBatch.length;
             recordIndex++) {
+          final y16 = executionYield.maybeYield();
+          if (y16 != null) await y16;
+
           final record = subBatch[recordIndex];
           final pkVal = record[primaryKey]?.toString();
           if (pkVal == null) continue;
 
           final existingRecord = existingRecords[recordIndex];
-
           if (existingRecord == null) {
-            if (allowPartialErrors) {
-              if (returnResultDetails) {
-                failedKeys.add(pkVal);
-              }
+            if (allowPartialErrors && returnResultDetails) {
+              failedKeys.add(pkVal);
             }
             failedCount++;
             continue;
           }
 
-          final y16 = executionYield.maybeYield();
-          if (y16 != null) await y16;
-          final preparedRecord = preparedRecords[recordIndex];
-          if (preparedRecord.missingExistingRecord) {
-            if (allowPartialErrors) {
-              if (returnResultDetails) {
-                failedKeys.add(pkVal);
-              }
+          // 1. Validate update payload pure
+          Map<String, dynamic>? validData;
+          final fieldConstraintErrors = <String>[];
+          List<Map<String, dynamic>>? validationStatusesJson;
+          bool validationFailed = false;
+
+          try {
+            validData = validateAndProcessUpdateDataPure(
+              schema: schema,
+              data: record,
+              tableName: table.tableName,
+              ignoreUnknownFields: _config?.ignoreUnknownFields ?? true,
+            );
+            if (validData == null || validData.isEmpty) {
+              validationFailed = true;
             }
-            failedCount++;
-            continue;
+          } on DbException catch (e) {
+            validationFailed = true;
+            fieldConstraintErrors.addAll(e.statuses.map((s) => s.message));
+            validationStatusesJson = e.statuses.map((s) => s.toJson()).toList();
+          } catch (e) {
+            validationFailed = true;
+            fieldConstraintErrors.add(e.toString());
           }
 
-          if (preparedRecord.validationFailed) {
+          if (validationFailed) {
             if (returnResultDetails) {
               failedKeys.add(pkVal);
-              if (preparedRecord.validationStatusesJson != null) {
-                for (final sJson in preparedRecord.validationStatusesJson!) {
-                  batchStatuses
-                      .add(ResultStatus.fromJson(sJson, indexOverride: i));
+              if (validationStatusesJson != null) {
+                for (final sJson in validationStatusesJson) {
+                  batchStatuses.add(ResultStatus.fromJson(sJson,
+                      indexOverride: i + recordIndex));
                 }
               } else {
                 batchStatuses.add(GeneralStatus(
                   type: ResultType.bizValidationFailed,
                   message: 'Data validation failed for record $pkVal',
-                  index: i,
+                  index: i + recordIndex,
                 ));
               }
             }
@@ -5658,20 +5486,82 @@ class DataStoreImpl {
             continue;
           }
 
-          if (preparedRecord.fieldConstraintErrors.isNotEmpty) {
+          // 2. Merge changes & evaluate expressions (in-place)
+          final updatedRecord = <String, dynamic>{...existingRecord};
+          final changedFields = <String>[];
+          final actualValidData = validData!;
+
+          for (final entry in actualValidData.entries) {
+            final fieldName = entry.key;
+            final proposed = entry.value;
+
+            if (proposed is ExprNode) {
+              try {
+                final result = evaluateExpressionForRecord(
+                  proposed,
+                  existingRecord,
+                  schema,
+                  isUpdate: true,
+                );
+                final field = fieldMap[fieldName];
+                if (field == null || field.name == primaryKey) {
+                  continue;
+                }
+
+                final converted = field.convertValue(result);
+                try {
+                  field.checkConstraints(
+                    converted,
+                    tableName: schema.name,
+                    skipMaxLengthCheck: true,
+                  );
+                } on DbException catch (e) {
+                  validationStatusesJson ??= [];
+                  validationStatusesJson
+                      .addAll(e.statuses.map((s) => s.toJson()));
+                  fieldConstraintErrors.add(
+                    'Result of expression for $fieldName exceeds constraints: $converted',
+                  );
+                  continue;
+                }
+
+                var finalValue = converted;
+                if (finalValue is String &&
+                    field.maxLength != null &&
+                    finalValue.length > field.maxLength!) {
+                  finalValue = finalValue.substring(0, field.maxLength!);
+                }
+
+                if (updatedRecord[fieldName] != finalValue) {
+                  updatedRecord[fieldName] = finalValue;
+                  changedFields.add(fieldName);
+                }
+              } catch (e) {
+                Logger.error('Expression evaluation failed for $fieldName',
+                    rawError: e);
+              }
+            } else {
+              if (updatedRecord[fieldName] != proposed) {
+                updatedRecord[fieldName] = proposed;
+                changedFields.add(fieldName);
+              }
+            }
+          }
+
+          if (fieldConstraintErrors.isNotEmpty) {
             if (returnResultDetails) {
               failedKeys.add(pkVal);
-              if (preparedRecord.validationStatusesJson != null) {
-                for (final sJson in preparedRecord.validationStatusesJson!) {
-                  batchStatuses
-                      .add(ResultStatus.fromJson(sJson, indexOverride: i));
+              if (validationStatusesJson != null) {
+                for (final sJson in validationStatusesJson) {
+                  batchStatuses.add(ResultStatus.fromJson(sJson,
+                      indexOverride: i + recordIndex));
                 }
               } else {
-                for (final error in preparedRecord.fieldConstraintErrors) {
+                for (final error in fieldConstraintErrors) {
                   batchStatuses.add(GeneralStatus(
                     type: ResultType.bizValidationFailed,
                     message: error,
-                    index: i,
+                    index: i + recordIndex,
                   ));
                 }
               }
@@ -5680,7 +5570,7 @@ class DataStoreImpl {
             if (!allowPartialErrors) {
               return finishWithPromoteMirror(DbResult.error(
                 type: ResultType.bizValidationFailed,
-                message: preparedRecord.fieldConstraintErrors.join("; "),
+                message: fieldConstraintErrors.join("; "),
                 failedKeys: returnResultDetails ? failedKeys : const [],
                 statuses: returnResultDetails ? batchStatuses : const [],
               ));
@@ -5688,9 +5578,6 @@ class DataStoreImpl {
             continue;
           }
 
-          final updatedRecord = preparedRecord.updatedRecord;
-          final changedFields = preparedRecord.changedFields;
-          if (updatedRecord == null) continue;
           if (changedFields.isEmpty) {
             if (returnResultDetails) {
               successKeys.add(
@@ -5707,52 +5594,63 @@ class DataStoreImpl {
             continue;
           }
 
-          candidateMergedRecords.add(updatedRecord);
-          candidatePkVals.add(pkVal);
-          candidateOldRecords.add(existingRecord);
-          candidateChangedFieldsMap[pkVal] = changedFields.toSet();
-        }
+          // 3. Foreign Key Check (using pre-probed results, 0 await)
+          if (batchFkViolations != null) {
+            final fkVio = batchFkViolations[recordIndex];
+            if (fkVio != null) {
+              if (returnResultDetails) {
+                failedKeys.add(pkVal);
+                for (final s in fkVio.statuses) {
+                  batchStatuses.add(ResultStatus.fromJson(s.toJson(),
+                      indexOverride: i + recordIndex));
+                }
+              }
+              failedCount++;
+              if (!allowPartialErrors) {
+                if (reservedPkSet.isNotEmpty) {
+                  await writeBufferManager.releaseReservedUniquesForPks(
+                    table: table,
+                    recordIds: reservedPkSet,
+                    transactionId: txId,
+                  );
+                  outstandingReservedPks.removeAll(reservedPkSet);
+                }
+                return finishWithPromoteMirror(DbResult.error(
+                  type: ResultType.bizForeignKeyViolation,
+                  message: fkVio.message,
+                  failedKeys: returnResultDetails ? failedKeys : const [],
+                  statuses: returnResultDetails ? batchStatuses : const [],
+                ));
+              }
+              continue;
+            }
+          }
 
-        if (candidateMergedRecords.isEmpty) continue;
-
-        // 8. Pipeline Stage 2: Batch Reserve (Buffer Lock)
-        // We lock the buffer FIRST to ensure atomic isolation during the subsequent slow disk check.
-        final List<Map<String, dynamic>> readyForDiskCheck = [];
-        final List<String> readyPkVals = [];
-        final List<Map<String, dynamic>> readyOldRecords = [];
-        final Map<String, Set<String>> readyChangedFieldsMap = {};
-        final Set<String> reservedPkSet = {};
-        // Hoist once per sub-batch: unique field names that can trigger reserve.
-        final Set<String> uniqueFieldNames = <String>{
-          for (final idx in allUniqueIndexes) ...idx.fields,
-        };
-
-        for (int j = 0; j < candidateMergedRecords.length; j++) {
-          final pkVal = candidatePkVals[j];
-          final updatedRecord = candidateMergedRecords[j];
-          final changedFields = candidateChangedFieldsMap[pkVal]!;
-          final needsReserve = uniqueFieldNames.isNotEmpty &&
+          // 4. Unique Reservation Check
+          final bool needsReserve = uniqueFieldNames.isNotEmpty &&
               changedFields.any(uniqueFieldNames.contains);
 
           if (needsReserve) {
+            final changedFieldsSet = changedFields.toSet();
             try {
               batchContext.tryReserve(
                 pkVal,
                 updatedRecord,
                 isUpdate: true,
-                changedFields: changedFields,
+                changedFields: changedFieldsSet,
                 schema: schema,
               );
               reservedPkSet.add(pkVal);
               outstandingReservedPks.add(pkVal);
+
+              commitIndicesForUniqueCheck.add(recordsToCommit.length);
+              recordsForUniqueDiskCheck.add(updatedRecord);
+              uniqueChangedFieldsMap[pkVal] = changedFieldsSet;
             } catch (e) {
               if (returnResultDetails) {
                 failedKeys.add(pkVal);
               }
               failedCount++;
-              final originalIndex =
-                  records.indexWhere((r) => r[primaryKey]?.toString() == pkVal);
-              final globalIndex = originalIndex != -1 ? originalIndex : 0;
               final violationType = e is UniqueViolation
                   ? e.constraintResultType
                   : ResultType.bizUniqueViolation;
@@ -5764,7 +5662,7 @@ class DataStoreImpl {
                   type: violationType,
                   message: violationMessage,
                   tableName: tableName,
-                  index: globalIndex,
+                  index: i + recordIndex,
                   primaryKey: pkVal,
                   constraintName:
                       e is UniqueViolation ? e.indexName?.value : null,
@@ -5773,7 +5671,6 @@ class DataStoreImpl {
                 ));
               }
               if (!allowPartialErrors) {
-                // Rollback all reservations in this sub-batch before returning
                 await writeBufferManager.releaseReservedUniquesForPks(
                   table: table,
                   recordIds: reservedPkSet,
@@ -5791,116 +5688,46 @@ class DataStoreImpl {
             }
           }
 
-          readyForDiskCheck.add(updatedRecord);
-          readyPkVals.add(pkVal);
-          readyOldRecords.add(candidateOldRecords[j]);
-          readyChangedFieldsMap[pkVal] = changedFields;
+          recordsToCommit.add(updatedRecord);
+          oldRecordsToCommit.add(existingRecord);
+          commitPkVals.add(pkVal);
         }
 
-        if (readyForDiskCheck.isEmpty) continue;
+        // 5. Conditional Batch Unique Constraint Check (Disk Only, on-demand)
+        if (recordsForUniqueDiskCheck.isNotEmpty) {
+          final violations = await indexManager!.checkUniqueConstraintsBatch(
+            table,
+            recordsForUniqueDiskCheck,
+            schemaOverride: schema,
+            transactionId: txId,
+            isUpdate: true,
+            skipBufferCheck: true,
+            changedFieldsMap: uniqueChangedFieldsMap,
+          );
 
-        // 9. Pipeline Stage 3: Batch Unique Constraint Check (Disk Only)
-        // Since we already hold the buffer locks, we only need to verify against committed disk state.
-        final violations = await indexManager!.checkUniqueConstraintsBatch(
-          table,
-          readyForDiskCheck,
-          schemaOverride: schema,
-          transactionId: txId,
-          isUpdate: true,
-          skipBufferCheck: true,
-          changedFieldsMap: readyChangedFieldsMap,
-        );
+          final Set<int> indicesToRemove = {};
+          for (int vIdx = 0; vIdx < violations.length; vIdx++) {
+            final violation = violations[vIdx];
+            if (violation != null) {
+              final commitIdx = commitIndicesForUniqueCheck[vIdx];
+              final pkVal = commitPkVals[commitIdx];
+              indicesToRemove.add(commitIdx);
 
-        // 10. Pipeline Stage 4: Validation and Commit
-        final List<Map<String, dynamic>> recordsToCommit = [];
-        final List<Map<String, dynamic>> oldRecordsToCommit = [];
-        final List<String> commitPkVals = [];
-
-        for (int j = 0; j < readyForDiskCheck.length; j++) {
-          final pkVal = readyPkVals[j];
-          final violation = violations[j];
-
-          if (violation != null) {
-            if (returnResultDetails) {
-              failedKeys.add(pkVal);
-            }
-            failedCount++;
-            final originalIndex =
-                records.indexWhere((r) => r[primaryKey]?.toString() == pkVal);
-            final globalIndex = originalIndex != -1 ? originalIndex : 0;
-            if (returnResultDetails) {
-              batchStatuses.add(ConstraintStatus(
-                type: violation.constraintResultType,
-                message: violation.message,
-                tableName: tableName,
-                fields: violation.fields,
-                conflictingKeys: [violation.value],
-                index: globalIndex,
-                primaryKey: pkVal,
-                constraintName: violation.indexName?.value,
-              ));
-            }
-            // Rollback reservation for this specific record on disk conflict
-            if (reservedPkSet.contains(pkVal)) {
-              writeBufferManager.releaseReservedUniques(
-                table: table,
-                recordId: pkVal,
-                transactionId: txId,
-              );
-              outstandingReservedPks.remove(pkVal);
-            }
-
-            if (!allowPartialErrors) {
-              // Rollback all other reservations in this sub-batch
-              await writeBufferManager.releaseReservedUniquesForPks(
-                table: table,
-                recordIds: reservedPkSet,
-                transactionId: txId,
-              );
-              outstandingReservedPks.removeAll(reservedPkSet);
-              return finishWithPromoteMirror(DbResult.error(
-                type: violation.constraintResultType,
-                message: violation.message,
-                failedKeys: returnResultDetails ? failedKeys : const [],
-                statuses: returnResultDetails ? batchStatuses : const [],
-              ));
-            }
-            continue;
-          }
-
-          final updatedRecord = readyForDiskCheck[j];
-          final existingRecord = readyOldRecords[j];
-
-          // 10.1: Foreign Key Checks
-          if (_foreignKeyManager != null) {
-            try {
-              await _foreignKeyManager!.validateForeignKeyConstraints(
-                table: table,
-                data: updatedRecord,
-                operation: ForeignKeyOperation.update,
-              );
-            } catch (e) {
               if (returnResultDetails) {
                 failedKeys.add(pkVal);
+                batchStatuses.add(ConstraintStatus(
+                  type: violation.constraintResultType,
+                  message: violation.message,
+                  tableName: tableName,
+                  fields: violation.fields,
+                  conflictingKeys: [violation.value],
+                  index: i,
+                  primaryKey: pkVal,
+                  constraintName: violation.indexName?.value,
+                ));
               }
               failedCount++;
-              final originalIndex =
-                  records.indexWhere((r) => r[primaryKey]?.toString() == pkVal);
-              final globalIndex = originalIndex != -1 ? originalIndex : 0;
-              if (returnResultDetails) {
-                if (e is DbException) {
-                  for (final s in e.statuses) {
-                    batchStatuses.add(ResultStatus.fromJson(s.toJson(),
-                        indexOverride: globalIndex));
-                  }
-                } else {
-                  batchStatuses.add(GeneralStatus(
-                    type: ResultType.bizForeignKeyViolation,
-                    message: e.toString(),
-                    index: globalIndex,
-                  ));
-                }
-              }
+
               if (reservedPkSet.contains(pkVal)) {
                 writeBufferManager.releaseReservedUniques(
                   table: table,
@@ -5908,29 +5735,49 @@ class DataStoreImpl {
                   transactionId: txId,
                 );
                 outstandingReservedPks.remove(pkVal);
+                reservedPkSet.remove(pkVal);
               }
+
               if (!allowPartialErrors) {
-                // Rollback all reservations
-                await writeBufferManager.releaseReservedUniquesForPks(
-                  table: table,
-                  recordIds: reservedPkSet,
-                  transactionId: txId,
-                );
-                outstandingReservedPks.removeAll(reservedPkSet);
+                if (reservedPkSet.isNotEmpty) {
+                  await writeBufferManager.releaseReservedUniquesForPks(
+                    table: table,
+                    recordIds: reservedPkSet,
+                    transactionId: txId,
+                  );
+                  outstandingReservedPks.removeAll(reservedPkSet);
+                }
                 return finishWithPromoteMirror(DbResult.error(
-                  type: ResultType.bizForeignKeyViolation,
-                  message: e.toString(),
+                  type: violation.constraintResultType,
+                  message: violation.message,
                   failedKeys: returnResultDetails ? failedKeys : const [],
                   statuses: returnResultDetails ? batchStatuses : const [],
                 ));
               }
-              continue;
             }
           }
 
-          recordsToCommit.add(updatedRecord);
-          oldRecordsToCommit.add(existingRecord);
-          commitPkVals.add(pkVal);
+          if (indicesToRemove.isNotEmpty) {
+            final filteredRecords = <Map<String, dynamic>>[];
+            final filteredOldRecords = <Map<String, dynamic>>[];
+            final filteredPks = <String>[];
+            for (int k = 0; k < recordsToCommit.length; k++) {
+              if (!indicesToRemove.contains(k)) {
+                filteredRecords.add(recordsToCommit[k]);
+                filteredOldRecords.add(oldRecordsToCommit[k]);
+                filteredPks.add(commitPkVals[k]);
+              }
+            }
+            recordsToCommit
+              ..clear()
+              ..addAll(filteredRecords);
+            oldRecordsToCommit
+              ..clear()
+              ..addAll(filteredOldRecords);
+            commitPkVals
+              ..clear()
+              ..addAll(filteredPks);
+          }
         }
 
         // 10.2: Single atomic batch commit to TableDataManager
@@ -6009,19 +5856,31 @@ class DataStoreImpl {
 
       // Fill success statuses (match on user-facing keys when promote active)
       if (returnResultDetails) {
-        final successSet = successKeys.toSet();
-        for (int i = 0; i < records.length; i++) {
-          final oldPk = records[i][primaryKey]?.toString() ?? '';
-          if (oldPk.isEmpty) continue;
-          final displayPk = promoteKeyDesc != null
-              ? _promoteUserFacingSuccessKey(records[i], promoteKeyDesc)
-              : oldPk;
-          if (successSet.contains(displayPk)) {
+        if (failedCount == 0 &&
+            successKeys.length == records.length &&
+            promoteKeyDesc == null) {
+          for (int i = 0; i < records.length; i++) {
             batchStatuses.add(SuccessStatus(
               message: 'Record updated successfully',
               index: i,
-              primaryKey: displayPk,
+              primaryKey: successKeys[i],
             ));
+          }
+        } else {
+          final successSet = successKeys.toSet();
+          for (int i = 0; i < records.length; i++) {
+            final oldPk = records[i][primaryKey]?.toString() ?? '';
+            if (oldPk.isEmpty) continue;
+            final displayPk = promoteKeyDesc != null
+                ? _promoteUserFacingSuccessKey(records[i], promoteKeyDesc)
+                : oldPk;
+            if (successSet.contains(displayPk)) {
+              batchStatuses.add(SuccessStatus(
+                message: 'Record updated successfully',
+                index: i,
+                primaryKey: displayPk,
+              ));
+            }
           }
         }
       }

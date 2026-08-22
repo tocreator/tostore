@@ -1132,8 +1132,9 @@ class TransactionManager {
             final y = yieldController.maybeYield();
             if (y != null) await y;
             // put() may trigger TreeCache fifo auto-eviction when over budget
-            _recentCommittedWrites.put(
-              [tableUid, k],
+            _recentCommittedWrites.putPoint2(
+              tableUid,
+              k,
               nowMs,
               size: _estimateSsiWriteIndexEntryBytes(tableUid, k),
             );
@@ -1231,7 +1232,7 @@ class TransactionManager {
           final y12 = yieldController.maybeYield();
           if (y12 != null) await y12;
           // Use TreeCache: key format [tableUid, pk]
-          final lastMs = _recentCommittedWrites.get([tableUid, k]);
+          final lastMs = _recentCommittedWrites.getPoint2(tableUid, k);
           if (lastMs != null && lastMs > startMs) {
             final tableName =
                 await _dataStore.tableMetaManager?.getNameByUid(tableUid) ??

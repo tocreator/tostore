@@ -357,34 +357,34 @@ final class TableTreePartitionManager {
   /// Force-overwrite so concurrent file reads cannot keep a stale page.
   void _publishLeafPage(String tableUid, TreePagePtr ptr, LeafPage leaf) {
     if (ptr.isNull) return;
-    _leafPageCache.put([tableUid, ptr.partitionNo, ptr.pageNo], leaf);
+    _leafPageCache.putPoint3(tableUid, ptr.partitionNo, ptr.pageNo, leaf);
   }
 
   void _publishInternalPage(
       String tableUid, TreePagePtr ptr, InternalPage page) {
     if (ptr.isNull) return;
-    _internalPageCache.put([tableUid, ptr.partitionNo, ptr.pageNo], page);
+    _internalPageCache.putPoint3(tableUid, ptr.partitionNo, ptr.pageNo, page);
   }
 
   /// Drop both leaf/internal slots for a freed page pointer.
   void _evictCachedPage(String tableUid, TreePagePtr ptr) {
     if (ptr.isNull) return;
-    final key = [tableUid, ptr.partitionNo, ptr.pageNo];
-    _leafPageCache.remove(key);
-    _internalPageCache.remove(key);
+    _leafPageCache.removePoint3(tableUid, ptr.partitionNo, ptr.pageNo);
+    _internalPageCache.removePoint3(tableUid, ptr.partitionNo, ptr.pageNo);
   }
 
   /// File-read populate: never overwrite a page published by writeChanges.
   void _offerLeafPageFromFile(String tableUid, TreePagePtr ptr, LeafPage leaf) {
     if (ptr.isNull || leaf.keys.isEmpty) return;
-    _leafPageCache.putIfAbsent([tableUid, ptr.partitionNo, ptr.pageNo], leaf);
+    _leafPageCache.putIfAbsentPoint3(
+        tableUid, ptr.partitionNo, ptr.pageNo, leaf);
   }
 
   void _offerInternalPageFromFile(
       String tableUid, TreePagePtr ptr, InternalPage page) {
     if (ptr.isNull || page.children.isEmpty) return;
-    _internalPageCache
-        .putIfAbsent([tableUid, ptr.partitionNo, ptr.pageNo], page);
+    _internalPageCache.putIfAbsentPoint3(
+        tableUid, ptr.partitionNo, ptr.pageNo, page);
   }
 
   /// Prewarm boundary leaf pages (first/last) for a table B+Tree.
@@ -410,8 +410,8 @@ final class TableTreePartitionManager {
 
     Future<void> prewarmLeaf(TreePagePtr ptr) async {
       if (ptr.isNull) return;
-      final cacheKey = [tableUid, ptr.partitionNo, ptr.pageNo];
-      final alreadyCached = _leafPageCache.containsKey(cacheKey);
+      final alreadyCached =
+          _leafPageCache.containsPoint3(tableUid, ptr.partitionNo, ptr.pageNo);
       await _readLeafPage(
         table,
         resolvedMeta,
@@ -487,8 +487,8 @@ final class TableTreePartitionManager {
     }
 
     // Check instance-level cache
-    final cacheKey = [tableUid, ptr.partitionNo, ptr.pageNo];
-    final instanceCached = _leafPageCache.get(cacheKey);
+    final instanceCached =
+        _leafPageCache.getPoint3(tableUid, ptr.partitionNo, ptr.pageNo);
     if (instanceCached != null) {
       // Copy to local cache if provided
       if (localCache != null) {
@@ -570,8 +570,8 @@ final class TableTreePartitionManager {
     }
 
     // Check instance-level cache
-    final cacheKey = [tableUid, ptr.partitionNo, ptr.pageNo];
-    final instanceCached = _internalPageCache.get(cacheKey);
+    final instanceCached =
+        _internalPageCache.getPoint3(tableUid, ptr.partitionNo, ptr.pageNo);
     if (instanceCached != null) {
       // Copy to local cache if provided
       if (localCache != null) {

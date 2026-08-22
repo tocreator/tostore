@@ -149,6 +149,8 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
   int _totalRecords = 0;
   int _totalPages = 0;
   bool _isDataLoading = false;
+  bool _isCountCalculating = false;
+  int _fetchSequence = 0;
   bool _isCountLimited =
       false; // Indicates if count might be limited by defaultQueryLimit
   String? _primaryKey;
@@ -208,6 +210,8 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
       return;
     }
 
+    final int currentSeq = ++_fetchSequence;
+
     setState(() {
       _isDataLoading = true;
       if (resetPage) {
@@ -220,7 +224,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     });
 
     try {
-      // Get schema to find columns and PK
+      // 1. Get schema to find columns and PK
       final schema = await widget.example.db.getTableSchema(_selectedTable);
       if (schema != null) {
         _tableColumns = schema.fields.map((f) => f.name).toList();
@@ -231,16 +235,13 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         _hasVectorSupport =
             schema.indexes.any((idx) => idx.type == IndexType.vector);
       } else {
-        // Fallback for tables without explicit schema (like kv store)
         _tableColumns = [];
         _primaryKey = 'key';
         _hasVectorSupport = false;
       }
 
-      // Base queries for data and count
+      // 2. Base query for data fetching
       var dataQuery = widget.example.db.query(_selectedTable);
-
-      // Apply active filters
       for (final filter in _activeFilters) {
         final field = filter['field'] as String;
         final op = filter['operator'] as String;
@@ -252,7 +253,21 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         }
       }
 
-      // Apply sorting
+      // 3. Base query for count calculation (matching filters)
+      var countQuery = widget.example.db.query(_selectedTable);
+      for (final filter in _activeFilters) {
+        final field = filter['field'] as String;
+        final op = filter['operator'] as String;
+        final value = filter['value'];
+        if (op == 'startsWith' || op == 'prefix') {
+          countQuery =
+              countQuery.whereStartsWith(field, value?.toString() ?? '');
+        } else {
+          countQuery = countQuery.where(field, op, value);
+        }
+      }
+
+      // 4. Apply sorting for data fetching
       if (_sortColumn != null) {
         if (_sortAscending) {
           dataQuery = dataQuery.orderByAsc(_sortColumn!);
@@ -262,29 +277,9 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
       }
 
       final int maxOffset = widget.example.db.config.maxQueryOffset;
-
-      // Get defaultQueryLimit to detect if count might be limited
-      final int defaultQueryLimit = widget.example.db.config.defaultQueryLimit;
-
       late final QueryResult<Map<String, dynamic>> result;
 
       if (_paginationMode == PaginationMode.offset) {
-        // Get total count for pagination (only needed in offset mode)
-        _totalRecords = await dataQuery.count();
-
-        // Detect if count might be limited by defaultQueryLimit
-        // If count equals defaultQueryLimit and there are filters, it's likely limited
-        _isCountLimited =
-            _activeFilters.isNotEmpty && _totalRecords == defaultQueryLimit;
-
-        _totalPages = (_totalRecords / _pageSize).ceil();
-        if (_totalPages == 0) _totalPages = 1;
-
-        // Clamp the current page
-        if (_currentPage > _totalPages) {
-          _currentPage = _totalPages;
-        }
-
         final int offset = (_currentPage - 1) * _pageSize;
         if (!mounted) return;
         if (offset > maxOffset) {
@@ -294,64 +289,25 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         }
 
         result = await dataQuery.limit(_pageSize).offset(offset);
-        if (!mounted) return;
-        setState(() {
-          _tableData = result.data;
-          _nextCursor = result.nextCursorToken;
-          _prevCursor = result.prevCursorToken;
-        });
       } else {
-        // Cursor mode
-        // IMPORTANT: Create a separate count query to avoid limit affecting the count
-        // Build count query with same filters but without limit/cursor
-        var countQuery = widget.example.db.query(_selectedTable);
-        for (final filter in _activeFilters) {
-          final field = filter['field'] as String;
-          final op = filter['operator'] as String;
-          final value = filter['value'];
-          if (op == 'startsWith' || op == 'prefix') {
-            countQuery =
-                countQuery.whereStartsWith(field, value?.toString() ?? '');
-          } else {
-            countQuery = countQuery.where(field, op, value);
-          }
-        }
-        // Apply same sorting for consistency (though count doesn't need it)
-        if (_sortColumn != null) {
-          if (_sortAscending) {
-            countQuery = countQuery.orderByAsc(_sortColumn!);
-          } else {
-            countQuery = countQuery.orderByDesc(_sortColumn!);
-          }
-        }
-        _totalRecords = await countQuery.count();
-
-        // Detect if count might be limited by defaultQueryLimit
-        // If count equals defaultQueryLimit and there are filters, it's likely limited
-        _isCountLimited =
-            _activeFilters.isNotEmpty && _totalRecords == defaultQueryLimit;
-
-        // Now apply limit and cursor for data fetching
         var q = dataQuery.limit(_pageSize);
         if (cursor != null) {
           q = q.cursor(cursor);
         }
-
         result = await q;
-        if (!mounted) return;
-
-        setState(() {
-          _tableData = result.data;
-          _nextCursor = result.nextCursorToken;
-          _prevCursor = result.prevCursorToken;
-        });
       }
 
+      if (!mounted || currentSeq != _fetchSequence) return;
+
       setState(() {
-        // if columns were not determined by schema, infer from first record
+        _tableData = result.data;
+        _nextCursor = result.nextCursorToken;
+        _prevCursor = result.prevCursorToken;
         if (_tableColumns.isEmpty && _tableData.isNotEmpty) {
           _tableColumns = _tableData.first.keys.toList();
         }
+        _isDataLoading = false;
+        _pageInputController.text = _currentPage.toString();
       });
 
       final filterHint = _activeFilters.isEmpty
@@ -363,17 +319,49 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
       final elapsedMs = result.executionTimeMs;
       logService.add(
           'Query table "$_selectedTable" ($modeHint, $filterHint): '
-          'fetched ${_tableData.length} records / $_totalRecords total '
+          'fetched ${_tableData.length} records '
           'in ${elapsedMs ?? '?'}ms',
           LogLevel.info);
+
+      // 5. Asynchronously update record count in background without blocking list rendering
+      _asyncCalculateTableCount(countQuery, currentSeq);
     } catch (e, s) {
       logService.add('Error fetching table data: $e', LogLevel.error);
       logService.add('Stacktrace: $s', LogLevel.error);
-    } finally {
+      if (mounted) {
+        setState(() => _isDataLoading = false);
+      }
+    }
+  }
+
+  Future<void> _asyncCalculateTableCount(
+      QueryBuilder countQuery, int sequence) async {
+    try {
+      if (mounted && sequence == _fetchSequence) {
+        setState(() => _isCountCalculating = true);
+      }
+
+      final count = await countQuery.count();
+      if (!mounted || sequence != _fetchSequence) return;
+
+      final defaultQueryLimit = widget.example.db.config.defaultQueryLimit;
       setState(() {
-        _isDataLoading = false;
-        _pageInputController.text = _currentPage.toString();
+        _totalRecords = count;
+        _isCountLimited =
+            _activeFilters.isNotEmpty && _totalRecords == defaultQueryLimit;
+        _totalPages = (_totalRecords / _pageSize).ceil();
+        if (_totalPages == 0) _totalPages = 1;
+        if (_currentPage > _totalPages &&
+            _paginationMode == PaginationMode.offset) {
+          _currentPage = _totalPages;
+          _pageInputController.text = _currentPage.toString();
+        }
+        _isCountCalculating = false;
       });
+    } catch (_) {
+      if (mounted && sequence == _fetchSequence) {
+        setState(() => _isCountCalculating = false);
+      }
     }
   }
 
@@ -381,6 +369,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
   Future<void> _fetchKvData({bool resetPage = false, String? cursor}) async {
     final previousNextCursor = _nextCursor;
     final previousPrevCursor = _prevCursor;
+    final int currentSeq = ++_fetchSequence;
 
     setState(() {
       _isDataLoading = true;
@@ -418,9 +407,6 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
       if (prefix != null) {
         countQuery = countQuery.prefix(prefix);
       }
-      _totalRecords = await countQuery.count();
-      _totalPages = (_totalRecords / _pageSize).ceil();
-      if (_totalPages == 0) _totalPages = 1;
 
       var dataQuery = kv.query(isGlobal: isGlobal);
       if (prefix != null) {
@@ -449,7 +435,9 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         }
         dataQuery = dataQuery.cursor(cursor);
       } else {
-        if (_currentPage > _totalPages) _currentPage = _totalPages;
+        if (_currentPage > _totalPages && _totalPages > 0) {
+          _currentPage = _totalPages;
+        }
         if (_currentPage < 1) _currentPage = 1;
         dataQuery = dataQuery.offset((_currentPage - 1) * _pageSize);
       }
@@ -466,7 +454,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         };
       }).toList();
 
-      if (!mounted) return;
+      if (!mounted || currentSeq != _fetchSequence) return;
       setState(() {
         _tableData = rows;
         if (_paginationMode == PaginationMode.cursor) {
@@ -476,6 +464,8 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
           _prevCursor = _currentPage > 1 ? 'prev' : null;
           _nextCursor = _currentPage < _totalPages ? 'next' : null;
         }
+        _isDataLoading = false;
+        _pageInputController.text = _currentPage.toString();
       });
 
       final scope = isGlobal ? 'global' : 'space';
@@ -484,18 +474,45 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
       final elapsedMs = result.executionTimeMs;
       logService.add(
           'Query KV ($scope, $prefixHint, $modeHint): '
-          'fetched ${rows.length} records / $_totalRecords total '
+          'fetched ${rows.length} records '
           'in ${elapsedMs ?? '?'}ms',
           LogLevel.info);
+
+      // Trigger asynchronous count
+      _asyncCalculateKvCount(countQuery, currentSeq);
     } catch (e, s) {
       logService.add('Error fetching KV data: $e', LogLevel.error);
       logService.add('Stacktrace: $s', LogLevel.error);
-    } finally {
       if (mounted) {
-        setState(() {
-          _isDataLoading = false;
+        setState(() => _isDataLoading = false);
+      }
+    }
+  }
+
+  Future<void> _asyncCalculateKvCount(
+      KvQueryBuilder countQuery, int sequence) async {
+    try {
+      if (mounted && sequence == _fetchSequence) {
+        setState(() => _isCountCalculating = true);
+      }
+
+      final count = await countQuery.count();
+      if (!mounted || sequence != _fetchSequence) return;
+
+      setState(() {
+        _totalRecords = count;
+        _totalPages = (_totalRecords / _pageSize).ceil();
+        if (_totalPages == 0) _totalPages = 1;
+        if (_currentPage > _totalPages &&
+            _paginationMode == PaginationMode.offset) {
+          _currentPage = _totalPages;
           _pageInputController.text = _currentPage.toString();
-        });
+        }
+        _isCountCalculating = false;
+      });
+    } catch (_) {
+      if (mounted && sequence == _fetchSequence) {
+        setState(() => _isCountCalculating = false);
       }
     }
   }
@@ -1138,9 +1155,13 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                 ),
               ),
               Text(
-                  _isCountLimited
-                      ? '≥$_totalRecords Records ($_selectedSpace)' // Indicate count might be limited
-                      : '$_totalRecords Records ($_selectedSpace)', // Show current space
+                  _isCountCalculating
+                      ? (_totalRecords > 0
+                          ? '$_totalRecords Records (updating...)'
+                          : 'Loading count...')
+                      : (_isCountLimited
+                          ? '≥$_totalRecords Records ($_selectedSpace)'
+                          : '$_totalRecords Records ($_selectedSpace)'),
                   style: Theme.of(context).textTheme.bodyMedium),
             ],
           ),

@@ -154,8 +154,8 @@ final class NghPartitionManager {
     }
 
     // 2. Instance cache
-    final instanceKey = [tableUid, indexUid, partitionNo, pageNo];
-    final cached = _graphPageCache.get(instanceKey);
+    final cached =
+        _graphPageCache.getPoint4(tableUid, indexUid, partitionNo, pageNo);
     if (cached != null) return cached;
 
     // When index is marked fully cached, do not fall back to disk
@@ -185,7 +185,7 @@ final class NghPartitionManager {
           maxDegree: meta.maxDegree,
           slotCount: meta.nodesPerGraphPage(_dataStore.configuredPageSize));
     }
-    _graphPageCache.put(instanceKey, page);
+    _graphPageCache.putPoint4(tableUid, indexUid, partitionNo, pageNo, page);
     return page;
   }
 
@@ -219,8 +219,8 @@ final class NghPartitionManager {
       if (cached != null) return cached;
     }
 
-    final instanceKey = [tableUid, indexUid, partitionNo, pageNo];
-    final cached = _pqCodePageCache.get(instanceKey);
+    final cached =
+        _pqCodePageCache.getPoint4(tableUid, indexUid, partitionNo, pageNo);
     if (cached != null) return cached;
 
     if (_pqCodePageCache.isFullyCached(_indexPrefix(tableUid, indexUid))) {
@@ -247,7 +247,7 @@ final class NghPartitionManager {
           pqSubspaces: meta.pqSubspaces,
           capacity: meta.vectorsPerPqPage(_dataStore.configuredPageSize));
     }
-    _pqCodePageCache.put(instanceKey, page);
+    _pqCodePageCache.putPoint4(tableUid, indexUid, partitionNo, pageNo, page);
     return page;
   }
 
@@ -268,8 +268,8 @@ final class NghPartitionManager {
       if (cached != null) return cached;
     }
 
-    final instanceKey = [tableUid, indexUid, partitionNo, pageNo];
-    final cached = _rawVectorPageCache.get(instanceKey);
+    final cached =
+        _rawVectorPageCache.getPoint4(tableUid, indexUid, partitionNo, pageNo);
     if (cached != null) return cached;
 
     if (_rawVectorPageCache.isFullyCached(_indexPrefix(tableUid, indexUid))) {
@@ -299,7 +299,8 @@ final class NghPartitionManager {
           precisionIndex: meta.precision.index,
           capacity: meta.vectorsPerRawPage(_dataStore.configuredPageSize));
     }
-    _rawVectorPageCache.put(instanceKey, page);
+    _rawVectorPageCache.putPoint4(
+        tableUid, indexUid, partitionNo, pageNo, page);
     return page;
   }
 
@@ -501,8 +502,8 @@ final class NghPartitionManager {
       stats.maxPageNoWritten = max(stats.maxPageNoWritten, ptr.pageNo);
 
       // Update instance cache
-      _graphPageCache
-          .put([tableUid, indexUid, ptr.partitionNo, ptr.pageNo], page);
+      _graphPageCache.putPoint4(
+          tableUid, indexUid, ptr.partitionNo, ptr.pageNo, page);
     }
 
     // -- Encode & stage PQ-code pages --
@@ -524,8 +525,8 @@ final class NghPartitionManager {
       stageWrite(stats.path!, ptr.pageNo * pageSize, pageBytes);
       stats.maxPageNoWritten = max(stats.maxPageNoWritten, ptr.pageNo);
 
-      _pqCodePageCache
-          .put([tableUid, indexUid, ptr.partitionNo, ptr.pageNo], page);
+      _pqCodePageCache.putPoint4(
+          tableUid, indexUid, ptr.partitionNo, ptr.pageNo, page);
     }
 
     // -- Encode & stage raw-vector pages --
@@ -547,8 +548,8 @@ final class NghPartitionManager {
       stageWrite(stats.path!, ptr.pageNo * pageSize, pageBytes);
       stats.maxPageNoWritten = max(stats.maxPageNoWritten, ptr.pageNo);
 
-      _rawVectorPageCache
-          .put([tableUid, indexUid, ptr.partitionNo, ptr.pageNo], page);
+      _rawVectorPageCache.putPoint4(
+          tableUid, indexUid, ptr.partitionNo, ptr.pageNo, page);
     }
 
     // Apply meta deltas before staging page0 so graph partition 0 embeds the

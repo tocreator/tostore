@@ -126,6 +126,8 @@ class BenchmarkRunner {
 
     await db.query(BenchmarkSchemas.simpleTable);
     await db.query(BenchmarkSchemas.indexedTable).where('age', '>=', 25);
+    db.query(BenchmarkSchemas.simpleTable).where('id', '=', 1).peekFirst();
+    db.query(BenchmarkSchemas.simpleTable).limit(10).peek();
 
     await db.clear(BenchmarkSchemas.simpleTable);
     await db.clear(BenchmarkSchemas.indexedTable);
@@ -190,6 +192,28 @@ class BenchmarkRunner {
         }
         break;
 
+      case BenchmarkOperation.pointReadHot:
+        // Ensure dataset is populated
+        await _ensureTablePopulated(tableName, tier, scale);
+        effectiveCount = scale;
+
+        // Pre-warm the single hot primary key into memory cache
+        db.query(tableName).where('id', '=', 1).peekFirst();
+
+        for (var round = 1; round <= iterations; round++) {
+          _updateLastOperation(
+              'Running [$tierName] PK Read (Hot Cache) ($round/$iterations)...');
+
+          final sw = Stopwatch()..start();
+          for (var i = 0; i < effectiveCount; i++) {
+            db.query(tableName).where('id', '=', 1).peekFirst();
+          }
+          sw.stop();
+          roundMicroseconds.add(sw.elapsedMicroseconds);
+          await Future.delayed(const Duration(milliseconds: 5));
+        }
+        break;
+
       case BenchmarkOperation.pointReadRandom:
         // Ensure dataset is populated
         await _ensureTablePopulated(tableName, tier, scale);
@@ -205,28 +229,6 @@ class BenchmarkRunner {
           final sw = Stopwatch()..start();
           for (final id in queryIds) {
             await db.query(tableName).where('id', '=', id).first();
-          }
-          sw.stop();
-          roundMicroseconds.add(sw.elapsedMicroseconds);
-          await Future.delayed(const Duration(milliseconds: 5));
-        }
-        break;
-
-      case BenchmarkOperation.pointReadHot:
-        // Ensure dataset is populated
-        await _ensureTablePopulated(tableName, tier, scale);
-        effectiveCount = scale;
-
-        // Pre-warm the single hot primary key into TreeCache / ReadView
-        await db.query(tableName).where('id', '=', 1).first();
-
-        for (var round = 1; round <= iterations; round++) {
-          _updateLastOperation(
-              'Running [$tierName] PK Read (Hot Cache) ($round/$iterations)...');
-
-          final sw = Stopwatch()..start();
-          for (var i = 0; i < effectiveCount; i++) {
-            await db.query(tableName).where('id', '=', 1).first();
           }
           sw.stop();
           roundMicroseconds.add(sw.elapsedMicroseconds);
@@ -256,22 +258,62 @@ class BenchmarkRunner {
         }
         break;
 
-      case BenchmarkOperation.rangeScan:
+      case BenchmarkOperation.rangeScanHot:
         await _ensureTablePopulated(tableName, tier, scale);
-        // Dynamic query rounds scaling with Dataset Scale (e.g. 500 for 1k, 2000 for 10k, 10000 for 100k)
+        final hotQueryRounds = math.max(500, math.min(scale ~/ 10, 10000));
+        effectiveCount = hotQueryRounds;
+
+        // Pre-warm the fixed range into memory cache
+        if (tier == BenchmarkTier.simple) {
+          db.query(tableName).where('id', '>=', 1).limit(10).peek();
+        } else {
+          db
+              .query(tableName)
+              .where('age', '>=', 20)
+              .orderByAsc('score')
+              .limit(10)
+              .peek();
+        }
+
+        for (var round = 1; round <= iterations; round++) {
+          _updateLastOperation(
+              'Running [$tierName] Range Scan (Hot Cache) ($round/$iterations)...');
+
+          final sw = Stopwatch()..start();
+          for (var i = 0; i < hotQueryRounds; i++) {
+            if (tier == BenchmarkTier.simple) {
+              db.query(tableName).where('id', '>=', 1).limit(10).peek();
+            } else {
+              db
+                  .query(tableName)
+                  .where('age', '>=', 20)
+                  .orderByAsc('score')
+                  .limit(10)
+                  .peek();
+            }
+          }
+          sw.stop();
+          roundMicroseconds.add(sw.elapsedMicroseconds);
+          await Future.delayed(const Duration(milliseconds: 5));
+        }
+        break;
+
+      case BenchmarkOperation.rangeScanRandom:
+        await _ensureTablePopulated(tableName, tier, scale);
+        // Dynamic query rounds scaling with Dataset Scale (e.g. 2000 for 10k, 10000 for 100k)
         final queryRounds = math.max(500, math.min(scale ~/ 10, 10000));
         effectiveCount = queryRounds;
         final random = math.Random(777);
 
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
-              'Running [$tierName] Range Scan ($round/$iterations)...');
+              'Running [$tierName] Range Scan (Random) ($round/$iterations)...');
 
           // Pre-generate random start keys before timing to evaluate pure database performance
           final startPoints = tier == BenchmarkTier.simple
               ? List.generate(
                   queryRounds,
-                  (_) => random.nextInt(math.max(1, scale - 50)) + 1,
+                  (_) => random.nextInt(math.max(1, scale - 10)) + 1,
                 )
               : List.generate(
                   queryRounds,
@@ -282,13 +324,13 @@ class BenchmarkRunner {
           for (var i = 0; i < queryRounds; i++) {
             final startVal = startPoints[i];
             if (tier == BenchmarkTier.simple) {
-              await db.query(tableName).where('id', '>=', startVal).limit(50);
+              await db.query(tableName).where('id', '>=', startVal).limit(10);
             } else {
               await db
                   .query(tableName)
                   .where('age', '>=', startVal)
                   .orderByAsc('score')
-                  .limit(50);
+                  .limit(10);
             }
           }
           sw.stop();

@@ -165,7 +165,8 @@ final class IndexTreePartitionManager {
     LeafPage leaf,
   ) {
     if (ptr.isNull) return;
-    _leafPageCache.put([tableUid, indexUid, ptr.partitionNo, ptr.pageNo], leaf);
+    _leafPageCache.putPoint4(
+        tableUid, indexUid, ptr.partitionNo, ptr.pageNo, leaf);
   }
 
   void _publishInternalPage(
@@ -175,15 +176,16 @@ final class IndexTreePartitionManager {
     InternalPage page,
   ) {
     if (ptr.isNull) return;
-    _internalPageCache
-        .put([tableUid, indexUid, ptr.partitionNo, ptr.pageNo], page);
+    _internalPageCache.putPoint4(
+        tableUid, indexUid, ptr.partitionNo, ptr.pageNo, page);
   }
 
   void _evictCachedPage(String tableUid, IndexUid indexUid, TreePagePtr ptr) {
     if (ptr.isNull) return;
-    final key = [tableUid, indexUid, ptr.partitionNo, ptr.pageNo];
-    _leafPageCache.remove(key);
-    _internalPageCache.remove(key);
+    _leafPageCache.removePoint4(
+        tableUid, indexUid, ptr.partitionNo, ptr.pageNo);
+    _internalPageCache.removePoint4(
+        tableUid, indexUid, ptr.partitionNo, ptr.pageNo);
   }
 
   /// File-read populate: never overwrite a page published by writeChanges.
@@ -194,8 +196,8 @@ final class IndexTreePartitionManager {
     LeafPage leaf,
   ) {
     if (ptr.isNull || leaf.keys.isEmpty) return;
-    _leafPageCache
-        .putIfAbsent([tableUid, indexUid, ptr.partitionNo, ptr.pageNo], leaf);
+    _leafPageCache.putIfAbsentPoint4(
+        tableUid, indexUid, ptr.partitionNo, ptr.pageNo, leaf);
   }
 
   void _offerInternalPageFromFile(
@@ -205,8 +207,8 @@ final class IndexTreePartitionManager {
     InternalPage page,
   ) {
     if (ptr.isNull || page.children.isEmpty) return;
-    _internalPageCache
-        .putIfAbsent([tableUid, indexUid, ptr.partitionNo, ptr.pageNo], page);
+    _internalPageCache.putIfAbsentPoint4(
+        tableUid, indexUid, ptr.partitionNo, ptr.pageNo, page);
   }
 
   /// Prewarm boundary leaf pages (first/last) for a B+Tree index.
@@ -233,8 +235,8 @@ final class IndexTreePartitionManager {
 
     Future<void> prewarmLeaf(TreePagePtr ptr) async {
       if (ptr.isNull) return;
-      final cacheKey = [tableUid, indexUid, ptr.partitionNo, ptr.pageNo];
-      final alreadyCached = _leafPageCache.containsKey(cacheKey);
+      final alreadyCached = _leafPageCache.containsPoint4(
+          tableUid, indexUid, ptr.partitionNo, ptr.pageNo);
       await _readLeaf(
         table,
         indexUid,
@@ -302,8 +304,8 @@ final class IndexTreePartitionManager {
     }
 
     // Check instance-level cache
-    final cacheKey = [tableUid, indexUid, ptr.partitionNo, ptr.pageNo];
-    final instanceCached = _leafPageCache.get(cacheKey);
+    final instanceCached = _leafPageCache.getPoint4(
+        tableUid, indexUid, ptr.partitionNo, ptr.pageNo);
     if (instanceCached != null) {
       // Copy to local cache if provided
       if (localCache != null) {
@@ -378,8 +380,8 @@ final class IndexTreePartitionManager {
     }
 
     // Check instance-level cache
-    final cacheKey = [tableUid, indexUid, ptr.partitionNo, ptr.pageNo];
-    final instanceCached = _internalPageCache.get(cacheKey);
+    final instanceCached = _internalPageCache.getPoint4(
+        tableUid, indexUid, ptr.partitionNo, ptr.pageNo);
     if (instanceCached != null) {
       // Copy to local cache if provided
       if (localCache != null) {

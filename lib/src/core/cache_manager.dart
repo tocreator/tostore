@@ -109,7 +109,7 @@ final class CacheManager {
   void _markQueryCacheDirty(TableContext table) {
     // Invalidate immediately for correctness (no stale window), but coalesce
     // repeated calls within the same microtask tick to avoid churn.
-    final firstInTick = _pendingQueryInvalidations.add(table.tableUid);
+    final firstInTick = _pendingQueryInvalidations.add(table.tableUid.value);
     if (firstInTick) {
       try {
         _dataStore.queryExecutor.invalidateQueryCacheForTable(table);
@@ -137,6 +137,7 @@ final class CacheManager {
     ]);
 
     _dataStore.queryExecutor.clearAllQueryCacheSync();
+    _dataStore.queryExecutor.clearAllPlanCache();
     _dataStore.tableTreePartitionManager?.clearPageCacheSync();
     _dataStore.indexTreePartitionManager?.clearPageCacheSync();
     _dataStore.weightManager?.clearMemory();

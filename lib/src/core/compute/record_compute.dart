@@ -327,6 +327,49 @@ Map<String, dynamic>? validateAndProcessUpdateDataPure({
   }
 }
 
+/// Pure synchronous computation to apply a uniform validated update payload to an existing record.
+Map<String, dynamic> applyUniformUpdatePure({
+  required TableSchema schema,
+  required Map<String, dynamic> validData,
+  required Map<String, dynamic> existingRecord,
+}) {
+  final primaryKey = schema.primaryKey;
+  final updatedRecord = <String, dynamic>{};
+  updatedRecord[primaryKey] = existingRecord[primaryKey];
+
+  for (final field in schema.fields) {
+    if (field.name == primaryKey) {
+      continue;
+    }
+
+    final fieldName = field.name;
+    final proposed =
+        validData.containsKey(fieldName) ? validData[fieldName] : null;
+
+    if (proposed is ExprNode) {
+      try {
+        final result = evaluateExpressionForRecord(
+          proposed,
+          existingRecord,
+          schema,
+          isUpdate: true,
+        );
+        updatedRecord[fieldName] = field.convertValue(result);
+      } catch (e) {
+        Logger.error('Failed to evaluate expression for field $fieldName',
+            rawError: e);
+        updatedRecord[fieldName] = existingRecord[fieldName];
+      }
+    } else if (validData.containsKey(fieldName)) {
+      updatedRecord[fieldName] = proposed;
+    } else {
+      updatedRecord[fieldName] = existingRecord[fieldName];
+    }
+  }
+
+  return updatedRecord;
+}
+
 /// Evaluates an expression AST using current record values.
 dynamic evaluateExpressionForRecord(
   ExprNode expression,

@@ -38,6 +38,7 @@ import 'src/model/table_schema.dart';
 import 'src/model/transaction_result.dart';
 
 export 'src/chain/kv_query_builder.dart';
+export 'src/interface/chain_builder.dart';
 export 'src/handler/logger.dart' show LogLevel, LogRecord, LogConfig, LogType;
 export 'src/handler/to_crypto.dart';
 export 'src/interface/status_provider.dart';

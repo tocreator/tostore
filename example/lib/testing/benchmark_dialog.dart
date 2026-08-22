@@ -25,7 +25,7 @@ class _BenchmarkDialogState extends State<BenchmarkDialog> {
   late int _selectedIterations;
   late Set<BenchmarkOperation> _selectedOperations;
 
-  static const List<int> _scaleOptions = [1000, 10000, 50000, 100000];
+  static const List<int> _scaleOptions = [10000, 50000, 100000];
   static const List<int> _iterationOptions = [1, 3, 5];
 
   @override
@@ -34,7 +34,7 @@ class _BenchmarkDialogState extends State<BenchmarkDialog> {
     _isViewingResults = widget.lastSummary != null;
     final config = widget.lastSummary?.config ?? widget.initialConfig;
     _selectedTier = config.tier;
-    _selectedScale = config.scale;
+    _selectedScale = config.scale < 10000 ? 10000 : config.scale;
     _selectedIterations = config.iterations;
     _selectedOperations = Set.from(config.operations);
   }

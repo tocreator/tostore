@@ -1,9 +1,206 @@
 import '../model/query_aggregation.dart';
 import '../model/join_clause.dart';
 import '../model/table_identity.dart';
+import '../handler/value_matcher.dart';
 import 'query_condition.dart';
+import 'query_plan.dart';
 
-/// query cache key
+/// Query result cache entry for Result Cache.
+final class QueryResultCacheEntry {
+  final List<Map<String, dynamic>> records;
+  final String? nextCursor;
+  final String? prevCursor;
+  final bool hasMore;
+  final bool hasPrev;
+  final int? totalRecordCount;
+  final int? count;
+  final dynamic aggregateResult;
+  final DateTime createdAt;
+  final Duration? expiry;
+  final int sizeBytes;
+
+  QueryResultCacheEntry({
+    required this.records,
+    this.nextCursor,
+    this.prevCursor,
+    this.hasMore = false,
+    this.hasPrev = false,
+    this.totalRecordCount,
+    this.count,
+    this.aggregateResult,
+    required this.createdAt,
+    required this.expiry,
+    required this.sizeBytes,
+  });
+
+  bool isExpired() {
+    final e = expiry;
+    if (e == null) return false;
+    return DateTime.now().difference(createdAt) >= e;
+  }
+}
+
+/// Execution route type for Plan Cache.
+enum PlanRouteType {
+  primaryKeyPoint,
+  uniqueIndexPoint,
+  indexRangeScan,
+  tableScan,
+  unionScan,
+}
+
+/// Compiled execution plan stored in Plan Cache.
+///
+/// Holds the pre-computed physical access route, selected index,
+/// sorting strategy, and pre-compiled predicate evaluator.
+///
+/// Plan Cache is completely data-independent (DML does not invalidate it).
+/// It is invalidated only when table schema or index structure changes.
+class CompiledExecutionPlan {
+  final PlanRouteType routeType;
+  final TableUid tableUid;
+  final String? singleEqualityField;
+  final IndexUid? indexUid;
+  final List<String> naturalOrderBy;
+  final bool needPostSort;
+  final QueryPlan? rawPlan;
+  final dynamic cursorMode;
+  final ConditionRecordMatcher? precompiledMatcher;
+
+  const CompiledExecutionPlan({
+    required this.routeType,
+    required this.tableUid,
+    this.singleEqualityField,
+    this.indexUid,
+    this.naturalOrderBy = const <String>[],
+    this.needPostSort = false,
+    this.rawPlan,
+    this.cursorMode,
+    this.precompiledMatcher,
+  });
+}
+
+/// Helper to build parameter-agnostic shape strings from condition nodes.
+abstract final class ConditionShapeBuilder {
+  static String buildShape(ConditionNode node) {
+    if (node.type == NodeType.leaf) {
+      if (node.condition.isEmpty) return '';
+      final entry = node.condition.entries.first;
+      final k = entry.key;
+      final v = entry.value;
+      if (v is Map) {
+        final op = v.keys.first.toString();
+        return '$k:$op';
+      }
+      return '$k:=';
+    }
+    final childShapes = <String>[];
+    for (final c in node.children) {
+      final s = buildShape(c);
+      if (s.isNotEmpty) childShapes.add(s);
+    }
+    if (childShapes.isEmpty) return '';
+    childShapes.sort();
+    final prefix = node.type == NodeType.or ? 'OR' : 'AND';
+    return '$prefix(${childShapes.join(',')})';
+  }
+}
+
+/// Query shape key for Plan Cache.
+///
+/// Represents the structure of a query without concrete literal parameters.
+/// Queries with identical shape share the same compiled execution plan.
+class QueryShapeKey {
+  final TableUid tableUid;
+  final String conditionShape;
+  final String orderByShape;
+  final bool hasLimit;
+  final bool hasOffset;
+  final bool hasCursor;
+  final bool onlyCount;
+  final String joinsShape;
+  final String aggsShape;
+  final String groupByShape;
+
+  String? _cachedIdentity;
+  int? _cachedHash;
+
+  QueryShapeKey({
+    required this.tableUid,
+    required this.conditionShape,
+    required this.orderByShape,
+    required this.hasLimit,
+    required this.hasOffset,
+    required this.hasCursor,
+    required this.onlyCount,
+    required this.joinsShape,
+    required this.aggsShape,
+    required this.groupByShape,
+  });
+
+  factory QueryShapeKey.fromQuery({
+    required TableUid tableUid,
+    QueryCondition? condition,
+    List<String>? orderBy,
+    int? limit,
+    int? offset,
+    String? cursor,
+    bool onlyCount = false,
+    List<JoinClause>? joins,
+    List<QueryAggregation>? aggregations,
+    List<String>? groupBy,
+  }) {
+    final condShape = condition != null && !condition.isEmpty
+        ? ConditionShapeBuilder.buildShape(condition.rootNode)
+        : '';
+    final orderShape =
+        (orderBy != null && orderBy.isNotEmpty) ? orderBy.join(',') : '';
+    final joinShape = (joins != null && joins.isNotEmpty)
+        ? joins
+            .map((j) =>
+                '${j.type.name}:${j.table}:${j.firstKey}${j.operator}${j.secondKey}')
+            .join('|')
+        : '';
+    final aggShape = (aggregations != null && aggregations.isNotEmpty)
+        ? aggregations.map((a) => '${a.type.name}:${a.field}').join('|')
+        : '';
+    final grpShape =
+        (groupBy != null && groupBy.isNotEmpty) ? groupBy.join(',') : '';
+
+    return QueryShapeKey(
+      tableUid: tableUid,
+      conditionShape: condShape,
+      orderByShape: orderShape,
+      hasLimit: limit != null && limit > 0,
+      hasOffset: offset != null && offset > 0,
+      hasCursor: cursor != null && cursor.isNotEmpty,
+      onlyCount: onlyCount,
+      joinsShape: joinShape,
+      aggsShape: aggShape,
+      groupByShape: grpShape,
+    );
+  }
+
+  String _identity() {
+    if (_cachedIdentity != null) return _cachedIdentity!;
+    return _cachedIdentity =
+        '${tableUid.value}#$conditionShape#$orderByShape#$hasLimit#$hasOffset#$hasCursor#$onlyCount#$joinsShape#$aggsShape#$groupByShape';
+  }
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+    return other is QueryShapeKey && _identity() == other._identity();
+  }
+
+  @override
+  int get hashCode => _cachedHash ??= _identity().hashCode;
+
+  @override
+  String toString() => _identity();
+}
+
+/// Query cache key for Result Cache.
 class QueryCacheKey {
   final TableUid tableUid;
   final QueryCondition condition;
@@ -14,6 +211,7 @@ class QueryCacheKey {
   final List<JoinClause>? joins;
   final List<QueryAggregation>? aggregations;
   final List<String>? groupBy;
+  final bool onlyCount;
 
   /// Cached identity string / hash.
   String? _cachedString;
@@ -29,6 +227,7 @@ class QueryCacheKey {
     this.joins,
     this.aggregations,
     this.groupBy,
+    this.onlyCount = false,
   });
 
   @override
@@ -52,6 +251,9 @@ class QueryCacheKey {
     }
     if (cursor != null && cursor!.isNotEmpty) {
       _writeTagged(b, 'r', cursor!);
+    }
+    if (onlyCount) {
+      _writeTagged(b, 'k', '1');
     }
     if (aggregations != null && aggregations!.isNotEmpty) {
       b.write('a');

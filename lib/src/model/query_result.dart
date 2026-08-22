@@ -67,6 +67,10 @@ class QueryResult<T> {
   final Future<QueryResult<T>> Function()? _nextPageExecutor;
   final Future<QueryResult<T>> Function()? _prevPageExecutor;
 
+  /// Pure synchronous in-memory callback executors to fetch the next or previous page seamlessly.
+  final QueryResult<T> Function()? _peekNextPageExecutor;
+  final QueryResult<T> Function()? _peekPrevPageExecutor;
+
   QueryResult({
     required this.type,
     required this.data,
@@ -79,8 +83,12 @@ class QueryResult<T> {
     this.executionTimeMs,
     Future<QueryResult<T>> Function()? nextPageExecutor,
     Future<QueryResult<T>> Function()? prevPageExecutor,
+    QueryResult<T> Function()? peekNextPageExecutor,
+    QueryResult<T> Function()? peekPrevPageExecutor,
   })  : _nextPageExecutor = nextPageExecutor,
-        _prevPageExecutor = prevPageExecutor;
+        _prevPageExecutor = prevPageExecutor,
+        _peekNextPageExecutor = peekNextPageExecutor,
+        _peekPrevPageExecutor = peekPrevPageExecutor;
 
   /// Seamlessly fetch the next page.
   /// Automatically handles both cursor-based and offset-based pagination.
@@ -122,6 +130,42 @@ class QueryResult<T> {
     return exec();
   }
 
+  /// Synchronously fetch the next page from pure memory tier without async overhead.
+  /// Automatically handles both cursor-based and offset-based pagination.
+  QueryResult<T> peekNext() {
+    final exec = _peekNextPageExecutor;
+    if (!hasMore || exec == null) {
+      return QueryResult.success(
+        data: const [],
+        hasMore: false,
+        hasPrev: hasPrev,
+        totalRecordCount: totalRecordCount,
+        message: exec == null
+            ? 'Synchronous pagination executor not initialized.'
+            : 'No more results available in memory.',
+      );
+    }
+    return exec();
+  }
+
+  /// Synchronously fetch the previous page from pure memory tier without async overhead.
+  /// Automatically handles both cursor-based and offset-based pagination.
+  QueryResult<T> peekPrev() {
+    final exec = _peekPrevPageExecutor;
+    if (!hasPrev || exec == null) {
+      return QueryResult.success(
+        data: const [],
+        hasMore: hasMore,
+        hasPrev: false,
+        totalRecordCount: totalRecordCount,
+        message: exec == null
+            ? 'Synchronous pagination executor not initialized.'
+            : 'No previous results available in memory.',
+      );
+    }
+    return exec();
+  }
+
   /// create a success result
   factory QueryResult.success({
     required List<T> data,
@@ -136,6 +180,8 @@ class QueryResult<T> {
     int? executionTimeMs,
     Future<QueryResult<T>> Function()? nextPageExecutor,
     Future<QueryResult<T>> Function()? prevPageExecutor,
+    QueryResult<T> Function()? peekNextPageExecutor,
+    QueryResult<T> Function()? peekPrevPageExecutor,
   }) {
     return QueryResult(
       data: data,
@@ -149,6 +195,8 @@ class QueryResult<T> {
       executionTimeMs: executionTimeMs,
       nextPageExecutor: nextPageExecutor,
       prevPageExecutor: prevPageExecutor,
+      peekNextPageExecutor: peekNextPageExecutor,
+      peekPrevPageExecutor: peekPrevPageExecutor,
     );
   }
 

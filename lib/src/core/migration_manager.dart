@@ -84,6 +84,9 @@ class MigrationManager {
   final Map<TableUid, PromoteRuntimeDescriptor> _promoteRuntimes =
       <TableUid, PromoteRuntimeDescriptor>{};
 
+  /// Fast check if any table currently has an active promote runtime.
+  bool get hasAnyActivePromotes => _promoteRuntimes.isNotEmpty;
+
   /// Returns promote runtime if [tableUid] is mid promoteFieldToPrimaryKey.
   PromoteRuntimeDescriptor? getPromoteRuntime(TableUid tableUid) =>
       _promoteRuntimes[tableUid];

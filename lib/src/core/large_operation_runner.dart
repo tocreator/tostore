@@ -17,6 +17,7 @@ import '../model/table_identity.dart';
 import '../model/table_schema.dart';
 import '../query/query_condition.dart';
 import 'compute/batch_match_runner.dart';
+import 'compute/record_compute.dart';
 import 'data_store_impl.dart';
 import 'resource_manager.dart';
 import 'yield_controller.dart';
@@ -624,15 +625,6 @@ class LargeOperationRunner {
 
           if (matchedRecords.isEmpty) return true;
 
-          // Compute uniform update records using isolate if applicable
-          final preparedMatchedRecords =
-              await dataStore.prepareUniformUpdateRecords(
-            schema,
-            table,
-            validData,
-            matchedRecords,
-          );
-
           final updates = <Map<String, dynamic>>[];
           final deletes = <Map<String, dynamic>>[];
           final inserts = <Map<String, dynamic>>[];
@@ -667,8 +659,11 @@ class LargeOperationRunner {
             }
 
             final record = matchedRecords[matchedIndex];
-            var updatedRecord =
-                preparedMatchedRecords[matchedIndex].updatedRecord;
+            var updatedRecord = applyUniformUpdatePure(
+              schema: schema,
+              validData: validData,
+              existingRecord: record,
+            );
             final pkValue = record[primaryKey];
             if (pkValue == null) continue;
             final pkValueStr = pkValue.toString();

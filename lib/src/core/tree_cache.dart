@@ -247,6 +247,507 @@ class TreeCache<T> {
   @pragma('vm:prefer-inline')
   T? peek(dynamic key) => get(key, touch: false);
 
+  /// Zero-allocation 2-component point lookup.
+  ///
+  /// - gd=1: `[groupKey, flatKey]` (table record)
+  /// - gd=2: exact group `[k0, k1]` (index meta)
+  @pragma('vm:prefer-inline')
+  T? getPoint2(Object? k0, Object? k1, {bool touch = true, bool? updateStats}) {
+    final gd = groupDepth;
+    final doTouch = _reorderOnTouch && (updateStats ?? touch);
+    if (gd == 1) {
+      final g = _groupOfDepth1(k0);
+      if (g == null) return null;
+      return g.getFlat(k1, touch: doTouch);
+    }
+    if (gd == 2) {
+      final g = _groupOfDepth2(k0, k1);
+      if (g == null || !g.hasExact) return null;
+      if (doTouch) g.touchExact();
+      return g.exact;
+    }
+    return null;
+  }
+
+  /// Zero-allocation 3-component point lookup.
+  ///
+  /// - gd=1: `[groupKey, deep1, deep2]` (table page)
+  /// - gd=2: `[k0, k1, flatKey]` (unique index / pq node)
+  /// - gd=3: exact group `[k0, k1, k2]`
+  @pragma('vm:prefer-inline')
+  T? getPoint3(Object? k0, Object? k1, Object? k2,
+      {bool touch = true, bool? updateStats}) {
+    final gd = groupDepth;
+    final doTouch = _reorderOnTouch && (updateStats ?? touch);
+    if (gd == 1) {
+      final g = _groupOfDepth1(k0);
+      if (g == null) return null;
+      final v = g.getDeep2(k1, k2);
+      if (v != null && doTouch) g.touchDeep2(k1, k2);
+      return v;
+    }
+    if (gd == 2) {
+      final g = _groupOfDepth2(k0, k1);
+      if (g == null) return null;
+      return g.getFlat(k2, touch: doTouch);
+    }
+    if (gd == 3) {
+      final g = _groupOfDepth3(k0, k1, k2);
+      if (g == null || !g.hasExact) return null;
+      if (doTouch) g.touchExact();
+      return g.exact;
+    }
+    return null;
+  }
+
+  /// Zero-allocation 4-component point lookup.
+  ///
+  /// - gd=2: `[k0, k1, deep1, deep2]` (index page / non-unique index)
+  /// - gd=3: `[k0, k1, k2, flatKey]` (txn unique index / PK slot)
+  @pragma('vm:prefer-inline')
+  T? getPoint4(Object? k0, Object? k1, Object? k2, Object? k3,
+      {bool touch = true, bool? updateStats}) {
+    final gd = groupDepth;
+    final doTouch = _reorderOnTouch && (updateStats ?? touch);
+    if (gd == 2) {
+      final g = _groupOfDepth2(k0, k1);
+      if (g == null) return null;
+      final v = g.getDeep2(k2, k3);
+      if (v != null && doTouch) g.touchDeep2(k2, k3);
+      return v;
+    }
+    if (gd == 3) {
+      final g = _groupOfDepth3(k0, k1, k2);
+      if (g == null) return null;
+      return g.getFlat(k3, touch: doTouch);
+    }
+    return null;
+  }
+
+  /// Zero-allocation 5-component point lookup (gd=3 deep2: txn index).
+  @pragma('vm:prefer-inline')
+  T? getPoint5(
+    Object? k0,
+    Object? k1,
+    Object? k2,
+    Object? k3,
+    Object? k4, {
+    bool touch = true,
+    bool? updateStats,
+  }) {
+    if (groupDepth != 3) return null;
+    final g = _groupOfDepth3(k0, k1, k2);
+    if (g == null) return null;
+    final doTouch = _reorderOnTouch && (updateStats ?? touch);
+    final v = g.getDeep2(k3, k4);
+    if (v != null && doTouch) g.touchDeep2(k3, k4);
+    return v;
+  }
+
+  @pragma('vm:prefer-inline')
+  T? peekPoint2(Object? k0, Object? k1) => getPoint2(k0, k1, touch: false);
+
+  @pragma('vm:prefer-inline')
+  T? peekPoint3(Object? k0, Object? k1, Object? k2) =>
+      getPoint3(k0, k1, k2, touch: false);
+
+  @pragma('vm:prefer-inline')
+  T? peekPoint4(Object? k0, Object? k1, Object? k2, Object? k3) =>
+      getPoint4(k0, k1, k2, k3, touch: false);
+
+  @pragma('vm:prefer-inline')
+  T? peekPoint5(
+    Object? k0,
+    Object? k1,
+    Object? k2,
+    Object? k3,
+    Object? k4,
+  ) =>
+      getPoint5(k0, k1, k2, k3, k4, touch: false);
+
+  @pragma('vm:prefer-inline')
+  bool containsPoint2(Object? k0, Object? k1) {
+    final gd = groupDepth;
+    if (gd == 1) {
+      final g = _groupOfDepth1(k0);
+      if (g == null) return false;
+      return g.containsFlat(k1);
+    }
+    if (gd == 2) {
+      final g = _groupOfDepth2(k0, k1);
+      return g != null && g.hasExact;
+    }
+    return false;
+  }
+
+  @pragma('vm:prefer-inline')
+  bool containsPoint3(Object? k0, Object? k1, Object? k2) {
+    final gd = groupDepth;
+    if (gd == 1) {
+      final g = _groupOfDepth1(k0);
+      if (g == null) return false;
+      return g.containsDeep2(k1, k2);
+    }
+    if (gd == 2) {
+      final g = _groupOfDepth2(k0, k1);
+      if (g == null) return false;
+      return g.containsFlat(k2);
+    }
+    if (gd == 3) {
+      final g = _groupOfDepth3(k0, k1, k2);
+      return g != null && g.hasExact;
+    }
+    return false;
+  }
+
+  @pragma('vm:prefer-inline')
+  bool containsPoint4(Object? k0, Object? k1, Object? k2, Object? k3) {
+    final gd = groupDepth;
+    if (gd == 2) {
+      final g = _groupOfDepth2(k0, k1);
+      if (g == null) return false;
+      return g.containsDeep2(k2, k3);
+    }
+    if (gd == 3) {
+      final g = _groupOfDepth3(k0, k1, k2);
+      if (g == null) return false;
+      return g.containsFlat(k3);
+    }
+    return false;
+  }
+
+  @pragma('vm:prefer-inline')
+  bool containsPoint5(
+    Object? k0,
+    Object? k1,
+    Object? k2,
+    Object? k3,
+    Object? k4,
+  ) {
+    if (groupDepth != 3) return false;
+    final g = _groupOfDepth3(k0, k1, k2);
+    if (g == null) return false;
+    return g.containsDeep2(k3, k4);
+  }
+
+  @pragma('vm:prefer-inline')
+  void putPoint2(Object? k0, Object? k1, T value, {int? size}) {
+    final gd = groupDepth;
+    if (gd == 1) {
+      if (!_orderEnabled) {
+        final g = _groupOfDepth1Create(k0);
+        if (g.putFlatNone(k1, value)) _totalEntries++;
+        return;
+      }
+      final sz = _resolveSize(size, value);
+      final g = _groupOfDepth1Create(k0);
+      final beforeBytes = g.totalBytes;
+      final isNew = g.putFlat(k1, value, sizeBytes: sz);
+      if (isNew) _totalEntries++;
+      _applyGroupByteDelta(g, beforeBytes);
+      _maybeScheduleCleanup();
+      return;
+    }
+    if (gd == 2) {
+      final key = <dynamic>[k0, k1];
+      if (!_orderEnabled) {
+        final g = _groupOfDepth2Create(k0, k1);
+        if (g.putExactNone(value)) _totalEntries++;
+        return;
+      }
+      final sz = _resolveSize(size, value);
+      final group = _groupOfDepth2Create(k0, k1);
+      final beforeBytes = group.totalBytes;
+      final isNew = group.putExact(value, key: key, sizeBytes: sz);
+      if (isNew) _totalEntries++;
+      _applyGroupByteDelta(group, beforeBytes);
+      _maybeScheduleCleanup();
+    }
+  }
+
+  @pragma('vm:prefer-inline')
+  void putPoint3(Object? k0, Object? k1, Object? k2, T value, {int? size}) {
+    final gd = groupDepth;
+    if (gd == 1) {
+      if (!_orderEnabled) {
+        final g = _groupOfDepth1Create(k0);
+        if (g.putDeep2None(k1, k2, value)) _totalEntries++;
+        return;
+      }
+      final sz = _resolveSize(size, value);
+      final g = _groupOfDepth1Create(k0);
+      final beforeBytes = g.totalBytes;
+      final isNew = g.putDeep2(k1, k2, value, sizeBytes: sz);
+      if (isNew) _totalEntries++;
+      _applyGroupByteDelta(g, beforeBytes);
+      _maybeScheduleCleanup();
+      return;
+    }
+    if (gd == 2) {
+      if (!_orderEnabled) {
+        final g = _groupOfDepth2Create(k0, k1);
+        if (g.putFlatNone(k2, value)) _totalEntries++;
+        return;
+      }
+      final sz = _resolveSize(size, value);
+      final g = _groupOfDepth2Create(k0, k1);
+      final beforeBytes = g.totalBytes;
+      final isNew = g.putFlat(k2, value, sizeBytes: sz);
+      if (isNew) _totalEntries++;
+      _applyGroupByteDelta(g, beforeBytes);
+      _maybeScheduleCleanup();
+      return;
+    }
+    if (gd == 3) {
+      final key = <dynamic>[k0, k1, k2];
+      if (!_orderEnabled) {
+        final g = _groupOfDepth3Create(k0, k1, k2);
+        if (g.putExactNone(value)) _totalEntries++;
+        return;
+      }
+      final sz = _resolveSize(size, value);
+      final group = _groupOfDepth3Create(k0, k1, k2);
+      final beforeBytes = group.totalBytes;
+      final isNew = group.putExact(value, key: key, sizeBytes: sz);
+      if (isNew) _totalEntries++;
+      _applyGroupByteDelta(group, beforeBytes);
+      _maybeScheduleCleanup();
+    }
+  }
+
+  @pragma('vm:prefer-inline')
+  void putPoint4(
+    Object? k0,
+    Object? k1,
+    Object? k2,
+    Object? k3,
+    T value, {
+    int? size,
+  }) {
+    final gd = groupDepth;
+    if (gd == 2) {
+      if (!_orderEnabled) {
+        final g = _groupOfDepth2Create(k0, k1);
+        if (g.putDeep2None(k2, k3, value)) _totalEntries++;
+        return;
+      }
+      final sz = _resolveSize(size, value);
+      final g = _groupOfDepth2Create(k0, k1);
+      final beforeBytes = g.totalBytes;
+      final isNew = g.putDeep2(k2, k3, value, sizeBytes: sz);
+      if (isNew) _totalEntries++;
+      _applyGroupByteDelta(g, beforeBytes);
+      _maybeScheduleCleanup();
+      return;
+    }
+    if (gd == 3) {
+      if (!_orderEnabled) {
+        final g = _groupOfDepth3Create(k0, k1, k2);
+        if (g.putFlatNone(k3, value)) _totalEntries++;
+        return;
+      }
+      final sz = _resolveSize(size, value);
+      final g = _groupOfDepth3Create(k0, k1, k2);
+      final beforeBytes = g.totalBytes;
+      final isNew = g.putFlat(k3, value, sizeBytes: sz);
+      if (isNew) _totalEntries++;
+      _applyGroupByteDelta(g, beforeBytes);
+      _maybeScheduleCleanup();
+    }
+  }
+
+  @pragma('vm:prefer-inline')
+  void putPoint5(
+    Object? k0,
+    Object? k1,
+    Object? k2,
+    Object? k3,
+    Object? k4,
+    T value, {
+    int? size,
+  }) {
+    if (groupDepth != 3) return;
+    if (!_orderEnabled) {
+      final g = _groupOfDepth3Create(k0, k1, k2);
+      if (g.putDeep2None(k3, k4, value)) _totalEntries++;
+      return;
+    }
+    final sz = _resolveSize(size, value);
+    final g = _groupOfDepth3Create(k0, k1, k2);
+    final beforeBytes = g.totalBytes;
+    final isNew = g.putDeep2(k3, k4, value, sizeBytes: sz);
+    if (isNew) _totalEntries++;
+    _applyGroupByteDelta(g, beforeBytes);
+    _maybeScheduleCleanup();
+  }
+
+  T? putIfAbsentPoint2(Object? k0, Object? k1, T value, {int? size}) {
+    if (containsPoint2(k0, k1)) return peekPoint2(k0, k1);
+    putPoint2(k0, k1, value, size: size);
+    return null;
+  }
+
+  T? putIfAbsentPoint3(
+    Object? k0,
+    Object? k1,
+    Object? k2,
+    T value, {
+    int? size,
+  }) {
+    if (containsPoint3(k0, k1, k2)) return peekPoint3(k0, k1, k2);
+    putPoint3(k0, k1, k2, value, size: size);
+    return null;
+  }
+
+  T? putIfAbsentPoint4(
+    Object? k0,
+    Object? k1,
+    Object? k2,
+    Object? k3,
+    T value, {
+    int? size,
+  }) {
+    if (containsPoint4(k0, k1, k2, k3)) return peekPoint4(k0, k1, k2, k3);
+    putPoint4(k0, k1, k2, k3, value, size: size);
+    return null;
+  }
+
+  @pragma('vm:prefer-inline')
+  void removePoint2(Object? k0, Object? k1) {
+    final gd = groupDepth;
+    if (gd == 1) {
+      if (!_orderEnabled) {
+        final g = _groupOfDepth1(k0);
+        if (g == null || !g.removeFlatNone(k1)) return;
+        _afterPointRemoved(g);
+        return;
+      }
+      final g = _groupOfDepth1(k0);
+      if (g == null) return;
+      final beforeBytes = g.totalBytes;
+      if (!g.removeFlat(k1)) return;
+      _afterPointRemoved(g, beforeBytes: beforeBytes);
+      return;
+    }
+    if (gd == 2) {
+      final key = <dynamic>[k0, k1];
+      final group = _getGroupForKey(key, create: false);
+      if (group == null) return;
+      if (!_orderEnabled) {
+        if (group.removeExactNone()) {
+          _afterPointRemoved(group);
+        }
+        return;
+      }
+      final beforeBytes = group.totalBytes;
+      if (group.removeExact()) {
+        _afterPointRemoved(group, beforeBytes: beforeBytes);
+      }
+    }
+  }
+
+  @pragma('vm:prefer-inline')
+  void removePoint3(Object? k0, Object? k1, Object? k2) {
+    final gd = groupDepth;
+    if (gd == 1) {
+      if (!_orderEnabled) {
+        final g = _groupOfDepth1(k0);
+        if (g == null || !g.removeDeep2None(k1, k2)) return;
+        _afterPointRemoved(g);
+        return;
+      }
+      final g = _groupOfDepth1(k0);
+      if (g == null) return;
+      final beforeBytes = g.totalBytes;
+      if (!g.removeDeep2(k1, k2)) return;
+      _afterPointRemoved(g, beforeBytes: beforeBytes);
+      return;
+    }
+    if (gd == 2) {
+      if (!_orderEnabled) {
+        final g = _groupOfDepth2(k0, k1);
+        if (g == null || !g.removeFlatNone(k2)) return;
+        _afterPointRemoved(g);
+        return;
+      }
+      final g = _groupOfDepth2(k0, k1);
+      if (g == null) return;
+      final beforeBytes = g.totalBytes;
+      if (!g.removeFlat(k2)) return;
+      _afterPointRemoved(g, beforeBytes: beforeBytes);
+      return;
+    }
+    if (gd == 3) {
+      final key = <dynamic>[k0, k1, k2];
+      final group = _getGroupForKey(key, create: false);
+      if (group == null) return;
+      if (!_orderEnabled) {
+        if (group.removeExactNone()) {
+          _afterPointRemoved(group);
+        }
+        return;
+      }
+      final beforeBytes = group.totalBytes;
+      if (group.removeExact()) {
+        _afterPointRemoved(group, beforeBytes: beforeBytes);
+      }
+    }
+  }
+
+  @pragma('vm:prefer-inline')
+  void removePoint4(Object? k0, Object? k1, Object? k2, Object? k3) {
+    final gd = groupDepth;
+    if (gd == 2) {
+      if (!_orderEnabled) {
+        final g = _groupOfDepth2(k0, k1);
+        if (g == null || !g.removeDeep2None(k2, k3)) return;
+        _afterPointRemoved(g);
+        return;
+      }
+      final g = _groupOfDepth2(k0, k1);
+      if (g == null) return;
+      final beforeBytes = g.totalBytes;
+      if (!g.removeDeep2(k2, k3)) return;
+      _afterPointRemoved(g, beforeBytes: beforeBytes);
+      return;
+    }
+    if (gd == 3) {
+      if (!_orderEnabled) {
+        final g = _groupOfDepth3(k0, k1, k2);
+        if (g == null || !g.removeFlatNone(k3)) return;
+        _afterPointRemoved(g);
+        return;
+      }
+      final g = _groupOfDepth3(k0, k1, k2);
+      if (g == null) return;
+      final beforeBytes = g.totalBytes;
+      if (!g.removeFlat(k3)) return;
+      _afterPointRemoved(g, beforeBytes: beforeBytes);
+    }
+  }
+
+  @pragma('vm:prefer-inline')
+  void removePoint5(
+    Object? k0,
+    Object? k1,
+    Object? k2,
+    Object? k3,
+    Object? k4,
+  ) {
+    if (groupDepth != 3) return;
+    if (!_orderEnabled) {
+      final g = _groupOfDepth3(k0, k1, k2);
+      if (g == null || !g.removeDeep2None(k3, k4)) return;
+      _afterPointRemoved(g);
+      return;
+    }
+    final g = _groupOfDepth3(k0, k1, k2);
+    if (g == null) return;
+    final beforeBytes = g.totalBytes;
+    if (!g.removeDeep2(k3, k4)) return;
+    _afterPointRemoved(g, beforeBytes: beforeBytes);
+  }
+
   /// Point lookup. [touch]/[updateStats] only matter when [evictionMode] is [lru].
   @pragma('vm:prefer-inline')
   T? get(dynamic key, {bool touch = true, bool? updateStats}) {

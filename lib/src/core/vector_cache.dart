@@ -64,20 +64,21 @@ class VectorCache {
 
   /// Get cached PQ code for a node.
   Uint8List? getPqCode(TableContext table, IndexUid indexUid, int nodeId) {
-    return _pqCodeCache.get([table.tableUid, indexUid, nodeId]);
+    return _pqCodeCache.getPoint3(table.tableUid, indexUid, nodeId);
   }
 
   /// Cache a PQ code for a node.
   void putPqCode(
       TableContext table, IndexUid indexUid, int nodeId, Uint8List code) {
-    _pqCodeCache.put([table.tableUid, indexUid, nodeId], code);
+    _pqCodeCache.putPoint3(table.tableUid, indexUid, nodeId, code);
   }
 
   /// Batch-cache PQ codes for a range of nodes (e.g. after reading a PQ page).
   void putPqCodeBatch(TableContext table, IndexUid indexUid, int startNodeId,
       List<Uint8List> codes) {
     for (int i = 0; i < codes.length; i++) {
-      _pqCodeCache.put([table.tableUid, indexUid, startNodeId + i], codes[i]);
+      _pqCodeCache.putPoint3(
+          table.tableUid, indexUid, startNodeId + i, codes[i]);
     }
   }
 
@@ -87,17 +88,17 @@ class VectorCache {
 
   /// Get cached codebook for an index.
   PqCodebook? getCodebook(TableContext table, IndexUid indexUid) {
-    return _codebookCache.get([table.tableUid, indexUid]);
+    return _codebookCache.getPoint2(table.tableUid, indexUid);
   }
 
   /// Cache a codebook for an index.
   void putCodebook(TableContext table, IndexUid indexUid, PqCodebook codebook) {
-    _codebookCache.put([table.tableUid, indexUid], codebook);
+    _codebookCache.putPoint2(table.tableUid, indexUid, codebook);
   }
 
   /// Remove cached codebook (e.g. after retraining).
   void removeCodebook(TableContext table, IndexUid indexUid) {
-    _codebookCache.remove([table.tableUid, indexUid]);
+    _codebookCache.removePoint2(table.tableUid, indexUid);
   }
 
   // =====================================================================
@@ -106,12 +107,12 @@ class VectorCache {
 
   /// Get cached NghIndexMeta.
   NghIndexMeta? getMeta(TableContext table, IndexUid indexUid) {
-    return _metaCache.get([table.tableUid, indexUid]);
+    return _metaCache.getPoint2(table.tableUid, indexUid);
   }
 
   /// Cache NghIndexMeta.
   void putMeta(TableContext table, IndexUid indexUid, NghIndexMeta meta) {
-    _metaCache.put([table.tableUid, indexUid], meta);
+    _metaCache.putPoint2(table.tableUid, indexUid, meta);
   }
 
   // =====================================================================

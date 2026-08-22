@@ -3,11 +3,15 @@ import '../model/table_schema.dart';
 
 /// Query Condition Builder
 class QueryCondition {
-  // Condition tree root node
-  final ConditionNode _root = ConditionNode(type: NodeType.and);
+  // Condition tree root node (lazily created)
+  ConditionNode? _root;
   // Current active node (for building conditions)
-  ConditionNode _current;
+  ConditionNode? _current;
   bool _isNormalized = false;
+  int _conditionCount = 0;
+  String? _fastSingleEqField;
+  dynamic _fastSingleEqVal;
+  String? _singleOp;
 
   // Order by, limit, offset related properties
   List<String>? _orderBy;
@@ -16,18 +20,30 @@ class QueryCondition {
   String? _cursor;
 
   /// Create a new query condition builder
-  QueryCondition() : _current = ConditionNode(type: NodeType.and) {
-    _root.children.add(_current);
-  }
+  QueryCondition();
 
   /// Creates a QueryCondition from a map representation.
   factory QueryCondition.fromMap(Map<String, dynamic> map) {
     final qc = QueryCondition();
-    qc._root.children.clear(); // Clear the default initial node.
-    qc._root.children.add(_nodeFromMap(map));
-    qc._current =
-        qc._root; // Set current to the root for further modifications.
+    qc._root = ConditionNode(type: NodeType.and);
+    qc._root!.children.add(_nodeFromMap(map));
+    qc._current = qc._root;
     return qc;
+  }
+
+  void _ensureTreeInitialized() {
+    if (_root != null) return;
+    _root = ConditionNode(type: NodeType.and);
+    _current = ConditionNode(type: NodeType.and);
+    _root!.children.add(_current!);
+    if (_conditionCount == 1 && _fastSingleEqField != null) {
+      final condition = _buildCondition(
+          _fastSingleEqField!, _singleOp ?? '=', _fastSingleEqVal);
+      final leafNode = ConditionNode(type: NodeType.leaf, condition: condition);
+      _current!.children.add(leafNode);
+      _fastSingleEqField = null;
+      _fastSingleEqVal = null;
+    }
   }
 
   static ConditionNode _nodeFromMap(Map<String, dynamic> map) {
@@ -52,7 +68,10 @@ class QueryCondition {
   }
 
   /// Expose the root for external evaluators
-  ConditionNode get rootNode => _root;
+  ConditionNode get rootNode {
+    _ensureTreeInitialized();
+    return _root!;
+  }
 
   /// Check if a single record matches this query condition
   bool matches(Map<String, dynamic> record) {
@@ -64,24 +83,24 @@ class QueryCondition {
   /// Create a copy of a query condition
   QueryCondition clone() {
     final copy = QueryCondition();
-
-    // Clear default created nodes
-    copy._root.children.clear();
-
-    // Deep copy the entire condition tree
-    copy._root.type = _root.type;
-    for (var child in _root.children) {
-      copy._root.children.add(child.clone());
-    }
+    copy._conditionCount = _conditionCount;
+    copy._fastSingleEqField = _fastSingleEqField;
+    copy._fastSingleEqVal = _fastSingleEqVal;
+    copy._singleOp = _singleOp;
     copy._isNormalized = _isNormalized;
 
-    // Set the current node to the corresponding node in the copied tree
-    if (_current == _root) {
-      copy._current = copy._root;
-    } else {
-      // Find the corresponding current node position in the copied tree
-      copy._current =
-          _findCorrespondingNode(copy._root, _root, _current) ?? copy._root;
+    if (_root != null) {
+      copy._root = ConditionNode(type: _root!.type);
+      for (var child in _root!.children) {
+        copy._root!.children.add(child.clone());
+      }
+      if (_current == _root) {
+        copy._current = copy._root;
+      } else {
+        copy._current =
+            _findCorrespondingNode(copy._root!, _root!, _current!) ??
+                copy._root;
+      }
     }
 
     // Copy sorting and pagination parameters
@@ -114,23 +133,36 @@ class QueryCondition {
 
   /// Add a basic condition
   QueryCondition where(String field, dynamic operator, dynamic value) {
+    _conditionCount++;
+    _cachedBuiltMap = null;
+    if (_conditionCount == 1 &&
+        _root == null &&
+        (operator == '=' || operator == '==')) {
+      _fastSingleEqField = field;
+      _fastSingleEqVal = value;
+      _singleOp = '=';
+      return this;
+    }
+    _ensureTreeInitialized();
+    _fastSingleEqField = null;
+    _fastSingleEqVal = null;
     final condition = _buildCondition(field, operator, value);
 
     // If the current node is an AND node, add a new leaf node as a child
-    if (_current.type == NodeType.and) {
+    if (_current!.type == NodeType.and) {
       final leafNode = ConditionNode(type: NodeType.leaf, condition: condition);
-      _current.children.add(leafNode);
+      _current!.children.add(leafNode);
     }
     // If the current node is an OR node, special handling is needed to maintain correct grouping
-    else if (_current.type == NodeType.or) {
+    else if (_current!.type == NodeType.or) {
       // Create a new AND node under the OR node
       final andNode = ConditionNode(type: NodeType.and);
 
       // If the last child node of the OR node is a leaf node, it can be merged with the new condition into an AND node
-      if (_current.children.isNotEmpty &&
-          _current.children.last.type == NodeType.leaf) {
+      if (_current!.children.isNotEmpty &&
+          _current!.children.last.type == NodeType.leaf) {
         // Remove the last leaf node
-        final lastLeaf = _current.children.removeLast();
+        final lastLeaf = _current!.children.removeLast();
 
         // Add the leaf node to the new AND node
         andNode.children.add(lastLeaf);
@@ -141,7 +173,7 @@ class QueryCondition {
         andNode.children.add(leafNode);
 
         // Add the AND node to the OR node
-        _current.children.add(andNode);
+        _current!.children.add(andNode);
 
         // Update the current node to the AND node, so that subsequent conditions can be added to this AND group correctly
         _current = andNode;
@@ -149,20 +181,20 @@ class QueryCondition {
         // If the last child node is not a leaf node or has no children, add a new leaf node directly
         final leafNode =
             ConditionNode(type: NodeType.leaf, condition: condition);
-        _current.children.add(leafNode);
+        _current!.children.add(leafNode);
       }
     }
     // If the current node is a leaf node, create a new AND node as a parent
-    else if (_current.type == NodeType.leaf) {
+    else if (_current!.type == NodeType.leaf) {
       // Find the parent node of the leaf node
-      final parent = _findParent(_root, _current);
+      final parent = _findParent(_root!, _current!);
 
       if (parent != null) {
         // Create a new AND node
         final andNode = ConditionNode(type: NodeType.and);
 
         // Replace the current leaf node with the AND node
-        final index = parent.children.indexOf(_current);
+        final index = parent.children.indexOf(_current!);
         parent.children[index] = andNode;
 
         // Add
@@ -196,15 +228,16 @@ class QueryCondition {
 
   /// Start an OR condition
   QueryCondition or() {
+    _ensureTreeInitialized();
     // If the current node is already an OR node, keep using that node
-    if (_current.type == NodeType.or) {
+    if (_current!.type == NodeType.or) {
       return this;
     }
 
     // If the current node is a leaf node
-    if (_current.type == NodeType.leaf) {
+    if (_current!.type == NodeType.leaf) {
       // Find the parent node of the current node
-      final parent = _findParent(_root, _current);
+      final parent = _findParent(_root!, _current!);
 
       if (parent != null) {
         // If the parent node is an AND node, we need to create a new OR node
@@ -213,12 +246,12 @@ class QueryCondition {
           final orNode = ConditionNode(type: NodeType.or);
 
           // Remove the current leaf node from the parent node
-          final index = parent.children.indexOf(_current);
+          final index = parent.children.indexOf(_current!);
           if (index >= 0) {
             parent.children.removeAt(index);
 
             // Add the leaf node as a child of the OR node
-            orNode.children.add(_current);
+            orNode.children.add(_current!);
 
             // Add the OR node to the parent AND node
             parent.children.add(orNode);
@@ -235,9 +268,9 @@ class QueryCondition {
       }
     }
     // If the current node is an AND node
-    else if (_current.type == NodeType.and) {
+    else if (_current!.type == NodeType.and) {
       // Find the parent node of the current AND node
-      final parent = _findParent(_root, _current);
+      final parent = _findParent(_root!, _current!);
 
       if (parent != null) {
         // If the parent node is an AND node
@@ -246,12 +279,12 @@ class QueryCondition {
           final orNode = ConditionNode(type: NodeType.or);
 
           // Remove the current AND node from the parent node
-          final index = parent.children.indexOf(_current);
+          final index = parent.children.indexOf(_current!);
           if (index >= 0) {
             parent.children.removeAt(index);
 
             // Add the current AND node as a child of the OR node
-            orNode.children.add(_current);
+            orNode.children.add(_current!);
 
             // Add the OR node to the parent AND node
             parent.children.add(orNode);
@@ -272,11 +305,11 @@ class QueryCondition {
         final orNode = ConditionNode(type: NodeType.or);
 
         // Move all child nodes to the OR node
-        orNode.children.addAll(_current.children);
-        _current.children.clear();
+        orNode.children.addAll(_current!.children);
+        _current!.children.clear();
 
         // Add the OR node to the root node
-        _current.children.add(orNode);
+        _root!.children.add(orNode);
 
         // Update the current node to the OR node
         _current = orNode;
@@ -289,22 +322,24 @@ class QueryCondition {
   /// Add another condition as an AND condition
   QueryCondition condition(QueryCondition other) {
     if (other.isEmpty) return this;
+    _ensureTreeInitialized();
+    other._ensureTreeInitialized();
 
     // Clone the condition tree of other
-    final otherRoot = other._root.clone();
+    final otherRoot = other._root!.clone();
 
     // If the current condition is empty, use the condition tree of other
     if (isEmpty) {
-      _root.children.clear();
+      _root!.children.clear();
       for (var child in otherRoot.children) {
-        _root.children.add(child);
+        _root!.children.add(child);
       }
       _current = _root;
       return this;
     }
 
     // If the current node is an OR node, special handling is needed
-    if (_current.type == NodeType.or) {
+    if (_current!.type == NodeType.or) {
       // Create a new AND node
       final andNode = ConditionNode(type: NodeType.and);
 
@@ -319,7 +354,7 @@ class QueryCondition {
       }
 
       // Add the AND node to the OR node, not directly to otherRoot
-      _current.children.add(andNode);
+      _current!.children.add(andNode);
 
       // Update the current node to the new AND node, so that subsequent conditions will be added to this AND group
       _current = andNode;
@@ -328,19 +363,19 @@ class QueryCondition {
     }
 
     // If the current node is a leaf node, create a new AND node
-    if (_current.type == NodeType.leaf) {
+    if (_current!.type == NodeType.leaf) {
       final andNode = ConditionNode(type: NodeType.and);
 
       // Find the parent node of the current node
-      final parent = _findParent(_root, _current);
+      final parent = _findParent(_root!, _current!);
 
       if (parent != null) {
         // Replace the current node with the AND node in the parent node
-        final index = parent.children.indexOf(_current);
+        final index = parent.children.indexOf(_current!);
         parent.children[index] = andNode;
 
         // Add the current node as a child of the AND node
-        andNode.children.add(_current);
+        andNode.children.add(_current!);
 
         // Update the current node to the AND node
         _current = andNode;
@@ -355,11 +390,11 @@ class QueryCondition {
         otherRoot.children[0].type == NodeType.and) {
       // If other is a single AND node, its children can be added directly to avoid unnecessary nesting
       for (var child in otherRoot.children[0].children) {
-        _current.children.add(child);
+        _current!.children.add(child);
       }
     } else {
       // Otherwise, add the entire other as a child
-      _current.children.add(otherRoot);
+      _current!.children.add(otherRoot);
     }
 
     return this;
@@ -368,38 +403,37 @@ class QueryCondition {
   /// Add another condition as an OR condition
   QueryCondition orCondition(QueryCondition other) {
     if (other.isEmpty) return this;
+    _ensureTreeInitialized();
+    other._ensureTreeInitialized();
 
     // First call or() to ensure that the current node uses OR connection
     or();
 
     // If the current node is an OR node
-    if (_current.type == NodeType.or) {
+    if (_current!.type == NodeType.or) {
       // Directly access the root node structure of other
-      final otherRoot = other._root;
+      final otherRoot = other._root!;
 
       // If other is a simple condition (the root node has only one child)
       if (otherRoot.children.length == 1) {
         // Use clone to create a copy of the child nodes to prevent modifying the original conditions
-        _current.children.add(otherRoot.children[0].clone());
+        _current!.children.add(otherRoot.children[0].clone());
       } else {
         // For complex conditions, the entire structure needs to be cloned
-        _current.children.add(otherRoot.clone());
+        _current!.children.add(otherRoot.clone());
       }
     } else {
-      // Theoretically, this should not be reached, because or() should ensure that the current node is an OR node
-      // But for safety, add a backup logic
-
       final orNode = ConditionNode(type: NodeType.or);
 
       // Add the current node as a child of the OR node
-      orNode.children.add(_current);
+      orNode.children.add(_current!);
 
       // Add the cloned root node of other as a child of the OR node
-      orNode.children.add(other._root.clone());
+      orNode.children.add(other._root!.clone());
 
       // Replace the root node
-      _root.children.clear();
-      _root.children.add(orNode);
+      _root!.children.clear();
+      _root!.children.add(orNode);
 
       // Update the current node to the OR node
       _current = orNode;
@@ -408,13 +442,21 @@ class QueryCondition {
     return this;
   }
 
+  Map<String, dynamic>? _cachedBuiltMap;
+
   /// Build the query condition
   Map<String, dynamic> build() {
+    if (_cachedBuiltMap != null) return _cachedBuiltMap!;
+    if (_conditionCount == 1 && _fastSingleEqField != null && _root == null) {
+      return _cachedBuiltMap = _buildCondition(
+          _fastSingleEqField!, _singleOp ?? '=', _fastSingleEqVal);
+    }
+    if (_root == null) return _cachedBuiltMap = const <String, dynamic>{};
     // Optimize the condition tree, merge unnecessary nested nodes
-    _optimizeTree(_root);
+    _optimizeTree(_root!);
 
     // Build the final condition structure
-    return _nodeToCondition(_root);
+    return _cachedBuiltMap = _nodeToCondition(_root!);
   }
 
   /// Optimize the condition tree
@@ -522,7 +564,9 @@ class QueryCondition {
 
   /// Check if the condition is empty
   bool get isEmpty {
-    return !_hasMeaningfulPredicate(_root);
+    if (_conditionCount == 0 && _root == null) return true;
+    if (_root == null) return _conditionCount == 0;
+    return !_hasMeaningfulPredicate(_root!);
   }
 
   /// Determine if the condition tree contains any effective predicate
@@ -749,7 +793,17 @@ class QueryCondition {
   void normalize(Map<String, TableSchema> schemas, String mainTableName) {
     if (isEmpty || _isNormalized) return;
     _isNormalized = true;
-    _normalizeNode(_root, schemas, mainTableName);
+    if (_conditionCount == 1 && _fastSingleEqField != null && _root == null) {
+      final fieldSchema =
+          _getFieldSchema(_fastSingleEqField!, schemas, mainTableName);
+      if (fieldSchema != null) {
+        _fastSingleEqVal = fieldSchema.convertValue(_fastSingleEqVal);
+      }
+      return;
+    }
+    if (_root != null) {
+      _normalizeNode(_root!, schemas, mainTableName);
+    }
   }
 
   void _normalizeNode(ConditionNode node, Map<String, TableSchema> schemas,
@@ -845,12 +899,18 @@ class QueryCondition {
   ///
   /// Returns a record `(field: String, value: dynamic)?` if it matches, or null otherwise.
   ({String field, dynamic value})? extractSingleEquality() {
+    if (_conditionCount == 1 &&
+        _fastSingleEqField != null &&
+        (_singleOp == null || _singleOp == '=' || _singleOp == '==')) {
+      return (field: _fastSingleEqField!, value: _fastSingleEqVal);
+    }
+    if (_root == null) return null;
     ConditionNode? leaf;
-    if (_root.type == NodeType.leaf) {
+    if (_root!.type == NodeType.leaf) {
       leaf = _root;
-    } else if (_root.type == NodeType.and) {
-      if (_root.children.length == 1) {
-        final c1 = _root.children.first;
+    } else if (_root!.type == NodeType.and) {
+      if (_root!.children.length == 1) {
+        final c1 = _root!.children.first;
         if (c1.type == NodeType.leaf) {
           leaf = c1;
         } else if (c1.type == NodeType.and &&

@@ -2,32 +2,37 @@ import 'dart:async';
 
 import '../core/data_store_impl.dart';
 import '../core/workload_scheduler.dart';
-import '../model/db_exception.dart';
-import '../model/result_status.dart';
-import '../model/result_type.dart';
+import '../core/yield_controller.dart';
 import '../handler/logger.dart';
-import '../model/table_schema.dart';
-import '../query/query_condition.dart';
 import '../interface/future_builder_mixin.dart';
+import '../model/db_exception.dart';
 import '../model/db_result.dart';
 import '../model/expr.dart';
 import '../model/join_clause.dart';
-import '../model/query_result.dart';
 import '../model/query_aggregation.dart';
-import '../query/query_cache.dart';
+import '../model/query_result.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../model/table_identity.dart';
+import '../model/table_schema.dart';
+import '../query/query_cache.dart';
+import '../query/query_condition.dart';
 import '../query/query_executor.dart';
-import '../core/yield_controller.dart';
 
 part '../chain/delete_builder.dart';
-part '../chain/update_builder.dart';
 part '../chain/query_builder.dart';
+part '../chain/update_builder.dart';
 
 /// chain builder base class
 abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
   final DataStoreImpl _db;
   final String _tableName;
-  final QueryCondition _condition = QueryCondition();
+  QueryCondition? _condition;
+
+  int _conditionCount = 0;
+  String? _fastSingleEqField;
+  dynamic _fastSingleEqVal;
+  String? _singleOp;
 
   List<String>? _orderBy;
   int? _limit;
@@ -41,6 +46,31 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// hook called when query parameters change (e.g. limit, offset, orderBy, cursor)
   void _onChanged() {}
+
+  void _ensureConditionTree() {
+    if (_condition != null) return;
+    _condition = QueryCondition();
+    if (_fastSingleEqField != null) {
+      _condition!
+          .where(_fastSingleEqField!, _singleOp ?? '=', _fastSingleEqVal);
+      _fastSingleEqField = null;
+      _fastSingleEqVal = null;
+      _singleOp = null;
+    }
+  }
+
+  /// Fast check if this query condition is a single equality condition:
+  ({String field, dynamic value})? extractSingleEquality() {
+    if (_conditionCount == 1 &&
+        _fastSingleEqField != null &&
+        (_singleOp == null || _singleOp == '=' || _singleOp == '==')) {
+      return (field: _fastSingleEqField!, value: _fastSingleEqVal);
+    }
+    if (_condition != null) {
+      return _condition!.extractSingleEquality();
+    }
+    return null;
+  }
 
   /// set order by (asc)
   SELF orderByAsc(String field) {
@@ -85,49 +115,69 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// base where condition
   SELF where(String field, String operator, dynamic value) {
-    _condition.where(field, operator, value);
+    _conditionCount++;
+    if (_conditionCount == 1 &&
+        _condition == null &&
+        (operator == '=' || operator == '==')) {
+      _fastSingleEqField = field;
+      _fastSingleEqVal = value;
+      _singleOp = '=';
+      return _self;
+    }
+    _ensureConditionTree();
+    _condition!.where(field, operator, value);
     _onChanged();
     return _self;
   }
 
   /// whereIn condition
   SELF whereIn(String field, List values) {
-    _condition.where(field, 'IN', values);
+    _conditionCount++;
+    _ensureConditionTree();
+    _condition!.where(field, 'IN', values);
     _onChanged();
     return _self;
   }
 
   /// whereBetween condition
   SELF whereBetween(String field, dynamic start, dynamic end) {
-    _condition.where(field, 'BETWEEN', [start, end]);
+    _conditionCount++;
+    _ensureConditionTree();
+    _condition!.where(field, 'BETWEEN', [start, end]);
     _onChanged();
     return _self;
   }
 
   /// whereNull condition
   SELF whereNull(String field) {
-    _condition.where(field, 'IS', null);
+    _conditionCount++;
+    _ensureConditionTree();
+    _condition!.where(field, 'IS', null);
     _onChanged();
     return _self;
   }
 
   /// whereNotNull condition
   SELF whereNotNull(String field) {
-    _condition.where(field, 'IS NOT', null);
+    _conditionCount++;
+    _ensureConditionTree();
+    _condition!.where(field, 'IS NOT', null);
     _onChanged();
     return _self;
   }
 
   /// OR condition
   SELF or() {
-    _condition.or();
+    _ensureConditionTree();
+    _condition!.or();
     _onChanged();
     return _self;
   }
 
   /// Add a predefined condition to this query with AND logic
   SELF condition(QueryCondition condition) {
-    _condition.condition(condition);
+    _ensureConditionTree();
+    _condition!.condition(condition);
 
     condition.$internalApplySettings(
         () => _orderBy,
@@ -142,7 +192,8 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// orCondition condition - adds OR logic
   SELF orCondition(QueryCondition condition) {
-    _condition.orCondition(condition);
+    _ensureConditionTree();
+    _condition!.orCondition(condition);
 
     condition.$internalApplySettings(
         () => _orderBy,
@@ -157,137 +208,156 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
 
   /// orWhere condition - adds OR logic
   SELF orWhere(String field, String operator, dynamic value) {
-    _condition.or().where(field, operator, value);
+    _ensureConditionTree();
+    _condition!.or().where(field, operator, value);
     _onChanged();
     return _self;
   }
 
   /// whereNotIn condition
   SELF whereNotIn(String field, List values) {
-    _condition.where(field, 'NOT IN', values);
+    _ensureConditionTree();
+    _condition!.where(field, 'NOT IN', values);
     _onChanged();
     return _self;
   }
 
   /// whereLike condition
   SELF whereLike(String field, String pattern) {
-    _condition.where(field, 'LIKE', pattern);
+    _ensureConditionTree();
+    _condition!.where(field, 'LIKE', pattern);
     _onChanged();
     return _self;
   }
 
   /// whereNotLike condition
   SELF whereNotLike(String field, String pattern) {
-    _condition.where(field, 'NOT LIKE', pattern);
+    _ensureConditionTree();
+    _condition!.where(field, 'NOT LIKE', pattern);
     _onChanged();
     return _self;
   }
 
   /// whereEqual condition
   SELF whereEqual(String field, dynamic value) {
-    _condition.whereEqual(field, value);
-    _onChanged();
-    return _self;
+    return where(field, '=', value);
   }
 
   /// whereNotEqual condition
   SELF whereNotEqual(String field, dynamic value) {
-    _condition.whereNotEqual(field, value);
+    _ensureConditionTree();
+    _condition!.whereNotEqual(field, value);
     _onChanged();
     return _self;
   }
 
   /// whereGreaterThan condition
   SELF whereGreaterThan(String field, dynamic value) {
-    _condition.whereGreaterThan(field, value);
+    _ensureConditionTree();
+    _condition!.whereGreaterThan(field, value);
     _onChanged();
     return _self;
   }
 
   /// whereGreaterThanOrEqualTo condition
   SELF whereGreaterThanOrEqualTo(String field, dynamic value) {
-    _condition.whereGreaterThanOrEqualTo(field, value);
+    _ensureConditionTree();
+    _condition!.whereGreaterThanOrEqualTo(field, value);
     _onChanged();
     return _self;
   }
 
   /// whereLessThan condition
   SELF whereLessThan(String field, dynamic value) {
-    _condition.whereLessThan(field, value);
+    _ensureConditionTree();
+    _condition!.whereLessThan(field, value);
     _onChanged();
     return _self;
   }
 
   /// whereLessThanOrEqualTo condition
   SELF whereLessThanOrEqualTo(String field, dynamic value) {
-    _condition.whereLessThanOrEqualTo(field, value);
+    _ensureConditionTree();
+    _condition!.whereLessThanOrEqualTo(field, value);
     _onChanged();
     return _self;
   }
 
   /// whereContains condition
   SELF whereContains(String field, String value) {
-    _condition.whereContains(field, value);
+    _ensureConditionTree();
+    _condition!.whereContains(field, value);
     _onChanged();
     return _self;
   }
 
   /// whereNotContains condition
   SELF whereNotContains(String field, String value) {
-    _condition.whereNotContains(field, value);
+    _ensureConditionTree();
+    _condition!.whereNotContains(field, value);
     _onChanged();
     return _self;
   }
 
   /// whereStartsWith condition
   SELF whereStartsWith(String field, String prefix) {
-    _condition.whereStartsWith(field, prefix);
+    _ensureConditionTree();
+    _condition!.whereStartsWith(field, prefix);
     _onChanged();
     return _self;
   }
 
   /// whereEndsWith condition
   SELF whereEndsWith(String field, String suffix) {
-    _condition.whereEndsWith(field, suffix);
+    _ensureConditionTree();
+    _condition!.whereEndsWith(field, suffix);
     _onChanged();
     return _self;
   }
 
   /// whereContainsAny condition
   SELF whereContainsAny(String field, List values) {
-    _condition.whereContainsAny(field, values);
+    _ensureConditionTree();
+    _condition!.whereContainsAny(field, values);
     _onChanged();
     return _self;
   }
 
   /// whereEmpty condition - matches null or empty string
   SELF whereEmpty(String field) {
-    _condition.whereEmpty(field);
+    _ensureConditionTree();
+    _condition!.whereEmpty(field);
     _onChanged();
     return _self;
   }
 
   /// whereNotEmpty condition - matches non-null and non-empty string
   SELF whereNotEmpty(String field) {
-    _condition.whereNotEmpty(field);
+    _ensureConditionTree();
+    _condition!.whereNotEmpty(field);
     _onChanged();
     return _self;
   }
 
   /// whereTrue condition - matches true
   SELF whereTrue(String field) {
-    _condition.whereTrue(field);
+    _ensureConditionTree();
+    _condition!.whereTrue(field);
     _onChanged();
     return _self;
   }
 
   /// whereFalse condition - matches false
   SELF whereFalse(String field) {
-    _condition.whereFalse(field);
+    _ensureConditionTree();
+    _condition!.whereFalse(field);
     _onChanged();
     return _self;
   }
 
   /// get condition builder
-  QueryCondition get queryCondition => _condition;
+  QueryCondition get queryCondition {
+    _ensureConditionTree();
+    return _condition!;
+  }
 }

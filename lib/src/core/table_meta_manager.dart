@@ -152,6 +152,54 @@ class TableMetaManager {
     return _uidByName[tableName];
   }
 
+  /// Synchronous memory-only table name to TableUid resolution.
+  TableUid? getUidByNameSync(TableName tableName) {
+    if (tableName.isEmpty) return null;
+    if (tableName.value == SystemTable.tableMetaName) {
+      return SystemTable.tableMetaTableUid;
+    }
+    return _uidByName[tableName];
+  }
+
+  /// Cached TableContext instances for zero-allocation synchronous lookups.
+  final Map<TableUid, TableContext> _tableContextCache =
+      <TableUid, TableContext>{};
+  final Map<String, TableContext> _contextByNameCache =
+      <String, TableContext>{};
+
+  /// Synchronous zero-allocation TableContext retrieval by table name string.
+  TableContext? getTableContextByNameSync(String tableName) {
+    if (tableName.isEmpty) return null;
+    final cached = _contextByNameCache[tableName];
+    if (cached != null) return cached;
+    final name = TableName(tableName);
+    final tableUid = getUidByNameSync(name);
+    if (tableUid == null) return null;
+    final ctx = getTableContextSync(tableUid);
+    if (ctx != null) {
+      _contextByNameCache[tableName] = ctx;
+    }
+    return ctx;
+  }
+
+  /// Synchronous memory-only TableContext retrieval.
+  TableContext? getTableContextSync(TableUid tableUid) {
+    if (tableUid.isEmpty) return null;
+    final cached = _tableContextCache[tableUid];
+    if (cached != null) return cached;
+    final meta = _peekTableMeta(tableUid);
+    if (meta == null) return null;
+    final ctx = TableContext(
+      tableUid: meta.tableUid,
+      tableName: meta.tableName,
+      isGlobal: meta.isGlobal,
+      dirIndex: meta.dirIndex,
+      schema: meta.schema,
+    );
+    _tableContextCache[tableUid] = ctx;
+    return ctx;
+  }
+
   /// Memory-only UID->name peek (logs / best-effort display only).
   TableName? _peekNameByUid(TableUid tableUid) {
     if (tableUid.isEmpty) return null;
@@ -410,12 +458,15 @@ class TableMetaManager {
   void removeCachedTableSchema(TableUid tableUid) {
     _tableSchemaCache?.remove(tableUid);
     _tableMetaCache?.remove(tableUid);
+    _tableContextCache.remove(tableUid);
+    _contextByNameCache.clear();
     _indexListCache.remove(tableUid);
     _tableFieldLayoutCache.remove(tableUid);
     _storageFieldStructCache.remove(tableUid);
     if (tableUid == SystemTable.tableMetaTableUid) {
       _pinnedMetaTableMeta = null;
     }
+    _dataStore.queryExecutor.invalidatePlanCacheForTable(tableUid);
   }
 
   /// Current schema cache size in bytes (incremental tracked).
@@ -983,6 +1034,13 @@ class TableMetaManager {
   IndexSchema? findIndexSchemaByUid(TableSchema schema, IndexUid indexUid) {
     if (indexUid.isEmpty) return null;
     return _indexCacheEntryFor(schema).byUid[indexUid];
+  }
+
+  /// O(1) lookup of single-column unique index by field name.
+  IndexSchema? findSingleFieldUniqueIndex(
+      TableSchema schema, String fieldName) {
+    if (fieldName.isEmpty) return null;
+    return _indexCacheEntryFor(schema).uniqueBySingleField[fieldName];
   }
 
   /// O(1) lookup by uid-or-legacy-name field (compat path only on alias miss).
@@ -1938,6 +1996,7 @@ class _IndexListCacheEntry {
   final List<IndexSchema> btreeIndexes;
   final Map<String, IndexSchema> byUid;
   final Map<String, IndexSchema> byAlias;
+  final Map<String, IndexSchema> uniqueBySingleField;
 
   const _IndexListCacheEntry({
     required this.allIndexes,
@@ -1946,6 +2005,7 @@ class _IndexListCacheEntry {
     required this.btreeIndexes,
     required this.byUid,
     required this.byAlias,
+    required this.uniqueBySingleField,
   });
 }
 
@@ -1961,6 +2021,7 @@ _IndexListCacheEntry _buildIndexListCache(TableSchema schema) {
       btreeIndexes: emptyList,
       byUid: {},
       byAlias: {},
+      uniqueBySingleField: {},
     );
   }
 
@@ -1969,10 +2030,14 @@ _IndexListCacheEntry _buildIndexListCache(TableSchema schema) {
   final btree = <IndexSchema>[];
   final byUid = <String, IndexSchema>{};
   final byAlias = <String, IndexSchema>{};
+  final uniqueBySingleField = <String, IndexSchema>{};
 
   for (final idx in all) {
     if (idx.unique) {
       unique.add(idx);
+      if (idx.fields.length == 1) {
+        uniqueBySingleField[idx.fields.first] = idx;
+      }
     }
     if (idx.type == IndexType.vector) {
       vector.add(idx);
@@ -1996,5 +2061,7 @@ _IndexListCacheEntry _buildIndexListCache(TableSchema schema) {
     btreeIndexes: List<IndexSchema>.unmodifiable(btree),
     byUid: Map<String, IndexSchema>.unmodifiable(byUid),
     byAlias: Map<String, IndexSchema>.unmodifiable(byAlias),
+    uniqueBySingleField:
+        Map<String, IndexSchema>.unmodifiable(uniqueBySingleField),
   );
 }

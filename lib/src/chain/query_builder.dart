@@ -5,16 +5,17 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     with FutureBuilderMixin<QueryResult<Map<String, dynamic>>> {
   Future<ExecuteResult>? _future;
   List<String>? _selectedFields;
-  List<QueryAggregation> _extraAggregations = []; // To store inline Agg objects
+  List<QueryAggregation> _extraAggregations =
+      const []; // To store inline Agg objects
 
   // related query related properties
-  final List<JoinClause> _joins = [];
+  List<JoinClause>? _joins;
 
   // Pending foreign key joins to be resolved during query execution
   List<PendingForeignKeyJoin>? _pendingForeignKeyJoins;
 
   // query cache control
-  bool _enableQueryCache = false;
+  bool _enableQueryCache = true;
   Duration? _queryCacheExpiry;
 
   // distinct modifier
@@ -29,7 +30,9 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   QueryBuilder(super.db, super.tableName);
 
   void _invalidateFuture() {
-    _future = null;
+    if (_future != null) {
+      _future = null;
+    }
   }
 
   @override
@@ -71,12 +74,12 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
           // This warms up the B-Tree Page Cache and Record Cache in ResourceManager.
           await _db.queryExecutor.execute(
             await _db.getTableContext(_tableName),
-            condition: _condition,
+            condition: queryCondition,
             orderBy: _orderBy,
             limit: _limit,
             offset: nextCursor != null ? null : (nextOffset ?? _offset),
             cursor: nextCursor,
-            joins: _joins,
+            joins: _joins ?? const [],
             enableQueryCache: false, // Don't interfere with manual result cache
             onlyCount: false,
             aggregations: combinedAggs.isNotEmpty ? combinedAggs : null,
@@ -170,7 +173,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   /// join another table
   QueryBuilder join(
       String table, String firstKey, String operator, String secondKey) {
-    _joins.add(JoinClause(
+    (_joins ??= []).add(JoinClause(
       type: JoinType.inner,
       table: table,
       firstKey: firstKey,
@@ -184,7 +187,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   /// left join another table
   QueryBuilder leftJoin(
       String table, String firstKey, String operator, String secondKey) {
-    _joins.add(JoinClause(
+    (_joins ??= []).add(JoinClause(
       type: JoinType.left,
       table: table,
       firstKey: firstKey,
@@ -198,7 +201,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   /// right join another table
   QueryBuilder rightJoin(
       String table, String firstKey, String operator, String secondKey) {
-    _joins.add(JoinClause(
+    (_joins ??= []).add(JoinClause(
       type: JoinType.right,
       table: table,
       firstKey: firstKey,
@@ -320,17 +323,234 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     return results.data.isEmpty ? null : results.data.first;
   }
 
+  /// Synchronously retrieve query results from pure memory cache (Result Cache / Point Cache).
+  ///
+  /// Never hits disk/files; returns empty result if memory caches miss.
+  /// Extremely fast (3M+ QPS for point lookups, 2M+ QPS for cached queries).
+  QueryResult<Map<String, dynamic>> peek() {
+    final result = _executePeekSync();
+
+    Future<QueryResult<Map<String, dynamic>>> nextPageExecutor() async {
+      final cloned = clone();
+      if (result.nextCursor != null) {
+        cloned.cursor(result.nextCursor!);
+      } else {
+        final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
+        final currentOffset = _offset ?? 0;
+        cloned.offset(currentOffset + effectiveLimit);
+      }
+      return cloned.future;
+    }
+
+    Future<QueryResult<Map<String, dynamic>>> prevPageExecutor() async {
+      final cloned = clone();
+      if (result.prevCursor != null) {
+        cloned.cursor(result.prevCursor!);
+      } else {
+        final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
+        final currentOffset = _offset ?? 0;
+        final newOffset = currentOffset - effectiveLimit;
+        cloned.offset(newOffset >= 0 ? newOffset : 0);
+      }
+      return cloned.future;
+    }
+
+    QueryResult<Map<String, dynamic>> peekNextPageExecutor() {
+      final cloned = clone();
+      if (result.nextCursor != null) {
+        cloned.cursor(result.nextCursor!);
+      } else {
+        final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
+        final currentOffset = _offset ?? 0;
+        cloned.offset(currentOffset + effectiveLimit);
+      }
+      return cloned.peek();
+    }
+
+    QueryResult<Map<String, dynamic>> peekPrevPageExecutor() {
+      final cloned = clone();
+      if (result.prevCursor != null) {
+        cloned.cursor(result.prevCursor!);
+      } else {
+        final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
+        final currentOffset = _offset ?? 0;
+        final newOffset = currentOffset - effectiveLimit;
+        cloned.offset(newOffset >= 0 ? newOffset : 0);
+      }
+      return cloned.peek();
+    }
+
+    return QueryResult.success(
+      data: result.records,
+      prevCursor: result.prevCursor,
+      nextCursor: result.nextCursor,
+      hasMore: result.hasMore,
+      hasPrev: result.hasPrev,
+      totalRecordCount: result.totalRecordCount,
+      executionTimeMs: result.executionTimeMs,
+      nextPageExecutor: result.hasMore ? nextPageExecutor : null,
+      prevPageExecutor: result.hasPrev ? prevPageExecutor : null,
+      peekNextPageExecutor: result.hasMore ? peekNextPageExecutor : null,
+      peekPrevPageExecutor: result.hasPrev ? peekPrevPageExecutor : null,
+    );
+  }
+
+  /// Synchronously retrieve the first matching record from pure memory cache.
+  ///
+  /// Returns null if not found in memory cache.
+  Map<String, dynamic>? peekFirst() {
+    final table = _db.getTableContextSync(_tableName);
+    if (table == null) return null;
+    return _db.queryExecutor.executePeekFirst(
+      table,
+      condition: _condition,
+      fastSingleEqField: _fastSingleEqField,
+      fastSingleEqVal: _fastSingleEqVal,
+      fastSingleEqOp: _singleOp,
+      joins: _joins,
+    );
+  }
+
+  /// Synchronously check if any matching record exists in pure memory cache.
+  bool peekExists() {
+    final table = _db.getTableContextSync(_tableName);
+    if (table == null) return false;
+    return _db.queryExecutor.executePeekExists(
+      table,
+      condition: _condition,
+      fastSingleEqField: _fastSingleEqField,
+      fastSingleEqVal: _fastSingleEqVal,
+      fastSingleEqOp: _singleOp,
+      joins: _joins,
+    );
+  }
+
+  /// Synchronously retrieve matching record count from pure memory cache.
+  int peekCount() {
+    final table = _db.getTableContextSync(_tableName);
+    if (table == null) return 0;
+    return _db.queryExecutor.executePeekCount(
+      table,
+      condition: _condition,
+      fastSingleEqField: _fastSingleEqField,
+      fastSingleEqVal: _fastSingleEqVal,
+      fastSingleEqOp: _singleOp,
+      joins: _joins,
+    );
+  }
+
+  ExecuteResult _executePeekSync({
+    bool onlyCount = false,
+    List<QueryAggregation>? extraAggregations,
+  }) {
+    final table = _db.getTableContextSync(_tableName);
+    if (table == null) {
+      return const ExecuteResult.empty();
+    }
+
+    final List<QueryAggregation>? combinedAggs = (_aggregations != null ||
+            extraAggregations != null ||
+            _extraAggregations.isNotEmpty)
+        ? <QueryAggregation>[
+            ...?_aggregations,
+            ...?extraAggregations,
+            ..._extraAggregations,
+          ]
+        : null;
+
+    final result = _db.getQueryExecutor()?.executePeek(
+              table,
+              condition: queryCondition,
+              orderBy: _orderBy,
+              limit: _limit,
+              offset: _offset,
+              cursor: _cursor,
+              joins: _joins != null && _joins!.isNotEmpty ? _joins : null,
+              enableQueryCache: _enableQueryCache,
+              queryCacheExpiry: _enableQueryCache ? _queryCacheExpiry : null,
+              onlyCount: onlyCount,
+              aggregations: combinedAggs,
+              groupBy: _groupByFields,
+              applyPromoteResultTransform: true,
+            ) ??
+        const ExecuteResult.empty();
+
+    List<Map<String, dynamic>> results = result.records;
+
+    if (result.aggregateResult is List) {
+      results = List<Map<String, dynamic>>.from(result.aggregateResult);
+    }
+
+    if (_joins != null && _joins!.isNotEmpty) {
+      final processed = _processManyTableResults(results, aggs: combinedAggs);
+      return ExecuteResult(
+        records: processed,
+        nextCursor: result.nextCursor,
+        prevCursor: result.prevCursor,
+        hasMore: result.hasMore,
+        hasPrev: result.hasPrev,
+        executionTimeMs: result.executionTimeMs,
+        totalRecordCount: result.totalRecordCount,
+        count: result.count,
+        aggregateResult: result.aggregateResult,
+      );
+    }
+
+    if (_selectedFields != null && _selectedFields!.isNotEmpty) {
+      final selected = _selectedFields!;
+      results = results.map((record) {
+        final filteredRecord = <String, dynamic>{};
+        for (final field in selected) {
+          if (record.containsKey(field)) {
+            filteredRecord[field] = record[field];
+          }
+        }
+        return filteredRecord;
+      }).toList();
+    }
+
+    if (_distinct && results.isNotEmpty) {
+      final seen = <String, bool>{};
+      final distinctResults = <Map<String, dynamic>>[];
+      final fieldsToCheck = _distinctFields ??
+          (_selectedFields != null && _selectedFields!.isNotEmpty
+              ? _selectedFields!.map(_getFieldAlias).toList()
+              : results.first.keys.toList());
+
+      for (final r in results) {
+        final sig = fieldsToCheck.map((f) => r[f]?.toString() ?? '').join('|');
+        if (!seen.containsKey(sig)) {
+          seen[sig] = true;
+          distinctResults.add(r);
+        }
+      }
+      results = distinctResults;
+    }
+
+    return ExecuteResult(
+      records: results,
+      nextCursor: result.nextCursor,
+      prevCursor: result.prevCursor,
+      hasMore: result.hasMore,
+      hasPrev: result.hasPrev,
+      executionTimeMs: result.executionTimeMs,
+      totalRecordCount: result.totalRecordCount,
+      count: result.count,
+      aggregateResult: result.aggregateResult,
+    );
+  }
+
   /// get record count
   Future<int> count() async {
     // if there are no conditions and no joins, get total count from metadata
     if (queryCondition.isEmpty &&
-        _joins.isEmpty &&
+        (_joins == null || _joins!.isEmpty) &&
         _pendingForeignKeyJoins?.isEmpty != false) {
       final table = await _db.getTableContext(_tableName);
       return await _db.tableDataManager.getTableRecordCount(table);
     }
 
-    if (_joins.isEmpty &&
+    if ((_joins == null || _joins!.isEmpty) &&
         (_pendingForeignKeyJoins == null || _pendingForeignKeyJoins!.isEmpty)) {
       final result = await _executeQuery(onlyCount: true);
       return result.count ?? result.records.length;
@@ -349,7 +569,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   Future<bool> exists() async {
     // No conditions, no joins: use table data metadata for O(1) check.
     if (queryCondition.isEmpty &&
-        _joins.isEmpty &&
+        (_joins == null || _joins!.isEmpty) &&
         _pendingForeignKeyJoins?.isEmpty != false) {
       final table = await _db.getTableContext(_tableName);
       final total = await _db.tableDataManager.getTableRecordCount(table);
@@ -357,7 +577,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     }
 
     // Single-table query: use count-only path with limit 1 for early-exit.
-    if (_joins.isEmpty &&
+    if ((_joins == null || _joins!.isEmpty) &&
         (_pendingForeignKeyJoins == null || _pendingForeignKeyJoins!.isEmpty)) {
       // Temporarily cap limit to 1 so executor can stop as soon as a match is seen.
       limit(1);
@@ -401,7 +621,13 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   QueryBuilder clone() {
     final builder = QueryBuilder(_db, _tableName);
     // Copy base ChainBuilder properties
-    builder._condition.condition(_condition);
+    builder._conditionCount = _conditionCount;
+    builder._fastSingleEqField = _fastSingleEqField;
+    builder._fastSingleEqVal = _fastSingleEqVal;
+    builder._singleOp = _singleOp;
+    if (_condition != null) {
+      builder._condition = _condition!.clone();
+    }
     if (_orderBy != null) builder._orderBy = List<String>.from(_orderBy!);
     builder._limit = _limit;
     builder._offset = _offset;
@@ -413,7 +639,9 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     }
     builder._extraAggregations =
         List<QueryAggregation>.from(_extraAggregations);
-    builder._joins.addAll(_joins);
+    if (_joins != null) {
+      builder._joins = List<JoinClause>.from(_joins!);
+    }
     if (_pendingForeignKeyJoins != null) {
       builder._pendingForeignKeyJoins =
           List<PendingForeignKeyJoin>.from(_pendingForeignKeyJoins!);
@@ -614,7 +842,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
               limit: _limit,
               offset: _offset,
               cursor: _cursor,
-              joins: _joins,
+              joins: _joins ?? const [],
               enableQueryCache: _enableQueryCache,
               queryCacheExpiry: _enableQueryCache ? _queryCacheExpiry : null,
               onlyCount: onlyCount,
@@ -632,7 +860,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     }
 
     // process related query results, ensure consistent field naming format
-    if (_joins.isNotEmpty) {
+    if (_joins != null && _joins!.isNotEmpty) {
       final processed = _processManyTableResults(results, aggs: combinedAggs);
       return ExecuteResult(
         records: processed,
@@ -957,7 +1185,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
             // So we join: current_table.pk = target_table.fk
             if (foreignKey.fields.length == 1 &&
                 foreignKey.referencedFields.length == 1) {
-              _joins.add(JoinClause(
+              (_joins ??= []).add(JoinClause(
                 type: type,
                 table: tableName,
                 firstKey: '$_tableName.${foreignKey.referencedFields.first}',
@@ -988,7 +1216,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       // Join: current_table.fk = target_table.pk
       if (fk.fields.length == 1 && fk.referencedFields.length == 1) {
         // Simple foreign key: single field join
-        _joins.add(JoinClause(
+        (_joins ??= []).add(JoinClause(
           type: type,
           table: tableName,
           firstKey: '$_tableName.${fk.fields.first}',
@@ -1000,7 +1228,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
         // Additional field pairs need to be added as WHERE conditions
         // This is a limitation of the current JoinClause design
         if (fk.fields.isNotEmpty && fk.referencedFields.isNotEmpty) {
-          _joins.add(JoinClause(
+          (_joins ??= []).add(JoinClause(
             type: type,
             table: tableName,
             firstKey: '$_tableName.${fk.fields.first}',
