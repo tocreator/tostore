@@ -17,6 +17,7 @@ import 'compute/compute_batch_planner.dart';
 import 'compute/wal_decode_batch_runner.dart';
 import 'compute_manager.dart';
 import 'compute_tasks.dart';
+import 'cpu_work_chunk.dart';
 import 'data_store_impl.dart';
 import 'storage_adapter.dart';
 import 'yield_controller.dart';
@@ -765,7 +766,13 @@ class WalManager {
       persistMeta(flush: false);
     }
 
-    final yieldController = YieldController('WalManager.appendBatch');
+    final yieldController =
+        _dataStore.parallelJournalManager.activeBatchOperationCount > 0
+            ? YieldController(
+                'WalManager.appendBatch',
+                minCheckInterval: EngineCpuChunk.hotPathMinCheckInterval,
+              )
+            : YieldController('WalManager.appendBatch');
     final List<WalPointer> pointers =
         List<WalPointer>.filled(walEntries.length, _current, growable: false);
     for (int i = 0; i < walEntries.length; i++) {

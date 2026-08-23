@@ -262,11 +262,13 @@ class WriteBufferManager {
         entry: entry,
         transactionId: batchTxId,
       );
-      commitReservedUniques(
-        table: table,
-        recordId: recordId,
-        transactionId: entry.transactionId ?? batchTxId,
-      );
+      if (!installAllIndexes) {
+        commitReservedUniques(
+          table: table,
+          recordId: recordId,
+          transactionId: entry.transactionId ?? batchTxId,
+        );
+      }
 
       final wp = entry.walPointer;
       if (wp == null) {
@@ -762,6 +764,7 @@ class WriteBufferManager {
     TableContext table,
     String? transactionId,
   ) {
+    trees.ensureComparators(table, table.schema);
     return BufferBatchReserveContext(this, table, transactionId);
   }
 }

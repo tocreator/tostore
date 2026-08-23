@@ -1602,6 +1602,8 @@ class TableDataManager {
     String? transactionId,
     DateTime? timestamp,
     required String schemaVersion,
+    bool installUniquesOnApply = false,
+    bool deferQueryCacheInvalidation = false,
   }) async {
     if (records.isEmpty) {
       return (
@@ -1883,7 +1885,7 @@ class TableDataManager {
         table: table,
         recordIds: recordIds,
         entries: entries,
-        installAllIndexes: applyingCommit,
+        installAllIndexes: applyingCommit || installUniquesOnApply,
       );
     } else if (operation == BufferOperationType.update) {
       await _dataStore.writeBufferManager.addUpdateBatch(
@@ -1898,7 +1900,9 @@ class TableDataManager {
     }
     successIds.addAll(recordIds);
     _markSpaceStatsDirty(table);
-    _dataStore.queryExecutor.invalidateQueryCacheForTable(table);
+    if (!deferQueryCacheInvalidation) {
+      _dataStore.queryExecutor.invalidateQueryCacheForTable(table);
+    }
 
     return (successRecordIds: successIds, failedRecordIds: failedIds);
   }

@@ -3968,6 +3968,7 @@ class DataStoreImpl {
     TableSchema? schema;
     TableContext? tableForRelease;
     final Set<String> reservedNotBuffered = <String>{};
+    bool deferQueryCacheInvalidation = false;
     parallelJournalManager.beginBatchOperation();
     try {
       // 1. Get table schema and validate data
@@ -4044,6 +4045,33 @@ class DataStoreImpl {
       final bool hasForeignKeys = _foreignKeyManager != null &&
           tableSchema.foreignKeys.any((fk) => fk.enabled);
 
+      // Check if table has custom PK or secondary unique indexes (need disk unique checks)
+      final bool hasCustomPk =
+          tableSchema.primaryKeyConfig.type == PrimaryKeyType.none;
+
+      // Hoist schema constraint pass check once for the entire batch.
+      var needsConstraintPass = false;
+      for (final field in tableSchema.fields) {
+        if (field.maxLength != null ||
+            field.minLength != null ||
+            field.minValue != null ||
+            field.maxValue != null) {
+          needsConstraintPass = true;
+          break;
+        }
+      }
+
+      // Pure PK insert on an empty table: no secondary uniques, no FK, no
+      // constraints, no promote mirror -- skip per-row reserve bookkeeping and
+      // install PK uniqueness once at buffer apply.
+      final bool isPurePkInsertFastPath = !hasSecondaryUniqueIndexes &&
+          !hasForeignKeys &&
+          !hasCustomPk &&
+          !needsConstraintPass &&
+          skipDiskUniqueChecks &&
+          promoteDesc == null;
+      deferQueryCacheInvalidation = isPurePkInsertFastPath;
+
       final invalidRecords = <Map<String, dynamic>>[];
       final List<String> successKeys = [];
       final List<String> failedKeys = [];
@@ -4053,29 +4081,14 @@ class DataStoreImpl {
       final List<String> validationErrorsForResult = [];
       final List<ResultStatus> batchStatuses = [];
 
-      // Check if table has custom PK or secondary unique indexes (need disk unique checks)
-      final bool hasCustomPk =
-          tableSchema.primaryKeyConfig.type == PrimaryKeyType.none;
       final bool needDiskUniqueCheckBase = !skipDiskUniqueChecks &&
           _indexManager != null &&
           (hasCustomPk || hasSecondaryUniqueIndexes);
 
       try {
-        const int bufferBatchSize = 1000;
+        final int bufferBatchSize = isPurePkInsertFastPath ? 2000 : 1000;
         int start = 0;
         final batchTimestamp = DateTime.now();
-
-        // Hoist schema constraint pass check once for the entire batch
-        var needsConstraintPass = false;
-        for (final field in tableSchema.fields) {
-          if (field.maxLength != null ||
-              field.minLength != null ||
-              field.minValue != null ||
-              field.maxValue != null) {
-            needsConstraintPass = true;
-            break;
-          }
-        }
 
         while (start < records.length) {
           final int end = min(start + bufferBatchSize, records.length);
@@ -4143,12 +4156,15 @@ class DataStoreImpl {
 
           final yieldController = YieldController(
             'DataStoreImpl.batchInsert.loop',
-            minCheckInterval: EngineCpuChunk.hotPathMinCheckInterval,
+            minCheckInterval: isPurePkInsertFastPath
+                ? 1024
+                : EngineCpuChunk.hotPathMinCheckInterval,
           );
 
           // Optimization: Create batch context to hoist table/buffer lookups out of the record loop
-          final batchContext =
-              writeBufferManager.createBatchReserveContext(table, txId);
+          final batchContext = isPurePkInsertFastPath && isWindowAllAutoPk
+              ? null
+              : writeBufferManager.createBatchReserveContext(table, txId);
 
           // Collect valid records for a single bulk enqueue into WAL + buffer + cache.
           final batchRecordsForBuffer = <Map<String, dynamic>>[];
@@ -4278,7 +4294,7 @@ class DataStoreImpl {
                               orig[primaryKey] = newId;
                               final newRid = newId.toString();
 
-                              batchContext.tryReserve(
+                              batchContext?.tryReserve(
                                 newRid,
                                 rec,
                                 isUpdate: false,
@@ -4373,6 +4389,9 @@ class DataStoreImpl {
               schema: tableSchema,
               transactionId: txId,
               schemaVersion: tableSchema.schemaVersion ?? '',
+              installUniquesOnApply:
+                  isPurePkInsertFastPath && isWindowAllAutoPk,
+              deferQueryCacheInvalidation: deferQueryCacheInvalidation,
             );
 
             if (bufferResult.successRecordIds.isNotEmpty) {
@@ -4474,6 +4493,7 @@ class DataStoreImpl {
                     ignoreUnknownFields: _config?.ignoreUnknownFields ?? true,
                     batchTimestamp: batchTimestamp,
                     schemaNeedsConstraintPass: needsConstraintPass,
+                    mutateInPlace: isPurePkInsertFastPath,
                   );
                 } on DbException catch (e) {
                   recordErrors.addAll(e.statuses.map((s) => s.message));
@@ -4561,110 +4581,114 @@ class DataStoreImpl {
 
                 // Reservation based: try reserve unique keys first (schema+data)
                 final recordId = validData[primaryKey].toString();
-                try {
-                  batchContext.tryReserve(
-                    recordId,
-                    validData,
-                    isUpdate: false,
-                    schema: tableSchema,
-                  );
-                  reservedNotBuffered.add(recordId);
-                } catch (e) {
-                  if (e is UniqueViolation) {
-                    final bool isPkConflict = e.indexName == 'pk';
-                    final bool isSequentialPk =
-                        tableSchema.primaryKeyConfig.type ==
-                            PrimaryKeyType.sequential;
-                    // Only adjust maxId and retry when the conflict is on the primary key
-                    // and the ID was originally generated by the system (Auto-ID).
-                    // Manual IDs must result in a violation if they conflict.
-                    if (isPkConflict &&
-                        isSequentialPk &&
-                        isAutoPk &&
-                        !triedPkConflictRetry) {
-                      try {
-                        final dynamic pkVal = validData[primaryKey];
-                        await tableDataManager.handlePrimaryKeyConflict(
-                            table, pkVal);
+                if (batchContext != null) {
+                  try {
+                    batchContext.tryReserve(
+                      recordId,
+                      validData,
+                      isUpdate: false,
+                      schema: tableSchema,
+                    );
+                    reservedNotBuffered.add(recordId);
+                  } catch (e) {
+                    if (e is UniqueViolation) {
+                      final bool isPkConflict = e.indexName == 'pk';
+                      final bool isSequentialPk =
+                          tableSchema.primaryKeyConfig.type ==
+                              PrimaryKeyType.sequential;
+                      // Only adjust maxId and retry when the conflict is on the primary key
+                      // and the ID was originally generated by the system (Auto-ID).
+                      // Manual IDs must result in a violation if they conflict.
+                      if (isPkConflict &&
+                          isSequentialPk &&
+                          isAutoPk &&
+                          !triedPkConflictRetry) {
+                        try {
+                          final dynamic pkVal = validData[primaryKey];
+                          await tableDataManager.handlePrimaryKeyConflict(
+                              table, pkVal);
 
-                        // CRITICAL: Also consider records already processed in the current flush batch
-                        // (but not yet in WriteBufferManager) to ensure the corrected sequence
-                        // stays ahead of everything currently in-flight.
-                        dynamic maxInCurrentBatch;
-                        for (final r in batchRecordsForBuffer) {
-                          final val = r[primaryKey];
-                          if (val != null) {
-                            if (maxInCurrentBatch == null ||
-                                pkMatcher(val, maxInCurrentBatch) > 0) {
-                              maxInCurrentBatch = val;
-                            }
-                          }
-                        }
-                        if (maxInCurrentBatch != null) {
-                          await tableDataManager.updateMaxIdInMemory(
-                              table, maxInCurrentBatch);
-                        }
-
-                        // If this was an auto-generated PK, re-assign all subsequent auto-PKs in the batch
-                        if (isAutoPk) {
-                          final List<Map<String, dynamic>>
-                              subsequentToReassign = [];
-                          for (int k = offset + 1;
-                              k < currentRecords.length;
-                              k++) {
-                            final bool isKAutoPk = isWindowAllAutoPk ||
-                                (!isWindowAllUserPk &&
-                                    autoPkIndexSet != null &&
-                                    autoPkIndexSet.contains(k));
-                            if (isKAutoPk) {
-                              subsequentToReassign.add(currentRecords[k]);
-                            }
-                          }
-
-                          if (subsequentToReassign.isNotEmpty) {
-                            final newIds = await tableDataManager.getBatchIds(
-                                table, subsequentToReassign.length);
-                            for (int k = 0;
-                                k < subsequentToReassign.length;
-                                k++) {
-                              if (k < newIds.length) {
-                                subsequentToReassign[k][primaryKey] = newIds[k];
+                          // CRITICAL: Also consider records already processed in the current flush batch
+                          // (but not yet in WriteBufferManager) to ensure the corrected sequence
+                          // stays ahead of everything currently in-flight.
+                          dynamic maxInCurrentBatch;
+                          for (final r in batchRecordsForBuffer) {
+                            final val = r[primaryKey];
+                            if (val != null) {
+                              if (maxInCurrentBatch == null ||
+                                  pkMatcher(val, maxInCurrentBatch) > 0) {
+                                maxInCurrentBatch = val;
                               }
                             }
                           }
-                        } else {
-                          // For user-provided PK, remove it so retry uses next auto ID
-                          record.remove(primaryKey);
-                        }
-                      } catch (err) {
-                        Logger.warn(
-                            'Failed to auto-correct PK conflict in batch: $err',
-                            rawError: e);
-                      }
-                      record[primaryKey] = null;
-                      triedPkConflictRetry = true;
-                      continue;
-                    }
+                          if (maxInCurrentBatch != null) {
+                            await tableDataManager.updateMaxIdInMemory(
+                                table, maxInCurrentBatch);
+                          }
 
-                    invalidRecords.add(record);
-                    final failedKey = validData[primaryKey]?.toString() ?? '';
-                    if (returnResultDetails && failedKey.isNotEmpty) {
-                      failedKeys.add(failedKey);
+                          // If this was an auto-generated PK, re-assign all subsequent auto-PKs in the batch
+                          if (isAutoPk) {
+                            final List<Map<String, dynamic>>
+                                subsequentToReassign = [];
+                            for (int k = offset + 1;
+                                k < currentRecords.length;
+                                k++) {
+                              final bool isKAutoPk = isWindowAllAutoPk ||
+                                  (!isWindowAllUserPk &&
+                                      autoPkIndexSet != null &&
+                                      autoPkIndexSet.contains(k));
+                              if (isKAutoPk) {
+                                subsequentToReassign.add(currentRecords[k]);
+                              }
+                            }
+
+                            if (subsequentToReassign.isNotEmpty) {
+                              final newIds = await tableDataManager.getBatchIds(
+                                  table, subsequentToReassign.length);
+                              for (int k = 0;
+                                  k < subsequentToReassign.length;
+                                  k++) {
+                                if (k < newIds.length) {
+                                  subsequentToReassign[k][primaryKey] =
+                                      newIds[k];
+                                }
+                              }
+                            }
+                          } else {
+                            // For user-provided PK, remove it so retry uses next auto ID
+                            record.remove(primaryKey);
+                          }
+                        } catch (err) {
+                          Logger.warn(
+                              'Failed to auto-correct PK conflict in batch: $err',
+                              rawError: e);
+                        }
+                        record[primaryKey] = null;
+                        triedPkConflictRetry = true;
+                        continue;
+                      }
+
+                      invalidRecords.add(record);
+                      final failedKey = validData[primaryKey]?.toString() ?? '';
+                      if (returnResultDetails && failedKey.isNotEmpty) {
+                        failedKeys.add(failedKey);
+                      }
+                      failedCount++;
+                      if (!allowPartialErrors) {
+                        // Flush pending successful records to avoid leaving reservations behind.
+                        await flushBatch();
+                        return finishWithPromoteMirror(DbResult.error(
+                          type: e.constraintResultType,
+                          message: e.message,
+                          failedKeys:
+                              returnResultDetails ? failedKeys : const [],
+                        ));
+                      }
+                      finishedRecord = true;
+                      break;
                     }
-                    failedCount++;
-                    if (!allowPartialErrors) {
-                      // Flush pending successful records to avoid leaving reservations behind.
-                      await flushBatch();
-                      return finishWithPromoteMirror(DbResult.error(
-                        type: e.constraintResultType,
-                        message: e.message,
-                        failedKeys: returnResultDetails ? failedKeys : const [],
-                      ));
-                    }
-                    finishedRecord = true;
-                    break;
+                    rethrow;
                   }
-                  rethrow;
                 }
 
                 try {
@@ -4858,6 +4882,11 @@ class DataStoreImpl {
       ));
     } finally {
       parallelJournalManager.endBatchOperation();
+      if (deferQueryCacheInvalidation && tableForRelease != null) {
+        try {
+          queryExecutor.invalidateQueryCacheForTable(tableForRelease);
+        } catch (_) {}
+      }
       // Early returns (!allowPartialErrors) skip catch -- still release orphans.
       // Successes already committed bookkeeping -> release is a no-op for them.
       if (tableForRelease != null && reservedNotBuffered.isNotEmpty) {

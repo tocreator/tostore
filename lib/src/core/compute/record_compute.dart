@@ -30,6 +30,10 @@ Map<String, dynamic>? validateAndProcessRecordPure({
   /// When non-null, skips the per-record length/range constraint scan.
   /// Pass the chunk-level result from the caller for batchInsert prepare.
   bool? schemaNeedsConstraintPass,
+
+  /// When true, mutate [data] in place instead of allocating a result map.
+  /// Safe when the caller owns the record map (batchInsert hot path).
+  bool mutateInPlace = false,
 }) {
   try {
     final primaryKey = schema.primaryKey;
@@ -70,7 +74,7 @@ Map<String, dynamic>? validateAndProcessRecordPure({
       needsConstraintPass = needs;
     }
 
-    final result = <String, dynamic>{};
+    final result = mutateInPlace ? data : <String, dynamic>{};
     final errors = validationErrors;
 
     // 1. Primary key handling.
@@ -106,11 +110,11 @@ Map<String, dynamic>? validateAndProcessRecordPure({
 
       // Auto-generated PKs are already strings from the ID pool -- avoid
       // convertPrimaryKey overhead on the batchInsert hot path.
-      if (skipPrimaryKeyFormatCheck && providedId is String) {
-        result[primaryKey] = providedId;
-      } else {
+      if (!(skipPrimaryKeyFormatCheck && providedId is String)) {
         result[primaryKey] = schema.primaryKeyConfig
             .convertPrimaryKey(providedId, tableName: tableName);
+      } else if (!mutateInPlace) {
+        result[primaryKey] = providedId;
       }
     }
 
@@ -158,7 +162,11 @@ Map<String, dynamic>? validateAndProcessRecordPure({
       }
 
       final converted = field.convertValue(value);
-      result[field.name] = converted;
+      if (mutateInPlace) {
+        data[field.name] = converted;
+      } else {
+        result[field.name] = converted;
+      }
 
       if (converted == null && !field.nullable) {
         final msg =
