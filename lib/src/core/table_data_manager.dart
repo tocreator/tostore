@@ -3571,18 +3571,22 @@ class TableDataManager {
       return out;
     }
 
-    final pendingRows = await scanBufferSource(
-      forEach: ({startPk, endPk, reverse = false, limit, required onEntry}) {
-        return trees.forEachPendingRecord(
-          table,
-          startPk: startPk,
-          endPk: endPk,
-          reverse: reverse,
-          limit: limit,
-          onEntry: onEntry,
-        );
-      },
-    );
+    final hasPending = trees.hasPendingWritesForUid(table.tableUid);
+    final pendingRows = hasPending
+        ? await scanBufferSource(
+            forEach: (
+                {startPk, endPk, reverse = false, limit, required onEntry}) {
+              return trees.forEachPendingRecord(
+                table,
+                startPk: startPk,
+                endPk: endPk,
+                reverse: reverse,
+                limit: limit,
+                onEntry: onEntry,
+              );
+            },
+          )
+        : const <Map<String, dynamic>>[];
 
     List<Map<String, dynamic>> txnRows = const [];
     if (useTxn) {

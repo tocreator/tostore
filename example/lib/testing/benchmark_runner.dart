@@ -264,8 +264,7 @@ class BenchmarkRunner {
 
       case BenchmarkOperation.rangeScanHot:
         await _ensureTablePopulated(tableName, tier, scale);
-        final hotQueryRounds = math.max(500, math.min(scale ~/ 10, 10000));
-        effectiveCount = hotQueryRounds;
+        effectiveCount = scale;
 
         // Pre-warm the fixed range into memory cache
         if (tier == BenchmarkTier.simple) {
@@ -284,7 +283,7 @@ class BenchmarkRunner {
               'Running [$tierName] Range Scan (Hot Cache) ($round/$iterations)...');
 
           final sw = Stopwatch()..start();
-          for (var i = 0; i < hotQueryRounds; i++) {
+          for (var i = 0; i < effectiveCount; i++) {
             if (tier == BenchmarkTier.simple) {
               db.query(tableName).where('id', '>=', 1).limit(10).peek();
             } else {
@@ -304,9 +303,7 @@ class BenchmarkRunner {
 
       case BenchmarkOperation.rangeScanRandom:
         await _ensureTablePopulated(tableName, tier, scale);
-        // Dynamic query rounds scaling with Dataset Scale (e.g. 2000 for 10k, 10000 for 100k)
-        final queryRounds = math.max(500, math.min(scale ~/ 10, 10000));
-        effectiveCount = queryRounds;
+        effectiveCount = scale;
         final random = math.Random(777);
 
         for (var round = 1; round <= iterations; round++) {
@@ -316,16 +313,16 @@ class BenchmarkRunner {
           // Pre-generate random start keys before timing to evaluate pure database performance
           final startPoints = tier == BenchmarkTier.simple
               ? List.generate(
-                  queryRounds,
+                  effectiveCount,
                   (_) => random.nextInt(math.max(1, scale - 10)) + 1,
                 )
               : List.generate(
-                  queryRounds,
+                  effectiveCount,
                   (_) => 18 + random.nextInt(45),
                 );
 
           final sw = Stopwatch()..start();
-          for (var i = 0; i < queryRounds; i++) {
+          for (var i = 0; i < effectiveCount; i++) {
             final startVal = startPoints[i];
             if (tier == BenchmarkTier.simple) {
               await db.query(tableName).where('id', '>=', startVal).limit(10);

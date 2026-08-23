@@ -1953,6 +1953,12 @@ final class _Group<T> {
   /// Delta removed path list for fast bisection removal.
   final List<List<dynamic>> _deltaPathsRemovedList = <List<dynamic>>[];
 
+  /// Schedule async compaction once |Δ|+|tombstones| exceeds this (never on put/scan hot path).
+  static const int _deltaConsolidateThreshold = 2048;
+
+  bool _flatConsolidateScheduled = false;
+  bool _pathsConsolidateScheduled = false;
+
   bool dirty = true;
 
   /// When true, prefer [orderedPaths] (deep or exact present / mixed).
@@ -2040,6 +2046,225 @@ final class _Group<T> {
     return al < bl ? -1 : 1;
   }
 
+  // ---- Delta maintenance helpers (LSM-style sorted micro-buffers) ----
+
+  void _maybeScheduleFlatConsolidate() {
+    if (_flatConsolidateScheduled) return;
+    if (orderedFlat == null) return;
+    if (_deltaFlatAdded.isEmpty && _deltaFlatRemoved.isEmpty) return;
+    if (_deltaFlatAdded.length + _deltaFlatRemoved.length <=
+        _deltaConsolidateThreshold) {
+      return;
+    }
+    _flatConsolidateScheduled = true;
+    scheduleMicrotask(() {
+      _flatConsolidateScheduled = false;
+      if (orderedFlat != null) {
+        _consolidateFlatDeltas();
+      }
+    });
+  }
+
+  void _maybeSchedulePathsConsolidate() {
+    if (_pathsConsolidateScheduled) return;
+    if (orderedPaths == null) return;
+    if (_deltaPathsAdded.isEmpty && _deltaPathsRemoved.isEmpty) return;
+    if (_deltaPathsAdded.length + _deltaPathsRemoved.length <=
+        _deltaConsolidateThreshold) {
+      return;
+    }
+    _pathsConsolidateScheduled = true;
+    scheduleMicrotask(() {
+      _pathsConsolidateScheduled = false;
+      if (orderedPaths != null) {
+        _consolidatePathsDeltas();
+      }
+    });
+  }
+
+  void _insertDeltaFlat(Object? suffix) {
+    if (_deltaFlatRemoved.isNotEmpty) {
+      _deltaFlatRemoved.remove(suffix);
+    }
+    final a = _deltaFlatAdded;
+    final cmp = _suffixComparator(0);
+
+    // Fast-path: sequential / monotonic append (e.g. auto-increment PKs / timestamps)
+    if (a.isNotEmpty) {
+      final cLast = cmp(a.last, suffix);
+      if (cLast < 0) {
+        a.add(suffix);
+        _maybeScheduleFlatConsolidate();
+        return;
+      } else if (cLast == 0) {
+        return;
+      }
+    }
+
+    var lo = 0;
+    var hi = a.length;
+    while (lo < hi) {
+      final mid = (lo + hi) >> 1;
+      final c = cmp(a[mid], suffix);
+      if (c < 0) {
+        lo = mid + 1;
+      } else if (c == 0) {
+        return;
+      } else {
+        hi = mid;
+      }
+    }
+    a.insert(lo, suffix);
+    _maybeScheduleFlatConsolidate();
+  }
+
+  void _removeDeltaFlat(Object? suffix) {
+    final a = _deltaFlatAdded;
+    if (a.isNotEmpty) {
+      final cmp = _suffixComparator(0);
+      var lo = 0;
+      var hi = a.length;
+      while (lo < hi) {
+        final mid = (lo + hi) >> 1;
+        final c = cmp(a[mid], suffix);
+        if (c < 0) {
+          lo = mid + 1;
+        } else if (c == 0) {
+          a.removeAt(mid);
+          break;
+        } else {
+          hi = mid;
+        }
+      }
+    }
+    if (orderedFlat != null) {
+      _deltaFlatRemoved.add(suffix);
+      _maybeScheduleFlatConsolidate();
+    }
+  }
+
+  int _lowerBoundDeltaFlat(Object? key) {
+    final a = _deltaFlatAdded;
+    final cmp = _suffixComparator(0);
+    var lo = 0;
+    var hi = a.length;
+    while (lo < hi) {
+      final mid = (lo + hi) >> 1;
+      if (cmp(a[mid], key) < 0) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo;
+  }
+
+  int _upperBoundDeltaFlat(Object? key) {
+    final a = _deltaFlatAdded;
+    final cmp = _suffixComparator(0);
+    var lo = 0;
+    var hi = a.length;
+    while (lo < hi) {
+      final mid = (lo + hi) >> 1;
+      if (cmp(a[mid], key) <= 0) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo;
+  }
+
+  void _insertDeltaPaths(List<dynamic> path) {
+    if (_deltaPathsRemoved.isNotEmpty) {
+      final sig = _pathSignature(path);
+      _deltaPathsRemoved.remove(sig);
+    }
+    final a = _deltaPathsAdded;
+
+    // Fast-path: monotonic path append
+    if (a.isNotEmpty) {
+      final cLast = comparePaths(a.last, path);
+      if (cLast < 0) {
+        a.add(path);
+        _maybeSchedulePathsConsolidate();
+        return;
+      } else if (cLast == 0) {
+        return;
+      }
+    }
+
+    var lo = 0;
+    var hi = a.length;
+    while (lo < hi) {
+      final mid = (lo + hi) >> 1;
+      final c = comparePaths(a[mid], path);
+      if (c < 0) {
+        lo = mid + 1;
+      } else if (c == 0) {
+        return;
+      } else {
+        hi = mid;
+      }
+    }
+    a.insert(lo, path);
+    _maybeSchedulePathsConsolidate();
+  }
+
+  void _removeDeltaPaths(List<dynamic> path) {
+    final a = _deltaPathsAdded;
+    if (a.isNotEmpty) {
+      var lo = 0;
+      var hi = a.length;
+      while (lo < hi) {
+        final mid = (lo + hi) >> 1;
+        final c = comparePaths(a[mid], path);
+        if (c < 0) {
+          lo = mid + 1;
+        } else if (c == 0) {
+          a.removeAt(mid);
+          break;
+        } else {
+          hi = mid;
+        }
+      }
+    }
+    if (orderedPaths != null) {
+      _deltaPathsRemoved.add(_pathSignature(path));
+      _maybeSchedulePathsConsolidate();
+    }
+  }
+
+  int _lowerBoundDeltaPaths(List<dynamic> key) {
+    final a = _deltaPathsAdded;
+    var lo = 0;
+    var hi = a.length;
+    while (lo < hi) {
+      final mid = (lo + hi) >> 1;
+      if (comparePaths(a[mid], key) < 0) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo;
+  }
+
+  int _upperBoundDeltaPaths(List<dynamic> key) {
+    final a = _deltaPathsAdded;
+    var lo = 0;
+    var hi = a.length;
+    while (lo < hi) {
+      final mid = (lo + hi) >> 1;
+      if (comparePaths(a[mid], key) <= 0) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo;
+  }
+
   // ---- order list ----
 
   /// After [TreeCache.renameGroup], rewrite group component on order keys.
@@ -2051,6 +2276,9 @@ final class _Group<T> {
         for (final p in paths) {
           if (p.isNotEmpty) p[0] = newGroupKey;
         }
+      }
+      for (final p in _deltaPathsAdded) {
+        if (p.isNotEmpty) p[0] = newGroupKey;
       }
       return;
     }
@@ -2064,6 +2292,9 @@ final class _Group<T> {
       for (final p in paths) {
         if (p.isNotEmpty) p[0] = newGroupKey;
       }
+    }
+    for (final p in _deltaPathsAdded) {
+      if (p.isNotEmpty) p[0] = newGroupKey;
     }
   }
 
@@ -2357,10 +2588,11 @@ final class _Group<T> {
     _orderedNeedsPaths = true;
     if (!was) {
       entryCount++;
-      dirty = true;
+      if (orderedPaths != null) {
+        _insertDeltaPaths(List<dynamic>.from(groupPath));
+      }
       return true;
     }
-    dirty = true;
     return false;
   }
 
@@ -2369,7 +2601,9 @@ final class _Group<T> {
     exact = null;
     _hasExact = false;
     entryCount--;
-    dirty = true;
+    if (orderedPaths != null) {
+      _removeDeltaPaths(List<dynamic>.from(groupPath));
+    }
     return true;
   }
 
@@ -2379,8 +2613,12 @@ final class _Group<T> {
     exact = value;
     _hasExact = true;
     _orderedNeedsPaths = true;
-    dirty = true;
-    if (!was) entryCount++;
+    if (!was) {
+      entryCount++;
+      if (orderedPaths != null) {
+        _insertDeltaPaths(List<dynamic>.from(groupPath));
+      }
+    }
     if (orderEnabled) {
       _noteExactOrder(key, sizeBytes <= 0 ? 1 : sizeBytes, isNew: !was);
     }
@@ -2392,7 +2630,9 @@ final class _Group<T> {
     exact = null;
     _hasExact = false;
     entryCount--;
-    dirty = true;
+    if (orderedPaths != null) {
+      _removeDeltaPaths(List<dynamic>.from(groupPath));
+    }
     _removeExactOrder();
     return true;
   }
@@ -2404,12 +2644,8 @@ final class _Group<T> {
     flat[suffix] = value;
     if (flat.length == before) return false;
     entryCount++;
-    if (orderedFlat != null && !dirty) {
-      if (!_deltaFlatRemoved.remove(suffix)) {
-        _deltaFlatAdded.add(suffix);
-      }
-    } else {
-      dirty = true;
+    if (orderedFlat != null) {
+      _insertDeltaFlat(suffix);
     }
     return true;
   }
@@ -2418,10 +2654,8 @@ final class _Group<T> {
   bool removeFlatNone(Object? suffix) {
     if (flat.remove(suffix) == null) return false;
     entryCount--;
-    if (orderedFlat != null && !dirty) {
-      _deltaFlatRemoved.add(suffix);
-    } else {
-      dirty = true;
+    if (orderedFlat != null) {
+      _removeDeltaFlat(suffix);
     }
     return true;
   }
@@ -2461,16 +2695,11 @@ final class _Group<T> {
     leaf[s1] = value;
     if (leaf.length == before) return false;
     entryCount++;
-    if (orderedPaths != null && !dirty) {
-      final sig = '$s0\x00$s1';
-      if (!_deltaPathsRemoved.remove(sig)) {
-        final path = List<dynamic>.from(groupPath)
-          ..add(s0)
-          ..add(s1);
-        _deltaPathsAdded.add(path);
-      }
-    } else {
-      dirty = true;
+    if (orderedPaths != null) {
+      final path = List<dynamic>.from(groupPath)
+        ..add(s0)
+        ..add(s1);
+      _insertDeltaPaths(path);
     }
     return true;
   }
@@ -2483,17 +2712,11 @@ final class _Group<T> {
     if (inner is! Map<Object?, dynamic>) return false;
     if (inner.remove(s1) == null) return false;
     entryCount--;
-    if (orderedPaths != null && !dirty) {
-      final sig = '$s0\x00$s1';
-      _deltaPathsRemoved.add(sig);
-      if (_deltaPathsRemovedList.length < 32) {
-        final path = List<dynamic>.from(groupPath)
-          ..add(s0)
-          ..add(s1);
-        _deltaPathsRemovedList.add(path);
-      }
-    } else {
-      dirty = true;
+    if (orderedPaths != null) {
+      final path = List<dynamic>.from(groupPath)
+        ..add(s0)
+        ..add(s1);
+      _removeDeltaPaths(path);
     }
     if (inner.isEmpty) {
       d.remove(s0);
@@ -2525,12 +2748,8 @@ final class _Group<T> {
     attachNew(order);
     totalBytes += sz;
     entryCount++;
-    if (orderedFlat != null && !dirty) {
-      if (!_deltaFlatRemoved.remove(suffix)) {
-        _deltaFlatAdded.add(suffix);
-      }
-    } else {
-      dirty = true;
+    if (orderedFlat != null) {
+      _insertDeltaFlat(suffix);
     }
     return true;
   }
@@ -2546,10 +2765,8 @@ final class _Group<T> {
     totalBytes -= live.order.sizeBytes;
     if (totalBytes < 0) totalBytes = 0;
     detachNode(live.order);
-    if (orderedFlat != null && !dirty) {
-      _deltaFlatRemoved.add(suffix);
-    } else {
-      dirty = true;
+    if (orderedFlat != null) {
+      _removeDeltaFlat(suffix);
     }
     return true;
   }
@@ -2602,16 +2819,11 @@ final class _Group<T> {
     final isNew = leaf.length > before;
     if (isNew) {
       entryCount++;
-      if (orderedPaths != null && !dirty) {
-        final sig = '$s0\x00$s1';
-        if (!_deltaPathsRemoved.remove(sig)) {
-          final path = List<dynamic>.from(groupPath)
-            ..add(s0)
-            ..add(s1);
-          _deltaPathsAdded.add(path);
-        }
-      } else {
-        dirty = true;
+      if (orderedPaths != null) {
+        final path = List<dynamic>.from(groupPath)
+          ..add(s0)
+          ..add(s1);
+        _insertDeltaPaths(path);
       }
     }
     _noteDeep2Order(s0, s1, sizeBytes <= 0 ? 1 : sizeBytes, isNew: isNew);
@@ -2629,17 +2841,11 @@ final class _Group<T> {
     if (inner is! Map<Object?, dynamic>) return false;
     if (inner.remove(s1) == null) return false;
     entryCount--;
-    if (orderedPaths != null && !dirty) {
-      final sig = '$s0\x00$s1';
-      _deltaPathsRemoved.add(sig);
-      if (_deltaPathsRemovedList.length < 32) {
-        final path = List<dynamic>.from(groupPath)
-          ..add(s0)
-          ..add(s1);
-        _deltaPathsRemovedList.add(path);
-      }
-    } else {
-      dirty = true;
+    if (orderedPaths != null) {
+      final path = List<dynamic>.from(groupPath)
+        ..add(s0)
+        ..add(s1);
+      _removeDeltaPaths(path);
     }
     _removeDeep2Order(s0, s1);
     if (inner.isEmpty) {
@@ -2773,8 +2979,12 @@ final class _Group<T> {
     final last = key[len - 1];
     final existed = map!.containsKey(last) && map[last] is! Map;
     map[last] = value;
-    dirty = true;
-    if (!existed) entryCount++;
+    if (!existed) {
+      entryCount++;
+      if (orderedPaths != null) {
+        _insertDeltaPaths(List<dynamic>.from(key));
+      }
+    }
     if (orderEnabled) {
       _noteDeepPathOrder(key, sz, isNew: !existed);
     }
@@ -2814,7 +3024,9 @@ final class _Group<T> {
     if (!map.containsKey(last) || map[last] is Map) return false;
     map.remove(last);
     entryCount--;
-    dirty = true;
+    if (orderedPaths != null) {
+      _removeDeltaPaths(List<dynamic>.from(key));
+    }
     _removeDeepPathOrder(key);
     for (int i = stack.length - 1; i >= 0; i--) {
       final m = (i == stack.length - 1) ? map : stack[i + 1];
@@ -2827,10 +3039,115 @@ final class _Group<T> {
 
   // ---- ordered / range ----
 
+  void _consolidateFlatDeltas() {
+    if (_deltaFlatAdded.isEmpty && _deltaFlatRemoved.isEmpty) return;
+    if (orderedFlat == null) {
+      ensureOrdered();
+      return;
+    }
+    final oldBase = orderedFlat!;
+    final cmp = _suffixComparator(0);
+    final n = oldBase.length;
+    final m = _deltaFlatAdded.length;
+    final newCap = n + m;
+    final merged =
+        List<Object?>.filled(newCap > 0 ? newCap : 0, null, growable: true);
+    var i = 0, j = 0, k = 0;
+    while (i < n && j < m) {
+      final bk = oldBase[i];
+      if (_deltaFlatRemoved.contains(bk)) {
+        i++;
+        continue;
+      }
+      final dk = _deltaFlatAdded[j];
+      final c = cmp(bk, dk);
+      if (c < 0) {
+        merged[k++] = bk;
+        i++;
+      } else if (c > 0) {
+        merged[k++] = dk;
+        j++;
+      } else {
+        merged[k++] = dk;
+        i++;
+        j++;
+      }
+    }
+    while (i < n) {
+      final bk = oldBase[i++];
+      if (!_deltaFlatRemoved.contains(bk)) {
+        merged[k++] = bk;
+      }
+    }
+    while (j < m) {
+      merged[k++] = _deltaFlatAdded[j++];
+    }
+    if (k < merged.length) {
+      merged.length = k;
+    }
+    orderedFlat = merged;
+    _deltaFlatAdded.clear();
+    _deltaFlatRemoved.clear();
+  }
+
+  void _consolidatePathsDeltas() {
+    if (_deltaPathsAdded.isEmpty && _deltaPathsRemoved.isEmpty) return;
+    if (orderedPaths == null) {
+      ensureOrdered();
+      return;
+    }
+    final oldBase = orderedPaths!;
+    final n = oldBase.length;
+    final m = _deltaPathsAdded.length;
+    final newCap = n + m;
+    final merged = List<List<dynamic>>.filled(
+      newCap > 0 ? newCap : 0,
+      const <dynamic>[],
+      growable: true,
+    );
+    var i = 0, j = 0, k = 0;
+    while (i < n && j < m) {
+      final bp = oldBase[i];
+      if (_deltaPathsRemoved.contains(_pathSignature(bp))) {
+        i++;
+        continue;
+      }
+      final dp = _deltaPathsAdded[j];
+      final c = comparePaths(bp, dp);
+      if (c < 0) {
+        merged[k++] = bp;
+        i++;
+      } else if (c > 0) {
+        merged[k++] = dp;
+        j++;
+      } else {
+        merged[k++] = dp;
+        i++;
+        j++;
+      }
+    }
+    while (i < n) {
+      final bp = oldBase[i++];
+      if (!_deltaPathsRemoved.contains(_pathSignature(bp))) {
+        merged[k++] = bp;
+      }
+    }
+    while (j < m) {
+      merged[k++] = _deltaPathsAdded[j++];
+    }
+    if (k < merged.length) {
+      merged.length = k;
+    }
+    orderedPaths = merged;
+    _deltaPathsAdded.clear();
+    _deltaPathsRemoved.clear();
+    _deltaPathsRemovedList.clear();
+  }
+
   void ensureOrdered() {
     final usePaths = _orderedNeedsPaths || _hasExact || deep != null;
     if (!usePaths) {
-      if (orderedFlat == null || dirty) {
+      if (orderedFlat == null) {
         final Iterable<Object?> keyIter =
             orderEnabled ? (flatLive?.keys ?? const <Object?>[]) : flat.keys;
         final keys = keyIter.toList(growable: true);
@@ -2842,181 +3159,12 @@ final class _Group<T> {
         dirty = false;
         return;
       }
-
-      if (_deltaFlatAdded.isEmpty && _deltaFlatRemoved.isEmpty) {
-        return;
-      }
-
-      final cmp = _suffixComparator(0);
-
-      // Fast bisection insert for small addition-only batches
-      if (_deltaFlatRemoved.isEmpty && _deltaFlatAdded.length <= 16) {
-        for (final k in _deltaFlatAdded) {
-          final idx = _lowerBoundFlat(k);
-          if (idx < orderedFlat!.length && cmp(orderedFlat![idx], k) == 0) {
-            continue;
-          }
-          orderedFlat!.insert(idx, k);
-        }
-        _deltaFlatAdded.clear();
-        return;
-      }
-
-      // Fast bisection remove for small deletion-only batches
-      if (_deltaFlatAdded.isEmpty && _deltaFlatRemoved.length <= 16) {
-        for (final k in _deltaFlatRemoved) {
-          final idx = _lowerBoundFlat(k);
-          if (idx < orderedFlat!.length && cmp(orderedFlat![idx], k) == 0) {
-            orderedFlat!.removeAt(idx);
-          }
-        }
-        _deltaFlatRemoved.clear();
-        return;
-      }
-
-      if (_deltaFlatAdded.isNotEmpty) {
-        _deltaFlatAdded.sort(cmp);
-        // Deduplicate _deltaFlatAdded if consecutive duplicates exist
-        var uniqueCount = 1;
-        for (var d = 1; d < _deltaFlatAdded.length; d++) {
-          if (cmp(_deltaFlatAdded[d], _deltaFlatAdded[uniqueCount - 1]) != 0) {
-            _deltaFlatAdded[uniqueCount++] = _deltaFlatAdded[d];
-          }
-        }
-        if (uniqueCount < _deltaFlatAdded.length) {
-          _deltaFlatAdded.length = uniqueCount;
-        }
-      }
-
-      final oldBase = orderedFlat!;
-      final newCap =
-          oldBase.length + _deltaFlatAdded.length - _deltaFlatRemoved.length;
-      final merged =
-          List<Object?>.filled(newCap > 0 ? newCap : 0, null, growable: true);
-
-      var i = 0, j = 0, k = 0;
-      final n = oldBase.length;
-      final m = _deltaFlatAdded.length;
-
-      if (_deltaFlatRemoved.isEmpty) {
-        while (i < n && j < m) {
-          final oldKey = oldBase[i];
-          final newKey = _deltaFlatAdded[j];
-          final c = cmp(oldKey, newKey);
-          if (c < 0) {
-            if (k < merged.length) {
-              merged[k++] = oldKey;
-            } else {
-              merged.add(oldKey);
-            }
-            i++;
-          } else if (c > 0) {
-            if (k < merged.length) {
-              merged[k++] = newKey;
-            } else {
-              merged.add(newKey);
-            }
-            j++;
-          } else {
-            if (k < merged.length) {
-              merged[k++] = oldKey;
-            } else {
-              merged.add(oldKey);
-            }
-            i++;
-            j++;
-          }
-        }
-        if (i < n) {
-          final count = n - i;
-          if (k + count <= merged.length) {
-            merged.setRange(k, k + count, oldBase, i);
-            k += count;
-          } else {
-            while (i < n) {
-              merged.add(oldBase[i++]);
-            }
-            k = merged.length;
-          }
-        }
-        if (j < m) {
-          final count = m - j;
-          if (k + count <= merged.length) {
-            merged.setRange(k, k + count, _deltaFlatAdded, j);
-            k += count;
-          } else {
-            while (j < m) {
-              merged.add(_deltaFlatAdded[j++]);
-            }
-            k = merged.length;
-          }
-        }
-      } else {
-        while (i < n && j < m) {
-          final oldKey = oldBase[i];
-          if (_deltaFlatRemoved.contains(oldKey)) {
-            i++;
-            continue;
-          }
-          final newKey = _deltaFlatAdded[j];
-          final c = cmp(oldKey, newKey);
-          if (c < 0) {
-            if (k < merged.length) {
-              merged[k++] = oldKey;
-            } else {
-              merged.add(oldKey);
-            }
-            i++;
-          } else if (c > 0) {
-            if (k < merged.length) {
-              merged[k++] = newKey;
-            } else {
-              merged.add(newKey);
-            }
-            j++;
-          } else {
-            if (k < merged.length) {
-              merged[k++] = oldKey;
-            } else {
-              merged.add(oldKey);
-            }
-            i++;
-            j++;
-          }
-        }
-
-        while (i < n) {
-          final oldKey = oldBase[i++];
-          if (!_deltaFlatRemoved.contains(oldKey)) {
-            if (k < merged.length) {
-              merged[k++] = oldKey;
-            } else {
-              merged.add(oldKey);
-            }
-          }
-        }
-
-        while (j < m) {
-          final newKey = _deltaFlatAdded[j++];
-          if (k < merged.length) {
-            merged[k++] = newKey;
-          } else {
-            merged.add(newKey);
-          }
-        }
-      }
-
-      if (k < merged.length) {
-        merged.length = k;
-      }
-
-      orderedFlat = merged;
-      _deltaFlatAdded.clear();
-      _deltaFlatRemoved.clear();
+      _consolidateFlatDeltas();
+      dirty = false;
       return;
     }
 
-    if (orderedPaths == null || dirty) {
+    if (orderedPaths == null) {
       final paths = <List<dynamic>>[];
       if (_hasExact) {
         paths.add(List<dynamic>.from(groupPath));
@@ -3047,184 +3195,9 @@ final class _Group<T> {
       _orderedNeedsPaths = usePaths;
       return;
     }
-
-    if (_deltaPathsAdded.isEmpty && _deltaPathsRemoved.isEmpty) {
-      return;
-    }
-
-    // Fast bisection insert for small addition-only batches
-    if (_deltaPathsRemoved.isEmpty && _deltaPathsAdded.length <= 16) {
-      for (final p in _deltaPathsAdded) {
-        final idx = _lowerBoundPaths(p);
-        if (idx < orderedPaths!.length &&
-            comparePaths(orderedPaths![idx], p) == 0) {
-          continue;
-        }
-        orderedPaths!.insert(idx, p);
-      }
-      _deltaPathsAdded.clear();
-      return;
-    }
-
-    // Fast bisection remove for small deletion-only batches
-    if (_deltaPathsAdded.isEmpty &&
-        _deltaPathsRemoved.length <= 16 &&
-        _deltaPathsRemovedList.length == _deltaPathsRemoved.length) {
-      for (final p in _deltaPathsRemovedList) {
-        final idx = _lowerBoundPaths(p);
-        if (idx < orderedPaths!.length &&
-            comparePaths(orderedPaths![idx], p) == 0) {
-          orderedPaths!.removeAt(idx);
-        }
-      }
-      _deltaPathsRemoved.clear();
-      _deltaPathsRemovedList.clear();
-      return;
-    }
-
-    if (_deltaPathsAdded.isNotEmpty) {
-      _deltaPathsAdded.sort(comparePaths);
-      var uniqueCount = 1;
-      for (var d = 1; d < _deltaPathsAdded.length; d++) {
-        if (comparePaths(
-                _deltaPathsAdded[d], _deltaPathsAdded[uniqueCount - 1]) !=
-            0) {
-          _deltaPathsAdded[uniqueCount++] = _deltaPathsAdded[d];
-        }
-      }
-      if (uniqueCount < _deltaPathsAdded.length) {
-        _deltaPathsAdded.length = uniqueCount;
-      }
-    }
-
-    final oldBase = orderedPaths!;
-    final newCap =
-        oldBase.length + _deltaPathsAdded.length - _deltaPathsRemoved.length;
-    final merged = List<List<dynamic>>.filled(
-        newCap > 0 ? newCap : 0, const <dynamic>[],
-        growable: true);
-
-    var i = 0, j = 0, k = 0;
-    final n = oldBase.length;
-    final m = _deltaPathsAdded.length;
-
-    if (_deltaPathsRemoved.isEmpty) {
-      while (i < n && j < m) {
-        final oldPath = oldBase[i];
-        final newPath = _deltaPathsAdded[j];
-        final c = comparePaths(oldPath, newPath);
-        if (c < 0) {
-          if (k < merged.length) {
-            merged[k++] = oldPath;
-          } else {
-            merged.add(oldPath);
-          }
-          i++;
-        } else if (c > 0) {
-          if (k < merged.length) {
-            merged[k++] = newPath;
-          } else {
-            merged.add(newPath);
-          }
-          j++;
-        } else {
-          if (k < merged.length) {
-            merged[k++] = oldPath;
-          } else {
-            merged.add(oldPath);
-          }
-          i++;
-          j++;
-        }
-      }
-      if (i < n) {
-        final count = n - i;
-        if (k + count <= merged.length) {
-          merged.setRange(k, k + count, oldBase, i);
-          k += count;
-        } else {
-          while (i < n) {
-            merged.add(oldBase[i++]);
-          }
-          k = merged.length;
-        }
-      }
-      if (j < m) {
-        final count = m - j;
-        if (k + count <= merged.length) {
-          merged.setRange(k, k + count, _deltaPathsAdded, j);
-          k += count;
-        } else {
-          while (j < m) {
-            merged.add(_deltaPathsAdded[j++]);
-          }
-          k = merged.length;
-        }
-      }
-    } else {
-      while (i < n && j < m) {
-        final oldPath = oldBase[i];
-        final oldSig = _pathSignature(oldPath);
-        if (_deltaPathsRemoved.contains(oldSig)) {
-          i++;
-          continue;
-        }
-        final newPath = _deltaPathsAdded[j];
-        final c = comparePaths(oldPath, newPath);
-        if (c < 0) {
-          if (k < merged.length) {
-            merged[k++] = oldPath;
-          } else {
-            merged.add(oldPath);
-          }
-          i++;
-        } else if (c > 0) {
-          if (k < merged.length) {
-            merged[k++] = newPath;
-          } else {
-            merged.add(newPath);
-          }
-          j++;
-        } else {
-          if (k < merged.length) {
-            merged[k++] = oldPath;
-          } else {
-            merged.add(oldPath);
-          }
-          i++;
-          j++;
-        }
-      }
-
-      while (i < n) {
-        final oldPath = oldBase[i++];
-        final oldSig = _pathSignature(oldPath);
-        if (!_deltaPathsRemoved.contains(oldSig)) {
-          if (k < merged.length) {
-            merged[k++] = oldPath;
-          } else {
-            merged.add(oldPath);
-          }
-        }
-      }
-
-      while (j < m) {
-        final newPath = _deltaPathsAdded[j++];
-        if (k < merged.length) {
-          merged[k++] = newPath;
-        } else {
-          merged.add(newPath);
-        }
-      }
-    }
-
-    if (k < merged.length) {
-      merged.length = k;
-    }
-
-    orderedPaths = merged;
-    _deltaPathsAdded.clear();
-    _deltaPathsRemoved.clear();
+    _consolidatePathsDeltas();
+    dirty = false;
+    _orderedNeedsPaths = usePaths;
   }
 
   void _collectDeepPaths(
@@ -3243,6 +3216,260 @@ final class _Group<T> {
     }
   }
 
+  /// Two-way merge scan for single-suffix groups (O(limit) early-stop).
+  int _scanRangeTwoWayFlat(
+    List<dynamic> start,
+    List<dynamic>? end, {
+    required bool reverse,
+    int? limit,
+    required bool Function(List<dynamic> path, T value) onEntry,
+  }) {
+    if (orderedFlat == null) {
+      ensureOrdered();
+    }
+    final base = orderedFlat!;
+    final delta = _deltaFlatAdded;
+    final removed = _deltaFlatRemoved;
+    final n = base.length;
+    final m = delta.length;
+
+    if (n == 0 && m == 0) return 0;
+
+    final Object? startSuffix =
+        start.length > groupDepth ? start[groupDepth] : null;
+    final Object? endSuffix =
+        (end != null && end.length > groupDepth && _prefixMatchesGroup(end))
+            ? end[groupDepth]
+            : null;
+
+    final cmp = _suffixComparator(0);
+    final path = List<dynamic>.from(groupPath)..add(null);
+    var emitted = 0;
+    var remaining = limit;
+
+    if (!reverse) {
+      var i = startSuffix == null ? 0 : _lowerBoundFlat(startSuffix);
+      var j = startSuffix == null ? 0 : _lowerBoundDeltaFlat(startSuffix);
+
+      while ((i < n || j < m) && (remaining == null || remaining > 0)) {
+        Object? curKey;
+        T? curVal;
+
+        if (i < n && j < m) {
+          final bk = base[i];
+          final dk = delta[j];
+          final c = cmp(bk, dk);
+          if (c < 0) {
+            i++;
+            if (removed.contains(bk)) continue;
+            curKey = bk;
+            curVal = getFlat(bk, touch: false);
+          } else if (c > 0) {
+            j++;
+            curKey = dk;
+            curVal = getFlat(dk, touch: false);
+          } else {
+            i++;
+            j++;
+            curKey = dk;
+            curVal = getFlat(dk, touch: false);
+          }
+        } else if (i < n) {
+          final bk = base[i++];
+          if (removed.contains(bk)) continue;
+          curKey = bk;
+          curVal = getFlat(bk, touch: false);
+        } else {
+          final dk = delta[j++];
+          curKey = dk;
+          curVal = getFlat(dk, touch: false);
+        }
+
+        if (curVal == null) continue;
+        if (endSuffix != null && cmp(curKey, endSuffix) > 0) break;
+
+        path[groupDepth] = curKey;
+        emitted++;
+        if (!onEntry(path, curVal)) break;
+        if (remaining != null) remaining--;
+      }
+    } else {
+      var i = endSuffix == null ? n - 1 : _upperBoundFlat(endSuffix) - 1;
+      var j = endSuffix == null ? m - 1 : _upperBoundDeltaFlat(endSuffix) - 1;
+      final loBase = startSuffix == null ? 0 : _lowerBoundFlat(startSuffix);
+      final loDelta =
+          startSuffix == null ? 0 : _lowerBoundDeltaFlat(startSuffix);
+
+      while ((i >= loBase || j >= loDelta) &&
+          (remaining == null || remaining > 0)) {
+        Object? curKey;
+        T? curVal;
+
+        if (i >= loBase && j >= loDelta) {
+          final bk = base[i];
+          final dk = delta[j];
+          final c = cmp(bk, dk);
+          if (c > 0) {
+            i--;
+            if (removed.contains(bk)) continue;
+            curKey = bk;
+            curVal = getFlat(bk, touch: false);
+          } else if (c < 0) {
+            j--;
+            curKey = dk;
+            curVal = getFlat(dk, touch: false);
+          } else {
+            i--;
+            j--;
+            curKey = dk;
+            curVal = getFlat(dk, touch: false);
+          }
+        } else if (i >= loBase) {
+          final bk = base[i--];
+          if (removed.contains(bk)) continue;
+          curKey = bk;
+          curVal = getFlat(bk, touch: false);
+        } else {
+          final dk = delta[j--];
+          curKey = dk;
+          curVal = getFlat(dk, touch: false);
+        }
+
+        if (curVal == null) continue;
+        if (startSuffix != null && cmp(curKey, startSuffix) < 0) break;
+
+        path[groupDepth] = curKey;
+        emitted++;
+        if (!onEntry(path, curVal)) break;
+        if (remaining != null) remaining--;
+      }
+    }
+
+    _maybeScheduleFlatConsolidate();
+    return emitted;
+  }
+
+  /// Two-way merge scan for multi-suffix path groups (O(limit) early-stop).
+  int _scanRangeTwoWayPaths(
+    List<dynamic> start,
+    List<dynamic>? end, {
+    required bool reverse,
+    int? limit,
+    required bool Function(List<dynamic> path, T value) onEntry,
+  }) {
+    if (orderedPaths == null) {
+      ensureOrdered();
+    }
+    final base = orderedPaths!;
+    final delta = _deltaPathsAdded;
+    final removed = _deltaPathsRemoved;
+    final n = base.length;
+    final m = delta.length;
+
+    if (n == 0 && m == 0) return 0;
+
+    var emitted = 0;
+    var remaining = limit;
+
+    if (!reverse) {
+      var i = _lowerBoundPaths(start);
+      var j = _lowerBoundDeltaPaths(start);
+
+      while ((i < n || j < m) && (remaining == null || remaining > 0)) {
+        List<dynamic>? curPath;
+        T? curVal;
+
+        if (i < n && j < m) {
+          final bp = base[i];
+          final dp = delta[j];
+          final c = comparePaths(bp, dp);
+          if (c < 0) {
+            i++;
+            if (removed.contains(_pathSignature(bp))) continue;
+            curPath = bp;
+            curVal = pointGet(bp);
+          } else if (c > 0) {
+            j++;
+            curPath = dp;
+            curVal = pointGet(dp);
+          } else {
+            i++;
+            j++;
+            curPath = dp;
+            curVal = pointGet(dp);
+          }
+        } else if (i < n) {
+          final bp = base[i++];
+          if (removed.contains(_pathSignature(bp))) continue;
+          curPath = bp;
+          curVal = pointGet(bp);
+        } else {
+          final dp = delta[j++];
+          curPath = dp;
+          curVal = pointGet(dp);
+        }
+
+        if (curVal == null) continue;
+        if (end != null && comparePaths(curPath, end) > 0) break;
+
+        emitted++;
+        if (!onEntry(curPath, curVal)) break;
+        if (remaining != null) remaining--;
+      }
+    } else {
+      var i = end == null ? n - 1 : _upperBoundPaths(end) - 1;
+      var j = end == null ? m - 1 : _upperBoundDeltaPaths(end) - 1;
+      final loBase = _lowerBoundPaths(start);
+      final loDelta = _lowerBoundDeltaPaths(start);
+
+      while ((i >= loBase || j >= loDelta) &&
+          (remaining == null || remaining > 0)) {
+        List<dynamic>? curPath;
+        T? curVal;
+
+        if (i >= loBase && j >= loDelta) {
+          final bp = base[i];
+          final dp = delta[j];
+          final c = comparePaths(bp, dp);
+          if (c > 0) {
+            i--;
+            if (removed.contains(_pathSignature(bp))) continue;
+            curPath = bp;
+            curVal = pointGet(bp);
+          } else if (c < 0) {
+            j--;
+            curPath = dp;
+            curVal = pointGet(dp);
+          } else {
+            i--;
+            j--;
+            curPath = dp;
+            curVal = pointGet(dp);
+          }
+        } else if (i >= loBase) {
+          final bp = base[i--];
+          if (removed.contains(_pathSignature(bp))) continue;
+          curPath = bp;
+          curVal = pointGet(bp);
+        } else {
+          final dp = delta[j--];
+          curPath = dp;
+          curVal = pointGet(dp);
+        }
+
+        if (curVal == null) continue;
+        if (comparePaths(curPath, start) < 0) break;
+
+        emitted++;
+        if (!onEntry(curPath, curVal)) break;
+        if (remaining != null) remaining--;
+      }
+    }
+
+    _maybeSchedulePathsConsolidate();
+    return emitted;
+  }
+
   /// Returns number of entries emitted.
   int scanRange(
     List<dynamic> start,
@@ -3251,90 +3478,23 @@ final class _Group<T> {
     int? limit,
     required bool Function(List<dynamic> path, T value) onEntry,
   }) {
-    ensureOrdered();
-    var emitted = 0;
-    var remaining = limit;
-
-    if (orderedFlat != null &&
-        !_orderedNeedsPaths &&
-        !_hasExact &&
-        deep == null) {
-      // Fast single-suffix scan.
-      final ordered = orderedFlat!;
-      if (ordered.isEmpty) return 0;
-      final Object? startSuffix =
-          start.length > groupDepth ? start[groupDepth] : null;
-      final Object? endSuffix =
-          (end != null && end.length > groupDepth && _prefixMatchesGroup(end))
-              ? end[groupDepth]
-              : null;
-
-      final path = List<dynamic>.from(groupPath)..add(null);
-
-      if (!reverse) {
-        var i = startSuffix == null ? 0 : _lowerBoundFlat(startSuffix);
-        for (; i < ordered.length; i++) {
-          if (remaining != null && remaining <= 0) break;
-          final s = ordered[i];
-          final v = getFlat(s, touch: false);
-          if (v == null) continue;
-          if (endSuffix != null && _suffixComparator(0)(s, endSuffix) > 0) {
-            break;
-          }
-          path[groupDepth] = s;
-          emitted++;
-          if (!onEntry(path, v)) break;
-          if (remaining != null) remaining--;
-        }
-      } else {
-        var i = endSuffix == null
-            ? ordered.length - 1
-            : _upperBoundFlat(endSuffix) - 1;
-        final lo = startSuffix == null ? 0 : _lowerBoundFlat(startSuffix);
-        for (; i >= lo; i--) {
-          if (remaining != null && remaining <= 0) break;
-          final s = ordered[i];
-          final v = getFlat(s, touch: false);
-          if (v == null) continue;
-          path[groupDepth] = s;
-          emitted++;
-          if (!onEntry(path, v)) break;
-          if (remaining != null) remaining--;
-        }
-      }
-      return emitted;
+    final usePaths = _orderedNeedsPaths || _hasExact || deep != null;
+    if (!usePaths) {
+      return _scanRangeTwoWayFlat(
+        start,
+        end,
+        reverse: reverse,
+        limit: limit,
+        onEntry: onEntry,
+      );
     }
-
-    // Path-ordered scan.
-    final paths = orderedPaths;
-    if (paths == null || paths.isEmpty) return 0;
-
-    if (!reverse) {
-      var i = _lowerBoundPaths(start);
-      for (; i < paths.length; i++) {
-        if (remaining != null && remaining <= 0) break;
-        final p = paths[i];
-        if (end != null && comparePaths(p, end) > 0) break;
-        final v = pointGet(p);
-        if (v == null) continue;
-        emitted++;
-        if (!onEntry(p, v)) break;
-        if (remaining != null) remaining--;
-      }
-    } else {
-      var i = end == null ? paths.length - 1 : _upperBoundPaths(end) - 1;
-      final lo = _lowerBoundPaths(start);
-      for (; i >= lo; i--) {
-        if (remaining != null && remaining <= 0) break;
-        final p = paths[i];
-        final v = pointGet(p);
-        if (v == null) continue;
-        emitted++;
-        if (!onEntry(p, v)) break;
-        if (remaining != null) remaining--;
-      }
-    }
-    return emitted;
+    return _scanRangeTwoWayPaths(
+      start,
+      end,
+      reverse: reverse,
+      limit: limit,
+      onEntry: onEntry,
+    );
   }
 
   bool _prefixMatchesGroup(List<dynamic> key) {
