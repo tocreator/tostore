@@ -23,74 +23,78 @@ class BenchmarkRunner {
       LogLevel.info,
     );
 
-    // 1. Ensure benchmark tables exist
+    // 1. Ensure benchmark tables exist and are clean before starting
     await BenchmarkSchemas.ensureTables(db);
-
-    // 2. Warm-up phase (JIT & VM cache priming)
-    _updateLastOperation('Priming Dart VM & Memory (Warm-up)...');
-    await _performWarmup();
-
-    final List<BenchmarkMetric> allMetrics = [];
-
-    // Determine target tiers
-    final tiersToRun = <BenchmarkTier>[];
-    if (config.tier == BenchmarkTier.simple ||
-        config.tier == BenchmarkTier.all) {
-      tiersToRun.add(BenchmarkTier.simple);
-    }
-    if (config.tier == BenchmarkTier.indexed ||
-        config.tier == BenchmarkTier.all) {
-      tiersToRun.add(BenchmarkTier.indexed);
-    }
-
-    for (final currentTier in tiersToRun) {
-      final tierName =
-          currentTier == BenchmarkTier.simple ? 'Simple' : 'Indexed';
-      final tableName = currentTier == BenchmarkTier.simple
-          ? BenchmarkSchemas.simpleTable
-          : BenchmarkSchemas.indexedTable;
-
-      log.add('--- Running Tier: $tierName Benchmark ---', LogLevel.info);
-
-      for (final op in config.operations) {
-        // Skip indexedSeek on simple tier (has no secondary unique index)
-        if (currentTier == BenchmarkTier.simple &&
-            op == BenchmarkOperation.indexedSeek) {
-          continue;
-        }
-
-        final metric = await _runOperation(
-          op: op,
-          tier: currentTier,
-          tierName: tierName,
-          tableName: tableName,
-          config: config,
-        );
-
-        if (metric != null) {
-          allMetrics.add(metric);
-          log.add(
-            '⚡ [$tierName] ${metric.name}: ${metric.avgMilliseconds.toStringAsFixed(2)} ms (${metric.opsPerSec.toStringAsFixed(0)} ops/s | ${metric.avgLatencyUs.toStringAsFixed(2)} μs/op)',
-            LogLevel.info,
-          );
-        }
-
-        // Yield to allow UI frame updates
-        await Future.delayed(const Duration(milliseconds: 10));
-      }
-    }
-
-    // Clean up benchmark tables to avoid occupying memory/disk
     await db.clear(BenchmarkSchemas.simpleTable);
     await db.clear(BenchmarkSchemas.indexedTable);
 
-    final summary = BenchmarkSummary(config: config, metrics: allMetrics);
+    try {
+      // 2. Warm-up phase (JIT & VM cache priming)
+      _updateLastOperation('Priming Dart VM & Memory (Warm-up)...');
+      await _performWarmup();
 
-    // Log the formatted markdown report
-    log.add('\n${summary.toMarkdownTable()}', LogLevel.info);
-    _updateLastOperation('✅ Benchmark completed successfully');
+      final List<BenchmarkMetric> allMetrics = [];
 
-    return summary;
+      // Determine target tiers
+      final tiersToRun = <BenchmarkTier>[];
+      if (config.tier == BenchmarkTier.simple ||
+          config.tier == BenchmarkTier.all) {
+        tiersToRun.add(BenchmarkTier.simple);
+      }
+      if (config.tier == BenchmarkTier.indexed ||
+          config.tier == BenchmarkTier.all) {
+        tiersToRun.add(BenchmarkTier.indexed);
+      }
+
+      for (final currentTier in tiersToRun) {
+        final tierName =
+            currentTier == BenchmarkTier.simple ? 'Simple' : 'Indexed';
+        final tableName = currentTier == BenchmarkTier.simple
+            ? BenchmarkSchemas.simpleTable
+            : BenchmarkSchemas.indexedTable;
+
+        log.add('--- Running Tier: $tierName Benchmark ---', LogLevel.info);
+
+        for (final op in config.operations) {
+          // Skip indexedSeek on simple tier (has no secondary unique index)
+          if (currentTier == BenchmarkTier.simple &&
+              op == BenchmarkOperation.indexedSeek) {
+            continue;
+          }
+
+          final metric = await _runOperation(
+            op: op,
+            tier: currentTier,
+            tierName: tierName,
+            tableName: tableName,
+            config: config,
+          );
+
+          if (metric != null) {
+            allMetrics.add(metric);
+            log.add(
+              '⚡ [$tierName] ${metric.name}: ${metric.avgMilliseconds.toStringAsFixed(2)} ms (${metric.opsPerSec.toStringAsFixed(0)} ops/s | ${metric.avgLatencyUs.toStringAsFixed(2)} μs/op)',
+              LogLevel.info,
+            );
+          }
+
+          // Yield to allow UI frame updates
+          await Future.delayed(const Duration(milliseconds: 10));
+        }
+      }
+
+      final summary = BenchmarkSummary(config: config, metrics: allMetrics);
+
+      // Log the formatted markdown report
+      log.add('\n${summary.toMarkdownTable()}', LogLevel.info);
+      _updateLastOperation('✅ Benchmark completed successfully');
+
+      return summary;
+    } finally {
+      // Clean up benchmark tables to avoid occupying memory/disk
+      await db.clear(BenchmarkSchemas.simpleTable);
+      await db.clear(BenchmarkSchemas.indexedTable);
+    }
   }
 
   /// Primes JIT compiler and memory allocations with small datasets.

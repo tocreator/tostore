@@ -449,6 +449,32 @@ final class IndexTreePartitionManager {
   IndexMeta _consumeNext(IndexMeta meta) =>
       meta.copyWith(btreeNextPageNo: meta.btreeNextPageNo + 1);
 
+  TreePagePtr? _locateLeafForKeySync(
+    TableContext table,
+    IndexUid indexUid,
+    IndexMeta meta,
+    Uint8List keyBytes,
+  ) {
+    final root = meta.btreeRoot;
+    if (root.isNull) return meta.btreeFirstLeaf;
+    if (meta.btreeHeight <= 0) return root;
+    TreePagePtr cur = root;
+    final tableUid = table.tableUid;
+    for (int depth = meta.btreeHeight; depth > 0; depth--) {
+      final node = _internalPageCache.getPoint4(
+        tableUid,
+        indexUid,
+        cur.partitionNo,
+        cur.pageNo,
+      );
+      if (node == null) return null; // Cache miss
+      if (node.children.isEmpty) return meta.btreeFirstLeaf;
+      final idx = node.childIndexForKey(keyBytes);
+      cur = node.children[idx];
+    }
+    return cur;
+  }
+
   Future<TreePagePtr> _locateLeafForKey(
     TableContext table,
     IndexUid indexUid,
@@ -2116,29 +2142,61 @@ final class IndexTreePartitionManager {
     if (firstLeaf.isNull) {
       return List<String?>.filled(uniqueKeys.length, null, growable: false);
     }
-    final leafPtrToKeyIndices = <String, List<int>>{};
+
+    final tableUid = table.tableUid;
+    final leafPtrToKeyIndices = <TreePagePtr, List<int>>{};
+    final yc = YieldController(
+      'IndexTreePartitionManager.lookupUniquePrimaryKeysBatch',
+      checkInterval: 200,
+    );
+
     for (int i = 0; i < uniqueKeys.length; i++) {
-      var leafPtr = await _locateLeafForKey(
+      final y = yc.maybeYield();
+      if (y != null) await y;
+      final k = uniqueKeys[i];
+
+      var leafPtr = readFromFileOnly
+          ? null
+          : _locateLeafForKeySync(table, resolvedUid, meta, k);
+      leafPtr ??= await _locateLeafForKey(
         table,
         resolvedUid,
         meta,
-        uniqueKeys[i],
+        k,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
         readFromFileOnly: readFromFileOnly,
       );
       if (leafPtr.isNull) leafPtr = firstLeaf;
-      leafPtrToKeyIndices.putIfAbsent(keyOfPtr(leafPtr), () => <int>[]).add(i);
+      leafPtrToKeyIndices.putIfAbsent(leafPtr, () => <int>[]).add(i);
     }
+
     final result =
         List<String?>.filled(uniqueKeys.length, null, growable: false);
     for (final entry in leafPtrToKeyIndices.entries) {
-      final parts = entry.key.split(':');
-      final ptr = TreePagePtr(int.parse(parts[0]), int.parse(parts[1]));
-      final leaf = await _readLeaf(table, resolvedUid, meta, ptr,
-          encryptionKey: encryptionKey,
-          encryptionKeyId: encryptionKeyId,
-          readFromFileOnly: readFromFileOnly);
+      final y = yc.maybeYield();
+      if (y != null) await y;
+      final ptr = entry.key;
+
+      LeafPage? leaf;
+      if (!readFromFileOnly) {
+        leaf = _leafPageCache.getPoint4(
+          tableUid,
+          resolvedUid,
+          ptr.partitionNo,
+          ptr.pageNo,
+        );
+      }
+      leaf ??= await _readLeaf(
+        table,
+        resolvedUid,
+        meta,
+        ptr,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+        readFromFileOnly: readFromFileOnly,
+      );
+
       for (final idx in entry.value) {
         final key = uniqueKeys[idx];
         final slot = leaf.find(key);
@@ -2169,11 +2227,20 @@ final class IndexTreePartitionManager {
       return List<bool>.filled(uniqueKeys.length, false, growable: false);
     }
 
-    // Group by leaf to reduce IO.
-    final leafToKeys = <String, List<int>>{};
+    final tableUid = table.tableUid;
+    final leafToKeys = <TreePagePtr, List<int>>{};
+    final yc = YieldController(
+      'IndexTreePartitionManager.existsUniqueKeysBatch',
+      checkInterval: 200,
+    );
+
     for (int i = 0; i < uniqueKeys.length; i++) {
+      final y = yc.maybeYield();
+      if (y != null) await y;
       final k = uniqueKeys[i];
-      final ptr = await _locateLeafForKey(
+
+      var ptr = _locateLeafForKeySync(table, resolvedUid, meta, k);
+      ptr ??= await _locateLeafForKey(
         table,
         resolvedUid,
         meta,
@@ -2182,22 +2249,30 @@ final class IndexTreePartitionManager {
         encryptionKeyId: encryptionKeyId,
       );
       final use = ptr.isNull ? firstLeaf : ptr;
-      leafToKeys
-          .putIfAbsent('${use.partitionNo}:${use.pageNo}', () => <int>[])
-          .add(i);
+      leafToKeys.putIfAbsent(use, () => <int>[]).add(i);
     }
 
     final out = List<bool>.filled(uniqueKeys.length, false, growable: false);
-    final yc = YieldController(
-        'IndexTreePartitionManager.existsUniqueKeysBatch',
-        checkInterval: 200);
     for (final e in leafToKeys.entries) {
       final y10 = yc.maybeYield();
       if (y10 != null) await y10;
-      final parts = e.key.split(':');
-      final ptr = TreePagePtr(int.parse(parts[0]), int.parse(parts[1]));
-      final leaf = await _readLeaf(table, resolvedUid, meta, ptr,
-          encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
+      final ptr = e.key;
+
+      LeafPage? leaf = _leafPageCache.getPoint4(
+        tableUid,
+        resolvedUid,
+        ptr.partitionNo,
+        ptr.pageNo,
+      );
+      leaf ??= await _readLeaf(
+        table,
+        resolvedUid,
+        meta,
+        ptr,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+      );
+
       for (final idx in e.value) {
         final key = uniqueKeys[idx];
         out[idx] = leaf.find(key) != null;

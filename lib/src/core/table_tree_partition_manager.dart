@@ -3,7 +3,6 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
-import '../interface/storage_interface.dart';
 import '../handler/binary_schema_codec.dart';
 import '../handler/common.dart';
 import '../handler/encryption.dart';
@@ -11,6 +10,7 @@ import '../handler/logger.dart';
 import '../handler/memcomparable.dart';
 import '../handler/meta_binary_codec.dart';
 import '../handler/parallel_processor.dart';
+import '../interface/storage_interface.dart';
 import '../model/data_store_config.dart';
 import '../model/db_exception.dart';
 import '../model/encoder_config.dart';
@@ -18,8 +18,8 @@ import '../model/meta_info.dart';
 import '../model/parallel_journal_entry.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
-import '../model/table_context.dart';
 import '../model/stored_value.dart';
+import '../model/table_context.dart';
 import '../model/table_schema.dart';
 import 'btree_page.dart';
 import 'compute/btree_page_encode_batch_runner.dart';
@@ -206,6 +206,7 @@ final class TableTreePartitionManager {
   // especially internal nodes which are shared across many queries.
   late final TreeCache<LeafPage> _leafPageCache;
   late final TreeCache<InternalPage> _internalPageCache;
+  final Map<String, Uint8List?> _physicalMaxPkBytesCache = {};
 
   TableTreePartitionManager(this._dataStore) {
     // Initialize page caches using memory manager quota
@@ -338,6 +339,7 @@ final class TableTreePartitionManager {
     try {
       _leafPageCache.clear();
       _internalPageCache.clear();
+      _physicalMaxPkBytesCache.clear();
     } catch (e) {
       Logger.warn('Clear page cache failed', rawError: e);
     }
@@ -348,6 +350,7 @@ final class TableTreePartitionManager {
     try {
       _leafPageCache.remove([table.tableUid]);
       _internalPageCache.remove([table.tableUid]);
+      _physicalMaxPkBytesCache.remove(table.tableUid);
     } catch (e) {
       Logger.warn('Clear page cache for table failed', rawError: e);
     }
@@ -358,6 +361,7 @@ final class TableTreePartitionManager {
   void _publishLeafPage(String tableUid, TreePagePtr ptr, LeafPage leaf) {
     if (ptr.isNull) return;
     _leafPageCache.putPoint3(tableUid, ptr.partitionNo, ptr.pageNo, leaf);
+    _physicalMaxPkBytesCache.remove(tableUid);
   }
 
   void _publishInternalPage(
@@ -622,6 +626,76 @@ final class TableTreePartitionManager {
             'Corrupted B+Tree internal page: table=$tableName ptr=$ptr path=$path offset=$offset err=$e',
       );
     }
+  }
+
+  TreePagePtr? _locateLeafForKeySync(
+    TableContext table,
+    TableDataMeta meta,
+    Uint8List keyBytes,
+  ) {
+    if (meta.btreeRoot.isNull) return meta.btreeFirstLeaf;
+    if (meta.btreeHeight <= 0) return meta.btreeRoot;
+    TreePagePtr cur = meta.btreeRoot;
+    final tableUid = table.tableUid;
+    for (int depth = meta.btreeHeight; depth > 0; depth--) {
+      final node = _internalPageCache.getPoint3(
+        tableUid,
+        cur.partitionNo,
+        cur.pageNo,
+      );
+      if (node == null) return null; // Cache miss, fallback to async
+      if (node.children.isEmpty) return meta.btreeFirstLeaf;
+      final idx = node.childIndexForKey(keyBytes);
+      cur = node.children[idx];
+    }
+    return cur;
+  }
+
+  /// Retrieve the true physical maximum primary key bytes on disk from the rightmost leaf.
+  Future<Uint8List?> getPhysicalMaxPrimaryKeyBytes(
+    TableContext table, {
+    TableDataMeta? metaSnapshot,
+  }) async {
+    final cached = _physicalMaxPkBytesCache[table.tableUid];
+    if (cached != null) return cached;
+
+    final meta = metaSnapshot ??
+        await _dataStore.tableDataManager.getTableDataMeta(table.tableUid);
+    if (meta == null ||
+        meta.totalRecordCount <= 0 ||
+        meta.btreeFirstLeaf.isNull) {
+      return null;
+    }
+
+    final lastLeafPtr = meta.btreeLastLeaf.isNull
+        ? (meta.btreeHeight <= 0 ? meta.btreeRoot : meta.btreeFirstLeaf)
+        : meta.btreeLastLeaf;
+    if (lastLeafPtr.isNull) return null;
+
+    final tableUid = table.tableUid;
+    final cachedLeaf = _leafPageCache.getPoint3(
+      tableUid,
+      lastLeafPtr.partitionNo,
+      lastLeafPtr.pageNo,
+    );
+    LeafPage leaf = cachedLeaf ?? await _readLeafPage(table, meta, lastLeafPtr);
+
+    while (!leaf.next.isNull) {
+      final nextPtr = leaf.next;
+      final cachedNext = _leafPageCache.getPoint3(
+        tableUid,
+        nextPtr.partitionNo,
+        nextPtr.pageNo,
+      );
+      leaf = cachedNext ?? await _readLeafPage(table, meta, nextPtr);
+    }
+
+    if (leaf.keys.isNotEmpty) {
+      final maxKey = leaf.keys.last;
+      _physicalMaxPkBytesCache[tableUid] = maxKey;
+      return maxKey;
+    }
+    return null;
   }
 
   Future<TreePagePtr> _locateLeafForKey(
@@ -2436,15 +2510,27 @@ final class TableTreePartitionManager {
     if (schema == null) return false;
     final meta =
         await _dataStore.tableDataManager.getTableDataMeta(table.tableUid);
-    if (meta == null || (meta.btreeFirstLeaf).isNull) return false;
+    if (meta == null ||
+        meta.totalRecordCount <= 0 ||
+        (meta.btreeFirstLeaf).isNull) {
+      return false;
+    }
     final keyBytes = schema.encodePrimaryKeyComponent(primaryKeyValue);
-    var ptr = await _locateLeafForKey(table, meta, keyBytes);
+
+    // Fast synchronous descent from cached internal nodes (0 await on hit)
+    var ptr = _locateLeafForKeySync(table, meta, keyBytes);
+    ptr ??= await _locateLeafForKey(table, meta, keyBytes);
     if (ptr.isNull) ptr = (meta.btreeFirstLeaf);
-    final leaf = await _readLeafPage(table, meta, ptr);
+
+    // Cache-first leaf retrieval: if in memory, 0 await and purely synchronous binary search
+    LeafPage? leaf =
+        _leafPageCache.getPoint3(table.tableUid, ptr.partitionNo, ptr.pageNo);
+    leaf ??= await _readLeafPage(table, meta, ptr);
     return leaf.find(keyBytes) != null;
   }
 
-  /// For custom PK inserts (PrimaryKeyType.none): check which PKs already exist on disk.
+  /// For custom PK inserts (PrimaryKeyType.none) or non-monotonic inserts:
+  /// check which PKs already exist on disk.
   Future<Set<String>> existingPrimaryKeysBatch(
     TableContext table,
     List<String> primaryKeys, {
@@ -2456,20 +2542,83 @@ final class TableTreePartitionManager {
     if (schema == null) return const <String>{};
     final meta =
         await _dataStore.tableDataManager.getTableDataMeta(table.tableUid);
-    if (meta == null || (meta.btreeFirstLeaf).isNull) return const <String>{};
-    final out = <String>{};
-    final yc = YieldController(
-        'TableTreePartitionManager.existingPrimaryKeysBatch',
-        checkInterval: 200);
-    for (final pk in primaryKeys) {
-      final y17 = yc.maybeYield();
-      if (y17 != null) await y17;
-      final keyBytes = schema.encodePrimaryKeyComponent(pk);
-      var leafPtr = await _locateLeafForKey(table, meta, keyBytes);
-      if (leafPtr.isNull) leafPtr = (meta.btreeFirstLeaf);
-      final leaf = await _readLeafPage(table, meta, leafPtr);
-      if (leaf.find(keyBytes) != null) out.add(pk);
+    if (meta == null ||
+        meta.totalRecordCount <= 0 ||
+        (meta.btreeFirstLeaf).isNull) {
+      return const <String>{};
     }
+
+    final tableUid = table.tableUid;
+    final yc = YieldController(
+      'TableTreePartitionManager.existingPrimaryKeysBatch',
+      checkInterval: 200,
+    );
+
+    // Pre-encode primary keys
+    final encodedKeys = <Uint8List>[];
+    for (int i = 0; i < primaryKeys.length; i++) {
+      final y = yc.maybeYield();
+      if (y != null) await y;
+      encodedKeys.add(schema.encodePrimaryKeyComponent(primaryKeys[i]));
+    }
+
+    // Step 1: Physical Right-Edge Pruning (B+Tree mathematical ordering)
+    // If the minimum key in this batch is strictly greater than the physical maximum key on disk,
+    // it is mathematically impossible for any key in this batch to collide with existing disk rows.
+    try {
+      final maxDiskKeyBytes =
+          await getPhysicalMaxPrimaryKeyBytes(table, metaSnapshot: meta);
+      if (maxDiskKeyBytes != null && maxDiskKeyBytes.isNotEmpty) {
+        Uint8List? minBatchKey;
+        for (final k in encodedKeys) {
+          if (minBatchKey == null ||
+              MemComparableKey.compare(k, minBatchKey) < 0) {
+            minBatchKey = k;
+          }
+        }
+        if (minBatchKey != null &&
+            MemComparableKey.compare(minBatchKey, maxDiskKeyBytes) > 0) {
+          // 100% physically proven: no collisions on disk!
+          return const <String>{};
+        }
+      }
+    } catch (_) {}
+
+    // Step 2: Full rigorous verification using Sync Tree Descent + Leaf Grouping + Cache-first binary search
+    final out = <String>{};
+    final leafToKeyIndices = <TreePagePtr, List<int>>{};
+
+    for (int i = 0; i < encodedKeys.length; i++) {
+      final y = yc.maybeYield();
+      if (y != null) await y;
+      final keyBytes = encodedKeys[i];
+
+      // Fast synchronous descent from cached internal nodes (0 await on cache hit)
+      var leafPtr = _locateLeafForKeySync(table, meta, keyBytes);
+      leafPtr ??= await _locateLeafForKey(table, meta, keyBytes);
+      if (leafPtr.isNull) leafPtr = meta.btreeFirstLeaf;
+
+      leafToKeyIndices.putIfAbsent(leafPtr, () => <int>[]).add(i);
+    }
+
+    for (final entry in leafToKeyIndices.entries) {
+      final y = yc.maybeYield();
+      if (y != null) await y;
+      final ptr = entry.key;
+
+      // Cache-first leaf retrieval: if leaf page is in memory, 0 await and purely synchronous binary search!
+      LeafPage? leaf =
+          _leafPageCache.getPoint3(tableUid, ptr.partitionNo, ptr.pageNo);
+      leaf ??= await _readLeafPage(table, meta, ptr);
+
+      for (final idx in entry.value) {
+        final keyBytes = encodedKeys[idx];
+        if (leaf.find(keyBytes) != null) {
+          out.add(primaryKeys[idx]);
+        }
+      }
+    }
+
     return out;
   }
 

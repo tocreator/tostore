@@ -2604,28 +2604,30 @@ class TableDataManager {
           fileMeta == null || fileMeta.totalRecordCount <= 0;
 
       if (!tableEmptyOnDisk) {
-        // Prefer cached maxAutoIncrementId when present -- avoids a leaf scan.
-        // !tableEmptyOnDisk implies fileMeta != null && totalRecordCount > 0.
+        // v2+ global B+Tree: retrieve the true physical maximum key from the leaf tail
+        try {
+          final last = await _dataStore.tableTreePartitionManager
+              ?.scanRecordsByPrimaryKeyRange(
+            table: table,
+            startKeyInclusive: Uint8List(0),
+            endKeyExclusive: Uint8List(0),
+            reverse: true,
+            limit: 1,
+          );
+          if (last != null && last.isNotEmpty) {
+            maxFromPartitions = last.first[schema.primaryKey];
+          }
+        } catch (_) {}
+
+        // Fallback / compare with cached maxAutoIncrementId to take the maximum
         final cachedMetaMax = fileMeta.maxAutoIncrementId;
         if (cachedMetaMax != null &&
             cachedMetaMax.isNotEmpty &&
             cachedMetaMax != '0') {
-          maxFromPartitions = cachedMetaMax;
-        } else {
-          // v2+ global B+Tree: take max key from the global leaf tail.
-          try {
-            final last = await _dataStore.tableTreePartitionManager
-                ?.scanRecordsByPrimaryKeyRange(
-              table: table,
-              startKeyInclusive: Uint8List(0),
-              endKeyExclusive: Uint8List(0),
-              reverse: true,
-              limit: 1,
-            );
-            if (last != null && last.isNotEmpty) {
-              maxFromPartitions = last.first[schema.primaryKey];
-            }
-          } catch (_) {}
+          if (maxFromPartitions == null ||
+              pkMatcher(cachedMetaMax, maxFromPartitions) > 0) {
+            maxFromPartitions = cachedMetaMax;
+          }
         }
       } else if (fileMeta?.maxAutoIncrementId != null &&
           fileMeta!.maxAutoIncrementId!.isNotEmpty) {
@@ -2675,6 +2677,12 @@ class TableDataManager {
       if (finalMax != null) {
         _maxIds[table.tableUid] = finalMax.toString();
         _maxIdsDirty[table.tableUid] = true;
+
+        // Purge any stale IDs <= finalMax from generator pool
+        final generator = _idGenerators[table.tableUid];
+        if (generator != null) {
+          generator.purgeIdsLessThanOrEqualTo(finalMax);
+        }
 
         // Save to FileMeta for caching (avoid recalculation on next initialization)
         await mutateTableDataMeta(table, (current) {
@@ -2764,22 +2772,17 @@ class TableDataManager {
           'Table ${table.tableName} has primary key conflict, update auto increment start: $newMaxId',
         );
 
-        // update generator current id (only for numeric id)
-        if (_idGenerators.containsKey(table.tableUid)) {
-          final generator = _idGenerators[table.tableUid];
-          if (generator is SequentialIdGenerator &&
-              _isNumericString(newMaxId)) {
-            try {
-              final newIdInt = int.parse(newMaxId);
-              generator.setCurrentId(newIdInt);
-            } catch (e) {
-              Logger.error('Failed to parse new id to integer: $newMaxId',
-                  rawError: e);
-            }
-          }
+        // Update generator and purge all stale IDs from the pool
+        final generator = _idGenerators[table.tableUid];
+        if (generator != null) {
+          generator.purgeIdsLessThanOrEqualTo(newMaxId);
         }
       } else {
-        // if current id is greater than conflict id, no need to adjust
+        // Even if current max id is greater, ensure the pool has discarded any IDs <= currentMaxId
+        final generator = _idGenerators[table.tableUid];
+        if (generator != null) {
+          generator.purgeIdsLessThanOrEqualTo(currentMaxId);
+        }
         Logger.debug(
           'Table ${table.tableName} has primary key conflict, but current max id $currentMaxId is greater than conflict id $conflictId, no need to adjust',
         );

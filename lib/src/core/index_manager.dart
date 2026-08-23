@@ -2239,7 +2239,7 @@ class IndexManager {
         return null;
       }
 
-      // 3. Execute disk checks using existsUniqueKeysBatch (fast BinaryFuseFilter + grouped I/O)
+      // 3. Execute disk checks using grouped B+Tree point lookups
       try {
         // Group constraints by stable index uid for batch processing
         final constraintsByIndex = <IndexUid, List<_UniqueConstraint>>{};
@@ -2316,77 +2316,45 @@ class IndexManager {
 
           if (keyBytes.isEmpty) continue;
 
-          // Batch check existence using BinaryFuseFilter + grouped I/O
-          final exists =
-              await _dataStore.indexTreePartitionManager?.existsUniqueKeysBatch(
-                    table: table,
-                    indexUid: indexUid,
-                    meta: meta,
-                    uniqueKeys: keyBytes,
-                  ) ??
-                  <bool>[];
-
-          final positiveKeyBytes = <Uint8List>[];
-          final positiveConstraintIndices = <int>[];
-          for (int j = 0; j < exists.length; j++) {
-            if (!exists[j]) {
-              continue;
-            }
-            final constraintIdx = constraintIndices[j];
-            if (constraintIdx < 0 || constraintIdx >= indexConstraints.length) {
-              continue;
-            }
-            positiveKeyBytes.add(keyBytes[j]);
-            positiveConstraintIndices.add(constraintIdx);
-          }
-
-          if (positiveKeyBytes.isEmpty) {
-            continue;
-          }
-
+          // Single-pass disk lookup (existence + owner PK); avoids duplicate
+          // B+Tree descent from existsUniqueKeysBatch + lookupUniquePrimaryKeysBatch.
           final existingPks = await _dataStore.indexTreePartitionManager
                   ?.lookupUniquePrimaryKeysBatch(
                 table: table,
                 indexUid: indexUid,
                 meta: meta,
-                uniqueKeys: positiveKeyBytes,
+                uniqueKeys: keyBytes,
               ) ??
-              <String>[];
+              <String?>[];
 
           // Check results
-          for (int j = 0; j < positiveConstraintIndices.length; j++) {
-            final constraintIdx = positiveConstraintIndices[j];
+          for (int j = 0; j < constraintIndices.length; j++) {
+            final constraintIdx = constraintIndices[j];
             if (constraintIdx < 0 || constraintIdx >= indexConstraints.length) {
               continue;
             }
             final constraint = indexConstraints[constraintIdx];
             final existingPk = j < existingPks.length ? existingPks[j] : null;
 
-            // Keep the fast existence probe, but only treat it as a conflict when
-            // the resolved owner record is still logically visible.
             if (existingPk == null || existingPk.isEmpty) {
-              Logger.warn(
-                'Unique key exists but owner lookup returned null: '
-                'table=${table.tableName} index=${_indexLogLabel(table, indexUid)} '
-                'value=${constraint.value}',
-              );
-            } else {
-              if (!_uniqueDiskOwnerStillOwnsKey(
-                table: table,
-                meta: meta,
-                schema: schema,
-                existingPk: existingPk,
-                uniqueKeyBytes: positiveKeyBytes[j],
-                transactionId: currentTxId,
-              )) {
-                continue;
-              }
+              continue;
+            }
 
-              if (isUpdate &&
-                  selfStoreIndexStr != null &&
-                  existingPk == selfStoreIndexStr) {
-                continue;
-              }
+            if (!_uniqueDiskOwnerStillOwnsKey(
+              table: table,
+              meta: meta,
+              schema: schema,
+              existingPk: existingPk,
+              uniqueKeyBytes: keyBytes[j],
+              transactionId: currentTxId,
+            )) {
+              continue;
+            }
+
+            if (isUpdate &&
+                selfStoreIndexStr != null &&
+                existingPk == selfStoreIndexStr) {
+              continue;
             }
 
             Logger.debug(
@@ -2396,9 +2364,7 @@ class IndexManager {
               fields: constraint.fields,
               value: constraint.value,
               indexName: constraint.indexName,
-              existingPrimaryKey: (existingPk != null && existingPk.isNotEmpty)
-                  ? existingPk
-                  : null,
+              existingPrimaryKey: existingPk,
             );
           }
         }
@@ -2503,6 +2469,28 @@ class IndexManager {
           tableDataMeta == null || tableDataMeta.totalRecordCount <= 0;
     }
 
+    // Fast-path: check if minimum sequential PK strictly exceeds physical disk max key
+    var bypassDiskPkCheck = skipDiskUniqueChecks;
+    if (!bypassDiskPkCheck &&
+        !isMemoryMode &&
+        schema.primaryKeyConfig.type == PrimaryKeyType.sequential &&
+        records.isNotEmpty) {
+      try {
+        final firstPkVal = records.first[primaryKey];
+        if (firstPkVal != null) {
+          final firstPkBytes =
+              schema.encodePrimaryKeyComponent(firstPkVal.toString());
+          final maxDiskKeyBytes = await _dataStore.tableTreePartitionManager
+              ?.getPhysicalMaxPrimaryKeyBytes(table);
+          if (maxDiskKeyBytes != null &&
+              maxDiskKeyBytes.isNotEmpty &&
+              MemComparableKey.compare(firstPkBytes, maxDiskKeyBytes) > 0) {
+            bypassDiskPkCheck = true;
+          }
+        }
+      } catch (_) {}
+    }
+
     if (!isUpdate && !skipPrimaryKeyCheck) {
       final pkList = <String>[];
       final pkSeen = <String>{};
@@ -2532,7 +2520,10 @@ class IndexManager {
           }
           pkSeen.add(pk);
 
-          pkList.add(pk);
+          if (!bypassDiskPkCheck) {
+            pkList.add(pk);
+          }
+
           // B) WriteBuffer PK conflict
           if (!skipBufferCheck) {
             // Use raw pkValue for buffer check to ensure type matching (e.g. int vs String)
@@ -2559,7 +2550,7 @@ class IndexManager {
         }
       }
 
-      if (pkList.isNotEmpty) {
+      if (pkList.isNotEmpty && !bypassDiskPkCheck) {
         final Set<String> existing;
         if (isMemoryMode) {
           final set = <String>{};
@@ -2571,8 +2562,6 @@ class IndexManager {
             }
           }
           existing = set;
-        } else if (skipDiskUniqueChecks) {
-          existing = const <String>{};
         } else {
           existing = await _dataStore.tableTreePartitionManager
                   ?.existingPrimaryKeysBatch(table, pkList) ??
@@ -2745,7 +2734,7 @@ class IndexManager {
         continue;
       }
 
-      // 2.2 Disk path using BinaryFuseFilter + grouped point lookups (existence-only).
+      // 2.2 Disk path using grouped B+Tree point lookups (existence-only).
       final meta = await getIndexMeta(table.tableUid, indexUid);
       if (meta == null || meta.isBuilding || meta.totalEntryCount <= 0) {
         for (int i = 0; i < records.length; i++) {
@@ -2796,68 +2785,48 @@ class IndexManager {
 
       if (keyBytes.isEmpty) continue;
 
-      final exists =
-          await _dataStore.indexTreePartitionManager?.existsUniqueKeysBatch(
-                table: table,
-                indexUid: indexUid,
-                meta: meta,
-                uniqueKeys: keyBytes,
-              ) ??
-              <bool>[];
-
-      final List<int> positiveRecordIdxs = [];
-      final List<Uint8List> positiveKeyBytes = [];
-      for (int j = 0; j < exists.length; j++) {
-        if (exists[j]) {
-          positiveRecordIdxs.add(recordIdxs[j]);
-          positiveKeyBytes.add(keyBytes[j]);
-        }
-      }
-
-      if (positiveKeyBytes.isEmpty) continue;
-
       final existingPks = await _dataStore.indexTreePartitionManager
               ?.lookupUniquePrimaryKeysBatch(
             table: table,
             indexUid: indexUid,
             meta: meta,
-            uniqueKeys: positiveKeyBytes,
+            uniqueKeys: keyBytes,
           ) ??
-          <String>[];
+          <String?>[];
 
-      for (int j = 0; j < positiveRecordIdxs.length; j++) {
-        final i = positiveRecordIdxs[j];
+      for (int j = 0; j < recordIdxs.length; j++) {
+        final i = recordIdxs[j];
         if (violations[i] != null) continue;
 
         final String? existingPk =
             j < existingPks.length ? existingPks[j] : null;
 
-        if (existingPk != null && existingPk.isNotEmpty) {
-          final recordId = records[i][primaryKey]?.toString();
-          if (isUpdate && existingPk == recordId) continue;
+        if (existingPk == null || existingPk.isEmpty) continue;
 
-          if (_uniqueDiskOwnerStillOwnsKey(
-            table: table,
-            meta: meta,
-            schema: schema,
-            existingPk: existingPk,
-            uniqueKeyBytes: positiveKeyBytes[j],
-            transactionId: txId,
-          )) {
-            final canKey = preparedEntries[i].canonicalKey;
-            if (canKey == null) {
-              continue;
-            }
-            violations[i] = UniqueViolation(
-              tableName: table.tableName,
-              fields: idx.fields,
-              value: canKey,
-              indexName: indexLabel,
-              existingPrimaryKey: existingPk,
-            );
-            if (resolveInPlace) {
-              records[i][primaryKey] = existingPk;
-            }
+        final recordId = records[i][primaryKey]?.toString();
+        if (isUpdate && existingPk == recordId) continue;
+
+        if (_uniqueDiskOwnerStillOwnsKey(
+          table: table,
+          meta: meta,
+          schema: schema,
+          existingPk: existingPk,
+          uniqueKeyBytes: keyBytes[j],
+          transactionId: txId,
+        )) {
+          final canKey = preparedEntries[i].canonicalKey;
+          if (canKey == null) {
+            continue;
+          }
+          violations[i] = UniqueViolation(
+            tableName: table.tableName,
+            fields: idx.fields,
+            value: canKey,
+            indexName: indexLabel,
+            existingPrimaryKey: existingPk,
+          );
+          if (resolveInPlace) {
+            records[i][primaryKey] = existingPk;
           }
         }
       }

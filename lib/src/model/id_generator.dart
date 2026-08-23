@@ -29,6 +29,9 @@ abstract class IdGenerator {
 
   /// Generator type
   String get type;
+
+  /// Purge cached IDs in pool that are <= actualMaxId, and advance internal counter if needed.
+  void purgeIdsLessThanOrEqualTo(dynamic actualMaxId);
 }
 
 /// Sequential ID generator with ID pool pre-generation (lock-free consumption).
@@ -262,6 +265,47 @@ class SequentialIdGenerator implements IdGenerator {
 
   /// Current id position (for persistence/recovery). Last allocated id.
   int get currentId => _currentId;
+
+  @override
+  void purgeIdsLessThanOrEqualTo(dynamic actualMaxId) {
+    if (actualMaxId == null) return;
+    int maxInt;
+    if (actualMaxId is int) {
+      maxInt = actualMaxId;
+    } else if (actualMaxId is String) {
+      maxInt = int.tryParse(actualMaxId) ?? 0;
+    } else {
+      maxInt = 0;
+    }
+
+    if (maxInt <= 0) return;
+
+    if (_currentId < maxInt) {
+      _currentId = maxInt;
+    }
+
+    if (_idPool.isEmpty) return;
+
+    // Check pool maximum (last element since queue is monotonically increasing)
+    final poolLastStr = _idPool.last;
+    final poolLastInt = int.tryParse(poolLastStr);
+    if (poolLastInt != null && poolLastInt <= maxInt) {
+      // Entire pool is stale, clear immediately in O(1)
+      _idPool.clear();
+      return;
+    }
+
+    // Otherwise, selectively discard stale head elements until head > maxInt
+    while (_idPool.isNotEmpty) {
+      final headStr = _idPool.first;
+      final headInt = int.tryParse(headStr);
+      if (headInt != null && headInt <= maxInt) {
+        _idPool.removeFirst();
+      } else {
+        break;
+      }
+    }
+  }
 }
 
 /// Base62 encoder (used for generating short code IDs)
@@ -1326,6 +1370,24 @@ class TimeBasedIdGenerator implements IdGenerator {
       // Without node ID, directly combine date and sequence number
       // Algorithm: date * 10^5 + sequence
       return dateValue * _sequenceFactor + sequenceBig;
+    }
+  }
+
+  @override
+  void purgeIdsLessThanOrEqualTo(dynamic actualMaxId) {
+    if (actualMaxId == null) return;
+    final maxStr = actualMaxId.toString();
+    if (maxStr.isEmpty) return;
+
+    for (final pool in _idPools.values) {
+      if (pool.isEmpty) continue;
+      if (pool.last.compareTo(maxStr) <= 0) {
+        pool.clear();
+      } else {
+        while (pool.isNotEmpty && pool.first.compareTo(maxStr) <= 0) {
+          pool.removeFirst();
+        }
+      }
     }
   }
 }
