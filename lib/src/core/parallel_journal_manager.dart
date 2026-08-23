@@ -431,6 +431,37 @@ class ParallelJournalManager {
     }
   }
 
+  /// Quiesce the flush pump before [TableDataManager.clearTable] acquires the
+  /// table write lock.
+  ///
+  /// Batch planning reads partition-0 meta under shared storage path locks
+  /// without holding the table write lock. If clear holds the table lock and
+  /// writes p0.dat while planning still reads the same path, both sides block
+  /// until lock timeout (~5 min).
+  ///
+  /// Must NOT be called while the target table write lock is already held.
+  Future<void> prepareForTableClear(TableContext table) async {
+    if (!_running) return;
+    await _awaitActivePump();
+    try {
+      if (!_bufferManager.isEmpty ||
+          !_dataStore.backgroundWriteScheduler.isEmpty ||
+          _inFlightFlushCount > 0) {
+        await flushCompletely();
+      }
+    } catch (_) {}
+    await _awaitActivePump();
+  }
+
+  Future<void> _awaitActivePump() async {
+    final fut = _loopFuture;
+    if (fut != null) {
+      try {
+        await fut;
+      } catch (_) {}
+    }
+  }
+
   /// Shut down the journal manager.
   ///
   /// - [flush] `true`: drain pending writes to disk, then stop (close / switchSpace
@@ -857,6 +888,10 @@ class ParallelJournalManager {
         for (final tableUid in allTables) {
           final tableContext = await _resolveTableContext(tableUid);
           if (tableContext == null) continue;
+          // Skip meta reads while clear holds the table lock and rewrites p0.dat.
+          if (_dataStore.tableDataManager.isTableBeingCleared(tableContext)) {
+            continue;
+          }
           try {
             final schema = await _dataStore.tableMetaManager
                 ?.getTableSchema(tableContext.tableUid);
@@ -2294,39 +2329,54 @@ class ParallelJournalManager {
 
     final tableUid = table.tableUid;
     final schema = tableContext.schema;
-    final tableDataMeta = await _dataStore.tableDataManager
-        .getTableDataMeta(tableContext.tableUid);
-    final indexUids = <IndexUid>[];
-    final baseIndexTotalEntryCount = <IndexUid, int>{};
-    final baseIndexTotalSizeBytes = <IndexUid, int>{};
-    try {
-      final btreeIndexes = <IndexSchema>[
-        ...?_dataStore.tableMetaManager?.getBtreeIndexesFor(schema),
-        ...?_dataStore.indexManager
-            ?.getEngineManagedBtreeIndexes(tableContext, schema),
-      ];
-      for (final idx in btreeIndexes) {
-        indexUids.add(idx.indexUid);
-        final idxMeta = await _dataStore.indexManager
-            ?.getIndexMeta(tableContext.tableUid, idx.indexUid);
-        if (idxMeta != null) {
-          baseIndexTotalEntryCount[idx.indexUid] = idxMeta.totalEntryCount;
-          baseIndexTotalSizeBytes[idx.indexUid] = idxMeta.totalSizeBytes;
-        }
-      }
-    } catch (_) {}
 
-    final tablePlans = <TableUid, BatchTablePlan>{
-      tableUid: BatchTablePlan(
-        willUpdateTableDataMeta: true,
-        indexes: indexUids,
-        willUpdateIndexMeta: indexUids.isNotEmpty,
-        baseTotalRecordCount: tableDataMeta?.totalRecordCount,
-        baseTotalSizeBytes: tableDataMeta?.totalSizeBytes,
-        baseIndexTotalEntryCount: baseIndexTotalEntryCount,
-        baseIndexTotalSizeBytes: baseIndexTotalSizeBytes,
-      ),
-    };
+    final Map<TableUid, BatchTablePlan> tablePlans;
+    if (_dataStore.tableDataManager.isTableBeingCleared(tableContext)) {
+      // clearTable rebuilds meta from scratch; avoid disk meta/index probes.
+      tablePlans = <TableUid, BatchTablePlan>{
+        tableUid: BatchTablePlan(
+          willUpdateTableDataMeta: true,
+          indexes: const <IndexUid>[],
+          willUpdateIndexMeta: false,
+          baseTotalRecordCount: 0,
+          baseTotalSizeBytes: 0,
+        ),
+      };
+    } else {
+      final tableDataMeta = await _dataStore.tableDataManager
+          .getTableDataMeta(tableContext.tableUid);
+      final indexUids = <IndexUid>[];
+      final baseIndexTotalEntryCount = <IndexUid, int>{};
+      final baseIndexTotalSizeBytes = <IndexUid, int>{};
+      try {
+        final btreeIndexes = <IndexSchema>[
+          ...?_dataStore.tableMetaManager?.getBtreeIndexesFor(schema),
+          ...?_dataStore.indexManager
+              ?.getEngineManagedBtreeIndexes(tableContext, schema),
+        ];
+        for (final idx in btreeIndexes) {
+          indexUids.add(idx.indexUid);
+          final idxMeta = await _dataStore.indexManager
+              ?.getIndexMeta(tableContext.tableUid, idx.indexUid);
+          if (idxMeta != null) {
+            baseIndexTotalEntryCount[idx.indexUid] = idxMeta.totalEntryCount;
+            baseIndexTotalSizeBytes[idx.indexUid] = idxMeta.totalSizeBytes;
+          }
+        }
+      } catch (_) {}
+
+      tablePlans = <TableUid, BatchTablePlan>{
+        tableUid: BatchTablePlan(
+          willUpdateTableDataMeta: true,
+          indexes: indexUids,
+          willUpdateIndexMeta: indexUids.isNotEmpty,
+          baseTotalRecordCount: tableDataMeta?.totalRecordCount,
+          baseTotalSizeBytes: tableDataMeta?.totalSizeBytes,
+          baseIndexTotalEntryCount: baseIndexTotalEntryCount,
+          baseIndexTotalSizeBytes: baseIndexTotalSizeBytes,
+        ),
+      };
+    }
 
     try {
       await _walManager.addPendingParallelBatch(PendingParallelBatch(

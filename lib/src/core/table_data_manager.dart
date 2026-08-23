@@ -658,6 +658,7 @@ class TableDataManager {
   /// Invalidate cached table data metadata for a single table (best-effort).
   void invalidateTableDataMetaCacheForTable(TableContext table) {
     _tableDataMetaCache.remove(table.tableUid);
+    _metaLoadingFutures.remove(table.tableUid);
   }
 
   // -------------------- SpaceStats (KV-backed aggregates) --------------------
@@ -1757,47 +1758,42 @@ class TableDataManager {
     }
 
     // 3. Persistent Path: WAL + Write Buffer
+    final int count = records.length;
     final walEntries = <Map<String, dynamic>>[];
     final validBatchRecords = <Map<String, dynamic>>[];
     final validBatchRecordIds = <String>[];
     final validBatchOldValues = <Map<String, dynamic>?>[];
 
-    await EngineCpuChunk.forEachRange(
-      length: records.length,
-      kind: CpuChunkKind.medium,
-      process: (start, end) {
-        for (int i = start; i < end; i++) {
-          final r = records[i];
-          final recordId = r[pkName]?.toString();
-          if (recordId == null || recordId.isEmpty) {
-            continue;
-          }
+    for (int i = 0; i < count; i++) {
+      final r = records[i];
+      final recordId = r[pkName]?.toString();
+      if (recordId == null || recordId.isEmpty) {
+        continue;
+      }
 
-          final oldR = oldRecordsMap != null ? oldRecordsMap[recordId] : null;
-          final walOldValues =
-              operation == BufferOperationType.update ? oldR : null;
+      final oldR = oldRecordsMap != null ? oldRecordsMap[recordId] : null;
+      final walOldValues =
+          operation == BufferOperationType.update ? oldR : null;
 
-          // Build WAL envelope once; appendBatch mutates p/seq in place.
-          final walEntry = <String, dynamic>{
-            'op': operation.index,
-            'table': table.tableUid,
-            'ts': tsIso,
-            'data': r,
-          };
-          if (currentTxId != null) {
-            walEntry['txId'] = currentTxId;
-          }
-          if (walOldValues != null) {
-            walEntry['oldValues'] = walOldValues;
-          }
-          walEntries.add(walEntry);
+      // Build WAL envelope once; appendBatch mutates p/seq in place.
+      final walEntry = <String, dynamic>{
+        'op': operation.index,
+        'table': table.tableUid,
+        'ts': tsIso,
+        'data': r,
+      };
+      if (currentTxId != null) {
+        walEntry['txId'] = currentTxId;
+      }
+      if (walOldValues != null) {
+        walEntry['oldValues'] = walOldValues;
+      }
+      walEntries.add(walEntry);
 
-          validBatchRecords.add(r);
-          validBatchRecordIds.add(recordId);
-          validBatchOldValues.add(walOldValues);
-        }
-      },
-    );
+      validBatchRecords.add(r);
+      validBatchRecordIds.add(recordId);
+      validBatchOldValues.add(walOldValues);
+    }
 
     if (walEntries.isEmpty) {
       return (successRecordIds: successIds, failedRecordIds: failedIds);
@@ -1824,68 +1820,62 @@ class TableDataManager {
 
     final recordIds = <String>[];
     final entries = <BufferEntry>[];
+    final int validCount = validBatchRecordIds.length;
+
     if (operation == BufferOperationType.insert) {
-      await EngineCpuChunk.forEachRange(
-        length: validBatchRecordIds.length,
-        kind: CpuChunkKind.medium,
-        process: (start, end) {
-          for (int i = start; i < end; i++) {
-            entries.add(BufferEntry(
-              data: validBatchRecords[i],
-              operation: operation,
-              timestamp: ts,
-              transactionId: bufferTxId,
-              walPointer: pointers[i],
-              oldValues: null,
-              schemaVersion: schemaVersion,
-            ));
-            recordIds.add(validBatchRecordIds[i]);
-          }
-        },
-      );
+      for (int i = 0; i < validCount; i++) {
+        entries.add(BufferEntry(
+          data: validBatchRecords[i],
+          operation: operation,
+          timestamp: ts,
+          transactionId: bufferTxId,
+          walPointer: pointers[i],
+          oldValues: null,
+          schemaVersion: schemaVersion,
+        ));
+        recordIds.add(validBatchRecordIds[i]);
+      }
     } else {
-      await EngineCpuChunk.forEachRangeAsync(
-        length: validBatchRecordIds.length,
-        kind: CpuChunkKind.medium,
-        process: (start, end) async {
-          for (int i = start; i < end; i++) {
-            final recordId = validBatchRecordIds[i];
-            final r = validBatchRecords[i];
-            final oldR = validBatchOldValues[i];
+      for (int i = 0; i < validCount; i++) {
+        final recordId = validBatchRecordIds[i];
+        final r = validBatchRecords[i];
+        final oldR = validBatchOldValues[i];
 
-            entries.add(BufferEntry(
-              data: r,
-              operation: operation,
-              timestamp: ts,
-              transactionId: bufferTxId,
-              walPointer: pointers[i],
-              oldValues: oldR,
-              schemaVersion: schemaVersion,
-            ));
-            recordIds.add(recordId);
+        entries.add(BufferEntry(
+          data: r,
+          operation: operation,
+          timestamp: ts,
+          transactionId: bufferTxId,
+          walPointer: pointers[i],
+          oldValues: oldR,
+          schemaVersion: schemaVersion,
+        ));
+        recordIds.add(recordId);
 
-            if (operation == BufferOperationType.update) {
-              cacheTableRecord(table, recordId, r, schema);
-              await _dataStore.indexManager?.updateIndexDataCache(
-                table,
-                recordId,
-                oldR,
-                r,
-                overrideSchema: schema,
-              );
-            } else if (operation == BufferOperationType.delete) {
-              removeTableRecord(table, recordId);
-              await _dataStore.indexManager?.updateIndexDataCache(
-                table,
-                recordId,
-                r,
-                null,
-                overrideSchema: schema,
-              );
-            }
+        if (operation == BufferOperationType.update) {
+          cacheTableRecord(table, recordId, r, schema);
+          if (_dataStore.indexManager != null) {
+            await _dataStore.indexManager!.updateIndexDataCache(
+              table,
+              recordId,
+              oldR,
+              r,
+              overrideSchema: schema,
+            );
           }
-        },
-      );
+        } else if (operation == BufferOperationType.delete) {
+          removeTableRecord(table, recordId);
+          if (_dataStore.indexManager != null) {
+            await _dataStore.indexManager!.updateIndexDataCache(
+              table,
+              recordId,
+              r,
+              null,
+              overrideSchema: schema,
+            );
+          }
+        }
+      }
     }
 
     if (operation == BufferOperationType.insert) {
@@ -3107,6 +3097,9 @@ class TableDataManager {
     _tableFlushingFlags[table.tableUid] = true;
     _maxIdsDirty[table.tableUid] = false; // Proactively stop background flush
     try {
+      // Drain in-flight flush before the table write lock: batch planning reads
+      // p0.dat under shared storage locks without needing this lock.
+      await _dataStore.parallelJournalManager.prepareForTableClear(table);
       await withTableWriteLock(
         table,
         (_) async {
@@ -3158,18 +3151,38 @@ class TableDataManager {
                 rawError: e);
           }
 
-          // 3. create empty table data meta
-          final prevMeta = await getTableDataMeta(table.tableUid);
+          // 3. create empty table data meta (directory is known empty after wipe)
+          _metaLoadingFutures.remove(table.tableUid);
+          final prevMeta = _tableDataMetaCache.get(table.tableUid);
           final int newPartitionCount =
               deletedDir ? 1 : max(1, (prevMeta?.btreePartitionCount ?? 0) + 1);
           final tableUid = table.tableUid;
-          final emptyMeta = TableDataMeta.createEmpty(
+          var emptyMeta = TableDataMeta.createEmpty(
             tableUid: tableUid,
             partitionCount: newPartitionCount,
           );
 
-          // 4. update table data meta (full replace under table write lock)
-          await mutateTableDataMeta(table, (_) => emptyMeta);
+          final schema = table.schema;
+          final isSequentialPk =
+              schema.primaryKeyConfig.type == PrimaryKeyType.sequential;
+          if (isSequentialPk) {
+            emptyMeta = emptyMeta.copyWith(maxAutoIncrementId: '0');
+          }
+
+          _tableDataMetaCache.put(
+            tableUid,
+            emptyMeta,
+            size: _estimateTableDataMetaSize(emptyMeta),
+          );
+
+          // 4. persist empty meta (single write; avoids redundant disk probes)
+          await updateTableDataMeta(
+            table,
+            emptyMeta,
+            flush: true,
+            persistToDisk: true,
+            acquireLock: true,
+          );
 
           // 5. clean ID generator related resources
           _idGenerators.remove(table.tableUid);
@@ -3177,26 +3190,10 @@ class TableDataManager {
           TimeBasedIdGenerator.handleTableDelete(table.tableUid);
 
           // 6. handle auto increment ID reset
-          try {
-            final schema = table.schema;
-            if (schema.primaryKeyConfig.type == PrimaryKeyType.sequential) {
-              // Reset maxId in FileMeta to "0"
-              await mutateTableDataMeta(table, (fileMeta) {
-                if (fileMeta == null) return null;
-                return fileMeta.copyWith(maxAutoIncrementId: '0');
-              });
-
-              // update memory cache
-              _maxIds[table.tableUid] = "0";
-              _maxIdsDirty[table.tableUid] = false; // Already saved to FileMeta
-
-              // clean ID generator resources
-              _idRanges.remove(table.tableUid);
-            }
-          } catch (e) {
-            Logger.error(
-                'reset table ${table.tableName} auto increment ID failed',
-                rawError: e);
+          if (isSequentialPk) {
+            _maxIds[table.tableUid] = '0';
+            _maxIdsDirty[table.tableUid] = false;
+            _idRanges.remove(table.tableUid);
           }
 
           // 7. clean other caches (keep empty TableDataMeta in cache so the

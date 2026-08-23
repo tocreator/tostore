@@ -160,6 +160,10 @@ final class CompactionManager {
             final tableCtx = await _dataStore.tableMetaManager
                 ?.getTableContext(task.tableUid);
             if (tableCtx == null) continue;
+            if (_dataStore.tableDataManager.isTableBeingCleared(tableCtx)) {
+              finished = true;
+              continue;
+            }
             final TreePagePtr? hint = _tableHint[task.tableUid];
             final next =
                 await _dataStore.tableTreePartitionManager?.compactLeafChain(
@@ -177,6 +181,10 @@ final class CompactionManager {
             final tableCtx = await _dataStore.tableMetaManager
                 ?.getTableContext(task.tableUid);
             if (tableCtx == null) continue;
+            if (_dataStore.tableDataManager.isTableBeingCleared(tableCtx)) {
+              finished = true;
+              continue;
+            }
             final TreePagePtr? hint =
                 _indexHint['${task.tableUid}:${task.indexUid!.value}'];
             final next =

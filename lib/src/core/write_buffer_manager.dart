@@ -239,7 +239,6 @@ class WriteBufferManager {
       'WriteBufferManager.addInsertBatch',
       minCheckInterval: EngineCpuChunk.hotPathMinCheckInterval,
     );
-    final int emitChunk = EngineCpuChunk.sizeFor(CpuChunkKind.light);
     final tableUid = table.tableUid;
     final bgScheduler = _dataStore.backgroundWriteScheduler;
     final bool bgMaybeActive = !bgScheduler.isEmpty;
@@ -248,14 +247,13 @@ class WriteBufferManager {
         ? null
         : (entries.isEmpty ? null : entries.first.transactionId);
 
+    final bp = _dataStore.parallelJournalManager
+        .applyEnqueueBackpressure(recordIds.length);
+    if (bp != null) await bp;
+
     for (int i = 0; i < recordIds.length; i++) {
       final y = yieldController.maybeYield();
       if (y != null) await y;
-      if (i % emitChunk == 0) {
-        final bp = _dataStore.parallelJournalManager
-            .applyEnqueueBackpressure(emitChunk);
-        if (bp != null) await bp;
-      }
       final recordId = recordIds[i];
       final entry = entries[i];
       trees.applyVirginInsertWithPlan(

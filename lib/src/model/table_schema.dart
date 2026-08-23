@@ -2144,7 +2144,13 @@ class FieldSchema {
         }
         return null;
       case DataType.text:
-        if (value is String) return value.trim();
+        if (value is String) {
+          if (value.isEmpty) return value;
+          final int first = value.codeUnitAt(0);
+          final int last = value.codeUnitAt(value.length - 1);
+          if (first > 0x20 && last > 0x20) return value;
+          return value.trim();
+        }
         if (value is DateTime) {
           try {
             return value.toIso8601String();

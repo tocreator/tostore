@@ -4044,101 +4044,24 @@ class DataStoreImpl {
       final bool hasForeignKeys = _foreignKeyManager != null &&
           tableSchema.foreignKeys.any((fk) => fk.enabled);
 
-      var recordsToProcess = List<Map<String, dynamic>>.from(records);
       final invalidRecords = <Map<String, dynamic>>[];
       final List<String> successKeys = [];
       final List<String> failedKeys = [];
       int successCount = 0;
       int failedCount = 0;
       // Collect a limited number of detailed validation error messages for result reporting.
-      // This is per-batch only and does not grow with table size, so it is safe for large-scale data.
       final List<String> validationErrorsForResult = [];
       final List<ResultStatus> batchStatuses = [];
-      // Track records whose primary key was auto-generated in this batch
-      final Set<Map<String, dynamic>> autoPkRecords = <Map<String, dynamic>>{};
-      // Track whether any record in this batch has a user-provided primary key.
-      bool hasUserProvidedPrimaryKey = false;
 
-      // Batch assign primary keys if needed, to improve performance.
-      if (tableSchema.primaryKeyConfig.type != PrimaryKeyType.none) {
-        final recordsNeedingPk = <Map<String, dynamic>>[];
-        for (final r in recordsToProcess) {
-          final pkVal = r[primaryKey];
-          if (pkVal == null) {
-            recordsNeedingPk.add(r);
-          } else {
-            hasUserProvidedPrimaryKey = true;
-          }
-        }
-
-        if (recordsNeedingPk.isNotEmpty) {
-          final newIds = await tableDataManager.getBatchIds(
-              table, recordsNeedingPk.length);
-
-          if (newIds.length != recordsNeedingPk.length) {
-            // Primary key generation failed for some/all records.
-            if (!allowPartialErrors) {
-              // Fail the entire batch.
-              final allKeys = records
-                  .map((r) => r[primaryKey]?.toString())
-                  .where((k) => k != null && k.isNotEmpty)
-                  .map((k) => k!)
-                  .toList();
-              return finish(DbResult.error(
-                type: ResultType.engError,
-                message:
-                    'Failed to generate enough primary keys for batch insert',
-                failedKeys: returnResultDetails ? allKeys : const [],
-              ));
-            } else {
-              // Mark records that needed a key as invalid and remove them from processing.
-              for (final record in recordsNeedingPk) {
-                invalidRecords.add(record);
-                failedCount++;
-              }
-              recordsToProcess.removeWhere((r) => r[primaryKey] == null);
-            }
-          } else {
-            // Key generation succeeded, assign keys and mark as auto-generated.
-            for (var i = 0; i < recordsNeedingPk.length; i++) {
-              final rec = recordsNeedingPk[i];
-              rec[primaryKey] = newIds[i];
-              autoPkRecords.add(rec);
-            }
-          }
-        }
-      }
-
-      // Disk unique checks are only needed when:
-      // - the table has committed data to check against (skipDiskUniqueChecks is false),
-      // - the table uses custom primary keys (type == none),
-      // - the table defines secondary unique indexes, OR
-      // - the user manually provided a primary key in this batch.
-      final bool needDiskUniqueCheck = !skipDiskUniqueChecks &&
+      // Check if table has custom PK or secondary unique indexes (need disk unique checks)
+      final bool hasCustomPk =
+          tableSchema.primaryKeyConfig.type == PrimaryKeyType.none;
+      final bool needDiskUniqueCheckBase = !skipDiskUniqueChecks &&
           _indexManager != null &&
-          (tableSchema.primaryKeyConfig.type == PrimaryKeyType.none ||
-              hasSecondaryUniqueIndexes ||
-              hasUserProvidedPrimaryKey);
-
-      // If all records were filtered out due to PK generation failure and partial errors are allowed,
-      // we can end early without starting a transaction.
-      if (recordsToProcess.isEmpty) {
-        return finish(DbResult.error(
-          type: ResultType.engError,
-          message:
-              'All ${invalidRecords.length} records failed during primary key generation.',
-          // failedKeys is empty because these records never received a key.
-        ));
-      }
+          (hasCustomPk || hasSecondaryUniqueIndexes);
 
       try {
-        // Prepare + reserve + flush in windows of [bufferBatchSize].
-        // Prepare now runs on the current isolate (no Map isolate transfer), so
-        // avoid the old memory-aware adaptive planner / system-memory probe that
-        // only existed to size isolate tasks.
         const int bufferBatchSize = 1000;
-
-        // Single-pass pipeline: Validate, check foreign keys, reserve uniques, and buffer
         int start = 0;
         final batchTimestamp = DateTime.now();
 
@@ -4154,9 +4077,59 @@ class DataStoreImpl {
           }
         }
 
-        while (start < recordsToProcess.length) {
-          final int end = min(start + bufferBatchSize, recordsToProcess.length);
-          final currentRecords = recordsToProcess.sublist(start, end);
+        while (start < records.length) {
+          final int end = min(start + bufferBatchSize, records.length);
+          final currentRecords = records.sublist(start, end);
+          final int windowLen = currentRecords.length;
+
+          // 1. Batch allocate auto PKs strictly for current window (O(1) memory)
+          final missingPkIndices = <int>[];
+          bool hasUserProvidedPrimaryKeyInWindow = false;
+
+          if (!hasCustomPk) {
+            for (int i = 0; i < windowLen; i++) {
+              if (currentRecords[i][primaryKey] == null) {
+                missingPkIndices.add(i);
+              } else {
+                hasUserProvidedPrimaryKeyInWindow = true;
+              }
+            }
+
+            if (missingPkIndices.isNotEmpty) {
+              final newIds = await tableDataManager.getBatchIds(
+                  table, missingPkIndices.length);
+              if (newIds.length != missingPkIndices.length) {
+                if (!allowPartialErrors) {
+                  return finish(DbResult.error(
+                    type: ResultType.engError,
+                    message:
+                        'Failed to generate enough primary keys for batch insert',
+                    failedKeys: returnResultDetails ? failedKeys : const [],
+                  ));
+                }
+              } else {
+                for (int i = 0; i < missingPkIndices.length; i++) {
+                  currentRecords[missingPkIndices[i]][primaryKey] = newIds[i];
+                }
+              }
+            }
+          } else {
+            hasUserProvidedPrimaryKeyInWindow = true;
+          }
+
+          final bool isWindowAllAutoPk =
+              !hasCustomPk && missingPkIndices.length == windowLen;
+          final bool isWindowAllUserPk =
+              !hasCustomPk && missingPkIndices.isEmpty;
+          final Set<int>? autoPkIndexSet =
+              (!isWindowAllAutoPk && !isWindowAllUserPk)
+                  ? missingPkIndices.toSet()
+                  : null;
+
+          final bool needDiskUniqueCheck = needDiskUniqueCheckBase ||
+              (!skipDiskUniqueChecks &&
+                  _indexManager != null &&
+                  hasUserProvidedPrimaryKeyInWindow);
 
           // Batch Foreign Key validation: 1:1 aligned directly on currentRecords (zero interim lists)
           final List<DbException?>? batchFkViolations = hasForeignKeys
@@ -4286,8 +4259,17 @@ class DataStoreImpl {
                               table, pkVal);
                         } catch (_) {}
 
+                        bool isRecAutoPk(Map<String, dynamic> r) {
+                          if (isWindowAllAutoPk) return true;
+                          if (isWindowAllUserPk || autoPkIndexSet == null) {
+                            return false;
+                          }
+                          final idx = currentRecords.indexOf(r);
+                          return idx >= 0 && autoPkIndexSet.contains(idx);
+                        }
+
                         // If the ID was auto-generated by the system, re-assign a new ID and heal
-                        if (orig != null && autoPkRecords.contains(orig)) {
+                        if (orig != null && isRecAutoPk(orig)) {
                           try {
                             final newId =
                                 await tableDataManager.getNextId(table);
@@ -4319,7 +4301,7 @@ class DataStoreImpl {
                               .add('pk=$rid: [Disk Conflict] ${vio.message}');
                         }
                       }
-                      final originalIndex = recordsToProcess
+                      final originalIndex = currentRecords
                           .indexWhere((r) => r[primaryKey]?.toString() == rid);
                       final effectiveIndex =
                           originalIndex != -1 ? originalIndex + start : 0;
@@ -4467,7 +4449,10 @@ class DataStoreImpl {
             final loopYield = yieldController.maybeYield();
             if (loopYield != null) await loopYield;
 
-            final bool isAutoPk = autoPkRecords.contains(record);
+            final bool isAutoPk = isWindowAllAutoPk ||
+                (!isWindowAllUserPk &&
+                    autoPkIndexSet != null &&
+                    autoPkIndexSet.contains(offset));
 
             try {
               bool finishedRecord = false;
@@ -4624,11 +4609,15 @@ class DataStoreImpl {
                         if (isAutoPk) {
                           final List<Map<String, dynamic>>
                               subsequentToReassign = [];
-                          for (int k = j + 1;
-                              k < recordsToProcess.length;
+                          for (int k = offset + 1;
+                              k < currentRecords.length;
                               k++) {
-                            if (autoPkRecords.contains(recordsToProcess[k])) {
-                              subsequentToReassign.add(recordsToProcess[k]);
+                            final bool isKAutoPk = isWindowAllAutoPk ||
+                                (!isWindowAllUserPk &&
+                                    autoPkIndexSet != null &&
+                                    autoPkIndexSet.contains(k));
+                            if (isKAutoPk) {
+                              subsequentToReassign.add(currentRecords[k]);
                             }
                           }
 
