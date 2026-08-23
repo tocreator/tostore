@@ -33,7 +33,7 @@
 - [ToStore를 선택해야 하는 이유](#why-tostore) | [주요 기능](#key-features) | [설치 안내](#installation) | [KV 모드](#quick-start-kv) | [테이블 모드](#quick-start-table) | [메모리 모드](#quick-start-memory)
 - [스키마 정의](#schema-definition) | [분산 아키텍처](#distributed-architecture) | [계단식 외래 키](#foreign-keys) | [모바일/데스크톱](#mobile-integration) | [서버/에이전트](#server-integration) | [기본 키 알고리즘](#primary-key-examples)
 - [고급 쿼리(JOIN)](#query-advanced) | [집계 및 통계](#aggregation-stats) | [복잡한 논리(쿼리조건)](#query-condition) | [반응형 쿼리(보기)](#reactive-query) | [스트리밍 쿼리](#streaming-query)
-- [KV 고급 작업](#kv-advanced) | [일괄 작업](#bulk-operations) | [벡터 검색](#vector-advanced) | [테이블 수준 TTL](#ttl-config) | [효율적인 페이지 매김](#query-pagination) | [쿼리 캐시](#query-cache) | [원자 표현](#atomic-expressions) | [거래](#transactions)
+- [KV 고급 작업](#kv-advanced) | [일괄 작업](#bulk-operations) | [벡터 검색](#vector-advanced) | [테이블 수준 TTL](#ttl-config) | [효율적인 페이지 매김](#query-pagination) | [메모리 프로브 및 동기 검색 (peek)](#query-peek) | [쿼리 캐시](#query-cache) | [원자 표현](#atomic-expressions) | [거래](#transactions)
 - [관리](#database-maintenance) | [보안설정](#security-config) | [오류 처리](#error-handling) | [성능 및 진단](#performance) | [기여](#contribute)
 
 ## <a id="why-tostore"></a>왜 ToStore를 선택해야 할까요?
@@ -1059,6 +1059,44 @@ if (nextToken != null) {
 | **쿼리 성능** | 페이지가 깊어질수록 저하됨 | 깊은 페이지 매김에서도 항상 일정함 |
 | **가장 적합한 용도** | 적은 데이터 세트, 정확한 페이지 이동 | **대량 데이터 세트, 무한 스크롤** |
 | **데이터 변경 시 일관성** | 데이터 변경으로 인한 행 건너뛰기/중복 발생 가능 | 데이터 변경으로 인한 중복 및 누락 방지 |
+
+
+### <a id="query-peek"></a>메모리 프로브 및 동기 검색 (peek)
+
+처리량과 지연 시간에 극단적인 요구가 있는 시나리오를 위해 ToStore는 `peek` 순수 동기 메모리 검색 시리즈를 제공합니다. 프로세스 내에서 버스트형 핫 리드 트래픽을 직접 처리할 수 있습니다: **엣지 측**은 백만 건/초급 읽기를, **서버 측**은 더 강력한 하드웨어에서 단일 머신 천만 건/초급에 도달할 수 있습니다(자세한 내용은 [벤치마크](#performance) 참조).
+
+> [!NOTE]
+> **메모리 캐시 전용**: `peek`는 제로 스케줄링 순수 메모리 바이패스입니다. 캐시 미스 시 즉시 빈 값/`null`을 반환하며, 엔진은 동기 파일 I/O를 수행하지 않습니다(고동시성 시 이벤트 루프 블로킹 방지). 완전한 영속 결과가 필요하면 애플리케이션에서 `await query()`를 사용하세요.
+
+#### peek API 메서드
+| 메서드 | 반환 유형 | 설명 |
+| :--- | :--- | :--- |
+| `peekFirst()` | `Map<String, dynamic>?` | 단일 레코드; 캐시 미스 시 `null` |
+| `peek()` | `QueryResult<T>` | `data` 목록 및 페이지네이션 메타데이터(`hasMore`, 커서 등)가 포함된 `QueryResult`; 캐시 히트 시에만 데이터 있음 |
+| `peekExists()` | `bool` | 메모리 캐시에 일치 레코드가 있는지 동기 확인 |
+| `peekCount()` | `int` | 메모리 캐시의 일치 레코드 수를 동기 집계 |
+| `result.peekNext()` | `QueryResult<T>` | 페이지네이션 결과가 캐시된 경우 동기 다음 페이지 |
+| `result.peekPrev()` | `QueryResult<T>` | 페이지네이션 결과가 캐시된 경우 동기 이전 페이지 |
+
+#### 모범 사례: 메모리 프로브 우선 (Peek-Through)
+```dart
+// 단일 레코드: 메모리 프로브 먼저, 미스 시 표준 비동기 쿼리
+final q = db.query('users').where('id', '=', userId);
+final user = q.peekFirst() ?? await q.first();
+
+// 페이지네이션 프로브
+final listQ = db.query('users').orderByDesc('id').limit(20);
+var page = listQ.peek();
+if (page.data.isEmpty) page = await listQ;
+
+if (page.hasMore) {
+  final next = page.peekNext(); // 캐시 히트: 동기 페이지 전환
+  if (next.data.isEmpty) await page.next();
+}
+```
+
+> [!TIP]
+> **권장**: 표준 비동기 쿼리(`await query()`)는 이벤트 스케줄링으로 장기 안정성과 멀티태스크 공정성을 보장하며, 10만+ QPS면 대부분의 업무에 충분합니다. `peek` 시리즈는 단일 머신에서 백만/천만 건/초급 극한 핫 리드 피크 셰이빙을 위해 설계되었습니다.
 
 
 ### <a id="foreign-keys"></a>외래 키 및 계단식 배열

@@ -33,7 +33,7 @@
 - [Why ToStore](#why-tostore) | [Hauptmerkmale](#key-features) | [Installationsanleitung](#installation) | [KV-Modus](#quick-start-kv) | [Tabellenmodus](#quick-start-table) | [Speichermodus](#quick-start-memory)
 - [Schemadefinition](#schema-definition) | [Verteilte Architektur](#distributed-architecture) | [Kaskadierende Fremdschlüssel](#foreign-keys) | [Mobil/Desktop](#mobile-integration) | [Server/Agent](#server-integration) | [Primärschlüsselalgorithmen](#primary-key-examples)
 - [Erweiterte Abfragen (JOIN)](#query-advanced) | [Aggregation & Statistik](#aggregation-stats) | [Komplexe Logik (Abfragebedingung)](#query-condition) | [Reaktive Abfrage (beobachten)](#reactive-query) | [Streaming-Anfrage](#streaming-query)
-- [Fortgeschrittenes KV](#kv-advanced) | [Stapeloperationen](#bulk-operations) | [Vektorsuche](#vector-advanced) | [TTL auf Tabellenebene](#ttl-config) | [Effiziente Paginierung](#query-pagination) | [Abfrage-Cache](#query-cache) | [Atomare Ausdrücke](#atomic-expressions) | [Transaktionen](#transactions)
+- [Fortgeschrittenes KV](#kv-advanced) | [Stapeloperationen](#bulk-operations) | [Vektorsuche](#vector-advanced) | [TTL auf Tabellenebene](#ttl-config) | [Effiziente Paginierung](#query-pagination) | [Speicher-Sonde und synchrone Abfrage (peek)](#query-peek) | [Abfrage-Cache](#query-cache) | [Atomare Ausdrücke](#atomic-expressions) | [Transaktionen](#transactions)
 - [Administration](#database-maintenance) | [Sicherheitskonfiguration](#security-config) | [Fehlerbehandlung](#error-handling) | [Leistung und Diagnose](#performance) | [Mitwirken](#contribute)
 
 ## <a id="why-tostore"></a>Warum ToStore wählen?
@@ -1058,6 +1058,44 @@ if (nextToken != null) {
 | **Abfrageleistung** | Nimmt mit zunehmender Seitenzahl ab | Konstante Geschwindigkeit bei tiefer Paginierung |
 | **Beste Eignung** | Kleinere Datensätze, exakte Seitensprünge | **Riesige Datensätze, unendliches Scrollen** |
 | **Konsistenz bei Änderungen** | Datenänderungen können zu doppelten oder übersprungenen Zeilen führen | Vermeidet Duplikate und Auslassungen durch Datenänderungen |
+
+
+### <a id="query-peek"></a>Speicher-Sonde und synchrone Abfrage (peek)
+
+Für Szenarien mit extremen Anforderungen an Durchsatz und Latenz bietet ToStore die `peek`-Serie rein synchroner In-Memory-Abfragen und absorbiert Burst-Hot-Reads direkt im Prozess: **Edge-Geräte** können Millionen Leseanfragen pro Sekunde verarbeiten; **Server** mit stärkerer Hardware erreichen zig Millionen pro Maschine (siehe [Benchmarks](#performance)).
+
+> [!NOTE]
+> **Nur In-Memory-Cache**: `peek` ist ein Zero-Scheduling-Rein-Memory-Bypass. Bei Cache-Miss wird sofort leer/`null` zurückgegeben; die Engine führt kein synchrones Datei-I/O aus (vermeidet Event-Loop-Blockierung unter hoher Parallelität). Für vollständige persistente Ergebnisse `await query()` in der Anwendung verwenden.
+
+#### peek-API-Methoden
+| Methode | Rückgabetyp | Beschreibung |
+| :--- | :--- | :--- |
+| `peekFirst()` | `Map<String, dynamic>?` | Einzelner Datensatz; `null` bei Cache-Miss |
+| `peek()` | `QueryResult<T>` | `QueryResult` mit `data`-Liste und Paginierungsmetadaten (`hasMore`, Cursor usw.); Daten nur bei Cache-Treffer |
+| `peekExists()` | `bool` | Prüft synchron, ob ein passender Datensatz im Cache existiert |
+| `peekCount()` | `int` | Zählt synchron passende Datensätze im Cache |
+| `result.peekNext()` | `QueryResult<T>` | Synchrone nächste Seite bei gecachtem Paginierungsergebnis |
+| `result.peekPrev()` | `QueryResult<T>` | Synchrone vorherige Seite bei gecachtem Paginierungsergebnis |
+
+#### Best Practice: Speichersonde zuerst (Peek-Through)
+```dart
+// Einzeldatensatz: Speichersonde zuerst, bei Miss Standard-Async-Abfrage
+final q = db.query('users').where('id', '=', userId);
+final user = q.peekFirst() ?? await q.first();
+
+// Paginierte Sondenabfrage
+final listQ = db.query('users').orderByDesc('id').limit(20);
+var page = listQ.peek();
+if (page.data.isEmpty) page = await listQ;
+
+if (page.hasMore) {
+  final next = page.peekNext(); // Cache-Treffer: synchrone Seitenwechsel
+  if (next.data.isEmpty) await page.next();
+}
+```
+
+> [!TIP]
+> **Empfehlung**: Standard-Async-Abfragen (`await query()`) sichern durch Event-Scheduling langfristige Stabilität und faire Multitasking; 100k+ QPS genügen für die meisten Workloads. Die `peek`-Serie ist für extreme Hot-Read-Spitzen mit Millionen/Zig-Millionen QPS pro Maschine konzipiert.
 
 
 ### <a id="foreign-keys"></a>Fremdschlüssel und Kaskadierung

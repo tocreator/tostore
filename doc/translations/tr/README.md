@@ -33,7 +33,7 @@
 - [Neden Saklamalı](#why-tostore) | [Temel Özellikler](#key-features) | [Kurulum Kılavuzu](#installation) | [KV Modu](#quick-start-kv) | [Tablo Modu](#quick-start-table) | [Bellek Modu](#quick-start-memory)
 - [Şema Tanımı](#schema-definition) | [Dağıtılmış Mimari](#distributed-architecture) | [Basamaklı Yabancı Anahtarlar](#foreign-keys) | [Mobil/Masaüstü](#mobile-integration) | [Sunucu/Aracı](#server-integration) | [Birincil Anahtar Algoritmaları](#primary-key-examples)
 - [Gelişmiş Sorgular (KATIL)](#query-advanced) | [Toplama ve İstatistikler](#aggregation-stats) | [Karmaşık Mantık (Sorgu Durumu)](#query-condition) | [Reaktif Sorgu (izle)](#reactive-query) | [Akış Sorgusu](#streaming-query)
-- [Gelişmiş KV](#kv-advanced) | [Toplu İşlemler](#bulk-operations) | [Vektör Arama](#vector-advanced) | [Tablo düzeyinde TTL](#ttl-config) | [Etkili Sayfalandırma](#query-pagination) | [Sorgu Önbelleği](#query-cache) | [Atomik İfadeler](#atomic-expressions) | [İşlemler](#transactions)
+- [Gelişmiş KV](#kv-advanced) | [Toplu İşlemler](#bulk-operations) | [Vektör Arama](#vector-advanced) | [Tablo düzeyinde TTL](#ttl-config) | [Etkili Sayfalandırma](#query-pagination) | [Bellek Probu ve Senkron Arama (peek)](#query-peek) | [Sorgu Önbelleği](#query-cache) | [Atomik İfadeler](#atomic-expressions) | [İşlemler](#transactions)
 - [Yönetim](#database-maintenance) | [Güvenlik Yapılandırması](#security-config) | [Hata İşleme](#error-handling) | [Performans ve Tanılama](#performance) | [Katkıda Bulunma](#contribute)
 
 ## <a id="why-tostore"></a>Neden ToStore'u Seçmelisiniz?
@@ -1058,6 +1058,44 @@ if (nextToken != null) {
 | **Sorgu Performansı** | Sayfa sayısı arttıkça düşer | Derin sayfalama için sabit hız |
 | **En İyi Kullanım Yeri** | Küçük veri kümeleri, tam sayfa atlamaları | **Büyük veri kümeleri, sonsuz kaydırma** |
 | **Değişikliklerde Tutarlılık** | Veri değişiklikleri yinelenen veya atlanan satırlara neden olabilir | Veri değişikliklerinden kaynaklanan yinelemeleri ve eksiklikleri önler |
+
+
+### <a id="query-peek"></a>Bellek Probu ve Senkron Arama (peek)
+
+İş hacmi ve gecikme açısından aşırı gereksinimleri olan senaryolar için ToStore, `peek` saf senkron bellek arama serisini sunar ve patlama halindeki sıcak okuma trafiğini doğrudan süreç içinde karşılar: **edge tarafı** saniyede milyonlarca okuma isteğini; **sunucu tarafı** daha güçlü donanımla makine başına on milyonlarca okumayı karşılayabilir (ayrıntılar için [Kıyaslamalar](#performance) bölümüne bakın).
+
+> [!NOTE]
+> **Yalnızca bellek önbelleği**: `peek` sıfır zamanlama ile saf bellek bypass'ıdır. Önbellek isabetsizliğinde hemen boş/`null` döner; motor senkron dosya G/Ç yapmaz (yüksek eşzamanlılıkta olay döngüsü tıkanmasını önler). Tam kalıcı sonuçlar için uygulamada `await query()` kullanın.
+
+#### peek API yöntemleri
+| Yöntem | Dönüş türü | Açıklama |
+| :--- | :--- | :--- |
+| `peekFirst()` | `Map<String, dynamic>?` | Tek kayıt; önbellek isabetsizliğinde `null` |
+| `peek()` | `QueryResult<T>` | `data` listesi ve sayfalama meta verileri (`hasMore`, imleçler vb.) içeren `QueryResult`; yalnızca önbellek isabetinde veri |
+| `peekExists()` | `bool` | Bellek önbelleğinde eşleşen kayıt olup olmadığını senkron kontrol eder |
+| `peekCount()` | `int` | Bellek önbelleğindeki eşleşen kayıtları senkron sayar |
+| `result.peekNext()` | `QueryResult<T>` | Sayfalama sonucu önbellekteyken senkron sonraki sayfa |
+| `result.peekPrev()` | `QueryResult<T>` | Sayfalama sonucu önbellekteyken senkron önceki sayfa |
+
+#### En iyi uygulama: bellek probu öncelikli (Peek-Through)
+```dart
+// Tek kayıt: önce bellek probu, isabetsizlikte standart asenkron sorgu
+final q = db.query('users').where('id', '=', userId);
+final user = q.peekFirst() ?? await q.first();
+
+// Sayfalı prob sorgusu
+final listQ = db.query('users').orderByDesc('id').limit(20);
+var page = listQ.peek();
+if (page.data.isEmpty) page = await listQ;
+
+if (page.hasMore) {
+  final next = page.peekNext(); // önbellek isabeti: senkron sayfa geçişi
+  if (next.data.isEmpty) await page.next();
+}
+```
+
+> [!TIP]
+> **Öneri**: Standart asenkron sorgular (`await query()`) olay zamanlaması ile uzun vadeli kararlılık ve çoklu görev adilliğini sağlar; 100k+ QPS çoğu iş yükü için yeterlidir. `peek` serisi, makine başına milyon/on milyon QPS düzeyindeki aşırı sıcak okuma tepe yüklerini karşılamak için tasarlanmıştır.
 
 
 ### <a id="foreign-keys"></a>Yabancı Anahtarlar ve Basamaklı

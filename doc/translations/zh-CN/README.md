@@ -39,7 +39,7 @@
 - [为什么选择ToStore](#why-tostore) | [核心特性](#key-features) | [安装指南](#installation) | [KV模式](#quick-start-kv) | [表模式](#quick-start-table) | [内存模式](#quick-start-memory)
 - [表结构定义](#schema-definition) | [分布式架构](#distributed-architecture) | [级联外键](#foreign-keys) | [移动/桌面端](#mobile-integration) | [服务端/智能体](#server-integration) | [主键算法](#primary-key-examples)
 - [高级查询 (JOIN)](#query-advanced) | [聚合与统计](#aggregation-stats) | [复杂逻辑 (Condition)](#query-condition) | [响应式监听 (watch)](#reactive-query) | [流式查询](#streaming-query)
-- [KV进阶](#kv-advanced) | [批量操作](#bulk-operations) | [向量检索](#vector-advanced) | [表级 TTL](#ttl-config) | [高效分页](#query-pagination) | [查询缓存](#query-cache) | [原子操作](#atomic-expressions) | [事务](#transactions)
+- [KV进阶](#kv-advanced) | [批量操作](#bulk-operations) | [向量检索](#vector-advanced) | [表级 TTL](#ttl-config) | [高效分页](#query-pagination) | [内存探针与同步检索 (peek)](#query-peek) | [查询缓存](#query-cache) | [原子操作](#atomic-expressions) | [事务](#transactions)
 - [管理维护](#database-maintenance) | [安全配置](#security-config) | [错误处理](#error-handling) | [性能与诊断](#performance) | [欢迎贡献](#contribute)
 
 
@@ -1081,6 +1081,46 @@ if (nextToken != null) {
 | **查询性能** | 随页数增加而下降 | 深度翻页时始终恒定 |
 | **适用范围** | 少量数据、精确页码跳转 | **海量数据、无限滚动** |
 | **数据一致性** | 数据变动导致跳行/重复行 | 避免数据变动导致的重复或遗漏 |
+
+
+
+### <a id="query-peek"></a>内存探针与同步检索 (peek)
+
+对吞吐和延迟有极端要求的场景，ToStore 提供 `peek` 纯同步内存检索系列，直接在进程内即可抗住爆发热点读流量：**边缘端**可承接百万级读请求，**服务端**更强硬件下单机可达千万级（详见 [基准测试](#performance)）。
+
+> [!NOTE]
+> **仅从内存缓存检索**：`peek` 属零调度纯内存旁路，未命中立即返回空/`null`，引擎不做同步文件 I/O（避免高并发下阻塞事件循环）；需要完整持久化结果时由业务自行 `await query()` 回退。
+
+#### peek系列方法
+| 方法 | 返回类型 | 功能说明 |
+| :--- | :--- | :--- |
+| `peekFirst()` | `Map<String, dynamic>?` | 单条记录，未命中立即返回 `null` |
+| `peek()` | `QueryResult<T>` | 返回 `QueryResult`（`data` 列表及 `hasMore`、游标等分页信息），仅内存命中时有数据 |
+| `peekExists()` | `bool` | 同步检查内存缓存中是否存在匹配记录 |
+| `peekCount()` | `int` | 同步统计内存缓存中的匹配记录数量 |
+| `result.peekNext()` | `QueryResult<T>` | 分页缓存命中时的同步下一页翻页 |
+| `result.peekPrev()` | `QueryResult<T>` | 分页缓存命中时的同步上一页翻页 |
+
+#### 最佳实践：内存探针优先 (Peek-Through)
+```dart
+// 单条探针：先走内存探针(极速削峰)，未命中回退标准异步读盘
+final q = db.query('users').where('id', '=', userId);
+final user = q.peekFirst() ?? await q.first();
+
+// 分页探针查询
+final listQ = db.query('users').orderByDesc('id').limit(20);
+var page = listQ.peek();
+if (page.data.isEmpty) page = await listQ;
+
+if (page.hasMore) {
+  final next = page.peekNext(); // 缓存命中，同步翻页
+  if (next.data.isEmpty) await page.next();
+}
+```
+
+> [!TIP]
+> **建议**：标准异步查询（`await query()`）通过事件调度保障系统长效稳定与多任务公平，十万级 QPS 已完全满足绝大多数业务；`peek` 系列则专为单机突破百万/千万级极端热点读削峰设计。
+
 
 
 

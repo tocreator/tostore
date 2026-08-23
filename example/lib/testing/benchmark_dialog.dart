@@ -131,11 +131,31 @@ class _BenchmarkDialogState extends State<BenchmarkDialog> {
             ? _buildResultsView(context, widget.lastSummary!)
             : _buildConfigView(context),
       ),
-      actionsAlignment: MainAxisAlignment.end,
       actionsPadding: const EdgeInsets.fromLTRB(24, 0, 24, 20),
-      actions: _isViewingResults
-          ? _buildResultsActions(context, widget.lastSummary!)
-          : _buildConfigActions(context),
+      actions: [
+        _buildActionBar(
+          _isViewingResults
+              ? _buildResultsActionButtons(context, widget.lastSummary!)
+              : _buildConfigActionButtons(context),
+        ),
+      ],
+    );
+  }
+
+  bool _isCompactActions(BuildContext context) =>
+      MediaQuery.sizeOf(context).width < 420;
+
+  /// Responsive action row: wraps on narrow screens instead of overlapping.
+  Widget _buildActionBar(List<Widget> children) {
+    return SizedBox(
+      width: double.infinity,
+      child: Wrap(
+        spacing: 8,
+        runSpacing: 10,
+        alignment: WrapAlignment.end,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: children,
+      ),
     );
   }
 
@@ -311,43 +331,47 @@ class _BenchmarkDialogState extends State<BenchmarkDialog> {
     );
   }
 
-  List<Widget> _buildResultsActions(
+  List<Widget> _buildResultsActionButtons(
       BuildContext context, BenchmarkSummary summary) {
+    final compact = _isCompactActions(context);
+    final buttonPadding = EdgeInsets.symmetric(
+      horizontal: compact ? 10 : 14,
+      vertical: compact ? 8 : 10,
+    );
+
     return [
       TextButton(
         onPressed: () => Navigator.of(context).pop(),
         child: const Text('Close'),
       ),
-      const SizedBox(width: 8),
       OutlinedButton.icon(
         style: OutlinedButton.styleFrom(
-          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          padding: buttonPadding,
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(8),
           ),
         ),
         icon: const Icon(Icons.tune_rounded, size: 18),
-        label: const Text('New Benchmark'),
+        label: Text(compact ? 'New' : 'New Benchmark'),
         onPressed: () {
           setState(() {
             _isViewingResults = false;
           });
         },
       ),
-      const SizedBox(width: 8),
       ElevatedButton.icon(
         style: ElevatedButton.styleFrom(
           foregroundColor: Colors.white,
           backgroundColor: const Color.fromARGB(255, 10, 150, 210),
-          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+          padding: buttonPadding,
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(8),
           ),
         ),
         icon: const Icon(Icons.refresh_rounded, size: 18),
-        label: const Text(
-          'Re-run Test',
-          style: TextStyle(fontWeight: FontWeight.bold),
+        label: Text(
+          compact ? 'Re-run' : 'Re-run Test',
+          style: const TextStyle(fontWeight: FontWeight.bold),
         ),
         onPressed: () => _onStart(summary.config),
       ),
@@ -496,26 +520,30 @@ class _BenchmarkDialogState extends State<BenchmarkDialog> {
     );
   }
 
-  List<Widget> _buildConfigActions(BuildContext context) {
+  List<Widget> _buildConfigActionButtons(BuildContext context) {
+    final compact = _isCompactActions(context);
+
     return [
       TextButton(
         onPressed: () => Navigator.of(context).pop(),
         child: const Text('Cancel'),
       ),
-      const SizedBox(width: 8),
       ElevatedButton.icon(
         style: ElevatedButton.styleFrom(
           foregroundColor: Colors.white,
           backgroundColor: const Color.fromARGB(255, 10, 150, 210),
-          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+          padding: EdgeInsets.symmetric(
+            horizontal: compact ? 14 : 20,
+            vertical: compact ? 10 : 12,
+          ),
           shape: RoundedRectangleBorder(
             borderRadius: BorderRadius.circular(10),
           ),
         ),
         icon: const Icon(Icons.play_arrow_rounded, size: 20),
-        label: const Text(
-          'Start Benchmark',
-          style: TextStyle(fontWeight: FontWeight.bold),
+        label: Text(
+          compact ? 'Start' : 'Start Benchmark',
+          style: const TextStyle(fontWeight: FontWeight.bold),
         ),
         onPressed: () => _onStart(),
       ),

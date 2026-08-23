@@ -33,7 +33,7 @@
 - [ストアする理由](#why-tostore) | 【主な特長】(#key-features) | [インストールガイド](#installation) | [KVモード](#quick-start-kv) | [テーブルモード](#quick-start-table) | [メモリーモード](#quick-start-memory)
 - [スキーマ定義](#schema-definition) | [分散アーキテクチャ](#distributed-architecture) | [カスケード外部キー](#foreign-keys) | [モバイル/デスクトップ](#mobile-integration) | [サーバー/エージェント](#server-integration) | [主キーのアルゴリズム](#primary-key-examples)
 - [高度なクエリ (JOIN)](#query-advanced) | [集計と統計](#aggregation-stats) | [複雑なロジック(QueryCondition)](#query-condition) | [リアクティブクエリ (監視)](#reactive-query) | [ストリーミングクエリ](#streaming-query)
-- [KV高度な操作](#kv-advanced) | [一括操作](#bulk-operations) | [ベクトル検索](#vector-advanced) | [テーブルレベル TTL](#ttl-config) | [効率的なページネーション](#query-pagination) | [クエリキャッシュ](#query-cache) | [原子式](#atomic-expressions) | 【取引】(#transactions)
+- [KV高度な操作](#kv-advanced) | [一括操作](#bulk-operations) | [ベクトル検索](#vector-advanced) | [テーブルレベル TTL](#ttl-config) | [効率的なページネーション](#query-pagination) | [メモリプローブと同期検索 (peek)](#query-peek) | [クエリキャッシュ](#query-cache) | [原子式](#atomic-expressions) | 【取引】(#transactions)
 - [管理](#database-maintenance) | [セキュリティ設定](#security-config) | [エラー処理](#error-handling) | [パフォーマンスと診断](#performance) | [貢献](#contribute)
 
 ## <a id="why-tostore"></a>ToStore を選ぶ理由
@@ -1059,6 +1059,44 @@ if (nextToken != null) {
 | **クエリのパフォーマンス** | ページ数が増えるにつれて低下 | ディープページングでも速度は常に一定 |
 | **最適な用途** | 小規模なデータセット、正確なページジャンプ | **大規模なデータセット、無限スクロール** |
 | **データ変更時の一貫性** | データの変更によって行の重複や欠落が発生しやすい | データ変更による重複や欠落を回避 |
+
+
+### <a id="query-peek"></a>メモリプローブと同期検索 (peek)
+
+スループットとレイテンシに極端な要求があるシナリオ向けに、ToStore は `peek` 純同期メモリ検索シリーズを提供します。プロセス内でバースト的なホットリードを直接さばけます：**エッジ側**は百万件/秒級の読み取りに対応、**サーバー側**はより強力なハードウェアで単機千万件/秒級に達可能（詳細は [ベンチマーク](#performance)）。
+
+> [!NOTE]
+> **メモリキャッシュのみ**：`peek` はゼロスケジューリングの純メモリバイパスです。キャッシュミス時は即座に空/`null` を返し、エンジンは同期ファイル I/O を行いません（高並行時のイベントループブロックを回避）。完全な永続化結果が必要な場合は、アプリケーション側で `await query()` を使用してください。
+
+#### peek API メソッド
+| メソッド | 戻り値の型 | 説明 |
+| :--- | :--- | :--- |
+| `peekFirst()` | `Map<String, dynamic>?` | 単一レコード；キャッシュミス時は `null` |
+| `peek()` | `QueryResult<T>` | `data` リストとページネーションメタデータ（`hasMore`、カーソル等）を含む `QueryResult`；キャッシュヒット時のみデータあり |
+| `peekExists()` | `bool` | メモリキャッシュ内の一致レコードの存在を同期的に確認 |
+| `peekCount()` | `int` | メモリキャッシュ内の一致レコード数を同期的にカウント |
+| `result.peekNext()` | `QueryResult<T>` | ページネーション結果がキャッシュされている場合の同期次ページ |
+| `result.peekPrev()` | `QueryResult<T>` | ページネーション結果がキャッシュされている場合の同期前ページ |
+
+#### ベストプラクティス：メモリプローブ優先 (Peek-Through)
+```dart
+// 単一レコード：メモリプローブを先に試行、ミス時は標準非同期クエリ
+final q = db.query('users').where('id', '=', userId);
+final user = q.peekFirst() ?? await q.first();
+
+// ページネーションプローブ
+final listQ = db.query('users').orderByDesc('id').limit(20);
+var page = listQ.peek();
+if (page.data.isEmpty) page = await listQ;
+
+if (page.hasMore) {
+  final next = page.peekNext(); // キャッシュヒット：同期ページ送り
+  if (next.data.isEmpty) await page.next();
+}
+```
+
+> [!TIP]
+> **推奨**：標準の非同期クエリ（`await query()`）はイベントスケジューリングにより長期安定性とマルチタスクの公平性を保証し、10万 QPS 以上で大多数の業務に十分です。`peek` シリーズは単機で百万/千万件/秒級の極端なホットリード削峰向けに設計されています。
 
 
 ### <a id="foreign-keys"></a>外部キーとカスケード

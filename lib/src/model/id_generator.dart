@@ -48,8 +48,7 @@ class SequentialIdGenerator implements IdGenerator {
   final Random _random = Random(DateTime.now().millisecondsSinceEpoch);
 
   final Queue<String> _idPool = Queue<String>();
-  final LockManager _lockManager = LockManager();
-  bool _idGenerationInProgress = false;
+  Future<void>? _refillTask;
 
   int _recentRequestCount = 0;
   DateTime _lastCountResetTime = DateTime.now();
@@ -109,17 +108,15 @@ class SequentialIdGenerator implements IdGenerator {
   }
 
   Future<void> _refillIdPool(int targetCount, int recentTotal) async {
-    if (_idGenerationInProgress) return;
+    if (_refillTask != null) {
+      await _refillTask;
+      if (_idPool.length >= targetCount) return;
+    }
 
-    bool acquired = false;
-    final lockResource = 'sequential_id_refill_${tableUid ?? "default"}';
-    final operationId = '${tableUid ?? "default"}_sequential_refill';
+    final completer = Completer<void>();
+    _refillTask = completer.future;
+
     try {
-      _idGenerationInProgress = true;
-      acquired =
-          await _lockManager.acquireExclusiveLock(lockResource, operationId);
-      if (!acquired) return;
-
       final currentPoolSize = _idPool.length;
       if (currentPoolSize >= targetCount) return;
 
@@ -152,9 +149,9 @@ class SequentialIdGenerator implements IdGenerator {
     } catch (e) {
       Logger.error('SequentialIdGenerator refill failed', rawError: e);
     } finally {
-      _idGenerationInProgress = false;
-      if (acquired) {
-        _lockManager.releaseExclusiveLock(lockResource, operationId);
+      _refillTask = null;
+      if (!completer.isCompleted) {
+        completer.complete();
       }
     }
   }
@@ -165,38 +162,27 @@ class SequentialIdGenerator implements IdGenerator {
 
     _updateRequestStats(count);
 
-    // Fast-path: single-node sequential increment (pure synchronous mathematical range allocation)
-    if (!isDistributed && !config.useRandomIncrement) {
-      final inc = config.increment;
-      final result = List<String>.generate(count, (i) {
-        _currentId += inc;
-        return _currentId.toString();
-      }, growable: false);
-      return result;
-    }
-
-    if (!isDistributed && config.useRandomIncrement) {
-      final result = <String>[];
-      for (int i = 0; i < count; i++) {
-        _currentId += _random.nextInt(config.increment) + 1;
-        result.add(_currentId.toString());
-      }
-      return result;
-    }
-
-    // Distributed / pool-backed path
+    // 1. Consume readily available IDs from pre-filled pool (pure synchronous, 0 block)
     final result = <String>[];
     while (result.length < count && _idPool.isNotEmpty) {
       result.add(_idPool.removeFirst());
     }
-    if (result.length == count) return result;
 
+    if (result.length == count) {
+      // Background proactive refill when pool drops below half batch size
+      if (_idPool.length < _minGenerateBatchSize ~/ 2 && _refillTask == null) {
+        unawaited(_refillIdPool(
+            _calculateExpectedPoolSize(_getRecentRequestCount()), 0));
+      }
+      return result;
+    }
+
+    // 2. Pool empty or insufficient: synchronous refill to satisfy remainder
     final effectiveRecentTotal =
         recentTotal > 0 ? recentTotal : _getRecentRequestCount();
     final expectedPoolSize = _calculateExpectedPoolSize(effectiveRecentTotal);
     final targetSize = expectedPoolSize + (count - result.length);
 
-    // Directly await refill rather than un-awaited fire with 10ms polling loops
     await _refillIdPool(targetSize, effectiveRecentTotal);
 
     while (result.length < count && _idPool.isNotEmpty) {
@@ -209,7 +195,7 @@ class SequentialIdGenerator implements IdGenerator {
           type: ResultType.sysTimeout,
           message:
               'SequentialIdGenerator: Pool empty and fill timeout. Request=$count, '
-              'RefillInProgress=$_idGenerationInProgress, PoolSize=${_idPool.length}.',
+              'RefillInProgress=${_refillTask != null}, PoolSize=${_idPool.length}.',
         )
       ]);
     }

@@ -33,7 +33,7 @@
 - [Perché ToStore](#why-tostore) | [Caratteristiche principali](#key-features) | [Guida all'installazione](#installation) | [Modalità KV](#quick-start-kv) | [Modalità tabella](#quick-start-table) | [Modalità memoria](#quick-start-memory)
 - [Definizione dello schema](#schema-definition) | [Architettura distribuita](#distributed-architecture) | [Chiavi esterne a cascata](#foreign-keys) | [Cellulare/Desktop](#mobile-integration) | [Server/Agente](#server-integration) | [Algoritmi a chiave primaria](#primary-key-examples)
 - [Query avanzate (JOIN)](#query-advanced) | [Aggregazione e statistiche](#aggregation-stats) | [Logica complessa (Condizione query)](#query-condition) | [Query reattiva (guarda)](#reactive-query) | [Query sullo streaming](#streaming-query)
-- [KV avanzate](#kv-advanced) | [Operazioni in blocco](#bulk-operations) | [Ricerca vettoriale](#vector-advanced) | [TTL a livello di tabella](#ttl-config) | [Paginazione efficiente](#query-pagination) | [Cache delle query](#query-cache) | [Espressioni atomiche](#atomic-expressions) | [Transazioni](#transactions)
+- [KV avanzate](#kv-advanced) | [Operazioni in blocco](#bulk-operations) | [Ricerca vettoriale](#vector-advanced) | [TTL a livello di tabella](#ttl-config) | [Paginazione efficiente](#query-pagination) | [Sonda di memoria e recupero sincrono (peek)](#query-peek) | [Cache delle query](#query-cache) | [Espressioni atomiche](#atomic-expressions) | [Transazioni](#transactions)
 - [Amministrazione](#database-maintenance) | [Configurazione sicurezza](#security-config) | [Gestione degli errori](#error-handling) | [Prestazioni e diagnostica](#performance) | [Contribuire](#contribute)
 
 ## <a id="why-tostore"></a>Perché scegliere ToStore?
@@ -1058,6 +1058,44 @@ if (nextToken != null) {
 | **Prestazioni della query** | Degrada con l'aumentare delle pagine | Velocità costante per la paginazione profonda |
 | **Ideale per** | Set di dati più piccoli, salti di pagina precisi | **Set di dati enormi, scorrimento infinito** |
 | **Coerenza con le modifiche** | Le modifiche ai dati possono causare righe duplicate o saltate | Evita duplicati e omissioni causati dalle modifiche ai dati |
+
+
+### <a id="query-peek"></a>Sonda di memoria e recupero sincrono (peek)
+
+Per scenari con requisiti estremi di throughput e latenza, ToStore fornisce la serie `peek` di recupero sincrono puramente in memoria, assorbendo letture hot in burst direttamente nel processo: i **dispositivi edge** possono sostenere milioni di letture al secondo; i **server** con hardware più potente possono raggiungere decine di milioni per macchina (vedi [Benchmark](#performance)).
+
+> [!NOTE]
+> **Solo cache in memoria**: `peek` è un bypass puramente in memoria senza scheduling. In caso di cache miss restituisce immediatamente vuoto/`null`; il motore non esegue I/O su file sincrono (evitando il blocco dell'event loop sotto alta concorrenza). Per risultati persistenti completi, usare `await query()` nell'applicazione.
+
+#### Metodi peek
+| Metodo | Tipo di ritorno | Descrizione |
+| :--- | :--- | :--- |
+| `peekFirst()` | `Map<String, dynamic>?` | Record singolo; `null` in caso di cache miss |
+| `peek()` | `QueryResult<T>` | `QueryResult` con lista `data` e metadati di paginazione (`hasMore`, cursori, ecc.); dati solo con cache hit |
+| `peekExists()` | `bool` | Verifica sincronamente l'esistenza di un record corrispondente in cache |
+| `peekCount()` | `int` | Conta sincronamente i record corrispondenti in cache |
+| `result.peekNext()` | `QueryResult<T>` | Pagina successiva sincrona quando il risultato paginato è in cache |
+| `result.peekPrev()` | `QueryResult<T>` | Pagina precedente sincrona quando il risultato paginato è in cache |
+
+#### Best practice: sonda di memoria prima (Peek-Through)
+```dart
+// Record singolo: sonda di memoria prima, query asincrona standard in caso di miss
+final q = db.query('users').where('id', '=', userId);
+final user = q.peekFirst() ?? await q.first();
+
+// Query paginata con sonda
+final listQ = db.query('users').orderByDesc('id').limit(20);
+var page = listQ.peek();
+if (page.data.isEmpty) page = await listQ;
+
+if (page.hasMore) {
+  final next = page.peekNext(); // cache hit: cambio pagina sincrono
+  if (next.data.isEmpty) await page.next();
+}
+```
+
+> [!TIP]
+> **Raccomandazione**: Le query asincrone standard (`await query()`) usano lo scheduling degli eventi per stabilità a lungo termine ed equità multitasking; 100k+ QPS sono sufficienti per la maggior parte dei carichi. La serie `peek` è progettata per picchi estremi di lettura hot a milioni/decine di milioni di QPS per macchina.
 
 
 ### <a id="foreign-keys"></a>Chiavi esterne e cascata

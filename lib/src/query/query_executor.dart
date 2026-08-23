@@ -210,7 +210,10 @@ class QueryExecutor {
     // Only non-PK, non-unique queries use Result Cache to prevent cache duplication!
     // =========================================================================
     final bool inTxn = TransactionContext.getCurrentTransactionId() != null;
-    final bool canUseResultCache = enableQueryCache && !inTxn && !isPointQuery;
+    final bool canUseResultCache = enableQueryCache &&
+        !inTxn &&
+        !isPointQuery &&
+        (joins == null || joins.isEmpty);
 
     final int defaultLimit = _dataStore.config.defaultQueryLimit;
     final int effectiveLimitForCache =
@@ -242,7 +245,7 @@ class QueryExecutor {
               resultCacheKey.tableUid.value, gen, queryStr);
         } else {
           return ExecuteResult(
-            records: entry.records,
+            records: _copyResultList(entry.records),
             nextCursor: entry.nextCursor,
             prevCursor: entry.prevCursor,
             hasMore: entry.hasMore,
@@ -526,8 +529,11 @@ class QueryExecutor {
     final bool isPointQuery = isPkPoint || isUniquePoint;
 
     final bool inTxn = TransactionContext.getCurrentTransactionId() != null;
-    final bool canUseResultCache =
-        enableQueryCache && !readFromFileOnly && !inTxn && !isPointQuery;
+    final bool canUseResultCache = enableQueryCache &&
+        !readFromFileOnly &&
+        !inTxn &&
+        !isPointQuery &&
+        (joins == null || joins.isEmpty);
 
     // Limit threshold: only cache result sets with limit <= 500 (or count/scalar aggregations)
     final int defaultLimit = _dataStore.config.defaultQueryLimit;
@@ -538,6 +544,7 @@ class QueryExecutor {
         (aggregations != null && aggregations.isNotEmpty);
 
     QueryCacheKey? resultCacheKey;
+    int? resultCacheStartGen;
 
     // =========================================================================
     // TIER-0: RESULT CACHE (Hot NonPoint Query Result Lookup)
@@ -557,6 +564,7 @@ class QueryExecutor {
         onlyCount: onlyCount,
       );
       final gen = _getTableQueryGeneration(resultCacheKey.tableUid);
+      resultCacheStartGen = gen;
       final queryStr = resultCacheKey.toString();
       final entry =
           _queryCache.getPoint3(resultCacheKey.tableUid.value, gen, queryStr);
@@ -567,7 +575,7 @@ class QueryExecutor {
         } else {
           // Instant 0ms memory hit!
           return ExecuteResult(
-            records: entry.records,
+            records: _copyResultList(entry.records),
             nextCursor: entry.nextCursor,
             prevCursor: entry.prevCursor,
             hasMore: entry.hasMore,
@@ -844,8 +852,12 @@ class QueryExecutor {
     // =========================================================================
     if (canUseResultCache &&
         isWithinResultCacheLimit &&
-        resultCacheKey != null) {
-      if (result.records.length <= 500) {
+        resultCacheKey != null &&
+        resultCacheStartGen != null) {
+      final currentGen = _getTableQueryGeneration(resultCacheKey.tableUid);
+      // Optimistic generation verification: only cache if the table has NOT mutated
+      // during the query execution time window (prevents stale result cache write).
+      if (currentGen == resultCacheStartGen && result.records.length <= 500) {
         final maxBytes = _queryCache.maxByteThreshold;
         if (_shouldCacheQueryResults(result.records, maxBytes: maxBytes)) {
           final copied = _copyResultList(result.records);
@@ -863,12 +875,10 @@ class QueryExecutor {
             expiry: queryCacheExpiry,
             sizeBytes: size,
           );
-          final gen = _getTableQueryGeneration(resultCacheKey.tableUid);
-          final queryStr = resultCacheKey.toString();
           _queryCache.putPoint3(
             resultCacheKey.tableUid.value,
-            gen,
-            queryStr,
+            resultCacheStartGen,
+            resultCacheKey.toString(),
             entry,
             size: size,
           );

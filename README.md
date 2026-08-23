@@ -33,7 +33,7 @@
 - [Why ToStore](#why-choose-tostore) | [Key Features](#key-features) | [Installation Guide](#installation) | [KV Mode](#key-value-storage-kv) | [Table Mode](#structured-table-mode) | [Memory Mode](#memory-mode)
 - [Schema Definition](#schema-definition) | [Distributed Architecture](#distributed-architecture) | [Cascading Foreign Keys](#foreign-keys-and-cascading) | [Mobile/Desktop](#mobile-and-desktop-integration) | [Server/Agent](#server-and-agent-integration) | [Primary Key Algorithms](#primary-key-examples)
 - [Advanced Queries (JOIN)](#advanced-queries) | [Aggregation & Statistics](#aggregation-grouping-and-statistics) | [Complex Logic (QueryCondition)](#complex-logic-with-querycondition) | [Reactive Query (watch)](#reactive-query) | [Streaming Query](#streaming-query)
-- [Advanced KV](#advanced-key-value-operations-dbkv) | [Bulk Operations](#bulk-operations) | [Vector Search](#vector-fields-vector-indexes-and-vector-search) | [Table-level TTL](#table-level-ttl) | [Efficient Pagination](#query-and-efficient-pagination) | [Query Cache](#manual-query-result-caching) | [Atomic Expressions](#atomic-expressions) | [Transactions](#transactions)
+- [Advanced KV](#advanced-key-value-operations-dbkv) | [Bulk Operations](#bulk-operations) | [Vector Search](#vector-fields-vector-indexes-and-vector-search) | [Table-level TTL](#table-level-ttl) | [Efficient Pagination](#query-and-efficient-pagination) | [Memory Probe & Sync Retrieval (peek)](#memory-probe-and-sync-retrieval-peek) | [Query Cache](#manual-query-result-caching) | [Atomic Expressions](#atomic-expressions) | [Transactions](#transactions)
 - [Administration](#administration-and-maintenance) | [Security Configuration](#security-configuration) | [Error Handling](#status-codes-and-error-handling) | [Performance & Diagnostics](#performance-and-experience) | [Contributing](#contributing)
 
 ## Why Choose ToStore?
@@ -1058,6 +1058,44 @@ if (nextToken != null) {
 | **Query Performance** | Degrades as page count increases | Constant speed for deep paging |
 | **Best for** | Small datasets, exact page jumping | **Massive datasets, infinite scrolling** |
 | **Consistency under changes** | Data changes can cause skipped/duplicate rows | Avoids duplicates and omissions caused by data changes |
+
+
+### Memory Probe and Sync Retrieval (peek)
+
+For scenarios with extreme throughput and latency requirements, ToStore provides the `peek` series of purely synchronous in-memory retrievals, absorbing burst hot-read traffic directly in-process: **edge devices** can sustain millions of read requests per second; **servers** on stronger hardware can reach tens of millions per machine (see [Benchmarks](#benchmarks)).
+
+> [!NOTE]
+> **In-memory cache only**: `peek` is a zero-scheduling, pure in-memory bypass. On cache miss it immediately returns empty/`null`; the engine performs no synchronous file I/O (avoiding event-loop blocking under high concurrency). For full persistent results, use `await query()` in application code.
+
+#### Peek API Methods
+| Method | Return Type | Description |
+| :--- | :--- | :--- |
+| `peekFirst()` | `Map<String, dynamic>?` | Single record; returns `null` on cache miss |
+| `peek()` | `QueryResult<T>` | `QueryResult` with `data` list and pagination metadata (`hasMore`, cursors, etc.); populated only on cache hit |
+| `peekExists()` | `bool` | Synchronously checks whether a matching record exists in memory cache |
+| `peekCount()` | `int` | Synchronously counts matching records in memory cache |
+| `result.peekNext()` | `QueryResult<T>` | Synchronous next page when pagination result is cached |
+| `result.peekPrev()` | `QueryResult<T>` | Synchronous previous page when pagination result is cached |
+
+#### Best Practice: Memory Probe First (Peek-Through)
+```dart
+// Single-record probe: memory probe first, then standard async query on miss
+final q = db.query('users').where('id', '=', userId);
+final user = q.peekFirst() ?? await q.first();
+
+// Paginated probe query
+final listQ = db.query('users').orderByDesc('id').limit(20);
+var page = listQ.peek();
+if (page.data.isEmpty) page = await listQ;
+
+if (page.hasMore) {
+  final next = page.peekNext(); // cache hit: synchronous page turn
+  if (next.data.isEmpty) await page.next();
+}
+```
+
+> [!TIP]
+> **Recommendation**: Standard async queries (`await query()`) use event scheduling for long-term stability and fair multi-tasking; 100k+ QPS is sufficient for most workloads. The `peek` series is designed for single-machine extreme hot-read peak shaving at millions/tens of millions of QPS.
 
 
 ### Foreign Keys and Cascading
