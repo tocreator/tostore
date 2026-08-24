@@ -8,7 +8,7 @@ enum BenchmarkTier {
 
   /// Indexed table with unique and range query indexes.
   /// Measures index maintenance overhead and indexed query acceleration.
-  indexed('Indexed', 'PK + 1 unique + 2 secondary indexes'),
+  indexed('Indexed', 'PK + 1 unique + 1 secondary index'),
 
   /// Run across all tiers.
   all('All Tiers', 'Compare both Simple and Indexed tiers');
@@ -20,21 +20,37 @@ enum BenchmarkTier {
 
 /// Defines specific database operations evaluated during benchmarks.
 enum BenchmarkOperation {
+  // Data Mutation Operations (Writes, Updates, Deletions)
   batchInsert('Batch Insert', 'Bulk insert records in a single batch'),
   singleInsert('Single Insert', 'Sequential single-record inserts'),
+  batchUpdate('Batch Update', 'Bulk update existing records by primary key'),
+  singleUpdate(
+      'Single Update', 'Sequential single-record updates by primary key'),
+  batchUpsert('Batch Upsert', 'Bulk upsert records with conflict resolution'),
+  batchDelete('Batch Delete',
+      'Bulk delete records by range condition with large scale execution'),
+  singleDelete(
+      'Single Delete', 'Sequential single-record deletes by primary key'),
+
+  // Data Query & Scan Operations (Reads, Seeks, Scans, Pagination)
   pointReadHot('PK Read (Hot Cache)',
       'Synchronous in-memory hot point lookup by primary key (peekFirst)'),
   pointReadRandom('PK Read (Random)',
       'Random uniform lookup by primary key across full table'),
-  indexedSeek('Indexed Seek', 'Unique index point lookup (where name = ?)'),
+  indexedSeekHot('Indexed Seek (Hot Cache)',
+      'Synchronous in-memory hot point lookup by secondary unique index (peekFirst)'),
+  indexedSeekRandom('Indexed Seek (Random)',
+      'Random uniform lookup by secondary unique index across full table'),
   rangeScanHot('Range Scan (Hot Cache)',
-      'Synchronous in-memory hot range scan with limit (peek)'),
+      'Synchronous in-memory hot range scan with limit 10 (peek)'),
   rangeScanRandom('Range Scan (Random)',
-      'Random start range query with ordering and limit'),
-  fullScan('Full Scan', 'Read and deserialize full table dataset'),
-  batchUpdate('Batch Update', 'Bulk update existing records by primary key'),
-  batchUpsert('Batch Upsert', 'Bulk upsert records with conflicts'),
-  batchDelete('Batch Delete', 'Bulk delete records by primary key'),
+      'Random start range query with ordering and limit 10'),
+  paginationHot('Pagination (Hot Cache)',
+      'Synchronous in-memory hot page read with limit 20 (peek)'),
+  paginationRandom(
+      'Pagination (Random)', 'Random cursor-based page query with limit 20'),
+
+  // Metadata & Aggregation Operations
   count('Count Verification', 'Fast metadata / index tree record count');
 
   final String label;
@@ -56,15 +72,19 @@ class BenchmarkConfig {
     this.operations = const {
       BenchmarkOperation.batchInsert,
       BenchmarkOperation.singleInsert,
-      BenchmarkOperation.pointReadHot,
-      BenchmarkOperation.pointReadRandom,
-      BenchmarkOperation.indexedSeek,
-      BenchmarkOperation.rangeScanHot,
-      BenchmarkOperation.rangeScanRandom,
-      BenchmarkOperation.fullScan,
       BenchmarkOperation.batchUpdate,
+      BenchmarkOperation.singleUpdate,
       BenchmarkOperation.batchUpsert,
       BenchmarkOperation.batchDelete,
+      BenchmarkOperation.singleDelete,
+      BenchmarkOperation.pointReadHot,
+      BenchmarkOperation.pointReadRandom,
+      BenchmarkOperation.indexedSeekHot,
+      BenchmarkOperation.indexedSeekRandom,
+      BenchmarkOperation.rangeScanHot,
+      BenchmarkOperation.rangeScanRandom,
+      BenchmarkOperation.paginationHot,
+      BenchmarkOperation.paginationRandom,
       BenchmarkOperation.count,
     },
   });

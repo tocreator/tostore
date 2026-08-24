@@ -1741,8 +1741,7 @@ class TableDataManager {
           );
           successIds.add(recordId);
         } catch (e) {
-          Logger.warn(
-              'Memory batch op failed: ${table.tableName} pk=$recordId',
+          Logger.warn('Memory batch op failed: ${table.tableName} pk=$recordId',
               rawError: e);
           _dataStore.writeBufferManager.releaseReservedUniques(
             table: table,

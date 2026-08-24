@@ -29,7 +29,6 @@ class BenchmarkSchemas {
     fields: [
       FieldSchema(name: 'name', type: DataType.text, nullable: false),
       FieldSchema(name: 'age', type: DataType.integer, nullable: false),
-      FieldSchema(name: 'score', type: DataType.double, nullable: false),
       FieldSchema(
         name: 'created_at',
         type: DataType.datetime,
@@ -39,7 +38,6 @@ class BenchmarkSchemas {
     indexes: [
       IndexSchema(fields: ['name'], unique: true),
       IndexSchema(fields: ['age']),
-      IndexSchema(fields: ['score']),
     ],
   );
 

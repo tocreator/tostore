@@ -280,36 +280,30 @@ Map<String, dynamic>? validateAndProcessUpdateDataPure({
   try {
     final primaryKey = schema.primaryKey;
     final fieldMap = {for (final f in schema.fields) f.name: f};
+    final result = <String, dynamic>{};
 
-    if (!ignoreUnknownFields) {
-      for (final key in data.keys) {
-        if (key != primaryKey && !fieldMap.containsKey(key)) {
+    for (final entry in data.entries) {
+      final fieldName = entry.key;
+      if (fieldName == primaryKey) continue;
+
+      final field = fieldMap[fieldName];
+      if (field == null) {
+        if (!ignoreUnknownFields) {
           throw DbException([
             InvalidArgumentStatus(
               type: ResultType.devFieldNotFound,
-              message: 'Unknown field $key in table $tableName',
-              parameterName: key,
-              passedValue: data[key],
+              message: 'Unknown field $fieldName in table $tableName',
+              parameterName: fieldName,
+              passedValue: entry.value,
             )
           ]);
         }
-      }
-    }
-
-    final result = <String, dynamic>{};
-
-    for (final field in schema.fields) {
-      if (field.name == primaryKey) {
         continue;
       }
 
-      if (!data.containsKey(field.name)) {
-        continue;
-      }
-
-      final value = data[field.name];
+      final value = entry.value;
       if (value is ExprNode) {
-        result[field.name] = value;
+        result[fieldName] = value;
         continue;
       }
 
@@ -319,16 +313,17 @@ Map<String, dynamic>? validateAndProcessUpdateDataPure({
         skipMaxLengthCheck: true,
       );
 
-      result[field.name] = field.convertValue(value);
-      if (result[field.name] != null &&
+      final converted = field.convertValue(value);
+      if (converted != null &&
           field.maxLength != null &&
-          result[field.name] is String &&
-          (result[field.name] as String).length > field.maxLength!) {
+          converted is String &&
+          converted.length > field.maxLength!) {
         Logger.warn(
-          'Warning: field ${field.name} exceeds max length',
+          'Warning: field $fieldName exceeds max length',
         );
-        result[field.name] =
-            (result[field.name] as String).substring(0, field.maxLength!);
+        result[fieldName] = converted.substring(0, field.maxLength!);
+      } else {
+        result[fieldName] = converted;
       }
     }
 
@@ -347,18 +342,27 @@ Map<String, dynamic> applyUniformUpdatePure({
   required Map<String, dynamic> validData,
   required Map<String, dynamic> existingRecord,
 }) {
-  final primaryKey = schema.primaryKey;
-  final updatedRecord = <String, dynamic>{};
-  updatedRecord[primaryKey] = existingRecord[primaryKey];
+  final updatedRecord = Map<String, dynamic>.of(existingRecord);
 
-  for (final field in schema.fields) {
-    if (field.name == primaryKey) {
-      continue;
+  // Fast path: if validData has no expressions, apply directly in O(1)
+  bool hasExpr = false;
+  for (final value in validData.values) {
+    if (value is ExprNode) {
+      hasExpr = true;
+      break;
     }
+  }
 
-    final fieldName = field.name;
-    final proposed =
-        validData.containsKey(fieldName) ? validData[fieldName] : null;
+  if (!hasExpr) {
+    updatedRecord.addAll(validData);
+    return updatedRecord;
+  }
+
+  // Expression evaluation path (only for fields in validData)
+  final fieldMap = {for (final f in schema.fields) f.name: f};
+  for (final entry in validData.entries) {
+    final fieldName = entry.key;
+    final proposed = entry.value;
 
     if (proposed is ExprNode) {
       try {
@@ -368,16 +372,15 @@ Map<String, dynamic> applyUniformUpdatePure({
           schema,
           isUpdate: true,
         );
-        updatedRecord[fieldName] = field.convertValue(result);
+        final field = fieldMap[fieldName];
+        updatedRecord[fieldName] =
+            field != null ? field.convertValue(result) : result;
       } catch (e) {
         Logger.error('Failed to evaluate expression for field $fieldName',
             rawError: e);
-        updatedRecord[fieldName] = existingRecord[fieldName];
       }
-    } else if (validData.containsKey(fieldName)) {
-      updatedRecord[fieldName] = proposed;
     } else {
-      updatedRecord[fieldName] = existingRecord[fieldName];
+      updatedRecord[fieldName] = proposed;
     }
   }
 

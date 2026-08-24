@@ -14,6 +14,30 @@ class BenchmarkRunner {
   final LogService log;
   final Function(String) _updateLastOperation;
 
+  /// Optimal execution order to ensure queries run against full datasets and destructive deletes run last.
+  static const List<BenchmarkOperation> _executionOrder = [
+    // 1. Ingestion & Writes
+    BenchmarkOperation.batchInsert,
+    BenchmarkOperation.singleInsert,
+    // 2. Updates & Upserts
+    BenchmarkOperation.batchUpdate,
+    BenchmarkOperation.singleUpdate,
+    BenchmarkOperation.batchUpsert,
+    // 3. Queries & Scans (Non-destructive: runs against populated dataset)
+    BenchmarkOperation.pointReadHot,
+    BenchmarkOperation.pointReadRandom,
+    BenchmarkOperation.indexedSeekHot,
+    BenchmarkOperation.indexedSeekRandom,
+    BenchmarkOperation.rangeScanHot,
+    BenchmarkOperation.rangeScanRandom,
+    BenchmarkOperation.paginationHot,
+    BenchmarkOperation.paginationRandom,
+    BenchmarkOperation.count,
+    // 4. Deletions (Destructive operations executed last)
+    BenchmarkOperation.batchDelete,
+    BenchmarkOperation.singleDelete,
+  ];
+
   BenchmarkRunner(this.db, this.log, this._updateLastOperation);
 
   /// Executes the full benchmark suite according to the provided [config].
@@ -53,13 +77,43 @@ class BenchmarkRunner {
             ? BenchmarkSchemas.simpleTable
             : BenchmarkSchemas.indexedTable;
 
-        log.add('--- Running Tier: $tierName Benchmark ---', LogLevel.info);
+        // Sort operations by optimal execution order:
+        // Ingestion -> Updates -> Queries (against full table) -> Deletions (destructive last)
+        final sortedOps = config.operations.toList()
+          ..sort((a, b) {
+            final aIdx = _executionOrder.indexOf(a);
+            final bIdx = _executionOrder.indexOf(b);
+            return aIdx.compareTo(bIdx);
+          });
 
-        for (final op in config.operations) {
+        bool flushedBeforeQueries = false;
+
+        for (final op in sortedOps) {
           // Skip indexedSeek on simple tier (has no secondary unique index)
           if (currentTier == BenchmarkTier.simple &&
-              op == BenchmarkOperation.indexedSeek) {
+              (op == BenchmarkOperation.indexedSeekHot ||
+                  op == BenchmarkOperation.indexedSeekRandom)) {
             continue;
+          }
+
+          // If transitioning from Mutation phase (Insert/Update/Upsert) to Query phase (Read/Seek/Scan/Pagination),
+          // flush all queued writes to disk once so queries execute on a settled, quiescent disk pipeline.
+          final isQueryOp = op == BenchmarkOperation.pointReadHot ||
+              op == BenchmarkOperation.pointReadRandom ||
+              op == BenchmarkOperation.indexedSeekHot ||
+              op == BenchmarkOperation.indexedSeekRandom ||
+              op == BenchmarkOperation.rangeScanHot ||
+              op == BenchmarkOperation.rangeScanRandom ||
+              op == BenchmarkOperation.paginationHot ||
+              op == BenchmarkOperation.paginationRandom ||
+              op == BenchmarkOperation.count;
+
+          if (isQueryOp && !flushedBeforeQueries) {
+            flushedBeforeQueries = true;
+            _updateLastOperation(
+                'Flushing write pipeline to disk before queries...');
+            await db.flush();
+            await Future.delayed(const Duration(milliseconds: 15));
           }
 
           final metric = await _runOperation(
@@ -82,6 +136,19 @@ class BenchmarkRunner {
           await Future.delayed(const Duration(milliseconds: 10));
         }
       }
+
+      // Sort metrics by display order (Insert -> Update -> Delete -> Read -> Count)
+      allMetrics.sort((a, b) {
+        if (a.tierName != b.tierName) {
+          if (a.tierName == 'Simple') return -1;
+          if (b.tierName == 'Simple') return 1;
+        }
+        final aOpIndex =
+            BenchmarkOperation.values.indexWhere((op) => op.label == a.name);
+        final bOpIndex =
+            BenchmarkOperation.values.indexWhere((op) => op.label == b.name);
+        return aOpIndex.compareTo(bOpIndex);
+      });
 
       final summary = BenchmarkSummary(config: config, metrics: allMetrics);
 
@@ -109,7 +176,6 @@ class BenchmarkRunner {
       (i) => {
         'name': 'warmup_$i',
         'age': 20 + (i % 50),
-        'score': i * 1.0,
         'created_at': DateTime.now().toIso8601String(),
       },
     );
@@ -131,7 +197,12 @@ class BenchmarkRunner {
     await db.query(BenchmarkSchemas.simpleTable);
     await db.query(BenchmarkSchemas.indexedTable).where('age', '>=', 25);
     db.query(BenchmarkSchemas.simpleTable).where('id', '=', 1).peekFirst();
+    db
+        .query(BenchmarkSchemas.indexedTable)
+        .where('name', '=', 'warmup_1')
+        .peekFirst();
     db.query(BenchmarkSchemas.simpleTable).limit(10).peek();
+    db.query(BenchmarkSchemas.simpleTable).limit(20).peek();
 
     await db.clear(BenchmarkSchemas.simpleTable);
     await db.clear(BenchmarkSchemas.indexedTable);
@@ -196,6 +267,108 @@ class BenchmarkRunner {
         }
         break;
 
+      case BenchmarkOperation.batchUpdate:
+        await _ensureTablePopulated(tableName, tier, scale);
+        effectiveCount = scale;
+
+        for (var round = 1; round <= iterations; round++) {
+          _updateLastOperation(
+              'Running [$tierName] Batch Update ($round/$iterations)...');
+          final updateRecords = _generateUpdateRecords(tier, scale, round);
+
+          final sw = Stopwatch()..start();
+          await db.batchUpdate(
+            tableName,
+            updateRecords,
+            allowPartialErrors: false,
+            returnResultDetails: false,
+          );
+          sw.stop();
+          roundMicroseconds.add(sw.elapsedMicroseconds);
+          await Future.delayed(const Duration(milliseconds: 5));
+        }
+        break;
+
+      case BenchmarkOperation.singleUpdate:
+        await _ensureTablePopulated(tableName, tier, scale);
+        effectiveCount = math.min(scale, 10000);
+
+        for (var round = 1; round <= iterations; round++) {
+          _updateLastOperation(
+              'Running [$tierName] Single Update ($round/$iterations)...');
+          final updateRecords =
+              _generateUpdateRecords(tier, effectiveCount, round);
+
+          final sw = Stopwatch()..start();
+          for (final record in updateRecords) {
+            final id = record['id'];
+            await db.update(tableName, record).where('id', '=', id);
+          }
+          sw.stop();
+          roundMicroseconds.add(sw.elapsedMicroseconds);
+          await Future.delayed(const Duration(milliseconds: 5));
+        }
+        break;
+
+      case BenchmarkOperation.batchUpsert:
+        await _ensureTablePopulated(tableName, tier, scale);
+        effectiveCount = scale;
+
+        for (var round = 1; round <= iterations; round++) {
+          _updateLastOperation(
+              'Running [$tierName] Batch Upsert ($round/$iterations)...');
+          // 50% update existing IDs, 50% insert new IDs with explicit PKs
+          final upsertRecords = _generateUpsertRecords(tier, scale, round);
+
+          final sw = Stopwatch()..start();
+          await db.batchUpsert(
+            tableName,
+            upsertRecords,
+            allowPartialErrors: false,
+            returnResultDetails: false,
+          );
+          sw.stop();
+          roundMicroseconds.add(sw.elapsedMicroseconds);
+          await Future.delayed(const Duration(milliseconds: 5));
+        }
+        break;
+
+      case BenchmarkOperation.batchDelete:
+        effectiveCount = scale;
+        for (var round = 1; round <= iterations; round++) {
+          _updateLastOperation(
+              'Running [$tierName] Batch Delete ($round/$iterations)...');
+          await _ensureTablePopulated(tableName, tier, scale);
+
+          final sw = Stopwatch()..start();
+          // Real batch delete evaluating range condition, key removals, index unregistrations, and write scheduling
+          await db
+              .delete(tableName)
+              .where('id', '<=', scale)
+              .allowLargeScaleOperation();
+          sw.stop();
+          roundMicroseconds.add(sw.elapsedMicroseconds);
+          await Future.delayed(const Duration(milliseconds: 5));
+        }
+        break;
+
+      case BenchmarkOperation.singleDelete:
+        effectiveCount = math.min(scale, 10000);
+        for (var round = 1; round <= iterations; round++) {
+          _updateLastOperation(
+              'Running [$tierName] Single Delete ($round/$iterations)...');
+          await _ensureTablePopulated(tableName, tier, scale);
+
+          final sw = Stopwatch()..start();
+          for (var id = 1; id <= effectiveCount; id++) {
+            await db.delete(tableName).where('id', '=', id);
+          }
+          sw.stop();
+          roundMicroseconds.add(sw.elapsedMicroseconds);
+          await Future.delayed(const Duration(milliseconds: 5));
+        }
+        break;
+
       case BenchmarkOperation.pointReadHot:
         // Ensure dataset is populated
         await _ensureTablePopulated(tableName, tier, scale);
@@ -221,7 +394,7 @@ class BenchmarkRunner {
       case BenchmarkOperation.pointReadRandom:
         // Ensure dataset is populated
         await _ensureTablePopulated(tableName, tier, scale);
-        effectiveCount = scale;
+        effectiveCount = math.min(scale, 10000);
         final random = math.Random(42);
 
         for (var round = 1; round <= iterations; round++) {
@@ -240,15 +413,37 @@ class BenchmarkRunner {
         }
         break;
 
-      case BenchmarkOperation.indexedSeek:
+      case BenchmarkOperation.indexedSeekHot:
         if (tier != BenchmarkTier.indexed) return null;
         await _ensureTablePopulated(tableName, tier, scale);
         effectiveCount = scale;
+
+        // Pre-warm unique index hot lookup
+        db.query(tableName).where('name', '=', 'user_0').peekFirst();
+
+        for (var round = 1; round <= iterations; round++) {
+          _updateLastOperation(
+              'Running [$tierName] Indexed Seek (Hot Cache) ($round/$iterations)...');
+
+          final sw = Stopwatch()..start();
+          for (var i = 0; i < effectiveCount; i++) {
+            db.query(tableName).where('name', '=', 'user_0').peekFirst();
+          }
+          sw.stop();
+          roundMicroseconds.add(sw.elapsedMicroseconds);
+          await Future.delayed(const Duration(milliseconds: 5));
+        }
+        break;
+
+      case BenchmarkOperation.indexedSeekRandom:
+        if (tier != BenchmarkTier.indexed) return null;
+        await _ensureTablePopulated(tableName, tier, scale);
+        effectiveCount = math.min(scale, 10000);
         final random = math.Random(1337);
 
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
-              'Running [$tierName] Indexed Seek ($round/$iterations)...');
+              'Running [$tierName] Indexed Seek (Random) ($round/$iterations)...');
           final queryNames = List.generate(
               effectiveCount, (_) => 'user_${random.nextInt(scale)}');
 
@@ -273,7 +468,7 @@ class BenchmarkRunner {
           db
               .query(tableName)
               .where('age', '>=', 20)
-              .orderByAsc('score')
+              .orderByAsc('age')
               .limit(10)
               .peek();
         }
@@ -290,7 +485,7 @@ class BenchmarkRunner {
               db
                   .query(tableName)
                   .where('age', '>=', 20)
-                  .orderByAsc('score')
+                  .orderByAsc('age')
                   .limit(10)
                   .peek();
             }
@@ -303,7 +498,8 @@ class BenchmarkRunner {
 
       case BenchmarkOperation.rangeScanRandom:
         await _ensureTablePopulated(tableName, tier, scale);
-        effectiveCount = scale;
+        // Standardized query sample count up to 10,000 queries for statistically solid metrics without long stalls
+        effectiveCount = math.min(scale, 10000);
         final random = math.Random(777);
 
         for (var round = 1; round <= iterations; round++) {
@@ -330,7 +526,7 @@ class BenchmarkRunner {
               await db
                   .query(tableName)
                   .where('age', '>=', startVal)
-                  .orderByAsc('score')
+                  .orderByAsc('age')
                   .limit(10);
             }
           }
@@ -340,73 +536,50 @@ class BenchmarkRunner {
         }
         break;
 
-      case BenchmarkOperation.fullScan:
+      case BenchmarkOperation.paginationHot:
         await _ensureTablePopulated(tableName, tier, scale);
+        effectiveCount = scale;
+
+        // Pre-warm hot page into memory cache
+        db.query(tableName).limit(20).peek();
 
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
-              'Running [$tierName] Full Scan ($round/$iterations)...');
+              'Running [$tierName] Pagination (Hot Cache) ($round/$iterations)...');
 
           final sw = Stopwatch()..start();
-          // Explicitly query all `scale` records to ensure complete deserialization
-          await db.query(tableName).limit(scale);
+          for (var i = 0; i < effectiveCount; i++) {
+            db.query(tableName).limit(20).peek();
+          }
           sw.stop();
           roundMicroseconds.add(sw.elapsedMicroseconds);
           await Future.delayed(const Duration(milliseconds: 5));
         }
         break;
 
-      case BenchmarkOperation.batchUpdate:
+      case BenchmarkOperation.paginationRandom:
         await _ensureTablePopulated(tableName, tier, scale);
+        // Standardized query sample count up to 10,000 queries for statistically solid metrics without long stalls
+        effectiveCount = math.min(scale, 10000);
+        final random = math.Random(999);
 
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
-              'Running [$tierName] Batch Update ($round/$iterations)...');
-          final updateRecords = _generateUpdateRecords(tier, scale, round);
+              'Running [$tierName] Pagination (Random) ($round/$iterations)...');
 
-          final sw = Stopwatch()..start();
-          await db.batchUpdate(
-            tableName,
-            updateRecords,
-            allowPartialErrors: false,
-            returnResultDetails: false,
+          // Keyset / Cursor-based pagination avoids O(N) offset scanning degradation
+          final startCursors = List.generate(
+            effectiveCount,
+            (_) => random.nextInt(math.max(1, scale - 20)),
           );
-          sw.stop();
-          roundMicroseconds.add(sw.elapsedMicroseconds);
-          await Future.delayed(const Duration(milliseconds: 5));
-        }
-        break;
-
-      case BenchmarkOperation.batchUpsert:
-        await _ensureTablePopulated(tableName, tier, scale);
-
-        for (var round = 1; round <= iterations; round++) {
-          _updateLastOperation(
-              'Running [$tierName] Batch Upsert ($round/$iterations)...');
-          // 50% update existing IDs, 50% insert new IDs with explicit PKs
-          final upsertRecords = _generateUpsertRecords(tier, scale, round);
 
           final sw = Stopwatch()..start();
-          await db.batchUpsert(
-            tableName,
-            upsertRecords,
-            allowPartialErrors: false,
-            returnResultDetails: false,
-          );
-          sw.stop();
-          roundMicroseconds.add(sw.elapsedMicroseconds);
-          await Future.delayed(const Duration(milliseconds: 5));
-        }
-        break;
-
-      case BenchmarkOperation.batchDelete:
-        for (var round = 1; round <= iterations; round++) {
-          _updateLastOperation(
-              'Running [$tierName] Batch Delete ($round/$iterations)...');
-          await _ensureTablePopulated(tableName, tier, scale);
-
-          final sw = Stopwatch()..start();
-          await db.delete(tableName).allowDeleteAll();
+          for (var i = 0; i < effectiveCount; i++) {
+            await db
+                .query(tableName)
+                .where('id', '>', startCursors[i])
+                .limit(20);
+          }
           sw.stop();
           roundMicroseconds.add(sw.elapsedMicroseconds);
           await Future.delayed(const Duration(milliseconds: 5));
@@ -454,6 +627,8 @@ class BenchmarkRunner {
         allowPartialErrors: false,
         returnResultDetails: false,
       );
+      // Ensure all initial data writes are fully flushed to disk before timing operations
+      await db.flush();
     }
   }
 
@@ -477,7 +652,6 @@ class BenchmarkRunner {
         return {
           'name': 'user_$idx',
           'age': 18 + (idx % 60),
-          'score': (idx * 1.25) % 100.0,
           'created_at': DateTime.now().toIso8601String(),
         };
       });
@@ -504,7 +678,6 @@ class BenchmarkRunner {
           'id': i + 1,
           'name': 'user_${i}_v$round',
           'age': 20 + ((i + round) % 55),
-          'score': 90.0 + (round % 10),
         };
       });
     }
@@ -539,7 +712,6 @@ class BenchmarkRunner {
           'id': targetId,
           'name': isExisting ? 'user_${i}_upd$round' : 'user_new_${round}_$i',
           'age': 21 + (i % 50),
-          'score': 75.5,
           'created_at': DateTime.now().toIso8601String(),
         };
       });
