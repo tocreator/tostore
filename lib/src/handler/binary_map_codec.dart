@@ -26,14 +26,15 @@ class BinaryMapCodec {
 
   static Uint8List encodeMap(Map<String, dynamic> map) {
     final buffer = BytesBuilder(copy: false);
-
-    final entries = map.entries.take(maxMapSize).toList(growable: false);
+    final int count = map.length > maxMapSize ? maxMapSize : map.length;
 
     // map32
     buffer.addByte(0xDF);
-    buffer.add(_u32be(entries.length));
+    buffer.add(_u32be(count));
 
-    for (final e in entries) {
+    int written = 0;
+    for (final e in map.entries) {
+      if (++written > maxMapSize) break;
       _writeString(buffer, e.key);
       _writeValue(buffer, e.value);
     }
@@ -140,10 +141,12 @@ class BinaryMapCodec {
     }
 
     if (value is Map) {
-      final entries = value.entries.take(maxMapSize).toList(growable: false);
+      final int count = value.length > maxMapSize ? maxMapSize : value.length;
       b.addByte(0xDF); // map32
-      b.add(_u32be(entries.length));
-      for (final e in entries) {
+      b.add(_u32be(count));
+      int written = 0;
+      for (final e in value.entries) {
+        if (++written > maxMapSize) break;
         _writeString(b, e.key.toString());
         _writeValue(b, e.value);
       }
@@ -155,15 +158,39 @@ class BinaryMapCodec {
   }
 
   static void _writeString(BytesBuilder b, String s) {
-    final bytes = utf8.encode(s);
-    final len = bytes.length > maxStringLength ? maxStringLength : bytes.length;
-    final out = (len < bytes.length) ? bytes.sublist(0, len) : bytes;
+    if (s.isEmpty) {
+      b.addByte(0xA0);
+      return;
+    }
 
+    final int len = s.length;
     if (len < 32) {
-      b.addByte(0xA0 | len); // fixstr
+      bool isAscii = true;
+      for (int i = 0; i < len; i++) {
+        if (s.codeUnitAt(i) > 0x7F) {
+          isAscii = false;
+          break;
+        }
+      }
+      if (isAscii) {
+        b.addByte(0xA0 | len);
+        for (int i = 0; i < len; i++) {
+          b.addByte(s.codeUnitAt(i));
+        }
+        return;
+      }
+    }
+
+    final bytes = utf8.encode(s);
+    final encLen =
+        bytes.length > maxStringLength ? maxStringLength : bytes.length;
+    final out = (encLen < bytes.length) ? bytes.sublist(0, encLen) : bytes;
+
+    if (encLen < 32) {
+      b.addByte(0xA0 | encLen); // fixstr
     } else {
       b.addByte(0xDB); // str32
-      b.add(_u32be(len));
+      b.add(_u32be(encLen));
     }
     b.add(out);
   }

@@ -28,6 +28,7 @@ final class IndexWritePlan {
   final TableUid tableUid;
   final List<IndexUid> indexUids;
   final List<List<String>> fieldsPerIndex;
+  final List<String?> singleFieldNames;
   final List<bool> isUnique;
   final bool includeUniques;
 
@@ -35,6 +36,7 @@ final class IndexWritePlan {
     required this.tableUid,
     required this.indexUids,
     required this.fieldsPerIndex,
+    required this.singleFieldNames,
     required this.isUnique,
     required this.includeUniques,
   });
@@ -268,10 +270,12 @@ class BufferTreeStore {
     ensureComparators(table, schema);
     final uids = <IndexUid>[];
     final fields = <List<String>>[];
+    final singleFields = <String?>[];
     final uniqueFlags = <bool>[];
     if (includeUniques) {
       uids.add(kBufferPkIndexUid);
       fields.add(const <String>[]);
+      singleFields.add(null);
       uniqueFlags.add(true);
     }
     for (final idx in schema.getAllIndexes()) {
@@ -279,12 +283,14 @@ class BufferTreeStore {
       if (!includeUniques && idx.unique) continue;
       uids.add(idx.indexUid);
       fields.add(idx.fields);
+      singleFields.add(idx.fields.length == 1 ? idx.fields.first : null);
       uniqueFlags.add(idx.unique);
     }
     return IndexWritePlan(
       tableUid: table.tableUid,
       indexUids: uids,
       fieldsPerIndex: fields,
+      singleFieldNames: singleFields,
       isUnique: uniqueFlags,
       includeUniques: includeUniques,
     );
@@ -549,19 +555,67 @@ class BufferTreeStore {
     final int markerSize = pk.length + 1;
     final uids = plan.indexUids;
     final fieldsList = plan.fieldsPerIndex;
+    final singleFields = plan.singleFieldNames;
     final uniqueFlags = plan.isUnique;
+
     for (int s = 0; s < uids.length; s++) {
-      final fields = fieldsList[s];
-      final List<dynamic> parts;
-      if (fields.isEmpty) {
-        // PK unique sentinel.
-        parts = <dynamic>[pk];
-      } else {
-        parts = _indexFieldsValue(data, fields);
-        if (parts.isEmpty) continue;
-      }
       final IndexUid indexUid = uids[s];
       final bool isUnique = uniqueFlags[s];
+      final singleField = singleFields[s];
+
+      if (singleField != null) {
+        // Fast-path: single-field index (zero List allocation)
+        final v = data[singleField];
+        if (v == null) continue;
+
+        if (isUnique) {
+          if (isTxn) {
+            indexCache.putIfAbsentPoint4(
+                transactionId, tableUid, indexUid, v, pk);
+          } else {
+            indexCache.putIfAbsentPoint3(tableUid, indexUid, v, pk);
+          }
+        } else {
+          if (isTxn) {
+            indexCache.putPoint5(
+              transactionId,
+              tableUid,
+              indexUid,
+              v,
+              pk,
+              true,
+              size: markerSize,
+            );
+          } else {
+            indexCache.putPoint4(
+              tableUid,
+              indexUid,
+              v,
+              pk,
+              true,
+              size: markerSize,
+            );
+          }
+        }
+        continue;
+      }
+
+      final fields = fieldsList[s];
+      if (fields.isEmpty) {
+        // PK unique sentinel slot (zero List allocation)
+        if (isTxn) {
+          indexCache.putIfAbsentPoint4(
+              transactionId, tableUid, indexUid, pk, pk);
+        } else {
+          indexCache.putIfAbsentPoint3(tableUid, indexUid, pk, pk);
+        }
+        continue;
+      }
+
+      // Composite index (multi-field path)
+      final parts = _indexFieldsValue(data, fields);
+      if (parts.isEmpty) continue;
+
       if (isUnique) {
         final List<dynamic> path = isTxn
             ? <dynamic>[transactionId, tableUid, indexUid, ...parts]

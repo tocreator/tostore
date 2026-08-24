@@ -4061,16 +4061,14 @@ class DataStoreImpl {
         }
       }
 
-      // Pure PK insert on an empty table: no secondary uniques, no FK, no
-      // constraints, no promote mirror -- skip per-row reserve bookkeeping and
-      // install PK uniqueness once at buffer apply.
-      final bool isPurePkInsertFastPath = !hasSecondaryUniqueIndexes &&
+      // Pure PK insert candidate: no secondary uniques, no FK, sequential PK,
+      // no constraints, no promote mirror.
+      final bool isPurePkCandidate = !hasSecondaryUniqueIndexes &&
           !hasForeignKeys &&
           !hasCustomPk &&
           !needsConstraintPass &&
-          skipDiskUniqueChecks &&
           promoteDesc == null;
-      deferQueryCacheInvalidation = isPurePkInsertFastPath;
+      deferQueryCacheInvalidation = isPurePkCandidate;
 
       final invalidRecords = <Map<String, dynamic>>[];
       final List<String> successKeys = [];
@@ -4086,7 +4084,7 @@ class DataStoreImpl {
           (hasCustomPk || hasSecondaryUniqueIndexes);
 
       try {
-        final int bufferBatchSize = isPurePkInsertFastPath ? 2000 : 1000;
+        final int bufferBatchSize = isPurePkCandidate ? 2000 : 1000;
         int start = 0;
         final batchTimestamp = DateTime.now();
 
@@ -4139,6 +4137,9 @@ class DataStoreImpl {
                   ? missingPkIndices.toSet()
                   : null;
 
+          final bool isFastPathWindow =
+              isPurePkCandidate && (isWindowAllAutoPk || skipDiskUniqueChecks);
+
           final bool needDiskUniqueCheck = needDiskUniqueCheckBase ||
               (!skipDiskUniqueChecks &&
                   _indexManager != null &&
@@ -4156,13 +4157,13 @@ class DataStoreImpl {
 
           final yieldController = YieldController(
             'DataStoreImpl.batchInsert.loop',
-            minCheckInterval: isPurePkInsertFastPath
+            minCheckInterval: isFastPathWindow
                 ? 1024
                 : EngineCpuChunk.hotPathMinCheckInterval,
           );
 
           // Optimization: Create batch context to hoist table/buffer lookups out of the record loop
-          final batchContext = isPurePkInsertFastPath && isWindowAllAutoPk
+          final batchContext = isFastPathWindow
               ? null
               : writeBufferManager.createBatchReserveContext(table, txId);
 
@@ -4389,8 +4390,7 @@ class DataStoreImpl {
               schema: tableSchema,
               transactionId: txId,
               schemaVersion: tableSchema.schemaVersion ?? '',
-              installUniquesOnApply:
-                  isPurePkInsertFastPath && isWindowAllAutoPk,
+              installUniquesOnApply: isFastPathWindow,
               deferQueryCacheInvalidation: deferQueryCacheInvalidation,
             );
 
@@ -4493,7 +4493,7 @@ class DataStoreImpl {
                     ignoreUnknownFields: _config?.ignoreUnknownFields ?? true,
                     batchTimestamp: batchTimestamp,
                     schemaNeedsConstraintPass: needsConstraintPass,
-                    mutateInPlace: isPurePkInsertFastPath,
+                    mutateInPlace: isFastPathWindow,
                   );
                 } on DbException catch (e) {
                   recordErrors.addAll(e.statuses.map((s) => s.message));
