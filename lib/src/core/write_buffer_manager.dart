@@ -661,8 +661,10 @@ class WriteBufferManager {
       // ignore: only_throw_errors
       throw violation;
     }
-    final key = _reserveKey(table.tableUid, recordId, transactionId);
-    _lastReserveRollback[key] = rollback;
+    if (rollback.isNotEmpty) {
+      final key = _reserveKey(table.tableUid, recordId, transactionId);
+      _lastReserveRollback[key] = rollback;
+    }
     return rollback;
   }
 
@@ -688,6 +690,10 @@ class WriteBufferManager {
     String? transactionId,
     List<List<dynamic>>? rollbackKeys,
   }) {
+    if (_lastReserveRollback.isEmpty &&
+        (rollbackKeys == null || rollbackKeys.isEmpty)) {
+      return;
+    }
     final key = _reserveKey(table.tableUid, recordId, transactionId);
     final paths = rollbackKeys ?? _lastReserveRollback.remove(key);
     if (rollbackKeys != null) {
@@ -708,6 +714,7 @@ class WriteBufferManager {
     required Iterable<String> recordIds,
     String? transactionId,
   }) async {
+    if (_lastReserveRollback.isEmpty) return;
     final yieldController = YieldController(
       'WriteBufferManager.releaseReservedUniquesForPks',
       minCheckInterval: EngineCpuChunk.hotPathMinCheckInterval,
@@ -776,7 +783,7 @@ class BufferBatchReserveContext {
   final WriteBufferManager _buf;
   final TableContext table;
   final String? transactionId;
-  final List<List<List<dynamic>>> _rollbacks = [];
+  final Map<String, List<List<dynamic>>> _rollbacksByPk = {};
 
   BufferBatchReserveContext(this._buf, this.table, this.transactionId);
 
@@ -798,19 +805,46 @@ class BufferBatchReserveContext {
       transactionId: transactionId,
     );
     if (paths.isNotEmpty) {
-      _rollbacks.add(paths);
+      _rollbacksByPk[recordId] = paths;
     }
     return paths;
   }
 
-  void releaseAll() {
-    for (final paths in _rollbacks) {
+  void releaseForPk(String recordId) {
+    final paths = _rollbacksByPk.remove(recordId);
+    final key = _buf._reserveKey(table.tableUid, recordId, transactionId);
+    _buf._lastReserveRollback.remove(key);
+    if (paths != null && paths.isNotEmpty) {
       _buf.bufferTrees.rollbackReserved(paths, transactionId: transactionId);
     }
-    _rollbacks.clear();
+  }
+
+  void releaseLast() {
+    if (_rollbacksByPk.isNotEmpty) {
+      final lastKey = _rollbacksByPk.keys.last;
+      releaseForPk(lastKey);
+    }
+  }
+
+  void releaseAll() {
+    if (_rollbacksByPk.isNotEmpty) {
+      for (final entry in _rollbacksByPk.entries) {
+        _buf.bufferTrees
+            .rollbackReserved(entry.value, transactionId: transactionId);
+        final key = _buf._reserveKey(table.tableUid, entry.key, transactionId);
+        _buf._lastReserveRollback.remove(key);
+      }
+      _rollbacksByPk.clear();
+    }
   }
 
   void clear() {
-    _rollbacks.clear();
+    if (_rollbacksByPk.isNotEmpty) {
+      for (final recordId in _rollbacksByPk.keys) {
+        final key = _buf._reserveKey(table.tableUid, recordId, transactionId);
+        _buf._lastReserveRollback.remove(key);
+      }
+      _rollbacksByPk.clear();
+    }
   }
 }

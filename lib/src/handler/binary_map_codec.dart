@@ -381,8 +381,6 @@ class BinaryMapCodec {
   }
 }
 
-
-
 final class _Reader {
   final Uint8List b;
   int off = 0;

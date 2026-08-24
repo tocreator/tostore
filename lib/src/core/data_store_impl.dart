@@ -4071,13 +4071,15 @@ class DataStoreImpl {
       deferQueryCacheInvalidation = isPurePkCandidate;
 
       final invalidRecords = <Map<String, dynamic>>[];
-      final List<String> successKeys = [];
-      final List<String> failedKeys = [];
+      final List<String> successKeys = returnResultDetails ? [] : const [];
+      final List<String> failedKeys = returnResultDetails ? [] : const [];
+      final List<ResultStatus?>? statusSlots = returnResultDetails
+          ? List<ResultStatus?>.filled(records.length, null, growable: false)
+          : null;
       int successCount = 0;
       int failedCount = 0;
       // Collect a limited number of detailed validation error messages for result reporting.
       final List<String> validationErrorsForResult = [];
-      final List<ResultStatus> batchStatuses = [];
 
       final bool needDiskUniqueCheckBase = !skipDiskUniqueChecks &&
           _indexManager != null &&
@@ -4090,8 +4092,7 @@ class DataStoreImpl {
 
         while (start < records.length) {
           final int end = min(start + bufferBatchSize, records.length);
-          final currentRecords = records.sublist(start, end);
-          final int windowLen = currentRecords.length;
+          final int windowLen = end - start;
 
           // 1. Batch allocate auto PKs strictly for current window (O(1) memory)
           final missingPkIndices = <int>[];
@@ -4099,7 +4100,7 @@ class DataStoreImpl {
 
           if (!hasCustomPk) {
             for (int i = 0; i < windowLen; i++) {
-              if (currentRecords[i][primaryKey] == null) {
+              if (records[start + i][primaryKey] == null) {
                 missingPkIndices.add(i);
               } else {
                 hasUserProvidedPrimaryKeyInWindow = true;
@@ -4120,7 +4121,7 @@ class DataStoreImpl {
                 }
               } else {
                 for (int i = 0; i < missingPkIndices.length; i++) {
-                  currentRecords[missingPkIndices[i]][primaryKey] = newIds[i];
+                  records[start + missingPkIndices[i]][primaryKey] = newIds[i];
                 }
               }
             }
@@ -4145,11 +4146,11 @@ class DataStoreImpl {
                   _indexManager != null &&
                   hasUserProvidedPrimaryKeyInWindow);
 
-          // Batch Foreign Key validation: 1:1 aligned directly on currentRecords (zero interim lists)
+          // Batch Foreign Key validation: 1:1 aligned directly on window records
           final List<DbException?>? batchFkViolations = hasForeignKeys
               ? await _foreignKeyManager!.validateForeignKeyConstraintsBatch(
                   table: table,
-                  records: currentRecords,
+                  records: records.sublist(start, end),
                   operation: ForeignKeyOperation.insert,
                   schemaOverride: tableSchema,
                 )
@@ -4169,7 +4170,7 @@ class DataStoreImpl {
 
           // Collect valid records for a single bulk enqueue into WAL + buffer + cache.
           final batchRecordsForBuffer = <Map<String, dynamic>>[];
-          final batchOriginalById = <String, Map<String, dynamic>>{};
+          final batchRecordIndicesForBuffer = <int>[];
 
           Future<bool> flushBatch() async {
             if (batchRecordsForBuffer.isEmpty) return false;
@@ -4228,7 +4229,7 @@ class DataStoreImpl {
 
                 if (vios.isNotEmpty) {
                   final keepRecords = <Map<String, dynamic>>[];
-                  final keepOriginalById = <String, Map<String, dynamic>>{};
+                  final keepIndices = <int>[];
                   final filterYield = YieldController(
                     'DataStore.batchInsert.flush.filter',
                     minCheckInterval: EngineCpuChunk.hotPathMinCheckInterval,
@@ -4239,28 +4240,19 @@ class DataStoreImpl {
                     if (y7 != null) await y7;
                     final vio = vios[i];
                     final rec = batchRecordsForBuffer[i];
-                    final rid = rec[primaryKey]?.toString() ?? '';
+                    final globalIdx = batchRecordIndicesForBuffer[i];
+                    final pkVal = rec[primaryKey];
+                    final rid =
+                        pkVal is String ? pkVal : (pkVal?.toString() ?? '');
 
                     if (vio == null) {
                       keepRecords.add(rec);
-                      if (rid.isNotEmpty) {
-                        keepOriginalById[rid] = batchOriginalById[rid] ?? rec;
-                      }
+                      keepIndices.add(globalIdx);
                       continue;
                     }
 
                     // Conflict with committed data: handle PK conflict healing or drop.
                     if (rid.isNotEmpty) {
-                      try {
-                        writeBufferManager.releaseReservedUniques(
-                          table: table,
-                          recordId: rid,
-                          transactionId: txId,
-                        );
-                      } catch (_) {}
-                      reservedNotBuffered.remove(rid);
-
-                      final orig = batchOriginalById[rid];
                       final bool isPkConflict =
                           vio.indexName == IndexName('pk') ||
                               vio.indexName?.value == 'pk';
@@ -4271,9 +4263,8 @@ class DataStoreImpl {
                       // Automatically adjust generator's high-water mark on PK conflict
                       if (isPkConflict && isSequentialPk) {
                         try {
-                          final dynamic pkVal = rec[primaryKey] ?? rid;
                           await tableDataManager.handlePrimaryKeyConflict(
-                              table, pkVal);
+                              table, pkVal ?? rid);
                         } catch (_) {}
 
                         bool isRecAutoPk(Map<String, dynamic> r) {
@@ -4281,18 +4272,21 @@ class DataStoreImpl {
                           if (isWindowAllUserPk || autoPkIndexSet == null) {
                             return false;
                           }
-                          final idx = currentRecords.indexOf(r);
-                          return idx >= 0 && autoPkIndexSet.contains(idx);
+                          for (int k = 0; k < windowLen; k++) {
+                            if (identical(records[start + k], r)) {
+                              return autoPkIndexSet.contains(k);
+                            }
+                          }
+                          return false;
                         }
 
                         // If the ID was auto-generated by the system, re-assign a new ID and heal
-                        if (orig != null && isRecAutoPk(orig)) {
+                        if (isRecAutoPk(rec)) {
                           try {
                             final newId =
                                 await tableDataManager.getNextId(table);
                             if (newId.isNotEmpty) {
                               rec[primaryKey] = newId;
-                              orig[primaryKey] = newId;
                               final newRid = newId.toString();
 
                               batchContext?.tryReserve(
@@ -4301,38 +4295,31 @@ class DataStoreImpl {
                                 isUpdate: false,
                                 schema: tableSchema,
                               );
-                              reservedNotBuffered.add(newRid);
                               keepRecords.add(rec);
-                              keepOriginalById[newRid] = orig;
+                              keepIndices.add(globalIdx);
                               continue; // Successfully healed!
                             }
                           } catch (_) {}
                         }
                       }
 
-                      if (orig != null) {
-                        invalidRecords.add(orig);
-                        // Efficient error capture for reporting
-                        if (validationErrorsForResult.length < 20) {
-                          validationErrorsForResult
-                              .add('pk=$rid: [Disk Conflict] ${vio.message}');
-                        }
+                      invalidRecords.add(rec);
+                      // Efficient error capture for reporting
+                      if (validationErrorsForResult.length < 20) {
+                        validationErrorsForResult
+                            .add('pk=$rid: [Disk Conflict] ${vio.message}');
                       }
-                      final originalIndex = currentRecords
-                          .indexWhere((r) => r[primaryKey]?.toString() == rid);
-                      final effectiveIndex =
-                          originalIndex != -1 ? originalIndex + start : 0;
                       if (returnResultDetails) {
-                        batchStatuses.add(ConstraintStatus(
+                        statusSlots![globalIdx] = ConstraintStatus(
                           type: vio.constraintResultType,
                           message: 'pk=$rid: [Disk Conflict] ${vio.message}',
                           tableName: tableName,
                           fields: vio.fields,
                           conflictingKeys: [vio.value],
-                          index: effectiveIndex,
+                          index: globalIdx,
                           primaryKey: rid,
                           constraintName: vio.indexName?.value,
-                        ));
+                        );
                         failedKeys.add(rid);
                       }
                       failedCount++;
@@ -4342,9 +4329,9 @@ class DataStoreImpl {
                   batchRecordsForBuffer
                     ..clear()
                     ..addAll(keepRecords);
-                  batchOriginalById
+                  batchRecordIndicesForBuffer
                     ..clear()
-                    ..addAll(keepOriginalById);
+                    ..addAll(keepIndices);
                 }
               } catch (e) {
                 Logger.warn('Batch unique disk check failed', rawError: e);
@@ -4354,28 +4341,43 @@ class DataStoreImpl {
                   'DataStore.batchInsert.flush.failAll',
                   minCheckInterval: EngineCpuChunk.hotPathMinCheckInterval,
                 );
-                for (final rec in batchRecordsForBuffer) {
+                for (int i = 0; i < batchRecordsForBuffer.length; i++) {
                   final y8 = failYield.maybeYield();
                   if (y8 != null) await y8;
-                  final rid = rec[primaryKey]?.toString() ?? '';
-                  if (rid.isEmpty) continue;
-                  try {
-                    writeBufferManager.releaseReservedUniques(
-                      table: table,
-                      recordId: rid,
-                      transactionId: txId,
-                    );
-                  } catch (_) {}
-                  reservedNotBuffered.remove(rid);
-                  final orig = batchOriginalById[rid];
-                  if (orig != null) invalidRecords.add(orig);
+                  final rec = batchRecordsForBuffer[i];
+                  final globalIdx = batchRecordIndicesForBuffer[i];
+                  final pkVal = rec[primaryKey];
+                  final rid =
+                      pkVal is String ? pkVal : (pkVal?.toString() ?? '');
+                  invalidRecords.add(rec);
                   if (returnResultDetails) {
-                    failedKeys.add(rid);
+                    if (rid.isNotEmpty) {
+                      failedKeys.add(rid);
+                    }
+                    if (e is DbException) {
+                      final s = e.statuses.isNotEmpty ? e.statuses.first : null;
+                      if (s != null) {
+                        statusSlots![globalIdx] = s.withIndex(globalIdx);
+                      } else {
+                        statusSlots![globalIdx] = GeneralStatus(
+                          type: ResultType.bizUniqueViolation,
+                          message: e.message,
+                          index: globalIdx,
+                        );
+                      }
+                    } else {
+                      statusSlots![globalIdx] = GeneralStatus(
+                        type: ResultType.engError,
+                        message: 'Disk unique check failed: $e',
+                        index: globalIdx,
+                      );
+                    }
                   }
                   failedCount++;
                 }
+                batchContext?.releaseAll();
                 batchRecordsForBuffer.clear();
-                batchOriginalById.clear();
+                batchRecordIndicesForBuffer.clear();
               }
             }
 
@@ -4394,11 +4396,31 @@ class DataStoreImpl {
               deferQueryCacheInvalidation: deferQueryCacheInvalidation,
             );
 
-            if (bufferResult.successRecordIds.isNotEmpty) {
-              for (final id in bufferResult.successRecordIds) {
-                reservedNotBuffered.remove(id);
+            bool hadFailures = false;
+            if (bufferResult.failedRecordIds.isNotEmpty) {
+              hadFailures = true;
+              final failedSet = bufferResult.failedRecordIds.toSet();
+              for (int i = 0; i < batchRecordsForBuffer.length; i++) {
+                final pkVal = batchRecordsForBuffer[i][primaryKey]?.toString();
+                if (pkVal != null && failedSet.contains(pkVal)) {
+                  final globalIdx = batchRecordIndicesForBuffer[i];
+                  batchContext?.releaseForPk(pkVal);
+                  if (returnResultDetails) {
+                    failedKeys.add(pkVal);
+                    statusSlots![globalIdx] = GeneralStatus(
+                      type: ResultType.engError,
+                      message: 'Buffer write failed for pk=$pkVal',
+                      index: globalIdx,
+                    );
+                  }
+                  failedCount++;
+                }
               }
+            }
+
+            if (bufferResult.successRecordIds.isNotEmpty) {
               successCount += bufferResult.successRecordIds.length;
+              batchContext?.clear();
 
               final hasNotify =
                   notificationManager.hasListeners(tableSchema.tableUid);
@@ -4430,31 +4452,7 @@ class DataStoreImpl {
               }
             }
 
-            bool hadFailures = false;
-            if (bufferResult.failedRecordIds.isNotEmpty) {
-              hadFailures = true;
-              for (final failedId in bufferResult.failedRecordIds) {
-                try {
-                  writeBufferManager.releaseReservedUniques(
-                    table: table,
-                    recordId: failedId,
-                    transactionId: txId,
-                  );
-                } catch (_) {}
-                reservedNotBuffered.remove(failedId);
-                final orig = batchOriginalById[failedId];
-                if (orig != null) invalidRecords.add(orig);
-                if (failedId.isNotEmpty) {
-                  if (returnResultDetails) {
-                    failedKeys.add(failedId);
-                  }
-                  failedCount++;
-                }
-              }
-            }
-
             batchRecordsForBuffer.clear();
-            batchOriginalById.clear();
 
             return hadFailures;
           }
@@ -4462,9 +4460,9 @@ class DataStoreImpl {
           final recordErrors = <String>[];
 
           // Process prepared records: reserve unique keys and enqueue for flush.
-          for (int offset = 0; offset < currentRecords.length; offset++) {
+          for (int offset = 0; offset < windowLen; offset++) {
             final int j = start + offset;
-            final record = currentRecords[offset];
+            final record = records[j];
             final loopYield = yieldController.maybeYield();
             if (loopYield != null) await loopYield;
 
@@ -4479,7 +4477,7 @@ class DataStoreImpl {
 
               while (!finishedRecord) {
                 Map<String, dynamic>? validData;
-                List<Map<String, dynamic>>? validationStatusesJson;
+                DbException? validationException;
                 recordErrors.clear();
 
                 try {
@@ -4493,19 +4491,20 @@ class DataStoreImpl {
                     ignoreUnknownFields: _config?.ignoreUnknownFields ?? true,
                     batchTimestamp: batchTimestamp,
                     schemaNeedsConstraintPass: needsConstraintPass,
-                    mutateInPlace: isFastPathWindow,
+                    mutateInPlace: true,
                   );
                 } on DbException catch (e) {
                   recordErrors.addAll(e.statuses.map((s) => s.message));
-                  validationStatusesJson =
-                      e.statuses.map((s) => s.toJson()).toList();
+                  validationException = e;
                 } catch (e) {
                   recordErrors.add(e.toString());
                 }
 
                 if (validData == null) {
                   invalidRecords.add(record);
-                  final failedKey = record[primaryKey]?.toString() ?? '';
+                  final pkVal = record[primaryKey];
+                  final failedKey =
+                      pkVal is String ? pkVal : (pkVal?.toString() ?? '');
                   if (returnResultDetails && failedKey.isNotEmpty) {
                     failedKeys.add(failedKey);
                   }
@@ -4518,19 +4517,19 @@ class DataStoreImpl {
                         .add('$prefix: ${recordErrors.join("; ")}');
                   }
                   if (returnResultDetails) {
-                    if (validationStatusesJson != null) {
-                      for (final sJson in validationStatusesJson) {
-                        batchStatuses.add(
-                            ResultStatus.fromJson(sJson, indexOverride: j));
-                      }
+                    final s = validationException?.statuses.isNotEmpty == true
+                        ? validationException!.statuses.first
+                        : null;
+                    if (s != null) {
+                      statusSlots![j] = s.withIndex(j);
                     } else {
-                      batchStatuses.add(GeneralStatus(
+                      statusSlots![j] = GeneralStatus(
                         type: ResultType.bizValidationFailed,
                         message: recordErrors.isNotEmpty
                             ? recordErrors.join("; ")
                             : 'Data validation failed',
                         index: j,
-                      ));
+                      );
                     }
                   }
                   finishedRecord = true;
@@ -4563,15 +4562,25 @@ class DataStoreImpl {
 
                   if (fkVio != null) {
                     invalidRecords.add(record);
-                    final failedKey = validData[primaryKey]?.toString() ?? '';
+                    final pkVal = validData[primaryKey];
+                    final failedKey =
+                        pkVal is String ? pkVal : (pkVal?.toString() ?? '');
                     if (returnResultDetails && failedKey.isNotEmpty) {
                       failedKeys.add(failedKey);
                     }
                     failedCount++;
                     if (returnResultDetails) {
-                      for (final s in fkVio.statuses) {
-                        batchStatuses.add(ResultStatus.fromJson(s.toJson(),
-                            indexOverride: j));
+                      final s = fkVio.statuses.isNotEmpty
+                          ? fkVio.statuses.first
+                          : null;
+                      if (s != null) {
+                        statusSlots![j] = s.withIndex(j);
+                      } else {
+                        statusSlots![j] = GeneralStatus(
+                          type: ResultType.bizForeignKeyViolation,
+                          message: fkVio.message,
+                          index: j,
+                        );
                       }
                     }
                     finishedRecord = true;
@@ -4580,7 +4589,8 @@ class DataStoreImpl {
                 }
 
                 // Reservation based: try reserve unique keys first (schema+data)
-                final recordId = validData[primaryKey].toString();
+                final pkVal = validData[primaryKey];
+                final recordId = pkVal is String ? pkVal : pkVal.toString();
                 if (batchContext != null) {
                   try {
                     batchContext.tryReserve(
@@ -4589,10 +4599,10 @@ class DataStoreImpl {
                       isUpdate: false,
                       schema: tableSchema,
                     );
-                    reservedNotBuffered.add(recordId);
                   } catch (e) {
                     if (e is UniqueViolation) {
-                      final bool isPkConflict = e.indexName == 'pk';
+                      final bool isPkConflict =
+                          e.indexName == 'pk' || e.indexName?.value == 'pk';
                       final bool isSequentialPk =
                           tableSchema.primaryKeyConfig.type ==
                               PrimaryKeyType.sequential;
@@ -4604,7 +4614,6 @@ class DataStoreImpl {
                           isAutoPk &&
                           !triedPkConflictRetry) {
                         try {
-                          final dynamic pkVal = validData[primaryKey];
                           await tableDataManager.handlePrimaryKeyConflict(
                               table, pkVal);
 
@@ -4630,15 +4639,13 @@ class DataStoreImpl {
                           if (isAutoPk) {
                             final List<Map<String, dynamic>>
                                 subsequentToReassign = [];
-                            for (int k = offset + 1;
-                                k < currentRecords.length;
-                                k++) {
+                            for (int k = offset + 1; k < windowLen; k++) {
                               final bool isKAutoPk = isWindowAllAutoPk ||
                                   (!isWindowAllUserPk &&
                                       autoPkIndexSet != null &&
                                       autoPkIndexSet.contains(k));
                               if (isKAutoPk) {
-                                subsequentToReassign.add(currentRecords[k]);
+                                subsequentToReassign.add(records[start + k]);
                               }
                             }
 
@@ -4669,19 +4676,36 @@ class DataStoreImpl {
                       }
 
                       invalidRecords.add(record);
-                      final failedKey = validData[primaryKey]?.toString() ?? '';
+                      final failedKey = recordId;
                       if (returnResultDetails && failedKey.isNotEmpty) {
                         failedKeys.add(failedKey);
+                        statusSlots![j] = ConstraintStatus(
+                          type: e.constraintResultType,
+                          message: 'pk=$failedKey: ${e.message}',
+                          tableName: tableName,
+                          fields: e.fields,
+                          conflictingKeys: [e.value],
+                          index: j,
+                          primaryKey: failedKey,
+                          constraintName: e.indexName?.value,
+                        );
                       }
                       failedCount++;
                       if (!allowPartialErrors) {
                         // Flush pending successful records to avoid leaving reservations behind.
                         await flushBatch();
+                        final List<ResultStatus> errStatuses =
+                            returnResultDetails
+                                ? statusSlots!
+                                    .whereType<ResultStatus>()
+                                    .toList(growable: false)
+                                : const [];
                         return finishWithPromoteMirror(DbResult.error(
                           type: e.constraintResultType,
                           message: e.message,
                           failedKeys:
                               returnResultDetails ? failedKeys : const [],
+                          statuses: errStatuses,
                         ));
                       }
                       finishedRecord = true;
@@ -4691,42 +4715,58 @@ class DataStoreImpl {
                   }
                 }
 
-                try {
-                  batchRecordsForBuffer.add(validData);
-                  batchOriginalById[recordId] = record;
-
-                  // Flush is deferred to the end of the prepare window
-                  // (window size == bufferBatchSize) to avoid mid-loop double work.
-
-                  finishedRecord = true;
-                } catch (e) {
-                  // Release reservation on unexpected error
-                  try {
-                    writeBufferManager.releaseReservedUniques(
-                      table: table,
-                      recordId: recordId,
-                      transactionId: txId,
-                    );
-                  } catch (_) {}
-                  rethrow;
-                }
+                batchRecordsForBuffer.add(validData);
+                batchRecordIndicesForBuffer.add(j);
+                finishedRecord = true;
               }
             } catch (e) {
               Logger.warn('Error processing record', rawError: e);
               invalidRecords.add(record);
-              final failedKey = record[primaryKey]?.toString() ?? '';
-              if (returnResultDetails && failedKey.isNotEmpty) {
-                failedKeys.add(failedKey);
+              final pkVal = record[primaryKey];
+              final failedKey =
+                  pkVal is String ? pkVal : (pkVal?.toString() ?? '');
+              if (returnResultDetails) {
+                if (failedKey.isNotEmpty) {
+                  failedKeys.add(failedKey);
+                }
+                if (e is DbException) {
+                  final s = e.statuses.isNotEmpty ? e.statuses.first : null;
+                  if (s != null) {
+                    statusSlots![j] = s.withIndex(j);
+                  } else {
+                    statusSlots![j] = GeneralStatus(
+                      type: ResultType.engError,
+                      message: e.message,
+                      index: j,
+                    );
+                  }
+                } else {
+                  statusSlots![j] = GeneralStatus(
+                    type: ResultType.engError,
+                    message: 'Error processing record: $e',
+                    index: j,
+                  );
+                }
               }
               failedCount++;
 
               if (!allowPartialErrors) {
                 // Flush pending successful records to avoid leaving reservations behind.
                 await flushBatch();
+                final List<ResultStatus> errStatuses = returnResultDetails
+                    ? statusSlots!
+                        .whereType<ResultStatus>()
+                        .toList(growable: false)
+                    : const [];
                 return finishWithPromoteMirror(DbResult.error(
-                  type: ResultType.engError,
+                  type: e is DbException
+                      ? (e.statuses.isNotEmpty
+                          ? e.statuses.first.type
+                          : ResultType.engError)
+                      : ResultType.engError,
                   message: 'Error processing record: $e',
                   failedKeys: returnResultDetails ? failedKeys : const [],
+                  statuses: errStatuses,
                 ));
               }
             }
@@ -4734,43 +4774,56 @@ class DataStoreImpl {
 
           final bool hadFlushFailures = await flushBatch();
           if (hadFlushFailures && !allowPartialErrors) {
+            final List<ResultStatus> errStatuses = returnResultDetails
+                ? statusSlots!.whereType<ResultStatus>().toList(growable: false)
+                : const [];
             return finishWithPromoteMirror(DbResult.error(
               type: ResultType.engError,
               message: 'Error processing record: WAL append failed',
               failedKeys: returnResultDetails ? failedKeys : const [],
+              statuses: errStatuses,
             ));
           }
 
           start = end;
         }
 
-        if (returnResultDetails) {
+        List<ResultStatus> finalBatchStatuses = const [];
+        if (returnResultDetails && statusSlots != null) {
           if (failedCount == 0 && successKeys.length == records.length) {
-            // Fast-path: 100% success rate -- zero toSet() and zero hash lookup overhead
-            for (int i = 0; i < records.length; i++) {
-              batchStatuses.add(SuccessStatus(
+            // Fast-path: 100% success rate -- O(N) direct List.generate with zero intermediate allocations
+            finalBatchStatuses = List<ResultStatus>.generate(
+              records.length,
+              (i) => SuccessStatus(
                 message: 'Record inserted successfully',
                 index: i,
                 primaryKey: successKeys[i],
-              ));
-            }
+              ),
+              growable: false,
+            );
           } else {
-            // Partial success / fail-allowed path
+            // Partial success / fail-allowed path -- fill remaining successful slots
             final successSet = successKeys.toSet();
             for (int i = 0; i < records.length; i++) {
+              if (statusSlots[i] != null) {
+                continue; // Already holds exact business failure status
+              }
               final oldPk = records[i][primaryKey]?.toString() ?? '';
               if (oldPk.isEmpty) continue;
               final displayPk = promoteKeyDesc != null
                   ? _promoteUserFacingSuccessKey(records[i], promoteKeyDesc)
                   : oldPk;
               if (successSet.contains(displayPk)) {
-                batchStatuses.add(SuccessStatus(
+                statusSlots[i] = SuccessStatus(
                   message: 'Record inserted successfully',
                   index: i,
                   primaryKey: displayPk,
-                ));
+                );
               }
             }
+            // Direct typed copy from statusSlots
+            finalBatchStatuses =
+                List<ResultStatus>.from(statusSlots, growable: false);
           }
         }
 
@@ -4791,7 +4844,7 @@ class DataStoreImpl {
             type: ResultType.bizValidationFailed,
             message: message,
             failedKeys: returnResultDetails ? failedKeys : const [],
-            statuses: returnResultDetails ? batchStatuses : const [],
+            statuses: finalBatchStatuses,
           ));
         }
 
@@ -4813,18 +4866,19 @@ class DataStoreImpl {
             type: ResultType.bizValidationFailed,
             message: message,
             failedKeys: returnResultDetails ? failedKeys : const [],
-            statuses: returnResultDetails ? batchStatuses : const [],
+            statuses: finalBatchStatuses,
           ));
         }
 
         // Return result
         if (invalidRecords.isEmpty) {
           return finishWithPromoteMirror(DbResult(
-            statuses: returnResultDetails ? batchStatuses : const [],
+            statuses: finalBatchStatuses,
             successKeys: returnResultDetails ? successKeys : const [],
             failedKeys: const [],
             successCount: successCount,
             failedCount: 0,
+            hasErrors: false,
           ));
         } else {
           String message =
@@ -4840,7 +4894,7 @@ class DataStoreImpl {
                 '$message. Example validation errors: ${preview.join(" | ")}$suffix';
           }
           return finishWithPromoteMirror(DbResult(
-            statuses: returnResultDetails ? batchStatuses : const [],
+            statuses: finalBatchStatuses,
             successKeys: returnResultDetails ? successKeys : const [],
             failedKeys: returnResultDetails ? failedKeys : const [],
             successCount: successCount,

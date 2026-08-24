@@ -159,12 +159,15 @@ Map<String, dynamic>? validateAndProcessRecordPure({
         } else {
           value = resolveNowIso();
         }
+      } else if (value == null && field.defaultValue != null) {
+        value = field.getDefaultValue();
       }
 
       final converted = field.convertValue(value);
       if (mutateInPlace) {
-        // Typed app records usually already match storage form -- skip map write.
-        if (!identical(converted, value)) {
+        // Typed app records usually already match storage form -- skip map write only if raw was identical.
+        if (!identical(converted, raw) ||
+            (converted != null && !data.containsKey(field.name))) {
           data[field.name] = converted;
         }
       } else {

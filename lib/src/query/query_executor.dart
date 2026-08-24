@@ -3889,21 +3889,14 @@ class QueryExecutor {
     final comps = <Uint8List>[];
     for (final f in spec.fields) {
       final v = lastRecord[f] ?? lastRecord['$tableName.$f'];
-      final c = schema.encodeFieldComponentToMemComparable(
-        f,
-        v,
-        truncateText: truncateText,
-      );
-      if (c == null) {
-        throw DbException([
-          InvalidArgumentStatus(
-            type: ResultType.devInvalidCursorPagination,
-            message:
-                'Cannot build next cursor: missing or unsupported index field value in the last record.',
-            parameterName: 'cursor',
-          ),
-        ]);
-      }
+      final c = (v == null)
+          ? MemComparableKey.encodeNull()
+          : schema.encodeFieldComponentToMemComparable(
+                f,
+                v,
+                truncateText: truncateText,
+              ) ??
+              MemComparableKey.encodeTextLex(v.toString());
       comps.add(c);
     }
     if (!spec.isUnique) {

@@ -162,6 +162,34 @@ class SequentialIdGenerator implements IdGenerator {
 
     _updateRequestStats(count);
 
+    // Fast path: for standard local sequential IDs (non-distributed, deterministic increment),
+    // allocate directly via range increment without intermediate queue overhead.
+    if (!isDistributed && !config.useRandomIncrement) {
+      final step = config.increment;
+      if (_idPool.isEmpty) {
+        final startId = _currentId + step;
+        _currentId += count * step;
+        return List<String>.generate(
+          count,
+          (i) => (startId + i * step).toString(),
+          growable: false,
+        );
+      }
+      final result = <String>[];
+      while (result.length < count && _idPool.isNotEmpty) {
+        result.add(_idPool.removeFirst());
+      }
+      final remaining = count - result.length;
+      if (remaining > 0) {
+        final startId = _currentId + step;
+        _currentId += remaining * step;
+        for (int i = 0; i < remaining; i++) {
+          result.add((startId + i * step).toString());
+        }
+      }
+      return result;
+    }
+
     // 1. Consume readily available IDs from pre-filled pool (pure synchronous, 0 block)
     final result = <String>[];
     while (result.length < count && _idPool.isNotEmpty) {

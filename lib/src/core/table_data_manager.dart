@@ -1765,10 +1765,8 @@ class TableDataManager {
     final validBatchRecordIds = <String>[];
     // Update/delete keep parallel record lists; insert reuses walEntries['data'].
     final bool isInsert = operation == BufferOperationType.insert;
-    final validBatchRecords =
-        isInsert ? null : <Map<String, dynamic>>[];
-    final validBatchOldValues =
-        isInsert ? null : <Map<String, dynamic>?>[];
+    final validBatchRecords = isInsert ? null : <Map<String, dynamic>>[];
+    final validBatchOldValues = isInsert ? null : <Map<String, dynamic>?>[];
 
     for (int i = 0; i < count; i++) {
       final r = records[i];
@@ -1828,13 +1826,15 @@ class TableDataManager {
     // Commit apply must land in pending (tx overlays are cleared after commit).
     final String? bufferTxId = applyingCommit ? null : currentTxId;
 
-    final recordIds = <String>[];
-    final entries = <BufferEntry>[];
     final int validCount = validBatchRecordIds.length;
+    final List<String> recordIds;
+    final List<BufferEntry> entries;
 
     if (isInsert) {
-      for (int i = 0; i < validCount; i++) {
-        entries.add(BufferEntry(
+      recordIds = validBatchRecordIds;
+      entries = List<BufferEntry>.generate(
+        validCount,
+        (i) => BufferEntry(
           data: walEntries[i]['data'] as Map<String, dynamic>,
           operation: operation,
           timestamp: ts,
@@ -1842,10 +1842,12 @@ class TableDataManager {
           walPointer: pointers[i],
           oldValues: null,
           schemaVersion: schemaVersion,
-        ));
-        recordIds.add(validBatchRecordIds[i]);
-      }
+        ),
+        growable: false,
+      );
     } else {
+      recordIds = <String>[];
+      entries = <BufferEntry>[];
       for (int i = 0; i < validCount; i++) {
         final recordId = validBatchRecordIds[i];
         final r = validBatchRecords![i];

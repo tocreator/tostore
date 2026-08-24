@@ -58,6 +58,10 @@ abstract class ResultStatus {
     };
   }
 
+  /// Returns a copy of this status with the specified batch sequence index.
+  /// If the current index is already equal to [newIndex], returns `this` directly.
+  ResultStatus withIndex(int newIndex);
+
   /// Build the concrete subclass that matches engine routing rules.
   ///
   /// Routing (must stay aligned with `doc/result_status_specification.md` §4):
@@ -199,6 +203,16 @@ class SuccessStatus extends ResultStatus {
     }
     return map;
   }
+
+  @override
+  SuccessStatus withIndex(int newIndex) {
+    if (index == newIndex) return this;
+    return SuccessStatus(
+      message: message,
+      index: newIndex,
+      primaryKey: primaryKey,
+    );
+  }
 }
 
 /// Status detail for database integrity and constraint violations.
@@ -251,6 +265,22 @@ class ConstraintStatus extends ResultStatus {
     }
     return map;
   }
+
+  @override
+  ConstraintStatus withIndex(int newIndex) {
+    if (index == newIndex) return this;
+    return ConstraintStatus(
+      type: type,
+      message: message,
+      tableName: tableName,
+      index: newIndex,
+      constraintName: constraintName,
+      fields: fields,
+      conflictingKeys: conflictingKeys,
+      primaryKey: primaryKey,
+      referencedTable: referencedTable,
+    );
+  }
 }
 
 /// Status detail for table schema validation and format failures.
@@ -284,6 +314,19 @@ class SchemaValidationStatus extends ResultStatus {
       map['wrongValue'] = jsonSafeDiagnosticValue(wrongValue);
     }
     return map;
+  }
+
+  @override
+  SchemaValidationStatus withIndex(int newIndex) {
+    if (index == newIndex) return this;
+    return SchemaValidationStatus(
+      type: type,
+      message: message,
+      tableName: tableName,
+      index: newIndex,
+      field: field,
+      wrongValue: wrongValue,
+    );
   }
 }
 
@@ -320,6 +363,19 @@ class InvalidArgumentStatus extends ResultStatus {
     }
     return map;
   }
+
+  @override
+  InvalidArgumentStatus withIndex(int newIndex) {
+    if (index == newIndex) return this;
+    return InvalidArgumentStatus(
+      type: type,
+      message: message,
+      parameterName: parameterName,
+      index: newIndex,
+      passedValue: passedValue,
+      primaryKey: primaryKey,
+    );
+  }
 }
 
 /// Status detail for transaction failures.
@@ -339,6 +395,17 @@ class TransactionOperationStatus extends ResultStatus {
     final map = super.toJson();
     map['txId'] = txId;
     return map;
+  }
+
+  @override
+  TransactionOperationStatus withIndex(int newIndex) {
+    if (index == newIndex) return this;
+    return TransactionOperationStatus(
+      type: type,
+      message: message,
+      txId: txId,
+      index: newIndex,
+    );
   }
 }
 
@@ -376,6 +443,19 @@ class GeneralStatus extends ResultStatus {
       map['operation'] = operation;
     }
     return map;
+  }
+
+  @override
+  GeneralStatus withIndex(int newIndex) {
+    if (index == newIndex) return this;
+    return GeneralStatus(
+      type: type,
+      message: message,
+      index: newIndex,
+      primaryKey: primaryKey,
+      target: target,
+      operation: operation,
+    );
   }
 }
 
