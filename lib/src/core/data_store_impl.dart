@@ -2133,19 +2133,6 @@ class DataStoreImpl {
     }
   }
 
-  /// validate and process update data
-  Future<Map<String, dynamic>?> _validateAndProcessUpdateData(
-    TableSchema schema,
-    Map<String, dynamic> data,
-    TableContext table,
-  ) async {
-    return validateAndProcessUpdateDataPure(
-      schema: schema,
-      data: data,
-      tableName: table.tableName,
-    );
-  }
-
   /// Engine-facing update.
   ///
   /// Defaults allow large-scale ops ([allowLargeScaleOperation] true) while
@@ -2219,7 +2206,8 @@ class DataStoreImpl {
       }
       Map<String, dynamic>? validData;
       try {
-        validData = await _validateAndProcessUpdateData(schema, data, table);
+        validData = validateAndProcessUpdateDataPure(
+            schema: schema, data: data, tableName: table.tableName);
       } on DbException catch (e) {
         return finish(DbResult.error(
           type: e.statuses.isNotEmpty
@@ -5561,28 +5549,107 @@ class DataStoreImpl {
             continue;
           }
 
-          // 5.1 Validate update payload pure
-          Map<String, dynamic>? validData;
+          // 5.1 In-Place Merge & Validate update payload (O(changed_fields) zero-allocation)
+          final updatedRecord = Map<String, dynamic>.of(existingRecord);
+          final changedFields = <String>[];
+          bool hasValidationError = false;
           DbException? validationException;
           String? validationErrorStr;
+          final bool ignoreUnknownFields = _config?.ignoreUnknownFields ?? true;
 
-          try {
-            validData = validateAndProcessUpdateDataPure(
-              schema: schema,
-              data: record,
-              tableName: table.tableName,
-              ignoreUnknownFields: _config?.ignoreUnknownFields ?? true,
-            );
-          } on DbException catch (e) {
-            validationException = e;
-          } catch (e) {
-            validationErrorStr = e.toString();
+          for (final entry in record.entries) {
+            final fieldName = entry.key;
+            if (fieldName == primaryKey) continue;
+
+            final field = fieldMap[fieldName];
+            if (field == null) {
+              if (!ignoreUnknownFields) {
+                hasValidationError = true;
+                validationException = DbException([
+                  InvalidArgumentStatus(
+                    type: ResultType.devFieldNotFound,
+                    message:
+                        'Unknown field $fieldName in table ${table.tableName}',
+                    parameterName: fieldName,
+                    passedValue: entry.value,
+                  )
+                ]);
+                break;
+              }
+              continue;
+            }
+
+            final proposed = entry.value;
+            if (proposed is ExprNode) {
+              try {
+                final result = evaluateExpressionForRecord(
+                  proposed,
+                  existingRecord,
+                  schema,
+                  isUpdate: true,
+                );
+                final converted = field.convertValue(result);
+                try {
+                  field.checkConstraints(
+                    converted,
+                    tableName: schema.name,
+                    skipMaxLengthCheck: true,
+                  );
+                } on DbException catch (e) {
+                  hasValidationError = true;
+                  validationException = e;
+                  break;
+                }
+
+                var finalValue = converted;
+                if (finalValue is String &&
+                    field.maxLength != null &&
+                    finalValue.length > field.maxLength!) {
+                  finalValue = finalValue.substring(0, field.maxLength!);
+                }
+
+                if (updatedRecord[fieldName] != finalValue) {
+                  updatedRecord[fieldName] = finalValue;
+                  changedFields.add(fieldName);
+                }
+              } catch (e) {
+                Logger.error('Expression evaluation failed for $fieldName',
+                    rawError: e);
+              }
+            } else {
+              try {
+                field.checkConstraints(
+                  proposed,
+                  tableName: table.tableName,
+                  skipMaxLengthCheck: true,
+                );
+              } on DbException catch (e) {
+                hasValidationError = true;
+                validationException = e;
+                break;
+              } catch (e) {
+                hasValidationError = true;
+                validationErrorStr = e.toString();
+                break;
+              }
+
+              final converted = field.convertValue(proposed);
+              var finalValue = converted;
+              if (finalValue != null &&
+                  field.maxLength != null &&
+                  finalValue is String &&
+                  finalValue.length > field.maxLength!) {
+                finalValue = finalValue.substring(0, field.maxLength!);
+              }
+
+              if (updatedRecord[fieldName] != finalValue) {
+                updatedRecord[fieldName] = finalValue;
+                changedFields.add(fieldName);
+              }
+            }
           }
 
-          if (validData == null ||
-              validData.isEmpty ||
-              validationException != null ||
-              validationErrorStr != null) {
+          if (hasValidationError) {
             if (returnResultDetails) {
               failedKeys.add(pkVal);
               if (validationException != null) {
@@ -5613,95 +5680,6 @@ class DataStoreImpl {
                 message: validationException?.message ??
                     validationErrorStr ??
                     'Data validation failed for record $pkVal',
-                failedKeys: returnResultDetails ? failedKeys : const [],
-                statuses: returnResultDetails
-                    ? statusSlots!
-                        .whereType<ResultStatus>()
-                        .toList(growable: false)
-                    : const [],
-              ));
-            }
-            continue;
-          }
-
-          // 5.2 Merge changes & evaluate expressions (in-place)
-          final updatedRecord = <String, dynamic>{...existingRecord};
-          final changedFields = <String>[];
-          bool hasConstraintError = false;
-          DbException? constraintException;
-
-          for (final entry in validData.entries) {
-            final fieldName = entry.key;
-            final proposed = entry.value;
-
-            if (proposed is ExprNode) {
-              try {
-                final result = evaluateExpressionForRecord(
-                  proposed,
-                  existingRecord,
-                  schema,
-                  isUpdate: true,
-                );
-                final field = fieldMap[fieldName];
-                if (field == null || field.name == primaryKey) {
-                  continue;
-                }
-
-                final converted = field.convertValue(result);
-                try {
-                  field.checkConstraints(
-                    converted,
-                    tableName: schema.name,
-                    skipMaxLengthCheck: true,
-                  );
-                } on DbException catch (e) {
-                  hasConstraintError = true;
-                  constraintException = e;
-                  break;
-                }
-
-                var finalValue = converted;
-                if (finalValue is String &&
-                    field.maxLength != null &&
-                    finalValue.length > field.maxLength!) {
-                  finalValue = finalValue.substring(0, field.maxLength!);
-                }
-
-                if (updatedRecord[fieldName] != finalValue) {
-                  updatedRecord[fieldName] = finalValue;
-                  changedFields.add(fieldName);
-                }
-              } catch (e) {
-                Logger.error('Expression evaluation failed for $fieldName',
-                    rawError: e);
-              }
-            } else {
-              if (updatedRecord[fieldName] != proposed) {
-                updatedRecord[fieldName] = proposed;
-                changedFields.add(fieldName);
-              }
-            }
-          }
-
-          if (hasConstraintError && constraintException != null) {
-            if (returnResultDetails) {
-              failedKeys.add(pkVal);
-              final s = constraintException.statuses.isNotEmpty
-                  ? constraintException.statuses.first
-                  : null;
-              statusSlots![j] = s?.withIndex(j) ??
-                  GeneralStatus(
-                    type: ResultType.bizValidationFailed,
-                    message: constraintException.message,
-                    index: j,
-                    primaryKey: pkVal,
-                  );
-            }
-            failedCount++;
-            if (!allowPartialErrors) {
-              return finishWithPromoteMirror(DbResult.error(
-                type: ResultType.bizValidationFailed,
-                message: constraintException.message,
                 failedKeys: returnResultDetails ? failedKeys : const [],
                 statuses: returnResultDetails
                     ? statusSlots!
@@ -5951,18 +5929,12 @@ class DataStoreImpl {
 
         // 7. Single atomic batch commit for Window to TableDataManager
         if (recordsToCommit.isNotEmpty) {
-          final Map<String, Map<String, dynamic>> oldRecordsMap = {};
-          for (int k = 0; k < recordsToCommit.length; k++) {
-            final pk = commitPkVals[k];
-            oldRecordsMap[pk] = oldRecordsToCommit[k];
-          }
-
           final commitResult = await tableDataManager.addBatchToBuffer(
             table: table,
             records: recordsToCommit,
             operation: BufferOperationType.update,
             schema: schema,
-            oldRecordsMap: oldRecordsMap,
+            oldRecordsList: oldRecordsToCommit,
             transactionId: txId,
             schemaVersion: schema.schemaVersion ?? '',
           );

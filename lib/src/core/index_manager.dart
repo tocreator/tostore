@@ -683,19 +683,22 @@ class IndexManager {
       Map<String, dynamic>? oldData, Map<String, dynamic>? newData,
       {TableSchema? overrideSchema, bool force = false}) {
     try {
+      final bool isMemoryMode =
+          _dataStore.config.persistenceMode == PersistenceMode.memory;
+      final bool shouldWrite =
+          force || _dataStore.isGlobalPrewarming || isMemoryMode;
+
+      // Fast path: if not in memory mode and cache is empty, no-op immediately
+      if (!shouldWrite && _indexDataCache.isEmpty) {
+        return;
+      }
+
       final schema = overrideSchema ?? table.schema;
       final indexes = <IndexSchema>[
         ...?_dataStore.tableMetaManager?.getAllIndexesFor(schema),
         ...getEngineManagedBtreeIndexes(table, schema),
       ];
       if (indexes.isEmpty) return;
-
-      final bool isMemoryMode =
-          _dataStore.config.persistenceMode == PersistenceMode.memory;
-      // In memory mode, _indexDataCache is the committed index store, not an optional cache.
-      // Always apply mutations so search/uniqueness never fall back to disk.
-      final bool shouldWrite =
-          force || _dataStore.isGlobalPrewarming || isMemoryMode;
 
       for (final index in indexes) {
         if (index.type == IndexType.vector) continue;

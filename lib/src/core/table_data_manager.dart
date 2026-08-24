@@ -27,7 +27,6 @@ import 'compute/compute_batch_planner.dart';
 import 'compute/delete_batch_prepare_compute.dart';
 import 'compute/query_aggregate_compute.dart';
 import 'compute_manager.dart';
-import 'cpu_work_chunk.dart';
 import 'crontab_manager.dart';
 import 'data_store_impl.dart';
 import 'resource_manager.dart';
@@ -1599,6 +1598,7 @@ class TableDataManager {
     required BufferOperationType operation,
     required TableSchema schema,
     Map<String, Map<String, dynamic>>? oldRecordsMap,
+    List<Map<String, dynamic>?>? oldRecordsList,
     String? transactionId,
     DateTime? timestamp,
     required String schemaVersion,
@@ -1630,47 +1630,43 @@ class TableDataManager {
         pkName,
       );
 
-      await EngineCpuChunk.forEachRange(
-        length: records.length,
-        kind: CpuChunkKind.medium,
-        process: (start, end) {
-          for (int i = start; i < end; i++) {
-            final r = records[i];
-            final recordId = r[pkName]?.toString();
-            if (recordId == null || recordId.isEmpty) {
-              // Cannot report failed key reliably here.
-              continue;
-            }
+      for (int i = 0; i < records.length; i++) {
+        final r = records[i];
+        final recordId = r[pkName]?.toString();
+        if (recordId == null || recordId.isEmpty) {
+          // Cannot report failed key reliably here.
+          continue;
+        }
 
-            final oldR = oldRecordsMap != null ? oldRecordsMap[recordId] : null;
+        final oldR = oldRecordsList != null && i < oldRecordsList.length
+            ? oldRecordsList[i]
+            : (oldRecordsMap != null ? oldRecordsMap[recordId] : null);
 
-            try {
-              final entry = BufferEntry(
-                data: Map<String, dynamic>.from(r),
-                operation: operation,
-                timestamp: ts,
-                walPointer: null,
-                transactionId: currentTxId,
-                oldValues: oldR,
-                schemaVersion: schemaVersion,
-              );
-              // Unique reservation is expected at call sites before addBatchToBuffer.
-              _dataStore.writeBufferManager.applyTxnRecord(
-                transactionId: currentTxId,
-                table: table,
-                recordId: recordId,
-                entry: entry,
-              );
-              successIds.add(recordId);
-            } catch (e) {
-              Logger.warn(
-                  'Txn deferred batch op failed: ${table.tableName} pk=$recordId',
-                  rawError: e);
-              failedIds.add(recordId);
-            }
-          }
-        },
-      );
+        try {
+          final entry = BufferEntry(
+            data: Map<String, dynamic>.from(r),
+            operation: operation,
+            timestamp: ts,
+            walPointer: null,
+            transactionId: currentTxId,
+            oldValues: oldR,
+            schemaVersion: schemaVersion,
+          );
+          // Unique reservation is expected at call sites before addBatchToBuffer.
+          _dataStore.writeBufferManager.applyTxnRecord(
+            transactionId: currentTxId,
+            table: table,
+            recordId: recordId,
+            entry: entry,
+          );
+          successIds.add(recordId);
+        } catch (e) {
+          Logger.warn(
+              'Txn deferred batch op failed: ${table.tableName} pk=$recordId',
+              rawError: e);
+          failedIds.add(recordId);
+        }
+      }
       if (successIds.isNotEmpty) {
         _txnIdsWithOps.add(currentTxId);
       }
@@ -1681,86 +1677,81 @@ class TableDataManager {
     if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
       _registerTableComparator(table, schema);
 
-      await EngineCpuChunk.forEachRangeAsync(
-        length: records.length,
-        kind: CpuChunkKind.medium,
-        process: (start, end) async {
-          for (int i = start; i < end; i++) {
-            final r = records[i];
-            final recordId = r[pkName]?.toString();
-            if (recordId == null || recordId.isEmpty) {
-              continue;
+      for (int i = 0; i < records.length; i++) {
+        final r = records[i];
+        final recordId = r[pkName]?.toString();
+        if (recordId == null || recordId.isEmpty) {
+          continue;
+        }
+        try {
+          final oldR = oldRecordsList != null && i < oldRecordsList.length
+              ? oldRecordsList[i]
+              : (oldRecordsMap != null ? oldRecordsMap[recordId] : null);
+
+          if (operation == BufferOperationType.delete) {
+            // Memory mode: Removal from primary cache
+            removeTableRecord(table, recordId);
+
+            // Per-table count cache applies to all tables (incl. system KV).
+            final current = _tableRecordCounts[table.tableUid] ?? 0;
+            if (current > 0) {
+              _tableRecordCounts[table.tableUid] = current - 1;
             }
-            try {
-              final oldR =
-                  oldRecordsMap != null ? oldRecordsMap[recordId] : null;
+            if (_contributesToSpaceStats(table) && current > 0) {
+              _deltaRecordCount--;
+              _needSaveStats = true;
+            }
 
-              if (operation == BufferOperationType.delete) {
-                // Memory mode: Removal from primary cache
-                removeTableRecord(table, recordId);
-
-                // Per-table count cache applies to all tables (incl. system KV).
-                final current = _tableRecordCounts[table.tableUid] ?? 0;
-                if (current > 0) {
-                  _tableRecordCounts[table.tableUid] = current - 1;
-                }
-                if (_contributesToSpaceStats(table) && current > 0) {
-                  _deltaRecordCount--;
-                  _needSaveStats = true;
-                }
-
-                // Memory mode: Index erasure (newData is null)
-                _dataStore.indexManager?.updateIndexDataCacheSync(
-                  table,
-                  recordId,
-                  r,
-                  null,
-                  overrideSchema: schema,
-                  force: true,
-                );
-              } else {
-                if (operation == BufferOperationType.insert) {
-                  _tableRecordCounts[table.tableUid] =
-                      (_tableRecordCounts[table.tableUid] ?? 0) + 1;
-                  if (_contributesToSpaceStats(table)) {
-                    _deltaRecordCount++;
-                    _needSaveStats = true;
-                  }
-                }
-                // Memory mode: Update primary cache
-                cacheTableRecord(table, recordId, r, schema, force: true);
-
-                // Memory mode: Index update
-                _dataStore.indexManager?.updateIndexDataCacheSync(
-                  table,
-                  recordId,
-                  oldR,
-                  r,
-                  overrideSchema: schema,
-                  force: true,
-                );
+            // Memory mode: Index erasure (newData is null)
+            _dataStore.indexManager?.updateIndexDataCacheSync(
+              table,
+              recordId,
+              r,
+              null,
+              overrideSchema: schema,
+              force: true,
+            );
+          } else {
+            if (operation == BufferOperationType.insert) {
+              _tableRecordCounts[table.tableUid] =
+                  (_tableRecordCounts[table.tableUid] ?? 0) + 1;
+              if (_contributesToSpaceStats(table)) {
+                _deltaRecordCount++;
+                _needSaveStats = true;
               }
-              // Drop reserve bookkeeping; unique leaves stay as memory locks.
-              _dataStore.writeBufferManager.commitReservedUniques(
-                table: table,
-                recordId: recordId,
-                transactionId: currentTxId,
-              );
-              successIds.add(recordId);
-            } catch (e) {
-              Logger.warn(
-                  'Memory batch op failed: ${table.tableName} pk=$recordId',
-                  rawError: e);
-              _dataStore.writeBufferManager.releaseReservedUniques(
-                table: table,
-                recordId: recordId,
-                transactionId: currentTxId,
-              );
-              failedIds.add(recordId);
             }
+            // Memory mode: Update primary cache
+            cacheTableRecord(table, recordId, r, schema, force: true);
+
+            // Memory mode: Index update
+            _dataStore.indexManager?.updateIndexDataCacheSync(
+              table,
+              recordId,
+              oldR,
+              r,
+              overrideSchema: schema,
+              force: true,
+            );
           }
-        },
-      );
+          // Drop reserve bookkeeping; unique leaves stay as memory locks.
+          _dataStore.writeBufferManager.commitReservedUniques(
+            table: table,
+            recordId: recordId,
+            transactionId: currentTxId,
+          );
+          successIds.add(recordId);
+        } catch (e) {
+          Logger.warn(
+              'Memory batch op failed: ${table.tableName} pk=$recordId',
+              rawError: e);
+          _dataStore.writeBufferManager.releaseReservedUniques(
+            table: table,
+            recordId: recordId,
+            transactionId: currentTxId,
+          );
+          failedIds.add(recordId);
+        }
+      }
 
       return (successRecordIds: successIds, failedRecordIds: failedIds);
     }
@@ -1782,7 +1773,9 @@ class TableDataManager {
         continue;
       }
 
-      final oldR = oldRecordsMap != null ? oldRecordsMap[recordId] : null;
+      final oldR = oldRecordsList != null && i < oldRecordsList.length
+          ? oldRecordsList[i]
+          : (oldRecordsMap != null ? oldRecordsMap[recordId] : null);
       final walOldValues =
           operation == BufferOperationType.update ? oldR : null;
 
@@ -4084,10 +4077,11 @@ class TableDataManager {
 
     final results = <Map<String, dynamic>>[];
     final stillMissing = <dynamic>[];
-    final uniqueKeys = keys.toSet().toList();
+    final queryKeys =
+        (keys.length <= 1) ? keys : keys.toSet().toList(growable: false);
 
     // 0. Resolve from memory tiers (Txn > WriteBuffer > _tableRecordCache)
-    for (final key in uniqueKeys) {
+    for (final key in queryKeys) {
       final pk = key.toString();
       final mem = _resolveRecordFromMemory(
         table,

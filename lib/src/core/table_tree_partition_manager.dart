@@ -2493,10 +2493,22 @@ final class TableTreePartitionManager {
         if (pk == null || keyBytes == null) continue;
         final pos = leaf.find(keyBytes);
         if (pos == null) continue;
-        final decoded = await _decodeStoredRecord(
+
+        // Fast pure synchronous inline decoding (0 await, 0 Future allocation for normal inline records)
+        final rawStored = leaf.values[pos];
+        final sv = StoredValue.decode(rawStored);
+        Map<String, dynamic>? decoded;
+        if (sv.tag != StoredValue.tagOverflowRef) {
+          final bytes = sv.inlineBytes;
+          if (bytes.length >= 2 &&
+              ((bytes[0] << 8) | bytes[1]) == fieldStruct.length) {
+            decoded = BinarySchemaCodec.decodeRecord(bytes, fieldStruct);
+          }
+        }
+        decoded ??= await _decodeStoredRecord(
           table: table,
           meta: meta,
-          storedValue: leaf.values[pos],
+          storedValue: rawStored,
           fieldStruct: fieldStruct,
           allowLegacyMigrationFallback: schemaOverride == null,
           primaryKeyBytes: keyBytes,
