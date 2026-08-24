@@ -24,7 +24,6 @@ import '../model/unique_violation.dart';
 import '../query/query_condition.dart';
 import 'compute/compute_batch_planner.dart';
 import 'compute/index_delta_prepare_compute.dart';
-import 'compute/unique_index_prepare_compute.dart';
 import 'compute_manager.dart';
 import 'data_store_impl.dart';
 import 'key_migration_runner.dart';
@@ -338,28 +337,37 @@ class IndexManager {
     return deltas;
   }
 
-  Future<List<PreparedUniqueIndexEntry>> _prepareUniqueIndexEntriesBatch({
-    required TableSchema schema,
-    required IndexSchema index,
-    required List<Map<String, dynamic>> records,
-    required List<List<String>?>? changedFieldsByRecord,
-  }) async {
-    if (records.isEmpty) {
-      return const <PreparedUniqueIndexEntry>[];
-    }
+  /// Pure synchronous memcomparable encoding for a canonical unique key.
+  Uint8List? _encodeUniqueIndexKeyBytesPure(
+    TableSchema schema,
+    IndexSchema index,
+    dynamic canonicalKey,
+  ) {
+    if (canonicalKey == null) return null;
+    final components = <Uint8List>[];
+    for (int fieldIndex = 0; fieldIndex < index.fields.length; fieldIndex++) {
+      final fieldName = index.fields[fieldIndex];
+      final dynamic fieldValue;
+      if (index.fields.length == 1) {
+        fieldValue = canonicalKey;
+      } else if (canonicalKey is List &&
+          canonicalKey.length == index.fields.length) {
+        fieldValue = canonicalKey[fieldIndex];
+      } else {
+        return null;
+      }
 
-    // PERFORMANCE: unique-key encoding is lighter than isolate Map transfer.
-    // Running on the current isolate avoids cloning every record for each
-    // unique index during checkUniqueConstraintsBatch (batchInsert hot path).
-    final result = await prepareUniqueIndexChunk(
-      UniqueIndexPrepareRequest(
-        schema: schema,
-        index: index,
-        records: records,
-        changedFieldsByRecord: changedFieldsByRecord,
-      ),
-    );
-    return result.entries;
+      final component = schema.encodeFieldComponentToMemComparable(
+        fieldName,
+        fieldValue,
+        truncateText: false,
+      );
+      if (component == null) return null;
+      components.add(component);
+    }
+    return components.isNotEmpty
+        ? MemComparableKey.encodeTuple(components)
+        : null;
   }
 
   IndexManager(this._dataStore) {
@@ -669,14 +677,13 @@ class IndexManager {
     }
   }
 
-  /// Update full index cache based on record changes
-  Future<void> updateIndexDataCache(TableContext table, String pk,
+  /// Synchronously update full index cache based on record changes.
+  /// Zero-await, pure in-memory operation.
+  void updateIndexDataCacheSync(TableContext table, String pk,
       Map<String, dynamic>? oldData, Map<String, dynamic>? newData,
-      {TableSchema? overrideSchema, bool force = false}) async {
+      {TableSchema? overrideSchema, bool force = false}) {
     try {
-      final schema = overrideSchema ??
-          await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
-      if (schema == null) return;
+      final schema = overrideSchema ?? table.schema;
       final indexes = <IndexSchema>[
         ...?_dataStore.tableMetaManager?.getAllIndexesFor(schema),
         ...getEngineManagedBtreeIndexes(table, schema),
@@ -2389,8 +2396,11 @@ class IndexManager {
   /// - For INSERT: Validates primary key and all unique indexes.
   /// - For UPDATE: Validates unique indexes ONLY if the indexed fields have changed.
   ///
+  /// Check unique constraints across a batch of records.
+  ///
   /// [records] The full merged records to check.
-  /// [changedFieldsMap] Optional map of changed field sets keyed by primary key string.
+  /// [targetUniqueIndexes] Optional list of unique indexes to specifically check (e.g. only modified indexes during update).
+  /// [changedFieldsList] Optional list of changed field sets directly aligned with [records] by index.
   /// If [isUpdate] is true, only indexes whose fields overlap with changed fields are checked.
   ///
   /// Returns a list aligned with [records], where each entry is either null (no violation)
@@ -2406,7 +2416,8 @@ class IndexManager {
       /// When true, skip primary-key existence probes (safe for auto-generated
       /// sequential/timestamp PKs already reserved in the write buffer).
       bool skipPrimaryKeyCheck = false,
-      Map<String, Set<String>>? changedFieldsMap}) async {
+      List<IndexSchema>? targetUniqueIndexes,
+      List<Set<String>?>? changedFieldsList}) async {
     if (records.isEmpty) return const <UniqueViolation?>[];
 
     final yieldController =
@@ -2419,13 +2430,6 @@ class IndexManager {
           growable: false);
     }
 
-    // Validation: If provided, changedFieldsMap must align by size (or be subset).
-    if (changedFieldsMap != null && changedFieldsMap.length > records.length) {
-      // Note: Map could be smaller if some records had no changes, but not larger.
-      Logger.warn(
-          'IndexManager.checkUniqueConstraintsBatch: changedFieldsMap size exceeds records length');
-    }
-
     final bool isMemoryMode =
         _dataStore.config.persistenceMode == PersistenceMode.memory;
 
@@ -2435,31 +2439,8 @@ class IndexManager {
     final writeBuf = _dataStore.writeBufferManager;
     final violations =
         List<UniqueViolation?>.filled(records.length, null, growable: false);
-    List<List<String>?>? changedFieldsByRecord;
-    if (isUpdate && changedFieldsMap != null) {
-      changedFieldsByRecord =
-          List<List<String>?>.filled(records.length, null, growable: false);
-      final changedFieldsYield = YieldController(
-        'IndexManager.checkUniqueConstraintsBatch.changedFields',
-        checkInterval: 1024,
-      );
-      for (int i = 0; i < records.length; i++) {
-        final y = changedFieldsYield.maybeYield();
-        if (y != null) await y;
-        final pk = records[i][primaryKey]?.toString();
-        if (pk == null) {
-          continue;
-        }
-        final changed = changedFieldsMap[pk];
-        if (changed == null || changed.isEmpty) {
-          continue;
-        }
-        changedFieldsByRecord[i] = changed.toList(growable: false);
-      }
-    }
 
     // 1) Primary key uniqueness (only for INSERTs with custom PKs).
-    // 1) Primary key check (only if not an update of the same record)
     // Empty committed table: skip disk PK probes (buffer/intra-batch still run).
     var skipDiskUniqueChecks = false;
     if (!isMemoryMode) {
@@ -2597,8 +2578,8 @@ class IndexManager {
       }
     }
 
-    // 2) Unique indexes
-    final uniqueIndexes =
+    // 2) Unique indexes: only check targetUniqueIndexes if specified, otherwise all unique indexes.
+    final uniqueIndexes = targetUniqueIndexes ??
         (_dataStore.tableMetaManager?.getUniqueIndexesFor(schema) ??
             const <IndexSchema>[]);
     if (uniqueIndexes.isEmpty) return violations;
@@ -2607,45 +2588,36 @@ class IndexManager {
       final indexUid = _indexUidFromSchema(idx);
       final indexLabel = IndexName(idx.actualIndexName);
       if (indexLabel.isEmpty) continue;
-      final preparedEntries = await _prepareUniqueIndexEntriesBatch(
-        schema: schema,
-        index: idx,
-        records: records,
-        changedFieldsByRecord: changedFieldsByRecord,
-      );
 
-      // Skip this index entirely if no records have changes that impact it.
-      bool hasPotentialCandidate = false;
-      for (int i = 0; i < records.length; i++) {
-        if (violations[i] != null) continue;
-        if (preparedEntries[i].canonicalKey != null) {
-          hasPotentialCandidate = true;
-          break;
-        }
-      }
-      if (!hasPotentialCandidate) continue;
-
-      // Increment index weight for uniqueness check
-      _dataStore.weightManager?.incrementAccess(
-        WeightType.indexData,
-        WeightManager.indexDataIdentifier(table.tableUid, indexUid),
-        spaceName: _dataStore.currentSpaceName,
-      );
-
-      // 1. WriteBuffer check (uncommitted data) AND Intra-batch check
       final Map<dynamic, int> batchSeen = {};
+      final List<Uint8List> keyBytesToLookup = [];
+      final List<int> recordIdxsToLookup = [];
+      final List<dynamic> canKeysToLookup = [];
 
+      // Single-Pass Fused Pipeline per index
       for (int i = 0; i < records.length; i++) {
         final y = yieldController.maybeYield();
         if (y != null) await y;
         if (violations[i] != null) continue;
-        final canKey = preparedEntries[i].canonicalKey;
+
+        // 1. If update, check if this index's fields changed in record i
+        if (isUpdate &&
+            changedFieldsList != null &&
+            i < changedFieldsList.length) {
+          final changed = changedFieldsList[i];
+          if (changed != null && !idx.fields.any(changed.contains)) {
+            continue; // Field not modified, skip checking this index for this record
+          }
+        }
+
+        // 2. Pure synchronous canonical key extraction
+        final r = records[i];
+        final canKey = schema.createCanonicalIndexKey(idx.fields, r);
         if (canKey == null) continue;
 
-        final r = records[i];
         final recordId = r[primaryKey]?.toString();
 
-        // A) Intra-batch conflict check
+        // 3. Intra-batch conflict check
         if (batchSeen.containsKey(canKey)) {
           final existingPk =
               records[batchSeen[canKey]!][primaryKey]?.toString();
@@ -2663,7 +2635,7 @@ class IndexManager {
         }
         batchSeen[canKey] = i;
 
-        // B) WriteBuffer conflict check
+        // 4. WriteBuffer conflict check
         if (!skipBufferCheck) {
           final conflictId = writeBuf.hasUniqueKeyOwnedByOther(
             table,
@@ -2683,68 +2655,74 @@ class IndexManager {
             if (resolveInPlace) {
               records[i][primaryKey] = conflictId;
             }
+            continue;
           }
         }
-      }
 
-      // Memory mode: validate against committed in-memory index store and skip disk checks.
-      if (isMemoryMode) {
-        _registerIndexComparator(table, indexUid, schema);
-        for (int i = 0; i < records.length; i++) {
-          final y2 = yieldController.maybeYield();
-          if (y2 != null) await y2;
-          if (violations[i] != null) continue;
-          final canKey = preparedEntries[i].canonicalKey;
-          if (canKey == null) continue;
-
-          final r = records[i];
-          final recordId = r[primaryKey]?.toString();
+        // 5. Memory mode check
+        if (isMemoryMode) {
           final vals = idx.fields.length == 1
               ? <dynamic>[canKey]
               : (canKey is List && canKey.length == idx.fields.length
                   ? List<dynamic>.from(canKey)
                   : null);
-          if (vals == null) continue;
-
-          final existingPk = vals.length == 1
-              ? _indexDataCache.getPoint3(table.tableUid, indexUid, vals.first)
-              : _indexDataCache
-                  .get(<dynamic>[table.tableUid, indexUid, ...vals]);
-          if (existingPk is String &&
-              existingPk.isNotEmpty &&
-              existingPk != recordId) {
-            violations[i] = UniqueViolation(
-              tableName: table.tableName,
-              fields: idx.fields,
-              value: (idx.fields.length == 1) ? vals.first : vals,
-              indexName: indexLabel,
-              existingPrimaryKey: existingPk,
-            );
-            if (resolveInPlace) {
-              records[i][primaryKey] = existingPk;
+          if (vals != null) {
+            final existingPk = vals.length == 1
+                ? _indexDataCache.getPoint3(
+                    table.tableUid, indexUid, vals.first)
+                : _indexDataCache
+                    .get(<dynamic>[table.tableUid, indexUid, ...vals]);
+            if (existingPk is String &&
+                existingPk.isNotEmpty &&
+                existingPk != recordId) {
+              violations[i] = UniqueViolation(
+                tableName: table.tableName,
+                fields: idx.fields,
+                value: (idx.fields.length == 1) ? vals.first : vals,
+                indexName: indexLabel,
+                existingPrimaryKey: existingPk,
+              );
+              if (resolveInPlace) {
+                records[i][primaryKey] = existingPk;
+              }
             }
           }
+          continue;
         }
-        // Continue to next index (no disk path).
+
+        // 6. Disk path: Pure synchronous byte encoding for candidate
+        if (!skipDiskUniqueChecks) {
+          final encodedBytes =
+              _encodeUniqueIndexKeyBytesPure(schema, idx, canKey);
+          if (encodedBytes != null) {
+            keyBytesToLookup.add(encodedBytes);
+            recordIdxsToLookup.add(i);
+            canKeysToLookup.add(canKey);
+          }
+        }
+      }
+
+      if (isMemoryMode || skipDiskUniqueChecks || keyBytesToLookup.isEmpty) {
         continue;
       }
 
-      // Empty on-disk table: buffer/intra-batch already checked; no index I/O.
-      if (skipDiskUniqueChecks) {
-        continue;
-      }
+      // Increment index weight for disk uniqueness check
+      _dataStore.weightManager?.incrementAccess(
+        WeightType.indexData,
+        WeightManager.indexDataIdentifier(table.tableUid, indexUid),
+        spaceName: _dataStore.currentSpaceName,
+      );
 
-      // 2.2 Disk path using grouped B+Tree point lookups (existence-only).
       final meta = await getIndexMeta(table.tableUid, indexUid);
       if (meta == null || meta.isBuilding || meta.totalEntryCount <= 0) {
-        for (int i = 0; i < records.length; i++) {
+        for (int j = 0; j < recordIdxsToLookup.length; j++) {
+          final i = recordIdxsToLookup[j];
           final y3 = yieldController.maybeYield();
           if (y3 != null) await y3;
           if (violations[i] != null) continue;
           final r = records[i];
           final recordId = r[primaryKey]?.toString();
-          final canKey = preparedEntries[i].canonicalKey;
-          if (canKey == null) continue;
+          final canKey = canKeysToLookup[j];
 
           final existingPk = await _findExistingPrimaryKeyByConstraint(
             table: table,
@@ -2769,33 +2747,17 @@ class IndexManager {
         continue;
       }
 
-      final recordIdxs = <int>[];
-      final keyBytes = <Uint8List>[];
-
-      for (int i = 0; i < records.length; i++) {
-        final y4 = yieldController.maybeYield();
-        if (y4 != null) await y4;
-        if (violations[i] != null) continue;
-        final encodedKeyBytes = preparedEntries[i].encodedKeyBytes;
-        if (encodedKeyBytes == null) continue;
-
-        keyBytes.add(encodedKeyBytes);
-        recordIdxs.add(i);
-      }
-
-      if (keyBytes.isEmpty) continue;
-
       final existingPks = await _dataStore.indexTreePartitionManager
               ?.lookupUniquePrimaryKeysBatch(
             table: table,
             indexUid: indexUid,
             meta: meta,
-            uniqueKeys: keyBytes,
+            uniqueKeys: keyBytesToLookup,
           ) ??
           <String?>[];
 
-      for (int j = 0; j < recordIdxs.length; j++) {
-        final i = recordIdxs[j];
+      for (int j = 0; j < recordIdxsToLookup.length; j++) {
+        final i = recordIdxsToLookup[j];
         if (violations[i] != null) continue;
 
         final String? existingPk =
@@ -2811,13 +2773,10 @@ class IndexManager {
           meta: meta,
           schema: schema,
           existingPk: existingPk,
-          uniqueKeyBytes: keyBytes[j],
+          uniqueKeyBytes: keyBytesToLookup[j],
           transactionId: txId,
         )) {
-          final canKey = preparedEntries[i].canonicalKey;
-          if (canKey == null) {
-            continue;
-          }
+          final canKey = canKeysToLookup[j];
           violations[i] = UniqueViolation(
             tableName: table.tableName,
             fields: idx.fields,

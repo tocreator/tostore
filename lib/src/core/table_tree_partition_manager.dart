@@ -2449,21 +2449,28 @@ final class TableTreePartitionManager {
     }
 
     // Group PKs by leaf to reduce IO.
-    final leafToIndexes = <String, List<int>>{};
+    final leafToIndexes = <TreePagePtr, List<int>>{};
     final pkStrings = List<String?>.filled(keys.length, null, growable: false);
+    final keyBytesList =
+        List<Uint8List?>.filled(keys.length, null, growable: false);
+    final tableUid = table.tableUid;
+
     for (int i = 0; i < keys.length; i++) {
       final pk = keys[i]?.toString();
       if (pk == null || pk.isEmpty) continue;
       pkStrings[i] = pk;
       final keyBytes = schema.encodePrimaryKeyComponent(pk);
-      var ptr = await _locateLeafForKey(table, meta, keyBytes,
+      keyBytesList[i] = keyBytes;
+
+      var ptr = readFromFileOnly
+          ? null
+          : _locateLeafForKeySync(table, meta, keyBytes);
+      ptr ??= await _locateLeafForKey(table, meta, keyBytes,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           readFromFileOnly: readFromFileOnly);
-      if (ptr.isNull) ptr = (meta.btreeFirstLeaf);
-      leafToIndexes
-          .putIfAbsent('${ptr.partitionNo}:${ptr.pageNo}', () => <int>[])
-          .add(i);
+      if (ptr.isNull) ptr = meta.btreeFirstLeaf;
+      leafToIndexes.putIfAbsent(ptr, () => <int>[]).add(i);
     }
 
     final out = <Map<String, dynamic>>[];
@@ -2472,16 +2479,18 @@ final class TableTreePartitionManager {
     for (final e in leafToIndexes.entries) {
       final y16 = yc.maybeYield();
       if (y16 != null) await y16;
-      final parts = e.key.split(':');
-      final ptr = TreePagePtr(int.parse(parts[0]), int.parse(parts[1]));
-      final leaf = await _readLeafPage(table, meta, ptr,
+      final ptr = e.key;
+      LeafPage? leaf = readFromFileOnly
+          ? null
+          : _leafPageCache.getPoint3(tableUid, ptr.partitionNo, ptr.pageNo);
+      leaf ??= await _readLeafPage(table, meta, ptr,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           readFromFileOnly: readFromFileOnly);
       for (final idx in e.value) {
         final pk = pkStrings[idx];
-        if (pk == null) continue;
-        final keyBytes = schema.encodePrimaryKeyComponent(pk);
+        final keyBytes = keyBytesList[idx];
+        if (pk == null || keyBytes == null) continue;
         final pos = leaf.find(keyBytes);
         if (pos == null) continue;
         final decoded = await _decodeStoredRecord(

@@ -1508,7 +1508,7 @@ class TableDataManager {
 
         if (indexOldData != null || indexNewData != null) {
           // Fire and forget, don't block main flow
-          await _dataStore.indexManager!.updateIndexDataCache(
+          _dataStore.indexManager!.updateIndexDataCacheSync(
             table,
             recordId,
             indexOldData,
@@ -1570,7 +1570,7 @@ class TableDataManager {
 
       if (indexOldData != null || indexNewData != null) {
         // Fire and forget, don't block main flow
-        await _dataStore.indexManager!.updateIndexDataCache(
+        _dataStore.indexManager!.updateIndexDataCacheSync(
           table,
           recordId,
           indexOldData,
@@ -1710,11 +1710,14 @@ class TableDataManager {
                 }
 
                 // Memory mode: Index erasure (newData is null)
-                if (_dataStore.indexManager != null) {
-                  await _dataStore.indexManager!.updateIndexDataCache(
-                      table, recordId, r, null,
-                      overrideSchema: schema, force: true);
-                }
+                _dataStore.indexManager?.updateIndexDataCacheSync(
+                  table,
+                  recordId,
+                  r,
+                  null,
+                  overrideSchema: schema,
+                  force: true,
+                );
               } else {
                 if (operation == BufferOperationType.insert) {
                   _tableRecordCounts[table.tableUid] =
@@ -1728,11 +1731,14 @@ class TableDataManager {
                 cacheTableRecord(table, recordId, r, schema, force: true);
 
                 // Memory mode: Index update
-                if (_dataStore.indexManager != null) {
-                  await _dataStore.indexManager!.updateIndexDataCache(
-                      table, recordId, oldR, r,
-                      overrideSchema: schema, force: true);
-                }
+                _dataStore.indexManager?.updateIndexDataCacheSync(
+                  table,
+                  recordId,
+                  oldR,
+                  r,
+                  overrideSchema: schema,
+                  force: true,
+                );
               }
               // Drop reserve bookkeeping; unique leaves stay as memory locks.
               _dataStore.writeBufferManager.commitReservedUniques(
@@ -1866,26 +1872,22 @@ class TableDataManager {
 
         if (operation == BufferOperationType.update) {
           cacheTableRecord(table, recordId, r, schema);
-          if (_dataStore.indexManager != null) {
-            await _dataStore.indexManager!.updateIndexDataCache(
-              table,
-              recordId,
-              oldR,
-              r,
-              overrideSchema: schema,
-            );
-          }
+          _dataStore.indexManager?.updateIndexDataCacheSync(
+            table,
+            recordId,
+            oldR,
+            r,
+            overrideSchema: schema,
+          );
         } else if (operation == BufferOperationType.delete) {
           removeTableRecord(table, recordId);
-          if (_dataStore.indexManager != null) {
-            await _dataStore.indexManager!.updateIndexDataCache(
-              table,
-              recordId,
-              r,
-              null,
-              overrideSchema: schema,
-            );
-          }
+          _dataStore.indexManager?.updateIndexDataCacheSync(
+            table,
+            recordId,
+            r,
+            null,
+            overrideSchema: schema,
+          );
         }
       }
     }
