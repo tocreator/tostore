@@ -770,7 +770,7 @@ class WalManager {
         _dataStore.parallelJournalManager.activeBatchOperationCount > 0
             ? YieldController(
                 'WalManager.appendBatch',
-                minCheckInterval: EngineCpuChunk.hotPathMinCheckInterval,
+                minCheckInterval: EngineCpuChunk.fastPathMinCheckInterval,
               )
             : YieldController('WalManager.appendBatch');
     final List<WalPointer> pointers =

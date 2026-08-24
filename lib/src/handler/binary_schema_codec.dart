@@ -35,7 +35,7 @@ class BinarySchemaCodec {
   }) {
     final buffer = BytesBuilder(copy: false);
     final fieldCount = fieldStructure.length.clamp(0, maxFieldCount);
-    buffer.add(_u16be(fieldCount));
+    _writeU16be(buffer, fieldCount);
 
     // Encode values in field order
     for (int i = 0; i < fieldCount; i++) {
@@ -112,13 +112,13 @@ class BinarySchemaCodec {
       // int32
       if (value >= -0x80000000 && value <= 0x7FFFFFFF) {
         b.addByte(0xD2);
-        b.add(_i32be(value));
+        _writeI32be(b, value);
         return;
       }
       // int64 (MessagePack)
       // value is int, and didn't fit in smaller types, so use int64.
       b.addByte(0xD3);
-      b.add(_i64be(value));
+      _writeI64be(b, value);
       return;
     }
 
@@ -133,7 +133,7 @@ class BinarySchemaCodec {
 
     if (value is double) {
       b.addByte(0xCB);
-      b.add(_f64be(value));
+      _writeF64be(b, value);
       return;
     }
 
@@ -157,7 +157,7 @@ class BinarySchemaCodec {
     if (value is List) {
       final length = value.length > maxArraySize ? maxArraySize : value.length;
       b.addByte(0xDD); // array32
-      b.add(_u32be(length));
+      _writeU32be(b, length);
       for (int i = 0; i < length; i++) {
         _writeValue(b, value[i]);
       }
@@ -165,10 +165,13 @@ class BinarySchemaCodec {
     }
 
     if (value is Map) {
-      final entries = value.entries.take(maxArraySize).toList(growable: false);
+      final int count =
+          value.length > maxArraySize ? maxArraySize : value.length;
       b.addByte(0xDF); // map32
-      b.add(_u32be(entries.length));
-      for (final e in entries) {
+      _writeU32be(b, count);
+      int written = 0;
+      for (final e in value.entries) {
+        if (++written > maxArraySize) break;
         _writeString(b, e.key.toString());
         _writeValue(b, e.value);
       }
@@ -180,15 +183,39 @@ class BinarySchemaCodec {
   }
 
   static void _writeString(BytesBuilder b, String s) {
-    final bytes = utf8.encode(s);
-    final len = bytes.length > maxStringLength ? maxStringLength : bytes.length;
-    final out = (len < bytes.length) ? bytes.sublist(0, len) : bytes;
+    if (s.isEmpty) {
+      b.addByte(0xA0);
+      return;
+    }
 
+    final int len = s.length;
     if (len < 32) {
-      b.addByte(0xA0 | len); // fixstr
+      bool isAscii = true;
+      for (int i = 0; i < len; i++) {
+        if (s.codeUnitAt(i) > 0x7F) {
+          isAscii = false;
+          break;
+        }
+      }
+      if (isAscii) {
+        b.addByte(0xA0 | len);
+        for (int i = 0; i < len; i++) {
+          b.addByte(s.codeUnitAt(i));
+        }
+        return;
+      }
+    }
+
+    final bytes = utf8.encode(s);
+    final encLen =
+        bytes.length > maxStringLength ? maxStringLength : bytes.length;
+    final out = (encLen < bytes.length) ? bytes.sublist(0, encLen) : bytes;
+
+    if (encLen < 32) {
+      b.addByte(0xA0 | encLen); // fixstr
     } else {
       b.addByte(0xDB); // str32
-      b.add(_u32be(len));
+      _writeU32be(b, encLen);
     }
     b.add(out);
   }
@@ -197,7 +224,7 @@ class BinarySchemaCodec {
     final len = bytes.length > maxBinaryLength ? maxBinaryLength : bytes.length;
     final out = (len < bytes.length) ? bytes.sublist(0, len) : bytes;
     b.addByte(0xC6); // bin32
-    b.add(_u32be(len));
+    _writeU32be(b, len);
     b.add(out);
   }
 
@@ -206,7 +233,7 @@ class BinarySchemaCodec {
     final len = payload.length;
     // ext32
     b.addByte(0xC9);
-    b.add(_u32be(len));
+    _writeU32be(b, len);
     b.addByte(_extTypeBigInt);
     b.add(payload);
   }
@@ -407,29 +434,38 @@ class BinarySchemaCodec {
     }
   }
 
-  // MessagePack uses big-endian for multi-byte integers and floats
-  static Uint8List _u16be(int v) =>
-      (ByteData(2)..setUint16(0, v, Endian.big)).buffer.asUint8List();
+  // MessagePack uses big-endian for multi-byte integers and floats.
+  // Write directly into [BytesBuilder] to avoid per-value ByteData/Uint8List allocs.
+  static final Uint8List _scratch8 = Uint8List(8);
+  static final ByteData _scratch8Bd = ByteData.sublistView(_scratch8);
 
-  static Uint8List _u32be(int v) =>
-      (ByteData(4)..setUint32(0, v, Endian.big)).buffer.asUint8List();
+  static void _writeU16be(BytesBuilder b, int v) {
+    b.addByte((v >> 8) & 0xFF);
+    b.addByte(v & 0xFF);
+  }
 
-  static Uint8List _i32be(int v) =>
-      (ByteData(4)..setInt32(0, v, Endian.big)).buffer.asUint8List();
+  static void _writeU32be(BytesBuilder b, int v) {
+    b.addByte((v >> 24) & 0xFF);
+    b.addByte((v >> 16) & 0xFF);
+    b.addByte((v >> 8) & 0xFF);
+    b.addByte(v & 0xFF);
+  }
 
-  static Uint8List _i64be(int v) => (ByteData(8)
-        ..apply((bd) => PlatformByteData.setInt64(bd, 0, v, Endian.big)))
-      .buffer
-      .asUint8List();
+  static void _writeI32be(BytesBuilder b, int v) {
+    b.addByte((v >> 24) & 0xFF);
+    b.addByte((v >> 16) & 0xFF);
+    b.addByte((v >> 8) & 0xFF);
+    b.addByte(v & 0xFF);
+  }
 
-  static Uint8List _f64be(double v) =>
-      (ByteData(8)..setFloat64(0, v, Endian.big)).buffer.asUint8List();
-}
+  static void _writeI64be(BytesBuilder b, int v) {
+    PlatformByteData.setInt64(_scratch8Bd, 0, v, Endian.big);
+    b.add(_scratch8);
+  }
 
-extension _Apply<T> on T {
-  T apply(void Function(T) f) {
-    f(this);
-    return this;
+  static void _writeF64be(BytesBuilder b, double v) {
+    _scratch8Bd.setFloat64(0, v, Endian.big);
+    b.add(_scratch8);
   }
 }
 

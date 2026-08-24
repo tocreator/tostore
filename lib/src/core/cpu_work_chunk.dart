@@ -35,6 +35,10 @@ class EngineCpuChunk {
   /// Hot-path [YieldController] floor -- prevents dual-pressure avalanche to 1--10.
   static const int hotPathMinCheckInterval = 64;
 
+  /// Fast-path batchInsert / WAL enqueue / insert-buffer apply.
+  /// Larger interval keeps the ACK path nearly sync on pure-PK bulk inserts.
+  static const int fastPathMinCheckInterval = 4096;
+
   /// Resolve chunk size for [kind] (mobile/web halved, server doubled).
   static int sizeFor(CpuChunkKind kind) {
     int base;

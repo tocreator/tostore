@@ -163,7 +163,10 @@ Map<String, dynamic>? validateAndProcessRecordPure({
 
       final converted = field.convertValue(value);
       if (mutateInPlace) {
-        data[field.name] = converted;
+        // Typed app records usually already match storage form -- skip map write.
+        if (!identical(converted, value)) {
+          data[field.name] = converted;
+        }
       } else {
         result[field.name] = converted;
       }

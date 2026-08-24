@@ -237,7 +237,9 @@ class WriteBufferManager {
     );
     final yieldController = YieldController(
       'WriteBufferManager.addInsertBatch',
-      minCheckInterval: EngineCpuChunk.hotPathMinCheckInterval,
+      minCheckInterval: installAllIndexes
+          ? EngineCpuChunk.fastPathMinCheckInterval
+          : EngineCpuChunk.hotPathMinCheckInterval,
     );
     final tableUid = table.tableUid;
     final bgScheduler = _dataStore.backgroundWriteScheduler;

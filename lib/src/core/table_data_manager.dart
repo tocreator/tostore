@@ -1762,13 +1762,18 @@ class TableDataManager {
     // 3. Persistent Path: WAL + Write Buffer
     final int count = records.length;
     final walEntries = <Map<String, dynamic>>[];
-    final validBatchRecords = <Map<String, dynamic>>[];
     final validBatchRecordIds = <String>[];
-    final validBatchOldValues = <Map<String, dynamic>?>[];
+    // Update/delete keep parallel record lists; insert reuses walEntries['data'].
+    final bool isInsert = operation == BufferOperationType.insert;
+    final validBatchRecords =
+        isInsert ? null : <Map<String, dynamic>>[];
+    final validBatchOldValues =
+        isInsert ? null : <Map<String, dynamic>?>[];
 
     for (int i = 0; i < count; i++) {
       final r = records[i];
-      final recordId = r[pkName]?.toString();
+      final pkVal = r[pkName];
+      final recordId = pkVal is String ? pkVal : pkVal?.toString();
       if (recordId == null || recordId.isEmpty) {
         continue;
       }
@@ -1792,9 +1797,9 @@ class TableDataManager {
       }
       walEntries.add(walEntry);
 
-      validBatchRecords.add(r);
       validBatchRecordIds.add(recordId);
-      validBatchOldValues.add(walOldValues);
+      validBatchRecords?.add(r);
+      validBatchOldValues?.add(walOldValues);
     }
 
     if (walEntries.isEmpty) {
@@ -1810,7 +1815,10 @@ class TableDataManager {
       return (
         successRecordIds: const <String>[],
         failedRecordIds: records
-            .map((r) => r[pkName]?.toString() ?? '')
+            .map((r) {
+              final v = r[pkName];
+              return v is String ? v : (v?.toString() ?? '');
+            })
             .where((id) => id.isNotEmpty)
             .toList()
       );
@@ -1824,10 +1832,10 @@ class TableDataManager {
     final entries = <BufferEntry>[];
     final int validCount = validBatchRecordIds.length;
 
-    if (operation == BufferOperationType.insert) {
+    if (isInsert) {
       for (int i = 0; i < validCount; i++) {
         entries.add(BufferEntry(
-          data: validBatchRecords[i],
+          data: walEntries[i]['data'] as Map<String, dynamic>,
           operation: operation,
           timestamp: ts,
           transactionId: bufferTxId,
@@ -1840,8 +1848,8 @@ class TableDataManager {
     } else {
       for (int i = 0; i < validCount; i++) {
         final recordId = validBatchRecordIds[i];
-        final r = validBatchRecords[i];
-        final oldR = validBatchOldValues[i];
+        final r = validBatchRecords![i];
+        final oldR = validBatchOldValues![i];
 
         entries.add(BufferEntry(
           data: r,
@@ -1938,8 +1946,9 @@ class TableDataManager {
 
   /// Batch update record count cache with a single await.
   ///
-  /// This is optimized for large batch operations (e.g. batchInsert) to avoid
-  /// 10k+ awaited calls to [updateTableRecordCount].
+  /// Optimized for large batch operations (e.g. batchInsert) to avoid
+  /// 10k+ awaited calls to [updateTableRecordCount]. When the count is already
+  /// cached, the load Future is skipped (still one async boundary at the call).
   Future<void> updateTableRecordCountDelta(
     TableContext table, {
     int insertDelta = 0,
@@ -1948,7 +1957,9 @@ class TableDataManager {
     final int delta = insertDelta - deleteDelta;
     if (delta == 0) return;
 
-    await _ensureRecordCountLoaded(table);
+    if (!_tableRecordCounts.containsKey(table.tableUid)) {
+      await _ensureRecordCountLoaded(table);
+    }
 
     final current = _tableRecordCounts[table.tableUid] ?? 0;
     _tableRecordCounts[table.tableUid] = max(0, current + delta);
