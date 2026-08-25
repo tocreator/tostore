@@ -23,6 +23,20 @@ part '../chain/delete_builder.dart';
 part '../chain/query_builder.dart';
 part '../chain/update_builder.dart';
 
+/// Integer bitmask flags for query clauses to enable O(1) point query detection.
+abstract final class QueryClauseMask {
+  static const int joins = 1 << 0;
+  static const int aggregations = 1 << 1;
+  static const int groupBy = 1 << 2;
+  static const int offset = 1 << 3;
+  static const int cursor = 1 << 4;
+  static const int selectedFields = 1 << 5;
+  static const int distinct = 1 << 6;
+  static const int having = 1 << 7;
+  static const int orderBy = 1 << 8;
+  static const int onlyCount = 1 << 9;
+}
+
 /// chain builder base class
 abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
   final DataStoreImpl _db;
@@ -33,6 +47,9 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
   String? _fastSingleEqField;
   dynamic _fastSingleEqVal;
   String? _singleOp;
+
+  int _clauseFlags = 0;
+  int get clauseFlags => _clauseFlags;
 
   List<String>? _orderBy;
   int? _limit;
@@ -76,6 +93,7 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
   SELF orderByAsc(String field) {
     _orderBy = _orderBy ?? [];
     _orderBy!.add(field);
+    _clauseFlags |= QueryClauseMask.orderBy;
     _onChanged();
     return _self;
   }
@@ -84,6 +102,7 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
   SELF orderByDesc(String field) {
     _orderBy = _orderBy ?? [];
     _orderBy!.add('-$field');
+    _clauseFlags |= QueryClauseMask.orderBy;
     _onChanged();
     return _self;
   }
@@ -99,6 +118,12 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
   SELF offset(int value) {
     _offset = value;
     _cursor = null;
+    if (value > 0) {
+      _clauseFlags |= QueryClauseMask.offset;
+    } else {
+      _clauseFlags &= ~QueryClauseMask.offset;
+    }
+    _clauseFlags &= ~QueryClauseMask.cursor;
     _onChanged();
     return _self;
   }
@@ -108,6 +133,10 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
     _cursor = value;
     if (value != null && value.isNotEmpty) {
       _offset = null;
+      _clauseFlags |= QueryClauseMask.cursor;
+      _clauseFlags &= ~QueryClauseMask.offset;
+    } else {
+      _clauseFlags &= ~QueryClauseMask.cursor;
     }
     _onChanged();
     return _self;

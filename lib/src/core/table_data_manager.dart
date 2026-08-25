@@ -2176,6 +2176,41 @@ class TableDataManager {
     _tableRecordCounts[table.tableUid] = meta?.totalRecordCount ?? 0;
   }
 
+  /// Fast synchronous table record count lookup from live memory cache.
+  ///
+  /// Returns table record count if cached in memory, accounting for active transaction overlay.
+  /// Returns null if count is not loaded into memory cache yet.
+  int? getTableRecordCountSync(TableContext table) {
+    final cached = _tableRecordCounts[table.tableUid];
+    if (cached == null) return null;
+
+    var count = cached;
+    final String? txId = TransactionContext.getCurrentTransactionId();
+    if (txId != null &&
+        !TransactionContext.isApplyingCommit() &&
+        _txnIdsWithOps.contains(txId)) {
+      try {
+        var inserted = 0;
+        var deleted = 0;
+        _dataStore.writeBufferManager.bufferTrees.forEachTxnRecord(
+          txId,
+          table,
+          onEntry: (pk, entry) {
+            if (entry.operation == BufferOperationType.insert) {
+              inserted++;
+            } else if (entry.operation == BufferOperationType.delete) {
+              deleted++;
+            }
+            return true;
+          },
+        );
+        count += inserted - deleted;
+      } catch (_) {}
+    }
+
+    return max(0, count);
+  }
+
   /// get table record count by table name
   Future<int> getTableRecordCount(TableContext table) async {
     // Ensure cache is populated

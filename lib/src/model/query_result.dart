@@ -224,7 +224,7 @@ class QueryResult<T> {
   /// Override toString for easy debugging
   @override
   String toString() {
-    return 'QueryResult{code: ${type.code} (${type.codeKey}), message: $message, data: $data, prevCursorToken: $prevCursorToken, nextCursorToken: $nextCursorToken, hasMore: $hasMore, hasPrev: $hasPrev, totalRecordCount: $totalRecordCount}';
+    return 'QueryResult{code: ${type.code} (${type.codeKey}), message: $message, data: $data, prevCursorToken: $prevCursorToken, nextCursorToken: $nextCursorToken, hasMore: $hasMore, hasPrev: $hasPrev, totalRecordCount: $totalRecordCount, executionTimeMs: $executionTimeMs}';
   }
 
   /// for serialization

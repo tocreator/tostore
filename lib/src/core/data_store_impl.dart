@@ -564,12 +564,11 @@ class DataStoreImpl {
   /// After [close] resets [_initCompleter] with nothing initializing, waiting
   /// would hang forever - throw [DbClosedException] instead.
   Future<void> ensureInitialized() async {
-    // Check if this is a system/internal operation (e.g., updating system tables during table creation)
-    final isSystemOp = TransactionContext.isSystemOperation();
+    if (_isInitialized) return;
 
     // For system operations during initialization, allow if base initialization is complete
     // This is needed for operations like foreign key system table updates during table creation
-    if (isSystemOp && _initializing) {
+    if (_initializing && TransactionContext.isSystemOperation()) {
       return;
     }
 
@@ -578,8 +577,6 @@ class DataStoreImpl {
     if (isMigrationInstance && _baseInitialized) {
       return;
     }
-
-    if (_isInitialized) return;
 
     // Close finished (or not yet opened): Completer is incomplete and nobody
     // is running initialize - never park on that future.
@@ -1643,6 +1640,9 @@ class DataStoreImpl {
 
   /// Easily obtain the TableContext of this table
   Future<TableContext> getTableContext(String tableName) async {
+    final syncContext = getTableContextSync(tableName);
+    if (syncContext != null) return syncContext;
+
     final name = TableName(tableName);
     final tableUid = await tableMetaManager?.resolveTableUidFromName(name);
     if (tableUid == null) {
@@ -2048,7 +2048,9 @@ class DataStoreImpl {
   /// Returns [DbResult]. No where clause; conflict target from data (pk or first complete unique index).
   Future<DbResult> upsert(String tableName, Map<String, dynamic> data) async {
     DbResult finish(DbResult r) => _returnOrThrowIfTxn(r, 'upsert', tableName);
-    await ensureInitialized();
+    if (!_isInitialized) {
+      await ensureInitialized();
+    }
 
     // Emergency Resource Check
     if (_resourceManager?.isWriteBlocked ?? false) {
@@ -2159,7 +2161,9 @@ class DataStoreImpl {
     final tableName = table.tableName;
     DbResult finish(DbResult r) => _returnOrThrowIfTxn(r, 'update', tableName);
     List<String>? partialUniqueFailedKeys;
-    await ensureInitialized();
+    if (!_isInitialized) {
+      await ensureInitialized();
+    }
 
     // Emergency Resource Check
     if (_resourceManager?.isWriteBlocked ?? false) {
@@ -2559,25 +2563,46 @@ class DataStoreImpl {
         final lockMgr = lockManager;
         final Map<String, String> acquiredResources = {};
 
-        final yieldController =
-            YieldController('DataStoreImpl._updateInternal.loop');
+        final yieldController = records.length <= 1
+            ? null
+            : YieldController('DataStoreImpl._updateInternal.loop');
 
-        // Unified unique constraints check using IndexManager, with unique-key granular locks.
-        // Only pass affected unique-constrained fields (including composite index fields) plus primary key.
+        // Precompute / hoist all index metadata outside the record loop
         final Set<String> changedFields = validData.keys.toSet();
         final Set<String> fieldsToCheck = <String>{};
 
-        // Collect fields from unique composite/single-field indexes that are affected by this update
-        final allIndexes =
+        final uniqueIndexes =
             tableMetaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
-        for (final index in allIndexes) {
-          if (index.fields.any((f) => changedFields.contains(f))) {
+        for (final index in uniqueIndexes) {
+          if (index.fields.any(changedFields.contains)) {
             fieldsToCheck.addAll(index.fields);
           }
         }
 
+        final allIndexes = <IndexSchema>[
+          ...?tableMetaManager?.getAllIndexesFor(schema),
+          ...?indexManager?.getEngineManagedBtreeIndexes(
+            table,
+            schema,
+          ),
+        ];
+
+        final Set<String> staticIndexFields = <String>{primaryKey};
+        for (final idx in allIndexes) {
+          if (idx.fields.any(changedFields.contains)) {
+            staticIndexFields.addAll(idx.fields);
+          }
+        }
+
+        // Collect records to batch commit
+        final List<Map<String, dynamic>> recordsToCommit = [];
+        final List<Map<String, dynamic>> oldRecordsToCommit = [];
+        final List<String> commitPkVals = [];
+        final List<Map<String, dynamic>> validOriginalRecords = [];
+        final Set<String> reservedPks = {};
+
         for (int recordIndex = 0; recordIndex < records.length; recordIndex++) {
-          final y3 = yieldController.maybeYield();
+          final y3 = yieldController?.maybeYield();
           if (y3 != null) await y3;
           final record = records[recordIndex];
           final recordKey = record[primaryKey]?.toString() ?? '';
@@ -2607,6 +2632,7 @@ class DataStoreImpl {
                 isUpdate: true,
                 changedFields: changedFields,
               );
+              reservedPks.add(recordKey);
             } catch (e) {
               if (e is UniqueViolation) {
                 if (continueOnPartialErrors) {
@@ -2642,6 +2668,7 @@ class DataStoreImpl {
                     transactionId: txId,
                     rollbackKeys: oldUniqueKeys,
                   );
+                  reservedPks.remove(recordKey);
                 } catch (_) {}
 
                 Logger.error('Foreign key constraint validation failed',
@@ -2687,6 +2714,7 @@ class DataStoreImpl {
                   transactionId: txId,
                   rollbackKeys: oldUniqueKeys,
                 );
+                reservedPks.remove(recordKey);
               } catch (_) {}
             }
           }
@@ -2715,21 +2743,22 @@ class DataStoreImpl {
               final opId = GlobalIdGenerator.generate('update_row_');
               final ok = await lockMgr.acquireExclusiveLock(res, opId);
               if (!ok) {
-                writeBufferManager.releaseReservedUniques(
-                  table: table,
-                  recordId: recordKey,
-                  transactionId: txId,
-                  rollbackKeys: oldUniqueKeys,
-                );
+                if (fieldsToCheck.isNotEmpty) {
+                  writeBufferManager.releaseReservedUniques(
+                    table: table,
+                    recordId: recordKey,
+                    transactionId: txId,
+                    rollbackKeys: oldUniqueKeys,
+                  );
+                  reservedPks.remove(recordKey);
+                }
                 if (continueOnPartialErrors) {
-                  // release unique locks before continuing
                   if (returnResultDetails) {
                     failedKeys.add(recordKey);
                   }
                   failedCount++;
                   continue;
                 }
-                // release unique locks before returning
                 return finishWithPromoteMirror(DbResult.error(
                   type: ResultType.engError,
                   message: 'Lock conflict on primary key $recordKey',
@@ -2740,13 +2769,15 @@ class DataStoreImpl {
                 TransactionContext.registerExclusiveLock(res, opId);
               }
             } catch (_) {
-              // Lock threw after reserve: must not leave unique slots behind.
-              writeBufferManager.releaseReservedUniques(
-                table: table,
-                recordId: recordKey,
-                transactionId: txId,
-                rollbackKeys: oldUniqueKeys,
-              );
+              if (fieldsToCheck.isNotEmpty) {
+                writeBufferManager.releaseReservedUniques(
+                  table: table,
+                  recordId: recordKey,
+                  transactionId: txId,
+                  rollbackKeys: oldUniqueKeys,
+                );
+                reservedPks.remove(recordKey);
+              }
               if (continueOnPartialErrors) {
                 if (returnResultDetails) {
                   failedKeys.add(recordKey);
@@ -2763,79 +2794,100 @@ class DataStoreImpl {
             transactionManager?.registerWriteKey(txId, table, recordKey);
           }
 
-          // update write queue
-          final Set<String> indexFields = <String>{primaryKey};
+          // Prepare oldValues
           final bool pkChanged = isPrimaryKeyUpdate &&
               record[primaryKey] != null &&
               updatedRecord[primaryKey] != null &&
               record[primaryKey] != updatedRecord[primaryKey];
-          final allIndexes = <IndexSchema>[
-            ...?tableMetaManager?.getAllIndexesFor(schema),
-            ...?indexManager?.getEngineManagedBtreeIndexes(
-              table,
-              schema,
-            ),
-          ];
+
+          final Set<String> targetIndexFields;
           if (pkChanged) {
-            // Primary key change affects all secondary indexes (non-unique: key suffix; unique: value).
+            targetIndexFields = <String>{primaryKey};
             for (final idx in allIndexes) {
-              indexFields.addAll(idx.fields);
+              targetIndexFields.addAll(idx.fields);
             }
           } else {
-            for (final idx in allIndexes) {
-              if (idx.fields.any((f) => changedFields.contains(f))) {
-                indexFields.addAll(idx.fields);
-              }
-            }
+            targetIndexFields = staticIndexFields;
           }
+
           final Map<String, dynamic> oldValues = {};
-          for (final k in indexFields) {
+          for (final k in targetIndexFields) {
             if (record.containsKey(k)) {
               oldValues[k] = record[k];
             }
           }
+
+          recordsToCommit.add(updatedRecord);
+          oldRecordsToCommit.add(oldValues);
+          commitPkVals.add(recordKey);
+          validOriginalRecords.add(record);
+        }
+
+        // Commit in unified batch to TableDataManager / WAL / Buffer
+        if (recordsToCommit.isNotEmpty) {
           try {
-            await tableDataManager.addToBuffer(
-              table,
-              updatedRecord,
-              BufferOperationType.update,
-              oldValues: oldValues.isEmpty ? null : oldValues,
-              transactionId: txId,
-              schemaVersion: table.schema.schemaVersion ?? '',
-            );
-          } catch (e) {
-            writeBufferManager.releaseReservedUniques(
+            final commitResult = await tableDataManager.addBatchToBuffer(
               table: table,
-              recordId: recordKey,
+              records: recordsToCommit,
+              operation: BufferOperationType.update,
+              schema: schema,
+              oldRecordsList: oldRecordsToCommit,
               transactionId: txId,
-              rollbackKeys: oldUniqueKeys,
+              schemaVersion: schema.schemaVersion ?? '',
             );
+
+            final successSet = commitResult.successRecordIds.toSet();
+            for (int k = 0; k < recordsToCommit.length; k++) {
+              final pkVal = commitPkVals[k];
+              final updatedRecord = recordsToCommit[k];
+              final origRecord = validOriginalRecords[k];
+
+              if (successSet.contains(pkVal)) {
+                final displayPk = promoteDesc != null
+                    ? _promoteUserFacingSuccessKey(
+                        updatedRecord,
+                        promoteDesc,
+                        alternateRecord: origRecord,
+                      )
+                    : pkVal;
+                if (returnResultDetails) {
+                  successKeys.add(displayPk);
+                }
+                successCount++;
+                promoteUpdated?.add(updatedRecord);
+
+                if (hasNotify) {
+                  notificationManager.notify(ChangeEvent(
+                    type: ChangeType.update,
+                    tableUid: table.tableUid,
+                    record: updatedRecord,
+                    oldRecord: origRecord,
+                  ));
+                }
+              } else {
+                if (returnResultDetails) {
+                  failedKeys.add(pkVal);
+                }
+                failedCount++;
+                if (reservedPks.contains(pkVal)) {
+                  writeBufferManager.releaseReservedUniques(
+                    table: table,
+                    recordId: pkVal,
+                    transactionId: txId,
+                  );
+                }
+              }
+            }
+          } catch (e) {
+            if (reservedPks.isNotEmpty) {
+              await writeBufferManager.releaseReservedUniquesForPks(
+                table: table,
+                recordIds: reservedPks,
+                transactionId: txId,
+              );
+            }
             rethrow;
           }
-
-          if (hasNotify) {
-            notificationManager.notify(ChangeEvent(
-              type: ChangeType.update,
-              tableUid: table.tableUid,
-              record: updatedRecord,
-              oldRecord: record,
-            ));
-          }
-
-          // Add to success keys list (user-facing PK when promote is active).
-          if (returnResultDetails) {
-            successKeys.add(
-              promoteDesc != null
-                  ? _promoteUserFacingSuccessKey(
-                      updatedRecord,
-                      promoteDesc,
-                      alternateRecord: record,
-                    )
-                  : recordKey,
-            );
-          }
-          successCount++;
-          promoteUpdated?.add(updatedRecord);
         }
 
         // Non-transaction: release locks immediately; transaction: release by commit/rollback
@@ -3072,7 +3124,9 @@ class DataStoreImpl {
   }) async {
     final tableName = table.tableName;
     DbResult finish(DbResult r) => _returnOrThrowIfTxn(r, 'delete', tableName);
-    await ensureInitialized();
+    if (!isInitialized) {
+      await ensureInitialized();
+    }
 
     // Emergency Resource Check
     if (_resourceManager?.isWriteBlocked ?? false) {
@@ -3535,7 +3589,9 @@ class DataStoreImpl {
       {bool rollbackOnError = true,
       bool? persistRecoveryOnCommit,
       TransactionIsolationLevel? isolation}) async {
-    await ensureInitialized();
+    if (!_isInitialized) {
+      await ensureInitialized();
+    }
     final txId = await transactionManager!.beginTransaction();
     final started = DateTime.now();
     final effectiveIsolation =
@@ -3932,7 +3988,9 @@ class DataStoreImpl {
       PromoteRuntimeDescriptor? promoteResultKeyDesc}) async {
     DbResult finish(DbResult r) =>
         _returnOrThrowIfTxn(r, 'batchInsert', tableName);
-    await ensureInitialized();
+    if (!_isInitialized) {
+      await ensureInitialized();
+    }
 
     // Emergency Resource Check
     if (_resourceManager?.isWriteBlocked ?? false) {
@@ -4957,7 +5015,9 @@ class DataStoreImpl {
       bool enablePromoteDualWrite = true}) async {
     DbResult finish(DbResult r) =>
         _returnOrThrowIfTxn(r, 'batchUpsert', tableName);
-    await ensureInitialized();
+    if (!_isInitialized) {
+      await ensureInitialized();
+    }
 
     if (_resourceManager?.isWriteBlocked ?? false) {
       return finish(DbResult.error(
@@ -5241,7 +5301,9 @@ class DataStoreImpl {
       PromoteRuntimeDescriptor? promoteResultKeyDesc}) async {
     DbResult finish(DbResult r) =>
         _returnOrThrowIfTxn(r, 'batchUpdate', tableName);
-    await ensureInitialized();
+    if (!_isInitialized) {
+      await ensureInitialized();
+    }
 
     // Emergency Resource Check
     if (_resourceManager?.isWriteBlocked ?? false) {
@@ -6568,7 +6630,9 @@ class DataStoreImpl {
     int? efSearch,
     double? distanceThreshold,
   }) async {
-    await ensureInitialized();
+    if (!_isInitialized) {
+      await ensureInitialized();
+    }
     if (_vectorIndexManager == null) return const [];
     final table = await getTableContext(tableName);
     return _vectorIndexManager!.vectorSearch(
@@ -6587,7 +6651,9 @@ class DataStoreImpl {
   /// [GlobalConfig.activeSpace]. When opening with default space, init will use activeSpace so one open lands in the right space.
   Future<bool> switchSpace(
       {String spaceName = 'default', bool keepActive = true}) async {
-    await ensureInitialized();
+    if (!_isInitialized) {
+      await ensureInitialized();
+    }
 
     if (_currentSpaceName == spaceName) {
       return true;
@@ -6719,7 +6785,9 @@ class DataStoreImpl {
     final tableName = SystemTable.getKeyValueName(isGlobal);
     DbResult finish(DbResult r) =>
         _returnOrThrowIfTxn(r, 'setValue', tableName);
-    await ensureInitialized();
+    if (!_isInitialized) {
+      await ensureInitialized();
+    }
 
     if (ttl != null && expiresAt != null) {
       return finish(DbResult.error(
@@ -6788,7 +6856,9 @@ class DataStoreImpl {
     final tableName = SystemTable.getKeyValueName(isGlobal);
     DbResult finish(DbResult r) =>
         _returnOrThrowIfTxn(r, 'setValueMany', tableName);
-    await ensureInitialized();
+    if (!_isInitialized) {
+      await ensureInitialized();
+    }
     if (items.isEmpty) {
       return finish(DbResult.success(message: 'No items to set'));
     }
@@ -6859,7 +6929,9 @@ class DataStoreImpl {
 
   /// Get key-value pair
   Future<dynamic> getValue(String key, {bool isGlobal = false}) async {
-    await ensureInitialized();
+    if (!_isInitialized) {
+      await ensureInitialized();
+    }
 
     final tableName = SystemTable.getKeyValueName(isGlobal);
     final table = await getTableContext(tableName);
@@ -6896,7 +6968,9 @@ class DataStoreImpl {
     int? offset,
     bool isGlobal = false,
   }) async {
-    await ensureInitialized();
+    if (!_isInitialized) {
+      await ensureInitialized();
+    }
     final tableName = SystemTable.getKeyValueName(isGlobal);
     final table = await getTableContext(tableName);
     final condition = QueryCondition();
@@ -6928,7 +7002,9 @@ class DataStoreImpl {
 
   /// Check if a key exists and is not expired.
   Future<bool> exists(String key, {bool isGlobal = false}) async {
-    await ensureInitialized();
+    if (!_isInitialized) {
+      await ensureInitialized();
+    }
     final tableName = SystemTable.getKeyValueName(isGlobal);
     final table = await getTableContext(tableName);
     final result = (await queryExecutor.execute(
@@ -6949,7 +7025,9 @@ class DataStoreImpl {
 
   /// Remove key-value pair
   Future<DbResult> removeValue(String key, {bool isGlobal = false}) async {
-    await ensureInitialized();
+    if (!_isInitialized) {
+      await ensureInitialized();
+    }
 
     final tableName = SystemTable.getKeyValueName(isGlobal);
     final table = await getTableContext(tableName);
@@ -6961,7 +7039,9 @@ class DataStoreImpl {
   /// Remove multiple key-value pairs.
   Future<DbResult> removeValues(Iterable<String> keys,
       {bool isGlobal = false}) async {
-    await ensureInitialized();
+    if (!_isInitialized) {
+      await ensureInitialized();
+    }
     final keyList = keys.toList();
     if (keyList.isEmpty) return DbResult.success();
 
@@ -6973,7 +7053,9 @@ class DataStoreImpl {
 
   /// Get remaining TTL for a key.
   Future<Duration?> getTtl(String key, {bool isGlobal = false}) async {
-    await ensureInitialized();
+    if (!_isInitialized) {
+      await ensureInitialized();
+    }
     final tableName = SystemTable.getKeyValueName(isGlobal);
     final table = await getTableContext(tableName);
     final result = (await queryExecutor.execute(
@@ -6999,7 +7081,9 @@ class DataStoreImpl {
   /// Set TTL for an existing key.
   Future<DbResult> setTtl(String key, Duration? ttl,
       {DateTime? expiresAt, bool isGlobal = false}) async {
-    await ensureInitialized();
+    if (!_isInitialized) {
+      await ensureInitialized();
+    }
     final tableName = SystemTable.getKeyValueName(isGlobal);
     final table = await getTableContext(tableName);
 
@@ -7019,7 +7103,9 @@ class DataStoreImpl {
   /// Atomic increment for a numeric value.
   Future<DbResult> setIncrement(String key,
       {int amount = 1, bool isGlobal = false}) async {
-    await ensureInitialized();
+    if (!_isInitialized) {
+      await ensureInitialized();
+    }
     final tableName = SystemTable.getKeyValueName(isGlobal);
     final table = await getTableContext(tableName);
 
@@ -7237,7 +7323,9 @@ class DataStoreImpl {
     controller = StreamController<T>(
       onListen: () async {
         try {
-          await ensureInitialized();
+          if (!_isInitialized) {
+            await ensureInitialized();
+          }
           await emitLatest();
         } catch (e, st) {
           if (!controller.isClosed) {
@@ -7406,7 +7494,9 @@ class DataStoreImpl {
   /// Get table info
   /// get table info
   Future<TableInfo?> getTableInfo(String tableName) async {
-    await ensureInitialized();
+    if (!_isInitialized) {
+      await ensureInitialized();
+    }
     final table = await getTableContext(tableName);
     // User-facing schema overlay during promote (engine TableContext stays old).
     final schema = await getTableSchema(tableName) ?? table.schema;
@@ -7978,7 +8068,9 @@ class DataStoreImpl {
   /// Returns [DbResult] to allow graceful error handling for business logic errors
   /// [spaceName] Space name to delete
   Future<DbResult> deleteSpace(String spaceName) async {
-    await ensureInitialized();
+    if (!_isInitialized) {
+      await ensureInitialized();
+    }
 
     if (spaceName == 'default') {
       Logger.warn(
@@ -8063,7 +8155,9 @@ class DataStoreImpl {
   /// List all space names (e.g. for multi-account UI or admin).
   /// Returns sorted list; at least contains 'default'.
   Future<List<String>> listSpaces() async {
-    await ensureInitialized();
+    if (!_isInitialized) {
+      await ensureInitialized();
+    }
     final globalConfig = await getGlobalConfig();
     if (globalConfig == null || globalConfig.spaceNames.isEmpty) {
       return ['default'];
@@ -8087,7 +8181,9 @@ class DataStoreImpl {
     String? oldKey,
     required String newKey,
   }) async {
-    await ensureInitialized();
+    if (!_isInitialized) {
+      await ensureInitialized();
+    }
     return keyManager.rotateEncryptionKey(oldKey: oldKey, newKey: newKey);
   }
 
@@ -8103,7 +8199,9 @@ class DataStoreImpl {
     List<String>? selectedFields,
   }) async* {
     try {
-      await ensureInitialized();
+      if (!_isInitialized) {
+        await ensureInitialized();
+      }
       final tableName = table.tableName;
       // Check if table exists
       if (!await tableExists(tableName)) {

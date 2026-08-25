@@ -149,7 +149,9 @@ class KvQueryBuilder
   /// Without a [prefix], uses table metadata (O(1); may briefly include
   /// expired keys not yet cleaned). With a prefix, runs a filtered count.
   Future<int> count() async {
-    await _db.ensureInitialized();
+    if (!_db.isInitialized) {
+      await _db.ensureInitialized();
+    }
     final tableName = SystemTable.getKeyValueName(_isGlobal);
     final table = await _db.getTableContext(tableName);
 
@@ -214,7 +216,9 @@ class KvQueryBuilder
         );
       }
 
-      await _db.ensureInitialized();
+      if (!_db.isInitialized) {
+        await _db.ensureInitialized();
+      }
       final tableName = SystemTable.getKeyValueName(_isGlobal);
       final table = await _db.getTableContext(tableName);
       final condition = _buildCondition();

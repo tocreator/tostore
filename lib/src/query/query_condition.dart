@@ -13,6 +13,16 @@ class QueryCondition {
   dynamic _fastSingleEqVal;
   String? _singleOp;
 
+  // Memoized single equality fast-path cache
+  ({String field, dynamic value})? _cachedSingleEq;
+  bool _hasCalculatedSingleEq = false;
+
+  void _invalidateSingleEqCache() {
+    _hasCalculatedSingleEq = false;
+    _cachedSingleEq = null;
+    _cachedBuiltMap = null;
+  }
+
   // Order by, limit, offset related properties
   List<String>? _orderBy;
   int? _limit;
@@ -134,13 +144,16 @@ class QueryCondition {
   /// Add a basic condition
   QueryCondition where(String field, dynamic operator, dynamic value) {
     _conditionCount++;
-    _cachedBuiltMap = null;
+    _invalidateSingleEqCache();
+    final cleanField = field.contains('.') ? field.split('.').last : field;
     if (_conditionCount == 1 &&
         _root == null &&
         (operator == '=' || operator == '==')) {
-      _fastSingleEqField = field;
+      _fastSingleEqField = cleanField;
       _fastSingleEqVal = value;
       _singleOp = '=';
+      _cachedSingleEq = (field: cleanField, value: value);
+      _hasCalculatedSingleEq = true;
       return this;
     }
     _ensureTreeInitialized();
@@ -898,13 +911,18 @@ class QueryCondition {
   /// `where field = value` or `where field == value` (with no other conditions, no OR).
   ///
   /// Returns a record `(field: String, value: dynamic)?` if it matches, or null otherwise.
+  /// Results are memoized in O(1) time after the first calculation.
   ({String field, dynamic value})? extractSingleEquality() {
+    if (_hasCalculatedSingleEq) return _cachedSingleEq;
+    _hasCalculatedSingleEq = true;
+
     if (_conditionCount == 1 &&
         _fastSingleEqField != null &&
         (_singleOp == null || _singleOp == '=' || _singleOp == '==')) {
-      return (field: _fastSingleEqField!, value: _fastSingleEqVal);
+      return _cachedSingleEq =
+          (field: _fastSingleEqField!, value: _fastSingleEqVal);
     }
-    if (_root == null) return null;
+    if (_root == null) return _cachedSingleEq = null;
     ConditionNode? leaf;
     if (_root!.type == NodeType.leaf) {
       leaf = _root;
@@ -921,22 +939,22 @@ class QueryCondition {
       }
     }
 
-    if (leaf == null || leaf.condition.isEmpty) return null;
+    if (leaf == null || leaf.condition.isEmpty) return _cachedSingleEq = null;
     final cond = leaf.condition;
-    if (cond.length != 1) return null;
+    if (cond.length != 1) return _cachedSingleEq = null;
 
     final entry = cond.entries.first;
     final field = entry.key;
-    if (field == 'AND' || field == 'OR') return null;
+    if (field == 'AND' || field == 'OR') return _cachedSingleEq = null;
 
     final rawVal = entry.value;
     if (rawVal is Map) {
       if (rawVal.length == 1 && rawVal.containsKey('=')) {
-        return (field: field, value: rawVal['=']);
+        return _cachedSingleEq = (field: field, value: rawVal['=']);
       }
-      return null;
+      return _cachedSingleEq = null;
     } else {
-      return (field: field, value: rawVal);
+      return _cachedSingleEq = (field: field, value: rawVal);
     }
   }
 }

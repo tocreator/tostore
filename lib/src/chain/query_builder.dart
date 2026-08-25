@@ -118,6 +118,10 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
         ]);
       }
     }
+    _clauseFlags |= QueryClauseMask.selectedFields;
+    if (_extraAggregations.isNotEmpty) {
+      _clauseFlags |= QueryClauseMask.aggregations;
+    }
     _onChanged();
     return this;
   }
@@ -144,6 +148,10 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
         ]);
       }
     }
+    _clauseFlags |= QueryClauseMask.selectedFields;
+    if (_aggregations!.isNotEmpty) {
+      _clauseFlags |= QueryClauseMask.aggregations;
+    }
     _onChanged();
     return this;
   }
@@ -151,6 +159,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   /// group by fields
   QueryBuilder groupBy(List<String> fields) {
     _groupByFields = fields;
+    _clauseFlags |= QueryClauseMask.groupBy;
     _onChanged();
     return this;
   }
@@ -158,6 +167,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   /// having condition for groups
   QueryBuilder having(QueryCondition condition) {
     _havingCondition = condition;
+    _clauseFlags |= QueryClauseMask.having;
     _onChanged();
     return this;
   }
@@ -166,6 +176,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   QueryBuilder distinct([List<String>? fields]) {
     _distinct = true;
     _distinctFields = fields;
+    _clauseFlags |= QueryClauseMask.distinct;
     _onChanged();
     return this;
   }
@@ -180,6 +191,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       operator: operator,
       secondKey: secondKey,
     ));
+    _clauseFlags |= QueryClauseMask.joins;
     _onChanged();
     return this;
   }
@@ -194,6 +206,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       operator: operator,
       secondKey: secondKey,
     ));
+    _clauseFlags |= QueryClauseMask.joins;
     _onChanged();
     return this;
   }
@@ -319,8 +332,8 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   /// get first record
   Future<Map<String, dynamic>?> first() async {
     limit(1);
-    final results = await this;
-    return results.data.isEmpty ? null : results.data.first;
+    final result = await _executeQuery();
+    return result.records.isEmpty ? null : result.records.first;
   }
 
   /// Synchronously retrieve query results from pure memory cache (Result Cache / Point Cache).
@@ -330,56 +343,6 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   QueryResult<Map<String, dynamic>> peek() {
     final result = _executePeekSync();
 
-    Future<QueryResult<Map<String, dynamic>>> nextPageExecutor() async {
-      final cloned = clone();
-      if (result.nextCursor != null) {
-        cloned.cursor(result.nextCursor!);
-      } else {
-        final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
-        final currentOffset = _offset ?? 0;
-        cloned.offset(currentOffset + effectiveLimit);
-      }
-      return cloned.future;
-    }
-
-    Future<QueryResult<Map<String, dynamic>>> prevPageExecutor() async {
-      final cloned = clone();
-      if (result.prevCursor != null) {
-        cloned.cursor(result.prevCursor!);
-      } else {
-        final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
-        final currentOffset = _offset ?? 0;
-        final newOffset = currentOffset - effectiveLimit;
-        cloned.offset(newOffset >= 0 ? newOffset : 0);
-      }
-      return cloned.future;
-    }
-
-    QueryResult<Map<String, dynamic>> peekNextPageExecutor() {
-      final cloned = clone();
-      if (result.nextCursor != null) {
-        cloned.cursor(result.nextCursor!);
-      } else {
-        final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
-        final currentOffset = _offset ?? 0;
-        cloned.offset(currentOffset + effectiveLimit);
-      }
-      return cloned.peek();
-    }
-
-    QueryResult<Map<String, dynamic>> peekPrevPageExecutor() {
-      final cloned = clone();
-      if (result.prevCursor != null) {
-        cloned.cursor(result.prevCursor!);
-      } else {
-        final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
-        final currentOffset = _offset ?? 0;
-        final newOffset = currentOffset - effectiveLimit;
-        cloned.offset(newOffset >= 0 ? newOffset : 0);
-      }
-      return cloned.peek();
-    }
-
     return QueryResult.success(
       data: result.records,
       prevCursor: result.prevCursor,
@@ -388,10 +351,60 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       hasPrev: result.hasPrev,
       totalRecordCount: result.totalRecordCount,
       executionTimeMs: result.executionTimeMs,
-      nextPageExecutor: result.hasMore ? nextPageExecutor : null,
-      prevPageExecutor: result.hasPrev ? prevPageExecutor : null,
-      peekNextPageExecutor: result.hasMore ? peekNextPageExecutor : null,
-      peekPrevPageExecutor: result.hasPrev ? peekPrevPageExecutor : null,
+      nextPageExecutor: result.hasMore
+          ? () async {
+              final cloned = clone();
+              if (result.nextCursor != null) {
+                cloned.cursor(result.nextCursor!);
+              } else {
+                final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
+                final currentOffset = _offset ?? 0;
+                cloned.offset(currentOffset + effectiveLimit);
+              }
+              return cloned.future;
+            }
+          : null,
+      prevPageExecutor: result.hasPrev
+          ? () async {
+              final cloned = clone();
+              if (result.prevCursor != null) {
+                cloned.cursor(result.prevCursor!);
+              } else {
+                final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
+                final currentOffset = _offset ?? 0;
+                final newOffset = currentOffset - effectiveLimit;
+                cloned.offset(newOffset >= 0 ? newOffset : 0);
+              }
+              return cloned.future;
+            }
+          : null,
+      peekNextPageExecutor: result.hasMore
+          ? () {
+              final cloned = clone();
+              if (result.nextCursor != null) {
+                cloned.cursor(result.nextCursor!);
+              } else {
+                final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
+                final currentOffset = _offset ?? 0;
+                cloned.offset(currentOffset + effectiveLimit);
+              }
+              return cloned.peek();
+            }
+          : null,
+      peekPrevPageExecutor: result.hasPrev
+          ? () {
+              final cloned = clone();
+              if (result.prevCursor != null) {
+                cloned.cursor(result.prevCursor!);
+              } else {
+                final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
+                final currentOffset = _offset ?? 0;
+                final newOffset = currentOffset - effectiveLimit;
+                cloned.offset(newOffset >= 0 ? newOffset : 0);
+              }
+              return cloned.peek();
+            }
+          : null,
     );
   }
 
@@ -471,9 +484,16 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
               onlyCount: onlyCount,
               aggregations: combinedAggs,
               groupBy: _groupByFields,
+              clauseFlags: _clauseFlags,
               applyPromoteResultTransform: true,
             ) ??
         const ExecuteResult.empty();
+
+    // Fast-path: Point query straight-through (zero post-processing checks and allocations)
+    if (result.isPointDirect &&
+        (_selectedFields == null || _selectedFields!.isEmpty)) {
+      return result;
+    }
 
     List<Map<String, dynamic>> results = result.records;
 
@@ -527,6 +547,13 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       results = distinctResults;
     }
 
+    int? finalTotalCount = result.totalRecordCount;
+    if (finalTotalCount == null &&
+        queryCondition.isEmpty &&
+        (_joins == null || _joins!.isEmpty)) {
+      finalTotalCount = _db.tableDataManager.getTableRecordCountSync(table);
+    }
+
     return ExecuteResult(
       records: results,
       nextCursor: result.nextCursor,
@@ -534,7 +561,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       hasMore: result.hasMore,
       hasPrev: result.hasPrev,
       executionTimeMs: result.executionTimeMs,
-      totalRecordCount: result.totalRecordCount,
+      totalRecordCount: finalTotalCount,
       count: result.count,
       aggregateResult: result.aggregateResult,
     );
@@ -625,6 +652,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     builder._fastSingleEqField = _fastSingleEqField;
     builder._fastSingleEqVal = _fastSingleEqVal;
     builder._singleOp = _singleOp;
+    builder._clauseFlags = _clauseFlags;
     if (_condition != null) {
       builder._condition = _condition!.clone();
     }
@@ -687,31 +715,6 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       return queryResult;
     }
 
-    Future<QueryResult<Map<String, dynamic>>> nextPageExecutor() async {
-      final cloned = clone();
-      if (result.nextCursor != null) {
-        cloned.cursor(result.nextCursor!);
-      } else {
-        final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
-        final currentOffset = _offset ?? 0;
-        cloned.offset(currentOffset + effectiveLimit);
-      }
-      return cloned.future;
-    }
-
-    Future<QueryResult<Map<String, dynamic>>> prevPageExecutor() async {
-      final cloned = clone();
-      if (result.prevCursor != null) {
-        cloned.cursor(result.prevCursor!);
-      } else {
-        final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
-        final currentOffset = _offset ?? 0;
-        final newOffset = currentOffset - effectiveLimit;
-        cloned.offset(newOffset >= 0 ? newOffset : 0);
-      }
-      return cloned.future;
-    }
-
     final queryResult = QueryResult.success(
       data: result.records,
       prevCursor: result.prevCursor,
@@ -720,8 +723,33 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       hasPrev: result.hasPrev,
       totalRecordCount: result.totalRecordCount,
       executionTimeMs: result.executionTimeMs,
-      nextPageExecutor: result.hasMore ? nextPageExecutor : null,
-      prevPageExecutor: result.hasPrev ? prevPageExecutor : null,
+      nextPageExecutor: result.hasMore
+          ? () async {
+              final cloned = clone();
+              if (result.nextCursor != null) {
+                cloned.cursor(result.nextCursor!);
+              } else {
+                final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
+                final currentOffset = _offset ?? 0;
+                cloned.offset(currentOffset + effectiveLimit);
+              }
+              return cloned.future;
+            }
+          : null,
+      prevPageExecutor: result.hasPrev
+          ? () async {
+              final cloned = clone();
+              if (result.prevCursor != null) {
+                cloned.cursor(result.prevCursor!);
+              } else {
+                final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
+                final currentOffset = _offset ?? 0;
+                final newOffset = currentOffset - effectiveLimit;
+                cloned.offset(newOffset >= 0 ? newOffset : 0);
+              }
+              return cloned.future;
+            }
+          : null,
     );
 
     // Trigger background pre-warm for next page if conditions are met (only on first execution)
@@ -773,7 +801,9 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
 
         // 2. Subscribe to changes
         // We need to ensure db is initialized before accessing notificationManager
-        await _db.ensureInitialized();
+        if (!_db.isInitialized) {
+          await _db.ensureInitialized();
+        }
 
         final table = await _db.getTableContext(_tableName);
         subscription = _db.notificationManager.register(
@@ -820,7 +850,9 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     bool onlyCount = false,
     List<QueryAggregation>? extraAggregations,
   }) async {
-    await _db.ensureInitialized();
+    if (!_db.isInitialized) {
+      await _db.ensureInitialized();
+    }
 
     // Resolve pending foreign key joins
     if (_pendingForeignKeyJoins != null &&
@@ -834,7 +866,8 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     if (extraAggregations != null) combinedAggs.addAll(extraAggregations);
     combinedAggs.addAll(_extraAggregations);
 
-    final table = await _db.getTableContext(_tableName);
+    final table = _db.getTableContextSync(_tableName) ??
+        await _db.getTableContext(_tableName);
     final result = await _db.getQueryExecutor()?.execute(
               table,
               condition: queryCondition,
@@ -848,9 +881,16 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
               onlyCount: onlyCount,
               aggregations: combinedAggs.isNotEmpty ? combinedAggs : null,
               groupBy: _groupByFields,
+              clauseFlags: _clauseFlags,
               applyPromoteResultTransform: true,
             ) ??
         const ExecuteResult.empty();
+
+    // Fast-path: Point query straight-through (zero post-processing checks and allocations)
+    if (result.isPointDirect &&
+        (_selectedFields == null || _selectedFields!.isEmpty)) {
+      return result;
+    }
 
     List<Map<String, dynamic>> results = result.records;
 
@@ -966,6 +1006,14 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       results = passedGroups;
     }
 
+    int? finalTotalCount = result.totalRecordCount;
+    if (finalTotalCount == null &&
+        queryCondition.isEmpty &&
+        (_joins == null || _joins!.isEmpty) &&
+        (_pendingForeignKeyJoins == null || _pendingForeignKeyJoins!.isEmpty)) {
+      finalTotalCount = _db.tableDataManager.getTableRecordCountSync(table);
+    }
+
     return ExecuteResult(
       records: results,
       nextCursor: result.nextCursor,
@@ -973,7 +1021,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       hasMore: result.hasMore,
       hasPrev: result.hasPrev,
       executionTimeMs: result.executionTimeMs,
-      totalRecordCount: result.totalRecordCount,
+      totalRecordCount: finalTotalCount,
       count: result.count ?? results.length,
       aggregateResult: result.aggregateResult,
     );

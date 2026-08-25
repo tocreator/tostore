@@ -60,6 +60,30 @@ class QueryExecutor {
     );
   }
 
+  /// Helper to wrap a single point lookup record into ExecuteResult with zero overhead.
+  static ExecuteResult _wrapPointRecordResult(
+    Map<String, dynamic> rec, {
+    PromoteRuntimeDescriptor? promoteDesc,
+    bool applyPromoteResultTransform = false,
+    bool onlyCount = false,
+  }) {
+    final Map<String, dynamic> resultRow;
+    if (promoteDesc != null && applyPromoteResultTransform) {
+      resultRow = Map<String, dynamic>.from(rec);
+      transformPromoteOldToNewInPlace(resultRow, promoteDesc);
+    } else {
+      resultRow = rec;
+    }
+    return ExecuteResult(
+      records: onlyCount ? const [] : [resultRow],
+      count: 1,
+      hasMore: false,
+      hasPrev: false,
+      executionTimeMs: 0,
+      isPointDirect: true,
+    );
+  }
+
   /// Execute query with optional cursor/keyset pagination.
   ///
   /// - When [cursor] is provided, cursor pagination is used (mutually exclusive with [offset]).
@@ -86,6 +110,7 @@ class QueryExecutor {
     bool onlyCount = false,
     List<QueryAggregation>? aggregations,
     List<String>? groupBy,
+    int clauseFlags = -1,
     bool applyPromoteResultTransform = false,
   }) {
     final schema = table.schema;
@@ -96,44 +121,44 @@ class QueryExecutor {
             ? _dataStore.migrationManager!.getPromoteRuntime(table.tableUid)
             : null;
 
-    // =========================================================================
-    // PRIORITY #1: POINT FAST PATH (PK & Unique Index Pure Memory)
-    // =========================================================================
-    final bool isPointCandidate =
-        (aggregations == null || aggregations.isEmpty) &&
+    // -------------------------------------------------------------------------
+    // Fast single-equality condition extraction (shared by PK and Unique index)
+    // -------------------------------------------------------------------------
+    final bool isPointCandidate = (clauseFlags != -1)
+        ? (clauseFlags == 0 &&
+            !onlyCount &&
+            condition != null &&
+            !condition.isEmpty)
+        : (!onlyCount &&
+            (aggregations == null || aggregations.isEmpty) &&
             (groupBy == null || groupBy.isEmpty) &&
             (joins == null || joins.isEmpty) &&
             (offset == null || offset <= 0) &&
             (cursor == null || cursor.isEmpty) &&
             (limit == null || limit >= 1) &&
             condition != null &&
-            !condition.isEmpty;
+            !condition.isEmpty);
 
     final singleEq =
         isPointCandidate ? condition.extractSingleEquality() : null;
     String? pointFieldName;
     dynamic pointRawVal;
+    final bool hasSingleEq = singleEq != null;
+
     if (singleEq != null) {
-      pointFieldName = singleEq.field.contains('.')
-          ? singleEq.field.split('.').last
+      pointFieldName = (promoteDesc != null)
+          ? promoteDesc.remapFieldNameNewToOld(singleEq.field)
           : singleEq.field;
       pointRawVal = singleEq.value;
-
-      if (promoteDesc != null) {
-        pointFieldName = promoteDesc.remapFieldNameNewToOld(pointFieldName);
-      }
     }
 
-    final bool isPkPoint =
-        singleEq != null && pointFieldName == schema.primaryKey;
-    final IndexSchema? fastUniqueIndex = (singleEq != null && !isPkPoint)
-        ? findFastUniqueIndex(schema, pointFieldName!)
-        : null;
-    final bool isUniquePoint = fastUniqueIndex != null;
-    final bool isPointQuery = isPkPoint || isUniquePoint;
-
-    // Fast-path: Primary key point lookup
-    if (isPkPoint) {
+    // =========================================================================
+    // LEVEL 1: PRIMARY KEY POINT LOOKUP
+    // Zero secondary index lookups, zero ResultCache overhead.
+    // =========================================================================
+    if (hasSingleEq &&
+        (identical(pointFieldName, schema.primaryKey) ||
+            pointFieldName == schema.primaryKey)) {
       final pk = pointRawVal?.toString();
       if (pk != null && pk.isNotEmpty) {
         final rec = _dataStore.tableDataManager.getRecordByPrimaryKeySync(
@@ -141,120 +166,98 @@ class QueryExecutor {
           pk,
         );
         if (rec != null) {
-          final Map<String, dynamic> resultRow;
-          if (promoteDesc != null && applyPromoteResultTransform) {
-            resultRow = Map<String, dynamic>.from(rec);
-            transformPromoteOldToNewInPlace(resultRow, promoteDesc);
-          } else {
-            resultRow = rec;
-          }
-          return ExecuteResult(
-            records: onlyCount ? const [] : [resultRow],
-            count: 1,
-            hasMore: false,
-            hasPrev: false,
-            executionTimeMs: 0,
+          return _wrapPointRecordResult(
+            rec,
+            promoteDesc: promoteDesc,
+            applyPromoteResultTransform: applyPromoteResultTransform,
+            onlyCount: onlyCount,
           );
         } else {
-          return const ExecuteResult(
-            records: [],
-            count: 0,
-            hasMore: false,
-            hasPrev: false,
-            executionTimeMs: 0,
-          );
+          return const ExecuteResult.empty();
         }
       }
-    }
-
-    // Fast-path: Unique index point lookup
-    if (fastUniqueIndex != null) {
-      final pk = _dataStore.indexManager?.lookupUniquePrimaryKeySync(
-        table,
-        fastUniqueIndex.indexUid,
-        pointRawVal,
-      );
-      if (pk != null && pk.isNotEmpty) {
-        final rec = _dataStore.tableDataManager.getRecordByPrimaryKeySync(
-          table,
-          pk,
-        );
-        if (rec != null) {
-          final Map<String, dynamic> resultRow;
-          if (promoteDesc != null && applyPromoteResultTransform) {
-            resultRow = Map<String, dynamic>.from(rec);
-            transformPromoteOldToNewInPlace(resultRow, promoteDesc);
-          } else {
-            resultRow = rec;
-          }
-          return ExecuteResult(
-            records: onlyCount ? const [] : [resultRow],
-            count: 1,
-            hasMore: false,
-            hasPrev: false,
-            executionTimeMs: 0,
-          );
-        }
-      }
-      return const ExecuteResult(
-        records: [],
-        count: 0,
-        hasMore: false,
-        hasPrev: false,
-        executionTimeMs: 0,
-      );
     }
 
     // =========================================================================
-    // PRIORITY #2: NON-POINT RESULT CACHE LOOKUP (0ms Synchronous Hit)
-    // Only non-PK, non-unique queries use Result Cache to prevent cache duplication!
+    // LEVEL 2: UNIQUE INDEX POINT LOOKUP
+    // Evaluated only when the query predicate is not on the primary key.
+    // =========================================================================
+    if (hasSingleEq && pointFieldName != null) {
+      final fastUniqueIndex = findFastUniqueIndex(schema, pointFieldName);
+      if (fastUniqueIndex != null) {
+        final pk = _dataStore.indexManager?.lookupUniquePrimaryKeySync(
+          table,
+          fastUniqueIndex.indexUid,
+          pointRawVal,
+        );
+        if (pk != null && pk.isNotEmpty) {
+          final rec = _dataStore.tableDataManager.getRecordByPrimaryKeySync(
+            table,
+            pk,
+          );
+          if (rec != null) {
+            return _wrapPointRecordResult(
+              rec,
+              promoteDesc: promoteDesc,
+              applyPromoteResultTransform: applyPromoteResultTransform,
+              onlyCount: onlyCount,
+            );
+          }
+        }
+        return const ExecuteResult.empty();
+      }
+    }
+
+    // =========================================================================
+    // LEVEL 3: NON-POINT RESULT CACHE LOOKUP
+    // Non-point queries check the hotspot result set cache.
     // =========================================================================
     final bool inTxn = TransactionContext.getCurrentTransactionId() != null;
-    final bool canUseResultCache = enableQueryCache &&
-        !inTxn &&
-        !isPointQuery &&
-        (joins == null || joins.isEmpty);
+    final bool canUseResultCache =
+        enableQueryCache && !inTxn && (joins == null || joins.isEmpty);
 
-    final int defaultLimit = _dataStore.config.defaultQueryLimit;
-    final int effectiveLimitForCache =
-        limit ?? (defaultLimit > 0 ? defaultLimit : 500);
-    final bool isWithinResultCacheLimit = effectiveLimitForCache <= 500 ||
-        onlyCount ||
-        (aggregations != null && aggregations.isNotEmpty);
+    if (canUseResultCache) {
+      final int defaultLimit = _dataStore.config.defaultQueryLimit;
+      final int effectiveLimitForCache =
+          limit ?? (defaultLimit > 0 ? defaultLimit : 500);
+      final bool isWithinResultCacheLimit = effectiveLimitForCache <= 500 ||
+          onlyCount ||
+          (aggregations != null && aggregations.isNotEmpty);
 
-    if (canUseResultCache && isWithinResultCacheLimit) {
-      final resultCacheKey = QueryCacheKey(
-        tableUid: TableUid(tableUid),
-        condition: condition ?? QueryCondition(),
-        orderBy: orderBy,
-        limit: limit,
-        offset: offset,
-        cursor: cursor,
-        joins: joins,
-        aggregations: aggregations,
-        groupBy: groupBy,
-        onlyCount: onlyCount,
-      );
-      final gen = _getTableQueryGeneration(resultCacheKey.tableUid);
-      final queryStr = resultCacheKey.toString();
-      final entry =
-          _queryCache.getPoint3(resultCacheKey.tableUid.value, gen, queryStr);
-      if (entry != null) {
-        if (entry.isExpired()) {
-          _queryCache.removePoint3(
-              resultCacheKey.tableUid.value, gen, queryStr);
-        } else {
-          return ExecuteResult(
-            records: _copyResultList(entry.records),
-            nextCursor: entry.nextCursor,
-            prevCursor: entry.prevCursor,
-            hasMore: entry.hasMore,
-            hasPrev: entry.hasPrev,
-            executionTimeMs: 0,
-            totalRecordCount: entry.totalRecordCount,
-            count: entry.count,
-            aggregateResult: entry.aggregateResult,
-          );
+      if (isWithinResultCacheLimit) {
+        final resultCacheKey = QueryCacheKey(
+          tableUid: TableUid(tableUid),
+          condition: condition ?? QueryCondition(),
+          orderBy: orderBy,
+          limit: limit,
+          offset: offset,
+          cursor: cursor,
+          joins: joins,
+          aggregations: aggregations,
+          groupBy: groupBy,
+          onlyCount: onlyCount,
+        );
+        final gen = _getTableQueryGeneration(resultCacheKey.tableUid);
+        final queryStr = resultCacheKey.toString();
+        final entry =
+            _queryCache.getPoint3(resultCacheKey.tableUid.value, gen, queryStr);
+        if (entry != null) {
+          if (entry.isExpired()) {
+            _queryCache.removePoint3(
+                resultCacheKey.tableUid.value, gen, queryStr);
+          } else {
+            return ExecuteResult(
+              records: _copyResultList(entry.records),
+              nextCursor: entry.nextCursor,
+              prevCursor: entry.prevCursor,
+              hasMore: entry.hasMore,
+              hasPrev: entry.hasPrev,
+              executionTimeMs: 0,
+              totalRecordCount: entry.totalRecordCount,
+              count: entry.count,
+              aggregateResult: entry.aggregateResult,
+            );
+          }
         }
       }
     }
@@ -435,6 +438,13 @@ class QueryExecutor {
         );
         return rec != null ? 1 : 0;
       }
+
+      // Fast-path: When condition and joins are empty, return table total record count directly from memory.
+      final totalCount =
+          _dataStore.tableDataManager.getTableRecordCountSync(table);
+      if (totalCount != null) {
+        return totalCount;
+      }
     }
     final result = executePeek(
       table,
@@ -462,6 +472,9 @@ class QueryExecutor {
     List<QueryAggregation>? aggregations,
     List<String>? groupBy,
     bool readFromFileOnly = false,
+
+    /// Bitmask of active clauses from QueryBuilder (0 indicates pure point query candidate).
+    int clauseFlags = -1,
 
     /// When true, reshape promote result rows from old-working -> user-facing
     /// target schema. Default false: engine/migration/system paths operate on
@@ -491,179 +504,193 @@ class QueryExecutor {
 
     // =========================================================================
     // FAST PATH / POINT QUERY DETECTION
-    // Point queries (PK single equality & single-column Unique index equality)
-    // bypass Result Cache to avoid redundant dual caching with TableRecordCache.
+    // Zero string operations: fast single equality condition is pre-normalized.
     // =========================================================================
-    final bool isPointCandidate = !onlyCount &&
-        (aggregations == null || aggregations.isEmpty) &&
-        (groupBy == null || groupBy.isEmpty) &&
-        (joins == null || joins.isEmpty) &&
-        (offset == null || offset <= 0) &&
-        (cursor == null || cursor.isEmpty) &&
-        (limit == null || limit >= 1) &&
-        condition != null &&
-        !condition.isEmpty;
+    final bool isPointCandidate = (clauseFlags != -1)
+        ? (clauseFlags == 0 &&
+            !onlyCount &&
+            condition != null &&
+            !condition.isEmpty)
+        : (!onlyCount &&
+            (aggregations == null || aggregations.isEmpty) &&
+            (groupBy == null || groupBy.isEmpty) &&
+            (joins == null || joins.isEmpty) &&
+            (offset == null || offset <= 0) &&
+            (cursor == null || cursor.isEmpty) &&
+            (limit == null || limit >= 1) &&
+            condition != null &&
+            !condition.isEmpty);
 
     final singleEq =
         isPointCandidate ? condition.extractSingleEquality() : null;
     String? pointFieldName;
     dynamic pointRawVal;
+    final bool hasSingleEq = singleEq != null;
+
     if (singleEq != null) {
-      pointFieldName = singleEq.field.contains('.')
-          ? singleEq.field.split('.').last
+      pointFieldName = (promoteDesc != null)
+          ? promoteDesc.remapFieldNameNewToOld(singleEq.field)
           : singleEq.field;
       pointRawVal = singleEq.value;
+    }
 
-      // Dual-write remapping if under promote migration
-      if (promoteDesc != null) {
-        pointFieldName = promoteDesc.remapFieldNameNewToOld(pointFieldName);
+    // =========================================================================
+    // LEVEL 1: PRIMARY KEY POINT LOOKUP
+    // Zero secondary index lookups, zero ResultCache overhead.
+    // =========================================================================
+    if (hasSingleEq &&
+        (identical(pointFieldName, schema.primaryKey) ||
+            pointFieldName == schema.primaryKey)) {
+      final pk = pointRawVal?.toString();
+      if (pk != null && pk.isNotEmpty) {
+        // Fast-path: Synchronous memory tier check (WriteBuffer / TableRecordCache / Txn)
+        if (!readFromFileOnly) {
+          final syncRec = _dataStore.tableDataManager.getRecordByPrimaryKeySync(
+            table,
+            pk,
+          );
+          if (syncRec != null) {
+            return _wrapPointRecordResult(
+              syncRec,
+              promoteDesc: promoteDesc,
+              applyPromoteResultTransform: applyPromoteResultTransform,
+              onlyCount: onlyCount,
+            );
+          }
+        }
+
+        final rec = await _dataStore.tableDataManager.getRecordByPrimaryKey(
+          table,
+          pk,
+          readFromFileOnly: readFromFileOnly,
+        );
+        if (rec != null) {
+          return _wrapPointRecordResult(
+            rec,
+            promoteDesc: promoteDesc,
+            applyPromoteResultTransform: applyPromoteResultTransform,
+            onlyCount: onlyCount,
+          );
+        } else {
+          return const ExecuteResult.empty();
+        }
       }
     }
 
-    final bool isPkPoint =
-        singleEq != null && pointFieldName == schema.primaryKey;
-    final IndexSchema? fastUniqueIndex = (singleEq != null && !isPkPoint)
-        ? findFastUniqueIndex(schema, pointFieldName!)
-        : null;
-    final bool isUniquePoint = fastUniqueIndex != null;
-    final bool isPointQuery = isPkPoint || isUniquePoint;
+    // =========================================================================
+    // LEVEL 2: UNIQUE INDEX POINT LOOKUP
+    // Evaluated only when the query predicate is not on the primary key.
+    // =========================================================================
+    if (hasSingleEq && pointFieldName != null) {
+      final fastUniqueIndex = findFastUniqueIndex(schema, pointFieldName);
+      if (fastUniqueIndex != null) {
+        if (!readFromFileOnly) {
+          final syncPk = _dataStore.indexManager?.lookupUniquePrimaryKeySync(
+            table,
+            fastUniqueIndex.indexUid,
+            pointRawVal,
+          );
+          if (syncPk != null && syncPk.isNotEmpty) {
+            final syncRec =
+                _dataStore.tableDataManager.getRecordByPrimaryKeySync(
+              table,
+              syncPk,
+            );
+            if (syncRec != null) {
+              return _wrapPointRecordResult(
+                syncRec,
+                promoteDesc: promoteDesc,
+                applyPromoteResultTransform: applyPromoteResultTransform,
+                onlyCount: onlyCount,
+              );
+            }
+          }
+        }
 
+        final pk = await _indexManager.lookupUniquePrimaryKey(
+          table,
+          fastUniqueIndex.indexUid,
+          pointRawVal,
+          readFromFileOnly: readFromFileOnly,
+        );
+        if (pk != null && pk.isNotEmpty) {
+          final rec = await _dataStore.tableDataManager.getRecordByPrimaryKey(
+            table,
+            pk,
+            readFromFileOnly: readFromFileOnly,
+          );
+          if (rec != null) {
+            return _wrapPointRecordResult(
+              rec,
+              promoteDesc: promoteDesc,
+              applyPromoteResultTransform: applyPromoteResultTransform,
+              onlyCount: onlyCount,
+            );
+          }
+        }
+        return const ExecuteResult.empty();
+      }
+    }
+
+    // =========================================================================
+    // LEVEL 3: NON-POINT RESULT CACHE LOOKUP
+    // Non-point queries check the hotspot result set cache.
+    // =========================================================================
     final bool inTxn = TransactionContext.getCurrentTransactionId() != null;
     final bool canUseResultCache = enableQueryCache &&
         !readFromFileOnly &&
         !inTxn &&
-        !isPointQuery &&
         (joins == null || joins.isEmpty);
-
-    // Limit threshold: only cache result sets with limit <= 500 (or count/scalar aggregations)
-    final int defaultLimit = _dataStore.config.defaultQueryLimit;
-    final int effectiveLimitForCache =
-        limit ?? (defaultLimit > 0 ? defaultLimit : 500);
-    final bool isWithinResultCacheLimit = effectiveLimitForCache <= 500 ||
-        onlyCount ||
-        (aggregations != null && aggregations.isNotEmpty);
 
     QueryCacheKey? resultCacheKey;
     int? resultCacheStartGen;
+    bool isWithinResultCacheLimit = false;
 
-    // =========================================================================
-    // TIER-0: RESULT CACHE (Hot NonPoint Query Result Lookup)
-    // Completely bypasses AST, optimizer, plan execution, and post-processing.
-    // =========================================================================
-    if (canUseResultCache && isWithinResultCacheLimit) {
-      resultCacheKey = QueryCacheKey(
-        tableUid: TableUid(tableUid),
-        condition: condition ?? QueryCondition(),
-        orderBy: orderBy,
-        limit: limit,
-        offset: offset,
-        cursor: cursor,
-        joins: joins,
-        aggregations: aggregations,
-        groupBy: groupBy,
-        onlyCount: onlyCount,
-      );
-      final gen = _getTableQueryGeneration(resultCacheKey.tableUid);
-      resultCacheStartGen = gen;
-      final queryStr = resultCacheKey.toString();
-      final entry =
-          _queryCache.getPoint3(resultCacheKey.tableUid.value, gen, queryStr);
-      if (entry != null) {
-        if (entry.isExpired()) {
-          _queryCache.removePoint3(
-              resultCacheKey.tableUid.value, gen, queryStr);
-        } else {
-          // Instant 0ms memory hit!
-          return ExecuteResult(
-            records: _copyResultList(entry.records),
-            nextCursor: entry.nextCursor,
-            prevCursor: entry.prevCursor,
-            hasMore: entry.hasMore,
-            hasPrev: entry.hasPrev,
-            executionTimeMs: 0,
-            totalRecordCount: entry.totalRecordCount,
-            count: entry.count,
-            aggregateResult: entry.aggregateResult,
-          );
-        }
-      }
-    }
+    if (canUseResultCache) {
+      final int defaultLimit = _dataStore.config.defaultQueryLimit;
+      final int effectiveLimitForCache =
+          limit ?? (defaultLimit > 0 ? defaultLimit : 500);
+      isWithinResultCacheLimit = effectiveLimitForCache <= 500 ||
+          onlyCount ||
+          (aggregations != null && aggregations.isNotEmpty);
 
-    // =========================================================================
-    // TIER-1: POINT FAST PATH (PK & Unique Index)
-    // =========================================================================
-    if (isPkPoint) {
-      final pk = pointRawVal?.toString();
-      if (pk != null && pk.isNotEmpty) {
-        final rec = await _dataStore.tableDataManager.getRecordByPrimaryKey(
-          table,
-          pk,
-          readFromFileOnly: readFromFileOnly,
+      if (isWithinResultCacheLimit) {
+        resultCacheKey = QueryCacheKey(
+          tableUid: TableUid(tableUid),
+          condition: condition ?? QueryCondition(),
+          orderBy: orderBy,
+          limit: limit,
+          offset: offset,
+          cursor: cursor,
+          joins: joins,
+          aggregations: aggregations,
+          groupBy: groupBy,
+          onlyCount: onlyCount,
         );
-        if (rec != null) {
-          final Map<String, dynamic> resultRow;
-          if (promoteDesc != null && applyPromoteResultTransform) {
-            resultRow = Map<String, dynamic>.from(rec);
-            transformPromoteOldToNewInPlace(resultRow, promoteDesc);
+        final gen = _getTableQueryGeneration(resultCacheKey.tableUid);
+        resultCacheStartGen = gen;
+        final queryStr = resultCacheKey.toString();
+        final entry =
+            _queryCache.getPoint3(resultCacheKey.tableUid.value, gen, queryStr);
+        if (entry != null) {
+          if (entry.isExpired()) {
+            _queryCache.removePoint3(
+                resultCacheKey.tableUid.value, gen, queryStr);
           } else {
-            resultRow = rec;
+            return ExecuteResult(
+              records: _copyResultList(entry.records),
+              nextCursor: entry.nextCursor,
+              prevCursor: entry.prevCursor,
+              hasMore: entry.hasMore,
+              hasPrev: entry.hasPrev,
+              executionTimeMs: 0,
+              totalRecordCount: entry.totalRecordCount,
+              count: entry.count,
+              aggregateResult: entry.aggregateResult,
+            );
           }
-          return ExecuteResult(
-            records: [resultRow],
-            count: 1,
-            hasMore: false,
-            hasPrev: false,
-            executionTimeMs: 0,
-          );
-        } else {
-          return const ExecuteResult(
-            records: [],
-            count: 0,
-            hasMore: false,
-            hasPrev: false,
-            executionTimeMs: 0,
-          );
         }
       }
-    }
-
-    if (fastUniqueIndex != null) {
-      final pk = await _indexManager.lookupUniquePrimaryKey(
-        table,
-        fastUniqueIndex.indexUid,
-        pointRawVal,
-        readFromFileOnly: readFromFileOnly,
-      );
-      if (pk != null && pk.isNotEmpty) {
-        final rec = await _dataStore.tableDataManager.getRecordByPrimaryKey(
-          table,
-          pk,
-          readFromFileOnly: readFromFileOnly,
-        );
-        if (rec != null) {
-          final Map<String, dynamic> resultRow;
-          if (promoteDesc != null && applyPromoteResultTransform) {
-            resultRow = Map<String, dynamic>.from(rec);
-            transformPromoteOldToNewInPlace(resultRow, promoteDesc);
-          } else {
-            resultRow = rec;
-          }
-          return ExecuteResult(
-            records: [resultRow],
-            count: 1,
-            hasMore: false,
-            hasPrev: false,
-            executionTimeMs: 0,
-          );
-        }
-      }
-      return const ExecuteResult(
-        records: [],
-        count: 0,
-        hasMore: false,
-        hasPrev: false,
-        executionTimeMs: 0,
-      );
     }
 
     // =========================================================================
@@ -847,13 +874,7 @@ class QueryExecutor {
       }
     }
 
-    // =========================================================================
-    // RESULT CACHE INSERTION (NonPoint queries with <= 500 records)
-    // =========================================================================
-    if (canUseResultCache &&
-        isWithinResultCacheLimit &&
-        resultCacheKey != null &&
-        resultCacheStartGen != null) {
+    if (resultCacheKey != null && resultCacheStartGen != null) {
       final currentGen = _getTableQueryGeneration(resultCacheKey.tableUid);
       // Optimistic generation verification: only cache if the table has NOT mutated
       // during the query execution time window (prevents stale result cache write).
@@ -4276,6 +4297,10 @@ class ExecuteResult {
   final int? count;
   final dynamic aggregateResult;
 
+  /// True when this result represents a direct point lookup (PK / Unique Index)
+  /// that bypassed full table scans, joins, aggregations, and query planners.
+  final bool isPointDirect;
+
   const ExecuteResult({
     required this.records,
     this.nextCursor,
@@ -4286,6 +4311,7 @@ class ExecuteResult {
     this.totalRecordCount,
     this.count,
     this.aggregateResult,
+    this.isPointDirect = false,
   });
 
   const ExecuteResult.empty()
@@ -4297,7 +4323,8 @@ class ExecuteResult {
         executionTimeMs = null,
         totalRecordCount = null,
         count = null,
-        aggregateResult = null;
+        aggregateResult = null,
+        isPointDirect = false;
 }
 
 enum _CursorMode {

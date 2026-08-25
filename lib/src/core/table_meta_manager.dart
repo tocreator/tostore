@@ -164,22 +164,14 @@ class TableMetaManager {
   /// Cached TableContext instances for zero-allocation synchronous lookups.
   final Map<TableUid, TableContext> _tableContextCache =
       <TableUid, TableContext>{};
-  final Map<String, TableContext> _contextByNameCache =
-      <String, TableContext>{};
 
   /// Synchronous zero-allocation TableContext retrieval by table name string.
   TableContext? getTableContextByNameSync(String tableName) {
     if (tableName.isEmpty) return null;
-    final cached = _contextByNameCache[tableName];
-    if (cached != null) return cached;
     final name = TableName(tableName);
     final tableUid = getUidByNameSync(name);
     if (tableUid == null) return null;
-    final ctx = getTableContextSync(tableUid);
-    if (ctx != null) {
-      _contextByNameCache[tableName] = ctx;
-    }
-    return ctx;
+    return getTableContextSync(tableUid);
   }
 
   /// Synchronous memory-only TableContext retrieval.
@@ -310,6 +302,14 @@ class TableMetaManager {
     _tableFieldLayoutCache[meta.tableUid] = meta.fieldLayout;
     _storageFieldStructCache.remove(meta.tableUid);
     _cacheTableSchema(meta.tableUid, meta.schema);
+    final ctx = TableContext(
+      tableUid: meta.tableUid,
+      tableName: meta.tableName,
+      isGlobal: meta.isGlobal,
+      dirIndex: meta.dirIndex,
+      schema: meta.schema,
+    );
+    _tableContextCache[meta.tableUid] = ctx;
     if (meta.tableUid == SystemTable.tableMetaTableUid ||
         meta.tableName.value == SystemTable.tableMetaName) {
       _pinnedMetaTableMeta = meta;
@@ -459,7 +459,6 @@ class TableMetaManager {
     _tableSchemaCache?.remove(tableUid);
     _tableMetaCache?.remove(tableUid);
     _tableContextCache.remove(tableUid);
-    _contextByNameCache.clear();
     _indexListCache.remove(tableUid);
     _tableFieldLayoutCache.remove(tableUid);
     _storageFieldStructCache.remove(tableUid);
@@ -486,6 +485,7 @@ class TableMetaManager {
     if (metaCache != null) {
       await metaCache.cleanup(removeRatio: ratio);
     }
+    _tableContextCache.clear();
   }
 
   /// Wait for the startup name inventory (joins the existing single-flight
@@ -590,6 +590,7 @@ class TableMetaManager {
     _uidByName.remove(meta.tableName);
     _nameByUid.remove(uid);
     _globalTableUids.remove(uid);
+    _tableContextCache.remove(uid);
   }
 
   /// Clear all in-memory caches and reset state.
@@ -602,6 +603,7 @@ class TableMetaManager {
     }
     _tableSchemaCache?.clear();
     _tableMetaCache?.clear();
+    _tableContextCache.clear();
     _indexListCache.clear();
     _tableFieldLayoutCache.clear();
     _storageFieldStructCache.clear();
@@ -625,6 +627,7 @@ class TableMetaManager {
     _cacheEpoch++;
     _tableMetaCache?.clear();
     _tableSchemaCache?.clear();
+    _tableContextCache.clear();
     _uidByName.clear();
     _nameByUid.clear();
     _globalTableUids.clear();
@@ -646,6 +649,7 @@ class TableMetaManager {
     _cacheEpoch++;
     _tableMetaCache?.clear();
     _tableSchemaCache?.clear();
+    _tableContextCache.clear();
     _uidByName.clear();
     _nameByUid.clear();
     _globalTableUids.clear();
