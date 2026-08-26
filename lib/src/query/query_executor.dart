@@ -1330,11 +1330,14 @@ class QueryExecutor {
 
       if (onlyCount) {
         stopwatch.stop();
-        int? totalRecordCount;
-        try {
-          totalRecordCount =
-              await _dataStore.tableDataManager.getTableRecordCount(table);
-        } catch (_) {}
+        int? totalRecordCount =
+            _dataStore.tableDataManager.getTableRecordCountSync(table);
+        if (totalRecordCount == null) {
+          try {
+            totalRecordCount =
+                await _dataStore.tableDataManager.getTableRecordCount(table);
+          } catch (_) {}
+        }
         return ExecuteResult(
           records: const [],
           count: planResult.count ?? 0,
@@ -1538,10 +1541,14 @@ class QueryExecutor {
       // Use getTableRecordCount for accurate, buffer-aware record count (O(1) approach).
       int? totalRecordCount;
       if (!engineInternal) {
-        try {
-          totalRecordCount =
-              await _dataStore.tableDataManager.getTableRecordCount(table);
-        } catch (_) {}
+        totalRecordCount =
+            _dataStore.tableDataManager.getTableRecordCountSync(table);
+        if (totalRecordCount == null) {
+          try {
+            totalRecordCount =
+                await _dataStore.tableDataManager.getTableRecordCount(table);
+          } catch (_) {}
+        }
       }
 
       stopwatch.stop();
@@ -3304,7 +3311,8 @@ class QueryExecutor {
         final parsed = _parseSortField(f);
         f = parsed.field;
         final isDesc = parsed.descending;
-        isPkOrder = (f == primaryKey);
+        final bareField = _normalizeCursorFieldName(f);
+        isPkOrder = (bareField == primaryKey);
         reverse = isPkOrder && isDesc;
       } else {
         isPkOrder = false;

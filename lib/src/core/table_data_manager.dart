@@ -2211,7 +2211,14 @@ class TableDataManager {
   /// Returns table record count if cached in memory, accounting for active transaction overlay.
   /// Returns null if count is not loaded into memory cache yet.
   int? getTableRecordCountSync(TableContext table) {
-    final cached = _tableRecordCounts[table.tableUid];
+    var cached = _tableRecordCounts[table.tableUid];
+    if (cached == null) {
+      final meta = _tableDataMetaCache.get(table.tableUid);
+      if (meta != null) {
+        cached = meta.totalRecordCount;
+        _tableRecordCounts[table.tableUid] = cached;
+      }
+    }
     if (cached == null) return null;
 
     var count = cached;
@@ -4814,6 +4821,14 @@ class TableDataManager {
     final pkMatcher =
         ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
 
+    bool isPkField(String f) {
+      if (f == primaryKey) return true;
+      if (f == '${table.tableName}.$primaryKey') return true;
+      final dot = f.lastIndexOf('.');
+      if (dot != -1 && f.substring(dot + 1) == primaryKey) return true;
+      return false;
+    }
+
     // Row predicate for residual conditions (after overlay). Applied at most
     // once per visible row via acceptRow / PK-point paths.
     bool rowMatches(Map<String, dynamic> r) {
@@ -4824,7 +4839,7 @@ class TableDataManager {
 
     // Decode non-PK columns only when residual filter/matcher needs them.
     final bool needsFullDecode = filter != null ||
-        (matcher != null && matcher.fields.any((f) => f != primaryKey));
+        (matcher != null && matcher.fields.any((f) => !isPkField(f)));
     // needsPostFilter is decided after PK range pushdown (below).
 
     // Parse Sort Order first as it is needed by fast paths
@@ -4846,7 +4861,7 @@ class TableDataManager {
         } else if (f.toUpperCase().endsWith(' ASC')) {
           f = f.substring(0, f.length - 4).trim();
         }
-        if (f == primaryKey) {
+        if (isPkField(f)) {
           isPkOrder = true;
           reverse = isDesc;
         } else {
@@ -5035,7 +5050,6 @@ class TableDataManager {
     /// - {'BETWEEN': {'start': 1, 'end': 9}}
     ///
     /// Returns null when no PK constraint exists.
-
     Map<String, dynamic>? collectPrimaryKeyConditionMap(
         Map<String, dynamic>? node) {
       if (node == null) return null;
@@ -5173,7 +5187,7 @@ class TableDataManager {
     bool matcherFullyCoveredByPkRangePushdown() {
       if (matcher == null) return true;
       if (hasOr) return false;
-      if (matcher.fields.any((f) => f != primaryKey)) return false;
+      if (matcher.fields.any((f) => !isPkField(f))) return false;
       if (pkCond == null || !pkCondIsIndexableRange) return false;
       const coveredOps = {'>', '>=', '<', '<=', 'BETWEEN', 'LIKE'};
       for (final op in pkCond.keys) {

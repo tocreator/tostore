@@ -100,10 +100,7 @@ class QueryCondition {
     copy._isNormalized = _isNormalized;
 
     if (_root != null) {
-      copy._root = ConditionNode(type: _root!.type);
-      for (var child in _root!.children) {
-        copy._root!.children.add(child.clone());
-      }
+      copy._root = _root!.clone();
       if (_current == _root) {
         copy._current = copy._root;
       } else {
@@ -806,6 +803,7 @@ class QueryCondition {
   void normalize(Map<String, TableSchema> schemas, String mainTableName) {
     if (isEmpty || _isNormalized) return;
     _isNormalized = true;
+    _cachedBuiltMap = null;
     if (_conditionCount == 1 && _fastSingleEqField != null && _root == null) {
       final fieldSchema =
           _getFieldSchema(_fastSingleEqField!, schemas, mainTableName);

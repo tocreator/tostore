@@ -87,8 +87,7 @@ class QueryOptimizer {
             ? _dataStore.config.defaultQueryLimit
             : limit;
         final int need = max(1, effOffset + max(1, effLimit));
-
-        final int totalRecordCount = await _estimateTotalRows(table);
+        final int totalRecordCount = _estimateTotalRowsSync(table);
         final fieldSel = _estimateFieldSelectivity(
           schema: schema,
           where: tableWhere,
@@ -639,10 +638,11 @@ class QueryOptimizer {
     return const <String, dynamic>{};
   }
 
-  Future<int> _estimateTotalRows(TableContext table) async {
+  int _estimateTotalRowsSync(TableContext table) {
     try {
-      final n = await _dataStore.tableDataManager.getTableRecordCount(table);
-      return max(1, n);
+      final n = _dataStore.tableDataManager.getTableRecordCountSync(table);
+      if (n != null) return max(1, n);
+      return 1;
     } catch (_) {
       return 1;
     }
