@@ -180,16 +180,23 @@ class TableMetaManager {
     final cached = _tableContextCache[tableUid];
     if (cached != null) return cached;
     final meta = _peekTableMeta(tableUid);
-    if (meta == null) return null;
-    final ctx = TableContext(
-      tableUid: meta.tableUid,
-      tableName: meta.tableName,
-      isGlobal: meta.isGlobal,
-      dirIndex: meta.dirIndex,
-      schema: meta.schema,
-    );
-    _tableContextCache[tableUid] = ctx;
-    return ctx;
+    if (meta != null) {
+      final ctx = TableContext(
+        tableUid: meta.tableUid,
+        tableName: meta.tableName,
+        isGlobal: meta.isGlobal,
+        dirIndex: meta.dirIndex,
+        schema: meta.schema,
+      );
+      _tableContextCache[tableUid] = ctx;
+      return ctx;
+    }
+    // Fixed layout for `_system_table_meta` disk IO. Must not call [getTableMeta]
+    // here: cold meta load queries this table and re-enters via [getTableDataMeta].
+    if (tableUid == SystemTable.tableMetaTableUid) {
+      return bootstrapTableMetaContext();
+    }
+    return null;
   }
 
   /// Memory-only UID->name peek (logs / best-effort display only).

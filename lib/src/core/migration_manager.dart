@@ -966,8 +966,11 @@ class MigrationManager {
           );
         }
         try {
-          final shadowPath =
-              await instance.pathManager.getTablePathByUid(shadowUid);
+          final shadowCtx =
+              await instance.tableMetaManager?.getTableContext(shadowUid);
+          final shadowPath = shadowCtx != null
+              ? instance.pathManager.getTablePathByContext(shadowCtx)
+              : await instance.pathManager.getTablePathByUid(shadowUid);
           if (await instance.storage.existsDirectory(shadowPath)) {
             await instance.storage.deleteDirectory(shadowPath);
           }
@@ -6389,9 +6392,18 @@ class MigrationManager {
     required String space,
     required String taskId,
   }) async {
-    final logicalPath =
-        await instance.pathManager.getTablePathByUid(logicalUid);
-    final shadowPath = await instance.pathManager.getTablePathByUid(shadowUid);
+    // Prefer sync path when TableContext is already warm; fall back to uid
+    // resolve for cold promote swap / crash restart.
+    final logicalCtx =
+        await instance.tableMetaManager?.getTableContext(logicalUid);
+    final shadowCtx =
+        await instance.tableMetaManager?.getTableContext(shadowUid);
+    final logicalPath = logicalCtx != null
+        ? instance.pathManager.getTablePathByContext(logicalCtx)
+        : await instance.pathManager.getTablePathByUid(logicalUid);
+    final shadowPath = shadowCtx != null
+        ? instance.pathManager.getTablePathByContext(shadowCtx)
+        : await instance.pathManager.getTablePathByUid(shadowUid);
 
     final shadowExists = await instance.storage.existsDirectory(shadowPath);
     final logicalExists = await instance.storage.existsDirectory(logicalPath);

@@ -12,6 +12,7 @@ import '../model/parallel_journal_entry.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/table_identity.dart';
+import '../model/table_context.dart';
 import 'btree_page.dart';
 import 'data_store_impl.dart';
 import 'page_redo_log_codec.dart';
@@ -41,10 +42,10 @@ final class TreeMetaPageService {
   // Global meta -- table
   // ---------------------------------------------------------------------------
 
-  Future<TableDataMeta?> readTableGlobalMeta(TableUid tableUid) async {
+  Future<TableDataMeta?> readTableGlobalMeta(TableContext table) async {
     final parsed = await _readPayload(
       partitionPath:
-          await _dataStore.pathManager.getPartitionFilePathByNo(tableUid, 0),
+          _dataStore.pathManager.getPartitionFilePathByContext(table, 0),
       partitionNo: 0,
       pageType: BTreePageType.meta,
     );
@@ -53,12 +54,12 @@ final class TreeMetaPageService {
     if (blob == null || blob.kind != TreeGlobalMetaKind.table) return null;
     return TableDataMetaCodec.decode(
       blob.payload,
-      tableUidFallback: tableUid,
+      tableUidFallback: table.tableUid,
     );
   }
 
   Future<void> persistTableGlobalMeta({
-    required TableUid tableUid,
+    required TableContext table,
     required TableDataMeta meta,
     PartitionLocalStats? partitionLocalOverride,
     BatchContext? batchContext,
@@ -67,8 +68,7 @@ final class TreeMetaPageService {
     bool flush = true,
   }) async {
     final pageSize = _requireConfiguredPageSize();
-    final path =
-        await _dataStore.pathManager.getPartitionFilePathByNo(tableUid, 0);
+    final path = _dataStore.pathManager.getPartitionFilePathByContext(table, 0);
     final local = partitionLocalOverride ??
         (await readPartitionLocal(
           path: path,
@@ -84,7 +84,7 @@ final class TreeMetaPageService {
       TableDataMetaCodec.encode(meta),
     );
     await _writePage0WithRedoBatch(
-      tableUid: tableUid,
+      table: table,
       batchContext: batchContext,
       write: (ctx, {required bool ownedBatch}) => writePartitionPage0(
         path: path,
@@ -95,7 +95,7 @@ final class TreeMetaPageService {
         treeGlobalMeta: globalBlob,
         batchContext: ctx,
         pageRedoTreeKind: PageRedoTreeKind.table,
-        pageRedoTableUid: tableUid,
+        pageRedoTableUid: table.tableUid,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
         flush: flush || ownedBatch,
@@ -108,11 +108,11 @@ final class TreeMetaPageService {
   // ---------------------------------------------------------------------------
 
   Future<IndexMeta?> readIndexGlobalMeta(
-    TableUid tableUid,
+    TableContext table,
     IndexUid indexUid,
   ) async {
-    final path = await _dataStore.pathManager
-        .getIndexPartitionPathByNo(tableUid, indexUid, 0);
+    final path = _dataStore.pathManager
+        .getIndexPartitionPathByContext(table, indexUid, 0);
     final parsed = await _readPayload(
       partitionPath: path,
       partitionNo: 0,
@@ -123,13 +123,13 @@ final class TreeMetaPageService {
     if (blob == null || blob.kind != TreeGlobalMetaKind.indexTree) return null;
     return IndexMetaCodec.decode(
       blob.payload,
-      tableUidFallback: tableUid,
+      tableUidFallback: table.tableUid,
       indexUidFallback: indexUid,
     );
   }
 
   Future<void> persistIndexGlobalMeta({
-    required TableUid tableUid,
+    required TableContext table,
     required IndexUid indexUid,
     required IndexMeta meta,
     PartitionLocalStats? partitionLocalOverride,
@@ -139,8 +139,8 @@ final class TreeMetaPageService {
     bool flush = true,
   }) async {
     final pageSize = _requireConfiguredPageSize();
-    final path = await _dataStore.pathManager
-        .getIndexPartitionPathByNo(tableUid, indexUid, 0);
+    final path = _dataStore.pathManager
+        .getIndexPartitionPathByContext(table, indexUid, 0);
     final local = partitionLocalOverride ??
         (await readPartitionLocal(
           path: path,
@@ -156,7 +156,7 @@ final class TreeMetaPageService {
       IndexMetaCodec.encode(meta),
     );
     await _writePage0WithRedoBatch(
-      tableUid: tableUid,
+      table: table,
       batchContext: batchContext,
       write: (ctx, {required bool ownedBatch}) => writePartitionPage0(
         path: path,
@@ -167,7 +167,7 @@ final class TreeMetaPageService {
         treeGlobalMeta: globalBlob,
         batchContext: ctx,
         pageRedoTreeKind: PageRedoTreeKind.indexTree,
-        pageRedoTableUid: tableUid,
+        pageRedoTableUid: table.tableUid,
         pageRedoIndexUid: indexUid,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
@@ -181,11 +181,11 @@ final class TreeMetaPageService {
   // ---------------------------------------------------------------------------
 
   Future<NghIndexMeta?> readNghGlobalMeta(
-    TableUid tableUid,
+    TableContext table,
     IndexUid indexUid,
   ) async {
-    final path = await _dataStore.pathManager
-        .getNghGraphPartitionPath(tableUid, indexUid, 0);
+    final path = _dataStore.pathManager
+        .getNghGraphPartitionPathByContext(table, indexUid, 0);
     final parsed = await _readPayload(
       partitionPath: path,
       partitionNo: 0,
@@ -196,13 +196,13 @@ final class TreeMetaPageService {
     if (blob == null || blob.kind != TreeGlobalMetaKind.ngh) return null;
     return NghIndexMetaCodec.decode(
       blob.payload,
-      tableUidFallback: tableUid,
+      tableUidFallback: table.tableUid,
       indexUidFallback: indexUid,
     );
   }
 
   Future<void> persistNghGlobalMeta({
-    required TableUid tableUid,
+    required TableContext table,
     required IndexUid indexUid,
     required NghIndexMeta meta,
     PartitionLocalStats? partitionLocalOverride,
@@ -212,8 +212,8 @@ final class TreeMetaPageService {
     bool flush = true,
   }) async {
     final pageSize = _requireConfiguredPageSize();
-    final path = await _dataStore.pathManager
-        .getNghGraphPartitionPath(tableUid, indexUid, 0);
+    final path = _dataStore.pathManager
+        .getNghGraphPartitionPathByContext(table, indexUid, 0);
     final local = partitionLocalOverride ??
         (await readPartitionLocal(
           path: path,
@@ -229,7 +229,7 @@ final class TreeMetaPageService {
       NghIndexMetaCodec.encode(meta),
     );
     await _writePage0WithRedoBatch(
-      tableUid: tableUid,
+      table: table,
       batchContext: batchContext,
       write: (ctx, {required bool ownedBatch}) => writePartitionPage0(
         path: path,
@@ -240,7 +240,7 @@ final class TreeMetaPageService {
         treeGlobalMeta: globalBlob,
         batchContext: ctx,
         pageRedoTreeKind: PageRedoTreeKind.ngh,
-        pageRedoTableUid: tableUid,
+        pageRedoTableUid: table.tableUid,
         pageRedoIndexUid: indexUid,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
@@ -325,18 +325,12 @@ final class TreeMetaPageService {
   /// is registered so `page_redo_$batchId.log` can be found via
   /// `pendingBatches` after a crash.
   Future<void> _writePage0WithRedoBatch({
-    required TableUid tableUid,
+    required TableContext table,
     required BatchContext? batchContext,
     required Future<void> Function(BatchContext? ctx,
             {required bool ownedBatch})
         write,
   }) async {
-    final table = await _dataStore.tableMetaManager?.getTableContext(tableUid);
-    if (table == null) {
-      // Cannot register a pending batch without a table context.
-      await write(batchContext, ownedBatch: false);
-      return;
-    }
     await _dataStore.parallelJournalManager.runWithPageRedoBatch(
       table: table,
       batchContext: batchContext,
@@ -469,8 +463,6 @@ final class TreeMetaPageService {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
   }) async {
-    if (!await _storage.existsFile(partitionPath)) return null;
-
     if (_dataStore.hasConfiguredPageSize) {
       final pageBytes = await _storage.readAsBytesAt(
         partitionPath,

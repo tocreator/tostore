@@ -258,9 +258,9 @@ final class IndexTreePartitionManager {
     return loadedBytes;
   }
 
-  /// Get partition file path using the dirIndex from partition meta.
-  Future<String> _partitionFilePath(TableContext table, IndexUid indexUid,
-      IndexMeta meta, int partitionNo) async {
+  /// Get partition file path using the dirIndex from [TableContext].
+  String _partitionFilePath(
+      TableContext table, IndexUid indexUid, IndexMeta meta, int partitionNo) {
     final count = meta.btreePartitionCount;
     if (partitionNo < 0 || partitionNo >= count) {
       throw DbException([
@@ -271,7 +271,7 @@ final class IndexTreePartitionManager {
       ]);
     }
     return _dataStore.pathManager
-        .getIndexPartitionPathByNo(table.tableUid, indexUid, partitionNo);
+        .getIndexPartitionPathByContext(table, indexUid, partitionNo);
   }
 
   Uint8List _aad(TreePagePtr ptr, BTreePageType type) {
@@ -319,8 +319,7 @@ final class IndexTreePartitionManager {
     if (ptr.partitionNo < 0 || ptr.partitionNo >= count) {
       return LeafPage.empty();
     }
-    final path =
-        await _partitionFilePath(table, indexUid, meta, ptr.partitionNo);
+    final path = _partitionFilePath(table, indexUid, meta, ptr.partitionNo);
     final pageSize = _dataStore.configuredPageSize;
     final raw = await _storage.readAsBytesAt(path, ptr.pageNo * pageSize,
         length: pageSize);
@@ -395,8 +394,7 @@ final class IndexTreePartitionManager {
     if (ptr.partitionNo < 0 || ptr.partitionNo >= count) {
       return InternalPage.empty();
     }
-    final path =
-        await _partitionFilePath(table, indexUid, meta, ptr.partitionNo);
+    final path = _partitionFilePath(table, indexUid, meta, ptr.partitionNo);
     final pageSize = _dataStore.configuredPageSize;
     final raw = await _storage.readAsBytesAt(path, ptr.pageNo * pageSize,
         length: pageSize);
@@ -665,7 +663,7 @@ final class IndexTreePartitionManager {
     Future<void> ensurePartitionHeaderLoaded(int pNo) async {
       final stats = getStats(pNo);
       if (stats.headerLoaded) return;
-      stats.path ??= await _partitionFilePath(table, indexUid, meta, pNo);
+      stats.path ??= _partitionFilePath(table, indexUid, meta, pNo);
       final pageSize = _dataStore.configuredPageSize;
       try {
         final raw0 =
@@ -715,8 +713,7 @@ final class IndexTreePartitionManager {
       _evictCachedPage(tableUid, indexUid, ptr);
       await ensurePartitionHeaderLoaded(ptr.partitionNo);
       final stats = getStats(ptr.partitionNo);
-      stats.path ??=
-          await _partitionFilePath(table, indexUid, meta, ptr.partitionNo);
+      stats.path ??= _partitionFilePath(table, indexUid, meta, ptr.partitionNo);
       if (!stats.dirEnsured) {
         await _storage.ensureDirectoryExists(p.dirname(stats.path!));
         stats.dirEnsured = true;
@@ -739,8 +736,7 @@ final class IndexTreePartitionManager {
       final stats = getStats(partitionNo);
       final head = stats.freeListHeadPageNo;
       if (head < _firstDataPageNo) return null;
-      stats.path ??=
-          await _partitionFilePath(table, indexUid, meta, partitionNo);
+      stats.path ??= _partitionFilePath(table, indexUid, meta, partitionNo);
       final pageSize = _dataStore.configuredPageSize;
       final off = head * pageSize;
       final stagedBytes = peekStaged(stats.path!, off);
@@ -1223,7 +1219,7 @@ final class IndexTreePartitionManager {
           final ptr = pendingPtrs[i];
           final stats = getStats(ptr.partitionNo);
           stats.path ??=
-              await _partitionFilePath(table, indexUid, meta, ptr.partitionNo);
+              _partitionFilePath(table, indexUid, meta, ptr.partitionNo);
           if (!stats.dirEnsured) {
             await _storage.ensureDirectoryExists(p.dirname(stats.path!));
             stats.dirEnsured = true;
@@ -1421,7 +1417,7 @@ final class IndexTreePartitionManager {
       final pNo = entry.key;
       final stats = entry.value;
 
-      stats.path ??= await _partitionFilePath(table, indexUid, meta, pNo);
+      stats.path ??= _partitionFilePath(table, indexUid, meta, pNo);
       if (!stats.dirEnsured) {
         await _storage.ensureDirectoryExists(p.dirname(stats.path!));
         stats.dirEnsured = true;
@@ -1540,8 +1536,7 @@ final class IndexTreePartitionManager {
     // applies when partition 0 is the active (last) partition.
     {
       final p0Stats = getStats(0);
-      p0Stats.path ??=
-          await _partitionFilePath(table, indexUid, updatedMeta, 0);
+      p0Stats.path ??= _partitionFilePath(table, indexUid, updatedMeta, 0);
       if (!p0Stats.dirEnsured) {
         await _storage.ensureDirectoryExists(p.dirname(p0Stats.path!));
         p0Stats.dirEnsured = true;
@@ -1771,7 +1766,7 @@ final class IndexTreePartitionManager {
     Future<void> ensureHeaderLoaded(int pNo) async {
       final s = getStats(pNo);
       if (s.headerLoaded) return;
-      s.path ??= await _partitionFilePath(table, indexUid, meta, pNo);
+      s.path ??= _partitionFilePath(table, indexUid, meta, pNo);
       try {
         final raw0 = await _storage.readAsBytesAt(s.path!, 0,
             length: _dataStore.configuredPageSize);
@@ -1804,8 +1799,7 @@ final class IndexTreePartitionManager {
       _evictCachedPage(table.tableUid, indexUid, pagePtr);
       await ensureHeaderLoaded(pagePtr.partitionNo);
       final s = getStats(pagePtr.partitionNo);
-      s.path ??=
-          await _partitionFilePath(table, indexUid, meta, pagePtr.partitionNo);
+      s.path ??= _partitionFilePath(table, indexUid, meta, pagePtr.partitionNo);
       if (!s.dirEnsured) {
         await _storage.ensureDirectoryExists(p.dirname(s.path!));
         s.dirEnsured = true;
@@ -1948,8 +1942,8 @@ final class IndexTreePartitionManager {
         final nextLeaf = await _readLeaf(table, indexUid, meta, oldRightNext,
             encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
         nextLeaf.prev = ptr;
-        final pth = await _partitionFilePath(
-            table, indexUid, meta, oldRightNext.partitionNo);
+        final pth =
+            _partitionFilePath(table, indexUid, meta, oldRightNext.partitionNo);
         stageWrite(pth, oldRightNext.pageNo * _dataStore.configuredPageSize,
             encodeLeaf(oldRightNext, nextLeaf));
         _publishLeafPage(table.tableUid, indexUid, oldRightNext, nextLeaf);
@@ -1968,7 +1962,7 @@ final class IndexTreePartitionManager {
         newHeight = 0;
         await pushFree(parentFrame.ptr);
       } else {
-        final parentPath = await _partitionFilePath(
+        final parentPath = _partitionFilePath(
             table, indexUid, meta, parentFrame.ptr.partitionNo);
         stageWrite(
             parentPath,
@@ -1978,7 +1972,7 @@ final class IndexTreePartitionManager {
       }
 
       final leftPath =
-          await _partitionFilePath(table, indexUid, meta, ptr.partitionNo);
+          _partitionFilePath(table, indexUid, meta, ptr.partitionNo);
       stageWrite(leftPath, ptr.pageNo * _dataStore.configuredPageSize,
           encodeLeaf(ptr, leaf));
       _publishLeafPage(table.tableUid, indexUid, ptr, leaf);
@@ -1997,7 +1991,7 @@ final class IndexTreePartitionManager {
       for (final e in partitionStats.entries) {
         final pNo = e.key;
         final s = e.value;
-        s.path ??= await _partitionFilePath(table, indexUid, meta, pNo);
+        s.path ??= _partitionFilePath(table, indexUid, meta, pNo);
         if (!s.dirEnsured) {
           await _storage.ensureDirectoryExists(p.dirname(s.path!));
           s.dirEnsured = true;
@@ -2098,7 +2092,10 @@ final class IndexTreePartitionManager {
     final resolvedUid = _effectiveIndexUid(indexUid, meta);
     final firstLeaf = meta.btreeFirstLeaf;
     if (firstLeaf.isNull) return null;
-    var leafPtr = await _locateLeafForKey(
+    var leafPtr = readFromFileOnly
+        ? null
+        : _locateLeafForKeySync(table, resolvedUid, meta, uniqueKey);
+    leafPtr ??= await _locateLeafForKey(
       table,
       resolvedUid,
       meta,

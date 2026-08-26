@@ -388,12 +388,12 @@ class KeyMigrationRunner {
           if (index.indexUid.isEmpty) continue;
           final indexMeta =
               await dataStore.treeMetaPageService.readIndexGlobalMeta(
-            table.tableUid,
+            table,
             index.indexUid,
           );
           if (indexMeta == null) continue;
           await dataStore.treeMetaPageService.persistIndexGlobalMeta(
-            tableUid: table.tableUid,
+            table: table,
             indexUid: index.indexUid,
             meta: indexMeta,
             flush: true,

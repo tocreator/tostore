@@ -700,7 +700,7 @@ class VectorIndexManager {
         bool hadLegacyDisplayFields,
       })?> _readNghMetaFromDisk(TableContext table, IndexUid pathKey) async {
     final meta = await _dataStore.treeMetaPageService.readNghGlobalMeta(
-      table.tableUid,
+      table,
       pathKey,
     );
     if (meta == null) return null;
@@ -750,7 +750,7 @@ class VectorIndexManager {
       TableContext table, IndexUid indexUid, NghIndexMeta meta) async {
     try {
       await _dataStore.treeMetaPageService.persistNghGlobalMeta(
-        tableUid: table.tableUid,
+        table: table,
         indexUid: indexUid,
         meta: meta,
         flush: false,

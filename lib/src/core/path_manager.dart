@@ -1,3 +1,4 @@
+import '../model/table_context.dart';
 import '../model/data_store_config.dart';
 import '../handler/common.dart';
 import '../handler/weight_snapshot_codec.dart';
@@ -77,168 +78,210 @@ class PathManager {
   }
 
   //==================================
-  // table path methods (async methods)
+  // Table / index / NGH paths (sync, TableContext)
   //==================================
 
-  /// get table path by UID
-  Future<String> getTablePathByUid(TableUid tableUid) async {
-    final uid = tableUid;
+  /// Synchronous table path using [TableContext] layout fields (no meta lookup).
+  String getTablePathByContext(TableContext table) {
     if (dataStore.config.persistenceMode == PersistenceMode.memory) {
-      return 'memory://${dataStore.currentSpaceName}/tables/$uid';
+      return 'memory://${dataStore.currentSpaceName}/tables/${table.tableUid}';
     }
 
-    // Bootstrap: `_system_table_meta` path is fixed (global / dir 0). Never call
-    // getTableMeta here -- that would deadlock with cold load of this table.
-    if (uid == SystemTable.tableMetaTableUid) {
-      return pathJoin(
-        pathJoin(_instancePath, 'global'),
-        'tables_${SystemTable.tableMetaDirIndex}',
-        uid.value,
-      );
-    }
+    final parentDir = table.isGlobal
+        ? pathJoin(_instancePath, 'global')
+        : getSpacePath(spaceName: dataStore.currentSpaceName);
 
-    final meta = await dataStore.tableMetaManager?.getTableMeta(tableUid);
-    if (meta == null) {
-      final displayName =
-          (await dataStore.tableMetaManager?.getNameByUid(tableUid))?.value ??
-              tableUid.value;
-      throw DbException([
-        SchemaValidationStatus(
-          type: ResultType.devTableNotFound,
-          message: 'Table meta not found for table: $displayName',
-          tableName: displayName,
-        ),
-      ]);
-    }
-
-    final String parentDir;
-    if (meta.isGlobal) {
-      parentDir = pathJoin(_instancePath, 'global');
-    } else {
-      parentDir = getSpacePath(spaceName: dataStore.currentSpaceName);
-    }
-
-    return pathJoin(parentDir, 'tables_${meta.dirIndex}', uid);
+    return pathJoin(parentDir, 'tables_${table.dirIndex}', table.tableUid);
   }
 
-  /// get table data root directory path
-  Future<String> getDataDirPath(TableUid tableUid) async {
-    final tablePath = await getTablePathByUid(tableUid);
-    return pathJoin(tablePath, 'data');
+  /// Synchronous table data root directory path.
+  String getDataDirPathByContext(TableContext table) {
+    return pathJoin(getTablePathByContext(table), 'data');
   }
 
-  /// get table data btree partitions directory path
-  Future<String> getPartitionsDirPath(TableUid tableUid) async {
-    final dataPath = await getDataDirPath(tableUid);
-    return pathJoin(dataPath, 'btree');
+  /// Synchronous table B+Tree partitions directory path.
+  String getPartitionsDirPathByContext(TableContext table) {
+    return pathJoin(getDataDirPathByContext(table), 'btree');
   }
 
-  /// Get table overflow (TOAST-like) directory path.
-  Future<String> getOverflowDirPath(TableUid tableUid) async {
-    final dataPath = await getDataDirPath(tableUid);
-    return pathJoin(dataPath, 'overflow');
+  /// Synchronous table B+Tree partition directory path by dir shard.
+  String getPartitionDirPathByContext(TableContext table, int dirIndex) {
+    return pathJoin(getPartitionsDirPathByContext(table), 'dir_$dirIndex');
   }
 
-  /// Get overflow partition file path by partitionNo.
-  Future<String> getOverflowPartitionFilePathByNo(
-      TableUid tableUid, int partitionNo) async {
-    final overflowDir = await getOverflowDirPath(tableUid);
+  /// Synchronous table B+Tree partition file path by partitionNo.
+  String getPartitionFilePathByContext(TableContext table, int partitionNo) {
     final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
-    final dirPath = pathJoin(overflowDir, 'dir_$dirIndex');
-    return pathJoin(dirPath, 'p$partitionNo.dat');
+    return pathJoin(
+      getPartitionDirPathByContext(table, dirIndex),
+      'p$partitionNo.dat',
+    );
   }
 
-  /// get table data partition directory path
-  Future<String> getPartitionDirPath(TableUid tableUid, int dirIndex) async {
-    final partitionsPath = await getPartitionsDirPath(tableUid);
-    return pathJoin(partitionsPath, 'dir_$dirIndex');
+  /// Synchronous table overflow (TOAST-like) directory path.
+  String getOverflowDirPathByContext(TableContext table) {
+    return pathJoin(getDataDirPathByContext(table), 'overflow');
   }
 
-  /// Get table B+Tree partition file path by partitionNo (new layout).
-  Future<String> getPartitionFilePathByNo(
-      TableUid tableUid, int partitionNo) async {
-    final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
-    final dirPath = await getPartitionDirPath(tableUid, dirIndex);
-    return pathJoin(dirPath, 'p$partitionNo.dat');
-  }
-
-  /// get table index directory path
-  Future<String> getIndexDirPath(TableUid tableUid) async {
-    final tablePath = await getTablePathByUid(tableUid);
-    return pathJoin(tablePath, 'index');
-  }
-
-  /// get index root directory path
-  Future<String> getIndexPath(TableUid tableUid, IndexUid indexUid) async {
-    final indexDirPath = await getIndexDirPath(tableUid);
-    return pathJoin(indexDirPath, indexUid);
-  }
-
-  /// get index btree partition directory path
-  Future<String> getIndexPartitionDirPath(
-      TableUid tableUid, IndexUid indexUid, int dirIndex) async {
-    final indexPath = await getIndexPath(tableUid, indexUid);
-    return pathJoin(indexPath, 'btree', 'dir_$dirIndex');
-  }
-
-  /// Get index B+Tree partition file path by partitionNo (new layout).
-  Future<String> getIndexPartitionPathByNo(
-      TableUid tableUid, IndexUid indexUid, int partitionNo) async {
+  /// Synchronous overflow partition file path by partitionNo.
+  String getOverflowPartitionFilePathByContext(
+    TableContext table,
+    int partitionNo,
+  ) {
     final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
     final dirPath =
-        await getIndexPartitionDirPath(tableUid, indexUid, dirIndex);
-    return pathJoin(dirPath, 'p$partitionNo.idx');
+        pathJoin(getOverflowDirPathByContext(table), 'dir_$dirIndex');
+    return pathJoin(dirPath, 'p$partitionNo.dat');
   }
 
-  // ==================================
-  // NGH vector index path methods
-  // ==================================
-
-  /// Root path for an NGH vector index.
-  Future<String> getNghIndexPath(TableUid tableUid, IndexUid indexUid) async {
-    final indexPath = await getIndexPath(tableUid, indexUid);
-    return pathJoin(indexPath, 'ngh');
+  /// Synchronous table index root directory path.
+  String getIndexDirPathByContext(TableContext table) {
+    return pathJoin(getTablePathByContext(table), 'index');
   }
 
-  /// NGH PQ codebook file.
-  Future<String> getNghCodebookPath(
-      TableUid tableUid, IndexUid indexUid) async {
-    final nghPath = await getNghIndexPath(tableUid, indexUid);
-    return pathJoin(nghPath, 'codebook.ngh');
+  /// Synchronous index root directory path.
+  String getIndexPathByContext(TableContext table, IndexUid indexUid) {
+    return pathJoin(getIndexDirPathByContext(table), indexUid);
   }
 
-  /// NGH graph partition directory path.
-  Future<String> _nghPartitionDirPath(TableUid tableUid, IndexUid indexUid,
-      String category, int dirIndex) async {
-    final nghPath = await getNghIndexPath(tableUid, indexUid);
-    return pathJoin(nghPath, category, 'dir_$dirIndex');
+  /// Synchronous index B+Tree partition directory path by dir shard.
+  String getIndexPartitionDirPathByContext(
+    TableContext table,
+    IndexUid indexUid,
+    int dirIndex,
+  ) {
+    return pathJoin(
+      getIndexPathByContext(table, indexUid),
+      'btree',
+      'dir_$dirIndex',
+    );
   }
 
-  /// NGH graph partition file path by partitionNo.
-  Future<String> getNghGraphPartitionPath(
-      TableUid tableUid, IndexUid indexUid, int partitionNo) async {
+  /// Synchronous index B+Tree partition file path by partitionNo.
+  String getIndexPartitionPathByContext(
+    TableContext table,
+    IndexUid indexUid,
+    int partitionNo,
+  ) {
     final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
-    final dir =
-        await _nghPartitionDirPath(tableUid, indexUid, 'graph', dirIndex);
-    return pathJoin(dir, 'p$partitionNo.ngh');
+    return pathJoin(
+      getIndexPartitionDirPathByContext(table, indexUid, dirIndex),
+      'p$partitionNo.idx',
+    );
   }
 
-  /// NGH PQ-code partition file path by partitionNo.
-  Future<String> getNghPqCodePartitionPath(
-      TableUid tableUid, IndexUid indexUid, int partitionNo) async {
-    final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
-    final dir =
-        await _nghPartitionDirPath(tableUid, indexUid, 'pqcode', dirIndex);
-    return pathJoin(dir, 'p$partitionNo.ngh');
+  /// Synchronous NGH vector index root path.
+  String getNghIndexPathByContext(TableContext table, IndexUid indexUid) {
+    return pathJoin(getIndexPathByContext(table, indexUid), 'ngh');
   }
 
-  /// NGH raw-vector partition file path by partitionNo.
-  Future<String> getNghRawVectorPartitionPath(
-      TableUid tableUid, IndexUid indexUid, int partitionNo) async {
+  /// Synchronous NGH PQ codebook file path.
+  String getNghCodebookPathByContext(TableContext table, IndexUid indexUid) {
+    return pathJoin(
+      getNghIndexPathByContext(table, indexUid),
+      'codebook.ngh',
+    );
+  }
+
+  String _nghPartitionDirPathByContext(
+    TableContext table,
+    IndexUid indexUid,
+    String category,
+    int dirIndex,
+  ) {
+    return pathJoin(
+      getNghIndexPathByContext(table, indexUid),
+      category,
+      'dir_$dirIndex',
+    );
+  }
+
+  /// Synchronous NGH graph partition file path by partitionNo.
+  String getNghGraphPartitionPathByContext(
+    TableContext table,
+    IndexUid indexUid,
+    int partitionNo,
+  ) {
     final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
-    final dir =
-        await _nghPartitionDirPath(tableUid, indexUid, 'rawvec', dirIndex);
-    return pathJoin(dir, 'p$partitionNo.ngh');
+    return pathJoin(
+      _nghPartitionDirPathByContext(table, indexUid, 'graph', dirIndex),
+      'p$partitionNo.ngh',
+    );
+  }
+
+  /// Synchronous NGH PQ-code partition file path by partitionNo.
+  String getNghPqCodePartitionPathByContext(
+    TableContext table,
+    IndexUid indexUid,
+    int partitionNo,
+  ) {
+    final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
+    return pathJoin(
+      _nghPartitionDirPathByContext(table, indexUid, 'pqcode', dirIndex),
+      'p$partitionNo.ngh',
+    );
+  }
+
+  /// Synchronous NGH raw-vector partition file path by partitionNo.
+  String getNghRawVectorPartitionPathByContext(
+    TableContext table,
+    IndexUid indexUid,
+    int partitionNo,
+  ) {
+    final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
+    return pathJoin(
+      _nghPartitionDirPathByContext(table, indexUid, 'rawvec', dirIndex),
+      'p$partitionNo.ngh',
+    );
+  }
+
+  /// Fixed [TableContext] for `_system_table_meta` (bootstrap; no meta I/O).
+  TableContext systemTableMetaContext() {
+    return TableContext(
+      tableUid: SystemTable.tableMetaTableUid,
+      tableName: TableName(SystemTable.tableMetaName),
+      isGlobal: true,
+      dirIndex: SystemTable.tableMetaDirIndex,
+      schema: SystemTable.tableMetaTable(),
+    );
+  }
+
+  //==================================
+  // Table path by UID (async layout resolve; cold / bootstrap only)
+  //==================================
+
+  /// Resolve persisted layout fields for [tableUid].
+  ///
+  /// Hot paths should pass [TableContext] and use the sync `*ByContext` APIs.
+  Future<TableContext> _resolveTableLayout(TableUid tableUid) async {
+    if (tableUid == SystemTable.tableMetaTableUid) {
+      return systemTableMetaContext();
+    }
+
+    final syncCtx = dataStore.tableMetaManager?.getTableContextSync(tableUid);
+    if (syncCtx != null) return syncCtx;
+
+    final ctx = await dataStore.tableMetaManager?.getTableContext(tableUid);
+    if (ctx != null) return ctx;
+
+    final displayName =
+        (await dataStore.tableMetaManager?.getNameByUid(tableUid))?.value ??
+            tableUid.value;
+    throw DbException([
+      SchemaValidationStatus(
+        type: ResultType.devTableNotFound,
+        message: 'Table meta not found for table: $displayName',
+        tableName: displayName,
+      ),
+    ]);
+  }
+
+  /// Table root path when only [tableUid] is known (resolves layout once).
+  ///
+  /// Prefer [getTablePathByContext] on engine hot paths.
+  Future<String> getTablePathByUid(TableUid tableUid) async {
+    final layout = await _resolveTableLayout(tableUid);
+    return getTablePathByContext(layout);
   }
 
   //==================================

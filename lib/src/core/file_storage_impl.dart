@@ -120,13 +120,17 @@ class FileStorageImpl implements StorageInterface {
       throw DbClosedException('Storage is closed');
     }
     final key = _poolKey(path, mode);
-    final file = File(path);
-    await file.parent.create(recursive: true);
 
     var existing = _handlePool[key];
     if (existing != null) {
       _lru[key] = DateTime.now();
       return existing;
+    }
+
+    final file = File(path);
+    // Read path must not mkdir: missing files return empty bytes upstream.
+    if (mode != FileMode.read) {
+      await file.parent.create(recursive: true);
     }
 
     // Open new handle
@@ -399,7 +403,11 @@ class FileStorageImpl implements StorageInterface {
     try {
       return await _withHandleLock<Uint8List>(key, () async {
         final raf = await _getHandle(path, FileMode.read);
-        final fileSize = await raf.length();
+        int fileSize = _handleLengths[key] ?? -1;
+        if (fileSize < 0) {
+          fileSize = await raf.length();
+          _handleLengths[key] = fileSize;
+        }
         if (start >= fileSize) {
           return Uint8List(0);
         }

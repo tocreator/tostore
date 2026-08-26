@@ -225,18 +225,19 @@ class BenchmarkRunner {
 
     switch (op) {
       case BenchmarkOperation.batchInsert:
+        final batchInsertRounds = <List<Map<String, dynamic>>>[
+          for (var round = 1; round <= iterations; round++)
+            _generateRecords(tier, scale, seedOffset: round * scale),
+        ];
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
               'Running [$tierName] Batch Insert ($round/$iterations)...');
           await db.clear(tableName);
 
-          final records =
-              _generateRecords(tier, scale, seedOffset: round * scale);
-
           final sw = Stopwatch()..start();
           await db.batchInsert(
             tableName,
-            records,
+            batchInsertRounds[round - 1],
             allowPartialErrors: false,
             returnResultDetails: false,
           );
@@ -247,16 +248,19 @@ class BenchmarkRunner {
         break;
 
       case BenchmarkOperation.singleInsert:
-        // Set single-insert test scale up to 10,000 records
+        // Cap single-row insert scale to keep wall-clock reasonable.
         effectiveCount = math.min(scale, 10000);
+        final singleInsertRounds = <List<Map<String, dynamic>>>[
+          for (var round = 1; round <= iterations; round++)
+            _generateRecords(tier, effectiveCount,
+                seedOffset: round * effectiveCount),
+        ];
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
               'Running [$tierName] Single Insert ($round/$iterations)...');
           await db.clear(tableName);
 
-          final records = _generateRecords(tier, effectiveCount,
-              seedOffset: round * effectiveCount);
-
+          final records = singleInsertRounds[round - 1];
           final sw = Stopwatch()..start();
           for (final record in records) {
             await db.insert(tableName, record);
@@ -268,18 +272,24 @@ class BenchmarkRunner {
         break;
 
       case BenchmarkOperation.batchUpdate:
-        await _ensureTablePopulated(tableName, tier, scale);
         effectiveCount = scale;
+        // Pre-generate all rounds before touching the write buffer, then insert
+        // once and update immediately so the pending queue keeps growing.
+        final batchUpdateRounds = <List<Map<String, dynamic>>>[
+          for (var round = 1; round <= iterations; round++)
+            _generateUpdateRecords(tier, scale, round),
+        ];
+        final batchUpdateBase = _generateRecords(tier, scale);
+        await _loadBufferDataset(tableName, batchUpdateBase);
 
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
               'Running [$tierName] Batch Update ($round/$iterations)...');
-          final updateRecords = _generateUpdateRecords(tier, scale, round);
 
           final sw = Stopwatch()..start();
           await db.batchUpdate(
             tableName,
-            updateRecords,
+            batchUpdateRounds[round - 1],
             allowPartialErrors: false,
             returnResultDetails: false,
           );
@@ -290,14 +300,18 @@ class BenchmarkRunner {
         break;
 
       case BenchmarkOperation.singleUpdate:
-        await _ensureTablePopulated(tableName, tier, scale);
         effectiveCount = math.min(scale, 10000);
+        final singleUpdateRounds = <List<Map<String, dynamic>>>[
+          for (var round = 1; round <= iterations; round++)
+            _generateUpdateRecords(tier, effectiveCount, round),
+        ];
+        final singleUpdateBase = _generateRecords(tier, effectiveCount);
+        await _loadBufferDataset(tableName, singleUpdateBase);
 
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
               'Running [$tierName] Single Update ($round/$iterations)...');
-          final updateRecords =
-              _generateUpdateRecords(tier, effectiveCount, round);
+          final updateRecords = singleUpdateRounds[round - 1];
 
           final sw = Stopwatch()..start();
           for (final record in updateRecords) {
@@ -311,19 +325,23 @@ class BenchmarkRunner {
         break;
 
       case BenchmarkOperation.batchUpsert:
-        await _ensureTablePopulated(tableName, tier, scale);
         effectiveCount = scale;
+        // 50% update existing IDs, 50% insert new IDs with explicit PKs
+        final batchUpsertRounds = <List<Map<String, dynamic>>>[
+          for (var round = 1; round <= iterations; round++)
+            _generateUpsertRecords(tier, scale, round),
+        ];
+        final batchUpsertBase = _generateRecords(tier, scale);
+        await _loadBufferDataset(tableName, batchUpsertBase);
 
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
               'Running [$tierName] Batch Upsert ($round/$iterations)...');
-          // 50% update existing IDs, 50% insert new IDs with explicit PKs
-          final upsertRecords = _generateUpsertRecords(tier, scale, round);
 
           final sw = Stopwatch()..start();
           await db.batchUpsert(
             tableName,
-            upsertRecords,
+            batchUpsertRounds[round - 1],
             allowPartialErrors: false,
             returnResultDetails: false,
           );
@@ -335,13 +353,15 @@ class BenchmarkRunner {
 
       case BenchmarkOperation.batchDelete:
         effectiveCount = scale;
+        // Independent buffer-hot rounds: shared base payload, insert then delete
+        // with no idle gap (avoids 1s pending-queue settle → disk delete).
+        final batchDeleteBase = _generateRecords(tier, scale);
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
               'Running [$tierName] Batch Delete ($round/$iterations)...');
-          await _ensureTablePopulated(tableName, tier, scale);
+          await _loadBufferDataset(tableName, batchDeleteBase);
 
           final sw = Stopwatch()..start();
-          // Real batch delete evaluating range condition, key removals, index unregistrations, and write scheduling
           await db
               .delete(tableName)
               .where('id', '<=', scale)
@@ -354,10 +374,11 @@ class BenchmarkRunner {
 
       case BenchmarkOperation.singleDelete:
         effectiveCount = math.min(scale, 10000);
+        final singleDeleteBase = _generateRecords(tier, effectiveCount);
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
               'Running [$tierName] Single Delete ($round/$iterations)...');
-          await _ensureTablePopulated(tableName, tier, scale);
+          await _loadBufferDataset(tableName, singleDeleteBase);
 
           final sw = Stopwatch()..start();
           for (var id = 1; id <= effectiveCount; id++) {
@@ -370,8 +391,8 @@ class BenchmarkRunner {
         break;
 
       case BenchmarkOperation.pointReadHot:
-        // Ensure dataset is populated
-        await _ensureTablePopulated(tableName, tier, scale);
+        // Query phase already flushed once; ensure durable row count for seeks.
+        await _ensureDurableDataset(tableName, tier, scale);
         effectiveCount = scale;
 
         // Pre-warm the single hot primary key into memory cache
@@ -392,8 +413,7 @@ class BenchmarkRunner {
         break;
 
       case BenchmarkOperation.pointReadRandom:
-        // Ensure dataset is populated
-        await _ensureTablePopulated(tableName, tier, scale);
+        await _ensureDurableDataset(tableName, tier, scale);
         effectiveCount = math.min(scale, 10000);
         final random = math.Random(42);
 
@@ -415,7 +435,7 @@ class BenchmarkRunner {
 
       case BenchmarkOperation.indexedSeekHot:
         if (tier != BenchmarkTier.indexed) return null;
-        await _ensureTablePopulated(tableName, tier, scale);
+        await _ensureDurableDataset(tableName, tier, scale);
         effectiveCount = scale;
 
         // Pre-warm unique index hot lookup
@@ -437,7 +457,7 @@ class BenchmarkRunner {
 
       case BenchmarkOperation.indexedSeekRandom:
         if (tier != BenchmarkTier.indexed) return null;
-        await _ensureTablePopulated(tableName, tier, scale);
+        await _ensureDurableDataset(tableName, tier, scale);
         effectiveCount = math.min(scale, 10000);
         final random = math.Random(1337);
 
@@ -458,7 +478,7 @@ class BenchmarkRunner {
         break;
 
       case BenchmarkOperation.rangeScanHot:
-        await _ensureTablePopulated(tableName, tier, scale);
+        await _ensureDurableDataset(tableName, tier, scale);
         effectiveCount = scale;
 
         // Pre-warm the fixed range into memory cache
@@ -497,7 +517,7 @@ class BenchmarkRunner {
         break;
 
       case BenchmarkOperation.rangeScanRandom:
-        await _ensureTablePopulated(tableName, tier, scale);
+        await _ensureDurableDataset(tableName, tier, scale);
         // Standardized query sample count up to 10,000 queries for statistically solid metrics without long stalls
         effectiveCount = math.min(scale, 10000);
         final random = math.Random(777);
@@ -537,7 +557,7 @@ class BenchmarkRunner {
         break;
 
       case BenchmarkOperation.paginationHot:
-        await _ensureTablePopulated(tableName, tier, scale);
+        await _ensureDurableDataset(tableName, tier, scale);
         effectiveCount = scale;
 
         // Pre-warm hot page into memory cache
@@ -558,7 +578,7 @@ class BenchmarkRunner {
         break;
 
       case BenchmarkOperation.paginationRandom:
-        await _ensureTablePopulated(tableName, tier, scale);
+        await _ensureDurableDataset(tableName, tier, scale);
         // Standardized query sample count up to 10,000 queries for statistically solid metrics without long stalls
         effectiveCount = math.min(scale, 10000);
         final random = math.Random(999);
@@ -587,7 +607,7 @@ class BenchmarkRunner {
         break;
 
       case BenchmarkOperation.count:
-        await _ensureTablePopulated(tableName, tier, scale);
+        await _ensureDurableDataset(tableName, tier, scale);
         final countQueries = math.min(scale, 10000);
         effectiveCount = countQueries;
 
@@ -614,22 +634,40 @@ class BenchmarkRunner {
     );
   }
 
-  /// Ensures that the table has at least [scale] records.
-  Future<void> _ensureTablePopulated(
-      String tableName, BenchmarkTier tier, int scale) async {
+  /// Loads [records] into the write buffer only (no flush).
+  ///
+  /// Used by update/upsert/delete setup so timed mutations stay on the
+  /// pending-queue hot path. Callers must pre-build [records] and invoke the
+  /// timed mutation immediately afterward to avoid a >1s idle settle flush.
+  Future<void> _loadBufferDataset(
+    String tableName,
+    List<Map<String, dynamic>> records,
+  ) async {
+    await db.clear(tableName);
+    await db.batchInsert(
+      tableName,
+      records,
+      allowPartialErrors: false,
+      returnResultDetails: false,
+    );
+  }
+
+  /// Ensures the table has at least [scale] rows for query benches.
+  ///
+  /// Repopulates only when short; flushes that refill so reads hit a settled
+  /// disk pipeline. Prefer the suite-level flush before the query phase when
+  /// mutation left enough rows already.
+  Future<void> _ensureDurableDataset(
+    String tableName,
+    BenchmarkTier tier,
+    int scale,
+  ) async {
     final currentCount = await db.query(tableName).count();
-    if (currentCount < scale) {
-      await db.clear(tableName);
-      final records = _generateRecords(tier, scale);
-      await db.batchInsert(
-        tableName,
-        records,
-        allowPartialErrors: false,
-        returnResultDetails: false,
-      );
-      // Ensure all initial data writes are fully flushed to disk before timing operations
-      await db.flush();
-    }
+    if (currentCount >= scale) return;
+
+    final records = _generateRecords(tier, scale);
+    await _loadBufferDataset(tableName, records);
+    await db.flush();
   }
 
   /// Generates synthetic records for insertion.

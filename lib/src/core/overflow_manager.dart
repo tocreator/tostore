@@ -12,7 +12,6 @@ import '../model/value_ref.dart';
 import '../model/table_context.dart';
 import 'btree_page.dart';
 import 'data_store_impl.dart';
-import '../model/table_identity.dart';
 
 /// Out-of-line large value store (TOAST-like), page based.
 ///
@@ -67,7 +66,7 @@ final class OverflowManager {
     int? encryptionKeyId,
     bool flush = true,
   }) async {
-    final path = await _overflowPath(table.tableUid, _defaultPartitionNo);
+    final path = _overflowPath(table, _defaultPartitionNo);
     return _getLock(path).synchronized(() async {
       await _ensureFileInitialized(
         path: path,
@@ -111,7 +110,7 @@ final class OverflowManager {
       ]);
     }
 
-    final path = await _overflowPath(table.tableUid, _defaultPartitionNo);
+    final path = _overflowPath(table, _defaultPartitionNo);
 
     final crc = Crc32.of(valueBytes);
     final maxChunk = _maxChunkLen(
@@ -188,7 +187,7 @@ final class OverflowManager {
   }) async {
     if (ref.kind != ValueRef.kindOverflow) return;
 
-    final path = await _overflowPath(table.tableUid, ref.overflowPartitionNo);
+    final path = _overflowPath(table, ref.overflowPartitionNo);
     if (!await _dataStore.storage.existsFile(path)) return;
 
     await _getLock(path).synchronized(() async {
@@ -289,7 +288,7 @@ final class OverflowManager {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
   }) async {
-    final path = await _overflowPath(table.tableUid, ref.overflowPartitionNo);
+    final path = _overflowPath(table, ref.overflowPartitionNo);
     // Fast path: if file missing, treat as corruption.
     if (!await _dataStore.storage.existsFile(path)) {
       throw DbException([
@@ -370,9 +369,9 @@ final class OverflowManager {
 
   // ---- Internal helpers ----
 
-  Future<String> _overflowPath(TableUid tableUid, int partitionNo) async {
+  String _overflowPath(TableContext table, int partitionNo) {
     return _dataStore.pathManager
-        .getOverflowPartitionFilePathByNo(tableUid, partitionNo);
+        .getOverflowPartitionFilePathByContext(table, partitionNo);
   }
 
   Uint8List _aadForOverflowPage(int partitionNo, int pageNo) {

@@ -166,8 +166,8 @@ final class NghPartitionManager {
     }
 
     // 3. Disk read
-    final path = await _dataStore.pathManager
-        .getNghGraphPartitionPath(tableUid, indexUid, partitionNo);
+    final path = _dataStore.pathManager
+        .getNghGraphPartitionPathByContext(table, indexUid, partitionNo);
     final raw = await _dataStore.storage.readAsBytesAt(
         path, pageNo * _dataStore.configuredPageSize,
         length: _dataStore.configuredPageSize);
@@ -229,8 +229,8 @@ final class NghPartitionManager {
           capacity: meta.vectorsPerPqPage(_dataStore.configuredPageSize));
     }
 
-    final path = await _dataStore.pathManager
-        .getNghPqCodePartitionPath(tableUid, indexUid, partitionNo);
+    final path = _dataStore.pathManager
+        .getNghPqCodePartitionPathByContext(table, indexUid, partitionNo);
     final raw = await _dataStore.storage.readAsBytesAt(
         path, pageNo * _dataStore.configuredPageSize,
         length: _dataStore.configuredPageSize);
@@ -279,8 +279,8 @@ final class NghPartitionManager {
           capacity: meta.vectorsPerRawPage(_dataStore.configuredPageSize));
     }
 
-    final path = await _dataStore.pathManager
-        .getNghRawVectorPartitionPath(tableUid, indexUid, partitionNo);
+    final path = _dataStore.pathManager
+        .getNghRawVectorPartitionPathByContext(table, indexUid, partitionNo);
     final raw = await _dataStore.storage.readAsBytesAt(
         path, pageNo * _dataStore.configuredPageSize,
         length: _dataStore.configuredPageSize);
@@ -492,8 +492,8 @@ final class NghPartitionManager {
       final pageBytes =
           _buildPageBytes(BTreePageType.nghGraph, payload, pageSize, encrypt);
       final stats = getStats(graphStats, ptr.partitionNo);
-      stats.path ??= await _dataStore.pathManager
-          .getNghGraphPartitionPath(tableUid, indexUid, ptr.partitionNo);
+      stats.path ??= _dataStore.pathManager
+          .getNghGraphPartitionPathByContext(table, indexUid, ptr.partitionNo);
       if (!stats.dirEnsured) {
         await _dataStore.storage.ensureDirectoryExists(p.dirname(stats.path!));
         stats.dirEnsured = true;
@@ -516,8 +516,8 @@ final class NghPartitionManager {
       final pageBytes =
           _buildPageBytes(BTreePageType.nghPqCode, payload, pageSize, encrypt);
       final stats = getStats(pqStats, ptr.partitionNo);
-      stats.path ??= await _dataStore.pathManager
-          .getNghPqCodePartitionPath(tableUid, indexUid, ptr.partitionNo);
+      stats.path ??= _dataStore.pathManager
+          .getNghPqCodePartitionPathByContext(table, indexUid, ptr.partitionNo);
       if (!stats.dirEnsured) {
         await _dataStore.storage.ensureDirectoryExists(p.dirname(stats.path!));
         stats.dirEnsured = true;
@@ -539,8 +539,9 @@ final class NghPartitionManager {
       final pageBytes = _buildPageBytes(
           BTreePageType.nghRawVector, payload, pageSize, encrypt);
       final stats = getStats(rawStats, ptr.partitionNo);
-      stats.path ??= await _dataStore.pathManager
-          .getNghRawVectorPartitionPath(tableUid, indexUid, ptr.partitionNo);
+      stats.path ??= _dataStore.pathManager
+          .getNghRawVectorPartitionPathByContext(
+              table, indexUid, ptr.partitionNo);
       if (!stats.dirEnsured) {
         await _dataStore.storage.ensureDirectoryExists(p.dirname(stats.path!));
         stats.dirEnsured = true;
@@ -583,8 +584,8 @@ final class NghPartitionManager {
     // Ensure it is refreshed even when this batch only touched other files.
     if (!graphStats.containsKey(0) && staged.isNotEmpty) {
       final p0Stats = getStats(graphStats, 0);
-      p0Stats.path ??= await _dataStore.pathManager
-          .getNghGraphPartitionPath(tableUid, indexUid, 0);
+      p0Stats.path ??= _dataStore.pathManager
+          .getNghGraphPartitionPathByContext(table, indexUid, 0);
       await _stagePartitionMeta(
         {0: p0Stats},
         pageSize,
@@ -766,8 +767,7 @@ final class NghPartitionManager {
       pageSize: pageSize,
     );
 
-    final path =
-        await _partitionPath(category, table, indexUid, ptr.partitionNo);
+    final path = _partitionPath(category, table, indexUid, ptr.partitionNo);
     stageWrite(path, ptr.pageNo * pageSize, freeBytes);
 
     // Update head pointer
@@ -798,7 +798,7 @@ final class NghPartitionManager {
       final headPageNo = entry.value;
       if (headPageNo < NghIndexMeta.firstDataPageNo) continue;
 
-      final path = await _partitionPath(category, table, indexUid, partitionNo);
+      final path = _partitionPath(category, table, indexUid, partitionNo);
       final pageSize = _dataStore.configuredPageSize;
 
       try {
@@ -856,19 +856,18 @@ final class NghPartitionManager {
   }
 
   /// Resolve the partition file path for a given category and partition number.
-  Future<String> _partitionPath(NghDataCategory category, TableContext table,
-      IndexUid indexUid, int partitionNo) async {
-    final tableUid = table.tableUid;
+  String _partitionPath(NghDataCategory category, TableContext table,
+      IndexUid indexUid, int partitionNo) {
     switch (category) {
       case NghDataCategory.graph:
         return _dataStore.pathManager
-            .getNghGraphPartitionPath(tableUid, indexUid, partitionNo);
+            .getNghGraphPartitionPathByContext(table, indexUid, partitionNo);
       case NghDataCategory.pqCode:
         return _dataStore.pathManager
-            .getNghPqCodePartitionPath(tableUid, indexUid, partitionNo);
+            .getNghPqCodePartitionPathByContext(table, indexUid, partitionNo);
       case NghDataCategory.rawVector:
-        return _dataStore.pathManager
-            .getNghRawVectorPartitionPath(tableUid, indexUid, partitionNo);
+        return _dataStore.pathManager.getNghRawVectorPartitionPathByContext(
+            table, indexUid, partitionNo);
     }
   }
 
@@ -883,11 +882,10 @@ final class NghPartitionManager {
     NghCodebookPage codebook,
     int pageSize,
   ) async {
-    final tableUid = table.tableUid;
     final encCfg = _dataStore.config.encryptionConfig;
     final bool encrypt = encCfg?.shouldEncryptVectorIndex ?? false;
     final path =
-        await _dataStore.pathManager.getNghCodebookPath(tableUid, indexUid);
+        _dataStore.pathManager.getNghCodebookPathByContext(table, indexUid);
     await _dataStore.storage.ensureDirectoryExists(p.dirname(path));
 
     // Check if codebook fits in a single page
@@ -996,9 +994,8 @@ final class NghPartitionManager {
     IndexUid indexUid,
     int pageSize,
   ) async {
-    final tableUid = table.tableUid;
     final path =
-        await _dataStore.pathManager.getNghCodebookPath(tableUid, indexUid);
+        _dataStore.pathManager.getNghCodebookPathByContext(table, indexUid);
     try {
       // Read first page to determine structure
       final firstPageRaw =

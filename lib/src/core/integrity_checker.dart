@@ -10,7 +10,6 @@ import '../model/table_schema.dart';
 import '../model/data_store_config.dart';
 import '../model/meta_info.dart';
 import '../model/table_context.dart';
-import '../model/table_identity.dart';
 
 /// data integrity checker
 class IntegrityChecker {
@@ -125,8 +124,8 @@ class IntegrityChecker {
 
       // Find and check last existing partition
       for (int pNo = fileMeta.btreePartitionCount - 1; pNo >= 0; pNo--) {
-        final path = await _dataStore.pathManager
-            .getPartitionFilePathByNo(table.tableUid, pNo);
+        final path =
+            _dataStore.pathManager.getPartitionFilePathByContext(table, pNo);
         if (await _dataStore.storage.existsFile(path) &&
             await _dataStore.storage.getFileSize(path) > 0) {
           partitionsToCheck.add(pNo);
@@ -136,8 +135,8 @@ class IntegrityChecker {
 
       // Validate sampled partition meta pages
       for (final pNo in partitionsToCheck) {
-        final path = await _dataStore.pathManager
-            .getPartitionFilePathByNo(table.tableUid, pNo);
+        final path =
+            _dataStore.pathManager.getPartitionFilePathByContext(table, pNo);
         if (!await _dataStore.storage.existsFile(path)) {
           if (pNo == 0) {
             Logger.error('First partition file missing (pNo=0)');
@@ -295,17 +294,9 @@ class IntegrityChecker {
 
     final referencedTable = _inferReferencedTable(fieldName);
     try {
-      final referencedSchema = await _dataStore.tableMetaManager
-          ?.getTableSchemaByName(TableName(referencedTable));
-      if (referencedSchema == null) {
-        return false;
-      }
-      final dataPath = await _dataStore.pathManager.getPartitionFilePathByNo(
-        referencedSchema.tableUid.isNotEmpty
-            ? TableUid(referencedSchema.tableUid)
-            : TableUid(referencedTable),
-        0,
-      );
+      final refTable = await _dataStore.getTableContext(referencedTable);
+      final dataPath =
+          _dataStore.pathManager.getPartitionFilePathByContext(refTable, 0);
 
       if (!await _dataStore.storage.existsFile(dataPath)) {
         return false;
@@ -313,7 +304,6 @@ class IntegrityChecker {
 
       // Use efficient point lookup instead of full table scan
       // This avoids traversing billions of records which would be fatal
-      final refTable = await _dataStore.getTableContext(referencedTable);
       final record = await _dataStore.tableDataManager
           .queryRecordsBatch(refTable, [value]);
       return record.records.isNotEmpty;
@@ -515,8 +505,8 @@ class IntegrityChecker {
         final TableDataMeta meta = fileMeta;
         Future<int?> findLastExistingPartitionNo() async {
           for (int pNo = meta.btreePartitionCount - 1; pNo >= 0; pNo--) {
-            final path = await _dataStore.pathManager
-                .getPartitionFilePathByNo(table.tableUid, pNo);
+            final path = _dataStore.pathManager
+                .getPartitionFilePathByContext(table, pNo);
             if (await _dataStore.storage.existsFile(path) &&
                 await _dataStore.storage.getFileSize(path) > 0) {
               return pNo;
@@ -527,8 +517,8 @@ class IntegrityChecker {
         }
 
         Future<bool> validatePartitionMetaPage(int partitionNo) async {
-          final path = await _dataStore.pathManager
-              .getPartitionFilePathByNo(table.tableUid, partitionNo);
+          final path = _dataStore.pathManager
+              .getPartitionFilePathByContext(table, partitionNo);
           if (!await _dataStore.storage.existsFile(path)) {
             // partitionNo=0 should exist if table has committed data.
             return partitionNo != 0;

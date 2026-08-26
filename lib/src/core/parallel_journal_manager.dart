@@ -2559,22 +2559,24 @@ class ParallelJournalManager {
       String path;
       try {
         if (key.kind == PageRedoTreeKind.table) {
-          path = await _dataStore.pathManager
-              .getPartitionFilePathByNo(key.tableUid, key.partitionNo);
+          final tableContext = await _tableContextFromUid(key.tableUid);
+          if (tableContext == null) continue;
+          path = _dataStore.pathManager
+              .getPartitionFilePathByContext(tableContext, key.partitionNo);
         } else if (key.kind == PageRedoTreeKind.ngh) {
           final tableContext = await _tableContextFromUid(key.tableUid);
           if (tableContext == null) continue;
           final indexUid =
               _resolveRedoIndexUid(tableContext.schema, key.indexUid);
-          path = await _dataStore.pathManager.getNghGraphPartitionPath(
-              key.tableUid, indexUid, key.partitionNo);
+          path = _dataStore.pathManager.getNghGraphPartitionPathByContext(
+              tableContext, indexUid, key.partitionNo);
         } else {
           final tableContext = await _tableContextFromUid(key.tableUid);
           if (tableContext == null) continue;
           final indexUid =
               _resolveRedoIndexUid(tableContext.schema, key.indexUid);
-          path = await _dataStore.pathManager.getIndexPartitionPathByNo(
-              key.tableUid, indexUid, key.partitionNo);
+          path = _dataStore.pathManager.getIndexPartitionPathByContext(
+              tableContext, indexUid, key.partitionNo);
         }
       } catch (_) {
         continue;

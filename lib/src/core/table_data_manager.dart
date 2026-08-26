@@ -18,6 +18,7 @@ import '../model/query_aggregation.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/space_stats.dart';
+import '../model/system_table.dart';
 import '../model/table_context.dart';
 import '../model/table_identity.dart';
 import '../model/table_schema.dart';
@@ -2352,11 +2353,31 @@ class TableDataManager {
     );
   }
 
+  /// Layout [TableContext] for reading partition-0 [TableDataMeta].
+  ///
+  /// `_system_table_meta` must use [TableMetaManager.bootstrapTableMetaContext]
+  /// only: calling [TableMetaManager.getTableMeta] / [getTableContext] would
+  /// deadlock with cold system-table meta load (single-flight self-wait).
+  Future<TableContext?> _resolveTableContextForDataMeta(
+      TableUid tableUid) async {
+    final mgr = _dataStore.tableMetaManager;
+    if (mgr == null) return null;
+    if (tableUid == SystemTable.tableMetaTableUid) {
+      return mgr.bootstrapTableMetaContext();
+    }
+    final sync = mgr.getTableContextSync(tableUid);
+    if (sync != null) return sync;
+    return mgr.getTableContext(tableUid);
+  }
+
   /// Internal method to perform the actual file load
   Future<TableDataMeta?> _doLoadTableDataMeta(TableUid tableUid) async {
     try {
+      final table = await _resolveTableContextForDataMeta(tableUid);
+      if (table == null) return null;
+
       final meta =
-          await _dataStore.treeMetaPageService.readTableGlobalMeta(tableUid);
+          await _dataStore.treeMetaPageService.readTableGlobalMeta(table);
       if (meta != null) {
         _tableDataMetaCache.put(tableUid, meta);
         return meta;
@@ -2416,7 +2437,7 @@ class TableDataManager {
 
     try {
       final partitionsDir =
-          await _dataStore.pathManager.getPartitionsDirPath(tableUid);
+          _dataStore.pathManager.getPartitionsDirPathByContext(table);
       await _ensureDirectoryExists(partitionsDir);
 
       _tableDataMetaCache.put(
@@ -2428,7 +2449,7 @@ class TableDataManager {
 
       if (persistToDisk) {
         await _dataStore.treeMetaPageService.persistTableGlobalMeta(
-          tableUid: tableUid,
+          table: table,
           meta: meta,
           batchContext: batchContext,
           flush: flush,
@@ -3182,7 +3203,7 @@ class TableDataManager {
           bool deletedDir = false;
           try {
             final dataPath =
-                await _dataStore.pathManager.getDataDirPath(table.tableUid);
+                _dataStore.pathManager.getDataDirPathByContext(table);
             if (await _dataStore.storage.existsDirectory(dataPath)) {
               await _dataStore.storage.deleteDirectory(dataPath);
               // delete and recreate empty directory, ensure directory structure is complete

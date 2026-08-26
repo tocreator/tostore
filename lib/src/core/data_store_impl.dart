@@ -3778,7 +3778,7 @@ class DataStoreImpl {
           'Deleting table $tableName data in space $_currentSpaceName during migration',
         );
 
-        final tablePath = await _pathManager!.getTablePathByUid(table.tableUid);
+        final tablePath = _pathManager!.getTablePathByContext(table);
         if (await storage.existsDirectory(tablePath)) {
           await storage.deleteDirectory(tablePath);
           Logger.info(
@@ -3843,7 +3843,7 @@ class DataStoreImpl {
           // Get table path
           String? tablePath;
           try {
-            tablePath = await _pathManager!.getTablePathByUid(table.tableUid);
+            tablePath = _pathManager!.getTablePathByContext(table);
           } catch (e) {
             // skip
           }
@@ -7507,8 +7507,7 @@ class DataStoreImpl {
         await tableDataManager.getTableDataMeta(table.tableUid);
     createdAt = tableDataMeta?.timestamps.created;
     if (createdAt == null) {
-      final part0Path =
-          await pathManager.getPartitionFilePathByNo(table.tableUid, 0);
+      final part0Path = pathManager.getPartitionFilePathByContext(table, 0);
       if (await storage.existsFile(part0Path)) {
         createdAt = await storage.getFileCreationTime(part0Path);
       }

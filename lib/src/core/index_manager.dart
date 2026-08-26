@@ -1801,6 +1801,19 @@ class IndexManager {
     }
   }
 
+  /// Layout [TableContext] for index meta page-0 IO (same bootstrap rule as table data).
+  Future<TableContext?> _resolveTableContextForIndexMeta(
+      TableUid tableUid) async {
+    final mgr = _dataStore.tableMetaManager;
+    if (mgr == null) return null;
+    if (tableUid == SystemTable.tableMetaTableUid) {
+      return mgr.bootstrapTableMetaContext();
+    }
+    final sync = mgr.getTableContextSync(tableUid);
+    if (sync != null) return sync;
+    return mgr.getTableContext(tableUid);
+  }
+
   /// Internal method to perform the actual file load
   Future<IndexMeta?> _doLoadIndexMeta(
       TableUid tableUid, IndexUid indexUid) async {
@@ -1808,8 +1821,13 @@ class IndexManager {
       final bool isMemoryMode =
           _dataStore.config.persistenceMode == PersistenceMode.memory;
 
+      final tableContext = await _resolveTableContextForIndexMeta(tableUid);
+      if (tableContext == null) {
+        return null;
+      }
+
       final meta = await _dataStore.treeMetaPageService.readIndexGlobalMeta(
-        tableUid,
+        tableContext,
         indexUid,
       );
       if (meta != null) {
@@ -1825,10 +1843,6 @@ class IndexManager {
       // Synthesize an in-memory IndexMeta from the consolidated index list
       // (includes implicit indexes like TTL / foreign keys).
       try {
-        final tableContext =
-            await _dataStore.tableMetaManager?.getTableContext(tableUid);
-        if (tableContext == null) return null;
-
         final schema = tableContext.schema;
         final allIndexes = <IndexSchema>[
           ...?_dataStore.tableMetaManager?.getAllIndexesFor(schema),
@@ -1920,7 +1934,7 @@ class IndexManager {
     try {
       if (persistToDisk) {
         await _dataStore.treeMetaPageService.persistIndexGlobalMeta(
-          tableUid: tableUid,
+          table: table,
           indexUid: resolvedUid,
           meta: meta,
           batchContext: batchContext,
@@ -1957,8 +1971,7 @@ class IndexManager {
           .removeWhere((key, _) => key.startsWith('${table.tableUid}#'));
       _dataStore.indexTreePartitionManager?.clearPageCacheForTable(table);
 
-      final indexDir =
-          await _dataStore.pathManager.getIndexDirPath(table.tableUid);
+      final indexDir = _dataStore.pathManager.getIndexDirPathByContext(table);
       if (await _dataStore.storage.existsDirectory(indexDir)) {
         await _dataStore.storage.deleteDirectory(indexDir);
       }
@@ -3102,9 +3115,9 @@ class IndexManager {
     }
 
     final stablePath =
-        await _dataStore.pathManager.getIndexPath(table.tableUid, indexUid);
-    final legacyPath = await _dataStore.pathManager
-        .getIndexPath(table.tableUid, IndexUid(legacyLogicalName));
+        _dataStore.pathManager.getIndexPathByContext(table, indexUid);
+    final legacyPath = _dataStore.pathManager
+        .getIndexPathByContext(table, IndexUid(legacyLogicalName));
     if (legacyPath == stablePath) return;
 
     final legacyExists = await _dataStore.storage.existsDirectory(legacyPath);
@@ -3136,9 +3149,9 @@ class IndexManager {
       if (stableUid == legacyUid) continue;
 
       final stablePath =
-          await _dataStore.pathManager.getIndexPath(table.tableUid, stableUid);
+          _dataStore.pathManager.getIndexPathByContext(table, stableUid);
       final legacyPath =
-          await _dataStore.pathManager.getIndexPath(table.tableUid, legacyUid);
+          _dataStore.pathManager.getIndexPathByContext(table, legacyUid);
       if (legacyPath == stablePath) continue;
 
       final legacyExists = await _dataStore.storage.existsDirectory(legacyPath);
@@ -3203,8 +3216,8 @@ class IndexManager {
     _invalidateIndexCache(table, resolved);
 
     try {
-      final indexPath = await _dataStore.pathManager.getIndexPath(
-        table.tableUid,
+      final indexPath = _dataStore.pathManager.getIndexPathByContext(
+        table,
         resolved,
       );
       if (await _dataStore.storage.existsDirectory(indexPath)) {

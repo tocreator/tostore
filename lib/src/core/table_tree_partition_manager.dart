@@ -51,6 +51,21 @@ final class TableTreePartitionManager {
 
   String keyOfPtr(TreePagePtr p) => '${p.partitionNo}:${p.pageNo}';
 
+  /// Fast synchronous inline decode for normal (non-overflow) records.
+  Map<String, dynamic>? _tryDecodeStoredRecordSync(
+    Uint8List storedValue,
+    List<FieldStructure> fieldStruct,
+  ) {
+    final sv = StoredValue.decode(storedValue);
+    if (sv.tag == StoredValue.tagOverflowRef) return null;
+    final bytes = sv.inlineBytes;
+    if (bytes.length >= 2 &&
+        ((bytes[0] << 8) | bytes[1]) == fieldStruct.length) {
+      return BinarySchemaCodec.decodeRecord(bytes, fieldStruct);
+    }
+    return null;
+  }
+
   Future<Map<String, dynamic>?> _decodeStoredRecord({
     required TableContext table,
     required TableDataMeta meta,
@@ -61,6 +76,9 @@ final class TableTreePartitionManager {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
   }) async {
+    final syncDecoded = _tryDecodeStoredRecordSync(storedValue, fieldStruct);
+    if (syncDecoded != null) return syncDecoded;
+
     final tableUid = table.tableUid;
     final sv = StoredValue.decode(storedValue);
     Uint8List bytes;
@@ -442,9 +460,9 @@ final class TableTreePartitionManager {
     );
   }
 
-  /// Get partition file path using the dirIndex from partition meta.
-  Future<String> _partitionFilePath(
-      TableContext table, TableDataMeta meta, int partitionNo) async {
+  /// Get partition file path using the dirIndex from [TableContext].
+  String _partitionFilePath(
+      TableContext table, TableDataMeta meta, int partitionNo) {
     final count = meta.btreePartitionCount;
     if (partitionNo < 0 || partitionNo >= count) {
       throw DbException([
@@ -455,10 +473,10 @@ final class TableTreePartitionManager {
       ]);
     }
     return _dataStore.pathManager
-        .getPartitionFilePathByNo(table.tableUid, partitionNo);
+        .getPartitionFilePathByContext(table, partitionNo);
   }
 
-  Future<TableDataMeta> _rotatePartition(TableDataMeta state) async {
+  TableDataMeta _rotatePartition(TableDataMeta state) {
     final currentCount = state.btreePartitionCount;
     return state.copyWith(
       btreePartitionCount: currentCount + 1,
@@ -506,7 +524,7 @@ final class TableTreePartitionManager {
     if (ptr.partitionNo < 0 || ptr.partitionNo >= count) {
       return LeafPage.empty();
     }
-    final path = await _partitionFilePath(table, meta, ptr.partitionNo);
+    final path = _partitionFilePath(table, meta, ptr.partitionNo);
     final offset = ptr.pageNo * _dataStore.configuredPageSize;
     final raw = await _storage.readAsBytesAt(path, offset,
         length: _dataStore.configuredPageSize);
@@ -589,7 +607,7 @@ final class TableTreePartitionManager {
     if (ptr.partitionNo < 0 || ptr.partitionNo >= count) {
       return InternalPage.empty();
     }
-    final path = await _partitionFilePath(table, meta, ptr.partitionNo);
+    final path = _partitionFilePath(table, meta, ptr.partitionNo);
     final offset = ptr.pageNo * _dataStore.configuredPageSize;
     final raw = await _storage.readAsBytesAt(path, offset,
         length: _dataStore.configuredPageSize);
@@ -904,7 +922,7 @@ final class TableTreePartitionManager {
     Future<void> ensurePartitionHeaderLoaded(int pNo) async {
       final stats = getStats(pNo);
       if (stats.headerLoaded) return;
-      stats.path ??= await _partitionFilePath(table, meta, pNo);
+      stats.path ??= _partitionFilePath(table, meta, pNo);
       final pageSize = _dataStore.configuredPageSize;
       try {
         final raw0 =
@@ -955,7 +973,7 @@ final class TableTreePartitionManager {
       _evictCachedPage(tableUid, ptr);
       await ensurePartitionHeaderLoaded(ptr.partitionNo);
       final stats = getStats(ptr.partitionNo);
-      stats.path ??= await _partitionFilePath(table, meta, ptr.partitionNo);
+      stats.path ??= _partitionFilePath(table, meta, ptr.partitionNo);
       if (!stats.dirEnsured) {
         await _storage.ensureDirectoryExists(p.dirname(stats.path!));
         stats.dirEnsured = true;
@@ -978,7 +996,7 @@ final class TableTreePartitionManager {
       final stats = getStats(partitionNo);
       final head = stats.freeListHeadPageNo;
       if (head < TableDataMeta.firstDataPageNo) return null;
-      stats.path ??= await _partitionFilePath(table, meta, partitionNo);
+      stats.path ??= _partitionFilePath(table, meta, partitionNo);
       final pageSize = _dataStore.configuredPageSize;
       final off = head * pageSize;
       final stagedBytes = peekStaged(stats.path!, off);
@@ -1087,7 +1105,7 @@ final class TableTreePartitionManager {
       final nextPg = meta.btreeNextPageNo;
       if (BTreeAllocator.estimateFileSizeBytes(pageSize, nextPg) >
           _config.maxPartitionFileSize) {
-        meta = await _rotatePartition(meta);
+        meta = _rotatePartition(meta);
       }
       final partitionCount = meta.btreePartitionCount;
       final ptr = TreePagePtr(partitionCount - 1, meta.btreeNextPageNo);
@@ -1403,9 +1421,9 @@ final class TableTreePartitionManager {
                 encryptionKey: encryptionKey,
                 encryptionKeyId: encryptionKeyId,
               );
-              final overflowPath = await _dataStore.pathManager
-                  .getOverflowPartitionFilePathByNo(
-                      tableUid, oldSv.ref!.overflowPartitionNo);
+              final overflowPath = _dataStore.pathManager
+                  .getOverflowPartitionFilePathByContext(
+                      table, oldSv.ref!.overflowPartitionNo);
               dirtyOverflowPaths.add(overflowPath);
             }
           } catch (_) {}
@@ -1423,9 +1441,9 @@ final class TableTreePartitionManager {
             flush: false,
             allocator: overflowAllocator,
           );
-          final overflowPath = await _dataStore.pathManager
-              .getOverflowPartitionFilePathByNo(
-                  tableUid, ref.overflowPartitionNo);
+          final overflowPath = _dataStore.pathManager
+              .getOverflowPartitionFilePathByContext(
+                  table, ref.overflowPartitionNo);
           dirtyOverflowPaths.add(overflowPath);
           stored = StoredValue.overflow(ref).encode();
         } else {
@@ -1587,7 +1605,7 @@ final class TableTreePartitionManager {
           if (y9 != null) await y9;
           final ptr = pendingPtrs[i];
           final stats = getStats(ptr.partitionNo);
-          stats.path ??= await _partitionFilePath(table, meta, ptr.partitionNo);
+          stats.path ??= _partitionFilePath(table, meta, ptr.partitionNo);
           if (!stats.dirEnsured) {
             await _storage.ensureDirectoryExists(p.dirname(stats.path!));
             stats.dirEnsured = true;
@@ -1769,7 +1787,7 @@ final class TableTreePartitionManager {
       final pNo = entry.key;
       final stats = entry.value;
 
-      stats.path ??= await _partitionFilePath(table, meta, pNo);
+      stats.path ??= _partitionFilePath(table, meta, pNo);
       if (!stats.dirEnsured) {
         await _storage.ensureDirectoryExists(p.dirname(stats.path!));
         stats.dirEnsured = true;
@@ -1884,7 +1902,7 @@ final class TableTreePartitionManager {
     // applies when partition 0 is the active (last) partition.
     {
       final p0Stats = getStats(0);
-      p0Stats.path ??= await _partitionFilePath(table, updatedMeta, 0);
+      p0Stats.path ??= _partitionFilePath(table, updatedMeta, 0);
       if (!p0Stats.dirEnsured) {
         await _storage.ensureDirectoryExists(p.dirname(p0Stats.path!));
         p0Stats.dirEnsured = true;
@@ -2090,7 +2108,7 @@ final class TableTreePartitionManager {
     Future<void> ensureHeaderLoaded(int pNo) async {
       final s = getStats(pNo);
       if (s.headerLoaded) return;
-      s.path ??= await _partitionFilePath(table, meta, pNo);
+      s.path ??= _partitionFilePath(table, meta, pNo);
       try {
         final raw0 = await _storage.readAsBytesAt(s.path!, 0,
             length: _dataStore.configuredPageSize);
@@ -2123,7 +2141,7 @@ final class TableTreePartitionManager {
       _evictCachedPage(table.tableUid, pagePtr);
       await ensureHeaderLoaded(pagePtr.partitionNo);
       final s = getStats(pagePtr.partitionNo);
-      s.path ??= await _partitionFilePath(table, meta, pagePtr.partitionNo);
+      s.path ??= _partitionFilePath(table, meta, pagePtr.partitionNo);
       if (!s.dirEnsured) {
         await _storage.ensureDirectoryExists(p.dirname(s.path!));
         s.dirEnsured = true;
@@ -2269,7 +2287,7 @@ final class TableTreePartitionManager {
             encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
         nextLeaf.prev = ptr;
         final nextPath =
-            await _partitionFilePath(table, meta, oldRightNext.partitionNo);
+            _partitionFilePath(table, meta, oldRightNext.partitionNo);
         stageWrite(
             nextPath,
             oldRightNext.pageNo * _dataStore.configuredPageSize,
@@ -2293,7 +2311,7 @@ final class TableTreePartitionManager {
         await pushFree(parentFrame.ptr);
       } else {
         final parentPath =
-            await _partitionFilePath(table, meta, parentFrame.ptr.partitionNo);
+            _partitionFilePath(table, meta, parentFrame.ptr.partitionNo);
         stageWrite(
             parentPath,
             parentFrame.ptr.pageNo * _dataStore.configuredPageSize,
@@ -2302,7 +2320,7 @@ final class TableTreePartitionManager {
       }
 
       // Persist leaf page and mark right as free.
-      final leftPath = await _partitionFilePath(table, meta, ptr.partitionNo);
+      final leftPath = _partitionFilePath(table, meta, ptr.partitionNo);
       stageWrite(leftPath, ptr.pageNo * _dataStore.configuredPageSize,
           encodeLeaf(ptr, leaf));
       _publishLeafPage(table.tableUid, ptr, leaf);
@@ -2323,7 +2341,7 @@ final class TableTreePartitionManager {
       for (final e in partitionStats.entries) {
         final pNo = e.key;
         final s = e.value;
-        s.path ??= await _partitionFilePath(table, meta, pNo);
+        s.path ??= _partitionFilePath(table, meta, pNo);
         if (!s.dirEnsured) {
           await _storage.ensureDirectoryExists(p.dirname(s.path!));
           s.dirEnsured = true;
@@ -2494,17 +2512,10 @@ final class TableTreePartitionManager {
         final pos = leaf.find(keyBytes);
         if (pos == null) continue;
 
-        // Fast pure synchronous inline decoding (0 await, 0 Future allocation for normal inline records)
+        // Fast pure synchronous inline decoding (0 await for normal inline records)
         final rawStored = leaf.values[pos];
-        final sv = StoredValue.decode(rawStored);
-        Map<String, dynamic>? decoded;
-        if (sv.tag != StoredValue.tagOverflowRef) {
-          final bytes = sv.inlineBytes;
-          if (bytes.length >= 2 &&
-              ((bytes[0] << 8) | bytes[1]) == fieldStruct.length) {
-            decoded = BinarySchemaCodec.decodeRecord(bytes, fieldStruct);
-          }
-        }
+        Map<String, dynamic>? decoded =
+            _tryDecodeStoredRecordSync(rawStored, fieldStruct);
         decoded ??= await _decodeStoredRecord(
           table: table,
           meta: meta,
@@ -2655,7 +2666,7 @@ final class TableTreePartitionManager {
     if (partitionNo < 0 || partitionNo >= meta.btreePartitionCount) {
       return 0;
     }
-    final path = await _partitionFilePath(table, meta, partitionNo);
+    final path = _partitionFilePath(table, meta, partitionNo);
     if (!await _storage.existsFile(path)) return 0;
     return _storage.getFileSize(path);
   }
@@ -2691,7 +2702,7 @@ final class TableTreePartitionManager {
       return (records: const <Map<String, dynamic>>[], reachedEnd: true);
     }
 
-    final path = await _partitionFilePath(table, meta, partitionNo);
+    final path = _partitionFilePath(table, meta, partitionNo);
 
     final fieldStruct = await _resolveStorageFieldStructure(
       table: table,
@@ -2766,7 +2777,11 @@ final class TableTreePartitionManager {
 
       if (leaf.keys.isEmpty) continue;
       for (int i = 0; i < leaf.keys.length; i++) {
-        final decoded = await _decodeStoredRecord(
+        var decoded = _tryDecodeStoredRecordSync(
+          leaf.values[i],
+          fieldStruct,
+        );
+        decoded ??= await _decodeStoredRecord(
           table: table,
           meta: meta,
           storedValue: leaf.values[i],
@@ -2808,7 +2823,7 @@ final class TableTreePartitionManager {
     if (partitionNo < 0 || partitionNo >= meta.btreePartitionCount) {
       return;
     }
-    final path = await _partitionFilePath(table, meta, partitionNo);
+    final path = _partitionFilePath(table, meta, partitionNo);
     if (!await _storage.existsFile(path)) return;
     final size = await _storage.getFileSize(path);
     final snapshotPageCount = (size + _dataStore.configuredPageSize - 1) ~/
@@ -2895,7 +2910,7 @@ final class TableTreePartitionManager {
       return const <Map<String, dynamic>>[];
     }
 
-    final path = await _partitionFilePath(table, meta, partitionNo);
+    final path = _partitionFilePath(table, meta, partitionNo);
     if (!await _storage.existsFile(path)) return const <Map<String, dynamic>>[];
     final size = await _storage.getFileSize(path);
     if (size <= _dataStore.configuredPageSize) {
@@ -2928,7 +2943,11 @@ final class TableTreePartitionManager {
       );
       if (leaf.keys.isEmpty) continue;
       for (int i = 0; i < leaf.keys.length; i++) {
-        final decoded = await _decodeStoredRecord(
+        var decoded = _tryDecodeStoredRecordSync(
+          leaf.values[i],
+          fieldStruct,
+        );
+        decoded ??= await _decodeStoredRecord(
           table: table,
           meta: meta,
           storedValue: leaf.values[i],
@@ -3098,7 +3117,11 @@ final class TableTreePartitionManager {
               MemComparableKey.compare(k, endKeyExclusive) >= 0) {
             return;
           }
-          final decoded = await _decodeStoredRecord(
+          var decoded = _tryDecodeStoredRecordSync(
+            leaf.values[i],
+            fieldStruct,
+          );
+          decoded ??= await _decodeStoredRecord(
             table: table,
             meta: meta,
             storedValue: leaf.values[i],
@@ -3142,7 +3165,11 @@ final class TableTreePartitionManager {
               MemComparableKey.compare(k, endKeyExclusive) >= 0) {
             continue;
           }
-          final decoded = await _decodeStoredRecord(
+          var decoded = _tryDecodeStoredRecordSync(
+            leaf.values[i],
+            fieldStruct,
+          );
+          decoded ??= await _decodeStoredRecord(
             table: table,
             meta: meta,
             storedValue: leaf.values[i],
@@ -3341,7 +3368,11 @@ final class TableTreePartitionManager {
           final pk = MemComparableKey.decodeLastText(k);
           Map<String, dynamic> row;
           if (decodeRecord) {
-            final decoded = await _decodeStoredRecord(
+            var decoded = _tryDecodeStoredRecordSync(
+              leaf.values[i],
+              fieldStruct,
+            );
+            decoded ??= await _decodeStoredRecord(
               table: table,
               meta: meta,
               storedValue: leaf.values[i],
@@ -3391,7 +3422,11 @@ final class TableTreePartitionManager {
           final pk = MemComparableKey.decodeLastText(k);
           Map<String, dynamic> row;
           if (decodeRecord) {
-            final decoded = await _decodeStoredRecord(
+            var decoded = _tryDecodeStoredRecordSync(
+              leaf.values[i],
+              fieldStruct,
+            );
+            decoded ??= await _decodeStoredRecord(
               table: table,
               meta: meta,
               storedValue: leaf.values[i],

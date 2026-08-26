@@ -323,12 +323,12 @@ class V2Upgrade {
       );
 
       // Clear post-V3 btree stubs only (`data/btree`), never legacy `data/partitions`.
-      final newRangesPath = await db.pathManager.getPartitionsDirPath(tableUid);
+      final newRangesPath = db.pathManager.getPartitionsDirPathByContext(table);
       if (await db.storage.existsDirectory(newRangesPath)) {
         await db.storage.deleteDirectory(newRangesPath);
       }
 
-      final indexRootPath = await db.pathManager.getIndexDirPath(tableUid);
+      final indexRootPath = db.pathManager.getIndexDirPathByContext(table);
       if (await db.storage.existsDirectory(indexRootPath)) {
         await db.storage.deleteDirectory(indexRootPath);
       }
