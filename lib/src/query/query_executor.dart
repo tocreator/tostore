@@ -16,7 +16,6 @@ import '../handler/memcomparable.dart';
 import '../handler/parallel_processor.dart';
 import '../handler/topk_heap.dart';
 import '../handler/value_matcher.dart';
-import '../model/buffer_entry.dart';
 import '../model/cancellation_token.dart';
 import '../model/db_exception.dart';
 import '../model/index_search.dart';
@@ -481,6 +480,10 @@ class QueryExecutor {
     /// the physical old table and must not transform. User-facing entry points
     /// ([QueryBuilder], [DataStoreImpl.executeUserQuery]) pass true explicitly.
     bool applyPromoteResultTransform = false,
+
+    /// Engine-internal mutation path (delete/update/ttl): skip user-facing
+    /// post-processing (schema normalize, totalRecordCount, cursor pagination).
+    bool engineInternal = false,
   }) async {
     final schemaMgr = _dataStore.tableMetaManager;
     if (schemaMgr == null) {
@@ -857,6 +860,7 @@ class QueryExecutor {
       aggregations: aggregations,
       groupBy: effectiveGroupBy,
       readFromFileOnly: readFromFileOnly,
+      engineInternal: engineInternal,
     );
 
     if (promoteDesc != null &&
@@ -1066,6 +1070,7 @@ class QueryExecutor {
     bool readFromFileOnly = false,
     TableSchema? decodeSchema,
     List<FieldStructure>? decodeFieldStructureOverride,
+    bool engineInternal = false,
   }) async {
     final tableName = table.tableName;
     try {
@@ -1074,7 +1079,7 @@ class QueryExecutor {
       final bool hasToken = cursor != null && cursor.trim().isNotEmpty;
       final bool isCursorIntent = hasToken || (offset == null || offset <= 0);
 
-      bool useCursor = isCursorIntent;
+      bool useCursor = engineInternal ? false : isCursorIntent;
 
       if (useCursor && offset != null && offset > 0) {
         throw DbException([
@@ -1183,8 +1188,10 @@ class QueryExecutor {
       // Fetch one extra record to detect whether there are more results.
       // This is valuable even when cursor pagination is not supported, so the caller
       // can still know if there is another page beyond [limit].
-      final int? fetchLimit =
-          effectiveLimit != null ? effectiveLimit + 1 : null;
+      // Engine-internal callers (delete/update) never need pagination probes.
+      final int? fetchLimit = engineInternal
+          ? effectiveLimit
+          : (effectiveLimit != null ? effectiveLimit + 1 : null);
 
       final stopwatch = Stopwatch()..start();
       final schema = schemas[tableName]!;
@@ -1345,7 +1352,7 @@ class QueryExecutor {
         );
       }
 
-      List<Map<String, dynamic>> results = planResult.records.toList();
+      var results = planResult.records;
 
       // Manual Offset skip if not applied at lower level (e.g. table scans with matcher)
       if (effectiveOffset > 0) {
@@ -1392,8 +1399,18 @@ class QueryExecutor {
       }
 
       // Final sort: single place after offset/joins, before limit truncation.
-      final bool needPostSort =
-          effectiveOrderBy.isNotEmpty && results.length > 1;
+      // Skip when the storage scan already returned rows in [effectiveOrderBy]
+      // order. Re-sorting large PK-ordered pages was the delete-path regression
+      final bool needPostSort = effectiveOrderBy.isNotEmpty &&
+          results.length > 1 &&
+          ((joins != null && joins.isNotEmpty) ||
+              !_storageScanAlreadyOrdered(
+                plan: plan,
+                schema: schema,
+                effectiveOrderBy: effectiveOrderBy,
+                fetchLimit: fetchLimit,
+                where: where,
+              ));
 
       if (needPostSort) {
         // For index cursor mode, validate orderBy matches index key order.
@@ -1414,7 +1431,7 @@ class QueryExecutor {
       if (effectiveLimit != null) {
         final int targetLimit = effectiveLimit + 1;
         if (results.length > targetLimit) {
-          results = results.take(targetLimit).toList();
+          results.removeRange(targetLimit, results.length);
         }
 
         // If we reached the default limit and have extra records, warn the user about truncation.
@@ -1501,11 +1518,13 @@ class QueryExecutor {
         }
       }
 
-      // Single-table query tail normalization:
+      // Single-table query tail normalization (user-facing API only):
       // - remove internal/deleted-slot payload fields
       // - fill missing schema fields with defaults
       // - enforce user-defined schema field order
-      if ((joins == null || joins.isEmpty) && results.isNotEmpty) {
+      if (!engineInternal &&
+          (joins == null || joins.isEmpty) &&
+          results.isNotEmpty) {
         final schemaMgr = _dataStore.tableMetaManager;
         if (schemaMgr != null) {
           results = List<Map<String, dynamic>>.generate(
@@ -1518,10 +1537,12 @@ class QueryExecutor {
 
       // Use getTableRecordCount for accurate, buffer-aware record count (O(1) approach).
       int? totalRecordCount;
-      try {
-        totalRecordCount =
-            await _dataStore.tableDataManager.getTableRecordCount(table);
-      } catch (_) {}
+      if (!engineInternal) {
+        try {
+          totalRecordCount =
+              await _dataStore.tableDataManager.getTableRecordCount(table);
+        } catch (_) {}
+      }
 
       stopwatch.stop();
 
@@ -2746,6 +2767,15 @@ class QueryExecutor {
               }
             }
           } else {
+            final idxFields = indexSchema?.fields;
+            final bool isCoveredByIndexScan = matcher == null ||
+                (idxFields != null &&
+                    matcher.fields.isNotEmpty &&
+                    matcher.fields.every((f) =>
+                        idxFields.contains(f) || f == tblSchema.primaryKey) &&
+                    (matcherCondition == null ||
+                        !matcherCondition.containsKey('OR')));
+
             final records = pks.isEmpty
                 ? const <Map<String, dynamic>>[]
                 : (await _dataStore.tableDataManager.queryRecordsBatch(
@@ -2765,57 +2795,20 @@ class QueryExecutor {
             }
 
             if (pks.isNotEmpty) {
-              final candidateRecords = <Map<String, dynamic>>[];
-              for (final pk in pks) {
-                // Early break when target count reached
-                if (onlyCount && targetNeed > 0 && outCount >= targetNeed) {
-                  break;
-                }
-                if (!(onlyCount ||
-                        (aggregations != null && aggregations.isNotEmpty)) &&
-                    out.length >= targetNeed) {
-                  break;
-                }
-                final rec = recordByPk[pk];
-                if (rec == null) {
-                  continue;
-                }
-
-                // Hide pending deletes; queryRecordsBatch already resolved
-                // pending/txn inserts and overlays.
-                final be = _dataStore.writeBufferManager
-                    .getBufferedRecordForRead(table, pk);
-                if (be != null && be.operation == BufferOperationType.delete) {
-                  continue;
-                }
-                candidateRecords.add(rec);
-              }
-
-              final idxFields = indexSchema?.fields;
-              final bool isCoveredByIndexScan = matcher == null ||
-                  (idxFields != null &&
-                      matcher.fields.isNotEmpty &&
-                      matcher.fields.every((f) =>
-                          idxFields.contains(f) || f == tblSchema.primaryKey) &&
-                      (matcherCondition == null ||
-                          !matcherCondition.containsKey('OR')));
-
-              final matchedCandidateIndices = isCoveredByIndexScan
-                  ? null
-                  : await _matchRecordIndicesIfNeeded(
-                      schema: tblSchema,
-                      table: table,
-                      matcherCondition: matcherCondition,
-                      records: candidateRecords,
-                    );
-
-              if (matchedCandidateIndices != null) {
-                final matchedCandidateYieldController = YieldController(
-                    'QueryExecutor._performIndexScan.candidates');
-                for (final matchedIndex in matchedCandidateIndices) {
-                  final y18 = matchedCandidateYieldController.maybeYield();
-                  if (y18 != null) await y18;
-                  final rec = candidateRecords[matchedIndex];
+              if (isCoveredByIndexScan) {
+                for (final pk in pks) {
+                  if (onlyCount && targetNeed > 0 && outCount >= targetNeed) {
+                    break;
+                  }
+                  if (!(onlyCount ||
+                          (aggregations != null && aggregations.isNotEmpty)) &&
+                      out.length >= targetNeed) {
+                    break;
+                  }
+                  final rec = recordByPk[pk];
+                  if (rec == null) {
+                    continue;
+                  }
                   if (filter != null && !filter(rec)) {
                     continue;
                   }
@@ -2834,21 +2827,72 @@ class QueryExecutor {
                   }
                 }
               } else {
-                for (final rec in candidateRecords) {
-                  if (filter != null && !filter(rec)) {
+                final candidateRecords = <Map<String, dynamic>>[];
+                for (final pk in pks) {
+                  if (onlyCount && targetNeed > 0 && outCount >= targetNeed) {
+                    break;
+                  }
+                  if (!(onlyCount ||
+                          (aggregations != null && aggregations.isNotEmpty)) &&
+                      out.length >= targetNeed) {
+                    break;
+                  }
+                  final rec = recordByPk[pk];
+                  if (rec == null) {
                     continue;
                   }
-                  if (onlyCount) {
-                    outCount++;
-                    if (targetNeed > 0 && outCount >= targetNeed) {
-                      break;
+                  candidateRecords.add(rec);
+                }
+
+                final matchedCandidateIndices =
+                    await _matchRecordIndicesIfNeeded(
+                  schema: tblSchema,
+                  table: table,
+                  matcherCondition: matcherCondition,
+                  records: candidateRecords,
+                );
+
+                if (matchedCandidateIndices != null) {
+                  final matchedCandidateYieldController = YieldController(
+                      'QueryExecutor._performIndexScan.candidates');
+                  for (final matchedIndex in matchedCandidateIndices) {
+                    final y18 = matchedCandidateYieldController.maybeYield();
+                    if (y18 != null) await y18;
+                    final rec = candidateRecords[matchedIndex];
+                    if (filter != null && !filter(rec)) {
+                      continue;
                     }
-                  } else if (aggregator != null) {
-                    aggregator.accumulate(rec);
-                  } else {
-                    out.add(rec);
-                    if (out.length >= targetNeed) {
-                      break;
+                    if (onlyCount) {
+                      outCount++;
+                      if (targetNeed > 0 && outCount >= targetNeed) {
+                        break;
+                      }
+                    } else if (aggregator != null) {
+                      aggregator.accumulate(rec);
+                    } else {
+                      out.add(rec);
+                      if (out.length >= targetNeed) {
+                        break;
+                      }
+                    }
+                  }
+                } else {
+                  for (final rec in candidateRecords) {
+                    if (filter != null && !filter(rec)) {
+                      continue;
+                    }
+                    if (onlyCount) {
+                      outCount++;
+                      if (targetNeed > 0 && outCount >= targetNeed) {
+                        break;
+                      }
+                    } else if (aggregator != null) {
+                      aggregator.accumulate(rec);
+                    } else {
+                      out.add(rec);
+                      if (out.length >= targetNeed) {
+                        break;
+                      }
                     }
                   }
                 }
@@ -3015,6 +3059,15 @@ class QueryExecutor {
         final lastKey = indexResults.lastKey;
         if ((pks.isEmpty) && (lastKey == null)) break;
 
+        final idxFields = indexSchema?.fields;
+        final bool isCoveredByIndexScan = matcher == null ||
+            (idxFields != null &&
+                matcher.fields.isNotEmpty &&
+                matcher.fields.every((f) =>
+                    idxFields.contains(f) || f == tblSchema.primaryKey) &&
+                (matcherCondition == null ||
+                    !matcherCondition.containsKey('OR')));
+
         final records = pks.isEmpty
             ? const <Map<String, dynamic>>[]
             : (await _dataStore.tableDataManager.queryRecordsBatch(
@@ -3035,44 +3088,10 @@ class QueryExecutor {
         }
 
         if (pks.isNotEmpty) {
-          final candidateRecords = <Map<String, dynamic>>[];
-          for (final pk in pks) {
-            final rec = recordByPk[pk];
-            if (rec == null) continue;
-
-            final be = _dataStore.writeBufferManager
-                .getBufferedRecordForRead(table, pk);
-            if (be != null && be.operation == BufferOperationType.delete) {
-              continue;
-            }
-            candidateRecords.add(rec);
-          }
-
-          final idxFields = indexSchema?.fields;
-          final bool isCoveredByIndexScan = matcher == null ||
-              (idxFields != null &&
-                  matcher.fields.isNotEmpty &&
-                  matcher.fields.every((f) =>
-                      idxFields.contains(f) || f == tblSchema.primaryKey) &&
-                  (matcherCondition == null ||
-                      !matcherCondition.containsKey('OR')));
-
-          final matchedCandidateIndices = isCoveredByIndexScan
-              ? null
-              : await _matchRecordIndicesIfNeeded(
-                  schema: tblSchema,
-                  table: table,
-                  matcherCondition: matcherCondition,
-                  records: candidateRecords,
-                );
-
-          if (matchedCandidateIndices != null) {
-            final matchedCandidateYieldController = YieldController(
-                'QueryExecutor._performIndexScan.topKCandidates');
-            for (final matchedIndex in matchedCandidateIndices) {
-              final y20 = matchedCandidateYieldController.maybeYield();
-              if (y20 != null) await y20;
-              final rec = candidateRecords[matchedIndex];
+          if (isCoveredByIndexScan) {
+            for (final pk in pks) {
+              final rec = recordByPk[pk];
+              if (rec == null) continue;
               if (filter != null && !filter(rec)) {
                 continue;
               }
@@ -3083,14 +3102,46 @@ class QueryExecutor {
               }
             }
           } else {
-            for (final rec in candidateRecords) {
-              if (filter != null && !filter(rec)) {
-                continue;
+            final candidateRecords = <Map<String, dynamic>>[];
+            for (final pk in pks) {
+              final rec = recordByPk[pk];
+              if (rec == null) continue;
+              candidateRecords.add(rec);
+            }
+
+            final matchedCandidateIndices = await _matchRecordIndicesIfNeeded(
+              schema: tblSchema,
+              table: table,
+              matcherCondition: matcherCondition,
+              records: candidateRecords,
+            );
+
+            if (matchedCandidateIndices != null) {
+              final matchedCandidateYieldController = YieldController(
+                  'QueryExecutor._performIndexScan.topKCandidates');
+              for (final matchedIndex in matchedCandidateIndices) {
+                final y20 = matchedCandidateYieldController.maybeYield();
+                if (y20 != null) await y20;
+                final rec = candidateRecords[matchedIndex];
+                if (filter != null && !filter(rec)) {
+                  continue;
+                }
+                if (onlyCount) {
+                  fullOutCount++;
+                } else {
+                  selector.offer(rec);
+                }
               }
-              if (onlyCount) {
-                fullOutCount++;
-              } else {
-                selector.offer(rec);
+            } else {
+              for (final rec in candidateRecords) {
+                if (filter != null && !filter(rec)) {
+                  continue;
+                }
+                if (onlyCount) {
+                  fullOutCount++;
+                } else {
+                  selector.offer(rec);
+                }
               }
             }
           }
@@ -3375,6 +3426,64 @@ class QueryExecutor {
     }
 
     return (aligned: false, reverse: callerReverse);
+  }
+
+  /// Whether [_executeQueryPlan] / [TableDataManager.searchTableData] already
+  /// produced [effectiveOrderBy] ordering, so [_applySort] would be redundant.
+  ///
+  /// - [QueryOperationType.tableScan]: PK-ordered range scan, or bounded TopK
+  ///   for non-PK order (unbounded non-PK still defers sort to this layer).
+  /// - [QueryOperationType.indexScan]: aligned index-key stream order.
+  /// - [QueryOperationType.union]: branches merged by PK map -- not globally sorted.
+  bool _storageScanAlreadyOrdered({
+    required QueryPlan plan,
+    required TableSchema schema,
+    required List<String> effectiveOrderBy,
+    int? fetchLimit,
+    Map<String, dynamic>? where,
+  }) {
+    if (effectiveOrderBy.isEmpty) return true;
+
+    switch (plan.operation.type) {
+      case QueryOperationType.union:
+        return false;
+      case QueryOperationType.tableScan:
+        if (effectiveOrderBy.length == 1) {
+          final parsed = _parseSortField(effectiveOrderBy[0]);
+          final bare = parsed.field.contains('.')
+              ? parsed.field.split('.').last
+              : parsed.field;
+          if (bare == schema.primaryKey) return true;
+        }
+        // searchTableData: bounded non-PK uses TopK (sorted); unbounded relies on
+        // QueryExecutor._applySort (see table_data_manager.dart needCount <= 0 path).
+        return fetchLimit != null && fetchLimit > 0;
+      case QueryOperationType.indexScan:
+        final idxUid = plan.operation.indexUid;
+        if (idxUid == null || idxUid.isEmpty) return false;
+        try {
+          final spec = _resolveIndexSpecForCursor(schema, idxUid);
+          final idxSchema =
+              _dataStore.tableMetaManager?.findIndexSchemaByUid(schema, idxUid);
+          final indexCond = _buildIndexConditionForSchema(
+            idxSchema,
+            idxUid,
+            where ?? const <String, dynamic>{},
+          );
+          if (indexCond == null) return false;
+          final alignment = _resolveIndexOrderByAlignment(
+            schema: schema,
+            indexFields: spec.fields,
+            isUnique: idxSchema?.unique ?? false,
+            orderBy: effectiveOrderBy,
+            indexCondition: indexCond,
+            callerReverse: false,
+          );
+          return alignment.aligned;
+        } catch (_) {
+          return false;
+        }
+    }
   }
 
   /// Default ordering when caller does not provide [orderBy].

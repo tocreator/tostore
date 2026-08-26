@@ -118,7 +118,6 @@ class WriteBufferManager {
     Set<String>? changedFields,
     bool updateStats = true,
   }) async {
-    trees.ensureComparators(table, table.schema);
     final prior = trees.getPendingRecord(table.tableUid, recordId);
     bool skipQueueEnqueue = false;
 
@@ -408,27 +407,26 @@ class WriteBufferManager {
       deleteDelta: recordIds.length,
     );
 
-    trees.ensureComparators(table, table.schema);
     final yieldController = YieldController(
       'WriteBufferManager.addDeleteBatch',
-      minCheckInterval: EngineCpuChunk.hotPathMinCheckInterval,
+      minCheckInterval: EngineCpuChunk.fastPathMinCheckInterval,
     );
-    final int emitChunk = EngineCpuChunk.sizeFor(CpuChunkKind.light);
+    final tableUid = table.tableUid;
+    final schema = table.schema;
+
+    final bp = _dataStore.parallelJournalManager
+        .applyEnqueueBackpressure(recordIds.length);
+    if (bp != null) await bp;
 
     for (int i = 0; i < recordIds.length; i++) {
       final y = yieldController.maybeYield();
       if (y != null) await y;
-      if (i % emitChunk == 0) {
-        final bp = _dataStore.parallelJournalManager
-            .applyEnqueueBackpressure(emitChunk);
-        if (bp != null) await bp;
-      }
 
       final recordId = recordIds[i];
       final entry = entries[i];
       trees.applyRecord(
         table: table,
-        schema: table.schema,
+        schema: schema,
         pk: recordId,
         entry: entry,
       );
@@ -436,7 +434,7 @@ class WriteBufferManager {
       final wp = entry.walPointer;
       if (wp != null) {
         _writeQueue.add(WriteQueueEntry(
-          tableUid: table.tableUid,
+          tableUid: tableUid,
           recordId: recordId,
           walPointer: wp,
         ));
@@ -455,7 +453,6 @@ class WriteBufferManager {
     required BufferEntry entry,
     Set<String>? changedFields,
   }) {
-    trees.ensureComparators(table, table.schema);
     trees.applyRecord(
       table: table,
       schema: table.schema,
@@ -771,7 +768,6 @@ class WriteBufferManager {
     TableContext table,
     String? transactionId,
   ) {
-    trees.ensureComparators(table, table.schema);
     return BufferBatchReserveContext(this, table, transactionId);
   }
 }

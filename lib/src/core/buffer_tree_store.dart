@@ -1,6 +1,5 @@
 import 'dart:collection';
 
-import '../handler/value_matcher.dart';
 import '../model/buffer_entry.dart';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
@@ -81,9 +80,6 @@ class BufferTreeStore {
   late final TreeCache<BufferEntry> txnRecordCache;
   late final TreeCache<dynamic> txnIndexCache;
 
-  final Map<String, Comparator<dynamic>> _pkComparators = {};
-  final Map<String, List<MatcherFunction>> _indexFieldMatchers = {};
-
   /// Generation bumped on clear/close/switchSpace to cancel queued eviction.
   int _evictGeneration = 0;
 
@@ -154,6 +150,13 @@ class BufferTreeStore {
     return 64;
   }
 
+  Comparator<dynamic> _pkComparatorForTableUid(String tableUid) {
+    return _dataStore.tableMetaManager
+            ?.resolveTreeMatcherEntry(TableUid(tableUid))
+            ?.pkMatcher ??
+        TreeCache.compareNative;
+  }
+
   Comparator<dynamic> _pendingRecordComparatorFactory(
     List<dynamic> path, {
     int suffixIndex = 0,
@@ -161,7 +164,7 @@ class BufferTreeStore {
     if (suffixIndex > 0) return TreeCache.compareNative;
     if (path.isEmpty) return TreeCache.compareNative;
     final tableUid = path[0]?.toString() ?? '';
-    return _pkComparators[tableUid] ?? TreeCache.compareNative;
+    return _pkComparatorForTableUid(tableUid);
   }
 
   Comparator<dynamic> _txnRecordComparatorFactory(
@@ -172,7 +175,7 @@ class BufferTreeStore {
     if (suffixIndex > 0) return TreeCache.compareNative;
     if (path.length < 2) return TreeCache.compareNative;
     final tableUid = path[1]?.toString() ?? '';
-    return _pkComparators[tableUid] ?? TreeCache.compareNative;
+    return _pkComparatorForTableUid(tableUid);
   }
 
   Comparator<dynamic> _pendingIndexComparatorFactory(
@@ -200,7 +203,9 @@ class BufferTreeStore {
     if (path.length < 2) return TreeCache.compareNative;
     final tableUid = path[pathOffset]?.toString() ?? '';
     final indexUid = path[pathOffset + 1]?.toString() ?? '';
-    final matchers = _indexFieldMatchers['$tableUid:$indexUid'];
+    final matchers = _dataStore.tableMetaManager
+        ?.resolveTreeMatcherEntry(TableUid(tableUid))
+        ?.indexMatchersByUid[indexUid];
     if (matchers != null) {
       // groupPath length is typically 2 ([tableUid, indexUid]); suffixIndex
       // selects field0, field1, ..., trailing pk for non-unique indexes.
@@ -212,53 +217,7 @@ class BufferTreeStore {
     return TreeCache.compareNative;
   }
 
-  void registerTableComparator(TableContext table, TableSchema schema) {
-    final tableUid = table.tableUid;
-    if (_pkComparators.containsKey(tableUid)) return;
-    _pkComparators[tableUid] =
-        ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
-  }
-
-  void registerIndexComparator(
-      TableContext table, IndexUid indexUid, TableSchema schema) {
-    final key = '${table.tableUid}:$indexUid';
-    if (_indexFieldMatchers.containsKey(key)) return;
-
-    if (indexUid == kBufferPkIndexUid) {
-      _indexFieldMatchers[key] = [
-        ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType()),
-      ];
-      return;
-    }
-
-    IndexSchema? indexSchema;
-    for (final idx in schema.getAllIndexes()) {
-      if (idx.indexUid == indexUid) {
-        indexSchema = idx;
-        break;
-      }
-    }
-    if (indexSchema == null || indexSchema.fields.isEmpty) return;
-
-    final matchers = <MatcherFunction>[];
-    for (final field in indexSchema.fields) {
-      matchers.add(ValueMatcher.getMatcher(schema.getFieldMatcherType(field)));
-    }
-    if (!indexSchema.unique) {
-      matchers.add(ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType()));
-    }
-    _indexFieldMatchers[key] = matchers;
-  }
-
-  void ensureComparators(TableContext table, TableSchema schema) {
-    registerTableComparator(table, schema);
-    registerIndexComparator(table, kBufferPkIndexUid, schema);
-    for (final idx in schema.getAllIndexes()) {
-      registerIndexComparator(table, idx.indexUid, schema);
-    }
-  }
-
-  /// Once-per-batch index plan + ensure comparators.
+  /// Once-per-batch index plan.
   ///
   /// When [includeUniques] is false, only non-unique slots (reserve owns uniques).
   /// When true, PK + all schema indexes for a single pending install pass.
@@ -267,7 +226,6 @@ class BufferTreeStore {
     TableSchema schema, {
     required bool includeUniques,
   }) {
-    ensureComparators(table, schema);
     final uids = <IndexUid>[];
     final fields = <List<String>>[];
     final singleFields = <String?>[];
@@ -344,7 +302,6 @@ class BufferTreeStore {
     bool installAllIndexes = false,
     IndexWritePlan? indexPlan,
   }) {
-    ensureComparators(table, schema);
     final tableUid = table.tableUid;
     final isTxn = transactionId != null;
 
@@ -708,7 +665,6 @@ class BufferTreeStore {
     required Map<String, dynamic> data,
     String? transactionId,
   }) {
-    ensureComparators(table, schema);
     _removeUniqueIndexKey(
       table: table,
       indexUid: kBufferPkIndexUid,
@@ -831,7 +787,6 @@ class BufferTreeStore {
     required bool isUnique,
     String? transactionId,
   }) {
-    registerIndexComparator(table, indexUid, table.schema);
     final path = _indexPath(
       tableUid: table.tableUid,
       indexUid: indexUid,
@@ -885,7 +840,6 @@ class BufferTreeStore {
     String? transactionId,
     List<List<dynamic>>? rollbackKeys,
   }) {
-    ensureComparators(table, schema);
     final tableUid = table.tableUid;
     final cache = transactionId != null ? txnIndexCache : pendingIndexCache;
 
@@ -1143,7 +1097,7 @@ class BufferTreeStore {
     String pkField,
   ) async {
     dynamic maxVal;
-    final matcher = _pkComparators[table.tableUid] ?? TreeCache.compareNative;
+    final matcher = _pkComparatorForTableUid(table.tableUid);
     await pendingRecordCache.scanRange(
       [table.tableUid],
       null,
@@ -1269,7 +1223,6 @@ class BufferTreeStore {
     if (entry.operation == BufferOperationType.delete) {
       return const <List<dynamic>>[];
     }
-    ensureComparators(table, schema);
     final tableUid = table.tableUid;
     final paths = <List<dynamic>>[
       _indexPath(

@@ -25,9 +25,9 @@ import '../model/table_schema.dart';
 import '../model/wal_pointer.dart';
 import '../query/query_executor.dart';
 import 'compute/compute_batch_planner.dart';
-import 'compute/delete_batch_prepare_compute.dart';
 import 'compute/query_aggregate_compute.dart';
 import 'compute_manager.dart';
+import 'cpu_work_chunk.dart';
 import 'crontab_manager.dart';
 import 'data_store_impl.dart';
 import 'resource_manager.dart';
@@ -177,9 +177,6 @@ class TableDataManager {
 
   // --- End: Intelligent Polling Methods ---
 
-  // Comparator registry for table primary keys
-  final Map<String, Comparator<dynamic>> _pkComparators = {};
-
   /// Factory to provide comparators for TreeCache based on path (Table Record Cache)
   Comparator<dynamic> _tableRecordComparatorFactory(
     List<dynamic> path, {
@@ -187,20 +184,13 @@ class TableDataManager {
   }) {
     if (suffixIndex > 0) return TreeCache.compareNative;
     if (path.isNotEmpty) {
-      final tableUid = path[0] as String;
-      return _pkComparators[tableUid] ?? TreeCache.compareNative;
+      final tableUid = path[0]?.toString() ?? '';
+      return _dataStore.tableMetaManager
+              ?.resolveTreeMatcherEntry(TableUid(tableUid))
+              ?.pkMatcher ??
+          TreeCache.compareNative;
     }
     return TreeCache.compareNative;
-  }
-
-  /// Register a comparator for a table's primary key
-  void _registerTableComparator(TableContext table, TableSchema schema) {
-    final tableUid = table.tableUid;
-    if (_pkComparators.containsKey(tableUid)) return;
-
-    // Use ValueMatcher to get the correct comparator for the PK type
-    final pdType = schema.getPrimaryKeyMatcherType();
-    _pkComparators[tableUid] = ValueMatcher.getMatcher(pdType);
   }
 
   TableDataManager(this._dataStore) {
@@ -349,9 +339,6 @@ class TableDataManager {
     final bool alreadyInCache = _tableRecordCache.containsPoint2(tableUid, pk);
 
     if (alreadyInCache || force || _dataStore.isGlobalPrewarming) {
-      // Lazy registration of comparator
-      _registerTableComparator(table, schema);
-
       _tableRecordCache.putPoint2(
         tableUid,
         pk,
@@ -384,9 +371,6 @@ class TableDataManager {
     if (isInsertOperation && doNotCache) {
       return;
     }
-
-    // Lazy registration of comparator
-    _registerTableComparator(table, schema);
 
     for (final r in records) {
       final pk = r[primaryKey]?.toString();
@@ -1338,7 +1322,6 @@ class TableDataManager {
       _lastModifiedTimes.clear();
       _tablePartitionSizes.clear();
       _tableFlushingFlags.clear();
-      _pkComparators.clear();
       _baselineRecordCount = 0;
       _baselineTableDataSizeBytes = 0;
       _baselineIndexDataSizeBytes = 0;
@@ -1726,8 +1709,6 @@ class TableDataManager {
 
     // 2. Memory Mode Path: Direct cache writes (no WAL/IO)
     if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
-      _registerTableComparator(table, schema);
-
       for (int i = 0; i < records.length; i++) {
         final r = records[i];
         final recordId = r[pkName]?.toString();
@@ -2016,97 +1997,78 @@ class TableDataManager {
     }
   }
 
-  Future<List<Map<String, dynamic>>> _prepareDeleteBufferRecords({
-    required TableContext table,
-    required List<Map<String, dynamic>> records,
-    required String primaryKey,
-    required List<String> requiredFields,
-  }) async {
-    if (records.isEmpty) return const <Map<String, dynamic>>[];
-
-    final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
-      itemCount: records.length,
-      estimateAverageItemBytes: () =>
-          estimateAverageRecordBytesForBatch(records),
-    );
-    final useIsolate = dispatchPlan.useIsolate;
-    final actualTaskCount = dispatchPlan.actualTaskCount;
-
-    final tasks =
-        <ComputeTask<DeleteBatchPrepareRequest, DeleteBatchPrepareResult>>[];
-    for (final range
-        in ComputeBatchPlanner.splitRange(records.length, actualTaskCount)) {
-      tasks.add(
-        ComputeTask(
-          function: prepareDeleteBatchChunk,
-          message: DeleteBatchPrepareRequest(
-            tableName: table.tableName,
-            primaryKeyField: primaryKey,
-            requiredFields: requiredFields,
-            records: records.sublist(range.start, range.end),
-          ),
-        ),
-      );
+  List<String> _deleteBufferRequiredFields(TableSchema schema) {
+    final fields = <String>{schema.primaryKey};
+    final allIndexes = _dataStore.tableMetaManager?.getAllIndexesFor(schema) ??
+        <IndexSchema>[];
+    for (final idx in allIndexes) {
+      fields.addAll(idx.fields);
     }
+    return fields.toList(growable: false);
+  }
 
-    final results =
-        await ComputeManager.computeBatch(tasks, enableIsolate: useIsolate);
+  Map<String, dynamic>? _trimDeleteBufferRecordSync(
+    Map<String, dynamic> record,
+    String primaryKey,
+    List<String> requiredFields,
+  ) {
+    final pkVal = record[primaryKey];
+    if (pkVal == null) return null;
 
-    final trimmedRecords = <Map<String, dynamic>>[];
-    final mergeYield = YieldController(
-      'TableDataManager._prepareDeleteBufferRecords',
-    );
-    for (final result in results) {
-      for (final record in result.trimmedRecords) {
-        final y7 = mergeYield.maybeYield();
-        if (y7 != null) await y7;
-        trimmedRecords.add(record);
+    // PK is mandatory for WAL / buffer identity; always set explicitly first.
+    final trimmed = <String, dynamic>{primaryKey: pkVal};
+    for (final fieldName in requiredFields) {
+      if (fieldName == primaryKey) continue;
+      if (record.containsKey(fieldName)) {
+        trimmed[fieldName] = record[fieldName];
       }
     }
-    return trimmedRecords;
+    return trimmed;
   }
 
   /// Add records to delete buffer - for batch deleting
   Future<void> addToDeleteBuffer(
-      TableContext table, List<Map<String, dynamic>> records,
-      {required String schemaVersion}) async {
+    TableContext table,
+    List<Map<String, dynamic>> records, {
+    required String schemaVersion,
+    int? chunkSize,
+  }) async {
     if (records.isEmpty) return;
 
     final schema = table.schema;
+    final pkName = schema.primaryKey;
+    final requiredFields = _deleteBufferRequiredFields(schema);
+    final int cs = chunkSize ?? EngineCpuChunk.sizeFor(CpuChunkKind.light);
+    final yieldController =
+        YieldController('TableDataManager.addDeleteRecordsToBufferInChunks');
 
-    final primaryKey = schema.primaryKey;
-    // For deletes, keep WAL payload minimal: pk + index/unique fields
-    final Set<String> needFields = () {
-      final s = <String>{primaryKey};
-      // Collect all fields used in any index (auto-generated unique/fk or explicit)
-      final allIndexes =
-          _dataStore.tableMetaManager?.getAllIndexesFor(schema) ??
-              <IndexSchema>[];
-      for (final idx in allIndexes) {
-        s.addAll(idx.fields);
+    for (int off = 0; off < records.length; off += cs) {
+      final y = yieldController.maybeYield();
+      if (y != null) await y;
+
+      final end = min(off + cs, records.length);
+      final chunk = <Map<String, dynamic>>[];
+      for (int i = off; i < end; i++) {
+        final trimmed = _trimDeleteBufferRecordSync(
+          records[i],
+          pkName,
+          requiredFields,
+        );
+        if (trimmed != null) {
+          chunk.add(trimmed);
+        }
       }
-      return s;
-    }();
+      if (chunk.isEmpty) continue;
 
-    final trimmedRecords = await _prepareDeleteBufferRecords(
-      table: table,
-      records: records,
-      primaryKey: primaryKey,
-      requiredFields: needFields.toList(growable: false),
-    );
-
-    if (trimmedRecords.isNotEmpty) {
       await addBatchToBuffer(
         table: table,
-        records: trimmedRecords,
+        records: chunk,
         operation: BufferOperationType.delete,
         schema: schema,
         schemaVersion: schemaVersion,
+        deferQueryCacheInvalidation: end < records.length,
       );
     }
-
-    // Record data change, need to update statistics
-    _markSpaceStatsDirty(table);
   }
 
   /// Recover a record from WAL/Journal to buffer.
@@ -4109,6 +4071,30 @@ class TableDataManager {
     return (found: false, record: null);
   }
 
+  /// Reconcile a disk-fetched row against current memory tiers.
+  ///
+  /// Called after IO because buffer may have changed during [await] (delete
+  /// tombstone, insert/update overlay). Returns null when the row is deleted.
+  Map<String, dynamic>? _fuseDiskRowAfterRead(
+    TableContext table,
+    Map<String, dynamic> diskRow,
+    String primaryKey, {
+    required bool readFromFileOnly,
+  }) {
+    final pk = diskRow[primaryKey]?.toString();
+    if (pk == null || pk.isEmpty) return null;
+
+    final mem = _resolveRecordFromMemory(
+      table,
+      pk,
+      readFromFileOnly: readFromFileOnly,
+    );
+    if (mem.found) {
+      return mem.record;
+    }
+    return diskRow;
+  }
+
   /// Fast synchronous single primary key point lookup.
   ///
   /// Tier order: Txn > WriteBuffer > _tableRecordCache > B+Tree page cache.
@@ -4185,26 +4171,19 @@ class TableDataManager {
   /// [isConsistent] in the result indicates if all requested keys were found in the committed state.
   Future<TableScanResult> queryRecordsBatch(
     TableContext table,
-    List<dynamic> keys, {
+    Iterable<dynamic> keys, {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
     bool readFromFileOnly = false,
     TableSchema? decodeSchema,
     List<FieldStructure>? decodeFieldStructureOverride,
   }) async {
-    if (keys.isEmpty) return TableScanResult(records: []);
-
-    final schema = decodeSchema ?? table.schema;
-    final pkName = schema.primaryKey;
-
     final results = <Map<String, dynamic>>[];
     final stillMissing = <dynamic>[];
-    final queryKeys =
-        (keys.length <= 1) ? keys : keys.toSet().toList(growable: false);
 
     // 0. Resolve from memory tiers (Txn > WriteBuffer > _tableRecordCache)
-    for (final key in queryKeys) {
-      final pk = key.toString();
+    for (final key in keys) {
+      final pk = key is String ? key : key.toString();
       final mem = _resolveRecordFromMemory(
         table,
         pk,
@@ -4218,6 +4197,13 @@ class TableDataManager {
         stillMissing.add(key);
       }
     }
+
+    if (results.isEmpty && stillMissing.isEmpty) {
+      return TableScanResult(records: []);
+    }
+
+    final schema = decodeSchema ?? table.schema;
+    final pkName = schema.primaryKey;
 
     // 2. Try Disk
     if (stillMissing.isNotEmpty) {
@@ -4242,15 +4228,28 @@ class TableDataManager {
         return TableScanResult(records: results);
       }
 
-      // Read-Through: Cache the results fetched from disk (Asynchronously)
-      if (diskResults.isNotEmpty && !readFromFileOnly) {
+      final fusedDiskRows = <Map<String, dynamic>>[];
+      for (final diskRow in diskResults) {
+        final fused = _fuseDiskRowAfterRead(
+          table,
+          diskRow,
+          pkName,
+          readFromFileOnly: readFromFileOnly,
+        );
+        if (fused != null) {
+          results.add(fused);
+          fusedDiskRows.add(fused);
+        }
+      }
+
+      // Read-Through: Cache live rows only (skip tombstones / buffer-superseded).
+      if (fusedDiskRows.isNotEmpty && !readFromFileOnly) {
         _asyncCacheDiskResults(
           table: table,
-          diskResults: diskResults,
+          diskResults: fusedDiskRows,
           schema: schema,
         );
       }
-      results.addAll(diskResults);
     }
 
     return TableScanResult(
@@ -4386,7 +4385,6 @@ class TableDataManager {
         return;
       }
 
-      _registerTableComparator(table, schema);
       late final List<dynamic> startKeyPath;
       List<dynamic>? endKeyPath;
       if (lowBoundPk != null) {
@@ -4740,7 +4738,7 @@ class TableDataManager {
 
     // Extract PK Equality/IN values from matcher
     dynamic pkEqValue;
-    List<dynamic>? pkInValues;
+    Set<String>? pkInValues;
 
     if (matcher != null) {
       // Try to optimize by primary key
@@ -4749,16 +4747,16 @@ class TableDataManager {
         if (pks.length == 1) {
           pkEqValue = pks.first;
         } else {
-          pkInValues = pks.toList();
+          pkInValues = pks;
         }
       }
     }
 
     // Fast path: PK '=' / IN (batch point lookup).
     if (pkEqValue != null || pkInValues != null) {
-      final keys =
-          pkEqValue != null ? [pkEqValue] : pkInValues!.toSet().toList();
-      if (keys.isEmpty) {
+      final Iterable<dynamic> keys =
+          pkEqValue != null ? [pkEqValue] : pkInValues!;
+      if (pkEqValue == null && pkInValues!.isEmpty) {
         return TableScanResult(records: [], count: onlyCount ? 0 : null);
       }
 

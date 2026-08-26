@@ -414,7 +414,7 @@ class BenchmarkRunner {
 
       case BenchmarkOperation.pointReadRandom:
         await _ensureDurableDataset(tableName, tier, scale);
-        effectiveCount = math.min(scale, 10000);
+        effectiveCount = scale;
         final random = math.Random(42);
 
         for (var round = 1; round <= iterations; round++) {
@@ -458,7 +458,7 @@ class BenchmarkRunner {
       case BenchmarkOperation.indexedSeekRandom:
         if (tier != BenchmarkTier.indexed) return null;
         await _ensureDurableDataset(tableName, tier, scale);
-        effectiveCount = math.min(scale, 10000);
+        effectiveCount = scale;
         final random = math.Random(1337);
 
         for (var round = 1; round <= iterations; round++) {
@@ -608,15 +608,14 @@ class BenchmarkRunner {
 
       case BenchmarkOperation.count:
         await _ensureDurableDataset(tableName, tier, scale);
-        final countQueries = math.min(scale, 10000);
-        effectiveCount = countQueries;
+        effectiveCount = scale;
 
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
               'Running [$tierName] Count ($round/$iterations)...');
 
           final sw = Stopwatch()..start();
-          for (var i = 0; i < countQueries; i++) {
+          for (var i = 0; i < effectiveCount; i++) {
             await db.query(tableName).count();
           }
           sw.stop();

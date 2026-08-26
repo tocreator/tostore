@@ -2467,6 +2467,7 @@ class DataStoreImpl {
           orderBy: orderBy,
           limit: effectiveLimit,
           offset: offset,
+          engineInternal: true,
         ))
             .records;
         if (records.isEmpty) {
@@ -3340,6 +3341,7 @@ class DataStoreImpl {
           orderBy: orderBy,
           limit: effectiveLimit,
           offset: offset,
+          engineInternal: true,
         ))
             .records;
 
@@ -3350,138 +3352,140 @@ class DataStoreImpl {
           ));
         }
 
-        // Handle foreign key constraints: RESTRICT must be checked immediately, CASCADE can be deferred
-        // CRITICAL: RESTRICT/NO ACTION constraints must be checked immediately when delete is attempted,
-        // not at commit time. Only CASCADE/SET NULL/SET DEFAULT operations can be deferred to commit.
-        if (_foreignKeyManager != null) {
-          final yieldController = YieldController('db_delete_fk');
-          for (final record in recordsToDelete) {
-            final y4 = yieldController.maybeYield();
-            if (y4 != null) await y4;
-            final pkValue = record[primaryKey];
-            if (pkValue != null) {
-              // Phase 1: Always check RESTRICT/NO ACTION constraints immediately (even in transaction)
-              // This ensures violations are caught early and transaction can be rolled back
-              try {
-                await _foreignKeyManager!.checkRestrictConstraintsForDelete(
-                  table: table,
-                  deletedPkValues: pkValue,
-                );
-              } catch (e) {
-                Logger.error('RESTRICT constraint check failed', rawError: e);
-                return finish(_normalizeCascadeError(e, 'delete'));
-              }
+        final hasListeners = notificationManager.hasListeners(table.tableUid);
+        final needFkWork = _foreignKeyManager != null &&
+            (await _foreignKeyManager!.findReferencingTables(table)).isNotEmpty;
 
-              // Phase 2: Handle CASCADE/SET NULL/SET DEFAULT operations
-              if (txId != null) {
-                // In transaction: defer CASCADE operations until commit
-                // RESTRICT has already been checked above, so we can safely defer CASCADE
-                transactionManager?.registerDeferredCascadeDelete(
-                    txId, table, pkValue);
-              } else {
-                // Outside transaction: execute CASCADE operations immediately
+        final successKeys = <String>[];
+        var successCount = 0;
+
+        if (needFkWork) {
+          // Pass 1: collect PKs (FK batch needs the full set before mutation).
+          final deletedPkValues = <dynamic>[];
+          final collectYield =
+              YieldController('DataStoreImpl.delete.collectPks');
+          for (final record in recordsToDelete) {
+            final y = collectYield.maybeYield();
+            if (y != null) await y;
+            final pkValue = record[primaryKey];
+            if (pkValue == null) continue;
+            deletedPkValues.add(pkValue);
+            successCount++;
+            if (returnResultDetails) {
+              successKeys.add(
+                promoteDesc != null
+                    ? _promoteUserFacingSuccessKey(record, promoteDesc)
+                    : pkValue.toString(),
+              );
+            }
+          }
+
+          // RESTRICT immediately; CASCADE/SET* now or defer to commit.
+          try {
+            await _foreignKeyManager!.checkRestrictConstraintsForDeleteBatch(
+              table: table,
+              deletedPkValues: deletedPkValues,
+            );
+          } catch (e) {
+            Logger.error('RESTRICT constraint check failed', rawError: e);
+            return finish(_normalizeCascadeError(e, 'delete'));
+          }
+
+          if (txId == null) {
+            try {
+              await _foreignKeyManager!.handleCascadeDeleteBatch(
+                table: table,
+                deletedPkValues: deletedPkValues,
+                skipRestrictCheck: true,
+              );
+            } catch (e) {
+              Logger.error('Cascade delete failed', rawError: e);
+              return finish(_normalizeCascadeError(e, 'delete'));
+            }
+          }
+
+          // Pass 2: transaction-only side effects (locks / write-set / defer CASCADE).
+          if (txId != null) {
+            final applyYield =
+                YieldController('DataStoreImpl.delete.applyAfterFk');
+            final lockMgr = lockManager;
+            for (final record in recordsToDelete) {
+              final y = applyYield.maybeYield();
+              if (y != null) await y;
+              final pkValue = record[primaryKey];
+              if (pkValue == null) continue;
+              final oldPk = pkValue.toString();
+              if (lockMgr != null) {
                 try {
-                  await _foreignKeyManager!.handleCascadeDelete(
-                    table: table,
-                    deletedPkValues: pkValue,
-                    skipRestrictCheck: true, // RESTRICT already checked above
-                  );
-                } catch (e) {
-                  Logger.error('Cascade delete failed', rawError: e);
-                  return finish(_normalizeCascadeError(e, 'delete'));
-                }
+                  final res = 'row:$tableName:pk:$oldPk';
+                  final opId = GlobalIdGenerator.generate('delete_row_');
+                  final ok = await lockMgr.acquireExclusiveLock(res, opId);
+                  if (ok) {
+                    TransactionContext.registerExclusiveLock(res, opId);
+                  }
+                } catch (_) {}
               }
+              transactionManager?.registerWriteKey(txId, table, oldPk);
+              transactionManager?.registerDeferredCascadeDelete(
+                  txId, table, pkValue);
+            }
+          }
+        } else {
+          // No referencing FKs: one pass covers keys and transaction side effects.
+          final applyYield = YieldController('DataStoreImpl.delete.applyNoFk');
+          final lockMgr = txId != null ? lockManager : null;
+          for (final record in recordsToDelete) {
+            final y = applyYield.maybeYield();
+            if (y != null) await y;
+            final pkValue = record[primaryKey];
+            if (pkValue == null) continue;
+            final oldPk = pkValue.toString();
+            successCount++;
+            if (returnResultDetails) {
+              successKeys.add(
+                promoteDesc != null
+                    ? _promoteUserFacingSuccessKey(record, promoteDesc)
+                    : oldPk,
+              );
+            }
+            if (txId != null) {
+              if (lockMgr != null) {
+                try {
+                  final res = 'row:$tableName:pk:$oldPk';
+                  final opId = GlobalIdGenerator.generate('delete_row_');
+                  final ok = await lockMgr.acquireExclusiveLock(res, opId);
+                  if (ok) {
+                    TransactionContext.registerExclusiveLock(res, opId);
+                  }
+                } catch (_) {}
+              }
+              transactionManager?.registerWriteKey(txId, table, oldPk);
             }
           }
         }
 
-        // Collect successful keys. Engine internals (locks / write-set / cache)
-        // always use old-table PK; user-facing successKeys use promote source
-        // field when active - collected directly, no post-pass remap.
-        final List<String> successKeys = [];
-        final List<String> deletedOldPks = [];
-        int successCount = 0;
-
-        // Row-level locks for delete
-        final lockMgr = lockManager;
-        final Map<String, String> acquiredResources = {};
-
-        final yieldController =
-            YieldController('DataStoreImpl._deleteInternal.loop');
-        for (var i = 0; i < recordsToDelete.length; i++) {
-          final record = recordsToDelete[i];
-          final oldPk = record[primaryKey]?.toString();
-          if (oldPk == null) {
-            continue;
-          }
-          // Acquire lock per record with unique operation id per resource
-          if (lockMgr != null) {
-            try {
-              final res = 'row:$tableName:pk:$oldPk';
-              final opId = GlobalIdGenerator.generate('delete_row_');
-              final ok = await lockMgr.acquireExclusiveLock(res, opId);
-              if (ok) {
-                acquiredResources[res] = opId;
-                if (txId != null) {
-                  TransactionContext.registerExclusiveLock(res, opId);
-                }
-              }
-            } catch (_) {}
-          }
-          deletedOldPks.add(oldPk);
-          if (returnResultDetails) {
-            successKeys.add(
-              promoteDesc != null
-                  ? _promoteUserFacingSuccessKey(record, promoteDesc)
-                  : oldPk,
-            );
-          }
-          successCount++;
-
-          // Register write-set for SSI conflict detection
-          if (txId != null) {
-            transactionManager?.registerWriteKey(txId, table, oldPk);
-          }
-
-          final y5 = yieldController.maybeYield();
-          if (y5 != null) await y5;
-        }
-
-        // Not in transaction: release locks immediately; in transaction: release by commit/rollback
-        try {
-          if (lockMgr != null && txId == null && acquiredResources.isNotEmpty) {
-            acquiredResources.forEach((res, opId) {
-              try {
-                lockMgr.releaseExclusiveLock(res, opId);
-              } catch (_) {}
-            });
-          }
-        } catch (_) {}
-
-        // Remove from record cache only when not in a transaction
-        if (txId == null) {
-          await tableDataManager.removeTableRecords(table, deletedOldPks);
-        }
-
-        // Add records to delete buffer instead of directly writing to file
         await tableDataManager.addToDeleteBuffer(
           table,
           recordsToDelete,
           schemaVersion: table.schema.schemaVersion ?? '',
         );
 
-        if (notificationManager.hasListeners(table.tableUid)) {
+        if (promoteDesc != null && successCount > 0) {
+          await _promoteMirrorDeleteFromShadow(promoteDesc, recordsToDelete);
+        }
+
+        // Notify after buffer/cache are updated so watch re-queries see tombstones.
+        if (hasListeners) {
+          final notifyYield = YieldController('DataStoreImpl.delete.notify');
           for (final record in recordsToDelete) {
+            final y = notifyYield.maybeYield();
+            if (y != null) await y;
             notificationManager.notify(ChangeEvent(
               type: ChangeType.delete,
               tableUid: table.tableUid,
               oldRecord: record,
             ));
           }
-        }
-
-        if (promoteDesc != null && successCount > 0) {
-          await _promoteMirrorDeleteFromShadow(promoteDesc, recordsToDelete);
         }
 
         if (!returnResultDetails) {
@@ -3496,7 +3500,7 @@ class DataStoreImpl {
 
         return finish(DbResult.success(
           successKeys: successKeys,
-          message: 'Successfully deleted ${successKeys.length} records',
+          message: 'Successfully deleted $successCount records',
         ));
       }
     } catch (e) {

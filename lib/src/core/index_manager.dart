@@ -45,10 +45,6 @@ class IndexManager {
   // This avoids the old "bucket Set<PK>" read/modify/write amplification for non-unique indexes.
   late final TreeCache<dynamic> _indexDataCache;
 
-  // Index Field Matchers: Map<"tableUid:indexUid", List<MatcherFunction>>
-  // Stores ordered matchers for each indexed field to ensure correct TreeCache path comparison.
-  final Map<String, List<MatcherFunction>> _indexFieldMatchers = {};
-
   // Index metadata cache using TreeCache
   late final TreeCache<IndexMeta> _indexMetaCache;
 
@@ -63,7 +59,6 @@ class IndexManager {
     if (indexUid.isEmpty) return;
     _indexMetaCache.removePoint2(table.tableUid, indexUid);
     _indexDataCache.remove([table.tableUid, indexUid]);
-    _indexFieldMatchers.remove('${table.tableUid}:$indexUid');
     _metaLoadingFutures.remove(_getMetaLoadingKey(table.tableUid, indexUid));
     _dataStore.indexTreePartitionManager
         ?.clearPageCacheForIndex(table, indexUid);
@@ -540,7 +535,6 @@ class IndexManager {
     }
 
     final indexUid = SystemTable.keyValueExpiryIndexUid;
-    _registerIndexComparator(table, indexUid, schema);
     final cutoffIso = upTo.toIso8601String();
 
     if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
@@ -704,9 +698,6 @@ class IndexManager {
         if (index.type == IndexType.vector) continue;
         final indexUid = _indexUidFromSchema(index);
 
-        // Ensure comparator is registered
-        _registerIndexComparator(table, indexUid, schema);
-
         // Remove old
         if (oldData != null) {
           final fields = <dynamic>[];
@@ -782,7 +773,9 @@ class IndexManager {
 
     final tableUid = path.isNotEmpty ? path[0]?.toString() ?? '' : '';
     final indexUid = path.length > 1 ? path[1]?.toString() ?? '' : '';
-    final matchers = _indexFieldMatchers['$tableUid:$indexUid'];
+    final matchers = _dataStore.tableMetaManager
+        ?.resolveTreeMatcherEntry(TableUid(tableUid))
+        ?.indexMatchersByUid[indexUid];
 
     if (matchers != null) {
       // path.length == 2: group [tableUid, indexUid]; suffixIndex 0 = field1,
@@ -795,29 +788,6 @@ class IndexManager {
 
     // Default: compareNative for unknown paths.
     return TreeCache.compareNative;
-  }
-
-  /// Register field comparators for a specific index to ensure TreeCache works correctly.
-  void _registerIndexComparator(
-      TableContext table, IndexUid indexUid, TableSchema schema) {
-    final key = '${table.tableUid}:$indexUid';
-    if (_indexFieldMatchers.containsKey(key)) return;
-
-    final indexSchema = _findBtreeIndexSchema(schema, indexUid, table: table);
-
-    if (indexSchema == null || indexSchema.fields.isEmpty) return;
-
-    final matchers = <MatcherFunction>[];
-    for (final field in indexSchema.fields) {
-      final mt = schema.getFieldMatcherType(field);
-      matchers.add(ValueMatcher.getMatcher(mt));
-    }
-    // Non-unique index key order is (fields..., pk). The trailing PK comparator
-    // must match schema primary-key ordering or cursor paging can break.
-    if (!indexSchema.unique) {
-      matchers.add(ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType()));
-    }
-    _indexFieldMatchers[key] = matchers;
   }
 
   /// Map a MemComparable index bound to a native TreeCache seek key.
@@ -874,7 +844,6 @@ class IndexManager {
     required bool isUnique,
     int? limit,
     int? offset,
-    bool ensureBufferComparators = false,
   }) async {
     List<dynamic>? rangeStart;
     List<dynamic>? rangeEnd;
@@ -901,12 +870,6 @@ class IndexManager {
 
     if (!seekMatchesPrefix(rangeStart)) rangeStart = null;
     if (!seekMatchesPrefix(rangeEnd)) rangeEnd = null;
-
-    if (ensureBufferComparators) {
-      _dataStore.writeBufferManager.bufferTrees
-          .ensureComparators(table, schema);
-    }
-    _registerIndexComparator(table, indexUid, schema);
 
     final indexSchema = _findBtreeIndexSchema(schema, indexUid, table: table) ??
         IndexSchema(indexName: '', fields: const []);
@@ -1129,7 +1092,6 @@ class IndexManager {
         isUnique: isUnique,
         limit: need,
         offset: pendingOffset,
-        ensureBufferComparators: true,
       );
       return scanned.entries;
     }
@@ -1281,7 +1243,6 @@ class IndexManager {
       return bufferId;
     }
 
-    _registerIndexComparator(table, indexUid, schema);
     final pkValue = _indexDataCache.getPoint3(table.tableUid, indexUid, value);
     if (pkValue is String && pkValue.isNotEmpty) {
       if (!_isPrimaryKeyHiddenByDeleteOverlay(table, pkValue)) {
@@ -1333,7 +1294,6 @@ class IndexManager {
         return bufferId;
       }
 
-      _registerIndexComparator(table, indexUid, schema);
       final pkValue =
           _indexDataCache.getPoint3(table.tableUid, indexUid, value);
       if (pkValue is String && pkValue.isNotEmpty) {
@@ -1407,8 +1367,6 @@ class IndexManager {
         );
       }
     }
-
-    _registerIndexComparator(table, indexUid, schema);
 
     // 1. Hotspot / Memory Cache probe
     if (!readFromFileOnly) {
@@ -1994,8 +1952,6 @@ class IndexManager {
       _dataStore.vectorIndexManager?.clearCacheForTable(table.tableUid);
       _indexMetaCache.remove([table.tableUid]);
       _indexDataCache.remove([table.tableUid]);
-      _indexFieldMatchers
-          .removeWhere((key, _) => key.startsWith('${table.tableUid}:'));
       _metaLoadingFutures
           .removeWhere((key, _) => key.startsWith('${table.tableUid}#'));
       _dataStore.indexTreePartitionManager?.clearPageCacheForTable(table);
@@ -2261,7 +2217,6 @@ class IndexManager {
               : (v is List && v.length == c.fields.length ? v : null);
           if (vals == null) continue;
 
-          _registerIndexComparator(table, c.indexUid, schema);
           final existing = vals.length == 1
               ? _indexDataCache.getPoint3(
                   table.tableUid, c.indexUid, vals.first)
@@ -3503,9 +3458,6 @@ class IndexManager {
       );
     }
     try {
-      // Ensure comparator is registered before cache access
-      _registerIndexComparator(table, indexUid, schema);
-
       final indexSchema = _findBtreeIndexSchema(schema, indexUid, table: table);
       if (indexSchema == null || indexSchema.fields.isEmpty) {
         return IndexSearchResult.tableScan();
@@ -4540,7 +4492,6 @@ class IndexManager {
   Future<void> clearAllCache() async {
     _indexDataCache.clear();
     _indexMetaCache.clear();
-    _indexFieldMatchers.clear();
     _metaLoadingFutures.clear();
   }
 
@@ -4569,7 +4520,6 @@ class IndexManager {
     // 2. Clear caches to release memory
     _indexDataCache.clear();
     _indexMetaCache.clear();
-    _indexFieldMatchers.clear();
     _metaLoadingFutures.clear();
   }
 }

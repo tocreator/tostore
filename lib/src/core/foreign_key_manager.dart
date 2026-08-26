@@ -1,17 +1,19 @@
 import 'dart:convert';
+import 'dart:math' as math;
+
 import '../handler/logger.dart';
-import '../model/table_schema.dart';
-import '../model/foreign_key_operation.dart';
-import '../model/system_table.dart';
+import '../interface/chain_builder.dart';
 import '../model/db_exception.dart';
 import '../model/db_result.dart';
+import '../model/foreign_key_operation.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
+import '../model/system_table.dart';
 import '../model/table_context.dart';
+import '../model/table_identity.dart';
+import '../model/table_schema.dart';
 import '../query/query_condition.dart';
 import 'data_store_impl.dart';
-import '../interface/chain_builder.dart';
-import '../model/table_identity.dart';
 
 /// ForeignKeyManager: Foreign key manager
 ///
@@ -708,6 +710,66 @@ class ForeignKeyManager {
     }
   }
 
+  /// Batch RESTRICT/NO ACTION check for deleting multiple parent records at once.
+  ///
+  /// Uses `IN` queries per child FK instead of one lookup per parent row, which
+  /// avoids O(n) empty child queries when related tables have no data.
+  Future<void> checkRestrictConstraintsForDeleteBatch({
+    required TableContext table,
+    required List<dynamic> deletedPkValues,
+  }) async {
+    if (deletedPkValues.isEmpty) return;
+    if (deletedPkValues.length == 1) {
+      return checkRestrictConstraintsForDelete(
+        table: table,
+        deletedPkValues: deletedPkValues.first,
+      );
+    }
+
+    final tableName = table.tableName;
+    final referencingTables = await _findReferencingTables(table.tableUid);
+    if (referencingTables.isEmpty) return;
+
+    final sortedEntries = referencingTables.entries.toList()
+      ..sort((a, b) => a.key.compareTo(b.key));
+
+    for (final entry in sortedEntries) {
+      final childTableUid = entry.key;
+      final childTableName = await _nameForUid(childTableUid);
+      final fks = entry.value;
+
+      for (final fk in fks) {
+        if (fk.onDelete != ForeignKeyCascadeAction.restrict &&
+            fk.onDelete != ForeignKeyCascadeAction.noAction) {
+          continue;
+        }
+
+        final conflictingPk = await _findChildReferenceConflictBatch(
+          childTableUid: childTableUid,
+          fk: fk,
+          parentPkValuesList: deletedPkValues,
+        );
+
+        if (conflictingPk != null) {
+          throw DbException([
+            ConstraintStatus(
+              type: ResultType.bizForeignKeyChildRestrict,
+              message:
+                  'Cannot delete record from table "$tableName" with values $conflictingPk: '
+                  'Referenced by records in child table "$childTableName" via foreign key "${fk.actualName}" (fields: ${fk.fields.join(', ')} referencing ${fk.referencedFields.join(', ')}). '
+                  'The constraint policy is RESTRICT/NO ACTION.',
+              tableName: tableName,
+              constraintName: fk.actualName,
+              fields: fk.referencedFields,
+              conflictingKeys: [conflictingPk],
+              referencedTable: tableName,
+            )
+          ]);
+        }
+      }
+    }
+  }
+
   /// Check RESTRICT/NO ACTION constraints for update operation
   ///
   /// This method only checks RESTRICT/NO ACTION constraints and throws an error if violated.
@@ -907,6 +969,103 @@ class ForeignKeyManager {
               childTableUid: childTableUid,
               fk: fk,
               parentPkValues: deletedPkValues,
+            );
+          } catch (e) {
+            Logger.error(
+                'Failed to set foreign key to default in $childTableName',
+                rawError: e);
+            rethrow;
+          }
+        }
+      }
+    }
+
+    return totalCascaded;
+  }
+
+  /// Batch cascade delete for multiple parent primary keys at once.
+  ///
+  /// Replaces per-parent [handleCascadeDelete] in bulk delete paths. When child
+  /// tables are empty this performs a small number of `IN` existence scans
+  /// instead of one cascade entry per parent row.
+  Future<int> handleCascadeDeleteBatch({
+    required TableContext table,
+    required List<dynamic> deletedPkValues,
+    Set<String>? visitedRecords,
+    bool skipRestrictCheck = false,
+  }) async {
+    if (deletedPkValues.isEmpty) return 0;
+    if (deletedPkValues.length == 1) {
+      return handleCascadeDelete(
+        table: table,
+        deletedPkValues: deletedPkValues.first,
+        visitedRecords: visitedRecords,
+        skipRestrictCheck: skipRestrictCheck,
+      );
+    }
+
+    final tableUid = table.tableUid;
+    int totalCascaded = 0;
+
+    final visited =
+        visitedRecords != null ? Set<String>.from(visitedRecords) : <String>{};
+
+    for (final deletedPkValuesEntry in deletedPkValues) {
+      final recordKey = _generateRecordKey(tableUid, deletedPkValuesEntry);
+      visited.add(recordKey);
+    }
+
+    final referencingTables = await _findReferencingTables(table.tableUid);
+    if (referencingTables.isEmpty) return 0;
+
+    final sortedEntries = referencingTables.entries.toList()
+      ..sort((a, b) => a.key.compareTo(b.key));
+
+    if (!skipRestrictCheck) {
+      await checkRestrictConstraintsForDeleteBatch(
+        table: table,
+        deletedPkValues: deletedPkValues,
+      );
+    }
+
+    for (final entry in sortedEntries) {
+      final childTableUid = entry.key;
+      final childTableName = await _nameForUid(childTableUid);
+      final fks = entry.value;
+
+      for (final fk in fks) {
+        if (fk.onDelete == ForeignKeyCascadeAction.cascade) {
+          try {
+            final deletedCount = await _cascadeDeleteBatch(
+              childTableUid: childTableUid,
+              fk: fk,
+              parentPkValuesList: deletedPkValues,
+              visitedRecords: visited,
+            );
+            totalCascaded += deletedCount;
+          } catch (e) {
+            Logger.error('Cascade delete failed for table $childTableName',
+                rawError: e);
+            rethrow;
+          }
+        } else if (fk.onDelete == ForeignKeyCascadeAction.setNull) {
+          try {
+            await _setForeignKeyToNullBatch(
+              childTableUid: childTableUid,
+              fk: fk,
+              parentPkValuesList: deletedPkValues,
+            );
+          } catch (e) {
+            Logger.error('Failed to set foreign key to NULL in $childTableName',
+                rawError: e);
+            rethrow;
+          }
+        } else if (fk.onDelete == ForeignKeyCascadeAction.setDefault) {
+          try {
+            await _setForeignKeyToDefaultBatch(
+              childTableUid: childTableUid,
+              fk: fk,
+              parentPkValuesList: deletedPkValues,
             );
           } catch (e) {
             Logger.error(
@@ -1307,6 +1466,381 @@ class ForeignKeyManager {
   /// Check if there are any child records referencing the updated record
   ///
   /// Optimized to use index lookup when possible
+  static const int _batchParentPkInChunkSize = 1000;
+
+  bool _isSimpleForeignKey(ForeignKeySchema fk) {
+    return fk.fields.length == 1 && fk.referencedFields.length == 1;
+  }
+
+  Future<List<dynamic>> _convertParentPkListForForeignKeyField({
+    required TableUid childTableUid,
+    required ForeignKeySchema fk,
+    required List<dynamic> parentPkValuesList,
+  }) async {
+    if (parentPkValuesList.isEmpty) {
+      return const <dynamic>[];
+    }
+
+    final childTableName = await _nameForUid(childTableUid);
+    final childSchema =
+        await _dataStore.tableMetaManager?.getTableSchema(childTableUid);
+    if (childSchema == null) {
+      return List<dynamic>.from(parentPkValuesList);
+    }
+
+    final fkField = fk.fields[0];
+    if (fkField == childSchema.primaryKey) {
+      return parentPkValuesList
+          .map((parentPk) => childSchema.primaryKeyConfig.convertPrimaryKey(
+                parentPk,
+                tableName: childTableName,
+              ))
+          .toList(growable: false);
+    }
+
+    final fieldSchema = childSchema.fields.firstWhere(
+      (f) => f.name == fkField,
+      orElse: () => throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devFieldNotFound,
+          message: 'Field "$fkField" not found in table "$childTableName"',
+          parameterName: 'fieldName',
+          passedValue: fkField,
+        ),
+      ]),
+    );
+    return parentPkValuesList
+        .map(fieldSchema.convertValue)
+        .toList(growable: false);
+  }
+
+  /// Returns the first conflicting parent PK if any child references exist.
+  Future<dynamic> _findChildReferenceConflictBatch({
+    required TableUid childTableUid,
+    required ForeignKeySchema fk,
+    required List<dynamic> parentPkValuesList,
+  }) async {
+    if (!_isSimpleForeignKey(fk)) {
+      for (final parentPk in parentPkValuesList) {
+        final hasReferences = await _checkChildReferences(
+          childTableUid: childTableUid,
+          fk: fk,
+          parentPkValues: parentPk,
+        );
+        if (hasReferences) {
+          return parentPk;
+        }
+      }
+      return null;
+    }
+
+    final childTableName = await _nameForUid(childTableUid);
+    final childSchema =
+        await _dataStore.tableMetaManager?.getTableSchema(childTableUid);
+    if (childSchema == null) {
+      return null;
+    }
+
+    final fkField = fk.fields[0];
+    final convertedPks = await _convertParentPkListForForeignKeyField(
+      childTableUid: childTableUid,
+      fk: fk,
+      parentPkValuesList: parentPkValuesList,
+    );
+
+    for (var i = 0; i < convertedPks.length; i += _batchParentPkInChunkSize) {
+      final end = math.min(i + _batchParentPkInChunkSize, convertedPks.length);
+      final chunk = convertedPks.sublist(i, end);
+      final queryBuilder = QueryBuilder(_dataStore, childTableName);
+      queryBuilder.where(fkField, 'IN', chunk);
+      final results = await queryBuilder.limit(1).future;
+      if (results.data.isEmpty) {
+        continue;
+      }
+
+      final childFkValue = results.data.first[fkField];
+      final originalIndex = convertedPks.indexOf(childFkValue);
+      if (originalIndex >= 0) {
+        return parentPkValuesList[originalIndex];
+      }
+      return childFkValue;
+    }
+
+    return null;
+  }
+
+  Future<int> _cascadeDeleteBatch({
+    required TableUid childTableUid,
+    required ForeignKeySchema fk,
+    required List<dynamic> parentPkValuesList,
+    required Set<String> visitedRecords,
+  }) async {
+    if (!_isSimpleForeignKey(fk)) {
+      var total = 0;
+      for (final parentPk in parentPkValuesList) {
+        total += await _cascadeDeleteWithRecursion(
+          childTableUid: childTableUid,
+          fk: fk,
+          parentPkValues: parentPk,
+          visitedRecords: visitedRecords,
+        );
+      }
+      return total;
+    }
+
+    final childTableName = await _nameForUid(childTableUid);
+    final childSchema =
+        await _dataStore.tableMetaManager?.getTableSchema(childTableUid);
+    if (childSchema == null) {
+      Logger.warn(
+        'Child table $childTableName does not exist during cascade delete, skipping',
+      );
+      return 0;
+    }
+
+    final fkField = fk.fields[0];
+    final convertedPks = await _convertParentPkListForForeignKeyField(
+      childTableUid: childTableUid,
+      fk: fk,
+      parentPkValuesList: parentPkValuesList,
+    );
+    if (convertedPks.isEmpty) {
+      return 0;
+    }
+
+    var totalDeleted = 0;
+    const childBatchSize = 1000;
+    var hasMore = true;
+
+    while (hasMore) {
+      final queryBuilder = QueryBuilder(_dataStore, childTableName);
+      queryBuilder.where(fkField, 'IN', convertedPks);
+      final childResults = await queryBuilder.limit(childBatchSize).future;
+
+      if (childResults.data.isEmpty) {
+        hasMore = false;
+        break;
+      }
+
+      final childPkValues = childResults.data
+          .map((r) => r[childSchema.primaryKey])
+          .where((pk) => pk != null)
+          .toList();
+
+      if (childPkValues.isEmpty) {
+        hasMore = false;
+        break;
+      }
+
+      final childReferencingTables =
+          await _findReferencingTables(childTableUid);
+      if (childReferencingTables.isNotEmpty) {
+        final sortedChildTables = childReferencingTables.entries.toList()
+          ..sort((a, b) => a.key.compareTo(b.key));
+
+        for (final childEntry in sortedChildTables) {
+          final grandChildTableUid = childEntry.key;
+          final grandChildTableName = await _nameForUid(grandChildTableUid);
+          final grandChildFks = childEntry.value;
+
+          for (final grandChildFk in grandChildFks) {
+            if (grandChildFk.onDelete != ForeignKeyCascadeAction.cascade) {
+              continue;
+            }
+            for (final childPk in childPkValues) {
+              try {
+                final recursiveCount = await _cascadeDeleteWithRecursion(
+                  childTableUid: grandChildTableUid,
+                  fk: grandChildFk,
+                  parentPkValues: childPk,
+                  visitedRecords: visitedRecords,
+                );
+                totalDeleted += recursiveCount;
+              } catch (e) {
+                Logger.error(
+                    'Cascade delete failed during recursive deletion of $grandChildTableName',
+                    rawError: e);
+                rethrow;
+              }
+            }
+          }
+        }
+      }
+
+      try {
+        final childTable = await _dataStore.getTableContext(childTableName);
+        final deleteCondition = childPkValues.length == 1
+            ? (QueryCondition()
+              ..where(childSchema.primaryKey, '=', childPkValues[0]))
+            : (QueryCondition()
+              ..where(childSchema.primaryKey, 'IN', childPkValues));
+        final deleteResult =
+            await _dataStore.deleteInternal(childTable, deleteCondition);
+        _throwIfEngineWriteFailed(deleteResult);
+        totalDeleted += deleteResult.successCount;
+      } catch (e) {
+        Logger.error(
+            'Cascade delete failed when deleting records from $childTableName',
+            rawError: e);
+        rethrow;
+      }
+
+      if (childResults.data.length < childBatchSize) {
+        hasMore = false;
+      }
+    }
+
+    return totalDeleted;
+  }
+
+  Future<void> _setForeignKeyToNullBatch({
+    required TableUid childTableUid,
+    required ForeignKeySchema fk,
+    required List<dynamic> parentPkValuesList,
+  }) async {
+    if (!_isSimpleForeignKey(fk)) {
+      for (final parentPk in parentPkValuesList) {
+        await _setForeignKeyToNull(
+          childTableUid: childTableUid,
+          fk: fk,
+          parentPkValues: parentPk,
+        );
+      }
+      return;
+    }
+
+    final childTableName = await _nameForUid(childTableUid);
+    final childSchema =
+        await _dataStore.tableMetaManager?.getTableSchema(childTableUid);
+    if (childSchema == null) {
+      Logger.warn(
+        'Child table $childTableName does not exist during set NULL operation, skipping',
+      );
+      return;
+    }
+
+    for (final fieldName in fk.fields) {
+      final field = childSchema.fields.firstWhere(
+        (f) => f.name == fieldName,
+        orElse: () => throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.devFieldNotFound,
+            message: 'Field "$fieldName" not found in table "$childTableName"',
+            parameterName: 'fieldName',
+            passedValue: fieldName,
+          ),
+        ]),
+      );
+      if (!field.nullable) {
+        throw DbException([
+          ConstraintStatus(
+            type: ResultType.bizNotNullViolation,
+            message:
+                'Cannot set foreign key field $fieldName to NULL: field does not allow NULL values',
+            tableName: childTableName,
+            fields: [fieldName],
+          )
+        ]);
+      }
+    }
+
+    final fkField = fk.fields[0];
+    final convertedPks = await _convertParentPkListForForeignKeyField(
+      childTableUid: childTableUid,
+      fk: fk,
+      parentPkValuesList: parentPkValuesList,
+    );
+    final updateData = <String, dynamic>{
+      for (final field in fk.fields) field: null
+    };
+    final childTable = await _dataStore.getTableContext(childTableName);
+
+    for (var i = 0; i < convertedPks.length; i += _batchParentPkInChunkSize) {
+      final end = math.min(i + _batchParentPkInChunkSize, convertedPks.length);
+      final chunk = convertedPks.sublist(i, end);
+      final updateResult = await _dataStore.updateInternal(
+        childTable,
+        updateData,
+        QueryCondition()..where(fkField, 'IN', chunk),
+      );
+      _throwIfEngineWriteFailed(updateResult, ignoreNotFound: true);
+    }
+  }
+
+  Future<void> _setForeignKeyToDefaultBatch({
+    required TableUid childTableUid,
+    required ForeignKeySchema fk,
+    required List<dynamic> parentPkValuesList,
+  }) async {
+    if (!_isSimpleForeignKey(fk)) {
+      for (final parentPk in parentPkValuesList) {
+        await _setForeignKeyToDefault(
+          childTableUid: childTableUid,
+          fk: fk,
+          parentPkValues: parentPk,
+        );
+      }
+      return;
+    }
+
+    final childTableName = await _nameForUid(childTableUid);
+    final childSchema =
+        await _dataStore.tableMetaManager?.getTableSchema(childTableUid);
+    if (childSchema == null) {
+      Logger.warn(
+        'Child table $childTableName does not exist during set DEFAULT operation, skipping',
+      );
+      return;
+    }
+
+    final defaultValues = <String, dynamic>{};
+    for (final fieldName in fk.fields) {
+      final field = childSchema.fields.firstWhere(
+        (f) => f.name == fieldName,
+        orElse: () => throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.devFieldNotFound,
+            message: 'Field "$fieldName" not found in table "$childTableName"',
+            parameterName: 'fieldName',
+            passedValue: fieldName,
+          ),
+        ]),
+      );
+      final defaultValue = field.getDefaultValue();
+      if (defaultValue == null && !field.nullable) {
+        throw DbException([
+          ConstraintStatus(
+            type: ResultType.bizNotNullViolation,
+            message:
+                'Cannot set foreign key field $fieldName to default: field has no default value and does not allow NULL',
+            tableName: childTableName,
+            fields: [fieldName],
+          )
+        ]);
+      }
+      defaultValues[fieldName] = defaultValue;
+    }
+
+    final fkField = fk.fields[0];
+    final convertedPks = await _convertParentPkListForForeignKeyField(
+      childTableUid: childTableUid,
+      fk: fk,
+      parentPkValuesList: parentPkValuesList,
+    );
+    final childTable = await _dataStore.getTableContext(childTableName);
+
+    for (var i = 0; i < convertedPks.length; i += _batchParentPkInChunkSize) {
+      final end = math.min(i + _batchParentPkInChunkSize, convertedPks.length);
+      final chunk = convertedPks.sublist(i, end);
+      final updateResult = await _dataStore.updateInternal(
+        childTable,
+        defaultValues,
+        QueryCondition()..where(fkField, 'IN', chunk),
+      );
+      _throwIfEngineWriteFailed(updateResult, ignoreNotFound: true);
+    }
+  }
+
   Future<bool> _checkChildReferences({
     required TableUid childTableUid,
     required ForeignKeySchema fk,

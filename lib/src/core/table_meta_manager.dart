@@ -18,6 +18,7 @@ import '../model/table_meta.dart';
 import '../model/table_schema.dart';
 import '../query/query_condition.dart';
 import 'data_store_impl.dart';
+import 'table_tree_matcher_entry.dart';
 import 'transaction_context.dart';
 import 'tree_cache.dart';
 import 'yield_controller.dart';
@@ -41,6 +42,10 @@ class TableMetaManager {
   /// Per-table index cache derived from [TableSchema].
   final Map<TableUid, _IndexListCacheEntry> _indexListCache =
       <TableUid, _IndexListCacheEntry>{};
+
+  /// Per-table TreeCache matcher registry derived from hot [TableSchema].
+  final Map<TableUid, TableTreeMatcherEntry> _treeMatcherCache =
+      <TableUid, TableTreeMatcherEntry>{};
 
   /// Per-table stable storage layout cache (keyed by tableUid).
   final Map<TableUid, FieldStorageLayout> _tableFieldLayoutCache =
@@ -297,7 +302,12 @@ class TableMetaManager {
   /// Hotspot schema cache + derived index lists (called from [_cacheTableMeta]).
   void _cacheTableSchema(TableUid tableUid, TableSchema schema) {
     _ensureTableSchemaCache().put(tableUid, schema);
-    _indexListCache[tableUid] = _buildIndexListCache(schema);
+    final indexEntry = _buildIndexListCache(schema);
+    _indexListCache[tableUid] = indexEntry;
+    _treeMatcherCache[tableUid] = buildTableTreeMatcherEntry(
+      schema,
+      indexes: indexEntry.allIndexes,
+    );
     _storageFieldStructCache.remove(tableUid);
     if (schema.schemaVersion != null) {
       _dataStore.migrationManager?.registerSchemaVersion(schema);
@@ -467,6 +477,7 @@ class TableMetaManager {
     _tableMetaCache?.remove(tableUid);
     _tableContextCache.remove(tableUid);
     _indexListCache.remove(tableUid);
+    _treeMatcherCache.remove(tableUid);
     _tableFieldLayoutCache.remove(tableUid);
     _storageFieldStructCache.remove(tableUid);
     if (tableUid == SystemTable.tableMetaTableUid) {
@@ -612,6 +623,7 @@ class TableMetaManager {
     _tableMetaCache?.clear();
     _tableContextCache.clear();
     _indexListCache.clear();
+    _treeMatcherCache.clear();
     _tableFieldLayoutCache.clear();
     _storageFieldStructCache.clear();
     _pinnedMetaTableMeta = null;
@@ -645,6 +657,7 @@ class TableMetaManager {
     _globalDirCounts.clear();
     _nonGlobalDirCounts.clear();
     _indexListCache.clear();
+    _treeMatcherCache.clear();
     _tableFieldLayoutCache.clear();
     _storageFieldStructCache.clear();
     _pinnedMetaTableMeta = null;
@@ -666,10 +679,58 @@ class TableMetaManager {
     _globalDirCounts.clear();
     _nonGlobalDirCounts.clear();
     _indexListCache.clear();
+    _treeMatcherCache.clear();
     _tableFieldLayoutCache.clear();
     _storageFieldStructCache.clear();
     _pinnedMetaTableMeta = null;
     _metaLoadingFutures.clear();
+  }
+
+  /// Hot peek of precomputed TreeCache matchers (O(1), no build).
+  TableTreeMatcherEntry? peekTreeMatcherEntry(TableUid tableUid) {
+    if (tableUid.isEmpty) return null;
+    return _treeMatcherCache[tableUid];
+  }
+
+  /// Resolve matchers for [tableUid]: hot cache first, then build from hot
+  /// [TableSchema] when the matcher slot is empty.
+  ///
+  /// TreeCache comparator factories should use this instead of [peekTreeMatcherEntry]
+  /// alone so a schema-hot / matcher-cold state still gets typed ordering.
+  /// Returns null only when no hot schema is available (caller falls back to
+  /// [TreeCache.compareNative]).
+  TableTreeMatcherEntry? resolveTreeMatcherEntry(TableUid tableUid) {
+    if (tableUid.isEmpty) return null;
+    final cached = _treeMatcherCache[tableUid];
+    if (cached != null) return cached;
+    final schema = _peekTableSchema(tableUid);
+    if (schema == null) return null;
+    return treeMatcherEntryFor(schema);
+  }
+
+  /// Resolve TreeCache matchers for [schema] (hot cache or ephemeral build).
+  ///
+  /// Migration / foreign snapshots that are not the hot schema instance are
+  /// built on demand and never written into [_treeMatcherCache].
+  TableTreeMatcherEntry treeMatcherEntryFor(TableSchema schema) {
+    final cacheKey = schema.tableUid;
+    final hot = _peekTableSchema(cacheKey);
+    if (hot != null && identical(hot, schema)) {
+      final existing = _treeMatcherCache[cacheKey];
+      if (existing != null) return existing;
+      final indexEntry = _indexCacheEntryFor(schema);
+      final entry = buildTableTreeMatcherEntry(
+        schema,
+        indexes: indexEntry.allIndexes,
+      );
+      _treeMatcherCache[cacheKey] = entry;
+      return entry;
+    }
+    final indexEntry = _buildIndexListCache(schema);
+    return buildTableTreeMatcherEntry(
+      schema,
+      indexes: indexEntry.allIndexes,
+    );
   }
 
   int _estimateTableSchemaSize(TableSchema schema) {
