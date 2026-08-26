@@ -407,6 +407,56 @@ class TableDataManager {
     }
   }
 
+  /// Cap for flush→hot-row promotion (benchmark / working-set retention).
+  /// Beyond this, skip promote so hot cache is not flooded by every flush batch.
+  static const int flushPromoteHotCacheBudgetBytes = 50 * 1024 * 1024;
+
+  /// Whether flush eviction may still promote rows into the hot cache.
+  bool get canFlushPromoteToHotCache =>
+      _tableRecordCache.maxByteThreshold > 0 &&
+      _tableRecordCache.estimatedTotalSizeBytes <
+          flushPromoteHotCacheBudgetBytes;
+
+  /// Promote one flushed pending insert into the hot row cache (O(1) put).
+  ///
+  /// Returns false when the budget is exhausted so the caller can stop promoting
+  /// for the rest of this flush batch. Updates/deletes are not promoted -- they
+  /// already sync the hot entry on buffer enqueue.
+  /// Does not touch index hot cache (avoids per-batch index churn).
+  bool tryPromoteFlushedPendingRecordToHotCache(
+    TableContext table,
+    String pk,
+    BufferEntry entry,
+  ) {
+    if (entry.operation != BufferOperationType.insert) return true;
+    if (!canFlushPromoteToHotCache) return false;
+
+    final schema = table.schema;
+    final pkName = schema.primaryKey;
+    final data = entry.data;
+    final record = data.containsKey(pkName)
+        ? data
+        : TableSchema.rowWithPrimaryKeyFirst(pkName, pk, data);
+    cacheTableRecord(table, pk, record, schema, force: true);
+    return canFlushPromoteToHotCache;
+  }
+
+  /// Best-effort async promotion after a page-cache sync hit (does not block query).
+  void _schedulePageCacheReadThrough(
+    TableContext table,
+    String pk,
+    Map<String, dynamic> record,
+  ) {
+    if (_tableRecordCache.maxByteThreshold <= 0) return;
+    scheduleMicrotask(() {
+      if (_dataStore.writeBufferManager.getBufferedRecordForRead(table, pk) !=
+          null) {
+        return;
+      }
+      cacheTableRecord(table, pk, record, table.schema, force: true);
+    });
+  }
+
   /// Asynchronously cache results fetched from disk after validating against write buffer.
   /// This prevents Read-Through Cache Pollution without blocking the main query flow.
   void _asyncCacheDiskResults({
@@ -4078,11 +4128,15 @@ class TableDataManager {
     }
 
     // Tier 2: B+Tree page cache (internal + leaf pages already resident after flush)
-    return _dataStore.tableTreePartitionManager
+    final pageHit = _dataStore.tableTreePartitionManager
         ?.queryRecordByPrimaryKeyFromPageCacheSync(
       table: table,
       pk: pk,
     );
+    if (pageHit != null) {
+      _schedulePageCacheReadThrough(table, pk, pageHit);
+    }
+    return pageHit;
   }
 
   /// Fast single primary key point lookup.

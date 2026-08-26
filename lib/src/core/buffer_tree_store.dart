@@ -1404,6 +1404,11 @@ class BufferTreeStore {
     final yc = YieldController('BufferTreeStore.evictFlushed');
     final tableUid = task.tableUid;
     final indexGroupDepth = pendingIndexCache.groupDepth;
+    final table = _dataStore.tableMetaManager?.getTableContextSync(tableUid);
+    final tdm = _dataStore.tableDataManager;
+    // Soft budget (~200MB): enough for ~100k-row benchmark. Over budget = skip
+    // promote for remaining PKs in this batch (still evict pending).
+    var allowPromote = table != null && tdm.canFlushPromoteToHotCache;
 
     for (final pk in task.flushedWalByPk.keys) {
       if (task.gen != _evictGeneration || _dataStore.isClosing) return;
@@ -1414,6 +1419,15 @@ class BufferTreeStore {
       if (live == null) continue;
       // Keep when a newer enqueue replaced this row after the flush snapshot.
       if (live.walPointer != task.flushedWalByPk[pk]) continue;
+
+      // Only insert needs promote: update already refreshes an existing hot entry
+      // on buffer enqueue; delete already removes it.
+      if (table != null &&
+          allowPromote &&
+          live.operation == BufferOperationType.insert) {
+        allowPromote =
+            tdm.tryPromoteFlushedPendingRecordToHotCache(table, pk, live);
+      }
 
       pendingRecordCache.removePoint2(tableUid, pk);
 

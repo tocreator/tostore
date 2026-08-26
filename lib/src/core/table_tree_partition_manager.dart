@@ -2473,7 +2473,9 @@ final class TableTreePartitionManager {
     final decoded = _tryDecodeStoredRecordSync(leaf.values[pos], fieldStruct);
     if (decoded == null) return null;
 
-    return TableSchema.rowWithPrimaryKeyFirst(schema.primaryKey, pk, decoded);
+    // Avoid a second map copy: decode yields a fresh mutable map without PK.
+    decoded[schema.primaryKey] = pk;
+    return decoded;
   }
 
   /// Batch point lookup by primary keys.
