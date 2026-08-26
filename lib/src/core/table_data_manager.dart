@@ -2307,6 +2307,11 @@ class TableDataManager {
     }
   }
 
+  /// Synchronous peek at in-memory [TableDataMeta] (never loads from disk).
+  TableDataMeta? peekTableDataMeta(TableUid tableUid) {
+    return _tableDataMetaCache.get(tableUid);
+  }
+
   /// Get table data meta (cache first, disk on miss).
   Future<TableDataMeta?> getTableDataMeta(TableUid tableUid) async {
     // Table data meta cache fast path
@@ -4055,8 +4060,10 @@ class TableDataManager {
   }
 
   /// Fast synchronous single primary key point lookup.
-  /// Checks memory tier (Txn > WriteBuffer > _tableRecordCache) with zero collection overhead.
-  /// Never hits disk; returns null if not present in memory.
+  ///
+  /// Tier order: Txn > WriteBuffer > _tableRecordCache > B+Tree page cache.
+  /// Never hits disk/IO; returns null when no in-memory tier has the row
+  /// (caller may fall back to [getRecordByPrimaryKey] async path).
   Map<String, dynamic>? getRecordByPrimaryKeySync(
     TableContext table,
     dynamic key,
@@ -4069,7 +4076,13 @@ class TableDataManager {
     if (mem.found) {
       return mem.record;
     }
-    return null;
+
+    // Tier 2: B+Tree page cache (internal + leaf pages already resident after flush)
+    return _dataStore.tableTreePartitionManager
+        ?.queryRecordByPrimaryKeyFromPageCacheSync(
+      table: table,
+      pk: pk,
+    );
   }
 
   /// Fast single primary key point lookup.

@@ -1259,8 +1259,15 @@ class IndexManager {
     return null;
   }
 
+  /// Synchronous peek at in-memory [IndexMeta] (never loads from disk).
+  IndexMeta? peekIndexMeta(TableUid tableUid, IndexUid indexUid) {
+    return _indexMetaCache.getPoint2(tableUid, indexUid);
+  }
+
   /// Fast synchronous single unique key lookup to primary key string.
-  /// Probes writeBuffer and hot index cache only; never hits disk.
+  ///
+  /// Tier order: writeBuffer > hot index cache > B+Tree page cache.
+  /// Never hits disk/IO; returns null when no in-memory tier has the mapping.
   String? lookupUniquePrimaryKeySync(
     TableContext table,
     IndexUid indexUid,
@@ -1280,6 +1287,28 @@ class IndexManager {
       if (!_isPrimaryKeyHiddenByDeleteOverlay(table, pkValue)) {
         return pkValue;
       }
+    }
+
+    // Tier 2: B+Tree page cache (internal + leaf pages resident after flush)
+    final indexSchema = _findBtreeIndexSchema(schema, indexUid, table: table);
+    if (indexSchema == null || indexSchema.fields.isEmpty) return null;
+    final encoded = schema.encodeFieldComponentToMemComparable(
+      indexSchema.fields.first,
+      value,
+      truncateText: false,
+    );
+    if (encoded == null) return null;
+    final tupleBytes = MemComparableKey.encodeTuple([encoded]);
+    final pagePk = _dataStore.indexTreePartitionManager
+        ?.lookupUniquePrimaryKeyFromPageCacheSync(
+      table: table,
+      indexUid: indexUid,
+      uniqueKey: tupleBytes,
+    );
+    if (pagePk != null &&
+        pagePk.isNotEmpty &&
+        !_isPrimaryKeyHiddenByDeleteOverlay(table, pagePk)) {
+      return pagePk;
     }
     return null;
   }

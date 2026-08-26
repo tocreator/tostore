@@ -2079,6 +2079,41 @@ final class IndexTreePartitionManager {
     return meta.indexUid.isNotEmpty ? meta.indexUid : indexUid;
   }
 
+  /// Synchronous unique-index point lookup from resident B+Tree page cache only.
+  ///
+  /// Returns PK string on full cache hit; null on any cache miss.
+  String? lookupUniquePrimaryKeyFromPageCacheSync({
+    required TableContext table,
+    required IndexUid indexUid,
+    required Uint8List uniqueKey,
+  }) {
+    final meta =
+        _dataStore.indexManager?.peekIndexMeta(table.tableUid, indexUid);
+    if (meta == null || meta.btreeFirstLeaf.isNull) return null;
+
+    final resolvedUid = _effectiveIndexUid(indexUid, meta);
+    final leafPtr = _locateLeafForKeySync(table, resolvedUid, meta, uniqueKey);
+    if (leafPtr == null || leafPtr.isNull) return null;
+
+    final leaf = _leafPageCache.getPoint4(
+      table.tableUid,
+      resolvedUid,
+      leafPtr.partitionNo,
+      leafPtr.pageNo,
+    );
+    if (leaf == null) return null;
+
+    final idx = leaf.find(uniqueKey);
+    if (idx == null) return null;
+    final v = leaf.values[idx];
+    if (v.isEmpty || v[0] != 0 || v.length <= 1) return null;
+    try {
+      return utf8.decode(v.sublist(1), allowMalformed: true);
+    } catch (_) {
+      return null;
+    }
+  }
+
   /// Point lookup for unique index key. Returns PK string if exists.
   Future<String?> lookupUniquePrimaryKey({
     required TableContext table,

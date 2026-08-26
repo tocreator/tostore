@@ -951,6 +951,11 @@ class TableMetaManager {
     return const FieldStorageLayout(nextSlotId: 0, slots: <FieldStorageSlot>[]);
   }
 
+  /// Synchronous peek at cached storage field structure (never loads from disk).
+  List<FieldStructure>? peekStorageFieldStructure(TableUid tableUid) {
+    return _storageFieldStructCache[tableUid];
+  }
+
   /// Get stable storage field structure used by the record binary codec.
   ///
   /// Structure is derived from the **persisted** field layout (or

@@ -2435,6 +2435,47 @@ final class TableTreePartitionManager {
     return ptr.isNull ? null : ptr;
   }
 
+  /// Synchronous primary-key point lookup from resident B+Tree page cache only.
+  ///
+  /// Requires [TableDataMeta], internal nodes, leaf page, and field structure
+  /// to all be present in memory caches. Returns null on any cache miss or when
+  /// the row uses overflow/legacy encoding that needs async decode.
+  Map<String, dynamic>? queryRecordByPrimaryKeyFromPageCacheSync({
+    required TableContext table,
+    required String pk,
+    TableSchema? schemaOverride,
+  }) {
+    if (pk.isEmpty) return null;
+    final schema = schemaOverride ?? table.schema;
+    if (schema.name.isEmpty) return null;
+
+    final meta = _dataStore.tableDataManager.peekTableDataMeta(table.tableUid);
+    if (meta == null || meta.btreeFirstLeaf.isNull) return null;
+
+    final fieldStruct =
+        _dataStore.tableMetaManager?.peekStorageFieldStructure(table.tableUid);
+    if (fieldStruct == null || fieldStruct.isEmpty) return null;
+
+    final keyBytes = schema.encodePrimaryKeyComponent(pk);
+    final leafPtr = _locateLeafForKeySync(table, meta, keyBytes);
+    if (leafPtr == null || leafPtr.isNull) return null;
+
+    final leaf = _leafPageCache.getPoint3(
+      table.tableUid,
+      leafPtr.partitionNo,
+      leafPtr.pageNo,
+    );
+    if (leaf == null) return null;
+
+    final pos = leaf.find(keyBytes);
+    if (pos == null) return null;
+
+    final decoded = _tryDecodeStoredRecordSync(leaf.values[pos], fieldStruct);
+    if (decoded == null) return null;
+
+    return TableSchema.rowWithPrimaryKeyFirst(schema.primaryKey, pk, decoded);
+  }
+
   /// Batch point lookup by primary keys.
   ///
   /// API shape matches existing caller expectations in `TableDataManager`.
