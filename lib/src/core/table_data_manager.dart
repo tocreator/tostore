@@ -1876,36 +1876,47 @@ class TableDataManager {
         growable: false,
       );
     } else {
-      recordIds = <String>[];
-      entries = <BufferEntry>[];
-      for (int i = 0; i < validCount; i++) {
-        final recordId = validBatchRecordIds[i];
-        final r = validBatchRecords![i];
-        final oldR = validBatchOldValues![i];
-
-        entries.add(BufferEntry(
-          data: r,
+      recordIds = validBatchRecordIds;
+      entries = List<BufferEntry>.generate(
+        validCount,
+        (i) => BufferEntry(
+          data: validBatchRecords![i],
           operation: operation,
           timestamp: ts,
           transactionId: bufferTxId,
           walPointer: pointers[i],
-          oldValues: oldR,
+          oldValues: validBatchOldValues![i],
           schemaVersion: schemaVersion,
-        ));
-        recordIds.add(recordId);
+        ),
+        growable: false,
+      );
 
-        if (operation == BufferOperationType.update) {
-          cacheTableRecord(table, recordId, r, schema);
-          _dataStore.indexManager?.updateIndexDataCacheSync(
-            table,
-            recordId,
-            oldR,
-            r,
-            overrideSchema: schema,
-          );
-        } else if (operation == BufferOperationType.delete) {
+      if (operation == BufferOperationType.update) {
+        cacheTableRecordsBatch(
+          table,
+          validBatchRecords!,
+          primaryKey: pkName,
+          schema: schema,
+        );
+        final indexMgr = _dataStore.indexManager;
+        if (indexMgr != null) {
+          for (int i = 0; i < validCount; i++) {
+            indexMgr.updateIndexDataCacheSync(
+              table,
+              validBatchRecordIds[i],
+              validBatchOldValues![i],
+              validBatchRecords[i],
+              overrideSchema: schema,
+            );
+          }
+        }
+      } else if (operation == BufferOperationType.delete) {
+        final indexMgr = _dataStore.indexManager;
+        for (int i = 0; i < validCount; i++) {
+          final recordId = validBatchRecordIds[i];
+          final r = validBatchRecords![i];
           removeTableRecord(table, recordId);
-          _dataStore.indexManager?.updateIndexDataCacheSync(
+          indexMgr?.updateIndexDataCacheSync(
             table,
             recordId,
             r,
@@ -4164,6 +4175,122 @@ class TableDataManager {
       return batchRes.records.first;
     }
     return null;
+  }
+
+  /// High-throughput batch query directly returning a `Map<String, Map<String, dynamic>>`
+  /// indexed by primary key. Hoists transaction context lookups out of the loop
+  /// and eliminates intermediate List allocations and secondary Map construction.
+  Future<Map<String, Map<String, dynamic>>> queryRecordsMapBatch(
+    TableContext table,
+    List<String> keys, {
+    Uint8List? encryptionKey,
+    int? encryptionKeyId,
+    bool readFromFileOnly = false,
+    TableSchema? decodeSchema,
+    List<FieldStructure>? decodeFieldStructureOverride,
+  }) async {
+    if (keys.isEmpty) {
+      return <String, Map<String, dynamic>>{};
+    }
+
+    final resultsMap = <String, Map<String, dynamic>>{};
+    final stillMissing = <String>[];
+
+    // 0. Resolve from memory tiers (Txn > WriteBuffer > _tableRecordCache)
+    final trees = _dataStore.writeBufferManager.bufferTrees;
+    final txId = TransactionContext.getCurrentTransactionId();
+    final useTxn = txId != null &&
+        !TransactionContext.isApplyingCommit() &&
+        _txnIdsWithOps.contains(txId);
+    final tableUid = table.tableUid;
+
+    for (int i = 0; i < keys.length; i++) {
+      final pk = keys[i];
+      if (readFromFileOnly) {
+        stillMissing.add(pk);
+        continue;
+      }
+
+      BufferEntry? entry;
+      var fromTxn = false;
+      if (useTxn) {
+        final tx = trees.getTxnRecord(txId, tableUid, pk);
+        if (tx != null) {
+          entry = tx;
+          fromTxn = true;
+        }
+      }
+      entry ??=
+          _dataStore.writeBufferManager.getBufferedRecordForRead(table, pk);
+      if (entry != null) {
+        if (entry.operation != BufferOperationType.delete) {
+          resultsMap[pk] = fromTxn ? _visibleTxnRecord(entry.data) : entry.data;
+        }
+      } else {
+        final cached = _tableRecordCache.getPoint2(tableUid, pk);
+        if (cached != null) {
+          resultsMap[pk] = cached;
+        } else {
+          stillMissing.add(pk);
+        }
+      }
+    }
+
+    if (stillMissing.isEmpty) {
+      return resultsMap;
+    }
+
+    // 1. Try Disk
+    final schema = decodeSchema ?? table.schema;
+    final pkName = schema.primaryKey;
+    final pkMatcher =
+        ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
+    if (_dataStore.tableTreePartitionManager == null) {
+      return resultsMap;
+    }
+
+    final diskResults =
+        await _dataStore.tableTreePartitionManager?.queryRecordsBatch(
+      table: table,
+      primaryKey: pkName,
+      keyComparator: pkMatcher,
+      keys: stillMissing,
+      encryptionKey: encryptionKey,
+      encryptionKeyId: encryptionKeyId,
+      schemaOverride: schema,
+      decodeFieldStructureOverride: decodeFieldStructureOverride,
+      readFromFileOnly: readFromFileOnly,
+    );
+
+    if (diskResults != null && diskResults.isNotEmpty) {
+      final fusedDiskRows = <Map<String, dynamic>>[];
+      for (final diskRow in diskResults) {
+        final fused = _fuseDiskRowAfterRead(
+          table,
+          diskRow,
+          pkName,
+          readFromFileOnly: readFromFileOnly,
+        );
+        if (fused != null) {
+          final pkVal = fused[pkName]?.toString();
+          if (pkVal != null && pkVal.isNotEmpty) {
+            resultsMap[pkVal] = fused;
+            fusedDiskRows.add(fused);
+          }
+        }
+      }
+
+      // Read-Through: Cache live rows only (skip tombstones / buffer-superseded).
+      if (fusedDiskRows.isNotEmpty && !readFromFileOnly) {
+        _asyncCacheDiskResults(
+          table: table,
+          diskResults: fusedDiskRows,
+          schema: schema,
+        );
+      }
+    }
+
+    return resultsMap;
   }
 
   /// Batch query with full consistency checking (Txn > Cache > Buffer > Disk).

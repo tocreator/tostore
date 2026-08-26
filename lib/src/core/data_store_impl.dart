@@ -5383,15 +5383,45 @@ class DataStoreImpl {
     // Reserved but not yet successfully buffered released on abort.
     final Set<String> outstandingReservedPks = <String>{};
 
-    final batchYield =
-        YieldController('DataStoreImpl.batchUpdate.batch', checkInterval: 1);
-    final executionYield =
-        YieldController('DataStoreImpl.batchUpdate.execute', checkInterval: 50);
+    final batchYield = YieldController(
+      'DataStoreImpl.batchUpdate.batch',
+      minCheckInterval: EngineCpuChunk.fastPathMinCheckInterval,
+    );
+    final executionYield = YieldController(
+      'DataStoreImpl.batchUpdate.execute',
+      minCheckInterval: EngineCpuChunk.hotPathMinCheckInterval,
+    );
     final hasNotify = notificationManager.hasListeners(schema.tableUid);
+    final bool hasSecondaryUnique = allUniqueIndexes.isNotEmpty;
+    final Set<String> uniqueFieldNames = hasSecondaryUnique
+        ? <String>{for (final idx in allUniqueIndexes) ...idx.fields}
+        : const <String>{};
+    final Map<String, FieldSchema> fieldMap = {
+      for (final field in schema.fields) field.name: field,
+    };
+
+    final bool hasActiveForeignKeys = _foreignKeyManager != null &&
+        schema.foreignKeys.any((fk) => fk.enabled);
+    final bool isSimpleBatch =
+        !hasSecondaryUnique && !hasActiveForeignKeys && promoteDesc == null;
+    final int batchSize = isSimpleBatch ? 2000 : 1000;
+
+    // Hoist reusable collections outside the sliding window loop to eliminate GC allocations
+    final List<String> windowPkList = [];
+    final List<Map<String, dynamic>> recordsToCommit = [];
+    final List<Map<String, dynamic>> oldRecordsToCommit = [];
+    final List<String> commitPkVals = [];
+    final List<int> commitGlobalIndices = [];
+    final Set<String> reservedPkSet = {};
+
+    final List<Map<String, dynamic>> recordsForUniqueDiskCheck = [];
+    final List<Set<String>> recordsChangedFieldsForUniqueCheck = [];
+    final List<int> commitIndicesForUniqueCheck = [];
+    final List<int> commitGlobalIndicesForUniqueCheck = [];
+    final Set<IndexSchema> affectedUniqueIndexesForBatch = {};
 
     parallelJournalManager.beginBatchOperation();
     try {
-      const int batchSize = 1000;
       int start = 0;
 
       while (start < records.length) {
@@ -5403,8 +5433,20 @@ class DataStoreImpl {
             : records.length;
         final int windowLen = end - start;
 
+        // Clear reusable collections for this window
+        windowPkList.clear();
+        recordsToCommit.clear();
+        oldRecordsToCommit.clear();
+        commitPkVals.clear();
+        commitGlobalIndices.clear();
+        reservedPkSet.clear();
+        recordsForUniqueDiskCheck.clear();
+        recordsChangedFieldsForUniqueCheck.clear();
+        commitIndicesForUniqueCheck.clear();
+        commitGlobalIndicesForUniqueCheck.clear();
+        affectedUniqueIndexesForBatch.clear();
+
         // 1. In-Window Identification & Resolution
-        final List<String> windowPkList = [];
         List<Map<String, dynamic>>? windowNeedsResolution;
         List<int>? windowNeedsResolutionIndices;
 
@@ -5503,15 +5545,8 @@ class DataStoreImpl {
         }
 
         // 2. Bulk Fetch Existing Records directly from storage (Txn > WriteBuffer > RecordCache > Disk)
-        final scanResult =
-            await tableDataManager.queryRecordsBatch(table, windowPkList);
-        final results = scanResult.records;
-
-        // Convert results to a map for O(1) lookup
-        final Map<String, Map<String, dynamic>> resultsMap = {
-          for (int rIdx = 0; rIdx < results.length; rIdx++)
-            results[rIdx][primaryKey].toString(): results[rIdx]
-        };
+        final resultsMap =
+            await tableDataManager.queryRecordsMapBatch(table, windowPkList);
 
         // 3. Fast-path check for strict error mode (if results missing items)
         if (!allowPartialErrors && resultsMap.length < windowPkList.length) {
@@ -5538,8 +5573,6 @@ class DataStoreImpl {
             writeBufferManager.createBatchReserveContext(table, txId);
 
         // Pre-probe foreign keys once per window if foreign keys are enabled
-        final bool hasActiveForeignKeys = _foreignKeyManager != null &&
-            schema.foreignKeys.any((fk) => fk.enabled);
         final List<DbException?>? windowFkViolations;
         if (hasActiveForeignKeys) {
           final windowRecords = records.sublist(start, end);
@@ -5553,27 +5586,6 @@ class DataStoreImpl {
         } else {
           windowFkViolations = null;
         }
-
-        // Hoist once per window: unique field names and field map
-        final Set<String> uniqueFieldNames = <String>{
-          for (final idx in allUniqueIndexes) ...idx.fields,
-        };
-        final Map<String, FieldSchema> fieldMap = {
-          for (final field in schema.fields) field.name: field,
-        };
-
-        final List<Map<String, dynamic>> recordsToCommit = [];
-        final List<Map<String, dynamic>> oldRecordsToCommit = [];
-        final List<String> commitPkVals = [];
-        final List<int> commitGlobalIndices = [];
-        final Set<String> reservedPkSet = {};
-
-        // Track items with unique index modifications that require disk checks
-        final List<Map<String, dynamic>> recordsForUniqueDiskCheck = [];
-        final List<Set<String>> recordsChangedFieldsForUniqueCheck = [];
-        final List<int> commitIndicesForUniqueCheck = [];
-        final List<int> commitGlobalIndicesForUniqueCheck = [];
-        final Set<IndexSchema> affectedUniqueIndexesForBatch = {};
 
         // 5. Single-Pass Pipeline over the current window
         for (int offset = 0; offset < windowLen; offset++) {
@@ -5615,8 +5627,8 @@ class DataStoreImpl {
             continue;
           }
 
-          // 5.1 In-Place Merge & Validate update payload (O(changed_fields) zero-allocation)
-          final updatedRecord = Map<String, dynamic>.of(existingRecord);
+          // 5.1 In-Place Merge & Validate update payload (Lazy Copy-on-Write)
+          Map<String, dynamic>? updatedRecord;
           final changedFields = <String>[];
           bool hasValidationError = false;
           DbException? validationException;
@@ -5674,7 +5686,8 @@ class DataStoreImpl {
                   finalValue = finalValue.substring(0, field.maxLength!);
                 }
 
-                if (updatedRecord[fieldName] != finalValue) {
+                if (existingRecord[fieldName] != finalValue) {
+                  updatedRecord ??= Map<String, dynamic>.of(existingRecord);
                   updatedRecord[fieldName] = finalValue;
                   changedFields.add(fieldName);
                 }
@@ -5684,11 +5697,15 @@ class DataStoreImpl {
               }
             } else {
               try {
-                field.checkConstraints(
+                final finalValue = field.fastValidateAndConvert(
                   proposed,
                   tableName: table.tableName,
-                  skipMaxLengthCheck: true,
                 );
+                if (existingRecord[fieldName] != finalValue) {
+                  updatedRecord ??= Map<String, dynamic>.of(existingRecord);
+                  updatedRecord[fieldName] = finalValue;
+                  changedFields.add(fieldName);
+                }
               } on DbException catch (e) {
                 hasValidationError = true;
                 validationException = e;
@@ -5697,20 +5714,6 @@ class DataStoreImpl {
                 hasValidationError = true;
                 validationErrorStr = e.toString();
                 break;
-              }
-
-              final converted = field.convertValue(proposed);
-              var finalValue = converted;
-              if (finalValue != null &&
-                  field.maxLength != null &&
-                  finalValue is String &&
-                  finalValue.length > field.maxLength!) {
-                finalValue = finalValue.substring(0, field.maxLength!);
-              }
-
-              if (updatedRecord[fieldName] != finalValue) {
-                updatedRecord[fieldName] = finalValue;
-                changedFields.add(fieldName);
               }
             }
           }
@@ -5757,12 +5760,11 @@ class DataStoreImpl {
             continue;
           }
 
-          if (changedFields.isEmpty) {
+          if (changedFields.isEmpty || updatedRecord == null) {
             final displayPk = promoteKeyDesc != null
                 ? _promoteUserFacingSuccessKey(
-                    updatedRecord,
+                    existingRecord,
                     promoteKeyDesc,
-                    alternateRecord: existingRecord,
                   )
                 : pkVal;
             if (returnResultDetails) {
@@ -5819,7 +5821,7 @@ class DataStoreImpl {
           }
 
           // 5.4 Unique Reservation Check
-          final bool needsReserve = uniqueFieldNames.isNotEmpty &&
+          final bool needsReserve = hasSecondaryUnique &&
               changedFields.any(uniqueFieldNames.contains);
 
           if (needsReserve) {
@@ -6003,6 +6005,7 @@ class DataStoreImpl {
             oldRecordsList: oldRecordsToCommit,
             transactionId: txId,
             schemaVersion: schema.schemaVersion ?? '',
+            deferQueryCacheInvalidation: true,
           );
 
           final successSet = commitResult.successRecordIds.toSet();
@@ -6066,6 +6069,8 @@ class DataStoreImpl {
         // Advance sliding window!
         start = end;
       }
+
+      queryExecutor.invalidateQueryCacheForTable(table);
 
       final List<ResultStatus> finalStatuses;
       if (returnResultDetails) {

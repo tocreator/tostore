@@ -2358,6 +2358,135 @@ class FieldSchema {
     }
   }
 
+  /// Whether this field has min/max length or value constraints configured.
+  bool get hasValueConstraints =>
+      maxLength != null ||
+      minLength != null ||
+      minValue != null ||
+      maxValue != null;
+
+  /// Fast validation and conversion in one pass for batch update/insert paths.
+  ///
+  /// If the proposed value already matches the target type and satisfies constraints,
+  /// returns the valid value directly without redundant type checks and duplicate conversions.
+  dynamic fastValidateAndConvert(dynamic value, {required String tableName}) {
+    if (value == null) {
+      if (!nullable) {
+        throw DbException([
+          ConstraintStatus(
+            type: ResultType.bizNotNullViolation,
+            message:
+                'Field $name is required and cannot be null (table $tableName)',
+            tableName: tableName,
+            fields: [name],
+          )
+        ]);
+      }
+      return null;
+    }
+
+    // Fast path: direct type match without extra conversions
+    switch (type) {
+      case DataType.text:
+        if (value is String) {
+          if (maxLength != null && value.length > maxLength!) {
+            return value.substring(0, maxLength!);
+          }
+          if (minLength != null && value.length < minLength!) {
+            throw DbException([
+              ConstraintStatus(
+                type: ResultType.bizValueLessThanMinLength,
+                message:
+                    'Field $name length ${value.length} is less than minLength $minLength (table $tableName)',
+                tableName: tableName,
+                fields: [name],
+                conflictingKeys: [value],
+              )
+            ]);
+          }
+          return value;
+        }
+        break;
+      case DataType.integer:
+        if (value is int) {
+          if (minValue != null && value < minValue!) {
+            throw DbException([
+              ConstraintStatus(
+                type: ResultType.bizValueLessThanMinValue,
+                message:
+                    'Field $name value $value is less than minValue $minValue (table $tableName)',
+                tableName: tableName,
+                fields: [name],
+                conflictingKeys: [value],
+              )
+            ]);
+          }
+          if (maxValue != null && value > maxValue!) {
+            throw DbException([
+              ConstraintStatus(
+                type: ResultType.bizValueExceedsMaxValue,
+                message:
+                    'Field $name value $value exceeds maxValue $maxValue (table $tableName)',
+                tableName: tableName,
+                fields: [name],
+                conflictingKeys: [value],
+              )
+            ]);
+          }
+          return value;
+        }
+        break;
+      case DataType.double:
+        if (value is double) {
+          if (minValue != null && value < minValue!) {
+            throw DbException([
+              ConstraintStatus(
+                type: ResultType.bizValueLessThanMinValue,
+                message:
+                    'Field $name value $value is less than minValue $minValue (table $tableName)',
+                tableName: tableName,
+                fields: [name],
+                conflictingKeys: [value],
+              )
+            ]);
+          }
+          if (maxValue != null && value > maxValue!) {
+            throw DbException([
+              ConstraintStatus(
+                type: ResultType.bizValueExceedsMaxValue,
+                message:
+                    'Field $name value $value exceeds maxValue $maxValue (table $tableName)',
+                tableName: tableName,
+                fields: [name],
+                conflictingKeys: [value],
+              )
+            ]);
+          }
+          return value;
+        }
+        break;
+      case DataType.boolean:
+        if (value is bool) {
+          return value;
+        }
+        break;
+      case DataType.dynamic:
+        return value;
+      default:
+        break;
+    }
+
+    // Fallback to standard checkConstraints + convertValue
+    checkConstraints(value, tableName: tableName, skipMaxLengthCheck: true);
+    final converted = convertValue(value);
+    if (converted is String &&
+        maxLength != null &&
+        converted.length > maxLength!) {
+      return converted.substring(0, maxLength!);
+    }
+    return converted;
+  }
+
   /// Returns `null` when the value is valid, otherwise returns a human-readable
   /// description of which constraint failed. This is designed for single-record
   /// validation and does not perform any table-wide scan.

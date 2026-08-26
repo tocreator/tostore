@@ -252,6 +252,7 @@ class WriteBufferManager {
         .applyEnqueueBackpressure(recordIds.length);
     if (bp != null) await bp;
 
+    final pendingQueue = <WriteQueueEntry>[];
     for (int i = 0; i < recordIds.length; i++) {
       final y = yieldController.maybeYield();
       if (y != null) await y;
@@ -281,11 +282,14 @@ class WriteBufferManager {
       if (bgMaybeActive) {
         bgScheduler.handleOnlineWrite(table, recordId);
       }
-      _writeQueue.add(WriteQueueEntry(
+      pendingQueue.add(WriteQueueEntry(
         tableUid: tableUid,
         recordId: recordId,
         walPointer: wp,
       ));
+    }
+    if (pendingQueue.isNotEmpty) {
+      _writeQueue.addAll(pendingQueue);
     }
 
     _emitSizeChanged();
@@ -362,11 +366,13 @@ class WriteBufferManager {
         installAllIndexes: installAllIndexes,
         indexPlan: indexPlan,
       );
-      commitReservedUniques(
-        table: table,
-        recordId: recordId,
-        transactionId: entry.transactionId ?? batchTxId,
-      );
+      if (_lastReserveRollback.isNotEmpty) {
+        commitReservedUniques(
+          table: table,
+          recordId: recordId,
+          transactionId: entry.transactionId ?? batchTxId,
+        );
+      }
 
       if (!skipQueue && effective != null && effective.walPointer != null) {
         _writeQueue.add(WriteQueueEntry(
