@@ -340,6 +340,8 @@ class WriteBufferManager {
         .applyEnqueueBackpressure(recordIds.length);
     if (bp != null) await bp;
 
+    final pendingQueue = <WriteQueueEntry>[];
+    final bool trackReserveRollback = _lastReserveRollback.isNotEmpty;
     for (int i = 0; i < recordIds.length; i++) {
       final y = yieldController.maybeYield();
       if (y != null) await y;
@@ -366,7 +368,7 @@ class WriteBufferManager {
         installAllIndexes: installAllIndexes,
         indexPlan: indexPlan,
       );
-      if (_lastReserveRollback.isNotEmpty) {
+      if (trackReserveRollback) {
         commitReservedUniques(
           table: table,
           recordId: recordId,
@@ -375,12 +377,15 @@ class WriteBufferManager {
       }
 
       if (!skipQueue && effective != null && effective.walPointer != null) {
-        _writeQueue.add(WriteQueueEntry(
+        pendingQueue.add(WriteQueueEntry(
           tableUid: table.tableUid,
           recordId: recordId,
           walPointer: effective.walPointer!,
         ));
       }
+    }
+    if (pendingQueue.isNotEmpty) {
+      _writeQueue.addAll(pendingQueue);
     }
 
     _emitSizeChanged();

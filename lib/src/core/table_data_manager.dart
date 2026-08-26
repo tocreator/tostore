@@ -1638,6 +1638,10 @@ class TableDataManager {
     required String schemaVersion,
     bool installUniquesOnApply = false,
     bool deferQueryCacheInvalidation = false,
+
+    /// When true, skip per-row index hot-cache sync on batch update.
+    /// Safe when changed columns do not affect any index (e.g. simple PK-only tables).
+    bool skipIndexCacheSync = false,
   }) async {
     if (records.isEmpty) {
       return (
@@ -1898,16 +1902,18 @@ class TableDataManager {
           primaryKey: pkName,
           schema: schema,
         );
-        final indexMgr = _dataStore.indexManager;
-        if (indexMgr != null) {
-          for (int i = 0; i < validCount; i++) {
-            indexMgr.updateIndexDataCacheSync(
-              table,
-              validBatchRecordIds[i],
-              validBatchOldValues![i],
-              validBatchRecords[i],
-              overrideSchema: schema,
-            );
+        if (!skipIndexCacheSync) {
+          final indexMgr = _dataStore.indexManager;
+          if (indexMgr != null) {
+            for (int i = 0; i < validCount; i++) {
+              indexMgr.updateIndexDataCacheSync(
+                table,
+                validBatchRecordIds[i],
+                validBatchOldValues![i],
+                validBatchRecords[i],
+                overrideSchema: schema,
+              );
+            }
           }
         }
       } else if (operation == BufferOperationType.delete) {

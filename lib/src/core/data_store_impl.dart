@@ -5373,8 +5373,8 @@ class DataStoreImpl {
     final allUniqueIndexes =
         tableMetaManager?.getUniqueIndexesFor(schema) ?? <IndexSchema>[];
 
-    final successKeys = <String>[];
-    final failedKeys = <String>[];
+    final successKeys = returnResultDetails ? <String>[] : const <String>[];
+    final failedKeys = returnResultDetails ? <String>[] : const <String>[];
     int successCount = 0;
     int failedCount = 0;
     final statusSlots = returnResultDetails
@@ -5419,6 +5419,7 @@ class DataStoreImpl {
     final List<int> commitIndicesForUniqueCheck = [];
     final List<int> commitGlobalIndicesForUniqueCheck = [];
     final Set<IndexSchema> affectedUniqueIndexesForBatch = {};
+    final changedFields = <String>[];
 
     parallelJournalManager.beginBatchOperation();
     try {
@@ -5568,9 +5569,10 @@ class DataStoreImpl {
           ));
         }
 
-        // 4. Optimization: Create batch context to hoist table/buffer lookups
-        final batchContext =
-            writeBufferManager.createBatchReserveContext(table, txId);
+        // 4. Create batch reserve context only when secondary unique indexes exist.
+        final batchContext = hasSecondaryUnique
+            ? writeBufferManager.createBatchReserveContext(table, txId)
+            : null;
 
         // Pre-probe foreign keys once per window if foreign keys are enabled
         final List<DbException?>? windowFkViolations;
@@ -5629,7 +5631,7 @@ class DataStoreImpl {
 
           // 5.1 In-Place Merge & Validate update payload (Lazy Copy-on-Write)
           Map<String, dynamic>? updatedRecord;
-          final changedFields = <String>[];
+          changedFields.clear();
           bool hasValidationError = false;
           DbException? validationException;
           String? validationErrorStr;
@@ -5831,8 +5833,16 @@ class DataStoreImpl {
                 affectedUniqueIndexesForBatch.add(idx);
               }
             }
+            final reserveCtx = batchContext;
+            if (reserveCtx == null) {
+              Logger.error(
+                'Unique reservation context missing for table ${table.tableName}',
+              );
+              failedCount++;
+              continue;
+            }
             try {
-              batchContext.tryReserve(
+              reserveCtx.tryReserve(
                 pkVal,
                 updatedRecord,
                 isUpdate: true,
@@ -6006,50 +6016,52 @@ class DataStoreImpl {
             transactionId: txId,
             schemaVersion: schema.schemaVersion ?? '',
             deferQueryCacheInvalidation: true,
+            skipIndexCacheSync: isSimpleBatch,
           );
 
-          final successSet = commitResult.successRecordIds.toSet();
-          for (int k = 0; k < recordsToCommit.length; k++) {
-            final pkVal = commitPkVals[k];
-            final globalIdx = commitGlobalIndices[k];
-            if (successSet.contains(pkVal)) {
-              final displayPk = promoteKeyDesc != null
-                  ? _promoteUserFacingSuccessKey(
-                      recordsToCommit[k], promoteKeyDesc)
-                  : pkVal;
-              if (returnResultDetails) {
+          if (returnResultDetails) {
+            final successSet = commitResult.successRecordIds.toSet();
+            for (int k = 0; k < recordsToCommit.length; k++) {
+              final pkVal = commitPkVals[k];
+              final globalIdx = commitGlobalIndices[k];
+              if (successSet.contains(pkVal)) {
+                final displayPk = promoteKeyDesc != null
+                    ? _promoteUserFacingSuccessKey(
+                        recordsToCommit[k], promoteKeyDesc)
+                    : pkVal;
                 successKeys.add(displayPk);
                 statusSlots![globalIdx] = SuccessStatus(
                   message: 'Record updated successfully',
                   index: globalIdx,
                   primaryKey: displayPk,
                 );
-              }
-              successCount++;
-            } else {
-              if (returnResultDetails) {
+                successCount++;
+              } else {
                 failedKeys.add(pkVal);
                 statusSlots![globalIdx] = GeneralStatus(
                   type: ResultType.engError,
                   message: 'Buffer write failed for pk=$pkVal',
                   index: globalIdx,
                 );
-              }
-              failedCount++;
-              if (reservedPkSet.contains(pkVal)) {
-                writeBufferManager.releaseReservedUniques(
-                  table: table,
-                  recordId: pkVal,
-                  transactionId: txId,
-                );
-                outstandingReservedPks.remove(pkVal);
+                failedCount++;
+                if (reservedPkSet.contains(pkVal)) {
+                  writeBufferManager.releaseReservedUniques(
+                    table: table,
+                    recordId: pkVal,
+                    transactionId: txId,
+                  );
+                  outstandingReservedPks.remove(pkVal);
+                }
               }
             }
+          } else {
+            successCount += commitResult.successRecordIds.length;
           }
           outstandingReservedPks.removeAll(commitResult.successRecordIds);
 
           if (commitResult.successRecordIds.isNotEmpty &&
               (promoteWritten != null || hasNotify)) {
+            final successSet = commitResult.successRecordIds.toSet();
             for (int k = 0; k < recordsToCommit.length; k++) {
               if (successSet.contains(commitPkVals[k])) {
                 promoteWritten?.add(recordsToCommit[k]);
