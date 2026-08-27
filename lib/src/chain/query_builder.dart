@@ -407,6 +407,61 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     );
   }
 
+  /// Match records using dense vector similarity search.
+  ///
+  /// [field] The vector field name to search on.
+  /// [vector] Query vector (accepts [VectorData], `List<num>`, or `Float32List`).
+  /// [weight] Fusion weight multiplier (default: 1.0).
+  /// [efSearch] NGH algorithm search expansion factor (higher = more accurate, slight latency increase).
+  /// [distanceThreshold] Maximum distance threshold to consider as a candidate.
+  /// [minScore] Minimum normalized similarity score threshold [0.0 ~ 1.0].
+  QueryBuilder matchVector(
+    String field,
+    dynamic vector, {
+    double weight = 1.0,
+    int? efSearch,
+    double? distanceThreshold,
+    double? minScore,
+  }) {
+    _conditionCount++;
+    _ensureConditionTree();
+    _condition!.matchVector(
+      field,
+      vector,
+      weight: weight,
+      efSearch: efSearch,
+      distanceThreshold: distanceThreshold,
+      minScore: minScore,
+    );
+    _clauseFlags |= QueryClauseMask.matchVector;
+    _onChanged();
+    return this;
+  }
+
+  /// OR branch with vector similarity search.
+  QueryBuilder orMatchVector(
+    String field,
+    dynamic vector, {
+    double weight = 1.0,
+    int? efSearch,
+    double? distanceThreshold,
+    double? minScore,
+  }) {
+    _conditionCount++;
+    _ensureConditionTree();
+    _condition!.orMatchVector(
+      field,
+      vector,
+      weight: weight,
+      efSearch: efSearch,
+      distanceThreshold: distanceThreshold,
+      minScore: minScore,
+    );
+    _clauseFlags |= QueryClauseMask.matchVector;
+    _onChanged();
+    return this;
+  }
+
   /// Synchronously retrieve the first matching record from pure memory cache.
   ///
   /// Returns null if not found in memory cache.
@@ -547,6 +602,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
 
     return ExecuteResult(
       records: results,
+      retrieval: result.retrieval,
       nextCursor: result.nextCursor,
       prevCursor: result.prevCursor,
       hasMore: result.hasMore,
@@ -707,6 +763,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
 
     final queryResult = QueryResult.success(
       data: result.records,
+      retrieval: result.retrieval,
       prevCursor: result.prevCursor,
       nextCursor: result.nextCursor,
       hasMore: result.hasMore,
@@ -893,6 +950,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       final processed = _processManyTableResults(results, aggs: combinedAggs);
       return ExecuteResult(
         records: processed,
+        retrieval: result.retrieval,
         nextCursor: result.nextCursor,
         prevCursor: result.prevCursor,
         hasMore: result.hasMore,
@@ -957,6 +1015,8 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       }).toList();
     }
 
+    RetrievalContext? effectiveRetrieval = result.retrieval;
+
     // apply distinct modifier if requested
     if (_distinct && results.isNotEmpty) {
       final seen = <String, bool>{};
@@ -967,35 +1027,88 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
               : results.first.keys.toList());
 
       final yieldController = YieldController('QueryBuilder.distinct');
-      for (final r in results) {
-        final y1 = yieldController.maybeYield();
-        if (y1 != null) await y1;
-        final sig = fieldsToCheck.map((f) => r[f]?.toString() ?? '').join('|');
-        if (!seen.containsKey(sig)) {
-          seen[sig] = true;
-          distinctResults.add(r);
+
+      if (effectiveRetrieval != null) {
+        // Hybrid search path: preserve 1:1 retrieval entries alignment
+        final distinctEntries = <RetrievalEntry>[];
+        final currentEntries = effectiveRetrieval.entries;
+        for (int i = 0; i < results.length; i++) {
+          final y1 = yieldController.maybeYield();
+          if (y1 != null) await y1;
+          final r = results[i];
+          final sig =
+              fieldsToCheck.map((f) => r[f]?.toString() ?? '').join('|');
+          if (!seen.containsKey(sig)) {
+            seen[sig] = true;
+            distinctResults.add(r);
+            if (i < currentEntries.length) {
+              distinctEntries.add(currentEntries[i]);
+            }
+          }
         }
+        results = distinctResults;
+        effectiveRetrieval = RetrievalContext(
+          entries: distinctEntries,
+          fusionMethod: effectiveRetrieval.fusionMethod,
+          meta: effectiveRetrieval.meta,
+        );
+      } else {
+        // Pure relational fast-path: zero index calculation & zero extra allocations
+        for (final r in results) {
+          final y1 = yieldController.maybeYield();
+          if (y1 != null) await y1;
+          final sig =
+              fieldsToCheck.map((f) => r[f]?.toString() ?? '').join('|');
+          if (!seen.containsKey(sig)) {
+            seen[sig] = true;
+            distinctResults.add(r);
+          }
+        }
+        results = distinctResults;
       }
-      results = distinctResults;
     }
 
     // apply having condition post-processing if necessary
     if (_havingCondition != null) {
       final passedGroups = <Map<String, dynamic>>[];
       final yieldController = YieldController('QueryBuilder.having');
-      for (final groupRow in results) {
-        final y2 = yieldController.maybeYield();
-        if (y2 != null) await y2;
-        if (_havingCondition!.matches(groupRow)) {
-          passedGroups.add(groupRow);
-        }
-      }
 
-      results = passedGroups;
+      if (effectiveRetrieval != null) {
+        final passedEntries = <RetrievalEntry>[];
+        final currentEntries = effectiveRetrieval.entries;
+        for (int i = 0; i < results.length; i++) {
+          final y2 = yieldController.maybeYield();
+          if (y2 != null) await y2;
+          final groupRow = results[i];
+          if (_havingCondition!.matches(groupRow)) {
+            passedGroups.add(groupRow);
+            if (i < currentEntries.length) {
+              passedEntries.add(currentEntries[i]);
+            }
+          }
+        }
+        results = passedGroups;
+        effectiveRetrieval = RetrievalContext(
+          entries: passedEntries,
+          fusionMethod: effectiveRetrieval.fusionMethod,
+          meta: effectiveRetrieval.meta,
+        );
+      } else {
+        // Pure relational fast-path
+        for (final groupRow in results) {
+          final y2 = yieldController.maybeYield();
+          if (y2 != null) await y2;
+          if (_havingCondition!.matches(groupRow)) {
+            passedGroups.add(groupRow);
+          }
+        }
+        results = passedGroups;
+      }
     }
 
     return ExecuteResult(
       records: results,
+      retrieval: effectiveRetrieval,
       nextCursor: result.nextCursor,
       prevCursor: result.prevCursor,
       hasMore: result.hasMore,

@@ -16,11 +16,13 @@ import '../handler/memcomparable.dart';
 import '../handler/parallel_processor.dart';
 import '../handler/topk_heap.dart';
 import '../handler/value_matcher.dart';
+import '../interface/chain_builder.dart';
 import '../model/cancellation_token.dart';
 import '../model/db_exception.dart';
 import '../model/index_search.dart';
 import '../model/join_clause.dart';
 import '../model/query_aggregation.dart';
+import '../model/query_result.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/table_context.dart';
@@ -729,6 +731,25 @@ class QueryExecutor {
       // For JOIN queries, unprefixed fields are assumed to belong to the main table.
       // This preserves existing QueryBuilder behavior while centralizing planning here.
       where = _prefixMainTableForJoinWhere(table, where);
+    }
+
+    // Hybrid retrieval and vector multi-way recall interception (O(1) bitmask check)
+    final bool isVectorQuery = clauseFlags != -1
+        ? (clauseFlags & QueryClauseMask.matchVector != 0)
+        : _VectorMatchSpec.containsVector(where);
+
+    if (isVectorQuery) {
+      return await _executeHybridRetrieval(
+        table,
+        condition: condition ?? QueryCondition(),
+        where: where ?? const {},
+        orderBy: effectiveOrderBy,
+        limit: limit,
+        offset: offset,
+        readFromFileOnly: readFromFileOnly,
+        promoteDesc: promoteDesc,
+        applyPromoteResultTransform: applyPromoteResultTransform,
+      );
     }
 
     // Plan Cache lookup by structural shape
@@ -4355,6 +4376,681 @@ class QueryExecutor {
       }
     }
   }
+
+  /// Hybrid retrieval and fusion execution entry point.
+  Future<ExecuteResult> _executeHybridRetrieval(
+    TableContext table, {
+    required QueryCondition condition,
+    required Map<String, dynamic> where,
+    List<String>? orderBy,
+    int? limit,
+    int? offset,
+    bool readFromFileOnly = false,
+    PromoteRuntimeDescriptor? promoteDesc,
+    bool applyPromoteResultTransform = false,
+  }) async {
+    final effectiveLimit = limit ?? _dataStore.config.defaultQueryLimit;
+    final effectiveOffset = offset ?? 0;
+
+    final shape = _HybridQueryShape.analyze(where);
+
+    if (!shape.isMultiWay && shape.singleVectorSpec != null) {
+      if (shape.globalFilter == null || shape.globalFilter!.isEmpty) {
+        // Pure single-vector search
+        return await _executeSingleVectorRetrieval(
+          table,
+          spec: shape.singleVectorSpec!,
+          effectiveLimit: effectiveLimit,
+          effectiveOffset: effectiveOffset,
+          readFromFileOnly: readFromFileOnly,
+          promoteDesc: promoteDesc,
+          applyPromoteResultTransform: applyPromoteResultTransform,
+        );
+      } else {
+        // AND filtered vector search (Structured + Vector)
+        return await _executeVectorWithFilterRetrieval(
+          table,
+          spec: shape.singleVectorSpec!,
+          structuredWhere: shape.globalFilter!,
+          effectiveLimit: effectiveLimit,
+          effectiveOffset: effectiveOffset,
+          readFromFileOnly: readFromFileOnly,
+          promoteDesc: promoteDesc,
+          applyPromoteResultTransform: applyPromoteResultTransform,
+        );
+      }
+    }
+
+    // Multi-way Hybrid Recall (OR branches, text, vector, structured) with RRF Fusion
+    return await _executeMultiWayHybridFusion(
+      table,
+      recallBranches: shape.recallBranches,
+      globalFilter: shape.globalFilter,
+      effectiveLimit: effectiveLimit,
+      effectiveOffset: effectiveOffset,
+      readFromFileOnly: readFromFileOnly,
+      promoteDesc: promoteDesc,
+      applyPromoteResultTransform: applyPromoteResultTransform,
+    );
+  }
+
+  Future<ExecuteResult> _executeSingleVectorRetrieval(
+    TableContext table, {
+    required _VectorMatchSpec spec,
+    required int effectiveLimit,
+    required int effectiveOffset,
+    bool readFromFileOnly = false,
+    PromoteRuntimeDescriptor? promoteDesc,
+    bool applyPromoteResultTransform = false,
+  }) async {
+    final vectorIndexMgr = _dataStore.vectorIndexManager;
+    if (vectorIndexMgr == null) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Vector index manager is not initialized',
+        )
+      ]);
+    }
+
+    final int candidateK = effectiveOffset + effectiveLimit + 1;
+    final vecResults = await vectorIndexMgr.vectorSearch(
+      table: table,
+      fieldName: spec.field,
+      queryVector: spec.vector,
+      topK: candidateK,
+      efSearch: spec.efSearch,
+      distanceThreshold: spec.distanceThreshold,
+    );
+
+    if (vecResults.isEmpty) {
+      return const ExecuteResult(
+        records: [],
+        retrieval: RetrievalContext(
+          entries: [],
+          fusionMethod: RetrievalFusionMethod.single,
+        ),
+      );
+    }
+
+    var candidates = vecResults;
+    if (spec.minScore != null) {
+      candidates = candidates.where((r) => r.score >= spec.minScore!).toList();
+    }
+
+    final bool hasMore = candidates.length > (effectiveOffset + effectiveLimit);
+    final pageCandidates =
+        candidates.skip(effectiveOffset).take(effectiveLimit).toList();
+
+    final records = <Map<String, dynamic>>[];
+    final entries = <RetrievalEntry>[];
+    final yieldController =
+        YieldController('QueryExecutor.singleVectorHydrate');
+
+    for (int i = 0; i < pageCandidates.length; i++) {
+      final y = yieldController.maybeYield();
+      if (y != null) await y;
+
+      final cand = pageCandidates[i];
+      Map<String, dynamic>? rec;
+      if (!readFromFileOnly) {
+        rec = _dataStore.tableDataManager.getRecordByPrimaryKeySync(
+          table,
+          cand.primaryKey,
+        );
+      }
+      rec ??= await _dataStore.tableDataManager.getRecordByPrimaryKey(
+        table,
+        cand.primaryKey,
+        readFromFileOnly: readFromFileOnly,
+      );
+
+      if (rec != null) {
+        final Map<String, dynamic> row;
+        if (promoteDesc != null && applyPromoteResultTransform) {
+          row = Map<String, dynamic>.from(rec);
+          transformPromoteOldToNewInPlace(row, promoteDesc);
+        } else {
+          row = rec;
+        }
+        records.add(row);
+        entries.add(RetrievalEntry(
+          score: cand.score,
+          channel: RetrievalChannel.vector,
+          rawScore: cand.distance,
+          meta: {
+            'distance': cand.distance,
+            'field': spec.field,
+          },
+        ));
+      }
+    }
+
+    return ExecuteResult(
+      records: records,
+      retrieval: RetrievalContext(
+        entries: entries,
+        fusionMethod: RetrievalFusionMethod.single,
+      ),
+      hasMore: hasMore,
+      hasPrev: effectiveOffset > 0,
+      count: records.length,
+    );
+  }
+
+  Future<ExecuteResult> _executeVectorWithFilterRetrieval(
+    TableContext table, {
+    required _VectorMatchSpec spec,
+    required Map<String, dynamic> structuredWhere,
+    required int effectiveLimit,
+    required int effectiveOffset,
+    bool readFromFileOnly = false,
+    PromoteRuntimeDescriptor? promoteDesc,
+    bool applyPromoteResultTransform = false,
+  }) async {
+    final vectorIndexMgr = _dataStore.vectorIndexManager;
+    if (vectorIndexMgr == null) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Vector index manager is not initialized',
+        )
+      ]);
+    }
+
+    final int recallPool = max((effectiveOffset + effectiveLimit) * 4, 100);
+    final vecResults = await vectorIndexMgr.vectorSearch(
+      table: table,
+      fieldName: spec.field,
+      queryVector: spec.vector,
+      topK: recallPool,
+      efSearch: spec.efSearch,
+      distanceThreshold: spec.distanceThreshold,
+    );
+
+    if (vecResults.isEmpty) {
+      return const ExecuteResult(
+        records: [],
+        retrieval: RetrievalContext(
+          entries: [],
+          fusionMethod: RetrievalFusionMethod.single,
+        ),
+      );
+    }
+
+    final filterCondition = QueryCondition.fromMap(structuredWhere);
+    final matcher = ConditionRecordMatcher.prepare(
+      filterCondition,
+      {table.tableName.toString(): table.schema},
+      table.tableName.toString(),
+    );
+
+    final qualifiedCandidates =
+        <({VectorSearchResult result, Map<String, dynamic> record})>[];
+    final yieldController =
+        YieldController('QueryExecutor.vectorFilterHydrate');
+
+    for (final cand in vecResults) {
+      final y = yieldController.maybeYield();
+      if (y != null) await y;
+
+      if (spec.minScore != null && cand.score < spec.minScore!) continue;
+
+      Map<String, dynamic>? rec;
+      if (!readFromFileOnly) {
+        rec = _dataStore.tableDataManager.getRecordByPrimaryKeySync(
+          table,
+          cand.primaryKey,
+        );
+      }
+      rec ??= await _dataStore.tableDataManager.getRecordByPrimaryKey(
+        table,
+        cand.primaryKey,
+        readFromFileOnly: readFromFileOnly,
+      );
+
+      if (rec != null && matcher.matches(rec)) {
+        qualifiedCandidates.add((result: cand, record: rec));
+      }
+    }
+
+    final bool hasMore =
+        qualifiedCandidates.length > (effectiveOffset + effectiveLimit);
+    final page =
+        qualifiedCandidates.skip(effectiveOffset).take(effectiveLimit).toList();
+
+    final records = <Map<String, dynamic>>[];
+    final entries = <RetrievalEntry>[];
+
+    for (final item in page) {
+      final Map<String, dynamic> row;
+      if (promoteDesc != null && applyPromoteResultTransform) {
+        row = Map<String, dynamic>.from(item.record);
+        transformPromoteOldToNewInPlace(row, promoteDesc);
+      } else {
+        row = item.record;
+      }
+      records.add(row);
+      entries.add(RetrievalEntry(
+        score: item.result.score,
+        channel: RetrievalChannel.vector,
+        rawScore: item.result.distance,
+        meta: {
+          'distance': item.result.distance,
+          'field': spec.field,
+        },
+      ));
+    }
+
+    return ExecuteResult(
+      records: records,
+      retrieval: RetrievalContext(
+        entries: entries,
+        fusionMethod: RetrievalFusionMethod.single,
+      ),
+      hasMore: hasMore,
+      hasPrev: effectiveOffset > 0,
+      count: records.length,
+    );
+  }
+
+  Future<ExecuteResult> _executeMultiWayHybridFusion(
+    TableContext table, {
+    required List<Map<String, dynamic>> recallBranches,
+    Map<String, dynamic>? globalFilter,
+    required int effectiveLimit,
+    required int effectiveOffset,
+    bool readFromFileOnly = false,
+    PromoteRuntimeDescriptor? promoteDesc,
+    bool applyPromoteResultTransform = false,
+  }) async {
+    final int recallPerChannel =
+        max((effectiveOffset + effectiveLimit) * 3, 50);
+
+    final channelHits = <String,
+        Map<
+            String,
+            ({
+              int rank,
+              double? rawScore,
+              double score,
+              RetrievalChannel channel,
+              Map<String, dynamic>? meta
+            })>>{};
+    final channelWeights = <String, double>{};
+
+    ConditionRecordMatcher? globalMatcher;
+    if (globalFilter != null && globalFilter.isNotEmpty) {
+      globalMatcher = ConditionRecordMatcher.prepare(
+        QueryCondition.fromMap(globalFilter),
+        {table.tableName.toString(): table.schema},
+        table.tableName.toString(),
+      );
+    }
+
+    final yieldController = YieldController('QueryExecutor.hybridFusion');
+
+    for (int branchIdx = 0; branchIdx < recallBranches.length; branchIdx++) {
+      final branch = recallBranches[branchIdx];
+      final branchKey = 'channel_$branchIdx';
+      final hits = <String,
+          ({
+        int rank,
+        double? rawScore,
+        double score,
+        RetrievalChannel channel,
+        Map<String, dynamic>? meta
+      })>{};
+
+      if (_VectorMatchSpec.containsVector(branch)) {
+        final spec = _VectorMatchSpec.extract(branch);
+        if (spec != null) {
+          channelWeights[branchKey] = spec.weight;
+          final vecResults = await _dataStore.vectorIndexManager?.vectorSearch(
+                table: table,
+                fieldName: spec.field,
+                queryVector: spec.vector,
+                topK: recallPerChannel,
+                efSearch: spec.efSearch,
+                distanceThreshold: spec.distanceThreshold,
+              ) ??
+              const <VectorSearchResult>[];
+
+          int rank = 1;
+          for (final r in vecResults) {
+            if (spec.minScore != null && r.score < spec.minScore!) continue;
+            hits[r.primaryKey] = (
+              rank: rank++,
+              rawScore: r.distance,
+              score: r.score,
+              channel: RetrievalChannel.vector,
+              meta: {'distance': r.distance, 'field': spec.field},
+            );
+          }
+        }
+      } else {
+        channelWeights[branchKey] = 1.0;
+        final subResult = await execute(
+          table,
+          condition: QueryCondition.fromMap(branch),
+          limit: recallPerChannel,
+          readFromFileOnly: readFromFileOnly,
+        );
+
+        final pkField = table.schema.primaryKey;
+        for (int rank = 0; rank < subResult.records.length; rank++) {
+          final rec = subResult.records[rank];
+          final pk = rec[pkField]?.toString();
+          if (pk != null && pk.isNotEmpty) {
+            hits[pk] = (
+              rank: rank + 1,
+              rawScore: null,
+              score: 1.0 / (rank + 1),
+              channel: RetrievalChannel.structured,
+              meta: {'structuredBranch': branch},
+            );
+          }
+        }
+      }
+
+      channelHits[branchKey] = hits;
+    }
+
+    final rrfScores = <String, double>{};
+    final pkContributions = <String, Map<String, dynamic>>{};
+
+    for (final entry in channelHits.entries) {
+      final channelKey = entry.key;
+      final hits = entry.value;
+      final weight = channelWeights[channelKey] ?? 1.0;
+
+      for (final hit in hits.entries) {
+        final pk = hit.key;
+        final info = hit.value;
+        final rrfDelta = weight / (60.0 + info.rank);
+        rrfScores[pk] = (rrfScores[pk] ?? 0.0) + rrfDelta;
+
+        final contrib =
+            pkContributions.putIfAbsent(pk, () => <String, dynamic>{});
+        contrib[channelKey] = {
+          'channel': info.channel.name,
+          'rank': info.rank,
+          'score': info.score,
+          if (info.rawScore != null) 'rawScore': info.rawScore,
+          if (info.meta != null) ...info.meta!,
+        };
+      }
+    }
+
+    if (rrfScores.isEmpty) {
+      return const ExecuteResult(
+        records: [],
+        retrieval: RetrievalContext(
+          entries: [],
+          fusionMethod: RetrievalFusionMethod.rrf,
+        ),
+      );
+    }
+
+    final sortedPks = rrfScores.keys.toList()
+      ..sort((a, b) => rrfScores[b]!.compareTo(rrfScores[a]!));
+
+    final double maxRrf =
+        sortedPks.isNotEmpty ? rrfScores[sortedPks.first]! : 1.0;
+
+    final records = <Map<String, dynamic>>[];
+    final entries = <RetrievalEntry>[];
+    int qualifiedOffsetCount = 0;
+
+    for (int i = 0; i < sortedPks.length; i++) {
+      final y = yieldController.maybeYield();
+      if (y != null) await y;
+
+      if (records.length >= effectiveLimit) {
+        break;
+      }
+
+      final pk = sortedPks[i];
+      Map<String, dynamic>? rec;
+      if (!readFromFileOnly) {
+        rec = _dataStore.tableDataManager.getRecordByPrimaryKeySync(table, pk);
+      }
+      rec ??= await _dataStore.tableDataManager.getRecordByPrimaryKey(
+        table,
+        pk,
+        readFromFileOnly: readFromFileOnly,
+      );
+
+      if (rec != null) {
+        // Global pre-filter validation (if global filter is specified)
+        if (globalMatcher != null && !globalMatcher.matches(rec)) {
+          continue;
+        }
+
+        if (qualifiedOffsetCount < effectiveOffset) {
+          qualifiedOffsetCount++;
+          continue;
+        }
+
+        final Map<String, dynamic> row;
+        if (promoteDesc != null && applyPromoteResultTransform) {
+          row = Map<String, dynamic>.from(rec);
+          transformPromoteOldToNewInPlace(row, promoteDesc);
+        } else {
+          row = rec;
+        }
+        records.add(row);
+
+        final rawRrf = rrfScores[pk] ?? 0.0;
+        final normalizedScore = maxRrf > 0 ? (rawRrf / maxRrf) : 0.0;
+        final contribs = pkContributions[pk];
+        final bool isMultiHit = contribs != null && contribs.length > 1;
+
+        RetrievalChannel primaryChannel;
+        if (isMultiHit) {
+          primaryChannel = RetrievalChannel.hybrid;
+        } else {
+          final cName = contribs?.values.first['channel'];
+          if (cName == RetrievalChannel.vector.name) {
+            primaryChannel = RetrievalChannel.vector;
+          } else {
+            primaryChannel = RetrievalChannel.structured;
+          }
+        }
+
+        entries.add(RetrievalEntry(
+          score: normalizedScore,
+          channel: primaryChannel,
+          rawScore: rawRrf,
+          meta: {
+            'rrfScore': rawRrf,
+            'channelContributions': contribs,
+          },
+        ));
+      }
+    }
+
+    final bool hasMore = (records.length == effectiveLimit);
+
+    return ExecuteResult(
+      records: records,
+      retrieval: RetrievalContext(
+        entries: entries,
+        fusionMethod: RetrievalFusionMethod.rrf,
+        meta: {
+          'totalCandidates': sortedPks.length,
+          'channels': channelWeights,
+        },
+      ),
+      hasMore: hasMore,
+      hasPrev: effectiveOffset > 0,
+      count: records.length,
+    );
+  }
+}
+
+class _HybridQueryShape {
+  final Map<String, dynamic>? globalFilter;
+  final List<Map<String, dynamic>> recallBranches;
+  final _VectorMatchSpec? singleVectorSpec;
+  final bool isMultiWay;
+
+  _HybridQueryShape({
+    this.globalFilter,
+    required this.recallBranches,
+    this.singleVectorSpec,
+    required this.isMultiWay,
+  });
+
+  static _HybridQueryShape analyze(Map<String, dynamic> where) {
+    // Check if root is OR
+    if (where.containsKey('OR') &&
+        where['OR'] is List &&
+        (where['OR'] as List).isNotEmpty) {
+      return _HybridQueryShape(
+        recallBranches: List<Map<String, dynamic>>.from(where['OR'] as List),
+        isMultiWay: true,
+      );
+    }
+
+    // Check if root is AND containing an OR branch
+    if (where.containsKey('AND') && where['AND'] is List) {
+      final andList = where['AND'] as List;
+      Map<String, dynamic>? orBranchMap;
+      final globalFilters = <Map<String, dynamic>>[];
+
+      for (final item in andList) {
+        if (item is Map<String, dynamic>) {
+          if (item.containsKey('OR') && item['OR'] is List) {
+            orBranchMap = item;
+          } else {
+            globalFilters.add(item);
+          }
+        }
+      }
+
+      if (orBranchMap != null) {
+        final branches =
+            List<Map<String, dynamic>>.from(orBranchMap['OR'] as List);
+        Map<String, dynamic>? combinedGlobalFilter;
+        if (globalFilters.isNotEmpty) {
+          combinedGlobalFilter = globalFilters.length == 1
+              ? globalFilters.first
+              : {'AND': globalFilters};
+        }
+        return _HybridQueryShape(
+          globalFilter: combinedGlobalFilter,
+          recallBranches: branches,
+          isMultiWay: true,
+        );
+      }
+    }
+
+    // Pure single vector or Vector + AND filter
+    final vecSpec = _VectorMatchSpec.extract(where);
+    final structuredWhere = _VectorMatchSpec.stripVector(where);
+    return _HybridQueryShape(
+      globalFilter: structuredWhere,
+      recallBranches: [where],
+      singleVectorSpec: vecSpec,
+      isMultiWay: false,
+    );
+  }
+}
+
+class _VectorMatchSpec {
+  final String field;
+  final VectorData vector;
+  final double weight;
+  final int? efSearch;
+  final double? distanceThreshold;
+  final double? minScore;
+
+  _VectorMatchSpec({
+    required this.field,
+    required this.vector,
+    this.weight = 1.0,
+    this.efSearch,
+    this.distanceThreshold,
+    this.minScore,
+  });
+
+  static _VectorMatchSpec? extract(Map<String, dynamic>? where) {
+    if (where == null || where.isEmpty) return null;
+    if (where.containsKey('AND') && where['AND'] is List) {
+      for (final item in (where['AND'] as List)) {
+        if (item is Map<String, dynamic>) {
+          final s = extract(item);
+          if (s != null) return s;
+        }
+      }
+      return null;
+    }
+    for (final entry in where.entries) {
+      if (entry.value is Map && (entry.value as Map).containsKey(r'$vector')) {
+        final payload = (entry.value as Map)[r'$vector'] as Map;
+        final vec = payload['vector'];
+        if (vec is VectorData) {
+          return _VectorMatchSpec(
+            field: entry.key,
+            vector: vec,
+            weight: (payload['weight'] as num?)?.toDouble() ?? 1.0,
+            efSearch: payload['efSearch'] as int?,
+            distanceThreshold:
+                (payload['distanceThreshold'] as num?)?.toDouble(),
+            minScore: (payload['minScore'] as num?)?.toDouble(),
+          );
+        }
+      }
+    }
+    return null;
+  }
+
+  static bool containsVector(Map<String, dynamic>? where) {
+    if (where == null || where.isEmpty) return false;
+    for (final entry in where.entries) {
+      if (entry.key == 'AND' || entry.key == 'OR') {
+        if (entry.value is List) {
+          for (final item in (entry.value as List)) {
+            if (item is Map<String, dynamic> && containsVector(item)) {
+              return true;
+            }
+          }
+        }
+      } else if (entry.value is Map &&
+          (entry.value as Map).containsKey(r'$vector')) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /// Remove $vector conditions from a where map to leave pure structured filters.
+  static Map<String, dynamic>? stripVector(Map<String, dynamic>? where) {
+    if (where == null || where.isEmpty) return null;
+    if (where.containsKey('AND') && where['AND'] is List) {
+      final newAnd = <Map<String, dynamic>>[];
+      for (final item in (where['AND'] as List)) {
+        if (item is Map<String, dynamic>) {
+          final stripped = stripVector(item);
+          if (stripped != null && stripped.isNotEmpty) {
+            newAnd.add(stripped);
+          }
+        }
+      }
+      if (newAnd.isEmpty) return null;
+      if (newAnd.length == 1) return newAnd.first;
+      return {'AND': newAnd};
+    }
+    final result = <String, dynamic>{};
+    for (final entry in where.entries) {
+      if (entry.value is Map && (entry.value as Map).containsKey(r'$vector')) {
+        continue;
+      }
+      result[entry.key] = entry.value;
+    }
+    return result.isEmpty ? null : result;
+  }
 }
 
 class TableScanResult {
@@ -4378,6 +5074,7 @@ class PlanExecutionResult {
 
 class ExecuteResult {
   final List<Map<String, dynamic>> records;
+  final RetrievalContext? retrieval;
   final String? nextCursor;
   final String? prevCursor;
   final bool hasMore;
@@ -4393,6 +5090,7 @@ class ExecuteResult {
 
   const ExecuteResult({
     required this.records,
+    this.retrieval,
     this.nextCursor,
     this.prevCursor,
     this.hasMore = false,
@@ -4405,6 +5103,7 @@ class ExecuteResult {
 
   const ExecuteResult.empty()
       : records = const [],
+        retrieval = null,
         nextCursor = null,
         prevCursor = null,
         hasMore = false,

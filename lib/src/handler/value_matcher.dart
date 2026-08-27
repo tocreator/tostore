@@ -1,3 +1,4 @@
+import 'dart:math';
 import 'dart:typed_data';
 
 import '../core/compute_manager.dart';
@@ -684,6 +685,40 @@ class ConditionRecordMatcher {
         return value == null && compareValue == null;
       case 'IS NOT':
         return value != null && compareValue == null;
+      case r'$VECTOR':
+        if (value == null) return false;
+        if (compareValue is Map) {
+          final queryVec = compareValue['vector'];
+          final distanceThreshold =
+              (compareValue['distanceThreshold'] as num?)?.toDouble();
+          final minScore = (compareValue['minScore'] as num?)?.toDouble();
+          if (distanceThreshold == null && minScore == null) return true;
+          final recordVec = value is VectorData
+              ? value.values
+              : (value is List
+                  ? value.map((e) => (e as num).toDouble()).toList()
+                  : null);
+          if (recordVec == null || queryVec is! VectorData) return false;
+          if (recordVec.length != queryVec.dimensions) return false;
+          double dot = 0.0, normA = 0.0, normB = 0.0;
+          for (int i = 0; i < recordVec.length; i++) {
+            final a = recordVec[i];
+            final b = queryVec.values[i];
+            dot += a * b;
+            normA += a * a;
+            normB += b * b;
+          }
+          final denom = sqrt(normA) * sqrt(normB);
+          final sim = denom > 0 ? (dot / denom) : 0.0;
+          final score = (sim + 1.0) / 2.0;
+          final dist = 1.0 - sim;
+          if (distanceThreshold != null && dist > distanceThreshold) {
+            return false;
+          }
+          if (minScore != null && score < minScore) return false;
+          return true;
+        }
+        return true;
       default:
         Logger.warn('Unknown operator: $operator');
         return false;

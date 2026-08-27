@@ -27,8 +27,10 @@ class FileStorageImpl implements StorageInterface {
 
   // Per-handle operation queues to serialize async operations on the same RandomAccessFile
   final Map<String, Future<void>> _handleLocks = {};
-  // Cached file length per handle key to avoid frequent raf.length() on hot append paths
-  final Map<String, int> _handleLengths = {};
+  // Cached physical file length per canonical path to avoid frequent raf.length() on hot write paths
+  final Map<String, int> _fileLengths = {};
+
+  String _canonicalPath(String path) => p.canonicalize(path);
 
   Future<T> _withHandleLock<T>(
       String key, Future<T> Function() operation) async {
@@ -59,7 +61,7 @@ class FileStorageImpl implements StorageInterface {
             : (mode == FileMode.read)
                 ? 'r'
                 : mode.toString();
-    return '${p.canonicalize(path)}|$modeKey';
+    return '${_canonicalPath(path)}|$modeKey';
   }
 
   /// Flush and close all open handles whose file paths are under [dirPath].
@@ -67,7 +69,7 @@ class FileStorageImpl implements StorageInterface {
   /// (especially on Windows, where open handles block deletion).
   Future<void> _flushAndCloseHandlesUnderDirectory(String dirPath) async {
     try {
-      final normalizedDir = p.canonicalize(dirPath);
+      final normalizedDir = _canonicalPath(dirPath);
       final String dirPrefix;
       if (normalizedDir.endsWith(p.separator)) {
         dirPrefix = normalizedDir;
@@ -105,7 +107,7 @@ class FileStorageImpl implements StorageInterface {
             } catch (_) {}
             _handlePool.remove(key);
             _lru.remove(key);
-            _handleLengths.remove(key);
+            _fileLengths.remove(filePath);
           });
         } catch (_) {}
 
@@ -147,7 +149,16 @@ class FileStorageImpl implements StorageInterface {
       // Remove from pool immediately to prevent new ops from checking it out
       final rafToClose = _handlePool.remove(oldestKey);
       _lru.remove(oldestKey);
-      _handleLengths.remove(oldestKey);
+      final sepIdx = oldestKey.lastIndexOf('|');
+      if (sepIdx > 0) {
+        final oldestPath = oldestKey.substring(0, sepIdx);
+        final bool hasOtherHandle = _handlePool.containsKey('$oldestPath|a') ||
+            _handlePool.containsKey('$oldestPath|r') ||
+            _handlePool.containsKey('$oldestPath|w');
+        if (!hasOtherHandle) {
+          _fileLengths.remove(oldestPath);
+        }
+      }
 
       if (rafToClose != null) {
         // Asynchronously close it, ensuring we respect existing locks.
@@ -296,7 +307,7 @@ class FileStorageImpl implements StorageInterface {
       }
       _handlePool.clear();
       _lru.clear();
-      _handleLengths.clear();
+      _fileLengths.clear();
     } catch (e) {
       Logger.error('Close storage failed', rawError: e);
     }
@@ -314,6 +325,7 @@ class FileStorageImpl implements StorageInterface {
         return;
       }
 
+      final normalized = _canonicalPath(path);
       final key = _poolKey(path, FileMode.write);
       await _withHandleLock(key, () async {
         final raf = await _getHandle(path, FileMode.write);
@@ -325,7 +337,7 @@ class FileStorageImpl implements StorageInterface {
             await raf.flush();
           }
           try {
-            _handleLengths[key] = await raf.position();
+            _fileLengths[normalized] = await raf.position();
           } catch (_) {}
         } finally {
           if (flush && closeHandleAfterFlush) {
@@ -334,7 +346,7 @@ class FileStorageImpl implements StorageInterface {
             } catch (_) {}
             _handlePool.remove(key);
             _lru.remove(key);
-            _handleLengths.remove(key);
+            _fileLengths.remove(normalized);
           }
         }
       });
@@ -348,6 +360,7 @@ class FileStorageImpl implements StorageInterface {
   Future<void> writeAsBytes(String path, Uint8List bytes,
       {bool flush = true, bool closeHandleAfterFlush = false}) async {
     try {
+      final normalized = _canonicalPath(path);
       final key = _poolKey(path, FileMode.write);
       await _withHandleLock(key, () async {
         final raf = await _getHandle(path, FileMode.write);
@@ -358,7 +371,7 @@ class FileStorageImpl implements StorageInterface {
           if (flush) {
             await raf.flush();
           }
-          _handleLengths[key] = bytes.length;
+          _fileLengths[normalized] = bytes.length;
         } finally {
           if (flush && closeHandleAfterFlush) {
             try {
@@ -366,7 +379,7 @@ class FileStorageImpl implements StorageInterface {
             } catch (_) {}
             _handlePool.remove(key);
             _lru.remove(key);
-            _handleLengths.remove(key);
+            _fileLengths.remove(normalized);
           }
         }
       });
@@ -399,14 +412,16 @@ class FileStorageImpl implements StorageInterface {
 
   @override
   Future<Uint8List> readAsBytesAt(String path, int start, {int? length}) async {
+    final normalized = _canonicalPath(path);
     final key = _poolKey(path, FileMode.read);
     try {
       return await _withHandleLock<Uint8List>(key, () async {
         final raf = await _getHandle(path, FileMode.read);
-        int fileSize = _handleLengths[key] ?? -1;
-        if (fileSize < 0) {
+        int? fileSize = _fileLengths[normalized];
+        final int targetEnd = length != null ? start + length : start + 1;
+        if (fileSize == null || targetEnd > fileSize) {
           fileSize = await raf.length();
-          _handleLengths[key] = fileSize;
+          _fileLengths[normalized] = fileSize;
         }
         if (start >= fileSize) {
           return Uint8List(0);
@@ -495,18 +510,19 @@ class FileStorageImpl implements StorageInterface {
     try {
       // Always use pooled handle for random writes to enable delayed flush batching.
       // Use FileMode.append to avoid truncation while allowing random access seeking.
+      final normalized = _canonicalPath(path);
       final key = _poolKey(path, FileMode.append);
       await _withHandleLock<void>(key, () async {
         final raf = await _getHandle(path, FileMode.append);
         try {
-          int? cachedLen = _handleLengths[key];
+          int? cachedLen = _fileLengths[normalized];
           if (cachedLen == null) {
             try {
               cachedLen = await raf.length();
             } catch (_) {
               cachedLen = 0;
             }
-            _handleLengths[key] = cachedLen;
+            _fileLengths[normalized] = cachedLen;
           }
           int currentPos = -1;
           int maxEnd = cachedLen;
@@ -529,8 +545,8 @@ class FileStorageImpl implements StorageInterface {
             await raf.flush();
           }
 
-          // Update cached length (best-effort).
-          _handleLengths[key] = maxEnd;
+          // Update cached length (authoritative).
+          _fileLengths[normalized] = maxEnd;
         } finally {
           if (flush && closeHandleAfterFlush) {
             try {
@@ -538,7 +554,7 @@ class FileStorageImpl implements StorageInterface {
             } catch (_) {}
             _handlePool.remove(key);
             _lru.remove(key);
-            _handleLengths.remove(key);
+            _fileLengths.remove(normalized);
           }
         }
       });
@@ -768,13 +784,14 @@ class FileStorageImpl implements StorageInterface {
   Future<int> appendBytes(String path, Uint8List bytes,
       {bool flush = true, bool closeHandleAfterFlush = false}) async {
     try {
+      final normalized = _canonicalPath(path);
       final key = _poolKey(path, FileMode.append);
       return await _withHandleLock<int>(key, () async {
         final raf = await _getHandle(path, FileMode.append);
-        int? cached = _handleLengths[key];
+        int? cached = _fileLengths[normalized];
         if (cached == null) {
           cached = await raf.length();
-          _handleLengths[key] = cached;
+          _fileLengths[normalized] = cached;
         }
         final offset = cached;
         await raf.setPosition(offset);
@@ -782,12 +799,12 @@ class FileStorageImpl implements StorageInterface {
         if (flush) {
           await raf.flush();
         }
-        _handleLengths[key] = offset + bytes.length;
+        _fileLengths[normalized] = offset + bytes.length;
         if (flush && closeHandleAfterFlush) {
           await raf.close();
           _handlePool.remove(key);
           _lru.remove(key);
-          _handleLengths.remove(key);
+          _fileLengths.remove(normalized);
         }
         return offset;
       });
@@ -800,13 +817,14 @@ class FileStorageImpl implements StorageInterface {
   Future<int> appendString(String path, String content,
       {bool flush = true, bool closeHandleAfterFlush = false}) async {
     try {
+      final normalized = _canonicalPath(path);
       final key = _poolKey(path, FileMode.append);
       return await _withHandleLock<int>(key, () async {
         final raf = await _getHandle(path, FileMode.append);
-        int? cached = _handleLengths[key];
+        int? cached = _fileLengths[normalized];
         if (cached == null) {
           cached = await raf.length();
-          _handleLengths[key] = cached;
+          _fileLengths[normalized] = cached;
         }
         final offset = cached;
         await raf.setPosition(offset);
@@ -815,13 +833,13 @@ class FileStorageImpl implements StorageInterface {
           await raf.flush();
         }
         try {
-          _handleLengths[key] = await raf.position();
+          _fileLengths[normalized] = await raf.position();
         } catch (_) {}
         if (flush && closeHandleAfterFlush) {
           await raf.close();
           _handlePool.remove(key);
           _lru.remove(key);
-          _handleLengths.remove(key);
+          _fileLengths.remove(normalized);
         }
         return offset;
       });
@@ -839,7 +857,7 @@ class FileStorageImpl implements StorageInterface {
   @override
   Future<void> flushFile(String path) async {
     try {
-      final normalizedPath = p.canonicalize(path);
+      final normalizedPath = _canonicalPath(path);
       final entries = _handlePool.entries.toList();
       for (final e in entries) {
         final key = e.key;
@@ -871,7 +889,7 @@ class FileStorageImpl implements StorageInterface {
       if (paths != null && paths.isNotEmpty) {
         final yieldController = YieldController('storage_flush_paths');
         for (final pth in paths) {
-          final normalized = p.canonicalize(pth);
+          final normalized = _canonicalPath(pth);
           for (final mode in candidateModes) {
             final key = _poolKey(normalized, mode);
             final raf = _handlePool[key];
@@ -886,7 +904,7 @@ class FileStorageImpl implements StorageInterface {
                   } catch (_) {}
                   _handlePool.remove(key);
                   _lru.remove(key);
-                  _handleLengths.remove(key);
+                  _fileLengths.remove(normalized);
                 }
               });
             }
@@ -911,14 +929,17 @@ class FileStorageImpl implements StorageInterface {
               } catch (_) {}
               _handlePool.remove(key);
               _lru.remove(key);
-              _handleLengths.remove(key);
+              final sepIdx = key.lastIndexOf('|');
+              if (sepIdx > 0) {
+                _fileLengths.remove(key.substring(0, sepIdx));
+              }
             }
           });
           final y3 = yieldController.maybeYield();
           if (y3 != null) await y3;
         }
       } else {
-        final normalized = p.canonicalize(path);
+        final normalized = _canonicalPath(path);
         for (final mode in candidateModes) {
           final key = _poolKey(normalized, mode);
           final raf = _handlePool[key];
@@ -933,7 +954,7 @@ class FileStorageImpl implements StorageInterface {
                 } catch (_) {}
                 _handlePool.remove(key);
                 _lru.remove(key);
-                _handleLengths.remove(key);
+                _fileLengths.remove(normalized);
               }
             });
           }

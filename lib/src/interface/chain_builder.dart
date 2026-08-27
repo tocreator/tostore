@@ -35,6 +35,7 @@ abstract final class QueryClauseMask {
   static const int having = 1 << 7;
   static const int orderBy = 1 << 8;
   static const int onlyCount = 1 << 9;
+  static const int matchVector = 1 << 10;
 }
 
 /// chain builder base class
@@ -207,6 +208,9 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
   SELF condition(QueryCondition condition) {
     _ensureConditionTree();
     _condition!.condition(condition);
+    if (condition.hasVectorMatch) {
+      _clauseFlags |= QueryClauseMask.matchVector;
+    }
 
     condition.$internalApplySettings(
         () => _orderBy,
@@ -223,6 +227,9 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
   SELF orCondition(QueryCondition condition) {
     _ensureConditionTree();
     _condition!.orCondition(condition);
+    if (condition.hasVectorMatch) {
+      _clauseFlags |= QueryClauseMask.matchVector;
+    }
 
     condition.$internalApplySettings(
         () => _orderBy,

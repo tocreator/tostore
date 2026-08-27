@@ -1,4 +1,9 @@
+import 'dart:typed_data';
+
 import '../handler/value_matcher.dart';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../model/table_schema.dart';
 
 /// Query Condition Builder
@@ -28,6 +33,10 @@ class QueryCondition {
   int? _limit;
   int? _offset;
   String? _cursor;
+  bool _hasVectorMatch = false;
+
+  /// Whether this condition tree contains any vector search predicates.
+  bool get hasVectorMatch => _hasVectorMatch;
 
   /// Create a new query condition builder
   QueryCondition();
@@ -35,6 +44,7 @@ class QueryCondition {
   /// Creates a QueryCondition from a map representation.
   factory QueryCondition.fromMap(Map<String, dynamic> map) {
     final qc = QueryCondition();
+    qc._hasVectorMatch = _containsVectorInMap(map);
     qc._root = ConditionNode(type: NodeType.and);
     qc._root!.children.add(_nodeFromMap(map));
     qc._current = qc._root;
@@ -46,13 +56,14 @@ class QueryCondition {
     _root = ConditionNode(type: NodeType.and);
     _current = ConditionNode(type: NodeType.and);
     _root!.children.add(_current!);
-    if (_conditionCount == 1 && _fastSingleEqField != null) {
+    if (_fastSingleEqField != null) {
       final condition = _buildCondition(
           _fastSingleEqField!, _singleOp ?? '=', _fastSingleEqVal);
       final leafNode = ConditionNode(type: NodeType.leaf, condition: condition);
       _current!.children.add(leafNode);
       _fastSingleEqField = null;
       _fastSingleEqVal = null;
+      _singleOp = null;
     }
   }
 
@@ -75,6 +86,24 @@ class QueryCondition {
       // It's a leaf node (a simple condition)
       return ConditionNode(type: NodeType.leaf, condition: map);
     }
+  }
+
+  static bool _containsVectorInMap(Map<String, dynamic> map) {
+    for (final entry in map.entries) {
+      if (entry.key == 'AND' || entry.key == 'OR') {
+        if (entry.value is List) {
+          for (final item in (entry.value as List)) {
+            if (item is Map<String, dynamic> && _containsVectorInMap(item)) {
+              return true;
+            }
+          }
+        }
+      } else if (entry.value is Map &&
+          (entry.value as Map).containsKey(r'$vector')) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /// Expose the root for external evaluators
@@ -154,8 +183,6 @@ class QueryCondition {
       return this;
     }
     _ensureTreeInitialized();
-    _fastSingleEqField = null;
-    _fastSingleEqVal = null;
     final condition = _buildCondition(field, operator, value);
 
     // If the current node is an AND node, add a new leaf node as a child
@@ -332,6 +359,7 @@ class QueryCondition {
   /// Add another condition as an AND condition
   QueryCondition condition(QueryCondition other) {
     if (other.isEmpty) return this;
+    _hasVectorMatch = _hasVectorMatch || other._hasVectorMatch;
     _ensureTreeInitialized();
     other._ensureTreeInitialized();
 
@@ -413,6 +441,7 @@ class QueryCondition {
   /// Add another condition as an OR condition
   QueryCondition orCondition(QueryCondition other) {
     if (other.isEmpty) return this;
+    _hasVectorMatch = _hasVectorMatch || other._hasVectorMatch;
     _ensureTreeInitialized();
     other._ensureTreeInitialized();
 
@@ -565,6 +594,11 @@ class QueryCondition {
           field: {
             'BETWEEN': {'start': value[0], 'end': value[1]}
           }
+        };
+      case r'$VECTOR':
+      case r'$vector':
+        return {
+          field: {r'$vector': value}
         };
     }
     return {
@@ -860,7 +894,9 @@ class QueryCondition {
       // It's an operator map like {'>': 10} or {'BETWEEN': {'start': 1, 'end': 5}}
       final newMap = <String, dynamic>{};
       value.forEach((op, opValue) {
-        if (op.toUpperCase() == 'BETWEEN' && opValue is Map) {
+        if (op == r'$vector') {
+          newMap[op] = opValue;
+        } else if (op.toUpperCase() == 'BETWEEN' && opValue is Map) {
           newMap[op] = {
             'start': fieldSchema.convertValue(opValue['start']),
             'end': fieldSchema.convertValue(opValue['end']),
@@ -954,5 +990,67 @@ class QueryCondition {
     } else {
       return _cachedSingleEq = (field: field, value: rawVal);
     }
+  }
+
+  /// Match records using dense vector similarity search.
+  QueryCondition matchVector(
+    String field,
+    dynamic vector, {
+    double weight = 1.0,
+    int? efSearch,
+    double? distanceThreshold,
+    double? minScore,
+  }) {
+    final VectorData vectorData;
+    if (vector is VectorData) {
+      vectorData = vector;
+    } else if (vector is List<num>) {
+      vectorData = VectorData.fromList(vector);
+    } else if (vector is Float32List) {
+      vectorData =
+          VectorData(vector.map((e) => e.toDouble()).toList(growable: false));
+    } else if (vector is List<double>) {
+      vectorData = VectorData(vector);
+    } else {
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devInvalidArgumentFormat,
+          message:
+              'matchVector parameter [vector] must be VectorData, List<num>, or Float32List, got ${vector.runtimeType}',
+          parameterName: 'vector',
+          passedValue: vector.runtimeType.toString(),
+        )
+      ]);
+    }
+
+    final payload = <String, dynamic>{
+      'vector': vectorData,
+      'weight': weight,
+      if (efSearch != null) 'efSearch': efSearch,
+      if (distanceThreshold != null) 'distanceThreshold': distanceThreshold,
+      if (minScore != null) 'minScore': minScore,
+    };
+
+    _hasVectorMatch = true;
+    return where(field, r'$vector', payload);
+  }
+
+  /// OR branch with vector similarity search.
+  QueryCondition orMatchVector(
+    String field,
+    dynamic vector, {
+    double weight = 1.0,
+    int? efSearch,
+    double? distanceThreshold,
+    double? minScore,
+  }) {
+    return or().matchVector(
+      field,
+      vector,
+      weight: weight,
+      efSearch: efSearch,
+      distanceThreshold: distanceThreshold,
+      minScore: minScore,
+    );
   }
 }
