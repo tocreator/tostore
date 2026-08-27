@@ -52,13 +52,6 @@ class QueryResult<T> {
   /// For cursor pagination, this is derived from cursor presence and scan direction.
   final bool hasPrev;
 
-  /// Estimated total number of records in the entire table (buffer-aware).
-  final int? totalRecordCount;
-
-  /// Deprecated: use [totalRecordCount].
-  @Deprecated('Use totalRecordCount instead')
-  int? get tableTotalCount => totalRecordCount;
-
   /// Query execution time in milliseconds.
   final int? executionTimeMs;
 
@@ -79,7 +72,6 @@ class QueryResult<T> {
     this.nextCursorToken,
     this.hasMore = false,
     this.hasPrev = false,
-    this.totalRecordCount,
     this.executionTimeMs,
     Future<QueryResult<T>> Function()? nextPageExecutor,
     Future<QueryResult<T>> Function()? prevPageExecutor,
@@ -101,7 +93,6 @@ class QueryResult<T> {
         data: const [],
         hasMore: false,
         hasPrev: hasPrev,
-        totalRecordCount: totalRecordCount,
         message: exec == null
             ? 'Pagination executor not initialized (e.g. deserialized from JSON).'
             : 'No more results available.',
@@ -121,7 +112,6 @@ class QueryResult<T> {
         data: const [],
         hasMore: hasMore,
         hasPrev: false,
-        totalRecordCount: totalRecordCount,
         message: exec == null
             ? 'Pagination executor not initialized (e.g. deserialized from JSON).'
             : 'No previous results available.',
@@ -139,7 +129,6 @@ class QueryResult<T> {
         data: const [],
         hasMore: false,
         hasPrev: hasPrev,
-        totalRecordCount: totalRecordCount,
         message: exec == null
             ? 'Synchronous pagination executor not initialized.'
             : 'No more results available in memory.',
@@ -157,7 +146,6 @@ class QueryResult<T> {
         data: const [],
         hasMore: hasMore,
         hasPrev: false,
-        totalRecordCount: totalRecordCount,
         message: exec == null
             ? 'Synchronous pagination executor not initialized.'
             : 'No previous results available in memory.',
@@ -176,7 +164,6 @@ class QueryResult<T> {
     String? nextCursorToken,
     bool hasMore = false,
     bool hasPrev = false,
-    int? totalRecordCount,
     int? executionTimeMs,
     Future<QueryResult<T>> Function()? nextPageExecutor,
     Future<QueryResult<T>> Function()? prevPageExecutor,
@@ -191,7 +178,6 @@ class QueryResult<T> {
       nextCursorToken: nextCursorToken ?? nextCursor,
       hasMore: hasMore,
       hasPrev: hasPrev,
-      totalRecordCount: totalRecordCount,
       executionTimeMs: executionTimeMs,
       nextPageExecutor: nextPageExecutor,
       prevPageExecutor: prevPageExecutor,
@@ -224,7 +210,7 @@ class QueryResult<T> {
   /// Override toString for easy debugging
   @override
   String toString() {
-    return 'QueryResult{code: ${type.code} (${type.codeKey}), message: $message, data: $data, prevCursorToken: $prevCursorToken, nextCursorToken: $nextCursorToken, hasMore: $hasMore, hasPrev: $hasPrev, totalRecordCount: $totalRecordCount, executionTimeMs: $executionTimeMs}';
+    return 'QueryResult{code: ${type.code} (${type.codeKey}), message: $message, data: $data, prevCursorToken: $prevCursorToken, nextCursorToken: $nextCursorToken, hasMore: $hasMore, hasPrev: $hasPrev, executionTimeMs: $executionTimeMs}';
   }
 
   /// for serialization
@@ -240,9 +226,6 @@ class QueryResult<T> {
       if (nextCursorToken != null) 'nextCursor': nextCursorToken,
       'hasMore': hasMore,
       'hasPrev': hasPrev,
-      if (totalRecordCount != null) 'totalRecordCount': totalRecordCount,
-      // Legacy key for older consumers.
-      if (totalRecordCount != null) 'tableTotalCount': totalRecordCount,
       if (executionTimeMs != null) 'executionTimeMs': executionTimeMs,
     };
   }
@@ -263,8 +246,6 @@ class QueryResult<T> {
       nextCursorToken: json['nextCursor'] as String?,
       hasMore: json['hasMore'] == true,
       hasPrev: json['hasPrev'] == true,
-      totalRecordCount: (json['totalRecordCount'] as int?) ??
-          (json['tableTotalCount'] as int?),
       executionTimeMs: json['executionTimeMs'] as int?,
     );
   }

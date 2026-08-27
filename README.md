@@ -606,6 +606,10 @@ For more complex Key-Value scenarios, it is recommended to use the `db.kv` names
   // Check if a key exists and is not expired
   final exists = await db.kv.exists('config_cache');
 
+  // Memory probe (sync, in-memory only — see [Memory Probe and Sync Retrieval (peek)](#memory-probe-and-sync-retrieval-peek))
+  final theme = db.kv.peekGet('theme') ?? await db.kv.get('theme');
+  if (db.kv.peekExists('config_cache')) { /* ... */ }
+
   // Clear all KV data in the current space
   await db.kv.clear();
   ```
@@ -1092,6 +1096,24 @@ if (page.hasMore) {
   final next = page.peekNext(); // cache hit: synchronous page turn
   if (next.data.isEmpty) await page.next();
 }
+```
+
+#### KV peek (`db.kv`)
+
+| Method | Async counterpart | Description |
+| :--- | :--- | :--- |
+| `peekGet(key)` | `get(key)` | Sync in-memory value probe; expired keys return `null` |
+| `peekExists(key)` | `exists(key)` | Sync in-memory existence check |
+| `db.kv.query().peek()` | `await db.kv.query()` | Paginated sync probe (prefix / sort / limit) |
+| `db.kv.query().peekFirst()` | `await db.kv.query().first()` | First matching record sync probe |
+
+```dart
+// Point lookup: probe first, fall back to async on miss
+final theme = db.kv.peekGet('theme', isGlobal: true) ?? await db.kv.get('theme', isGlobal: true);
+
+// Paginated KV probe
+var page = db.kv.query().prefix('setting_').limit(20).peek();
+if (page.data.isEmpty) page = await db.kv.query().prefix('setting_').limit(20);
 ```
 
 > [!TIP]

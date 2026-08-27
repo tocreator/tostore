@@ -12,7 +12,6 @@ final class QueryResultCacheEntry {
   final String? prevCursor;
   final bool hasMore;
   final bool hasPrev;
-  final int? totalRecordCount;
   final int? count;
   final dynamic aggregateResult;
   final DateTime createdAt;
@@ -25,7 +24,6 @@ final class QueryResultCacheEntry {
     this.prevCursor,
     this.hasMore = false,
     this.hasPrev = false,
-    this.totalRecordCount,
     this.count,
     this.aggregateResult,
     required this.createdAt,

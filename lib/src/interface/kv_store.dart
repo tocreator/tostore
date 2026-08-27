@@ -111,6 +111,16 @@ class KvStore {
     return _db.getValue(key, isGlobal: isGlobal);
   }
 
+  /// Synchronously peek a value from pure memory (Point Cache).
+  ///
+  /// Pairs with [get]: never hits disk/files; returns null if the key is absent,
+  /// expired, or not in memory. Prefer [get] when authoritative reads are required.
+  ///
+  /// 从纯内存缓存同步探针读取值（与 [get] 成对）；未命中或已过期时返回 null。
+  dynamic peekGet(String key, {bool isGlobal = false}) {
+    return _db.peekValue(key, isGlobal: isGlobal);
+  }
+
   /// Get value as String.
   /// 获取字符串类型的值。
   ///
@@ -240,6 +250,15 @@ class KvStore {
   /// - [isGlobal]: 是否在全局空间中检查。
   Future<bool> exists(String key, {bool isGlobal = false}) {
     return _db.exists(key, isGlobal: isGlobal);
+  }
+
+  /// Synchronously check whether a key exists in pure memory and is not expired.
+  ///
+  /// Never hits disk/files; returns false on cache miss or expiration.
+  ///
+  /// 从纯内存缓存同步探针检查键是否存在且未过期。
+  bool peekExists(String key, {bool isGlobal = false}) {
+    return _db.peekValueExists(key, isGlobal: isGlobal);
   }
 
   /// Remove a key-value pair.

@@ -606,6 +606,10 @@ Daha karmaşık anahtar-değer senaryoları için `db.kv` ad alanının kullanı
   // Bir anahtarın mevcut olup olmadığını ve süresinin dolup dolmadığını kontrol et
   final exists = await db.kv.exists('config_cache');
 
+  // Bellek probu (senkron, yalnızca önbellek isabeti — bkz. [Bellek Probu ve Senkron Arama (peek)](#query-peek))
+  final theme = db.kv.peekGet('theme') ?? await db.kv.get('theme');
+  if (db.kv.peekExists('config_cache')) { /* ... */ }
+
   // Mevcut alandaki tüm KV verilerini temizle
   await db.kv.clear();
   ```
@@ -1092,6 +1096,24 @@ if (page.hasMore) {
   final next = page.peekNext(); // önbellek isabeti: senkron sayfa geçişi
   if (next.data.isEmpty) await page.next();
 }
+```
+
+#### KV probu (`db.kv`)
+
+| Yöntem | Async eşdeğeri | Açıklama |
+| :--- | :--- | :--- |
+| `peekGet(key)` | `get(key)` | Senkron bellek nokta sorgusu; süresi dolmuş anahtarlar → `null` |
+| `peekExists(key)` | `exists(key)` | Senkron bellek varlık kontrolü |
+| `db.kv.query().peek()` | `await db.kv.query()` | Sayfalı senkron prob (önek / sıralama / limit) |
+| `db.kv.query().peekFirst()` | `await db.kv.query().first()` | İlk kayıt senkron probu |
+
+```dart
+// Nokta: önce prob, isabetsizlikte async geri dönüş
+final theme = db.kv.peekGet('theme', isGlobal: true) ?? await db.kv.get('theme', isGlobal: true);
+
+// Sayfalı KV probu
+var page = db.kv.query().prefix('setting_').limit(20).peek();
+if (page.data.isEmpty) page = await db.kv.query().prefix('setting_').limit(20);
 ```
 
 > [!TIP]

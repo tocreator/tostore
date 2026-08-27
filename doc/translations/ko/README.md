@@ -606,6 +606,10 @@ ToStore는 복잡한 비즈니스 시나리오를 위한 풍부한 고급 기능
   // 키 존재 여부 및 만료 확인
   final exists = await db.kv.exists('config_cache');
 
+  // 메모리 프로브 (동기, 캐시 히트 시만 — [메모리 프로브 및 동기 검색 (peek)](#query-peek) 참조)
+  final theme = db.kv.peekGet('theme') ?? await db.kv.get('theme');
+  if (db.kv.peekExists('config_cache')) { /* ... */ }
+
   // 현재 공간의 모든 KV 데이터 삭제
   await db.kv.clear();
   ```
@@ -1093,6 +1097,24 @@ if (page.hasMore) {
   final next = page.peekNext(); // 캐시 히트: 동기 페이지 전환
   if (next.data.isEmpty) await page.next();
 }
+```
+
+#### KV 프로브 (`db.kv`)
+
+| 메서드 | 비동기 대응 | 설명 |
+| :--- | :--- | :--- |
+| `peekGet(key)` | `get(key)` | 동기 메모리 점검색; 만료 키는 `null` |
+| `peekExists(key)` | `exists(key)` | 동기 메모리 존재 확인 |
+| `db.kv.query().peek()` | `await db.kv.query()` | 페이지네이션 동기 프로브 (접두사 / 정렬 / limit) |
+| `db.kv.query().peekFirst()` | `await db.kv.query().first()` | 첫 레코드 동기 프로브 |
+
+```dart
+// 점검색: 프로브 우선, 미스 시 비동기 폴백
+final theme = db.kv.peekGet('theme', isGlobal: true) ?? await db.kv.get('theme', isGlobal: true);
+
+// 페이지네이션 KV 프로브
+var page = db.kv.query().prefix('setting_').limit(20).peek();
+if (page.data.isEmpty) page = await db.kv.query().prefix('setting_').limit(20);
 ```
 
 > [!TIP]

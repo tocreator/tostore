@@ -6975,6 +6975,59 @@ class DataStoreImpl {
     return _decodeLegacyKvValueIfNeeded(row[_kvValueField]);
   }
 
+  /// Synchronously peek a key-value pair from pure memory (Point Cache).
+  ///
+  /// Never hits disk/files; returns null if the key is absent or not in memory.
+  /// Expired rows are treated as absent and scheduled for lazy cleanup.
+  dynamic peekValue(String key, {bool isGlobal = false}) {
+    if (!_isInitialized) return null;
+    final tableName = SystemTable.getKeyValueName(isGlobal);
+    final table = getTableContextSync(tableName);
+    if (table == null) return null;
+
+    final row = queryExecutor.executePeekFirst(
+      table,
+      condition: QueryCondition()..where(_kvKeyField, '=', key),
+      fastSingleEqField: _kvKeyField,
+      fastSingleEqVal: key,
+      fastSingleEqOp: '=',
+    );
+    if (row == null) return null;
+
+    if (_isKvRowExpired(row)) {
+      _scheduleExactExpiredKvCleanup(table, key, row[_kvExpiresAtField]);
+      return null;
+    }
+
+    return _decodeLegacyKvValueIfNeeded(row[_kvValueField]);
+  }
+
+  /// Synchronously check whether a key exists in pure memory and is not expired.
+  ///
+  /// Never hits disk/files; returns false on cache miss or expiration.
+  bool peekValueExists(String key, {bool isGlobal = false}) {
+    if (!_isInitialized) return false;
+    final tableName = SystemTable.getKeyValueName(isGlobal);
+    final table = getTableContextSync(tableName);
+    if (table == null) return false;
+
+    final row = queryExecutor.executePeekFirst(
+      table,
+      condition: QueryCondition()..where(_kvKeyField, '=', key),
+      fastSingleEqField: _kvKeyField,
+      fastSingleEqVal: key,
+      fastSingleEqOp: '=',
+    );
+    if (row == null) return false;
+
+    if (_isKvRowExpired(row)) {
+      _scheduleExactExpiredKvCleanup(table, key, row[_kvExpiresAtField]);
+      return false;
+    }
+
+    return true;
+  }
+
   /// Get key names in the specified space, optionally filtered by prefix.
   ///
   /// This enumerates key **names** only -- it does not return values.

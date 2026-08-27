@@ -606,6 +606,10 @@ ToStore предоставляет богатый набор расширенн�
   // Проверить существование ключа и срок его действия
   final exists = await db.kv.exists('config_cache');
 
+  // Зонд памяти (синхронно, только при попадании в кэш — см. [Зонд памяти и синхронный поиск (peek)](#query-peek))
+  final theme = db.kv.peekGet('theme') ?? await db.kv.get('theme');
+  if (db.kv.peekExists('config_cache')) { /* ... */ }
+
   // Очистить все данные KV в текущем пространстве
   await db.kv.clear();
   ```
@@ -1093,6 +1097,24 @@ if (page.hasMore) {
   final next = page.peekNext(); // попадание в кэш: синхронная смена страницы
   if (next.data.isEmpty) await page.next();
 }
+```
+
+#### Зонд KV (`db.kv`)
+
+| Метод | Async-аналог | Описание |
+| :--- | :--- | :--- |
+| `peekGet(key)` | `get(key)` | Синхронная точечная проверка в памяти; просроченные ключи → `null` |
+| `peekExists(key)` | `exists(key)` | Синхронная проверка существования в памяти |
+| `db.kv.query().peek()` | `await db.kv.query()` | Синхронная пагинированная сонда (префикс / сортировка / limit) |
+| `db.kv.query().peekFirst()` | `await db.kv.query().first()` | Синхронная сонда первой записи |
+
+```dart
+// Точечный: сначала зонд, при промахе — async
+final theme = db.kv.peekGet('theme', isGlobal: true) ?? await db.kv.get('theme', isGlobal: true);
+
+// Пагинированная KV-сонда
+var page = db.kv.query().prefix('setting_').limit(20).peek();
+if (page.data.isEmpty) page = await db.kv.query().prefix('setting_').limit(20);
 ```
 
 > [!TIP]

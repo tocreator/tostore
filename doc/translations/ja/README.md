@@ -606,6 +606,10 @@ ToStore は、複雑なビジネス シナリオに対応する高度な機能�
   // キーが存在し、期限切れでないか確認
   final exists = await db.kv.exists('config_cache');
 
+  // メモリプローブ（同期、キャッシュヒット時のみ — [メモリプローブと同期検索 (peek)](#query-peek) を参照）
+  final theme = db.kv.peekGet('theme') ?? await db.kv.get('theme');
+  if (db.kv.peekExists('config_cache')) { /* ... */ }
+
   // 現在の空間のすべての KV データをクリア
   await db.kv.clear();
   ```
@@ -1093,6 +1097,24 @@ if (page.hasMore) {
   final next = page.peekNext(); // キャッシュヒット：同期ページ送り
   if (next.data.isEmpty) await page.next();
 }
+```
+
+#### KV プローブ (`db.kv`)
+
+| メソッド | 非同期対応 | 説明 |
+| :--- | :--- | :--- |
+| `peekGet(key)` | `get(key)` | 同期メモリ点検索；期限切れキーは `null` |
+| `peekExists(key)` | `exists(key)` | 同期メモリ存在確認 |
+| `db.kv.query().peek()` | `await db.kv.query()` | ページネーション同期プローブ（プレフィックス / ソート / limit） |
+| `db.kv.query().peekFirst()` | `await db.kv.query().first()` | 先頭レコード同期プローブ |
+
+```dart
+// 点検索：プローブ優先、ミス時は非同期にフォールバック
+final theme = db.kv.peekGet('theme', isGlobal: true) ?? await db.kv.get('theme', isGlobal: true);
+
+// ページネーション KV プローブ
+var page = db.kv.query().prefix('setting_').limit(20).peek();
+if (page.data.isEmpty) page = await db.kv.query().prefix('setting_').limit(20);
 ```
 
 > [!TIP]

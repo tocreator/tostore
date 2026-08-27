@@ -606,6 +606,10 @@ Para escenarios de clave-valor más complejos, se recomienda utilizar el espacio
   // Verificar si una clave existe y no ha expirado
   final exists = await db.kv.exists('config_cache');
 
+  // Sonda de memoria (sincrona, solo en caché — ver [Sonda de memoria y recuperación sincrónica (peek)](#query-peek))
+  final theme = db.kv.peekGet('theme') ?? await db.kv.get('theme');
+  if (db.kv.peekExists('config_cache')) { /* ... */ }
+
   // Limpiar todos los datos KV en el espacio actual
   await db.kv.clear();
   ```
@@ -1092,6 +1096,24 @@ if (page.hasMore) {
   final next = page.peekNext(); // acierto de caché: cambio de página sincrónico
   if (next.data.isEmpty) await page.next();
 }
+```
+
+#### Sonda KV (`db.kv`)
+
+| Método | Equivalente async | Descripción |
+| :--- | :--- | :--- |
+| `peekGet(key)` | `get(key)` | Sondeo puntual en memoria; claves expiradas → `null` |
+| `peekExists(key)` | `exists(key)` | Verificación de existencia en memoria |
+| `db.kv.query().peek()` | `await db.kv.query()` | Sondeo paginado (prefijo / orden / limit) |
+| `db.kv.query().peekFirst()` | `await db.kv.query().first()` | Sondeo del primer registro |
+
+```dart
+// Punto: sondea primero, async si falla
+final theme = db.kv.peekGet('theme', isGlobal: true) ?? await db.kv.get('theme', isGlobal: true);
+
+// Sonda KV paginada
+var page = db.kv.query().prefix('setting_').limit(20).peek();
+if (page.data.isEmpty) page = await db.kv.query().prefix('setting_').limit(20);
 ```
 
 > [!TIP]

@@ -349,7 +349,6 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       nextCursor: result.nextCursor,
       hasMore: result.hasMore,
       hasPrev: result.hasPrev,
-      totalRecordCount: result.totalRecordCount,
       executionTimeMs: result.executionTimeMs,
       nextPageExecutor: result.hasMore
           ? () async {
@@ -510,7 +509,6 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
         hasMore: result.hasMore,
         hasPrev: result.hasPrev,
         executionTimeMs: result.executionTimeMs,
-        totalRecordCount: result.totalRecordCount,
         count: result.count,
         aggregateResult: result.aggregateResult,
       );
@@ -547,13 +545,6 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       results = distinctResults;
     }
 
-    int? finalTotalCount = result.totalRecordCount;
-    if (finalTotalCount == null &&
-        queryCondition.isEmpty &&
-        (_joins == null || _joins!.isEmpty)) {
-      finalTotalCount = _db.tableDataManager.getTableRecordCountSync(table);
-    }
-
     return ExecuteResult(
       records: results,
       nextCursor: result.nextCursor,
@@ -561,7 +552,6 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       hasMore: result.hasMore,
       hasPrev: result.hasPrev,
       executionTimeMs: result.executionTimeMs,
-      totalRecordCount: finalTotalCount,
       count: result.count,
       aggregateResult: result.aggregateResult,
     );
@@ -721,7 +711,6 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       nextCursor: result.nextCursor,
       hasMore: result.hasMore,
       hasPrev: result.hasPrev,
-      totalRecordCount: result.totalRecordCount,
       executionTimeMs: result.executionTimeMs,
       nextPageExecutor: result.hasMore
           ? () async {
@@ -909,7 +898,6 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
         hasMore: result.hasMore,
         hasPrev: result.hasPrev,
         executionTimeMs: result.executionTimeMs,
-        totalRecordCount: result.totalRecordCount,
       );
     }
 
@@ -1006,14 +994,6 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       results = passedGroups;
     }
 
-    int? finalTotalCount = result.totalRecordCount;
-    if (finalTotalCount == null &&
-        queryCondition.isEmpty &&
-        (_joins == null || _joins!.isEmpty) &&
-        (_pendingForeignKeyJoins == null || _pendingForeignKeyJoins!.isEmpty)) {
-      finalTotalCount = _db.tableDataManager.getTableRecordCountSync(table);
-    }
-
     return ExecuteResult(
       records: results,
       nextCursor: result.nextCursor,
@@ -1021,7 +1001,6 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       hasMore: result.hasMore,
       hasPrev: result.hasPrev,
       executionTimeMs: result.executionTimeMs,
-      totalRecordCount: finalTotalCount,
       count: result.count ?? results.length,
       aggregateResult: result.aggregateResult,
     );

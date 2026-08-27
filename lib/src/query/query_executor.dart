@@ -252,7 +252,6 @@ class QueryExecutor {
               hasMore: entry.hasMore,
               hasPrev: entry.hasPrev,
               executionTimeMs: 0,
-              totalRecordCount: entry.totalRecordCount,
               count: entry.count,
               aggregateResult: entry.aggregateResult,
             );
@@ -482,7 +481,7 @@ class QueryExecutor {
     bool applyPromoteResultTransform = false,
 
     /// Engine-internal mutation path (delete/update/ttl): skip user-facing
-    /// post-processing (schema normalize, totalRecordCount, cursor pagination).
+    /// post-processing (schema normalize, cursor pagination).
     bool engineInternal = false,
   }) async {
     final schemaMgr = _dataStore.tableMetaManager;
@@ -687,7 +686,6 @@ class QueryExecutor {
               hasMore: entry.hasMore,
               hasPrev: entry.hasPrev,
               executionTimeMs: 0,
-              totalRecordCount: entry.totalRecordCount,
               count: entry.count,
               aggregateResult: entry.aggregateResult,
             );
@@ -893,7 +891,6 @@ class QueryExecutor {
             prevCursor: result.prevCursor,
             hasMore: result.hasMore,
             hasPrev: result.hasPrev,
-            totalRecordCount: result.totalRecordCount,
             count: result.count,
             aggregateResult: result.aggregateResult,
             createdAt: DateTime.now(),
@@ -1330,19 +1327,10 @@ class QueryExecutor {
 
       if (onlyCount) {
         stopwatch.stop();
-        int? totalRecordCount =
-            _dataStore.tableDataManager.getTableRecordCountSync(table);
-        if (totalRecordCount == null) {
-          try {
-            totalRecordCount =
-                await _dataStore.tableDataManager.getTableRecordCount(table);
-          } catch (_) {}
-        }
         return ExecuteResult(
           records: const [],
           count: planResult.count ?? 0,
           executionTimeMs: stopwatch.elapsedMilliseconds,
-          totalRecordCount: totalRecordCount,
         );
       }
 
@@ -1538,19 +1526,6 @@ class QueryExecutor {
         }
       }
 
-      // Use getTableRecordCount for accurate, buffer-aware record count (O(1) approach).
-      int? totalRecordCount;
-      if (!engineInternal) {
-        totalRecordCount =
-            _dataStore.tableDataManager.getTableRecordCountSync(table);
-        if (totalRecordCount == null) {
-          try {
-            totalRecordCount =
-                await _dataStore.tableDataManager.getTableRecordCount(table);
-          } catch (_) {}
-        }
-      }
-
       stopwatch.stop();
 
       return ExecuteResult(
@@ -1560,7 +1535,6 @@ class QueryExecutor {
         hasMore: hasMore,
         hasPrev: hasPrev,
         executionTimeMs: stopwatch.elapsedMilliseconds,
-        totalRecordCount: totalRecordCount,
       );
     } catch (e) {
       Logger.error('query execution failed', rawError: e);
@@ -4410,7 +4384,6 @@ class ExecuteResult {
   final bool hasPrev;
 
   final int? executionTimeMs;
-  final int? totalRecordCount;
   final int? count;
   final dynamic aggregateResult;
 
@@ -4425,7 +4398,6 @@ class ExecuteResult {
     this.hasMore = false,
     this.hasPrev = false,
     this.executionTimeMs,
-    this.totalRecordCount,
     this.count,
     this.aggregateResult,
     this.isPointDirect = false,
@@ -4438,7 +4410,6 @@ class ExecuteResult {
         hasMore = false,
         hasPrev = false,
         executionTimeMs = null,
-        totalRecordCount = null,
         count = null,
         aggregateResult = null,
         isPointDirect = false;

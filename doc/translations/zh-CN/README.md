@@ -627,6 +627,10 @@ ToStore 提供了丰富的进阶功能，满足各种复杂业务场景需求：
   // 检查某个键是否存在且未过期
   final exists = await db.kv.exists('config_cache');
 
+  // 内存探针（同步、仅内存命中 — 详见 [内存探针与同步检索 (peek)](#query-peek)）
+  final theme = db.kv.peekGet('theme') ?? await db.kv.get('theme');
+  if (db.kv.peekExists('config_cache')) { /* ... */ }
+
   // 清空当前空间的所有 KV 数据
   await db.kv.clear();
   ```
@@ -1116,6 +1120,24 @@ if (page.hasMore) {
   final next = page.peekNext(); // 缓存命中，同步翻页
   if (next.data.isEmpty) await page.next();
 }
+```
+
+#### KV 探针 (`db.kv`)
+
+| 方法 | 异步对应 | 说明 |
+| :--- | :--- | :--- |
+| `peekGet(key)` | `get(key)` | 同步内存点查；过期键返回 `null` |
+| `peekExists(key)` | `exists(key)` | 同步内存存在性检查 |
+| `db.kv.query().peek()` | `await db.kv.query()` | 分页列表同步探针（前缀 / 排序 / limit） |
+| `db.kv.query().peekFirst()` | `await db.kv.query().first()` | 首条记录同步探针 |
+
+```dart
+// 点查：先探针，未命中再异步回退
+final theme = db.kv.peekGet('theme', isGlobal: true) ?? await db.kv.get('theme', isGlobal: true);
+
+// 分页 KV 探针
+var page = db.kv.query().prefix('setting_').limit(20).peek();
+if (page.data.isEmpty) page = await db.kv.query().prefix('setting_').limit(20);
 ```
 
 > [!TIP]
