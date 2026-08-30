@@ -436,7 +436,7 @@ class LargeOperationRunner {
             deletes.add(record);
 
             if (dataStore.notificationManager.hasListeners(schema.tableUid)) {
-              dataStore.notificationManager.notify(ChangeEvent(
+              dataStore.notifyDataChange(ChangeEvent(
                 type: ChangeType.delete,
                 tableUid: schema.tableUid,
                 oldRecord: record,
@@ -913,7 +913,7 @@ class LargeOperationRunner {
             updatedCount++;
 
             if (dataStore.notificationManager.hasListeners(schema.tableUid)) {
-              dataStore.notificationManager.notify(ChangeEvent(
+              dataStore.notifyDataChange(ChangeEvent(
                 type: ChangeType.update,
                 tableUid: schema.tableUid,
                 record: updatedRecord,

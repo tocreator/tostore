@@ -67,6 +67,11 @@ final class NoopStorageImpl implements StorageInterface {
       Uint8List(0);
 
   @override
+  Future<List<Uint8List>> readManyAsBytesAt(
+          String path, List<ByteReadRange> ranges) async =>
+      List<Uint8List>.filled(ranges.length, Uint8List(0), growable: false);
+
+  @override
   Future<void> writeAsBytesAt(
     String path,
     int start,

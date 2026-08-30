@@ -410,22 +410,33 @@ class ToStoreExample {
       'embedding': sampleVector2,
     });
 
-    // --- Vector similarity search (ANN) ---
+    // --- Vector similarity search (ANN via db.query chain) ---
     final queryVector =
         VectorData.fromList(List.generate(128, (i) => (i * 0.015)));
 
-    final searchResults = await db.vectorSearch(
-      'embeddings',
-      fieldName: 'embedding',
-      queryVector: queryVector,
-      topK: 5,
-    );
+    final queryResult = await db
+        .query('embeddings')
+        .matchVector('embedding', queryVector)
+        .limit(5);
 
-    for (final r in searchResults) {
-      logService.add(
-          'match: pk=${r.primaryKey}, distance=${r.distance.toStringAsFixed(4)}, '
-          'score=${r.score.toStringAsFixed(4)}');
+    final retrieval = queryResult.retrieval;
+    final sb = StringBuffer('--- Vector Search Top-5 Matches ---');
+    for (int i = 0; i < queryResult.data.length; i++) {
+      final doc = queryResult.data[i];
+      final pk = doc['id'];
+      final title = doc['document_title'] ?? '';
+      final entry = (retrieval != null && i < retrieval.entries.length)
+          ? retrieval.entries[i]
+          : null;
+      final score = entry?.score.toStringAsFixed(4) ?? 'N/A';
+      final rawScore = entry?.rawScore;
+      final dist = entry?.meta?['distance']?.toString() ??
+          (rawScore != null ? rawScore.toStringAsFixed(4) : 'N/A');
+      sb.writeln();
+      sb.write(
+          '  #${i + 1} pk=$pk, score=$score, distance=$dist, title="$title"');
     }
+    logService.add(sb.toString());
 
     // --- Direct vector operations ---
     final result = await db.query('embeddings');
@@ -741,16 +752,58 @@ class ToStoreExample {
         case DataType.datetime:
           break;
         case DataType.vector:
-          // Generate high-quality random vector
+          // Generate 5-member semantic proximity chains along a dedicated 1D topic ray.
+          // Guarantees every single record (M0..M4) always has 3-4 immediate neighbors
+          // with cosine scores smoothly distributed across 0.96 -> 0.87 -> 0.76.
           if (field.vectorConfig != null) {
             final dims = field.vectorConfig!.dimensions;
-            final values = List<double>.generate(dims, (_) {
-              // Gaussian approximation using Box-Muller transform
-              final u1 = rng.nextDouble();
-              final u2 = rng.nextDouble();
-              final z = sqrt(-2.0 * log(u1)) * cos(2.0 * pi * u2);
-              return z;
+            final groupId = (index - 1) ~/ 5;
+            final memberId = (index - 1) % 5;
+            final groupSeed = Random(groupId * 10007 + dims);
+
+            // 1. Generate base cluster vector (unit normalized)
+            final base = List<double>.generate(dims, (_) {
+              final u1 = groupSeed.nextDouble().clamp(1e-10, 1.0);
+              final u2 = groupSeed.nextDouble();
+              return sqrt(-2.0 * log(u1)) * cos(2.0 * pi * u2);
             });
+            final bNorm = sqrt(base.fold(0.0, (p, e) => p + e * e));
+            if (bNorm > 0) {
+              for (var i = 0; i < dims; i++) {
+                base[i] /= bNorm;
+              }
+            }
+
+            // 2. Generate orthogonal direction vector for this group
+            final dir = List<double>.generate(dims, (_) {
+              final u1 = groupSeed.nextDouble().clamp(1e-10, 1.0);
+              final u2 = groupSeed.nextDouble();
+              return sqrt(-2.0 * log(u1)) * cos(2.0 * pi * u2);
+            });
+            double bDotD = 0;
+            for (var i = 0; i < dims; i++) {
+              bDotD += base[i] * dir[i];
+            }
+            for (var i = 0; i < dims; i++) {
+              dir[i] -= bDotD * base[i];
+            }
+            final dNorm = sqrt(dir.fold(0.0, (p, e) => p + e * e));
+            if (dNorm > 0) {
+              for (var i = 0; i < dims; i++) {
+                dir[i] /= dNorm;
+              }
+            }
+
+            // 3. Step parameter along the ray: t_k = (k - 2) * 0.28 (centered around M2)
+            // Adjacent members have cos ≈ 0.96
+            // 2-step neighbors have cos ≈ 0.87
+            // 3-step neighbors have cos ≈ 0.77
+            final double t = (memberId - 2) * 0.28;
+
+            final values = List<double>.generate(dims, (d) {
+              return base[d] + (dir[d] * t);
+            });
+
             // Normalize to unit length for cosine similarity
             final norm = sqrt(values.fold(0.0, (p, e) => p + e * e));
             if (norm > 0) {
@@ -759,6 +812,10 @@ class ToStoreExample {
               }
             }
             record[field.name] = VectorData(values);
+            if (record['document_title'] != null) {
+              record['document_title'] =
+                  '[Group $groupId:M$memberId] ${record['document_title']}';
+            }
           }
           break;
         case DataType.blob:
@@ -1135,54 +1192,152 @@ class ToStoreExample {
     }
 
     final random = Random();
-    final stopwatch = Stopwatch()..start();
-    int totalResults = 0;
-    bool validationFailed = false;
+    final totalCount = await db.query(tableName).count();
+    final isSequential =
+        schema.primaryKeyConfig.type == PrimaryKeyType.sequential;
 
-    logService.add('Running $iterations searches...');
+    final List<Map<String, dynamic>> sampleDocs;
+    if (isSequential && totalCount > 50) {
+      // O(log N) Random Primary Key Probing across the entire table range (e.g. 1 ~ 100,000)
+      // Generates 25 randomly distributed PKs and fetches them concurrently with zero table scan.
+      final pks = <int>{};
+      final probeCount = min(totalCount, 25);
+      while (pks.length < probeCount) {
+        pks.add(random.nextInt(totalCount) + 1);
+      }
+      final probeResults = await Future.wait([
+        for (final pk in pks)
+          db
+              .query(tableName)
+              .where(schema.primaryKey, '=', pk.toString())
+              .limit(1)
+      ]);
+      sampleDocs = [
+        for (final res in probeResults)
+          if (res.data.isNotEmpty) res.data.first
+      ];
+    } else {
+      // Fallback: fast first-page read
+      sampleDocs = (await db.query(tableName).limit(25)).data;
+    }
+
+    final List<(dynamic pk, VectorData vec)> anchorSamples = [];
+    for (final doc in sampleDocs) {
+      final rawVec = doc[vectorField.name];
+      final pk = doc[schema.primaryKey] ?? doc['id'];
+      if (rawVec is VectorData) {
+        anchorSamples.add((pk, rawVec));
+      } else if (rawVec is Float32List) {
+        anchorSamples.add((pk, VectorData(rawVec)));
+      } else if (rawVec is Iterable) {
+        try {
+          final list = [for (final dynamic n in rawVec) (n as num).toDouble()];
+          if (list.length == dims) {
+            anchorSamples.add((pk, VectorData.fromList(list)));
+          }
+        } catch (_) {}
+      }
+    }
+
+    final totalStopwatch = Stopwatch()..start();
+    final latenciesMs = <double>[];
+    int exactTestCount = 0;
+    int exactHitCount = 0;
+    int semanticTestCount = 0;
+    int semanticHitCount = 0;
 
     for (int i = 0; i < iterations; i++) {
-      // 1. Generate random query vector (normalized)
-      final queryValues = List<double>.generate(dims, (_) {
-        final u1 = random.nextDouble();
-        final u2 = random.nextDouble();
-        return sqrt(-2.0 * log(u1)) * cos(2.0 * pi * u2);
-      });
-      final norm = sqrt(queryValues.fold(0.0, (p, e) => p + e * e));
-      if (norm > 0) {
-        for (var j = 0; j < dims; j++) {
-          queryValues[j] /= norm;
+      dynamic targetAnchorPk;
+      VectorData queryVector;
+      bool isExactTest = false;
+
+      // 1. Generate query vector based on real in-table anchor records:
+      // - 50% Exact 0-Noise Identity Probe (tests 100% target recall)
+      // - 50% Semantic Proximity Probe (tests neighboring cluster recall)
+      if (anchorSamples.isNotEmpty) {
+        final anchor = anchorSamples[random.nextInt(anchorSamples.length)];
+        targetAnchorPk = anchor.$1;
+        final baseValues = anchor.$2.values;
+
+        if (iterations == 1 || random.nextDouble() < 0.50) {
+          isExactTest = true;
+          exactTestCount++;
+          queryVector = anchor.$2;
+        } else {
+          semanticTestCount++;
+          // Extremely light semantic noise (1% noise) for realistic neighbor retrieval
+          final perturbed = List<double>.generate(dims, (d) {
+            final u1 = random.nextDouble().clamp(1e-10, 1.0);
+            final u2 = random.nextDouble();
+            final g = sqrt(-2.0 * log(u1)) * cos(2.0 * pi * u2);
+            return (d < baseValues.length ? baseValues[d] : 0.0) + (g * 0.015);
+          });
+          final norm = sqrt(perturbed.fold(0.0, (p, e) => p + e * e));
+          if (norm > 0) {
+            for (var j = 0; j < dims; j++) {
+              perturbed[j] /= norm;
+            }
+          }
+          queryVector = VectorData(perturbed);
         }
+      } else {
+        final queryValues = List<double>.generate(dims, (_) {
+          final u1 = random.nextDouble().clamp(1e-10, 1.0);
+          final u2 = random.nextDouble();
+          return sqrt(-2.0 * log(u1)) * cos(2.0 * pi * u2);
+        });
+        final norm = sqrt(queryValues.fold(0.0, (p, e) => p + e * e));
+        if (norm > 0) {
+          for (var j = 0; j < dims; j++) {
+            queryValues[j] /= norm;
+          }
+        }
+        queryVector = VectorData(queryValues);
       }
-      final queryVector = VectorData(queryValues);
 
-      // 2. Perform search
-      final results = await db.vectorSearch(
-        tableName,
-        fieldName: vectorField.name,
-        queryVector: queryVector,
-        topK: topK,
-      );
+      // 2. Perform search via db.query chain with timing
+      final querySw = Stopwatch()..start();
+      final queryResult = await db
+          .query(tableName)
+          .matchVector(vectorField.name, queryVector)
+          .limit(topK);
+      querySw.stop();
+      final queryElapsedMs = querySw.elapsedMicroseconds / 1000.0;
+      latenciesMs.add(queryElapsedMs);
 
-      totalResults += results.length;
+      final results = queryResult.data;
 
-      // 3. Validate results (only for the first/single iteration to avoid overhead if iterations are high)
-      if (i == 0 || iterations <= 10) {
+      // Track target hit statistics
+      bool targetHitTop1 = false;
+      bool targetHitTopK = false;
+      if (targetAnchorPk != null && results.isNotEmpty) {
+        final firstPk = results.first[schema.primaryKey] ?? results.first['id'];
+        if (firstPk.toString() == targetAnchorPk.toString()) {
+          targetHitTop1 = true;
+        }
         for (final r in results) {
-          // Validate similarity score range for Cosine (-1.0 to 1.0)
-          if (r.score < -1.0001 || r.score > 1.0001) {
-            logService.add(
-                'Validation Error: Invalid similarity score ${r.score} (expected -1.0 to 1.0 for Cosine)',
-                LogLevel.error);
-            validationFailed = true;
+          final pk = r[schema.primaryKey] ?? r['id'];
+          if (pk.toString() == targetAnchorPk.toString()) {
+            targetHitTopK = true;
+            break;
           }
         }
       }
 
+      if (isExactTest) {
+        if (targetHitTop1) exactHitCount++;
+      } else if (targetAnchorPk != null) {
+        if (targetHitTopK) semanticHitCount++;
+      }
+
       // Periodically log progress for long tests
-      if (iterations >= 1000 && (i + 1) % (iterations ~/ 10) == 0) {
+      if (iterations >= 100 &&
+          (i + 1) % (iterations ~/ 5) == 0 &&
+          (i + 1) < iterations) {
+        final pct = ((i + 1) / iterations * 100).toStringAsFixed(0);
         logService.add(
-            'Progress: ${i + 1}/$iterations completed...', LogLevel.info, true);
+            '⏳ Benchmark Progress: ${i + 1}/$iterations completed ($pct%)...',
+            LogLevel.info);
       }
 
       // Small delay to allow UI refresh in very long loops
@@ -1191,19 +1346,59 @@ class ToStoreExample {
       }
     }
 
-    stopwatch.stop();
-    final totalElapsed = stopwatch.elapsedMilliseconds;
+    totalStopwatch.stop();
+    final totalElapsed = totalStopwatch.elapsedMilliseconds;
     final avgLatency = totalElapsed / iterations;
 
-    logService.add('---------------------------------------');
-    logService.add('Vector Search Benchmark Completed:');
-    logService.add('- Total Latency: ${totalElapsed}ms');
-    logService.add('- Average Latency: ${avgLatency.toStringAsFixed(3)}ms');
-    logService.add(
-        '- Results Count (Avg): ${(totalResults / iterations).toStringAsFixed(1)}');
-    logService.add(
-        '- Status: ${validationFailed ? "FAILED (Check logs)" : "PASSED"}');
-    logService.add('---------------------------------------');
+    // 4. Print Single Consolidated Summary Report for the entire execution
+    latenciesMs.sort();
+    final p50 = latenciesMs[
+        (iterations * 0.50).floor().clamp(0, latenciesMs.length - 1)];
+    final p95 = latenciesMs[
+        (iterations * 0.95).floor().clamp(0, latenciesMs.length - 1)];
+    final p99 = latenciesMs[
+        (iterations * 0.99).floor().clamp(0, latenciesMs.length - 1)];
+    final qps = avgLatency > 0 ? (1000.0 / avgLatency) : 0.0;
+
+    final exactHitRate =
+        exactTestCount > 0 ? (exactHitCount / exactTestCount) : 1.0;
+    final semanticHitRate =
+        semanticTestCount > 0 ? (semanticHitCount / semanticTestCount) : 1.0;
+    final overallHitCount = exactHitCount + semanticHitCount;
+    final totalAnchorTests = exactTestCount + semanticTestCount;
+    final overallHitRate =
+        totalAnchorTests > 0 ? (overallHitCount / totalAnchorTests) : 1.0;
+
+    final report = StringBuffer();
+    report.writeln('');
+    report.writeln('=' * 78);
+    report.writeln(
+        '        TOSTORE VECTOR SEARCH BENCHMARK SUMMARY ($iterations Iterations)       ');
+    report.writeln('=' * 78);
+    report.writeln(
+        '  Target Table         : $tableName (${dims}D, Cosine Metric)');
+    report.writeln('  Total Executed       : $iterations queries (Top-$topK)');
+    report.writeln('  Total Time Elapsed   : $totalElapsed ms');
+    report.writeln('-' * 78);
+    report.writeln('  ACCURACY & RECALL METRICS:');
+    report.writeln(
+        '    Exact Identity Hit : ${(exactHitRate * 100).toStringAsFixed(1)}% ($exactHitCount/$exactTestCount) 🎯 [Top-1 Exact]');
+    report.writeln(
+        '    Semantic Recall    : ${(semanticHitRate * 100).toStringAsFixed(1)}% ($semanticHitCount/$semanticTestCount) 🎯 [Top-$topK Proximity]');
+    report.writeln(
+        '    Overall Target Hit : ${(overallHitRate * 100).toStringAsFixed(1)}% ($overallHitCount/$totalAnchorTests)');
+    report.writeln('-' * 78);
+    report.writeln('  LATENCY & THROUGHPUT:');
+    report.writeln(
+        '    Average Latency    : ${avgLatency.toStringAsFixed(2)} ms/query');
+    report.writeln('    P50 Latency        : ${p50.toStringAsFixed(2)} ms');
+    report.writeln('    P95 Latency        : ${p95.toStringAsFixed(2)} ms');
+    report.writeln('    P99 Latency        : ${p99.toStringAsFixed(2)} ms');
+    report.writeln(
+        '    QPS Throughput     : ${qps.toStringAsFixed(1)} queries/sec');
+    report.writeln('=' * 78);
+
+    logService.add(report.toString().trimRight(), LogLevel.info);
 
     return avgLatency;
   }

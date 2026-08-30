@@ -1,5 +1,4 @@
 import '../handler/common.dart';
-import '../core/ngh_page.dart';
 import 'meta_info.dart';
 import 'table_identity.dart';
 import 'table_schema.dart';
@@ -10,17 +9,11 @@ import 'table_schema.dart';
 
 /// Metadata for an NGH vector index instance.
 ///
-/// Tracks all structural parameters, page layout constants, and runtime
-/// statistics for a single vector index. Persisted as JSON alongside the
-/// index partition files and rebuilt/updated atomically during flush.
 class NghIndexMeta {
   /// Metadata format version for forward-compatibility.
   final int version;
 
-  /// Stable index uid for NGH paths, caches, and mapping B+Tree directories.
-  ///
-  /// Required for all instances. [fromJson] may synthesize a legacy value from
-  /// the deprecated on-disk `name` field when loading pre-uid files.
+  /// Stable index uid for NGH paths and caches.
   final IndexUid indexUid;
 
   /// Owning table unique identifier.
@@ -52,17 +45,6 @@ class NghIndexMeta {
   /// Diversity parameter for Robust Prune (alpha >= 1.0).
   final double pruneAlpha;
 
-  // ===================== PQ Parameters ========================
-
-  /// Number of PQ sub-spaces (M). Each sub-vector is quantised independently.
-  final int pqSubspaces;
-
-  /// Centroids per sub-space (K). Fixed at 256 -> 1 byte per sub-code.
-  final int pqCentroids;
-
-  /// Whether the PQ codebook has been trained.
-  final bool pqTrained;
-
   // ===================== Runtime Statistics ====================
 
   /// Total number of live vectors (excluding tombstoned).
@@ -79,111 +61,23 @@ class NghIndexMeta {
 
   // ===================== Partition Layout ======================
 
-  /// Number of graph partition files.
-  final int graphPartitionCount;
+  /// Number of posting partition files.
+  final int postingPartitionCount;
 
-  /// Next page number in the active graph partition.
-  final int graphNextPageNo;
+  /// Next page number in the active posting partition.
+  final int postingNextPageNo;
 
-  /// Number of PQ-code partition files.
-  final int pqCodePartitionCount;
-
-  /// Next page number in the active PQ-code partition.
-  final int pqCodeNextPageNo;
-
-  /// Number of raw-vector partition files.
-  final int rawVectorPartitionCount;
-
-  /// Next page number in the active raw-vector partition.
-  final int rawVectorNextPageNo;
+  /// Posting partition free-list heads.
+  final Map<int, int> postingFreeListHeads;
 
   /// Total size of all partition files in bytes (best-effort).
   final int totalSizeBytes;
 
-  // ===================== nodeId <-> PK B+Tree Mapping ============
+  /// Whether this index is currently being built by a background migration task.
+  final bool isBuilding;
 
-  /// B+Tree index meta for nodeId -> PK forward lookup.
-  /// Stored under [nid2pkIndexUid] (derived from [indexUid]).
-  final IndexMeta? nodeIdToPkMeta;
-
-  /// B+Tree index meta for PK -> nodeId reverse lookup.
-  /// Stored under [pk2nidIndexUid] (derived from [indexUid]).
-  final IndexMeta? pkToNodeIdMeta;
-
-  /// Stable virtual B+Tree uid for nodeId -> PK mapping.
-  IndexUid get nid2pkIndexUid => IndexUid('${indexUid.value}__nid2pk');
-
-  /// Stable virtual B+Tree uid for PK -> nodeId mapping.
-  IndexUid get pk2nidIndexUid => IndexUid('${indexUid.value}__pk2nid');
-
-  // ===================== Free-List State ======================
-
-  /// Graph partition free-list heads (partitionNo -> headPageNo, -1 = empty).
-  final Map<int, int> graphFreeListHeads;
-
-  /// PQ-code partition free-list heads.
-  final Map<int, int> pqCodeFreeListHeads;
-
-  /// Raw-vector partition free-list heads.
-  final Map<int, int> rawVectorFreeListHeads;
-
-  // ===================== Derived Constants ====================
-
-  /// Bytes per graph node slot: 1(flags) + 1(degree) + maxDegree*4(neighbors).
-  int get graphNodeSlotSize => 2 + maxDegree * 4;
-
-  /// Number of node slots that fit in one graph page.
-  int nodesPerGraphPage(int pageSize) =>
-      NghPageSizer.nodesPerGraphPage(pageSize, maxDegree);
-
-  /// Bytes per PQ code entry.
-  int get pqCodeEntrySize => pqSubspaces;
-
-  /// Number of PQ entries that fit in one PQ-code page.
-  int vectorsPerPqPage(int pageSize) =>
-      NghPageSizer.vectorsPerPqPage(pageSize, pqSubspaces);
-
-  /// Bytes per raw vector: dimensions x bytesPerElement.
-  int get rawVectorEntrySize => dimensions * _bytesPerElement;
-
-  /// Number of raw vectors that fit in one raw-vector page.
-  int vectorsPerRawPage(int pageSize) =>
-      NghPageSizer.vectorsPerRawPage(pageSize, dimensions, _bytesPerElement);
-
-  /// Maximum logical graph pages per partition file.
-  int graphPagesPerPartition(int pageSize) =>
-      _maxPagesPerPartitionFile(pageSize);
-
-  /// Maximum logical PQ-code pages per partition file.
-  int pqCodePagesPerPartition(int pageSize) =>
-      _maxPagesPerPartitionFile(pageSize);
-
-  /// Maximum logical raw-vector pages per partition file.
-  int rawVectorPagesPerPartition(int pageSize) =>
-      _maxPagesPerPartitionFile(pageSize);
-
-  // ===================== Private Helpers =======================
-
-  int get _bytesPerElement {
-    switch (precision) {
-      case VectorPrecision.float32:
-        return 4;
-      case VectorPrecision.float64:
-        return 8;
-      case VectorPrecision.int8:
-        return 1;
-    }
-  }
-
-  int _maxPagesPerPartitionFile(int pageSize) =>
-      _maxPartitionFileSize ~/ pageSize;
-
-  /// Snapshot of the per-partition file size limit used when this meta was created.
-  int get maxPartitionFileSizeBytes => _maxPartitionFileSize;
-
-  /// Placeholder -- the actual limit is injected from [DataStoreConfig].
-  /// We store a snapshot so the meta is self-contained.
-  final int _maxPartitionFileSize;
+  /// Number of centroids currently in the navigating graph.
+  final int centroidCount;
 
   // ===================== Constructor ===========================
 
@@ -199,44 +93,23 @@ class NghIndexMeta {
     this.efSearch = 64,
     this.constructionEf = 128,
     this.pruneAlpha = 1.2,
-    this.pqSubspaces = 16,
-    this.pqCentroids = 256,
-    this.pqTrained = false,
     this.totalVectors = 0,
     this.deletedCount = 0,
     this.medoidNodeId = -1,
     this.nextNodeId = 0,
-    this.graphPartitionCount = 1,
-    this.graphNextPageNo = firstDataPageNo,
-    this.pqCodePartitionCount = 1,
-    this.pqCodeNextPageNo = firstDataPageNo,
-    this.rawVectorPartitionCount = 1,
-    this.rawVectorNextPageNo = firstDataPageNo,
     this.totalSizeBytes = 0,
-    this.nodeIdToPkMeta,
-    this.pkToNodeIdMeta,
-    Map<int, int>? graphFreeListHeads,
-    Map<int, int>? pqCodeFreeListHeads,
-    Map<int, int>? rawVectorFreeListHeads,
-    int maxPartitionFileSize = 16 * 1024 * 1024,
+    this.isBuilding = false,
+    this.centroidCount = 0,
+    this.postingPartitionCount = 1,
+    this.postingNextPageNo = firstDataPageNo,
+    Map<int, int>? postingFreeListHeads,
   })  : version = version ?? InternalConfig.indexVersion,
-        graphFreeListHeads = graphFreeListHeads ?? const {},
-        pqCodeFreeListHeads = pqCodeFreeListHeads ?? const {},
-        rawVectorFreeListHeads = rawVectorFreeListHeads ?? const {},
-        _maxPartitionFileSize = maxPartitionFileSize;
+        postingFreeListHeads = postingFreeListHeads ?? const {};
 
   // ===================== Defaults ==============================
 
   /// First data page number (pageNo=0 reserved for per-file meta).
   static const int firstDataPageNo = 1;
-
-  /// Auto-select PQ sub-spaces from vector dimensionality.
-  ///
-  /// Keeps each sub-vector at 8 dimensions when possible, clamped to [8, 128].
-  static int autoPqSubspaces(int dimensions) {
-    final m = dimensions ~/ 8;
-    return m.clamp(8, 128);
-  }
 
   // ===================== Factory ===============================
 
@@ -251,12 +124,10 @@ class NghIndexMeta {
     int? efSearch,
     int? constructionEf,
     double? pruneAlpha,
-    int? pqSubspaces,
-    int maxPartitionFileSize = 16 * 1024 * 1024,
     DateTime? now,
+    bool isBuilding = false,
   }) {
     final ts = now ?? DateTime.now();
-    final m = pqSubspaces ?? autoPqSubspaces(dimensions);
     return NghIndexMeta(
       indexUid: indexUid,
       tableUid: tableUid,
@@ -268,8 +139,7 @@ class NghIndexMeta {
       efSearch: efSearch ?? 64,
       constructionEf: constructionEf ?? 128,
       pruneAlpha: pruneAlpha ?? 1.2,
-      pqSubspaces: m,
-      maxPartitionFileSize: maxPartitionFileSize,
+      isBuilding: isBuilding,
     );
   }
 
@@ -287,26 +157,16 @@ class NghIndexMeta {
     int? efSearch,
     int? constructionEf,
     double? pruneAlpha,
-    int? pqSubspaces,
-    int? pqCentroids,
-    bool? pqTrained,
     int? totalVectors,
     int? deletedCount,
     int? medoidNodeId,
     int? nextNodeId,
-    int? graphPartitionCount,
-    int? graphNextPageNo,
-    int? pqCodePartitionCount,
-    int? pqCodeNextPageNo,
-    int? rawVectorPartitionCount,
-    int? rawVectorNextPageNo,
     int? totalSizeBytes,
-    IndexMeta? nodeIdToPkMeta,
-    IndexMeta? pkToNodeIdMeta,
-    Map<int, int>? graphFreeListHeads,
-    Map<int, int>? pqCodeFreeListHeads,
-    Map<int, int>? rawVectorFreeListHeads,
-    int? maxPartitionFileSize,
+    bool? isBuilding,
+    int? centroidCount,
+    int? postingPartitionCount,
+    int? postingNextPageNo,
+    Map<int, int>? postingFreeListHeads,
   }) {
     return NghIndexMeta(
       version: version ?? this.version,
@@ -320,28 +180,17 @@ class NghIndexMeta {
       efSearch: efSearch ?? this.efSearch,
       constructionEf: constructionEf ?? this.constructionEf,
       pruneAlpha: pruneAlpha ?? this.pruneAlpha,
-      pqSubspaces: pqSubspaces ?? this.pqSubspaces,
-      pqCentroids: pqCentroids ?? this.pqCentroids,
-      pqTrained: pqTrained ?? this.pqTrained,
       totalVectors: totalVectors ?? this.totalVectors,
       deletedCount: deletedCount ?? this.deletedCount,
       medoidNodeId: medoidNodeId ?? this.medoidNodeId,
       nextNodeId: nextNodeId ?? this.nextNodeId,
-      graphPartitionCount: graphPartitionCount ?? this.graphPartitionCount,
-      graphNextPageNo: graphNextPageNo ?? this.graphNextPageNo,
-      pqCodePartitionCount: pqCodePartitionCount ?? this.pqCodePartitionCount,
-      pqCodeNextPageNo: pqCodeNextPageNo ?? this.pqCodeNextPageNo,
-      rawVectorPartitionCount:
-          rawVectorPartitionCount ?? this.rawVectorPartitionCount,
-      rawVectorNextPageNo: rawVectorNextPageNo ?? this.rawVectorNextPageNo,
       totalSizeBytes: totalSizeBytes ?? this.totalSizeBytes,
-      nodeIdToPkMeta: nodeIdToPkMeta ?? this.nodeIdToPkMeta,
-      pkToNodeIdMeta: pkToNodeIdMeta ?? this.pkToNodeIdMeta,
-      graphFreeListHeads: graphFreeListHeads ?? this.graphFreeListHeads,
-      pqCodeFreeListHeads: pqCodeFreeListHeads ?? this.pqCodeFreeListHeads,
-      rawVectorFreeListHeads:
-          rawVectorFreeListHeads ?? this.rawVectorFreeListHeads,
-      maxPartitionFileSize: maxPartitionFileSize ?? _maxPartitionFileSize,
+      isBuilding: isBuilding ?? this.isBuilding,
+      centroidCount: centroidCount ?? this.centroidCount,
+      postingPartitionCount:
+          postingPartitionCount ?? this.postingPartitionCount,
+      postingNextPageNo: postingNextPageNo ?? this.postingNextPageNo,
+      postingFreeListHeads: postingFreeListHeads ?? this.postingFreeListHeads,
     );
   }
 
@@ -350,7 +199,8 @@ class NghIndexMeta {
   factory NghIndexMeta.fromJson(Map<String, dynamic> json) {
     return NghIndexMeta(
       version: (json['version'] as num?)?.toInt(),
-      indexUid: _indexUidFromJson(json),
+      indexUid:
+          IndexUid.tryParse(json['indexUid'] as String?) ?? IndexUid.empty,
       tableUid: TableUid((json['tableUid'] ?? json['tableName']) as String),
       dimensions: (json['dimensions'] as num).toInt(),
       distanceMetric: _parseDistanceMetric(json['distanceMetric'] as String?),
@@ -361,40 +211,21 @@ class NghIndexMeta {
       efSearch: (json['efSearch'] as num?)?.toInt() ?? 64,
       constructionEf: (json['constructionEf'] as num?)?.toInt() ?? 128,
       pruneAlpha: (json['pruneAlpha'] as num?)?.toDouble() ?? 1.2,
-      pqSubspaces: (json['pqSubspaces'] as num?)?.toInt() ??
-          NghIndexMeta.autoPqSubspaces((json['dimensions'] as num).toInt()),
-      pqCentroids: (json['pqCentroids'] as num?)?.toInt() ?? 256,
-      pqTrained: json['pqTrained'] as bool? ?? false,
       totalVectors: (json['totalVectors'] as num?)?.toInt() ?? 0,
       deletedCount: (json['deletedCount'] as num?)?.toInt() ?? 0,
       medoidNodeId: (json['medoidNodeId'] as num?)?.toInt() ?? -1,
       nextNodeId: (json['nextNodeId'] as num?)?.toInt() ?? 0,
-      graphPartitionCount: (json['graphPartitionCount'] as num?)?.toInt() ?? 1,
-      graphNextPageNo:
-          (json['graphNextPageNo'] as num?)?.toInt() ?? firstDataPageNo,
-      pqCodePartitionCount:
-          (json['pqCodePartitionCount'] as num?)?.toInt() ?? 1,
-      pqCodeNextPageNo:
-          (json['pqCodeNextPageNo'] as num?)?.toInt() ?? firstDataPageNo,
-      rawVectorPartitionCount:
-          (json['rawVectorPartitionCount'] as num?)?.toInt() ?? 1,
-      rawVectorNextPageNo:
-          (json['rawVectorNextPageNo'] as num?)?.toInt() ?? firstDataPageNo,
       totalSizeBytes:
           ((json['totalSizeBytes'] ?? json['totalSizeInBytes']) as num?)
                   ?.toInt() ??
               0,
-      nodeIdToPkMeta: json['nodeIdToPkMeta'] != null
-          ? IndexMeta.fromJson(json['nodeIdToPkMeta'] as Map<String, dynamic>)
-          : null,
-      pkToNodeIdMeta: json['pkToNodeIdMeta'] != null
-          ? IndexMeta.fromJson(json['pkToNodeIdMeta'] as Map<String, dynamic>)
-          : null,
-      graphFreeListHeads: _parseIntIntMap(json['graphFreeListHeads']),
-      pqCodeFreeListHeads: _parseIntIntMap(json['pqCodeFreeListHeads']),
-      rawVectorFreeListHeads: _parseIntIntMap(json['rawVectorFreeListHeads']),
-      maxPartitionFileSize:
-          (json['maxPartitionFileSize'] as num?)?.toInt() ?? 16 * 1024 * 1024,
+      isBuilding: (json['isBuilding'] as bool?) ?? false,
+      centroidCount: (json['centroidCount'] as num?)?.toInt() ?? 0,
+      postingPartitionCount:
+          (json['postingPartitionCount'] as num?)?.toInt() ?? 1,
+      postingNextPageNo:
+          (json['postingNextPageNo'] as num?)?.toInt() ?? firstDataPageNo,
+      postingFreeListHeads: _parseIntIntMap(json['postingFreeListHeads']),
     );
   }
 
@@ -411,76 +242,18 @@ class NghIndexMeta {
       'efSearch': efSearch,
       'constructionEf': constructionEf,
       'pruneAlpha': pruneAlpha,
-      'pqSubspaces': pqSubspaces,
-      'pqCentroids': pqCentroids,
-      'pqTrained': pqTrained,
       'totalVectors': totalVectors,
       'deletedCount': deletedCount,
       'medoidNodeId': medoidNodeId,
       'nextNodeId': nextNodeId,
-      'graphPartitionCount': graphPartitionCount,
-      'graphNextPageNo': graphNextPageNo,
-      'pqCodePartitionCount': pqCodePartitionCount,
-      'pqCodeNextPageNo': pqCodeNextPageNo,
-      'rawVectorPartitionCount': rawVectorPartitionCount,
-      'rawVectorNextPageNo': rawVectorNextPageNo,
       'totalSizeBytes': totalSizeBytes,
-      if (nodeIdToPkMeta != null) 'nodeIdToPkMeta': nodeIdToPkMeta!.toJson(),
-      if (pkToNodeIdMeta != null) 'pkToNodeIdMeta': pkToNodeIdMeta!.toJson(),
-      'graphFreeListHeads': _serializeIntIntMap(graphFreeListHeads),
-      'pqCodeFreeListHeads': _serializeIntIntMap(pqCodeFreeListHeads),
-      'rawVectorFreeListHeads': _serializeIntIntMap(rawVectorFreeListHeads),
-      'maxPartitionFileSize': _maxPartitionFileSize,
+      'isBuilding': isBuilding,
+      'centroidCount': centroidCount,
+      'postingPartitionCount': postingPartitionCount,
+      'postingNextPageNo': postingNextPageNo,
+      'postingFreeListHeads': _serializeIntIntMap(postingFreeListHeads),
     };
   }
-
-  // ===================== Node -> Page Mapping ===================
-
-  /// Compute the graph partition file number for a given [nodeId].
-  int graphPartitionForNode(int nodeId, int pageSize) {
-    final logicalPage = nodeId ~/ nodesPerGraphPage(pageSize);
-    return logicalPage ~/ graphPagesPerPartition(pageSize);
-  }
-
-  /// Compute the local page number within its graph partition for [nodeId].
-  int graphLocalPageForNode(int nodeId, int pageSize) {
-    final logicalPage = nodeId ~/ nodesPerGraphPage(pageSize);
-    // +1 because pageNo=0 is meta page in each partition file
-    return firstDataPageNo + (logicalPage % graphPagesPerPartition(pageSize));
-  }
-
-  /// Compute the slot index within its graph page for [nodeId].
-  int graphSlotForNode(int nodeId, int pageSize) =>
-      nodeId % nodesPerGraphPage(pageSize);
-
-  /// Compute the PQ-code partition and local page for [nodeId].
-  int pqPartitionForNode(int nodeId, int pageSize) {
-    final logicalPage = nodeId ~/ vectorsPerPqPage(pageSize);
-    return logicalPage ~/ pqCodePagesPerPartition(pageSize);
-  }
-
-  int pqLocalPageForNode(int nodeId, int pageSize) {
-    final logicalPage = nodeId ~/ vectorsPerPqPage(pageSize);
-    return firstDataPageNo + (logicalPage % pqCodePagesPerPartition(pageSize));
-  }
-
-  int pqSlotForNode(int nodeId, int pageSize) =>
-      nodeId % vectorsPerPqPage(pageSize);
-
-  /// Compute the raw-vector partition and local page for [nodeId].
-  int rawVectorPartitionForNode(int nodeId, int pageSize) {
-    final logicalPage = nodeId ~/ vectorsPerRawPage(pageSize);
-    return logicalPage ~/ rawVectorPagesPerPartition(pageSize);
-  }
-
-  int rawVectorLocalPageForNode(int nodeId, int pageSize) {
-    final logicalPage = nodeId ~/ vectorsPerRawPage(pageSize);
-    return firstDataPageNo +
-        (logicalPage % rawVectorPagesPerPartition(pageSize));
-  }
-
-  int rawVectorSlotForNode(int nodeId, int pageSize) =>
-      nodeId % vectorsPerRawPage(pageSize);
 
   // ===================== Private Helpers =======================
 
@@ -522,99 +295,6 @@ class NghIndexMeta {
   @override
   String toString() => 'NghIndexMeta(uid: $indexUid, table: $tableUid, '
       'dim: $dimensions, vectors: $totalVectors, '
-      'deleted: $deletedCount, graphPartitions: $graphPartitionCount, '
-      'pqTrained: $pqTrained, medoid: $medoidNodeId)';
-
-  /// Legacy logical index name from deprecated on-disk `name` (migration only).
-  static String? legacyLogicalNameFromJson(Map<String, dynamic> json) {
-    final legacy = json['name'] as String?;
-    if (legacy != null && legacy.isNotEmpty) return legacy;
-    return null;
-  }
-
-  /// Whether on-disk JSON still carries deprecated display fields.
-  static bool hasLegacyDisplayFieldsInJson(Map<String, dynamic> json) {
-    return json.containsKey('name') || json.containsKey('fieldName');
-  }
-
-  /// True when persisted meta still needs uid/layout repair (not for hot-path loads).
-  static bool needsOnDiskRepair({
-    required NghIndexMeta meta,
-    required IndexUid expectedIndexUid,
-    required bool hadLegacyDisplayFields,
-  }) {
-    if (hadLegacyDisplayFields) return true;
-    if (expectedIndexUid.isNotEmpty && meta.indexUid != expectedIndexUid) {
-      return true;
-    }
-    return hasLegacyMappingIndexUids(meta);
-  }
-
-  /// Nested mapping B+Tree uids still keyed by a legacy logical base name.
-  static bool hasLegacyMappingIndexUids(NghIndexMeta meta) {
-    final nid = meta.nodeIdToPkMeta;
-    if (nid != null && nid.indexUid != meta.nid2pkIndexUid) {
-      return true;
-    }
-    final pk = meta.pkToNodeIdMeta;
-    if (pk != null && pk.indexUid != meta.pk2nidIndexUid) {
-      return true;
-    }
-    return false;
-  }
-
-  /// Infer the on-disk legacy directory base name for one-time layout repair.
-  static String? inferLegacyLogicalName({
-    required NghIndexMeta meta,
-    required IndexUid expectedIndexUid,
-    String? legacyNameFromJson,
-  }) {
-    if (legacyNameFromJson != null &&
-        legacyNameFromJson.isNotEmpty &&
-        legacyNameFromJson != expectedIndexUid.value) {
-      return legacyNameFromJson;
-    }
-    final fromNid = _legacyBaseFromMappingUid(
-      meta.nodeIdToPkMeta?.indexUid.value,
-      expectedIndexUid.value,
-    );
-    if (fromNid != null) return fromNid;
-    final fromPk = _legacyBaseFromMappingUid(
-      meta.pkToNodeIdMeta?.indexUid.value,
-      expectedIndexUid.value,
-    );
-    if (fromPk != null) return fromPk;
-    if (meta.indexUid.isNotEmpty &&
-        meta.indexUid != expectedIndexUid &&
-        !meta.indexUid.looksLikeStableUid) {
-      return meta.indexUid.value;
-    }
-    return null;
-  }
-
-  static String? _legacyBaseFromMappingUid(
-    String? mappingUid,
-    String stableIndexUid,
-  ) {
-    if (mappingUid == null || mappingUid.isEmpty) return null;
-    for (final suffix in ['__nid2pk', '__pk2nid']) {
-      if (!mappingUid.endsWith(suffix)) continue;
-      final base = mappingUid.substring(0, mappingUid.length - suffix.length);
-      if (base.isNotEmpty && base != stableIndexUid) return base;
-    }
-    return null;
-  }
-
-  /// Parse stable uid from JSON, falling back to legacy `name` for old files.
-  static IndexUid _indexUidFromJson(Map<String, dynamic> json) {
-    final parsed = IndexUid.tryParse(json['indexUid'] as String?);
-    if (parsed != null && parsed.isNotEmpty) {
-      return parsed;
-    }
-    final legacyName = json['name'] as String?;
-    if (legacyName != null && legacyName.isNotEmpty) {
-      return IndexUid(legacyName);
-    }
-    return IndexUid.empty;
-  }
+      'deleted: $deletedCount, postingPartitions: $postingPartitionCount, '
+      'centroids: $centroidCount, medoid: $medoidNodeId)';
 }

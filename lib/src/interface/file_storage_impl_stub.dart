@@ -55,6 +55,12 @@ class FileStorageImpl implements StorageInterface {
   }
 
   @override
+  Future<List<Uint8List>> readManyAsBytesAt(
+      String path, List<ByteReadRange> ranges) async {
+    throw UnsupportedError('FileStorageImpl is not supported on Web platform');
+  }
+
+  @override
   Future<void> writeAsBytesAt(String path, int start, Uint8List bytes,
       {bool flush = true, bool closeHandleAfterFlush = false}) async {
     throw UnsupportedError('FileStorageImpl is not supported on Web platform');

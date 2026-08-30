@@ -1889,7 +1889,7 @@ class DataStoreImpl {
         schemaVersion: table.schema.schemaVersion ?? '',
       );
 
-      notificationManager.notify(ChangeEvent(
+      notifyDataChange(ChangeEvent(
         type: ChangeType.insert,
         tableUid: table.tableUid,
         record: orderedValidData,
@@ -2315,9 +2315,6 @@ class DataStoreImpl {
           }
         }
       }
-      // Get table file metadata to make an informed decision on the update strategy
-      final tableDataMeta =
-          await tableDataManager.getTableDataMeta(table.tableUid);
 
       // Get memory manager to access cache size limits
       final recordCacheSize =
@@ -2330,12 +2327,15 @@ class DataStoreImpl {
       bool isOptimizableQuery = false;
       // Small table heuristics: always optimize when
       // - table data meta is unknown or size invalid
-      // - size < 5MB (unconditional minimum threshold)
+      // - size < 50MB (unconditional minimum threshold)
       // - size < 30% of record cache size
+      // Include overflow files: large VectorData rows live mostly out-of-line.
       const int minSmallTableBytes = 50 * 1024 * 1024; // 50MB
-      if (tableDataMeta == null ||
-          tableDataMeta.totalSizeBytes < minSmallTableBytes ||
-          tableDataMeta.totalSizeBytes < recordCacheSize * 0.3) {
+      final tableDataSizeBytes =
+          await tableDataManager.sumTableDataSizeBytes(table);
+      if (tableDataSizeBytes == 0 ||
+          tableDataSizeBytes < minSmallTableBytes ||
+          tableDataSizeBytes < recordCacheSize * 0.3) {
         isOptimizableQuery = true;
       }
 
@@ -2858,7 +2858,7 @@ class DataStoreImpl {
                 promoteUpdated?.add(updatedRecord);
 
                 if (hasNotify) {
-                  notificationManager.notify(ChangeEvent(
+                  notifyDataChange(ChangeEvent(
                     type: ChangeType.update,
                     tableUid: table.tableUid,
                     record: updatedRecord,
@@ -3181,9 +3181,6 @@ class DataStoreImpl {
     try {
       // If inside a transaction and this is a heavy delete path, we should defer execution
       final String? txId = Zone.current[_txnZoneKey] as String?;
-      // Get table file metadata to make an informed decision on the deletion strategy
-      final tableDataMeta =
-          await tableDataManager.getTableDataMeta(table.tableUid);
 
       // Get memory manager to access cache size limits
       final recordCacheSize =
@@ -3207,12 +3204,15 @@ class DataStoreImpl {
       bool isOptimizableQuery = false;
       // Small table heuristics: always optimize when
       // - table data meta is unknown or size invalid
-      // - size < 5MB (unconditional minimum threshold)
+      // - size < 50MB (unconditional minimum threshold)
       // - size < 30% of record cache size
+      // Include overflow files: large VectorData rows live mostly out-of-line.
       const int minSmallTableBytes = 50 * 1024 * 1024; // 50MB
-      if (tableDataMeta == null ||
-          tableDataMeta.totalSizeBytes < minSmallTableBytes ||
-          tableDataMeta.totalSizeBytes < recordCacheSize * 0.3) {
+      final tableDataSizeBytes =
+          await tableDataManager.sumTableDataSizeBytes(table);
+      if (tableDataSizeBytes == 0 ||
+          tableDataSizeBytes < minSmallTableBytes ||
+          tableDataSizeBytes < recordCacheSize * 0.3) {
         isOptimizableQuery = true;
       }
 
@@ -3475,12 +3475,13 @@ class DataStoreImpl {
         }
 
         // Notify after buffer/cache are updated so watch re-queries see tombstones.
+        // Inside a transaction, events are deferred until commit (data not yet visible).
         if (hasListeners) {
           final notifyYield = YieldController('DataStoreImpl.delete.notify');
           for (final record in recordsToDelete) {
             final y = notifyYield.maybeYield();
             if (y != null) await y;
-            notificationManager.notify(ChangeEvent(
+            notifyDataChange(ChangeEvent(
               type: ChangeType.delete,
               tableUid: table.tableUid,
               oldRecord: record,
@@ -3585,6 +3586,37 @@ class DataStoreImpl {
     }
   }
 
+  /// Emit a change notification immediately, or defer until transaction commit.
+  ///
+  /// While the user transaction body runs, writes sit in the deferred txn
+  /// buffer and are invisible to external queries — notifying then causes
+  /// [watch] to re-query stale data with no follow-up after commit. Events
+  /// are queued and flushed after [applyCommitPlan] + [commit] succeed.
+  /// During [TransactionContext.isApplyingCommit] (and outside transactions)
+  /// notifications are emitted immediately.
+  void notifyDataChange(ChangeEvent event) {
+    if (TransactionContext.shouldDeferChangeNotification()) {
+      if (!notificationManager.hasListeners(event.tableUid)) return;
+      TransactionContext.enqueuePendingChangeEvent(event);
+      return;
+    }
+    notificationManager.notify(event);
+  }
+
+  /// Flush deferred change events after a successful transaction commit.
+  Future<void> _flushPendingTransactionNotifications() async {
+    final pending = TransactionContext.takePendingChangeEvents();
+    if (pending.isEmpty) return;
+    final yieldController = YieldController('txn_flush_notifications');
+    for (final event in pending) {
+      final y = yieldController.maybeYield();
+      if (y != null) await y;
+      if (notificationManager.hasListeners(event.tableUid)) {
+        notificationManager.notify(event);
+      }
+    }
+  }
+
   /// Run a transactional scope. All operations inside are logged to a dedicated
   /// transaction log for potential rollback. If the callback throws, changes are
   /// compensated using the recorded before-images. On success, the transaction is
@@ -3645,6 +3677,9 @@ class DataStoreImpl {
             final bool effective =
                 persistRecoveryOnCommit ?? config.persistRecoveryOnCommit;
             logFlushed = effective;
+            // Data is now visible in the normal write buffer; emit deferred
+            // change events so watch() re-queries committed state.
+            await _flushPendingTransactionNotifications();
           } finally {
             // Release any row locks acquired in this transaction zone
             try {
@@ -3695,6 +3730,7 @@ class DataStoreImpl {
         TransactionContext.isolationLevelKey: effectiveIsolation,
         TransactionContext.acquiredExclusiveLocksKey: <String, String>{},
         TransactionContext.readKeysKey: <TableUid, Set<String>>{},
+        TransactionContext.pendingChangeEventsKey: <ChangeEvent>[],
       });
       return result;
     } catch (e) {
@@ -4490,7 +4526,7 @@ class DataStoreImpl {
                   }
                   promoteWritten?.add(record);
                   if (hasNotify) {
-                    notificationManager.notify(ChangeEvent(
+                    notifyDataChange(ChangeEvent(
                       type: ChangeType.insert,
                       tableUid: tableSchema.tableUid,
                       record: record,
@@ -6066,7 +6102,7 @@ class DataStoreImpl {
               if (successSet.contains(commitPkVals[k])) {
                 promoteWritten?.add(recordsToCommit[k]);
                 if (hasNotify) {
-                  notificationManager.notify(ChangeEvent(
+                  notifyDataChange(ChangeEvent(
                     type: ChangeType.update,
                     tableUid: schema.tableUid,
                     record: recordsToCommit[k],
@@ -6297,6 +6333,17 @@ class DataStoreImpl {
               final y17 = yieldController.maybeYield();
               if (y17 != null) await y17;
             }
+
+            final vectorIndexes = schemaMgr.getVectorIndexesFor(schema);
+            for (final vIdx in vectorIndexes) {
+              if (shouldAbortBackgroundScan) break;
+              await _vectorIndexManager?.prewarmVectorIndex(
+                table,
+                vIdx.indexUid,
+              );
+              final yVec = yieldController.maybeYield();
+              if (yVec != null) await yVec;
+            }
           }
 
           // Yield control to the event loop to prevent UI freezing during a long prewarm process.
@@ -6368,7 +6415,9 @@ class DataStoreImpl {
         }
 
         final indexBytes = await _estimateTableIndexBytes(table);
-        final estimatedBytes = tableDataMeta.totalSizeBytes + indexBytes;
+        final tableDataSize =
+            await tableDataManager.sumTableDataSizeBytes(table);
+        final estimatedBytes = tableDataSize + indexBytes;
         if (currentPrewarmedBytes + estimatedBytes > maxPrewarmBytes) {
           continue;
         }
@@ -6440,7 +6489,9 @@ class DataStoreImpl {
         final schema = table.schema;
 
         final indexBytes = await _estimateTableIndexBytes(table);
-        final estimatedBytes = tableDataMeta.totalSizeBytes + indexBytes;
+        final tableDataSize =
+            await tableDataManager.sumTableDataSizeBytes(table);
+        final estimatedBytes = tableDataSize + indexBytes;
 
         if (currentPrewarmedBytes + estimatedBytes > prewarmBudgetBytes ||
             tableDataMeta.totalRecordCount > maxRecordsSafetyCap) {
@@ -7587,7 +7638,7 @@ class DataStoreImpl {
       }
     }
     final lastModified = tableDataMeta?.timestamps.modified;
-    final tableDataSize = tableDataMeta?.totalSizeBytes ?? 0;
+    final tableDataSize = await tableDataManager.sumTableDataSizeBytes(table);
     final totalRecordCount = await tableDataManager.getTableRecordCount(table);
     final indexDataSize =
         await tableDataManager.sumTableIndexDataSizeBytes(table);

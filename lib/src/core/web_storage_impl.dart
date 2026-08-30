@@ -620,6 +620,48 @@ class WebStorageImpl implements StorageInterface {
   }
 
   @override
+  Future<List<Uint8List>> readManyAsBytesAt(
+    String path,
+    List<ByteReadRange> ranges,
+  ) async {
+    if (ranges.isEmpty) return const [];
+    await _initCompleter.future;
+    try {
+      final normalizedPath = _normalizePath(path);
+      final buffered = _writeBuffer[normalizedPath];
+      Uint8List fullData;
+      if (buffered != null) {
+        fullData = buffered.buildBytes();
+      } else {
+        final fileInfo = await _getFileInfo(normalizedPath);
+        if (fileInfo == null || fileInfo.data == null) {
+          return List<Uint8List>.filled(ranges.length, Uint8List(0),
+              growable: false);
+        }
+        fullData = _convertDataToUint8List(fileInfo.data);
+      }
+
+      final results =
+          List<Uint8List>.filled(ranges.length, Uint8List(0), growable: false);
+      for (int i = 0; i < ranges.length; i++) {
+        final r = ranges[i];
+        final start = r.offset;
+        final length = r.length;
+        if (start < 0 || length <= 0 || start >= fullData.length) continue;
+        final end = (start + length > fullData.length)
+            ? fullData.length
+            : start + length;
+        results[i] = fullData.sublist(start, end);
+      }
+      return results;
+    } catch (e) {
+      Logger.error('Batch read bytes at offset failed', rawError: e);
+      return List<Uint8List>.filled(ranges.length, Uint8List(0),
+          growable: false);
+    }
+  }
+
+  @override
   Future<void> writeAsBytesAt(
     String path,
     int start,

@@ -1334,15 +1334,25 @@ final class TableTreePartitionManager {
     }
 
     OverflowBatchAllocator? overflowAllocator;
+    var overflowSizeDeltaSum = 0;
     if (totalOverflowChunks > 0) {
       overflowAllocator = await _dataStore.overflowManager.startBatchAllocation(
         totalChunks: totalOverflowChunks,
         table: table,
         pageSize: _dataStore.configuredPageSize,
+        overflowPartitionCount: meta.overflowPartitionCount,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
         flush: false,
       );
+      overflowSizeDeltaSum = overflowAllocator.sizeDeltaBytes;
+      if (overflowAllocator.updatedOverflowPartitionCount >
+          meta.overflowPartitionCount) {
+        meta = meta.copyWith(
+          overflowPartitionCount:
+              overflowAllocator.updatedOverflowPartitionCount,
+        );
+      }
     }
     for (final op in opList) {
       final y8 = yc.maybeYield();
@@ -1432,15 +1442,25 @@ final class TableTreePartitionManager {
         Uint8List stored;
         if (_dataStore.overflowManager
             .shouldExternalize(_dataStore.configuredPageSize, encoded.length)) {
-          final ref = await _dataStore.overflowManager.putLargeValue(
+          final allocRes = await _dataStore.overflowManager.putLargeValue(
             table: table,
             valueBytes: encoded,
             pageSize: _dataStore.configuredPageSize,
+            overflowPartitionCount: meta.overflowPartitionCount,
             encryptionKey: encryptionKey,
             encryptionKeyId: encryptionKeyId,
             flush: false,
             allocator: overflowAllocator,
           );
+          // Non-batch put accounts file growth here; batch put returns 0
+          // (already counted in startBatchAllocation).
+          overflowSizeDeltaSum += allocRes.sizeDeltaBytes;
+          if (allocRes.overflowPartitionCount > meta.overflowPartitionCount) {
+            meta = meta.copyWith(
+              overflowPartitionCount: allocRes.overflowPartitionCount,
+            );
+          }
+          final ref = allocRes.ref;
           final overflowPath = _dataStore.pathManager
               .getOverflowPartitionFilePathByContext(
                   table, ref.overflowPartitionNo);
@@ -1889,11 +1909,15 @@ final class TableTreePartitionManager {
     final updatedMeta = meta.copyWith(
       totalRecordCount: max(0, meta.totalRecordCount + recordsDeltaSum),
       totalSizeBytes: max(0, meta.totalSizeBytes + sizeDeltaSum),
+      overflowTotalSizeBytes:
+          max(0, meta.overflowTotalSizeBytes + overflowSizeDeltaSum),
       timestamps: Timestamps(created: meta.timestamps.created, modified: now),
     );
+    // Table occupancy = B+Tree partition growth + overflow file growth.
+    // Large rows (e.g. VectorData) live mostly in overflow; leaf only keeps a ref.
     _dataStore.tableDataManager.applyTableOccupancyDelta(
       table,
-      sizeDelta: sizeDeltaSum,
+      sizeDelta: sizeDeltaSum + overflowSizeDeltaSum,
       recordDelta: recordsDeltaSum,
     );
 
@@ -3403,6 +3427,9 @@ final class TableTreePartitionManager {
           startIndexInLeaf = 0; // mark initialized
         }
         for (; i < leaf.keys.length && remaining > 0; i++) {
+          final y = yc.maybeYield();
+          if (y != null) await y;
+
           final k = leaf.keys[i];
           if (endKeyExclusive.isNotEmpty &&
               MemComparableKey.compare(k, endKeyExclusive) >= 0) {
@@ -3456,6 +3483,9 @@ final class TableTreePartitionManager {
           startIndexInLeaf = 0;
         }
         for (; i >= 0 && remaining > 0; i--) {
+          final y = yc.maybeYield();
+          if (y != null) await y;
+
           final k = leaf.keys[i];
           if (MemComparableKey.compare(k, startKeyInclusive) < 0) return;
           if (endKeyExclusive.isNotEmpty &&

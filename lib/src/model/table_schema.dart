@@ -3144,8 +3144,14 @@ class VectorData {
       ]);
     }
 
-    final buffer = bytes.buffer;
-    final doubleList = Float64List.view(buffer, 0, bytes.length ~/ 8);
+    final int count = bytes.length ~/ 8;
+    final Float64List doubleList;
+    if (bytes.offsetInBytes % 8 == 0) {
+      doubleList = Float64List.view(bytes.buffer, bytes.offsetInBytes, count);
+    } else {
+      final aligned = Uint8List.fromList(bytes);
+      doubleList = Float64List.view(aligned.buffer, 0, count);
+    }
     return VectorData(doubleList.toList(growable: false));
   }
 

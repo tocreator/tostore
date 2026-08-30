@@ -1808,6 +1808,8 @@ Uint8List _resolveBTreePagePayload(
     case BTreePageType.free:
     case BTreePageType.overflow:
     case BTreePageType.nghMeta:
+    case BTreePageType.nghPosting:
+    case BTreePageType.nghNavGraph:
     case BTreePageType.nghGraph:
     case BTreePageType.nghPqCode:
     case BTreePageType.nghRawVector:

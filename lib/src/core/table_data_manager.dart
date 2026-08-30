@@ -608,6 +608,8 @@ class TableDataManager {
     if (v is DateTime) return 16;
     if (v is Uint8List) return v.length;
     if (v is String) return v.length * 2;
+    // VectorData on-disk / heap estimate: Float64 payload + small header.
+    if (v is VectorData) return 24 + v.dimensions * 8;
 
     // Bound recursion depth to avoid pathological nested structures.
     if (depth >= 2) return 32;
@@ -942,8 +944,12 @@ class TableDataManager {
 
   /// O(1) table-data flush occupancy: SpaceStats size delta + last-flush avg.
   ///
-  /// Last-flush average updates only on net growth
-  /// ([recordDelta] > 0 and [sizeDelta] > 0).
+  /// [sizeDelta] should include B+Tree partition growth **and** overflow file
+  /// growth for the same flush (large rows live mostly in overflow).
+  ///
+  /// Last-flush table average updates only on net growth
+  /// ([recordDelta] > 0 and [sizeDelta] > 0). PJM batch-sizing average also
+  /// folds in [estimateIndexBytesPerRecord] when warm.
   void applyTableOccupancyDelta(
     TableContext table, {
     int sizeDelta = 0,
@@ -958,14 +964,15 @@ class TableDataManager {
     if (recordDelta > 0 && sizeDelta > 0) {
       final sampleAvg = sizeDelta ~/ recordDelta;
       _lastFlushAvgTableRecordSizeBytes = sampleAvg;
-      _dataStore.parallelJournalManager.recordFlushRecordSizeSample(sampleAvg);
+      _refreshFlushRecordSizeSample();
     }
   }
 
   /// O(1) incremental adjust for persisted index occupancy
   /// (file size bytes + B+Tree `totalEntryCount` / NGH `totalVectors`).
   ///
-  /// Also refreshes last-flush index-entry average on net growth.
+  /// Also refreshes last-flush index-entry average on net growth, and updates
+  /// PJM per-record average (table + index bytes / record).
   void applyIndexOccupancyDelta(
     TableContext table, {
     int sizeDelta = 0,
@@ -977,8 +984,25 @@ class TableDataManager {
     if (entryDelta != 0) _deltaIndexEntryCount += entryDelta;
     if (entryDelta > 0 && sizeDelta > 0) {
       _lastFlushAvgIndexEntrySizeBytes = sizeDelta ~/ entryDelta;
+      _refreshFlushRecordSizeSample();
     }
     _needSaveStats = true;
+  }
+
+  /// Feed ParallelJournalManager with table-row avg + index-bytes-per-record.
+  void _refreshFlushRecordSizeSample() {
+    final tableAvg = averageTableRecordSizeBytes;
+    if (tableAvg == null || tableAvg <= 0) return;
+    final indexPer = estimateIndexBytesPerRecord ?? 0;
+    _dataStore.parallelJournalManager
+        .recordFlushRecordSizeSample(tableAvg + indexPer);
+  }
+
+  /// B+Tree + overflow occupancy from cached [TableDataMeta] (O(1), no FS size).
+  Future<int> sumTableDataSizeBytes(TableContext table) async {
+    final meta = await getTableDataMeta(table.tableUid);
+    if (meta == null) return 0;
+    return meta.totalSizeBytes + meta.overflowTotalSizeBytes;
   }
 
   /// Sum index file sizes for one table (B+Tree + vector/NGH).
@@ -1076,7 +1100,24 @@ class TableDataManager {
         final indexOcc = await _sumTableIndexOccupancy(ctx);
         if (meta != null) {
           totalRecordCount += meta.totalRecordCount;
-          totalTableDataSize += meta.totalSizeBytes;
+          // Prefer incrementally maintained overflowTotalSizeBytes.
+          // Heal legacy metas (field == 0 but overflow partitions exist) via
+          // partition meta pages only -- never filesystem getFileSize.
+          var overflowBytes = meta.overflowTotalSizeBytes;
+          if (overflowBytes <= 0 && meta.overflowPartitionCount > 0) {
+            overflowBytes = await _dataStore.overflowManager
+                .sumOverflowSizeFromPartitionMetas(
+              table: ctx,
+              overflowPartitionCount: meta.overflowPartitionCount,
+            );
+            if (overflowBytes > 0) {
+              await updateTableDataMeta(
+                ctx,
+                meta.copyWith(overflowTotalSizeBytes: overflowBytes),
+              );
+            }
+          }
+          totalTableDataSize += meta.totalSizeBytes + overflowBytes;
         }
         totalIndexDataSize += indexOcc.sizeBytes;
         totalIndexEntryCount += indexOcc.entryCount;
@@ -2157,7 +2198,8 @@ class TableDataManager {
       final meta = await getTableDataMeta(table.tableUid);
       if (meta != null) {
         _deltaRecordCount -= meta.totalRecordCount;
-        _deltaTableDataSizeBytes -= meta.totalSizeBytes;
+        _deltaTableDataSizeBytes -=
+            meta.totalSizeBytes + meta.overflowTotalSizeBytes;
       }
       final indexOcc = await _sumTableIndexOccupancy(table);
       if (indexOcc.sizeBytes != 0) {
@@ -3217,7 +3259,8 @@ class TableDataManager {
               final fileMeta = await getTableDataMeta(table.tableUid);
               if (fileMeta != null) {
                 _deltaRecordCount -= fileMeta.totalRecordCount;
-                _deltaTableDataSizeBytes -= fileMeta.totalSizeBytes;
+                _deltaTableDataSizeBytes -=
+                    fileMeta.totalSizeBytes + fileMeta.overflowTotalSizeBytes;
               }
               final indexOcc = await _sumTableIndexOccupancy(table);
               if (indexOcc.sizeBytes != 0) {
@@ -3239,6 +3282,8 @@ class TableDataManager {
           _tableRecordCounts[table.tableUid] = 0;
 
           await _dataStore.writeBufferManager.clearTableByUid(table.tableUid);
+          _dataStore.overflowManager.clearTableCache(table.tableUid);
+          _dataStore.tableTreePartitionManager?.clearPageCacheForTable(table);
 
           // 2. directly delete the entire partition directory
           bool deletedDir = false;
@@ -3453,6 +3498,8 @@ class TableDataManager {
 
     // Clear WAL-driven table-level write buffer and queue to prevent subsequent writes
     await _dataStore.writeBufferManager.clearTableByUid(table.tableUid);
+    _dataStore.tableTreePartitionManager?.clearPageCacheForTable(table);
+    _dataStore.overflowManager.clearTableCache(table.tableUid);
 
     // Clean up other caches
     _tableDataMetaCache.remove(table.tableUid);

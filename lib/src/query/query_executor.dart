@@ -4389,6 +4389,7 @@ class QueryExecutor {
     PromoteRuntimeDescriptor? promoteDesc,
     bool applyPromoteResultTransform = false,
   }) async {
+    final stopwatch = Stopwatch()..start();
     final effectiveLimit = limit ?? _dataStore.config.defaultQueryLimit;
     final effectiveOffset = offset ?? 0;
 
@@ -4397,7 +4398,7 @@ class QueryExecutor {
     if (!shape.isMultiWay && shape.singleVectorSpec != null) {
       if (shape.globalFilter == null || shape.globalFilter!.isEmpty) {
         // Pure single-vector search
-        return await _executeSingleVectorRetrieval(
+        return _executeSingleVectorRetrieval(
           table,
           spec: shape.singleVectorSpec!,
           effectiveLimit: effectiveLimit,
@@ -4405,10 +4406,11 @@ class QueryExecutor {
           readFromFileOnly: readFromFileOnly,
           promoteDesc: promoteDesc,
           applyPromoteResultTransform: applyPromoteResultTransform,
+          stopwatch: stopwatch,
         );
       } else {
         // AND filtered vector search (Structured + Vector)
-        return await _executeVectorWithFilterRetrieval(
+        return _executeVectorWithFilterRetrieval(
           table,
           spec: shape.singleVectorSpec!,
           structuredWhere: shape.globalFilter!,
@@ -4417,6 +4419,7 @@ class QueryExecutor {
           readFromFileOnly: readFromFileOnly,
           promoteDesc: promoteDesc,
           applyPromoteResultTransform: applyPromoteResultTransform,
+          stopwatch: stopwatch,
         );
       }
     }
@@ -4431,6 +4434,7 @@ class QueryExecutor {
       readFromFileOnly: readFromFileOnly,
       promoteDesc: promoteDesc,
       applyPromoteResultTransform: applyPromoteResultTransform,
+      stopwatch: stopwatch,
     );
   }
 
@@ -4442,6 +4446,7 @@ class QueryExecutor {
     bool readFromFileOnly = false,
     PromoteRuntimeDescriptor? promoteDesc,
     bool applyPromoteResultTransform = false,
+    Stopwatch? stopwatch,
   }) async {
     final vectorIndexMgr = _dataStore.vectorIndexManager;
     if (vectorIndexMgr == null) {
@@ -4464,12 +4469,14 @@ class QueryExecutor {
     );
 
     if (vecResults.isEmpty) {
-      return const ExecuteResult(
-        records: [],
-        retrieval: RetrievalContext(
+      stopwatch?.stop();
+      return ExecuteResult(
+        records: const [],
+        retrieval: const RetrievalContext(
           entries: [],
           fusionMethod: RetrievalFusionMethod.single,
         ),
+        executionTimeMs: stopwatch?.elapsedMilliseconds,
       );
     }
 
@@ -4482,29 +4489,19 @@ class QueryExecutor {
     final pageCandidates =
         candidates.skip(effectiveOffset).take(effectiveLimit).toList();
 
+    final pks = [for (final c in pageCandidates) c.primaryKey];
+    final recordsMap = await _dataStore.tableDataManager.queryRecordsMapBatch(
+      table,
+      pks,
+      readFromFileOnly: readFromFileOnly,
+    );
+
     final records = <Map<String, dynamic>>[];
     final entries = <RetrievalEntry>[];
-    final yieldController =
-        YieldController('QueryExecutor.singleVectorHydrate');
 
     for (int i = 0; i < pageCandidates.length; i++) {
-      final y = yieldController.maybeYield();
-      if (y != null) await y;
-
       final cand = pageCandidates[i];
-      Map<String, dynamic>? rec;
-      if (!readFromFileOnly) {
-        rec = _dataStore.tableDataManager.getRecordByPrimaryKeySync(
-          table,
-          cand.primaryKey,
-        );
-      }
-      rec ??= await _dataStore.tableDataManager.getRecordByPrimaryKey(
-        table,
-        cand.primaryKey,
-        readFromFileOnly: readFromFileOnly,
-      );
-
+      final rec = recordsMap[cand.primaryKey];
       if (rec != null) {
         final Map<String, dynamic> row;
         if (promoteDesc != null && applyPromoteResultTransform) {
@@ -4526,6 +4523,7 @@ class QueryExecutor {
       }
     }
 
+    stopwatch?.stop();
     return ExecuteResult(
       records: records,
       retrieval: RetrievalContext(
@@ -4535,6 +4533,7 @@ class QueryExecutor {
       hasMore: hasMore,
       hasPrev: effectiveOffset > 0,
       count: records.length,
+      executionTimeMs: stopwatch?.elapsedMilliseconds,
     );
   }
 
@@ -4547,6 +4546,7 @@ class QueryExecutor {
     bool readFromFileOnly = false,
     PromoteRuntimeDescriptor? promoteDesc,
     bool applyPromoteResultTransform = false,
+    Stopwatch? stopwatch,
   }) async {
     final vectorIndexMgr = _dataStore.vectorIndexManager;
     if (vectorIndexMgr == null) {
@@ -4569,12 +4569,14 @@ class QueryExecutor {
     );
 
     if (vecResults.isEmpty) {
-      return const ExecuteResult(
-        records: [],
-        retrieval: RetrievalContext(
+      stopwatch?.stop();
+      return ExecuteResult(
+        records: const [],
+        retrieval: const RetrievalContext(
           entries: [],
           fusionMethod: RetrievalFusionMethod.single,
         ),
+        executionTimeMs: stopwatch?.elapsedMilliseconds,
       );
     }
 
@@ -4642,6 +4644,7 @@ class QueryExecutor {
       ));
     }
 
+    stopwatch?.stop();
     return ExecuteResult(
       records: records,
       retrieval: RetrievalContext(
@@ -4651,6 +4654,7 @@ class QueryExecutor {
       hasMore: hasMore,
       hasPrev: effectiveOffset > 0,
       count: records.length,
+      executionTimeMs: stopwatch?.elapsedMilliseconds,
     );
   }
 
@@ -4663,6 +4667,7 @@ class QueryExecutor {
     bool readFromFileOnly = false,
     PromoteRuntimeDescriptor? promoteDesc,
     bool applyPromoteResultTransform = false,
+    Stopwatch? stopwatch,
   }) async {
     final int recallPerChannel =
         max((effectiveOffset + effectiveLimit) * 3, 50);
@@ -4783,12 +4788,14 @@ class QueryExecutor {
     }
 
     if (rrfScores.isEmpty) {
-      return const ExecuteResult(
-        records: [],
-        retrieval: RetrievalContext(
+      stopwatch?.stop();
+      return ExecuteResult(
+        records: const [],
+        retrieval: const RetrievalContext(
           entries: [],
           fusionMethod: RetrievalFusionMethod.rrf,
         ),
+        executionTimeMs: stopwatch?.elapsedMilliseconds,
       );
     }
 
@@ -4872,6 +4879,7 @@ class QueryExecutor {
 
     final bool hasMore = (records.length == effectiveLimit);
 
+    stopwatch?.stop();
     return ExecuteResult(
       records: records,
       retrieval: RetrievalContext(
@@ -4885,6 +4893,7 @@ class QueryExecutor {
       hasMore: hasMore,
       hasPrev: effectiveOffset > 0,
       count: records.length,
+      executionTimeMs: stopwatch?.elapsedMilliseconds,
     );
   }
 }

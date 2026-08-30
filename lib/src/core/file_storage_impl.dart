@@ -420,8 +420,12 @@ class FileStorageImpl implements StorageInterface {
         int? fileSize = _fileLengths[normalized];
         final int targetEnd = length != null ? start + length : start + 1;
         if (fileSize == null || targetEnd > fileSize) {
-          fileSize = await raf.length();
-          _fileLengths[normalized] = fileSize;
+          try {
+            fileSize = await raf.length();
+            _fileLengths[normalized] = fileSize;
+          } catch (_) {
+            fileSize = 0;
+          }
         }
         if (start >= fileSize) {
           return Uint8List(0);
@@ -441,6 +445,60 @@ class FileStorageImpl implements StorageInterface {
       }
       Logger.error('Read bytes at offset failed', rawError: e);
       return Uint8List(0);
+    }
+  }
+
+  @override
+  Future<List<Uint8List>> readManyAsBytesAt(
+    String path,
+    List<ByteReadRange> ranges,
+  ) async {
+    if (ranges.isEmpty) return const [];
+    final normalized = _canonicalPath(path);
+    final key = _poolKey(path, FileMode.read);
+    try {
+      return await _withHandleLock<List<Uint8List>>(key, () async {
+        final raf = await _getHandle(path, FileMode.read);
+        int? fileSize = _fileLengths[normalized];
+        if (fileSize == null) {
+          try {
+            fileSize = await raf.length();
+            _fileLengths[normalized] = fileSize;
+          } catch (_) {
+            fileSize = 0;
+          }
+        }
+
+        final results = List<Uint8List>.filled(ranges.length, Uint8List(0),
+            growable: false);
+        for (int i = 0; i < ranges.length; i++) {
+          final r = ranges[i];
+          final start = r.offset;
+          final length = r.length;
+          if (start < 0 || length <= 0) continue;
+          if (fileSize != null && start + length > fileSize) {
+            try {
+              fileSize = await raf.length();
+              _fileLengths[normalized] = fileSize;
+            } catch (_) {}
+          }
+          if (start >= fileSize!) continue;
+          final readLen =
+              (start + length > fileSize) ? fileSize - start : length;
+          if (readLen <= 0) continue;
+          await raf.setPosition(start);
+          results[i] = await raf.read(readLen);
+        }
+        return results;
+      });
+    } catch (e) {
+      if (_isFileNotFound(e)) {
+        return List<Uint8List>.filled(ranges.length, Uint8List(0),
+            growable: false);
+      }
+      Logger.error('Batch read bytes at offset failed', rawError: e);
+      return List<Uint8List>.filled(ranges.length, Uint8List(0),
+          growable: false);
     }
   }
 

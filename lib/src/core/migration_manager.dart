@@ -2711,6 +2711,16 @@ class MigrationManager {
         schedulePendingMigrationWork();
       }
 
+      if (Logger.shouldLog(LogLevel.debug) &&
+          !SystemTable.isSystemTable(tableName)) {
+        final opsSummary = _formatMigrationOperationsSummary(task.operations);
+        Logger.debug(
+          'Added migration task [${task.taskId}] for table "$tableName" '
+          '(tableUid: ${tableUid.value}, writeMode: ${task.writeMode?.name ?? "none"}). '
+          'Operations: $opsSummary',
+        );
+      }
+
       return task;
     } catch (e) {
       if (e is! DbClosedException) {
@@ -2732,6 +2742,73 @@ class MigrationManager {
       }
     }
     return latest;
+  }
+
+  /// Format migration operations into a concise human-readable summary for debug logging.
+  static String _formatMigrationOperationsSummary(
+      List<MigrationOperation> operations) {
+    if (operations.isEmpty) return '[]';
+    final parts = <String>[];
+    for (final op in operations) {
+      switch (op.type) {
+        case MigrationType.addField:
+          parts.add('addField(${op.field?.name ?? op.fieldName ?? "?"})');
+          break;
+        case MigrationType.removeField:
+          parts.add('removeField(${op.fieldName ?? "?"})');
+          break;
+        case MigrationType.renameField:
+          parts
+              .add('renameField(${op.fieldName ?? "?"}->${op.newName ?? "?"})');
+          break;
+        case MigrationType.modifyField:
+          parts.add(
+              'modifyField(${op.fieldUpdate?.name ?? op.fieldName ?? "?"})');
+          break;
+        case MigrationType.addIndex:
+          parts.add(
+              'addIndex(${op.index?.actualIndexName ?? op.indexName ?? "?"})');
+          break;
+        case MigrationType.removeIndex:
+          parts.add('removeIndex(${op.indexName ?? "?"})');
+          break;
+        case MigrationType.modifyIndex:
+          parts.add(
+              'modifyIndex(${op.index?.actualIndexName ?? op.indexName ?? "?"})');
+          break;
+        case MigrationType.renameIndex:
+          parts
+              .add('renameIndex(${op.indexName ?? "?"}->${op.newName ?? "?"})');
+          break;
+        case MigrationType.renameTable:
+          parts.add('renameTable(${op.newTableName ?? "?"})');
+          break;
+        case MigrationType.setPrimaryKeyConfig:
+          parts.add('setPrimaryKeyConfig');
+          break;
+        case MigrationType.setTableTtlConfig:
+          parts.add('setTableTtlConfig');
+          break;
+        case MigrationType.dropTable:
+          parts.add('dropTable');
+          break;
+        case MigrationType.addForeignKey:
+          parts.add(
+              'addForeignKey(${op.foreignKey?.actualName ?? op.foreignKeyName ?? "?"})');
+          break;
+        case MigrationType.removeForeignKey:
+          parts.add('removeForeignKey(${op.foreignKeyName ?? "?"})');
+          break;
+        case MigrationType.modifyForeignKey:
+          parts.add(
+              'modifyForeignKey(${op.foreignKey?.actualName ?? op.foreignKeyName ?? "?"})');
+          break;
+        case MigrationType.promoteFieldToPrimaryKey:
+          parts.add('promoteFieldToPrimaryKey(${op.fieldName ?? "?"})');
+          break;
+      }
+    }
+    return '[${parts.join(", ")}]';
   }
 
   /// Wait for a specific migration task to complete (either currently executing or in queue).

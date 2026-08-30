@@ -1,4 +1,5 @@
 import 'dart:async';
+import '../model/change_event.dart';
 import '../model/data_store_config.dart';
 import '../model/table_identity.dart';
 
@@ -22,6 +23,10 @@ class TransactionContext {
 
   /// Zone key indicating we are applying commit (bypassing tx deferral)
   static const Symbol applyingCommitKey = #to_applying_commit;
+
+  /// Zone key for deferred [ChangeEvent]s flushed after successful commit.
+  /// External watchers must not observe uncommitted buffer writes.
+  static const Symbol pendingChangeEventsKey = #to_pending_change_events;
 
   /// Register a file path as touched in current transaction scope (if any)
   static void registerTouchedPath(String path) {
@@ -82,6 +87,33 @@ class TransactionContext {
   /// Check if we are currently applying commit
   static bool isApplyingCommit() {
     return (Zone.current[applyingCommitKey] as bool?) == true;
+  }
+
+  /// Whether change notifications should be deferred until commit.
+  ///
+  /// True while executing the user transaction body (writes land in the
+  /// deferred txn buffer and are invisible to external queries). False
+  /// during [isApplyingCommit] when changes are promoted to the visible
+  /// write buffer, and outside any transaction.
+  static bool shouldDeferChangeNotification() {
+    return getCurrentTransactionId() != null && !isApplyingCommit();
+  }
+
+  /// Enqueue a change event for flush after successful commit.
+  /// No-op outside a transaction zone that installed the pending list.
+  static void enqueuePendingChangeEvent(ChangeEvent event) {
+    final list = Zone.current[pendingChangeEventsKey] as List<ChangeEvent>?;
+    if (list == null) return;
+    list.add(event);
+  }
+
+  /// Snapshot and clear pending change events (or empty if none).
+  static List<ChangeEvent> takePendingChangeEvents() {
+    final list = Zone.current[pendingChangeEventsKey] as List<ChangeEvent>?;
+    if (list == null || list.isEmpty) return const <ChangeEvent>[];
+    final out = List<ChangeEvent>.from(list);
+    list.clear();
+    return out;
   }
 
   /// Zone key indicating system/internal operation (bypass certain gates)

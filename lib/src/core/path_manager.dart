@@ -175,14 +175,6 @@ class PathManager {
     return pathJoin(getIndexPathByContext(table, indexUid), 'ngh');
   }
 
-  /// Synchronous NGH PQ codebook file path.
-  String getNghCodebookPathByContext(TableContext table, IndexUid indexUid) {
-    return pathJoin(
-      getNghIndexPathByContext(table, indexUid),
-      'codebook.ngh',
-    );
-  }
-
   String _nghPartitionDirPathByContext(
     TableContext table,
     IndexUid indexUid,
@@ -196,42 +188,24 @@ class PathManager {
     );
   }
 
-  /// Synchronous NGH graph partition file path by partitionNo.
-  String getNghGraphPartitionPathByContext(
+  /// Synchronous NGH inverted cluster posting partition file path by partitionNo.
+  String getNghPostingPartitionPathByContext(
     TableContext table,
     IndexUid indexUid,
     int partitionNo,
   ) {
     final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
     return pathJoin(
-      _nghPartitionDirPathByContext(table, indexUid, 'graph', dirIndex),
+      _nghPartitionDirPathByContext(table, indexUid, 'posting', dirIndex),
       'p$partitionNo.ngh',
     );
   }
 
-  /// Synchronous NGH PQ-code partition file path by partitionNo.
-  String getNghPqCodePartitionPathByContext(
-    TableContext table,
-    IndexUid indexUid,
-    int partitionNo,
-  ) {
-    final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
+  /// Synchronous NGH navigating centroid graph file path.
+  String getNghNavGraphPathByContext(TableContext table, IndexUid indexUid) {
     return pathJoin(
-      _nghPartitionDirPathByContext(table, indexUid, 'pqcode', dirIndex),
-      'p$partitionNo.ngh',
-    );
-  }
-
-  /// Synchronous NGH raw-vector partition file path by partitionNo.
-  String getNghRawVectorPartitionPathByContext(
-    TableContext table,
-    IndexUid indexUid,
-    int partitionNo,
-  ) {
-    final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
-    return pathJoin(
-      _nghPartitionDirPathByContext(table, indexUid, 'rawvec', dirIndex),
-      'p$partitionNo.ngh',
+      getNghIndexPathByContext(table, indexUid),
+      'nav_graph.ngh',
     );
   }
 

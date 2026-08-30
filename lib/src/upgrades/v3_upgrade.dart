@@ -15,7 +15,8 @@ import '../model/db_exception.dart';
 import '../model/global_config.dart';
 import '../model/id_generator.dart';
 import '../model/meta_info.dart';
-import '../model/ngh_index_meta.dart';
+import '../model/migration_task.dart';
+import '../model/migration_write_mode.dart';
 import '../model/parallel_journal_entry.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
@@ -39,8 +40,12 @@ import 'weight_format_migration.dart';
 /// - Restructures storage directory names from physical table/index names to stable UIDs.
 /// - Primes [GlobalConfig.pageSize] (sample legacy meta.json / default) before
 ///   bootstrap so index page0 writes never see pageSize=0.
-/// - Reads legacy meta.json once, writes TableDataMeta/IndexMeta/NghIndexMeta into
+/// - Reads legacy meta.json once, writes TableDataMeta/IndexMeta into
 ///   partition-0 page0, then deletes the JSON files (no intermediate JSON rewrite).
+/// - Vector indexes: algorithm layout changed -- skip name/uid relocate and NGH
+///   meta->page0; delete legacy vector roots (`index/{name|uid}`, `__nid2pk` /
+///   `__pk2nid`) and enqueue one [MigrationWriteMode.indexOnly] addIndex task
+///   per table (schema is global; spaces rebuild independently).
 /// - Migrates pending parallel-batch `tablePlan` out of A/B journal into WalMeta,
 ///   then deletes `journal_a.log` / `journal_b.log` (interim JSON; converted below).
 /// - Migrates legacy NDJSON transaction logs to binary ToTX.
@@ -49,6 +54,8 @@ import 'weight_format_migration.dart';
 /// - Blocking [MigrationFormatMigration]: `migration_meta` / `task_*` JSON ->
 ///   `.tobf` (after WAL/Txn meta; before version bump; accepts v1 dirUsage/taskIndex
 ///   via [MigrationMeta.fromJson]).
+/// - Enqueues vector rebuild tasks after migration format migration and before
+///   version bump so crash mid-upgrade re-runs V3 with a rebuild plan.
 /// - Bumps version config markers last (after format migrations) for crash resume.
 /// - Async [WeightFormatMigration]: `cache_weights.json` -> `access_weights.tobf`
 ///   (non-blocking; loss acceptable; not WAL-backed).
@@ -203,6 +210,12 @@ class V3Upgrade {
     final tableIsGlobalMap = <String, bool>{};
     final tableDirIndexMap = <String, int>{};
 
+    /// Upgraded schemas (post generateAutoIndexes) for vector rebuild enqueue.
+    final tableSchemaMap = <String, TableSchema>{};
+
+    /// Legacy actualIndexName of vector indexes per table (skip relocate / delete).
+    final tableVectorIndexNames = <String, Set<String>>{};
+
     // Seed from GlobalConfig (bootstrap createTable may already have advanced it).
     final seedCfg = await _dataStore.getGlobalConfig() ?? GlobalConfig();
     var lastGlobalDirIndex = seedCfg.lastGlobalDirIndex;
@@ -297,12 +310,20 @@ class V3Upgrade {
           );
 
           final idxUidMap = <String, String>{};
+          final vectorNames = <String>{};
           for (final idx in upgradedSchema.getAllIndexes()) {
             if (idx.indexUid.isNotEmpty) {
-              idxUidMap[idx.actualIndexName] = idx.indexUid;
+              idxUidMap[idx.actualIndexName] = idx.indexUid.value;
+            }
+            if (idx.type == IndexType.vector && idx.indexUid.isNotEmpty) {
+              vectorNames.add(idx.actualIndexName);
             }
           }
           tableIndexUidMap[tableName] = idxUidMap;
+          tableSchemaMap[tableName] = upgradedSchema;
+          if (vectorNames.isNotEmpty) {
+            tableVectorIndexNames[tableName] = vectorNames;
+          }
 
           final finalDirIndex = allocateDirIndex(schema.isGlobal);
           tableDirIndexMap[tableName] = finalDirIndex;
@@ -346,11 +367,14 @@ class V3Upgrade {
         TableSchema.generateSchemasHash(SystemTable.gettableSchemas);
 
     // 4. Move physical folders; migrate legacy meta.json -> partition-0 page0.
+    // Vector indexes: delete artifacts (algorithm incompatible) -- rebuild later.
     for (final tableName in tableUidMap.keys) {
       final tableUid = tableUidMap[tableName]!;
       final isGlobal = tableIsGlobalMap[tableName] ?? false;
       final finalDirIndex = tableDirIndexMap[tableName] ?? 0;
       final indexUidMap = tableIndexUidMap[tableName] ?? {};
+      final vectorIndexNames =
+          tableVectorIndexNames[tableName] ?? const <String>{};
 
       if (isGlobal) {
         // Move global table directory
@@ -366,6 +390,7 @@ class V3Upgrade {
           _globalTableRoot(finalDirIndex, tableUid),
           tableUid,
           indexUidMap,
+          vectorIndexNames: vectorIndexNames,
         );
       } else {
         // Move space table directories across all spaces
@@ -383,6 +408,7 @@ class V3Upgrade {
             _spaceTableRoot(spaceName, finalDirIndex, tableUid),
             tableUid,
             indexUidMap,
+            vectorIndexNames: vectorIndexNames,
           );
         }
       }
@@ -428,6 +454,14 @@ class V3Upgrade {
 
     // Migration meta / tasks JSON -> TOBF (blocking, before version bump).
     await MigrationFormatMigration.migrate(_dataStore);
+
+    // Vector algorithm changed: enqueue one indexOnly rebuild task per table
+    // (schema global; pendingMigrationSpaces covers all spaces). Before bump so
+    // a crash re-runs V3 and still leaves a durable rebuild plan.
+    await _enqueueVectorIndexRebuildTasks(
+      tableUidMap: tableUidMap,
+      tableSchemaMap: tableSchemaMap,
+    );
 
     // Single GlobalConfig write: schema hashes + pageSize + dir high-water + version.
     final applied = (await _dataStore.getGlobalConfig())?.appliedEncryption;
@@ -820,8 +854,13 @@ class V3Upgrade {
     return result;
   }
 
-  Future<void> _migrateTableDirectory(String oldPath, String newPath,
-      String tableUid, Map<String, String> indexUidMap) async {
+  Future<void> _migrateTableDirectory(
+    String oldPath,
+    String newPath,
+    String tableUid,
+    Map<String, String> indexUidMap, {
+    Set<String> vectorIndexNames = const {},
+  }) async {
     final oldExists = await _dataStore.storage.existsDirectory(oldPath);
     final newExists = await _dataStore.storage.existsDirectory(newPath);
     if (!oldExists && !newExists) {
@@ -840,11 +879,20 @@ class V3Upgrade {
     final uid = TableUid(tableUid);
     final indexDirPath = path.join(newPath, 'index');
 
-    // Rename index / mapping / NGH trees to stable indexUid -- no JSON rewrite.
+    // B+Tree: rename to stable indexUid. Vector: delete roots (algorithm rebuild).
     // Meta is migrated once: legacy meta.json -> partition-0 page0 -> delete JSON.
     if (await _dataStore.storage.existsDirectory(indexDirPath)) {
       for (final indexName in indexUidMap.keys) {
         final indexUid = indexUidMap[indexName]!;
+        if (vectorIndexNames.contains(indexName)) {
+          await _deleteVectorIndexArtifacts(
+            indexDirPath,
+            legacyIndexName: indexName,
+            indexUid: indexUid,
+          );
+          continue;
+        }
+
         final oldIndexFilePath = path.join(indexDirPath, indexName);
         final newIndexFilePath = path.join(indexDirPath, indexUid);
         final oldIdxExists =
@@ -856,27 +904,8 @@ class V3Upgrade {
           await _dataStore.storage
               .moveDirectory(oldIndexFilePath, newIndexFilePath);
         } else if (oldIdxExists && newIdxExists) {
-          // Salvage NGH from the leftover logical-name tree before delete.
-          await _ensureNghUnderStableIndexUid(
-            indexDirPath: indexDirPath,
-            indexUid: indexUid,
-            legacyIndexName: indexName,
-          );
           await _dataStore.storage.deleteDirectory(oldIndexFilePath);
         }
-
-        for (final suffix in const ['__nid2pk', '__pk2nid']) {
-          await _moveDirectoryIfNeeded(
-            path.join(indexDirPath, '$indexName$suffix'),
-            path.join(indexDirPath, '$indexUid$suffix'),
-          );
-        }
-
-        await _ensureNghUnderStableIndexUid(
-          indexDirPath: indexDirPath,
-          indexUid: indexUid,
-          legacyIndexName: indexName,
-        );
       }
     }
 
@@ -886,51 +915,129 @@ class V3Upgrade {
       indexDirPath: indexDirPath,
       tableRoot: newPath,
       indexUidMap: indexUidMap,
+      skipIndexNames: vectorIndexNames,
     );
 
     // Legacy sidecar unused by btree maxAutoIncrementId - async delete after bump.
     _scheduleLegacyFileDelete(path.join(newPath, 'maxid.txt'));
   }
 
-  Future<void> _moveDirectoryIfNeeded(String oldPath, String newPath) async {
-    if (oldPath == newPath ||
-        !await _dataStore.storage.existsDirectory(oldPath)) {
-      return;
+  /// Delete legacy/stable vector index roots and nodeId<->PK mapping trees.
+  ///
+  /// Paths match pre-v3 layout constructed elsewhere in this file:
+  /// `{indexDir}/{name|uid}/` (contains `ngh/`) and `{name|uid}__nid2pk|__pk2nid`.
+  Future<void> _deleteVectorIndexArtifacts(
+    String indexDirPath, {
+    required String legacyIndexName,
+    required String indexUid,
+  }) async {
+    final bases = <String>{
+      if (legacyIndexName.isNotEmpty) legacyIndexName,
+      if (indexUid.isNotEmpty) indexUid,
+    };
+    for (final base in bases) {
+      await _deleteDirectoryIfExists(path.join(indexDirPath, base));
+      for (final suffix in const ['__nid2pk', '__pk2nid']) {
+        await _deleteDirectoryIfExists(path.join(indexDirPath, '$base$suffix'));
+      }
     }
-    if (await _dataStore.storage.existsDirectory(newPath)) {
-      await _dataStore.storage.deleteDirectory(oldPath);
-      return;
-    }
-    await _dataStore.storage.moveDirectory(oldPath, newPath);
   }
 
-  /// Move NGH files under `{indexUid}/ngh` when still on logical-name tree.
-  Future<void> _ensureNghUnderStableIndexUid({
-    required String indexDirPath,
-    required String indexUid,
-    required String legacyIndexName,
+  Future<void> _deleteDirectoryIfExists(String dirPath) async {
+    if (await _dataStore.storage.existsDirectory(dirPath)) {
+      await _dataStore.storage.deleteDirectory(dirPath);
+    }
+  }
+
+  /// One [MigrationWriteMode.indexOnly] task per table with vector indexes.
+  ///
+  /// Schema already contains the vector indexes in TableMeta; [oldSchemaSnapshot]
+  /// strips them so fold keeps [MigrationType.addIndex] and rebuild runs across
+  /// all [MigrationTask.pendingMigrationSpaces].
+  Future<void> _enqueueVectorIndexRebuildTasks({
+    required Map<String, String> tableUidMap,
+    required Map<String, TableSchema> tableSchemaMap,
   }) async {
-    if (legacyIndexName.isEmpty || legacyIndexName == indexUid) return;
+    final migrationManager = _dataStore.migrationManager;
+    if (migrationManager == null) return;
 
-    final nghMetaPath = path.join(indexDirPath, indexUid, 'ngh', 'meta.json');
-    if (await _dataStore.storage.existsFile(nghMetaPath)) return;
+    for (final entry in tableSchemaMap.entries) {
+      final tableName = entry.key;
+      final schema = entry.value;
+      final tableUidValue = tableUidMap[tableName];
+      if (tableUidValue == null || tableUidValue.isEmpty) continue;
 
-    final legacyIndexDir = path.join(indexDirPath, legacyIndexName);
-    final stableIndexDir = path.join(indexDirPath, indexUid);
-    final legacyMetaPath = path.join(legacyIndexDir, 'ngh', 'meta.json');
-    if (!await _dataStore.storage.existsFile(legacyMetaPath)) return;
+      final vectorIndexes = <IndexSchema>[];
+      for (final idx in schema.getAllIndexes()) {
+        if (idx.type == IndexType.vector && idx.indexUid.isNotEmpty) {
+          vectorIndexes.add(idx);
+        }
+      }
+      if (vectorIndexes.isEmpty) continue;
 
-    if (!await _dataStore.storage.existsDirectory(stableIndexDir)) {
-      await _dataStore.storage.moveDirectory(legacyIndexDir, stableIndexDir);
-      return;
+      final tableUid = TableUid(tableUidValue);
+      final wantUids = {
+        for (final idx in vectorIndexes) idx.indexUid,
+      };
+      final alreadyQueued = migrationManager.pendingTasks.any((task) {
+        if (task.tableUid != tableUid) return false;
+        if (task.writeMode != MigrationWriteMode.indexOnly) return false;
+        final specific = task.specificIndexUids;
+        if (specific == null || specific.isEmpty) return false;
+        if (specific.length != wantUids.length) return false;
+        for (final uid in specific) {
+          if (!wantUids.contains(uid)) return false;
+        }
+        return true;
+      });
+      if (alreadyQueued) continue;
+
+      final operations = <MigrationOperation>[
+        for (final idx in vectorIndexes)
+          MigrationOperation(type: MigrationType.addIndex, index: idx),
+      ];
+
+      try {
+        await migrationManager.addMigrationTask(
+          tableUid,
+          operations,
+          startProcessing: false,
+          isAutoGenerated: true,
+          writeMode: MigrationWriteMode.indexOnly,
+          specificIndexUids: [
+            for (final idx in vectorIndexes) idx.indexUid,
+          ],
+          targetSchemaSnapshot: schema,
+          oldSchemaSnapshot: _schemaWithoutVectorIndexes(schema),
+        );
+        Logger.info(
+          'v3: enqueued vector index rebuild for table $tableName '
+          '(${vectorIndexes.length} index(es), indexOnly)',
+        );
+      } catch (e) {
+        Logger.error(
+          'v3: failed to enqueue vector index rebuild for table $tableName',
+          rawError: e,
+        );
+        rethrow;
+      }
     }
+  }
 
-    final legacyNghDir = path.join(legacyIndexDir, 'ngh');
-    final stableNghDir = path.join(stableIndexDir, 'ngh');
-    if (await _dataStore.storage.existsDirectory(legacyNghDir) &&
-        !await _dataStore.storage.existsDirectory(stableNghDir)) {
-      await _dataStore.storage.moveDirectory(legacyNghDir, stableNghDir);
-    }
+  /// Schema snapshot used only so fold treats vector [addIndex] as new.
+  TableSchema _schemaWithoutVectorIndexes(TableSchema schema) {
+    return schema.copyWith(
+      indexes: [
+        for (final idx in schema.indexes)
+          if (idx.type != IndexType.vector) idx,
+      ],
+      autoIndexes: schema.autoIndexes == null
+          ? null
+          : [
+              for (final idx in schema.autoIndexes!)
+                if (idx.type != IndexType.vector) idx,
+            ],
+    );
   }
 
   /// Resolve and persist [GlobalConfig.pageSize] before bootstrap createTable.
@@ -1090,16 +1197,6 @@ class V3Upgrade {
         'p0.idx',
       );
 
-  String _nghGraphPart0Path(String tableRoot, String indexUid) => path.join(
-        tableRoot,
-        'index',
-        indexUid,
-        'ngh',
-        'graph',
-        'dir_0',
-        'p0.ngh',
-      );
-
   Future<void> _migrateTableTreeMetaToPage0(
     TableUid tableUid, {
     required String tableRoot,
@@ -1160,6 +1257,7 @@ class V3Upgrade {
     required String indexDirPath,
     required String tableRoot,
     required Map<String, String> indexUidMap,
+    Set<String> skipIndexNames = const {},
   }) async {
     if (indexUidMap.isEmpty ||
         !await _dataStore.storage.existsDirectory(indexDirPath)) {
@@ -1167,16 +1265,18 @@ class V3Upgrade {
     }
     for (final entry in indexUidMap.entries) {
       final legacyIndexName = entry.key;
+      if (skipIndexNames.contains(legacyIndexName)) {
+        // Vector roots already deleted; do not relocate or write NGH page0.
+        continue;
+      }
       final indexUid = IndexUid(entry.value);
 
-      var indexSubDir = path.join(indexDirPath, indexUid.value);
-      var metaPath = path.join(indexSubDir, 'meta.json');
+      var metaPath = path.join(indexDirPath, indexUid.value, 'meta.json');
 
       if (!await _dataStore.storage.existsFile(metaPath)) {
-        final legacySubDir = path.join(indexDirPath, legacyIndexName);
-        final legacyMetaPath = path.join(legacySubDir, 'meta.json');
+        final legacyMetaPath =
+            path.join(indexDirPath, legacyIndexName, 'meta.json');
         if (await _dataStore.storage.existsFile(legacyMetaPath)) {
-          indexSubDir = legacySubDir;
           metaPath = legacyMetaPath;
         } else {
           continue;
@@ -1223,79 +1323,10 @@ class V3Upgrade {
           flush: true,
         );
         await _dataStore.storage.deleteFile(metaPath);
-
-        final nghMetaPath = path.join(indexSubDir, 'ngh', 'meta.json');
-        if (await _dataStore.storage.existsFile(nghMetaPath)) {
-          await _migrateNghMetaToPage0(
-            tableUid,
-            indexUid,
-            nghMetaPath,
-            tableRoot: tableRoot,
-          );
-        }
       } catch (e) {
         Logger.warn('v3: failed to migrate index meta to page 0 for $indexUid',
             rawError: e);
       }
-    }
-  }
-
-  Future<void> _migrateNghMetaToPage0(
-    TableUid tableUid,
-    IndexUid indexUid,
-    String nghMetaPath, {
-    required String tableRoot,
-  }) async {
-    try {
-      final content = await _dataStore.storage.readAsString(nghMetaPath);
-      if (content == null || content.isEmpty) return;
-      var meta = NghIndexMeta.fromJson(
-        jsonDecode(content) as Map<String, dynamic>,
-      );
-      // Rebind UIDs from directory rename (JSON may still hold tableName/indexName).
-      final nid2pk = meta.nodeIdToPkMeta;
-      final pk2nid = meta.pkToNodeIdMeta;
-      meta = meta.copyWith(
-        indexUid: indexUid,
-        tableUid: tableUid,
-        nodeIdToPkMeta: nid2pk?.copyWith(
-          indexUid: IndexUid('${indexUid.value}__nid2pk'),
-          tableUid: tableUid,
-        ),
-        pkToNodeIdMeta: pk2nid?.copyWith(
-          indexUid: IndexUid('${indexUid.value}__pk2nid'),
-          tableUid: tableUid,
-        ),
-      );
-
-      PartitionLocalStats local =
-          const PartitionLocalStats(partitionNo: 0, dataCategory: 0);
-      final graphP0 = _nghGraphPart0Path(tableRoot, indexUid.value);
-      if (await _dataStore.storage.existsFile(graphP0)) {
-        local = await _dataStore.treeMetaPageService.readPartitionLocal(
-              path: graphP0,
-              partitionNo: 0,
-              pageType: BTreePageType.nghMeta,
-            ) ??
-            local;
-      }
-
-      await _dataStore.treeMetaPageService.writePartitionPage0(
-        path: graphP0,
-        pageSize: _upgradePageSize,
-        partitionNo: 0,
-        pageType: BTreePageType.nghMeta,
-        partitionLocal: local,
-        treeGlobalMeta: TreeGlobalMetaBlobCodec.encode(
-          TreeGlobalMetaKind.ngh,
-          NghIndexMetaCodec.encode(meta),
-        ),
-        flush: true,
-      );
-      await _dataStore.storage.deleteFile(nghMetaPath);
-    } catch (e) {
-      Logger.warn('v3: failed to migrate NGH meta to page 0 for $indexUid',
-          rawError: e);
     }
   }
 

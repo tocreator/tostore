@@ -55,6 +55,12 @@ enum BTreePageType {
 
   /// NGH PQ codebook page containing trained centroid vectors.
   nghCodebook,
+
+  /// NGH posting page containing inlined SQ8 vector slots for inverted cluster.
+  nghPosting,
+
+  /// NGH navigating graph page containing centroid vectors and cluster topology.
+  nghNavGraph,
 }
 
 // ============================================================================

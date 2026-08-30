@@ -41,6 +41,12 @@ final class CacheManager {
       } catch (e) {
         Logger.warn('Evict page cache failed', rawError: e);
       }
+      try {
+        // Evict overflow page cache
+        await _dataStore.overflowManager.evictPageCache(ratio: 0.3);
+      } catch (e) {
+        Logger.warn('Evict overflow page cache failed', rawError: e);
+      }
     });
 
     // Index data (data cache + B+Tree pages + NGH vector pages)

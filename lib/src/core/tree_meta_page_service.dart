@@ -177,7 +177,7 @@ final class TreeMetaPageService {
   }
 
   // ---------------------------------------------------------------------------
-  // Global meta -- NGH vector (stored on graph partition 0 page 0)
+  // Global meta -- NGH vector (stored on posting partition 0 page 0)
   // ---------------------------------------------------------------------------
 
   Future<NghIndexMeta?> readNghGlobalMeta(
@@ -185,7 +185,7 @@ final class TreeMetaPageService {
     IndexUid indexUid,
   ) async {
     final path = _dataStore.pathManager
-        .getNghGraphPartitionPathByContext(table, indexUid, 0);
+        .getNghPostingPartitionPathByContext(table, indexUid, 0);
     final parsed = await _readPayload(
       partitionPath: path,
       partitionNo: 0,
@@ -213,7 +213,7 @@ final class TreeMetaPageService {
   }) async {
     final pageSize = _requireConfiguredPageSize();
     final path = _dataStore.pathManager
-        .getNghGraphPartitionPathByContext(table, indexUid, 0);
+        .getNghPostingPartitionPathByContext(table, indexUid, 0);
     final local = partitionLocalOverride ??
         (await readPartitionLocal(
           path: path,

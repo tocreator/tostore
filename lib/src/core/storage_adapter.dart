@@ -585,6 +585,32 @@ class StorageAdapter implements StorageInterface {
   }
 
   @override
+  Future<List<Uint8List>> readManyAsBytesAt(
+    String path,
+    List<ByteReadRange> ranges,
+  ) async {
+    if (ranges.isEmpty) return const [];
+    _ensureOpen();
+    final resource = _getLockResource(path);
+    final opId = _generateOperationId(_readOpPrefix);
+
+    bool acquired = false;
+    try {
+      acquired = await _lockManager.acquireSharedLock(resource, opId);
+      if (!acquired) {
+        _throwLockTimeout(
+            'Failed to acquire shared lock for readManyAsBytesAt: $resource',
+            resource);
+      }
+      return await _storage.readManyAsBytesAt(path, ranges);
+    } finally {
+      if (acquired) {
+        _lockManager.releaseSharedLock(resource, opId);
+      }
+    }
+  }
+
+  @override
   Future<void> writeAsBytesAt(String path, int start, Uint8List bytes,
       {bool flush = true, bool closeHandleAfterFlush = false}) async {
     _ensureOpen();

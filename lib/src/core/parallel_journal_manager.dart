@@ -2568,7 +2568,7 @@ class ParallelJournalManager {
           if (tableContext == null) continue;
           final indexUid =
               _resolveRedoIndexUid(tableContext.schema, key.indexUid);
-          path = _dataStore.pathManager.getNghGraphPartitionPathByContext(
+          path = _dataStore.pathManager.getNghPostingPartitionPathByContext(
               tableContext, indexUid, key.partitionNo);
         } else {
           final tableContext = await _tableContextFromUid(key.tableUid);

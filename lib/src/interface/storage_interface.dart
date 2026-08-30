@@ -16,6 +16,16 @@ final class ByteWrite {
   ByteWrite({required this.offset, required this.bytes});
 }
 
+/// A byte read range for batch random-access file IO.
+///
+/// - [offset] is the byte offset from the beginning of the file.
+/// - [length] is the number of bytes to read from [offset].
+final class ByteReadRange {
+  final int offset;
+  final int length;
+  const ByteReadRange({required this.offset, required this.length});
+}
+
 /// Storage interface for cross-platform compatibility
 abstract class StorageInterface {
   /// Write string to file
@@ -66,6 +76,15 @@ abstract class StorageInterface {
   /// [length] - number of bytes to read (null means read to end)
   /// Returns empty Uint8List if start is beyond file size.
   Future<Uint8List> readAsBytesAt(String path, int start, {int? length});
+
+  /// Read multiple byte ranges from a single file in a single handle lock window.
+  ///
+  /// Implementations optimize this by minimizing handle acquisitions and syscalls.
+  /// Returns a list of [Uint8List] corresponding 1:1 with [ranges].
+  Future<List<Uint8List>> readManyAsBytesAt(
+    String path,
+    List<ByteReadRange> ranges,
+  );
 
   /// Write bytes at a specific offset (random write).
   ///

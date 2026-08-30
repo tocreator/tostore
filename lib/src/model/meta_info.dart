@@ -207,6 +207,15 @@ class TableDataMeta {
   /// Number of B+Tree partition files for this table.
   final int btreePartitionCount;
 
+  /// Number of Overflow partition files for this table.
+  final int overflowPartitionCount;
+
+  /// Aggregate overflow partition file occupancy (bytes), maintained
+  /// incrementally on flush -- same role as [totalSizeBytes] for B+Tree.
+  ///
+  /// Never derived via filesystem `getFileSize` on hot paths.
+  final int overflowTotalSizeBytes;
+
   /// B+Tree root pointer.
   final TreePagePtr btreeRoot;
 
@@ -228,11 +237,14 @@ class TableDataMeta {
     this.maxAutoIncrementId,
     required this.btreeNextPageNo,
     required this.btreePartitionCount,
+    int? overflowPartitionCount,
+    this.overflowTotalSizeBytes = 0,
     required this.btreeRoot,
     required this.btreeFirstLeaf,
     required this.btreeLastLeaf,
     required this.btreeHeight,
-  }) : version = version ?? InternalConfig.tableDataVersion;
+  })  : overflowPartitionCount = overflowPartitionCount ?? 1,
+        version = version ?? InternalConfig.tableDataVersion;
 
   /// First data page number (pageNo=0 is reserved for [PartitionMetaPage]).
   static const int firstDataPageNo = 1;
@@ -246,6 +258,7 @@ class TableDataMeta {
   static TableDataMeta createEmpty({
     required TableUid tableUid,
     int partitionCount = 1,
+    int overflowPartitionCount = 1,
     DateTime? now,
   }) {
     final timestamp = now ?? DateTime.now();
@@ -256,6 +269,8 @@ class TableDataMeta {
       timestamps: Timestamps(created: timestamp, modified: timestamp),
       btreeNextPageNo: firstDataPageNo,
       btreePartitionCount: partitionCount,
+      overflowPartitionCount: overflowPartitionCount,
+      overflowTotalSizeBytes: 0,
       btreeRoot: TreePagePtr.nullPtr,
       btreeFirstLeaf: TreePagePtr.nullPtr,
       btreeLastLeaf: TreePagePtr.nullPtr,
@@ -272,6 +287,8 @@ class TableDataMeta {
     String? maxAutoIncrementId,
     int? btreeNextPageNo,
     int? btreePartitionCount,
+    int? overflowPartitionCount,
+    int? overflowTotalSizeBytes,
     TreePagePtr? btreeRoot,
     TreePagePtr? btreeFirstLeaf,
     TreePagePtr? btreeLastLeaf,
@@ -286,6 +303,10 @@ class TableDataMeta {
       maxAutoIncrementId: maxAutoIncrementId ?? this.maxAutoIncrementId,
       btreeNextPageNo: btreeNextPageNo ?? this.btreeNextPageNo,
       btreePartitionCount: btreePartitionCount ?? this.btreePartitionCount,
+      overflowPartitionCount:
+          overflowPartitionCount ?? this.overflowPartitionCount,
+      overflowTotalSizeBytes:
+          overflowTotalSizeBytes ?? this.overflowTotalSizeBytes,
       btreeRoot: btreeRoot ?? this.btreeRoot,
       btreeFirstLeaf: btreeFirstLeaf ?? this.btreeFirstLeaf,
       btreeLastLeaf: btreeLastLeaf ?? this.btreeLastLeaf,
@@ -347,6 +368,10 @@ class TableDataMeta {
       maxAutoIncrementId: json['maxAutoIncrementId'] as String?,
       btreeNextPageNo: (json['btreeNextPageNo'] as num).toInt(),
       btreePartitionCount: (json['btreePartitionCount'] as num).toInt(),
+      overflowPartitionCount:
+          (json['overflowPartitionCount'] as num?)?.toInt() ?? 1,
+      overflowTotalSizeBytes:
+          (json['overflowTotalSizeBytes'] as num?)?.toInt() ?? 0,
       btreeRoot:
           TreePagePtr.fromJson(json['btreeRoot'] as Map<String, dynamic>),
       btreeFirstLeaf:
@@ -368,6 +393,8 @@ class TableDataMeta {
       if (maxAutoIncrementId != null) 'maxAutoIncrementId': maxAutoIncrementId,
       'btreeNextPageNo': btreeNextPageNo,
       'btreePartitionCount': btreePartitionCount,
+      'overflowPartitionCount': overflowPartitionCount,
+      'overflowTotalSizeBytes': overflowTotalSizeBytes,
       'btreeRoot': btreeRoot.toJson(),
       'btreeFirstLeaf': btreeFirstLeaf.toJson(),
       'btreeLastLeaf': btreeLastLeaf.toJson(),
@@ -377,7 +404,7 @@ class TableDataMeta {
 
   @override
   String toString() =>
-      'TableDataMeta(version: $version, tableUid: $tableUid, totalSizeBytes: $totalSizeBytes, totalRecordCount: $totalRecordCount, btreePartitionCount: $btreePartitionCount, btreeHeight: $btreeHeight, btreeRoot: $btreeRoot)';
+      'TableDataMeta(version: $version, tableUid: $tableUid, totalSizeBytes: $totalSizeBytes, overflowTotalSizeBytes: $overflowTotalSizeBytes, totalRecordCount: $totalRecordCount, btreePartitionCount: $btreePartitionCount, overflowPartitionCount: $overflowPartitionCount, btreeHeight: $btreeHeight, btreeRoot: $btreeRoot)';
 }
 
 /// timestamp info

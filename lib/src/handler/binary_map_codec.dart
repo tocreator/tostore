@@ -4,12 +4,14 @@ import 'dart:typed_data';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
+import '../model/table_schema.dart' show VectorData;
 import 'platform_byte_data.dart';
 
 /// A compact binary codec for `Map<String, dynamic>`.
 ///
 /// This is a MessagePack-compatible subset with a small custom extension:
 /// - BigInt is encoded as MessagePack ext (type=1) with decimal string payload.
+/// - VectorData is encoded as MessagePack ext (type=2) with Float64 binary payload.
 ///
 /// Goals:
 /// - Avoid JSON for hot data paths (partition blocks, WAL payloads)
@@ -23,6 +25,8 @@ class BinaryMapCodec {
 
   // MessagePack ext type for BigInt
   static const int _extTypeBigInt = 1;
+  // MessagePack ext type for VectorData
+  static const int _extTypeVector = 2;
 
   static Uint8List encodeMap(Map<String, dynamic> map) {
     final buffer = BytesBuilder(copy: false);
@@ -111,6 +115,11 @@ class BinaryMapCodec {
 
     if (value is BigInt) {
       _writeBigIntExt(b, value);
+      return;
+    }
+
+    if (value is VectorData) {
+      _writeVectorExt(b, value);
       return;
     }
 
@@ -210,6 +219,16 @@ class BinaryMapCodec {
     b.addByte(0xC9);
     _writeU32be(b, len);
     b.addByte(_extTypeBigInt);
+    b.add(payload);
+  }
+
+  static void _writeVectorExt(BytesBuilder b, VectorData v) {
+    final payload = v.toBytes();
+    final len = payload.length;
+    // ext32
+    b.addByte(0xC9);
+    _writeU32be(b, len);
+    b.addByte(_extTypeVector);
     b.add(payload);
   }
 
@@ -346,6 +365,13 @@ class BinaryMapCodec {
     if (type == _extTypeBigInt) {
       final s = utf8.decode(payload, allowMalformed: true);
       return BigInt.tryParse(s) ?? BigInt.zero;
+    }
+    if (type == _extTypeVector) {
+      try {
+        return VectorData.fromBytes(payload);
+      } catch (_) {
+        return null;
+      }
     }
     // Unknown extension: return raw bytes.
     return payload;

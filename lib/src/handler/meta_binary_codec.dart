@@ -3,15 +3,15 @@ import 'dart:typed_data';
 import '../core/btree_page.dart';
 import '../core/ngh_page.dart';
 import '../model/db_exception.dart';
+import '../model/meta_info.dart';
+import '../model/ngh_index_meta.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
+import '../model/table_identity.dart';
+import '../model/table_schema.dart';
 import 'binary_codec.dart';
 import 'common.dart';
 import 'platform_byte_data.dart';
-import '../model/meta_info.dart';
-import '../model/ngh_index_meta.dart';
-import '../model/table_identity.dart';
-import '../model/table_schema.dart';
 
 /// Stable field IDs for [TimestampsCodec]. Reserved: 3..127.
 abstract final class TimestampsFieldId {
@@ -25,7 +25,7 @@ abstract final class TreePagePtrFieldId {
   static const int pageNo = 2;
 }
 
-/// Stable field IDs for [TableDataMetaCodec]. Reserved: 17..127.
+/// Stable field IDs for [TableDataMetaCodec]. Reserved: 19..127.
 abstract final class TableDataMetaFieldId {
   static const int version = 1;
   static const int tableUid = 2;
@@ -42,6 +42,8 @@ abstract final class TableDataMetaFieldId {
   static const int btreeFirstLeaf = 14;
   static const int btreeLastLeaf = 15;
   static const int btreeHeight = 16;
+  static const int overflowPartitionCount = 17;
+  static const int overflowTotalSizeBytes = 18;
 }
 
 /// Stable field IDs for [IndexMetaCodec]. Reserved: 17..127.
@@ -65,7 +67,7 @@ abstract final class IndexMetaFieldId {
   static const int btreeHeight = 16;
 }
 
-/// Stable field IDs for [NghIndexMetaCodec]. Reserved: 40..127.
+/// Stable field IDs for [NghIndexMetaCodec].
 abstract final class NghIndexMetaFieldId {
   static const int version = 1;
   static const int indexUid = 2;
@@ -74,33 +76,20 @@ abstract final class NghIndexMetaFieldId {
   static const int distanceMetric = 5;
   static const int precision = 6;
   static const int timestamps = 7;
-  static const int maxDegree = 10;
-  static const int efSearch = 11;
-  static const int constructionEf = 12;
-  static const int pruneAlpha = 13;
-  static const int pqSubspaces = 14;
-  static const int pqCentroids = 15;
-  static const int pqTrained = 16;
-  static const int totalVectors = 20;
-  static const int deletedCount = 21;
-  static const int medoidNodeId = 22;
-  static const int nextNodeId = 23;
-
-  /// Legacy -- ignored; page size lives in [GlobalConfig].
-  static const int nghPageSize = 24;
-  static const int graphPartitionCount = 25;
-  static const int graphNextPageNo = 26;
-  static const int pqCodePartitionCount = 27;
-  static const int pqCodeNextPageNo = 28;
-  static const int rawVectorPartitionCount = 29;
-  static const int rawVectorNextPageNo = 30;
-  static const int totalSizeBytes = 31;
-  static const int nodeIdToPkMeta = 32;
-  static const int pkToNodeIdMeta = 33;
-  static const int graphFreeListHeads = 34;
-  static const int pqCodeFreeListHeads = 35;
-  static const int rawVectorFreeListHeads = 36;
-  static const int maxPartitionFileSize = 37;
+  static const int maxDegree = 8;
+  static const int efSearch = 9;
+  static const int constructionEf = 10;
+  static const int pruneAlpha = 11;
+  static const int totalVectors = 12;
+  static const int deletedCount = 13;
+  static const int medoidNodeId = 14;
+  static const int nextNodeId = 15;
+  static const int totalSizeBytes = 16;
+  static const int isBuilding = 17;
+  static const int centroidCount = 18;
+  static const int postingPartitionCount = 19;
+  static const int postingNextPageNo = 20;
+  static const int postingFreeListHeads = 21;
 }
 
 /// Discriminator for global meta blobs embedded in partition-0 page 0.
@@ -212,6 +201,14 @@ final class TableDataMetaCodec {
     w.writeVarint(meta.btreeNextPageNo);
     w.writeFieldTag(TableDataMetaFieldId.btreePartitionCount, WireType.varint);
     w.writeVarint(meta.btreePartitionCount);
+    w.writeFieldTag(
+        TableDataMetaFieldId.overflowPartitionCount, WireType.varint);
+    w.writeVarint(meta.overflowPartitionCount);
+    if (meta.overflowTotalSizeBytes > 0) {
+      w.writeFieldTag(
+          TableDataMetaFieldId.overflowTotalSizeBytes, WireType.varint);
+      w.writeVarint(meta.overflowTotalSizeBytes);
+    }
     w.writeFieldTag(TableDataMetaFieldId.btreeRoot, WireType.lengthDelimited);
     w.writeBytes(TreePagePtrCodec.encode(meta.btreeRoot));
     w.writeFieldTag(
@@ -238,6 +235,8 @@ final class TableDataMetaCodec {
     String? maxAutoIncrementId;
     int btreeNextPageNo = TableDataMeta.firstDataPageNo;
     int btreePartitionCount = 1;
+    int overflowPartitionCount = 1;
+    int overflowTotalSizeBytes = 0;
     TreePagePtr btreeRoot = TreePagePtr.nullPtr;
     TreePagePtr btreeFirstLeaf = TreePagePtr.nullPtr;
     TreePagePtr btreeLastLeaf = TreePagePtr.nullPtr;
@@ -272,6 +271,12 @@ final class TableDataMetaCodec {
           break;
         case TableDataMetaFieldId.btreePartitionCount:
           btreePartitionCount = reader.readVarint();
+          break;
+        case TableDataMetaFieldId.overflowPartitionCount:
+          overflowPartitionCount = reader.readVarint();
+          break;
+        case TableDataMetaFieldId.overflowTotalSizeBytes:
+          overflowTotalSizeBytes = reader.readVarint();
           break;
         case TableDataMetaFieldId.btreeRoot:
           btreeRoot = TreePagePtrCodec.decode(reader.readBytes());
@@ -309,6 +314,8 @@ final class TableDataMetaCodec {
       maxAutoIncrementId: maxAutoIncrementId,
       btreeNextPageNo: btreeNextPageNo,
       btreePartitionCount: btreePartitionCount,
+      overflowPartitionCount: overflowPartitionCount,
+      overflowTotalSizeBytes: overflowTotalSizeBytes,
       btreeRoot: btreeRoot,
       btreeFirstLeaf: btreeFirstLeaf,
       btreeLastLeaf: btreeLastLeaf,
@@ -482,12 +489,6 @@ final class NghIndexMetaCodec {
     w.writeVarint(meta.constructionEf);
     w.writeFieldTag(NghIndexMetaFieldId.pruneAlpha, WireType.fixed64);
     w.writeDouble(meta.pruneAlpha);
-    w.writeFieldTag(NghIndexMetaFieldId.pqSubspaces, WireType.varint);
-    w.writeVarint(meta.pqSubspaces);
-    w.writeFieldTag(NghIndexMetaFieldId.pqCentroids, WireType.varint);
-    w.writeVarint(meta.pqCentroids);
-    w.writeFieldTag(NghIndexMetaFieldId.pqTrained, WireType.varint);
-    w.writeBool(meta.pqTrained);
     w.writeFieldTag(NghIndexMetaFieldId.totalVectors, WireType.varint);
     w.writeVarint(meta.totalVectors);
     w.writeFieldTag(NghIndexMetaFieldId.deletedCount, WireType.varint);
@@ -496,39 +497,18 @@ final class NghIndexMetaCodec {
     w.writeZigZag32(meta.medoidNodeId);
     w.writeFieldTag(NghIndexMetaFieldId.nextNodeId, WireType.varint);
     w.writeVarint(meta.nextNodeId);
-    w.writeFieldTag(NghIndexMetaFieldId.graphPartitionCount, WireType.varint);
-    w.writeVarint(meta.graphPartitionCount);
-    w.writeFieldTag(NghIndexMetaFieldId.graphNextPageNo, WireType.varint);
-    w.writeVarint(meta.graphNextPageNo);
-    w.writeFieldTag(NghIndexMetaFieldId.pqCodePartitionCount, WireType.varint);
-    w.writeVarint(meta.pqCodePartitionCount);
-    w.writeFieldTag(NghIndexMetaFieldId.pqCodeNextPageNo, WireType.varint);
-    w.writeVarint(meta.pqCodeNextPageNo);
-    w.writeFieldTag(
-        NghIndexMetaFieldId.rawVectorPartitionCount, WireType.varint);
-    w.writeVarint(meta.rawVectorPartitionCount);
-    w.writeFieldTag(NghIndexMetaFieldId.rawVectorNextPageNo, WireType.varint);
-    w.writeVarint(meta.rawVectorNextPageNo);
     w.writeFieldTag(NghIndexMetaFieldId.totalSizeBytes, WireType.varint);
     w.writeVarint(meta.totalSizeBytes);
-    if (meta.nodeIdToPkMeta != null) {
-      w.writeFieldTag(
-          NghIndexMetaFieldId.nodeIdToPkMeta, WireType.lengthDelimited);
-      w.writeBytes(IndexMetaCodec.encode(meta.nodeIdToPkMeta!));
-    }
-    if (meta.pkToNodeIdMeta != null) {
-      w.writeFieldTag(
-          NghIndexMetaFieldId.pkToNodeIdMeta, WireType.lengthDelimited);
-      w.writeBytes(IndexMetaCodec.encode(meta.pkToNodeIdMeta!));
-    }
+    w.writeFieldTag(NghIndexMetaFieldId.isBuilding, WireType.varint);
+    w.writeBool(meta.isBuilding);
+    w.writeFieldTag(NghIndexMetaFieldId.centroidCount, WireType.varint);
+    w.writeVarint(meta.centroidCount);
+    w.writeFieldTag(NghIndexMetaFieldId.postingPartitionCount, WireType.varint);
+    w.writeVarint(meta.postingPartitionCount);
+    w.writeFieldTag(NghIndexMetaFieldId.postingNextPageNo, WireType.varint);
+    w.writeVarint(meta.postingNextPageNo);
     _writeIntIntMap(
-        w, NghIndexMetaFieldId.graphFreeListHeads, meta.graphFreeListHeads);
-    _writeIntIntMap(
-        w, NghIndexMetaFieldId.pqCodeFreeListHeads, meta.pqCodeFreeListHeads);
-    _writeIntIntMap(w, NghIndexMetaFieldId.rawVectorFreeListHeads,
-        meta.rawVectorFreeListHeads);
-    w.writeFieldTag(NghIndexMetaFieldId.maxPartitionFileSize, WireType.varint);
-    w.writeVarint(meta.maxPartitionFileSizeBytes);
+        w, NghIndexMetaFieldId.postingFreeListHeads, meta.postingFreeListHeads);
     return w.view;
   }
 
@@ -549,26 +529,16 @@ final class NghIndexMetaCodec {
     int efSearch = 64;
     int constructionEf = 128;
     double pruneAlpha = 1.2;
-    int pqSubspaces = 16;
-    int pqCentroids = 256;
-    bool pqTrained = false;
     int totalVectors = 0;
     int deletedCount = 0;
     int medoidNodeId = -1;
     int nextNodeId = 0;
-    int graphPartitionCount = 1;
-    int graphNextPageNo = NghIndexMeta.firstDataPageNo;
-    int pqCodePartitionCount = 1;
-    int pqCodeNextPageNo = NghIndexMeta.firstDataPageNo;
-    int rawVectorPartitionCount = 1;
-    int rawVectorNextPageNo = NghIndexMeta.firstDataPageNo;
     int totalSizeBytes = 0;
-    IndexMeta? nodeIdToPkMeta;
-    IndexMeta? pkToNodeIdMeta;
-    Map<int, int> graphFreeListHeads = const {};
-    Map<int, int> pqCodeFreeListHeads = const {};
-    Map<int, int> rawVectorFreeListHeads = const {};
-    int maxPartitionFileSize = 16 * 1024 * 1024;
+    bool isBuilding = false;
+    int centroidCount = 0;
+    int postingPartitionCount = 1;
+    int postingNextPageNo = NghIndexMeta.firstDataPageNo;
+    Map<int, int> postingFreeListHeads = const {};
 
     while (!reader.isEOF) {
       final (fieldId, wireType) = reader.readFieldTag();
@@ -612,15 +582,6 @@ final class NghIndexMetaCodec {
         case NghIndexMetaFieldId.pruneAlpha:
           pruneAlpha = reader.readDouble();
           break;
-        case NghIndexMetaFieldId.pqSubspaces:
-          pqSubspaces = reader.readVarint();
-          break;
-        case NghIndexMetaFieldId.pqCentroids:
-          pqCentroids = reader.readVarint();
-          break;
-        case NghIndexMetaFieldId.pqTrained:
-          pqTrained = reader.readBool();
-          break;
         case NghIndexMetaFieldId.totalVectors:
           totalVectors = reader.readVarint();
           break;
@@ -633,47 +594,23 @@ final class NghIndexMetaCodec {
         case NghIndexMetaFieldId.nextNodeId:
           nextNodeId = reader.readVarint();
           break;
-        case NghIndexMetaFieldId.nghPageSize:
-          reader.readVarint(); // legacy field -- ignore
-          break;
-        case NghIndexMetaFieldId.graphPartitionCount:
-          graphPartitionCount = reader.readVarint();
-          break;
-        case NghIndexMetaFieldId.graphNextPageNo:
-          graphNextPageNo = reader.readVarint();
-          break;
-        case NghIndexMetaFieldId.pqCodePartitionCount:
-          pqCodePartitionCount = reader.readVarint();
-          break;
-        case NghIndexMetaFieldId.pqCodeNextPageNo:
-          pqCodeNextPageNo = reader.readVarint();
-          break;
-        case NghIndexMetaFieldId.rawVectorPartitionCount:
-          rawVectorPartitionCount = reader.readVarint();
-          break;
-        case NghIndexMetaFieldId.rawVectorNextPageNo:
-          rawVectorNextPageNo = reader.readVarint();
-          break;
         case NghIndexMetaFieldId.totalSizeBytes:
           totalSizeBytes = reader.readVarint();
           break;
-        case NghIndexMetaFieldId.nodeIdToPkMeta:
-          nodeIdToPkMeta = IndexMetaCodec.decode(reader.readBytes());
+        case NghIndexMetaFieldId.isBuilding:
+          isBuilding = reader.readBool();
           break;
-        case NghIndexMetaFieldId.pkToNodeIdMeta:
-          pkToNodeIdMeta = IndexMetaCodec.decode(reader.readBytes());
+        case NghIndexMetaFieldId.centroidCount:
+          centroidCount = reader.readVarint();
           break;
-        case NghIndexMetaFieldId.graphFreeListHeads:
-          graphFreeListHeads = _readIntIntMap(reader);
+        case NghIndexMetaFieldId.postingPartitionCount:
+          postingPartitionCount = reader.readVarint();
           break;
-        case NghIndexMetaFieldId.pqCodeFreeListHeads:
-          pqCodeFreeListHeads = _readIntIntMap(reader);
+        case NghIndexMetaFieldId.postingNextPageNo:
+          postingNextPageNo = reader.readVarint();
           break;
-        case NghIndexMetaFieldId.rawVectorFreeListHeads:
-          rawVectorFreeListHeads = _readIntIntMap(reader);
-          break;
-        case NghIndexMetaFieldId.maxPartitionFileSize:
-          maxPartitionFileSize = reader.readVarint();
+        case NghIndexMetaFieldId.postingFreeListHeads:
+          postingFreeListHeads = _readIntIntMap(reader);
           break;
         default:
           reader.skipField(wireType);
@@ -706,26 +643,16 @@ final class NghIndexMetaCodec {
       efSearch: efSearch,
       constructionEf: constructionEf,
       pruneAlpha: pruneAlpha,
-      pqSubspaces: pqSubspaces,
-      pqCentroids: pqCentroids,
-      pqTrained: pqTrained,
       totalVectors: totalVectors,
       deletedCount: deletedCount,
       medoidNodeId: medoidNodeId,
       nextNodeId: nextNodeId,
-      graphPartitionCount: graphPartitionCount,
-      graphNextPageNo: graphNextPageNo,
-      pqCodePartitionCount: pqCodePartitionCount,
-      pqCodeNextPageNo: pqCodeNextPageNo,
-      rawVectorPartitionCount: rawVectorPartitionCount,
-      rawVectorNextPageNo: rawVectorNextPageNo,
       totalSizeBytes: totalSizeBytes,
-      nodeIdToPkMeta: nodeIdToPkMeta,
-      pkToNodeIdMeta: pkToNodeIdMeta,
-      graphFreeListHeads: graphFreeListHeads,
-      pqCodeFreeListHeads: pqCodeFreeListHeads,
-      rawVectorFreeListHeads: rawVectorFreeListHeads,
-      maxPartitionFileSize: maxPartitionFileSize,
+      isBuilding: isBuilding,
+      centroidCount: centroidCount,
+      postingPartitionCount: postingPartitionCount,
+      postingNextPageNo: postingNextPageNo,
+      postingFreeListHeads: postingFreeListHeads,
     );
   }
 

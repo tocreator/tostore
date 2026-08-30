@@ -71,8 +71,23 @@ List<double>? _extractVectorValues(dynamic value) {
   if (value == null) return null;
   if (value is VectorData) return value.values;
   if (value is List<double>) return value;
-  if (value is List<num>) {
-    return value.map((v) => v.toDouble()).toList(growable: false);
+  if (value is List) {
+    final list = <double>[];
+    for (final v in value) {
+      if (v is num) {
+        list.add(v.toDouble());
+      } else {
+        return null;
+      }
+    }
+    return list;
+  }
+  if (value is Uint8List) {
+    try {
+      return VectorData.fromBytes(value).values;
+    } catch (_) {
+      return null;
+    }
   }
   return null;
 }

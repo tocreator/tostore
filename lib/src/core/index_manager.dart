@@ -1653,6 +1653,12 @@ class IndexManager {
   ) async {
     final indexUid = _indexUidFromSchema(indexSchema);
     if (indexUid.isEmpty) return;
+
+    if (indexSchema.type == IndexType.vector) {
+      await _dataStore.vectorIndexManager?.beginIndexBuild(table, indexSchema);
+      return;
+    }
+
     await deletePhysicalIndexArtifacts(table, indexUid);
     await updateIndexMeta(
       table: table,
@@ -1669,9 +1675,17 @@ class IndexManager {
   /// Authority-only: clear isBuilding after a owned rebuild completes or is aborted.
   Future<void> endIndexBuild(TableContext table, IndexUid indexUid) async {
     if (indexUid.isEmpty) return;
+    final resolved = _resolveIndexUid(table, indexUid.value);
+    final idxSchema = _dataStore.tableMetaManager
+        ?.findIndexSchemaByUid(table.schema, resolved);
+    if (idxSchema?.type == IndexType.vector) {
+      await _dataStore.vectorIndexManager?.endIndexBuild(table, resolved);
+      return;
+    }
+
     await mutateIndexMeta(
       table,
-      indexUid,
+      resolved,
       (current) {
         if (current == null || !current.isBuilding) return null;
         return current.copyWith(isBuilding: false);
@@ -3069,7 +3083,7 @@ class IndexManager {
     }
   }
 
-  /// One-time layout fix when opening a vector index with pre-uid on-disk paths.
+  /// One-time layout fix when opening an index with pre-uid on-disk paths.
   Future<void> ensureStableIndexLayoutOnLoad(
     TableContext table, {
     required IndexUid indexUid,
@@ -3077,11 +3091,6 @@ class IndexManager {
   }) async {
     if (indexUid.isEmpty || legacyLogicalName.isEmpty) return;
     await _migrateLegacyIndexDirectoryIfNeeded(
-      table,
-      indexUid: indexUid,
-      legacyLogicalName: legacyLogicalName,
-    );
-    await _migrateLegacyMappingIndexDirectoriesIfNeeded(
       table,
       indexUid: indexUid,
       legacyLogicalName: legacyLogicalName,
@@ -3115,39 +3124,6 @@ class IndexManager {
     }
 
     await _dataStore.storage.moveDirectory(legacyPath, stablePath);
-  }
-
-  /// Migrate vector nodeId->PK mapping B+Tree dirs from legacy logical names.
-  Future<void> _migrateLegacyMappingIndexDirectoriesIfNeeded(
-    TableContext table, {
-    required IndexUid indexUid,
-    required String legacyLogicalName,
-  }) async {
-    if (legacyLogicalName.isEmpty || legacyLogicalName == indexUid.value) {
-      return;
-    }
-
-    for (final suffix in const ['__nid2pk', '__pk2nid']) {
-      final stableUid = IndexUid('${indexUid.value}$suffix');
-      final legacyUid = IndexUid('$legacyLogicalName$suffix');
-      if (stableUid == legacyUid) continue;
-
-      final stablePath =
-          _dataStore.pathManager.getIndexPathByContext(table, stableUid);
-      final legacyPath =
-          _dataStore.pathManager.getIndexPathByContext(table, legacyUid);
-      if (legacyPath == stablePath) continue;
-
-      final legacyExists = await _dataStore.storage.existsDirectory(legacyPath);
-      if (!legacyExists) continue;
-
-      final stableExists = await _dataStore.storage.existsDirectory(stablePath);
-      if (stableExists) {
-        await _dataStore.storage.deleteDirectory(legacyPath);
-      } else {
-        await _dataStore.storage.moveDirectory(legacyPath, stablePath);
-      }
-    }
   }
 
   /// Compare two field lists with order preserved.
@@ -3200,12 +3176,19 @@ class IndexManager {
     _invalidateIndexCache(table, resolved);
 
     try {
-      final indexPath = _dataStore.pathManager.getIndexPathByContext(
-        table,
-        resolved,
-      );
-      if (await _dataStore.storage.existsDirectory(indexPath)) {
-        await _dataStore.storage.deleteDirectory(indexPath);
+      final indexSchema = _dataStore.tableMetaManager
+          ?.findIndexSchemaByUid(table.schema, resolved);
+      if (indexSchema?.type == IndexType.vector) {
+        await _dataStore.vectorIndexManager
+            ?.deletePhysicalIndexArtifacts(table, resolved);
+      } else {
+        final indexPath = _dataStore.pathManager.getIndexPathByContext(
+          table,
+          resolved,
+        );
+        if (await _dataStore.storage.existsDirectory(indexPath)) {
+          await _dataStore.storage.deleteDirectory(indexPath);
+        }
       }
     } catch (e) {
       Logger.warn(

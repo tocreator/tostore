@@ -1,24 +1,19 @@
+import 'dart:convert';
 import 'dart:typed_data';
 
 import '../handler/platform_byte_data.dart';
-import '../model/db_exception.dart';
-import '../model/result_status.dart';
-import '../model/result_type.dart';
 import 'btree_page.dart';
 
 // ============================================================================
-// NGH (Node-Graph Hybrid) Page Structures
+// NGH (Node-Graph Hybrid) Page Structures -- Modern Zero-Residue Architecture
 //
 // All pages reuse BTreePageHeader (20-byte header with magic/CRC/type/flags)
-// and BTreePageIO for encoding/decoding. The payload formats below are specific
-// to NGH vector index storage.
+// and BTreePageIO for encoding/decoding.
 //
 // Page types:
 //   nghMeta      -- per-partition-file metadata (pageNo=0)
-//   nghGraph     -- fixed-slot graph nodes with neighbor lists
-//   nghPqCode    -- densely packed PQ codes
-//   nghRawVector -- full-precision vectors for re-ranking
-//   nghCodebook  -- trained PQ centroid vectors
+//   nghPosting   -- inverted cluster posting page with inlined SQ8 vector slots
+//   nghNavGraph  -- memory/disk navigating centroid graph nodes
 // ============================================================================
 
 // ============================================================================
@@ -101,453 +96,379 @@ final class NghPartitionMetaPage {
 }
 
 // ============================================================================
-// NGH Graph Page -- Fixed-Slot Neighbor Lists
+// NGH Posting Page (Inverted Cluster Data Page)
 // ============================================================================
 
-/// Node flags stored in the first byte of each graph slot.
-abstract final class NghNodeFlags {
-  static const int deleted = 0x01; // tombstone
-  static const int updated = 0x02; // pending compaction
-}
+/// Inlined SQ8 compressed vector entry with metadata inside an inverted cluster posting page.
+final class NghPostingSlot {
+  /// Unique vector node/document ID.
+  int nodeId;
 
-/// A single graph node within an [NghGraphPage].
-///
-/// Fixed-size slot layout:
-///   [flags:u8][actualDegree:u8][neighbors: maxDegree x u32]
-final class NghGraphNode {
-  /// Node status flags (see [NghNodeFlags]).
+  /// Logical deletion / tombstone flag (0 = active, 1 = deleted).
   int flags;
 
-  /// Actual number of valid neighbors (<= maxDegree).
-  int actualDegree;
+  /// Original string primary key.
+  String primaryKey;
 
-  /// Neighbor node IDs. Length == maxDegree; only first [actualDegree] valid.
-  final Uint32List neighbors;
+  /// 8-bit quantized vector components. Length == dimensions.
+  Uint8List sq8Codes;
 
-  NghGraphNode({
+  /// Min raw component value (offset).
+  double offset;
+
+  /// Step size per quantization level: (max - min) / 255.0.
+  double scale;
+
+  /// Pre-computed squared L2 norm for fast exact/approximate distance calculations.
+  double squaredNorm;
+
+  NghPostingSlot({
+    required this.nodeId,
     this.flags = 0,
-    this.actualDegree = 0,
-    required this.neighbors,
+    required this.primaryKey,
+    required this.sq8Codes,
+    required this.offset,
+    required this.scale,
+    required this.squaredNorm,
   });
 
-  bool get isDeleted => (flags & NghNodeFlags.deleted) != 0;
+  bool get isDeleted => (flags & 0x01) != 0;
 
-  /// Create an empty node with the given max degree.
-  factory NghGraphNode.empty(int maxDegree) {
-    return NghGraphNode(neighbors: Uint32List(maxDegree));
-  }
+  /// Approximate in-memory / serialized byte size of this slot.
+  int estimateSize() => 20 + primaryKey.length * 2 + sq8Codes.length;
 }
 
-/// A page of fixed-size graph node slots.
-///
-/// Payload layout:
-///   [slotCount:u16][maxDegree:u16]
-///   [slot_0][slot_1]...[slot_{slotCount-1}]
-///
-/// Each slot is exactly `2 + maxDegree * 4` bytes.
-final class NghGraphPage {
-  /// Configured max degree (same for all slots in this page).
-  final int maxDegree;
+/// An inverted cluster posting page storing multiple inlined [NghPostingSlot]s.
+final class NghPostingPage {
+  /// Owning cluster/centroid ID.
+  final int centroidId;
 
-  /// Node slots. Length == slotCount (the number of slots that fit per page).
-  final List<NghGraphNode> slots;
+  /// Next chained posting page packed ref (`partitionNo<<20|pageNo`), or -1.
+  int nextPostingPageNo;
 
-  NghGraphPage({required this.maxDegree, required this.slots});
-
-  /// Bytes per node slot: 1(flags) + 1(degree) + maxDegree * 4.
-  int get nodeSlotSize => 2 + maxDegree * 4;
-
-  /// Create a page pre-filled with empty slots.
-  factory NghGraphPage.empty({required int maxDegree, required int slotCount}) {
-    return NghGraphPage(
-      maxDegree: maxDegree,
-      slots: List.generate(slotCount, (_) => NghGraphNode.empty(maxDegree),
-          growable: false),
-    );
-  }
-
-  Uint8List encodePayload() {
-    final slotSize = nodeSlotSize;
-    final totalLen = 4 + slots.length * slotSize;
-    final buf = Uint8List(totalLen);
-    final bd = ByteData.sublistView(buf);
-    bd.setUint16(0, slots.length, Endian.little);
-    bd.setUint16(2, maxDegree, Endian.little);
-
-    int off = 4;
-    for (int i = 0; i < slots.length; i++) {
-      final node = slots[i];
-      buf[off] = node.flags;
-      buf[off + 1] = node.actualDegree;
-      off += 2;
-      for (int j = 0; j < maxDegree; j++) {
-        bd.setUint32(
-            off, j < node.actualDegree ? node.neighbors[j] : 0, Endian.little);
-        off += 4;
-      }
-    }
-    return buf;
-  }
-
-  static NghGraphPage? tryDecodePayload(Uint8List bytes) {
-    if (bytes.length < 4) return null;
-    final bd = ByteData.sublistView(bytes);
-    final slotCount = bd.getUint16(0, Endian.little);
-    final maxDeg = bd.getUint16(2, Endian.little);
-    if (maxDeg == 0) return null;
-    final slotSize = 2 + maxDeg * 4;
-    if (bytes.length < 4 + slotCount * slotSize) return null;
-
-    int off = 4;
-    final slots = List<NghGraphNode>.generate(slotCount, (_) {
-      final flags = bytes[off];
-      final degree = bytes[off + 1];
-      off += 2;
-      final neighbors = Uint32List(maxDeg);
-      for (int j = 0; j < maxDeg; j++) {
-        neighbors[j] = bd.getUint32(off, Endian.little);
-        off += 4;
-      }
-      return NghGraphNode(
-        flags: flags,
-        actualDegree: degree > maxDeg ? maxDeg : degree,
-        neighbors: neighbors,
-      );
-    }, growable: false);
-
-    return NghGraphPage(maxDegree: maxDeg, slots: slots);
-  }
-
-  int estimatePayloadSize() => 4 + slots.length * nodeSlotSize;
-}
-
-// ============================================================================
-// NGH PQ-Code Page -- Dense Quantisation Codes
-// ============================================================================
-
-/// A page of densely packed PQ codes.
-///
-/// Payload layout:
-///   [vectorCount:u16][pqSubspaces:u16]
-///   [code_0: M bytes][code_1: M bytes]...
-///
-/// Total payload = 4 + vectorCount x M bytes.
-final class NghPqCodePage {
-  /// Number of PQ sub-spaces (M); each code is M bytes.
-  final int pqSubspaces;
-
-  /// Packed PQ codes; each entry is [pqSubspaces] bytes.
-  /// Total length = vectorCount x pqSubspaces.
-  final Uint8List codes;
-
-  /// Number of vectors stored in this page.
-  final int vectorCount;
-
-  NghPqCodePage({
-    required this.pqSubspaces,
-    required this.codes,
-    required this.vectorCount,
-  });
-
-  /// Create an empty page pre-allocated for [capacity] vectors.
-  factory NghPqCodePage.empty(
-      {required int pqSubspaces, required int capacity}) {
-    return NghPqCodePage(
-      pqSubspaces: pqSubspaces,
-      codes: Uint8List(capacity * pqSubspaces),
-      vectorCount: capacity,
-    );
-  }
-
-  /// Get PQ code for the vector at [index] within this page.
-  /// Returns a view (zero-copy) -- safe for Uint8List on all platforms.
-  Uint8List getCode(int index) {
-    final off = index * pqSubspaces;
-    return Uint8List.view(codes.buffer, codes.offsetInBytes + off, pqSubspaces);
-  }
-
-  /// Set PQ code for the vector at [index] within this page.
-  void setCode(int index, Uint8List code) {
-    if (code.length != pqSubspaces) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message:
-              'PQ code length mismatch: expected $pqSubspaces, got ${code.length}',
-        ),
-      ]);
-    }
-    final off = index * pqSubspaces;
-    codes.setRange(off, off + pqSubspaces, code);
-  }
-
-  Uint8List encodePayload() {
-    final totalLen = 4 + vectorCount * pqSubspaces;
-    final buf = Uint8List(totalLen);
-    final bd = ByteData.sublistView(buf);
-    bd.setUint16(0, vectorCount, Endian.little);
-    bd.setUint16(2, pqSubspaces, Endian.little);
-    buf.setRange(4, 4 + codes.length, codes);
-    return buf;
-  }
-
-  static NghPqCodePage? tryDecodePayload(Uint8List bytes) {
-    if (bytes.length < 4) return null;
-    final bd = ByteData.sublistView(bytes);
-    final vCount = bd.getUint16(0, Endian.little);
-    final m = bd.getUint16(2, Endian.little);
-    if (m == 0) return null;
-    final dataLen = vCount * m;
-    if (bytes.length < 4 + dataLen) return null;
-    final codes = Uint8List.fromList(bytes.sublist(4, 4 + dataLen));
-    return NghPqCodePage(pqSubspaces: m, codes: codes, vectorCount: vCount);
-  }
-
-  int estimatePayloadSize() => 4 + vectorCount * pqSubspaces;
-}
-
-// ============================================================================
-// NGH Raw-Vector Page -- Full-Precision Vectors
-// ============================================================================
-
-/// A page of full-precision raw vectors for re-ranking.
-///
-/// Payload layout:
-///   [vectorCount:u16][dimensions:u16][precision:u8][padding:u24]
-///   [vec_0: D x bytesPerElem][vec_1: D x bytesPerElem]...
-final class NghRawVectorPage {
+  /// Vector dimensionality.
   final int dimensions;
 
-  /// 0=float64, 1=float32, 2=int8 (same order as [VectorPrecision] enum).
-  final int precisionIndex;
+  /// List of vector entries stored in this page.
+  final List<NghPostingSlot> slots;
 
-  /// Raw bytes for all vectors, packed contiguously.
-  /// Length = vectorCount x dimensions x bytesPerElement.
-  final Uint8List data;
-
-  /// Number of vectors in this page.
-  final int vectorCount;
-
-  NghRawVectorPage({
+  NghPostingPage({
+    required this.centroidId,
+    this.nextPostingPageNo = -1,
     required this.dimensions,
-    required this.precisionIndex,
-    required this.data,
-    required this.vectorCount,
+    required this.slots,
   });
 
-  /// Bytes per element based on precision.
-  int get bytesPerElement {
-    switch (precisionIndex) {
-      case 0:
-        return 8; // float64
-      case 2:
-        return 1; // int8
-      default:
-        return 4; // float32
-    }
-  }
-
-  /// Bytes per single vector.
-  int get vectorSize => dimensions * bytesPerElement;
-
-  /// Create an empty page pre-allocated for [capacity] vectors.
-  factory NghRawVectorPage.empty({
+  /// Create an empty posting page for a cluster.
+  factory NghPostingPage.empty({
+    required int centroidId,
     required int dimensions,
-    required int precisionIndex,
-    required int capacity,
   }) {
-    final bpe = precisionIndex == 0
-        ? 8
-        : precisionIndex == 2
-            ? 1
-            : 4;
-    return NghRawVectorPage(
+    return NghPostingPage(
+      centroidId: centroidId,
       dimensions: dimensions,
-      precisionIndex: precisionIndex,
-      data: Uint8List(capacity * dimensions * bpe),
-      vectorCount: capacity,
+      slots: [],
     );
   }
 
-  /// Read vector at [index] as Float32List (normalised to float32).
+  /// Encode posting page payload.
   ///
-  /// Uses ByteData element-wise reads to avoid alignment issues on web
-  /// (Dart2JS typed-array views require platform-aligned offsets).
-  Float32List getVectorAsFloat32(int index) {
-    final off = index * vectorSize;
-    final result = Float32List(dimensions);
-    final bd = ByteData.sublistView(data, off, off + vectorSize);
-    if (precisionIndex == 1) {
-      // float32 -> float32
-      for (int i = 0; i < dimensions; i++) {
-        result[i] = bd.getFloat32(i * 4, Endian.little);
-      }
-    } else if (precisionIndex == 0) {
-      // float64 -> float32
-      for (int i = 0; i < dimensions; i++) {
-        result[i] = bd.getFloat64(i * 8, Endian.little).toDouble();
-      }
-    } else {
-      // int8 -> float32 (de-quantize: value / 127.0)
-      for (int i = 0; i < dimensions; i++) {
-        result[i] = data[off + i].toSigned(8) / 127.0;
-      }
-    }
-    return result;
-  }
-
-  /// Write a float32 vector at [index].
-  ///
-  /// Uses ByteData element-wise writes for web-safe unaligned access.
-  void setVectorFromFloat32(int index, Float32List vec) {
-    final off = index * vectorSize;
-    final bd = ByteData.sublistView(data, off, off + vectorSize);
-    if (precisionIndex == 1) {
-      for (int i = 0; i < dimensions; i++) {
-        bd.setFloat32(i * 4, vec[i], Endian.little);
-      }
-    } else if (precisionIndex == 0) {
-      for (int i = 0; i < dimensions; i++) {
-        bd.setFloat64(i * 8, vec[i].toDouble(), Endian.little);
-      }
-    } else {
-      // float32 -> int8 quantize (clamp to [-1, 1], scale to [-127, 127])
-      for (int i = 0; i < dimensions; i++) {
-        final clamped = vec[i].clamp(-1.0, 1.0);
-        data[off + i] = (clamped * 127.0).round().toSigned(8).toUnsigned(8);
-      }
-    }
-  }
-
+  /// Wire layout:
+  ///   [centroidId: u32][nextPostingPackedRef: i32][dimensions: u16][slotCount: u16]
+  ///   For each slot:
+  ///     [nodeId: u32][flags: u8][offset: f32][scale: f32][sqNorm: f32][pkLen: u16][pkBytes: pkLen][sq8Codes: D bytes]
   Uint8List encodePayload() {
-    final headerLen = 8; // 2+2+1+3
-    final totalLen = headerLen + data.length;
-    final buf = Uint8List(totalLen);
+    final slotCount = slots.length;
+    int totalBytes = 12; // 4 + 4 + 2 + 2
+
+    final pks =
+        List<Uint8List>.filled(slotCount, Uint8List(0), growable: false);
+    for (int i = 0; i < slotCount; i++) {
+      final pkBytes = Uint8List.fromList(utf8.encode(slots[i].primaryKey));
+      pks[i] = pkBytes;
+      totalBytes += 19 + pkBytes.length + dimensions;
+    }
+
+    final buf = Uint8List(totalBytes);
     final bd = ByteData.sublistView(buf);
-    bd.setUint16(0, vectorCount, Endian.little);
-    bd.setUint16(2, dimensions, Endian.little);
-    buf[4] = precisionIndex;
-    // [5..7] padding
-    buf.setRange(headerLen, headerLen + data.length, data);
+
+    bd.setUint32(0, centroidId, Endian.little);
+    bd.setInt32(4, nextPostingPageNo, Endian.little);
+    bd.setUint16(8, dimensions, Endian.little);
+    bd.setUint16(10, slotCount, Endian.little);
+
+    int off = 12;
+    for (int i = 0; i < slotCount; i++) {
+      final slot = slots[i];
+      final pkBytes = pks[i];
+
+      bd.setUint32(off, slot.nodeId, Endian.little);
+      buf[off + 4] = slot.flags;
+      bd.setFloat32(off + 5, slot.offset, Endian.little);
+      bd.setFloat32(off + 9, slot.scale, Endian.little);
+      bd.setFloat32(off + 13, slot.squaredNorm, Endian.little);
+      bd.setUint16(off + 17, pkBytes.length, Endian.little);
+      off += 19;
+
+      buf.setRange(off, off + pkBytes.length, pkBytes);
+      off += pkBytes.length;
+
+      buf.setRange(off, off + dimensions, slot.sq8Codes);
+      off += dimensions;
+    }
+
     return buf;
   }
 
-  static NghRawVectorPage? tryDecodePayload(Uint8List bytes) {
-    if (bytes.length < 8) return null;
+  /// Decode posting page payload.
+  static NghPostingPage? tryDecodePayload(Uint8List bytes) {
+    if (bytes.length < 12) return null;
     final bd = ByteData.sublistView(bytes);
-    final vCount = bd.getUint16(0, Endian.little);
-    final dims = bd.getUint16(2, Endian.little);
-    final prec = bytes[4];
+
+    final cId = bd.getUint32(0, Endian.little);
+    final nextPg = bd.getInt32(4, Endian.little);
+    final dims = bd.getUint16(8, Endian.little);
+    final count = bd.getUint16(10, Endian.little);
+
     if (dims == 0) return null;
-    final bpe = prec == 0
-        ? 8
-        : prec == 2
-            ? 1
-            : 4;
-    final dataLen = vCount * dims * bpe;
-    if (bytes.length < 8 + dataLen) return null;
-    return NghRawVectorPage(
+
+    int off = 12;
+    final slots = <NghPostingSlot>[];
+
+    for (int i = 0; i < count; i++) {
+      if (off + 19 > bytes.length) break;
+      final nodeId = bd.getUint32(off, Endian.little);
+      final flags = bytes[off + 4];
+      final offset = bd.getFloat32(off + 5, Endian.little);
+      final scale = bd.getFloat32(off + 9, Endian.little);
+      final sqNorm = bd.getFloat32(off + 13, Endian.little);
+      final pkLen = bd.getUint16(off + 17, Endian.little);
+      off += 19;
+
+      if (off + pkLen + dims > bytes.length) break;
+
+      final pk = utf8.decode(bytes.sublist(off, off + pkLen));
+      off += pkLen;
+
+      final sq8Codes = Uint8List.fromList(bytes.sublist(off, off + dims));
+      off += dims;
+
+      slots.add(NghPostingSlot(
+        nodeId: nodeId,
+        flags: flags,
+        primaryKey: pk,
+        sq8Codes: sq8Codes,
+        offset: offset,
+        scale: scale,
+        squaredNorm: sqNorm,
+      ));
+    }
+
+    return NghPostingPage(
+      centroidId: cId,
+      nextPostingPageNo: nextPg,
       dimensions: dims,
-      precisionIndex: prec,
-      data: Uint8List.fromList(bytes.sublist(8, 8 + dataLen)),
-      vectorCount: vCount,
+      slots: slots,
     );
   }
 
-  int estimatePayloadSize() => 8 + data.length;
+  int estimatePayloadSize() {
+    int size = 12;
+    for (final s in slots) {
+      size += 19 + s.primaryKey.length * 2 + dimensions;
+    }
+    return size;
+  }
 }
 
 // ============================================================================
-// NGH Codebook Page -- PQ Centroid Vectors
+// NGH Navigating Centroid Graph Page
 // ============================================================================
 
-/// Stores PQ codebook for one or more sub-spaces.
-///
-/// Payload layout:
-///   [subspaceStart:u16] -- first sub-space index stored in this page
-///   [subspaceCount:u16] -- number of sub-spaces in this page
-///   [centroidsPerSubspace:u16] -- K (typically 256)
-///   [subspaceDimensions:u16]   -- D/M (dimensions per sub-space)
-///   [centroids: subspaceCount x K x (D/M) x 4 bytes (float32)]
-final class NghCodebookPage {
-  /// First sub-space index (for multi-page codebooks).
-  final int subspaceStart;
+/// A centroid node in the navigating graph.
+final class NghNavCentroidNode {
+  /// Centroid identifier (0..K-1).
+  final int centroidId;
 
-  /// Number of sub-spaces stored in this page.
-  final int subspaceCount;
+  /// Centroid vector (Float32List of length [dimensions]).
+  final Float32List vector;
 
-  /// Number of centroids per sub-space (typically 256).
-  final int centroidsPerSubspace;
+  /// Head posting page packed ref (`partitionNo<<20|pageNo`), or -1.
+  int headPostingPageNo;
 
-  /// Dimensions per sub-space (D / M).
-  final int subspaceDimensions;
+  /// Tail posting page packed ref (`partitionNo<<20|pageNo`), or -1.
+  int tailPostingPageNo;
 
-  /// Centroid data, packed as float32.
-  /// Layout: [sub0_cent0 ... sub0_centK-1][sub1_cent0 ...]...
-  /// Total: subspaceCount x centroidsPerSubspace x subspaceDimensions floats.
-  final Float32List centroids;
+  /// Total number of active vectors belonging to this cluster.
+  int entryCount;
 
-  NghCodebookPage({
-    required this.subspaceStart,
-    required this.subspaceCount,
-    required this.centroidsPerSubspace,
-    required this.subspaceDimensions,
+  /// Out-degree and neighbor centroid IDs in the navigating graph.
+  final List<int> neighbors;
+
+  /// All physical inverted posting page packed refs for this cluster.
+  final List<int> postingPageNos;
+
+  NghNavCentroidNode({
+    required this.centroidId,
+    required this.vector,
+    this.headPostingPageNo = -1,
+    this.tailPostingPageNo = -1,
+    this.entryCount = 0,
+    List<int>? neighbors,
+    List<int>? postingPageNos,
+  })  : neighbors = neighbors ?? [],
+        postingPageNos = postingPageNos ??
+            (headPostingPageNo > 0
+                ? (headPostingPageNo == tailPostingPageNo ||
+                        tailPostingPageNo <= 0
+                    ? [headPostingPageNo]
+                    : [headPostingPageNo, tailPostingPageNo])
+                : []);
+}
+
+/// A serialized page of navigating centroid graph nodes.
+final class NghNavGraphPage {
+  final int dimensions;
+  final List<NghNavCentroidNode> centroids;
+
+  NghNavGraphPage({
+    required this.dimensions,
     required this.centroids,
   });
 
-  /// Get centroid vector for sub-space [m], centroid [k].
-  /// Returns a sub-list view (safe on all platforms since [centroids] is aligned).
-  Float32List getCentroid(int m, int k) {
-    final offset = (m * centroidsPerSubspace + k) * subspaceDimensions;
-    return centroids.sublist(offset, offset + subspaceDimensions);
-  }
-
   Uint8List encodePayload() {
-    final headerLen = 8; // 4 x u16
-    final floatCount =
-        subspaceCount * centroidsPerSubspace * subspaceDimensions;
-    final dataBytes = floatCount * 4;
-    final buf = Uint8List(headerLen + dataBytes);
-    final bd = ByteData.sublistView(buf);
-    bd.setUint16(0, subspaceStart, Endian.little);
-    bd.setUint16(2, subspaceCount, Endian.little);
-    bd.setUint16(4, centroidsPerSubspace, Endian.little);
-    bd.setUint16(6, subspaceDimensions, Endian.little);
-    // Write centroid floats element-wise for web-safe unaligned access
-    for (int i = 0; i < floatCount; i++) {
-      bd.setFloat32(headerLen + i * 4, centroids[i], Endian.little);
+    final count = centroids.length;
+    int totalBytes = 4; // dims: u16, count: u16
+
+    for (final c in centroids) {
+      totalBytes += (4 +
+          4 +
+          4 +
+          4 +
+          dimensions * 4 +
+          2 +
+          c.neighbors.length * 2 +
+          2 +
+          c.postingPageNos.length * 4);
     }
+
+    final buf = Uint8List(totalBytes);
+    final bd = ByteData.sublistView(buf);
+
+    bd.setUint16(0, dimensions, Endian.little);
+    bd.setUint16(2, count, Endian.little);
+
+    int off = 4;
+    for (final c in centroids) {
+      bd.setUint32(off, c.centroidId, Endian.little);
+      bd.setInt32(off + 4, c.headPostingPageNo, Endian.little);
+      bd.setInt32(off + 8, c.tailPostingPageNo, Endian.little);
+      bd.setInt32(off + 12, c.entryCount, Endian.little);
+      off += 16;
+
+      for (int d = 0; d < dimensions; d++) {
+        bd.setFloat32(off, c.vector[d], Endian.little);
+        off += 4;
+      }
+
+      final nLen = c.neighbors.length;
+      bd.setUint16(off, nLen, Endian.little);
+      off += 2;
+
+      for (int n = 0; n < nLen; n++) {
+        bd.setUint16(off, c.neighbors[n], Endian.little);
+        off += 2;
+      }
+
+      final pLen = c.postingPageNos.length;
+      bd.setUint16(off, pLen, Endian.little);
+      off += 2;
+
+      for (int p = 0; p < pLen; p++) {
+        bd.setInt32(off, c.postingPageNos[p], Endian.little);
+        off += 4;
+      }
+    }
+
     return buf;
   }
 
-  static NghCodebookPage? tryDecodePayload(Uint8List bytes) {
-    if (bytes.length < 8) return null;
+  static NghNavGraphPage? tryDecodePayload(Uint8List bytes) {
+    if (bytes.length < 4) return null;
     final bd = ByteData.sublistView(bytes);
-    final start = bd.getUint16(0, Endian.little);
+
+    final dims = bd.getUint16(0, Endian.little);
     final count = bd.getUint16(2, Endian.little);
-    final k = bd.getUint16(4, Endian.little);
-    final sDim = bd.getUint16(6, Endian.little);
-    if (count == 0 || k == 0 || sDim == 0) return null;
-    final floatCount = count * k * sDim;
-    final dataBytes = floatCount * 4;
-    if (bytes.length < 8 + dataBytes) return null;
-    // Copy to aligned float32 buffer
-    final aligned = Float32List(floatCount);
-    final srcBd = ByteData.sublistView(bytes, 8, 8 + dataBytes);
-    for (int i = 0; i < floatCount; i++) {
-      aligned[i] = srcBd.getFloat32(i * 4, Endian.little);
+    if (dims == 0) return null;
+
+    int off = 4;
+    final list = <NghNavCentroidNode>[];
+
+    for (int i = 0; i < count; i++) {
+      if (off + 16 > bytes.length) break;
+      final cId = bd.getUint32(off, Endian.little);
+      final headPg = bd.getInt32(off + 4, Endian.little);
+      final tailPg = bd.getInt32(off + 8, Endian.little);
+      final countEntries = bd.getInt32(off + 12, Endian.little);
+      off += 16;
+
+      if (off + dims * 4 + 2 > bytes.length) break;
+      final vec = Float32List(dims);
+      for (int d = 0; d < dims; d++) {
+        vec[d] = bd.getFloat32(off, Endian.little);
+        off += 4;
+      }
+
+      final nLen = bd.getUint16(off, Endian.little);
+      off += 2;
+
+      if (off + nLen * 2 > bytes.length) break;
+      final neighbors = <int>[];
+      for (int n = 0; n < nLen; n++) {
+        neighbors.add(bd.getUint16(off, Endian.little));
+        off += 2;
+      }
+
+      final postingPageNos = <int>[];
+      if (off + 2 <= bytes.length) {
+        final pLen = bd.getUint16(off, Endian.little);
+        off += 2;
+        if (off + pLen * 4 <= bytes.length) {
+          for (int p = 0; p < pLen; p++) {
+            postingPageNos.add(bd.getInt32(off, Endian.little));
+            off += 4;
+          }
+        }
+      }
+
+      if (postingPageNos.isEmpty && headPg > 0) {
+        postingPageNos.add(headPg);
+        if (tailPg > 0 && tailPg != headPg) {
+          postingPageNos.add(tailPg);
+        }
+      }
+
+      list.add(NghNavCentroidNode(
+        centroidId: cId,
+        vector: vec,
+        headPostingPageNo: headPg,
+        tailPostingPageNo: tailPg,
+        entryCount: countEntries,
+        neighbors: neighbors,
+        postingPageNos: postingPageNos,
+      ));
     }
-    return NghCodebookPage(
-      subspaceStart: start,
-      subspaceCount: count,
-      centroidsPerSubspace: k,
-      subspaceDimensions: sDim,
-      centroids: aligned,
-    );
+
+    return NghNavGraphPage(dimensions: dims, centroids: list);
   }
 
-  int estimatePayloadSize() =>
-      8 + subspaceCount * centroidsPerSubspace * subspaceDimensions * 4;
+  int estimatePayloadSize() {
+    int size = 4;
+    for (final c in centroids) {
+      size += 18 + dimensions * 4 + c.neighbors.length * 2;
+    }
+    return size;
+  }
 }
 
 // ============================================================================
@@ -563,27 +484,15 @@ final class NghPageSizer {
   /// Safety margin for encoding/encryption overhead (header, padding, etc).
   static const int encodingSafetyMargin = 64;
 
-  /// Compute how many graph node slots fit in one page.
-  static int nodesPerGraphPage(int pageSize, int maxDegree) {
-    final slotSize = 2 + maxDegree * 4; // flags(1) + degree(1) + R*4
-    final usable = pageSize -
-        pageHeaderSize -
-        4 -
-        encodingSafetyMargin; // 4 = page-level header
-    return usable > 0 ? usable ~/ slotSize : 0;
-  }
-
-  /// Compute how many PQ code entries fit in one page.
-  static int vectorsPerPqPage(int pageSize, int pqSubspaces) {
-    final usable = pageSize - pageHeaderSize - 4 - encodingSafetyMargin;
-    return usable > 0 ? usable ~/ pqSubspaces : 0;
-  }
-
-  /// Compute how many raw vectors fit in one page.
-  static int vectorsPerRawPage(int pageSize, int dimensions, int bpe) {
-    final usable = pageSize - pageHeaderSize - 8 - encodingSafetyMargin;
-    final vecSize = dimensions * bpe;
-    return (usable > 0 && vecSize > 0) ? usable ~/ vecSize : 0;
+  /// Compute how many posting slots can fit in one page for a given average PK length.
+  static int estimatePostingSlotsPerPage(
+    int pageSize,
+    int dimensions, {
+    int avgPkLength = 16,
+  }) {
+    final slotSize = 19 + avgPkLength + dimensions;
+    final usable = pageSize - pageHeaderSize - 12 - encodingSafetyMargin;
+    return usable > 0 ? (usable ~/ slotSize).clamp(1, 1024) : 1;
   }
 
   /// Estimate file size given page count and page size.
@@ -594,23 +503,5 @@ final class NghPageSizer {
   /// Whether the encoded payload fits within the page.
   static bool fitsInPage(int payloadSize, int pageSize) {
     return (pageHeaderSize + payloadSize) <= pageSize;
-  }
-
-  /// Compute how many sub-spaces fit in one codebook page.
-  /// Returns 0 if even a single sub-space exceeds page capacity.
-  static int subspacesPerCodebookPage(
-    int pageSize,
-    int centroidsPerSubspace,
-    int subspaceDimensions,
-  ) {
-    final headerLen = 8; // codebook page header
-    // Codebook pages are generally not encrypted but we keep the margin for safety
-    final usable = pageSize - pageHeaderSize - headerLen - encodingSafetyMargin;
-    if (usable <= 0) return 0;
-    final bytesPerSubspace = centroidsPerSubspace * subspaceDimensions * 4;
-    if (bytesPerSubspace <= 0) return 0;
-    // Must fit at least one sub-space
-    if (bytesPerSubspace > usable) return 0;
-    return usable ~/ bytesPerSubspace;
   }
 }

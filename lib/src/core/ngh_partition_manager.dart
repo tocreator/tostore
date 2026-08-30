@@ -3,23 +3,21 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
-import '../interface/storage_interface.dart';
+import '../handler/logger.dart';
 import '../handler/meta_binary_codec.dart';
 import '../handler/parallel_processor.dart';
+import '../interface/storage_interface.dart';
 import '../model/data_store_config.dart';
-import '../model/db_exception.dart';
 import '../model/ngh_index_meta.dart';
 import '../model/parallel_journal_entry.dart';
-import '../model/result_status.dart';
-import '../model/result_type.dart';
 import '../model/table_context.dart';
+import '../model/table_identity.dart';
 import 'btree_page.dart';
 import 'data_store_impl.dart';
 import 'ngh_page.dart';
 import 'tree_cache.dart';
 import 'workload_scheduler.dart';
 import 'yield_controller.dart';
-import '../model/table_identity.dart';
 
 // ============================================================================
 // NGH Partition Manager
@@ -37,20 +35,47 @@ import '../model/table_identity.dart';
 
 /// Category of NGH partition data.
 enum NghDataCategory {
-  graph, // 0
-  pqCode, // 1
-  rawVector, // 2
+  posting,
 }
 
 /// Identifies a physical page location.
+///
+/// On-disk centroid/chain refs pack `(partitionNo, pageNo)` into a single i32
+/// via [packRef] / [unpackRef] (same layout as the in-memory cache key).
+/// Legacy bare pageNos decode as partition 0.
 final class NghPagePtr {
+  /// Low bits reserved for pageNo in packed refs / cache keys.
+  static const int pageNoBits = 20;
+  static const int pageNoMask = (1 << pageNoBits) - 1;
+
   final NghDataCategory category;
   final int partitionNo;
   final int pageNo;
 
   const NghPagePtr(this.category, this.partitionNo, this.pageNo);
-  static const NghPagePtr nullPtr = NghPagePtr(NghDataCategory.graph, -1, -1);
+  static const NghPagePtr nullPtr = NghPagePtr(NghDataCategory.posting, -1, -1);
   bool get isNull => partitionNo < 0 || pageNo < 0;
+
+  /// Packed `(partitionNo << 20) | pageNo` for nav-graph / chain fields.
+  /// Sentinels (`<= 0`) are returned unchanged.
+  int get packedRef => packRef(partitionNo, pageNo);
+
+  factory NghPagePtr.fromPacked(NghDataCategory category, int packed) {
+    final (part, page) = unpackRef(packed);
+    return NghPagePtr(category, part, page);
+  }
+
+  /// Pack partition+page into one i32. Values `<= 0` pass through as sentinels.
+  static int packRef(int partitionNo, int pageNo) {
+    if (pageNo <= 0) return pageNo;
+    return (partitionNo << pageNoBits) | (pageNo & pageNoMask);
+  }
+
+  /// Unpack a packed ref. Sentinels (`<= 0`) yield `(-1, packed)`.
+  static (int partitionNo, int pageNo) unpackRef(int packed) {
+    if (packed <= 0) return (-1, packed);
+    return (packed >> pageNoBits, packed & pageNoMask);
+  }
 
   @override
   String toString() => 'NghPagePtr(${category.name}, p$partitionNo, pg$pageNo)';
@@ -85,17 +110,8 @@ final class NghPartitionManager {
   final DataStoreImpl _dataStore;
 
   // -- Page Caches --
-  // Graph pages are accessed randomly during beam search -> LRU cache critical.
-  late final TreeCache<NghGraphPage> _graphPageCache;
-
-  // PQ code pages are scanned sequentially; caching still helps for warm queries.
-  late final TreeCache<NghPqCodePage> _pqCodePageCache;
-
-  // Raw vector pages are loaded on demand for re-ranking; moderate cache.
-  late final TreeCache<NghRawVectorPage> _rawVectorPageCache;
-
-  /// In-flight preload future per index; concurrent queries await the same future.
-  final Map<String, Future<void>> _preloadFutures = {};
+  // Inverted posting pages with inlined SQ8 vector slots.
+  late final TreeCache<NghPostingPage> _postingPageCache;
 
   NghPartitionManager(this._dataStore) {
     final indexBudget =
@@ -106,202 +122,252 @@ final class NghPartitionManager {
   int get configuredPageSize => _dataStore.configuredPageSize;
 
   void _initCaches(int indexBudget) {
-    final nghBudget = (indexBudget * 0.15).round();
+    final nghBudget = (indexBudget * 0.60).round();
     final int minThreshold = 50 * 1024 * 1024;
-    _graphPageCache = TreeCache<NghGraphPage>(
-      sizeCalculator: (page) => page.estimatePayloadSize() + 64,
-      maxByteThreshold: nghBudget,
-      minByteThreshold: minThreshold,
-      groupDepth: 2,
-      debugLabel: 'NghGraphPageCache',
-    );
-    _pqCodePageCache = TreeCache<NghPqCodePage>(
+    _postingPageCache = TreeCache<NghPostingPage>(
       sizeCalculator: (page) => page.estimatePayloadSize() + 32,
       maxByteThreshold: nghBudget,
       minByteThreshold: minThreshold,
       groupDepth: 2,
-      debugLabel: 'NghPqCodePageCache',
-    );
-    _rawVectorPageCache = TreeCache<NghRawVectorPage>(
-      sizeCalculator: (page) => page.estimatePayloadSize() + 32,
-      maxByteThreshold: nghBudget,
-      minByteThreshold: minThreshold,
-      groupDepth: 2,
-      debugLabel: 'NghRawVectorPageCache',
+      debugLabel: 'NghPostingPageCache',
     );
   }
 
-  // =====================================================================
-  // Page Reading (with cache hierarchy: local -> instance -> disk)
-  // =====================================================================
-
-  /// Read a graph page from cache or disk.
-  Future<NghGraphPage> readGraphPage(
+  /// Delete all physical files and directories belonging to a vector index.
+  Future<void> deletePhysicalIndexArtifacts(
     TableContext table,
     IndexUid indexUid,
-    NghIndexMeta meta,
-    int partitionNo,
-    int pageNo, {
-    Map<int, NghGraphPage>? localCache,
-  }) async {
-    final tableUid = table.tableUid;
-    final cacheKey = _cacheKey(partitionNo, pageNo);
+  ) async {
+    _postingPageCache.remove([table.tableUid, indexUid]);
 
-    // 1. Local batch cache
-    if (localCache != null) {
-      final cached = localCache[cacheKey];
-      if (cached != null) return cached;
+    final basePath =
+        _dataStore.pathManager.getIndexPathByContext(table, indexUid);
+    if (await _dataStore.storage.existsDirectory(basePath)) {
+      await _dataStore.storage.deleteDirectory(basePath);
     }
-
-    // 2. Instance cache
-    final cached =
-        _graphPageCache.getPoint4(tableUid, indexUid, partitionNo, pageNo);
-    if (cached != null) return cached;
-
-    // When index is marked fully cached, do not fall back to disk
-    if (_graphPageCache.isFullyCached(_indexPrefix(tableUid, indexUid))) {
-      return NghGraphPage.empty(
-          maxDegree: meta.maxDegree,
-          slotCount: meta.nodesPerGraphPage(_dataStore.configuredPageSize));
-    }
-
-    // 3. Disk read
-    final path = _dataStore.pathManager
-        .getNghGraphPartitionPathByContext(table, indexUid, partitionNo);
-    final raw = await _dataStore.storage.readAsBytesAt(
-        path, pageNo * _dataStore.configuredPageSize,
-        length: _dataStore.configuredPageSize);
-    if (raw.isEmpty) {
-      // Return empty page
-      return NghGraphPage.empty(
-          maxDegree: meta.maxDegree,
-          slotCount: meta.nodesPerGraphPage(_dataStore.configuredPageSize));
-    }
-    final parsed = BTreePageIO.parsePageBytes(raw);
-    final page =
-        NghGraphPage.tryDecodePayload(_decodePayload(parsed.encodedPayload));
-    if (page == null) {
-      return NghGraphPage.empty(
-          maxDegree: meta.maxDegree,
-          slotCount: meta.nodesPerGraphPage(_dataStore.configuredPageSize));
-    }
-    _graphPageCache.putPoint4(tableUid, indexUid, partitionNo, pageNo, page);
-    return page;
   }
 
   /// Clear all in-memory caches and reset state.
   Future<void> dispose() async {
-    if (_preloadFutures.isNotEmpty) {
+    _postingPageCache.clear();
+  }
+
+  /// Synchronous memory cache lookup for an inverted posting page (0 I/O).
+  NghPostingPage? getCachedPostingPage(
+    TableUid tableUid,
+    IndexUid indexUid,
+    int partitionNo,
+    int pageNo,
+  ) {
+    return _postingPageCache.getPoint4(tableUid, indexUid, partitionNo, pageNo);
+  }
+
+  /// Read an inverted posting page from cache or disk.
+  Future<NghPostingPage?> readPostingPage(
+    TableContext table,
+    IndexUid indexUid,
+    NghIndexMeta meta,
+    int partitionNo,
+    int pageNo, {
+    Map<int, NghPostingPage>? localCache,
+  }) async {
+    final tableUid = table.tableUid;
+    final cacheKey = _cacheKey(partitionNo, pageNo);
+
+    if (localCache != null) {
+      final cached = localCache[cacheKey];
+      if (cached != null) return cached;
+    }
+
+    final cached =
+        _postingPageCache.getPoint4(tableUid, indexUid, partitionNo, pageNo);
+    if (cached != null) return cached;
+
+    final path = _dataStore.pathManager
+        .getNghPostingPartitionPathByContext(table, indexUid, partitionNo);
+    try {
+      final raw = await _dataStore.storage.readAsBytesAt(
+          path, pageNo * _dataStore.configuredPageSize,
+          length: _dataStore.configuredPageSize);
+      if (raw.isEmpty) return null;
+
+      final parsed = BTreePageIO.parsePageBytes(raw);
+      final page = NghPostingPage.tryDecodePayload(
+          _decodePayload(parsed.encodedPayload));
+      if (page == null) return null;
+
+      _postingPageCache.putPoint4(
+          tableUid, indexUid, partitionNo, pageNo, page);
+      return page;
+    } catch (e) {
+      Logger.warn(
+        'NGH posting page corrupted or torn at partition $partitionNo, page $pageNo for index "$indexUid". Gracefully degrading to null.',
+        rawError: e,
+      );
+      return null;
+    }
+  }
+
+  /// Read specific posting pages by packed refs, grouped by partition for parallel I/O.
+  ///
+  /// Each entry in [packedRefs] is `partitionNo<<20|pageNo` (legacy bare pageNo = p0).
+  Future<List<({int packedRef, NghPostingPage page})>> readPostingPagesBatch(
+    TableContext table,
+    IndexUid indexUid,
+    NghIndexMeta meta,
+    List<int> packedRefs, {
+    Map<int, NghPostingPage>? localCache,
+  }) async {
+    if (packedRefs.isEmpty) return const [];
+    final results = <({int packedRef, NghPostingPage page})>[];
+    // partitionNo -> packed refs still needing disk I/O
+    final missingByPartition = <int, List<int>>{};
+
+    for (final packed in packedRefs) {
+      if (packed <= 0) continue;
+      final (part, pageNo) = NghPagePtr.unpackRef(packed);
+      if (pageNo <= 0) continue;
+
+      final local = localCache?[packed];
+      if (local != null) {
+        results.add((packedRef: packed, page: local));
+        continue;
+      }
+      final cached =
+          _postingPageCache.getPoint4(table.tableUid, indexUid, part, pageNo);
+      if (cached != null) {
+        results.add((packedRef: packed, page: cached));
+        continue;
+      }
+      missingByPartition.putIfAbsent(part, () => <int>[]).add(packed);
+    }
+
+    if (missingByPartition.isEmpty) return results;
+
+    final pageSize = _dataStore.configuredPageSize;
+    final tableUid = table.tableUid;
+    final yc = YieldController(
+      'NghPartitionManager.readPostingPagesBatch',
+      checkInterval: 2,
+      budgetMs: 20,
+    );
+
+    for (final entry in missingByPartition.entries) {
+      final y = yc.maybeYield();
+      if (y != null) await y;
+
+      final part = entry.key;
+      final missingPacked = entry.value;
+      final path = _dataStore.pathManager
+          .getNghPostingPartitionPathByContext(table, indexUid, part);
+      final ranges = <ByteReadRange>[
+        for (final packed in missingPacked)
+          ByteReadRange(
+            offset: NghPagePtr.unpackRef(packed).$2 * pageSize,
+            length: pageSize,
+          ),
+      ];
+
+      final rawBlocks =
+          await _dataStore.storage.readManyAsBytesAt(path, ranges);
+
+      for (int i = 0; i < missingPacked.length; i++) {
+        final packed = missingPacked[i];
+        final pageNo = NghPagePtr.unpackRef(packed).$2;
+        final raw = (i < rawBlocks.length) ? rawBlocks[i] : Uint8List(0);
+        if (raw.isEmpty) continue;
+        try {
+          final parsed = BTreePageIO.parsePageBytes(raw);
+          final page = NghPostingPage.tryDecodePayload(
+              _decodePayload(parsed.encodedPayload));
+          if (page != null) {
+            _postingPageCache.putPoint4(tableUid, indexUid, part, pageNo, page);
+            localCache?[packed] = page;
+            results.add((packedRef: packed, page: page));
+          }
+        } catch (_) {}
+      }
+    }
+    return results;
+  }
+
+  /// Read the entire posting cluster chain starting at [headPackedRef].
+  Future<List<({int packedRef, NghPostingPage page})>> readPostingCluster(
+    TableContext table,
+    IndexUid indexUid,
+    NghIndexMeta meta,
+    int headPackedRef, {
+    Map<int, NghPostingPage>? localCache,
+  }) async {
+    if (headPackedRef <= 0) return const [];
+    final pages = <({int packedRef, NghPostingPage page})>[];
+    int current = headPackedRef;
+    final visited = <int>{};
+
+    while (current > 0 && !visited.contains(current)) {
+      visited.add(current);
+      final (part, pageNo) = NghPagePtr.unpackRef(current);
+      if (pageNo <= 0) break;
+      final pg = await readPostingPage(
+        table,
+        indexUid,
+        meta,
+        part,
+        pageNo,
+        localCache: localCache,
+      );
+      if (pg == null) break;
+      pages.add((packedRef: current, page: pg));
+      current = pg.nextPostingPageNo;
+    }
+    return pages;
+  }
+
+  /// Batch read multiple posting clusters in parallel or sequentially.
+  Future<List<List<({int packedRef, NghPostingPage page})>>>
+      readPostingClustersBatch(
+    TableContext table,
+    IndexUid indexUid,
+    NghIndexMeta meta,
+    List<int> headPackedRefs, {
+    Map<int, NghPostingPage>? localCache,
+    int concurrency = 4,
+  }) async {
+    if (headPackedRefs.isEmpty) return const [];
+    final tasks = [
+      for (final headRef in headPackedRefs)
+        () => readPostingCluster(table, indexUid, meta, headRef,
+            localCache: localCache),
+    ];
+    final res = await ParallelProcessor.execute<
+        List<({int packedRef, NghPostingPage page})>>(
+      tasks,
+      concurrency: min(concurrency, tasks.length),
+      label: 'readPostingClustersBatch',
+    );
+    return res
+        .whereType<List<({int packedRef, NghPostingPage page})>>()
+        .toList();
+  }
+
+  /// Read the navigating centroid graph from disk.
+  Future<NghNavGraphPage?> readNavGraph(
+    TableContext table,
+    IndexUid indexUid,
+  ) async {
+    final path =
+        _dataStore.pathManager.getNghNavGraphPathByContext(table, indexUid);
+    final bytes = await _dataStore.storage.readAsBytes(path);
+    if (bytes.isEmpty) return null;
+
+    if (bytes.length >= 20 && bytes[0] == 0x54 && bytes[1] == 0x53) {
       try {
-        await Future.wait(_preloadFutures.values);
+        final parsed = BTreePageIO.parsePageBytes(bytes);
+        return NghNavGraphPage.tryDecodePayload(
+            _decodePayload(parsed.encodedPayload));
       } catch (_) {}
     }
-    _graphPageCache.clear();
-    _pqCodePageCache.clear();
-    _rawVectorPageCache.clear();
-    _preloadFutures.clear();
-  }
-
-  /// Read a PQ-code page from cache or disk.
-  Future<NghPqCodePage> readPqCodePage(
-    TableContext table,
-    IndexUid indexUid,
-    NghIndexMeta meta,
-    int partitionNo,
-    int pageNo, {
-    Map<int, NghPqCodePage>? localCache,
-  }) async {
-    final tableUid = table.tableUid;
-    final cacheKey = _cacheKey(partitionNo, pageNo);
-
-    if (localCache != null) {
-      final cached = localCache[cacheKey];
-      if (cached != null) return cached;
-    }
-
-    final cached =
-        _pqCodePageCache.getPoint4(tableUid, indexUid, partitionNo, pageNo);
-    if (cached != null) return cached;
-
-    if (_pqCodePageCache.isFullyCached(_indexPrefix(tableUid, indexUid))) {
-      return NghPqCodePage.empty(
-          pqSubspaces: meta.pqSubspaces,
-          capacity: meta.vectorsPerPqPage(_dataStore.configuredPageSize));
-    }
-
-    final path = _dataStore.pathManager
-        .getNghPqCodePartitionPathByContext(table, indexUid, partitionNo);
-    final raw = await _dataStore.storage.readAsBytesAt(
-        path, pageNo * _dataStore.configuredPageSize,
-        length: _dataStore.configuredPageSize);
-    if (raw.isEmpty) {
-      return NghPqCodePage.empty(
-          pqSubspaces: meta.pqSubspaces,
-          capacity: meta.vectorsPerPqPage(_dataStore.configuredPageSize));
-    }
-    final parsed = BTreePageIO.parsePageBytes(raw);
-    final page =
-        NghPqCodePage.tryDecodePayload(_decodePayload(parsed.encodedPayload));
-    if (page == null) {
-      return NghPqCodePage.empty(
-          pqSubspaces: meta.pqSubspaces,
-          capacity: meta.vectorsPerPqPage(_dataStore.configuredPageSize));
-    }
-    _pqCodePageCache.putPoint4(tableUid, indexUid, partitionNo, pageNo, page);
-    return page;
-  }
-
-  /// Read a raw-vector page from cache or disk.
-  Future<NghRawVectorPage> readRawVectorPage(
-    TableContext table,
-    IndexUid indexUid,
-    NghIndexMeta meta,
-    int partitionNo,
-    int pageNo, {
-    Map<int, NghRawVectorPage>? localCache,
-  }) async {
-    final tableUid = table.tableUid;
-    final cacheKey = _cacheKey(partitionNo, pageNo);
-
-    if (localCache != null) {
-      final cached = localCache[cacheKey];
-      if (cached != null) return cached;
-    }
-
-    final cached =
-        _rawVectorPageCache.getPoint4(tableUid, indexUid, partitionNo, pageNo);
-    if (cached != null) return cached;
-
-    if (_rawVectorPageCache.isFullyCached(_indexPrefix(tableUid, indexUid))) {
-      return NghRawVectorPage.empty(
-          dimensions: meta.dimensions,
-          precisionIndex: meta.precision.index,
-          capacity: meta.vectorsPerRawPage(_dataStore.configuredPageSize));
-    }
-
-    final path = _dataStore.pathManager
-        .getNghRawVectorPartitionPathByContext(table, indexUid, partitionNo);
-    final raw = await _dataStore.storage.readAsBytesAt(
-        path, pageNo * _dataStore.configuredPageSize,
-        length: _dataStore.configuredPageSize);
-    if (raw.isEmpty) {
-      return NghRawVectorPage.empty(
-          dimensions: meta.dimensions,
-          precisionIndex: meta.precision.index,
-          capacity: meta.vectorsPerRawPage(_dataStore.configuredPageSize));
-    }
-    final parsed = BTreePageIO.parsePageBytes(raw);
-    final page = NghRawVectorPage.tryDecodePayload(
-        _decodePayload(parsed.encodedPayload));
-    if (page == null) {
-      return NghRawVectorPage.empty(
-          dimensions: meta.dimensions,
-          precisionIndex: meta.precision.index,
-          capacity: meta.vectorsPerRawPage(_dataStore.configuredPageSize));
-    }
-    _rawVectorPageCache.putPoint4(
-        tableUid, indexUid, partitionNo, pageNo, page);
-    return page;
+    return NghNavGraphPage.tryDecodePayload(bytes);
   }
 
   // =====================================================================
@@ -312,113 +378,10 @@ final class NghPartitionManager {
   List<dynamic> _indexPrefix(TableUid tableUid, IndexUid indexUid) =>
       [tableUid, indexUid];
 
-  /// Whether this index is already marked fully cached (skip preload).
-  bool isFullyCachedForIndex(TableUid tableUid, IndexUid indexUid) {
-    final prefix = _indexPrefix(tableUid, indexUid);
-    return _graphPageCache.isFullyCached(prefix);
-  }
-
-  /// Lazy preload: fire-and-forget. Loads graph + PQ pages in background using
-  /// [WorkloadType.maintenance] and [ParallelProcessor]. Schedules work in a
-  /// microtask so the caller is not blocked by any computation.
-  Future<void> preloadForVectorSearch(
-    TableContext table,
-    IndexUid indexUid,
-    NghIndexMeta meta,
-  ) {
-    final tableUid = table.tableUid;
-    return Future.microtask(() {
-      final prefix = _indexPrefix(tableUid, indexUid);
-      if (_graphPageCache.isFullyCached(prefix)) return;
-      if (meta.totalVectors <= 0) return;
-      final indexBudget =
-          _dataStore.resourceManager?.getIndexCacheSize() ?? (64 * 1024 * 1024);
-      final nghBudget = (indexBudget * 0.15).round();
-      // Use single-cache budget so preloaded data fits in each of graph/pq
-      // caches and is not evicted by cleanup (each cache has max nghBudget).
-      if (meta.totalSizeBytes <= 0 || meta.totalSizeBytes > nghBudget) {
-        return;
-      }
-
-      final key = '$tableUid/$indexUid';
-      if (_preloadFutures.containsKey(key)) return;
-
-      final future = _doPreloadForVectorSearch(table, indexUid, meta)
-          .whenComplete(() => _preloadFutures.remove(key));
-      _preloadFutures[key] = future;
-    });
-  }
-
-  Future<void> _doPreloadForVectorSearch(
-    TableContext table,
-    IndexUid indexUid,
-    NghIndexMeta meta,
-  ) async {
-    final tableUid = table.tableUid;
-    WorkloadLease? lease;
-    try {
-      lease = await _dataStore.workloadScheduler.acquire(
-        WorkloadType.maintenance,
-        requestedTokens: _dataStore.workloadScheduler
-            .capacityTokens(WorkloadType.maintenance),
-        minTokens: 1,
-        label: 'NghPartitionManager.preload',
-      );
-    } catch (_) {
-      lease = null;
-    }
-
-    final concurrency = lease?.asConcurrency(0.3).clamp(1, 16) ?? 4;
-    const firstData = NghIndexMeta.firstDataPageNo;
-    final n = meta.totalVectors;
-    final graphPages =
-        (n + meta.nodesPerGraphPage(_dataStore.configuredPageSize) - 1) ~/
-            meta.nodesPerGraphPage(_dataStore.configuredPageSize);
-    final pqPages =
-        (n + meta.vectorsPerPqPage(_dataStore.configuredPageSize) - 1) ~/
-            meta.vectorsPerPqPage(_dataStore.configuredPageSize);
-
-    final graphTasks = <Future<void> Function()>[];
-    for (int logicalPage = 0; logicalPage < graphPages; logicalPage++) {
-      final partitionNo = logicalPage ~/
-          meta.graphPagesPerPartition(_dataStore.configuredPageSize);
-      final pageNo = firstData +
-          (logicalPage %
-              meta.graphPagesPerPartition(_dataStore.configuredPageSize));
-      graphTasks.add(() async {
-        await readGraphPage(table, indexUid, meta, partitionNo, pageNo);
-      });
-    }
-    final pqTasks = <Future<void> Function()>[];
-    for (int logicalPage = 0; logicalPage < pqPages; logicalPage++) {
-      final partitionNo = logicalPage ~/
-          meta.pqCodePagesPerPartition(_dataStore.configuredPageSize);
-      final pageNo = firstData +
-          (logicalPage %
-              meta.pqCodePagesPerPartition(_dataStore.configuredPageSize));
-      pqTasks.add(() async {
-        await readPqCodePage(table, indexUid, meta, partitionNo, pageNo);
-      });
-    }
-
-    await ParallelProcessor.execute<void>(
-      [...graphTasks, ...pqTasks],
-      concurrency: concurrency,
-      label: 'ngh_preload',
-    );
-
-    final prefix = _indexPrefix(tableUid, indexUid);
-    _graphPageCache.setFullyCached(prefix, true);
-    _pqCodePageCache.setFullyCached(prefix, true);
-    lease?.release();
-  }
-
-  /// Clear fully-cached markers for an index after write (next search may preload again).
+  /// Clear fully-cached markers for an index after write.
   void clearFullyCachedForIndex(TableUid tableUid, IndexUid indexUid) {
     final prefix = _indexPrefix(tableUid, indexUid);
-    _graphPageCache.setFullyCached(prefix, false);
-    _pqCodePageCache.setFullyCached(prefix, false);
-    _rawVectorPageCache.setFullyCached(prefix, false);
+    _postingPageCache.setFullyCached(prefix, false);
   }
 
   // =====================================================================
@@ -430,18 +393,12 @@ final class NghPartitionManager {
   /// This method is called by [VectorIndexManager] during the flush pipeline.
   /// All pages are first staged into an in-memory map, then flushed once at the
   /// end to minimise I/O syscalls and avoid write amplification.
-  ///
-  /// [dirtyGraphPages]     -- graph pages modified by the graph engine.
-  /// [dirtyPqCodePages]    -- PQ-code pages modified during encoding.
-  /// [dirtyRawVectorPages] -- raw-vector pages modified during insertion.
-  /// [meta]                -- current NGH index metadata (may be mutated for partition rotation).
   Future<NghIndexMeta> writeChanges({
     required TableContext table,
     required IndexUid indexUid,
     required NghIndexMeta meta,
-    required Map<NghPagePtr, NghGraphPage> dirtyGraphPages,
-    required Map<NghPagePtr, NghPqCodePage> dirtyPqCodePages,
-    required Map<NghPagePtr, NghRawVectorPage> dirtyRawVectorPages,
+    Map<NghPagePtr, NghPostingPage> dirtyPostingPages = const {},
+    NghNavGraphPage? navGraphPage,
     int vectorsDelta = 0,
     int deletedDelta = 0,
     BatchContext? batchContext,
@@ -449,9 +406,7 @@ final class NghPartitionManager {
     int? yieldBudgetMs,
   }) async {
     final tableUid = table.tableUid;
-    if (dirtyGraphPages.isEmpty &&
-        dirtyPqCodePages.isEmpty &&
-        dirtyRawVectorPages.isEmpty) {
+    if (dirtyPostingPages.isEmpty && navGraphPage == null) {
       return meta;
     }
 
@@ -470,9 +425,7 @@ final class NghPartitionManager {
     }
 
     // Per-partition stats for meta page updates
-    final graphStats = <int, _NghPartitionStats>{};
-    final pqStats = <int, _NghPartitionStats>{};
-    final rawStats = <int, _NghPartitionStats>{};
+    final postingStats = <int, _NghPartitionStats>{};
 
     _NghPartitionStats getStats(Map<int, _NghPartitionStats> map, int pNo) {
       return map.putIfAbsent(pNo, () => _NghPartitionStats());
@@ -482,18 +435,18 @@ final class NghPartitionManager {
     final encCfg = _dataStore.config.encryptionConfig;
     final bool encrypt = encCfg?.shouldEncryptVectorIndex ?? false;
 
-    // -- Encode & stage graph pages --
-    for (final entry in dirtyGraphPages.entries) {
-      final y1 = yc.maybeYield();
-      if (y1 != null) await y1;
+    // -- Encode & stage posting pages --
+    for (final entry in dirtyPostingPages.entries) {
+      final y0 = yc.maybeYield();
+      if (y0 != null) await y0;
       final ptr = entry.key;
       final page = entry.value;
       final payload = page.encodePayload();
       final pageBytes =
-          _buildPageBytes(BTreePageType.nghGraph, payload, pageSize, encrypt);
-      final stats = getStats(graphStats, ptr.partitionNo);
-      stats.path ??= _dataStore.pathManager
-          .getNghGraphPartitionPathByContext(table, indexUid, ptr.partitionNo);
+          _buildPageBytes(BTreePageType.nghPosting, payload, pageSize, encrypt);
+      final stats = getStats(postingStats, ptr.partitionNo);
+      stats.path ??= _dataStore.pathManager.getNghPostingPartitionPathByContext(
+          table, indexUid, ptr.partitionNo);
       if (!stats.dirEnsured) {
         await _dataStore.storage.ensureDirectoryExists(p.dirname(stats.path!));
         stats.dirEnsured = true;
@@ -501,62 +454,21 @@ final class NghPartitionManager {
       stageWrite(stats.path!, ptr.pageNo * pageSize, pageBytes);
       stats.maxPageNoWritten = max(stats.maxPageNoWritten, ptr.pageNo);
 
-      // Update instance cache
-      _graphPageCache.putPoint4(
+      _postingPageCache.putPoint4(
           tableUid, indexUid, ptr.partitionNo, ptr.pageNo, page);
     }
 
-    // -- Encode & stage PQ-code pages --
-    for (final entry in dirtyPqCodePages.entries) {
-      final y2 = yc.maybeYield();
-      if (y2 != null) await y2;
-      final ptr = entry.key;
-      final page = entry.value;
-      final payload = page.encodePayload();
-      final pageBytes =
-          _buildPageBytes(BTreePageType.nghPqCode, payload, pageSize, encrypt);
-      final stats = getStats(pqStats, ptr.partitionNo);
-      stats.path ??= _dataStore.pathManager
-          .getNghPqCodePartitionPathByContext(table, indexUid, ptr.partitionNo);
-      if (!stats.dirEnsured) {
-        await _dataStore.storage.ensureDirectoryExists(p.dirname(stats.path!));
-        stats.dirEnsured = true;
-      }
-      stageWrite(stats.path!, ptr.pageNo * pageSize, pageBytes);
-      stats.maxPageNoWritten = max(stats.maxPageNoWritten, ptr.pageNo);
-
-      _pqCodePageCache.putPoint4(
-          tableUid, indexUid, ptr.partitionNo, ptr.pageNo, page);
+    // -- Encode & stage nav graph file --
+    if (navGraphPage != null) {
+      final navPath =
+          _dataStore.pathManager.getNghNavGraphPathByContext(table, indexUid);
+      await _dataStore.storage.ensureDirectoryExists(p.dirname(navPath));
+      final navPayload = navGraphPage.encodePayload();
+      stageWrite(navPath, 0, navPayload);
     }
 
-    // -- Encode & stage raw-vector pages --
-    for (final entry in dirtyRawVectorPages.entries) {
-      final y3 = yc.maybeYield();
-      if (y3 != null) await y3;
-      final ptr = entry.key;
-      final page = entry.value;
-      final payload = page.encodePayload();
-      final pageBytes = _buildPageBytes(
-          BTreePageType.nghRawVector, payload, pageSize, encrypt);
-      final stats = getStats(rawStats, ptr.partitionNo);
-      stats.path ??= _dataStore.pathManager
-          .getNghRawVectorPartitionPathByContext(
-              table, indexUid, ptr.partitionNo);
-      if (!stats.dirEnsured) {
-        await _dataStore.storage.ensureDirectoryExists(p.dirname(stats.path!));
-        stats.dirEnsured = true;
-      }
-      stageWrite(stats.path!, ptr.pageNo * pageSize, pageBytes);
-      stats.maxPageNoWritten = max(stats.maxPageNoWritten, ptr.pageNo);
-
-      _rawVectorPageCache.putPoint4(
-          tableUid, indexUid, ptr.partitionNo, ptr.pageNo, page);
-    }
-
-    // Apply meta deltas before staging page0 so graph partition 0 embeds the
-    // same NghIndexMeta that callers will cache (no wipe-before-persist window).
     final sizeDeltaSum = await _computePartitionSizeDeltaSum(
-      [graphStats, pqStats, rawStats],
+      [postingStats],
       pageSize,
     );
     final now = DateTime.now();
@@ -573,26 +485,21 @@ final class NghPartitionManager {
     );
 
     // -- Stage per-partition meta pages (pageNo=0) --
-    await _stagePartitionMeta(graphStats, pageSize, updatedMeta, stageWrite, yc,
-        NghDataCategory.graph);
-    await _stagePartitionMeta(
-        pqStats, pageSize, updatedMeta, stageWrite, yc, NghDataCategory.pqCode);
-    await _stagePartitionMeta(rawStats, pageSize, updatedMeta, stageWrite, yc,
-        NghDataCategory.rawVector);
+    await _stagePartitionMeta(postingStats, pageSize, updatedMeta, stageWrite,
+        yc, NghDataCategory.posting);
 
-    // Graph partition 0 always carries NghIndexMeta (same as table/index p0).
-    // Ensure it is refreshed even when this batch only touched other files.
-    if (!graphStats.containsKey(0) && staged.isNotEmpty) {
-      final p0Stats = getStats(graphStats, 0);
+    // Posting partition 0 carrying NghIndexMeta
+    if (!postingStats.containsKey(0) && staged.isNotEmpty) {
+      final p0Stats = getStats(postingStats, 0);
       p0Stats.path ??= _dataStore.pathManager
-          .getNghGraphPartitionPathByContext(table, indexUid, 0);
+          .getNghPostingPartitionPathByContext(table, indexUid, 0);
       await _stagePartitionMeta(
         {0: p0Stats},
         pageSize,
         updatedMeta,
         stageWrite,
         yc,
-        NghDataCategory.graph,
+        NghDataCategory.posting,
       );
     }
 
@@ -660,12 +567,54 @@ final class NghPartitionManager {
   // Page Allocation & Free-List
   // =====================================================================
 
+  /// Synchronously allocate [count] pages with partition rotation (0 I/O, 0 await).
+  ///
+  /// Mirrors B+Tree / [allocatePage]: when the active file would exceed
+  /// [DataStoreConfig.maxPartitionFileSize], opens a new partition and resets
+  /// page numbering to [NghIndexMeta.firstDataPageNo]. A single batch may
+  /// rotate more than once.
+  (List<NghPagePtr>, NghIndexMeta) allocatePagesBatchSync(
+    NghDataCategory category,
+    NghIndexMeta meta,
+    int count,
+  ) {
+    if (count <= 0) return (const [], meta);
+
+    final maxFileSize = _dataStore.config.maxPartitionFileSize;
+    final pageSize = _dataStore.configuredPageSize;
+    final pages = <NghPagePtr>[];
+    var current = meta;
+
+    if (current.postingPartitionCount < 1) {
+      current = current.copyWith(
+        postingPartitionCount: 1,
+        postingNextPageNo: NghIndexMeta.firstDataPageNo,
+      );
+    }
+
+    for (int i = 0; i < count; i++) {
+      var activePartition = current.postingPartitionCount - 1;
+      var nextPg = current.postingNextPageNo;
+      if (NghPageSizer.estimateFileSizeBytes(pageSize, nextPg) > maxFileSize) {
+        final newPartitionCount = current.postingPartitionCount + 1;
+        current = current.copyWith(
+          postingPartitionCount: newPartitionCount,
+          postingNextPageNo: NghIndexMeta.firstDataPageNo + 1,
+        );
+        pages.add(NghPagePtr(
+          category,
+          newPartitionCount - 1,
+          NghIndexMeta.firstDataPageNo,
+        ));
+        continue;
+      }
+      pages.add(NghPagePtr(category, activePartition, nextPg));
+      current = current.copyWith(postingNextPageNo: nextPg + 1);
+    }
+    return (pages, current);
+  }
+
   /// Allocate a new page in the specified category.
-  ///
-  /// Priority: 1) pop from free-list (O(1) reuse), 2) append at end,
-  /// 3) rotate to new partition if file size exceeded.
-  ///
-  /// Returns the [NghPagePtr] and the (possibly rotated) [NghIndexMeta].
   Future<(NghPagePtr, NghIndexMeta)> allocatePage(
     NghDataCategory category,
     NghIndexMeta meta,
@@ -673,84 +622,22 @@ final class NghPartitionManager {
     IndexUid indexUid,
   ) async {
     // 1) Try free-list pop
-    final reused = await _popFreePage(category, meta, table, indexUid);
+    final (reused, metaAfterPop) =
+        await _popFreePage(category, meta, table, indexUid);
     if (reused != null) {
-      return (reused, meta);
+      return (reused, metaAfterPop);
     }
 
-    // 2) Append allocation with partition rotation
-    final maxFileSize = _dataStore.config.maxPartitionFileSize;
-    final pageSize = _dataStore.configuredPageSize;
-
-    switch (category) {
-      case NghDataCategory.graph:
-        final activePartition = meta.graphPartitionCount - 1;
-        final nextPg = meta.graphNextPageNo;
-        if (NghPageSizer.estimateFileSizeBytes(pageSize, nextPg) >
-            maxFileSize) {
-          // Rotate: create new partition
-          final newPartitionCount = meta.graphPartitionCount + 1;
-          meta = meta.copyWith(
-            graphPartitionCount: newPartitionCount,
-            graphNextPageNo: NghIndexMeta.firstDataPageNo + 1,
-          );
-          return (
-            NghPagePtr(
-                category, newPartitionCount - 1, NghIndexMeta.firstDataPageNo),
-            meta,
-          );
-        }
-        meta = meta.copyWith(graphNextPageNo: nextPg + 1);
-        return (NghPagePtr(category, activePartition, nextPg), meta);
-
-      case NghDataCategory.pqCode:
-        final activePartition = meta.pqCodePartitionCount - 1;
-        final nextPg = meta.pqCodeNextPageNo;
-        if (NghPageSizer.estimateFileSizeBytes(pageSize, nextPg) >
-            maxFileSize) {
-          final newPartitionCount = meta.pqCodePartitionCount + 1;
-          meta = meta.copyWith(
-            pqCodePartitionCount: newPartitionCount,
-            pqCodeNextPageNo: NghIndexMeta.firstDataPageNo + 1,
-          );
-          return (
-            NghPagePtr(
-                category, newPartitionCount - 1, NghIndexMeta.firstDataPageNo),
-            meta,
-          );
-        }
-        meta = meta.copyWith(pqCodeNextPageNo: nextPg + 1);
-        return (NghPagePtr(category, activePartition, nextPg), meta);
-
-      case NghDataCategory.rawVector:
-        final activePartition = meta.rawVectorPartitionCount - 1;
-        final nextPg = meta.rawVectorNextPageNo;
-        if (NghPageSizer.estimateFileSizeBytes(pageSize, nextPg) >
-            maxFileSize) {
-          final newPartitionCount = meta.rawVectorPartitionCount + 1;
-          meta = meta.copyWith(
-            rawVectorPartitionCount: newPartitionCount,
-            rawVectorNextPageNo: NghIndexMeta.firstDataPageNo + 1,
-          );
-          return (
-            NghPagePtr(
-                category, newPartitionCount - 1, NghIndexMeta.firstDataPageNo),
-            meta,
-          );
-        }
-        meta = meta.copyWith(rawVectorNextPageNo: nextPg + 1);
-        return (NghPagePtr(category, activePartition, nextPg), meta);
-    }
+    // 2) Append allocation with partition rotation (shared with batch path)
+    final (pages, updated) = allocatePagesBatchSync(category, metaAfterPop, 1);
+    return (pages.first, updated);
   }
 
   /// Push a released page onto the free-list for its category and partition.
-  ///
-  /// Writes a [FreePage] in-band at the released page's location, linked
-  /// to the previous free-list head. O(1) push, no scanning.
   Future<NghIndexMeta> pushFreePage(
     NghDataCategory category,
-    NghPagePtr ptr,
     NghIndexMeta meta,
+    NghPagePtr ptr,
     TableContext table,
     IndexUid indexUid,
     void Function(String path, int offset, Uint8List bytes) stageWrite,
@@ -759,7 +646,6 @@ final class NghPartitionManager {
     final heads = _getFreeListHeads(category, meta);
     final currentHead = heads[ptr.partitionNo] ?? -1;
 
-    // Write FreePage at the released slot, pointing to current head
     final freePayload = FreePage(nextFreePageNo: currentHead).encodePayload();
     final freeBytes = BTreePageIO.buildPageBytes(
       type: BTreePageType.free,
@@ -770,7 +656,6 @@ final class NghPartitionManager {
     final path = _partitionPath(category, table, indexUid, ptr.partitionNo);
     stageWrite(path, ptr.pageNo * pageSize, freeBytes);
 
-    // Update head pointer
     final updatedHeads = Map<int, int>.from(heads);
     updatedHeads[ptr.partitionNo] = ptr.pageNo;
 
@@ -778,7 +663,7 @@ final class NghPartitionManager {
   }
 
   /// Pop a free page from the category's free-list. Returns null if empty.
-  Future<NghPagePtr?> _popFreePage(
+  Future<(NghPagePtr?, NghIndexMeta)> _popFreePage(
     NghDataCategory category,
     NghIndexMeta meta,
     TableContext table,
@@ -790,7 +675,6 @@ final class NghPartitionManager {
       checkInterval: 5,
       budgetMs: 10,
     );
-    // Find any partition with a free page
     for (final entry in heads.entries) {
       final y5 = yc.maybeYield();
       if (y5 != null) await y5;
@@ -804,285 +688,55 @@ final class NghPartitionManager {
       try {
         final raw = await _dataStore.storage
             .readAsBytesAt(path, headPageNo * pageSize, length: pageSize);
-        if (raw.isEmpty) continue;
-
-        final parsed = BTreePageIO.parsePageBytes(raw);
-        if (parsed.type != BTreePageType.free) continue;
-
-        final fp = FreePage.tryDecodePayload(parsed.encodedPayload);
-        if (fp == null) continue;
-
-        // Cycle safety: self-referencing head -> reset
-        if (fp.nextFreePageNo == headPageNo) {
-          heads[partitionNo] = -1;
+        if (raw.isEmpty) {
+          final updatedHeads = Map<int, int>.from(heads)..[partitionNo] = -1;
+          meta = _setFreeListHeads(category, meta, updatedHeads);
           continue;
         }
 
-        // Pop: advance head to next
-        heads[partitionNo] = fp.nextFreePageNo;
-        return NghPagePtr(category, partitionNo, headPageNo);
+        final parsed = BTreePageIO.parsePageBytes(raw);
+        if (parsed.type != BTreePageType.free) {
+          final updatedHeads = Map<int, int>.from(heads)..[partitionNo] = -1;
+          meta = _setFreeListHeads(category, meta, updatedHeads);
+          continue;
+        }
+
+        final fp = FreePage.tryDecodePayload(parsed.encodedPayload);
+        if (fp == null || fp.nextFreePageNo == headPageNo) {
+          final updatedHeads = Map<int, int>.from(heads)..[partitionNo] = -1;
+          meta = _setFreeListHeads(category, meta, updatedHeads);
+          continue;
+        }
+
+        final updatedHeads = Map<int, int>.from(heads)
+          ..[partitionNo] = fp.nextFreePageNo;
+        final updatedMeta = _setFreeListHeads(category, meta, updatedHeads);
+        return (NghPagePtr(category, partitionNo, headPageNo), updatedMeta);
       } catch (_) {
-        // Corruption tolerance: reset this partition's free-list
-        heads[partitionNo] = -1;
+        final updatedHeads = Map<int, int>.from(heads)..[partitionNo] = -1;
+        meta = _setFreeListHeads(category, meta, updatedHeads);
         continue;
       }
     }
-    return null;
+    return (null, meta);
   }
 
   /// Get the free-list heads map for a given category.
   Map<int, int> _getFreeListHeads(NghDataCategory category, NghIndexMeta meta) {
-    switch (category) {
-      case NghDataCategory.graph:
-        return Map<int, int>.from(meta.graphFreeListHeads);
-      case NghDataCategory.pqCode:
-        return Map<int, int>.from(meta.pqCodeFreeListHeads);
-      case NghDataCategory.rawVector:
-        return Map<int, int>.from(meta.rawVectorFreeListHeads);
-    }
+    return Map<int, int>.from(meta.postingFreeListHeads);
   }
 
   /// Return a new meta with updated free-list heads for the given category.
   NghIndexMeta _setFreeListHeads(
       NghDataCategory category, NghIndexMeta meta, Map<int, int> heads) {
-    switch (category) {
-      case NghDataCategory.graph:
-        return meta.copyWith(graphFreeListHeads: heads);
-      case NghDataCategory.pqCode:
-        return meta.copyWith(pqCodeFreeListHeads: heads);
-      case NghDataCategory.rawVector:
-        return meta.copyWith(rawVectorFreeListHeads: heads);
-    }
+    return meta.copyWith(postingFreeListHeads: heads);
   }
 
   /// Resolve the partition file path for a given category and partition number.
   String _partitionPath(NghDataCategory category, TableContext table,
       IndexUid indexUid, int partitionNo) {
-    switch (category) {
-      case NghDataCategory.graph:
-        return _dataStore.pathManager
-            .getNghGraphPartitionPathByContext(table, indexUid, partitionNo);
-      case NghDataCategory.pqCode:
-        return _dataStore.pathManager
-            .getNghPqCodePartitionPathByContext(table, indexUid, partitionNo);
-      case NghDataCategory.rawVector:
-        return _dataStore.pathManager.getNghRawVectorPartitionPathByContext(
-            table, indexUid, partitionNo);
-    }
-  }
-
-  // =====================================================================
-  // Codebook I/O
-  // =====================================================================
-
-  /// Write a PQ codebook to the dedicated codebook file.
-  Future<void> writeCodebook(
-    TableContext table,
-    IndexUid indexUid,
-    NghCodebookPage codebook,
-    int pageSize,
-  ) async {
-    final encCfg = _dataStore.config.encryptionConfig;
-    final bool encrypt = encCfg?.shouldEncryptVectorIndex ?? false;
-    final path =
-        _dataStore.pathManager.getNghCodebookPathByContext(table, indexUid);
-    await _dataStore.storage.ensureDirectoryExists(p.dirname(path));
-
-    // Check if codebook fits in a single page
-    final payloadSize = codebook.estimatePayloadSize();
-    if (NghPageSizer.fitsInPage(payloadSize, pageSize)) {
-      // Single page: write directly
-      final payload = codebook.encodePayload();
-      final pageBytes = _buildPageBytes(
-          BTreePageType.nghCodebook, payload, pageSize, encrypt);
-      await _dataStore.storage.writeManyAsBytesAt(
-        path,
-        [ByteWrite(offset: 0, bytes: pageBytes)],
-        flush: false,
-      );
-      return;
-    }
-
-    // Multi-page: split codebook across multiple pages
-    final subspacesPerPage = NghPageSizer.subspacesPerCodebookPage(
-      pageSize,
-      codebook.centroidsPerSubspace,
-      codebook.subspaceDimensions,
-    );
-    if (subspacesPerPage <= 0) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message:
-              'Codebook sub-space size (${codebook.centroidsPerSubspace} x ${codebook.subspaceDimensions} x 4 bytes) exceeds page capacity',
-        ),
-      ]);
-    }
-
-    final totalSubspaces = codebook.subspaceCount;
-    final writes = <ByteWrite>[];
-
-    int remainingSubspaces = totalSubspaces;
-    int pageIdx = 0;
-    int globalSubspaceOffset = 0;
-
-    final centroidsPerSubspace = codebook.centroidsPerSubspace;
-    final subspaceDimensions = codebook.subspaceDimensions;
-    final floatsPerSubspace = centroidsPerSubspace * subspaceDimensions;
-    final srcBaseOffset = codebook.subspaceStart * floatsPerSubspace;
-
-    while (remainingSubspaces > 0) {
-      // Start with estimated subspaces per page
-      int countSubspaces = min(subspacesPerPage, remainingSubspaces);
-
-      // Try to fit as many subspaces as possible, reducing if needed
-      NghCodebookPage? pageCodebook;
-      Uint8List? payload;
-
-      while (countSubspaces > 0) {
-        final testFloats = countSubspaces * floatsPerSubspace;
-        final testCentroids = Float32List(testFloats);
-        final srcOffset =
-            srcBaseOffset + globalSubspaceOffset * floatsPerSubspace;
-        testCentroids.setRange(0, testFloats, codebook.centroids, srcOffset);
-
-        pageCodebook = NghCodebookPage(
-          subspaceStart: codebook.subspaceStart + globalSubspaceOffset,
-          subspaceCount: countSubspaces,
-          centroidsPerSubspace: centroidsPerSubspace,
-          subspaceDimensions: subspaceDimensions,
-          centroids: testCentroids,
-        );
-
-        // Use actual encoded payload size for verification
-        payload = pageCodebook.encodePayload();
-        final actualPayloadSize = payload.length;
-
-        if (NghPageSizer.fitsInPage(actualPayloadSize, pageSize)) {
-          break; // This size fits
-        }
-
-        countSubspaces--;
-      }
-
-      if (countSubspaces <= 0 || pageCodebook == null || payload == null) {
-        throw DbException([
-          GeneralStatus(
-            type: ResultType.engError,
-            message:
-                'Codebook sub-space size ($centroidsPerSubspace x $subspaceDimensions x 4 bytes) exceeds page capacity',
-          ),
-        ]);
-      }
-
-      final pageBytes = _buildPageBytes(
-          BTreePageType.nghCodebook, payload, pageSize, encrypt);
-      writes.add(ByteWrite(offset: pageIdx * pageSize, bytes: pageBytes));
-
-      globalSubspaceOffset += countSubspaces;
-      remainingSubspaces -= countSubspaces;
-      pageIdx++;
-    }
-
-    await _dataStore.storage.writeManyAsBytesAt(path, writes, flush: false);
-  }
-
-  /// Read the PQ codebook from disk.
-  /// Supports both single-page and multi-page codebooks.
-  Future<NghCodebookPage?> readCodebook(
-    TableContext table,
-    IndexUid indexUid,
-    int pageSize,
-  ) async {
-    final path =
-        _dataStore.pathManager.getNghCodebookPathByContext(table, indexUid);
-    try {
-      // Read first page to determine structure
-      final firstPageRaw =
-          await _dataStore.storage.readAsBytesAt(path, 0, length: pageSize);
-      if (firstPageRaw.isEmpty) return null;
-
-      final firstParsed = BTreePageIO.parsePageBytes(firstPageRaw);
-      final firstPage = NghCodebookPage.tryDecodePayload(
-          _decodePayload(firstParsed.encodedPayload));
-      if (firstPage == null) return null;
-
-      // Determine if this is a multi-page codebook
-      final subspacesPerPage = NghPageSizer.subspacesPerCodebookPage(
-        pageSize,
-        firstPage.centroidsPerSubspace,
-        firstPage.subspaceDimensions,
-      );
-
-      // If subspacesPerPage is 0, even a single sub-space doesn't fit
-      if (subspacesPerPage <= 0) {
-        // Fallback: return first page (may be incomplete, but better than nothing)
-        return firstPage;
-      }
-
-      // Check if this is a single-page codebook
-      // Single-page if: subspaceCount < subspacesPerPage (meaning no more pages)
-      // or it is exactly subspacesPerPage but happens to fit perfectly as the only page?
-      // Actually, if it is exactly subspacesPerPage, we MUST check if there's a next page
-      // to avoid returning a truncated codebook.
-      final firstPayloadSize = firstPage.estimatePayloadSize();
-      if (firstPage.subspaceCount < subspacesPerPage &&
-          NghPageSizer.fitsInPage(firstPayloadSize, pageSize)) {
-        return firstPage;
-      }
-
-      // Estimate total pages needed (read until we get a page with fewer subspaces)
-      final pages = <NghCodebookPage>[firstPage];
-      int totalSubspaces = firstPage.subspaceCount;
-      int pageIdx = 1;
-
-      while (true) {
-        try {
-          final pageRaw = await _dataStore.storage
-              .readAsBytesAt(path, pageIdx * pageSize, length: pageSize);
-          if (pageRaw.isEmpty) break;
-
-          final parsed = BTreePageIO.parsePageBytes(pageRaw);
-          final page = NghCodebookPage.tryDecodePayload(
-              _decodePayload(parsed.encodedPayload));
-          if (page == null) break;
-
-          pages.add(page);
-          totalSubspaces += page.subspaceCount;
-
-          // Last page if it has fewer subspaces than capacity
-          if (page.subspaceCount < subspacesPerPage) break;
-          pageIdx++;
-        } catch (_) {
-          break;
-        }
-      }
-
-      // Merge all pages into a single codebook
-      final centroidsPerSubspace = firstPage.centroidsPerSubspace;
-      final subspaceDimensions = firstPage.subspaceDimensions;
-      final floatsPerSubspace = centroidsPerSubspace * subspaceDimensions;
-      final totalFloats = totalSubspaces * floatsPerSubspace;
-      final mergedCentroids = Float32List(totalFloats);
-
-      int destOffset = 0;
-      for (final page in pages) {
-        final count = page.subspaceCount * floatsPerSubspace;
-        mergedCentroids.setRange(
-            destOffset, destOffset + count, page.centroids);
-        destOffset += count;
-      }
-
-      return NghCodebookPage(
-        subspaceStart: firstPage.subspaceStart,
-        subspaceCount: totalSubspaces,
-        centroidsPerSubspace: centroidsPerSubspace,
-        subspaceDimensions: subspaceDimensions,
-        centroids: mergedCentroids,
-      );
-    } catch (_) {
-      return null;
-    }
+    return _dataStore.pathManager
+        .getNghPostingPartitionPathByContext(table, indexUid, partitionNo);
   }
 
   // =====================================================================
@@ -1091,44 +745,35 @@ final class NghPartitionManager {
 
   /// Current total size of all NGH page caches.
   int getCurrentPageCacheSize() {
-    return _graphPageCache.estimatedTotalSizeBytes +
-        _pqCodePageCache.estimatedTotalSizeBytes +
-        _rawVectorPageCache.estimatedTotalSizeBytes;
+    return _postingPageCache.estimatedTotalSizeBytes;
   }
 
   /// Evict a portion of all NGH page caches.
   Future<void> evictPageCache({double ratio = 0.3}) async {
-    await _graphPageCache.cleanup(removeRatio: ratio);
-    await _pqCodePageCache.cleanup(removeRatio: ratio);
-    await _rawVectorPageCache.cleanup(removeRatio: ratio);
+    await _postingPageCache.cleanup(removeRatio: ratio);
   }
 
   /// Clear all NGH page caches synchronously.
   void clearPageCacheSync() {
-    _graphPageCache.clear();
-    _pqCodePageCache.clear();
-    _rawVectorPageCache.clear();
+    _postingPageCache.clear();
   }
 
   /// Clear caches for a specific table.
   void clearPageCacheForTable(TableUid tableUid) {
-    _graphPageCache.remove([tableUid]);
-    _pqCodePageCache.remove([tableUid]);
-    _rawVectorPageCache.remove([tableUid]);
+    _postingPageCache.remove([tableUid]);
   }
 
   /// Clear caches for a specific index.
   void clearPageCacheForIndex(TableUid tableUid, IndexUid indexUid) {
-    _graphPageCache.remove([tableUid, indexUid]);
-    _pqCodePageCache.remove([tableUid, indexUid]);
-    _rawVectorPageCache.remove([tableUid, indexUid]);
+    _postingPageCache.remove([tableUid, indexUid]);
   }
 
   // =====================================================================
   // Private Helpers
   // =====================================================================
 
-  int _cacheKey(int partitionNo, int pageNo) => partitionNo << 20 | pageNo;
+  int _cacheKey(int partitionNo, int pageNo) =>
+      NghPagePtr.packRef(partitionNo, pageNo);
 
   /// Build raw page bytes (header + payload + padding).
   ///
@@ -1247,9 +892,9 @@ final class NghPartitionManager {
       final computedSize = (stats.maxPageNoWritten + 1) * pageSize;
       final newSize = max(stats.oldFileSizeInBytes, computedSize);
 
-      // NghIndexMeta lives only on graph partition 0 (same as table/index p0).
+      // NghIndexMeta lives only on posting partition 0 (same as table/index p0).
       Uint8List? treeGlobalMeta;
-      if (category == NghDataCategory.graph && pNo == 0) {
+      if (category == NghDataCategory.posting && pNo == 0) {
         treeGlobalMeta = TreeGlobalMetaBlobCodec.encode(
           TreeGlobalMetaKind.ngh,
           NghIndexMetaCodec.encode(meta),
