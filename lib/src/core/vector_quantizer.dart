@@ -710,8 +710,7 @@ abstract final class ScalarQuantizer {
     return dist < 0 ? 0.0 : (dist > 2.0 ? 2.0 : dist);
   }
 
-  /// Ultra-fast 8-way unrolled positional cosine distance kernel.
-  /// Zero named argument overhead, direct instruction pipeline.
+  /// 16-way unrolled SQ8 cosine distance (hot path for 128/256/512-d).
   static double fastCosineDistance(
     Float32List query,
     double querySum,
@@ -721,11 +720,44 @@ abstract final class ScalarQuantizer {
     double invNorm,
   ) {
     final len = query.length;
-    double codeDot = 0;
+    final codeDot = _sq8CodeDot(query, codes, len);
+    final ip = offset * querySum + scale * codeDot;
+    final cosSim = ip * invNorm;
+    final dist = 1.0 - cosSim;
+    return dist < 0 ? 0.0 : (dist > 2.0 ? 2.0 : dist);
+  }
 
-    int i = 0;
-    final unrollLen = len - 7;
-    while (i < unrollLen) {
+  /// Strided SQ8 cosine for coarse prefilter (relative ranking only).
+  /// Samples every [stride]-th dim and scales the code-dot back by [stride].
+  static double fastCosineDistanceStrided(
+    Float32List query,
+    double querySum,
+    Uint8List codes,
+    double offset,
+    double scale,
+    double invNorm, {
+    int stride = 4,
+  }) {
+    final len = query.length;
+    if (stride <= 1 || len <= stride * 8) {
+      return fastCosineDistance(query, querySum, codes, offset, scale, invNorm);
+    }
+    double codeDot = 0;
+    for (var i = 0; i < len; i += stride) {
+      codeDot += query[i] * codes[i];
+    }
+    final ip = offset * querySum + scale * codeDot * stride;
+    final cosSim = ip * invNorm;
+    final dist = 1.0 - cosSim;
+    return dist < 0 ? 0.0 : (dist > 2.0 ? 2.0 : dist);
+  }
+
+  /// Σ query[i]·codes[i] with 16-way unroll when [len] ≥ 16.
+  static double _sq8CodeDot(Float32List query, Uint8List codes, int len) {
+    double codeDot = 0;
+    var i = 0;
+    final unroll16 = len - 15;
+    while (i < unroll16) {
       codeDot += query[i] * codes[i] +
           query[i + 1] * codes[i + 1] +
           query[i + 2] * codes[i + 2] +
@@ -733,21 +765,117 @@ abstract final class ScalarQuantizer {
           query[i + 4] * codes[i + 4] +
           query[i + 5] * codes[i + 5] +
           query[i + 6] * codes[i + 6] +
-          query[i + 7] * codes[i + 7];
-      i += 8;
+          query[i + 7] * codes[i + 7] +
+          query[i + 8] * codes[i + 8] +
+          query[i + 9] * codes[i + 9] +
+          query[i + 10] * codes[i + 10] +
+          query[i + 11] * codes[i + 11] +
+          query[i + 12] * codes[i + 12] +
+          query[i + 13] * codes[i + 13] +
+          query[i + 14] * codes[i + 14] +
+          query[i + 15] * codes[i + 15];
+      i += 16;
     }
     while (i < len) {
       codeDot += query[i] * codes[i];
       i++;
     }
+    return codeDot;
+  }
 
-    final ip = offset * querySum + scale * codeDot;
+  /// Reconstruct SQ8 → float32 (utility / tests). Prefer scoring via SQ8 kernels.
+  static Float32List reconstructSq8(
+    Uint8List codes,
+    double offset,
+    double scale,
+  ) {
+    final len = codes.length;
+    final out = Float32List(len);
+    int i = 0;
+    final unroll = len - 3;
+    while (i < unroll) {
+      out[i] = offset + scale * codes[i];
+      out[i + 1] = offset + scale * codes[i + 1];
+      out[i + 2] = offset + scale * codes[i + 2];
+      out[i + 3] = offset + scale * codes[i + 3];
+      i += 4;
+    }
+    while (i < len) {
+      out[i] = offset + scale * codes[i];
+      i++;
+    }
+    return out;
+  }
+
+  /// Float32x4List.view dot product for aligned float32 vectors (routing).
+  static double dotProductF32(Float32List a, Float32List b) {
+    final len = a.length;
+    final n = len >> 2;
+    if (n > 0 && (a.offsetInBytes & 15) == 0 && (b.offsetInBytes & 15) == 0) {
+      final av = Float32x4List.view(a.buffer, a.offsetInBytes, n);
+      final bv = Float32x4List.view(b.buffer, b.offsetInBytes, n);
+      var acc = Float32x4.zero();
+      for (var i = 0; i < n; i++) {
+        acc += av[i] * bv[i];
+      }
+      double sum = acc.x + acc.y + acc.z + acc.w;
+      for (var i = n << 2; i < len; i++) {
+        sum += a[i] * b[i];
+      }
+      return sum;
+    }
+
+    double sum = 0;
+    var i = 0;
+    final unroll = len - 7;
+    while (i < unroll) {
+      sum += a[i] * b[i] +
+          a[i + 1] * b[i + 1] +
+          a[i + 2] * b[i + 2] +
+          a[i + 3] * b[i + 3] +
+          a[i + 4] * b[i + 4] +
+          a[i + 5] * b[i + 5] +
+          a[i + 6] * b[i + 6] +
+          a[i + 7] * b[i + 7];
+      i += 8;
+    }
+    while (i < len) {
+      sum += a[i] * b[i];
+      i++;
+    }
+    return sum;
+  }
+
+  /// Cosine distance against a pre-reconstructed float vector.
+  static double fastCosineDistanceF32(
+    Float32List query,
+    Float32List target,
+    double invNorm,
+  ) {
+    final ip = dotProductF32(query, target);
     final cosSim = ip * invNorm;
     final dist = 1.0 - cosSim;
     return dist < 0 ? 0.0 : (dist > 2.0 ? 2.0 : dist);
   }
 
-  /// Ultra-fast 8-way unrolled positional squared L2 distance kernel.
+  /// Negated inner-product distance against a pre-reconstructed float vector.
+  static double fastDotProductF32(Float32List query, Float32List target) {
+    return -dotProductF32(query, target);
+  }
+
+  /// Squared L2 against a pre-reconstructed float vector.
+  static double fastSquaredL2DistanceF32(
+    Float32List query,
+    double querySquaredNorm,
+    Float32List target,
+    double targetSquaredNorm,
+  ) {
+    final ip = dotProductF32(query, target);
+    final dist = querySquaredNorm + targetSquaredNorm - 2.0 * ip;
+    return dist < 0 ? 0.0 : dist;
+  }
+
+  /// 8-way unrolled SQ8 squared L2 distance kernel.
   static double fastSquaredL2Distance(
     Float32List query,
     double querySquaredNorm,
@@ -757,33 +885,13 @@ abstract final class ScalarQuantizer {
     double scale,
     double targetSquaredNorm,
   ) {
-    final len = query.length;
-    double codeDot = 0;
-
-    int i = 0;
-    final unrollLen = len - 7;
-    while (i < unrollLen) {
-      codeDot += query[i] * codes[i] +
-          query[i + 1] * codes[i + 1] +
-          query[i + 2] * codes[i + 2] +
-          query[i + 3] * codes[i + 3] +
-          query[i + 4] * codes[i + 4] +
-          query[i + 5] * codes[i + 5] +
-          query[i + 6] * codes[i + 6] +
-          query[i + 7] * codes[i + 7];
-      i += 8;
-    }
-    while (i < len) {
-      codeDot += query[i] * codes[i];
-      i++;
-    }
-
+    final codeDot = _sq8CodeDot(query, codes, query.length);
     final ip = offset * querySum + scale * codeDot;
     final dist = querySquaredNorm + targetSquaredNorm - 2.0 * ip;
     return dist < 0 ? 0.0 : dist;
   }
 
-  /// Ultra-fast 8-way unrolled positional dot product distance kernel.
+  /// 16-way unrolled SQ8 inner-product distance kernel (returns negated IP).
   static double fastDotProduct(
     Float32List query,
     double querySum,
@@ -791,27 +899,7 @@ abstract final class ScalarQuantizer {
     double offset,
     double scale,
   ) {
-    final len = query.length;
-    double codeDot = 0;
-
-    int i = 0;
-    final unrollLen = len - 7;
-    while (i < unrollLen) {
-      codeDot += query[i] * codes[i] +
-          query[i + 1] * codes[i + 1] +
-          query[i + 2] * codes[i + 2] +
-          query[i + 3] * codes[i + 3] +
-          query[i + 4] * codes[i + 4] +
-          query[i + 5] * codes[i + 5] +
-          query[i + 6] * codes[i + 6] +
-          query[i + 7] * codes[i + 7];
-      i += 8;
-    }
-    while (i < len) {
-      codeDot += query[i] * codes[i];
-      i++;
-    }
-
+    final codeDot = _sq8CodeDot(query, codes, query.length);
     return -(offset * querySum + scale * codeDot);
   }
 }

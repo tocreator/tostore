@@ -155,7 +155,7 @@ final class TableTreePartitionManager {
     if (storedFieldCount != null && storedFieldCount < fieldStruct.length) {
       final activeStruct = <FieldStructure>[
         for (final f in fieldStruct)
-          if (!f.name.startsWith('_system_storage_deleted_slot_')) f,
+          if (!f.deleted) f,
       ];
       if (activeStruct.length == storedFieldCount) {
         final activeDecoded =
@@ -172,7 +172,7 @@ final class TableTreePartitionManager {
       final prefix = fieldStruct.sublist(0, storedFieldCount);
       var deletedInPrefix = false;
       for (final f in prefix) {
-        if (f.name.startsWith('_system_storage_deleted_slot_')) {
+        if (f.deleted) {
           deletedInPrefix = true;
           break;
         }
@@ -2559,10 +2559,12 @@ final class TableTreePartitionManager {
     }
 
     final out = <Map<String, dynamic>>[];
-    final yc = YieldController('TableTreePartitionManager.queryRecordsBatch',
-        checkInterval: 100);
+    final YieldController? yc = keys.length > 32
+        ? YieldController('TableTreePartitionManager.queryRecordsBatch',
+            checkInterval: 100)
+        : null;
     for (final e in leafToIndexes.entries) {
-      final y16 = yc.maybeYield();
+      final y16 = yc?.maybeYield();
       if (y16 != null) await y16;
       final ptr = e.key;
       LeafPage? leaf = readFromFileOnly

@@ -28,6 +28,7 @@ import '../model/foreign_key_operation.dart';
 import '../model/global_config.dart';
 import '../model/id_generator.dart';
 import '../model/memory_info.dart';
+import '../model/meta_info.dart';
 import '../model/migration_task.dart';
 import '../model/query_result.dart';
 import '../model/result_status.dart';
@@ -147,16 +148,22 @@ class DataStoreImpl {
   bool _isGlobalPrewarming = false;
   bool get isGlobalPrewarming => _isGlobalPrewarming;
 
-  /// In-flight cache prewarm task. Close/switchSpace awaits this after cancel
-  /// so full-table scans cannot race storage handle teardown.
+  /// In-flight cache prewarm task (this instance only).
+  ///
+  /// [ToStore.switchSpace] replaces the engine instance, so an orphan warm on
+  /// a closed instance cannot touch the successor's caches. Close cancels via
+  /// [_closing] / [globalQueryCancelToken] and does not await this future.
   Future<void>? _prewarmFuture;
 
-  /// True when long-running leaf scans should stop (close / switchSpace /
+  /// True when long-running leaf scans should stop (close /
   /// global query cancel). Checked on each leaf page boundary.
   ///
   /// Do NOT gate on [isInitialized]: setup/migration/recovery scan table and
   /// index leaves before `_isInitialized` flips true. Aborting those scans
   /// silently yields empty results and breaks schema migration tests.
+  ///
+  /// Do NOT add sticky generation/epoch here: a stuck flag permanently aborts
+  /// core scans. Space switch isolation is instance replacement in [ToStore].
   bool get shouldAbortBackgroundScan =>
       _closing || _globalQueryCancelToken.isCancelled;
 
@@ -1134,12 +1141,11 @@ class DataStoreImpl {
     _isInitialized = false;
     _baseInitialized = false;
     _globalQueryCancelToken.cancel();
+    // Yield once so in-flight prewarm/scans observe [_closing] / cancel.
+    // Do not await prewarm completion: switchSpace replaces this instance, and
+    // blocking close on warm would stall the UI for an unbounded time.
     await Future.delayed(Duration.zero);
-
-    // Stop cache prewarm before maintenance / handle close. Without this,
-    // 100k+ full-table/index scans keep shared locks + file handle queues
-    // busy and switchSpace/close stalls for seconds.
-    await _stopAndAwaitPrewarm();
+    _isGlobalPrewarming = false;
 
     try {
       // Stop background triggers first to prevent new work from entering pipelines
@@ -3589,7 +3595,7 @@ class DataStoreImpl {
   /// Emit a change notification immediately, or defer until transaction commit.
   ///
   /// While the user transaction body runs, writes sit in the deferred txn
-  /// buffer and are invisible to external queries — notifying then causes
+  /// buffer and are invisible to external queries notifying then causes
   /// [watch] to re-query stale data with no follow-up after commit. Events
   /// are queued and flushed after [applyCommitPlan] + [commit] succeed.
   /// During [TransactionContext.isApplyingCommit] (and outside transactions)
@@ -6206,7 +6212,7 @@ class DataStoreImpl {
 
   /// load data from specified path
   Future<void> loadDataToCache() async {
-    if (_isGlobalPrewarming) {
+    if (_isGlobalPrewarming || _prewarmFuture != null) {
       return;
     }
     if (config.persistenceMode == PersistenceMode.memory) {
@@ -6228,7 +6234,6 @@ class DataStoreImpl {
     }
     _isGlobalPrewarming = true;
 
-    // Fire-and-forget, but keep a handle so close/switchSpace can await stop.
     final task = _executePrewarm();
     _prewarmFuture = task;
     unawaited(task.whenComplete(() {
@@ -6238,44 +6243,22 @@ class DataStoreImpl {
     }));
   }
 
-  /// Cancel-aware wait for the in-flight prewarm task.
-  ///
-  /// Caller must already have set [shouldAbortBackgroundScan] (via `_closing`
-  /// / cancel token) so leaf scans exit cooperatively.
-  Future<void> _stopAndAwaitPrewarm({
-    Duration timeout = const Duration(seconds: 3),
-  }) async {
-    final future = _prewarmFuture;
-    if (future == null) {
-      _isGlobalPrewarming = false;
-      return;
-    }
-    try {
-      await future.timeout(timeout);
-    } on TimeoutException {
-      Logger.warn(
-        'Cache prewarm did not stop within ${timeout.inMilliseconds}ms '
-        'during close/switchSpace; continuing shutdown',
-      );
-    } catch (e) {
-      // Errors inside prewarm are logged there; ignore here.
-      if (_isInitialized) {
-        Logger.warn('Await prewarm stop failed', rawError: e);
-      }
-    } finally {
-      // If the task timed out, force the flag so later init can start fresh.
-      // The orphaned future's finally will also clear _isGlobalPrewarming.
-      _isGlobalPrewarming = false;
-      if (identical(_prewarmFuture, future)) {
-        _prewarmFuture = null;
-      }
-    }
-  }
-
   Future<void> _executePrewarm() async {
     try {
+      // Let open / first queries proceed from file first. Also covers "open then
+      // immediately switchSpace" before heavy warm starts.
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+      if (shouldAbortBackgroundScan) {
+        return;
+      }
+
       final schemaMgr = tableMetaManager;
       if (schemaMgr == null) return;
+
+      // Resolve prewarm budget up front so vector posting preload can stop at threshold.
+      final effectivePrewarmThresholdMB =
+          await _resourceManager!.initializeEffectivePrewarmThresholdMB();
+      var remainingPrewarmBytes = effectivePrewarmThresholdMB * 1024 * 1024;
 
       // From tableMetaManager get all schemas (empty tables skip data load below).
       final allTables = await getTableNames();
@@ -6336,11 +6319,18 @@ class DataStoreImpl {
 
             final vectorIndexes = schemaMgr.getVectorIndexesFor(schema);
             for (final vIdx in vectorIndexes) {
-              if (shouldAbortBackgroundScan) break;
-              await _vectorIndexManager?.prewarmVectorIndex(
-                table,
-                vIdx.indexUid,
-              );
+              if (shouldAbortBackgroundScan || remainingPrewarmBytes <= 0) {
+                break;
+              }
+              final used = await _vectorIndexManager?.prewarmVectorIndex(
+                    table,
+                    vIdx.indexUid,
+                    maxBytes: remainingPrewarmBytes,
+                  ) ??
+                  0;
+              remainingPrewarmBytes = remainingPrewarmBytes > used
+                  ? remainingPrewarmBytes - used
+                  : 0;
               final yVec = yieldController.maybeYield();
               if (yVec != null) await yVec;
             }
@@ -6353,6 +6343,12 @@ class DataStoreImpl {
           // If already closing/closed, suppress errors from missing managers
           if (shouldAbortBackgroundScan) break;
 
+          // Schema migrate drops runtime-only tables asynchronously after open;
+          // prewarm may still hold a stale name list - skip quietly.
+          if (_isDevTableNotFound(e)) {
+            continue;
+          }
+
           Logger.error('Load table data failed: $tableName', rawError: e);
           continue; // Continue load other tables
         }
@@ -6360,12 +6356,6 @@ class DataStoreImpl {
 
       if (shouldAbortBackgroundScan) return;
 
-      final effectivePrewarmThresholdMB =
-          await _resourceManager!.initializeEffectivePrewarmThresholdMB();
-      final effectivePrewarmBudgetBytes =
-          effectivePrewarmThresholdMB * 1024 * 1024;
-
-      var remainingPrewarmBytes = effectivePrewarmBudgetBytes;
       remainingPrewarmBytes = await _prewarmKvStore(
         maxPrewarmBytes: remainingPrewarmBytes,
       );
@@ -6385,11 +6375,84 @@ class DataStoreImpl {
     }
   }
 
+  /// Max rows to warm into TreeCache (covers typical < 200k datasets).
+  static const int _prewarmMaxRecords = 200000;
+
+  /// Per-batch size so Flutter can paint between chunks (avoid one 200k scan).
+  static const int _prewarmBatchSize = 1000;
+
+  /// Prewarm table rows via cursor batches; yields to the event loop each batch.
+  Future<void> _prewarmQueryInBatches({
+    required TableContext table,
+    required QueryCondition condition,
+    int maxRecords = _prewarmMaxRecords,
+    int batchSize = _prewarmBatchSize,
+  }) async {
+    if (maxRecords <= 0 || batchSize <= 0) return;
+    String? cursor;
+    var loaded = 0;
+    while (loaded < maxRecords) {
+      if (shouldAbortBackgroundScan) return;
+      final limit = min(batchSize, maxRecords - loaded);
+      final result = await queryExecutor.execute(
+        table,
+        condition: condition,
+        limit: limit,
+        cursor: cursor,
+        enableQueryCache: false,
+      );
+      final n = result.records.length;
+      loaded += n;
+      if (n == 0 || !result.hasMore || result.nextCursor == null) {
+        return;
+      }
+      cursor = result.nextCursor;
+      // Always return to the event loop between batches for UI / cancel.
+      await Future<void>.delayed(Duration.zero);
+    }
+  }
+
+  /// Prewarm one B+Tree index in batches (avoids a single 200k materialization).
+  Future<void> _prewarmIndexInBatches({
+    required TableContext table,
+    required IndexUid indexUid,
+    required IndexMeta meta,
+    int maxRecords = _prewarmMaxRecords,
+    int batchSize = _prewarmBatchSize,
+  }) async {
+    final tree = indexTreePartitionManager;
+    if (tree == null || maxRecords <= 0 || batchSize <= 0) return;
+
+    var startKey = Uint8List(0);
+    var loaded = 0;
+    while (loaded < maxRecords) {
+      if (shouldAbortBackgroundScan) return;
+      final limit = min(batchSize, maxRecords - loaded);
+      final result = await tree.searchByKeyRange(
+        table: table,
+        indexUid: indexUid,
+        meta: meta,
+        startKeyInclusive: startKey,
+        endKeyExclusive: Uint8List(0),
+        limit: limit,
+      );
+      final n = result.primaryKeys.length;
+      loaded += n;
+      final lastKey = result.lastKey;
+      if (n == 0 || lastKey == null || n < limit) {
+        return;
+      }
+      // Exclusive resume: append type sentinel (same as table PK cursor).
+      startKey = Uint8List(lastKey.length + 1 + 4);
+      startKey.setRange(0, lastKey.length, lastKey);
+      startKey[lastKey.length] = 0xFF;
+      await Future<void>.delayed(Duration.zero);
+    }
+  }
+
   /// Prewarm KV store tables into TreeCache.
   /// Returns the remaining budget after KV warmup.
   Future<int> _prewarmKvStore({required int maxPrewarmBytes}) async {
-    const maxRecordsSafetyCap = 200000;
-
     final kvTables = [
       SystemTable.getKeyValueName(true),
       SystemTable.getKeyValueName(false),
@@ -6422,11 +6485,10 @@ class DataStoreImpl {
           continue;
         }
 
-        await queryExecutor.execute(
-          table,
+        await _prewarmQueryInBatches(
+          table: table,
           condition: QueryCondition()
             ..where(SystemTable.keyValueKeyField, '>=', ''),
-          limit: maxRecordsSafetyCap,
         );
         currentPrewarmedBytes += estimatedBytes;
         final y19 = yieldController.maybeYield();
@@ -6452,7 +6514,6 @@ class DataStoreImpl {
 
     final spaceStats = await getSpaceStats();
     final spaceUsageBytes = spaceStats.totalSizeBytes;
-    const maxRecordsSafetyCap = 200000;
 
     if (spaceUsageBytes >= prewarmBudgetBytes) {
       return;
@@ -6494,14 +6555,13 @@ class DataStoreImpl {
         final estimatedBytes = tableDataSize + indexBytes;
 
         if (currentPrewarmedBytes + estimatedBytes > prewarmBudgetBytes ||
-            tableDataMeta.totalRecordCount > maxRecordsSafetyCap) {
+            tableDataMeta.totalRecordCount > _prewarmMaxRecords) {
           break;
         }
 
-        await queryExecutor.execute(
-          table,
+        await _prewarmQueryInBatches(
+          table: table,
           condition: QueryCondition()..where(schema.primaryKey, '>=', ''),
-          limit: maxRecordsSafetyCap,
         );
         final y20 = yieldController.maybeYield();
         if (y20 != null) await y20;
@@ -6513,14 +6573,10 @@ class DataStoreImpl {
               await _indexManager?.getIndexMeta(table.tableUid, index.indexUid);
           if (indexMeta == null || indexMeta.btreeFirstLeaf.isNull) continue;
 
-          // Warm the full index by traversing its leaf chain directly.
-          await indexTreePartitionManager?.searchByKeyRange(
+          await _prewarmIndexInBatches(
             table: table,
             indexUid: index.indexUid,
             meta: indexMeta,
-            startKeyInclusive: Uint8List(0),
-            endKeyExclusive: Uint8List(0),
-            limit: maxRecordsSafetyCap,
           );
           final y21 = yieldController.maybeYield();
           if (y21 != null) await y21;
@@ -6531,6 +6587,10 @@ class DataStoreImpl {
         if (y22 != null) await y22;
       } catch (e) {
         if (shouldAbortBackgroundScan) break;
+        // Same race as boundary prewarm: dropped tables vs stale name snapshot.
+        if (_isDevTableNotFound(e)) {
+          continue;
+        }
         Logger.warn('Prewarm user table failed for $tableName', rawError: e);
       }
     }
@@ -6699,7 +6759,7 @@ class DataStoreImpl {
     required String fieldName,
     required VectorData queryVector,
     int topK = 10,
-    int? efSearch,
+    int? searchDepth,
     double? distanceThreshold,
   }) async {
     if (!_isInitialized) {
@@ -6712,93 +6772,44 @@ class DataStoreImpl {
       fieldName: fieldName,
       queryVector: queryVector,
       topK: topK,
-      efSearch: efSearch,
+      searchDepth: searchDepth,
       distanceThreshold: distanceThreshold,
     );
   }
 
-  /// Switch space
+  /// Pause encoding-key migration before tearing down space files / storage.
   ///
-  /// [keepActive] When true (default), writes this [spaceName] to
-  /// [GlobalConfig.activeSpace]. When opening with default space, init will use activeSpace so one open lands in the right space.
-  Future<bool> switchSpace(
-      {String spaceName = 'default', bool keepActive = true}) async {
-    if (!_isInitialized) {
-      await ensureInitialized();
-    }
+  /// Returns false if the runner did not pause in time (caller should abort
+  /// space switch to avoid Windows file-handle races).
+  Future<bool> prepareForSpaceSwitch() async {
+    return await _keyManager?.pauseKeyMigration() ?? true;
+  }
 
-    if (_currentSpaceName == spaceName) {
-      return true;
-    }
-
-    final oldSpaceName = _currentSpaceName;
-    try {
-      // Pause key migration on the primary before tearing down space files.
-      // Helper (isMigrationInstance) close must not cancel this runner - that is
-      // enforced inside KeyManager.pauseKeyMigration.
-      final paused = await _keyManager?.pauseKeyMigration() ?? true;
-      if (!paused) {
-        Logger.warn(
-          'Space switch aborted: encodingKey migration did not pause in time '
-          '(oldSpace=[$oldSpaceName], target=[$spaceName]). '
-          'Refusing to open another space while file handles may still be held.',
-        );
-        return false;
-      }
-
-      // 1. Unified shutdown logic for the current space via close().
-      // closeStorage: true releases the handle pool / Web retain so late async
-      // cannot reopen files belonging to the old space (Windows errno 32).
-      // initialize() rebuilds a fresh StorageAdapter afterwards.
-      await close(closeStorage: true, removeRegistry: false);
-
-      // 2. Update current space name and config
-      _currentSpaceName = spaceName;
-      if (_config != null) {
-        _config = _config!.copyWith(spaceName: _currentSpaceName);
-      }
-
-      // Reinitialize database with the new space configuration
-      await initialize(applyActiveSpaceOnDefault: false);
-
-      // Update GlobalConfig only if there are actual changes to avoid unnecessary IO
-      final globalConfig = await getGlobalConfig();
-      if (globalConfig != null) {
-        bool needsUpdate = false;
-        GlobalConfig updatedConfig = globalConfig;
-
-        // Add space if it doesn't exist
-        if (!globalConfig.spaceNames.contains(spaceName)) {
-          updatedConfig = updatedConfig.addSpace(spaceName);
-          needsUpdate = true;
-        }
-
-        // Update activeSpace only if keepActive is true and it's different
-        if (keepActive && globalConfig.activeSpace != spaceName) {
-          updatedConfig = updatedConfig.copyWith(activeSpace: spaceName);
-          needsUpdate = true;
-        }
-
-        // Save only if there are actual changes
-        if (needsUpdate) {
-          await saveGlobalConfig(updatedConfig);
-        }
-      }
-
-      Logger.info(
-        'Switched space from [$oldSpaceName] to [$spaceName]',
-      );
-
-      return true;
-    } catch (e) {
-      // Rollback on failure
-      _currentSpaceName = oldSpaceName;
-      if (_config != null) {
-        _config = _config!.copyWith(spaceName: oldSpaceName);
-      }
-      Logger.error('Space switch failed', rawError: e);
-      return false;
-    }
+  /// After [close] with [removeRegistry] true, allocate a fresh engine for
+  /// [spaceName] that reuses path identity, schemas, and lifecycle callbacks.
+  ///
+  /// Does not start [initialize]  - caller must open the successor explicitly
+  /// with [applyActiveSpaceOnDefault] false so the target space is honored.
+  DataStoreImpl spawnSuccessor({required String spaceName}) {
+    final base = _config ?? DataStoreConfig();
+    final next = DataStoreImpl._internal(
+      _instanceKey,
+      List<TableSchema>.from(_userSchemas),
+      _onConfigure,
+      _onCreate,
+      _onOpen,
+      false,
+    );
+    next._dbPath = _dbPath;
+    next._dbName = _dbName;
+    next._config = base.copyWith(
+      spaceName: spaceName,
+      dbPath: _dbPath ?? base.dbPath,
+      dbName: _dbName ?? base.dbName,
+    );
+    next._currentSpaceName = spaceName;
+    _instances[_instanceKey] = next;
+    return next;
   }
 
   /// Save all cache data before application exit

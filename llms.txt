@@ -1,0 +1,18 @@
+# ToStore
+
+> Distributed data engine (tables + KV + vectors): online schema evolution, hybrid retrieval, ACID transactions, multi-space isolation, and encryption — for apps, servers, and Agents.
+
+Import: `package:tostore/tostore.dart`. Prefer `ToStore.open` / `ToStore.memory`. Full AI coding rules live in the complete corpus below.
+
+## Docs
+
+- [Complete AI Programming Spec (llms-full)](https://raw.githubusercontent.com/tocreator/tostore/main/llms-full.txt): Self-contained API rules, checklists, and anti-patterns for coding agents and training
+- [AI modules (source)](https://github.com/tocreator/tostore/tree/main/doc/ai/modules): Maintainable topic modules that generate llms-full
+- [Human README](https://raw.githubusercontent.com/tocreator/tostore/main/README.md): Tutorials and examples for people
+- [ResultStatus Specification](https://raw.githubusercontent.com/tocreator/tostore/main/doc/result_status_specification.md): Status codes for Agents and automated ops
+- [AGENTS.md](https://raw.githubusercontent.com/tocreator/tostore/main/AGENTS.md): Short hard rules for in-repo agents
+
+## Optional
+
+- [Upgrade Guide v3](https://raw.githubusercontent.com/tocreator/tostore/main/doc/UPGRADE_GUIDE_v3.md): Breaking changes from v2.x
+- [pub.dev package](https://pub.dev/packages/tostore): Package page and versions

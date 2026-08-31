@@ -1,4 +1,4 @@
-<h1 align="center">
+﻿<h1 align="center">
   <img src="../../resource/logo-tostore.svg" width="400" alt="ToStore">
 </h1>
 
@@ -39,8 +39,8 @@
 - [为什么选择ToStore](#why-tostore) | [核心特性](#key-features) | [安装指南](#installation) | [KV模式](#quick-start-kv) | [表模式](#quick-start-table) | [内存模式](#quick-start-memory)
 - [表结构定义](#schema-definition) | [分布式架构](#distributed-architecture) | [级联外键](#foreign-keys) | [移动/桌面端](#mobile-integration) | [服务端/智能体](#server-integration) | [主键算法](#primary-key-examples)
 - [高级查询 (JOIN)](#query-advanced) | [聚合与统计](#aggregation-stats) | [复杂逻辑 (Condition)](#query-condition) | [响应式监听 (watch)](#reactive-query) | [流式查询](#streaming-query)
-- [KV进阶](#kv-advanced) | [批量操作](#bulk-operations) | [向量检索](#vector-advanced) | [表级 TTL](#ttl-config) | [高效分页](#query-pagination) | [内存探针与同步检索 (peek)](#query-peek) | [查询缓存](#query-cache) | [原子操作](#atomic-expressions) | [事务](#transactions)
-- [管理维护](#database-maintenance) | [安全配置](#security-config) | [错误处理](#error-handling) | [性能与诊断](#performance) | [欢迎贡献](#contribute)
+- [KV进阶](#kv-advanced) | [批量操作](#bulk-operations) | [向量与混合检索](#vector-advanced) | [表级 TTL](#ttl-config) | [高效分页](#query-pagination) | [内存探针与同步检索 (peek)](#query-peek) | [查询缓存](#query-cache) | [原子操作](#atomic-expressions) | [事务](#transactions)
+- [管理维护](#database-maintenance) | [安全配置](#security-config) | [错误处理](#error-handling) | [性能与诊断](#performance) | [欢迎贡献](#contribute) | [AI 编程助手](#for-ai-coding-assistants)
 
 
 ## <a id="why-tostore"></a>为什么选择 ToStore？
@@ -49,9 +49,9 @@ ToStore 是面向 AGI 时代与边缘智能场景设计的现代化数据引擎�
 
 运行态建模与非阻塞执行路径，架构演进全程在线、业务完全无感——表结构声明式变更、密钥轮换、海量数据重构均可在线无感完成。面向 Agent 与自动化运维，支撑其自主演进与持续迭代，服务不中断。
 
-原生支持关系型结构化数据、高维向量数据与非结构化数据的统一数据引擎，兼具工业级数据库能力，如 ACID 事务、复杂关系查询（JOIN、级联外键）、表级 TTL、聚合计算，以及分布式主键算法、原子性表达式、加密保护、多空间隔离与故障自愈等。
+原生支持关系型结构化数据、高维向量数据与非结构化数据的统一数据引擎，内建混合检索与多路召回融合能力，兼具工业级数据库能力，如 ACID 事务、复杂关系查询（JOIN、级联外键）、表级 TTL、聚合计算，以及分布式主键算法、原子性表达式、加密保护、多空间隔离与故障自愈等。
 
-随着计算重心持续向端侧边缘智能偏移，终端设备不再只是"内容展示器"，而是承担局部生成、环境感知、实时决策与数据协同的智能节点。ToStore 赋予边缘端支撑海量数据与复杂 AI 局部生成的分布式能力，边云节点深度智能协同，为多模态交互、语义向量、空间建模及边缘自主协同等场景提供可靠的数据基座。
+随着计算重心持续向端侧边缘智能偏移，终端设备不再只是"内容展示器"，而是承担局部生成、环境感知、实时决策与数据协同的智能节点。ToStore 赋予边缘端支撑海量数据与复杂 AI 局部生成的分布式能力，边云节点深度智能协同，为多模态交互、语义向量混合检索、空间建模及边缘自主协同等场景提供可靠的数据基座。
 
 
 
@@ -73,6 +73,11 @@ ToStore 是面向 AGI 时代与边缘智能场景设计的现代化数据引擎�
   - 移动端、桌面端、Web 与服务端统一 API
   - 覆盖关系型结构化数据、高维向量与非结构化数据
   - 从本地存储到边云协同的完整数据链路
+
+- 🔍 **结构化查询与混合检索**
+  - 复杂条件、JOIN、聚合与表级 TTL
+  - 多通道召回可同链组合（向量、结构化等）
+  - 多路召回融合排序，分数与通道诊断随查询结果返回
 
 - ⚡ **并行执行与资源调度**
   - 资源感知智能负载调度，保障高可用
@@ -96,6 +101,10 @@ ToStore 是面向 AGI 时代与边缘智能场景设计的现代化数据引擎�
 dependencies:
   tostore: any # 请使用最新版本
 ```
+
+### For AI Coding Assistants
+
+使用 AI 助手生成 ToStore 客户端代码时，请向其提供单文件规范 [`llms-full.txt`](../../../llms-full.txt)——例如在 IDE 中 `@llms-full.txt`、上传或粘贴该文件，或将其 [raw URL](https://raw.githubusercontent.com/tocreator/tostore/main/llms-full.txt) 加入助手的文档索引。该文件包含 API 签名、约束与反模式，有助于模型对齐真实的公开接口。发现索引：[`llms.txt`](../../../llms.txt)。
 
 ## <a id="quick-start"></a>快速开始
 
@@ -696,7 +705,9 @@ ToStore 针对大规模数据吞吐提供了专门的批量处理接口。这些
 > 可以设置 `allowPartialErrors: true` 来确保个别数据错误不会拒绝本次批量操作。
 
 
-### <a id="vector-advanced"></a>向量字段、向量索引与向量检索
+### <a id="vector-advanced"></a>向量字段、向量索引与混合检索
+
+向量检索走统一的 `db.query(...).matchVector(...)` 查询链：可与结构化条件同链组合，也可与其它召回分支做多路融合；分数与通道诊断在 `QueryResult.retrieval` 中返回，与 `data` 行一一对应。当前示例以向量 + 结构化为主，词法、图检索等通道将沿同一套链式混合检索模型扩展。
 
 ```dart
 await db.createTables([
@@ -711,6 +722,12 @@ await db.createTables([
         name: 'document_title',
         type: DataType.text,
         nullable: false,
+      ),
+      FieldSchema(
+        name: 'category',
+        type: DataType.text,
+        nullable: false,
+        createIndex: true,
       ),
       FieldSchema(
         name: 'embedding',
@@ -729,9 +746,6 @@ await db.createTables([
         vectorConfig: VectorIndexConfig(
           indexType: VectorIndexType.ngh,  // 向量索引类型；当前内置为 NGH
           distanceMetric: VectorDistanceMetric.cosine, // 距离度量；适合归一化后的 embedding
-          maxDegree: 32, // 图中每个节点保留的最大邻居数；越大召回通常越高，但更耗内存
-          efSearch: 64, // 查询扩展因子；越大召回通常越高，但查询更慢
-          constructionEf: 128, // 建索引扩展因子；越大索引质量通常越高，但构建更慢
         ),
       ),
     ],
@@ -741,34 +755,63 @@ await db.createTables([
 final queryVector =
     VectorData.fromList(List.generate(128, (i) => i * 0.01)); // 长度需与 dimensions 一致
 
-// 向量检索
-final results = await db.vectorSearch(
-  'embeddings', // 表名
-  fieldName: 'embedding', // 向量字段名
-  queryVector: queryVector, // 查询向量
-  topK: 5, // 返回最相近的前 5 条记录
-  efSearch: 64, // 可覆盖索引中的查询扩展因子；越大通常召回越高，但延迟也更高
-);
+// 1) 主推：链式混合检索（纯向量近邻）
+final result = await db
+    .query('embeddings')
+    .matchVector('embedding', queryVector) // 默认 searchDepth = 80
+    .limit(5);
 
-for (final r in results) {
-  print('pk=${r.primaryKey}, score=${r.score}, distance=${r.distance}');
+for (var i = 0; i < result.data.length; i++) {
+  final row = result.data[i];
+  final entry = result.retrieval?.entries[i];
+  final score = entry?.score;
+  final distance = entry?.meta?['distance'];
+  print('pk=${row['id']}, title=${row['document_title']}, '
+      'score=$score, distance=$distance');
 }
+
+// 2) 结构化过滤 + 向量（AND 混合）
+final filtered = await db
+    .query('embeddings')
+    .whereEqual('category', 'tech')
+    .matchVector('embedding', queryVector)
+    .limit(5);
+
+// 3) 多路融合召回（向量路 + 结构化路，引擎侧 RRF 融合）
+final otherVector =
+    VectorData.fromList(List.generate(128, (i) => i * 0.012));
+final fused = await db
+    .query('embeddings')
+    .matchVector('embedding', queryVector, weight: 1.0)
+    .orMatchVector('embedding', otherVector, weight: 0.6, minScore: 0.2)
+    .or()
+    .whereEqual('category', 'tech')
+    .limit(10);
+
+print('fusion=${fused.retrieval?.fusionMethod}'); // 多路时通常为 rrf
 ```
 
-参数说明：
+**表结构 / 向量索引配置**（`VectorFieldConfig`、`VectorIndexConfig`）：
 
 - `dimensions`：向量维度，必须与实际写入的 embedding 长度一致。
 - `precision`：向量存储精度，常见可选值有 `float64`、`float32`、`int8`；精度越高，存储开销通常越大。
-- `distanceMetric`：相似度度量方式；`cosine` 常用于语义 embedding，`l2` 适合欧氏距离场景，`innerProduct` 适合点积检索。
-- `maxDegree`：NGH 图索引中每个节点保留的邻居上限，增大后通常可提升召回率，但会增加内存占用和构建成本。
-- `efSearch`：查询阶段扩展宽度，增大后通常可提升召回率，但会增加查询延迟。索引配置里可设置默认值，`vectorSearch(...)` 时也可以按单次查询覆盖。
-- `constructionEf`：索引构建阶段扩展宽度，增大后通常可提升索引质量，但会增加建索引耗时。
-- `topK`：返回结果数量。
+- `distanceMetric`：索引侧相似度度量（构建与检索共用）；`cosine` 常用于语义 embedding，`l2` 适合欧氏距离场景，`innerProduct` 适合点积检索。数据写入后若修改通常需要重建向量索引。
 
-结果说明：
+**链式检索参数**（`matchVector` / `orMatchVector`，以及查询链上的 `limit`）：
 
-- `score`：归一化后的相似度分数，范围通常在 `0 ~ 1`，值越大表示越相近。
-- `distance`：距离值；对 `l2` / `cosine` 场景通常越小表示越相近。
+- `field` / `vector`：目标向量字段与查询向量（`VectorData` / `List<num>` / `Float32List`）。
+- `searchDepth`：可选检索深度 `[1, 100]`（**不是**召回率%）；值越大通常召回意图越高、也更耗时，值越小更快但可能漏检；未传则使用引擎默认 `80`。
+- `weight`：多路召回时该通道的融合权重，默认 `1.0`。
+- `minScore`：归一化相似度下限 `[0.0 ~ 1.0]`，低于阈值的候选会被裁剪。
+- `distanceThreshold`：距离上限，超出则不作为候选。
+- `limit`：返回结果数量（对应常见 ANN 场景中的 topK）。
+
+**结果说明**（`QueryResult`）：
+
+- 业务行数据在 `data`；检索分数与通道信息在 `retrieval.entries`，与 `data` **一一对应**。
+- `entry.score`：归一化后的相似度 / 融合分数，范围通常在 `0 ~ 1`，值越大表示越相关。
+- `entry.meta['distance']`：原始距离（向量通道常见）；对 `l2` / `cosine` 场景通常越小表示越相近。
+- `retrieval.fusionMethod`：单通道多为 `single`；多路融合召回多为 `rrf`（Reciprocal Rank Fusion）。
 
 ### <a id="ttl-config"></a>表级 TTL（按时间自动过期清理）
 
@@ -1564,7 +1607,7 @@ if (result.hasErrors) {
 #### 2. 批量写入操作的精细化诊断
 
 ```dart
-final batchResult = await db.insertAll('users', [
+final batchResult = await db.batchInsert('users', [
   {'username': 'alice', 'email': 'alice@example.com'},
   {'username': 'bob', 'email': 'invalid-email-format'}, // 格式校验失败
 ]);

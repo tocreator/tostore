@@ -33,8 +33,8 @@
 - [ストアする理由](#why-tostore) | 【主な特長】(#key-features) | [インストールガイド](#installation) | [KVモード](#quick-start-kv) | [テーブルモード](#quick-start-table) | [メモリーモード](#quick-start-memory)
 - [スキーマ定義](#schema-definition) | [分散アーキテクチャ](#distributed-architecture) | [カスケード外部キー](#foreign-keys) | [モバイル/デスクトップ](#mobile-integration) | [サーバー/エージェント](#server-integration) | [主キーのアルゴリズム](#primary-key-examples)
 - [高度なクエリ (JOIN)](#query-advanced) | [集計と統計](#aggregation-stats) | [複雑なロジック(QueryCondition)](#query-condition) | [リアクティブクエリ (監視)](#reactive-query) | [ストリーミングクエリ](#streaming-query)
-- [KV高度な操作](#kv-advanced) | [一括操作](#bulk-operations) | [ベクトル検索](#vector-advanced) | [テーブルレベル TTL](#ttl-config) | [効率的なページネーション](#query-pagination) | [メモリプローブと同期検索 (peek)](#query-peek) | [クエリキャッシュ](#query-cache) | [原子式](#atomic-expressions) | 【取引】(#transactions)
-- [管理](#database-maintenance) | [セキュリティ設定](#security-config) | [エラー処理](#error-handling) | [パフォーマンスと診断](#performance) | [貢献](#contribute)
+- [KV高度な操作](#kv-advanced) | [一括操作](#bulk-operations) | [ベクトル＆ハイブリッド検索](#vector-advanced) | [テーブルレベル TTL](#ttl-config) | [効率的なページネーション](#query-pagination) | [メモリプローブと同期検索 (peek)](#query-peek) | [クエリキャッシュ](#query-cache) | [原子式](#atomic-expressions) | 【取引】(#transactions)
+- [管理](#database-maintenance) | [セキュリティ設定](#security-config) | [エラー処理](#error-handling) | [パフォーマンスと診断](#performance) | [貢献](#contribute) | [AI コーディング支援](#for-ai-coding-assistants)
 
 ## <a id="why-tostore"></a>ToStore を選ぶ理由
 
@@ -42,9 +42,9 @@ ToStore は、AGI 時代とエッジ インテリジェンス シナリオ向け
 
 ランタイム モデリングと非ブロッキング実行パスにより、アーキテクチャの進化は常にオンラインでビジネスに完全に透過的です——宣言的スキーマ変更、データエンコーディングキーのローテーション、大規模なデータリファクタリングはすべてオンラインでシームレスに実行されます。Agent と自動運用に向けて、その自律的な進化と継続的なイテレーションを支え、サービスは中断しません。
 
-リレーショナル構造化データ、高次元ベクトル、非構造化データをネイティブにサポートする統合データエンジンであり、ACID トランザクション、複雑なリレーショナル クエリ（JOIN、カスケード外部キー）、テーブル レベル TTL、集計、分散主キー アルゴリズム、アトミック式、暗号化、マルチスペース分離、自己修復リカバリなど、エンタープライズグレードのデータベース機能を備えています。
+リレーショナル構造化データ、高次元ベクトル、非構造化データをネイティブにサポートする統合データエンジンであり、ハイブリッド検索と多路リコール融合機能を内蔵し、ACID トランザクション、複雑なリレーショナル クエリ（JOIN、カスケード外部キー）、テーブル レベル TTL、集計、分散主キー アルゴリズム、アトミック式、暗号化、マルチスペース分離、自己修復リカバリなど、エンタープライズグレードのデータベース機能を備えています。
 
-コンピューティングがエッジ インテリジェンスに移行し続ける中、デバイスはもはや単なる「コンテンツ ディスプレイ」ではなく、ローカル生成、環境認識、リアルタイムの意思決定、調整されたデータフローを担うインテリジェント ノードです。ToStore はエッジに大規模データセットと複雑なローカル AI 生成を支える分散機能を提供し、エッジとクラウドの深いインテリジェント コラボレーションにより、マルチモーダル インタラクション、セマンティック ベクトル、空間モデリング、エッジ自律連携などのシナリオに信頼できるデータ基盤を提供します。
+コンピューティングがエッジ インテリジェンスに移行し続ける中、デバイスはもはや単なる「コンテンツ ディスプレイ」ではなく、ローカル生成、環境認識、リアルタイムの意思決定、調整されたデータフローを担うインテリジェント ノードです。ToStore はエッジに大規模データセットと複雑なローカル AI 生成を支える分散機能を提供し、エッジとクラウドの深いインテリジェント コラボレーションにより、マルチモーダル インタラクション、セマンティック ベクトル ハイブリッド検索、空間モデリング、エッジ自律連携などのシナリオに信頼できるデータ基盤を提供します。
 
 ## <a id="key-features"></a>主な機能
 
@@ -63,6 +63,11 @@ ToStore は、AGI 時代とエッジ インテリジェンス シナリオ向け
   - モバイル、デスクトップ、Web、サーバー環境にわたる統合 API
   - リレーショナル構造化データ、高次元ベクトル、非構造化データをカバー
   - ローカルストレージからエッジクラウドコラボレーションまでの完全なデータパイプライン
+
+- 🔍 **構造化クエリとハイブリッド検索**
+  - 複雑な条件、JOIN、集計、およびテーブルレベル TTL
+  - 同一クエリチェーン上で多チャネルリコールを組み合わせ可能（ベクトル、構造化など）
+  - 多路リコール融合ランキング。スコアとチャネル診断をクエリ結果とともに返却
 
 - ⚡ **並列実行とリソーススケジューリング**
   - 高可用性のためのリソース認識インテリジェント負荷スケジューリング
@@ -85,6 +90,10 @@ ToStore は、AGI 時代とエッジ インテリジェンス シナリオ向け
 dependencies:
   tostore: any # Please use the latest version
 ```
+
+### For AI Coding Assistants
+
+AI アシスタントで ToStore のクライアントコードを生成する場合は、単一ファイルの仕様 [`llms-full.txt`](../../../llms-full.txt) を渡してください。IDE で `@llms-full.txt`、ファイルのアップロード/貼り付け、または [raw URL](https://raw.githubusercontent.com/tocreator/tostore/main/llms-full.txt) をアシスタントのドキュメントに登録する方法があります。API シグネチャ、制約、アンチパターンが含まれ、公開 API に沿った出力を助けます。索引：[`llms.txt`](../../../llms.txt)。
 
 ## <a id="quick-start"></a>クイックスタート
 
@@ -675,7 +684,9 @@ ToStore は、大規模なデータスループット向けに最適化された
 > `allowPartialErrors: true` を設定することで、個別のデータエラー（単一レコードの衝突など）がバッチ操作全体を拒否しないようにできます。
 
 
-### <a id="vector-advanced"></a>ベクトル フィールド、ベクトル インデックス、ベクトル検索
+### <a id="vector-advanced"></a>ベクトル フィールド、ベクトル インデックス、ハイブリッド検索
+
+ベクトル検索は統一された `db.query(...).matchVector(...)` クエリチェーンを使用します。同一チェーン上で構造化条件と組み合わせることも、他のリコール分岐と多路融合することもできます。スコアとチャネル診断は `QueryResult.retrieval` で返され、`data` 行と 1:1 で対応します。現在の例はベクトル＋構造化パスを中心としており、語彙・グラフなどのチャネルも同じチェーン型ハイブリッド検索モデルに沿って拡張されます。
 
 ```dart
 await db.createTables([
@@ -690,6 +701,12 @@ await db.createTables([
         name: 'document_title',
         type: DataType.text,
         nullable: false,
+      ),
+      FieldSchema(
+        name: 'category',
+        type: DataType.text,
+        nullable: false,
+        createIndex: true,
       ),
       FieldSchema(
         name: 'embedding',
@@ -708,9 +725,6 @@ await db.createTables([
         vectorConfig: VectorIndexConfig(
           indexType: VectorIndexType.ngh, // Built-in vector index type
           distanceMetric: VectorDistanceMetric.cosine, // Good for normalized embeddings
-          maxDegree: 32, // More neighbors usually improve recall at higher memory cost
-          efSearch: 64, // Higher recall but slower queries
-          constructionEf: 128, // Higher-quality index but slower build time
         ),
       ),
     ],
@@ -720,34 +734,63 @@ await db.createTables([
 final queryVector =
     VectorData.fromList(List.generate(128, (i) => i * 0.01)); // Must match dimensions
 
-// Vector search
-final results = await db.vectorSearch(
-  'embeddings',
-  fieldName: 'embedding',
-  queryVector: queryVector,
-  topK: 5, // Return the top 5 nearest records
-  efSearch: 64, // Override the search expansion factor for this request
-);
+// 1) Recommended: chained hybrid retrieval (pure vector ANN)
+final result = await db
+    .query('embeddings')
+    .matchVector('embedding', queryVector) // default searchDepth = 80
+    .limit(5);
 
-for (final r in results) {
-  print('pk=${r.primaryKey}, score=${r.score}, distance=${r.distance}');
+for (var i = 0; i < result.data.length; i++) {
+  final row = result.data[i];
+  final entry = result.retrieval?.entries[i];
+  final score = entry?.score;
+  final distance = entry?.meta?['distance'];
+  print('pk=${row['id']}, title=${row['document_title']}, '
+      'score=$score, distance=$distance');
 }
+
+// 2) Structured filter + vector (AND hybrid)
+final filtered = await db
+    .query('embeddings')
+    .whereEqual('category', 'tech')
+    .matchVector('embedding', queryVector)
+    .limit(5);
+
+// 3) Multi-way fused recall (vector + structured paths, engine-side RRF)
+final otherVector =
+    VectorData.fromList(List.generate(128, (i) => i * 0.012));
+final fused = await db
+    .query('embeddings')
+    .matchVector('embedding', queryVector, weight: 1.0)
+    .orMatchVector('embedding', otherVector, weight: 0.6, minScore: 0.2)
+    .or()
+    .whereEqual('category', 'tech')
+    .limit(10);
+
+print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
 ```
 
-パラメータのメモ:
+**スキーマ / ベクトルインデックス設定**（`VectorFieldConfig`、`VectorIndexConfig`）：
 
-- `dimensions`: 書き込む実際の埋め込み幅と一致する必要があります
-- `precision`: 一般的な選択肢には、`float64`、`float32`、`int8` が含まれます。精度が高いほど、通常はより多くのストレージが必要になります
-- `distanceMetric`: `cosine` はセマンティック埋め込みに一般的、`l2` はユークリッド距離に適し、`innerProduct` はドット積検索に適しています
-- `maxDegree`: NGH グラフ内のノードごとに保持される隣接ノードの上限。通常、値を大きくすると、より多くのメモリとビルド時間を犠牲にしてリコールが向上します。
-- `efSearch`: 検索時の拡張幅。通常、値を増やすとリコールは改善されますが、レイテンシが増加します。
-- `constructionEf`: ビルド時の拡張幅。通常、値を増やすとインデックスの品質は向上しますが、ビルド時間が長くなります。
-- `topK`: 返される結果の数
+- `dimensions`: 実際に書き込む埋め込み幅と一致する必要があります
+- `precision`: 一般的な選択肢には `float64`、`float32`、`int8` が含まれます。精度が高いほど、通常はより多くのストレージが必要です
+- `distanceMetric`: インデックス側の類似度メトリクス。`cosine` はセマンティック埋め込みに一般的、`l2` はユークリッド距離に適し、`innerProduct` はドット積検索に適しています
 
-結果のメモ:
+**チェーン検索パラメータ**（`matchVector` / `orMatchVector`、およびクエリチェーン上の `limit`）：
 
-- `score`: 正規化された類似性スコア。通常は `0 ~ 1` の範囲です。大きいほど類似していることを意味します
-- `distance`: 距離値。 `l2` と `cosine` の場合、通常、小さいほど類似していることを意味します
+- `field` / `vector`: 対象ベクトルフィールドとクエリベクトル（`VectorData` / `List<num>` / `Float32List`）
+- `searchDepth`: optional thoroughness in `[1, 100]` (**not** a recall%); higher usually means better recall intent and higher latency, lower is faster but may miss neighbors; omit → engine default `80`
+- `weight`: 多路リコール時の当該チャネルの融合ウェイト。デフォルトは `1.0`
+- `minScore`: 正規化類似度の下限 `[0.0 ~ 1.0]`。閾値未満の候補は切り捨てられます
+- `distanceThreshold`: 距離の上限。超えた候補は除外されます
+- `limit`: 返却する結果数（一般的な ANN における topK に相当）
+
+**結果のメモ**（`QueryResult`）：
+
+- 業務行データは `data`、検索スコアとチャネル情報は `retrieval.entries` にあり、`data` と **1:1** で対応します
+- `entry.score`: 正規化された類似度 / 融合スコア。通常は `0 ~ 1` の範囲で、大きいほど関連性が高いことを意味します
+- `entry.meta['distance']`: 生の距離（ベクトルチャネルで一般的）。`l2` / `cosine` の場合、通常小さいほど近いことを意味します
+- `retrieval.fusionMethod`: 単一チャネルでは多くが `single`、多路融合リコールでは多くが `rrf`（Reciprocal Rank Fusion）です
 
 ### <a id="ttl-config"></a>テーブルレベルの TTL (時間ベースの自動有効期限)
 
@@ -1535,7 +1578,7 @@ if (result.hasErrors) {
 #### 2. 一括書き込みにおける詳細な診断
 
 ```dart
-final batchResult = await db.insertAll('users', [
+final batchResult = await db.batchInsert('users', [
   {'username': 'alice', 'email': 'alice@example.com'},
   {'username': 'bob', 'email': 'invalid-email-format'}, // Validation fails
 ]);

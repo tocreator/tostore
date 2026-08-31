@@ -13,6 +13,7 @@ import 'ngh_graph_engine.dart';
 import 'ngh_partition_manager.dart';
 import 'vector_cache.dart';
 import 'vector_quantizer.dart';
+import 'vector_search_timing.dart';
 import 'workload_scheduler.dart';
 import 'yield_controller.dart';
 
@@ -28,10 +29,37 @@ class VectorIndexManager {
   /// Key: "$tableUid/$indexUid", value: the single in-progress Future.
   final Map<String, Future<NghIndexMeta?>> _metaLoadingFutures = {};
 
+  /// Hot field → vector indexUid resolution cache.
+  /// Key: "$tableUid/$fieldName"
+  final Map<String, IndexUid?> _fieldIndexUidCache = {};
+
   VectorIndexManager(this._dataStore) {
     _partitionManager = NghPartitionManager(_dataStore);
     _graphEngine = NghGraphEngine(_partitionManager);
     _vectorCache = VectorCache();
+    final indexBudget =
+        _dataStore.resourceManager?.getIndexCacheSize() ?? (64 * 1024 * 1024);
+    // Compact SQ8 cluster cache — keep enough to hold probed clusters warm.
+    _graphEngine.configureClusterCacheBudget((indexBudget * 0.45).round());
+  }
+
+  IndexUid? _resolveVectorIndexUid(TableContext table, String fieldName) {
+    final cacheKey = '${table.tableUid.value}/$fieldName';
+    if (_fieldIndexUidCache.containsKey(cacheKey)) {
+      return _fieldIndexUidCache[cacheKey];
+    }
+    final vectorIndexes =
+        _dataStore.tableMetaManager?.getVectorIndexesFor(table.schema) ??
+            const <IndexSchema>[];
+    IndexUid? resolved;
+    for (final idx in vectorIndexes) {
+      if (idx.fields.contains(fieldName)) {
+        resolved = idx.indexUid;
+        break;
+      }
+    }
+    _fieldIndexUidCache[cacheKey] = resolved;
+    return resolved;
   }
 
   Future<({List<Float32List> vectors, List<String> primaryKeys})>
@@ -221,96 +249,178 @@ class VectorIndexManager {
     required String fieldName,
     required VectorData queryVector,
     int topK = 10,
-    int? efSearch,
+    int? searchDepth,
     double? distanceThreshold,
+    VectorSearchPhaseRecorder? timing,
   }) async {
-    // Find the vector index for this field
-    final schema =
-        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
-    if (schema == null) return const [];
-
-    final vectorIndexes =
-        _dataStore.tableMetaManager?.getVectorIndexesFor(schema) ??
-            const <IndexSchema>[];
-    IndexSchema? targetIdx;
-    for (final idx in vectorIndexes) {
-      if (idx.fields.contains(fieldName)) {
-        targetIdx = idx;
-        break;
-      }
-    }
-    if (targetIdx == null) return const [];
-
-    final indexUid = targetIdx.indexUid;
+    final indexUid = timing != null
+        ? timing.phase(
+            'mgr.resolveIndex',
+            () => _resolveVectorIndexUid(table, fieldName),
+          )
+        : _resolveVectorIndexUid(table, fieldName);
+    if (indexUid == null) return const [];
 
     // Load meta (concurrently prefetch navGraph on cold start)
-    var meta = _vectorCache.getMeta(table, indexUid);
-    if (meta == null) {
-      final navPrefetch = _graphEngine.prefetchNavGraph(table, indexUid);
-      meta = await _loadMeta(table, indexUid);
-      await navPrefetch;
+    NghIndexMeta? meta;
+    if (timing != null) {
+      meta = await timing.phaseAsync('mgr.loadMeta', () async {
+        var m = _vectorCache.getMeta(table, indexUid);
+        if (m == null) {
+          final navPrefetch = _graphEngine.prefetchNavGraph(table, indexUid);
+          m = await _loadMeta(table, indexUid);
+          await navPrefetch;
+        }
+        return m;
+      });
+    } else {
+      meta = _vectorCache.getMeta(table, indexUid);
+      if (meta == null) {
+        final navPrefetch = _graphEngine.prefetchNavGraph(table, indexUid);
+        meta = await _loadMeta(table, indexUid);
+        await navPrefetch;
+      }
     }
     if (meta == null || meta.isBuilding || meta.totalVectors == 0) {
       return const [];
     }
 
-    // NGH engine uses direct inlined SQ8 scoring (0 external quantizer codebook read)
     final quantizer = VectorQuantizer.empty();
 
-    // Prepare query vector
-    final queryF32 = _toFloat32(queryVector.values, meta.dimensions);
-
-    // Normalise for cosine metric
-    Float32List searchQuery = queryF32;
-    if (meta.distanceMetric == VectorDistanceMetric.cosine) {
-      searchQuery = _normalizeFloat32(queryF32);
+    late final Float32List queryF32;
+    late Float32List searchQuery;
+    late final bool alreadyNormalized;
+    if (timing != null) {
+      timing.phase('mgr.prepareQuery', () {
+        final rawValues = queryVector.values;
+        if (rawValues is Float32List && rawValues.length == meta!.dimensions) {
+          queryF32 = rawValues;
+        } else {
+          queryF32 = _toFloat32(rawValues, meta!.dimensions);
+        }
+        alreadyNormalized = meta.distanceMetric == VectorDistanceMetric.cosine;
+        searchQuery =
+            alreadyNormalized ? _normalizeFloat32(queryF32) : queryF32;
+      });
+    } else {
+      final rawValues = queryVector.values;
+      if (rawValues is Float32List && rawValues.length == meta.dimensions) {
+        queryF32 = rawValues;
+      } else {
+        queryF32 = _toFloat32(rawValues, meta.dimensions);
+      }
+      alreadyNormalized = meta.distanceMetric == VectorDistanceMetric.cosine;
+      searchQuery = alreadyNormalized ? _normalizeFloat32(queryF32) : queryF32;
     }
 
-    final results = await _graphEngine.search(
-      table: table,
-      indexUid: indexUid,
-      meta: meta,
-      quantizer: quantizer,
-      query: searchQuery,
-      topK: topK,
-      efSearch: efSearch,
-      distanceThreshold: distanceThreshold,
-    );
+    final results = timing != null
+        ? await timing.phaseAsync(
+            'mgr.graphSearch',
+            () => _graphEngine.search(
+              table: table,
+              indexUid: indexUid,
+              meta: meta!,
+              quantizer: quantizer,
+              query: searchQuery,
+              topK: topK,
+              searchDepth: searchDepth,
+              distanceThreshold: distanceThreshold,
+              queryAlreadyNormalized: alreadyNormalized,
+              timing: timing,
+            ),
+          )
+        : await _graphEngine.search(
+            table: table,
+            indexUid: indexUid,
+            meta: meta,
+            quantizer: quantizer,
+            query: searchQuery,
+            topK: topK,
+            searchDepth: searchDepth,
+            distanceThreshold: distanceThreshold,
+            queryAlreadyNormalized: alreadyNormalized,
+          );
     if (results.isEmpty) {
       return const [];
     }
 
-    // PK is inlined in posting slots (0 secondary I/O).
     final entries = <VectorSearchResult>[];
-    for (final r in results) {
-      final pk = r.primaryKey;
-      if (pk == null || pk.isEmpty) continue;
-      entries.add(VectorSearchResult(
-        primaryKey: pk,
-        distance: r.distance,
-        score: _distanceToScore(r.distance, meta.distanceMetric),
-      ));
+    if (timing != null) {
+      timing.phase('mgr.buildResults', () {
+        for (final r in results) {
+          final pk = r.primaryKey;
+          if (pk == null || pk.isEmpty) continue;
+          entries.add(VectorSearchResult(
+            primaryKey: pk,
+            distance: r.distance,
+            score: _distanceToScore(r.distance, meta!.distanceMetric),
+          ));
+        }
+      });
+    } else {
+      for (final r in results) {
+        final pk = r.primaryKey;
+        if (pk == null || pk.isEmpty) continue;
+        entries.add(VectorSearchResult(
+          primaryKey: pk,
+          distance: r.distance,
+          score: _distanceToScore(r.distance, meta.distanceMetric),
+        ));
+      }
     }
     return entries;
   }
 
-  /// Prewarm vector index metadata and navigating centroid graph into memory cache.
-  Future<void> prewarmVectorIndex(
+  /// Prewarm vector index meta, nav graph, and posting clusters into cache.
+  ///
+  /// Respects [maxBytes] (and the global cluster-cache ceiling) to avoid OOM.
+  /// Returns approximate bytes added to the cluster compact cache.
+  Future<int> prewarmVectorIndex(
     TableContext table,
-    IndexUid indexUid,
-  ) async {
+    IndexUid indexUid, {
+    int? maxBytes,
+  }) async {
     try {
       final navPrefetch = _graphEngine.prefetchNavGraph(table, indexUid);
       final meta = await _loadMeta(table, indexUid);
-      if (meta != null && !meta.isBuilding && meta.totalVectors > 0) {
-        await navPrefetch;
+      await navPrefetch;
+      if (meta == null || meta.isBuilding || meta.totalVectors <= 0) {
+        return 0;
       }
+
+      final budget = maxBytes ?? _defaultPrewarmBudget();
+      if (budget <= 0) return 0;
+
+      final added = await _graphEngine.prewarmClusters(
+        table: table,
+        indexUid: indexUid,
+        meta: meta,
+        maxBytes: budget,
+      );
+
+      // JIT-compile scoring kernels and prime cluster routing on this isolate.
+      await _graphEngine.warmSearchPath(
+        table: table,
+        indexUid: indexUid,
+        meta: meta,
+      );
+
+      return added;
     } catch (e) {
       Logger.warn(
         'Vector index prewarm failed for index "$indexUid" in table "${table.tableName}"',
         rawError: e,
       );
+      return 0;
     }
+  }
+
+  int _defaultPrewarmBudget() {
+    final rm = _dataStore.resourceManager;
+    final thresholdMb = rm?.getEffectivePrewarmThresholdMB() ?? 32;
+    final thresholdBytes = thresholdMb * 1024 * 1024;
+    final used = getCurrentCacheSize();
+    return max(0, thresholdBytes - used);
   }
 
   // =====================================================================
@@ -411,10 +521,6 @@ class VectorIndexManager {
       dimensions: dims,
       distanceMetric: vc?.distanceMetric ?? VectorDistanceMetric.cosine,
       precision: fieldSchema.vectorConfig?.precision ?? VectorPrecision.float32,
-      maxDegree: vc?.maxDegree ?? 64,
-      efSearch: vc?.efSearch ?? 64,
-      constructionEf: vc?.constructionEf ?? 128,
-      pruneAlpha: vc?.pruneAlpha ?? 1.2,
     );
 
     _vectorCache.putMeta(table, indexUid, meta);
@@ -546,17 +652,21 @@ class VectorIndexManager {
   /// Total estimated cache size (bytes).
   int getCurrentCacheSize() {
     return _vectorCache.estimatedSizeBytes +
-        _partitionManager.getCurrentPageCacheSize();
+        _partitionManager.getCurrentPageCacheSize() +
+        _graphEngine.clusterCacheBytes;
   }
 
   /// Evict caches under memory pressure.
   Future<void> evictCache({double ratio = 0.3}) async {
     await _vectorCache.evict(ratio: ratio);
     await _partitionManager.evictPageCache(ratio: ratio);
+    _graphEngine.evictClusterCache(ratio: ratio);
   }
 
   /// Clear all caches for a table.
   void clearCacheForTable(TableUid tableUid) {
+    final prefix = '${tableUid.value}/';
+    _fieldIndexUidCache.removeWhere((k, _) => k.startsWith(prefix));
     _vectorCache.clearForTable(tableUid);
     _partitionManager.clearPageCacheForTable(tableUid);
     _graphEngine.clearCacheForTable(tableUid);
@@ -580,6 +690,7 @@ class VectorIndexManager {
     }
     await _partitionManager.dispose();
     _metaLoadingFutures.clear();
+    _fieldIndexUidCache.clear();
     _vectorCache.clear();
     _partitionManager.clearPageCacheSync();
     _graphEngine.clearCache();

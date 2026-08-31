@@ -4440,11 +4440,13 @@ class IndexManager {
 
   /// Get current index data cache size in bytes (Data Partition + Range Partition Data + B+Tree pages)
   Future<int> getCurrentIndexDataCacheSize() async {
-    // Include both data cache and page cache (B+Tree pages)
+    // Include both data cache and page cache (B+Tree pages) + NGH vector caches
     final dataCacheSize = _indexDataCache.estimatedTotalSizeBytes;
     final pageCacheSize =
         _dataStore.indexTreePartitionManager?.getCurrentPageCacheSize() ?? 0;
-    return dataCacheSize + pageCacheSize;
+    final vectorCacheSize =
+        _dataStore.vectorIndexManager?.getCurrentCacheSize() ?? 0;
+    return dataCacheSize + pageCacheSize + vectorCacheSize;
   }
 
   /// Get current index metadata cache size in bytes (Schema/Directories)

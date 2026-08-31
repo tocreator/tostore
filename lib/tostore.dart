@@ -20,6 +20,7 @@ import 'src/core/data_store_impl.dart';
 import 'src/handler/logger.dart';
 import 'src/interface/chain_builder.dart';
 import 'src/interface/data_store_interface.dart';
+import 'src/interface/engine_binding.dart';
 import 'src/interface/kv_store.dart';
 import 'src/interface/status_provider.dart';
 import 'src/model/backup_scope.dart';
@@ -38,9 +39,9 @@ import 'src/model/table_schema.dart';
 import 'src/model/transaction_result.dart';
 
 export 'src/chain/kv_query_builder.dart';
-export 'src/interface/chain_builder.dart';
 export 'src/handler/logger.dart' show LogLevel, LogRecord, LogConfig, LogType;
 export 'src/handler/to_crypto.dart';
+export 'src/interface/chain_builder.dart';
 export 'src/interface/status_provider.dart';
 export 'src/model/backup_scope.dart';
 export 'src/model/config_info.dart';
@@ -336,7 +337,7 @@ class ToStore implements DataStoreInterface {
   ///     ),
   ///   ],
   /// ));
-  /// if (!result.isSuccess) {
+  /// if (result.hasErrors) {
   ///   print('Failed to create table: ${result.message}');
   /// }
   /// ```
@@ -419,7 +420,7 @@ class ToStore implements DataStoreInterface {
     _checkSystemTableAccess(
         tableName, 'cannot be queried manually', 'ToStore.query');
 
-    return QueryBuilder(_impl, tableName);
+    return QueryBuilder(_impl, tableName, binding: _engineBinding);
   }
 
   /// Get a stream query builder for reactive data updates.
@@ -489,7 +490,9 @@ class ToStore implements DataStoreInterface {
   /// [fieldName] The name of the vector field.
   /// [queryVector] The target vector to search for.
   /// [topK] Number of most similar results to return.
-  /// [efSearch] Search width for NGH (HNSW-style) algorithm (higher is more accurate but slower).
+  /// [searchDepth] Search depth in `[1, 100]` (higher ≈ better recall intent
+  /// and higher latency; engine-capped by corpus scale; depth 100 does not
+  /// promise 100% recall). When null, uses [VectorIndexConfig.defaultSearchDepth] (`80`).
   /// [distanceThreshold] Maximum distance for results to be included.
   /// Returns a list of [VectorSearchResult] sorted by similarity.
   ///
@@ -512,7 +515,8 @@ class ToStore implements DataStoreInterface {
   /// [fieldName] 向量字段名称。
   /// [queryVector] 查询目标向量。
   /// [topK] 返回最相似的结果数量。
-  /// [efSearch] NGH 算法的搜索宽度（值越大越精确，但速度越慢）。
+  /// [searchDepth] 检索深度 `[1, 100]`（越大通常召回意图越高、也更耗时；引擎按数据规模封顶；
+  /// 100 不承诺 100% 召回）。未传时使用引擎默认 `80`。
   /// [distanceThreshold] 距离阈值，超过此值的记录将被过滤。
   /// 返回按相似度排序的 [VectorSearchResult] 列表。
   @override
@@ -521,7 +525,7 @@ class ToStore implements DataStoreInterface {
     required String fieldName,
     required VectorData queryVector,
     int topK = 10,
-    int? efSearch,
+    int? searchDepth,
     double? distanceThreshold,
   }) {
     _checkSystemTableAccess(
@@ -531,7 +535,7 @@ class ToStore implements DataStoreInterface {
       fieldName: fieldName,
       queryVector: queryVector,
       topK: topK,
-      efSearch: efSearch,
+      searchDepth: searchDepth,
       distanceThreshold: distanceThreshold,
     );
   }
@@ -553,8 +557,111 @@ class ToStore implements DataStoreInterface {
   /// 返回 true 表示切换成功。
   @override
   Future<bool> switchSpace(
-      {String spaceName = 'default', bool keepActive = true}) {
-    return _impl.switchSpace(spaceName: spaceName, keepActive: keepActive);
+      {String spaceName = 'default', bool keepActive = true}) async {
+    // Serialize concurrent switches on this facade.
+    while (_spaceSwitchInFlight != null) {
+      await _spaceSwitchInFlight;
+    }
+    final gate = Completer<void>();
+    _spaceSwitchInFlight = gate.future;
+    try {
+      return await _switchSpaceImpl(
+        spaceName: spaceName,
+        keepActive: keepActive,
+      );
+    } finally {
+      gate.complete();
+      if (identical(_spaceSwitchInFlight, gate.future)) {
+        _spaceSwitchInFlight = null;
+      }
+    }
+  }
+
+  Future<bool> _switchSpaceImpl({
+    required String spaceName,
+    required bool keepActive,
+  }) async {
+    if (!_impl.isInitialized) {
+      await _impl.ensureInitialized();
+    }
+
+    final old = _impl;
+    final oldSpaceName = old.currentSpaceName;
+    if (oldSpaceName == spaceName) {
+      return true;
+    }
+
+    DataStoreImpl? next;
+    try {
+      final paused = await old.prepareForSpaceSwitch();
+      if (!paused) {
+        Logger.warn(
+          'Space switch aborted: encodingKey migration did not pause in time '
+          '(oldSpace=[$oldSpaceName], target=[$spaceName]). '
+          'Refusing to open another space while file handles may still be held.',
+        );
+        return false;
+      }
+
+      // Detach live watches before tearing down the old engine so user streams
+      // do not observe close errors; they re-attach after the successor is live.
+      _notifyEngineReplacing();
+
+      // Tear down the current engine completely (registry + storage). Orphan
+      // async on [old] may still run briefly but only touches [old]'s state.
+      await old.close(closeStorage: true, removeRegistry: true);
+
+      next = old.spawnSuccessor(spaceName: spaceName);
+      await next.initialize(applyActiveSpaceOnDefault: false);
+      _impl = next;
+      next = null;
+      _notifyEngineReplaced();
+
+      final globalConfig = await _impl.getGlobalConfig();
+      if (globalConfig != null) {
+        var needsUpdate = false;
+        var updatedConfig = globalConfig;
+        if (!globalConfig.spaceNames.contains(spaceName)) {
+          updatedConfig = updatedConfig.addSpace(spaceName);
+          needsUpdate = true;
+        }
+        if (keepActive && globalConfig.activeSpace != spaceName) {
+          updatedConfig = updatedConfig.copyWith(activeSpace: spaceName);
+          needsUpdate = true;
+        }
+        if (needsUpdate) {
+          await _impl.saveGlobalConfig(updatedConfig);
+        }
+      }
+
+      Logger.info(
+        'Switched space from [$oldSpaceName] to [$spaceName] '
+        '(engine instance replaced)',
+      );
+      return true;
+    } catch (e) {
+      Logger.error('Space switch failed', rawError: e);
+      if (next != null) {
+        try {
+          await next.close(
+            persistChanges: false,
+            closeStorage: true,
+            removeRegistry: true,
+          );
+        } catch (_) {}
+      }
+      try {
+        if (!_impl.isInitialized) {
+          final recovered = old.spawnSuccessor(spaceName: oldSpaceName);
+          await recovered.initialize(applyActiveSpaceOnDefault: false);
+          _impl = recovered;
+          _notifyEngineReplaced();
+        }
+      } catch (rollbackError) {
+        Logger.error('Space switch rollback failed', rawError: rollbackError);
+      }
+      return false;
+    }
   }
 
   /// Get an update builder to modify records.
@@ -812,6 +919,9 @@ class ToStore implements DataStoreInterface {
   ///
   /// Emits the current value immediately upon subscription.
   ///
+  /// Survives [switchSpace]: the stream detaches before the old engine closes
+  /// and re-attaches to the new space (emits a fresh snapshot).
+  ///
   /// [key] The unique identifier for the value.
   /// [isGlobal] If true, watches the value in the global space.
   /// [defaultValue] The value to emit if the key does not exist.
@@ -820,7 +930,7 @@ class ToStore implements DataStoreInterface {
   ///
   /// 监听键值对的变化。
   ///
-  /// 订阅时会立即发出当前值。
+  /// 订阅时会立即发出当前值。切空间后自动重绑到新引擎。
   ///
   /// [key] 键。
   /// [isGlobal] 为 true 时，监听全局空间的值。
@@ -830,11 +940,14 @@ class ToStore implements DataStoreInterface {
   @override
   Stream<T?> watchValue<T>(String key,
       {bool isGlobal = false, T? defaultValue, bool distinct = true}) {
-    return _impl.watchValue<T>(
-      key,
-      isGlobal: isGlobal,
-      defaultValue: defaultValue,
-      distinct: distinct,
+    return bindEngineStream<T?>(
+      binding: _engineBinding,
+      open: (engine) => engine.watchValue<T>(
+        key,
+        isGlobal: isGlobal,
+        defaultValue: defaultValue,
+        distinct: distinct,
+      ),
     );
   }
 
@@ -844,6 +957,8 @@ class ToStore implements DataStoreInterface {
   /// [isGlobal] If true, watches the values in the global space.
   /// [distinct] If true, suppresses emissions if the snapshot has not changed.
   /// Returns a [Stream] of the snapshot map.
+  ///
+  /// Survives [switchSpace] via engine rebind (same as [watchValue]).
   ///
   /// 监听多个键值对的变化。
   ///
@@ -856,10 +971,13 @@ class ToStore implements DataStoreInterface {
   @override
   Stream<Map<String, dynamic>> watchValues(Iterable<String> keys,
       {bool isGlobal = false, bool distinct = true}) {
-    return _impl.watchValues(
-      keys,
-      isGlobal: isGlobal,
-      distinct: distinct,
+    return bindEngineStream<Map<String, dynamic>>(
+      binding: _engineBinding,
+      open: (engine) => engine.watchValues(
+        keys,
+        isGlobal: isGlobal,
+        distinct: distinct,
+      ),
     );
   }
 
@@ -1316,15 +1434,28 @@ class ToStore implements DataStoreInterface {
   @override
   DbStatus get status => _impl.status;
 
-  /// Key-value storage namespace
+  /// Key-value storage namespace (follows the live engine across [switchSpace]).
   @override
-  KvStore get kv => _impl.kv;
+  KvStore get kv => _kv;
 
   /// @nodoc
   static final Map<String, ToStore> _instances = {};
 
   /// @nodoc
-  final DataStoreImpl _impl;
+  /// Replaced on [switchSpace] so each space has an isolated engine instance.
+  DataStoreImpl _impl;
+
+  /// Internal live-engine handle for watch rebind (not part of public API).
+  late final _LiveEngineBinding _engineBinding = _LiveEngineBinding(this);
+
+  late final KvStore _kv = KvStore.withBinding(_engineBinding);
+
+  /// Serializes [switchSpace] on this facade.
+  Future<void>? _spaceSwitchInFlight;
+
+  void _notifyEngineReplacing() => _engineBinding.notifyReplacing();
+
+  void _notifyEngineReplaced() => _engineBinding.notifyReplaced();
 
   /// @nodoc
   ToStore._internal(this._impl);
@@ -1375,5 +1506,48 @@ class ToStore implements DataStoreInterface {
       logLabel: logLabel,
       logLevel: logLevel,
     );
+  }
+}
+
+/// Package-private live engine pointer for watch rebind across [ToStore.switchSpace].
+///
+/// Kept off the public [ToStore] type so apps cannot call
+/// `db.addEngineReplacingListener` / similar hooks.
+class _LiveEngineBinding implements EngineBinding {
+  _LiveEngineBinding(this._store);
+
+  final ToStore _store;
+  final List<void Function()> _replacingListeners = [];
+  final StreamController<void> _replacedController =
+      StreamController<void>.broadcast();
+
+  @override
+  DataStoreImpl get engine => _store._impl;
+
+  @override
+  void addEngineReplacingListener(void Function() listener) {
+    _replacingListeners.add(listener);
+  }
+
+  @override
+  void removeEngineReplacingListener(void Function() listener) {
+    _replacingListeners.remove(listener);
+  }
+
+  @override
+  Stream<void> get onEngineReplaced => _replacedController.stream;
+
+  void notifyReplacing() {
+    for (final listener in List<void Function()>.of(_replacingListeners)) {
+      try {
+        listener();
+      } catch (_) {}
+    }
+  }
+
+  void notifyReplaced() {
+    if (!_replacedController.isClosed) {
+      _replacedController.add(null);
+    }
   }
 }

@@ -1,5 +1,7 @@
 import 'dart:math' as math;
 
+import 'benchmark_schemas.dart';
+
 /// Defines the complexity tier of benchmark tables.
 enum BenchmarkTier {
   /// Simple table with single primary key and basic scalar fields (no secondary indexes).
@@ -10,8 +12,12 @@ enum BenchmarkTier {
   /// Measures index maintenance overhead and indexed query acceleration.
   indexed('Indexed', 'PK + 1 unique + 1 secondary index'),
 
+  /// Vector table with NGH index (128-d float32, cosine).
+  /// Measures embedding ingest, pure ANN (PK-only), and hybrid retrieval.
+  vector('Vector (NGH 128-d)', 'PK + 128-d embedding + NGH cosine index'),
+
   /// Run across all tiers.
-  all('All Tiers', 'Compare both Simple and Indexed tiers');
+  all('All Tiers', 'Compare Simple, Indexed, and Vector tiers');
 
   final String label;
   final String description;
@@ -51,11 +57,73 @@ enum BenchmarkOperation {
       'Pagination (Random)', 'Random cursor-based page query with limit 20'),
 
   // Metadata & Aggregation Operations
-  count('Count Verification', 'Fast metadata / index tree record count');
+  count('Count Verification', 'Fast metadata / index tree record count'),
+
+  // Vector Operations (Vector tier only)
+  vectorBatchInsert('Vector Batch Insert',
+      'Bulk insert 128-d embeddings with NGH index maintenance'),
+  vectorSearch('Vector ANN Search',
+      'Pure ANN via db.vectorSearch (primary key + score only)'),
+  vectorHybridSearch('Vector Hybrid Search',
+      'Structured filter AND matchVector (full table rows on query chain)'),
+  vectorRecallCheck('Vector Recall Check',
+      'Sampled exact-match recall@1 / recall@K via db.vectorSearch');
 
   final String label;
   final String description;
   const BenchmarkOperation(this.label, this.description);
+
+  bool get isVectorOperation =>
+      this == BenchmarkOperation.vectorBatchInsert ||
+      this == BenchmarkOperation.vectorSearch ||
+      this == BenchmarkOperation.vectorHybridSearch ||
+      this == BenchmarkOperation.vectorRecallCheck;
+
+  bool get isIndexedSeekOperation =>
+      this == BenchmarkOperation.indexedSeekHot ||
+      this == BenchmarkOperation.indexedSeekRandom;
+
+  /// Whether this op is meaningful for the selected [tier].
+  bool appliesTo(BenchmarkTier tier) {
+    if (isVectorOperation) {
+      return tier == BenchmarkTier.vector || tier == BenchmarkTier.all;
+    }
+    if (tier == BenchmarkTier.vector) {
+      return false;
+    }
+    if (isIndexedSeekOperation) {
+      return tier == BenchmarkTier.indexed || tier == BenchmarkTier.all;
+    }
+    return true;
+  }
+
+  /// Default ops when configuring a fresh Simple / Indexed suite.
+  static const Set<BenchmarkOperation> defaultScalarOps = {
+    BenchmarkOperation.batchInsert,
+    BenchmarkOperation.singleInsert,
+    BenchmarkOperation.batchUpdate,
+    BenchmarkOperation.singleUpdate,
+    BenchmarkOperation.batchUpsert,
+    BenchmarkOperation.batchDelete,
+    BenchmarkOperation.singleDelete,
+    BenchmarkOperation.pointReadHot,
+    BenchmarkOperation.pointReadRandom,
+    BenchmarkOperation.indexedSeekHot,
+    BenchmarkOperation.indexedSeekRandom,
+    BenchmarkOperation.rangeScanHot,
+    BenchmarkOperation.rangeScanRandom,
+    BenchmarkOperation.paginationHot,
+    BenchmarkOperation.paginationRandom,
+    BenchmarkOperation.count,
+  };
+
+  /// Default ops when configuring a Vector-only suite.
+  static const Set<BenchmarkOperation> defaultVectorOps = {
+    BenchmarkOperation.vectorBatchInsert,
+    BenchmarkOperation.vectorSearch,
+    BenchmarkOperation.vectorHybridSearch,
+    BenchmarkOperation.vectorRecallCheck,
+  };
 }
 
 /// Configuration payload for running a benchmark suite.
@@ -69,24 +137,7 @@ class BenchmarkConfig {
     this.tier = BenchmarkTier.simple,
     this.scale = 10000,
     this.iterations = 3,
-    this.operations = const {
-      BenchmarkOperation.batchInsert,
-      BenchmarkOperation.singleInsert,
-      BenchmarkOperation.batchUpdate,
-      BenchmarkOperation.singleUpdate,
-      BenchmarkOperation.batchUpsert,
-      BenchmarkOperation.batchDelete,
-      BenchmarkOperation.singleDelete,
-      BenchmarkOperation.pointReadHot,
-      BenchmarkOperation.pointReadRandom,
-      BenchmarkOperation.indexedSeekHot,
-      BenchmarkOperation.indexedSeekRandom,
-      BenchmarkOperation.rangeScanHot,
-      BenchmarkOperation.rangeScanRandom,
-      BenchmarkOperation.paginationHot,
-      BenchmarkOperation.paginationRandom,
-      BenchmarkOperation.count,
-    },
+    this.operations = BenchmarkOperation.defaultScalarOps,
   });
 
   BenchmarkConfig copyWith({
@@ -111,11 +162,19 @@ class BenchmarkMetric {
   final int recordCount;
   final List<int> roundElapsedMicroseconds;
 
+  /// Full quality detail for Markdown notes / tooltips (may be long).
+  final String? qualityNote;
+
+  /// Short label for the results table Highlight column (keeps layout stable).
+  final String? compactHighlight;
+
   BenchmarkMetric({
     required this.name,
     required this.tierName,
     required this.recordCount,
     required this.roundElapsedMicroseconds,
+    this.qualityNote,
+    this.compactHighlight,
   });
 
   int get avgMicroseconds {
@@ -144,6 +203,10 @@ class BenchmarkMetric {
     if (recordCount == 0) return 0.0;
     return avgMicroseconds / recordCount;
   }
+
+  /// Compact cell text: short quality label when present, else throughput.
+  String get highlightLabel =>
+      compactHighlight ?? '${opsPerSec.toStringAsFixed(0)} ops/s';
 }
 
 /// Aggregated report summary containing all executed metrics.
@@ -164,20 +227,42 @@ class BenchmarkSummary {
     buffer.writeln('### ToStore Benchmark Results');
     buffer.writeln(
         '- **Scale**: ${config.scale} records | **Iterations**: ${config.iterations} rounds | **Date**: ${timestamp.toIso8601String().split('T').first}');
+    if (config.tier == BenchmarkTier.vector ||
+        config.tier == BenchmarkTier.all) {
+      buffer.writeln(
+          '- **Vector**: ${BenchmarkSchemas.vectorDimensions}d float32, cosine NGH, topK=${BenchmarkSchemas.vectorTopK}');
+      buffer.writeln(
+          '- **ANN / Recall**: `db.vectorSearch` (PK + score only); **Hybrid**: `matchVector` (full rows)');
+    }
     buffer.writeln();
     buffer.writeln(
-        '| Model | Operation | Scale | Avg Time | Throughput | Avg Latency | Min / Max |');
+        '| Model | Operation | Count | Avg Time | Result | Avg Latency | Min / Max |');
     buffer.writeln('| :--- | :--- | :---: | :---: | :---: | :---: | :---: |');
 
     for (final m in metrics) {
-      final avgTimeStr = '${m.avgMilliseconds.toStringAsFixed(2)} ms';
-      final throughputStr = '${m.opsPerSec.toStringAsFixed(0)} ops/s';
-      final latencyStr = '${m.avgLatencyUs.toStringAsFixed(2)} μs/op';
-      final minMaxStr =
-          '${(m.minMicroseconds / 1000.0).toStringAsFixed(1)} / ${(m.maxMicroseconds / 1000.0).toStringAsFixed(1)} ms';
+      final isQuality = m.compactHighlight != null;
+      final avgTimeStr =
+          isQuality ? '—' : '${m.avgMilliseconds.toStringAsFixed(2)} ms';
+      final highlightStr = '**${m.highlightLabel}**';
+      final latencyStr =
+          isQuality ? '—' : '${m.avgLatencyUs.toStringAsFixed(2)} μs/op';
+      final minMaxStr = isQuality
+          ? '—'
+          : '${(m.minMicroseconds / 1000.0).toStringAsFixed(1)} / ${(m.maxMicroseconds / 1000.0).toStringAsFixed(1)} ms';
 
       buffer.writeln(
-          '| ${m.tierName} | ${m.name} | ${m.recordCount} | $avgTimeStr | **$throughputStr** | $latencyStr | $minMaxStr |');
+          '| ${m.tierName} | ${m.name} | ${m.recordCount} | $avgTimeStr | $highlightStr | $latencyStr | $minMaxStr |');
+    }
+
+    final qualityRows = metrics
+        .where((m) => m.qualityNote != null && m.qualityNote!.isNotEmpty);
+    if (qualityRows.isNotEmpty) {
+      buffer.writeln();
+      buffer.writeln(
+          '**Quality notes** (Result = Exact@1 / Exact@5 / Exact@K %; Count = probe sample size):');
+      for (final m in qualityRows) {
+        buffer.writeln('- **${m.name}**: ${m.qualityNote}');
+      }
     }
 
     return buffer.toString();

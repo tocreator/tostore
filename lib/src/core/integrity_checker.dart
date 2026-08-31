@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:typed_data';
 import 'data_store_impl.dart';
 import 'btree_page.dart';
+import 'table_meta_manager.dart';
 import '../handler/logger.dart';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
@@ -399,6 +400,12 @@ class IntegrityChecker {
 
     // check data type
     for (var entry in data.entries) {
+      // Deleted storage slots keep positional placeholders in decode maps until
+      // layout compaction; they are not logical schema fields.
+      if (TableMetaManager.isDeletedSlotFieldName(entry.key)) {
+        continue;
+      }
+
       // check if it is primary key field
       if (entry.key == schema.primaryKey) {
         // primary key field, check its type

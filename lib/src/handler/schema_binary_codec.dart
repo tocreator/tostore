@@ -79,11 +79,6 @@ abstract final class VectorFieldConfigFieldId {
 abstract final class VectorIndexConfigFieldId {
   static const int indexType = 1;
   static const int distanceMetric = 2;
-  static const int maxDegree = 3;
-  static const int efSearch = 4;
-  static const int constructionEf = 5;
-  static const int pruneAlpha = 6;
-  static const int pqSubspaces = 7;
 }
 
 abstract final class ForeignKeySchemaFieldId {
@@ -710,36 +705,11 @@ abstract final class SchemaBinaryCodec {
       w.writeFieldTag(VectorIndexConfigFieldId.distanceMetric, WireType.varint);
       w.writeVarint(config.distanceMetric.index);
     }
-    if (config.maxDegree != null) {
-      w.writeFieldTag(VectorIndexConfigFieldId.maxDegree, WireType.varint);
-      w.writeVarint(config.maxDegree!);
-    }
-    if (config.efSearch != null) {
-      w.writeFieldTag(VectorIndexConfigFieldId.efSearch, WireType.varint);
-      w.writeVarint(config.efSearch!);
-    }
-    if (config.constructionEf != null) {
-      w.writeFieldTag(VectorIndexConfigFieldId.constructionEf, WireType.varint);
-      w.writeVarint(config.constructionEf!);
-    }
-    if (config.pruneAlpha != null) {
-      w.writeFieldTag(VectorIndexConfigFieldId.pruneAlpha, WireType.fixed64);
-      w.writeDouble(config.pruneAlpha!);
-    }
-    if (config.pqSubspaces != null) {
-      w.writeFieldTag(VectorIndexConfigFieldId.pqSubspaces, WireType.varint);
-      w.writeVarint(config.pqSubspaces!);
-    }
   }
 
   static VectorIndexConfig readVectorIndexConfig(BinaryReader r) {
     var indexType = VectorIndexType.ngh;
     var distanceMetric = VectorDistanceMetric.cosine;
-    int? maxDegree;
-    int? efSearch;
-    int? constructionEf;
-    double? pruneAlpha;
-    int? pqSubspaces;
 
     while (!r.isEOF) {
       final (fid, wireType) = r.readFieldTag();
@@ -758,21 +728,6 @@ abstract final class SchemaBinaryCodec {
             VectorDistanceMetric.cosine,
           );
           break;
-        case VectorIndexConfigFieldId.maxDegree:
-          maxDegree = r.readVarint();
-          break;
-        case VectorIndexConfigFieldId.efSearch:
-          efSearch = r.readVarint();
-          break;
-        case VectorIndexConfigFieldId.constructionEf:
-          constructionEf = r.readVarint();
-          break;
-        case VectorIndexConfigFieldId.pruneAlpha:
-          pruneAlpha = r.readDouble();
-          break;
-        case VectorIndexConfigFieldId.pqSubspaces:
-          pqSubspaces = r.readVarint();
-          break;
         default:
           r.skipField(wireType);
           break;
@@ -782,11 +737,6 @@ abstract final class SchemaBinaryCodec {
     return VectorIndexConfig(
       indexType: indexType,
       distanceMetric: distanceMetric,
-      maxDegree: maxDegree,
-      efSearch: efSearch,
-      constructionEf: constructionEf,
-      pruneAlpha: pruneAlpha,
-      pqSubspaces: pqSubspaces,
     );
   }
 

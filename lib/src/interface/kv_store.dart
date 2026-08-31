@@ -4,13 +4,24 @@ import '../chain/kv_query_builder.dart';
 import '../core/data_store_impl.dart';
 import '../model/db_result.dart';
 import '../model/system_table.dart';
+import 'engine_binding.dart';
 
 /// Namespace for Key-Value storage operations.
 /// 键值对存储操作命名空间。
 class KvStore {
-  final DataStoreImpl _db;
+  final DataStoreImpl? _pinnedDb;
+  final EngineBinding? _binding;
 
-  KvStore(this._db);
+  KvStore(DataStoreImpl db)
+      : _pinnedDb = db,
+        _binding = null;
+
+  /// Facade bound to [ToStore] so watches survive [ToStore.switchSpace].
+  KvStore.withBinding(EngineBinding binding)
+      : _binding = binding,
+        _pinnedDb = null;
+
+  DataStoreImpl get _db => _binding?.engine ?? _pinnedDb!;
 
   /// Get the table name for KV storage.
   /// 获取键值对存储的表名。
@@ -359,6 +370,18 @@ class KvStore {
     T? defaultValue,
     bool distinct = true,
   }) {
+    final binding = _binding;
+    if (binding != null) {
+      return bindEngineStream<T?>(
+        binding: binding,
+        open: (engine) => engine.watchValue<T>(
+          key,
+          isGlobal: isGlobal,
+          defaultValue: defaultValue,
+          distinct: distinct,
+        ),
+      );
+    }
     return _db.watchValue<T>(key,
         isGlobal: isGlobal, defaultValue: defaultValue, distinct: distinct);
   }
@@ -380,6 +403,17 @@ class KvStore {
     bool isGlobal = false,
     bool distinct = true,
   }) {
+    final binding = _binding;
+    if (binding != null) {
+      return bindEngineStream<Map<String, dynamic>>(
+        binding: binding,
+        open: (engine) => engine.watchValues(
+          keys,
+          isGlobal: isGlobal,
+          distinct: distinct,
+        ),
+      );
+    }
     return _db.watchValues(keys, isGlobal: isGlobal, distinct: distinct);
   }
 

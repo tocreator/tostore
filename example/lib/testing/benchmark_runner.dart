@@ -19,6 +19,7 @@ class BenchmarkRunner {
     // 1. Ingestion & Writes
     BenchmarkOperation.batchInsert,
     BenchmarkOperation.singleInsert,
+    BenchmarkOperation.vectorBatchInsert,
     // 2. Updates & Upserts
     BenchmarkOperation.batchUpdate,
     BenchmarkOperation.singleUpdate,
@@ -33,6 +34,9 @@ class BenchmarkRunner {
     BenchmarkOperation.paginationHot,
     BenchmarkOperation.paginationRandom,
     BenchmarkOperation.count,
+    BenchmarkOperation.vectorSearch,
+    BenchmarkOperation.vectorHybridSearch,
+    BenchmarkOperation.vectorRecallCheck,
     // 4. Deletions (Destructive operations executed last)
     BenchmarkOperation.batchDelete,
     BenchmarkOperation.singleDelete,
@@ -49,8 +53,9 @@ class BenchmarkRunner {
 
     // 1. Ensure benchmark tables exist and are clean before starting
     await BenchmarkSchemas.ensureTables(db);
-    await db.clear(BenchmarkSchemas.simpleTable);
-    await db.clear(BenchmarkSchemas.indexedTable);
+    await db.clear(BenchmarkSchemas.simple.name);
+    await db.clear(BenchmarkSchemas.indexed.name);
+    await db.clear(BenchmarkSchemas.vector.name);
 
     try {
       // 2. Warm-up phase (JIT & VM cache priming)
@@ -69,35 +74,40 @@ class BenchmarkRunner {
           config.tier == BenchmarkTier.all) {
         tiersToRun.add(BenchmarkTier.indexed);
       }
+      if (config.tier == BenchmarkTier.vector ||
+          config.tier == BenchmarkTier.all) {
+        tiersToRun.add(BenchmarkTier.vector);
+      }
 
       for (final currentTier in tiersToRun) {
-        final tierName =
-            currentTier == BenchmarkTier.simple ? 'Simple' : 'Indexed';
-        final tableName = currentTier == BenchmarkTier.simple
-            ? BenchmarkSchemas.simpleTable
-            : BenchmarkSchemas.indexedTable;
+        final tierName = switch (currentTier) {
+          BenchmarkTier.simple => 'Simple',
+          BenchmarkTier.indexed => 'Indexed',
+          BenchmarkTier.vector => 'Vector',
+          BenchmarkTier.all => 'All',
+        };
+        final tableName = switch (currentTier) {
+          BenchmarkTier.simple => BenchmarkSchemas.simple.name,
+          BenchmarkTier.indexed => BenchmarkSchemas.indexed.name,
+          BenchmarkTier.vector => BenchmarkSchemas.vector.name,
+          BenchmarkTier.all => BenchmarkSchemas.simple.name,
+        };
 
         // Sort operations by optimal execution order:
         // Ingestion -> Updates -> Queries (against full table) -> Deletions (destructive last)
-        final sortedOps = config.operations.toList()
-          ..sort((a, b) {
-            final aIdx = _executionOrder.indexOf(a);
-            final bIdx = _executionOrder.indexOf(b);
-            return aIdx.compareTo(bIdx);
-          });
+        final sortedOps =
+            config.operations.where((op) => op.appliesTo(currentTier)).toList()
+              ..sort((a, b) {
+                final aIdx = _executionOrder.indexOf(a);
+                final bIdx = _executionOrder.indexOf(b);
+                return aIdx.compareTo(bIdx);
+              });
 
         bool flushedBeforeQueries = false;
 
         for (final op in sortedOps) {
-          // Skip indexedSeek on simple tier (has no secondary unique index)
-          if (currentTier == BenchmarkTier.simple &&
-              (op == BenchmarkOperation.indexedSeekHot ||
-                  op == BenchmarkOperation.indexedSeekRandom)) {
-            continue;
-          }
-
-          // If transitioning from Mutation phase (Insert/Update/Upsert) to Query phase (Read/Seek/Scan/Pagination),
-          // flush all queued writes to disk once so queries execute on a settled, quiescent disk pipeline.
+          // If transitioning from Mutation phase to Query phase,
+          // flush all queued writes to disk once so queries execute on a settled pipeline.
           final isQueryOp = op == BenchmarkOperation.pointReadHot ||
               op == BenchmarkOperation.pointReadRandom ||
               op == BenchmarkOperation.indexedSeekHot ||
@@ -106,7 +116,10 @@ class BenchmarkRunner {
               op == BenchmarkOperation.rangeScanRandom ||
               op == BenchmarkOperation.paginationHot ||
               op == BenchmarkOperation.paginationRandom ||
-              op == BenchmarkOperation.count;
+              op == BenchmarkOperation.count ||
+              op == BenchmarkOperation.vectorSearch ||
+              op == BenchmarkOperation.vectorHybridSearch ||
+              op == BenchmarkOperation.vectorRecallCheck;
 
           if (isQueryOp && !flushedBeforeQueries) {
             flushedBeforeQueries = true;
@@ -126,8 +139,10 @@ class BenchmarkRunner {
 
           if (metric != null) {
             allMetrics.add(metric);
+            final highlight = metric.compactHighlight ??
+                '${metric.opsPerSec.toStringAsFixed(0)} ops/s | ${metric.avgLatencyUs.toStringAsFixed(2)} μs/op';
             log.add(
-              '⚡ [$tierName] ${metric.name}: ${metric.avgMilliseconds.toStringAsFixed(2)} ms (${metric.opsPerSec.toStringAsFixed(0)} ops/s | ${metric.avgLatencyUs.toStringAsFixed(2)} μs/op)',
+              '⚡ [$tierName] ${metric.name}: ${metric.compactHighlight != null ? highlight : '${metric.avgMilliseconds.toStringAsFixed(2)} ms ($highlight)'}${metric.qualityNote != null ? ' · ${metric.qualityNote}' : ''}',
               LogLevel.info,
             );
           }
@@ -137,11 +152,13 @@ class BenchmarkRunner {
         }
       }
 
-      // Sort metrics by display order (Insert -> Update -> Delete -> Read -> Count)
+      // Sort metrics by display order (tier then enum order)
       allMetrics.sort((a, b) {
         if (a.tierName != b.tierName) {
-          if (a.tierName == 'Simple') return -1;
-          if (b.tierName == 'Simple') return 1;
+          const order = ['Simple', 'Indexed', 'Vector'];
+          final aIdx = order.indexOf(a.tierName);
+          final bIdx = order.indexOf(b.tierName);
+          return aIdx.compareTo(bIdx);
         }
         final aOpIndex =
             BenchmarkOperation.values.indexWhere((op) => op.label == a.name);
@@ -159,8 +176,9 @@ class BenchmarkRunner {
       return summary;
     } finally {
       // Clean up benchmark tables to avoid occupying memory/disk
-      await db.clear(BenchmarkSchemas.simpleTable);
-      await db.clear(BenchmarkSchemas.indexedTable);
+      await db.clear(BenchmarkSchemas.simple.name);
+      await db.clear(BenchmarkSchemas.indexed.name);
+      await db.clear(BenchmarkSchemas.vector.name);
     }
   }
 
@@ -179,33 +197,56 @@ class BenchmarkRunner {
         'created_at': DateTime.now().toIso8601String(),
       },
     );
+    final vectorWarmupData =
+        _generateRecords(BenchmarkTier.vector, warmupCount);
 
     // Batch insert and query warmup
     await db.batchInsert(
-      BenchmarkSchemas.simpleTable,
+      BenchmarkSchemas.simple.name,
       simpleWarmupData,
       allowPartialErrors: false,
       returnResultDetails: false,
     );
     await db.batchInsert(
-      BenchmarkSchemas.indexedTable,
+      BenchmarkSchemas.indexed.name,
       indexedWarmupData,
       allowPartialErrors: false,
       returnResultDetails: false,
     );
+    await db.batchInsert(
+      BenchmarkSchemas.vector.name,
+      vectorWarmupData,
+      allowPartialErrors: false,
+      returnResultDetails: false,
+    );
 
-    await db.query(BenchmarkSchemas.simpleTable);
-    await db.query(BenchmarkSchemas.indexedTable).where('age', '>=', 25);
-    db.query(BenchmarkSchemas.simpleTable).where('id', '=', 1).peekFirst();
+    await db.query(BenchmarkSchemas.simple.name);
+    await db.query(BenchmarkSchemas.indexed.name).where('age', '>=', 25);
+    db.query(BenchmarkSchemas.simple.name).where('id', '=', 1).peekFirst();
     db
-        .query(BenchmarkSchemas.indexedTable)
+        .query(BenchmarkSchemas.indexed.name)
         .where('name', '=', 'warmup_1')
         .peekFirst();
-    db.query(BenchmarkSchemas.simpleTable).limit(10).peek();
-    db.query(BenchmarkSchemas.simpleTable).limit(20).peek();
+    db.query(BenchmarkSchemas.simple.name).limit(10).peek();
+    db.query(BenchmarkSchemas.simple.name).limit(20).peek();
 
-    await db.clear(BenchmarkSchemas.simpleTable);
-    await db.clear(BenchmarkSchemas.indexedTable);
+    final warmupVec = vectorWarmupData.first['embedding'] as VectorData;
+    // Warm both paths: standalone ANN (PK-only) and hybrid chain (full rows).
+    await db.vectorSearch(
+      BenchmarkSchemas.vector.name,
+      fieldName: 'embedding',
+      queryVector: warmupVec,
+      topK: BenchmarkSchemas.vectorTopK,
+    );
+    await db
+        .query(BenchmarkSchemas.vector.name)
+        .where('category', '=', 0)
+        .matchVector('embedding', warmupVec)
+        .limit(BenchmarkSchemas.vectorTopK);
+
+    await db.clear(BenchmarkSchemas.simple.name);
+    await db.clear(BenchmarkSchemas.indexed.name);
+    await db.clear(BenchmarkSchemas.vector.name);
   }
 
   /// Runs an individual benchmark operation across multiple iterations.
@@ -220,6 +261,8 @@ class BenchmarkRunner {
     final iterations = config.iterations;
     final List<int> roundMicroseconds = [];
     int effectiveCount = scale;
+    String? qualityNote;
+    String? compactHighlight;
 
     _updateLastOperation('Running [$tierName] ${op.label} (0/$iterations)...');
 
@@ -623,6 +666,158 @@ class BenchmarkRunner {
           await Future.delayed(const Duration(milliseconds: 5));
         }
         break;
+
+      case BenchmarkOperation.vectorBatchInsert:
+        if (tier != BenchmarkTier.vector) return null;
+        // Cap ingest scale so NGH construction stays practical on edge devices.
+        effectiveCount = math.min(scale, 10000);
+        final vectorInsertRounds = <List<Map<String, dynamic>>>[
+          for (var round = 1; round <= iterations; round++)
+            _generateRecords(tier, effectiveCount,
+                seedOffset: round * effectiveCount),
+        ];
+        for (var round = 1; round <= iterations; round++) {
+          _updateLastOperation(
+              'Running [$tierName] Vector Batch Insert ($round/$iterations)...');
+          await db.clear(tableName);
+
+          final sw = Stopwatch()..start();
+          await db.batchInsert(
+            tableName,
+            vectorInsertRounds[round - 1],
+            allowPartialErrors: false,
+            returnResultDetails: false,
+          );
+          sw.stop();
+          roundMicroseconds.add(sw.elapsedMicroseconds);
+          await Future.delayed(const Duration(milliseconds: 5));
+        }
+        break;
+
+      case BenchmarkOperation.vectorSearch:
+        if (tier != BenchmarkTier.vector) return null;
+        final datasetScale = math.min(scale, 10000);
+        await _ensureDurableDataset(tableName, tier, datasetScale);
+        // Query sample count: enough for stable QPS without multi-minute stalls.
+        effectiveCount = math.min(datasetScale, 1000);
+        final random = math.Random(4242);
+
+        for (var round = 1; round <= iterations; round++) {
+          _updateLastOperation(
+              'Running [$tierName] Vector ANN Search ($round/$iterations)...');
+          final querySeeds = List.generate(
+            effectiveCount,
+            (_) => random.nextInt(datasetScale),
+          );
+
+          // Pure ANN: PK + score only — aligns with mainstream vector-DB latency.
+          final sw = Stopwatch()..start();
+          for (final seed in querySeeds) {
+            await db.vectorSearch(
+              tableName,
+              fieldName: 'embedding',
+              queryVector: _unitVector(seed),
+              topK: BenchmarkSchemas.vectorTopK,
+            );
+          }
+          sw.stop();
+          roundMicroseconds.add(sw.elapsedMicroseconds);
+          await Future.delayed(const Duration(milliseconds: 5));
+        }
+        break;
+
+      case BenchmarkOperation.vectorHybridSearch:
+        if (tier != BenchmarkTier.vector) return null;
+        final hybridScale = math.min(scale, 10000);
+        await _ensureDurableDataset(tableName, tier, hybridScale);
+        effectiveCount = math.min(hybridScale, 1000);
+        final random = math.Random(5252);
+
+        for (var round = 1; round <= iterations; round++) {
+          _updateLastOperation(
+              'Running [$tierName] Vector Hybrid Search ($round/$iterations)...');
+          final querySeeds = List.generate(
+            effectiveCount,
+            (_) => random.nextInt(hybridScale),
+          );
+
+          final sw = Stopwatch()..start();
+          for (final seed in querySeeds) {
+            final category = seed % 16;
+            await db
+                .query(tableName)
+                .where('category', '=', category)
+                .matchVector('embedding', _unitVector(seed))
+                .limit(BenchmarkSchemas.vectorTopK);
+          }
+          sw.stop();
+          roundMicroseconds.add(sw.elapsedMicroseconds);
+          await Future.delayed(const Duration(milliseconds: 5));
+        }
+        break;
+
+      case BenchmarkOperation.vectorRecallCheck:
+        if (tier != BenchmarkTier.vector) return null;
+        final corpusScale = math.min(scale, 10000);
+        await _ensureDurableDataset(tableName, tier, corpusScale);
+        // Count = probe sample size (not corpus size).
+        effectiveCount = math.min(
+          BenchmarkSchemas.vectorRecallProbes,
+          corpusScale,
+        );
+        final topK = BenchmarkSchemas.vectorTopK;
+        final midK = math.min(5, topK);
+        final random = math.Random(6262);
+        var hitAt1 = 0;
+        var hitAtMid = 0;
+        var hitAtK = 0;
+        var probes = 0;
+
+        for (var round = 1; round <= iterations; round++) {
+          _updateLastOperation(
+              'Running [$tierName] Vector Recall Check ($round/$iterations)...');
+          final querySeeds = List.generate(
+            effectiveCount,
+            (_) => random.nextInt(corpusScale),
+          );
+
+          final sw = Stopwatch()..start();
+          for (final seed in querySeeds) {
+            // Sequential PK: slot i inserted as id = i + 1 with embedding seed i.
+            final targetId = (seed + 1).toString();
+            final hits = await db.vectorSearch(
+              tableName,
+              fieldName: 'embedding',
+              queryVector: _unitVector(seed),
+              topK: topK,
+            );
+            probes++;
+            var rank = -1;
+            for (var i = 0; i < hits.length; i++) {
+              if (hits[i].primaryKey == targetId) {
+                rank = i + 1;
+                break;
+              }
+            }
+            if (rank < 0) continue;
+            if (rank <= 1) hitAt1++;
+            if (rank <= midK) hitAtMid++;
+            if (rank <= topK) hitAtK++;
+          }
+          sw.stop();
+          roundMicroseconds.add(sw.elapsedMicroseconds);
+          await Future.delayed(const Duration(milliseconds: 5));
+        }
+
+        final recall1 = probes == 0 ? 0.0 : (hitAt1 * 100.0 / probes);
+        final recallMid = probes == 0 ? 0.0 : (hitAtMid * 100.0 / probes);
+        final recallK = probes == 0 ? 0.0 : (hitAtK * 100.0 / probes);
+        // Percentages only in the table cell — no ops/s mixed in.
+        compactHighlight =
+            '${recall1.toStringAsFixed(0)}% / ${recallMid.toStringAsFixed(0)}% / ${recallK.toStringAsFixed(0)}%';
+        qualityNote =
+            'Exact@1=${recall1.toStringAsFixed(1)}%; Exact@$midK=${recallMid.toStringAsFixed(1)}%; Exact@$topK=${recallK.toStringAsFixed(1)}%; probes=$probes; corpus=$corpusScale';
+        break;
     }
 
     return BenchmarkMetric(
@@ -630,6 +825,8 @@ class BenchmarkRunner {
       tierName: tierName,
       recordCount: effectiveCount,
       roundElapsedMicroseconds: roundMicroseconds,
+      qualityNote: qualityNote,
+      compactHighlight: compactHighlight,
     );
   }
 
@@ -675,24 +872,61 @@ class BenchmarkRunner {
     int count, {
     int seedOffset = 0,
   }) {
-    if (tier == BenchmarkTier.simple) {
-      return List.generate(count, (i) {
-        final idx = seedOffset + i;
-        return {
-          'text_val': 'benchmark_payload_item_$idx',
-          'num_val': idx,
-        };
-      });
-    } else {
-      return List.generate(count, (i) {
-        final idx = seedOffset + i;
-        return {
-          'name': 'user_$idx',
-          'age': 18 + (idx % 60),
-          'created_at': DateTime.now().toIso8601String(),
-        };
-      });
+    switch (tier) {
+      case BenchmarkTier.simple:
+        return List.generate(count, (i) {
+          final idx = seedOffset + i;
+          return {
+            'text_val': 'benchmark_payload_item_$idx',
+            'num_val': idx,
+          };
+        });
+      case BenchmarkTier.indexed:
+        return List.generate(count, (i) {
+          final idx = seedOffset + i;
+          return {
+            'name': 'user_$idx',
+            'age': 18 + (idx % 60),
+            'created_at': DateTime.now().toIso8601String(),
+          };
+        });
+      case BenchmarkTier.vector:
+        return List.generate(count, (i) {
+          final idx = seedOffset + i;
+          return {
+            'label': 'vec_$idx',
+            // Slot-stable embedding seed so ANN queries can recreate vectors
+            // after clear/reload without depending on insert round offsets.
+            'category': i % 16,
+            'embedding': _unitVector(i),
+          };
+        });
+      case BenchmarkTier.all:
+        return _generateRecords(BenchmarkTier.simple, count,
+            seedOffset: seedOffset);
     }
+  }
+
+  /// Deterministic unit vector for reproducible ANN queries (matches insert seeds).
+  VectorData _unitVector(int seed) {
+    final dims = BenchmarkSchemas.vectorDimensions;
+    final rng = math.Random(seed);
+    final values = List<double>.generate(dims, (_) {
+      final u1 = rng.nextDouble().clamp(1e-10, 1.0);
+      final u2 = rng.nextDouble();
+      return math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2);
+    });
+    var normSq = 0.0;
+    for (final v in values) {
+      normSq += v * v;
+    }
+    final norm = math.sqrt(normSq);
+    if (norm > 0) {
+      for (var i = 0; i < dims; i++) {
+        values[i] /= norm;
+      }
+    }
+    return VectorData(values);
   }
 
   /// Generates synthetic update records targeting existing primary keys.
@@ -709,15 +943,14 @@ class BenchmarkRunner {
           'num_val': (i + round) * 10,
         };
       });
-    } else {
-      return List.generate(count, (i) {
-        return {
-          'id': i + 1,
-          'name': 'user_${i}_v$round',
-          'age': 20 + ((i + round) % 55),
-        };
-      });
     }
+    return List.generate(count, (i) {
+      return {
+        'id': i + 1,
+        'name': 'user_${i}_v$round',
+        'age': 20 + ((i + round) % 55),
+      };
+    });
   }
 
   /// Generates synthetic records for upsert testing (50% updates, 50% inserts).
@@ -740,18 +973,16 @@ class BenchmarkRunner {
           'num_val': i + (round * 100),
         };
       });
-    } else {
-      return List.generate(count, (i) {
-        final isExisting = i < half;
-        final targetId =
-            isExisting ? (i + 1) : (count + (round * count) + i + 1);
-        return {
-          'id': targetId,
-          'name': isExisting ? 'user_${i}_upd$round' : 'user_new_${round}_$i',
-          'age': 21 + (i % 50),
-          'created_at': DateTime.now().toIso8601String(),
-        };
-      });
     }
+    return List.generate(count, (i) {
+      final isExisting = i < half;
+      final targetId = isExisting ? (i + 1) : (count + (round * count) + i + 1);
+      return {
+        'id': targetId,
+        'name': isExisting ? 'user_${i}_upd$round' : 'user_new_${round}_$i',
+        'age': 21 + (i % 50),
+        'created_at': DateTime.now().toIso8601String(),
+      };
+    });
   }
 }

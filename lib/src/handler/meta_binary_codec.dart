@@ -76,20 +76,16 @@ abstract final class NghIndexMetaFieldId {
   static const int distanceMetric = 5;
   static const int precision = 6;
   static const int timestamps = 7;
-  static const int maxDegree = 8;
-  static const int efSearch = 9;
-  static const int constructionEf = 10;
-  static const int pruneAlpha = 11;
-  static const int totalVectors = 12;
-  static const int deletedCount = 13;
-  static const int medoidNodeId = 14;
-  static const int nextNodeId = 15;
-  static const int totalSizeBytes = 16;
-  static const int isBuilding = 17;
-  static const int centroidCount = 18;
-  static const int postingPartitionCount = 19;
-  static const int postingNextPageNo = 20;
-  static const int postingFreeListHeads = 21;
+  static const int totalVectors = 8;
+  static const int deletedCount = 9;
+  static const int medoidNodeId = 10;
+  static const int nextNodeId = 11;
+  static const int totalSizeBytes = 12;
+  static const int isBuilding = 13;
+  static const int centroidCount = 14;
+  static const int postingPartitionCount = 15;
+  static const int postingNextPageNo = 16;
+  static const int postingFreeListHeads = 17;
 }
 
 /// Discriminator for global meta blobs embedded in partition-0 page 0.
@@ -481,14 +477,6 @@ final class NghIndexMetaCodec {
     w.writeVarint(meta.precision.index);
     w.writeFieldTag(NghIndexMetaFieldId.timestamps, WireType.lengthDelimited);
     w.writeBytes(TimestampsCodec.encode(meta.timestamps));
-    w.writeFieldTag(NghIndexMetaFieldId.maxDegree, WireType.varint);
-    w.writeVarint(meta.maxDegree);
-    w.writeFieldTag(NghIndexMetaFieldId.efSearch, WireType.varint);
-    w.writeVarint(meta.efSearch);
-    w.writeFieldTag(NghIndexMetaFieldId.constructionEf, WireType.varint);
-    w.writeVarint(meta.constructionEf);
-    w.writeFieldTag(NghIndexMetaFieldId.pruneAlpha, WireType.fixed64);
-    w.writeDouble(meta.pruneAlpha);
     w.writeFieldTag(NghIndexMetaFieldId.totalVectors, WireType.varint);
     w.writeVarint(meta.totalVectors);
     w.writeFieldTag(NghIndexMetaFieldId.deletedCount, WireType.varint);
@@ -525,10 +513,6 @@ final class NghIndexMetaCodec {
     VectorDistanceMetric distanceMetric = VectorDistanceMetric.cosine;
     VectorPrecision precision = VectorPrecision.float32;
     Timestamps? timestamps;
-    int maxDegree = 64;
-    int efSearch = 64;
-    int constructionEf = 128;
-    double pruneAlpha = 1.2;
     int totalVectors = 0;
     int deletedCount = 0;
     int medoidNodeId = -1;
@@ -569,18 +553,6 @@ final class NghIndexMetaCodec {
           break;
         case NghIndexMetaFieldId.timestamps:
           timestamps = TimestampsCodec.decode(reader.readBytes());
-          break;
-        case NghIndexMetaFieldId.maxDegree:
-          maxDegree = reader.readVarint();
-          break;
-        case NghIndexMetaFieldId.efSearch:
-          efSearch = reader.readVarint();
-          break;
-        case NghIndexMetaFieldId.constructionEf:
-          constructionEf = reader.readVarint();
-          break;
-        case NghIndexMetaFieldId.pruneAlpha:
-          pruneAlpha = reader.readDouble();
           break;
         case NghIndexMetaFieldId.totalVectors:
           totalVectors = reader.readVarint();
@@ -639,10 +611,6 @@ final class NghIndexMetaCodec {
       distanceMetric: distanceMetric,
       precision: precision,
       timestamps: timestamps,
-      maxDegree: maxDegree,
-      efSearch: efSearch,
-      constructionEf: constructionEf,
-      pruneAlpha: pruneAlpha,
       totalVectors: totalVectors,
       deletedCount: deletedCount,
       medoidNodeId: medoidNodeId,

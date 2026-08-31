@@ -31,20 +31,6 @@ class NghIndexMeta {
   /// Creation / last-modified timestamps.
   final Timestamps timestamps;
 
-  // ===================== Graph Parameters =====================
-
-  /// Maximum out-degree per graph node (R).
-  final int maxDegree;
-
-  /// Search expansion factor (ef_search).
-  final int efSearch;
-
-  /// Expansion factor for construction (ef_construction).
-  final int constructionEf;
-
-  /// Diversity parameter for Robust Prune (alpha >= 1.0).
-  final double pruneAlpha;
-
   // ===================== Runtime Statistics ====================
 
   /// Total number of live vectors (excluding tombstoned).
@@ -89,10 +75,6 @@ class NghIndexMeta {
     required this.distanceMetric,
     required this.precision,
     required this.timestamps,
-    this.maxDegree = 64,
-    this.efSearch = 64,
-    this.constructionEf = 128,
-    this.pruneAlpha = 1.2,
     this.totalVectors = 0,
     this.deletedCount = 0,
     this.medoidNodeId = -1,
@@ -120,10 +102,6 @@ class NghIndexMeta {
     required int dimensions,
     VectorDistanceMetric distanceMetric = VectorDistanceMetric.cosine,
     VectorPrecision precision = VectorPrecision.float32,
-    int? maxDegree,
-    int? efSearch,
-    int? constructionEf,
-    double? pruneAlpha,
     DateTime? now,
     bool isBuilding = false,
   }) {
@@ -135,10 +113,6 @@ class NghIndexMeta {
       distanceMetric: distanceMetric,
       precision: precision,
       timestamps: Timestamps(created: ts, modified: ts),
-      maxDegree: maxDegree ?? 64,
-      efSearch: efSearch ?? 64,
-      constructionEf: constructionEf ?? 128,
-      pruneAlpha: pruneAlpha ?? 1.2,
       isBuilding: isBuilding,
     );
   }
@@ -153,10 +127,6 @@ class NghIndexMeta {
     VectorDistanceMetric? distanceMetric,
     VectorPrecision? precision,
     Timestamps? timestamps,
-    int? maxDegree,
-    int? efSearch,
-    int? constructionEf,
-    double? pruneAlpha,
     int? totalVectors,
     int? deletedCount,
     int? medoidNodeId,
@@ -176,10 +146,6 @@ class NghIndexMeta {
       distanceMetric: distanceMetric ?? this.distanceMetric,
       precision: precision ?? this.precision,
       timestamps: timestamps ?? this.timestamps,
-      maxDegree: maxDegree ?? this.maxDegree,
-      efSearch: efSearch ?? this.efSearch,
-      constructionEf: constructionEf ?? this.constructionEf,
-      pruneAlpha: pruneAlpha ?? this.pruneAlpha,
       totalVectors: totalVectors ?? this.totalVectors,
       deletedCount: deletedCount ?? this.deletedCount,
       medoidNodeId: medoidNodeId ?? this.medoidNodeId,
@@ -207,10 +173,6 @@ class NghIndexMeta {
       precision: _parsePrecision(json['precision'] as String?),
       timestamps:
           Timestamps.fromJson(json['timestamps'] as Map<String, dynamic>),
-      maxDegree: (json['maxDegree'] as num?)?.toInt() ?? 64,
-      efSearch: (json['efSearch'] as num?)?.toInt() ?? 64,
-      constructionEf: (json['constructionEf'] as num?)?.toInt() ?? 128,
-      pruneAlpha: (json['pruneAlpha'] as num?)?.toDouble() ?? 1.2,
       totalVectors: (json['totalVectors'] as num?)?.toInt() ?? 0,
       deletedCount: (json['deletedCount'] as num?)?.toInt() ?? 0,
       medoidNodeId: (json['medoidNodeId'] as num?)?.toInt() ?? -1,
@@ -238,10 +200,6 @@ class NghIndexMeta {
       'distanceMetric': distanceMetric.name,
       'precision': precision.name,
       'timestamps': timestamps.toJson(),
-      'maxDegree': maxDegree,
-      'efSearch': efSearch,
-      'constructionEf': constructionEf,
-      'pruneAlpha': pruneAlpha,
       'totalVectors': totalVectors,
       'deletedCount': deletedCount,
       'medoidNodeId': medoidNodeId,

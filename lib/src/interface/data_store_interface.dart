@@ -1,18 +1,19 @@
 import 'dart:async';
-import '../interface/chain_builder.dart';
+
 import '../chain/schema_builder.dart';
 import '../chain/stream_query_builder.dart';
+import '../interface/chain_builder.dart';
+import '../interface/kv_store.dart';
+import '../model/backup_scope.dart';
 import '../model/data_store_config.dart';
 import '../model/db_result.dart';
 import '../model/db_startup_stage.dart';
 import '../model/migration_task.dart';
-import '../model/transaction_result.dart';
+import '../model/query_result.dart';
 import '../model/space_info.dart';
 import '../model/table_info.dart';
 import '../model/table_schema.dart';
-import '../model/query_result.dart';
-import '../model/backup_scope.dart';
-import '../interface/kv_store.dart';
+import '../model/transaction_result.dart';
 import 'status_provider.dart';
 
 /// Data store engine interface
@@ -125,7 +126,7 @@ abstract class DataStoreInterface {
     required String fieldName,
     required VectorData queryVector,
     int topK = 10,
-    int? efSearch,
+    int? searchDepth,
     double? distanceThreshold,
   });
 

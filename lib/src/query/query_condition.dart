@@ -997,7 +997,7 @@ class QueryCondition {
     String field,
     dynamic vector, {
     double weight = 1.0,
-    int? efSearch,
+    int? searchDepth,
     double? distanceThreshold,
     double? minScore,
   }) {
@@ -1026,7 +1026,7 @@ class QueryCondition {
     final payload = <String, dynamic>{
       'vector': vectorData,
       'weight': weight,
-      if (efSearch != null) 'efSearch': efSearch,
+      if (searchDepth != null) 'searchDepth': searchDepth,
       if (distanceThreshold != null) 'distanceThreshold': distanceThreshold,
       if (minScore != null) 'minScore': minScore,
     };
@@ -1040,7 +1040,7 @@ class QueryCondition {
     String field,
     dynamic vector, {
     double weight = 1.0,
-    int? efSearch,
+    int? searchDepth,
     double? distanceThreshold,
     double? minScore,
   }) {
@@ -1048,7 +1048,7 @@ class QueryCondition {
       field,
       vector,
       weight: weight,
-      efSearch: efSearch,
+      searchDepth: searchDepth,
       distanceThreshold: distanceThreshold,
       minScore: minScore,
     );

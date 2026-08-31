@@ -27,7 +27,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   QueryCondition? _havingCondition;
   List<QueryAggregation>? _aggregations;
 
-  QueryBuilder(super.db, super.tableName);
+  QueryBuilder(super.db, super.tableName, {super.binding});
 
   void _invalidateFuture() {
     if (_future != null) {
@@ -412,14 +412,16 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   /// [field] The vector field name to search on.
   /// [vector] Query vector (accepts [VectorData], `List<num>`, or `Float32List`).
   /// [weight] Fusion weight multiplier (default: 1.0).
-  /// [efSearch] NGH algorithm search expansion factor (higher = more accurate, slight latency increase).
+  /// [searchDepth] ANN search depth in `[1, 100]` (higher ≈ better recall
+  /// intent and higher latency; engine-capped; does not promise recall% ==
+  /// depth). When null, uses [VectorIndexConfig.defaultSearchDepth] (`80`).
   /// [distanceThreshold] Maximum distance threshold to consider as a candidate.
   /// [minScore] Minimum normalized similarity score threshold [0.0 ~ 1.0].
   QueryBuilder matchVector(
     String field,
     dynamic vector, {
     double weight = 1.0,
-    int? efSearch,
+    int? searchDepth,
     double? distanceThreshold,
     double? minScore,
   }) {
@@ -429,7 +431,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       field,
       vector,
       weight: weight,
-      efSearch: efSearch,
+      searchDepth: searchDepth,
       distanceThreshold: distanceThreshold,
       minScore: minScore,
     );
@@ -443,7 +445,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     String field,
     dynamic vector, {
     double weight = 1.0,
-    int? efSearch,
+    int? searchDepth,
     double? distanceThreshold,
     double? minScore,
   }) {
@@ -453,7 +455,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       field,
       vector,
       weight: weight,
-      efSearch: efSearch,
+      searchDepth: searchDepth,
       distanceThreshold: distanceThreshold,
       minScore: minScore,
     );
@@ -692,7 +694,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
 
   /// Clone the current QueryBuilder with all its filters, ordering, joins, cache, and limits intact.
   QueryBuilder clone() {
-    final builder = QueryBuilder(_db, _tableName);
+    final builder = QueryBuilder(_pinnedDb, _tableName, binding: _binding);
     // Copy base ChainBuilder properties
     builder._conditionCount = _conditionCount;
     builder._fastSingleEqField = _fastSingleEqField;
@@ -823,68 +825,109 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   /// are coalesced via a boolean flag instead of spawning new queries.
   /// This keeps overhead at zero (no Timer, no extra allocations) and
   /// is self-adaptive -- the slower the query, the more events are batched.
+  ///
+  /// When created via [ToStore.query], the stream survives
+  /// [ToStore.switchSpace]: it detaches before the old engine closes and
+  /// re-attaches to the new space (emits a fresh snapshot).
   Stream<List<Map<String, dynamic>>> watch() {
-    // Create a controller to manage the stream
     late StreamController<List<Map<String, dynamic>>> controller;
     StreamSubscription? subscription;
-
-    // Debounce state -- shared between the onListen closure and the
-    // notification callback.  Only accessed on the main isolate so no
-    // synchronisation is needed.
+    StreamSubscription<void>? replacedSub;
     bool queryPending = false;
     bool needsRefresh = false;
+    var listening = false;
+
+    Future<void> detachNotification() async {
+      final sub = subscription;
+      subscription = null;
+      await sub?.cancel();
+    }
+
+    Future<void> attach() async {
+      if (!listening || controller.isClosed) return;
+      await detachNotification();
+
+      try {
+        _invalidateFuture();
+        final initialData = await this;
+        if (!controller.isClosed) {
+          controller.add(initialData.data);
+        }
+      } catch (e) {
+        if (!controller.isClosed) {
+          controller.addError(e);
+        }
+      }
+
+      if (!listening || controller.isClosed) return;
+
+      final db = _db;
+      if (!db.isInitialized) {
+        await db.ensureInitialized();
+      }
+      if (!listening || controller.isClosed || !identical(_db, db)) return;
+
+      final table = await db.getTableContext(_tableName);
+      if (!listening || controller.isClosed || !identical(_db, db)) return;
+
+      subscription = db.notificationManager.register(
+        table.tableUid,
+        queryCondition,
+        (event) async {
+          if (queryPending) {
+            needsRefresh = true;
+            return;
+          }
+
+          queryPending = true;
+          try {
+            do {
+              needsRefresh = false;
+              _invalidateFuture();
+              final newData = await this;
+              if (!controller.isClosed) {
+                controller.add(newData.data);
+              }
+            } while (needsRefresh && !controller.isClosed);
+          } catch (e) {
+            if (!controller.isClosed) {
+              controller.addError(e);
+            }
+          } finally {
+            queryPending = false;
+          }
+        },
+      );
+    }
+
+    void onReplacing() {
+      // Sync cancel path so switchSpace can close the old engine without
+      // forwarding teardown errors into the user stream.
+      final sub = subscription;
+      subscription = null;
+      unawaited(sub?.cancel());
+    }
 
     controller = StreamController<List<Map<String, dynamic>>>(
       onListen: () async {
-        // 1. Emit initial value
-        try {
-          _invalidateFuture();
-          final initialData = await this;
-          controller.add(initialData.data);
-        } catch (e) {
-          controller.addError(e);
+        listening = true;
+        final binding = _binding;
+        if (binding != null) {
+          binding.addEngineReplacingListener(onReplacing);
+          replacedSub = binding.onEngineReplaced.listen((_) {
+            unawaited(attach());
+          });
         }
-
-        // 2. Subscribe to changes
-        // We need to ensure db is initialized before accessing notificationManager
-        if (!_db.isInitialized) {
-          await _db.ensureInitialized();
-        }
-
-        final table = await _db.getTableContext(_tableName);
-        subscription = _db.notificationManager.register(
-          table.tableUid,
-          queryCondition,
-          (event) async {
-            // A query is already in flight -- just mark that the result
-            // will be stale so we re-query once it finishes.
-            if (queryPending) {
-              needsRefresh = true;
-              return;
-            }
-
-            queryPending = true;
-            try {
-              do {
-                needsRefresh = false;
-                _invalidateFuture();
-                final newData = await this;
-                if (!controller.isClosed) {
-                  controller.add(newData.data);
-                }
-              } while (needsRefresh && !controller.isClosed);
-            } catch (e) {
-              if (!controller.isClosed) {
-                controller.addError(e);
-              }
-            } finally {
-              queryPending = false;
-            }
-          },
-        );
+        await attach();
       },
       onCancel: () async {
-        await subscription?.cancel();
+        listening = false;
+        final binding = _binding;
+        if (binding != null) {
+          binding.removeEngineReplacingListener(onReplacing);
+        }
+        await replacedSub?.cancel();
+        await detachNotification();
       },
     );
 

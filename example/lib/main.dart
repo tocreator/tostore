@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
 
@@ -9,6 +10,7 @@ import 'testing/benchmark_dialog.dart';
 import 'testing/benchmark_models.dart';
 import 'testing/benchmark_runner.dart';
 import 'testing/database_tester.dart';
+import 'testing/example_schemas.dart';
 import 'testing/log_service.dart';
 import 'tostore_example.dart' show ForeignKeyMode, ToStoreExample;
 
@@ -128,15 +130,15 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
 
   // State for Data View
   final List<String> _tableNames = [
-    'users',
-    'posts',
-    'comments',
-    'embeddings',
-    'settings',
+    ExampleSchemas.users.name,
+    ExampleSchemas.posts.name,
+    ExampleSchemas.comments.name,
+    ExampleSchemas.embeddings.name,
+    ExampleSchemas.settings.name,
     _kKvSpaceLabel,
     _kKvGlobalLabel,
   ];
-  String _selectedTable = 'users';
+  String _selectedTable = ExampleSchemas.users.name;
   bool _hasVectorSupport = false;
 
   bool get _isKvMode =>
@@ -178,6 +180,21 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
   // New state for active filters
   List<Map<String, dynamic>> _activeFilters = [];
 
+  /// Collapsed log handle height — watch strip matches this so the main list
+  /// stays usable while a single-row live watch is open.
+  static const double _kBottomChromeHeight = 60;
+
+  /// Live single-record watch (query().watch on PK). Survives switchSpace.
+  String? _watchTable;
+  String? _watchPkField;
+  dynamic _watchPkValue;
+  Map<String, dynamic>? _watchRow;
+  bool _watchMissing = false;
+  int _watchPulse = 0;
+  StreamSubscription<List<Map<String, dynamic>>>? _watchSub;
+
+  bool get _hasRecordWatch => _watchTable != null && _watchPkValue != null;
+
   @override
   void initState() {
     super.initState();
@@ -193,6 +210,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
 
   @override
   void dispose() {
+    unawaited(_stopRecordWatch());
     logService.logs.removeListener(_onLogsChanged);
     _logPanelController.dispose();
     _sheetScrollController?.removeListener(_logScrollListener);
@@ -884,17 +902,54 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                               ],
                             ),
                     ),
-                    // This space is a buffer for the collapsed log panel handle
-                    const SizedBox(height: 60),
+                    // Reserve space for collapsed log (+ watch strip when live).
+                    SizedBox(
+                      height: _hasRecordWatch
+                          ? _kBottomChromeHeight * 2
+                          : _kBottomChromeHeight,
+                    ),
                   ],
                 ),
               ),
             ),
             // Draggable Log Panel
             _buildResizableLogPanel(),
+            // Sit on top of the log sheet so the live strip is never covered.
+            if (_hasRecordWatch) _buildRecordWatchOverlay(),
           ],
         ),
       ),
+    );
+  }
+
+  /// Positions the PK watch strip just above the current log panel height.
+  Widget _buildRecordWatchOverlay() {
+    return ListenableBuilder(
+      listenable: _logPanelController,
+      builder: (context, _) {
+        return LayoutBuilder(
+          builder: (context, constraints) {
+            final logFraction =
+                _logPanelController.isAttached ? _logPanelController.size : 0.1;
+            final bottom = constraints.maxHeight * logFraction;
+            return Align(
+              alignment: Alignment.bottomCenter,
+              child: Padding(
+                padding: EdgeInsets.only(bottom: bottom),
+                child: ConstrainedBox(
+                  constraints:
+                      const BoxConstraints(maxWidth: _kContentMaxWidth),
+                  child: Material(
+                    elevation: 6,
+                    shadowColor: Colors.black26,
+                    child: _buildRecordWatchStrip(),
+                  ),
+                ),
+              ),
+            );
+          },
+        );
+      },
     );
   }
 
@@ -1102,6 +1157,195 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     );
   }
 
+  /// Bar above the log panel: live PK watch via [QueryBuilder.watch].
+  Widget _buildRecordWatchStrip() {
+    final title = _watchMissing
+        ? 'MISSING  $_watchTable.$_watchPkField=$_watchPkValue'
+        : 'LIVE  $_watchTable.$_watchPkField=$_watchPkValue';
+    final body = _watchMissing
+        ? 'No row in current space (deleted or never existed here). '
+            'Edits in another space with the same id will appear after switch.'
+        : (_watchRow == null
+            ? 'Waiting for first watch emission…'
+            : _watchRow!.entries
+                .map((e) => '${e.key}:${e.value ?? 'NULL'}')
+                .join(' · '));
+
+    return ColoredBox(
+      color: _watchMissing ? const Color(0xFFFFF7ED) : const Color(0xFFF5F3FF),
+      child: SizedBox(
+        height: _kBottomChromeHeight,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          child: Row(
+            children: [
+              AnimatedContainer(
+                duration: const Duration(milliseconds: 220),
+                width: 8,
+                height: 8,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: _watchMissing
+                      ? const Color(0xFFEA580C)
+                      : (_watchPulse.isEven
+                          ? const Color(0xFF7C3AED)
+                          : const Color(0xFF22C55E)),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Text(
+                      title,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: 0.2,
+                        color: _watchMissing
+                            ? const Color(0xFF9A3412)
+                            : const Color(0xFF5B21B6),
+                      ),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      body,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Color(0xFF334155),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              IconButton(
+                tooltip: 'Stop watch',
+                visualDensity: VisualDensity.compact,
+                padding: EdgeInsets.zero,
+                constraints: const BoxConstraints(minWidth: 32, minHeight: 32),
+                onPressed: () => unawaited(_stopRecordWatch()),
+                icon: const Icon(Icons.close, size: 18),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _offerWatchSelectedRecord() async {
+    if (_isKvMode || _primaryKey == null || _selectedRows.length != 1) {
+      return;
+    }
+    final pk = _selectedRows.first;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Watch this primary key?'),
+        content: Text(
+          'Start a live query().watch() on\n'
+          '$_selectedTable.$_primaryKey = $pk\n\n'
+          'A strip above the log panel will show the row and update on '
+          'modify/delete. After switchSpace, the same id in the new space '
+          'keeps driving this watch.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Start watch'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed == true && mounted) {
+      await _startRecordWatch(
+        table: _selectedTable,
+        pkField: _primaryKey!,
+        pkValue: pk,
+      );
+    }
+  }
+
+  Future<void> _startRecordWatch({
+    required String table,
+    required String pkField,
+    required dynamic pkValue,
+  }) async {
+    await _stopRecordWatch(notify: false);
+    if (!mounted) return;
+
+    setState(() {
+      _watchTable = table;
+      _watchPkField = pkField;
+      _watchPkValue = pkValue;
+      _watchRow = null;
+      _watchMissing = false;
+      _watchPulse = 0;
+    });
+
+    final stream =
+        widget.example.db.query(table).where(pkField, '=', pkValue).watch();
+
+    _watchSub = stream.listen(
+      (rows) {
+        if (!mounted) return;
+        setState(() {
+          _watchPulse++;
+          if (rows.isEmpty) {
+            _watchMissing = true;
+            _watchRow = null;
+          } else {
+            _watchMissing = false;
+            _watchRow = Map<String, dynamic>.from(rows.first);
+          }
+        });
+        logService.add(
+          rows.isEmpty
+              ? 'Watch $_watchTable.$_watchPkField=$_watchPkValue → empty '
+                  '(missing in current space)'
+              : 'Watch $_watchTable.$_watchPkField=$_watchPkValue → '
+                  '${rows.first}',
+          LogLevel.info,
+        );
+      },
+      onError: (Object e, StackTrace st) {
+        logService.add('Watch error: $e', LogLevel.error);
+      },
+    );
+
+    logService.add(
+      'Started live watch on $table.$pkField=$pkValue',
+      LogLevel.info,
+    );
+  }
+
+  Future<void> _stopRecordWatch({bool notify = true}) async {
+    await _watchSub?.cancel();
+    _watchSub = null;
+    if (!mounted) return;
+    if (_watchTable == null && _watchPkValue == null) return;
+    setState(() {
+      _watchTable = null;
+      _watchPkField = null;
+      _watchPkValue = null;
+      _watchRow = null;
+      _watchMissing = false;
+    });
+    if (notify) {
+      logService.add('Stopped live record watch', LogLevel.info);
+    }
+  }
+
   Widget _buildDataHeader() {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8.0),
@@ -1268,6 +1512,8 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                     _showKvGetDialog();
                   } else if (value == 'filter') {
                     _showFilterDialog();
+                  } else if (value == 'watch_pk') {
+                    unawaited(_offerWatchSelectedRecord());
                   } else if (value == 'custom_delete') {
                     _showCustomDeleteDialog();
                   } else if (value == 'clear_current_table') {
@@ -1312,6 +1558,29 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                     ),
                   ),
                   if (!_isKvMode) ...[
+                    PopupMenuItem(
+                      value: 'watch_pk',
+                      enabled: _selectedRows.length == 1 &&
+                          _primaryKey != null &&
+                          !_isDataLoading,
+                      child: Row(
+                        children: [
+                          Icon(
+                            Icons.visibility_outlined,
+                            size: 18,
+                            color: _selectedRows.length == 1
+                                ? const Color(0xFF7C3AED)
+                                : Colors.grey,
+                          ),
+                          const SizedBox(width: 8),
+                          Text(
+                            _selectedRows.length == 1
+                                ? 'Watch PK ${_selectedRows.first}'
+                                : 'Watch PK (select 1 row)',
+                          ),
+                        ],
+                      ),
+                    ),
                     const PopupMenuDivider(),
                     const PopupMenuItem(
                       value: 'custom_delete',
@@ -2151,11 +2420,11 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
               _lastOperationInfo = 'Clearing all tables...';
             });
             try {
-              await widget.example.db.clear('comments');
-              await widget.example.db.clear('posts');
-              await widget.example.db.clear('users');
-              await widget.example.db.clear('settings');
-              await widget.example.db.clear('embeddings');
+              await widget.example.db.clear(ExampleSchemas.comments.name);
+              await widget.example.db.clear(ExampleSchemas.posts.name);
+              await widget.example.db.clear(ExampleSchemas.users.name);
+              await widget.example.db.clear(ExampleSchemas.settings.name);
+              await widget.example.db.clear(ExampleSchemas.embeddings.name);
               _updateOperationInfo('All tables cleared.');
               _fetchTableData(resetPage: true);
             } finally {
@@ -2346,16 +2615,21 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     if (result != null) {
       final iterations = result['iterations'] ?? 1;
       final topK = result['topK'] ?? 10;
+      final searchDepth = result['searchDepth'] ?? 80;
 
       setState(() {
         _isTesting = true;
         _lastOperationInfo =
-            'Running $iterations vector search iterations (Top-$topK)...';
+            'Running $iterations vector search iterations (Top-$topK, depth=$searchDepth)...';
       });
 
       try {
-        await widget.example
-            .vectorSearchBenchmark(_selectedTable, iterations, topK);
+        await widget.example.vectorSearchBenchmark(
+          _selectedTable,
+          iterations,
+          topK,
+          searchDepth: searchDepth,
+        );
       } catch (e) {
         logService.add('Benchmark failed: $e', LogLevel.error);
         _updateOperationInfo('❌ Vector search benchmark failed.');
@@ -3464,13 +3738,13 @@ class _ConcurrencyTestDialogState extends State<ConcurrencyTestDialog> {
   final _formKey = GlobalKey<FormState>();
 
   final _controllers = {
-    'users': {
+    ExampleSchemas.users.name: {
       'insert': TextEditingController(text: '1000'),
       'read': TextEditingController(text: '1000'),
       'update': TextEditingController(text: '500'),
       'delete': TextEditingController(text: '500'),
     },
-    'settings': {
+    ExampleSchemas.settings.name: {
       'insert': TextEditingController(text: '1000'),
       'read': TextEditingController(text: '1000'),
       'update': TextEditingController(text: '500'),
@@ -4815,9 +5089,30 @@ class VectorSearchDialog extends StatefulWidget {
 }
 
 class _VectorSearchDialogState extends State<VectorSearchDialog> {
+  static const int _depthFast = 40;
+  static const int _depthBalanced = 80;
+  static const int _depthDeep = 100;
+
   int _iterations = 1;
   int _topK = 10;
+  int _searchDepth = _depthBalanced;
   final _customController = TextEditingController(text: '1');
+  final _depthController = TextEditingController(text: '$_depthBalanced');
+
+  @override
+  void dispose() {
+    _customController.dispose();
+    _depthController.dispose();
+    super.dispose();
+  }
+
+  void _setSearchDepth(int depth) {
+    final clamped = depth.clamp(1, 100);
+    setState(() {
+      _searchDepth = clamped;
+      _depthController.text = clamped.toString();
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -4854,6 +5149,52 @@ class _VectorSearchDialogState extends State<VectorSearchDialog> {
             ),
             Center(child: Text('$_topK results per search')),
             const SizedBox(height: 24),
+            const Text('Search Depth (1–100):',
+                style: TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              children: [
+                (_depthFast, 'Fast'),
+                (_depthBalanced, 'Balanced'),
+                (_depthDeep, 'Deep'),
+              ].map((preset) {
+                final depth = preset.$1;
+                final label = preset.$2;
+                final isSelected = _searchDepth == depth;
+                return ChoiceChip(
+                  label: Text('$label ($depth)'),
+                  selected: isSelected,
+                  selectedColor: const Color(0xff0aa6e8),
+                  checkmarkColor: Colors.white,
+                  labelStyle: TextStyle(
+                    color: isSelected ? Colors.white : Colors.black,
+                  ),
+                  onSelected: (selected) {
+                    if (selected) _setSearchDepth(depth);
+                  },
+                );
+              }).toList(),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _depthController,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                labelText: 'Custom Search Depth',
+                border: OutlineInputBorder(),
+                prefixIcon: Icon(Icons.layers),
+                helperText:
+                    'Higher ≈ better recall intent + more latency (not recall%)',
+              ),
+              onChanged: (v) {
+                final val = int.tryParse(v);
+                if (val != null && val >= 1 && val <= 100) {
+                  setState(() => _searchDepth = val);
+                }
+              },
+            ),
+            const SizedBox(height: 24),
             const Text('Iterations:',
                 style: TextStyle(fontWeight: FontWeight.bold)),
             const SizedBox(height: 8),
@@ -4865,6 +5206,7 @@ class _VectorSearchDialogState extends State<VectorSearchDialog> {
                   label: Text(count == 1 ? 'Single' : count.toString()),
                   selected: isSelected,
                   selectedColor: const Color(0xff0aa6e8),
+                  checkmarkColor: Colors.white,
                   labelStyle: TextStyle(
                     color: isSelected ? Colors.white : Colors.black,
                   ),
@@ -4910,9 +5252,12 @@ class _VectorSearchDialogState extends State<VectorSearchDialog> {
         ),
         ElevatedButton(
           onPressed: () {
+            final parsedDepth = int.tryParse(_depthController.text.trim());
+            final depth = (parsedDepth ?? _searchDepth).clamp(1, 100);
             Navigator.of(context).pop({
               'iterations': _iterations,
               'topK': _topK,
+              'searchDepth': depth,
             });
           },
           style: ElevatedButton.styleFrom(

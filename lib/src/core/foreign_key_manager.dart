@@ -2440,21 +2440,20 @@ class ForeignKeyManager {
     TableSchema schema, {
     bool throwOnError = false,
   }) async {
-    if (schema.foreignKeys.isEmpty) return;
-    final tableName = table.tableName;
+    // Empty foreignKeys still runs so stale system-table rows are deleted.
+    final referencingName = table.tableName.value;
     try {
       final fkTableName = SystemTable.getFkReferencesName();
 
       // Check if system table exists
       final tableExists = await _dataStore.tableExists(fkTableName);
       if (!tableExists) {
+        if (schema.foreignKeys.isEmpty) return;
         // System table doesn't exist yet
         // This can happen during upgrade from old version without system_fk_references table
         // The system table should be created before user tables (ensured by getInitialSchema)
-        // If we reach here, it means the system table creation was skipped or failed
-        // Log a warning but don't throw - the system table will be created eventually
         final message =
-            'System table $fkTableName does not exist yet. Foreign key relationships for table $tableName will not be stored in system table. '
+            'System table $fkTableName does not exist yet. Foreign key relationships for table $referencingName will not be stored in system table. '
             'This may happen during upgrade. The system table should be created before user tables.';
         if (throwOnError) {
           throw DbException([
@@ -2470,32 +2469,25 @@ class ForeignKeyManager {
         return;
       }
 
-      // Optimization: Compare existing system table entries with new schema
-      // Only perform updates if there are changes to avoid unnecessary writes
-
-      // 1. Get all existing FKs for this table from system table
+      // 1. Get all existing FKs for this referencing table from system table
       final queryBuilder = QueryBuilder(_dataStore, fkTableName);
-      queryBuilder.where('referencing_table', '=', tableName);
+      queryBuilder.where('referencing_table', '=', referencingName);
       final existingResults = await queryBuilder.limit(1000000000).future;
 
-      final existingFkMap = <String, Map<String, dynamic>>{};
+      final existingByFkName = <String, Map<String, dynamic>>{};
       for (final record in existingResults.data) {
-        final fkName = record['fk_name'] as String;
-        existingFkMap[fkName] = record;
+        final fkName = record['fk_name']?.toString();
+        if (fkName == null || fkName.isEmpty) continue;
+        existingByFkName[fkName] = record;
       }
 
-      // 2. Perform differential update: Update existing, Insert new, Delete removed
-      // This avoids unnecessary delete operations and preserves primary keys
-
-      // Track which FKs from schema we've processed
       final processedFkNames = <String>{};
+      final fkTable = await _dataStore.getTableContext(fkTableName);
 
-      // Process each FK in the schema
       for (final fk in schema.foreignKeys) {
-        final existingRecord = existingFkMap[fk.actualName];
-        final fkData = {
+        final fkData = <String, dynamic>{
           'referenced_table': fk.referencedTable,
-          'referencing_table': tableName,
+          'referencing_table': referencingName,
           'fk_name': fk.actualName,
           'fk_fields': jsonEncode(fk.fields),
           'ref_fields': jsonEncode(fk.referencedFields),
@@ -2504,85 +2496,106 @@ class ForeignKeyManager {
           'enabled': fk.enabled,
         };
 
+        final existingRecord = existingByFkName[fk.actualName];
         if (existingRecord != null) {
-          // FK exists - check if update is needed
-          final needsUpdate = existingRecord['referenced_table'] !=
-                  fk.referencedTable ||
-              existingRecord['on_delete'] !=
+          final oldReferenced =
+              existingRecord['referenced_table']?.toString() ?? '';
+          final needsUpdate = oldReferenced != fk.referencedTable ||
+              existingRecord['on_delete']?.toString() !=
                   fk.onDelete.toString().split('.').last ||
-              existingRecord['on_update'] !=
+              existingRecord['on_update']?.toString() !=
                   fk.onUpdate.toString().split('.').last ||
               existingRecord['enabled'] != fk.enabled ||
-              existingRecord['fk_fields'] != jsonEncode(fk.fields) ||
-              existingRecord['ref_fields'] != jsonEncode(fk.referencedFields);
+              existingRecord['fk_fields']?.toString() !=
+                  jsonEncode(fk.fields) ||
+              existingRecord['ref_fields']?.toString() !=
+                  jsonEncode(fk.referencedFields);
 
           if (needsUpdate) {
-            // Update existing record (preserves primary key)
-            final updateData = <String, dynamic>{};
-            for (final entry in fkData.entries) {
-              // Don't update composite key fields (they're used in WHERE clause)
-              if (entry.key != 'referencing_table' &&
-                  entry.key != 'referenced_table' &&
-                  entry.key != 'fk_name') {
-                updateData[entry.key] = entry.value;
-              }
-            }
-
-            if (updateData.isNotEmpty) {
-              final fkTable = await _dataStore.getTableContext(fkTableName);
+            if (oldReferenced != fk.referencedTable) {
+              // Composite unique key includes referenced_table — delete old
+              // row then insert (in-place update cannot change unique key cols).
+              final deleteResult = await _dataStore.deleteInternal(
+                fkTable,
+                QueryCondition()
+                  ..where('referencing_table', '=', referencingName)
+                  ..where('referenced_table', '=', oldReferenced)
+                  ..where('fk_name', '=', fk.actualName),
+              );
+              _throwIfEngineWriteFailed(deleteResult, ignoreNotFound: true);
+              await _insertOrUpdateFkReferenceRow(
+                fkTableName: fkTableName,
+                fkData: fkData,
+              );
+            } else {
+              final updateData = <String, dynamic>{
+                'fk_fields': fkData['fk_fields'],
+                'ref_fields': fkData['ref_fields'],
+                'on_delete': fkData['on_delete'],
+                'on_update': fkData['on_update'],
+                'enabled': fkData['enabled'],
+              };
               final result = await _dataStore.updateInternal(
                 fkTable,
                 updateData,
                 QueryCondition()
-                  ..where('referencing_table', '=', tableName)
+                  ..where('referencing_table', '=', referencingName)
                   ..where('referenced_table', '=', fk.referencedTable)
                   ..where('fk_name', '=', fk.actualName),
               );
               _throwIfEngineWriteFailed(result, ignoreNotFound: true);
             }
           }
-          // If no update needed, skip
         } else {
-          // New FK - insert
-          await _dataStore.insert(fkTableName, fkData);
+          await _insertOrUpdateFkReferenceRow(
+            fkTableName: fkTableName,
+            fkData: fkData,
+          );
         }
 
         processedFkNames.add(fk.actualName);
       }
 
       // Delete FKs that no longer exist in schema
-      for (final existingFkName in existingFkMap.keys) {
-        if (!processedFkNames.contains(existingFkName)) {
-          // This FK was removed from schema, delete it
-          final existingRecord = existingFkMap[existingFkName];
-          if (existingRecord != null) {
-            final fkTable = await _dataStore.getTableContext(fkTableName);
-            final result = await _dataStore.deleteInternal(
-              fkTable,
-              QueryCondition()
-                ..where('referencing_table', '=', tableName)
-                ..where(
-                    'referenced_table', '=', existingRecord['referenced_table'])
-                ..where('fk_name', '=', existingFkName),
-            );
-            _throwIfEngineWriteFailed(result);
-          }
-        }
+      for (final existingFkName in existingByFkName.keys) {
+        if (processedFkNames.contains(existingFkName)) continue;
+        final existingRecord = existingByFkName[existingFkName];
+        if (existingRecord == null) continue;
+        final result = await _dataStore.deleteInternal(
+          fkTable,
+          QueryCondition()
+            ..where('referencing_table', '=', referencingName)
+            ..where('referenced_table', '=', existingRecord['referenced_table'])
+            ..where('fk_name', '=', existingFkName),
+        );
+        _throwIfEngineWriteFailed(result, ignoreNotFound: true);
       }
 
-      // Invalidate cache to force reload
       invalidateCache();
     } catch (e) {
-      Logger.warn('Failed to update system table for table $tableName',
+      Logger.warn('Failed to update system table for table $referencingName',
           rawError: e);
       if (throwOnError) {
         rethrow;
       }
-      // Don't throw - cache invalidation will handle it
     }
   }
 
+  /// Upsert an FK system-table row by the composite unique key
+  /// `(referenced_table, referencing_table, fk_name)`.
+  ///
+  /// Avoids failing [insert] that logs `[Unique Constraint Violation]` whenever
+  /// a prior query miss / race would re-insert an already-indexed row.
+  Future<void> _insertOrUpdateFkReferenceRow({
+    required String fkTableName,
+    required Map<String, dynamic> fkData,
+  }) async {
+    final result = await _dataStore.upsert(fkTableName, fkData);
+    _throwIfEngineWriteFailed(result);
+  }
+
   /// Check if any tables reference the given table via foreign keys
+
   ///
   /// This is a public method to check foreign key references before dropping a table
   Future<Map<TableUid, List<ForeignKeySchema>>> findReferencingTables(
@@ -2602,7 +2615,7 @@ class ForeignKeyManager {
     TableContext table, {
     bool throwOnError = false,
   }) async {
-    final tableName = table.tableName;
+    final tableNameStr = table.tableName.value;
     try {
       final fkTableName = SystemTable.getFkReferencesName();
 
@@ -2620,8 +2633,8 @@ class ForeignKeyManager {
       final result = await _dataStore.deleteInternal(
         fkTable,
         QueryCondition()
-          ..where('referencing_table', '=', tableName)
-          ..orWhere('referenced_table', '=', tableName),
+          ..where('referencing_table', '=', tableNameStr)
+          ..orWhere('referenced_table', '=', tableNameStr),
       );
       _throwIfEngineWriteFailed(result);
 
@@ -2629,10 +2642,11 @@ class ForeignKeyManager {
       invalidateCache();
 
       Logger.debug(
-        'Cleaned up system table entries for dropped table: $tableName',
+        'Cleaned up system table entries for dropped table: $tableNameStr',
       );
     } catch (e) {
-      Logger.warn('Failed to cleanup system table for dropped table $tableName',
+      Logger.warn(
+          'Failed to cleanup system table for dropped table $tableNameStr',
           rawError: e);
       if (throwOnError) {
         rethrow;

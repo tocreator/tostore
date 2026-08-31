@@ -2321,7 +2321,13 @@ class MigrationManager {
             final allowedTables = _dataStore
                     .config.migrationConfig?.allowedAfterDataMigrationTables ??
                 [];
-            if (allowedTables.contains(tableName)) {
+            // Accept old or new table name after renameTable.
+            final namesToMatch = <String>{
+              tableName,
+              oldSchema.name,
+              targetSchema.name,
+            };
+            if (namesToMatch.any(allowedTables.contains)) {
               isAllowed = true;
             }
           }
@@ -2518,7 +2524,7 @@ class MigrationManager {
             shadowSchema,
             isSystemTable: true,
           );
-          if (!createResult.isSuccess) {
+          if (createResult.hasErrors) {
             throw DbException([
               GeneralStatus(
                 type: ResultType.engError,
@@ -3158,10 +3164,17 @@ class MigrationManager {
         );
       }
 
+      // Match child FKs by old and/or new parent name: cutover may already use
+      // the new table name while child schemas still reference the old name
+      // until applyTableRenameSideEffects runs below.
       await _syncReferencingForeignKeysMetadata(
         tableForSave,
         targetSchema: schemaToSave,
         operations: operations,
+        parentTableNames: {
+          currentTableName,
+          if (isTableRename) tableName,
+        },
         outDroppedChildIndexes: outDroppedChildIndexes,
       );
 
@@ -3408,7 +3421,17 @@ class MigrationManager {
         final newIdxUid = newIdx.indexUid;
         IndexSchema? oldIdx;
 
-        if (fieldRenames.isNotEmpty) {
+        // Prefer stable indexUid even when fields were renamed; fall back to
+        // mapped field lists / explicit names.
+        for (final oldIndex in oldAllIndexes) {
+          if (oldIndex.indexUid.isNotEmpty &&
+              newIdx.indexUid.isNotEmpty &&
+              oldIndex.indexUid == newIdx.indexUid) {
+            oldIdx = oldIndex;
+            break;
+          }
+        }
+        if (oldIdx == null && fieldRenames.isNotEmpty) {
           for (final oldIndex in oldAllIndexes) {
             final mappedOldFields =
                 oldIndex.fields.map((f) => fieldRenames[f] ?? f).toList();
@@ -3422,13 +3445,9 @@ class MigrationManager {
               break;
             }
           }
-        } else {
+        }
+        if (oldIdx == null) {
           for (final oldIndex in oldAllIndexes) {
-            if (oldIndex.indexUid.isNotEmpty &&
-                oldIndex.indexUid == newIdx.indexUid) {
-              oldIdx = oldIndex;
-              break;
-            }
             if (oldIndex.actualIndexName == newIdx.actualIndexName) {
               oldIdx = oldIndex;
               break;
@@ -3607,6 +3626,24 @@ class MigrationManager {
           return true;
         default:
           break;
+      }
+    }
+    return false;
+  }
+
+  /// True when modifyField may clamp/default existing row values during rewrite.
+  bool _operationsMayAdjustFieldValues(List<MigrationOperation> operations) {
+    for (final op in operations) {
+      if (op.type != MigrationType.modifyField) continue;
+      final u = op.fieldUpdate;
+      if (u == null) continue;
+      if (u.type != null) return true;
+      if (u.nullable == false) return true;
+      if (u.isExplicitlySet('minValue') ||
+          u.isExplicitlySet('maxValue') ||
+          u.isExplicitlySet('minLength') ||
+          u.isExplicitlySet('maxLength')) {
+        return true;
       }
     }
     return false;
@@ -3908,14 +3945,18 @@ class MigrationManager {
     await _detectRenamedFields(oldSchema, newSchema, operations);
   }
 
-  /// Compare indexes and generate operations
+  /// Compare effective indexes (explicit + implicit) and generate operations.
+  ///
+  /// Always diffs [TableSchema.getAllIndexes] — never `indexes` alone — so
+  /// FieldSchema.unique / createIndex / TTL / FK implicits and IndexSchema
+  /// representation swaps do not spuriously add/remove/rebuild.
   void _compareIndexes(
     TableSchema oldSchema,
     TableSchema newSchema,
     List<MigrationOperation> operations,
   ) {
-    final oldIndexes = oldSchema.indexes;
-    final newIndexes = newSchema.indexes;
+    final oldIndexes = oldSchema.getAllIndexes();
+    final newIndexes = newSchema.getAllIndexes();
 
     // Build field rename mapping
     final fieldRenames = <String, String>{};
@@ -3927,33 +3968,63 @@ class MigrationManager {
       }
     }
 
-    // First mark all old indexes as to be removed
+    // First mark all old effective indexes as to be removed
     final indexesToRemove = List<IndexSchema>.from(oldIndexes);
 
     // Check for added and modified indexes
     for (var newIndex in newIndexes) {
-      // Try to find matching index in old schema
+      // Prefer uid / same unique+type over fields-only match so a unique and
+      // a non-unique index on the same columns are not paired incorrectly.
       IndexSchema? matchedOldIndex;
+      IndexSchema? fieldsOnlyMatch;
 
       for (var oldIndex in indexesToRemove) {
-        // Map old index fields to new names using rename operations
         final mappedOldFields =
             oldIndex.fields.map((f) => fieldRenames[f] ?? f).toList();
         final mappedOldIndex = oldIndex.copyWith(fields: mappedOldFields);
 
-        if (_areIndexesSame(mappedOldIndex, newIndex)) {
+        if (!_areEffectiveIndexesSame(mappedOldIndex, newIndex)) {
+          continue;
+        }
+        if (oldIndex.indexUid.isNotEmpty &&
+            newIndex.indexUid.isNotEmpty &&
+            oldIndex.indexUid == newIndex.indexUid) {
           matchedOldIndex = oldIndex;
           break;
         }
+        if (mappedOldIndex.unique == newIndex.unique &&
+            mappedOldIndex.type == newIndex.type) {
+          matchedOldIndex = oldIndex;
+          break;
+        }
+        fieldsOnlyMatch ??= oldIndex;
       }
+      matchedOldIndex ??= fieldsOnlyMatch;
 
       if (matchedOldIndex == null) {
-        // No matching old index found, this is a new index
+        // No matching old effective index — truly new (incl. new implicits).
         operations.add(MigrationOperation(
           type: MigrationType.addIndex,
           index: newIndex,
         ));
       } else {
+        // Defense: IndexSchema(unique) → FieldSchema.unique representation
+        // swap must not emit modifyIndex(unique:false) churn. getAllIndexes
+        // already upgrades Field.unique onto single-field indexes, so this
+        // mainly covers odd intermediate snapshots.
+        final mappedOldFields = matchedOldIndex.fields
+            .map((f) => fieldRenames[f] ?? f)
+            .toList(growable: false);
+        if (_isUniqueRelocatedFromIndexToField(
+          oldIndex: matchedOldIndex,
+          mappedOldFields: mappedOldFields,
+          newIndex: newIndex,
+          newSchema: newSchema,
+        )) {
+          indexesToRemove.remove(matchedOldIndex);
+          continue;
+        }
+
         // Found matching old index, remove from to-be-deleted list
         indexesToRemove.remove(matchedOldIndex);
 
@@ -3979,8 +4050,10 @@ class MigrationManager {
             ));
           }
         }
-        // Check if modification is needed (no rename)
-        else if (_isIndexModified(matchedOldIndex, newIndex)) {
+        // Check if modification is needed (no rename). Compare fields after
+        // applying rename map so field-only renames do not become modifyIndex.
+        else if (_isIndexModified(matchedOldIndex, newIndex,
+            fieldRenames: fieldRenames)) {
           operations.add(MigrationOperation(
             type: MigrationType.modifyIndex,
             indexName: matchedOldIndex.actualIndexName,
@@ -3994,6 +4067,17 @@ class MigrationManager {
 
     // Handle indexes that need to be removed
     for (var indexToRemove in indexesToRemove) {
+      final mappedFields = indexToRemove.fields
+          .map((f) => fieldRenames[f] ?? f)
+          .toList(growable: false);
+      // Unique still enforced on new schema (Field.unique or remaining
+      // single-field unique index) — keep for indexUid inheritance.
+      if (indexToRemove.unique &&
+          mappedFields.length == 1 &&
+          _hasSingleFieldUniqueConstraint(newSchema, mappedFields.first)) {
+        continue;
+      }
+
       if (!SystemTable.isSystemTable(oldSchema.name)) {
         Logger.info(
           'Detected index to be removed: ${indexToRemove.actualIndexName}, fields: ${indexToRemove.fields.join(", ")}',
@@ -4008,6 +4092,32 @@ class MigrationManager {
             .fields, // Also provide field list for more reliable matching
       ));
     }
+  }
+
+  /// True when a single-field unique IndexSchema is being replaced by
+  /// [FieldSchema.unique] on the same field (uniqueness unchanged).
+  bool _isUniqueRelocatedFromIndexToField({
+    required IndexSchema oldIndex,
+    required List<String> mappedOldFields,
+    required IndexSchema newIndex,
+    required TableSchema newSchema,
+  }) {
+    if (!oldIndex.unique || newIndex.unique) return false;
+    if (mappedOldFields.length != 1 || newIndex.fields.length != 1) {
+      return false;
+    }
+    if (mappedOldFields.first != newIndex.fields.first) return false;
+    return _hasSingleFieldUniqueConstraint(newSchema, newIndex.fields.first);
+  }
+
+  /// Match effective indexes: prefer stable [IndexUid], then name/fields.
+  bool _areEffectiveIndexesSame(IndexSchema a, IndexSchema b) {
+    if (a.indexUid.isNotEmpty &&
+        b.indexUid.isNotEmpty &&
+        a.indexUid == b.indexUid) {
+      return true;
+    }
+    return _areIndexesSame(a, b);
   }
 
   /// Check if two indexes are the same
@@ -4034,15 +4144,24 @@ class MigrationManager {
   }
 
   /// Check if index is modified
-  bool _isIndexModified(IndexSchema oldIndex, IndexSchema newIndex) {
+  bool _isIndexModified(
+    IndexSchema oldIndex,
+    IndexSchema newIndex, {
+    Map<String, String> fieldRenames = const {},
+  }) {
     // Note: logical indexName change is handled by MigrationType.renameIndex
     // (schema only). Physical reconciliation uses stable [IndexUid].
     // ModifyIndex causes a full rebuild (drop + recreate), so it should only trigger
     // if structural configuration (unique, type, vector config, or fields) changes.
+    final mappedOldFields = fieldRenames.isEmpty
+        ? oldIndex.fields
+        : oldIndex.fields
+            .map((f) => fieldRenames[f] ?? f)
+            .toList(growable: false);
     return oldIndex.unique != newIndex.unique ||
         oldIndex.type != newIndex.type ||
         oldIndex.vectorConfig != newIndex.vectorConfig ||
-        !_areIndexFieldsEqual(oldIndex.fields, newIndex.fields);
+        !_areIndexFieldsEqual(mappedOldFields, newIndex.fields);
   }
 
   /// Compare foreign keys and generate operations
@@ -4051,25 +4170,41 @@ class MigrationManager {
   /// - **Allowed to modify**: onDelete, onUpdate, enabled, autoCreateIndex, comment
   /// - **Not allowed to modify**: fields, referencedTable, referencedFields
   ///   (These are core definitions. If changed, must remove old FK and add new FK)
+  /// - Local field renames on FK columns are not core changes (map via rename ops).
   void _compareForeignKeys(
     TableSchema oldSchema,
     TableSchema newSchema,
     List<MigrationOperation> operations,
   ) {
+    final fieldRenames = _buildFieldRenameHints(operations);
     // First mark all old foreign keys as to be removed
     final foreignKeysToRemove =
         List<ForeignKeySchema>.from(oldSchema.foreignKeys);
 
     // Check for added and modified foreign keys
     for (var newFk in newSchema.foreignKeys) {
-      // Try to find matching foreign key in old schema by name
+      // Try to find matching foreign key in old schema by name, then by
+      // rename-mapped fields (auto-generated names change with field renames).
       ForeignKeySchema? matchedOldFk;
 
-      for (var oldFk in oldSchema.foreignKeys) {
-        // Match by actual name (handles auto-generated names)
+      for (var oldFk in foreignKeysToRemove) {
         if (oldFk.actualName == newFk.actualName) {
           matchedOldFk = oldFk;
           break;
+        }
+      }
+      if (matchedOldFk == null && fieldRenames.isNotEmpty) {
+        for (var oldFk in foreignKeysToRemove) {
+          final mappedFields = oldFk.fields
+              .map((f) => fieldRenames[f] ?? f)
+              .toList(growable: false);
+          if (_areFieldListsEqual(mappedFields, newFk.fields) &&
+              oldFk.referencedTable == newFk.referencedTable &&
+              _areFieldListsEqual(
+                  oldFk.referencedFields, newFk.referencedFields)) {
+            matchedOldFk = oldFk;
+            break;
+          }
         }
       }
 
@@ -4086,8 +4221,11 @@ class MigrationManager {
         // Check if modification is needed
         // Core definitions (fields, referencedTable, referencedFields) cannot be modified
         // If they change, we must remove old FK and add new FK
+        final mappedOldFields = matchedOldFk.fields
+            .map((f) => fieldRenames[f] ?? f)
+            .toList(growable: false);
         final coreDefinitionChanged =
-            !_areFieldListsEqual(matchedOldFk.fields, newFk.fields) ||
+            !_areFieldListsEqual(mappedOldFields, newFk.fields) ||
                 matchedOldFk.referencedTable != newFk.referencedTable ||
                 !_areFieldListsEqual(
                     matchedOldFk.referencedFields, newFk.referencedFields);
@@ -4125,7 +4263,9 @@ class MigrationManager {
             )
           ]);
         } else {
-          // Only non-core properties changed - can modify
+          // Only non-core properties changed - can modify.
+          // Auto-generated FK names that follow renamed fields are absorbed by
+          // the target schema snapshot; no separate rename op is required.
           final needsModification = matchedOldFk.onDelete != newFk.onDelete ||
               matchedOldFk.onUpdate != newFk.onUpdate ||
               matchedOldFk.enabled != newFk.enabled ||
@@ -4512,7 +4652,10 @@ class MigrationManager {
       return true;
     }
 
-    // check if field is modified
+    // Field.unique flag changes still emit modifyField so persisted schema
+    // meta stays in sync. That alone does not require table rewrite
+    // (_needDataMigration ignores unique); Index↔Field relocation must not
+    // also emit modifyIndex(unique:false) or schedule index rebuilds.
     return oldField.type != newField.type ||
         oldField.nullable != newField.nullable ||
         oldField.unique != newField.unique ||
@@ -5254,6 +5397,18 @@ class MigrationManager {
                     currentTask.taskId, tableDataMeta.totalRecordCount);
               }
 
+              // One summary warn before rewrite — never per-row in
+              // applyFieldModification (avoids UI freezes on large tables).
+              if (_operationsMayAdjustFieldValues(sortedOperations)) {
+                final n = tableDataMeta?.totalRecordCount;
+                Logger.warn(
+                  'Table "${migrationTableCtx.tableName}" will adjust row values '
+                  'for field type/constraint changes'
+                  '${n != null ? ' (approximately $n records)' : ''}; '
+                  'per-row details omitted.',
+                );
+              }
+
               final startCursor = currentTask.checkpointKeyForSpace(space);
 
               final writeMode =
@@ -5883,9 +6038,14 @@ class MigrationManager {
     TableContext parentTable, {
     required TableSchema targetSchema,
     required List<MigrationOperation> operations,
+    Set<String>? parentTableNames,
     Map<TableUid, List<IndexUid>>? outDroppedChildIndexes,
   }) async {
-    final parentTableName = parentTable.tableName;
+    final currentParentName = parentTable.tableName.value;
+    final parentNames = <String>{
+      currentParentName,
+      ...?parentTableNames,
+    };
     final schemaMgr = _dataStore.tableMetaManager;
     final fkManager = _dataStore.foreignKeyManager;
     if (fkManager == null || schemaMgr == null) {
@@ -5919,7 +6079,7 @@ class MigrationManager {
             op.newName != null) {
           final renamed = _applyParentFieldRenameToChildSchema(
             updatedChildSchema,
-            parentTableName.value,
+            parentNames,
             op.fieldName!,
             op.newName!,
           );
@@ -5931,7 +6091,7 @@ class MigrationManager {
             op.fieldName != null) {
           final removed = _applyParentFieldRemovalToChildSchema(
             updatedChildSchema,
-            parentTableName.value,
+            parentNames,
             op.fieldName!,
           );
           if (removed != null) {
@@ -5942,7 +6102,7 @@ class MigrationManager {
       }
 
       final childFksOnParent = updatedChildSchema.foreignKeys
-          .where((fk) => fk.referencedTable == parentTableName.value)
+          .where((fk) => parentNames.contains(fk.referencedTable))
           .toList(growable: false);
       final childTableName = childSchema.name;
       for (final fk in childFksOnParent) {
@@ -5954,12 +6114,12 @@ class MigrationManager {
             SchemaValidationStatus(
               type: ResultType.devInvalidSchemaForeignKey,
               message:
-                  'Foreign key ${fk.actualName} in table $childTableName is no longer compatible with the migrated table $parentTableName.',
+                  'Foreign key ${fk.actualName} in table $childTableName is no longer compatible with the migrated table $currentParentName.',
               tableName: childTableName,
               field: fk.fields.join(','),
               wrongValue: {
                 'fkName': fk.actualName,
-                'referencedTable': parentTableName,
+                'referencedTable': currentParentName,
               },
             )
           ]);
@@ -6017,13 +6177,13 @@ class MigrationManager {
 
   TableSchema? _applyParentFieldRenameToChildSchema(
     TableSchema childSchema,
-    String parentTableName,
+    Set<String> parentTableNames,
     String oldFieldName,
     String newFieldName,
   ) {
     var changed = false;
     final updatedForeignKeys = childSchema.foreignKeys.map((fk) {
-      if (fk.referencedTable != parentTableName ||
+      if (!parentTableNames.contains(fk.referencedTable) ||
           !fk.referencedFields.contains(oldFieldName)) {
         return fk;
       }
@@ -6043,13 +6203,13 @@ class MigrationManager {
 
   TableSchema? _applyParentFieldRemovalToChildSchema(
     TableSchema childSchema,
-    String parentTableName,
+    Set<String> parentTableNames,
     String removedFieldName,
   ) {
     var changed = false;
     final updatedForeignKeys = <ForeignKeySchema>[];
     for (final fk in childSchema.foreignKeys) {
-      if (fk.referencedTable == parentTableName &&
+      if (parentTableNames.contains(fk.referencedTable) &&
           fk.referencedFields.contains(removedFieldName)) {
         changed = true;
         continue;
@@ -6135,6 +6295,33 @@ class MigrationManager {
       if (a[i] != b[i]) return false;
     }
     return true;
+  }
+
+  /// True when [schema] already enforces single-field uniqueness on [fieldName]
+  /// via [FieldSchema.unique] or a single-column unique index (explicit/auto).
+  ///
+  /// [fieldName] may be the **new** name after renames; [fieldRenames] is
+  /// `oldName -> newName` so old schema fields/indexes can still match.
+  bool _hasSingleFieldUniqueConstraint(
+    TableSchema schema,
+    String fieldName, {
+    Map<String, String> fieldRenames = const {},
+  }) {
+    bool matches(String schemaFieldName) =>
+        schemaFieldName == fieldName ||
+        fieldRenames[schemaFieldName] == fieldName;
+
+    for (final field in schema.fields) {
+      if (matches(field.name) && field.unique) {
+        return true;
+      }
+    }
+    for (final idx in schema.getAllIndexes()) {
+      if (idx.unique && idx.fields.length == 1 && matches(idx.fields.first)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /// Early-exit scan -- prefer over repeated `.any` on hot migration paths.
@@ -7231,15 +7418,38 @@ class MigrationManager {
       await _requireTableContextByUid(oldSchema.tableUid),
     );
 
-    // Check for unique index tightening (both explicit and implicit unique properties)
+    // Check for unique index tightening (both explicit and implicit unique properties).
+    // Field renames must be applied before comparing index field lists; otherwise a
+    // rename of a field that already had a unique index is misclassified as adding
+    // a new unique constraint (e.g. uniq_email -> uniq_email2).
     if (targetSchema != null) {
       final oldIndexes = oldSchema.getAllIndexes();
       final targetIndexes = targetSchema.getAllIndexes();
+      final fieldRenames = _buildFieldRenameHints(operations);
 
       for (final newIdx in targetIndexes) {
         if (newIdx.unique) {
-          final hasEquivalentOldUnique = oldIndexes.any((oldIdx) =>
-              oldIdx.unique && _sameFieldList(oldIdx.fields, newIdx.fields));
+          // Single-field: also accept old FieldSchema.unique / unique index under
+          // the pre-rename name (Index↔Field unique representation swaps).
+          final hasEquivalentOldUnique = (newIdx.fields.length == 1 &&
+                  _hasSingleFieldUniqueConstraint(
+                    oldSchema,
+                    newIdx.fields.first,
+                    fieldRenames: fieldRenames,
+                  )) ||
+              oldIndexes.any((oldIdx) {
+                if (!oldIdx.unique) return false;
+                // Same physical index after schema evolution.
+                if (oldIdx.indexUid.isNotEmpty &&
+                    newIdx.indexUid.isNotEmpty &&
+                    oldIdx.indexUid == newIdx.indexUid) {
+                  return true;
+                }
+                final mappedOldFields = oldIdx.fields
+                    .map((f) => fieldRenames[f] ?? f)
+                    .toList(growable: false);
+                return _sameFieldList(mappedOldFields, newIdx.fields);
+              });
 
           if (!hasEquivalentOldUnique) {
             if (recordCount > 0 && !isAllowed) {
@@ -7385,28 +7595,37 @@ class MigrationManager {
                 return true;
               }
             }
-            // from non-unique to unique
+            // from non-unique to unique on FieldSchema.
+            // Unique may already exist via IndexSchema(unique: true) on the same
+            // single field - moving uniqueness between FieldSchema and IndexSchema
+            // is not a real tightening.
             if (!oldField.unique && (fieldUpdate.unique == true)) {
-              if (recordCount > 0 && !isAllowed) {
-                throw DbException([
-                  SchemaValidationStatus(
-                    type: ResultType.devMigrationUniqueTighteningNotAllowed,
-                    message:
-                        'Changing field "${fieldUpdate.name}" from non-unique to unique is not allowed on non-empty table "${oldSchema.name}" '
-                        'without explicit data migration allowance.',
-                    tableName: oldSchema.name,
-                    field: fieldUpdate.name,
-                    wrongValue: {
-                      'oldUnique': false,
-                      'newUnique': true,
-                    },
-                  )
-                ]);
-              }
-              Logger.warn(
-                'Data migration required: changing field "${fieldUpdate.name}" from non-unique to unique.',
+              final alreadyUniqueViaIndex = _hasSingleFieldUniqueConstraint(
+                oldSchema,
+                fieldUpdate.name,
               );
-              return true;
+              if (!alreadyUniqueViaIndex) {
+                if (recordCount > 0 && !isAllowed) {
+                  throw DbException([
+                    SchemaValidationStatus(
+                      type: ResultType.devMigrationUniqueTighteningNotAllowed,
+                      message:
+                          'Changing field "${fieldUpdate.name}" from non-unique to unique is not allowed on non-empty table "${oldSchema.name}" '
+                          'without explicit data migration allowance.',
+                      tableName: oldSchema.name,
+                      field: fieldUpdate.name,
+                      wrongValue: {
+                        'oldUnique': false,
+                        'newUnique': true,
+                      },
+                    )
+                  ]);
+                }
+                Logger.warn(
+                  'Data migration required: changing field "${fieldUpdate.name}" from non-unique to unique.',
+                );
+                return true;
+              }
             }
           }
           break;

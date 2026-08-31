@@ -6,6 +6,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:tostore/tostore.dart';
 
+import 'example_schemas.dart';
 import 'log_service.dart';
 
 /// A comprehensive testing suite for validating ToStore's core functionalities.
@@ -80,7 +81,7 @@ class DatabaseTester {
   Future<Map<String, dynamic>?> _queryCachedFirstUserByField(
       String field, dynamic value) async {
     return await db
-        .query('users')
+        .query(ExampleSchemas.users.name)
         .select(_crudUserReadFields)
         .where(field, '=', value)
         .first();
@@ -196,14 +197,14 @@ class DatabaseTester {
   // Default concurrency test config using users and settings tables
   // to avoid foreign key constraint issues. Both tables have no foreign key dependencies,
   // allowing true concurrent operations without RESTRICT constraint blocking.
-  static const Map<String, Map<String, int>> _baseConcurrencyConfig = {
-    'users': {
+  static final Map<String, Map<String, int>> _baseConcurrencyConfig = {
+    ExampleSchemas.users.name: {
       'insert': 100,
       'read': 100,
       'update': 50,
       'delete': 50,
     },
-    'settings': {
+    ExampleSchemas.settings.name: {
       'insert': 100,
       'read': 100,
       'update': 50,
@@ -215,10 +216,10 @@ class DatabaseTester {
   /// Order: comments -> posts -> users (to respect RESTRICT foreign key constraint)
   Future<void> _clearTablesSafely({bool includeComments = true}) async {
     if (includeComments) {
-      await db.clear('comments');
+      await db.clear(ExampleSchemas.comments.name);
     }
-    await db.clear('posts');
-    await db.clear('users');
+    await db.clear(ExampleSchemas.posts.name);
+    await db.clear(ExampleSchemas.users.name);
   }
 
   /// CRITICAL TEST: Verifies that clearing a table or deleting all records works as expected.
@@ -231,14 +232,14 @@ class DatabaseTester {
       await _clearTablesSafely();
 
       // 1. Test db.clear()
-      await db.batchInsert('users', [
+      await db.batchInsert(ExampleSchemas.users.name, [
         {'username': 'clear_user_1', 'email': 'cu1@test.com'},
         {'username': 'clear_user_2', 'email': 'cu2@test.com'},
       ]);
 
       // Clear users (should work since no foreign key references exist yet)
-      await db.clear('users');
-      final dataAfterClear = await db.query('users');
+      await db.clear(ExampleSchemas.users.name);
+      final dataAfterClear = await db.query(ExampleSchemas.users.name);
       final countAfterClear = dataAfterClear.length;
 
       isTestPassed &=
@@ -249,14 +250,15 @@ class DatabaseTester {
 
       // 2. Test deleting all records with a condition
       // Note: Don't use fixed IDs to avoid foreign key issues, let DB generate them
-      await db.batchInsert('users', [
+      await db.batchInsert(ExampleSchemas.users.name, [
         {'username': 'delete_user_1', 'email': 'du1@test.com'},
         {'username': 'delete_user_2', 'email': 'du2@test.com'},
       ]);
-      final deleteResult = await db.delete('users').where('id', '>', 0);
+      final deleteResult =
+          await db.delete(ExampleSchemas.users.name).where('id', '>', 0);
       isTestPassed &= _expect(
           'Delete result should be successful', !deleteResult.hasErrors, true);
-      final dataAfterDelete = await db.query('users');
+      final dataAfterDelete = await db.query(ExampleSchemas.users.name);
       final countAfterDelete = dataAfterDelete.length;
       isTestPassed &= _expect(
           'Count after deleting all (id > 0) should be 0', countAfterDelete, 0);
@@ -1440,7 +1442,8 @@ class DatabaseTester {
 
       // 1. Benchmark Batch Insert
       final sw = Stopwatch()..start();
-      final insertResult = await db.batchInsert('users', insertRecords);
+      final insertResult =
+          await db.batchInsert(ExampleSchemas.users.name, insertRecords);
       sw.stop();
       log.add('🚀 Batch Insert $count records took ${sw.elapsedMilliseconds}ms',
           LogLevel.info);
@@ -1464,7 +1467,8 @@ class DatabaseTester {
       // 3. Benchmark Batch Update
       sw.reset();
       sw.start();
-      final updateResult = await db.batchUpdate('users', updateRecords);
+      final updateResult =
+          await db.batchUpdate(ExampleSchemas.users.name, updateRecords);
       sw.stop();
       log.add('🚀 Batch Update $count records took ${sw.elapsedMilliseconds}ms',
           LogLevel.info);
@@ -1480,7 +1484,10 @@ class DatabaseTester {
       // Check middle record to avoid just checking boundaries
       const middleIdx = count ~/ 2;
       final middleId = insertResult.statuses[middleIdx].primaryKey;
-      final user = await db.query('users').where('id', '=', middleId).first();
+      final user = await db
+          .query(ExampleSchemas.users.name)
+          .where('id', '=', middleId)
+          .first();
 
       isTestPassed &=
           _expect('User $middleId should exist', user != null, true);
@@ -1495,14 +1502,14 @@ class DatabaseTester {
 
       // Check first and last
       final firstUser = await db
-          .query('users')
+          .query(ExampleSchemas.users.name)
           .where('id', '=', insertResult.statuses[0].primaryKey)
           .first();
       isTestPassed &=
           _expect('First user age should be updated', firstUser?['age'], 30);
 
       final lastUser = await db
-          .query('users')
+          .query(ExampleSchemas.users.name)
           .where('id', '=', insertResult.statuses[count - 1].primaryKey)
           .first();
       isTestPassed &= _expect('Last user age should be updated',
@@ -1527,7 +1534,7 @@ class DatabaseTester {
       const String testEmail = 'buffer@test.com';
 
       // 1. Insert then Insert (Immediate duplicate check)
-      final firstInsert = await db.insert('users', {
+      final firstInsert = await db.insert(ExampleSchemas.users.name, {
         'username': testUser,
         'email': testEmail,
         'age': 25,
@@ -1536,7 +1543,7 @@ class DatabaseTester {
           _expect('First insert should succeed', !firstInsert.hasErrors, true);
 
       // Immediate second insert with same username (unique)
-      final secondInsert = await db.insert('users', {
+      final secondInsert = await db.insert(ExampleSchemas.users.name, {
         'username': testUser,
         'email': 'another@test.com',
       });
@@ -1547,7 +1554,7 @@ class DatabaseTester {
 
       // 2. Insert then Partial Update (Merging test)
       const String partialUser = 'partial_test_user';
-      final insertForUpdate = await db.insert('users', {
+      final insertForUpdate = await db.insert(ExampleSchemas.users.name, {
         'username': partialUser,
         'email': 'partial@test.com',
         'age': 30,
@@ -1558,13 +1565,16 @@ class DatabaseTester {
 
       // Immediately update ONLY age
       final partialUpdate = await db
-          .update('users', {'age': 31}).where('username', '=', partialUser);
+          .update(ExampleSchemas.users.name, {'age': 31}).where(
+              'username', '=', partialUser);
       isTestPassed &= _expect('Immediate partial update should succeed',
           !partialUpdate.hasErrors, true);
 
       // Query immediately (should see merged data from buffer)
-      final mergedRecord =
-          await db.query('users').where('username', '=', partialUser).first();
+      final mergedRecord = await db
+          .query(ExampleSchemas.users.name)
+          .where('username', '=', partialUser)
+          .first();
       isTestPassed &= _expect('Merged record should retain original email',
           mergedRecord?['email'], 'partial@test.com');
       isTestPassed &= _expect(
@@ -1572,38 +1582,42 @@ class DatabaseTester {
 
       // 3. Insert then Delete (Cancel logic)
       const String deleteUser = 'delete_me_fast';
-      await db.insert('users', {
+      await db.insert(ExampleSchemas.users.name, {
         'username': deleteUser,
         'email': 'delete@test.com',
       });
 
-      final immediateDelete =
-          await db.delete('users').where('username', '=', deleteUser);
+      final immediateDelete = await db
+          .delete(ExampleSchemas.users.name)
+          .where('username', '=', deleteUser);
       isTestPassed &= _expect(
           'Immediate delete should succeed', !immediateDelete.hasErrors, true);
 
-      final deletedRecord =
-          await db.query('users').where('username', '=', deleteUser).first();
+      final deletedRecord = await db
+          .query(ExampleSchemas.users.name)
+          .where('username', '=', deleteUser)
+          .first();
       isTestPassed &= _expect('Record should be gone immediately after delete',
           deletedRecord, null);
 
       // 4. Consecutive Partial Updates
       const String multiUpdateUser = 'multi_update_user';
-      await db.insert('users', {
+      await db.insert(ExampleSchemas.users.name, {
         'username': multiUpdateUser,
         'email': 'multi@test.com',
         'age': 20,
       });
 
       // Update 1: Change email
-      await db.update('users', {'email': 'multi_new@test.com'}).where(
-          'username', '=', multiUpdateUser);
+      await db.update(ExampleSchemas.users.name, {
+        'email': 'multi_new@test.com'
+      }).where('username', '=', multiUpdateUser);
       // Update 2: Change age
-      await db
-          .update('users', {'age': 21}).where('username', '=', multiUpdateUser);
+      await db.update(ExampleSchemas.users.name, {'age': 21}).where(
+          'username', '=', multiUpdateUser);
 
       final finalRecord = await db
-          .query('users')
+          .query(ExampleSchemas.users.name)
           .where('username', '=', multiUpdateUser)
           .first();
       isTestPassed &= _expect('Multi-update: final email matches',
@@ -1615,7 +1629,7 @@ class DatabaseTester {
 
       // 5. Failed insert after reserve must release slots (no orphan unique lock)
       const String orphanUser = 'orphan_reserve_probe';
-      final owner = await db.insert('users', {
+      final owner = await db.insert(ExampleSchemas.users.name, {
         'username': orphanUser,
         'email': 'orphan_owner@test.com',
         'age': 40,
@@ -1623,7 +1637,7 @@ class DatabaseTester {
       isTestPassed &=
           _expect('Orphan probe owner insert succeeds', !owner.hasErrors, true);
 
-      final blocked = await db.insert('users', {
+      final blocked = await db.insert(ExampleSchemas.users.name, {
         'username': orphanUser,
         'email': 'orphan_blocked@test.com',
         'age': 41,
@@ -1631,9 +1645,11 @@ class DatabaseTester {
       isTestPassed &=
           _expect('Duplicate username insert blocked', blocked.hasErrors, true);
 
-      await db.delete('users').where('username', '=', orphanUser);
+      await db
+          .delete(ExampleSchemas.users.name)
+          .where('username', '=', orphanUser);
 
-      final reused = await db.insert('users', {
+      final reused = await db.insert(ExampleSchemas.users.name, {
         'username': orphanUser,
         'email': 'orphan_reused@test.com',
         'age': 42,
@@ -1644,12 +1660,12 @@ class DatabaseTester {
           true);
 
       // 6. Concurrent same PK: exactly one success
-      final c1 = db.insert('users', {
+      final c1 = db.insert(ExampleSchemas.users.name, {
         'id': 99001,
         'username': 'concurrent_pk_a',
         'email': 'c_pk_a@test.com',
       });
-      final c2 = db.insert('users', {
+      final c2 = db.insert(ExampleSchemas.users.name, {
         'id': 99001,
         'username': 'concurrent_pk_b',
         'email': 'c_pk_b@test.com',
@@ -1676,33 +1692,37 @@ class DatabaseTester {
       await _clearTablesSafely();
 
       if (_isWasmBuild) {
-        final insertResult = await db.insert('users',
+        final insertResult = await db.insert(ExampleSchemas.users.name,
             {'username': 'crud_user', 'email': 'crud@test.com', 'age': 30});
         isTestPassed &= _expect(
             'Insert should be successful', !insertResult.hasErrors, true);
         isTestPassed &=
             _expect('Insert should affect 1 row', insertResult.successCount, 1);
 
-        final user =
-            await db.query('users').where('username', '=', 'crud_user');
+        final user = await db
+            .query(ExampleSchemas.users.name)
+            .where('username', '=', 'crud_user');
         isTestPassed &= _expect('Read should find 1 user', user.length, 1);
         isTestPassed &= _expect('Read should find correct user',
             user.data.first['email'], 'crud@test.com');
 
-        await db
-            .update('users', {'age': 31}).where('username', '=', 'crud_user');
-        final updatedUser =
-            await db.query('users').where('username', '=', 'crud_user').first();
+        await db.update(ExampleSchemas.users.name, {'age': 31}).where(
+            'username', '=', 'crud_user');
+        final updatedUser = await db
+            .query(ExampleSchemas.users.name)
+            .where('username', '=', 'crud_user')
+            .first();
         isTestPassed &=
             _expect('Update should change age to 31', updatedUser?['age'], 31);
 
-        final deleteResult =
-            await db.delete('users').where('username', '=', 'crud_user');
+        final deleteResult = await db
+            .delete(ExampleSchemas.users.name)
+            .where('username', '=', 'crud_user');
         isTestPassed &= _expect(
             'Delete should be successful', !deleteResult.hasErrors, true);
         isTestPassed &=
             _expect('Delete should affect 1 row', deleteResult.successCount, 1);
-        final dataAfterDeleteQuery = await db.query('users');
+        final dataAfterDeleteQuery = await db.query(ExampleSchemas.users.name);
         final countAfterDelete = dataAfterDeleteQuery.length;
         isTestPassed &=
             _expect('Count after delete should be 0', countAfterDelete, 0);
@@ -1727,7 +1747,10 @@ class DatabaseTester {
 
       // Attach watch listener before write operations to verify all stream callbacks.
       watchCollector = _WatchEventCollector<List<Map<String, dynamic>>>(
-        db.query('users').where('username', '=', username).watch(),
+        db
+            .query(ExampleSchemas.users.name)
+            .where('username', '=', username)
+            .watch(),
       );
 
       // Verify event 0: initial query state before insert must be empty.
@@ -1751,7 +1774,7 @@ class DatabaseTester {
       );
 
       // Create
-      final insertResult = await db.insert('users', {
+      final insertResult = await db.insert(ExampleSchemas.users.name, {
         'username': username,
         'email': email,
         'age': insertedAge,
@@ -1803,7 +1826,8 @@ class DatabaseTester {
 
       // Update: query twice after write to catch stale data being re-cached.
       final updateResult = await db
-          .update('users', {'age': updatedAge}).where('id', '=', userId);
+          .update(ExampleSchemas.users.name, {'age': updatedAge}).where(
+              'id', '=', userId);
       isTestPassed &=
           _expect('Update should be successful', !updateResult.hasErrors, true);
       isTestPassed &=
@@ -1847,7 +1871,8 @@ class DatabaseTester {
       );
 
       // Delete: verify repeated cached lookups do not resurrect stale data.
-      final deleteResult = await db.delete('users').where('id', '=', userId);
+      final deleteResult =
+          await db.delete(ExampleSchemas.users.name).where('id', '=', userId);
       isTestPassed &=
           _expect('Delete should be successful', !deleteResult.hasErrors, true);
       isTestPassed &=
@@ -1877,7 +1902,7 @@ class DatabaseTester {
         value: updatedAge,
       );
 
-      final dataAfterDeleteQuery = await db.query('users');
+      final dataAfterDeleteQuery = await db.query(ExampleSchemas.users.name);
       final countAfterDelete = dataAfterDeleteQuery.length;
       isTestPassed &=
           _expect('Count after delete should be 0', countAfterDelete, 0);
@@ -1898,84 +1923,92 @@ class DatabaseTester {
     try {
       await _clearTablesSafely();
       // Upsert (insert)
-      await db.upsert(
-          'users', {'username': 'upsert_user', 'email': 'upsert@test.com'});
-      final dataAfterInsert = await db.query('users');
+      await db.upsert(ExampleSchemas.users.name,
+          {'username': 'upsert_user', 'email': 'upsert@test.com'});
+      final dataAfterInsert = await db.query(ExampleSchemas.users.name);
       final countAfterInsert = dataAfterInsert.length;
       isTestPassed &=
           _expect('Upsert-insert should result in 1 user', countAfterInsert, 1);
 
       // Upsert (update): include all non-nullable + unique key fields for conflict target
-      await db.upsert('users', {
+      await db.upsert(ExampleSchemas.users.name, {
         'username': 'upsert_user',
         'email': 'upsert@test.com',
         'age': 40,
       });
       final updatedUser = await db
-          .query('users')
+          .query(ExampleSchemas.users.name)
           .where('email', '=', 'upsert@test.com')
           .first();
       isTestPassed &= _expect(
           'Upsert-update should set age to 40', updatedUser?['age'], 40);
-      final dataAfterUpdate = await db.query('users');
+      final dataAfterUpdate = await db.query(ExampleSchemas.users.name);
       isTestPassed &= _expect('Upsert-update should not create a new user',
           dataAfterUpdate.length, 1);
 
       // Cache Synchronization Verification
-      final q1 =
-          await db.query('users').whereEqual('username', 'upsert_user').first();
+      final q1 = await db
+          .query(ExampleSchemas.users.name)
+          .whereEqual('username', 'upsert_user')
+          .first();
       isTestPassed &=
           _expect('Cached read matches current age 40', q1?['age'], 40);
 
       // Perform a new upsert to test cache invalidation/synchronization on update
-      await db.upsert('users', {
+      await db.upsert(ExampleSchemas.users.name, {
         'username': 'upsert_user',
         'email': 'upsert@test.com',
         'age': 50,
       });
-      final q2 =
-          await db.query('users').whereEqual('username', 'upsert_user').first();
+      final q2 = await db
+          .query(ExampleSchemas.users.name)
+          .whereEqual('username', 'upsert_user')
+          .first();
       isTestPassed &= _expect(
           'Upsert-update should immediately set age to 50 in cache',
           q2?['age'],
           50);
 
       // Perform delete to test cache sync on delete
-      await db.delete('users').whereEqual('username', 'upsert_user');
-      final q3 =
-          await db.query('users').whereEqual('username', 'upsert_user').first();
+      await db
+          .delete(ExampleSchemas.users.name)
+          .whereEqual('username', 'upsert_user');
+      final q3 = await db
+          .query(ExampleSchemas.users.name)
+          .whereEqual('username', 'upsert_user')
+          .first();
       isTestPassed &= _expect(
           'Query returns null after delete due to cache clear', q3, null);
 
       // 4. Test batchUpsert cache synchronization
-      await db.batchUpsert('users', [
+      await db.batchUpsert(ExampleSchemas.users.name, [
         {'username': 'batch_upsert_u1', 'email': 'bu1@test.com', 'age': 20},
         {'username': 'batch_upsert_u2', 'email': 'bu2@test.com', 'age': 25},
       ]);
       // Query to load them into the cache
       final qbu1 = await db
-          .query('users')
+          .query(ExampleSchemas.users.name)
           .whereEqual('username', 'batch_upsert_u1')
           .first();
       final qbu2 = await db
-          .query('users')
+          .query(ExampleSchemas.users.name)
           .whereEqual('username', 'batch_upsert_u2')
           .first();
       isTestPassed &= _expect('batch_upsert_u1 age in cache', qbu1?['age'], 20);
       isTestPassed &= _expect('batch_upsert_u2 age in cache', qbu2?['age'], 25);
 
       // Now update them via batchUpsert
-      await db.batchUpsert('users', [
+      await db.batchUpsert(ExampleSchemas.users.name, [
         {'username': 'batch_upsert_u1', 'email': 'bu1@test.com', 'age': 30},
         {'username': 'batch_upsert_u2', 'email': 'bu2@test.com', 'age': 35},
       ]);
       // Immediately read again to ensure cache is updated
       final qbu1Updated = await db
-          .query('users')
+          .query(ExampleSchemas.users.name)
           .whereEqual('username', 'batch_upsert_u1')
           .first();
       final qbu2Updated = await db
-          .query('users')
+          .query(ExampleSchemas.users.name)
           .whereEqual('username', 'batch_upsert_u2')
           .first();
       isTestPassed &= _expect(
@@ -1984,19 +2017,21 @@ class DatabaseTester {
           'batch_upsert_u2 updated age from cache', qbu2Updated?['age'], 35);
 
       // 5. Test normal update cache synchronization
-      await db.update('users', {'age': 45}).whereEqual(
+      await db.update(ExampleSchemas.users.name, {'age': 45}).whereEqual(
           'username', 'batch_upsert_u1');
       final qup = await db
-          .query('users')
+          .query(ExampleSchemas.users.name)
           .whereEqual('username', 'batch_upsert_u1')
           .first();
       isTestPassed &=
           _expect('normal update syncs with cache correctly', qup?['age'], 45);
 
       // 6. Test delete cache sync with normal delete
-      await db.delete('users').whereEqual('username', 'batch_upsert_u1');
+      await db
+          .delete(ExampleSchemas.users.name)
+          .whereEqual('username', 'batch_upsert_u1');
       final qupDel = await db
-          .query('users')
+          .query(ExampleSchemas.users.name)
           .whereEqual('username', 'batch_upsert_u1')
           .first();
       isTestPassed &= _expect(
@@ -2004,17 +2039,17 @@ class DatabaseTester {
 
       // 7. Test batchUpdate cache synchronization
       // Insert first
-      await db.batchInsert('users', [
+      await db.batchInsert(ExampleSchemas.users.name, [
         {'username': 'batch_update_u1', 'email': 'bu_up1@test.com', 'age': 20},
         {'username': 'batch_update_u2', 'email': 'bu_up2@test.com', 'age': 25},
       ]);
       // Load into cache
       final qbuUp1 = await db
-          .query('users')
+          .query(ExampleSchemas.users.name)
           .whereEqual('username', 'batch_update_u1')
           .first();
       final qbuUp2 = await db
-          .query('users')
+          .query(ExampleSchemas.users.name)
           .whereEqual('username', 'batch_update_u2')
           .first();
       isTestPassed &=
@@ -2027,7 +2062,7 @@ class DatabaseTester {
       final id2 = qbuUp2?['id'];
 
       // Perform batchUpdate
-      await db.batchUpdate('users', [
+      await db.batchUpdate(ExampleSchemas.users.name, [
         {
           'id': id1,
           'username': 'batch_update_u1',
@@ -2044,11 +2079,11 @@ class DatabaseTester {
 
       // Immediately read again to ensure cache is updated
       final qbuUp1Updated = await db
-          .query('users')
+          .query(ExampleSchemas.users.name)
           .whereEqual('username', 'batch_update_u1')
           .first();
       final qbuUp2Updated = await db
-          .query('users')
+          .query(ExampleSchemas.users.name)
           .whereEqual('username', 'batch_update_u2')
           .first();
       isTestPassed &= _expect(
@@ -2095,21 +2130,22 @@ class DatabaseTester {
     try {
       await _clearTablesSafely();
       // Insert user first to get valid ID for foreign key
-      final userResult = await db
-          .insert('users', {'username': 'join_user', 'email': 'join@test.com'});
+      final userResult = await db.insert(ExampleSchemas.users.name,
+          {'username': 'join_user', 'email': 'join@test.com'});
       if (!!userResult.hasErrors) {
         isTestPassed = false;
         _failTest('Failed to insert user for join test');
         return false;
       }
       final userId = userResult.firstPrimaryKey;
-      await db.insert(
-          'posts', {'title': 'Join Post', 'user_id': userId, 'content': '...'});
+      await db.insert(ExampleSchemas.posts.name,
+          {'title': 'Join Post', 'user_id': userId, 'content': '...'});
 
-      final result = await db
-          .query('posts')
-          .select(['posts.title', 'users.username']).join(
-              'users', 'posts.user_id', '=', 'users.id');
+      final result = await db.query(ExampleSchemas.posts.name).select([
+        '${ExampleSchemas.posts.name}.title',
+        '${ExampleSchemas.users.name}.username',
+      ]).join(ExampleSchemas.users.name, '${ExampleSchemas.posts.name}.user_id',
+          '=', '${ExampleSchemas.users.name}.id');
 
       isTestPassed &=
           _expect('Join should return 1 result', result.data.length, 1);
@@ -2136,34 +2172,35 @@ class DatabaseTester {
       // Setup in space 'space1'
       await db.switchSpace(spaceName: 'space1');
       await _clearTablesSafely();
-      await db.insert('users',
+      await db.insert(ExampleSchemas.users.name,
           {'username': 'user_space1', 'email': 'user_space2@test.com'});
-      final data1 = await db.query('users');
+      final data1 = await db.query(ExampleSchemas.users.name);
       final count1 = data1.length;
       isTestPassed &= _expect('Count in space1 should be 1', count1, 1);
 
       // Switch to space 'space2'
       await db.switchSpace(spaceName: 'space2');
       await _clearTablesSafely();
-      final data2 = await db.query('users');
+      final data2 = await db.query(ExampleSchemas.users.name);
       final count2 = data2.length;
       isTestPassed &=
           _expect('Count in space2 should be 0 initially', count2, 0);
-      await db.insert('users',
+      await db.insert(ExampleSchemas.users.name,
           {'username': 'user_space2', 'email': 'user_space2@test.com'});
-      final data3 = await db.query('users');
+      final data3 = await db.query(ExampleSchemas.users.name);
       final count3 = data3.length;
       isTestPassed &=
           _expect('Count in space2 after insert should be 1', count3, 1);
 
       // Verify space1 was not affected
       await db.switchSpace(spaceName: 'space1');
-      final data4 = await db.query('users');
+      final data4 = await db.query(ExampleSchemas.users.name);
       final count4 = data4.length;
       isTestPassed &= _expect('Count in space1 should still be 1', count4, 1);
 
-      final space1Result =
-          await db.query('users').whereEqual('username', 'user_space1');
+      final space1Result = await db
+          .query(ExampleSchemas.users.name)
+          .whereEqual('username', 'user_space1');
       isTestPassed &= _expect(
           'Space1 query username = user_space1 result should be 1',
           space1Result.length,
@@ -2184,7 +2221,7 @@ class DatabaseTester {
     bool isTestPassed = true;
     try {
       await _clearTablesSafely();
-      await db.batchInsert('users', [
+      await db.batchInsert(ExampleSchemas.users.name, [
         {
           'id': 1,
           'username': 'user_1',
@@ -2224,62 +2261,93 @@ class DatabaseTester {
 
       // Test 1: Primary Key Sort Comparison
       // Test 1a: Ascending sort
-      final userIdsAsc = (await db.query('users').orderByAsc('id'))
-          .data
-          .map((u) => u['id'])
-          .toList();
+      final userIdsAsc =
+          (await db.query(ExampleSchemas.users.name).orderByAsc('id'))
+              .data
+              .map((u) => u['id'])
+              .toList();
 
       isTestPassed &= _expect('Primary key ascending sort order', userIdsAsc,
           ['1', '2', '3', '10', '20']);
 
       // Test 1b: Descending sort
-      final userIdsDesc = (await db.query('users').orderByDesc('id'))
-          .data
-          .map((u) => u['id'])
-          .toList();
+      final userIdsDesc =
+          (await db.query(ExampleSchemas.users.name).orderByDesc('id'))
+              .data
+              .map((u) => u['id'])
+              .toList();
       isTestPassed &= _expect('Primary key descending sort order', userIdsDesc,
           ['20', '10', '3', '2', '1']);
 
       // Test 2: Primary Key Range Queries
       final usersIdGreaterThan2 =
-          (await db.query('users').where('id', '>', 2)).length;
+          (await db.query(ExampleSchemas.users.name).where('id', '>', 2))
+              .length;
       isTestPassed &=
           _expect('Query "id > 2"', usersIdGreaterThan2, 3); // ids 3, 10, 20
 
       // Test 3: Quoted vs. Unquoted Numeric Queries
-      isTestPassed &= _expect('Query age = 20 (numeric)',
-          (await db.query('users').where('age', '=', 20)).length, 1);
-      isTestPassed &= _expect('Query age = "20" (string)',
-          (await db.query('users').where('age', '=', '20')).length, 1);
-      isTestPassed &= _expect('Query age > 40 (numeric)',
-          (await db.query('users').where('age', '>', 40)).length, 1);
-      isTestPassed &= _expect('Query age > "40" (string)',
-          (await db.query('users').where('age', '>', '40')).length, 1);
+      isTestPassed &= _expect(
+          'Query age = 20 (numeric)',
+          (await db.query(ExampleSchemas.users.name).where('age', '=', 20))
+              .length,
+          1);
+      isTestPassed &= _expect(
+          'Query age = "20" (string)',
+          (await db.query(ExampleSchemas.users.name).where('age', '=', '20'))
+              .length,
+          1);
+      isTestPassed &= _expect(
+          'Query age > 40 (numeric)',
+          (await db.query(ExampleSchemas.users.name).where('age', '>', 40))
+              .length,
+          1);
+      isTestPassed &= _expect(
+          'Query age > "40" (string)',
+          (await db.query(ExampleSchemas.users.name).where('age', '>', '40'))
+              .length,
+          1);
 
       // Test 4: LIKE Queries
       isTestPassed &= _expect(
           'LIKE "user_1%"',
-          (await db.query('users').where('username', 'like', 'user_1%')).length,
+          (await db
+                  .query(ExampleSchemas.users.name)
+                  .where('username', 'like', 'user_1%'))
+              .length,
           2);
       isTestPassed &= _expect(
           'LIKE "%@a.com"',
-          (await db.query('users').where('email', 'like', '%@a.com')).length,
+          (await db
+                  .query(ExampleSchemas.users.name)
+                  .where('email', 'like', '%@a.com'))
+              .length,
           1);
       isTestPassed &= _expect(
           'LIKE "%user%"',
-          (await db.query('users').where('username', 'like', '%user%')).length,
+          (await db
+                  .query(ExampleSchemas.users.name)
+                  .where('username', 'like', '%user%'))
+              .length,
           5);
 
       // Test 5: Non-indexed Field Query
-      isTestPassed &= _expect('Non-indexed query fans >= 400',
-          (await db.query('users').where('fans', '>=', 400)).length, 2);
+      isTestPassed &= _expect(
+          'Non-indexed query fans >= 400',
+          (await db.query(ExampleSchemas.users.name).where('fans', '>=', 400))
+              .length,
+          2);
 
       // Test 6: Primary Key Range Query
-      isTestPassed &= _expect('PK range id > 10',
-          (await db.query('users').where('id', '>', 10)).length, 1); // id 20
+      isTestPassed &= _expect(
+          'PK range id > 10',
+          (await db.query(ExampleSchemas.users.name).where('id', '>', 10))
+              .length,
+          1); // id 20
       isTestPassed &= _expect(
           'PK range id >= 10',
-          (await db.query('users').where('id', '>=', 10)).length,
+          (await db.query(ExampleSchemas.users.name).where('id', '>=', 10))
+              .length,
           2); // id 10, 20
     } catch (e, s) {
       isTestPassed = false;
@@ -2295,7 +2363,7 @@ class DatabaseTester {
     try {
       await _clearTablesSafely();
       // The 'email' field is non-nullable. This insert should fail.
-      final result = await db.insert('users', {
+      final result = await db.insert(ExampleSchemas.users.name, {
         'username': 'non_null_test',
         'email': null, // Explicitly setting a non-nullable field to null
       });
@@ -2310,7 +2378,7 @@ class DatabaseTester {
               result.firstType == ResultType.bizNotNullViolation,
           true);
 
-      final count = (await db.query('users')).length;
+      final count = (await db.query(ExampleSchemas.users.name)).length;
       isTestPassed &=
           _expect('Table should be empty after failed insert', count, 0);
     } catch (e, s) {
@@ -2326,7 +2394,7 @@ class DatabaseTester {
     bool isTestPassed = true;
 
     Future<bool> verify(String step) async {
-      final query = db.query('users').where('age', '>', 25);
+      final query = db.query(ExampleSchemas.users.name).where('age', '>', 25);
       final actualData = await query;
       final actualLength = actualData.length;
 
@@ -2345,7 +2413,7 @@ class DatabaseTester {
                 'email': 'count_user_$i@example.com',
                 'age': 18 + i, // Ages 18 to 37
               });
-      await db.batchInsert('users', records);
+      await db.batchInsert(ExampleSchemas.users.name, records);
 
       // Initial state: age > 25 means ages 26..37 (12 records)
       isTestPassed &= await verify('Initial insert');
@@ -2353,7 +2421,7 @@ class DatabaseTester {
 
       // Delete some records that match the condition
       // Delete ages > 30 (31..37 -> 7 records)
-      await db.delete('users').where('age', '>', 30);
+      await db.delete(ExampleSchemas.users.name).where('age', '>', 30);
 
       // After delete: age > 25 means ages 26..30 (5 records)
       isTestPassed &= await verify('After deleting some matching records');
@@ -2361,7 +2429,7 @@ class DatabaseTester {
 
       // Delete some records that DO NOT match the condition
       // Delete age < 22 (18..21 -> 4 records)
-      await db.delete('users').where('age', '<', 22);
+      await db.delete(ExampleSchemas.users.name).where('age', '<', 22);
 
       // After delete: age > 25 should still be 5 records
       isTestPassed &= await verify('After deleting non-matching records');
@@ -2385,20 +2453,21 @@ class DatabaseTester {
       await _clearTablesSafely();
 
       // Step 2: insert base data
-      final u1 = await db.insert('users',
+      final u1 = await db.insert(ExampleSchemas.users.name,
           {'username': 'bk_user_1', 'email': 'bk1@test.com', 'age': 21});
-      final u2 = await db.insert('users',
+      final u2 = await db.insert(ExampleSchemas.users.name,
           {'username': 'bk_user_2', 'email': 'bk2@test.com', 'age': 22});
       ok &= _expect(
           'Insert base users success', !u1.hasErrors && !u2.hasErrors, true);
-      final p1 = await db.insert(
-          'posts', {'title': 'bk_post_1', 'user_id': u1.firstPrimaryKey});
+      final p1 = await db.insert(ExampleSchemas.posts.name,
+          {'title': 'bk_post_1', 'user_id': u1.firstPrimaryKey});
       ok &= _expect('Insert base post success', !p1.hasErrors, true);
 
       // Snapshot counts before backup
-      final usersBefore = (await db.query('users')).length;
-      final postsBefore = (await db.query('posts')).length;
-      final commentsBefore = (await db.query('comments')).length;
+      final usersBefore = (await db.query(ExampleSchemas.users.name)).length;
+      final postsBefore = (await db.query(ExampleSchemas.posts.name)).length;
+      final commentsBefore =
+          (await db.query(ExampleSchemas.comments.name)).length;
 
       // Step 3: create backup (partial backup is enough)
       backupPath = await db.backup(compress: false);
@@ -2406,18 +2475,25 @@ class DatabaseTester {
           'Backup path should be non-empty', backupPath.isNotEmpty, true);
 
       // Step 4: mutate data after backup
-      await db.insert('users',
+      await db.insert(ExampleSchemas.users.name,
           {'username': 'bk_user_3', 'email': 'bk3@test.com', 'age': 23});
-      await db.update('users', {'age': 99}).where('username', '=', 'bk_user_1');
-      await db.delete('users').where('username', '=', 'bk_user_2');
+      await db.update(ExampleSchemas.users.name, {'age': 99}).where(
+          'username', '=', 'bk_user_1');
+      await db
+          .delete(ExampleSchemas.users.name)
+          .where('username', '=', 'bk_user_2');
 
       // Sanity check: content changed (not just count)
-      final insertedUser3 =
-          await db.query('users').where('username', '=', 'bk_user_3');
-      final deletedUser2 =
-          await db.query('users').where('username', '=', 'bk_user_2');
-      final updatedUser1 =
-          await db.query('users').where('username', '=', 'bk_user_1').first();
+      final insertedUser3 = await db
+          .query(ExampleSchemas.users.name)
+          .where('username', '=', 'bk_user_3');
+      final deletedUser2 = await db
+          .query(ExampleSchemas.users.name)
+          .where('username', '=', 'bk_user_2');
+      final updatedUser1 = await db
+          .query(ExampleSchemas.users.name)
+          .where('username', '=', 'bk_user_1')
+          .first();
       ok &= _expect('bk_user_3 inserted', insertedUser3.length, 1);
       ok &= _expect('bk_user_2 deleted', deletedUser2.length, 0);
       ok &= _expect('bk_user_1 age updated to 99', updatedUser1?['age'], 99);
@@ -2427,9 +2503,11 @@ class DatabaseTester {
       ok &= _expect('Restore should return true', restored, true);
 
       // Step 6: verify state equals snapshot
-      final usersAfter = await db.query('users').orderByAsc('username');
-      final postsAfter = await db.query('posts').orderByAsc('title');
-      final commentsAfter = await db.query('comments');
+      final usersAfter =
+          await db.query(ExampleSchemas.users.name).orderByAsc('username');
+      final postsAfter =
+          await db.query(ExampleSchemas.posts.name).orderByAsc('title');
+      final commentsAfter = await db.query(ExampleSchemas.comments.name);
 
       ok &= _expect('Users count after restore equals before backup',
           usersAfter.length, usersBefore);
@@ -2439,10 +2517,14 @@ class DatabaseTester {
           commentsAfter.length, commentsBefore);
 
       // Verify specific records restored (bk_user_1 and bk_user_2 exist; ages restored)
-      final uRestored1 =
-          await db.query('users').where('username', '=', 'bk_user_1').first();
-      final uRestored2 =
-          await db.query('users').where('username', '=', 'bk_user_2').first();
+      final uRestored1 = await db
+          .query(ExampleSchemas.users.name)
+          .where('username', '=', 'bk_user_1')
+          .first();
+      final uRestored2 = await db
+          .query(ExampleSchemas.users.name)
+          .where('username', '=', 'bk_user_2')
+          .first();
       ok &= _expect('bk_user_1 exists after restore', uRestored1 != null, true);
       ok &= _expect('bk_user_2 exists after restore', uRestored2 != null, true);
       ok &= _expect('bk_user_1 age restored to 21', uRestored1?['age'], 21);
@@ -2496,10 +2578,10 @@ class DatabaseTester {
       // Clear tables safely (users and settings have no foreign key dependencies)
       // However, if previous tests created comments/posts with RESTRICT constraints,
       // we need to clear them first before clearing users
-      await db.clear('comments');
-      await db.clear('posts');
-      await db.clear('users');
-      await db.clear('settings');
+      await db.clear(ExampleSchemas.comments.name);
+      await db.clear(ExampleSchemas.posts.name);
+      await db.clear(ExampleSchemas.users.name);
+      await db.clear(ExampleSchemas.settings.name);
 
       final random = Random();
       // Store closures to DEFER execution until the concurrent phase.
@@ -2629,8 +2711,8 @@ class DatabaseTester {
 
       // Stage 1: Prepare Users
       await prepareAndGenerateOpsForTable(
-        tableName: 'users',
-        tableConfig: config['users']!,
+        tableName: ExampleSchemas.users.name,
+        tableConfig: config[ExampleSchemas.users.name]!,
         itemsToInsert: insertedUsers,
         itemsToUpdate: updatedUsers,
         itemsToDelete: deletedUsers,
@@ -2645,8 +2727,8 @@ class DatabaseTester {
 
       // Stage 2: Prepare Settings
       await prepareAndGenerateOpsForTable(
-        tableName: 'settings',
-        tableConfig: config['settings']!,
+        tableName: ExampleSchemas.settings.name,
+        tableConfig: config[ExampleSchemas.settings.name]!,
         itemsToInsert: insertedSettings,
         itemsToUpdate: updatedSettings,
         itemsToDelete: deletedSettings,
@@ -2701,8 +2783,9 @@ class DatabaseTester {
       _updateLastOperation('Checking actual deletion results...');
       if (deletedUsers.isNotEmpty) {
         final allDeletedUserIds = deletedUsers.map((u) => u['id']).toList();
-        final stillExisting =
-            await db.query('users').whereIn('id', allDeletedUserIds);
+        final stillExisting = await db
+            .query(ExampleSchemas.users.name)
+            .whereIn('id', allDeletedUserIds);
         final existingIdSet =
             stillExisting.data.map((u) => u['id'].toString()).toSet();
         for (final user in deletedUsers) {
@@ -2714,8 +2797,9 @@ class DatabaseTester {
       if (deletedSettings.isNotEmpty) {
         final allDeletedSettingKeys =
             deletedSettings.map((s) => s['key']).toList();
-        final stillExisting =
-            await db.query('settings').whereIn('key', allDeletedSettingKeys);
+        final stillExisting = await db
+            .query(ExampleSchemas.settings.name)
+            .whereIn('key', allDeletedSettingKeys);
         final existingKeySet =
             stillExisting.data.map((s) => s['key'].toString()).toSet();
         for (final setting in deletedSettings) {
@@ -2742,7 +2826,9 @@ class DatabaseTester {
       final updatedUserSample = getHeadTailSample(updatedUsers);
       final updatedUserIds = updatedUserSample.map((u) => u['id']).toList();
       if (updatedUserIds.isNotEmpty) {
-        final result = await db.query('users').whereIn('id', updatedUserIds);
+        final result = await db
+            .query(ExampleSchemas.users.name)
+            .whereIn('id', updatedUserIds);
         isTestPassed &= _expect(
             'All updated users in sample must exist after test',
             result.length,
@@ -2765,8 +2851,9 @@ class DatabaseTester {
           .map((u) => u['id'])
           .toList();
       if (actuallyDeletedUserIds.isNotEmpty) {
-        final result =
-            await db.query('users').whereIn('id', actuallyDeletedUserIds);
+        final result = await db
+            .query(ExampleSchemas.users.name)
+            .whereIn('id', actuallyDeletedUserIds);
         isTestPassed &= _expect(
             'Deleted users in sample should not be found', result.length, 0);
       }
@@ -2776,8 +2863,9 @@ class DatabaseTester {
       final insertedUsernames =
           insertedUserSample.map((u) => u['username'] as String).toList();
       if (insertedUsernames.isNotEmpty) {
-        final result =
-            await db.query('users').whereIn('username', insertedUsernames);
+        final result = await db
+            .query(ExampleSchemas.users.name)
+            .whereIn('username', insertedUsernames);
         isTestPassed &= _expect(
             'All newly inserted users in sample should be found',
             result.length,
@@ -2790,8 +2878,9 @@ class DatabaseTester {
       final updatedSettingKeys =
           updatedSettingsSample.map((s) => s['key'] as String).toList();
       if (updatedSettingKeys.isNotEmpty) {
-        final result =
-            await db.query('settings').whereIn('key', updatedSettingKeys);
+        final result = await db
+            .query(ExampleSchemas.settings.name)
+            .whereIn('key', updatedSettingKeys);
         isTestPassed &= _expect(
             'All updated settings in sample must exist after test',
             result.length,
@@ -2819,7 +2908,7 @@ class DatabaseTester {
         isTestPassed &= _expect(
             'Deleted settings in sample should not be found',
             (await db
-                    .query('settings')
+                    .query(ExampleSchemas.settings.name)
                     .whereIn('key', actuallyDeletedSettingKeys))
                 .length,
             0);
@@ -2832,7 +2921,9 @@ class DatabaseTester {
       if (insertedSettingKeys.isNotEmpty) {
         isTestPassed &= _expect(
             'All newly inserted settings in sample should be found',
-            (await db.query('settings').whereIn('key', insertedSettingKeys))
+            (await db
+                    .query(ExampleSchemas.settings.name)
+                    .whereIn('key', insertedSettingKeys))
                 .length,
             insertedSettingKeys.length);
       }
@@ -2843,10 +2934,10 @@ class DatabaseTester {
       stopwatch.stop();
       _updateLastOperation('Cleaning up test data...');
       // Clear in correct order to respect foreign key constraints
-      await db.clear('comments');
-      await db.clear('posts');
-      await db.clear('users');
-      await db.clear('settings');
+      await db.clear(ExampleSchemas.comments.name);
+      await db.clear(ExampleSchemas.posts.name);
+      await db.clear(ExampleSchemas.users.name);
+      await db.clear(ExampleSchemas.settings.name);
       log.add('Test data cleaned up.', LogLevel.info);
       log.add(
           'Concurrency test finished in ${stopwatch.elapsedMilliseconds}ms.',
@@ -2871,7 +2962,7 @@ class DatabaseTester {
           LogLevel.debug);
 
       // Insert a valid user
-      final userResult = await db.insert('users', {
+      final userResult = await db.insert(ExampleSchemas.users.name, {
         'username': 'fk_user',
         'email': 'fk@test.com',
       });
@@ -2882,7 +2973,7 @@ class DatabaseTester {
       final userId = userResult.firstPrimaryKey;
 
       // Test 1.1: Insert post with valid foreign key
-      final postResult = await db.insert('posts', {
+      final postResult = await db.insert(ExampleSchemas.posts.name, {
         'title': 'Valid Post',
         'user_id': userId,
       });
@@ -2890,7 +2981,7 @@ class DatabaseTester {
           !postResult.hasErrors, true);
 
       // Test 1.2: Insert post with invalid foreign key (non-existent user_id)
-      final invalidPostResult = await db.insert('posts', {
+      final invalidPostResult = await db.insert(ExampleSchemas.posts.name, {
         'title': 'Invalid Post',
         'user_id': '99999', // Non-existent user ID
       });
@@ -2906,7 +2997,7 @@ class DatabaseTester {
 
       // Test 1.3: Insert comment with valid foreign keys
       final postId = postResult.firstPrimaryKey;
-      final commentResult = await db.insert('comments', {
+      final commentResult = await db.insert(ExampleSchemas.comments.name, {
         'post_id': postId,
         'user_id': userId,
         'content': 'Valid comment',
@@ -2917,7 +3008,8 @@ class DatabaseTester {
           true);
 
       // Test 1.4: Insert comment with invalid post_id
-      final invalidCommentResult1 = await db.insert('comments', {
+      final invalidCommentResult1 =
+          await db.insert(ExampleSchemas.comments.name, {
         'post_id': '99999', // Non-existent post ID
         'user_id': userId,
         'content': 'Invalid comment',
@@ -2926,7 +3018,8 @@ class DatabaseTester {
           !invalidCommentResult1.hasErrors, false);
 
       // Test 1.5: Insert comment with invalid user_id
-      final invalidCommentResult2 = await db.insert('comments', {
+      final invalidCommentResult2 =
+          await db.insert(ExampleSchemas.comments.name, {
         'post_id': postId,
         'user_id': '99999', // Non-existent user ID
         'content': 'Invalid comment',
@@ -2942,7 +3035,7 @@ class DatabaseTester {
       // Create test data: user -> posts -> comments
       // Note: comments.user_id has RESTRICT, so we use a different user for comments
       // to avoid RESTRICT blocking the cascade delete test
-      final cascadeUserResult = await db.insert('users', {
+      final cascadeUserResult = await db.insert(ExampleSchemas.users.name, {
         'username': 'cascade_user',
         'email': 'cascade@test.com',
       });
@@ -2953,7 +3046,8 @@ class DatabaseTester {
       final cascadeUserId = cascadeUserResult.firstPrimaryKey;
 
       // Create a separate user for comments (to avoid RESTRICT blocking cascade delete)
-      final cascadeCommentUserResult = await db.insert('users', {
+      final cascadeCommentUserResult =
+          await db.insert(ExampleSchemas.users.name, {
         'username': 'cascade_comment_user',
         'email': 'cascade_comment@test.com',
       });
@@ -2964,11 +3058,11 @@ class DatabaseTester {
       final cascadeCommentUserId = cascadeCommentUserResult.firstPrimaryKey;
 
       // Create posts for the user
-      final cascadePost1Result = await db.insert('posts', {
+      final cascadePost1Result = await db.insert(ExampleSchemas.posts.name, {
         'title': 'Post 1',
         'user_id': cascadeUserId,
       });
-      final cascadePost2Result = await db.insert('posts', {
+      final cascadePost2Result = await db.insert(ExampleSchemas.posts.name, {
         'title': 'Post 2',
         'user_id': cascadeUserId,
       });
@@ -2980,27 +3074,28 @@ class DatabaseTester {
       final cascadePost2Id = cascadePost2Result.firstPrimaryKey;
 
       // Create comments for posts (using different user to avoid RESTRICT blocking)
-      await db.insert('comments', {
+      await db.insert(ExampleSchemas.comments.name, {
         'post_id': cascadePost1Id,
         'user_id': cascadeCommentUserId, // Use different user to avoid RESTRICT
         'content': 'Comment 1',
       });
-      await db.insert('comments', {
+      await db.insert(ExampleSchemas.comments.name, {
         'post_id': cascadePost1Id,
         'user_id': cascadeCommentUserId, // Use different user to avoid RESTRICT
         'content': 'Comment 2',
       });
-      await db.insert('comments', {
+      await db.insert(ExampleSchemas.comments.name, {
         'post_id': cascadePost2Id,
         'user_id': cascadeCommentUserId, // Use different user to avoid RESTRICT
         'content': 'Comment 3',
       });
 
       // Verify initial counts
-      final postsBefore =
-          await db.query('posts').where('user_id', '=', cascadeUserId);
+      final postsBefore = await db
+          .query(ExampleSchemas.posts.name)
+          .where('user_id', '=', cascadeUserId);
       final commentsBefore = await db
-          .query('comments')
+          .query(ExampleSchemas.comments.name)
           .whereIn('post_id', [cascadePost1Id, cascadePost2Id]);
       isTestPassed &=
           _expect('Should have 2 posts before delete', postsBefore.length, 2);
@@ -3009,28 +3104,31 @@ class DatabaseTester {
 
       // Store the total comment count before delete (to verify cascade delete)
       // Note: We need to get the count AFTER creating all test data to ensure accuracy
-      final totalCommentsBefore = await db.query('comments').count();
+      final totalCommentsBefore =
+          await db.query(ExampleSchemas.comments.name).count();
       isTestPassed &= _expect('Should have at least 3 comments before delete',
           totalCommentsBefore >= 3, true);
       if (!isTestPassed) return false;
 
       // Delete user (should cascade delete posts, which should cascade delete comments)
-      final deleteResult =
-          await db.delete('users').where('id', '=', cascadeUserId);
+      final deleteResult = await db
+          .delete(ExampleSchemas.users.name)
+          .where('id', '=', cascadeUserId);
       isTestPassed &=
           _expect('Delete user should succeed', !deleteResult.hasErrors, true);
       if (!isTestPassed) return false;
 
       // Verify cascade delete: posts should be deleted
-      final postsAfter =
-          await db.query('posts').where('user_id', '=', cascadeUserId);
+      final postsAfter = await db
+          .query(ExampleSchemas.posts.name)
+          .where('user_id', '=', cascadeUserId);
       isTestPassed &=
           _expect('Posts should be cascade deleted', postsAfter.length, 0);
       if (!isTestPassed) return false;
 
       // Verify cascade delete: comments should be deleted
       final commentsAfter = await db
-          .query('comments')
+          .query(ExampleSchemas.comments.name)
           .whereIn('post_id', [cascadePost1Id, cascadePost2Id]);
       isTestPassed &= _expect(
           'Comments should be cascade deleted', commentsAfter.length, 0);
@@ -3041,7 +3139,7 @@ class DatabaseTester {
       await _clearTablesSafely();
 
       // Create test data
-      final updateUserResult = await db.insert('users', {
+      final updateUserResult = await db.insert(ExampleSchemas.users.name, {
         'username': 'update_user',
         'email': 'update@test.com',
       });
@@ -3052,7 +3150,7 @@ class DatabaseTester {
       final updateUserId = updateUserResult.firstPrimaryKey;
 
       // Create post
-      final updatePostResult = await db.insert('posts', {
+      final updatePostResult = await db.insert(ExampleSchemas.posts.name, {
         'title': 'Update Post',
         'user_id': updateUserId,
       });
@@ -3063,15 +3161,17 @@ class DatabaseTester {
       final updatePostId = updatePostResult.firstPrimaryKey;
 
       // Create comment
-      await db.insert('comments', {
+      await db.insert(ExampleSchemas.comments.name, {
         'post_id': updatePostId,
         'user_id': updateUserId,
         'content': 'Update Comment',
       });
 
       // Verify initial state
-      final updatePostBefore =
-          await db.query('posts').where('id', '=', updatePostId).first();
+      final updatePostBefore = await db
+          .query(ExampleSchemas.posts.name)
+          .where('id', '=', updatePostId)
+          .first();
       isTestPassed &= _expect(
           'Post should exist before update', updatePostBefore != null, true);
       // Compare as strings since primary keys are stored as strings, but foreign key fields may be integers
@@ -3080,7 +3180,7 @@ class DatabaseTester {
 
       // Verify foreign key constraint is still enforced after operations
       final updateCommentBefore = await db
-          .query('comments')
+          .query(ExampleSchemas.comments.name)
           .where('post_id', '=', updatePostId)
           .first();
       isTestPassed &=
@@ -3095,7 +3195,7 @@ class DatabaseTester {
       await _clearTablesSafely();
 
       // Create test data
-      final restrictUserResult = await db.insert('users', {
+      final restrictUserResult = await db.insert(ExampleSchemas.users.name, {
         'username': 'restrict_user',
         'email': 'restrict@test.com',
       });
@@ -3106,7 +3206,7 @@ class DatabaseTester {
       final restrictUserId = restrictUserResult.firstPrimaryKey;
 
       // Create post (posts.user_id has CASCADE, so this won't test RESTRICT)
-      final restrictPostResult = await db.insert('posts', {
+      final restrictPostResult = await db.insert(ExampleSchemas.posts.name, {
         'title': 'Restrict Post',
         'user_id': restrictUserId,
       });
@@ -3117,7 +3217,8 @@ class DatabaseTester {
       final restrictPostId = restrictPostResult.firstPrimaryKey;
 
       // Create comment (comments.user_id has RESTRICT)
-      final restrictCommentResult = await db.insert('comments', {
+      final restrictCommentResult =
+          await db.insert(ExampleSchemas.comments.name, {
         'post_id': restrictPostId,
         'user_id': restrictUserId,
         'content': 'Restrict Comment',
@@ -3127,8 +3228,9 @@ class DatabaseTester {
       if (!isTestPassed) return false;
 
       // Try to delete user - should fail because comments.user_id has RESTRICT
-      final restrictDeleteResult =
-          await db.delete('users').where('id', '=', restrictUserId);
+      final restrictDeleteResult = await db
+          .delete(ExampleSchemas.users.name)
+          .where('id', '=', restrictUserId);
       isTestPassed &= _expect(
           'Delete user with RESTRICT foreign key should fail',
           !restrictDeleteResult.hasErrors,
@@ -3142,17 +3244,20 @@ class DatabaseTester {
           true);
 
       // Verify user still exists
-      final restrictUserAfter =
-          await db.query('users').where('id', '=', restrictUserId).first();
+      final restrictUserAfter = await db
+          .query(ExampleSchemas.users.name)
+          .where('id', '=', restrictUserId)
+          .first();
       isTestPassed &= _expect('User should still exist after failed delete',
           restrictUserAfter != null, true);
 
       // Delete comment first, then user should succeed
       await db
-          .delete('comments')
+          .delete(ExampleSchemas.comments.name)
           .where('id', '=', restrictCommentResult.firstPrimaryKey);
-      final restrictDeleteResult2 =
-          await db.delete('users').where('id', '=', restrictUserId);
+      final restrictDeleteResult2 = await db
+          .delete(ExampleSchemas.users.name)
+          .where('id', '=', restrictUserId);
       isTestPassed &= _expect(
           'Delete user after removing comment should succeed',
           !restrictDeleteResult2.hasErrors,
@@ -3164,11 +3269,11 @@ class DatabaseTester {
       await _clearTablesSafely();
 
       // Create test data
-      final clearUser1Result = await db.insert('users', {
+      final clearUser1Result = await db.insert(ExampleSchemas.users.name, {
         'username': 'clear_user1',
         'email': 'clear1@test.com',
       });
-      final clearUser2Result = await db.insert('users', {
+      final clearUser2Result = await db.insert(ExampleSchemas.users.name, {
         'username': 'clear_user2',
         'email': 'clear2@test.com',
       });
@@ -3180,11 +3285,11 @@ class DatabaseTester {
       final clearUser2Id = clearUser2Result.firstPrimaryKey;
 
       // Create posts
-      final clearPost1Result = await db.insert('posts', {
+      final clearPost1Result = await db.insert(ExampleSchemas.posts.name, {
         'title': 'Clear Post 1',
         'user_id': clearUser1Id,
       });
-      final clearPost2Result = await db.insert('posts', {
+      final clearPost2Result = await db.insert(ExampleSchemas.posts.name, {
         'title': 'Clear Post 2',
         'user_id': clearUser2Id,
       });
@@ -3196,47 +3301,50 @@ class DatabaseTester {
       final clearPost2Id = clearPost2Result.firstPrimaryKey;
 
       // Create comments
-      await db.insert('comments', {
+      await db.insert(ExampleSchemas.comments.name, {
         'post_id': clearPost1Id,
         'user_id': clearUser1Id,
         'content': 'Comment 1',
       });
-      await db.insert('comments', {
+      await db.insert(ExampleSchemas.comments.name, {
         'post_id': clearPost2Id,
         'user_id': clearUser2Id,
         'content': 'Comment 2',
       });
 
       // Test 5.1: Clear posts table (should cascade delete comments)
-      final clearPostsBefore = await db.query('posts').count();
-      final clearCommentsBefore = await db.query('comments').count();
+      final clearPostsBefore =
+          await db.query(ExampleSchemas.posts.name).count();
+      final clearCommentsBefore =
+          await db.query(ExampleSchemas.comments.name).count();
       isTestPassed &=
           _expect('Should have 2 posts before clear', clearPostsBefore, 2);
       isTestPassed &= _expect(
           'Should have 2 comments before clear', clearCommentsBefore, 2);
 
-      await db.clear('posts');
+      await db.clear(ExampleSchemas.posts.name);
 
-      final clearPostsAfter = await db.query('posts').count();
-      final clearCommentsAfter = await db.query('comments').count();
+      final clearPostsAfter = await db.query(ExampleSchemas.posts.name).count();
+      final clearCommentsAfter =
+          await db.query(ExampleSchemas.comments.name).count();
       isTestPassed &= _expect('Posts should be cleared', clearPostsAfter, 0);
       isTestPassed &=
           _expect('Comments should be cascade deleted', clearCommentsAfter, 0);
 
       // Test 5.2: Clear users table (should handle RESTRICT constraint)
       // First, ensure clean state by clearing all tables
-      // Note: clear('users') may fail due to RESTRICT, so we need to clear comments first
-      await db.clear('comments');
-      await db.clear('posts');
+      // Note: clear(ExampleSchemas.users.name) may fail due to RESTRICT, so we need to clear comments first
+      await db.clear(ExampleSchemas.comments.name);
+      await db.clear(ExampleSchemas.posts.name);
       // Now clear users should succeed since no comments reference users
-      final clearUsersBeforeTest = await db.clear('users');
+      final clearUsersBeforeTest = await db.clear(ExampleSchemas.users.name);
       if (!!clearUsersBeforeTest.hasErrors) {
         // If clear failed, manually delete all users
-        await db.delete('users').allowDeleteAll();
+        await db.delete(ExampleSchemas.users.name).allowDeleteAll();
       }
 
       // Create test data for RESTRICT test
-      final clearUser3Result = await db.insert('users', {
+      final clearUser3Result = await db.insert(ExampleSchemas.users.name, {
         'username': 'clear_user3',
         'email': 'clear3@test.com',
       });
@@ -3245,7 +3353,7 @@ class DatabaseTester {
       if (!isTestPassed) return false;
 
       final clearUser3Id = clearUser3Result.firstPrimaryKey;
-      final clearPost3Result = await db.insert('posts', {
+      final clearPost3Result = await db.insert(ExampleSchemas.posts.name, {
         'title': 'Clear Post 3',
         'user_id': clearUser3Id,
       });
@@ -3254,7 +3362,7 @@ class DatabaseTester {
       if (!isTestPassed) return false;
 
       final clearPost3Id = clearPost3Result.firstPrimaryKey;
-      final clearCommentResult = await db.insert('comments', {
+      final clearCommentResult = await db.insert(ExampleSchemas.comments.name, {
         'post_id': clearPost3Id,
         'user_id': clearUser3Id,
         'content': 'Comment 3',
@@ -3264,13 +3372,14 @@ class DatabaseTester {
       if (!isTestPassed) return false;
 
       // Verify initial state: should have exactly 1 user
-      final usersBeforeClear = await db.query('users').count();
+      final usersBeforeClear =
+          await db.query(ExampleSchemas.users.name).count();
       isTestPassed &= _expect(
           'Should have exactly 1 user before clear', usersBeforeClear, 1);
       if (!isTestPassed) return false;
 
       // Try to clear users - should fail because comments.user_id has RESTRICT
-      final clearResult = await db.clear('users');
+      final clearResult = await db.clear(ExampleSchemas.users.name);
       isTestPassed &= _expect(
           'Clear users with RESTRICT foreign key should fail',
           !clearResult.hasErrors,
@@ -3283,7 +3392,8 @@ class DatabaseTester {
           true);
 
       // Verify users still exist (should still be 1, the same as before)
-      final clearUsersAfterFailed = await db.query('users').count();
+      final clearUsersAfterFailed =
+          await db.query(ExampleSchemas.users.name).count();
       isTestPassed &= _expect('Users should still exist after failed clear',
           clearUsersAfterFailed, 1);
     } catch (e, s) {
@@ -3302,103 +3412,117 @@ class DatabaseTester {
       await _clearTablesSafely();
 
       // Test 1: Simple increment expression
-      await db.insert('users', {
+      await db.insert(ExampleSchemas.users.name, {
         'username': 'expr_user1',
         'email': 'expr1@test.com',
         'age': 20,
         'fans': 100,
       });
 
-      await db.update('users', {
+      await db.update(ExampleSchemas.users.name, {
         'fans': Expr.field('fans') + Expr.value(50),
       }).where('username', '=', 'expr_user1');
 
-      final user1 =
-          await db.query('users').where('username', '=', 'expr_user1').first();
+      final user1 = await db
+          .query(ExampleSchemas.users.name)
+          .where('username', '=', 'expr_user1')
+          .first();
       isTestPassed &= _expect(
           'Increment expression: fans should be 150', user1?['fans'], 150);
 
       // Test 2: Multiply expression
-      await db.update('users', {
+      await db.update(ExampleSchemas.users.name, {
         'fans': Expr.field('fans') * Expr.value(0.9),
       }).where('username', '=', 'expr_user1');
 
-      final user1AfterMultiply =
-          await db.query('users').where('username', '=', 'expr_user1').first();
+      final user1AfterMultiply = await db
+          .query(ExampleSchemas.users.name)
+          .where('username', '=', 'expr_user1')
+          .first();
       isTestPassed &= _expect(
           'Multiply expression: fans should be 135 (150 * 0.9)',
           user1AfterMultiply?['fans'],
           135);
 
       // Test 3: Complex multi-field expression
-      await db.insert('users', {
+      await db.insert(ExampleSchemas.users.name, {
         'username': 'expr_user2',
         'email': 'expr2@test.com',
         'age': 25,
         'fans': 200,
       });
 
-      await db.update('users', {
+      await db.update(ExampleSchemas.users.name, {
         'fans': Expr.field('fans') + (Expr.field('age') * Expr.value(2)),
       }).where('username', '=', 'expr_user2');
 
-      final user2 =
-          await db.query('users').where('username', '=', 'expr_user2').first();
+      final user2 = await db
+          .query(ExampleSchemas.users.name)
+          .where('username', '=', 'expr_user2')
+          .first();
       isTestPassed &= _expect(
           'Complex expression: fans should be 250 (200 + 25*2)',
           user2?['fans'],
           250);
 
       // Test 4: Multi-level parentheses expression
-      await db.insert('users', {
+      await db.insert(ExampleSchemas.users.name, {
         'username': 'expr_user3',
         'email': 'expr3@test.com',
         'age': 30,
         'fans': 300,
       });
 
-      await db.update('users', {
+      await db.update(ExampleSchemas.users.name, {
         'fans': ((Expr.field('fans') + Expr.field('age')) * Expr.value(0.8)) -
             Expr.value(10),
       }).where('username', '=', 'expr_user3');
 
-      final user3 =
-          await db.query('users').where('username', '=', 'expr_user3').first();
+      final user3 = await db
+          .query(ExampleSchemas.users.name)
+          .where('username', '=', 'expr_user3')
+          .first();
       // Expected: ((300 + 30) * 0.8) - 10 = 264 - 10 = 254
       isTestPassed &= _expect(
           'Multi-level parentheses: fans should be 254', user3?['fans'], 254);
 
       // Test 5: Min/Max functions
-      await db.update('users', {
+      await db.update(ExampleSchemas.users.name, {
         'fans': Expr.min(Expr.field('fans'), Expr.value(200)),
       }).where('username', '=', 'expr_user3');
 
-      final user3AfterMin =
-          await db.query('users').where('username', '=', 'expr_user3').first();
+      final user3AfterMin = await db
+          .query(ExampleSchemas.users.name)
+          .where('username', '=', 'expr_user3')
+          .first();
       isTestPassed &= _expect(
           'Min function: fans should be 200', user3AfterMin?['fans'], 200);
 
-      await db.update('users', {
+      await db.update(ExampleSchemas.users.name, {
         'fans': Expr.max(Expr.field('fans'), Expr.value(300)),
       }).where('username', '=', 'expr_user3');
 
-      final user3AfterMax =
-          await db.query('users').where('username', '=', 'expr_user3').first();
+      final user3AfterMax = await db
+          .query(ExampleSchemas.users.name)
+          .where('username', '=', 'expr_user3')
+          .first();
       isTestPassed &= _expect(
           'Max function: fans should be 300', user3AfterMax?['fans'], 300);
 
       // Test 6: Timestamp expression
-      await db.update('users', {
+      await db.update(ExampleSchemas.users.name, {
         'last_login': Expr.now(),
       }).where('username', '=', 'expr_user1');
 
-      final user1WithTimestamp =
-          await db.query('users').where('username', '=', 'expr_user1').first();
+      final user1WithTimestamp = await db
+          .query(ExampleSchemas.users.name)
+          .where('username', '=', 'expr_user1')
+          .first();
       isTestPassed &= _expect('Timestamp expression: last_login should be set',
           user1WithTimestamp?['last_login'] != null, true);
 
       // Test 7: Chain builder syntax sugar
-      await db.insert('users', {
+      await db.insert(ExampleSchemas.users.name, {
         'username': 'expr_user4',
         'email': 'expr4@test.com',
         'age': 35,
@@ -3406,13 +3530,15 @@ class DatabaseTester {
       });
 
       await db
-          .update('users', {})
+          .update(ExampleSchemas.users.name, {})
           .increment('fans', 100)
           .compute('age', Expr.round(Expr.field('age') * Expr.value(1.1)))
           .where('username', '=', 'expr_user4');
 
-      final user4 =
-          await db.query('users').where('username', '=', 'expr_user4').first();
+      final user4 = await db
+          .query(ExampleSchemas.users.name)
+          .where('username', '=', 'expr_user4')
+          .first();
       isTestPassed &=
           _expect('Chain increment: fans should be 500', user4?['fans'], 500);
       isTestPassed &= _expect(
@@ -3421,31 +3547,35 @@ class DatabaseTester {
           39); // round(38.5) = 39
 
       // Test 8: Expression in Map literal
-      await db.insert('users', {
+      await db.insert(ExampleSchemas.users.name, {
         'username': 'expr_user5',
         'email': 'expr5@test.com',
         'age': 40,
         'fans': 500,
       });
 
-      await db.update('users', {
+      await db.update(ExampleSchemas.users.name, {
         'fans': Expr.field('fans') * Expr.field('age') / Expr.value(10),
         'last_login': Expr.now(),
       }).where('username', '=', 'expr_user5');
 
-      final user5 =
-          await db.query('users').where('username', '=', 'expr_user5').first();
+      final user5 = await db
+          .query(ExampleSchemas.users.name)
+          .where('username', '=', 'expr_user5')
+          .first();
       // Expected: 500 * 40 / 10 = 2000
       isTestPassed &= _expect(
           'Expression in Map: fans should be 2000', user5?['fans'], 2000);
 
       // Test 9: Division by zero handling
-      await db.update('users', {
+      await db.update(ExampleSchemas.users.name, {
         'fans': Expr.field('fans') / Expr.value(0),
       }).where('username', '=', 'expr_user5');
 
-      final user5AfterDivZero =
-          await db.query('users').where('username', '=', 'expr_user5').first();
+      final user5AfterDivZero = await db
+          .query(ExampleSchemas.users.name)
+          .where('username', '=', 'expr_user5')
+          .first();
       // Division by zero should return 0 (safe handling)
       isTestPassed &= _expect(
           'Division by zero: fans should be 0 (safe fallback)',
@@ -3468,12 +3598,12 @@ class DatabaseTester {
 
       // Test 1: Basic transaction commit
       final txResult1 = await db.transaction(() async {
-        await db.insert('users', {
+        await db.insert(ExampleSchemas.users.name, {
           'username': 'tx_user1',
           'email': 'tx1@test.com',
           'age': 25,
         });
-        await db.insert('users', {
+        await db.insert(ExampleSchemas.users.name, {
           'username': 'tx_user2',
           'email': 'tx2@test.com',
           'age': 30,
@@ -3483,13 +3613,13 @@ class DatabaseTester {
       isTestPassed &= _expect(
           'Transaction should commit successfully', !txResult1.hasErrors, true);
 
-      final countAfterTx = await db.query('users').count();
+      final countAfterTx = await db.query(ExampleSchemas.users.name).count();
       isTestPassed &=
           _expect('Should have 2 users after transaction', countAfterTx, 2);
 
       // Test 2: Transaction rollback on error
       final txResult2 = await db.transaction(() async {
-        await db.insert('users', {
+        await db.insert(ExampleSchemas.users.name, {
           'username': 'tx_user3',
           'email': 'tx3@test.com',
           'age': 35,
@@ -3500,24 +3630,27 @@ class DatabaseTester {
       isTestPassed &= _expect(
           'Transaction should rollback on error', txResult2.hasErrors, true);
 
-      final countAfterRollback = await db.query('users').count();
+      final countAfterRollback =
+          await db.query(ExampleSchemas.users.name).count();
       isTestPassed &= _expect(
           'Should still have 2 users after rollback', countAfterRollback, 2);
 
-      final txUser3 =
-          await db.query('users').where('username', '=', 'tx_user3').first();
+      final txUser3 = await db
+          .query(ExampleSchemas.users.name)
+          .where('username', '=', 'tx_user3')
+          .first();
       isTestPassed &= _expect(
           'tx_user3 should not exist after rollback', txUser3 == null, true);
 
       // Test 3: Transaction with unique constraint violation
       final txResult3 = await db.transaction(() async {
-        await db.insert('users', {
+        await db.insert(ExampleSchemas.users.name, {
           'username': 'tx_user4',
           'email': 'tx4@test.com',
           'age': 40,
         });
         // Try to insert duplicate username (should fail)
-        await db.insert('users', {
+        await db.insert(ExampleSchemas.users.name, {
           'username': 'tx_user1', // Duplicate
           'email': 'tx4_dup@test.com',
           'age': 45,
@@ -3529,8 +3662,10 @@ class DatabaseTester {
           txResult3.hasErrors,
           true);
 
-      final txUser4 =
-          await db.query('users').where('username', '=', 'tx_user4').first();
+      final txUser4 = await db
+          .query(ExampleSchemas.users.name)
+          .where('username', '=', 'tx_user4')
+          .first();
       isTestPassed &= _expect(
           'tx_user4 should not exist after constraint violation rollback',
           txUser4 == null,
@@ -3538,14 +3673,14 @@ class DatabaseTester {
 
       // Test 4: Transaction with expressions
       final txResult4 = await db.transaction(() async {
-        await db.insert('users', {
+        await db.insert(ExampleSchemas.users.name, {
           'username': 'tx_user5',
           'email': 'tx5@test.com',
           'age': 50,
           'fans': 100,
         });
 
-        await db.update('users', {
+        await db.update(ExampleSchemas.users.name, {
           'fans': Expr.field('fans') + Expr.value(200),
           'age': Expr.field('age') + Expr.value(10),
         }).where('username', '=', 'tx_user5');
@@ -3554,8 +3689,10 @@ class DatabaseTester {
       isTestPassed &= _expect('Transaction with expressions should commit',
           !txResult4.hasErrors, true);
 
-      final txUser5 =
-          await db.query('users').where('username', '=', 'tx_user5').first();
+      final txUser5 = await db
+          .query(ExampleSchemas.users.name)
+          .where('username', '=', 'tx_user5')
+          .first();
       isTestPassed &= _expect(
           'tx_user5 fans should be 300 after expression update',
           txUser5?['fans'],
@@ -3567,14 +3704,14 @@ class DatabaseTester {
 
       // Test 5: Transaction rollback with expressions
       final txResult6 = await db.transaction(() async {
-        await db.insert('users', {
+        await db.insert(ExampleSchemas.users.name, {
           'username': 'tx_user7',
           'email': 'tx7@test.com',
           'age': 25,
           'fans': 200,
         });
 
-        await db.update('users', {
+        await db.update(ExampleSchemas.users.name, {
           'fans': Expr.field('fans') * Expr.value(2),
         }).where('username', '=', 'tx_user7');
 
@@ -3584,15 +3721,17 @@ class DatabaseTester {
       isTestPassed &= _expect('Transaction should rollback expression updates',
           txResult6.hasErrors, true);
 
-      final txUser7 =
-          await db.query('users').where('username', '=', 'tx_user7').first();
+      final txUser7 = await db
+          .query(ExampleSchemas.users.name)
+          .where('username', '=', 'tx_user7')
+          .first();
       isTestPassed &= _expect(
           'tx_user7 should not exist after rollback', txUser7 == null, true);
 
       // Test 6: Multiple operations in transaction
       final txResult7 = await db.transaction(() async {
         // Insert
-        await db.insert('users', {
+        await db.insert(ExampleSchemas.users.name, {
           'username': 'tx_user8',
           'email': 'tx8@test.com',
           'age': 30,
@@ -3600,24 +3739,30 @@ class DatabaseTester {
         });
 
         // Update with expression
-        await db.update('users', {
+        await db.update(ExampleSchemas.users.name, {
           'fans': Expr.field('fans') + Expr.value(50),
         }).where('username', '=', 'tx_user8');
 
         // Delete another user (tx_user5 from Test 4)
-        await db.delete('users').where('username', '=', 'tx_user5');
+        await db
+            .delete(ExampleSchemas.users.name)
+            .where('username', '=', 'tx_user5');
       });
 
       isTestPassed &= _expect('Multi-operation transaction should commit',
           !txResult7.hasErrors, true);
 
-      final txUser8 =
-          await db.query('users').where('username', '=', 'tx_user8').first();
+      final txUser8 = await db
+          .query(ExampleSchemas.users.name)
+          .where('username', '=', 'tx_user8')
+          .first();
       isTestPassed &= _expect(
           'tx_user8 should exist with updated fans', txUser8?['fans'], 150);
 
-      final txUser5AfterDelete =
-          await db.query('users').where('username', '=', 'tx_user5').first();
+      final txUser5AfterDelete = await db
+          .query(ExampleSchemas.users.name)
+          .where('username', '=', 'tx_user5')
+          .first();
       isTestPassed &= _expect(
           'tx_user5 should be deleted', txUser5AfterDelete == null, true);
     } catch (e, s) {

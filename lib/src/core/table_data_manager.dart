@@ -4290,6 +4290,20 @@ class TableDataManager {
         final cached = _tableRecordCache.getPoint2(tableUid, pk);
         if (cached != null) {
           resultsMap[pk] = cached;
+        } else if (!readFromFileOnly) {
+          // Tier: B+Tree leaf page cache (sync, zero I/O when table prewarmed).
+          final pageHit = _dataStore.tableTreePartitionManager
+              ?.queryRecordByPrimaryKeyFromPageCacheSync(
+            table: table,
+            pk: pk,
+            schemaOverride: decodeSchema,
+          );
+          if (pageHit != null) {
+            resultsMap[pk] = pageHit;
+            _schedulePageCacheReadThrough(table, pk, pageHit);
+          } else {
+            stillMissing.add(pk);
+          }
         } else {
           stillMissing.add(pk);
         }

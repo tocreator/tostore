@@ -277,7 +277,7 @@ class TtlCleanupManager {
           condition,
           limit: batchSize,
         );
-        if (!r.isSuccess) {
+        if (r.hasErrors) {
           Logger.warn(
             'TTL cleanup delete failed on $tableName: ${r.message}',
           );
@@ -350,7 +350,7 @@ class TtlCleanupManager {
         orderBy: [plan.sourceField],
         limit: batchSize,
       );
-      if (!r.isSuccess) {
+      if (r.hasErrors) {
         Logger.warn(
           'TTL cleanup delete failed on $tableName: ${r.message}',
         );
@@ -473,7 +473,7 @@ class TtlCleanupManager {
             ),
           limit: 1,
         );
-        if (!deleteResult.isSuccess) {
+        if (deleteResult.hasErrors) {
           if (_dataStore.isClosing) {
             return const _TtlBatchResult(deleted: 0, ok: false);
           }

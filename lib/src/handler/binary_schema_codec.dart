@@ -40,9 +40,11 @@ class BinarySchemaCodec {
     // Encode values in field order
     for (int i = 0; i < fieldCount; i++) {
       final field = fieldStructure[i];
-      final value = (nullifyField != null && field.name == nullifyField)
+      final value = field.deleted
           ? null
-          : record[field.name];
+          : (nullifyField != null && field.name == nullifyField)
+              ? null
+              : record[field.name];
       _writeValue(buffer, value);
     }
 
@@ -75,11 +77,9 @@ class BinarySchemaCodec {
       for (int i = 0; i < fieldCount; i++) {
         final field = fieldStructure[i];
         final raw = _readValue(r);
-        // Only include non-null values to match original behavior
-        if (raw != null) {
-          final value = _coerceByTypeIndex(field.typeIndex, raw);
-          result[field.name] = value;
-        }
+        // Deleted slots keep positional alignment only — never expose to callers.
+        if (field.deleted || raw == null) continue;
+        result[field.name] = _coerceByTypeIndex(field.typeIndex, raw);
       }
 
       return result;
@@ -585,5 +585,13 @@ final class FieldStructure {
   final String name;
   final int typeIndex; // DataType enum index
 
-  const FieldStructure({required this.name, required this.typeIndex});
+  /// Deleted storage slot: still occupies a positional decode/encode slot, but
+  /// must not appear in logical record maps (encode writes null).
+  final bool deleted;
+
+  const FieldStructure({
+    required this.name,
+    required this.typeIndex,
+    this.deleted = false,
+  });
 }

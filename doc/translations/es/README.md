@@ -33,8 +33,8 @@
 - [Por qué almacenar](#why-tostore) | [Características clave](#key-features) | [Guía de instalación](#installation) | [Modo KV](#quick-start-kv) | [Modo tabla](#quick-start-table) | [Modo de memoria](#quick-start-memory)
 - [Definición de esquema](#schema-definition) | [Arquitectura distribuida](#distributed-architecture) | [Claves externas en cascada](#foreign-keys) | [Móvil/Escritorio](#mobile-integration) | [Servidor/Agente](#server-integration) | [Algoritmos de clave primaria](#primary-key-examples)
 - [Consultas avanzadas (UNIRSE)](#query-advanced) | [Agregación y estadísticas](#aggregation-stats) | [Lógica compleja (Condición de consulta)](#query-condition) | [Consulta reactiva (ver)](#reactive-query) | [Consulta de transmisión](#streaming-query)
-- [KV avanzado](#kv-advanced) | [Operaciones por lotes](#bulk-operations) | [Búsqueda vectorial](#vector-advanced) | [TTL a nivel de tabla](#ttl-config) | [Paginación eficiente](#query-pagination) | [Sonda de memoria y recuperación sincrónica (peek)](#query-peek) | [Caché de consultas](#query-cache) | [Expresiones atómicas](#atomic-expressions) | [Transacciones](#transactions)
-- [Administración](#database-maintenance) | [Configuración de seguridad](#security-config) | [Manejo de errores](#error-handling) | [Rendimiento y diagnóstico](#performance) | [Contribuir](#contribute)
+- [KV avanzado](#kv-advanced) | [Operaciones por lotes](#bulk-operations) | [Vectores y recuperación híbrida](#vector-advanced) | [TTL a nivel de tabla](#ttl-config) | [Paginación eficiente](#query-pagination) | [Sonda de memoria y recuperación sincrónica (peek)](#query-peek) | [Caché de consultas](#query-cache) | [Expresiones atómicas](#atomic-expressions) | [Transacciones](#transactions)
+- [Administración](#database-maintenance) | [Configuración de seguridad](#security-config) | [Manejo de errores](#error-handling) | [Rendimiento y diagnóstico](#performance) | [Contribuir](#contribute) | [Asistentes de IA](#for-ai-coding-assistants)
 
 ## <a id="why-tostore"></a>¿Por qué elegir ToStore?
 
@@ -42,9 +42,9 @@ ToStore es un motor de datos moderno diseñado para la era de la AGI y escenario
 
 El modelado en tiempo de ejecución y las rutas de ejecución sin bloqueo mantienen la evolución de la arquitectura siempre en línea y totalmente transparente para las operaciones del negocio: los cambios declarativos de esquema, la rotación de claves de codificación de datos y la refactorización masiva de datos se realizan sin interrupciones. Orientado a Agentes y O&M automatizado, sustenta su evolución autónoma y su iteración continua sin interrumpir el servicio.
 
-Un motor de datos unificado que soporta nativamente datos estructurados relacionales, vectores de alta dimensión y datos no estructurados, con capacidades de base de datos de nivel empresarial que incluyen transacciones ACID, consultas relacionales complejas (JOINs, claves externas en cascada), TTL a nivel de tabla, agregaciones, así como algoritmos de clave primaria distribuida, expresiones atómicas, cifrado, aislamiento multi-espacio y recuperación automática.
+Un motor de datos unificado que soporta nativamente datos estructurados relacionales, vectores de alta dimensión y datos no estructurados, con recuperación híbrida integrada y fusión de recuperación multi-vía, además de capacidades de base de datos de nivel empresarial que incluyen transacciones ACID, consultas relacionales complejas (JOINs, claves externas en cascada), TTL a nivel de tabla, agregaciones, así como algoritmos de clave primaria distribuida, expresiones atómicas, cifrado, aislamiento multi-espacio y recuperación automática.
 
-A medida que la computación continúa desplazándose hacia la inteligencia perimetral, los dispositivos ya no son simplemente "pantallas de contenido", sino nodos inteligentes responsables de la generación local, la percepción del entorno, la toma de decisiones en tiempo real y la coordinación de datos. ToStore otorga al borde capacidades distribuidas para conjuntos de datos masivos y generación compleja de IA local. La profunda colaboración inteligente entre nodos de borde y nube proporciona una base de datos confiable para interacción multimodal, vectores semánticos, modelado espacial, colaboración autónoma en el borde y escenarios similares.
+A medida que la computación continúa desplazándose hacia la inteligencia perimetral, los dispositivos ya no son simplemente "pantallas de contenido", sino nodos inteligentes responsables de la generación local, la percepción del entorno, la toma de decisiones en tiempo real y la coordinación de datos. ToStore otorga al borde capacidades distribuidas para conjuntos de datos masivos y generación compleja de IA local. La profunda colaboración inteligente entre nodos de borde y nube proporciona una base de datos confiable para interacción multimodal, recuperación híbrida de vectores semánticos, modelado espacial, colaboración autónoma en el borde y escenarios similares.
 
 ## <a id="key-features"></a>Características clave
 
@@ -63,6 +63,11 @@ A medida que la computación continúa desplazándose hacia la inteligencia peri
   - API unificada en entornos móviles, de escritorio, web y servidor
   - Cubre datos estructurados relacionales, vectores de alta dimensión y datos no estructurados
   - Canal de datos completo desde el almacenamiento local hasta la colaboración borde-nube
+
+- 🔍 **Consultas estructuradas y recuperación híbrida**
+  - Predicados complejos, JOINs, agregaciones y TTL a nivel de tabla
+  - Recuperación multicanal combinable en la misma cadena de consulta (vectorial, estructurada y más)
+  - Clasificación por fusión de recuperación multi-vía, con puntuaciones y diagnósticos de canal en el resultado de la consulta
 
 - ⚡ **Ejecución paralela y planificación de recursos**
   - Planificación inteligente de carga con reconocimiento de recursos para alta disponibilidad
@@ -85,6 +90,10 @@ Añade `tostore` a tu `pubspec.yaml`:
 dependencies:
   tostore: any # Please use the latest version
 ```
+
+### For AI Coding Assistants
+
+Al generar código cliente de ToStore con un asistente de IA, proporcione el corpus de un solo archivo [`llms-full.txt`](../../../llms-full.txt): por ejemplo `@llms-full.txt` en el IDE, suba/pegue el archivo, o indexe su [raw URL](https://raw.githubusercontent.com/tocreator/tostore/main/llms-full.txt) en la documentación del asistente. Incluye firmas de API, restricciones y antipatrones para alinear al modelo con la superficie pública real. Índice: [`llms.txt`](../../../llms.txt).
 
 ## <a id="quick-start"></a>Inicio rápido
 
@@ -675,7 +684,9 @@ ToStore proporciona interfaces de procesamiento por lotes especializadas optimiz
 > Puede establecer `allowPartialErrors: true` para asegurarse de que los fallos en registros individuales (por ejemplo, una violación de restricción única) no rechacen toda la operación por lotes.
 
 
-### <a id="vector-advanced"></a>Campos vectoriales, índices vectoriales y búsqueda de vectores
+### <a id="vector-advanced"></a>Campos vectoriales, índices vectoriales y recuperación híbrida
+
+La recuperación vectorial utiliza la cadena unificada `db.query(...).matchVector(...)`: puede combinarse con predicados estructurados en la misma cadena, o fusionarse con otras ramas de recuperación. Las puntuaciones y los diagnósticos de canal se devuelven en `QueryResult.retrieval`, alineados 1:1 con las filas de `data`. Los ejemplos actuales se centran en rutas vectoriales + estructuradas; los canales léxicos, de grafos y otros se extenderán siguiendo el mismo modelo de recuperación híbrida encadenada.
 
 ```dart
 await db.createTables([
@@ -690,6 +701,12 @@ await db.createTables([
         name: 'document_title',
         type: DataType.text,
         nullable: false,
+      ),
+      FieldSchema(
+        name: 'category',
+        type: DataType.text,
+        nullable: false,
+        createIndex: true,
       ),
       FieldSchema(
         name: 'embedding',
@@ -708,9 +725,6 @@ await db.createTables([
         vectorConfig: VectorIndexConfig(
           indexType: VectorIndexType.ngh, // Built-in vector index type
           distanceMetric: VectorDistanceMetric.cosine, // Good for normalized embeddings
-          maxDegree: 32, // More neighbors usually improve recall at higher memory cost
-          efSearch: 64, // Higher recall but slower queries
-          constructionEf: 128, // Higher-quality index but slower build time
         ),
       ),
     ],
@@ -720,34 +734,63 @@ await db.createTables([
 final queryVector =
     VectorData.fromList(List.generate(128, (i) => i * 0.01)); // Must match dimensions
 
-// Vector search
-final results = await db.vectorSearch(
-  'embeddings',
-  fieldName: 'embedding',
-  queryVector: queryVector,
-  topK: 5, // Return the top 5 nearest records
-  efSearch: 64, // Override the search expansion factor for this request
-);
+// 1) Recommended: chained hybrid retrieval (pure vector ANN)
+final result = await db
+    .query('embeddings')
+    .matchVector('embedding', queryVector) // default searchDepth = 80
+    .limit(5);
 
-for (final r in results) {
-  print('pk=${r.primaryKey}, score=${r.score}, distance=${r.distance}');
+for (var i = 0; i < result.data.length; i++) {
+  final row = result.data[i];
+  final entry = result.retrieval?.entries[i];
+  final score = entry?.score;
+  final distance = entry?.meta?['distance'];
+  print('pk=${row['id']}, title=${row['document_title']}, '
+      'score=$score, distance=$distance');
 }
+
+// 2) Structured filter + vector (AND hybrid)
+final filtered = await db
+    .query('embeddings')
+    .whereEqual('category', 'tech')
+    .matchVector('embedding', queryVector)
+    .limit(5);
+
+// 3) Multi-way fused recall (vector + structured paths, engine-side RRF)
+final otherVector =
+    VectorData.fromList(List.generate(128, (i) => i * 0.012));
+final fused = await db
+    .query('embeddings')
+    .matchVector('embedding', queryVector, weight: 1.0)
+    .orMatchVector('embedding', otherVector, weight: 0.6, minScore: 0.2)
+    .or()
+    .whereEqual('category', 'tech')
+    .limit(10);
+
+print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
 ```
 
-Notas de parámetros:
+**Configuración de esquema / índice vectorial** (`VectorFieldConfig`, `VectorIndexConfig`):
 
-- `dimensions`: debe coincidir con el ancho de incrustación real que escribe
-- `precision`: las opciones comunes incluyen `float64`, `float32` y `int8`; Una mayor precisión generalmente cuesta más almacenamiento.
-- `distanceMetric`: `cosine` es común para incrustaciones semánticas, `l2` se adapta a la distancia euclidiana y `innerProduct` se adapta a la búsqueda de productos escalares.
-- `maxDegree`: límite superior de vecinos retenidos por nodo en el gráfico NGH; Los valores más altos generalmente mejoran la recuperación a costa de más memoria y tiempo de construcción.
-- `efSearch`: ancho de expansión del tiempo de búsqueda; aumentarlo generalmente mejora la recuperación pero aumenta la latencia
-- `constructionEf`: ancho de expansión en tiempo de construcción; aumentarlo generalmente mejora la calidad del índice pero aumenta el tiempo de construcción
-- `topK`: número de resultados a devolver
+- `dimensions`: debe coincidir con el ancho real de la incrustación que escribe
+- `precision`: las opciones comunes incluyen `float64`, `float32` e `int8`; una mayor precisión suele costar más almacenamiento
+- `distanceMetric`: métrica de similitud del lado del índice; `cosine` es habitual para incrustaciones semánticas, `l2` se adapta a la distancia euclidiana e `innerProduct` a la búsqueda por producto escalar
 
-Notas de resultados:
+**Parámetros de recuperación encadenada** (`matchVector` / `orMatchVector`, más `limit` en la cadena de consulta):
 
-- `score`: puntuación de similitud normalizada, normalmente en el rango `0 ~ 1`; más grande significa más similar
-- `distance`: valor de distancia; para `l2` y `cosine`, más pequeño generalmente significa más similar
+- `field` / `vector`: campo vectorial de destino y vector de consulta (`VectorData` / `List<num>` / `Float32List`)
+- `searchDepth`: optional thoroughness in `[1, 100]` (**not** a recall%); higher usually means better recall intent and higher latency, lower is faster but may miss neighbors; omit → engine default `80`
+- `weight`: peso de fusión de este canal de recuperación en la recuperación multi-vía; valor predeterminado `1.0`
+- `minScore`: umbral inferior de similitud normalizada en `[0.0 ~ 1.0]`; los candidatos por debajo se descartan
+- `distanceThreshold`: techo de distancia; los candidatos que lo superen se excluyen
+- `limit`: número de resultados a devolver (equivalente a topK en el uso típico de ANN)
+
+**Notas sobre el resultado** (`QueryResult`):
+
+- Las filas de negocio están en `data`; las puntuaciones de recuperación y la información de canal están en `retrieval.entries`, alineadas **1:1** con `data`
+- `entry.score`: puntuación de similitud / fusión normalizada, normalmente en `0 ~ 1`; mayor significa más relevante
+- `entry.meta['distance']`: distancia bruta (habitual en el canal vectorial); para `l2` / `cosine`, menor suele significar más cercano
+- `retrieval.fusionMethod`: suele ser `single` para un canal; la recuperación fusionada multi-vía es típicamente `rrf` (Reciprocal Rank Fusion)
 
 ### <a id="ttl-config"></a>TTL a nivel de tabla (vencimiento automático basado en tiempo)
 
@@ -1534,7 +1577,7 @@ if (result.hasErrors) {
 #### 2. Diagnóstico detallado en escritura por lotes
 
 ```dart
-final batchResult = await db.insertAll('users', [
+final batchResult = await db.batchInsert('users', [
   {'username': 'alice', 'email': 'alice@example.com'},
   {'username': 'bob', 'email': 'invalid-email-format'}, // Validation fails
 ]);

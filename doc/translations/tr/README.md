@@ -33,8 +33,8 @@
 - [Neden Saklamalı](#why-tostore) | [Temel Özellikler](#key-features) | [Kurulum Kılavuzu](#installation) | [KV Modu](#quick-start-kv) | [Tablo Modu](#quick-start-table) | [Bellek Modu](#quick-start-memory)
 - [Şema Tanımı](#schema-definition) | [Dağıtılmış Mimari](#distributed-architecture) | [Basamaklı Yabancı Anahtarlar](#foreign-keys) | [Mobil/Masaüstü](#mobile-integration) | [Sunucu/Aracı](#server-integration) | [Birincil Anahtar Algoritmaları](#primary-key-examples)
 - [Gelişmiş Sorgular (KATIL)](#query-advanced) | [Toplama ve İstatistikler](#aggregation-stats) | [Karmaşık Mantık (Sorgu Durumu)](#query-condition) | [Reaktif Sorgu (izle)](#reactive-query) | [Akış Sorgusu](#streaming-query)
-- [Gelişmiş KV](#kv-advanced) | [Toplu İşlemler](#bulk-operations) | [Vektör Arama](#vector-advanced) | [Tablo düzeyinde TTL](#ttl-config) | [Etkili Sayfalandırma](#query-pagination) | [Bellek Probu ve Senkron Arama (peek)](#query-peek) | [Sorgu Önbelleği](#query-cache) | [Atomik İfadeler](#atomic-expressions) | [İşlemler](#transactions)
-- [Yönetim](#database-maintenance) | [Güvenlik Yapılandırması](#security-config) | [Hata İşleme](#error-handling) | [Performans ve Tanılama](#performance) | [Katkıda Bulunma](#contribute)
+- [Gelişmiş KV](#kv-advanced) | [Toplu İşlemler](#bulk-operations) | [Vektör ve Hibrit Getirme](#vector-advanced) | [Tablo düzeyinde TTL](#ttl-config) | [Etkili Sayfalandırma](#query-pagination) | [Bellek Probu ve Senkron Arama (peek)](#query-peek) | [Sorgu Önbelleği](#query-cache) | [Atomik İfadeler](#atomic-expressions) | [İşlemler](#transactions)
+- [Yönetim](#database-maintenance) | [Güvenlik Yapılandırması](#security-config) | [Hata İşleme](#error-handling) | [Performans ve Tanılama](#performance) | [Katkıda Bulunma](#contribute) | [YZ asistanları](#for-ai-coding-assistants)
 
 ## <a id="why-tostore"></a>Neden ToStore'u Seçmelisiniz?
 
@@ -42,9 +42,9 @@ ToStore, AGI çağı ve uç zeka senaryoları için tasarlanmış modern bir ver
 
 Çalışma zamanı modellemesi ve engelsiz yürütme yolları, mimari evrimi her zaman çevrimiçi ve iş operasyonlarına tamamen şeffaf tutar — bildirimsel şema değişiklikleri, veri kodlama anahtarı rotasyonu ve büyük ölçekli veri yeniden yapılandırması kesintisiz olarak gerçekleşir. Ajan ve otomatik işletime yönelik olarak, onların özerk evrimini ve sürekli yinelemesini hizmeti kesmeden destekler.
 
-İlişkisel yapılandırılmış verileri, yüksek boyutlu vektörleri ve yapılandırılmamış verileri yerel olarak destekleyen birleşik bir veri motoru; ACID işlemleri, karmaşık ilişkisel sorgular (JOIN'ler, basamaklı yabancı anahtarlar), tablo düzeyinde TTL, toplama işlemlerinin yanı sıra dağıtık birincil anahtar algoritmaları, atomik ifadeler, şifreleme, çoklu alan yalıtımı ve otomatik kurtarma gibi kurumsal düzeyde veritabanı yetenekleri sunar.
+İlişkisel yapılandırılmış verileri, yüksek boyutlu vektörleri ve yapılandırılmamış verileri yerel olarak destekleyen birleşik bir veri motoru; yerleşik hibrit getirme ve çok yollu getirme füzyonu ile birlikte ACID işlemleri, karmaşık ilişkisel sorgular (JOIN'ler, basamaklı yabancı anahtarlar), tablo düzeyinde TTL, toplama işlemlerinin yanı sıra dağıtık birincil anahtar algoritmaları, atomik ifadeler, şifreleme, çoklu alan yalıtımı ve otomatik kurtarma gibi kurumsal düzeyde veritabanı yetenekleri sunar.
 
-Bilgi işlem uç zekaya doğru kaymaya devam ettikçe, cihazlar artık yalnızca "içerik ekranları" değil, yerel üretimden, çevre algılamasından, gerçek zamanlı karar alma ve veri koordinasyonundan sorumlu akıllı düğümlerdir. ToStore, uca büyük veri kümeleri ve karmaşık yerel yapay zeka üretimi için dağıtık yetenekler sunar. Uç ve bulut düğümleri arasındaki derin akıllı işbirliği, çok modlu etkileşim, anlamsal vektörler, uzamsal modelleme, uç özerk işbirliği ve benzer senaryolar için güvenilir bir veri temeli sağlar.
+Bilgi işlem uç zekaya doğru kaymaya devam ettikçe, cihazlar artık yalnızca "içerik ekranları" değil, yerel üretimden, çevre algılamasından, gerçek zamanlı karar alma ve veri koordinasyonundan sorumlu akıllı düğümlerdir. ToStore, uca büyük veri kümeleri ve karmaşık yerel yapay zeka üretimi için dağıtık yetenekler sunar. Uç ve bulut düğümleri arasındaki derin akıllı işbirliği, çok modlu etkileşim, anlamsal vektör hibrit getirme, uzamsal modelleme, uç özerk işbirliği ve benzer senaryolar için güvenilir bir veri temeli sağlar.
 
 ## <a id="key-features"></a>Temel Özellikler
 
@@ -63,6 +63,11 @@ Bilgi işlem uç zekaya doğru kaymaya devam ettikçe, cihazlar artık yalnızca
   - Mobil, masaüstü, web ve sunucu ortamlarında birleşik API
   - İlişkisel yapılandırılmış verileri, yüksek boyutlu vektörleri ve yapılandırılmamış verileri kapsar
   - Yerel depolamadan uç-bulut işbirliğine kadar eksiksiz veri hattı
+
+- 🔍 **Yapılandırılmış Sorgular ve Hibrit Getirme**
+  - Karmaşık yüklemler, JOIN'ler, toplama işlemleri ve tablo düzeyinde TTL
+  - Çok kanallı getirme aynı sorgu zincirinde birleştirilebilir (vektör, yapılandırılmış ve daha fazlası)
+  - Çok yollu getirme füzyon sıralaması; puanlar ve kanal tanılaması sorgu sonucunda döner
 
 - ⚡ **Paralel Yürütme ve Kaynak Planlama**
   - Yüksek kullanılabilirlik için kaynağa duyarlı akıllı yük planlaması
@@ -85,6 +90,10 @@ Bilgi işlem uç zekaya doğru kaymaya devam ettikçe, cihazlar artık yalnızca
 dependencies:
   tostore: any # Please use the latest version
 ```
+
+### For AI Coding Assistants
+
+ToStore istemci kodunu bir YZ asistanıyla üretirken, tek dosyalık derlemeyi [`llms-full.txt`](../../../llms-full.txt) asistanına verin — örneğin IDE'de `@llms-full.txt`, dosyayı yükleyin/yapıştırın veya [raw URL](https://raw.githubusercontent.com/tocreator/tostore/main/llms-full.txt) adresini asistan belgelerine ekleyin. Gerçek genel API yüzeyine uyum için imzalar, kısıtlar ve anti-örüntüler içerir. Dizin: [`llms.txt`](../../../llms.txt).
 
 ## <a id="quick-start"></a>Hızlı Başlangıç
 
@@ -675,7 +684,9 @@ ToStore, büyük ölçekli veri çıkışı için optimize edilmiş özel toplu 
 > Münferit kayıt hatalarının (örneğin benzersiz kısıtlama ihlali) tüm toplu işlemi reddetmemesini sağlamak için `allowPartialErrors: true` ayarını yapabilirsiniz.
 
 
-### <a id="vector-advanced"></a>Vektör Alanları, Vektör İndeksleri ve Vektör Arama
+### <a id="vector-advanced"></a>Vektör Alanları, Vektör İndeksleri ve Hibrit Getirme
+
+Vektör getirme, birleşik `db.query(...).matchVector(...)` sorgu zincirini kullanır: aynı zincirde yapılandırılmış koşullarla birleştirilebilir veya diğer getirme dallarıyla kaynaştırılabilir. Skorlar ve kanal tanıları `QueryResult.retrieval` içinde döner ve `data` satırlarıyla 1:1 hizalanır. Güncel örnekler vektör + yapılandırılmış yollara odaklanır; sözcüksel, grafik ve diğer kanallar aynı zincirli hibrit getirme modeliyle genişletilecektir.
 
 ```dart
 await db.createTables([
@@ -690,6 +701,12 @@ await db.createTables([
         name: 'document_title',
         type: DataType.text,
         nullable: false,
+      ),
+      FieldSchema(
+        name: 'category',
+        type: DataType.text,
+        nullable: false,
+        createIndex: true,
       ),
       FieldSchema(
         name: 'embedding',
@@ -708,9 +725,6 @@ await db.createTables([
         vectorConfig: VectorIndexConfig(
           indexType: VectorIndexType.ngh, // Built-in vector index type
           distanceMetric: VectorDistanceMetric.cosine, // Good for normalized embeddings
-          maxDegree: 32, // More neighbors usually improve recall at higher memory cost
-          efSearch: 64, // Higher recall but slower queries
-          constructionEf: 128, // Higher-quality index but slower build time
         ),
       ),
     ],
@@ -720,34 +734,63 @@ await db.createTables([
 final queryVector =
     VectorData.fromList(List.generate(128, (i) => i * 0.01)); // Must match dimensions
 
-// Vector search
-final results = await db.vectorSearch(
-  'embeddings',
-  fieldName: 'embedding',
-  queryVector: queryVector,
-  topK: 5, // Return the top 5 nearest records
-  efSearch: 64, // Override the search expansion factor for this request
-);
+// 1) Recommended: chained hybrid retrieval (pure vector ANN)
+final result = await db
+    .query('embeddings')
+    .matchVector('embedding', queryVector) // default searchDepth = 80
+    .limit(5);
 
-for (final r in results) {
-  print('pk=${r.primaryKey}, score=${r.score}, distance=${r.distance}');
+for (var i = 0; i < result.data.length; i++) {
+  final row = result.data[i];
+  final entry = result.retrieval?.entries[i];
+  final score = entry?.score;
+  final distance = entry?.meta?['distance'];
+  print('pk=${row['id']}, title=${row['document_title']}, '
+      'score=$score, distance=$distance');
 }
+
+// 2) Structured filter + vector (AND hybrid)
+final filtered = await db
+    .query('embeddings')
+    .whereEqual('category', 'tech')
+    .matchVector('embedding', queryVector)
+    .limit(5);
+
+// 3) Multi-way fused recall (vector + structured paths, engine-side RRF)
+final otherVector =
+    VectorData.fromList(List.generate(128, (i) => i * 0.012));
+final fused = await db
+    .query('embeddings')
+    .matchVector('embedding', queryVector, weight: 1.0)
+    .orMatchVector('embedding', otherVector, weight: 0.6, minScore: 0.2)
+    .or()
+    .whereEqual('category', 'tech')
+    .limit(10);
+
+print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
 ```
 
-Parametre notları:
+**Şema / vektör indeks yapılandırması** (`VectorFieldConfig`, `VectorIndexConfig`):
 
-- `dimensions`: yazdığınız gerçek yerleştirme genişliğiyle eşleşmelidir
-- `precision`: yaygın seçenekler arasında `float64`, `float32` ve `int8` yer alır; daha yüksek hassasiyet genellikle daha fazla depolamaya mal olur
-- `distanceMetric`: `cosine` anlamsal yerleştirmeler için yaygındır, `l2` Öklid mesafesine uygundur ve `innerProduct` nokta-çarpım aramasına uygundur
-- `maxDegree`: NGH grafiğinde düğüm başına tutulan komşuların üst sınırı; daha yüksek değerler genellikle daha fazla bellek ve derleme süresi pahasına hatırlamayı iyileştirir
-- `efSearch`: arama süresi genişletme genişliği; bunu artırmak genellikle hatırlamayı iyileştirir ancak gecikmeyi artırır
-- `constructionEf`: derleme zamanı genişletme genişliği; bunu artırmak genellikle dizin kalitesini artırır ancak derleme süresini artırır
-- `topK`: döndürülecek sonuç sayısı
+- `dimensions`: yazılan embedding genişliğiyle eşleşmelidir
+- `precision`: yaygın seçenekler `float64`, `float32`, `int8`; daha yüksek hassasiyet genellikle daha fazla depolama gerektirir
+- `distanceMetric`: indeks tarafı benzerlik ölçüsü; `cosine` anlamsal embedding için yaygındır, `l2` Öklid mesafesi, `innerProduct` nokta çarpımı araması içindir
 
-Sonuç notları:
+**Zincirli getirme parametreleri** (`matchVector` / `orMatchVector` ve sorgu zincirindeki `limit`):
 
-- `score`: normalleştirilmiş benzerlik puanı, genellikle `0 ~ 1` aralığında; daha büyük, daha benzer anlamına gelir
-- `distance`: mesafe değeri; `l2` ve `cosine` için daha küçük, genellikle daha benzer anlamına gelir
+- `field` / `vector`: hedef vektör alanı ve sorgu vektörü (`VectorData` / `List<num>` / `Float32List`)
+- `searchDepth`: optional thoroughness in `[1, 100]` (**not** a recall%); higher usually means better recall intent and higher latency, lower is faster but may miss neighbors; omit → engine default `80`
+- `weight`: çok yollu getirmede bu kanalın füzyon ağırlığı; varsayılan `1.0`
+- `minScore`: normalize benzerlik alt sınırı `[0.0 ~ 1.0]`; altındakiler elenir
+- `distanceThreshold`: mesafe üst sınırı; aşan adaylar dışlanır
+- `limit`: döndürülecek sonuç sayısı (tipik ANN kullanımında topK karşılığı)
+
+**Sonuç notları** (`QueryResult`):
+
+- İş satırları `data` içinde; getirme skorları ve kanal bilgisi `retrieval.entries` içinde, `data` ile **1:1** hizalı
+- `entry.score`: normalize benzerlik / füzyon skoru, tipik olarak `0 ~ 1`; büyük = daha ilgili
+- `entry.meta['distance']`: ham mesafe (vektör kanalında yaygındır); `l2` / `cosine` için küçük genellikle daha yakındır
+- `retrieval.fusionMethod`: tek kanalda genellikle `single`; çok yollu füzyon tipik olarak `rrf` (Reciprocal Rank Fusion)
 
 ### <a id="ttl-config"></a>Tablo düzeyinde TTL (Otomatik Zamana Dayalı Sona Erme)
 
@@ -1534,7 +1577,7 @@ if (result.hasErrors) {
 #### 2. Toplu Yazma Hassas Teşhis
 
 ```dart
-final batchResult = await db.insertAll('users', [
+final batchResult = await db.batchInsert('users', [
   {'username': 'alice', 'email': 'alice@example.com'},
   {'username': 'bob', 'email': 'invalid-email-format'}, // Validation fails
 ]);

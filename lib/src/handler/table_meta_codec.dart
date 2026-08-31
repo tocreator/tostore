@@ -90,11 +90,6 @@ abstract final class VectorFieldConfigFieldId {
 abstract final class VectorIndexConfigFieldId {
   static const int indexType = 1;
   static const int distanceMetric = 2;
-  static const int maxDegree = 3;
-  static const int efSearch = 4;
-  static const int constructionEf = 5;
-  static const int pruneAlpha = 6;
-  static const int pqSubspaces = 7;
 }
 
 abstract final class FieldStorageLayoutFieldId {
@@ -777,36 +772,11 @@ final class TableMetaCodec {
     w.writeVarint(c.indexType.index);
     w.writeFieldTag(VectorIndexConfigFieldId.distanceMetric, WireType.varint);
     w.writeVarint(c.distanceMetric.index);
-    if (c.maxDegree != null) {
-      w.writeFieldTag(VectorIndexConfigFieldId.maxDegree, WireType.varint);
-      w.writeVarint(c.maxDegree!);
-    }
-    if (c.efSearch != null) {
-      w.writeFieldTag(VectorIndexConfigFieldId.efSearch, WireType.varint);
-      w.writeVarint(c.efSearch!);
-    }
-    if (c.constructionEf != null) {
-      w.writeFieldTag(VectorIndexConfigFieldId.constructionEf, WireType.varint);
-      w.writeVarint(c.constructionEf!);
-    }
-    if (c.pruneAlpha != null) {
-      w.writeFieldTag(VectorIndexConfigFieldId.pruneAlpha, WireType.fixed64);
-      w.writeDouble(c.pruneAlpha!);
-    }
-    if (c.pqSubspaces != null) {
-      w.writeFieldTag(VectorIndexConfigFieldId.pqSubspaces, WireType.varint);
-      w.writeVarint(c.pqSubspaces!);
-    }
   }
 
   static VectorIndexConfig _readVectorIndexConfig(BinaryReader r) {
     VectorIndexType indexType = VectorIndexType.ngh;
     VectorDistanceMetric distanceMetric = VectorDistanceMetric.cosine;
-    int? maxDegree;
-    int? efSearch;
-    int? constructionEf;
-    double? pruneAlpha;
-    int? pqSubspaces;
     while (!r.isEOF) {
       final (fid, wireType) = r.readFieldTag();
       switch (fid) {
@@ -818,21 +788,6 @@ final class TableMetaCodec {
           distanceMetric = VectorDistanceMetric.values[
               r.readVarint().clamp(0, VectorDistanceMetric.values.length - 1)];
           break;
-        case VectorIndexConfigFieldId.maxDegree:
-          maxDegree = r.readVarint();
-          break;
-        case VectorIndexConfigFieldId.efSearch:
-          efSearch = r.readVarint();
-          break;
-        case VectorIndexConfigFieldId.constructionEf:
-          constructionEf = r.readVarint();
-          break;
-        case VectorIndexConfigFieldId.pruneAlpha:
-          pruneAlpha = r.readDouble();
-          break;
-        case VectorIndexConfigFieldId.pqSubspaces:
-          pqSubspaces = r.readVarint();
-          break;
         default:
           r.skipField(wireType);
       }
@@ -840,11 +795,6 @@ final class TableMetaCodec {
     return VectorIndexConfig(
       indexType: indexType,
       distanceMetric: distanceMetric,
-      maxDegree: maxDegree,
-      efSearch: efSearch,
-      constructionEf: constructionEf,
-      pruneAlpha: pruneAlpha,
-      pqSubspaces: pqSubspaces,
     );
   }
 

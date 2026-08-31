@@ -1,4 +1,5 @@
 import 'dart:collection';
+import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
@@ -9,6 +10,8 @@ import '../model/table_schema.dart';
 import 'ngh_page.dart';
 import 'ngh_partition_manager.dart';
 import 'vector_quantizer.dart';
+import 'vector_search_timing.dart';
+import 'yield_controller.dart';
 
 // ============================================================================
 // NGH Graph Engine -- Adaptive Inverted Navigating Graph Architecture
@@ -42,19 +45,23 @@ class NghSearchResult {
 class _SearchCandidate implements Comparable<_SearchCandidate> {
   final int nodeId;
   final double distance;
-  final String? primaryKey;
+  final Uint8List? primaryKeyBytes;
 
-  _SearchCandidate(this.nodeId, this.distance, [this.primaryKey]);
+  _SearchCandidate(this.nodeId, this.distance, [this.primaryKeyBytes]);
 
   @override
   int compareTo(_SearchCandidate other) => distance.compareTo(other.distance);
 }
 
-/// In-memory compact vector slot representation for DiskANN-style microsecond search.
+/// In-memory compact vector slot for hot ANN search.
+///
+/// Keeps SQ8 codes (1 byte/dim) so many clusters stay resident. Scoring uses
+/// SIMD kernels; math is identical to the scalar SQ8 path (recall unchanged).
 class _NghCompactSlot {
   final int nodeId;
   int flags; // 0x01: deleted
-  final String primaryKey;
+  /// UTF-8 primary key bytes (decoded only for top-K emit / delete).
+  final Uint8List primaryKeyBytes;
   final Uint8List sq8Codes;
   final double offset;
   final double scale;
@@ -65,7 +72,7 @@ class _NghCompactSlot {
   _NghCompactSlot({
     required this.nodeId,
     required this.flags,
-    required this.primaryKey,
+    required this.primaryKeyBytes,
     required this.sq8Codes,
     required this.offset,
     required this.scale,
@@ -79,35 +86,234 @@ class _NghCompactSlot {
 class NghGraphEngine {
   final NghPartitionManager _partitionManager;
 
+  /// Soft absolute nprobe ceiling when depth=100 on large corpora.
+  /// Depth 100 still means "as deep as the engine allows", not unbounded scan.
+  static const int _hardNprobeCap = 256;
+
+  /// Reference width for dimension-aware budget scaling (128-d → full hard cap).
+  static const int _nprobeScaleRefDims = 128;
+
+  /// Map user-facing [searchDepth] (1..100) to internal centroid probe count.
+  ///
+  /// Depth is relative thoroughness of the engine probe budget — **not** a
+  /// recall percentage. Depth 100 uses the full (latency-capped) budget;
+  /// default depth 80 is quality-first. The engine does not promise
+  /// recall% == depth.
+  int _resolveNprobe({
+    required int nCentroids,
+    required int dimensions,
+    required int totalVectors,
+    int? searchDepth,
+  }) {
+    final depth =
+        (searchDepth ?? VectorIndexConfig.defaultSearchDepth).clamp(1, 100);
+    final maxBudget = _maxNprobeBudget(
+      nCentroids: nCentroids,
+      dimensions: dimensions,
+      totalVectors: totalVectors,
+    );
+    // Linear map onto the engine budget: depth 1 → 1, depth 100 → maxBudget.
+    final nprobe = max(1, (maxBudget * depth + 99) ~/ 100);
+    return min(nCentroids, nprobe);
+  }
+
+  /// Engine-owned probe ceiling so depth=100 stays latency-bounded at scale.
+  int _maxNprobeBudget({
+    required int nCentroids,
+    required int dimensions,
+    required int totalVectors,
+  }) {
+    if (nCentroids <= 1) return 1;
+
+    // Dimension soft-cap: high-d scoring is more expensive per probe.
+    final dimCap = max(
+      12,
+      _hardNprobeCap * _nprobeScaleRefDims ~/ max(1, dimensions),
+    );
+
+    // Corpus soft-cap: keep large-scale queries from probing "everything".
+    // Small indexes may still probe all centroids at depth 100.
+    final int corpusCap;
+    if (totalVectors <= 50000) {
+      corpusCap = nCentroids;
+    } else if (totalVectors <= 500000) {
+      corpusCap = min(nCentroids, 128);
+    } else if (totalVectors <= 5000000) {
+      corpusCap = min(nCentroids, 96);
+    } else {
+      corpusCap = min(nCentroids, 64);
+    }
+
+    return min(nCentroids, min(_hardNprobeCap, min(dimCap, corpusCap)));
+  }
+
   /// In-memory cached navigating centroid graph per index.
   /// Key: tableUid/indexUid
   final Map<String, NghNavGraphPage> _navGraphCache = {};
 
-  /// In-memory compact vector cache partitioned by centroidId for sub-millisecond search.
+  /// In-memory compact vector cache partitioned by centroidId for hot search.
+  /// LinkedHashMap preserves insertion order for FIFO eviction under pressure.
   /// Key: tableUid/indexUid -> `Map<int centroidId, List<_NghCompactSlot>>`
-  final Map<String, Map<int, List<_NghCompactSlot>>> _inMemoryClusterCache = {};
+  final LinkedHashMap<String, Map<int, List<_NghCompactSlot>>>
+      _inMemoryClusterCache =
+      LinkedHashMap<String, Map<int, List<_NghCompactSlot>>>();
+
+  /// Estimated resident bytes of [_inMemoryClusterCache] (SQ8 + PK + overhead).
+  int _clusterCacheBytes = 0;
+
+  /// Soft ceiling for cluster compact cache; enforced after load/prewarm.
+  int _clusterCacheMaxBytes = 64 * 1024 * 1024;
+
+  /// Most-recently-used cluster-cache key (avoid O(n) LinkedHashMap.keys.last).
+  String? _clusterCacheMruKey;
 
   NghGraphEngine(this._partitionManager);
 
   int get _pageSize => _partitionManager.configuredPageSize;
 
+  /// Current estimated cluster-cache footprint in bytes.
+  int get clusterCacheBytes => _clusterCacheBytes;
+
+  /// Configure cluster-cache ceiling (typically a share of the index budget).
+  void configureClusterCacheBudget(int maxBytes) {
+    _clusterCacheMaxBytes = max(4 * 1024 * 1024, maxBytes);
+    _enforceClusterCacheBudget();
+  }
+
   String _cacheKey(TableUid tableUid, IndexUid indexUid) =>
       '${tableUid.value}/${indexUid.value}';
+
+  int _estimateSlotBytes(_NghCompactSlot slot) =>
+      24 + slot.primaryKeyBytes.length + slot.sq8Codes.length;
+
+  _NghCompactSlot _compactFromPostingSlot(NghPostingSlot slot, int pageNo) {
+    return _NghCompactSlot(
+      nodeId: slot.nodeId,
+      flags: slot.flags,
+      primaryKeyBytes: slot.primaryKeyBytes ?? slot.primaryKeyUtf8,
+      sq8Codes: slot.sq8Codes,
+      offset: slot.offset,
+      scale: slot.scale,
+      squaredNorm: slot.squaredNorm,
+      pageNo: pageNo,
+    );
+  }
+
+  int _estimateClusterMapBytes(Map<int, List<_NghCompactSlot>> clusterMap) {
+    var bytes = 64;
+    for (final slots in clusterMap.values) {
+      bytes += 16;
+      for (final slot in slots) {
+        bytes += _estimateSlotBytes(slot);
+      }
+    }
+    return bytes;
+  }
+
+  void _touchClusterCacheKey(String key) {
+    // Already MRU: skip LinkedHashMap remove/reinsert churn on every search.
+    if (_clusterCacheMruKey == key) return;
+    final map = _inMemoryClusterCache.remove(key);
+    if (map != null) {
+      _inMemoryClusterCache[key] = map;
+      _clusterCacheMruKey = key;
+    }
+  }
+
+  /// Evict oldest index cluster maps until under [targetBytes].
+  void _enforceClusterCacheBudget({String? protectKey, int? targetBytes}) {
+    final limit = targetBytes ?? _clusterCacheMaxBytes;
+    if (_clusterCacheBytes <= limit) return;
+
+    final keys = _inMemoryClusterCache.keys.toList(growable: false);
+    for (final key in keys) {
+      if (_clusterCacheBytes <= limit) break;
+      if (protectKey != null && key == protectKey) continue;
+      final removed = _inMemoryClusterCache.remove(key);
+      if (removed == null) continue;
+      if (_clusterCacheMruKey == key) _clusterCacheMruKey = null;
+      _clusterCacheBytes =
+          max(0, _clusterCacheBytes - _estimateClusterMapBytes(removed));
+    }
+
+    // Still over budget: evict protected key last (OOM safety > hot hit rate).
+    if (_clusterCacheBytes > limit &&
+        protectKey != null &&
+        _inMemoryClusterCache.containsKey(protectKey)) {
+      final removed = _inMemoryClusterCache.remove(protectKey);
+      if (removed != null) {
+        if (_clusterCacheMruKey == protectKey) _clusterCacheMruKey = null;
+        _clusterCacheBytes =
+            max(0, _clusterCacheBytes - _estimateClusterMapBytes(removed));
+      }
+    }
+  }
+
+  /// Evict a ratio of cluster compact caches (oldest indexes first).
+  void evictClusterCache({double ratio = 0.3}) {
+    if (_inMemoryClusterCache.isEmpty || ratio <= 0) return;
+    final target = max(
+      0,
+      (_clusterCacheBytes * (1.0 - ratio.clamp(0.0, 1.0))).floor(),
+    );
+    _enforceClusterCacheBudget(targetBytes: target);
+  }
 
   /// Clear cluster cache for a specific table.
   void clearCacheForTable(TableUid tableUid) {
     final prefix = '${tableUid.value}/';
-    _inMemoryClusterCache.removeWhere((k, _) => k.startsWith(prefix));
+    final toRemove = <String>[
+      for (final k in _inMemoryClusterCache.keys)
+        if (k.startsWith(prefix)) k,
+    ];
+    for (final k in toRemove) {
+      final removed = _inMemoryClusterCache.remove(k);
+      if (removed != null) {
+        if (_clusterCacheMruKey == k) _clusterCacheMruKey = null;
+        _clusterCacheBytes =
+            max(0, _clusterCacheBytes - _estimateClusterMapBytes(removed));
+      }
+    }
+    _navGraphCache.removeWhere((k, _) => k.startsWith(prefix));
   }
 
   /// Clear cluster cache for a specific index.
   void clearCacheForIndex(TableUid tableUid, IndexUid indexUid) {
-    _inMemoryClusterCache.remove(_cacheKey(tableUid, indexUid));
+    final key = _cacheKey(tableUid, indexUid);
+    final removed = _inMemoryClusterCache.remove(key);
+    if (removed != null) {
+      if (_clusterCacheMruKey == key) _clusterCacheMruKey = null;
+      _clusterCacheBytes =
+          max(0, _clusterCacheBytes - _estimateClusterMapBytes(removed));
+    }
+    _navGraphCache.remove(key);
   }
 
   /// Clear all cluster caches.
   void clearCache() {
     _inMemoryClusterCache.clear();
+    _navGraphCache.clear();
+    _clusterCacheBytes = 0;
+    _clusterCacheMruKey = null;
+  }
+
+  void _ingestLoadedPagesIntoClusterMap({
+    required Map<int, List<_NghCompactSlot>> clusterMap,
+    required List<({int packedRef, NghPostingPage page})> loaded,
+    required Set<int> expectedCentroidIds,
+  }) {
+    for (final item in loaded) {
+      final cList = clusterMap.putIfAbsent(item.page.centroidId, () => []);
+      for (final slot in item.page.slots) {
+        final compact = _compactFromPostingSlot(slot, item.packedRef);
+        cList.add(compact);
+        _clusterCacheBytes += _estimateSlotBytes(compact);
+      }
+    }
+    // Mark requested centroids present even if empty (avoid repeat I/O).
+    for (final cId in expectedCentroidIds) {
+      clusterMap.putIfAbsent(cId, () => <_NghCompactSlot>[]);
+    }
   }
 
   /// Ensure only the probed candidate clusters are loaded into memory cache.
@@ -118,59 +324,286 @@ class NghGraphEngine {
     required NghNavGraphPage navGraph,
     required List<int> probeCentroids,
     required Map<int, List<_NghCompactSlot>> clusterMap,
+    required String cacheKey,
   }) async {
     final packedRefsToRead = <int>[];
+    final chainHeads = <int>[];
+    final expected = <int>{};
 
     for (final cId in probeCentroids) {
-      if (!clusterMap.containsKey(cId)) {
-        if (cId >= 0 && cId < navGraph.centroids.length) {
-          final c = navGraph.centroids[cId];
-          if (c.postingPageNos.isNotEmpty) {
-            packedRefsToRead.addAll(c.postingPageNos);
-          } else if (c.headPostingPageNo > 0) {
-            packedRefsToRead.add(c.headPostingPageNo);
-          }
-        }
+      if (clusterMap.containsKey(cId)) continue;
+      if (cId < 0 || cId >= navGraph.centroids.length) continue;
+      expected.add(cId);
+      final c = navGraph.centroids[cId];
+      if (c.postingPageNos.isNotEmpty) {
+        packedRefsToRead.addAll(c.postingPageNos);
+      } else if (c.headPostingPageNo > 0) {
+        // Legacy / incomplete meta: follow the posting chain from head.
+        chainHeads.add(c.headPostingPageNo);
+      } else {
+        clusterMap[cId] = <_NghCompactSlot>[];
       }
     }
 
-    if (packedRefsToRead.isEmpty) return;
+    if (packedRefsToRead.isNotEmpty) {
+      final uniqueRefs = packedRefsToRead.toSet().toList(growable: false);
+      final loaded = await _partitionManager.readPostingPagesBatch(
+        table,
+        indexUid,
+        meta,
+        uniqueRefs,
+        populatePageCache: false,
+      );
+      _ingestLoadedPagesIntoClusterMap(
+        clusterMap: clusterMap,
+        loaded: loaded,
+        expectedCentroidIds: expected,
+      );
+    }
 
-    final loaded = await _partitionManager.readPostingPagesBatch(
-      table,
-      indexUid,
-      meta,
-      packedRefsToRead,
+    if (chainHeads.isNotEmpty) {
+      final chains = await _partitionManager.readPostingClustersBatch(
+        table,
+        indexUid,
+        meta,
+        chainHeads,
+      );
+      for (final chain in chains) {
+        _ingestLoadedPagesIntoClusterMap(
+          clusterMap: clusterMap,
+          loaded: chain,
+          expectedCentroidIds: expected,
+        );
+      }
+    }
+
+    _touchClusterCacheKey(cacheKey);
+    _enforceClusterCacheBudget(protectKey: cacheKey);
+  }
+
+  /// Startup/runtime prewarm: load posting clusters into compact cache.
+  ///
+  /// Stops once [maxBytes] would be exceeded (OOM guard). Hot clusters
+  /// (highest entryCount) are loaded first. Returns bytes added.
+  Future<int> prewarmClusters({
+    required TableContext table,
+    required IndexUid indexUid,
+    required NghIndexMeta meta,
+    required int maxBytes,
+  }) async {
+    if (maxBytes <= 0 || meta.totalVectors <= 0) return 0;
+
+    final key = _cacheKey(table.tableUid, indexUid);
+    final beforeBytes = _clusterCacheBytes;
+    final navGraph = await _getOrLoadNavGraph(table, indexUid, meta);
+    if (navGraph == null || navGraph.centroids.isEmpty) return 0;
+
+    final clusterMap = _inMemoryClusterCache.putIfAbsent(key, () => {});
+    final centroids = navGraph.centroids;
+    final order = List<int>.generate(centroids.length, (i) => i);
+
+    // When the whole compact index fits the budget, load every cluster so
+    // arbitrary query vectors never pay disk I/O on probed-centroid misses.
+    var totalEst = 64;
+    for (final c in centroids) {
+      totalEst += max(1, c.entryCount) * (24 + meta.dimensions);
+    }
+    final loadAll = totalEst <= maxBytes;
+    if (!loadAll) {
+      order.sort(
+          (a, b) => centroids[b].entryCount.compareTo(centroids[a].entryCount));
+    }
+
+    final packedBatch = <int>[];
+    final chainHeads = <int>[];
+    final expected = <int>{};
+    var planned = 0;
+
+    for (final cId in order) {
+      if (clusterMap.containsKey(cId)) continue;
+      final c = centroids[cId];
+      if (!loadAll) {
+        final est = max(1, c.entryCount) * (24 + meta.dimensions);
+        if (planned + est > maxBytes) break;
+        planned += est;
+      }
+
+      expected.add(cId);
+      if (c.postingPageNos.isNotEmpty) {
+        packedBatch.addAll(c.postingPageNos);
+      } else if (c.headPostingPageNo > 0) {
+        chainHeads.add(c.headPostingPageNo);
+      } else {
+        clusterMap[cId] = <_NghCompactSlot>[];
+      }
+    }
+
+    // Chunked batch reads so we can stop early if decode blew past budget.
+    const chunkSize = 64;
+    for (var i = 0; i < packedBatch.length; i += chunkSize) {
+      if (_clusterCacheBytes - beforeBytes >= maxBytes) break;
+      final chunk = packedBatch.sublist(
+        i,
+        min(i + chunkSize, packedBatch.length),
+      );
+      final loaded = await _partitionManager.readPostingPagesBatch(
+        table,
+        indexUid,
+        meta,
+        chunk,
+        populatePageCache: false,
+      );
+      _ingestLoadedPagesIntoClusterMap(
+        clusterMap: clusterMap,
+        loaded: loaded,
+        expectedCentroidIds: const {},
+      );
+    }
+
+    if (chainHeads.isNotEmpty && _clusterCacheBytes - beforeBytes < maxBytes) {
+      for (final head in chainHeads) {
+        if (_clusterCacheBytes - beforeBytes >= maxBytes) break;
+        final chain = await _partitionManager.readPostingCluster(
+          table,
+          indexUid,
+          meta,
+          head,
+        );
+        _ingestLoadedPagesIntoClusterMap(
+          clusterMap: clusterMap,
+          loaded: chain,
+          expectedCentroidIds: const {},
+        );
+      }
+    }
+
+    for (final cId in expected) {
+      clusterMap.putIfAbsent(cId, () => <_NghCompactSlot>[]);
+    }
+
+    _touchClusterCacheKey(key);
+    // Cap this index's contribution; do not evict the index we just warmed.
+    if (_clusterCacheBytes > _clusterCacheMaxBytes) {
+      _enforceClusterCacheBudget(protectKey: key);
+    }
+    return max(0, _clusterCacheBytes - beforeBytes);
+  }
+
+  /// Compile hot ANN loops and populate routing/cluster caches after prewarm.
+  Future<void> warmSearchPath({
+    required TableContext table,
+    required IndexUid indexUid,
+    required NghIndexMeta meta,
+  }) async {
+    if (meta.totalVectors <= 0 || meta.dimensions <= 0) return;
+    final dims = meta.dimensions;
+    final q = Float32List(dims);
+    final inv = 1.0 / sqrt(dims);
+    for (var i = 0; i < dims; i++) {
+      q[i] = inv;
+    }
+    await search(
+      table: table,
+      indexUid: indexUid,
+      meta: meta,
+      quantizer: VectorQuantizer.empty(),
+      query: q,
+      topK: 10,
+      queryAlreadyNormalized:
+          meta.distanceMetric == VectorDistanceMetric.cosine,
     );
-
-    for (final item in loaded) {
-      final cList = clusterMap.putIfAbsent(item.page.centroidId, () => []);
-      for (final slot in item.page.slots) {
-        cList.add(_NghCompactSlot(
-          nodeId: slot.nodeId,
-          flags: slot.flags,
-          primaryKey: slot.primaryKey.toString(),
-          sq8Codes: slot.sq8Codes,
-          offset: slot.offset,
-          scale: slot.scale,
-          squaredNorm: slot.squaredNorm,
-          pageNo: item.packedRef,
-        ));
-      }
-    }
   }
 
   // =====================================================================
   // Search -- DiskANN Architecture (In-Memory Centroid-Routed SQ8 Filter + Precise Disk Fetch)
   // =====================================================================
 
+  /// Select top-[nprobe] centroid ids by exact distance (partial selection).
+  ///
+  /// Exact routing is required for recall: hierarchical/neighbor beams can miss
+  /// the true home cluster (especially under multi-assignment), which showed up
+  /// as Exact Identity Hit regressing below 90%.
+  List<int> _selectProbeCentroids({
+    required Float32List searchQuery,
+    required NghNavGraphPage navGraph,
+    required VectorDistanceMetric metric,
+    required int nprobe,
+  }) {
+    final centroids = navGraph.centroids;
+    final nCentroids = centroids.length;
+    if (nprobe >= nCentroids) {
+      return List<int>.generate(nCentroids, (i) => i, growable: false);
+    }
+
+    // Max-heap of size nprobe (worst of the best). Same recall as full sort.
+    final ids = Int32List(nprobe);
+    final dists = Float64List(nprobe);
+    var size = 0;
+
+    void siftUp(int idx) {
+      var child = idx;
+      while (child > 0) {
+        final parent = (child - 1) >> 1;
+        if (dists[child] <= dists[parent]) break;
+        final td = dists[child];
+        dists[child] = dists[parent];
+        dists[parent] = td;
+        final ti = ids[child];
+        ids[child] = ids[parent];
+        ids[parent] = ti;
+        child = parent;
+      }
+    }
+
+    void siftDown(int idx) {
+      var parent = idx;
+      while (true) {
+        var best = parent;
+        final left = (parent << 1) + 1;
+        final right = left + 1;
+        if (left < size && dists[left] > dists[best]) best = left;
+        if (right < size && dists[right] > dists[best]) best = right;
+        if (best == parent) break;
+        final td = dists[parent];
+        dists[parent] = dists[best];
+        dists[best] = td;
+        final ti = ids[parent];
+        ids[parent] = ids[best];
+        ids[best] = ti;
+        parent = best;
+      }
+    }
+
+    for (int i = 0; i < nCentroids; i++) {
+      final d = _exactDistance(searchQuery, centroids[i].vector, metric);
+      if (size < nprobe) {
+        ids[size] = i;
+        dists[size] = d;
+        siftUp(size);
+        size++;
+      } else if (d < dists[0]) {
+        ids[0] = i;
+        dists[0] = d;
+        siftDown(0);
+      }
+    }
+
+    final pairs = List<(int, double)>.generate(
+      size,
+      (i) => (ids[i], dists[i]),
+      growable: false,
+    );
+    pairs.sort((a, b) => a.$2.compareTo(b.$2));
+    return [for (final p in pairs) p.$1];
+  }
+
   /// Perform ANN search on the NGH index.
   ///
   /// Steps:
-  ///   1. Sub-millisecond centroid routing on in-memory navigating graph (0.02ms)
-  ///   2. On-demand load only probed clusters (cold: 10~20ms, hot: 0ms, 0 I/O)
-  ///   3. Pure synchronous SIMD/unrolled SQ8 distance calculation in memory across probed clusters (1.0ms)
-  ///   4. Global Top-K extraction via min-max heap
+  ///   1. Exact centroid routing on in-memory navigating graph
+  ///   2. On-demand load only probed clusters (prewarmed: 0 I/O)
+  ///   3. SQ8 distance scoring across all slots in probed clusters
+  ///   4. Global Top-K extraction via fixed heap
   Future<List<NghSearchResult>> search({
     required TableContext table,
     required IndexUid indexUid,
@@ -178,126 +611,408 @@ class NghGraphEngine {
     required VectorQuantizer quantizer,
     required Float32List query,
     required int topK,
-    int? efSearch,
+    int? searchDepth,
     double? distanceThreshold,
+    bool queryAlreadyNormalized = false,
+    VectorSearchPhaseRecorder? timing,
   }) async {
     if (meta.totalVectors == 0) return const [];
 
     final key = _cacheKey(table.tableUid, indexUid);
     final clusterMap = _inMemoryClusterCache.putIfAbsent(key, () => {});
 
-    final navGraph = await _getOrLoadNavGraph(table, indexUid, meta);
+    // Prefer sync nav hit to avoid await microtask on hot path.
+    NghNavGraphPage? navGraph = _navGraphCache[key];
+    navGraph ??= timing != null
+        ? await timing.phaseAsync(
+            'ann.navGraphLoad',
+            () => _getOrLoadNavGraph(table, indexUid, meta),
+          )
+        : await _getOrLoadNavGraph(table, indexUid, meta);
     if (navGraph == null || navGraph.centroids.isEmpty) {
       return const [];
     }
 
-    // Normalise query vector if metric is cosine
+    // Normalise once unless caller already did (vectorSearch path).
     Float32List searchQuery = query;
-    if (meta.distanceMetric == VectorDistanceMetric.cosine) {
-      searchQuery = _normalizeFloat32(query);
+    if (meta.distanceMetric == VectorDistanceMetric.cosine &&
+        !queryAlreadyNormalized) {
+      searchQuery = timing != null
+          ? timing.phase('ann.normalize', () => _normalizeFloat32(query))
+          : _normalizeFloat32(query);
     }
 
-    // Pre-calculate query properties for SQ8 fast distance kernel
-    double querySum = 0;
-    double querySqNorm = 0;
-    final qLen = searchQuery.length;
-    for (int d = 0; d < qLen; d++) {
-      final qVal = searchQuery[d];
-      querySum += qVal;
-      querySqNorm += qVal * qVal;
+    // Pre-calculate query properties for SQ8 kernels.
+    late final double querySum;
+    late final double querySqNorm;
+    if (timing != null) {
+      timing.phase('ann.queryPrep', () {
+        final prep = _prepQueryStats(searchQuery);
+        querySum = prep.$1;
+        querySqNorm = prep.$2;
+      });
+    } else {
+      final prep = _prepQueryStats(searchQuery);
+      querySum = prep.$1;
+      querySqNorm = prep.$2;
     }
 
-    // Step 1: Sub-millisecond centroid routing on in-memory centroids (< 0.05ms)
+    // nprobe is independent of result topK.
     final nCentroids = navGraph.centroids.length;
-    final int defaultProbes =
-        max(16, min(nCentroids, max(topK * 2, (nCentroids * 0.15).ceil())));
-    final int maxCentroidsBudget = min(nCentroids, efSearch ?? defaultProbes);
-
-    final initialProbes = <(int, double)>[];
-    for (int i = 0; i < nCentroids; i++) {
-      final d = _exactDistance(
-          searchQuery, navGraph.centroids[i].vector, meta.distanceMetric);
-      initialProbes.add((i, d));
-    }
-    initialProbes.sort((a, b) => a.$2.compareTo(b.$2));
-
-    final probeCentroids = <int>[];
-    for (int i = 0; i < min(maxCentroidsBudget, initialProbes.length); i++) {
-      probeCentroids.add(initialProbes[i].$1);
-    }
-
-    // Step 2: On-demand load only probed clusters (cold: 10~20ms, hot: 0ms)
-    await _ensureProbedClustersLoaded(
-      table: table,
-      indexUid: indexUid,
-      meta: meta,
-      navGraph: navGraph,
-      probeCentroids: probeCentroids,
-      clusterMap: clusterMap,
+    final int nprobe = _resolveNprobe(
+      nCentroids: nCentroids,
+      dimensions: meta.dimensions,
+      totalVectors: meta.totalVectors,
+      searchDepth: searchDepth,
     );
 
-    // Step 3: Pure synchronous distance scoring ONLY on candidate compact slots in probed clusters (1ms)
-    final _FixedHeap resultHeap = _FixedHeap(topK, maxHeap: true);
+    final probeCentroids = timing != null
+        ? timing.phase(
+            'ann.centroidProbe',
+            () => _selectProbeCentroids(
+              searchQuery: searchQuery,
+              navGraph: navGraph!,
+              metric: meta.distanceMetric,
+              nprobe: nprobe,
+            ),
+          )
+        : _selectProbeCentroids(
+            searchQuery: searchQuery,
+            navGraph: navGraph,
+            metric: meta.distanceMetric,
+            nprobe: nprobe,
+          );
+
+    // Step 2: Load only missing probed clusters (skip await when fully warm).
+    var needsLoad = false;
+    for (final cId in probeCentroids) {
+      if (!clusterMap.containsKey(cId)) {
+        needsLoad = true;
+        break;
+      }
+    }
+    if (needsLoad) {
+      if (timing != null) {
+        await timing.phaseAsync(
+          'ann.clusterLoad',
+          () => _ensureProbedClustersLoaded(
+            table: table,
+            indexUid: indexUid,
+            meta: meta,
+            navGraph: navGraph!,
+            probeCentroids: probeCentroids,
+            clusterMap: clusterMap,
+            cacheKey: key,
+          ),
+        );
+      } else {
+        await _ensureProbedClustersLoaded(
+          table: table,
+          indexUid: indexUid,
+          meta: meta,
+          navGraph: navGraph,
+          probeCentroids: probeCentroids,
+          clusterMap: clusterMap,
+          cacheKey: key,
+        );
+      }
+    } else {
+      if (timing != null) {
+        timing.phase('ann.clusterHit', () => _touchClusterCacheKey(key));
+      } else {
+        _touchClusterCacheKey(key);
+      }
+    }
+
+    var slotEstimate = 0;
+    for (final cId in probeCentroids) {
+      slotEstimate += clusterMap[cId]?.length ?? 0;
+    }
+    if (timing != null && VectorSearchPhaseRecorder.traceEnabled) {
+      timing
+        ..setDiagnostic('nprobe', nprobe)
+        ..setDiagnostic(
+            'searchDepth', searchDepth ?? VectorIndexConfig.defaultSearchDepth)
+        ..setDiagnostic('candidates', slotEstimate)
+        ..setDiagnostic('clusterMiss', needsLoad);
+    }
+
+    // Step 3: Score probed clusters.
+    final resultHeap = _FixedHeap(max(1, topK), maxHeap: true);
     final isCosine = meta.distanceMetric == VectorDistanceMetric.cosine;
     final isIP = meta.distanceMetric == VectorDistanceMetric.innerProduct;
 
-    for (final cId in probeCentroids) {
-      final slots = clusterMap[cId];
-      if (slots == null || slots.isEmpty) continue;
+    final shouldYield = topK > 128 || slotEstimate > 24000;
 
-      final sCount = slots.length;
-      for (int i = 0; i < sCount; i++) {
-        final slot = slots[i];
-        if (slot.flags & 0x01 != 0) continue; // marked deleted
-
-        double dist;
-        if (isCosine) {
-          dist = ScalarQuantizer.fastCosineDistance(
-            searchQuery,
-            querySum,
-            slot.sq8Codes,
-            slot.offset,
-            slot.scale,
-            slot.invNorm,
+    void runScoreSync() {
+      if (isCosine) {
+        // High-dim + large candidate pool: coarse strided pass then full rescore.
+        final useTwoPass = meta.dimensions >= 256 &&
+            slotEstimate > 2000 &&
+            topK <= 64 &&
+            distanceThreshold == null;
+        if (useTwoPass) {
+          _scoreCosineTwoPass(
+            probeCentroids: probeCentroids,
+            clusterMap: clusterMap,
+            searchQuery: searchQuery,
+            querySum: querySum,
+            topK: topK,
+            resultHeap: resultHeap,
+            timing: timing,
           );
-        } else if (isIP) {
-          dist = ScalarQuantizer.fastDotProduct(
-            searchQuery,
-            querySum,
-            slot.sq8Codes,
-            slot.offset,
-            slot.scale,
-          );
-        } else {
-          dist = ScalarQuantizer.fastSquaredL2Distance(
-            searchQuery,
-            querySqNorm,
-            querySum,
-            slot.sq8Codes,
-            slot.offset,
-            slot.scale,
-            slot.squaredNorm,
-          );
+          return;
         }
-
-        if (distanceThreshold != null && dist > distanceThreshold) continue;
-
-        if (!resultHeap.isFull || dist < resultHeap.peekDist) {
-          resultHeap.pushWithPk(slot.nodeId, dist, slot.primaryKey);
+        for (final cId in probeCentroids) {
+          final slots = clusterMap[cId];
+          if (slots == null || slots.isEmpty) continue;
+          final sCount = slots.length;
+          for (int i = 0; i < sCount; i++) {
+            final slot = slots[i];
+            if (slot.flags & 0x01 != 0) continue;
+            final dist = ScalarQuantizer.fastCosineDistance(
+              searchQuery,
+              querySum,
+              slot.sq8Codes,
+              slot.offset,
+              slot.scale,
+              slot.invNorm,
+            );
+            if (distanceThreshold != null && dist > distanceThreshold) continue;
+            if (!resultHeap.isFull || dist < resultHeap.peekDist) {
+              resultHeap.pushWithPk(slot.nodeId, dist, slot.primaryKeyBytes);
+            }
+          }
+        }
+      } else {
+        for (final cId in probeCentroids) {
+          final slots = clusterMap[cId];
+          if (slots == null || slots.isEmpty) continue;
+          final sCount = slots.length;
+          for (int i = 0; i < sCount; i++) {
+            _scoreSlotIntoHeap(
+              slots[i],
+              searchQuery: searchQuery,
+              querySum: querySum,
+              querySqNorm: querySqNorm,
+              isCosine: isCosine,
+              isIP: isIP,
+              distanceThreshold: distanceThreshold,
+              resultHeap: resultHeap,
+            );
+          }
         }
       }
     }
 
-    // Step 4: Extract top-K results (100% in-memory direct hit, 0 secondary I/O)
+    if (shouldYield) {
+      final yc = YieldController(
+        'NghGraphEngine.search.score',
+        checkInterval: 1024,
+        budgetMs: 12,
+        minCheckInterval: 256,
+      );
+      final scoreSw = timing != null ? (Stopwatch()..start()) : null;
+      for (final cId in probeCentroids) {
+        final slots = clusterMap[cId];
+        if (slots == null || slots.isEmpty) continue;
+        final sCount = slots.length;
+        for (int i = 0; i < sCount; i++) {
+          final y = yc.maybeYield();
+          if (y != null) await y;
+          _scoreSlotIntoHeap(
+            slots[i],
+            searchQuery: searchQuery,
+            querySum: querySum,
+            querySqNorm: querySqNorm,
+            isCosine: isCosine,
+            isIP: isIP,
+            distanceThreshold: distanceThreshold,
+            resultHeap: resultHeap,
+          );
+        }
+      }
+      scoreSw?.stop();
+      timing?.addMicros('ann.score', scoreSw?.elapsedMicroseconds ?? 0);
+    } else if (timing != null) {
+      timing.phase('ann.score', runScoreSync);
+    } else {
+      runScoreSync();
+    }
+
+    // Step 4: Decode PK only for top-K winners.
+    if (timing != null) {
+      return timing.phase('ann.topKDecode', () {
+        final rawResults = resultHeap.drainSortedWithPk();
+        return [
+          for (final r in rawResults)
+            NghSearchResult(
+              nodeId: r.nodeId,
+              distance: r.distance,
+              primaryKey: r.primaryKeyBytes != null
+                  ? utf8.decode(r.primaryKeyBytes!)
+                  : null,
+            )
+        ];
+      });
+    }
     final rawResults = resultHeap.drainSortedWithPk();
     return [
       for (final r in rawResults)
         NghSearchResult(
           nodeId: r.nodeId,
           distance: r.distance,
-          primaryKey: r.primaryKey,
+          primaryKey: r.primaryKeyBytes != null
+              ? utf8.decode(r.primaryKeyBytes!)
+              : null,
         )
     ];
+  }
+
+  (double, double) _prepQueryStats(Float32List searchQuery) {
+    double querySum = 0;
+    double querySqNorm = 0;
+    final qLen = searchQuery.length;
+    final qN = qLen >> 2;
+    if (qN > 0 && (searchQuery.offsetInBytes & 15) == 0) {
+      final qv =
+          Float32x4List.view(searchQuery.buffer, searchQuery.offsetInBytes, qN);
+      var sumAcc = Float32x4.zero();
+      var sqAcc = Float32x4.zero();
+      for (var i = 0; i < qN; i++) {
+        final v = qv[i];
+        sumAcc += v;
+        sqAcc += v * v;
+      }
+      querySum = sumAcc.x + sumAcc.y + sumAcc.z + sumAcc.w;
+      querySqNorm = sqAcc.x + sqAcc.y + sqAcc.z + sqAcc.w;
+      for (var i = qN << 2; i < qLen; i++) {
+        final qVal = searchQuery[i];
+        querySum += qVal;
+        querySqNorm += qVal * qVal;
+      }
+    } else {
+      for (int d = 0; d < qLen; d++) {
+        final qVal = searchQuery[d];
+        querySum += qVal;
+        querySqNorm += qVal * qVal;
+      }
+    }
+    return (querySum, querySqNorm);
+  }
+
+  /// Coarse strided filter + full SQ8 rescore for high-dim ANN.
+  ///
+  /// Pass 1 scores every 4th dim (~4× cheaper) into a keep-heap of size
+  /// `max(topK*16, 512)`. Pass 2 fully scores only survivors into [resultHeap].
+  void _scoreCosineTwoPass({
+    required List<int> probeCentroids,
+    required Map<int, List<_NghCompactSlot>> clusterMap,
+    required Float32List searchQuery,
+    required double querySum,
+    required int topK,
+    required _FixedHeap resultHeap,
+    VectorSearchPhaseRecorder? timing,
+  }) {
+    final keep = max(topK * 16, 512);
+    final coarse = _SlotHeap(keep);
+    const stride = 4;
+
+    final coarseSw = Stopwatch()..start();
+    for (final cId in probeCentroids) {
+      final slots = clusterMap[cId];
+      if (slots == null || slots.isEmpty) continue;
+      final sCount = slots.length;
+      for (int i = 0; i < sCount; i++) {
+        final slot = slots[i];
+        if (slot.flags & 0x01 != 0) continue;
+        final dist = ScalarQuantizer.fastCosineDistanceStrided(
+          searchQuery,
+          querySum,
+          slot.sq8Codes,
+          slot.offset,
+          slot.scale,
+          slot.invNorm,
+          stride: stride,
+        );
+        coarse.offer(slot, dist);
+      }
+    }
+    coarseSw.stop();
+
+    final fineSw = Stopwatch()..start();
+    final survivors = coarse.slotsInHeap();
+    for (final slot in survivors) {
+      final dist = ScalarQuantizer.fastCosineDistance(
+        searchQuery,
+        querySum,
+        slot.sq8Codes,
+        slot.offset,
+        slot.scale,
+        slot.invNorm,
+      );
+      if (!resultHeap.isFull || dist < resultHeap.peekDist) {
+        resultHeap.pushWithPk(slot.nodeId, dist, slot.primaryKeyBytes);
+      }
+    }
+    fineSw.stop();
+
+    if (timing != null) {
+      timing
+        ..setDiagnostic('scoreCoarseMs', coarseSw.elapsedMicroseconds / 1000.0)
+        ..setDiagnostic('scoreFineMs', fineSw.elapsedMicroseconds / 1000.0)
+        ..setDiagnostic('twoPassKeep', survivors.length);
+    }
+  }
+
+  /// Score one compact slot into the result heap (hot path, no allocations).
+  void _scoreSlotIntoHeap(
+    _NghCompactSlot slot, {
+    required Float32List searchQuery,
+    required double querySum,
+    required double querySqNorm,
+    required bool isCosine,
+    required bool isIP,
+    required double? distanceThreshold,
+    required _FixedHeap resultHeap,
+  }) {
+    if (slot.flags & 0x01 != 0) return; // marked deleted
+
+    late final double dist;
+    if (isCosine) {
+      dist = ScalarQuantizer.fastCosineDistance(
+        searchQuery,
+        querySum,
+        slot.sq8Codes,
+        slot.offset,
+        slot.scale,
+        slot.invNorm,
+      );
+    } else if (isIP) {
+      dist = ScalarQuantizer.fastDotProduct(
+        searchQuery,
+        querySum,
+        slot.sq8Codes,
+        slot.offset,
+        slot.scale,
+      );
+    } else {
+      dist = ScalarQuantizer.fastSquaredL2Distance(
+        searchQuery,
+        querySqNorm,
+        querySum,
+        slot.sq8Codes,
+        slot.offset,
+        slot.scale,
+        slot.squaredNorm,
+      );
+    }
+
+    if (distanceThreshold != null && dist > distanceThreshold) return;
+
+    if (!resultHeap.isFull || dist < resultHeap.peekDist) {
+      resultHeap.pushWithPk(slot.nodeId, dist, slot.primaryKeyBytes);
+    }
   }
 
   // =====================================================================
@@ -664,20 +1379,19 @@ class NghGraphEngine {
     for (final entry in clusterSlots.entries) {
       final cId = entry.key;
       final packedRef = centroids[cId].tailPostingPageNo;
-      final cList = inMemoryClusterMap.putIfAbsent(cId, () => []);
+      final cList =
+          inMemoryClusterMap.putIfAbsent(cId, () => <_NghCompactSlot>[]);
       for (final slot in entry.value) {
-        cList.add(_NghCompactSlot(
-          nodeId: slot.nodeId,
-          flags: slot.flags,
-          primaryKey: slot.primaryKey.toString(),
-          sq8Codes: slot.sq8Codes,
-          offset: slot.offset,
-          scale: slot.scale,
-          squaredNorm: slot.squaredNorm,
-          pageNo: packedRef > 0 ? packedRef : 1,
-        ));
+        final compact = _compactFromPostingSlot(
+          slot,
+          packedRef > 0 ? packedRef : 1,
+        );
+        cList.add(compact);
+        _clusterCacheBytes += _estimateSlotBytes(compact);
       }
     }
+    _touchClusterCacheKey(cacheKey);
+    _enforceClusterCacheBudget(protectKey: cacheKey);
 
     return NghInsertResult(
       meta: currentMeta.copyWith(centroidCount: centroids.length),
@@ -746,7 +1460,7 @@ class NghGraphEngine {
     if (inMemoryClusterMap != null) {
       for (final slots in inMemoryClusterMap.values) {
         for (final slot in slots) {
-          if (targetSet.contains(slot.primaryKey)) {
+          if (targetSet.contains(utf8.decode(slot.primaryKeyBytes))) {
             slot.flags |= 0x01;
           }
         }
@@ -929,17 +1643,46 @@ class NghGraphEngine {
   }
 
   double _l2Distance(Float32List a, Float32List b) {
-    double sum = 0;
+    // Prefer true SIMD loads via Float32x4List.view when buffers are aligned.
     final len = a.length;
-    int i = 0;
-    final unroll = len - 3;
+    final n = len >> 2;
+    if (n > 0 && (a.offsetInBytes & 15) == 0 && (b.offsetInBytes & 15) == 0) {
+      final av = Float32x4List.view(a.buffer, a.offsetInBytes, n);
+      final bv = Float32x4List.view(b.buffer, b.offsetInBytes, n);
+      var acc = Float32x4.zero();
+      for (var i = 0; i < n; i++) {
+        final d = av[i] - bv[i];
+        acc += d * d;
+      }
+      double sum = acc.x + acc.y + acc.z + acc.w;
+      for (var i = n << 2; i < len; i++) {
+        final diff = a[i] - b[i];
+        sum += diff * diff;
+      }
+      return sum;
+    }
+
+    double sum = 0;
+    var i = 0;
+    final unroll = len - 7;
     while (i < unroll) {
       final d0 = a[i] - b[i];
       final d1 = a[i + 1] - b[i + 1];
       final d2 = a[i + 2] - b[i + 2];
       final d3 = a[i + 3] - b[i + 3];
-      sum += d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
-      i += 4;
+      final d4 = a[i + 4] - b[i + 4];
+      final d5 = a[i + 5] - b[i + 5];
+      final d6 = a[i + 6] - b[i + 6];
+      final d7 = a[i + 7] - b[i + 7];
+      sum += d0 * d0 +
+          d1 * d1 +
+          d2 * d2 +
+          d3 * d3 +
+          d4 * d4 +
+          d5 * d5 +
+          d6 * d6 +
+          d7 * d7;
+      i += 8;
     }
     while (i < len) {
       final diff = a[i] - b[i];
@@ -950,34 +1693,46 @@ class NghGraphEngine {
   }
 
   double _innerProduct(Float32List a, Float32List b) {
-    double sum = 0;
-    final len = a.length;
-    int i = 0;
-    final unroll = len - 3;
-    while (i < unroll) {
-      sum += a[i] * b[i] +
-          a[i + 1] * b[i + 1] +
-          a[i + 2] * b[i + 2] +
-          a[i + 3] * b[i + 3];
-      i += 4;
-    }
-    while (i < len) {
-      sum += a[i] * b[i];
-      i++;
-    }
-    return sum;
+    return ScalarQuantizer.dotProductF32(a, b);
   }
 
   Float32List _normalizeFloat32(Float32List v) {
+    final len = v.length;
     double norm = 0;
-    for (int i = 0; i < v.length; i++) {
-      norm += v[i] * v[i];
+    final n = len >> 2;
+    if (n > 0 && (v.offsetInBytes & 15) == 0) {
+      final vv = Float32x4List.view(v.buffer, v.offsetInBytes, n);
+      var acc = Float32x4.zero();
+      for (var i = 0; i < n; i++) {
+        final x = vv[i];
+        acc += x * x;
+      }
+      norm = acc.x + acc.y + acc.z + acc.w;
+      for (var i = n << 2; i < len; i++) {
+        norm += v[i] * v[i];
+      }
+    } else {
+      for (int i = 0; i < len; i++) {
+        norm += v[i] * v[i];
+      }
     }
     if (norm == 0) return v;
     final inv = 1.0 / sqrt(norm);
-    final out = Float32List(v.length);
-    for (int i = 0; i < v.length; i++) {
-      out[i] = v[i] * inv;
+    final out = Float32List(len);
+    if (n > 0 && (v.offsetInBytes & 15) == 0) {
+      final vv = Float32x4List.view(v.buffer, v.offsetInBytes, n);
+      final ov = Float32x4List.view(out.buffer, out.offsetInBytes, n);
+      final scale = Float32x4.splat(inv);
+      for (var i = 0; i < n; i++) {
+        ov[i] = vv[i] * scale;
+      }
+      for (var i = n << 2; i < len; i++) {
+        out[i] = v[i] * inv;
+      }
+    } else {
+      for (int i = 0; i < len; i++) {
+        out[i] = v[i] * inv;
+      }
     }
     return out;
   }
@@ -1162,19 +1917,88 @@ class NghCompactResult {
 // Fixed-Size Binary Heap -- Zero-GC Search Primitive
 // ============================================================================
 
+/// Max-heap of slots by distance for coarse ANN prefilter.
+class _SlotHeap {
+  final int capacity;
+  late final List<_NghCompactSlot?> _slots;
+  late final Float64List _dists;
+  int _size = 0;
+
+  _SlotHeap(this.capacity) {
+    _slots = List<_NghCompactSlot?>.filled(capacity, null);
+    _dists = Float64List(capacity);
+  }
+
+  void offer(_NghCompactSlot slot, double dist) {
+    if (_size < capacity) {
+      final i = _size;
+      _slots[i] = slot;
+      _dists[i] = dist;
+      _size = i + 1;
+      _siftUp(i);
+    } else if (dist < _dists[0]) {
+      _slots[0] = slot;
+      _dists[0] = dist;
+      _siftDown(0);
+    }
+  }
+
+  List<_NghCompactSlot> slotsInHeap() {
+    final out = <_NghCompactSlot>[];
+    for (var i = 0; i < _size; i++) {
+      final s = _slots[i];
+      if (s != null) out.add(s);
+    }
+    return out;
+  }
+
+  void _siftUp(int idx) {
+    var child = idx;
+    while (child > 0) {
+      final parent = (child - 1) >> 1;
+      if (_dists[child] <= _dists[parent]) break;
+      _swap(child, parent);
+      child = parent;
+    }
+  }
+
+  void _siftDown(int idx) {
+    var parent = idx;
+    while (true) {
+      var best = parent;
+      final left = (parent << 1) + 1;
+      final right = left + 1;
+      if (left < _size && _dists[left] > _dists[best]) best = left;
+      if (right < _size && _dists[right] > _dists[best]) best = right;
+      if (best == parent) break;
+      _swap(parent, best);
+      parent = best;
+    }
+  }
+
+  void _swap(int a, int b) {
+    final ts = _slots[a];
+    final td = _dists[a];
+    _slots[a] = _slots[b];
+    _dists[a] = _dists[b];
+    _slots[b] = ts;
+    _dists[b] = td;
+  }
+}
+
 class _FixedHeap {
   final int capacity;
   final bool maxHeap;
 
   late final Int32List _ids;
   late final Float64List _dists;
-  late final List<String?> _pks;
+  late final List<Uint8List?> _pks;
   int _size = 0;
 
   _FixedHeap(this.capacity, {this.maxHeap = false}) {
     _ids = Int32List(capacity);
     _dists = Float64List(capacity);
-    _pks = List<String?>.filled(capacity, null);
+    _pks = List<Uint8List?>.filled(capacity, null);
   }
 
   bool get isEmpty => _size == 0;
@@ -1183,24 +2007,25 @@ class _FixedHeap {
   int get length => _size;
   double get peekDist => _size > 0 ? _dists[0] : double.infinity;
 
-  void pushWithPk(int id, double dist, String? pk) {
+  void pushWithPk(int id, double dist, Uint8List? pkBytes) {
     if (_size < capacity) {
-      _ids[_size] = id;
-      _dists[_size] = dist;
-      _pks[_size] = pk;
-      _siftUp(_size);
-      _size++;
-    } else {
-      if ((maxHeap && dist < _dists[0]) || (!maxHeap && dist > _dists[0])) {
-        _ids[0] = id;
-        _dists[0] = dist;
-        _pks[0] = pk;
-        _siftDown(0);
-      }
+      final i = _size;
+      _ids[i] = id;
+      _dists[i] = dist;
+      _pks[i] = pkBytes;
+      _size = i + 1;
+      _siftUp(i);
+    } else if ((maxHeap && dist < _dists[0]) ||
+        (!maxHeap && dist > _dists[0])) {
+      _ids[0] = id;
+      _dists[0] = dist;
+      _pks[0] = pkBytes;
+      _siftDown(0);
     }
   }
 
   List<_SearchCandidate> drainSortedWithPk() {
+    if (_size == 0) return const [];
     final result = <_SearchCandidate>[];
     while (_size > 0) {
       final id = _ids[0];
@@ -1216,7 +2041,12 @@ class _FixedHeap {
       result.add(_SearchCandidate(id, dist, pk));
     }
     if (maxHeap) {
-      return result.reversed.toList();
+      // In-place reverse (worst-first → best-first); avoids second list alloc.
+      for (var i = 0, j = result.length - 1; i < j; i++, j--) {
+        final tmp = result[i];
+        result[i] = result[j];
+        result[j] = tmp;
+      }
     }
     return result;
   }

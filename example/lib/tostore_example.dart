@@ -5,6 +5,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:tostore/tostore.dart';
 
+import 'testing/example_schemas.dart';
 import 'testing/log_service.dart';
 
 String _statusErrorMessage(
@@ -55,197 +56,51 @@ class ToStoreExample {
           encryptionType: EncryptionType.none,
         ),
       ),
-      schemas: [
-        // suitable for table structure definition in frequent startup scenarios of mobile applications, accurately identifying table structure changes, automatically upgrading and migrating data
-        const TableSchema(
-          name: 'users',
-          primaryKeyConfig:
-              PrimaryKeyConfig(name: 'id', type: PrimaryKeyType.sequential),
-          fields: [
-            FieldSchema(name: 'username', type: DataType.text, nullable: false),
-            FieldSchema(name: 'email', type: DataType.text, nullable: false),
-            FieldSchema(
-                name: 'last_login',
-                type: DataType.datetime,
-                defaultValueType: DefaultValueType.currentTimestamp),
-            FieldSchema(
-                name: 'is_active', type: DataType.boolean, defaultValue: true),
-            FieldSchema(name: 'age', type: DataType.integer, defaultValue: 18),
-            FieldSchema(name: 'tags', type: DataType.text),
-            FieldSchema(
-                name: 'type', type: DataType.text, defaultValue: 'user'),
-            FieldSchema(name: 'fans', type: DataType.integer, defaultValue: 10),
-          ],
-          indexes: [
-            IndexSchema(fields: ['username'], unique: true),
-            IndexSchema(fields: ['email'], unique: true),
-            IndexSchema(fields: ['last_login'], unique: false),
-            IndexSchema(fields: ['age']),
-          ],
-        ),
-        TableSchema(
-          name: 'posts',
-          primaryKeyConfig: const PrimaryKeyConfig(
-            name: 'id',
-          ),
-          fields: [
-            const FieldSchema(
-                name: 'title', type: DataType.text, nullable: false),
-            const FieldSchema(name: 'content', type: DataType.text),
-            const FieldSchema(
-                name: 'user_id', type: DataType.integer, nullable: false),
-            const FieldSchema(
-                name: 'created_at',
-                type: DataType.datetime,
-                defaultValueType: DefaultValueType.currentTimestamp),
-            const FieldSchema(
-                name: 'is_published',
-                type: DataType.boolean,
-                defaultValue: true),
-          ],
-          foreignKeys: [
-            ForeignKeySchema(
-              name: 'fk_posts_user',
-              fields: ['user_id'],
-              referencedTable: 'users',
-              referencedFields: ['id'],
-              onDelete: ForeignKeyCascadeAction.cascade,
-              onUpdate: ForeignKeyCascadeAction.cascade,
-            ),
-          ],
-          indexes: [
-            const IndexSchema(fields: ['user_id']),
-            const IndexSchema(fields: ['created_at']),
-          ],
-        ),
-        TableSchema(
-          name: 'comments',
-          primaryKeyConfig: const PrimaryKeyConfig(
-            name: 'id',
-          ),
-          fields: [
-            const FieldSchema(
-                name: 'post_id', type: DataType.integer, nullable: false),
-            const FieldSchema(
-                name: 'user_id', type: DataType.integer, nullable: false),
-            const FieldSchema(
-                name: 'content', type: DataType.text, nullable: false),
-            const FieldSchema(
-                name: 'created_at',
-                type: DataType.datetime,
-                defaultValueType: DefaultValueType.currentTimestamp),
-          ],
-          foreignKeys: [
-            ForeignKeySchema(
-              name: 'fk_comments_post',
-              fields: ['post_id'],
-              referencedTable: 'posts',
-              referencedFields: ['id'],
-              onDelete: ForeignKeyCascadeAction.cascade,
-              onUpdate: ForeignKeyCascadeAction.cascade,
-            ),
-            ForeignKeySchema(
-              name: 'fk_comments_user',
-              fields: ['user_id'],
-              referencedTable: 'users',
-              referencedFields: ['id'],
-              onDelete: ForeignKeyCascadeAction.restrict,
-              onUpdate: ForeignKeyCascadeAction.cascade,
-            ),
-          ],
-          indexes: [
-            const IndexSchema(fields: ['post_id']),
-            const IndexSchema(fields: ['user_id']),
-          ],
-        ),
-        const TableSchema(
-          name: 'settings',
-          primaryKeyConfig: PrimaryKeyConfig(),
-          isGlobal: true,
-          fields: [
-            FieldSchema(
-                name: 'key',
-                type: DataType.text,
-                nullable: false,
-                unique: true),
-            FieldSchema(name: 'value', type: DataType.text),
-            FieldSchema(
-                name: 'updated_at',
-                type: DataType.datetime,
-                defaultValueType: DefaultValueType.currentTimestamp),
-          ],
-          indexes: [
-            IndexSchema(fields: ['key'], unique: true),
-            IndexSchema(fields: ['updated_at'], unique: false),
-          ],
-        ),
-        const TableSchema(
-          name: 'embeddings',
-          primaryKeyConfig: PrimaryKeyConfig(
-            name: 'id',
-            type: PrimaryKeyType.sequential,
-          ),
-          fields: [
-            FieldSchema(name: 'name', type: DataType.text, nullable: false),
-            FieldSchema(
-              name: 'embedding',
-              type: DataType.vector,
-              vectorConfig: VectorFieldConfig(
-                dimensions: 512,
-                precision: VectorPrecision.float32,
-              ),
-            ),
-          ],
-          indexes: [
-            IndexSchema(
-              fields: ['embedding'],
-              type: IndexType.vector,
-              vectorConfig: VectorIndexConfig(
-                distanceMetric: VectorDistanceMetric.cosine,
-                maxDegree: 64,
-                efSearch: 64,
-                constructionEf: 128,
-              ),
-            ),
-          ],
-        ),
-      ],
+      // suitable for table structure definition in frequent startup scenarios of
+      // mobile applications, accurately identifying table structure changes,
+      // automatically upgrading and migrating data
+      schemas: ExampleSchemas.all,
     );
   }
 
   /// Example: Basic CRUD operations for users
   Future<void> userExamples() async {
     // Create: Insert a new user
-    await db.insert('users', {
+    await db.insert(ExampleSchemas.users.name, {
       'username': 'john_doe',
       'email': 'john@example.com',
       'last_login': DateTime.now().toIso8601String(),
     });
 
     // Read: Query user using chain style
-    await db.query('users').where('username', '=', 'john_doe');
+    await db
+        .query(ExampleSchemas.users.name)
+        .where('username', '=', 'john_doe');
 
     // Update: Modify user data
-    await db.update('users', {
+    await db.update(ExampleSchemas.users.name, {
       'last_login': DateTime.now().toIso8601String(),
     }).where('username', '=', 'john_doe');
 
     // Automatically store data, support batch upsert (uses pk or unique key from data)
-    await db.upsert('users', {'username': 'John', 'email': 'john@example.com'});
+    await db.upsert(ExampleSchemas.users.name,
+        {'username': 'John', 'email': 'john@example.com'});
 
     // Auto insert or update based on primary key
-    await db.upsert('users', {
+    await db.upsert(ExampleSchemas.users.name, {
       'id': 1,
       'username': 'John',
       'email': 'john@example.com',
     });
 
     // Delete: Remove user
-    await db.delete('users').where('username', '=', 'john_doe');
+    await db
+        .delete(ExampleSchemas.users.name)
+        .where('username', '=', 'john_doe');
 
     // use stream query to handle large data
     db
-        .streamQuery('users')
+        .streamQuery(ExampleSchemas.users.name)
         .where('email', 'like', '%@example.com')
         .listen((userData) {
       // handle each data as needed, avoid memory pressure
@@ -256,7 +111,7 @@ class ToStoreExample {
   /// Example: Working with global settings
   Future<void> settingsExamples() async {
     // Set global theme (accessible from any space)
-    await db.insert('settings', {
+    await db.insert(ExampleSchemas.settings.name, {
       'key': 'theme',
       'value': 'dark',
       'updated_at': DateTime.now().toIso8601String(),
@@ -266,25 +121,25 @@ class ToStoreExample {
     await db.setValue('language', 'en', isGlobal: true);
 
     // Read settings using different methods
-    await db.query('settings').where('key', '=', 'theme');
+    await db.query(ExampleSchemas.settings.name).where('key', '=', 'theme');
 
     await db.getValue('language', isGlobal: true);
 
     // Update setting with conflict resolution
-    await db.update('settings', {
+    await db.update(ExampleSchemas.settings.name, {
       'value': 'light',
       'updated_at': DateTime.now().toIso8601String(),
     }).where('key', '=', 'theme');
 
     // Delete setting
-    await db.delete('settings').where('key', '=', 'theme');
+    await db.delete(ExampleSchemas.settings.name).where('key', '=', 'theme');
   }
 
   /// Example: Multi-space feature for user data isolation
   Future<void> multiSpaceExamples() async {
     // Switch to user1's space
     await db.switchSpace(spaceName: 'user1');
-    await db.insert('users', {
+    await db.insert(ExampleSchemas.users.name, {
       'username': 'user1',
       'email': 'user1@example.com',
       'last_login': DateTime.now().toIso8601String(),
@@ -292,7 +147,7 @@ class ToStoreExample {
 
     // Switch to user2's space
     await db.switchSpace(spaceName: 'user2');
-    await db.insert('users', {
+    await db.insert(ExampleSchemas.users.name, {
       'username': 'user2',
       'email': 'user2@example.com',
       'last_login': DateTime.now().toIso8601String(),
@@ -310,7 +165,7 @@ class ToStoreExample {
   Future<void> advancedQueryExamples() async {
     // Complex conditions
     await db
-        .query('users')
+        .query(ExampleSchemas.users.name)
         .where(
             'last_login',
             '>',
@@ -325,10 +180,10 @@ class ToStoreExample {
         .limit(10);
 
     // Count users
-    await db.query('users').count();
+    await db.query(ExampleSchemas.users.name).count();
 
     // Batch operations
-    await db.batchInsert('users', [
+    await db.batchInsert(ExampleSchemas.users.name, [
       {
         'username': 'user3',
         'email': 'user3@example.com',
@@ -356,8 +211,8 @@ class ToStoreExample {
   Future<void> vectorExamples() async {
     // Create table with vector field and NGH vector index
     await db.createTables([
-      const TableSchema(
-        name: 'embeddings',
+      TableSchema(
+        name: ExampleSchemas.embeddings.name,
         primaryKeyConfig: PrimaryKeyConfig(
           name: 'id',
           type: PrimaryKeyType.timestampBased,
@@ -384,9 +239,6 @@ class ToStoreExample {
             type: IndexType.vector,
             vectorConfig: VectorIndexConfig(
               distanceMetric: VectorDistanceMetric.cosine,
-              maxDegree: 64, // Graph max neighbors (R)
-              efSearch: 64, // Search expansion factor
-              constructionEf: 128, // Construction expansion factor
             ),
           ),
         ],
@@ -400,12 +252,12 @@ class ToStoreExample {
         VectorData.fromList(List.generate(128, (i) => (i * 0.02 + 0.5)));
 
     // Store documents with vector embeddings
-    await db.insert('embeddings', {
+    await db.insert(ExampleSchemas.embeddings.name, {
       'document_title': 'Introduction to vector databases',
       'embedding': sampleVector1,
     });
 
-    await db.insert('embeddings', {
+    await db.insert(ExampleSchemas.embeddings.name, {
       'document_title': 'Machine Learning with embeddings',
       'embedding': sampleVector2,
     });
@@ -415,7 +267,7 @@ class ToStoreExample {
         VectorData.fromList(List.generate(128, (i) => (i * 0.015)));
 
     final queryResult = await db
-        .query('embeddings')
+        .query(ExampleSchemas.embeddings.name)
         .matchVector('embedding', queryVector)
         .limit(5);
 
@@ -439,7 +291,7 @@ class ToStoreExample {
     logService.add(sb.toString());
 
     // --- Direct vector operations ---
-    final result = await db.query('embeddings');
+    final result = await db.query(ExampleSchemas.embeddings.name);
     final documents = result.data;
     List<VectorData> vectors = [];
 
@@ -494,8 +346,8 @@ class ToStoreExample {
     // create tables
     await db.createTables(
       [
-        const TableSchema(
-            name: 'users',
+        TableSchema(
+            name: ExampleSchemas.users.name,
             primaryKeyConfig: PrimaryKeyConfig(
               name: 'id',
               type: PrimaryKeyType.sequential, // sequential key type
@@ -514,7 +366,7 @@ class ToStoreExample {
 
     // update table structure
     final result = await db
-        .updateSchema('users')
+        .updateSchema(ExampleSchemas.users.name)
         .renameTable('newTableName') // rename table
         .modifyField('username',
             minLength: 5,
@@ -538,7 +390,7 @@ class ToStoreExample {
   /// Example: Complex nested queries with predefined conditions
   Future<void> complexQueryExamples() async {
     // prepare some test data
-    await db.insert('users', {
+    await db.insert(ExampleSchemas.users.name, {
       'username': 'active_user',
       'email': 'active@example.com',
       'is_active': true,
@@ -549,7 +401,7 @@ class ToStoreExample {
       'last_login': DateTime.now().toIso8601String(),
     });
 
-    await db.insert('users', {
+    await db.insert(ExampleSchemas.users.name, {
       'username': 'inactive_user',
       'email': 'inactive@example.com',
       'is_active': false,
@@ -573,7 +425,7 @@ class ToStoreExample {
 
     // query condition nesting example - show infinite nesting ability
     final result = await db
-        .query('users')
+        .query(ExampleSchemas.users.name)
         .where('is_active', '=', true)
         .condition(QueryCondition() // query condition construction
                 .whereEqual('type', 'app')
@@ -597,9 +449,9 @@ class ToStoreExample {
 
   Future<int> clearExamples() async {
     final stopwatch = Stopwatch()..start();
-    await db.clear('users');
-    await db.clear('posts');
-    await db.clear('comments');
+    await db.clear(ExampleSchemas.users.name);
+    await db.clear(ExampleSchemas.posts.name);
+    await db.clear(ExampleSchemas.comments.name);
     stopwatch.stop();
     final elapsed = stopwatch.elapsedMilliseconds;
     logService
@@ -611,14 +463,14 @@ class ToStoreExample {
   Future<void> joinQueryExamples() async {
     // prepare test data
     // insert user
-    await db.insert('users', {
+    await db.insert(ExampleSchemas.users.name, {
       'username': 'blogger',
       'email': 'blogger@example.com',
       'is_active': true,
     });
 
     // insert post
-    await db.insert('posts', {
+    await db.insert(ExampleSchemas.posts.name, {
       'title': 'how to use join to query',
       'content': 'this is a post about join...',
       'user_id': 1,
@@ -626,7 +478,7 @@ class ToStoreExample {
     });
 
     // insert comment
-    await db.insert('comments', {
+    await db.insert(ExampleSchemas.comments.name, {
       'post_id': 1,
       'user_id': 1,
       'content': 'this is my own post comment',
@@ -635,18 +487,23 @@ class ToStoreExample {
 
     // multi-table join query - post, author and comment
     final postsWithComments = await db
-        .query('posts')
+        .query(ExampleSchemas.posts.name)
         .select([
-          'posts.id as post_id',
-          'posts.title',
-          'users.username as author',
-          'comments.content as comment',
-          'comments.created_at as comment_time'
+          '${ExampleSchemas.posts.name}.id as post_id',
+          '${ExampleSchemas.posts.name}.title',
+          '${ExampleSchemas.users.name}.username as author',
+          '${ExampleSchemas.comments.name}.content as comment',
+          '${ExampleSchemas.comments.name}.created_at as comment_time'
         ])
-        .join('users', 'posts.user_id', '=', 'users.id')
-        .join('comments', 'posts.user_id', '=', 'comments.user_id')
-        .where('posts.is_published', '=', true)
-        .orderByDesc('comments.created_at');
+        .join(ExampleSchemas.users.name, '${ExampleSchemas.posts.name}.user_id',
+            '=', '${ExampleSchemas.users.name}.id')
+        .join(
+            ExampleSchemas.comments.name,
+            '${ExampleSchemas.posts.name}.user_id',
+            '=',
+            '${ExampleSchemas.comments.name}.user_id')
+        .where('${ExampleSchemas.posts.name}.is_published', '=', true)
+        .orderByDesc('${ExampleSchemas.comments.name}.created_at');
 
     for (var item in postsWithComments.data) {
       logService.add(
@@ -986,7 +843,8 @@ class ToStoreExample {
 
   Future<int> deleteExamples() async {
     final stopwatch = Stopwatch()..start();
-    final deleteResult = await db.delete('users').where('id', '>', '5');
+    final deleteResult =
+        await db.delete(ExampleSchemas.users.name).where('id', '>', '5');
     stopwatch.stop();
     final elapsed = stopwatch.elapsedMilliseconds;
     logService.add('delete : ${deleteResult.toJson()}');
@@ -996,14 +854,17 @@ class ToStoreExample {
 
   Future<int> queryExamples() async {
     Stopwatch stopwatch = Stopwatch()..start();
-    final queryResult = await db.query('users').where('id', '<', '6').limit(8);
+    final queryResult = await db
+        .query(ExampleSchemas.users.name)
+        .where('id', '<', '6')
+        .limit(8);
     stopwatch.stop();
     final elapsed = stopwatch.elapsedMilliseconds;
 
     logService.add('query time: ${elapsed}ms');
     logService
         .add('query result: ${queryResult.length} ${queryResult.toJson()}');
-    final queryCount = await db.query('users').count();
+    final queryCount = await db.query(ExampleSchemas.users.name).count();
     logService.add('query count: $queryCount');
     return elapsed;
   }
@@ -1014,7 +875,7 @@ class ToStoreExample {
     logService.add('--- Expression Examples ---', LogLevel.info);
 
     // Example 1: Simple increment using expression
-    await db.insert('users', {
+    await db.insert(ExampleSchemas.users.name, {
       'username': 'expr_user1',
       'email': 'expr1@example.com',
       'age': 25,
@@ -1022,12 +883,12 @@ class ToStoreExample {
     });
 
     // Increment fans by 50 atomically
-    await db.update('users', {
+    await db.update(ExampleSchemas.users.name, {
       'fans': Expr.field('fans') + Expr.value(50),
     }).where('username', '=', 'expr_user1');
 
     // Example 2: Complex calculation with multiple fields
-    await db.insert('users', {
+    await db.insert(ExampleSchemas.users.name, {
       'username': 'expr_user2',
       'email': 'expr2@example.com',
       'age': 30,
@@ -1035,12 +896,12 @@ class ToStoreExample {
     });
 
     // Calculate total: fans + (age * 2)
-    await db.update('users', {
+    await db.update(ExampleSchemas.users.name, {
       'fans': Expr.field('fans') + (Expr.field('age') * Expr.value(2)),
     }).where('username', '=', 'expr_user2');
 
     // Example 3: Multi-level parentheses for complex calculations
-    await db.insert('users', {
+    await db.insert(ExampleSchemas.users.name, {
       'username': 'expr_user3',
       'email': 'expr3@example.com',
       'age': 35,
@@ -1048,13 +909,13 @@ class ToStoreExample {
     });
 
     // Complex calculation: ((fans + age) * 0.8) - 10
-    await db.update('users', {
+    await db.update(ExampleSchemas.users.name, {
       'fans': ((Expr.field('fans') + Expr.field('age')) * Expr.value(0.8)) -
           Expr.value(10),
     }).where('username', '=', 'expr_user3');
 
     // Example 4: Using chain builder syntax sugar
-    await db.insert('users', {
+    await db.insert(ExampleSchemas.users.name, {
       'username': 'expr_user4',
       'email': 'expr4@example.com',
       'age': 40,
@@ -1063,33 +924,33 @@ class ToStoreExample {
 
     // Chain builder methods (syntax sugar for expressions)
     await db
-        .update('users', {})
+        .update(ExampleSchemas.users.name, {})
         .increment('fans', 100) // fans = fans + 100
         .multiply('age', 1.1) // age = age * 1.1
         .setServerTimestamp('last_login') // last_login = now()
         .where('username', '=', 'expr_user4');
 
     // Example 5: Using min/max functions
-    await db.update('users', {
+    await db.update(ExampleSchemas.users.name, {
       'fans': Expr.min(Expr.field('fans'), Expr.value(500)),
     }).where('username', '=', 'expr_user4');
 
     // Example 6: Expression in Map literal (direct usage)
-    await db.update('users', {
+    await db.update(ExampleSchemas.users.name, {
       'fans': Expr.field('fans') * Expr.field('age') / Expr.value(10),
       'last_login': Expr.now(),
     }).where('username', '=', 'expr_user4');
 
     // Example 7: Complex business logic calculation
     // Calculate final price: (price * quantity + tax) * (1 - discount)
-    await db.insert('posts', {
+    await db.insert(ExampleSchemas.posts.name, {
       'title': 'Product A',
       'user_id': 1,
       'content': 'Product description',
     });
 
     // If posts table had price, quantity, tax, discount fields:
-    // await db.update('posts', {
+    // await db.update(ExampleSchemas.posts.name, {
     //   'final_price': ((Expr.field('price') * Expr.field('quantity') + Expr.field('tax')) *
     //                  (Expr.value(1) - Expr.field('discount'))),
     // }).where('title', '=', 'Product A');
@@ -1105,13 +966,13 @@ class ToStoreExample {
     // Example 1: Basic transaction with commit
     // All operations in the transaction are atomic - either all succeed or all fail
     final txResult1 = await db.transaction(() async {
-      await db.insert('users', {
+      await db.insert(ExampleSchemas.users.name, {
         'username': 'tx_user1',
         'email': 'tx1@example.com',
         'age': 25,
         'fans': 100,
       });
-      await db.insert('users', {
+      await db.insert(ExampleSchemas.users.name, {
         'username': 'tx_user2',
         'email': 'tx2@example.com',
         'age': 30,
@@ -1126,7 +987,7 @@ class ToStoreExample {
     // Example 2: Transaction with rollback on error
     // If an error occurs, all changes are automatically rolled back
     final txResult2 = await db.transaction(() async {
-      await db.insert('users', {
+      await db.insert(ExampleSchemas.users.name, {
         'username': 'tx_user3',
         'email': 'tx3@example.com',
         'age': 35,
@@ -1150,12 +1011,15 @@ class ToStoreExample {
   /// [tableName] The table to search in.
   /// [iterations] Number of searches to perform.
   /// [topK] Number of nearest neighbors to retrieve.
+  /// [searchDepth] ANN search depth in `[1, 100]` (null = engine default 80).
   ///
   /// Returns the average latency in milliseconds.
   Future<double> vectorSearchBenchmark(
-      String tableName, int iterations, int topK) async {
+      String tableName, int iterations, int topK,
+      {int? searchDepth}) async {
+    final depthLabel = searchDepth?.toString() ?? 'default';
     logService.add(
-        'Starting Vector Search Benchmark: table="$tableName", iterations=$iterations, topK=$topK');
+        'Starting Vector Search Benchmark: table="$tableName", iterations=$iterations, topK=$topK, searchDepth=$depthLabel');
 
     final schema = await db.getTableSchema(tableName);
     if (schema == null) {
@@ -1192,6 +1056,9 @@ class ToStoreExample {
     }
 
     final random = Random();
+
+    // Setup (schema, anchor sampling) — reported separately, never mixed into latency.
+    final setupSw = Stopwatch()..start();
     final totalCount = await db.query(tableName).count();
     final isSequential =
         schema.primaryKeyConfig.type == PrimaryKeyType.sequential;
@@ -1238,8 +1105,9 @@ class ToStoreExample {
         } catch (_) {}
       }
     }
+    setupSw.stop();
+    final setupElapsedMs = setupSw.elapsedMilliseconds;
 
-    final totalStopwatch = Stopwatch()..start();
     final latenciesMs = <double>[];
     int exactTestCount = 0;
     int exactHitCount = 0;
@@ -1295,29 +1163,30 @@ class ToStoreExample {
         queryVector = VectorData(queryValues);
       }
 
-      // 2. Perform search via db.query chain with timing
+      // 2. Pure ANN via db.vectorSearch (PK + score only; matches mainstream
+      // vector-DB latency reporting — not hybrid full-row fetch).
       final querySw = Stopwatch()..start();
-      final queryResult = await db
-          .query(tableName)
-          .matchVector(vectorField.name, queryVector)
-          .limit(topK);
+      final results = await db.vectorSearch(
+        tableName,
+        fieldName: vectorField.name,
+        queryVector: queryVector,
+        topK: topK,
+        searchDepth: searchDepth,
+      );
       querySw.stop();
       final queryElapsedMs = querySw.elapsedMicroseconds / 1000.0;
       latenciesMs.add(queryElapsedMs);
-
-      final results = queryResult.data;
 
       // Track target hit statistics
       bool targetHitTop1 = false;
       bool targetHitTopK = false;
       if (targetAnchorPk != null && results.isNotEmpty) {
-        final firstPk = results.first[schema.primaryKey] ?? results.first['id'];
-        if (firstPk.toString() == targetAnchorPk.toString()) {
+        final targetPkStr = targetAnchorPk.toString();
+        if (results.first.primaryKey == targetPkStr) {
           targetHitTop1 = true;
         }
         for (final r in results) {
-          final pk = r[schema.primaryKey] ?? r['id'];
-          if (pk.toString() == targetAnchorPk.toString()) {
+          if (r.primaryKey == targetPkStr) {
             targetHitTopK = true;
             break;
           }
@@ -1339,25 +1208,29 @@ class ToStoreExample {
             '⏳ Benchmark Progress: ${i + 1}/$iterations completed ($pct%)...',
             LogLevel.info);
       }
-
-      // Small delay to allow UI refresh in very long loops
-      if (i % 500 == 0) {
-        await Future.delayed(Duration.zero);
-      }
     }
 
-    totalStopwatch.stop();
-    final totalElapsed = totalStopwatch.elapsedMilliseconds;
-    final avgLatency = totalElapsed / iterations;
+    // Sum of per-query vectorSearch timings only (same basis as Average/Pxx).
+    final totalSearchMs =
+        latenciesMs.isEmpty ? 0.0 : latenciesMs.reduce((a, b) => a + b);
+
+    // Average / percentiles / QPS use per-query vectorSearch timings only.
+    final avgLatency = latenciesMs.isEmpty
+        ? 0.0
+        : latenciesMs.reduce((a, b) => a + b) / latenciesMs.length;
 
     // 4. Print Single Consolidated Summary Report for the entire execution
     latenciesMs.sort();
-    final p50 = latenciesMs[
-        (iterations * 0.50).floor().clamp(0, latenciesMs.length - 1)];
-    final p95 = latenciesMs[
-        (iterations * 0.95).floor().clamp(0, latenciesMs.length - 1)];
-    final p99 = latenciesMs[
-        (iterations * 0.99).floor().clamp(0, latenciesMs.length - 1)];
+    final lastIdx = latenciesMs.isEmpty ? 0 : latenciesMs.length - 1;
+    final p50 = latenciesMs.isEmpty
+        ? 0.0
+        : latenciesMs[(latenciesMs.length * 0.50).floor().clamp(0, lastIdx)];
+    final p95 = latenciesMs.isEmpty
+        ? 0.0
+        : latenciesMs[(latenciesMs.length * 0.95).floor().clamp(0, lastIdx)];
+    final p99 = latenciesMs.isEmpty
+        ? 0.0
+        : latenciesMs[(latenciesMs.length * 0.99).floor().clamp(0, lastIdx)];
     final qps = avgLatency > 0 ? (1000.0 / avgLatency) : 0.0;
 
     final exactHitRate =
@@ -1378,7 +1251,12 @@ class ToStoreExample {
     report.writeln(
         '  Target Table         : $tableName (${dims}D, Cosine Metric)');
     report.writeln('  Total Executed       : $iterations queries (Top-$topK)');
-    report.writeln('  Total Time Elapsed   : $totalElapsed ms');
+    report.writeln(
+        '  Total Search Time    : ${totalSearchMs.toStringAsFixed(2)} ms (vectorSearch PK-only)');
+    if (setupElapsedMs > 0) {
+      report.writeln(
+          '  Setup Time           : $setupElapsedMs ms (schema + anchor sampling, excluded from latency)');
+    }
     report.writeln('-' * 78);
     report.writeln('  ACCURACY & RECALL METRICS:');
     report.writeln(

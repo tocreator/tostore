@@ -107,8 +107,11 @@ final class NghPostingSlot {
   /// Logical deletion / tombstone flag (0 = active, 1 = deleted).
   int flags;
 
-  /// Original string primary key.
-  String primaryKey;
+  /// Lazily decoded primary key (set on insert, or first access after disk decode).
+  String? _decodedPrimaryKey;
+
+  /// UTF-8 PK bytes from disk (sublistView). Avoids decode until needed.
+  Uint8List? primaryKeyBytes;
 
   /// 8-bit quantized vector components. Length == dimensions.
   Uint8List sq8Codes;
@@ -125,17 +128,42 @@ final class NghPostingSlot {
   NghPostingSlot({
     required this.nodeId,
     this.flags = 0,
-    required this.primaryKey,
+    String? primaryKey,
+    this.primaryKeyBytes,
     required this.sq8Codes,
     required this.offset,
     required this.scale,
     required this.squaredNorm,
-  });
+  }) : _decodedPrimaryKey = primaryKey;
+
+  /// Original string primary key (decoded on demand for disk-loaded slots).
+  String get primaryKey {
+    final cached = _decodedPrimaryKey;
+    if (cached != null) return cached;
+    final bytes = primaryKeyBytes;
+    if (bytes == null || bytes.isEmpty) return '';
+    return _decodedPrimaryKey = utf8.decode(bytes);
+  }
+
+  set primaryKey(String value) {
+    _decodedPrimaryKey = value;
+    primaryKeyBytes = null;
+  }
+
+  /// Wire-format UTF-8 bytes without forcing a Dart String round-trip.
+  Uint8List get primaryKeyUtf8 {
+    final bytes = primaryKeyBytes;
+    if (bytes != null) return bytes;
+    return Uint8List.fromList(utf8.encode(primaryKey));
+  }
 
   bool get isDeleted => (flags & 0x01) != 0;
 
   /// Approximate in-memory / serialized byte size of this slot.
-  int estimateSize() => 20 + primaryKey.length * 2 + sq8Codes.length;
+  int estimateSize() {
+    final pkLen = primaryKeyBytes?.length ?? (primaryKey.length * 2);
+    return 20 + pkLen + sq8Codes.length;
+  }
 }
 
 /// An inverted cluster posting page storing multiple inlined [NghPostingSlot]s.
@@ -184,7 +212,7 @@ final class NghPostingPage {
     final pks =
         List<Uint8List>.filled(slotCount, Uint8List(0), growable: false);
     for (int i = 0; i < slotCount; i++) {
-      final pkBytes = Uint8List.fromList(utf8.encode(slots[i].primaryKey));
+      final pkBytes = slots[i].primaryKeyUtf8;
       pks[i] = pkBytes;
       totalBytes += 19 + pkBytes.length + dimensions;
     }
@@ -247,16 +275,18 @@ final class NghPostingPage {
 
       if (off + pkLen + dims > bytes.length) break;
 
-      final pk = utf8.decode(bytes.sublist(off, off + pkLen));
+      // Keep UTF-8 view; decode only when primaryKey is accessed.
+      final pkBytes = Uint8List.sublistView(bytes, off, off + pkLen);
       off += pkLen;
 
-      final sq8Codes = Uint8List.fromList(bytes.sublist(off, off + dims));
+      // View into page buffer — avoid per-slot SQ8 copies on decode.
+      final sq8Codes = Uint8List.sublistView(bytes, off, off + dims);
       off += dims;
 
       slots.add(NghPostingSlot(
         nodeId: nodeId,
         flags: flags,
-        primaryKey: pk,
+        primaryKeyBytes: pkBytes,
         sq8Codes: sq8Codes,
         offset: offset,
         scale: scale,
@@ -275,7 +305,8 @@ final class NghPostingPage {
   int estimatePayloadSize() {
     int size = 12;
     for (final s in slots) {
-      size += 19 + s.primaryKey.length * 2 + dimensions;
+      final pkLen = s.primaryKeyBytes?.length ?? s.primaryKey.length * 2;
+      size += 19 + pkLen + dimensions;
     }
     return size;
   }

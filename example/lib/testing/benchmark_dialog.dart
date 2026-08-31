@@ -25,8 +25,17 @@ class _BenchmarkDialogState extends State<BenchmarkDialog> {
   late int _selectedIterations;
   late Set<BenchmarkOperation> _selectedOperations;
 
-  static const List<int> _scaleOptions = [10000, 50000, 100000];
+  static const List<int> _scalarScaleOptions = [10000, 50000, 100000];
+  static const List<int> _vectorScaleOptions = [1000, 5000, 10000];
   static const List<int> _iterationOptions = [1, 3, 5];
+
+  List<int> get _scaleOptions => _selectedTier == BenchmarkTier.vector
+      ? _vectorScaleOptions
+      : _scalarScaleOptions;
+
+  List<BenchmarkOperation> get _visibleOperations => BenchmarkOperation.values
+      .where((op) => op.appliesTo(_selectedTier))
+      .toList();
 
   @override
   void initState() {
@@ -34,9 +43,46 @@ class _BenchmarkDialogState extends State<BenchmarkDialog> {
     _isViewingResults = widget.lastSummary != null;
     final config = widget.lastSummary?.config ?? widget.initialConfig;
     _selectedTier = config.tier;
-    _selectedScale = config.scale < 10000 ? 10000 : config.scale;
     _selectedIterations = config.iterations;
-    _selectedOperations = Set.from(config.operations);
+    _selectedOperations = Set.from(
+      config.operations.where((op) => op.appliesTo(_selectedTier)),
+    );
+    if (_selectedOperations.isEmpty) {
+      _selectedOperations = _defaultOpsForTier(_selectedTier);
+    }
+    _selectedScale = _clampScale(config.scale, _selectedTier);
+  }
+
+  Set<BenchmarkOperation> _defaultOpsForTier(BenchmarkTier tier) {
+    if (tier == BenchmarkTier.vector) {
+      return Set.from(BenchmarkOperation.defaultVectorOps);
+    }
+    if (tier == BenchmarkTier.all) {
+      return {
+        ...BenchmarkOperation.defaultScalarOps,
+        ...BenchmarkOperation.defaultVectorOps,
+      };
+    }
+    return Set.from(BenchmarkOperation.defaultScalarOps);
+  }
+
+  int _clampScale(int scale, BenchmarkTier tier) {
+    final options = tier == BenchmarkTier.vector
+        ? _vectorScaleOptions
+        : _scalarScaleOptions;
+    if (options.contains(scale)) return scale;
+    // Pick nearest option.
+    return options.reduce(
+      (a, b) => (a - scale).abs() <= (b - scale).abs() ? a : b,
+    );
+  }
+
+  void _onTierSelected(BenchmarkTier tier) {
+    setState(() {
+      _selectedTier = tier;
+      _selectedScale = _clampScale(_selectedScale, tier);
+      _selectedOperations = _defaultOpsForTier(tier);
+    });
   }
 
   void _onStart([BenchmarkConfig? overrideConfig]) {
@@ -251,7 +297,7 @@ class _BenchmarkDialogState extends State<BenchmarkDialog> {
                     color: Color(0xFF1E293B),
                   ),
                   dataRowMinHeight: 40,
-                  dataRowMaxHeight: 46,
+                  dataRowMaxHeight: 48,
                   columnSpacing: 18,
                   horizontalMargin: 14,
                   columns: const [
@@ -259,11 +305,12 @@ class _BenchmarkDialogState extends State<BenchmarkDialog> {
                     DataColumn(label: Text('Operation')),
                     DataColumn(label: Text('Count'), numeric: true),
                     DataColumn(label: Text('Avg Time'), numeric: true),
-                    DataColumn(label: Text('Throughput'), numeric: true),
+                    DataColumn(label: Text('Result')),
                     DataColumn(label: Text('Avg Latency'), numeric: true),
                     DataColumn(label: Text('Min / Max'), numeric: true),
                   ],
                   rows: summary.metrics.map((m) {
+                    final isQuality = m.compactHighlight != null;
                     return DataRow(
                       cells: [
                         DataCell(Text(m.tierName,
@@ -275,32 +322,43 @@ class _BenchmarkDialogState extends State<BenchmarkDialog> {
                             style: const TextStyle(
                                 fontSize: 12.5, color: Color(0xFF64748B)))),
                         DataCell(Text(
-                            '${m.avgMilliseconds.toStringAsFixed(2)} ms',
+                            isQuality
+                                ? '—'
+                                : '${m.avgMilliseconds.toStringAsFixed(2)} ms',
                             style: const TextStyle(
                                 fontSize: 12.5, fontWeight: FontWeight.w500))),
                         DataCell(
-                          Container(
-                            padding: const EdgeInsets.symmetric(
-                                horizontal: 6, vertical: 2),
-                            decoration: BoxDecoration(
-                              color: primaryColor.withAlpha(20),
-                              borderRadius: BorderRadius.circular(4),
-                            ),
-                            child: Text(
-                              '${m.opsPerSec.toStringAsFixed(0)} ops/s',
-                              style: TextStyle(
-                                fontSize: 12.5,
-                                fontWeight: FontWeight.bold,
-                                color: primaryColor,
+                          Tooltip(
+                            message: m.qualityNote ?? m.highlightLabel,
+                            waitDuration: const Duration(milliseconds: 400),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 6, vertical: 2),
+                              decoration: BoxDecoration(
+                                color: primaryColor.withAlpha(20),
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Text(
+                                m.highlightLabel,
+                                style: TextStyle(
+                                  fontSize: 12.5,
+                                  fontWeight: FontWeight.bold,
+                                  color: primaryColor,
+                                ),
                               ),
                             ),
                           ),
                         ),
-                        DataCell(Text('${m.avgLatencyUs.toStringAsFixed(2)} μs',
+                        DataCell(Text(
+                            isQuality
+                                ? '—'
+                                : '${m.avgLatencyUs.toStringAsFixed(2)} μs',
                             style: const TextStyle(
                                 fontSize: 12.5, color: Color(0xFF475569)))),
                         DataCell(Text(
-                          '${(m.minMicroseconds / 1000.0).toStringAsFixed(1)} / ${(m.maxMicroseconds / 1000.0).toStringAsFixed(1)} ms',
+                          isQuality
+                              ? '—'
+                              : '${(m.minMicroseconds / 1000.0).toStringAsFixed(1)} / ${(m.maxMicroseconds / 1000.0).toStringAsFixed(1)} ms',
                           style: const TextStyle(
                               fontSize: 12, color: Color(0xFF94A3B8)),
                         )),
@@ -406,7 +464,7 @@ class _BenchmarkDialogState extends State<BenchmarkDialog> {
                 ),
                 onSelected: (selected) {
                   if (selected) {
-                    setState(() => _selectedTier = tier);
+                    _onTierSelected(tier);
                   }
                 },
               );
@@ -472,16 +530,18 @@ class _BenchmarkDialogState extends State<BenchmarkDialog> {
               TextButton(
                 onPressed: () {
                   setState(() {
-                    if (_selectedOperations.length ==
-                        BenchmarkOperation.values.length) {
+                    final visible = _visibleOperations;
+                    if (_selectedOperations.length == visible.length &&
+                        visible.every(_selectedOperations.contains)) {
                       _selectedOperations.clear();
                     } else {
-                      _selectedOperations = Set.from(BenchmarkOperation.values);
+                      _selectedOperations = Set.from(visible);
                     }
                   });
                 },
                 child: Text(
-                  _selectedOperations.length == BenchmarkOperation.values.length
+                  _selectedOperations.length == _visibleOperations.length &&
+                          _visibleOperations.every(_selectedOperations.contains)
                       ? 'Deselect All'
                       : 'Select All',
                   style: const TextStyle(fontSize: 12),
@@ -493,7 +553,7 @@ class _BenchmarkDialogState extends State<BenchmarkDialog> {
           Wrap(
             spacing: 8,
             runSpacing: 6,
-            children: BenchmarkOperation.values.map((op) {
+            children: _visibleOperations.map((op) {
               final isSelected = _selectedOperations.contains(op);
               return FilterChip(
                 label: Text(op.label),

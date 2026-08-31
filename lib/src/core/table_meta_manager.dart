@@ -64,7 +64,15 @@ class TableMetaManager {
   /// Loading futures to prevent thundering herd on concurrent meta reads.
   final Map<TableUid, Future<TableMeta?>> _metaLoadingFutures = {};
 
-  static const String _deletedSlotFieldPrefix = '_system_storage_deleted_slot_';
+  /// Synthetic decode-map key for a deleted positional storage slot.
+  ///
+  /// On-disk records are nameless; this prefix exists only so codec structures
+  /// keep stable slot counts. Logical [TableSchema] never includes these names.
+  static const String deletedSlotFieldPrefix = '_system_storage_deleted_slot_';
+
+  /// Whether [name] is a deleted-slot placeholder (not a logical field).
+  static bool isDeletedSlotFieldName(String name) =>
+      name.startsWith(deletedSlotFieldPrefix);
 
   /// Name->UID inventory for **all** tables in the database.
   ///
@@ -984,9 +992,13 @@ class TableMetaManager {
     final out = <FieldStructure>[];
     for (final slot in layout.slots) {
       final name = slot.deleted
-          ? '$_deletedSlotFieldPrefix${slot.slotId}'
+          ? '$deletedSlotFieldPrefix${slot.slotId}'
           : slot.fieldName;
-      out.add(FieldStructure(name: name, typeIndex: slot.typeIndex));
+      out.add(FieldStructure(
+        name: name,
+        typeIndex: slot.typeIndex,
+        deleted: slot.deleted,
+      ));
     }
     return List<FieldStructure>.unmodifiable(out);
   }

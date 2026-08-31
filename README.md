@@ -33,8 +33,8 @@
 - [Why ToStore](#why-choose-tostore) | [Key Features](#key-features) | [Installation Guide](#installation) | [KV Mode](#key-value-storage-kv) | [Table Mode](#structured-table-mode) | [Memory Mode](#memory-mode)
 - [Schema Definition](#schema-definition) | [Distributed Architecture](#distributed-architecture) | [Cascading Foreign Keys](#foreign-keys-and-cascading) | [Mobile/Desktop](#mobile-and-desktop-integration) | [Server/Agent](#server-and-agent-integration) | [Primary Key Algorithms](#primary-key-examples)
 - [Advanced Queries (JOIN)](#advanced-queries) | [Aggregation & Statistics](#aggregation-grouping-and-statistics) | [Complex Logic (QueryCondition)](#complex-logic-with-querycondition) | [Reactive Query (watch)](#reactive-query) | [Streaming Query](#streaming-query)
-- [Advanced KV](#advanced-key-value-operations-dbkv) | [Bulk Operations](#bulk-operations) | [Vector Search](#vector-fields-vector-indexes-and-vector-search) | [Table-level TTL](#table-level-ttl) | [Efficient Pagination](#query-and-efficient-pagination) | [Memory Probe & Sync Retrieval (peek)](#memory-probe-and-sync-retrieval-peek) | [Query Cache](#manual-query-result-caching) | [Atomic Expressions](#atomic-expressions) | [Transactions](#transactions)
-- [Administration](#administration-and-maintenance) | [Security Configuration](#security-configuration) | [Error Handling](#status-codes-and-error-handling) | [Performance & Diagnostics](#performance-and-experience) | [Contributing](#contributing)
+- [Advanced KV](#advanced-key-value-operations-dbkv) | [Bulk Operations](#bulk-operations) | [Vector & Hybrid Retrieval](#vector-fields-vector-indexes-and-hybrid-retrieval) | [Table-level TTL](#table-level-ttl) | [Efficient Pagination](#query-and-efficient-pagination) | [Memory Probe & Sync Retrieval (peek)](#memory-probe-and-sync-retrieval-peek) | [Query Cache](#manual-query-result-caching) | [Atomic Expressions](#atomic-expressions) | [Transactions](#transactions)
+- [Administration](#administration-and-maintenance) | [Security Configuration](#security-configuration) | [Error Handling](#status-codes-and-error-handling) | [Performance & Diagnostics](#performance-and-experience) | [Contributing](#contributing) | [AI assistants](#for-ai-coding-assistants)
 
 ## Why Choose ToStore?
 
@@ -42,9 +42,9 @@ ToStore is a modern data engine designed for the AGI era and edge intelligence s
 
 Runtime modeling and non-blocking execution paths keep architecture evolution always online and fully transparent to business operations—declarative schema changes, data encoding key rotation, and massive data refactoring all happen seamlessly online. Built for Agent and automated O&M, it underpins their autonomous evolution and continuous iteration without interrupting service.
 
-A unified data engine natively supporting relational structured data, high-dimensional vectors, and unstructured data, with enterprise-grade database capabilities including ACID transactions, complex relational queries (JOINs, cascading foreign keys), table-level TTL, aggregations, as well as distributed primary key algorithms, atomic expressions, encryption, multi-space isolation, and self-healing recovery.
+A unified data engine natively supporting relational structured data, high-dimensional vectors, and unstructured data, with built-in hybrid retrieval and multi-way recall fusion, plus enterprise-grade database capabilities including ACID transactions, complex relational queries (JOINs, cascading foreign keys), table-level TTL, aggregations, as well as distributed primary key algorithms, atomic expressions, encryption, multi-space isolation, and self-healing recovery.
 
-As computing continues shifting toward edge intelligence, devices are no longer just "content displays". They are intelligent nodes responsible for local generation, environmental awareness, real-time decision-making, and coordinated data flows. ToStore gives the edge distributed capabilities strong enough for massive datasets and complex local AI generation. Deep intelligent collaboration between edge and cloud nodes provides a reliable data foundation for multi-modal interaction, semantic vectors, spatial modeling, edge autonomous collaboration, and similar scenarios.
+As computing continues shifting toward edge intelligence, devices are no longer just "content displays". They are intelligent nodes responsible for local generation, environmental awareness, real-time decision-making, and coordinated data flows. ToStore gives the edge distributed capabilities strong enough for massive datasets and complex local AI generation. Deep intelligent collaboration between edge and cloud nodes provides a reliable data foundation for multi-modal interaction, semantic vector hybrid retrieval, spatial modeling, edge autonomous collaboration, and similar scenarios.
 
 ## Key Features
 
@@ -63,6 +63,11 @@ As computing continues shifting toward edge intelligence, devices are no longer 
   - Unified API across mobile, desktop, web, and server environments
   - Covers relational structured data, high-dimensional vectors, and unstructured data
   - Complete data pipeline from local storage to edge-cloud collaboration
+
+- 🔍 **Structured Queries & Hybrid Retrieval**
+  - Complex predicates, JOINs, aggregations, and table-level TTL
+  - Multi-channel recall can be composed on the same query chain (vector, structured, and more)
+  - Multi-way recall fusion ranking, with scores and channel diagnostics returned on the query result
 
 - ⚡ **Parallel Execution & Resource Scheduling**
   - Resource-aware intelligent load scheduling for high availability
@@ -85,6 +90,12 @@ Add `tostore` to your `pubspec.yaml`:
 dependencies:
   tostore: any # Please use the latest version
 ```
+
+### For AI Coding Assistants
+
+When generating ToStore client code with an AI assistant, give it the single-file corpus [`llms-full.txt`](llms-full.txt) — for example `@llms-full.txt` in the IDE, upload/paste the file, or index its [raw URL](https://raw.githubusercontent.com/tocreator/tostore/main/llms-full.txt) in the assistant's docs. That file carries API signatures, constraints, and anti-patterns so the model stays aligned with the real public surface. Discovery index: [`llms.txt`](llms.txt).
+
+
 
 ## Quick Start
 
@@ -675,7 +686,9 @@ ToStore provides specialized bulk processing interfaces optimized for large-scal
 > You can set `allowPartialErrors: true` to ensure that individual record failures (e.g., a single constraint violation) do not reject the entire batch operation.
 
 
-### Vector Fields Vector Indexes and Vector Search
+### Vector Fields, Vector Indexes, and Hybrid Retrieval
+
+Vector retrieval uses the unified `db.query(...).matchVector(...)` query chain: it can be combined with structured predicates on the same chain, or fused with other recall branches. Scores and channel diagnostics are returned in `QueryResult.retrieval`, aligned 1:1 with `data` rows. Current examples focus on vector + structured paths; lexical, graph, and other channels will extend along the same chained hybrid retrieval model.
 
 ```dart
 await db.createTables([
@@ -690,6 +703,12 @@ await db.createTables([
         name: 'document_title',
         type: DataType.text,
         nullable: false,
+      ),
+      FieldSchema(
+        name: 'category',
+        type: DataType.text,
+        nullable: false,
+        createIndex: true,
       ),
       FieldSchema(
         name: 'embedding',
@@ -708,9 +727,6 @@ await db.createTables([
         vectorConfig: VectorIndexConfig(
           indexType: VectorIndexType.ngh, // Built-in vector index type
           distanceMetric: VectorDistanceMetric.cosine, // Good for normalized embeddings
-          maxDegree: 32, // More neighbors usually improve recall at higher memory cost
-          efSearch: 64, // Higher recall but slower queries
-          constructionEf: 128, // Higher-quality index but slower build time
         ),
       ),
     ],
@@ -720,34 +736,63 @@ await db.createTables([
 final queryVector =
     VectorData.fromList(List.generate(128, (i) => i * 0.01)); // Must match dimensions
 
-// Vector search
-final results = await db.vectorSearch(
-  'embeddings',
-  fieldName: 'embedding',
-  queryVector: queryVector,
-  topK: 5, // Return the top 5 nearest records
-  efSearch: 64, // Override the search expansion factor for this request
-);
+// 1) Recommended: chained hybrid retrieval (pure vector ANN)
+final result = await db
+    .query('embeddings')
+    .matchVector('embedding', queryVector) // default searchDepth = 80
+    .limit(5);
 
-for (final r in results) {
-  print('pk=${r.primaryKey}, score=${r.score}, distance=${r.distance}');
+for (var i = 0; i < result.data.length; i++) {
+  final row = result.data[i];
+  final entry = result.retrieval?.entries[i];
+  final score = entry?.score;
+  final distance = entry?.meta?['distance'];
+  print('pk=${row['id']}, title=${row['document_title']}, '
+      'score=$score, distance=$distance');
 }
+
+// 2) Structured filter + vector (AND hybrid)
+final filtered = await db
+    .query('embeddings')
+    .whereEqual('category', 'tech')
+    .matchVector('embedding', queryVector)
+    .limit(5);
+
+// 3) Multi-way fused recall (vector + structured paths, engine-side RRF)
+final otherVector =
+    VectorData.fromList(List.generate(128, (i) => i * 0.012));
+final fused = await db
+    .query('embeddings')
+    .matchVector('embedding', queryVector, weight: 1.0)
+    .orMatchVector('embedding', otherVector, weight: 0.6, minScore: 0.2)
+    .or()
+    .whereEqual('category', 'tech')
+    .limit(10);
+
+print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
 ```
 
-Parameter notes:
+**Schema / vector index config** (`VectorFieldConfig`, `VectorIndexConfig`):
 
 - `dimensions`: must match the actual embedding width you write
 - `precision`: common choices include `float64`, `float32`, and `int8`; higher precision usually costs more storage
-- `distanceMetric`: `cosine` is common for semantic embeddings, `l2` suits Euclidean distance, and `innerProduct` suits dot-product search
-- `maxDegree`: upper bound of neighbors retained per node in the NGH graph; higher values usually improve recall at the cost of more memory and build time
-- `efSearch`: search-time expansion width; increasing it usually improves recall but increases latency
-- `constructionEf`: build-time expansion width; increasing it usually improves index quality but increases build time
-- `topK`: number of results to return
+- `distanceMetric`: index-side similarity metric used for insert and search; `cosine` is common for semantic embeddings, `l2` suits Euclidean distance, and `innerProduct` suits dot-product search. Changing it after data exists requires rebuilding the vector index.
 
-Result notes:
+**Chained retrieval parameters** (`matchVector` / `orMatchVector`, plus `limit` on the query chain):
 
-- `score`: normalized similarity score, typically in the `0 ~ 1` range; larger means more similar
-- `distance`: distance value; for `l2` and `cosine`, smaller usually means more similar
+- `field` / `vector`: target vector field and query vector (`VectorData` / `List<num>` / `Float32List`)
+- `searchDepth`: optional search thoroughness in `[1, 100]` (**not** a recall%); higher usually means better recall intent and higher latency, lower is faster but may miss neighbors; omit to use engine default `80`
+- `weight`: fusion weight for this recall channel in multi-way retrieval; default `1.0`
+- `minScore`: normalized similarity floor in `[0.0 ~ 1.0]`; candidates below it are dropped
+- `distanceThreshold`: distance ceiling; candidates beyond it are excluded
+- `limit`: number of results to return (equivalent to topK in typical ANN usage)
+
+**Result notes** (`QueryResult`):
+
+- Business rows are in `data`; retrieval scores and channel info are in `retrieval.entries`, aligned **1:1** with `data`
+- `entry.score`: normalized similarity / fusion score, typically in `0 ~ 1`; larger means more relevant
+- `entry.meta['distance']`: raw distance (common on the vector channel); for `l2` / `cosine`, smaller usually means closer
+- `retrieval.fusionMethod`: usually `single` for one channel; multi-way fused recall is typically `rrf` (Reciprocal Rank Fusion)
 
 ### Table-level TTL
 
@@ -1534,7 +1579,7 @@ if (result.hasErrors) {
 #### 2. Batch Write Fine-Grained Diagnosis
 
 ```dart
-final batchResult = await db.insertAll('users', [
+final batchResult = await db.batchInsert('users', [
   {'username': 'alice', 'email': 'alice@example.com'},
   {'username': 'bob', 'email': 'invalid-email-format'}, // Validation fails
 ]);

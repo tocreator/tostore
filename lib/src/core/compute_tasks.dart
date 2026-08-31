@@ -880,7 +880,11 @@ Future<MigrationRecordProcessResult> processMigrationRecords(
   }
 }
 
-/// Apply field modification to a single record
+/// Apply field modification to a single record.
+///
+/// Constraint/type adjustments are applied silently on the hot path — logging
+/// every row can freeze the UI on large tables. Callers that need a notice
+/// should emit a single summary warn before bulk rewrite.
 Map<String, dynamic> applyFieldModification(
     Map<String, dynamic> record, FieldSchemaUpdate fieldUpdate,
     {FieldSchema? oldFieldSchema, String tableName = ''}) {
@@ -919,12 +923,8 @@ Map<String, dynamic> applyFieldModification(
       record[fieldUpdate.name] = fieldSchema.convertValue(
         record[fieldUpdate.name],
       );
-    } catch (e) {
-      final invalidValue = record[fieldUpdate.name];
+    } catch (_) {
       record[fieldUpdate.name] = fieldSchema.getDefaultValue();
-      Logger.warn(
-          'Failed to convert field ${fieldUpdate.name} in table "$tableName" (value: $invalidValue) to type ${fieldUpdate.type}, using default value',
-          rawError: e);
     }
   }
 
@@ -933,28 +933,15 @@ Map<String, dynamic> applyFieldModification(
       !fieldUpdate.nullable! &&
       record[fieldUpdate.name] == null) {
     record[fieldUpdate.name] = fieldSchema.getDefaultValue();
-    Logger.debug(
-      'Field ${fieldUpdate.name} in table "$tableName" is now non-nullable, applied default value',
-    );
   }
 
   // 3. Process default value changes
   if (fieldUpdate.isExplicitlySet('defaultValue') &&
       record[fieldUpdate.name] == null) {
     record[fieldUpdate.name] = fieldUpdate.defaultValue;
-    Logger.debug(
-      'Field ${fieldUpdate.name} in table "$tableName" has new default value, applied to null value',
-    );
   }
 
-  // 4. Process unique constraint changes (only log, do not directly process data itself)
-  if (fieldUpdate.unique != null && fieldUpdate.unique!) {
-    Logger.debug(
-      'Field ${fieldUpdate.name} in table "$tableName" now has unique constraint, further validation may be needed',
-    );
-  }
-
-  // 5. Process length constraint changes (only log, do not directly process data itself)
+  // 4. Process length constraint changes
   if ((fieldUpdate.isExplicitlySet('maxLength') ||
           fieldUpdate.isExplicitlySet('minLength')) &&
       record[fieldUpdate.name] is String) {
@@ -963,21 +950,15 @@ Map<String, dynamic> applyFieldModification(
         fieldUpdate.maxLength != null &&
         value.length > fieldUpdate.maxLength!) {
       record[fieldUpdate.name] = value.substring(0, fieldUpdate.maxLength!);
-      Logger.warn(
-        'Field ${fieldUpdate.name} in table "$tableName" (value: "$value") exceeds max length of ${fieldUpdate.maxLength}, truncated',
-      );
     }
     if (fieldUpdate.isExplicitlySet('minLength') &&
         fieldUpdate.minLength != null &&
         value.length < fieldUpdate.minLength!) {
       record[fieldUpdate.name] = fieldSchema.getDefaultValue();
-      Logger.warn(
-        'Field ${fieldUpdate.name} in table "$tableName" (value: "$value") is shorter than min length of ${fieldUpdate.minLength}, using default value',
-      );
     }
   }
 
-  // 6. Process value range constraint changes (only log, do not directly process data itself)
+  // 5. Process value range constraint changes
   if ((fieldUpdate.isExplicitlySet('minValue') ||
           fieldUpdate.isExplicitlySet('maxValue')) &&
       record[fieldUpdate.name] is num) {
@@ -987,32 +968,22 @@ Map<String, dynamic> applyFieldModification(
         fieldUpdate.minValue != null &&
         value < fieldUpdate.minValue!) {
       record[fieldUpdate.name] = fieldUpdate.minValue;
-      Logger.warn(
-        'Field ${fieldUpdate.name} in table "$tableName" (value: $value) below min value of ${fieldUpdate.minValue}, set to min',
-      );
     }
 
     if (fieldUpdate.isExplicitlySet('maxValue') &&
         fieldUpdate.maxValue != null &&
         value > fieldUpdate.maxValue!) {
       record[fieldUpdate.name] = fieldUpdate.maxValue;
-      Logger.warn(
-        'Field ${fieldUpdate.name} in table "$tableName" (value: $value) exceeds max value of ${fieldUpdate.maxValue}, set to max',
-      );
     }
   }
 
-  // 7. Final validation
+  // 6. Final validation
   final validationErr = fieldSchema.getValidationError(
     record[fieldUpdate.name],
     tableName: tableName,
   );
   if (validationErr != null) {
-    final invalidValue = record[fieldUpdate.name];
     record[fieldUpdate.name] = fieldSchema.getDefaultValue();
-    Logger.warn(
-      'Field ${fieldUpdate.name} in table "$tableName" value ($invalidValue) does not meet constraints after updates, using default value: "${fieldSchema.getDefaultValue()}". Error: $validationErr',
-    );
   }
 
   return record;

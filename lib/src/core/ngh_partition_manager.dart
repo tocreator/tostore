@@ -122,8 +122,10 @@ final class NghPartitionManager {
   int get configuredPageSize => _dataStore.configuredPageSize;
 
   void _initCaches(int indexBudget) {
-    final nghBudget = (indexBudget * 0.60).round();
-    final int minThreshold = 50 * 1024 * 1024;
+    // Search prefers the float compact cluster cache; keep posting pages smaller.
+    final nghBudget = max(1, (indexBudget * 0.35).round());
+    // Never force a min floor above the actual budget (avoids OOM on small devices).
+    final int minThreshold = max(1, min(nghBudget ~/ 2, 16 * 1024 * 1024));
     _postingPageCache = TreeCache<NghPostingPage>(
       sizeCalculator: (page) => page.estimatePayloadSize() + 32,
       maxByteThreshold: nghBudget,
@@ -217,6 +219,7 @@ final class NghPartitionManager {
     NghIndexMeta meta,
     List<int> packedRefs, {
     Map<int, NghPostingPage>? localCache,
+    bool populatePageCache = true,
   }) async {
     if (packedRefs.isEmpty) return const [];
     final results = <({int packedRef, NghPostingPage page})>[];
@@ -246,18 +249,12 @@ final class NghPartitionManager {
 
     final pageSize = _dataStore.configuredPageSize;
     final tableUid = table.tableUid;
-    final yc = YieldController(
-      'NghPartitionManager.readPostingPagesBatch',
-      checkInterval: 2,
-      budgetMs: 20,
-    );
 
-    for (final entry in missingByPartition.entries) {
-      final y = yc.maybeYield();
-      if (y != null) await y;
-
-      final part = entry.key;
-      final missingPacked = entry.value;
+    Future<List<({int packedRef, NghPostingPage page})>> readOnePartition(
+      int part,
+      List<int> missingPacked,
+    ) async {
+      final partResults = <({int packedRef, NghPostingPage page})>[];
       final path = _dataStore.pathManager
           .getNghPostingPartitionPathByContext(table, indexUid, part);
       final ranges = <ByteReadRange>[
@@ -281,11 +278,37 @@ final class NghPartitionManager {
           final page = NghPostingPage.tryDecodePayload(
               _decodePayload(parsed.encodedPayload));
           if (page != null) {
-            _postingPageCache.putPoint4(tableUid, indexUid, part, pageNo, page);
+            if (populatePageCache) {
+              _postingPageCache.putPoint4(
+                  tableUid, indexUid, part, pageNo, page);
+            }
             localCache?[packed] = page;
-            results.add((packedRef: packed, page: page));
+            partResults.add((packedRef: packed, page: page));
           }
         } catch (_) {}
+      }
+      return partResults;
+    }
+
+    final partitions = missingByPartition.entries.toList(growable: false);
+    if (partitions.length == 1) {
+      results.addAll(await readOnePartition(
+        partitions.first.key,
+        partitions.first.value,
+      ));
+    } else {
+      final tasks = [
+        for (final entry in partitions)
+          () => readOnePartition(entry.key, entry.value),
+      ];
+      final partLists = await ParallelProcessor.execute<
+          List<({int packedRef, NghPostingPage page})>>(
+        tasks,
+        concurrency: min(5, tasks.length),
+        label: 'readPostingPagesBatch',
+      );
+      for (final partList in partLists) {
+        if (partList != null) results.addAll(partList);
       }
     }
     return results;

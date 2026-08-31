@@ -8,6 +8,7 @@ import '../core/index_manager.dart';
 import '../core/promote_primary_key.dart';
 import '../core/transaction_context.dart';
 import '../core/tree_cache.dart';
+import '../core/vector_search_timing.dart';
 import '../core/workload_scheduler.dart';
 import '../core/yield_controller.dart';
 import '../handler/binary_schema_codec.dart';
@@ -4459,22 +4460,41 @@ class QueryExecutor {
     }
 
     final int candidateK = effectiveOffset + effectiveLimit + 1;
-    final vecResults = await vectorIndexMgr.vectorSearch(
-      table: table,
-      fieldName: spec.field,
-      queryVector: spec.vector,
-      topK: candidateK,
-      efSearch: spec.efSearch,
-      distanceThreshold: spec.distanceThreshold,
-    );
+    final timing = VectorSearchPhaseRecorder.traceEnabled
+        ? VectorSearchPhaseRecorder()
+        : null;
+
+    final vecResults = timing != null
+        ? await timing.phaseAsync(
+            'exec.vectorSearch',
+            () => vectorIndexMgr.vectorSearch(
+              table: table,
+              fieldName: spec.field,
+              queryVector: spec.vector,
+              topK: candidateK,
+              searchDepth: spec.searchDepth,
+              distanceThreshold: spec.distanceThreshold,
+              timing: timing,
+            ),
+          )
+        : await vectorIndexMgr.vectorSearch(
+            table: table,
+            fieldName: spec.field,
+            queryVector: spec.vector,
+            topK: candidateK,
+            searchDepth: spec.searchDepth,
+            distanceThreshold: spec.distanceThreshold,
+          );
 
     if (vecResults.isEmpty) {
       stopwatch?.stop();
+      timing?.logSummary(tag: 'vector-empty');
       return ExecuteResult(
         records: const [],
-        retrieval: const RetrievalContext(
-          entries: [],
+        retrieval: RetrievalContext(
+          entries: const [],
           fusionMethod: RetrievalFusionMethod.single,
+          meta: timing?.toMeta(),
         ),
         executionTimeMs: stopwatch?.elapsedMilliseconds,
       );
@@ -4482,46 +4502,94 @@ class QueryExecutor {
 
     var candidates = vecResults;
     if (spec.minScore != null) {
-      candidates = candidates.where((r) => r.score >= spec.minScore!).toList();
+      candidates = timing != null
+          ? timing.phase(
+              'exec.minScoreFilter',
+              () => candidates.where((r) => r.score >= spec.minScore!).toList(),
+            )
+          : candidates.where((r) => r.score >= spec.minScore!).toList();
     }
 
     final bool hasMore = candidates.length > (effectiveOffset + effectiveLimit);
-    final pageCandidates =
-        candidates.skip(effectiveOffset).take(effectiveLimit).toList();
+    final int start = min(effectiveOffset, candidates.length);
+    final int end = min(candidates.length, effectiveOffset + effectiveLimit);
+    final pageCandidates = start == 0 && end == candidates.length
+        ? candidates
+        : candidates.sublist(start, end);
 
     final pks = [for (final c in pageCandidates) c.primaryKey];
-    final recordsMap = await _dataStore.tableDataManager.queryRecordsMapBatch(
-      table,
-      pks,
-      readFromFileOnly: readFromFileOnly,
-    );
+    final recordsMap = timing != null
+        ? await timing.phaseAsync(
+            'exec.recordHydrate',
+            () => _dataStore.tableDataManager.queryRecordsMapBatch(
+              table,
+              pks,
+              readFromFileOnly: readFromFileOnly,
+            ),
+          )
+        : await _dataStore.tableDataManager.queryRecordsMapBatch(
+            table,
+            pks,
+            readFromFileOnly: readFromFileOnly,
+          );
 
     final records = <Map<String, dynamic>>[];
     final entries = <RetrievalEntry>[];
 
-    for (int i = 0; i < pageCandidates.length; i++) {
-      final cand = pageCandidates[i];
-      final rec = recordsMap[cand.primaryKey];
-      if (rec != null) {
-        final Map<String, dynamic> row;
-        if (promoteDesc != null && applyPromoteResultTransform) {
-          row = Map<String, dynamic>.from(rec);
-          transformPromoteOldToNewInPlace(row, promoteDesc);
-        } else {
-          row = rec;
+    if (timing != null) {
+      timing.phase('exec.assemble', () {
+        for (int i = 0; i < pageCandidates.length; i++) {
+          final cand = pageCandidates[i];
+          final rec = recordsMap[cand.primaryKey];
+          if (rec != null) {
+            final Map<String, dynamic> row;
+            if (promoteDesc != null && applyPromoteResultTransform) {
+              row = Map<String, dynamic>.from(rec);
+              transformPromoteOldToNewInPlace(row, promoteDesc);
+            } else {
+              row = rec;
+            }
+            records.add(row);
+            entries.add(RetrievalEntry(
+              score: cand.score,
+              channel: RetrievalChannel.vector,
+              rawScore: cand.distance,
+              meta: {
+                'distance': cand.distance,
+                'field': spec.field,
+              },
+            ));
+          }
         }
-        records.add(row);
-        entries.add(RetrievalEntry(
-          score: cand.score,
-          channel: RetrievalChannel.vector,
-          rawScore: cand.distance,
-          meta: {
-            'distance': cand.distance,
-            'field': spec.field,
-          },
-        ));
+      });
+    } else {
+      for (int i = 0; i < pageCandidates.length; i++) {
+        final cand = pageCandidates[i];
+        final rec = recordsMap[cand.primaryKey];
+        if (rec != null) {
+          final Map<String, dynamic> row;
+          if (promoteDesc != null && applyPromoteResultTransform) {
+            row = Map<String, dynamic>.from(rec);
+            transformPromoteOldToNewInPlace(row, promoteDesc);
+          } else {
+            row = rec;
+          }
+          records.add(row);
+          entries.add(RetrievalEntry(
+            score: cand.score,
+            channel: RetrievalChannel.vector,
+            rawScore: cand.distance,
+            meta: {
+              'distance': cand.distance,
+              'field': spec.field,
+            },
+          ));
+        }
       }
     }
+
+    timing?.logSummary(tag: 'vector-top$effectiveLimit');
+    final timingMeta = timing?.toMeta();
 
     stopwatch?.stop();
     return ExecuteResult(
@@ -4529,6 +4597,7 @@ class QueryExecutor {
       retrieval: RetrievalContext(
         entries: entries,
         fusionMethod: RetrievalFusionMethod.single,
+        meta: timingMeta != null && timingMeta.isNotEmpty ? timingMeta : null,
       ),
       hasMore: hasMore,
       hasPrev: effectiveOffset > 0,
@@ -4558,13 +4627,15 @@ class QueryExecutor {
       ]);
     }
 
-    final int recallPool = max((effectiveOffset + effectiveLimit) * 4, 100);
+    final int need = effectiveOffset + effectiveLimit;
+    // Over-fetch for AND filters, but never explode with large limits (UI freeze).
+    final int recallPool = max(need, min(need * 3, max(need + 64, 512)));
     final vecResults = await vectorIndexMgr.vectorSearch(
       table: table,
       fieldName: spec.field,
       queryVector: spec.vector,
       topK: recallPool,
-      efSearch: spec.efSearch,
+      searchDepth: spec.searchDepth,
       distanceThreshold: spec.distanceThreshold,
     );
 
@@ -4587,30 +4658,28 @@ class QueryExecutor {
       table.tableName.toString(),
     );
 
+    // Batch PK hydrate instead of one-by-one B+Tree lookups.
+    final candidatePks = <String>[];
+    final scoreFiltered = <VectorSearchResult>[];
+    for (final cand in vecResults) {
+      if (spec.minScore != null && cand.score < spec.minScore!) continue;
+      scoreFiltered.add(cand);
+      candidatePks.add(cand.primaryKey);
+    }
+
+    final recordsMap = candidatePks.isEmpty
+        ? const <String, Map<String, dynamic>>{}
+        : await _dataStore.tableDataManager.queryRecordsMapBatch(
+            table,
+            candidatePks,
+            readFromFileOnly: readFromFileOnly,
+          );
+
     final qualifiedCandidates =
         <({VectorSearchResult result, Map<String, dynamic> record})>[];
-    final yieldController =
-        YieldController('QueryExecutor.vectorFilterHydrate');
 
-    for (final cand in vecResults) {
-      final y = yieldController.maybeYield();
-      if (y != null) await y;
-
-      if (spec.minScore != null && cand.score < spec.minScore!) continue;
-
-      Map<String, dynamic>? rec;
-      if (!readFromFileOnly) {
-        rec = _dataStore.tableDataManager.getRecordByPrimaryKeySync(
-          table,
-          cand.primaryKey,
-        );
-      }
-      rec ??= await _dataStore.tableDataManager.getRecordByPrimaryKey(
-        table,
-        cand.primaryKey,
-        readFromFileOnly: readFromFileOnly,
-      );
-
+    for (final cand in scoreFiltered) {
+      final rec = recordsMap[cand.primaryKey];
       if (rec != null && matcher.matches(rec)) {
         qualifiedCandidates.add((result: cand, record: rec));
       }
@@ -4669,8 +4738,9 @@ class QueryExecutor {
     bool applyPromoteResultTransform = false,
     Stopwatch? stopwatch,
   }) async {
-    final int recallPerChannel =
-        max((effectiveOffset + effectiveLimit) * 3, 50);
+    final need = effectiveOffset + effectiveLimit;
+    // Cap channel recall so large limits don't inflate ANN heap / UI work.
+    final int recallPerChannel = max(need, min(need * 3, max(need + 64, 256)));
 
     final channelHits = <String,
         Map<
@@ -4693,72 +4763,95 @@ class QueryExecutor {
       );
     }
 
-    final yieldController = YieldController('QueryExecutor.hybridFusion');
+    // Run independent recall channels concurrently (vector + structured).
+    final branchTasks = <Future<
+        ({
+          String branchKey,
+          double weight,
+          Map<
+              String,
+              ({
+                int rank,
+                double? rawScore,
+                double score,
+                RetrievalChannel channel,
+                Map<String, dynamic>? meta
+              })> hits
+        })>>[];
 
     for (int branchIdx = 0; branchIdx < recallBranches.length; branchIdx++) {
       final branch = recallBranches[branchIdx];
       final branchKey = 'channel_$branchIdx';
-      final hits = <String,
-          ({
-        int rank,
-        double? rawScore,
-        double score,
-        RetrievalChannel channel,
-        Map<String, dynamic>? meta
-      })>{};
+      branchTasks.add(() async {
+        final hits = <String,
+            ({
+          int rank,
+          double? rawScore,
+          double score,
+          RetrievalChannel channel,
+          Map<String, dynamic>? meta
+        })>{};
+        var weight = 1.0;
 
-      if (_VectorMatchSpec.containsVector(branch)) {
-        final spec = _VectorMatchSpec.extract(branch);
-        if (spec != null) {
-          channelWeights[branchKey] = spec.weight;
-          final vecResults = await _dataStore.vectorIndexManager?.vectorSearch(
-                table: table,
-                fieldName: spec.field,
-                queryVector: spec.vector,
-                topK: recallPerChannel,
-                efSearch: spec.efSearch,
-                distanceThreshold: spec.distanceThreshold,
-              ) ??
-              const <VectorSearchResult>[];
+        if (_VectorMatchSpec.containsVector(branch)) {
+          final spec = _VectorMatchSpec.extract(branch);
+          if (spec != null) {
+            weight = spec.weight;
+            final vecResults =
+                await _dataStore.vectorIndexManager?.vectorSearch(
+                      table: table,
+                      fieldName: spec.field,
+                      queryVector: spec.vector,
+                      topK: recallPerChannel,
+                      searchDepth: spec.searchDepth,
+                      distanceThreshold: spec.distanceThreshold,
+                    ) ??
+                    const <VectorSearchResult>[];
 
-          int rank = 1;
-          for (final r in vecResults) {
-            if (spec.minScore != null && r.score < spec.minScore!) continue;
-            hits[r.primaryKey] = (
-              rank: rank++,
-              rawScore: r.distance,
-              score: r.score,
-              channel: RetrievalChannel.vector,
-              meta: {'distance': r.distance, 'field': spec.field},
-            );
+            int rank = 1;
+            for (final r in vecResults) {
+              if (spec.minScore != null && r.score < spec.minScore!) continue;
+              hits[r.primaryKey] = (
+                rank: rank++,
+                rawScore: r.distance,
+                score: r.score,
+                channel: RetrievalChannel.vector,
+                meta: {'distance': r.distance, 'field': spec.field},
+              );
+            }
+          }
+        } else {
+          final subResult = await execute(
+            table,
+            condition: QueryCondition.fromMap(branch),
+            limit: recallPerChannel,
+            readFromFileOnly: readFromFileOnly,
+          );
+
+          final pkField = table.schema.primaryKey;
+          for (int rank = 0; rank < subResult.records.length; rank++) {
+            final rec = subResult.records[rank];
+            final pk = rec[pkField]?.toString();
+            if (pk != null && pk.isNotEmpty) {
+              hits[pk] = (
+                rank: rank + 1,
+                rawScore: null,
+                score: 1.0 / (rank + 1),
+                channel: RetrievalChannel.structured,
+                meta: {'structuredBranch': branch},
+              );
+            }
           }
         }
-      } else {
-        channelWeights[branchKey] = 1.0;
-        final subResult = await execute(
-          table,
-          condition: QueryCondition.fromMap(branch),
-          limit: recallPerChannel,
-          readFromFileOnly: readFromFileOnly,
-        );
 
-        final pkField = table.schema.primaryKey;
-        for (int rank = 0; rank < subResult.records.length; rank++) {
-          final rec = subResult.records[rank];
-          final pk = rec[pkField]?.toString();
-          if (pk != null && pk.isNotEmpty) {
-            hits[pk] = (
-              rank: rank + 1,
-              rawScore: null,
-              score: 1.0 / (rank + 1),
-              channel: RetrievalChannel.structured,
-              meta: {'structuredBranch': branch},
-            );
-          }
-        }
-      }
+        return (branchKey: branchKey, weight: weight, hits: hits);
+      }());
+    }
 
-      channelHits[branchKey] = hits;
+    final branchResults = await Future.wait(branchTasks);
+    for (final branchResult in branchResults) {
+      channelWeights[branchResult.branchKey] = branchResult.weight;
+      channelHits[branchResult.branchKey] = branchResult.hits;
     }
 
     final rrfScores = <String, double>{};
@@ -4808,25 +4901,37 @@ class QueryExecutor {
     final records = <Map<String, dynamic>>[];
     final entries = <RetrievalEntry>[];
     int qualifiedOffsetCount = 0;
+    final fetchCount = globalMatcher != null
+        ? min(sortedPks.length, max(need * 3, need + 16))
+        : min(sortedPks.length, need);
+    final batchPks = sortedPks.sublist(0, fetchCount);
+    final recordsMap = batchPks.isEmpty
+        ? const <String, Map<String, dynamic>>{}
+        : await _dataStore.tableDataManager.queryRecordsMapBatch(
+            table,
+            batchPks,
+            readFromFileOnly: readFromFileOnly,
+          );
 
     for (int i = 0; i < sortedPks.length; i++) {
-      final y = yieldController.maybeYield();
-      if (y != null) await y;
-
       if (records.length >= effectiveLimit) {
         break;
       }
 
       final pk = sortedPks[i];
-      Map<String, dynamic>? rec;
-      if (!readFromFileOnly) {
-        rec = _dataStore.tableDataManager.getRecordByPrimaryKeySync(table, pk);
+      Map<String, dynamic>? rec = recordsMap[pk];
+      if (rec == null && i >= fetchCount) {
+        // Rare: overfetch window exhausted under heavy filter rejection.
+        if (!readFromFileOnly) {
+          rec =
+              _dataStore.tableDataManager.getRecordByPrimaryKeySync(table, pk);
+        }
+        rec ??= await _dataStore.tableDataManager.getRecordByPrimaryKey(
+          table,
+          pk,
+          readFromFileOnly: readFromFileOnly,
+        );
       }
-      rec ??= await _dataStore.tableDataManager.getRecordByPrimaryKey(
-        table,
-        pk,
-        readFromFileOnly: readFromFileOnly,
-      );
 
       if (rec != null) {
         // Global pre-filter validation (if global filter is specified)
@@ -4971,7 +5076,7 @@ class _VectorMatchSpec {
   final String field;
   final VectorData vector;
   final double weight;
-  final int? efSearch;
+  final int? searchDepth;
   final double? distanceThreshold;
   final double? minScore;
 
@@ -4979,7 +5084,7 @@ class _VectorMatchSpec {
     required this.field,
     required this.vector,
     this.weight = 1.0,
-    this.efSearch,
+    this.searchDepth,
     this.distanceThreshold,
     this.minScore,
   });
@@ -5004,7 +5109,7 @@ class _VectorMatchSpec {
             field: entry.key,
             vector: vec,
             weight: (payload['weight'] as num?)?.toDouble() ?? 1.0,
-            efSearch: payload['efSearch'] as int?,
+            searchDepth: payload['searchDepth'] as int?,
             distanceThreshold:
                 (payload['distanceThreshold'] as num?)?.toDouble(),
             minScore: (payload['minScore'] as num?)?.toDouble(),

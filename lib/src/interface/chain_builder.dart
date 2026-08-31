@@ -18,6 +18,7 @@ import '../model/table_schema.dart';
 import '../query/query_cache.dart';
 import '../query/query_condition.dart';
 import '../query/query_executor.dart';
+import 'engine_binding.dart';
 
 part '../chain/delete_builder.dart';
 part '../chain/query_builder.dart';
@@ -40,7 +41,13 @@ abstract final class QueryClauseMask {
 
 /// chain builder base class
 abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
-  final DataStoreImpl _db;
+  /// Pinned engine when no [EngineBinding] is provided (tests / internal).
+  final DataStoreImpl _pinnedDb;
+
+  /// When set (ToStore facades), [_db] always resolves to the live engine so
+  /// builders survive [ToStore.switchSpace].
+  final EngineBinding? _binding;
+
   final String _tableName;
   QueryCondition? _condition;
 
@@ -57,7 +64,11 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
   int? _offset;
   String? _cursor;
 
-  ChainBuilder(this._db, this._tableName);
+  ChainBuilder(this._pinnedDb, this._tableName, {EngineBinding? binding})
+      : _binding = binding;
+
+  /// Live engine (follows space switch when constructed with a binding).
+  DataStoreImpl get _db => _binding?.engine ?? _pinnedDb;
 
   /// get actual builder instance
   SELF get _self => this as SELF;

@@ -199,13 +199,22 @@ class TableSchema {
     return out;
   }
 
-  /// Get all indexes (Consolidated list of Explicit, Unique, and FK indexes)
+  /// Get all indexes (Consolidated list of Explicit, Unique, TTL, and FK indexes).
+  ///
   List<IndexSchema> getAllIndexes() {
     if (autoIndexes != null) {
-      return [
+      // Hot path: persisted / post-generateAutoIndexes — already normalized.
+      return <IndexSchema>[
         ...indexes,
         ...autoIndexes!,
       ];
+    }
+
+    Set<String>? uniqueNonPkFields;
+    for (final f in fields) {
+      if (f.unique && f.name != primaryKey) {
+        (uniqueNonPkFields ??= <String>{}).add(f.name);
+      }
     }
 
     final allIndexes = <IndexSchema>[];
@@ -216,7 +225,15 @@ class TableSchema {
         );
         continue;
       }
-      allIndexes.add(index);
+      // Inline Field.unique upgrade — only on declarative explicit indexes.
+      if (uniqueNonPkFields != null &&
+          !index.unique &&
+          index.fields.length == 1 &&
+          uniqueNonPkFields.contains(index.fields.first)) {
+        allIndexes.add(index.copyWith(unique: true));
+      } else {
+        allIndexes.add(index);
+      }
     }
     allIndexes.addAll(_computeRawImplicitIndexes());
     return allIndexes;
@@ -367,10 +384,20 @@ class TableSchema {
     final List<IndexSchema> populatedExplicitIndexes = [];
     for (final explicit in indexes) {
       IndexSchema resolvedExplicit = explicit;
+      // FieldSchema.unique + IndexSchema(fields:[f], unique:false) is one
+      // logical unique index. Upgrade so Index↔Field unique swaps inherit the
+      // existing indexUid instead of stripping unique and building a second idx.
+      if (!resolvedExplicit.unique &&
+          resolvedExplicit.fields.length == 1 &&
+          fields.any(
+              (f) => f.name == resolvedExplicit.fields.first && f.unique)) {
+        resolvedExplicit = resolvedExplicit.copyWith(unique: true);
+      }
       if (oldSchema != null) {
         final matched = findMatchingOldIndex(resolvedExplicit);
         if (matched != null && matched.indexUid.isNotEmpty) {
-          resolvedExplicit = explicit.copyWith(indexUid: matched.indexUid);
+          resolvedExplicit =
+              resolvedExplicit.copyWith(indexUid: matched.indexUid);
           claimedOldIndexUids.add(matched.indexUid.value);
         }
       }
@@ -434,10 +461,12 @@ class TableSchema {
       }
 
       if (field.unique) {
-        final alreadyHasUniqueIndex = indexes.any((i) =>
-            i.unique && i.fields.length == 1 && i.fields.first == field.name);
+        // Prefer a single-column explicit index on this field (unique already,
+        // or non-unique that generateAutoIndexes upgrades when field.unique).
+        final coveredByExplicitSingleFieldIndex = indexes
+            .any((i) => i.fields.length == 1 && i.fields.first == field.name);
 
-        if (!alreadyHasUniqueIndex) {
+        if (!coveredByExplicitSingleFieldIndex) {
           final uniqueIndexSchema = IndexSchema(
             indexName: field.name,
             fields: [field.name],
@@ -1108,34 +1137,6 @@ class TableSchema {
             wrongValue: fieldVectorConfig?.dimensions,
           )
         ]);
-      }
-
-      final vecIdxConfig = index.vectorConfig;
-      if (vecIdxConfig != null) {
-        if (vecIdxConfig.maxDegree != null && vecIdxConfig.maxDegree! <= 0) {
-          throw DbException([
-            SchemaValidationStatus(
-              type: ResultType.devInvalidSchemaIndexType,
-              message:
-                  'Vector index "${index.actualIndexName}" in table "$name" has invalid maxDegree ${vecIdxConfig.maxDegree}. maxDegree must be greater than 0.',
-              tableName: name,
-              field: targetFieldName,
-              wrongValue: vecIdxConfig.maxDegree,
-            )
-          ]);
-        }
-        if (vecIdxConfig.efSearch != null && vecIdxConfig.efSearch! <= 0) {
-          throw DbException([
-            SchemaValidationStatus(
-              type: ResultType.devInvalidSchemaIndexType,
-              message:
-                  'Vector index "${index.actualIndexName}" in table "$name" has invalid efSearch ${vecIdxConfig.efSearch}. efSearch must be greater than 0.',
-              tableName: name,
-              field: targetFieldName,
-              wrongValue: vecIdxConfig.efSearch,
-            )
-          ]);
-        }
       }
     } else if (index.type == IndexType.btree) {
       for (final fieldName in index.fields) {
@@ -3592,68 +3593,40 @@ enum VectorDistanceMetric {
 
 /// Vector Index Configuration for NGH (Node-Graph Hybrid) vector search.
 ///
-/// Configures how vector indexes are built and searched.
-/// This is used with [IndexSchema] when the index type is [IndexType.vector].
+/// semantic / structural choices belong here.
 ///
 /// Example:
 /// ```dart
 /// VectorIndexConfig(
 ///   distanceMetric: VectorDistanceMetric.cosine,
-///   maxDegree: 64,
-///   efSearch: 64,
-///   constructionEf: 128,
 /// )
 /// ```
 class VectorIndexConfig {
+  /// Default ANN [searchDepth] when a query omits the parameter (`1..100`).
+  ///
+  /// Quality-first thoroughness scale mapped to an engine probe budget —
+  /// **not** a recall percentage. Higher values usually improve recall intent
+  /// and increase latency. Depth `100` still does not promise 100% recall.
+  /// Override per call via [ToStore.vectorSearch] /
+  /// [QueryBuilder.matchVector].
+  static const int defaultSearchDepth = 80;
+
   /// Type of vector index. Currently only supports [VectorIndexType.ngh].
   final VectorIndexType indexType;
 
-  /// Distance metric for similarity search.
+  /// Distance metric for similarity search (also used during index insert).
   ///
   /// - [VectorDistanceMetric.l2]: Euclidean distance (lower = more similar)
   /// - [VectorDistanceMetric.cosine]: Cosine similarity (higher = more similar)
   /// - [VectorDistanceMetric.innerProduct]: Dot product (higher = more similar)
+  ///
+  /// Changing this after data exists requires rebuilding the vector index.
   final VectorDistanceMetric distanceMetric;
-
-  /// Maximum out-degree per graph node (R).
-  ///
-  /// Higher values improve recall but increase memory and construction time.
-  /// Recommended: 32 for mobile/edge, 64 for desktop/server.
-  final int? maxDegree;
-
-  /// Search expansion factor (ef_search).
-  ///
-  /// Controls the search quality--speed trade-off. Higher values improve
-  /// recall at the cost of latency. Standard ANN terminology.
-  final int? efSearch;
-
-  /// Expansion factor during graph construction (ef_construction).
-  ///
-  /// Higher values build a better-quality graph but take longer.
-  /// Typical range: 64-256.
-  final int? constructionEf;
-
-  /// Diversity parameter for Robust Prune (alpha >= 1.0).
-  ///
-  /// Higher values produce more diverse neighbor selections, improving recall
-  /// for high-dimensional data. Default 1.2.
-  final double? pruneAlpha;
-
-  /// Number of PQ sub-spaces (M).
-  ///
-  /// If null, automatically calculated as `dimensions / 8` (clamped to [8, 128]).
-  /// Must evenly divide the vector dimensions.
-  final int? pqSubspaces;
 
   /// Constructor
   const VectorIndexConfig({
     this.indexType = VectorIndexType.ngh,
     this.distanceMetric = VectorDistanceMetric.cosine,
-    this.maxDegree,
-    this.efSearch,
-    this.constructionEf,
-    this.pruneAlpha,
-    this.pqSubspaces,
   });
 
   /// Convert to JSON
@@ -3661,15 +3634,10 @@ class VectorIndexConfig {
     return {
       'indexType': indexType.name,
       'distanceMetric': distanceMetric.name,
-      if (maxDegree != null) 'maxDegree': maxDegree,
-      if (efSearch != null) 'efSearch': efSearch,
-      if (constructionEf != null) 'constructionEf': constructionEf,
-      if (pruneAlpha != null) 'pruneAlpha': pruneAlpha,
-      if (pqSubspaces != null) 'pqSubspaces': pqSubspaces,
     };
   }
 
-  /// Create from JSON
+  /// Create from JSON.
   factory VectorIndexConfig.fromJson(Map<String, dynamic> json) {
     VectorIndexType indexType = VectorIndexType.ngh;
     final typeStr = json['indexType'] as String?;
@@ -3690,22 +3658,9 @@ class VectorIndexConfig {
       }
     }
 
-    // Support both flat fields and legacy nested 'parameters' map
-    final params = json['parameters'] as Map<String, dynamic>? ?? json;
-
     return VectorIndexConfig(
       indexType: indexType,
       distanceMetric: distanceMetric,
-      maxDegree: (params['maxDegree'] as num?)?.toInt() ??
-          (json['maxDegree'] as num?)?.toInt(),
-      efSearch: (params['efSearch'] as num?)?.toInt() ??
-          (json['efSearch'] as num?)?.toInt(),
-      constructionEf: (params['constructionEf'] as num?)?.toInt() ??
-          (json['constructionEf'] as num?)?.toInt(),
-      pruneAlpha: (params['pruneAlpha'] as num?)?.toDouble() ??
-          (json['pruneAlpha'] as num?)?.toDouble(),
-      pqSubspaces: (params['pqSubspaces'] as num?)?.toInt() ??
-          (json['pqSubspaces'] as num?)?.toInt(),
     );
   }
 
@@ -3714,24 +3669,11 @@ class VectorIndexConfig {
     if (identical(this, other)) return true;
     if (other is! VectorIndexConfig) return false;
     return other.indexType == indexType &&
-        other.distanceMetric == distanceMetric &&
-        other.maxDegree == maxDegree &&
-        other.efSearch == efSearch &&
-        other.constructionEf == constructionEf &&
-        other.pruneAlpha == pruneAlpha &&
-        other.pqSubspaces == pqSubspaces;
+        other.distanceMetric == distanceMetric;
   }
 
   @override
-  int get hashCode => Object.hash(
-        indexType,
-        distanceMetric,
-        maxDegree,
-        efSearch,
-        constructionEf,
-        pruneAlpha,
-        pqSubspaces,
-      );
+  int get hashCode => Object.hash(indexType, distanceMetric);
 }
 
 /// Vector utility methods extension
