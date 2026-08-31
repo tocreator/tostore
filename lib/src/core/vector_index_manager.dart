@@ -12,7 +12,6 @@ import 'data_store_impl.dart';
 import 'ngh_graph_engine.dart';
 import 'ngh_partition_manager.dart';
 import 'vector_cache.dart';
-import 'vector_quantizer.dart';
 import 'vector_search_timing.dart';
 import 'workload_scheduler.dart';
 import 'yield_controller.dart';
@@ -153,9 +152,6 @@ class VectorIndexManager {
       var meta =
           await _getOrCreateMeta(table, indexUid, fieldName, fieldSchema, idx);
 
-      // NGH uses online ScalarQuantizer (SQ8) requiring zero training
-      final quantizer = VectorQuantizer.empty();
-
       // -- Process inserts --
       if (inserts.isNotEmpty) {
         final preparedVectors = await _prepareInsertVectorsBatch(
@@ -173,7 +169,6 @@ class VectorIndexManager {
             table: table,
             indexUid: indexUid,
             meta: meta,
-            quantizer: quantizer,
             vectors: vectors,
             primaryKeys: pks,
             yieldBudgetMs: 100,
@@ -285,8 +280,6 @@ class VectorIndexManager {
       return const [];
     }
 
-    final quantizer = VectorQuantizer.empty();
-
     late final Float32List queryF32;
     late Float32List searchQuery;
     late final bool alreadyNormalized;
@@ -320,7 +313,6 @@ class VectorIndexManager {
               table: table,
               indexUid: indexUid,
               meta: meta!,
-              quantizer: quantizer,
               query: searchQuery,
               topK: topK,
               searchDepth: searchDepth,
@@ -333,7 +325,6 @@ class VectorIndexManager {
             table: table,
             indexUid: indexUid,
             meta: meta,
-            quantizer: quantizer,
             query: searchQuery,
             topK: topK,
             searchDepth: searchDepth,
@@ -520,7 +511,6 @@ class VectorIndexManager {
       tableUid: table.tableUid,
       dimensions: dims,
       distanceMetric: vc?.distanceMetric ?? VectorDistanceMetric.cosine,
-      precision: fieldSchema.vectorConfig?.precision ?? VectorPrecision.float32,
     );
 
     _vectorCache.putMeta(table, indexUid, meta);

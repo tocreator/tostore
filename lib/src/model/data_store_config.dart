@@ -1026,12 +1026,6 @@ class EncryptionConfig {
   /// Rotate online via `rotateEncryptionKey` -- does not rewrite table data.
   final String? encryptionKey;
 
-  /// Whether to encrypt vector index data (NGH graph pages, PQ codes, raw vectors).
-  ///
-  /// **Deprecated:** conflicts with [EncryptionScope.full]. Prefer `encryptionScope: full`.
-  @Deprecated('Use EncryptionScope.full instead')
-  final bool encryptVectorIndex;
-
   /// The encryption scope configures how much of the database engine is encrypted.
   /// standard: Default standard encryption, encrypts key data such as table data, index data, and log data.
   /// full: Full encryption, encrypts the entire engine files completely.
@@ -1041,8 +1035,6 @@ class EncryptionConfig {
     this.encryptionType = EncryptionType.none,
     this.encodingKey,
     this.encryptionKey,
-    @Deprecated('Use EncryptionScope.full instead')
-    this.encryptVectorIndex = false,
     this.encryptionScope = EncryptionScope.standard,
   });
 
@@ -1062,12 +1054,10 @@ class EncryptionConfig {
     return defaultEncryptionKey;
   }
 
-  /// True when vector pages should be encrypted (full scope, or legacy flag).
+  /// True when vector pages should be encrypted ([EncryptionScope.full]).
   bool get shouldEncryptVectorIndex {
     if (encryptionType == EncryptionType.none) return false;
-    if (encryptionScope == EncryptionScope.full) return true;
-    // ignore: deprecated_member_use_from_same_package
-    return encryptVectorIndex;
+    return encryptionScope == EncryptionScope.full;
   }
 
   /// Create from JSON
@@ -1080,8 +1070,6 @@ class EncryptionConfig {
           : EncryptionType.xorObfuscation,
       encodingKey: json['encodingKey'] as String?,
       encryptionKey: json['encryptionKey'] as String?,
-      // ignore: deprecated_member_use_from_same_package
-      encryptVectorIndex: json['encryptVectorIndex'] as bool? ?? false,
       encryptionScope: json['encryptionScope'] != null
           ? EncryptionScopeExtension.fromConfigString(
               json['encryptionScope'] as String?,
@@ -1105,15 +1093,12 @@ class EncryptionConfig {
     EncryptionType? encryptionType,
     String? encodingKey,
     String? encryptionKey,
-    @Deprecated('Use EncryptionScope.full instead') bool? encryptVectorIndex,
     EncryptionScope? encryptionScope,
   }) {
     return EncryptionConfig(
       encryptionType: encryptionType ?? this.encryptionType,
       encodingKey: encodingKey ?? this.encodingKey,
       encryptionKey: encryptionKey ?? this.encryptionKey,
-      // ignore: deprecated_member_use_from_same_package
-      encryptVectorIndex: encryptVectorIndex ?? this.encryptVectorIndex,
       encryptionScope: encryptionScope ?? this.encryptionScope,
     );
   }

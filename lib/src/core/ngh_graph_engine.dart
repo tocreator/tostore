@@ -14,7 +14,7 @@ import 'vector_search_timing.dart';
 import 'yield_controller.dart';
 
 // ============================================================================
-// NGH Graph Engine -- Adaptive Inverted Navigating Graph Architecture
+// NGH Graph Engine
 //
 // Responsibilities:
 //   1. In-memory light-weight navigating centroid graph (microsecond synchronous routing)
@@ -506,7 +506,6 @@ class NghGraphEngine {
       table: table,
       indexUid: indexUid,
       meta: meta,
-      quantizer: VectorQuantizer.empty(),
       query: q,
       topK: 10,
       queryAlreadyNormalized:
@@ -515,7 +514,7 @@ class NghGraphEngine {
   }
 
   // =====================================================================
-  // Search -- DiskANN Architecture (In-Memory Centroid-Routed SQ8 Filter + Precise Disk Fetch)
+  // Search -- centroid-routed filter + candidate ranking
   // =====================================================================
 
   /// Select top-[nprobe] centroid ids by exact distance (partial selection).
@@ -608,7 +607,6 @@ class NghGraphEngine {
     required TableContext table,
     required IndexUid indexUid,
     required NghIndexMeta meta,
-    required VectorQuantizer quantizer,
     required Float32List query,
     required int topK,
     int? searchDepth,
@@ -1024,10 +1022,8 @@ class NghGraphEngine {
     required TableContext table,
     required IndexUid indexUid,
     required NghIndexMeta meta,
-    required VectorQuantizer quantizer,
     required List<Float32List> vectors,
     required List<String> primaryKeys,
-    List<Uint8List>? pqCodes,
     int? yieldBudgetMs,
   }) async {
     if (vectors.isEmpty) {
@@ -1361,7 +1357,6 @@ class NghGraphEngine {
 
     currentMeta = currentMeta.copyWith(
       nextNodeId: currentMeta.nextNodeId + vectors.length,
-      centroidCount: centroids.length,
     );
 
     // Step 6: Construct updated NavGraphPage and sync in-memory compact cache
@@ -1394,7 +1389,7 @@ class NghGraphEngine {
     _enforceClusterCacheBudget(protectKey: cacheKey);
 
     return NghInsertResult(
-      meta: currentMeta.copyWith(centroidCount: centroids.length),
+      meta: currentMeta,
       dirtyPostingPages: dirtyPosting,
       navGraphPage: navGraphPage,
       insertedCount: vectors.length,

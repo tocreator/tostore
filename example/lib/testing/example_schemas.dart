@@ -136,7 +136,6 @@ class ExampleSchemas {
         type: DataType.vector,
         vectorConfig: VectorFieldConfig(
           dimensions: 512,
-          precision: VectorPrecision.float32,
         ),
       ),
     ],
@@ -145,6 +144,7 @@ class ExampleSchemas {
         fields: ['embedding'],
         type: IndexType.vector,
         vectorConfig: VectorIndexConfig(
+          indexType: VectorIndexType.ngh,
           distanceMetric: VectorDistanceMetric.cosine,
         ),
       ),

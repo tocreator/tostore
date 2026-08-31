@@ -78,8 +78,7 @@ EncryptionConfig({
   EncryptionType encryptionType, // none | xorObfuscation | chacha20Poly1305 | aes256Gcm
   String? encodingKey,   // data key — change → background rewrite
   String? encryptionKey, // master key protecting encodingKey — rotate online
-  EncryptionScope encryptionScope, // standard | full
-  bool encryptVectorIndex,
+  EncryptionScope encryptionScope, // standard | full (full also encrypts vector index pages)
 });
 ```
 

@@ -5,7 +5,7 @@ import '../handler/platform_byte_data.dart';
 import 'btree_page.dart';
 
 // ============================================================================
-// NGH (Node-Graph Hybrid) Page Structures -- Modern Zero-Residue Architecture
+// NGH Page Structures
 //
 // All pages reuse BTreePageHeader (20-byte header with magic/CRC/type/flags)
 // and BTreePageIO for encoding/decoding.

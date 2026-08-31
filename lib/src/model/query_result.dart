@@ -293,7 +293,7 @@ class VectorSearchResult {
 
 /// Represents the retrieval channel / modality for candidate recall.
 enum RetrievalChannel {
-  /// Dense vector similarity search (NGH / HNSW / DiskANN etc.)
+  /// Dense vector similarity search (NGH).
   vector,
 
   /// Lexical / Fulltext search (BM25 / Inverted Index / Token Match)

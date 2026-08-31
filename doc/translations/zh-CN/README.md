@@ -735,7 +735,6 @@ await db.createTables([
         nullable: false,
         vectorConfig: VectorFieldConfig(
           dimensions: 128, // 向量维度；写入和查询时的向量长度都必须一致
-          precision: VectorPrecision.float32, // 存储精度；float32 通常兼顾精度与空间占用
         ),
       ),
     ],
@@ -744,7 +743,7 @@ await db.createTables([
         fields: ['embedding'], // 要建立向量索引的字段
         type: IndexType.vector,  // 构建向量索引
         vectorConfig: VectorIndexConfig(
-          indexType: VectorIndexType.ngh,  // 向量索引类型；当前内置为 NGH
+          indexType: VectorIndexType.ngh,  // NGH：ToStore 自研稠密向量索引
           distanceMetric: VectorDistanceMetric.cosine, // 距离度量；适合归一化后的 embedding
         ),
       ),
@@ -794,7 +793,7 @@ print('fusion=${fused.retrieval?.fusionMethod}'); // 多路时通常为 rrf
 **表结构 / 向量索引配置**（`VectorFieldConfig`、`VectorIndexConfig`）：
 
 - `dimensions`：向量维度，必须与实际写入的 embedding 长度一致。
-- `precision`：向量存储精度，常见可选值有 `float64`、`float32`、`int8`；精度越高，存储开销通常越大。
+- `indexType`：稠密向量算法标识；当前为 `ngh`。
 - `distanceMetric`：索引侧相似度度量（构建与检索共用）；`cosine` 常用于语义 embedding，`l2` 适合欧氏距离场景，`innerProduct` 适合点积检索。数据写入后若修改通常需要重建向量索引。
 
 **链式检索参数**（`matchVector` / `orMatchVector`，以及查询链上的 `limit`）：

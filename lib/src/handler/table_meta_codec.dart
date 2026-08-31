@@ -84,7 +84,6 @@ abstract final class TableTtlConfigFieldId {
 
 abstract final class VectorFieldConfigFieldId {
   static const int dimensions = 1;
-  static const int precision = 2;
 }
 
 abstract final class VectorIndexConfigFieldId {
@@ -743,28 +742,21 @@ final class TableMetaCodec {
   static void _writeVectorFieldConfig(BinaryWriter w, VectorFieldConfig c) {
     w.writeFieldTag(VectorFieldConfigFieldId.dimensions, WireType.varint);
     w.writeVarint(c.dimensions);
-    w.writeFieldTag(VectorFieldConfigFieldId.precision, WireType.varint);
-    w.writeVarint(c.precision.index);
   }
 
   static VectorFieldConfig _readVectorFieldConfig(BinaryReader r) {
     int dimensions = 0;
-    VectorPrecision precision = VectorPrecision.float64;
     while (!r.isEOF) {
       final (fid, wireType) = r.readFieldTag();
       switch (fid) {
         case VectorFieldConfigFieldId.dimensions:
           dimensions = r.readVarint();
           break;
-        case VectorFieldConfigFieldId.precision:
-          precision = VectorPrecision.values[
-              r.readVarint().clamp(0, VectorPrecision.values.length - 1)];
-          break;
         default:
           r.skipField(wireType);
       }
     }
-    return VectorFieldConfig(dimensions: dimensions, precision: precision);
+    return VectorFieldConfig(dimensions: dimensions);
   }
 
   static void _writeVectorIndexConfig(BinaryWriter w, VectorIndexConfig c) {

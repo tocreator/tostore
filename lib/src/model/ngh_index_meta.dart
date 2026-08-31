@@ -4,7 +4,7 @@ import 'table_identity.dart';
 import 'table_schema.dart';
 
 // ============================================================================
-// NGH (Node-Graph Hybrid) Vector Index Metadata
+// NGH Vector Index Metadata
 // ============================================================================
 
 /// Metadata for an NGH vector index instance.
@@ -25,9 +25,6 @@ class NghIndexMeta {
   /// Distance metric used for similarity computation.
   final VectorDistanceMetric distanceMetric;
 
-  /// Storage precision for raw vectors.
-  final VectorPrecision precision;
-
   /// Creation / last-modified timestamps.
   final Timestamps timestamps;
 
@@ -38,9 +35,6 @@ class NghIndexMeta {
 
   /// Number of tombstoned (logically deleted) vectors.
   final int deletedCount;
-
-  /// Entry-point node for greedy search (medoid of the dataset).
-  final int medoidNodeId;
 
   /// Next node ID to allocate (monotonically increasing).
   final int nextNodeId;
@@ -62,9 +56,6 @@ class NghIndexMeta {
   /// Whether this index is currently being built by a background migration task.
   final bool isBuilding;
 
-  /// Number of centroids currently in the navigating graph.
-  final int centroidCount;
-
   // ===================== Constructor ===========================
 
   NghIndexMeta({
@@ -73,15 +64,12 @@ class NghIndexMeta {
     required this.tableUid,
     required this.dimensions,
     required this.distanceMetric,
-    required this.precision,
     required this.timestamps,
     this.totalVectors = 0,
     this.deletedCount = 0,
-    this.medoidNodeId = -1,
     this.nextNodeId = 0,
     this.totalSizeBytes = 0,
     this.isBuilding = false,
-    this.centroidCount = 0,
     this.postingPartitionCount = 1,
     this.postingNextPageNo = firstDataPageNo,
     Map<int, int>? postingFreeListHeads,
@@ -101,7 +89,6 @@ class NghIndexMeta {
     required TableUid tableUid,
     required int dimensions,
     VectorDistanceMetric distanceMetric = VectorDistanceMetric.cosine,
-    VectorPrecision precision = VectorPrecision.float32,
     DateTime? now,
     bool isBuilding = false,
   }) {
@@ -111,7 +98,6 @@ class NghIndexMeta {
       tableUid: tableUid,
       dimensions: dimensions,
       distanceMetric: distanceMetric,
-      precision: precision,
       timestamps: Timestamps(created: ts, modified: ts),
       isBuilding: isBuilding,
     );
@@ -125,15 +111,12 @@ class NghIndexMeta {
     TableUid? tableUid,
     int? dimensions,
     VectorDistanceMetric? distanceMetric,
-    VectorPrecision? precision,
     Timestamps? timestamps,
     int? totalVectors,
     int? deletedCount,
-    int? medoidNodeId,
     int? nextNodeId,
     int? totalSizeBytes,
     bool? isBuilding,
-    int? centroidCount,
     int? postingPartitionCount,
     int? postingNextPageNo,
     Map<int, int>? postingFreeListHeads,
@@ -144,15 +127,12 @@ class NghIndexMeta {
       tableUid: tableUid ?? this.tableUid,
       dimensions: dimensions ?? this.dimensions,
       distanceMetric: distanceMetric ?? this.distanceMetric,
-      precision: precision ?? this.precision,
       timestamps: timestamps ?? this.timestamps,
       totalVectors: totalVectors ?? this.totalVectors,
       deletedCount: deletedCount ?? this.deletedCount,
-      medoidNodeId: medoidNodeId ?? this.medoidNodeId,
       nextNodeId: nextNodeId ?? this.nextNodeId,
       totalSizeBytes: totalSizeBytes ?? this.totalSizeBytes,
       isBuilding: isBuilding ?? this.isBuilding,
-      centroidCount: centroidCount ?? this.centroidCount,
       postingPartitionCount:
           postingPartitionCount ?? this.postingPartitionCount,
       postingNextPageNo: postingNextPageNo ?? this.postingNextPageNo,
@@ -170,19 +150,16 @@ class NghIndexMeta {
       tableUid: TableUid((json['tableUid'] ?? json['tableName']) as String),
       dimensions: (json['dimensions'] as num).toInt(),
       distanceMetric: _parseDistanceMetric(json['distanceMetric'] as String?),
-      precision: _parsePrecision(json['precision'] as String?),
       timestamps:
           Timestamps.fromJson(json['timestamps'] as Map<String, dynamic>),
       totalVectors: (json['totalVectors'] as num?)?.toInt() ?? 0,
       deletedCount: (json['deletedCount'] as num?)?.toInt() ?? 0,
-      medoidNodeId: (json['medoidNodeId'] as num?)?.toInt() ?? -1,
       nextNodeId: (json['nextNodeId'] as num?)?.toInt() ?? 0,
       totalSizeBytes:
           ((json['totalSizeBytes'] ?? json['totalSizeInBytes']) as num?)
                   ?.toInt() ??
               0,
       isBuilding: (json['isBuilding'] as bool?) ?? false,
-      centroidCount: (json['centroidCount'] as num?)?.toInt() ?? 0,
       postingPartitionCount:
           (json['postingPartitionCount'] as num?)?.toInt() ?? 1,
       postingNextPageNo:
@@ -198,15 +175,12 @@ class NghIndexMeta {
       'tableUid': tableUid,
       'dimensions': dimensions,
       'distanceMetric': distanceMetric.name,
-      'precision': precision.name,
       'timestamps': timestamps.toJson(),
       'totalVectors': totalVectors,
       'deletedCount': deletedCount,
-      'medoidNodeId': medoidNodeId,
       'nextNodeId': nextNodeId,
       'totalSizeBytes': totalSizeBytes,
       'isBuilding': isBuilding,
-      'centroidCount': centroidCount,
       'postingPartitionCount': postingPartitionCount,
       'postingNextPageNo': postingNextPageNo,
       'postingFreeListHeads': _serializeIntIntMap(postingFreeListHeads),
@@ -226,17 +200,6 @@ class NghIndexMeta {
     }
   }
 
-  static VectorPrecision _parsePrecision(String? s) {
-    switch (s) {
-      case 'float64':
-        return VectorPrecision.float64;
-      case 'int8':
-        return VectorPrecision.int8;
-      default:
-        return VectorPrecision.float32;
-    }
-  }
-
   static Map<int, int> _parseIntIntMap(dynamic raw) {
     if (raw == null) return {};
     if (raw is Map) {
@@ -253,6 +216,5 @@ class NghIndexMeta {
   @override
   String toString() => 'NghIndexMeta(uid: $indexUid, table: $tableUid, '
       'dim: $dimensions, vectors: $totalVectors, '
-      'deleted: $deletedCount, postingPartitions: $postingPartitionCount, '
-      'centroids: $centroidCount, medoid: $medoidNodeId)';
+      'deleted: $deletedCount, postingPartitions: $postingPartitionCount)';
 }

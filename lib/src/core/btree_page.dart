@@ -1,11 +1,11 @@
 import 'dart:typed_data';
 
-import '../handler/memcomparable.dart';
 import '../handler/encryption.dart';
+import '../handler/memcomparable.dart';
 import '../handler/platform_byte_data.dart';
 import '../model/data_store_config.dart';
-import '../model/meta_info.dart';
 import '../model/db_exception.dart';
+import '../model/meta_info.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
 
@@ -43,18 +43,6 @@ enum BTreePageType {
 
   /// NGH per-file metadata page (pageNo=0 in each partition file).
   nghMeta,
-
-  /// NGH graph page containing fixed-size node slots with neighbor lists.
-  nghGraph,
-
-  /// NGH PQ-code page containing densely packed product-quantisation codes.
-  nghPqCode,
-
-  /// NGH raw-vector page containing full-precision vectors for re-ranking.
-  nghRawVector,
-
-  /// NGH PQ codebook page containing trained centroid vectors.
-  nghCodebook,
 
   /// NGH posting page containing inlined SQ8 vector slots for inverted cluster.
   nghPosting,

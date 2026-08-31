@@ -1105,7 +1105,6 @@ FieldSchema(
   nullable: false,
   vectorConfig: VectorFieldConfig(
     dimensions: 128, // MUST match write/query width
-    precision: VectorPrecision.float32, // float64 | float32 | int8
   ),
 )
 ```
@@ -1117,7 +1116,7 @@ IndexSchema(
   fields: ['embedding'],
   type: IndexType.vector,
   vectorConfig: VectorIndexConfig(
-    indexType: VectorIndexType.ngh, // currently only ngh
+    indexType: VectorIndexType.ngh, // ToStore built-in proprietary dense index
     distanceMetric: VectorDistanceMetric.cosine, // l2 | cosine | innerProduct
   ),
 )
@@ -1125,10 +1124,19 @@ IndexSchema(
 
 | Config | Meaning |
 | :--- | :--- |
-| `dimensions` / `precision` | On `VectorFieldConfig`: embedding width and storage precision |
-| `indexType` | Algorithm family; currently only `ngh` |
-| `distanceMetric` | Similarity metric used for **insert and search**; changing it requires rebuild |
+| `dimensions` | On `VectorFieldConfig`: embedding width (must match writes/queries) |
+| `indexType` | Opaque dense algorithm id; currently `ngh` (ToStore proprietary). Do not expand or document internals. |
+| `distanceMetric` | Similarity metric for **insert and search**; changing it requires rebuild |
 
+### Distance semantics (ANN path)
+
+Engine ranks by a **distance** (lower = closer):
+
+| Metric | ANN distance | Notes |
+| :--- | :--- | :--- |
+| `l2` | **squared** L2 | No square-root |
+| `innerProduct` | **negated** IP | Engine does **not** auto-normalize; normalize caller-side for semantic IP |
+| `cosine` | `1 - cosine` | Engine auto-normalizes |
 
 `VectorData.fromList(...)` (or `List<num>` / `Float32List`) for query vectors.
 
@@ -1622,8 +1630,7 @@ EncryptionConfig({
   EncryptionType encryptionType, // none | xorObfuscation | chacha20Poly1305 | aes256Gcm
   String? encodingKey,   // data key — change → background rewrite
   String? encryptionKey, // master key protecting encodingKey — rotate online
-  EncryptionScope encryptionScope, // standard | full
-  bool encryptVectorIndex,
+  EncryptionScope encryptionScope, // standard | full (full also encrypts vector index pages)
 });
 ```
 
@@ -1955,7 +1962,7 @@ Agents MAY import these via `package:tostore/tostore.dart`:
 | `schema_update_result.dart` | `SchemaUpdateResult` |
 | `space_info.dart` | `SpaceInfo` |
 | `table_info.dart` | `TableInfo` |
-| `table_schema.dart` | `TableSchema`, `FieldSchema`, `IndexSchema`, `TableTtlConfig`, `DataType`, `IndexType`, `DefaultValueType`, `PrimaryKeyType`, `SequentialIdConfig`, `PrimaryKeyConfig`, `VectorData`, `VectorFieldConfig`, `VectorPrecision`, `VectorIndexType`, `VectorDistanceMetric`, `VectorIndexConfig`, `ForeignKeyCascadeAction`, `ForeignKeySchema`, … |
+| `table_schema.dart` | `TableSchema`, `FieldSchema`, `IndexSchema`, `TableTtlConfig`, `DataType`, `IndexType`, `DefaultValueType`, `PrimaryKeyType`, `SequentialIdConfig`, `PrimaryKeyConfig`, `VectorData`, `VectorFieldConfig`, `VectorIndexType`, `VectorDistanceMetric`, `VectorIndexConfig`, `ForeignKeyCascadeAction`, `ForeignKeySchema`, … |
 | `transaction_result.dart` | `TransactionResult`, `TransactionStatus`, `TransactionErrorType`, `TransactionError` |
 | `query_condition.dart` | `QueryCondition` |
 

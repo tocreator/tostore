@@ -74,18 +74,15 @@ abstract final class NghIndexMetaFieldId {
   static const int tableUid = 3;
   static const int dimensions = 4;
   static const int distanceMetric = 5;
-  static const int precision = 6;
-  static const int timestamps = 7;
-  static const int totalVectors = 8;
-  static const int deletedCount = 9;
-  static const int medoidNodeId = 10;
-  static const int nextNodeId = 11;
-  static const int totalSizeBytes = 12;
-  static const int isBuilding = 13;
-  static const int centroidCount = 14;
-  static const int postingPartitionCount = 15;
-  static const int postingNextPageNo = 16;
-  static const int postingFreeListHeads = 17;
+  static const int timestamps = 6;
+  static const int totalVectors = 7;
+  static const int deletedCount = 8;
+  static const int nextNodeId = 9;
+  static const int totalSizeBytes = 10;
+  static const int isBuilding = 11;
+  static const int postingPartitionCount = 12;
+  static const int postingNextPageNo = 13;
+  static const int postingFreeListHeads = 14;
 }
 
 /// Discriminator for global meta blobs embedded in partition-0 page 0.
@@ -473,24 +470,18 @@ final class NghIndexMetaCodec {
     w.writeVarint(meta.dimensions);
     w.writeFieldTag(NghIndexMetaFieldId.distanceMetric, WireType.varint);
     w.writeVarint(meta.distanceMetric.index);
-    w.writeFieldTag(NghIndexMetaFieldId.precision, WireType.varint);
-    w.writeVarint(meta.precision.index);
     w.writeFieldTag(NghIndexMetaFieldId.timestamps, WireType.lengthDelimited);
     w.writeBytes(TimestampsCodec.encode(meta.timestamps));
     w.writeFieldTag(NghIndexMetaFieldId.totalVectors, WireType.varint);
     w.writeVarint(meta.totalVectors);
     w.writeFieldTag(NghIndexMetaFieldId.deletedCount, WireType.varint);
     w.writeVarint(meta.deletedCount);
-    w.writeFieldTag(NghIndexMetaFieldId.medoidNodeId, WireType.varint);
-    w.writeZigZag32(meta.medoidNodeId);
     w.writeFieldTag(NghIndexMetaFieldId.nextNodeId, WireType.varint);
     w.writeVarint(meta.nextNodeId);
     w.writeFieldTag(NghIndexMetaFieldId.totalSizeBytes, WireType.varint);
     w.writeVarint(meta.totalSizeBytes);
     w.writeFieldTag(NghIndexMetaFieldId.isBuilding, WireType.varint);
     w.writeBool(meta.isBuilding);
-    w.writeFieldTag(NghIndexMetaFieldId.centroidCount, WireType.varint);
-    w.writeVarint(meta.centroidCount);
     w.writeFieldTag(NghIndexMetaFieldId.postingPartitionCount, WireType.varint);
     w.writeVarint(meta.postingPartitionCount);
     w.writeFieldTag(NghIndexMetaFieldId.postingNextPageNo, WireType.varint);
@@ -511,15 +502,12 @@ final class NghIndexMetaCodec {
     TableUid? tableUid = tableUidFallback;
     int dimensions = 0;
     VectorDistanceMetric distanceMetric = VectorDistanceMetric.cosine;
-    VectorPrecision precision = VectorPrecision.float32;
     Timestamps? timestamps;
     int totalVectors = 0;
     int deletedCount = 0;
-    int medoidNodeId = -1;
     int nextNodeId = 0;
     int totalSizeBytes = 0;
     bool isBuilding = false;
-    int centroidCount = 0;
     int postingPartitionCount = 1;
     int postingNextPageNo = NghIndexMeta.firstDataPageNo;
     Map<int, int> postingFreeListHeads = const {};
@@ -545,12 +533,6 @@ final class NghIndexMetaCodec {
             distanceMetric = VectorDistanceMetric.values[idx];
           }
           break;
-        case NghIndexMetaFieldId.precision:
-          final idx = reader.readVarint();
-          if (idx >= 0 && idx < VectorPrecision.values.length) {
-            precision = VectorPrecision.values[idx];
-          }
-          break;
         case NghIndexMetaFieldId.timestamps:
           timestamps = TimestampsCodec.decode(reader.readBytes());
           break;
@@ -560,9 +542,6 @@ final class NghIndexMetaCodec {
         case NghIndexMetaFieldId.deletedCount:
           deletedCount = reader.readVarint();
           break;
-        case NghIndexMetaFieldId.medoidNodeId:
-          medoidNodeId = reader.readZigZag32();
-          break;
         case NghIndexMetaFieldId.nextNodeId:
           nextNodeId = reader.readVarint();
           break;
@@ -571,9 +550,6 @@ final class NghIndexMetaCodec {
           break;
         case NghIndexMetaFieldId.isBuilding:
           isBuilding = reader.readBool();
-          break;
-        case NghIndexMetaFieldId.centroidCount:
-          centroidCount = reader.readVarint();
           break;
         case NghIndexMetaFieldId.postingPartitionCount:
           postingPartitionCount = reader.readVarint();
@@ -609,15 +585,12 @@ final class NghIndexMetaCodec {
       tableUid: resolvedTableUid,
       dimensions: dimensions,
       distanceMetric: distanceMetric,
-      precision: precision,
       timestamps: timestamps,
       totalVectors: totalVectors,
       deletedCount: deletedCount,
-      medoidNodeId: medoidNodeId,
       nextNodeId: nextNodeId,
       totalSizeBytes: totalSizeBytes,
       isBuilding: isBuilding,
-      centroidCount: centroidCount,
       postingPartitionCount: postingPartitionCount,
       postingNextPageNo: postingNextPageNo,
       postingFreeListHeads: postingFreeListHeads,

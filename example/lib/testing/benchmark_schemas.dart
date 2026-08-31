@@ -63,7 +63,6 @@ class BenchmarkSchemas {
         nullable: false,
         vectorConfig: VectorFieldConfig(
           dimensions: vectorDimensions,
-          precision: VectorPrecision.float32,
         ),
       ),
     ],
@@ -72,6 +71,7 @@ class BenchmarkSchemas {
         fields: ['embedding'],
         type: IndexType.vector,
         vectorConfig: VectorIndexConfig(
+          indexType: VectorIndexType.ngh,
           distanceMetric: VectorDistanceMetric.cosine,
         ),
       ),

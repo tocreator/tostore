@@ -454,7 +454,7 @@ final class NghPartitionManager {
       return map.putIfAbsent(pNo, () => _NghPartitionStats());
     }
 
-    // Vector pages encrypt under EncryptionScope.full (or legacy encryptVectorIndex).
+    // Vector pages encrypt under EncryptionScope.full.
     final encCfg = _dataStore.config.encryptionConfig;
     final bool encrypt = encCfg?.shouldEncryptVectorIndex ?? false;
 

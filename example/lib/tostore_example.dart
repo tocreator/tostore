@@ -228,16 +228,16 @@ class ToStoreExample {
             type: DataType.vector,
             vectorConfig: VectorFieldConfig(
               dimensions: 128, // 128-dimensional embeddings
-              precision: VectorPrecision.float32,
             ),
           ),
         ],
         indexes: [
-          // NGH vector index with typed configuration
+          // NGH vector index
           IndexSchema(
             fields: ['embedding'],
             type: IndexType.vector,
             vectorConfig: VectorIndexConfig(
+              indexType: VectorIndexType.ngh,
               distanceMetric: VectorDistanceMetric.cosine,
             ),
           ),

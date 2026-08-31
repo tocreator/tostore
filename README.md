@@ -716,7 +716,6 @@ await db.createTables([
         nullable: false,
         vectorConfig: VectorFieldConfig(
           dimensions: 128, // Written and queried vectors must match this width
-          precision: VectorPrecision.float32, // float32 usually balances precision and storage well
         ),
       ),
     ],
@@ -725,7 +724,7 @@ await db.createTables([
         fields: ['embedding'], // Field to index
         type: IndexType.vector, // Build a vector index
         vectorConfig: VectorIndexConfig(
-          indexType: VectorIndexType.ngh, // Built-in vector index type
+          indexType: VectorIndexType.ngh, // ToStore built-in proprietary dense index
           distanceMetric: VectorDistanceMetric.cosine, // Good for normalized embeddings
         ),
       ),
@@ -775,7 +774,7 @@ print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
 **Schema / vector index config** (`VectorFieldConfig`, `VectorIndexConfig`):
 
 - `dimensions`: must match the actual embedding width you write
-- `precision`: common choices include `float64`, `float32`, and `int8`; higher precision usually costs more storage
+- `indexType`: opaque dense algorithm id; currently `ngh`. 
 - `distanceMetric`: index-side similarity metric used for insert and search; `cosine` is common for semantic embeddings, `l2` suits Euclidean distance, and `innerProduct` suits dot-product search. Changing it after data exists requires rebuilding the vector index.
 
 **Chained retrieval parameters** (`matchVector` / `orMatchVector`, plus `limit` on the query chain):

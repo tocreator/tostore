@@ -714,7 +714,6 @@ await db.createTables([
         nullable: false,
         vectorConfig: VectorFieldConfig(
           dimensions: 128, // Written and queried vectors must match this width
-          precision: VectorPrecision.float32, // float32 usually balances precision and storage well
         ),
       ),
     ],
@@ -723,7 +722,7 @@ await db.createTables([
         fields: ['embedding'], // Field to index
         type: IndexType.vector, // Build a vector index
         vectorConfig: VectorIndexConfig(
-          indexType: VectorIndexType.ngh, // Built-in vector index type
+          indexType: VectorIndexType.ngh, // ToStore built-in proprietary dense index
           distanceMetric: VectorDistanceMetric.cosine, // Good for normalized embeddings
         ),
       ),

@@ -30,7 +30,6 @@ FieldSchema(
   nullable: false,
   vectorConfig: VectorFieldConfig(
     dimensions: 128, // MUST match write/query width
-    precision: VectorPrecision.float32, // float64 | float32 | int8
   ),
 )
 ```
@@ -42,7 +41,7 @@ IndexSchema(
   fields: ['embedding'],
   type: IndexType.vector,
   vectorConfig: VectorIndexConfig(
-    indexType: VectorIndexType.ngh, // currently only ngh
+    indexType: VectorIndexType.ngh, // ToStore built-in proprietary dense index
     distanceMetric: VectorDistanceMetric.cosine, // l2 | cosine | innerProduct
   ),
 )
@@ -50,10 +49,19 @@ IndexSchema(
 
 | Config | Meaning |
 | :--- | :--- |
-| `dimensions` / `precision` | On `VectorFieldConfig`: embedding width and storage precision |
-| `indexType` | Algorithm family; currently only `ngh` |
-| `distanceMetric` | Similarity metric used for **insert and search**; changing it requires rebuild |
+| `dimensions` | On `VectorFieldConfig`: embedding width (must match writes/queries) |
+| `indexType` | Opaque dense algorithm id; currently `ngh` (ToStore proprietary).  |
+| `distanceMetric` | Similarity metric for **insert and search**; changing it requires rebuild |
 
+### Distance semantics (ANN path)
+
+Engine ranks by a **distance** (lower = closer):
+
+| Metric | ANN distance | Notes |
+| :--- | :--- | :--- |
+| `l2` | **squared** L2 | No square-root |
+| `innerProduct` | **negated** IP | Engine does **not** auto-normalize; normalize caller-side for semantic IP |
+| `cosine` | `1 - cosine` | Engine auto-normalizes |
 
 `VectorData.fromList(...)` (or `List<num>` / `Float32List`) for query vectors.
 

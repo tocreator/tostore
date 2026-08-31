@@ -6738,7 +6738,7 @@ class DataStoreImpl {
 
   /// Perform approximate nearest neighbor (ANN) vector similarity search.
   ///
-  /// Searches the NGH vector index on [fieldName] in [tableName] to find
+  /// Searches the vector index on [fieldName] in [tableName] to find
   /// the top-[topK] records most similar to [queryVector].
   ///
   /// Returns a list of [VectorSearchResult] sorted by similarity

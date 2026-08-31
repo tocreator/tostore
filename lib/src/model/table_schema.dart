@@ -3097,16 +3097,10 @@ class PrimaryKeyConfig {
   }
 }
 
-/// Represents vector data for machine learning and similarity search operations
+/// Represents vector data for machine learning and similarity search operations.
 ///
-/// [VectorData] provides a specialized container for managing numerical vectors used in
-/// machine learning applications, similarity searches, and other vector operations.
-///
-/// Key features:
-/// - Supports different precision levels ([VectorPrecision])
-/// - Performs basic vector operations (normalization, dot product)
-/// - Ensures type safety and validation for vector operations
-
+/// Stored as IEEE-754 float64 values (MessagePack vector extension). Index-side
+/// ANN uses online SQ8 codes derived at insert/search time.
 class VectorData {
   /// Internal storage of vector values
   final List<double> values;
@@ -3461,66 +3455,26 @@ class VectorData {
   }
 }
 
-/// Vector field configuration
-///
-/// Configures the properties of a vector field, such as dimensions and precision.
+/// Vector field configuration (embedding width only).
 class VectorFieldConfig {
-  /// Dimension of the vector
-  ///
-  /// Specifies the number of dimensions (length) of the vector.
-  /// Common values are 384, 512, 768, 1024, and 1536 (for OpenAI embeddings).
+  /// Dimension of the vector (must match write/query width).
   final int dimensions;
 
-  /// Precision of vector data (bits per dimension)
-  ///
-  /// Controls how the vector is stored and the precision of calculations.
-  final VectorPrecision precision;
-
-  /// Constructor
   const VectorFieldConfig({
     required this.dimensions,
-    this.precision = VectorPrecision.float64,
   });
 
-  /// Convert to JSON
-  Map<String, dynamic> toJson() {
-    return {
-      'dimensions': dimensions,
-      'precision': precision.toString().split('.').last,
-    };
-  }
+  Map<String, dynamic> toJson() => {'dimensions': dimensions};
 
-  /// Create from JSON
   factory VectorFieldConfig.fromJson(Map<String, dynamic> json) {
-    // Parse precision
-    VectorPrecision getPrecision() {
-      final precisionStr = json['precision'] as String?;
-      if (precisionStr == null) return VectorPrecision.float64;
-
-      switch (precisionStr.toLowerCase()) {
-        case 'float32':
-          return VectorPrecision.float32;
-        case 'int8':
-          return VectorPrecision.int8;
-        default:
-          return VectorPrecision.float64;
-      }
-    }
-
     return VectorFieldConfig(
       dimensions: json['dimensions'] as int? ?? 0,
-      precision: getPrecision(),
     );
   }
 
-  /// Copy with new values
-  VectorFieldConfig copyWith({
-    int? dimensions,
-    VectorPrecision? precision,
-  }) {
+  VectorFieldConfig copyWith({int? dimensions}) {
     return VectorFieldConfig(
       dimensions: dimensions ?? this.dimensions,
-      precision: precision ?? this.precision,
     );
   }
 
@@ -3528,124 +3482,92 @@ class VectorFieldConfig {
   bool operator ==(Object other) {
     if (identical(this, other)) return true;
     if (other is! VectorFieldConfig) return false;
-    return other.dimensions == dimensions && other.precision == precision;
+    return other.dimensions == dimensions;
   }
 
   @override
-  int get hashCode => Object.hash(dimensions, precision);
+  int get hashCode => dimensions.hashCode;
 }
 
-/// Vector precision options
+/// Vector distance metric for similarity calculations.
 ///
-/// Specifies the numeric precision used for storing vector values.
-/// Higher precision offers better accuracy but uses more storage space.
-enum VectorPrecision {
-  /// 64-bit floating point (IEEE 754)
-  ///
-  /// Default and highest precision, uses 8 bytes per dimension
-  float64,
-
-  /// 32-bit floating point
-  ///
-  /// Standard single precision, uses 4 bytes per dimension
-  /// Offers a good balance between precision and storage efficiency
-  float32,
-
-  /// 8-bit integer (quantized)
-  ///
-  /// Uses quantization to reduce storage to 1 byte per dimension
-  /// Significant memory savings with some loss of precision
-  int8,
-}
-
-/// Vector index type.
-///
-enum VectorIndexType {
-  /// NGH (Node-Graph Hybrid)
-  ngh,
-}
-
-/// Vector distance metric for similarity calculations
-///
-/// Specifies how the distance/similarity between vectors is calculated.
-/// The appropriate metric depends on your application and how vectors were created.
+/// Engine ANN always ranks by a **distance** where lower is closer:
+/// - [l2]: **squared** L2 (no square-root)
+/// - [innerProduct]: **negated** IP (caller usually normalizes; engine does not)
+/// - [cosine]: `1 - cosine` after engine auto-normalize
 enum VectorDistanceMetric {
-  /// Euclidean distance (L2)
-  ///
-  /// Straight-line distance in vector space
-  /// Lower values indicate greater similarity
+  /// Squared Euclidean distance in the ANN path (lower = closer).
   l2,
 
-  /// Inner product
-  ///
-  /// Dot product of vectors
-  /// Higher values indicate greater similarity
-  /// Most efficient but requires normalized vectors for meaningful similarity
+  /// Negated inner product in the ANN path (lower = closer).
+  /// Prefer caller-normalized vectors for semantic IP search.
   innerProduct,
 
-  /// Cosine similarity
-  ///
-  /// Measures the cosine of the angle between vectors
-  /// Higher values indicate greater similarity
-  /// Invariant to vector magnitude, focuses on direction
+  /// Cosine distance `1 - similarity` (engine auto-normalizes).
   cosine,
 }
 
-/// Vector Index Configuration for NGH (Node-Graph Hybrid) vector search.
+/// Dense vector index algorithm family.
 ///
-/// semantic / structural choices belong here.
+/// Public surface: treat values as **opaque algorithm ids**.
+/// Currently only [ngh] (ToStore's built-in proprietary dense vector index).
+/// Do not document internal structure or compare to third-party ANN names in
+/// user-facing copy.
+enum VectorIndexType {
+  /// NGH — ToStore's built-in proprietary dense vector index.
+  ngh,
+}
+
+/// Vector index configuration for dense ANN ([IndexType.vector]).
+///
+/// [indexType] selects the dense algorithm id (currently only [VectorIndexType.ngh]).
+/// [distanceMetric] is user-configurable. Build quality and search depth are
+/// engine / query owned.
 ///
 /// Example:
 /// ```dart
 /// VectorIndexConfig(
+///   indexType: VectorIndexType.ngh,
 ///   distanceMetric: VectorDistanceMetric.cosine,
 /// )
 /// ```
 class VectorIndexConfig {
-  /// Default ANN [searchDepth] when a query omits the parameter (`1..100`).
+  /// Default ANN searchDepth when a query omits it (`1..100`).
   ///
-  /// Quality-first thoroughness scale mapped to an engine probe budget —
-  /// **not** a recall percentage. Higher values usually improve recall intent
-  /// and increase latency. Depth `100` still does not promise 100% recall.
-  /// Override per call via [ToStore.vectorSearch] /
-  /// [QueryBuilder.matchVector].
+  /// Higher values usually improve recall intent and increase latency.
+  /// Not a recall percentage.
   static const int defaultSearchDepth = 80;
 
-  /// Type of vector index. Currently only supports [VectorIndexType.ngh].
+  /// Dense vector algorithm id. Defaults to [VectorIndexType.ngh].
   final VectorIndexType indexType;
 
-  /// Distance metric for similarity search (also used during index insert).
-  ///
-  /// - [VectorDistanceMetric.l2]: Euclidean distance (lower = more similar)
-  /// - [VectorDistanceMetric.cosine]: Cosine similarity (higher = more similar)
-  /// - [VectorDistanceMetric.innerProduct]: Dot product (higher = more similar)
+  /// Distance metric for insert and search.
   ///
   /// Changing this after data exists requires rebuilding the vector index.
   final VectorDistanceMetric distanceMetric;
 
-  /// Constructor
   const VectorIndexConfig({
     this.indexType = VectorIndexType.ngh,
     this.distanceMetric = VectorDistanceMetric.cosine,
   });
 
-  /// Convert to JSON
-  Map<String, dynamic> toJson() {
-    return {
-      'indexType': indexType.name,
-      'distanceMetric': distanceMetric.name,
-    };
-  }
+  Map<String, dynamic> toJson() => {
+        'indexType': indexType.name,
+        'distanceMetric': distanceMetric.name,
+      };
 
-  /// Create from JSON.
   factory VectorIndexConfig.fromJson(Map<String, dynamic> json) {
-    VectorIndexType indexType = VectorIndexType.ngh;
+    var indexType = VectorIndexType.ngh;
     final typeStr = json['indexType'] as String?;
-    if (typeStr != null && typeStr.toLowerCase() == 'ngh') {
-      indexType = VectorIndexType.ngh;
+    if (typeStr != null) {
+      switch (typeStr.toLowerCase()) {
+        case 'ngh':
+          indexType = VectorIndexType.ngh;
+          break;
+      }
     }
 
-    VectorDistanceMetric distanceMetric = VectorDistanceMetric.cosine;
+    var distanceMetric = VectorDistanceMetric.cosine;
     final metricStr = json['distanceMetric'] as String?;
     if (metricStr != null) {
       switch (metricStr.toLowerCase()) {
@@ -3657,7 +3579,6 @@ class VectorIndexConfig {
           break;
       }
     }
-
     return VectorIndexConfig(
       indexType: indexType,
       distanceMetric: distanceMetric,
@@ -3676,106 +3597,6 @@ class VectorIndexConfig {
   int get hashCode => Object.hash(indexType, distanceMetric);
 }
 
-/// Vector utility methods extension
-extension VectorMethods on VectorData {
-  /// Calculate dot product with another vector
-  double dotProduct(VectorData other) {
-    if (dimensions != other.dimensions) {
-      throw DbException([
-        InvalidArgumentStatus(
-          type: ResultType.devVectorDimensionMismatch,
-          message: 'Vectors must have same dimensions',
-          parameterName: 'other',
-          passedValue: other.dimensions,
-        )
-      ]);
-    }
-
-    double sum = 0;
-    for (int i = 0; i < dimensions; i++) {
-      sum += values[i] * other.values[i];
-    }
-    return sum;
-  }
-
-  /// Calculate Euclidean distance (L2) to another vector
-  double l2Distance(VectorData other) {
-    if (dimensions != other.dimensions) {
-      throw DbException([
-        InvalidArgumentStatus(
-          type: ResultType.devVectorDimensionMismatch,
-          message: 'Vectors must have same dimensions',
-          parameterName: 'other',
-          passedValue: other.dimensions,
-        )
-      ]);
-    }
-
-    double sum = 0;
-    for (int i = 0; i < dimensions; i++) {
-      final diff = values[i] - other.values[i];
-      sum += diff * diff;
-    }
-    return sqrt(sum);
-  }
-
-  /// Calculate cosine similarity to another vector
-  double cosineSimilarity(VectorData other) {
-    if (dimensions != other.dimensions) {
-      throw DbException([
-        InvalidArgumentStatus(
-          type: ResultType.devVectorDimensionMismatch,
-          message: 'Vectors must have same dimensions',
-          parameterName: 'other',
-          passedValue: other.dimensions,
-        )
-      ]);
-    }
-
-    // Calculate dot product
-    double dotProd = dotProduct(other);
-
-    // Calculate magnitudes
-    double mag1 = 0;
-    double mag2 = 0;
-
-    for (int i = 0; i < dimensions; i++) {
-      mag1 += values[i] * values[i];
-      mag2 += other.values[i] * other.values[i];
-    }
-
-    mag1 = sqrt(mag1);
-    mag2 = sqrt(mag2);
-
-    // Avoid division by zero
-    if (mag1 == 0 || mag2 == 0) return 0;
-
-    return dotProd / (mag1 * mag2);
-  }
-
-  /// Normalize the vector (convert to unit vector)
-  VectorData normalize() {
-    // Calculate magnitude
-    double sumSquares = 0;
-    for (final val in values) {
-      sumSquares += val * val;
-    }
-
-    final magnitude = sqrt(sumSquares);
-
-    // Avoid division by zero
-    if (magnitude == 0) return this;
-
-    // Create normalized values
-    final normalizedValues =
-        values.map((v) => v / magnitude).toList(growable: false);
-    return VectorData(normalizedValues);
-  }
-}
-
-/// ForeignKeyCascadeAction: Foreign key cascade action enum
-///
-/// Define how to handle related records in the child table (referenced table) when the record in the parent table (referenced table) is deleted or updated
 enum ForeignKeyCascadeAction {
   /// Restrict operation (RESTRICT)
   ///

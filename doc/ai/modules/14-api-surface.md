@@ -138,7 +138,7 @@ Agents MAY import these via `package:tostore/tostore.dart`:
 | `schema_update_result.dart` | `SchemaUpdateResult` |
 | `space_info.dart` | `SpaceInfo` |
 | `table_info.dart` | `TableInfo` |
-| `table_schema.dart` | `TableSchema`, `FieldSchema`, `IndexSchema`, `TableTtlConfig`, `DataType`, `IndexType`, `DefaultValueType`, `PrimaryKeyType`, `SequentialIdConfig`, `PrimaryKeyConfig`, `VectorData`, `VectorFieldConfig`, `VectorPrecision`, `VectorIndexType`, `VectorDistanceMetric`, `VectorIndexConfig`, `ForeignKeyCascadeAction`, `ForeignKeySchema`, … |
+| `table_schema.dart` | `TableSchema`, `FieldSchema`, `IndexSchema`, `TableTtlConfig`, `DataType`, `IndexType`, `DefaultValueType`, `PrimaryKeyType`, `SequentialIdConfig`, `PrimaryKeyConfig`, `VectorData`, `VectorFieldConfig`, `VectorIndexType`, `VectorDistanceMetric`, `VectorIndexConfig`, `ForeignKeyCascadeAction`, `ForeignKeySchema`, … |
 | `transaction_result.dart` | `TransactionResult`, `TransactionStatus`, `TransactionErrorType`, `TransactionError` |
 | `query_condition.dart` | `QueryCondition` |
 
