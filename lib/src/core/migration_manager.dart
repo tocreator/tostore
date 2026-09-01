@@ -3947,7 +3947,7 @@ class MigrationManager {
 
   /// Compare effective indexes (explicit + implicit) and generate operations.
   ///
-  /// Always diffs [TableSchema.getAllIndexes] — never `indexes` alone — so
+  /// Always diffs [TableSchema.getAllIndexes] - never `indexes` alone - so
   /// FieldSchema.unique / createIndex / TTL / FK implicits and IndexSchema
   /// representation swaps do not spuriously add/remove/rebuild.
   void _compareIndexes(
@@ -4002,13 +4002,13 @@ class MigrationManager {
       matchedOldIndex ??= fieldsOnlyMatch;
 
       if (matchedOldIndex == null) {
-        // No matching old effective index — truly new (incl. new implicits).
+        // No matching old effective index - truly new (incl. new implicits).
         operations.add(MigrationOperation(
           type: MigrationType.addIndex,
           index: newIndex,
         ));
       } else {
-        // Defense: IndexSchema(unique) → FieldSchema.unique representation
+        // Defense: IndexSchema(unique) -> FieldSchema.unique representation
         // swap must not emit modifyIndex(unique:false) churn. getAllIndexes
         // already upgrades Field.unique onto single-field indexes, so this
         // mainly covers odd intermediate snapshots.
@@ -4071,7 +4071,7 @@ class MigrationManager {
           .map((f) => fieldRenames[f] ?? f)
           .toList(growable: false);
       // Unique still enforced on new schema (Field.unique or remaining
-      // single-field unique index) — keep for indexUid inheritance.
+      // single-field unique index) - keep for indexUid inheritance.
       if (indexToRemove.unique &&
           mappedFields.length == 1 &&
           _hasSingleFieldUniqueConstraint(newSchema, mappedFields.first)) {
@@ -4654,7 +4654,7 @@ class MigrationManager {
 
     // Field.unique flag changes still emit modifyField so persisted schema
     // meta stays in sync. That alone does not require table rewrite
-    // (_needDataMigration ignores unique); Index↔Field relocation must not
+    // (_needDataMigration ignores unique); Index <-> Field relocation must not
     // also emit modifyIndex(unique:false) or schedule index rebuilds.
     return oldField.type != newField.type ||
         oldField.nullable != newField.nullable ||
@@ -4864,7 +4864,7 @@ class MigrationManager {
         dirToFileCount: newDirToFileCount,
       );
 
-      return _saveMigrationMeta(
+      return await _saveMigrationMeta(
         meta.copyWith(directoryMapping: updatedMapping),
       );
     });
@@ -5397,7 +5397,7 @@ class MigrationManager {
                     currentTask.taskId, tableDataMeta.totalRecordCount);
               }
 
-              // One summary warn before rewrite — never per-row in
+              // One summary warn before rewrite - never per-row in
               // applyFieldModification (avoids UI freezes on large tables).
               if (_operationsMayAdjustFieldValues(sortedOperations)) {
                 final n = tableDataMeta?.totalRecordCount;
@@ -6952,7 +6952,7 @@ class MigrationManager {
           return true;
         }
         final updatedMapping = meta.directoryMapping.removeId(task.taskId);
-        return _saveMigrationMeta(
+        return await _saveMigrationMeta(
           meta.copyWith(directoryMapping: updatedMapping),
         );
       });
@@ -7430,7 +7430,7 @@ class MigrationManager {
       for (final newIdx in targetIndexes) {
         if (newIdx.unique) {
           // Single-field: also accept old FieldSchema.unique / unique index under
-          // the pre-rename name (Index↔Field unique representation swaps).
+          // the pre-rename name (Index <-> Field unique representation swaps).
           final hasEquivalentOldUnique = (newIdx.fields.length == 1 &&
                   _hasSingleFieldUniqueConstraint(
                     oldSchema,

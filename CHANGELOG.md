@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## 3.5.1
+
+### Changed
+- Optimized pub points only for the latest Dart 3.13 static analysis.
+
 ## 3.5.0
 
 ### Added

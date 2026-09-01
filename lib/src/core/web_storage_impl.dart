@@ -1064,7 +1064,7 @@ class WebStorageImpl implements StorageInterface {
         return [];
       }
       final byteStream = Stream.fromIterable([bytes.sublist(offset)]);
-      return utf8.decoder
+      return await utf8.decoder
           .bind(byteStream)
           .transform(const LineSplitter())
           .toList();
