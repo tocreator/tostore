@@ -110,14 +110,53 @@ final class WalDecodeBatchRunner {
     );
   }
 
+  /// Byte offset immediately after [skipCount] length-prefixed records.
+  ///
+  /// Cheap scan only (no decrypt). Used by recovery to skip already-checkpointed
+  /// leading entries without paying decrypt/decode cost.
+  static int offsetAfterRecords(Uint8List fileBytes, int skipCount) {
+    if (skipCount <= 0) return 0;
+    int offset = 0;
+    int count = 0;
+    while (offset < fileBytes.length && count < skipCount) {
+      if (offset + 4 > fileBytes.length) break;
+      final recordLength = ByteData.sublistView(
+        fileBytes,
+        offset,
+        offset + 4,
+      ).getUint32(0, Endian.little);
+      offset += 4;
+      if (recordLength == 0 ||
+          recordLength > _maxRecordSize ||
+          offset + recordLength > fileBytes.length) {
+        break;
+      }
+      offset += recordLength;
+      count++;
+    }
+    return offset;
+  }
+
   static Future<List<Map<String, dynamic>>> decodeFile({
     required Uint8List fileBytes,
     required int partitionIndex,
     required EncoderConfig encoderConfig,
     int minUsefulTaskItems = ComputeBatchPlanner.minUsefulTaskItems,
+    // Skip this many leading records via length-prefix scan only (no decrypt).
+    // Recovery uses this for checkpoint / batch-start offsets.
+    int skipLeadingRecords = 0,
   }) async {
+    final safeSkip = skipLeadingRecords < 0 ? 0 : skipLeadingRecords;
+    final decodeStart = offsetAfterRecords(fileBytes, safeSkip);
+    if (decodeStart >= fileBytes.length) {
+      return const <Map<String, dynamic>>[];
+    }
+    final decodeBytes = decodeStart == 0
+        ? fileBytes
+        : Uint8List.sublistView(fileBytes, decodeStart);
+
     final plan = planFile(
-      fileBytes: fileBytes,
+      fileBytes: decodeBytes,
       minUsefulTaskItems: minUsefulTaskItems,
     );
     if (plan.recordCount <= 0 || plan.ranges.isEmpty) {
@@ -132,7 +171,7 @@ final class WalDecodeBatchRunner {
           function: decodeWalChunk,
           message: WalDecodeChunkRequest(
             chunkBytes: Uint8List.sublistView(
-              fileBytes,
+              decodeBytes,
               range.startOffset,
               range.endOffset,
             ),

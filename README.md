@@ -49,10 +49,10 @@ As computing continues shifting toward edge intelligence, devices are no longer 
 ## Key Features
 
 - 🤖 **Runtime Evolution & Intelligent O&M**
-  - Declarative definition, automatic refactoring, zero version management
-  - Key rotation, schema changes, massive refactoring—all online, zero disruption
+  - Declarative schema changes—automatic refactoring, no manual versioning
+  - Key rotation, schema migration, massive refactoring—all online, business-transparent
   - Built-in status spec for automated O&M and Agent recognition
-  - Hot upgrades without service interruption for long-term stability
+  - Architecture evolves continuously without interrupting service
 
 - 🧠 **Self-Routing Distributed Architecture**
   - Self-routing node architecture that decouples physical addressing from data scale
@@ -66,16 +66,16 @@ As computing continues shifting toward edge intelligence, devices are no longer 
 
 - 🔍 **Structured Queries & Hybrid Retrieval**
   - Complex predicates, JOINs, aggregations, and table-level TTL
-  - Multi-channel recall can be composed on the same query chain (vector, structured, and more)
-  - Multi-way recall fusion ranking, with scores and channel diagnostics returned on the query result
+  - Multi-channel recall on one query chain (vector + structured and more)
+  - Multi-way recall fusion ranking, with scores and channel diagnostics on the result
 
 - ⚡ **Parallel Execution & Resource Scheduling**
-  - Resource-aware intelligent load scheduling for high availability
-  - Multi-node parallel collaboration and task decomposition
+  - Cold start stays ~35 ms regardless of data scale
+  - Resource-aware load scheduling; multi-node parallel task decomposition
   - Time-slicing keeps UI animations smooth even under heavy load
 
 - 🔐 **Data Security & Isolation**
-  - Multi-space isolation with optional global sharing, ideal for multi-user and multi-tenant scenarios
+  - Multi-space isolation with optional global sharing—multi-user / multi-tenant ready
   - Built-in ChaCha20-Poly1305 and AES-256-GCM encryption
   - Validated through multiple complex disaster recovery scenarios
 
@@ -1761,18 +1761,29 @@ final db = await ToStore.open(
 
 ### Benchmarks
 
+Highlights from the 100K suite and **1e9**-record edge validation (3 rounds, 2026-08-29):
+
+| Metric | Result |
+| :--- | :--- |
+| Cold start | **~35 ms** (stable vs data scale) |
+| PK Read (Hot Cache) | **4.5M ops/s** |
+| Batch Insert | **541K ops/s** |
+| Pagination (Hot Cache) | **604K ops/s** |
+| Vector ANN Search | **1715 ops/s** |
+
+Full charts and every operation: **[Benchmarks](doc/BENCHMARKS.md)**.
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/tocreator/.toway-assets/main/tostore/basic-demo.gif" alt="ToStore Basic Performance Demo" width="320" />
 </p>
 
-- **Basic performance demo** (<a href="https://raw.githubusercontent.com/tocreator/.toway-assets/main/tostore/basic-demo.mp4" target="_blank" rel="noopener">basic-demo.mp4</a>): the GIF preview may not show everything. Please open the video for the complete demonstration. Even on ordinary mobile devices, startup, paging, and retrieval remain stable and smooth even when the dataset exceeds 100 million records.
+- **Basic performance demo** (<a href="https://raw.githubusercontent.com/tocreator/.toway-assets/main/tostore/basic-demo.mp4" target="_blank" rel="noopener">basic-demo.mp4</a>): even on ordinary mobile devices, startup, paging, and retrieval stay smooth past 100 million records.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/tocreator/.toway-assets/main/tostore/disaster-recovery.gif" alt="ToStore Disaster Recovery Stress Test" width="320" />
 </p>
 
-- **Disaster recovery stress test** (<a href="https://raw.githubusercontent.com/tocreator/.toway-assets/main/tostore/disaster-recovery.mp4" target="_blank" rel="noopener">disaster-recovery.mp4</a>): during high-frequency writes, the process is intentionally interrupted again and again to simulate crashes and power failures. ToStore is able to recover quickly.
-
+- **Disaster recovery stress test** (<a href="https://raw.githubusercontent.com/tocreator/.toway-assets/main/tostore/disaster-recovery.mp4" target="_blank" rel="noopener">disaster-recovery.mp4</a>): under high-frequency writes, intentional crash/power-loss interruptions still recover quickly.
 
 ### Experience Tips
 

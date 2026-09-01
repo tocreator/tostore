@@ -59,10 +59,10 @@ ToStore 是面向 AGI 时代与边缘智能场景设计的现代化数据引擎�
 ## <a id="key-features"></a>核心特性
 
 - 🤖 **运行态演进与智能运维**
-  - 声明式定义、自动识别重构、免版本管理
-  - 密钥轮换、表结构变更、海量重构——全程在线无感
+  - 表结构声明式变更——自动识别重构，无需手动维护版本
+  - 密钥轮换、表结构迁移、海量重构——全程在线，业务无感
   - 内置状态规范，支撑自动化运维与智能体精准识别
-  - 不中断服务的热升级，保障系统长效稳定运行
+  - 架构自主演进、持续迭代，服务不中断
 
 - 🧠 **自寻径分布式架构**
   - 自寻径节点架构，物理寻址与数据规模解耦
@@ -76,16 +76,16 @@ ToStore 是面向 AGI 时代与边缘智能场景设计的现代化数据引擎�
 
 - 🔍 **结构化查询与混合检索**
   - 复杂条件、JOIN、聚合与表级 TTL
-  - 多通道召回可同链组合（向量、结构化等）
-  - 多路召回融合排序，分数与通道诊断随查询结果返回
+  - 多通道召回同链组合（向量 + 结构化等）
+  - 多路召回融合排序，分数与通道诊断随结果返回
 
 - ⚡ **并行执行与资源调度**
-  - 资源感知智能负载调度，保障高可用
-  - 多节点并行协同与任务拆分
+  - 冷启动耗时恒定约 35 ms，与数据规模解耦
+  - 资源感知负载调度；多节点并行协同与任务拆分
   - 时间切片机制，高负载下 UI 动画依然流畅
 
 - 🔐 **数据安全与隔离**
-  - 多空间隔离与可选全局共享，天然适配多用户与多租户场景
+  - 多空间隔离与可选全局共享，天然适配多用户 / 多租户
   - 内置 ChaCha20-Poly1305 与 AES-256-GCM 加密
   - 经多重复杂灾难性场景恢复验证
 
@@ -1792,20 +1792,29 @@ final db = await ToStore.open(
 
 ### 基准测试
 
+亮点——10 万条基准套件与十亿级边缘实测（3 轮，2026-08-29）：
+
+| 指标 | 结果 |
+| :--- | :--- |
+| 冷启动 | **约 35 ms**（与数据规模解耦） |
+| PK Read（热缓存） | **452 万 ops/s** |
+| Batch Insert | **54 万 ops/s** |
+| Pagination（热缓存） | **60 万 ops/s** |
+| Vector ANN Search | **1715 ops/s** |
+
+完整图表与全部操作项见 **[基准测试](../../BENCHMARKS.md)**。
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/tocreator/.toway-assets/main/tostore/basic-demo.gif" alt="ToStore 基础性能演示" width="320" />
 </p>
 
-- **基础性能演示**（<a href="https://raw.githubusercontent.com/tocreator/.toway-assets/main/tostore/basic-demo.mp4" target="_blank" rel="noopener">basic-demo.mp4</a>）：GIF 预览可能显示不全，请点击视频查看完整演示。在普通手机上，即便数据量超过亿级，应用的启动、翻页与检索性能依旧保持稳定顺滑。
+- **基础性能演示**（<a href="https://raw.githubusercontent.com/tocreator/.toway-assets/main/tostore/basic-demo.mp4" target="_blank" rel="noopener">basic-demo.mp4</a>）：普通手机上，数据量过亿时启动、翻页与检索仍保持稳定顺滑。
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/tocreator/.toway-assets/main/tostore/disaster-recovery.gif" alt="ToStore 灾难恢复压力测试" width="320" />
 </p>
 
-- **灾难恢复压力测试**（<a href="https://raw.githubusercontent.com/tocreator/.toway-assets/main/tostore/disaster-recovery.mp4" target="_blank" rel="noopener">disaster-recovery.mp4</a>）：在高频写入过程中，故意反复中断进程，模拟崩溃与断电，ToStore 能够快速完成自恢复。
-
-
-
+- **灾难恢复压力测试**（<a href="https://raw.githubusercontent.com/tocreator/.toway-assets/main/tostore/disaster-recovery.mp4" target="_blank" rel="noopener">disaster-recovery.mp4</a>）：高频写入下反复中断进程模拟崩溃/断电，仍可快速自恢复。
 
 ### 体验建议
 

@@ -13,6 +13,7 @@ import '../model/background_write_type.dart';
 import '../model/buffer_entry.dart';
 import '../model/data_store_config.dart';
 import '../model/db_exception.dart';
+import '../model/encoder_config.dart';
 import '../model/flush_pressure_state.dart';
 import '../model/id_generator.dart';
 import '../model/index_entry.dart';
@@ -49,6 +50,15 @@ class ParallelJournalManager {
   bool _flushInProgress = false;
   BatchContext? _activeBatchContext;
   bool _isRecovering = false; // Flag to indicate if currently in recovery mode
+
+  /// Short-lived partition decode cache shared by batch reconcile + WAL replay
+  /// during [start], so the same partition is not decrypted twice.
+  Map<int, List<Map<String, dynamic>>>? _startupWalDecodeCache;
+
+  /// Per-startup caches for table field / context / cutoff resolution.
+  Map<String, TableUid>? _recoveryFieldCache;
+  Map<TableUid, TableContext?>? _recoveryContextCache;
+  Map<TableUid, List<WalPointer>?>? _recoveryCutoffCache;
 
   /// Number of records currently popped from queue and being actively flushed to disk.
   int _inFlightFlushCount = 0;
@@ -347,6 +357,10 @@ class ParallelJournalManager {
     // recovery pump cannot interleave with unrelated WAL-replayed queue entries.
     List<_WalRange>? excludeRanges;
     List<Future<void> Function()> recoveryFlushTasks = const [];
+    _startupWalDecodeCache = <int, List<Map<String, dynamic>>>{};
+    _recoveryFieldCache = <String, TableUid>{};
+    _recoveryContextCache = <TableUid, TableContext?>{};
+    _recoveryCutoffCache = <TableUid, List<WalPointer>?>{};
     try {
       if (_walManager.hasPendingParallelBatches) {
         final reconciled = await _reconcileWithParallelJournal();
@@ -367,6 +381,11 @@ class ParallelJournalManager {
         _isRecovering = false;
       }
       rethrow;
+    } finally {
+      _startupWalDecodeCache = null;
+      _recoveryFieldCache = null;
+      _recoveryContextCache = null;
+      _recoveryCutoffCache = null;
     }
 
     if (!_dataStore.config.enableJournal) {
@@ -1535,61 +1554,86 @@ class ParallelJournalManager {
       final encoderConfig = EncryptionManager.getCurrentEncodingState();
       final partitionYieldController = YieldController(
           'ParallelJournalManager._recoverFromWal.partition',
-          checkInterval: 1);
+          checkInterval: 1,
+          budgetMs: 50);
+      final recoveryNow = DateTime.now();
       while (true) {
         final y4 = partitionYieldController.maybeYield();
         if (y4 != null) await y4;
-        final dirIndex = _walManager.getPartitionDirIndex(p);
-        final path = dirIndex != null
-            ? _dataStore.pathManager.getWalPartitionLogPath(dirIndex, p,
-                spaceName: _dataStore.currentSpaceName)
-            : _dataStore.pathManager.getWalPartitionLogPath(
-                p ~/ _dataStore.maxEntriesPerDir, p,
-                spaceName: _dataStore.currentSpaceName);
+
+        // Pending-batch reconcile already loaded fully-covered partitions.
+        if (excludeRanges != null &&
+            excludeRanges.isNotEmpty &&
+            _isPartitionFullyExcluded(p, excludeRanges, cap)) {
+          if (p == endP) break;
+          p = (p + 1) % cap;
+          first = false;
+          if (p == startP) break;
+          continue;
+        }
+
         int toSkip = 0;
         if (first) {
           toSkip = meta.checkpoint.entrySeq; // skip already processed
         }
-        int seq = 0;
+        int seq = toSkip;
         try {
-          // Check if file exists before reading to avoid PathNotFoundException
-          final exists = await _dataStore.storage.existsFile(path);
-          if (!exists) {
-            // File doesn't exist, skip this partition (may be first startup or file was deleted)
-            if (p == endP) break;
-            p = (p + 1) % cap;
-            first = false;
-            if (p == startP) break;
-            continue;
-          }
+          // Reuse startup decode cache before touching disk when possible.
+          List<Map<String, dynamic>>? entries;
+          final cached = _startupWalDecodeCache?[p];
+          if (cached != null) {
+            entries = toSkip <= 0
+                ? cached
+                : (toSkip >= cached.length
+                    ? const <Map<String, dynamic>>[]
+                    : cached.sublist(toSkip));
+          } else {
+            final dirIndex = _walManager.getPartitionDirIndex(p);
+            final path = dirIndex != null
+                ? _dataStore.pathManager.getWalPartitionLogPath(dirIndex, p,
+                    spaceName: _dataStore.currentSpaceName)
+                : _dataStore.pathManager.getWalPartitionLogPath(
+                    p ~/ _dataStore.maxEntriesPerDir, p,
+                    spaceName: _dataStore.currentSpaceName);
+            final exists = await _dataStore.storage.existsFile(path);
+            if (!exists) {
+              if (p == endP) break;
+              p = (p + 1) % cap;
+              first = false;
+              if (p == startP) break;
+              continue;
+            }
 
-          // Read WAL file as binary and decode using WalEncoder
-          final fileBytes = await _dataStore.storage.readAsBytes(path);
-          if (fileBytes.isEmpty) {
-            if (p == endP) break;
-            p = (p + 1) % cap;
-            first = false;
-            if (p == startP) break;
-            continue;
-          }
+            final fileBytes = await _dataStore.storage.readAsBytes(path);
+            if (fileBytes.isEmpty) {
+              if (p == endP) break;
+              p = (p + 1) % cap;
+              first = false;
+              if (p == startP) break;
+              continue;
+            }
 
-          // Decode all entries from file using isolate for performance
-          // Pass partition index for AAD verification
-          final entries = await WalDecodeBatchRunner.decodeFile(
-            fileBytes: fileBytes,
-            partitionIndex: p,
-            encoderConfig: encoderConfig,
-          );
+            // Decode entries; skipLeadingRecords avoids decrypt of checkpointed
+            // prefix. Startup decode cache reuses partitions already decoded by
+            // batch reconcile.
+            entries = await _decodeWalPartitionForRecovery(
+              fileBytes: fileBytes,
+              partitionIndex: p,
+              encoderConfig: encoderConfig,
+              skipLeadingRecords: toSkip,
+            );
+          }
 
           // Process each entry
-          final yieldController =
-              YieldController('ParallelJournalManager._recoverFromWal');
+          final yieldController = YieldController(
+            'ParallelJournalManager._recoverFromWal',
+            budgetMs: 50,
+          );
 
           for (final entry in entries) {
             final y5 = yieldController.maybeYield();
             if (y5 != null) await y5;
             seq++;
-            if (first && seq <= toSkip) continue;
 
             final ptr = WalPointer(partitionIndex: p, entrySeq: seq);
 
@@ -1597,7 +1641,6 @@ class ParallelJournalManager {
             // to avoid duplicate data in buffer and incorrect record count stats.
             if (excludeRanges != null && excludeRanges.isNotEmpty) {
               bool inExclude = false;
-              final cap = _dataStore.config.logPartitionCycle;
               for (final range in excludeRanges) {
                 final bool afterStart =
                     ptr == range.start || ptr.isNewerThan(range.start, cap);
@@ -1626,7 +1669,6 @@ class ParallelJournalManager {
             // for this table.
             final cutoffs = await _tableCutoffsFor(tableCutoffs, resolvedTable);
             if (cutoffs != null && cutoffs.isNotEmpty) {
-              final ptr = WalPointer(partitionIndex: p, entrySeq: seq);
               bool skip = false;
               for (final c in cutoffs) {
                 if (_walManager.isAtOrBefore(ptr, c)) {
@@ -1680,7 +1722,7 @@ class ParallelJournalManager {
             final be = BufferEntry(
               data: data,
               operation: op,
-              timestamp: DateTime.now(),
+              timestamp: recoveryNow,
               transactionId: entry['txId'] as String?,
               oldValues: (entry['oldValues'] as Map?)?.cast<String, dynamic>(),
               schemaVersion: entry['schemaVersion'] as String? ?? '',
@@ -1707,13 +1749,24 @@ class ParallelJournalManager {
           WalPointer(partitionIndex: lastPartition, entrySeq: lastSeq);
       _walManager.updateCurrentPointerAfterRecovery(lastPtr);
 
-      // No effective entries to recover: delete all WAL partitions and reset meta
-      // so next startup sees no WAL (existingStart/End = -1) and returns
-      // immediately, avoiding repeated full WAL read and unbounded growth.
+      // No effective entries outside pending-batch ranges: only wipe WAL when
+      // nothing remains to flush. Pending-batch data is already in the buffer
+      // and still needs the underlying WAL until recovery flush completes.
       if (!hasEffectiveEntry) {
-        try {
-          await _walManager.clearWalPartitionsAndResetMeta();
-        } catch (_) {}
+        final hasPendingBatchRanges =
+            excludeRanges != null && excludeRanges.isNotEmpty;
+        if (!hasPendingBatchRanges) {
+          try {
+            await _walManager.clearWalPartitionsAndResetMeta();
+          } catch (_) {}
+        } else {
+          try {
+            final ptrForMeta = (lastPartition == endP)
+                ? lastPtr
+                : WalPointer(partitionIndex: endP, entrySeq: 0);
+            await _walManager.setLastRecoveredPointer(ptrForMeta);
+          } catch (_) {}
+        }
         return;
       } else {
         Logger.debug('Recovery added effective entries');
@@ -1901,30 +1954,59 @@ class ParallelJournalManager {
   /// Slow path (legacy name + in-flight rename): apply pending renames, then normalize.
   Future<TableUid> _resolvePersistedTableField(String rawField) async {
     if (rawField.isEmpty) return TableUid.empty;
+    final fieldCache = _recoveryFieldCache;
+    if (fieldCache != null) {
+      final hit = fieldCache[rawField];
+      if (hit != null) return hit;
+    }
     final mgr = _dataStore.tableMetaManager;
     final normalized = await mgr?.normalizeTableFieldKey(rawField) ?? rawField;
+    TableUid result;
     if (mgr != null && await mgr.isActiveTableUidKey(normalized)) {
-      return TableUid(normalized);
+      result = TableUid(normalized);
+    } else {
+      final migMgr = _dataStore.migrationManager;
+      if (migMgr == null) {
+        result = TableUid(normalized);
+      } else {
+        final pendingRenames = migMgr.getPendingTableRenames();
+        if (pendingRenames.isEmpty) {
+          result = TableUid(normalized);
+        } else {
+          final renamed =
+              pendingRenames[rawField] ?? pendingRenames[normalized];
+          if (renamed == null) {
+            result = TableUid(normalized);
+          } else {
+            result =
+                TableUid(await mgr?.normalizeTableFieldKey(renamed) ?? renamed);
+          }
+        }
+      }
     }
-    final migMgr = _dataStore.migrationManager;
-    if (migMgr == null) return TableUid(normalized);
-    final pendingRenames = migMgr.getPendingTableRenames();
-    if (pendingRenames.isEmpty) return TableUid(normalized);
-    final renamed = pendingRenames[rawField] ?? pendingRenames[normalized];
-    if (renamed == null) return TableUid(normalized);
-    return TableUid(await mgr?.normalizeTableFieldKey(renamed) ?? renamed);
+    fieldCache?[rawField] = result;
+    return result;
   }
 
   Future<TableContext?> _resolveTableContext(TableUid tableUid) async {
     if (tableUid.isEmpty) return null;
-    final ctx = await _dataStore.tableMetaManager?.getTableContext(tableUid);
-    if (ctx != null) return ctx;
-    // Interrupted v3 may leave meta-row inserts in WAL before the self-row is
-    // readable via getTableMeta; bootstrap context is enough to replay them.
-    if (tableUid == SystemTable.tableMetaTableUid) {
-      return _dataStore.tableMetaManager?.bootstrapTableMetaContext();
+    final ctxCache = _recoveryContextCache;
+    if (ctxCache != null && ctxCache.containsKey(tableUid)) {
+      return ctxCache[tableUid];
     }
-    return null;
+    final ctx = await _dataStore.tableMetaManager?.getTableContext(tableUid);
+    TableContext? result = ctx;
+    if (result == null) {
+      // Interrupted v3 may leave meta-row inserts in WAL before the self-row is
+      // readable via getTableMeta; bootstrap context is enough to replay them.
+      if (tableUid == SystemTable.tableMetaTableUid) {
+        result = _dataStore.tableMetaManager?.bootstrapTableMetaContext();
+      }
+    }
+    if (ctxCache != null) {
+      ctxCache[tableUid] = result;
+    }
+    return result;
   }
 
   BatchTablePlan? _tablePlanFor(
@@ -1937,13 +2019,21 @@ class ParallelJournalManager {
     Map<TableUid, List<WalPointer>> tableCutoffs,
     TableUid tableUid,
   ) async {
-    final mgr = _dataStore.tableMetaManager;
-    if (mgr == null) {
-      return tableCutoffs[tableUid];
+    final cutoffCache = _recoveryCutoffCache;
+    if (cutoffCache != null && cutoffCache.containsKey(tableUid)) {
+      return cutoffCache[tableUid];
     }
-    final normalized =
-        TableUid(await mgr.normalizeTableFieldKey(tableUid.value));
-    return tableCutoffs[normalized] ?? tableCutoffs[tableUid];
+    final mgr = _dataStore.tableMetaManager;
+    List<WalPointer>? result;
+    if (mgr == null) {
+      result = tableCutoffs[tableUid];
+    } else {
+      final normalized =
+          TableUid(await mgr.normalizeTableFieldKey(tableUid.value));
+      result = tableCutoffs[normalized] ?? tableCutoffs[tableUid];
+    }
+    cutoffCache?[tableUid] = result;
+    return result;
   }
 
   Future<TableSchema?> _resolveTableSchema(TableUid tableUid) async {
@@ -1956,7 +2046,64 @@ class ParallelJournalManager {
   }
 
   Future<TableContext?> _tableContextFromUid(TableUid tableUid) async {
-    return _dataStore.tableMetaManager?.getTableContext(tableUid);
+    return _resolveTableContext(tableUid);
+  }
+
+  /// Whether every entry in partition [p] lies inside some [excludeRanges] range.
+  ///
+  /// When true, startup WAL replay can skip reading/decoding that partition file
+  /// after pending-batch reconcile already loaded the same range.
+  bool _isPartitionFullyExcluded(
+    int p,
+    List<_WalRange> ranges,
+    int cap,
+  ) {
+    if (ranges.isEmpty) return false;
+    final first = WalPointer(partitionIndex: p, entrySeq: 1);
+    for (final range in ranges) {
+      // start must be at or before the first entry of this partition
+      final startOk =
+          range.start == first || !range.start.isNewerThan(first, cap);
+      if (!startOk) continue;
+      // end must cover the whole partition: cannot end mid-partition
+      if (range.end.partitionIndex == p) continue;
+      final endOk = range.end == first || range.end.isNewerThan(first, cap);
+      if (endOk) return true;
+    }
+    return false;
+  }
+
+  /// Decode one WAL partition, reusing the startup decode cache when present.
+  Future<List<Map<String, dynamic>>> _decodeWalPartitionForRecovery({
+    required Uint8List fileBytes,
+    required int partitionIndex,
+    required EncoderConfig encoderConfig,
+    int skipLeadingRecords = 0,
+  }) async {
+    final cache = _startupWalDecodeCache;
+    final safeSkip = skipLeadingRecords < 0 ? 0 : skipLeadingRecords;
+
+    if (cache != null) {
+      final hit = cache[partitionIndex];
+      if (hit != null) {
+        if (safeSkip <= 0) return hit;
+        if (safeSkip >= hit.length) return const <Map<String, dynamic>>[];
+        return hit.sublist(safeSkip);
+      }
+    }
+
+    final entries = await WalDecodeBatchRunner.decodeFile(
+      fileBytes: fileBytes,
+      partitionIndex: partitionIndex,
+      encoderConfig: encoderConfig,
+      skipLeadingRecords: safeSkip,
+    );
+    // Only cache complete partition decodes (no leading skip) so later passes
+    // can slice arbitrary prefixes correctly.
+    if (cache != null && safeSkip == 0) {
+      cache[partitionIndex] = entries;
+    }
+    return entries;
   }
 
   /// Resolve stable [IndexUid] for redo replay (legacy logs may store logical names).
@@ -2011,7 +2158,14 @@ class ParallelJournalManager {
 
       final maxIds = <TableUid, int>{};
       int count = 0;
+      final recoveryNow = DateTime.now();
+      final loadYield = YieldController(
+        'ParallelJournalManager._recoverPendingBatch.load',
+        budgetMs: 50,
+      );
       for (final item in walData.orderedOpsInWalOrder) {
+        final yLoad = loadYield.maybeYield();
+        if (yLoad != null) await yLoad;
         final tableUid = item.table;
         final op = item.op;
         if (op.walPointer == null) continue;
@@ -2030,7 +2184,7 @@ class ParallelJournalManager {
         final be = BufferEntry(
           data: op.data,
           operation: op.op,
-          timestamp: DateTime.now(),
+          timestamp: recoveryNow,
           oldValues: op.oldValues,
           walPointer: op.walPointer,
           schemaVersion: schema.schemaVersion ?? '',
@@ -2202,38 +2356,44 @@ class ParallelJournalManager {
         }
         int seq = 0;
         try {
-          // Check if file exists before reading to avoid PathNotFoundException
-          final exists = await _dataStore.storage.existsFile(path);
-          if (!exists) {
-            // File doesn't exist, skip this partition (may be first startup or file was deleted)
-            if (p == endP) break;
-            p = (p + 1) % cap;
-            first = false;
-            if (p == startP) break;
-            continue;
-          }
+          List<Map<String, dynamic>> entries;
+          final cached = _startupWalDecodeCache?[p];
+          if (cached != null) {
+            entries = cached;
+          } else {
+            final exists = await _dataStore.storage.existsFile(path);
+            if (!exists) {
+              // File doesn't exist, skip this partition (may be first startup or file was deleted)
+              if (p == endP) break;
+              p = (p + 1) % cap;
+              first = false;
+              if (p == startP) break;
+              continue;
+            }
 
-          // Read WAL file as binary and decode using WalEncoder
-          final fileBytes = await _dataStore.storage.readAsBytes(path);
-          if (fileBytes.isEmpty) {
-            if (p == endP) break;
-            p = (p + 1) % cap;
-            first = false;
-            if (p == startP) break;
-            continue;
-          }
+            final fileBytes = await _dataStore.storage.readAsBytes(path);
+            if (fileBytes.isEmpty) {
+              if (p == endP) break;
+              p = (p + 1) % cap;
+              first = false;
+              if (p == startP) break;
+              continue;
+            }
 
-          // Decode all entries from file using length-prefix format
-          // Pass partition index for AAD verification
-          final entries = await WalDecodeBatchRunner.decodeFile(
-            fileBytes: fileBytes,
-            partitionIndex: p,
-            encoderConfig: encoderConfig,
-          );
+            // Full-file decode (cached for subsequent _recoverFromWal). Leading
+            // batch-start entries are skipped in the loop below.
+            entries = await _decodeWalPartitionForRecovery(
+              fileBytes: fileBytes,
+              partitionIndex: p,
+              encoderConfig: encoderConfig,
+            );
+          }
 
           // Process each entry
-          final yieldController =
-              YieldController('ParallelJournalManager._collectBatchWalChanges');
+          final yieldController = YieldController(
+            'ParallelJournalManager._collectBatchWalChanges',
+            budgetMs: 50,
+          );
           for (final entry in entries) {
             final y6 = yieldController.maybeYield();
             if (y6 != null) await y6;

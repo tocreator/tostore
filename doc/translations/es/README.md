@@ -1755,6 +1755,18 @@ final db = await ToStore.open(
 
 ### Puntos de referencia
 
+Destacados del suite 100K y validación edge a escala de mil millones (3 rondas, 2026-08-29):
+
+| Metric | Result |
+| :--- | :--- |
+| Cold start | **~35 ms** (stable vs data scale) |
+| PK Read (Hot Cache) | **4.5M ops/s** |
+| Batch Insert | **541K ops/s** |
+| Pagination (Hot Cache) | **604K ops/s** |
+| Vector ANN Search | **1715 ops/s** |
+
+Gráficos completos y todas las operaciones: **[Benchmarks](../../BENCHMARKS.md)**.
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/tocreator/.toway-assets/main/tostore/basic-demo.gif" alt="ToStore Basic Performance Demo" width="320" />
 </p>

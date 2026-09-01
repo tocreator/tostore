@@ -1756,6 +1756,18 @@ final db = await ToStore.open(
 
 ### 벤치마크
 
+하이라이트 — 100K 스위트와 10억 규모 엣지 실측(3라운드, 2026-08-29):
+
+| Metric | Result |
+| :--- | :--- |
+| Cold start | **~35 ms** (stable vs data scale) |
+| PK Read (Hot Cache) | **4.5M ops/s** |
+| Batch Insert | **541K ops/s** |
+| Pagination (Hot Cache) | **604K ops/s** |
+| Vector ANN Search | **1715 ops/s** |
+
+전체 차트와 모든 항목: **[Benchmarks](../../BENCHMARKS.md)**.
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/tocreator/.toway-assets/main/tostore/basic-demo.gif" alt="ToStore Basic Performance Demo" width="320" />
 </p>
