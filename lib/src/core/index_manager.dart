@@ -1768,7 +1768,7 @@ class IndexManager {
       final current = await getIndexMeta(tableUid, indexUid);
       final next = await mutator(current);
       if (next == null) return null;
-      return _updateIndexMetaCore(
+      return await _updateIndexMetaCore(
         table: table,
         indexUid: indexUid,
         meta: next,
@@ -1787,7 +1787,7 @@ class IndexManager {
       final current = await getIndexMeta(tableUid, indexUid);
       final next = await mutator(current);
       if (next == null) return null;
-      return _updateIndexMetaCore(
+      return await _updateIndexMetaCore(
         table: table,
         indexUid: indexUid,
         meta: next,

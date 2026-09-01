@@ -95,7 +95,7 @@ class DbResult {
   ///
   /// - For single-item operations, it returns the exact operation result type in O(1).
   /// - For batch operations, if any items fail ([hasErrors] is true), it returns the first
-  ///   encountered error type (or [ResultType.dbError] if details are missing) instead of success.
+  ///   encountered error type (or [ResultType.engError] if details are missing) instead of success.
   ResultType get firstType {
     if (statuses.isEmpty) {
       return hasErrors ? ResultType.engError : ResultType.success;

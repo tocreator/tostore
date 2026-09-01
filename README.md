@@ -1206,16 +1206,16 @@ All `where(field, operator, value)` conditions support the following operators (
 
 | Operator | Description | Example / Performance |
 | :--- | :--- | :--- |
-| `=` | Equal | `where('status', '=', 'val')` — **[Recommended]** Index Seek |
-| `!=`, `<>` | Not equal | `where('role', '!=', 'val')` — **[Caution]** Full Table Scan |
-| `>` , `>=`, `<`, `<=` | Comparison | `where('age', '>', 18)` — **[Recommended]** Index Scan |
-| `IN` | In list | `where('id', 'IN', [...])` — **[Recommended]** Index Seek |
-| `NOT IN` | Not in list | `where('status', 'NOT IN', [...])` — **[Caution]** Full Table Scan |
-| `BETWEEN` | Range | `where('age', 'BETWEEN', [18, 65])` — **[Recommended]** Index Scan |
-| `LIKE` | Pattern match (`%` = any chars, `_` = single char) | `where('name', 'LIKE', 'John%')` — **[Caution]** See note below |
-| `NOT LIKE` | Pattern mismatch | `where('email', 'NOT LIKE', '...')` — **[Caution]** Full Table Scan |
-| `IS` | Is null | `where('deleted_at', 'IS', null)` — **[Recommended]** Index Seek |
-| `IS NOT` | Is not null | `where('email', 'IS NOT', null)` — **[Caution]** Full Table Scan |
+| `=` | Equal | `where('status', '=', 'val')` — **\[Recommended\]** Index Seek |
+| `!=`, `<>` | Not equal | `where('role', '!=', 'val')` — **\[Caution\]** Full Table Scan |
+| `>` , `>=`, `<`, `<=` | Comparison | `where('age', '>', 18)` — **\[Recommended\]** Index Scan |
+| `IN` | In list | `where('id', 'IN', [...])` — **\[Recommended\]** Index Seek |
+| `NOT IN` | Not in list | `where('status', 'NOT IN', [...])` — **\[Caution\]** Full Table Scan |
+| `BETWEEN` | Range | `where('age', 'BETWEEN', [18, 65])` — **\[Recommended\]** Index Scan |
+| `LIKE` | Pattern match (`%` = any chars, `_` = single char) | `where('name', 'LIKE', 'John%')` — **\[Caution\]** See note below |
+| `NOT LIKE` | Pattern mismatch | `where('email', 'NOT LIKE', '...')` — **\[Caution\]** Full Table Scan |
+| `IS` | Is null | `where('deleted_at', 'IS', null)` — **\[Recommended\]** Index Seek |
+| `IS NOT` | Is not null | `where('email', 'IS NOT', null)` — **\[Caution\]** Full Table Scan |
 
 ### Semantic Query Methods (Recommended)
 
@@ -1279,12 +1279,12 @@ final users = await db.query('users')
 >
 > In large-scale data scenarios (millions of rows or more), please follow these principles to avoid main thread lag and query timeouts:
 >
-> 1. **Index Optimized - [Recommended]**:
+> 1. **Index Optimized - \[Recommended\]**:
 >    *   **Semantic Methods**: `whereEqual`, `whereGreaterThan`, `whereLessThan`, `whereIn`, `whereBetween`, `whereNull`, `whereTrue`, `whereFalse`, and **`whereStartsWith`** (prefix match).
 >    *   **Operators**: `=`, `>`, `<`, `>=`, `<=`, `IN`, `BETWEEN`, `IS null`, `LIKE 'prefix%'`.
 >    *   *Explanation: These operations achieve ultra-fast positioning via indexes. For `whereStartsWith` / `LIKE 'abc%'`, the index can still perform a prefix range scan.*
 >
-> 2. **Full-Scan Risks - [Caution]**:
+> 2. **Full-Scan Risks - \[Caution\]**:
 >    *   **Fuzzy Matching**: `whereContains` (`LIKE '%val%'`), `whereEndsWith` (`LIKE '%val'`), `whereContainsAny`.
 >    *   **Negation Queries**: `whereNotEqual` (`!=`, `<>`), `whereNotIn` (`NOT IN`), `whereNotNull` (`IS NOT null`/`whereNotEmpty`).
 >    *   **Pattern Mismatch**: `NOT LIKE`.

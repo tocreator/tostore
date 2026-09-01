@@ -2649,7 +2649,7 @@ class DataStoreImpl {
                   failedCount++;
                   continue;
                 }
-                return finishWithPromoteMirror(DbResult.error(
+                return await finishWithPromoteMirror(DbResult.error(
                   type: e.constraintResultType,
                   message: e.message,
                   failedKeys: returnResultDetails ? [recordKey] : const [],
@@ -2687,7 +2687,7 @@ class DataStoreImpl {
                   failedCount++;
                   continue;
                 }
-                return finishWithPromoteMirror(DbResult.error(
+                return await finishWithPromoteMirror(DbResult.error(
                   type: ResultType.bizForeignKeyViolation,
                   message: e.toString(),
                   failedKeys: returnResultDetails ? [recordKey] : const [],
@@ -2734,7 +2734,7 @@ class DataStoreImpl {
             if (continueOnPartialErrors) {
               continue;
             }
-            return finishWithPromoteMirror(DbResult.error(
+            return await finishWithPromoteMirror(DbResult.error(
               type: uniqueViolation?.constraintResultType ??
                   ResultType.bizUniqueViolation,
               message:
@@ -2766,7 +2766,7 @@ class DataStoreImpl {
                   failedCount++;
                   continue;
                 }
-                return finishWithPromoteMirror(DbResult.error(
+                return await finishWithPromoteMirror(DbResult.error(
                   type: ResultType.engError,
                   message: 'Lock conflict on primary key $recordKey',
                 ));
@@ -2911,7 +2911,7 @@ class DataStoreImpl {
         // If there are both successful and failed records
         if (successCount > 0 && failedCount > 0) {
           if (!returnResultDetails) {
-            return finishWithPromoteMirror(DbResult(
+            return await finishWithPromoteMirror(DbResult(
               statuses: const [],
               successKeys: const [],
               failedKeys: const [],
@@ -2919,7 +2919,7 @@ class DataStoreImpl {
               failedCount: failedCount,
             ));
           }
-          return finishWithPromoteMirror(DbResult.batch(
+          return await finishWithPromoteMirror(DbResult.batch(
             successKeys: successKeys,
             failedKeys: failedKeys,
             message:
@@ -2929,7 +2929,7 @@ class DataStoreImpl {
           if (partialUniqueFailedKeys != null) {
             final int partialFailedCount = partialUniqueFailedKeys.length;
             if (!returnResultDetails) {
-              return finishWithPromoteMirror(DbResult(
+              return await finishWithPromoteMirror(DbResult(
                 statuses: const [],
                 successKeys: const [],
                 failedKeys: const [],
@@ -2937,7 +2937,7 @@ class DataStoreImpl {
                 failedCount: partialFailedCount,
               ));
             }
-            return finishWithPromoteMirror(DbResult.batch(
+            return await finishWithPromoteMirror(DbResult.batch(
               successKeys: successKeys,
               failedKeys: partialUniqueFailedKeys,
               message:
@@ -2945,7 +2945,7 @@ class DataStoreImpl {
             ));
           }
           if (!returnResultDetails) {
-            return finishWithPromoteMirror(DbResult(
+            return await finishWithPromoteMirror(DbResult(
               statuses: const [],
               successKeys: const [],
               failedKeys: const [],
@@ -2953,7 +2953,7 @@ class DataStoreImpl {
               failedCount: 0,
             ));
           }
-          return finishWithPromoteMirror(DbResult.success(
+          return await finishWithPromoteMirror(DbResult.success(
             successKeys: successKeys,
             message:
                 'Update successful, affected ${successKeys.length} records',
@@ -4792,7 +4792,7 @@ class DataStoreImpl {
                                     .whereType<ResultStatus>()
                                     .toList(growable: false)
                                 : const [];
-                        return finishWithPromoteMirror(DbResult.error(
+                        return await finishWithPromoteMirror(DbResult.error(
                           type: e.constraintResultType,
                           message: e.message,
                           failedKeys:
@@ -4850,7 +4850,7 @@ class DataStoreImpl {
                         .whereType<ResultStatus>()
                         .toList(growable: false)
                     : const [];
-                return finishWithPromoteMirror(DbResult.error(
+                return await finishWithPromoteMirror(DbResult.error(
                   type: e is DbException
                       ? (e.statuses.isNotEmpty
                           ? e.statuses.first.type
@@ -4869,7 +4869,7 @@ class DataStoreImpl {
             final List<ResultStatus> errStatuses = returnResultDetails
                 ? statusSlots!.whereType<ResultStatus>().toList(growable: false)
                 : const [];
-            return finishWithPromoteMirror(DbResult.error(
+            return await finishWithPromoteMirror(DbResult.error(
               type: ResultType.engError,
               message: 'Error processing record: WAL append failed',
               failedKeys: returnResultDetails ? failedKeys : const [],
@@ -4932,7 +4932,7 @@ class DataStoreImpl {
             message =
                 '$message. Example validation errors: ${preview.join(" | ")}$suffix';
           }
-          return finishWithPromoteMirror(DbResult.error(
+          return await finishWithPromoteMirror(DbResult.error(
             type: ResultType.bizValidationFailed,
             message: message,
             failedKeys: returnResultDetails ? failedKeys : const [],
@@ -4954,7 +4954,7 @@ class DataStoreImpl {
             message =
                 '$message. Example validation errors: ${preview.join(" | ")}$suffix';
           }
-          return finishWithPromoteMirror(DbResult.error(
+          return await finishWithPromoteMirror(DbResult.error(
             type: ResultType.bizValidationFailed,
             message: message,
             failedKeys: returnResultDetails ? failedKeys : const [],
@@ -4964,7 +4964,7 @@ class DataStoreImpl {
 
         // Return result
         if (invalidRecords.isEmpty) {
-          return finishWithPromoteMirror(DbResult(
+          return await finishWithPromoteMirror(DbResult(
             statuses: finalBatchStatuses,
             successKeys: returnResultDetails ? successKeys : const [],
             failedKeys: const [],
@@ -4985,7 +4985,7 @@ class DataStoreImpl {
             message =
                 '$message. Example validation errors: ${preview.join(" | ")}$suffix';
           }
-          return finishWithPromoteMirror(DbResult(
+          return await finishWithPromoteMirror(DbResult(
             statuses: finalBatchStatuses,
             successKeys: returnResultDetails ? successKeys : const [],
             failedKeys: returnResultDetails ? failedKeys : const [],
@@ -5601,7 +5601,7 @@ class DataStoreImpl {
               failedCount++;
             }
           }
-          return finishWithPromoteMirror(DbResult.error(
+          return await finishWithPromoteMirror(DbResult.error(
             type: ResultType.bizRecordNotFound,
             message: 'Some records not found during batchUpdate',
             failedKeys: returnResultDetails ? failedKeys : const [],
@@ -5657,7 +5657,7 @@ class DataStoreImpl {
             }
             failedCount++;
             if (!allowPartialErrors) {
-              return finishWithPromoteMirror(DbResult.error(
+              return await finishWithPromoteMirror(DbResult.error(
                 type: ResultType.bizRecordNotFound,
                 message: 'Record not found for pk $pkVal',
                 failedKeys: returnResultDetails ? failedKeys : const [],
@@ -5788,7 +5788,7 @@ class DataStoreImpl {
             }
             failedCount++;
             if (!allowPartialErrors) {
-              return finishWithPromoteMirror(DbResult.error(
+              return await finishWithPromoteMirror(DbResult.error(
                 type: ResultType.bizValidationFailed,
                 message: validationException?.message ??
                     validationErrorStr ??
@@ -5849,7 +5849,7 @@ class DataStoreImpl {
                   );
                   outstandingReservedPks.removeAll(reservedPkSet);
                 }
-                return finishWithPromoteMirror(DbResult.error(
+                return await finishWithPromoteMirror(DbResult.error(
                   type: ResultType.bizForeignKeyViolation,
                   message: fkVio.message,
                   failedKeys: returnResultDetails ? failedKeys : const [],
@@ -5927,7 +5927,7 @@ class DataStoreImpl {
                   transactionId: txId,
                 );
                 outstandingReservedPks.removeAll(reservedPkSet);
-                return finishWithPromoteMirror(DbResult.error(
+                return await finishWithPromoteMirror(DbResult.error(
                   type: violationType,
                   message: violationMessage,
                   failedKeys: returnResultDetails ? failedKeys : const [],
@@ -6005,7 +6005,7 @@ class DataStoreImpl {
                   );
                   outstandingReservedPks.removeAll(reservedPkSet);
                 }
-                return finishWithPromoteMirror(DbResult.error(
+                return await finishWithPromoteMirror(DbResult.error(
                   type: violation.constraintResultType,
                   message: violation.message,
                   failedKeys: returnResultDetails ? failedKeys : const [],
@@ -6151,7 +6151,7 @@ class DataStoreImpl {
       }
 
       if (successCount > 0 && failedCount > 0) {
-        return finishWithPromoteMirror(DbResult(
+        return await finishWithPromoteMirror(DbResult(
           statuses: finalStatuses,
           successKeys: returnResultDetails ? successKeys : const [],
           failedKeys: returnResultDetails ? failedKeys : const [],
@@ -6159,7 +6159,7 @@ class DataStoreImpl {
           failedCount: failedCount,
         ));
       } else if (successCount > 0) {
-        return finishWithPromoteMirror(DbResult(
+        return await finishWithPromoteMirror(DbResult(
           statuses: finalStatuses,
           successKeys: returnResultDetails ? successKeys : const [],
           failedKeys: const [],
@@ -6167,7 +6167,7 @@ class DataStoreImpl {
           failedCount: 0,
         ));
       } else {
-        return finishWithPromoteMirror(DbResult.error(
+        return await finishWithPromoteMirror(DbResult.error(
           type: ResultType.bizRecordNotFound,
           message: 'No records were updated',
           failedKeys: returnResultDetails ? failedKeys : const [],
@@ -8062,7 +8062,7 @@ class DataStoreImpl {
     } catch (e) {
       Logger.error('Failed to get global config', rawError: e);
       // Fatal: encrypted GlobalConfig path failed (IO / wrong key / corrupt).
-      // Do NOT return null — that would mint a fresh AppliedEncryption.
+      // Do NOT return null - that would mint a fresh AppliedEncryption.
       rethrow;
     }
 

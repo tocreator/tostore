@@ -417,7 +417,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   /// picks a minimum-cost probe budget; not a guaranteed recall@K. When null,
   /// uses [VectorIndexConfig.defaultSearchDepth] (`50`).
   /// [distanceThreshold] Maximum distance threshold to consider as a candidate.
-  /// [minScore] Minimum normalized similarity score threshold [0.0 ~ 1.0].
+  /// [minScore] Minimum normalized similarity score threshold (0.0 ~ 1.0).
   QueryBuilder matchVector(
     String field,
     dynamic vector, {

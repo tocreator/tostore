@@ -140,7 +140,7 @@ class UpdateBuilder extends ChainBuilder<UpdateBuilder>
     return this;
   }
 
-  /// Atomically clamps a numeric field's value within the given [min, max] range.
+  /// Atomically clamps a numeric field's value within the given [min] and [max] range.
   ///
   /// This is a syntax sugar combining min and max operations.
   ///

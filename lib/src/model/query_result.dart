@@ -275,7 +275,7 @@ class VectorSearchResult {
   /// Distance from the query vector (lower = more similar for L2/cosine).
   final double distance;
 
-  /// Similarity score normalised to [0, 1] (higher = more similar).
+  /// Similarity score normalised to `[0, 1]` (higher = more similar).
   final double score;
 
   VectorSearchResult({
@@ -326,7 +326,7 @@ enum RetrievalFusionMethod {
 
 /// Detailed retrieval context entry for a single result row.
 class RetrievalEntry {
-  /// Unified normalized fusion score in [0.0, 1.0] (higher = more relevant).
+  /// Unified normalized fusion score in `[0.0, 1.0]` (higher = more relevant).
   final double score;
 
   /// The channel/modality that produced or primarily contributed to this match.

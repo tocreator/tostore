@@ -10,7 +10,7 @@ import '../query/query_executor.dart';
 
 /// Chain builder for querying user-facing key-value records.
 ///
-/// Unlike [KvStore.getKeys] (key-name enumeration only), this returns decoded
+/// Unlike `KvStore.getKeys` (key-name enumeration only), this returns decoded
 /// KV records with the same [QueryResult] pagination as [QueryBuilder] /
 /// `db.query()`: prefer [QueryResult.next] / [QueryResult.prev].
 ///
@@ -69,14 +69,14 @@ class KvQueryBuilder
     return this;
   }
 
-  /// Order by [updated_at] ascending.
+  /// Order by `updated_at` ascending.
   KvQueryBuilder orderByUpdatedAtAsc() {
     _orderBy = [SystemTable.keyValueUpdatedAtField];
     _invalidate();
     return this;
   }
 
-  /// Order by [updated_at] descending.
+  /// Order by `updated_at` descending.
   KvQueryBuilder orderByUpdatedAtDesc() {
     _orderBy = ['-${SystemTable.keyValueUpdatedAtField}'];
     _invalidate();

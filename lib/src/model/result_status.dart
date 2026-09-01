@@ -462,7 +462,7 @@ class GeneralStatus extends ResultStatus {
 /// Convert a diagnostic field value into a JSON-serializable representation.
 ///
 /// Construction of [InvalidArgumentStatus] / [DbException] never calls this;
-/// it is used when serializing or logging so exotic [passedValue] types cannot
+/// it is used when serializing or logging so exotic `passedValue` types cannot
 /// cause secondary failures after the original error was thrown.
 dynamic jsonSafeDiagnosticValue(dynamic value) {
   if (value == null) return null;

@@ -716,7 +716,7 @@ class QueryCondition {
 
   /// Contains condition
   ///
-  /// **[PERFORMANCE WARNING]** Full substring matching ('%value%') will ALWAYS trigger a
+  /// **PERFORMANCE WARNING:** Full substring matching ('%value%') will ALWAYS trigger a
   /// full table scan even if an index is present. For large-scale data, consider using
   QueryCondition whereContains(String field, String value) {
     return where(field, 'LIKE', '%$value%');
@@ -724,7 +724,7 @@ class QueryCondition {
 
   /// Not contains condition
   ///
-  /// **[PERFORMANCE WARNING]** Full substring matching ('%value%') will ALWAYS trigger a
+  /// **PERFORMANCE WARNING:** Full substring matching ('%value%') will ALWAYS trigger a
   /// full table scan.
   QueryCondition whereNotContains(String field, String value) {
     return where(field, 'NOT LIKE', '%$value%');
@@ -743,7 +743,7 @@ class QueryCondition {
 
   /// Ends with condition
   ///
-  /// **[PERFORMANCE WARNING]** Suffix matching ('%suffix') will ALWAYS trigger a
+  /// **PERFORMANCE WARNING:** Suffix matching ('%suffix') will ALWAYS trigger a
   /// full table scan even if an index is present.
   QueryCondition whereEndsWith(String field, String suffix) {
     return where(field, 'LIKE', '%$suffix');
