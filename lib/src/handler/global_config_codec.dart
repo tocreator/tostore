@@ -431,7 +431,9 @@ final class GlobalConfigCodec {
       GeneralStatus(
         type: ResultType.devInvalidArgumentFormat,
         message:
-            'GlobalConfigCodec: failed to decrypt with provided encryptionKey',
+            'GlobalConfigCodec: failed to decrypt with provided encryptionKey. '
+            'Open is aborted to avoid overwriting an existing database; '
+            'pass the correct encryptionKey or restore from backup.',
       ),
       if (lastError is DbException) ...lastError.statuses,
     ]);

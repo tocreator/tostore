@@ -8031,14 +8031,14 @@ class DataStoreImpl {
 
   /// Get global configuration
   Future<GlobalConfig?> getGlobalConfig() async {
+    // Get from cache first
+    if (_globalConfigCache != null) {
+      return _globalConfigCache;
+    }
+
+    final configPath = pathManager.getGlobalConfigPath();
+
     try {
-      // Get from cache first
-      if (_globalConfigCache != null) {
-        return _globalConfigCache;
-      }
-
-      final configPath = pathManager.getGlobalConfigPath();
-
       if (await storage.existsFile(configPath)) {
         final bytes = await storage.readAsBytes(configPath);
         if (bytes.isEmpty) return null;
@@ -8059,9 +8059,16 @@ class DataStoreImpl {
         }
         return decoded.config;
       }
+    } catch (e) {
+      Logger.error('Failed to get global config', rawError: e);
+      // Fatal: encrypted GlobalConfig path failed (IO / wrong key / corrupt).
+      // Do NOT return null — that would mint a fresh AppliedEncryption.
+      rethrow;
+    }
 
-      // Pre-v3: read JSON into memory only - do NOT write TOBF or delete JSON.
-      // `tableDirectoryMap` must remain on disk until V3Upgrade consumes it.
+    // Pre-v3: read JSON into memory only - do NOT write TOBF or delete JSON.
+    // `tableDirectoryMap` must remain on disk until V3Upgrade consumes it.
+    try {
       final legacy = await LegacyConfigBootstrap.readGlobalConfig(this);
       if (legacy != null) {
         _globalConfigCache = legacy;
