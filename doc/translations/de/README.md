@@ -736,7 +736,7 @@ final queryVector =
 // 1) Recommended: chained hybrid retrieval (pure vector ANN)
 final result = await db
     .query('embeddings')
-    .matchVector('embedding', queryVector) // default searchDepth = 80
+    .matchVector('embedding', queryVector) // Standard searchDepth = 50 (~95 % Recall-Intent)
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
@@ -772,13 +772,13 @@ print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
 **Schema- / Vektorindex-Konfiguration** (`VectorFieldConfig`, `VectorIndexConfig`):
 
 - `dimensions`: muss mit der tatsächlichen Embedding-Breite übereinstimmen
-- `precision`: gängige Optionen sind `float64`, `float32` und `int8`; höhere Präzision kostet meist mehr Speicher
-- `distanceMetric`: Ähnlichkeitsmaß auf Indexseite; `cosine` ist für semantische Embeddings üblich, `l2` für euklidische Distanz, `innerProduct` für Skalarproduktsuche
+- `indexType`: Bezeichner für den dichten Algorithmus; derzeit `ngh`
+- `distanceMetric`: Ähnlichkeitsmaß auf Indexseite (Build und Suche); `cosine` ist für semantische Embeddings üblich, `l2` für euklidische Distanz, `innerProduct` für Skalarproduktsuche. Nach dem Schreiben von Daten erfordert eine Änderung in der Regel einen Neuaufbau des Vektorindex.
 
 **Verkettete Abrufparameter** (`matchVector` / `orMatchVector`, plus `limit` auf der Abfragekette):
 
 - `field` / `vector`: Ziel-Vektorfeld und Abfragevektor (`VectorData` / `List<num>` / `Float32List`)
-- `searchDepth`: optional thoroughness in `[1, 100]` (**not** a recall%); higher usually means better recall intent and higher latency, lower is faster but may miss neighbors; omit → engine default `80`
+- `searchDepth`: optionale Tiefe `[1, 100]`, abgebildet auf Recall-**Intent** `[90 %, 100 %]` (`0.90 + depth/1000`; `50` → ~95 % Produktionsbaseline, `80` → ~98 %); Engine wählt ein kostenarmes Sondierbudget — best-effort ANN, **kein** garantiertes recall@K; Standard `50`
 - `weight`: Fusionsgewicht dieses Recall-Kanals bei Mehrwegabruf; Standard `1.0`
 - `minScore`: untere Grenze der normalisierten Ähnlichkeit in `[0.0 ~ 1.0]`; darunterliegende Kandidaten entfallen
 - `distanceThreshold`: Distanzobergrenze; darüberliegende Kandidaten werden ausgeschlossen

@@ -1011,7 +1011,7 @@ class ToStoreExample {
   /// [tableName] The table to search in.
   /// [iterations] Number of searches to perform.
   /// [topK] Number of nearest neighbors to retrieve.
-  /// [searchDepth] ANN search depth in `[1, 100]` (null = engine default 80).
+  /// [searchDepth] ANN search depth in `[1, 100]` (null = engine default 50 → ~95% recall intent).
   ///
   /// Returns the average latency in milliseconds.
   Future<double> vectorSearchBenchmark(

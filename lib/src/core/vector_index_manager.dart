@@ -12,7 +12,6 @@ import 'data_store_impl.dart';
 import 'ngh_graph_engine.dart';
 import 'ngh_partition_manager.dart';
 import 'vector_cache.dart';
-import 'vector_search_timing.dart';
 import 'workload_scheduler.dart';
 import 'yield_controller.dart';
 
@@ -246,118 +245,55 @@ class VectorIndexManager {
     int topK = 10,
     int? searchDepth,
     double? distanceThreshold,
-    VectorSearchPhaseRecorder? timing,
   }) async {
-    final indexUid = timing != null
-        ? timing.phase(
-            'mgr.resolveIndex',
-            () => _resolveVectorIndexUid(table, fieldName),
-          )
-        : _resolveVectorIndexUid(table, fieldName);
+    final indexUid = _resolveVectorIndexUid(table, fieldName);
     if (indexUid == null) return const [];
 
-    // Load meta (concurrently prefetch navGraph on cold start)
-    NghIndexMeta? meta;
-    if (timing != null) {
-      meta = await timing.phaseAsync('mgr.loadMeta', () async {
-        var m = _vectorCache.getMeta(table, indexUid);
-        if (m == null) {
-          final navPrefetch = _graphEngine.prefetchNavGraph(table, indexUid);
-          m = await _loadMeta(table, indexUid);
-          await navPrefetch;
-        }
-        return m;
-      });
-    } else {
-      meta = _vectorCache.getMeta(table, indexUid);
-      if (meta == null) {
-        final navPrefetch = _graphEngine.prefetchNavGraph(table, indexUid);
-        meta = await _loadMeta(table, indexUid);
-        await navPrefetch;
-      }
+    var meta = _vectorCache.getMeta(table, indexUid);
+    if (meta == null) {
+      final navPrefetch = _graphEngine.prefetchNavGraph(table, indexUid);
+      meta = await _loadMeta(table, indexUid);
+      await navPrefetch;
     }
     if (meta == null || meta.isBuilding || meta.totalVectors == 0) {
       return const [];
     }
 
-    late final Float32List queryF32;
-    late Float32List searchQuery;
-    late final bool alreadyNormalized;
-    if (timing != null) {
-      timing.phase('mgr.prepareQuery', () {
-        final rawValues = queryVector.values;
-        if (rawValues is Float32List && rawValues.length == meta!.dimensions) {
-          queryF32 = rawValues;
-        } else {
-          queryF32 = _toFloat32(rawValues, meta!.dimensions);
-        }
-        alreadyNormalized = meta.distanceMetric == VectorDistanceMetric.cosine;
-        searchQuery =
-            alreadyNormalized ? _normalizeFloat32(queryF32) : queryF32;
-      });
+    final rawValues = queryVector.values;
+    final Float32List queryF32;
+    if (rawValues is Float32List && rawValues.length == meta.dimensions) {
+      queryF32 = rawValues;
     } else {
-      final rawValues = queryVector.values;
-      if (rawValues is Float32List && rawValues.length == meta.dimensions) {
-        queryF32 = rawValues;
-      } else {
-        queryF32 = _toFloat32(rawValues, meta.dimensions);
-      }
-      alreadyNormalized = meta.distanceMetric == VectorDistanceMetric.cosine;
-      searchQuery = alreadyNormalized ? _normalizeFloat32(queryF32) : queryF32;
+      queryF32 = _toFloat32(rawValues, meta.dimensions);
     }
+    final alreadyNormalized =
+        meta.distanceMetric == VectorDistanceMetric.cosine;
+    final searchQuery =
+        alreadyNormalized ? _normalizeFloat32(queryF32) : queryF32;
 
-    final results = timing != null
-        ? await timing.phaseAsync(
-            'mgr.graphSearch',
-            () => _graphEngine.search(
-              table: table,
-              indexUid: indexUid,
-              meta: meta!,
-              query: searchQuery,
-              topK: topK,
-              searchDepth: searchDepth,
-              distanceThreshold: distanceThreshold,
-              queryAlreadyNormalized: alreadyNormalized,
-              timing: timing,
-            ),
-          )
-        : await _graphEngine.search(
-            table: table,
-            indexUid: indexUid,
-            meta: meta,
-            query: searchQuery,
-            topK: topK,
-            searchDepth: searchDepth,
-            distanceThreshold: distanceThreshold,
-            queryAlreadyNormalized: alreadyNormalized,
-          );
+    final results = await _graphEngine.search(
+      table: table,
+      indexUid: indexUid,
+      meta: meta,
+      query: searchQuery,
+      topK: topK,
+      searchDepth: searchDepth,
+      distanceThreshold: distanceThreshold,
+      queryAlreadyNormalized: alreadyNormalized,
+    );
     if (results.isEmpty) {
       return const [];
     }
 
     final entries = <VectorSearchResult>[];
-    if (timing != null) {
-      timing.phase('mgr.buildResults', () {
-        for (final r in results) {
-          final pk = r.primaryKey;
-          if (pk == null || pk.isEmpty) continue;
-          entries.add(VectorSearchResult(
-            primaryKey: pk,
-            distance: r.distance,
-            score: _distanceToScore(r.distance, meta!.distanceMetric),
-          ));
-        }
-      });
-    } else {
-      for (final r in results) {
-        final pk = r.primaryKey;
-        if (pk == null || pk.isEmpty) continue;
-        entries.add(VectorSearchResult(
-          primaryKey: pk,
-          distance: r.distance,
-          score: _distanceToScore(r.distance, meta.distanceMetric),
-        ));
-      }
+    for (final r in results) {
+      final pk = r.primaryKey;
+      if (pk == null || pk.isEmpty) continue;
+      entries.add(VectorSearchResult(
+        primaryKey: pk,
+        distance: r.distance,
+        score: _distanceToScore(r.distance, meta.distanceMetric),
+      ));
     }
     return entries;
   }

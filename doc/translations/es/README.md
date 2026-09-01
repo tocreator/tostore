@@ -736,7 +736,7 @@ final queryVector =
 // 1) Recommended: chained hybrid retrieval (pure vector ANN)
 final result = await db
     .query('embeddings')
-    .matchVector('embedding', queryVector) // default searchDepth = 80
+    .matchVector('embedding', queryVector) // searchDepth predeterminado = 50 (~95 % intención de recall)
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
@@ -772,13 +772,13 @@ print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
 **Configuración de esquema / índice vectorial** (`VectorFieldConfig`, `VectorIndexConfig`):
 
 - `dimensions`: debe coincidir con el ancho real de la incrustación que escribe
-- `precision`: las opciones comunes incluyen `float64`, `float32` e `int8`; una mayor precisión suele costar más almacenamiento
-- `distanceMetric`: métrica de similitud del lado del índice; `cosine` es habitual para incrustaciones semánticas, `l2` se adapta a la distancia euclidiana e `innerProduct` a la búsqueda por producto escalar
+- `indexType`: identificador del algoritmo denso; actualmente `ngh`
+- `distanceMetric`: métrica de similitud del lado del índice (construcción y búsqueda); `cosine` es habitual para incrustaciones semánticas, `l2` se adapta a la distancia euclidiana e `innerProduct` a la búsqueda por producto escalar. Tras escribir datos, cambiarla suele requerir reconstruir el índice vectorial.
 
 **Parámetros de recuperación encadenada** (`matchVector` / `orMatchVector`, más `limit` en la cadena de consulta):
 
 - `field` / `vector`: campo vectorial de destino y vector de consulta (`VectorData` / `List<num>` / `Float32List`)
-- `searchDepth`: optional thoroughness in `[1, 100]` (**not** a recall%); higher usually means better recall intent and higher latency, lower is faster but may miss neighbors; omit → engine default `80`
+- `searchDepth`: profundidad opcional `[1, 100]`, mapeada a **intención** de recall `[90 %, 100 %]` (`0.90 + depth/1000`; `50` → ~95 % baseline de producción, `80` → ~98 %); el motor elige un presupuesto mínimo de sondas — ANN best-effort, **no** recall@K garantizado; omitir → `50` por defecto
 - `weight`: peso de fusión de este canal de recuperación en la recuperación multi-vía; valor predeterminado `1.0`
 - `minScore`: umbral inferior de similitud normalizada en `[0.0 ~ 1.0]`; los candidatos por debajo se descartan
 - `distanceThreshold`: techo de distancia; los candidatos que lo superen se excluyen

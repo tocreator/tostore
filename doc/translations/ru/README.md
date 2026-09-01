@@ -736,7 +736,7 @@ final queryVector =
 // 1) Recommended: chained hybrid retrieval (pure vector ANN)
 final result = await db
     .query('embeddings')
-    .matchVector('embedding', queryVector) // default searchDepth = 80
+    .matchVector('embedding', queryVector) // searchDepth по умолчанию = 50 (~95% намерения recall)
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
@@ -772,13 +772,13 @@ print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
 **Конфигурация схемы / векторного индекса** (`VectorFieldConfig`, `VectorIndexConfig`):
 
 - `dimensions`: должна совпадать с фактической шириной записываемого embedding
-- `precision`: распространённые варианты `float64`, `float32`, `int8`; более высокая точность обычно требует больше памяти
-- `distanceMetric`: метрика сходства на стороне индекса; `cosine` типична для семантических embedding, `l2` — для евклидова расстояния, `innerProduct` — для скалярного произведения
+- `indexType`: идентификатор плотного алгоритма; сейчас `ngh`
+- `distanceMetric`: метрика сходства на стороне индекса (построение и поиск); `cosine` типична для семантических embedding, `l2` — для евклидова расстояния, `innerProduct` — для скалярного произведения. После записи данных изменение обычно требует перестройки векторного индекса.
 
 **Параметры цепочечного поиска** (`matchVector` / `orMatchVector`, а также `limit` в цепочке):
 
 - `field` / `vector`: целевое векторное поле и вектор запроса (`VectorData` / `List<num>` / `Float32List`)
-- `searchDepth`: optional thoroughness in `[1, 100]` (**not** a recall%); higher usually means better recall intent and higher latency, lower is faster but may miss neighbors; omit → engine default `80`
+- `searchDepth`: необязательная глубина `[1, 100]`, отображается в **намерение** recall `[90 %, 100 %]` (`0.90 + depth/1000`; `50` → ~95 % production baseline, `80` → ~98 %); движок выбирает минимальный бюджет зондов — best-effort ANN, **не** гарантированный recall@K; по умолчанию `50`
 - `weight`: вес слияния этого канала отзыва при многоканальном поиске; по умолчанию `1.0`
 - `minScore`: нижний порог нормализованного сходства `[0.0 ~ 1.0]`; кандидаты ниже отбрасываются
 - `distanceThreshold`: верхний порог расстояния; превышающие исключаются

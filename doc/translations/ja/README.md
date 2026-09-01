@@ -736,7 +736,7 @@ final queryVector =
 // 1) Recommended: chained hybrid retrieval (pure vector ANN)
 final result = await db
     .query('embeddings')
-    .matchVector('embedding', queryVector) // default searchDepth = 80
+    .matchVector('embedding', queryVector) // デフォルト searchDepth = 50（約 95% リコール意図）
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
@@ -772,13 +772,13 @@ print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
 **スキーマ / ベクトルインデックス設定**（`VectorFieldConfig`、`VectorIndexConfig`）：
 
 - `dimensions`: 実際に書き込む埋め込み幅と一致する必要があります
-- `precision`: 一般的な選択肢には `float64`、`float32`、`int8` が含まれます。精度が高いほど、通常はより多くのストレージが必要です
-- `distanceMetric`: インデックス側の類似度メトリクス。`cosine` はセマンティック埋め込みに一般的、`l2` はユークリッド距離に適し、`innerProduct` はドット積検索に適しています
+- `indexType`: 密ベクトルアルゴリズム識別子。現在は `ngh`
+- `distanceMetric`: インデックス側の類似度メトリクス（構築と検索で共通）。`cosine` はセマンティック埋め込みに一般的、`l2` はユークリッド距離、`innerProduct` は内積検索に適しています。データ書き込み後の変更は通常ベクトルインデックスの再構築が必要です。
 
 **チェーン検索パラメータ**（`matchVector` / `orMatchVector`、およびクエリチェーン上の `limit`）：
 
 - `field` / `vector`: 対象ベクトルフィールドとクエリベクトル（`VectorData` / `List<num>` / `Float32List`）
-- `searchDepth`: optional thoroughness in `[1, 100]` (**not** a recall%); higher usually means better recall intent and higher latency, lower is faster but may miss neighbors; omit → engine default `80`
+- `searchDepth`: 任意の深度 `[1, 100]`。リコール**意図** `[90 %, 100 %]` にマップ（`0.90 + depth/1000`；`50` → 約 95 % 本番基線、`80` → 約 98 %）。エンジンは最小コストのプローブ予算を選択 — best-effort ANN で **recall@K 保証ではありません**。未指定時はデフォルト `50`
 - `weight`: 多路リコール時の当該チャネルの融合ウェイト。デフォルトは `1.0`
 - `minScore`: 正規化類似度の下限 `[0.0 ~ 1.0]`。閾値未満の候補は切り捨てられます
 - `distanceThreshold`: 距離の上限。超えた候補は除外されます

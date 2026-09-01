@@ -736,7 +736,7 @@ final queryVector =
 // 1) Recommended: chained hybrid retrieval (pure vector ANN)
 final result = await db
     .query('embeddings')
-    .matchVector('embedding', queryVector) // default searchDepth = 80
+    .matchVector('embedding', queryVector) // varsayılan searchDepth = 50 (~%95 recall niyeti)
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
@@ -772,13 +772,13 @@ print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
 **Şema / vektör indeks yapılandırması** (`VectorFieldConfig`, `VectorIndexConfig`):
 
 - `dimensions`: yazılan embedding genişliğiyle eşleşmelidir
-- `precision`: yaygın seçenekler `float64`, `float32`, `int8`; daha yüksek hassasiyet genellikle daha fazla depolama gerektirir
-- `distanceMetric`: indeks tarafı benzerlik ölçüsü; `cosine` anlamsal embedding için yaygındır, `l2` Öklid mesafesi, `innerProduct` nokta çarpımı araması içindir
+- `indexType`: yoğun vektör algoritması tanımlayıcısı; şu an `ngh`
+- `distanceMetric`: indeks tarafı benzerlik ölçüsü (oluşturma ve arama); `cosine` anlamsal embedding için yaygındır, `l2` Öklid mesafesi, `innerProduct` nokta çarpımı araması içindir. Veri yazıldıktan sonra değiştirmek genellikle vektör indeksini yeniden oluşturmayı gerektirir.
 
 **Zincirli getirme parametreleri** (`matchVector` / `orMatchVector` ve sorgu zincirindeki `limit`):
 
 - `field` / `vector`: hedef vektör alanı ve sorgu vektörü (`VectorData` / `List<num>` / `Float32List`)
-- `searchDepth`: optional thoroughness in `[1, 100]` (**not** a recall%); higher usually means better recall intent and higher latency, lower is faster but may miss neighbors; omit → engine default `80`
+- `searchDepth`: isteğe bağlı derinlik `[1, 100]`, recall **niyeti** `[90 %, 100 %]` ile eşlenir (`0.90 + depth/1000`; `50` → ~%95 üretim tabanı, `80` → ~%98); motor minimum maliyetli prob bütçesi seçer — best-effort ANN, **garantili recall@K değil**; varsayılan `50`
 - `weight`: çok yollu getirmede bu kanalın füzyon ağırlığı; varsayılan `1.0`
 - `minScore`: normalize benzerlik alt sınırı `[0.0 ~ 1.0]`; altındakiler elenir
 - `distanceThreshold`: mesafe üst sınırı; aşan adaylar dışlanır

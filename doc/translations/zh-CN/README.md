@@ -757,7 +757,7 @@ final queryVector =
 // 1) 主推：链式混合检索（纯向量近邻）
 final result = await db
     .query('embeddings')
-    .matchVector('embedding', queryVector) // 默认 searchDepth = 80
+    .matchVector('embedding', queryVector) // 默认 searchDepth = 50（约 95% 召回意图）
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
@@ -799,7 +799,7 @@ print('fusion=${fused.retrieval?.fusionMethod}'); // 多路时通常为 rrf
 **链式检索参数**（`matchVector` / `orMatchVector`，以及查询链上的 `limit`）：
 
 - `field` / `vector`：目标向量字段与查询向量（`VectorData` / `List<num>` / `Float32List`）。
-- `searchDepth`：可选检索深度 `[1, 100]`（**不是**召回率%）；值越大通常召回意图越高、也更耗时，值越小更快但可能漏检；未传则使用引擎默认 `80`。
+- `searchDepth`：可选深度 `[1, 100]`，映射为召回**意图** `[90%, 100%]`（`0.90 + depth/1000`；`50` → 约 95% 生产基线，`80` → 约 98%）；引擎按最小成本选探测预算——尽力 ANN，**不是**保证的 recall@K；未传则默认 `50`。
 - `weight`：多路召回时该通道的融合权重，默认 `1.0`。
 - `minScore`：归一化相似度下限 `[0.0 ~ 1.0]`，低于阈值的候选会被裁剪。
 - `distanceThreshold`：距离上限，超出则不作为候选。

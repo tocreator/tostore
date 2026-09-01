@@ -27,9 +27,8 @@ Store embeddings, build vector indexes, run ANN search, and fuse vector + struct
 FieldSchema(
   name: 'embedding',
   type: DataType.vector,
-  nullable: false,
   vectorConfig: VectorFieldConfig(
-    dimensions: 128, // MUST match write/query width
+    dimensions: 128, // MUST match written vector length
   ),
 )
 ```
@@ -72,7 +71,7 @@ QueryBuilder matchVector(
   String field,
   dynamic vector, {
   double weight = 1.0,
-  int? searchDepth, // 1..100; default VectorIndexConfig.defaultSearchDepth (80)
+  int? searchDepth, // 1..100; default VectorIndexConfig.defaultSearchDepth (50)
   double? distanceThreshold,
   double? minScore,
 });
@@ -82,18 +81,18 @@ QueryBuilder orMatchVector(...); // same params, OR branch
 | Param | Meaning |
 | :--- | :--- |
 | `weight` | Multi-way fusion weight (default 1.0) |
-| `searchDepth` | Per-query thoroughness `[1, 100]`; higher ≈ better recall intent + higher latency; omit → engine default `80` |
+| `searchDepth` | Per-query depth `[1, 100]` → recall **intent** `[90%, 100%]` (`0.90 + depth/1000`); omit → default `50` (~95% intent). Best-effort ANN under latency/layout constraints — **not** a guaranteed recall@K |
 | `minScore` | Normalized similarity floor `[0,1]` |
 | `distanceThreshold` | Distance ceiling |
 | chain `limit` | Acts as topK |
 
 ```dart
-// Pure ANN (uses default searchDepth 80)
+// Pure ANN (default searchDepth 50 → ~95% recall intent)
 final result = await db.query('embeddings')
   .matchVector('embedding', queryVector)
   .limit(5);
 
-// Explicit depth override
+// Explicit depth override (~94% intent)
 await db.query('embeddings')
   .matchVector('embedding', queryVector, searchDepth: 40)
   .limit(5);
@@ -137,13 +136,24 @@ Prefer `query().matchVector` when combining filters or multi-way fusion.
 
 ## searchDepth guidance
 
-| Depth | Intent |
-| :--- | :--- |
-| `40` | Fast / latency-first (lower recall intent) |
-| `80` | Default quality-first |
-| `100` | Max engine probe budget for this corpus (highest recall intent, highest cost) |
+`searchDepth ∈ [1, 100]` maps continuously to recall **intent** in `[90%, 100%]`:
 
-Higher `searchDepth` usually improves recall *intent* and increases latency; lower values are faster but may miss neighbors. It is **not** a recall% SLA (`80` ≠ 80% recall; `100` does not promise 100% recall). Resolution: `query searchDepth ?? 80`. The engine maps depth to an internal probe budget and caps that budget on large corpora.
+`targetRecall = 0.90 + searchDepth / 1000`
+
+| Depth | Recall intent | Typical use |
+| :--- | :--- | :--- |
+| `1–9` | ~90–91% | Minimum usable |
+| `10–19` | ~91–92% | Very fast |
+| `20–29` | ~92–93% | Fast |
+| `30–39` | ~93–94% | Latency-first |
+| `40–49` | ~94–95% | Near baseline |
+| **`50–59`** | **~95–96%** | **Default / production intent (`50`)** |
+| `60–69` | ~96–97% | High quality |
+| `70–79` | ~97–98% | Higher quality |
+| `80–89` | ~98–99% | Near-exact intent |
+| `90–100` | ~99–100% | Max intent (highest cost) |
+
+Resolution: `query searchDepth ?? 50`. Best-effort under latency budget — **not** a guaranteed recall@K SLA.
 
 ## Rules
 

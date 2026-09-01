@@ -412,9 +412,10 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   /// [field] The vector field name to search on.
   /// [vector] Query vector (accepts [VectorData], `List<num>`, or `Float32List`).
   /// [weight] Fusion weight multiplier (default: 1.0).
-  /// [searchDepth] ANN search depth in `[1, 100]` (higher ≈ better recall
-  /// intent and higher latency; engine-capped; does not promise recall% ==
-  /// depth). When null, uses [VectorIndexConfig.defaultSearchDepth] (`80`).
+  /// [searchDepth] ANN search depth in `[1, 100]` mapped to recall intent
+  /// `[90%, 100%]` (`0.90 + depth/1000`; depth 50 → 95% baseline). Engine
+  /// picks a minimum-cost probe budget; not a guaranteed recall@K. When null,
+  /// uses [VectorIndexConfig.defaultSearchDepth] (`50`).
   /// [distanceThreshold] Maximum distance threshold to consider as a candidate.
   /// [minScore] Minimum normalized similarity score threshold [0.0 ~ 1.0].
   QueryBuilder matchVector(

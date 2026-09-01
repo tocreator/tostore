@@ -8,7 +8,6 @@ import '../core/index_manager.dart';
 import '../core/promote_primary_key.dart';
 import '../core/transaction_context.dart';
 import '../core/tree_cache.dart';
-import '../core/vector_search_timing.dart';
 import '../core/workload_scheduler.dart';
 import '../core/yield_controller.dart';
 import '../handler/binary_schema_codec.dart';
@@ -4460,41 +4459,23 @@ class QueryExecutor {
     }
 
     final int candidateK = effectiveOffset + effectiveLimit + 1;
-    final timing = VectorSearchPhaseRecorder.traceEnabled
-        ? VectorSearchPhaseRecorder()
-        : null;
 
-    final vecResults = timing != null
-        ? await timing.phaseAsync(
-            'exec.vectorSearch',
-            () => vectorIndexMgr.vectorSearch(
-              table: table,
-              fieldName: spec.field,
-              queryVector: spec.vector,
-              topK: candidateK,
-              searchDepth: spec.searchDepth,
-              distanceThreshold: spec.distanceThreshold,
-              timing: timing,
-            ),
-          )
-        : await vectorIndexMgr.vectorSearch(
-            table: table,
-            fieldName: spec.field,
-            queryVector: spec.vector,
-            topK: candidateK,
-            searchDepth: spec.searchDepth,
-            distanceThreshold: spec.distanceThreshold,
-          );
+    final vecResults = await vectorIndexMgr.vectorSearch(
+      table: table,
+      fieldName: spec.field,
+      queryVector: spec.vector,
+      topK: candidateK,
+      searchDepth: spec.searchDepth,
+      distanceThreshold: spec.distanceThreshold,
+    );
 
     if (vecResults.isEmpty) {
       stopwatch?.stop();
-      timing?.logSummary(tag: 'vector-empty');
       return ExecuteResult(
         records: const [],
-        retrieval: RetrievalContext(
-          entries: const [],
+        retrieval: const RetrievalContext(
+          entries: [],
           fusionMethod: RetrievalFusionMethod.single,
-          meta: timing?.toMeta(),
         ),
         executionTimeMs: stopwatch?.elapsedMilliseconds,
       );
@@ -4502,12 +4483,7 @@ class QueryExecutor {
 
     var candidates = vecResults;
     if (spec.minScore != null) {
-      candidates = timing != null
-          ? timing.phase(
-              'exec.minScoreFilter',
-              () => candidates.where((r) => r.score >= spec.minScore!).toList(),
-            )
-          : candidates.where((r) => r.score >= spec.minScore!).toList();
+      candidates = candidates.where((r) => r.score >= spec.minScore!).toList();
     }
 
     final bool hasMore = candidates.length > (effectiveOffset + effectiveLimit);
@@ -4518,78 +4494,38 @@ class QueryExecutor {
         : candidates.sublist(start, end);
 
     final pks = [for (final c in pageCandidates) c.primaryKey];
-    final recordsMap = timing != null
-        ? await timing.phaseAsync(
-            'exec.recordHydrate',
-            () => _dataStore.tableDataManager.queryRecordsMapBatch(
-              table,
-              pks,
-              readFromFileOnly: readFromFileOnly,
-            ),
-          )
-        : await _dataStore.tableDataManager.queryRecordsMapBatch(
-            table,
-            pks,
-            readFromFileOnly: readFromFileOnly,
-          );
+    final recordsMap = await _dataStore.tableDataManager.queryRecordsMapBatch(
+      table,
+      pks,
+      readFromFileOnly: readFromFileOnly,
+    );
 
     final records = <Map<String, dynamic>>[];
     final entries = <RetrievalEntry>[];
 
-    if (timing != null) {
-      timing.phase('exec.assemble', () {
-        for (int i = 0; i < pageCandidates.length; i++) {
-          final cand = pageCandidates[i];
-          final rec = recordsMap[cand.primaryKey];
-          if (rec != null) {
-            final Map<String, dynamic> row;
-            if (promoteDesc != null && applyPromoteResultTransform) {
-              row = Map<String, dynamic>.from(rec);
-              transformPromoteOldToNewInPlace(row, promoteDesc);
-            } else {
-              row = rec;
-            }
-            records.add(row);
-            entries.add(RetrievalEntry(
-              score: cand.score,
-              channel: RetrievalChannel.vector,
-              rawScore: cand.distance,
-              meta: {
-                'distance': cand.distance,
-                'field': spec.field,
-              },
-            ));
-          }
+    for (int i = 0; i < pageCandidates.length; i++) {
+      final cand = pageCandidates[i];
+      final rec = recordsMap[cand.primaryKey];
+      if (rec != null) {
+        final Map<String, dynamic> row;
+        if (promoteDesc != null && applyPromoteResultTransform) {
+          row = Map<String, dynamic>.from(rec);
+          transformPromoteOldToNewInPlace(row, promoteDesc);
+        } else {
+          row = rec;
         }
-      });
-    } else {
-      for (int i = 0; i < pageCandidates.length; i++) {
-        final cand = pageCandidates[i];
-        final rec = recordsMap[cand.primaryKey];
-        if (rec != null) {
-          final Map<String, dynamic> row;
-          if (promoteDesc != null && applyPromoteResultTransform) {
-            row = Map<String, dynamic>.from(rec);
-            transformPromoteOldToNewInPlace(row, promoteDesc);
-          } else {
-            row = rec;
-          }
-          records.add(row);
-          entries.add(RetrievalEntry(
-            score: cand.score,
-            channel: RetrievalChannel.vector,
-            rawScore: cand.distance,
-            meta: {
-              'distance': cand.distance,
-              'field': spec.field,
-            },
-          ));
-        }
+        records.add(row);
+        entries.add(RetrievalEntry(
+          score: cand.score,
+          channel: RetrievalChannel.vector,
+          rawScore: cand.distance,
+          meta: {
+            'distance': cand.distance,
+            'field': spec.field,
+          },
+        ));
       }
     }
-
-    timing?.logSummary(tag: 'vector-top$effectiveLimit');
-    final timingMeta = timing?.toMeta();
 
     stopwatch?.stop();
     return ExecuteResult(
@@ -4597,7 +4533,6 @@ class QueryExecutor {
       retrieval: RetrievalContext(
         entries: entries,
         fusionMethod: RetrievalFusionMethod.single,
-        meta: timingMeta != null && timingMeta.isNotEmpty ? timingMeta : null,
       ),
       hasMore: hasMore,
       hasPrev: effectiveOffset > 0,
@@ -4630,6 +4565,7 @@ class QueryExecutor {
     final int need = effectiveOffset + effectiveLimit;
     // Over-fetch for AND filters, but never explode with large limits (UI freeze).
     final int recallPool = max(need, min(need * 3, max(need + 64, 512)));
+
     final vecResults = await vectorIndexMgr.vectorSearch(
       table: table,
       fieldName: spec.field,
@@ -4658,7 +4594,6 @@ class QueryExecutor {
       table.tableName.toString(),
     );
 
-    // Batch PK hydrate instead of one-by-one B+Tree lookups.
     final candidatePks = <String>[];
     final scoreFiltered = <VectorSearchResult>[];
     for (final cand in vecResults) {

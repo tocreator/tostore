@@ -736,7 +736,7 @@ final queryVector =
 // 1) Recommended: chained hybrid retrieval (pure vector ANN)
 final result = await db
     .query('embeddings')
-    .matchVector('embedding', queryVector) // default searchDepth = 80
+    .matchVector('embedding', queryVector) // searchDepth predefinito = 50 (~95 % intento di recall)
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
@@ -772,13 +772,13 @@ print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
 **Configurazione schema / indice vettoriale** (`VectorFieldConfig`, `VectorIndexConfig`):
 
 - `dimensions`: deve corrispondere alla larghezza effettiva dell'embedding scritto
-- `precision`: scelte comuni `float64`, `float32`, `int8`; maggiore precisione di solito costa più storage
-- `distanceMetric`: metrica di similarità lato indice; `cosine` è comune per embedding semantici, `l2` per distanza euclidea, `innerProduct` per prodotto scalare
+- `indexType`: identificatore dell'algoritmo denso; attualmente `ngh`
+- `distanceMetric`: metrica di similarità lato indice (build e ricerca); `cosine` è comune per embedding semantici, `l2` per distanza euclidea, `innerProduct` per prodotto scalare. Dopo la scrittura dei dati, modificarla richiede in genere la ricostruzione dell'indice vettoriale.
 
 **Parametri di recupero a catena** (`matchVector` / `orMatchVector`, più `limit` sulla catena):
 
 - `field` / `vector`: campo vettoriale di destinazione e vettore di query (`VectorData` / `List<num>` / `Float32List`)
-- `searchDepth`: optional thoroughness in `[1, 100]` (**not** a recall%); higher usually means better recall intent and higher latency, lower is faster but may miss neighbors; omit → engine default `80`
+- `searchDepth`: profondità opzionale `[1, 100]`, mappata all'**intento** di recall `[90 %, 100 %]` (`0.90 + depth/1000`; `50` → ~95 % baseline produzione, `80` → ~98 %); il motore sceglie un budget minimo di sonde — ANN best-effort, **non** recall@K garantito; omesso → default `50`
 - `weight`: peso di fusione di questo canale di richiamo in multi-via; default `1.0`
 - `minScore`: soglia inferiore di similarità normalizzata `[0.0 ~ 1.0]`; i candidati sotto vengono scartati
 - `distanceThreshold`: soglia superiore di distanza; oltre, il candidato è escluso

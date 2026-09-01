@@ -2615,7 +2615,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     if (result != null) {
       final iterations = result['iterations'] ?? 1;
       final topK = result['topK'] ?? 10;
-      final searchDepth = result['searchDepth'] ?? 80;
+      final searchDepth = result['searchDepth'] ?? 50;
 
       setState(() {
         _isTesting = true;
@@ -5089,9 +5089,10 @@ class VectorSearchDialog extends StatefulWidget {
 }
 
 class _VectorSearchDialogState extends State<VectorSearchDialog> {
-  static const int _depthFast = 40;
-  static const int _depthBalanced = 80;
-  static const int _depthDeep = 100;
+  // Presets aligned to recall-intent mapping (depth → ~90–100%).
+  static const int _depthFast = 30; // ~93%
+  static const int _depthBalanced = 50; // ~95% production baseline
+  static const int _depthDeep = 80; // ~98%
 
   int _iterations = 1;
   int _topK = 10;
