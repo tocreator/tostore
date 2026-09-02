@@ -101,9 +101,9 @@ When generating ToStore client code with an AI assistant, give it the single-fil
 
 > [!TIP]
 > **How should you choose a storage mode?**
-> 1. [**Key-Value Mode (KV)**](#quick-start-kv): Best for configuration access, scattered state management, or JSON data storage. It is the fastest way to get started.
-> 2. [**Structured Table Mode**](#quick-start-table): Best for core business data that needs complex queries, constraint validation, or large-scale data governance. By pushing integrity logic into the engine, you can significantly reduce application-layer development and maintenance costs.
-> 3. [**Memory Mode**](#quick-start-memory): Best for temporary computation, unit tests, or **ultra-fast global state management**. With global queries and `watch` listeners, you can reshape application interaction without maintaining a pile of global variables.
+> 1. [**Key-Value Mode (KV)**](#key-value-storage-kv): Best for configuration access, scattered state management, or JSON data storage. It is the fastest way to get started.
+> 2. [**Structured Table Mode**](#structured-table-mode): Best for core business data that needs complex queries, constraint validation, or large-scale data governance. By pushing integrity logic into the engine, you can significantly reduce application-layer development and maintenance costs.
+> 3. [**Memory Mode**](#memory-mode): Best for temporary computation, unit tests, or **ultra-fast global state management**. With global queries and `watch` listeners, you can reshape application interaction without maintaining a pile of global variables.
 
 ### Key-Value Storage (KV)
 This mode is suitable when you do not need predefined structured tables. It is simple, practical, and backed by a high-performance storage engine. **Its efficient indexing architecture keeps query performance highly stable and extremely responsive even on ordinary mobile devices at very large data scales.** Data in different Spaces is naturally isolated, while global sharing is also supported.
@@ -148,7 +148,7 @@ await db.removeValue('current_user');
 
 > [!TIP]
 > **Need more Key-Value features?**
-> For advanced operations like type-safe getters (`getInt`, `getBool`), atomic increments, prefix-based discovery, **chained paginated record queries** (`db.kv.query()`), and key counting, see [**Advanced Key-Value Operations (db.kv)**](#kv-advanced).
+> For advanced operations like type-safe getters (`getInt`, `getBool`), atomic increments, prefix-based discovery, **chained paginated record queries** (`db.kv.query()`), and key counting, see [**Advanced Key-Value Operations (db.kv)**](#advanced-key-value-operations-dbkv).
 
 #### Flutter UI Auto-Refresh Example
 In Flutter, `StreamBuilder` plus `watchValue` gives you a very concise reactive refresh flow:
@@ -167,8 +167,8 @@ StreamBuilder(
 
 ### Structured Table Mode
 CRUD on structured tables requires the schema to be created in advance (see [Schema Definition](#schema-definition)). Recommended integration approaches for different scenarios:
-- **Mobile/Desktop**: For [frequent startup scenarios](#mobile-integration), it is recommended to pass `schemas` during initialization.
-- **Server/Agent**: For [long-running scenarios](#server-integration), it is recommended to create tables dynamically through `createTables`.
+- **Mobile/Desktop**: For [frequent startup scenarios](#mobile-and-desktop-integration), it is recommended to pass `schemas` during initialization.
+- **Server/Agent**: For [long-running scenarios](#server-and-agent-integration), it is recommended to create tables dynamically through `createTables`.
 
 ```dart
 // 1. Initialize the database
