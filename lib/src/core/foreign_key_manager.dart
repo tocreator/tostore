@@ -316,20 +316,22 @@ class ForeignKeyManager {
         }
 
         if (fkValuesToRecords.isNotEmpty) {
-          final pksToCheck = fkValuesToRecords.keys.toList();
           final existingSet = <String>{};
+          final missingFromMem = <String>[];
+          final tdm = _dataStore.tableDataManager;
 
-          // 1. Check in-memory buffer / primary cache (instant memory speed)
-          for (final pk in pksToCheck) {
-            if (_dataStore.tableDataManager
-                .hasLiveTableRecord(referencedTableCtx, pk)) {
+          // 1. Txn / pending write buffer / primary cache (one resolve each)
+          for (final pk in fkValuesToRecords.keys) {
+            final mem = tdm.resolveRecordFromMemory(referencedTableCtx, pk);
+            if (!mem.found) {
+              missingFromMem.add(pk);
+            } else if (mem.record != null) {
               existingSet.add(pk);
             }
+            // found + null record: delete overlay — treat as absent, skip disk
           }
 
-          // 2. Check disk B-Tree if needed
-          final missingFromMem =
-              pksToCheck.where((pk) => !existingSet.contains(pk)).toList();
+          // 2. Disk B-Tree for unresolved PKs
           if (missingFromMem.isNotEmpty) {
             final diskExisting = await _dataStore.tableTreePartitionManager
                     ?.existingPrimaryKeysBatch(

@@ -2097,7 +2097,7 @@ class IndexManager {
 
         if (isMemoryMode) {
           // Memory mode: table TreeCache is the committed store.
-          if (_dataStore.tableDataManager.hasLiveTableRecord(table, pkStr)) {
+          if (_dataStore.tableDataManager.hasTableRecord(table, pkStr)) {
             return UniqueViolation(
               tableName: table.tableName,
               fields: [primaryKey],
@@ -2552,7 +2552,7 @@ class IndexManager {
           for (final pk in pkList) {
             final y = yieldController.maybeYield();
             if (y != null) await y;
-            if (_dataStore.tableDataManager.hasLiveTableRecord(table, pk)) {
+            if (_dataStore.tableDataManager.hasTableRecord(table, pk)) {
               set.add(pk);
             }
           }

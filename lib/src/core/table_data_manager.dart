@@ -289,14 +289,6 @@ class TableDataManager {
     return _tableRecordCache.containsPoint2(table.tableUid, pk);
   }
 
-  /// Check if a record exists in the table record cache.
-  ///
-  /// Deletes live in the write buffer as [BufferOperationType.delete], not as
-  /// cached tombstone rows -- presence here means a live cached row.
-  bool hasLiveTableRecord(TableContext table, String pk) {
-    return _tableRecordCache.containsPoint2(table.tableUid, pk);
-  }
-
   /// Returns true when the record is hidden by a pending/txn **delete** overlay,
   /// even if the physical row still exists on disk (pre-flush).
   ///
@@ -4099,7 +4091,7 @@ class TableDataManager {
   /// - `(found: true, record: data)`: Found live record in memory.
   /// - `(found: true, record: null)`: Found tombstone/delete in memory (record does not exist).
   /// - `(found: false, record: null)`: Not present in memory (must query disk/storage).
-  ({bool found, Map<String, dynamic>? record}) _resolveRecordFromMemory(
+  ({bool found, Map<String, dynamic>? record}) resolveRecordFromMemory(
     TableContext table,
     String pk, {
     bool readFromFileOnly = false,
@@ -4155,7 +4147,7 @@ class TableDataManager {
     final pk = diskRow[primaryKey]?.toString();
     if (pk == null || pk.isEmpty) return null;
 
-    final mem = _resolveRecordFromMemory(
+    final mem = resolveRecordFromMemory(
       table,
       pk,
       readFromFileOnly: readFromFileOnly,
@@ -4179,7 +4171,7 @@ class TableDataManager {
     final pk = key is String ? key : key.toString();
     if (pk.isEmpty) return null;
 
-    final mem = _resolveRecordFromMemory(table, pk);
+    final mem = resolveRecordFromMemory(table, pk);
     if (mem.found) {
       return mem.record;
     }
@@ -4212,7 +4204,7 @@ class TableDataManager {
     final pk = key.toString();
     if (pk.isEmpty) return null;
 
-    final mem = _resolveRecordFromMemory(
+    final mem = resolveRecordFromMemory(
       table,
       pk,
       readFromFileOnly: readFromFileOnly,
@@ -4385,7 +4377,7 @@ class TableDataManager {
     // 0. Resolve from memory tiers (Txn > WriteBuffer > _tableRecordCache)
     for (final key in keys) {
       final pk = key is String ? key : key.toString();
-      final mem = _resolveRecordFromMemory(
+      final mem = resolveRecordFromMemory(
         table,
         pk,
         readFromFileOnly: readFromFileOnly,
