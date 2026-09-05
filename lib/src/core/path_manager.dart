@@ -1,3 +1,4 @@
+import 'package:path/path.dart' as path;
 import '../model/table_context.dart';
 import '../model/data_store_config.dart';
 import '../handler/common.dart';
@@ -61,6 +62,37 @@ class PathManager {
   /// get global config file path (TOBF binary)
   String getGlobalConfigPath() {
     return pathJoin(_instancePath, 'global_config.tobf');
+  }
+
+  /// Generate the deterministic temporary file path for any target [filePath]
+  /// (used for atomic flush / emergency recovery).
+  static String buildTempPath(String filePath) {
+    final normalized = path.normalize(filePath);
+    final parts = path.split(normalized);
+    final idx = parts.indexOf('spaces');
+
+    if (idx != -1 && idx + 1 < parts.length) {
+      final spaceRootParts = parts.sublist(0, idx + 2); // .../spaces/<space>
+      final spaceRoot = path.joinAll(spaceRootParts);
+      final tmpRoot = path.join(spaceRoot, 'tmp');
+
+      final relParts = parts.sublist(idx + 2); // after .../spaces/<space>
+      if (relParts.isEmpty) {
+        return path.join(tmpRoot, 'temp.tmp');
+      }
+
+      final base = relParts.removeLast();
+      final relDir = relParts.isEmpty ? '' : path.joinAll(relParts);
+      final tmpName = '$base.tmp';
+
+      return relDir.isEmpty
+          ? path.join(tmpRoot, tmpName)
+          : path.join(tmpRoot, relDir, tmpName);
+    }
+
+    final dir = path.dirname(normalized);
+    final base = path.basename(normalized);
+    return path.join(dir, '$base.tmp');
   }
 
   /// Space-local access-weight snapshot (soft stats; not WAL-backed).

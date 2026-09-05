@@ -6,8 +6,8 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
-import '../interface/storage_interface.dart';
 import '../handler/logger.dart';
+import '../interface/storage_interface.dart';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
@@ -1050,48 +1050,38 @@ class FileStorageImpl implements StorageInterface {
       const retryDelays = [50, 150, 400, 800, 1500];
       for (int attempt = 0; attempt <= retryDelays.length; attempt++) {
         try {
-          if (Platform.isWindows) {
-            final dst = File(finalPath);
-            if (await dst.exists()) {
-              try {
-                await dst.delete();
-              } catch (e) {
-                // If delete fails on Windows, it's often due to a lingering handle.
-                // Try one more aggressive flush before giving up on this attempt.
-                await flushAll(path: finalPath, closeHandles: true);
-                if (attempt >= retryDelays.length) rethrow;
-              }
-            } else {
-              await dst.parent.create(recursive: true);
-            }
-          } else {
-            await File(finalPath).parent.create(recursive: true);
+          // Ensure parent directory exists
+          final finalFile = File(finalPath);
+          if (!await finalFile.parent.exists()) {
+            await finalFile.parent.create(recursive: true);
           }
 
-          // Before rename, ensure no one else opened a handle in the tiny window
-          if (Platform.isWindows) {
-            await flushAll(path: finalPath, closeHandles: true);
-            await flushAll(path: tempPath, closeHandles: true);
-          }
-
-          // Try to rename
+          // Directly attempt atomic rename first (atomic overwrite on POSIX and Win32 MoveFileEx)
           try {
             await tmpFile.rename(finalPath);
+            return;
           } catch (e) {
-            if (Platform.isWindows &&
-                e is FileSystemException &&
-                (e.osError?.errorCode == 32 || e.osError?.errorCode == 5)) {
+            if (Platform.isWindows && e is FileSystemException) {
               // On Windows, sharing violations (32) or access denied (5)
-              // often mean handles are still closing.
+              // often mean handles are still closing. Flush and retry.
               await flushAll(path: finalPath, closeHandles: true);
               await flushAll(path: tempPath, closeHandles: true);
               await Future.delayed(const Duration(milliseconds: 20));
+
+              // If direct rename still fails on late attempts, fallback to delete + rename
+              if (attempt >= 2) {
+                if (await finalFile.exists()) {
+                  try {
+                    await finalFile.delete();
+                  } catch (_) {}
+                }
+              }
               await tmpFile.rename(finalPath);
+              return;
             } else {
               rethrow;
             }
           }
-          return;
         } on FileSystemException catch (e) {
           if (attempt >= retryDelays.length) {
             rethrow;

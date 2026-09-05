@@ -63,6 +63,9 @@ class ResourceManager {
   /// Initialization flag
   bool _initialized = false;
 
+  /// Single-flight handle for [initialize] (startup prefetch / concurrent).
+  Future<void>? _initFuture;
+
   /// Last measured total cache usage across all types (bytes)
   int _lastMeasuredTotalUsageBytes = 0;
 
@@ -83,6 +86,36 @@ class ResourceManager {
 
   /// Initialize resource manager
   Future<void> initialize(
+      DataStoreConfig config, DataStoreImpl dataStore) async {
+    if (_initialized) return;
+    final inFlight = _initFuture;
+    if (inFlight != null) {
+      await inFlight;
+      return;
+    }
+
+    final loadOp = _doInitialize(config, dataStore);
+    _initFuture = loadOp;
+    try {
+      await loadOp;
+    } finally {
+      if (identical(_initFuture, loadOp)) {
+        _initFuture = null;
+      }
+    }
+  }
+
+  /// Await in-flight [initialize] if any; no-op when already initialized or
+  /// never started (callers already use sync fallbacks for unset quotas).
+  Future<void> ensureInitialized() async {
+    if (_initialized) return;
+    final inFlight = _initFuture;
+    if (inFlight != null) {
+      await inFlight;
+    }
+  }
+
+  Future<void> _doInitialize(
       DataStoreConfig config, DataStoreImpl dataStore) async {
     if (_initialized) return;
 
@@ -586,6 +619,7 @@ class ResourceManager {
     _status = ResourceStatus.normal;
     _memoryStatus = ResourceStatus.normal;
     _initialized = false;
+    _initFuture = null;
   }
 }
 

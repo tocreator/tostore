@@ -19,6 +19,7 @@ import 'compute_manager.dart';
 import 'compute_tasks.dart';
 import 'cpu_work_chunk.dart';
 import 'data_store_impl.dart';
+import 'path_manager.dart';
 import 'storage_adapter.dart';
 import 'yield_controller.dart';
 
@@ -464,9 +465,30 @@ class WalManager {
             }
           }
         } catch (e) {
-          // Primary meta is corrupted or unreadable; fallback to backup.
-          Logger.warn('Primary WAL meta is invalid, will try backup.',
+          // Primary meta is corrupted or unreadable; try temp file before backup.
+          Logger.warn('Primary WAL meta is invalid, trying temp fallback.',
               rawError: e);
+          try {
+            final tempPath = PathManager.buildTempPath(metaPath);
+            if (await _dataStore.storage.existsFile(tempPath)) {
+              final tempBytes = await _dataStore.storage.readAsBytes(tempPath);
+              if (tempBytes.isNotEmpty) {
+                loaded = WalMetaCodec.decodeFile(tempBytes);
+                recoveredFromBackup = true;
+                // Self-heal: rewrite valid meta back
+                unawaited(
+                  _dataStore.storage
+                      .writeAsBytes(metaPath, tempBytes, flush: true)
+                      .catchError((_) {}),
+                );
+                Logger.info(
+                    'WalMeta auto-recovered from temp file ($tempPath)');
+              }
+            }
+          } catch (tempErr) {
+            Logger.warn('Fallback to temp WalMeta failed, will try backup.',
+                rawError: tempErr);
+          }
         }
 
         // 2) Fallback to backup WAL meta if primary failed

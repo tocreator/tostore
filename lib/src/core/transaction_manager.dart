@@ -25,6 +25,9 @@ class TransactionManager {
 
   TransactionMainMeta? _mainMetaCache;
 
+  /// Single-flight handle for [initialize] (startup prefetch / concurrent).
+  Future<void>? _initFuture;
+
   /// Latest loaded transaction main meta (may be null before initialize).
   TransactionMainMeta? get mainMeta => _mainMetaCache;
   final Map<int, TransactionPartitionMeta> _partitionMetaCache = {};
@@ -40,8 +43,9 @@ class TransactionManager {
   // Active serializable transactions: txId -> startedAtMs (watermark source)
   final Map<String, int> _activeSsiStartMs = <String, int>{};
   // Recently committed write index for SSI: [tableUid, pk] -> lastCommitTimeMillis
-  // Retained only while SSI txs are active; trimmed by oldest startMs + FIFO cap
-  late final TreeCache<int> _recentCommittedWrites;
+  // Retained only while SSI txs are active; trimmed by oldest startMs + FIFO cap.
+  // Nullable: startup may dispose before [initialize] finishes assigning it.
+  TreeCache<int>? _recentCommittedWrites;
 
   // In-memory log size cache to avoid frequent filesystem size calls
   Map<String, int>? _logSizeCache;
@@ -75,11 +79,14 @@ class TransactionManager {
       _cleanupCallback = null;
     }
     _cleanupRegistered = false;
+    _initFuture = null;
+    _mainMetaCache = null;
     _activeTransactions.clear();
     _txnStatusCache.clear();
     _txnWriteSets.clear();
     _activeSsiStartMs.clear();
-    _recentCommittedWrites.clear();
+    _recentCommittedWrites?.clear();
+    _recentCommittedWrites = null;
     _logSizeCache?.clear();
     _txnCascadeDeletes.clear();
     _txnCascadeUpdates.clear();
@@ -162,6 +169,27 @@ class TransactionManager {
     if (_mainMetaCache != null) {
       return;
     }
+    final inFlight = _initFuture;
+    if (inFlight != null) {
+      await inFlight;
+      return;
+    }
+
+    final loadOp = _doInitialize();
+    _initFuture = loadOp;
+    try {
+      await loadOp;
+    } finally {
+      if (identical(_initFuture, loadOp)) {
+        _initFuture = null;
+      }
+    }
+  }
+
+  Future<void> _doInitialize() async {
+    if (_mainMetaCache != null) {
+      return;
+    }
     try {
       // Memory mode must not touch storage; transaction meta is in-memory only.
       if (!_isMemoryMode) {
@@ -180,18 +208,22 @@ class TransactionManager {
 
     // SSI recent-committed write index: [tableUid, pk] -> lastCommitTimeMillis
     // Capacity: TreeCache fifo auto-evict. Safe reclaim: periodic watermark trim.
-    final resourceManager = _dataStore.resourceManager;
-    final cacheSize = resourceManager?.getMetaCacheSize() ?? (32 * 1024 * 1024);
-    // Allocate up to 10% of meta cache; floor keeps small devices responsive
-    final int maxBytes = (cacheSize * 0.10).toInt();
-    _recentCommittedWrites = TreeCache<int>(
-      sizeCalculator: (_) => 64, // fallback; put() passes key-aware size
-      maxByteThreshold: maxBytes,
-      minByteThreshold: 10 * 1024 * 1024, // 10MB minimum
-      groupDepth: 1, // Group by tableUid
-      evictionMode: TreeCacheEvictionMode.fifo,
-      debugLabel: 'RecentCommittedWrites',
-    );
+    // Quotas may still be loading in parallel; fall back until ResourceManager finishes.
+    if (_recentCommittedWrites == null) {
+      final resourceManager = _dataStore.resourceManager;
+      final cacheSize =
+          resourceManager?.getMetaCacheSize() ?? (32 * 1024 * 1024);
+      // Allocate up to 10% of meta cache; floor keeps small devices responsive
+      final int maxBytes = (cacheSize * 0.10).toInt();
+      _recentCommittedWrites = TreeCache<int>(
+        sizeCalculator: (_) => 64, // fallback; put() passes key-aware size
+        maxByteThreshold: maxBytes,
+        minByteThreshold: 10 * 1024 * 1024, // 10MB minimum
+        groupDepth: 1, // Group by tableUid
+        evictionMode: TreeCacheEvictionMode.fifo,
+        debugLabel: 'RecentCommittedWrites',
+      );
+    }
 
     // Register periodic cleanup via CrontabManager (idempotent)
     try {
@@ -1099,8 +1131,9 @@ class TransactionManager {
     if (_activeSsiStartMs.isNotEmpty) return;
     try {
       await _withSsiIndexLock(() async {
-        if (_activeSsiStartMs.isEmpty && _recentCommittedWrites.length > 0) {
-          _recentCommittedWrites.clear();
+        final index = _recentCommittedWrites;
+        if (_activeSsiStartMs.isEmpty && index != null && index.length > 0) {
+          index.clear();
         }
       });
     } catch (_) {}
@@ -1115,10 +1148,12 @@ class TransactionManager {
     unregisterActiveSsiTransaction(transactionId);
     try {
       await _withSsiIndexLock(() async {
+        final index = _recentCommittedWrites;
+        if (index == null) return;
         final writesByTable = _txnWriteSets.remove(transactionId);
         if (_activeSsiStartMs.isEmpty) {
-          if (_recentCommittedWrites.length > 0) {
-            _recentCommittedWrites.clear();
+          if (index.length > 0) {
+            index.clear();
           }
           return;
         }
@@ -1132,7 +1167,7 @@ class TransactionManager {
             final y = yieldController.maybeYield();
             if (y != null) await y;
             // put() may trigger TreeCache fifo auto-eviction when over budget
-            _recentCommittedWrites.putPoint2(
+            index.putPoint2(
               tableUid,
               k,
               nowMs,
@@ -1150,15 +1185,17 @@ class TransactionManager {
   /// is safe to delete. This is not the same as fifo (fifo may drop keys still
   /// needed by a long-lived SSI reader).
   Future<void> _trimSsiIndexByWatermark() async {
+    final index = _recentCommittedWrites;
+    if (index == null) return;
     if (_activeSsiStartMs.isEmpty) {
-      if (_recentCommittedWrites.length > 0) {
-        _recentCommittedWrites.clear();
+      if (index.length > 0) {
+        index.clear();
       }
       return;
     }
     final watermark = oldestActiveSsiStartMs;
     if (watermark == null) return;
-    await _recentCommittedWrites.removeWhere(
+    await index.removeWhere(
       (_, commitMs) => commitMs <= watermark,
       yieldLabel: 'txn_ssi_watermark_trim',
     );
@@ -1232,7 +1269,7 @@ class TransactionManager {
           final y12 = yieldController.maybeYield();
           if (y12 != null) await y12;
           // Use TreeCache: key format [tableUid, pk]
-          final lastMs = _recentCommittedWrites.getPoint2(tableUid, k);
+          final lastMs = _recentCommittedWrites?.getPoint2(tableUid, k);
           if (lastMs != null && lastMs > startMs) {
             final tableName =
                 await _dataStore.tableMetaManager?.getNameByUid(tableUid) ??

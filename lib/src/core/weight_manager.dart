@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:typed_data';
 
 import '../handler/logger.dart';
 import '../handler/weight_snapshot_codec.dart';
@@ -10,6 +9,7 @@ import '../model/table_identity.dart';
 import '../model/weight_data.dart';
 import 'crontab_manager.dart';
 import 'data_store_impl.dart';
+import 'path_manager.dart';
 import 'yield_controller.dart';
 
 export '../model/weight_data.dart';
@@ -124,26 +124,49 @@ class WeightManager {
     _loadingLock = completer;
 
     try {
-      Uint8List? bytes;
+      WeightSnapshot? snapshot;
       if (!_isMemoryMode) {
         final path = _weightsPath(spaceName: spaceName);
         try {
           if (await _dataStore.storage.existsFile(path)) {
             final raw = await _dataStore.storage.readAsBytes(path);
-            if (raw.isNotEmpty) bytes = raw;
+            if (raw.isNotEmpty) {
+              snapshot = WeightSnapshotCodec.decode(raw);
+            }
           }
         } catch (e) {
-          Logger.warn('Failed to read access_weights.tobf', rawError: e);
+          Logger.warn(
+              'Failed to read access_weights.tobf, trying temp fallback',
+              rawError: e);
+          // Try fallback from stable temp file
+          try {
+            final tempPath = PathManager.buildTempPath(path);
+            if (await _dataStore.storage.existsFile(tempPath)) {
+              final tempBytes = await _dataStore.storage.readAsBytes(tempPath);
+              if (tempBytes.isNotEmpty) {
+                snapshot = WeightSnapshotCodec.decode(tempBytes);
+                // Self-heal: rewrite valid weights back
+                unawaited(
+                  _dataStore.storage
+                      .writeAsBytes(path, tempBytes, flush: true)
+                      .catchError((_) {}),
+                );
+                Logger.info(
+                    'AccessWeights auto-recovered from temp file ($tempPath)');
+              }
+            }
+          } catch (tempErr) {
+            Logger.warn('Fallback to temp AccessWeights failed',
+                rawError: tempErr);
+          }
         }
       }
 
-      if (bytes == null || bytes.isEmpty) {
+      if (snapshot == null) {
         await _initializeWeights(spaceName: spaceName);
         completer.complete();
         return;
       }
-
-      final snapshot = WeightSnapshotCodec.decode(bytes);
       _tableRecordWeights
         ..clear()
         ..addAll(snapshot.tableRecord);

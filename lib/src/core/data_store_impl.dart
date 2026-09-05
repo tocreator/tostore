@@ -170,6 +170,9 @@ class DataStoreImpl {
   // Global configuration cache
   GlobalConfig? _globalConfigCache;
 
+  /// Single-flight handle for [getGlobalConfig] disk load (startup / concurrent).
+  Future<GlobalConfig?>? _globalConfigLoadFuture;
+
   /// Engine version last successfully written to the downgrade-guard JSON stub.
   /// Process-local: avoids rewriting on every [saveGlobalConfig].
   int? _downgradeGuardJsonVersion;
@@ -779,18 +782,9 @@ class DataStoreImpl {
 
       transactionManager = TransactionManager(this);
 
-      if (!isMemoryMode) {
-        await Future.wait([
-          getGlobalConfig(),
-          _resourceManager!.initialize(_config!, this),
-          Future(() async => await transactionManager!.initialize()),
-        ]);
-      } else {
-        await Future.wait([
-          _resourceManager!.initialize(_config!, this),
-          Future(() async => await transactionManager!.initialize()),
-        ]);
-      }
+      // Kick off upgrade-safe loads in parallel without blocking open().
+      // WAL / txn / migration meta wait until after version upgrades (JSON→TOBF).
+      _kickoffStartupMetadataLoads(isMemoryMode: isMemoryMode);
       _startupProgressCallback?.call(0.1, DbStartupStage.opening);
 
       // When opening with default space (first open only), use stored activeSpace so one open lands in the right space.
@@ -861,15 +855,16 @@ class DataStoreImpl {
 
           // NOW initialize KeyManager for ALL instances (including migration instances)
           await _keyManager!.initialize();
+
+          // After upgrades (JSON→TOBF), prefetch WAL/txn/migration meta in parallel.
+          // Each later await joins its own single-flight load.
+          _kickoffPostUpgradeMetadataLoads();
         }
 
         // Mark base initialization complete AFTER KeyManager is initialized
         _baseInitialized = true;
         _startupProgressCallback?.call(0.2, DbStartupStage.opening);
         if (!isMemoryMode) {
-          // Prepare temp directory for crash-safe writes (native only)
-          await _resetTempDir();
-
           _startupProgressCallback?.call(0.2, DbStartupStage.recovering);
           await walManager.initializeAndRecover();
 
@@ -919,30 +914,38 @@ class DataStoreImpl {
 
         _startupProgressCallback?.call(1.0, DbStartupStage.ready);
 
-        // Background: full TableMeta cache + reconcile dir high-water.
-        if (!isMigrationInstance && !isMemoryMode) {
-          unawaited(
-              tableMetaManager?.loadAllTableMetaAsync().catchError((Object e) {
-            Logger.warn('Background table meta load failed', rawError: e);
-          }));
-
-          migrationManager?.schedulePendingMigrationWork();
-        }
-
         if (!_initCompleter.isCompleted) {
           _initCompleter.complete();
         }
 
         if (!isMigrationInstance) {
-          // Initialize WeightManager
-          if (_weightManager != null) {
-            await _weightManager!.initialize();
+          // Best-effort warmups after ready: kick all before [onOpen] so they
+          // overlap with the user callback. None are required for correctness.
+          if (!isMemoryMode) {
+            unawaited(tableMetaManager
+                ?.loadAllTableMetaAsync()
+                .catchError((Object e) {
+              Logger.warn('Background table meta load failed', rawError: e);
+            }));
+            migrationManager?.schedulePendingMigrationWork();
           }
-          await loadDataToCache();
+
+          final weightManager = _weightManager;
+          if (weightManager != null) {
+            unawaited(weightManager.initialize().catchError((Object e) {
+              Logger.warn('WeightManager background init failed', rawError: e);
+            }));
+          }
+          unawaited(loadDataToCache().catchError((Object e) {
+            Logger.warn('Startup cache/FK preload failed', rawError: e);
+          }));
           CrontabManager.start();
           _ttlCleanupManager.registerCleanupTask();
 
-          // Database open callback
+          if (!isMemoryMode) {
+            unawaited(_resetTempDir());
+          }
+
           await _onOpen?.call(this);
         }
       });
@@ -1263,6 +1266,7 @@ class DataStoreImpl {
       migrationManager?.dispose();
 
       _globalConfigCache = null;
+      _globalConfigLoadFuture = null;
       _downgradeGuardJsonVersion = null;
 
       // Now that we have yielded and called dispose, it is safe to
@@ -6210,7 +6214,8 @@ class DataStoreImpl {
     }
   }
 
-  /// load data from specified path
+  /// Startup / explicit cache warm.
+  ///
   Future<void> loadDataToCache() async {
     if (_isGlobalPrewarming || _prewarmFuture != null) {
       return;
@@ -6275,6 +6280,11 @@ class DataStoreImpl {
           ? prioritizedTables
           : prioritizedTables.take(maxPrewarmTables).toList(growable: false);
 
+      // Vector posting warm shares the global budget; cap its share so KV/table
+      // partial row caches still get a chance on large corpora.
+      final vectorBudgetCap = remainingPrewarmBytes ~/ 2;
+      var vectorBudgetUsed = 0;
+
       // Load tables by weight order.
       // If total table count is small, prewarm all tables to avoid missing hot
       // tables when weight data is incomplete.
@@ -6319,15 +6329,20 @@ class DataStoreImpl {
 
             final vectorIndexes = schemaMgr.getVectorIndexesFor(schema);
             for (final vIdx in vectorIndexes) {
-              if (shouldAbortBackgroundScan || remainingPrewarmBytes <= 0) {
+              final vectorBudget = min(
+                remainingPrewarmBytes,
+                vectorBudgetCap - vectorBudgetUsed,
+              );
+              if (shouldAbortBackgroundScan || vectorBudget <= 0) {
                 break;
               }
               final used = await _vectorIndexManager?.prewarmVectorIndex(
                     table,
                     vIdx.indexUid,
-                    maxBytes: remainingPrewarmBytes,
+                    maxBytes: vectorBudget,
                   ) ??
                   0;
+              vectorBudgetUsed += used;
               remainingPrewarmBytes = remainingPrewarmBytes > used
                   ? remainingPrewarmBytes - used
                   : 0;
@@ -6450,7 +6465,22 @@ class DataStoreImpl {
     }
   }
 
-  /// Prewarm KV store tables into TreeCache.
+  /// Estimate how many leading records fit in [remainingBytes] for partial warm.
+  int _prewarmRecordCap({
+    required int remainingBytes,
+    required int totalRecordCount,
+    required int tableDataSizeBytes,
+    required int indexBytes,
+  }) {
+    if (remainingBytes <= 0 || totalRecordCount <= 0) return 0;
+    final totalBytes = max(1, tableDataSizeBytes + indexBytes);
+    final avgBytesPerRecord = max(64, totalBytes ~/ totalRecordCount);
+    final byBudget = remainingBytes ~/ avgBytesPerRecord;
+    if (byBudget <= 0) return 0;
+    return min(_prewarmMaxRecords, min(totalRecordCount, byBudget));
+  }
+
+  /// Prewarm KV store tables into TreeCache (partial when over budget).
   /// Returns the remaining budget after KV warmup.
   Future<int> _prewarmKvStore({required int maxPrewarmBytes}) async {
     final kvTables = [
@@ -6458,20 +6488,20 @@ class DataStoreImpl {
       SystemTable.getKeyValueName(false),
     ];
 
-    var currentPrewarmedBytes = 0;
+    var remainingBytes = maxPrewarmBytes;
     final yieldController =
         YieldController('DataStoreImpl._prewarmKvStore', checkInterval: 1);
 
     for (final tableName in kvTables) {
-      if (shouldAbortBackgroundScan) {
-        return maxPrewarmBytes - currentPrewarmedBytes;
+      if (shouldAbortBackgroundScan || remainingBytes <= 0) {
+        return remainingBytes;
       }
       try {
         final table = await getTableContext(tableName);
         final tableDataMeta =
             await tableDataManager.getTableDataMeta(table.tableUid);
         if (shouldAbortBackgroundScan) {
-          return maxPrewarmBytes - currentPrewarmedBytes;
+          return remainingBytes;
         }
         if (tableDataMeta == null || tableDataMeta.totalRecordCount <= 0) {
           continue;
@@ -6480,8 +6510,13 @@ class DataStoreImpl {
         final indexBytes = await _estimateTableIndexBytes(table);
         final tableDataSize =
             await tableDataManager.sumTableDataSizeBytes(table);
-        final estimatedBytes = tableDataSize + indexBytes;
-        if (currentPrewarmedBytes + estimatedBytes > maxPrewarmBytes) {
+        final maxRecords = _prewarmRecordCap(
+          remainingBytes: remainingBytes,
+          totalRecordCount: tableDataMeta.totalRecordCount,
+          tableDataSizeBytes: tableDataSize,
+          indexBytes: indexBytes,
+        );
+        if (maxRecords <= 0) {
           continue;
         }
 
@@ -6489,33 +6524,43 @@ class DataStoreImpl {
           table: table,
           condition: QueryCondition()
             ..where(SystemTable.keyValueKeyField, '>=', ''),
+          maxRecords: maxRecords,
         );
-        currentPrewarmedBytes += estimatedBytes;
+        final used = min(
+          remainingBytes,
+          max(
+            1,
+            ((tableDataSize + indexBytes) * maxRecords) ~/
+                max(1, tableDataMeta.totalRecordCount),
+          ),
+        );
+        remainingBytes -= used;
         final y19 = yieldController.maybeYield();
         if (y19 != null) await y19;
       } catch (e) {
         if (shouldAbortBackgroundScan) {
-          return maxPrewarmBytes - currentPrewarmedBytes;
+          return remainingBytes;
         }
         Logger.warn('Prewarm KV store failed for $tableName', rawError: e);
       }
     }
 
-    return maxPrewarmBytes - currentPrewarmedBytes;
+    return remainingBytes;
   }
 
-  /// Prewarm user tables when the current space remains small enough.
+  /// Prewarm user table rows + B-tree indexes up to [prewarmBudgetBytes].
+  ///
+  /// Large spaces / million-row tables still get a **partial** leading warm
+  /// (never all-or-nothing skip). Boundary leaf pages are warmed earlier in
+  /// [_executePrewarm] and are independent of this budget.
   Future<void> _prewarmUserTables({
     List<String>? prioritizedTables,
     required int prewarmBudgetBytes,
   }) async {
     final schemaMgr = tableMetaManager;
-    if (schemaMgr == null || shouldAbortBackgroundScan) return;
-
-    final spaceStats = await getSpaceStats();
-    final spaceUsageBytes = spaceStats.totalSizeBytes;
-
-    if (spaceUsageBytes >= prewarmBudgetBytes) {
+    if (schemaMgr == null ||
+        shouldAbortBackgroundScan ||
+        prewarmBudgetBytes <= 0) {
       return;
     }
 
@@ -6533,10 +6578,10 @@ class DataStoreImpl {
     final yieldController =
         YieldController('DataStoreImpl._prewarmUserTables', checkInterval: 1);
 
-    var currentPrewarmedBytes = 0;
+    var remainingBytes = prewarmBudgetBytes;
 
     for (final tableName in userTables) {
-      if (shouldAbortBackgroundScan) break;
+      if (shouldAbortBackgroundScan || remainingBytes <= 0) break;
       try {
         if (shouldAbortBackgroundScan) continue;
 
@@ -6548,27 +6593,30 @@ class DataStoreImpl {
         }
 
         final schema = table.schema;
-
         final indexBytes = await _estimateTableIndexBytes(table);
         final tableDataSize =
             await tableDataManager.sumTableDataSizeBytes(table);
-        final estimatedBytes = tableDataSize + indexBytes;
-
-        if (currentPrewarmedBytes + estimatedBytes > prewarmBudgetBytes ||
-            tableDataMeta.totalRecordCount > _prewarmMaxRecords) {
-          break;
+        final maxRecords = _prewarmRecordCap(
+          remainingBytes: remainingBytes,
+          totalRecordCount: tableDataMeta.totalRecordCount,
+          tableDataSizeBytes: tableDataSize,
+          indexBytes: indexBytes,
+        );
+        if (maxRecords <= 0) {
+          continue;
         }
 
         await _prewarmQueryInBatches(
           table: table,
           condition: QueryCondition()..where(schema.primaryKey, '>=', ''),
+          maxRecords: maxRecords,
         );
         final y20 = yieldController.maybeYield();
         if (y20 != null) await y20;
 
         final indexes = schemaMgr.getBtreeIndexesFor(schema);
         for (final index in indexes) {
-          if (shouldAbortBackgroundScan) break;
+          if (shouldAbortBackgroundScan || remainingBytes <= 0) break;
           final indexMeta =
               await _indexManager?.getIndexMeta(table.tableUid, index.indexUid);
           if (indexMeta == null || indexMeta.btreeFirstLeaf.isNull) continue;
@@ -6577,12 +6625,21 @@ class DataStoreImpl {
             table: table,
             indexUid: index.indexUid,
             meta: indexMeta,
+            maxRecords: maxRecords,
           );
           final y21 = yieldController.maybeYield();
           if (y21 != null) await y21;
         }
 
-        currentPrewarmedBytes += estimatedBytes;
+        final used = min(
+          remainingBytes,
+          max(
+            1,
+            ((tableDataSize + indexBytes) * maxRecords) ~/
+                max(1, tableDataMeta.totalRecordCount),
+          ),
+        );
+        remainingBytes -= used;
         final y22 = yieldController.maybeYield();
         if (y22 != null) await y22;
       } catch (e) {
@@ -8029,9 +8086,80 @@ class DataStoreImpl {
     }
   }
 
+  /// Start independent startup metadata loads without awaiting.
+  ///
+  /// Only loads that are safe before version upgrades (GlobalConfig +
+  /// ResourceManager). WAL / txn / migration meta are started in
+  /// [_kickoffPostUpgradeMetadataLoads] after JSON→TOBF migrations.
+  void _kickoffStartupMetadataLoads({required bool isMemoryMode}) {
+    if (!isMemoryMode) {
+      // Zone-handle completion errors so prefetch cannot spam unhandled async
+      // errors; the next [getGlobalConfig] consumer still loads / joins correctly.
+      unawaited(getGlobalConfig().catchError((Object _) => null));
+    }
+    unawaited(
+        _resourceManager!.initialize(_config!, this).catchError((Object e) {
+      Logger.warn('ResourceManager startup init failed', rawError: e);
+    }));
+    // Memory mode has no version upgrades / meta format migration.
+    if (isMemoryMode) {
+      unawaited(transactionManager!.initialize().catchError((Object e) {
+        Logger.warn('TransactionManager startup init failed', rawError: e);
+      }));
+    }
+  }
+
+  /// Prefetch WAL / transaction / migration meta after version upgrades.
+  ///
+  /// Must not run before [VersionUpgradeManager.runDatabaseUpgradesIfNeeded]:
+  /// V3 migrates these files JSON→TOBF; loading earlier would cache empty/stale
+  /// in-memory meta and skip the migrated files.
+  void _kickoffPostUpgradeMetadataLoads() {
+    unawaited(walManager.initializeAndRecover().then<void>(
+      (_) {},
+      onError: (Object e, StackTrace _) {
+        Logger.warn('WAL meta startup prefetch failed', rawError: e);
+      },
+    ));
+    unawaited(transactionManager!.initialize().catchError((Object e) {
+      Logger.warn('TransactionManager startup init failed', rawError: e);
+    }));
+    unawaited(migrationManager!.getMigrationMeta().then<void>(
+      (_) {},
+      onError: (Object e, StackTrace _) {
+        Logger.warn('Migration meta startup prefetch failed', rawError: e);
+      },
+    ));
+  }
+
   /// Get global configuration
   Future<GlobalConfig?> getGlobalConfig() async {
     // Get from cache first
+    if (_globalConfigCache != null) {
+      return _globalConfigCache;
+    }
+
+    // Join in-flight load (startup prefetch / concurrent callers).
+    final inFlight = _globalConfigLoadFuture;
+    if (inFlight != null) {
+      return inFlight;
+    }
+
+    final loadOp = _loadGlobalConfigFromDisk();
+    _globalConfigLoadFuture = loadOp;
+    try {
+      return await loadOp;
+    } finally {
+      if (identical(_globalConfigLoadFuture, loadOp)) {
+        _globalConfigLoadFuture = null;
+      }
+    }
+  }
+
+  /// Disk/legacy load for [getGlobalConfig]. Do not call directly — use
+  /// [getGlobalConfig] so concurrent callers share one flight.
+  Future<GlobalConfig?> _loadGlobalConfigFromDisk() async {
+    // Another writer may have populated the cache while we were queued.
     if (_globalConfigCache != null) {
       return _globalConfigCache;
     }
@@ -8041,26 +8169,61 @@ class DataStoreImpl {
     try {
       if (await storage.existsFile(configPath)) {
         final bytes = await storage.readAsBytes(configPath);
-        if (bytes.isEmpty) return null;
+        if (bytes.isNotEmpty) {
+          final preferred = _resolveEncryptionKeyForGlobalConfig();
+          final decoded = GlobalConfigCodec.decodeFileWithFallback(
+            bytes,
+            preferredKey: preferred,
+            fallbackKeys: [
+              defaultEncryptionKey,
+            ],
+          );
+          // Do not clobber a newer in-memory save that won the race.
+          if (_globalConfigCache != null) {
+            return _globalConfigCache;
+          }
+          _globalConfigCache = decoded.config;
 
-        final preferred = _resolveEncryptionKeyForGlobalConfig();
-        final decoded = GlobalConfigCodec.decodeFileWithFallback(
-          bytes,
-          preferredKey: preferred,
-          fallbackKeys: [
-            defaultEncryptionKey,
-          ],
-        );
-        _globalConfigCache = decoded.config;
-
-        // Auto-rewrap when opened with a newer encryptionKey than on disk.
-        if (decoded.usedKey != preferred) {
-          await saveGlobalConfig(decoded.config, propagateErrors: false);
+          // Auto-rewrap when opened with a newer encryptionKey than on disk.
+          if (decoded.usedKey != preferred) {
+            await saveGlobalConfig(decoded.config, propagateErrors: false);
+          }
+          return decoded.config;
         }
-        return decoded.config;
       }
-    } catch (e) {
-      Logger.error('Failed to get global config', rawError: e);
+    } catch (primaryErr) {
+      // Primary file failed (IO / wrong key / corrupt / empty).
+      // Try fallback from stable temp file before giving up.
+      try {
+        final tempPath = PathManager.buildTempPath(configPath);
+        if (await storage.existsFile(tempPath)) {
+          final tempBytes = await storage.readAsBytes(tempPath);
+          if (tempBytes.isNotEmpty) {
+            final preferred = _resolveEncryptionKeyForGlobalConfig();
+            final decoded = GlobalConfigCodec.decodeFileWithFallback(
+              tempBytes,
+              preferredKey: preferred,
+              fallbackKeys: [
+                defaultEncryptionKey,
+              ],
+            );
+            if (_globalConfigCache != null) {
+              return _globalConfigCache;
+            }
+            _globalConfigCache = decoded.config;
+            // Self-heal: rewrite the recovered valid config back to main config path
+            await saveGlobalConfig(decoded.config, propagateErrors: false);
+            Logger.info(
+              'GlobalConfig auto-recovered from stable temp file ($tempPath)',
+            );
+            return decoded.config;
+          }
+        }
+      } catch (tempErr) {
+        Logger.warn('Fallback to temp GlobalConfig failed', rawError: tempErr);
+      }
+
+      Logger.error('Failed to get global config', rawError: primaryErr);
       // Fatal: encrypted GlobalConfig path failed (IO / wrong key / corrupt).
       // Do NOT return null - that would mint a fresh AppliedEncryption.
       rethrow;
@@ -8070,6 +8233,9 @@ class DataStoreImpl {
     // `tableDirectoryMap` must remain on disk until V3Upgrade consumes it.
     try {
       final legacy = await LegacyConfigBootstrap.readGlobalConfig(this);
+      if (_globalConfigCache != null) {
+        return _globalConfigCache;
+      }
       if (legacy != null) {
         _globalConfigCache = legacy;
         return legacy;

@@ -1,20 +1,20 @@
 import 'dart:async';
-import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:path/path.dart' as path;
 
+import '../handler/logger.dart';
+import '../handler/platform_handler.dart';
 import '../interface/file_storage_impl_stub.dart'
     if (dart.library.io) 'file_storage_impl.dart';
 import '../interface/storage_interface.dart';
-import '../handler/logger.dart';
-import '../handler/platform_handler.dart';
 import '../model/data_store_config.dart';
 import '../model/db_exception.dart';
 import '../model/id_generator.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
 import 'lock_manager.dart';
+import 'path_manager.dart';
 import 'transaction_context.dart';
 // Import platform-specific implementations with conditional imports
 import 'web_storage_impl.dart'
@@ -148,50 +148,9 @@ class StorageAdapter implements StorageInterface {
   ///
   /// For paths under a database space root (`.../spaces/{spaceName}/...`),
   /// place all temporary files under that space's `tmp` directory with
-  /// the same relative layout:
-  ///
-  /// ```text
-  /// final:  /.../spaces/{spaceName}/data/xxx/meta.json
-  /// temp :  /.../spaces/{spaceName}/tmp/data/xxx/.meta.json.tmp-{ts}
-  /// ```
-  ///
-  /// This allows the caller to simply delete the `tmp` directory on
-  /// startup for cleanup, without scanning all data/index directories.
-  /// For other paths (schemas/global/logs), fall back to same-directory
-  /// temporary files.
-  String _buildTempPath(String filePath) {
-    final normalized = path.normalize(filePath);
-    final parts = path.split(normalized);
-    final idx = parts.indexOf('spaces');
-
-    if (idx != -1 && idx + 1 < parts.length) {
-      final spaceRootParts = parts.sublist(0, idx + 2); // .../spaces/<space>
-      final spaceRoot = path.joinAll(spaceRootParts);
-      final tmpRoot = path.join(spaceRoot, 'tmp');
-
-      final relParts = parts.sublist(idx + 2); // after .../spaces/<space>
-      final ts = DateTime.now().microsecondsSinceEpoch;
-      final rand = Random().nextInt(1000000);
-
-      if (relParts.isEmpty) {
-        return path.join(tmpRoot, '.temp.tmp-$ts-$rand');
-      }
-
-      final base = relParts.removeLast();
-      final relDir = relParts.isEmpty ? '' : path.joinAll(relParts);
-      final tmpName = '.$base.tmp-$ts-$rand';
-
-      return relDir.isEmpty
-          ? path.join(tmpRoot, tmpName)
-          : path.join(tmpRoot, relDir, tmpName);
-    }
-
-    final dir = path.dirname(normalized);
-    final base = path.basename(normalized);
-    final ts = DateTime.now().microsecondsSinceEpoch;
-    final rand = Random().nextInt(1000000);
-    return path.join(dir, '.$base.tmp-$ts-$rand');
-  }
+  /// Place temporary files under the space's `tmp` directory or target directory,
+  /// delegated to [PathManager.buildTempPath].
+  String _buildTempPath(String filePath) => PathManager.buildTempPath(filePath);
 
   Future<void> _cleanupTemp(String? tempPath) async {
     if (tempPath == null) return;

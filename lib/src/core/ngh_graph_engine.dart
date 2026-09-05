@@ -496,18 +496,24 @@ class NghGraphEngine {
   ///
   /// Stops once [maxBytes] would be exceeded (OOM guard). Hot clusters
   /// (highest entryCount) are loaded first. Returns bytes added.
+  ///
+  /// Loads in small cluster/page batches and yields to the event loop between
+  /// batches so [shouldAbort] (close / switchSpace) can stop promptly — same
+  /// cooperative pattern as table/index row prewarm.
   Future<int> prewarmClusters({
     required TableContext table,
     required IndexUid indexUid,
     required NghIndexMeta meta,
     required int maxBytes,
+    bool Function()? shouldAbort,
   }) async {
-    if (maxBytes <= 0 || meta.totalVectors <= 0) return 0;
+    bool aborted() => shouldAbort?.call() ?? false;
+    if (maxBytes <= 0 || meta.totalVectors <= 0 || aborted()) return 0;
 
     final key = _cacheKey(table.tableUid, indexUid);
     final beforeBytes = _clusterCacheBytes;
     final navGraph = await _getOrLoadNavGraph(table, indexUid, meta);
-    if (navGraph == null || navGraph.centroids.isEmpty) return 0;
+    if (navGraph == null || navGraph.centroids.isEmpty || aborted()) return 0;
 
     final clusterMap = _inMemoryClusterCache.putIfAbsent(key, () => {});
     final centroids = navGraph.centroids;
@@ -525,75 +531,111 @@ class NghGraphEngine {
           (a, b) => centroids[b].entryCount.compareTo(centroids[a].entryCount));
     }
 
-    final packedBatch = <int>[];
-    final chainHeads = <int>[];
-    final expected = <int>{};
+    // Cluster batches + small page chunks keep close/switchSpace responsive
+    // under large vector counts (hundreds of thousands).
+    const clustersPerBatch = 16;
+    const pageChunkSize = 16;
+    final yieldController =
+        YieldController('NghGraphEngine.prewarmClusters', checkInterval: 1);
     var planned = 0;
+    var budgetExhausted = false;
 
-    for (final cId in order) {
-      if (clusterMap.containsKey(cId)) continue;
-      final c = centroids[cId];
-      if (!loadAll) {
-        final est = max(1, c.entryCount) * (24 + meta.dimensions);
-        if (planned + est > maxBytes) break;
-        planned += est;
-      }
-
-      expected.add(cId);
-      if (c.postingPageNos.isNotEmpty) {
-        packedBatch.addAll(c.postingPageNos);
-      } else if (c.headPostingPageNo > 0) {
-        chainHeads.add(c.headPostingPageNo);
-      } else {
-        clusterMap[cId] = <_NghCompactSlot>[];
-      }
-    }
-
-    // Chunked batch reads so we can stop early if decode blew past budget.
-    const chunkSize = 64;
-    for (var i = 0; i < packedBatch.length; i += chunkSize) {
+    for (var batchStart = 0;
+        batchStart < order.length && !budgetExhausted;
+        batchStart += clustersPerBatch) {
+      if (aborted()) break;
       if (_clusterCacheBytes - beforeBytes >= maxBytes) break;
-      final chunk = packedBatch.sublist(
-        i,
-        min(i + chunkSize, packedBatch.length),
-      );
-      final loaded = await _partitionManager.readPostingPagesBatch(
-        table,
-        indexUid,
-        meta,
-        chunk,
-        populatePageCache: false,
-      );
-      _ingestLoadedPagesIntoClusterMap(
-        clusterMap: clusterMap,
-        loaded: loaded,
-        expectedCentroidIds: const {},
-      );
-    }
 
-    if (chainHeads.isNotEmpty && _clusterCacheBytes - beforeBytes < maxBytes) {
-      for (final head in chainHeads) {
-        if (_clusterCacheBytes - beforeBytes >= maxBytes) break;
-        final chain = await _partitionManager.readPostingCluster(
+      final packedBatch = <int>[];
+      final chainHeads = <int>[];
+      final expected = <int>{};
+      final batchEnd = min(batchStart + clustersPerBatch, order.length);
+
+      for (var i = batchStart; i < batchEnd; i++) {
+        final cId = order[i];
+        if (clusterMap.containsKey(cId)) continue;
+        final c = centroids[cId];
+        if (!loadAll) {
+          final est = max(1, c.entryCount) * (24 + meta.dimensions);
+          if (planned + est > maxBytes) {
+            budgetExhausted = true;
+            break;
+          }
+          planned += est;
+        }
+
+        expected.add(cId);
+        if (c.postingPageNos.isNotEmpty) {
+          packedBatch.addAll(c.postingPageNos);
+        } else if (c.headPostingPageNo > 0) {
+          chainHeads.add(c.headPostingPageNo);
+        } else {
+          clusterMap[cId] = <_NghCompactSlot>[];
+        }
+      }
+
+      for (var i = 0; i < packedBatch.length; i += pageChunkSize) {
+        if (aborted() || _clusterCacheBytes - beforeBytes >= maxBytes) {
+          budgetExhausted = _clusterCacheBytes - beforeBytes >= maxBytes;
+          break;
+        }
+        final chunk = packedBatch.sublist(
+          i,
+          min(i + pageChunkSize, packedBatch.length),
+        );
+        final loaded = await _partitionManager.readPostingPagesBatch(
           table,
           indexUid,
           meta,
-          head,
+          chunk,
+          populatePageCache: false,
         );
+        if (aborted()) break;
         _ingestLoadedPagesIntoClusterMap(
           clusterMap: clusterMap,
-          loaded: chain,
+          loaded: loaded,
           expectedCentroidIds: const {},
         );
+        // Always return to the event loop between chunks for UI / cancel.
+        await Future<void>.delayed(Duration.zero);
       }
+
+      if (aborted()) break;
+
+      if (chainHeads.isNotEmpty &&
+          _clusterCacheBytes - beforeBytes < maxBytes) {
+        for (final head in chainHeads) {
+          if (aborted() || _clusterCacheBytes - beforeBytes >= maxBytes) {
+            break;
+          }
+          final chain = await _partitionManager.readPostingCluster(
+            table,
+            indexUid,
+            meta,
+            head,
+          );
+          if (aborted()) break;
+          _ingestLoadedPagesIntoClusterMap(
+            clusterMap: clusterMap,
+            loaded: chain,
+            expectedCentroidIds: const {},
+          );
+          await Future<void>.delayed(Duration.zero);
+        }
+      }
+
+      if (aborted()) break;
+
+      for (final cId in expected) {
+        clusterMap.putIfAbsent(cId, () => <_NghCompactSlot>[]);
+      }
+
+      final y = yieldController.maybeYield();
+      if (y != null) await y;
     }
 
-    for (final cId in expected) {
-      clusterMap.putIfAbsent(cId, () => <_NghCompactSlot>[]);
-    }
-
+    // Partial warm on abort is fine; still touch/cap for coherent resident state.
     _touchClusterCacheKey(key);
-    // Cap this index's contribution; do not evict the index we just warmed.
     if (_clusterCacheBytes > _clusterCacheMaxBytes) {
       _enforceClusterCacheBudget(protectKey: key);
     }

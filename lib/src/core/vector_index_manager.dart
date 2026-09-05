@@ -301,6 +301,8 @@ class VectorIndexManager {
   /// Prewarm vector index meta, nav graph, and posting clusters into cache.
   ///
   /// Respects [maxBytes] (and the global cluster-cache ceiling) to avoid OOM.
+  /// Loads clusters in cooperative batches so close / switchSpace can abort
+  /// promptly (mirrors table/index row prewarm).
   /// Returns approximate bytes added to the cluster compact cache.
   Future<int> prewarmVectorIndex(
     TableContext table,
@@ -308,9 +310,12 @@ class VectorIndexManager {
     int? maxBytes,
   }) async {
     try {
+      if (_dataStore.shouldAbortBackgroundScan) return 0;
+
       final navPrefetch = _graphEngine.prefetchNavGraph(table, indexUid);
       final meta = await _loadMeta(table, indexUid);
       await navPrefetch;
+      if (_dataStore.shouldAbortBackgroundScan) return 0;
       if (meta == null || meta.isBuilding || meta.totalVectors <= 0) {
         return 0;
       }
@@ -323,7 +328,10 @@ class VectorIndexManager {
         indexUid: indexUid,
         meta: meta,
         maxBytes: budget,
+        shouldAbort: () => _dataStore.shouldAbortBackgroundScan,
       );
+
+      if (_dataStore.shouldAbortBackgroundScan) return added;
 
       // JIT-compile scoring kernels and prime cluster routing on this isolate.
       await _graphEngine.warmSearchPath(

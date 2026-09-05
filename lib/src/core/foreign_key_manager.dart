@@ -46,13 +46,11 @@ class ForeignKeyManager {
       await _dataStore.tableMetaManager?.getNameByUid(uid) ??
       TableName(uid.value);
 
-  /// Preload foreign key cache synchronously
+  /// Prefetch foreign key reverse-mapping cache.
   ///
-  /// This method should be called during database initialization to ensure the cache
-  /// is loaded before user table caches consume memory. This prevents the cache from
-  /// being evicted due to memory pressure from user table caches.
-  ///
-  /// This is a synchronous operation that should be called before loading user table caches.
+  /// Prefer calling early so the FK cache is resident before heavy table
+  /// prewarm. Not required for correctness — first FK use joins
+  /// [_ensureCacheLoaded] single-flight.
   Future<void> preloadCache() async {
     await _ensureCacheLoaded();
   }
@@ -2513,7 +2511,7 @@ class ForeignKeyManager {
 
           if (needsUpdate) {
             if (oldReferenced != fk.referencedTable) {
-              // Composite unique key includes referenced_table — delete old
+              // Composite unique key includes referenced_table - delete old
               // row then insert (in-place update cannot change unique key cols).
               final deleteResult = await _dataStore.deleteInternal(
                 fkTable,

@@ -28,6 +28,7 @@ import '../model/table_schema.dart';
 import '../model/wal_pointer.dart';
 import '../upgrades/legacy_model/pre_v3.dart';
 import 'backup_manager.dart';
+import 'path_manager.dart';
 import 'compute_manager.dart';
 import 'compute_tasks.dart';
 import 'crontab_manager.dart';
@@ -4702,6 +4703,9 @@ class MigrationManager {
   }
 
   /// Get or load migration metadata from cache or file
+  Future<MigrationMeta> getMigrationMeta() => _getOrLoadMigrationMeta();
+
+  /// Get or load migration metadata from cache or file
   Future<MigrationMeta> _getOrLoadMigrationMeta() async {
     // Return cached value if available
     if (_migrationMetaCache != null) {
@@ -4741,21 +4745,50 @@ class MigrationManager {
       return _migrationMetaCache!;
     }
 
+    final metaPath = _dataStore.pathManager.getMigrationMetaPath();
     try {
-      final metaPath = _dataStore.pathManager.getMigrationMetaPath();
       if (!await _dataStore.storage.existsFile(metaPath)) {
         _migrationMetaCache = MigrationMeta.initial();
       } else {
         final bytes = await _dataStore.storage.readAsBytes(metaPath);
         if (bytes.isEmpty) {
-          _migrationMetaCache = MigrationMeta.initial();
+          throw DbException([
+            GeneralStatus(
+              type: ResultType.sysIoDataCorrupted,
+              message: 'migration_meta.tobf is empty',
+            ),
+          ]);
         } else {
           _migrationMetaCache = MigrationMetaCodec.decodeFile(bytes);
         }
       }
     } catch (e) {
-      Logger.warn('Load migration meta failed, use initial', rawError: e);
-      _migrationMetaCache = MigrationMeta.initial();
+      // Primary migration_meta failed/corrupt: attempt emergency fallback from stable temp file
+      try {
+        final tempPath = PathManager.buildTempPath(metaPath);
+        if (await _dataStore.storage.existsFile(tempPath)) {
+          final tempBytes = await _dataStore.storage.readAsBytes(tempPath);
+          if (tempBytes.isNotEmpty) {
+            final recovered = MigrationMetaCodec.decodeFile(tempBytes);
+            _migrationMetaCache = recovered;
+            // Self-heal: rewrite valid meta back to primary path
+            unawaited(
+              _dataStore.storage
+                  .writeAsBytes(metaPath, tempBytes, flush: true)
+                  .catchError((_) {}),
+            );
+            Logger.info(
+                'MigrationMeta auto-recovered from temp file ($tempPath)');
+          }
+        }
+      } catch (tempErr) {
+        Logger.warn('Fallback to temp MigrationMeta failed', rawError: tempErr);
+      }
+
+      if (_migrationMetaCache == null) {
+        Logger.warn('Load migration meta failed, use initial', rawError: e);
+        _migrationMetaCache = MigrationMeta.initial();
+      }
     }
 
     // Update currentDirIndex cache
