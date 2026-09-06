@@ -289,6 +289,13 @@ class ForeignKeyManager {
         for (int i = 0; i < records.length; i++) {
           if (violations[i] != null) continue;
           final r = records[i];
+          // Match single-row update semantics: absent FK fields are not being
+          // written, so skip (do not treat Map-miss as NULL).
+          if (!r.containsKey(fkField)) {
+            if (operation == ForeignKeyOperation.update) {
+              continue;
+            }
+          }
           final rawVal = r[fkField];
           if (rawVal == null) {
             final fieldSchema =

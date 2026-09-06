@@ -973,9 +973,7 @@ class DataStoreImpl {
     try {
       if (PlatformHandler.isWeb) return;
       final tempDir = pathManager.getTempDirPath();
-      // Best-effort delete; then recreate
-      await storage.deleteDirectory(tempDir);
-      await storage.ensureDirectoryExists(tempDir);
+      await storage.drainAndResetTempDirectory(tempDir);
     } catch (e) {
       Logger.warn('Reset temp directory failed', rawError: e);
     }

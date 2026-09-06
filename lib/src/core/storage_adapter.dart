@@ -161,6 +161,109 @@ class StorageAdapter implements StorageInterface {
     } catch (_) {}
   }
 
+  //========================================================================
+  // In-flight temp write tracking & safe drain for temp directory reset
+  //========================================================================
+
+  int _activeTempWrites = 0;
+  bool _tempResetting = false;
+  Completer<void>? _tempResetCompleter;
+  Completer<void>? _activeTempWritesDrainCompleter;
+
+  /// Wait out an in-progress temp-dir reset (no-op on the fast path).
+  Future<void> _checkTempResetGate() async {
+    while (_tempResetting) {
+      final completer = _tempResetCompleter;
+      if (completer == null || completer.isCompleted) {
+        // Flag/completer being torn down; yield and re-check.
+        await Future<void>.value();
+        continue;
+      }
+      await completer.future;
+    }
+  }
+
+  /// Enter the temp-staging critical section.
+  ///
+  /// Must not leave a window where reset sees count==0 after the gate passed:
+  /// wait → begin is retried if reset started in between (single-isolate safe
+  /// once begin and the re-check are synchronous).
+  Future<void> _enterTempWrite() async {
+    while (true) {
+      await _checkTempResetGate();
+      _beginTempWrite();
+      if (!_tempResetting) {
+        return;
+      }
+      // Lost the race with reset: undo and wait for it to finish.
+      _endTempWrite();
+    }
+  }
+
+  /// Synchronous in-flight counter increment.
+  void _beginTempWrite() {
+    _activeTempWrites++;
+  }
+
+  /// Synchronous in-flight counter decrement and drain notification.
+  void _endTempWrite() {
+    _activeTempWrites--;
+    if (_activeTempWrites <= 0) {
+      _activeTempWrites = 0;
+      final drainCompleter = _activeTempWritesDrainCompleter;
+      if (drainCompleter != null && !drainCompleter.isCompleted) {
+        drainCompleter.complete();
+      }
+    }
+  }
+
+  /// True when [filePath] is under `spaces/<name>/tmp/` (atomic staging area).
+  static bool _isSpaceTempPath(String filePath) {
+    final parts = path.split(path.normalize(filePath));
+    final idx = parts.indexOf('spaces');
+    return idx != -1 && idx + 2 < parts.length && parts[idx + 2] == 'tmp';
+  }
+
+  /// Wait for in-flight atomic temp writers, then delete and recreate [tempDir].
+  ///
+  /// Does not time out into an unsafe delete: if drain is slow we keep waiting.
+  /// Concurrent callers join the in-flight reset instead of no-op'ing.
+  Future<void> drainAndResetTempDirectory(String tempDir) async {
+    _ensureOpen();
+    if (_tempResetting) {
+      final inFlight = _tempResetCompleter;
+      if (inFlight != null && !inFlight.isCompleted) {
+        await inFlight.future;
+      }
+      return;
+    }
+
+    _tempResetting = true;
+    _tempResetCompleter = Completer<void>();
+
+    try {
+      while (_activeTempWrites > 0) {
+        final drainCompleter = Completer<void>();
+        _activeTempWritesDrainCompleter = drainCompleter;
+        // Double-check in case writes completed right before setting completer.
+        if (_activeTempWrites > 0) {
+          await drainCompleter.future;
+        }
+        _activeTempWritesDrainCompleter = null;
+      }
+
+      await _storage.deleteDirectory(tempDir);
+      await _storage.ensureDirectoryExists(tempDir);
+    } finally {
+      _tempResetting = false;
+      final resetCompleter = _tempResetCompleter;
+      _tempResetCompleter = null;
+      if (resetCompleter != null && !resetCompleter.isCompleted) {
+        resetCompleter.complete();
+      }
+    }
+  }
+
   /// generate operation id with high uniqueness
   String _generateOperationId(String prefix) {
     return GlobalIdGenerator.generate(prefix);
@@ -263,6 +366,7 @@ class StorageAdapter implements StorageInterface {
       // Atomic path for non-append + flush=true: long write goes to temp without blocking readers.
       if (!append && flush) {
         final tempPath = _buildTempPath(path);
+        await _enterTempWrite();
         try {
           await _storage.writeAsString(tempPath, content,
               append: false, flush: true, closeHandleAfterFlush: true);
@@ -285,7 +389,11 @@ class StorageAdapter implements StorageInterface {
             }
           }
         } finally {
-          await _cleanupTemp(tempPath);
+          try {
+            await _cleanupTemp(tempPath);
+          } finally {
+            _endTempWrite();
+          }
         }
         return;
       }
@@ -338,6 +446,7 @@ class StorageAdapter implements StorageInterface {
 
       if (flush) {
         final tempPath = _buildTempPath(path);
+        await _enterTempWrite();
         try {
           await _storage.writeAsBytes(tempPath, bytes,
               flush: true, closeHandleAfterFlush: true);
@@ -360,7 +469,11 @@ class StorageAdapter implements StorageInterface {
             }
           }
         } finally {
-          await _cleanupTemp(tempPath);
+          try {
+            await _cleanupTemp(tempPath);
+          } finally {
+            _endTempWrite();
+          }
         }
         return;
       }
@@ -1077,23 +1190,35 @@ class StorageAdapter implements StorageInterface {
   @override
   Future<void> replaceFileAtomic(String tempPath, String finalPath) async {
     _ensureOpen();
-    // Acquire exclusive lock on final path to serialize atomic replacement
-    final resource = _getLockResource(finalPath);
-    final opId = _generateOperationId(_writeOpPrefix);
-    bool acquired = false;
+    // writeAs* already counts via _enterTempWrite and calls _storage.replace...
+    // Only track direct callers that stage under space tmp.
+    final trackTemp = _isSpaceTempPath(tempPath);
+    if (trackTemp) {
+      await _enterTempWrite();
+    }
     try {
-      acquired = await _lockManager.acquireExclusiveLock(resource, opId);
-      if (!acquired) {
-        _throwLockTimeout(
-            'Failed to acquire exclusive lock for replaceFileAtomic: $resource',
-            resource);
+      // Acquire exclusive lock on final path to serialize atomic replacement
+      final resource = _getLockResource(finalPath);
+      final opId = _generateOperationId(_writeOpPrefix);
+      bool acquired = false;
+      try {
+        acquired = await _lockManager.acquireExclusiveLock(resource, opId);
+        if (!acquired) {
+          _throwLockTimeout(
+              'Failed to acquire exclusive lock for replaceFileAtomic: $resource',
+              resource);
+        }
+        await _storage.replaceFileAtomic(tempPath, finalPath);
+        // Register final path as touched for current transaction scope (if any)
+        TransactionContext.registerTouchedPath(finalPath);
+      } finally {
+        if (acquired) {
+          _lockManager.releaseExclusiveLock(resource, opId);
+        }
       }
-      await _storage.replaceFileAtomic(tempPath, finalPath);
-      // Register final path as touched for current transaction scope (if any)
-      TransactionContext.registerTouchedPath(finalPath);
     } finally {
-      if (acquired) {
-        _lockManager.releaseExclusiveLock(resource, opId);
+      if (trackTemp) {
+        _endTempWrite();
       }
     }
   }

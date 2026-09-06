@@ -136,7 +136,18 @@ class FileStorageImpl implements StorageInterface {
     }
 
     // Open new handle
-    final raf = await file.open(mode: mode);
+    RandomAccessFile raf;
+    try {
+      raf = await file.open(mode: mode);
+    } on PathNotFoundException {
+      if (mode != FileMode.read) {
+        // Defensive self-healing: re-ensure parent exists and retry once
+        await file.parent.create(recursive: true);
+        raf = await file.open(mode: mode);
+      } else {
+        rethrow;
+      }
+    }
     _handlePool[key] = raf;
     _lru[key] = DateTime.now();
 

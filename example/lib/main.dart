@@ -3173,17 +3173,57 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
 
       try {
         if (_isKvMode) {
-          await widget.example.db.kv.clear(isGlobal: _isKvGlobal);
-          logService.add(
-              'Cleared ${_isKvGlobal ? 'global' : 'space'} KV store.',
-              LogLevel.info);
+          final result =
+              await widget.example.db.kv.clear(isGlobal: _isKvGlobal);
+          if (!result.hasErrors) {
+            logService.add(
+                'Cleared ${_isKvGlobal ? 'global' : 'space'} KV store.',
+                LogLevel.info);
+          } else {
+            final errorMsg = _dbResultErrorMessage(result);
+            logService.add(
+                'Failed to clear KV store: $errorMsg', LogLevel.error);
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text('Clear failed: $errorMsg'),
+                  backgroundColor: Colors.red,
+                  duration: const Duration(seconds: 4),
+                ),
+              );
+            }
+          }
         } else {
-          await widget.example.db.clear(_selectedTable);
-          logService.add('Cleared table $_selectedTable.', LogLevel.info);
+          final result = await widget.example.db.clear(_selectedTable);
+          if (!result.hasErrors) {
+            logService.add('Cleared table $_selectedTable.', LogLevel.info);
+          } else {
+            final errorMsg = _dbResultErrorMessage(result);
+            logService.add('Failed to clear table $_selectedTable: $errorMsg',
+                LogLevel.error);
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                SnackBar(
+                  content: Text('Clear failed: $errorMsg'),
+                  backgroundColor: Colors.red,
+                  duration: const Duration(seconds: 4),
+                ),
+              );
+            }
+          }
         }
       } catch (e, s) {
         logService.add('Failed to clear table: $e', LogLevel.error);
         logService.add('Stacktrace: $s', LogLevel.error);
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Clear failed: $e'),
+              backgroundColor: Colors.red,
+              duration: const Duration(seconds: 4),
+            ),
+          );
+        }
       }
       await _fetchTableData(resetPage: true);
     }
