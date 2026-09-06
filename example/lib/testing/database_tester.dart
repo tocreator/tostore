@@ -2949,458 +2949,754 @@ class DatabaseTester {
     return isTestPassed;
   }
 
-  /// Comprehensive test for foreign key operations.
-  /// Tests constraint validation, cascade delete, cascade update, RESTRICT, and clear/drop operations.
+  /// Comprehensive foreign-key / cascade correctness suite.
+  ///
+  /// Covers single-row and batch paths for insert/update/delete/clear, plus
+  /// every [ForeignKeyCascadeAction] via dedicated temporary tables.
   Future<bool> _testForeignKeyOperations() async {
     log.add('--- Testing: Foreign Key Operations ---', LogLevel.debug);
-    bool isTestPassed = true;
+    bool ok = true;
     try {
-      await _clearTablesSafely();
-
-      // ========== Test 1: Foreign Key Constraint Validation ==========
-      log.add('--- Sub-test: Foreign Key Constraint Validation ---',
-          LogLevel.debug);
-
-      // Insert a valid user
-      final userResult = await db.insert(ExampleSchemas.users.name, {
-        'username': 'fk_user',
-        'email': 'fk@test.com',
-      });
-      isTestPassed &=
-          _expect('Insert user should succeed', !userResult.hasErrors, true);
-      if (!isTestPassed) return false;
-
-      final userId = userResult.firstPrimaryKey;
-
-      // Test 1.1: Insert post with valid foreign key
-      final postResult = await db.insert(ExampleSchemas.posts.name, {
-        'title': 'Valid Post',
-        'user_id': userId,
-      });
-      isTestPassed &= _expect('Insert post with valid user_id should succeed',
-          !postResult.hasErrors, true);
-
-      // Test 1.2: Insert post with invalid foreign key (non-existent user_id)
-      final invalidPostResult = await db.insert(ExampleSchemas.posts.name, {
-        'title': 'Invalid Post',
-        'user_id': '99999', // Non-existent user ID
-      });
-      isTestPassed &= _expect('Insert post with invalid user_id should fail',
-          !invalidPostResult.hasErrors, false);
-      isTestPassed &= _expect(
-          'Error type should be foreignKeyViolation or validationFailed',
-          invalidPostResult.firstType == ResultType.bizForeignKeyViolation ||
-              invalidPostResult.firstType ==
-                  ResultType.bizForeignKeyParentNotExist ||
-              invalidPostResult.firstType == ResultType.bizValidationFailed,
-          true);
-
-      // Test 1.3: Insert comment with valid foreign keys
-      final postId = postResult.firstPrimaryKey;
-      final commentResult = await db.insert(ExampleSchemas.comments.name, {
-        'post_id': postId,
-        'user_id': userId,
-        'content': 'Valid comment',
-      });
-      isTestPassed &= _expect(
-          'Insert comment with valid foreign keys should succeed',
-          !commentResult.hasErrors,
-          true);
-
-      // Test 1.4: Insert comment with invalid post_id
-      final invalidCommentResult1 =
-          await db.insert(ExampleSchemas.comments.name, {
-        'post_id': '99999', // Non-existent post ID
-        'user_id': userId,
-        'content': 'Invalid comment',
-      });
-      isTestPassed &= _expect('Insert comment with invalid post_id should fail',
-          !invalidCommentResult1.hasErrors, false);
-
-      // Test 1.5: Insert comment with invalid user_id
-      final invalidCommentResult2 =
-          await db.insert(ExampleSchemas.comments.name, {
-        'post_id': postId,
-        'user_id': '99999', // Non-existent user ID
-        'content': 'Invalid comment',
-      });
-      isTestPassed &= _expect('Insert comment with invalid user_id should fail',
-          !invalidCommentResult2.hasErrors, false);
-
-      // ========== Test 2: Cascade Delete (CASCADE) ==========
-      log.add('--- Sub-test: Cascade Delete ---', LogLevel.debug);
-
-      await _clearTablesSafely();
-
-      // Create test data: user -> posts -> comments
-      // Note: comments.user_id has RESTRICT, so we use a different user for comments
-      // to avoid RESTRICT blocking the cascade delete test
-      final cascadeUserResult = await db.insert(ExampleSchemas.users.name, {
-        'username': 'cascade_user',
-        'email': 'cascade@test.com',
-      });
-      isTestPassed &= _expect(
-          'Insert user should succeed', !cascadeUserResult.hasErrors, true);
-      if (!isTestPassed) return false;
-
-      final cascadeUserId = cascadeUserResult.firstPrimaryKey;
-
-      // Create a separate user for comments (to avoid RESTRICT blocking cascade delete)
-      final cascadeCommentUserResult =
-          await db.insert(ExampleSchemas.users.name, {
-        'username': 'cascade_comment_user',
-        'email': 'cascade_comment@test.com',
-      });
-      isTestPassed &= _expect('Insert comment user should succeed',
-          !cascadeCommentUserResult.hasErrors, true);
-      if (!isTestPassed) return false;
-
-      final cascadeCommentUserId = cascadeCommentUserResult.firstPrimaryKey;
-
-      // Create posts for the user
-      final cascadePost1Result = await db.insert(ExampleSchemas.posts.name, {
-        'title': 'Post 1',
-        'user_id': cascadeUserId,
-      });
-      final cascadePost2Result = await db.insert(ExampleSchemas.posts.name, {
-        'title': 'Post 2',
-        'user_id': cascadeUserId,
-      });
-      isTestPassed &= _expect('Insert posts should succeed',
-          !cascadePost1Result.hasErrors && !cascadePost2Result.hasErrors, true);
-      if (!isTestPassed) return false;
-
-      final cascadePost1Id = cascadePost1Result.firstPrimaryKey;
-      final cascadePost2Id = cascadePost2Result.firstPrimaryKey;
-
-      // Create comments for posts (using different user to avoid RESTRICT blocking)
-      await db.insert(ExampleSchemas.comments.name, {
-        'post_id': cascadePost1Id,
-        'user_id': cascadeCommentUserId, // Use different user to avoid RESTRICT
-        'content': 'Comment 1',
-      });
-      await db.insert(ExampleSchemas.comments.name, {
-        'post_id': cascadePost1Id,
-        'user_id': cascadeCommentUserId, // Use different user to avoid RESTRICT
-        'content': 'Comment 2',
-      });
-      await db.insert(ExampleSchemas.comments.name, {
-        'post_id': cascadePost2Id,
-        'user_id': cascadeCommentUserId, // Use different user to avoid RESTRICT
-        'content': 'Comment 3',
-      });
-
-      // Verify initial counts
-      final postsBefore = await db
-          .query(ExampleSchemas.posts.name)
-          .where('user_id', '=', cascadeUserId);
-      final commentsBefore = await db
-          .query(ExampleSchemas.comments.name)
-          .whereIn('post_id', [cascadePost1Id, cascadePost2Id]);
-      isTestPassed &=
-          _expect('Should have 2 posts before delete', postsBefore.length, 2);
-      isTestPassed &= _expect(
-          'Should have 3 comments before delete', commentsBefore.length, 3);
-
-      // Store the total comment count before delete (to verify cascade delete)
-      // Note: We need to get the count AFTER creating all test data to ensure accuracy
-      final totalCommentsBefore =
-          await db.query(ExampleSchemas.comments.name).count();
-      isTestPassed &= _expect('Should have at least 3 comments before delete',
-          totalCommentsBefore >= 3, true);
-      if (!isTestPassed) return false;
-
-      // Delete user (should cascade delete posts, which should cascade delete comments)
-      final deleteResult = await db
-          .delete(ExampleSchemas.users.name)
-          .where('id', '=', cascadeUserId);
-      isTestPassed &=
-          _expect('Delete user should succeed', !deleteResult.hasErrors, true);
-      if (!isTestPassed) return false;
-
-      // Verify cascade delete: posts should be deleted
-      final postsAfter = await db
-          .query(ExampleSchemas.posts.name)
-          .where('user_id', '=', cascadeUserId);
-      isTestPassed &=
-          _expect('Posts should be cascade deleted', postsAfter.length, 0);
-      if (!isTestPassed) return false;
-
-      // Verify cascade delete: comments should be deleted
-      final commentsAfter = await db
-          .query(ExampleSchemas.comments.name)
-          .whereIn('post_id', [cascadePost1Id, cascadePost2Id]);
-      isTestPassed &= _expect(
-          'Comments should be cascade deleted', commentsAfter.length, 0);
-
-      // ========== Test 3: Cascade Update (CASCADE) ==========
-      log.add('--- Sub-test: Cascade Update ---', LogLevel.debug);
-
-      await _clearTablesSafely();
-
-      // Create test data
-      final updateUserResult = await db.insert(ExampleSchemas.users.name, {
-        'username': 'update_user',
-        'email': 'update@test.com',
-      });
-      isTestPassed &= _expect(
-          'Insert user should succeed', !updateUserResult.hasErrors, true);
-      if (!isTestPassed) return false;
-
-      final updateUserId = updateUserResult.firstPrimaryKey;
-
-      // Create post
-      final updatePostResult = await db.insert(ExampleSchemas.posts.name, {
-        'title': 'Update Post',
-        'user_id': updateUserId,
-      });
-      isTestPassed &= _expect(
-          'Insert post should succeed', !updatePostResult.hasErrors, true);
-      if (!isTestPassed) return false;
-
-      final updatePostId = updatePostResult.firstPrimaryKey;
-
-      // Create comment
-      await db.insert(ExampleSchemas.comments.name, {
-        'post_id': updatePostId,
-        'user_id': updateUserId,
-        'content': 'Update Comment',
-      });
-
-      // Verify initial state
-      final updatePostBefore = await db
-          .query(ExampleSchemas.posts.name)
-          .where('id', '=', updatePostId)
-          .first();
-      isTestPassed &= _expect(
-          'Post should exist before update', updatePostBefore != null, true);
-      // Compare as strings since primary keys are stored as strings, but foreign key fields may be integers
-      isTestPassed &= _expect('Post user_id should match',
-          updatePostBefore?['user_id']?.toString(), updateUserId.toString());
-
-      // Verify foreign key constraint is still enforced after operations
-      final updateCommentBefore = await db
-          .query(ExampleSchemas.comments.name)
-          .where('post_id', '=', updatePostId)
-          .first();
-      isTestPassed &=
-          _expect('Comment should exist', updateCommentBefore != null, true);
-      // Compare as strings since primary keys are stored as strings, but foreign key fields may be integers
-      isTestPassed &= _expect('Comment post_id should match',
-          updateCommentBefore?['post_id']?.toString(), updatePostId.toString());
-
-      // ========== Test 4: RESTRICT Constraint ==========
-      log.add('--- Sub-test: RESTRICT Constraint ---', LogLevel.debug);
-
-      await _clearTablesSafely();
-
-      // Create test data
-      final restrictUserResult = await db.insert(ExampleSchemas.users.name, {
-        'username': 'restrict_user',
-        'email': 'restrict@test.com',
-      });
-      isTestPassed &= _expect(
-          'Insert user should succeed', !restrictUserResult.hasErrors, true);
-      if (!isTestPassed) return false;
-
-      final restrictUserId = restrictUserResult.firstPrimaryKey;
-
-      // Create post (posts.user_id has CASCADE, so this won't test RESTRICT)
-      final restrictPostResult = await db.insert(ExampleSchemas.posts.name, {
-        'title': 'Restrict Post',
-        'user_id': restrictUserId,
-      });
-      isTestPassed &= _expect(
-          'Insert post should succeed', !restrictPostResult.hasErrors, true);
-      if (!isTestPassed) return false;
-
-      final restrictPostId = restrictPostResult.firstPrimaryKey;
-
-      // Create comment (comments.user_id has RESTRICT)
-      final restrictCommentResult =
-          await db.insert(ExampleSchemas.comments.name, {
-        'post_id': restrictPostId,
-        'user_id': restrictUserId,
-        'content': 'Restrict Comment',
-      });
-      isTestPassed &= _expect('Insert comment should succeed',
-          !restrictCommentResult.hasErrors, true);
-      if (!isTestPassed) return false;
-
-      // Try to delete user - should fail because comments.user_id has RESTRICT
-      final restrictDeleteResult = await db
-          .delete(ExampleSchemas.users.name)
-          .where('id', '=', restrictUserId);
-      isTestPassed &= _expect(
-          'Delete user with RESTRICT foreign key should fail',
-          !restrictDeleteResult.hasErrors,
-          false);
-      isTestPassed &= _expect(
-          'Error type should be foreignKeyViolation or validationFailed',
-          restrictDeleteResult.firstType == ResultType.bizForeignKeyViolation ||
-              restrictDeleteResult.firstType ==
-                  ResultType.bizForeignKeyChildRestrict ||
-              restrictDeleteResult.firstType == ResultType.bizValidationFailed,
-          true);
-
-      // Verify user still exists
-      final restrictUserAfter = await db
-          .query(ExampleSchemas.users.name)
-          .where('id', '=', restrictUserId)
-          .first();
-      isTestPassed &= _expect('User should still exist after failed delete',
-          restrictUserAfter != null, true);
-
-      // Delete comment first, then user should succeed
-      await db
-          .delete(ExampleSchemas.comments.name)
-          .where('id', '=', restrictCommentResult.firstPrimaryKey);
-      final restrictDeleteResult2 = await db
-          .delete(ExampleSchemas.users.name)
-          .where('id', '=', restrictUserId);
-      isTestPassed &= _expect(
-          'Delete user after removing comment should succeed',
-          !restrictDeleteResult2.hasErrors,
-          true);
-
-      // ========== Test 5: Clear and Drop Operations ==========
-      log.add('--- Sub-test: Clear and Drop Operations ---', LogLevel.debug);
-
-      await _clearTablesSafely();
-
-      // Create test data
-      final clearUser1Result = await db.insert(ExampleSchemas.users.name, {
-        'username': 'clear_user1',
-        'email': 'clear1@test.com',
-      });
-      final clearUser2Result = await db.insert(ExampleSchemas.users.name, {
-        'username': 'clear_user2',
-        'email': 'clear2@test.com',
-      });
-      isTestPassed &= _expect('Insert users should succeed',
-          !clearUser1Result.hasErrors && !clearUser2Result.hasErrors, true);
-      if (!isTestPassed) return false;
-
-      final clearUser1Id = clearUser1Result.firstPrimaryKey;
-      final clearUser2Id = clearUser2Result.firstPrimaryKey;
-
-      // Create posts
-      final clearPost1Result = await db.insert(ExampleSchemas.posts.name, {
-        'title': 'Clear Post 1',
-        'user_id': clearUser1Id,
-      });
-      final clearPost2Result = await db.insert(ExampleSchemas.posts.name, {
-        'title': 'Clear Post 2',
-        'user_id': clearUser2Id,
-      });
-      isTestPassed &= _expect('Insert posts should succeed',
-          !clearPost1Result.hasErrors && !clearPost2Result.hasErrors, true);
-      if (!isTestPassed) return false;
-
-      final clearPost1Id = clearPost1Result.firstPrimaryKey;
-      final clearPost2Id = clearPost2Result.firstPrimaryKey;
-
-      // Create comments
-      await db.insert(ExampleSchemas.comments.name, {
-        'post_id': clearPost1Id,
-        'user_id': clearUser1Id,
-        'content': 'Comment 1',
-      });
-      await db.insert(ExampleSchemas.comments.name, {
-        'post_id': clearPost2Id,
-        'user_id': clearUser2Id,
-        'content': 'Comment 2',
-      });
-
-      // Test 5.1: Clear posts table (should cascade delete comments)
-      final clearPostsBefore =
-          await db.query(ExampleSchemas.posts.name).count();
-      final clearCommentsBefore =
-          await db.query(ExampleSchemas.comments.name).count();
-      isTestPassed &=
-          _expect('Should have 2 posts before clear', clearPostsBefore, 2);
-      isTestPassed &= _expect(
-          'Should have 2 comments before clear', clearCommentsBefore, 2);
-
-      await db.clear(ExampleSchemas.posts.name);
-
-      final clearPostsAfter = await db.query(ExampleSchemas.posts.name).count();
-      final clearCommentsAfter =
-          await db.query(ExampleSchemas.comments.name).count();
-      isTestPassed &= _expect('Posts should be cleared', clearPostsAfter, 0);
-      isTestPassed &=
-          _expect('Comments should be cascade deleted', clearCommentsAfter, 0);
-
-      // Test 5.2: Clear users table (should handle RESTRICT constraint)
-      // First, ensure clean state by clearing all tables
-      // Note: clear(ExampleSchemas.users.name) may fail due to RESTRICT, so we need to clear comments first
-      await db.clear(ExampleSchemas.comments.name);
-      await db.clear(ExampleSchemas.posts.name);
-      // Now clear users should succeed since no comments reference users
-      final clearUsersBeforeTest = await db.clear(ExampleSchemas.users.name);
-      if (!!clearUsersBeforeTest.hasErrors) {
-        // If clear failed, manually delete all users
-        await db.delete(ExampleSchemas.users.name).allowDeleteAll();
-      }
-
-      // Create test data for RESTRICT test
-      final clearUser3Result = await db.insert(ExampleSchemas.users.name, {
-        'username': 'clear_user3',
-        'email': 'clear3@test.com',
-      });
-      isTestPassed &= _expect('Insert user for RESTRICT test should succeed',
-          !clearUser3Result.hasErrors, true);
-      if (!isTestPassed) return false;
-
-      final clearUser3Id = clearUser3Result.firstPrimaryKey;
-      final clearPost3Result = await db.insert(ExampleSchemas.posts.name, {
-        'title': 'Clear Post 3',
-        'user_id': clearUser3Id,
-      });
-      isTestPassed &= _expect('Insert post for RESTRICT test should succeed',
-          !clearPost3Result.hasErrors, true);
-      if (!isTestPassed) return false;
-
-      final clearPost3Id = clearPost3Result.firstPrimaryKey;
-      final clearCommentResult = await db.insert(ExampleSchemas.comments.name, {
-        'post_id': clearPost3Id,
-        'user_id': clearUser3Id,
-        'content': 'Comment 3',
-      });
-      isTestPassed &= _expect('Insert comment for RESTRICT test should succeed',
-          !clearCommentResult.hasErrors, true);
-      if (!isTestPassed) return false;
-
-      // Verify initial state: should have exactly 1 user
-      final usersBeforeClear =
-          await db.query(ExampleSchemas.users.name).count();
-      isTestPassed &= _expect(
-          'Should have exactly 1 user before clear', usersBeforeClear, 1);
-      if (!isTestPassed) return false;
-
-      // Try to clear users - should fail because comments.user_id has RESTRICT
-      final clearResult = await db.clear(ExampleSchemas.users.name);
-      isTestPassed &= _expect(
-          'Clear users with RESTRICT foreign key should fail',
-          !clearResult.hasErrors,
-          false);
-      isTestPassed &= _expect(
-          'Error type should be foreignKeyViolation or validationFailed',
-          clearResult.firstType == ResultType.bizForeignKeyViolation ||
-              clearResult.firstType == ResultType.bizForeignKeyChildRestrict ||
-              clearResult.firstType == ResultType.bizValidationFailed,
-          true);
-
-      // Verify users still exist (should still be 1, the same as before)
-      final clearUsersAfterFailed =
-          await db.query(ExampleSchemas.users.name).count();
-      isTestPassed &= _expect('Users should still exist after failed clear',
-          clearUsersAfterFailed, 1);
+      ok &= await _testFkOutboundConstraints();
+      if (!ok) return false;
+      ok &= await _testFkUnflushedParentVisibility();
+      if (!ok) return false;
+      ok &= await _testFkCascadeDeleteSingleAndBatch();
+      if (!ok) return false;
+      ok &= await _testFkCascadeUpdateSingleAndBatch();
+      if (!ok) return false;
+      ok &= await _testFkRestrictSingleAndBatch();
+      if (!ok) return false;
+      ok &= await _testFkClearCascadeAndRestrict();
+      if (!ok) return false;
+      ok &= await _testFkAllCascadeActionsTables();
+      if (!ok) return false;
     } catch (e, s) {
-      isTestPassed = false;
+      ok = false;
       _failTest('Exception in _testForeignKeyOperations: $e\n$s');
     }
-    return isTestPassed;
+    return ok;
+  }
+
+  bool _isFkParentMissing(ResultType t) =>
+      t == ResultType.bizForeignKeyParentNotExist ||
+      t == ResultType.bizForeignKeyViolation ||
+      t == ResultType.bizValidationFailed;
+
+  bool _isFkChildRestrict(ResultType t) =>
+      t == ResultType.bizForeignKeyChildRestrict ||
+      t == ResultType.bizForeignKeyViolation ||
+      t == ResultType.bizValidationFailed;
+
+  String _pk(dynamic v) => v?.toString() ?? '';
+
+  /// Outbound FK validation: single insert + batchInsert (valid / invalid).
+  Future<bool> _testFkOutboundConstraints() async {
+    log.add('--- Sub-test: Outbound FK constraints (single + batch) ---',
+        LogLevel.debug);
+    var ok = true;
+    await _clearTablesSafely();
+
+    final user = await db.insert(ExampleSchemas.users.name, {
+      'username': 'fk_user',
+      'email': 'fk@test.com',
+    });
+    ok &= _expect('Insert parent user', !user.hasErrors, true);
+    if (!ok) return false;
+    final userId = user.firstPrimaryKey;
+
+    final post = await db.insert(ExampleSchemas.posts.name, {
+      'title': 'Valid Post',
+      'user_id': userId,
+    });
+    ok &= _expect('Single insert child with valid FK', !post.hasErrors, true);
+
+    final badPost = await db.insert(ExampleSchemas.posts.name, {
+      'title': 'Invalid Post',
+      'user_id': 99999,
+    });
+    ok &= _expect(
+        'Single insert child with invalid FK fails', !badPost.hasErrors, false);
+    ok &= _expect(
+        'Invalid FK error type', _isFkParentMissing(badPost.firstType), true);
+
+    final postId = post.firstPrimaryKey;
+    final comment = await db.insert(ExampleSchemas.comments.name, {
+      'post_id': postId,
+      'user_id': userId,
+      'content': 'ok',
+    });
+    ok &= _expect(
+        'Single insert comment with valid FKs', !comment.hasErrors, true);
+
+    final badComment = await db.insert(ExampleSchemas.comments.name, {
+      'post_id': 99999,
+      'user_id': userId,
+      'content': 'bad post',
+    });
+    ok &= _expect('Single insert comment invalid post_id fails',
+        !badComment.hasErrors, false);
+
+    // batchInsert: mix of valid + invalid
+    final batch = await db.batchInsert(ExampleSchemas.posts.name, [
+      {'title': 'Batch OK 1', 'user_id': userId},
+      {'title': 'Batch BAD', 'user_id': 88888},
+      {'title': 'Batch OK 2', 'user_id': userId},
+    ]);
+    ok &= _expect('batchInsert partial FK: hasErrors', batch.hasErrors, true);
+    ok &=
+        _expect('batchInsert partial FK: successCount', batch.successCount, 2);
+    ok &= _expect('batchInsert partial FK: failedCount', batch.failedCount, 1);
+    final badStatus = batch.statuses.where((s) => s.type != ResultType.success);
+    ok &= _expect(
+      'batchInsert invalid row is parent-missing',
+      badStatus.isNotEmpty && _isFkParentMissing(badStatus.first.type),
+      true,
+    );
+
+    // batchUpdate FK field to missing parent should fail
+    final okPosts = await db
+        .query(ExampleSchemas.posts.name)
+        .where('title', '=', 'Batch OK 1');
+    if (okPosts.data.isEmpty) {
+      return _failTest('Expected Batch OK 1 post for batchUpdate FK test');
+    }
+    final pk = _pk(okPosts.data.first['id']);
+    final upd = await db.batchUpdate(ExampleSchemas.posts.name, [
+      {'id': pk, 'user_id': 77777},
+    ]);
+    ok &=
+        _expect('batchUpdate FK to missing parent fails', upd.hasErrors, true);
+    ok &= _expect(
+      'batchUpdate missing parent type',
+      upd.statuses.isNotEmpty && _isFkParentMissing(upd.firstType),
+      true,
+    );
+
+    // Partial batchUpdate without FK fields must not spuriously fail NOT NULL
+    final titleOnly = await db.batchUpdate(ExampleSchemas.posts.name, [
+      {'id': pk, 'title': 'Batch OK 1 renamed'},
+    ]);
+    ok &= _expect(
+        'batchUpdate without FK fields succeeds', !titleOnly.hasErrors, true);
+
+    return ok;
+  }
+
+  /// Regression: parent still in write buffer; child batchInsert must see it.
+  Future<bool> _testFkUnflushedParentVisibility() async {
+    log.add('--- Sub-test: Unflushed parent visible to child batchInsert ---',
+        LogLevel.debug);
+    var ok = true;
+    await _clearTablesSafely();
+
+    final parent = await db.insert(ExampleSchemas.users.name, {
+      'username': 'buf_parent',
+      'email': 'buf_parent@test.com',
+    });
+    ok &= _expect('Unflushed parent insert', !parent.hasErrors, true);
+    if (!ok) return false;
+    final parentId = parent.firstPrimaryKey;
+
+    // Intentionally do NOT flush — child must resolve parent from pending buffer.
+    final children = await db.batchInsert(ExampleSchemas.posts.name, [
+      {'title': 'buf_child_1', 'user_id': parentId},
+      {'title': 'buf_child_2', 'user_id': parentId},
+      {'title': 'buf_child_3', 'user_id': parentId},
+    ]);
+    ok &= _expect('batchInsert children against unflushed parent succeeds',
+        !children.hasErrors, true);
+    ok &= _expect('all 3 children inserted', children.successCount, 3);
+
+    final single = await db.insert(ExampleSchemas.posts.name, {
+      'title': 'buf_child_single',
+      'user_id': parentId,
+    });
+    ok &= _expect('single insert child against unflushed parent succeeds',
+        !single.hasErrors, true);
+
+    return ok;
+  }
+
+  /// CASCADE onDelete: single delete + batch/multi delete via whereIn.
+  Future<bool> _testFkCascadeDeleteSingleAndBatch() async {
+    log.add(
+        '--- Sub-test: CASCADE delete (single + batch) ---', LogLevel.debug);
+    var ok = true;
+    await _clearTablesSafely();
+
+    final owner = await db.insert(ExampleSchemas.users.name, {
+      'username': 'cascade_owner',
+      'email': 'cascade_owner@test.com',
+    });
+    final commenter = await db.insert(ExampleSchemas.users.name, {
+      'username': 'cascade_commenter',
+      'email': 'cascade_commenter@test.com',
+    });
+    ok &= _expect(
+        'cascade users insert', !owner.hasErrors && !commenter.hasErrors, true);
+    if (!ok) return false;
+    final ownerId = owner.firstPrimaryKey;
+    final commenterId = commenter.firstPrimaryKey;
+
+    final p1 = await db.insert(ExampleSchemas.posts.name, {
+      'title': 'C1',
+      'user_id': ownerId,
+    });
+    final p2 = await db.insert(ExampleSchemas.posts.name, {
+      'title': 'C2',
+      'user_id': ownerId,
+    });
+    final p1Id = p1.firstPrimaryKey;
+    final p2Id = p2.firstPrimaryKey;
+
+    await db.batchInsert(ExampleSchemas.comments.name, [
+      {'post_id': p1Id, 'user_id': commenterId, 'content': 'a'},
+      {'post_id': p1Id, 'user_id': commenterId, 'content': 'b'},
+      {'post_id': p2Id, 'user_id': commenterId, 'content': 'c'},
+    ]);
+
+    // Single-row path: delete one post -> cascade comments for that post
+    final delOne =
+        await db.delete(ExampleSchemas.posts.name).where('id', '=', p1Id);
+    ok &= _expect('single cascade delete post', !delOne.hasErrors, true);
+    final cAfterOne = await db
+        .query(ExampleSchemas.comments.name)
+        .where('post_id', '=', p1Id);
+    ok &= _expect(
+        'comments for deleted post cascade-removed', cAfterOne.length, 0);
+    final cRemain = await db
+        .query(ExampleSchemas.comments.name)
+        .where('post_id', '=', p2Id);
+    ok &= _expect('other post comments remain', cRemain.length, 1);
+
+    // Prepare second owner + posts for batch cascade
+    final owner2 = await db.insert(ExampleSchemas.users.name, {
+      'username': 'cascade_owner2',
+      'email': 'cascade_owner2@test.com',
+    });
+    final o2 = owner2.firstPrimaryKey;
+    final batchPosts = await db.batchInsert(ExampleSchemas.posts.name, [
+      {'title': 'B1', 'user_id': o2},
+      {'title': 'B2', 'user_id': o2},
+    ]);
+    ok &= _expect('batch posts for cascade', batchPosts.successCount, 2);
+    final bpIds = batchPosts.statuses
+        .where((s) => s.type == ResultType.success)
+        .map((s) => s.primaryKey)
+        .whereType<String>()
+        .toList();
+    await db.batchInsert(ExampleSchemas.comments.name, [
+      for (final id in bpIds)
+        {'post_id': id, 'user_id': commenterId, 'content': 'x$id'},
+    ]);
+
+    // Batch delete posts (whereIn) -> cascade comments
+    final delBatch =
+        await db.delete(ExampleSchemas.posts.name).whereIn('id', bpIds);
+    ok &= _expect('batch cascade delete posts', !delBatch.hasErrors, true);
+    final commentsLeft =
+        await db.query(ExampleSchemas.comments.name).whereIn('post_id', bpIds);
+    ok &= _expect('batch cascade removed comments', commentsLeft.length, 0);
+
+    // Delete user owner (posts CASCADE; comments use other user so RESTRICT OK)
+    // Remaining: p2 still owned by ownerId with 1 comment by commenter
+    final delUser =
+        await db.delete(ExampleSchemas.users.name).where('id', '=', ownerId);
+    ok &= _expect(
+        'cascade delete user (posts cascade)', !delUser.hasErrors, true);
+    final postsOfOwner = await db
+        .query(ExampleSchemas.posts.name)
+        .where('user_id', '=', ownerId);
+    ok &= _expect('owner posts cascade-deleted', postsOfOwner.length, 0);
+    final orphanComments = await db
+        .query(ExampleSchemas.comments.name)
+        .where('post_id', '=', p2Id);
+    ok &= _expect('comments of cascaded post also cascade-deleted',
+        orphanComments.length, 0);
+
+    return ok;
+  }
+
+  /// CASCADE onUpdate: parent PK change propagates (single + multi).
+  Future<bool> _testFkCascadeUpdateSingleAndBatch() async {
+    log.add('--- Sub-test: CASCADE update PK (single + batch-style) ---',
+        LogLevel.debug);
+    var ok = true;
+    await _clearTablesSafely();
+
+    final u1 = await db.insert(ExampleSchemas.users.name, {
+      'username': 'upd_u1',
+      'email': 'upd_u1@test.com',
+    });
+    final u2 = await db.insert(ExampleSchemas.users.name, {
+      'username': 'upd_u2',
+      'email': 'upd_u2@test.com',
+    });
+    ok &= _expect('cascade-update users', !u1.hasErrors && !u2.hasErrors, true);
+    if (!ok) return false;
+    final oldId = u1.firstPrimaryKey!;
+    final otherId = u2.firstPrimaryKey!;
+
+    // Pick a free sequential id unlikely to collide
+    final newId = 900001;
+
+    final post = await db.insert(ExampleSchemas.posts.name, {
+      'title': 'upd_post',
+      'user_id': oldId,
+    });
+    final postId = post.firstPrimaryKey;
+    await db.insert(ExampleSchemas.comments.name, {
+      'post_id': postId,
+      'user_id': oldId,
+      'content': 'upd_c',
+    });
+
+    // Single update parent PK -> cascade posts.user_id + comments.user_id
+    final upd = await db.update(ExampleSchemas.users.name, {
+      'id': newId,
+    }).where('id', '=', oldId);
+    if (upd.hasErrors) {
+      log.add(
+          'cascade update parent PK failed: ${upd.message} '
+          '(type=${upd.firstType})',
+          LogLevel.error);
+    }
+    ok &= _expect('cascade update parent PK', !upd.hasErrors, true);
+
+    final postAfter = await db
+        .query(ExampleSchemas.posts.name)
+        .where('id', '=', postId)
+        .first();
+    ok &= _expect(
+        'post.user_id cascaded', _pk(postAfter?['user_id']), _pk(newId));
+
+    final commentAfter = await db
+        .query(ExampleSchemas.comments.name)
+        .where('post_id', '=', postId)
+        .first();
+    ok &= _expect(
+        'comment.user_id cascaded', _pk(commentAfter?['user_id']), _pk(newId));
+
+    // Update post PK -> cascade comments.post_id
+    final newPostId = 900002;
+    final updPost = await db.update(ExampleSchemas.posts.name, {
+      'id': newPostId,
+    }).where('id', '=', postId);
+    if (updPost.hasErrors) {
+      log.add(
+          'cascade update post PK failed: ${updPost.message} '
+          '(type=${updPost.firstType})',
+          LogLevel.error);
+    }
+    ok &= _expect('cascade update post PK', !updPost.hasErrors, true);
+    final c2 = await db
+        .query(ExampleSchemas.comments.name)
+        .where('post_id', '=', newPostId)
+        .first();
+    ok &= _expect('comment.post_id cascaded', c2 != null, true);
+
+    // Second parent path: delete-style multi update not changing PK via batchUpdate
+    // (batchUpdate skips PK). Verify outbound FK update still cascades nothing needed.
+    final post2 = await db.insert(ExampleSchemas.posts.name, {
+      'title': 'other',
+      'user_id': otherId,
+    });
+    ok &= _expect('control post insert', !post2.hasErrors, true);
+
+    return ok;
+  }
+
+  /// RESTRICT onDelete: single + batch delete must fail while children exist.
+  Future<bool> _testFkRestrictSingleAndBatch() async {
+    log.add(
+        '--- Sub-test: RESTRICT delete (single + batch) ---', LogLevel.debug);
+    var ok = true;
+    await _clearTablesSafely();
+
+    final u = await db.insert(ExampleSchemas.users.name, {
+      'username': 'restrict_u',
+      'email': 'restrict_u@test.com',
+    });
+    final uid = u.firstPrimaryKey;
+    final p = await db.insert(ExampleSchemas.posts.name, {
+      'title': 'r_post',
+      'user_id': uid,
+    });
+    final pid = p.firstPrimaryKey;
+    final c = await db.insert(ExampleSchemas.comments.name, {
+      'post_id': pid,
+      'user_id': uid,
+      'content': 'r_c',
+    });
+    ok &= _expect(
+        'restrict fixture', !u.hasErrors && !p.hasErrors && !c.hasErrors, true);
+    if (!ok) return false;
+
+    final del =
+        await db.delete(ExampleSchemas.users.name).where('id', '=', uid);
+    ok &= _expect('single RESTRICT delete fails', !del.hasErrors, false);
+    ok &= _expect('RESTRICT type', _isFkChildRestrict(del.firstType), true);
+    final still =
+        await db.query(ExampleSchemas.users.name).where('id', '=', uid);
+    ok &= _expect('user remains after RESTRICT', still.length, 1);
+
+    // Batch/multi delete same RESTRICT
+    final del2 =
+        await db.delete(ExampleSchemas.users.name).whereIn('id', [uid]);
+    ok &= _expect('batch RESTRICT delete fails', !del2.hasErrors, false);
+    ok &= _expect(
+        'batch RESTRICT type', _isFkChildRestrict(del2.firstType), true);
+
+    // After removing restricting child, delete succeeds (posts cascade)
+    await db
+        .delete(ExampleSchemas.comments.name)
+        .where('id', '=', c.firstPrimaryKey);
+    final del3 =
+        await db.delete(ExampleSchemas.users.name).where('id', '=', uid);
+    ok &=
+        _expect('delete after removing RESTRICT child', !del3.hasErrors, true);
+
+    return ok;
+  }
+
+  /// clear(): CASCADE child wipe + RESTRICT block.
+  Future<bool> _testFkClearCascadeAndRestrict() async {
+    log.add('--- Sub-test: clear() CASCADE + RESTRICT ---', LogLevel.debug);
+    var ok = true;
+    await _clearTablesSafely();
+
+    final u1 = await db.insert(ExampleSchemas.users.name, {
+      'username': 'clr1',
+      'email': 'clr1@test.com',
+    });
+    final u2 = await db.insert(ExampleSchemas.users.name, {
+      'username': 'clr2',
+      'email': 'clr2@test.com',
+    });
+    final id1 = u1.firstPrimaryKey;
+    final id2 = u2.firstPrimaryKey;
+    final posts = await db.batchInsert(ExampleSchemas.posts.name, [
+      {'title': 'cp1', 'user_id': id1},
+      {'title': 'cp2', 'user_id': id2},
+    ]);
+    final postIds = posts.statuses
+        .where((s) => s.type == ResultType.success)
+        .map((s) => s.primaryKey)
+        .whereType<String>()
+        .toList();
+    await db.batchInsert(ExampleSchemas.comments.name, [
+      {'post_id': postIds[0], 'user_id': id1, 'content': 'c1'},
+      {'post_id': postIds[1], 'user_id': id2, 'content': 'c2'},
+    ]);
+
+    final clearPosts = await db.clear(ExampleSchemas.posts.name);
+    ok &= _expect(
+        'clear posts succeeds (CASCADE comments)', !clearPosts.hasErrors, true);
+    ok &= _expect('comments wiped by clear posts',
+        await db.query(ExampleSchemas.comments.name).count(), 0);
+
+    // Recreate RESTRICT scenario for clear(users)
+    await _clearTablesSafely();
+    final ru = await db.insert(ExampleSchemas.users.name, {
+      'username': 'clr_r',
+      'email': 'clr_r@test.com',
+    });
+    final rid = ru.firstPrimaryKey;
+    final rp = await db.insert(ExampleSchemas.posts.name, {
+      'title': 'rp',
+      'user_id': rid,
+    });
+    await db.insert(ExampleSchemas.comments.name, {
+      'post_id': rp.firstPrimaryKey,
+      'user_id': rid,
+      'content': 'rc',
+    });
+    final clearUsers = await db.clear(ExampleSchemas.users.name);
+    ok &= _expect(
+        'clear users blocked by RESTRICT', !clearUsers.hasErrors, false);
+    ok &= _expect(
+        'clear RESTRICT type', _isFkChildRestrict(clearUsers.firstType), true);
+    ok &= _expect('users remain after failed clear',
+        await db.query(ExampleSchemas.users.name).count(), 1);
+
+    return ok;
+  }
+
+  static const _fkActParent = 'fk_act_parent';
+  static const _fkActCascade = 'fk_act_child_cascade';
+  static const _fkActRestrict = 'fk_act_child_restrict';
+  static const _fkActSetNull = 'fk_act_child_set_null';
+  static const _fkActSetDefault = 'fk_act_child_set_default';
+  static const _fkActNoAction = 'fk_act_child_no_action';
+
+  List<TableSchema> _fkActionSchemas() {
+    final parent = TableSchema(
+      name: _fkActParent,
+      primaryKeyConfig: const PrimaryKeyConfig(
+        name: 'id',
+        type: PrimaryKeyType.sequential,
+      ),
+      fields: const [
+        FieldSchema(name: 'name', type: DataType.text, nullable: false),
+      ],
+    );
+
+    TableSchema child(
+      String name, {
+      required ForeignKeyCascadeAction onDelete,
+      required ForeignKeyCascadeAction onUpdate,
+      bool nullableFk = false,
+      dynamic defaultFk,
+    }) {
+      return TableSchema(
+        name: name,
+        primaryKeyConfig: const PrimaryKeyConfig(
+          name: 'id',
+          type: PrimaryKeyType.sequential,
+        ),
+        fields: [
+          FieldSchema(
+            name: 'parent_id',
+            type: DataType.integer,
+            nullable: nullableFk,
+            defaultValue: defaultFk,
+          ),
+          const FieldSchema(
+              name: 'label', type: DataType.text, nullable: false),
+        ],
+        foreignKeys: [
+          ForeignKeySchema(
+            name: 'fk_$name',
+            fields: const ['parent_id'],
+            referencedTable: _fkActParent,
+            referencedFields: const ['id'],
+            onDelete: onDelete,
+            onUpdate: onUpdate,
+          ),
+        ],
+        indexes: const [
+          IndexSchema(fields: ['parent_id'])
+        ],
+      );
+    }
+
+    return [
+      parent,
+      child(_fkActCascade,
+          onDelete: ForeignKeyCascadeAction.cascade,
+          onUpdate: ForeignKeyCascadeAction.cascade),
+      child(_fkActRestrict,
+          onDelete: ForeignKeyCascadeAction.restrict,
+          onUpdate: ForeignKeyCascadeAction.restrict),
+      child(_fkActSetNull,
+          onDelete: ForeignKeyCascadeAction.setNull,
+          onUpdate: ForeignKeyCascadeAction.setNull,
+          nullableFk: true),
+      child(_fkActSetDefault,
+          onDelete: ForeignKeyCascadeAction.setDefault,
+          onUpdate: ForeignKeyCascadeAction.setDefault,
+          defaultFk: 1),
+      child(_fkActNoAction,
+          onDelete: ForeignKeyCascadeAction.noAction,
+          onUpdate: ForeignKeyCascadeAction.noAction),
+    ];
+  }
+
+  Future<void> _dropFkActionTables() async {
+    // Children first (RESTRICT / NO ACTION may block parent drop).
+    for (final name in [
+      _fkActCascade,
+      _fkActRestrict,
+      _fkActSetNull,
+      _fkActSetDefault,
+      _fkActNoAction,
+      _fkActParent,
+    ]) {
+      try {
+        if (await db.tableExists(name)) {
+          await db.dropTable(name);
+        }
+      } catch (_) {}
+    }
+  }
+
+  /// Dedicated tables: cascade / restrict / setNull / setDefault / noAction,
+  /// each exercised with single-row and batch delete/update.
+  Future<bool> _testFkAllCascadeActionsTables() async {
+    log.add(
+        '--- Sub-test: All ForeignKeyCascadeAction (temp tables, single+batch) ---',
+        LogLevel.debug);
+    var ok = true;
+    await _dropFkActionTables();
+
+    try {
+      final created = await db.createTables(_fkActionSchemas());
+      ok &= _expect('create FK action tables', !created.hasErrors, true);
+      if (!ok) return false;
+
+      // ---- Shared parents: first row must be id=1 (SET DEFAULT target) ----
+      final sentinel = await db.insert(_fkActParent, {'name': 'sentinel'});
+      ok &= _expect('sentinel parent inserted', !sentinel.hasErrors, true);
+      final sentinelId = sentinel.firstPrimaryKey;
+      ok &= _expect('sentinel parent id must be 1 (matches child defaultValue)',
+          sentinelId, '1');
+      if (!ok) return false;
+      final pA = await db.insert(_fkActParent, {'name': 'A'});
+      final pB = await db.insert(_fkActParent, {'name': 'B'});
+      final pC = await db.insert(_fkActParent, {'name': 'C'});
+      final pD = await db.insert(_fkActParent, {'name': 'D'});
+      ok &= _expect(
+          'action parents',
+          !pA.hasErrors && !pB.hasErrors && !pC.hasErrors && !pD.hasErrors,
+          true);
+      if (!ok) return false;
+      final idA = pA.firstPrimaryKey!;
+      final idB = pB.firstPrimaryKey!;
+      final idC = pC.firstPrimaryKey!;
+      final idD = pD.firstPrimaryKey!;
+
+      // ========== CASCADE ==========
+      final casKids = await db.batchInsert(_fkActCascade, [
+        {'parent_id': idA, 'label': 'c1'},
+        {'parent_id': idA, 'label': 'c2'},
+      ]);
+      ok &= _expect('cascade children batchInsert', casKids.successCount, 2);
+      final casDel = await db.delete(_fkActParent).where('id', '=', idA);
+      ok &= _expect('CASCADE single delete parent', !casDel.hasErrors, true);
+      ok &= _expect(
+          'CASCADE children removed',
+          await db.query(_fkActCascade).where('parent_id', '=', idA).count(),
+          0);
+
+      // batch: two parents with cascade children
+      final pE = await db.insert(_fkActParent, {'name': 'E'});
+      final pF = await db.insert(_fkActParent, {'name': 'F'});
+      final idE = pE.firstPrimaryKey!;
+      final idF = pF.firstPrimaryKey!;
+      await db.batchInsert(_fkActCascade, [
+        {'parent_id': idE, 'label': 'e1'},
+        {'parent_id': idF, 'label': 'f1'},
+      ]);
+      final casBatchDel =
+          await db.delete(_fkActParent).whereIn('id', [idE, idF]);
+      ok &=
+          _expect('CASCADE batch delete parents', !casBatchDel.hasErrors, true);
+      ok &= _expect(
+          'CASCADE batch children gone',
+          await db
+              .query(_fkActCascade)
+              .whereIn('parent_id', [idE, idF]).count(),
+          0);
+
+      // CASCADE onUpdate (single)
+      final pG = await db.insert(_fkActParent, {'name': 'G'});
+      final idG = pG.firstPrimaryKey!;
+      await db.insert(_fkActCascade, {'parent_id': idG, 'label': 'g1'});
+      const newG = 910001;
+      final casUpd =
+          await db.update(_fkActParent, {'id': newG}).where('id', '=', idG);
+      ok &= _expect('CASCADE update parent PK', !casUpd.hasErrors, true);
+      ok &= _expect(
+          'CASCADE child FK updated',
+          await db.query(_fkActCascade).where('parent_id', '=', newG).count(),
+          1);
+
+      // ========== RESTRICT ==========
+      await db.insert(_fkActRestrict, {'parent_id': idB, 'label': 'r1'});
+      final resDel = await db.delete(_fkActParent).where('id', '=', idB);
+      ok &= _expect('RESTRICT single delete fails', !resDel.hasErrors, false);
+      ok &=
+          _expect('RESTRICT type', _isFkChildRestrict(resDel.firstType), true);
+
+      final resBatch = await db.delete(_fkActParent).whereIn('id', [idB]);
+      ok &= _expect('RESTRICT batch delete fails', !resBatch.hasErrors, false);
+
+      // RESTRICT onUpdate
+      final resUpd =
+          await db.update(_fkActParent, {'id': 910002}).where('id', '=', idB);
+      ok &= _expect('RESTRICT update PK fails', !resUpd.hasErrors, false);
+      ok &= _expect(
+          'RESTRICT update type', _isFkChildRestrict(resUpd.firstType), true);
+
+      // ========== SET NULL ==========
+      await db.batchInsert(_fkActSetNull, [
+        {'parent_id': idC, 'label': 'n1'},
+        {'parent_id': idC, 'label': 'n2'},
+      ]);
+      final nullDel = await db.delete(_fkActParent).where('id', '=', idC);
+      ok &= _expect('SET NULL single delete', !nullDel.hasErrors, true);
+      final nullKids =
+          await db.query(_fkActSetNull).where('label', 'like', 'n%');
+      ok &= _expect('SET NULL children remain', nullKids.length, 2);
+      ok &= _expect('SET NULL parent_id is null',
+          nullKids.data.every((r) => r['parent_id'] == null), true);
+
+      final pH = await db.insert(_fkActParent, {'name': 'H'});
+      final idH = pH.firstPrimaryKey!;
+      await db.insert(_fkActSetNull, {'parent_id': idH, 'label': 'n3'});
+      const newH = 910003;
+      final nullUpd =
+          await db.update(_fkActParent, {'id': newH}).where('id', '=', idH);
+      ok &= _expect('SET NULL update parent PK', !nullUpd.hasErrors, true);
+      final n3 =
+          await db.query(_fkActSetNull).where('label', '=', 'n3').first();
+      ok &= _expect('SET NULL onUpdate -> null', n3?['parent_id'], null);
+
+      // ========== SET DEFAULT ==========
+      await db.batchInsert(_fkActSetDefault, [
+        {'parent_id': idD, 'label': 'd1'},
+        {'parent_id': idD, 'label': 'd2'},
+      ]);
+      final defDel = await db.delete(_fkActParent).where('id', '=', idD);
+      ok &= _expect('SET DEFAULT single delete', !defDel.hasErrors, true);
+      final defKids =
+          await db.query(_fkActSetDefault).where('label', 'like', 'd%');
+      ok &= _expect('SET DEFAULT children remain', defKids.length, 2);
+      ok &= _expect('SET DEFAULT parent_id -> 1',
+          defKids.data.every((r) => _pk(r['parent_id']) == '1'), true);
+
+      final pI = await db.insert(_fkActParent, {'name': 'I'});
+      final idI = pI.firstPrimaryKey!;
+      await db.insert(_fkActSetDefault, {'parent_id': idI, 'label': 'd3'});
+      const newI = 910004;
+      final defUpd =
+          await db.update(_fkActParent, {'id': newI}).where('id', '=', idI);
+      ok &= _expect('SET DEFAULT update parent PK', !defUpd.hasErrors, true);
+      final d3 =
+          await db.query(_fkActSetDefault).where('label', '=', 'd3').first();
+      ok &= _expect('SET DEFAULT onUpdate -> 1', _pk(d3?['parent_id']), '1');
+
+      // ========== NO ACTION (behaves like RESTRICT here) ==========
+      final pJ = await db.insert(_fkActParent, {'name': 'J'});
+      final idJ = pJ.firstPrimaryKey!;
+      await db.insert(_fkActNoAction, {'parent_id': idJ, 'label': 'na1'});
+      final naDel = await db.delete(_fkActParent).where('id', '=', idJ);
+      ok &= _expect('NO ACTION single delete fails', !naDel.hasErrors, false);
+      ok &=
+          _expect('NO ACTION type', _isFkChildRestrict(naDel.firstType), true);
+
+      final naBatch = await db.delete(_fkActParent).whereIn('id', [idJ]);
+      ok &= _expect('NO ACTION batch delete fails', !naBatch.hasErrors, false);
+
+      final naUpd =
+          await db.update(_fkActParent, {'id': 910005}).where('id', '=', idJ);
+      ok &= _expect('NO ACTION update PK fails', !naUpd.hasErrors, false);
+
+      // Unflushed parent + batchInsert child on cascade table
+      final pK = await db.insert(_fkActParent, {'name': 'K'});
+      final idK = pK.firstPrimaryKey!;
+      final bufKids = await db.batchInsert(_fkActCascade, [
+        {'parent_id': idK, 'label': 'buf1'},
+        {'parent_id': idK, 'label': 'buf2'},
+      ]);
+      ok &= _expect('unflushed parent + batchInsert cascade children',
+          !bufKids.hasErrors && bufKids.successCount == 2, true);
+    } finally {
+      await _dropFkActionTables();
+    }
+
+    return ok;
   }
 
   /// Comprehensive test for expression operations.

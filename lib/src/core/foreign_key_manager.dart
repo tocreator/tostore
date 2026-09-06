@@ -2108,10 +2108,9 @@ class ForeignKeyManager {
 
   /// Cascade update child records' foreign key fields
   ///
-  /// Optimized to directly batch update without querying first.
-  ///
-  /// Note: This method validates that the new primary key value exists in the referenced table
-  /// before performing the update to ensure referential integrity.
+  /// Directly batch-updates children matching the old parent PK. Caller must
+  /// already have queued parent delete(old)+insert(new) so child FK validation
+  /// can resolve the new parent from the write buffer.
   Future<int> _cascadeUpdateChildren({
     required TableUid childTableUid,
     required ForeignKeySchema fk,
@@ -2143,76 +2142,11 @@ class ForeignKeyManager {
       ]);
     }
 
-    // Validate that the new primary key value exists in the referenced table
-    // This ensures referential integrity before performing the cascade update
-    //
-    // Special case: If this is a self-referencing foreign key (childTableName == referencedTable),
-    // and the new primary key value is the same as the old one (already validated in handleCascadeUpdate),
-    // we can skip the validation since we're updating the same record.
-    // However, if the new primary key value is different, we still need to verify it exists.
-    final newPkCondition = <String, dynamic>{};
-    if (newParentPkValues is Map) {
-      // Composite primary key
-      for (int i = 0; i < fk.referencedFields.length; i++) {
-        final refField = fk.referencedFields[i];
-        final pkValue = newParentPkValues[refField];
-        if (pkValue != null) {
-          newPkCondition[refField] = pkValue;
-        }
-      }
-    } else {
-      // Simple primary key
-      final refField =
-          fk.referencedFields.isNotEmpty ? fk.referencedFields[0] : null;
-      if (refField != null) {
-        newPkCondition[refField] = newParentPkValues;
-      }
-    }
-
-    // Verify new primary key value exists (unless it's a self-reference with same value)
-    // For self-referencing foreign keys, if oldPkValues == newPkValues, skip validation
-    // since we're updating the same record (already handled in handleCascadeUpdate)
-    bool skipValidation = false;
-    if (childTableName.value == fk.referencedTable) {
-      // Self-referencing foreign key
-      if (oldParentPkValues is Map && newParentPkValues is Map) {
-        // Compare composite keys
-        bool allEqual = true;
-        for (int i = 0; i < fk.referencedFields.length; i++) {
-          final refField = fk.referencedFields[i];
-          if (oldParentPkValues[refField] != newParentPkValues[refField]) {
-            allEqual = false;
-            break;
-          }
-        }
-        skipValidation = allEqual;
-      } else if (oldParentPkValues == newParentPkValues) {
-        // Simple keys are equal
-        skipValidation = true;
-      }
-    }
-
-    if (!skipValidation && newPkCondition.isNotEmpty) {
-      final verifyBuilder = QueryBuilder(_dataStore, fk.referencedTable);
-      for (final entry in newPkCondition.entries) {
-        verifyBuilder.where(entry.key, '=', entry.value);
-      }
-      final verifyResult = await verifyBuilder.limit(1).future;
-      if (verifyResult.data.isEmpty) {
-        throw DbException([
-          ConstraintStatus(
-            type: ResultType.bizForeignKeyParentNotExist,
-            message:
-                'Cannot execute cascade update on table "$childTableName" (Constraint: "${fk.actualName}"): New referenced value ${newPkCondition.values.toList()} does not exist in table "${fk.referencedTable}".',
-            tableName: childTableName,
-            constraintName: fk.actualName,
-            fields: fk.fields,
-            conflictingKeys: newPkCondition.values.toList(),
-            referencedTable: fk.referencedTable,
-          )
-        ]);
-      }
-    }
+    // Parent new-PK existence is the caller's responsibility: updateInternal /
+    // large-scale must delete(old)+insert(new) into the write buffer *before*
+    // cascade. Child updateInternal still enforces outgoing FK via
+    // validateForeignKeyConstraints (memory-tier aware) — no redundant
+    // QueryBuilder probe here.
 
     // Build query conditions using helper method (using the old primary key value)
     final condition = _buildForeignKeyCondition(fk, oldParentPkValues);

@@ -2485,67 +2485,9 @@ class DataStoreImpl {
           ));
         }
 
-        // Check if primary key is being updated (for cascade update handling)
+        // Check if primary key is being updated (cascade after parent is buffered)
         final isPrimaryKeyUpdate = validData.containsKey(primaryKey);
 
-        // Validate foreign key constraints for each record to be updated
-        final bool hasForeignKeys = _foreignKeyManager != null;
-        if (hasForeignKeys) {
-          final yieldController = YieldController('db_update_fk');
-          for (final record in records) {
-            final y2 = yieldController.maybeYield();
-            if (y2 != null) await y2;
-            // Merge existing record with update data
-            final mergedData = Map<String, dynamic>.from(record);
-            mergedData.addAll(validData);
-
-            // Handle foreign key constraints for primary key update: RESTRICT must be checked immediately, CASCADE can be deferred
-            // CRITICAL: RESTRICT/NO ACTION constraints must be checked immediately when update is attempted,
-            // not at commit time. Only CASCADE/SET NULL/SET DEFAULT operations can be deferred to commit.
-            if (isPrimaryKeyUpdate) {
-              final oldPkValue = record[primaryKey];
-              final newPkValue = mergedData[primaryKey];
-              if (oldPkValue != null &&
-                  newPkValue != null &&
-                  oldPkValue != newPkValue) {
-                // Phase 1: Always check RESTRICT/NO ACTION constraints immediately (even in transaction)
-                // This ensures violations are caught early and transaction can be rolled back
-                try {
-                  await _foreignKeyManager!.checkRestrictConstraintsForUpdate(
-                    table: table,
-                    oldPkValues: oldPkValue,
-                  );
-                } catch (e) {
-                  Logger.error('RESTRICT constraint check failed', rawError: e);
-                  return finish(_normalizeCascadeError(e, 'update'));
-                }
-
-                // Phase 2: Handle CASCADE/SET NULL/SET DEFAULT operations
-                if (txId != null) {
-                  // In transaction: defer CASCADE operations until commit
-                  // RESTRICT has already been checked above, so we can safely defer CASCADE
-                  transactionManager?.registerDeferredCascadeUpdate(
-                      txId, table, oldPkValue, newPkValue);
-                } else {
-                  // Outside transaction: execute CASCADE operations immediately
-                  try {
-                    await _foreignKeyManager!.handleCascadeUpdate(
-                      table: table,
-                      oldPkValues: oldPkValue,
-                      newPkValues: newPkValue,
-                      visitedTables:
-                          null, // Start with fresh visited set for each update
-                      skipRestrictCheck: true, // RESTRICT already checked above
-                    );
-                  } catch (e) {
-                    Logger.error('Cascade update failed', rawError: e);
-                    return finish(_normalizeCascadeError(e, 'update'));
-                  }
-                }
-              }
-            }
-          }
-        }
         final List<String> successKeys = [];
         final List<String> failedKeys = [];
         int successCount = 0;
@@ -2554,9 +2496,46 @@ class DataStoreImpl {
             promoteDesc != null ? <Map<String, dynamic>>[] : null;
         final hasNotify = notificationManager.hasListeners(table.tableUid);
 
+        // Row-level locks for target records
+        final lockMgr = lockManager;
+        final Map<String, String> acquiredResources = {};
+
+        void releaseOneRowLock(String pk) {
+          if (acquiredResources.isEmpty || lockMgr == null || pk.isEmpty) {
+            return;
+          }
+          final res = 'row:$tableName:pk:$pk';
+          final opId = acquiredResources.remove(res);
+          if (opId == null) return;
+          try {
+            lockMgr.releaseExclusiveLock(res, opId);
+          } catch (_) {}
+          // Drop from txn zone map so commit/rollback will not double-release.
+          final txnLocks =
+              Zone.current[TransactionContext.acquiredExclusiveLocksKey]
+                  as Map<String, String>?;
+          txnLocks?.remove(res);
+        }
+
+        void releaseNonTxnRowLocks() {
+          // Hottest no-op first: most finish paths have nothing (or already) released.
+          if (acquiredResources.isEmpty || txId != null || lockMgr == null) {
+            return;
+          }
+          final entries = acquiredResources.entries.toList(growable: false);
+          acquiredResources.clear();
+          for (final e in entries) {
+            try {
+              lockMgr.releaseExclusiveLock(e.key, e.value);
+            } catch (_) {}
+          }
+        }
+
         // Mirror successful old-working rows before returning; skip when the
         // active transaction will abort and roll back those writes.
         Future<DbResult> finishWithPromoteMirror(DbResult r) async {
+          // Non-txn row locks must not survive early returns (unique/FK/cascade).
+          releaseNonTxnRowLocks();
           final String? activeTxId = Zone.current[_txnZoneKey] as String?;
           final bool rollbackOnError =
               Zone.current[_txnRollbackOnErrorKey] as bool? ?? true;
@@ -2567,10 +2546,6 @@ class DataStoreImpl {
           }
           return finish(r);
         }
-
-        // Row-level locks for target records
-        final lockMgr = lockManager;
-        final Map<String, String> acquiredResources = {};
 
         final yieldController = records.length <= 1
             ? null
@@ -2588,27 +2563,42 @@ class DataStoreImpl {
           }
         }
 
-        final allIndexes = <IndexSchema>[
-          ...?tableMetaManager?.getAllIndexesFor(schema),
-          ...?indexManager?.getEngineManagedBtreeIndexes(
-            table,
-            schema,
-          ),
-        ];
-
         final Set<String> staticIndexFields = <String>{primaryKey};
-        for (final idx in allIndexes) {
-          if (idx.fields.any(changedFields.contains)) {
-            staticIndexFields.addAll(idx.fields);
+        final allIndexesForOldValues =
+            tableMetaManager?.getAllIndexesFor(schema);
+        if (allIndexesForOldValues != null) {
+          for (final idx in allIndexesForOldValues) {
+            if (idx.fields.any(changedFields.contains)) {
+              staticIndexFields.addAll(idx.fields);
+            }
+          }
+        }
+        final engineIndexes = indexManager?.getEngineManagedBtreeIndexes(
+          table,
+          schema,
+        );
+        if (engineIndexes != null) {
+          for (final idx in engineIndexes) {
+            if (idx.fields.any(changedFields.contains)) {
+              staticIndexFields.addAll(idx.fields);
+            }
           }
         }
 
-        // Collect records to batch commit
+        // Non-PK updates
         final List<Map<String, dynamic>> recordsToCommit = [];
         final List<Map<String, dynamic>> oldRecordsToCommit = [];
         final List<String> commitPkVals = [];
         final List<Map<String, dynamic>> validOriginalRecords = [];
+        // PK changes: delete(old) + insert(new), then cascade
+        final List<Map<String, dynamic>> pkDeleteRecords = [];
+        final List<Map<String, dynamic>> pkInsertRecords = [];
+        final List<String> pkChangeOldKeys = [];
+        final List<String> pkChangeNewKeys = [];
+        final List<Map<String, dynamic>> pkChangeOrigRecords = [];
+        final List<Map<String, dynamic>> pkChangeUpdatedRecords = [];
         final Set<String> reservedPks = {};
+        final bool hasForeignKeys = _foreignKeyManager != null;
 
         for (int recordIndex = 0; recordIndex < records.length; recordIndex++) {
           final y3 = yieldController?.maybeYield();
@@ -2624,6 +2614,270 @@ class DataStoreImpl {
             validData: validData,
             existingRecord: record,
           );
+
+          final newPkValue = updatedRecord[primaryKey];
+          final oldPkValue = record[primaryKey];
+          final bool pkChanged = isPrimaryKeyUpdate &&
+              oldPkValue != null &&
+              newPkValue != null &&
+              oldPkValue != newPkValue;
+
+          if (pkChanged) {
+            final newPkStr =
+                newPkValue is String ? newPkValue : newPkValue.toString();
+
+            List<List<dynamic>>? pkReservedKeys;
+            List<List<dynamic>>? secondaryReservedKeys;
+            UniqueViolation? uniqueViolation;
+
+            // 1) Reserve new PK sentinel only (no secondary unique data → no
+            //    false conflicts with the still-living old row).
+            try {
+              pkReservedKeys = writeBufferManager.tryReserveUniques(
+                table: table,
+                schema: schema,
+                recordId: newPkStr,
+                data: <String, dynamic>{primaryKey: newPkValue},
+                transactionId: txId,
+                isUpdate: false,
+              );
+              reservedPks.add(newPkStr);
+            } catch (e) {
+              if (e is UniqueViolation) {
+                if (continueOnPartialErrors) {
+                  if (returnResultDetails) failedKeys.add(recordKey);
+                  failedCount++;
+                  continue;
+                }
+                return await finishWithPromoteMirror(DbResult.error(
+                  type: e.constraintResultType,
+                  message: e.message,
+                  failedKeys: returnResultDetails ? [recordKey] : const [],
+                ));
+              }
+              rethrow;
+            }
+
+            // 2) Reserve changed secondary uniques under the new PK identity
+            if (fieldsToCheck.isNotEmpty) {
+              try {
+                secondaryReservedKeys = writeBufferManager.tryReserveUniques(
+                  table: table,
+                  schema: schema,
+                  recordId: newPkStr,
+                  data: updatedRecord,
+                  transactionId: txId,
+                  isUpdate: true,
+                  changedFields: fieldsToCheck,
+                );
+              } catch (e) {
+                writeBufferManager.releaseReservedUniques(
+                  table: table,
+                  recordId: newPkStr,
+                  transactionId: txId,
+                  rollbackKeys: pkReservedKeys,
+                );
+                reservedPks.remove(newPkStr);
+                if (e is UniqueViolation) {
+                  if (continueOnPartialErrors) {
+                    if (returnResultDetails) failedKeys.add(recordKey);
+                    failedCount++;
+                    continue;
+                  }
+                  return await finishWithPromoteMirror(DbResult.error(
+                    type: e.constraintResultType,
+                    message: e.message,
+                    failedKeys: returnResultDetails ? [recordKey] : const [],
+                  ));
+                }
+                rethrow;
+              }
+            }
+
+            void releasePkChangeReserves() {
+              if (pkReservedKeys != null) {
+                writeBufferManager.releaseReservedUniques(
+                  table: table,
+                  recordId: newPkStr,
+                  transactionId: txId,
+                  rollbackKeys: pkReservedKeys,
+                );
+              }
+              if (secondaryReservedKeys != null) {
+                writeBufferManager.releaseReservedUniques(
+                  table: table,
+                  recordId: newPkStr,
+                  transactionId: txId,
+                  rollbackKeys: secondaryReservedKeys,
+                );
+              }
+              reservedPks.remove(newPkStr);
+            }
+
+            // 3) Disk: new PK must not exist
+            uniqueViolation = await _indexManager?.checkUniqueConstraints(
+              table,
+              <String, dynamic>{primaryKey: newPkValue},
+              isUpdate: false,
+              txId: txId,
+              schemaOverride: schema,
+              skipBufferCheck: true,
+            );
+            if (uniqueViolation != null) {
+              releasePkChangeReserves();
+              if (continueOnPartialErrors) {
+                if (returnResultDetails) failedKeys.add(recordKey);
+                failedCount++;
+                continue;
+              }
+              return await finishWithPromoteMirror(DbResult.error(
+                type: uniqueViolation.constraintResultType,
+                message: uniqueViolation.message,
+                failedKeys: returnResultDetails ? [recordKey] : const [],
+              ));
+            }
+
+            // 4) Disk: secondary uniques with OLD pk as self-exclusion
+            if (fieldsToCheck.isNotEmpty) {
+              final uniqueCheckData = <String, dynamic>{
+                primaryKey: oldPkValue,
+              };
+              for (final fname in fieldsToCheck) {
+                uniqueCheckData[fname] = updatedRecord[fname];
+              }
+              uniqueViolation = await _indexManager?.checkUniqueConstraints(
+                table,
+                uniqueCheckData,
+                isUpdate: true,
+                txId: txId,
+                schemaOverride: schema,
+                skipBufferCheck: true,
+              );
+              if (uniqueViolation != null) {
+                releasePkChangeReserves();
+                if (continueOnPartialErrors) {
+                  if (returnResultDetails) failedKeys.add(recordKey);
+                  failedCount++;
+                  continue;
+                }
+                return await finishWithPromoteMirror(DbResult.error(
+                  type: uniqueViolation.constraintResultType,
+                  message: uniqueViolation.message,
+                  failedKeys: returnResultDetails ? [recordKey] : const [],
+                ));
+              }
+            }
+
+            // 5) Outgoing FK on the updated row
+            if (hasForeignKeys && changedFields.isNotEmpty) {
+              try {
+                await _foreignKeyManager!.validateForeignKeyConstraints(
+                  table: table,
+                  data: updatedRecord,
+                  operation: ForeignKeyOperation.update,
+                );
+              } catch (e) {
+                releasePkChangeReserves();
+                Logger.error('Foreign key constraint validation failed',
+                    rawError: e);
+                if (continueOnPartialErrors) {
+                  if (returnResultDetails) failedKeys.add(recordKey);
+                  failedCount++;
+                  continue;
+                }
+                return await finishWithPromoteMirror(DbResult.error(
+                  type: ResultType.bizForeignKeyViolation,
+                  message: e.toString(),
+                  failedKeys: returnResultDetails ? [recordKey] : const [],
+                ));
+              }
+            }
+
+            // 6) RESTRICT/NO ACTION on the OLD primary key (immediate)
+            if (hasForeignKeys) {
+              try {
+                await _foreignKeyManager!.checkRestrictConstraintsForUpdate(
+                  table: table,
+                  oldPkValues: oldPkValue,
+                );
+              } catch (e) {
+                releasePkChangeReserves();
+                Logger.error('RESTRICT constraint check failed', rawError: e);
+                return await finishWithPromoteMirror(
+                    _normalizeCascadeError(e, 'update'));
+              }
+            }
+
+            // 7) Row locks: old identity + new identity
+            if (lockMgr != null) {
+              Future<bool> lockPk(String pk) async {
+                final res = 'row:$tableName:pk:$pk';
+                final opId = GlobalIdGenerator.generate('update_row_');
+                final ok = await lockMgr.acquireExclusiveLock(res, opId);
+                if (!ok) return false;
+                acquiredResources[res] = opId;
+                if (txId != null) {
+                  TransactionContext.registerExclusiveLock(res, opId);
+                }
+                return true;
+              }
+
+              try {
+                final oldLocked = await lockPk(recordKey);
+                if (!oldLocked) {
+                  releasePkChangeReserves();
+                  if (continueOnPartialErrors) {
+                    if (returnResultDetails) failedKeys.add(recordKey);
+                    failedCount++;
+                    continue;
+                  }
+                  return await finishWithPromoteMirror(DbResult.error(
+                    type: ResultType.engError,
+                    message: 'Lock conflict on primary key $recordKey',
+                  ));
+                }
+                final newLocked = await lockPk(newPkStr);
+                if (!newLocked) {
+                  // Old lock must not linger when the rename is abandoned.
+                  releaseOneRowLock(recordKey);
+                  releasePkChangeReserves();
+                  if (continueOnPartialErrors) {
+                    if (returnResultDetails) failedKeys.add(recordKey);
+                    failedCount++;
+                    continue;
+                  }
+                  return await finishWithPromoteMirror(DbResult.error(
+                    type: ResultType.engError,
+                    message: 'Lock conflict on primary key $recordKey',
+                  ));
+                }
+              } catch (_) {
+                releaseOneRowLock(recordKey);
+                releaseOneRowLock(newPkStr);
+                releasePkChangeReserves();
+                if (continueOnPartialErrors) {
+                  if (returnResultDetails) failedKeys.add(recordKey);
+                  failedCount++;
+                  continue;
+                }
+                releaseNonTxnRowLocks();
+                rethrow;
+              }
+            }
+
+            if (txId != null) {
+              transactionManager?.registerWriteKey(txId, table, recordKey);
+              transactionManager?.registerWriteKey(txId, table, newPkStr);
+            }
+
+            pkDeleteRecords.add(record);
+            pkInsertRecords.add(updatedRecord);
+            pkChangeOldKeys.add(recordKey);
+            pkChangeNewKeys.add(newPkStr);
+            pkChangeOrigRecords.add(record);
+            pkChangeUpdatedRecords.add(updatedRecord);
+            continue;
+          }
 
           bool ok = true;
           UniqueViolation? uniqueViolation;
@@ -2803,24 +3057,8 @@ class DataStoreImpl {
             transactionManager?.registerWriteKey(txId, table, recordKey);
           }
 
-          // Prepare oldValues
-          final bool pkChanged = isPrimaryKeyUpdate &&
-              record[primaryKey] != null &&
-              updatedRecord[primaryKey] != null &&
-              record[primaryKey] != updatedRecord[primaryKey];
-
-          final Set<String> targetIndexFields;
-          if (pkChanged) {
-            targetIndexFields = <String>{primaryKey};
-            for (final idx in allIndexes) {
-              targetIndexFields.addAll(idx.fields);
-            }
-          } else {
-            targetIndexFields = staticIndexFields;
-          }
-
           final Map<String, dynamic> oldValues = {};
-          for (final k in targetIndexFields) {
+          for (final k in staticIndexFields) {
             if (record.containsKey(k)) {
               oldValues[k] = record[k];
             }
@@ -2832,7 +3070,120 @@ class DataStoreImpl {
           validOriginalRecords.add(record);
         }
 
-        // Commit in unified batch to TableDataManager / WAL / Buffer
+        // PK changes: delete(old) then insert(new) so cascade can resolve the
+        // new parent from the write buffer / txn overlay.
+        if (pkDeleteRecords.isNotEmpty) {
+          try {
+            final deleteResult = await tableDataManager.addBatchToBuffer(
+              table: table,
+              records: pkDeleteRecords,
+              operation: BufferOperationType.delete,
+              schema: schema,
+              transactionId: txId,
+              schemaVersion: schema.schemaVersion ?? '',
+            );
+            final insertResult = await tableDataManager.addBatchToBuffer(
+              table: table,
+              records: pkInsertRecords,
+              operation: BufferOperationType.insert,
+              schema: schema,
+              transactionId: txId,
+              schemaVersion: schema.schemaVersion ?? '',
+            );
+
+            final deleteOk =
+                deleteResult.successRecordIds.length == pkChangeOldKeys.length
+                    ? null
+                    : deleteResult.successRecordIds.toSet();
+            final insertOk =
+                insertResult.successRecordIds.length == pkChangeNewKeys.length
+                    ? null
+                    : insertResult.successRecordIds.toSet();
+
+            for (int k = 0; k < pkChangeOldKeys.length; k++) {
+              final oldKey = pkChangeOldKeys[k];
+              final newKey = pkChangeNewKeys[k];
+              final updatedRecord = pkChangeUpdatedRecords[k];
+              final origRecord = pkChangeOrigRecords[k];
+              final bool rowOk =
+                  (deleteOk == null || deleteOk.contains(oldKey)) &&
+                      (insertOk == null || insertOk.contains(newKey));
+
+              if (rowOk) {
+                final displayPk = promoteDesc != null
+                    ? _promoteUserFacingSuccessKey(
+                        updatedRecord,
+                        promoteDesc,
+                        alternateRecord: origRecord,
+                      )
+                    : newKey;
+                if (returnResultDetails) {
+                  successKeys.add(displayPk);
+                }
+                successCount++;
+                promoteUpdated?.add(updatedRecord);
+                reservedPks.remove(newKey);
+
+                if (hasNotify) {
+                  notifyDataChange(ChangeEvent(
+                    type: ChangeType.update,
+                    tableUid: table.tableUid,
+                    record: updatedRecord,
+                    oldRecord: origRecord,
+                  ));
+                }
+
+                // CASCADE/SET NULL/SET DEFAULT after parent is buffered
+                if (hasForeignKeys) {
+                  final oldPk = origRecord[primaryKey];
+                  final newPk = updatedRecord[primaryKey];
+                  if (txId != null) {
+                    transactionManager?.registerDeferredCascadeUpdate(
+                        txId, table, oldPk, newPk);
+                  } else {
+                    try {
+                      await _foreignKeyManager!.handleCascadeUpdate(
+                        table: table,
+                        oldPkValues: oldPk,
+                        newPkValues: newPk,
+                        visitedTables: null,
+                        skipRestrictCheck: true,
+                      );
+                    } catch (e) {
+                      Logger.error('Cascade update failed', rawError: e);
+                      return await finishWithPromoteMirror(
+                          _normalizeCascadeError(e, 'update'));
+                    }
+                  }
+                }
+              } else {
+                if (returnResultDetails) {
+                  failedKeys.add(oldKey);
+                }
+                failedCount++;
+                if (reservedPks.contains(newKey)) {
+                  writeBufferManager.releaseReservedUniques(
+                    table: table,
+                    recordId: newKey,
+                    transactionId: txId,
+                  );
+                  reservedPks.remove(newKey);
+                }
+              }
+            }
+          } catch (e) {
+            if (reservedPks.isNotEmpty) {
+              await writeBufferManager.releaseReservedUniquesForPks(
+                table: table,
+                recordIds: reservedPks,
+                transactionId: txId,
+              );
+            }
+            rethrow;
+          }
+        }
+
+        // Commit non-PK updates in unified batch
         if (recordsToCommit.isNotEmpty) {
           try {
             final commitResult = await tableDataManager.addBatchToBuffer(
@@ -2898,17 +3249,6 @@ class DataStoreImpl {
             rethrow;
           }
         }
-
-        // Non-transaction: release locks immediately; transaction: release by commit/rollback
-        try {
-          if (lockMgr != null && txId == null && acquiredResources.isNotEmpty) {
-            acquiredResources.forEach((res, opId) {
-              try {
-                lockMgr.releaseExclusiveLock(res, opId);
-              } catch (_) {}
-            });
-          }
-        } catch (_) {}
 
         // If there are both successful and failed records
         if (successCount > 0 && failedCount > 0) {
@@ -3561,6 +3901,20 @@ class DataStoreImpl {
               continue;
             }
           } else if (op.type == 'drop') {
+            if (tableName == 'unknown') {
+              Logger.debug(
+                'Skip resume drop for op ${op.opId}: table no longer exists',
+              );
+              // Meta already gone — mark op complete so WAL cutoff can advance.
+              try {
+                await walManager.completeTableOp(op.opId);
+              } catch (e) {
+                Logger.warn(
+                    'Complete orphaned drop table op failed for ${op.opId}',
+                    rawError: e);
+              }
+              continue;
+            }
             final dropResult = await dropTable(
               tableName,
               isMigration: false,

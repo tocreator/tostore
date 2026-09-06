@@ -28,7 +28,6 @@ import '../model/table_schema.dart';
 import '../model/wal_pointer.dart';
 import '../upgrades/legacy_model/pre_v3.dart';
 import 'backup_manager.dart';
-import 'path_manager.dart';
 import 'compute_manager.dart';
 import 'compute_tasks.dart';
 import 'crontab_manager.dart';
@@ -36,6 +35,7 @@ import 'data_store_impl.dart';
 import 'key_migration_progress.dart';
 import 'key_migration_runner.dart';
 import 'large_operation_runner.dart';
+import 'path_manager.dart';
 import 'promote_primary_key.dart';
 import 'resource_manager.dart';
 import 'transaction_context.dart';
@@ -7120,10 +7120,28 @@ class MigrationManager {
         try {
           final table = await _tableContextForUid(uid);
           if (table == null) {
-            Logger.warn(
-              'Skip reconcile for pending migration taskId[${task.taskId}]: '
-              'tableUid[${uid.value}] meta not found (tableName[${task.tableName}])',
-            );
+            // Meta gone: drop-only tasks still need to drain other spaces'
+            // data dirs via the space loop (exists→skip / uid path). Non-drop
+            // orphans cannot cut over — remove them so startup does not loop
+            // on "Table unknown does not exist".
+            final dropOnly = task.operations.isNotEmpty &&
+                task.operations
+                    .every((op) => op.type == MigrationType.dropTable);
+            if (!dropOnly) {
+              Logger.debug(
+                'Removing orphaned migration taskId[${task.taskId}]: '
+                'tableUid[${uid.value}] meta not found (tableName[${task.tableName}])',
+              );
+              await _removePendingTaskCompletely(
+                task,
+                reason: 'table meta not found',
+              );
+            } else {
+              Logger.debug(
+                'Skip reconcile for pending migration taskId[${task.taskId}]: '
+                'tableUid[${uid.value}] meta not found (tableName[${task.tableName}])',
+              );
+            }
             continue;
           }
           await _reconcilePendingTasksForTable(table);
@@ -7747,7 +7765,12 @@ class MigrationManager {
   }) async {
     // Always resolve by stable tableUid: rename cutover drops the old name
     // from inventory, and cache keys are uid-based.
-    final table = await _requireTableContextByUid(tableUid);
+    // Drop tasks are enqueued after current-space meta is already deleted —
+    // there is nothing left to invalidate (same guard as addMigrationTask).
+    final table = await _tableContextForUid(tableUid);
+    if (table == null) {
+      return;
+    }
 
     if (renameOp != null || needDataMigration) {
       // Physical identity unchanged on rename; drop read-side caches. Keep the

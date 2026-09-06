@@ -535,11 +535,14 @@ class LargeOperationRunner {
     int skippedForOffset = 0;
     final offsetBudget = op.offset ?? 0;
     final conditionMap = op.condition;
+    // PK renames are single-row and always take the online update path.
+    // Large-scale batches ignore any primary-key field in the payload.
     final validData = op.updateData;
+    validData.remove(primaryKey);
+    if (validData.isEmpty) {
+      return 0;
+    }
     final writeBatchSize = dataStore.config.writeBatchSize;
-
-    final isPrimaryKeyUpdate = validData.containsKey(primaryKey);
-    final insertedPrimaryKeysThisUpdate = <String>{};
 
     final Set<String> uniqueFieldsToCheck = <String>{};
     if (dataStore.indexManager != null) {
@@ -607,11 +610,6 @@ class LargeOperationRunner {
 
           for (final matchedIndex in matchResult.matchedIndices) {
             final candidate = records[matchedIndex];
-            final candidatePk = candidate[primaryKey]?.toString();
-            if (candidatePk != null &&
-                insertedPrimaryKeysThisUpdate.contains(candidatePk)) {
-              continue;
-            }
             if (skippedForOffset < offsetBudget) {
               skippedForOffset++;
               continue;
@@ -626,8 +624,6 @@ class LargeOperationRunner {
           if (matchedRecords.isEmpty) return true;
 
           final updates = <Map<String, dynamic>>[];
-          final deletes = <Map<String, dynamic>>[];
-          final inserts = <Map<String, dynamic>>[];
           // PKs reserved in this chunk but not yet handed to scheduler.
           final chunkReservedPks = <String>{};
 
@@ -671,8 +667,7 @@ class LargeOperationRunner {
             List<List<dynamic>>? reservedKeys;
             // Verify unique constraints
             if (uniqueFieldsToCheck.isNotEmpty &&
-                dataStore.indexManager != null &&
-                !isPrimaryKeyUpdate) {
+                dataStore.indexManager != null) {
               try {
                 reservedKeys = dataStore.writeBufferManager.tryReserveUniques(
                   table: table,
@@ -741,132 +736,7 @@ class LargeOperationRunner {
               }
             }
 
-            // Verify and check primary key update unique constraints with reservation
-            if (isPrimaryKeyUpdate) {
-              final newPkVal = updatedRecord[primaryKey]?.toString();
-              if (newPkVal != null && newPkVal != pkValueStr) {
-                List<List<dynamic>>? pkReservedKeys;
-                try {
-                  pkReservedKeys =
-                      dataStore.writeBufferManager.tryReserveUniques(
-                    table: table,
-                    schema: schema,
-                    recordId: newPkVal,
-                    data: updatedRecord,
-                    isUpdate: false,
-                  );
-                  chunkReservedPks.add(newPkVal);
-                } catch (e) {
-                  Logger.error(
-                      'Unique constraint check failed in primary key update reserve',
-                      rawError: e);
-                  if (op.continueOnPartialErrors) {
-                    Logger.warn(
-                        'Skip primary key update for record with PK $pkValueStr due to unique conflict',
-                        rawError: e);
-                    continue;
-                  }
-                  await releaseChunkReservations();
-                  rethrow;
-                }
-
-                try {
-                  final violation =
-                      await dataStore.indexManager!.checkUniqueConstraints(
-                    table,
-                    updatedRecord,
-                    isUpdate: true,
-                    skipBufferCheck: true,
-                  );
-                  if (violation != null) {
-                    throw DbException([
-                      ConstraintStatus(
-                        type: violation.constraintResultType,
-                        message: violation.message,
-                        tableName: table.tableName,
-                        constraintName: violation.indexName?.value,
-                        fields: violation.fields,
-                        conflictingKeys: [violation.value],
-                        primaryKey: newPkVal,
-                      ),
-                    ]);
-                  }
-                } catch (e) {
-                  try {
-                    dataStore.writeBufferManager.releaseReservedUniques(
-                      table: table,
-                      recordId: newPkVal,
-                      rollbackKeys: pkReservedKeys,
-                    );
-                  } catch (_) {}
-                  chunkReservedPks.remove(newPkVal);
-                  Logger.error(
-                      'Unique constraint check failed in primary key update',
-                      rawError: e);
-                  if (op.continueOnPartialErrors) {
-                    Logger.warn(
-                        'Skip primary key update for record with PK $pkValueStr due to unique conflict',
-                        rawError: e);
-                    continue;
-                  }
-                  await releaseChunkReservations();
-                  rethrow;
-                }
-
-                // Check restrict and cascade update for primary key updates
-                if (dataStore.foreignKeyManager != null) {
-                  try {
-                    await dataStore.foreignKeyManager!
-                        .checkRestrictConstraintsForUpdate(
-                      table: table,
-                      oldPkValues: pkValueStr,
-                    );
-                  } catch (e) {
-                    dataStore.writeBufferManager.releaseReservedUniques(
-                      table: table,
-                      recordId: newPkVal,
-                      rollbackKeys: pkReservedKeys,
-                    );
-                    chunkReservedPks.remove(newPkVal);
-                    Logger.error(
-                        'RESTRICT constraint check failed in primary key update',
-                        rawError: e);
-                    if (op.continueOnPartialErrors) continue;
-                    await releaseChunkReservations();
-                    rethrow;
-                  }
-
-                  try {
-                    await dataStore.foreignKeyManager!.handleCascadeUpdate(
-                      table: table,
-                      oldPkValues: pkValueStr,
-                      newPkValues: newPkVal,
-                    );
-                  } catch (e) {
-                    dataStore.writeBufferManager.releaseReservedUniques(
-                      table: table,
-                      recordId: newPkVal,
-                      rollbackKeys: pkReservedKeys,
-                    );
-                    chunkReservedPks.remove(newPkVal);
-                    Logger.error(
-                        'Cascade update failed in large-scale data update',
-                        rawError: e);
-                    if (op.continueOnPartialErrors) continue;
-                    await releaseChunkReservations();
-                    rethrow;
-                  }
-                }
-
-                deletes.add(record);
-                inserts.add(updatedRecord);
-                insertedPrimaryKeysThisUpdate.add(newPkVal);
-              } else {
-                updates.add(updatedRecord);
-              }
-            } else {
-              updates.add(updatedRecord);
-            }
+            updates.add(updatedRecord);
 
             // Validate foreign key constraints for fields in updatedRecord
             if (dataStore.foreignKeyManager != null) {
@@ -886,21 +756,7 @@ class LargeOperationRunner {
                   );
                   chunkReservedPks.remove(pkValueStr);
                 }
-                // PK-change path reserved under newPk
-                final newPkVal = updatedRecord[primaryKey]?.toString();
-                if (isPrimaryKeyUpdate &&
-                    newPkVal != null &&
-                    newPkVal != pkValueStr) {
-                  dataStore.writeBufferManager.releaseReservedUniques(
-                    table: table,
-                    recordId: newPkVal,
-                  );
-                  chunkReservedPks.remove(newPkVal);
-                  deletes.remove(record);
-                  inserts.remove(updatedRecord);
-                } else {
-                  updates.remove(updatedRecord);
-                }
+                updates.remove(updatedRecord);
                 Logger.error(
                     'Foreign key check failed in large-scale data update',
                     rawError: e);
@@ -932,66 +788,6 @@ class LargeOperationRunner {
           }
 
           // Populate scheduler
-          for (final record in deletes) {
-            if (token.isCancelled ||
-                !dataStore.isInitialized ||
-                dataStore.isClosing) {
-              await releaseChunkReservations();
-              _throwIfInterrupted(dataStore, token, 'update');
-            }
-            final pk = record[primaryKey].toString();
-            final entry = BufferEntry(
-              operation: BufferOperationType.delete,
-              data: record,
-              timestamp: DateTime.now(),
-              schemaVersion: entryVersion,
-            );
-            dataStore.backgroundWriteScheduler.addEntry(
-              BackgroundWriteEntry(
-                taskId: op.opId,
-                tableUid: table.tableUid,
-                primaryKey: pk,
-                type: BackgroundWriteType.largeUpdate,
-                mode: MigrationWriteMode.tableAndIndex,
-                entry: entry,
-                currentCursor: nextCursor,
-                nextCursor: nextCursor,
-              ),
-              pk,
-            );
-          }
-
-          for (final record in inserts) {
-            if (token.isCancelled ||
-                !dataStore.isInitialized ||
-                dataStore.isClosing) {
-              await releaseChunkReservations();
-              _throwIfInterrupted(dataStore, token, 'update');
-            }
-            final pk = record[primaryKey].toString();
-            final entry = BufferEntry(
-              operation: BufferOperationType.insert,
-              data: record,
-              timestamp: DateTime.now(),
-              schemaVersion: entryVersion,
-            );
-            dataStore.backgroundWriteScheduler.addEntry(
-              BackgroundWriteEntry(
-                taskId: op.opId,
-                tableUid: table.tableUid,
-                primaryKey: pk,
-                type: BackgroundWriteType.largeUpdate,
-                mode: MigrationWriteMode.tableAndIndex,
-                entry: entry,
-                currentCursor: nextCursor,
-                nextCursor: nextCursor,
-              ),
-              pk,
-            );
-            // Handed to scheduler/flush; do not release here.
-            chunkReservedPks.remove(pk);
-          }
-
           for (final record in updates) {
             if (token.isCancelled ||
                 !dataStore.isInitialized ||

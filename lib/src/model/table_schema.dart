@@ -2477,9 +2477,27 @@ class FieldSchema {
         break;
     }
 
-    // Fallback to standard checkConstraints + convertValue
-    checkConstraints(value, tableName: tableName, skipMaxLengthCheck: true);
+    // Fallback: convert then validate (same order as insert / update validate).
+    // Checking the raw type first rejects legitimate coercions (e.g. PK String →
+    // integer FK during CASCADE onUpdate).
     final converted = convertValue(value);
+    if (converted == null && value != null) {
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devInvalidArgumentType,
+          message:
+              'Field $name expects type $type but cannot convert ${value.runtimeType} value $value (table $tableName)',
+          parameterName: name,
+          passedValue: value,
+        )
+      ]);
+    }
+    checkConstraints(
+      converted,
+      tableName: tableName,
+      skipMaxLengthCheck: true,
+      trustedConvertedValue: true,
+    );
     if (converted is String &&
         maxLength != null &&
         converted.length > maxLength!) {

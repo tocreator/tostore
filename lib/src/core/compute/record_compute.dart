@@ -271,6 +271,8 @@ String? validateRecordIdentifierPure({
 }
 
 /// Pure update-field validation + conversion path that is safe to run in an isolate.
+///
+/// Primary key, when present, is validated/converted with the same rules as insert
 Map<String, dynamic>? validateAndProcessUpdateDataPure({
   required TableSchema schema,
   required Map<String, dynamic> data,
@@ -284,7 +286,45 @@ Map<String, dynamic>? validateAndProcessUpdateDataPure({
 
     for (final entry in data.entries) {
       final fieldName = entry.key;
-      if (fieldName == primaryKey) continue;
+      if (fieldName == primaryKey) {
+        final value = entry.value;
+        if (value == null) {
+          throw DbException([
+            ConstraintStatus(
+              type: ResultType.bizNotNullViolation,
+              message: 'Primary key value cannot be null (table $tableName)',
+              tableName: tableName,
+              fields: [primaryKey],
+            )
+          ]);
+        }
+        if (value is ExprNode) {
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.devInvalidExpression,
+              message:
+                  'Primary key updates do not support expressions (table $tableName)',
+              parameterName: primaryKey,
+              passedValue: value,
+            )
+          ]);
+        }
+        if (!schema.validatePrimaryKeyFormat(value)) {
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.devInvalidPrimaryKeyFormat,
+              message:
+                  'The provided primary key value $value for table $tableName does not meet the format requirements for type ${schema.primaryKeyConfig.type}',
+              parameterName: primaryKey,
+              passedValue: value,
+            )
+          ]);
+        }
+        // convertPrimaryKey fast-returns for String — no extra allocation.
+        result[primaryKey] = schema.primaryKeyConfig
+            .convertPrimaryKey(value, tableName: tableName);
+        continue;
+      }
 
       final field = fieldMap[fieldName];
       if (field == null) {
@@ -307,13 +347,28 @@ Map<String, dynamic>? validateAndProcessUpdateDataPure({
         continue;
       }
 
+      // Convert first (PK strings → integer FK, numeric strings, etc.), then
+      // validate the storage form. Matching insert: never type-check raw input.
+      final converted = field.convertValue(value);
+      if (converted == null && value != null) {
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidArgumentType,
+            message:
+                'Field $fieldName expects type ${field.type} but cannot convert ${value.runtimeType} value $value (table $tableName)',
+            parameterName: fieldName,
+            passedValue: value,
+          )
+        ]);
+      }
+
       field.checkConstraints(
-        value,
+        converted,
         tableName: tableName,
         skipMaxLengthCheck: true,
+        trustedConvertedValue: true,
       );
 
-      final converted = field.convertValue(value);
       if (converted != null &&
           field.maxLength != null &&
           converted is String &&

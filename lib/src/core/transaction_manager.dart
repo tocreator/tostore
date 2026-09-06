@@ -642,73 +642,11 @@ class TransactionManager {
         return pk;
       }
 
-      // Re-enact inserts as INSERT to unified range partition write
+      // Apply order: updates → deletes → inserts.
+      // PK renames are delete(old)+insert(new); deletes must land before inserts
+      // so secondary unique index slots are freed before the new row claims them.
+      // Cascade updates run after inserts so the new parent PK is visible.
       final yieldController = YieldController('txn_apply_commit_plan');
-      for (final entry in commitPlan.inserts.entries) {
-        final tableUid = entry.key;
-        final recs = entry.value;
-        final tableCtx = await _dataStore.tableMetaManager
-            ?.getTableContext(TableUid(tableUid));
-        if (tableCtx == null) {
-          Logger.warn(
-              'Table context not found for $tableUid during applyCommitPlan');
-          continue;
-        }
-        final schema = await _dataStore.tableMetaManager
-            ?.getTableSchema(tableCtx.tableUid);
-        if (schema == null) {
-          Logger.warn(
-              'Schema not found for table $tableUid during applyCommitPlan');
-          continue;
-        }
-
-        final startIdx = progress['inserts']![tableUid] ?? 0;
-        const int batchSize = 1000;
-        final migrationManager = _dataStore.migrationManager;
-        final hasRuntimeMigration = migrationManager != null &&
-            migrationManager.hasRuntimeMigrationForTable(tableCtx);
-
-        for (int i = startIdx; i < recs.length; i += batchSize) {
-          final y4 = yieldController.maybeYield();
-          if (y4 != null) await y4;
-          final end =
-              (i + batchSize < recs.length) ? i + batchSize : recs.length;
-
-          final List<Map<String, dynamic>> records = [];
-
-          for (int j = i; j < end; j++) {
-            // Take ownership of plan maps: strip embedded meta in place.
-            final rec = recs[j];
-            rec.remove('_oldValues'); // inserts do not use oldValues
-            rec.remove('_uniqueKeys'); // legacy commit-plan field; ignore
-            final normalizedRec = (hasRuntimeMigration)
-                ? migrationManager.normalizeRecordToLatestSync(tableCtx, rec,
-                    fromVersion: '')
-                : rec;
-            records.add(normalizedRec);
-          }
-
-          await _dataStore.tableDataManager.addBatchToBuffer(
-            table: tableCtx,
-            records: records,
-            operation: BufferOperationType.insert,
-            schema: schema,
-            transactionId: commitPlan.transactionId,
-            schemaVersion: schema.schemaVersion ?? '',
-          );
-
-          progress['inserts']![tableUid] = end;
-          processedSinceLastCheckpoint += (end - i);
-          if (processedSinceLastCheckpoint >= checkpointEvery) {
-            await _persistPlanProgress(
-                commitPlan.transactionId,
-                progress['inserts']!,
-                progress['updates']!,
-                progress['deletes']!);
-            processedSinceLastCheckpoint = 0;
-          }
-        }
-      }
       for (final entry in commitPlan.updates.entries) {
         final tableUid = entry.key;
         final recs = entry.value;
@@ -837,6 +775,71 @@ class TransactionManager {
             schemaVersion: version,
           );
           progress['deletes']![tableUid] = end;
+          processedSinceLastCheckpoint += (end - i);
+          if (processedSinceLastCheckpoint >= checkpointEvery) {
+            await _persistPlanProgress(
+                commitPlan.transactionId,
+                progress['inserts']!,
+                progress['updates']!,
+                progress['deletes']!);
+            processedSinceLastCheckpoint = 0;
+          }
+        }
+      }
+      for (final entry in commitPlan.inserts.entries) {
+        final tableUid = entry.key;
+        final recs = entry.value;
+        final tableCtx = await _dataStore.tableMetaManager
+            ?.getTableContext(TableUid(tableUid));
+        if (tableCtx == null) {
+          Logger.warn(
+              'Table context not found for $tableUid during applyCommitPlan');
+          continue;
+        }
+        final schema = await _dataStore.tableMetaManager
+            ?.getTableSchema(tableCtx.tableUid);
+        if (schema == null) {
+          Logger.warn(
+              'Schema not found for table $tableUid during applyCommitPlan');
+          continue;
+        }
+
+        final startIdx = progress['inserts']![tableUid] ?? 0;
+        const int batchSize = 1000;
+        final migrationManager = _dataStore.migrationManager;
+        final hasRuntimeMigration = migrationManager != null &&
+            migrationManager.hasRuntimeMigrationForTable(tableCtx);
+
+        for (int i = startIdx; i < recs.length; i += batchSize) {
+          final y4 = yieldController.maybeYield();
+          if (y4 != null) await y4;
+          final end =
+              (i + batchSize < recs.length) ? i + batchSize : recs.length;
+
+          final List<Map<String, dynamic>> records = [];
+
+          for (int j = i; j < end; j++) {
+            // Take ownership of plan maps: strip embedded meta in place.
+            final rec = recs[j];
+            rec.remove('_oldValues'); // inserts do not use oldValues
+            rec.remove('_uniqueKeys'); // legacy commit-plan field; ignore
+            final normalizedRec = (hasRuntimeMigration)
+                ? migrationManager.normalizeRecordToLatestSync(tableCtx, rec,
+                    fromVersion: '')
+                : rec;
+            records.add(normalizedRec);
+          }
+
+          await _dataStore.tableDataManager.addBatchToBuffer(
+            table: tableCtx,
+            records: records,
+            operation: BufferOperationType.insert,
+            schema: schema,
+            transactionId: commitPlan.transactionId,
+            schemaVersion: schema.schemaVersion ?? '',
+          );
+
+          progress['inserts']![tableUid] = end;
           processedSinceLastCheckpoint += (end - i);
           if (processedSinceLastCheckpoint >= checkpointEvery) {
             await _persistPlanProgress(
