@@ -44,6 +44,16 @@ extension type const TableUid(String value) implements String {
     }
     return TableUid(raw);
   }
+
+  /// Whether [value] matches engine-issued stable table uid shape.
+  ///
+  /// Stable ids are `GlobalIdGenerator.generate("t")` -- `'t'` + 14-char Base36
+  /// body (length 15). Logical table names never match this shape.
+  bool get looksLikeStableUid {
+    if (isEmpty) return false;
+    if (!value.startsWith('t')) return false;
+    return value.length == 15;
+  }
 }
 
 /// Logical table name exposed to database users (mutable on rename).

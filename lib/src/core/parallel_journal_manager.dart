@@ -298,6 +298,7 @@ class ParallelJournalManager {
     if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
       return null;
     }
+    if (_isRecovering) return null;
     return _applyEnqueueBackpressureSlow(count);
   }
 
@@ -912,8 +913,12 @@ class ParallelJournalManager {
             continue;
           }
           try {
-            final schema = await _dataStore.tableMetaManager
-                ?.getTableSchema(tableContext.tableUid);
+            // Prefer schema already on [TableContext] -- avoids getTableMeta
+            // cold load / bootstrap deadlock while flushing recovered meta rows.
+            final schema = tableContext.schema.name.isNotEmpty
+                ? tableContext.schema
+                : await _dataStore.tableMetaManager
+                    ?.getTableSchema(tableContext.tableUid);
             final tableDataMeta = await _dataStore.tableDataManager
                 .getTableDataMeta(tableContext.tableUid);
             final indexUids = <IndexUid>[];
@@ -1482,6 +1487,9 @@ class ParallelJournalManager {
   }
 
   Future<void> _recoverFromWal({List<_WalRange>? excludeRanges}) async {
+    // Block online flush for the whole replay window. Without this, mid-replay
+    final heldRecoveringFlag = _isRecovering;
+    _isRecovering = true;
     try {
       final hasLogs = _walManager.hasExistingLogs;
       if (!_dataStore.config.enableJournal && !hasLogs) return;
@@ -1664,7 +1672,6 @@ class ParallelJournalManager {
             if (table == null || data == null || opIdx == null) continue;
 
             var resolvedTable = await _resolvePersistedTableField(table);
-
             // Skip WAL entries that are logically before a clear/drop cutoff
             // for this table.
             final cutoffs = await _tableCutoffsFor(tableCutoffs, resolvedTable);
@@ -1681,7 +1688,6 @@ class ParallelJournalManager {
               }
             }
             final op = BufferOperationType.values[opIdx];
-
             final schema = await _resolveTableSchema(resolvedTable);
             if (schema == null) {
               Logger.warn(
@@ -1735,6 +1741,20 @@ class ParallelJournalManager {
               recordId: recordId,
               entry: be.copyWith(walPointer: walPtr),
             );
+
+            // Meta rows land in the write buffer only; hydrate memory inventory
+            if (resolvedTable == SystemTable.tableMetaTableUid &&
+                (op == BufferOperationType.insert ||
+                    op == BufferOperationType.update)) {
+              try {
+                _dataStore.tableMetaManager?.ingestRecoveredTableMetaRow(data);
+              } catch (e) {
+                Logger.warn(
+                  'WAL recovery: failed to ingest tableMeta row pk=$recordId',
+                  rawError: e,
+                );
+              }
+            }
           }
         } catch (_) {}
 
@@ -1743,7 +1763,6 @@ class ParallelJournalManager {
         first = false;
         if (p == startP) break; // safety
       }
-
       // After replaying WAL, update WAL manager's in-memory current pointer.
       final WalPointer lastPtr =
           WalPointer(partitionIndex: lastPartition, entrySeq: lastSeq);
@@ -1815,6 +1834,11 @@ class ParallelJournalManager {
       }
     } catch (e) {
       Logger.error('Recover from WAL failed', rawError: e);
+    } finally {
+      // Keep flag if pending-batch reconcile already owns recovery flush chain.
+      if (!heldRecoveringFlag) {
+        _isRecovering = false;
+      }
     }
   }
 
@@ -1950,63 +1974,71 @@ class ParallelJournalManager {
 
   /// Resolve a persisted journal/WAL table field to a stable uid key.
   ///
-  /// Fast path (common): normalize once; if already a live uid, return immediately.
-  /// Slow path (legacy name + in-flight rename): apply pending renames, then normalize.
+  /// Fast path (common): field is already a stable table uid -- return as-is
+  /// must not query empty `_system_table_meta` data pages).
+  /// Slow path (legacy name + in-flight rename): name→uid, then pending renames.
   Future<TableUid> _resolvePersistedTableField(String rawField) async {
     if (rawField.isEmpty) return TableUid.empty;
+
+    // Hot path first: modern WAL already stores stable table uids.
+    final asUid = TableUid(rawField);
+    if (asUid == SystemTable.tableMetaTableUid || asUid.looksLikeStableUid) {
+      return asUid;
+    }
+
+    // Recovery-only name→uid cache (null outside WAL/batch reconcile).
     final fieldCache = _recoveryFieldCache;
     if (fieldCache != null) {
       final hit = fieldCache[rawField];
       if (hit != null) return hit;
     }
+
     final mgr = _dataStore.tableMetaManager;
     final normalized = await mgr?.normalizeTableFieldKey(rawField) ?? rawField;
-    TableUid result;
-    if (mgr != null && await mgr.isActiveTableUidKey(normalized)) {
-      result = TableUid(normalized);
-    } else {
-      final migMgr = _dataStore.migrationManager;
-      if (migMgr == null) {
-        result = TableUid(normalized);
-      } else {
-        final pendingRenames = migMgr.getPendingTableRenames();
-        if (pendingRenames.isEmpty) {
-          result = TableUid(normalized);
-        } else {
-          final renamed =
-              pendingRenames[rawField] ?? pendingRenames[normalized];
-          if (renamed == null) {
-            result = TableUid(normalized);
-          } else {
-            result =
-                TableUid(await mgr?.normalizeTableFieldKey(renamed) ?? renamed);
-          }
+    TableUid result = TableUid(normalized);
+
+    // Legacy name may still need in-flight rename remapping.
+    final migMgr = _dataStore.migrationManager;
+    if (migMgr != null) {
+      final pendingRenames = migMgr.getPendingTableRenames();
+      if (pendingRenames.isNotEmpty) {
+        final renamed = pendingRenames[rawField] ?? pendingRenames[normalized];
+        if (renamed != null) {
+          result =
+              TableUid(await mgr?.normalizeTableFieldKey(renamed) ?? renamed);
         }
       }
     }
+
     fieldCache?[rawField] = result;
     return result;
   }
 
   Future<TableContext?> _resolveTableContext(TableUid tableUid) async {
     if (tableUid.isEmpty) return null;
+
+    final mgr = _dataStore.tableMetaManager;
+    // Hot path first: memory inventory / pinned meta / tableMeta bootstrap.
+    final sync = mgr?.getTableContextSync(tableUid);
+    if (sync != null) return sync;
+    if (tableUid == SystemTable.tableMetaTableUid) {
+      return mgr?.bootstrapTableMetaContext();
+    }
+
+    // Recovery-only cache (null outside WAL/batch reconcile). Checked after
+    // sync miss so online flush does not pay containsKey on every call.
     final ctxCache = _recoveryContextCache;
-    if (ctxCache != null && ctxCache.containsKey(tableUid)) {
-      return ctxCache[tableUid];
-    }
-    final ctx = await _dataStore.tableMetaManager?.getTableContext(tableUid);
-    TableContext? result = ctx;
-    if (result == null) {
-      // Interrupted v3 may leave meta-row inserts in WAL before the self-row is
-      // readable via getTableMeta; bootstrap context is enough to replay them.
-      if (tableUid == SystemTable.tableMetaTableUid) {
-        result = _dataStore.tableMetaManager?.bootstrapTableMetaContext();
-      }
-    }
     if (ctxCache != null) {
-      ctxCache[tableUid] = result;
+      final cached = ctxCache[tableUid];
+      // Never sticky-cache null: a later tableMeta WAL row may ingest the meta
+      // for this uid in the same recovery pass (InternalKv bootstrap ordering).
+      if (cached != null) return cached;
     }
-    return result;
+
+    // Cold path: disk/buffer query (normal restart when meta not yet in memory).
+    final ctx = await mgr?.getTableContext(tableUid);
+    if (ctx != null) ctxCache?[tableUid] = ctx;
+    return ctx;
   }
 
   BatchTablePlan? _tablePlanFor(
@@ -2037,12 +2069,15 @@ class ParallelJournalManager {
   }
 
   Future<TableSchema?> _resolveTableSchema(TableUid tableUid) async {
+    // Fixed schema -- never await getTableMeta for the meta table itself.
+    if (tableUid == SystemTable.tableMetaTableUid) {
+      return SystemTable.tableMetaTable();
+    }
     final ctx = await _resolveTableContext(tableUid);
     if (ctx == null) return null;
-    // Prefer [TableContext.schema] so bootstrap meta context works when the
-    // self-row is not yet loadable via getTableMeta.
+    // while `_system_table_meta` data pages are still empty.
     if (ctx.schema.name.isNotEmpty) return ctx.schema;
-    return _dataStore.tableMetaManager?.getTableSchema(ctx.tableUid);
+    return null;
   }
 
   Future<TableContext?> _tableContextFromUid(TableUid tableUid) async {
@@ -2125,7 +2160,6 @@ class ParallelJournalManager {
       PendingParallelBatch batch) async {
     try {
       await _replayPageRedoLogIfExists(batch.batchId);
-
       if (batch.batchType == BatchType.maintenance) {
         await _walManager.removePendingParallelBatch(batch.batchId);
         await _deletePageRedoLogIfExists(batch.batchId);
@@ -2140,7 +2174,6 @@ class ParallelJournalManager {
       // unmarked sibling partitions must still be rewritten by writeChanges, which
       // already skips individual durable partition files via alreadyDurableForBatch.
       final plans = Map<TableUid, BatchTablePlan>.from(batch.tablePlans);
-
       final _BatchWalData walData = await _collectBatchWalChanges(batch);
       walData.tablePlans.addAll(plans);
 
@@ -2199,6 +2232,19 @@ class ParallelJournalManager {
           updateStats: true,
         );
 
+        if (tableUid == SystemTable.tableMetaTableUid &&
+            (op.op == BufferOperationType.insert ||
+                op.op == BufferOperationType.update)) {
+          try {
+            _dataStore.tableMetaManager?.ingestRecoveredTableMetaRow(op.data);
+          } catch (e) {
+            Logger.warn(
+              'Batch recovery: failed to ingest tableMeta row pk=$pkValue',
+              rawError: e,
+            );
+          }
+        }
+
         // Track maxId for batch update
         if (schema.primaryKeyConfig.type == PrimaryKeyType.sequential &&
             op.op == BufferOperationType.insert) {
@@ -2235,7 +2281,6 @@ class ParallelJournalManager {
       final captureCount = count;
       final captureBatchId = batch.batchId;
       final captureBatchType = batch.batchType;
-
       return () async {
         if (!_running) return;
         _flushInProgress = true;

@@ -1050,8 +1050,8 @@ class DataStoreImpl {
           }
         }
 
-        // Single durability barrier: meta rows sit in the write buffer
-        await _flushPendingWrites();
+        // Without journal: no WAL replay path, so meta rows must hit disk now.
+        await _flushFirstInstallDurabilityBarrier();
         await tableMetaManager?.updateSchemaHashes(
           systemSchemas: systemSchemas,
           userSchemas: userSchemas.isNotEmpty ? userSchemas : null,
@@ -1114,6 +1114,22 @@ class DataStoreImpl {
           await storage.flushAll();
         } catch (_) {}
       }
+    });
+  }
+
+  /// Durability before persisting first-install schema hashes.
+  ///
+  /// Journal on: only ensure WAL entries are on disk (meta rows recover on
+  /// next open). Journal off: full buffer/WAL/storage flush.
+  Future<void> _flushFirstInstallDurabilityBarrier() async {
+    if (!config.enableJournal) {
+      await _flushPendingWrites();
+      return;
+    }
+    await TransactionContext.runAsSystemOperation(() async {
+      try {
+        await walManager.flushQueueCompletely();
+      } catch (_) {}
     });
   }
 

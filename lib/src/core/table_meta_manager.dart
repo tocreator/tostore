@@ -128,6 +128,16 @@ class TableMetaManager {
     _syncTableMetaFullyCachedFlag();
   }
 
+  /// Apply a `_system_table_meta` row recovered from WAL into memory only.
+  ///
+  /// WAL replay puts the row in the write buffer before data pages exist; other
+  /// tables (e.g. InternalKv) must resolve [TableContext] without querying disk.
+  void ingestRecoveredTableMetaRow(Map<String, dynamic> row) {
+    final meta = TableMetaCodec.decodeRow(row);
+    _registerMetaInLookups(meta, updateDirCounts: false);
+    _cacheTableMeta(meta);
+  }
+
   /// Set TreeCache `all` flag only when every inventoried uid is still hot.
   ///
   /// [_nameInventoryReady] may be true while this stays false (eviction left a
@@ -221,7 +231,10 @@ class TableMetaManager {
   /// Normalize a persisted uid-or-name field to a stable map key (prefers uid).
   Future<String> normalizeTableFieldKey(String field) async {
     if (field.isEmpty) return field;
-    if (await isActiveTableUidKey(field)) return field;
+    final asUid = TableUid(field);
+    if (asUid == SystemTable.tableMetaTableUid || asUid.looksLikeStableUid) {
+      return field;
+    }
     final uid = await getUidByName(TableName(field));
     return uid?.value ?? field;
   }
@@ -1346,7 +1359,9 @@ class TableMetaManager {
     try {
       return await loadFuture;
     } finally {
-      _metaLoadingFutures.remove(tableUid);
+      if (identical(_metaLoadingFutures[tableUid], loadFuture)) {
+        _metaLoadingFutures.remove(tableUid);
+      }
     }
   }
 
