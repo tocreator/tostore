@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## 3.5.2
+
+### Changed
+- Optimized first startup duration.
+
+### Fixed
+- Fixed child-table foreign key cascade during batch insert incorrectly treating newly inserted parent rows as missing.
+
 ## 3.5.1
 
 ### Changed
