@@ -1471,7 +1471,7 @@ Aşağıdaki API'ler, eklenti tarzı geliştirme, yönetici panelleri ve operasy
   - `instancePath`: fiziksel depolama dizinini tam olarak bulun
   - `getVersion()` / `setVersion(version)`: uygulama düzeyinde geçiş kararları için iş tanımlı sürüm kontrolü (motor sürümü değil)
 - **Bakım**
-  - `flush(flushStorage: true)`: bekleyen verileri diske zorla; `flushStorage: true` ise sistemden ayrıca alt düzey depolama arabelleklerini temizlemesi istenir
+  - `flush(mode: FlushMode.fullPowerSafe)`: bekleyen yazmaları depolamaya zorla. Modlar: `recovery` (en hızlı; kurtarma günlüğü yalnızca OS arabelleklerine; uygulama çökmesinden sonra kurtarılabilir, güç kesintisinde veri kaybı olabilir), `recoveryPowerSafe` (kurtarma günlüğü kalıcı depolamaya; güç kesintisine dayanmayı hedefler), `fullPowerSafe` (varsayılan; kurtarma günlüğü + tablo ve dizin verileri kalıcı depolamaya).
   - `deleteDatabase()`: geçerli örnek için tüm fiziksel dosyaları ve meta verileri kaldırın; dikkatli kullanın
 - **Teşhis**
   - `db.status.memory()`: önbellek isabet oranlarını, dizin sayfası kullanımını ve genel yığın tahsisini inceleyin

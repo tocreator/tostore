@@ -1473,7 +1473,7 @@ The following APIs cover database administration, diagnostics, and maintenance f
   - `instancePath`: locate the physical storage directory precisely
   - `getVersion()` / `setVersion(version)`: business-defined version control for application-level migration decisions (not the engine version)
 - **Maintenance**
-  - `flush(flushStorage: true)`: force pending data to disk; if `flushStorage: true`, the system is also asked to flush lower-level storage buffers
+  - `flush(mode: FlushMode.fullPowerSafe)`: force pending writes to storage. Modes: `recovery` (fastest, recovery log to OS buffers; survives app crash, not power loss), `recoveryPowerSafe` (recovery log to stable storage; aims to survive power loss), `fullPowerSafe` (default; recovery log + table + index to stable storage).
   - `deleteDatabase()`: remove all physical files and metadata for the current instance; use with care
 - **Diagnostics**
   - `db.status.memory()`: inspect cache hit ratios, index-page usage, and overall heap allocation

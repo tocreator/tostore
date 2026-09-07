@@ -28,6 +28,7 @@ import 'src/model/data_store_config.dart';
 import 'src/model/db_exception.dart';
 import 'src/model/db_result.dart';
 import 'src/model/db_startup_stage.dart';
+import 'src/model/flush_mode.dart';
 import 'src/model/migration_task.dart';
 import 'src/model/query_result.dart';
 import 'src/model/result_status.dart';
@@ -50,6 +51,7 @@ export 'src/model/db_exception.dart';
 export 'src/model/db_result.dart';
 export 'src/model/db_startup_stage.dart';
 export 'src/model/expr.dart';
+export 'src/model/flush_mode.dart';
 export 'src/model/memory_info.dart';
 export 'src/model/migration_config.dart';
 export 'src/model/migration_task.dart';
@@ -1288,14 +1290,38 @@ class ToStore implements DataStoreInterface {
     return result;
   }
 
-  /// Flush pending writes to disk.
-  /// [flushStorage] When true (default), also flush underlying storage buffers.
+  /// Flush pending writes to storage.
   ///
-  /// 将待落盘的数据刷入磁盘。
-  /// [flushStorage] 为 true（默认）时，同时刷新底层存储缓冲区。
+  /// [mode] controls scope and durability (default: [FlushMode.fullPowerSafe]):
+  /// - [FlushMode.recovery]: fastest; recovery log to OS buffers only.
+  ///   Survives app interrupt / crash restart; power loss may lose data.
+  /// - [FlushMode.recoveryPowerSafe]: recovery log to stable storage.
+  ///   Aims to survive power loss so startup can recover committed data.
+  /// - [FlushMode.fullPowerSafe]: recovery log + table data + indexes to
+  ///   stable storage (includes durable sync for safe checkpoints).
+  ///
+  /// 将待落盘数据刷入存储。
+  /// [mode] 控制刷盘范围与强度（默认 [FlushMode.fullPowerSafe]）：
+  /// - [FlushMode.recovery]：最快；恢复日志仅写入 OS 缓存。
+  ///   防应用中断、崩溃重启可恢复；注意断电会丢失数据。
+  /// - [FlushMode.recoveryPowerSafe]：稍微耗时；恢复日志写入物理文件。
+  ///   防断电故障，断电后启动可恢复全部已提交数据。
+  /// - [FlushMode.fullPowerSafe]：比较耗时；恢复日志、表数据与索引
+  ///   全量写入物理文件。
+  ///
+  /// Example:
+  /// ```dart
+  /// await db.flush(); // fullPowerSafe
+  /// await db.flush(mode: FlushMode.recovery);
+  /// ```
   @override
-  Future<void> flush({bool flushStorage = true}) async {
-    await _impl.flush(flushStorage: flushStorage);
+  Future<void> flush({
+    FlushMode mode = FlushMode.fullPowerSafe,
+    @Deprecated(
+        'Use mode: FlushMode.recovery, recoveryPowerSafe, or fullPowerSafe')
+    bool? flushStorage,
+  }) async {
+    await _impl.flush(mode: mode);
   }
 
   /// Close database and clean up resources

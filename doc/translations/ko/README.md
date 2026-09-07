@@ -1472,7 +1472,7 @@ final txResult2 = await db.transaction(() async {
   - `instancePath`: 물리적 저장소 디렉터리를 정확하게 찾습니다.
   - `getVersion()` / `setVersion(version)`: 애플리케이션 수준 마이그레이션 결정을 위한 비즈니스 정의 버전 제어(엔진 버전 아님)
 - **유지관리**
-  - `flush(flushStorage: true)`: 보류 중인 데이터를 디스크에 강제로 저장합니다. `flushStorage: true`인 경우 시스템은 하위 수준 저장소 버퍼도 플러시하도록 요청받습니다.
+  - `flush(mode: FlushMode.fullPowerSafe)`: 보류 중인 쓰기를 스토리지에 강제로 반영합니다. 모드: `recovery`(가장 빠름. 복구 로그만 OS 버퍼에 기록. 앱 크래시 재시작은 복구 가능, 정전 시 데이터 손실 가능), `recoveryPowerSafe`(복구 로그를 안정 스토리지에 기록. 정전 내성 목표), `fullPowerSafe`(기본값. 복구 로그 + 테이블 데이터 + 인덱스를 안정 스토리지에 기록).
   - `deleteDatabase()`: 현재 인스턴스에 대한 모든 실제 파일과 메타데이터를 제거합니다. 조심해서 사용하세요
 - **진단**
   - `db.status.memory()`: 캐시 적중률, 인덱스 페이지 사용량 및 전체 힙 할당을 검사합니다.

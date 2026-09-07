@@ -277,6 +277,12 @@ class WalManager {
   bool _persistMetaInProgress = false;
   Completer<void>? _nextPersistMetaCompleter; // Only the latest waiting request
 
+  /// WAL partition indices with bytes written since last durable storage flush.
+  Set<int> _durableDirtyPartitions = <int>{};
+
+  /// Whether WAL main meta was written without a durable flush.
+  bool _walMetaDurableDirty = false;
+
   WalManager(this._dataStore) {
     _config = _dataStore.config;
   }
@@ -423,6 +429,7 @@ class WalManager {
     _currentPartitionDirIndex = 0;
     _currentPartitionSizeLoaded = false;
     _currentPartitionSizeApprox = 0;
+    _clearDurableDirtyState();
 
     Logger.info('WAL destroyed.');
   }
@@ -922,6 +929,7 @@ class WalManager {
     );
     _currentPartitionSizeLoaded = true;
     _currentPartitionSizeApprox = 0;
+    _clearDurableDirtyState();
     await persistMeta(flush: true);
   }
 
@@ -988,6 +996,7 @@ class WalManager {
             await _dataStore.storage.flushAll(path: path, closeHandles: true);
           } catch (_) {}
           await _dataStore.storage.deleteFile(path);
+          _markPartitionDurable(p);
         } catch (_) {}
       }
 
@@ -1157,9 +1166,12 @@ class WalManager {
             // embedded partition index over path rebuild (mapping-safe).
             final writeP =
                 rawEntries.isNotEmpty ? rawEntries.first['p'] as int? : null;
-            if (writeP != null && writeP == _current.partitionIndex) {
-              _currentPartitionSizeApprox += combined.length;
-              wroteToCurrentPartition = true;
+            if (writeP != null) {
+              _durableDirtyPartitions.add(writeP);
+              if (writeP == _current.partitionIndex) {
+                _currentPartitionSizeApprox += combined.length;
+                wroteToCurrentPartition = true;
+              }
             }
           } catch (e) {
             Logger.error('WAL append batch failed', rawError: e);
@@ -1220,6 +1232,56 @@ class WalManager {
     } finally {
       _clearImmediateFlushRequest();
     }
+  }
+
+  /// Flush existing WAL partition logs and main meta to stable storage.
+  ///
+  /// Intended for power-safe recovery durability after [flushQueueCompletely].
+  /// Only flushes partitions/meta that received writes since the last durable
+  /// sync (hot-path safe; skips already-durable files).
+  Future<void> flushRecoveryArtifactsToStorage() async {
+    if (!_config.enableJournal) return;
+    if (_durableDirtyPartitions.isEmpty && !_walMetaDurableDirty) return;
+
+    // Claim (= remove from dirty) before await: swap out the set so success
+    // needs no post-flush remove, and concurrent appends re-mark on a fresh set.
+    final dirtyPartitions = _durableDirtyPartitions;
+    _durableDirtyPartitions = <int>{};
+    final flushMeta = _walMetaDurableDirty;
+    _walMetaDurableDirty = false;
+
+    final space = _dataStore.currentSpaceName;
+    final paths = <String>[];
+    for (final p in dirtyPartitions) {
+      if (p < 0) continue;
+      final dirIndex =
+          getPartitionDirIndex(p) ?? p ~/ _dataStore.maxEntriesPerDir;
+      paths.add(_dataStore.pathManager.getWalPartitionLogPath(
+        dirIndex,
+        p,
+        spaceName: space,
+      ));
+    }
+    if (flushMeta) {
+      paths.add(_dataStore.pathManager.getWalMainMetaPath(spaceName: space));
+    }
+    if (paths.isEmpty) return;
+
+    try {
+      await _dataStore.storage.flushAll(paths: paths, closeHandles: false);
+    } catch (_) {
+      _durableDirtyPartitions.addAll(dirtyPartitions);
+      if (flushMeta) _walMetaDurableDirty = true;
+    }
+  }
+
+  void _clearDurableDirtyState() {
+    _durableDirtyPartitions.clear();
+    _walMetaDurableDirty = false;
+  }
+
+  void _markPartitionDurable(int partitionIndex) {
+    _durableDirtyPartitions.remove(partitionIndex);
   }
 
   /// Lazily initialize the approximate size for the current WAL partition
@@ -1447,6 +1509,7 @@ class WalManager {
     // Close handle for the old (rotated out) partition to avoid leaking pooled handle
     try {
       await _dataStore.storage.flushAll(path: path, closeHandles: true);
+      _markPartitionDurable(pIdx);
     } catch (_) {}
   }
 
@@ -1533,6 +1596,8 @@ class WalManager {
           encryptionConfig: _dataStore.config.encryptionConfig,
         );
         await _dataStore.storage.writeAsBytes(metaPath, bytes, flush: flush);
+        // Durable flag tracks whether meta still needs a storage-level flush.
+        _walMetaDurableDirty = !flush;
       } catch (e) {
         // Log the full error with stack trace for debugging
         Logger.error('Failed to persist WAL meta', rawError: e);

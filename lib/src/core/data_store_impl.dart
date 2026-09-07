@@ -24,6 +24,7 @@ import '../model/db_exception.dart';
 import '../model/db_result.dart';
 import '../model/db_startup_stage.dart';
 import '../model/expr.dart';
+import '../model/flush_mode.dart';
 import '../model/foreign_key_operation.dart';
 import '../model/global_config.dart';
 import '../model/id_generator.dart';
@@ -1090,29 +1091,49 @@ class DataStoreImpl {
     }
   }
 
-  Future<void> flush({bool flushStorage = true}) async {
+  Future<void> flush({
+    FlushMode mode = FlushMode.fullPowerSafe,
+    bool? flushStorage,
+  }) async {
     if (!_isInitialized) {
       await ensureInitialized();
     }
-    await _flushPendingWrites(flushStorage: flushStorage);
+    await _flushPendingWrites(mode: mode);
   }
 
-  /// Drain write buffer + WAL queue (+ optional storage fsync).
+  /// Drain pending writes according to [mode].
   ///
   /// Unlike [flush], this does not call [ensureInitialized], so it is safe
   /// during bootstrap while [_isInitialized] is still false.
-  Future<void> _flushPendingWrites({bool flushStorage = true}) async {
+  Future<void> _flushPendingWrites({
+    FlushMode mode = FlushMode.fullPowerSafe,
+  }) async {
     await TransactionContext.runAsSystemOperation(() async {
-      try {
-        await parallelJournalManager.flushCompletely();
-      } catch (_) {}
-      try {
-        await walManager.flushQueueCompletely();
-      } catch (_) {}
-      if (flushStorage) {
-        try {
-          await storage.flushAll();
-        } catch (_) {}
+      switch (mode) {
+        case FlushMode.recovery:
+          try {
+            await walManager.flushQueueCompletely();
+          } catch (_) {}
+          break;
+        case FlushMode.recoveryPowerSafe:
+          try {
+            await walManager.flushQueueCompletely();
+          } catch (_) {}
+          try {
+            await walManager.flushRecoveryArtifactsToStorage();
+          } catch (_) {}
+          break;
+        case FlushMode.fullPowerSafe:
+          try {
+            await walManager.flushQueueCompletely();
+          } catch (_) {}
+          try {
+            await parallelJournalManager.flushCompletely();
+          } catch (_) {}
+          try {
+            await storage.flushAll();
+          } catch (_) {}
+          break;
       }
     });
   }

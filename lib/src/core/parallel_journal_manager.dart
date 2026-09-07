@@ -2938,22 +2938,7 @@ class ParallelJournalManager {
   Future<void> _flushRecoveryArtifactsIfNeeded() async {
     if (!_dataStore.config.persistRecoveryOnCommit) return;
     try {
-      final walIdx = _walManager.currentPointer.partitionIndex;
-      final walDirIndex = _walManager.getPartitionDirIndex(walIdx);
-      final walPath = walDirIndex != null
-          ? _dataStore.pathManager.getWalPartitionLogPath(walDirIndex, walIdx,
-              spaceName: _dataStore.currentSpaceName)
-          : _dataStore.pathManager.getWalPartitionLogPath(
-              walIdx ~/ _dataStore.maxEntriesPerDir, walIdx,
-              spaceName: _dataStore.currentSpaceName);
-      final walMetaPath = _dataStore.pathManager
-          .getWalMainMetaPath(spaceName: _dataStore.currentSpaceName);
-      try {
-        await _dataStore.storage.flushAll(path: walPath);
-      } catch (_) {}
-      try {
-        await _dataStore.storage.flushAll(path: walMetaPath);
-      } catch (_) {}
+      await _walManager.flushRecoveryArtifactsToStorage();
     } catch (_) {}
   }
 }

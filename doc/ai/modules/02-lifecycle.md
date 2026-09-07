@@ -81,9 +81,17 @@ static Future<ToStore> memory({
 | `instancePath` | `String?` | Final storage directory |
 | `getVersion()` | `Future<int>` | User-defined only |
 | `setVersion(int)` | `Future<void>` | User-defined only |
-| `flush({bool flushStorage = true})` | `Future<void>` | Persist pending writes |
+| `flush({FlushMode mode = FlushMode.fullPowerSafe})` | `Future<void>` | Persist pending writes |
 | `close({bool keepActiveSpace = true})` | `Future<void>` | Releases instance from pool; `keepActiveSpace: false` clears active space (e.g. logout) |
 | `deleteDatabase({dbPath, dbName})` | `Future<void>` | Deletes DB files; removes instance from pool |
+
+## FlushMode
+
+| Mode | Behavior |
+| :--- | :--- |
+| `recovery` | Fastest. Recovery log → OS buffers. Survives app crash; power loss may lose data. |
+| `recoveryPowerSafe` | Recovery log → stable storage. Aims to survive power loss. |
+| `fullPowerSafe` | Default. Recovery log + table + index → stable storage (checkpoint-safe durable sync). |
 
 ## Startup progress
 

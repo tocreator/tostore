@@ -1471,7 +1471,7 @@ Le seguenti API coprono l'amministrazione del database, la diagnostica e la manu
   - `instancePath`: individua con precisione la directory di archiviazione fisica
   - `getVersion()` / `setVersion(version)`: controllo della versione definito dal business per le decisioni di migrazione a livello di applicazione (non la versione del motore)
 - **Manutenzione**
-  - `flush(flushStorage: true)`: forza i dati in sospeso su disco; se `flushStorage: true`, al sistema viene richiesto anche di svuotare i buffer di archiviazione di livello inferiore
+  - `flush(mode: FlushMode.fullPowerSafe)`: forza la scrittura dei dati in sospeso sullo storage. Modalità: `recovery` (più veloce; log di ripristino solo nei buffer OS; sopravvive a crash dell'app, non a interruzioni di corrente), `recoveryPowerSafe` (log di ripristino su storage stabile; mira a sopravvivere alle interruzioni di corrente), `fullPowerSafe` (predefinito; log di ripristino + dati tabella e indici su storage stabile).
   - `deleteDatabase()`: rimuove tutti i file fisici e i metadati per l'istanza corrente; utilizzare con cura
 - **Diagnostica**
   - `db.status.memory()`: controlla i rapporti di riscontro della cache, l'utilizzo della pagina indice e l'allocazione complessiva dell'heap

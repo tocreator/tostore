@@ -8,6 +8,7 @@ import '../model/backup_scope.dart';
 import '../model/data_store_config.dart';
 import '../model/db_result.dart';
 import '../model/db_startup_stage.dart';
+import '../model/flush_mode.dart';
 import '../model/migration_task.dart';
 import '../model/query_result.dart';
 import '../model/space_info.dart';
@@ -142,8 +143,22 @@ abstract class DataStoreInterface {
     required String newKey,
   });
 
-  /// flush data
-  Future<void> flush({bool flushStorage = true});
+  /// Flush pending writes to storage.
+  ///
+  /// [mode] controls scope and durability (default: [FlushMode.fullPowerSafe]):
+  /// - [FlushMode.recovery]: fastest; recovery log to OS buffers only.
+  ///   Survives app interrupt / crash restart; power loss may lose data.
+  /// - [FlushMode.recoveryPowerSafe]: recovery log to stable storage.
+  ///   Aims to survive power loss so startup can recover committed data.
+  /// - [FlushMode.fullPowerSafe]: recovery log + table data + indexes to
+  ///   stable storage (includes durable sync for safe checkpoints).
+  ///
+  Future<void> flush({
+    FlushMode mode = FlushMode.fullPowerSafe,
+    @Deprecated(
+        'Use mode: FlushMode.recovery, recoveryPowerSafe, or fullPowerSafe')
+    bool? flushStorage,
+  });
 
   /// close data store engine
   /// [keepActiveSpace] when false, clears active space so next launch uses default (e.g. logout). Default true.

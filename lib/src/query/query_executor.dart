@@ -4282,7 +4282,7 @@ class QueryExecutor {
     List<FieldStructure>? decodeFieldStructureOverride,
   }) async {
     // 1. Force flush to ensure storage files are fully up-to-date
-    await _dataStore.flush(flushStorage: true);
+    await _dataStore.flush();
 
     // 2. Resolve Table Schema
     final schemaMgr = _dataStore.tableMetaManager;

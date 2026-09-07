@@ -1499,7 +1499,7 @@ final txResult2 = await db.transaction(() async {
   - `instancePath`：准确定位数据存储目录。
   - `getVersion()` / `setVersion(version)`：业务自定义版本控制。用于记录应用自身的数据库版本号（非引擎版本），方便业务进行手动逻辑迁移判定。
 - **底线性维护 (Maintenance)**
-  - `flush(flushStorage: true)`：强制数据落盘。调用此方法可立即将内存暂存的变动持久化。若 `flushStorage: true`，还会请求系统同步文件底层缓冲区。
+  - `flush(mode: FlushMode.fullPowerSafe)`：强制待写数据落盘。模式：`recovery`（最快，恢复日志仅写 OS 缓存，防应用中断、崩溃重启，断电可能丢数据）、`recoveryPowerSafe`（恢复日志写物理文件，防断电）、`fullPowerSafe`（默认；恢复日志 + 表数据 + 索引全量写物理文件）。
   - `deleteDatabase()`：全量清除。抹除当前实例的所有物理文件及其元数据，慎用。
 - **一站式诊断 (Diagnostics)**
   - `db.status.memory()`：内存快照诊断。查看读写缓存命中率、索引页占用及整体堆内存分配。

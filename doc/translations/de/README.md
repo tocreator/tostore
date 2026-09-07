@@ -1471,7 +1471,7 @@ Die folgenden APIs decken die Datenbankverwaltung, Diagnose und Wartung für die
   - `instancePath`: Lokalisieren Sie das physische Speicherverzeichnis genau
   - `getVersion()` / `setVersion(version)`: geschäftsdefinierte Versionskontrolle für Migrationsentscheidungen auf Anwendungsebene (nicht die Engine-Version)
 - **Wartung**
-  - `flush(flushStorage: true)`: Ausstehende Daten auf die Festplatte erzwingen; Wenn `flushStorage: true`, wird das System auch aufgefordert, Speicherpuffer auf niedrigerer Ebene zu leeren
+  - `flush(mode: FlushMode.fullPowerSafe)`: erzwingt das Schreiben ausstehender Daten in den Speicher. Modi: `recovery` (schnellste; Wiederherstellungsprotokoll nur in OS-Puffer; übersteht App-Absturz, nicht Stromausfall), `recoveryPowerSafe` (Wiederherstellungsprotokoll auf stabilen Speicher; zielt auf Überstehen von Stromausfällen), `fullPowerSafe` (Standard; Wiederherstellungsprotokoll + Tabellen- und Indexdaten auf stabilen Speicher).
   - `deleteDatabase()`: alle physischen Dateien und Metadaten für die aktuelle Instanz entfernen; mit Vorsicht verwenden
 - **Diagnose**
   - `db.status.memory()`: Überprüfen Sie die Cache-Trefferquoten, die Indexseitennutzung und die gesamte Heap-Zuordnung

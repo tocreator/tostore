@@ -85,7 +85,7 @@ import 'package:tostore/tostore.dart';
 | `restore(String, {deleteAfterRestore, cleanupBeforeRestore})` | `Future<bool>` |
 | `transaction<T>(action, {rollbackOnError, persistRecoveryOnCommit, isolation})` | `Future<TransactionResult>` |
 | `rotateEncryptionKey({oldKey, required newKey})` | `Future<DbResult>` |
-| `flush({flushStorage})` | `Future<void>` |
+| `flush({mode})` | `Future<void>` | `FlushMode`: `recovery`, `recoveryPowerSafe`, `fullPowerSafe` (default) |
 | `close({keepActiveSpace})` | `Future<void>` |
 | `deleteDatabase({dbPath, dbName})` | `Future<void>` |
 | `getVersion()` / `setVersion(int)` | version bookkeeping |

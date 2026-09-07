@@ -209,9 +209,17 @@ static Future<ToStore> memory({
 | `instancePath` | `String?` | Final storage directory |
 | `getVersion()` | `Future<int>` | User-defined only |
 | `setVersion(int)` | `Future<void>` | User-defined only |
-| `flush({bool flushStorage = true})` | `Future<void>` | Persist pending writes |
+| `flush({FlushMode mode = FlushMode.fullPowerSafe})` | `Future<void>` | Persist pending writes |
 | `close({bool keepActiveSpace = true})` | `Future<void>` | Releases instance from pool; `keepActiveSpace: false` clears active space (e.g. logout) |
 | `deleteDatabase({dbPath, dbName})` | `Future<void>` | Deletes DB files; removes instance from pool |
+
+## FlushMode
+
+| Mode | Behavior |
+| :--- | :--- |
+| `recovery` | Fastest. Recovery log → OS buffers. Survives app crash; power loss may lose data. |
+| `recoveryPowerSafe` | Recovery log → stable storage. Aims to survive power loss. |
+| `fullPowerSafe` | Default. Recovery log + table + index → stable storage (checkpoint-safe durable sync). |
 
 ## Startup progress
 
@@ -1471,7 +1479,7 @@ status: complete
 | Tables | `createTable`, `getTableSchema`, `getTableNames`, `getTableInfo`, `clear`, `dropTable` |
 | Spaces | `currentSpaceName`, `listSpaces`, `getSpaceInfo`, `deleteSpace` |
 | Instance | `config`, `instancePath`, `getVersion`/`setVersion` (app bookkeeping only) |
-| Maintenance | `flush({flushStorage = true})`, `deleteDatabase({dbPath, dbName})` |
+| Maintenance | `flush({mode = FlushMode.fullPowerSafe})`, `deleteDatabase({dbPath, dbName})` |
 
 ## Backup & restore
 
@@ -1919,7 +1927,7 @@ import 'package:tostore/tostore.dart';
 | `restore(String, {deleteAfterRestore, cleanupBeforeRestore})` | `Future<bool>` |
 | `transaction<T>(action, {rollbackOnError, persistRecoveryOnCommit, isolation})` | `Future<TransactionResult>` |
 | `rotateEncryptionKey({oldKey, required newKey})` | `Future<DbResult>` |
-| `flush({flushStorage})` | `Future<void>` |
+| `flush({mode})` | `Future<void>` | `FlushMode`: `recovery`, `recoveryPowerSafe`, `fullPowerSafe` (default) |
 | `close({keepActiveSpace})` | `Future<void>` |
 | `deleteDatabase({dbPath, dbName})` | `Future<void>` |
 | `getVersion()` / `setVersion(int)` | version bookkeeping |

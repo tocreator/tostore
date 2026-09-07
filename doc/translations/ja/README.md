@@ -1472,7 +1472,7 @@ final txResult2 = await db.transaction(() async {
   - `instancePath`: 物理ストレージ ディレクトリを正確に特定します
   - `getVersion()` / `setVersion(version)`: アプリケーション レベルの移行決定のためのビジネス定義のバージョン管理 (エンジンのバージョンではありません)
 - **メンテナンス**
-  - `flush(flushStorage: true)`: 保留中のデータを強制的にディスクにコピーします。 `flushStorage: true` の場合、システムは下位レベルのストレージ バッファもフラッシュするように求められます
+  - `flush(mode: FlushMode.fullPowerSafe)`: 保留中の書き込みをストレージへ強制反映します。モード: `recovery`（最速。復旧ログのみ OS バッファへ。アプリクラッシュ再開は復旧可能、停電ではデータ損失の可能性）、`recoveryPowerSafe`（復旧ログを物理ストレージへ。停電耐性を想定）、`fullPowerSafe`（デフォルト。復旧ログ + テーブルデータ + インデックスを物理ストレージへ）。
   - `deleteDatabase()`: 現在のインスタンスのすべての物理ファイルとメタデータを削除します。慎重に使用してください
 - **診断**
   - `db.status.memory()`: キャッシュ ヒット率、インデックス ページの使用状況、および全体的なヒープ割り当てを検査します。

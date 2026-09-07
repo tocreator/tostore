@@ -4,8 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## 3.5.2
 
+### Added
+- Added `FlushMode` (`recovery`, `recoveryPowerSafe`, `fullPowerSafe`) for `db.flush(mode: ...)`.
+
 ### Changed
 - Optimized first startup duration.
+- `db.flush()` now defaults to `FlushMode.fullPowerSafe`. Deprecated `flushStorage`; use `mode` instead.
 
 ### Fixed
 - Fixed child-table foreign key cascade during batch insert incorrectly treating newly inserted parent rows as missing.
