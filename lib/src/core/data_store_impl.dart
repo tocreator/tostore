@@ -4123,8 +4123,6 @@ class DataStoreImpl {
       }, zoneValues: {
         _txnZoneKey: txId,
         _txnRollbackOnErrorKey: rollbackOnError,
-        // track touched paths during this transaction
-        TransactionContext.touchedPathsKey: <String>{},
         TransactionContext.currentTxIdKey: txId,
         TransactionContext.isolationLevelKey: effectiveIsolation,
         TransactionContext.acquiredExclusiveLocksKey: <String, String>{},

@@ -3,12 +3,9 @@ import '../model/change_event.dart';
 import '../model/data_store_config.dart';
 import '../model/table_identity.dart';
 
-/// Lightweight transaction-scoped context for tracking touched file paths
-/// without introducing circular dependencies. Values are stored in Zone.
+/// Lightweight transaction-scoped context without circular dependencies.
+/// Values are stored in Zone.
 class TransactionContext {
-  /// Zone key to store a `Set<String>` of touched file paths in current transaction
-  static const Symbol touchedPathsKey = #to_touched_paths;
-
   /// Zone key for current transaction id
   static const Symbol currentTxIdKey = #to_current_tx_id;
 
@@ -27,19 +24,6 @@ class TransactionContext {
   /// Zone key for deferred [ChangeEvent]s flushed after successful commit.
   /// External watchers must not observe uncommitted buffer writes.
   static const Symbol pendingChangeEventsKey = #to_pending_change_events;
-
-  /// Register a file path as touched in current transaction scope (if any)
-  static void registerTouchedPath(String path) {
-    final set = Zone.current[touchedPathsKey] as Set<String>?;
-    if (set == null) return;
-    set.add(path);
-  }
-
-  /// Get a snapshot of touched paths in the current transaction scope
-  static Set<String> getTouchedPaths() {
-    final set = Zone.current[touchedPathsKey] as Set<String>?;
-    return set ?? const <String>{};
-  }
 
   /// Get current transaction id from Zone if any
   static String? getCurrentTransactionId() {

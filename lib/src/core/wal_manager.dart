@@ -310,10 +310,34 @@ class WalManager {
     return size;
   }
 
+  /// Encode WAL entries on the calling isolate (no ComputeManager / isolate).
+  List<Uint8List> _encodeWalEntriesInline(
+    List<Map<String, dynamic>> entries,
+  ) {
+    final encodedChunks = List<Uint8List>.filled(
+      entries.length,
+      Uint8List(0),
+      growable: false,
+    );
+    for (int i = 0; i < entries.length; i++) {
+      encodedChunks[i] = WalEncoder.encodeAsLine(entries[i]);
+    }
+    return encodedChunks;
+  }
+
   Future<List<Uint8List>> _encodeWalEntriesBatch(
     List<Map<String, dynamic>> entries,
   ) async {
     if (entries.isEmpty) return const <Uint8List>[];
+
+    // Hot path: small batches and encryption-none stay on this isolate.
+    // Avoids ComputeManager scheduling / isolate spawn which dominates
+    // single-op and small-txn durability latency.
+    final encryptionType = EncryptionManager.getEncryptionType();
+    if (encryptionType == EncryptionType.none ||
+        entries.length < ComputeBatchPlanner.minUsefulTaskItems) {
+      return _encodeWalEntriesInline(entries);
+    }
 
     final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
       itemCount: entries.length,
@@ -325,6 +349,10 @@ class WalManager {
     );
     final useIsolate = dispatchPlan.useIsolate;
     final actualTaskCount = dispatchPlan.actualTaskCount;
+    if (!useIsolate && actualTaskCount <= 1) {
+      return _encodeWalEntriesInline(entries);
+    }
+
     final encoderConfig = EncryptionManager.getCurrentEncodingState();
 
     final tasks = <ComputeTask<BatchWalEncodeRequest, BatchWalEncodeResult>>[];
@@ -1072,17 +1100,30 @@ class WalManager {
 
   /// Flush WAL write queue to files in batches.
   ///
-  /// - Normal mode (drainCompletely=false): used for online WAL persistence,
-  ///   will stop when queue length drops below a small threshold after the
-  ///   first iteration to avoid tiny batches.
-  /// - Drain mode (drainCompletely=true): used for shutdown/strong durability,
-  ///   will continue until the queue is fully drained.
-  Future<void> _pumpWalFlush({bool drainCompletely = false}) async {
+  /// - Normal mode (drainCompletely=false, until=null): used for online WAL
+  ///   persistence; may stop after a small tail with a policy-based delay.
+  /// - Drain mode (drainCompletely=true): shutdown / strong full drain.
+  /// - Prefix mode ([until] set): stop once [_appended] covers [until], leaving
+  ///   newer queued entries for the background pump. No online tail delay.
+  Future<void> _pumpWalFlush({
+    bool drainCompletely = false,
+    WalPointer? until,
+  }) async {
     if (!_config.enableJournal) return;
     if (_walQueue.isEmpty) return;
-    // If a flush is already running, let that one handle the queue.
-    if (_walFlushInProgress) return;
+    // Another pump owns the queue: wait for it instead of no-op spinning.
+    if (_walFlushInProgress) {
+      final existing = _walFlushFuture;
+      if (existing != null) {
+        try {
+          await existing;
+        } catch (_) {}
+      }
+      return;
+    }
     _walFlushInProgress = true;
+    final run = Completer<void>();
+    _walFlushFuture = run.future;
     try {
       if (!_currentPartitionSizeLoaded) {
         await _ensureCurrentPartitionSizeLoaded();
@@ -1091,9 +1132,17 @@ class WalManager {
       final int batchSize = _config.logWriteBatchSize;
       const int minTail = 100;
       bool firstIteration = true;
+      final bool prefixMode = until != null;
 
       while (_walQueue.isNotEmpty) {
-        if (!firstIteration && !drainCompletely && !_immediateFlushRequested) {
+        if (prefixMode && !_isPointerNewerThan(until, _appended)) {
+          break;
+        }
+
+        if (!firstIteration &&
+            !drainCompletely &&
+            !prefixMode &&
+            !_immediateFlushRequested) {
           final int remaining = _walQueue.length;
           if (remaining < minTail) {
             // For small tails, wait a short delay based on recoveryFlushPolicy
@@ -1119,8 +1168,12 @@ class WalManager {
 
         firstIteration = false;
         if (_walQueue.isEmpty) break;
+        if (prefixMode && !_isPointerNewerThan(until, _appended)) {
+          break;
+        }
 
         // Take up to batchSize entries from the head of the queue for this batch.
+        // In prefix mode, stop taking once we have included [until].
         final int take =
             batchSize < _walQueue.length ? batchSize : _walQueue.length;
         if (take <= 0) break;
@@ -1129,11 +1182,16 @@ class WalManager {
         // entries from the queue as we go to avoid holding the entire queue.
         final Map<String, List<Map<String, dynamic>>> byPath = {};
         WalPointer lastAppended = _appended;
-        for (int i = 0; i < take && _walQueue.isNotEmpty; i++) {
+        int taken = 0;
+        while (taken < take && _walQueue.isNotEmpty) {
           final _QueuedWalEntry e = _walQueue.removeFirst();
           final list = byPath.putIfAbsent(e.path, () => []);
           list.add(e.rawEntry);
           lastAppended = e.pointer;
+          taken++;
+          if (prefixMode && !_isPointerNewerThan(until, e.pointer)) {
+            break;
+          }
         }
 
         final yieldController = YieldController('WalManager._pumpWalFlush');
@@ -1194,7 +1252,12 @@ class WalManager {
       }
     } finally {
       _walFlushInProgress = false;
-      _walFlushFuture = null;
+      if (!run.isCompleted) {
+        run.complete();
+      }
+      if (identical(_walFlushFuture, run.future)) {
+        _walFlushFuture = null;
+      }
     }
   }
 
@@ -1231,6 +1294,48 @@ class WalManager {
       await _pumpWalFlush(drainCompletely: true);
     } finally {
       _clearImmediateFlushRequest();
+    }
+  }
+
+  /// Lightweight durability: write queued WAL entries through [target] into OS
+  /// file buffers, without draining newer entries or waiting online tail delay.
+  ///
+  /// Prefer this over [flushQueueCompletely] on commit / single-op return paths.
+  /// When [flushToStorage] is true, also durable-sync dirty WAL partitions/meta
+  /// (power-safer; more expensive).
+  Future<void> ensureAppendedUpTo(
+    WalPointer target, {
+    bool flushToStorage = false,
+  }) async {
+    if (!_config.enableJournal) return;
+    if (target.partitionIndex < 0) return;
+
+    try {
+      // Prefix-drain until [target] is in OS buffers. Loop covers races where an
+      // online pump is in-flight or starts between awaits.
+      while (_isPointerNewerThan(target, _appended)) {
+        _requestImmediateFlush();
+        final existing = _walFlushFuture;
+        if (existing != null) {
+          try {
+            await existing;
+          } catch (_) {}
+          continue;
+        }
+        if (_walQueue.isEmpty) break;
+        // Do not overwrite [_walFlushFuture]; scheduleFlushIfNeeded owns it.
+        await _pumpWalFlush(until: target);
+      }
+    } finally {
+      _clearImmediateFlushRequest();
+    }
+
+    if (flushToStorage) {
+      await flushRecoveryArtifactsToStorage();
+    }
+    // Newer entries may remain; keep the background pump alive.
+    if (_walQueue.isNotEmpty) {
+      scheduleFlushIfNeeded();
     }
   }
 

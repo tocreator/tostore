@@ -1,4 +1,4 @@
-import 'dart:async';
+﻿import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:path/path.dart' as path;
@@ -15,7 +15,6 @@ import '../model/result_status.dart';
 import '../model/result_type.dart';
 import 'lock_manager.dart';
 import 'path_manager.dart';
-import 'transaction_context.dart';
 // Import platform-specific implementations with conditional imports
 import 'web_storage_impl.dart'
     if (dart.library.io) '../interface/web_storage_impl_stub.dart';
@@ -186,7 +185,7 @@ class StorageAdapter implements StorageInterface {
   /// Enter the temp-staging critical section.
   ///
   /// Must not leave a window where reset sees count==0 after the gate passed:
-  /// wait → begin is retried if reset started in between (single-isolate safe
+  /// wait -> begin is retried if reset started in between (single-isolate safe
   /// once begin and the re-check are synchronous).
   Future<void> _enterTempWrite() async {
     while (true) {
@@ -382,7 +381,6 @@ class StorageAdapter implements StorageInterface {
                   resource);
             }
             await _storage.replaceFileAtomic(tempPath, path);
-            TransactionContext.registerTouchedPath(path);
           } finally {
             if (replaceAcquired) {
               _lockManager.releaseExclusiveLock(resource, replaceOpId);
@@ -412,7 +410,6 @@ class StorageAdapter implements StorageInterface {
             append: append,
             flush: flush,
             closeHandleAfterFlush: closeHandleAfterFlush);
-        TransactionContext.registerTouchedPath(path);
       } finally {
         if (acquired) {
           _lockManager.releaseExclusiveLock(resource, opId);
@@ -462,7 +459,6 @@ class StorageAdapter implements StorageInterface {
                   resource);
             }
             await _storage.replaceFileAtomic(tempPath, path);
-            TransactionContext.registerTouchedPath(path);
           } finally {
             if (replaceAcquired) {
               _lockManager.releaseExclusiveLock(resource, replaceOpId);
@@ -489,7 +485,6 @@ class StorageAdapter implements StorageInterface {
 
         await _storage.writeAsBytes(path, bytes,
             flush: flush, closeHandleAfterFlush: closeHandleAfterFlush);
-        TransactionContext.registerTouchedPath(path);
       } finally {
         if (acquired) {
           _lockManager.releaseExclusiveLock(resource, opId);
@@ -722,7 +717,6 @@ class StorageAdapter implements StorageInterface {
 
       await _storage.writeAsBytesAt(path, start, bytes,
           flush: flush, closeHandleAfterFlush: closeHandleAfterFlush);
-      TransactionContext.registerTouchedPath(path);
     } finally {
       if (resourceAcquired) {
         _lockManager.releaseExclusiveLock(resource, '$opId-path');
@@ -764,7 +758,6 @@ class StorageAdapter implements StorageInterface {
 
       await _storage.writeManyAsBytesAt(path, writes,
           flush: flush, closeHandleAfterFlush: closeHandleAfterFlush);
-      TransactionContext.registerTouchedPath(path);
     } finally {
       if (resourceAcquired) {
         _lockManager.releaseExclusiveLock(resource, '$opId-path');
@@ -1094,7 +1087,6 @@ class StorageAdapter implements StorageInterface {
       }
       final off = await _storage.appendBytes(path, bytes,
           flush: flush, closeHandleAfterFlush: closeHandleAfterFlush);
-      TransactionContext.registerTouchedPath(path);
       return off;
     } finally {
       if (acquired) {
@@ -1119,7 +1111,6 @@ class StorageAdapter implements StorageInterface {
       }
       final off = await _storage.appendString(path, content,
           flush: flush, closeHandleAfterFlush: closeHandleAfterFlush);
-      TransactionContext.registerTouchedPath(path);
       return off;
     } finally {
       if (acquired) {
@@ -1209,8 +1200,6 @@ class StorageAdapter implements StorageInterface {
               resource);
         }
         await _storage.replaceFileAtomic(tempPath, finalPath);
-        // Register final path as touched for current transaction scope (if any)
-        TransactionContext.registerTouchedPath(finalPath);
       } finally {
         if (acquired) {
           _lockManager.releaseExclusiveLock(resource, opId);

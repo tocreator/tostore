@@ -13,7 +13,6 @@ import '../model/transaction_models.dart';
 import 'crontab_manager.dart';
 import 'data_store_impl.dart';
 // common utilities may be used by callers; keep imports minimal here
-import 'transaction_context.dart';
 import 'tree_cache.dart';
 import 'yield_controller.dart';
 
@@ -318,53 +317,18 @@ class TransactionManager {
       pIndex,
     );
 
-    // Determine whether to persist recovery artifacts (WAL/log/meta/journal)
+    // Determine whether to persist recovery artifacts (WAL/log/meta)
     final bool shouldPersistRecovery =
         persistRecovery ?? _config.persistRecoveryOnCommit;
     try {
       if (shouldPersistRecovery) {
-        // Collect recovery files touched by this transaction (multi-WAL-partition aware)
-        final touched = TransactionContext.getTouchedPaths();
-        final walRoot = _dataStore.pathManager
-            .getWalRootPath(spaceName: _dataStore.currentSpaceName);
-        final journalRoot = _dataStore.pathManager
-            .getParallelJournalRootPath(spaceName: _dataStore.currentSpaceName);
-        final walMetaPath = _dataStore.pathManager
-            .getWalMainMetaPath(spaceName: _dataStore.currentSpaceName);
-
-        final walPaths = <String>{};
-        final journalPaths = <String>{};
-        for (final p in touched) {
-          if (p.startsWith(walRoot) && p.endsWith('.log')) {
-            walPaths.add(p);
-          } else if (p.startsWith(journalRoot) && p.endsWith('.log')) {
-            journalPaths.add(p);
-          }
-        }
-        // Fallback to current WAL partition if nothing was captured.
-        // WAL append goes through WalManager's queue and may not register paths
-        // in TransactionContext (common for schema-only / migration commits).
-        if (walPaths.isEmpty && _dataStore.config.enableJournal) {
-          final walIdx = _dataStore.walManager.currentPointer.partitionIndex;
-          final walDirIndex =
-              _dataStore.walManager.getPartitionDirIndex(walIdx) ??
-                  walIdx ~/ _dataStore.maxEntriesPerDir;
-          walPaths.add(_dataStore.pathManager.getWalPartitionLogPath(
-              walDirIndex, walIdx,
-              spaceName: _dataStore.currentSpaceName));
-        }
-
-        // Flush wal/journal; keep handles open to avoid frequent reopen.
-        if (walPaths.isNotEmpty) {
-          await _dataStore.storage
-              .flushAll(paths: walPaths.toList(), closeHandles: false);
-        }
-        if (journalPaths.isNotEmpty) {
-          await _dataStore.storage
-              .flushAll(paths: journalPaths.toList(), closeHandles: false);
-        }
-        await _dataStore.storage
-            .flushAll(path: walMetaPath, closeHandles: false);
+        // Prefix-drain WAL through current pointer, then durable-sync dirty
+        // WAL partitions/meta. Journal/table data flush is not required for
+        // commit durability (recovery replays WAL).
+        await _dataStore.walManager.ensureAppendedUpTo(
+          _dataStore.walManager.currentPointer,
+          flushToStorage: true,
+        );
       }
     } catch (e) {
       Logger.warn('Flush on commit failed', rawError: e);
