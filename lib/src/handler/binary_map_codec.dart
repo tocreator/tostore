@@ -28,13 +28,29 @@ class BinaryMapCodec {
   // MessagePack ext type for VectorData
   static const int _extTypeVector = 2;
 
+  // Pre-allocated immutable singletons for 1-byte MessagePack tokens
+  static final List<Uint8List> _posFixInt =
+      List.generate(128, (i) => Uint8List.fromList([i]), growable: false);
+  static final List<Uint8List> _negFixInt = List.generate(
+      32, (i) => Uint8List.fromList([0xE0 | (i & 0x1F)]),
+      growable: false);
+  static final Uint8List _tokenNull = Uint8List.fromList([0xC0]);
+  static final Uint8List _tokenTrue = Uint8List.fromList([0xC3]);
+  static final Uint8List _tokenFalse = Uint8List.fromList([0xC2]);
+  static final Uint8List _tokenEmptyStr = Uint8List.fromList([0xA0]);
+
   static Uint8List encodeMap(Map<String, dynamic> map) {
     final buffer = BytesBuilder(copy: false);
     final int count = map.length > maxMapSize ? maxMapSize : map.length;
 
     // map32
-    buffer.addByte(0xDF);
-    _writeU32be(buffer, count);
+    final hdr = Uint8List(5);
+    hdr[0] = 0xDF;
+    hdr[1] = (count >> 24) & 0xFF;
+    hdr[2] = (count >> 16) & 0xFF;
+    hdr[3] = (count >> 8) & 0xFF;
+    hdr[4] = count & 0xFF;
+    buffer.add(hdr);
 
     int written = 0;
     for (final e in map.entries) {
@@ -81,35 +97,43 @@ class BinaryMapCodec {
 
   static void _writeValue(BytesBuilder b, dynamic value) {
     if (value == null) {
-      b.addByte(0xC0);
+      b.add(_tokenNull);
       return;
     }
 
     if (value is bool) {
-      b.addByte(value ? 0xC3 : 0xC2);
+      b.add(value ? _tokenTrue : _tokenFalse);
       return;
     }
 
     if (value is int) {
       // Prefer smallest forms, but keep implementation simple.
       if (value >= 0 && value < 128) {
-        b.addByte(value); // positive fixint
+        b.add(_posFixInt[value]);
         return;
       }
       if (value >= -32 && value < 0) {
-        b.addByte(0xE0 | (value & 0x1F)); // negative fixint
+        b.add(_negFixInt[value + 32]);
         return;
       }
       // int32
       if (value >= -0x80000000 && value <= 0x7FFFFFFF) {
-        b.addByte(0xD2);
-        _writeI32be(b, value);
+        final out = Uint8List(5);
+        out[0] = 0xD2;
+        out[1] = (value >> 24) & 0xFF;
+        out[2] = (value >> 16) & 0xFF;
+        out[3] = (value >> 8) & 0xFF;
+        out[4] = value & 0xFF;
+        b.add(out);
         return;
       }
       // int64 (MessagePack)
       // value is int, and didn't fit in smaller types, so use int64.
-      b.addByte(0xD3);
-      _writeI64be(b, value);
+      final out = Uint8List(9);
+      out[0] = 0xD3;
+      final bd = ByteData.sublistView(out, 1, 9);
+      PlatformByteData.setInt64(bd, 0, value, Endian.big);
+      b.add(out);
       return;
     }
 
@@ -124,8 +148,11 @@ class BinaryMapCodec {
     }
 
     if (value is double) {
-      b.addByte(0xCB);
-      _writeF64be(b, value);
+      final out = Uint8List(9);
+      out[0] = 0xCB;
+      final bd = ByteData.sublistView(out, 1, 9);
+      bd.setFloat64(0, value, Endian.big);
+      b.add(out);
       return;
     }
 
@@ -140,9 +167,15 @@ class BinaryMapCodec {
     }
 
     if (value is List) {
-      final length = value.length > maxArraySize ? maxArraySize : value.length;
-      b.addByte(0xDD); // array32
-      _writeU32be(b, length);
+      final int length =
+          value.length > maxArraySize ? maxArraySize : value.length;
+      final hdr = Uint8List(5);
+      hdr[0] = 0xDD; // array32
+      hdr[1] = (length >> 24) & 0xFF;
+      hdr[2] = (length >> 16) & 0xFF;
+      hdr[3] = (length >> 8) & 0xFF;
+      hdr[4] = length & 0xFF;
+      b.add(hdr);
       for (int i = 0; i < length; i++) {
         _writeValue(b, value[i]);
       }
@@ -151,8 +184,13 @@ class BinaryMapCodec {
 
     if (value is Map) {
       final int count = value.length > maxMapSize ? maxMapSize : value.length;
-      b.addByte(0xDF); // map32
-      _writeU32be(b, count);
+      final hdr = Uint8List(5);
+      hdr[0] = 0xDF; // map32
+      hdr[1] = (count >> 24) & 0xFF;
+      hdr[2] = (count >> 16) & 0xFF;
+      hdr[3] = (count >> 8) & 0xFF;
+      hdr[4] = count & 0xFF;
+      b.add(hdr);
       int written = 0;
       for (final e in value.entries) {
         if (++written > maxMapSize) break;
@@ -163,12 +201,12 @@ class BinaryMapCodec {
     }
 
     // Unsupported
-    b.addByte(0xC0);
+    b.add(_tokenNull);
   }
 
   static void _writeString(BytesBuilder b, String s) {
     if (s.isEmpty) {
-      b.addByte(0xA0);
+      b.add(_tokenEmptyStr);
       return;
     }
 
@@ -182,53 +220,77 @@ class BinaryMapCodec {
         }
       }
       if (isAscii) {
-        b.addByte(0xA0 | len);
+        final chunk = Uint8List(1 + len);
+        chunk[0] = 0xA0 | len;
         for (int i = 0; i < len; i++) {
-          b.addByte(s.codeUnitAt(i));
+          chunk[i + 1] = s.codeUnitAt(i);
         }
+        b.add(chunk);
         return;
       }
     }
 
     final bytes = utf8.encode(s);
-    final encLen =
+    final int encLen =
         bytes.length > maxStringLength ? maxStringLength : bytes.length;
     final out = (encLen < bytes.length) ? bytes.sublist(0, encLen) : bytes;
 
     if (encLen < 32) {
-      b.addByte(0xA0 | encLen); // fixstr
+      final chunk = Uint8List(1 + encLen);
+      chunk[0] = 0xA0 | encLen; // fixstr
+      chunk.setRange(1, 1 + encLen, out);
+      b.add(chunk);
     } else {
-      b.addByte(0xDB); // str32
-      _writeU32be(b, encLen);
+      final hdr = Uint8List(5);
+      hdr[0] = 0xDB; // str32
+      hdr[1] = (encLen >> 24) & 0xFF;
+      hdr[2] = (encLen >> 16) & 0xFF;
+      hdr[3] = (encLen >> 8) & 0xFF;
+      hdr[4] = encLen & 0xFF;
+      b.add(hdr);
+      b.add(out);
     }
-    b.add(out);
   }
 
   static void _writeBinary(BytesBuilder b, Uint8List bytes) {
-    final len = bytes.length > maxBinaryLength ? maxBinaryLength : bytes.length;
+    final int len =
+        bytes.length > maxBinaryLength ? maxBinaryLength : bytes.length;
     final out = (len < bytes.length) ? bytes.sublist(0, len) : bytes;
-    b.addByte(0xC6); // bin32
-    _writeU32be(b, len);
+    final hdr = Uint8List(5);
+    hdr[0] = 0xC6; // bin32
+    hdr[1] = (len >> 24) & 0xFF;
+    hdr[2] = (len >> 16) & 0xFF;
+    hdr[3] = (len >> 8) & 0xFF;
+    hdr[4] = len & 0xFF;
+    b.add(hdr);
     b.add(out);
   }
 
   static void _writeBigIntExt(BytesBuilder b, BigInt v) {
     final payload = utf8.encode(v.toString());
-    final len = payload.length;
-    // ext32
-    b.addByte(0xC9);
-    _writeU32be(b, len);
-    b.addByte(_extTypeBigInt);
+    final int len = payload.length;
+    final hdr = Uint8List(6);
+    hdr[0] = 0xC9; // ext32
+    hdr[1] = (len >> 24) & 0xFF;
+    hdr[2] = (len >> 16) & 0xFF;
+    hdr[3] = (len >> 8) & 0xFF;
+    hdr[4] = len & 0xFF;
+    hdr[5] = _extTypeBigInt;
+    b.add(hdr);
     b.add(payload);
   }
 
   static void _writeVectorExt(BytesBuilder b, VectorData v) {
     final payload = v.toBytes();
-    final len = payload.length;
-    // ext32
-    b.addByte(0xC9);
-    _writeU32be(b, len);
-    b.addByte(_extTypeVector);
+    final int len = payload.length;
+    final hdr = Uint8List(6);
+    hdr[0] = 0xC9; // ext32
+    hdr[1] = (len >> 24) & 0xFF;
+    hdr[2] = (len >> 16) & 0xFF;
+    hdr[3] = (len >> 8) & 0xFF;
+    hdr[4] = len & 0xFF;
+    hdr[5] = _extTypeVector;
+    b.add(hdr);
     b.add(payload);
   }
 
@@ -375,35 +437,6 @@ class BinaryMapCodec {
     }
     // Unknown extension: return raw bytes.
     return payload;
-  }
-
-  // MessagePack uses big-endian for multi-byte integers and floats.
-  // Write directly into [BytesBuilder] to avoid per-value ByteData/Uint8List allocs.
-  static final Uint8List _scratch8 = Uint8List(8);
-  static final ByteData _scratch8Bd = ByteData.sublistView(_scratch8);
-
-  static void _writeU32be(BytesBuilder b, int v) {
-    b.addByte((v >> 24) & 0xFF);
-    b.addByte((v >> 16) & 0xFF);
-    b.addByte((v >> 8) & 0xFF);
-    b.addByte(v & 0xFF);
-  }
-
-  static void _writeI32be(BytesBuilder b, int v) {
-    b.addByte((v >> 24) & 0xFF);
-    b.addByte((v >> 16) & 0xFF);
-    b.addByte((v >> 8) & 0xFF);
-    b.addByte(v & 0xFF);
-  }
-
-  static void _writeI64be(BytesBuilder b, int v) {
-    PlatformByteData.setInt64(_scratch8Bd, 0, v, Endian.big);
-    b.add(_scratch8);
-  }
-
-  static void _writeF64be(BytesBuilder b, double v) {
-    _scratch8Bd.setFloat64(0, v, Endian.big);
-    b.add(_scratch8);
   }
 }
 

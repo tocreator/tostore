@@ -10,8 +10,8 @@ import '../handler/wal_meta_codec.dart';
 import '../model/data_store_config.dart';
 import '../model/meta_info.dart';
 import '../model/parallel_journal_entry.dart';
-import '../model/table_op_meta.dart';
 import '../model/table_identity.dart';
+import '../model/table_op_meta.dart';
 import '../model/wal_pointer.dart';
 import 'compute/compute_batch_planner.dart';
 import 'compute/wal_decode_batch_runner.dart';
@@ -330,15 +330,7 @@ class WalManager {
   ) async {
     if (entries.isEmpty) return const <Uint8List>[];
 
-    // Hot path: small batches and encryption-none stay on this isolate.
-    // Avoids ComputeManager scheduling / isolate spawn which dominates
-    // single-op and small-txn durability latency.
-    final encryptionType = EncryptionManager.getEncryptionType();
-    if (encryptionType == EncryptionType.none ||
-        entries.length < ComputeBatchPlanner.minUsefulTaskItems) {
-      return _encodeWalEntriesInline(entries);
-    }
-
+    // Small batches stay inline: isolate spawn/transfer dominates encode.
     final dispatchPlan = ComputeBatchPlanner.planTaskExecution(
       itemCount: entries.length,
       estimateAverageItemBytes: () =>
@@ -349,7 +341,7 @@ class WalManager {
     );
     final useIsolate = dispatchPlan.useIsolate;
     final actualTaskCount = dispatchPlan.actualTaskCount;
-    if (!useIsolate && actualTaskCount <= 1) {
+    if (!useIsolate || actualTaskCount <= 1) {
       return _encodeWalEntriesInline(entries);
     }
 
@@ -372,15 +364,22 @@ class WalManager {
     final results =
         await ComputeManager.computeBatch(tasks, enableIsolate: useIsolate);
 
-    final encodedChunks = <Uint8List>[];
+    // Preserve input order; pre-size to avoid repeated list growth on big batches.
+    final encodedChunks = List<Uint8List>.filled(
+      entries.length,
+      Uint8List(0),
+      growable: false,
+    );
+    var offset = 0;
     final mergeYield = YieldController(
       'WalManager._encodeWalEntriesBatch',
     );
     for (final result in results) {
-      for (final chunk in result.encodedChunks) {
+      final chunks = result.encodedChunks;
+      for (var i = 0; i < chunks.length; i++) {
         final y1 = mergeYield.maybeYield();
         if (y1 != null) await y1;
-        encodedChunks.add(chunk);
+        encodedChunks[offset++] = chunks[i];
       }
     }
     return encodedChunks;

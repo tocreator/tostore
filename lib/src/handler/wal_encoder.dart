@@ -1,7 +1,9 @@
 import 'dart:convert';
 import 'dart:typed_data';
-import 'encryption.dart';
+
+import '../model/data_store_config.dart';
 import 'binary_map_codec.dart';
+import 'encryption.dart';
 
 /// High-performance binary encoder for WAL entries
 /// Uses MessagePack-style binary serialization + EncoderHandler encryption
@@ -30,38 +32,19 @@ class WalEncoder {
   ///
   /// Magic: 0x546F574C ("ToWL")
   /// Version: 0x01
-  /// DataLen: Uint32 little-endian (length of serialized data)
+  /// DataLen: Uint32 little-endian (length of serialized / encrypted payload)
   /// Data: MessagePack binary data (will be encrypted by EncoderHandler if enabled)
   ///
   /// [partitionIndex] - WAL partition index for AAD (prevents cross-partition tampering)
+  ///
+  /// Wire layout is unchanged vs historical writers — only allocation/copy paths
+  /// are tightened (especially [EncryptionType.none]).
   static Uint8List encode(Map<String, dynamic> walEntry, int partitionIndex) {
-    // Step 1: Serialize to MessagePack binary
-    final serialized = BinaryMapCodec.encodeMap(walEntry);
-
-    // Step 2: Build AAD from partition index (if available)
-    // Note: We cannot use entry sequence because it's inside the encrypted data
-    Uint8List? aad;
-
-    // AAD format: [partition:4B]
-    final aadData = ByteData(4);
-    aadData.setInt32(0, partitionIndex, Endian.little);
-    aad = aadData.buffer.asUint8List();
-
-    // Step 3: Encrypt binary directly using EncoderHandler.encodeBytes
-    // No string conversion! Direct binary encryption with partition-based AAD
-    final encrypted = EncryptionManager.encodeBytes(serialized, aad: aad);
-
-    // Step 4: Build WAL binary format with header
-    final header = ByteData(9);
-    header.setUint32(0, _walMagic, Endian.little); // Magic
-    header.setUint8(4, _walVersion); // Version
-    header.setUint32(5, encrypted.length, Endian.little); // DataLen
-
-    final result = Uint8List(9 + encrypted.length);
-    result.setAll(0, header.buffer.asUint8List());
-    result.setAll(9, encrypted);
-
-    return result;
+    final payload = _payloadBytes(walEntry, partitionIndex);
+    final out = Uint8List(9 + payload.length);
+    _writeRecordHeader(out, 0, payload.length);
+    out.setRange(9, 9 + payload.length, payload);
+    return out;
   }
 
   /// Decode multiple WAL entries from a file's binary content
@@ -95,8 +78,9 @@ class WalEncoder {
         break;
       }
 
-      // Extract and decode this record
-      final recordData = fileBytes.sublist(offset, offset + recordLength);
+      // Extract and decode this record (view — decodeSingle does not retain the slice)
+      final recordData =
+          Uint8List.sublistView(fileBytes, offset, offset + recordLength);
       offset += recordLength;
 
       try {
@@ -138,19 +122,11 @@ class WalEncoder {
     final dataLen = header.getUint32(5, Endian.little);
     if (data.length < 9 + dataLen) return null;
 
-    // Step 1: Extract encrypted data
-    final encryptedData = data.sublist(9, 9 + dataLen);
+    // Step 1: Extract encrypted data (zero-copy view)
+    final encryptedData = Uint8List.sublistView(data, 9, 9 + dataLen);
 
-    // Step 2: Build AAD from partition index (if available)
-    Uint8List? aad;
-    // AAD format: [partition:4B]
-    final aadData = ByteData(4);
-    aadData.setInt32(0, partitionIndex, Endian.little);
-    aad = aadData.buffer.asUint8List();
-
-    // Step 3: Decrypt binary directly using EncoderHandler.decodeBytes
-    // No string conversion! Direct binary decryption with partition-based AAD
-    final decrypted = EncryptionManager.decodeBytes(encryptedData, aad: aad);
+    // Step 2/3: Decrypt. AAD only needed for AEAD algorithms.
+    final decrypted = _decodePayload(encryptedData, partitionIndex);
 
     // Step 4: Parse MessagePack binary
     return BinaryMapCodec.decodeMap(decrypted);
@@ -183,20 +159,66 @@ class WalEncoder {
   /// Length: Uint32 little-endian (length of binary WAL entry including header)
   ///
   /// [walEntry] should contain 'p' (partition) for AAD
+  ///
+  /// Hot path for [WalManager]: builds the length-prefixed record in **one**
+  /// allocation. Byte layout matches the historical encode()+prepend path.
   static Uint8List encodeAsLine(Map<String, dynamic> walEntry) {
-    // Extract partition index for AAD (available before encryption)
-    final partitionIndex = walEntry['p'] as int?;
+    final partitionIndex = (walEntry['p'] as int?) ?? 0;
+    final payload = _payloadBytes(walEntry, partitionIndex);
+    final recordLen = 9 + payload.length;
+    final out = Uint8List(4 + recordLen);
+    final view = ByteData.sublistView(out);
+    view.setUint32(0, recordLen, Endian.little);
+    _writeRecordHeader(out, 4, payload.length);
+    out.setRange(13, 13 + payload.length, payload);
+    return out;
+  }
 
-    final binaryData = encode(walEntry, partitionIndex ?? 0);
+  /// MessagePack (+ optional encryption) payload that sits after the 9-byte
+  /// ToWL header. Identical to the historical encode() payload bytes.
+  static Uint8List _payloadBytes(
+    Map<String, dynamic> walEntry,
+    int partitionIndex,
+  ) {
+    final serialized = BinaryMapCodec.encodeMap(walEntry);
 
-    // Prepend 4-byte length prefix for record-based file storage
-    // This avoids conflicts with 0x0A bytes in binary data
-    final result = Uint8List(4 + binaryData.length);
-    final header = ByteData.sublistView(result, 0, 4);
-    header.setUint32(0, binaryData.length, Endian.little);
-    result.setAll(4, binaryData);
+    // none: EncryptionManager.encodeBytes returns [serialized] unchanged —
+    // skip AAD alloc + encodeBytes call (same on-disk payload).
+    if (EncryptionManager.getEncryptionType() == EncryptionType.none) {
+      return serialized;
+    }
 
-    return result;
+    return EncryptionManager.encodeBytes(
+      serialized,
+      aad: _partitionAad(partitionIndex),
+    );
+  }
+
+  static Uint8List _decodePayload(Uint8List encryptedData, int partitionIndex) {
+    // Headerless none payloads ignore AAD; AEAD still needs partition AAD.
+    if (EncryptionManager.getEncryptionType() == EncryptionType.none) {
+      // Still run decodeBytes: files may contain prefixed ciphertext from an
+      // older key/type while the process default is none (prefix dispatch).
+      return EncryptionManager.decodeBytes(encryptedData);
+    }
+    return EncryptionManager.decodeBytes(
+      encryptedData,
+      aad: _partitionAad(partitionIndex),
+    );
+  }
+
+  static Uint8List _partitionAad(int partitionIndex) {
+    final aadData = ByteData(4);
+    aadData.setInt32(0, partitionIndex, Endian.little);
+    return aadData.buffer.asUint8List();
+  }
+
+  /// Write [Magic:4][Version:1][DataLen:4] at [offset] into [out].
+  static void _writeRecordHeader(Uint8List out, int offset, int dataLen) {
+    final view = ByteData.sublistView(out, offset, offset + 9);
+    view.setUint32(0, _walMagic, Endian.little);
+    view.setUint8(4, _walVersion);
+    view.setUint32(5, dataLen, Endian.little);
   }
 
   /// Try decode legacy JSON format (for backward compatibility)
@@ -282,7 +304,8 @@ class WalEncoder {
       final recordDataStart = candidateStart + 4;
       if (recordDataStart + recordLength > tailBytes.length) continue;
 
-      final recordData = tailBytes.sublist(recordDataStart, offset);
+      final recordData =
+          Uint8List.sublistView(tailBytes, recordDataStart, offset);
 
       // CRITICAL OPTIMIZATION: Check Magic number before attempting expensive decryption
       // This avoids decrypting data at every position that happens to have a valid-looking
