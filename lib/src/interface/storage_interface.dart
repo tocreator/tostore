@@ -152,6 +152,12 @@ abstract class StorageInterface {
   Future<int> appendBytes(String path, Uint8List bytes,
       {bool flush = true, bool closeHandleAfterFlush = false});
 
+  /// Appends binary data to a file synchronously without awaiting event loops.
+  /// Content is pushed directly into OS page cache buffers.
+  /// Returns the offset before writing, or -1 if the platform/adapter does not support sync IO.
+  int appendBytesSync(String path, List<int> bytes,
+      {int offset = 0, int? length});
+
   /// Reads a file as a list of lines, starting from a specific byte offset.
   Future<List<String>> readAsLines(String path, {int offset = 0});
 
@@ -176,4 +182,7 @@ abstract class StorageInterface {
   /// Flush any buffered writes for the specific file path.
   /// This ensures data durability for the given file without closing the handle necessarily.
   Future<void> flushFile(String path);
+
+  /// Synchronously forces OS page cache buffers for [path] to be flushed to physical media.
+  void flushFileSync(String path);
 }

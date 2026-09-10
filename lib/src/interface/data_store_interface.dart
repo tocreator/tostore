@@ -40,25 +40,33 @@ abstract class DataStoreInterface {
   StreamQueryBuilder streamQuery(String tableName);
 
   /// insert data, returns the operation result with primary key if successful
-  Future<DbResult> insert(String tableName, Map<String, dynamic> data);
+  Future<DbResult> insert(String tableName, Map<String, dynamic> data,
+      {RecoveryDurability? durability});
 
   /// upsert data; conflict target from primary key or unique index in data
-  Future<DbResult> upsert(String tableName, Map<String, dynamic> data);
+  Future<DbResult> upsert(String tableName, Map<String, dynamic> data,
+      {RecoveryDurability? durability});
 
   /// batch insert data, returns the operation result with successful and failed keys
   Future<DbResult> batchInsert(
       String tableName, List<Map<String, dynamic>> records,
-      {bool allowPartialErrors = true, bool returnResultDetails = true});
+      {bool allowPartialErrors = true,
+      bool returnResultDetails = true,
+      RecoveryDurability? durability});
 
   /// batch upsert data based on unique constraints.
   Future<DbResult> batchUpsert(
       String tableName, List<Map<String, dynamic>> records,
-      {bool allowPartialErrors = true, bool returnResultDetails = true});
+      {bool allowPartialErrors = true,
+      bool returnResultDetails = true,
+      RecoveryDurability? durability});
 
   /// batch update data based on primary keys or unique identifiers.
   Future<DbResult> batchUpdate(
       String tableName, List<Map<String, dynamic>> records,
-      {bool allowPartialErrors = true, bool returnResultDetails = true});
+      {bool allowPartialErrors = true,
+      bool returnResultDetails = true,
+      RecoveryDurability? durability});
 
   /// update data
   UpdateBuilder update(String tableName,
@@ -74,6 +82,7 @@ abstract class DataStoreInterface {
     Duration? ttl,
     DateTime? expiresAt,
     bool isGlobal = false,
+    RecoveryDurability? durability,
   });
 
   /// get key-value pair
@@ -145,18 +154,17 @@ abstract class DataStoreInterface {
 
   /// Flush pending writes to storage.
   ///
-  /// [mode] controls scope and durability (default: [FlushMode.fullPowerSafe]):
+  /// [mode] controls scope and durability (default: [FlushMode.full]):
   /// - [FlushMode.recovery]: fastest; recovery log to OS buffers only.
   ///   Survives app interrupt / crash restart; power loss may lose data.
-  /// - [FlushMode.recoveryPowerSafe]: recovery log to stable storage.
-  ///   Aims to survive power loss so startup can recover committed data.
-  /// - [FlushMode.fullPowerSafe]: recovery log + table data + indexes to
-  ///   stable storage (includes durable sync for safe checkpoints).
+  /// - [FlushMode.recoveryDurable]: recovery log to physical storage.
+  ///   Survives power loss so startup can recover all committed data.
+  /// - [FlushMode.full]: recovery log and all data (tables + indexes) to
+  ///   physical storage.
   ///
   Future<void> flush({
-    FlushMode mode = FlushMode.fullPowerSafe,
-    @Deprecated(
-        'Use mode: FlushMode.recovery, recoveryPowerSafe, or fullPowerSafe')
+    FlushMode mode = FlushMode.full,
+    @Deprecated('Use mode: FlushMode.recovery, recoveryDurable, or full')
     bool? flushStorage,
   });
 

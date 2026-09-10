@@ -26,12 +26,13 @@ Write paths for single-row, builder-conditioned, and bulk operations; atomic fie
 ## Single-row writes
 
 ```dart
-Future<DbResult> insert(String tableName, Map<String, dynamic> data);
-Future<DbResult> upsert(String tableName, Map<String, dynamic> data);
+Future<DbResult> insert(String tableName, Map<String, dynamic> data, {RecoveryDurability? durability});
+Future<DbResult> upsert(String tableName, Map<String, dynamic> data, {RecoveryDurability? durability});
 ```
 
 - `insert`: new row; on success read `firstPrimaryKey`.
 - `upsert`: update if PK/unique match, else insert.
+- `durability`: optional recovery guarantee level (`RecoveryDurability.standard` default crash-safe before ack, `durable` power-loss safe before ack, `async` immediate response with brief few-ms window on small writes).
 - MUST check `!result.hasErrors` (or inspect `statuses`). Constraint failures return results; they do not always throw.
 
 ```dart
@@ -59,6 +60,7 @@ Awaiting the builder (or `.future`) executes.
 | `min` / `max` / `clamp` | Bound field |
 | `setServerTimestamp(field)` | Server time |
 | `compute(field, ExprNode)` | Explicit expression |
+| `durability(RecoveryDurability)` | Set recovery guarantee level for this update (durable / standard / async) |
 | `allowUpdateAll()` | REQUIRED if no condition |
 | `allowPartialErrors()` | Continue on per-row failures |
 | `allowLargeScaleOperation()` | Large update; blocks until done; returns `successCount` only; **MUST NOT** inside transaction |
@@ -80,6 +82,7 @@ DeleteBuilder delete(String tableName);
 | Method | Purpose |
 | :--- | :--- |
 | `where` / predicates | Filter |
+| `durability(RecoveryDurability)` | Set recovery guarantee level for this delete (durable / standard / async) |
 | `allowDeleteAll()` | REQUIRED if no condition |
 | `allowLargeScaleOperation()` | Same large-op rules as update |
 
@@ -99,6 +102,7 @@ Future<DbResult> batchInsert(
   String tableName, List<Map<String, dynamic>> dataList, {
   bool allowPartialErrors = true,
   bool returnResultDetails = true,
+  RecoveryDurability? durability,
 });
 Future<DbResult> batchUpsert(...); // same options
 Future<DbResult> batchUpdate(...); // same options
@@ -112,6 +116,7 @@ Future<DbResult> batchUpdate(...); // same options
 
 - `allowPartialErrors: true` (default): one bad row does not abort the batch.
 - `returnResultDetails: false`: skip success/failure key collection — better perf / less memory.
+- `durability`: optional per-batch recovery guarantee override (`durable` power-loss safe, `standard` crash-safe default, `async` immediate response with brief few-ms window on small writes).
 
 ## Atomic expressions (`Expr`)
 

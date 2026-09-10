@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:tostore/tostore.dart';
 
 import 'benchmark_models.dart';
 
@@ -23,11 +24,17 @@ class _BenchmarkDialogState extends State<BenchmarkDialog> {
   late BenchmarkTier _selectedTier;
   late int _selectedScale;
   late int _selectedIterations;
+  late RecoveryDurability _selectedDurability;
   late Set<BenchmarkOperation> _selectedOperations;
 
   static const List<int> _scalarScaleOptions = [10000, 50000, 100000];
   static const List<int> _vectorScaleOptions = [1000, 5000, 10000];
   static const List<int> _iterationOptions = [1, 3, 5];
+  static const List<RecoveryDurability> _durabilityOptions = [
+    RecoveryDurability.async,
+    RecoveryDurability.standard,
+    RecoveryDurability.durable,
+  ];
 
   List<int> get _scaleOptions => _selectedTier == BenchmarkTier.vector
       ? _vectorScaleOptions
@@ -44,6 +51,7 @@ class _BenchmarkDialogState extends State<BenchmarkDialog> {
     final config = widget.lastSummary?.config ?? widget.initialConfig;
     _selectedTier = config.tier;
     _selectedIterations = config.iterations;
+    _selectedDurability = config.durability;
     _selectedOperations = Set.from(
       config.operations.where((op) => op.appliesTo(_selectedTier)),
     );
@@ -102,6 +110,7 @@ class _BenchmarkDialogState extends State<BenchmarkDialog> {
           scale: _selectedScale,
           iterations: _selectedIterations,
           operations: _selectedOperations,
+          durability: _selectedDurability,
         );
 
     Navigator.of(context).pop(config);
@@ -242,6 +251,10 @@ class _BenchmarkDialogState extends State<BenchmarkDialog> {
                         const Color(0xFF334155)),
                     _buildBadge('${summary.config.iterations} Rounds',
                         Colors.grey.shade100, const Color(0xFF334155)),
+                    _buildBadge(
+                        'Durability: ${summary.config.durability.benchmarkLabel}',
+                        Colors.grey.shade100,
+                        const Color(0xFF334155)),
                     _buildBadge(
                         dateStr, Colors.grey.shade100, const Color(0xFF64748B)),
                   ],
@@ -522,11 +535,41 @@ class _BenchmarkDialogState extends State<BenchmarkDialog> {
           ),
           const SizedBox(height: 16),
 
-          // 4. Operations Selection
+          // 4. Recovery Durability
+          _buildSectionTitle('4. Write Recovery Durability'),
+          const SizedBox(height: 4),
+          Text(
+            _selectedDurability.benchmarkDescription,
+            style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+          ),
+          const SizedBox(height: 8),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: _durabilityOptions.map((mode) {
+              final isSelected = _selectedDurability == mode;
+              return ChoiceChip(
+                label: Text(mode.benchmarkChipLabel),
+                selected: isSelected,
+                selectedColor: primaryColor.withAlpha(40),
+                side: BorderSide(
+                  color: isSelected ? primaryColor : Colors.grey.shade300,
+                ),
+                onSelected: (selected) {
+                  if (selected) {
+                    setState(() => _selectedDurability = mode);
+                  }
+                },
+              );
+            }).toList(),
+          ),
+          const SizedBox(height: 16),
+
+          // 5. Operations Selection
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              _buildSectionTitle('4. Operations to Evaluate'),
+              _buildSectionTitle('5. Operations to Evaluate'),
               TextButton(
                 onPressed: () {
                   setState(() {

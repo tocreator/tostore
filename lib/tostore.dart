@@ -229,7 +229,6 @@ class ToStore implements DataStoreInterface {
       dbName: effectiveName,
       enableJournal: false,
       persistRecoveryOnCommit: false,
-      recoveryFlushPolicy: RecoveryFlushPolicy.off,
     );
 
     // ignore: deprecated_member_use_from_same_package
@@ -385,19 +384,28 @@ class ToStore implements DataStoreInterface {
   ///
   /// [tableName] The name of the table.
   /// [data] The map of fields and values to insert.
+  /// [durability] Optional recovery guarantee level (overrides global config).
+  /// - [RecoveryDurability.standard] (default): Crash-safe before response returns.
+  /// - [RecoveryDurability.durable]: Power-loss safe before response returns.
+  /// - [RecoveryDurability.async]: Returns immediately; on small writes, typically leaves a brief few-millisecond window after response before reaching persistent storage.
   /// Returns a [DbResult] containing the primary key of the inserted record.
   ///
   /// 插入单条数据。
   ///
   /// [tableName] 表名。
   /// [data] 要插入的数据（键值对）。
+  /// [durability] 可选的恢复能力级别（覆盖全局配置）。
+  /// - [RecoveryDurability.standard]（默认）：返回结果前即具备防闪退与强杀自愈能力；
+  /// - [RecoveryDurability.durable]：返回结果前即具备防断电自愈能力；
+  /// - [RecoveryDurability.async]：极速返回，在返回响应结果后小数据量多数存在几毫秒极其短暂的丢失窗口期。
   /// 返回操作结果 [DbResult]，成功时包含主键信息。
   @override
-  Future<DbResult> insert(String tableName, Map<String, dynamic> data) async {
+  Future<DbResult> insert(String tableName, Map<String, dynamic> data,
+      {RecoveryDurability? durability}) async {
     _checkSystemTableAccess(
         tableName, 'cannot be accessed manually', 'ToStore.insert');
 
-    final result = await _impl.insert(tableName, data);
+    final result = await _impl.insert(tableName, data, durability: durability);
     DbException.checkDeveloperError(result);
     return result;
   }
@@ -463,6 +471,10 @@ class ToStore implements DataStoreInterface {
   ///
   /// [tableName] The name of the table.
   /// [data] The data map to insert or update.
+  /// [durability] Optional recovery guarantee level (overrides global config).
+  /// - [RecoveryDurability.standard] (default): Crash-safe before response returns.
+  /// - [RecoveryDurability.durable]: Power-loss safe before response returns.
+  /// - [RecoveryDurability.async]: Returns immediately; on small writes, typically leaves a brief few-millisecond window after response before reaching persistent storage.
   /// Returns a [DbResult] indicating success or failure.
   ///
   /// Example:
@@ -475,13 +487,18 @@ class ToStore implements DataStoreInterface {
   ///
   /// [tableName] 表名。
   /// [data] 要插入或更新的数据。
+  /// [durability] 可选的恢复能力级别（覆盖全局配置）。
+  /// - [RecoveryDurability.standard]（默认）：返回结果前即具备防闪退与强杀自愈能力；
+  /// - [RecoveryDurability.durable]：返回结果前即具备防断电自愈能力；
+  /// - [RecoveryDurability.async]：极速返回，在返回响应结果后小数据量多数存在几毫秒极其短暂的丢失窗口期。
   /// 返回 [DbResult] 表示操作成功或失败。
   @override
-  Future<DbResult> upsert(String tableName, Map<String, dynamic> data) async {
+  Future<DbResult> upsert(String tableName, Map<String, dynamic> data,
+      {RecoveryDurability? durability}) async {
     _checkSystemTableAccess(
         tableName, 'cannot be modified manually', 'ToStore.upsert');
 
-    final result = await _impl.upsert(tableName, data);
+    final result = await _impl.upsert(tableName, data, durability: durability);
     DbException.checkDeveloperError(result);
     return result;
   }
@@ -685,6 +702,7 @@ class ToStore implements DataStoreInterface {
   ///     If interrupted, already-persisted changes are kept; retry to continue.
   /// - `.allowUpdateAll()` -- allow updating all records without a condition
   /// - `.allowPartialErrors()` -- continue on partial record failures
+  /// - `.durability(level)` -- set recovery guarantee level for this update (durable / standard / async)
   ///
   /// Example:
   /// ```dart
@@ -721,6 +739,7 @@ class ToStore implements DataStoreInterface {
   ///     中断后已落盘部分保留，需自行重试继续。
   /// - `.allowUpdateAll()` -- 允许无条件更新全部记录
   /// - `.allowPartialErrors()` -- 部分记录失败时继续执行
+  /// - `.durability(level)` -- 设置本次更新的响应恢复能力级别（防断电 durable / 防闪退强杀 standard / 极速异步 async）
   @override
   UpdateBuilder update(String tableName,
       [Map<String, dynamic> data = const {}]) {
@@ -737,6 +756,10 @@ class ToStore implements DataStoreInterface {
   /// [allowPartialErrors] Whether to continue when some records fail to insert (defaults to true).
   /// [returnResultDetails] Whether to collect success/failure primary key lists and status details.
   ///   Setting false skips result detail collection, improving performance and avoiding memory overhead (defaults to true).
+  /// [durability] Optional recovery guarantee level (overrides global config).
+  /// - [RecoveryDurability.standard] (default): Crash-safe before response returns.
+  /// - [RecoveryDurability.durable]: Power-loss safe before response returns.
+  /// - [RecoveryDurability.async]: Returns immediately; on small writes, typically leaves a brief few-millisecond window after response before reaching persistent storage.
   ///
   /// Returns the operation result with successful and failed keys.
   ///
@@ -746,12 +769,18 @@ class ToStore implements DataStoreInterface {
   /// [allowPartialErrors] 当部分记录插入失败时是否继续处理其他记录（默认为 true）。
   /// [returnResultDetails] 是否收集成功/失败的主键列表和状态详情。
   ///   设置 false 不返回结果详情，能够提升性能及避免内存开销（默认为 true）。
+  /// [durability] 可选的恢复能力级别（覆盖全局配置）。
+  /// - [RecoveryDurability.standard]（默认）：返回结果前即具备防闪退与强杀自愈能力；
+  /// - [RecoveryDurability.durable]：返回结果前即具备防断电自愈能力；
+  /// - [RecoveryDurability.async]：极速返回，在返回响应结果后小数据量多数存在几毫秒极其短暂的丢失窗口期。
   ///
   /// 返回包含成功和失败主键信息的操作结果。
   @override
   Future<DbResult> batchInsert(
       String tableName, List<Map<String, dynamic>> dataList,
-      {bool allowPartialErrors = true, bool returnResultDetails = true}) async {
+      {bool allowPartialErrors = true,
+      bool returnResultDetails = true,
+      RecoveryDurability? durability}) async {
     _checkSystemTableAccess(
         tableName, 'cannot be batchInserted manually', 'ToStore.batchInsert');
 
@@ -760,6 +789,7 @@ class ToStore implements DataStoreInterface {
       dataList,
       allowPartialErrors: allowPartialErrors,
       returnResultDetails: returnResultDetails,
+      durability: durability,
     );
     DbException.checkDeveloperError(result);
     return result;
@@ -777,6 +807,10 @@ class ToStore implements DataStoreInterface {
   /// [allowPartialErrors] When false, the operation fails immediately if any record fails. Defaults to true.
   /// [returnResultDetails] Whether to collect success/failure primary key lists and status details.
   ///   Setting false skips result detail collection, improving performance and avoiding memory overhead (defaults to true).
+  /// [durability] Optional recovery guarantee level (overrides global config).
+  /// - [RecoveryDurability.standard] (default): Crash-safe before response returns.
+  /// - [RecoveryDurability.durable]: Power-loss safe before response returns.
+  /// - [RecoveryDurability.async]: Returns immediately; on small writes, typically leaves a brief few-millisecond window after response before reaching persistent storage.
   ///
   ///  ///
   /// Example:
@@ -806,10 +840,16 @@ class ToStore implements DataStoreInterface {
   /// [allowPartialErrors] 当部分记录失败时是否继续处理其他记录（默认为 true）。
   /// [returnResultDetails] 是否收集成功/失败的主键列表和状态详情。
   ///   设置 false 不返回结果详情，能够提升性能及避免内存开销（默认为 true）。
+  /// [durability] 可选的恢复能力级别（覆盖全局配置）。
+  /// - [RecoveryDurability.standard]（默认）：返回结果前即具备防闪退与强杀自愈能力；
+  /// - [RecoveryDurability.durable]：返回结果前即具备防断电自愈能力；
+  /// - [RecoveryDurability.async]：极速返回，在返回响应结果后小数据量多数存在几毫秒极其短暂的丢失窗口期。
   @override
   Future<DbResult> batchUpsert(
       String tableName, List<Map<String, dynamic>> dataList,
-      {bool allowPartialErrors = true, bool returnResultDetails = true}) async {
+      {bool allowPartialErrors = true,
+      bool returnResultDetails = true,
+      RecoveryDurability? durability}) async {
     _checkSystemTableAccess(
         tableName, 'cannot be batchUpserted manually', 'ToStore.batchUpsert');
 
@@ -818,6 +858,7 @@ class ToStore implements DataStoreInterface {
       dataList,
       allowPartialErrors: allowPartialErrors,
       returnResultDetails: returnResultDetails,
+      durability: durability,
     );
     DbException.checkDeveloperError(result);
     return result;
@@ -832,6 +873,10 @@ class ToStore implements DataStoreInterface {
   /// [allowPartialErrors] When false, the operation fails immediately if any record fails. Defaults to true.
   /// [returnResultDetails] Whether to collect success/failure primary key lists and status details.
   ///   Setting false skips result detail collection, improving performance and avoiding memory overhead (defaults to true).
+  /// [durability] Optional recovery guarantee level (overrides global config).
+  /// - [RecoveryDurability.standard] (default): Crash-safe before response returns.
+  /// - [RecoveryDurability.durable]: Power-loss safe before response returns.
+  /// - [RecoveryDurability.async]: Returns immediately; on small writes, typically leaves a brief few-millisecond window after response before reaching persistent storage.
   ///
   /// Example:
   /// ```dart
@@ -851,10 +896,16 @@ class ToStore implements DataStoreInterface {
   /// [allowPartialErrors] 当部分记录失败时是否继续处理其他记录（默认为 true）。
   /// [returnResultDetails] 是否收集成功/失败的主键列表和状态详情。
   ///   设置 false 不返回结果详情，能够提升性能及避免内存开销（默认为 true）。
+  /// [durability] 可选的恢复能力级别（覆盖全局配置）。
+  /// - [RecoveryDurability.standard]（默认）：返回结果前即具备防闪退与强杀自愈能力；
+  /// - [RecoveryDurability.durable]：返回结果前即具备防断电自愈能力；
+  /// - [RecoveryDurability.async]：极速返回，在返回响应结果后小数据量多数存在几毫秒极其短暂的丢失窗口期。
   @override
   Future<DbResult> batchUpdate(
       String tableName, List<Map<String, dynamic>> dataList,
-      {bool allowPartialErrors = true, bool returnResultDetails = true}) async {
+      {bool allowPartialErrors = true,
+      bool returnResultDetails = true,
+      RecoveryDurability? durability}) async {
     _checkSystemTableAccess(
         tableName, 'cannot be batchUpdated manually', 'ToStore.batchUpdate');
 
@@ -863,6 +914,7 @@ class ToStore implements DataStoreInterface {
       dataList,
       allowPartialErrors: allowPartialErrors,
       returnResultDetails: returnResultDetails,
+      durability: durability,
     );
     DbException.checkDeveloperError(result);
     return result;
@@ -875,6 +927,10 @@ class ToStore implements DataStoreInterface {
   /// [ttl] Relative expiration duration (mutually exclusive with [expiresAt]).
   /// [expiresAt] Absolute expiration time (mutually exclusive with [ttl]).
   /// [isGlobal] If true, the value is shared across all spaces.
+  /// [durability] Optional recovery guarantee level (overrides global config).
+  /// - [RecoveryDurability.standard] (default): Crash-safe before response returns.
+  /// - [RecoveryDurability.durable]: Power-loss safe before response returns.
+  /// - [RecoveryDurability.async]: Returns immediately; on small writes, typically leaves a brief few-millisecond window after response before reaching persistent storage.
   /// Returns a [DbResult] indicating success or failure.
   ///
   /// 在 KV 存储中设置键值对。
@@ -884,6 +940,10 @@ class ToStore implements DataStoreInterface {
   /// [ttl] 相对过期时间（与 [expiresAt] 互斥）。
   /// [expiresAt] 绝对过期时间（与 [ttl] 互斥）。
   /// [isGlobal] 为 true 时，该键值对在所有空间共享。
+  /// [durability] 可选的恢复能力级别（覆盖全局配置）。
+  /// - [RecoveryDurability.standard]（默认）：返回结果前即具备防闪退与强杀自愈能力；
+  /// - [RecoveryDurability.durable]：返回结果前即具备防断电自愈能力；
+  /// - [RecoveryDurability.async]：极速返回，在返回响应结果后小数据量多数存在几毫秒极其短暂的丢失窗口期。
   /// 返回 [DbResult] 表示操作成功或失败。
   @override
   Future<DbResult> setValue(
@@ -892,6 +952,7 @@ class ToStore implements DataStoreInterface {
     Duration? ttl,
     DateTime? expiresAt,
     bool isGlobal = false,
+    RecoveryDurability? durability,
   }) async {
     final result = await _impl.setValue(
       key,
@@ -899,6 +960,7 @@ class ToStore implements DataStoreInterface {
       ttl: ttl,
       expiresAt: expiresAt,
       isGlobal: isGlobal,
+      durability: durability,
     );
     DbException.checkDeveloperError(result);
     return result;
@@ -1081,6 +1143,7 @@ class ToStore implements DataStoreInterface {
   ///     status details). Not allowed inside a transaction (rejected with rollback).
   ///     If interrupted, already-persisted changes are kept; retry to continue.
   /// - `.allowDeleteAll()` -- allow deleting all records without a condition
+  /// - `.durability(level)` -- set recovery guarantee level for this delete (durable / standard / async)
   ///
   /// Example:
   /// ```dart
@@ -1105,6 +1168,7 @@ class ToStore implements DataStoreInterface {
   ///     不返回成功/失败主键与逐条状态。事务内不允许（拒绝并触发回滚）。
   ///     中断后已落盘部分保留，需自行重试继续。
   /// - `.allowDeleteAll()` -- 允许无条件删除全部记录
+  /// - `.durability(level)` -- 设置本次删除的响应恢复能力级别（防断电 durable / 防闪退强杀 standard / 极速异步 async）
   @override
   DeleteBuilder delete(String tableName) {
     _checkSystemTableAccess(
@@ -1292,33 +1356,31 @@ class ToStore implements DataStoreInterface {
 
   /// Flush pending writes to storage.
   ///
-  /// [mode] controls scope and durability (default: [FlushMode.fullPowerSafe]):
+  /// [mode] controls scope and durability (default: [FlushMode.full]):
   /// - [FlushMode.recovery]: fastest; recovery log to OS buffers only.
   ///   Survives app interrupt / crash restart; power loss may lose data.
-  /// - [FlushMode.recoveryPowerSafe]: recovery log to stable storage.
-  ///   Aims to survive power loss so startup can recover committed data.
-  /// - [FlushMode.fullPowerSafe]: recovery log + table data + indexes to
-  ///   stable storage (includes durable sync for safe checkpoints).
+  /// - [FlushMode.recoveryDurable]: recovery log to physical storage.
+  ///   Survives power loss so startup can recover all committed data.
+  /// - [FlushMode.full]: recovery log and all data (tables + indexes) to
+  ///   physical storage.
   ///
   /// 将待落盘数据刷入存储。
-  /// [mode] 控制刷盘范围与强度（默认 [FlushMode.fullPowerSafe]）：
+  /// [mode] 控制刷盘范围与强度（默认 [FlushMode.full]）：
   /// - [FlushMode.recovery]：最快；恢复日志仅写入 OS 缓存。
   ///   防应用中断、崩溃重启可恢复；注意断电会丢失数据。
-  /// - [FlushMode.recoveryPowerSafe]：稍微耗时；恢复日志写入物理文件。
-  ///   防断电故障，断电后启动可恢复全部已提交数据。
-  /// - [FlushMode.fullPowerSafe]：比较耗时；恢复日志、表数据与索引
-  ///   全量写入物理文件。
+  /// - [FlushMode.recoveryDurable]：稍微耗时；恢复日志写入物理文件。
+  ///   防断电故障，断电后启动可恢复全部数据。
+  /// - [FlushMode.full]：比较耗时；恢复日志及数据全量写入物理文件。
   ///
   /// Example:
   /// ```dart
-  /// await db.flush(); // fullPowerSafe
+  /// await db.flush(); // full
   /// await db.flush(mode: FlushMode.recovery);
   /// ```
   @override
   Future<void> flush({
-    FlushMode mode = FlushMode.fullPowerSafe,
-    @Deprecated(
-        'Use mode: FlushMode.recovery, recoveryPowerSafe, or fullPowerSafe')
+    FlushMode mode = FlushMode.full,
+    @Deprecated('Use mode: FlushMode.recovery, recoveryDurable, or full')
     bool? flushStorage,
   }) async {
     await _impl.flush(mode: mode);

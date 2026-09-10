@@ -10,16 +10,16 @@ enum FlushMode {
   /// 防应用中断、崩溃重启可恢复；注意断电会丢失数据。
   recovery,
 
-  /// Slightly slower. Persist recovery log to stable storage when supported.
-  /// Aims to survive power loss so startup can recover all committed data.
+  /// Slightly slower. Persist recovery log to physical storage.
+  /// Survives power loss so startup can recover all committed data.
   ///
   /// 稍微耗时：恢复日志写入物理文件，防断电故障，
   /// 断电后能够在启动时恢复全部数据。
-  recoveryPowerSafe,
+  recoveryDurable,
 
-  /// Strongest and most expensive. Persist recovery log, table data, and
-  /// indexes to stable storage (includes durable sync for safe checkpoints).
+  /// Strongest and most expensive. Persist recovery log and all data
+  /// (tables and indexes) to physical storage.
   ///
-  /// 比较耗时：恢复日志及数据（表数据与索引）全量写入物理文件。
-  fullPowerSafe,
+  /// 比较耗时：恢复日志及数据全量写入物理文件。
+  full,
 }

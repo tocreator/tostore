@@ -723,6 +723,11 @@ class WebStorageImpl implements StorageInterface {
     }
   }
 
+  @override
+  void flushFileSync(String path) {
+    // Web IndexedDB does not support synchronous physical sync
+  }
+
   /// Update copyFile to use FileInfo
   @override
   Future<void> copyFile(String sourcePath, String targetPath) async {
@@ -1024,6 +1029,13 @@ class WebStorageImpl implements StorageInterface {
       Logger.error('Append bytes failed', rawError: e);
       rethrow;
     }
+  }
+
+  @override
+  int appendBytesSync(String path, List<int> bytes,
+      {int offset = 0, int? length}) {
+    // Web environment does not support synchronous native file system IO.
+    return -1;
   }
 
   @override

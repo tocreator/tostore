@@ -209,7 +209,7 @@ static Future<ToStore> memory({
 | `instancePath` | `String?` | Final storage directory |
 | `getVersion()` | `Future<int>` | User-defined only |
 | `setVersion(int)` | `Future<void>` | User-defined only |
-| `flush({FlushMode mode = FlushMode.fullPowerSafe})` | `Future<void>` | Persist pending writes |
+| `flush({FlushMode mode = FlushMode.full})` | `Future<void>` | Persist pending writes |
 | `close({bool keepActiveSpace = true})` | `Future<void>` | Releases instance from pool; `keepActiveSpace: false` clears active space (e.g. logout) |
 | `deleteDatabase({dbPath, dbName})` | `Future<void>` | Deletes DB files; removes instance from pool |
 
@@ -218,8 +218,8 @@ static Future<ToStore> memory({
 | Mode | Behavior |
 | :--- | :--- |
 | `recovery` | Fastest. Recovery log → OS buffers. Survives app crash; power loss may lose data. |
-| `recoveryPowerSafe` | Recovery log → stable storage. Aims to survive power loss. |
-| `fullPowerSafe` | Default. Recovery log + table + index → stable storage (checkpoint-safe durable sync). |
+| `recoveryDurable` | Recovery log → physical storage. Survives power loss. |
+| `full` | Default. Recovery log + all data (tables + indexes) → physical storage. |
 
 ## Startup progress
 
@@ -542,12 +542,13 @@ Write paths for single-row, builder-conditioned, and bulk operations; atomic fie
 ## Single-row writes
 
 ```dart
-Future<DbResult> insert(String tableName, Map<String, dynamic> data);
-Future<DbResult> upsert(String tableName, Map<String, dynamic> data);
+Future<DbResult> insert(String tableName, Map<String, dynamic> data, {RecoveryDurability? durability});
+Future<DbResult> upsert(String tableName, Map<String, dynamic> data, {RecoveryDurability? durability});
 ```
 
 - `insert`: new row; on success read `firstPrimaryKey`.
 - `upsert`: update if PK/unique match, else insert.
+- `durability`: optional recovery guarantee level (`RecoveryDurability.standard` default crash-safe before ack, `durable` power-loss safe before ack, `async` immediate response with brief few-ms window on small writes).
 - MUST check `!result.hasErrors` (or inspect `statuses`). Constraint failures return results; they do not always throw.
 
 ```dart
@@ -575,6 +576,7 @@ Awaiting the builder (or `.future`) executes.
 | `min` / `max` / `clamp` | Bound field |
 | `setServerTimestamp(field)` | Server time |
 | `compute(field, ExprNode)` | Explicit expression |
+| `durability(RecoveryDurability)` | Set recovery guarantee level for this update (durable / standard / async) |
 | `allowUpdateAll()` | REQUIRED if no condition |
 | `allowPartialErrors()` | Continue on per-row failures |
 | `allowLargeScaleOperation()` | Large update; blocks until done; returns `successCount` only; **MUST NOT** inside transaction |
@@ -596,6 +598,7 @@ DeleteBuilder delete(String tableName);
 | Method | Purpose |
 | :--- | :--- |
 | `where` / predicates | Filter |
+| `durability(RecoveryDurability)` | Set recovery guarantee level for this delete (durable / standard / async) |
 | `allowDeleteAll()` | REQUIRED if no condition |
 | `allowLargeScaleOperation()` | Same large-op rules as update |
 
@@ -615,6 +618,7 @@ Future<DbResult> batchInsert(
   String tableName, List<Map<String, dynamic>> dataList, {
   bool allowPartialErrors = true,
   bool returnResultDetails = true,
+  RecoveryDurability? durability,
 });
 Future<DbResult> batchUpsert(...); // same options
 Future<DbResult> batchUpdate(...); // same options
@@ -628,6 +632,7 @@ Future<DbResult> batchUpdate(...); // same options
 
 - `allowPartialErrors: true` (default): one bad row does not abort the batch.
 - `returnResultDetails: false`: skip success/failure key collection — better perf / less memory.
+- `durability`: optional per-batch recovery guarantee override (`durable` power-loss safe, `standard` crash-safe default, `async` immediate response with brief few-ms window on small writes).
 
 ## Atomic expressions (`Expr`)
 
@@ -982,6 +987,7 @@ Future<DbResult> setValue(String key, dynamic value, {
   Duration? ttl,
   DateTime? expiresAt,
   bool isGlobal = false,
+  RecoveryDurability? durability,
 });
 Future<dynamic> getValue(String key, {bool isGlobal = false});
 Future<DbResult> removeValue(String key, {bool isGlobal = false});
@@ -998,6 +1004,7 @@ Stream<Map<String, dynamic>> watchValues(Iterable<String> keys, {
 
 - `ttl` and `expiresAt` are **mutually exclusive** — MUST NOT pass both.
 - `isGlobal: true` → shared across all spaces.
+- `durability`: optional recovery guarantee level (`standard` crash-safe before ack, `durable` power-loss safe before ack, `async` immediate response with brief few-ms window on small writes).
 - Missing / expired → `getValue` returns `null`.
 - `watchValue` / `watchValues` emit current snapshot on subscribe.
 
@@ -1007,8 +1014,8 @@ Stream<Map<String, dynamic>> watchValues(Iterable<String> keys, {
 
 | Method | Notes |
 | :--- | :--- |
-| `set(key, value, {ttl, expiresAt, isGlobal})` | Same rules as `setValue` |
-| `setMany(map, {ttl, expiresAt, isGlobal, allowPartialErrors})` | Bulk set |
+| `set(key, value, {ttl, expiresAt, isGlobal, durability})` | Same rules as `setValue` |
+| `setMany(map, {ttl, expiresAt, isGlobal, allowPartialErrors, durability})` | Bulk set |
 | `get` / `getString` / `getInt` / `getBool` / `getMap` / `getList<T>` | Typed getters |
 | `remove` / `removeKeys` | Delete |
 | `clear({isGlobal})` | Clear space (or global) KV |
@@ -1479,7 +1486,7 @@ status: complete
 | Tables | `createTable`, `getTableSchema`, `getTableNames`, `getTableInfo`, `clear`, `dropTable` |
 | Spaces | `currentSpaceName`, `listSpaces`, `getSpaceInfo`, `deleteSpace` |
 | Instance | `config`, `instancePath`, `getVersion`/`setVersion` (app bookkeeping only) |
-| Maintenance | `flush({mode = FlushMode.fullPowerSafe})`, `deleteDatabase({dbPath, dbName})` |
+| Maintenance | `flush({mode = FlushMode.full})`, `deleteDatabase({dbPath, dbName})` |
 
 ## Backup & restore
 
@@ -1613,7 +1620,7 @@ factory DataStoreConfig({
   // journal / batch / flush / open files...
   bool? enableJournal,
   bool? persistRecoveryOnCommit,
-  RecoveryFlushPolicy? recoveryFlushPolicy,
+  RecoveryDurability? defaultRecoveryDurability, // standard (default) | async | durable
   TransactionIsolationLevel? defaultTransactionIsolationLevel,
   Duration transactionTimeout = const Duration(minutes: 5),
   // ... cleanup TTLs ...
@@ -1633,6 +1640,7 @@ factory DataStoreConfig({
 | `defaultQueryLimit` | 1000 | Applied when query omits `limit` |
 | `maxQueryOffset` | 10000 | Deep offset rejected beyond this |
 | `enableJournal` | true (non-web) | Crash recovery |
+| `defaultRecoveryDurability` | `standard` | Recovery-log durability before write ack: `async` (enqueue; brief crash loss until background drain to OS), `standard` (OS page cache, crash-safe), `durable` (physical fsync, power-safe). Override per CRUD/batch via `durability:` / `.durability(...)` |
 | `persistRecoveryOnCommit` | true | Strong durability; false = faster, tiny crash risk |
 | `ttlCleanupIntervalMs` | ≥60000 | Background TTL scan |
 | `cacheMemoryBudgetMB` | auto | LRU budget |
@@ -1927,7 +1935,7 @@ import 'package:tostore/tostore.dart';
 | `restore(String, {deleteAfterRestore, cleanupBeforeRestore})` | `Future<bool>` |
 | `transaction<T>(action, {rollbackOnError, persistRecoveryOnCommit, isolation})` | `Future<TransactionResult>` |
 | `rotateEncryptionKey({oldKey, required newKey})` | `Future<DbResult>` |
-| `flush({mode})` | `Future<void>` | `FlushMode`: `recovery`, `recoveryPowerSafe`, `fullPowerSafe` (default) |
+| `flush({mode})` | `Future<void>` | `FlushMode`: `recovery`, `recoveryDurable`, `full` (default) |
 | `close({keepActiveSpace})` | `Future<void>` |
 | `deleteDatabase({dbPath, dbName})` | `Future<void>` |
 | `getVersion()` / `setVersion(int)` | version bookkeeping |
@@ -1964,7 +1972,7 @@ Agents MAY import these via `package:tostore/tostore.dart`:
 | `status_provider.dart` | `DbStatus` |
 | `backup_scope.dart` | `BackupScope` |
 | `config_info.dart` | `ConfigInfo` |
-| `data_store_config.dart` | `DataStoreConfig`, `PersistenceMode`, `DistributedNodeConfig`, `TransactionIsolationLevel`, `RecoveryFlushPolicy`, `EncryptionType`, `EncryptionScope`, `EncryptionConfig` |
+| `data_store_config.dart` | `DataStoreConfig`, `PersistenceMode`, `DistributedNodeConfig`, `TransactionIsolationLevel`, `RecoveryDurability`, `EncryptionType`, `EncryptionScope`, `EncryptionConfig` |
 | `db_exception.dart` | `DbException`, `DbClosedException` |
 | `db_result.dart` | `DbResult` |
 | `db_startup_stage.dart` | `DbStartupStage`, `StartupProgressCallback` |

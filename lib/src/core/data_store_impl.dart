@@ -766,10 +766,8 @@ class DataStoreImpl {
               lockManager: lockManager!)
           : StorageAdapter(lockManager: lockManager!);
 
-      // Configure storage runtime and flush policy based on DataStoreConfig
       await storage.configure(
         maxOpenHandles: _config!.maxOpenFiles,
-        flushPolicy: _config!.recoveryFlushPolicy,
       );
 
       tableMetaManager = TableMetaManager(this);
@@ -1092,7 +1090,7 @@ class DataStoreImpl {
   }
 
   Future<void> flush({
-    FlushMode mode = FlushMode.fullPowerSafe,
+    FlushMode mode = FlushMode.full,
     bool? flushStorage,
   }) async {
     if (!_isInitialized) {
@@ -1106,7 +1104,7 @@ class DataStoreImpl {
   /// Unlike [flush], this does not call [ensureInitialized], so it is safe
   /// during bootstrap while [_isInitialized] is still false.
   Future<void> _flushPendingWrites({
-    FlushMode mode = FlushMode.fullPowerSafe,
+    FlushMode mode = FlushMode.full,
   }) async {
     await TransactionContext.runAsSystemOperation(() async {
       switch (mode) {
@@ -1115,7 +1113,7 @@ class DataStoreImpl {
             await walManager.flushQueueCompletely();
           } catch (_) {}
           break;
-        case FlushMode.recoveryPowerSafe:
+        case FlushMode.recoveryDurable:
           try {
             await walManager.flushQueueCompletely();
           } catch (_) {}
@@ -1123,7 +1121,7 @@ class DataStoreImpl {
             await walManager.flushRecoveryArtifactsToStorage();
           } catch (_) {}
           break;
-        case FlushMode.fullPowerSafe:
+        case FlushMode.full:
           try {
             await walManager.flushQueueCompletely();
           } catch (_) {}
@@ -1483,6 +1481,9 @@ class DataStoreImpl {
         // Empty committed meta in memory: first insert skips disk unique probes
         // without a separate negative-cache. Persist happens on first flush.
         tableDataManager.seedEmptyTableDataMeta(tableCtx);
+        if (resolvedSchema.primaryKeyConfig.type == PrimaryKeyType.sequential) {
+          await tableDataManager.updateMaxIdInMemory(tableCtx, '0');
+        }
 
         // Persist self-row after schema is durable (bootstrap recursion avoided).
         // Index files/meta are created lazily on first write via writeChanges.
@@ -1509,7 +1510,7 @@ class DataStoreImpl {
         }
 
         return finish(DbResult.success(
-          successKey: resolvedSchema.name,
+          successKeys: [resolvedSchema.name],
           message: 'Table ${resolvedSchema.name} created successfully',
         ));
       } catch (e) {
@@ -1725,7 +1726,8 @@ class DataStoreImpl {
   /// pass false to avoid promote old->shadow recursion.
   Future<DbResult> insert(String tableName, Map<String, dynamic> data,
       {bool retryOnPkConflict = false,
-      bool enablePromoteDualWrite = true}) async {
+      bool enablePromoteDualWrite = true,
+      RecoveryDurability? durability}) async {
     DbResult finish(DbResult r) => _returnOrThrowIfTxn(r, 'insert', tableName);
     // Need to be fully initialized
     if (!_isInitialized) {
@@ -1750,7 +1752,8 @@ class DataStoreImpl {
 
     try {
       // 1. Data validation
-      table = await getTableContext(tableName);
+      table =
+          getTableContextSync(tableName) ?? await getTableContext(tableName);
       promoteDesc = _promoteRuntimeForDualWrite(
         table.tableUid,
         enablePromoteDualWrite: enablePromoteDualWrite,
@@ -1763,7 +1766,23 @@ class DataStoreImpl {
 
       final validationErrors = <String>[];
       try {
-        validData = await _validateAndProcessData(
+        if ((!data.containsKey(schema.primaryKey) ||
+                data[schema.primaryKey] == null) &&
+            schema.primaryKeyConfig.type == PrimaryKeyType.sequential) {
+          final nextId = tableDataManager.getNextIdSync(table);
+          if (nextId != null) {
+            validData = validateAndProcessRecordPure(
+              schema: schema,
+              data: data,
+              tableName: table.tableName,
+              validationErrors: validationErrors,
+              hasResolvedPrimaryKey: true,
+              resolvedPrimaryKey: nextId,
+              ignoreUnknownFields: _config?.ignoreUnknownFields ?? true,
+            );
+          }
+        }
+        validData ??= await _validateAndProcessData(
           schema,
           data,
           table,
@@ -1822,7 +1841,8 @@ class DataStoreImpl {
             if (!retryOnPkConflict) {
               return await insert(tableName, data,
                   retryOnPkConflict: true,
-                  enablePromoteDualWrite: enablePromoteDualWrite);
+                  enablePromoteDualWrite: enablePromoteDualWrite,
+                  durability: durability);
             }
           }
 
@@ -1863,10 +1883,21 @@ class DataStoreImpl {
         }
       }
 
-      // 5. Unique check (disk only) - skip buffer check as we already reserved the keys
-      final uniqueViolation = await _indexManager?.checkUniqueConstraints(
-          table, validData,
-          txId: txId, schemaOverride: schema, skipBufferCheck: true);
+      // 5. Unique check (disk only) - skip if table has no secondary unique indexes and PK was auto-generated
+      UniqueViolation? uniqueViolation;
+      final bool hasSecondaryUniques =
+          tableMetaManager?.getUniqueIndexesFor(schema).isNotEmpty ?? false;
+      final bool userProvidedPk = data.containsKey(schema.primaryKey) &&
+          data[schema.primaryKey] != null;
+      final bool canSkipDiskUniqueCheck = !hasSecondaryUniques &&
+          !userProvidedPk &&
+          schema.primaryKeyConfig.type == PrimaryKeyType.sequential;
+
+      if (!canSkipDiskUniqueCheck) {
+        uniqueViolation = await _indexManager?.checkUniqueConstraints(
+            table, validData,
+            txId: txId, schemaOverride: schema, skipBufferCheck: true);
+      }
 
       if (uniqueViolation != null) {
         final bool isPkConflict = uniqueViolation.indexName == 'pk';
@@ -1874,9 +1905,6 @@ class DataStoreImpl {
             schema.primaryKeyConfig.type == PrimaryKeyType.sequential;
 
         // Handle PK conflict found on disk: only auto-correct if ID was NOT user-provided
-        final bool userProvidedPk = data.containsKey(schema.primaryKey) &&
-            data[schema.primaryKey] != null;
-
         if (isPkConflict && isSequentialPk && !userProvidedPk) {
           final providedId = validData[schema.primaryKey];
           if (providedId != null) {
@@ -1914,31 +1942,49 @@ class DataStoreImpl {
         ));
       }
 
-      // 6. Rebuild record strictly following schema order (primary key first)
-      final orderedValidData = <String, dynamic>{
-        schema.primaryKey: validData[schema.primaryKey],
-      };
-      for (final field in schema.fields) {
-        if (field.name == schema.primaryKey) {
-          continue;
+      // 6. Ensure record follows schema order (primary key first)
+      final Map<String, dynamic> orderedValidData;
+      if (validData.keys.isNotEmpty &&
+          validData.keys.first == schema.primaryKey) {
+        orderedValidData = validData;
+      } else {
+        orderedValidData = <String, dynamic>{
+          schema.primaryKey: validData[schema.primaryKey],
+        };
+        for (final field in schema.fields) {
+          if (field.name == schema.primaryKey) {
+            continue;
+          }
+          orderedValidData[field.name] = validData[field.name];
         }
-        orderedValidData[field.name] = validData[field.name];
       }
 
-      // 7. Add to write queue (insert operation)
-      await tableDataManager.addToBuffer(
+      // 7. Add to write queue synchronously (zero microtask yields)
+      tableDataManager.addToBufferSync(
         table,
         orderedValidData,
         BufferOperationType.insert,
         transactionId: txId,
         schemaVersion: table.schema.schemaVersion ?? '',
+        durability: durability,
       );
 
-      notifyDataChange(ChangeEvent(
-        type: ChangeType.insert,
-        tableUid: table.tableUid,
-        record: orderedValidData,
-      ));
+      // Advance generator and maxId if user provided a manual primary key
+      if (userProvidedPk &&
+          schema.primaryKeyConfig.type == PrimaryKeyType.sequential) {
+        tableDataManager.updateMaxIdOnManualInsert(
+          table,
+          validData[schema.primaryKey],
+        );
+      }
+
+      if (notificationManager.hasListeners(table.tableUid)) {
+        notifyDataChange(ChangeEvent(
+          type: ChangeType.insert,
+          tableUid: table.tableUid,
+          record: orderedValidData,
+        ));
+      }
 
       if (promoteDesc != null) {
         await _promoteMirrorUpsertToShadow(promoteDesc, [orderedValidData]);
@@ -1950,7 +1996,7 @@ class DataStoreImpl {
           ? _promoteUserFacingSuccessKey(orderedValidData, promoteDesc)
           : validData[schema.primaryKey]?.toString();
       return finish(DbResult.success(
-        successKey: primaryKeyValue,
+        successKeys: primaryKeyValue != null ? [primaryKeyValue] : const [],
         message: 'Insert successful',
       ));
     } catch (e) {
@@ -2091,7 +2137,8 @@ class DataStoreImpl {
 
   /// Upsert one record: update-first by pk or unique key, then insert if not found.
   /// Returns [DbResult]. No where clause; conflict target from data (pk or first complete unique index).
-  Future<DbResult> upsert(String tableName, Map<String, dynamic> data) async {
+  Future<DbResult> upsert(String tableName, Map<String, dynamic> data,
+      {RecoveryDurability? durability}) async {
     DbResult finish(DbResult r) => _returnOrThrowIfTxn(r, 'upsert', tableName);
     if (!_isInitialized) {
       await ensureInitialized();
@@ -2106,7 +2153,7 @@ class DataStoreImpl {
       ));
     }
 
-    return await batchUpsert(tableName, [data]);
+    return await batchUpsert(tableName, [data], durability: durability);
   }
 
   /// backup data and return backup path
@@ -2202,6 +2249,7 @@ class DataStoreImpl {
     bool returnResultDetails = true,
     bool allowLargeScaleOperation = true,
     bool enablePromoteDualWrite = true,
+    RecoveryDurability? durability,
   }) async {
     final tableName = table.tableName;
     DbResult finish(DbResult r) => _returnOrThrowIfTxn(r, 'update', tableName);
@@ -2256,7 +2304,11 @@ class DataStoreImpl {
       Map<String, dynamic>? validData;
       try {
         validData = validateAndProcessUpdateDataPure(
-            schema: schema, data: data, tableName: table.tableName);
+          schema: schema,
+          data: data,
+          tableName: table.tableName,
+          fieldMap: table.fieldMap,
+        );
       } on DbException catch (e) {
         return finish(DbResult.error(
           type: e.statuses.isNotEmpty
@@ -2274,6 +2326,30 @@ class DataStoreImpl {
           message: 'Data validation failed',
         ));
       }
+
+      // Direct Single-PK Fast-Path for update
+      final primaryKey = schema.primaryKey;
+      String? targetPk;
+      late final conditionMap = condition.build();
+      final singleEq = condition.extractSingleEquality();
+      if (singleEq != null && singleEq.field == primaryKey) {
+        targetPk = singleEq.value?.toString();
+      } else {
+        if (conditionMap.length == 1 && conditionMap.containsKey(primaryKey)) {
+          final rawVal = conditionMap[primaryKey];
+          if (rawVal is! Map) {
+            targetPk = rawVal?.toString();
+          } else if (rawVal.containsKey('=')) {
+            targetPk = rawVal['=']?.toString();
+          }
+        }
+      }
+
+      final bool isSinglePkPointTarget = targetPk != null &&
+          offset == null &&
+          orderBy == null &&
+          limit == null &&
+          promoteDesc == null;
 
       // Unique Key and Primary Key Detection
       final String? txIdCheck = Zone.current[_txnZoneKey] as String?;
@@ -2364,24 +2440,23 @@ class DataStoreImpl {
       // Get memory manager to access cache size limits
       final recordCacheSize =
           _resourceManager?.getRecordCacheSize() ?? 200 * 1024 * 1024;
-      final conditionMap = condition.build();
-
-      final primaryKey = schema.primaryKey;
 
       // Check if condition is an equality on primary key or unique field - this can be optimized
-      bool isOptimizableQuery = false;
-      // Small table heuristics: always optimize when
-      // - table data meta is unknown or size invalid
-      // - size < 50MB (unconditional minimum threshold)
-      // - size < 30% of record cache size
-      // Include overflow files: large VectorData rows live mostly out-of-line.
-      const int minSmallTableBytes = 50 * 1024 * 1024; // 50MB
-      final tableDataSizeBytes =
-          await tableDataManager.sumTableDataSizeBytes(table);
-      if (tableDataSizeBytes == 0 ||
-          tableDataSizeBytes < minSmallTableBytes ||
-          tableDataSizeBytes < recordCacheSize * 0.3) {
-        isOptimizableQuery = true;
+      bool isOptimizableQuery = isSinglePkPointTarget;
+      if (!isOptimizableQuery) {
+        // Small table heuristics: always optimize when
+        // - table data meta is unknown or size invalid
+        // - size < 50MB (unconditional minimum threshold)
+        // - size < 30% of record cache size
+        // Include overflow files: large VectorData rows live mostly out-of-line.
+        const int minSmallTableBytes = 50 * 1024 * 1024; // 50MB
+        final tableDataSizeBytes =
+            await tableDataManager.sumTableDataSizeBytes(table);
+        if (tableDataSizeBytes == 0 ||
+            tableDataSizeBytes < minSmallTableBytes ||
+            tableDataSizeBytes < recordCacheSize * 0.3) {
+          isOptimizableQuery = true;
+        }
       }
 
       if (!isOptimizableQuery) {
@@ -2504,17 +2579,31 @@ class DataStoreImpl {
       } else {
         // Optimizable query path: use regular method
         // find matching records (for optimizable queries)
-        // Use a large internal limit when limit is null to avoid default QueryLimit (e.g. 1000)
-        final int effectiveLimit = limit ?? 1000000000;
-        final records = (await queryExecutor.execute(
-          table,
-          condition: condition,
-          orderBy: orderBy,
-          limit: effectiveLimit,
-          offset: offset,
-          engineInternal: true,
-        ))
-            .records;
+        List<Map<String, dynamic>> records;
+        if (isSinglePkPointTarget) {
+          final pointLookup =
+              tableDataManager.getRecordForPointMutationSync(table, targetPk);
+          Map<String, dynamic>? oldRecord;
+          if (pointLookup.found) {
+            oldRecord = pointLookup.record;
+          } else {
+            oldRecord =
+                await tableDataManager.getRecordByPrimaryKey(table, targetPk);
+          }
+          records = oldRecord != null ? [oldRecord] : const [];
+        } else {
+          // Use a large internal limit when limit is null to avoid default QueryLimit (e.g. 1000)
+          final int effectiveLimit = limit ?? 1000000000;
+          records = (await queryExecutor.execute(
+            table,
+            condition: condition,
+            orderBy: orderBy,
+            limit: effectiveLimit,
+            offset: offset,
+            engineInternal: true,
+          ))
+              .records;
+        }
         if (records.isEmpty) {
           return finish(DbResult.error(
             type: ResultType.bizRecordNotFound,
@@ -2534,7 +2623,7 @@ class DataStoreImpl {
         final hasNotify = notificationManager.hasListeners(table.tableUid);
 
         // Row-level locks for target records
-        final lockMgr = lockManager;
+        final lockMgr = txId != null ? lockManager : null;
         final Map<String, String> acquiredResources = {};
 
         void releaseOneRowLock(String pk) {
@@ -2635,7 +2724,11 @@ class DataStoreImpl {
         final List<Map<String, dynamic>> pkChangeOrigRecords = [];
         final List<Map<String, dynamic>> pkChangeUpdatedRecords = [];
         final Set<String> reservedPks = {};
-        final bool hasForeignKeys = _foreignKeyManager != null;
+        final bool touchesOutboundFk = _foreignKeyManager != null &&
+            table.schema.foreignKeys
+                .any((fk) => fk.fields.any(changedFields.contains));
+        final bool needFkWork = _foreignKeyManager != null &&
+            _foreignKeyManager!.hasReferencingTablesSync(table.tableUid);
 
         for (int recordIndex = 0; recordIndex < records.length; recordIndex++) {
           final y3 = yieldController?.maybeYield();
@@ -2650,6 +2743,7 @@ class DataStoreImpl {
             schema: schema,
             validData: validData,
             existingRecord: record,
+            fieldMap: table.fieldMap,
           );
 
           final newPkValue = updatedRecord[primaryKey];
@@ -2806,7 +2900,7 @@ class DataStoreImpl {
             }
 
             // 5) Outgoing FK on the updated row
-            if (hasForeignKeys && changedFields.isNotEmpty) {
+            if (touchesOutboundFk) {
               try {
                 await _foreignKeyManager!.validateForeignKeyConstraints(
                   table: table,
@@ -2831,7 +2925,7 @@ class DataStoreImpl {
             }
 
             // 6) RESTRICT/NO ACTION on the OLD primary key (immediate)
-            if (hasForeignKeys) {
+            if (needFkWork) {
               try {
                 await _foreignKeyManager!.checkRestrictConstraintsForUpdate(
                   table: table,
@@ -2950,17 +3044,19 @@ class DataStoreImpl {
               }
               rethrow;
             }
+          }
 
-            // 2. Validate foreign key constraints after reservation
-            if (hasForeignKeys && changedFields.isNotEmpty) {
-              try {
-                await _foreignKeyManager!.validateForeignKeyConstraints(
-                  table: table,
-                  data: updatedRecord,
-                  operation: ForeignKeyOperation.update,
-                );
-              } catch (e) {
-                // Rollback reservation on FK failure
+          // 2. Validate foreign key constraints (if changed fields touch any outbound FK)
+          if (touchesOutboundFk) {
+            try {
+              await _foreignKeyManager!.validateForeignKeyConstraints(
+                table: table,
+                data: updatedRecord,
+                operation: ForeignKeyOperation.update,
+              );
+            } catch (e) {
+              // Rollback reservation on FK failure
+              if (fieldsToCheck.isNotEmpty) {
                 try {
                   writeBufferManager.releaseReservedUniques(
                     table: table,
@@ -2970,25 +3066,27 @@ class DataStoreImpl {
                   );
                   reservedPks.remove(recordKey);
                 } catch (_) {}
-
-                Logger.error('Foreign key constraint validation failed',
-                    rawError: e);
-                if (continueOnPartialErrors) {
-                  if (returnResultDetails) {
-                    failedKeys.add(recordKey);
-                  }
-                  failedCount++;
-                  continue;
-                }
-                return await finishWithPromoteMirror(DbResult.error(
-                  type: ResultType.bizForeignKeyViolation,
-                  message: e.toString(),
-                  failedKeys: returnResultDetails ? [recordKey] : const [],
-                ));
               }
-            }
 
-            // 3. Perform unique check (disk only) - skip buffer check as we already reserved the keys
+              Logger.error('Foreign key constraint validation failed',
+                  rawError: e);
+              if (continueOnPartialErrors) {
+                if (returnResultDetails) {
+                  failedKeys.add(recordKey);
+                }
+                failedCount++;
+                continue;
+              }
+              return await finishWithPromoteMirror(DbResult.error(
+                type: ResultType.bizForeignKeyViolation,
+                message: e.toString(),
+                failedKeys: returnResultDetails ? [recordKey] : const [],
+              ));
+            }
+          }
+
+          // 3. Perform unique check (disk only) - skip buffer check as we already reserved the keys
+          if (fieldsToCheck.isNotEmpty) {
             final Map<String, dynamic> uniqueCheckData = <String, dynamic>{};
             // Include primary key for self-identification during update
             uniqueCheckData[primaryKey] = record[primaryKey];
@@ -3118,6 +3216,7 @@ class DataStoreImpl {
               schema: schema,
               transactionId: txId,
               schemaVersion: schema.schemaVersion ?? '',
+              durability: durability,
             );
             final insertResult = await tableDataManager.addBatchToBuffer(
               table: table,
@@ -3126,6 +3225,7 @@ class DataStoreImpl {
               schema: schema,
               transactionId: txId,
               schemaVersion: schema.schemaVersion ?? '',
+              durability: durability,
             );
 
             final deleteOk =
@@ -3171,7 +3271,7 @@ class DataStoreImpl {
                 }
 
                 // CASCADE/SET NULL/SET DEFAULT after parent is buffered
-                if (hasForeignKeys) {
+                if (needFkWork) {
                   final oldPk = origRecord[primaryKey];
                   final newPk = updatedRecord[primaryKey];
                   if (txId != null) {
@@ -3222,68 +3322,112 @@ class DataStoreImpl {
 
         // Commit non-PK updates in unified batch
         if (recordsToCommit.isNotEmpty) {
-          try {
-            final commitResult = await tableDataManager.addBatchToBuffer(
-              table: table,
-              records: recordsToCommit,
-              operation: BufferOperationType.update,
-              schema: schema,
-              oldRecordsList: oldRecordsToCommit,
+          if (recordsToCommit.length == 1) {
+            final updatedRecord = recordsToCommit.first;
+            final origRecord = validOriginalRecords.first;
+            final oldRecordValues = oldRecordsToCommit.first;
+            final pkVal = commitPkVals.first;
+
+            tableDataManager.addToBufferSync(
+              table,
+              updatedRecord,
+              BufferOperationType.update,
+              oldValues: oldRecordValues,
+              walOldValues: staticIndexFields.length > 1 ? origRecord : null,
+              hasWalOldValues: true,
+              skipDeletedCheck: true,
               transactionId: txId,
               schemaVersion: schema.schemaVersion ?? '',
+              durability: durability,
             );
 
-            final successSet = commitResult.successRecordIds.toSet();
-            for (int k = 0; k < recordsToCommit.length; k++) {
-              final pkVal = commitPkVals[k];
-              final updatedRecord = recordsToCommit[k];
-              final origRecord = validOriginalRecords[k];
+            final displayPk = promoteDesc != null
+                ? _promoteUserFacingSuccessKey(
+                    updatedRecord,
+                    promoteDesc,
+                    alternateRecord: origRecord,
+                  )
+                : pkVal;
+            if (returnResultDetails) {
+              successKeys.add(displayPk);
+            }
+            successCount++;
+            promoteUpdated?.add(updatedRecord);
+            reservedPks.remove(pkVal);
 
-              if (successSet.contains(pkVal)) {
-                final displayPk = promoteDesc != null
-                    ? _promoteUserFacingSuccessKey(
-                        updatedRecord,
-                        promoteDesc,
-                        alternateRecord: origRecord,
-                      )
-                    : pkVal;
-                if (returnResultDetails) {
-                  successKeys.add(displayPk);
-                }
-                successCount++;
-                promoteUpdated?.add(updatedRecord);
+            if (hasNotify) {
+              notifyDataChange(ChangeEvent(
+                type: ChangeType.update,
+                tableUid: table.tableUid,
+                record: updatedRecord,
+                oldRecord: origRecord,
+              ));
+            }
+          } else {
+            try {
+              final commitResult = await tableDataManager.addBatchToBuffer(
+                table: table,
+                records: recordsToCommit,
+                operation: BufferOperationType.update,
+                schema: schema,
+                oldRecordsList: oldRecordsToCommit,
+                transactionId: txId,
+                schemaVersion: schema.schemaVersion ?? '',
+                durability: durability,
+              );
 
-                if (hasNotify) {
-                  notifyDataChange(ChangeEvent(
-                    type: ChangeType.update,
-                    tableUid: table.tableUid,
-                    record: updatedRecord,
-                    oldRecord: origRecord,
-                  ));
-                }
-              } else {
-                if (returnResultDetails) {
-                  failedKeys.add(pkVal);
-                }
-                failedCount++;
-                if (reservedPks.contains(pkVal)) {
-                  writeBufferManager.releaseReservedUniques(
-                    table: table,
-                    recordId: pkVal,
-                    transactionId: txId,
-                  );
+              final successSet = commitResult.successRecordIds.toSet();
+              for (int k = 0; k < recordsToCommit.length; k++) {
+                final pkVal = commitPkVals[k];
+                final updatedRecord = recordsToCommit[k];
+                final origRecord = validOriginalRecords[k];
+
+                if (successSet.contains(pkVal)) {
+                  final displayPk = promoteDesc != null
+                      ? _promoteUserFacingSuccessKey(
+                          updatedRecord,
+                          promoteDesc,
+                          alternateRecord: origRecord,
+                        )
+                      : pkVal;
+                  if (returnResultDetails) {
+                    successKeys.add(displayPk);
+                  }
+                  successCount++;
+                  promoteUpdated?.add(updatedRecord);
+
+                  if (hasNotify) {
+                    notifyDataChange(ChangeEvent(
+                      type: ChangeType.update,
+                      tableUid: table.tableUid,
+                      record: updatedRecord,
+                      oldRecord: origRecord,
+                    ));
+                  }
+                } else {
+                  if (returnResultDetails) {
+                    failedKeys.add(pkVal);
+                  }
+                  failedCount++;
+                  if (reservedPks.contains(pkVal)) {
+                    writeBufferManager.releaseReservedUniques(
+                      table: table,
+                      recordId: pkVal,
+                      transactionId: txId,
+                    );
+                  }
                 }
               }
+            } catch (e) {
+              if (reservedPks.isNotEmpty) {
+                await writeBufferManager.releaseReservedUniquesForPks(
+                  table: table,
+                  recordIds: reservedPks,
+                  transactionId: txId,
+                );
+              }
+              rethrow;
             }
-          } catch (e) {
-            if (reservedPks.isNotEmpty) {
-              await writeBufferManager.releaseReservedUniquesForPks(
-                table: table,
-                recordIds: reservedPks,
-                transactionId: txId,
-              );
-            }
-            rethrow;
           }
         }
 
@@ -3507,6 +3651,7 @@ class DataStoreImpl {
     bool returnResultDetails = true,
     bool allowLargeScaleOperation = true,
     bool enablePromoteDualWrite = true,
+    RecoveryDurability? durability,
   }) async {
     final tableName = table.tableName;
     DbResult finish(DbResult r) => _returnOrThrowIfTxn(r, 'delete', tableName);
@@ -3581,146 +3726,180 @@ class DataStoreImpl {
         remapPromoteConditionNewToOld(condition, promoteDesc);
       }
 
-      final conditionMap = condition.build();
-
       final primaryKey = schema.primaryKey;
 
-      // Check if condition is an equality on primary key or unique field - this can be optimized
-      bool isOptimizableQuery = false;
-      // Small table heuristics: always optimize when
-      // - table data meta is unknown or size invalid
-      // - size < 50MB (unconditional minimum threshold)
-      // - size < 30% of record cache size
-      // Include overflow files: large VectorData rows live mostly out-of-line.
-      const int minSmallTableBytes = 50 * 1024 * 1024; // 50MB
-      final tableDataSizeBytes =
-          await tableDataManager.sumTableDataSizeBytes(table);
-      if (tableDataSizeBytes == 0 ||
-          tableDataSizeBytes < minSmallTableBytes ||
-          tableDataSizeBytes < recordCacheSize * 0.3) {
-        isOptimizableQuery = true;
+      // Target PK resolution for point-lookup optimization
+      String? targetPk;
+      late final conditionMap = condition.build();
+      final singleEq = condition.extractSingleEquality();
+      if (singleEq != null && singleEq.field == primaryKey) {
+        targetPk = singleEq.value?.toString();
+      } else {
+        if (conditionMap.length == 1 && conditionMap.containsKey(primaryKey)) {
+          final rawVal = conditionMap[primaryKey];
+          if (rawVal is! Map) {
+            targetPk = rawVal?.toString();
+          } else if (rawVal.containsKey('=')) {
+            targetPk = rawVal['=']?.toString();
+          }
+        }
       }
 
-      if (!isOptimizableQuery) {
-        // Analyze condition to check if it's a primary key/unique/index-driven operation
-        if (!condition.isEmpty) {
-          // Heuristic 2: primary key queries for equality-like ops only (=, IN, BETWEEN)
-          if (conditionMap.containsKey(primaryKey)) {
-            final pkCond = conditionMap[primaryKey];
-            if (pkCond is Map<String, dynamic>) {
-              const supportedOps = ['=', 'IN', 'BETWEEN'];
-              for (final op in supportedOps) {
-                if (pkCond.containsKey(op)) {
-                  isOptimizableQuery = true;
-                  break;
-                }
-              }
-            } else {
-              // Direct equality value
-              isOptimizableQuery = true;
-            }
-          }
+      // Stage 1: Target Records Resolution
+      List<Map<String, dynamic>> recordsToDelete;
+      final bool isSinglePkPointTarget = targetPk != null &&
+          offset == null &&
+          orderBy == null &&
+          limit == null &&
+          promoteDesc == null;
 
-          // Heuristic 3: unique field equality or IN (range operators are excluded)
-          if (!isOptimizableQuery) {
-            final uniqueFieldNames = <String>{};
-            final allIndexes = tableMetaManager?.getUniqueIndexesFor(schema) ??
-                <IndexSchema>[];
-            for (final index in allIndexes) {
-              if (index.fields.length == 1) {
-                uniqueFieldNames.add(index.fields[0]);
-              }
-            }
-            for (final fname in uniqueFieldNames) {
-              if (conditionMap.containsKey(fname)) {
-                final v = conditionMap[fname];
-                if (v is Map<String, dynamic>) {
-                  if (v.containsKey('=') || v.containsKey('IN')) {
+      if (isSinglePkPointTarget) {
+        final pointLookup =
+            tableDataManager.getRecordForPointMutationSync(table, targetPk);
+        Map<String, dynamic>? currentRecord;
+        if (pointLookup.found) {
+          currentRecord = pointLookup.record;
+        } else {
+          currentRecord =
+              await tableDataManager.getRecordByPrimaryKey(table, targetPk);
+        }
+        recordsToDelete = currentRecord != null ? [currentRecord] : const [];
+      } else {
+        // Check if condition is an equality on primary key or unique field - this can be optimized
+        bool isOptimizableQuery = false;
+        // Small table heuristics: always optimize when
+        // - table data meta is unknown or size invalid
+        // - size < 50MB (unconditional minimum threshold)
+        // - size < 30% of record cache size
+        // Include overflow files: large VectorData rows live mostly out-of-line.
+        const int minSmallTableBytes = 50 * 1024 * 1024; // 50MB
+        final tableDataSizeBytes =
+            await tableDataManager.sumTableDataSizeBytes(table);
+        if (tableDataSizeBytes == 0 ||
+            tableDataSizeBytes < minSmallTableBytes ||
+            tableDataSizeBytes < recordCacheSize * 0.3) {
+          isOptimizableQuery = true;
+        }
+
+        if (!isOptimizableQuery) {
+          // Analyze condition to check if it's a primary key/unique/index-driven operation
+          if (!condition.isEmpty) {
+            // Heuristic 2: primary key queries for equality-like ops only (=, IN, BETWEEN)
+            if (conditionMap.containsKey(primaryKey)) {
+              final pkCond = conditionMap[primaryKey];
+              if (pkCond is Map<String, dynamic>) {
+                const supportedOps = ['=', 'IN', 'BETWEEN'];
+                for (final op in supportedOps) {
+                  if (pkCond.containsKey(op)) {
                     isOptimizableQuery = true;
                     break;
                   }
-                } else {
-                  isOptimizableQuery = true;
-                  break;
+                }
+              } else {
+                // Direct equality value
+                isOptimizableQuery = true;
+              }
+            }
+
+            // Heuristic 3: unique field equality or IN (range operators are excluded)
+            if (!isOptimizableQuery) {
+              final uniqueFieldNames = <String>{};
+              final allIndexes =
+                  tableMetaManager?.getUniqueIndexesFor(schema) ??
+                      <IndexSchema>[];
+              for (final index in allIndexes) {
+                if (index.fields.length == 1) {
+                  uniqueFieldNames.add(index.fields[0]);
+                }
+              }
+              for (final fname in uniqueFieldNames) {
+                if (conditionMap.containsKey(fname)) {
+                  final v = conditionMap[fname];
+                  if (v is Map<String, dynamic>) {
+                    if (v.containsKey('=') || v.containsKey('IN')) {
+                      isOptimizableQuery = true;
+                      break;
+                    }
+                  } else {
+                    isOptimizableQuery = true;
+                    break;
+                  }
                 }
               }
             }
           }
-        }
 
-        // If limit is not null and less than 200000, set isOptimizableQuery to true
-        if (limit != null && limit < 200000) {
-          isOptimizableQuery = true;
-          if (offset != null && offset > 200000) {
-            isOptimizableQuery = false;
+          // If limit is not null and less than 200000, set isOptimizableQuery to true
+          if (limit != null && limit < 200000) {
+            isOptimizableQuery = true;
+            if (offset != null && offset > 200000) {
+              isOptimizableQuery = false;
+            }
           }
         }
-      }
 
-      // Large-scale data delete path: engine defaults allow; public API must opt in
-      if (!isOptimizableQuery) {
-        if (promoteDesc != null) {
-          return finish(_promoteRejectLargeOp(tableName, 'delete'));
-        }
-        if (!allowLargeScaleOperation) {
-          const message =
-              'This is a large-scale data delete operation. To prevent memory overflow, you must explicitly call allowLargeScaleOperation(). The operation will run in background batches and block until completion; success/failure primary keys and per-row status details are not returned. If interrupted, already-persisted changes are kept and you must retry to continue.';
-          Logger.warn(message);
-          return finish(DbResult.error(
-            type: ResultType.devLargeScaleOperationRequired,
-            message: message,
-          ));
-        }
-        if (txId != null) {
-          const message =
-              'Large-scale data delete is not allowed inside a transaction. '
-              'Run it outside the transaction with allowLargeScaleOperation().';
-          Logger.warn(message);
-          return finish(DbResult.error(
-            type: ResultType.devLargeScaleOperationNotAllowedInTransaction,
-            message: message,
-          ));
-        }
+        // Large-scale data delete path: engine defaults allow; public API must opt in
+        if (!isOptimizableQuery) {
+          if (promoteDesc != null) {
+            return finish(_promoteRejectLargeOp(tableName, 'delete'));
+          }
+          if (!allowLargeScaleOperation) {
+            const message =
+                'This is a large-scale data delete operation. To prevent memory overflow, you must explicitly call allowLargeScaleOperation(). The operation will run in background batches and block until completion; success/failure primary keys and per-row status details are not returned. If interrupted, already-persisted changes are kept and you must retry to continue.';
+            Logger.warn(message);
+            return finish(DbResult.error(
+              type: ResultType.devLargeScaleOperationRequired,
+              message: message,
+            ));
+          }
+          if (txId != null) {
+            const message =
+                'Large-scale data delete is not allowed inside a transaction. '
+                'Run it outside the transaction with allowLargeScaleOperation().';
+            Logger.warn(message);
+            return finish(DbResult.error(
+              type: ResultType.devLargeScaleOperationNotAllowedInTransaction,
+              message: message,
+            ));
+          }
 
-        final largeDeleteOpId = GlobalIdGenerator.generate('large_delete_');
-        final outcome = await LargeOperationRunner.runLargeDelete(
-          this,
-          LargeDeleteRequest(
-            opId: largeDeleteOpId,
-            tableUid: table.tableUid,
-            condition: conditionMap,
-            orderBy: orderBy,
-            limit: limit,
-            offset: offset,
-          ),
-        );
-        if (outcome.hasErrors) {
-          return finish(DbResult.batch(
-            statuses: outcome.errorStatuses,
-            successCount: outcome.successCount,
-            failedCount: outcome.errorStatuses.length,
-            hasErrors: true,
-          ));
-        }
-
-        return finish(DbResult(
-          statuses: [
-            SuccessStatus(
-              message:
-                  'Large-scale data delete completed (${outcome.successCount} records).',
+          final largeDeleteOpId = GlobalIdGenerator.generate('large_delete_');
+          final outcome = await LargeOperationRunner.runLargeDelete(
+            this,
+            LargeDeleteRequest(
+              opId: largeDeleteOpId,
+              tableUid: table.tableUid,
+              condition: conditionMap,
+              orderBy: orderBy,
+              limit: limit,
+              offset: offset,
             ),
-          ],
-          successCount: outcome.successCount,
-          failedCount: 0,
-          hasErrors: false,
-        ));
-      }
+          );
+          if (outcome.hasErrors) {
+            return finish(DbResult.batch(
+              statuses: outcome.errorStatuses,
+              successCount: outcome.successCount,
+              failedCount: outcome.errorStatuses.length,
+              hasErrors: true,
+            ));
+          }
 
-      // Optimizable path: get all matching records
-      {
-        // Use a large internal limit when limit is null to avoid default QueryLimit (e.g. 1000)
+          return finish(DbResult(
+            statuses: [
+              SuccessStatus(
+                message:
+                    'Large-scale data delete completed (${outcome.successCount} records).',
+              ),
+            ],
+            successCount: outcome.successCount,
+            failedCount: 0,
+            hasErrors: false,
+          ));
+        }
+
+        // Optimizable query path: get all matching records via query executor
         final int effectiveLimit = limit ?? 1000000000;
-        final recordsToDelete = (await queryExecutor.execute(
+        recordsToDelete = (await queryExecutor.execute(
           table,
           condition: condition,
           orderBy: orderBy,
@@ -3729,166 +3908,179 @@ class DataStoreImpl {
           engineInternal: true,
         ))
             .records;
+      }
 
-        if (recordsToDelete.isEmpty) {
-          return finish(DbResult.success(
-            message: 'No records found to delete',
-            successKeys: [],
-          ));
+      if (recordsToDelete.isEmpty) {
+        return finish(DbResult.success(
+          message: 'No records found to delete',
+          successKeys: [],
+        ));
+      }
+
+      final hasListeners = notificationManager.hasListeners(table.tableUid);
+      final needFkWork = _foreignKeyManager != null &&
+          _foreignKeyManager!.hasReferencingTablesSync(table.tableUid);
+
+      final successKeys = <String>[];
+      var successCount = 0;
+
+      if (needFkWork) {
+        // Pass 1: collect PKs (FK batch needs the full set before mutation).
+        final deletedPkValues = <dynamic>[];
+        final collectYield = YieldController('DataStoreImpl.delete.collectPks');
+        for (final record in recordsToDelete) {
+          final y = collectYield.maybeYield();
+          if (y != null) await y;
+          final pkValue = record[primaryKey];
+          if (pkValue == null) continue;
+          deletedPkValues.add(pkValue);
+          successCount++;
+          if (returnResultDetails) {
+            successKeys.add(
+              promoteDesc != null
+                  ? _promoteUserFacingSuccessKey(record, promoteDesc)
+                  : pkValue.toString(),
+            );
+          }
         }
 
-        final hasListeners = notificationManager.hasListeners(table.tableUid);
-        final needFkWork = _foreignKeyManager != null &&
-            (await _foreignKeyManager!.findReferencingTables(table)).isNotEmpty;
+        // RESTRICT immediately; CASCADE/SET* now or defer to commit.
+        try {
+          await _foreignKeyManager!.checkRestrictConstraintsForDeleteBatch(
+            table: table,
+            deletedPkValues: deletedPkValues,
+          );
+        } catch (e) {
+          Logger.error('RESTRICT constraint check failed', rawError: e);
+          return finish(_normalizeCascadeError(e, 'delete'));
+        }
 
-        final successKeys = <String>[];
-        var successCount = 0;
-
-        if (needFkWork) {
-          // Pass 1: collect PKs (FK batch needs the full set before mutation).
-          final deletedPkValues = <dynamic>[];
-          final collectYield =
-              YieldController('DataStoreImpl.delete.collectPks');
-          for (final record in recordsToDelete) {
-            final y = collectYield.maybeYield();
-            if (y != null) await y;
-            final pkValue = record[primaryKey];
-            if (pkValue == null) continue;
-            deletedPkValues.add(pkValue);
-            successCount++;
-            if (returnResultDetails) {
-              successKeys.add(
-                promoteDesc != null
-                    ? _promoteUserFacingSuccessKey(record, promoteDesc)
-                    : pkValue.toString(),
-              );
-            }
-          }
-
-          // RESTRICT immediately; CASCADE/SET* now or defer to commit.
+        if (txId == null) {
           try {
-            await _foreignKeyManager!.checkRestrictConstraintsForDeleteBatch(
+            await _foreignKeyManager!.handleCascadeDeleteBatch(
               table: table,
               deletedPkValues: deletedPkValues,
+              skipRestrictCheck: true,
             );
           } catch (e) {
-            Logger.error('RESTRICT constraint check failed', rawError: e);
+            Logger.error('Cascade delete failed', rawError: e);
             return finish(_normalizeCascadeError(e, 'delete'));
           }
+        }
 
-          if (txId == null) {
-            try {
-              await _foreignKeyManager!.handleCascadeDeleteBatch(
-                table: table,
-                deletedPkValues: deletedPkValues,
-                skipRestrictCheck: true,
-              );
-            } catch (e) {
-              Logger.error('Cascade delete failed', rawError: e);
-              return finish(_normalizeCascadeError(e, 'delete'));
-            }
-          }
-
-          // Pass 2: transaction-only side effects (locks / write-set / defer CASCADE).
-          if (txId != null) {
-            final applyYield =
-                YieldController('DataStoreImpl.delete.applyAfterFk');
-            final lockMgr = lockManager;
-            for (final record in recordsToDelete) {
-              final y = applyYield.maybeYield();
-              if (y != null) await y;
-              final pkValue = record[primaryKey];
-              if (pkValue == null) continue;
-              final oldPk = pkValue.toString();
-              if (lockMgr != null) {
-                try {
-                  final res = 'row:$tableName:pk:$oldPk';
-                  final opId = GlobalIdGenerator.generate('delete_row_');
-                  final ok = await lockMgr.acquireExclusiveLock(res, opId);
-                  if (ok) {
-                    TransactionContext.registerExclusiveLock(res, opId);
-                  }
-                } catch (_) {}
-              }
-              transactionManager?.registerWriteKey(txId, table, oldPk);
-              transactionManager?.registerDeferredCascadeDelete(
-                  txId, table, pkValue);
-            }
-          }
-        } else {
-          // No referencing FKs: one pass covers keys and transaction side effects.
-          final applyYield = YieldController('DataStoreImpl.delete.applyNoFk');
-          final lockMgr = txId != null ? lockManager : null;
+        // Pass 2: transaction-only side effects (locks / write-set / defer CASCADE).
+        if (txId != null) {
+          final applyYield =
+              YieldController('DataStoreImpl.delete.applyAfterFk');
+          final lockMgr = lockManager;
           for (final record in recordsToDelete) {
             final y = applyYield.maybeYield();
             if (y != null) await y;
             final pkValue = record[primaryKey];
             if (pkValue == null) continue;
             final oldPk = pkValue.toString();
-            successCount++;
-            if (returnResultDetails) {
-              successKeys.add(
-                promoteDesc != null
-                    ? _promoteUserFacingSuccessKey(record, promoteDesc)
-                    : oldPk,
-              );
+            if (lockMgr != null) {
+              try {
+                final res = 'row:$tableName:pk:$oldPk';
+                final opId = GlobalIdGenerator.generate('delete_row_');
+                final ok = await lockMgr.acquireExclusiveLock(res, opId);
+                if (ok) {
+                  TransactionContext.registerExclusiveLock(res, opId);
+                }
+              } catch (_) {}
             }
-            if (txId != null) {
-              if (lockMgr != null) {
-                try {
-                  final res = 'row:$tableName:pk:$oldPk';
-                  final opId = GlobalIdGenerator.generate('delete_row_');
-                  final ok = await lockMgr.acquireExclusiveLock(res, opId);
-                  if (ok) {
-                    TransactionContext.registerExclusiveLock(res, opId);
-                  }
-                } catch (_) {}
-              }
-              transactionManager?.registerWriteKey(txId, table, oldPk);
-            }
+            transactionManager?.registerWriteKey(txId, table, oldPk);
+            transactionManager?.registerDeferredCascadeDelete(
+                txId, table, pkValue);
           }
         }
+      } else {
+        // No referencing FKs: one pass covers keys and transaction side effects.
+        final applyYield = YieldController('DataStoreImpl.delete.applyNoFk');
+        final lockMgr = txId != null ? lockManager : null;
+        for (final record in recordsToDelete) {
+          final y = applyYield.maybeYield();
+          if (y != null) await y;
+          final pkValue = record[primaryKey];
+          if (pkValue == null) continue;
+          final oldPk = pkValue.toString();
+          successCount++;
+          if (returnResultDetails) {
+            successKeys.add(
+              promoteDesc != null
+                  ? _promoteUserFacingSuccessKey(record, promoteDesc)
+                  : oldPk,
+            );
+          }
+          if (txId != null) {
+            if (lockMgr != null) {
+              try {
+                final res = 'row:$tableName:pk:$oldPk';
+                final opId = GlobalIdGenerator.generate('delete_row_');
+                final ok = await lockMgr.acquireExclusiveLock(res, opId);
+                if (ok) {
+                  TransactionContext.registerExclusiveLock(res, opId);
+                }
+              } catch (_) {}
+            }
+            transactionManager?.registerWriteKey(txId, table, oldPk);
+          }
+        }
+      }
 
+      if (recordsToDelete.length == 1) {
+        tableDataManager.addToBufferSync(
+          table,
+          recordsToDelete.first,
+          BufferOperationType.delete,
+          skipDeletedCheck: true,
+          transactionId: txId,
+          schemaVersion: table.schema.schemaVersion ?? '',
+          durability: durability,
+        );
+      } else {
         await tableDataManager.addToDeleteBuffer(
           table,
           recordsToDelete,
           schemaVersion: table.schema.schemaVersion ?? '',
+          durability: durability,
         );
+      }
 
-        if (promoteDesc != null && successCount > 0) {
-          await _promoteMirrorDeleteFromShadow(promoteDesc, recordsToDelete);
-        }
+      if (promoteDesc != null && successCount > 0) {
+        await _promoteMirrorDeleteFromShadow(promoteDesc, recordsToDelete);
+      }
 
-        // Notify after buffer/cache are updated so watch re-queries see tombstones.
-        // Inside a transaction, events are deferred until commit (data not yet visible).
-        if (hasListeners) {
-          final notifyYield = YieldController('DataStoreImpl.delete.notify');
-          for (final record in recordsToDelete) {
-            final y = notifyYield.maybeYield();
-            if (y != null) await y;
-            notifyDataChange(ChangeEvent(
-              type: ChangeType.delete,
-              tableUid: table.tableUid,
-              oldRecord: record,
-            ));
-          }
-        }
-
-        if (!returnResultDetails) {
-          return finish(DbResult(
-            statuses: const [],
-            successKeys: const [],
-            failedKeys: const [],
-            successCount: successCount,
-            failedCount: 0,
+      // Notify after buffer/cache are updated so watch re-queries see tombstones.
+      // Inside a transaction, events are deferred until commit (data not yet visible).
+      if (hasListeners) {
+        final notifyYield = YieldController('DataStoreImpl.delete.notify');
+        for (final record in recordsToDelete) {
+          final y = notifyYield.maybeYield();
+          if (y != null) await y;
+          notifyDataChange(ChangeEvent(
+            type: ChangeType.delete,
+            tableUid: table.tableUid,
+            record: record,
+            oldRecord: record,
           ));
         }
+      }
 
-        return finish(DbResult.success(
-          successKeys: successKeys,
-          message: 'Successfully deleted $successCount records',
+      if (!returnResultDetails) {
+        return finish(DbResult(
+          statuses: const [],
+          successKeys: const [],
+          failedKeys: const [],
+          successCount: successCount,
+          failedCount: 0,
         ));
       }
+
+      return finish(DbResult.success(
+        successKeys: successKeys,
+        message: 'Successfully deleted $successCount records',
+      ));
     } catch (e) {
       Logger.error('Delete failed', rawError: e);
       if (isInTransactionWithRollback()) {
@@ -3994,8 +4186,8 @@ class DataStoreImpl {
   /// During [TransactionContext.isApplyingCommit] (and outside transactions)
   /// notifications are emitted immediately.
   void notifyDataChange(ChangeEvent event) {
+    if (!notificationManager.hasListeners(event.tableUid)) return;
     if (TransactionContext.shouldDeferChangeNotification()) {
-      if (!notificationManager.hasListeners(event.tableUid)) return;
       TransactionContext.enqueuePendingChangeEvent(event);
       return;
     }
@@ -4422,7 +4614,8 @@ class DataStoreImpl {
       {bool allowPartialErrors = true,
       bool returnResultDetails = true,
       bool enablePromoteDualWrite = true,
-      PromoteRuntimeDescriptor? promoteResultKeyDesc}) async {
+      PromoteRuntimeDescriptor? promoteResultKeyDesc,
+      RecoveryDurability? durability}) async {
     DbResult finish(DbResult r) =>
         _returnOrThrowIfTxn(r, 'batchInsert', tableName);
     if (!_isInitialized) {
@@ -4569,31 +4762,37 @@ class DataStoreImpl {
           (hasCustomPk || hasSecondaryUniqueIndexes);
 
       try {
-        final int bufferBatchSize = isPurePkCandidate ? 2000 : 1000;
+        final int bufferBatchSize = isPurePkCandidate ? 100000 : 50000;
         int start = 0;
         final batchTimestamp = DateTime.now();
+        final String sharedNowIso = batchTimestamp.toIso8601String();
+        final int sharedNowMs = batchTimestamp.millisecondsSinceEpoch;
 
         while (start < records.length) {
           final int end = min(start + bufferBatchSize, records.length);
           final int windowLen = end - start;
 
           // 1. Batch allocate auto PKs strictly for current window (O(1) memory)
-          final missingPkIndices = <int>[];
+          List<int>? missingPkIndices;
           bool hasUserProvidedPrimaryKeyInWindow = false;
+          List<String>? newIds;
+          bool isWindowAllAutoPk = false;
+          bool isWindowAllUserPk = false;
 
           if (!hasCustomPk) {
+            int missingCount = 0;
             for (int i = 0; i < windowLen; i++) {
               if (records[start + i][primaryKey] == null) {
-                missingPkIndices.add(i);
+                missingCount++;
               } else {
                 hasUserProvidedPrimaryKeyInWindow = true;
               }
             }
 
-            if (missingPkIndices.isNotEmpty) {
-              final newIds = await tableDataManager.getBatchIds(
-                  table, missingPkIndices.length);
-              if (newIds.length != missingPkIndices.length) {
+            if (missingCount == windowLen) {
+              isWindowAllAutoPk = true;
+              newIds = await tableDataManager.getBatchIds(table, windowLen);
+              if (newIds.length != windowLen) {
                 if (!allowPartialErrors) {
                   return finish(DbResult.error(
                     type: ResultType.engError,
@@ -4603,26 +4802,53 @@ class DataStoreImpl {
                   ));
                 }
               } else {
-                for (int i = 0; i < missingPkIndices.length; i++) {
-                  records[start + missingPkIndices[i]][primaryKey] = newIds[i];
+                for (int i = 0; i < windowLen; i++) {
+                  records[start + i][primaryKey] = newIds[i];
+                }
+              }
+            } else if (missingCount == 0) {
+              isWindowAllUserPk = true;
+            } else {
+              // Mixed user-provided PKs and auto-increment PKs
+              final list = <int>[];
+              for (int i = 0; i < windowLen; i++) {
+                if (records[start + i][primaryKey] == null) {
+                  list.add(i);
+                }
+              }
+              missingPkIndices = list;
+              newIds = await tableDataManager.getBatchIds(table, list.length);
+              if (newIds.length != list.length) {
+                if (!allowPartialErrors) {
+                  return finish(DbResult.error(
+                    type: ResultType.engError,
+                    message:
+                        'Failed to generate enough primary keys for batch insert',
+                    failedKeys: returnResultDetails ? failedKeys : const [],
+                  ));
+                }
+              } else {
+                for (int i = 0; i < list.length; i++) {
+                  records[start + list[i]][primaryKey] = newIds[i];
                 }
               }
             }
           } else {
             hasUserProvidedPrimaryKeyInWindow = true;
+            isWindowAllUserPk = true;
           }
 
-          final bool isWindowAllAutoPk =
-              !hasCustomPk && missingPkIndices.length == windowLen;
-          final bool isWindowAllUserPk =
-              !hasCustomPk && missingPkIndices.isEmpty;
-          final Set<int>? autoPkIndexSet =
-              (!isWindowAllAutoPk && !isWindowAllUserPk)
-                  ? missingPkIndices.toSet()
-                  : null;
+          final Set<int>? autoPkIndexSet = (!isWindowAllAutoPk &&
+                  !isWindowAllUserPk &&
+                  missingPkIndices != null)
+              ? missingPkIndices.toSet()
+              : null;
 
-          final bool isFastPathWindow =
-              isPurePkCandidate && (isWindowAllAutoPk || skipDiskUniqueChecks);
+          // Safe memory reservation skip condition:
+          // Strictly only when all PKs in this window are auto-generated by the system sequence
+          // (guaranteed unique and monotonically increasing) AND there are no secondary unique indexes.
+          final bool canSkipMemoryReserve =
+              isWindowAllAutoPk && !hasSecondaryUniqueIndexes;
 
           final bool needDiskUniqueCheck = needDiskUniqueCheckBase ||
               (!skipDiskUniqueChecks &&
@@ -4641,19 +4867,22 @@ class DataStoreImpl {
 
           final yieldController = YieldController(
             'DataStoreImpl.batchInsert.loop',
-            minCheckInterval: isFastPathWindow
-                ? 1024
+            minCheckInterval: canSkipMemoryReserve
+                ? EngineCpuChunk.fastPathMinCheckInterval
                 : EngineCpuChunk.hotPathMinCheckInterval,
           );
 
-          // Optimization: Create batch context to hoist table/buffer lookups out of the record loop
-          final batchContext = isFastPathWindow
+          // Optimization: Create batch context to hoist table/buffer lookups out of the record loop.
+          // Skipped when canSkipMemoryReserve is true because auto-generated PKs have no conflicts.
+          final batchContext = canSkipMemoryReserve
               ? null
               : writeBufferManager.createBatchReserveContext(table, txId);
 
           // Collect valid records for a single bulk enqueue into WAL + buffer + cache.
-          final batchRecordsForBuffer = <Map<String, dynamic>>[];
+          List<Map<String, dynamic>> batchRecordsForBuffer =
+              <Map<String, dynamic>>[];
           final batchRecordIndicesForBuffer = <int>[];
+          List<String> batchRecordIdsForBuffer = <String>[];
 
           Future<bool> flushBatch() async {
             if (batchRecordsForBuffer.isEmpty) return false;
@@ -4713,6 +4942,7 @@ class DataStoreImpl {
                 if (vios.isNotEmpty) {
                   final keepRecords = <Map<String, dynamic>>[];
                   final keepIndices = <int>[];
+                  final keepIds = <String>[];
                   final filterYield = YieldController(
                     'DataStore.batchInsert.flush.filter',
                     minCheckInterval: EngineCpuChunk.hotPathMinCheckInterval,
@@ -4731,6 +4961,7 @@ class DataStoreImpl {
                     if (vio == null) {
                       keepRecords.add(rec);
                       keepIndices.add(globalIdx);
+                      keepIds.add(rid);
                       continue;
                     }
 
@@ -4780,6 +5011,7 @@ class DataStoreImpl {
                               );
                               keepRecords.add(rec);
                               keepIndices.add(globalIdx);
+                              keepIds.add(newRid);
                               continue; // Successfully healed!
                             }
                           } catch (_) {}
@@ -4809,12 +5041,11 @@ class DataStoreImpl {
                     }
                   }
 
-                  batchRecordsForBuffer
-                    ..clear()
-                    ..addAll(keepRecords);
+                  batchRecordsForBuffer = keepRecords;
                   batchRecordIndicesForBuffer
                     ..clear()
                     ..addAll(keepIndices);
+                  batchRecordIdsForBuffer = keepIds;
                 }
               } catch (e) {
                 Logger.warn('Batch unique disk check failed', rawError: e);
@@ -4859,8 +5090,9 @@ class DataStoreImpl {
                   failedCount++;
                 }
                 batchContext?.releaseAll();
-                batchRecordsForBuffer.clear();
+                batchRecordsForBuffer = <Map<String, dynamic>>[];
                 batchRecordIndicesForBuffer.clear();
+                batchRecordIdsForBuffer = <String>[];
               }
             }
 
@@ -4875,8 +5107,10 @@ class DataStoreImpl {
               schema: tableSchema,
               transactionId: txId,
               schemaVersion: tableSchema.schemaVersion ?? '',
-              installUniquesOnApply: isFastPathWindow,
+              installUniquesOnApply: canSkipMemoryReserve,
               deferQueryCacheInvalidation: deferQueryCacheInvalidation,
+              durability: durability,
+              preValidatedRecordIds: batchRecordIdsForBuffer,
             );
 
             bool hadFailures = false;
@@ -4935,14 +5169,29 @@ class DataStoreImpl {
               }
             }
 
-            batchRecordsForBuffer.clear();
+            batchRecordsForBuffer = <Map<String, dynamic>>[];
+            batchRecordIndicesForBuffer.clear();
+            batchRecordIdsForBuffer = <String>[];
 
             return hadFailures;
           }
 
           final recordErrors = <String>[];
+          bool allRecordsValidInWindow = true;
 
-          // Process prepared records: reserve unique keys and enqueue for flush.
+          void backfillPrecedingValidRecords(int failedOffset) {
+            for (int k = 0; k < failedOffset; k++) {
+              final int idx = start + k;
+              final r = records[idx];
+              final pkVal = r[primaryKey];
+              final id = pkVal is String ? pkVal : (pkVal?.toString() ?? '');
+              batchRecordsForBuffer.add(r);
+              batchRecordIndicesForBuffer.add(idx);
+              batchRecordIdsForBuffer.add(id);
+            }
+          }
+
+          // Process prepared records: validate, verify FKs, reserve unique keys, and enqueue for flush.
           for (int offset = 0; offset < windowLen; offset++) {
             final int j = start + offset;
             final record = records[j];
@@ -4975,6 +5224,8 @@ class DataStoreImpl {
                     batchTimestamp: batchTimestamp,
                     schemaNeedsConstraintPass: needsConstraintPass,
                     mutateInPlace: true,
+                    precomputedNowIso: sharedNowIso,
+                    precomputedNowMs: sharedNowMs,
                   );
                 } on DbException catch (e) {
                   recordErrors.addAll(e.statuses.map((s) => s.message));
@@ -4984,6 +5235,12 @@ class DataStoreImpl {
                 }
 
                 if (validData == null) {
+                  if (allRecordsValidInWindow) {
+                    allRecordsValidInWindow = false;
+                    if (canSkipMemoryReserve && allowPartialErrors) {
+                      backfillPrecedingValidRecords(offset);
+                    }
+                  }
                   invalidRecords.add(record);
                   final pkVal = record[primaryKey];
                   final failedKey =
@@ -5015,6 +5272,22 @@ class DataStoreImpl {
                       );
                     }
                   }
+                  if (!allowPartialErrors) {
+                    await flushBatch();
+                    final List<ResultStatus> errStatuses = returnResultDetails
+                        ? statusSlots!
+                            .whereType<ResultStatus>()
+                            .toList(growable: false)
+                        : const [];
+                    return await finishWithPromoteMirror(DbResult.error(
+                      type: ResultType.bizValidationFailed,
+                      message: recordErrors.isNotEmpty
+                          ? recordErrors.join('; ')
+                          : 'Validation failed for record pk=$failedKey',
+                      failedKeys: returnResultDetails ? failedKeys : const [],
+                      statuses: errStatuses,
+                    ));
+                  }
                   finishedRecord = true;
                   break;
                 }
@@ -5044,6 +5317,12 @@ class DataStoreImpl {
                   }
 
                   if (fkVio != null) {
+                    if (allRecordsValidInWindow) {
+                      allRecordsValidInWindow = false;
+                      if (canSkipMemoryReserve && allowPartialErrors) {
+                        backfillPrecedingValidRecords(offset);
+                      }
+                    }
                     invalidRecords.add(record);
                     final pkVal = validData[primaryKey];
                     final failedKey =
@@ -5065,6 +5344,20 @@ class DataStoreImpl {
                           index: j,
                         );
                       }
+                    }
+                    if (!allowPartialErrors) {
+                      await flushBatch();
+                      final List<ResultStatus> errStatuses = returnResultDetails
+                          ? statusSlots!
+                              .whereType<ResultStatus>()
+                              .toList(growable: false)
+                          : const [];
+                      return await finishWithPromoteMirror(DbResult.error(
+                        type: ResultType.bizForeignKeyViolation,
+                        message: fkVio.message,
+                        failedKeys: returnResultDetails ? failedKeys : const [],
+                        statuses: errStatuses,
+                      ));
                     }
                     finishedRecord = true;
                     break;
@@ -5133,8 +5426,9 @@ class DataStoreImpl {
                             }
 
                             if (subsequentToReassign.isNotEmpty) {
-                              final newIds = await tableDataManager.getBatchIds(
-                                  table, subsequentToReassign.length);
+                              final newIds =
+                                  await tableDataManager.getBatchIds(
+                                      table, subsequentToReassign.length);
                               for (int k = 0;
                                   k < subsequentToReassign.length;
                                   k++) {
@@ -5158,6 +5452,12 @@ class DataStoreImpl {
                         continue;
                       }
 
+                      if (allRecordsValidInWindow) {
+                        allRecordsValidInWindow = false;
+                        if (canSkipMemoryReserve && allowPartialErrors) {
+                          backfillPrecedingValidRecords(offset);
+                        }
+                      }
                       invalidRecords.add(record);
                       final failedKey = recordId;
                       if (returnResultDetails && failedKey.isNotEmpty) {
@@ -5198,11 +5498,20 @@ class DataStoreImpl {
                   }
                 }
 
-                batchRecordsForBuffer.add(validData);
-                batchRecordIndicesForBuffer.add(j);
+                if (!canSkipMemoryReserve || !allRecordsValidInWindow) {
+                  batchRecordsForBuffer.add(validData);
+                  batchRecordIndicesForBuffer.add(j);
+                  batchRecordIdsForBuffer.add(recordId);
+                }
                 finishedRecord = true;
               }
             } catch (e) {
+              if (allRecordsValidInWindow) {
+                allRecordsValidInWindow = false;
+                if (canSkipMemoryReserve && allowPartialErrors) {
+                  backfillPrecedingValidRecords(offset);
+                }
+              }
               Logger.warn('Error processing record', rawError: e);
               invalidRecords.add(record);
               final pkVal = record[primaryKey];
@@ -5252,6 +5561,24 @@ class DataStoreImpl {
                   statuses: errStatuses,
                 ));
               }
+            }
+          }
+
+          if (canSkipMemoryReserve && allRecordsValidInWindow) {
+            batchRecordsForBuffer = (start == 0 && end == records.length)
+                ? records
+                : records.sublist(start, end);
+            batchRecordIdsForBuffer = (isWindowAllAutoPk && newIds != null)
+                ? newIds
+                : List<String>.generate(windowLen, (i) {
+                    final pkVal = records[start + i][primaryKey];
+                    return pkVal is String ? pkVal : (pkVal?.toString() ?? '');
+                  }, growable: false);
+            if (returnResultDetails) {
+              batchRecordIndicesForBuffer.addAll(
+                List<int>.generate(windowLen, (i) => start + i,
+                    growable: false),
+              );
             }
           }
 
@@ -5449,7 +5776,8 @@ class DataStoreImpl {
       String tableName, List<Map<String, dynamic>> records,
       {bool allowPartialErrors = true,
       bool returnResultDetails = true,
-      bool enablePromoteDualWrite = true}) async {
+      bool enablePromoteDualWrite = true,
+      RecoveryDurability? durability}) async {
     DbResult finish(DbResult r) =>
         _returnOrThrowIfTxn(r, 'batchUpsert', tableName);
     if (!_isInitialized) {
@@ -5619,6 +5947,7 @@ class DataStoreImpl {
           returnResultDetails: trackKeys,
           enablePromoteDualWrite: false,
           promoteResultKeyDesc: promoteDesc,
+          durability: durability,
         );
         if (!upResult.hasErrors || allowPartialErrors) {
           if (trackKeys) {
@@ -5653,6 +5982,7 @@ class DataStoreImpl {
           returnResultDetails: trackKeys,
           enablePromoteDualWrite: false,
           promoteResultKeyDesc: promoteDesc,
+          durability: durability,
         );
         if (trackKeys) {
           successKeys.addAll(insResult.successKeys);
@@ -5735,7 +6065,8 @@ class DataStoreImpl {
       {bool allowPartialErrors = true,
       bool returnResultDetails = true,
       bool enablePromoteDualWrite = true,
-      PromoteRuntimeDescriptor? promoteResultKeyDesc}) async {
+      PromoteRuntimeDescriptor? promoteResultKeyDesc,
+      RecoveryDurability? durability}) async {
     DbResult finish(DbResult r) =>
         _returnOrThrowIfTxn(r, 'batchUpdate', tableName);
     if (!_isInitialized) {
@@ -6450,6 +6781,7 @@ class DataStoreImpl {
             schemaVersion: schema.schemaVersion ?? '',
             deferQueryCacheInvalidation: true,
             skipIndexCacheSync: isSimpleBatch,
+            durability: durability,
           );
 
           if (returnResultDetails) {
@@ -7308,6 +7640,7 @@ class DataStoreImpl {
     Duration? ttl,
     DateTime? expiresAt,
     bool isGlobal = false,
+    RecoveryDurability? durability,
   }) async {
     final tableName = SystemTable.getKeyValueName(isGlobal);
     DbResult finish(DbResult r) =>
@@ -7370,7 +7703,7 @@ class DataStoreImpl {
       ));
     }
 
-    return await batchUpsert(tableName, [data]);
+    return await batchUpsert(tableName, [data], durability: durability);
   }
 
   Future<DbResult> setValueMany(
@@ -7379,6 +7712,7 @@ class DataStoreImpl {
     DateTime? expiresAt,
     bool isGlobal = false,
     bool allowPartialErrors = true,
+    RecoveryDurability? durability,
   }) async {
     final tableName = SystemTable.getKeyValueName(isGlobal);
     DbResult finish(DbResult r) =>
@@ -7451,7 +7785,7 @@ class DataStoreImpl {
     }
 
     return await batchUpsert(tableName, records,
-        allowPartialErrors: allowPartialErrors);
+        allowPartialErrors: allowPartialErrors, durability: durability);
   }
 
   /// Get key-value pair
@@ -9014,7 +9348,6 @@ class _DbStatusImpl implements DbStatus {
       cacheMemoryBudgetMB: _db.config.cacheMemoryBudgetMB ?? 0,
       isMemoryManaged: _db._resourceManager != null,
       maxParallelWorkers: _db.config.maxConcurrency,
-      flushPolicy: StorageAdapter.flushPolicy.name,
     );
   }
 

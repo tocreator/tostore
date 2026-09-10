@@ -199,6 +199,14 @@ class TableSchema {
     return out;
   }
 
+  /// Whether this table has any secondary indexes (explicit, unique, auto, FK, or TTL).
+  bool get hasSecondaryIndexes {
+    if (indexes.isNotEmpty) return true;
+    final auto = autoIndexes;
+    if (auto != null) return auto.isNotEmpty;
+    return getAllIndexes().isNotEmpty;
+  }
+
   /// Get all indexes (Consolidated list of Explicit, Unique, TTL, and FK indexes).
   ///
   List<IndexSchema> getAllIndexes() {

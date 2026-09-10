@@ -397,50 +397,58 @@ class BufferTreeStore {
     if (prior != null &&
         prior.operation != BufferOperationType.delete &&
         effective.operation != BufferOperationType.delete) {
-      _updateIndexesIncremental(
-        table: table,
-        schema: schema,
-        pk: pk,
-        oldData: prior.data,
-        newData: effective.data,
-        changedFields: changedFields,
-        transactionId: transactionId,
-        isInsert: effective.operation == BufferOperationType.insert &&
-            prior.operation == BufferOperationType.insert,
-        installAllIndexes: installAllIndexes,
-      );
+      if (schema.hasSecondaryIndexes || installAllIndexes) {
+        _updateIndexesIncremental(
+          table: table,
+          schema: schema,
+          pk: pk,
+          oldData: prior.data,
+          newData: effective.data,
+          changedFields: changedFields,
+          transactionId: transactionId,
+          isInsert: effective.operation == BufferOperationType.insert &&
+              prior.operation == BufferOperationType.insert,
+          installAllIndexes: installAllIndexes,
+        );
+      }
     } else if (prior != null &&
         prior.operation != BufferOperationType.delete &&
         effective.operation == BufferOperationType.delete) {
-      _removeAllIndexesForRecord(
-        table: table,
-        schema: schema,
-        pk: pk,
-        data: prior.oldValues ?? prior.data,
-        transactionId: transactionId,
-      );
+      if (schema.hasSecondaryIndexes) {
+        _removeAllIndexesForRecord(
+          table: table,
+          schema: schema,
+          pk: pk,
+          data: prior.oldValues ?? prior.data,
+          transactionId: transactionId,
+        );
+      }
     } else if ((prior == null ||
             prior.operation == BufferOperationType.delete) &&
         effective.operation != BufferOperationType.delete) {
       // Fresh insert / insert-after-delete: one plan pass.
-      applyIndexWritePlan(
-        plan: indexPlan ??
-            prepareIndexWritePlan(table, schema,
-                includeUniques: installAllIndexes),
-        pk: pk,
-        data: effective.data,
-        transactionId: transactionId,
-      );
+      if (schema.hasSecondaryIndexes || installAllIndexes) {
+        applyIndexWritePlan(
+          plan: indexPlan ??
+              prepareIndexWritePlan(table, schema,
+                  includeUniques: installAllIndexes),
+          pk: pk,
+          data: effective.data,
+          transactionId: transactionId,
+        );
+      }
     } else if (prior == null &&
         effective.operation == BufferOperationType.delete) {
       // Delete of a disk-only row: store tombstone; indexes from oldValues/data.
-      _removeAllIndexesForRecord(
-        table: table,
-        schema: schema,
-        pk: pk,
-        data: effective.oldValues ?? effective.data,
-        transactionId: transactionId,
-      );
+      if (schema.hasSecondaryIndexes) {
+        _removeAllIndexesForRecord(
+          table: table,
+          schema: schema,
+          pk: pk,
+          data: effective.oldValues ?? effective.data,
+          transactionId: transactionId,
+        );
+      }
     }
 
     final cache = isTxn ? txnRecordCache : pendingRecordCache;
@@ -463,13 +471,23 @@ class BufferTreeStore {
     String? transactionId,
     bool installAllIndexes = false,
   }) {
-    applyVirginInsertWithPlan(
-      plan: prepareIndexWritePlan(table, schema,
-          includeUniques: installAllIndexes),
-      pk: pk,
-      entry: entry,
-      transactionId: transactionId,
-    );
+    if (schema.hasSecondaryIndexes || installAllIndexes) {
+      applyVirginInsertWithPlan(
+        plan: prepareIndexWritePlan(table, schema,
+            includeUniques: installAllIndexes),
+        pk: pk,
+        entry: entry,
+        transactionId: transactionId,
+      );
+    } else {
+      final isTxn = transactionId != null;
+      final recordCache = isTxn ? txnRecordCache : pendingRecordCache;
+      if (isTxn) {
+        recordCache.putPoint3(transactionId, table.tableUid, pk, entry);
+      } else {
+        recordCache.putPoint2(table.tableUid, pk, entry);
+      }
+    }
   }
 
   /// Virgin insert using a precomputed [IndexWritePlan] (batch hot path).

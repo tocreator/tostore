@@ -34,6 +34,10 @@ Map<String, dynamic>? validateAndProcessRecordPure({
   /// When true, mutate [data] in place instead of allocating a result map.
   /// Safe when the caller owns the record map (batchInsert hot path).
   bool mutateInPlace = false,
+
+  /// Precomputed ISO string and ms timestamp to eliminate closure allocations.
+  String? precomputedNowIso,
+  int? precomputedNowMs,
 }) {
   try {
     final primaryKey = schema.primaryKey;
@@ -78,7 +82,8 @@ Map<String, dynamic>? validateAndProcessRecordPure({
     final errors = validationErrors;
 
     // 1. Primary key handling.
-    if (!data.containsKey(primaryKey) || data[primaryKey] == null) {
+    final providedId = data[primaryKey];
+    if (providedId == null) {
       if (hasResolvedPrimaryKey) {
         result[primaryKey] = resolvedPrimaryKey;
       } else {
@@ -92,10 +97,7 @@ Map<String, dynamic>? validateAndProcessRecordPure({
         ]);
       }
     } else {
-      final providedId = data[primaryKey];
-
-      if (providedId != null &&
-          !skipPrimaryKeyFormatCheck &&
+      if (!skipPrimaryKeyFormatCheck &&
           !schema.validatePrimaryKeyFormat(providedId)) {
         throw DbException([
           InvalidArgumentStatus(
@@ -118,12 +120,12 @@ Map<String, dynamic>? validateAndProcessRecordPure({
       }
     }
 
-    // Lazily materialize shared timestamp strings/ints once per record batch.
-    String? sharedNowIso;
-    int? sharedNowMs;
-    String resolveNowIso() =>
-        sharedNowIso ??= (batchTimestamp ?? DateTime.now()).toIso8601String();
-    int resolveNowMs() => sharedNowMs ??=
+    // Use precomputed timestamps if provided, or lazily compute once if needed
+    String? localNowIso = precomputedNowIso;
+    int? localNowMs = precomputedNowMs;
+    String getNowIso() => localNowIso ??=
+        (batchTimestamp ?? DateTime.now()).toIso8601String();
+    int getNowMs() => localNowMs ??=
         (batchTimestamp ?? DateTime.now()).millisecondsSinceEpoch;
 
     // 2. Defaults, expressions, type conversion, and not-null in one pass.
@@ -134,7 +136,7 @@ Map<String, dynamic>? validateAndProcessRecordPure({
       dynamic value = raw;
       if (raw is ExprNode) {
         if (raw is TimestampExpr) {
-          value = resolveNowIso();
+          value = getNowIso();
         } else if (raw is Constant) {
           value = raw.value;
         } else if (raw is FieldRef) {
@@ -153,21 +155,55 @@ Map<String, dynamic>? validateAndProcessRecordPure({
       } else if (value == null &&
           field.defaultValueType == DefaultValueType.currentTimestamp) {
         if (field.type == DataType.integer) {
-          value = resolveNowMs();
+          value = getNowMs();
         } else if (field.type == DataType.bigInt) {
-          value = BigInt.from(resolveNowMs());
+          value = BigInt.from(getNowMs());
         } else {
-          value = resolveNowIso();
+          value = getNowIso();
         }
       } else if (value == null && field.defaultValue != null) {
         value = field.getDefaultValue();
       }
 
-      final converted = field.convertValue(value);
+      // Hot path type conversion: values already in declared Dart form return immediately
+      dynamic converted;
+      if (identical(value, raw) && raw != null) {
+        switch (field.type) {
+          case DataType.text:
+            if (raw is String) {
+              if (raw.isEmpty) {
+                converted = raw;
+              } else {
+                final int first = raw.codeUnitAt(0);
+                final int last = raw.codeUnitAt(raw.length - 1);
+                converted = (first > 0x20 && last > 0x20) ? raw : raw.trim();
+              }
+            } else {
+              converted = field.convertValue(raw);
+            }
+            break;
+          case DataType.integer:
+            converted = raw is int ? raw : field.convertValue(raw);
+            break;
+          case DataType.double:
+            converted = raw is double ? raw : field.convertValue(raw);
+            break;
+          case DataType.boolean:
+            converted = raw is bool ? raw : field.convertValue(raw);
+            break;
+          default:
+            converted = field.convertValue(raw);
+            break;
+        }
+      } else {
+        converted = field.convertValue(value);
+      }
+
       if (mutateInPlace) {
         // Typed app records usually already match storage form -- skip map write only if raw was identical.
-        if (!identical(converted, raw) ||
-            (converted != null && !data.containsKey(field.name))) {
+        if (!identical(converted, raw)) {
+          data[field.name] = converted;
+        } else if (raw == null && converted != null) {
           data[field.name] = converted;
         }
       } else {
@@ -277,11 +313,12 @@ Map<String, dynamic>? validateAndProcessUpdateDataPure({
   required TableSchema schema,
   required Map<String, dynamic> data,
   required TableName tableName,
+  Map<String, FieldSchema>? fieldMap,
   bool ignoreUnknownFields = true,
 }) {
   try {
     final primaryKey = schema.primaryKey;
-    final fieldMap = {for (final f in schema.fields) f.name: f};
+    final fMap = fieldMap ?? {for (final f in schema.fields) f.name: f};
     final result = <String, dynamic>{};
 
     for (final entry in data.entries) {
@@ -326,7 +363,7 @@ Map<String, dynamic>? validateAndProcessUpdateDataPure({
         continue;
       }
 
-      final field = fieldMap[fieldName];
+      final field = fMap[fieldName];
       if (field == null) {
         if (!ignoreUnknownFields) {
           throw DbException([
@@ -396,6 +433,7 @@ Map<String, dynamic> applyUniformUpdatePure({
   required TableSchema schema,
   required Map<String, dynamic> validData,
   required Map<String, dynamic> existingRecord,
+  Map<String, FieldSchema>? fieldMap,
 }) {
   final updatedRecord = Map<String, dynamic>.of(existingRecord);
 
@@ -414,7 +452,7 @@ Map<String, dynamic> applyUniformUpdatePure({
   }
 
   // Expression evaluation path (only for fields in validData)
-  final fieldMap = {for (final f in schema.fields) f.name: f};
+  final fMap = fieldMap ?? {for (final f in schema.fields) f.name: f};
   for (final entry in validData.entries) {
     final fieldName = entry.key;
     final proposed = entry.value;
@@ -427,7 +465,7 @@ Map<String, dynamic> applyUniformUpdatePure({
           schema,
           isUpdate: true,
         );
-        final field = fieldMap[fieldName];
+        final field = fMap[fieldName];
         updatedRecord[fieldName] =
             field != null ? field.convertValue(result) : result;
       } catch (e) {

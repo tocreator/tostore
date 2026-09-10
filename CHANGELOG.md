@@ -5,11 +5,13 @@ All notable changes to this project will be documented in this file.
 ## 3.5.2
 
 ### Added
-- Added `FlushMode` (`recovery`, `recoveryPowerSafe`, `fullPowerSafe`) for `db.flush(mode: ...)`.
+- Added `RecoveryDurability` (`standard`, `durable`, `async`) and optional `durability` parameter across write operations (CRUD, batch, KV, and chained updates/deletes) to configure self-healing recovery policies when returning operation results.
+- Added `defaultRecoveryDurability` to `DataStoreConfig` to set the instance-wide default recovery policy upon operation response.
+- Added `FlushMode` (`recovery`, `recoveryDurable`, `full`) for `db.flush(mode: ...)`.
 
 ### Changed
 - Optimized first startup duration.
-- `db.flush()` now defaults to `FlushMode.fullPowerSafe`. Deprecated `flushStorage`; use `mode` instead.
+- `db.flush()` now defaults to `FlushMode.full`. Deprecated `flushStorage`; use `mode` instead.
 
 ### Fixed
 - Fixed child-table foreign key cascade during batch insert incorrectly treating newly inserted parent rows as missing.

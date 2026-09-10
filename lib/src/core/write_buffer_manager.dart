@@ -197,6 +197,83 @@ class WriteBufferManager {
     CrontabManager.notifyActivity();
   }
 
+  /// Synchronous variant of [addRecord] for hot single-record insert/update/delete.
+  /// Completely eliminates microtask yields and avoids async state machines.
+  void addRecordSync({
+    required TableContext table,
+    required String recordId,
+    required BufferEntry entry,
+    Set<String>? changedFields,
+    bool updateStats = true,
+  }) {
+    final prior = trees.getPendingRecord(table.tableUid, recordId);
+    bool skipQueueEnqueue = false;
+
+    if (prior != null &&
+        prior.operation == BufferOperationType.insert &&
+        entry.operation == BufferOperationType.update) {
+      skipQueueEnqueue = true;
+    }
+
+    final bool restoreDeletedCount = prior != null &&
+        prior.operation == BufferOperationType.delete &&
+        entry.operation == BufferOperationType.insert;
+
+    final BufferEntry? effective;
+    if (prior == null && entry.operation == BufferOperationType.insert) {
+      trees.applyVirginInsert(
+        table: table,
+        schema: table.schema,
+        pk: recordId,
+        entry: entry,
+      );
+      effective = entry;
+    } else {
+      effective = trees.applyRecord(
+        table: table,
+        schema: table.schema,
+        pk: recordId,
+        entry: entry,
+        changedFields: changedFields,
+      );
+    }
+    commitReservedUniques(
+      table: table,
+      recordId: recordId,
+      transactionId: entry.transactionId,
+    );
+
+    if (!skipQueueEnqueue && effective != null) {
+      _dataStore.backgroundWriteScheduler.handleOnlineWrite(table, recordId);
+      if (updateStats) {
+        final op = restoreDeletedCount
+            ? BufferOperationType.insert
+            : effective.operation;
+        _dataStore.tableDataManager.updateTableRecordCountFast(table, op);
+      }
+      final wp = effective.walPointer;
+      if (wp != null) {
+        _writeQueue.add(WriteQueueEntry(
+          tableUid: table.tableUid,
+          recordId: recordId,
+          walPointer: wp,
+        ));
+        _emitSizeChanged();
+      }
+    } else if (effective == null && !skipQueueEnqueue) {
+      if (entry.operation == BufferOperationType.delete &&
+          entry.walPointer != null) {
+        _writeQueue.add(WriteQueueEntry(
+          tableUid: table.tableUid,
+          recordId: recordId,
+          walPointer: entry.walPointer!,
+        ));
+        _emitSizeChanged();
+      }
+    }
+    CrontabManager.notifyActivity();
+  }
+
   Future<void> addInsertBatch({
     required TableContext table,
     required List<String> recordIds,
@@ -290,6 +367,60 @@ class WriteBufferManager {
     }
     if (pendingQueue.isNotEmpty) {
       _writeQueue.addAll(pendingQueue);
+    }
+
+    _emitSizeChanged();
+    CrontabManager.notifyActivity();
+  }
+
+  /// High-throughput bulk virgin insert for tables without secondary indexes (e.g. pure PK tables).
+  ///
+  /// Directly enqueues into [pendingRecordCache] and [_writeQueue] in a tight synchronous loop,
+  /// skipping index plan lookups, reservation checks, and intermediate list allocations.
+  Future<void> addPurePkInsertBatch({
+    required TableContext table,
+    required List<String> recordIds,
+    required List<BufferEntry> entries,
+  }) async {
+    final int count = recordIds.length;
+    if (count == 0) return;
+
+    await _dataStore.tableDataManager.updateTableRecordCountDelta(
+      table,
+      insertDelta: count,
+    );
+
+    final bp =
+        _dataStore.parallelJournalManager.applyEnqueueBackpressure(count);
+    if (bp != null) await bp;
+
+    final tableUid = table.tableUid;
+    final recordCache = trees.pendingRecordCache;
+    final bgScheduler = _dataStore.backgroundWriteScheduler;
+    final bool bgMaybeActive = !bgScheduler.isEmpty;
+
+    final yieldController = YieldController(
+      'WriteBufferManager.addPurePkInsertBatch',
+      minCheckInterval: 8192,
+    );
+
+    recordCache.putFlatBatchNone(tableUid, recordIds, entries);
+
+    for (int i = 0; i < count; i++) {
+      final y = yieldController.maybeYield();
+      if (y != null) await y;
+
+      final wp = entries[i].walPointer;
+      if (wp != null) {
+        if (bgMaybeActive) {
+          bgScheduler.handleOnlineWrite(table, recordIds[i]);
+        }
+        _writeQueue.add(WriteQueueEntry(
+          tableUid: tableUid,
+          recordId: recordIds[i],
+          walPointer: wp,
+        ));
+      }
     }
 
     _emitSizeChanged();

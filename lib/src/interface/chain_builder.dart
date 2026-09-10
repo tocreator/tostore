@@ -5,6 +5,7 @@ import '../core/workload_scheduler.dart';
 import '../core/yield_controller.dart';
 import '../handler/logger.dart';
 import '../interface/future_builder_mixin.dart';
+import '../model/data_store_config.dart';
 import '../model/db_exception.dart';
 import '../model/db_result.dart';
 import '../model/expr.dart';

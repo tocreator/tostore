@@ -25,7 +25,7 @@ status: complete
 | Tables | `createTable`, `getTableSchema`, `getTableNames`, `getTableInfo`, `clear`, `dropTable` |
 | Spaces | `currentSpaceName`, `listSpaces`, `getSpaceInfo`, `deleteSpace` |
 | Instance | `config`, `instancePath`, `getVersion`/`setVersion` (app bookkeeping only) |
-| Maintenance | `flush({mode = FlushMode.fullPowerSafe})`, `deleteDatabase({dbPath, dbName})` |
+| Maintenance | `flush({mode = FlushMode.full})`, `deleteDatabase({dbPath, dbName})` |
 
 ## Backup & restore
 

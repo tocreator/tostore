@@ -133,22 +133,21 @@ class DbResult {
 
   /// Create a success result
   static DbResult success({
-    String? successKey,
     List<String>? successKeys,
     String message = 'Operation successful',
   }) {
-    final keys = successKey != null ? [successKey] : successKeys ?? [];
+    final effectiveKeys = successKeys ?? const <String>[];
     return DbResult(
       statuses: [
-        for (int i = 0; i < keys.length; i++)
+        for (int i = 0; i < effectiveKeys.length; i++)
           SuccessStatus(
             message: message,
             index: i,
-            primaryKey: keys[i],
+            primaryKey: effectiveKeys[i],
           )
       ],
-      successKeys: keys,
-      successCount: keys.length,
+      successKeys: effectiveKeys,
+      successCount: effectiveKeys.length,
       failedCount: 0,
       hasErrors: false,
     );

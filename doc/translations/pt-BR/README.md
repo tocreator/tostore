@@ -33,7 +33,7 @@
 - [Por que armazenar](#why-tostore) | [Principais recursos](#key-features) | [Guia de instalação](#installation) | [Modo KV](#quick-start-kv) | [Modo Tabela](#quick-start-table) | [Modo de memória](#quick-start-memory)
 - [Definição de Esquema](#schema-definition) | [Arquitetura Distribuída](#distributed-architecture) | [Chaves estrangeiras em cascata](#foreign-keys) | [Celular/Desktop](#mobile-integration) | [Servidor/Agente](#server-integration) | [Algoritmos de chave primária](#primary-key-examples)
 - [Consultas Avançadas (JOIN)](#query-advanced) | [Agregação e estatísticas](#aggregation-stats) | [Lógica Complexa (Condição de Consulta)](#query-condition) | [Consulta reativa (assistir)](#reactive-query) | [Consulta de streaming](#streaming-query)
-- [KV Avançado](#kv-advanced) | [Operações em lote](#bulk-operations) | [Vetores e recuperação híbrida](#vector-advanced) | [TTL em nível de tabela](#ttl-config) | [Paginação Eficiente](#query-pagination) | [Sonda de memória e recuperação síncrona (peek)](#query-peek) | [Cache de consulta](#query-cache) | [Expressões Atômicas](#atomic-expressions) | [Transações](#transactions)
+- [KV Avançado](#kv-advanced) | [Operações em lote](#bulk-operations) | [Garantia de recuperação](#recovery-durability) | [Vetores e recuperação híbrida](#vector-advanced) | [TTL em nível de tabela](#ttl-config) | [Paginação Eficiente](#query-pagination) | [Sonda de memória e recuperação síncrona (peek)](#query-peek) | [Cache de consulta](#query-cache) | [Expressões Atômicas](#atomic-expressions) | [Transações](#transactions)
 - [Administração](#database-maintenance) | [Configuração de segurança](#security-config) | [Tratamento de erros](#error-handling) | [Desempenho e diagnóstico](#performance) | [Contribuir](#contribute) | [Assistentes de IA](#for-ai-coding-assistants)
 
 ## <a id="why-tostore"></a>Por que escolher a ToStore?
@@ -682,6 +682,45 @@ ToStore fornece interfaces especializadas de processamento em lote, otimizadas p
 > [!TIP]
 > Você pode definir `allowPartialErrors: true` para garantir que falhas em registros individuais (por exemplo, violação de restrição única) não rejeitem toda a operação em lote.
 
+
+### <a id="recovery-durability"></a>Garantia de recuperação de gravação (Recovery Durability)
+
+O ToStore permite controlar com flexibilidade o nível de autorrecuperação no **momento do retorno do resultado da operação de gravação (conclusão do `await`)**:
+
+| Nível | Garantia de recuperação na resposta | Casos de uso e características |
+| :--- | :--- | :--- |
+| **`RecoveryDurability.standard`**<br>*(Recomendado padrão)* | **À prova de falhas antes de responder** | Protegido contra travamentos do aplicativo, exceções não capturadas e encerramento de processos por OOM do sistema operacional. Equilibra rendimento altíssimo com segurança diária. |
+| **`RecoveryDurability.durable`** | **À prova de corte de energia antes de responder** | Persistência física forçada no armazenamento antes de retornar. Garante recuperação autorrecuperável completa mesmo em caso de queda de energia repentina ou kernel panic. Ideal para transações financeiras e auditorias críticas. |
+| **`RecoveryDurability.async`** | **Rendimento máximo (salvamento assíncrono)** | Enfileira em memória e retorna imediatamente; após o retorno, para pequenos volumes de dados geralmente existe apenas uma janela de perda **extremamente breve de poucos milissegundos**. Ideal para logs massivos e métricas. |
+
+#### 1. Configuração global padrão
+Configure o nível de recuperação padrão para toda a instância em `DataStoreConfig`:
+```dart
+final db = await ToStore.open(
+  config: DataStoreConfig(
+    defaultRecoveryDurability: RecoveryDurability.standard, // Padrão: à prova de falhas antes de responder
+  ),
+);
+```
+
+#### 2. Substituição por operação
+Todas as gravações em tabelas estruturadas, operações em lote, atualizações/exclusões encadeadas e o **armazenamento Chave-Valor (KV)** suportam especificação individual por meio do parâmetro opcional `durability`:
+
+```dart
+// 1. Operações em tabelas estruturadas
+await db.insert('orders', orderData, durability: RecoveryDurability.durable); // Pedido crítico: à prova de corte de energia
+await db.batchInsert('logs', logList, durability: RecoveryDurability.async); // Logs massivos: assíncrono ultrarrápido
+
+// 2. Atualizações e exclusões encadeadas
+await db.update('users', {'status': 'active'})
+  .where('id', '=', userId)
+  .durability(RecoveryDurability.durable);
+
+// 3. Armazenamento Chave-Valor (KV)
+await db.setValue('token', tokenVal, durability: RecoveryDurability.standard);
+await db.kv.set('session_id', 'xyz', durability: RecoveryDurability.async);
+await db.kv.setMany(settingsMap, durability: RecoveryDurability.durable);
+```
 
 
 ### <a id="vector-advanced"></a>Campos vetoriais, índices vetoriais e recuperação híbrida
@@ -1472,7 +1511,7 @@ As APIs a seguir cobrem administração de banco de dados, diagnóstico e manute
   - `instancePath`: localize o diretório de armazenamento físico com precisão
   - `getVersion()` / `setVersion(version)`: controle de versão definido pelo negócio para decisões de migração em nível de aplicativo (não a versão do mecanismo)
 - **Manutenção**
-  - `flush(mode: FlushMode.fullPowerSafe)`: força gravações pendentes no armazenamento. Modos: `recovery` (mais rápido; log de recuperação apenas para buffers do SO; sobrevive a crash do app, não a perda de energia), `recoveryPowerSafe` (log de recuperação para armazenamento estável; visa sobreviver a perda de energia), `fullPowerSafe` (padrão; log de recuperação + dados de tabela e índices para armazenamento estável).
+  - `flush(mode: FlushMode.full)`: força gravações pendentes no armazenamento. Modos: `recovery` (mais rápido; log de recuperação apenas para buffers do SO; sobrevive a crash do app, não a perda de energia), `recoveryDurable` (log de recuperação para armazenamento estável; visa sobreviver a perda de energia), `full` (padrão; log de recuperação + dados de tabela e índices para armazenamento estável).
   - `deleteDatabase()`: remove todos os arquivos físicos e metadados da instância atual; use com cuidado
 - **Diagnóstico**
   - `db.status.memory()`: inspeciona as taxas de acertos do cache, o uso da página de índice e a alocação geral de heap
@@ -1736,6 +1775,7 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 | **`defaultQueryLimit`** | **1000** | **Proteção de recursos.** Aplicado quando uma consulta não especifica `limit`, evitando o carregamento acidental de conjuntos de resultados massivos e possíveis problemas de OOM. |
 | **`cacheMemoryBudgetMB`** | (automático) | **Gerenciamento de memória refinado.** Orçamento total de memória cache. O mecanismo o utiliza para conduzir a recuperação de LRU automaticamente. |
 | **`enableJournal`** | **verdade** | **Autocorreção de falhas.** Quando ativado, o mecanismo pode se recuperar automaticamente após falhas ou falhas de energia. |
+| **`defaultRecoveryDurability`** | **`standard`** | **Garantia de recuperação na resposta.** Define o nível de recuperação autorrecuperável antes que as operações de gravação retornem o resultado:<br>• **`standard` (Padrão)**: **À prova de falhas antes da resposta.** Protegido contra travamentos, exceções e encerramentos OOM.<br>• **`durable`**: **À prova de corte de energia antes da resposta.** Persistência física forçada antes do retorno; recuperação completa mesmo com queda de energia repentina.<br>• **`async`**: **Rendimento máximo.** Retorna imediatamente e salva em segundo plano; para poucos dados, janela de perda de apenas alguns milissegundos após responder. |
 | **`persistRecoveryOnCommit`** | **verdade** | **Forte garantia de durabilidade.** Quando verdadeira, as transações confirmadas são sincronizadas com o armazenamento físico. Quando falso, a liberação é feita de forma assíncrona em segundo plano para melhor velocidade, com um pequeno risco de perda de uma pequena quantidade de dados em falhas extremas. |
 | **`ttlCleanupIntervalMs`** | **300.000** | **Pesquisa TTL global.** O intervalo em segundo plano para verificação de dados expirados quando o mecanismo não está ocioso. Valores mais baixos excluem os dados expirados mais cedo, mas custam mais despesas gerais. |
 | **`maxConcurrency`** | (automático) | **Controle de simultaneidade computacional.** Define a contagem máxima de trabalhadores paralelos para tarefas intensivas, como computação vetorial e criptografia/descriptografia. Mantê-lo automático geralmente é melhor. |
@@ -1746,6 +1786,7 @@ final db = await ToStore.open(
     yieldDurationMs: 8, // Excellent for frontend UI smoothness; for servers, 50ms is often better
     defaultQueryLimit: 50, // Force a maximum result-set size
     enableJournal: true, // Ensure crash self-healing
+    defaultRecoveryDurability: RecoveryDurability.standard, // À prova de falhas antes da resposta
   ),
 );
 ```

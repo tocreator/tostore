@@ -1,6 +1,32 @@
 import 'dart:math' as math;
 
+import 'package:tostore/tostore.dart';
+
 import 'benchmark_schemas.dart';
+
+/// Short labels / descriptions for benchmark durability chips and reports.
+extension BenchmarkRecoveryDurabilityX on RecoveryDurability {
+  String get benchmarkLabel => switch (this) {
+        RecoveryDurability.async => 'async',
+        RecoveryDurability.standard => 'standard',
+        RecoveryDurability.durable => 'durable',
+      };
+
+  String get benchmarkChipLabel => switch (this) {
+        RecoveryDurability.async => 'async (peak)',
+        RecoveryDurability.standard => 'standard (default)',
+        RecoveryDurability.durable => 'durable (power-safe)',
+      };
+
+  String get benchmarkDescription => switch (this) {
+        RecoveryDurability.async =>
+          'Enqueue recovery log only; brief crash loss until background drain to OS. Peak write throughput.',
+        RecoveryDurability.standard =>
+          'Recovery log to OS page cache before ack. Crash/kill safe (product default).',
+        RecoveryDurability.durable =>
+          'Recovery log fsync before ack. Power-loss safe; slowest write path.',
+      };
+}
 
 /// Defines the complexity tier of benchmark tables.
 enum BenchmarkTier {
@@ -133,11 +159,18 @@ class BenchmarkConfig {
   final int iterations;
   final Set<BenchmarkOperation> operations;
 
+  /// Recovery durability applied to timed write/update/delete ops.
+  ///
+  /// Defaults to [RecoveryDurability.standard] (product default) so published
+  /// numbers stay comparable unless the operator explicitly selects another tier.
+  final RecoveryDurability durability;
+
   const BenchmarkConfig({
     this.tier = BenchmarkTier.simple,
     this.scale = 10000,
     this.iterations = 3,
     this.operations = BenchmarkOperation.defaultScalarOps,
+    this.durability = RecoveryDurability.standard,
   });
 
   BenchmarkConfig copyWith({
@@ -145,12 +178,14 @@ class BenchmarkConfig {
     int? scale,
     int? iterations,
     Set<BenchmarkOperation>? operations,
+    RecoveryDurability? durability,
   }) {
     return BenchmarkConfig(
       tier: tier ?? this.tier,
       scale: scale ?? this.scale,
       iterations: iterations ?? this.iterations,
       operations: operations ?? this.operations,
+      durability: durability ?? this.durability,
     );
   }
 }
@@ -226,7 +261,9 @@ class BenchmarkSummary {
     final buffer = StringBuffer();
     buffer.writeln('### ToStore Benchmark Results');
     buffer.writeln(
-        '- **Scale**: ${config.scale} records | **Iterations**: ${config.iterations} rounds | **Date**: ${timestamp.toIso8601String().split('T').first}');
+        '- **Scale**: ${config.scale} records | **Iterations**: ${config.iterations} rounds | **Durability**: `${config.durability.benchmarkLabel}` | **Date**: ${timestamp.toIso8601String().split('T').first}');
+    buffer.writeln(
+        '- **Durability note**: ${config.durability.benchmarkDescription}');
     if (config.tier == BenchmarkTier.vector ||
         config.tier == BenchmarkTier.all) {
       buffer.writeln(

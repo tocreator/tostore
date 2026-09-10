@@ -139,6 +139,11 @@ final class NoopStorageImpl implements StorageInterface {
       0;
 
   @override
+  int appendBytesSync(String path, List<int> bytes,
+          {int offset = 0, int? length}) =>
+      0;
+
+  @override
   Future<List<String>> readAsLines(String path, {int offset = 0}) async =>
       const <String>[];
 
@@ -154,4 +159,7 @@ final class NoopStorageImpl implements StorageInterface {
 
   @override
   Future<void> flushFile(String path) async {}
+
+  @override
+  void flushFileSync(String path) {}
 }

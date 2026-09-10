@@ -33,7 +33,7 @@
 - [Why ToStore](#why-tostore) | [Hauptmerkmale](#key-features) | [Installationsanleitung](#installation) | [KV-Modus](#quick-start-kv) | [Tabellenmodus](#quick-start-table) | [Speichermodus](#quick-start-memory)
 - [Schemadefinition](#schema-definition) | [Verteilte Architektur](#distributed-architecture) | [Kaskadierende Fremdschlüssel](#foreign-keys) | [Mobil/Desktop](#mobile-integration) | [Server/Agent](#server-integration) | [Primärschlüsselalgorithmen](#primary-key-examples)
 - [Erweiterte Abfragen (JOIN)](#query-advanced) | [Aggregation & Statistik](#aggregation-stats) | [Komplexe Logik (Abfragebedingung)](#query-condition) | [Reaktive Abfrage (beobachten)](#reactive-query) | [Streaming-Anfrage](#streaming-query)
-- [Fortgeschrittenes KV](#kv-advanced) | [Stapeloperationen](#bulk-operations) | [Vektor- & Hybridabruf](#vector-advanced) | [TTL auf Tabellenebene](#ttl-config) | [Effiziente Paginierung](#query-pagination) | [Speicher-Sonde und synchrone Abfrage (peek)](#query-peek) | [Abfrage-Cache](#query-cache) | [Atomare Ausdrücke](#atomic-expressions) | [Transaktionen](#transactions)
+- [Fortgeschrittenes KV](#kv-advanced) | [Stapeloperationen](#bulk-operations) | [Wiederherstellungsgarantie](#recovery-durability) | [Vektor- & Hybridabruf](#vector-advanced) | [TTL auf Tabellenebene](#ttl-config) | [Effiziente Paginierung](#query-pagination) | [Speicher-Sonde und synchrone Abfrage (peek)](#query-peek) | [Abfrage-Cache](#query-cache) | [Atomare Ausdrücke](#atomic-expressions) | [Transaktionen](#transactions)
 - [Administration](#database-maintenance) | [Sicherheitskonfiguration](#security-config) | [Fehlerbehandlung](#error-handling) | [Leistung und Diagnose](#performance) | [Mitwirken](#contribute) | [KI-Assistenten](#for-ai-coding-assistants)
 
 ## <a id="why-tostore"></a>Warum ToStore wählen?
@@ -682,6 +682,46 @@ ToStore bietet spezialisierte Schnittstellen für die Stapelverarbeitung, die f�
 
 > [!TIP]
 > Sie können `allowPartialErrors: true` festlegen, um sicherzustellen, dass Fehler bei einzelnen Datensätzen (z. B. eine Verletzung einer eindeutigen Einschränkung) nicht die gesamte Stapeloperation ablehnen.
+
+
+### <a id="recovery-durability"></a>Garantie für Schreibwiederherstellung (Recovery Durability)
+
+ToStore ermöglicht die flexible Steuerung der Selbstheilungswiederherstellungsstufe zum **Zeitpunkt der Rückgabe des Ergebnisses von Schreiboperationen (`await`-Abschluss)**:
+
+| Stufe | Wiederherstellungsgarantie bei Antwort | Anwendungsfälle & Eigenschaften |
+| :--- | :--- | :--- |
+| **`RecoveryDurability.standard`**<br>*(Standardempfehlung)* | **Vor der Antwort absturzsicher** | Schutz vor App-Abstürzen, nicht abgefangenen Ausnahmen und OOM-Prozessbeendigungen durch das Betriebssystem. Hoher Durchsatz bei alltäglicher Geschäftssicherheit. |
+| **`RecoveryDurability.durable`** | **Vor der Antwort stromausfallsicher** | Vor der Rückgabe auf den physischen Speicher erzwungen. Vollständige Selbstheilung auch bei plötzlichen Stromausfällen oder Kernel-Panics. Ideal für Finanztransaktionen und kritische Audits. |
+| **`RecoveryDurability.async`** | **Maximaler Durchsatz (asynchrones Speichern)** | Wird in den Speicher eingereiht und gibt sofort die Antwort zurück; nach der Rückgabe besteht bei kleinen Datenmengen meist nur ein **extrem kurzes Datenverlustfenster von wenigen Millisekunden**. Ideal für Massenprotokolle und Metriken. |
+
+#### 1. Globale Standardkonfiguration
+Konfigurieren Sie die Standardwiederherstellungsstufe der Instanz in `DataStoreConfig`:
+```dart
+final db = await ToStore.open(
+  config: DataStoreConfig(
+    defaultRecoveryDurability: RecoveryDurability.standard, // Standard: Vor der Antwort absturzsicher
+  ),
+);
+```
+
+#### 2. Überschreibung pro Operation
+Alle strukturierten Tabellenoperationen, Stapeloperationen, verketteten Updates/Deletes sowie der **Key-Value-Speicher (KV)** unterstützen die individuelle Überschreibung über den optionalen Parameter `durability`:
+
+```dart
+// 1. Strukturierte Tabellenoperationen
+await db.insert('orders', orderData, durability: RecoveryDurability.durable); // Wichtige Bestellung: Stromausfallsicher
+await db.batchInsert('logs', logList, durability: RecoveryDurability.async); // Massenprotokolle: Schnelle asynchrone Speicherung
+
+// 2. Verkettete Updates und Löschvorgänge
+await db.update('users', {'status': 'active'})
+  .where('id', '=', userId)
+  .durability(RecoveryDurability.durable);
+
+// 3. Key-Value-Speicher (KV)
+await db.setValue('token', tokenVal, durability: RecoveryDurability.standard);
+await db.kv.set('session_id', 'xyz', durability: RecoveryDurability.async);
+await db.kv.setMany(settingsMap, durability: RecoveryDurability.durable);
+```
 
 
 ### <a id="vector-advanced"></a>Vektorfelder, Vektorindizes und Hybridabruf
@@ -1471,7 +1511,7 @@ Die folgenden APIs decken die Datenbankverwaltung, Diagnose und Wartung für die
   - `instancePath`: Lokalisieren Sie das physische Speicherverzeichnis genau
   - `getVersion()` / `setVersion(version)`: geschäftsdefinierte Versionskontrolle für Migrationsentscheidungen auf Anwendungsebene (nicht die Engine-Version)
 - **Wartung**
-  - `flush(mode: FlushMode.fullPowerSafe)`: erzwingt das Schreiben ausstehender Daten in den Speicher. Modi: `recovery` (schnellste; Wiederherstellungsprotokoll nur in OS-Puffer; übersteht App-Absturz, nicht Stromausfall), `recoveryPowerSafe` (Wiederherstellungsprotokoll auf stabilen Speicher; zielt auf Überstehen von Stromausfällen), `fullPowerSafe` (Standard; Wiederherstellungsprotokoll + Tabellen- und Indexdaten auf stabilen Speicher).
+  - `flush(mode: FlushMode.full)`: erzwingt das Schreiben ausstehender Daten in den Speicher. Modi: `recovery` (schnellste; Wiederherstellungsprotokoll nur in OS-Puffer; übersteht App-Absturz, nicht Stromausfall), `recoveryDurable` (Wiederherstellungsprotokoll auf stabilen Speicher; zielt auf Überstehen von Stromausfällen), `full` (Standard; Wiederherstellungsprotokoll + Tabellen- und Indexdaten auf stabilen Speicher).
   - `deleteDatabase()`: alle physischen Dateien und Metadaten für die aktuelle Instanz entfernen; mit Vorsicht verwenden
 - **Diagnose**
   - `db.status.memory()`: Überprüfen Sie die Cache-Trefferquoten, die Indexseitennutzung und die gesamte Heap-Zuordnung
@@ -1735,6 +1775,7 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 | **`defaultQueryLimit`** | **1000** | **Ressourcenleitplanke.** Wird angewendet, wenn eine Abfrage nicht `limit` angibt, um ein versehentliches Laden großer Ergebnismengen und potenzielle OOM-Probleme zu verhindern. |
 | **`cacheMemoryBudgetMB`** | (automatisch) | **Feingranulare Speicherverwaltung.** Gesamtcache-Speicherbudget. Die Engine nutzt es, um die LRU-Rückgewinnung automatisch voranzutreiben. |
 | **`enableJournal`** | **wahr** | **Selbstheilung bei Abstürzen.** Wenn diese Option aktiviert ist, kann sich der Motor nach Abstürzen oder Stromausfällen automatisch erholen. |
+| **`defaultRecoveryDurability`** | **`standard`** | **Wiederherstellungsgarantie bei Antwort.** Definiert die Stufe der Selbstheilungswiederherstellung vor Rückgabe des Ergebnisses von Schreiboperationen:<br>• **`standard` (Standard)**: **Vor der Antwort absturzsicher.** Garantiert Selbstheilung gegen App-Abstürze, unbehandelte Ausnahmen und OOM-Kills.<br>• **`durable`**: **Vor der Antwort stromausfallsicher.** Vor der Rückgabe physisch persistiert; garantiert Selbstheilung auch bei plötzlichem Stromausfall.<br>• **`async`**: **Maximaler Durchsatz.** Antwortet sofort und speichert im Hintergrund; nach der Rückgabe bei kleinen Datenmengen meist nur ein extrem kurzes Fenster von wenigen Millisekunden bis zur persistenten Speicherung. |
 | **`persistRecoveryOnCommit`** | **wahr** | **Starke Haltbarkeitsgarantie.** Wenn dies zutrifft, werden festgeschriebene Transaktionen mit dem physischen Speicher synchronisiert. Bei „false“ erfolgt die Löschung asynchron im Hintergrund, um die Geschwindigkeit zu erhöhen, wobei bei extremen Abstürzen ein geringes Risiko besteht, dass eine kleine Datenmenge verloren geht. |
 | **`ttlCleanupIntervalMs`** | **300000** | **Globale TTL-Abfrage.** Das Hintergrundintervall zum Scannen abgelaufener Daten, wenn die Engine nicht im Leerlauf ist. Niedrigere Werte löschen abgelaufene Daten früher, kosten aber mehr Overhead. |
 | **`maxConcurrency`** | (automatisch) | **Computing-Parallelitätskontrolle.** Legt die maximale Anzahl paralleler Worker für intensive Aufgaben wie Vektorberechnung und Verschlüsselung/Entschlüsselung fest. Normalerweise ist es am besten, es automatisch zu lassen. |
@@ -1745,6 +1786,7 @@ final db = await ToStore.open(
     yieldDurationMs: 8, // Excellent for frontend UI smoothness; for servers, 50ms is often better
     defaultQueryLimit: 50, // Force a maximum result-set size
     enableJournal: true, // Ensure crash self-healing
+    defaultRecoveryDurability: RecoveryDurability.standard, // Vor der Antwort absturzsicher
   ),
 );
 ```

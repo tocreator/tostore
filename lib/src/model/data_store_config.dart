@@ -110,10 +110,14 @@ class DataStoreConfig {
   /// Explicitly force server environment optimizations (throughput prioritized over UI responsiveness).
   final bool isServerEnvironment;
 
-  /// Background flush policy for recovery artifacts (WAL/journal/meta) only.
-  final RecoveryFlushPolicy recoveryFlushPolicy;
+  /// Default recovery-log durability for write acknowledgements.
+  ///
+  /// - [RecoveryDurability.async]: Enqueue only; brief crash loss until background drain to OS.
+  /// - [RecoveryDurability.standard]: Sync recovery log to OS page cache; crash/kill safe (default).
+  /// - [RecoveryDurability.durable]: Sync recovery log to physical media; power-loss safe.
+  final RecoveryDurability defaultRecoveryDurability;
 
-  /// Whether to persist recovery artifacts (WAL/journal/meta) at commit/batch boundaries.
+  /// Whether to persist recovery artifacts (recovery log / journal / meta) at commit/batch boundaries.
   /// Set true to ensure durability on commit; false to rely on background flush only.
   final bool persistRecoveryOnCommit;
 
@@ -168,7 +172,7 @@ class DataStoreConfig {
     required this.writeBatchSize,
     required this.maxFlushLatencyMs,
     required this.maxOpenFiles,
-    required this.recoveryFlushPolicy,
+    required this.defaultRecoveryDurability,
     required this.persistRecoveryOnCommit,
     required this.defaultTransactionIsolationLevel,
     required this.transactionTimeout,
@@ -208,7 +212,7 @@ class DataStoreConfig {
     int? writeBatchSize,
     int? maxFlushLatencyMs,
     int? maxOpenFiles,
-    RecoveryFlushPolicy? recoveryFlushPolicy,
+    RecoveryDurability? defaultRecoveryDurability,
     bool? persistRecoveryOnCommit,
     TransactionIsolationLevel? defaultTransactionIsolationLevel,
     Duration transactionTimeout = const Duration(minutes: 5),
@@ -258,8 +262,8 @@ class DataStoreConfig {
       maxFlushLatencyMs:
           maxFlushLatencyMs ?? _getDefaultMaxFlushLatencyMs(resolvedServer),
       maxOpenFiles: maxOpenFiles ?? _getDefaultMaxOpenHandles(resolvedServer),
-      recoveryFlushPolicy:
-          recoveryFlushPolicy ?? _getDefaultRecoveryFlushPolicy(),
+      defaultRecoveryDurability:
+          defaultRecoveryDurability ?? _getDefaultRecoveryDurability(),
       persistRecoveryOnCommit:
           persistRecoveryOnCommit ?? _getDefaultPersistRecoveryOnCommit(),
       defaultTransactionIsolationLevel: defaultTransactionIsolationLevel ??
@@ -434,14 +438,13 @@ class DataStoreConfig {
     return 128;
   }
 
-  static RecoveryFlushPolicy _getDefaultRecoveryFlushPolicy() {
-    // Prefer adaptive across platforms
-    return RecoveryFlushPolicy.adaptive;
+  static RecoveryDurability _getDefaultRecoveryDurability() {
+    return RecoveryDurability.standard;
   }
 
   static bool _getDefaultPersistRecoveryOnCommit() {
     if (PlatformHandler.isWeb) return false;
-    return true; // native defaults to persisting WAL/journal/meta at commit
+    return true; // native defaults to persisting recovery log/journal/meta at commit
   }
 
   static int _getWriteBatchSize(int? cacheMemoryBudgetMB, bool isServer) {
@@ -531,25 +534,20 @@ class DataStoreConfig {
       } catch (_) {}
     }
 
-    // Parse recovery flush policy
-    RecoveryFlushPolicy? parsedRecoveryFlushPolicy;
-    final dynPolicy = json['recoveryFlushPolicy'];
-    if (dynPolicy is String) {
-      switch (dynPolicy.toLowerCase()) {
-        case 'off':
-          parsedRecoveryFlushPolicy = RecoveryFlushPolicy.off;
+    // Parse default recovery durability
+    RecoveryDurability? parsedDefaultRecoveryDurability;
+    final dynDurability =
+        json['defaultRecoveryDurability'] ?? json['recoveryDurability'];
+    if (dynDurability is String) {
+      switch (dynDurability.toLowerCase()) {
+        case 'async':
+          parsedDefaultRecoveryDurability = RecoveryDurability.async;
           break;
-        case 'low':
-          parsedRecoveryFlushPolicy = RecoveryFlushPolicy.low;
+        case 'standard':
+          parsedDefaultRecoveryDurability = RecoveryDurability.standard;
           break;
-        case 'medium':
-          parsedRecoveryFlushPolicy = RecoveryFlushPolicy.medium;
-          break;
-        case 'high':
-          parsedRecoveryFlushPolicy = RecoveryFlushPolicy.high;
-          break;
-        case 'adaptive':
-          parsedRecoveryFlushPolicy = RecoveryFlushPolicy.adaptive;
+        case 'durable':
+          parsedDefaultRecoveryDurability = RecoveryDurability.durable;
           break;
       }
     }
@@ -610,8 +608,7 @@ class DataStoreConfig {
       writeBatchSize: json['writeBatchSize'] as int?,
       maxFlushLatencyMs: json['maxFlushLatencyMs'] as int?,
       maxOpenFiles: json['maxOpenFiles'] as int?,
-      recoveryFlushPolicy:
-          parsedRecoveryFlushPolicy ?? _getDefaultRecoveryFlushPolicy(),
+      defaultRecoveryDurability: parsedDefaultRecoveryDurability,
       persistRecoveryOnCommit: json['persistRecoveryOnCommit'] as bool? ??
           _getDefaultPersistRecoveryOnCommit(),
       defaultTransactionIsolationLevel:
@@ -661,7 +658,7 @@ class DataStoreConfig {
       'writeBatchSize': writeBatchSize,
       'maxFlushLatencyMs': maxFlushLatencyMs,
       'maxOpenFiles': maxOpenFiles,
-      'recoveryFlushPolicy': recoveryFlushPolicy.toString().split('.').last,
+      'defaultRecoveryDurability': defaultRecoveryDurability.name,
       'persistRecoveryOnCommit': persistRecoveryOnCommit,
       'transactionIsolationLevel':
           defaultTransactionIsolationLevel.toString().split('.').last,
@@ -702,7 +699,7 @@ class DataStoreConfig {
     int? writeBatchSize,
     int? maxFlushLatencyMs,
     int? maxOpenFiles,
-    RecoveryFlushPolicy? recoveryFlushPolicy,
+    RecoveryDurability? defaultRecoveryDurability,
     bool? persistRecoveryOnCommit,
     TransactionIsolationLevel? defaultTransactionIsolationLevel,
     bool? enableTransactionCleanup,
@@ -741,7 +738,8 @@ class DataStoreConfig {
       writeBatchSize: writeBatchSize ?? this.writeBatchSize,
       maxFlushLatencyMs: maxFlushLatencyMs ?? this.maxFlushLatencyMs,
       maxOpenFiles: maxOpenFiles ?? this.maxOpenFiles,
-      recoveryFlushPolicy: recoveryFlushPolicy ?? this.recoveryFlushPolicy,
+      defaultRecoveryDurability:
+          defaultRecoveryDurability ?? this.defaultRecoveryDurability,
       persistRecoveryOnCommit:
           persistRecoveryOnCommit ?? this.persistRecoveryOnCommit,
       defaultTransactionIsolationLevel: defaultTransactionIsolationLevel ??
@@ -866,22 +864,34 @@ enum TransactionIsolationLevel {
   serializable,
 }
 
-/// Background flush policy for recovery artifacts (WAL/journal/meta)
-enum RecoveryFlushPolicy {
-  /// Disable periodic background flush (manual or on-close only)
-  off,
+/// Recovery-log durability guarantee before a write is acknowledged.
+enum RecoveryDurability {
+  /// Asynchronous recovery-log queue (fastest).
+  ///
+  /// Entries are enqueued in memory and the call returns immediately; a
+  /// background pump drains them to the OS page cache.
+  ///
+  /// - Safe against graceful application exit.
+  /// - On sudden crash/kill, only the still-queued tail may be lost.
+  async,
 
-  /// Low frequency, optimized for energy saving
-  low,
+  /// Synchronous OS page-cache append (balanced, default).
+  ///
+  /// Recovery-log entries reach the OS page cache before the call returns
+  /// (no physical disk sync).
+  ///
+  /// - Durable against application crashes, uncaught exceptions, and process kills (OOM).
+  /// - Vulnerable only to sudden power loss before the OS writes dirty pages out.
+  standard,
 
-  /// Balanced default frequency
-  medium,
-
-  /// High frequency, optimized for durability/latency
-  high,
-
-  /// Adaptive: auto-adjust based on recent write activity
-  adaptive,
+  /// Synchronous physical disk flush (highest durability).
+  ///
+  /// Recovery-log entries are written to the OS and forced to stable storage
+  /// before the call returns.
+  ///
+  /// - Durable against sudden power cuts, kernel panics, and hardware crashes.
+  /// - Slower due to physical media sync latency.
+  durable,
 }
 
 /// Encryption type enumeration for data encoding and encryption

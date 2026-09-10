@@ -33,7 +33,7 @@
 - [Neden Saklamalı](#why-tostore) | [Temel Özellikler](#key-features) | [Kurulum Kılavuzu](#installation) | [KV Modu](#quick-start-kv) | [Tablo Modu](#quick-start-table) | [Bellek Modu](#quick-start-memory)
 - [Şema Tanımı](#schema-definition) | [Dağıtılmış Mimari](#distributed-architecture) | [Basamaklı Yabancı Anahtarlar](#foreign-keys) | [Mobil/Masaüstü](#mobile-integration) | [Sunucu/Aracı](#server-integration) | [Birincil Anahtar Algoritmaları](#primary-key-examples)
 - [Gelişmiş Sorgular (KATIL)](#query-advanced) | [Toplama ve İstatistikler](#aggregation-stats) | [Karmaşık Mantık (Sorgu Durumu)](#query-condition) | [Reaktif Sorgu (izle)](#reactive-query) | [Akış Sorgusu](#streaming-query)
-- [Gelişmiş KV](#kv-advanced) | [Toplu İşlemler](#bulk-operations) | [Vektör ve Hibrit Getirme](#vector-advanced) | [Tablo düzeyinde TTL](#ttl-config) | [Etkili Sayfalandırma](#query-pagination) | [Bellek Probu ve Senkron Arama (peek)](#query-peek) | [Sorgu Önbelleği](#query-cache) | [Atomik İfadeler](#atomic-expressions) | [İşlemler](#transactions)
+- [Gelişmiş KV](#kv-advanced) | [Toplu İşlemler](#bulk-operations) | [Kurtarma Garantisi](#recovery-durability) | [Vektör ve Hibrit Getirme](#vector-advanced) | [Tablo düzeyinde TTL](#ttl-config) | [Etkili Sayfalandırma](#query-pagination) | [Bellek Probu ve Senkron Arama (peek)](#query-peek) | [Sorgu Önbelleği](#query-cache) | [Atomik İfadeler](#atomic-expressions) | [İşlemler](#transactions)
 - [Yönetim](#database-maintenance) | [Güvenlik Yapılandırması](#security-config) | [Hata İşleme](#error-handling) | [Performans ve Tanılama](#performance) | [Katkıda Bulunma](#contribute) | [YZ asistanları](#for-ai-coding-assistants)
 
 ## <a id="why-tostore"></a>Neden ToStore'u Seçmelisiniz?
@@ -682,6 +682,46 @@ ToStore, büyük ölçekli veri çıkışı için optimize edilmiş özel toplu 
 
 > [!TIP]
 > Münferit kayıt hatalarının (örneğin benzersiz kısıtlama ihlali) tüm toplu işlemi reddetmemesini sağlamak için `allowPartialErrors: true` ayarını yapabilirsiniz.
+
+
+### <a id="recovery-durability"></a>Yazma Kurtarma Garantisi (Recovery Durability)
+
+ToStore, **yazma işlemlerinin sonuç döndürdüğü anda (`await` tamamlandığında)** sahip olduğu kendi kendini iyileştirme kurtarma düzeyini esnek bir şekilde kontrol etmeyi destekler:
+
+| Düzey | Yanıt Anında Kurtarma Garantisi | Kullanım Alanları ve Özellikler |
+| :--- | :--- | :--- |
+| **`RecoveryDurability.standard`**<br>*(Varsayılan Öneri)* | **Yanıt öncesi çökmeye dayanıklı** | Uygulama çökmelerine, yakalanmamış istisnalara ve işletim sistemi tarafından OOM sonlandırmalarına karşı koruma. Yüksek verimlilik ile günlük iş güvenliğini dengeler. |
+| **`RecoveryDurability.durable`** | **Yanıt öncesi elektrik kesintisine dayanıklı** | Geri dönmeden önce fiziksel depolamaya zorlanır. Ani güç kesintilerinde veya çekirdek çökmelerinde bile tam kendini iyileştirme garantisi sunar. Finansal işlemler ve kritik denetimler için uygundur. |
+| **`RecoveryDurability.async`** | **Maksimum işleme hızı (asenkron kaydetme)** | Bellek kuyruğuna alınır ve hemen yanıt döner; yanıt döndükten sonra küçük veri hacimlerinde genellikle yalnızca **birkaç milisaniyelik son derece kısa** bir veri kaybı penceresi bulunur. Yüksek hacimli günlükler ve metrikler için idealdir. |
+
+#### 1. Genel Varsayılan Yapılandırma
+Veritabanı başlatılırken `DataStoreConfig` içinde örnek genelindeki varsayılan düzeyi ayarlayın:
+```dart
+final db = await ToStore.open(
+  config: DataStoreConfig(
+    defaultRecoveryDurability: RecoveryDurability.standard, // Varsayılan: yanıt öncesi çökmeye dayanıklı
+  ),
+);
+```
+
+#### 2. İşlem Başına Esnek Geçersiz Kılma
+Tüm yapılandırılmış tablo yazma işlemleri, toplu işlemler, zincirleme güncelleme/silme işlemleri ve **Anahtar-Değer (KV) depolaması**, isteğe bağlı `durability` parametresi aracılığıyla ayrı ayrı belirtilmeyi destekler:
+
+```dart
+// 1. Yapılandırılmış tablo işlemleri
+await db.insert('orders', orderData, durability: RecoveryDurability.durable); // Kritik sipariş: güç kesintisine dayanıklı
+await db.batchInsert('logs', logList, durability: RecoveryDurability.async); // Büyük günlükler: son derece hızlı asenkron
+
+// 2. Zincirleme güncelleme ve silme işlemleri
+await db.update('users', {'status': 'active'})
+  .where('id', '=', userId)
+  .durability(RecoveryDurability.durable);
+
+// 3. Anahtar-Değer (KV) depolaması
+await db.setValue('token', tokenVal, durability: RecoveryDurability.standard);
+await db.kv.set('session_id', 'xyz', durability: RecoveryDurability.async);
+await db.kv.setMany(settingsMap, durability: RecoveryDurability.durable);
+```
 
 
 ### <a id="vector-advanced"></a>Vektör Alanları, Vektör İndeksleri ve Hibrit Getirme
@@ -1471,7 +1511,7 @@ Aşağıdaki API'ler, eklenti tarzı geliştirme, yönetici panelleri ve operasy
   - `instancePath`: fiziksel depolama dizinini tam olarak bulun
   - `getVersion()` / `setVersion(version)`: uygulama düzeyinde geçiş kararları için iş tanımlı sürüm kontrolü (motor sürümü değil)
 - **Bakım**
-  - `flush(mode: FlushMode.fullPowerSafe)`: bekleyen yazmaları depolamaya zorla. Modlar: `recovery` (en hızlı; kurtarma günlüğü yalnızca OS arabelleklerine; uygulama çökmesinden sonra kurtarılabilir, güç kesintisinde veri kaybı olabilir), `recoveryPowerSafe` (kurtarma günlüğü kalıcı depolamaya; güç kesintisine dayanmayı hedefler), `fullPowerSafe` (varsayılan; kurtarma günlüğü + tablo ve dizin verileri kalıcı depolamaya).
+  - `flush(mode: FlushMode.full)`: bekleyen yazmaları depolamaya zorla. Modlar: `recovery` (en hızlı; kurtarma günlüğü yalnızca OS arabelleklerine; uygulama çökmesinden sonra kurtarılabilir, güç kesintisinde veri kaybı olabilir), `recoveryDurable` (kurtarma günlüğü kalıcı depolamaya; güç kesintisine dayanmayı hedefler), `full` (varsayılan; kurtarma günlüğü + tablo ve dizin verileri kalıcı depolamaya).
   - `deleteDatabase()`: geçerli örnek için tüm fiziksel dosyaları ve meta verileri kaldırın; dikkatli kullanın
 - **Teşhis**
   - `db.status.memory()`: önbellek isabet oranlarını, dizin sayfası kullanımını ve genel yığın tahsisini inceleyin
@@ -1735,6 +1775,7 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 | **`defaultQueryLimit`** | **1000** | **Kaynak koruması.** Bir sorguda `limit` belirtilmediğinde uygulanır; böylece çok büyük sonuç kümelerinin yanlışlıkla yüklenmesi ve olası OOM sorunları önlenir. |
 | **`cacheMemoryBudgetMB`** | (otomatik) | **İnce taneli bellek yönetimi.** Toplam önbellek bütçesi. Motor bunu LRU ıslahını otomatik olarak gerçekleştirmek için kullanır. |
 | **`enableJournal`** | **doğru** | **Çökme durumunda kendi kendini iyileştirme.** Etkinleştirildiğinde, motor, çarpma veya elektrik kesintilerinden sonra otomatik olarak iyileşebilir. |
+| **`defaultRecoveryDurability`** | **`standard`** | **Yanıt anında kurtarma garantisi.** Yazma işlemlerinin sonuç döndürmeden önce sahip olduğu kendi kendini iyileştirme düzeyini tanımlar:<br>• **`standard` (Varsayılan)**: **Yanıt öncesi çökmeye dayanıklı.** Uygulama çökmelerine, istisnalara ve OOM sonlandırmalarına karşı koruma.<br>• **`durable`**: **Yanıt öncesi güç kesintisine dayanıklı.** Yanıttan önce fiziksel depolamaya zorlanır; ani elektrik kesintisinde bile tam kurtarma.<br>• **`async`**: **Maksimum işleme hızı.** Hemen yanıt verir ve arka planda kaydeder; küçük verilerde yanıttan sonra yalnızca birkaç milisaniyelik kayıp penceresi vardır. |
 | **`persistRecoveryOnCommit`** | **doğru** | **Güçlü dayanıklılık garantisi.** Doğru olduğunda, taahhüt edilen işlemler fiziksel depolamayla senkronize edilir. Yanlış olduğunda, temizleme işlemi daha iyi hız için arka planda eşzamansız olarak yapılır; aşırı çökmelerde çok küçük miktarda veri kaybı riski vardır. |
 | **`ttlCleanupIntervalMs`** | **300000** | **Genel TTL yoklaması.** Motor boşta değilken süresi dolmuş verileri taramak için arka plan aralığı. Daha düşük değerler, süresi dolmuş verileri daha çabuk siler ancak daha fazla masrafa neden olur. |
 | **`maxConcurrency`** | (otomatik) | **Hesaplama eşzamanlılık kontrolü.** Vektör hesaplama ve şifreleme/şifre çözme gibi yoğun görevler için maksimum paralel çalışan sayısını ayarlar. Otomatik tutmak genellikle en iyisidir. |
@@ -1745,6 +1786,7 @@ final db = await ToStore.open(
     yieldDurationMs: 8, // Excellent for frontend UI smoothness; for servers, 50ms is often better
     defaultQueryLimit: 50, // Force a maximum result-set size
     enableJournal: true, // Ensure crash self-healing
+    defaultRecoveryDurability: RecoveryDurability.standard, // Yanıt öncesi çökmeye dayanıklı
   ),
 );
 ```

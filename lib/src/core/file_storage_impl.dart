@@ -25,12 +25,31 @@ class FileStorageImpl implements StorageInterface {
       LinkedHashMap<String, DateTime>();
   int _maxOpenHandles = 128;
 
+  // Dedicated handle pool for purely synchronous append channels (e.g. WAL direct-to-OS).
+  // These handles NEVER execute asynchronous operations (raf.flush/read/writeFrom/close),
+  // ensuring Dart VM's internal asyncOperationInProgress is strictly false and preventing
+  // "An async operation is currently pending" collisions with background flushes.
+  final Map<String, RandomAccessFile> _syncHandlePool = {};
+  final LinkedHashMap<String, int> _syncLruTicks = LinkedHashMap<String, int>();
+  int _syncTick = 0;
+  static const int _maxOpenSyncHandles = 16;
+
   // Per-handle operation queues to serialize async operations on the same RandomAccessFile
   final Map<String, Future<void>> _handleLocks = {};
   // Cached physical file length per canonical path to avoid frequent raf.length() on hot write paths
   final Map<String, int> _fileLengths = {};
 
-  String _canonicalPath(String path) => p.canonicalize(path);
+  String? _lastRawPath;
+  String? _lastCanonicalPath;
+  String _canonicalPath(String path) {
+    if (identical(path, _lastRawPath) || path == _lastRawPath) {
+      return _lastCanonicalPath!;
+    }
+    final res = p.canonicalize(path);
+    _lastRawPath = path;
+    _lastCanonicalPath = res;
+    return res;
+  }
 
   Future<T> _withHandleLock<T>(
       String key, Future<T> Function() operation) async {
@@ -53,7 +72,7 @@ class FileStorageImpl implements StorageInterface {
     }
   }
 
-  String _poolKey(String path, FileMode mode) {
+  String _poolKey(String path, FileMode mode, [String? normalizedPath]) {
     final modeKey = (mode == FileMode.append)
         ? 'a'
         : (mode == FileMode.write)
@@ -61,7 +80,8 @@ class FileStorageImpl implements StorageInterface {
             : (mode == FileMode.read)
                 ? 'r'
                 : mode.toString();
-    return '${_canonicalPath(path)}|$modeKey';
+    final norm = normalizedPath ?? _canonicalPath(path);
+    return '$norm|$modeKey';
   }
 
   /// Flush and close all open handles whose file paths are under [dirPath].
@@ -113,6 +133,26 @@ class FileStorageImpl implements StorageInterface {
 
         final y1 = yieldController.maybeYield();
         if (y1 != null) await y1;
+      }
+
+      // Also cleanly flush and close all dedicated sync handles under dirPath
+      final syncEntries = _syncHandlePool.entries.toList();
+      for (final e in syncEntries) {
+        final key = e.key;
+        final raf = e.value;
+        final sepIdx = key.lastIndexOf('|');
+        if (sepIdx <= 0) continue;
+        final filePath = key.substring(0, sepIdx);
+        if (filePath != normalizedDir && !filePath.startsWith(dirPrefix)) {
+          continue;
+        }
+        try {
+          raf.flushSync();
+          raf.closeSync();
+        } catch (_) {}
+        _syncHandlePool.remove(key);
+        _syncLruTicks.remove(key);
+        _fileLengths.remove(filePath);
       }
     } catch (_) {}
   }
@@ -318,6 +358,17 @@ class FileStorageImpl implements StorageInterface {
       }
       _handlePool.clear();
       _lru.clear();
+
+      // Flush and close all dedicated sync handles synchronously
+      final syncEntries = _syncHandlePool.entries.toList();
+      for (final e in syncEntries) {
+        try {
+          e.value.flushSync();
+          e.value.closeSync();
+        } catch (_) {}
+      }
+      _syncHandlePool.clear();
+      _syncLruTicks.clear();
       _fileLengths.clear();
     } catch (e) {
       Logger.error('Close storage failed', rawError: e);
@@ -883,6 +934,71 @@ class FileStorageImpl implements StorageInterface {
   }
 
   @override
+  int appendBytesSync(String path, List<int> bytes,
+      {int offset = 0, int? length}) {
+    if (_closed) {
+      throw DbClosedException('Storage is closed');
+    }
+    final normalized = _canonicalPath(path);
+    final key = _poolKey(path, FileMode.append, normalized);
+
+    RandomAccessFile? raf = _syncHandlePool[key];
+    try {
+      if (raf == null) {
+        final file = File(path);
+        if (!file.parent.existsSync()) {
+          file.parent.createSync(recursive: true);
+        }
+        raf = file.openSync(mode: FileMode.append);
+        _syncHandlePool[key] = raf;
+        _syncLruTicks[key] = ++_syncTick;
+
+        // Evict oldest sync handle if pool exceeds limit to prevent handle leak
+        if (_syncHandlePool.length > _maxOpenSyncHandles) {
+          final oldestSyncKey = _syncLruTicks.entries
+              .reduce((a, b) => a.value < b.value ? a : b)
+              .key;
+          if (oldestSyncKey != key) {
+            final oldRaf = _syncHandlePool.remove(oldestSyncKey);
+            _syncLruTicks.remove(oldestSyncKey);
+            if (oldRaf != null) {
+              try {
+                oldRaf.flushSync();
+                oldRaf.closeSync();
+              } catch (_) {}
+            }
+          }
+        }
+      } else {
+        _syncLruTicks[key] = ++_syncTick;
+      }
+
+      int? cached = _fileLengths[normalized];
+      if (cached == null) {
+        cached = raf.lengthSync();
+        _fileLengths[normalized] = cached;
+      }
+
+      final writeOffset = cached;
+      final int toWrite = (length ?? bytes.length) - offset;
+      if (toWrite > 0) {
+        raf.writeFromSync(bytes, offset, offset + toWrite);
+        _fileLengths[normalized] = writeOffset + toWrite;
+      }
+      return writeOffset;
+    } catch (e) {
+      _syncHandlePool.remove(key);
+      _syncLruTicks.remove(key);
+      if (raf != null) {
+        try {
+          raf.closeSync();
+        } catch (_) {}
+      }
+      throw _wrapIoError(e, 'appendBytesSync', path);
+    }
+  }
+
+  @override
   Future<int> appendString(String path, String content,
       {bool flush = true, bool closeHandleAfterFlush = false}) async {
     try {
@@ -927,22 +1043,30 @@ class FileStorageImpl implements StorageInterface {
   Future<void> flushFile(String path) async {
     try {
       final normalizedPath = _canonicalPath(path);
-      final entries = _handlePool.entries.toList();
-      for (final e in entries) {
-        final key = e.key;
-        final raf = e.value;
-        final sepIdx = key.lastIndexOf('|');
-        if (sepIdx <= 0) {
-          continue;
-        }
-        final filePath = key.substring(0, sepIdx);
-        if (filePath == normalizedPath) {
-          await _withHandleLock(key, () async {
-            try {
-              await raf.flush();
-            } catch (_) {}
-          });
-        }
+      final syncRaf = _syncHandlePool['$normalizedPath|a'];
+      if (syncRaf != null) {
+        try {
+          syncRaf.flushSync();
+        } catch (_) {}
+      }
+      // Direct O(1) key lookups for writable modes avoid iterating hundreds of pooled handles
+      final appendKey = '$normalizedPath|a';
+      final appendRaf = _handlePool[appendKey];
+      if (appendRaf != null) {
+        await _withHandleLock(appendKey, () async {
+          try {
+            await appendRaf.flush();
+          } catch (_) {}
+        });
+      }
+      final writeKey = '$normalizedPath|w';
+      final writeRaf = _handlePool[writeKey];
+      if (writeRaf != null) {
+        await _withHandleLock(writeKey, () async {
+          try {
+            await writeRaf.flush();
+          } catch (_) {}
+        });
       }
     } catch (e) {
       Logger.error('Flush file failed', rawError: e);
@@ -951,10 +1075,100 @@ class FileStorageImpl implements StorageInterface {
   }
 
   @override
+  void flushFileSync(String path) {
+    try {
+      final normalizedPath = _canonicalPath(path);
+      // 1. Flush dedicated sync handle (used by appendBytesSync)
+      final syncRaf = _syncHandlePool['$normalizedPath|a'];
+      if (syncRaf != null) {
+        try {
+          syncRaf.flushSync();
+        } catch (_) {}
+      }
+      // 2. Direct O(1) handle lookups for writable modes, eliminating O(N) handle pool iteration
+      final appendRaf = _handlePool['$normalizedPath|a'];
+      if (appendRaf != null) {
+        try {
+          appendRaf.flushSync();
+        } catch (_) {}
+      }
+      final writeRaf = _handlePool['$normalizedPath|w'];
+      if (writeRaf != null) {
+        try {
+          writeRaf.flushSync();
+        } catch (_) {}
+      }
+    } catch (e) {
+      Logger.error('Flush file sync failed', rawError: e);
+    }
+  }
+
+  @override
   Future<void> flushAll(
       {String? path, List<String>? paths, bool closeHandles = false}) async {
     const candidateModes = [FileMode.read, FileMode.write, FileMode.append];
     try {
+      // 1. Flush/close dedicated sync handles purely synchronously.
+      // Since these handles NEVER invoke async operations, they never set
+      // _asyncOperationInProgress and are completely isolated from async handle locks.
+      if (path != null) {
+        final normalized = _canonicalPath(path);
+        final syncKey = _poolKey(normalized, FileMode.append);
+        final syncRaf = _syncHandlePool[syncKey];
+        if (syncRaf != null) {
+          try {
+            syncRaf.flushSync();
+          } catch (_) {}
+          if (closeHandles) {
+            try {
+              syncRaf.closeSync();
+            } catch (_) {}
+            _syncHandlePool.remove(syncKey);
+            _syncLruTicks.remove(syncKey);
+            _fileLengths.remove(normalized);
+          }
+        }
+      } else if (paths != null && paths.isNotEmpty) {
+        for (final pth in paths) {
+          final normalized = _canonicalPath(pth);
+          final syncKey = _poolKey(normalized, FileMode.append);
+          final syncRaf = _syncHandlePool[syncKey];
+          if (syncRaf != null) {
+            try {
+              syncRaf.flushSync();
+            } catch (_) {}
+            if (closeHandles) {
+              try {
+                syncRaf.closeSync();
+              } catch (_) {}
+              _syncHandlePool.remove(syncKey);
+              _syncLruTicks.remove(syncKey);
+              _fileLengths.remove(normalized);
+            }
+          }
+        }
+      } else if (path == null && paths == null) {
+        final syncEntries = _syncHandlePool.entries.toList();
+        for (final e in syncEntries) {
+          try {
+            e.value.flushSync();
+          } catch (_) {}
+          if (closeHandles) {
+            try {
+              e.value.closeSync();
+            } catch (_) {}
+            final sepIdx = e.key.lastIndexOf('|');
+            if (sepIdx > 0) {
+              _fileLengths.remove(e.key.substring(0, sepIdx));
+            }
+          }
+        }
+        if (closeHandles) {
+          _syncHandlePool.clear();
+          _syncLruTicks.clear();
+        }
+      }
+
       if (paths != null && paths.isNotEmpty) {
         final yieldController = YieldController('storage_flush_paths');
         for (final pth in paths) {

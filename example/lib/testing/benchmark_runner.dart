@@ -47,7 +47,7 @@ class BenchmarkRunner {
   /// Executes the full benchmark suite according to the provided [config].
   Future<BenchmarkSummary> runBenchmark(BenchmarkConfig config) async {
     log.add(
-      '🚀 Starting Benchmark Suite [Scale: ${config.scale}, Tier: ${config.tier.label}, Iterations: ${config.iterations}]',
+      '🚀 Starting Benchmark Suite [Scale: ${config.scale}, Tier: ${config.tier.label}, Iterations: ${config.iterations}, Durability: ${config.durability.benchmarkLabel}]',
       LogLevel.info,
     );
 
@@ -259,6 +259,7 @@ class BenchmarkRunner {
   }) async {
     final scale = config.scale;
     final iterations = config.iterations;
+    final durability = config.durability;
     final List<int> roundMicroseconds = [];
     int effectiveCount = scale;
     String? qualityNote;
@@ -283,6 +284,7 @@ class BenchmarkRunner {
             batchInsertRounds[round - 1],
             allowPartialErrors: false,
             returnResultDetails: false,
+            durability: durability,
           );
           sw.stop();
           roundMicroseconds.add(sw.elapsedMicroseconds);
@@ -306,7 +308,7 @@ class BenchmarkRunner {
           final records = singleInsertRounds[round - 1];
           final sw = Stopwatch()..start();
           for (final record in records) {
-            await db.insert(tableName, record);
+            await db.insert(tableName, record, durability: durability);
           }
           sw.stop();
           roundMicroseconds.add(sw.elapsedMicroseconds);
@@ -323,7 +325,8 @@ class BenchmarkRunner {
             _generateUpdateRecords(tier, scale, round),
         ];
         final batchUpdateBase = _generateRecords(tier, scale);
-        await _loadBufferDataset(tableName, batchUpdateBase);
+        await _loadBufferDataset(tableName, batchUpdateBase,
+            durability: durability);
 
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
@@ -335,6 +338,7 @@ class BenchmarkRunner {
             batchUpdateRounds[round - 1],
             allowPartialErrors: false,
             returnResultDetails: false,
+            durability: durability,
           );
           sw.stop();
           roundMicroseconds.add(sw.elapsedMicroseconds);
@@ -349,7 +353,8 @@ class BenchmarkRunner {
             _generateUpdateRecords(tier, effectiveCount, round),
         ];
         final singleUpdateBase = _generateRecords(tier, effectiveCount);
-        await _loadBufferDataset(tableName, singleUpdateBase);
+        await _loadBufferDataset(tableName, singleUpdateBase,
+            durability: durability);
 
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
@@ -359,7 +364,10 @@ class BenchmarkRunner {
           final sw = Stopwatch()..start();
           for (final record in updateRecords) {
             final id = record['id'];
-            await db.update(tableName, record).where('id', '=', id);
+            await db
+                .update(tableName, record)
+                .where('id', '=', id)
+                .durability(durability);
           }
           sw.stop();
           roundMicroseconds.add(sw.elapsedMicroseconds);
@@ -375,7 +383,8 @@ class BenchmarkRunner {
             _generateUpsertRecords(tier, scale, round),
         ];
         final batchUpsertBase = _generateRecords(tier, scale);
-        await _loadBufferDataset(tableName, batchUpsertBase);
+        await _loadBufferDataset(tableName, batchUpsertBase,
+            durability: durability);
 
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
@@ -387,6 +396,7 @@ class BenchmarkRunner {
             batchUpsertRounds[round - 1],
             allowPartialErrors: false,
             returnResultDetails: false,
+            durability: durability,
           );
           sw.stop();
           roundMicroseconds.add(sw.elapsedMicroseconds);
@@ -402,13 +412,15 @@ class BenchmarkRunner {
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
               'Running [$tierName] Batch Delete ($round/$iterations)...');
-          await _loadBufferDataset(tableName, batchDeleteBase);
+          await _loadBufferDataset(tableName, batchDeleteBase,
+              durability: durability);
 
           final sw = Stopwatch()..start();
           await db
               .delete(tableName)
               .where('id', '<=', scale)
-              .allowLargeScaleOperation();
+              .allowLargeScaleOperation()
+              .durability(durability);
           sw.stop();
           roundMicroseconds.add(sw.elapsedMicroseconds);
           await Future.delayed(const Duration(milliseconds: 5));
@@ -421,11 +433,15 @@ class BenchmarkRunner {
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
               'Running [$tierName] Single Delete ($round/$iterations)...');
-          await _loadBufferDataset(tableName, singleDeleteBase);
+          await _loadBufferDataset(tableName, singleDeleteBase,
+              durability: durability);
 
           final sw = Stopwatch()..start();
           for (var id = 1; id <= effectiveCount; id++) {
-            await db.delete(tableName).where('id', '=', id);
+            await db
+                .delete(tableName)
+                .where('id', '=', id)
+                .durability(durability);
           }
           sw.stop();
           roundMicroseconds.add(sw.elapsedMicroseconds);
@@ -435,7 +451,8 @@ class BenchmarkRunner {
 
       case BenchmarkOperation.pointReadHot:
         // Query phase already flushed once; ensure durable row count for seeks.
-        await _ensureDurableDataset(tableName, tier, scale);
+        await _ensureDurableDataset(tableName, tier, scale,
+            durability: durability);
         effectiveCount = scale;
 
         // Pre-warm the single hot primary key into memory cache
@@ -456,7 +473,8 @@ class BenchmarkRunner {
         break;
 
       case BenchmarkOperation.pointReadRandom:
-        await _ensureDurableDataset(tableName, tier, scale);
+        await _ensureDurableDataset(tableName, tier, scale,
+            durability: durability);
         effectiveCount = scale;
         final random = math.Random(42);
 
@@ -478,7 +496,8 @@ class BenchmarkRunner {
 
       case BenchmarkOperation.indexedSeekHot:
         if (tier != BenchmarkTier.indexed) return null;
-        await _ensureDurableDataset(tableName, tier, scale);
+        await _ensureDurableDataset(tableName, tier, scale,
+            durability: durability);
         effectiveCount = scale;
 
         // Pre-warm unique index hot lookup
@@ -500,7 +519,8 @@ class BenchmarkRunner {
 
       case BenchmarkOperation.indexedSeekRandom:
         if (tier != BenchmarkTier.indexed) return null;
-        await _ensureDurableDataset(tableName, tier, scale);
+        await _ensureDurableDataset(tableName, tier, scale,
+            durability: durability);
         effectiveCount = scale;
         final random = math.Random(1337);
 
@@ -521,7 +541,8 @@ class BenchmarkRunner {
         break;
 
       case BenchmarkOperation.rangeScanHot:
-        await _ensureDurableDataset(tableName, tier, scale);
+        await _ensureDurableDataset(tableName, tier, scale,
+            durability: durability);
         effectiveCount = scale;
 
         // Pre-warm the fixed range into memory cache
@@ -560,7 +581,8 @@ class BenchmarkRunner {
         break;
 
       case BenchmarkOperation.rangeScanRandom:
-        await _ensureDurableDataset(tableName, tier, scale);
+        await _ensureDurableDataset(tableName, tier, scale,
+            durability: durability);
         // Standardized query sample count up to 10,000 queries for statistically solid metrics without long stalls
         effectiveCount = math.min(scale, 10000);
         final random = math.Random(777);
@@ -600,7 +622,8 @@ class BenchmarkRunner {
         break;
 
       case BenchmarkOperation.paginationHot:
-        await _ensureDurableDataset(tableName, tier, scale);
+        await _ensureDurableDataset(tableName, tier, scale,
+            durability: durability);
         effectiveCount = scale;
 
         // Pre-warm hot page into memory cache
@@ -621,7 +644,8 @@ class BenchmarkRunner {
         break;
 
       case BenchmarkOperation.paginationRandom:
-        await _ensureDurableDataset(tableName, tier, scale);
+        await _ensureDurableDataset(tableName, tier, scale,
+            durability: durability);
         // Standardized query sample count up to 10,000 queries for statistically solid metrics without long stalls
         effectiveCount = math.min(scale, 10000);
         final random = math.Random(999);
@@ -650,7 +674,8 @@ class BenchmarkRunner {
         break;
 
       case BenchmarkOperation.count:
-        await _ensureDurableDataset(tableName, tier, scale);
+        await _ensureDurableDataset(tableName, tier, scale,
+            durability: durability);
         effectiveCount = scale;
 
         for (var round = 1; round <= iterations; round++) {
@@ -687,6 +712,7 @@ class BenchmarkRunner {
             vectorInsertRounds[round - 1],
             allowPartialErrors: false,
             returnResultDetails: false,
+            durability: durability,
           );
           sw.stop();
           roundMicroseconds.add(sw.elapsedMicroseconds);
@@ -697,7 +723,8 @@ class BenchmarkRunner {
       case BenchmarkOperation.vectorSearch:
         if (tier != BenchmarkTier.vector) return null;
         final datasetScale = math.min(scale, 10000);
-        await _ensureDurableDataset(tableName, tier, datasetScale);
+        await _ensureDurableDataset(tableName, tier, datasetScale,
+            durability: durability);
         // Query sample count: enough for stable QPS without multi-minute stalls.
         effectiveCount = math.min(datasetScale, 1000);
         final random = math.Random(4242);
@@ -729,7 +756,8 @@ class BenchmarkRunner {
       case BenchmarkOperation.vectorHybridSearch:
         if (tier != BenchmarkTier.vector) return null;
         final hybridScale = math.min(scale, 10000);
-        await _ensureDurableDataset(tableName, tier, hybridScale);
+        await _ensureDurableDataset(tableName, tier, hybridScale,
+            durability: durability);
         effectiveCount = math.min(hybridScale, 1000);
         final random = math.Random(5252);
 
@@ -759,7 +787,8 @@ class BenchmarkRunner {
       case BenchmarkOperation.vectorRecallCheck:
         if (tier != BenchmarkTier.vector) return null;
         final corpusScale = math.min(scale, 10000);
-        await _ensureDurableDataset(tableName, tier, corpusScale);
+        await _ensureDurableDataset(tableName, tier, corpusScale,
+            durability: durability);
         // Count = probe sample size (not corpus size).
         effectiveCount = math.min(
           BenchmarkSchemas.vectorRecallProbes,
@@ -837,14 +866,16 @@ class BenchmarkRunner {
   /// timed mutation immediately afterward to avoid a >1s idle settle flush.
   Future<void> _loadBufferDataset(
     String tableName,
-    List<Map<String, dynamic>> records,
-  ) async {
+    List<Map<String, dynamic>> records, {
+    RecoveryDurability durability = RecoveryDurability.standard,
+  }) async {
     await db.clear(tableName);
     await db.batchInsert(
       tableName,
       records,
       allowPartialErrors: false,
       returnResultDetails: false,
+      durability: durability,
     );
   }
 
@@ -856,13 +887,14 @@ class BenchmarkRunner {
   Future<void> _ensureDurableDataset(
     String tableName,
     BenchmarkTier tier,
-    int scale,
-  ) async {
+    int scale, {
+    RecoveryDurability durability = RecoveryDurability.standard,
+  }) async {
     final currentCount = await db.query(tableName).count();
     if (currentCount >= scale) return;
 
     final records = _generateRecords(tier, scale);
-    await _loadBufferDataset(tableName, records);
+    await _loadBufferDataset(tableName, records, durability: durability);
     await db.flush();
   }
 

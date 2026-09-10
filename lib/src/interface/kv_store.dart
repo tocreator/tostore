@@ -2,6 +2,7 @@ import 'dart:async';
 
 import '../chain/kv_query_builder.dart';
 import '../core/data_store_impl.dart';
+import '../model/data_store_config.dart';
 import '../model/db_result.dart';
 import '../model/system_table.dart';
 import 'engine_binding.dart';
@@ -72,9 +73,13 @@ class KvStore {
     Duration? ttl,
     DateTime? expiresAt,
     bool isGlobal = false,
+    RecoveryDurability? durability,
   }) {
     return _db.setValue(key, value,
-        ttl: ttl, expiresAt: expiresAt, isGlobal: isGlobal);
+        ttl: ttl,
+        expiresAt: expiresAt,
+        isGlobal: isGlobal,
+        durability: durability);
   }
 
   /// Set multiple key-value pairs in a single operation.
@@ -86,6 +91,7 @@ class KvStore {
   /// - [expiresAt]: Optional absolute expiration time for all items.
   /// - [isGlobal]: If true, stores in the global space.
   /// - [allowPartialErrors]: If true, partial write failures will not cause the entire operation to fail.
+  /// - [durability]: Optional recovery durability override.
   ///
   /// 参数说明：
   /// - [items]: 要存储的键值对 Map。
@@ -93,6 +99,7 @@ class KvStore {
   /// - [expiresAt]: 可选的绝对过期时间点（对所有项生效）。
   /// - [isGlobal]: 是否存储在全局空间。
   /// - [allowPartialErrors]: 是否允许部分错误，如果为 true，则部分写入失败不会导致整个操作失败。
+  /// - [durability]: 可选的恢复能力策略覆盖。
 
   Future<DbResult> setMany(
     Map<String, dynamic> items, {
@@ -100,12 +107,14 @@ class KvStore {
     DateTime? expiresAt,
     bool isGlobal = false,
     bool allowPartialErrors = true,
+    RecoveryDurability? durability,
   }) {
     return _db.setValueMany(items,
         ttl: ttl,
         expiresAt: expiresAt,
         isGlobal: isGlobal,
-        allowPartialErrors: allowPartialErrors);
+        allowPartialErrors: allowPartialErrors,
+        durability: durability);
   }
 
   /// Get a value by key.

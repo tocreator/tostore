@@ -33,7 +33,7 @@
 - [Why ToStore](#why-choose-tostore) | [Key Features](#key-features) | [Installation Guide](#installation) | [KV Mode](#key-value-storage-kv) | [Table Mode](#structured-table-mode) | [Memory Mode](#memory-mode)
 - [Schema Definition](#schema-definition) | [Distributed Architecture](#distributed-architecture) | [Cascading Foreign Keys](#foreign-keys-and-cascading) | [Mobile/Desktop](#mobile-and-desktop-integration) | [Server/Agent](#server-and-agent-integration) | [Primary Key Algorithms](#primary-key-examples)
 - [Advanced Queries (JOIN)](#advanced-queries) | [Aggregation & Statistics](#aggregation-grouping-and-statistics) | [Complex Logic (QueryCondition)](#complex-logic-with-querycondition) | [Reactive Query (watch)](#reactive-query) | [Streaming Query](#streaming-query)
-- [Advanced KV](#advanced-key-value-operations-dbkv) | [Bulk Operations](#bulk-operations) | [Vector & Hybrid Retrieval](#vector-fields-vector-indexes-and-hybrid-retrieval) | [Table-level TTL](#table-level-ttl) | [Efficient Pagination](#query-and-efficient-pagination) | [Memory Probe & Sync Retrieval (peek)](#memory-probe-and-sync-retrieval-peek) | [Query Cache](#manual-query-result-caching) | [Atomic Expressions](#atomic-expressions) | [Transactions](#transactions)
+- [Advanced KV](#advanced-key-value-operations-dbkv) | [Bulk Operations](#bulk-operations) | [Recovery Durability](#recovery-durability-guarantee) | [Vector & Hybrid Retrieval](#vector-fields-vector-indexes-and-hybrid-retrieval) | [Table-level TTL](#table-level-ttl) | [Efficient Pagination](#query-and-efficient-pagination) | [Memory Probe & Sync Retrieval (peek)](#memory-probe-and-sync-retrieval-peek) | [Query Cache](#manual-query-result-caching) | [Atomic Expressions](#atomic-expressions) | [Transactions](#transactions)
 - [Administration](#administration-and-maintenance) | [Security Configuration](#security-configuration) | [Error Handling](#status-codes-and-error-handling) | [Performance & Diagnostics](#performance-and-experience) | [Contributing](#contributing) | [AI assistants](#for-ai-coding-assistants)
 
 ## Why Choose ToStore?
@@ -684,6 +684,46 @@ ToStore provides specialized bulk processing interfaces optimized for large-scal
 
 > [!TIP]
 > You can set `allowPartialErrors: true` to ensure that individual record failures (e.g., a single constraint violation) do not reject the entire batch operation.
+
+
+### Recovery Durability Guarantee
+
+ToStore allows you to control the self-healing recovery guarantee level before write operations return results (`await` completion):
+
+| Level | Recovery Guarantee on Ack | Use Case & Characteristics |
+| :--- | :--- | :--- |
+| **`RecoveryDurability.standard`**<br>*(Default)* | **Crash-safe before response** | Protected against app crashes, uncaught exceptions, and process kills (OOM). Balances high throughput with daily business safety. |
+| **`RecoveryDurability.durable`** | **Power-loss safe before response** | Forced to physical storage before returning. Guarantees full self-healing recovery even under sudden power cuts or OS panics. Ideal for financial transactions and core audits. |
+| **`RecoveryDurability.async`** | **Maximum throughput (async persist)** | Enqueued in memory and returns response immediately; after returning, on small writes, there is typically a brief few-millisecond window before reaching persistent storage. Ideal for high-frequency logs and metrics. |
+
+#### 1. Global Default Configuration
+Configure the instance default recovery level in `DataStoreConfig`:
+```dart
+final db = await ToStore.open(
+  config: DataStoreConfig(
+    defaultRecoveryDurability: RecoveryDurability.standard, // Default: crash-safe before response
+  ),
+);
+```
+
+#### 2. Per-Operation Durability Override
+All structured table writes, bulk operations, chained update/delete, and **Key-Value (KV) storage** support overriding durability individually via the optional `durability:` parameter:
+
+```dart
+// 1. Structured table operations
+await db.insert('orders', orderData, durability: RecoveryDurability.durable); // Core order: power-loss safe
+await db.batchInsert('logs', logList, durability: RecoveryDurability.async); // High-throughput metrics: async
+
+// 2. Chained update and delete operations
+await db.update('users', {'status': 'active'})
+  .where('id', '=', userId)
+  .durability(RecoveryDurability.durable);
+
+// 3. Key-Value (KV) storage operations
+await db.setValue('token', tokenVal, durability: RecoveryDurability.standard);
+await db.kv.set('session_id', 'xyz', durability: RecoveryDurability.async);
+await db.kv.setMany(settingsMap, durability: RecoveryDurability.durable);
+```
 
 
 ### Vector Fields, Vector Indexes, and Hybrid Retrieval
@@ -1473,7 +1513,7 @@ The following APIs cover database administration, diagnostics, and maintenance f
   - `instancePath`: locate the physical storage directory precisely
   - `getVersion()` / `setVersion(version)`: business-defined version control for application-level migration decisions (not the engine version)
 - **Maintenance**
-  - `flush(mode: FlushMode.fullPowerSafe)`: force pending writes to storage. Modes: `recovery` (fastest, recovery log to OS buffers; survives app crash, not power loss), `recoveryPowerSafe` (recovery log to stable storage; aims to survive power loss), `fullPowerSafe` (default; recovery log + table + index to stable storage).
+  - `flush(mode: FlushMode.full)`: force pending writes to storage. Modes: `recovery` (fastest, recovery log to OS buffers; survives app crash, not power loss), `recoveryDurable` (recovery log to physical storage; survives power loss), `full` (default; recovery log + all data to physical storage).
   - `deleteDatabase()`: remove all physical files and metadata for the current instance; use with care
 - **Diagnostics**
   - `db.status.memory()`: inspect cache hit ratios, index-page usage, and overall heap allocation
@@ -1741,6 +1781,7 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 | **`defaultQueryLimit`** | **1000** | **Resource guardrail.** Applied when a query does not specify `limit`, preventing accidental loading of massive result sets and potential OOM issues. |
 | **`cacheMemoryBudgetMB`** | (auto) | **Fine-grained memory management.** Total cache memory budget. The engine uses it to drive LRU reclamation automatically. |
 | **`enableJournal`** | **true** | **Crash self-healing.** When enabled, the engine can recover automatically after crashes or power failures. |
+| **`defaultRecoveryDurability`** | **`standard`** | **Recovery guarantee on write response.** Defines the self-healing recovery level before write operations return results:<br>• **`standard` (default)**: **Crash-safe before response.** Guarantees self-healing recovery against app crashes, uncaught exceptions, and process kills (OOM).<br>• **`durable`**: **Power-loss safe before response.** Forced to physical storage before returning; guarantees full self-healing recovery even under sudden power loss.<br>• **`async`**: **Maximum throughput.** Returns immediately and saves in background; after returning, on small writes, typically leaves a brief few-millisecond window before reaching persistent storage. |
 | **`persistRecoveryOnCommit`** | **true** | **Strong durability guarantee.** When true, committed transactions are synced to physical storage. When false, flushing is done asynchronously in the background for better speed, with a small risk of losing a tiny amount of data in extreme crashes. |
 | **`ttlCleanupIntervalMs`** | **300000** | **Global TTL polling.** The background interval for scanning expired data when the engine is not idle. Lower values delete expired data sooner but cost more overhead. |
 | **`maxConcurrency`** | (auto) | **Compute concurrency control.** Sets the maximum parallel worker count for intensive tasks such as vector computation and encryption/decryption. Keeping it automatic is usually best. |
@@ -1751,6 +1792,7 @@ final db = await ToStore.open(
     yieldDurationMs: 8, // Excellent for frontend UI smoothness; for servers, 50ms is often better
     defaultQueryLimit: 50, // Force a maximum result-set size
     enableJournal: true, // Ensure crash self-healing
+    defaultRecoveryDurability: RecoveryDurability.standard, // Crash-safe before response
   ),
 );
 ```

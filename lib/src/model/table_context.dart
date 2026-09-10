@@ -19,6 +19,10 @@ class TableContext {
     required this.schema,
   });
 
+  Map<String, FieldSchema>? _fieldMap;
+  Map<String, FieldSchema> get fieldMap =>
+      _fieldMap ??= {for (final f in schema.fields) f.name: f};
+
   @override
   String toString() =>
       'TableContext(uid: $tableUid, name: $tableName, isGlobal: $isGlobal, dir: $dirIndex, schemaVersion: ${schema.schemaVersion})';

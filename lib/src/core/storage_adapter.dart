@@ -8,7 +8,6 @@ import '../handler/platform_handler.dart';
 import '../interface/file_storage_impl_stub.dart'
     if (dart.library.io) 'file_storage_impl.dart';
 import '../interface/storage_interface.dart';
-import '../model/data_store_config.dart';
 import '../model/db_exception.dart';
 import '../model/id_generator.dart';
 import '../model/result_status.dart';
@@ -65,12 +64,10 @@ class StorageAdapter implements StorageInterface {
   static final Set<StorageAdapter> _instances = <StorageAdapter>{};
   static DateTime? _lastWriteAt;
   static DateTime? _lastFlushAt;
-  static RecoveryFlushPolicy _flushPolicy = RecoveryFlushPolicy.adaptive;
 
   static Timer? _burstTimer;
   static DateTime? _lastBurstAt;
   static const Duration _burstMinGap = Duration(seconds: 1);
-  static RecoveryFlushPolicy get flushPolicy => _flushPolicy;
 
   /// operation prefix
   static const String _readOpPrefix = 'read-';
@@ -103,12 +100,8 @@ class StorageAdapter implements StorageInterface {
       : this(overrideStorage: storage, lockManager: lockManager);
 
   /// Unified configuration entry to reduce initialization redundancy
-  Future<void> configure(
-      {int? maxOpenHandles, RecoveryFlushPolicy? flushPolicy}) async {
+  Future<void> configure({int? maxOpenHandles}) async {
     try {
-      if (flushPolicy != null) {
-        setFlushPolicy(flushPolicy);
-      }
       await configureStorage(maxOpenHandles: maxOpenHandles);
     } catch (e) {
       Logger.error('Configure storage failed', rawError: e);
@@ -268,47 +261,25 @@ class StorageAdapter implements StorageInterface {
     return GlobalIdGenerator.generate(prefix);
   }
 
-  /// Update recovery flush policy and (re)register global scheduler accordingly
-  void setFlushPolicy(RecoveryFlushPolicy policy) {
-    _flushPolicy = policy;
-  }
-
   // Debounced event-driven flush for recovery artifacts (pooled handles).
   static void _scheduleBurstFlush() {
     // If a burst timer is already pending, do not reschedule; coalesce triggers.
     if (_burstTimer != null && _burstTimer!.isActive) {
       return;
     }
-    Duration? delay;
-    switch (_flushPolicy) {
-      case RecoveryFlushPolicy.off:
-      case RecoveryFlushPolicy.low:
-        delay = null;
-        break;
-      case RecoveryFlushPolicy.medium:
-        delay = const Duration(seconds: 1);
-        break;
-      case RecoveryFlushPolicy.high:
-        delay = const Duration(milliseconds: 200);
-        break;
-      case RecoveryFlushPolicy.adaptive:
-        final now = DateTime.now();
-        final last = _lastWriteAt;
-        if (last == null) {
-          delay = null;
-        } else {
-          final since = now.difference(last);
-          if (since.inMinutes >= 1) {
-            delay = null; // idle
-          } else if (since.inSeconds <= 30) {
-            delay = const Duration(milliseconds: 200); // busy
-          } else {
-            delay = const Duration(milliseconds: 500); // normal
-          }
-        }
-        break;
+    final now = DateTime.now();
+    final last = _lastWriteAt;
+    if (last == null) return;
+
+    final since = now.difference(last);
+    final Duration delay;
+    if (since.inMinutes >= 1) {
+      return; // idle
+    } else if (since.inSeconds <= 30) {
+      delay = const Duration(milliseconds: 200); // busy
+    } else {
+      delay = const Duration(milliseconds: 500); // normal
     }
-    if (delay == null) return;
 
     _burstTimer = Timer(delay, () async {
       final now = DateTime.now();
@@ -1096,6 +1067,14 @@ class StorageAdapter implements StorageInterface {
   }
 
   @override
+  int appendBytesSync(String path, List<int> bytes,
+      {int offset = 0, int? length}) {
+    _ensureOpen();
+    return _storage.appendBytesSync(path, bytes,
+        offset: offset, length: length);
+  }
+
+  @override
   Future<int> appendString(String path, String content,
       {bool flush = true, bool closeHandleAfterFlush = false}) async {
     _ensureOpen();
@@ -1144,6 +1123,12 @@ class StorageAdapter implements StorageInterface {
   Future<void> flushFile(String path) async {
     _ensureOpen();
     return _storage.flushFile(path);
+  }
+
+  @override
+  void flushFileSync(String path) {
+    _ensureOpen();
+    _storage.flushFileSync(path);
   }
 
   @override

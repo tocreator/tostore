@@ -36,9 +36,6 @@ class ConfigInfo {
   /// Maximum number of parallel workers (isolates)
   final int maxParallelWorkers;
 
-  /// Current storage flush policy (adaptive, low, medium, high, off)
-  final String flushPolicy;
-
   const ConfigInfo({
     required this.dbPath,
     required this.dbName,
@@ -52,7 +49,6 @@ class ConfigInfo {
     required this.cacheMemoryBudgetMB,
     required this.isMemoryManaged,
     required this.maxParallelWorkers,
-    required this.flushPolicy,
   });
 
   Map<String, dynamic> toJson() {
@@ -69,7 +65,6 @@ class ConfigInfo {
       'cacheMemoryBudgetMB': cacheMemoryBudgetMB,
       'isMemoryManaged': isMemoryManaged,
       'maxParallelWorkers': maxParallelWorkers,
-      'flushPolicy': flushPolicy,
     };
   }
 }

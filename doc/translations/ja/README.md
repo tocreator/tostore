@@ -33,7 +33,7 @@
 - [ストアする理由](#why-tostore) | 【主な特長】(#key-features) | [インストールガイド](#installation) | [KVモード](#quick-start-kv) | [テーブルモード](#quick-start-table) | [メモリーモード](#quick-start-memory)
 - [スキーマ定義](#schema-definition) | [分散アーキテクチャ](#distributed-architecture) | [カスケード外部キー](#foreign-keys) | [モバイル/デスクトップ](#mobile-integration) | [サーバー/エージェント](#server-integration) | [主キーのアルゴリズム](#primary-key-examples)
 - [高度なクエリ (JOIN)](#query-advanced) | [集計と統計](#aggregation-stats) | [複雑なロジック(QueryCondition)](#query-condition) | [リアクティブクエリ (監視)](#reactive-query) | [ストリーミングクエリ](#streaming-query)
-- [KV高度な操作](#kv-advanced) | [一括操作](#bulk-operations) | [ベクトル＆ハイブリッド検索](#vector-advanced) | [テーブルレベル TTL](#ttl-config) | [効率的なページネーション](#query-pagination) | [メモリプローブと同期検索 (peek)](#query-peek) | [クエリキャッシュ](#query-cache) | [原子式](#atomic-expressions) | 【取引】(#transactions)
+- [KV高度な操作](#kv-advanced) | [一括操作](#bulk-operations) | [リカバリ保証](#recovery-durability) | [ベクトル＆ハイブリッド検索](#vector-advanced) | [テーブルレベル TTL](#ttl-config) | [効率的なページネーション](#query-pagination) | [メモリプローブと同期検索 (peek)](#query-peek) | [クエリキャッシュ](#query-cache) | [原子式](#atomic-expressions) | 【取引】(#transactions)
 - [管理](#database-maintenance) | [セキュリティ設定](#security-config) | [エラー処理](#error-handling) | [パフォーマンスと診断](#performance) | [貢献](#contribute) | [AI コーディング支援](#for-ai-coding-assistants)
 
 ## <a id="why-tostore"></a>ToStore を選ぶ理由
@@ -682,6 +682,46 @@ ToStore は、大規模なデータスループット向けに最適化された
 
 > [!TIP]
 > `allowPartialErrors: true` を設定することで、個別のデータエラー（単一レコードの衝突など）がバッチ操作全体を拒否しないようにできます。
+
+
+### <a id="recovery-durability"></a>データ書き込みリカバリ保証 (Recovery Durability)
+
+ToStore は、**書き込み操作が結果を返す時点（`await` 完了時）**に備える自己修復リカバリレベルを柔軟に制御できます：
+
+| レベル | 応答時のリカバリ保証 | 適用シナリオと特性 |
+| :--- | :--- | :--- |
+| **`RecoveryDurability.standard`**<br>*(デフォルト推奨)* | **応答前にクラッシュ自己修復保証** | アプリの異常終了、未処理の例外、およびシステムによる OOM 強制終了から保護。極めて高いスループットと日常業務の安全性を両立。 |
+| **`RecoveryDurability.durable`** | **応答前に停電耐性自己修復保証** | 物理ストレージへの強制同期を行ってから復帰。突然の停電やカーネルクラッシュ時でも完全自己修復。金融取引や重要監査データに最適。 |
+| **`RecoveryDurability.async`** | **超高速スループット（応答後非同期保存）** | メモリキューに追加後直ちに応答。応答を返した後、少量のデータであれば通常わずか**数ミリ秒の極めて短い**データ損失ウィンドウが存在するのみ。大量のログやメトリクスに最適。 |
+
+#### 1. グローバルデフォルト設定
+データベース初期化時に `DataStoreConfig` でインスタンス全体のデフォルト復旧レベルを設定：
+```dart
+final db = await ToStore.open(
+  config: DataStoreConfig(
+    defaultRecoveryDurability: RecoveryDurability.standard, // デフォルト：応答前にクラッシュ耐性を保証
+  ),
+);
+```
+
+#### 2. 単一操作レベルでの柔軟な上書き
+構造化テーブル書き込み、バッチ操作、チェーン更新／削除、および**キー・バリューストア (KV)** のすべてにおいて、オプション引数 `durability` による個別指定をサポート：
+
+```dart
+// 1. 構造化テーブル操作
+await db.insert('orders', orderData, durability: RecoveryDurability.durable); // 重要注文：停電耐性
+await db.batchInsert('logs', logList, durability: RecoveryDurability.async); // 大量ログ：高速非同期
+
+// 2. チェーン更新および削除
+await db.update('users', {'status': 'active'})
+  .where('id', '=', userId)
+  .durability(RecoveryDurability.durable);
+
+// 3. キー・バリュー (KV) 操作
+await db.setValue('token', tokenVal, durability: RecoveryDurability.standard);
+await db.kv.set('session_id', 'xyz', durability: RecoveryDurability.async);
+await db.kv.setMany(settingsMap, durability: RecoveryDurability.durable);
+```
 
 
 ### <a id="vector-advanced"></a>ベクトル フィールド、ベクトル インデックス、ハイブリッド検索
@@ -1472,7 +1512,7 @@ final txResult2 = await db.transaction(() async {
   - `instancePath`: 物理ストレージ ディレクトリを正確に特定します
   - `getVersion()` / `setVersion(version)`: アプリケーション レベルの移行決定のためのビジネス定義のバージョン管理 (エンジンのバージョンではありません)
 - **メンテナンス**
-  - `flush(mode: FlushMode.fullPowerSafe)`: 保留中の書き込みをストレージへ強制反映します。モード: `recovery`（最速。復旧ログのみ OS バッファへ。アプリクラッシュ再開は復旧可能、停電ではデータ損失の可能性）、`recoveryPowerSafe`（復旧ログを物理ストレージへ。停電耐性を想定）、`fullPowerSafe`（デフォルト。復旧ログ + テーブルデータ + インデックスを物理ストレージへ）。
+  - `flush(mode: FlushMode.full)`: 保留中の書き込みをストレージへ強制反映します。モード: `recovery`（最速。復旧ログのみ OS バッファへ。アプリクラッシュ再開は復旧可能、停電ではデータ損失の可能性）、`recoveryDurable`（復旧ログを物理ストレージへ。停電耐性を想定）、`full`（デフォルト。復旧ログ + テーブルデータ + インデックスを物理ストレージへ）。
   - `deleteDatabase()`: 現在のインスタンスのすべての物理ファイルとメタデータを削除します。慎重に使用してください
 - **診断**
   - `db.status.memory()`: キャッシュ ヒット率、インデックス ページの使用状況、および全体的なヒープ割り当てを検査します。
@@ -1736,6 +1776,7 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 | **`defaultQueryLimit`** | **1000** | **リソース ガードレール。** クエリで `limit` が指定されていない場合に適用され、大量の結果セットの誤った読み込みや潜在的な OOM の問題を防ぎます。 |
 | **`cacheMemoryBudgetMB`** | (自動) | **きめ細かいメモリ管理。** 総キャッシュ メモリ バジェット。エンジンはこれを使用して、LRU 再利用を自動的に実行します。 |
 | **`enableJournal`** | **本当** | **クラッシュ自己修復** 有効にすると、クラッシュまたは停電後にエンジンが自動的に回復します。 |
+| **`defaultRecoveryDurability`** | **`standard`** | **応答時のリカバリ保証。** 書き込み操作が結果を返す前に備える自己修復リカバリレベルを定義します：<br>• **`standard`（デフォルト）**：**応答前にクラッシュ自己修復保証**。アプリのクラッシュ、未処理例外、OOM強制終了から保護します。<br>• **`durable`**：**応答前に停電耐性自己修復保証**。物理ストレージへの同期後に復帰し、突発的な停電でも復旧可能です。<br>• **`async`**：**超高速スループット**。即座に応答しバックグラウンドで保存します。応答後、少量データでは数ミリ秒程度の極めて短い損失ウィンドウが存在します。 |
 | **`persistRecoveryOnCommit`** | **本当** | **強力な耐久性の保証。** true の場合、コミットされたトランザクションは物理ストレージに同期されます。 false の場合、速度を上げるためにフラッシュがバックグラウンドで非同期に実行されますが、極端なクラッシュで少量のデータが失われるリスクは低くなります。 |
 | **`ttlCleanupIntervalMs`** | **300000** | **グローバル TTL ポーリング。** エンジンがアイドル状態でないときに期限切れデータをスキャンするバックグラウンド間隔。値を小さくすると、期限切れのデータがすぐに削除されますが、オーバーヘッドが増加します。 |
 | **`maxConcurrency`** | (自動) | **コンピューティング同時実行制御。** ベクトル計算や暗号化/復号化などの集中的なタスクの最大並列ワーカー数を設定します。通常は自動のままにしておくのが最善です。 |
@@ -1746,6 +1787,7 @@ final db = await ToStore.open(
     yieldDurationMs: 8, // Excellent for frontend UI smoothness; for servers, 50ms is often better
     defaultQueryLimit: 50, // Force a maximum result-set size
     enableJournal: true, // Ensure crash self-healing
+    defaultRecoveryDurability: RecoveryDurability.standard, // 応答前にクラッシュ耐性を保証
   ),
 );
 ```

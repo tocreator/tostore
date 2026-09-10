@@ -2526,7 +2526,8 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     if (!mounted || config == null) return;
 
     _benchmarkConfig = config;
-    _updateOperationInfo('Starting Benchmark Suite...');
+    _updateOperationInfo(
+        'Starting Benchmark Suite (durability: ${config.durability.benchmarkLabel})...');
     setState(() {
       _isTesting = true;
     });

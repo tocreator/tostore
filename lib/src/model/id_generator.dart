@@ -68,7 +68,9 @@ class SequentialIdGenerator implements IdGenerator {
     this.centralClient,
   }) : _currentId = config.initialValue - 1 {
     _initializeGenerator();
-    Future.microtask(() => _refillIdPool(_minGenerateBatchSize, 0));
+    if (isDistributed || config.useRandomIncrement) {
+      Future.microtask(() => _refillIdPool(_minGenerateBatchSize, 0));
+    }
   }
 
   void _initializeGenerator() {
@@ -156,6 +158,27 @@ class SequentialIdGenerator implements IdGenerator {
     }
   }
 
+  /// Synchronously generates a single sequential ID for local deterministic sequences.
+  /// Returns null if distributed coordination or asynchronous refill is required.
+  String? getSingleIdSync() {
+    if (!isDistributed && !config.useRandomIncrement) {
+      if (_idPool.isNotEmpty) {
+        return _idPool.removeFirst();
+      }
+      _currentId += config.increment;
+      return _currentId.toString();
+    }
+    if (_idPool.isNotEmpty) {
+      final id = _idPool.removeFirst();
+      if (_idPool.length < _minGenerateBatchSize ~/ 2 && _refillTask == null) {
+        unawaited(_refillIdPool(
+            _calculateExpectedPoolSize(_getRecentRequestCount()), 0));
+      }
+      return id;
+    }
+    return null;
+  }
+
   @override
   Future<List<String>> getId(int count, {int recentTotal = 0}) async {
     if (count <= 0) return [];
@@ -175,16 +198,17 @@ class SequentialIdGenerator implements IdGenerator {
           growable: false,
         );
       }
-      final result = <String>[];
-      while (result.length < count && _idPool.isNotEmpty) {
-        result.add(_idPool.removeFirst());
+      final result = List<String>.filled(count, '', growable: false);
+      int idx = 0;
+      while (idx < count && _idPool.isNotEmpty) {
+        result[idx++] = _idPool.removeFirst();
       }
-      final remaining = count - result.length;
+      final remaining = count - idx;
       if (remaining > 0) {
         final startId = _currentId + step;
         _currentId += remaining * step;
         for (int i = 0; i < remaining; i++) {
-          result.add((startId + i * step).toString());
+          result[idx++] = (startId + i * step).toString();
         }
       }
       return result;
@@ -270,6 +294,7 @@ class SequentialIdGenerator implements IdGenerator {
 
   void setCurrentId(int id) {
     _currentId = id;
+    purgeIdsLessThanOrEqualTo(id);
   }
 
   void setIdRange(int currentId, int maxId) {

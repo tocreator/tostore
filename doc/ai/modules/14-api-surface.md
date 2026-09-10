@@ -85,7 +85,7 @@ import 'package:tostore/tostore.dart';
 | `restore(String, {deleteAfterRestore, cleanupBeforeRestore})` | `Future<bool>` |
 | `transaction<T>(action, {rollbackOnError, persistRecoveryOnCommit, isolation})` | `Future<TransactionResult>` |
 | `rotateEncryptionKey({oldKey, required newKey})` | `Future<DbResult>` |
-| `flush({mode})` | `Future<void>` | `FlushMode`: `recovery`, `recoveryPowerSafe`, `fullPowerSafe` (default) |
+| `flush({mode})` | `Future<void>` | `FlushMode`: `recovery`, `recoveryDurable`, `full` (default) |
 | `close({keepActiveSpace})` | `Future<void>` |
 | `deleteDatabase({dbPath, dbName})` | `Future<void>` |
 | `getVersion()` / `setVersion(int)` | version bookkeeping |
@@ -122,7 +122,7 @@ Agents MAY import these via `package:tostore/tostore.dart`:
 | `status_provider.dart` | `DbStatus` |
 | `backup_scope.dart` | `BackupScope` |
 | `config_info.dart` | `ConfigInfo` |
-| `data_store_config.dart` | `DataStoreConfig`, `PersistenceMode`, `DistributedNodeConfig`, `TransactionIsolationLevel`, `RecoveryFlushPolicy`, `EncryptionType`, `EncryptionScope`, `EncryptionConfig` |
+| `data_store_config.dart` | `DataStoreConfig`, `PersistenceMode`, `DistributedNodeConfig`, `TransactionIsolationLevel`, `RecoveryDurability`, `EncryptionType`, `EncryptionScope`, `EncryptionConfig` |
 | `db_exception.dart` | `DbException`, `DbClosedException` |
 | `db_result.dart` | `DbResult` |
 | `db_startup_stage.dart` | `DbStartupStage`, `StartupProgressCallback` |

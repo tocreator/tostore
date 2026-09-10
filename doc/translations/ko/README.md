@@ -33,7 +33,7 @@
 - [ToStore를 선택해야 하는 이유](#why-tostore) | [주요 기능](#key-features) | [설치 안내](#installation) | [KV 모드](#quick-start-kv) | [테이블 모드](#quick-start-table) | [메모리 모드](#quick-start-memory)
 - [스키마 정의](#schema-definition) | [분산 아키텍처](#distributed-architecture) | [계단식 외래 키](#foreign-keys) | [모바일/데스크톱](#mobile-integration) | [서버/에이전트](#server-integration) | [기본 키 알고리즘](#primary-key-examples)
 - [고급 쿼리(JOIN)](#query-advanced) | [집계 및 통계](#aggregation-stats) | [복잡한 논리(쿼리조건)](#query-condition) | [반응형 쿼리(보기)](#reactive-query) | [스트리밍 쿼리](#streaming-query)
-- [KV 고급 작업](#kv-advanced) | [일괄 작업](#bulk-operations) | [벡터 및 하이브리드 검색](#vector-advanced) | [테이블 수준 TTL](#ttl-config) | [효율적인 페이지 매김](#query-pagination) | [메모리 프로브 및 동기 검색 (peek)](#query-peek) | [쿼리 캐시](#query-cache) | [원자 표현](#atomic-expressions) | [거래](#transactions)
+- [KV 고급 작업](#kv-advanced) | [일괄 작업](#bulk-operations) | [복구 보장](#recovery-durability) | [벡터 및 하이브리드 검색](#vector-advanced) | [테이블 수준 TTL](#ttl-config) | [효율적인 페이지 매김](#query-pagination) | [메모리 프로브 및 동기 검색 (peek)](#query-peek) | [쿼리 캐시](#query-cache) | [원자 표현](#atomic-expressions) | [거래](#transactions)
 - [관리](#database-maintenance) | [보안설정](#security-config) | [오류 처리](#error-handling) | [성능 및 진단](#performance) | [기여](#contribute) | [AI 코딩 어시스턴트](#for-ai-coding-assistants)
 
 ## <a id="why-tostore"></a>왜 ToStore를 선택해야 할까요?
@@ -682,6 +682,46 @@ ToStore는 대규모 데이터 처리량에 최적화된 전용 일괄 처리 �
 
 > [!TIP]
 > `allowPartialErrors: true`를 설정하면 개별 데이터 오류(예: 단일 레코드 충돌)가 전체 일괄 작업을 중단시키지 않도록 할 수 있습니다.
+
+
+### <a id="recovery-durability"></a>데이터 쓰기 복구 보장 (Recovery Durability)
+
+ToStore는 **쓰기 작업이 결과를 반환하는 시점(`await` 완료 시)**에 갖추는 자가 치유 복구 수준을 유연하게 제어할 수 있습니다:
+
+| 레벨 | 응답 시 복구 보장 | 적용 시나리오 및 특성 |
+| :--- | :--- | :--- |
+| **`RecoveryDurability.standard`**<br>*(기본 권장)* | **응답 전 충돌 자가 치유 보장** | 앱 비정상 종료, 미처리 예외 및 시스템 OOM 강제 종료로부터 보호. 극대화된 처리량과 일상 업무 안전성을 동시에 제공. |
+| **`RecoveryDurability.durable`** | **응답 전 정전 자가 치유 보장** | 물리적 저장소에 강제 동기화 후 반환. 돌발 정전이나 커널 패닉 시에도 완전한 자가 치유 보장. 금융 거래 및 핵심 감사 데이터에 적합. |
+| **`RecoveryDurability.async`** | **초고속 처리량 (응답 후 비동기 저장)** | 메모리 큐에 추가 즉시 응답 반환. 응답을 반환한 후 적은 데이터량에서는 일반적으로 **몇 밀리초의 극히 짧은** 데이터 손실 윈도우만 존재. 대량 로그 수집에 적합. |
+
+#### 1. 전역 기본 설정
+데이터베이스 초기화 시 `DataStoreConfig`에서 인스턴스 전역 기본 복구 수준을 설정:
+```dart
+final db = await ToStore.open(
+  config: DataStoreConfig(
+    defaultRecoveryDurability: RecoveryDurability.standard, // 기본값: 응답 전 충돌 자가 치유 보장
+  ),
+);
+```
+
+#### 2. 단일 작업별 유연한 재정의
+구조화된 테이블 쓰기, 일괄 작업, 체인형 업데이트/삭제 및 **키-값 저장소 (KV)** 전체에서 선택적 매개변수 `durability`를 통한 개별 지정을 지원:
+
+```dart
+// 1. 구조화된 테이블 작업 재정의
+await db.insert('orders', orderData, durability: RecoveryDurability.durable); // 핵심 주문: 정전 방지
+await db.batchInsert('logs', logList, durability: RecoveryDurability.async); // 대량 로그: 초고속 비동기
+
+// 2. 체인형 업데이트 및 삭제 재정의
+await db.update('users', {'status': 'active'})
+  .where('id', '=', userId)
+  .durability(RecoveryDurability.durable);
+
+// 3. 키-값 저장소 (KV) 재정의
+await db.setValue('token', tokenVal, durability: RecoveryDurability.standard);
+await db.kv.set('session_id', 'xyz', durability: RecoveryDurability.async);
+await db.kv.setMany(settingsMap, durability: RecoveryDurability.durable);
+```
 
 
 ### <a id="vector-advanced"></a>벡터 필드, 벡터 인덱스 및 하이브리드 검색
@@ -1472,7 +1512,7 @@ final txResult2 = await db.transaction(() async {
   - `instancePath`: 물리적 저장소 디렉터리를 정확하게 찾습니다.
   - `getVersion()` / `setVersion(version)`: 애플리케이션 수준 마이그레이션 결정을 위한 비즈니스 정의 버전 제어(엔진 버전 아님)
 - **유지관리**
-  - `flush(mode: FlushMode.fullPowerSafe)`: 보류 중인 쓰기를 스토리지에 강제로 반영합니다. 모드: `recovery`(가장 빠름. 복구 로그만 OS 버퍼에 기록. 앱 크래시 재시작은 복구 가능, 정전 시 데이터 손실 가능), `recoveryPowerSafe`(복구 로그를 안정 스토리지에 기록. 정전 내성 목표), `fullPowerSafe`(기본값. 복구 로그 + 테이블 데이터 + 인덱스를 안정 스토리지에 기록).
+  - `flush(mode: FlushMode.full)`: 보류 중인 쓰기를 스토리지에 강제로 반영합니다. 모드: `recovery`(가장 빠름. 복구 로그만 OS 버퍼에 기록. 앱 크래시 재시작은 복구 가능, 정전 시 데이터 손실 가능), `recoveryDurable`(복구 로그를 안정 스토리지에 기록. 정전 내성 목표), `full`(기본값. 복구 로그 + 테이블 데이터 + 인덱스를 안정 스토리지에 기록).
   - `deleteDatabase()`: 현재 인스턴스에 대한 모든 실제 파일과 메타데이터를 제거합니다. 조심해서 사용하세요
 - **진단**
   - `db.status.memory()`: 캐시 적중률, 인덱스 페이지 사용량 및 전체 힙 할당을 검사합니다.
@@ -1736,6 +1776,7 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 | **`defaultQueryLimit`** | **1000** | **리소스 가드레일.** 쿼리가 `limit`을 지정하지 않을 때 적용되어 실수로 대규모 결과 세트가 로드되고 잠재적인 OOM 문제가 발생하는 것을 방지합니다. |
 | **`cacheMemoryBudgetMB`** | (자동) | **세밀한 메모리 관리.** 총 캐시 메모리 예산. 엔진은 이를 사용하여 LRU 회수를 자동으로 실행합니다. |
 | **`enableJournal`** | **사실** | **충돌 자가 치유.** 활성화되면 충돌이나 정전 후 엔진이 자동으로 복구될 수 있습니다. |
+| **`defaultRecoveryDurability`** | **`standard`** | **응답 시 복구 보장.** 쓰기 작업이 결과를 반환하기 전에 갖추는 자가 치유 복구 수준을 정의합니다:<br>• **`standard` (기본값)**: **응답 전 충돌 자가 치유 보장.** 앱 비정상 종료, 예외, OOM 종료로부터 보호.<br>• **`durable`**: **응답 전 정전 자가 치유 보장.** 물리 디스크 동기화 후 반환하여 돌발 정전에도 복구 가능.<br>• **`async`**: **초고속 처리량.** 즉시 응답 후 백그라운드 저장. 응답 후 소량 데이터 기준 수 밀리초의 극히 짧은 손실 윈도우만 존재. |
 | **`persistRecoveryOnCommit`** | **사실** | **강력한 내구성 보장.** true인 경우 커밋된 트랜잭션이 물리적 스토리지에 동기화됩니다. false인 경우 더 나은 속도를 위해 플러시가 백그라운드에서 비동기적으로 수행되며 극단적인 충돌 시 소량의 데이터가 손실될 위험이 적습니다. |
 | **`ttlCleanupIntervalMs`** | **300000** | **글로벌 TTL 폴링.** 엔진이 유휴 상태가 아닐 때 만료된 데이터를 검색하는 백그라운드 간격입니다. 값이 낮을수록 만료된 데이터가 더 빨리 삭제되지만 오버헤드가 더 많이 발생합니다. |
 | **`maxConcurrency`** | (자동) | **컴퓨팅 동시성 제어.** 벡터 계산 및 암호화/암호 해독과 같은 집약적인 작업을 위한 최대 병렬 작업자 수를 설정합니다. 일반적으로 자동으로 유지하는 것이 가장 좋습니다. |
@@ -1746,6 +1787,7 @@ final db = await ToStore.open(
     yieldDurationMs: 8, // Excellent for frontend UI smoothness; for servers, 50ms is often better
     defaultQueryLimit: 50, // Force a maximum result-set size
     enableJournal: true, // Ensure crash self-healing
+    defaultRecoveryDurability: RecoveryDurability.standard, // 응답 전 충돌 방지 자가 치유 보장
   ),
 );
 ```

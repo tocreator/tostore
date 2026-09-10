@@ -1217,6 +1217,19 @@ class TableDataManager {
         }
       }
 
+      if (shouldUpdate) {
+        final generator = _idGenerators[table.tableUid];
+        if (generator != null) {
+          generator.purgeIdsLessThanOrEqualTo(idStr);
+          if (generator is SequentialIdGenerator) {
+            final intId = int.tryParse(idStr);
+            if (intId != null && generator.currentId < intId) {
+              generator.setCurrentId(intId);
+            }
+          }
+        }
+      }
+
       // If updateFileMeta is true and we updated the maxId, also update FileMeta
       // This ensures cache consistency and prevents unnecessary recalculations
       if (updateFileMeta && shouldUpdate) {
@@ -1237,6 +1250,56 @@ class TableDataManager {
   }
 
   /// Get next auto-increment ID
+  /// Fast synchronous single sequential ID generator.
+  /// Returns null if generator is not yet initialized or requires async coordination.
+  String? getNextIdSync(TableContext table) {
+    final schema = table.schema;
+    if (schema.primaryKeyConfig.type != PrimaryKeyType.sequential) {
+      return null;
+    }
+    if (!_maxIds.containsKey(table.tableUid)) {
+      return null;
+    }
+    final generator = _idGenerators[table.tableUid];
+    if (generator is SequentialIdGenerator) {
+      final nextId = generator.getSingleIdSync();
+      if (nextId != null) {
+        _maxIds[table.tableUid] = nextId;
+        _maxIdsDirty[table.tableUid] = true;
+        _saveIdRange(table);
+        return nextId;
+      }
+    }
+    return null;
+  }
+
+  /// Update max ID and advance generator when a user manually inserts or updates a primary key.
+  void updateMaxIdOnManualInsert(TableContext table, dynamic id) {
+    if (id == null) return;
+    final schema = table.schema;
+    if (schema.primaryKeyConfig.type != PrimaryKeyType.sequential) return;
+
+    final idStr = id.toString();
+    if (!_isNumericString(idStr)) return;
+
+    final currentMax = _maxIds[table.tableUid];
+    final matcher = ValueMatcher.getMatcher(MatcherType.pkNumericString);
+    if (currentMax == null || matcher(idStr, currentMax) > 0) {
+      _maxIds[table.tableUid] = idStr;
+      _maxIdsDirty[table.tableUid] = true;
+      final generator = _idGenerators[table.tableUid];
+      if (generator != null) {
+        generator.purgeIdsLessThanOrEqualTo(idStr);
+        if (generator is SequentialIdGenerator) {
+          final intId = int.tryParse(idStr);
+          if (intId != null && generator.currentId < intId) {
+            generator.setCurrentId(intId);
+          }
+        }
+      }
+    }
+  }
+
   Future<String> getNextId(TableContext table) async {
     try {
       final schema = table.schema;
@@ -1472,6 +1535,7 @@ class TableDataManager {
     Map<String, dynamic>? oldValues,
     String? transactionId,
     required String schemaVersion,
+    RecoveryDurability? durability,
   }) async {
     final schema = table.schema;
     final primaryKey = schema.primaryKey;
@@ -1593,21 +1657,22 @@ class TableDataManager {
     final Map<String, dynamic> bufferedData = data;
     final updateOldValues =
         finalOperation == BufferOperationType.update ? oldValues : null;
+    final DateTime now = DateTime.now();
     // Append WAL (if enabled) and get pointer
     final walPointer = await _dataStore.walManager.append({
       'op': finalOperation.index,
       'table': table.tableUid,
       'data': bufferedData,
-      'ts': DateTime.now().toIso8601String(),
+      'ts': now.toIso8601String(),
       if (currentTxId != null) 'txId': currentTxId,
       if (updateOldValues != null) 'oldValues': updateOldValues,
-    });
+    }, durability: durability);
 
     // Create BufferEntry with WAL pointer
     final entry = BufferEntry(
         data: bufferedData,
         operation: finalOperation,
-        timestamp: DateTime.now(),
+        timestamp: now,
         transactionId: currentTxId,
         walPointer: walPointer,
         oldValues:
@@ -1656,6 +1721,182 @@ class TableDataManager {
     _dataStore.queryExecutor.invalidateQueryCacheForTable(table);
   }
 
+  /// Fully synchronous fast-path of [addToBuffer] for single-record CRUD.
+  /// Completely eliminates async/await microtask scheduling overhead.
+  void addToBufferSync(
+    TableContext table,
+    Map<String, dynamic> data,
+    BufferOperationType operationType, {
+    Map<String, dynamic>? oldValues,
+    Map<String, dynamic>? walOldValues,
+    bool hasWalOldValues = false,
+    bool skipDeletedCheck = false,
+    String? transactionId,
+    required String schemaVersion,
+    RecoveryDurability? durability,
+  }) {
+    final schema = table.schema;
+    final primaryKey = schema.primaryKey;
+    final recordId = data[primaryKey]?.toString();
+    if (recordId == null) {
+      Logger.error(
+        'Record in table ${table.tableName} does not have a primary key value, cannot add to buffer',
+      );
+      return;
+    }
+
+    final String? currentTxId =
+        transactionId ?? TransactionContext.getCurrentTransactionId();
+    if (currentTxId != null && !TransactionContext.isApplyingCommit()) {
+      final finalData = Map<String, dynamic>.from(data);
+      final entry = BufferEntry(
+        data: finalData,
+        operation: operationType,
+        timestamp: DateTime.now(),
+        walPointer: null,
+        transactionId: currentTxId,
+        oldValues: oldValues,
+        schemaVersion: schemaVersion,
+      );
+
+      _dataStore.writeBufferManager.applyTxnRecord(
+        transactionId: currentTxId,
+        table: table,
+        recordId: recordId,
+        entry: entry,
+      );
+
+      _trackTransactionBufferBatch(
+        currentTxId,
+        [finalData],
+        oldValues != null ? {recordId: oldValues} : null,
+        primaryKey,
+      );
+      _txnIdsWithOps.add(currentTxId);
+      return;
+    }
+
+    if (operationType == BufferOperationType.update && !skipDeletedCheck) {
+      final priorBuffered =
+          _dataStore.writeBufferManager.getBufferedRecord(table, recordId);
+      if (priorBuffered != null &&
+          priorBuffered.operation == BufferOperationType.delete) {
+        throw DbException([
+          ConstraintStatus(
+            type: ResultType.bizRecordNotFound,
+            tableName: table.tableName,
+            fields: [primaryKey],
+            conflictingKeys: [recordId],
+            message:
+                'Cannot update record $recordId in table ${table.tableName} because it has already been deleted',
+          ),
+        ]);
+      }
+    }
+
+    final bool hasIndexes = schema.hasSecondaryIndexes ||
+        SystemTable.isKeyValueTable(table.tableName);
+
+    if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
+      if (operationType == BufferOperationType.delete) {
+        removeTableRecord(table, recordId);
+        final cur = _tableRecordCounts[table.tableUid];
+        if (cur != null && cur > 0) {
+          _tableRecordCounts[table.tableUid] = cur - 1;
+        }
+      } else {
+        cacheTableRecord(table, recordId, data, schema, force: true);
+        if (operationType == BufferOperationType.insert) {
+          _tableRecordCounts[table.tableUid] =
+              (_tableRecordCounts[table.tableUid] ?? 0) + 1;
+        }
+      }
+
+      if (_dataStore.indexManager != null && hasIndexes) {
+        Map<String, dynamic>? indexOldData;
+        Map<String, dynamic>? indexNewData;
+        if (operationType == BufferOperationType.insert) {
+          indexNewData = data;
+        } else if (operationType == BufferOperationType.update) {
+          indexOldData = oldValues;
+          indexNewData = data;
+        } else if (operationType == BufferOperationType.delete) {
+          indexOldData = data;
+        }
+        if (indexOldData != null || indexNewData != null) {
+          _dataStore.indexManager!.updateIndexDataCacheSync(
+            table,
+            recordId,
+            indexOldData,
+            indexNewData,
+            force: true,
+          );
+        }
+      }
+      return;
+    }
+
+    // Direct synchronous WAL append
+    final effectiveWalOld = hasWalOldValues
+        ? walOldValues
+        : (operationType == BufferOperationType.update ? oldValues : null);
+    final walPointer = _dataStore.walManager.appendDirectSync(
+      table: table,
+      operation: operationType,
+      data: data,
+      oldValues: effectiveWalOld,
+      transactionId: currentTxId,
+      durability: durability,
+    );
+
+    final entry = BufferEntry(
+      data: data,
+      operation: operationType,
+      timestamp: DateTime.now(),
+      transactionId: currentTxId,
+      walPointer: walPointer,
+      oldValues: operationType == BufferOperationType.update ? oldValues : null,
+      schemaVersion: schemaVersion,
+    );
+
+    // Ingest into in-memory write buffer synchronously
+    _dataStore.writeBufferManager.addRecordSync(
+      table: table,
+      recordId: recordId,
+      entry: entry,
+    );
+
+    // Update full index cache
+    if (_dataStore.indexManager != null && hasIndexes) {
+      Map<String, dynamic>? indexOldData;
+      Map<String, dynamic>? indexNewData;
+      if (operationType == BufferOperationType.update) {
+        indexOldData = oldValues;
+        indexNewData = data;
+      } else if (operationType == BufferOperationType.delete) {
+        indexOldData = data;
+      }
+      if (indexOldData != null || indexNewData != null) {
+        _dataStore.indexManager!.updateIndexDataCacheSync(
+          table,
+          recordId,
+          indexOldData,
+          indexNewData,
+        );
+      }
+    }
+
+    // Sync to TableRecordCache
+    if (operationType == BufferOperationType.delete) {
+      removeTableRecord(table, recordId);
+    } else {
+      cacheTableRecord(table, recordId, data, schema, force: true);
+    }
+
+    _markSpaceStatsDirty(table);
+    _dataStore.queryExecutor.invalidateQueryCacheForTable(table);
+  }
+
   /// Unified internal batch processor for high-throughput writes.
   /// Handles Transactions, Memory-Mode, and Persistent WAL+Buffer paths.
   Future<({List<String> successRecordIds, List<String> failedRecordIds})>
@@ -1675,6 +1916,8 @@ class TableDataManager {
     /// When true, skip per-row index hot-cache sync on batch update.
     /// Safe when changed columns do not affect any index (e.g. simple PK-only tables).
     bool skipIndexCacheSync = false,
+    RecoveryDurability? durability,
+    List<String>? preValidatedRecordIds,
   }) async {
     if (records.isEmpty) {
       return (
@@ -1826,66 +2069,63 @@ class TableDataManager {
 
     // 3. Persistent Path: WAL + Write Buffer
     final int count = records.length;
-    final walEntries = <Map<String, dynamic>>[];
-    final validBatchRecordIds = <String>[];
-    // Update/delete keep parallel record lists; insert reuses walEntries['data'].
-    final bool isInsert = operation == BufferOperationType.insert;
-    final validBatchRecords = isInsert ? null : <Map<String, dynamic>>[];
-    final validBatchOldValues = isInsert ? null : <Map<String, dynamic>?>[];
+    List<String> validBatchRecordIds;
+    List<Map<String, dynamic>> validBatchRecords;
+    final bool isUpdate = operation == BufferOperationType.update;
+    List<Map<String, dynamic>?>? validBatchOldValues;
 
-    for (int i = 0; i < count; i++) {
-      final r = records[i];
-      final pkVal = r[pkName];
-      final recordId = pkVal is String ? pkVal : pkVal?.toString();
-      if (recordId == null || recordId.isEmpty) {
-        continue;
+    if (preValidatedRecordIds != null &&
+        preValidatedRecordIds.length == count &&
+        !isUpdate) {
+      validBatchRecordIds = preValidatedRecordIds;
+      validBatchRecords = records;
+      validBatchOldValues = null;
+    } else {
+      validBatchRecordIds = <String>[];
+      validBatchRecords = <Map<String, dynamic>>[];
+      validBatchOldValues = isUpdate ? <Map<String, dynamic>?>[] : null;
+
+      for (int i = 0; i < count; i++) {
+        final r = records[i];
+        final pkVal = r[pkName];
+        final recordId = pkVal is String ? pkVal : pkVal?.toString();
+        if (recordId == null || recordId.isEmpty) {
+          continue;
+        }
+
+        validBatchRecordIds.add(recordId);
+        validBatchRecords.add(r);
+        if (isUpdate) {
+          final oldR = oldRecordsList != null && i < oldRecordsList.length
+              ? oldRecordsList[i]
+              : (oldRecordsMap != null ? oldRecordsMap[recordId] : null);
+          validBatchOldValues!.add(oldR);
+        }
       }
-
-      final oldR = oldRecordsList != null && i < oldRecordsList.length
-          ? oldRecordsList[i]
-          : (oldRecordsMap != null ? oldRecordsMap[recordId] : null);
-      final walOldValues =
-          operation == BufferOperationType.update ? oldR : null;
-
-      // Build WAL envelope once; appendBatch mutates p/seq in place.
-      final walEntry = <String, dynamic>{
-        'op': operation.index,
-        'table': table.tableUid,
-        'ts': tsIso,
-        'data': r,
-      };
-      if (currentTxId != null) {
-        walEntry['txId'] = currentTxId;
-      }
-      if (walOldValues != null) {
-        walEntry['oldValues'] = walOldValues;
-      }
-      walEntries.add(walEntry);
-
-      validBatchRecordIds.add(recordId);
-      validBatchRecords?.add(r);
-      validBatchOldValues?.add(walOldValues);
     }
 
-    if (walEntries.isEmpty) {
+    if (validBatchRecordIds.isEmpty) {
       return (successRecordIds: successIds, failedRecordIds: failedIds);
     }
 
     late final List<WalPointer> pointers;
     try {
-      pointers = await _dataStore.walManager.appendBatch(walEntries);
+      pointers = await _dataStore.walManager.appendBatchDirect(
+        table: table,
+        operation: operation,
+        tsIso: tsIso,
+        records: validBatchRecords,
+        schema: schema,
+        transactionId: currentTxId,
+        oldValuesList: validBatchOldValues,
+        durability: durability,
+      );
     } catch (e) {
       Logger.error('Persistent batch WAL append failed: ${table.tableName}',
           rawError: e);
       return (
         successRecordIds: const <String>[],
-        failedRecordIds: records
-            .map((r) {
-              final v = r[pkName];
-              return v is String ? v : (v?.toString() ?? '');
-            })
-            .where((id) => id.isNotEmpty)
-            .toList()
+        failedRecordIds: validBatchRecordIds,
       );
     }
 
@@ -1894,85 +2134,75 @@ class TableDataManager {
     final String? bufferTxId = applyingCommit ? null : currentTxId;
 
     final int validCount = validBatchRecordIds.length;
-    final List<String> recordIds;
-    final List<BufferEntry> entries;
+    final List<String> recordIds = validBatchRecordIds;
+    final List<BufferEntry> entries = List<BufferEntry>.generate(
+      validCount,
+      (i) => BufferEntry(
+        data: validBatchRecords[i],
+        operation: operation,
+        timestamp: ts,
+        transactionId: bufferTxId,
+        walPointer: pointers[i],
+        oldValues: isUpdate ? validBatchOldValues![i] : null,
+        schemaVersion: schemaVersion,
+      ),
+      growable: false,
+    );
 
-    if (isInsert) {
-      recordIds = validBatchRecordIds;
-      entries = List<BufferEntry>.generate(
-        validCount,
-        (i) => BufferEntry(
-          data: walEntries[i]['data'] as Map<String, dynamic>,
-          operation: operation,
-          timestamp: ts,
-          transactionId: bufferTxId,
-          walPointer: pointers[i],
-          oldValues: null,
-          schemaVersion: schemaVersion,
-        ),
-        growable: false,
+    if (isUpdate) {
+      cacheTableRecordsBatch(
+        table,
+        validBatchRecords,
+        primaryKey: pkName,
+        schema: schema,
       );
-    } else {
-      recordIds = validBatchRecordIds;
-      entries = List<BufferEntry>.generate(
-        validCount,
-        (i) => BufferEntry(
-          data: validBatchRecords![i],
-          operation: operation,
-          timestamp: ts,
-          transactionId: bufferTxId,
-          walPointer: pointers[i],
-          oldValues: validBatchOldValues![i],
-          schemaVersion: schemaVersion,
-        ),
-        growable: false,
-      );
-
-      if (operation == BufferOperationType.update) {
-        cacheTableRecordsBatch(
-          table,
-          validBatchRecords!,
-          primaryKey: pkName,
-          schema: schema,
-        );
-        if (!skipIndexCacheSync) {
-          final indexMgr = _dataStore.indexManager;
-          if (indexMgr != null) {
-            for (int i = 0; i < validCount; i++) {
-              indexMgr.updateIndexDataCacheSync(
-                table,
-                validBatchRecordIds[i],
-                validBatchOldValues![i],
-                validBatchRecords[i],
-                overrideSchema: schema,
-              );
-            }
+      if (!skipIndexCacheSync) {
+        final indexMgr = _dataStore.indexManager;
+        if (indexMgr != null) {
+          for (int i = 0; i < validCount; i++) {
+            indexMgr.updateIndexDataCacheSync(
+              table,
+              validBatchRecordIds[i],
+              validBatchOldValues![i],
+              validBatchRecords[i],
+              overrideSchema: schema,
+            );
           }
         }
-      } else if (operation == BufferOperationType.delete) {
-        final indexMgr = _dataStore.indexManager;
-        for (int i = 0; i < validCount; i++) {
-          final recordId = validBatchRecordIds[i];
-          final r = validBatchRecords![i];
-          removeTableRecord(table, recordId);
-          indexMgr?.updateIndexDataCacheSync(
-            table,
-            recordId,
-            r,
-            null,
-            overrideSchema: schema,
-          );
-        }
+      }
+    } else if (operation == BufferOperationType.delete) {
+      final indexMgr = _dataStore.indexManager;
+      for (int i = 0; i < validCount; i++) {
+        final recordId = validBatchRecordIds[i];
+        final r = validBatchRecords[i];
+        removeTableRecord(table, recordId);
+        indexMgr?.updateIndexDataCacheSync(
+          table,
+          recordId,
+          r,
+          null,
+          overrideSchema: schema,
+        );
       }
     }
 
     if (operation == BufferOperationType.insert) {
-      await _dataStore.writeBufferManager.addInsertBatch(
-        table: table,
-        recordIds: recordIds,
-        entries: entries,
-        installAllIndexes: applyingCommit || installUniquesOnApply,
-      );
+      if (!schema.hasSecondaryIndexes &&
+          !schema.isGlobal &&
+          (applyingCommit || installUniquesOnApply)) {
+        await _dataStore.writeBufferManager.addPurePkInsertBatch(
+          table: table,
+          recordIds: recordIds,
+          entries: entries,
+        );
+      } else {
+        await _dataStore.writeBufferManager.addInsertBatch(
+          table: table,
+          recordIds: recordIds,
+          entries: entries,
+          installAllIndexes: applyingCommit || installUniquesOnApply,
+        );
+      }
     } else if (operation == BufferOperationType.update) {
       await _dataStore.writeBufferManager.addUpdateBatch(
         table: table,
@@ -2003,6 +2233,28 @@ class TableDataManager {
     // Ensure loaded first so we start from a valid base
     await _ensureRecordCountLoaded(table);
 
+    if (op == BufferOperationType.insert) {
+      _tableRecordCounts[table.tableUid] =
+          (_tableRecordCounts[table.tableUid] ?? 0) + 1;
+      if (_contributesToSpaceStats(table)) {
+        _deltaRecordCount++;
+        _needSaveStats = true;
+      }
+    } else if (op == BufferOperationType.delete) {
+      final current = _tableRecordCounts[table.tableUid] ?? 0;
+      if (current > 0) {
+        _tableRecordCounts[table.tableUid] = current - 1;
+        if (_contributesToSpaceStats(table)) {
+          _deltaRecordCount--;
+          _needSaveStats = true;
+        }
+      }
+    }
+  }
+
+  /// Fast synchronous table record count update when count is already loaded.
+  @pragma('vm:prefer-inline')
+  void updateTableRecordCountFast(TableContext table, BufferOperationType op) {
     if (op == BufferOperationType.insert) {
       _tableRecordCounts[table.tableUid] =
           (_tableRecordCounts[table.tableUid] ?? 0) + 1;
@@ -2082,6 +2334,7 @@ class TableDataManager {
     List<Map<String, dynamic>> records, {
     required String schemaVersion,
     int? chunkSize,
+    RecoveryDurability? durability,
   }) async {
     if (records.isEmpty) return;
 
@@ -2117,6 +2370,7 @@ class TableDataManager {
         schema: schema,
         schemaVersion: schemaVersion,
         deferQueryCacheInvalidation: end < records.length,
+        durability: durability,
       );
     }
   }
@@ -2730,10 +2984,12 @@ class TableDataManager {
       final pkMatcher =
           ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
 
-      // Fast path for empty tables: skip B+Tree reverse scan (can cost 100ms+
-      // on cold storage) when metadata already proves there are no records.
-      final bool tableEmptyOnDisk =
-          fileMeta == null || fileMeta.totalRecordCount <= 0;
+      // Fast path for empty tables: skip B+Tree reverse scan only when
+      // metadata proves there are no records AND no B+Tree structures exist.
+      final bool tableEmptyOnDisk = fileMeta == null ||
+          (fileMeta.totalRecordCount <= 0 &&
+              fileMeta.btreeFirstLeaf.isNull &&
+              fileMeta.btreeRoot.isNull);
 
       if (!tableEmptyOnDisk) {
         // v2+ global B+Tree: retrieve the true physical maximum key from the leaf tail
@@ -2749,7 +3005,12 @@ class TableDataManager {
           if (last != null && last.isNotEmpty) {
             maxFromPartitions = last.first[schema.primaryKey];
           }
-        } catch (_) {}
+        } catch (e) {
+          Logger.warn(
+            'Failed to scan physical max PK from leaf tail for table ${table.tableName}',
+            rawError: e,
+          );
+        }
 
         // Fallback / compare with cached maxAutoIncrementId to take the maximum
         final cachedMetaMax = fileMeta.maxAutoIncrementId;
@@ -2810,10 +3071,16 @@ class TableDataManager {
         _maxIds[table.tableUid] = finalMax.toString();
         _maxIdsDirty[table.tableUid] = true;
 
-        // Purge any stale IDs <= finalMax from generator pool
+        // Purge any stale IDs <= finalMax from generator pool and advance currentId
         final generator = _idGenerators[table.tableUid];
         if (generator != null) {
           generator.purgeIdsLessThanOrEqualTo(finalMax);
+          if (generator is SequentialIdGenerator) {
+            final intMax = int.tryParse(finalMax.toString());
+            if (intMax != null && generator.currentId < intMax) {
+              generator.setCurrentId(intMax);
+            }
+          }
         }
 
         // Save to FileMeta for caching (avoid recalculation on next initialization)
@@ -4186,6 +4453,38 @@ class TableDataManager {
       _schedulePageCacheReadThrough(table, pk, pageHit);
     }
     return pageHit;
+  }
+
+  /// Synchronous retrieval for point mutation (update / delete).
+  ///
+  /// Accurately differentiates:
+  /// - `(found: true, record: map)`: live record hit in memory or resident page cache.
+  /// - `(found: true, record: null)`: tombstone / deleted record in memory (record does NOT exist).
+  /// - `(found: false, record: null)`: cache miss across all memory tiers (requires async disk query).
+  ({bool found, Map<String, dynamic>? record}) getRecordForPointMutationSync(
+    TableContext table,
+    String pk,
+  ) {
+    if (pk.isEmpty) return const (found: false, record: null);
+
+    // Tier 1: Live memory (Txn > WriteBuffer > Row Cache), with tombstone awareness
+    final mem = resolveRecordFromMemory(table, pk);
+    if (mem.found) {
+      return mem;
+    }
+
+    // Tier 2: Resident B+Tree page cache
+    final pageHit = _dataStore.tableTreePartitionManager
+        ?.queryRecordByPrimaryKeyFromPageCacheSync(
+      table: table,
+      pk: pk,
+    );
+    if (pageHit != null) {
+      _schedulePageCacheReadThrough(table, pk, pageHit);
+      return (found: true, record: pageHit);
+    }
+
+    return const (found: false, record: null);
   }
 
   /// Fast single primary key point lookup.

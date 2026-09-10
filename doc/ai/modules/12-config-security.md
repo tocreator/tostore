@@ -43,7 +43,7 @@ factory DataStoreConfig({
   // journal / batch / flush / open files...
   bool? enableJournal,
   bool? persistRecoveryOnCommit,
-  RecoveryFlushPolicy? recoveryFlushPolicy,
+  RecoveryDurability? defaultRecoveryDurability, // standard (default) | async | durable
   TransactionIsolationLevel? defaultTransactionIsolationLevel,
   Duration transactionTimeout = const Duration(minutes: 5),
   // ... cleanup TTLs ...
@@ -63,6 +63,7 @@ factory DataStoreConfig({
 | `defaultQueryLimit` | 1000 | Applied when query omits `limit` |
 | `maxQueryOffset` | 10000 | Deep offset rejected beyond this |
 | `enableJournal` | true (non-web) | Crash recovery |
+| `defaultRecoveryDurability` | `standard` | Recovery-log durability before write ack: `async` (enqueue; brief crash loss until background drain to OS), `standard` (OS page cache, crash-safe), `durable` (physical fsync, power-safe). Override per CRUD/batch via `durability:` / `.durability(...)` |
 | `persistRecoveryOnCommit` | true | Strong durability; false = faster, tiny crash risk |
 | `ttlCleanupIntervalMs` | ≥60000 | Background TTL scan |
 | `cacheMemoryBudgetMB` | auto | LRU budget |

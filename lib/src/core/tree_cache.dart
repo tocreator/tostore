@@ -430,6 +430,23 @@ class TreeCache<T> {
     return g.containsDeep2(k3, k4);
   }
 
+  /// High-throughput batch insertion for depth-1 TreeCache with evictionMode=none (e.g. pendingRecordCache).
+  ///
+  /// Hoists group lookup, bypasses polymorphic checks, and updates totalEntries once.
+  @pragma('vm:prefer-inline')
+  void putFlatBatchNone(Object? k0, List<String> keys, List<T> values) {
+    if (keys.isEmpty) return;
+    final g = _groupOfDepth1Create(k0);
+    int newCount = 0;
+    final int len = keys.length;
+    for (int i = 0; i < len; i++) {
+      if (g.putFlatNone(keys[i], values[i])) {
+        newCount++;
+      }
+    }
+    _totalEntries += newCount;
+  }
+
   @pragma('vm:prefer-inline')
   void putPoint2(Object? k0, Object? k1, T value, {int? size}) {
     final gd = groupDepth;

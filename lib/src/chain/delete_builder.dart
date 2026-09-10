@@ -8,6 +8,8 @@ class DeleteBuilder extends ChainBuilder<DeleteBuilder>
   bool _allowAll = false;
   // Public API: large-scale must be opted in; also skips per-row result details
   bool _allowLargeScaleOperation = false;
+  // Recovery durability override for this delete
+  RecoveryDurability? _durability;
 
   DeleteBuilder(super.db, super.tableName);
 
@@ -48,21 +50,54 @@ class DeleteBuilder extends ChainBuilder<DeleteBuilder>
     return this;
   }
 
+  /// Sets recovery-log durability for this delete operation.
+  ///
+  /// - [RecoveryDurability.async]: Enqueue only; brief crash loss until background drain to OS.
+  /// - [RecoveryDurability.standard]: Sync recovery log to OS page cache (crash-safe, default).
+  /// - [RecoveryDurability.durable]: Sync recovery log to physical media (power-safe).
+  DeleteBuilder durability(RecoveryDurability durability) {
+    _durability = durability;
+    _onChanged();
+    return this;
+  }
+
   @override
-  Future<DbResult> get future async {
-    _future ??= _db.deleteInternal(
-      await _db.getTableContext(_tableName),
+  Future<DbResult> get future {
+    if (_future != null) return _future!;
+    final table = _db.getTableContextSync(_tableName);
+    if (table != null) {
+      final f = _db.deleteInternal(
+        table,
+        queryCondition,
+        orderBy: _orderBy,
+        limit: _limit,
+        offset: _offset,
+        allowAll: _allowAll,
+        allowLargeScaleOperation: _allowLargeScaleOperation,
+        returnResultDetails: !_allowLargeScaleOperation,
+        durability: _durability,
+      );
+      return _future = f.then((result) {
+        DbException.checkDeveloperError(result);
+        return result;
+      });
+    }
+    return _future = _executeFallback();
+  }
+
+  Future<DbResult> _executeFallback() async {
+    final table = await _db.getTableContext(_tableName);
+    final result = await _db.deleteInternal(
+      table,
       queryCondition,
       orderBy: _orderBy,
       limit: _limit,
       offset: _offset,
       allowAll: _allowAll,
-      // User-facing: gate large-scale unless explicitly allowed; no PK details
-      // when allowed (matches large-path contract).
       allowLargeScaleOperation: _allowLargeScaleOperation,
       returnResultDetails: !_allowLargeScaleOperation,
+      durability: _durability,
     );
-    final result = await _future!;
     DbException.checkDeveloperError(result);
     return result;
   }

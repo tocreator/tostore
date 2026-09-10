@@ -1,4 +1,4 @@
-﻿<h1 align="center">
+<h1 align="center">
   <img src="../../resource/logo-tostore.svg" width="400" alt="ToStore">
 </h1>
 
@@ -39,7 +39,7 @@
 - [为什么选择ToStore](#why-tostore) | [核心特性](#key-features) | [安装指南](#installation) | [KV模式](#quick-start-kv) | [表模式](#quick-start-table) | [内存模式](#quick-start-memory)
 - [表结构定义](#schema-definition) | [分布式架构](#distributed-architecture) | [级联外键](#foreign-keys) | [移动/桌面端](#mobile-integration) | [服务端/智能体](#server-integration) | [主键算法](#primary-key-examples)
 - [高级查询 (JOIN)](#query-advanced) | [聚合与统计](#aggregation-stats) | [复杂逻辑 (Condition)](#query-condition) | [响应式监听 (watch)](#reactive-query) | [流式查询](#streaming-query)
-- [KV进阶](#kv-advanced) | [批量操作](#bulk-operations) | [向量与混合检索](#vector-advanced) | [表级 TTL](#ttl-config) | [高效分页](#query-pagination) | [内存探针与同步检索 (peek)](#query-peek) | [查询缓存](#query-cache) | [原子操作](#atomic-expressions) | [事务](#transactions)
+- [KV进阶](#kv-advanced) | [批量操作](#bulk-operations) | [恢复保障](#recovery-durability) | [向量与混合检索](#vector-advanced) | [表级 TTL](#ttl-config) | [高效分页](#query-pagination) | [内存探针与同步检索 (peek)](#query-peek) | [查询缓存](#query-cache) | [原子操作](#atomic-expressions) | [事务](#transactions)
 - [管理维护](#database-maintenance) | [安全配置](#security-config) | [错误处理](#error-handling) | [性能与诊断](#performance) | [欢迎贡献](#contribute) | [AI 编程助手](#for-ai-coding-assistants)
 
 
@@ -703,6 +703,46 @@ ToStore 针对大规模数据吞吐提供了专门的批量处理接口。这些
 
 > [!TIP]
 > 可以设置 `allowPartialErrors: true` 来确保个别数据错误不会拒绝本次批量操作。
+
+
+### <a id="recovery-durability"></a>数据写入恢复保障 (Recovery Durability)
+
+ToStore 支持在**数据操作返回响应结果时**，灵活控制写入数据所具备的崩溃自愈恢复能力级别：
+
+| 级别 | 响应时恢复保障 | 适用场景与特性 |
+| :--- | :--- | :--- |
+| **`RecoveryDurability.standard`**<br>*(默认推荐)* | **返回前具备防崩溃自愈能力** | 抵御应用闪退、未捕获异常及系统 OOM 强杀。兼顾极高吞吐与日常业务安全。 |
+| **`RecoveryDurability.durable`** | **返回前具备防断电自愈能力** | 强制物理落盘，即使设备突发断电、内核宕机亦可完整自愈恢复。适用于关键交易等严苛场景。 |
+| **`RecoveryDurability.async`** | **极速吞吐（返回后异步保存）** | 内存入队后立即返回响应结果；在返回响应结果后，小数据量下多数仅存在**几毫秒极其短暂**的数据丢失窗口期。适用于海量非核心数据。 |
+
+#### 1. 全局默认配置
+在初始化数据库时，通过 `DataStoreConfig` 配置当前实例的默认恢复保障级别：
+```dart
+final db = await ToStore.open(
+  config: DataStoreConfig(
+    defaultRecoveryDurability: RecoveryDurability.standard, // 默认配置，返回前具备防闪退强杀能力
+  ),
+);
+```
+
+#### 2. 单操作级灵活覆盖
+所有结构化表写入、批量操作、链式更新/删除，以及**键值对 (KV) 存储**，均支持通过可选参数 `durability` 单独指定：
+
+```dart
+// 1. 结构化表操作覆盖
+await db.insert('orders', orderData, durability: RecoveryDurability.durable); // 核心订单：防断电恢复
+await db.batchInsert('logs', logList, durability: RecoveryDurability.async); // 海量日志：极速异步
+
+// 2. 链式更新与删除覆盖
+await db.update('users', {'status': 'active'})
+  .where('id', '=', userId)
+  .durability(RecoveryDurability.durable);
+
+// 3. 键值对存储 (KV) 覆盖
+await db.setValue('token', tokenVal, durability: RecoveryDurability.standard);
+await db.kv.set('session_id', 'xyz', durability: RecoveryDurability.async);
+await db.kv.setMany(settingsMap, durability: RecoveryDurability.durable);
+```
 
 
 ### <a id="vector-advanced"></a>向量字段、向量索引与混合检索
@@ -1499,7 +1539,7 @@ final txResult2 = await db.transaction(() async {
   - `instancePath`：准确定位数据存储目录。
   - `getVersion()` / `setVersion(version)`：业务自定义版本控制。用于记录应用自身的数据库版本号（非引擎版本），方便业务进行手动逻辑迁移判定。
 - **底线性维护 (Maintenance)**
-  - `flush(mode: FlushMode.fullPowerSafe)`：强制待写数据落盘。模式：`recovery`（最快，恢复日志仅写 OS 缓存，防应用中断、崩溃重启，断电可能丢数据）、`recoveryPowerSafe`（恢复日志写物理文件，防断电）、`fullPowerSafe`（默认；恢复日志 + 表数据 + 索引全量写物理文件）。
+  - `flush(mode: FlushMode.full)`：强制待写数据落盘。模式：`recovery`（最快，恢复日志仅写 OS 缓存，防应用中断、崩溃重启，断电可能丢数据）、`recoveryDurable`（恢复日志写物理文件，防断电）、`full`（默认；恢复日志 + 表数据 + 索引全量写物理文件）。
   - `deleteDatabase()`：全量清除。抹除当前实例的所有物理文件及其元数据，慎用。
 - **一站式诊断 (Diagnostics)**
   - `db.status.memory()`：内存快照诊断。查看读写缓存命中率、索引页占用及整体堆内存分配。
@@ -1772,6 +1812,7 @@ final plain2 = ToCrypto.decode(cipher2, key: key, aad: aad);
 | **`defaultQueryLimit`** | **1000** | **资源预检**。当查询未指定 `limit` 时套用此默认值，防止开发者失误导致的一次性加载海量结果导致 OOM。 |
 | **`cacheMemoryBudgetMB`** | (自动) | **内存精细化管理**。各缓存总内存预算。引擎会根据此预算自动启用 LRU 回收。 |
 | **`enableJournal`**| **true** | **崩溃自愈**。开启后，遇到异常崩溃或断电，数据会在下次启动时自愈恢复。 |
+| **`defaultRecoveryDurability`** | **`standard`** | **响应时恢复能力保障**。定义数据操作在返回响应结果时所具备的自愈恢复级别：<br>• **`standard`（默认）**：**返回响应结果前即具备防崩溃自愈能力**。能抵御应用闪退、未捕获异常及进程被系统强杀（OOM），兼顾极高吞吐与日常安全。<br>• **`durable`**：**返回响应结果前即具备防断电自愈能力**。数据强制物理落盘，即使突发断电、内核宕机亦可完整自愈恢复，适用于金融交易等核心场景。<br>• **`async`**：**极速吞吐**。内存入队后立即返回响应结果并在后台触发保存；**在返回响应结果后**，小数据量下多数仅存在**几毫秒极其短暂**的数据丢失窗口期。 |
 | **`persistRecoveryOnCommit`**| **true** | **强持久化保证**。为 true 时，事务提交后会强制 Sync 到物理磁盘；为 false 则后台异步 Flush（极大提速，但极端崩溃下可能丢失极少量数据）。 |
 | **`ttlCleanupIntervalMs`**| **300000** | **全局 TTL 轮询**。引擎后台会在非闲置时扫描过期数据的时间间隔（默认 5 分钟），调小后删除更及时，但开销稍大。 |
 | **`maxConcurrency`**| (自动) | **并发算力控制**。设置密集型任务（如向量计算、加解密）的最大并行线程数。通常推荐保持自动（基于核心数）。 |
@@ -1782,6 +1823,7 @@ final db = await ToStore.open(
     yieldDurationMs: 8, // 对前端 UI 极其友好，后端建议调整50ms
     defaultQueryLimit: 50, // 强制限制查询最大结果集
     enableJournal: true, // 确保崩溃自愈
+    defaultRecoveryDurability: RecoveryDurability.standard, // 响应前具备防闪退强杀自愈能力
   ),
 );
 ```

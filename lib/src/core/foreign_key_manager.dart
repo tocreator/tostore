@@ -136,7 +136,6 @@ class ForeignKeyManager {
       // Use a large limit to bypass the default 1000-record query limit
       final queryBuilder = QueryBuilder(_dataStore, fkTableName);
       final results = await queryBuilder.limit(1000000000).future;
-
       if (results.data.isEmpty) {
         return false;
       }
@@ -2536,12 +2535,23 @@ class ForeignKeyManager {
   }
 
   /// Check if any tables reference the given table via foreign keys
-
   ///
   /// This is a public method to check foreign key references before dropping a table
   Future<Map<TableUid, List<ForeignKeySchema>>> findReferencingTables(
       TableContext table) async {
     return await _findReferencingTables(table.tableUid);
+  }
+
+  /// Synchronously check if [tableUid] is referenced by any other table via active foreign keys.
+  ///
+  /// Returns `true` (conservative fallback) if the cache is not yet ready or being rebuilt.
+  /// Returns `false` only when the cache is loaded and confirmed empty for [tableUid].
+  bool hasReferencingTablesSync(TableUid tableUid) {
+    if (_referencingTablesCache == null || _cacheNeedsRebuild) {
+      return true; // Conservative fallback
+    }
+    final referencing = _referencingTablesCache![tableUid];
+    return referencing != null && referencing.isNotEmpty;
   }
 
   /// Clean up system table entries when a table is dropped
