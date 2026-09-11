@@ -383,7 +383,11 @@ final class TreeMetaPageService {
         pageNo: 0,
         payload: pageBytes,
       );
-      await _storage.appendBytes(redoPath, rec, flush: true);
+      await _storage.appendBytes(
+        redoPath,
+        PageRedoLogCodec.wrapChunk(rec),
+        flush: true,
+      );
     }
 
     await _storage.ensureDirectoryExists(p.dirname(path));

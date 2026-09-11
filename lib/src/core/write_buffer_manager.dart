@@ -120,11 +120,30 @@ class WriteBufferManager {
   }) async {
     final prior = trees.getPendingRecord(table.tableUid, recordId);
     bool skipQueueEnqueue = false;
+    var effectiveUpdateStats = updateStats;
 
-    if (prior != null &&
-        prior.operation == BufferOperationType.insert &&
-        entry.operation == BufferOperationType.update) {
-      skipQueueEnqueue = true;
+    if (prior != null) {
+      // insert→update coalesces in trees; must NOT skip the write queue —
+      // a concurrent flush may already have popped the insert, leaving the
+      // merged pending row stranded with no schedule trigger.
+      if (prior.operation == BufferOperationType.insert &&
+          entry.operation == BufferOperationType.update) {
+        effectiveUpdateStats = false;
+      }
+
+      // Recovery-only: pending-batch + WAL may replay the same op. Online
+      // path never sees identical walPointer / duplicate insert for one PK.
+      if (_dataStore.parallelJournalManager.isInRecoveryMode) {
+        final sameWal = prior.walPointer != null &&
+            entry.walPointer != null &&
+            prior.walPointer == entry.walPointer;
+        final dupInsert = prior.operation == BufferOperationType.insert &&
+            entry.operation == BufferOperationType.insert;
+        if (sameWal || dupInsert) {
+          skipQueueEnqueue = true;
+          effectiveUpdateStats = false;
+        }
+      }
     }
 
     final bool restoreDeletedCount = prior != null &&
@@ -159,7 +178,7 @@ class WriteBufferManager {
       _dataStore.backgroundWriteScheduler.handleOnlineWrite(table, recordId);
       final bp = _dataStore.parallelJournalManager.applyEnqueueBackpressure();
       if (bp != null) await bp;
-      if (updateStats) {
+      if (effectiveUpdateStats) {
         if (restoreDeletedCount) {
           await _dataStore.tableDataManager
               .updateTableRecordCount(table, BufferOperationType.insert);
@@ -208,11 +227,30 @@ class WriteBufferManager {
   }) {
     final prior = trees.getPendingRecord(table.tableUid, recordId);
     bool skipQueueEnqueue = false;
+    var effectiveUpdateStats = updateStats;
 
-    if (prior != null &&
-        prior.operation == BufferOperationType.insert &&
-        entry.operation == BufferOperationType.update) {
-      skipQueueEnqueue = true;
+    if (prior != null) {
+      // insert→update coalesces in trees; must NOT skip the write queue —
+      // a concurrent flush may already have popped the insert, leaving the
+      // merged pending row stranded with no schedule trigger.
+      if (prior.operation == BufferOperationType.insert &&
+          entry.operation == BufferOperationType.update) {
+        effectiveUpdateStats = false;
+      }
+
+      // Recovery-only: pending-batch + WAL may replay the same op. Online
+      // path never sees identical walPointer / duplicate insert for one PK.
+      if (_dataStore.parallelJournalManager.isInRecoveryMode) {
+        final sameWal = prior.walPointer != null &&
+            entry.walPointer != null &&
+            prior.walPointer == entry.walPointer;
+        final dupInsert = prior.operation == BufferOperationType.insert &&
+            entry.operation == BufferOperationType.insert;
+        if (sameWal || dupInsert) {
+          skipQueueEnqueue = true;
+          effectiveUpdateStats = false;
+        }
+      }
     }
 
     final bool restoreDeletedCount = prior != null &&
@@ -245,7 +283,7 @@ class WriteBufferManager {
 
     if (!skipQueueEnqueue && effective != null) {
       _dataStore.backgroundWriteScheduler.handleOnlineWrite(table, recordId);
-      if (updateStats) {
+      if (effectiveUpdateStats) {
         final op = restoreDeletedCount
             ? BufferOperationType.insert
             : effective.operation;
@@ -483,12 +521,6 @@ class WriteBufferManager {
 
       final recordId = recordIds[i];
       final entry = entries[i];
-      final prior = batchTxId != null
-          ? trees.getTxnRecord(batchTxId, table.tableUid, recordId)
-          : trees.getPendingRecord(table.tableUid, recordId);
-      final skipQueue = prior != null &&
-          prior.operation == BufferOperationType.insert &&
-          entry.operation == BufferOperationType.update;
       final changed = changedFieldsList != null && i < changedFieldsList.length
           ? changedFieldsList[i]
           : null;
@@ -511,7 +543,9 @@ class WriteBufferManager {
         );
       }
 
-      if (!skipQueue && effective != null && effective.walPointer != null) {
+      // Always enqueue (O(1)). insert→update coalesces in trees; skipping the
+      // queue previously stranded rows when flush already popped the insert.
+      if (effective != null && effective.walPointer != null) {
         pendingQueue.add(WriteQueueEntry(
           tableUid: table.tableUid,
           recordId: recordId,

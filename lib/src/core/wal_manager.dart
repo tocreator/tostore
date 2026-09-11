@@ -2013,10 +2013,18 @@ class WalManager {
         _walFlushFuture = null;
       }
       // Cover the race where new entries arrived after the last emptiness
-      // check but before [_walFlushInProgress] cleared. Skip immediate retry
-      // after a hard write error to avoid a tight failure loop.
-      if (!stopAfterWriteError && _walQueue.isNotEmpty) {
-        scheduleFlushIfNeeded();
+      // check but before [_walFlushInProgress] cleared. After a hard write
+      // error, delay the retry so we do not spin, but still re-arm the pump
+      // so orphaned queue entries are not left forever without a new writer.
+      if (_walQueue.isNotEmpty) {
+        if (stopAfterWriteError) {
+          // ignore: discarded_futures
+          Future<void>.delayed(const Duration(milliseconds: 100), () {
+            scheduleFlushIfNeeded();
+          });
+        } else {
+          scheduleFlushIfNeeded();
+        }
       }
     }
   }

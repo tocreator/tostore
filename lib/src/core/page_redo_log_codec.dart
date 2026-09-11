@@ -9,17 +9,29 @@ import '../model/table_identity.dart';
 /// Page redo log: append-only records for crash-safe page replay.
 ///
 /// ## Write path (current)
-/// Only [PageRedoLogCodec.encodePageRecord]. Partition-0 page0 payloads carry
-/// full tree-global meta (TMP1 [TreeMetaPagePayload]); do not invent a separate
-/// structure-only record for new batches.
+/// Each durable redo append is one **chunk**:
+/// `[ChunkBegin][PageRecord...][ChunkEnd]` via [wrapChunk], fsync'd **before**
+/// the corresponding page bytes are staged/written.
+///
+/// If a crash truncates mid-chunk, recovery sees Begin without End and
+/// **discards that incomplete segment** -- those pages were not written yet.
+/// Prior complete chunks remain applicable.
+///
+/// Partition-0 page0 payloads carry full tree-global meta
+/// (TMP1 [TreeMetaPagePayload]); do not invent a separate structure-only
+/// record for new batches.
 ///
 /// ## Read path
 /// [PageRedoLogCodec.decodeRecord] accepts:
 /// - type 1: [PageRedoPageRecord] (current)
 /// - type 2: [PageRedoTreeMetaRecord] (legacy structure snapshot only)
+/// - type 3: [PageRedoChunkBeginRecord]
+/// - type 4: [PageRedoChunkEndRecord]
 ///
-/// Legacy type-2 records are applied by recovery **only when** the same redo
-/// log did not restore partition-0 page0.
+/// [collectApplicableRecords] returns page/meta records only from complete
+/// Begin…End chunks. A trailing open chunk (Begin without End) is dropped.
+/// Legacy files with no framing markers still apply every complete record
+/// until a truncated tail.
 ///
 /// Framing: `[recLen:u32 LE][recType:u8][payload...]`
 /// Strings: UTF-8 with `[len:u16 LE][bytes]`.
@@ -34,6 +46,24 @@ enum PageRedoTreeKind {
 sealed class PageRedoLogRecord {
   final int nextStart;
   const PageRedoLogRecord({required this.nextStart});
+}
+
+/// Marks the start of one redo append unit (before page records).
+///
+/// Wire: `[recLen:u32][type=3][magic:u32 LE]`
+final class PageRedoChunkBeginRecord extends PageRedoLogRecord {
+  static const int magic = 0x52444247; // 'RDBB'
+
+  const PageRedoChunkBeginRecord({required super.nextStart});
+}
+
+/// Marks the end of one redo append unit (after page records, before page IO).
+///
+/// Wire: `[recLen:u32][type=4][magic:u32 LE]`
+final class PageRedoChunkEndRecord extends PageRedoLogRecord {
+  static const int magic = 0x5244454E; // 'RDEN'
+
+  const PageRedoChunkEndRecord({required super.nextStart});
 }
 
 /// Full page after-image (the only record type new code should append).
@@ -95,9 +125,25 @@ final class PageRedoTreeMetaRecord extends PageRedoLogRecord {
   });
 }
 
+/// Page/meta records from complete redo chunks only.
+final class PageRedoApplicableRecords {
+  final List<PageRedoPageRecord> pages;
+  final List<PageRedoTreeMetaRecord> treeMetas;
+
+  const PageRedoApplicableRecords({
+    required this.pages,
+    required this.treeMetas,
+  });
+}
+
 final class PageRedoLogCodec {
   static const int _recTypePage = 1;
   static const int _recTypeTreeMetaLegacy = 2;
+  static const int _recTypeChunkBegin = 3;
+  static const int _recTypeChunkEnd = 4;
+
+  /// Fixed size of a begin/end marker including the length prefix.
+  static const int markerRecordLength = 4 + 1 + 4;
 
   static Uint8List _u16StringBytes(String s) {
     final b = Uint8List.fromList(utf8.encode(s));
@@ -114,7 +160,16 @@ final class PageRedoLogCodec {
     return b;
   }
 
-  /// Encode one page write (full page bytes). This is the sole write API.
+  static Uint8List _encodeMarker(int recType, int magic) {
+    final out = Uint8List(markerRecordLength);
+    final bd = ByteData.sublistView(out);
+    bd.setUint32(0, markerRecordLength, Endian.little);
+    out[4] = recType;
+    bd.setUint32(5, magic, Endian.little);
+    return out;
+  }
+
+  /// Encode one page write (full page bytes). This is the sole page write API.
   static Uint8List encodePageRecord({
     required PageRedoTreeKind treeKind,
     required TableUid tableUid,
@@ -182,17 +237,130 @@ final class PageRedoLogCodec {
     return out;
   }
 
+  static Uint8List encodeChunkBegin() =>
+      _encodeMarker(_recTypeChunkBegin, PageRedoChunkBeginRecord.magic);
+
+  static Uint8List encodeChunkEnd() =>
+      _encodeMarker(_recTypeChunkEnd, PageRedoChunkEndRecord.magic);
+
+  /// Wrap [body] (one or more page/meta records) as a complete redo chunk.
+  ///
+  /// Callers must append the result and fsync **before** writing the matching
+  /// page bytes. Crash mid-append leaves Begin without End → chunk discarded.
+  static Uint8List wrapChunk(Uint8List body) {
+    final begin = encodeChunkBegin();
+    final end = encodeChunkEnd();
+    if (body.isEmpty) {
+      final out = Uint8List(begin.length + end.length);
+      out.setRange(0, begin.length, begin);
+      out.setRange(begin.length, out.length, end);
+      return out;
+    }
+    final out = Uint8List(begin.length + body.length + end.length);
+    out.setRange(0, begin.length, begin);
+    out.setRange(begin.length, begin.length + body.length, body);
+    out.setRange(begin.length + body.length, out.length, end);
+    return out;
+  }
+
+  /// Collect page/meta records that are safe to apply on recovery.
+  ///
+  /// - Framed logs: only records inside complete Begin…End chunks.
+  /// - Legacy (no markers): every complete record until a truncated tail.
+  /// - Trailing open chunk (Begin without End): dropped entirely.
+  static PageRedoApplicableRecords collectApplicableRecords(Uint8List bytes) {
+    final pages = <PageRedoPageRecord>[];
+    final treeMetas = <PageRedoTreeMetaRecord>[];
+    if (bytes.isEmpty) {
+      return PageRedoApplicableRecords(pages: pages, treeMetas: treeMetas);
+    }
+
+    int pos = 0;
+    var sawFraming = false;
+    var inChunk = false;
+    final pendingPages = <PageRedoPageRecord>[];
+    final pendingMetas = <PageRedoTreeMetaRecord>[];
+
+    void commitPending() {
+      pages.addAll(pendingPages);
+      treeMetas.addAll(pendingMetas);
+      pendingPages.clear();
+      pendingMetas.clear();
+    }
+
+    void dropPending() {
+      pendingPages.clear();
+      pendingMetas.clear();
+    }
+
+    while (pos < bytes.length) {
+      final rec = decodeRecord(bytes, pos);
+      if (rec == null) break;
+      pos = rec.nextStart;
+
+      if (rec is PageRedoChunkBeginRecord) {
+        sawFraming = true;
+        // Nested/stray begin: drop any open unfinished chunk.
+        dropPending();
+        inChunk = true;
+        continue;
+      }
+      if (rec is PageRedoChunkEndRecord) {
+        sawFraming = true;
+        if (inChunk) {
+          commitPending();
+        }
+        inChunk = false;
+        continue;
+      }
+
+      if (sawFraming) {
+        if (!inChunk) continue; // orphan outside a chunk
+        if (rec is PageRedoPageRecord) {
+          pendingPages.add(rec);
+        } else if (rec is PageRedoTreeMetaRecord) {
+          pendingMetas.add(rec);
+        }
+      } else {
+        // Legacy unframed log: apply complete records until truncated.
+        if (rec is PageRedoPageRecord) {
+          pages.add(rec);
+        } else if (rec is PageRedoTreeMetaRecord) {
+          treeMetas.add(rec);
+        }
+      }
+    }
+
+    // Incomplete trailing chunk (Begin… without End): discard.
+    dropPending();
+    return PageRedoApplicableRecords(pages: pages, treeMetas: treeMetas);
+  }
+
   /// Decode next record at [start], or null if truncated / invalid.
   static PageRedoLogRecord? decodeRecord(Uint8List bytes, int start) {
     if (start + 4 > bytes.length) return null;
     final bd = ByteData.sublistView(bytes);
     final recLen = bd.getUint32(start, Endian.little);
-    if (recLen < 6) return null;
+    if (recLen < 5) return null;
     final end = start + recLen;
     if (end > bytes.length) return null;
 
     int pos = start + 4;
     final recType = bytes[pos++];
+
+    if (recType == _recTypeChunkBegin || recType == _recTypeChunkEnd) {
+      if (end - (start + 4) < 1 + 4) return null;
+      final magic = bd.getUint32(pos, Endian.little);
+      if (recType == _recTypeChunkBegin) {
+        if (magic != PageRedoChunkBeginRecord.magic) return null;
+        return PageRedoChunkBeginRecord(nextStart: end);
+      }
+      if (magic != PageRedoChunkEndRecord.magic) return null;
+      return PageRedoChunkEndRecord(nextStart: end);
+    }
+
+    if (recLen < 6) return null;
+    if (pos >= end) return null;
     final kindIdx = bytes[pos++];
     if (kindIdx < 0 || kindIdx >= PageRedoTreeKind.values.length) return null;
     final kind = PageRedoTreeKind.values[kindIdx];

@@ -1617,7 +1617,12 @@ final class TableTreePartitionManager {
               batchContext.batchId,
               spaceName: _dataStore.currentSpaceName);
           await _storage.ensureDirectoryExists(p.dirname(redoPath));
-          await _storage.appendBytes(redoPath, res.pageRedoBytes!, flush: true);
+          // Begin…End chunk sealed before page IO: truncated chunk ⇒ no page write yet.
+          await _storage.appendBytes(
+            redoPath,
+            PageRedoLogCodec.wrapChunk(res.pageRedoBytes!),
+            flush: true,
+          );
         }
 
         for (int i = 0; i < bytesList.length; i++) {
@@ -1978,8 +1983,6 @@ final class TableTreePartitionManager {
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
         );
-        stageWrite(p0Stats.path!, 0, p0Bytes);
-
         if (batchContext != null) {
           final redoPath = _dataStore.pathManager.getPageRedoLogPath(
             batchContext.batchId,
@@ -1993,8 +1996,13 @@ final class TableTreePartitionManager {
             pageNo: 0,
             payload: p0Bytes,
           );
-          await _storage.appendBytes(redoPath, rec, flush: true);
+          await _storage.appendBytes(
+            redoPath,
+            PageRedoLogCodec.wrapChunk(rec),
+            flush: true,
+          );
         }
+        stageWrite(p0Stats.path!, 0, p0Bytes);
       }
     }
 

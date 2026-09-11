@@ -48,6 +48,10 @@ class ParallelJournalManager {
   Future<void>? _loopFuture;
   StreamSubscription<int>? _bufSizeSub;
   bool _flushInProgress = false;
+
+  /// When true, online pump [whenComplete] must not chain another
+  /// [scheduleFlushIfNeeded] (owned by [flushCompletely] / stop drain).
+  bool _suppressOnlineReschedule = false;
   BatchContext? _activeBatchContext;
   bool _isRecovering = false; // Flag to indicate if currently in recovery mode
 
@@ -264,7 +268,11 @@ class ParallelJournalManager {
     }
   }
 
-  /// First real (non-pseudo) WAL pointer in [batch], if any.
+  /// First real (non-pseudo) WAL pointer in queue order (O(1)).
+  ///
+  /// The write queue is FIFO and WAL pointers are assigned monotonically on
+  /// enqueue, so the first/last real pointers bound the batch's WAL span
+  /// without scanning the whole batch.
   static WalPointer? _firstRealWalPointer(List<WriteQueueEntry> batch) {
     for (final e in batch) {
       if (e.walPointer.partitionIndex >= 0) return e.walPointer;
@@ -272,7 +280,7 @@ class ParallelJournalManager {
     return null;
   }
 
-  /// Last real (non-pseudo) WAL pointer in [batch], if any.
+  /// Last real (non-pseudo) WAL pointer in queue order (O(1)).
   static WalPointer? _lastRealWalPointer(List<WriteQueueEntry> batch) {
     for (var i = batch.length - 1; i >= 0; i--) {
       if (batch[i].walPointer.partitionIndex >= 0) {
@@ -420,34 +428,45 @@ class ParallelJournalManager {
 
     // Wake any in-flight online tail wait before awaiting that pump.
     _requestImmediateFlush();
+    // Block lost-wakeup chaining while we take exclusive drain ownership.
+    _suppressOnlineReschedule = true;
 
-    // Drain must not silently no-op while recovery holds the flush gate.
-    if (_isRecovering) {
-      await waitUntilRecoveryCompleted();
-      if (!_running) {
-        _clearImmediateFlushRequest();
-        return;
-      }
-    }
-
-    // Wait for any in-flight flush first to avoid overlapping pumps.
-    final existing = _loopFuture;
-    if (existing != null) {
-      try {
-        await existing;
-      } catch (_) {}
-    }
-
-    // Run a dedicated drain-mode pump.
     try {
-      _flushInProgress = true;
-      final fut = _pumpFlush(drainCompletely: true);
-      _loopFuture = fut;
-      await fut;
+      // Drain must not silently no-op while recovery holds the flush gate.
+      if (_isRecovering) {
+        await waitUntilRecoveryCompleted();
+        if (!_running) {
+          return;
+        }
+      }
+
+      // Wait for any in-flight flush first to avoid overlapping pumps.
+      final existing = _loopFuture;
+      if (existing != null) {
+        try {
+          await existing;
+        } catch (_) {}
+      }
+
+      // Run a dedicated drain-mode pump.
+      try {
+        _flushInProgress = true;
+        final fut = _pumpFlush(drainCompletely: true);
+        _loopFuture = fut;
+        await fut;
+      } finally {
+        _flushInProgress = false;
+        _loopFuture = null;
+      }
     } finally {
-      _flushInProgress = false;
-      _loopFuture = null;
+      _suppressOnlineReschedule = false;
       _clearImmediateFlushRequest();
+      // Writes may have arrived while suppress blocked online chaining.
+      if (_running &&
+          (!_bufferManager.isEmpty ||
+              !_dataStore.backgroundWriteScheduler.isEmpty)) {
+        scheduleFlushIfNeeded();
+      }
     }
   }
 
@@ -502,6 +521,7 @@ class ParallelJournalManager {
     }
 
     _requestImmediateFlush();
+    _suppressOnlineReschedule = true;
 
     try {
       _running = true;
@@ -526,6 +546,7 @@ class ParallelJournalManager {
       await _pumpFlush(drainCompletely: true);
     } finally {
       _running = false;
+      _suppressOnlineReschedule = false;
       _loopFuture = null;
       _flushInProgress = false;
       _activeBatchContext = null;
@@ -597,7 +618,23 @@ class ParallelJournalManager {
     final fut = _pumpFlush();
     _loopFuture = fut;
     fut.whenComplete(() {
+      // Only the pump that still owns [_loopFuture] may clear the gate.
+      // [flushCompletely] / stop may have replaced it with a drain pump.
+      if (!identical(_loopFuture, fut)) {
+        return;
+      }
+      _loopFuture = null;
       _flushInProgress = false;
+
+      // Lost-wakeup cover: entries (or requeued work after break) may have
+      // arrived while [_flushInProgress] caused scheduleFlushIfNeeded to
+      // no-op, and the pump then exited without another sizeStream event.
+      if (_suppressOnlineReschedule) return;
+      if (!_running || _isRecovering) return;
+      if (!_bufferManager.isEmpty ||
+          !_dataStore.backgroundWriteScheduler.isEmpty) {
+        scheduleFlushIfNeeded();
+      }
     });
   }
 
@@ -1862,7 +1899,9 @@ class ParallelJournalManager {
           tasks.add(task);
           // Only exclude ranges for FLUSH batches that were actually loaded into buffer.
           // Maintenance batches do not load record data into buffer.
-          if (b.batchType == BatchType.flush) {
+          if (b.batchType == BatchType.flush &&
+              b.start.partitionIndex >= 0 &&
+              b.end.partitionIndex >= 0) {
             excludeRanges.add(_WalRange(b.start, b.end));
           }
         }
@@ -2702,7 +2741,7 @@ class ParallelJournalManager {
     final size = await _dataStore.storage.getFileSize(redoPath);
     if (size <= 0) return;
     final bytes = await _dataStore.storage.readAsBytes(redoPath);
-    int pos = 0;
+    final applicable = PageRedoLogCodec.collectApplicableRecords(bytes);
     // Deduplicate by logical identity with last-write-wins.
     // Reason: redo log may contain multiple attempts or duplicates for the same page.
     final byPartition = <({
@@ -2722,29 +2761,26 @@ class ParallelJournalManager {
     final parseYc = YieldController(
         'ParallelJournalManager._replayPageRedoLog.parse',
         checkInterval: yieldInterval);
-    while (pos < bytes.length) {
+    for (var i = 0; i < applicable.pages.length; i++) {
       final y7 = parseYc.maybeYield();
       if (y7 != null) await y7;
-      final rec = PageRedoLogCodec.decodeRecord(bytes, pos);
-      if (rec == null) break;
-      pos = rec.nextStart;
-      if (rec is PageRedoPageRecord) {
-        final key = (
-          kind: rec.treeKind,
-          tableUid: rec.tableUid,
-          indexUid: rec.indexUid ?? IndexUid.empty,
-          partitionNo: rec.partitionNo,
-        );
-        byPartition.putIfAbsent(key, () => <int, Uint8List>{})[rec.pageNo] =
-            rec.payload;
-      } else if (rec is PageRedoTreeMetaRecord) {
-        final key = (
-          kind: rec.treeKind,
-          tableUid: rec.tableUid,
-          indexUid: rec.indexUid ?? IndexUid.empty,
-        );
-        treeMeta[key] = rec;
-      }
+      final rec = applicable.pages[i];
+      final key = (
+        kind: rec.treeKind,
+        tableUid: rec.tableUid,
+        indexUid: rec.indexUid ?? IndexUid.empty,
+        partitionNo: rec.partitionNo,
+      );
+      byPartition.putIfAbsent(key, () => <int, Uint8List>{})[rec.pageNo] =
+          rec.payload;
+    }
+    for (final rec in applicable.treeMetas) {
+      final key = (
+        kind: rec.treeKind,
+        tableUid: rec.tableUid,
+        indexUid: rec.indexUid ?? IndexUid.empty,
+      );
+      treeMeta[key] = rec;
     }
     final writeYc = YieldController(
         'ParallelJournalManager._replayPageRedoLog.write',
