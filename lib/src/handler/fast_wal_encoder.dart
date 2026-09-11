@@ -522,12 +522,10 @@ class FastWalEncoder {
 /// Ultra-fast growable byte buffer designed for direct MessagePack serialization.
 class FastWalBuffer {
   Uint8List _buffer;
-  ByteData _view;
+  late ByteData _view;
   int length = 0;
 
-  FastWalBuffer({int capacity = 64 * 1024})
-      : _buffer = Uint8List(capacity),
-        _view = ByteData.sublistView(Uint8List(capacity)) {
+  FastWalBuffer({int capacity = 64 * 1024}) : _buffer = Uint8List(capacity) {
     _view = ByteData.sublistView(_buffer);
   }
 
@@ -539,6 +537,31 @@ class FastWalBuffer {
     final out = Uint8List(length);
     out.setRange(0, length, _buffer);
     return out;
+  }
+
+  /// Transfer ownership of the current payload and reset this buffer.
+  ///
+  /// Avoids a full memcpy when handing encoded bytes to the async WAL queue,
+  /// but creates an exact-sized copy if the buffer is significantly larger
+  /// than the taken length to prevent memory retention leaks.
+  Uint8List takeBytes() {
+    final int len = length;
+    if (len == 0) {
+      length = 0;
+      return Uint8List(0);
+    }
+    if (len < (_buffer.length >> 1)) {
+      final taken = Uint8List(len);
+      taken.setRange(0, len, _buffer);
+      length = 0;
+      return taken;
+    }
+    final taken = Uint8List.sublistView(_buffer, 0, len);
+    final int nextCap = _buffer.length < 65536 ? 65536 : _buffer.length;
+    _buffer = Uint8List(nextCap);
+    _view = ByteData.sublistView(_buffer);
+    length = 0;
+    return taken;
   }
 
   void reset() {
@@ -564,6 +587,9 @@ class FastWalBuffer {
 
   @pragma('vm:prefer-inline')
   void writeUint8Fast(int byte) {
+    if (length >= _buffer.length) {
+      ensureAvailable(1);
+    }
     _buffer[length++] = byte;
   }
 
@@ -612,6 +638,9 @@ class FastWalBuffer {
 
   @pragma('vm:prefer-inline')
   void writeInt32BEFast(int val) {
+    if (length + 4 > _buffer.length) {
+      ensureAvailable(4);
+    }
     _buffer[length] = (val >> 24) & 0xFF;
     _buffer[length + 1] = (val >> 16) & 0xFF;
     _buffer[length + 2] = (val >> 8) & 0xFF;
@@ -645,13 +674,30 @@ class FastWalBuffer {
   void writeBytesFast(List<int> bytes, [int start = 0, int? end]) {
     final int toWrite = (end ?? bytes.length) - start;
     if (toWrite <= 0) return;
+    if (length + toWrite > _buffer.length) {
+      ensureAvailable(toWrite);
+    }
     _buffer.setRange(length, length + toWrite, bytes, start);
     length += toWrite;
   }
 
   @pragma('vm:prefer-inline')
-  void writeAsciiStringFast(String str) {
+  void writeStringSafe(String str) {
     final len = str.length;
+    if (len == 0) {
+      writeUint8(0xA0);
+      return;
+    }
+
+    final int maxHeader =
+        len < 32 ? 1 : (len <= 255 ? 2 : (len <= 65535 ? 3 : 5));
+    if (length + maxHeader + len > _buffer.length) {
+      ensureAvailable(maxHeader + len);
+    }
+
+    final int rollbackPos = length;
+
+    // Optimistic ASCII header write
     if (len < 32) {
       _buffer[length++] = 0xA0 | len;
     } else if (len <= 255) {
@@ -668,18 +714,76 @@ class FastWalBuffer {
       _buffer[length++] = (len >> 8) & 0xFF;
       _buffer[length++] = len & 0xFF;
     }
+
     int i = 0;
+    bool isPureAscii = true;
     while (i + 4 <= len) {
-      _buffer[length] = str.codeUnitAt(i);
-      _buffer[length + 1] = str.codeUnitAt(i + 1);
-      _buffer[length + 2] = str.codeUnitAt(i + 2);
-      _buffer[length + 3] = str.codeUnitAt(i + 3);
+      final c0 = str.codeUnitAt(i);
+      final c1 = str.codeUnitAt(i + 1);
+      final c2 = str.codeUnitAt(i + 2);
+      final c3 = str.codeUnitAt(i + 3);
+      if ((c0 | c1 | c2 | c3) > 0x7F) {
+        isPureAscii = false;
+        break;
+      }
+      _buffer[length] = c0;
+      _buffer[length + 1] = c1;
+      _buffer[length + 2] = c2;
+      _buffer[length + 3] = c3;
       length += 4;
       i += 4;
     }
-    while (i < len) {
-      _buffer[length++] = str.codeUnitAt(i++);
+
+    if (isPureAscii) {
+      while (i < len) {
+        final c = str.codeUnitAt(i++);
+        if (c > 0x7F) {
+          isPureAscii = false;
+          break;
+        }
+        _buffer[length++] = c;
+      }
+      if (isPureAscii) {
+        return;
+      }
     }
+
+    // Rollback and fallback to standard UTF-8 encoding for multi-byte strings
+    length = rollbackPos;
+    final encoded = utf8.encode(str);
+    final int byteLen = encoded.length;
+    final int headerBytes = byteLen < 32
+        ? 1
+        : byteLen <= 255
+            ? 2
+            : byteLen <= 65535
+                ? 3
+                : 5;
+    if (length + headerBytes + byteLen > _buffer.length) {
+      ensureAvailable(headerBytes + byteLen);
+    }
+    if (byteLen < 32) {
+      _buffer[length++] = 0xA0 | byteLen;
+    } else if (byteLen <= 255) {
+      _buffer[length++] = 0xD9;
+      _buffer[length++] = byteLen;
+    } else if (byteLen <= 65535) {
+      _buffer[length++] = 0xDA;
+      _buffer[length++] = (byteLen >> 8) & 0xFF;
+      _buffer[length++] = byteLen & 0xFF;
+    } else {
+      _buffer[length++] = 0xDB;
+      _buffer[length++] = (byteLen >> 24) & 0xFF;
+      _buffer[length++] = (byteLen >> 16) & 0xFF;
+      _buffer[length++] = (byteLen >> 8) & 0xFF;
+      _buffer[length++] = byteLen & 0xFF;
+    }
+    writeBytesFast(encoded);
+  }
+
+  @pragma('vm:prefer-inline')
+  void writeAsciiStringFast(String str) {
+    writeStringSafe(str);
   }
 }
 
@@ -776,7 +880,7 @@ class FastWalBatchSession {
       FastWalEncoder._writeValue(buf, record);
 
       // 4. "oldValues" (if present)
-      if (hasOldValues && oldValues != null) {
+      if (hasOldValues) {
         buf.writeBytes(FastWalEncoder._keyOldValues);
         FastWalEncoder._writeValue(buf, oldValues);
       }
@@ -795,7 +899,7 @@ class FastWalBatchSession {
       FastWalEncoder._writeValue(tempBuf, seq);
       tempBuf.writeBytes(FastWalEncoder._keyData);
       FastWalEncoder._writeValue(tempBuf, record);
-      if (hasOldValues && oldValues != null) {
+      if (hasOldValues) {
         tempBuf.writeBytes(FastWalEncoder._keyOldValues);
         FastWalEncoder._writeValue(tempBuf, oldValues);
       }
@@ -829,10 +933,18 @@ class FastWalTableField {
   });
 
   factory FastWalTableField.create(String name, DataType type) {
-    final len = name.length;
+    final encoded = utf8.encode(name);
+    final len = encoded.length;
     final buf = <int>[];
     if (len < 32) {
       buf.add(0xA0 | len);
+    } else if (len <= 255) {
+      buf.add(0xD9);
+      buf.add(len);
+    } else if (len <= 65535) {
+      buf.add(0xDA);
+      buf.add((len >> 8) & 0xFF);
+      buf.add(len & 0xFF);
     } else {
       buf.add(0xDB);
       buf.add((len >> 24) & 0xFF);
@@ -840,13 +952,26 @@ class FastWalTableField {
       buf.add((len >> 8) & 0xFF);
       buf.add(len & 0xFF);
     }
-    buf.addAll(name.codeUnits);
+    buf.addAll(encoded);
     return FastWalTableField(
       name: name,
       type: type,
       keyToken: Uint8List.fromList(buf),
     );
   }
+}
+
+/// Cached schema field layout and MessagePack map header.
+class _SchemaWalFieldsDescriptor {
+  final List<FastWalTableField> fields;
+  final Uint8List mapHeader;
+  final int estimatedFieldsBytes;
+
+  const _SchemaWalFieldsDescriptor({
+    required this.fields,
+    required this.mapHeader,
+    required this.estimatedFieldsBytes,
+  });
 }
 
 /// Ultra-fast schema-aware batch WAL encoder session.
@@ -862,6 +987,49 @@ class FastWalTableSession {
   final bool _isEncrypted;
   final int _estimatedRecordBytes;
   int get estimatedRecordBytes => _estimatedRecordBytes;
+
+  static final Expando<_SchemaWalFieldsDescriptor> _schemaFieldsCache =
+      Expando<_SchemaWalFieldsDescriptor>('FastWalSchemaFields');
+
+  static _SchemaWalFieldsDescriptor _getOrCreateSchemaDescriptor(
+      TableSchema schema) {
+    final cached = _schemaFieldsCache[schema];
+    if (cached != null) return cached;
+
+    final fields = <FastWalTableField>[];
+    DataType pkType = schema.primaryKeyConfig.type == PrimaryKeyType.sequential
+        ? DataType.integer
+        : DataType.text;
+    for (final f in schema.fields) {
+      if (f.name == schema.primaryKey) {
+        pkType = f.type;
+        break;
+      }
+    }
+    // Primary key field first
+    fields.add(FastWalTableField.create(schema.primaryKey, pkType));
+    for (final f in schema.fields) {
+      if (f.name != schema.primaryKey) {
+        fields.add(FastWalTableField.create(f.name, f.type));
+      }
+    }
+
+    final mapBuf = <int>[
+      0xDF,
+      (fields.length >> 24) & 0xFF,
+      (fields.length >> 16) & 0xFF,
+      (fields.length >> 8) & 0xFF,
+      fields.length & 0xFF,
+    ];
+
+    final desc = _SchemaWalFieldsDescriptor(
+      fields: List<FastWalTableField>.unmodifiable(fields),
+      mapHeader: Uint8List.fromList(mapBuf),
+      estimatedFieldsBytes: fields.length * 48,
+    );
+    _schemaFieldsCache[schema] = desc;
+    return desc;
+  }
 
   FastWalTableSession._({
     required Uint8List staticPrefix,
@@ -916,37 +1084,18 @@ class FastWalTableSession {
       FastWalEncoder._writeString(prefixBuf, txId);
     }
 
-    final fields = <FastWalTableField>[];
-    // Primary key field first
-    fields.add(FastWalTableField.create(
-      schema.primaryKey,
-      schema.primaryKeyConfig.type == PrimaryKeyType.sequential
-          ? DataType.integer
-          : DataType.text,
-    ));
-    for (final f in schema.fields) {
-      if (f.name != schema.primaryKey) {
-        fields.add(FastWalTableField.create(f.name, f.type));
-      }
-    }
-
-    final mapBuf = <int>[
-      0xDF,
-      (fields.length >> 24) & 0xFF,
-      (fields.length >> 16) & 0xFF,
-      (fields.length >> 8) & 0xFF,
-      fields.length & 0xFF,
-    ];
+    final descriptor = _getOrCreateSchemaDescriptor(schema);
 
     final isEncrypted =
         EncryptionManager.getEncryptionType() != EncryptionType.none;
 
-    final estimatedRecordBytes = prefixBuf.length + 30 + fields.length * 48;
+    final estimatedRecordBytes =
+        prefixBuf.length + 30 + descriptor.estimatedFieldsBytes;
 
     return FastWalTableSession._(
       staticPrefix: prefixBuf.copyCurrentBytes(),
-      fields: fields,
-      mapHeader: Uint8List.fromList(mapBuf),
+      fields: descriptor.fields,
+      mapHeader: descriptor.mapHeader,
       partitionIndex: partitionIndex,
       hasOldValues: hasOldValues,
       isEncrypted: isEncrypted,
@@ -1112,27 +1261,10 @@ class FastWalTableSession {
 
       case DataType.datetime:
         if (val is String) {
-          final len = val.length;
-          if (len < 32) {
-            buf.writeUint8(0xA0 | len);
-            for (int i = 0; i < len; i++) {
-              buf.writeUint8Fast(val.codeUnitAt(i));
-            }
-          } else {
-            buf.writeUint8(0xDB);
-            buf.writeUint32BE(len);
-            for (int i = 0; i < len; i++) {
-              buf.writeUint8Fast(val.codeUnitAt(i));
-            }
-          }
+          buf.writeStringSafe(val);
           return;
         } else if (val is DateTime) {
-          final s = val.toIso8601String();
-          final len = s.length;
-          buf.writeUint8(0xA0 | len);
-          for (int i = 0; i < len; i++) {
-            buf.writeUint8Fast(s.codeUnitAt(i));
-          }
+          buf.writeStringSafe(val.toIso8601String());
           return;
         }
         break;

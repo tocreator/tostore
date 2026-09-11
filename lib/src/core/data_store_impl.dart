@@ -1243,7 +1243,8 @@ class DataStoreImpl {
           try {
             await walManager.flushQueueCompletely();
             if (persistChanges && config.enableJournal) {
-              await walManager.persistMeta(flush: true);
+              final currentPtr = walManager.currentPointer;
+              await walManager.syncCheckpointOnClose(currentPtr);
             }
           } catch (e) {
             Logger.warn('Flush WAL failed', rawError: e);
@@ -1960,7 +1961,7 @@ class DataStoreImpl {
       }
 
       // 7. Add to write queue synchronously (zero microtask yields)
-      tableDataManager.addToBufferSync(
+      final walPointer = tableDataManager.addToBufferSync(
         table,
         orderedValidData,
         BufferOperationType.insert,
@@ -1968,6 +1969,15 @@ class DataStoreImpl {
         schemaVersion: table.schema.schemaVersion ?? '',
         durability: durability,
       );
+
+      final effDurability = durability ?? config.defaultRecoveryDurability;
+      if (effDurability != RecoveryDurability.async &&
+          !walManager.isPointerFlushed(walPointer)) {
+        await walManager.ensureAppendedUpTo(
+          walPointer,
+          flushToStorage: effDurability == RecoveryDurability.durable,
+        );
+      }
 
       // Advance generator and maxId if user provided a manual primary key
       if (userProvidedPk &&
@@ -3328,7 +3338,7 @@ class DataStoreImpl {
             final oldRecordValues = oldRecordsToCommit.first;
             final pkVal = commitPkVals.first;
 
-            tableDataManager.addToBufferSync(
+            final walPointer = tableDataManager.addToBufferSync(
               table,
               updatedRecord,
               BufferOperationType.update,
@@ -3340,6 +3350,16 @@ class DataStoreImpl {
               schemaVersion: schema.schemaVersion ?? '',
               durability: durability,
             );
+
+            final effDurability =
+                durability ?? config.defaultRecoveryDurability;
+            if (effDurability != RecoveryDurability.async &&
+                !walManager.isPointerFlushed(walPointer)) {
+              await walManager.ensureAppendedUpTo(
+                walPointer,
+                flushToStorage: effDurability == RecoveryDurability.durable,
+              );
+            }
 
             final displayPk = promoteDesc != null
                 ? _promoteUserFacingSuccessKey(
@@ -4029,7 +4049,7 @@ class DataStoreImpl {
       }
 
       if (recordsToDelete.length == 1) {
-        tableDataManager.addToBufferSync(
+        final walPointer = tableDataManager.addToBufferSync(
           table,
           recordsToDelete.first,
           BufferOperationType.delete,
@@ -4038,6 +4058,15 @@ class DataStoreImpl {
           schemaVersion: table.schema.schemaVersion ?? '',
           durability: durability,
         );
+
+        final effDurability = durability ?? config.defaultRecoveryDurability;
+        if (effDurability != RecoveryDurability.async &&
+            !walManager.isPointerFlushed(walPointer)) {
+          await walManager.ensureAppendedUpTo(
+            walPointer,
+            flushToStorage: effDurability == RecoveryDurability.durable,
+          );
+        }
       } else {
         await tableDataManager.addToDeleteBuffer(
           table,
@@ -4727,14 +4756,20 @@ class DataStoreImpl {
 
       // Hoist schema constraint pass check once for the entire batch.
       var needsConstraintPass = false;
+      var schemaHasNoDefaults = true;
       for (final field in tableSchema.fields) {
         if (field.maxLength != null ||
             field.minLength != null ||
             field.minValue != null ||
             field.maxValue != null) {
           needsConstraintPass = true;
-          break;
         }
+        if (schemaHasNoDefaults &&
+            (field.defaultValue != null ||
+                field.defaultValueType != DefaultValueType.none)) {
+          schemaHasNoDefaults = false;
+        }
+        if (needsConstraintPass && !schemaHasNoDefaults) break;
       }
 
       // Pure PK insert candidate: no secondary uniques, no FK, sequential PK,
@@ -5223,6 +5258,7 @@ class DataStoreImpl {
                     ignoreUnknownFields: _config?.ignoreUnknownFields ?? true,
                     batchTimestamp: batchTimestamp,
                     schemaNeedsConstraintPass: needsConstraintPass,
+                    schemaHasNoDefaults: schemaHasNoDefaults,
                     mutateInPlace: true,
                     precomputedNowIso: sharedNowIso,
                     precomputedNowMs: sharedNowMs,
@@ -5426,9 +5462,8 @@ class DataStoreImpl {
                             }
 
                             if (subsequentToReassign.isNotEmpty) {
-                              final newIds =
-                                  await tableDataManager.getBatchIds(
-                                      table, subsequentToReassign.length);
+                              final newIds = await tableDataManager.getBatchIds(
+                                  table, subsequentToReassign.length);
                               for (int k = 0;
                                   k < subsequentToReassign.length;
                                   k++) {
@@ -7558,7 +7593,13 @@ class DataStoreImpl {
   /// Returns false if the runner did not pause in time (caller should abort
   /// space switch to avoid Windows file-handle races).
   Future<bool> prepareForSpaceSwitch() async {
-    return await _keyManager?.pauseKeyMigration() ?? true;
+    final keyOk = await _keyManager?.pauseKeyMigration() ?? true;
+    if (!keyOk) return false;
+
+    await LargeOperationRunner.pauseForShutdown(this);
+    backgroundWriteScheduler.clearAll();
+
+    return true;
   }
 
   /// After [close] with [removeRegistry] true, allocate a fresh engine for
@@ -9017,6 +9058,7 @@ class DataStoreImpl {
   /// the existing stub first - matching version avoids a redundant rewrite.
   Future<void> ensureDowngradeGuardJson({required int version}) async {
     if (version < 3) return;
+    if (_closing || storage.isClosed) return;
     if (_downgradeGuardJsonVersion == version) return;
     final ok = await LegacyConfigBootstrap.writeDowngradeGuardJson(
       this,

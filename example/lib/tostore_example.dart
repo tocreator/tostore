@@ -245,11 +245,15 @@ class ToStoreExample {
       ),
     ]);
 
-    // Create sample vector data
-    final sampleVector1 =
-        VectorData.fromList(List.generate(128, (i) => (i * 0.01)));
-    final sampleVector2 =
-        VectorData.fromList(List.generate(128, (i) => (i * 0.02 + 0.5)));
+    // Create sample vector data using typed Float64List (zero-closure, unboxed primitive buffer)
+    final v1Data = Float64List(128);
+    final v2Data = Float64List(128);
+    for (int i = 0; i < 128; i++) {
+      v1Data[i] = i * 0.01;
+      v2Data[i] = i * 0.02 + 0.5;
+    }
+    final sampleVector1 = VectorData(v1Data);
+    final sampleVector2 = VectorData(v2Data);
 
     // Store documents with vector embeddings
     await db.insert(ExampleSchemas.embeddings.name, {
@@ -263,8 +267,11 @@ class ToStoreExample {
     });
 
     // --- Vector similarity search (ANN via db.query chain) ---
-    final queryVector =
-        VectorData.fromList(List.generate(128, (i) => (i * 0.015)));
+    final qData = Float64List(128);
+    for (int i = 0; i < 128; i++) {
+      qData[i] = i * 0.015;
+    }
+    final queryVector = VectorData(qData);
 
     final queryResult = await db
         .query(ExampleSchemas.embeddings.name)

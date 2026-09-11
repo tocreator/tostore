@@ -180,4 +180,9 @@ class FileStorageImpl implements StorageInterface {
   Future<void> replaceFileAtomic(String tempPath, String finalPath) async {
     throw UnsupportedError('FileStorageImpl is not supported on Web platform');
   }
+
+  @override
+  void deleteFileSync(String path) {
+    throw UnsupportedError('FileStorageImpl is not supported on Web platform');
+  }
 }

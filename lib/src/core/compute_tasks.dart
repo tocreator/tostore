@@ -580,20 +580,40 @@ String _normalizeFieldName(String name) {
 int _getLongestCommonSubsequenceLength(String a, String b) {
   if (a.isEmpty || b.isEmpty) return 0;
 
-  List<List<int>> dp =
-      List.generate(a.length + 1, (_) => List.filled(b.length + 1, 0));
-
-  for (int i = 1; i <= a.length; i++) {
-    for (int j = 1; j <= b.length; j++) {
-      if (a[i - 1] == b[j - 1]) {
-        dp[i][j] = dp[i - 1][j - 1] + 1;
-      } else {
-        dp[i][j] = dp[i - 1][j] > dp[i][j - 1] ? dp[i - 1][j] : dp[i][j - 1];
-      }
-    }
+  // Space optimization: pick the shorter string for column buffers to achieve O(min(M, N)) space
+  final String s1;
+  final String s2;
+  if (a.length >= b.length) {
+    s1 = a;
+    s2 = b;
+  } else {
+    s1 = b;
+    s2 = a;
   }
 
-  return dp[a.length][b.length];
+  final int len1 = s1.length;
+  final int len2 = s2.length;
+
+  Int32List prev = Int32List(len2 + 1);
+  Int32List curr = Int32List(len2 + 1);
+
+  for (int i = 1; i <= len1; i++) {
+    final int code1 = s1.codeUnitAt(i - 1);
+    for (int j = 1; j <= len2; j++) {
+      if (code1 == s2.codeUnitAt(j - 1)) {
+        curr[j] = prev[j - 1] + 1;
+      } else {
+        final int valPrev = prev[j];
+        final int valLeft = curr[j - 1];
+        curr[j] = valPrev > valLeft ? valPrev : valLeft;
+      }
+    }
+    final temp = prev;
+    prev = curr;
+    curr = temp;
+  }
+
+  return prev[len2];
 }
 
 /// Table record migration processing request

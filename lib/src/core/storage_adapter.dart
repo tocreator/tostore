@@ -1,4 +1,4 @@
-﻿import 'dart:async';
+import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:path/path.dart' as path;
@@ -1129,6 +1129,12 @@ class StorageAdapter implements StorageInterface {
   void flushFileSync(String path) {
     _ensureOpen();
     _storage.flushFileSync(path);
+  }
+
+  @override
+  void deleteFileSync(String path) {
+    _ensureOpen();
+    _storage.deleteFileSync(path);
   }
 
   @override

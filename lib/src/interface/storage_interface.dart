@@ -185,4 +185,7 @@ abstract class StorageInterface {
 
   /// Synchronously forces OS page cache buffers for [path] to be flushed to physical media.
   void flushFileSync(String path);
+
+  /// Synchronously deletes [path] if it exists and closes any cached open handle.
+  void deleteFileSync(String path);
 }

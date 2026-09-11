@@ -375,8 +375,9 @@ class WriteBufferManager {
 
   /// High-throughput bulk virgin insert for tables without secondary indexes (e.g. pure PK tables).
   ///
-  /// Directly enqueues into [pendingRecordCache] and [_writeQueue] in a tight synchronous loop,
-  /// skipping index plan lookups, reservation checks, and intermediate list allocations.
+  /// Directly enqueues into [pendingRecordCache] and [_writeQueue],
+  /// skipping index plan lookups and reservation checks. The write-queue
+  /// build loop yields so a large window cannot monopolize the UI isolate.
   Future<void> addPurePkInsertBatch({
     required TableContext table,
     required List<String> recordIds,
@@ -399,28 +400,31 @@ class WriteBufferManager {
     final bgScheduler = _dataStore.backgroundWriteScheduler;
     final bool bgMaybeActive = !bgScheduler.isEmpty;
 
-    final yieldController = YieldController(
-      'WriteBufferManager.addPurePkInsertBatch',
-      minCheckInterval: 8192,
-    );
-
     recordCache.putFlatBatchNone(tableUid, recordIds, entries);
 
+    final yieldController = YieldController(
+      'WriteBufferManager.addPurePkInsertBatch',
+      minCheckInterval: EngineCpuChunk.fastPathMinCheckInterval,
+    );
+
+    // Build queue entries with yield cadence, then one addAll.
+    final pendingQueue = <WriteQueueEntry>[];
     for (int i = 0; i < count; i++) {
       final y = yieldController.maybeYield();
       if (y != null) await y;
-
       final wp = entries[i].walPointer;
-      if (wp != null) {
-        if (bgMaybeActive) {
-          bgScheduler.handleOnlineWrite(table, recordIds[i]);
-        }
-        _writeQueue.add(WriteQueueEntry(
-          tableUid: tableUid,
-          recordId: recordIds[i],
-          walPointer: wp,
-        ));
+      if (wp == null) continue;
+      if (bgMaybeActive) {
+        bgScheduler.handleOnlineWrite(table, recordIds[i]);
       }
+      pendingQueue.add(WriteQueueEntry(
+        tableUid: tableUid,
+        recordId: recordIds[i],
+        walPointer: wp,
+      ));
+    }
+    if (pendingQueue.isNotEmpty) {
+      _writeQueue.addAll(pendingQueue);
     }
 
     _emitSizeChanged();

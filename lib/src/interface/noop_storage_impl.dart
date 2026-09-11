@@ -162,4 +162,7 @@ final class NoopStorageImpl implements StorageInterface {
 
   @override
   void flushFileSync(String path) {}
+
+  @override
+  void deleteFileSync(String path) {}
 }

@@ -1723,7 +1723,7 @@ class TableDataManager {
 
   /// Fully synchronous fast-path of [addToBuffer] for single-record CRUD.
   /// Completely eliminates async/await microtask scheduling overhead.
-  void addToBufferSync(
+  WalPointer addToBufferSync(
     TableContext table,
     Map<String, dynamic> data,
     BufferOperationType operationType, {
@@ -1742,7 +1742,7 @@ class TableDataManager {
       Logger.error(
         'Record in table ${table.tableName} does not have a primary key value, cannot add to buffer',
       );
-      return;
+      return const WalPointer(partitionIndex: -1, entrySeq: -1);
     }
 
     final String? currentTxId =
@@ -1773,7 +1773,7 @@ class TableDataManager {
         primaryKey,
       );
       _txnIdsWithOps.add(currentTxId);
-      return;
+      return const WalPointer(partitionIndex: -1, entrySeq: -1);
     }
 
     if (operationType == BufferOperationType.update && !skipDeletedCheck) {
@@ -1833,7 +1833,7 @@ class TableDataManager {
           );
         }
       }
-      return;
+      return const WalPointer(partitionIndex: -1, entrySeq: -1);
     }
 
     // Direct synchronous WAL append
@@ -1895,6 +1895,7 @@ class TableDataManager {
 
     _markSpaceStatsDirty(table);
     _dataStore.queryExecutor.invalidateQueryCacheForTable(table);
+    return walPointer;
   }
 
   /// Unified internal batch processor for high-throughput writes.
@@ -2214,13 +2215,16 @@ class TableDataManager {
       await _dataStore.writeBufferManager
           .addDeleteBatch(table: table, recordIds: recordIds, entries: entries);
     }
-    successIds.addAll(recordIds);
-    _markSpaceStatsDirty(table);
     if (!deferQueryCacheInvalidation) {
       _dataStore.queryExecutor.invalidateQueryCacheForTable(table);
     }
+    _markSpaceStatsDirty(table);
 
-    return (successRecordIds: successIds, failedRecordIds: failedIds);
+    // Avoid duplicating the id list when the batch fully succeeded.
+    return (
+      successRecordIds: recordIds,
+      failedRecordIds: failedIds,
+    );
   }
 
   /// Update the per-table record count cache based on the operation.

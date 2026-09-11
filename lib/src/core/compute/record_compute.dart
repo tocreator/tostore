@@ -31,6 +31,10 @@ Map<String, dynamic>? validateAndProcessRecordPure({
   /// Pass the chunk-level result from the caller for batchInsert prepare.
   bool? schemaNeedsConstraintPass,
 
+  /// When true, schema has no field defaults / timestamp defaults -- skip those
+  /// branches in the field loop. ExprNode inputs are still detected.
+  bool schemaHasNoDefaults = false,
+
   /// When true, mutate [data] in place instead of allocating a result map.
   /// Safe when the caller owns the record map (batchInsert hot path).
   bool mutateInPlace = false,
@@ -123,8 +127,8 @@ Map<String, dynamic>? validateAndProcessRecordPure({
     // Use precomputed timestamps if provided, or lazily compute once if needed
     String? localNowIso = precomputedNowIso;
     int? localNowMs = precomputedNowMs;
-    String getNowIso() => localNowIso ??=
-        (batchTimestamp ?? DateTime.now()).toIso8601String();
+    String getNowIso() =>
+        localNowIso ??= (batchTimestamp ?? DateTime.now()).toIso8601String();
     int getNowMs() => localNowMs ??=
         (batchTimestamp ?? DateTime.now()).millisecondsSinceEpoch;
 
@@ -152,7 +156,8 @@ Map<String, dynamic>? validateAndProcessRecordPure({
             value = 0;
           }
         }
-      } else if (value == null &&
+      } else if (!schemaHasNoDefaults &&
+          value == null &&
           field.defaultValueType == DefaultValueType.currentTimestamp) {
         if (field.type == DataType.integer) {
           value = getNowMs();
@@ -161,7 +166,9 @@ Map<String, dynamic>? validateAndProcessRecordPure({
         } else {
           value = getNowIso();
         }
-      } else if (value == null && field.defaultValue != null) {
+      } else if (!schemaHasNoDefaults &&
+          value == null &&
+          field.defaultValue != null) {
         value = field.getDefaultValue();
       }
 

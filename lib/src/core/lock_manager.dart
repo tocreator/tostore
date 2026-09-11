@@ -1,10 +1,12 @@
 import 'dart:async';
 import 'dart:collection';
+import 'dart:math';
+
+import 'package:path/path.dart' as p;
+
 import '../handler/logger.dart';
 import 'crontab_manager.dart';
 import 'transaction_context.dart';
-import 'dart:math';
-import 'package:path/path.dart' as p;
 
 /// Database lock manager optimized for large-scale scenarios
 ///
@@ -772,37 +774,40 @@ class LockManager {
   void _releaseLock(String resource, String operationId, LockType lockType) {
     final request = _operationToRequest.remove(operationId);
     if (request == null) {
-      Logger.warn('Attempted to release non-existent lock: $operationId');
       // Best-effort self-heal: if the operation mapping was lost (e.g. due to a bug
       // or stale cleanup), attempt to remove the held lock from the resource to
       // prevent permanent deadlocks.
       final lockResource = _activeLocks[resource];
-      if (lockResource != null) {
-        bool removed = false;
-        if (lockResource.exclusiveLock?.operationId == operationId) {
-          lockResource.exclusiveLock = null;
+      if (lockResource == null) {
+        // Benign race: dispose/clear already dropped this op (and usually the
+        // whole table) while a writer was in finally. Not an OS file lock.
+        return;
+      }
+      Logger.warn('Attempted to release non-existent lock: $operationId');
+      bool removed = false;
+      if (lockResource.exclusiveLock?.operationId == operationId) {
+        lockResource.exclusiveLock = null;
+        removed = true;
+      }
+      if (lockResource.sharedLocks.isNotEmpty) {
+        final toRemove = <_LockRequest>[];
+        for (final r in lockResource.sharedLocks) {
+          if (r.operationId == operationId) toRemove.add(r);
+        }
+        for (final r in toRemove) {
+          lockResource.sharedLocks.remove(r);
           removed = true;
         }
-        if (lockResource.sharedLocks.isNotEmpty) {
-          final toRemove = <_LockRequest>[];
-          for (final r in lockResource.sharedLocks) {
-            if (r.operationId == operationId) toRemove.add(r);
-          }
-          for (final r in toRemove) {
-            lockResource.sharedLocks.remove(r);
-            removed = true;
-          }
-        }
+      }
 
-        if (removed) {
-          // Grant next waiters, and drop the empty resource.
-          _processResourceQueue(resource);
-          if (lockResource.isEmpty) {
-            _activeLocks.remove(resource);
-          }
-          Logger.warn(
-              'Recovered orphaned lock state for $operationId on $resource');
+      if (removed) {
+        // Grant next waiters, and drop the empty resource.
+        _processResourceQueue(resource);
+        if (lockResource.isEmpty) {
+          _activeLocks.remove(resource);
         }
+        Logger.warn(
+            'Recovered orphaned lock state for $operationId on $resource');
       }
       return;
     }

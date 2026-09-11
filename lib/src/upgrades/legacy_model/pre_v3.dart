@@ -105,7 +105,9 @@ final class LegacyConfigBootstrap {
     required int version,
   }) async {
     final root = dataStore.instancePath;
-    if (root == null) return false;
+    if (root == null || dataStore.isClosing || dataStore.storage.isClosed) {
+      return false;
+    }
     final jsonPath = LegacyConfigPaths.globalJson(root);
     try {
       if (await _isDowngradeGuardCurrentAt(dataStore, jsonPath, version)) {

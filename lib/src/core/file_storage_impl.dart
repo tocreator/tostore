@@ -19,6 +19,14 @@ class FileStorageImpl implements StorageInterface {
 
   bool _closed = false;
 
+  /// Set at the start of [close] to reject new [_getHandle] callers while
+  /// in-flight opens are allowed to finish and enter the pool, then closed
+  /// together. Avoids post-open close+throw (which races Windows rename).
+  bool _closing = false;
+
+  /// Number of [_getHandle] calls currently inside `File.open` / pool insert.
+  int _opensInFlight = 0;
+
   // File handle pool with simple LRU eviction to reduce open/close overhead
   final Map<String, RandomAccessFile> _handlePool = {};
   final LinkedHashMap<String, DateTime> _lru =
@@ -158,7 +166,7 @@ class FileStorageImpl implements StorageInterface {
   }
 
   Future<RandomAccessFile> _getHandle(String path, FileMode mode) async {
-    if (_closed) {
+    if (_closed || _closing) {
       throw DbClosedException('Storage is closed');
     }
     final key = _poolKey(path, mode);
@@ -175,55 +183,68 @@ class FileStorageImpl implements StorageInterface {
       await file.parent.create(recursive: true);
     }
 
-    // Open new handle
-    RandomAccessFile raf;
+    // Count in-flight opens so [close] can drain them into the pool and close
+    // every handle together — no post-open close+throw (that caused rename /
+    // cascade errors on Windows).
+    _opensInFlight++;
     try {
-      raf = await file.open(mode: mode);
-    } on PathNotFoundException {
-      if (mode != FileMode.read) {
-        // Defensive self-healing: re-ensure parent exists and retry once
-        await file.parent.create(recursive: true);
-        raf = await file.open(mode: mode);
-      } else {
-        rethrow;
+      if (_closed || _closing) {
+        throw DbClosedException('Storage is closed');
       }
-    }
-    _handlePool[key] = raf;
-    _lru[key] = DateTime.now();
+      RandomAccessFile raf;
+      try {
+        raf = await file.open(mode: mode);
+      } on PathNotFoundException {
+        if (mode != FileMode.read) {
+          // Defensive self-healing: re-ensure parent exists and retry once
+          await file.parent.create(recursive: true);
+          raf = await file.open(mode: mode);
+        } else {
+          rethrow;
+        }
+      }
+      // Always pool; if close is draining, it will close this handle next.
+      _handlePool[key] = raf;
+      _lru[key] = DateTime.now();
 
-    // Evict if exceeding threshold
-    if (_handlePool.length > _maxOpenHandles) {
-      // remove least-recently used
-      final oldestKey =
-          _lru.entries.reduce((a, b) => a.value.isBefore(b.value) ? a : b).key;
+      // Evict if exceeding threshold
+      if (_handlePool.length > _maxOpenHandles) {
+        // remove least-recently used
+        final oldestKey = _lru.entries
+            .reduce((a, b) => a.value.isBefore(b.value) ? a : b)
+            .key;
 
-      // Remove from pool immediately to prevent new ops from checking it out
-      final rafToClose = _handlePool.remove(oldestKey);
-      _lru.remove(oldestKey);
-      final sepIdx = oldestKey.lastIndexOf('|');
-      if (sepIdx > 0) {
-        final oldestPath = oldestKey.substring(0, sepIdx);
-        final bool hasOtherHandle = _handlePool.containsKey('$oldestPath|a') ||
-            _handlePool.containsKey('$oldestPath|r') ||
-            _handlePool.containsKey('$oldestPath|w');
-        if (!hasOtherHandle) {
-          _fileLengths.remove(oldestPath);
+        // Remove from pool immediately to prevent new ops from checking it out
+        final rafToClose = _handlePool.remove(oldestKey);
+        _lru.remove(oldestKey);
+        final sepIdx = oldestKey.lastIndexOf('|');
+        if (sepIdx > 0) {
+          final oldestPath = oldestKey.substring(0, sepIdx);
+          final bool hasOtherHandle =
+              _handlePool.containsKey('$oldestPath|a') ||
+                  _handlePool.containsKey('$oldestPath|r') ||
+                  _handlePool.containsKey('$oldestPath|w');
+          if (!hasOtherHandle) {
+            _fileLengths.remove(oldestPath);
+          }
+        }
+
+        if (rafToClose != null) {
+          // Asynchronously close it, ensuring we respect existing locks.
+          // ignore: unawaited_futures
+          _withHandleLock(oldestKey, () async {
+            try {
+              await rafToClose.flush();
+              await rafToClose.close();
+            } catch (_) {}
+          });
         }
       }
 
-      if (rafToClose != null) {
-        // Asynchronously close it, ensuring we respect existing locks.
-        // ignore: unawaited_futures
-        _withHandleLock(oldestKey, () async {
-          try {
-            await rafToClose.flush();
-            await rafToClose.close();
-          } catch (_) {}
-        });
-      }
+      return raf;
+    } finally {
+      _opensInFlight--;
     }
-
-    return raf;
   }
 
   @override
@@ -340,9 +361,18 @@ class FileStorageImpl implements StorageInterface {
 
   @override
   Future<void> close() async {
-    _closed = true;
+    // Reject new opens first; let in-flight opens finish and enter the pool,
+    // then close every pooled handle. Do not open-then-close+throw in
+    // [_getHandle] — that races Windows rename and floods close-path errors.
+    _closing = true;
     try {
-      // Snapshot handles (key, raf) to avoid concurrent modification if pool changes during close
+      final deadline = DateTime.now().add(const Duration(seconds: 5));
+      while (_opensInFlight > 0 && DateTime.now().isBefore(deadline)) {
+        await Future<void>.delayed(const Duration(milliseconds: 5));
+      }
+
+      _closed = true;
+
       final entries = _handlePool.entries.toList();
       for (final e in entries) {
         final key = e.key;
@@ -358,6 +388,7 @@ class FileStorageImpl implements StorageInterface {
       }
       _handlePool.clear();
       _lru.clear();
+      _handleLocks.clear();
 
       // Flush and close all dedicated sync handles synchronously
       final syncEntries = _syncHandlePool.entries.toList();
@@ -936,7 +967,7 @@ class FileStorageImpl implements StorageInterface {
   @override
   int appendBytesSync(String path, List<int> bytes,
       {int offset = 0, int? length}) {
-    if (_closed) {
+    if (_closed || _closing) {
       throw DbClosedException('Storage is closed');
     }
     final normalized = _canonicalPath(path);
@@ -1100,6 +1131,44 @@ class FileStorageImpl implements StorageInterface {
       }
     } catch (e) {
       Logger.error('Flush file sync failed', rawError: e);
+    }
+  }
+
+  @override
+  void deleteFileSync(String path) {
+    try {
+      final normalizedPath = _canonicalPath(path);
+      // 1. Close and remove dedicated sync handle
+      final syncKey = '$normalizedPath|a';
+      final syncRaf = _syncHandlePool.remove(syncKey);
+      _syncLruTicks.remove(syncKey);
+      if (syncRaf != null) {
+        try {
+          syncRaf.flushSync();
+          syncRaf.closeSync();
+        } catch (_) {}
+      }
+      // 2. Close and remove from general handle pool if present
+      for (final mode in const ['a', 'w', 'r']) {
+        final key = '$normalizedPath|$mode';
+        final raf = _handlePool.remove(key);
+        _lru.remove(key);
+        if (raf != null) {
+          try {
+            raf.flushSync();
+            raf.closeSync();
+          } catch (_) {}
+        }
+      }
+      // 3. Delete physical file if it exists
+      final file = File(path);
+      if (file.existsSync()) {
+        try {
+          file.deleteSync();
+        } catch (_) {}
+      }
+    } catch (e) {
+      Logger.error('Delete file sync failed', rawError: e);
     }
   }
 

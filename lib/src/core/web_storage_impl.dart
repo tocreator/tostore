@@ -728,6 +728,12 @@ class WebStorageImpl implements StorageInterface {
     // Web IndexedDB does not support synchronous physical sync
   }
 
+  @override
+  void deleteFileSync(String path) {
+    final normalized = _normalizePath(path);
+    _writeBuffer.remove(normalized);
+  }
+
   /// Update copyFile to use FileInfo
   @override
   Future<void> copyFile(String sourcePath, String targetPath) async {

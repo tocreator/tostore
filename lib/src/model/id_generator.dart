@@ -192,11 +192,13 @@ class SequentialIdGenerator implements IdGenerator {
       if (_idPool.isEmpty) {
         final startId = _currentId + step;
         _currentId += count * step;
-        return List<String>.generate(
-          count,
-          (i) => (startId + i * step).toString(),
-          growable: false,
-        );
+        final result = List<String>.filled(count, '', growable: false);
+        var id = startId;
+        for (int i = 0; i < count; i++) {
+          result[i] = id.toString();
+          id += step;
+        }
+        return result;
       }
       final result = List<String>.filled(count, '', growable: false);
       int idx = 0;
@@ -207,8 +209,10 @@ class SequentialIdGenerator implements IdGenerator {
       if (remaining > 0) {
         final startId = _currentId + step;
         _currentId += remaining * step;
+        var id = startId;
         for (int i = 0; i < remaining; i++) {
-          result[idx++] = (startId + i * step).toString();
+          result[idx++] = id.toString();
+          id += step;
         }
       }
       return result;
