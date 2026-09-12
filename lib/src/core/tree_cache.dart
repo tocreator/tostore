@@ -604,6 +604,10 @@ class TreeCache<T> {
     return null;
   }
 
+  /// Insert-only point put. Returns existing value, or `null` if inserted.
+  ///
+  /// None-mode gd=2 uses a single [Map.putIfAbsent] (no contains+peek+put
+  /// triple walk). Used by buffer unique reserve hot path.
   T? putIfAbsentPoint3(
     Object? k0,
     Object? k1,
@@ -611,6 +615,21 @@ class TreeCache<T> {
     T value, {
     int? size,
   }) {
+    final gd = groupDepth;
+    if (!_orderEnabled && gd == 2) {
+      final g = _groupOfDepth2Create(k0, k1);
+      var inserted = false;
+      final result = g.flat.putIfAbsent(k2, () {
+        inserted = true;
+        return value;
+      });
+      if (inserted) {
+        g.entryCount++;
+        _totalEntries++;
+        return null;
+      }
+      return result;
+    }
     if (containsPoint3(k0, k1, k2)) return peekPoint3(k0, k1, k2);
     putPoint3(k0, k1, k2, value, size: size);
     return null;
@@ -627,6 +646,72 @@ class TreeCache<T> {
     if (containsPoint4(k0, k1, k2, k3)) return peekPoint4(k0, k1, k2, k3);
     putPoint4(k0, k1, k2, k3, value, size: size);
     return null;
+  }
+
+  /// Batch non-unique index install for pendingIndexCache (gd=2, none mode).
+  ///
+  /// Hoists `[k0, k1]` group once; each item is `deep2(fieldValue, pk) -> true`.
+  /// [fieldValues] may contain nulls (skipped). Length must match [pks].
+  void putPoint4Deep2BatchNone(
+    Object? k0,
+    Object? k1,
+    List<dynamic> fieldValues,
+    List<String> pks,
+  ) {
+    assert(fieldValues.length == pks.length);
+    if (pks.isEmpty) return;
+    if (groupDepth != 2 || _orderEnabled) {
+      for (int i = 0; i < pks.length; i++) {
+        final v = fieldValues[i];
+        if (v == null) continue;
+        putPoint4(k0, k1, v, pks[i], true as T, size: pks[i].length + 1);
+      }
+      return;
+    }
+    final g = _groupOfDepth2Create(k0, k1);
+    int newCount = 0;
+    for (int i = 0; i < pks.length; i++) {
+      final v = fieldValues[i];
+      if (v == null) continue;
+      if (g.putDeep2None(v, pks[i], true as T)) newCount++;
+    }
+    _totalEntries += newCount;
+  }
+
+  /// Batch unique index install for pendingIndexCache (gd=2, none mode).
+  ///
+  /// Hoists `[k0, k1]` group once; each item is `flat(fieldValue) -> pk`.
+  /// Does **not** check conflicts — caller must pre-validate / reserve.
+  void putPoint3FlatBatchNone(
+    Object? k0,
+    Object? k1,
+    List<dynamic> fieldValues,
+    List<String> pks,
+  ) {
+    assert(fieldValues.length == pks.length);
+    if (pks.isEmpty) return;
+    if (groupDepth != 2 || _orderEnabled) {
+      for (int i = 0; i < pks.length; i++) {
+        final v = fieldValues[i];
+        if (v == null) continue;
+        putPoint3(k0, k1, v, pks[i] as T);
+      }
+      return;
+    }
+    final g = _groupOfDepth2Create(k0, k1);
+    int newCount = 0;
+    final flat = g.flat;
+    for (int i = 0; i < pks.length; i++) {
+      final v = fieldValues[i];
+      if (v == null) continue;
+      final before = flat.length;
+      flat[v] = pks[i] as T;
+      if (flat.length != before) {
+        newCount++;
+        g.entryCount++;
+      }
+    }
+    _totalEntries += newCount;
   }
 
   @pragma('vm:prefer-inline')

@@ -2136,9 +2136,17 @@ class TableDataManager {
 
     final int validCount = validBatchRecordIds.length;
     final List<String> recordIds = validBatchRecordIds;
-    final List<BufferEntry> entries = List<BufferEntry>.generate(
-      validCount,
-      (i) => BufferEntry(
+    // List.filled shares one sentinel then overwrite — avoids generate closure.
+    final sentinel = BufferEntry(
+      data: const <String, dynamic>{},
+      operation: operation,
+      timestamp: ts,
+      schemaVersion: schemaVersion,
+    );
+    final List<BufferEntry> entries =
+        List<BufferEntry>.filled(validCount, sentinel, growable: false);
+    for (int i = 0; i < validCount; i++) {
+      entries[i] = BufferEntry(
         data: validBatchRecords[i],
         operation: operation,
         timestamp: ts,
@@ -2146,9 +2154,8 @@ class TableDataManager {
         walPointer: pointers[i],
         oldValues: isUpdate ? validBatchOldValues![i] : null,
         schemaVersion: schemaVersion,
-      ),
-      growable: false,
-    );
+      );
+    }
 
     if (isUpdate) {
       cacheTableRecordsBatch(

@@ -4797,7 +4797,8 @@ class DataStoreImpl {
           (hasCustomPk || hasSecondaryUniqueIndexes);
 
       try {
-        final int bufferBatchSize = isPurePkCandidate ? 100000 : 50000;
+        final int bufferBatchSize =
+            (isPurePkCandidate || !hasForeignKeys) ? 100000 : 50000;
         int start = 0;
         final batchTimestamp = DateTime.now();
         final String sharedNowIso = batchTimestamp.toIso8601String();
