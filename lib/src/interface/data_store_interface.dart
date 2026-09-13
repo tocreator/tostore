@@ -21,7 +21,8 @@ import 'status_provider.dart';
 abstract class DataStoreInterface {
   /// Initialize data store engine
   /// [reinitialize] when true, force reinitialize (close then reopen)
-  /// [noPersistOnClose] when reinitializing, do not persist pending buffers; only clear caches/flush handles
+  /// [noPersistOnClose] when reinitializing, skip pending buffer flush on close
+  /// (same as `close(flush: false)`); only clear caches / release handles
   /// [applyActiveSpaceOnDefault] when true (default), if config spaceName is default, use stored activeSpace so first open lands in last used space
   Future<void> initialize({
     String? dbPath,
@@ -169,8 +170,9 @@ abstract class DataStoreInterface {
   });
 
   /// close data store engine
+  /// [flush] when true (default), drain pending buffers to disk; when false, discard them.
   /// [keepActiveSpace] when false, clears active space so next launch uses default (e.g. logout). Default true.
-  Future<void> close({bool keepActiveSpace = true});
+  Future<void> close({bool flush = true, bool keepActiveSpace = true});
 
   /// backup database
   Future<String> backup(

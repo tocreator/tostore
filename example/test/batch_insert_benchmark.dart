@@ -12,9 +12,20 @@ import 'package:tostore/tostore.dart';
 /// Usage:
 ///   dart run example/test/batch_insert_benchmark.dart
 void main() async {
+  // Fixed path so a crashed/killed run does not leave orphaned multi-GB dirs;
+  // wipe before each run so leftovers from a prior abort are always cleared.
   final tempDir = Directory(
-    '${Directory.systemTemp.path}/tostore_bench_user_${DateTime.now().millisecondsSinceEpoch}',
+    '${Directory.systemTemp.path}/tostore_bench_batch_insert',
   );
+  if (tempDir.existsSync()) {
+    try {
+      tempDir.deleteSync(recursive: true);
+    } catch (e) {
+      stderr.writeln(
+        'Warning: failed to clear previous bench dir ${tempDir.path}: $e',
+      );
+    }
+  }
 
   const testDurabilities = [
     RecoveryDurability.standard,
@@ -194,7 +205,7 @@ void main() async {
     stdout.writeln(
         '================================================================\n');
 
-    await db.close();
+    await db.close(flush: false);
   } catch (e, st) {
     stderr.writeln('Benchmark Error: $e\n$st');
   } finally {

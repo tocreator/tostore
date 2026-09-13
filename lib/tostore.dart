@@ -150,6 +150,7 @@ class ToStore implements DataStoreInterface {
   /// [onOpen] Callback invoked when the database is successfully opened.
   /// [reinitialize] If true, forces a re-initialization (close then open).
   /// [noPersistOnClose] If true, skips flushing the buffer during close (used with reinitialize).
+  /// Same effect as the reinitialize path calling `close(flush: false)`.
   /// [applyActiveSpaceOnDefault] If true, uses the last active space when opening the 'default' space.
   ///
   /// 打开数据库实例（一步初始化）。
@@ -166,7 +167,7 @@ class ToStore implements DataStoreInterface {
   /// [onCreate] 数据库首次创建时的回调。
   /// [onOpen] 数据库打开成功后的回调。
   /// [reinitialize] 为 true 时强制重新初始化（先关闭后打开）。
-  /// [noPersistOnClose] 为 true 时关闭时不落盘缓冲数据（与 reinitialize 配合使用）。
+  /// [noPersistOnClose] 为 true 时关闭时不落盘缓冲数据（与 reinitialize 配合使用，等价于 `close(flush: false)`）。
   /// [applyActiveSpaceOnDefault] 为 true 时，打开 'default' 空间将自动切换到上次活跃的空间。
   static Future<ToStore> open({
     String? dbPath,
@@ -264,6 +265,7 @@ class ToStore implements DataStoreInterface {
   ///   over the corresponding fields in this config.
   /// - [reinitialize]: When true, force a re-open of the database (close then open).
   /// - [noPersistOnClose]: Used together with `reinitialize`. When true, do NOT persist pending
+  ///   buffers on the close-before-reopen path (same as `close(flush: false)`).
   /// - [onStartupProgress]: Callback for tracking startup progress (0.0--1.0) and the current stage.
   ///
   /// Examples:
@@ -282,7 +284,7 @@ class ToStore implements DataStoreInterface {
   /// - dbName：可选数据库名称；传入时优先级高于 `config.dbName`。
   /// - config：数据库配置；当同时传入 dbPath/dbName 时，以参数值覆盖配置中的同名字段。
   /// - reinitialize：为 true 时强制重新初始化（先关闭后打开）。
-  /// - noPersistOnClose：与 reinitialize 配合；为 true 时关闭阶段不落盘缓冲数据，直接清理缓存
+  /// - noPersistOnClose：与 reinitialize 配合；为 true 时关闭阶段不落盘缓冲数据（等价于 `close(flush: false)`）
   /// - onStartupProgress：启动进度回调，参数为当前进度（0.0--1.0）和所处阶段。
   ///
   /// Examples:
@@ -666,7 +668,7 @@ class ToStore implements DataStoreInterface {
       if (next != null) {
         try {
           await next.close(
-            persistChanges: false,
+            flush: false,
             closeStorage: true,
             removeRegistry: true,
           );
@@ -1387,14 +1389,22 @@ class ToStore implements DataStoreInterface {
   }
 
   /// Close database and clean up resources
+  /// [flush] When true (default), drain pending buffers to disk before closing.
+  /// When false, discard unpersisted buffers and close quickly (e.g. about to
+  /// delete the database directory, or ephemeral benchmark cleanup).
   /// [keepActiveSpace] When false, clears active space so next launch uses default (e.g. logout). Default true.
   ///
   /// Removes current instance from instance pool
   /// 关闭数据库并清理资源
+  /// [flush] 为 true（默认）时关闭前将未落盘缓冲刷盘；为 false 时丢弃未落盘数据并快速关闭
+  /// （例如即将删除数据库目录，或基准测试清理临时目录）
   /// [keepActiveSpace] 为 false 时清除活跃空间（如退出登录），下次启动将使用 default 空间
   @override
-  Future<void> close({bool keepActiveSpace = true}) async {
-    await _impl.close(keepActiveSpace: keepActiveSpace);
+  Future<void> close({
+    bool flush = true,
+    bool keepActiveSpace = true,
+  }) async {
+    await _impl.close(flush: flush, keepActiveSpace: keepActiveSpace);
     String? instanceKey;
     _instances.forEach((key, value) {
       if (value == this) {

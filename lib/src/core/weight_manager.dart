@@ -72,6 +72,16 @@ class WeightManager {
     CrontabManager.removeCallback(ExecuteInterval.hour1, _hourlyGuaranteeSave);
   }
 
+  /// Await any in-flight [saveWeights] without starting a new save.
+  /// Used on `close(flush: false)` so storage is not closed under a writer.
+  Future<void> awaitPendingSave() async {
+    final pending = _saveLock;
+    if (pending == null) return;
+    try {
+      await pending;
+    } catch (_) {}
+  }
+
   String _weightsPath({String? spaceName}) =>
       _dataStore.pathManager.getAccessWeightsPath(spaceName: spaceName);
 

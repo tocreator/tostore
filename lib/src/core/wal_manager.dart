@@ -2029,8 +2029,14 @@ class WalManager {
     }
   }
 
-  /// Flush all pending WAL entries in the queue (drain mode).
-  Future<void> flushQueueCompletely() async {
+  /// Drain or discard the WAL write queue.
+  ///
+  /// - [flush] `true` (default): write all queued entries to disk.
+  /// - [flush] `false`: await in-flight pump/rotate, then drop remaining
+  ///   queued entries without writing (aligned with `close(flush: false)` /
+  ///   journal `stop(flush: false)`). Callers already returned for async
+  ///   durability; queued entries have no waiters.
+  Future<void> flushQueueCompletely({bool flush = true}) async {
     if (!_config.enableJournal) return;
     // 1. Ensure any in-flight background rotation completes
     while (_rotateInProgress && _rotateFuture != null) {
@@ -2039,7 +2045,7 @@ class WalManager {
       } catch (_) {}
     }
 
-    // 2. Ensure any currently in-flight flush pump completes before checking queue
+    // 2. Ensure any currently in-flight flush pump completes before touching queue
     final inFlight = _walFlushFuture;
     if (inFlight != null) {
       try {
@@ -2047,7 +2053,22 @@ class WalManager {
       } catch (_) {}
     }
 
-    // 3. Drain any remaining queued items
+    if (!flush) {
+      // Drop not-yet-written entries. Re-await once: the completed pump's
+      // finally may have synchronously rescheduled while the queue was still
+      // non-empty; after that second await, clear again.
+      _walQueue.clear();
+      final again = _walFlushFuture;
+      if (again != null) {
+        try {
+          await again;
+        } catch (_) {}
+      }
+      _walQueue.clear();
+      return;
+    }
+
+    // 3. Drain any remaining queued items to disk
     while (_walQueue.isNotEmpty) {
       final existing = _walFlushFuture;
       if (existing != null) {
@@ -2059,7 +2080,7 @@ class WalManager {
       await _pumpWalFlush(drainCompletely: true);
     }
 
-    // 3. Ensure the last pump that may have drained the queue has completely finished
+    // 4. Ensure the last pump that may have drained the queue has completely finished
     final remaining = _walFlushFuture;
     if (remaining != null) {
       try {

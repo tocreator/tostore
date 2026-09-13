@@ -236,7 +236,11 @@ class BufferTreeStore {
       singleFields.add(null);
       uniqueFlags.add(true);
     }
-    for (final idx in schema.getAllIndexes()) {
+    // Prefer meta-manager cached lists when available (avoids getAllIndexes alloc).
+    final meta = _dataStore.tableMetaManager;
+    final Iterable<IndexSchema> allIdx =
+        meta?.getAllIndexesFor(schema) ?? schema.getAllIndexes();
+    for (final idx in allIdx) {
       if (idx.fields.isEmpty) continue;
       if (!includeUniques && idx.unique) continue;
       uids.add(idx.indexUid);
@@ -857,11 +861,53 @@ class BufferTreeStore {
     Set<String>? changedFields,
     String? transactionId,
     List<List<dynamic>>? rollbackKeys,
+    bool skipPrimaryKey = false,
+    List<IndexSchema>? uniqueIndexes,
   }) {
     final tableUid = table.tableUid;
     final cache = transactionId != null ? txnIndexCache : pendingIndexCache;
+    final bool isTxn = transactionId != null;
 
-    UniqueViolation? conflictOn({
+    UniqueViolation? conflictOnPoint({
+      required IndexUid indexUid,
+      required dynamic keyValue,
+      required List<String> fields,
+      required dynamic value,
+      required IndexName? indexName,
+    }) {
+      final Object? existing;
+      if (isTxn) {
+        existing = cache.putIfAbsentPoint4(
+          transactionId,
+          tableUid,
+          indexUid,
+          keyValue,
+          pk,
+        );
+      } else {
+        existing = cache.putIfAbsentPoint3(tableUid, indexUid, keyValue, pk);
+      }
+      if (existing == null) {
+        // Build rollback path only after successful insert (bookkeeping).
+        rollbackKeys?.add(isTxn
+            ? <dynamic>[transactionId, tableUid, indexUid, keyValue]
+            : <dynamic>[tableUid, indexUid, keyValue]);
+        return null;
+      }
+      final existingPk = existing.toString();
+      // PK sentinel: path identity IS the pk, so existing always means conflict.
+      // Secondary unique: same-owner re-reserve is idempotent.
+      if (indexUid != kBufferPkIndexUid && existingPk == pk) return null;
+      return UniqueViolation(
+        tableName: table.tableName,
+        fields: fields,
+        value: value,
+        indexName: indexName,
+        existingPrimaryKey: existingPk,
+      );
+    }
+
+    UniqueViolation? conflictOnComposite({
       required IndexUid indexUid,
       required List<dynamic> keyParts,
       required List<String> fields,
@@ -882,13 +928,6 @@ class BufferTreeStore {
         return null;
       }
       final existingPk = existing.toString();
-      // PK sentinel slot: path already is the identity ([..., pkValue] -> pk).
-      // "existingPk == pk" is ALWAYS true for a duplicate insert, so the
-      // secondary-unique same-owner idempotent bypass must NOT apply here ?
-      // otherwise concurrent/duplicate inserts with the same PK all "succeed"
-      // and later record puts just overwrite.
-      // PK sentinel: path identity IS the pk, so existing always means conflict.
-      // Secondary unique: same-owner re-reserve is idempotent.
       if (indexUid != kBufferPkIndexUid && existingPk == pk) return null;
       return UniqueViolation(
         tableName: table.tableName,
@@ -900,14 +939,39 @@ class BufferTreeStore {
     }
 
     // Also check the other buffer domain (txn vs pending) for conflicts.
-    UniqueViolation? crossDomainConflict({
+    UniqueViolation? crossDomainConflictPoint({
+      required IndexUid indexUid,
+      required dynamic keyValue,
+      required List<String> fields,
+      required dynamic value,
+      required IndexName? indexName,
+    }) {
+      if (transactionId != null) {
+        final existing =
+            pendingIndexCache.peekPoint3(tableUid, indexUid, keyValue);
+        if (existing != null) {
+          final existingPk = existing.toString();
+          if (!(isUpdate && existingPk == pk)) {
+            return UniqueViolation(
+              tableName: table.tableName,
+              fields: fields,
+              value: value,
+              indexName: indexName,
+              existingPrimaryKey: existingPk,
+            );
+          }
+        }
+      }
+      return null;
+    }
+
+    UniqueViolation? crossDomainConflictComposite({
       required IndexUid indexUid,
       required List<dynamic> keyParts,
       required List<String> fields,
       required dynamic value,
       required IndexName? indexName,
     }) {
-      // Check pending if we are in txn, and all txn trees if in pending.
       if (transactionId != null) {
         final pendingPath = _indexPath(
           tableUid: tableUid,
@@ -929,27 +993,23 @@ class BufferTreeStore {
             );
           }
         }
-      } else {
-        // Scan other txns: groupDepth=3, no cheap global scan by key without txId.
-        // Cross-txn uniqueness is enforced by checking all active txn prefixes
-        // via hasUniqueOwnedByOtherTransaction (WriteBufferManager helper).
       }
       return null;
     }
 
     // PK
-    if (!isUpdate) {
-      final v = conflictOn(
+    if (!isUpdate && !skipPrimaryKey) {
+      final v = conflictOnPoint(
         indexUid: kBufferPkIndexUid,
-        keyParts: [pk],
+        keyValue: pk,
         fields: [schema.primaryKey],
         value: pk,
         indexName: IndexName('pk'),
       );
       if (v != null) return v;
-      final cross = crossDomainConflict(
+      final cross = crossDomainConflictPoint(
         indexUid: kBufferPkIndexUid,
-        keyParts: [pk],
+        keyValue: pk,
         fields: [schema.primaryKey],
         value: pk,
         indexName: IndexName('pk'),
@@ -961,7 +1021,10 @@ class BufferTreeStore {
       }
     }
 
-    for (final idx in schema.getAllIndexes()) {
+    final Iterable<IndexSchema> indexesToCheck =
+        uniqueIndexes ?? schema.getAllIndexes().where((idx) => idx.unique);
+
+    for (final idx in indexesToCheck) {
       if (!idx.unique) continue;
       if (isUpdate &&
           changedFields != null &&
@@ -969,10 +1032,41 @@ class BufferTreeStore {
           !idx.fields.any(changedFields.contains)) {
         continue;
       }
+      if (idx.fields.length == 1) {
+        final fieldName = idx.fields.first;
+        final keyValue = data[fieldName];
+        if (keyValue == null) continue;
+        final v = conflictOnPoint(
+          indexUid: idx.indexUid,
+          keyValue: keyValue,
+          fields: idx.fields,
+          value: keyValue,
+          indexName: IndexName(idx.actualIndexName),
+        );
+        if (v != null) {
+          rollbackReserved(rollbackKeys ?? const [],
+              transactionId: transactionId);
+          return v;
+        }
+        final cross = crossDomainConflictPoint(
+          indexUid: idx.indexUid,
+          keyValue: keyValue,
+          fields: idx.fields,
+          value: keyValue,
+          indexName: IndexName(idx.actualIndexName),
+        );
+        if (cross != null) {
+          rollbackReserved(rollbackKeys ?? const [],
+              transactionId: transactionId);
+          return cross;
+        }
+        continue;
+      }
+
       final parts = _indexFieldsValue(data, idx.fields);
       if (parts.isEmpty) continue;
-      final value = parts.length == 1 ? parts.first : parts;
-      final v = conflictOn(
+      final value = parts;
+      final v = conflictOnComposite(
         indexUid: idx.indexUid,
         keyParts: parts,
         fields: idx.fields,
@@ -984,7 +1078,7 @@ class BufferTreeStore {
             transactionId: transactionId);
         return v;
       }
-      final cross = crossDomainConflict(
+      final cross = crossDomainConflictComposite(
         indexUid: idx.indexUid,
         keyParts: parts,
         fields: idx.fields,

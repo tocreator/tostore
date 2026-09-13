@@ -133,11 +133,14 @@ final class CacheManager {
   // -------------------- Space / lifecycle --------------------
 
   /// Clear in-memory caches synchronously (used on close).
-  Future<void> dispose({bool includeSchema = true}) async {
+  ///
+  /// [flush]: when true (default), managers may persist runtime metadata before
+  /// clearing; when false, discard and clear only.
+  Future<void> dispose({bool includeSchema = true, bool flush = true}) async {
     // Batch wait for multiple asynchronous tasks
     await Future.wait([
       _dataStore.tableMetaManager?.dispose() ?? Future.value(),
-      _dataStore.tableDataManager.dispose(),
+      _dataStore.tableDataManager.dispose(flush: flush),
       _dataStore.indexManager?.dispose() ?? Future.value(),
       _dataStore.vectorIndexManager?.dispose() ?? Future.value(),
     ]);

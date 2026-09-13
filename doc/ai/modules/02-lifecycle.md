@@ -47,7 +47,7 @@ static Future<ToStore> open({
 - `dbPath` / `dbName` arguments override the same fields on `config`.
 - `schemas`: initial/declarative schemas for automatic migration (typical mobile apps).
 - `applyActiveSpaceOnDefault`: when true, opening space `default` may restore last active space.
-- `reinitialize`: force close-then-open; pair with `noPersistOnClose` when skipping buffer flush on close.
+- `reinitialize`: force close-then-open; pair with `noPersistOnClose: true` when skipping buffer flush on that close (maps to `close(flush: false)`).
 
 ### `ToStore.memory`
 
@@ -82,8 +82,8 @@ static Future<ToStore> memory({
 | `getVersion()` | `Future<int>` | User-defined only |
 | `setVersion(int)` | `Future<void>` | User-defined only |
 | `flush({FlushMode mode = FlushMode.full})` | `Future<void>` | Persist pending writes |
-| `close({bool keepActiveSpace = true})` | `Future<void>` | Releases instance from pool; `keepActiveSpace: false` clears active space (e.g. logout) |
-| `deleteDatabase({dbPath, dbName})` | `Future<void>` | Deletes DB files; removes instance from pool |
+| `close({bool flush = true, bool keepActiveSpace = true})` | `Future<void>` | Releases instance from pool; `flush: false` skips persisting outstanding writes after quiesce (still stops background work); `keepActiveSpace: false` clears active space (e.g. logout) |
+| `deleteDatabase({dbPath, dbName})` | `Future<void>` | Deletes DB files (closes with `flush: false`); removes instance from pool |
 
 ## FlushMode
 

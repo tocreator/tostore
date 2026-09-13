@@ -416,7 +416,7 @@ class BackupManager {
         if (_dataStore.isInitialized) {
           final closeStorage = !PlatformHandler.isWeb;
           await _dataStore.close(
-            persistChanges: false,
+            flush: false,
             closeStorage: closeStorage,
           );
           if (!closeStorage) {

@@ -671,7 +671,7 @@ class DataStoreImpl {
         // Always close the underlying storage when we are about to rebuild
         // managers + StorageAdapter below. Leaving it open leaks handle pools
         await close(
-            persistChanges: !noPersistOnClose,
+            flush: !noPersistOnClose,
             closeStorage: true,
             removeRegistry: false);
         // close() clears _initializing and resets _initCompleter; restore so
@@ -1152,16 +1152,19 @@ class DataStoreImpl {
     });
   }
 
-  /// Close database
-  /// Close database
-  /// [persistChanges]: when true, save buffers/caches to disk (default behavior).
-  /// When false, DO NOT persist pending data; only flush OS handles and clear memory to avoid overwriting restore data.
+  /// Close database.
+  ///
+  /// [flush]: when true (default), drain pending buffers/caches to disk after
+  /// quiesce. When false, discard unpersisted buffers after the same quiesce
+  /// (e.g. restore, deleteDatabase, benchmarks about to wipe the dir).
+  /// Quiesce/maintenance runs in both cases so late writers cannot race into a
+  /// closed storage adapter.
   /// [closeStorage]: whether to close the underlying storage (IndexedDB etc.).
   /// Set [closeStorage] to false when performing operations like Restore that need
   /// to re-initialize the DataStore but keep the connection logic alive.
   /// [keepActiveSpace]: when false, clears [GlobalConfig.activeSpace] so next launch uses default (e.g. logout). Default true.
   Future<void> close({
-    bool persistChanges = true,
+    bool flush = true,
     bool closeStorage = true,
     bool keepActiveSpace = true,
     bool removeRegistry = true,
@@ -1216,12 +1219,15 @@ class DataStoreImpl {
         // Clear all background write scheduler entries to prevent flush blocking
         backgroundWriteScheduler.clearAll();
 
-        // Primary instance only: wait for user transactions to drain, then flush.
+        // Primary instance only: wait for user transactions to drain, then
+        // flush or discard. Quiesce even when flush:false — otherwise late
+        // writers (migration, weights) race into a closed storage adapter
+        // (seen on deleteDatabase after open-for-cleanup).
         // Migration helper instances share LockManager - entering maintenance
         // from them deadlocks the parent's stopAllMigrations await.
         var enteredMaintenance = false;
         try {
-          if (persistChanges && !isMigrationInstance) {
+          if (!isMigrationInstance) {
             try {
               // Only arm maintenance after quiescent succeeds; do not treat a
               // failed drain as "entered" (would leave barrier up until finally).
@@ -1235,14 +1241,17 @@ class DataStoreImpl {
 
           // Flush and stop write pipelines
           try {
-            await parallelJournalManager.stop(flush: persistChanges);
+            await parallelJournalManager.stop(flush: flush);
           } catch (e) {
             Logger.warn('Stop journal manager failed', rawError: e);
           }
 
           try {
-            await walManager.flushQueueCompletely();
-            if (persistChanges && config.enableJournal) {
+            // flush:true -> drain WAL queue to disk + checkpoint
+            // flush:false -> await in-flight WAL IO, discard remaining queue
+            //               (no checkpoint). Never skip the await barrier.
+            await walManager.flushQueueCompletely(flush: flush);
+            if (flush && config.enableJournal) {
               final currentPtr = walManager.currentPointer;
               await walManager.syncCheckpointOnClose(currentPtr);
             }
@@ -1252,14 +1261,17 @@ class DataStoreImpl {
 
           // Flush weight data
           if (_weightManager != null) {
-            if (persistChanges) {
+            if (flush) {
               await _weightManager!.saveWeights(force: true);
+            } else {
+              // Wait for any in-flight periodic save before closing storage.
+              await _weightManager!.awaitPendingSave();
             }
             _weightManager!.stopBackgroundTasks();
           }
 
           // Persist and dispose data managers via CacheManager
-          await cacheManager.dispose();
+          await cacheManager.dispose(flush: flush);
 
           // Clear activeSpace while storage is still open (before close below).
           if (!keepActiveSpace) {
@@ -4912,7 +4924,12 @@ class DataStoreImpl {
           // Skipped when canSkipMemoryReserve is true because auto-generated PKs have no conflicts.
           final batchContext = canSkipMemoryReserve
               ? null
-              : writeBufferManager.createBatchReserveContext(table, txId);
+              : writeBufferManager.createBatchReserveContext(
+                  table,
+                  txId,
+                  uniqueIndexes: uniqueIndexesForTable,
+                  skipPrimaryKey: isWindowAllAutoPk,
+                );
 
           // Collect valid records for a single bulk enqueue into WAL + buffer + cache.
           List<Map<String, dynamic>> batchRecordsForBuffer =
@@ -4940,6 +4957,8 @@ class DataStoreImpl {
                       recs,
                       schemaOverride: tableSchema,
                       skipBufferCheck: true,
+                      // Auto sequential PKs are monotonic -- disk PK probe is wasted work.
+                      skipPrimaryKeyCheck: isWindowAllAutoPk,
                     );
                   } catch (e) {
                     // Fallback: chunked validation to reduce peak memory/IO pressure.
@@ -4964,6 +4983,7 @@ class DataStoreImpl {
                         sub,
                         schemaOverride: tableSchema,
                         skipBufferCheck: true,
+                        skipPrimaryKeyCheck: isWindowAllAutoPk,
                       );
                       for (int i = 0; i < subVios.length; i++) {
                         out[off + i] = subVios[i];
@@ -7661,7 +7681,8 @@ class DataStoreImpl {
   Future<void> deleteDatabase({String? dbPath, String? dbName}) async {
     try {
       final dbDirPath = await getDatabasePath(dbPath: dbPath, dbName: dbName);
-      await close();
+      // Discard pending buffers — files are about to be removed.
+      await close(flush: false);
 
       if (await storage.existsDirectory(dbDirPath)) {
         await storage.deleteDirectory(dbDirPath);

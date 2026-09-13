@@ -86,8 +86,8 @@ import 'package:tostore/tostore.dart';
 | `transaction<T>(action, {rollbackOnError, persistRecoveryOnCommit, isolation})` | `Future<TransactionResult>` |
 | `rotateEncryptionKey({oldKey, required newKey})` | `Future<DbResult>` |
 | `flush({mode})` | `Future<void>` | `FlushMode`: `recovery`, `recoveryDurable`, `full` (default) |
-| `close({keepActiveSpace})` | `Future<void>` |
-| `deleteDatabase({dbPath, dbName})` | `Future<void>` |
+| `close({flush, keepActiveSpace})` | `Future<void>` | `flush: false` discards pending buffers (e.g. about to delete DB); `keepActiveSpace: false` clears active space |
+| `deleteDatabase({dbPath, dbName})` | `Future<void>` | Closes with `flush: false`, then deletes DB files |
 | `getVersion()` / `setVersion(int)` | version bookkeeping |
 | `config` | `DataStoreConfig` |
 | `instancePath` | `String?` |

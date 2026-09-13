@@ -1375,7 +1375,7 @@ class TableDataManager {
   }
 
   /// Remove scheduled task when instance is closed
-  Future<void> dispose({bool persistChanges = true}) async {
+  Future<void> dispose({bool flush = true}) async {
     CrontabManager.removeCallback(
         ExecuteInterval.seconds3, TimeBasedIdGenerator.periodicPoolCheck);
     CrontabManager.removeCallback(
@@ -1383,7 +1383,7 @@ class TableDataManager {
     _unregisterSpaceStatsReconcileCron();
 
     try {
-      if (persistChanges) {
+      if (flush) {
         // Persist runtime metadata (max IDs) one last time.
         // SpaceStats intentionally skipped -- close/switchSpace must not block
         // on InternalKv; periodic tick / recalculate covers durability.

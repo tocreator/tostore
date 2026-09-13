@@ -817,6 +817,8 @@ class WriteBufferManager {
     bool isUpdate = false,
     Set<String>? changedFields,
     String? transactionId,
+    bool skipPrimaryKey = false,
+    List<IndexSchema>? uniqueIndexes,
   }) {
     final rollback = <List<dynamic>>[];
     final violation = trees.tryReserveUniqueInMemory(
@@ -828,6 +830,8 @@ class WriteBufferManager {
       changedFields: changedFields,
       transactionId: transactionId,
       rollbackKeys: rollback,
+      skipPrimaryKey: skipPrimaryKey,
+      uniqueIndexes: uniqueIndexes,
     );
     if (violation != null) {
       // Call sites historically catch UniqueViolation directly.
@@ -944,9 +948,17 @@ class WriteBufferManager {
   /// Batch unique pre-reserve helper for multi-row insert/update paths.
   BufferBatchReserveContext createBatchReserveContext(
     TableContext table,
-    String? transactionId,
-  ) {
-    return BufferBatchReserveContext(this, table, transactionId);
+    String? transactionId, {
+    List<IndexSchema>? uniqueIndexes,
+    bool skipPrimaryKey = false,
+  }) {
+    return BufferBatchReserveContext(
+      this,
+      table,
+      transactionId,
+      uniqueIndexes: uniqueIndexes,
+      skipPrimaryKey: skipPrimaryKey,
+    );
   }
 }
 
@@ -956,8 +968,16 @@ class BufferBatchReserveContext {
   final TableContext table;
   final String? transactionId;
   final Map<String, List<List<dynamic>>> _rollbacksByPk = {};
+  final List<IndexSchema>? uniqueIndexes;
+  final bool skipPrimaryKey;
 
-  BufferBatchReserveContext(this._buf, this.table, this.transactionId);
+  BufferBatchReserveContext(
+    this._buf,
+    this.table,
+    this.transactionId, {
+    this.uniqueIndexes,
+    this.skipPrimaryKey = false,
+  });
 
   /// Reserve uniques for one record; returns rollback paths (empty if update self).
   List<List<dynamic>> tryReserve(
@@ -966,6 +986,7 @@ class BufferBatchReserveContext {
     required bool isUpdate,
     Set<String>? changedFields,
     TableSchema? schema,
+    bool? skipPrimaryKey,
   }) {
     final paths = _buf.tryReserveUniques(
       table: table,
@@ -975,6 +996,8 @@ class BufferBatchReserveContext {
       isUpdate: isUpdate,
       changedFields: changedFields,
       transactionId: transactionId,
+      skipPrimaryKey: skipPrimaryKey ?? this.skipPrimaryKey,
+      uniqueIndexes: uniqueIndexes,
     );
     if (paths.isNotEmpty) {
       _rollbacksByPk[recordId] = paths;
