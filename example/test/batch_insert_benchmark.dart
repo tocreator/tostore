@@ -1,4 +1,5 @@
 import 'dart:io';
+
 import 'package:tostore/tostore.dart';
 
 /// Benchmark for ToStore batchInsert throughput.
@@ -28,8 +29,8 @@ void main() async {
   }
 
   const testDurabilities = [
-    RecoveryDurability.standard,
     RecoveryDurability.async,
+    RecoveryDurability.standard,
   ];
   const int batchSize = 100000;
   const int batches = 5;

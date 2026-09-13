@@ -41,10 +41,6 @@ class WriteBufferManager {
   final StreamController<int> _sizeController =
       StreamController<int>.broadcast();
 
-  /// Rollback paths from the latest successful [tryReserveUniques] per record.
-  final Map<String, List<List<dynamic>>> _lastReserveRollback =
-      <String, List<List<dynamic>>>{};
-
   WriteBufferManager(this._dataStore) {
     trees = BufferTreeStore(_dataStore);
   }
@@ -89,9 +85,6 @@ class WriteBufferManager {
   int getClearEpoch(TableContext table) {
     return (_tableClearEpochs[table.tableUid] ?? 0) + _globalClearEpoch;
   }
-
-  String _reserveKey(TableUid tableUid, String recordId, String? txId) =>
-      '${txId ?? ''}|$tableUid|$recordId';
 
   void removeRecord(TableContext table, String recordId) {
     final tableUid = table.tableUid;
@@ -168,11 +161,6 @@ class WriteBufferManager {
         changedFields: changedFields,
       );
     }
-    commitReservedUniques(
-      table: table,
-      recordId: recordId,
-      transactionId: entry.transactionId,
-    );
 
     if (!skipQueueEnqueue && effective != null) {
       _dataStore.backgroundWriteScheduler.handleOnlineWrite(table, recordId);
@@ -275,11 +263,6 @@ class WriteBufferManager {
         changedFields: changedFields,
       );
     }
-    commitReservedUniques(
-      table: table,
-      recordId: recordId,
-      transactionId: entry.transactionId,
-    );
 
     if (!skipQueueEnqueue && effective != null) {
       _dataStore.backgroundWriteScheduler.handleOnlineWrite(table, recordId);
@@ -365,7 +348,6 @@ class WriteBufferManager {
         .applyEnqueueBackpressure(recordIds.length);
     if (bp != null) await bp;
 
-    final pendingQueue = <WriteQueueEntry>[];
     for (int i = 0; i < recordIds.length; i++) {
       final y = yieldController.maybeYield();
       if (y != null) await y;
@@ -377,13 +359,6 @@ class WriteBufferManager {
         entry: entry,
         transactionId: batchTxId,
       );
-      if (!installAllIndexes) {
-        commitReservedUniques(
-          table: table,
-          recordId: recordId,
-          transactionId: entry.transactionId ?? batchTxId,
-        );
-      }
 
       final wp = entry.walPointer;
       if (wp == null) {
@@ -395,23 +370,18 @@ class WriteBufferManager {
       if (bgMaybeActive) {
         bgScheduler.handleOnlineWrite(table, recordId);
       }
-      pendingQueue.add(WriteQueueEntry(
+      _writeQueue.add(WriteQueueEntry(
         tableUid: tableUid,
         recordId: recordId,
         walPointer: wp,
       ));
-    }
-    if (pendingQueue.isNotEmpty) {
-      _writeQueue.addAll(pendingQueue);
     }
 
     _emitSizeChanged();
     CrontabManager.notifyActivity();
   }
 
-  /// High-throughput bulk virgin insert for tables without secondary indexes (e.g. pure PK tables).
-  ///
-  /// Directly enqueues into [pendingRecordCache] and [_writeQueue],
+  /// High-throughput batch insertion for tables with ONLY a primary key,
   /// skipping index plan lookups and reservation checks. The write-queue
   /// build loop yields so a large window cannot monopolize the UI isolate.
   Future<void> addPurePkInsertBatch({
@@ -443,8 +413,7 @@ class WriteBufferManager {
       minCheckInterval: EngineCpuChunk.fastPathMinCheckInterval,
     );
 
-    // Build queue entries with yield cadence, then one addAll.
-    final pendingQueue = <WriteQueueEntry>[];
+    // Build queue entries directly into _writeQueue to avoid intermediate list allocation.
     for (int i = 0; i < count; i++) {
       final y = yieldController.maybeYield();
       if (y != null) await y;
@@ -453,14 +422,11 @@ class WriteBufferManager {
       if (bgMaybeActive) {
         bgScheduler.handleOnlineWrite(table, recordIds[i]);
       }
-      pendingQueue.add(WriteQueueEntry(
+      _writeQueue.add(WriteQueueEntry(
         tableUid: tableUid,
         recordId: recordIds[i],
         walPointer: wp,
       ));
-    }
-    if (pendingQueue.isNotEmpty) {
-      _writeQueue.addAll(pendingQueue);
     }
 
     _emitSizeChanged();
@@ -512,7 +478,6 @@ class WriteBufferManager {
     if (bp != null) await bp;
 
     final pendingQueue = <WriteQueueEntry>[];
-    final bool trackReserveRollback = _lastReserveRollback.isNotEmpty;
     for (int i = 0; i < recordIds.length; i++) {
       final y = yieldController.maybeYield();
       if (y != null) await y;
@@ -533,13 +498,6 @@ class WriteBufferManager {
         installAllIndexes: installAllIndexes,
         indexPlan: indexPlan,
       );
-      if (trackReserveRollback) {
-        commitReservedUniques(
-          table: table,
-          recordId: recordId,
-          transactionId: entry.transactionId ?? batchTxId,
-        );
-      }
 
       // Always enqueue (O(1)). insert→update coalesces in trees; skipping the
       // queue previously stranded rows when flush already popped the insert.
@@ -638,11 +596,6 @@ class WriteBufferManager {
       entry: entry,
       transactionId: transactionId,
       changedFields: changedFields,
-    );
-    commitReservedUniques(
-      table: table,
-      recordId: recordId,
-      transactionId: transactionId,
     );
   }
 
@@ -788,7 +741,6 @@ class WriteBufferManager {
     _globalClearEpoch++;
     trees.clearAll();
     _writeQueue.clear();
-    _lastReserveRollback.clear();
     _tableClearEpochs.clear();
     _globalClearEpoch = 0;
     _emitSizeChanged();
@@ -807,8 +759,10 @@ class WriteBufferManager {
 
   /// Memory unique pre-reserve via TreeCache.putIfAbsent.
   ///
-  /// Throws [DbException] with [UniqueViolation] on conflict.
-  /// Returns rollback paths for [releaseReservedUniques].
+  /// Throws [UniqueViolation] on conflict.
+  /// When [trackRollback] is true, returns paths newly inserted by this call
+  /// (caller must pass them to [releaseReservedUniques] on abort). When false,
+  /// returns an empty list and mid-call conflicts undo via by-data release.
   List<List<dynamic>> tryReserveUniques({
     required TableContext table,
     required TableSchema schema,
@@ -819,8 +773,10 @@ class WriteBufferManager {
     String? transactionId,
     bool skipPrimaryKey = false,
     List<IndexSchema>? uniqueIndexes,
+    bool trackRollback = true,
   }) {
-    final rollback = <List<dynamic>>[];
+    final List<List<dynamic>>? rollback =
+        trackRollback ? <List<dynamic>>[] : null;
     final violation = trees.tryReserveUniqueInMemory(
       table: table,
       schema: schema,
@@ -838,79 +794,67 @@ class WriteBufferManager {
       // ignore: only_throw_errors
       throw violation;
     }
-    if (rollback.isNotEmpty) {
-      final key = _reserveKey(table.tableUid, recordId, transactionId);
-      _lastReserveRollback[key] = rollback;
+    if (rollback == null || rollback.isEmpty) {
+      return const <List<dynamic>>[];
     }
     return rollback;
   }
 
-  /// Bookkeeping entries awaiting commit/release (diagnostics / tests).
-  int get debugReserveBookkeepingCount => _lastReserveRollback.length;
-
-  /// Drop rollback bookkeeping after buffer apply succeeded.
-  /// Does not remove index leaves -- they remain until flush evict / delete.
-  void commitReservedUniques({
+  /// Release unique pre-reserve slots by reconstructing keys from [data].
+  void releaseReservedUniquesByData({
     required TableContext table,
+    required TableSchema schema,
     required String recordId,
+    required Map<String, dynamic> data,
     String? transactionId,
+    bool isUpdate = false,
+    Set<String>? changedFields,
+    bool skipPrimaryKey = false,
+    List<IndexSchema>? uniqueIndexes,
   }) {
-    if (_lastReserveRollback.isEmpty) return;
-    _lastReserveRollback.remove(
-      _reserveKey(table.tableUid, recordId, transactionId),
+    trees.releaseReservedUniquesByData(
+      table: table,
+      schema: schema,
+      pk: recordId,
+      data: data,
+      transactionId: transactionId,
+      isUpdate: isUpdate,
+      changedFields: changedFields,
+      skipPrimaryKey: skipPrimaryKey,
+      uniqueIndexes: uniqueIndexes,
     );
   }
 
+  /// Drop reserved unique leaves using explicit [rollbackKeys] from
+  /// [tryReserveUniques]. No global bookkeeping map.
   void releaseReservedUniques({
     required TableContext table,
     required String recordId,
     String? transactionId,
     List<List<dynamic>>? rollbackKeys,
   }) {
-    if (_lastReserveRollback.isEmpty &&
-        (rollbackKeys == null || rollbackKeys.isEmpty)) {
-      return;
-    }
-    final key = _reserveKey(table.tableUid, recordId, transactionId);
-    final paths = rollbackKeys ?? _lastReserveRollback.remove(key);
-    if (rollbackKeys != null) {
-      _lastReserveRollback.remove(key);
-    }
-    if (paths == null || paths.isEmpty) return;
-    trees.rollbackReserved(paths, transactionId: transactionId);
+    if (rollbackKeys == null || rollbackKeys.isEmpty) return;
+    trees.rollbackReserved(rollbackKeys, transactionId: transactionId);
   }
 
-  /// Release reservations for many pks (failed / aborted rows only).
-  ///
-  /// Safe for rows that already [commitReservedUniques]: bookkeeping is gone
-  /// and this becomes a no-op (does not wipe leaves of buffered rows).
-  ///
-  /// Yields on large sets to avoid UI jank (batch abort / fail-all paths).
-  Future<void> releaseReservedUniquesForPks({
+  /// Release many reserved rows by their path lists (update abort / chunk abort).
+  Future<void> releaseReservedUniquesByPaths({
     required TableContext table,
-    required Iterable<String> recordIds,
+    required Map<String, List<List<dynamic>>> pathsByPk,
     String? transactionId,
   }) async {
-    if (_lastReserveRollback.isEmpty) return;
+    if (pathsByPk.isEmpty) return;
     final yieldController = YieldController(
-      'WriteBufferManager.releaseReservedUniquesForPks',
+      'WriteBufferManager.releaseReservedUniquesByPaths',
       minCheckInterval: EngineCpuChunk.hotPathMinCheckInterval,
     );
-    final int chunk = EngineCpuChunk.sizeFor(CpuChunkKind.light);
-    int i = 0;
-    for (final recordId in recordIds) {
-      if (recordId.isEmpty) continue;
-      if (i % chunk == 0) {
-        final y = yieldController.maybeYield();
-        if (y != null) await y;
-      }
-      i++;
+    for (final entry in pathsByPk.entries) {
+      final y = yieldController.maybeYield();
+      if (y != null) await y;
+      final paths = entry.value;
+      if (paths.isEmpty) continue;
       try {
-        releaseReservedUniques(
-          table: table,
-          recordId: recordId,
-          transactionId: transactionId,
-        );
+        trees.rollbackReserved(paths, transactionId: transactionId);
       } catch (_) {}
     }
   }
@@ -946,11 +890,18 @@ class WriteBufferManager {
   }
 
   /// Batch unique pre-reserve helper for multi-row insert/update paths.
+  ///
+  /// [trackPaths]: when false (batchInsert), collect nothing — callers pass
+  /// row data into [BufferBatchReserveContext.releaseForPk] /
+  /// [BufferBatchReserveContext.releaseAll] on abort. When true (batchUpdate),
+  /// keep per-pk path lists so partial unique re-reserves do not wipe
+  /// pre-existing slots.
   BufferBatchReserveContext createBatchReserveContext(
     TableContext table,
     String? transactionId, {
     List<IndexSchema>? uniqueIndexes,
     bool skipPrimaryKey = false,
+    bool trackPaths = true,
   }) {
     return BufferBatchReserveContext(
       this,
@@ -958,6 +909,7 @@ class WriteBufferManager {
       transactionId,
       uniqueIndexes: uniqueIndexes,
       skipPrimaryKey: skipPrimaryKey,
+      trackPaths: trackPaths,
     );
   }
 }
@@ -967,9 +919,12 @@ class BufferBatchReserveContext {
   final WriteBufferManager _buf;
   final TableContext table;
   final String? transactionId;
+
+  /// Only used when [trackPaths] is true (batchUpdate partial unique re-reserve).
   final Map<String, List<List<dynamic>>> _rollbacksByPk = {};
   final List<IndexSchema>? uniqueIndexes;
   final bool skipPrimaryKey;
+  final bool trackPaths;
 
   BufferBatchReserveContext(
     this._buf,
@@ -977,10 +932,14 @@ class BufferBatchReserveContext {
     this.transactionId, {
     this.uniqueIndexes,
     this.skipPrimaryKey = false,
+    this.trackPaths = true,
   });
 
-  /// Reserve uniques for one record; returns rollback paths (empty if update self).
-  List<List<dynamic>> tryReserve(
+  /// Reserve uniques for one record.
+  ///
+  /// When [trackPaths] is false (batchInsert), nothing is collected — abort
+  /// paths must call [releaseForPk]/[releaseAll] with the row [data].
+  void tryReserve(
     String recordId,
     Map<String, dynamic> data, {
     required bool isUpdate,
@@ -988,6 +947,7 @@ class BufferBatchReserveContext {
     TableSchema? schema,
     bool? skipPrimaryKey,
   }) {
+    final effectiveSkip = skipPrimaryKey ?? this.skipPrimaryKey;
     final paths = _buf.tryReserveUniques(
       table: table,
       schema: schema ?? table.schema,
@@ -996,50 +956,89 @@ class BufferBatchReserveContext {
       isUpdate: isUpdate,
       changedFields: changedFields,
       transactionId: transactionId,
-      skipPrimaryKey: skipPrimaryKey ?? this.skipPrimaryKey,
+      skipPrimaryKey: effectiveSkip,
       uniqueIndexes: uniqueIndexes,
+      trackRollback: trackPaths,
     );
-    if (paths.isNotEmpty) {
-      _rollbacksByPk[recordId] = paths;
+    if (trackPaths && paths.isNotEmpty) {
+      final existing = _rollbacksByPk[recordId];
+      if (existing == null) {
+        _rollbacksByPk[recordId] = paths;
+      } else {
+        existing.addAll(paths);
+      }
     }
-    return paths;
   }
 
-  void releaseForPk(String recordId) {
+  /// Drop path bookkeeping after buffer apply succeeded (leaves stay).
+  void commitForPk(String recordId) {
+    if (!trackPaths) return;
+    _rollbacksByPk.remove(recordId);
+  }
+
+  void commitForPks(Iterable<String> recordIds) {
+    if (!trackPaths || _rollbacksByPk.isEmpty) return;
+    for (final id in recordIds) {
+      _rollbacksByPk.remove(id);
+    }
+  }
+
+  /// Release a reserved row. [data] is required when [trackPaths] is false.
+  void releaseForPk(String recordId, [Map<String, dynamic>? data]) {
+    if (!trackPaths) {
+      if (data == null) return;
+      _buf.releaseReservedUniquesByData(
+        table: table,
+        schema: table.schema,
+        recordId: recordId,
+        data: data,
+        transactionId: transactionId,
+        skipPrimaryKey: skipPrimaryKey,
+        uniqueIndexes: uniqueIndexes,
+      );
+      return;
+    }
     final paths = _rollbacksByPk.remove(recordId);
-    final key = _buf._reserveKey(table.tableUid, recordId, transactionId);
-    _buf._lastReserveRollback.remove(key);
     if (paths != null && paths.isNotEmpty) {
       _buf.bufferTrees.rollbackReserved(paths, transactionId: transactionId);
     }
   }
 
   void releaseLast() {
+    if (!trackPaths) return;
     if (_rollbacksByPk.isNotEmpty) {
-      final lastKey = _rollbacksByPk.keys.last;
-      releaseForPk(lastKey);
+      releaseForPk(_rollbacksByPk.keys.last);
     }
   }
 
-  void releaseAll() {
-    if (_rollbacksByPk.isNotEmpty) {
-      for (final entry in _rollbacksByPk.entries) {
-        _buf.bufferTrees
-            .rollbackReserved(entry.value, transactionId: transactionId);
-        final key = _buf._reserveKey(table.tableUid, entry.key, transactionId);
-        _buf._lastReserveRollback.remove(key);
+  /// Release every tracked reservation, or (no-ledger mode) every row in
+  /// [records] using [primaryKeyField] to resolve pk.
+  void releaseAll({
+    List<Map<String, dynamic>>? records,
+    String? primaryKeyField,
+  }) {
+    if (!trackPaths) {
+      if (records == null || primaryKeyField == null) return;
+      for (final rec in records) {
+        final pkVal = rec[primaryKeyField];
+        final rid = pkVal is String ? pkVal : (pkVal?.toString() ?? '');
+        if (rid.isEmpty) continue;
+        releaseForPk(rid, rec);
       }
-      _rollbacksByPk.clear();
+      return;
     }
+    if (_rollbacksByPk.isEmpty) return;
+    for (final entry in _rollbacksByPk.entries) {
+      _buf.bufferTrees
+          .rollbackReserved(entry.value, transactionId: transactionId);
+    }
+    _rollbacksByPk.clear();
   }
 
+  /// Success path: drop path bookkeeping only (leaves stay until flush/evict).
+  /// No-op when [trackPaths] is false (nothing was collected).
   void clear() {
-    if (_rollbacksByPk.isNotEmpty) {
-      for (final recordId in _rollbacksByPk.keys) {
-        final key = _buf._reserveKey(table.tableUid, recordId, transactionId);
-        _buf._lastReserveRollback.remove(key);
-      }
-      _rollbacksByPk.clear();
-    }
+    if (!trackPaths) return;
+    _rollbacksByPk.clear();
   }
 }

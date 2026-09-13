@@ -2046,21 +2046,21 @@ class TableDataManager {
               force: true,
             );
           }
-          // Drop reserve bookkeeping; unique leaves stay as memory locks.
-          _dataStore.writeBufferManager.commitReservedUniques(
-            table: table,
-            recordId: recordId,
-            transactionId: currentTxId,
-          );
           successIds.add(recordId);
         } catch (e) {
           Logger.warn('Memory batch op failed: ${table.tableName} pk=$recordId',
               rawError: e);
-          _dataStore.writeBufferManager.releaseReservedUniques(
-            table: table,
-            recordId: recordId,
-            transactionId: currentTxId,
-          );
+          // Insert reserve can be undone by data; update needs path lists from
+          // the call site (not available here after global ledger removal).
+          if (operation == BufferOperationType.insert) {
+            _dataStore.writeBufferManager.releaseReservedUniquesByData(
+              table: table,
+              schema: schema,
+              recordId: recordId,
+              data: r,
+              transactionId: currentTxId,
+            );
+          }
           failedIds.add(recordId);
         }
       }

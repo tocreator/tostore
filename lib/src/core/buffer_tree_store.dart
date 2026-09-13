@@ -848,10 +848,86 @@ class BufferTreeStore {
 
   // -------------------- Unique reservation (putIfAbsent) --------------------
 
+  /// Drop unique slots this row owns, reconstructed from [data] (no path ledger).
+  ///
+  /// Only removes leaves whose stored owner pk equals [pk]. Filters match
+  /// [tryReserveUniqueInMemory] ([skipPrimaryKey], [uniqueIndexes],
+  /// [changedFields] on update).
+  void releaseReservedUniquesByData({
+    required TableContext table,
+    required TableSchema schema,
+    required String pk,
+    required Map<String, dynamic> data,
+    String? transactionId,
+    bool isUpdate = false,
+    Set<String>? changedFields,
+    bool skipPrimaryKey = false,
+    List<IndexSchema>? uniqueIndexes,
+  }) {
+    void removeIfOwned({
+      required IndexUid indexUid,
+      required List<dynamic> keyParts,
+    }) {
+      final owner = lookupUniqueOwner(
+        tableUid: table.tableUid,
+        indexUid: indexUid,
+        keyParts: keyParts,
+        transactionId: transactionId,
+      );
+      if (owner != pk) return;
+      _removeUniqueIndexKey(
+        table: table,
+        indexUid: indexUid,
+        keyParts: keyParts,
+        pk: pk,
+        isUnique: true,
+        transactionId: transactionId,
+      );
+    }
+
+    // PK slot is only reserved on insert (see tryReserveUniqueInMemory).
+    if (!isUpdate && !skipPrimaryKey) {
+      removeIfOwned(
+        indexUid: kBufferPkIndexUid,
+        keyParts: <dynamic>[pk],
+      );
+    }
+
+    final Iterable<IndexSchema> indexesToRelease =
+        uniqueIndexes ?? schema.getAllIndexes().where((idx) => idx.unique);
+
+    for (final idx in indexesToRelease) {
+      if (!idx.unique) continue;
+      if (isUpdate &&
+          changedFields != null &&
+          changedFields.isNotEmpty &&
+          !idx.fields.any(changedFields.contains)) {
+        continue;
+      }
+      if (idx.fields.length == 1) {
+        final keyValue = data[idx.fields.first];
+        if (keyValue == null) continue;
+        removeIfOwned(
+          indexUid: idx.indexUid,
+          keyParts: <dynamic>[keyValue],
+        );
+        continue;
+      }
+      final parts = _indexFieldsValue(data, idx.fields);
+      if (parts.isEmpty) continue;
+      removeIfOwned(
+        indexUid: idx.indexUid,
+        keyParts: parts,
+      );
+    }
+  }
+
   /// Memory unique pre-reserve via putIfAbsent. Returns violation or null.
   ///
   /// On success, keys are already placed. On failure, [rollbackKeys] lists
-  /// paths that this call inserted (caller should remove them).
+  /// paths that this call inserted (caller should remove them). When
+  /// [rollbackKeys] is null, partial inserts are undone via
+  /// [releaseReservedUniquesByData] (no path ledger).
   UniqueViolation? tryReserveUniqueInMemory({
     required TableContext table,
     required TableSchema schema,
@@ -867,6 +943,24 @@ class BufferTreeStore {
     final tableUid = table.tableUid;
     final cache = transactionId != null ? txnIndexCache : pendingIndexCache;
     final bool isTxn = transactionId != null;
+
+    void undoPartialReserve() {
+      if (rollbackKeys != null) {
+        rollbackReserved(rollbackKeys, transactionId: transactionId);
+        return;
+      }
+      releaseReservedUniquesByData(
+        table: table,
+        schema: schema,
+        pk: pk,
+        data: data,
+        transactionId: transactionId,
+        isUpdate: isUpdate,
+        changedFields: changedFields,
+        skipPrimaryKey: skipPrimaryKey,
+        uniqueIndexes: uniqueIndexes,
+      );
+    }
 
     UniqueViolation? conflictOnPoint({
       required IndexUid indexUid,
@@ -888,7 +982,7 @@ class BufferTreeStore {
         existing = cache.putIfAbsentPoint3(tableUid, indexUid, keyValue, pk);
       }
       if (existing == null) {
-        // Build rollback path only after successful insert (bookkeeping).
+        // Path ledger only when caller requested bookkeeping.
         rollbackKeys?.add(isTxn
             ? <dynamic>[transactionId, tableUid, indexUid, keyValue]
             : <dynamic>[tableUid, indexUid, keyValue]);
@@ -1015,8 +1109,7 @@ class BufferTreeStore {
         indexName: IndexName('pk'),
       );
       if (cross != null) {
-        rollbackReserved(rollbackKeys ?? const [],
-            transactionId: transactionId);
+        undoPartialReserve();
         return cross;
       }
     }
@@ -1044,8 +1137,7 @@ class BufferTreeStore {
           indexName: IndexName(idx.actualIndexName),
         );
         if (v != null) {
-          rollbackReserved(rollbackKeys ?? const [],
-              transactionId: transactionId);
+          undoPartialReserve();
           return v;
         }
         final cross = crossDomainConflictPoint(
@@ -1056,8 +1148,7 @@ class BufferTreeStore {
           indexName: IndexName(idx.actualIndexName),
         );
         if (cross != null) {
-          rollbackReserved(rollbackKeys ?? const [],
-              transactionId: transactionId);
+          undoPartialReserve();
           return cross;
         }
         continue;
@@ -1074,8 +1165,7 @@ class BufferTreeStore {
         indexName: IndexName(idx.actualIndexName),
       );
       if (v != null) {
-        rollbackReserved(rollbackKeys ?? const [],
-            transactionId: transactionId);
+        undoPartialReserve();
         return v;
       }
       final cross = crossDomainConflictComposite(
@@ -1086,8 +1176,7 @@ class BufferTreeStore {
         indexName: IndexName(idx.actualIndexName),
       );
       if (cross != null) {
-        rollbackReserved(rollbackKeys ?? const [],
-            transactionId: transactionId);
+        undoPartialReserve();
         return cross;
       }
     }

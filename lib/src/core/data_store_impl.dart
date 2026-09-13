@@ -1833,6 +1833,7 @@ class DataStoreImpl {
           recordId: recordId,
           data: validData,
           transactionId: txId,
+          trackRollback: false,
         );
       } catch (e) {
         if (e is UniqueViolation) {
@@ -1881,9 +1882,11 @@ class DataStoreImpl {
         } catch (e) {
           // Rollback reservation on FK failure
           try {
-            writeBufferManager.releaseReservedUniques(
+            writeBufferManager.releaseReservedUniquesByData(
               table: table,
+              schema: schema,
               recordId: recordId,
+              data: validData,
               transactionId: txId,
             );
           } catch (_) {}
@@ -1926,9 +1929,11 @@ class DataStoreImpl {
           if (!retryOnPkConflict) {
             // Rollback reservation before retrying
             try {
-              writeBufferManager.releaseReservedUniques(
+              writeBufferManager.releaseReservedUniquesByData(
                 table: table,
+                schema: schema,
                 recordId: recordId,
+                data: validData,
                 transactionId: txId,
               );
             } catch (_) {}
@@ -1941,9 +1946,11 @@ class DataStoreImpl {
 
         // Rollback reservation on disk conflict
         try {
-          writeBufferManager.releaseReservedUniques(
+          writeBufferManager.releaseReservedUniquesByData(
             table: table,
+            schema: schema,
             recordId: recordId,
+            data: validData,
             transactionId: txId,
           );
         } catch (_) {}
@@ -2030,9 +2037,11 @@ class DataStoreImpl {
           final schema = table.schema;
           final rid = validData[schema.primaryKey]?.toString();
           if (rid != null && rid.isNotEmpty) {
-            writeBufferManager.releaseReservedUniques(
+            writeBufferManager.releaseReservedUniquesByData(
               table: table,
+              schema: schema,
               recordId: rid,
+              data: validData,
               transactionId: txId,
             );
           }
@@ -2745,7 +2754,7 @@ class DataStoreImpl {
         final List<String> pkChangeNewKeys = [];
         final List<Map<String, dynamic>> pkChangeOrigRecords = [];
         final List<Map<String, dynamic>> pkChangeUpdatedRecords = [];
-        final Set<String> reservedPks = {};
+        final Map<String, List<List<dynamic>>> reservedByPk = {};
         final bool touchesOutboundFk = _foreignKeyManager != null &&
             table.schema.foreignKeys
                 .any((fk) => fk.fields.any(changedFields.contains));
@@ -2794,7 +2803,9 @@ class DataStoreImpl {
                 transactionId: txId,
                 isUpdate: false,
               );
-              reservedPks.add(newPkStr);
+              if (pkReservedKeys.isNotEmpty) {
+                reservedByPk[newPkStr] = pkReservedKeys;
+              }
             } catch (e) {
               if (e is UniqueViolation) {
                 if (continueOnPartialErrors) {
@@ -2823,6 +2834,11 @@ class DataStoreImpl {
                   isUpdate: true,
                   changedFields: fieldsToCheck,
                 );
+                if (secondaryReservedKeys.isNotEmpty) {
+                  reservedByPk
+                      .putIfAbsent(newPkStr, () => <List<dynamic>>[])
+                      .addAll(secondaryReservedKeys);
+                }
               } catch (e) {
                 writeBufferManager.releaseReservedUniques(
                   table: table,
@@ -2830,7 +2846,7 @@ class DataStoreImpl {
                   transactionId: txId,
                   rollbackKeys: pkReservedKeys,
                 );
-                reservedPks.remove(newPkStr);
+                reservedByPk.remove(newPkStr);
                 if (e is UniqueViolation) {
                   if (continueOnPartialErrors) {
                     if (returnResultDetails) failedKeys.add(recordKey);
@@ -2864,7 +2880,7 @@ class DataStoreImpl {
                   rollbackKeys: secondaryReservedKeys,
                 );
               }
-              reservedPks.remove(newPkStr);
+              reservedByPk.remove(newPkStr);
             }
 
             // 3) Disk: new PK must not exist
@@ -3048,7 +3064,9 @@ class DataStoreImpl {
                 isUpdate: true,
                 changedFields: changedFields,
               );
-              reservedPks.add(recordKey);
+              if (oldUniqueKeys.isNotEmpty) {
+                reservedByPk[recordKey] = oldUniqueKeys;
+              }
             } catch (e) {
               if (e is UniqueViolation) {
                 if (continueOnPartialErrors) {
@@ -3086,7 +3104,7 @@ class DataStoreImpl {
                     transactionId: txId,
                     rollbackKeys: oldUniqueKeys,
                   );
-                  reservedPks.remove(recordKey);
+                  reservedByPk.remove(recordKey);
                 } catch (_) {}
               }
 
@@ -3134,7 +3152,7 @@ class DataStoreImpl {
                   transactionId: txId,
                   rollbackKeys: oldUniqueKeys,
                 );
-                reservedPks.remove(recordKey);
+                reservedByPk.remove(recordKey);
               } catch (_) {}
             }
           }
@@ -3170,7 +3188,7 @@ class DataStoreImpl {
                     transactionId: txId,
                     rollbackKeys: oldUniqueKeys,
                   );
-                  reservedPks.remove(recordKey);
+                  reservedByPk.remove(recordKey);
                 }
                 if (continueOnPartialErrors) {
                   if (returnResultDetails) {
@@ -3196,7 +3214,7 @@ class DataStoreImpl {
                   transactionId: txId,
                   rollbackKeys: oldUniqueKeys,
                 );
-                reservedPks.remove(recordKey);
+                reservedByPk.remove(recordKey);
               }
               if (continueOnPartialErrors) {
                 if (returnResultDetails) {
@@ -3281,7 +3299,7 @@ class DataStoreImpl {
                 }
                 successCount++;
                 promoteUpdated?.add(updatedRecord);
-                reservedPks.remove(newKey);
+                reservedByPk.remove(newKey);
 
                 if (hasNotify) {
                   notifyDataChange(ChangeEvent(
@@ -3320,23 +3338,25 @@ class DataStoreImpl {
                   failedKeys.add(oldKey);
                 }
                 failedCount++;
-                if (reservedPks.contains(newKey)) {
+                final failedPaths = reservedByPk.remove(newKey);
+                if (failedPaths != null) {
                   writeBufferManager.releaseReservedUniques(
                     table: table,
                     recordId: newKey,
                     transactionId: txId,
+                    rollbackKeys: failedPaths,
                   );
-                  reservedPks.remove(newKey);
                 }
               }
             }
           } catch (e) {
-            if (reservedPks.isNotEmpty) {
-              await writeBufferManager.releaseReservedUniquesForPks(
+            if (reservedByPk.isNotEmpty) {
+              await writeBufferManager.releaseReservedUniquesByPaths(
                 table: table,
-                recordIds: reservedPks,
+                pathsByPk: reservedByPk,
                 transactionId: txId,
               );
+              reservedByPk.clear();
             }
             rethrow;
           }
@@ -3385,7 +3405,7 @@ class DataStoreImpl {
             }
             successCount++;
             promoteUpdated?.add(updatedRecord);
-            reservedPks.remove(pkVal);
+            reservedByPk.remove(pkVal);
 
             if (hasNotify) {
               notifyDataChange(ChangeEvent(
@@ -3441,22 +3461,25 @@ class DataStoreImpl {
                     failedKeys.add(pkVal);
                   }
                   failedCount++;
-                  if (reservedPks.contains(pkVal)) {
+                  final failedPaths = reservedByPk.remove(pkVal);
+                  if (failedPaths != null) {
                     writeBufferManager.releaseReservedUniques(
                       table: table,
                       recordId: pkVal,
                       transactionId: txId,
+                      rollbackKeys: failedPaths,
                     );
                   }
                 }
               }
             } catch (e) {
-              if (reservedPks.isNotEmpty) {
-                await writeBufferManager.releaseReservedUniquesForPks(
+              if (reservedByPk.isNotEmpty) {
+                await writeBufferManager.releaseReservedUniquesByPaths(
                   table: table,
-                  recordIds: reservedPks,
+                  pathsByPk: reservedByPk,
                   transactionId: txId,
                 );
+                reservedByPk.clear();
               }
               rethrow;
             }
@@ -4684,7 +4707,6 @@ class DataStoreImpl {
 
     TableSchema? schema;
     TableContext? tableForRelease;
-    final Set<String> reservedNotBuffered = <String>{};
     bool deferQueryCacheInvalidation = false;
     parallelJournalManager.beginBatchOperation();
     try {
@@ -4929,6 +4951,8 @@ class DataStoreImpl {
                   txId,
                   uniqueIndexes: uniqueIndexesForTable,
                   skipPrimaryKey: isWindowAllAutoPk,
+                  // Insert: no path ledger; abort releases by record data.
+                  trackPaths: false,
                 );
 
           // Collect valid records for a single bulk enqueue into WAL + buffer + cache.
@@ -5056,6 +5080,10 @@ class DataStoreImpl {
                             final newId =
                                 await tableDataManager.getNextId(table);
                             if (newId.isNotEmpty) {
+                              // Drop old-pk reservation before mutating in place.
+                              if (rid.isNotEmpty) {
+                                batchContext?.releaseForPk(rid, rec);
+                              }
                               rec[primaryKey] = newId;
                               final newRid = newId.toString();
 
@@ -5075,6 +5103,9 @@ class DataStoreImpl {
                       }
 
                       invalidRecords.add(rec);
+                      if (rid.isNotEmpty) {
+                        batchContext?.releaseForPk(rid, rec);
+                      }
                       // Efficient error capture for reporting
                       if (validationErrorsForResult.length < 20) {
                         validationErrorsForResult
@@ -5145,7 +5176,10 @@ class DataStoreImpl {
                   }
                   failedCount++;
                 }
-                batchContext?.releaseAll();
+                batchContext?.releaseAll(
+                  records: batchRecordsForBuffer,
+                  primaryKeyField: primaryKey,
+                );
                 batchRecordsForBuffer = <Map<String, dynamic>>[];
                 batchRecordIndicesForBuffer.clear();
                 batchRecordIdsForBuffer = <String>[];
@@ -5177,7 +5211,7 @@ class DataStoreImpl {
                 final pkVal = batchRecordsForBuffer[i][primaryKey]?.toString();
                 if (pkVal != null && failedSet.contains(pkVal)) {
                   final globalIdx = batchRecordIndicesForBuffer[i];
-                  batchContext?.releaseForPk(pkVal);
+                  batchContext?.releaseForPk(pkVal, batchRecordsForBuffer[i]);
                   if (returnResultDetails) {
                     failedKeys.add(pkVal);
                     statusSlots![globalIdx] = GeneralStatus(
@@ -5807,18 +5841,6 @@ class DataStoreImpl {
           queryExecutor.invalidateQueryCacheForTable(tableForRelease);
         } catch (_) {}
       }
-      // Early returns (!allowPartialErrors) skip catch -- still release orphans.
-      // Successes already committed bookkeeping -> release is a no-op for them.
-      if (tableForRelease != null && reservedNotBuffered.isNotEmpty) {
-        try {
-          await writeBufferManager.releaseReservedUniquesForPks(
-            table: tableForRelease,
-            recordIds: reservedNotBuffered,
-            transactionId: txId,
-          );
-        } catch (_) {}
-        reservedNotBuffered.clear();
-      }
     }
   }
 
@@ -6200,8 +6222,11 @@ class DataStoreImpl {
     final statusSlots = returnResultDetails
         ? List<ResultStatus?>.filled(records.length, null, growable: false)
         : null;
-    // Reserved but not yet successfully buffered released on abort.
-    final Set<String> outstandingReservedPks = <String>{};
+    // Update unique-reserve path ledger (insert batch uses trackPaths:false).
+    final BufferBatchReserveContext? batchReserveCtx =
+        allUniqueIndexes.isNotEmpty
+            ? writeBufferManager.createBatchReserveContext(table, txId)
+            : null;
 
     final batchYield = YieldController(
       'DataStoreImpl.batchUpdate.batch',
@@ -6212,7 +6237,7 @@ class DataStoreImpl {
       minCheckInterval: EngineCpuChunk.hotPathMinCheckInterval,
     );
     final hasNotify = notificationManager.hasListeners(schema.tableUid);
-    final bool hasSecondaryUnique = allUniqueIndexes.isNotEmpty;
+    final bool hasSecondaryUnique = batchReserveCtx != null;
     final Set<String> uniqueFieldNames = hasSecondaryUnique
         ? <String>{for (final idx in allUniqueIndexes) ...idx.fields}
         : const <String>{};
@@ -6389,10 +6414,8 @@ class DataStoreImpl {
           ));
         }
 
-        // 4. Create batch reserve context only when secondary unique indexes exist.
-        final batchContext = hasSecondaryUnique
-            ? writeBufferManager.createBatchReserveContext(table, txId)
-            : null;
+        // 4. Reuse hoisted batchReserveCtx when secondary unique indexes exist.
+        final batchContext = batchReserveCtx;
 
         // Pre-probe foreign keys once per window if foreign keys are enabled
         final List<DbException?>? windowFkViolations;
@@ -6619,14 +6642,7 @@ class DataStoreImpl {
               }
               failedCount++;
               if (!allowPartialErrors) {
-                if (reservedPkSet.isNotEmpty) {
-                  await writeBufferManager.releaseReservedUniquesForPks(
-                    table: table,
-                    recordIds: reservedPkSet,
-                    transactionId: txId,
-                  );
-                  outstandingReservedPks.removeAll(reservedPkSet);
-                }
+                batchReserveCtx?.releaseAll();
                 return await finishWithPromoteMirror(DbResult.error(
                   type: ResultType.bizForeignKeyViolation,
                   message: fkVio.message,
@@ -6670,7 +6686,6 @@ class DataStoreImpl {
                 schema: schema,
               );
               reservedPkSet.add(pkVal);
-              outstandingReservedPks.add(pkVal);
 
               commitIndicesForUniqueCheck.add(recordsToCommit.length);
               commitGlobalIndicesForUniqueCheck.add(j);
@@ -6699,12 +6714,7 @@ class DataStoreImpl {
               }
               failedCount++;
               if (!allowPartialErrors) {
-                await writeBufferManager.releaseReservedUniquesForPks(
-                  table: table,
-                  recordIds: reservedPkSet,
-                  transactionId: txId,
-                );
-                outstandingReservedPks.removeAll(reservedPkSet);
+                reserveCtx.releaseAll();
                 return await finishWithPromoteMirror(DbResult.error(
                   type: violationType,
                   message: violationMessage,
@@ -6765,24 +6775,12 @@ class DataStoreImpl {
               failedCount++;
 
               if (reservedPkSet.contains(pkVal)) {
-                writeBufferManager.releaseReservedUniques(
-                  table: table,
-                  recordId: pkVal,
-                  transactionId: txId,
-                );
-                outstandingReservedPks.remove(pkVal);
+                batchReserveCtx?.releaseForPk(pkVal);
                 reservedPkSet.remove(pkVal);
               }
 
               if (!allowPartialErrors) {
-                if (reservedPkSet.isNotEmpty) {
-                  await writeBufferManager.releaseReservedUniquesForPks(
-                    table: table,
-                    recordIds: reservedPkSet,
-                    transactionId: txId,
-                  );
-                  outstandingReservedPks.removeAll(reservedPkSet);
-                }
+                batchReserveCtx?.releaseAll();
                 return await finishWithPromoteMirror(DbResult.error(
                   type: violation.constraintResultType,
                   message: violation.message,
@@ -6866,19 +6864,15 @@ class DataStoreImpl {
                 );
                 failedCount++;
                 if (reservedPkSet.contains(pkVal)) {
-                  writeBufferManager.releaseReservedUniques(
-                    table: table,
-                    recordId: pkVal,
-                    transactionId: txId,
-                  );
-                  outstandingReservedPks.remove(pkVal);
+                  batchReserveCtx?.releaseForPk(pkVal);
+                  reservedPkSet.remove(pkVal);
                 }
               }
             }
           } else {
             successCount += commitResult.successRecordIds.length;
           }
-          outstandingReservedPks.removeAll(commitResult.successRecordIds);
+          batchReserveCtx?.commitForPks(commitResult.successRecordIds);
 
           if (commitResult.successRecordIds.isNotEmpty &&
               (promoteWritten != null || hasNotify)) {
@@ -6973,19 +6967,10 @@ class DataStoreImpl {
       ));
     } finally {
       parallelJournalManager.endBatchOperation();
-      // Covers early returns (!allowPartialErrors) that never hit catch:
-      // only still-outstanding (not yet buffered/committed) pks are released;
-      // commitReservedUniques already cleared bookkeeping for successes -> no-op.
-      if (outstandingReservedPks.isNotEmpty) {
-        try {
-          await writeBufferManager.releaseReservedUniquesForPks(
-            table: table,
-            recordIds: outstandingReservedPks,
-            transactionId: txId,
-          );
-        } catch (_) {}
-        outstandingReservedPks.clear();
-      }
+      // Early returns may leave uncommitted unique reserves in the path ledger.
+      try {
+        batchReserveCtx?.releaseAll();
+      } catch (_) {}
     }
   }
 

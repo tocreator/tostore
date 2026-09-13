@@ -624,15 +624,15 @@ class LargeOperationRunner {
           if (matchedRecords.isEmpty) return true;
 
           final updates = <Map<String, dynamic>>[];
-          // PKs reserved in this chunk but not yet handed to scheduler.
-          final chunkReservedPks = <String>{};
+          // Paths reserved in this chunk but not yet handed to scheduler.
+          final chunkReservedPaths = <String, List<List<dynamic>>>{};
 
           Future<void> releaseChunkReservations() async {
-            await dataStore.writeBufferManager.releaseReservedUniquesForPks(
+            await dataStore.writeBufferManager.releaseReservedUniquesByPaths(
               table: table,
-              recordIds: chunkReservedPks,
+              pathsByPk: chunkReservedPaths,
             );
-            chunkReservedPks.clear();
+            chunkReservedPaths.clear();
           }
 
           final applyYieldController =
@@ -677,7 +677,9 @@ class LargeOperationRunner {
                   isUpdate: true,
                   changedFields: validData.keys.toSet(),
                 );
-                chunkReservedPks.add(pkValueStr);
+                if (reservedKeys.isNotEmpty) {
+                  chunkReservedPaths[pkValueStr] = reservedKeys;
+                }
               } catch (e) {
                 Logger.error(
                     'Unique constraint check failed in large-scale data update reserve',
@@ -721,7 +723,7 @@ class LargeOperationRunner {
                     rollbackKeys: reservedKeys,
                   );
                 } catch (_) {}
-                chunkReservedPks.remove(pkValueStr);
+                chunkReservedPaths.remove(pkValueStr);
                 Logger.error(
                     'Unique constraint check failed in large-scale data update',
                     rawError: e);
@@ -754,7 +756,7 @@ class LargeOperationRunner {
                     recordId: pkValueStr,
                     rollbackKeys: reservedKeys,
                   );
-                  chunkReservedPks.remove(pkValueStr);
+                  chunkReservedPaths.remove(pkValueStr);
                 }
                 updates.remove(updatedRecord);
                 Logger.error(
@@ -818,10 +820,10 @@ class LargeOperationRunner {
                 entry: entry,
                 currentCursor: nextCursor,
                 nextCursor: nextCursor,
+                reserveRollbackKeys: chunkReservedPaths.remove(pk),
               ),
               pk,
             );
-            chunkReservedPks.remove(pk);
           }
 
           dataStore.parallelJournalManager.scheduleFlushIfNeeded();

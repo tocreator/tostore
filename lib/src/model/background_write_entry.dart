@@ -33,6 +33,9 @@ class BackgroundWriteEntry {
   /// The current batch end cursor (for in-memory active intention check).
   final String? nextCursor;
 
+  /// Unique-reserve rollback paths (large update). Cleared after flush.
+  final List<List<dynamic>>? reserveRollbackKeys;
+
   /// Flag indicating if the entry is valid. If merged by a higher-priority task,
   /// this is set to false.
   bool isValid;
@@ -47,6 +50,7 @@ class BackgroundWriteEntry {
     this.specificIndexUids,
     this.currentCursor,
     this.nextCursor,
+    this.reserveRollbackKeys,
     this.isValid = true,
   });
 
@@ -60,6 +64,7 @@ class BackgroundWriteEntry {
     List<IndexUid>? specificIndexUids,
     String? currentCursor,
     String? nextCursor,
+    List<List<dynamic>>? reserveRollbackKeys,
     bool? isValid,
   }) {
     return BackgroundWriteEntry(
@@ -72,6 +77,7 @@ class BackgroundWriteEntry {
       specificIndexUids: specificIndexUids ?? this.specificIndexUids,
       currentCursor: currentCursor ?? this.currentCursor,
       nextCursor: nextCursor ?? this.nextCursor,
+      reserveRollbackKeys: reserveRollbackKeys ?? this.reserveRollbackKeys,
       isValid: isValid ?? this.isValid,
     );
   }

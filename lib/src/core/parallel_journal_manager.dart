@@ -1394,6 +1394,7 @@ class ParallelJournalManager {
                       _bufferManager.releaseReservedUniques(
                         table: tableContext,
                         recordId: bgEntry.primaryKey,
+                        rollbackKeys: bgEntry.reserveRollbackKeys,
                       );
                     } catch (_) {}
                   }
