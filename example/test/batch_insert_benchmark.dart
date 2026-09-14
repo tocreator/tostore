@@ -32,6 +32,7 @@ void main() async {
     RecoveryDurability.async,
     RecoveryDurability.standard,
   ];
+  const int warmupSize = 10000;
   const int batchSize = 100000;
   const int batches = 5;
 
@@ -88,9 +89,11 @@ void main() async {
   stdout.writeln(
       '================================================================');
   stdout.writeln('Database path:  ${tempDir.path}');
-  stdout.writeln('Records/batch:  $batchSize');
   stdout.writeln(
-      'Batches/mode:   $batches (${batchSize * batches} records per mode)');
+      'JIT warmup:     $warmupSize inserts per schema, once at startup');
+  stdout.writeln('Records/round:  $batchSize');
+  stdout
+      .writeln('Rounds/mode:    $batches (isolated: clear before each round)');
   stdout
       .writeln('Schema tiers:   ${schemaTiers.map((e) => e.label).join(', ')}');
   stdout.writeln(
@@ -101,8 +104,42 @@ void main() async {
   // Nested map: schemaLabel -> durability -> warm avg OPS
   final avgOpsMap = <String, Map<RecoveryDurability, double>>{};
 
+  final allSchemas = [
+    for (final tier in schemaTiers)
+      for (final durability in testDurabilities)
+        tier.build(_tableName(indexed: tier.indexed, durability: durability)),
+  ];
+
   try {
-    final db = await ToStore.open(dbPath: tempDir.path);
+    final db = await ToStore.open(
+      dbPath: tempDir.path,
+      schemas: allSchemas,
+    );
+
+    // Suite-level JIT warmup (once).
+    stdout.writeln(
+        'JIT warmup (once at startup): $warmupSize inserts per schema, then clear...');
+    var warmupOk = true;
+    for (final tier in schemaTiers) {
+      final tableName = _tableName(
+        indexed: tier.indexed,
+        durability: testDurabilities.first,
+      );
+      final warmupRes = await db.batchInsert(
+        tableName,
+        _generateRecords(
+          indexed: tier.indexed,
+          batchSize: warmupSize,
+          batchIndex: 1,
+          durability: testDurabilities.first,
+        ),
+        allowPartialErrors: false,
+        returnResultDetails: false,
+        durability: testDurabilities.first,
+      );
+      await db.clear(tableName);
+      warmupOk = warmupOk && !warmupRes.hasErrors;
+    }
 
     for (final tier in schemaTiers) {
       avgOpsMap[tier.label] = {};
@@ -113,29 +150,33 @@ void main() async {
           '################################################################\n');
 
       for (final durability in testDurabilities) {
-        final tablePrefix =
-            tier.indexed ? 'benchmark_indexed' : 'benchmark_simple';
-        final schema = tier.build('${tablePrefix}_${durability.name}');
-        await db.createTable(schema);
+        final tableName =
+            _tableName(indexed: tier.indexed, durability: durability);
 
         stdout.writeln(
             '>>> [${tier.label}] Durability: ${durability.name.toUpperCase()} <<<');
+
+        final roundRecords = [
+          for (int b = 1; b <= batches; b++)
+            _generateRecords(
+              indexed: tier.indexed,
+              batchSize: batchSize,
+              batchIndex: b,
+              durability: durability,
+            ),
+        ];
 
         int warmTotalElapsedMs = 0;
         int warmBatchCount = 0;
 
         for (int b = 1; b <= batches; b++) {
-          final records = _generateRecords(
-            indexed: tier.indexed,
-            batchSize: batchSize,
-            batchIndex: b,
-            durability: durability,
-          );
+          // Fixture reset: empty table + drain in-flight flush for this table.
+          await db.clear(tableName);
 
           final sw = Stopwatch()..start();
           final res = await db.batchInsert(
-            schema.name,
-            records,
+            tableName,
+            roundRecords[b - 1],
             allowPartialErrors: false,
             returnResultDetails: false,
             durability: durability,
@@ -145,7 +186,7 @@ void main() async {
           final elapsedMs = sw.elapsedMilliseconds;
           final ops = (batchSize / (sw.elapsedMicroseconds / 1000000))
               .toStringAsFixed(0);
-          final isCold = b == 1 ? ' (Cold Start + JIT)' : '';
+          final isCold = b == 1 ? ' (Cold Start)' : '';
 
           stdout.writeln(
               '  Batch $b$isCold: ${elapsedMs.toString().padLeft(4)} ms -> ${ops.padLeft(7)} OPS (success: ${!res.hasErrors})');
@@ -162,14 +203,14 @@ void main() async {
           avgOpsMap[tier.label]![durability] = avgWarmOps;
         }
 
-        // Verify sample data integrity for this table
+        // Verify last round, then wipe so leftover rows/flush do not overlap
         stdout.writeln('  Verifying sample data integrity:');
-        final sampleFirst = await db.query(schema.name).where('id', '=', '1');
+        final sampleFirst = await db.query(tableName).where('id', '=', '1');
         stdout.writeln('  First record: ${sampleFirst.data.firstOrNull}');
-        final sampleLast = await db
-            .query(schema.name)
-            .where('id', '=', '${batchSize * batches}');
+        final sampleLast =
+            await db.query(tableName).where('id', '=', '$batchSize');
         stdout.writeln('  Last record:  ${sampleLast.data.firstOrNull}');
+        await db.clear(tableName);
         stdout.writeln(
             '----------------------------------------------------------------\n');
       }
@@ -178,7 +219,7 @@ void main() async {
     // Print summary comparison
     stdout.writeln(
         '================================================================');
-    stdout.writeln(' Throughput Summary (Warm Batches 2-$batches Average)');
+    stdout.writeln(' Throughput Summary (Warm Rounds 2-$batches Average)');
     stdout.writeln(
         '================================================================');
     for (final tier in schemaTiers) {
@@ -217,6 +258,14 @@ void main() async {
     }
     exit(0);
   }
+}
+
+String _tableName({
+  required bool indexed,
+  required RecoveryDurability durability,
+}) {
+  final prefix = indexed ? 'benchmark_indexed' : 'benchmark_simple';
+  return '${prefix}_${durability.name}';
 }
 
 /// Build batch payloads matching the schema tier field layout.

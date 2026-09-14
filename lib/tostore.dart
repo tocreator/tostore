@@ -1440,6 +1440,35 @@ class ToStore implements DataStoreInterface {
     }
   }
 
+  /// Delete database directory and clean up resources directly without opening an instance.
+  ///
+  /// Safely closes any existing in-memory instance for [dbPath]/[dbName] first,
+  /// then directly deletes the database folder on disk.
+  ///
+  /// 直接删除数据库目录并释放可能存在的缓存实例，无需提前调用 open 打开。
+  static Future<void> deleteDatabaseDirect({
+    String? dbPath,
+    String? dbName,
+    DataStoreConfig? config,
+  }) async {
+    final effectiveDbPath = dbPath ?? config?.dbPath ?? 'default';
+    final effectiveDbName = dbName ?? config?.dbName ?? 'default';
+    final instanceKey = '$effectiveDbPath-$effectiveDbName';
+
+    final existingStore = _instances.remove(instanceKey);
+    if (existingStore != null) {
+      try {
+        await existingStore.close(flush: false);
+      } catch (_) {}
+    }
+
+    await DataStoreImpl.deleteDatabaseDirect(
+      dbPath: dbPath,
+      dbName: dbName,
+      config: config,
+    );
+  }
+
   /// Update table schema, supports chain operations
   /// [tableName] Table name
   ///

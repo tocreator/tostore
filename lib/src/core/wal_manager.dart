@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:collection';
+import 'dart:typed_data';
 
 import '../handler/encryption.dart';
 import '../handler/fast_wal_encoder.dart';
@@ -20,7 +21,6 @@ import '../model/table_op_meta.dart';
 import '../model/table_schema.dart' show TableSchema;
 import '../model/wal_pointer.dart';
 import 'compute/wal_decode_batch_runner.dart';
-import 'cpu_work_chunk.dart';
 import 'data_store_impl.dart';
 import 'path_manager.dart';
 import 'storage_adapter.dart';
@@ -261,8 +261,17 @@ class WalManager {
   int _currentPartitionSizeApprox = 0;
   bool _currentPartitionSizeLoaded = false;
 
-  // WAL write queue (path + binary data + pointer) for background persistence.
+  /// Encoded bytes queued for the current partition but not yet counted in
+  /// [_currentPartitionSizeApprox] (async enqueue / chunk not yet on disk).
+  int _pendingCurrentPartitionBytes = 0;
+
+  // WAL write queue (path + bytes + pointer) for background persistence.
   final Queue<_QueuedWalEntry> _walQueue = Queue<_QueuedWalEntry>();
+
+  /// Logical WAL record count in [_walQueue]. One encoded node can cover
+  /// many records ([_QueuedWalEntry.recordCount]); compaction/migration idle
+  /// checks use this, not [_walQueue.length].
+  int _queuedRecordCount = 0;
   bool _walFlushInProgress = false;
   Future<void>? _walFlushFuture;
 
@@ -305,39 +314,265 @@ class WalManager {
     return first;
   }
 
+  /// Pseudo pointers when journaling is off. Partition stays -1 so recovery
+  /// never treats them as durable WAL.
+  List<WalPointer> _disabledJournalPointers(int count) {
+    final firstSeq = _current.entrySeq + 1;
+    _current = WalPointer(
+      partitionIndex: _current.partitionIndex,
+      entrySeq: _current.entrySeq + count,
+    );
+    final result = List<WalPointer>.filled(
+      count,
+      const WalPointer(partitionIndex: -1, entrySeq: 0),
+      growable: false,
+    );
+    for (int i = 0; i < count; i++) {
+      result[i] = WalPointer(partitionIndex: -1, entrySeq: firstSeq + i);
+    }
+    return result;
+  }
+
+  void _enqueueWal(_QueuedWalEntry entry) {
+    _walQueue.add(entry);
+    _queuedRecordCount += entry.recordCount;
+  }
+
+  void _enqueueWalFirst(_QueuedWalEntry entry) {
+    _walQueue.addFirst(entry);
+    _queuedRecordCount += entry.recordCount;
+  }
+
+  _QueuedWalEntry _dequeueWal() {
+    final entry = _walQueue.removeFirst();
+    _queuedRecordCount -= entry.recordCount;
+    return entry;
+  }
+
+  void _clearWalQueue() {
+    _walQueue.clear();
+    _queuedRecordCount = 0;
+  }
+
+  void _requeueWalEntriesFront(List<_QueuedWalEntry> entries) {
+    for (int i = entries.length - 1; i >= 0; i--) {
+      _enqueueWalFirst(entries[i]);
+    }
+  }
+
+  /// [_appended] must never move backwards: a later batch completing after a
+  /// concurrent direct write would otherwise hide already-durable seqs.
+  void _advanceAppended(WalPointer pointer) {
+    if (pointer.partitionIndex < 0) return;
+    if (_isPointerNewerThan(_appended, pointer)) return;
+    _appended = pointer;
+  }
+
+  /// Track bytes landed on the current partition.
+  ///
+  /// [writeOffset] is the pre-write file length from `appendBytes[Sync]`. On
+  /// the first observation after startup/recovery that is the real on-disk
+  /// size — using it avoids a separate `getFileSize` and prevents the async
+  /// size-load from clobbering bytes already appended in the race window.
+  void _accountAppendedBytes({
+    required int partitionIndex,
+    required int writeOffset,
+    required int byteCount,
+  }) {
+    if (byteCount <= 0 || writeOffset < 0) return;
+    _durableDirtyPartitions.add(partitionIndex);
+    if (partitionIndex != _current.partitionIndex) return;
+    final int endSize = writeOffset + byteCount;
+    _currentPartitionSizeLoaded = true;
+    // appendBytesSync returns the pre-write length; endSize is the on-disk
+    // size after this write. Prefer it over += to avoid drift. If the offset
+    // cache lags behind, fall back to incrementing.
+    if (endSize > _currentPartitionSizeApprox) {
+      _currentPartitionSizeApprox = endSize;
+    } else {
+      _currentPartitionSizeApprox += byteCount;
+    }
+    if (_pendingCurrentPartitionBytes > 0) {
+      _pendingCurrentPartitionBytes -= byteCount;
+      if (_pendingCurrentPartitionBytes < 0) {
+        _pendingCurrentPartitionBytes = 0;
+      }
+    }
+  }
+
+  void _clearPartitionSizeTracking({required bool sizeKnown}) {
+    _currentPartitionSizeApprox = 0;
+    _pendingCurrentPartitionBytes = 0;
+    _currentPartitionSizeLoaded = sizeKnown;
+  }
+
+  int get _filledCurrentPartitionBytes =>
+      _currentPartitionSizeApprox + _pendingCurrentPartitionBytes;
+
+  int _chunkLimitForCurrentPartition() {
+    final int maxSize = _config.maxLogPartitionFileSize;
+    if (!_currentPartitionSizeLoaded && _pendingCurrentPartitionBytes == 0) {
+      return maxSize;
+    }
+    final int left = maxSize - _filledCurrentPartitionBytes;
+    // 0 => encode exactly one complete record, then rotate/flush.
+    return left > 0 ? left : 0;
+  }
+
+  bool _rotateIfCurrentPartitionFullSync() {
+    if (!_currentPartitionSizeLoaded && _pendingCurrentPartitionBytes == 0) {
+      return false;
+    }
+    if (_filledCurrentPartitionBytes < _config.maxLogPartitionFileSize) {
+      return false;
+    }
+    final pIdx = _current.partitionIndex;
+    return _rotatePartitionSync(pIdx, _getWalPartitionLogPathCached(pIdx));
+  }
+
+  void _publishRangeIfFirst(int pIdx) {
+    if (_publishExistingPartitionRange(pIdx)) {
+      unawaited(persistMeta(flush: false));
+    }
+  }
+
+  /// Rotate if the current partition is already full, then claim one seq.
+  WalPointer _claimRecordOnWritablePartition() {
+    _rotateIfCurrentPartitionFullSync();
+    final pIdx = _current.partitionIndex;
+    _publishRangeIfFirst(pIdx);
+    final seq = _claimEntrySeqRange(1);
+    return WalPointer(partitionIndex: pIdx, entrySeq: seq);
+  }
+
+  void _enqueueRawWal({
+    required Map<String, dynamic> entry,
+    required WalPointer pointer,
+    bool reserveHint = false,
+  }) {
+    entry['p'] = pointer.partitionIndex;
+    entry['seq'] = pointer.entrySeq;
+    _enqueueWal(_QueuedWalEntry(
+      path: _getWalPartitionLogPathCached(pointer.partitionIndex),
+      rawEntry: entry,
+      pointer: pointer,
+    ));
+    if (reserveHint) {
+      _reserveQueuedRecordHint();
+    }
+  }
+
+  /// Cheap size hint so async raw-entry enqueue can rotate before the pump.
+  void _reserveQueuedRecordHint({int count = 1}) {
+    final avg = _dataStore.tableDataManager.averageTableRecordSizeBytes;
+    final one = (avg != null && avg > 0) ? avg + 64 : 128;
+    _pendingCurrentPartitionBytes += one * count;
+  }
+
+  /// Direct-to-OS append of [buf]. Returns false if the caller should enqueue.
+  bool _tryAppendBufferSync({
+    required String path,
+    required int partitionIndex,
+    required FastWalBuffer buf,
+    required WalPointer lastPointer,
+  }) {
+    if (buf.length <= 0) return true;
+    try {
+      final off = _dataStore.storage.appendBytesSync(path, buf.bytesView);
+      if (off < 0) return false;
+      _accountAppendedBytes(
+        partitionIndex: partitionIndex,
+        writeOffset: off,
+        byteCount: buf.length,
+      );
+      _advanceAppended(lastPointer);
+      try {
+        StorageAdapter.notifyRecoveryWrite();
+      } catch (_) {}
+      return true;
+    } catch (e) {
+      Logger.error('Direct sync WAL append failed for path: $path',
+          rawError: e);
+      return false;
+    }
+  }
+
+  /// Record that WAL files now exist for [pIdx]. Returns true when this call
+  /// is the one that published the range and meta still needs a disk write.
+  bool _publishExistingPartitionRange(int pIdx) {
+    if (_meta.existingStartPartitionIndex >= 0 &&
+        _meta.existingEndPartitionIndex >= 0) {
+      return false;
+    }
+    _meta.existingStartPartitionIndex = pIdx;
+    _meta.existingEndPartitionIndex = pIdx;
+    _partitionRangePersistPending = true;
+    return true;
+  }
+
+  Future<void> _awaitPartitionRangePersisted() async {
+    if (!_partitionRangePersistPending) return;
+    await persistMeta(flush: false, throwOnError: true);
+  }
+
   /// Synchronously drain [_walQueue] into OS page cache (and fsync when durable).
   /// Returns `true` only when the queue is empty afterwards.
   ///
   /// Safe to call ONLY when `!_walFlushInProgress` to avoid out-of-order writes
   /// and concurrent file handle conflicts with background flushes.
+  ///
+  /// Write failures leave the failed entries at the head of [_walQueue] so the
+  /// async pump can retry (e.g. Web `appendBytesSync` returns -1).
   bool _drainWalQueueSync({required RecoveryDurability durability}) {
     if (_walQueue.isEmpty) return true;
     if (_walFlushInProgress) return false;
 
-    FastWalBuffer? customBuf;
-    FastWalBuffer buf;
-    if (!_batchSyncBufferInUse) {
-      _batchSyncBufferInUse = true;
-      buf = _batchSyncBuffer;
-      buf.reset();
-    } else {
-      buf = customBuf = FastWalBuffer(capacity: 64 * 1024);
-    }
+    final locked = _lockBatchEncodeBuffer();
+    final FastWalBuffer buf = locked.$1;
+    final FastWalBuffer? customBuf = locked.$2;
 
     final paths = <String>{};
+    var failed = false;
+    List<_QueuedWalEntry>? inFlight;
     try {
       while (_walQueue.isNotEmpty && !_walFlushInProgress) {
+        inFlight = null;
         final currentPath = _walQueue.first.path;
+        final first = _walQueue.first;
+        if (first.encoded != null) {
+          final bytes = first.encoded!;
+          final off = _dataStore.storage.appendBytesSync(
+            currentPath,
+            bytes,
+          );
+          if (off < 0) {
+            failed = true;
+            break;
+          }
+          final qEntry = _dequeueWal();
+          _accountAppendedBytes(
+            partitionIndex: qEntry.pointer.partitionIndex,
+            writeOffset: off,
+            byteCount: bytes.length,
+          );
+          _advanceAppended(qEntry.pointer);
+          paths.add(currentPath);
+          continue;
+        }
+
         buf.reset();
-        int lastPartition = _walQueue.first.pointer.partitionIndex;
+        inFlight = <_QueuedWalEntry>[];
+        int lastPartition = first.pointer.partitionIndex;
         WalPointer? lastPointer;
 
-        // Chunk contiguous entries targeting the same path into buf (up to 512KB)
+        // Chunk contiguous raw entries targeting the same path into buf (up to 512KB)
         while (_walQueue.isNotEmpty &&
             _walQueue.first.path == currentPath &&
+            _walQueue.first.encoded == null &&
             buf.length < 512 * 1024) {
-          final qEntry = _walQueue.removeFirst();
-          FastWalEncoder.encodeEntryIntoBuffer(qEntry.rawEntry, buf);
+          final qEntry = _dequeueWal();
+          inFlight.add(qEntry);
+          FastWalEncoder.encodeEntryIntoBuffer(qEntry.rawEntry!, buf);
           lastPartition = qEntry.pointer.partitionIndex;
           lastPointer = qEntry.pointer;
         }
@@ -348,37 +583,50 @@ class WalManager {
             buf.bytesView,
           );
           if (off < 0) {
-            return false;
+            _requeueWalEntriesFront(inFlight);
+            inFlight = null;
+            failed = true;
+            break;
           }
           final int written = buf.length;
-          _durableDirtyPartitions.add(lastPartition);
-          if (lastPartition == _current.partitionIndex) {
-            _currentPartitionSizeApprox += written;
-          }
+          _accountAppendedBytes(
+            partitionIndex: lastPartition,
+            writeOffset: off,
+            byteCount: written,
+          );
           if (lastPointer != null) {
-            _appended = lastPointer;
+            _advanceAppended(lastPointer);
           }
           paths.add(currentPath);
+        } else if (inFlight.isNotEmpty) {
+          _requeueWalEntriesFront(inFlight);
+          inFlight = null;
+          failed = true;
+          break;
         }
+        inFlight = null;
       }
     } catch (e) {
       Logger.error('Sync WAL queue drain failed', rawError: e);
-      return false;
-    } finally {
-      if (customBuf == null) {
-        _batchSyncBufferInUse = false;
+      if (inFlight != null && inFlight.isNotEmpty) {
+        _requeueWalEntriesFront(inFlight);
       }
+      failed = true;
+    } finally {
+      _unlockBatchEncodeBuffer(customBuf);
     }
 
-    try {
-      StorageAdapter.notifyRecoveryWrite();
-    } catch (_) {}
-    if (durability == RecoveryDurability.durable) {
-      for (final path in paths) {
-        _flushDurableSync(path);
+    if (paths.isNotEmpty) {
+      try {
+        StorageAdapter.notifyRecoveryWrite();
+      } catch (_) {}
+      if (durability == RecoveryDurability.durable) {
+        for (final path in paths) {
+          _flushDurableSync(path);
+        }
       }
     }
-    return _walQueue.isEmpty;
+    return !failed && _walQueue.isEmpty;
   }
 
   // Directory mapping cache
@@ -408,14 +656,21 @@ class WalManager {
     return path;
   }
 
-  // Mutex for persistMeta to prevent concurrent writes
-  // Use coalescing strategy: only the latest persistMeta needs to execute
+  // Mutex for persistMeta: one writer, waiters share the cycle result.
+  // Flush/backup/throw flags OR across coalesced callers so a later
+  // persistMeta(flush: false) cannot drop an earlier flush:true / backupOld.
   bool _persistMetaInProgress = false;
-  Completer<void>? _nextPersistMetaCompleter; // Only the latest waiting request
+  Completer<void>? _persistMetaIdle;
+  bool _persistMetaWantFlush = false;
+  bool _persistMetaWantBackup = false;
+  bool _persistMetaWantThrow = false;
+  Object? _persistMetaCycleError;
+  bool _partitionRangePersistPending = false;
 
   /// Partition rotation mutex and in-flight future
   bool _rotateInProgress = false;
   Future<void>? _rotateFuture;
+  bool _loggedRotateDeferred = false;
 
   /// WAL partition indices with bytes written since last durable storage flush.
   Set<int> _durableDirtyPartitions = <int>{};
@@ -438,10 +693,9 @@ class WalManager {
   /// queued entries waiting to be written.
   WalPointer get appendedPointer => _appended;
 
-  /// Current in-memory WAL write queue length (pending persistence).
-  ///
-  /// This is used as a high-load signal for incremental partitioning.
-  int get pendingQueueLength => _walQueue.length;
+  /// Current WAL write queue, in logical records (an encoded chunk of 50k
+  /// rows still counts as 50000 so idle/compaction signals stay honest).
+  int get pendingQueueLength => _queuedRecordCount;
 
   bool get hasPendingParallelBatches => _meta.pendingBatches.isNotEmpty;
 
@@ -458,6 +712,9 @@ class WalManager {
   bool isPointerFlushed(WalPointer pointer) {
     if (!_config.enableJournal) return true;
     if (pointer.partitionIndex < 0) return true;
+    // First-partition meta must be visible to recovery before we admit durable
+    // success; otherwise a crash leaves WAL bytes that startup will skip.
+    if (_partitionRangePersistPending) return false;
     return isAtOrBefore(pointer, _appended);
   }
 
@@ -483,6 +740,15 @@ class WalManager {
   /// Destroys all WAL data (files and metadata) permanently.
   /// Used when disabling journaling to ensure no stale data remains.
   Future<void> destroyWal() async {
+    _clearWalQueue();
+    final inFlight = _walFlushFuture;
+    if (inFlight != null) {
+      try {
+        await inFlight;
+      } catch (_) {}
+    }
+    _clearWalQueue();
+
     // 1. Delete all partition files and metadata
     //    Efficiently delete the entire WAL directory
     try {
@@ -503,8 +769,11 @@ class WalManager {
     // Reset directory mapping
     _directoryMapping = null;
     _currentPartitionDirIndex = 0;
-    _currentPartitionSizeLoaded = false;
-    _currentPartitionSizeApprox = 0;
+    _clearPartitionSizeTracking(sizeKnown: false);
+    _partitionRangePersistPending = false;
+    _cachedWalPartitionIndex = -1;
+    _cachedWalPartitionPath = null;
+    _cachedWalSpaceName = null;
     _clearDurableDirtyState();
 
     Logger.info('WAL destroyed.');
@@ -525,8 +794,7 @@ class WalManager {
           _currentPartitionDirIndex = 0;
           _current = const WalPointer(partitionIndex: 0, entrySeq: 0);
           _appended = const WalPointer(partitionIndex: 0, entrySeq: 0);
-          _currentPartitionSizeLoaded = true;
-          _currentPartitionSizeApprox = 0;
+          _clearPartitionSizeTracking(sizeKnown: true);
           _initialized = true;
           return;
         }
@@ -645,8 +913,7 @@ class WalManager {
             entrySeq: _meta.checkpoint.entrySeq,
           );
         }
-        _currentPartitionSizeLoaded = false;
-        _currentPartitionSizeApprox = 0;
+        _clearPartitionSizeTracking(sizeKnown: false);
 
         _ensureCurrentPartitionSizeLoaded();
 
@@ -726,7 +993,7 @@ class WalManager {
   @pragma('vm:prefer-inline')
   bool get _needsPartitionRotation =>
       !_currentPartitionSizeLoaded ||
-      _currentPartitionSizeApprox >= _config.maxLogPartitionFileSize;
+      _filledCurrentPartitionBytes >= _config.maxLogPartitionFileSize;
 
   /// Rotate before assigning path/seq when the active partition already meets
   /// [DataStoreConfig.maxLogPartitionFileSize], so new entries land on a
@@ -735,7 +1002,7 @@ class WalManager {
     if (!_currentPartitionSizeLoaded) {
       await _ensureCurrentPartitionSizeLoaded();
     }
-    if (_currentPartitionSizeApprox >= _config.maxLogPartitionFileSize) {
+    if (_filledCurrentPartitionBytes >= _config.maxLogPartitionFileSize) {
       await _rotatePartition();
     }
   }
@@ -744,7 +1011,7 @@ class WalManager {
   ///
   /// - Hard: current partition encoded size already >= limit.
   /// - Predictive: remaining queue for this partition would push us over;
-  ///   rotate so subsequent [append]/[appendBatch] use the next file.
+  ///   rotate so subsequent [append]/[appendBatchDirect] use the next file.
   /// Already-queued entries keep their assigned path/p/seq (soft overrun).
   Future<void> _maybeRotateAfterAppend({
     required int writtenBytes,
@@ -752,18 +1019,33 @@ class WalManager {
     required bool wroteToCurrentPartition,
   }) async {
     if (wroteToCurrentPartition &&
-        _currentPartitionSizeApprox >= _config.maxLogPartitionFileSize) {
+        _filledCurrentPartitionBytes >= _config.maxLogPartitionFileSize) {
       await _rotatePartition();
       return;
     }
     if (entryCount <= 0 || _walQueue.isEmpty) return;
-    if (_walQueue.first.pointer.partitionIndex != _current.partitionIndex) {
+    final head = _walQueue.first;
+    if (head.pointer.partitionIndex != _current.partitionIndex) {
       return;
     }
-    final int avgSize = (writtenBytes / entryCount).ceil();
-    final int estimatedBacklog = _walQueue.length * avgSize;
-    if (_currentPartitionSizeApprox + estimatedBacklog >
-        _config.maxLogPartitionFileSize) {
+    final int maxSize = _config.maxLogPartitionFileSize;
+    final int remaining = maxSize > _currentPartitionSizeApprox
+        ? maxSize - _currentPartitionSizeApprox
+        : 0;
+    if (remaining == 0) {
+      await _rotatePartition();
+      return;
+    }
+    // O(1): already-queued nodes for this partition share [_current] until a
+    // rotate; [_queuedRecordCount] is the full remaining logical backlog.
+    // Over-estimate (rotate a bit early) is cheap; a 64-node prefix would miss
+    // a large tail and keep stuffing new appends into an overflowing file.
+    final int avgSize =
+        writtenBytes <= 0 ? 1 : (writtenBytes / entryCount).ceil();
+    final int estimatedBacklog =
+        (avgSize < 1 ? 1 : avgSize) * _queuedRecordCount;
+    final int headBytes = head.encoded?.length ?? 0;
+    if (headBytes > remaining || estimatedBacklog > remaining) {
       await _rotatePartition();
     }
   }
@@ -779,62 +1061,32 @@ class WalManager {
 
     // If journal disabled, still create a pseudo pointer to maintain order in memory
     if (!_config.enableJournal) {
-      // In-memory only; WAL meta is not used for recovery when journal is disabled.
-      _current = WalPointer(
-        partitionIndex: _current.partitionIndex,
-        entrySeq: _current.entrySeq + 1,
-      );
-      return WalPointer(partitionIndex: -1, entrySeq: _current.entrySeq);
+      return _disabledJournalPointers(1).first;
     }
 
     if (_needsPartitionRotation) {
       await _ensureWritablePartition();
     }
 
-    final pIdx = _current.partitionIndex;
-    final nextSeq = _current.entrySeq + 1;
-
-    _current = WalPointer(
-      partitionIndex: _current.partitionIndex,
-      entrySeq: nextSeq,
-    );
-
-    // Embed physical WAL pointer into the entry itself so that recovery can
-    // efficiently determine the last WAL pointer by reading only the tail of
-    // the last partition file.
-    // Mutate in place -- same ownership contract as appendBatch: callers own
-    // the map and must not reuse it after enqueue.
+    final pointer = _claimRecordOnWritablePartition();
+    final pIdx = pointer.partitionIndex;
     walEntry['p'] = pIdx;
-    walEntry['seq'] = nextSeq;
-
+    walEntry['seq'] = pointer.entrySeq;
     final path = _getWalPartitionLogPathCached(pIdx);
-
-    // Initialize existing partition range on first write to avoid later scans
-    if (_meta.existingStartPartitionIndex < 0 ||
-        _meta.existingEndPartitionIndex < 0) {
-      _meta.existingStartPartitionIndex = pIdx;
-      _meta.existingEndPartitionIndex = pIdx;
-      // We can persist update meta asynchronously
-      persistMeta(flush: false);
-    }
 
     final effDurability = durability ?? _config.defaultRecoveryDurability;
 
     // Fast path for async durability:
     // enqueue to memory queue and return immediately
     if (effDurability == RecoveryDurability.async) {
-      _walQueue.add(_QueuedWalEntry(
-        path: path,
-        rawEntry: walEntry,
-        pointer: _current,
-      ));
+      _enqueueRawWal(entry: walEntry, pointer: pointer, reserveHint: true);
       scheduleFlushIfNeeded();
-      return WalPointer(partitionIndex: pIdx, entrySeq: _current.entrySeq);
+      return pointer;
     }
 
     // Direct-to-OS fast path: synchronous write into OS page cache
     bool directWritten = false;
-    if (_walQueue.isEmpty) {
+    if (_walQueue.isEmpty && !_walFlushInProgress && !_directBatchInProgress) {
       try {
         final buf = _directSyncBuffer;
         buf.reset();
@@ -845,9 +1097,12 @@ class WalManager {
         );
         if (writtenOffset >= 0) {
           final int writtenBytes = buf.length;
-          _durableDirtyPartitions.add(pIdx);
-          _currentPartitionSizeApprox += writtenBytes;
-          _appended = _current;
+          _accountAppendedBytes(
+            partitionIndex: pIdx,
+            writeOffset: writtenOffset,
+            byteCount: writtenBytes,
+          );
+          _advanceAppended(pointer);
           directWritten = true;
           try {
             StorageAdapter.notifyRecoveryWrite();
@@ -862,7 +1117,7 @@ class WalManager {
         if (effDurability == RecoveryDurability.durable) {
           _flushDurableSync(path);
         }
-        if (_currentPartitionSizeApprox >= _config.maxLogPartitionFileSize) {
+        if (_filledCurrentPartitionBytes >= _config.maxLogPartitionFileSize) {
           await _rotatePartition();
         }
       }
@@ -870,11 +1125,7 @@ class WalManager {
 
     if (!directWritten) {
       // Enqueue into WAL write queue for background persistence as fallback
-      _walQueue.add(_QueuedWalEntry(
-        path: path,
-        rawEntry: walEntry,
-        pointer: _current,
-      ));
+      _enqueueRawWal(entry: walEntry, pointer: pointer, reserveHint: true);
       if (effDurability != RecoveryDurability.async) {
         await flushQueueCompletely();
         if (effDurability == RecoveryDurability.durable) {
@@ -885,9 +1136,13 @@ class WalManager {
       }
     }
 
+    if (effDurability != RecoveryDurability.async) {
+      await _awaitPartitionRangePersisted();
+    }
+
     // Persist meta lazily; rotation/checkpoint will persist. Return the precise
     // in-memory WAL pointer for this entry.
-    return WalPointer(partitionIndex: pIdx, entrySeq: _current.entrySeq);
+    return pointer;
   }
 
   String _cachedTimestampIso = DateTime.now().toIso8601String();
@@ -924,24 +1179,13 @@ class WalManager {
     }
 
     if (!_config.enableJournal) {
-      _current = WalPointer(
-        partitionIndex: _current.partitionIndex,
-        entrySeq: _current.entrySeq + 1,
-      );
-      return WalPointer(partitionIndex: -1, entrySeq: _current.entrySeq);
+      return _disabledJournalPointers(1).first;
     }
 
-    final pIdx = _current.partitionIndex;
-    final nextSeq = _claimEntrySeqRange(1);
+    final pointer = _claimRecordOnWritablePartition();
+    final pIdx = pointer.partitionIndex;
+    final nextSeq = pointer.entrySeq;
     final path = _getWalPartitionLogPathCached(pIdx);
-    final pointer = WalPointer(partitionIndex: pIdx, entrySeq: nextSeq);
-
-    if (_meta.existingStartPartitionIndex < 0 ||
-        _meta.existingEndPartitionIndex < 0) {
-      _meta.existingStartPartitionIndex = pIdx;
-      _meta.existingEndPartitionIndex = pIdx;
-      persistMeta(flush: false);
-    }
 
     final effDurability = durability ?? _config.defaultRecoveryDurability;
     final actualTsIso = tsIso ?? _currentTimestampIso;
@@ -958,11 +1202,7 @@ class WalManager {
         };
 
     if (effDurability == RecoveryDurability.async) {
-      _walQueue.add(_QueuedWalEntry(
-        path: path,
-        rawEntry: buildEntry(),
-        pointer: pointer,
-      ));
+      _enqueueRawWal(entry: buildEntry(), pointer: pointer, reserveHint: true);
       scheduleFlushIfNeeded();
       return pointer;
     }
@@ -990,19 +1230,22 @@ class WalManager {
         );
         if (writtenOffset >= 0) {
           final int writtenBytes = buf.length;
-          _durableDirtyPartitions.add(pIdx);
-          _currentPartitionSizeApprox += writtenBytes;
-          _appended = pointer;
+          _accountAppendedBytes(
+            partitionIndex: pIdx,
+            writeOffset: writtenOffset,
+            byteCount: writtenBytes,
+          );
+          _advanceAppended(pointer);
           try {
             StorageAdapter.notifyRecoveryWrite();
           } catch (_) {}
           if (effDurability == RecoveryDurability.durable) {
             _flushDurableSync(path);
           }
-          if (_currentPartitionSizeApprox >= _config.maxLogPartitionFileSize) {
+          if (_filledCurrentPartitionBytes >= _config.maxLogPartitionFileSize) {
             _rotatePartitionSync(pIdx, path);
           }
-          // Soft overrun OK: next append()/appendBatch or background rotation will rotate.
+          // Soft overrun OK: next append or background rotation will rotate.
           return pointer;
         }
       } catch (e) {
@@ -1022,11 +1265,7 @@ class WalManager {
     }
 
     // Queued / fallback path: enqueue this entry
-    _walQueue.add(_QueuedWalEntry(
-      path: path,
-      rawEntry: buildEntry(),
-      pointer: pointer,
-    ));
+    _enqueueRawWal(entry: buildEntry(), pointer: pointer, reserveHint: true);
 
     // Attempt synchronous drain only when no background pump is actively running
     if (!_walFlushInProgress) {
@@ -1042,220 +1281,153 @@ class WalManager {
     return pointer;
   }
 
-  /// Append multiple WAL entries in a single batch. Returns their pointers.
-  ///
-  /// This is significantly faster than calling [append] in a loop for large
-  /// datasets (10k+ entries) because it minimizes microtask yields and allows
-  /// the background flush pump to process the entries more efficiently.
-  Future<List<WalPointer>> appendBatch(
-    List<Map<String, dynamic>> walEntries, {
-    RecoveryDurability? durability,
-  }) async {
-    if (!_initialized) {
-      await initializeAndRecover();
+  (FastWalBuffer, FastWalBuffer?) _lockBatchEncodeBuffer() {
+    if (!_batchSyncBufferInUse) {
+      _batchSyncBufferInUse = true;
+      _batchSyncBuffer.reset();
+      return (_batchSyncBuffer, null);
     }
-
-    if (walEntries.isEmpty) return const <WalPointer>[];
-
-    // If journal disabled, still create pseudo pointers to maintain order in memory
-    if (!_config.enableJournal) {
-      final count = walEntries.length;
-      final pIdx = _current.partitionIndex;
-      final firstSeq = _current.entrySeq + 1;
-      _current = WalPointer(
-        partitionIndex: pIdx,
-        entrySeq: _current.entrySeq + count,
-      );
-      final result = List<WalPointer>.filled(count, _current, growable: false);
-      for (int i = 0; i < count; i++) {
-        result[i] = WalPointer(partitionIndex: -1, entrySeq: firstSeq + i);
-      }
-      return result;
-    }
-
-    if (_needsPartitionRotation ||
-        _currentPartitionSizeApprox >= _config.maxLogPartitionFileSize) {
-      await _ensureWritablePartition();
-    }
-
-    int pIdx = _current.partitionIndex;
-    int dirIndex = _getOrAllocateDirIndexForPartition(pIdx);
-    String path = _dataStore.pathManager.getWalPartitionLogPath(
-      dirIndex,
-      pIdx,
-      spaceName: _dataStore.currentSpaceName,
-    );
-
-    // Publish range before the yield loop so a concurrent flush rotate cannot
-    // treat existingStart as uninitialized and drop the first partition.
-    if (_meta.existingStartPartitionIndex < 0 ||
-        _meta.existingEndPartitionIndex < 0) {
-      _meta.existingStartPartitionIndex = pIdx;
-      _meta.existingEndPartitionIndex = pIdx;
-      persistMeta(flush: false);
-    }
-
-    final yieldController =
-        _dataStore.parallelJournalManager.activeBatchOperationCount > 0
-            ? YieldController(
-                'WalManager.appendBatch',
-                minCheckInterval: EngineCpuChunk.fastPathMinCheckInterval,
-              )
-            : YieldController('WalManager.appendBatch');
-
-    final effDurability = durability ?? _config.defaultRecoveryDurability;
-    final int count = walEntries.length;
-    final int firstSeq = _claimEntrySeqRange(count);
-    final List<WalPointer> pointers =
-        List<WalPointer>.filled(count, _current, growable: false);
-
-    // Fast path for async durability:
-    // enqueue to memory queue and return immediately
-    if (effDurability == RecoveryDurability.async) {
-      for (int i = 0; i < count; i++) {
-        final y = yieldController.maybeYield();
-        if (y != null) await y;
-
-        final pointer =
-            WalPointer(partitionIndex: pIdx, entrySeq: firstSeq + i);
-        pointers[i] = pointer;
-        final entry = walEntries[i];
-        entry['p'] = pIdx;
-        entry['seq'] = pointer.entrySeq;
-
-        _walQueue.add(_QueuedWalEntry(
-          path: path,
-          rawEntry: entry,
-          pointer: pointer,
-        ));
-      }
-
-      scheduleFlushIfNeeded();
-      return pointers;
-    }
-
-    // Direct-to-OS fast path: encode into buffer and write synchronously
-    if (!_walFlushInProgress && !_directBatchInProgress && _walQueue.isEmpty) {
-      _directBatchInProgress = true;
-      FastWalBuffer? customBuf;
-      FastWalBuffer buf;
-      if (!_batchSyncBufferInUse) {
-        _batchSyncBufferInUse = true;
-        buf = _batchSyncBuffer;
-        buf.reset();
-      } else {
-        buf = customBuf = FastWalBuffer(capacity: 64 * 1024);
-      }
-
-      try {
-        for (int i = 0; i < count; i++) {
-          final y = yieldController.maybeYield();
-          if (y != null) await y;
-
-          final pointer =
-              WalPointer(partitionIndex: pIdx, entrySeq: firstSeq + i);
-          pointers[i] = pointer;
-          final entry = walEntries[i];
-          entry['p'] = pIdx;
-          entry['seq'] = pointer.entrySeq;
-
-          FastWalEncoder.encodeEntryIntoBuffer(entry, buf);
-        }
-
-        bool directSuccess = false;
-        if (buf.length > 0) {
-          try {
-            final off = _dataStore.storage.appendBytesSync(path, buf.bytesView);
-            if (off >= 0) {
-              _durableDirtyPartitions.add(pIdx);
-              _currentPartitionSizeApprox += buf.length;
-              _appended = pointers.last;
-              directSuccess = true;
-              try {
-                StorageAdapter.notifyRecoveryWrite();
-              } catch (_) {}
-            }
-          } catch (e) {
-            Logger.error('Direct sync batch WAL append failed for path: $path',
-                rawError: e);
-            directSuccess = false;
-          }
-        } else {
-          directSuccess = true;
-        }
-
-        if (directSuccess) {
-          if (effDurability == RecoveryDurability.durable) {
-            _flushDurableSync(path);
-          }
-          if (_currentPartitionSizeApprox >= _config.maxLogPartitionFileSize) {
-            try {
-              await _rotatePartition();
-            } catch (e) {
-              Logger.warn('WAL post-batch partition rotation failed',
-                  rawError: e);
-            }
-          }
-          return pointers;
-        }
-      } finally {
-        _directBatchInProgress = false;
-        if (customBuf == null) {
-          _batchSyncBufferInUse = false;
-        }
-      }
-
-      // Fallback: enqueue on failure (entries already have p/seq assigned)
-      for (int i = 0; i < count; i++) {
-        final entry = walEntries[i];
-        entry['p'] = pointers[i].partitionIndex;
-        entry['seq'] = pointers[i].entrySeq;
-        _walQueue.add(_QueuedWalEntry(
-          path: path,
-          rawEntry: entry,
-          pointer: pointers[i],
-        ));
-      }
-      await ensureAppendedUpTo(
-        pointers.last,
-        flushToStorage: effDurability == RecoveryDurability.durable,
-      );
-      if (effDurability == RecoveryDurability.durable) {
-        _flushDurableSync(path);
-      }
-      return pointers;
-    }
-
-    // Standard queued fallback path if _walQueue already has pending entries
-    for (int i = 0; i < count; i++) {
-      final y = yieldController.maybeYield();
-      if (y != null) await y;
-
-      final pointer = WalPointer(partitionIndex: pIdx, entrySeq: firstSeq + i);
-      pointers[i] = pointer;
-      final entry = walEntries[i];
-      entry['p'] = pIdx;
-      entry['seq'] = pointer.entrySeq;
-
-      _walQueue.add(_QueuedWalEntry(
-        path: path,
-        rawEntry: entry,
-        pointer: pointer,
-      ));
-    }
-
-    await ensureAppendedUpTo(
-      pointers.last,
-      flushToStorage: effDurability == RecoveryDurability.durable,
-    );
-    if (effDurability == RecoveryDurability.durable) {
-      _flushDurableSync(path);
-    }
-
-    return pointers;
+    final custom = FastWalBuffer(capacity: 64 * 1024);
+    return (custom, custom);
   }
 
-  /// Direct streaming batch WAL append avoiding intermediate wrapper Maps and redundant lookups.
+  void _unlockBatchEncodeBuffer(FastWalBuffer? customBuf) {
+    if (customBuf == null) {
+      _batchSyncBufferInUse = false;
+    }
+  }
+
+  int _encodeRecordsDirectToBuffer({
+    required FastWalBuffer buf,
+    required int op,
+    required String tableUid,
+    required String tsIso,
+    required List<Map<String, dynamic>> records,
+    required List<WalPointer> pointers,
+    int start = 0,
+    int? stopAfterBytes,
+    required int pIdx,
+    required TableSchema schema,
+    String? transactionId,
+    List<Map<String, dynamic>?>? oldValuesList,
+    required bool hasOldValues,
+  }) {
+    final int count = records.length;
+    if (start >= count) return 0;
+    FastWalTableSession? tableSession;
+    FastWalBatchSession? batchSession;
+    if (schema.fields.isNotEmpty) {
+      tableSession = FastWalTableSession.create(
+        op: op,
+        tableUid: tableUid,
+        tsIso: tsIso,
+        partitionIndex: pIdx,
+        schema: schema,
+        txId: transactionId,
+        hasOldValues: hasOldValues,
+      );
+    } else {
+      batchSession = FastWalBatchSession.create(
+        op: op,
+        tableUid: tableUid,
+        tsIso: tsIso,
+        partitionIndex: pIdx,
+        txId: transactionId,
+        hasOldValues: hasOldValues,
+      );
+    }
+
+    int recEst = tableSession?.estimatedRecordBytes ?? 128;
+    final avgDataBytes =
+        _dataStore.tableDataManager.averageTableRecordSizeBytes;
+    if (avgDataBytes != null && avgDataBytes > 0) {
+      final int adjusted = avgDataBytes + 64;
+      if (adjusted > recEst) {
+        recEst = adjusted;
+      }
+    }
+    // Probe-encode the first row so the first large batch commits ~1x the
+    // real WAL size instead of a 2x schema formula (cold-start memset).
+    // Also warms the encoder on Dart VM JIT before the tight loop.
+    if (tableSession != null && start == 0 && (count - start) >= 32) {
+      try {
+        final Map<String, dynamic>? probeOld =
+            (oldValuesList != null && oldValuesList.isNotEmpty)
+                ? oldValuesList[0]
+                : null;
+        tableSession.encodeRecordDirect(
+          buf,
+          records[0],
+          0,
+          probeOld,
+          false,
+        );
+        final int probed = buf.length;
+        buf.reset();
+        if (probed > 0) {
+          recEst = probed + (probed >> 3);
+        }
+      } catch (_) {
+        buf.reset();
+      }
+    }
+    final int remainRecords = count - start;
+    int hint = remainRecords * recEst + 4096;
+    if (stopAfterBytes != null) {
+      final int cap = stopAfterBytes + recEst + 4096;
+      if (hint > cap) hint = cap;
+    }
+    buf.ensureAvailable(hint);
+
+    final olds = oldValuesList;
+    var encoded = 0;
+    for (int i = start; i < count; i++) {
+      if (stopAfterBytes != null &&
+          encoded > 0 &&
+          buf.length >= stopAfterBytes) {
+        break;
+      }
+      final seq = _claimEntrySeqRange(1);
+      pointers[i] = WalPointer(partitionIndex: pIdx, entrySeq: seq);
+      final oldR =
+          (hasOldValues && olds != null && i < olds.length) ? olds[i] : null;
+
+      if (tableSession != null) {
+        tableSession.encodeRecordDirect(
+          buf,
+          records[i],
+          seq,
+          oldR,
+          true,
+        );
+      } else {
+        batchSession!.encodeRecordDirect(buf, records[i], seq, oldR);
+      }
+      encoded++;
+    }
+    return encoded;
+  }
+
+  void _enqueueEncodedWalBlob({
+    required String path,
+    required FastWalBuffer buf,
+    required WalPointer lastPointer,
+    required int recordCount,
+  }) {
+    final int nBytes = buf.length;
+    if (nBytes <= 0) return;
+    if (lastPointer.partitionIndex == _current.partitionIndex) {
+      _pendingCurrentPartitionBytes += nBytes;
+    }
+    _enqueueWal(_QueuedWalEntry(
+      path: path,
+      encoded: buf.takeBytes(),
+      pointer: lastPointer,
+      recordCount: recordCount,
+    ));
+  }
+
+  /// Direct streaming batch WAL append avoiding intermediate wrapper Maps.
   ///
   /// Serializes records directly into contiguous partition byte buffer and writes to OS synchronously.
   Future<List<WalPointer>> appendBatchDirect({
@@ -1275,277 +1447,108 @@ class WalManager {
     final int count = records.length;
     if (count == 0) return const <WalPointer>[];
 
-    // If journal disabled, still create pseudo pointers to maintain order in memory
-    // If journal disabled, still create pseudo pointers to maintain order in memory
     if (!_config.enableJournal) {
-      final pIdx = _current.partitionIndex;
-      final firstSeq = _current.entrySeq + 1;
-      _current = WalPointer(
-        partitionIndex: pIdx,
-        entrySeq: _current.entrySeq + count,
-      );
-      final result = List<WalPointer>.filled(count, _current, growable: false);
-      for (int i = 0; i < count; i++) {
-        result[i] = WalPointer(partitionIndex: -1, entrySeq: firstSeq + i);
-      }
-      return result;
+      return _disabledJournalPointers(count);
     }
-
-    if (_needsPartitionRotation) {
-      await _ensureWritablePartition();
-    }
-
-    int pIdx = _current.partitionIndex;
-    int dirIndex = _getOrAllocateDirIndexForPartition(pIdx);
-    String path = _dataStore.pathManager.getWalPartitionLogPath(
-      dirIndex,
-      pIdx,
-      spaceName: _dataStore.currentSpaceName,
-    );
-
-    if (_meta.existingStartPartitionIndex < 0 ||
-        _meta.existingEndPartitionIndex < 0) {
-      _meta.existingStartPartitionIndex = pIdx;
-      _meta.existingEndPartitionIndex = pIdx;
-      persistMeta(flush: false);
-    }
-
-    final yieldController = YieldController(
-      'WalManager.appendBatchDirect',
-      minCheckInterval: EngineCpuChunk.fastPathMinCheckInterval,
-    );
 
     final effDurability = durability ?? _config.defaultRecoveryDurability;
     final bool hasOldValues = oldValuesList != null && oldValuesList.isNotEmpty;
-
-    final int firstSeq = _claimEntrySeqRange(count);
-    final List<WalPointer> pointers =
-        List<WalPointer>.filled(count, _current, growable: false);
-
-    // Fast path for async durability:
-    // enqueue to memory queue and return immediately
-    if (effDurability == RecoveryDurability.async) {
-      for (int i = 0; i < count; i++) {
-        final y = yieldController.maybeYield();
-        if (y != null) await y;
-
-        final pointer =
-            WalPointer(partitionIndex: pIdx, entrySeq: firstSeq + i);
-        pointers[i] = pointer;
-        final entry = <String, dynamic>{
-          'op': operation.index,
-          'table': table.tableUid,
-          'ts': tsIso,
-          'p': pIdx,
-          'seq': pointer.entrySeq,
-          'data': records[i],
-        };
-        if (transactionId != null) entry['txId'] = transactionId;
-        if (hasOldValues &&
-            i < oldValuesList.length &&
-            oldValuesList[i] != null) {
-          entry['oldValues'] = oldValuesList[i];
-        }
-
-        _walQueue.add(_QueuedWalEntry(
-          path: path,
-          rawEntry: entry,
-          pointer: pointer,
-        ));
-      }
-      scheduleFlushIfNeeded();
-      return pointers;
-    }
-
-    // Direct-to-OS fast path: encode into buffer and write synchronously
-    if (!_walFlushInProgress && !_directBatchInProgress && _walQueue.isEmpty) {
-      _directBatchInProgress = true;
-      FastWalBuffer? customBuf;
-      FastWalBuffer buf;
-      if (!_batchSyncBufferInUse) {
-        _batchSyncBufferInUse = true;
-        buf = _batchSyncBuffer;
-        buf.reset();
-      } else {
-        buf = customBuf = FastWalBuffer(capacity: 64 * 1024);
-      }
-
-      try {
-        final effectiveSchema = schema ?? table.schema;
-        final bool useSchemaSession = effectiveSchema.fields.isNotEmpty;
-
-        FastWalTableSession? tableSession;
-        FastWalBatchSession? batchSession;
-        if (useSchemaSession) {
-          tableSession = FastWalTableSession.create(
-            op: operation.index,
-            tableUid: table.tableUid,
-            tsIso: tsIso,
-            partitionIndex: pIdx,
-            schema: effectiveSchema,
-            txId: transactionId,
-            hasOldValues: hasOldValues,
-          );
-        } else {
-          batchSession = FastWalBatchSession.create(
-            op: operation.index,
-            tableUid: table.tableUid,
-            tsIso: tsIso,
-            partitionIndex: pIdx,
-            txId: transactionId,
-            hasOldValues: hasOldValues,
-          );
-        }
-
-        int recEst = tableSession?.estimatedRecordBytes ?? 128;
-        final avgDataBytes =
-            _dataStore.tableDataManager.averageTableRecordSizeBytes;
-        if (avgDataBytes != null && avgDataBytes > 0) {
-          final int adjusted = avgDataBytes + 64;
-          if (adjusted > recEst) {
-            recEst = adjusted;
-          }
-        }
-        buf.ensureAvailable(count * recEst + 4096);
-
-        for (int i = 0; i < count; i++) {
-          final y = yieldController.maybeYield();
-          if (y != null) await y;
-
-          final pointer =
-              WalPointer(partitionIndex: pIdx, entrySeq: firstSeq + i);
-          pointers[i] = pointer;
-          final r = records[i];
-          final oldR = (hasOldValues && i < oldValuesList.length)
-              ? oldValuesList[i]
-              : null;
-
-          if (tableSession != null) {
-            tableSession.encodeRecordDirect(
-              buf,
-              r,
-              pointer.entrySeq,
-              oldR,
-              true,
-            );
-          } else {
-            batchSession!.encodeRecordDirect(buf, r, pointer.entrySeq, oldR);
-          }
-        }
-
-        bool directSuccess = false;
-        if (buf.length > 0) {
-          try {
-            final off = _dataStore.storage.appendBytesSync(path, buf.bytesView);
-            if (off >= 0) {
-              _durableDirtyPartitions.add(pIdx);
-              _currentPartitionSizeApprox += buf.length;
-              _appended = pointers.last;
-              directSuccess = true;
-              try {
-                StorageAdapter.notifyRecoveryWrite();
-              } catch (_) {}
-            }
-          } catch (e) {
-            Logger.error('Direct sync batch WAL append failed for path: $path',
-                rawError: e);
-            directSuccess = false;
-          }
-        } else {
-          directSuccess = true;
-        }
-
-        if (directSuccess) {
-          if (effDurability == RecoveryDurability.durable) {
-            _flushDurableSync(path);
-          }
-          if (_currentPartitionSizeApprox >= _config.maxLogPartitionFileSize) {
-            try {
-              await _rotatePartition();
-            } catch (e) {
-              Logger.warn('WAL post-batch partition rotation failed',
-                  rawError: e);
-            }
-          }
-          return pointers;
-        }
-      } finally {
-        _directBatchInProgress = false;
-        if (customBuf == null) {
-          _batchSyncBufferInUse = false;
-        }
-      }
-
-      // Fallback: enqueue on failure
-      for (int i = 0; i < count; i++) {
-        final fallbackEntry = <String, dynamic>{
-          'op': operation.index,
-          'table': table.tableUid,
-          'ts': tsIso,
-          'p': pointers[i].partitionIndex,
-          'seq': pointers[i].entrySeq,
-          'data': records[i],
-        };
-        if (transactionId != null) fallbackEntry['txId'] = transactionId;
-        if (hasOldValues &&
-            i < oldValuesList.length &&
-            oldValuesList[i] != null) {
-          fallbackEntry['oldValues'] = oldValuesList[i];
-        }
-        _walQueue.add(_QueuedWalEntry(
-          path: path,
-          rawEntry: fallbackEntry,
-          pointer: pointers[i],
-        ));
-      }
-      await ensureAppendedUpTo(
-        pointers.last,
-        flushToStorage: effDurability == RecoveryDurability.durable,
-      );
-      if (effDurability == RecoveryDurability.durable) {
-        _flushDurableSync(path);
-      }
-      return pointers;
-    }
-
-    // Standard queued fallback path if _walQueue already has pending entries
-    for (int i = 0; i < count; i++) {
-      final y = yieldController.maybeYield();
-      if (y != null) await y;
-
-      final pointer = WalPointer(partitionIndex: pIdx, entrySeq: firstSeq + i);
-      pointers[i] = pointer;
-      final entry = <String, dynamic>{
-        'op': operation.index,
-        'table': table.tableUid,
-        'ts': tsIso,
-        'p': pIdx,
-        'seq': pointer.entrySeq,
-        'data': records[i],
-      };
-      if (transactionId != null) entry['txId'] = transactionId;
-      if (hasOldValues &&
-          i < oldValuesList.length &&
-          oldValuesList[i] != null) {
-        entry['oldValues'] = oldValuesList[i];
-      }
-
-      _walQueue.add(_QueuedWalEntry(
-        path: path,
-        rawEntry: entry,
-        pointer: pointer,
-      ));
-    }
-
-    await ensureAppendedUpTo(
-      pointers.last,
-      flushToStorage: effDurability == RecoveryDurability.durable,
+    final TableSchema schema0 = schema ?? table.schema;
+    final List<WalPointer> pointers = List<WalPointer>.filled(
+      count,
+      const WalPointer(partitionIndex: -1, entrySeq: 0),
+      growable: false,
     );
-    if (effDurability == RecoveryDurability.durable) {
-      _flushDurableSync(path);
-    }
 
-    return pointers;
+    final bool isAsync = effDurability == RecoveryDurability.async;
+    final bool canDirectWrite = !isAsync &&
+        !_walFlushInProgress &&
+        !_directBatchInProgress &&
+        _walQueue.isEmpty;
+
+    if (canDirectWrite) {
+      _directBatchInProgress = true;
+    }
+    final locked = _lockBatchEncodeBuffer();
+    final FastWalBuffer buf = locked.$1;
+    final FastWalBuffer? customBuf = locked.$2;
+    var usedDirect = canDirectWrite;
+    try {
+      var offset = 0;
+      while (offset < count) {
+        if (!_currentPartitionSizeLoaded) {
+          await _ensureCurrentPartitionSizeLoaded();
+        }
+        _rotateIfCurrentPartitionFullSync();
+        final pIdx = _current.partitionIndex;
+        final path = _getWalPartitionLogPathCached(pIdx);
+        _publishRangeIfFirst(pIdx);
+
+        buf.reset();
+        final n = _encodeRecordsDirectToBuffer(
+          buf: buf,
+          op: operation.index,
+          tableUid: table.tableUid,
+          tsIso: tsIso,
+          records: records,
+          pointers: pointers,
+          start: offset,
+          stopAfterBytes: _chunkLimitForCurrentPartition(),
+          pIdx: pIdx,
+          schema: schema0,
+          transactionId: transactionId,
+          oldValuesList: oldValuesList,
+          hasOldValues: hasOldValues,
+        );
+        if (n <= 0) break;
+        offset += n;
+        final lastPointer = pointers[offset - 1];
+
+        if (usedDirect) {
+          if (!_tryAppendBufferSync(
+            path: path,
+            partitionIndex: pIdx,
+            buf: buf,
+            lastPointer: lastPointer,
+          )) {
+            usedDirect = false;
+            _enqueueEncodedWalBlob(
+              path: path,
+              buf: buf,
+              lastPointer: lastPointer,
+              recordCount: n,
+            );
+          }
+        } else {
+          _enqueueEncodedWalBlob(
+            path: path,
+            buf: buf,
+            lastPointer: lastPointer,
+            recordCount: n,
+          );
+        }
+      }
+
+      if (isAsync) {
+        scheduleFlushIfNeeded();
+        return pointers;
+      }
+      await _awaitPartitionRangePersisted();
+      if (!usedDirect) {
+        await ensureAppendedUpTo(
+          pointers.last,
+          flushToStorage: effDurability == RecoveryDurability.durable,
+        );
+      } else if (effDurability == RecoveryDurability.durable) {
+        await flushRecoveryArtifactsToStorage();
+      }
+      return pointers;
+    } finally {
+      if (canDirectWrite) {
+        _directBatchInProgress = false;
+      }
+      _unlockBatchEncodeBuffer(customBuf);
+    }
   }
 
   /// Advance checkpoint after a batch has been safely flushed to data files.
@@ -1695,6 +1698,11 @@ class WalManager {
         _meta.existingEndPartitionIndex < 0) {
       return;
     }
+    // Maintenance batches may not contribute excludeRanges; never wipe WAL
+    // while recovery still holds a pending-batch handle.
+    if (_meta.pendingBatches.isNotEmpty) {
+      return;
+    }
     final start = _meta.existingStartPartitionIndex;
     final end = _meta.existingEndPartitionIndex;
     final cap = _config.logPartitionCycle;
@@ -1750,8 +1758,7 @@ class WalManager {
       lastRecoveredPointer: null,
       lastRecoveredTailFileSize: null,
     );
-    _currentPartitionSizeLoaded = true;
-    _currentPartitionSizeApprox = 0;
+    _clearPartitionSizeTracking(sizeKnown: true);
     _clearDurableDirtyState();
     await persistMeta(flush: true);
   }
@@ -1865,9 +1872,8 @@ class WalManager {
   void updateCurrentPointerAfterRecovery(WalPointer pointer) {
     _current = pointer;
     _appended = pointer;
-    // Force size to be reloaded lazily on next append to avoid stale estimates.
-    _currentPartitionSizeLoaded = false;
-    _currentPartitionSizeApprox = 0;
+    _clearPartitionSizeTracking(sizeKnown: false);
+    _reclaimUnusedRotatedTail();
   }
 
   /// Schedule a background WAL flush if not already running.
@@ -1906,6 +1912,7 @@ class WalManager {
     final run = Completer<void>();
     _walFlushFuture = run.future;
     var stopAfterWriteError = false;
+    Object? writeError;
     try {
       if (!_currentPartitionSizeLoaded) {
         await _ensureCurrentPartitionSizeLoaded();
@@ -1931,11 +1938,30 @@ class WalManager {
         var advancedAppended = false;
         int taken = 0;
         while (taken < take && _walQueue.isNotEmpty) {
-          final _QueuedWalEntry e = _walQueue.removeFirst();
+          final peek = _walQueue.first;
+          if (peek.encoded != null) {
+            if (taken > 0) break;
+            while (_walQueue.isNotEmpty &&
+                _walQueue.first.encoded != null &&
+                _walQueue.first.path == peek.path) {
+              final e = _dequeueWal();
+              final list = byPath.putIfAbsent(e.path, () => []);
+              list.add(e);
+              taken++;
+              if (prefixMode && !_isPointerNewerThan(until, e.pointer)) {
+                break;
+              }
+            }
+            break;
+          }
+          final _QueuedWalEntry e = _dequeueWal();
           final list = byPath.putIfAbsent(e.path, () => []);
           list.add(e);
           taken++;
           if (prefixMode && !_isPointerNewerThan(until, e.pointer)) {
+            break;
+          }
+          if (_walQueue.isNotEmpty && _walQueue.first.encoded != null) {
             break;
           }
         }
@@ -1948,36 +1974,60 @@ class WalManager {
           final List<_QueuedWalEntry> queued = byPath.remove(path)!;
           if (queued.isEmpty) continue;
 
-          final rawEntries = <Map<String, dynamic>>[
-            for (final q in queued) q.rawEntry,
-          ];
-          final combined = FastWalEncoder.encodeBatch(rawEntries);
-
-          bool wroteToCurrentPartition = false;
+          Uint8List? combined;
+          var groupRecordCount = 0;
+          final int writeP = queued.first.pointer.partitionIndex;
+          var wroteToCurrentPartition = false;
           try {
-            await _dataStore.storage.appendBytes(path, combined, flush: false);
-
-            final writeP =
-                rawEntries.isNotEmpty ? rawEntries.first['p'] as int? : null;
-            if (writeP != null) {
-              _durableDirtyPartitions.add(writeP);
-              if (writeP == _current.partitionIndex) {
-                _currentPartitionSizeApprox += combined.length;
-                wroteToCurrentPartition = true;
+            if (queued.first.encoded != null) {
+              groupRecordCount =
+                  queued.fold<int>(0, (n, q) => n + q.recordCount);
+              if (queued.length == 1) {
+                combined = queued.first.encoded!;
+              } else {
+                int total = 0;
+                for (final q in queued) {
+                  total += q.encoded!.length;
+                }
+                combined = Uint8List(total);
+                int o = 0;
+                for (final q in queued) {
+                  final b = q.encoded!;
+                  combined.setRange(o, o + b.length, b);
+                  o += b.length;
+                }
               }
+            } else {
+              final rawEntries = <Map<String, dynamic>>[
+                for (final q in queued) q.rawEntry!,
+              ];
+              combined = FastWalEncoder.encodeBatch(rawEntries);
+              groupRecordCount = rawEntries.length;
+            }
+
+            if (combined.isNotEmpty) {
+              final off = await _dataStore.storage
+                  .appendBytes(path, combined, flush: false);
+              _accountAppendedBytes(
+                partitionIndex: writeP,
+                writeOffset: off,
+                byteCount: combined.length,
+              );
+              wroteToCurrentPartition = writeP == _current.partitionIndex;
             }
           } catch (e) {
             Logger.error('WAL append batch failed for path: $path',
                 rawError: e);
+            writeError = e;
             // Requeue failed group + any not-yet-written groups.
             for (int i = queued.length - 1; i >= 0; i--) {
-              _walQueue.addFirst(queued[i]);
+              _enqueueWalFirst(queued[i]);
             }
             final remainingPaths = byPath.keys.toList(growable: false);
             for (int pi = remainingPaths.length - 1; pi >= 0; pi--) {
               final rem = byPath.remove(remainingPaths[pi])!;
               for (int i = rem.length - 1; i >= 0; i--) {
-                _walQueue.addFirst(rem[i]);
+                _enqueueWalFirst(rem[i]);
               }
             }
             stopAfterWriteError = true;
@@ -1989,13 +2039,13 @@ class WalManager {
 
           await _maybeRotateAfterAppend(
             writtenBytes: combined.length,
-            entryCount: rawEntries.length,
+            entryCount: groupRecordCount,
             wroteToCurrentPartition: wroteToCurrentPartition,
           );
         }
 
         if (advancedAppended) {
-          _appended = lastAppended;
+          _advanceAppended(lastAppended);
           try {
             StorageAdapter.notifyRecoveryWrite();
           } catch (_) {}
@@ -2027,6 +2077,13 @@ class WalManager {
         }
       }
     }
+    if (writeError != null) {
+      throw DbException.wrap(
+        writeError,
+        fallbackType: ResultType.sysIoGeneric,
+        fallbackMessage: 'WAL append batch failed',
+      );
+    }
   }
 
   /// Drain or discard the WAL write queue.
@@ -2038,6 +2095,7 @@ class WalManager {
   ///   durability; queued entries have no waiters.
   Future<void> flushQueueCompletely({bool flush = true}) async {
     if (!_config.enableJournal) return;
+    await _awaitPartitionRangePersisted();
     // 1. Ensure any in-flight background rotation completes
     while (_rotateInProgress && _rotateFuture != null) {
       try {
@@ -2057,14 +2115,14 @@ class WalManager {
       // Drop not-yet-written entries. Re-await once: the completed pump's
       // finally may have synchronously rescheduled while the queue was still
       // non-empty; after that second await, clear again.
-      _walQueue.clear();
+      _clearWalQueue();
       final again = _walFlushFuture;
       if (again != null) {
         try {
           await again;
         } catch (_) {}
       }
-      _walQueue.clear();
+      _clearWalQueue();
       return;
     }
 
@@ -2072,9 +2130,7 @@ class WalManager {
     while (_walQueue.isNotEmpty) {
       final existing = _walFlushFuture;
       if (existing != null) {
-        try {
-          await existing;
-        } catch (_) {}
+        await existing;
       }
       if (_walQueue.isEmpty) break;
       await _pumpWalFlush(drainCompletely: true);
@@ -2083,9 +2139,7 @@ class WalManager {
     // 4. Ensure the last pump that may have drained the queue has completely finished
     final remaining = _walFlushFuture;
     if (remaining != null) {
-      try {
-        await remaining;
-      } catch (_) {}
+      await remaining;
     }
   }
 
@@ -2102,6 +2156,8 @@ class WalManager {
     if (!_config.enableJournal) return;
     if (target.partitionIndex < 0) return;
 
+    await _awaitPartitionRangePersisted();
+
     // Prefix-drain until [target] is in OS buffers. Loop covers races where an
     // online pump is in-flight or starts between awaits.
     while (_isPointerNewerThan(target, _appended)) {
@@ -2115,6 +2171,16 @@ class WalManager {
       if (_walQueue.isEmpty) break;
       // Do not overwrite [_walFlushFuture]; scheduleFlushIfNeeded owns it.
       await _pumpWalFlush(until: target);
+    }
+
+    if (_isPointerNewerThan(target, _appended)) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.sysIoGeneric,
+          message:
+              'WAL append did not reach $target (appended=$_appended, queued=${_walQueue.length})',
+        ),
+      ]);
     }
 
     if (flushToStorage) {
@@ -2161,9 +2227,10 @@ class WalManager {
 
     try {
       await _dataStore.storage.flushAll(paths: paths, closeHandles: false);
-    } catch (_) {
+    } catch (e) {
       _durableDirtyPartitions.addAll(dirtyPartitions);
       if (flushMeta) _walMetaDurableDirty = true;
+      rethrow;
     }
   }
 
@@ -2194,6 +2261,11 @@ class WalManager {
     } catch (_) {
       size = 0;
     }
+    // Partition may have rotated, recovery may have reset the pointer, or a
+    // sync append may already have sealed the size from writeOffset. Do not
+    // clobber a live counter with a stale File.length().
+    if (_currentPartitionSizeLoaded) return;
+    if (_current.partitionIndex != pIdx) return;
     _currentPartitionSizeApprox = size;
     _currentPartitionSizeLoaded = true;
   }
@@ -2202,6 +2274,7 @@ class WalManager {
   /// Uses only a single getFileSize (no file content read). Returns true if recovery was skipped.
   Future<bool> tryFastPathSkipRecovery() async {
     if (!_config.enableJournal) return false;
+    if (_meta.pendingBatches.isNotEmpty) return false;
     final ptr = _meta.lastRecoveredPointer;
     final savedSize = _meta.lastRecoveredTailFileSize;
     if (ptr == null ||
@@ -2272,7 +2345,8 @@ class WalManager {
     if (_meta.existingEndPartitionIndex < 0) return null;
 
     final pIdx = _meta.existingEndPartitionIndex;
-    final dirIndex = _getOrAllocateDirIndexForPartition(pIdx);
+    final dirIndex =
+        getPartitionDirIndex(pIdx) ?? pIdx ~/ _dataStore.maxEntriesPerDir;
     final path = _dataStore.pathManager.getWalPartitionLogPath(
       dirIndex,
       pIdx,
@@ -2305,8 +2379,7 @@ class WalManager {
       // Efficiently decode only the last entry from the tail (backward scan)
       // decodeLastEntryFromTail scans backwards from the end to find the last
       // complete record, which works correctly even if we only have the tail
-      final lastEntry =
-          await WalEncoder.decodeLastEntryFromTail(tailData, pIdx);
+      final lastEntry = WalEncoder.decodeLastEntryFromTail(tailData, pIdx);
       if (lastEntry != null) {
         final p = lastEntry['p'] as int?;
         final seq = (lastEntry['seq'] as num?)?.toInt();
@@ -2327,7 +2400,7 @@ class WalManager {
             .readAsBytesAt(path, largerOffset, length: largerReadSize);
         if (largerTailData.isEmpty) continue;
         final lastEntryLarger =
-            await WalEncoder.decodeLastEntryFromTail(largerTailData, pIdx);
+            WalEncoder.decodeLastEntryFromTail(largerTailData, pIdx);
         if (lastEntryLarger != null) {
           final p = lastEntryLarger['p'] as int?;
           final seq = (lastEntryLarger['seq'] as num?)?.toInt();
@@ -2349,24 +2422,111 @@ class WalManager {
         partitionIndex: pIdx,
         encoderConfig: encoderConfig,
       );
-      return WalPointer(partitionIndex: pIdx, entrySeq: allEntries.length);
+      for (int i = allEntries.length - 1; i >= 0; i--) {
+        final p = allEntries[i]['p'] as int?;
+        final seq = (allEntries[i]['seq'] as num?)?.toInt();
+        if (seq != null) {
+          return WalPointer(partitionIndex: p ?? pIdx, entrySeq: seq);
+        }
+      }
+      return WalPointer(partitionIndex: pIdx, entrySeq: 0);
     } catch (e) {
       Logger.warn('readLastWalPointer failed', rawError: e);
       return WalPointer(partitionIndex: pIdx, entrySeq: 0);
     }
   }
 
+  /// Linear range where [existingEnd] is exactly one slot past the write head:
+  /// a rotated file that recovery never adopted (empty next partition).
+  /// Treating that slot as live deadlocks rotate — checkpoint stays on the
+  /// write partition and can never reach a file we never write again.
+  bool _isUnusedRotatedTail(int p) {
+    final start = _meta.existingStartPartitionIndex;
+    final end = _meta.existingEndPartitionIndex;
+    if (start < 0 || end < 0 || start > end) return false;
+    final cur = _current.partitionIndex;
+    if (p != end || cur == end) return false;
+    return end == (cur + 1) % _config.logPartitionCycle;
+  }
+
+  /// Drop a stale unused tail from meta so later rotate/cleanup see the write head.
+  void _reclaimUnusedRotatedTail() {
+    final end = _meta.existingEndPartitionIndex;
+    if (!_isUnusedRotatedTail(end)) return;
+    _meta.existingEndPartitionIndex = _current.partitionIndex;
+  }
+
+  /// Whether [p] is still required for recovery (checkpoint partition through
+  /// the live tail). Rotating onto such a partition would delete unreclaimed WAL.
+  bool _isWalPartitionStillNeeded(int p) {
+    final start = _meta.existingStartPartitionIndex;
+    final end = _meta.existingEndPartitionIndex;
+    if (start < 0 || end < 0) return false;
+    final cp = _meta.checkpoint.partitionIndex;
+    if (p == cp) return true;
+    if (_isUnusedRotatedTail(p)) return false;
+    bool inExistingRange(int x) {
+      if (start <= end) return x >= start && x <= end;
+      return x >= start || x <= end;
+    }
+
+    if (!inExistingRange(p)) return false;
+    // Live unreclaimed arc is [checkpoint, existingEnd] walking forward.
+    if (cp <= end) return p >= cp && p <= end;
+    return p >= cp || p <= end;
+  }
+
+  void _clearLastRecoveredHint() {
+    if (_meta.lastRecoveredPointer == null &&
+        _meta.lastRecoveredTailFileSize == null) {
+      return;
+    }
+    _meta = WalMeta(
+      checkpoint: _meta.checkpoint,
+      existingStartPartitionIndex: _meta.existingStartPartitionIndex,
+      existingEndPartitionIndex: _meta.existingEndPartitionIndex,
+      pendingBatches: _meta.pendingBatches,
+      tableOps: _meta.tableOps,
+      directoryMapping: _meta.directoryMapping,
+      lastRecoveredPointer: null,
+      lastRecoveredTailFileSize: null,
+    );
+  }
+
   /// Synchronously switches active WAL partition in memory (0 await overhead),
   /// cleans target partition file synchronously, and schedules background
   /// persistence of metadata and old handle closure.
-  void _rotatePartitionSync(int pIdx, String oldPath) {
+  ///
+  /// Returns `false` when rotation was deferred (target partition still needed
+  /// for recovery). Caller must keep writing the current file (soft overrun).
+  bool _rotatePartitionSync(int pIdx, String oldPath) {
     final next = (pIdx + 1) % _config.logPartitionCycle;
+    if (_isWalPartitionStillNeeded(next)) {
+      if (!_loggedRotateDeferred) {
+        _loggedRotateDeferred = true;
+        Logger.warn(
+          'WAL rotate deferred: partition $next still needed for checkpoint '
+          '${_meta.checkpoint} (current=$_current, '
+          'existing=${_meta.existingStartPartitionIndex}..${_meta.existingEndPartitionIndex})',
+        );
+      }
+      return false;
+    }
+    _loggedRotateDeferred = false;
+
     final nextDirIndex = _getOrAllocateDirIndexForPartition(next);
     final newPath = _dataStore.pathManager.getWalPartitionLogPath(
       nextDirIndex,
       next,
       spaceName: _dataStore.currentSpaceName,
     );
+
+    // Reusing [next] (ring wrap or leftover file) invalidates a recovery hint
+    // that still points at this partition index — size coincidence would skip
+    // replay of the new file.
+    if (_meta.lastRecoveredPointer?.partitionIndex == next) {
+      _clearLastRecoveredHint();
+    }
 
     // 1. Synchronously clean newPath if it exists (e.g. from previous cycle or aborted run).
     // Closes any sync handle and removes physical file synchronously without microtask yield.
@@ -2379,8 +2539,7 @@ class WalManager {
 
     // 2. Synchronously advance in-memory pointer and reset partition size IMMEDIATELY!
     _current = WalPointer(partitionIndex: next, entrySeq: 0);
-    _currentPartitionSizeApprox = 0;
-    _currentPartitionSizeLoaded = true;
+    _clearPartitionSizeTracking(sizeKnown: true);
     _cachedWalPartitionIndex = -1;
     _cachedWalPartitionPath = null;
 
@@ -2399,6 +2558,7 @@ class WalManager {
 
     // 4. Schedule background task to flush old handle and persist metadata durably
     _scheduleBackgroundRotationIo(oldPIdx: pIdx, oldPath: oldPath);
+    return true;
   }
 
   /// Chains background I/O tasks for WAL partition rotation.
@@ -2441,7 +2601,7 @@ class WalManager {
       pIdx,
       spaceName: _dataStore.currentSpaceName,
     );
-    _rotatePartitionSync(pIdx, path);
+    if (!_rotatePartitionSync(pIdx, path)) return;
     final fut = _rotateFuture;
     if (fut != null) {
       try {
@@ -2450,110 +2610,115 @@ class WalManager {
     }
   }
 
-  Future<void> persistMeta({bool flush = false, bool backupOld = false}) async {
-    // Coalescing strategy: if persistMeta is already in progress, wait for it to complete.
-    // If there's already a waiting request, replace it with this one (only latest matters).
-    Completer<void>? myCompleter;
+  Future<void> persistMeta({
+    bool flush = false,
+    bool backupOld = false,
+    bool throwOnError = false,
+  }) async {
+    _persistMetaWantFlush |= flush;
+    _persistMetaWantBackup |= backupOld;
+    _persistMetaWantThrow |= throwOnError;
 
-    if (_persistMetaInProgress) {
-      // Cancel previous waiting request if exists (coalesce to latest)
-      final previousCompleter = _nextPersistMetaCompleter;
-      if (previousCompleter != null && !previousCompleter.isCompleted) {
-        try {
-          previousCompleter.complete();
-        } catch (_) {}
+    while (_persistMetaInProgress) {
+      final idle = _persistMetaIdle;
+      if (idle != null) {
+        await idle.future;
+      } else {
+        while (_persistMetaInProgress) {
+          await Future.delayed(const Duration(milliseconds: 10));
+        }
       }
-
-      // Create new completer for this request
-      myCompleter = Completer<void>();
-      _nextPersistMetaCompleter = myCompleter;
-
-      // Wait for current persistMeta to complete (or timeout)
-      try {
-        await myCompleter.future.timeout(
-          const Duration(seconds: 30),
-          onTimeout: () {
-            Logger.warn(
-                'persistMeta wait timeout after 30s, proceeding anyway');
-          },
+      if (throwOnError && _persistMetaCycleError != null) {
+        throw DbException.wrap(
+          _persistMetaCycleError,
+          fallbackType: ResultType.sysIoGeneric,
+          fallbackMessage: 'Failed to persist WAL meta',
         );
-      } catch (e) {
-        Logger.warn('persistMeta wait error', rawError: e);
       }
-
-      // Check if we were superseded by a newer request
-      if (_nextPersistMetaCompleter != myCompleter) {
-        // A newer request came in, skip this one (coalesced)
+      if (!_persistMetaWantFlush &&
+          !_persistMetaWantBackup &&
+          !_persistMetaWantThrow) {
         return;
-      }
-
-      // Double-check to prevent race condition
-      while (_persistMetaInProgress) {
-        await Future.delayed(const Duration(milliseconds: 10));
       }
     }
 
+    final idle = Completer<void>();
+    _persistMetaIdle = idle;
     _persistMetaInProgress = true;
-    _nextPersistMetaCompleter = null; // Clear waiting request
-
+    _persistMetaCycleError = null;
+    var failLoudly = false;
+    Object? persistError;
     try {
-      // Update directory mapping in meta if cache exists
-      if (_directoryMapping != null) {
-        _meta = _meta.copyWith(directoryMapping: _directoryMapping);
-      }
-      try {
-        final metaPath = _dataStore.pathManager
-            .getWalMainMetaPath(spaceName: _dataStore.currentSpaceName);
+      do {
+        final doFlush = _persistMetaWantFlush;
+        final doBackup = _persistMetaWantBackup;
+        final doThrow = _persistMetaWantThrow;
+        _persistMetaWantFlush = false;
+        _persistMetaWantBackup = false;
+        _persistMetaWantThrow = false;
 
-        // Optionally backup existing WAL meta before writing a new version.
-        if (backupOld) {
-          final backupPath = _dataStore.pathManager
-              .getWalBackupMetaPath(spaceName: _dataStore.currentSpaceName);
-          try {
-            // Ensure any pooled handle for WAL meta is flushed and closed
-            // before renaming, to avoid platform-specific rename failures.
+        try {
+          if (_directoryMapping != null) {
+            _meta = _meta.copyWith(directoryMapping: _directoryMapping);
+          }
+          final metaPath = _dataStore.pathManager
+              .getWalMainMetaPath(spaceName: _dataStore.currentSpaceName);
+
+          if (doBackup) {
+            final backupPath = _dataStore.pathManager
+                .getWalBackupMetaPath(spaceName: _dataStore.currentSpaceName);
             try {
-              await _dataStore.storage
-                  .flushAll(path: metaPath, closeHandles: true);
-            } catch (_) {}
+              try {
+                await _dataStore.storage
+                    .flushAll(path: metaPath, closeHandles: true);
+              } catch (_) {}
 
-            final exists = await _dataStore.storage.existsFile(metaPath);
-            if (exists) {
-              // Atomically move current meta to backup path.
-              await _dataStore.storage.replaceFileAtomic(metaPath, backupPath);
+              final exists = await _dataStore.storage.existsFile(metaPath);
+              if (exists) {
+                await _dataStore.storage
+                    .replaceFileAtomic(metaPath, backupPath);
+              }
+            } catch (e) {
+              Logger.error('Backup WAL meta failed', rawError: e);
             }
-          } catch (e) {
-            // Backup failure should not block forward progress; just log it.
-            Logger.error('Backup WAL meta failed', rawError: e);
+          }
+
+          final bytes = WalMetaCodec.encodeFile(
+            _meta,
+            encryptionConfig: _dataStore.config.encryptionConfig,
+          );
+          await _dataStore.storage
+              .writeAsBytes(metaPath, bytes, flush: doFlush);
+          _walMetaDurableDirty = !doFlush;
+          _partitionRangePersistPending = false;
+          persistError = null;
+          _persistMetaCycleError = null;
+        } catch (e) {
+          Logger.error('Failed to persist WAL meta', rawError: e);
+          persistError = e;
+          _persistMetaCycleError = e;
+          if (doThrow) {
+            failLoudly = true;
+            break;
           }
         }
-
-        final bytes = WalMetaCodec.encodeFile(
-          _meta,
-          encryptionConfig: _dataStore.config.encryptionConfig,
-        );
-        await _dataStore.storage.writeAsBytes(metaPath, bytes, flush: flush);
-        // Durable flag tracks whether meta still needs a storage-level flush.
-        _walMetaDurableDirty = !flush;
-      } catch (e) {
-        // Log the full error with stack trace for debugging
-        Logger.error('Failed to persist WAL meta', rawError: e);
-        // Don't rethrow: allow the operation to fail gracefully.
-        // The next persistMeta call will retry, and the in-memory _meta
-        // state remains correct even if persistence fails temporarily.
-        // This prevents WAL meta write failures from interrupting the main
-        // business flow (queries, inserts, updates, deletes).
-      }
+      } while (_persistMetaWantFlush ||
+          _persistMetaWantBackup ||
+          _persistMetaWantThrow);
     } finally {
       _persistMetaInProgress = false;
-      // Notify the next waiting request (if any)
-      final nextCompleter = _nextPersistMetaCompleter;
-      if (nextCompleter != null && !nextCompleter.isCompleted) {
-        try {
-          nextCompleter.complete();
-        } catch (_) {}
-        _nextPersistMetaCompleter = null;
+      _persistMetaIdle = null;
+      if (!idle.isCompleted) {
+        idle.complete();
       }
+    }
+
+    if (failLoudly && persistError != null) {
+      throw DbException.wrap(
+        persistError,
+        fallbackType: ResultType.sysIoGeneric,
+        fallbackMessage: 'Failed to persist WAL meta',
+      );
     }
   }
 
@@ -2562,13 +2727,13 @@ class WalManager {
     _meta.pendingBatches.add(batch);
     // Batch is critical for recovery; backup previous WAL meta before
     // persisting the new state that includes this pending batch.
-    await persistMeta(flush: false, backupOld: true);
+    await persistMeta(flush: false, backupOld: true, throwOnError: true);
   }
 
   /// Remove a pending parallel batch by id
   Future<void> removePendingParallelBatch(String batchId) async {
     _meta.pendingBatches.removeWhere((b) => b.batchId == batchId);
-    await persistMeta(flush: false);
+    await persistMeta(flush: false, throwOnError: true);
   }
 
   /// Register a table-level maintenance operation (clear/drop) into WAL meta.
@@ -2586,7 +2751,7 @@ class WalManager {
     _meta.tableOps
         .removeWhere((_, existing) => existing.tableUid == op.tableUid);
     _meta.tableOps[op.opId] = op;
-    await persistMeta(flush: false);
+    await persistMeta(flush: false, throwOnError: true);
   }
 
   /// Mark a table-level maintenance operation as completed.
@@ -2603,7 +2768,7 @@ class WalManager {
     final op = _meta.tableOps[opId];
     if (op == null) return;
     _meta.tableOps[opId] = op.copyWith(completed: true);
-    await persistMeta(flush: false);
+    await persistMeta(flush: false, throwOnError: true);
   }
 
   /// Remove a pending table-level maintenance op that never took effect.
@@ -2615,19 +2780,23 @@ class WalManager {
     if (!_config.enableJournal) return;
     if (!_meta.tableOps.containsKey(opId)) return;
     _meta.tableOps.remove(opId);
-    await persistMeta(flush: false);
+    await persistMeta(flush: false, throwOnError: true);
   }
 }
 
 /// Internal WAL queue entry used by [WalManager] for background persistence.
 class _QueuedWalEntry {
   final String path;
-  final Map<String, dynamic> rawEntry;
+  final Map<String, dynamic>? rawEntry;
+  final Uint8List? encoded;
   final WalPointer pointer;
+  final int recordCount;
 
   _QueuedWalEntry({
     required this.path,
-    required this.rawEntry,
+    this.rawEntry,
+    this.encoded,
     required this.pointer,
+    this.recordCount = 1,
   });
 }

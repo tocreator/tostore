@@ -184,7 +184,7 @@ class BenchmarkRunner {
 
   /// Primes JIT compiler and memory allocations with small datasets.
   Future<void> _performWarmup() async {
-    const warmupCount = 100;
+    const warmupCount = 10000;
     final simpleWarmupData = List.generate(
       warmupCount,
       (i) => {'text_val': 'warmup_$i', 'num_val': i},
@@ -197,8 +197,7 @@ class BenchmarkRunner {
         'created_at': DateTime.now().toIso8601String(),
       },
     );
-    final vectorWarmupData =
-        _generateRecords(BenchmarkTier.vector, warmupCount);
+    final vectorWarmupData = _generateRecords(BenchmarkTier.vector, 1000);
 
     // Batch insert and query warmup
     await db.batchInsert(

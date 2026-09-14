@@ -47,14 +47,14 @@ class WalEncoder {
     return out;
   }
 
-  /// Decode multiple WAL entries from a file's binary content
+  /// Decode multiple WAL entries synchronously from a file's binary content.
   ///
   /// Reads records using length-prefix format: [Length: 4B][Binary WAL Entry]
-  /// Returns list of decoded entries in order
+  /// Returns list of decoded entries in order.
   ///
   /// [partitionIndex] - WAL partition index for AAD verification
-  static Future<List<Map<String, dynamic>>> decodeFile(
-      Uint8List fileBytes, int partitionIndex) async {
+  static List<Map<String, dynamic>> decodeFile(
+      Uint8List fileBytes, int partitionIndex) {
     final List<Map<String, dynamic>> entries = [];
     int offset = 0;
 
@@ -84,13 +84,12 @@ class WalEncoder {
       offset += recordLength;
 
       try {
-        final entry = await decodeSingle(recordData, partitionIndex);
+        final entry = decodeSingle(recordData, partitionIndex);
         if (entry != null) {
           entries.add(entry);
         }
       } catch (e) {
         // Skip corrupted record, continue with next
-        // In production, you might want to log this for debugging
         continue;
       }
     }
@@ -98,11 +97,11 @@ class WalEncoder {
     return entries;
   }
 
-  /// Decode single WAL entry from binary format
+  /// Decode single WAL entry synchronously from binary format.
   ///
   /// [partitionIndex] - WAL partition index for AAD verification (must match encoding)
-  static Future<Map<String, dynamic>?> decodeSingle(
-      Uint8List data, int partitionIndex) async {
+  static Map<String, dynamic>? decodeSingle(
+      Uint8List data, int partitionIndex) {
     if (data.length < 9) return null;
 
     final header = ByteData.sublistView(data, 0, 9);
@@ -148,8 +147,7 @@ class WalEncoder {
   /// New code should use decodeFile() for reading entire WAL files.
   ///
   /// [partitionIndex] - WAL partition index for AAD verification
-  static Future<Map<String, dynamic>?> decode(
-      Uint8List data, int partitionIndex) async {
+  static Map<String, dynamic>? decode(Uint8List data, int partitionIndex) {
     return decodeSingle(data, partitionIndex);
   }
 
@@ -195,19 +193,26 @@ class WalEncoder {
   }
 
   static Uint8List _decodePayload(Uint8List encryptedData, int partitionIndex) {
-    // Headerless none payloads ignore AAD; AEAD still needs partition AAD.
-    if (EncryptionManager.getEncryptionType() == EncryptionType.none) {
-      // Still run decodeBytes: files may contain prefixed ciphertext from an
-      // older key/type while the process default is none (prefix dispatch).
-      return EncryptionManager.decodeBytes(encryptedData);
-    }
     return EncryptionManager.decodeBytes(
       encryptedData,
       aad: _partitionAad(partitionIndex),
     );
   }
 
+  static final List<Uint8List> _partitionAadCache = List<Uint8List>.generate(
+    16,
+    (i) {
+      final b = ByteData(4);
+      b.setInt32(0, i, Endian.little);
+      return b.buffer.asUint8List();
+    },
+    growable: false,
+  );
+
   static Uint8List _partitionAad(int partitionIndex) {
+    if (partitionIndex >= 0 && partitionIndex < 16) {
+      return _partitionAadCache[partitionIndex];
+    }
     final aadData = ByteData(4);
     aadData.setInt32(0, partitionIndex, Endian.little);
     return aadData.buffer.asUint8List();
@@ -257,8 +262,8 @@ class WalEncoder {
   /// [partitionIndex] - WAL partition index for AAD verification
   ///
   /// Returns null if no valid record found or the tail is insufficient.
-  static Future<Map<String, dynamic>?> decodeLastEntryFromTail(
-      Uint8List tailBytes, int partitionIndex) async {
+  static Map<String, dynamic>? decodeLastEntryFromTail(
+      Uint8List tailBytes, int partitionIndex) {
     if (tailBytes.length < 4) return null;
 
     // Start from the end and scan backwards to find the last complete record
@@ -322,7 +327,7 @@ class WalEncoder {
       // Magic matches! This is very likely a valid record. Now attempt full decode.
       // The decodeSingle will verify version, decrypt, and parse the entry.
       try {
-        final entry = await decodeSingle(recordData, partitionIndex);
+        final entry = decodeSingle(recordData, partitionIndex);
         if (entry != null) {
           return entry; // Found the last valid entry
         }

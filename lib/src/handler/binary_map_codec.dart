@@ -7,54 +7,85 @@ import '../model/result_type.dart';
 import '../model/table_schema.dart' show VectorData;
 import 'platform_byte_data.dart';
 
-/// A compact binary codec for `Map<String, dynamic>`.
+/// A compact high-performance binary codec for `Map<String, dynamic>`.
 ///
-/// This is a MessagePack-compatible subset with a small custom extension:
+/// This is a MessagePack-compatible format with custom extensions:
 /// - BigInt is encoded as MessagePack ext (type=1) with decimal string payload.
 /// - VectorData is encoded as MessagePack ext (type=2) with Float64 binary payload.
 ///
-/// Goals:
-/// - Avoid JSON for hot data paths (partition blocks, WAL payloads)
-/// - Deterministic, fast, and safe (DoS size limits)
+/// On-disk contract is the released [WalEncoder] / table-file format:
+/// encode and decode `map32`, `array32`, `str32`, `bin32`, `fixint`, `fixstr`,
+/// `int32`/`int64`, `float64`, `bool`, `nil`, `ext8`/`ext16`/`ext32`.
+/// [FastWalEncoder] is a faster writer of this same format, not a new one.
+///
+/// Design guarantees:
+/// - Hot paths (int, String, null, bool, double) are evaluated first.
+/// - Zero silent truncation: oversized data triggers a descriptive [DbException].
+/// - Full Unicode/Emoji fidelity across all global language scripts.
+/// - Allocation-free [ByteData] operations on decoding.
 class BinaryMapCodec {
-  // Maximum sizes to prevent DoS attacks via large arrays/maps
+  // Maximum sizes to prevent DoS attacks via excessively large payloads
   static const int maxArraySize = 1000000; // 1M elements
   static const int maxMapSize = 1000000; // 1M entries
   static const int maxStringLength = 100 * 1024 * 1024; // 100MB per string
   static const int maxBinaryLength = 256 * 1024 * 1024; // 256MB per binary blob
 
-  // MessagePack ext type for BigInt
+  // MessagePack ext types
   static const int _extTypeBigInt = 1;
-  // MessagePack ext type for VectorData
   static const int _extTypeVector = 2;
 
-  // Pre-allocated immutable singletons for 1-byte MessagePack tokens
-  static final List<Uint8List> _posFixInt =
-      List.generate(128, (i) => Uint8List.fromList([i]), growable: false);
-  static final List<Uint8List> _negFixInt = List.generate(
-      32, (i) => Uint8List.fromList([0xE0 | (i & 0x1F)]),
-      growable: false);
-  static final Uint8List _tokenNull = Uint8List.fromList([0xC0]);
-  static final Uint8List _tokenTrue = Uint8List.fromList([0xC3]);
-  static final Uint8List _tokenFalse = Uint8List.fromList([0xC2]);
-  static final Uint8List _tokenEmptyStr = Uint8List.fromList([0xA0]);
+  /// String header matching released [WalEncoder] / [BinaryMapCodec]:
+  /// fixstr if UTF-8 length &lt; 32, otherwise str32.
+  static int onDiskStringHeaderSize(int utf8Length) => utf8Length < 32 ? 1 : 5;
+
+  static void writeOnDiskStringHeader(BytesBuilder b, int utf8Length) {
+    if (utf8Length < 32) {
+      b.addByte(0xA0 | utf8Length);
+      return;
+    }
+    b.addByte(0xDB);
+    _writeU32be(b, utf8Length);
+  }
+
+  /// Writes the released string header at [offset]. Returns 1 or 5.
+  static int writeOnDiskStringHeaderAt(
+    Uint8List dest,
+    int offset,
+    int utf8Length,
+  ) {
+    if (utf8Length < 32) {
+      dest[offset] = 0xA0 | utf8Length;
+      return 1;
+    }
+    dest[offset] = 0xDB;
+    dest[offset + 1] = (utf8Length >> 24) & 0xFF;
+    dest[offset + 2] = (utf8Length >> 16) & 0xFF;
+    dest[offset + 3] = (utf8Length >> 8) & 0xFF;
+    dest[offset + 4] = utf8Length & 0xFF;
+    return 5;
+  }
+
+  // Pre-allocated scratch buffer for 64-bit numbers (per isolate)
+  static final Uint8List _scratch8 = Uint8List(8);
+  static final ByteData _scratch8Bd = ByteData.sublistView(_scratch8);
 
   static Uint8List encodeMap(Map<String, dynamic> map) {
+    final int count = map.length;
+    if (count > maxMapSize) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Binary map codec: Map size $count exceeds maximum limit of $maxMapSize.',
+        )
+      ]);
+    }
+
     final buffer = BytesBuilder(copy: false);
-    final int count = map.length > maxMapSize ? maxMapSize : map.length;
+    buffer.addByte(0xDF); // map32
+    _writeU32be(buffer, count);
 
-    // map32
-    final hdr = Uint8List(5);
-    hdr[0] = 0xDF;
-    hdr[1] = (count >> 24) & 0xFF;
-    hdr[2] = (count >> 16) & 0xFF;
-    hdr[3] = (count >> 8) & 0xFF;
-    hdr[4] = count & 0xFF;
-    buffer.add(hdr);
-
-    int written = 0;
     for (final e in map.entries) {
-      if (++written > maxMapSize) break;
       _writeString(buffer, e.key);
       _writeValue(buffer, e.value);
     }
@@ -95,48 +126,104 @@ class BinaryMapCodec {
     }
   }
 
+  /// MessagePack value serializer writing directly to [BytesBuilder].
+  ///
+  /// Hot path optimized: evaluates the most frequent database column types first
+  /// (int -> String -> null -> bool -> double -> Uint8List -> List -> Map -> extensions).
   static void _writeValue(BytesBuilder b, dynamic value) {
-    if (value == null) {
-      b.add(_tokenNull);
-      return;
-    }
-
-    if (value is bool) {
-      b.add(value ? _tokenTrue : _tokenFalse);
-      return;
-    }
-
+    // 1. int (dominant in IDs, foreign keys, flags, timestamps)
     if (value is int) {
-      // Prefer smallest forms, but keep implementation simple.
       if (value >= 0 && value < 128) {
-        b.add(_posFixInt[value]);
+        b.addByte(value); // positive fixint
         return;
       }
       if (value >= -32 && value < 0) {
-        b.add(_negFixInt[value + 32]);
+        b.addByte(0xE0 | (value & 0x1F)); // negative fixint
         return;
       }
-      // int32
       if (value >= -0x80000000 && value <= 0x7FFFFFFF) {
-        final out = Uint8List(5);
-        out[0] = 0xD2;
-        out[1] = (value >> 24) & 0xFF;
-        out[2] = (value >> 16) & 0xFF;
-        out[3] = (value >> 8) & 0xFF;
-        out[4] = value & 0xFF;
-        b.add(out);
+        b.addByte(0xD2); // int32
+        _writeI32be(b, value);
         return;
       }
-      // int64 (MessagePack)
-      // value is int, and didn't fit in smaller types, so use int64.
-      final out = Uint8List(9);
-      out[0] = 0xD3;
-      final bd = ByteData.sublistView(out, 1, 9);
-      PlatformByteData.setInt64(bd, 0, value, Endian.big);
-      b.add(out);
+      b.addByte(0xD3); // int64
+      _writeI64be(b, value);
       return;
     }
 
+    // 2. String (dominant in text, UUIDs, identifiers, status, JSON payload)
+    if (value is String) {
+      _writeString(b, value);
+      return;
+    }
+
+    // 3. null (frequent in nullable fields)
+    if (value == null) {
+      b.addByte(0xC0);
+      return;
+    }
+
+    // 4. bool
+    if (value is bool) {
+      b.addByte(value ? 0xC3 : 0xC2);
+      return;
+    }
+
+    // 5. double (numeric metrics, currencies, coordinates)
+    if (value is double) {
+      b.addByte(0xCB);
+      _writeF64be(b, value);
+      return;
+    }
+
+    // 6. Uint8List (binary blobs, encrypted payloads)
+    if (value is Uint8List) {
+      _writeBinary(b, value);
+      return;
+    }
+
+    // 7. List
+    if (value is List) {
+      final int length = value.length;
+      if (length > maxArraySize) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message:
+                'Binary map codec: Array size $length exceeds maximum limit of $maxArraySize.',
+          )
+        ]);
+      }
+      b.addByte(0xDD); // array32
+      _writeU32be(b, length);
+      for (int i = 0; i < length; i++) {
+        _writeValue(b, value[i]);
+      }
+      return;
+    }
+
+    // 8. Map
+    if (value is Map) {
+      final int count = value.length;
+      if (count > maxMapSize) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message:
+                'Binary map codec: Map size $count exceeds maximum limit of $maxMapSize.',
+          )
+        ]);
+      }
+      b.addByte(0xDF); // map32
+      _writeU32be(b, count);
+      for (final e in value.entries) {
+        _writeString(b, e.key.toString());
+        _writeValue(b, e.value);
+      }
+      return;
+    }
+
+    // 9. Infrequent extensions: BigInt & VectorData
     if (value is BigInt) {
       _writeBigIntExt(b, value);
       return;
@@ -147,70 +234,37 @@ class BinaryMapCodec {
       return;
     }
 
-    if (value is double) {
-      final out = Uint8List(9);
-      out[0] = 0xCB;
-      final bd = ByteData.sublistView(out, 1, 9);
-      bd.setFloat64(0, value, Endian.big);
-      b.add(out);
+    if (value is DateTime) {
+      _writeString(b, value.toIso8601String());
       return;
     }
 
-    if (value is String) {
-      _writeString(b, value);
-      return;
-    }
-
-    if (value is Uint8List) {
-      _writeBinary(b, value);
-      return;
-    }
-
-    if (value is List) {
-      final int length =
-          value.length > maxArraySize ? maxArraySize : value.length;
-      final hdr = Uint8List(5);
-      hdr[0] = 0xDD; // array32
-      hdr[1] = (length >> 24) & 0xFF;
-      hdr[2] = (length >> 16) & 0xFF;
-      hdr[3] = (length >> 8) & 0xFF;
-      hdr[4] = length & 0xFF;
-      b.add(hdr);
-      for (int i = 0; i < length; i++) {
-        _writeValue(b, value[i]);
-      }
-      return;
-    }
-
-    if (value is Map) {
-      final int count = value.length > maxMapSize ? maxMapSize : value.length;
-      final hdr = Uint8List(5);
-      hdr[0] = 0xDF; // map32
-      hdr[1] = (count >> 24) & 0xFF;
-      hdr[2] = (count >> 16) & 0xFF;
-      hdr[3] = (count >> 8) & 0xFF;
-      hdr[4] = count & 0xFF;
-      b.add(hdr);
-      int written = 0;
-      for (final e in value.entries) {
-        if (++written > maxMapSize) break;
-        _writeString(b, e.key.toString());
-        _writeValue(b, e.value);
-      }
-      return;
-    }
-
-    // Unsupported
-    b.add(_tokenNull);
+    // Unsupported fallback: encode as null
+    b.addByte(0xC0);
   }
 
+  /// Encodes a string into standard MessagePack bytes.
+  ///
+  /// Supports ASCII fast-path without intermediate utf8 allocation, and encodes
+  /// full multi-byte Unicode (Emoji, CJK, Cyrillic, Arabic, Latin-extended, etc.)
+  /// using standard MessagePack format tokens without silent truncation.
   static void _writeString(BytesBuilder b, String s) {
-    if (s.isEmpty) {
-      b.add(_tokenEmptyStr);
+    final int len = s.length;
+    if (len == 0) {
+      b.addByte(0xA0); // fixstr of length 0
       return;
     }
+    if (len > maxStringLength) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Binary map codec: String length $len exceeds maximum limit of $maxStringLength.',
+        )
+      ]);
+    }
 
-    final int len = s.length;
+    // Fast-path for short pure-ASCII strings (common for table names, field names, enum values)
     if (len < 32) {
       bool isAscii = true;
       for (int i = 0; i < len; i++) {
@@ -220,121 +274,144 @@ class BinaryMapCodec {
         }
       }
       if (isAscii) {
-        final chunk = Uint8List(1 + len);
-        chunk[0] = 0xA0 | len;
+        b.addByte(0xA0 | len);
         for (int i = 0; i < len; i++) {
-          chunk[i + 1] = s.codeUnitAt(i);
+          b.addByte(s.codeUnitAt(i));
         }
-        b.add(chunk);
         return;
       }
     }
 
+    // Full UTF-8 encode for multi-byte Unicode and strings >= 32 chars
     final bytes = utf8.encode(s);
-    final int encLen =
-        bytes.length > maxStringLength ? maxStringLength : bytes.length;
-    final out = (encLen < bytes.length) ? bytes.sublist(0, encLen) : bytes;
-
-    if (encLen < 32) {
-      final chunk = Uint8List(1 + encLen);
-      chunk[0] = 0xA0 | encLen; // fixstr
-      chunk.setRange(1, 1 + encLen, out);
-      b.add(chunk);
-    } else {
-      final hdr = Uint8List(5);
-      hdr[0] = 0xDB; // str32
-      hdr[1] = (encLen >> 24) & 0xFF;
-      hdr[2] = (encLen >> 16) & 0xFF;
-      hdr[3] = (encLen >> 8) & 0xFF;
-      hdr[4] = encLen & 0xFF;
-      b.add(hdr);
-      b.add(out);
+    final int encLen = bytes.length;
+    if (encLen > maxStringLength) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Binary map codec: String length $encLen exceeds maximum limit of $maxStringLength.',
+        )
+      ]);
     }
+
+    writeOnDiskStringHeader(b, encLen);
+    b.add(bytes);
   }
 
   static void _writeBinary(BytesBuilder b, Uint8List bytes) {
-    final int len =
-        bytes.length > maxBinaryLength ? maxBinaryLength : bytes.length;
-    final out = (len < bytes.length) ? bytes.sublist(0, len) : bytes;
-    final hdr = Uint8List(5);
-    hdr[0] = 0xC6; // bin32
-    hdr[1] = (len >> 24) & 0xFF;
-    hdr[2] = (len >> 16) & 0xFF;
-    hdr[3] = (len >> 8) & 0xFF;
-    hdr[4] = len & 0xFF;
-    b.add(hdr);
-    b.add(out);
+    final int len = bytes.length;
+    if (len > maxBinaryLength) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Binary map codec: Binary length $len exceeds maximum limit of $maxBinaryLength.',
+        )
+      ]);
+    }
+    b.addByte(0xC6); // bin32
+    _writeU32be(b, len);
+    b.add(bytes);
   }
 
   static void _writeBigIntExt(BytesBuilder b, BigInt v) {
     final payload = utf8.encode(v.toString());
     final int len = payload.length;
-    final hdr = Uint8List(6);
-    hdr[0] = 0xC9; // ext32
-    hdr[1] = (len >> 24) & 0xFF;
-    hdr[2] = (len >> 16) & 0xFF;
-    hdr[3] = (len >> 8) & 0xFF;
-    hdr[4] = len & 0xFF;
-    hdr[5] = _extTypeBigInt;
-    b.add(hdr);
+    b.addByte(0xC9); // ext 32
+    _writeU32be(b, len);
+    b.addByte(_extTypeBigInt);
     b.add(payload);
   }
 
   static void _writeVectorExt(BytesBuilder b, VectorData v) {
     final payload = v.toBytes();
     final int len = payload.length;
-    final hdr = Uint8List(6);
-    hdr[0] = 0xC9; // ext32
-    hdr[1] = (len >> 24) & 0xFF;
-    hdr[2] = (len >> 16) & 0xFF;
-    hdr[3] = (len >> 8) & 0xFF;
-    hdr[4] = len & 0xFF;
-    hdr[5] = _extTypeVector;
-    b.add(hdr);
+    b.addByte(0xC9); // ext 32
+    _writeU32be(b, len);
+    b.addByte(_extTypeVector);
     b.add(payload);
   }
 
+  static void _writeU32be(BytesBuilder b, int v) {
+    b.addByte((v >> 24) & 0xFF);
+    b.addByte((v >> 16) & 0xFF);
+    b.addByte((v >> 8) & 0xFF);
+    b.addByte(v & 0xFF);
+  }
+
+  static void _writeI32be(BytesBuilder b, int v) {
+    b.addByte((v >> 24) & 0xFF);
+    b.addByte((v >> 16) & 0xFF);
+    b.addByte((v >> 8) & 0xFF);
+    b.addByte(v & 0xFF);
+  }
+
+  static void _writeI64be(BytesBuilder b, int v) {
+    PlatformByteData.setInt64(_scratch8Bd, 0, v, Endian.big);
+    _addScratch8(b);
+  }
+
+  static void _writeF64be(BytesBuilder b, double v) {
+    _scratch8Bd.setFloat64(0, v, Endian.big);
+    _addScratch8(b);
+  }
+
+  /// Copy scratch bytes into the builder. [BytesBuilder] is constructed with
+  /// `copy: false`, so adding [_scratch8] by reference would alias every
+  /// subsequent int64/float64 write onto the same 8-byte buffer.
+  static void _addScratch8(BytesBuilder b) {
+    b.addByte(_scratch8[0]);
+    b.addByte(_scratch8[1]);
+    b.addByte(_scratch8[2]);
+    b.addByte(_scratch8[3]);
+    b.addByte(_scratch8[4]);
+    b.addByte(_scratch8[5]);
+    b.addByte(_scratch8[6]);
+    b.addByte(_scratch8[7]);
+  }
+
+  /// Decode MessagePack value with branch optimization for dominant data types.
   static dynamic _readValue(_Reader r) {
     final byte = r.u8();
 
-    // positive fixint
+    // 1. positive fixint (0x00 ~ 0x7F) - extremely hot
     if (byte < 0x80) return byte;
 
-    // negative fixint
-    if (byte >= 0xE0) return (byte & 0x1F) - 32;
-
-    // fixstr
+    // 2. fixstr (0xA0 ~ 0xBF) - extremely hot
     if (byte >= 0xA0 && byte < 0xC0) {
-      final len = byte & 0x1F;
-      return _readString(r, len);
+      return _readString(r, byte & 0x1F);
     }
 
+    // 3. negative fixint (0xE0 ~ 0xFF)
+    if (byte >= 0xE0) return (byte & 0x1F) - 32;
+
     switch (byte) {
-      case 0xC0:
+      case 0xC0: // nil
         return null;
-      case 0xC2:
+      case 0xC2: // false
         return false;
-      case 0xC3:
+      case 0xC3: // true
         return true;
-      case 0xCB:
+      case 0xCB: // float 64
         return r.f64be();
-      case 0xD2:
+      case 0xD2: // int 32
         return r.i32be();
-      case 0xD3:
+      case 0xD3: // int 64
         return r.i64be();
-      case 0xDB:
+      case 0xDB: // str 32
         return _readString(r, r.u32be());
-      case 0xC6:
+      case 0xC6: // bin 32
         return _readBinary(r, r.u32be());
-      case 0xDD:
-        return _readArray32(r);
-      case 0xDF:
-        return _readMap32(r);
-      case 0xC7: // ext8
+      case 0xDD: // array 32
+        return _readArray(r, r.u32be());
+      case 0xDF: // map 32
+        return _readMap(r, r.u32be());
+      case 0xC7: // ext 8
         return _readExt(r, r.u8());
-      case 0xC8: // ext16
+      case 0xC8: // ext 16
         return _readExt(r, r.u16be());
-      case 0xC9: // ext32
+      case 0xC9: // ext 32
         return _readExt(r, r.u32be());
       default:
         throw DbException([
@@ -357,8 +434,24 @@ class BinaryMapCodec {
         )
       ]);
     }
-    final bytes = r.bytes(len);
-    return utf8.decode(bytes, allowMalformed: true);
+    final view = r.bytesView(len);
+    return _decodeUtf8(view);
+  }
+
+  /// ASCII strings (short keys, IDs, enums <= 64 bytes) skip the UTF-8 state machine.
+  /// Longer texts directly delegate to utf8.decode to leverage VM-native SIMD acceleration
+  /// and avoid Dart-level double-scan overhead.
+  static String _decodeUtf8(Uint8List view) {
+    final int n = view.length;
+    if (n <= 64) {
+      for (int i = 0; i < n; i++) {
+        if (view[i] > 0x7F) {
+          return utf8.decode(view, allowMalformed: true);
+        }
+      }
+      return String.fromCharCodes(view);
+    }
+    return utf8.decode(view, allowMalformed: true);
   }
 
   static Uint8List _readBinary(_Reader r, int len) {
@@ -371,11 +464,10 @@ class BinaryMapCodec {
         )
       ]);
     }
-    return r.bytes(len);
+    return r.bytesCopy(len);
   }
 
-  static List<dynamic> _readArray32(_Reader r) {
-    final count = r.u32be();
+  static List<dynamic> _readArray(_Reader r, int count) {
     if (count > maxArraySize) {
       throw DbException([
         GeneralStatus(
@@ -393,8 +485,7 @@ class BinaryMapCodec {
     return out;
   }
 
-  static Map<String, dynamic> _readMap32(_Reader r) {
-    final count = r.u32be();
+  static Map<String, dynamic> _readMap(_Reader r, int count) {
     if (count > maxMapSize) {
       throw DbException([
         GeneralStatus(
@@ -423,7 +514,7 @@ class BinaryMapCodec {
 
   static dynamic _readExt(_Reader r, int len) {
     final type = r.u8();
-    final payload = r.bytes(len);
+    final payload = r.bytesCopy(len);
     if (type == _extTypeBigInt) {
       final s = utf8.decode(payload, allowMalformed: true);
       return BigInt.tryParse(s) ?? BigInt.zero;
@@ -440,113 +531,89 @@ class BinaryMapCodec {
   }
 }
 
+/// Zero-allocation Reader for MessagePack decoding.
 final class _Reader {
   final Uint8List b;
+  late final ByteData _bd;
   int off = 0;
-  _Reader(this.b);
 
+  _Reader(this.b) {
+    _bd = ByteData.sublistView(b);
+  }
+
+  @pragma('vm:prefer-inline')
   int u8() {
-    if (off + 1 > b.length) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message:
-              'Binary map codec: Read beyond buffer. Offset: $off, Buffer length: ${b.length}.',
-        )
-      ]);
-    }
+    if (off >= b.length) _throwBufferOverflow();
     return b[off++];
   }
 
+  @pragma('vm:prefer-inline')
   int u16be() {
-    if (off + 2 > b.length) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message:
-              'Binary map codec: Read beyond buffer. Offset: $off, Buffer length: ${b.length}.',
-        )
-      ]);
-    }
-    final v = ByteData.sublistView(b, off, off + 2).getUint16(0, Endian.big);
+    if (off + 2 > b.length) _throwBufferOverflow();
+    final v = (b[off] << 8) | b[off + 1];
     off += 2;
     return v;
   }
 
+  @pragma('vm:prefer-inline')
   int u32be() {
-    if (off + 4 > b.length) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message:
-              'Binary map codec: Read beyond buffer. Offset: $off, Buffer length: ${b.length}.',
-        )
-      ]);
-    }
-    final v = ByteData.sublistView(b, off, off + 4).getUint32(0, Endian.big);
+    if (off + 4 > b.length) _throwBufferOverflow();
+    // dart2js bitwise << is signed 32-bit; getUint32 stays in 0..2^32-1.
+    final v = _bd.getUint32(off, Endian.big);
     off += 4;
     return v;
   }
 
+  @pragma('vm:prefer-inline')
   int i32be() {
-    if (off + 4 > b.length) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message:
-              'Binary map codec: Read beyond buffer. Offset: $off, Buffer length: ${b.length}.',
-        )
-      ]);
-    }
-    final v = ByteData.sublistView(b, off, off + 4).getInt32(0, Endian.big);
+    if (off + 4 > b.length) _throwBufferOverflow();
+    final v = _bd.getInt32(off, Endian.big);
     off += 4;
     return v;
   }
 
+  @pragma('vm:prefer-inline')
   int i64be() {
-    if (off + 8 > b.length) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message:
-              'Binary map codec: Read beyond buffer. Offset: $off, Buffer length: ${b.length}.',
-        )
-      ]);
-    }
-    final v = PlatformByteData.getInt64(
-        ByteData.sublistView(b, off, off + 8), 0, Endian.big);
+    if (off + 8 > b.length) _throwBufferOverflow();
+    final v = PlatformByteData.getInt64(_bd, off, Endian.big);
     off += 8;
     return v;
   }
 
+  @pragma('vm:prefer-inline')
   double f64be() {
-    if (off + 8 > b.length) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message:
-              'Binary map codec: Read beyond buffer. Offset: $off, Buffer length: ${b.length}.',
-        )
-      ]);
-    }
-    final v = ByteData.sublistView(b, off, off + 8).getFloat64(0, Endian.big);
+    if (off + 8 > b.length) _throwBufferOverflow();
+    final v = _bd.getFloat64(off, Endian.big);
     off += 8;
     return v;
   }
 
-  Uint8List bytes(int len) {
+  /// Zero-copy read-only view of slice.
+  @pragma('vm:prefer-inline')
+  Uint8List bytesView(int len) {
     if (len <= 0) return Uint8List(0);
-    if (off + len > b.length) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message:
-              'Binary map codec: Read beyond buffer. Offset: $off, Buffer length: ${b.length}.',
-        )
-      ]);
-    }
+    if (off + len > b.length) _throwBufferOverflow();
+    final out = Uint8List.sublistView(b, off, off + len);
+    off += len;
+    return out;
+  }
+
+  /// Owned copy of slice when callers retain or mutate the bytes.
+  Uint8List bytesCopy(int len) {
+    if (len <= 0) return Uint8List(0);
+    if (off + len > b.length) _throwBufferOverflow();
     final out = b.sublist(off, off + len);
     off += len;
     return out;
+  }
+
+  Never _throwBufferOverflow() {
+    throw DbException([
+      GeneralStatus(
+        type: ResultType.engError,
+        message:
+            'Binary map codec: Read beyond buffer. Offset: $off, Buffer length: ${b.length}.',
+      )
+    ]);
   }
 }

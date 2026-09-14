@@ -310,6 +310,7 @@ class WeightManager {
 
     // Prior saver may have cleared dirty.
     if (!force && !_dirty) return;
+    if (_dataStore.isClosing) return;
 
     final completer = Completer<void>();
     _saveLock = completer.future;
@@ -335,7 +336,11 @@ class WeightManager {
         _lastSuccessfulSaveMs = DateTime.now().millisecondsSinceEpoch;
       }
     } catch (e) {
-      Logger.error('Failed to save weights to file', rawError: e);
+      if (_dataStore.isClosing) {
+        Logger.debug('Skipped saving weights during shutdown', rawError: e);
+      } else {
+        Logger.error('Failed to save weights to file', rawError: e);
+      }
       // Keep _dirty so a later tick/hourly guarantee retries.
     } finally {
       completer.complete();

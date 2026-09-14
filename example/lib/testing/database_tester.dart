@@ -532,31 +532,17 @@ class DatabaseTester {
 
   Future<void> _deleteSchemaAutoUpgradeTestDatabase(
       DataStoreConfig config) async {
-    ToStore? cleanupDb;
     try {
-      cleanupDb = await ToStore.open(
+      await ToStore.deleteDatabaseDirect(
         dbPath: config.dbPath,
         dbName: config.dbName,
         config: config,
-        schemas: const [],
-        applyActiveSpaceOnDefault: false,
       );
-      await cleanupDb.deleteDatabase(
-        dbPath: config.dbPath,
-        dbName: config.dbName,
-      );
-      cleanupDb = null;
     } catch (e) {
       log.add(
         'Schema auto-upgrade test database cleanup skipped: $e',
-        LogLevel.warn,
+        LogLevel.info,
       );
-    } finally {
-      if (cleanupDb != null) {
-        try {
-          await cleanupDb.close();
-        } catch (_) {}
-      }
     }
   }
 

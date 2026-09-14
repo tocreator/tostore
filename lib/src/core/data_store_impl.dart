@@ -952,13 +952,13 @@ class DataStoreImpl {
       return true;
     } catch (e) {
       _isInitialized = false;
+      _baseInitialized = false;
       if (!_initCompleter.isCompleted) {
         _initCompleter.completeError(e);
       }
       Logger.error('Database initialization failed', rawError: e);
       try {
-        // Prevent ReadViewManager callback leak if initialization failed after its creation
-        readViewManager.dispose();
+        await close(flush: false, closeStorage: true, removeRegistry: true);
       } catch (_) {}
       rethrow;
     } finally {
@@ -1169,7 +1169,53 @@ class DataStoreImpl {
     bool keepActiveSpace = true,
     bool removeRegistry = true,
   }) async {
-    if (!_isInitialized && !_baseInitialized) return;
+    if (!_isInitialized && !_baseInitialized) {
+      _closing = true;
+      try {
+        _weightManager?.stopBackgroundTasks();
+      } catch (_) {}
+      try {
+        _ttlCleanupManager.unregisterCleanupTask();
+      } catch (_) {}
+      try {
+        compactionManager.dispose();
+      } catch (_) {}
+      try {
+        readViewManager.dispose();
+      } catch (_) {}
+      try {
+        transactionManager?.dispose();
+      } catch (_) {}
+      try {
+        notificationManager.dispose();
+      } catch (_) {}
+      try {
+        _resourceManager?.dispose();
+      } catch (_) {}
+      try {
+        migrationManager?.dispose();
+      } catch (_) {}
+      if (closeStorage) {
+        try {
+          await storage.flushAll(closeHandles: true);
+          await storage.close();
+        } catch (_) {}
+        _indexManager = null;
+        _vectorIndexManager = null;
+        _weightManager = null;
+        _keyManager = null;
+        tableMetaManager = null;
+        transactionManager = null;
+        _resourceManager = null;
+        migrationManager = null;
+        versionUpgradeManager = null;
+      }
+      if (removeRegistry && _instances[_instanceKey] == this) {
+        _instances.remove(_instanceKey);
+        SharedEngineRegistry.remove(_instanceKey);
+      }
+      return;
+    }
 
     // Mark closing before clearing init flags so SpaceStats skips InternalKv
     // while journal flush / teardown still runs.
@@ -4861,7 +4907,13 @@ class DataStoreImpl {
 
             if (missingCount == windowLen) {
               isWindowAllAutoPk = true;
-              newIds = await tableDataManager.getBatchIds(table, windowLen);
+              newIds = await tableDataManager.getBatchIds(
+                table,
+                windowLen,
+                assignTo: records,
+                assignStart: start,
+                assignField: primaryKey,
+              );
               if (newIds.length != windowLen) {
                 if (!allowPartialErrors) {
                   return finish(DbResult.error(
@@ -4870,10 +4922,6 @@ class DataStoreImpl {
                         'Failed to generate enough primary keys for batch insert',
                     failedKeys: returnResultDetails ? failedKeys : const [],
                   ));
-                }
-              } else {
-                for (int i = 0; i < windowLen; i++) {
-                  records[start + i][primaryKey] = newIds[i];
                 }
               }
             } else if (missingCount == 0) {
@@ -7681,6 +7729,50 @@ class DataStoreImpl {
     }
   }
 
+  /// Delete database directory directly without requiring an opened instance.
+  static Future<void> deleteDatabaseDirect({
+    String? dbPath,
+    String? dbName,
+    DataStoreConfig? config,
+  }) async {
+    try {
+      final effectiveDbPath = dbPath ?? config?.dbPath;
+      final effectiveDbName = dbName ?? config?.dbName ?? 'default';
+      final key = '${effectiveDbPath ?? 'default'}-$effectiveDbName';
+
+      final existingImpl = _instances.remove(key);
+      if (existingImpl != null) {
+        try {
+          await existingImpl.close(flush: false);
+        } catch (_) {}
+      }
+      SharedEngineRegistry.remove(key);
+
+      String rootPath;
+      if (effectiveDbPath != null && effectiveDbPath.isNotEmpty) {
+        rootPath = effectiveDbPath;
+      } else {
+        if (PlatformHandler.isMobile) return;
+        rootPath = await getPathApp();
+      }
+      rootPath = path.canonicalize(rootPath);
+      final dbDirPath = pathJoin(rootPath, 'db', effectiveDbName);
+
+      final storage = StorageAdapter(lockManager: LockManager());
+      try {
+        if (await storage.existsDirectory(dbDirPath)) {
+          await storage.deleteDirectory(dbDirPath);
+          Logger.info('Database deleted directly: $dbDirPath');
+        }
+      } finally {
+        await storage.close();
+      }
+    } catch (e) {
+      Logger.error('Delete database direct failed', rawError: e);
+      rethrow;
+    }
+  }
+
   /// Set key-value pair
   Future<DbResult> setValue(
     String key,
@@ -9051,8 +9143,13 @@ class DataStoreImpl {
       await storage.writeAsBytes(configPath, bytes);
 
       // Version-only JSON stub for older engines (once per version per process).
-      unawaited(ensureDowngradeGuardJson(version: config.version));
+      if (!_closing) {
+        unawaited(ensureDowngradeGuardJson(version: config.version));
+      }
     } catch (e) {
+      if (e is DbClosedException) {
+        return;
+      }
       Logger.error('Failed to save global config', rawError: e);
       if (propagateErrors) rethrow;
     }

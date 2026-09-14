@@ -5,6 +5,7 @@ import '../model/db_exception.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/table_schema.dart' show VectorData;
+import 'binary_map_codec.dart';
 import 'platform_byte_data.dart';
 
 /// A compact binary codec for records using schema-based encoding.
@@ -13,7 +14,8 @@ import 'platform_byte_data.dart';
 /// The field structure is stored in PartitionFooter.
 ///
 /// Format: [fieldCount:u16][value1][value2]...[valueN]
-/// Each value is encoded using MessagePack-compatible format (same as BinaryMapCodec).
+/// Each value uses the same released MessagePack tokens as [BinaryMapCodec]
+/// (map32 / array32 / str32 / bin32 + fixint/fixstr).
 class BinarySchemaCodec {
   // Maximum sizes to prevent DoS attacks
   static const int maxArraySize = 1000000; // 1M elements
@@ -34,7 +36,16 @@ class BinarySchemaCodec {
     String? nullifyField,
   }) {
     final buffer = BytesBuilder(copy: false);
-    final fieldCount = fieldStructure.length.clamp(0, maxFieldCount);
+    final fieldCount = fieldStructure.length;
+    if (fieldCount > maxFieldCount) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Binary schema codec: Field count $fieldCount exceeds maximum limit of $maxFieldCount.',
+        )
+      ]);
+    }
     _writeU16be(buffer, fieldCount);
 
     // Encode values in field order
@@ -89,18 +100,8 @@ class BinarySchemaCodec {
   }
 
   static void _writeValue(BytesBuilder b, dynamic value) {
-    if (value == null) {
-      b.addByte(0xC0);
-      return;
-    }
-
-    if (value is bool) {
-      b.addByte(value ? 0xC3 : 0xC2);
-      return;
-    }
-
+    // 1. int (dominant in IDs, foreign keys, flags, timestamps)
     if (value is int) {
-      // Prefer smallest forms
       if (value >= 0 && value < 128) {
         b.addByte(value); // positive fixint
         return;
@@ -109,19 +110,96 @@ class BinarySchemaCodec {
         b.addByte(0xE0 | (value & 0x1F)); // negative fixint
         return;
       }
-      // int32
       if (value >= -0x80000000 && value <= 0x7FFFFFFF) {
         b.addByte(0xD2);
         _writeI32be(b, value);
         return;
       }
-      // int64 (MessagePack)
-      // value is int, and didn't fit in smaller types, so use int64.
       b.addByte(0xD3);
       _writeI64be(b, value);
       return;
     }
 
+    // 2. String (dominant in text, UUIDs, identifiers, status, JSON payload)
+    if (value is String) {
+      _writeString(b, value);
+      return;
+    }
+
+    // 3. null (frequent in nullable fields)
+    if (value == null) {
+      b.addByte(0xC0);
+      return;
+    }
+
+    // 4. bool
+    if (value is bool) {
+      b.addByte(value ? 0xC3 : 0xC2);
+      return;
+    }
+
+    // 5. double (numeric metrics, currencies, coordinates)
+    if (value is double) {
+      b.addByte(0xCB);
+      _writeF64be(b, value);
+      return;
+    }
+
+    // 6. Uint8List (binary blobs, encrypted payloads)
+    if (value is Uint8List) {
+      _writeBinary(b, value);
+      return;
+    }
+
+    // 7. VectorData: encode as binary (Float64List bytes) for compact storage.
+    if (value is VectorData) {
+      final f64 = Float64List.fromList(value.values);
+      _writeBinary(b, f64.buffer.asUint8List());
+      return;
+    }
+
+    // 8. List
+    if (value is List) {
+      final length = value.length;
+      if (length > maxArraySize) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message:
+                'Binary schema codec: Array size $length exceeds maximum limit of $maxArraySize.',
+          )
+        ]);
+      }
+      b.addByte(0xDD); // array32
+      _writeU32be(b, length);
+      for (int i = 0; i < length; i++) {
+        _writeValue(b, value[i]);
+      }
+      return;
+    }
+
+    // 9. Map
+    if (value is Map) {
+      final int count = value.length;
+      if (count > maxArraySize) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message:
+                'Binary schema codec: Map size $count exceeds maximum limit of $maxArraySize.',
+          )
+        ]);
+      }
+      b.addByte(0xDF); // map32
+      _writeU32be(b, count);
+      for (final e in value.entries) {
+        _writeString(b, e.key.toString());
+        _writeValue(b, e.value);
+      }
+      return;
+    }
+
+    // 10. BigInt
     if (value is BigInt) {
       if (value.isValidInt) {
         _writeValue(b, value.toInt());
@@ -131,50 +209,8 @@ class BinarySchemaCodec {
       return;
     }
 
-    if (value is double) {
-      b.addByte(0xCB);
-      _writeF64be(b, value);
-      return;
-    }
-
-    if (value is String) {
-      _writeString(b, value);
-      return;
-    }
-
-    if (value is Uint8List) {
-      _writeBinary(b, value);
-      return;
-    }
-
-    // VectorData: encode as binary (Float64List bytes) for compact storage.
-    if (value is VectorData) {
-      final f64 = Float64List.fromList(value.values);
-      _writeBinary(b, f64.buffer.asUint8List());
-      return;
-    }
-
-    if (value is List) {
-      final length = value.length > maxArraySize ? maxArraySize : value.length;
-      b.addByte(0xDD); // array32
-      _writeU32be(b, length);
-      for (int i = 0; i < length; i++) {
-        _writeValue(b, value[i]);
-      }
-      return;
-    }
-
-    if (value is Map) {
-      final int count =
-          value.length > maxArraySize ? maxArraySize : value.length;
-      b.addByte(0xDF); // map32
-      _writeU32be(b, count);
-      int written = 0;
-      for (final e in value.entries) {
-        if (++written > maxArraySize) break;
-        _writeString(b, e.key.toString());
-        _writeValue(b, e.value);
-      }
+    if (value is DateTime) {
+      _writeString(b, value.toIso8601String());
       return;
     }
 
@@ -183,12 +219,21 @@ class BinarySchemaCodec {
   }
 
   static void _writeString(BytesBuilder b, String s) {
-    if (s.isEmpty) {
+    final int len = s.length;
+    if (len == 0) {
       b.addByte(0xA0);
       return;
     }
+    if (len > maxStringLength) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Binary schema codec: String length $len exceeds maximum limit of $maxStringLength.',
+        )
+      ]);
+    }
 
-    final int len = s.length;
     if (len < 32) {
       bool isAscii = true;
       for (int i = 0; i < len; i++) {
@@ -207,25 +252,35 @@ class BinarySchemaCodec {
     }
 
     final bytes = utf8.encode(s);
-    final encLen =
-        bytes.length > maxStringLength ? maxStringLength : bytes.length;
-    final out = (encLen < bytes.length) ? bytes.sublist(0, encLen) : bytes;
-
-    if (encLen < 32) {
-      b.addByte(0xA0 | encLen); // fixstr
-    } else {
-      b.addByte(0xDB); // str32
-      _writeU32be(b, encLen);
+    final encLen = bytes.length;
+    if (encLen > maxStringLength) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Binary schema codec: String length $encLen exceeds maximum limit of $maxStringLength.',
+        )
+      ]);
     }
-    b.add(out);
+
+    BinaryMapCodec.writeOnDiskStringHeader(b, encLen);
+    b.add(bytes);
   }
 
   static void _writeBinary(BytesBuilder b, Uint8List bytes) {
-    final len = bytes.length > maxBinaryLength ? maxBinaryLength : bytes.length;
-    final out = (len < bytes.length) ? bytes.sublist(0, len) : bytes;
+    final len = bytes.length;
+    if (len > maxBinaryLength) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Binary schema codec: Binary length $len exceeds maximum limit of $maxBinaryLength.',
+        )
+      ]);
+    }
     b.addByte(0xC6); // bin32
     _writeU32be(b, len);
-    b.add(out);
+    b.add(bytes);
   }
 
   static void _writeBigIntExt(BytesBuilder b, BigInt v) {
@@ -241,44 +296,43 @@ class BinarySchemaCodec {
   static dynamic _readValue(_Reader r) {
     final byte = r.u8();
 
-    // positive fixint
+    // 1. positive fixint (0x00 ~ 0x7F) - extremely hot
     if (byte < 0x80) return byte;
 
-    // negative fixint
-    if (byte >= 0xE0) return (byte & 0x1F) - 32;
-
-    // fixstr
+    // 2. fixstr (0xA0 ~ 0xBF) - extremely hot
     if (byte >= 0xA0 && byte < 0xC0) {
-      final len = byte & 0x1F;
-      return _readString(r, len);
+      return _readString(r, byte & 0x1F);
     }
 
+    // 3. negative fixint (0xE0 ~ 0xFF)
+    if (byte >= 0xE0) return (byte & 0x1F) - 32;
+
     switch (byte) {
-      case 0xC0:
+      case 0xC0: // nil
         return null;
-      case 0xC2:
+      case 0xC2: // false
         return false;
-      case 0xC3:
+      case 0xC3: // true
         return true;
-      case 0xCB:
+      case 0xCB: // float 64
         return r.f64be();
-      case 0xD2:
+      case 0xD2: // int 32
         return r.i32be();
-      case 0xD3:
+      case 0xD3: // int 64
         return r.i64be();
-      case 0xDB:
+      case 0xDB: // str 32
         return _readString(r, r.u32be());
-      case 0xC6:
+      case 0xC6: // bin 32
         return _readBinary(r, r.u32be());
-      case 0xDD:
-        return _readArray32(r);
-      case 0xDF:
-        return _readMap32(r);
-      case 0xC7: // ext8
+      case 0xDD: // array 32
+        return _readArray(r, r.u32be());
+      case 0xDF: // map 32
+        return _readMap(r, r.u32be());
+      case 0xC7: // ext 8
         return _readExt(r, r.u8());
-      case 0xC8: // ext16
+      case 0xC8: // ext 16
         return _readExt(r, r.u16be());
-      case 0xC9: // ext32
+      case 0xC9: // ext 32
         return _readExt(r, r.u32be());
       default:
         throw DbException([
@@ -301,8 +355,24 @@ class BinarySchemaCodec {
         )
       ]);
     }
-    final bytes = r.bytes(len);
-    return utf8.decode(bytes, allowMalformed: true);
+    final view = r.bytesView(len);
+    return _decodeUtf8(view);
+  }
+
+  /// ASCII strings (short field names, enums <= 64 bytes) skip the UTF-8 state machine.
+  /// Longer texts directly delegate to utf8.decode to leverage VM-native SIMD acceleration
+  /// and avoid Dart-level double-scan overhead.
+  static String _decodeUtf8(Uint8List view) {
+    final int n = view.length;
+    if (n <= 64) {
+      for (int i = 0; i < n; i++) {
+        if (view[i] > 0x7F) {
+          return utf8.decode(view, allowMalformed: true);
+        }
+      }
+      return String.fromCharCodes(view);
+    }
+    return utf8.decode(view, allowMalformed: true);
   }
 
   static Uint8List _readBinary(_Reader r, int len) {
@@ -315,11 +385,10 @@ class BinarySchemaCodec {
         )
       ]);
     }
-    return r.bytes(len);
+    return r.bytesCopy(len);
   }
 
-  static List<dynamic> _readArray32(_Reader r) {
-    final count = r.u32be();
+  static List<dynamic> _readArray(_Reader r, int count) {
     if (count > maxArraySize) {
       throw DbException([
         GeneralStatus(
@@ -337,8 +406,7 @@ class BinarySchemaCodec {
     return out;
   }
 
-  static Map<String, dynamic> _readMap32(_Reader r) {
-    final count = r.u32be();
+  static Map<String, dynamic> _readMap(_Reader r, int count) {
     if (count > maxArraySize) {
       throw DbException([
         GeneralStatus(
@@ -367,7 +435,7 @@ class BinarySchemaCodec {
 
   static dynamic _readExt(_Reader r, int len) {
     final type = r.u8();
-    final payload = r.bytes(len);
+    final payload = r.bytesCopy(len);
     if (type == _extTypeBigInt) {
       final s = utf8.decode(payload, allowMalformed: true);
       return BigInt.tryParse(s) ?? BigInt.zero;
@@ -375,6 +443,10 @@ class BinarySchemaCodec {
     // Unknown extension: return raw bytes.
     return payload;
   }
+
+  static final BigInt _int64Min = BigInt.parse('-9223372036854775808'); // -2^63
+  static final BigInt _int64Max =
+      BigInt.parse('9223372036854775807'); // 2^63 - 1
 
   /// Coerce decoded value to match the table field type when safe.
   ///
@@ -391,11 +463,7 @@ class BinarySchemaCodec {
       case 0:
         if (value is BigInt) {
           // Only downcast when within signed 64-bit range to avoid silent overflow.
-          // Only downcast when within signed 64-bit range to avoid silent overflow.
-          // Use BigInt.parse to safely represent 64-bit limits on all platforms (including web).
-          final min = BigInt.parse('-9223372036854775808'); // -2^63
-          final max = BigInt.parse('9223372036854775807'); // 2^63 - 1
-          if (value >= min && value <= max) {
+          if (value >= _int64Min && value <= _int64Max) {
             return value.toInt();
           }
           // Keep BigInt if out of range; caller can decide how to handle it.
@@ -460,123 +528,112 @@ class BinarySchemaCodec {
 
   static void _writeI64be(BytesBuilder b, int v) {
     PlatformByteData.setInt64(_scratch8Bd, 0, v, Endian.big);
-    b.add(_scratch8);
+    _addScratch8(b);
   }
 
   static void _writeF64be(BytesBuilder b, double v) {
     _scratch8Bd.setFloat64(0, v, Endian.big);
-    b.add(_scratch8);
+    _addScratch8(b);
+  }
+
+  /// Copy scratch bytes. [BytesBuilder] uses `copy: false`; sharing
+  /// [_scratch8] by reference would overwrite earlier int64/float64 values.
+  static void _addScratch8(BytesBuilder b) {
+    b.addByte(_scratch8[0]);
+    b.addByte(_scratch8[1]);
+    b.addByte(_scratch8[2]);
+    b.addByte(_scratch8[3]);
+    b.addByte(_scratch8[4]);
+    b.addByte(_scratch8[5]);
+    b.addByte(_scratch8[6]);
+    b.addByte(_scratch8[7]);
   }
 }
 
+/// Zero-allocation Reader for MessagePack decoding.
 final class _Reader {
   final Uint8List b;
+  late final ByteData _bd;
   int off = 0;
-  _Reader(this.b);
 
+  _Reader(this.b) {
+    _bd = ByteData.sublistView(b);
+  }
+
+  @pragma('vm:prefer-inline')
   int u8() {
-    if (off + 1 > b.length) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message:
-              'Binary schema codec: Read beyond buffer. Offset: $off, Buffer length: ${b.length}.',
-        )
-      ]);
-    }
+    if (off >= b.length) _throwBufferOverflow();
     return b[off++];
   }
 
+  @pragma('vm:prefer-inline')
   int u16be() {
-    if (off + 2 > b.length) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message:
-              'Binary schema codec: Read beyond buffer. Offset: $off, Buffer length: ${b.length}.',
-        )
-      ]);
-    }
-    final v = ByteData.sublistView(b, off, off + 2).getUint16(0, Endian.big);
+    if (off + 2 > b.length) _throwBufferOverflow();
+    final v = (b[off] << 8) | b[off + 1];
     off += 2;
     return v;
   }
 
+  @pragma('vm:prefer-inline')
   int u32be() {
-    if (off + 4 > b.length) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message:
-              'Binary schema codec: Read beyond buffer. Offset: $off, Buffer length: ${b.length}.',
-        )
-      ]);
-    }
-    final v = ByteData.sublistView(b, off, off + 4).getUint32(0, Endian.big);
+    if (off + 4 > b.length) _throwBufferOverflow();
+    // dart2js bitwise << is signed 32-bit; getUint32 stays in 0..2^32-1.
+    final v = _bd.getUint32(off, Endian.big);
     off += 4;
     return v;
   }
 
+  @pragma('vm:prefer-inline')
   int i32be() {
-    if (off + 4 > b.length) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message:
-              'Binary schema codec: Read beyond buffer. Offset: $off, Buffer length: ${b.length}.',
-        )
-      ]);
-    }
-    final v = ByteData.sublistView(b, off, off + 4).getInt32(0, Endian.big);
+    if (off + 4 > b.length) _throwBufferOverflow();
+    final v = _bd.getInt32(off, Endian.big);
     off += 4;
     return v;
   }
 
+  @pragma('vm:prefer-inline')
   int i64be() {
-    if (off + 8 > b.length) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message:
-              'Binary schema codec: Read beyond buffer. Offset: $off, Buffer length: ${b.length}.',
-        )
-      ]);
-    }
-    final v = PlatformByteData.getInt64(
-        ByteData.sublistView(b, off, off + 8), 0, Endian.big);
+    if (off + 8 > b.length) _throwBufferOverflow();
+    final v = PlatformByteData.getInt64(_bd, off, Endian.big);
     off += 8;
     return v;
   }
 
+  @pragma('vm:prefer-inline')
   double f64be() {
-    if (off + 8 > b.length) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message:
-              'Binary schema codec: Read beyond buffer. Offset: $off, Buffer length: ${b.length}.',
-        )
-      ]);
-    }
-    final v = ByteData.sublistView(b, off, off + 8).getFloat64(0, Endian.big);
+    if (off + 8 > b.length) _throwBufferOverflow();
+    final v = _bd.getFloat64(off, Endian.big);
     off += 8;
     return v;
   }
 
-  Uint8List bytes(int len) {
+  /// Zero-copy read-only view of slice.
+  @pragma('vm:prefer-inline')
+  Uint8List bytesView(int len) {
     if (len <= 0) return Uint8List(0);
-    if (off + len > b.length) {
-      throw DbException([
-        GeneralStatus(
-          type: ResultType.engError,
-          message:
-              'Binary schema codec: Read beyond buffer. Offset: $off, Buffer length: ${b.length}.',
-        )
-      ]);
-    }
+    if (off + len > b.length) _throwBufferOverflow();
+    final out = Uint8List.sublistView(b, off, off + len);
+    off += len;
+    return out;
+  }
+
+  /// Owned copy of slice when callers retain or mutate the bytes.
+  Uint8List bytesCopy(int len) {
+    if (len <= 0) return Uint8List(0);
+    if (off + len > b.length) _throwBufferOverflow();
     final out = b.sublist(off, off + len);
     off += len;
     return out;
+  }
+
+  Never _throwBufferOverflow() {
+    throw DbException([
+      GeneralStatus(
+        type: ResultType.engError,
+        message:
+            'Binary schema codec: Read beyond buffer. Offset: $off, Buffer length: ${b.length}.',
+      )
+    ]);
   }
 }
 

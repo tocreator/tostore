@@ -179,6 +179,70 @@ class SequentialIdGenerator implements IdGenerator {
     return null;
   }
 
+  /// Local deterministic sequences never refill in the background (constructor
+  /// only starts [_refillIdPool] for distributed / random-increment). Range
+  /// allocation is fully synchronous, so another insert or a pool refill cannot
+  /// interleave and reuse the same [_currentId] window on this isolate.
+  bool get _canAllocateLocalRangeSync =>
+      !isDistributed &&
+      !config.useRandomIncrement &&
+      _idPool.isEmpty &&
+      _refillTask == null;
+
+  List<String> _allocateLocalRange(
+    int count, {
+    List<Map<String, dynamic>>? assignTo,
+    int assignStart = 0,
+    String? assignField,
+  }) {
+    final int step = config.increment;
+    final int startId = _currentId + step;
+    _currentId += count * step;
+    final result = List<String>.filled(count, '', growable: false);
+    int id = startId;
+    for (int i = 0; i < count; i++) {
+      final s = id.toString();
+      result[i] = s;
+      if (assignTo != null) {
+        assignTo[assignStart + i][assignField!] = s;
+      }
+      id += step;
+    }
+    return result;
+  }
+
+  /// Allocates [count] IDs and writes them onto [records] in a single pass.
+  ///
+  /// Uses the same [_currentId] cursor as [getId] / [getSingleIdSync]. The
+  /// local range path has no `await`, so it cannot race a concurrent insert or
+  /// the pre-generation pool. Distributed / random-increment / non-empty pool
+  /// always go through [getId].
+  Future<List<String>> allocateAndAssign(
+    int count,
+    List<Map<String, dynamic>> records,
+    int start,
+    String pkField,
+  ) async {
+    if (count <= 0) return const <String>[];
+
+    if (_canAllocateLocalRangeSync) {
+      _updateRequestStats(count);
+      return _allocateLocalRange(
+        count,
+        assignTo: records,
+        assignStart: start,
+        assignField: pkField,
+      );
+    }
+
+    final ids = await getId(count);
+    final int n = ids.length;
+    for (int i = 0; i < n; i++) {
+      records[start + i][pkField] = ids[i];
+    }
+    return ids;
+  }
+
   @override
   Future<List<String>> getId(int count, {int recentTotal = 0}) async {
     if (count <= 0) return [];
@@ -188,17 +252,11 @@ class SequentialIdGenerator implements IdGenerator {
     // Fast path: for standard local sequential IDs (non-distributed, deterministic increment),
     // allocate directly via range increment without intermediate queue overhead.
     if (!isDistributed && !config.useRandomIncrement) {
-      final step = config.increment;
+      if (_refillTask != null) {
+        await _refillTask;
+      }
       if (_idPool.isEmpty) {
-        final startId = _currentId + step;
-        _currentId += count * step;
-        final result = List<String>.filled(count, '', growable: false);
-        var id = startId;
-        for (int i = 0; i < count; i++) {
-          result[i] = id.toString();
-          id += step;
-        }
-        return result;
+        return _allocateLocalRange(count);
       }
       final result = List<String>.filled(count, '', growable: false);
       int idx = 0;
@@ -207,12 +265,9 @@ class SequentialIdGenerator implements IdGenerator {
       }
       final remaining = count - idx;
       if (remaining > 0) {
-        final startId = _currentId + step;
-        _currentId += remaining * step;
-        var id = startId;
+        final rest = _allocateLocalRange(remaining);
         for (int i = 0; i < remaining; i++) {
-          result[idx++] = id.toString();
-          id += step;
+          result[idx++] = rest[i];
         }
       }
       return result;

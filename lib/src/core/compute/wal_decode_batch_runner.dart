@@ -163,6 +163,10 @@ final class WalDecodeBatchRunner {
       return const <Map<String, dynamic>>[];
     }
 
+    if (!plan.useIsolate && plan.ranges.length <= 1) {
+      return WalEncoder.decodeFile(decodeBytes, partitionIndex);
+    }
+
     final tasks =
         <ComputeTask<WalDecodeChunkRequest, List<Map<String, dynamic>>>>[];
     for (final range in plan.ranges) {

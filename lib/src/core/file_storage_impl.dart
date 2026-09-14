@@ -482,6 +482,18 @@ class FileStorageImpl implements StorageInterface {
     }
   }
 
+  static bool _isWindowsSharingViolation(Object e) {
+    if (!Platform.isWindows) return false;
+    if (e is FileSystemException) {
+      final code = e.osError?.errorCode;
+      if (code == 32 || code == 33 || code == 5) return true;
+    }
+    final msg = e.toString().toLowerCase();
+    return msg.contains('sharing violation') ||
+        msg.contains('errno = 32') ||
+        msg.contains('errno = 33');
+  }
+
   @override
   Future<Uint8List> readAsBytes(String path) async {
     try {
@@ -489,7 +501,29 @@ class FileStorageImpl implements StorageInterface {
       if (!await file.exists()) {
         return Uint8List(0);
       }
-      return await file.readAsBytes();
+      try {
+        return await file.readAsBytes();
+      } catch (e) {
+        if (_isWindowsSharingViolation(e)) {
+          const retryDelays = [20, 50, 120, 300, 600];
+          for (int attempt = 0; attempt < retryDelays.length; attempt++) {
+            await flushAll(path: path, closeHandles: true);
+            await Future<void>.delayed(
+                Duration(milliseconds: retryDelays[attempt]));
+            try {
+              if (!await file.exists()) {
+                return Uint8List(0);
+              }
+              return await file.readAsBytes();
+            } catch (retryErr) {
+              if (attempt == retryDelays.length - 1) {
+                rethrow;
+              }
+            }
+          }
+        }
+        rethrow;
+      }
     } catch (e) {
       Logger.error('Read bytes failed', rawError: e);
       throw _wrapIoError(e, 'readAsBytes', path);
@@ -722,7 +756,29 @@ class FileStorageImpl implements StorageInterface {
       if (!await file.exists()) {
         return null;
       }
-      return await file.readAsString();
+      try {
+        return await file.readAsString();
+      } catch (e) {
+        if (_isWindowsSharingViolation(e)) {
+          const retryDelays = [20, 50, 120, 300, 600];
+          for (int attempt = 0; attempt < retryDelays.length; attempt++) {
+            await flushAll(path: path, closeHandles: true);
+            await Future<void>.delayed(
+                Duration(milliseconds: retryDelays[attempt]));
+            try {
+              if (!await file.exists()) {
+                return null;
+              }
+              return await file.readAsString();
+            } catch (retryErr) {
+              if (attempt == retryDelays.length - 1) {
+                rethrow;
+              }
+            }
+          }
+        }
+        rethrow;
+      }
     } catch (e) {
       Logger.error('Read string failed', rawError: e);
       return null;
@@ -1107,30 +1163,25 @@ class FileStorageImpl implements StorageInterface {
 
   @override
   void flushFileSync(String path) {
-    try {
-      final normalizedPath = _canonicalPath(path);
-      // 1. Flush dedicated sync handle (used by appendBytesSync)
-      final syncRaf = _syncHandlePool['$normalizedPath|a'];
-      if (syncRaf != null) {
-        try {
-          syncRaf.flushSync();
-        } catch (_) {}
+    final normalizedPath = _canonicalPath(path);
+    Object? firstError;
+    void tryFlush(RandomAccessFile? raf) {
+      if (raf == null) return;
+      try {
+        raf.flushSync();
+      } catch (e) {
+        firstError ??= e;
       }
-      // 2. Direct O(1) handle lookups for writable modes, eliminating O(N) handle pool iteration
-      final appendRaf = _handlePool['$normalizedPath|a'];
-      if (appendRaf != null) {
-        try {
-          appendRaf.flushSync();
-        } catch (_) {}
-      }
-      final writeRaf = _handlePool['$normalizedPath|w'];
-      if (writeRaf != null) {
-        try {
-          writeRaf.flushSync();
-        } catch (_) {}
-      }
-    } catch (e) {
-      Logger.error('Flush file sync failed', rawError: e);
+    }
+
+    tryFlush(_syncHandlePool['$normalizedPath|a']);
+    tryFlush(_handlePool['$normalizedPath|a']);
+    tryFlush(_handlePool['$normalizedPath|w']);
+    final err = firstError;
+    if (err != null) {
+      Logger.error('Flush file sync failed', rawError: err);
+      if (err is DbException) throw err;
+      throw _wrapIoError(err, 'flushFileSync', path);
     }
   }
 

@@ -1339,8 +1339,17 @@ class TableDataManager {
     }
   }
 
-  /// Get batch of IDs (used for optimizing bulk insert scenarios)
-  Future<List<String>> getBatchIds(TableContext table, int count) async {
+  /// Get batch of IDs (used for optimizing bulk insert scenarios).
+  ///
+  /// When [assignTo] / [assignField] are set, IDs are written onto the records
+  /// in the same pass as generation (no extra Map inject scan).
+  Future<List<String>> getBatchIds(
+    TableContext table,
+    int count, {
+    List<Map<String, dynamic>>? assignTo,
+    int assignStart = 0,
+    String? assignField,
+  }) async {
     try {
       if (count <= 0) return [];
 
@@ -1355,8 +1364,25 @@ class TableDataManager {
       // Get ID generator
       final generator = await _getIdGenerator(table);
 
-      // Get IDs directly in batch
-      final ids = await generator.getId(count);
+      late final List<String> ids;
+      if (assignTo != null &&
+          assignField != null &&
+          generator is SequentialIdGenerator) {
+        ids = await generator.allocateAndAssign(
+          count,
+          assignTo,
+          assignStart,
+          assignField,
+        );
+      } else {
+        ids = await generator.getId(count);
+        if (assignTo != null && assignField != null) {
+          final int n = ids.length;
+          for (int i = 0; i < n; i++) {
+            assignTo[assignStart + i][assignField] = ids[i];
+          }
+        }
+      }
 
       // If it's a sequential increment type, update max ID value
       if (schema.primaryKeyConfig.type == PrimaryKeyType.sequential &&
