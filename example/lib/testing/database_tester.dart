@@ -14,7 +14,6 @@ import 'log_service.dart';
 class DatabaseTester {
   static const bool _isWasmBuild =
       kIsWasm || bool.fromEnvironment('FLUTTER_WEB_USE_SKWASM');
-  // These tests currently pull in code paths that break dart2wasm/wasm-opt.
   static const String _schemaUpgradeLegacyUsersTable =
       'mobile_upgrade_users_legacy';
   static const String _schemaUpgradeUsersTable = 'mobile_upgrade_users';
@@ -78,6 +77,24 @@ class DatabaseTester {
     }
   }
 
+  FieldSchema? _schemaFieldByName(TableSchema schema, String name) {
+    for (final field in schema.fields) {
+      if (field.name == name) {
+        return field;
+      }
+    }
+    return null;
+  }
+
+  bool _schemaHasIndexField(TableSchema schema, String fieldName) {
+    for (final idx in schema.indexes) {
+      if (idx.fields.contains(fieldName)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   Future<Map<String, dynamic>?> _queryCachedFirstUserByField(
       String field, dynamic value) async {
     return await db
@@ -102,6 +119,22 @@ class DatabaseTester {
     isTestPassed &= _expect('$description (2nd query)', secondResult, expected);
 
     return isTestPassed;
+  }
+
+  Future<bool> _andExpectCachedUserQueryTwice({
+    required bool ok,
+    required String description,
+    required String field,
+    required dynamic value,
+    Map<String, dynamic>? expected,
+  }) async {
+    final nextOk = await _expectCachedUserQueryTwice(
+      description: description,
+      field: field,
+      value: value,
+      expected: expected,
+    );
+    return ok && nextOk;
   }
 
   /// Main test runner that executes all test suites.
@@ -134,25 +167,20 @@ class DatabaseTester {
         {'name': 'Expression Operations', 'test': _testExpressionOperations},
         {'name': 'Transaction Operations', 'test': _testTransactionOperations},
         {'name': 'Backup & Restore', 'test': _testBackupAndRestore},
-        if (!_isWasmBuild) ...[
-          {
-            'name': 'Instance Schema Auto Upgrade',
-            'test': _testInstanceSchemaAutoUpgrade
-          },
-          {
-            'name': 'Runtime Schema Migration Integrity',
-            'test': _testRuntimeSchemaMigrationIntegrity,
-          },
-          {
-            'name': 'Advanced Queries & Edge Cases',
-            'test': _testAdvancedQueriesAndEdgeCases
-          },
-          {'name': 'Count Verification', 'test': _testCountVerification},
-          {
-            'name': 'Concurrency Stress Test',
-            'test': () => runConfigurableConcurrencyTest(_baseConcurrencyConfig)
-          },
-        ],
+        {
+          'name': 'Instance Schema Auto Upgrade',
+          'test': _testInstanceSchemaAutoUpgrade
+        },
+        {
+          'name': 'Runtime Schema Migration Integrity',
+          'test': _testRuntimeSchemaMigrationIntegrity,
+        },
+        {
+          'name': 'Advanced Queries & Edge Cases',
+          'test': _testAdvancedQueriesAndEdgeCases
+        },
+        {'name': 'Count Verification', 'test': _testCountVerification},
+        {'name': 'Concurrency Stress Test', 'test': _testConcurrencyStress},
       ];
 
       for (var i = 0; i < tests.length; i++) {
@@ -608,10 +636,18 @@ class DatabaseTester {
       });
 
       isTestPassed &= _expect(
-        'Old schema insert users into renamed table should succeed',
-        !insertUser1.hasErrors &&
-            !insertUser2.hasErrors &&
-            !insertUser3.hasErrors,
+        'Old schema insert user 1 should succeed',
+        !insertUser1.hasErrors,
+        true,
+      );
+      isTestPassed &= _expect(
+        'Old schema insert user 2 should succeed',
+        !insertUser2.hasErrors,
+        true,
+      );
+      isTestPassed &= _expect(
+        'Old schema insert user 3 should succeed',
+        !insertUser3.hasErrors,
         true,
       );
       if (!isTestPassed || insertUser1.firstPrimaryKey == null) {
@@ -644,19 +680,25 @@ class DatabaseTester {
         applyActiveSpaceOnDefault: false,
       );
 
+      final legacyTableExists =
+          await migratedDb.tableExists(_schemaUpgradeLegacyUsersTable);
       isTestPassed &= _expect(
         'Legacy renamed table should not exist after reopen migration',
-        await migratedDb.tableExists(_schemaUpgradeLegacyUsersTable),
+        legacyTableExists,
         false,
       );
+      final renamedUsersExists =
+          await migratedDb.tableExists(_schemaUpgradeUsersTable);
       isTestPassed &= _expect(
         'Renamed users table should exist after reopen migration',
-        await migratedDb.tableExists(_schemaUpgradeUsersTable),
+        renamedUsersExists,
         true,
       );
+      final auditTableExists =
+          await migratedDb.tableExists(_schemaUpgradeAuditTable);
       isTestPassed &= _expect(
         'New audit table should be created during reopen migration',
-        await migratedDb.tableExists(_schemaUpgradeAuditTable),
+        auditTableExists,
         true,
       );
 
@@ -668,21 +710,21 @@ class DatabaseTester {
         );
       }
 
-      final usernameField = migratedUserSchema.fields.firstWhere(
-        (field) => field.name == 'username',
-      );
-      final displayNameField = migratedUserSchema.fields.firstWhere(
-        (field) => field.name == 'display_name',
-      );
-      final statusField = migratedUserSchema.fields.firstWhere(
-        (field) => field.name == 'status',
-      );
-      final pointsField = migratedUserSchema.fields.firstWhere(
-        (field) => field.name == 'points',
-      );
-      final tierField = migratedUserSchema.fields.firstWhere(
-        (field) => field.name == 'tier',
-      );
+      final usernameField = _schemaFieldByName(migratedUserSchema, 'username');
+      final displayNameField =
+          _schemaFieldByName(migratedUserSchema, 'display_name');
+      final statusField = _schemaFieldByName(migratedUserSchema, 'status');
+      final pointsField = _schemaFieldByName(migratedUserSchema, 'points');
+      final tierField = _schemaFieldByName(migratedUserSchema, 'tier');
+      if (usernameField == null ||
+          displayNameField == null ||
+          statusField == null ||
+          pointsField == null ||
+          tierField == null) {
+        return _failTest(
+          'Migrated users schema is missing expected fields after reopen migration.',
+        );
+      }
 
       isTestPassed &= _expect(
           'Migrated username field maxLength', usernameField.maxLength, 32);
@@ -1029,11 +1071,23 @@ class DatabaseTester {
       });
 
       isTestPassed &= _expect(
-        'Initial inserts into default space should succeed',
-        !insA1.hasErrors &&
-            !insA2.hasErrors &&
-            !insB1.hasErrors &&
-            !insB2.hasErrors,
+        'Initial insert A1 should succeed',
+        !insA1.hasErrors,
+        true,
+      );
+      isTestPassed &= _expect(
+        'Initial insert A2 should succeed',
+        !insA2.hasErrors,
+        true,
+      );
+      isTestPassed &= _expect(
+        'Initial insert B1 should succeed',
+        !insB1.hasErrors,
+        true,
+      );
+      isTestPassed &= _expect(
+        'Initial insert B2 should succeed',
+        !insB2.hasErrors,
         true,
       );
 
@@ -1063,11 +1117,23 @@ class DatabaseTester {
       });
 
       isTestPassed &= _expect(
-        'Initial inserts into test_space should succeed',
-        !insA3.hasErrors &&
-            !insA4.hasErrors &&
-            !insB3.hasErrors &&
-            !insB4.hasErrors,
+        'Initial test_space insert A3 should succeed',
+        !insA3.hasErrors,
+        true,
+      );
+      isTestPassed &= _expect(
+        'Initial test_space insert A4 should succeed',
+        !insA4.hasErrors,
+        true,
+      );
+      isTestPassed &= _expect(
+        'Initial test_space insert B3 should succeed',
+        !insB3.hasErrors,
+        true,
+      );
+      isTestPassed &= _expect(
+        'Initial test_space insert B4 should succeed',
+        !insB4.hasErrors,
         true,
       );
 
@@ -1100,8 +1166,16 @@ class DatabaseTester {
         'toBeIndexed': 'index_val_old_2',
         'shouldRemoveIndex': 'rm_idx_old_2',
       });
-      isTestPassed &= _expect('Pre-rename unflushed inserts should succeed',
-          !insAOld1.hasErrors && !insAOld2.hasErrors, true);
+      isTestPassed &= _expect(
+        'Pre-rename unflushed insert 1 should succeed',
+        !insAOld1.hasErrors,
+        true,
+      );
+      isTestPassed &= _expect(
+        'Pre-rename unflushed insert 2 should succeed',
+        !insAOld2.hasErrors,
+        true,
+      );
 
       // 7. Perform runtime schema migration: 2 table renames, 2 field renames, 1 add field, 1 add index, 1 remove index
       final updateResultA = await testDb
@@ -1345,13 +1419,13 @@ class DatabaseTester {
       isTestPassed &= _expect('Final schema for new_table_a should exist',
           finalSchemaA != null, true);
       if (finalSchemaA != null) {
-        final hasToBeIndexed = finalSchemaA.indexes
-            .any((idx) => idx.fields.contains('toBeIndexed'));
+        final hasToBeIndexed =
+            _schemaHasIndexField(finalSchemaA, 'toBeIndexed');
         isTestPassed &= _expect(
             'Schema must contain toBeIndexed index', hasToBeIndexed, true);
 
-        final hasRemovedIndex = finalSchemaA.indexes
-            .any((idx) => idx.fields.contains('shouldRemoveIndex'));
+        final hasRemovedIndex =
+            _schemaHasIndexField(finalSchemaA, 'shouldRemoveIndex');
         isTestPassed &= _expect(
             'Schema must NOT contain shouldRemoveIndex index',
             hasRemovedIndex,
@@ -1677,44 +1751,6 @@ class DatabaseTester {
     try {
       await _clearTablesSafely();
 
-      if (_isWasmBuild) {
-        final insertResult = await db.insert(ExampleSchemas.users.name,
-            {'username': 'crud_user', 'email': 'crud@test.com', 'age': 30});
-        isTestPassed &= _expect(
-            'Insert should be successful', !insertResult.hasErrors, true);
-        isTestPassed &=
-            _expect('Insert should affect 1 row', insertResult.successCount, 1);
-
-        final user = await db
-            .query(ExampleSchemas.users.name)
-            .where('username', '=', 'crud_user');
-        isTestPassed &= _expect('Read should find 1 user', user.length, 1);
-        isTestPassed &= _expect('Read should find correct user',
-            user.data.first['email'], 'crud@test.com');
-
-        await db.update(ExampleSchemas.users.name, {'age': 31}).where(
-            'username', '=', 'crud_user');
-        final updatedUser = await db
-            .query(ExampleSchemas.users.name)
-            .where('username', '=', 'crud_user')
-            .first();
-        isTestPassed &=
-            _expect('Update should change age to 31', updatedUser?['age'], 31);
-
-        final deleteResult = await db
-            .delete(ExampleSchemas.users.name)
-            .where('username', '=', 'crud_user');
-        isTestPassed &= _expect(
-            'Delete should be successful', !deleteResult.hasErrors, true);
-        isTestPassed &=
-            _expect('Delete should affect 1 row', deleteResult.successCount, 1);
-        final dataAfterDeleteQuery = await db.query(ExampleSchemas.users.name);
-        final countAfterDelete = dataAfterDeleteQuery.length;
-        isTestPassed &=
-            _expect('Count after delete should be 0', countAfterDelete, 0);
-        return isTestPassed;
-      }
-
       const username = 'crud_user';
       const email = 'crud@test.com';
       const insertedAge = 30;
@@ -1732,28 +1768,34 @@ class DatabaseTester {
       };
 
       // Attach watch listener before write operations to verify all stream callbacks.
-      watchCollector = _WatchEventCollector<List<Map<String, dynamic>>>(
-        db
-            .query(ExampleSchemas.users.name)
-            .where('username', '=', username)
-            .watch(),
-      );
+      // Query/KV watch uses Stream/Record paths that dart2wasm still mishandles.
+      if (!_isWasmBuild) {
+        watchCollector = _WatchEventCollector<List<Map<String, dynamic>>>(
+          db
+              .query(ExampleSchemas.users.name)
+              .where('username', '=', username)
+              .watch(),
+        );
 
-      // Verify event 0: initial query state before insert must be empty.
-      final initialWatchData = await watchCollector.waitForEventAt(0);
-      isTestPassed &= _expect(
-        'Watch stream initial emission should be empty',
-        initialWatchData?.isEmpty ?? false,
-        true,
-      );
+        // Verify event 0: initial query state before insert must be empty.
+        final initialWatchData = await watchCollector.waitForEventAt(0);
+        final initialWatchEmpty = initialWatchData?.isEmpty ?? false;
+        isTestPassed &= _expect(
+          'Watch stream initial emission should be empty',
+          initialWatchEmpty,
+          true,
+        );
+      }
 
       // Prime cached miss queries so insert must invalidate and rebuild them.
-      isTestPassed &= await _expectCachedUserQueryTwice(
+      isTestPassed = await _andExpectCachedUserQueryTwice(
+        ok: isTestPassed,
         description: 'Pre-insert username index query should be empty',
         field: 'username',
         value: username,
       );
-      isTestPassed &= await _expectCachedUserQueryTwice(
+      isTestPassed = await _andExpectCachedUserQueryTwice(
+        ok: isTestPassed,
         description: 'Pre-insert age index query should be empty',
         field: 'age',
         value: insertedAge,
@@ -1774,36 +1816,42 @@ class DatabaseTester {
       final userId = insertResult.firstPrimaryKey;
 
       // Verify event 1: watch callback after insert.
-      final insertedWatchData = await watchCollector.waitForEventAt(1);
-      isTestPassed &= _expect(
-        'Watch stream emission after insert should contain 1 row',
-        insertedWatchData?.length,
-        1,
-      );
-      if (insertedWatchData != null && insertedWatchData.isNotEmpty) {
-        final row = insertedWatchData.first;
-        isTestPassed &=
-            _expect('Watch insert event username', row['username'], username);
-        isTestPassed &=
-            _expect('Watch insert event email', row['email'], email);
-        isTestPassed &=
-            _expect('Watch insert event age', row['age'], insertedAge);
+      if (!_isWasmBuild) {
+        final insertedWatchData = await watchCollector!.waitForEventAt(1);
+        final insertedWatchLength = insertedWatchData?.length;
+        isTestPassed &= _expect(
+          'Watch stream emission after insert should contain 1 row',
+          insertedWatchLength,
+          1,
+        );
+        if (insertedWatchData != null && insertedWatchData.isNotEmpty) {
+          final row = insertedWatchData.first;
+          isTestPassed &=
+              _expect('Watch insert event username', row['username'], username);
+          isTestPassed &=
+              _expect('Watch insert event email', row['email'], email);
+          isTestPassed &=
+              _expect('Watch insert event age', row['age'], insertedAge);
+        }
       }
 
       // Read twice after insert to ensure repeated cached queries stay correct.
-      isTestPassed &= await _expectCachedUserQueryTwice(
+      isTestPassed = await _andExpectCachedUserQueryTwice(
+        ok: isTestPassed,
         description: 'Inserted user should be readable by primary key',
         field: 'id',
         value: userId,
         expected: insertedExpected,
       );
-      isTestPassed &= await _expectCachedUserQueryTwice(
+      isTestPassed = await _andExpectCachedUserQueryTwice(
+        ok: isTestPassed,
         description: 'Inserted user should be readable by username index',
         field: 'username',
         value: username,
         expected: insertedExpected,
       );
-      isTestPassed &= await _expectCachedUserQueryTwice(
+      isTestPassed = await _andExpectCachedUserQueryTwice(
+        ok: isTestPassed,
         description: 'Inserted user should be readable by age index',
         field: 'age',
         value: insertedAge,
@@ -1820,37 +1868,44 @@ class DatabaseTester {
           _expect('Update should affect 1 row', updateResult.successCount, 1);
 
       // Verify event 2: watch callback after update.
-      final updatedWatchData = await watchCollector.waitForEventAt(2);
-      isTestPassed &= _expect(
-        'Watch stream emission after update should contain 1 row',
-        updatedWatchData?.length,
-        1,
-      );
-      if (updatedWatchData != null && updatedWatchData.isNotEmpty) {
-        final row = updatedWatchData.first;
-        isTestPassed &=
-            _expect('Watch update event age', row['age'], updatedAge);
+      if (!_isWasmBuild) {
+        final updatedWatchData = await watchCollector!.waitForEventAt(2);
+        final updatedWatchLength = updatedWatchData?.length;
+        isTestPassed &= _expect(
+          'Watch stream emission after update should contain 1 row',
+          updatedWatchLength,
+          1,
+        );
+        if (updatedWatchData != null && updatedWatchData.isNotEmpty) {
+          final row = updatedWatchData.first;
+          isTestPassed &=
+              _expect('Watch update event age', row['age'], updatedAge);
+        }
       }
 
-      isTestPassed &= await _expectCachedUserQueryTwice(
+      isTestPassed = await _andExpectCachedUserQueryTwice(
+        ok: isTestPassed,
         description: 'Updated user should return latest data by primary key',
         field: 'id',
         value: userId,
         expected: updatedExpected,
       );
-      isTestPassed &= await _expectCachedUserQueryTwice(
+      isTestPassed = await _andExpectCachedUserQueryTwice(
+        ok: isTestPassed,
         description: 'Updated user should return latest data by username index',
         field: 'username',
         value: username,
         expected: updatedExpected,
       );
-      isTestPassed &= await _expectCachedUserQueryTwice(
+      isTestPassed = await _andExpectCachedUserQueryTwice(
+        ok: isTestPassed,
         description: 'Updated user should return latest data by new age index',
         field: 'age',
         value: updatedAge,
         expected: updatedExpected,
       );
-      isTestPassed &= await _expectCachedUserQueryTwice(
+      isTestPassed = await _andExpectCachedUserQueryTwice(
+        ok: isTestPassed,
         description: 'Updated user old age index query should stay empty',
         field: 'age',
         value: insertedAge,
@@ -1865,24 +1920,30 @@ class DatabaseTester {
           _expect('Delete should affect 1 row', deleteResult.successCount, 1);
 
       // Verify event 3: watch callback after delete.
-      final deletedWatchData = await watchCollector.waitForEventAt(3);
-      isTestPassed &= _expect(
-        'Watch stream emission after delete should be empty',
-        deletedWatchData?.isEmpty ?? false,
-        true,
-      );
+      if (!_isWasmBuild) {
+        final deletedWatchData = await watchCollector!.waitForEventAt(3);
+        final deletedWatchEmpty = deletedWatchData?.isEmpty ?? false;
+        isTestPassed &= _expect(
+          'Watch stream emission after delete should be empty',
+          deletedWatchEmpty,
+          true,
+        );
+      }
 
-      isTestPassed &= await _expectCachedUserQueryTwice(
+      isTestPassed = await _andExpectCachedUserQueryTwice(
+        ok: isTestPassed,
         description: 'Deleted user primary key query should stay empty',
         field: 'id',
         value: userId,
       );
-      isTestPassed &= await _expectCachedUserQueryTwice(
+      isTestPassed = await _andExpectCachedUserQueryTwice(
+        ok: isTestPassed,
         description: 'Deleted user username index query should stay empty',
         field: 'username',
         value: username,
       );
-      isTestPassed &= await _expectCachedUserQueryTwice(
+      isTestPassed = await _andExpectCachedUserQueryTwice(
+        ok: isTestPassed,
         description: 'Deleted user age index query should stay empty',
         field: 'age',
         value: updatedAge,
@@ -2247,94 +2308,76 @@ class DatabaseTester {
 
       // Test 1: Primary Key Sort Comparison
       // Test 1a: Ascending sort
-      final userIdsAsc =
-          (await db.query(ExampleSchemas.users.name).orderByAsc('id'))
-              .data
-              .map((u) => u['id'])
-              .toList();
+      final usersAsc =
+          await db.query(ExampleSchemas.users.name).orderByAsc('id');
+      final userIdsAsc = <dynamic>[];
+      for (final u in usersAsc.data) {
+        userIdsAsc.add(u['id']);
+      }
 
       isTestPassed &= _expect('Primary key ascending sort order', userIdsAsc,
           ['1', '2', '3', '10', '20']);
 
       // Test 1b: Descending sort
-      final userIdsDesc =
-          (await db.query(ExampleSchemas.users.name).orderByDesc('id'))
-              .data
-              .map((u) => u['id'])
-              .toList();
+      final usersDesc =
+          await db.query(ExampleSchemas.users.name).orderByDesc('id');
+      final userIdsDesc = <dynamic>[];
+      for (final u in usersDesc.data) {
+        userIdsDesc.add(u['id']);
+      }
       isTestPassed &= _expect('Primary key descending sort order', userIdsDesc,
           ['20', '10', '3', '2', '1']);
 
       // Test 2: Primary Key Range Queries
       final usersIdGreaterThan2 =
-          (await db.query(ExampleSchemas.users.name).where('id', '>', 2))
-              .length;
-      isTestPassed &=
-          _expect('Query "id > 2"', usersIdGreaterThan2, 3); // ids 3, 10, 20
+          await db.query(ExampleSchemas.users.name).where('id', '>', 2);
+      isTestPassed &= _expect(
+          'Query "id > 2"', usersIdGreaterThan2.length, 3); // ids 3, 10, 20
 
       // Test 3: Quoted vs. Unquoted Numeric Queries
-      isTestPassed &= _expect(
-          'Query age = 20 (numeric)',
-          (await db.query(ExampleSchemas.users.name).where('age', '=', 20))
-              .length,
-          1);
-      isTestPassed &= _expect(
-          'Query age = "20" (string)',
-          (await db.query(ExampleSchemas.users.name).where('age', '=', '20'))
-              .length,
-          1);
-      isTestPassed &= _expect(
-          'Query age > 40 (numeric)',
-          (await db.query(ExampleSchemas.users.name).where('age', '>', 40))
-              .length,
-          1);
-      isTestPassed &= _expect(
-          'Query age > "40" (string)',
-          (await db.query(ExampleSchemas.users.name).where('age', '>', '40'))
-              .length,
-          1);
+      final ageEq20 =
+          await db.query(ExampleSchemas.users.name).where('age', '=', 20);
+      isTestPassed &= _expect('Query age = 20 (numeric)', ageEq20.length, 1);
+      final ageEq20Str =
+          await db.query(ExampleSchemas.users.name).where('age', '=', '20');
+      isTestPassed &=
+          _expect('Query age = "20" (string)', ageEq20Str.length, 1);
+      final ageGt40 =
+          await db.query(ExampleSchemas.users.name).where('age', '>', 40);
+      isTestPassed &= _expect('Query age > 40 (numeric)', ageGt40.length, 1);
+      final ageGt40Str =
+          await db.query(ExampleSchemas.users.name).where('age', '>', '40');
+      isTestPassed &=
+          _expect('Query age > "40" (string)', ageGt40Str.length, 1);
 
       // Test 4: LIKE Queries
-      isTestPassed &= _expect(
-          'LIKE "user_1%"',
-          (await db
-                  .query(ExampleSchemas.users.name)
-                  .where('username', 'like', 'user_1%'))
-              .length,
-          2);
-      isTestPassed &= _expect(
-          'LIKE "%@a.com"',
-          (await db
-                  .query(ExampleSchemas.users.name)
-                  .where('email', 'like', '%@a.com'))
-              .length,
-          1);
-      isTestPassed &= _expect(
-          'LIKE "%user%"',
-          (await db
-                  .query(ExampleSchemas.users.name)
-                  .where('username', 'like', '%user%'))
-              .length,
-          5);
+      final likeUser1 = await db
+          .query(ExampleSchemas.users.name)
+          .where('username', 'like', 'user_1%');
+      isTestPassed &= _expect('LIKE "user_1%"', likeUser1.length, 2);
+      final likeEmailA = await db
+          .query(ExampleSchemas.users.name)
+          .where('email', 'like', '%@a.com');
+      isTestPassed &= _expect('LIKE "%@a.com"', likeEmailA.length, 1);
+      final likeUser = await db
+          .query(ExampleSchemas.users.name)
+          .where('username', 'like', '%user%');
+      isTestPassed &= _expect('LIKE "%user%"', likeUser.length, 5);
 
       // Test 5: Non-indexed Field Query
-      isTestPassed &= _expect(
-          'Non-indexed query fans >= 400',
-          (await db.query(ExampleSchemas.users.name).where('fans', '>=', 400))
-              .length,
-          2);
+      final fansGte400 =
+          await db.query(ExampleSchemas.users.name).where('fans', '>=', 400);
+      isTestPassed &=
+          _expect('Non-indexed query fans >= 400', fansGte400.length, 2);
 
       // Test 6: Primary Key Range Query
-      isTestPassed &= _expect(
-          'PK range id > 10',
-          (await db.query(ExampleSchemas.users.name).where('id', '>', 10))
-              .length,
-          1); // id 20
-      isTestPassed &= _expect(
-          'PK range id >= 10',
-          (await db.query(ExampleSchemas.users.name).where('id', '>=', 10))
-              .length,
-          2); // id 10, 20
+      final idGt10 =
+          await db.query(ExampleSchemas.users.name).where('id', '>', 10);
+      isTestPassed &= _expect('PK range id > 10', idGt10.length, 1); // id 20
+      final idGte10 =
+          await db.query(ExampleSchemas.users.name).where('id', '>=', 10);
+      isTestPassed &=
+          _expect('PK range id >= 10', idGte10.length, 2); // id 10, 20
     } catch (e, s) {
       isTestPassed = false;
       _failTest('Exception in _testAdvancedQueriesAndEdgeCases: $e\n$s');
@@ -2379,30 +2422,21 @@ class DatabaseTester {
     log.add('--- Testing: .count() Verification ---', LogLevel.debug);
     bool isTestPassed = true;
 
-    Future<bool> verify(String step) async {
-      final query = db.query(ExampleSchemas.users.name).where('age', '>', 25);
-      final actualData = await query;
-      final actualLength = actualData.length;
-
-      return _expect(
-          '$step: Actual data length ($actualLength) should be verified',
-          actualLength,
-          actualLength);
-    }
-
     try {
       await _clearTablesSafely();
-      final records = List.generate(
-          20,
-          (i) => {
-                'username': 'count_user_$i',
-                'email': 'count_user_$i@example.com',
-                'age': 18 + i, // Ages 18 to 37
-              });
+      final records = <Map<String, dynamic>>[];
+      for (int i = 0; i < 20; i++) {
+        records.add({
+          'username': 'count_user_$i',
+          'email': 'count_user_$i@example.com',
+          'age': 18 + i, // Ages 18 to 37
+        });
+      }
       await db.batchInsert(ExampleSchemas.users.name, records);
 
       // Initial state: age > 25 means ages 26..37 (12 records)
-      isTestPassed &= await verify('Initial insert');
+      final initialOk = await _verifyUsersOlderThan25Length('Initial insert');
+      isTestPassed = initialOk;
       if (!isTestPassed) return false;
 
       // Delete some records that match the condition
@@ -2410,7 +2444,9 @@ class DatabaseTester {
       await db.delete(ExampleSchemas.users.name).where('age', '>', 30);
 
       // After delete: age > 25 means ages 26..30 (5 records)
-      isTestPassed &= await verify('After deleting some matching records');
+      final afterMatchDeleteOk = await _verifyUsersOlderThan25Length(
+          'After deleting some matching records');
+      isTestPassed = afterMatchDeleteOk;
       if (!isTestPassed) return false;
 
       // Delete some records that DO NOT match the condition
@@ -2418,13 +2454,25 @@ class DatabaseTester {
       await db.delete(ExampleSchemas.users.name).where('age', '<', 22);
 
       // After delete: age > 25 should still be 5 records
-      isTestPassed &= await verify('After deleting non-matching records');
+      final afterNonMatchDeleteOk = await _verifyUsersOlderThan25Length(
+          'After deleting non-matching records');
+      isTestPassed = afterNonMatchDeleteOk;
       if (!isTestPassed) return false;
     } catch (e, s) {
       isTestPassed = false;
       _failTest('Exception in _testCountVerification: $e\n$s');
     }
     return isTestPassed;
+  }
+
+  Future<bool> _verifyUsersOlderThan25Length(String step) async {
+    final actualData =
+        await db.query(ExampleSchemas.users.name).where('age', '>', 25);
+    final actualLength = actualData.length;
+    return _expect(
+        '$step: Actual data length ($actualLength) should be verified',
+        actualLength,
+        actualLength);
   }
 
   /// Tests backup and restore correctness.
@@ -2531,20 +2579,16 @@ class DatabaseTester {
     return ok;
   }
 
+  Future<bool> _testConcurrencyStress() {
+    return runConfigurableConcurrencyTest(_baseConcurrencyConfig);
+  }
+
   /// Runs a configurable concurrency test based on user input.
   /// Uses users and settings tables to avoid foreign key constraint issues.
   /// Both tables have no foreign key dependencies, allowing true concurrent operations.
   Future<bool> runConfigurableConcurrencyTest(
       Map<String, Map<String, int>> config,
       {int verificationSampleSize = 10}) async {
-    if (_isWasmBuild) {
-      log.add(
-          '❌ Concurrency Stress Test is skipped on WebAssembly due to dart2wasm/wasm-opt compatibility.',
-          LogLevel.warn);
-      _updateLastOperation('❌ Concurrency Test Skipped on WebAssembly');
-      return false;
-    }
-
     log.add(
         '--- Testing: Configurable Concurrency Stress Test (users & settings) ---',
         LogLevel.debug);
@@ -2891,12 +2935,12 @@ class DatabaseTester {
           .map((s) => s['key'] as String)
           .toList();
       if (actuallyDeletedSettingKeys.isNotEmpty) {
+        final deletedSettingsQuery = await db
+            .query(ExampleSchemas.settings.name)
+            .whereIn('key', actuallyDeletedSettingKeys);
         isTestPassed &= _expect(
             'Deleted settings in sample should not be found',
-            (await db
-                    .query(ExampleSchemas.settings.name)
-                    .whereIn('key', actuallyDeletedSettingKeys))
-                .length,
+            deletedSettingsQuery.length,
             0);
       }
 
@@ -2905,12 +2949,12 @@ class DatabaseTester {
       final insertedSettingKeys =
           insertedSettingsSample.map((s) => s['key'] as String).toList();
       if (insertedSettingKeys.isNotEmpty) {
+        final insertedSettingsQuery = await db
+            .query(ExampleSchemas.settings.name)
+            .whereIn('key', insertedSettingKeys);
         isTestPassed &= _expect(
             'All newly inserted settings in sample should be found',
-            (await db
-                    .query(ExampleSchemas.settings.name)
-                    .whereIn('key', insertedSettingKeys))
-                .length,
+            insertedSettingsQuery.length,
             insertedSettingKeys.length);
       }
     } catch (e, s) {
@@ -2943,19 +2987,19 @@ class DatabaseTester {
     log.add('--- Testing: Foreign Key Operations ---', LogLevel.debug);
     bool ok = true;
     try {
-      ok &= await _testFkOutboundConstraints();
+      ok = await _testFkOutboundConstraints();
       if (!ok) return false;
-      ok &= await _testFkUnflushedParentVisibility();
+      ok = await _testFkUnflushedParentVisibility();
       if (!ok) return false;
-      ok &= await _testFkCascadeDeleteSingleAndBatch();
+      ok = await _testFkCascadeDeleteSingleAndBatch();
       if (!ok) return false;
-      ok &= await _testFkCascadeUpdateSingleAndBatch();
+      ok = await _testFkCascadeUpdateSingleAndBatch();
       if (!ok) return false;
-      ok &= await _testFkRestrictSingleAndBatch();
+      ok = await _testFkRestrictSingleAndBatch();
       if (!ok) return false;
-      ok &= await _testFkClearCascadeAndRestrict();
+      ok = await _testFkClearCascadeAndRestrict();
       if (!ok) return false;
-      ok &= await _testFkAllCascadeActionsTables();
+      ok = await _testFkAllCascadeActionsTables();
       if (!ok) return false;
     } catch (e, s) {
       ok = false;
@@ -3003,8 +3047,8 @@ class DatabaseTester {
     });
     ok &= _expect(
         'Single insert child with invalid FK fails', !badPost.hasErrors, false);
-    ok &= _expect(
-        'Invalid FK error type', _isFkParentMissing(badPost.firstType), true);
+    final badPostTypeOk = _isFkParentMissing(badPost.firstType);
+    ok &= _expect('Invalid FK error type', badPostTypeOk, true);
 
     final postId = post.firstPrimaryKey;
     final comment = await db.insert(ExampleSchemas.comments.name, {
@@ -3034,9 +3078,12 @@ class DatabaseTester {
         _expect('batchInsert partial FK: successCount', batch.successCount, 2);
     ok &= _expect('batchInsert partial FK: failedCount', batch.failedCount, 1);
     final badStatus = batch.statuses.where((s) => s.type != ResultType.success);
+    final firstBadStatus = badStatus.isEmpty ? null : badStatus.first;
+    final invalidRowIsParentMissing =
+        firstBadStatus != null && _isFkParentMissing(firstBadStatus.type);
     ok &= _expect(
       'batchInsert invalid row is parent-missing',
-      badStatus.isNotEmpty && _isFkParentMissing(badStatus.first.type),
+      invalidRowIsParentMissing,
       true,
     );
 
@@ -3053,9 +3100,11 @@ class DatabaseTester {
     ]);
     ok &=
         _expect('batchUpdate FK to missing parent fails', upd.hasErrors, true);
+    final batchUpdateMissingParentType =
+        upd.statuses.isNotEmpty && _isFkParentMissing(upd.firstType);
     ok &= _expect(
       'batchUpdate missing parent type',
-      upd.statuses.isNotEmpty && _isFkParentMissing(upd.firstType),
+      batchUpdateMissingParentType,
       true,
     );
 
@@ -3080,26 +3129,30 @@ class DatabaseTester {
       'username': 'buf_parent',
       'email': 'buf_parent@test.com',
     });
-    ok &= _expect('Unflushed parent insert', !parent.hasErrors, true);
+    final parentOk = !parent.hasErrors;
+    ok &= _expect('Unflushed parent insert', parentOk, true);
     if (!ok) return false;
     final parentId = parent.firstPrimaryKey;
 
-    // Intentionally do NOT flush — child must resolve parent from pending buffer.
-    final children = await db.batchInsert(ExampleSchemas.posts.name, [
-      {'title': 'buf_child_1', 'user_id': parentId},
-      {'title': 'buf_child_2', 'user_id': parentId},
-      {'title': 'buf_child_3', 'user_id': parentId},
-    ]);
+    final childRows = <Map<String, dynamic>>[];
+    childRows.add({'title': 'buf_child_1', 'user_id': parentId});
+    childRows.add({'title': 'buf_child_2', 'user_id': parentId});
+    childRows.add({'title': 'buf_child_3', 'user_id': parentId});
+    final children = await db.batchInsert(ExampleSchemas.posts.name, childRows);
+    final childrenOk = !children.hasErrors;
     ok &= _expect('batchInsert children against unflushed parent succeeds',
-        !children.hasErrors, true);
-    ok &= _expect('all 3 children inserted', children.successCount, 3);
+        childrenOk, true);
+    final childCount = children.successCount;
+    ok &= _expect('all 3 children inserted', childCount, 3);
 
-    final single = await db.insert(ExampleSchemas.posts.name, {
+    final singleRow = <String, dynamic>{
       'title': 'buf_child_single',
       'user_id': parentId,
-    });
+    };
+    final single = await db.insert(ExampleSchemas.posts.name, singleRow);
+    final singleOk = !single.hasErrors;
     ok &= _expect('single insert child against unflushed parent succeeds',
-        !single.hasErrors, true);
+        singleOk, true);
 
     return ok;
   }
@@ -3119,8 +3172,8 @@ class DatabaseTester {
       'username': 'cascade_commenter',
       'email': 'cascade_commenter@test.com',
     });
-    ok &= _expect(
-        'cascade users insert', !owner.hasErrors && !commenter.hasErrors, true);
+    ok &= _expect('cascade users insert owner', !owner.hasErrors, true);
+    ok &= _expect('cascade users insert commenter', !commenter.hasErrors, true);
     if (!ok) return false;
     final ownerId = owner.firstPrimaryKey;
     final commenterId = commenter.firstPrimaryKey;
@@ -3172,10 +3225,15 @@ class DatabaseTester {
         .map((s) => s.primaryKey)
         .whereType<String>()
         .toList();
-    await db.batchInsert(ExampleSchemas.comments.name, [
-      for (final id in bpIds)
-        {'post_id': id, 'user_id': commenterId, 'content': 'x$id'},
-    ]);
+    final cascadeComments = <Map<String, dynamic>>[];
+    for (final id in bpIds) {
+      cascadeComments.add({
+        'post_id': id,
+        'user_id': commenterId,
+        'content': 'x$id',
+      });
+    }
+    await db.batchInsert(ExampleSchemas.comments.name, cascadeComments);
 
     // Batch delete posts (whereIn) -> cascade comments
     final delBatch =
@@ -3183,7 +3241,8 @@ class DatabaseTester {
     ok &= _expect('batch cascade delete posts', !delBatch.hasErrors, true);
     final commentsLeft =
         await db.query(ExampleSchemas.comments.name).whereIn('post_id', bpIds);
-    ok &= _expect('batch cascade removed comments', commentsLeft.length, 0);
+    final commentsLeftCount = commentsLeft.length;
+    ok &= _expect('batch cascade removed comments', commentsLeftCount, 0);
 
     // Delete user owner (posts CASCADE; comments use other user so RESTRICT OK)
     // Remaining: p2 still owned by ownerId with 1 comment by commenter
@@ -3219,7 +3278,8 @@ class DatabaseTester {
       'username': 'upd_u2',
       'email': 'upd_u2@test.com',
     });
-    ok &= _expect('cascade-update users', !u1.hasErrors && !u2.hasErrors, true);
+    ok &= _expect('cascade-update users u1', !u1.hasErrors, true);
+    ok &= _expect('cascade-update users u2', !u2.hasErrors, true);
     if (!ok) return false;
     final oldId = u1.firstPrimaryKey!;
     final otherId = u2.firstPrimaryKey!;
@@ -3254,15 +3314,17 @@ class DatabaseTester {
         .query(ExampleSchemas.posts.name)
         .where('id', '=', postId)
         .first();
-    ok &= _expect(
-        'post.user_id cascaded', _pk(postAfter?['user_id']), _pk(newId));
+    final postAfterUserId = _pk(postAfter?['user_id']);
+    final expectedUserId = _pk(newId);
+    ok &= _expect('post.user_id cascaded', postAfterUserId, expectedUserId);
 
     final commentAfter = await db
         .query(ExampleSchemas.comments.name)
         .where('post_id', '=', postId)
         .first();
-    ok &= _expect(
-        'comment.user_id cascaded', _pk(commentAfter?['user_id']), _pk(newId));
+    final commentAfterUserId = _pk(commentAfter?['user_id']);
+    ok &=
+        _expect('comment.user_id cascaded', commentAfterUserId, expectedUserId);
 
     // Update post PK -> cascade comments.post_id
     final newPostId = 900002;
@@ -3315,14 +3377,16 @@ class DatabaseTester {
       'user_id': uid,
       'content': 'r_c',
     });
-    ok &= _expect(
-        'restrict fixture', !u.hasErrors && !p.hasErrors && !c.hasErrors, true);
+    ok &= _expect('restrict fixture user', !u.hasErrors, true);
+    ok &= _expect('restrict fixture post', !p.hasErrors, true);
+    ok &= _expect('restrict fixture comment', !c.hasErrors, true);
     if (!ok) return false;
 
     final del =
         await db.delete(ExampleSchemas.users.name).where('id', '=', uid);
     ok &= _expect('single RESTRICT delete fails', !del.hasErrors, false);
-    ok &= _expect('RESTRICT type', _isFkChildRestrict(del.firstType), true);
+    final restrictType = _isFkChildRestrict(del.firstType);
+    ok &= _expect('RESTRICT type', restrictType, true);
     final still =
         await db.query(ExampleSchemas.users.name).where('id', '=', uid);
     ok &= _expect('user remains after RESTRICT', still.length, 1);
@@ -3331,8 +3395,8 @@ class DatabaseTester {
     final del2 =
         await db.delete(ExampleSchemas.users.name).whereIn('id', [uid]);
     ok &= _expect('batch RESTRICT delete fails', !del2.hasErrors, false);
-    ok &= _expect(
-        'batch RESTRICT type', _isFkChildRestrict(del2.firstType), true);
+    final batchRestrictType = _isFkChildRestrict(del2.firstType);
+    ok &= _expect('batch RESTRICT type', batchRestrictType, true);
 
     // After removing restricting child, delete succeeds (posts cascade)
     await db
@@ -3379,8 +3443,10 @@ class DatabaseTester {
     final clearPosts = await db.clear(ExampleSchemas.posts.name);
     ok &= _expect(
         'clear posts succeeds (CASCADE comments)', !clearPosts.hasErrors, true);
-    ok &= _expect('comments wiped by clear posts',
-        await db.query(ExampleSchemas.comments.name).count(), 0);
+    final commentsAfterClearPosts =
+        await db.query(ExampleSchemas.comments.name);
+    ok &= _expect(
+        'comments wiped by clear posts', commentsAfterClearPosts.length, 0);
 
     // Recreate RESTRICT scenario for clear(users)
     await _clearTablesSafely();
@@ -3401,10 +3467,11 @@ class DatabaseTester {
     final clearUsers = await db.clear(ExampleSchemas.users.name);
     ok &= _expect(
         'clear users blocked by RESTRICT', !clearUsers.hasErrors, false);
+    final clearRestrictType = _isFkChildRestrict(clearUsers.firstType);
+    ok &= _expect('clear RESTRICT type', clearRestrictType, true);
+    final usersAfterFailedClear = await db.query(ExampleSchemas.users.name);
     ok &= _expect(
-        'clear RESTRICT type', _isFkChildRestrict(clearUsers.firstType), true);
-    ok &= _expect('users remain after failed clear',
-        await db.query(ExampleSchemas.users.name).count(), 1);
+        'users remain after failed clear', usersAfterFailedClear.length, 1);
 
     return ok;
   }
@@ -3416,74 +3483,71 @@ class DatabaseTester {
   static const _fkActSetDefault = 'fk_act_child_set_default';
   static const _fkActNoAction = 'fk_act_child_no_action';
 
-  List<TableSchema> _fkActionSchemas() {
-    final parent = TableSchema(
-      name: _fkActParent,
+  TableSchema _fkActionChildSchema(
+    String name, {
+    required ForeignKeyCascadeAction onDelete,
+    required ForeignKeyCascadeAction onUpdate,
+    bool nullableFk = false,
+    dynamic defaultFk,
+  }) {
+    return TableSchema(
+      name: name,
       primaryKeyConfig: const PrimaryKeyConfig(
         name: 'id',
         type: PrimaryKeyType.sequential,
       ),
-      fields: const [
-        FieldSchema(name: 'name', type: DataType.text, nullable: false),
+      fields: [
+        FieldSchema(
+          name: 'parent_id',
+          type: DataType.integer,
+          nullable: nullableFk,
+          defaultValue: defaultFk,
+        ),
+        const FieldSchema(name: 'label', type: DataType.text, nullable: false),
+      ],
+      foreignKeys: [
+        ForeignKeySchema(
+          name: 'fk_$name',
+          fields: const ['parent_id'],
+          referencedTable: _fkActParent,
+          referencedFields: const ['id'],
+          onDelete: onDelete,
+          onUpdate: onUpdate,
+        ),
+      ],
+      indexes: const [
+        IndexSchema(fields: ['parent_id'])
       ],
     );
+  }
 
-    TableSchema child(
-      String name, {
-      required ForeignKeyCascadeAction onDelete,
-      required ForeignKeyCascadeAction onUpdate,
-      bool nullableFk = false,
-      dynamic defaultFk,
-    }) {
-      return TableSchema(
-        name: name,
+  List<TableSchema> _fkActionSchemas() {
+    return [
+      TableSchema(
+        name: _fkActParent,
         primaryKeyConfig: const PrimaryKeyConfig(
           name: 'id',
           type: PrimaryKeyType.sequential,
         ),
-        fields: [
-          FieldSchema(
-            name: 'parent_id',
-            type: DataType.integer,
-            nullable: nullableFk,
-            defaultValue: defaultFk,
-          ),
-          const FieldSchema(
-              name: 'label', type: DataType.text, nullable: false),
+        fields: const [
+          FieldSchema(name: 'name', type: DataType.text, nullable: false),
         ],
-        foreignKeys: [
-          ForeignKeySchema(
-            name: 'fk_$name',
-            fields: const ['parent_id'],
-            referencedTable: _fkActParent,
-            referencedFields: const ['id'],
-            onDelete: onDelete,
-            onUpdate: onUpdate,
-          ),
-        ],
-        indexes: const [
-          IndexSchema(fields: ['parent_id'])
-        ],
-      );
-    }
-
-    return [
-      parent,
-      child(_fkActCascade,
+      ),
+      _fkActionChildSchema(_fkActCascade,
           onDelete: ForeignKeyCascadeAction.cascade,
           onUpdate: ForeignKeyCascadeAction.cascade),
-      child(_fkActRestrict,
+      _fkActionChildSchema(_fkActRestrict,
           onDelete: ForeignKeyCascadeAction.restrict,
           onUpdate: ForeignKeyCascadeAction.restrict),
-      child(_fkActSetNull,
+      _fkActionChildSchema(_fkActSetNull,
           onDelete: ForeignKeyCascadeAction.setNull,
           onUpdate: ForeignKeyCascadeAction.setNull,
           nullableFk: true),
-      child(_fkActSetDefault,
+      _fkActionChildSchema(_fkActSetDefault,
           onDelete: ForeignKeyCascadeAction.setDefault,
           onUpdate: ForeignKeyCascadeAction.setDefault,
           defaultFk: 1),
-      child(_fkActNoAction,
+      _fkActionChildSchema(_fkActNoAction,
           onDelete: ForeignKeyCascadeAction.noAction,
           onUpdate: ForeignKeyCascadeAction.noAction),
     ];
@@ -3500,7 +3564,8 @@ class DatabaseTester {
       _fkActParent,
     ]) {
       try {
-        if (await db.tableExists(name)) {
+        final exists = await db.tableExists(name);
+        if (exists) {
           await db.dropTable(name);
         }
       } catch (_) {}
@@ -3532,10 +3597,10 @@ class DatabaseTester {
       final pB = await db.insert(_fkActParent, {'name': 'B'});
       final pC = await db.insert(_fkActParent, {'name': 'C'});
       final pD = await db.insert(_fkActParent, {'name': 'D'});
-      ok &= _expect(
-          'action parents',
-          !pA.hasErrors && !pB.hasErrors && !pC.hasErrors && !pD.hasErrors,
-          true);
+      ok &= _expect('action parent A', !pA.hasErrors, true);
+      ok &= _expect('action parent B', !pB.hasErrors, true);
+      ok &= _expect('action parent C', !pC.hasErrors, true);
+      ok &= _expect('action parent D', !pD.hasErrors, true);
       if (!ok) return false;
       final idA = pA.firstPrimaryKey!;
       final idB = pB.firstPrimaryKey!;
@@ -3550,10 +3615,9 @@ class DatabaseTester {
       ok &= _expect('cascade children batchInsert', casKids.successCount, 2);
       final casDel = await db.delete(_fkActParent).where('id', '=', idA);
       ok &= _expect('CASCADE single delete parent', !casDel.hasErrors, true);
-      ok &= _expect(
-          'CASCADE children removed',
-          await db.query(_fkActCascade).where('parent_id', '=', idA).count(),
-          0);
+      final casKidsAfterDel =
+          await db.query(_fkActCascade).where('parent_id', '=', idA);
+      ok &= _expect('CASCADE children removed', casKidsAfterDel.length, 0);
 
       // batch: two parents with cascade children
       final pE = await db.insert(_fkActParent, {'name': 'E'});
@@ -3568,12 +3632,9 @@ class DatabaseTester {
           await db.delete(_fkActParent).whereIn('id', [idE, idF]);
       ok &=
           _expect('CASCADE batch delete parents', !casBatchDel.hasErrors, true);
-      ok &= _expect(
-          'CASCADE batch children gone',
-          await db
-              .query(_fkActCascade)
-              .whereIn('parent_id', [idE, idF]).count(),
-          0);
+      final casKidsAfterBatch =
+          await db.query(_fkActCascade).whereIn('parent_id', [idE, idF]);
+      ok &= _expect('CASCADE batch children gone', casKidsAfterBatch.length, 0);
 
       // CASCADE onUpdate (single)
       final pG = await db.insert(_fkActParent, {'name': 'G'});
@@ -3583,17 +3644,16 @@ class DatabaseTester {
       final casUpd =
           await db.update(_fkActParent, {'id': newG}).where('id', '=', idG);
       ok &= _expect('CASCADE update parent PK', !casUpd.hasErrors, true);
-      ok &= _expect(
-          'CASCADE child FK updated',
-          await db.query(_fkActCascade).where('parent_id', '=', newG).count(),
-          1);
+      final casKidsAfterUpd =
+          await db.query(_fkActCascade).where('parent_id', '=', newG);
+      ok &= _expect('CASCADE child FK updated', casKidsAfterUpd.length, 1);
 
       // ========== RESTRICT ==========
       await db.insert(_fkActRestrict, {'parent_id': idB, 'label': 'r1'});
       final resDel = await db.delete(_fkActParent).where('id', '=', idB);
       ok &= _expect('RESTRICT single delete fails', !resDel.hasErrors, false);
-      ok &=
-          _expect('RESTRICT type', _isFkChildRestrict(resDel.firstType), true);
+      final resDelType = _isFkChildRestrict(resDel.firstType);
+      ok &= _expect('RESTRICT type', resDelType, true);
 
       final resBatch = await db.delete(_fkActParent).whereIn('id', [idB]);
       ok &= _expect('RESTRICT batch delete fails', !resBatch.hasErrors, false);
@@ -3602,8 +3662,8 @@ class DatabaseTester {
       final resUpd =
           await db.update(_fkActParent, {'id': 910002}).where('id', '=', idB);
       ok &= _expect('RESTRICT update PK fails', !resUpd.hasErrors, false);
-      ok &= _expect(
-          'RESTRICT update type', _isFkChildRestrict(resUpd.firstType), true);
+      final resUpdType = _isFkChildRestrict(resUpd.firstType);
+      ok &= _expect('RESTRICT update type', resUpdType, true);
 
       // ========== SET NULL ==========
       await db.batchInsert(_fkActSetNull, [
@@ -3615,8 +3675,14 @@ class DatabaseTester {
       final nullKids =
           await db.query(_fkActSetNull).where('label', 'like', 'n%');
       ok &= _expect('SET NULL children remain', nullKids.length, 2);
-      ok &= _expect('SET NULL parent_id is null',
-          nullKids.data.every((r) => r['parent_id'] == null), true);
+      var setNullAllNull = true;
+      for (final row in nullKids.data) {
+        if (row['parent_id'] != null) {
+          setNullAllNull = false;
+          break;
+        }
+      }
+      ok &= _expect('SET NULL parent_id is null', setNullAllNull, true);
 
       final pH = await db.insert(_fkActParent, {'name': 'H'});
       final idH = pH.firstPrimaryKey!;
@@ -3627,7 +3693,8 @@ class DatabaseTester {
       ok &= _expect('SET NULL update parent PK', !nullUpd.hasErrors, true);
       final n3 =
           await db.query(_fkActSetNull).where('label', '=', 'n3').first();
-      ok &= _expect('SET NULL onUpdate -> null', n3?['parent_id'], null);
+      final n3ParentId = n3?['parent_id'];
+      ok &= _expect('SET NULL onUpdate -> null', n3ParentId, null);
 
       // ========== SET DEFAULT ==========
       await db.batchInsert(_fkActSetDefault, [
@@ -3639,8 +3706,14 @@ class DatabaseTester {
       final defKids =
           await db.query(_fkActSetDefault).where('label', 'like', 'd%');
       ok &= _expect('SET DEFAULT children remain', defKids.length, 2);
-      ok &= _expect('SET DEFAULT parent_id -> 1',
-          defKids.data.every((r) => _pk(r['parent_id']) == '1'), true);
+      var setDefaultAllOne = true;
+      for (final row in defKids.data) {
+        if (_pk(row['parent_id']) != '1') {
+          setDefaultAllOne = false;
+          break;
+        }
+      }
+      ok &= _expect('SET DEFAULT parent_id -> 1', setDefaultAllOne, true);
 
       final pI = await db.insert(_fkActParent, {'name': 'I'});
       final idI = pI.firstPrimaryKey!;
@@ -3651,7 +3724,8 @@ class DatabaseTester {
       ok &= _expect('SET DEFAULT update parent PK', !defUpd.hasErrors, true);
       final d3 =
           await db.query(_fkActSetDefault).where('label', '=', 'd3').first();
-      ok &= _expect('SET DEFAULT onUpdate -> 1', _pk(d3?['parent_id']), '1');
+      final d3ParentId = _pk(d3?['parent_id']);
+      ok &= _expect('SET DEFAULT onUpdate -> 1', d3ParentId, '1');
 
       // ========== NO ACTION (behaves like RESTRICT here) ==========
       final pJ = await db.insert(_fkActParent, {'name': 'J'});
@@ -3659,8 +3733,8 @@ class DatabaseTester {
       await db.insert(_fkActNoAction, {'parent_id': idJ, 'label': 'na1'});
       final naDel = await db.delete(_fkActParent).where('id', '=', idJ);
       ok &= _expect('NO ACTION single delete fails', !naDel.hasErrors, false);
-      ok &=
-          _expect('NO ACTION type', _isFkChildRestrict(naDel.firstType), true);
+      final naDelType = _isFkChildRestrict(naDel.firstType);
+      ok &= _expect('NO ACTION type', naDelType, true);
 
       final naBatch = await db.delete(_fkActParent).whereIn('id', [idJ]);
       ok &= _expect('NO ACTION batch delete fails', !naBatch.hasErrors, false);
@@ -3677,7 +3751,9 @@ class DatabaseTester {
         {'parent_id': idK, 'label': 'buf2'},
       ]);
       ok &= _expect('unflushed parent + batchInsert cascade children',
-          !bufKids.hasErrors && bufKids.successCount == 2, true);
+          !bufKids.hasErrors, true);
+      ok &= _expect('unflushed parent + batchInsert cascade children count',
+          bufKids.successCount, 2);
     } finally {
       await _dropFkActionTables();
     }

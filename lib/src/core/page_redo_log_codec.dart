@@ -267,7 +267,8 @@ final class PageRedoLogCodec {
   ///
   /// - Framed logs: only records inside complete Begin…End chunks.
   /// - Legacy (no markers): every complete record until a truncated tail.
-  /// - Trailing open chunk (Begin without End): dropped entirely.
+  /// - Trailing open chunk (Begin without End): that chunk only is dropped;
+  ///   earlier sealed chunks remain applicable.
   static PageRedoApplicableRecords collectApplicableRecords(Uint8List bytes) {
     final pages = <PageRedoPageRecord>[];
     final treeMetas = <PageRedoTreeMetaRecord>[];
@@ -296,6 +297,7 @@ final class PageRedoLogCodec {
     while (pos < bytes.length) {
       final rec = decodeRecord(bytes, pos);
       if (rec == null) break;
+      if (rec.nextStart <= pos) break;
       pos = rec.nextStart;
 
       if (rec is PageRedoChunkBeginRecord) {
@@ -331,8 +333,14 @@ final class PageRedoLogCodec {
       }
     }
 
-    // Incomplete trailing chunk (Begin… without End): discard.
-    dropPending();
+    // Incomplete trailing chunk: drop only the unsealed pending records.
+    // Prior Begin…End chunks already committed into [pages]/[treeMetas] stay.
+    // The write path seals one whole batch as a single wrapChunk, so a torn
+    // trailing append is a later attempt -- not half of the same B+tree split.
+    if (sawFraming && inChunk) {
+      dropPending();
+    }
+
     return PageRedoApplicableRecords(pages: pages, treeMetas: treeMetas);
   }
 

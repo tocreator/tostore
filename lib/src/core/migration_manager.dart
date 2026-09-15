@@ -4763,6 +4763,9 @@ class MigrationManager {
         }
       }
     } catch (e) {
+      if (e is DbClosedException) {
+        return MigrationMeta.initial();
+      }
       // Primary migration_meta failed/corrupt: attempt emergency fallback from stable temp file
       try {
         final tempPath = PathManager.buildTempPath(metaPath);
@@ -5434,7 +5437,7 @@ class MigrationManager {
               // applyFieldModification (avoids UI freezes on large tables).
               if (_operationsMayAdjustFieldValues(sortedOperations)) {
                 final n = tableDataMeta?.totalRecordCount;
-                Logger.warn(
+                Logger.debug(
                   'Table "${migrationTableCtx.tableName}" will adjust row values '
                   'for field type/constraint changes'
                   '${n != null ? ' (approximately $n records)' : ''}; '
@@ -5783,6 +5786,17 @@ class MigrationManager {
 
     // Pseudo cutover should not block.
     if (cutover.partitionIndex < 0) {
+      await _forceDrainWalAndJournal();
+      return;
+    }
+
+    // Meta may still claim a pending checkpoint/batch after a crash that never
+    // durably wrote WAL partition files. Do not poll until timeout.
+    if (!await wal.hasReadablePartitionLogs()) {
+      Logger.debug(
+        'WAL cutover wait: no readable partition logs in space [$spaceName]; '
+        'skipping wait',
+      );
       await _forceDrainWalAndJournal();
       return;
     }

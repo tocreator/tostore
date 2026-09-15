@@ -93,13 +93,19 @@ class BinaryMapCodec {
     return buffer.toBytes();
   }
 
-  static Map<String, dynamic>? decodeMap(Uint8List data) {
+  static Map<String, dynamic>? decodeMap(
+    Uint8List data, {
+    bool requireComplete = false,
+  }) {
     if (data.isEmpty) return null;
     try {
       final r = _Reader(data);
       final v = _readValue(r);
-      if (v is Map<String, dynamic>) return v;
-      return null;
+      if (v is! Map<String, dynamic>) return null;
+      // WAL frames size the payload to the map. If later appends made a torn
+      // dataLen "fit", a prefix map must not succeed and swallow those bytes.
+      if (requireComplete && r.off != data.length) return null;
+      return v;
     } catch (_) {
       return null;
     }

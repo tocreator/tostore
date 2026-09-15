@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math';
 import 'dart:typed_data';
 
 import '../model/data_store_config.dart';
@@ -52,6 +53,11 @@ class WalEncoder {
   /// Reads records using length-prefix format: [Length: 4B][Binary WAL Entry]
   /// Returns list of decoded entries in order.
   ///
+  /// A crash can leave a torn record whose 4-byte length later "fits" because
+  /// new records were appended. That length must not swallow following records:
+  /// if the frame header is invalid or payload decode fails, resync from the
+  /// next byte instead of skipping the claimed length.
+  ///
   /// [partitionIndex] - WAL partition index for AAD verification
   static List<Map<String, dynamic>> decodeFile(
       Uint8List fileBytes, int partitionIndex) {
@@ -62,23 +68,49 @@ class WalEncoder {
     const int maxRecordSize = 10 * 1024 * 1024;
 
     while (offset < fileBytes.length) {
-      // Need at least 4 bytes for length prefix
       if (offset + 4 > fileBytes.length) break;
 
-      // Read length prefix
-      final lengthHeader = ByteData.sublistView(fileBytes, offset, offset + 4);
-      final recordLength = lengthHeader.getUint32(0, Endian.little);
-      offset += 4;
+      final recordStart = offset;
+      final recordLength = ByteData.sublistView(fileBytes, offset, offset + 4)
+          .getUint32(0, Endian.little);
 
-      // Validate record length: must be positive, reasonable size, and fit in remaining data
-      if (recordLength == 0 ||
-          recordLength > maxRecordSize ||
-          offset + recordLength > fileBytes.length) {
-        // Invalid record length, stop parsing to avoid reading garbage
+      if (!isWellFormedBinaryRecordAt(fileBytes, recordStart, maxRecordSize)) {
+        // Legacy JSON length-prefixed records have no ToWL header.
+        if (recordLength > 0 &&
+            recordLength <= maxRecordSize &&
+            recordStart + 4 + recordLength <= fileBytes.length) {
+          final slice = Uint8List.sublistView(
+            fileBytes,
+            recordStart + 4,
+            recordStart + 4 + recordLength,
+          );
+          try {
+            final jsonEntry = _tryDecodeJson(slice);
+            if (jsonEntry != null) {
+              entries.add(jsonEntry);
+              offset = recordStart + 4 + recordLength;
+              continue;
+            }
+          } catch (_) {}
+        }
+        final resynced = tryResyncNextRecord(
+          fileBytes,
+          recordStart + 1,
+          maxRecordSize,
+          searchWindow: _resyncWindow(
+            claimedLength: recordLength,
+            maxRecordSize: maxRecordSize,
+            remainingBytes: fileBytes.length - recordStart,
+          ),
+        );
+        if (resynced != null) {
+          offset = resynced;
+          continue;
+        }
         break;
       }
 
-      // Extract and decode this record (view — decodeSingle does not retain the slice)
+      offset = recordStart + 4;
       final recordData =
           Uint8List.sublistView(fileBytes, offset, offset + recordLength);
       offset += recordLength;
@@ -87,14 +119,98 @@ class WalEncoder {
         final entry = decodeSingle(recordData, partitionIndex);
         if (entry != null) {
           entries.add(entry);
+          continue;
         }
-      } catch (e) {
-        // Skip corrupted record, continue with next
+      } catch (_) {}
+
+      // Header looked complete (length now fits after later appends) but the
+      // payload is torn. Do not skip [recordLength] — that window contains
+      // subsequently appended valid records.
+      final resynced = tryResyncNextRecord(
+        fileBytes,
+        recordStart + 1,
+        maxRecordSize,
+        searchWindow: _resyncWindow(
+          claimedLength: recordLength,
+          maxRecordSize: maxRecordSize,
+          remainingBytes: fileBytes.length - recordStart,
+        ),
+      );
+      if (resynced != null) {
+        offset = resynced;
         continue;
       }
+      break;
     }
 
     return entries;
+  }
+
+  /// True when [start] is a complete ToWL frame: length, magic, version, and
+  /// inner dataLen all agree and the bytes fit in [fileBytes].
+  static bool isWellFormedBinaryRecordAt(
+    Uint8List fileBytes,
+    int start,
+    int maxRecordSize,
+  ) {
+    if (start < 0 || start + 13 > fileBytes.length) return false;
+    final bd = ByteData.sublistView(fileBytes);
+    final recordLength = bd.getUint32(start, Endian.little);
+    if (recordLength < 9 || recordLength > maxRecordSize) return false;
+    if (start + 4 + recordLength > fileBytes.length) return false;
+    if (bd.getUint32(start + 4, Endian.little) != _walMagic) return false;
+    if (fileBytes[start + 8] != _walVersion) return false;
+    final dataLen = bd.getUint32(start + 9, Endian.little);
+    return dataLen == recordLength - 9;
+  }
+
+  static int _resyncWindow({
+    required int claimedLength,
+    required int maxRecordSize,
+    required int remainingBytes,
+  }) {
+    const defaultWindow = 65536;
+    if (claimedLength <= 0 || claimedLength > maxRecordSize) {
+      return defaultWindow;
+    }
+    final span = min(claimedLength, max(0, remainingBytes));
+    return max(defaultWindow, span);
+  }
+
+  /// Scan ahead to find the next valid WAL record header if a record was torn
+  /// or corrupted mid-file.
+  ///
+  /// Returns the byte offset of the next length prefix, or null if none.
+  /// [searchWindow] defaults to 64KB; pass the torn record's claimed length
+  /// when later appends made that length fit, so records inside the swallowed
+  /// span are still found.
+  static int? tryResyncNextRecord(
+    Uint8List fileBytes,
+    int searchStart,
+    int maxRecordSize, {
+    int searchWindow = 65536,
+  }) {
+    if (searchStart < 0 || searchStart + 8 > fileBytes.length) return null;
+    final int searchEnd = min(
+      fileBytes.length - 8,
+      searchStart + max(0, searchWindow),
+    );
+    for (int i = searchStart; i <= searchEnd; i++) {
+      if (fileBytes[i] != 0x4C ||
+          i + 3 >= fileBytes.length ||
+          fileBytes[i + 1] != 0x57 ||
+          fileBytes[i + 2] != 0x6F ||
+          fileBytes[i + 3] != 0x54) {
+        continue;
+      }
+      final candidateStart = i - 4;
+      if (candidateStart < searchStart) continue;
+      if (isWellFormedBinaryRecordAt(
+          fileBytes, candidateStart, maxRecordSize)) {
+        return candidateStart;
+      }
+    }
+    return null;
   }
 
   /// Decode single WAL entry synchronously from binary format.
@@ -119,7 +235,7 @@ class WalEncoder {
 
     // Get data length
     final dataLen = header.getUint32(5, Endian.little);
-    if (data.length < 9 + dataLen) return null;
+    if (data.length != 9 + dataLen) return null;
 
     // Step 1: Extract encrypted data (zero-copy view)
     final encryptedData = Uint8List.sublistView(data, 9, 9 + dataLen);
@@ -127,8 +243,10 @@ class WalEncoder {
     // Step 2/3: Decrypt. AAD only needed for AEAD algorithms.
     final decrypted = _decodePayload(encryptedData, partitionIndex);
 
-    // Step 4: Parse MessagePack binary
-    return BinaryMapCodec.decodeMap(decrypted);
+    // Step 4: Parse MessagePack binary. Require the map to consume the whole
+    // payload so a torn frame whose dataLen later fits (because new records
+    // were appended) cannot decode a prefix map and skip those records.
+    return BinaryMapCodec.decodeMap(decrypted, requireComplete: true);
   }
 
   /// Check if data is in binary WAL format
@@ -297,20 +415,23 @@ class WalEncoder {
           ByteData.sublistView(tailBytes, candidateStart, candidateStart + 4);
       final recordLength = lengthHeader.getUint32(0, Endian.little);
 
-      // Quick validation: length must be reasonable and record must end at tail end
+      // Quick validation: length must be reasonable and fit within the tail buffer.
+      // Notice: candidateStart + 4 + recordLength may be <= offset because a crash
+      // during write may leave a few partial/truncated bytes at the very end of the file!
       if (recordLength < _minRecordSize ||
           recordLength >=
               10 * 1024 * 1024 || // Sanity check: max 10MB per record
-          candidateStart + 4 + recordLength != offset) {
+          candidateStart + 4 + recordLength > offset) {
         continue; // Skip invalid length
       }
 
       // Extract the Binary WAL Entry (without length prefix)
       final recordDataStart = candidateStart + 4;
-      if (recordDataStart + recordLength > tailBytes.length) continue;
+      final recordDataEnd = recordDataStart + recordLength;
+      if (recordDataEnd > tailBytes.length) continue;
 
       final recordData =
-          Uint8List.sublistView(tailBytes, recordDataStart, offset);
+          Uint8List.sublistView(tailBytes, recordDataStart, recordDataEnd);
 
       // CRITICAL OPTIMIZATION: Check Magic number before attempting expensive decryption
       // This avoids decrypting data at every position that happens to have a valid-looking

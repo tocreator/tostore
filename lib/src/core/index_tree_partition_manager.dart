@@ -488,13 +488,20 @@ final class IndexTreePartitionManager {
     if (meta.btreeHeight <= 0) return root;
     TreePagePtr cur = root;
     for (int depth = meta.btreeHeight; depth > 0; depth--) {
-      final node = await _readInternal(table, indexUid, meta, cur,
-          encryptionKey: encryptionKey,
-          encryptionKeyId: encryptionKeyId,
-          readFromFileOnly: readFromFileOnly);
-      if (node.children.isEmpty) return firstLeaf;
-      final idx = node.childIndexForKey(keyBytes);
-      cur = node.children[idx];
+      try {
+        final node = await _readInternal(table, indexUid, meta, cur,
+            encryptionKey: encryptionKey,
+            encryptionKeyId: encryptionKeyId,
+            readFromFileOnly: readFromFileOnly);
+        if (node.children.isEmpty) return firstLeaf;
+        final idx = node.childIndexForKey(keyBytes);
+        cur = node.children[idx];
+      } catch (e) {
+        Logger.warn(
+          'Failed to descend index internal node for index ${indexUid.value} on ${table.tableName} at $cur: $e; falling back to first leaf.',
+        );
+        return firstLeaf;
+      }
     }
     return cur;
   }
@@ -513,12 +520,19 @@ final class IndexTreePartitionManager {
     if (meta.btreeHeight <= 0) return root;
     TreePagePtr cur = root;
     for (int depth = meta.btreeHeight; depth > 0; depth--) {
-      final node = await _readInternal(table, indexUid, meta, cur,
-          encryptionKey: encryptionKey,
-          encryptionKeyId: encryptionKeyId,
-          readFromFileOnly: readFromFileOnly);
-      if (node.children.isEmpty) return lastLeaf;
-      cur = node.children.last;
+      try {
+        final node = await _readInternal(table, indexUid, meta, cur,
+            encryptionKey: encryptionKey,
+            encryptionKeyId: encryptionKeyId,
+            readFromFileOnly: readFromFileOnly);
+        if (node.children.isEmpty) return lastLeaf;
+        cur = node.children.last;
+      } catch (e) {
+        Logger.warn(
+          'Failed to descend rightmost index internal node for index ${indexUid.value} on ${table.tableName} at $cur: $e; falling back to last leaf.',
+        );
+        return lastLeaf.isNull ? meta.btreeFirstLeaf : lastLeaf;
+      }
     }
 
     return cur;
@@ -819,10 +833,15 @@ final class IndexTreePartitionManager {
       stats.maxPageNoWritten = max(stats.maxPageNoWritten, ptr.pageNo);
     }
 
+    final allocatedPages = <TreePagePtr>{};
+
     Future<TreePagePtr> allocatePage() async {
       final activePartitionNo = meta.btreePartitionCount - 1;
       final reused = await popFreePage(activePartitionNo);
-      if (reused != null) return reused;
+      if (reused != null) {
+        allocatedPages.add(reused);
+        return reused;
+      }
 
       final pageSize = _dataStore.configuredPageSize;
       final nextPg = meta.btreeNextPageNo;
@@ -833,6 +852,7 @@ final class IndexTreePartitionManager {
       final partitionCount = meta.btreePartitionCount;
       final ptr = TreePagePtr(partitionCount - 1, meta.btreeNextPageNo);
       meta = _consumeNext(meta);
+      allocatedPages.add(ptr);
       return ptr;
     }
 
@@ -1140,6 +1160,8 @@ final class IndexTreePartitionManager {
     int targetLeafPages = 0;
     int targetInternalPages = 0;
 
+    final accumulatedRedoBytes = <Uint8List>[];
+
     // ---- Encode dirty pages into staged writes (once per page) ----
     if (dirtyLeaves.isNotEmpty || dirtyInternals.isNotEmpty) {
       final stageYc = YieldController(
@@ -1206,16 +1228,7 @@ final class IndexTreePartitionManager {
         final bytesList = res.pageBytes;
 
         if (res.pageRedoBytes != null && batchContext != null) {
-          final redoPath = _dataStore.pathManager.getPageRedoLogPath(
-              batchContext.batchId,
-              spaceName: _dataStore.currentSpaceName);
-          await _storage.ensureDirectoryExists(p.dirname(redoPath));
-          // Begin…End chunk sealed before page IO: truncated chunk ⇒ no page write yet.
-          await _storage.appendBytes(
-            redoPath,
-            PageRedoLogCodec.wrapChunk(res.pageRedoBytes!),
-            flush: true,
-          );
+          accumulatedRedoBytes.add(res.pageRedoBytes!);
         }
 
         for (int i = 0; i < bytesList.length; i++) {
@@ -1622,11 +1635,6 @@ final class IndexTreePartitionManager {
           encryptionKeyId: encryptionKeyId,
         );
         if (batchContext != null) {
-          final redoPath = _dataStore.pathManager.getPageRedoLogPath(
-            batchContext.batchId,
-            spaceName: _dataStore.currentSpaceName,
-          );
-          await _storage.ensureDirectoryExists(p.dirname(redoPath));
           final rec = PageRedoLogCodec.encodePageRecord(
             treeKind: PageRedoTreeKind.indexTree,
             tableUid: table.tableUid,
@@ -1635,24 +1643,52 @@ final class IndexTreePartitionManager {
             pageNo: 0,
             payload: p0Bytes,
           );
-          await _storage.appendBytes(
-            redoPath,
-            PageRedoLogCodec.wrapChunk(rec),
-            flush: true,
-          );
+          accumulatedRedoBytes.add(rec);
         }
         stageWrite(p0Stats.path!, 0, p0Bytes);
       }
     }
 
-    // Flush staged random writes per file.
+    // Seal and persist all dirty pages + Page 0 atomically in Page Redo Log.
+    if (accumulatedRedoBytes.isNotEmpty && batchContext != null) {
+      final redoPath = _dataStore.pathManager.getPageRedoLogPath(
+        batchContext.batchId,
+        spaceName: _dataStore.currentSpaceName,
+      );
+      await _storage.ensureDirectoryExists(p.dirname(redoPath));
+      final int totalLen =
+          accumulatedRedoBytes.fold<int>(0, (sum, b) => sum + b.length);
+      final Uint8List merged;
+      if (accumulatedRedoBytes.length == 1) {
+        merged = accumulatedRedoBytes.first;
+      } else {
+        merged = Uint8List(totalLen);
+        int offset = 0;
+        for (final b in accumulatedRedoBytes) {
+          merged.setRange(offset, offset + b.length, b);
+          offset += b.length;
+        }
+      }
+      await _storage.appendBytes(
+        redoPath,
+        PageRedoLogCodec.wrapChunk(merged),
+        flush: true,
+      );
+    }
+
     if (staged.isNotEmpty) {
       final flushYc = YieldController(
         'IndexTreePartitionManager.writeChanges.flushFiles',
         checkInterval: 20,
       );
 
+      final scheduler = _dataStore.workloadScheduler;
+      final workloadType = (batchContext?.batchType == BatchType.maintenance)
+          ? WorkloadType.maintenance
+          : WorkloadType.flush;
+
       final tasks = <Future<void> Function()>[];
+
       for (final e in staged.entries) {
         final y7 = flushYc.maybeYield();
         if (y7 != null) await y7;
@@ -1660,34 +1696,32 @@ final class IndexTreePartitionManager {
         final durable = partitionStats.values
             .any((s) => s.path == path && s.alreadyDurableForBatch);
         if (durable) continue;
+
         final offsets = e.value.keys.toList(growable: false)..sort();
-        final writes = <ByteWrite>[
-          for (final off in offsets)
-            ByteWrite(offset: off, bytes: e.value[off]!),
-        ];
-        tasks.add(() async {
-          await _storage.writeManyAsBytesAt(path, writes, flush: false);
-        });
+        final writes = <ByteWrite>[];
+        for (final off in offsets) {
+          writes.add(ByteWrite(offset: off, bytes: e.value[off]!));
+        }
+
+        if (writes.isNotEmpty) {
+          tasks.add(() async {
+            await _storage.writeManyAsBytesAt(path, writes, flush: false);
+            await _storage.flushFile(path);
+          });
+        }
       }
 
       if (tasks.isNotEmpty) {
-        final scheduler = _dataStore.workloadScheduler;
         if (scheduler.globalMax <= 0 || tasks.length <= 1) {
           for (final t in tasks) {
-            final y8 = flushYc.maybeYield();
-            if (y8 != null) await y8;
+            final y = flushYc.maybeYield();
+            if (y != null) await y;
             await t();
           }
         } else {
-          final workloadType =
-              (batchContext?.batchType == BatchType.maintenance)
-                  ? WorkloadType.maintenance
-                  : WorkloadType.flush;
-
           final int requested = (concurrency != null && concurrency > 0)
               ? min(concurrency, tasks.length)
               : min(scheduler.capacityTokens(workloadType), tasks.length);
-
           WorkloadLease? lease;
           try {
             lease = await scheduler.acquire(
@@ -1695,14 +1729,13 @@ final class IndexTreePartitionManager {
               requestedTokens: requested,
               minTokens: 1,
               label:
-                  'IndexTreePartitionManager.writeChanges($tableName.$indexLogName)',
+                  'IndexTreePartitionManager.writeChanges.flushFiles($tableName.$indexLogName)',
             );
-
             final int ioConcurrency = min(tasks.length, max(1, lease.tokens));
             await ParallelProcessor.execute<void>(
               tasks,
               concurrency: ioConcurrency,
-              label: 'IndexTreePartitionManager.writeChanges.flush',
+              label: 'IndexTreePartitionManager.writeChanges.flushFiles',
               continueOnError: false,
             );
           } finally {
@@ -2437,6 +2470,12 @@ final class IndexTreePartitionManager {
       }
     }
 
+    final visited = <int>{};
+    int toKey(TreePagePtr p) => (p.partitionNo << 32) | (p.pageNo & 0xFFFFFFFF);
+
+    LeafPage? lastValidLeaf;
+    TreePagePtr lastValidPtr = TreePagePtr.nullPtr;
+
     while (!leafPtr.isNull && remaining > 0) {
       if (_dataStore.shouldAbortBackgroundScan) {
         await drainPrefetch();
@@ -2446,13 +2485,75 @@ final class IndexTreePartitionManager {
           lastKey: lastKey,
         );
       }
+      final k = toKey(leafPtr);
+      if (visited.contains(k)) {
+        Logger.warn(
+          'B+Tree cycle detected during index range scan for table ${table.tableName} index $indexUid at $leafPtr; terminating scan.',
+        );
+        await drainPrefetch();
+        return IndexSearchResult(
+          primaryKeys: out,
+          entries: entriesOut.isEmpty ? null : entriesOut,
+          lastKey: lastKey,
+        );
+      }
+      visited.add(k);
+
       final y11 = yc.maybeYield();
       if (y11 != null) await y11;
-      final leaf = await getLeaf(leafPtr);
+      LeafPage leaf;
+      try {
+        leaf = await getLeaf(leafPtr);
+      } catch (e) {
+        // --- Self-Healing: Attempt to bypass broken/missing leaf via index internal tree ---
+        if (!reverse &&
+            lastValidLeaf != null &&
+            lastValidLeaf.keys.isNotEmpty) {
+          final probeKey = lastValidLeaf.highKey.isNotEmpty
+              ? lastValidLeaf.highKey
+              : Uint8List.fromList([...lastValidLeaf.keys.last, 0x00]);
+          try {
+            final healedPtr = await _locateLeafForKey(
+              table,
+              resolvedUid,
+              meta,
+              probeKey,
+              encryptionKey: encryptionKey,
+              encryptionKeyId: encryptionKeyId,
+              readFromFileOnly: readFromFileOnly,
+            );
+            if (!healedPtr.isNull &&
+                healedPtr != leafPtr &&
+                healedPtr != lastValidPtr &&
+                !visited.contains(toKey(healedPtr))) {
+              Logger.warn(
+                'B+Tree self-healed index leaf chain for table ${table.tableName} index $indexUid: bypassed broken leaf $leafPtr to $healedPtr.',
+              );
+              leafPtr = healedPtr;
+              continue;
+            }
+          } catch (_) {}
+        }
+        Logger.warn(
+          'Corrupted leaf page encountered during index range scan for table ${table.tableName} index $indexUid at $leafPtr: $e; stopping scan.',
+        );
+        await drainPrefetch();
+        return IndexSearchResult(
+          primaryKeys: out,
+          entries: entriesOut.isEmpty ? null : entriesOut,
+          lastKey: lastKey,
+        );
+      }
+
       if (leaf.keys.isEmpty) {
-        leafPtr = reverse ? leaf.prev : leaf.next;
+        final nextTarget = reverse ? leaf.prev : leaf.next;
+        if (nextTarget.isNull) break;
+        leafPtr = nextTarget;
         continue;
       }
+
+      lastValidLeaf = leaf;
+      lastValidPtr = leafPtr;
 
       schedulePrefetch(reverse ? leaf.prev : leaf.next);
 
@@ -2559,19 +2660,40 @@ final class IndexTreePartitionManager {
     var ptr = firstLeaf;
     final yc = YieldController('IndexTreePartitionManager.getAllDecodedEntries',
         checkInterval: 50);
+    final visited = <int>{};
+    int toKey(TreePagePtr p) => (p.partitionNo << 32) | (p.pageNo & 0xFFFFFFFF);
+
     while (!ptr.isNull) {
+      final k = toKey(ptr);
+      if (visited.contains(k)) {
+        Logger.warn(
+          'Index B+Tree cycle detected in leaf chain for index ${indexUid.value} on table ${table.tableName} at $ptr; terminating traversal.',
+        );
+        break;
+      }
+      visited.add(k);
+
       final y12 = yc.maybeYield();
       if (y12 != null) await y12;
-      final leaf = await _readLeaf(table, resolvedUid, meta, ptr,
-          encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
+      LeafPage leaf;
+      try {
+        leaf = await _readLeaf(table, resolvedUid, meta, ptr,
+            encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
+      } catch (e) {
+        Logger.warn(
+          'Corrupted index leaf page encountered for index ${indexUid.value} on table ${table.tableName} at $ptr: $e; stopping traversal.',
+        );
+        break;
+      }
+
       for (int i = 0; i < leaf.keys.length; i++) {
         final y13 = yc.maybeYield();
         if (y13 != null) await y13;
-        final k = leaf.keys[i];
+        final key = leaf.keys[i];
         final v = leaf.values[i];
-        final pk = _extractPk(meta, k, v);
+        final pk = _extractPk(meta, key, v);
         if (pk == null || pk.isEmpty) continue;
-        final comps = MemComparableKey.decodeTuple(k);
+        final comps = MemComparableKey.decodeTuple(key);
         if (comps.isEmpty) continue;
         // Non-unique: last component is PK; strip it from key components.
         final keyComps =

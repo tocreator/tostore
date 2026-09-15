@@ -1532,6 +1532,15 @@ class ParallelJournalManager {
       final hasLogs = _walManager.hasExistingLogs;
       if (!_dataStore.config.enableJournal && !hasLogs) return;
       final meta = _walManager.meta;
+      // Meta can claim a range/pending batch after a kill even when the
+      // partition log was never written. Persist a clean checkpoint here;
+      // otherwise idle restarts keep re-entering recovery until a later write.
+      if (hasLogs && !await _walManager.hasReadablePartitionLogs()) {
+        try {
+          await _walManager.healStaleWalMetaIfLogsMissing();
+        } catch (_) {}
+        return;
+      }
       // If there are no known WAL partitions, nothing to replay.
       if (meta.existingStartPartitionIndex < 0 ||
           meta.existingEndPartitionIndex < 0) {
@@ -1557,19 +1566,25 @@ class ParallelJournalManager {
           final ptr = tailLastPtr ?? checkpoint;
           _walManager.updateCurrentPointerAfterRecovery(ptr);
           try {
-            await _walManager.setLastRecoveredPointer(ptr);
+            await _walManager.setLastRecoveredPointer(ptr, flush: true);
           } catch (_) {}
           return;
         }
       }
 
-      final startP = checkpoint.partitionIndex;
-      // Use existingEndPartitionIndex as the logical tail of WAL partitions.
-      final endP = tailP;
       final cap = _dataStore.config.logPartitionCycle;
+      if (cap <= 0) {
+        Logger.error(
+          'WAL recovery: invalid logPartitionCycle=$cap, skipping replay',
+        );
+        return;
+      }
+      final startP = normalizeWalPartitionIndex(checkpoint.partitionIndex, cap);
+      final partitions = await _walManager.listPartitionsToScan(
+        checkpoint.partitionIndex,
+        tailP,
+      );
 
-      int p = startP;
-      bool first = true;
       // Track the last WAL pointer we actually scanned so that WAL manager
       // can update its in-memory current pointer precisely after recovery.
       int lastPartition = startP;
@@ -1603,7 +1618,13 @@ class ParallelJournalManager {
           checkInterval: 1,
           budgetMs: 50);
       final recoveryNow = DateTime.now();
-      while (true) {
+      if (partitions.isEmpty) {
+        Logger.warn(
+          'WAL recovery: no partitions to scan '
+          '(checkpoint=$checkpoint end=$tailP cycle=$cap)',
+        );
+      }
+      for (final p in partitions) {
         final y4 = partitionYieldController.maybeYield();
         if (y4 != null) await y4;
 
@@ -1611,17 +1632,12 @@ class ParallelJournalManager {
         if (excludeRanges != null &&
             excludeRanges.isNotEmpty &&
             _isPartitionFullyExcluded(p, excludeRanges, cap)) {
-          if (p == endP) break;
-          p = (p + 1) % cap;
-          first = false;
-          if (p == startP) break;
           continue;
         }
 
-        int toSkip = 0;
-        if (first) {
-          toSkip = meta.checkpoint.entrySeq; // skip already processed
-        }
+        final int toSkip = p == startP
+            ? meta.checkpoint.entrySeq
+            : 0; // skip already processed
         int seq = toSkip;
         try {
           // Reuse startup decode cache before touching disk when possible.
@@ -1634,28 +1650,14 @@ class ParallelJournalManager {
                     ? const <Map<String, dynamic>>[]
                     : cached.sublist(toSkip));
           } else {
-            final dirIndex = _walManager.getPartitionDirIndex(p);
-            final path = dirIndex != null
-                ? _dataStore.pathManager.getWalPartitionLogPath(dirIndex, p,
-                    spaceName: _dataStore.currentSpaceName)
-                : _dataStore.pathManager.getWalPartitionLogPath(
-                    p ~/ _dataStore.maxEntriesPerDir, p,
-                    spaceName: _dataStore.currentSpaceName);
+            final path = _walManager.partitionLogPath(p);
             final exists = await _dataStore.storage.existsFile(path);
             if (!exists) {
-              if (p == endP) break;
-              p = (p + 1) % cap;
-              first = false;
-              if (p == startP) break;
               continue;
             }
 
             final fileBytes = await _dataStore.storage.readAsBytes(path);
             if (fileBytes.isEmpty) {
-              if (p == endP) break;
-              p = (p + 1) % cap;
-              first = false;
-              if (p == startP) break;
               continue;
             }
 
@@ -1795,11 +1797,6 @@ class ParallelJournalManager {
             }
           }
         } catch (_) {}
-
-        if (p == endP) break;
-        p = (p + 1) % cap;
-        first = false;
-        if (p == startP) break; // safety
       }
       // After replaying WAL, update WAL manager's in-memory current pointer.
       final WalPointer lastPtr =
@@ -1816,28 +1813,14 @@ class ParallelJournalManager {
           try {
             await _walManager.clearWalPartitionsAndResetMeta();
           } catch (_) {}
-        } else {
-          try {
-            final ptrForMeta = (lastPartition == endP)
-                ? lastPtr
-                : WalPointer(partitionIndex: endP, entrySeq: 0);
-            await _walManager.setLastRecoveredPointer(ptrForMeta);
-          } catch (_) {}
         }
         return;
       } else {
         Logger.debug('Recovery added effective entries');
       }
 
-      try {
-        // Persist recovery hint using tail partition so tryFastPathSkipRecovery
-        // can match next startup (lastRecoveredPointer.partitionIndex must equal
-        // existingEndPartitionIndex; otherwise fast path never triggers).
-        final ptrForMeta = (lastPartition == endP)
-            ? lastPtr
-            : WalPointer(partitionIndex: endP, entrySeq: 0);
-        await _walManager.setLastRecoveredPointer(ptrForMeta);
-      } catch (_) {}
+      // Do not persist lastRecovered / checkpoint here. Entries are only in
+      // the flush queue; a close/kill before table IO must still replay WAL.
 
       // After WAL recovery completes, update maxId for all tables that had inserts
       // We tracked the max primary key during recovery (WAL entries are processed in order,
@@ -2217,6 +2200,20 @@ class ParallelJournalManager {
       final _BatchWalData walData = await _collectBatchWalChanges(batch);
       walData.tablePlans.addAll(plans);
 
+      if (walData.orderedOpsInWalOrder.isEmpty &&
+          walData.orderedOpsByTable.isEmpty) {
+        Logger.warn(
+          'Pending batch ${batch.batchId}: WAL logs missing or empty; '
+          'dropping batch without table rollback or reflush',
+        );
+        await _walManager.removePendingParallelBatch(batch.batchId);
+        await _deletePageRedoLogIfExists(batch.batchId);
+        try {
+          await _flushRecoveryArtifactsIfNeeded();
+        } catch (_) {}
+        return null;
+      }
+
       final tablesNeedingReplay = <TableUid>{
         ...walData.orderedOpsByTable.keys,
         ...plans.keys,
@@ -2383,7 +2380,10 @@ class ParallelJournalManager {
   }
 
   bool _reachedWalEnd(int partitionIndex, int entrySeq, WalPointer end) {
-    if (partitionIndex == end.partitionIndex && entrySeq > end.entrySeq) {
+    final cap = _dataStore.config.logPartitionCycle;
+    if (cap <= 0) return false;
+    final endP = normalizeWalPartitionIndex(end.partitionIndex, cap);
+    if (partitionIndex == endP && entrySeq > end.entrySeq) {
       return true;
     }
     return false;
@@ -2424,21 +2424,21 @@ class ParallelJournalManager {
         );
       }
       final cap = _dataStore.config.logPartitionCycle;
+      if (cap <= 0) {
+        return _BatchWalData(
+          insertsByTable: inserts,
+          updatesByTable: updates,
+          deletesByTable: deletes,
+          orderedOpsByTable: ordered,
+          orderedOpsInWalOrder: [],
+        );
+      }
+      final startN = normalizeWalPartitionIndex(startP, cap);
       final encoderConfig = EncryptionManager.getCurrentEncodingState();
-      int p = startP;
-      bool first = true;
-      while (true) {
-        final dirIndex = _walManager.getPartitionDirIndex(p);
-        final path = dirIndex != null
-            ? _dataStore.pathManager.getWalPartitionLogPath(dirIndex, p,
-                spaceName: _dataStore.currentSpaceName)
-            : _dataStore.pathManager.getWalPartitionLogPath(
-                p ~/ _dataStore.maxEntriesPerDir, p,
-                spaceName: _dataStore.currentSpaceName);
-        int toSkip = 0;
-        if (first) {
-          toSkip = batch.start.entrySeq;
-        }
+      final partitions = await _walManager.listPartitionsToScan(startP, endP);
+      for (final p in partitions) {
+        final path = _walManager.partitionLogPath(p);
+        final int toSkip = p == startN ? batch.start.entrySeq : 0;
         int seq = 0;
         try {
           List<Map<String, dynamic>> entries;
@@ -2448,20 +2448,11 @@ class ParallelJournalManager {
           } else {
             final exists = await _dataStore.storage.existsFile(path);
             if (!exists) {
-              // File doesn't exist, skip this partition (may be first startup or file was deleted)
-              if (p == endP) break;
-              p = (p + 1) % cap;
-              first = false;
-              if (p == startP) break;
               continue;
             }
 
             final fileBytes = await _dataStore.storage.readAsBytes(path);
             if (fileBytes.isEmpty) {
-              if (p == endP) break;
-              p = (p + 1) % cap;
-              first = false;
-              if (p == startP) break;
               continue;
             }
 
@@ -2483,7 +2474,7 @@ class ParallelJournalManager {
             final y6 = yieldController.maybeYield();
             if (y6 != null) await y6;
             seq++;
-            if (first && seq < toSkip) continue;
+            if (p == startN && seq < toSkip) continue;
 
             final table = entry['table'] as String?;
             final data = (entry['data'] as Map?)?.cast<String, dynamic>();
@@ -2545,11 +2536,6 @@ class ParallelJournalManager {
             }
           }
         } catch (_) {}
-
-        if (p == endP) break;
-        p = (p + 1) % cap;
-        first = false;
-        if (p == startP) break;
       }
     } catch (e) {
       Logger.error('collect WAL for batch failed', rawError: e);
@@ -2736,228 +2722,238 @@ class ParallelJournalManager {
   /// the commit image -- keep replayed pages as-is; do not roll totals back to
   /// base (there is no WAL reflush to rebuild them).
   Future<void> _replayPageRedoLogIfExists(String batchId) async {
-    final redoPath = _dataStore.pathManager
-        .getPageRedoLogPath(batchId, spaceName: _dataStore.currentSpaceName);
-    if (!await _dataStore.storage.existsFile(redoPath)) return;
-    final size = await _dataStore.storage.getFileSize(redoPath);
-    if (size <= 0) return;
-    final bytes = await _dataStore.storage.readAsBytes(redoPath);
-    final applicable = PageRedoLogCodec.collectApplicableRecords(bytes);
-    // Deduplicate by logical identity with last-write-wins.
-    // Reason: redo log may contain multiple attempts or duplicates for the same page.
-    final byPartition = <({
-      PageRedoTreeKind kind,
-      TableUid tableUid,
-      IndexUid indexUid,
-      int partitionNo
-    }),
-        Map<int, Uint8List>>{};
-    final treeMeta = <({
-      PageRedoTreeKind kind,
-      TableUid tableUid,
-      IndexUid indexUid
-    }),
-        PageRedoTreeMetaRecord>{};
-    const yieldInterval = 50;
-    final parseYc = YieldController(
-        'ParallelJournalManager._replayPageRedoLog.parse',
-        checkInterval: yieldInterval);
-    for (var i = 0; i < applicable.pages.length; i++) {
-      final y7 = parseYc.maybeYield();
-      if (y7 != null) await y7;
-      final rec = applicable.pages[i];
-      final key = (
-        kind: rec.treeKind,
-        tableUid: rec.tableUid,
-        indexUid: rec.indexUid ?? IndexUid.empty,
-        partitionNo: rec.partitionNo,
-      );
-      byPartition.putIfAbsent(key, () => <int, Uint8List>{})[rec.pageNo] =
-          rec.payload;
-    }
-    for (final rec in applicable.treeMetas) {
-      final key = (
-        kind: rec.treeKind,
-        tableUid: rec.tableUid,
-        indexUid: rec.indexUid ?? IndexUid.empty,
-      );
-      treeMeta[key] = rec;
-    }
-    final writeYc = YieldController(
-        'ParallelJournalManager._replayPageRedoLog.write',
-        checkInterval: 5);
-    for (final e in byPartition.entries) {
-      final y8 = writeYc.maybeYield();
-      if (y8 != null) await y8;
-      final key = e.key;
-      final pages = e.value;
-      if (pages.isEmpty) continue;
-      if ((key.kind == PageRedoTreeKind.indexTree ||
-              key.kind == PageRedoTreeKind.ngh) &&
-          key.indexUid.isEmpty) {
-        continue;
+    try {
+      final redoPath = _dataStore.pathManager
+          .getPageRedoLogPath(batchId, spaceName: _dataStore.currentSpaceName);
+      if (!await _dataStore.storage.existsFile(redoPath)) return;
+      final size = await _dataStore.storage.getFileSize(redoPath);
+      if (size <= 0) return;
+      final bytes = await _dataStore.storage.readAsBytes(redoPath);
+      if (bytes.isEmpty) return;
+      final applicable = PageRedoLogCodec.collectApplicableRecords(bytes);
+      // Deduplicate by logical identity with last-write-wins.
+      // Reason: redo log may contain multiple attempts or duplicates for the same page.
+      final byPartition = <({
+        PageRedoTreeKind kind,
+        TableUid tableUid,
+        IndexUid indexUid,
+        int partitionNo
+      }),
+          Map<int, Uint8List>>{};
+      final treeMeta = <({
+        PageRedoTreeKind kind,
+        TableUid tableUid,
+        IndexUid indexUid
+      }),
+          PageRedoTreeMetaRecord>{};
+      const yieldInterval = 50;
+      final parseYc = YieldController(
+          'ParallelJournalManager._replayPageRedoLog.parse',
+          checkInterval: yieldInterval);
+      for (var i = 0; i < applicable.pages.length; i++) {
+        final y7 = parseYc.maybeYield();
+        if (y7 != null) await y7;
+        final rec = applicable.pages[i];
+        final key = (
+          kind: rec.treeKind,
+          tableUid: rec.tableUid,
+          indexUid: rec.indexUid ?? IndexUid.empty,
+          partitionNo: rec.partitionNo,
+        );
+        byPartition.putIfAbsent(key, () => <int, Uint8List>{})[rec.pageNo] =
+            rec.payload;
       }
-
-      String path;
-      try {
-        if (key.kind == PageRedoTreeKind.table) {
-          final tableContext = await _tableContextFromUid(key.tableUid);
-          if (tableContext == null) continue;
-          path = _dataStore.pathManager
-              .getPartitionFilePathByContext(tableContext, key.partitionNo);
-        } else if (key.kind == PageRedoTreeKind.ngh) {
-          final tableContext = await _tableContextFromUid(key.tableUid);
-          if (tableContext == null) continue;
-          final indexUid =
-              _resolveRedoIndexUid(tableContext.schema, key.indexUid);
-          path = _dataStore.pathManager.getNghPostingPartitionPathByContext(
-              tableContext, indexUid, key.partitionNo);
-        } else {
-          final tableContext = await _tableContextFromUid(key.tableUid);
-          if (tableContext == null) continue;
-          final indexUid =
-              _resolveRedoIndexUid(tableContext.schema, key.indexUid);
-          path = _dataStore.pathManager.getIndexPartitionPathByContext(
-              tableContext, indexUid, key.partitionNo);
+      for (final rec in applicable.treeMetas) {
+        final key = (
+          kind: rec.treeKind,
+          tableUid: rec.tableUid,
+          indexUid: rec.indexUid ?? IndexUid.empty,
+        );
+        treeMeta[key] = rec;
+      }
+      final writeYc = YieldController(
+          'ParallelJournalManager._replayPageRedoLog.write',
+          checkInterval: 5);
+      for (final e in byPartition.entries) {
+        final y8 = writeYc.maybeYield();
+        if (y8 != null) await y8;
+        final key = e.key;
+        final pages = e.value;
+        if (pages.isEmpty) continue;
+        if ((key.kind == PageRedoTreeKind.indexTree ||
+                key.kind == PageRedoTreeKind.ngh) &&
+            key.indexUid.isEmpty) {
+          continue;
         }
-      } catch (_) {
-        continue;
-      }
 
-      // Ensure directory exists before writing.
-      try {
-        await _dataStore.storage.ensureDirectoryExists(p.dirname(path));
-      } catch (_) {}
-
-      // Use a consistent pageSize for this partition; skip inconsistent payloads.
-      int pageSize = 0;
-      for (final v in pages.values) {
-        if (v.isNotEmpty) {
-          pageSize = v.length;
-          break;
-        }
-      }
-      if (pageSize <= 0) continue;
-
-      final pageNos = pages.keys.toList(growable: false)..sort();
-      final writes = <ByteWrite>[];
-      for (final pg in pageNos) {
-        if (pg < 0) continue;
-        final payload = pages[pg];
-        if (payload == null || payload.isEmpty) continue;
-        if (payload.length != pageSize) continue;
-        final off = pg * pageSize;
-        writes.add(ByteWrite(offset: off, bytes: payload));
-      }
-      if (writes.isEmpty) continue;
-      writes.sort((a, b) => a.offset.compareTo(b.offset));
-      await _dataStore.storage.writeManyAsBytesAt(path, writes, flush: true);
-
-      // Partition-0 page0 carries global TableDataMeta / IndexMeta / NghIndexMeta.
-      // Invalidate meta caches so later recovery reads the restored page0, not
-      // a pre-crash in-memory snapshot.
-      if (key.partitionNo == 0 && pages.containsKey(0)) {
-        final tableContext = await _tableContextFromUid(key.tableUid);
-        if (tableContext != null) {
-          if (key.kind == PageRedoTreeKind.table) {
-            _dataStore.tableDataManager
-                .invalidateTableDataMetaCacheForTable(tableContext);
-          } else if (key.kind == PageRedoTreeKind.indexTree) {
-            final indexUid =
-                _resolveRedoIndexUid(tableContext.schema, key.indexUid);
-            _dataStore.indexManager
-                ?.invalidateIndexMetaCache(key.tableUid, indexUid);
-          } else if (key.kind == PageRedoTreeKind.ngh) {
-            final indexUid =
-                _resolveRedoIndexUid(tableContext.schema, key.indexUid);
-            _dataStore.vectorIndexManager
-                ?.clearCacheForIndex(key.tableUid, indexUid);
-          }
-        }
-      }
-    }
-
-    // Legacy TreeMetaRecord: only apply when partition-0 page0 was NOT restored
-    // in this redo (old logs before global meta lived in page0). New write path
-    // embeds full meta in page0 images -- applying TreeMetaRecord after p0 would
-    // overwrite restored totals with a stale cache RMW.
-    if (treeMeta.isNotEmpty) {
-      final metaYc = YieldController(
-        'ParallelJournalManager._replayPageRedoLog.meta',
-        checkInterval: 5,
-      );
-      for (final rec in treeMeta.values) {
-        final y9 = metaYc.maybeYield();
-        if (y9 != null) await y9;
+        String path;
         try {
-          final tableContext =
-              await _tableContextFromUid(TableUid(rec.tableUid));
-          if (tableContext == null) continue;
-
-          final p0Key = (
-            kind: rec.treeKind,
-            tableUid: rec.tableUid,
-            indexUid: rec.indexUid ?? IndexUid.empty,
-            partitionNo: 0,
-          );
-          final p0Restored = byPartition[p0Key]?.containsKey(0) == true;
-          if (p0Restored) {
-            continue;
+          if (key.kind == PageRedoTreeKind.table) {
+            final tableContext = await _tableContextFromUid(key.tableUid);
+            if (tableContext == null) continue;
+            path = _dataStore.pathManager
+                .getPartitionFilePathByContext(tableContext, key.partitionNo);
+          } else if (key.kind == PageRedoTreeKind.ngh) {
+            final tableContext = await _tableContextFromUid(key.tableUid);
+            if (tableContext == null) continue;
+            final indexUid =
+                _resolveRedoIndexUid(tableContext.schema, key.indexUid);
+            path = _dataStore.pathManager.getNghPostingPartitionPathByContext(
+                tableContext, indexUid, key.partitionNo);
+          } else {
+            final tableContext = await _tableContextFromUid(key.tableUid);
+            if (tableContext == null) continue;
+            final indexUid =
+                _resolveRedoIndexUid(tableContext.schema, key.indexUid);
+            path = _dataStore.pathManager.getIndexPartitionPathByContext(
+                tableContext, indexUid, key.partitionNo);
           }
+        } catch (_) {
+          continue;
+        }
 
-          if (rec.treeKind == PageRedoTreeKind.table) {
-            final meta = await _dataStore.tableDataManager
-                .getTableDataMeta(tableContext.tableUid);
-            if (meta == null) continue;
-            final updated = meta.copyWith(
-              btreeNextPageNo: rec.btreeNextPageNo,
-              btreePartitionCount: rec.btreePartitionCount,
-              btreeRoot:
-                  TreePagePtr(rec.btreeRootPartitionNo, rec.btreeRootPageNo),
-              btreeFirstLeaf: TreePagePtr(
-                  rec.btreeFirstLeafPartitionNo, rec.btreeFirstLeafPageNo),
-              btreeLastLeaf: TreePagePtr(
-                  rec.btreeLastLeafPartitionNo, rec.btreeLastLeafPageNo),
-              btreeHeight: rec.btreeHeight,
-              timestamps: Timestamps(
-                created: meta.timestamps.created,
-                modified: DateTime.now(),
-              ),
-            );
-            await _dataStore.tableDataManager
-                .updateTableDataMeta(tableContext, updated, flush: true);
-          } else if (rec.treeKind == PageRedoTreeKind.indexTree) {
-            final idxUid = rec.indexUid;
-            if (idxUid == null || idxUid.isEmpty) continue;
-            final resolved = _resolveRedoIndexUid(tableContext.schema, idxUid);
-            final meta = await _dataStore.indexManager
-                ?.getIndexMeta(tableContext.tableUid, resolved);
-            if (meta == null) continue;
-            final updated = meta.copyWith(
-              btreeNextPageNo: rec.btreeNextPageNo,
-              btreePartitionCount: rec.btreePartitionCount,
-              btreeRoot:
-                  TreePagePtr(rec.btreeRootPartitionNo, rec.btreeRootPageNo),
-              btreeFirstLeaf: TreePagePtr(
-                  rec.btreeFirstLeafPartitionNo, rec.btreeFirstLeafPageNo),
-              btreeLastLeaf: TreePagePtr(
-                  rec.btreeLastLeafPartitionNo, rec.btreeLastLeafPageNo),
-              btreeHeight: rec.btreeHeight,
-              timestamps: Timestamps(
-                created: meta.timestamps.created,
-                modified: DateTime.now(),
-              ),
-            );
-            await _dataStore.indexManager?.updateIndexMeta(
-              table: tableContext,
-              indexUid: resolved,
-              updatedMeta: updated,
-              flush: true,
-            );
-          }
-          // NGH: global meta is only in page-0 images (never TreeMetaRecord).
+        // Ensure directory exists before writing.
+        try {
+          await _dataStore.storage.ensureDirectoryExists(p.dirname(path));
         } catch (_) {}
+
+        // Use a consistent pageSize for this partition; skip inconsistent payloads.
+        int pageSize = 0;
+        for (final v in pages.values) {
+          if (v.isNotEmpty) {
+            pageSize = v.length;
+            break;
+          }
+        }
+        if (pageSize <= 0) continue;
+
+        final pageNos = pages.keys.toList(growable: false)..sort();
+        final writes = <ByteWrite>[];
+        for (final pg in pageNos) {
+          if (pg < 0) continue;
+          final payload = pages[pg];
+          if (payload == null || payload.isEmpty) continue;
+          if (payload.length != pageSize) continue;
+          final off = pg * pageSize;
+          writes.add(ByteWrite(offset: off, bytes: payload));
+        }
+        if (writes.isEmpty) continue;
+        writes.sort((a, b) => a.offset.compareTo(b.offset));
+        await _dataStore.storage.writeManyAsBytesAt(path, writes, flush: true);
+
+        // Partition-0 page0 carries global TableDataMeta / IndexMeta / NghIndexMeta.
+        // Invalidate meta caches so later recovery reads the restored page0, not
+        // a pre-crash in-memory snapshot.
+        if (key.partitionNo == 0 && pages.containsKey(0)) {
+          final tableContext = await _tableContextFromUid(key.tableUid);
+          if (tableContext != null) {
+            if (key.kind == PageRedoTreeKind.table) {
+              _dataStore.tableDataManager
+                  .invalidateTableDataMetaCacheForTable(tableContext);
+            } else if (key.kind == PageRedoTreeKind.indexTree) {
+              final indexUid =
+                  _resolveRedoIndexUid(tableContext.schema, key.indexUid);
+              _dataStore.indexManager
+                  ?.invalidateIndexMetaCache(key.tableUid, indexUid);
+            } else if (key.kind == PageRedoTreeKind.ngh) {
+              final indexUid =
+                  _resolveRedoIndexUid(tableContext.schema, key.indexUid);
+              _dataStore.vectorIndexManager
+                  ?.clearCacheForIndex(key.tableUid, indexUid);
+            }
+          }
+        }
       }
+
+      // Legacy TreeMetaRecord: only apply when partition-0 page0 was NOT restored
+      // in this redo (old logs before global meta lived in page0). New write path
+      // embeds full meta in page0 images -- applying TreeMetaRecord after p0 would
+      // overwrite restored totals with a stale cache RMW.
+      if (treeMeta.isNotEmpty) {
+        final metaYc = YieldController(
+          'ParallelJournalManager._replayPageRedoLog.meta',
+          checkInterval: 5,
+        );
+        for (final rec in treeMeta.values) {
+          final y9 = metaYc.maybeYield();
+          if (y9 != null) await y9;
+          try {
+            final tableContext =
+                await _tableContextFromUid(TableUid(rec.tableUid));
+            if (tableContext == null) continue;
+
+            final p0Key = (
+              kind: rec.treeKind,
+              tableUid: rec.tableUid,
+              indexUid: rec.indexUid ?? IndexUid.empty,
+              partitionNo: 0,
+            );
+            final p0Restored = byPartition[p0Key]?.containsKey(0) == true;
+            if (p0Restored) {
+              continue;
+            }
+
+            if (rec.treeKind == PageRedoTreeKind.table) {
+              final meta = await _dataStore.tableDataManager
+                  .getTableDataMeta(tableContext.tableUid);
+              if (meta == null) continue;
+              final updated = meta.copyWith(
+                btreeNextPageNo: rec.btreeNextPageNo,
+                btreePartitionCount: rec.btreePartitionCount,
+                btreeRoot:
+                    TreePagePtr(rec.btreeRootPartitionNo, rec.btreeRootPageNo),
+                btreeFirstLeaf: TreePagePtr(
+                    rec.btreeFirstLeafPartitionNo, rec.btreeFirstLeafPageNo),
+                btreeLastLeaf: TreePagePtr(
+                    rec.btreeLastLeafPartitionNo, rec.btreeLastLeafPageNo),
+                btreeHeight: rec.btreeHeight,
+                timestamps: Timestamps(
+                  created: meta.timestamps.created,
+                  modified: DateTime.now(),
+                ),
+              );
+              await _dataStore.tableDataManager
+                  .updateTableDataMeta(tableContext, updated, flush: true);
+            } else if (rec.treeKind == PageRedoTreeKind.indexTree) {
+              final idxUid = rec.indexUid;
+              if (idxUid == null || idxUid.isEmpty) continue;
+              final resolved =
+                  _resolveRedoIndexUid(tableContext.schema, idxUid);
+              final meta = await _dataStore.indexManager
+                  ?.getIndexMeta(tableContext.tableUid, resolved);
+              if (meta == null) continue;
+              final updated = meta.copyWith(
+                btreeNextPageNo: rec.btreeNextPageNo,
+                btreePartitionCount: rec.btreePartitionCount,
+                btreeRoot:
+                    TreePagePtr(rec.btreeRootPartitionNo, rec.btreeRootPageNo),
+                btreeFirstLeaf: TreePagePtr(
+                    rec.btreeFirstLeafPartitionNo, rec.btreeFirstLeafPageNo),
+                btreeLastLeaf: TreePagePtr(
+                    rec.btreeLastLeafPartitionNo, rec.btreeLastLeafPageNo),
+                btreeHeight: rec.btreeHeight,
+                timestamps: Timestamps(
+                  created: meta.timestamps.created,
+                  modified: DateTime.now(),
+                ),
+              );
+              await _dataStore.indexManager?.updateIndexMeta(
+                table: tableContext,
+                indexUid: resolved,
+                updatedMeta: updated,
+                flush: true,
+              );
+            }
+            // NGH: global meta is only in page-0 images (never TreeMetaRecord).
+          } catch (_) {}
+        }
+      }
+    } catch (e) {
+      Logger.warn(
+        'Page redo replay skipped for batch $batchId '
+        '(missing, empty, or unreadable log)',
+        rawError: e,
+      );
     }
   }
 

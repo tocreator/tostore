@@ -71,6 +71,23 @@ final class WalDecodeBatchRunner {
     int minUsefulTaskItems = ComputeBatchPlanner.minUsefulTaskItems,
   }) {
     final scanResult = _scanFile(fileBytes);
+    if (scanResult.hasResync) {
+      final count = max(1, scanResult.recordCount);
+      return WalDecodeFilePlan(
+        recordCount: count,
+        averageRecordBytes: scanResult.averageRecordBytes,
+        validEndOffset: fileBytes.length,
+        useIsolate: false,
+        dispatchTaskCount: 1,
+        ranges: <WalDecodeChunkRange>[
+          WalDecodeChunkRange(
+            startOffset: 0,
+            endOffset: fileBytes.length,
+            recordCount: count,
+          ),
+        ],
+      );
+    }
     if (scanResult.recordCount <= 0) {
       return const WalDecodeFilePlan(
         recordCount: 0,
@@ -125,13 +142,23 @@ final class WalDecodeBatchRunner {
         offset,
         offset + 4,
       ).getUint32(0, Endian.little);
-      offset += 4;
-      if (recordLength == 0 ||
-          recordLength > _maxRecordSize ||
-          offset + recordLength > fileBytes.length) {
+      if (!WalEncoder.isWellFormedBinaryRecordAt(
+          fileBytes, offset, _maxRecordSize)) {
+        final resynced = WalEncoder.tryResyncNextRecord(
+          fileBytes,
+          offset + 1,
+          _maxRecordSize,
+          searchWindow: recordLength > 0 && recordLength <= _maxRecordSize
+              ? max(65536, recordLength)
+              : 65536,
+        );
+        if (resynced != null) {
+          offset = resynced;
+          continue;
+        }
         break;
       }
-      offset += recordLength;
+      offset += 4 + recordLength;
       count++;
     }
     return offset;
@@ -213,6 +240,7 @@ final class WalDecodeBatchRunner {
     int offset = 0;
     int recordCount = 0;
     int validBytes = 0;
+    var hasResync = false;
 
     while (offset < fileBytes.length) {
       if (offset + 4 > fileBytes.length) break;
@@ -222,15 +250,36 @@ final class WalDecodeBatchRunner {
         offset,
         offset + 4,
       ).getUint32(0, Endian.little);
-      offset += 4;
 
-      if (recordLength == 0 ||
-          recordLength > _maxRecordSize ||
-          offset + recordLength > fileBytes.length) {
+      final wellFormed = WalEncoder.isWellFormedBinaryRecordAt(
+        fileBytes,
+        offset,
+        _maxRecordSize,
+      );
+      final next = wellFormed ? offset + 4 + recordLength : -1;
+      final packed = wellFormed &&
+          (next >= fileBytes.length ||
+              WalEncoder.isWellFormedBinaryRecordAt(
+                  fileBytes, next, _maxRecordSize));
+
+      if (!packed) {
+        hasResync = true;
+        final resynced = WalEncoder.tryResyncNextRecord(
+          fileBytes,
+          offset + 1,
+          _maxRecordSize,
+          searchWindow: recordLength > 0 && recordLength <= _maxRecordSize
+              ? max(65536, recordLength)
+              : 65536,
+        );
+        if (resynced != null) {
+          offset = resynced;
+          continue;
+        }
         break;
       }
 
-      offset += recordLength;
+      offset = next;
       validBytes = offset;
       recordCount++;
 
@@ -262,6 +311,7 @@ final class WalDecodeBatchRunner {
       averageRecordBytes:
           recordCount <= 0 ? 0 : max(1, (validBytes / recordCount).ceil()),
       validEndOffset: validBytes,
+      hasResync: hasResync,
       boundarySnapshotsByTaskCount: boundarySnapshotsByTaskCount,
     );
   }
@@ -336,12 +386,14 @@ final class _WalDecodeScanResult {
   final int recordCount;
   final int averageRecordBytes;
   final int validEndOffset;
+  final bool hasResync;
   final Map<int, List<_WalChunkBoundarySnapshot>> boundarySnapshotsByTaskCount;
 
   const _WalDecodeScanResult({
     required this.recordCount,
     required this.averageRecordBytes,
     required this.validEndOffset,
+    required this.hasResync,
     required this.boundarySnapshotsByTaskCount,
   });
 }

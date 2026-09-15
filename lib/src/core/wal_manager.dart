@@ -140,6 +140,15 @@ class WalMeta {
   /// Tail partition file size when lastRecoveredPointer was set; fast-path only when size unchanged.
   final int? lastRecoveredTailFileSize;
 
+  /// True when meta still advertises a WAL range or pending batch.
+  ///
+  /// Startup recovery runs while this is true. If logs are gone or replay
+  /// produced nothing to flush, meta must be reset or every idle restart
+  /// re-enters recovery without waiting for a later write.
+  bool get claimsUnfinishedRecovery =>
+      pendingBatches.isNotEmpty ||
+      (existingStartPartitionIndex >= 0 && existingEndPartitionIndex >= 0);
+
   WalMeta({
     required this.checkpoint,
     required this.existingStartPartitionIndex,
@@ -958,6 +967,110 @@ class WalManager {
     return _getPartitionDirIndexForExistingPartition(partitionIndex);
   }
 
+  /// Partition indices to visit on the inclusive recovery/cleanup arc.
+  ///
+  /// Short ranges walk every index from [start] to [end] (a missing file skips
+  /// that slot only). Huge ranges never enumerate `logPartitionCycle` empty
+  /// slots; they union directory mapping with on-disk `wal_*.log` files that
+  /// still lie on the meta arc.
+  Future<List<int>> listPartitionsToScan(int start, int end) async {
+    final mapping = _directoryMapping ?? _meta.directoryMapping;
+    final cycle = _config.logPartitionCycle;
+    final startN = start < 0 ? start : normalizeWalPartitionIndex(start, cycle);
+    final endN = end < 0 ? end : normalizeWalPartitionIndex(end, cycle);
+    final len =
+        (start < 0 || end < 0) ? 0 : walInclusiveArcLength(startN, endN, cycle);
+    Iterable<int>? existing;
+    if (len > 1024) {
+      existing = await _listExistingWalPartitionIndices();
+    }
+    return listWalPartitionsOnArc(
+      start: start,
+      end: end,
+      cycle: cycle,
+      mappedPartitions: mapping?.partitionToDir.keys,
+      existingPartitionIndices: existing,
+    );
+  }
+
+  /// Partition indices that still have a `wal_N.log` under the WAL root.
+  Future<Set<int>> _listExistingWalPartitionIndices() async {
+    final found = <int>{};
+    try {
+      final root = _dataStore.pathManager
+          .getWalRootPath(spaceName: _dataStore.currentSpaceName);
+      if (!await _dataStore.storage.existsDirectory(root)) {
+        return found;
+      }
+      final items =
+          await _dataStore.storage.listDirectory(root, recursive: true);
+      final re = RegExp(r'wal_(\d+)\.log$');
+      for (final item in items) {
+        final match = re.firstMatch(item.replaceAll('\\', '/'));
+        if (match == null) continue;
+        final idx = int.tryParse(match.group(1)!);
+        if (idx != null && idx >= 0) found.add(idx);
+      }
+    } catch (_) {}
+    return found;
+  }
+
+  /// Path of the WAL partition log file for [partitionIndex].
+  String partitionLogPath(int partitionIndex) {
+    final dirIndex = getPartitionDirIndex(partitionIndex) ??
+        partitionIndex ~/ _dataStore.maxEntriesPerDir;
+    return _dataStore.pathManager.getWalPartitionLogPath(
+      dirIndex,
+      partitionIndex,
+      spaceName: _dataStore.currentSpaceName,
+    );
+  }
+
+  /// Whether any known WAL partition file is present on disk.
+  ///
+  /// Used by recovery/migration to skip waits when meta still claims a range
+  /// or pending batch but the log was never durably written.
+  Future<bool> hasReadablePartitionLogs() async {
+    if (!hasExistingLogs) return false;
+    final parts = await listPartitionsToScan(
+      _meta.existingStartPartitionIndex,
+      _meta.existingEndPartitionIndex,
+    );
+    for (final p in parts) {
+      try {
+        if (await _dataStore.storage.existsFile(partitionLogPath(p))) {
+          return true;
+        }
+      } catch (_) {}
+    }
+    return false;
+  }
+
+  /// Meta still lists a WAL range or pending batches, but no partition log
+  /// is on disk. Persist a clean checkpoint so the next idle startup does not
+  /// re-enter recovery (checkpoint used to advance only on a later write).
+  Future<void> healStaleWalMetaIfLogsMissing() async {
+    if (await hasReadablePartitionLogs()) return;
+    final leftoverBatches = _meta.pendingBatches.isNotEmpty;
+    final leftoverRange = hasExistingLogs;
+    if (!leftoverBatches && !leftoverRange) return;
+    Logger.warn(
+      'WAL meta claims unfinished work but partition logs are missing; '
+      'resetting range/pending so idle restart does not re-enter recovery '
+      '(start=${_meta.existingStartPartitionIndex} '
+      'end=${_meta.existingEndPartitionIndex} '
+      'pending=${_meta.pendingBatches.length})',
+    );
+    if (leftoverBatches) {
+      _meta.pendingBatches.clear();
+    }
+    if (leftoverRange) {
+      await clearWalPartitionsAndResetMeta();
+      return;
+    }
+    await persistMeta(flush: true);
+  }
+
   /// Get or allocate directory index for a partition.
   int _getOrAllocateDirIndexForPartition(int partitionIndex) {
     final mapping = _getOrLoadDirectoryMapping();
@@ -1564,13 +1677,21 @@ class WalManager {
     if (_meta.checkpoint == pointer && !_walMetaDurableDirty) {
       return;
     }
+    final bool partitionChanged =
+        _meta.checkpoint.partitionIndex != pointer.partitionIndex;
     _meta.checkpoint = pointer;
     // After advancing checkpoint, remove table-level ops whose cutoff is
     // older than or equal to the new checkpoint; they can no longer affect
     // recovery semantics.
     _pruneTableOpsUpToCheckpoint();
-    // At batch commit, also backup previous WAL meta for recovery.
-    await persistMeta(flush: false, backupOld: true);
+    final recoveredSize = await _tailFileSizeForPointer(pointer);
+    _meta = _meta.copyWith(
+      lastRecoveredPointer: pointer,
+      lastRecoveredTailFileSize: recoveredSize,
+    );
+    // Only perform disaster backup when crossing a partition boundary (major epoch advance).
+    // In-partition micro-advances rely on atomic single-write to avoid redundant copyFile overhead.
+    await persistMeta(flush: true, backupOld: partitionChanged);
   }
 
   /// Gracefully synchronize checkpoint and recovery hint on shutdown.
@@ -1705,16 +1826,7 @@ class WalManager {
     }
     final start = _meta.existingStartPartitionIndex;
     final end = _meta.existingEndPartitionIndex;
-    final cap = _config.logPartitionCycle;
-
-    int idx = start;
-    final toDelete = <int>[];
-    while (true) {
-      toDelete.add(idx);
-      if (idx == end) break;
-      idx = (idx + 1) % cap;
-      if (idx == start) break;
-    }
+    final toDelete = await listPartitionsToScan(start, end);
 
     final partitionToDirIndex = <int, int>{};
     if (_directoryMapping != null) {
@@ -2270,8 +2382,12 @@ class WalManager {
     _currentPartitionSizeLoaded = true;
   }
 
-  /// Fast-path: skip full WAL replay when tail partition is unchanged since last recovery.
-  /// Uses only a single getFileSize (no file content read). Returns true if recovery was skipped.
+  /// Fast-path: skip full WAL replay when tail partition is unchanged since last
+  /// **durable** recovery. Uses only a single getFileSize (no file content read).
+  /// Returns true if recovery was skipped.
+  ///
+  /// A hint ahead of [WalMeta.checkpoint] means entries were only queued for
+  /// flush. Skipping would drop them on the next start.
   Future<bool> tryFastPathSkipRecovery() async {
     if (!_config.enableJournal) return false;
     if (_meta.pendingBatches.isNotEmpty) return false;
@@ -2283,9 +2399,16 @@ class WalManager {
         ptr.partitionIndex != _meta.existingEndPartitionIndex) {
       return false;
     }
+    if (!walRecoveryHintIsSafeToSkip(
+      checkpoint: _meta.checkpoint,
+      lastRecovered: ptr,
+      cycle: _config.logPartitionCycle,
+    )) {
+      return false;
+    }
     final pIdx = _meta.existingEndPartitionIndex;
-    final dirIndex = getPartitionDirIndex(pIdx);
-    if (dirIndex == null) return false;
+    final dirIndex =
+        getPartitionDirIndex(pIdx) ?? pIdx ~/ _dataStore.maxEntriesPerDir;
     final path = _dataStore.pathManager.getWalPartitionLogPath(
       dirIndex,
       pIdx,
@@ -2304,27 +2427,13 @@ class WalManager {
     }
   }
 
-  /// Persist last-recovered pointer and tail file size after a successful WAL recovery
-  /// so that the next startup can skip replay via tryFastPathSkipRecovery when unchanged.
-  Future<void> setLastRecoveredPointer(WalPointer ptr) async {
-    final dirIndex = getPartitionDirIndex(ptr.partitionIndex);
-    if (dirIndex == null) return;
-    int size = 0;
-    if (_currentPartitionSizeLoaded &&
-        _current.partitionIndex == ptr.partitionIndex) {
-      size = _currentPartitionSizeApprox;
-    } else {
-      final path = _dataStore.pathManager.getWalPartitionLogPath(
-        dirIndex,
-        ptr.partitionIndex,
-        spaceName: _dataStore.currentSpaceName,
-      );
-      try {
-        if (await _dataStore.storage.existsFile(path)) {
-          size = await _dataStore.storage.getFileSize(path);
-        }
-      } catch (_) {}
-    }
+  /// Persist last-recovered pointer and tail file size after WAL is durable in
+  /// table files (checkpoint caught up), so the next startup can skip replay.
+  Future<void> setLastRecoveredPointer(
+    WalPointer ptr, {
+    bool flush = false,
+  }) async {
+    final size = await _tailFileSizeForPointer(ptr);
     if (_meta.lastRecoveredPointer == ptr &&
         _meta.lastRecoveredTailFileSize == size &&
         !_walMetaDurableDirty) {
@@ -2334,7 +2443,27 @@ class WalManager {
       lastRecoveredPointer: ptr,
       lastRecoveredTailFileSize: size,
     );
-    await persistMeta(flush: false);
+    await persistMeta(flush: flush);
+  }
+
+  Future<int> _tailFileSizeForPointer(WalPointer ptr) async {
+    final dirIndex = getPartitionDirIndex(ptr.partitionIndex) ??
+        ptr.partitionIndex ~/ _dataStore.maxEntriesPerDir;
+    if (_currentPartitionSizeLoaded &&
+        _current.partitionIndex == ptr.partitionIndex) {
+      return _currentPartitionSizeApprox;
+    }
+    final path = _dataStore.pathManager.getWalPartitionLogPath(
+      dirIndex,
+      ptr.partitionIndex,
+      spaceName: _dataStore.currentSpaceName,
+    );
+    try {
+      if (await _dataStore.storage.existsFile(path)) {
+        return await _dataStore.storage.getFileSize(path);
+      }
+    } catch (_) {}
+    return 0;
   }
 
   /// Efficiently read the last WAL pointer from the logical tail partition.
@@ -2726,14 +2855,14 @@ class WalManager {
   Future<void> addPendingParallelBatch(PendingParallelBatch batch) async {
     _meta.pendingBatches.add(batch);
     // Batch is critical for recovery; backup previous WAL meta before
-    // persisting the new state that includes this pending batch.
-    await persistMeta(flush: false, backupOld: true, throwOnError: true);
+    // without redundant backup double-write.
+    await persistMeta(flush: true, throwOnError: true);
   }
 
   /// Remove a pending parallel batch by id
   Future<void> removePendingParallelBatch(String batchId) async {
     _meta.pendingBatches.removeWhere((b) => b.batchId == batchId);
-    await persistMeta(flush: false, throwOnError: true);
+    await persistMeta(flush: true, throwOnError: true);
   }
 
   /// Register a table-level maintenance operation (clear/drop) into WAL meta.
@@ -2751,7 +2880,7 @@ class WalManager {
     _meta.tableOps
         .removeWhere((_, existing) => existing.tableUid == op.tableUid);
     _meta.tableOps[op.opId] = op;
-    await persistMeta(flush: false, throwOnError: true);
+    await persistMeta(flush: true, throwOnError: true);
   }
 
   /// Mark a table-level maintenance operation as completed.
@@ -2768,7 +2897,7 @@ class WalManager {
     final op = _meta.tableOps[opId];
     if (op == null) return;
     _meta.tableOps[opId] = op.copyWith(completed: true);
-    await persistMeta(flush: false, throwOnError: true);
+    await persistMeta(flush: true, throwOnError: true);
   }
 
   /// Remove a pending table-level maintenance op that never took effect.
@@ -2780,7 +2909,7 @@ class WalManager {
     if (!_config.enableJournal) return;
     if (!_meta.tableOps.containsKey(opId)) return;
     _meta.tableOps.remove(opId);
-    await persistMeta(flush: false, throwOnError: true);
+    await persistMeta(flush: true, throwOnError: true);
   }
 }
 
