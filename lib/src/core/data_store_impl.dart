@@ -893,14 +893,16 @@ class DataStoreImpl {
             // System tables (incl. key-migration progress) before key rewrite.
             await _startSetupAndUpgrade();
             _startupProgressCallback?.call(0.8, DbStartupStage.optimizing);
-
-            // Key migration after setup so `_system_key_migration` exists
-            // (schema tasks already recovered in migrationManager.initialize).
-            await _keyManager!.startDeferredKeyMigrationWork();
           }
         }
 
         _isInitialized = true;
+
+        // Key migration after full init so natural-turnover refresh/poll can use
+        // WAL, journal, and multi-space flush (not blocked by isInitialized).
+        if (!isMigrationInstance && !isMemoryMode) {
+          await _keyManager!.startDeferredKeyMigrationWork();
+        }
 
         // Space stats: lazy hydrate in TableDataManager (non-blocking).
         if (!isMigrationInstance) {

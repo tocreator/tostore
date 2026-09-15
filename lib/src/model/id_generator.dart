@@ -513,6 +513,7 @@ class TimeBasedIdGenerator implements IdGenerator {
   // ID request statistics
   final Map<String, int> _recentRequestCount = {};
   final Map<String, DateTime> _lastCountResetTime = {};
+  final Map<String, Future<void>?> _refillTasks = {};
 
   // ID pool config constants
   static const Duration _idPoolExpiry = Duration(minutes: 60);
@@ -530,6 +531,8 @@ class TimeBasedIdGenerator implements IdGenerator {
   int _maxConcurrent = 4; // Maximum parallel count, default is 4
   static const int _minCountPerIsolate =
       100; // Minimum number of IDs to generate for each isolate
+  /// Batch sizes at or above this use sequential high-throughput ID generation.
+  static const int _highGenerationBatchThreshold = 1000;
 
   // Static mapping for global access to all generator instances
   static final Map<String, TimeBasedIdGenerator> _instances = {};
@@ -672,7 +675,7 @@ class TimeBasedIdGenerator implements IdGenerator {
     }
 
     // Preheat ID pool - use microtask to ensure non-blocking initialization
-    Future.microtask(() => _refillIdPool(100, 0));
+    Future.microtask(() => _refillIdPool(100, 0, backgroundPrefetch: true));
   }
 
   /// Format IDs according to ID type
@@ -685,14 +688,41 @@ class TimeBasedIdGenerator implements IdGenerator {
   }
 
   /// Refill ID pool - the only entry point for all ID generation
-  Future<void> _refillIdPool(int targetCount, int recentTotal) async {
-    // Add duplicate fill check
-    if (_idGenerationInProgress[tableUid] == true) {
-      Logger.debug(
-          'Skip duplicate ID pool fill request: $tableUid, fill task already running');
-      return;
+  Future<void> _refillIdPool(
+    int targetCount,
+    int recentTotal, {
+    bool backgroundPrefetch = false,
+  }) async {
+    final inFlight = _refillTasks[tableUid];
+    if (inFlight != null) {
+      await inFlight;
+      if ((_idPools[tableUid]?.length ?? 0) >= targetCount) {
+        return;
+      }
     }
 
+    final completer = Completer<void>();
+    _refillTasks[tableUid] = completer.future;
+
+    try {
+      await _refillIdPoolOnce(
+        targetCount,
+        recentTotal,
+        backgroundPrefetch: backgroundPrefetch,
+      );
+    } finally {
+      _refillTasks.remove(tableUid);
+      if (!completer.isCompleted) {
+        completer.complete();
+      }
+    }
+  }
+
+  Future<void> _refillIdPoolOnce(
+    int targetCount,
+    int recentTotal, {
+    bool backgroundPrefetch = false,
+  }) async {
     bool acquired = false;
     final lockResource = 'id_refill_$tableUid';
     final operationId = '${tableUid}_id_fill';
@@ -739,9 +769,10 @@ class TimeBasedIdGenerator implements IdGenerator {
         final startTime = DateTime.now();
         int totalGenerated = 0;
 
-        // Offload a large ID batch to a single isolate only when it can
-        // amortize isolate startup and message transfer overhead.
-        final canUseIsolateBatch = _enableParallel &&
+        // Caller-blocking refills stay on the main isolate (low latency).
+        // Background prefetch may use one isolate batch when large enough.
+        final canUseIsolateBatch = backgroundPrefetch &&
+            _enableParallel &&
             _maxConcurrent > 0 &&
             neededCount >= _minCountPerIsolate * 2;
 
@@ -824,11 +855,6 @@ class TimeBasedIdGenerator implements IdGenerator {
                 remainingCount += newNeededCount;
               }
             }
-
-            // Generate each batch, yield execution thread
-            if (remainingCount > 0) {
-              await Future.delayed(const Duration(milliseconds: 5));
-            }
           }
 
           // Record performance data
@@ -865,7 +891,7 @@ class TimeBasedIdGenerator implements IdGenerator {
   Future<List<String>> _generateIdsInIsolateBatch(
       int neededCount, int recentTotal) async {
     try {
-      final isHighGeneration = recentTotal >= (_maxSequence ~/ 5);
+      final isHighGeneration = _isHighGeneration(recentTotal, neededCount);
       final startSequence = _sequenceMap[tableUid] ?? 0;
       dynamic startValue;
       bool useNewTimestamp = false;
@@ -959,20 +985,45 @@ class TimeBasedIdGenerator implements IdGenerator {
       }
     }
 
-    // Here indicates pool ID is insufficient, need to synchronize waiting for refill
-
-    // Get effective recent request count
+    // Pool insufficient: satisfy the caller on the main isolate first, then
+    // prefill the pool asynchronously (large prefetches may use an isolate).
     final effectiveRecentTotal =
         recentTotal > 0 ? recentTotal : _getRecentRequestCount();
-    // Calculate expected pool size
-    final expectedPoolSize = _calculateExpectedPoolSize(effectiveRecentTotal);
+    final shortfall = count - result.length;
 
-    // Calculate the number of IDs needed
-    final targetSize = expectedPoolSize + (count - result.length);
+    if (shortfall > 0) {
+      final load = _effectiveLoad(effectiveRecentTotal, shortfall);
+      try {
+        final numericIds = await _generateIds(shortfall, load);
+        result.addAll(_formatIds(numericIds));
+      } catch (e) {
+        Logger.error('Direct ID generation failed', rawError: e);
+      }
+
+      if (result.length == count) {
+        final expectedPoolSize =
+            _calculateExpectedPoolSize(effectiveRecentTotal);
+        final poolSize = _idPools[tableUid]?.length ?? 0;
+        if (poolSize < expectedPoolSize && _refillTasks[tableUid] == null) {
+          unawaited(_refillIdPool(
+            expectedPoolSize,
+            effectiveRecentTotal,
+            backgroundPrefetch: true,
+          ));
+        }
+        return result;
+      }
+    }
+
+    final expectedPoolSize = _calculateExpectedPoolSize(effectiveRecentTotal);
+    final targetSize = expectedPoolSize + shortfall;
 
     try {
-      // Directly await refill to avoid un-awaited timer polling
-      await _refillIdPool(targetSize, effectiveRecentTotal);
+      await _refillIdPool(
+        targetSize,
+        effectiveRecentTotal,
+        backgroundPrefetch: false,
+      );
 
       // Drain remaining required IDs from pool
       while (
@@ -1043,6 +1094,15 @@ class TimeBasedIdGenerator implements IdGenerator {
     return max(estimatedSize, _minGenerateBatchSize);
   }
 
+  bool _isHighGeneration(int recentTotal, int batchCount) {
+    return recentTotal >= (_maxSequence ~/ 5) ||
+        batchCount >= _highGenerationBatchThreshold;
+  }
+
+  int _effectiveLoad(int recentTotal, int batchCount) {
+    return max(recentTotal, batchCount);
+  }
+
   /// Clean up expired ID pools
   void _cleanupExpiredPools() {
     final now = DateTime.now();
@@ -1085,8 +1145,7 @@ class TimeBasedIdGenerator implements IdGenerator {
     int sequence = _sequenceMap[tableUid] ?? 0;
     int lastTimestamp = _lastValueMap[tableUid] ?? currentTimestamp;
 
-    // Determine generation strategy based on load
-    bool isHighGeneration = recentTotal >= (_maxSequence ~/ 5);
+    final bool isHighGeneration = _isHighGeneration(recentTotal, count);
 
     // If current timestamp is too far from last or load is not high, use new timestamp
     bool useNewTimestamp =
@@ -1094,15 +1153,16 @@ class TimeBasedIdGenerator implements IdGenerator {
 
     int timestamp = useNewTimestamp ? currentTimestamp : lastTimestamp;
 
-    // Batch optimization: Precompute most IDs
-    if (isHighGeneration && sequence + count <= _maxSequence) {
-      // All IDs can be generated in the same timestamp - efficient batch processing
+    if (isHighGeneration) {
       for (int i = 0; i < count; i++) {
+        if (sequence >= _maxSequence) {
+          timestamp += 1;
+          sequence = 0;
+        }
         sequence += 1;
         result[i] = _calculateTimestampIdAsBigInt(timestamp, sequence);
       }
 
-      // Update state
       _sequenceMap[tableUid] = sequence;
       _lastValueMap[tableUid] = timestamp;
       _lastValue = timestamp;
@@ -1154,8 +1214,7 @@ class TimeBasedIdGenerator implements IdGenerator {
     int sequence = _sequenceMap[tableUid] ?? 0;
     String lastDate = _lastValueMap[tableUid] ?? currentDateString;
 
-    // Determine generation strategy based on load
-    bool isHighGeneration = recentTotal >= (_maxSequence ~/ 5);
+    final bool isHighGeneration = _isHighGeneration(recentTotal, count);
 
     // If current date is different from last or load is not high, use new date
     bool useNewDate =
@@ -1164,15 +1223,16 @@ class TimeBasedIdGenerator implements IdGenerator {
     // Set working date string
     String dateString = useNewDate ? currentDateString : lastDate;
 
-    // Batch optimization: Precompute most IDs
-    if (isHighGeneration && sequence + count <= _maxSequence) {
-      // All IDs can be generated in the same date string - efficient batch processing
+    if (isHighGeneration) {
       for (int i = 0; i < count; i++) {
+        if (sequence >= _maxSequence) {
+          dateString = _advanceDateStringForBulk(dateString);
+          sequence = 0;
+        }
         sequence += 1;
         result[i] = _calculateDatePrefixedIdAsBigInt(dateString, sequence);
       }
 
-      // Update state
       _sequenceMap[tableUid] = sequence;
       _lastValueMap[tableUid] = dateString;
       _lastValue = dateString;
@@ -1288,9 +1348,13 @@ class TimeBasedIdGenerator implements IdGenerator {
 
         // If pool size is less than 70% of expected and current no generation task in progress, trigger refill
         if (currentPoolSize < expectedPoolSize * 0.7 &&
-            _idGenerationInProgress[tableUid] != true) {
+            _refillTasks[tableUid] == null) {
           // Asynchronous refill pool, no waiting for result
-          Future.microtask(() => _refillIdPool(expectedPoolSize, recentTotal));
+          Future.microtask(() => _refillIdPool(
+                expectedPoolSize,
+                recentTotal,
+                backgroundPrefetch: true,
+              ));
         }
       }
     } catch (e) {
@@ -1338,6 +1402,23 @@ class TimeBasedIdGenerator implements IdGenerator {
         '${now.minute.toString().padLeft(2, '0')}'
         '${now.second.toString().padLeft(2, '0')}';
     return dateString;
+  }
+
+  /// Advance a bulk date-prefixed bucket without wall-clock waits.
+  String _advanceDateStringForBulk(String dateString) {
+    try {
+      final fmt =
+          '${dateString.substring(0, 8)}T${dateString.substring(8, 10)}:${dateString.substring(10, 12)}:${dateString.substring(12, 14)}';
+      final dt = DateTime.parse(fmt).add(const Duration(seconds: 1));
+      return '${dt.year}'
+          '${dt.month.toString().padLeft(2, '0')}'
+          '${dt.day.toString().padLeft(2, '0')}'
+          '${dt.hour.toString().padLeft(2, '0')}'
+          '${dt.minute.toString().padLeft(2, '0')}'
+          '${dt.second.toString().padLeft(2, '0')}';
+    } catch (_) {
+      return _getCurrentDateString();
+    }
   }
 
   /// Wait for next timestamp - optimized version, avoid excessive CPU usage and stack overflow risk

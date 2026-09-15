@@ -7135,8 +7135,8 @@ class MigrationManager {
           final table = await _tableContextForUid(uid);
           if (table == null) {
             // Meta gone: drop-only tasks still need to drain other spaces'
-            // data dirs via the space loop (exists→skip / uid path). Non-drop
-            // orphans cannot cut over — remove them so startup does not loop
+            // data dirs via the space loop (exists -> skip / uid path). Non-drop
+            // orphans cannot cut over - remove them so startup does not loop
             // on "Table unknown does not exist".
             final dropOnly = task.operations.isNotEmpty &&
                 task.operations
@@ -7779,7 +7779,7 @@ class MigrationManager {
   }) async {
     // Always resolve by stable tableUid: rename cutover drops the old name
     // from inventory, and cache keys are uid-based.
-    // Drop tasks are enqueued after current-space meta is already deleted —
+    // Drop tasks are enqueued after current-space meta is already deleted -
     // there is nothing left to invalidate (same guard as addMigrationTask).
     final table = await _tableContextForUid(tableUid);
     if (table == null) {

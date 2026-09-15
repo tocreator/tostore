@@ -329,8 +329,6 @@ class DatabaseTester {
       dbPath: resolvedDbPath,
       dbName: '${db.config.dbName}_schema_upgrade_validation',
       spaceName: 'default',
-      enableLog: true,
-      logLevel: LogLevel.warn,
     );
   }
 
@@ -929,8 +927,6 @@ class DatabaseTester {
       dbName:
           '${db.config.dbName}_rt_mig_${DateTime.now().millisecondsSinceEpoch}',
       spaceName: 'default',
-      enableLog: true,
-      logLevel: LogLevel.warn,
       maxFlushLatencyMs: 100,
       writeBatchSize: 5,
     );

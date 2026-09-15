@@ -1233,31 +1233,32 @@ Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
         request.keyType == PrimaryKeyType.shortCode) {
       // Timestamp ID generation or short code ID generation
 
-      // Efficient generation strategy: generate all IDs in order when sequence number space is sufficient
-      if (request.isHighGeneration && sequence + request.count <= maxSequence) {
-        // Efficient batch generation method
+      if (request.isHighGeneration) {
+        int timestamp = workingValue as int;
         for (int i = 0; i < request.count; i++) {
           final y4 = yieldController.maybeYield();
           if (y4 != null) await y4;
+          if (sequence >= maxSequence) {
+            timestamp += 1;
+            sequence = 0;
+          }
           sequence += 1;
 
-          // Calculate timestamp ID
-          final BigInt timestampBig = BigInt.from(workingValue);
+          final BigInt timestampBig = BigInt.from(timestamp);
           final BigInt sequenceBig = BigInt.from(sequence);
 
           BigInt idValue;
           if (request.nodeConfig.enableDistributed) {
-            // Algorithm with node ID: timestamp * 10^(nodeIdDigits+5) + nodeId * 10^5 + sequence
             idValue = timestampBig * powerFactor +
                 nodeIdBig * sequenceFactor +
                 sequenceBig;
           } else {
-            // Simplified algorithm: timestamp * 10^5 + sequence
             idValue = timestampBig * sequenceFactor + sequenceBig;
           }
 
           numericIds.add(idValue);
         }
+        workingValue = timestamp;
       } else {
         // Regular generation method: consider step and sequence number limit
         int step = 1;
@@ -1307,20 +1308,42 @@ Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
       // Date prefixed ID generation logic
       String dateString = workingValue as String;
 
-      // Efficient generation strategy
-      if (request.isHighGeneration && sequence + request.count <= maxSequence) {
-        // Efficient batch generation method
+      String advanceDateStringForBulk(String value) {
+        try {
+          final fmt =
+              '${value.substring(0, 8)}T${value.substring(8, 10)}:${value.substring(10, 12)}:${value.substring(12, 14)}';
+          final dt = DateTime.parse(fmt).add(const Duration(seconds: 1));
+          return '${dt.year}'
+              '${dt.month.toString().padLeft(2, '0')}'
+              '${dt.day.toString().padLeft(2, '0')}'
+              '${dt.hour.toString().padLeft(2, '0')}'
+              '${dt.minute.toString().padLeft(2, '0')}'
+              '${dt.second.toString().padLeft(2, '0')}';
+        } catch (_) {
+          final now = DateTime.now();
+          return '${now.year}'
+              '${now.month.toString().padLeft(2, '0')}'
+              '${now.day.toString().padLeft(2, '0')}'
+              '${now.hour.toString().padLeft(2, '0')}'
+              '${now.minute.toString().padLeft(2, '0')}'
+              '${now.second.toString().padLeft(2, '0')}';
+        }
+      }
+
+      if (request.isHighGeneration) {
         for (int i = 0; i < request.count; i++) {
           final y6 = yieldController.maybeYield();
           if (y6 != null) await y6;
+          if (sequence >= maxSequence) {
+            dateString = advanceDateStringForBulk(dateString);
+            sequence = 0;
+          }
           sequence += 1;
 
-          // Calculate date prefixed ID
           BigInt dateValue;
           try {
             dateValue = BigInt.parse(dateString);
           } catch (e) {
-            // Use timestamp as fallback
             dateValue = BigInt.from(
                 (DateTime.now().millisecondsSinceEpoch ~/ 1000) % 10000000000);
           }
@@ -1329,17 +1352,16 @@ Future<TimeBasedIdGenerateResult> generateTimeBasedIds(
           BigInt idValue;
 
           if (request.nodeConfig.enableDistributed) {
-            // Algorithm with node ID
             idValue = dateValue * powerFactor +
                 nodeIdBig * sequenceFactor +
                 sequenceBig;
           } else {
-            // Simplified algorithm
             idValue = dateValue * sequenceFactor + sequenceBig;
           }
 
           numericIds.add(idValue);
         }
+        workingValue = dateString;
       } else {
         // Regular generation method
         int step = 1;

@@ -430,8 +430,7 @@ final class GlobalConfigCodec {
     throw DbException([
       GeneralStatus(
         type: ResultType.devInvalidArgumentFormat,
-        message:
-            'GlobalConfigCodec: failed to decrypt with provided encryptionKey. '
+        message: 'Failed to decrypt with provided encryptionKey. '
             'Open is aborted to avoid overwriting an existing database; '
             'pass the correct encryptionKey or restore from backup.',
       ),
@@ -453,7 +452,7 @@ final class GlobalConfigCodec {
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,
-          message: 'GlobalConfigCodec: expected encrypted TOBF frame',
+          message: 'Expected encrypted TOBF frame',
         ),
       ]);
     }
@@ -463,7 +462,7 @@ final class GlobalConfigCodec {
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,
-          message: 'GlobalConfigCodec: encrypted body too short',
+          message: 'Encrypted body too short',
         ),
       ]);
     }
@@ -533,7 +532,7 @@ final class GlobalConfigCodec {
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,
-          message: 'GlobalConfigCodec: decrypt failed (alg=${algorithm.id})',
+          message: 'Decrypt failed (alg=${algorithm.id})',
         ),
       ]);
     }

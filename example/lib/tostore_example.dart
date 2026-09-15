@@ -50,8 +50,6 @@ class ToStoreExample {
       dbPath: dbRoot,
       dbName: 'tostore_example',
       config: DataStoreConfig(
-        enableLog: true,
-        logLevel: LogLevel.debug,
         encryptionConfig: const EncryptionConfig(
           encryptionType: EncryptionType.none,
         ),
@@ -345,8 +343,6 @@ class ToStoreExample {
           centralServerUrl: 'https://127.0.0.1:8080',
           accessToken: 'b7628a4f9b4d269b98649129',
         ),
-        enableLog: true, // enable log
-        logLevel: LogLevel.warn, // log level
       ),
     );
 

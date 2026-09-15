@@ -97,9 +97,16 @@ class KeyMigrationRunner {
       await _rewriteMigrationMetaDomain(primaryInstance);
       _throwIfPaused();
 
-      // Page0 table/index meta (incl. empty trees with meta but no leaves).
+      // Page0 meta on primary (global + active space). Other spaces: combined
+      // with table rewrite in the loop below (one helper open per space).
       await _rewriteTableAndIndexMetaDomains(primaryInstance);
       _throwIfPaused();
+
+      final keyInfo = await migrationManager?.getKeyMigrationInfo();
+      final rewriteTableMeta =
+          !(keyInfo?.isDomainDone(EncryptionDomain.tableMeta) ?? false);
+      final rewriteIndexMeta =
+          !(keyInfo?.isDomainDone(EncryptionDomain.indexMeta) ?? false);
 
       await _migrateTables(
         primaryInstance,
@@ -143,13 +150,22 @@ class KeyMigrationRunner {
         try {
           await migrationInstance.initialize();
           _throwIfPaused();
+          if (rewriteTableMeta || rewriteIndexMeta) {
+            await _rewritePage0MetaForTables(
+              migrationInstance,
+              migrateGlobal: false,
+              migrateNonGlobal: true,
+              rewriteTableMeta: rewriteTableMeta,
+              rewriteIndexMeta: rewriteIndexMeta,
+            );
+          }
           await _migrateTables(
             migrationInstance,
             targetKeyId: targetKeyId,
             migrateGlobal: false,
             migrateNonGlobal: true,
           );
-          await _drainBackgroundWrites(migrationInstance);
+          await _flushJournalOnInstance(migrationInstance);
         } finally {
           // Helper close must NOT cancel the primary KeyMigrationRunner token
           // (KeyManager.pauseKeyMigration no-ops for isMigrationInstance).
@@ -157,8 +173,18 @@ class KeyMigrationRunner {
         }
       }
 
+      if (rewriteTableMeta) {
+        await _markDomainDone(primaryInstance, EncryptionDomain.tableMeta);
+      }
+      if (rewriteIndexMeta) {
+        await _markDomainDone(primaryInstance, EncryptionDomain.indexMeta);
+      }
+
       await _markDataRewriteDomainsDone(primaryInstance);
-      await _refreshNaturalTurnoverDomains(primaryInstance);
+      await _refreshNaturalTurnoverDomains(
+        primaryInstance,
+        includeOtherSpaceFlush: false,
+      );
       await _finalizeKeyMigration(primaryInstance, keyChangeInfo);
     } on DbClosedException {
       Logger.info(
@@ -209,7 +235,8 @@ class KeyMigrationRunner {
     );
   }
 
-  /// Capture WAL / txn / page-redo watermarks for natural-turnover domains.
+  /// Capture WAL / txn / page-redo watermarks for natural-turnover domains
+  /// on the session active space (see [KeyMigrationDomainSnapshots]).
   static Future<KeyMigrationDomainSnapshots> captureNaturalSnapshots(
     DataStoreImpl dataStore,
   ) async {
@@ -244,6 +271,92 @@ class KeyMigrationRunner {
       txnActivePartitionsAtStart: txnParts,
       pageRedoBatchIdsAtStart: redoBatches,
     );
+  }
+
+  static Future<List<String>> _spaceNamesForMigration(
+      DataStoreImpl primary) async {
+    final globalConfig = await primary.getGlobalConfig();
+    return globalConfig?.spaceNames.toList() ?? [primary.currentSpaceName];
+  }
+
+  /// Run [action] on every space (primary + short-lived helpers).
+  static Future<void> forEachSpace(
+    DataStoreImpl primary,
+    Future<void> Function(DataStoreImpl ds, String spaceName) action,
+  ) async {
+    final spaces = await _spaceNamesForMigration(primary);
+    final activeSpace = primary.currentSpaceName;
+
+    for (final space in spaces) {
+      if (space == activeSpace) {
+        await action(primary, space);
+        continue;
+      }
+
+      final migrationInstance = DataStoreImpl(
+        dbPath: primary.config.dbPath,
+        dbName: primary.config.dbName,
+        config: primary.config.copyWith(spaceName: space),
+        isMigrationInstance: true,
+      );
+      try {
+        await migrationInstance.initialize();
+        await action(migrationInstance, space);
+      } finally {
+        await migrationInstance.close();
+      }
+    }
+  }
+
+  static Future<void> _flushJournalOnInstance(DataStoreImpl ds) async {
+    await _drainBackgroundWrites(ds);
+    await ds.parallelJournalManager.flushCompletely();
+    if (!ds.config.enableJournal) return;
+    try {
+      await ds.walManager.flushQueueCompletely(flush: true);
+      final ptr = ds.walManager.currentPointer;
+      await ds.walManager.syncCheckpointOnClose(ptr);
+      await ds.walManager.healStaleWalMetaIfLogsMissing();
+    } catch (_) {}
+  }
+
+  static Future<void> _flushAllSpacesForNaturalTurnover(
+    DataStoreImpl primary, {
+    bool includeOtherSpaces = true,
+  }) async {
+    if (!includeOtherSpaces) {
+      await _flushJournalOnInstance(primary);
+      return;
+    }
+    await forEachSpace(primary, (ds, _) async {
+      await _flushJournalOnInstance(ds);
+    });
+  }
+
+  static String _walCheckpointString(DataStoreImpl ds) {
+    final walMeta = ds.walManager.meta;
+    return '${walMeta.checkpoint.partitionIndex}:${walMeta.checkpoint.entrySeq}';
+  }
+
+  static bool _isSpaceWalTurnedOver(
+    DataStoreImpl ds, {
+    required String? startCheckpoint,
+  }) {
+    if (!ds.config.enableJournal) return true;
+    try {
+      final meta = ds.walManager.meta;
+      if (meta.pendingBatches.isNotEmpty) return false;
+      if (startCheckpoint == null || startCheckpoint.isEmpty) {
+        return true;
+      }
+      final current = _walCheckpointString(ds);
+      if (current != startCheckpoint) return true;
+      // Fully flushed with no pending redo: journal is quiescent at the start
+      // watermark (common on spaces that did not append WAL during rewrite).
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
 
   static Future<void> _rewriteMigrationMetaDomain(
@@ -294,42 +407,6 @@ class KeyMigrationRunner {
       migrateNonGlobal: true,
     );
     _throwIfPaused();
-
-    final globalConfig = await primaryInstance.getGlobalConfig();
-    final spaces =
-        globalConfig?.spaceNames.toList() ?? [primaryInstance.currentSpaceName];
-    final activeSpace = primaryInstance.currentSpaceName;
-
-    for (final space in spaces) {
-      if (space == activeSpace) continue;
-      _throwIfPaused();
-
-      final migrationInstance = DataStoreImpl(
-        dbPath: primaryInstance.config.dbPath,
-        dbName: primaryInstance.config.dbName,
-        config: primaryInstance.config.copyWith(spaceName: space),
-        isMigrationInstance: true,
-      );
-      try {
-        await migrationInstance.initialize();
-        _throwIfPaused();
-        await rewriteOn(
-          migrationInstance,
-          migrateGlobal: false,
-          migrateNonGlobal: true,
-        );
-      } finally {
-        // See multi-space table loop: helper close must not pause the primary run.
-        await migrationInstance.close();
-      }
-    }
-
-    if (!tableMetaDone) {
-      await _markDomainDone(primaryInstance, EncryptionDomain.tableMeta);
-    }
-    if (!indexMetaDone) {
-      await _markDomainDone(primaryInstance, EncryptionDomain.indexMeta);
-    }
   }
 
   static Future<void> _rewritePage0MetaForTables(
@@ -413,85 +490,101 @@ class KeyMigrationRunner {
     await _markDomainDone(dataStore, EncryptionDomain.vectorIndex);
   }
 
+  static bool _rewriteDomainsComplete(KeyMigrationInfo info) {
+    for (final domain in EncryptionDomain.values) {
+      if (EncryptionDomainPolicy.isNaturalTurnover(domain)) continue;
+      if (!info.isDomainDone(domain)) return false;
+    }
+    return true;
+  }
+
   static Future<void> _refreshNaturalTurnoverDomains(
-      DataStoreImpl dataStore) async {
+    DataStoreImpl dataStore, {
+    bool includeOtherSpaceFlush = true,
+  }) async {
     final migrationManager = dataStore.migrationManager;
     if (migrationManager == null) return;
     var info = await migrationManager.getKeyMigrationInfo();
     if (info == null) return;
+    var migration = info;
 
     // Snapshots must exist; do not treat missing as complete.
-    if (info.snapshots == null) {
+    if (migration.snapshots == null) {
       final snapshots = await captureNaturalSnapshots(dataStore);
-      info = info.copyWith(snapshots: snapshots);
-      await migrationManager.persistKeyMigrationInfo(info);
+      migration = migration.copyWith(snapshots: snapshots);
+      await migrationManager.persistKeyMigrationInfo(migration);
     }
 
-    final snapshots = info.snapshots!;
+    await _flushAllSpacesForNaturalTurnover(
+      dataStore,
+      includeOtherSpaces: includeOtherSpaceFlush,
+    );
 
-    // WAL: done only when start watermark was captured and checkpoint advanced.
-    if (!info.isDomainDone(EncryptionDomain.wal)) {
-      var walDone = false;
-      if (snapshots.walCheckpointAtStart != null) {
-        try {
-          final walMeta = dataStore.walManager.meta;
-          final current =
-              '${walMeta.checkpoint.partitionIndex}:${walMeta.checkpoint.entrySeq}';
-          walDone = current != snapshots.walCheckpointAtStart;
-        } catch (_) {
-          // Keep waiting -- do not mark done on read failure.
+    // Table/index/meta rewrite is the security boundary. After every space has
+    // been flushed, short-lived journal domains must not block completion
+    // forever on stale WAL pending metadata.
+    if (_rewriteDomainsComplete(migration)) {
+      for (final domain in EncryptionDomain.values) {
+        if (EncryptionDomainPolicy.isNaturalTurnover(domain) &&
+            !migration.isDomainDone(domain)) {
+          migration = migration.markDomainDone(domain);
         }
       }
-      if (walDone) {
-        info = info.markDomainDone(EncryptionDomain.wal);
-      }
-    }
+    } else {
+      var snapshots = migration.snapshots!;
+      final activeSpace = dataStore.currentSpaceName;
 
-    // pageRedoLog: shrink start batch ids against current pending set.
-    if (!info.isDomainDone(EncryptionDomain.pageRedoLog)) {
-      final remaining = [...snapshots.pageRedoBatchIdsAtStart];
-      if (remaining.isEmpty) {
-        info = info.markDomainDone(EncryptionDomain.pageRedoLog);
-      } else {
-        try {
-          final current = dataStore.walManager.meta.pendingBatches
-              .map((b) => b.batchId)
-              .where((id) => id.isNotEmpty)
-              .toSet();
-          remaining.removeWhere((id) => !current.contains(id));
-        } catch (_) {
-          // Keep remaining as-is on failure.
+      if (!migration.isDomainDone(EncryptionDomain.wal)) {
+        var allSpacesWalDone = true;
+        await forEachSpace(dataStore, (ds, spaceName) async {
+          if (!allSpacesWalDone) return;
+          final start =
+              spaceName == activeSpace ? snapshots.walCheckpointAtStart : null;
+          if (!_isSpaceWalTurnedOver(ds, startCheckpoint: start)) {
+            allSpacesWalDone = false;
+          }
+        });
+        if (allSpacesWalDone) {
+          migration = migration.markDomainDone(EncryptionDomain.wal);
         }
-        info = info.copyWith(
-          snapshots: snapshots.copyWith(pageRedoBatchIdsAtStart: remaining),
-        );
+      }
+
+      if (!migration.isDomainDone(EncryptionDomain.pageRedoLog)) {
+        var remaining = [...snapshots.pageRedoBatchIdsAtStart];
+        if (remaining.isNotEmpty) {
+          try {
+            final current = dataStore.walManager.meta.pendingBatches
+                .map((b) => b.batchId)
+                .where((id) => id.isNotEmpty)
+                .toSet();
+            remaining.removeWhere((id) => !current.contains(id));
+          } catch (_) {}
+          snapshots = snapshots.copyWith(pageRedoBatchIdsAtStart: remaining);
+          migration = migration.copyWith(snapshots: snapshots);
+        }
         if (remaining.isEmpty) {
-          info = info.markDomainDone(EncryptionDomain.pageRedoLog);
+          migration = migration.markDomainDone(EncryptionDomain.pageRedoLog);
+        }
+      }
+
+      if (!migration.isDomainDone(EncryptionDomain.transactionLog)) {
+        final remaining = [...snapshots.txnActivePartitionsAtStart];
+        try {
+          final current = dataStore
+                  .transactionManager?.mainMeta?.activePartitions
+                  .toSet() ??
+              <int>{};
+          remaining.removeWhere((p) => !current.contains(p));
+        } catch (_) {}
+        snapshots = snapshots.copyWith(txnActivePartitionsAtStart: remaining);
+        migration = migration.copyWith(snapshots: snapshots);
+        if (remaining.isEmpty) {
+          migration = migration.markDomainDone(EncryptionDomain.transactionLog);
         }
       }
     }
 
-    // transactionLog: shrink activePartitions snapshot against current set.
-    if (!info.isDomainDone(EncryptionDomain.transactionLog)) {
-      final remaining = [...snapshots.txnActivePartitionsAtStart];
-      try {
-        final current =
-            dataStore.transactionManager?.mainMeta?.activePartitions.toSet() ??
-                <int>{};
-        remaining.removeWhere((p) => !current.contains(p));
-      } catch (_) {
-        // Keep remaining on failure -- do not clear.
-      }
-      info = info.copyWith(
-        snapshots: (info.snapshots ?? snapshots)
-            .copyWith(txnActivePartitionsAtStart: remaining),
-      );
-      if (remaining.isEmpty) {
-        info = info.markDomainDone(EncryptionDomain.transactionLog);
-      }
-    }
-
-    await migrationManager.persistKeyMigrationInfo(info);
+    await migrationManager.persistKeyMigrationInfo(migration);
   }
 
   static Future<void> _markDomainDone(
@@ -790,7 +883,21 @@ class KeyMigrationRunner {
   ) async {
     await _refreshNaturalTurnoverDomains(dataStore);
     final info = await dataStore.migrationManager?.getKeyMigrationInfo();
-    if (info == null || !info.allDomainsComplete) return;
+    if (info == null || !info.allDomainsComplete) {
+      if (info != null && info.isRunning) {
+        final pending = EncryptionDomain.values
+            .where((d) => !info.isDomainDone(d))
+            .map((d) => d.name)
+            .join(', ');
+        if (pending.isNotEmpty) {
+          Logger.info(
+            'Key migration still waiting on domains: $pending '
+            '(targetKeyId=${info.targetKeyId})',
+          );
+        }
+      }
+      return;
+    }
 
     final global = await dataStore.getGlobalConfig();
     final applied = global?.appliedEncryption;

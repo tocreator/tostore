@@ -55,8 +55,6 @@ class ServerDatabaseConfig {
 
   /// Get database configuration
   static DataStoreConfig get config => DataStoreConfig(
-        enableLog: true,
-        logLevel: LogLevel.warn,
         // Enable encoding and encryption
         encryptionConfig: const EncryptionConfig(
           encryptionType: EncryptionType.chacha20Poly1305,

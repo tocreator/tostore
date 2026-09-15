@@ -489,6 +489,9 @@ class KeyManager {
     final rewriteDone = info.isDomainDone(EncryptionDomain.tableData) &&
         info.isDomainDone(EncryptionDomain.btreeIndex);
     if (rewriteDone && !info.allDomainsComplete) {
+      Logger.info(
+        'Refreshing encodingKey natural-turnover state for keyId ${info.targetKeyId}',
+      );
       await KeyMigrationRunner.refreshNaturalTurnoverAndMaybeComplete(
         _dataStore,
       );
