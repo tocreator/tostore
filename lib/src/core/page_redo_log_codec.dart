@@ -17,6 +17,8 @@ import '../model/table_identity.dart';
 /// **discards that incomplete segment** -- those pages were not written yet.
 /// Prior complete chunks remain applicable.
 ///
+/// Recovery reflush must not append more chunks to the same log.
+///
 /// Partition-0 page0 payloads carry full tree-global meta
 /// (TMP1 [TreeMetaPagePayload]); do not invent a separate structure-only
 /// record for new batches.
@@ -39,8 +41,27 @@ enum PageRedoTreeKind {
   table,
   indexTree,
 
-  /// NGH vector pages (global meta on graph partition 0 page 0).
+  /// NGH posting partition-0 page 0 (global [NghIndexMeta]).
   ngh,
+
+  /// NGH paged navigating-centroid pages (layoutVersion >= 2).
+  nghNav,
+
+  /// NGH posting-page directory pages (layoutVersion >= 2).
+  nghPdir;
+
+  /// Index uid is required on the redo record.
+  bool get requiresIndexUid {
+    switch (this) {
+      case PageRedoTreeKind.table:
+        return false;
+      case PageRedoTreeKind.indexTree:
+      case PageRedoTreeKind.ngh:
+      case PageRedoTreeKind.nghNav:
+      case PageRedoTreeKind.nghPdir:
+        return true;
+    }
+  }
 }
 
 sealed class PageRedoLogRecord {
@@ -179,8 +200,7 @@ final class PageRedoLogCodec {
     required Uint8List payload,
   }) {
     final tableBytes = _u16StringBytes(tableUid);
-    final needsIndex = treeKind == PageRedoTreeKind.indexTree ||
-        treeKind == PageRedoTreeKind.ngh;
+    final needsIndex = treeKind.requiresIndexUid;
     final indexBytes =
         needsIndex ? _u16StringBytes(indexUid?.value ?? '') : Uint8List(0);
 

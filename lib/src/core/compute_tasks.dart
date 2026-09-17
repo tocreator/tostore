@@ -1764,10 +1764,7 @@ Future<BatchBTreePageEncodeResult> batchEncodeBTreePages(
       records.add(PageRedoLogCodec.encodePageRecord(
         treeKind: treeKind,
         tableUid: tableUid,
-        indexUid: (treeKind == PageRedoTreeKind.indexTree ||
-                treeKind == PageRedoTreeKind.ngh)
-            ? indexUid
-            : null,
+        indexUid: treeKind.requiresIndexUid ? indexUid : null,
         partitionNo: p.partitionNo,
         pageNo: p.pageNo,
         payload: out[i],
@@ -1822,6 +1819,7 @@ Uint8List _resolveBTreePagePayload(
     case BTreePageType.nghMeta:
     case BTreePageType.nghPosting:
     case BTreePageType.nghNavGraph:
+    case BTreePageType.nghPdir:
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,

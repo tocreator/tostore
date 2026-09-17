@@ -49,6 +49,9 @@ enum BTreePageType {
 
   /// NGH navigating graph page containing centroid vectors and cluster topology.
   nghNavGraph,
+
+  /// NGH posting-page directory (appended; do not insert before existing values).
+  nghPdir,
 }
 
 // ============================================================================

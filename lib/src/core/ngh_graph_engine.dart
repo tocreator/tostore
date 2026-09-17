@@ -3,12 +3,14 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
+import '../handler/memcomparable.dart';
 import '../model/ngh_index_meta.dart';
 import '../model/table_context.dart';
 import '../model/table_identity.dart';
 import '../model/table_schema.dart';
 import 'ngh_page.dart';
 import 'ngh_partition_manager.dart';
+import 'ngh_pk_map.dart';
 import 'vector_quantizer.dart';
 import 'yield_controller.dart';
 
@@ -22,11 +24,29 @@ import 'yield_controller.dart';
 //   4. Hub governance: softCap (~1.75× fair share) + batch-end 2-means posting rewrite
 //   5. Tombstone deletion and compaction
 //
-// Release lock (searchDepth controllability, ~100k–10M):
-//   - Construction keeps imbalance typically <=2.5 after clear+rebuild.
-//   - depth → nprobe / maxCandidates / post-trim floors are monotonic so
-//     latency and recall intent rise together (30 < 50 < 80).
-//   - Prefer layout fixes when imbalance; do not thrash search constants.
+// Scale lock (identity recall + tens of billions):
+//   - Insert and search share one router: exact among top-level lists
+//     (coarses ∪ orphan leaves), then exact among that node's children.
+//     Never stride-sample a flat K, never probe only coarses while leftover
+//     flat leaves still hold data.
+//   - Format cap for top-level ids is 16384. Insert assignment is
+//     O(topLevel × D) per vector, so the *L0 routing* cap is 256. Further
+//     growth nests coarse→mid→leaf (fanout ≤256 per level) instead of
+//     scanning thousands of centroids, and instead of skipping splits once
+//     a parent is full (that left giant leaves and search avalanches).
+//   - Leaf posting size is hard-capped (~4k–64 pages). Three levels at
+//     256×256×256×~4k ≈ 68B before a children-dir / fourth level.
+//   - nprobe is on L0 count. Each probed coarse expands an exact child-
+//     nprobe recursively down to leaves (always includes the nearest child).
+//   - searchDepth is a 1..100 recall-intent knob (90%–100%). Values above
+//     100 clamp to 100 — they do not buy extra probes. Leaf count is
+//     max(staircase, ~√nlist) under a depth-scaled interactive ceiling
+//     (d1=4, d50=16, d80=32, d100=48 leaves) so 5M still reaches ~95%
+//     intent at depth 100 without a 10B scoring avalanche.
+//   - Engine v4 never rewrites nav_graph.ngh. New writes are paged nav/pdir
+//     only. Posting slot layout (including inlined PK) stays frozen; pdir is
+//     the page-list authority. Packed i32 `next` may be -1 at huge partition
+//     counts — that is not a posting rewrite trigger.
 // ============================================================================
 
 /// A search result with node ID, primary key, and distance.
@@ -110,8 +130,18 @@ class _NprobePlan {
 class NghGraphEngine {
   final NghPartitionManager _partitionManager;
 
-  /// Absolute nprobe ceiling (depth=100 still latency-bounded).
+  /// Absolute L0 nprobe ceiling (depth=100 still latency-bounded).
   static const int _hardNprobeCap = 256;
+
+  /// Typical IVF leaf occupancy used for slot-budget estimates.
+  static const int _typicalLeafSlots = 4096;
+
+  /// Interactive leaf ceiling at searchDepth=100 (~196k SQ8 scores).
+  ///
+  /// True-kNN 95% at 5–10M is bought here, not by raising the public knob
+  /// past 100. 10B still cannot brute-force 95%; this cap keeps latency in
+  /// the tens-to-low-hundreds of ms class at D=512.
+  static const int _maxInteractiveLeaves = 48;
 
   /// Reference width for dimension-aware latency ceilings (128-d → full scale).
   static const int _nprobeScaleRefDims = 128;
@@ -120,6 +150,7 @@ class NghGraphEngine {
   ///
   /// Hard contract: depth only spans 90%–100% recall intent.
   /// depth 50 → 95% (production baseline), depth 80 → 98%, depth 100 → 100%.
+  /// Values above 100 are clamped; 200/300 is not a higher-recall mode.
   static double targetRecallFromDepth(int searchDepth) {
     final depth = searchDepth.clamp(1, 100);
     return 0.90 + depth / 1000.0;
@@ -130,33 +161,39 @@ class NghGraphEngine {
     if (centroids.isEmpty) return 1.0;
     var sum = 0;
     var maxEntry = 0;
+    var n = 0;
     for (final c in centroids) {
+      if (c.isCoarse) continue;
       final e = c.entryCount < 0 ? 0 : c.entryCount;
       sum += e;
+      n++;
       if (e > maxEntry) maxEntry = e;
     }
-    final avg = sum / centroids.length;
+    if (n <= 0) return 1.0;
+    final avg = sum / n;
     if (avg <= 0) return 1.0;
     return maxEntry / avg;
   }
 
-  /// Fraction of [nlist] to probe for intensity [t] = depth/100 in `[0, 1]`.
+  /// Fraction of [nlist] used only for hierarchical child-nprobe.
   ///
-  /// Must stay cheap at low depth (depth 5 must not behave like depth 50).
-  /// depth≈50 (t=0.5) targets ~7% nlist before floors; higher depths rise faster.
+  /// Parent nprobe is sqrt-scaled in [_resolveNprobePlan] (min-cost for intent).
+  /// This curve stays well below the old ~7% @ depth 50, which over-probed.
   static double _nlistCoverageForIntensity(double t) {
     final x = t.clamp(0.0, 1.0);
-    // t=0 → 1.5%, t=0.05 → ~1.8%, t=0.5 → ~7.2%, t=0.8 → ~14%, t=1 → 22%.
-    return 0.015 + 0.205 * pow(x, 1.35);
+    // t=0 → 0.3%, t=0.5 → ~2.0%, t=1 → ~5.5%.
+    return 0.003 + 0.052 * pow(x, 1.20);
   }
 
-  /// Map recall intent + corpus shape → nprobe plan.
+  /// Map recall intent → minimum-cost nprobe / scoring plan.
   ///
-  /// Release contract: on balanced indexes, higher [searchDepth] must raise
-  /// both probe intent and scoring budget so wall clock and recall move
-  /// together through ~100k → 10M (interactive ceilings still apply).
+  /// L0 nprobe stays √(L0) (L0 ≤ 256). Leaf count is max(depth staircase,
+  /// ~√nLeaves) so 5M+/10M still differentiate 50 vs 100, capped by
+  /// [_maxLeavesForDepth] (d100 = 48 leaves, ~196k SQ8) — not by raising
+  /// searchDepth to 200/300.
   _NprobePlan _resolveNprobePlan({
     required int nCentroids,
+    required int nLeaves,
     required int dimensions,
     required int totalVectors,
     required double imbalance,
@@ -165,88 +202,52 @@ class NghGraphEngine {
     final depth =
         (searchDepth ?? VectorIndexConfig.defaultSearchDepth).clamp(1, 100);
     final targetRecall = targetRecallFromDepth(depth);
-    if (nCentroids <= 1) {
+    final nlist = max(1, nCentroids);
+    if (nlist <= 1) {
       return _NprobePlan(
         depth: depth,
         targetRecall: targetRecall,
         maxCandidates: max(1, totalVectors),
         nprobe: 1,
-        nlist: max(1, nCentroids),
+        nlist: nlist,
         imbalance: imbalance,
       );
     }
 
-    // t = depth/100 ≡ (targetRecall-0.90)/0.10
     final t = depth / 100.0;
-    final coverage = _nlistCoverageForIntensity(t);
-    var nprobe = max(1, (coverage * nCentroids).ceil());
+    final sqrtK = sqrt(nlist);
+    const n1 = 1;
+    final n50 = max(3, min(16, (0.42 * sqrtK).round()));
+    final n100 = max(n50 + 4, min(_hardNprobeCap, (1.05 * sqrtK).round()));
+    var nprobe = t <= 0.5
+        ? max(n1, (n1 + (n50 - n1) * (t / 0.5)).round())
+        : (n50 + (n100 - n50) * ((t - 0.5) / 0.5)).round();
 
-    final sqrtN = sqrt(nCentroids);
-    // Depth-proportional floors (NOT stuck near the 95% floor at low depth).
-    final floorLo = max(2, min(8, (0.35 * sqrtN).round())); // ~depth 1
-    final floor95 = max(16, min(72, (1.35 * sqrtN).round())); // ~depth 50
-    final floor100 =
-        max(floor95, min(_hardNprobeCap, (0.28 * nCentroids).round()));
-    final nFloor = t <= 0.5
-        ? (floorLo + (floor95 - floorLo) * (t / 0.5)).round()
-        : (floor95 + (floor100 - floor95) * ((t - 0.5) / 0.5)).round();
-    nprobe = max(nprobe, max(1, nFloor));
-
-    // Imbalance boost only above mid depth (low depth stays latency-first).
-    if (imbalance > 2.5 && t >= 0.35) {
-      final boost = min(1.25, 1.0 + (imbalance - 2.5) * 0.06 * t);
-      nprobe = (nprobe * boost).round();
+    if (imbalance > 2.5 && t >= 0.40) {
+      final boost = min(1.20, 1.0 + (imbalance - 2.5) * 0.05 * t);
+      nprobe = min(n100, (nprobe * boost).round());
     }
 
-    // Hard latency ceilings (dim/corpus). Depth-aware corpus ceil so depth=80
-    // can still out-probe depth=50 at 1M–10M.
-    final dimCeil = max(
-      48,
-      (_hardNprobeCap *
-              sqrt(_nprobeScaleRefDims / max(_nprobeScaleRefDims, dimensions)))
-          .round(),
-    );
-    final int corpusBase;
-    if (totalVectors <= 100000) {
-      corpusBase = nCentroids;
-    } else if (totalVectors <= 1000000) {
-      corpusBase = min(nCentroids, 192);
-    } else if (totalVectors <= 10000000) {
-      corpusBase = min(nCentroids, 160);
-    } else {
-      corpusBase = min(nCentroids, 128);
-    }
-    final corpusCeil = min(
-      nCentroids,
-      max(floorLo + 4, (corpusBase * (0.55 + 0.55 * t)).round()),
-    );
-    final hardCeil =
-        min(nCentroids, min(_hardNprobeCap, min(dimCeil, corpusCeil)));
-
-    // Depth-scaled ceiling: depth 5 → ~14 probes max on 512-d, depth 50 → ~mid.
-    final depthCeil = max(
-      floorLo + 1,
-      (floorLo + t * (hardCeil - floorLo)).round(),
-    );
-    nprobe = min(nprobe, min(hardCeil, depthCeil));
-
-    // Scoring budget: depth-scaled; dim soft-dampen; log growth cap for large N.
-    final budgetBase = 2800.0 + 28000.0 * pow(t, 1.20);
     final dimScale =
-        pow(_nprobeScaleRefDims / max(_nprobeScaleRefDims, dimensions), 0.40)
-            .toDouble();
-    final nScale = 1.0 +
-        0.05 *
-            min(4.0, log(max(1000.0, totalVectors.toDouble()) / 1000.0) / ln10);
-    final budgetLo = (1800 + 5500 * t).round();
-    final budgetHi = (9000 + 38000 * t).round().clamp(9000, 48000);
-    var maxCandidates =
-        (budgetBase * dimScale * nScale).round().clamp(budgetLo, budgetHi);
+        sqrt(_nprobeScaleRefDims / max(_nprobeScaleRefDims, dimensions));
+    final dimCeil = max(
+      n1,
+      ((n1 + (n100 - n1) * t) * max(0.70, dimScale)).round(),
+    );
+    nprobe = min(nlist, min(nprobe, dimCeil));
 
-    // Skewed lists: light inflate only above mid depth.
+    final leafKeep = _minKeepLeaves(t, nLeaves: nLeaves);
+    final slotCap = _slotCapForDepth(t);
+    var maxCandidates = (_typicalLeafSlots * leafKeep * 1.15).round();
+    maxCandidates = maxCandidates.clamp(_typicalLeafSlots, slotCap);
+    maxCandidates = min(maxCandidates, max(1, totalVectors));
     if (imbalance > 3.0 && t >= 0.45) {
-      final imbScale = min(1.25, 1.0 + (imbalance - 3.0) * 0.05);
-      maxCandidates = (maxCandidates * imbScale).round().clamp(budgetLo, 48000);
+      final imbScale = min(1.15, 1.0 + (imbalance - 3.0) * 0.04);
+      maxCandidates =
+          (maxCandidates * imbScale).round().clamp(_typicalLeafSlots, slotCap);
+    }
+    if (nLeaves > 0) {
+      maxCandidates = min(maxCandidates, nLeaves * _typicalLeafSlots);
     }
 
     return _NprobePlan(
@@ -254,42 +255,209 @@ class NghGraphEngine {
       targetRecall: targetRecall,
       maxCandidates: maxCandidates,
       nprobe: nprobe,
-      nlist: nCentroids,
+      nlist: nlist,
       imbalance: imbalance,
     );
+  }
+
+  /// Interactive leaf ceiling: depth 1→4, 50→16, 80→32, 100→48.
+  static int _maxLeavesForDepth(double t) {
+    final x = t.clamp(0.0, 1.0);
+    if (x <= 0.50) {
+      return max(4, (4 + 12 * (x / 0.50)).round());
+    }
+    if (x <= 0.80) {
+      return max(16, (16 + 16 * ((x - 0.50) / 0.30)).round());
+    }
+    return max(
+      32,
+      min(_maxInteractiveLeaves, (32 + 16 * ((x - 0.80) / 0.20)).round()),
+    );
+  }
+
+  static int _slotCapForDepth(double t) =>
+      (_typicalLeafSlots * _maxLeavesForDepth(t) * 1.15).round();
+
+  /// Depth staircase is the latency floor. IVF recall at large nlist needs
+  /// ~√nlist extra leaves; never exceed [_maxLeavesForDepth].
+  static int _minKeepLeaves(double t, {int nLeaves = 0}) {
+    final x = t.clamp(0.0, 1.0);
+    final stair = x <= 0.50
+        ? max(1, (1 + 3 * (x / 0.50)).round())
+        : (4 + 8 * ((x - 0.50) / 0.50)).round();
+    final cap = _maxLeavesForDepth(x);
+    if (nLeaves <= 0) return min(stair, cap);
+    if (nLeaves <= stair) return min(nLeaves, cap);
+
+    final sqrtN = sqrt(nLeaves.toDouble());
+    final want50 = max(stair, (0.45 * sqrtN).round());
+    final want100 = max(stair, (1.25 * sqrtN).round());
+    final want = x <= 0.50
+        ? (stair + (want50 - stair) * (x / 0.50)).round()
+        : (want50 + (want100 - want50) * ((x - 0.50) / 0.50)).round();
+    return min(nLeaves, max(stair, min(want, cap)));
   }
 
   /// In-memory cached navigating centroid graph per index.
   /// Key: tableUid/indexUid
   final Map<String, NghNavGraphPage> _navGraphCache = {};
 
-  /// In-memory compact vector cache partitioned by centroidId for hot search.
-  /// LinkedHashMap preserves insertion order for FIFO eviction under pressure.
-  /// Key: tableUid/indexUid -> `Map<int centroidId, List<_NghCompactSlot>>`
-  final LinkedHashMap<String, Map<int, List<_NghCompactSlot>>>
-      _inMemoryClusterCache =
-      LinkedHashMap<String, Map<int, List<_NghCompactSlot>>>();
+  /// Per-centroid compact SQ8 cache. Key: `tableUid/indexUid/centroidId`.
+  final LinkedHashMap<String, List<_NghCompactSlot>> _inMemoryClusterCache =
+      LinkedHashMap<String, List<_NghCompactSlot>>();
 
-  /// Estimated resident bytes of [_inMemoryClusterCache] (SQ8 + PK + overhead).
+  /// Estimated resident bytes of [_inMemoryClusterCache].
   int _clusterCacheBytes = 0;
 
   /// Soft ceiling for cluster compact cache; enforced after load/prewarm.
-  int _clusterCacheMaxBytes = 64 * 1024 * 1024;
+  ///
+  /// Default is a floor only. [configureClusterCacheBudget] is synced from
+  /// [ResourceManager] index quota once that manager finishes initializing
+  /// (VectorIndexManager is constructed earlier, when the quota is still 0).
+  int _clusterCacheMaxBytes = 32 * 1024 * 1024;
 
-  /// Most-recently-used cluster-cache key (avoid O(n) LinkedHashMap.keys.last).
-  String? _clusterCacheMruKey;
+  final Map<String, Future<void>> _clusterLoadInflight = {};
+
+  late final NghPkMapEngine _pkMap =
+      NghPkMapEngine(_partitionManager, _partitionManager.engineConfig);
 
   NghGraphEngine(this._partitionManager);
+
+  /// Format / page-directory cap for top-level IVF ids.
+  static const int _maxTargetK = 16384;
+
+  /// L0 IVF lists (roots: coarses ∪ orphan leaves). Exact-scanned on insert.
+  /// Nested coarses are children, not L0 — otherwise K grows past 256 and
+  /// 10k-flush assignment returns to minutes at 10M+.
+  static const int _maxTopLevelRouting = 256;
+
+  /// Coarse→mid→leaf hops. 256^3 × ~4k ≈ 68B; deeper would need childrenDir.
+  static const int _maxIvfDepth = 2;
+
+  /// Hard cap on live vectors in one leaf. Fair-share softCap must not exceed
+  /// this or 10B corpora collapse into ~610k-slot lists (search I/O avalanche).
+  static int _leafEntryCap(int slotsPerPage) =>
+      max(4096, 64 * max(1, slotsPerPage));
 
   int get _pageSize => _partitionManager.configuredPageSize;
 
   /// Current estimated cluster-cache footprint in bytes.
   int get clusterCacheBytes => _clusterCacheBytes;
 
+  /// Current compact-cache ceiling in bytes.
+  int get clusterCacheMaxBytes => _clusterCacheMaxBytes;
+
   /// Configure cluster-cache ceiling (typically a share of the index budget).
   void configureClusterCacheBudget(int maxBytes) {
     _clusterCacheMaxBytes = max(4 * 1024 * 1024, maxBytes);
     _enforceClusterCacheBudget();
+  }
+
+  int _liveCompactCount(List<_NghCompactSlot> slots) {
+    var n = 0;
+    for (final slot in slots) {
+      if (slot.flags & 0x01 == 0) n++;
+    }
+    return n;
+  }
+
+  int _estimateCompactIndexBytes(
+    List<NghNavCentroidNode> centroids,
+    int dimensions,
+  ) {
+    var bytes = 64;
+    for (final c in centroids) {
+      if (c.isCoarse) continue;
+      bytes += max(1, c.entryCount) * (24 + dimensions);
+    }
+    return bytes;
+  }
+
+  List<_NghCompactSlot> _compactNewSlots(
+    List<NghPostingSlot> slots,
+    int pageNo,
+  ) {
+    return [
+      for (final slot in slots) _compactFromPostingSlot(slot, pageNo),
+    ];
+  }
+
+  /// Keep the search compact cache coherent after insert.
+  ///
+  /// Never publish a *partial* batch as the whole cluster (that made search
+  /// skip disk and recall collapse to the last flush). Do keep:
+  /// 1. brand-new / batch-complete clusters
+  /// 2. append onto a cache that already held the pre-batch cluster
+  /// Returns true only when the corpus still fits the budget **and** some
+  /// leaves are missing (cold process / first fill). Already-warm small
+  /// indexes must not trigger a post-flush prewarm on every persist.
+  bool _refreshCompactCacheAfterInsert({
+    required String cacheKey,
+    required List<NghNavCentroidNode> centroids,
+    required Map<int, List<NghPostingSlot>> clusterSlots,
+    required Set<int> rewrittenIds,
+    required Set<int> newCentroidIds,
+    required int dimensions,
+  }) {
+    final fits = _estimateCompactIndexBytes(centroids, dimensions) <=
+        _clusterCacheMaxBytes;
+    final protect = <String>{
+      for (final cId in rewrittenIds) _centroidCacheKey(cacheKey, cId),
+    };
+
+    for (final cId in clusterSlots.keys) {
+      if (rewrittenIds.contains(cId)) {
+        protect.add(_centroidCacheKey(cacheKey, cId));
+        continue;
+      }
+      if (cId < 0 || cId >= centroids.length) {
+        _removeCentroidSlots(cacheKey, cId);
+        continue;
+      }
+      final newSlots = clusterSlots[cId]!;
+      final centroid = centroids[cId];
+      final packedRef =
+          centroid.tailPostingPageNo > 0 ? centroid.tailPostingPageNo : 1;
+      final ck = _centroidCacheKey(cacheKey, cId);
+      final cached = _inMemoryClusterCache[ck];
+      final liveCached = cached == null ? 0 : _liveCompactCount(cached);
+      final newCount = newSlots.length;
+
+      if (newCentroidIds.contains(cId) || centroid.entryCount == newCount) {
+        _putCentroidSlots(
+          cacheKey,
+          cId,
+          _compactNewSlots(newSlots, packedRef),
+        );
+        protect.add(ck);
+        continue;
+      }
+
+      if (cached != null &&
+          newCount > 0 &&
+          liveCached + newCount >= centroid.entryCount) {
+        final merged = List<_NghCompactSlot>.from(cached)
+          ..addAll(_compactNewSlots(newSlots, packedRef));
+        _putCentroidSlots(cacheKey, cId, merged);
+        protect.add(ck);
+        continue;
+      }
+
+      // Incomplete and not cached: drop so search cannot treat a stump as
+      // the whole list. Small indexes reload after persist.
+      _removeCentroidSlots(cacheKey, cId);
+    }
+
+    _enforceClusterCacheBudget(protectKeys: protect);
+    if (!fits) return false;
+    for (final c in centroids) {
+      if (c.isCoarse || c.entryCount <= 0) continue;
+      if (!_inMemoryClusterCache
+          .containsKey(_centroidCacheKey(cacheKey, c.centroidId))) {
+        return true;
+      }
+    }
+    return false;
   }
 
   String _cacheKey(TableUid tableUid, IndexUid indexUid) =>
@@ -311,57 +479,86 @@ class NghGraphEngine {
     );
   }
 
-  int _estimateClusterMapBytes(Map<int, List<_NghCompactSlot>> clusterMap) {
-    var bytes = 64;
-    for (final slots in clusterMap.values) {
-      bytes += 16;
-      for (final slot in slots) {
-        bytes += _estimateSlotBytes(slot);
-      }
+  int _estimateSlotListBytes(List<_NghCompactSlot> slots) {
+    var bytes = 16;
+    for (final slot in slots) {
+      bytes += _estimateSlotBytes(slot);
     }
     return bytes;
   }
 
-  void _touchClusterCacheKey(String key) {
-    // Already MRU: skip LinkedHashMap remove/reinsert churn on every search.
-    if (_clusterCacheMruKey == key) return;
-    final map = _inMemoryClusterCache.remove(key);
-    if (map != null) {
-      _inMemoryClusterCache[key] = map;
-      _clusterCacheMruKey = key;
+  String _centroidCacheKey(String indexKey, int centroidId) =>
+      '$indexKey/$centroidId';
+
+  bool _clusterCacheIsFresh(
+    List<_NghCompactSlot> cached,
+    NghNavCentroidNode centroid,
+  ) {
+    if (centroid.entryCount <= 0) return true;
+    var live = 0;
+    for (final slot in cached) {
+      if (slot.flags & 0x01 == 0) live++;
+    }
+    final minLive = min(centroid.entryCount, (centroid.entryCount * 3) ~/ 4);
+    return live >= minLive;
+  }
+
+  void _touchCentroidCacheKey(String key) {
+    final list = _inMemoryClusterCache.remove(key);
+    if (list != null) {
+      _inMemoryClusterCache[key] = list;
     }
   }
 
-  /// Evict oldest index cluster maps until under [targetBytes].
-  void _enforceClusterCacheBudget({String? protectKey, int? targetBytes}) {
+  void _putCentroidSlots(
+      String indexKey, int centroidId, List<_NghCompactSlot> slots) {
+    final key = _centroidCacheKey(indexKey, centroidId);
+    final old = _inMemoryClusterCache.remove(key);
+    if (old != null) {
+      _clusterCacheBytes =
+          max(0, _clusterCacheBytes - _estimateSlotListBytes(old));
+    }
+    _inMemoryClusterCache[key] = slots;
+    _clusterCacheBytes += _estimateSlotListBytes(slots);
+  }
+
+  void _removeCentroidSlots(String indexKey, int centroidId) {
+    final key = _centroidCacheKey(indexKey, centroidId);
+    final old = _inMemoryClusterCache.remove(key);
+    if (old != null) {
+      _clusterCacheBytes =
+          max(0, _clusterCacheBytes - _estimateSlotListBytes(old));
+    }
+  }
+
+  /// Evict oldest centroid lists until under [targetBytes].
+  void _enforceClusterCacheBudget(
+      {Set<String>? protectKeys, int? targetBytes}) {
     final limit = targetBytes ?? _clusterCacheMaxBytes;
     if (_clusterCacheBytes <= limit) return;
 
     final keys = _inMemoryClusterCache.keys.toList(growable: false);
     for (final key in keys) {
       if (_clusterCacheBytes <= limit) break;
-      if (protectKey != null && key == protectKey) continue;
+      if (protectKeys != null && protectKeys.contains(key)) continue;
       final removed = _inMemoryClusterCache.remove(key);
       if (removed == null) continue;
-      if (_clusterCacheMruKey == key) _clusterCacheMruKey = null;
       _clusterCacheBytes =
-          max(0, _clusterCacheBytes - _estimateClusterMapBytes(removed));
+          max(0, _clusterCacheBytes - _estimateSlotListBytes(removed));
     }
 
-    // Still over budget: evict protected key last (OOM safety > hot hit rate).
-    if (_clusterCacheBytes > limit &&
-        protectKey != null &&
-        _inMemoryClusterCache.containsKey(protectKey)) {
-      final removed = _inMemoryClusterCache.remove(protectKey);
-      if (removed != null) {
-        if (_clusterCacheMruKey == protectKey) _clusterCacheMruKey = null;
+    if (_clusterCacheBytes > limit && protectKeys != null) {
+      for (final key in protectKeys) {
+        if (_clusterCacheBytes <= limit) break;
+        final removed = _inMemoryClusterCache.remove(key);
+        if (removed == null) continue;
         _clusterCacheBytes =
-            max(0, _clusterCacheBytes - _estimateClusterMapBytes(removed));
+            max(0, _clusterCacheBytes - _estimateSlotListBytes(removed));
       }
     }
   }
 
-  /// Evict a ratio of cluster compact caches (oldest indexes first).
+  /// Evict a ratio of cluster compact caches (oldest centroids first).
   void evictClusterCache({double ratio = 0.3}) {
     if (_inMemoryClusterCache.isEmpty || ratio <= 0) return;
     final target = max(
@@ -381,9 +578,8 @@ class NghGraphEngine {
     for (final k in toRemove) {
       final removed = _inMemoryClusterCache.remove(k);
       if (removed != null) {
-        if (_clusterCacheMruKey == k) _clusterCacheMruKey = null;
         _clusterCacheBytes =
-            max(0, _clusterCacheBytes - _estimateClusterMapBytes(removed));
+            max(0, _clusterCacheBytes - _estimateSlotListBytes(removed));
       }
     }
     _navGraphCache.removeWhere((k, _) => k.startsWith(prefix));
@@ -391,14 +587,19 @@ class NghGraphEngine {
 
   /// Clear cluster cache for a specific index.
   void clearCacheForIndex(TableUid tableUid, IndexUid indexUid) {
-    final key = _cacheKey(tableUid, indexUid);
-    final removed = _inMemoryClusterCache.remove(key);
-    if (removed != null) {
-      if (_clusterCacheMruKey == key) _clusterCacheMruKey = null;
-      _clusterCacheBytes =
-          max(0, _clusterCacheBytes - _estimateClusterMapBytes(removed));
+    final prefix = '${_cacheKey(tableUid, indexUid)}/';
+    final toRemove = <String>[
+      for (final k in _inMemoryClusterCache.keys)
+        if (k.startsWith(prefix) || k == _cacheKey(tableUid, indexUid)) k,
+    ];
+    for (final k in toRemove) {
+      final removed = _inMemoryClusterCache.remove(k);
+      if (removed != null) {
+        _clusterCacheBytes =
+            max(0, _clusterCacheBytes - _estimateSlotListBytes(removed));
+      }
     }
-    _navGraphCache.remove(key);
+    _navGraphCache.remove(_cacheKey(tableUid, indexUid));
   }
 
   /// Clear all cluster caches.
@@ -406,23 +607,42 @@ class NghGraphEngine {
     _inMemoryClusterCache.clear();
     _navGraphCache.clear();
     _clusterCacheBytes = 0;
-    _clusterCacheMruKey = null;
   }
 
   void _ingestLoadedPagesIntoClusterMap({
     required Map<int, List<_NghCompactSlot>> clusterMap,
     required List<({int packedRef, NghPostingPage page})> loaded,
     required Set<int> expectedCentroidIds,
+    Map<int, int>? packedOwner,
   }) {
     for (final item in loaded) {
-      final cList = clusterMap.putIfAbsent(item.page.centroidId, () => []);
+      final owner = packedOwner?[item.packedRef] ?? item.page.centroidId;
+      final cList = clusterMap.putIfAbsent(owner, () => []);
       for (final slot in item.page.slots) {
         final compact = _compactFromPostingSlot(slot, item.packedRef);
         cList.add(compact);
-        _clusterCacheBytes += _estimateSlotBytes(compact);
       }
     }
-    // Mark requested centroids present even if empty (avoid repeat I/O).
+    for (final cId in expectedCentroidIds) {
+      clusterMap.putIfAbsent(cId, () => <_NghCompactSlot>[]);
+    }
+  }
+
+  void _ingestIdPagesIntoClusterMap({
+    required Map<int, List<_NghCompactSlot>> clusterMap,
+    required List<({NghPageId id, NghPostingPage page})> loaded,
+    required Set<int> expectedCentroidIds,
+    Map<int, int>? pageOwnerByCacheKey,
+  }) {
+    for (final item in loaded) {
+      final owner =
+          pageOwnerByCacheKey?[item.id.cacheKey] ?? item.page.centroidId;
+      final cList = clusterMap.putIfAbsent(owner, () => []);
+      final packed = item.id.tryPack() ?? item.id.cacheKey;
+      for (final slot in item.page.slots) {
+        cList.add(_compactFromPostingSlot(slot, packed));
+      }
+    }
     for (final cId in expectedCentroidIds) {
       clusterMap.putIfAbsent(cId, () => <_NghCompactSlot>[]);
     }
@@ -438,58 +658,118 @@ class NghGraphEngine {
     required Map<int, List<_NghCompactSlot>> clusterMap,
     required String cacheKey,
   }) async {
-    final packedRefsToRead = <int>[];
+    final pageIdsToRead = <NghPageId>[];
     final chainHeads = <int>[];
     final expected = <int>{};
+    final protect = <String>{};
+    final pageOwnerByCacheKey = <int, int>{};
+    final packedOwner = <int, int>{};
 
     for (final cId in probeCentroids) {
-      if (clusterMap.containsKey(cId)) continue;
       if (cId < 0 || cId >= navGraph.centroids.length) continue;
+      final ck = _centroidCacheKey(cacheKey, cId);
+      protect.add(ck);
+      final cached = _inMemoryClusterCache[ck];
+      if (cached != null &&
+          _clusterCacheIsFresh(cached, navGraph.centroids[cId])) {
+        clusterMap[cId] = cached;
+        _touchCentroidCacheKey(ck);
+        continue;
+      }
+      if (cached != null) _removeCentroidSlots(cacheKey, cId);
+      if (clusterMap.containsKey(cId)) continue;
       expected.add(cId);
       final c = navGraph.centroids[cId];
-      if (c.postingPageNos.isNotEmpty) {
-        packedRefsToRead.addAll(c.postingPageNos);
+      if (c.postingPages.isEmpty && !c.postingDirRoot.isNone) {
+        await _partitionManager.hydratePostingDirs(table, indexUid, [c]);
+      }
+      if (c.postingPages.isNotEmpty) {
+        for (final pid in c.postingPages) {
+          pageIdsToRead.add(pid);
+          pageOwnerByCacheKey[pid.cacheKey] = cId;
+        }
+      } else if (c.postingPageNos.isNotEmpty) {
+        for (final p in c.postingPageNos) {
+          if (p > 0) {
+            final pid = NghPageId.fromPacked(p);
+            pageIdsToRead.add(pid);
+            pageOwnerByCacheKey[pid.cacheKey] = cId;
+          }
+        }
       } else if (c.headPostingPageNo > 0) {
         chainHeads.add(c.headPostingPageNo);
+        packedOwner[c.headPostingPageNo] = cId;
       } else {
         clusterMap[cId] = <_NghCompactSlot>[];
       }
     }
 
-    if (packedRefsToRead.isNotEmpty) {
-      final uniqueRefs = packedRefsToRead.toSet().toList(growable: false);
-      final loaded = await _partitionManager.readPostingPagesBatch(
-        table,
-        indexUid,
-        meta,
-        uniqueRefs,
-        populatePageCache: false,
-      );
-      _ingestLoadedPagesIntoClusterMap(
-        clusterMap: clusterMap,
-        loaded: loaded,
-        expectedCentroidIds: expected,
-      );
-    }
-
-    if (chainHeads.isNotEmpty) {
-      final chains = await _partitionManager.readPostingClustersBatch(
-        table,
-        indexUid,
-        meta,
-        chainHeads,
-      );
-      for (final chain in chains) {
-        _ingestLoadedPagesIntoClusterMap(
+    Future<void> load() async {
+      if (pageIdsToRead.isNotEmpty) {
+        final unique = <int, NghPageId>{};
+        for (final id in pageIdsToRead) {
+          unique[id.cacheKey] = id;
+        }
+        final loaded = await _partitionManager.readPostingPagesByIds(
+          table,
+          indexUid,
+          meta,
+          unique.values.toList(growable: false),
+          populatePageCache: false,
+        );
+        _ingestIdPagesIntoClusterMap(
           clusterMap: clusterMap,
-          loaded: chain,
+          loaded: loaded,
           expectedCentroidIds: expected,
+          pageOwnerByCacheKey: pageOwnerByCacheKey,
         );
       }
+      if (chainHeads.isNotEmpty) {
+        final chains = await _partitionManager.readPostingClustersBatch(
+          table,
+          indexUid,
+          meta,
+          chainHeads,
+        );
+        for (final chain in chains) {
+          final headOwner =
+              chain.isEmpty ? null : packedOwner[chain.first.packedRef];
+          _ingestLoadedPagesIntoClusterMap(
+            clusterMap: clusterMap,
+            loaded: chain,
+            expectedCentroidIds: expected,
+            packedOwner: headOwner == null
+                ? packedOwner
+                : {
+                    for (final item in chain) item.packedRef: headOwner,
+                  },
+          );
+        }
+      }
+      for (final cId in expected) {
+        final slots = clusterMap.putIfAbsent(cId, () => <_NghCompactSlot>[]);
+        _putCentroidSlots(cacheKey, cId, slots);
+      }
+      _enforceClusterCacheBudget(protectKeys: protect);
     }
 
-    _touchClusterCacheKey(cacheKey);
-    _enforceClusterCacheBudget(protectKey: cacheKey);
+    final inflightKey = '$cacheKey/load/${probeCentroids.join(',')}';
+    final existing = _clusterLoadInflight[inflightKey];
+    if (existing != null) {
+      await existing;
+      for (final cId in probeCentroids) {
+        final cached = _inMemoryClusterCache[_centroidCacheKey(cacheKey, cId)];
+        if (cached != null) clusterMap[cId] = cached;
+      }
+      return;
+    }
+    final future = load();
+    _clusterLoadInflight[inflightKey] = future;
+    try {
+      await future;
+    } finally {
+      _clusterLoadInflight.remove(inflightKey);
+    }
   }
 
   /// Startup/runtime prewarm: load posting clusters into compact cache.
@@ -515,7 +795,6 @@ class NghGraphEngine {
     final navGraph = await _getOrLoadNavGraph(table, indexUid, meta);
     if (navGraph == null || navGraph.centroids.isEmpty || aborted()) return 0;
 
-    final clusterMap = _inMemoryClusterCache.putIfAbsent(key, () => {});
     final centroids = navGraph.centroids;
     final order = List<int>.generate(centroids.length, (i) => i);
 
@@ -523,6 +802,7 @@ class NghGraphEngine {
     // arbitrary query vectors never pay disk I/O on probed-centroid misses.
     var totalEst = 64;
     for (final c in centroids) {
+      if (c.isCoarse) continue;
       totalEst += max(1, c.entryCount) * (24 + meta.dimensions);
     }
     final loadAll = totalEst <= maxBytes;
@@ -539,6 +819,7 @@ class NghGraphEngine {
         YieldController('NghGraphEngine.prewarmClusters', checkInterval: 1);
     var planned = 0;
     var budgetExhausted = false;
+    final protect = <String>{};
 
     for (var batchStart = 0;
         batchStart < order.length && !budgetExhausted;
@@ -546,15 +827,23 @@ class NghGraphEngine {
       if (aborted()) break;
       if (_clusterCacheBytes - beforeBytes >= maxBytes) break;
 
-      final packedBatch = <int>[];
+      final pageIds = <NghPageId>[];
       final chainHeads = <int>[];
       final expected = <int>{};
+      final batchMap = <int, List<_NghCompactSlot>>{};
+      final pageOwnerByCacheKey = <int, int>{};
+      final packedOwner = <int, int>{};
       final batchEnd = min(batchStart + clustersPerBatch, order.length);
 
       for (var i = batchStart; i < batchEnd; i++) {
         final cId = order[i];
-        if (clusterMap.containsKey(cId)) continue;
+        final ck = _centroidCacheKey(key, cId);
+        if (_inMemoryClusterCache.containsKey(ck)) {
+          protect.add(ck);
+          continue;
+        }
         final c = centroids[cId];
+        if (c.isCoarse) continue;
         if (!loadAll) {
           final est = max(1, c.entryCount) * (24 + meta.dimensions);
           if (planned + est > maxBytes) {
@@ -565,25 +854,41 @@ class NghGraphEngine {
         }
 
         expected.add(cId);
-        if (c.postingPageNos.isNotEmpty) {
-          packedBatch.addAll(c.postingPageNos);
+        protect.add(ck);
+        if (c.postingPages.isEmpty && !c.postingDirRoot.isNone) {
+          await _partitionManager.hydratePostingDirs(table, indexUid, [c]);
+        }
+        if (c.postingPages.isNotEmpty) {
+          for (final pid in c.postingPages) {
+            pageIds.add(pid);
+            pageOwnerByCacheKey[pid.cacheKey] = cId;
+          }
+        } else if (c.postingPageNos.isNotEmpty) {
+          for (final p in c.postingPageNos) {
+            if (p > 0) {
+              final pid = NghPageId.fromPacked(p);
+              pageIds.add(pid);
+              pageOwnerByCacheKey[pid.cacheKey] = cId;
+            }
+          }
         } else if (c.headPostingPageNo > 0) {
           chainHeads.add(c.headPostingPageNo);
+          packedOwner[c.headPostingPageNo] = cId;
         } else {
-          clusterMap[cId] = <_NghCompactSlot>[];
+          _putCentroidSlots(key, cId, const []);
         }
       }
 
-      for (var i = 0; i < packedBatch.length; i += pageChunkSize) {
+      for (var i = 0; i < pageIds.length; i += pageChunkSize) {
         if (aborted() || _clusterCacheBytes - beforeBytes >= maxBytes) {
           budgetExhausted = _clusterCacheBytes - beforeBytes >= maxBytes;
           break;
         }
-        final chunk = packedBatch.sublist(
+        final chunk = pageIds.sublist(
           i,
-          min(i + pageChunkSize, packedBatch.length),
+          min(i + pageChunkSize, pageIds.length),
         );
-        final loaded = await _partitionManager.readPostingPagesBatch(
+        final loaded = await _partitionManager.readPostingPagesByIds(
           table,
           indexUid,
           meta,
@@ -591,12 +896,12 @@ class NghGraphEngine {
           populatePageCache: false,
         );
         if (aborted()) break;
-        _ingestLoadedPagesIntoClusterMap(
-          clusterMap: clusterMap,
+        _ingestIdPagesIntoClusterMap(
+          clusterMap: batchMap,
           loaded: loaded,
           expectedCentroidIds: const {},
+          pageOwnerByCacheKey: pageOwnerByCacheKey,
         );
-        // Always return to the event loop between chunks for UI / cancel.
         await Future<void>.delayed(Duration.zero);
       }
 
@@ -616,9 +921,13 @@ class NghGraphEngine {
           );
           if (aborted()) break;
           _ingestLoadedPagesIntoClusterMap(
-            clusterMap: clusterMap,
+            clusterMap: batchMap,
             loaded: chain,
             expectedCentroidIds: const {},
+            packedOwner: {
+              if (packedOwner[head] != null)
+                for (final item in chain) item.packedRef: packedOwner[head]!,
+            },
           );
           await Future<void>.delayed(Duration.zero);
         }
@@ -627,17 +936,17 @@ class NghGraphEngine {
       if (aborted()) break;
 
       for (final cId in expected) {
-        clusterMap.putIfAbsent(cId, () => <_NghCompactSlot>[]);
+        final slots = batchMap.putIfAbsent(cId, () => <_NghCompactSlot>[]);
+        _putCentroidSlots(key, cId, slots);
       }
 
       final y = yieldController.maybeYield();
       if (y != null) await y;
     }
 
-    // Partial warm on abort is fine; still touch/cap for coherent resident state.
-    _touchClusterCacheKey(key);
+    // Partial warm on abort is fine; still cap for coherent resident state.
     if (_clusterCacheBytes > _clusterCacheMaxBytes) {
-      _enforceClusterCacheBudget(protectKey: key);
+      _enforceClusterCacheBudget(protectKeys: protect);
     }
     return max(0, _clusterCacheBytes - beforeBytes);
   }
@@ -670,28 +979,66 @@ class NghGraphEngine {
   // Search -- centroid-routed filter + candidate ranking
   // =====================================================================
 
-  /// Select nearest centroids by exact distance (partial selection).
+  /// Top-level IVF routing nodes: coarses plus orphan (unsplit) leaves.
   ///
-  /// Exact routing is required for recall: hierarchical/neighbor beams can miss
-  /// the true home cluster (especially under multi-assignment).
-  ///
-  /// Do **not** truncate by entryCount budget here — giant nearest clusters
-  /// would consume the budget and drop the drifted home cluster (exact-identity
-  /// misses). Cost control belongs in nprobe planning + SQ8/two-pass scoring.
-  List<int> _selectProbeCentroids({
-    required Float32List searchQuery,
-    required NghNavGraphPage navGraph,
+  /// Mixed graphs must keep leftover flat leaves in the same exact scan as
+  /// coarses. Routing only among coarses is what made identity recall collapse
+  /// to ~nprobe/K once the first hub was promoted.
+  List<int> _topLevelRoutingIds(List<NghNavCentroidNode> centroids) {
+    final n = centroids.length;
+    if (n == 0) return <int>[];
+    var hasCoarse = false;
+    final isChild = Uint8List(n);
+    for (int i = 0; i < n; i++) {
+      final c = centroids[i];
+      if (!c.isCoarse) continue;
+      hasCoarse = true;
+      for (final ch in c.childIds) {
+        if (ch >= 0 && ch < n) isChild[ch] = 1;
+      }
+    }
+    if (!hasCoarse) {
+      return List<int>.generate(n, (i) => i);
+    }
+    // Roots only: L0 coarses and leftover orphan leaves. Nested coarses are
+    // children — listing every coarse here blew past the 256 insert scan.
+    final ids = <int>[];
+    for (int i = 0; i < n; i++) {
+      if (isChild[i] == 0) ids.add(i);
+    }
+    return ids.isEmpty ? List<int>.generate(n, (i) => i) : ids;
+  }
+
+  int _leafNprobeForChildren(int childCount, double t) {
+    if (childCount <= 1) return max(0, childCount);
+    final cov = _nlistCoverageForIntensity(t);
+    var n = max(1, (cov * childCount).ceil());
+    // Mid-depth floor of 4 spent budget inside the first coarses, then
+    // score-budget clamp dropped everything to 1 list at 500k+. Keep 1
+    // child until depth 50 so extra parent nprobe buys more Voronoi cells.
+    final floor = t < 0.50
+        ? 1
+        : (t < 0.70
+            ? min(2, childCount)
+            : (t < 0.85 ? min(4, childCount) : min(8, childCount)));
+    n = max(n, floor);
+    return min(childCount, min(n, _maxInteractiveLeaves));
+  }
+
+  /// Exact partial selection among [routing] (same recall as a full sort).
+  List<int> _selectExactNearestIds({
+    required Float32List vec,
+    required List<NghNavCentroidNode> centroids,
+    required List<int> routing,
     required VectorDistanceMetric metric,
     required int nprobe,
   }) {
-    final centroids = navGraph.centroids;
-    final nCentroids = centroids.length;
-    final want = min(nCentroids, max(1, nprobe));
-    if (want >= nCentroids) {
-      return List<int>.generate(nCentroids, (i) => i, growable: false);
+    if (routing.isEmpty) return const [];
+    final want = min(routing.length, max(1, nprobe));
+    if (want >= routing.length) {
+      return List<int>.from(routing, growable: false);
     }
 
-    // Max-heap of size want (worst of the best). Same recall as full sort.
     final ids = Int32List(want);
     final dists = Float64List(want);
     var size = 0;
@@ -730,8 +1077,9 @@ class NghGraphEngine {
       }
     }
 
-    for (int i = 0; i < nCentroids; i++) {
-      final d = _exactDistance(searchQuery, centroids[i].vector, metric);
+    for (final i in routing) {
+      if (i < 0 || i >= centroids.length) continue;
+      final d = _exactDistance(vec, centroids[i].vector, metric);
       if (size < want) {
         ids[size] = i;
         dists[size] = d;
@@ -751,6 +1099,101 @@ class NghGraphEngine {
     );
     pairs.sort((a, b) => a.$2.compareTo(b.$2));
     return [for (final p in pairs) p.$1];
+  }
+
+  /// Centroid-major exact top-2 among [ids] for [vectors] `[from, n)`.
+  ///
+  /// Same nearest/second as a per-vector scan; keeps one centroid in cache
+  /// while streaming a tile of queries (insert of 10k at K=256 is seconds,
+  /// not a query-major scan of thousands of 512-d centroids).
+  void _accumulateTop2AgainstIds({
+    required List<Float32List> vectors,
+    required List<NghNavCentroidNode> centroids,
+    required List<int> ids,
+    required VectorDistanceMetric metric,
+    required Int32List bestId,
+    required Float64List bestD,
+    required Int32List secondId,
+    required Float64List secondD,
+    required int from,
+  }) {
+    final n = vectors.length;
+    if (from >= n || ids.isEmpty) return;
+    for (final cid in ids) {
+      if (cid < 0 || cid >= centroids.length) continue;
+      _accumulateTop2AgainstCentroid(
+        vectors: vectors,
+        centroid: centroids[cid].vector,
+        centroidId: cid,
+        metric: metric,
+        bestId: bestId,
+        bestD: bestD,
+        secondId: secondId,
+        secondD: secondD,
+        from: from,
+      );
+    }
+  }
+
+  void _accumulateTop2AgainstCentroid({
+    required List<Float32List> vectors,
+    required Float32List centroid,
+    required int centroidId,
+    required VectorDistanceMetric metric,
+    required Int32List bestId,
+    required Float64List bestD,
+    required Int32List secondId,
+    required Float64List secondD,
+    required int from,
+  }) {
+    const tile = 32;
+    final n = vectors.length;
+    if (from >= n) return;
+    for (int t = from; t < n; t += tile) {
+      final end = min(n, t + tile);
+      for (int i = t; i < end; i++) {
+        final d = _exactDistance(vectors[i], centroid, metric);
+        if (d < bestD[i]) {
+          secondD[i] = bestD[i];
+          secondId[i] = bestId[i];
+          bestD[i] = d;
+          bestId[i] = centroidId;
+        } else if (d < secondD[i]) {
+          secondD[i] = d;
+          secondId[i] = centroidId;
+        }
+      }
+    }
+  }
+
+  List<Float32List> _kMeansSample(List<Float32List> vectors, int maxSamples) {
+    final n = vectors.length;
+    if (n <= maxSamples) return vectors;
+    return [
+      for (int s = 0; s < maxSamples; s++) vectors[(s * n) ~/ maxSamples],
+    ];
+  }
+
+  /// Select nearest **top-level** lists by exact distance (partial selection).
+  ///
+  /// Do **not** truncate by entryCount budget here — giant nearest clusters
+  /// would consume the budget and drop the drifted home cluster (exact-identity
+  /// misses). Cost control belongs in nprobe planning + SQ8/two-pass scoring.
+  List<int> _selectProbeCentroids({
+    required Float32List searchQuery,
+    required NghNavGraphPage navGraph,
+    required VectorDistanceMetric metric,
+    required int nprobe,
+    List<int>? routingIds,
+  }) {
+    final routing = routingIds ?? _topLevelRoutingIds(navGraph.centroids);
+    return _selectExactNearestIds(
+      vec: searchQuery,
+      centroids: navGraph.centroids,
+      routing: routing,
+      metric: metric,
+      nprobe: nprobe,
+    );
   }
 
   /// Pack probes under [maxCandidates] while maximizing cluster diversity.
@@ -782,7 +1225,7 @@ class NghGraphEngine {
     }
     if (total <= maxCandidates) return probes;
 
-    final alwaysKeep = min(probes.length, max(4, min(minKeep, 12)));
+    final alwaysKeep = min(probes.length, max(1, minKeep));
     final giantThresh = max(avgCluster * 2.2, maxCandidates ~/ 14);
     final target = min(probes.length, max(alwaysKeep, targetProbes));
     final seedBudget = max(
@@ -979,6 +1422,55 @@ class NghGraphEngine {
     return out;
   }
 
+  /// Replace coarse probes with an exact child-nprobe (multi-level IVF).
+  ///
+  /// One hop is not enough once hubs nest (parent-full → mid-coarse). Recurse
+  /// to leaves; each hop keeps the nearest child so identity routing matches
+  /// insert. Expanding *all* children of nprobe coarses would still avalanche.
+  List<int> _expandCoarseChildren({
+    required List<int> probes,
+    required NghNavGraphPage navGraph,
+    required Float32List query,
+    required VectorDistanceMetric metric,
+    required int Function(int childCount) leafNprobeOf,
+  }) {
+    final n = navGraph.centroids.length;
+    var current = probes;
+    for (var hop = 0; hop < _maxIvfDepth + 1; hop++) {
+      var sawCoarse = false;
+      final out = <int>[];
+      final seen = <int>{};
+      for (final id in current) {
+        if (id < 0 || id >= n) continue;
+        final c = navGraph.centroids[id];
+        if (c.isCoarse && c.childIds.isNotEmpty) {
+          sawCoarse = true;
+          final children = <int>[
+            for (final ch in c.childIds)
+              if (ch >= 0 && ch < n) ch,
+          ];
+          if (children.isEmpty) continue;
+          final picked = _selectExactNearestIds(
+            vec: query,
+            centroids: navGraph.centroids,
+            routing: children,
+            metric: metric,
+            nprobe: leafNprobeOf(children.length),
+          );
+          for (final ch in picked) {
+            if (seen.add(ch)) out.add(ch);
+          }
+        } else if (seen.add(id)) {
+          out.add(id);
+        }
+      }
+      if (!sawCoarse) return out.isNotEmpty ? out : current;
+      current = out;
+      if (current.isEmpty) break;
+    }
+    return current;
+  }
+
   /// Perform ANN search on the NGH index.
   ///
   /// Steps:
@@ -995,14 +1487,14 @@ class NghGraphEngine {
     int? searchDepth,
     double? distanceThreshold,
     bool queryAlreadyNormalized = false,
+    Set<String>? pendingDeletePks,
   }) async {
     if (meta.totalVectors == 0) return const [];
 
     final key = _cacheKey(table.tableUid, indexUid);
-    final clusterMap = _inMemoryClusterCache.putIfAbsent(key, () => {});
+    final clusterMap = <int, List<_NghCompactSlot>>{};
 
-    NghNavGraphPage? navGraph = _navGraphCache[key];
-    navGraph ??= await _getOrLoadNavGraph(table, indexUid, meta);
+    NghNavGraphPage? navGraph = await _getOrLoadNavGraph(table, indexUid, meta);
     if (navGraph == null || navGraph.centroids.isEmpty) {
       return const [];
     }
@@ -1018,8 +1510,15 @@ class NghGraphEngine {
     final querySqNorm = prep.$2;
 
     final imbalance = _centroidImbalance(navGraph.centroids);
+    final routingIds = _topLevelRoutingIds(navGraph.centroids);
+    var nLeaves = 0;
+    for (final c in navGraph.centroids) {
+      if (c.isLeaf) nLeaves++;
+    }
     final plan = _resolveNprobePlan(
-      nCentroids: navGraph.centroids.length,
+      nCentroids:
+          routingIds.isNotEmpty ? routingIds.length : navGraph.centroids.length,
+      nLeaves: max(1, nLeaves),
       dimensions: meta.dimensions,
       totalVectors: meta.totalVectors,
       imbalance: imbalance,
@@ -1031,17 +1530,20 @@ class NghGraphEngine {
       navGraph: navGraph,
       metric: meta.distanceMetric,
       nprobe: plan.nprobe,
+      routingIds: routingIds,
     );
 
     final depthT = plan.depth / 100.0;
     final int maxNeighborExtra;
-    if (depthT < 0.30) {
+    if (depthT < 0.20) {
       maxNeighborExtra = 0;
-    } else if (depthT < 0.55) {
-      maxNeighborExtra = min(12, max(0, (plan.nprobe * 0.14).round()));
+    } else if (depthT < 0.50) {
+      maxNeighborExtra = 1;
+    } else if (depthT < 0.70) {
+      maxNeighborExtra = min(3, max(1, (plan.nprobe * 0.20).round()));
     } else {
       maxNeighborExtra =
-          min(24, max(0, (plan.nprobe * (0.10 + 0.22 * depthT)).round()));
+          min(8, max(2, (plan.nprobe * (0.12 + 0.12 * depthT)).round()));
     }
     var probeCentroids = maxNeighborExtra <= 0
         ? primaryProbes
@@ -1050,17 +1552,27 @@ class NghGraphEngine {
             navGraph: navGraph,
             maxExtra: maxNeighborExtra,
           );
+    probeCentroids = _expandCoarseChildren(
+      probes: probeCentroids,
+      navGraph: navGraph,
+      query: searchQuery,
+      metric: meta.distanceMetric,
+      leafNprobeOf: (childCount) => _leafNprobeForChildren(childCount, depthT),
+    );
 
     final avgCluster = max(
       1,
-      (meta.totalVectors / max(1, navGraph.centroids.length)).round(),
+      (meta.totalVectors /
+              max(1, nLeaves > 0 ? nLeaves : navGraph.centroids.length))
+          .round(),
     );
-    final trimBudget = (plan.maxCandidates * (0.92 + 0.55 * depthT))
+    final slotCap = _slotCapForDepth(depthT);
+    final trimBudget = (plan.maxCandidates * (0.92 + 0.25 * depthT))
         .round()
-        .clamp(plan.maxCandidates, 56000);
+        .clamp(plan.maxCandidates, slotCap);
     final minKeep = min(
       probeCentroids.length,
-      max(8, min(24, trimBudget ~/ max(avgCluster * 3, 1))),
+      _minKeepLeaves(depthT, nLeaves: nLeaves),
     );
     final targetProbes = min(
       probeCentroids.length,
@@ -1076,35 +1588,10 @@ class NghGraphEngine {
       targetProbes: targetProbes,
     );
 
-    final int minProbeFloor;
-    if (plan.depth >= 70) {
-      minProbeFloor = min(
-        rankedProbes.length,
-        max(
-          48,
-          max((0.72 * plan.nprobe).round(), (0.05 * plan.nlist).ceil()),
-        ),
-      );
-    } else if (plan.depth >= 50) {
-      minProbeFloor = min(
-        rankedProbes.length,
-        max(
-          40,
-          max((0.72 * plan.nprobe).round(), (0.045 * plan.nlist).ceil()),
-        ),
-      );
-    } else if (plan.depth >= 25) {
-      minProbeFloor = min(
-        rankedProbes.length,
-        max(
-          28,
-          max((0.82 * plan.nprobe).round(), (0.032 * plan.nlist).ceil()),
-        ),
-      );
-    } else {
-      minProbeFloor = 0;
-    }
-    if (minProbeFloor > 0 && probeCentroids.length < minProbeFloor) {
+    // Depth-scaled floor at every depth — not only ≥80. At 500k one leaf
+    // already ≈ scoreBudget, so a 0/1 floor collapses 1..79 to a single list.
+    final minProbeFloor = min(rankedProbes.length, minKeep);
+    if (minProbeFloor > 1 && probeCentroids.length < minProbeFloor) {
       probeCentroids = _topUpProbesToMinCount(
         ranked: rankedProbes,
         current: probeCentroids,
@@ -1115,22 +1602,32 @@ class NghGraphEngine {
       );
     }
 
-    final scoreBudget = (plan.maxCandidates * (1.05 + 0.30 * depthT))
+    final scoreBudget = (plan.maxCandidates * (1.05 + 0.20 * depthT))
         .round()
-        .clamp(plan.maxCandidates, 56000);
+        .clamp(plan.maxCandidates, slotCap);
     probeCentroids = _clampProbesToScoreBudget(
       ranked: rankedProbes,
       current: probeCentroids,
       navGraph: navGraph,
       scoreBudget: scoreBudget,
-      minProbes: minProbeFloor > 0 ? minProbeFloor : 1,
+      minProbes: minKeep,
     );
 
     var needsLoad = false;
     for (final cId in probeCentroids) {
-      if (!clusterMap.containsKey(cId)) {
+      if (cId < 0 || cId >= navGraph.centroids.length) {
         needsLoad = true;
-        break;
+        continue;
+      }
+      final ck = _centroidCacheKey(key, cId);
+      final cached = _inMemoryClusterCache[ck];
+      if (cached != null &&
+          _clusterCacheIsFresh(cached, navGraph.centroids[cId])) {
+        clusterMap[cId] = cached;
+        _touchCentroidCacheKey(ck);
+      } else {
+        if (cached != null) _removeCentroidSlots(key, cId);
+        needsLoad = true;
       }
     }
     if (needsLoad) {
@@ -1143,8 +1640,6 @@ class NghGraphEngine {
         clusterMap: clusterMap,
         cacheKey: key,
       );
-    } else {
-      _touchClusterCacheKey(key);
     }
 
     var slotEstimate = 0;
@@ -1252,15 +1747,19 @@ class NghGraphEngine {
     }
 
     final rawResults = resultHeap.drainSortedWithPk();
+    final pending = pendingDeletePks;
     return [
       for (final r in rawResults)
-        NghSearchResult(
-          nodeId: r.nodeId,
-          distance: r.distance,
-          primaryKey: r.primaryKeyBytes != null
-              ? utf8.decode(r.primaryKeyBytes!)
-              : null,
-        )
+        if (pending == null ||
+            r.primaryKeyBytes == null ||
+            !pending.contains(utf8.decode(r.primaryKeyBytes!)))
+          NghSearchResult(
+            nodeId: r.nodeId,
+            distance: r.distance,
+            primaryKey: r.primaryKeyBytes != null
+                ? utf8.decode(r.primaryKeyBytes!)
+                : null,
+          )
     ];
   }
 
@@ -1323,8 +1822,8 @@ class NghGraphEngine {
       max(keepMin, (candidateCount * keepFrac).ceil()),
     );
 
-    // Only skip coarse when keep would retain almost everything.
-    if (keep >= (candidateCount * 0.9).ceil() && candidateCount <= 2500) {
+    // Skip the strided pass when we would rescore nearly everyone anyway.
+    if (keep >= (candidateCount * 0.88).ceil()) {
       for (final cId in probeCentroids) {
         final slots = clusterMap[cId];
         if (slots == null || slots.isEmpty) continue;
@@ -1396,7 +1895,6 @@ class NghGraphEngine {
     runFine();
   }
 
-  /// Score one compact slot into the result heap (hot path, no allocations).
   void _scoreSlotIntoHeap(
     _NghCompactSlot slot, {
     required Float32List searchQuery,
@@ -1444,6 +1942,23 @@ class NghGraphEngine {
     if (!resultHeap.isFull || dist < resultHeap.peekDist) {
       resultHeap.pushWithPk(slot.nodeId, dist, slot.primaryKeyBytes);
     }
+  }
+
+  int _appendSlotsUntilFull(
+    NghPostingPage page,
+    List<NghPostingSlot> src,
+    int from,
+  ) {
+    var i = from;
+    while (i < src.length) {
+      page.slots.add(src[i]);
+      if (!_partitionManager.postingPayloadFits(page.estimatePayloadSize())) {
+        page.slots.removeLast();
+        break;
+      }
+      i++;
+    }
+    return i;
   }
 
   // =====================================================================
@@ -1495,6 +2010,8 @@ class NghGraphEngine {
 
     final clusterSlots = <int, List<NghPostingSlot>>{};
     final newCentroids = <NghNavCentroidNode>[];
+    final newDirPages = <int, List<NghPageId>>{};
+    final startedEmpty = centroids.isEmpty;
 
     // Metric-aware distance spawn threshold (far from all centroids).
     final double splitDistThreshold = isCosineMetric
@@ -1503,10 +2020,10 @@ class NghGraphEngine {
             ? -0.68
             : 0.65);
 
-    // Dynamic centroids: K capped for nav-graph wire format (neighbors as u16).
+    // Dynamic centroids: leaf K capped; format supports two-level IVF beyond this.
     final int projectedN = currentMeta.totalVectors + vectors.length;
     final int targetK = min(
-      4096,
+      _maxTargetK,
       max(48, (sqrt(projectedN) * 2.25).round()),
     );
 
@@ -1514,9 +2031,12 @@ class NghGraphEngine {
     // that previously made this block unreachable and produced hub clusters).
     if (centroids.isEmpty) {
       final initialK = min(targetK, max(16, min(vectors.length, 64)));
+      // Full-batch k-means++ on 10k×512×64 is several seconds; 1024 seeds
+      // give the same IVF skeleton and the insert loop still assigns all rows.
+      final kmPool = _kMeansSample(normalizedVectors, 1024);
       final seeds = _kMeansInit(
-        samples: normalizedVectors,
-        k: max(1, min(initialK, vectors.length)),
+        samples: kmPool,
+        k: max(1, min(initialK, kmPool.length)),
         metric: currentMeta.distanceMetric,
         iterations: 5,
       );
@@ -1540,14 +2060,64 @@ class NghGraphEngine {
     // batch end via 2-means posting rewrite (spawn-without-move cannot lower
     // max/avg imbalance).
     final clusterVectors = <int, List<Float32List>>{};
+    final topLevelIds = List<int>.from(_topLevelRoutingIds(centroids));
+    var leafK = 0;
+    var hasCoarse = false;
+    for (final c in centroids) {
+      if (c.isLeaf) leafK++;
+      if (c.isCoarse) hasCoarse = true;
+    }
+    final maxChildren = NghPageSizer.maxNavInlineChildren(
+      _pageSize,
+      currentMeta.dimensions,
+    );
+    final leafCap = _leafEntryCap(maxSlotsPerPage);
+    final routingCap = min(_maxTopLevelRouting, min(targetK, _maxTargetK));
+    final assignMetric = currentMeta.distanceMetric;
 
     int softCapForK(int k) {
       final kk = max(1, k);
-      // ~1.75× fair share — measured rebuilds landed ~3.0–3.6 with 2.0×.
-      return max(96, (1.75 * projectedN / kk).round());
+      final fair = max(96, (1.75 * projectedN / kk).round());
+      return min(fair, leafCap);
     }
 
-    for (int i = 0; i < vectors.length; i++) {
+    void attachSpawnedLeaf(NghNavCentroidNode node, {required int parentId}) {
+      if (parentId < 0 || parentId >= centroids.length) return;
+      final parent = centroids[parentId];
+      if (!parent.isCoarse) return;
+      if (parent.childIds.length >= maxChildren) return;
+      if (!parent.childIds.contains(node.centroidId)) {
+        parent.childIds.add(node.centroidId);
+      }
+      node.parentId = parentId;
+      node.level = NghNavCentroidNode.levelLeaf;
+    }
+
+    final nAssign = vectors.length;
+    final bestId = Int32List(nAssign);
+    final secondId = Int32List(nAssign);
+    final bestD = Float64List(nAssign);
+    final secondD = Float64List(nAssign);
+    for (int i = 0; i < nAssign; i++) {
+      bestId[i] = -1;
+      secondId[i] = -1;
+      bestD[i] = double.infinity;
+      secondD[i] = double.infinity;
+    }
+    // Centroid-major exact top-2 (same nearest as per-vector scan, L1-friendly).
+    _accumulateTop2AgainstIds(
+      vectors: normalizedVectors,
+      centroids: centroids,
+      ids: topLevelIds,
+      metric: assignMetric,
+      bestId: bestId,
+      bestD: bestD,
+      secondId: secondId,
+      secondD: secondD,
+      from: 0,
+    );
+
+    for (int i = 0; i < nAssign; i++) {
       final vec = normalizedVectors[i];
       final pk = primaryKeys[i];
       final sq8 = sq8List[i];
@@ -1563,18 +2133,25 @@ class NghGraphEngine {
         squaredNorm: sq8.squaredNorm,
       );
 
-      final (bestCId, bestDist, secondCId, secondDist, _, _) =
-          _findNearestCentroidFast(
-        vec,
-        centroids,
-        currentMeta.distanceMetric,
-      );
+      final rawBest = bestId[i];
+      final rawSecond = secondId[i];
+      final bestDist = bestD[i];
+      final secondDist = secondD[i];
+      final bestCId = hasCoarse
+          ? _resolveLeafCentroid(rawBest, centroids, vec, assignMetric)
+          : (rawBest < 0 ? 0 : rawBest);
+      var secondCId = rawSecond < 0
+          ? -1
+          : (hasCoarse
+              ? _resolveLeafCentroid(rawSecond, centroids, vec, assignMetric)
+              : rawSecond);
+      if (secondCId == bestCId) secondCId = -1;
 
-      final canGrowK = centroids.length < targetK;
-      final softCap = softCapForK(centroids.length);
+      final canGrowTop = topLevelIds.length < routingCap;
+      final softCap = softCapForK(max(1, leafK));
 
       // Distance spawn for far points only (new tiny centroid).
-      if (canGrowK && bestDist > splitDistThreshold) {
+      if (canGrowTop && bestDist > splitDistThreshold) {
         final newCentroidId = centroids.length;
         final parentId = bestCId;
         final newNode = NghNavCentroidNode(
@@ -1588,8 +2165,63 @@ class NghGraphEngine {
         );
         centroids.add(newNode);
         newCentroids.add(newNode);
+        topLevelIds.add(newCentroidId);
+        leafK++;
         clusterSlots[newCentroidId] = [slot];
         clusterVectors[newCentroidId] = [vec];
+        _accumulateTop2AgainstCentroid(
+          vectors: normalizedVectors,
+          centroid: newNode.vector,
+          centroidId: newCentroidId,
+          metric: assignMetric,
+          bestId: bestId,
+          bestD: bestD,
+          secondId: secondId,
+          secondD: secondD,
+          from: i + 1,
+        );
+      } else if (bestCId < 0 || bestCId >= centroids.length) {
+        continue;
+      } else if (bestDist > splitDistThreshold) {
+        final parentId = bestCId >= 0 && bestCId < centroids.length
+            ? centroids[bestCId].parentId
+            : -1;
+        final canGrowUnderParent = parentId >= 0 &&
+            parentId < centroids.length &&
+            centroids[parentId].isCoarse &&
+            centroids[parentId].childIds.length < maxChildren;
+        if (canGrowUnderParent) {
+          final newCentroidId = centroids.length;
+          final newNode = NghNavCentroidNode(
+            centroidId: newCentroidId,
+            vector: Float32List.fromList(vec),
+            headPostingPageNo: -1,
+            tailPostingPageNo: -1,
+            postingPageNos: [],
+            entryCount: 1,
+            neighbors: [bestCId],
+            parentId: parentId,
+            level: NghNavCentroidNode.levelLeaf,
+          );
+          centroids.add(newNode);
+          newCentroids.add(newNode);
+          attachSpawnedLeaf(newNode, parentId: parentId);
+          leafK++;
+          clusterSlots[newCentroidId] = [slot];
+          clusterVectors[newCentroidId] = [vec];
+        } else {
+          (clusterSlots[bestCId] ??= []).add(slot);
+          (clusterVectors[bestCId] ??= []).add(vec);
+          centroids[bestCId].entryCount += 1;
+          if (secondCId >= 0 &&
+              secondCId < centroids.length &&
+              (secondDist - bestDist) < 0.035 &&
+              centroids[secondCId].entryCount < softCap) {
+            (clusterSlots[secondCId] ??= []).add(slot);
+            (clusterVectors[secondCId] ??= []).add(vec);
+            centroids[secondCId].entryCount += 1;
+          }
+        }
       } else {
         // Primary assignment to the best centroid
         (clusterSlots[bestCId] ??= []).add(slot);
@@ -1609,7 +2241,31 @@ class NghGraphEngine {
       }
     }
 
-    // Step 3: Batch allocate all required chained pages in one single synchronous call (0 await inside loop)
+    // Prefetch cluster tails so we fill existing posting pages (avoids a new
+    // 16KB page per batch when the tail was evicted from cache).
+    final tailRefs = <int>{};
+    for (final cId in clusterSlots.keys) {
+      final ref = centroids[cId].tailPostingPageNo;
+      if (ref > 0) tailRefs.add(ref);
+    }
+    for (final ref in tailRefs) {
+      if (localPostingCache.containsKey(ref)) continue;
+      final ptr = NghPagePtr.fromPacked(NghDataCategory.posting, ref);
+      if (dirtyPosting.containsKey(ptr)) {
+        localPostingCache[ref] = dirtyPosting[ptr]!;
+        continue;
+      }
+      final loaded = await _partitionManager.readPostingPage(
+        table,
+        indexUid,
+        currentMeta,
+        ptr.partitionNo,
+        ptr.pageNo,
+      );
+      if (loaded != null) localPostingCache[ref] = loaded;
+    }
+
+    // Step 3: Batch allocate chained pages (grow if PK packing needs extra).
     int totalNewPagesNeeded = 0;
     for (final entry in clusterSlots.entries) {
       final cId = entry.key;
@@ -1634,14 +2290,27 @@ class NghGraphEngine {
       }
     }
 
-    final (allocatedPages, metaAfterAlloc) =
-        _partitionManager.allocatePagesBatchSync(
+    final allocBatch = _partitionManager.allocatePagesBatchSync(
       NghDataCategory.posting,
       currentMeta,
       totalNewPagesNeeded,
     );
-    currentMeta = metaAfterAlloc;
-    int allocatedIdx = 0;
+    currentMeta = allocBatch.$2;
+    final allocatedPages = List<NghPagePtr>.from(allocBatch.$1);
+    var allocatedIdx = 0;
+
+    NghPagePtr takePostingPage() {
+      if (allocatedIdx >= allocatedPages.length) {
+        final extra = _partitionManager.allocatePagesBatchSync(
+          NghDataCategory.posting,
+          currentMeta,
+          1,
+        );
+        currentMeta = extra.$2;
+        allocatedPages.addAll(extra.$1);
+      }
+      return allocatedPages[allocatedIdx++];
+    }
 
     // Step 4: Assemble posting pages in memory
     for (final entry in clusterSlots.entries) {
@@ -1661,32 +2330,26 @@ class NghGraphEngine {
       }
 
       int slotIndex = 0;
-      if (tailPage != null &&
-          tailPtr != null &&
-          tailPage.slots.length < maxSlotsPerPage) {
-        final available = maxSlotsPerPage - tailPage.slots.length;
-        final toTake = min(available, newSlots.length);
-        for (int i = 0; i < toTake; i++) {
-          tailPage.slots.add(newSlots[slotIndex++]);
-        }
+      if (tailPage != null && tailPtr != null) {
+        slotIndex = _appendSlotsUntilFull(tailPage, newSlots, slotIndex);
         dirtyPosting[tailPtr] = tailPage;
         localPostingCache[tailRef] = tailPage;
       }
 
       while (slotIndex < newSlots.length) {
-        final takeCount = min(maxSlotsPerPage, newSlots.length - slotIndex);
-        final chunk = newSlots.sublist(slotIndex, slotIndex + takeCount);
-        slotIndex += takeCount;
-
-        final newPtr = allocatedPages[allocatedIdx++];
+        final newPtr = takePostingPage();
         final newPacked = newPtr.packedRef;
 
         final newPage = NghPostingPage(
           centroidId: cId,
           nextPostingPageNo: -1,
           dimensions: currentMeta.dimensions,
-          slots: chunk,
+          slots: <NghPostingSlot>[],
         );
+        slotIndex = _appendSlotsUntilFull(newPage, newSlots, slotIndex);
+        if (newPage.slots.isEmpty && slotIndex < newSlots.length) {
+          newPage.slots.add(newSlots[slotIndex++]);
+        }
 
         if (tailPage != null && tailPtr != null) {
           tailPage.nextPostingPageNo = newPacked;
@@ -1696,10 +2359,12 @@ class NghGraphEngine {
           centroid.headPostingPageNo = newPacked;
         }
 
-        if (!centroid.postingPageNos.contains(newPacked)) {
-          centroid.postingPageNos.add(newPacked);
-        }
+        centroid.addPostingPage(newPtr.pageId);
+        (newDirPages[cId] ??= []).add(newPtr.pageId);
         centroid.tailPostingPageNo = newPacked;
+        if (centroid.headPostingPageNo <= 0) {
+          centroid.headPostingPageNo = newPacked;
+        }
 
         dirtyPosting[newPtr] = newPage;
         localPostingCache[newPacked] = newPage;
@@ -1750,7 +2415,7 @@ class NghGraphEngine {
     for (final newCentroid in newCentroids) {
       final parentId =
           newCentroid.neighbors.isNotEmpty ? newCentroid.neighbors.first : 0;
-      if (parentId < centroids.length) {
+      if (parentId >= 0 && parentId < centroids.length) {
         final parentNode = centroids[parentId];
         if (!parentNode.neighbors.contains(newCentroid.centroidId) &&
             parentNode.neighbors.length < 16) {
@@ -1770,9 +2435,18 @@ class NghGraphEngine {
     // Step 5.5: 2-means rewrite of oversized hubs so max/avg imbalance drops.
     // Overflow-spawn-without-move cannot do this; searchDepth controllability
     // depends on hubs not dominating candidate volume.
+    // Cap splits per 10k flush. Raise only when a leaf already exceeded the
+    // hard cap (parent-full skip used to leave 10k+ slot giants).
+    var overLeafCap = false;
+    for (final c in centroids) {
+      if (c.isLeaf && c.entryCount > leafCap) {
+        overLeafCap = true;
+        break;
+      }
+    }
     final maxSplitsThisBatch = min(
-      12,
-      max(2, (vectors.length / 100).ceil()),
+      overLeafCap ? 12 : 4,
+      max(1, (vectors.length / 2500).ceil()),
     );
     final splitBatch = await _rebalanceOversizedHubs(
       table: table,
@@ -1784,8 +2458,6 @@ class NghGraphEngine {
       maxSlotsPerPage: maxSlotsPerPage,
       metric: currentMeta.distanceMetric,
       isCosine: isCosineMetric,
-      projectedN: projectedN,
-      targetK: targetK,
       softCapForK: softCapForK,
       maxSplits: maxSplitsThisBatch,
       yieldBudgetMs: yieldBudgetMs,
@@ -1796,64 +2468,344 @@ class NghGraphEngine {
       nextNodeId: currentMeta.nextNodeId + vectors.length,
     );
 
-    // Step 6: Construct updated NavGraphPage and sync in-memory compact cache
+    // Step 6: Persist paged nav/pdir/pkmap sidecars (or migrate legacy blob).
+    final cacheKey = _cacheKey(table.tableUid, indexUid);
     final navGraphPage = NghNavGraphPage(
       dimensions: currentMeta.dimensions,
       centroids: centroids,
     );
-
-    final cacheKey = _cacheKey(table.tableUid, indexUid);
     _navGraphCache[cacheKey] = navGraphPage;
 
-    // Synchronously append new slots to in-memory compact vector cache.
-    // Rewritten hubs replace their cache lists entirely (stale pages moved).
-    final inMemoryClusterMap =
-        _inMemoryClusterCache.putIfAbsent(cacheKey, () => {});
     final rewrittenIds = splitBatch.rewrittenCentroidIds;
     for (final cId in rewrittenIds) {
-      final oldList = inMemoryClusterMap.remove(cId);
-      if (oldList != null) {
-        for (final s in oldList) {
-          _clusterCacheBytes -= _estimateSlotBytes(s);
-        }
-      }
+      _removeCentroidSlots(cacheKey, cId);
       final slots = splitBatch.slotsByCentroid[cId];
       if (slots == null || slots.isEmpty) continue;
-      final cList = <_NghCompactSlot>[];
       final packedRef = centroids[cId].tailPostingPageNo;
-      for (final slot in slots) {
-        final compact = _compactFromPostingSlot(
-          slot,
-          packedRef > 0 ? packedRef : 1,
-        );
-        cList.add(compact);
-        _clusterCacheBytes += _estimateSlotBytes(compact);
-      }
-      inMemoryClusterMap[cId] = cList;
+      final cList = <_NghCompactSlot>[
+        for (final slot in slots)
+          _compactFromPostingSlot(slot, packedRef > 0 ? packedRef : 1),
+      ];
+      _putCentroidSlots(cacheKey, cId, cList);
     }
-    for (final entry in clusterSlots.entries) {
-      final cId = entry.key;
-      if (rewrittenIds.contains(cId)) continue;
-      final packedRef = centroids[cId].tailPostingPageNo;
-      final cList =
-          inMemoryClusterMap.putIfAbsent(cId, () => <_NghCompactSlot>[]);
-      for (final slot in entry.value) {
-        final compact = _compactFromPostingSlot(
-          slot,
-          packedRef > 0 ? packedRef : 1,
-        );
-        cList.add(compact);
-        _clusterCacheBytes += _estimateSlotBytes(compact);
+    final needsCompactGapFill = _refreshCompactCacheAfterInsert(
+      cacheKey: cacheKey,
+      centroids: centroids,
+      clusterSlots: clusterSlots,
+      rewrittenIds: rewrittenIds,
+      newCentroidIds: {for (final c in newCentroids) c.centroidId},
+      dimensions: currentMeta.dimensions,
+    );
+
+    return _finishInsertSidecars(
+      table: table,
+      indexUid: indexUid,
+      meta: currentMeta,
+      centroids: centroids,
+      dirtyPosting: dirtyPosting,
+      insertedCount: vectors.length,
+      insertedPks: primaryKeys,
+      rewrittenIds: rewrittenIds,
+      newDirPages: newDirPages,
+      startedEmpty: startedEmpty,
+      touchedCentroidIds: {
+        ...clusterSlots.keys,
+        ...rewrittenIds,
+      },
+      navGraphPage: navGraphPage,
+      needsCompactGapFill: needsCompactGapFill,
+    );
+  }
+
+  int _resolveLeafCentroid(
+    int id,
+    List<NghNavCentroidNode> centroids,
+    Float32List vec,
+    VectorDistanceMetric metric,
+  ) {
+    var cur = id;
+    for (var hop = 0; hop < _maxIvfDepth + 2; hop++) {
+      if (cur < 0 || cur >= centroids.length) return 0;
+      final node = centroids[cur];
+      if (!node.isCoarse) return cur;
+      final children = node.childIds.isNotEmpty
+          ? node.childIds
+          : [
+              for (int i = 0; i < centroids.length; i++)
+                if (centroids[i].parentId == cur) i,
+            ];
+      if (children.isEmpty) return cur;
+      var best = cur;
+      var bestD = double.infinity;
+      var found = false;
+      for (final ch in children) {
+        if (ch < 0 || ch >= centroids.length) continue;
+        found = true;
+        final d = _exactDistance(vec, centroids[ch].vector, metric);
+        if (d < bestD) {
+          bestD = d;
+          best = ch;
+        }
+      }
+      if (!found || best == cur) return cur;
+      cur = best;
+    }
+    return cur < 0 || cur >= centroids.length ? 0 : cur;
+  }
+
+  int _nodeIvfDepth(List<NghNavCentroidNode> centroids, int id) {
+    var d = 0;
+    var cur = id;
+    final seen = <int>{};
+    while (cur >= 0 && cur < centroids.length && seen.add(cur)) {
+      final p = centroids[cur].parentId;
+      if (p < 0 || p >= centroids.length || !centroids[p].isCoarse) break;
+      d++;
+      cur = p;
+    }
+    return d;
+  }
+
+  /// Split a full coarse's children with 2-means on child vectors (no posting
+  /// I/O). Returns the new coarse id, or -1 if L0/parent fanout is exhausted.
+  int _splitCoarseFanout({
+    required List<NghNavCentroidNode> centroids,
+    required int coarseId,
+    required int maxChildren,
+    required VectorDistanceMetric metric,
+    required bool isCosine,
+    required int topLevelCount,
+  }) {
+    if (coarseId < 0 || coarseId >= centroids.length) return -1;
+    final coarse = centroids[coarseId];
+    if (!coarse.isCoarse) return -1;
+    final childIds = <int>[
+      for (final id in coarse.childIds)
+        if (id >= 0 && id < centroids.length) id,
+    ];
+    if (childIds.length < 4) return -1;
+
+    final gp0 = coarse.parentId;
+    var isL0 = gp0 < 0 || gp0 >= centroids.length || !centroids[gp0].isCoarse;
+    if (isL0) {
+      if (topLevelCount >= _maxTopLevelRouting) return -1;
+    } else if (centroids[gp0].childIds.length >= maxChildren) {
+      final splitGp = _splitCoarseFanout(
+        centroids: centroids,
+        coarseId: gp0,
+        maxChildren: maxChildren,
+        metric: metric,
+        isCosine: isCosine,
+        topLevelCount: topLevelCount,
+      );
+      if (splitGp < 0) return -1;
+    }
+
+    final gp = coarse.parentId;
+    isL0 = gp < 0 || gp >= centroids.length || !centroids[gp].isCoarse;
+
+    final samples = [for (final id in childIds) centroids[id].vector];
+    final means = _kMeansInit(
+      samples: samples,
+      k: 2,
+      metric: metric,
+      iterations: 4,
+    );
+    if (means.length < 2) return -1;
+    final meanA = means[0];
+    final meanB = means[1];
+    final a = <int>[];
+    final b = <int>[];
+    for (final id in childIds) {
+      final dA = _exactDistance(centroids[id].vector, meanA, metric);
+      final dB = _exactDistance(centroids[id].vector, meanB, metric);
+      if (dA <= dB) {
+        a.add(id);
+      } else {
+        b.add(id);
       }
     }
-    _touchClusterCacheKey(cacheKey);
-    _enforceClusterCacheBudget(protectKey: cacheKey);
+    if (a.length < 2 || b.length < 2) return -1;
+
+    final newId = centroids.length;
+    final parentForNew = isL0 ? -1 : gp;
+    if (!isL0 &&
+        parentForNew >= 0 &&
+        parentForNew < centroids.length &&
+        centroids[parentForNew].childIds.length >= maxChildren) {
+      return -1;
+    }
+    final newNode = NghNavCentroidNode(
+      centroidId: newId,
+      vector: Float32List.fromList(isCosine ? _normalizeFloat32(meanB) : meanB),
+      level: NghNavCentroidNode.levelCoarse,
+      parentId: parentForNew,
+      childIds: b,
+      neighbors: [coarseId],
+    );
+    centroids.add(newNode);
+    for (final id in b) {
+      centroids[id].parentId = newId;
+    }
+    coarse.childIds
+      ..clear()
+      ..addAll(a);
+    final centerA = isCosine ? _normalizeFloat32(meanA) : meanA;
+    if (coarse.vector.length == centerA.length) {
+      coarse.vector.setAll(0, centerA);
+    }
+    if (!coarse.neighbors.contains(newId) &&
+        coarse.neighbors.length < NghPageSizer.maxNavNeighbors) {
+      coarse.neighbors.add(newId);
+    }
+    if (!isL0 && parentForNew >= 0 && parentForNew < centroids.length) {
+      final gpn = centroids[parentForNew];
+      if (!gpn.childIds.contains(newId)) {
+        gpn.childIds.add(newId);
+      }
+    }
+    return newId;
+  }
+
+  Uint8List _pkMapKey(String pk) => MemComparableKey.encodeTextLex(pk);
+
+  Future<NghInsertResult> _finishInsertSidecars({
+    required TableContext table,
+    required IndexUid indexUid,
+    required NghIndexMeta meta,
+    required List<NghNavCentroidNode> centroids,
+    required Map<NghPagePtr, NghPostingPage> dirtyPosting,
+    required int insertedCount,
+    required List<String> insertedPks,
+    required Set<int> rewrittenIds,
+    required Map<int, List<NghPageId>> newDirPages,
+    required bool startedEmpty,
+    required Set<int> touchedCentroidIds,
+    required NghNavGraphPage navGraphPage,
+    bool needsCompactGapFill = false,
+  }) async {
+    var currentMeta = meta;
+    final dirtyNav = <NghPagePtr, NghNavCentroidPage>{};
+    final dirtyPdir = <NghPagePtr, NghPostingDirPage>{};
+    var deleteLegacy = false;
+
+    if (!currentMeta.isPagedLayout) {
+      final migrated = await _partitionManager.migrateLegacyNavGraph(
+        table: table,
+        indexUid: indexUid,
+        meta: currentMeta,
+        blob: navGraphPage,
+      );
+      currentMeta = migrated.meta;
+      dirtyNav.addAll(migrated.nav);
+      dirtyPdir.addAll(migrated.pdir);
+      deleteLegacy = true;
+      for (final c in centroids) {
+        c.postingDirDirty = false;
+      }
+    } else {
+      for (final c in centroids) {
+        if (!c.postingDirDirty || c.isCoarse) continue;
+        if (rewrittenIds.contains(c.centroidId) || c.postingDirRoot.isNone) {
+          currentMeta = await _partitionManager.rewritePostingDir(
+            table: table,
+            indexUid: indexUid,
+            meta: currentMeta,
+            centroid: c,
+            dirtyPdir: dirtyPdir,
+          );
+        } else {
+          currentMeta = await _partitionManager.appendPostingDir(
+            table: table,
+            indexUid: indexUid,
+            meta: currentMeta,
+            centroid: c,
+            newPages: newDirPages[c.centroidId] ?? const [],
+            dirtyPdir: dirtyPdir,
+          );
+        }
+      }
+      final dirtyIds = <int>{
+        ...touchedCentroidIds,
+        ...rewrittenIds,
+        ...newDirPages.keys,
+        if (startedEmpty)
+          for (int i = 0; i < centroids.length; i++) i,
+      };
+      for (final id in [...dirtyIds]) {
+        if (id < 0 || id >= centroids.length) continue;
+        dirtyIds.addAll(centroids[id].neighbors);
+      }
+      dirtyNav.addAll(_partitionManager.buildDirtyNavPages(
+        meta: currentMeta,
+        centroids: centroids,
+        dirtyCentroidIds: dirtyIds.isEmpty
+            ? {for (int i = 0; i < centroids.length; i++) i}
+            : dirtyIds,
+        diskRecordsPerPage: navGraphPage.navPackPerPage,
+        rewriteAll: startedEmpty,
+      ));
+      navGraphPage.navPackPerPage = NghPageSizer.navCentroidsPerPage(
+        _pageSize,
+        currentMeta.dimensions,
+      );
+      currentMeta = _partitionManager.ensureNavCoverage(
+        currentMeta,
+        centroids.length,
+      );
+    }
+
+    final pkBatch = NghPkMapBatch(meta: currentMeta);
+    final insertSet = HashSet<String>.from(insertedPks);
+    final collected = <String, List<NghPkLocator>>{};
+    for (final e in dirtyPosting.entries) {
+      final page = e.value;
+      final ptr = e.key;
+      final rewritten = rewrittenIds.contains(page.centroidId);
+      for (int i = 0; i < page.slots.length; i++) {
+        final slot = page.slots[i];
+        if (slot.isDeleted) continue;
+        final pk = slot.primaryKey;
+        if (pk.isEmpty) continue;
+        if (!insertSet.contains(pk) && !rewritten) continue;
+        (collected[pk] ??= []).add(NghPkLocator(
+          centroidId: page.centroidId,
+          partitionNo: ptr.partitionNo,
+          pageNo: ptr.pageNo,
+          slotIndex: i,
+        ));
+      }
+    }
+    final pkEntries = <NghPkMapWrite>[];
+    for (final e in collected.entries) {
+      var locs = e.value;
+      if (locs.length > 2) locs = locs.sublist(0, 2);
+      pkEntries.add(NghPkMapWrite(
+        key: _pkMapKey(e.key),
+        locators: locs,
+        mergeRewritten: rewrittenIds.isNotEmpty && !insertSet.contains(e.key),
+      ));
+    }
+    pkEntries.sort((a, b) => MemComparableKey.compare(a.key, b.key));
+    await _pkMap.upsertSorted(
+      table: table,
+      indexUid: indexUid,
+      batch: pkBatch,
+      entries: pkEntries,
+      rewrittenIds: rewrittenIds,
+    );
+
+    currentMeta = pkBatch.meta.copyWith(centroidCount: centroids.length);
 
     return NghInsertResult(
       meta: currentMeta,
       dirtyPostingPages: dirtyPosting,
-      navGraphPage: navGraphPage,
-      insertedCount: vectors.length,
+      dirtyNavPages: dirtyNav,
+      dirtyPdirPages: dirtyPdir,
+      dirtyPkmapPages: pkBatch.dirty,
+      deleteLegacyNavGraph: deleteLegacy,
+      insertedCount: insertedCount,
+      needsCompactGapFill: needsCompactGapFill,
     );
   }
 
@@ -1869,8 +2821,6 @@ class NghGraphEngine {
     required int maxSlotsPerPage,
     required VectorDistanceMetric metric,
     required bool isCosine,
-    required int projectedN,
-    required int targetK,
     required int Function(int k) softCapForK,
     required int maxSplits,
     int? yieldBudgetMs,
@@ -1894,33 +2844,72 @@ class NghGraphEngine {
 
     var splitsDone = 0;
     final skippedHubs = <int>{};
+    final maxChildren = NghPageSizer.maxNavInlineChildren(
+      _pageSize,
+      meta.dimensions,
+    );
+    var topLevelCount = _topLevelRoutingIds(centroids).length;
+    final leafCap = _leafEntryCap(maxSlotsPerPage);
     while (splitsDone < maxSplits) {
       final y = yc.maybeYield();
       if (y != null) await y;
 
-      final softCap = softCapForK(centroids.length);
-      // Hard pressure: split even when near targetK if a hub is extreme.
-      final hardCap = max(
-        softCap + 48,
-        (2.35 * projectedN / max(1, centroids.length)).round(),
-      );
+      var leafK = 0;
+      for (final c in centroids) {
+        if (c.isLeaf) leafK++;
+      }
+      final softCap = softCapForK(max(1, leafK));
+      final splitCap = min(leafCap, max(softCap * 2, 512));
 
       int hubId = -1;
       var hubCount = 0;
       for (int i = 0; i < centroids.length; i++) {
-        if (skippedHubs.contains(i)) continue;
+        if (skippedHubs.contains(i) || centroids[i].isCoarse) continue;
         final e = centroids[i].entryCount;
-        if (e > hubCount && e > softCap) {
+        if (e > hubCount && e > splitCap) {
           hubCount = e;
           hubId = i;
         }
       }
       if (hubId < 0) break;
 
-      // No room to grow K: only continue for pathological hubs, and only if
-      // we still have headroom below the absolute K ceiling (2048).
-      if (centroids.length >= targetK) {
-        if (hubCount <= hardCap || centroids.length >= 4096) break;
+      final hub = centroids[hubId];
+      final parentId = hub.parentId;
+      final parentFull = parentId >= 0 &&
+          parentId < centroids.length &&
+          centroids[parentId].isCoarse &&
+          centroids[parentId].childIds.length >= maxChildren;
+      final isOrphanTop = parentId < 0 ||
+          parentId >= centroids.length ||
+          !centroids[parentId].isCoarse;
+      final hubDepth = _nodeIvfDepth(centroids, hubId);
+      var makeCoarse = false;
+      if (parentFull) {
+        if (hubDepth >= _maxIvfDepth) {
+          final before = centroids.length;
+          final newCoarseId = _splitCoarseFanout(
+            centroids: centroids,
+            coarseId: parentId,
+            maxChildren: maxChildren,
+            metric: metric,
+            isCosine: isCosine,
+            topLevelCount: topLevelCount,
+          );
+          if (newCoarseId < 0) {
+            skippedHubs.add(hubId);
+            continue;
+          }
+          rewritten.add(parentId);
+          for (int i = before; i < centroids.length; i++) {
+            rewritten.add(i);
+            if (centroids[i].parentId < 0) topLevelCount++;
+          }
+          makeCoarse = false;
+        } else {
+          makeCoarse = true;
+        }
+      } else {
+        makeCoarse = isOrphanTop && topLevelCount >= _maxTopLevelRouting;
       }
 
       final split = await _splitHubByTwoMeans(
@@ -1934,6 +2923,8 @@ class NghGraphEngine {
         maxSlotsPerPage: maxSlotsPerPage,
         metric: metric,
         isCosine: isCosine,
+        makeCoarseParent: makeCoarse,
+        maxChildren: maxChildren,
       );
       if (split == null) {
         skippedHubs.add(hubId);
@@ -1942,8 +2933,15 @@ class NghGraphEngine {
       currentMeta = split.meta;
       rewritten.add(hubId);
       rewritten.add(split.newCentroidId);
-      slotsByCentroid[hubId] = split.slotsA;
-      slotsByCentroid[split.newCentroidId] = split.slotsB;
+      if (split.extraCentroidId != null) {
+        rewritten.add(split.extraCentroidId!);
+        slotsByCentroid[split.newCentroidId] = split.slotsA;
+        slotsByCentroid[split.extraCentroidId!] = split.slotsB;
+      } else {
+        slotsByCentroid[hubId] = split.slotsA;
+        slotsByCentroid[split.newCentroidId] = split.slotsB;
+      }
+      if (!makeCoarse && isOrphanTop) topLevelCount++;
       splitsDone++;
     }
 
@@ -1967,10 +2965,15 @@ class NghGraphEngine {
     required int maxSlotsPerPage,
     required VectorDistanceMetric metric,
     required bool isCosine,
+    bool makeCoarseParent = false,
+    int maxChildren = 256,
   }) async {
     if (hubId < 0 || hubId >= centroids.length) return null;
     final hub = centroids[hubId];
     if (hub.entryCount < 64) return null;
+    // Runaway leaf (parent-full skip leftover): do not dequantize hundreds of
+    // thousands of slots on the insert path. Fanout split must run first.
+    if (hub.entryCount > max(16384, maxSlotsPerPage * 256)) return null;
 
     final liveSlots = await _loadLiveCentroidSlots(
       table: table,
@@ -1983,22 +2986,17 @@ class NghGraphEngine {
     if (liveSlots.length < 64) return null;
 
     final dims = meta.dimensions;
-    // One dequant pass for all live slots; subsample for 2-means; assign from cache.
     const maxSamples = 1024;
-    final vectors = List<Float32List>.generate(liveSlots.length, (i) {
+    final sampleStride = max(1, liveSlots.length ~/ maxSamples);
+    final samples = <Float32List>[];
+    for (int i = 0; i < liveSlots.length; i += sampleStride) {
       var vec = ScalarQuantizer.dequantize(
         liveSlots[i].sq8Codes,
         liveSlots[i].offset,
         liveSlots[i].scale,
       );
       if (isCosine) vec = _normalizeFloat32(vec);
-      return vec;
-    }, growable: false);
-
-    final sampleStride = max(1, vectors.length ~/ maxSamples);
-    final samples = <Float32List>[];
-    for (int i = 0; i < vectors.length; i += sampleStride) {
-      samples.add(vectors[i]);
+      samples.add(vec);
       if (samples.length >= maxSamples) break;
     }
     if (samples.length < 2) return null;
@@ -2018,7 +3016,12 @@ class NghGraphEngine {
     final sumA = Float32List(dims);
     final sumB = Float32List(dims);
     for (int i = 0; i < liveSlots.length; i++) {
-      final vec = vectors[i];
+      var vec = ScalarQuantizer.dequantize(
+        liveSlots[i].sq8Codes,
+        liveSlots[i].offset,
+        liveSlots[i].scale,
+      );
+      if (isCosine) vec = _normalizeFloat32(vec);
       final dA = _exactDistance(vec, meanA, metric);
       final dB = _exactDistance(vec, meanB, metric);
       final clone = _clonePostingSlot(liveSlots[i]);
@@ -2057,7 +3060,11 @@ class NghGraphEngine {
     final pagesNeeded =
         (slotsA.length + maxSlotsPerPage - 1) ~/ maxSlotsPerPage +
             (slotsB.length + maxSlotsPerPage - 1) ~/ maxSlotsPerPage;
-    final oldRefs = List<int>.from(hub.postingPageNos);
+    final oldRefs = <int>[
+      for (final p in hub.postingPages)
+        if (p.tryPack() != null) p.tryPack()!,
+    ];
+    if (oldRefs.isEmpty) oldRefs.addAll(hub.postingPageNos);
     final reused = <int>[];
     for (final ref in oldRefs) {
       if (ref > 0) reused.add(ref);
@@ -2121,9 +3128,11 @@ class NghGraphEngine {
       return (head, tail, refs);
     }
 
-    final chainA = writeChain(hubId, slotsA);
     final newCentroidId = centroids.length;
-    final chainB = writeChain(newCentroidId, slotsB);
+    final chainAId = makeCoarseParent ? newCentroidId : hubId;
+    final chainBId = makeCoarseParent ? newCentroidId + 1 : newCentroidId;
+    final chainA = writeChain(chainAId, slotsA);
+    final chainB = writeChain(chainBId, slotsB);
 
     // Drop unused old pages from the hub's chain (left unreferenced; content
     // overwritten when pool reused). Clear any leftover pool pages.
@@ -2133,19 +3142,69 @@ class NghGraphEngine {
         centroidId: hubId,
         nextPostingPageNo: -1,
         dimensions: dims,
-        slots: const [],
+        slots: <NghPostingSlot>[],
       );
       dirtyPosting[ptr] = empty;
       localPostingCache[ptr.packedRef] = empty;
     }
 
     hub.vector.setAll(0, centerA);
+    if (makeCoarseParent) {
+      final leafAId = newCentroidId;
+      final leafBId = newCentroidId + 1;
+      hub.level = NghNavCentroidNode.levelCoarse;
+      hub.entryCount = 0;
+      hub.headPostingPageNo = -1;
+      hub.tailPostingPageNo = -1;
+      hub.replacePostingPages(const []);
+      hub.postingDirRoot = NghPageId.none;
+      hub.postingDirTail = NghPageId.none;
+      hub.childIds
+        ..clear()
+        ..add(leafAId)
+        ..add(leafBId);
+      final leafA = NghNavCentroidNode(
+        centroidId: leafAId,
+        vector: Float32List.fromList(centerA),
+        headPostingPageNo: chainA.$1,
+        tailPostingPageNo: chainA.$2,
+        postingPageNos: List<int>.from(chainA.$3),
+        entryCount: slotsA.length,
+        neighbors: [hubId],
+        parentId: hubId,
+        level: NghNavCentroidNode.levelLeaf,
+        postingDirDirty: true,
+      );
+      final leafB = NghNavCentroidNode(
+        centroidId: leafBId,
+        vector: Float32List.fromList(centerB),
+        headPostingPageNo: chainB.$1,
+        tailPostingPageNo: chainB.$2,
+        postingPageNos: List<int>.from(chainB.$3),
+        entryCount: slotsB.length,
+        neighbors: [hubId],
+        parentId: hubId,
+        level: NghNavCentroidNode.levelLeaf,
+        postingDirDirty: true,
+      );
+      centroids.add(leafA);
+      centroids.add(leafB);
+      return _HubSplitResult(
+        meta: currentMeta,
+        newCentroidId: leafAId,
+        extraCentroidId: leafBId,
+        slotsA: slotsA,
+        slotsB: slotsB,
+      );
+    }
+
     hub.entryCount = slotsA.length;
     hub.headPostingPageNo = chainA.$1;
     hub.tailPostingPageNo = chainA.$2;
-    hub.postingPageNos
-      ..clear()
-      ..addAll(chainA.$3);
+    hub.replacePostingPages([
+      for (final p in chainA.$3)
+        if (p > 0) NghPageId.fromPacked(p),
+    ]);
 
     final newNode = NghNavCentroidNode(
       centroidId: newCentroidId,
@@ -2155,8 +3214,18 @@ class NghGraphEngine {
       postingPageNos: List<int>.from(chainB.$3),
       entryCount: slotsB.length,
       neighbors: [hubId],
+      parentId: hub.parentId,
+      postingDirDirty: true,
     );
     centroids.add(newNode);
+    if (hub.parentId >= 0 && hub.parentId < centroids.length) {
+      final parent = centroids[hub.parentId];
+      if (parent.isCoarse &&
+          parent.childIds.length < maxChildren &&
+          !parent.childIds.contains(newCentroidId)) {
+        parent.childIds.add(newCentroidId);
+      }
+    }
 
     if (!hub.neighbors.contains(newCentroidId) && hub.neighbors.length < 16) {
       hub.neighbors.add(newCentroidId);
@@ -2189,50 +3258,61 @@ class NghGraphEngine {
     required Map<NghPagePtr, NghPostingPage> dirtyPosting,
     required Map<int, NghPostingPage> localPostingCache,
   }) async {
+    if (centroid.postingPages.isEmpty && !centroid.postingDirRoot.isNone) {
+      await _partitionManager.hydratePostingDirs(table, indexUid, [centroid]);
+    }
     final live = <NghPostingSlot>[];
-    final refs = centroid.postingPageNos.isNotEmpty
-        ? List<int>.from(centroid.postingPageNos)
-        : (centroid.headPostingPageNo > 0
-            ? [centroid.headPostingPageNo]
-            : <int>[]);
-    if (refs.isEmpty) return live;
+    final ids = centroid.postingPages.isNotEmpty
+        ? List<NghPageId>.from(centroid.postingPages)
+        : [
+            for (final packed in centroid.postingPageNos)
+              if (packed > 0) NghPageId.fromPacked(packed),
+            if (centroid.postingPages.isEmpty &&
+                centroid.headPostingPageNo > 0 &&
+                centroid.postingPageNos.isEmpty)
+              NghPageId.fromPacked(centroid.headPostingPageNo),
+          ];
+    if (ids.isEmpty) return live;
 
-    // Prefer dirty/local pages first; batch-read the rest.
-    final missing = <int>[];
-    for (final ref in refs) {
-      if (ref <= 0) continue;
-      final local = localPostingCache[ref];
-      if (local != null) {
-        for (final s in local.slots) {
-          if (!s.isDeleted) live.add(s);
+    final missing = <NghPageId>[];
+    for (final id in ids) {
+      if (id.isNone) continue;
+      final packed = id.tryPack();
+      if (packed != null && packed > 0) {
+        final local = localPostingCache[packed];
+        if (local != null) {
+          for (final s in local.slots) {
+            if (!s.isDeleted) live.add(s);
+          }
+          continue;
         }
-        continue;
       }
-      final ptr = NghPagePtr.fromPacked(NghDataCategory.posting, ref);
+      final ptr = NghPagePtr.fromPageId(NghDataCategory.posting, id);
       final dirty = dirtyPosting[ptr];
       if (dirty != null) {
-        localPostingCache[ref] = dirty;
+        if (packed != null && packed > 0) localPostingCache[packed] = dirty;
         for (final s in dirty.slots) {
           if (!s.isDeleted) live.add(s);
         }
         continue;
       }
-      missing.add(ref);
+      missing.add(id);
     }
 
     if (missing.isNotEmpty) {
-      final loaded = await _partitionManager.readPostingPagesBatch(
+      final loaded = await _partitionManager.readPostingPagesByIds(
         table,
         indexUid,
         meta,
         missing,
-        localCache: localPostingCache,
       );
       for (final item in loaded) {
-        dirtyPosting.putIfAbsent(
-          NghPagePtr.fromPacked(NghDataCategory.posting, item.packedRef),
-          () => item.page,
-        );
+        final ptr = NghPagePtr.fromPageId(NghDataCategory.posting, item.id);
+        dirtyPosting.putIfAbsent(ptr, () => item.page);
+        final packed = item.id.tryPack();
+        if (packed != null && packed > 0) {
+          localPostingCache[packed] = item.page;
+        }
         for (final s in item.page.slots) {
           if (!s.isDeleted) live.add(s);
         }
@@ -2259,71 +3339,146 @@ class NghGraphEngine {
   // Deletion -- Tombstone in Posting Pages
   // =====================================================================
 
-  /// Mark posting slots deleted by inlined primary key (tombstone).
+  /// Mark posting slots deleted via PK locator (never a full-cluster scan).
   Future<NghDeleteResult> deleteBatch({
     required TableContext table,
     required IndexUid indexUid,
     required NghIndexMeta meta,
     required List<String> primaryKeys,
   }) async {
-    final dirtyPosting = <NghPagePtr, NghPostingPage>{};
-    final localCache = <int, NghPostingPage>{};
-    final targetSet = HashSet<String>.from(primaryKeys);
-    if (targetSet.isEmpty) {
-      return NghDeleteResult(dirtyPostingPages: const {}, deletedCount: 0);
+    if (primaryKeys.isEmpty) {
+      return NghDeleteResult(meta: meta, deletedCount: 0);
     }
 
     final navGraph = await _getOrLoadNavGraph(table, indexUid, meta);
-    if (navGraph == null || navGraph.centroids.isEmpty) {
-      return NghDeleteResult(dirtyPostingPages: const {}, deletedCount: 0);
-    }
+    var currentMeta = meta;
+    final dirtyPosting = <NghPagePtr, NghPostingPage>{};
+    final dirtyNavIds = <int>{};
+    final pkBatch = NghPkMapBatch(meta: currentMeta);
+    final unresolved = <String>[];
+    final cacheKey = _cacheKey(table.tableUid, indexUid);
+    var deleted = 0;
 
-    int deleted = 0;
-    for (final centroid in navGraph.centroids) {
-      if (centroid.headPostingPageNo <= 0) continue;
-
-      final pages = await _partitionManager.readPostingCluster(
+    Future<NghPostingPage?> loadPage(NghPkLocator loc) async {
+      final ptr =
+          NghPagePtr(NghDataCategory.posting, loc.partitionNo, loc.pageNo);
+      final existing = dirtyPosting[ptr];
+      if (existing != null) return existing;
+      return _partitionManager.readPostingPage(
         table,
         indexUid,
-        meta,
-        centroid.headPostingPageNo,
-        localCache: localCache,
+        currentMeta,
+        loc.partitionNo,
+        loc.pageNo,
       );
-
-      for (final item in pages) {
-        final p = item.page;
-        bool pageModified = false;
-        for (final slot in p.slots) {
-          if (!slot.isDeleted && targetSet.contains(slot.primaryKey)) {
-            slot.flags |= 0x01; // mark deleted
-            pageModified = true;
-            deleted++;
-            centroid.entryCount = max(0, centroid.entryCount - 1);
-          }
-        }
-        if (pageModified) {
-          dirtyPosting[NghPagePtr.fromPacked(
-              NghDataCategory.posting, item.packedRef)] = p;
-        }
-      }
     }
 
-    // Update in-memory compact cache
-    final cacheKey = _cacheKey(table.tableUid, indexUid);
-    final inMemoryClusterMap = _inMemoryClusterCache[cacheKey];
-    if (inMemoryClusterMap != null) {
-      for (final slots in inMemoryClusterMap.values) {
-        for (final slot in slots) {
-          if (targetSet.contains(utf8.decode(slot.primaryKeyBytes))) {
+    for (final pk in primaryKeys) {
+      if (pk.isEmpty) continue;
+      var locs = const <NghPkLocator>[];
+      if (!pkBatch.meta.pkmapRootIsNull) {
+        locs = await _pkMap.lookup(
+          table: table,
+          indexUid: indexUid,
+          batch: pkBatch,
+          key: _pkMapKey(pk),
+        );
+      }
+      if (locs.isEmpty) {
+        if (!currentMeta.hasPkLocator) unresolved.add(pk);
+        continue;
+      }
+      for (final loc in locs) {
+        final page = await loadPage(loc);
+        if (page == null) continue;
+        var hit = false;
+        if (loc.slotIndex >= 0 && loc.slotIndex < page.slots.length) {
+          final slot = page.slots[loc.slotIndex];
+          if (!slot.isDeleted && slot.primaryKey == pk) {
             slot.flags |= 0x01;
+            hit = true;
+          }
+        }
+        if (!hit) {
+          for (final slot in page.slots) {
+            if (!slot.isDeleted && slot.primaryKey == pk) {
+              slot.flags |= 0x01;
+              hit = true;
+              break;
+            }
+          }
+        }
+        if (!hit) continue;
+        deleted++;
+        dirtyPosting[NghPagePtr(
+            NghDataCategory.posting, loc.partitionNo, loc.pageNo)] = page;
+        if (navGraph != null &&
+            loc.centroidId >= 0 &&
+            loc.centroidId < navGraph.centroids.length) {
+          final c = navGraph.centroids[loc.centroidId];
+          c.entryCount = max(0, c.entryCount - 1);
+          dirtyNavIds.add(loc.centroidId);
+        }
+        final ck = _centroidCacheKey(cacheKey, loc.centroidId);
+        final cached = _inMemoryClusterCache[ck];
+        if (cached != null) {
+          for (final slot in cached) {
+            if (utf8.decode(slot.primaryKeyBytes) == pk) {
+              slot.flags |= 0x01;
+            }
           }
         }
       }
+      await _pkMap.remove(
+        table: table,
+        indexUid: indexUid,
+        batch: pkBatch,
+        key: _pkMapKey(pk),
+      );
+    }
+
+    currentMeta = pkBatch.meta;
+    var dirtyNav = <NghPagePtr, NghNavCentroidPage>{};
+    var dirtyPdir = <NghPagePtr, NghPostingDirPage>{};
+    var deleteLegacy = false;
+    if (navGraph != null && deleted > 0 && !currentMeta.isPagedLayout) {
+      final migrated = await _partitionManager.migrateLegacyNavGraph(
+        table: table,
+        indexUid: indexUid,
+        meta: currentMeta,
+        blob: navGraph,
+      );
+      currentMeta = migrated.meta;
+      dirtyNav = migrated.nav;
+      dirtyPdir = migrated.pdir;
+      deleteLegacy = true;
+    } else if (navGraph != null &&
+        dirtyNavIds.isNotEmpty &&
+        currentMeta.isPagedLayout) {
+      dirtyNav = _partitionManager.buildDirtyNavPages(
+        meta: currentMeta,
+        centroids: navGraph.centroids,
+        dirtyCentroidIds: dirtyNavIds,
+        diskRecordsPerPage: navGraph.navPackPerPage,
+      );
+      navGraph.navPackPerPage = NghPageSizer.navCentroidsPerPage(
+        _pageSize,
+        currentMeta.dimensions,
+      );
+    }
+    if (navGraph != null) {
+      _navGraphCache[cacheKey] = navGraph;
     }
 
     return NghDeleteResult(
+      meta: currentMeta,
       dirtyPostingPages: dirtyPosting,
+      dirtyNavPages: dirtyNav,
+      dirtyPdirPages: dirtyPdir,
+      dirtyPkmapPages: pkBatch.dirty,
+      deleteLegacyNavGraph: deleteLegacy,
       deletedCount: deleted,
+      unresolvedPks: unresolved,
     );
   }
 
@@ -2331,135 +3486,31 @@ class NghGraphEngine {
   // Synchronous Navigating Graph Routing & Soft-Margin Assignment
   // =====================================================================
 
-  /// Fast nearest centroid finder with multi-candidate support (Hierarchical 2-Level Routing, 0 await).
-  (int, double, int, double, int, double) _findNearestCentroidFast(
-    Float32List vec,
-    List<NghNavCentroidNode> centroids,
-    VectorDistanceMetric metric,
-  ) {
-    final count = centroids.length;
-    if (count <= 1) {
-      return (
-        0,
-        count == 1 ? _exactDistance(vec, centroids[0].vector, metric) : 0.0,
-        -1,
-        double.infinity,
-        -1,
-        double.infinity,
-      );
-    }
-
-    if (count <= 64) {
-      int bestId = 0;
-      double bestD = double.infinity;
-      int secondId = -1;
-      double secondD = double.infinity;
-      int thirdId = -1;
-      double thirdD = double.infinity;
-
-      for (int c = 0; c < count; c++) {
-        final d = _exactDistance(vec, centroids[c].vector, metric);
-        if (d < bestD) {
-          thirdD = secondD;
-          thirdId = secondId;
-          secondD = bestD;
-          secondId = bestId;
-          bestD = d;
-          bestId = c;
-        } else if (d < secondD) {
-          thirdD = secondD;
-          thirdId = secondId;
-          secondD = d;
-          secondId = c;
-        } else if (d < thirdD) {
-          thirdD = d;
-          thirdId = c;
-        }
-      }
-      return (bestId, bestD, secondId, secondD, thirdId, thirdD);
-    }
-
-    // High-performance Hierarchical 2-Level Routing (O(sqrt(K)))
-    final coarseCount = min(32, count);
-    final stride = count / coarseCount;
-    int c1 = 0, c2 = 0, c3 = 0;
-    double d1 = double.infinity, d2 = double.infinity, d3 = double.infinity;
-
-    for (int i = 0; i < coarseCount; i++) {
-      final idx = (i * stride).toInt().clamp(0, count - 1);
-      final d = _exactDistance(vec, centroids[idx].vector, metric);
-      if (d < d1) {
-        d3 = d2;
-        c3 = c2;
-        d2 = d1;
-        c2 = c1;
-        d1 = d;
-        c1 = idx;
-      } else if (d < d2) {
-        d3 = d2;
-        c3 = c2;
-        d2 = d;
-        c2 = idx;
-      } else if (d < d3) {
-        d3 = d;
-        c3 = idx;
-      }
-    }
-
-    final candidateSet = <int>{};
-    for (final seed in [c1, c2, c3]) {
-      candidateSet.add(seed);
-      final node = centroids[seed];
-      for (final nId in node.neighbors) {
-        if (nId < count) candidateSet.add(nId);
-      }
-      final start = max(0, seed - 4);
-      final end = min(count, seed + 5);
-      for (int s = start; s < end; s++) {
-        candidateSet.add(s);
-      }
-    }
-
-    int bestId = c1;
-    double bestD = d1;
-    int secondId = c2;
-    double secondD = d2;
-    int thirdId = c3;
-    double thirdD = d3;
-
-    for (final c in candidateSet) {
-      if (c == c1 || c == c2 || c == c3) continue;
-      final d = _exactDistance(vec, centroids[c].vector, metric);
-      if (d < bestD) {
-        thirdD = secondD;
-        thirdId = secondId;
-        secondD = bestD;
-        secondId = bestId;
-        bestD = d;
-        bestId = c;
-      } else if (d < secondD) {
-        thirdD = secondD;
-        thirdId = secondId;
-        secondD = d;
-        secondId = c;
-      } else if (d < thirdD) {
-        thirdD = d;
-        thirdId = c;
-      }
-    }
-
-    return (bestId, bestD, secondId, secondD, thirdId, thirdD);
-  }
-
-  /// Prefetch and cache nav graph in parallel with metadata loading.
-  Future<void> prefetchNavGraph(TableContext table, IndexUid indexUid) async {
+  /// Prefetch and cache the full paged nav graph (requires [meta] page counts).
+  Future<void> prefetchNavGraph(
+    TableContext table,
+    IndexUid indexUid, {
+    NghIndexMeta? meta,
+  }) async {
     final key = _cacheKey(table.tableUid, indexUid);
-    if (_navGraphCache.containsKey(key)) return;
+    final cached = _navGraphCache[key];
+    if (cached != null &&
+        (meta == null ||
+            meta.centroidCount <= 0 ||
+            cached.centroids.length >= meta.centroidCount)) {
+      return;
+    }
     try {
-      final loaded = await _partitionManager.readNavGraph(table, indexUid);
-      if (loaded != null) {
-        _navGraphCache[key] = loaded;
+      final loaded = await _partitionManager.readNavGraph(
+        table,
+        indexUid,
+        meta: meta,
+      );
+      if (loaded == null || loaded.centroids.isEmpty) return;
+      if (cached != null && cached.centroids.length > loaded.centroids.length) {
+        return;
       }
+      _navGraphCache[key] = loaded;
     } catch (_) {}
   }
 
@@ -2470,14 +3521,22 @@ class NghGraphEngine {
   ) async {
     final key = _cacheKey(table.tableUid, indexUid);
     final cached = _navGraphCache[key];
-    if (cached != null) return cached;
+    if (cached != null &&
+        (meta.centroidCount <= 0 ||
+            cached.centroids.length >= meta.centroidCount)) {
+      return cached;
+    }
 
-    final loaded = await _partitionManager.readNavGraph(table, indexUid);
-    if (loaded != null) {
+    final loaded =
+        await _partitionManager.readNavGraph(table, indexUid, meta: meta);
+    if (loaded != null && loaded.centroids.isNotEmpty) {
+      if (cached != null && cached.centroids.length > loaded.centroids.length) {
+        return cached;
+      }
       _navGraphCache[key] = loaded;
       return loaded;
     }
-    return null;
+    return cached;
   }
 
   // =====================================================================
@@ -2710,16 +3769,266 @@ class NghGraphEngine {
     return centroids;
   }
 
-  /// Scans posting pages to compact tombstones.
+  /// Rewrite posting pages whose tombstone ratio is high; free empty pages.
   Future<NghCompactResult> compactTombstones({
     required TableContext table,
     required IndexUid indexUid,
     required NghIndexMeta meta,
     int maxVisitedPages = 100,
   }) async {
+    final navGraph = await _getOrLoadNavGraph(table, indexUid, meta);
+    if (navGraph == null || navGraph.centroids.isEmpty) {
+      return NghCompactResult(meta: meta, compactedCount: 0);
+    }
+
+    var currentMeta = meta;
+    final dirtyPosting = <NghPagePtr, NghPostingPage>{};
+    final dirtyPdir = <NghPagePtr, NghPostingDirPage>{};
+    final freed = <NghPagePtr>[];
+    final dirtyNavIds = <int>{};
+    final pkBatch = NghPkMapBatch(meta: currentMeta);
+    var compacted = 0;
+    var visited = 0;
+    const minGarbageRatio = 0.35;
+
+    for (final c in navGraph.centroids) {
+      if (visited >= maxVisitedPages) break;
+      if (c.isCoarse || c.postingPages.isEmpty) continue;
+      final livePages = <NghPageId>[];
+      var dirChanged = false;
+      for (final pid in c.postingPages) {
+        if (visited >= maxVisitedPages) {
+          livePages.add(pid);
+          continue;
+        }
+        visited++;
+        final ptr = NghPagePtr.fromPageId(NghDataCategory.posting, pid);
+        final page = dirtyPosting[ptr] ??
+            await _partitionManager.readPostingPage(
+              table,
+              indexUid,
+              currentMeta,
+              pid.partitionNo,
+              pid.pageNo,
+            );
+        if (page == null) {
+          livePages.add(pid);
+          continue;
+        }
+        final dead = page.slots.where((s) => s.isDeleted).length;
+        if (page.slots.isEmpty || dead / page.slots.length < minGarbageRatio) {
+          livePages.add(pid);
+          continue;
+        }
+        final live = [
+          for (final s in page.slots)
+            if (!s.isDeleted) s
+        ];
+        compacted += page.slots.length - live.length;
+        if (live.isEmpty) {
+          freed.add(ptr);
+          dirChanged = true;
+          continue;
+        }
+        dirtyPosting[ptr] = NghPostingPage(
+          centroidId: page.centroidId,
+          nextPostingPageNo: page.nextPostingPageNo,
+          dimensions: page.dimensions,
+          slots: live,
+        );
+        livePages.add(pid);
+        for (int i = 0; i < live.length; i++) {
+          final pk = live[i].primaryKey;
+          if (pk.isEmpty) continue;
+          final old = await _pkMap.lookup(
+            table: table,
+            indexUid: indexUid,
+            batch: pkBatch,
+            key: _pkMapKey(pk),
+          );
+          final updated = <NghPkLocator>[];
+          var replaced = false;
+          for (final l in old) {
+            if (l.partitionNo == pid.partitionNo && l.pageNo == pid.pageNo) {
+              updated.add(NghPkLocator(
+                centroidId: l.centroidId,
+                partitionNo: l.partitionNo,
+                pageNo: l.pageNo,
+                slotIndex: i,
+              ));
+              replaced = true;
+            } else {
+              updated.add(l);
+            }
+          }
+          if (!replaced) {
+            updated.add(NghPkLocator(
+              centroidId: c.centroidId,
+              partitionNo: pid.partitionNo,
+              pageNo: pid.pageNo,
+              slotIndex: i,
+            ));
+          }
+          await _pkMap.upsert(
+            table: table,
+            indexUid: indexUid,
+            batch: pkBatch,
+            key: _pkMapKey(pk),
+            locators: updated.length > 2 ? updated.sublist(0, 2) : updated,
+          );
+        }
+      }
+      if (dirChanged) {
+        c.replacePostingPages(livePages);
+        currentMeta = await _partitionManager.rewritePostingDir(
+          table: table,
+          indexUid: indexUid,
+          meta: currentMeta,
+          centroid: c,
+          dirtyPdir: dirtyPdir,
+        );
+        dirtyNavIds.add(c.centroidId);
+      }
+    }
+
+    currentMeta =
+        pkBatch.meta.copyWith(centroidCount: navGraph.centroids.length);
+    final dirtyNav = currentMeta.isPagedLayout
+        ? _partitionManager.buildDirtyNavPages(
+            meta: currentMeta,
+            centroids: navGraph.centroids,
+            dirtyCentroidIds: dirtyNavIds,
+            diskRecordsPerPage: navGraph.navPackPerPage,
+          )
+        : <NghPagePtr, NghNavCentroidPage>{};
+    if (currentMeta.isPagedLayout) {
+      navGraph.navPackPerPage = NghPageSizer.navCentroidsPerPage(
+        _pageSize,
+        currentMeta.dimensions,
+      );
+    }
+
     return NghCompactResult(
-      dirtyPostingPages: const {},
-      compactedCount: 0,
+      meta: currentMeta,
+      dirtyPostingPages: dirtyPosting,
+      dirtyNavPages: dirtyNav,
+      dirtyPdirPages: dirtyPdir,
+      dirtyPkmapPages: pkBatch.dirty,
+      freePostingPages: freed,
+      compactedCount: compacted,
+    );
+  }
+
+  /// Scan posting pages to fill the PK locator tree. Tombstones pending-delete
+  /// PKs as they are encountered. Never falls back to a full delete scan.
+  Future<NghInsertResult> backfillPkLocator({
+    required TableContext table,
+    required IndexUid indexUid,
+    required NghIndexMeta meta,
+    required Set<String> pendingDeletePks,
+    int maxPages = 64,
+  }) async {
+    if (meta.hasPkLocator) {
+      return NghInsertResult(meta: meta, insertedCount: 0);
+    }
+
+    var currentMeta = meta;
+    final pkBatch = NghPkMapBatch(meta: currentMeta);
+    final dirtyPosting = <NghPagePtr, NghPostingPage>{};
+    var part = currentMeta.pkBackfillPartition;
+    var page = currentMeta.pkBackfillPage < NghIndexMeta.firstDataPageNo
+        ? NghIndexMeta.firstDataPageNo
+        : currentMeta.pkBackfillPage;
+    var visited = 0;
+    var tombstoned = 0;
+    final partLimit = max(1, currentMeta.postingPartitionCount);
+
+    while (visited < maxPages && part < partLimit) {
+      final pageCount = await _partitionManager.postingFilePageCount(
+        table,
+        indexUid,
+        part,
+      );
+      if (pageCount <= NghIndexMeta.firstDataPageNo) {
+        part++;
+        page = NghIndexMeta.firstDataPageNo;
+        continue;
+      }
+      while (page < pageCount && visited < maxPages) {
+        visited++;
+        final loaded = await _partitionManager.readPostingPage(
+          table,
+          indexUid,
+          currentMeta,
+          part,
+          page,
+        );
+        final pgNo = page;
+        page++;
+        if (loaded == null) continue;
+        var modified = false;
+        for (int i = 0; i < loaded.slots.length; i++) {
+          final slot = loaded.slots[i];
+          final pk = slot.primaryKey;
+          if (pk.isEmpty) continue;
+          if (pendingDeletePks.contains(pk)) {
+            if (!slot.isDeleted) {
+              slot.flags |= 0x01;
+              modified = true;
+              tombstoned++;
+            }
+            continue;
+          }
+          if (slot.isDeleted) continue;
+          final old = await _pkMap.lookup(
+            table: table,
+            indexUid: indexUid,
+            batch: pkBatch,
+            key: _pkMapKey(pk),
+          );
+          final loc = NghPkLocator(
+            centroidId: loaded.centroidId,
+            partitionNo: part,
+            pageNo: pgNo,
+            slotIndex: i,
+          );
+          final merged = <NghPkLocator>[
+            for (final l in old)
+              if (!(l.partitionNo == part && l.pageNo == pgNo)) l,
+            loc,
+          ];
+          await _pkMap.upsert(
+            table: table,
+            indexUid: indexUid,
+            batch: pkBatch,
+            key: _pkMapKey(pk),
+            locators: merged.length > 2 ? merged.sublist(0, 2) : merged,
+          );
+        }
+        if (modified) {
+          dirtyPosting[NghPagePtr(NghDataCategory.posting, part, pgNo)] =
+              loaded;
+        }
+      }
+      if (page >= pageCount) {
+        part++;
+        page = NghIndexMeta.firstDataPageNo;
+      }
+    }
+
+    final done = part >= partLimit;
+    currentMeta = pkBatch.meta.copyWith(
+      pkBackfillPartition: part,
+      pkBackfillPage: page,
+      hasPkLocator: done ? true : currentMeta.hasPkLocator,
+    );
+
+    return NghInsertResult(
+      meta: currentMeta,
+      dirtyPostingPages: dirtyPosting,
+      dirtyPkmapPages: pkBatch.dirty,
+      insertedCount: 0,
+      tombstonedCount: tombstoned,
     );
   }
 }
@@ -2741,12 +4050,14 @@ class _HubSplitBatchResult {
 class _HubSplitResult {
   final NghIndexMeta meta;
   final int newCentroidId;
+  final int? extraCentroidId;
   final List<NghPostingSlot> slotsA;
   final List<NghPostingSlot> slotsB;
 
   _HubSplitResult({
     required this.meta,
     required this.newCentroidId,
+    this.extraCentroidId,
     required this.slotsA,
     required this.slotsB,
   });
@@ -2760,37 +4071,71 @@ class _HubSplitResult {
 class NghInsertResult {
   final NghIndexMeta meta;
   final Map<NghPagePtr, NghPostingPage> dirtyPostingPages;
-  final Map<int, int> chainedPagePatches;
-  final NghNavGraphPage? navGraphPage;
+  final Map<NghPagePtr, NghNavCentroidPage> dirtyNavPages;
+  final Map<NghPagePtr, NghPostingDirPage> dirtyPdirPages;
+  final Map<NghPagePtr, NghPkMapDirtyPage> dirtyPkmapPages;
+  final bool deleteLegacyNavGraph;
   final int insertedCount;
+  final int tombstonedCount;
+
+  /// True when this flush should load *missing* compact clusters after persist.
+  ///
+  /// Not "index fits budget" — that would re-prewarm every small-corpus flush.
+  final bool needsCompactGapFill;
 
   NghInsertResult({
     required this.meta,
     this.dirtyPostingPages = const {},
-    this.chainedPagePatches = const {},
-    this.navGraphPage,
+    this.dirtyNavPages = const {},
+    this.dirtyPdirPages = const {},
+    this.dirtyPkmapPages = const {},
+    this.deleteLegacyNavGraph = false,
     required this.insertedCount,
+    this.tombstonedCount = 0,
+    this.needsCompactGapFill = false,
   });
 }
 
 /// Result of a batch deletion operation.
 class NghDeleteResult {
+  final NghIndexMeta meta;
   final Map<NghPagePtr, NghPostingPage> dirtyPostingPages;
+  final Map<NghPagePtr, NghNavCentroidPage> dirtyNavPages;
+  final Map<NghPagePtr, NghPostingDirPage> dirtyPdirPages;
+  final Map<NghPagePtr, NghPkMapDirtyPage> dirtyPkmapPages;
+  final bool deleteLegacyNavGraph;
   final int deletedCount;
+  final List<String> unresolvedPks;
 
   NghDeleteResult({
+    required this.meta,
     this.dirtyPostingPages = const {},
+    this.dirtyNavPages = const {},
+    this.dirtyPdirPages = const {},
+    this.dirtyPkmapPages = const {},
+    this.deleteLegacyNavGraph = false,
     required this.deletedCount,
+    this.unresolvedPks = const [],
   });
 }
 
 /// Result of a background tombstone compaction.
 class NghCompactResult {
+  final NghIndexMeta meta;
   final Map<NghPagePtr, NghPostingPage> dirtyPostingPages;
+  final Map<NghPagePtr, NghNavCentroidPage> dirtyNavPages;
+  final Map<NghPagePtr, NghPostingDirPage> dirtyPdirPages;
+  final Map<NghPagePtr, NghPkMapDirtyPage> dirtyPkmapPages;
+  final List<NghPagePtr> freePostingPages;
   final int compactedCount;
 
   NghCompactResult({
+    required this.meta,
     this.dirtyPostingPages = const {},
+    this.dirtyNavPages = const {},
+    this.dirtyPdirPages = const {},
+    this.dirtyPkmapPages = const {},
+    this.freePostingPages = const [],
     required this.compactedCount,
   });
 }

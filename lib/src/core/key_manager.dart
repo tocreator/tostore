@@ -486,8 +486,10 @@ class KeyManager {
     if (!info.isRunning) return;
 
     // Rewrite already finished; only natural-turnover domains remain.
-    final rewriteDone = info.isDomainDone(EncryptionDomain.tableData) &&
-        info.isDomainDone(EncryptionDomain.btreeIndex);
+    final rewriteDone = KeyMigrationRunner.isActiveRewriteComplete(
+      info,
+      _dataStore.config.encryptionConfig,
+    );
     if (rewriteDone && !info.allDomainsComplete) {
       Logger.info(
         'Refreshing encodingKey natural-turnover state for keyId ${info.targetKeyId}',
@@ -709,8 +711,10 @@ class KeyManager {
       return;
     }
 
-    final rewriteDone = info.isDomainDone(EncryptionDomain.tableData) &&
-        info.isDomainDone(EncryptionDomain.btreeIndex);
+    final rewriteDone = KeyMigrationRunner.isActiveRewriteComplete(
+      info,
+      _dataStore.config.encryptionConfig,
+    );
     if (rewriteDone && !info.allDomainsComplete) {
       _ensureNaturalTurnoverWatch();
     } else {
@@ -764,8 +768,10 @@ class KeyManager {
         return;
       }
 
-      final rewriteDone = info.isDomainDone(EncryptionDomain.tableData) &&
-          info.isDomainDone(EncryptionDomain.btreeIndex);
+      final rewriteDone = KeyMigrationRunner.isActiveRewriteComplete(
+        info,
+        _dataStore.config.encryptionConfig,
+      );
       if (!rewriteDone) {
         // Table rewrite still in progress -- runner owns progress.
         return;

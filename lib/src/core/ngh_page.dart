@@ -201,10 +201,15 @@ final class NghPostingPage {
 
   /// Encode posting page payload.
   ///
-  /// Wire layout:
+  /// **Frozen wire layout** (engine v4 and later). Do not change field widths
+  /// or drop inlined PK — tens-of-billions scale uses pdir (`u32+u32`) as the
+  /// page-list authority, not a posting rewrite. `nextPostingPackedRef` is a
+  /// hint; unrepresentable locations write `-1`.
+  ///
   ///   [centroidId: u32][nextPostingPackedRef: i32][dimensions: u16][slotCount: u16]
   ///   For each slot:
-  ///     [nodeId: u32][flags: u8][offset: f32][scale: f32][sqNorm: f32][pkLen: u16][pkBytes: pkLen][sq8Codes: D bytes]
+  ///     [nodeId: u32][flags: u8][offset: f32][scale: f32][sqNorm: f32]
+  ///     [pkLen: u16][pkBytes: pkLen][sq8Codes: D bytes]
   Uint8List encodePayload() {
     final slotCount = slots.length;
     int totalBytes = 12; // 4 + 4 + 2 + 2
@@ -313,12 +318,80 @@ final class NghPostingPage {
 }
 
 // ============================================================================
+// NGH page identity (v2: u32 partition + u32 page, not packed i32)
+// ============================================================================
+
+/// Physical page location that does not overflow at partition >= 2048.
+final class NghPageId {
+  static const int noneWire = 0xFFFFFFFF;
+  static const int _maxPackedPartition = 2047;
+
+  final int partitionNo;
+  final int pageNo;
+
+  const NghPageId(this.partitionNo, this.pageNo);
+  static const NghPageId none = NghPageId(-1, -1);
+
+  bool get isNone => partitionNo < 0 || pageNo <= 0;
+
+  /// Cache / map key (Dart int is arbitrary-width).
+  int get cacheKey => (partitionNo << 32) | (pageNo & 0xFFFFFFFF);
+
+  /// Legacy i32 pack used inside v1 posting `next` fields. Null if unrepresentable.
+  int? tryPack() {
+    if (isNone) return -1;
+    if (partitionNo > _maxPackedPartition ||
+        pageNo > ((1 << 20) - 1) ||
+        partitionNo < 0) {
+      return null;
+    }
+    if (pageNo <= 0) return pageNo;
+    return (partitionNo << 20) | (pageNo & ((1 << 20) - 1));
+  }
+
+  factory NghPageId.fromPacked(int packed) {
+    if (packed <= 0) return none;
+    return NghPageId(packed >> 20, packed & ((1 << 20) - 1));
+  }
+
+  static NghPageId fromWire(int partitionNo, int pageNo) {
+    if (partitionNo == noneWire ||
+        pageNo == noneWire ||
+        partitionNo < 0 ||
+        pageNo <= 0) {
+      return none;
+    }
+    return NghPageId(partitionNo, pageNo);
+  }
+
+  int get wirePartition => isNone ? noneWire : partitionNo;
+  int get wirePage => isNone ? noneWire : pageNo;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      (other is NghPageId &&
+          other.partitionNo == partitionNo &&
+          other.pageNo == pageNo);
+
+  @override
+  int get hashCode => Object.hash(partitionNo, pageNo);
+
+  @override
+  String toString() =>
+      isNone ? 'NghPageId.none' : 'NghPageId(p$partitionNo, pg$pageNo)';
+}
+
+// ============================================================================
 // NGH Navigating Centroid Graph Page
 // ============================================================================
 
 /// A centroid node in the navigating graph.
 final class NghNavCentroidNode {
-  /// Centroid identifier (0..K-1).
+  static const int levelCoarse = 0;
+  static const int levelLeaf = 1;
+
+  /// Centroid identifier (0..K-1, u32 on v2 wire).
   final int centroidId;
 
   /// Centroid vector (Float32List of length [dimensions]).
@@ -336,8 +409,36 @@ final class NghNavCentroidNode {
   /// Out-degree and neighbor centroid IDs in the navigating graph.
   final List<int> neighbors;
 
-  /// All physical inverted posting page packed refs for this cluster.
-  final List<int> postingPageNos;
+  /// All physical inverted posting pages for this cluster (v2 source of truth).
+  final List<NghPageId> postingPages;
+
+  /// Packed posting refs for search batch I/O when they still fit in i32.
+  List<int> get postingPageNos => [
+        for (final p in postingPages)
+          if (p.tryPack() != null) p.tryPack()!,
+      ];
+
+  /// 0 = coarse (no posting, has children), 1 = leaf (owns posting lists).
+  int level;
+
+  /// Parent coarse centroid, or -1.
+  int parentId;
+
+  /// Root / tail of the posting-page directory chain.
+  NghPageId postingDirRoot;
+  NghPageId postingDirTail;
+
+  /// Overflow children directory (inline [childIds] is preferred).
+  NghPageId childrenDirRoot;
+
+  /// Inline child centroid ids (hierarchical IVF). Empty for flat leaves.
+  final List<int> childIds;
+
+  /// Directory pages need a flush (append or rewrite).
+  bool postingDirDirty;
+
+  bool get isCoarse => level == levelCoarse;
+  bool get isLeaf => level != levelCoarse;
 
   NghNavCentroidNode({
     required this.centroidId,
@@ -347,14 +448,68 @@ final class NghNavCentroidNode {
     this.entryCount = 0,
     List<int>? neighbors,
     List<int>? postingPageNos,
-  })  : neighbors = neighbors ?? [],
-        postingPageNos = postingPageNos ??
-            (headPostingPageNo > 0
-                ? (headPostingPageNo == tailPostingPageNo ||
-                        tailPostingPageNo <= 0
-                    ? [headPostingPageNo]
-                    : [headPostingPageNo, tailPostingPageNo])
-                : []);
+    List<NghPageId>? postingPages,
+    this.level = levelLeaf,
+    this.parentId = -1,
+    this.postingDirRoot = NghPageId.none,
+    this.postingDirTail = NghPageId.none,
+    this.childrenDirRoot = NghPageId.none,
+    List<int>? childIds,
+    this.postingDirDirty = false,
+  })  : neighbors = List<int>.of(neighbors ?? const <int>[]),
+        childIds = List<int>.of(childIds ?? const <int>[]),
+        postingPages = List<NghPageId>.of(
+          postingPages ??
+              _pagesFromPacked(
+                postingPageNos,
+                headPostingPageNo,
+                tailPostingPageNo,
+              ),
+        );
+
+  static List<NghPageId> _pagesFromPacked(
+    List<int>? packed,
+    int headPacked,
+    int tailPacked,
+  ) {
+    if (packed != null && packed.isNotEmpty) {
+      return [
+        for (final p in packed)
+          if (p > 0) NghPageId.fromPacked(p)
+      ];
+    }
+    if (headPacked > 0) {
+      if (tailPacked > 0 && tailPacked != headPacked) {
+        return [
+          NghPageId.fromPacked(headPacked),
+          NghPageId.fromPacked(tailPacked),
+        ];
+      }
+      return [NghPageId.fromPacked(headPacked)];
+    }
+    return <NghPageId>[];
+  }
+
+  void addPostingPage(NghPageId id) {
+    if (id.isNone) return;
+    for (final e in postingPages) {
+      if (e.partitionNo == id.partitionNo && e.pageNo == id.pageNo) return;
+    }
+    postingPages.add(id);
+    postingDirDirty = true;
+  }
+
+  void replacePostingPages(List<NghPageId> pages) {
+    postingPages
+      ..clear()
+      ..addAll(pages);
+    postingDirDirty = true;
+  }
+
+  void setHeadTailFromIds(NghPageId head, NghPageId tail) {
+    headPostingPageNo = head.tryPack() ?? -1;
+    tailPostingPageNo = tail.tryPack() ?? -1;
+  }
 }
 
 /// A serialized page of navigating centroid graph nodes.
@@ -362,9 +517,14 @@ final class NghNavGraphPage {
   final int dimensions;
   final List<NghNavCentroidNode> centroids;
 
+  /// On-disk records/page observed at load (first nav page). `null` = new graph.
+  /// Used to detect 7-pack → 5-pack occupancy changes and rewrite all pages once.
+  int? navPackPerPage;
+
   NghNavGraphPage({
     required this.dimensions,
     required this.centroids,
+    this.navPackPerPage,
   });
 
   Uint8List encodePayload() {
@@ -503,8 +663,281 @@ final class NghNavGraphPage {
 }
 
 // ============================================================================
-// NGH Page Size Utilities
+// NGH v2 paged centroid + posting directory (TPG2 payloads)
 // ============================================================================
+
+/// One TPG2 page of v2 centroid records (no inlined posting page lists).
+final class NghNavCentroidPage {
+  static const int magic = 0x3256434E; // 'NCV2'
+  static const int payloadVersion = 1;
+
+  final int dimensions;
+  final List<NghNavCentroidNode> centroids;
+
+  NghNavCentroidPage({
+    required this.dimensions,
+    required this.centroids,
+  });
+
+  static int recordSize(int dimensions, int neighborCount, int childCount) {
+    return 58 + neighborCount * 4 + childCount * 4 + dimensions * 4;
+  }
+
+  int estimatePayloadSize({int pageSize = 16 * 1024}) {
+    var total = 12;
+    final maxChildren = NghPageSizer.maxNavInlineChildren(pageSize, dimensions);
+    for (final c in centroids) {
+      total += recordSize(
+        dimensions,
+        c.neighbors.length > NghPageSizer.maxNavNeighbors
+            ? NghPageSizer.maxNavNeighbors
+            : c.neighbors.length,
+        c.childIds.length > maxChildren ? maxChildren : c.childIds.length,
+      );
+    }
+    return total;
+  }
+
+  Uint8List encodePayload({int pageSize = 16 * 1024}) {
+    final total = estimatePayloadSize(pageSize: pageSize);
+    final maxChildren = NghPageSizer.maxNavInlineChildren(pageSize, dimensions);
+    final buf = Uint8List(total);
+    final bd = ByteData.sublistView(buf);
+    bd.setUint32(0, magic, Endian.little);
+    bd.setUint16(4, payloadVersion, Endian.little);
+    bd.setUint16(6, dimensions, Endian.little);
+    bd.setUint16(8, centroids.length, Endian.little);
+    bd.setUint16(10, 0, Endian.little);
+    int off = 12;
+    for (final c in centroids) {
+      bd.setUint32(off, c.centroidId, Endian.little);
+      buf[off + 4] = c.level;
+      buf[off + 5] = 0;
+      bd.setUint32(off + 6, c.parentId < 0 ? NghPageId.noneWire : c.parentId,
+          Endian.little);
+      bd.setUint32(
+          off + 10, c.entryCount < 0 ? 0 : c.entryCount, Endian.little);
+      bd.setUint32(off + 14, c.postingDirRoot.wirePartition, Endian.little);
+      bd.setUint32(off + 18, c.postingDirRoot.wirePage, Endian.little);
+      bd.setUint32(off + 22, c.postingDirTail.wirePartition, Endian.little);
+      bd.setUint32(off + 26, c.postingDirTail.wirePage, Endian.little);
+      final head = NghPageId.fromPacked(c.headPostingPageNo);
+      final tail = NghPageId.fromPacked(c.tailPostingPageNo);
+      bd.setUint32(off + 30, head.wirePartition, Endian.little);
+      bd.setUint32(off + 34, head.wirePage, Endian.little);
+      bd.setUint32(off + 38, tail.wirePartition, Endian.little);
+      bd.setUint32(off + 42, tail.wirePage, Endian.little);
+      bd.setUint32(off + 46, c.childrenDirRoot.wirePartition, Endian.little);
+      bd.setUint32(off + 50, c.childrenDirRoot.wirePage, Endian.little);
+      off += 54;
+      final nLen = c.neighbors.length > NghPageSizer.maxNavNeighbors
+          ? NghPageSizer.maxNavNeighbors
+          : c.neighbors.length;
+      bd.setUint16(off, nLen, Endian.little);
+      off += 2;
+      for (int n = 0; n < nLen; n++) {
+        bd.setUint32(off, c.neighbors[n], Endian.little);
+        off += 4;
+      }
+      final cLen =
+          c.childIds.length > maxChildren ? maxChildren : c.childIds.length;
+      bd.setUint16(off, cLen, Endian.little);
+      off += 2;
+      for (int n = 0; n < cLen; n++) {
+        bd.setUint32(off, c.childIds[n], Endian.little);
+        off += 4;
+      }
+      for (int d = 0; d < dimensions; d++) {
+        bd.setFloat32(
+            off, d < c.vector.length ? c.vector[d] : 0.0, Endian.little);
+        off += 4;
+      }
+    }
+    return buf;
+  }
+
+  static NghNavCentroidPage? tryDecodePayload(Uint8List bytes) {
+    if (bytes.length < 12) return null;
+    final bd = ByteData.sublistView(bytes);
+    if (bd.getUint32(0, Endian.little) != magic) return null;
+    final ver = bd.getUint16(4, Endian.little);
+    if (ver <= 0) return null;
+    final dims = bd.getUint16(6, Endian.little);
+    final count = bd.getUint16(8, Endian.little);
+    if (dims == 0) return null;
+    int off = 12;
+    final list = <NghNavCentroidNode>[];
+    for (int i = 0; i < count; i++) {
+      if (off + 54 + 4 > bytes.length) break;
+      final cId = bd.getUint32(off, Endian.little);
+      final level = bytes[off + 4];
+      final parentRaw = bd.getUint32(off + 6, Endian.little);
+      final entries = bd.getUint32(off + 10, Endian.little);
+      final pdirRoot = NghPageId.fromWire(bd.getUint32(off + 14, Endian.little),
+          bd.getUint32(off + 18, Endian.little));
+      final pdirTail = NghPageId.fromWire(bd.getUint32(off + 22, Endian.little),
+          bd.getUint32(off + 26, Endian.little));
+      final head = NghPageId.fromWire(bd.getUint32(off + 30, Endian.little),
+          bd.getUint32(off + 34, Endian.little));
+      final tail = NghPageId.fromWire(bd.getUint32(off + 38, Endian.little),
+          bd.getUint32(off + 42, Endian.little));
+      final childDir = NghPageId.fromWire(bd.getUint32(off + 46, Endian.little),
+          bd.getUint32(off + 50, Endian.little));
+      off += 54;
+      if (off + 2 > bytes.length) break;
+      final nLen = bd.getUint16(off, Endian.little);
+      off += 2;
+      if (off + nLen * 4 + 2 > bytes.length) break;
+      final neighbors = <int>[];
+      for (int n = 0; n < nLen; n++) {
+        neighbors.add(bd.getUint32(off, Endian.little));
+        off += 4;
+      }
+      final cLen = bd.getUint16(off, Endian.little);
+      off += 2;
+      if (off + cLen * 4 + dims * 4 > bytes.length) break;
+      final children = <int>[];
+      for (int n = 0; n < cLen; n++) {
+        children.add(bd.getUint32(off, Endian.little));
+        off += 4;
+      }
+      final vec = Float32List(dims);
+      for (int d = 0; d < dims; d++) {
+        vec[d] = bd.getFloat32(off, Endian.little);
+        off += 4;
+      }
+      list.add(NghNavCentroidNode(
+        centroidId: cId,
+        vector: vec,
+        headPostingPageNo: head.tryPack() ?? -1,
+        tailPostingPageNo: tail.tryPack() ?? -1,
+        entryCount: entries,
+        neighbors: neighbors,
+        postingPages: <NghPageId>[],
+        level: level,
+        parentId: parentRaw == NghPageId.noneWire ? -1 : parentRaw,
+        postingDirRoot: pdirRoot,
+        postingDirTail: pdirTail,
+        childrenDirRoot: childDir,
+        childIds: children,
+      ));
+    }
+    return NghNavCentroidPage(dimensions: dims, centroids: list);
+  }
+}
+
+/// Linked directory of posting [NghPageId]s for one leaf centroid.
+final class NghPostingDirPage {
+  static const int magic = 0x32564450; // 'PDV2'
+  static const int headerSize = 20;
+
+  final int centroidId;
+  NghPageId next;
+  final List<NghPageId> pages;
+
+  NghPostingDirPage({
+    required this.centroidId,
+    this.next = NghPageId.none,
+    List<NghPageId>? pages,
+  }) : pages = pages ?? <NghPageId>[];
+
+  static int maxEntriesForPage(int pageSize) {
+    final usable =
+        pageSize - BTreePageHeader.size - NghPageSizer.encodingSafetyMargin;
+    final body = usable - headerSize;
+    return body > 8 ? body ~/ 8 : 1;
+  }
+
+  Uint8List encodePayload() {
+    final buf = Uint8List(headerSize + pages.length * 8);
+    final bd = ByteData.sublistView(buf);
+    bd.setUint32(0, magic, Endian.little);
+    bd.setUint32(4, centroidId, Endian.little);
+    bd.setUint32(8, next.wirePartition, Endian.little);
+    bd.setUint32(12, next.wirePage, Endian.little);
+    bd.setUint16(16, pages.length, Endian.little);
+    bd.setUint16(18, 0, Endian.little);
+    int off = headerSize;
+    for (final p in pages) {
+      bd.setUint32(off, p.wirePartition, Endian.little);
+      bd.setUint32(off + 4, p.wirePage, Endian.little);
+      off += 8;
+    }
+    return buf;
+  }
+
+  static NghPostingDirPage? tryDecodePayload(Uint8List bytes) {
+    if (bytes.length < headerSize) return null;
+    final bd = ByteData.sublistView(bytes);
+    if (bd.getUint32(0, Endian.little) != magic) return null;
+    final cId = bd.getUint32(4, Endian.little);
+    final next = NghPageId.fromWire(
+        bd.getUint32(8, Endian.little), bd.getUint32(12, Endian.little));
+    final count = bd.getUint16(16, Endian.little);
+    int off = headerSize;
+    final pages = <NghPageId>[];
+    for (int i = 0; i < count; i++) {
+      if (off + 8 > bytes.length) break;
+      pages.add(NghPageId.fromWire(bd.getUint32(off, Endian.little),
+          bd.getUint32(off + 4, Endian.little)));
+      off += 8;
+    }
+    return NghPostingDirPage(centroidId: cId, next: next, pages: pages);
+  }
+}
+
+/// PK locator value: one or more (centroid, partition, page, slot) tuples.
+final class NghPkLocator {
+  final int centroidId;
+  final int partitionNo;
+  final int pageNo;
+  final int slotIndex;
+
+  const NghPkLocator({
+    required this.centroidId,
+    required this.partitionNo,
+    required this.pageNo,
+    required this.slotIndex,
+  });
+
+  NghPageId get pageId => NghPageId(partitionNo, pageNo);
+
+  static Uint8List encodeList(List<NghPkLocator> locs) {
+    final n = locs.length.clamp(0, 8);
+    final buf = Uint8List(1 + n * 14);
+    buf[0] = n;
+    final bd = ByteData.sublistView(buf);
+    int off = 1;
+    for (int i = 0; i < n; i++) {
+      final l = locs[i];
+      bd.setUint32(off, l.centroidId, Endian.little);
+      bd.setUint32(off + 4, l.partitionNo, Endian.little);
+      bd.setUint32(off + 8, l.pageNo, Endian.little);
+      bd.setUint16(off + 12, l.slotIndex, Endian.little);
+      off += 14;
+    }
+    return buf;
+  }
+
+  static List<NghPkLocator> decodeList(Uint8List bytes) {
+    if (bytes.isEmpty) return const [];
+    final n = bytes[0];
+    final bd = ByteData.sublistView(bytes);
+    int off = 1;
+    final out = <NghPkLocator>[];
+    for (int i = 0; i < n; i++) {
+      if (off + 14 > bytes.length) break;
+      out.add(NghPkLocator(
+        centroidId: bd.getUint32(off, Endian.little),
+        partitionNo: bd.getUint32(off + 4, Endian.little),
+        pageNo: bd.getUint32(off + 8, Endian.little),
+        slotIndex: bd.getUint16(off + 12, Endian.little),
+      ));
+      off += 14;
+    }
+    return out;
+  }
+}
 
 /// Helper to compute slot counts and check page capacity.
 final class NghPageSizer {
@@ -534,5 +967,64 @@ final class NghPageSizer {
   /// Whether the encoded payload fits within the page.
   static bool fitsInPage(int payloadSize, int pageSize) {
     return (pageHeaderSize + payloadSize) <= pageSize;
+  }
+
+  /// Bytes reserved besides the centroid records: TPG2 header, page payload
+  /// header, encoder/AEAD slack, and [BTreePageSizer] 128-byte flush margin.
+  static const int navPagePackReserve =
+      pageHeaderSize + 12 + encodingSafetyMargin + 128 + 48;
+
+  /// Neighbor cap used by insert splits and nav packing.
+  static const int maxNavNeighbors = 16;
+
+  /// How many v2 centroid records fit on one TPG2 page.
+  ///
+  /// Must assume **max** neighbors and inline children. Packing with
+  /// `childCount=4` overflowed at ~1M vectors once coarses held 100+ children
+  /// (`payload=17082 > 16384-20`).
+  static int navCentroidsPerPage(int pageSize, int dimensions) {
+    final maxChildren = maxNavInlineChildren(pageSize, dimensions);
+    final rec =
+        NghNavCentroidPage.recordSize(dimensions, maxNavNeighbors, maxChildren);
+    final usable = pageSize - navPagePackReserve;
+    if (rec <= 0 || usable < rec) return 1;
+    return (usable ~/ rec).clamp(1, 256);
+  }
+
+  /// Max inline child ids on one coarse so the nav record still fits a page.
+  ///
+  ///   16384 coarses × 256 leaves × ~4k vectors/leaf ≈ 17B at two levels; three
+  /// levels at 256^3 × ~4k ≈ 68B. Larger child lists belong in `childrenDirRoot`.
+  static int maxNavInlineChildren(int pageSize, int dimensions) {
+    final usable = pageSize - navPagePackReserve;
+    final base = NghNavCentroidPage.recordSize(dimensions, maxNavNeighbors, 0);
+    if (usable <= base + 4) return 8;
+    return ((usable - base) ~/ 4).clamp(8, 256);
+  }
+
+  /// Drop out-of-range parent/child/neighbor ids and clamp inline lists so a
+  /// partial nav redo cannot `RangeError` on `centroids[id]`.
+  static void sanitizeNavGraph(
+    List<NghNavCentroidNode> centroids, {
+    required int pageSize,
+    int? dimensions,
+  }) {
+    final n = centroids.length;
+    if (n == 0) return;
+    final dims = dimensions ?? centroids.first.vector.length;
+    final maxChildren = maxNavInlineChildren(pageSize, dims);
+    for (final c in centroids) {
+      if (c.parentId < -1 || c.parentId >= n) {
+        c.parentId = -1;
+      }
+      c.childIds.removeWhere((id) => id < 0 || id >= n);
+      if (c.childIds.length > maxChildren) {
+        c.childIds.removeRange(maxChildren, c.childIds.length);
+      }
+      c.neighbors.removeWhere((id) => id < 0 || id >= n);
+      if (c.neighbors.length > maxNavNeighbors) {
+        c.neighbors.removeRange(maxNavNeighbors, c.neighbors.length);
+      }
+    }
   }
 }

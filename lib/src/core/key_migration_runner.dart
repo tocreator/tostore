@@ -86,6 +86,7 @@ class KeyMigrationRunner {
 
       // Ensure domain flags + natural-turnover snapshots exist.
       await _ensureMigrationInfoPrimed(primaryInstance, targetKeyId);
+      await _markOutOfScopeDomainsDone(primaryInstance);
 
       // Flush only leftover schema-migration scheduler entries (not entire DB idle).
       await _flushSchedulerEntriesOfType(
@@ -365,6 +366,13 @@ class KeyMigrationRunner {
     if (info != null && info.isDomainDone(EncryptionDomain.migrationMeta)) {
       return;
     }
+    if (!EncryptionDomainPolicy.participatesInEncodingKeyMigration(
+      EncryptionDomain.migrationMeta,
+      dataStore.config.encryptionConfig,
+    )) {
+      await _markDomainDone(dataStore, EncryptionDomain.migrationMeta);
+      return;
+    }
     // Persist current meta (re-encrypts under full scope with new encoding key).
     final migrationManager = dataStore.migrationManager;
     if (migrationManager != null && info != null) {
@@ -484,9 +492,49 @@ class KeyMigrationRunner {
       DataStoreImpl dataStore) async {
     await _markDomainDone(dataStore, EncryptionDomain.tableData);
     await _markDomainDone(dataStore, EncryptionDomain.btreeIndex);
+    await _rewriteVectorIndexDomain(dataStore);
+  }
 
-    // Soft: vector pages rewritten with MigrationWriteMode.tableAndIndex when
-    // present; explicit NGH full-scan deferred.
+  static Future<void> _rewriteVectorIndexDomain(DataStoreImpl dataStore) async {
+    final info = await dataStore.migrationManager?.getKeyMigrationInfo();
+    if (info != null && info.isDomainDone(EncryptionDomain.vectorIndex)) {
+      return;
+    }
+    if (!EncryptionDomainPolicy.participatesInEncodingKeyMigration(
+      EncryptionDomain.vectorIndex,
+      dataStore.config.encryptionConfig,
+    )) {
+      await _markDomainDone(dataStore, EncryptionDomain.vectorIndex);
+      return;
+    }
+    final vim = dataStore.vectorIndexManager;
+    if (vim == null) {
+      await _markDomainDone(dataStore, EncryptionDomain.vectorIndex);
+      return;
+    }
+    final tableNames = await dataStore.getTableNames();
+    final yieldController = YieldController(
+      'KeyMigrationRunner.rewriteVectorIndex',
+      checkInterval: 4,
+    );
+    for (final tableName in tableNames) {
+      _throwIfPaused();
+      final y = yieldController.maybeYield();
+      if (y != null) await y;
+      if (tableName == SystemTable.keyMigrationProgressTableName) continue;
+      final tableUid =
+          await dataStore.tableMetaManager?.getUidByName(TableName(tableName));
+      if (tableUid == null) continue;
+      final table = await dataStore.tableMetaManager?.getTableContext(tableUid);
+      if (table == null) continue;
+      final indexes =
+          dataStore.tableMetaManager?.getVectorIndexesFor(table.schema) ??
+              const [];
+      for (final index in indexes) {
+        if (index.indexUid.isEmpty) continue;
+        await vim.rewriteEncryptedPages(table, index.indexUid);
+      }
+    }
     await _markDomainDone(dataStore, EncryptionDomain.vectorIndex);
   }
 
@@ -496,6 +544,39 @@ class KeyMigrationRunner {
       if (!info.isDomainDone(domain)) return false;
     }
     return true;
+  }
+
+  /// True when every active rewrite domain (respecting encryption scope) is done.
+  static bool isActiveRewriteComplete(
+    KeyMigrationInfo info,
+    EncryptionConfig? encryptionConfig,
+  ) {
+    for (final domain in EncryptionDomain.values) {
+      if (!EncryptionDomainPolicy.participatesInEncodingKeyMigration(
+        domain,
+        encryptionConfig,
+      )) {
+        continue;
+      }
+      if (!info.isDomainDone(domain)) return false;
+    }
+    return true;
+  }
+
+  static Future<void> _markOutOfScopeDomainsDone(
+    DataStoreImpl dataStore,
+  ) async {
+    final config = dataStore.config.encryptionConfig;
+    for (final domain in EncryptionDomain.values) {
+      if (EncryptionDomainPolicy.isNaturalTurnover(domain)) continue;
+      if (EncryptionDomainPolicy.participatesInEncodingKeyMigration(
+        domain,
+        config,
+      )) {
+        continue;
+      }
+      await _markDomainDone(dataStore, domain);
+    }
   }
 
   static Future<void> _refreshNaturalTurnoverDomains(

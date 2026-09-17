@@ -83,6 +83,23 @@ abstract final class NghIndexMetaFieldId {
   static const int postingPartitionCount = 12;
   static const int postingNextPageNo = 13;
   static const int postingFreeListHeads = 14;
+  static const int layoutVersion = 15;
+  static const int centroidCount = 16;
+  static const int navPartitionCount = 17;
+  static const int navNextPageNo = 18;
+  static const int navFreeListHeads = 19;
+  static const int pdirPartitionCount = 20;
+  static const int pdirNextPageNo = 21;
+  static const int pdirFreeListHeads = 22;
+  static const int pkmapPartitionCount = 23;
+  static const int pkmapNextPageNo = 24;
+  static const int pkmapFreeListHeads = 25;
+  static const int pkmapRootPartition = 26;
+  static const int pkmapRootPage = 27;
+  static const int pkmapHeight = 28;
+  static const int hasPkLocator = 29;
+  static const int pkBackfillPartition = 30;
+  static const int pkBackfillPage = 31;
 }
 
 /// Discriminator for global meta blobs embedded in partition-0 page 0.
@@ -488,6 +505,44 @@ final class NghIndexMetaCodec {
     w.writeVarint(meta.postingNextPageNo);
     _writeIntIntMap(
         w, NghIndexMetaFieldId.postingFreeListHeads, meta.postingFreeListHeads);
+    if (meta.layoutVersion != NghIndexMeta.layoutLegacy) {
+      w.writeFieldTag(NghIndexMetaFieldId.layoutVersion, WireType.varint);
+      w.writeVarint(meta.layoutVersion);
+    }
+    if (meta.centroidCount != 0) {
+      w.writeFieldTag(NghIndexMetaFieldId.centroidCount, WireType.varint);
+      w.writeVarint(meta.centroidCount);
+    }
+    w.writeFieldTag(NghIndexMetaFieldId.navPartitionCount, WireType.varint);
+    w.writeVarint(meta.navPartitionCount);
+    w.writeFieldTag(NghIndexMetaFieldId.navNextPageNo, WireType.varint);
+    w.writeVarint(meta.navNextPageNo);
+    _writeIntIntMap(
+        w, NghIndexMetaFieldId.navFreeListHeads, meta.navFreeListHeads);
+    w.writeFieldTag(NghIndexMetaFieldId.pdirPartitionCount, WireType.varint);
+    w.writeVarint(meta.pdirPartitionCount);
+    w.writeFieldTag(NghIndexMetaFieldId.pdirNextPageNo, WireType.varint);
+    w.writeVarint(meta.pdirNextPageNo);
+    _writeIntIntMap(
+        w, NghIndexMetaFieldId.pdirFreeListHeads, meta.pdirFreeListHeads);
+    w.writeFieldTag(NghIndexMetaFieldId.pkmapPartitionCount, WireType.varint);
+    w.writeVarint(meta.pkmapPartitionCount);
+    w.writeFieldTag(NghIndexMetaFieldId.pkmapNextPageNo, WireType.varint);
+    w.writeVarint(meta.pkmapNextPageNo);
+    _writeIntIntMap(
+        w, NghIndexMetaFieldId.pkmapFreeListHeads, meta.pkmapFreeListHeads);
+    w.writeFieldTag(NghIndexMetaFieldId.pkmapRootPartition, WireType.varint);
+    w.writeZigZag32(meta.pkmapRootPartition);
+    w.writeFieldTag(NghIndexMetaFieldId.pkmapRootPage, WireType.varint);
+    w.writeZigZag32(meta.pkmapRootPage);
+    w.writeFieldTag(NghIndexMetaFieldId.pkmapHeight, WireType.varint);
+    w.writeVarint(meta.pkmapHeight);
+    w.writeFieldTag(NghIndexMetaFieldId.hasPkLocator, WireType.varint);
+    w.writeBool(meta.hasPkLocator);
+    w.writeFieldTag(NghIndexMetaFieldId.pkBackfillPartition, WireType.varint);
+    w.writeVarint(meta.pkBackfillPartition);
+    w.writeFieldTag(NghIndexMetaFieldId.pkBackfillPage, WireType.varint);
+    w.writeVarint(meta.pkBackfillPage);
     return w.view;
   }
 
@@ -511,6 +566,23 @@ final class NghIndexMetaCodec {
     int postingPartitionCount = 1;
     int postingNextPageNo = NghIndexMeta.firstDataPageNo;
     Map<int, int> postingFreeListHeads = const {};
+    int layoutVersion = NghIndexMeta.layoutLegacy;
+    int centroidCount = 0;
+    int navPartitionCount = 1;
+    int navNextPageNo = NghIndexMeta.firstDataPageNo;
+    Map<int, int> navFreeListHeads = const {};
+    int pdirPartitionCount = 1;
+    int pdirNextPageNo = NghIndexMeta.firstDataPageNo;
+    Map<int, int> pdirFreeListHeads = const {};
+    int pkmapPartitionCount = 1;
+    int pkmapNextPageNo = NghIndexMeta.firstDataPageNo;
+    Map<int, int> pkmapFreeListHeads = const {};
+    int pkmapRootPartition = -1;
+    int pkmapRootPage = -1;
+    int pkmapHeight = 0;
+    bool hasPkLocator = false;
+    int pkBackfillPartition = 0;
+    int pkBackfillPage = 0;
 
     while (!reader.isEOF) {
       final (fieldId, wireType) = reader.readFieldTag();
@@ -560,6 +632,57 @@ final class NghIndexMetaCodec {
         case NghIndexMetaFieldId.postingFreeListHeads:
           postingFreeListHeads = _readIntIntMap(reader);
           break;
+        case NghIndexMetaFieldId.layoutVersion:
+          layoutVersion = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.centroidCount:
+          centroidCount = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.navPartitionCount:
+          navPartitionCount = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.navNextPageNo:
+          navNextPageNo = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.navFreeListHeads:
+          navFreeListHeads = _readIntIntMap(reader);
+          break;
+        case NghIndexMetaFieldId.pdirPartitionCount:
+          pdirPartitionCount = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.pdirNextPageNo:
+          pdirNextPageNo = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.pdirFreeListHeads:
+          pdirFreeListHeads = _readIntIntMap(reader);
+          break;
+        case NghIndexMetaFieldId.pkmapPartitionCount:
+          pkmapPartitionCount = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.pkmapNextPageNo:
+          pkmapNextPageNo = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.pkmapFreeListHeads:
+          pkmapFreeListHeads = _readIntIntMap(reader);
+          break;
+        case NghIndexMetaFieldId.pkmapRootPartition:
+          pkmapRootPartition = reader.readZigZag32();
+          break;
+        case NghIndexMetaFieldId.pkmapRootPage:
+          pkmapRootPage = reader.readZigZag32();
+          break;
+        case NghIndexMetaFieldId.pkmapHeight:
+          pkmapHeight = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.hasPkLocator:
+          hasPkLocator = reader.readBool();
+          break;
+        case NghIndexMetaFieldId.pkBackfillPartition:
+          pkBackfillPartition = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.pkBackfillPage:
+          pkBackfillPage = reader.readVarint();
+          break;
         default:
           reader.skipField(wireType);
       }
@@ -594,6 +717,23 @@ final class NghIndexMetaCodec {
       postingPartitionCount: postingPartitionCount,
       postingNextPageNo: postingNextPageNo,
       postingFreeListHeads: postingFreeListHeads,
+      layoutVersion: layoutVersion,
+      centroidCount: centroidCount,
+      navPartitionCount: navPartitionCount,
+      navNextPageNo: navNextPageNo,
+      navFreeListHeads: navFreeListHeads,
+      pdirPartitionCount: pdirPartitionCount,
+      pdirNextPageNo: pdirNextPageNo,
+      pdirFreeListHeads: pdirFreeListHeads,
+      pkmapPartitionCount: pkmapPartitionCount,
+      pkmapNextPageNo: pkmapNextPageNo,
+      pkmapFreeListHeads: pkmapFreeListHeads,
+      pkmapRootPartition: pkmapRootPartition,
+      pkmapRootPage: pkmapRootPage,
+      pkmapHeight: pkmapHeight,
+      hasPkLocator: hasPkLocator,
+      pkBackfillPartition: pkBackfillPartition,
+      pkBackfillPage: pkBackfillPage,
     );
   }
 

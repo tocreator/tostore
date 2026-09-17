@@ -233,11 +233,62 @@ class PathManager {
     );
   }
 
-  /// Synchronous NGH navigating centroid graph file path.
+  /// Synchronous NGH navigating centroid graph file path (layoutVersion=1).
+  /// Read-only after engine v4; new writes use paged [getNghNavPartitionPathByContext].
   String getNghNavGraphPathByContext(TableContext table, IndexUid indexUid) {
     return pathJoin(
       getNghIndexPathByContext(table, indexUid),
       'nav_graph.ngh',
+    );
+  }
+
+  /// Synchronous NGH paged navigating-centroid partition path.
+  String getNghNavPartitionPathByContext(
+    TableContext table,
+    IndexUid indexUid,
+    int partitionNo,
+  ) {
+    final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
+    return pathJoin(
+      _nghPartitionDirPathByContext(table, indexUid, 'nav', dirIndex),
+      'p$partitionNo.ngh',
+    );
+  }
+
+  /// Synchronous NGH posting-page directory partition path.
+  String getNghPdirPartitionPathByContext(
+    TableContext table,
+    IndexUid indexUid,
+    int partitionNo,
+  ) {
+    final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
+    return pathJoin(
+      _nghPartitionDirPathByContext(table, indexUid, 'pdir', dirIndex),
+      'p$partitionNo.ngh',
+    );
+  }
+
+  /// Synchronous NGH PK-locator B+Tree partition path.
+  String getNghPkmapPartitionPathByContext(
+    TableContext table,
+    IndexUid indexUid,
+    int partitionNo,
+  ) {
+    final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
+    return pathJoin(
+      _nghPartitionDirPathByContext(table, indexUid, 'pkmap', dirIndex),
+      'p$partitionNo.ngh',
+    );
+  }
+
+  /// Pending-delete PK set used only while PK locator backfill is incomplete.
+  String getNghPendingDeletePathByContext(
+    TableContext table,
+    IndexUid indexUid,
+  ) {
+    return pathJoin(
+      getNghIndexPathByContext(table, indexUid),
+      'pending_delete.ngh',
     );
   }
 

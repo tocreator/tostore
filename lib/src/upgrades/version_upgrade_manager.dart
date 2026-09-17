@@ -6,6 +6,7 @@ import '../model/result_status.dart';
 import '../model/result_type.dart';
 import 'v2_upgrade.dart';
 import 'v3_upgrade.dart';
+import 'v4_upgrade.dart';
 
 /// Manage database major version upgrades (GlobalConfig / table data).
 /// Each major upgrade should be implemented in separate files under upgrades/
@@ -49,17 +50,19 @@ class VersionUpgradeManager {
         return;
       }
 
-      // 3. Handle Upgrade: Current engine is newer than the database.
+      // One hop to the live engine: pick the oldest format entry that still
+      // applies. V2 already chains V3 and stamps [InternalConfig.engineVersion];
+      // do not run V3/V4 afterwards.
       Logger.info(
         'Database version upgrade required: v$currentVersion -> v$engineVersion',
       );
 
-      if (currentVersion < 2 && engineVersion >= 2) {
-        final v2Upgrade = V2Upgrade(_dataStore);
-        await v2Upgrade.execute(globalConfig);
-      } else if (currentVersion < 3 && engineVersion >= 3) {
-        final v3Upgrade = V3Upgrade(_dataStore);
-        await v3Upgrade.execute(globalConfig);
+      if (currentVersion < 2) {
+        await V2Upgrade(_dataStore).execute(globalConfig);
+      } else if (currentVersion < 3) {
+        await V3Upgrade(_dataStore).execute(globalConfig);
+      } else {
+        await V4Upgrade(_dataStore).execute(globalConfig);
       }
     } catch (e) {
       if (e is DbException) rethrow;

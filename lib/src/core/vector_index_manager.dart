@@ -1,7 +1,12 @@
+import 'dart:async';
+import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:path/path.dart' as p;
+
 import '../handler/logger.dart';
+import '../model/index_entry.dart';
 import '../model/ngh_index_meta.dart';
 import '../model/parallel_journal_entry.dart';
 import '../model/query_result.dart';
@@ -27,6 +32,9 @@ class VectorIndexManager {
   /// Key: "$tableUid/$indexUid", value: the single in-progress Future.
   final Map<String, Future<NghIndexMeta?>> _metaLoadingFutures = {};
 
+  /// Pending-delete PK sets while PK locator backfill is incomplete.
+  final Map<String, Set<String>> _pendingDeleteCache = {};
+
   /// Hot field → vector indexUid resolution cache.
   /// Key: "$tableUid/$fieldName"
   final Map<String, IndexUid?> _fieldIndexUidCache = {};
@@ -35,10 +43,55 @@ class VectorIndexManager {
     _partitionManager = NghPartitionManager(_dataStore);
     _graphEngine = NghGraphEngine(_partitionManager);
     _vectorCache = VectorCache();
-    final indexBudget =
-        _dataStore.resourceManager?.getIndexCacheSize() ?? (64 * 1024 * 1024);
-    // Compact SQ8 cluster cache — keep enough to hold probed clusters warm.
-    _graphEngine.configureClusterCacheBudget((indexBudget * 0.45).round());
+    syncClusterCacheBudget();
+  }
+
+  int _resolveIndexCacheBudget() {
+    final sized = _dataStore.resourceManager?.getIndexCacheSize() ?? 0;
+    if (sized > 0) return sized;
+    return 128 * 1024 * 1024;
+  }
+
+  /// Compact SQ8 search cache share of the index quota.
+  ///
+  /// D=512 ≈ 0.55KB/slot → 55% of a ~300MB index quota holds ~300k vectors.
+  int _compactClusterBudget(int indexBudget) {
+    final fromIndex = max(4 * 1024 * 1024, (indexBudget * 0.55).round());
+    return min(indexBudget, fromIndex);
+  }
+
+  /// Re-apply cache ceilings after ResourceManager computes real quotas.
+  void syncClusterCacheBudget() {
+    final indexBudget = _resolveIndexCacheBudget();
+    _graphEngine
+        .configureClusterCacheBudget(_compactClusterBudget(indexBudget));
+    _partitionManager.syncCacheBudget(indexBudget);
+  }
+
+  /// Serializes layout-1 → paged nav migrate with the first flush that
+  /// still sees a legacy blob (background catch-up vs insert).
+  final Map<String, Future<void>> _navLayoutLocks = {};
+
+  Future<T> _withNavLayoutLock<T>(
+    TableUid tableUid,
+    IndexUid indexUid,
+    Future<T> Function() body,
+  ) async {
+    final key = '${tableUid.value}/${indexUid.value}';
+    final prev = _navLayoutLocks[key];
+    final gate = Completer<void>();
+    _navLayoutLocks[key] = gate.future;
+    if (prev != null) {
+      await prev;
+    }
+    try {
+      return await body();
+    } finally {
+      gate.complete();
+      if (identical(_navLayoutLocks[key], gate.future)) {
+        _navLayoutLocks.remove(key);
+      }
+    }
   }
 
   IndexUid? _resolveVectorIndexUid(TableContext table, String fieldName) {
@@ -111,6 +164,7 @@ class VectorIndexManager {
   Future<void> writeChanges({
     required TableContext table,
     List<Map<String, dynamic>> inserts = const [],
+    List<IndexRecordUpdate> updates = const [],
     List<Map<String, dynamic>> deletes = const [],
     BatchContext? batchContext,
     int? concurrency,
@@ -147,14 +201,76 @@ class VectorIndexManager {
         continue;
       }
 
-      // Load or create meta
       var meta =
           await _getOrCreateMeta(table, indexUid, fieldName, fieldSchema, idx);
 
-      // -- Process inserts --
-      if (inserts.isNotEmpty) {
+      final insertRecords = <Map<String, dynamic>>[...inserts];
+      final deleteRecords = <Map<String, dynamic>>[...deletes];
+      for (final update in updates) {
+        final changed = update.changedFields;
+        final fieldChanged = changed == null ||
+            changed.contains(fieldName) ||
+            changed.contains(pkName);
+        if (!fieldChanged) continue;
+        final oldRow = <String, dynamic>{
+          ...?update.oldValues,
+          pkName: update.primaryKey,
+        };
+        deleteRecords.add(oldRow);
+        insertRecords.add({
+          ...update.newValues,
+          pkName: update.primaryKey,
+        });
+      }
+
+      if (deleteRecords.isNotEmpty) {
+        final deletePks = <String>[];
+        for (final row in deleteRecords) {
+          final pk = row[pkName]?.toString();
+          if (pk != null && pk.isNotEmpty) deletePks.add(pk);
+        }
+        if (deletePks.isNotEmpty) {
+          Future<void> flushDelete() async {
+            var liveMeta = _vectorCache.getMeta(table, indexUid) ?? meta;
+            final result = await _graphEngine.deleteBatch(
+              table: table,
+              indexUid: indexUid,
+              meta: liveMeta,
+              primaryKeys: deletePks,
+            );
+            meta = result.meta;
+            if (result.unresolvedPks.isNotEmpty) {
+              await _mergePendingDeletes(table, indexUid, result.unresolvedPks);
+            }
+            meta = await _partitionManager.writeChanges(
+              table: table,
+              indexUid: indexUid,
+              meta: meta,
+              dirtyPostingPages: result.dirtyPostingPages,
+              dirtyNavPages: result.dirtyNavPages,
+              dirtyPdirPages: result.dirtyPdirPages,
+              dirtyPkmapPages: result.dirtyPkmapPages,
+              deleteLegacyNavGraph: result.deleteLegacyNavGraph,
+              vectorsDelta: -result.deletedCount,
+              deletedDelta: result.deletedCount,
+              batchContext: batchContext,
+              concurrency: concurrency,
+            );
+          }
+
+          if (!meta.isPagedLayout) {
+            await migrateLegacyNavIfNeeded(table, indexUid);
+            meta = _vectorCache.getMeta(table, indexUid) ??
+                await _loadMeta(table, indexUid) ??
+                meta;
+          }
+          await flushDelete();
+        }
+      }
+
+      if (insertRecords.isNotEmpty) {
         final preparedVectors = await _prepareInsertVectorsBatch(
-          records: inserts,
+          records: insertRecords,
           fieldName: fieldName,
           primaryKeyField: pkName,
           dimensions: meta.dimensions,
@@ -163,69 +279,63 @@ class VectorIndexManager {
         final pks = preparedVectors.primaryKeys;
 
         if (vectors.isNotEmpty) {
-          // NGH Stream insert: online SQ8 quantization + dynamic single-bucket split
-          final insertResult = await _graphEngine.insertBatch(
-            table: table,
-            indexUid: indexUid,
-            meta: meta,
-            vectors: vectors,
-            primaryKeys: pks,
-            yieldBudgetMs: 100,
-          );
-          meta = insertResult.meta;
-          meta = await _partitionManager.writeChanges(
-            table: table,
-            indexUid: indexUid,
-            meta: meta,
-            dirtyPostingPages: insertResult.dirtyPostingPages,
-            navGraphPage: insertResult.navGraphPage,
-            vectorsDelta: insertResult.insertedCount,
-            concurrency: concurrency,
-          );
-
-          // Persist updated meta
-          await _persistMeta(table, indexUid, meta);
-        }
-      }
-
-      // -- Process deletes --
-      if (deletes.isNotEmpty) {
-        final deletePks = <String>[];
-        final delYc = YieldController(
-          'VectorIndexManager.writeChanges.deletes',
-          checkInterval: 20,
-          budgetMs: 30,
-        );
-        for (var di = 0; di < deletes.length; di++) {
-          final y5 = delYc.maybeYield();
-          if (y5 != null) await y5;
-          final pk = deletes[di][pkName]?.toString();
-          if (pk != null && pk.isNotEmpty) {
-            deletePks.add(pk);
+          Future<void> flushInsert() async {
+            var liveMeta = _vectorCache.getMeta(table, indexUid) ?? meta;
+            final insertResult = await _graphEngine.insertBatch(
+              table: table,
+              indexUid: indexUid,
+              meta: liveMeta,
+              vectors: vectors,
+              primaryKeys: pks,
+              yieldBudgetMs: 100,
+            );
+            meta = insertResult.meta;
+            meta = await _partitionManager.writeChanges(
+              table: table,
+              indexUid: indexUid,
+              meta: meta,
+              dirtyPostingPages: insertResult.dirtyPostingPages,
+              dirtyNavPages: insertResult.dirtyNavPages,
+              dirtyPdirPages: insertResult.dirtyPdirPages,
+              dirtyPkmapPages: insertResult.dirtyPkmapPages,
+              deleteLegacyNavGraph: insertResult.deleteLegacyNavGraph,
+              vectorsDelta: insertResult.insertedCount,
+              concurrency: concurrency,
+              batchContext: batchContext,
+            );
+            await _removePendingDeletes(table, indexUid, pks);
+            if (insertResult.needsCompactGapFill) {
+              final remain = max(
+                0,
+                _graphEngine.clusterCacheMaxBytes -
+                    _graphEngine.clusterCacheBytes,
+              );
+              if (remain > 0 && !_dataStore.shouldAbortBackgroundScan) {
+                await _graphEngine.prewarmClusters(
+                  table: table,
+                  indexUid: indexUid,
+                  meta: meta,
+                  maxBytes: remain,
+                  shouldAbort: () => _dataStore.shouldAbortBackgroundScan,
+                );
+              }
+            }
           }
-        }
 
-        if (deletePks.isNotEmpty) {
-          final result = await _graphEngine.deleteBatch(
-            table: table,
-            indexUid: indexUid,
-            meta: meta,
-            primaryKeys: deletePks,
-          );
-
-          meta = await _partitionManager.writeChanges(
-            table: table,
-            indexUid: indexUid,
-            meta: meta,
-            dirtyPostingPages: result.dirtyPostingPages,
-            deletedDelta: result.deletedCount,
-            batchContext: batchContext,
-            concurrency: concurrency,
-          );
+          if (!meta.isPagedLayout) {
+            await migrateLegacyNavIfNeeded(table, indexUid);
+            meta = _vectorCache.getMeta(table, indexUid) ??
+                await _loadMeta(table, indexUid) ??
+                meta;
+          }
+          await flushInsert();
         }
       }
 
-      // Persist updated meta
+      if (!meta.hasPkLocator) {
+        meta = await _runPkBackfill(table, indexUid, meta);
+      }
+
       await _persistMeta(table, indexUid, meta);
       _vectorCache.putMeta(table, indexUid, meta);
     }
@@ -250,14 +360,11 @@ class VectorIndexManager {
     if (indexUid == null) return const [];
 
     var meta = _vectorCache.getMeta(table, indexUid);
-    if (meta == null) {
-      final navPrefetch = _graphEngine.prefetchNavGraph(table, indexUid);
-      meta = await _loadMeta(table, indexUid);
-      await navPrefetch;
-    }
+    meta ??= await _loadMeta(table, indexUid);
     if (meta == null || meta.isBuilding || meta.totalVectors == 0) {
       return const [];
     }
+    await _graphEngine.prefetchNavGraph(table, indexUid, meta: meta);
 
     final rawValues = queryVector.values;
     final Float32List queryF32;
@@ -271,6 +378,8 @@ class VectorIndexManager {
     final searchQuery =
         alreadyNormalized ? _normalizeFloat32(queryF32) : queryF32;
 
+    final pending =
+        meta.hasPkLocator ? null : await _loadPendingDeletes(table, indexUid);
     final results = await _graphEngine.search(
       table: table,
       indexUid: indexUid,
@@ -280,6 +389,7 @@ class VectorIndexManager {
       searchDepth: searchDepth,
       distanceThreshold: distanceThreshold,
       queryAlreadyNormalized: alreadyNormalized,
+      pendingDeletePks: pending,
     );
     if (results.isEmpty) {
       return const [];
@@ -312,13 +422,12 @@ class VectorIndexManager {
     try {
       if (_dataStore.shouldAbortBackgroundScan) return 0;
 
-      final navPrefetch = _graphEngine.prefetchNavGraph(table, indexUid);
       final meta = await _loadMeta(table, indexUid);
-      await navPrefetch;
       if (_dataStore.shouldAbortBackgroundScan) return 0;
       if (meta == null || meta.isBuilding || meta.totalVectors <= 0) {
         return 0;
       }
+      await _graphEngine.prefetchNavGraph(table, indexUid, meta: meta);
 
       final budget = maxBytes ?? _defaultPrewarmBudget();
       if (budget <= 0) return 0;
@@ -348,6 +457,62 @@ class VectorIndexManager {
       );
       return 0;
     }
+  }
+
+  /// Convert leftover `nav_graph.ngh` to paged nav/pdir, or drop a stale blob.
+  ///
+  /// No-op when [NghIndexMeta.isPagedLayout] and the legacy blob is absent.
+  /// Does not rewrite posting slots.
+  Future<void> migrateLegacyNavIfNeeded(
+    TableContext table,
+    IndexUid indexUid,
+  ) async {
+    await _withNavLayoutLock(table.tableUid, indexUid, () async {
+      var meta = await _loadMeta(table, indexUid);
+      if (meta == null) return;
+      if (meta.isPagedLayout) {
+        await _partitionManager.deleteLegacyNavBlobIfExists(table, indexUid);
+        return;
+      }
+      final blob =
+          await _partitionManager.readLegacyNavGraphBlob(table, indexUid);
+      if (blob != null) {
+        final migrated = await _partitionManager.migrateLegacyNavGraph(
+          table: table,
+          indexUid: indexUid,
+          meta: meta,
+          blob: blob,
+        );
+        meta = await _partitionManager.writeChanges(
+          table: table,
+          indexUid: indexUid,
+          meta: migrated.meta,
+          dirtyNavPages: migrated.nav,
+          dirtyPdirPages: migrated.pdir,
+          deleteLegacyNavGraph: true,
+        );
+        await _persistMeta(table, indexUid, meta);
+        _vectorCache.putMeta(table, indexUid, meta);
+        return;
+      }
+      // Blob already gone but meta still layout 1 (crash after delete, or
+      // p0 meta not flushed). Promote if paged nav pages are readable.
+      final orphan = await _partitionManager.readNavCentroidPage(
+        table,
+        indexUid,
+        const NghPagePtr(NghDataCategory.nav, 0, NghIndexMeta.firstDataPageNo),
+      );
+      if (orphan == null || orphan.centroids.isEmpty) return;
+      final graph =
+          await _partitionManager.readPagedNavGraph(table, indexUid, null);
+      if (graph == null || graph.centroids.isEmpty) return;
+      meta = meta.copyWith(
+        layoutVersion: NghIndexMeta.layoutPaged,
+        centroidCount: graph.centroids.length,
+      );
+      await _persistMeta(table, indexUid, meta);
+      _vectorCache.putMeta(table, indexUid, meta);
+    });
   }
 
   int _defaultPrewarmBudget() {
@@ -551,6 +716,14 @@ class VectorIndexManager {
       var meta = _vectorCache.getMeta(table, indexUid);
       meta ??= await _loadMeta(table, indexUid);
       if (meta == null) continue;
+      if (!meta.isPagedLayout) {
+        await migrateLegacyNavIfNeeded(table, indexUid);
+        meta = _vectorCache.getMeta(table, indexUid) ??
+            await _loadMeta(table, indexUid);
+        if (meta == null || !meta.isPagedLayout) continue;
+      } else {
+        await _partitionManager.deleteLegacyNavBlobIfExists(table, indexUid);
+      }
 
       // Skip if deletion ratio is low (< 10%)
       if (meta.totalVectors == 0 ||
@@ -565,12 +738,21 @@ class VectorIndexManager {
         maxVisitedPages: maxVisitedPages,
       );
 
-      if (result.dirtyPostingPages.isNotEmpty) {
+      if (result.dirtyPostingPages.isNotEmpty ||
+          result.dirtyNavPages.isNotEmpty ||
+          result.dirtyPdirPages.isNotEmpty ||
+          result.dirtyPkmapPages.isNotEmpty ||
+          result.freePostingPages.isNotEmpty) {
+        meta = result.meta;
         meta = await _partitionManager.writeChanges(
           table: table,
           indexUid: indexUid,
           meta: meta,
           dirtyPostingPages: result.dirtyPostingPages,
+          dirtyNavPages: result.dirtyNavPages,
+          dirtyPdirPages: result.dirtyPdirPages,
+          dirtyPkmapPages: result.dirtyPkmapPages,
+          freePostingPages: result.freePostingPages,
           deletedDelta: -result.compactedCount,
         );
         await _persistMeta(table, indexUid, meta);
@@ -628,11 +810,169 @@ class VectorIndexManager {
     _vectorCache.clear();
     _partitionManager.clearPageCacheSync();
     _graphEngine.clearCache();
+    _pendingDeleteCache.clear();
+  }
+
+  /// Re-encrypt NGH TPG2 pages for key migration (nav/pdir/pkmap/posting).
+  Future<void> rewriteEncryptedPages(
+    TableContext table,
+    IndexUid indexUid,
+  ) async {
+    final meta = _vectorCache.getMeta(table, indexUid) ??
+        await _loadMeta(table, indexUid);
+    if (meta == null) return;
+    await _partitionManager.rewriteEncryptedPages(table, indexUid, meta);
   }
 
   // =====================================================================
   // Private Helpers
   // =====================================================================
+
+  String _pendingKey(TableUid tableUid, IndexUid indexUid) =>
+      '${tableUid.value}/${indexUid.value}';
+
+  String _pendingPath(TableContext table, IndexUid indexUid) =>
+      _dataStore.pathManager.getNghPendingDeletePathByContext(table, indexUid);
+
+  Future<Set<String>> _loadPendingDeletes(
+    TableContext table,
+    IndexUid indexUid,
+  ) async {
+    final cacheKey = _pendingKey(table.tableUid, indexUid);
+    final cached = _pendingDeleteCache[cacheKey];
+    if (cached != null) return cached;
+    final path = _pendingPath(table, indexUid);
+    try {
+      if (!await _dataStore.storage.existsFile(path)) {
+        final empty = <String>{};
+        _pendingDeleteCache[cacheKey] = empty;
+        return empty;
+      }
+      final bytes = await _dataStore.storage.readAsBytes(path);
+      final set = _decodePendingDeletes(bytes);
+      _pendingDeleteCache[cacheKey] = set;
+      return set;
+    } catch (_) {
+      final empty = <String>{};
+      _pendingDeleteCache[cacheKey] = empty;
+      return empty;
+    }
+  }
+
+  Future<void> _persistPendingDeletes(
+    TableContext table,
+    IndexUid indexUid,
+    Set<String> pks,
+  ) async {
+    final cacheKey = _pendingKey(table.tableUid, indexUid);
+    _pendingDeleteCache[cacheKey] = pks;
+    final path = _pendingPath(table, indexUid);
+    if (pks.isEmpty) {
+      try {
+        if (await _dataStore.storage.existsFile(path)) {
+          await _dataStore.storage.deleteFile(path);
+        }
+      } catch (_) {}
+      return;
+    }
+    await _dataStore.storage.ensureDirectoryExists(p.dirname(path));
+    await _dataStore.storage.writeAsBytes(path, _encodePendingDeletes(pks));
+  }
+
+  Future<void> _mergePendingDeletes(
+    TableContext table,
+    IndexUid indexUid,
+    List<String> extra,
+  ) async {
+    if (extra.isEmpty) return;
+    final current = await _loadPendingDeletes(table, indexUid);
+    current.addAll(extra);
+    await _persistPendingDeletes(table, indexUid, current);
+  }
+
+  Future<void> _removePendingDeletes(
+    TableContext table,
+    IndexUid indexUid,
+    List<String> pks,
+  ) async {
+    if (pks.isEmpty) return;
+    final current = await _loadPendingDeletes(table, indexUid);
+    if (current.isEmpty) return;
+    var changed = false;
+    for (final pk in pks) {
+      if (current.remove(pk)) changed = true;
+    }
+    if (changed) {
+      await _persistPendingDeletes(table, indexUid, current);
+    }
+  }
+
+  Uint8List _encodePendingDeletes(Set<String> pks) {
+    final encoded = [for (final pk in pks) utf8.encode(pk)];
+    var total = 4;
+    for (final e in encoded) {
+      total += 4 + e.length;
+    }
+    final out = Uint8List(total);
+    final bd = ByteData.sublistView(out);
+    bd.setUint32(0, encoded.length, Endian.little);
+    var off = 4;
+    for (final e in encoded) {
+      bd.setUint32(off, e.length, Endian.little);
+      off += 4;
+      out.setRange(off, off + e.length, e);
+      off += e.length;
+    }
+    return out;
+  }
+
+  Set<String> _decodePendingDeletes(Uint8List bytes) {
+    if (bytes.length < 4) return <String>{};
+    final bd = ByteData.sublistView(bytes);
+    final n = bd.getUint32(0, Endian.little);
+    var off = 4;
+    final out = <String>{};
+    for (int i = 0; i < n; i++) {
+      if (off + 4 > bytes.length) break;
+      final len = bd.getUint32(off, Endian.little);
+      off += 4;
+      if (len < 0 || off + len > bytes.length) break;
+      out.add(utf8.decode(bytes.sublist(off, off + len)));
+      off += len;
+    }
+    return out;
+  }
+
+  Future<NghIndexMeta> _runPkBackfill(
+    TableContext table,
+    IndexUid indexUid,
+    NghIndexMeta meta,
+  ) async {
+    final pending = await _loadPendingDeletes(table, indexUid);
+    final result = await _graphEngine.backfillPkLocator(
+      table: table,
+      indexUid: indexUid,
+      meta: meta,
+      pendingDeletePks: pending,
+    );
+    var next = result.meta;
+    if (result.dirtyPostingPages.isNotEmpty ||
+        result.dirtyPkmapPages.isNotEmpty) {
+      next = await _partitionManager.writeChanges(
+        table: table,
+        indexUid: indexUid,
+        meta: next,
+        dirtyPostingPages: result.dirtyPostingPages,
+        dirtyPkmapPages: result.dirtyPkmapPages,
+        vectorsDelta: -result.tombstonedCount,
+        deletedDelta: result.tombstonedCount,
+      );
+    }
+    if (next.hasPkLocator) {
+      await _persistPendingDeletes(table, indexUid, <String>{});
+    }
+    return next;
+  }
 
   /// Convert double list to Float32List, ensuring correct dimensions.
   Float32List _toFloat32(List<dynamic> values, int dimensions) {

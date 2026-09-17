@@ -1694,6 +1694,38 @@ class WalManager {
     await persistMeta(flush: true, backupOld: partitionChanged);
   }
 
+  /// Durable flush completion: move [WalMeta.checkpoint] and drop the pending
+  /// batch in **one** meta persist.
+  ///
+  /// Table pages are already flushed. A crash between two separate writes used
+  /// to leave checkpoint at [checkpoint] while the batch handle still existed,
+  /// so the next start would reflush already-durable rows.
+  Future<void> completePendingFlushBatch({
+    required String batchId,
+    required WalPointer checkpoint,
+  }) async {
+    var backupOld = false;
+    if (checkpoint.partitionIndex >= 0) {
+      if (_meta.checkpoint != checkpoint) {
+        backupOld =
+            _meta.checkpoint.partitionIndex != checkpoint.partitionIndex;
+        _meta.checkpoint = checkpoint;
+        _pruneTableOpsUpToCheckpoint();
+      }
+      final recoveredSize = await _tailFileSizeForPointer(checkpoint);
+      _meta = _meta.copyWith(
+        lastRecoveredPointer: checkpoint,
+        lastRecoveredTailFileSize: recoveredSize,
+      );
+    }
+    _meta.pendingBatches.removeWhere((b) => b.batchId == batchId);
+    await persistMeta(
+      flush: true,
+      backupOld: backupOld,
+      throwOnError: true,
+    );
+  }
+
   /// Gracefully synchronize checkpoint and recovery hint on shutdown.
   ///
   /// Zero-I/O Optimization:
@@ -1819,8 +1851,8 @@ class WalManager {
         _meta.existingEndPartitionIndex < 0) {
       return;
     }
-    // Maintenance batches may not contribute excludeRanges; never wipe WAL
-    // while recovery still holds a pending-batch handle.
+    // A pending flush batch still needs WAL bytes until table IO completes.
+    // Never wipe WAL while recovery still holds a pending-batch handle.
     if (_meta.pendingBatches.isNotEmpty) {
       return;
     }

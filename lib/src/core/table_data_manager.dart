@@ -508,6 +508,7 @@ class TableDataManager {
   /// Remove record count cache for a table.
   void removeRecordCountCache(TableContext table) {
     _tableRecordCounts.remove(table.tableUid);
+    _recordCountLoadingFutures.remove(table.tableUid);
   }
 
   /// Remove record count cache for all tables.
@@ -687,6 +688,10 @@ class TableDataManager {
   void invalidateTableDataMetaCacheForTable(TableContext table) {
     _tableDataMetaCache.remove(table.tableUid);
     _metaLoadingFutures.remove(table.tableUid);
+    // Redo / base-total rollback rewrite page0; a stale count cache would
+    // then be incremented again by buffer replay (visible 2x until restart).
+    _tableRecordCounts.remove(table.tableUid);
+    _recordCountLoadingFutures.remove(table.tableUid);
   }
 
   // -------------------- SpaceStats (KV-backed aggregates) --------------------

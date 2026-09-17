@@ -98,9 +98,15 @@ class BatchContext {
   final String batchId;
   final BatchType batchType;
 
+  /// Recovery reflush of an existing pending batch. Replay already applied
+  /// `page_redo_$batchId.log`; persist must not append more chunks (a later
+  /// crash/error would otherwise grow that file without bound).
+  final bool skipPageRedoRecord;
+
   const BatchContext({
     required this.batchId,
     required this.batchType,
+    this.skipPageRedoRecord = false,
   });
 
   factory BatchContext.flush(String batchId) {
@@ -113,18 +119,23 @@ class BatchContext {
 
   String get batchTypeString => batchType.value;
 
+  /// Whether persist paths may append this batch's page redo log.
+  bool get recordsPageRedo => !skipPageRedoRecord;
+
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
       other is BatchContext &&
           runtimeType == other.runtimeType &&
           batchId == other.batchId &&
-          batchType == other.batchType;
+          batchType == other.batchType &&
+          skipPageRedoRecord == other.skipPageRedoRecord;
 
   @override
-  int get hashCode => batchId.hashCode ^ batchType.hashCode;
+  int get hashCode => Object.hash(batchId, batchType, skipPageRedoRecord);
 
   @override
   String toString() =>
-      'BatchContext(batchId: $batchId, batchType: ${batchType.value})';
+      'BatchContext(batchId: $batchId, batchType: ${batchType.value}'
+      '${skipPageRedoRecord ? ', skipPageRedoRecord' : ''})';
 }

@@ -477,7 +477,9 @@ class V3Upgrade {
       hasLegacyJsonKv: true,
     );
     if (!skipVersionBump) {
-      updatedGlobal = updatedGlobal.setVersion(InternalConfig.engineVersion);
+      updatedGlobal = updatedGlobal.copyWith(
+        version: InternalConfig.engineVersion,
+      );
     }
     await _dataStore.saveGlobalConfig(
       updatedGlobal,

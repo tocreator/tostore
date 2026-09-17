@@ -3285,6 +3285,7 @@ class IndexManager {
             ? _dataStore.vectorIndexManager!.writeChanges(
                 table: table,
                 inserts: inserts,
+                updates: updates,
                 deletes: deletes,
                 batchContext: batchContext,
                 concurrency: concurrency,

@@ -395,18 +395,17 @@ final class TreeMetaPageService {
   }
 
   /// Batch id usable for page redo: must already be in WAL `pendingBatches`
-  /// (or currently active under that registration). Empty / invented ids are
-  /// rejected -- orphan `page_redo_*.log` files are not a recovery signal.
+  /// (or currently active under that registration). Empty / invented ids and
+  /// recovery batches with [BatchContext.skipPageRedoRecord] are rejected.
   String? _resolveRegisteredBatchId(BatchContext? batchContext) {
     if (!_config.enableJournal) return null;
-    if (batchContext != null && batchContext.batchId.isNotEmpty) {
-      return batchContext.batchId;
+    final ctx = (batchContext != null && batchContext.batchId.isNotEmpty)
+        ? batchContext
+        : _dataStore.parallelJournalManager.activeBatchContext;
+    if (ctx == null || ctx.batchId.isEmpty || !ctx.recordsPageRedo) {
+      return null;
     }
-    final active = _dataStore.parallelJournalManager.activeBatchContext;
-    if (active != null && active.batchId.isNotEmpty) {
-      return active.batchId;
-    }
-    return null;
+    return ctx.batchId;
   }
 
   /// Parse partition-local stats from a full on-disk page image.

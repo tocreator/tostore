@@ -290,6 +290,30 @@ class ParallelJournalManager {
     return null;
   }
 
+  /// Later of two real WAL pointers on the partition ring.
+  static WalPointer _laterWalPointer(WalPointer a, WalPointer b, int cycle) {
+    if (a.partitionIndex < 0) return b;
+    if (b.partitionIndex < 0) return a;
+    if (cycle <= 0) return a;
+    return b.isNewerThan(a, cycle) ? b : a;
+  }
+
+  /// Scan start for generic WAL replay: durable checkpoint, or the recovered
+  /// flush batch's [PendingParallelBatch.end] when that is further ahead.
+  ///
+  /// The temporary pointer is never written to [WalMeta.checkpoint].
+  static WalPointer _replayStartCheckpoint(
+    WalPointer durable,
+    WalPointer? recoveredFlushEnd,
+    int cycle,
+  ) {
+    if (recoveredFlushEnd == null || recoveredFlushEnd.partitionIndex < 0) {
+      return durable;
+    }
+    if (durable.partitionIndex < 0) return recoveredFlushEnd;
+    return _laterWalPointer(durable, recoveredFlushEnd, cycle);
+  }
+
   /// Enqueue-path backpressure for [WriteBufferManager].
   ///
   /// Returns `null` on the hot path (normal pressure state / healthy system memory).
@@ -361,10 +385,12 @@ class ParallelJournalManager {
       }
     } catch (_) {}
 
-    // Reconcile incomplete pending batches: load flush WAL ranges into buffer
-    // first; do not start recovery flush until _recoverFromWal finishes, so the
+    // Reconcile incomplete pending batches: load flush WAL into buffer first;
+    // do not start recovery flush until _recoverFromWal finishes, so the
     // recovery pump cannot interleave with unrelated WAL-replayed queue entries.
-    List<_WalRange>? excludeRanges;
+    // A loaded flush batch returns its end as a temporary replay checkpoint so
+    // generic WAL replay starts after that span (durable checkpoint is unchanged).
+    WalPointer? replayCheckpoint;
     List<Future<void> Function()> recoveryFlushTasks = const [];
     _startupWalDecodeCache = <int, List<Map<String, dynamic>>>{};
     _recoveryFieldCache = <String, TableUid>{};
@@ -373,11 +399,11 @@ class ParallelJournalManager {
     try {
       if (_walManager.hasPendingParallelBatches) {
         final reconciled = await _reconcileWithParallelJournal();
-        excludeRanges = reconciled.excludeRanges;
+        replayCheckpoint = reconciled.replayCheckpoint;
         recoveryFlushTasks = reconciled.flushTasks;
       }
       // Then recover remaining WAL entries into in-memory buffer/queue
-      await _recoverFromWal(excludeRanges: excludeRanges);
+      await _recoverFromWal(replayCheckpoint: replayCheckpoint);
 
       if (recoveryFlushTasks.isNotEmpty) {
         _executeRecoveryFlushChain(recoveryFlushTasks);
@@ -725,7 +751,12 @@ class ParallelJournalManager {
         // every tiny batch immediately while still bounding latency.
         // In drain mode (close/switch space) or when immediate flush is requested,
         // ignore this and ensure the queue is fully flushed.
-        if (!drainCompletely && !_immediateFlushRequested) {
+        // Recovery reflush must pop the restored batch as-is. Waiting for a
+        // "full" online batch can merge live inserts after open() returns
+        // (start() does not await the recovery chain).
+        if (!drainCompletely &&
+            !_immediateFlushRequested &&
+            recoveryBatchContext == null) {
           final currentSize = _bufferManager.queueLength;
           if (currentSize < batchSize) {
             await _waitTailFillWhileGrowing(
@@ -1439,9 +1470,10 @@ class ParallelJournalManager {
             await _dataStore.storage.flushAll();
           } catch (_) {}
 
-          await _walManager.advanceCheckpoint(endPtr);
-          await _walManager
-              .removePendingParallelBatch(currentBatchContext.batchId);
+          await _walManager.completePendingFlushBatch(
+            batchId: currentBatchContext.batchId,
+            checkpoint: endPtr,
+          );
           await _deletePageRedoLogIfExists(currentBatchContext.batchId);
           await _walManager.cleanupObsoletePartitions();
 
@@ -1524,7 +1556,7 @@ class ParallelJournalManager {
     } catch (_) {}
   }
 
-  Future<void> _recoverFromWal({List<_WalRange>? excludeRanges}) async {
+  Future<void> _recoverFromWal({WalPointer? replayCheckpoint}) async {
     // Block online flush for the whole replay window. Without this, mid-replay
     final heldRecoveringFlag = _isRecovering;
     _isRecovering = true;
@@ -1551,7 +1583,22 @@ class ParallelJournalManager {
       // (single getFileSize check, no file content read).
       if (await _walManager.tryFastPathSkipRecovery()) return;
 
-      final checkpoint = meta.checkpoint;
+      final cap = _dataStore.config.logPartitionCycle;
+      if (cap <= 0) {
+        Logger.error(
+          'WAL recovery: invalid logPartitionCycle=$cap, skipping replay',
+        );
+        return;
+      }
+
+      final durableCheckpoint = meta.checkpoint;
+      final checkpoint = _replayStartCheckpoint(
+        durableCheckpoint,
+        replayCheckpoint,
+        cap,
+      );
+      final flushBatchOwnsReplay =
+          replayCheckpoint != null && replayCheckpoint.partitionIndex >= 0;
 
       // Fast-path: if checkpoint partition equals tail partition, only need last pointer
       // in the cycle, we know there is unprocessed WAL without examining entry
@@ -1565,20 +1612,20 @@ class ParallelJournalManager {
             tailLastPtr.entrySeq <= checkpoint.entrySeq) {
           final ptr = tailLastPtr ?? checkpoint;
           _walManager.updateCurrentPointerAfterRecovery(ptr);
-          try {
-            await _walManager.setLastRecoveredPointer(ptr, flush: true);
-          } catch (_) {}
+          // lastRecovered may skip the next start: only persist it when the
+          // durable WAL-meta checkpoint already covers the tail. A temporary
+          // flush-batch end is memory-only until table IO completes.
+          if (durableCheckpoint.partitionIndex == tailP &&
+              (tailLastPtr == null ||
+                  tailLastPtr.entrySeq <= durableCheckpoint.entrySeq)) {
+            try {
+              await _walManager.setLastRecoveredPointer(ptr, flush: true);
+            } catch (_) {}
+          }
           return;
         }
       }
 
-      final cap = _dataStore.config.logPartitionCycle;
-      if (cap <= 0) {
-        Logger.error(
-          'WAL recovery: invalid logPartitionCycle=$cap, skipping replay',
-        );
-        return;
-      }
       final startP = normalizeWalPartitionIndex(checkpoint.partitionIndex, cap);
       final partitions = await _walManager.listPartitionsToScan(
         checkpoint.partitionIndex,
@@ -1628,16 +1675,8 @@ class ParallelJournalManager {
         final y4 = partitionYieldController.maybeYield();
         if (y4 != null) await y4;
 
-        // Pending-batch reconcile already loaded fully-covered partitions.
-        if (excludeRanges != null &&
-            excludeRanges.isNotEmpty &&
-            _isPartitionFullyExcluded(p, excludeRanges, cap)) {
-          continue;
-        }
-
-        final int toSkip = p == startP
-            ? meta.checkpoint.entrySeq
-            : 0; // skip already processed
+        final int toSkip =
+            p == startP ? checkpoint.entrySeq : 0; // skip already processed
         int seq = toSkip;
         try {
           // Reuse startup decode cache before touching disk when possible.
@@ -1685,23 +1724,6 @@ class ParallelJournalManager {
 
             final ptr = WalPointer(partitionIndex: p, entrySeq: seq);
 
-            // Skip entries that were already handled by parallel journal reconciliation
-            // to avoid duplicate data in buffer and incorrect record count stats.
-            if (excludeRanges != null && excludeRanges.isNotEmpty) {
-              bool inExclude = false;
-              for (final range in excludeRanges) {
-                final bool afterStart =
-                    ptr == range.start || ptr.isNewerThan(range.start, cap);
-                if (!afterStart) continue;
-                final bool beforeEnd =
-                    ptr == range.end || !ptr.isNewerThan(range.end, cap);
-                if (beforeEnd) {
-                  inExclude = true;
-                  break;
-                }
-              }
-              if (inExclude) continue;
-            }
             // Update last seen WAL pointer for reconstruction of current.
             lastPartition = p;
             lastSeq = seq;
@@ -1803,13 +1825,11 @@ class ParallelJournalManager {
           WalPointer(partitionIndex: lastPartition, entrySeq: lastSeq);
       _walManager.updateCurrentPointerAfterRecovery(lastPtr);
 
-      // No effective entries outside pending-batch ranges: only wipe WAL when
-      // nothing remains to flush. Pending-batch data is already in the buffer
-      // and still needs the underlying WAL until recovery flush completes.
+      // No effective entries after the replay start: only wipe WAL when
+      // nothing remains to flush. A loaded flush batch is already in the
+      // buffer and still needs the underlying WAL until table IO completes.
       if (!hasEffectiveEntry) {
-        final hasPendingBatchRanges =
-            excludeRanges != null && excludeRanges.isNotEmpty;
-        if (!hasPendingBatchRanges) {
+        if (!flushBatchOwnsReplay) {
           try {
             await _walManager.clearWalPartitionsAndResetMeta();
           } catch (_) {}
@@ -1865,13 +1885,14 @@ class ParallelJournalManager {
 
   Future<
       ({
-        List<_WalRange> excludeRanges,
+        WalPointer? replayCheckpoint,
         List<Future<void> Function()> flushTasks
       })> _reconcileWithParallelJournal() async {
-    final excludeRanges = <_WalRange>[];
+    WalPointer? replayCheckpoint;
     final tasks = <Future<void> Function()>[];
     try {
       _isRecovering = true; // Mark as recovering
+      final cap = _dataStore.config.logPartitionCycle;
       final batches =
           List<PendingParallelBatch>.from(_walManager.meta.pendingBatches)
             ..sort((a, b) => a.createdAt.compareTo(b.createdAt));
@@ -1881,12 +1902,12 @@ class ParallelJournalManager {
         final task = await _recoverPendingBatch(b);
         if (task != null) {
           tasks.add(task);
-          // Only exclude ranges for FLUSH batches that were actually loaded into buffer.
-          // Maintenance batches do not load record data into buffer.
-          if (b.batchType == BatchType.flush &&
-              b.start.partitionIndex >= 0 &&
-              b.end.partitionIndex >= 0) {
-            excludeRanges.add(_WalRange(b.start, b.end));
+          // Flush batches own table/index/WAL rows. Maintenance is metadata
+          // redo only and must not move the WAL replay start.
+          if (b.batchType == BatchType.flush && b.end.partitionIndex >= 0) {
+            replayCheckpoint = replayCheckpoint == null
+                ? b.end
+                : _laterWalPointer(replayCheckpoint, b.end, cap);
           }
         }
       }
@@ -1895,7 +1916,7 @@ class ParallelJournalManager {
       Logger.error('Parallel journal reconcile failed', rawError: e);
       _isRecovering = false;
     }
-    return (excludeRanges: excludeRanges, flushTasks: tasks);
+    return (replayCheckpoint: replayCheckpoint, flushTasks: tasks);
   }
 
   Future<void> _executeRecoveryFlushChain(
@@ -1955,6 +1976,9 @@ class ParallelJournalManager {
         updated,
         flush: true,
       );
+      // Enqueue reloads this cache then +1 per insert. Drop the pre-crash
+      // value or replay would add on top of the unflushed count.
+      _dataStore.tableDataManager.removeRecordCountCache(tableContext);
     } catch (e) {
       Logger.warn(
           'Failed to restore table ${tableContext.tableName} base totals',
@@ -2107,30 +2131,6 @@ class ParallelJournalManager {
     return _resolveTableContext(tableUid);
   }
 
-  /// Whether every entry in partition [p] lies inside some [excludeRanges] range.
-  ///
-  /// When true, startup WAL replay can skip reading/decoding that partition file
-  /// after pending-batch reconcile already loaded the same range.
-  bool _isPartitionFullyExcluded(
-    int p,
-    List<_WalRange> ranges,
-    int cap,
-  ) {
-    if (ranges.isEmpty) return false;
-    final first = WalPointer(partitionIndex: p, entrySeq: 1);
-    for (final range in ranges) {
-      // start must be at or before the first entry of this partition
-      final startOk =
-          range.start == first || !range.start.isNewerThan(first, cap);
-      if (!startOk) continue;
-      // end must cover the whole partition: cannot end mid-partition
-      if (range.end.partitionIndex == p) continue;
-      final endOk = range.end == first || range.end.isNewerThan(first, cap);
-      if (endOk) return true;
-    }
-    return false;
-  }
-
   /// Decode one WAL partition, reusing the startup decode cache when present.
   Future<List<Map<String, dynamic>>> _decodeWalPartitionForRecovery({
     required Uint8List fileBytes,
@@ -2182,8 +2182,8 @@ class ParallelJournalManager {
   Future<Future<void> Function()?> _recoverPendingBatch(
       PendingParallelBatch batch) async {
     try {
-      await _replayPageRedoLogIfExists(batch.batchId);
       if (batch.batchType == BatchType.maintenance) {
+        await _replayPageRedoLogIfExists(batch.batchId);
         await _walManager.removePendingParallelBatch(batch.batchId);
         await _deletePageRedoLogIfExists(batch.batchId);
         try {
@@ -2191,6 +2191,25 @@ class ParallelJournalManager {
         } catch (_) {}
         return null;
       }
+
+      // Durable checkpoint and pending-batch removal are one meta write.
+      // A leftover flush handle whose end is already at or before checkpoint
+      // must not roll totals back or reflush table/index rows.
+      if (batch.end.partitionIndex >= 0 &&
+          _walManager.isAtOrBefore(batch.end, _walManager.meta.checkpoint)) {
+        Logger.debug(
+          'Pending flush ${batch.batchId} already covered by WAL checkpoint; '
+          'dropping without reflush',
+        );
+        await _walManager.removePendingParallelBatch(batch.batchId);
+        await _deletePageRedoLogIfExists(batch.batchId);
+        try {
+          await _flushRecoveryArtifactsIfNeeded();
+        } catch (_) {}
+        return null;
+      }
+
+      await _replayPageRedoLogIfExists(batch.batchId);
 
       // Partition markers are per-file, not table-complete. Never skip whole-table
       // WAL replay based on partition 0 (or any single partition) matching:
@@ -2304,10 +2323,10 @@ class ParallelJournalManager {
       }
 
       if (count == 0 && tablesNeedingReplay.isEmpty) {
-        if (batch.end.partitionIndex >= 0) {
-          await _walManager.advanceCheckpoint(batch.end);
-        }
-        await _walManager.removePendingParallelBatch(batch.batchId);
+        await _walManager.completePendingFlushBatch(
+          batchId: batch.batchId,
+          checkpoint: batch.end,
+        );
         await _deletePageRedoLogIfExists(batch.batchId);
         try {
           await _flushRecoveryArtifactsIfNeeded();
@@ -2328,6 +2347,7 @@ class ParallelJournalManager {
             recoveryBatchContext: BatchContext(
               batchId: captureBatchId,
               batchType: captureBatchType,
+              skipPageRedoRecord: true,
             ),
             batchSizeOverride: captureCount > 0 ? captureCount : null,
           );
@@ -2383,7 +2403,8 @@ class ParallelJournalManager {
     final cap = _dataStore.config.logPartitionCycle;
     if (cap <= 0) return false;
     final endP = normalizeWalPartitionIndex(end.partitionIndex, cap);
-    if (partitionIndex == endP && entrySeq > end.entrySeq) {
+    final p = normalizeWalPartitionIndex(partitionIndex, cap);
+    if (p == endP && entrySeq > end.entrySeq) {
       return true;
     }
     return false;
@@ -2710,7 +2731,7 @@ class ParallelJournalManager {
 
   /// Replay page redo log for [batchId] if it exists and has content.
   /// Writes each (path, offset, payload) from the log so recovery does not read
-  /// possibly corrupted pages.
+  /// possibly corrupted pages. Does **not** append to the redo log.
   ///
   /// Redo log contains **intended page images** (what the batch was about to write).
   /// Partition-0 page0 images include full tree-global meta (TMP1).
@@ -2780,9 +2801,7 @@ class ParallelJournalManager {
         final key = e.key;
         final pages = e.value;
         if (pages.isEmpty) continue;
-        if ((key.kind == PageRedoTreeKind.indexTree ||
-                key.kind == PageRedoTreeKind.ngh) &&
-            key.indexUid.isEmpty) {
+        if (key.kind.requiresIndexUid && key.indexUid.isEmpty) {
           continue;
         }
 
@@ -2799,6 +2818,20 @@ class ParallelJournalManager {
             final indexUid =
                 _resolveRedoIndexUid(tableContext.schema, key.indexUid);
             path = _dataStore.pathManager.getNghPostingPartitionPathByContext(
+                tableContext, indexUid, key.partitionNo);
+          } else if (key.kind == PageRedoTreeKind.nghNav) {
+            final tableContext = await _tableContextFromUid(key.tableUid);
+            if (tableContext == null) continue;
+            final indexUid =
+                _resolveRedoIndexUid(tableContext.schema, key.indexUid);
+            path = _dataStore.pathManager.getNghNavPartitionPathByContext(
+                tableContext, indexUid, key.partitionNo);
+          } else if (key.kind == PageRedoTreeKind.nghPdir) {
+            final tableContext = await _tableContextFromUid(key.tableUid);
+            if (tableContext == null) continue;
+            final indexUid =
+                _resolveRedoIndexUid(tableContext.schema, key.indexUid);
+            path = _dataStore.pathManager.getNghPdirPartitionPathByContext(
                 tableContext, indexUid, key.partitionNo);
           } else {
             final tableContext = await _tableContextFromUid(key.tableUid);
@@ -2855,7 +2888,9 @@ class ParallelJournalManager {
                   _resolveRedoIndexUid(tableContext.schema, key.indexUid);
               _dataStore.indexManager
                   ?.invalidateIndexMetaCache(key.tableUid, indexUid);
-            } else if (key.kind == PageRedoTreeKind.ngh) {
+            } else if (key.kind == PageRedoTreeKind.ngh ||
+                key.kind == PageRedoTreeKind.nghNav ||
+                key.kind == PageRedoTreeKind.nghPdir) {
               final indexUid =
                   _resolveRedoIndexUid(tableContext.schema, key.indexUid);
               _dataStore.vectorIndexManager
@@ -3002,10 +3037,4 @@ class _WalOp {
   final Map<String, dynamic>? oldValues;
   final WalPointer? walPointer;
   _WalOp(this.op, this.data, {this.oldValues, this.walPointer});
-}
-
-class _WalRange {
-  final WalPointer start;
-  final WalPointer end;
-  _WalRange(this.start, this.end);
 }

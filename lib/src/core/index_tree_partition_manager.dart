@@ -1161,6 +1161,7 @@ final class IndexTreePartitionManager {
     int targetInternalPages = 0;
 
     final accumulatedRedoBytes = <Uint8List>[];
+    final recordPageRedo = batchContext != null && batchContext.recordsPageRedo;
 
     // ---- Encode dirty pages into staged writes (once per page) ----
     if (dirtyLeaves.isNotEmpty || dirtyInternals.isNotEmpty) {
@@ -1220,14 +1221,14 @@ final class IndexTreePartitionManager {
           customKeyId: encryptionKeyId,
           pages: List<BTreePageEncodeItem>.from(pending, growable: false),
           pageRedoTreeKindIndex:
-              batchContext != null ? PageRedoTreeKind.indexTree.index : null,
-          pageRedoTableUid: batchContext != null ? tableUid : null,
-          pageRedoIndexUid: batchContext != null ? indexUid : null,
+              recordPageRedo ? PageRedoTreeKind.indexTree.index : null,
+          pageRedoTableUid: recordPageRedo ? tableUid : null,
+          pageRedoIndexUid: recordPageRedo ? indexUid : null,
         );
 
         final bytesList = res.pageBytes;
 
-        if (res.pageRedoBytes != null && batchContext != null) {
+        if (res.pageRedoBytes != null && recordPageRedo) {
           accumulatedRedoBytes.add(res.pageRedoBytes!);
         }
 
@@ -1634,7 +1635,7 @@ final class IndexTreePartitionManager {
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
         );
-        if (batchContext != null) {
+        if (recordPageRedo) {
           final rec = PageRedoLogCodec.encodePageRecord(
             treeKind: PageRedoTreeKind.indexTree,
             tableUid: table.tableUid,
@@ -1650,7 +1651,9 @@ final class IndexTreePartitionManager {
     }
 
     // Seal and persist all dirty pages + Page 0 atomically in Page Redo Log.
-    if (accumulatedRedoBytes.isNotEmpty && batchContext != null) {
+    if (accumulatedRedoBytes.isNotEmpty &&
+        batchContext != null &&
+        batchContext.recordsPageRedo) {
       final redoPath = _dataStore.pathManager.getPageRedoLogPath(
         batchContext.batchId,
         spaceName: _dataStore.currentSpaceName,

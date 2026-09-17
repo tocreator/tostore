@@ -1619,6 +1619,7 @@ final class TableTreePartitionManager {
     }
 
     final accumulatedRedoBytes = <Uint8List>[];
+    final recordPageRedo = batchContext != null && batchContext.recordsPageRedo;
 
     // ---- Encode dirty pages into staged writes (once per page) ----
     if (dirtyLeaves.isNotEmpty || dirtyInternals.isNotEmpty) {
@@ -1680,13 +1681,13 @@ final class TableTreePartitionManager {
           customKeyId: encryptionKeyId,
           pages: List<BTreePageEncodeItem>.from(pending, growable: false),
           pageRedoTreeKindIndex:
-              batchContext != null ? PageRedoTreeKind.table.index : null,
-          pageRedoTableUid: batchContext != null ? tableUid : null,
+              recordPageRedo ? PageRedoTreeKind.table.index : null,
+          pageRedoTableUid: recordPageRedo ? tableUid : null,
         );
 
         final bytesList = res.pageBytes;
 
-        if (res.pageRedoBytes != null && batchContext != null) {
+        if (res.pageRedoBytes != null && recordPageRedo) {
           accumulatedRedoBytes.add(res.pageRedoBytes!);
         }
 
@@ -2048,7 +2049,7 @@ final class TableTreePartitionManager {
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
         );
-        if (batchContext != null) {
+        if (recordPageRedo) {
           final rec = PageRedoLogCodec.encodePageRecord(
             treeKind: PageRedoTreeKind.table,
             tableUid: table.tableUid,
@@ -2063,7 +2064,9 @@ final class TableTreePartitionManager {
     }
 
     // Seal and persist all dirty pages + Page 0 atomically in Page Redo Log.
-    if (accumulatedRedoBytes.isNotEmpty && batchContext != null) {
+    if (accumulatedRedoBytes.isNotEmpty &&
+        batchContext != null &&
+        batchContext.recordsPageRedo) {
       final redoPath = _dataStore.pathManager.getPageRedoLogPath(
         batchContext.batchId,
         spaceName: _dataStore.currentSpaceName,

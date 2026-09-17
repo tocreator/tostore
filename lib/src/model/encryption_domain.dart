@@ -1,3 +1,5 @@
+import 'data_store_config.dart';
+
 /// Exhaustive set of on-disk domains that participate in encodingKey migration.
 ///
 /// No `default` in switches: adding a member forces migration + completion logic updates.
@@ -100,5 +102,39 @@ abstract final class EncryptionDomainPolicy {
       case EncryptionDomain.transactionLog:
         return false;
     }
+  }
+
+  /// Domains that use encodingKey only under [EncryptionScope.full].
+  static bool isFullScopeEncodingDomain(EncryptionDomain domain) {
+    switch (domain) {
+      case EncryptionDomain.vectorIndex:
+      case EncryptionDomain.migrationMeta:
+        return true;
+      case EncryptionDomain.tableData:
+      case EncryptionDomain.btreeIndex:
+      case EncryptionDomain.tableMeta:
+      case EncryptionDomain.indexMeta:
+      case EncryptionDomain.wal:
+      case EncryptionDomain.pageRedoLog:
+      case EncryptionDomain.transactionLog:
+        return false;
+    }
+  }
+
+  /// Whether [domain] must be actively rewritten when encodingKey rotates.
+  ///
+  /// Standard-scope domains (table/index/meta/logs) always participate when
+  /// encryption is enabled. Full-scope-only domains (vector pages, migration
+  /// meta shells) are skipped under [EncryptionScope.standard] to avoid costly
+  /// no-op rewrites of plaintext on-disk data.
+  static bool participatesInEncodingKeyMigration(
+    EncryptionDomain domain,
+    EncryptionConfig? config,
+  ) {
+    if (isNaturalTurnover(domain)) return false;
+    if (isFullScopeEncodingDomain(domain)) {
+      return config?.shouldEncryptVectorIndex ?? false;
+    }
+    return config != null && config.encryptionType != EncryptionType.none;
   }
 }
