@@ -123,39 +123,77 @@ class ExampleSchemas {
     ],
   );
 
-  static const TableSchema embeddings = TableSchema(
-    name: 'embeddings',
-    primaryKeyConfig: PrimaryKeyConfig(
-      name: 'id',
-      type: PrimaryKeyType.sequential,
-    ),
-    fields: [
-      FieldSchema(name: 'name', type: DataType.text, nullable: false),
-      FieldSchema(
-        name: 'embedding',
-        type: DataType.vector,
-        vectorConfig: VectorFieldConfig(
-          dimensions: 512,
-        ),
-      ),
-    ],
-    indexes: [
-      IndexSchema(
-        fields: ['embedding'],
-        type: IndexType.vector,
-        vectorConfig: VectorIndexConfig(
-          indexType: VectorIndexType.ngh,
-          distanceMetric: VectorDistanceMetric.cosine,
-        ),
-      ),
-    ],
+  /// Low / mid / high widths for searchDepth alignment sweeps.
+  ///
+  /// Engine `dimScale` is `sqrt(D/512)` clamped to `[0.85, 1.18]`:
+  /// 128 hits the floor, 512 is the calibration table, 1536 hits the cap.
+  /// Fill and sweep one table at a time — do not bulk-load all three to 1M.
+  static const int vectorDimLow = 128;
+  static const int vectorDimMid = 512;
+  static const int vectorDimHigh = 1536;
+
+  /// 128-d (small encoders). Use to catch low-D over-probe / cheap-recall bias.
+  static final TableSchema embeddings128 = _cosineNghEmbeddings(
+    name: 'embeddings_128',
+    dimensions: vectorDimLow,
   );
+
+  /// 512-d default. searchDepth probe budget is calibrated on this table.
+  static final TableSchema embeddings512 = _cosineNghEmbeddings(
+    name: 'embeddings_512',
+    dimensions: vectorDimMid,
+  );
+
+  /// 1536-d (large encoders). Use to catch high-D under-probe / concentration.
+  static final TableSchema embeddings1536 = _cosineNghEmbeddings(
+    name: 'embeddings_1536',
+    dimensions: vectorDimHigh,
+  );
+
+  static List<TableSchema> get vectorTables => [
+        embeddings128,
+        embeddings512,
+        embeddings1536,
+      ];
+
+  static TableSchema _cosineNghEmbeddings({
+    required String name,
+    required int dimensions,
+  }) {
+    return TableSchema(
+      name: name,
+      primaryKeyConfig: const PrimaryKeyConfig(
+        name: 'id',
+        type: PrimaryKeyType.sequential,
+      ),
+      fields: [
+        const FieldSchema(name: 'name', type: DataType.text, nullable: false),
+        FieldSchema(
+          name: 'embedding',
+          type: DataType.vector,
+          vectorConfig: VectorFieldConfig(
+            dimensions: dimensions,
+          ),
+        ),
+      ],
+      indexes: const [
+        IndexSchema(
+          fields: ['embedding'],
+          type: IndexType.vector,
+          vectorConfig: VectorIndexConfig(
+            indexType: VectorIndexType.ngh,
+            distanceMetric: VectorDistanceMetric.cosine,
+          ),
+        ),
+      ],
+    );
+  }
 
   static List<TableSchema> get all => [
         users,
         posts,
         comments,
         settings,
-        embeddings,
+        ...vectorTables,
       ];
 }

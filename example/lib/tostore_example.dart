@@ -207,74 +207,41 @@ class ToStoreExample {
     await db.restore(backupPath, deleteAfterRestore: true);
   }
 
-  /// Example: Working with vector data and similarity search
+  /// Example: Working with vector data and similarity search.
+  ///
+  /// Uses the 128-d harness table. Do not retarget this at embeddings_512 —
+  /// a mismatched width would fail insert or silently poison the mid-D corpus.
   Future<void> vectorExamples() async {
-    // Create table with vector field and NGH vector index
-    await db.createTables([
-      TableSchema(
-        name: ExampleSchemas.embeddings.name,
-        primaryKeyConfig: PrimaryKeyConfig(
-          name: 'id',
-          type: PrimaryKeyType.timestampBased,
-        ),
-        fields: [
-          FieldSchema(
-            name: 'document_title',
-            type: DataType.text,
-            nullable: false,
-          ),
-          FieldSchema(
-            name: 'embedding',
-            type: DataType.vector,
-            vectorConfig: VectorFieldConfig(
-              dimensions: 128, // 128-dimensional embeddings
-            ),
-          ),
-        ],
-        indexes: [
-          // NGH vector index
-          IndexSchema(
-            fields: ['embedding'],
-            type: IndexType.vector,
-            vectorConfig: VectorIndexConfig(
-              indexType: VectorIndexType.ngh,
-              distanceMetric: VectorDistanceMetric.cosine,
-            ),
-          ),
-        ],
-      ),
-    ]);
+    final tableName = ExampleSchemas.embeddings128.name;
+    final dims = ExampleSchemas.vectorDimLow;
 
-    // Create sample vector data using typed Float64List (zero-closure, unboxed primitive buffer)
-    final v1Data = Float64List(128);
-    final v2Data = Float64List(128);
-    for (int i = 0; i < 128; i++) {
+    final v1Data = Float64List(dims);
+    final v2Data = Float64List(dims);
+    for (int i = 0; i < dims; i++) {
       v1Data[i] = i * 0.01;
       v2Data[i] = i * 0.02 + 0.5;
     }
     final sampleVector1 = VectorData(v1Data);
     final sampleVector2 = VectorData(v2Data);
 
-    // Store documents with vector embeddings
-    await db.insert(ExampleSchemas.embeddings.name, {
-      'document_title': 'Introduction to vector databases',
+    await db.insert(tableName, {
+      'name': 'Introduction to vector databases',
       'embedding': sampleVector1,
     });
 
-    await db.insert(ExampleSchemas.embeddings.name, {
-      'document_title': 'Machine Learning with embeddings',
+    await db.insert(tableName, {
+      'name': 'Machine Learning with embeddings',
       'embedding': sampleVector2,
     });
 
-    // --- Vector similarity search (ANN via db.query chain) ---
-    final qData = Float64List(128);
-    for (int i = 0; i < 128; i++) {
+    final qData = Float64List(dims);
+    for (int i = 0; i < dims; i++) {
       qData[i] = i * 0.015;
     }
     final queryVector = VectorData(qData);
 
     final queryResult = await db
-        .query(ExampleSchemas.embeddings.name)
+        .query(tableName)
         .matchVector('embedding', queryVector)
         .limit(5);
 
@@ -283,7 +250,7 @@ class ToStoreExample {
     for (int i = 0; i < queryResult.data.length; i++) {
       final doc = queryResult.data[i];
       final pk = doc['id'];
-      final title = doc['document_title'] ?? '';
+      final title = doc['name'] ?? '';
       final entry = (retrieval != null && i < retrieval.entries.length)
           ? retrieval.entries[i]
           : null;
@@ -298,7 +265,7 @@ class ToStoreExample {
     logService.add(sb.toString());
 
     // --- Direct vector operations ---
-    final result = await db.query(ExampleSchemas.embeddings.name);
+    final result = await db.query(tableName);
     final documents = result.data;
     List<VectorData> vectors = [];
 
@@ -309,7 +276,7 @@ class ToStoreExample {
         vectors.add(vector);
 
         logService.add(
-            'document title: ${doc['document_title']}, vector dimensions: ${vector.dimensions}');
+            'document name: ${doc['name']}, vector dimensions: ${vector.dimensions}');
       }
     }
 
@@ -614,7 +581,8 @@ class ToStoreExample {
         case DataType.datetime:
           break;
         case DataType.vector:
-          // Example embeddings used by the Recall@K benchmark.
+          // Width comes from the selected table schema (128 / 512 / 1536),
+          // not a hardcoded 512-d default.
           if (field.vectorConfig != null) {
             final dims = field.vectorConfig!.dimensions;
             record[field.name] = ExampleVectorCorpus.memberVector(
@@ -645,6 +613,25 @@ class ToStoreExample {
       }
     }
     return record;
+  }
+
+  void _logVectorGenerationWidth(TableSchema schema) {
+    for (final field in schema.fields) {
+      if (field.type != DataType.vector) continue;
+      final dims = field.vectorConfig?.dimensions ?? 0;
+      if (dims > 0) {
+        logService.add(
+          'Generating ${dims}D vectors for table "${schema.name}".',
+          LogLevel.info,
+        );
+      } else {
+        logService.add(
+          'Table "${schema.name}" field "${field.name}" has no vector dimensions.',
+          LogLevel.error,
+        );
+      }
+      return;
+    }
   }
 
   /// Lets the example UI paint a frame during mock-data generation.
@@ -707,6 +694,7 @@ class ToStoreExample {
           LogLevel.error);
       return -1;
     }
+    _logVectorGenerationWidth(schema);
 
     // Get a generation base for derived text fields (email, username, etc.).
     final baseIndex = await _resolveExampleBaseIndex(tableName, schema);
@@ -798,6 +786,7 @@ class ToStoreExample {
           LogLevel.error);
       return -1;
     }
+    _logVectorGenerationWidth(schema);
 
     // This base is only used for generated field values, not for assigning
     // the primary key itself.

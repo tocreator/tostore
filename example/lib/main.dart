@@ -134,7 +134,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     ExampleSchemas.users.name,
     ExampleSchemas.posts.name,
     ExampleSchemas.comments.name,
-    ExampleSchemas.embeddings.name,
+    ...ExampleSchemas.vectorTables.map((schema) => schema.name),
     ExampleSchemas.settings.name,
     _kKvSpaceLabel,
     _kKvGlobalLabel,
@@ -2459,7 +2459,9 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
               await widget.example.db.clear(ExampleSchemas.posts.name);
               await widget.example.db.clear(ExampleSchemas.users.name);
               await widget.example.db.clear(ExampleSchemas.settings.name);
-              await widget.example.db.clear(ExampleSchemas.embeddings.name);
+              for (final schema in ExampleSchemas.vectorTables) {
+                await widget.example.db.clear(schema.name);
+              }
               _updateOperationInfo('All tables cleared.');
               _fetchTableData(resetPage: true);
             } finally {

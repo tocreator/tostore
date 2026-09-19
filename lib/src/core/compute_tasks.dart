@@ -220,28 +220,42 @@ Future<TableSimilarityResult> calculateTableSimilarity(
   } else {
     // Check common field count
     int matchingFields = 0;
-    Set<String> oldFieldNames =
-        request.oldSchema.fields.map((f) => f.name).toSet();
-    Set<String> newFieldNames =
-        request.newSchema.fields.map((f) => f.name).toSet();
-
-    // Calculate common field count
-    for (final name in oldFieldNames) {
-      if (newFieldNames.contains(name)) {
-        matchingFields++;
-      }
+    final newByName = {
+      for (final f in request.newSchema.fields) f.name: f,
+    };
+    for (final oldField in request.oldSchema.fields) {
+      final newField = newByName[oldField.name];
+      if (newField == null) continue;
+      if (!_fieldsCompatibleForTableIdentity(oldField, newField)) continue;
+      matchingFields++;
     }
 
-    // Calculate field match rate
-    final matchingFieldsRatio = request.oldSchema.fields.isEmpty ||
-            request.newSchema.fields.isEmpty
-        ? 0.0
-        : (2 * matchingFields) / (oldFieldNames.length + newFieldNames.length);
+    final matchingFieldsRatio = (2 * matchingFields) /
+        (request.oldSchema.fields.length + request.newSchema.fields.length);
 
     fieldsScore = matchingFieldsRatio;
   }
 
   score += fieldsWeight * fieldsScore;
+
+  // 4.2 Vector layout (high weight). Same-named fields with different
+  // dimensions stay in the candidate pool so greedy can still pick a
+  // better match (embeddings → embeddings_512, not embeddings_128).
+  // A hard 0.0 abort would hide that ranking. Mismatch is scored like a
+  // PK miss: strong negative, usually below the 0.75 rename threshold.
+  final oldHasVector =
+      request.oldSchema.fields.any((f) => f.type == DataType.vector);
+  final newHasVector =
+      request.newSchema.fields.any((f) => f.type == DataType.vector);
+  if (oldHasVector || newHasVector) {
+    const vectorLayoutWeight = 35.0;
+    totalWeight += vectorLayoutWeight;
+    final layout = _vectorLayoutScore(request.oldSchema, request.newSchema);
+    score += vectorLayoutWeight * layout;
+    if (_hasSameNameVectorConflict(request.oldSchema, request.newSchema)) {
+      score -= vectorLayoutWeight * 0.5;
+    }
+  }
 
   // 5. Index match rate (medium weight)
   const indexWeight = 15.0;
@@ -261,7 +275,9 @@ Future<TableSimilarityResult> calculateTableSimilarity(
 
     for (final oldIndex in request.oldSchema.indexes) {
       for (final newIndex in request.newSchema.indexes) {
-        if (_areFieldListsEqual(oldIndex.fields, newIndex.fields)) {
+        if (_areFieldListsEqual(oldIndex.fields, newIndex.fields) &&
+            oldIndex.type == newIndex.type &&
+            oldIndex.vectorConfig == newIndex.vectorConfig) {
           matchingIndexes++;
           break;
         }
@@ -388,6 +404,20 @@ Future<FieldSimilarityResult> calculateFieldSimilarity(
     score -= uniqueWeight * 0.3;
   }
 
+  // Vector width is scored, not aborting: a 512-d field can still be
+  // compared to a 128-d field, it just loses to a same-width candidate.
+  if (request.oldField.type == DataType.vector ||
+      request.newField.type == DataType.vector) {
+    const vectorWeight = 25.0;
+    totalWeight += vectorWeight;
+    if (request.oldField.type == request.newField.type &&
+        request.oldField.vectorConfig == request.newField.vectorConfig) {
+      score += vectorWeight;
+    } else {
+      score -= vectorWeight * 0.7;
+    }
+  }
+
   // 5. Length and value range constraint matching
   const constraintWeight = 5.0;
   double constraintsChecked = 0;
@@ -510,6 +540,69 @@ Future<BatchFieldSimilarityResult> calculateBatchFieldSimilarity(
   }
 
   return BatchFieldSimilarityResult(results: results);
+}
+
+/// 0..1 agreement of vector field layouts. Used as a weight, never as a veto.
+double _vectorLayoutScore(TableSchema oldSchema, TableSchema newSchema) {
+  final oldVec = [
+    for (final f in oldSchema.fields)
+      if (f.type == DataType.vector) f,
+  ];
+  final newVec = [
+    for (final f in newSchema.fields)
+      if (f.type == DataType.vector) f,
+  ];
+  if (oldVec.isEmpty && newVec.isEmpty) return 1.0;
+  if (oldVec.isEmpty || newVec.isEmpty) return 0.2;
+
+  final newByName = {for (final f in newSchema.fields) f.name: f};
+  var paired = 0;
+  var matched = 0.0;
+  for (final oldField in oldVec) {
+    final newField = newByName[oldField.name];
+    if (newField == null) continue;
+    paired++;
+    if (newField.type == DataType.vector &&
+        oldField.vectorConfig == newField.vectorConfig) {
+      matched += 1.0;
+    }
+  }
+  if (paired > 0) return matched / paired;
+
+  // Vector column was renamed: compare dimension bags.
+  final oldDims = {
+    for (final f in oldVec) f.vectorConfig?.dimensions ?? 0,
+  };
+  final newDims = {
+    for (final f in newVec) f.vectorConfig?.dimensions ?? 0,
+  };
+  final union = oldDims.union(newDims).length;
+  if (union == 0) return 0.0;
+  return oldDims.intersection(newDims).length / union;
+}
+
+bool _hasSameNameVectorConflict(TableSchema oldSchema, TableSchema newSchema) {
+  final newByName = {for (final f in newSchema.fields) f.name: f};
+  for (final oldField in oldSchema.fields) {
+    final newField = newByName[oldField.name];
+    if (newField == null) continue;
+    final oldIsVector = oldField.type == DataType.vector;
+    final newIsVector = newField.type == DataType.vector;
+    if (!oldIsVector && !newIsVector) continue;
+    if (oldIsVector != newIsVector) return true;
+    if (oldField.vectorConfig != newField.vectorConfig) return true;
+  }
+  return false;
+}
+
+bool _fieldsCompatibleForTableIdentity(
+    FieldSchema oldField, FieldSchema newField) {
+  if (oldField.type != newField.type) return false;
+  if (oldField.type == DataType.vector &&
+      oldField.vectorConfig != newField.vectorConfig) {
+    return false;
+  }
+  return true;
 }
 
 /// Check if field is in any index
