@@ -40,6 +40,7 @@ factory DataStoreConfig({
   int? cacheMemoryBudgetMB,
   bool? enablePrewarmCache,
   int? prewarmThresholdMB,
+  double? vectorCacheBudgetRatio,
   // journal / batch / flush / open files...
   bool? enableJournal,
   bool? persistRecoveryOnCommit,
@@ -67,6 +68,7 @@ factory DataStoreConfig({
 | `persistRecoveryOnCommit` | true | Strong durability; false = faster, tiny crash risk |
 | `ttlCleanupIntervalMs` | ≥60000 | Background TTL scan |
 | `cacheMemoryBudgetMB` | auto | LRU budget |
+| `vectorCacheBudgetRatio` | 0.50 (adaptive) | Proportion of cache budget dedicated to vector index cache ceiling |
 | `maxConcurrency` | auto | Vector/crypto workers |
 | `isServerEnvironment` | auto-detected | Changes partition/concurrency defaults |
 

@@ -437,6 +437,24 @@ final class NghNavCentroidNode {
   /// Directory pages need a flush (append or rewrite).
   bool postingDirDirty;
 
+  /// Pre-computed SIMD view for zero-allocation dot product kernels.
+  Float32x4List? simdVector;
+
+  Float32x4List? getSimdVector() {
+    if (simdVector != null) return simdVector;
+    final len = vector.length;
+    final n = len >> 2;
+    if (n <= 0) return null;
+    if ((vector.offsetInBytes & 15) == 0) {
+      simdVector = Float32x4List.view(vector.buffer, vector.offsetInBytes, n);
+    } else {
+      final aligned = Float32List(len);
+      aligned.setAll(0, vector);
+      simdVector = Float32x4List.view(aligned.buffer, aligned.offsetInBytes, n);
+    }
+    return simdVector;
+  }
+
   bool get isCoarse => level == levelCoarse;
   bool get isLeaf => level != levelCoarse;
 
@@ -465,7 +483,13 @@ final class NghNavCentroidNode {
                 headPostingPageNo,
                 tailPostingPageNo,
               ),
-        );
+        ) {
+    final len = vector.length;
+    final n = len >> 2;
+    if (n > 0 && (vector.offsetInBytes & 15) == 0) {
+      simdVector = Float32x4List.view(vector.buffer, vector.offsetInBytes, n);
+    }
+  }
 
   static List<NghPageId> _pagesFromPacked(
     List<int>? packed,
@@ -521,10 +545,22 @@ final class NghNavGraphPage {
   /// Used to detect 7-pack → 5-pack occupancy changes and rewrite all pages once.
   int? navPackPerPage;
 
+  /// Cached top-level routing centroid IDs to eliminate repeated O(N) full graph scans on read queries.
+  List<int>? cachedTopLevelRoutingIds;
+
+  /// Cached centroid imbalance metric.
+  double? cachedImbalance;
+
+  /// Cached count of leaf centroids.
+  int? cachedNLeaves;
+
   NghNavGraphPage({
     required this.dimensions,
     required this.centroids,
     this.navPackPerPage,
+    this.cachedTopLevelRoutingIds,
+    this.cachedImbalance,
+    this.cachedNLeaves,
   });
 
   Uint8List encodePayload() {

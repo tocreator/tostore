@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:path/path.dart' as p;
 
 import '../handler/logger.dart';
+import '../handler/platform_handler.dart';
 import '../model/index_entry.dart';
 import '../model/ngh_index_meta.dart';
 import '../model/parallel_journal_entry.dart';
@@ -16,6 +17,7 @@ import '../model/table_schema.dart';
 import 'data_store_impl.dart';
 import 'ngh_graph_engine.dart';
 import 'ngh_partition_manager.dart';
+import 'resource_manager.dart';
 import 'vector_cache.dart';
 import 'workload_scheduler.dart';
 import 'yield_controller.dart';
@@ -26,6 +28,7 @@ class VectorIndexManager {
 
   late final NghPartitionManager _partitionManager;
   late final NghGraphEngine _graphEngine;
+  NghGraphEngine get graphEngine => _graphEngine;
   late final VectorCache _vectorCache;
 
   /// In-flight meta loads -- prevents parallel readers from each hitting disk.
@@ -52,19 +55,42 @@ class VectorIndexManager {
     return 128 * 1024 * 1024;
   }
 
-  /// Compact SQ8 search cache share of the index quota.
+  /// Compact SQ8 search cache budget.
   ///
-  /// D=512 ≈ 0.55KB/slot → 55% of a ~300MB index quota holds ~300k vectors.
-  int _compactClusterBudget(int indexBudget) {
-    final fromIndex = max(4 * 1024 * 1024, (indexBudget * 0.55).round());
-    return min(indexBudget, fromIndex);
+  /// Lazily anchors to [vectorCacheBudgetRatio] (default 50%) of the total memory threshold.
+  /// This allocation is zero-cost when no vector queries occur, but prevents disk I/O
+  /// thrashing under large corpora (e.g. 1M 512D vectors) by keeping posting clusters in memory.
+  int _resolveCompactVectorClusterBudget() {
+    final totalBudgetMB = _dataStore.resourceManager?.memoryThresholdInMB ?? 0;
+    final resolvedMB = totalBudgetMB > 0
+        ? totalBudgetMB
+        : (_dataStore.config.cacheMemoryBudgetMB ?? 1024);
+    final ratio =
+        (_dataStore.config.vectorCacheBudgetRatio ?? 0.50).clamp(0.10, 0.85);
+    final targetBytes = (resolvedMB * 1024 * 1024 * ratio).round();
+    return max(32 * 1024 * 1024, targetBytes);
+  }
+
+  /// Resolve navigating centroid graph cache budget.
+  ///
+  /// Nav graph is the entry routing backbone. Keeping it 100% in RAM prevents
+  /// disk I/O jitter during centroid navigation across millions/billions of vectors.
+  /// Minimum floor: 32MB on mobile, 128MB on desktop/server.
+  /// Dynamically expands to ~15% of the total vector cache budget.
+  int _resolveNavGraphCacheBudget() {
+    final clusterBudget = _resolveCompactVectorClusterBudget();
+    final floor =
+        PlatformHandler.isMobile ? 32 * 1024 * 1024 : 128 * 1024 * 1024;
+    final targetBytes = (clusterBudget * 0.15).round();
+    return max(floor, targetBytes);
   }
 
   /// Re-apply cache ceilings after ResourceManager computes real quotas.
   void syncClusterCacheBudget() {
     final indexBudget = _resolveIndexCacheBudget();
     _graphEngine
-        .configureClusterCacheBudget(_compactClusterBudget(indexBudget));
+        .configureClusterCacheBudget(_resolveCompactVectorClusterBudget());
+    _graphEngine.configureNavGraphCacheBudget(_resolveNavGraphCacheBudget());
     _partitionManager.syncCacheBudget(indexBudget);
   }
 
@@ -364,7 +390,9 @@ class VectorIndexManager {
     if (meta == null || meta.isBuilding || meta.totalVectors == 0) {
       return const [];
     }
-    await _graphEngine.prefetchNavGraph(table, indexUid, meta: meta);
+    if (!_graphEngine.isNavGraphCached(table, indexUid, meta: meta)) {
+      await _graphEngine.prefetchNavGraph(table, indexUid, meta: meta);
+    }
 
     final rawValues = queryVector.values;
     final Float32List queryF32;
@@ -429,7 +457,9 @@ class VectorIndexManager {
       }
       await _graphEngine.prefetchNavGraph(table, indexUid, meta: meta);
 
-      final budget = maxBytes ?? _defaultPrewarmBudget();
+      final defaultBudget = _defaultPrewarmBudget();
+      final budget =
+          maxBytes != null ? min(maxBytes, defaultBudget) : defaultBudget;
       if (budget <= 0) return 0;
 
       final added = await _graphEngine.prewarmClusters(
@@ -457,6 +487,33 @@ class VectorIndexManager {
       );
       return 0;
     }
+  }
+
+  /// Prewarm vector indexes for a given table context.
+  Future<int> prewarmVectorIndexByContext(
+    TableContext table, {
+    String? fieldName,
+    int? maxBytes,
+  }) async {
+    final schema = await _dataStore.tableMetaManager
+        ?.getTableSchemaByName(TableName(table.tableName));
+    if (schema == null) return 0;
+    final vectorIndexes = _dataStore.tableMetaManager
+        ?.getVectorIndexesFor(schema)
+        .where((idx) => fieldName == null || idx.fields.contains(fieldName))
+        .toList(growable: false);
+    if (vectorIndexes == null || vectorIndexes.isEmpty) return 0;
+
+    var totalLoaded = 0;
+    for (final vIdx in vectorIndexes) {
+      if (_dataStore.shouldAbortBackgroundScan) break;
+      totalLoaded += await prewarmVectorIndex(
+        table,
+        vIdx.indexUid,
+        maxBytes: maxBytes,
+      );
+    }
+    return totalLoaded;
   }
 
   /// Convert leftover `nav_graph.ngh` to paged nav/pdir, or drop a stale blob.
@@ -516,11 +573,9 @@ class VectorIndexManager {
   }
 
   int _defaultPrewarmBudget() {
-    final rm = _dataStore.resourceManager;
-    final thresholdMb = rm?.getEffectivePrewarmThresholdMB() ?? 32;
-    final thresholdBytes = thresholdMb * 1024 * 1024;
-    final used = getCurrentCacheSize();
-    return max(0, thresholdBytes - used);
+    final clusterBudget = _resolveCompactVectorClusterBudget();
+    final used = _graphEngine.clusterCacheBytes;
+    return max(0, clusterBudget - used);
   }
 
   // =====================================================================
@@ -773,10 +828,19 @@ class VectorIndexManager {
   }
 
   /// Evict caches under memory pressure.
-  Future<void> evictCache({double ratio = 0.3}) async {
+  Future<void> evictCache({double ratio = 0.3, bool force = false}) async {
     await _vectorCache.evict(ratio: ratio);
     await _partitionManager.evictPageCache(ratio: ratio);
-    _graphEngine.evictClusterCache(ratio: ratio);
+
+    // Protect vector cluster cache: only evict if it exceeded its own dedicated
+    // budget, or if the system is under critical memory emergency.
+    final clusterBytes = _graphEngine.clusterCacheBytes;
+    final clusterMax = _graphEngine.clusterCacheMaxBytes;
+    final isCritical =
+        _dataStore.resourceManager?.status == ResourceStatus.critical;
+    if (force || isCritical || clusterBytes > clusterMax) {
+      await _graphEngine.evictClusterCache(ratio: ratio);
+    }
   }
 
   /// Clear all caches for a table.

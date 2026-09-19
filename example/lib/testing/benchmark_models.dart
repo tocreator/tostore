@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import 'package:tostore/tostore.dart';
 
 import 'benchmark_schemas.dart';
+import 'vector_recall.dart';
 
 /// Short labels / descriptions for benchmark durability chips and reports.
 extension BenchmarkRecoveryDurabilityX on RecoveryDurability {
@@ -39,7 +40,7 @@ enum BenchmarkTier {
   indexed('Indexed', 'PK + 1 unique + 1 secondary index'),
 
   /// Vector table with NGH index (128-d float32, cosine).
-  /// Measures embedding ingest, pure ANN (PK-only), and hybrid retrieval.
+  /// Measures embedding ingest, ANN search, and hybrid retrieval.
   vector('Vector (NGH 128-d)', 'PK + 128-d embedding + NGH cosine index'),
 
   /// Run across all tiers.
@@ -88,12 +89,12 @@ enum BenchmarkOperation {
   // Vector Operations (Vector tier only)
   vectorBatchInsert('Vector Batch Insert',
       'Bulk insert 128-d embeddings with NGH index maintenance'),
-  vectorSearch('Vector ANN Search',
-      'Pure ANN via db.vectorSearch (primary key + score only)'),
-  vectorHybridSearch('Vector Hybrid Search',
-      'Structured filter AND matchVector (full table rows on query chain)'),
-  vectorRecallCheck('Vector Recall Check',
-      'Sampled exact-match recall@1 / recall@K via db.vectorSearch');
+  vectorSearch(
+      'Vector ANN Search', 'Nearest-neighbor search (primary key + score)'),
+  vectorHybridSearch(
+      'Vector Hybrid Search', 'Filter plus vector search (full rows)'),
+  vectorRecallCheck('Vector Recall',
+      'Checks Recall@K at the default searchDepth. Not a ceiling — depth 1–100 targets about 90%–100%');
 
   final String label;
   final String description;
@@ -256,6 +257,23 @@ class BenchmarkSummary {
     DateTime? timestamp,
   }) : timestamp = timestamp ?? DateTime.now();
 
+  bool get hasVectorRecall =>
+      metrics.any((m) => m.name == BenchmarkOperation.vectorRecallCheck.label);
+
+  /// Visible under the results table. States that default depth is an
+  /// operating point (~95% at 50), not the engine's recall ceiling.
+  String? get vectorRecallCaption {
+    if (!hasVectorRecall) return null;
+    final depth = VectorIndexConfig.defaultSearchDepth;
+    final intent =
+        (VectorRecallHarness.recallIntent(depth) * 100).toStringAsFixed(0);
+    return 'Recall checks the default searchDepth ($depth → about $intent% intent), '
+        'the same point used by the ANN and hybrid rows. '
+        'That is the production operating point, not maximum recall. '
+        'Raise searchDepth from 1 to 100 to target about 90%–100% '
+        '(higher depth costs more latency).';
+  }
+
   /// Formats the benchmark results as a clean Markdown table.
   String toMarkdownTable() {
     final buffer = StringBuffer();
@@ -269,7 +287,11 @@ class BenchmarkSummary {
       buffer.writeln(
           '- **Vector**: ${BenchmarkSchemas.vectorDimensions}d float32, cosine NGH, topK=${BenchmarkSchemas.vectorTopK}');
       buffer.writeln(
-          '- **ANN / Recall**: `db.vectorSearch` (PK + score only); **Hybrid**: `matchVector` (full rows)');
+          '- **Vector search**: ANN (primary key + score); hybrid = filter + vector');
+      final recallCaption = vectorRecallCaption;
+      if (recallCaption != null) {
+        buffer.writeln('- **Vector recall**: $recallCaption');
+      }
     }
     buffer.writeln();
     buffer.writeln(
@@ -296,7 +318,7 @@ class BenchmarkSummary {
     if (qualityRows.isNotEmpty) {
       buffer.writeln();
       buffer.writeln(
-          '**Quality notes** (Result = Exact@1 / Exact@5 / Exact@K %; Count = probe sample size):');
+          '**Quality notes** (Result = whether Recall@K met the searchDepth intent, not a ceiling; Count = queries):');
       for (final m in qualityRows) {
         buffer.writeln('- **${m.name}**: ${m.qualityNote}');
       }

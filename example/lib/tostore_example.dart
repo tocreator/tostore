@@ -7,6 +7,7 @@ import 'package:tostore/tostore.dart';
 
 import 'testing/example_schemas.dart';
 import 'testing/log_service.dart';
+import 'testing/vector_recall.dart';
 
 String _statusErrorMessage(
   Iterable<ResultStatus> statuses, {
@@ -612,70 +613,13 @@ class ToStoreExample {
         case DataType.datetime:
           break;
         case DataType.vector:
-          // Generate 5-member semantic proximity chains along a dedicated 1D topic ray.
-          // Guarantees every single record (M0..M4) always has 3-4 immediate neighbors
-          // with cosine scores smoothly distributed across 0.96 -> 0.87 -> 0.76.
+          // Example embeddings used by the Recall@K benchmark.
           if (field.vectorConfig != null) {
             final dims = field.vectorConfig!.dimensions;
-            final groupId = (index - 1) ~/ 5;
-            final memberId = (index - 1) % 5;
-            final groupSeed = Random(groupId * 10007 + dims);
-
-            // 1. Generate base cluster vector (unit normalized)
-            final base = List<double>.generate(dims, (_) {
-              final u1 = groupSeed.nextDouble().clamp(1e-10, 1.0);
-              final u2 = groupSeed.nextDouble();
-              return sqrt(-2.0 * log(u1)) * cos(2.0 * pi * u2);
-            });
-            final bNorm = sqrt(base.fold(0.0, (p, e) => p + e * e));
-            if (bNorm > 0) {
-              for (var i = 0; i < dims; i++) {
-                base[i] /= bNorm;
-              }
-            }
-
-            // 2. Generate orthogonal direction vector for this group
-            final dir = List<double>.generate(dims, (_) {
-              final u1 = groupSeed.nextDouble().clamp(1e-10, 1.0);
-              final u2 = groupSeed.nextDouble();
-              return sqrt(-2.0 * log(u1)) * cos(2.0 * pi * u2);
-            });
-            double bDotD = 0;
-            for (var i = 0; i < dims; i++) {
-              bDotD += base[i] * dir[i];
-            }
-            for (var i = 0; i < dims; i++) {
-              dir[i] -= bDotD * base[i];
-            }
-            final dNorm = sqrt(dir.fold(0.0, (p, e) => p + e * e));
-            if (dNorm > 0) {
-              for (var i = 0; i < dims; i++) {
-                dir[i] /= dNorm;
-              }
-            }
-
-            // 3. Step parameter along the ray: t_k = (k - 2) * 0.28 (centered around M2)
-            // Adjacent members have cos ≈ 0.96
-            // 2-step neighbors have cos ≈ 0.87
-            // 3-step neighbors have cos ≈ 0.77
-            final double t = (memberId - 2) * 0.28;
-
-            final values = List<double>.generate(dims, (d) {
-              return base[d] + (dir[d] * t);
-            });
-
-            // Normalize to unit length for cosine similarity
-            final norm = sqrt(values.fold(0.0, (p, e) => p + e * e));
-            if (norm > 0) {
-              for (var i = 0; i < dims; i++) {
-                values[i] /= norm;
-              }
-            }
-            record[field.name] = VectorData(values);
-            if (record['document_title'] != null) {
-              record['document_title'] =
-                  '[Group $groupId:M$memberId] ${record['document_title']}';
-            }
+            record[field.name] = ExampleVectorCorpus.memberVector(
+              index: index,
+              dimensions: dims,
+            );
           }
           break;
         case DataType.blob:
@@ -687,6 +631,16 @@ class ToStoreExample {
         case DataType.dynamic:
           // Skip dynamic for mock data generation
           break;
+      }
+    }
+
+    if (record.values.any((v) => v is VectorData)) {
+      final label = ExampleVectorCorpus.recordLabel(index);
+      for (final field in schema.fields) {
+        if (ExampleVectorCorpus.stampFields.contains(field.name) &&
+            field.type == DataType.text) {
+          record[field.name] = label;
+        }
       }
     }
     return record;
@@ -1009,241 +963,223 @@ class ToStoreExample {
 
   // --- Vector Benchmarking ---
 
-  /// Performs a benchmark of vector search operations.
+  /// Vector search latency and Recall@K versus known nearest neighbors.
   ///
-  /// [tableName] The table to search in.
-  /// [iterations] Number of searches to perform.
-  /// [topK] Number of nearest neighbors to retrieve.
-  /// [searchDepth] ANN search depth in `[1, 100]` (null = engine default 50 → ~95% recall intent).
-  ///
-  /// Returns the average latency in milliseconds.
-  Future<double> vectorSearchBenchmark(
-      String tableName, int iterations, int topK,
-      {int? searchDepth}) async {
-    final depthLabel = searchDepth?.toString() ?? 'default';
-    logService.add(
-        'Starting Vector Search Benchmark: table="$tableName", iterations=$iterations, topK=$topK, searchDepth=$depthLabel');
+  /// [searchDepth] `[1, 100]` (null = engine default 50 → ~95% recall intent).
+  /// Set [verbose] false to suppress per-run logs (used by depth sweeps).
+  Future<VectorSearchBenchmarkResult?> vectorSearchBenchmark(
+    String tableName,
+    int iterations,
+    int topK, {
+    int? searchDepth,
+    bool verbose = true,
+    bool runIdentityDiagnostic = true,
+  }) async {
+    final depth =
+        (searchDepth ?? VectorIndexConfig.defaultSearchDepth).clamp(1, 100);
+    if (verbose) {
+      logService.add('Starting Vector Search Benchmark: table="$tableName", '
+          'iterations=$iterations, topK=$topK, searchDepth=$depth '
+          '(recall intent ${((VectorRecallHarness.recallIntent(depth)) * 100).toStringAsFixed(1)}%)');
+    }
 
     final schema = await db.getTableSchema(tableName);
     if (schema == null) {
       logService.add('Benchmark failed: Schema for "$tableName" not found.',
           LogLevel.error);
-      return -1;
+      return null;
     }
 
-    final vectorField = schema.fields.firstWhere(
-        (f) => f.type == DataType.vector,
-        orElse: () => const FieldSchema(name: '', type: DataType.text));
-
-    if (vectorField.name.isEmpty) {
+    FieldSchema? vectorField;
+    for (final field in schema.fields) {
+      if (field.type == DataType.vector) {
+        vectorField = field;
+        break;
+      }
+    }
+    if (vectorField == null || vectorField.name.isEmpty) {
       logService.add('Benchmark failed: No vector field found in "$tableName".',
           LogLevel.error);
-      return -1;
+      return null;
     }
 
+    final vectorFieldName = vectorField.name;
     final dims = vectorField.vectorConfig?.dimensions ?? 0;
     if (dims == 0) {
       logService.add(
-          'Benchmark failed: Vector dimensions not configured for "${vectorField.name}".',
+          'Benchmark failed: Vector dimensions not configured for "$vectorFieldName".',
           LogLevel.error);
-      return -1;
+      return null;
     }
 
-    // Verify index existence
     final hasVectorIndex = schema.indexes.any((idx) =>
-        idx.type == IndexType.vector && idx.fields.contains(vectorField.name));
-    if (!hasVectorIndex) {
+        idx.type == IndexType.vector && idx.fields.contains(vectorFieldName));
+    if (!hasVectorIndex && verbose) {
       logService.add(
-          'Warning: No vector index found on "${vectorField.name}". Search will be slow.',
+          'Warning: No vector index found on "$vectorFieldName". Search will be slow.',
           LogLevel.warn);
     }
 
-    final random = Random();
+    Future<void> yieldUi() => Future<void>.delayed(Duration.zero);
 
-    // Setup (schema, anchor sampling) — reported separately, never mixed into latency.
-    final setupSw = Stopwatch()..start();
-    final totalCount = await db.query(tableName).count();
-    final isSequential =
-        schema.primaryKeyConfig.type == PrimaryKeyType.sequential;
-
-    final List<Map<String, dynamic>> sampleDocs;
-    if (isSequential && totalCount > 50) {
-      // O(log N) Random Primary Key Probing across the entire table range (e.g. 1 ~ 100,000)
-      // Generates 25 randomly distributed PKs and fetches them concurrently with zero table scan.
-      final pks = <int>{};
-      final probeCount = min(totalCount, 25);
-      while (pks.length < probeCount) {
-        pks.add(random.nextInt(totalCount) + 1);
-      }
-      final probeResults = await Future.wait([
-        for (final pk in pks)
-          db
-              .query(tableName)
-              .where(schema.primaryKey, '=', pk.toString())
-              .limit(1)
-      ]);
-      sampleDocs = [
-        for (final res in probeResults)
-          if (res.data.isNotEmpty) res.data.first
-      ];
-    } else {
-      // Fallback: fast first-page read
-      sampleDocs = (await db.query(tableName).limit(25)).data;
+    final recall = await VectorRecallHarness.evaluate(
+      db: db,
+      tableName: tableName,
+      topK: topK,
+      searchDepth: depth,
+      requestedQueries: max(1, iterations),
+      runIdentityDiagnostic: runIdentityDiagnostic,
+      yieldUi: yieldUi,
+      onLog: verbose ? (msg) => logService.add(msg, LogLevel.info) : null,
+    );
+    if (recall == null) {
+      return null;
     }
 
-    final List<(dynamic pk, VectorData vec)> anchorSamples = [];
-    for (final doc in sampleDocs) {
-      final rawVec = doc[vectorField.name];
-      final pk = doc[schema.primaryKey] ?? doc['id'];
-      if (rawVec is VectorData) {
-        anchorSamples.add((pk, rawVec));
-      } else if (rawVec is Float32List) {
-        anchorSamples.add((pk, VectorData(rawVec)));
-      } else if (rawVec is Iterable) {
-        try {
-          final list = [for (final dynamic n in rawVec) (n as num).toDouble()];
-          if (list.length == dims) {
-            anchorSamples.add((pk, VectorData.fromList(list)));
-          }
-        } catch (_) {}
+    final latenciesMs = List<double>.from(recall.annLatenciesMs);
+    final extra = max(0, iterations - recall.queryCount);
+    if (extra > 0 && recall.queryVectors.isNotEmpty) {
+      if (verbose) {
+        logService.add('Running $extra additional searches for latency...');
+      }
+      final random = Random();
+      for (var i = 0; i < extra; i++) {
+        final queryVector = (recall.canScoreRecall && recall.completeGroups > 0)
+            ? ExampleVectorCorpus.groupQuery(
+                random.nextInt(recall.completeGroups),
+                recall.dimensions,
+              )
+            : recall.queryVectors[i % recall.queryVectors.length];
+        final querySw = Stopwatch()..start();
+        await db.vectorSearch(
+          tableName,
+          fieldName: vectorFieldName,
+          queryVector: queryVector,
+          topK: topK,
+          searchDepth: depth,
+        );
+        querySw.stop();
+        latenciesMs.add(querySw.elapsedMicroseconds / 1000.0);
+
+        if (verbose &&
+            iterations >= 100 &&
+            (recall.queryCount + i + 1) % (iterations ~/ 5) == 0 &&
+            (recall.queryCount + i + 1) < iterations) {
+          final done = recall.queryCount + i + 1;
+          final pct = (done / iterations * 100).toStringAsFixed(0);
+          logService.add(
+              '⏳ Benchmark Progress: $done/$iterations completed ($pct%)...',
+              LogLevel.info);
+        }
+        if (i > 0 && i % 50 == 0) {
+          await yieldUi();
+        }
       }
     }
-    setupSw.stop();
-    final setupElapsedMs = setupSw.elapsedMilliseconds;
 
-    final latenciesMs = <double>[];
-    int exactTestCount = 0;
-    int exactHitCount = 0;
-    int semanticTestCount = 0;
-    int semanticHitCount = 0;
+    final result = VectorSearchBenchmarkResult.fromLatencies(
+      recall: recall,
+      latenciesMs: latenciesMs,
+    );
 
-    for (int i = 0; i < iterations; i++) {
-      dynamic targetAnchorPk;
-      VectorData queryVector;
-      bool isExactTest = false;
-
-      // 1. Generate query vector based on real in-table anchor records:
-      // - 50% Exact 0-Noise Identity Probe (tests 100% target recall)
-      // - 50% Semantic Proximity Probe (tests neighboring cluster recall)
-      if (anchorSamples.isNotEmpty) {
-        final anchor = anchorSamples[random.nextInt(anchorSamples.length)];
-        targetAnchorPk = anchor.$1;
-        final baseValues = anchor.$2.values;
-
-        if (iterations == 1 || random.nextDouble() < 0.50) {
-          isExactTest = true;
-          exactTestCount++;
-          queryVector = anchor.$2;
-        } else {
-          semanticTestCount++;
-          // Extremely light semantic noise (1% noise) for realistic neighbor retrieval
-          final perturbed = List<double>.generate(dims, (d) {
-            final u1 = random.nextDouble().clamp(1e-10, 1.0);
-            final u2 = random.nextDouble();
-            final g = sqrt(-2.0 * log(u1)) * cos(2.0 * pi * u2);
-            return (d < baseValues.length ? baseValues[d] : 0.0) + (g * 0.015);
-          });
-          final norm = sqrt(perturbed.fold(0.0, (p, e) => p + e * e));
-          if (norm > 0) {
-            for (var j = 0; j < dims; j++) {
-              perturbed[j] /= norm;
-            }
-          }
-          queryVector = VectorData(perturbed);
-        }
-      } else {
-        final queryValues = List<double>.generate(dims, (_) {
-          final u1 = random.nextDouble().clamp(1e-10, 1.0);
-          final u2 = random.nextDouble();
-          return sqrt(-2.0 * log(u1)) * cos(2.0 * pi * u2);
-        });
-        final norm = sqrt(queryValues.fold(0.0, (p, e) => p + e * e));
-        if (norm > 0) {
-          for (var j = 0; j < dims; j++) {
-            queryValues[j] /= norm;
-          }
-        }
-        queryVector = VectorData(queryValues);
-      }
-
-      // 2. Pure ANN via db.vectorSearch (PK + score only; matches mainstream
-      // vector-DB latency reporting — not hybrid full-row fetch).
-      final querySw = Stopwatch()..start();
-      final results = await db.vectorSearch(
-        tableName,
-        fieldName: vectorField.name,
-        queryVector: queryVector,
+    if (verbose) {
+      _logVectorSearchBenchmarkSummary(
+        iterations: iterations,
         topK: topK,
-        searchDepth: searchDepth,
+        depth: depth,
+        result: result,
       );
-      querySw.stop();
-      final queryElapsedMs = querySw.elapsedMicroseconds / 1000.0;
-      latenciesMs.add(queryElapsedMs);
-
-      // Track target hit statistics
-      bool targetHitTop1 = false;
-      bool targetHitTopK = false;
-      if (targetAnchorPk != null && results.isNotEmpty) {
-        final targetPkStr = targetAnchorPk.toString();
-        if (results.first.primaryKey == targetPkStr) {
-          targetHitTop1 = true;
-        }
-        for (final r in results) {
-          if (r.primaryKey == targetPkStr) {
-            targetHitTopK = true;
-            break;
-          }
-        }
-      }
-
-      if (isExactTest) {
-        if (targetHitTop1) exactHitCount++;
-      } else if (targetAnchorPk != null) {
-        if (targetHitTopK) semanticHitCount++;
-      }
-
-      // Periodically log progress for long tests
-      if (iterations >= 100 &&
-          (i + 1) % (iterations ~/ 5) == 0 &&
-          (i + 1) < iterations) {
-        final pct = ((i + 1) / iterations * 100).toStringAsFixed(0);
-        logService.add(
-            '⏳ Benchmark Progress: ${i + 1}/$iterations completed ($pct%)...',
-            LogLevel.info);
-      }
     }
 
-    // Sum of per-query vectorSearch timings only (same basis as Average/Pxx).
+    return result;
+  }
+
+  /// Runs [vectorSearchDepthSweepPoints] at the current corpus size and logs
+  /// one compact table for recall-vs-intent alignment.
+  Future<void> vectorSearchDepthSweep(
+    String tableName, {
+    int iterations = 100,
+    int topK = 10,
+    List<int>? depths,
+    void Function(int completed, int total)? onProgress,
+  }) async {
+    final sweepDepths = depths ?? vectorSearchDepthSweepPoints;
+    if (sweepDepths.isEmpty) {
+      logService.add(
+          'Depth sweep skipped: no depths configured.', LogLevel.warn);
+      return;
+    }
+
+    final rows = <VectorSearchBenchmarkResult>[];
+    for (var i = 0; i < sweepDepths.length; i++) {
+      final depth = sweepDepths[i].clamp(1, 100);
+      onProgress?.call(i, sweepDepths.length);
+
+      final row = await vectorSearchBenchmark(
+        tableName,
+        iterations,
+        topK,
+        searchDepth: depth,
+        verbose: false,
+        runIdentityDiagnostic: true,
+      );
+      if (row != null) {
+        rows.add(row);
+      } else {
+        logService.add(
+          'Depth sweep stopped at depth=$depth (benchmark failed).',
+          LogLevel.error,
+        );
+        break;
+      }
+
+      onProgress?.call(i + 1, sweepDepths.length);
+      await Future<void>.delayed(Duration.zero);
+    }
+
+    if (rows.isEmpty) {
+      logService.add('Depth sweep produced no results.', LogLevel.error);
+      return;
+    }
+
+    logService.add(
+      formatVectorDepthSweepSummary(
+        tableName: tableName,
+        topK: topK,
+        iterations: iterations,
+        rows: rows,
+      ),
+      LogLevel.info,
+    );
+  }
+
+  void _logVectorSearchBenchmarkSummary({
+    required int iterations,
+    required int topK,
+    required int depth,
+    required VectorSearchBenchmarkResult result,
+  }) {
+    final recall = result.recall;
+    final latenciesMs = List<double>.from(recall.annLatenciesMs);
     final totalSearchMs =
         latenciesMs.isEmpty ? 0.0 : latenciesMs.reduce((a, b) => a + b);
 
-    // Average / percentiles / QPS use per-query vectorSearch timings only.
-    final avgLatency = latenciesMs.isEmpty
-        ? 0.0
-        : latenciesMs.reduce((a, b) => a + b) / latenciesMs.length;
+    final intentPct = (recall.recallIntent * 100).toStringAsFixed(1);
+    final recallPct = (recall.recallAtK * 100).toStringAsFixed(1);
+    final gap = recall.intentGapPp;
+    final gapLabel =
+        '${gap >= 0 ? '+' : ''}${gap.toStringAsFixed(1)} vs intent';
+    final identityPct = recall.identityAt1 == null
+        ? 'n/a'
+        : '${(recall.identityAt1! * 100).toStringAsFixed(1)}% '
+            '(${recall.identityHits}/${recall.identityProbes})';
 
-    // 4. Print Single Consolidated Summary Report for the entire execution
-    latenciesMs.sort();
-    final lastIdx = latenciesMs.isEmpty ? 0 : latenciesMs.length - 1;
-    final p50 = latenciesMs.isEmpty
-        ? 0.0
-        : latenciesMs[(latenciesMs.length * 0.50).floor().clamp(0, lastIdx)];
-    final p95 = latenciesMs.isEmpty
-        ? 0.0
-        : latenciesMs[(latenciesMs.length * 0.95).floor().clamp(0, lastIdx)];
-    final p99 = latenciesMs.isEmpty
-        ? 0.0
-        : latenciesMs[(latenciesMs.length * 0.99).floor().clamp(0, lastIdx)];
-    final qps = avgLatency > 0 ? (1000.0 / avgLatency) : 0.0;
-
-    final exactHitRate =
-        exactTestCount > 0 ? (exactHitCount / exactTestCount) : 1.0;
-    final semanticHitRate =
-        semanticTestCount > 0 ? (semanticHitCount / semanticTestCount) : 1.0;
-    final overallHitCount = exactHitCount + semanticHitCount;
-    final totalAnchorTests = exactTestCount + semanticTestCount;
-    final overallHitRate =
-        totalAnchorTests > 0 ? (overallHitCount / totalAnchorTests) : 1.0;
+    if (iterations < 50 && recall.canScoreRecall) {
+      logService.add(
+          'Note: Recall@K is noisy below ~50 queries. Use 100–1000 iterations '
+          'for a stable Recall@K estimate.',
+          LogLevel.debug);
+    }
 
     final report = StringBuffer();
     report.writeln('');
@@ -1252,36 +1188,53 @@ class ToStoreExample {
         '        TOSTORE VECTOR SEARCH BENCHMARK SUMMARY ($iterations Iterations)       ');
     report.writeln('=' * 78);
     report.writeln(
-        '  Target Table         : $tableName (${dims}D, Cosine Metric)');
-    report.writeln('  Total Executed       : $iterations queries (Top-$topK)');
+        '  Target Table         : ${recall.tableName} (${recall.dimensions}D, ${recall.metricLabel})');
+    report.writeln('  Corpus               : ${recall.corpusSize} vectors'
+        '${recall.canScoreRecall ? '' : ' (latency only)'}');
     report.writeln(
-        '  Total Search Time    : ${totalSearchMs.toStringAsFixed(2)} ms (vectorSearch PK-only)');
-    if (setupElapsedMs > 0) {
-      report.writeln(
-          '  Setup Time           : $setupElapsedMs ms (schema + anchor sampling, excluded from latency)');
+        '  Total Executed       : ${result.totalSearches} searches (Top-$topK)');
+    report.writeln(
+        '  Total Search Time    : ${totalSearchMs.toStringAsFixed(2)} ms');
+    if (recall.gtElapsedMs > 0) {
+      report.writeln('  Setup Time           : ${recall.gtElapsedMs} ms');
     }
     report.writeln('-' * 78);
-    report.writeln('  ACCURACY & RECALL METRICS:');
+    if (recall.canScoreRecall) {
+      report.writeln('  RECALL@K:');
+      report.writeln('    searchDepth        : $depth  →  intent $intentPct%');
+      report.writeln(
+          '    ${'Recall@${recall.topK}'.padRight(19)}: $recallPct% (${recall.neighborHits}/${recall.neighborPossible})  $gapLabel');
+      report.writeln('    Queries            : ${recall.queryCount}'
+          '${recall.queryCount < iterations ? ' for Recall@K; $iterations timed' : ''}');
+    } else {
+      report.writeln('  RECALL@K:');
+      report.writeln('    searchDepth        : $depth  →  intent $intentPct%');
+      report.writeln(
+          '    Status             : Skipped (insert example vector rows to measure Recall@K)');
+    }
+    report.writeln('-' * 78);
+    report.writeln('  CHECKS:');
+    if (recall.canScoreRecall) {
+      report.writeln(
+          '    Top-1 Hit Rate     : ${(recall.top1HitRate * 100).toStringAsFixed(1)}%  (true nearest is first)');
+    }
     report.writeln(
-        '    Exact Identity Hit : ${(exactHitRate * 100).toStringAsFixed(1)}% ($exactHitCount/$exactTestCount) 🎯 [Top-1 Exact]');
-    report.writeln(
-        '    Semantic Recall    : ${(semanticHitRate * 100).toStringAsFixed(1)}% ($semanticHitCount/$semanticTestCount) 🎯 [Top-$topK Proximity]');
-    report.writeln(
-        '    Overall Target Hit : ${(overallHitRate * 100).toStringAsFixed(1)}% ($overallHitCount/$totalAnchorTests)');
+        '    Self-Recall        : $identityPct  (stored vector returns itself first)');
     report.writeln('-' * 78);
     report.writeln('  LATENCY & THROUGHPUT:');
     report.writeln(
-        '    Average Latency    : ${avgLatency.toStringAsFixed(2)} ms/query');
-    report.writeln('    P50 Latency        : ${p50.toStringAsFixed(2)} ms');
-    report.writeln('    P95 Latency        : ${p95.toStringAsFixed(2)} ms');
-    report.writeln('    P99 Latency        : ${p99.toStringAsFixed(2)} ms');
+        '    Average Latency    : ${result.avgLatencyMs.toStringAsFixed(2)} ms/query');
     report.writeln(
-        '    QPS Throughput     : ${qps.toStringAsFixed(1)} queries/sec');
+        '    P50 Latency        : ${result.p50LatencyMs.toStringAsFixed(2)} ms');
+    report.writeln(
+        '    P95 Latency        : ${result.p95LatencyMs.toStringAsFixed(2)} ms');
+    report.writeln(
+        '    P99 Latency        : ${result.p99LatencyMs.toStringAsFixed(2)} ms');
+    report.writeln(
+        '    QPS Throughput     : ${result.qps.toStringAsFixed(1)} queries/sec');
     report.writeln('=' * 78);
 
     logService.add(report.toString().trimRight(), LogLevel.info);
-
-    return avgLatency;
   }
 
   Future<int> _resolveExampleBaseIndex(

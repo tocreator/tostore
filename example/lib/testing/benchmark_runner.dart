@@ -6,6 +6,7 @@ import 'package:tostore/tostore.dart';
 import 'benchmark_models.dart';
 import 'benchmark_schemas.dart';
 import 'log_service.dart';
+import 'vector_recall.dart';
 
 /// Runner that executes standardized benchmarks, collects metrics,
 /// and outputs detailed performance reports.
@@ -230,7 +231,7 @@ class BenchmarkRunner {
     db.query(BenchmarkSchemas.simple.name).limit(20).peek();
 
     final warmupVec = vectorWarmupData.first['embedding'] as VectorData;
-    // Warm both paths: standalone ANN (PK-only) and hybrid chain (full rows).
+    // Warm ANN search and hybrid (filter + vector) paths.
     await db.vectorSearch(
       BenchmarkSchemas.vector.name,
       fieldName: 'embedding',
@@ -695,11 +696,7 @@ class BenchmarkRunner {
         if (tier != BenchmarkTier.vector) return null;
         // Cap ingest scale so NGH construction stays practical on edge devices.
         effectiveCount = math.min(scale, 10000);
-        final vectorInsertRounds = <List<Map<String, dynamic>>>[
-          for (var round = 1; round <= iterations; round++)
-            _generateRecords(tier, effectiveCount,
-                seedOffset: round * effectiveCount),
-        ];
+        final vectorRows = _generateRecords(tier, effectiveCount);
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
               'Running [$tierName] Vector Batch Insert ($round/$iterations)...');
@@ -708,7 +705,7 @@ class BenchmarkRunner {
           final sw = Stopwatch()..start();
           await db.batchInsert(
             tableName,
-            vectorInsertRounds[round - 1],
+            vectorRows,
             allowPartialErrors: false,
             returnResultDetails: false,
             durability: durability,
@@ -736,13 +733,17 @@ class BenchmarkRunner {
             (_) => random.nextInt(datasetScale),
           );
 
-          // Pure ANN: PK + score only — aligns with mainstream vector-DB latency.
+          final groups =
+              math.max(1, datasetScale ~/ ExampleVectorCorpus.groupSize);
           final sw = Stopwatch()..start();
           for (final seed in querySeeds) {
             await db.vectorSearch(
               tableName,
               fieldName: 'embedding',
-              queryVector: _unitVector(seed),
+              queryVector: ExampleVectorCorpus.groupQuery(
+                seed % groups,
+                BenchmarkSchemas.vectorDimensions,
+              ),
               topK: BenchmarkSchemas.vectorTopK,
             );
           }
@@ -770,11 +771,19 @@ class BenchmarkRunner {
 
           final sw = Stopwatch()..start();
           for (final seed in querySeeds) {
-            final category = seed % 16;
+            final index = seed + 1;
+            final groupId = ExampleVectorCorpus.groupIdForIndex(index);
+            final category = groupId % 16;
             await db
                 .query(tableName)
                 .where('category', '=', category)
-                .matchVector('embedding', _unitVector(seed))
+                .matchVector(
+                  'embedding',
+                  ExampleVectorCorpus.groupQuery(
+                    groupId,
+                    BenchmarkSchemas.vectorDimensions,
+                  ),
+                )
                 .limit(BenchmarkSchemas.vectorTopK);
           }
           sw.stop();
@@ -788,63 +797,64 @@ class BenchmarkRunner {
         final corpusScale = math.min(scale, 10000);
         await _ensureDurableDataset(tableName, tier, corpusScale,
             durability: durability);
-        // Count = probe sample size (not corpus size).
-        effectiveCount = math.min(
-          BenchmarkSchemas.vectorRecallProbes,
-          corpusScale,
-        );
         final topK = BenchmarkSchemas.vectorTopK;
-        final midK = math.min(5, topK);
-        final random = math.Random(6262);
-        var hitAt1 = 0;
-        var hitAtMid = 0;
-        var hitAtK = 0;
-        var probes = 0;
+        final searchDepth = VectorIndexConfig.defaultSearchDepth;
+        final requested = math.min(
+          BenchmarkSchemas.vectorRecallProbes,
+          math.max(corpusScale, 1),
+        );
+        effectiveCount = requested;
+        var neighborHits = 0;
+        var neighborPossible = 0;
+        VectorRecallReport? lastReport;
 
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
-              'Running [$tierName] Vector Recall Check ($round/$iterations)...');
-          final querySeeds = List.generate(
-            effectiveCount,
-            (_) => random.nextInt(corpusScale),
+              'Running [$tierName] Vector Recall@K ($round/$iterations)...');
+          final report = await VectorRecallHarness.evaluate(
+            db: db,
+            tableName: tableName,
+            topK: topK,
+            searchDepth: searchDepth,
+            requestedQueries: requested,
+            querySeedOffset: (round - 1) * 100000,
+            yieldUi: () => Future<void>.delayed(Duration.zero),
+            onLog: (msg) => _updateLastOperation(msg),
           );
-
-          final sw = Stopwatch()..start();
-          for (final seed in querySeeds) {
-            // Sequential PK: slot i inserted as id = i + 1 with embedding seed i.
-            final targetId = (seed + 1).toString();
-            final hits = await db.vectorSearch(
-              tableName,
-              fieldName: 'embedding',
-              queryVector: _unitVector(seed),
-              topK: topK,
-            );
-            probes++;
-            var rank = -1;
-            for (var i = 0; i < hits.length; i++) {
-              if (hits[i].primaryKey == targetId) {
-                rank = i + 1;
-                break;
-              }
-            }
-            if (rank < 0) continue;
-            if (rank <= 1) hitAt1++;
-            if (rank <= midK) hitAtMid++;
-            if (rank <= topK) hitAtK++;
+          if (report == null) {
+            return null;
           }
-          sw.stop();
-          roundMicroseconds.add(sw.elapsedMicroseconds);
+          lastReport = report;
+          effectiveCount = report.queryCount;
+          neighborHits += report.neighborHits;
+          neighborPossible += report.neighborPossible;
+          final annUs = report.annLatenciesMs.fold<double>(
+            0,
+            (sum, ms) => sum + ms * 1000.0,
+          );
+          roundMicroseconds.add(annUs.round());
           await Future.delayed(const Duration(milliseconds: 5));
         }
 
-        final recall1 = probes == 0 ? 0.0 : (hitAt1 * 100.0 / probes);
-        final recallMid = probes == 0 ? 0.0 : (hitAtMid * 100.0 / probes);
-        final recallK = probes == 0 ? 0.0 : (hitAtK * 100.0 / probes);
-        // Percentages only in the table cell — no ops/s mixed in.
-        compactHighlight =
-            '${recall1.toStringAsFixed(0)}% / ${recallMid.toStringAsFixed(0)}% / ${recallK.toStringAsFixed(0)}%';
-        qualityNote =
-            'Exact@1=${recall1.toStringAsFixed(1)}%; Exact@$midK=${recallMid.toStringAsFixed(1)}%; Exact@$topK=${recallK.toStringAsFixed(1)}%; probes=$probes; corpus=$corpusScale';
+        final canScore =
+            lastReport?.canScoreRecall == true && neighborPossible > 0;
+        final recallFraction = canScore ? neighborHits / neighborPossible : 0.0;
+        // Headline is the operating point, not a raw percentage. A default
+        // depth of 50 is ~95% intent; printing "95%" reads as a ceiling.
+        compactHighlight = VectorRecallHarness.suiteHighlight(
+          canScore: canScore,
+          recallFraction: recallFraction,
+          searchDepth: searchDepth,
+        );
+        if (!canScore) {
+          qualityNote = lastReport == null
+              ? 'Recall@$topK=n/a at searchDepth=$searchDepth'
+              : '${lastReport.qualityNote}; rounds=$iterations';
+        } else {
+          qualityNote = '${lastReport!.qualityNote}; rounds=$iterations; '
+              'mean Recall@$topK=${(recallFraction * 100).toStringAsFixed(1)}% '
+              'at searchDepth=$searchDepth';
+        }
         break;
     }
 
@@ -892,7 +902,8 @@ class BenchmarkRunner {
     final currentCount = await db.query(tableName).count();
     if (currentCount >= scale) return;
 
-    final records = _generateRecords(tier, scale);
+    final missing = scale - currentCount;
+    final records = _generateRecords(tier, missing, seedOffset: currentCount);
     await _loadBufferDataset(tableName, records, durability: durability);
     await db.flush();
   }
@@ -923,41 +934,21 @@ class BenchmarkRunner {
         });
       case BenchmarkTier.vector:
         return List.generate(count, (i) {
-          final idx = seedOffset + i;
+          // Slot-stable index based on seedOffset so Recall@K still matches after appends.
+          final index = seedOffset + i + 1;
           return {
-            'label': 'vec_$idx',
-            // Slot-stable embedding seed so ANN queries can recreate vectors
-            // after clear/reload without depending on insert round offsets.
-            'category': i % 16,
-            'embedding': _unitVector(i),
+            'label': ExampleVectorCorpus.recordLabel(index),
+            'category': ExampleVectorCorpus.groupIdForIndex(index) % 16,
+            'embedding': ExampleVectorCorpus.memberVector(
+              index: index,
+              dimensions: BenchmarkSchemas.vectorDimensions,
+            ),
           };
         });
       case BenchmarkTier.all:
         return _generateRecords(BenchmarkTier.simple, count,
             seedOffset: seedOffset);
     }
-  }
-
-  /// Deterministic unit vector for reproducible ANN queries (matches insert seeds).
-  VectorData _unitVector(int seed) {
-    final dims = BenchmarkSchemas.vectorDimensions;
-    final rng = math.Random(seed);
-    final values = List<double>.generate(dims, (_) {
-      final u1 = rng.nextDouble().clamp(1e-10, 1.0);
-      final u2 = rng.nextDouble();
-      return math.sqrt(-2.0 * math.log(u1)) * math.cos(2.0 * math.pi * u2);
-    });
-    var normSq = 0.0;
-    for (final v in values) {
-      normSq += v * v;
-    }
-    final norm = math.sqrt(normSq);
-    if (norm > 0) {
-      for (var i = 0; i < dims; i++) {
-        values[i] /= norm;
-      }
-    }
-    return VectorData(values);
   }
 
   /// Generates synthetic update records targeting existing primary keys.

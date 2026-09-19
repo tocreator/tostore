@@ -8,7 +8,7 @@ class BenchmarkSchemas {
   /// Top-K used by pure ANN (vectorSearch) and hybrid search benches.
   static const int vectorTopK = 10;
 
-  /// Probe count for sampled exact-match recall check (Count column).
+  /// Query count for Recall@K (Count column).
   static const int vectorRecallProbes = 100;
 
   /// Pure PK table (Tier 1) - measures peak engine throughput.

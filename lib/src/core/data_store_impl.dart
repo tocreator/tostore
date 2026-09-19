@@ -7033,29 +7033,33 @@ class DataStoreImpl {
     if (config.persistenceMode == PersistenceMode.memory) {
       return;
     }
-
-    // Priority 1: Preload foreign key system table cache first
-    // This ensures the cache is loaded before user table caches consume memory,
-    // preventing it from being evicted due to memory pressure
-    if (_foreignKeyManager != null) {
-      await _foreignKeyManager!.preloadCache();
-    }
-
-    // Priority 2: Load user table caches
     final bool? enablePrewarm = config.enablePrewarmCache;
-
     if (enablePrewarm == false) {
       return; // Explicitly disabled
     }
-    _isGlobalPrewarming = true;
 
-    final task = _executePrewarm();
-    _prewarmFuture = task;
-    unawaited(task.whenComplete(() {
-      if (identical(_prewarmFuture, task)) {
+    _isGlobalPrewarming = true;
+    final completer = Completer<void>();
+    _prewarmFuture = completer.future;
+
+    unawaited(() async {
+      try {
+        // Priority 1: Preload foreign key system table cache first
+        // This ensures the cache is loaded before user table caches consume memory,
+        // preventing it from being evicted due to memory pressure
+        if (_foreignKeyManager != null) {
+          await _foreignKeyManager!.preloadCache();
+        }
+
+        await _executePrewarm();
+        if (!completer.isCompleted) completer.complete();
+      } catch (e, s) {
+        if (!completer.isCompleted) completer.completeError(e, s);
+      } finally {
+        _isGlobalPrewarming = false;
         _prewarmFuture = null;
       }
-    }));
+    }());
   }
 
   Future<void> _executePrewarm() async {
@@ -7069,6 +7073,10 @@ class DataStoreImpl {
 
       final schemaMgr = tableMetaManager;
       if (schemaMgr == null) return;
+
+      // Ensure system memory threshold and vector cluster budget are fully computed
+      await _resourceManager?.ensureInitialized();
+      _vectorIndexManager?.syncClusterCacheBudget();
 
       // Resolve prewarm budget up front so vector posting preload can stop at threshold.
       final effectivePrewarmThresholdMB =
@@ -7090,14 +7098,11 @@ class DataStoreImpl {
           ? prioritizedTables
           : prioritizedTables.take(maxPrewarmTables).toList(growable: false);
 
-      // Vector posting warm shares the global budget; cap its share so KV/table
-      // partial row caches still get a chance on large corpora.
-      final vectorBudgetCap = remainingPrewarmBytes ~/ 2;
-      var vectorBudgetUsed = 0;
-
-      // Load tables by weight order.
-      // If total table count is small, prewarm all tables to avoid missing hot
-      // tables when weight data is incomplete.
+      // =========================================================================
+      // Phase 1: Boundary leaf pages of all tables and B+Tree indexes (Highest priority).
+      // Extremely lightweight (few KB/table) and essential for fast index positioning
+      // and append writes. MUST NOT be crowded out by any data or vector loads.
+      // =========================================================================
       for (final tableName in selectedTables) {
         if (shouldAbortBackgroundScan) break;
         try {
@@ -7136,46 +7141,60 @@ class DataStoreImpl {
               final y17 = yieldController.maybeYield();
               if (y17 != null) await y17;
             }
-
-            final vectorIndexes = schemaMgr.getVectorIndexesFor(schema);
-            for (final vIdx in vectorIndexes) {
-              final vectorBudget = min(
-                remainingPrewarmBytes,
-                vectorBudgetCap - vectorBudgetUsed,
-              );
-              if (shouldAbortBackgroundScan || vectorBudget <= 0) {
-                break;
-              }
-              final used = await _vectorIndexManager?.prewarmVectorIndex(
-                    table,
-                    vIdx.indexUid,
-                    maxBytes: vectorBudget,
-                  ) ??
-                  0;
-              vectorBudgetUsed += used;
-              remainingPrewarmBytes = remainingPrewarmBytes > used
-                  ? remainingPrewarmBytes - used
-                  : 0;
-              final yVec = yieldController.maybeYield();
-              if (yVec != null) await yVec;
-            }
           }
 
-          // Yield control to the event loop to prevent UI freezing during a long prewarm process.
           final y18 = yieldController.maybeYield();
           if (y18 != null) await y18;
         } catch (e) {
-          // If already closing/closed, suppress errors from missing managers
           if (shouldAbortBackgroundScan) break;
-
-          // Schema migrate drops runtime-only tables asynchronously after open;
-          // prewarm may still hold a stale name list - skip quietly.
           if (_isDevTableNotFound(e)) {
             continue;
           }
+          Logger.error('Phase 1 boundary prewarm failed: $tableName',
+              rawError: e);
+          continue;
+        }
+      }
 
-          Logger.error('Load table data failed: $tableName', rawError: e);
-          continue; // Continue load other tables
+      if (shouldAbortBackgroundScan) return;
+
+      // =========================================================================
+      // Phase 2: Vector index prewarm (Nav centroid graph & compact posting clusters).
+      // Executed strictly AFTER all table boundary pages, and BEFORE full row scans.
+      // Operates within its dedicated compact cluster cache budget (governed by
+      // vectorCacheBudgetRatio), ensuring complete in-memory residency without
+      // competing with or crowding out table boundary pages.
+      // =========================================================================
+      for (final tableName in selectedTables) {
+        if (shouldAbortBackgroundScan || remainingPrewarmBytes <= 0) break;
+        try {
+          final schema =
+              await schemaMgr.getTableSchemaByName(TableName(tableName));
+          if (schema == null) continue;
+          final vectorIndexes = schemaMgr.getVectorIndexesFor(schema);
+          if (vectorIndexes.isEmpty) continue;
+
+          final table = await getTableContext(tableName);
+          for (final vIdx in vectorIndexes) {
+            if (shouldAbortBackgroundScan || remainingPrewarmBytes <= 0) break;
+            final loaded = await _vectorIndexManager?.prewarmVectorIndex(
+                  table,
+                  vIdx.indexUid,
+                  maxBytes: remainingPrewarmBytes,
+                ) ??
+                0;
+            remainingPrewarmBytes = max(0, remainingPrewarmBytes - loaded);
+            final yVec = yieldController.maybeYield();
+            if (yVec != null) await yVec;
+          }
+        } catch (e) {
+          if (shouldAbortBackgroundScan) break;
+          if (_isDevTableNotFound(e)) {
+            continue;
+          }
+          Logger.error('Phase 2 vector prewarm failed: $tableName',
+              rawError: e);
+          continue;
         }
       }
 
@@ -7403,15 +7422,20 @@ class DataStoreImpl {
         }
 
         final schema = table.schema;
+        final hasVector = schema.fields.any((f) => f.type == DataType.vector);
         final indexBytes = await _estimateTableIndexBytes(table);
         final tableDataSize =
             await tableDataManager.sumTableDataSizeBytes(table);
-        final maxRecords = _prewarmRecordCap(
+        final rawCap = _prewarmRecordCap(
           remainingBytes: remainingBytes,
           totalRecordCount: tableDataMeta.totalRecordCount,
           tableDataSizeBytes: tableDataSize,
           indexBytes: indexBytes,
         );
+        // Tables with vector fields already have their vector index prewarmed.
+        // Cap row-level prewarm to 50% of the raw budget capacity (rawCap ~/ 2)
+        // to balance rich point-lookup cache coverage against large vector row footprints.
+        final maxRecords = hasVector ? (rawCap ~/ 2) : rawCap;
         if (maxRecords <= 0) {
           continue;
         }

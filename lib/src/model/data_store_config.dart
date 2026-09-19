@@ -82,6 +82,15 @@ class DataStoreConfig {
   /// If null, the engine will derive a threshold from available memory at startup.
   final int? prewarmThresholdMB;
 
+  /// The proportion of [cacheMemoryBudgetMB] allocated to the compact vector
+  /// index cache ceiling (0.0 to 0.85).
+  ///
+  /// Defaults to null, which automatically uses an adaptive **0.50** (50% of the
+  /// total cache memory budget) as the independent vector cluster cache ceiling.
+  ///
+  /// This allocation is lazy and zero-cost when no vector operations are performed.
+  final double? vectorCacheBudgetRatio;
+
   /// Log segment file size in bytes.
   /// Defaults to a fraction of the main data partition size.
   final int maxLogPartitionFileSize;
@@ -165,6 +174,7 @@ class DataStoreConfig {
     this.cacheMemoryBudgetMB,
     this.enablePrewarmCache,
     this.prewarmThresholdMB,
+    this.vectorCacheBudgetRatio,
     required this.maxLogPartitionFileSize,
     required this.logPartitionCycle,
     required this.enableJournal,
@@ -206,6 +216,7 @@ class DataStoreConfig {
     int? cacheMemoryBudgetMB,
     bool? enablePrewarmCache,
     int? prewarmThresholdMB,
+    double? vectorCacheBudgetRatio,
     int? maxLogPartitionFileSize,
     int logPartitionCycle = 900000,
     bool? enableJournal,
@@ -253,6 +264,7 @@ class DataStoreConfig {
       cacheMemoryBudgetMB: cacheMemoryBudgetMB,
       enablePrewarmCache: enablePrewarmCache,
       prewarmThresholdMB: prewarmThresholdMB,
+      vectorCacheBudgetRatio: vectorCacheBudgetRatio,
       maxLogPartitionFileSize: resolvedMaxLogPartition,
       logPartitionCycle: logPartitionCycle,
       enableJournal: enableJournal ?? !PlatformHandler.isWeb,
@@ -602,6 +614,8 @@ class DataStoreConfig {
       cacheMemoryBudgetMB: json['cacheMemoryBudgetMB'] as int?,
       enablePrewarmCache: json['enablePrewarmCache'] as bool?,
       prewarmThresholdMB: json['prewarmThresholdMB'] as int?,
+      vectorCacheBudgetRatio:
+          (json['vectorCacheBudgetRatio'] as num?)?.toDouble(),
       maxLogPartitionFileSize: json['maxLogPartitionFileSize'] as int?,
       logPartitionCycle: json['logPartitionCycle'] as int? ?? 900000,
       enableJournal: json['enableJournal'] as bool? ?? !PlatformHandler.isWeb,
@@ -652,6 +666,8 @@ class DataStoreConfig {
       'cacheMemoryBudgetMB': cacheMemoryBudgetMB,
       'enablePrewarmCache': enablePrewarmCache,
       'prewarmThresholdMB': prewarmThresholdMB,
+      if (vectorCacheBudgetRatio != null)
+        'vectorCacheBudgetRatio': vectorCacheBudgetRatio,
       'maxLogPartitionFileSize': maxLogPartitionFileSize,
       'logPartitionCycle': logPartitionCycle,
       'enableJournal': enableJournal,
@@ -693,6 +709,7 @@ class DataStoreConfig {
     int? cacheMemoryBudgetMB,
     bool? enablePrewarmCache,
     int? prewarmThresholdMB,
+    double? vectorCacheBudgetRatio,
     int? maxLogPartitionFileSize,
     int? logPartitionCycle,
     bool? enableJournal,
@@ -731,6 +748,8 @@ class DataStoreConfig {
       cacheMemoryBudgetMB: cacheMemoryBudgetMB ?? this.cacheMemoryBudgetMB,
       enablePrewarmCache: enablePrewarmCache ?? this.enablePrewarmCache,
       prewarmThresholdMB: prewarmThresholdMB ?? this.prewarmThresholdMB,
+      vectorCacheBudgetRatio:
+          vectorCacheBudgetRatio ?? this.vectorCacheBudgetRatio,
       maxLogPartitionFileSize:
           maxLogPartitionFileSize ?? this.maxLogPartitionFileSize,
       logPartitionCycle: logPartitionCycle ?? this.logPartitionCycle,

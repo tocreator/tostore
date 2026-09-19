@@ -12,6 +12,7 @@ import 'testing/benchmark_runner.dart';
 import 'testing/database_tester.dart';
 import 'testing/example_schemas.dart';
 import 'testing/log_service.dart';
+import 'testing/vector_recall.dart' show vectorSearchDepthSweepPoints;
 import 'tostore_example.dart' show ForeignKeyMode, ToStoreExample;
 
 String _dbResultErrorMessage(DbResult result) {
@@ -1520,6 +1521,8 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                     _confirmClearCurrentTable();
                   } else if (value == 'vector_search') {
                     _showVectorSearchBenchmarkDialog();
+                  } else if (value == 'vector_depth_sweep') {
+                    _runVectorSearchDepthSweep();
                   }
                 },
                 itemBuilder: (context) => [
@@ -1602,6 +1605,18 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                                 size: 18, color: Color(0xff0aa6e8)),
                             SizedBox(width: 8),
                             Text('Vector Search'),
+                          ],
+                        ),
+                      ),
+                    if (_hasVectorSupport)
+                      const PopupMenuItem(
+                        value: 'vector_depth_sweep',
+                        child: Row(
+                          children: [
+                            Icon(_kDepthSweepIcon,
+                                size: 18, color: Color(0xff0aa6e8)),
+                            SizedBox(width: 8),
+                            Text('Depth Sweep (Recall)'),
                           ],
                         ),
                       ),
@@ -2614,23 +2629,40 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     if (!mounted) return;
 
     if (result != null) {
+      final isSweep = result['sweep'] == 1;
       final iterations = result['iterations'] ?? 1;
       final topK = result['topK'] ?? 10;
       final searchDepth = result['searchDepth'] ?? 50;
 
       setState(() {
         _isTesting = true;
-        _lastOperationInfo =
-            'Running $iterations vector search iterations (Top-$topK, depth=$searchDepth)...';
+        _lastOperationInfo = isSweep
+            ? 'Depth sweep: $iterations queries × Top-$topK across 11 depths...'
+            : 'Running $iterations vector search iterations (Top-$topK, depth=$searchDepth)...';
       });
 
       try {
-        await widget.example.vectorSearchBenchmark(
-          _selectedTable,
-          iterations,
-          topK,
-          searchDepth: searchDepth,
-        );
+        if (isSweep) {
+          await widget.example.vectorSearchDepthSweep(
+            _selectedTable,
+            iterations: iterations,
+            topK: topK,
+            onProgress: (done, total) {
+              if (!mounted) return;
+              setState(() {
+                _lastOperationInfo =
+                    'Depth sweep: $done/$total depths (Top-$topK, $iterations queries)...';
+              });
+            },
+          );
+        } else {
+          await widget.example.vectorSearchBenchmark(
+            _selectedTable,
+            iterations,
+            topK,
+            searchDepth: searchDepth,
+          );
+        }
       } catch (e) {
         logService.add('Benchmark failed: $e', LogLevel.error);
         _updateOperationInfo('❌ Vector search benchmark failed.');
@@ -2640,6 +2672,41 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
             _isTesting = false;
           });
         }
+      }
+    }
+  }
+
+  Future<void> _runVectorSearchDepthSweep({
+    int iterations = 100,
+    int topK = 10,
+  }) async {
+    setState(() {
+      _isTesting = true;
+      _lastOperationInfo =
+          'Depth sweep: $iterations queries × Top-$topK across 11 depths...';
+    });
+
+    try {
+      await widget.example.vectorSearchDepthSweep(
+        _selectedTable,
+        iterations: iterations,
+        topK: topK,
+        onProgress: (done, total) {
+          if (!mounted) return;
+          setState(() {
+            _lastOperationInfo =
+                'Depth sweep: $done/$total depths (Top-$topK, $iterations queries)...';
+          });
+        },
+      );
+    } catch (e) {
+      logService.add('Depth sweep failed: $e', LogLevel.error);
+      _updateOperationInfo('❌ Vector depth sweep failed.');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isTesting = false;
+        });
       }
     }
   }
@@ -5131,14 +5198,15 @@ class VectorSearchDialog extends StatefulWidget {
 
 class _VectorSearchDialogState extends State<VectorSearchDialog> {
   // Presets aligned to recall-intent mapping (depth → ~90–100%).
+  static const int _depthMin = 1; // ~90.1%
   static const int _depthFast = 30; // ~93%
   static const int _depthBalanced = 50; // ~95% production baseline
   static const int _depthDeep = 80; // ~98%
 
-  int _iterations = 1;
+  int _iterations = 100;
   int _topK = 10;
   int _searchDepth = _depthBalanced;
-  final _customController = TextEditingController(text: '1');
+  final _customController = TextEditingController(text: '100');
   final _depthController = TextEditingController(text: '$_depthBalanced');
 
   @override
@@ -5197,6 +5265,7 @@ class _VectorSearchDialogState extends State<VectorSearchDialog> {
             Wrap(
               spacing: 8,
               children: [
+                (_depthMin, 'Min'),
                 (_depthFast, 'Fast'),
                 (_depthBalanced, 'Balanced'),
                 (_depthDeep, 'Deep'),
@@ -5227,7 +5296,7 @@ class _VectorSearchDialogState extends State<VectorSearchDialog> {
                 border: OutlineInputBorder(),
                 prefixIcon: Icon(Icons.layers),
                 helperText:
-                    'Higher ≈ better recall intent + more latency (not recall%)',
+                    '1–100: higher depth raises recall intent (~90% to 100%) and latency',
               ),
               onChanged: (v) {
                 final val = int.tryParse(v);
@@ -5281,8 +5350,19 @@ class _VectorSearchDialogState extends State<VectorSearchDialog> {
             ),
             const SizedBox(height: 16),
             const Text(
-              'Total searches to perform. Results will be averaged to measure latency.',
+              'Iterations control latency measurement. Recall@K uses up to 200 '
+              'queries. Use 100 or more iterations for a stable Recall@K estimate.',
               style: TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+            const SizedBox(height: 24),
+            const Text('Depth Sweep',
+                style: TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
+            Text(
+              'One click runs searchDepth '
+              '${vectorSearchDepthSweepPoints.join(", ")} at the current corpus '
+              'size and prints a compact recall-vs-intent table.',
+              style: const TextStyle(fontSize: 12, color: Colors.grey),
             ),
           ],
         ),
@@ -5291,6 +5371,19 @@ class _VectorSearchDialogState extends State<VectorSearchDialog> {
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
           child: const Text('Cancel'),
+        ),
+        OutlinedButton(
+          onPressed: () {
+            final parsedDepth = int.tryParse(_depthController.text.trim());
+            final depth = (parsedDepth ?? _searchDepth).clamp(1, 100);
+            Navigator.of(context).pop({
+              'sweep': 1,
+              'iterations': _iterations,
+              'topK': _topK,
+              'searchDepth': depth,
+            });
+          },
+          child: const Text('Sweep All Depths'),
         ),
         ElevatedButton(
           onPressed: () {
@@ -5306,7 +5399,7 @@ class _VectorSearchDialogState extends State<VectorSearchDialog> {
             backgroundColor: const Color(0xff0aa6e8),
             foregroundColor: Colors.white,
           ),
-          child: const Text('Start Benchmark'),
+          child: const Text('Single Depth'),
         ),
       ],
     );
@@ -5316,6 +5409,9 @@ class _VectorSearchDialogState extends State<VectorSearchDialog> {
 /// Pseudo table labels for the system key-value store (not real table names).
 /// Listing uses [KvStore.getKeys]/[KvStore.get] because system tables cannot
 /// be queried via [ToStore.query].
+// Explicit IconData so release icon tree-shaking retains this glyph (Icons.auto_graph).
+const IconData _kDepthSweepIcon = IconData(0xe0be, fontFamily: 'MaterialIcons');
+
 const String _kKvSpaceLabel = 'KV (space)';
 const String _kKvGlobalLabel = 'KV (global)';
 const String _kKvDefaultKeyPrefix = 'demo_kv_';

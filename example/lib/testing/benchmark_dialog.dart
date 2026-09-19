@@ -382,6 +382,17 @@ class _BenchmarkDialogState extends State<BenchmarkDialog> {
               ),
             ),
           ),
+          if (summary.vectorRecallCaption != null) ...[
+            const SizedBox(height: 10),
+            Text(
+              summary.vectorRecallCaption!,
+              style: const TextStyle(
+                fontSize: 12,
+                height: 1.4,
+                color: Color(0xFF64748B),
+              ),
+            ),
+          ],
         ],
       ),
     );
