@@ -1406,7 +1406,9 @@ final class TableTreePartitionManager {
     }
 
     OverflowBatchAllocator? overflowAllocator;
+    OverflowWriteBuffer? overflowWriteBuffer;
     var overflowSizeDeltaSum = 0;
+    final preStoredOverflow = <String, Uint8List>{};
     if (totalOverflowChunks > 0) {
       overflowAllocator = await _dataStore.overflowManager.startBatchAllocation(
         totalChunks: totalOverflowChunks,
@@ -1417,6 +1419,7 @@ final class TableTreePartitionManager {
         encryptionKeyId: encryptionKeyId,
         flush: false,
       );
+      overflowWriteBuffer = OverflowWriteBuffer();
       overflowSizeDeltaSum = overflowAllocator.sizeDeltaBytes;
       if (overflowAllocator.updatedOverflowPartitionCount >
           meta.overflowPartitionCount) {
@@ -1424,6 +1427,51 @@ final class TableTreePartitionManager {
           overflowPartitionCount:
               overflowAllocator.updatedOverflowPartitionCount,
         );
+      }
+      // Write overflow pages before any leaf is published. markLeafDirty
+      // publishes ValueRefs into the live page cache; a concurrent decode
+      // (or LRU eviction of the overflow page cache) must hit durable pages,
+      // not an in-memory write buffer.
+      try {
+        for (int i = 0; i < putOps.length; i++) {
+          final yPre = yc.maybeYield();
+          if (yPre != null) await yPre;
+          final op = putOps[i];
+          final encoded = preEncoded[op.pk]!;
+          if (!_dataStore.overflowManager.shouldExternalize(
+              _dataStore.configuredPageSize, encoded.length)) {
+            continue;
+          }
+          final allocRes = await _dataStore.overflowManager.putLargeValue(
+            table: table,
+            valueBytes: encoded,
+            pageSize: _dataStore.configuredPageSize,
+            overflowPartitionCount: meta.overflowPartitionCount,
+            encryptionKey: encryptionKey,
+            encryptionKeyId: encryptionKeyId,
+            flush: false,
+            allocator: overflowAllocator,
+            writeBuffer: overflowWriteBuffer,
+          );
+          overflowSizeDeltaSum += allocRes.sizeDeltaBytes;
+          if (allocRes.overflowPartitionCount > meta.overflowPartitionCount) {
+            meta = meta.copyWith(
+              overflowPartitionCount: allocRes.overflowPartitionCount,
+            );
+          }
+          dirtyOverflowPaths.add(
+            _dataStore.pathManager.getOverflowPartitionFilePathByContext(
+              table,
+              allocRes.ref.overflowPartitionNo,
+            ),
+          );
+          preStoredOverflow[op.pk] =
+              StoredValue.overflow(allocRes.ref).encode();
+        }
+      } finally {
+        if (!overflowWriteBuffer.isEmpty) {
+          await overflowWriteBuffer.commit(_storage, flush: false);
+        }
       }
     }
     for (final op in opList) {
@@ -1512,8 +1560,13 @@ final class TableTreePartitionManager {
         }
 
         Uint8List stored;
-        if (_dataStore.overflowManager
+        final preparedOverflow = preStoredOverflow[op.pk];
+        if (preparedOverflow != null) {
+          stored = preparedOverflow;
+        } else if (_dataStore.overflowManager
             .shouldExternalize(_dataStore.configuredPageSize, encoded.length)) {
+          // Estimate missed this row (should be rare). Write immediately so
+          // the ValueRef is never published without overflow pages on disk.
           final allocRes = await _dataStore.overflowManager.putLargeValue(
             table: table,
             valueBytes: encoded,
@@ -1522,22 +1575,20 @@ final class TableTreePartitionManager {
             encryptionKey: encryptionKey,
             encryptionKeyId: encryptionKeyId,
             flush: false,
-            allocator: overflowAllocator,
           );
-          // Non-batch put accounts file growth here; batch put returns 0
-          // (already counted in startBatchAllocation).
           overflowSizeDeltaSum += allocRes.sizeDeltaBytes;
           if (allocRes.overflowPartitionCount > meta.overflowPartitionCount) {
             meta = meta.copyWith(
               overflowPartitionCount: allocRes.overflowPartitionCount,
             );
           }
-          final ref = allocRes.ref;
-          final overflowPath = _dataStore.pathManager
-              .getOverflowPartitionFilePathByContext(
-                  table, ref.overflowPartitionNo);
-          dirtyOverflowPaths.add(overflowPath);
-          stored = StoredValue.overflow(ref).encode();
+          dirtyOverflowPaths.add(
+            _dataStore.pathManager.getOverflowPartitionFilePathByContext(
+              table,
+              allocRes.ref.overflowPartitionNo,
+            ),
+          );
+          stored = StoredValue.overflow(allocRes.ref).encode();
         } else {
           stored = StoredValue.inline(encoded).encode();
         }
@@ -1612,6 +1663,8 @@ final class TableTreePartitionManager {
       } catch (_) {}
     }
 
+    // Freelist updates from replace/delete are written immediately; fsync
+    // overflow files before B+Tree leaves become durable.
     if (dirtyOverflowPaths.isNotEmpty) {
       for (final path in dirtyOverflowPaths) {
         await _storage.flushFile(path);

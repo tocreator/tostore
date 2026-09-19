@@ -3,15 +3,15 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
-import '../interface/storage_interface.dart';
 import '../handler/logger.dart';
+import '../interface/storage_interface.dart';
+import '../model/data_store_config.dart';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
-import '../model/value_ref.dart';
-import '../model/data_store_config.dart';
 import '../model/table_context.dart';
 import '../model/table_identity.dart';
+import '../model/value_ref.dart';
 import 'btree_page.dart';
 import 'data_store_impl.dart';
 import 'tree_cache.dart';
@@ -25,8 +25,10 @@ import 'tree_cache.dart';
 ///   - pageNo>=1: [OverflowPage] or [FreePage]
 ///
 /// Notes:
-/// - This manager is **write-order safe** for references: we write overflow pages
-///   first, then callers store the resulting [ValueRef] bytes in the primary tree.
+/// - This manager is **write-order safe** for references: overflow pages are
+///   committed before callers persist [ValueRef] bytes in the primary tree.
+///   Batch callers stage pages in [OverflowWriteBuffer] and must [OverflowWriteBuffer.commit]
+///   before flushing B+Tree leaves. On-disk page layout is unchanged.
 /// - Reuse via freelist is supported, but freeing old blobs is intentionally
 ///   **best-effort** and should be wired to a safe GC policy later.
 final class OverflowAllocationResult {
@@ -71,6 +73,9 @@ final class OverflowManager {
 
   // Locks to prevent concurrent metadata updates (race on free list/file size).
   final Map<String, SimpleLock> _locks = {};
+
+  /// (pageSize, encryptionKeyId) -> max overflow chunk payload length.
+  final Map<(int, int?), int> _maxChunkLenCache = {};
 
   SimpleLock _getLock(String path) {
     return _locks.putIfAbsent(path, () => SimpleLock());
@@ -222,6 +227,7 @@ final class OverflowManager {
     int? encryptionKeyId,
     bool flush = true,
     OverflowBatchAllocator? allocator,
+    OverflowWriteBuffer? writeBuffer,
   }) async {
     if (valueBytes.isEmpty) {
       throw DbException([
@@ -282,16 +288,27 @@ final class OverflowManager {
         encryptionKeyId: encryptionKeyId,
         aad: _aadForOverflowPage(targetPartitionNo, pn),
       );
-      final pageBytes = BTreePageIO.buildPageBytes(
-        type: BTreePageType.overflow,
-        encodedPayload: encodedPayload,
-        pageSize: pageSize,
-      );
-      writes.add(ByteWrite(offset: pn * pageSize, bytes: pageBytes));
+      writes.add(ByteWrite(
+        offset: pn * pageSize,
+        bytes: BTreePageIO.buildPageBytes(
+          type: BTreePageType.overflow,
+          encodedPayload: encodedPayload,
+          pageSize: pageSize,
+        ),
+      ));
     }
 
-    // IMPORTANT: write overflow pages first (reference safety).
-    await _dataStore.storage.writeManyAsBytesAt(path, writes, flush: flush);
+    // Overflow pages must be on disk before ValueRefs are published. Batch
+    // apply stages pages and commits in sequential runs (same bytes / page
+    // numbers; each commit is awaited).
+    if (writeBuffer != null) {
+      writeBuffer.addWrites(path, writes);
+      if (writeBuffer.pendingBytes >= OverflowWriteBuffer.maxStagedBytes) {
+        await writeBuffer.commit(_dataStore.storage, flush: false);
+      }
+    } else {
+      await _dataStore.storage.writeManyAsBytesAt(path, writes, flush: flush);
+    }
 
     // Warm cache with newly written pages
     for (int i = 0; i < pageNos.length; i++) {
@@ -594,6 +611,16 @@ final class OverflowManager {
   }
 
   int _maxChunkLen(int pageSize, {int? encryptionKeyId}) {
+    final key = (pageSize, encryptionKeyId);
+    final cached = _maxChunkLenCache[key];
+    if (cached != null) return cached;
+    final computed =
+        _computeMaxChunkLen(pageSize, encryptionKeyId: encryptionKeyId);
+    _maxChunkLenCache[key] = computed;
+    return computed;
+  }
+
+  int _computeMaxChunkLen(int pageSize, {int? encryptionKeyId}) {
     // Ensure the whole page fits after optional encryption wrapper:
     // BTreeHeader + encodeBytes(header + payload) <= pageSize.
     const int overflowPayloadHeader = 16; // magic+ver+flags+next+len
@@ -879,6 +906,88 @@ final class OverflowManager {
       }
     }
     return total;
+  }
+}
+
+/// Stages overflow page writes so a batch apply issues sequential IO instead of
+/// one `writeManyAsBytesAt` per record. On-disk format is unchanged.
+final class OverflowWriteBuffer {
+  /// Flush staged pages once this many bytes are pending (bounds Dart heap on
+  /// large vector ingest). 4MB ≈ 256 × 16KB pages ≈ 256 overflow records.
+  static const int maxStagedBytes = 4 * 1024 * 1024;
+
+  final Map<String, List<ByteWrite>> _writes = {};
+  int _pendingBytes = 0;
+
+  int get pendingBytes => _pendingBytes;
+
+  bool get isEmpty => _pendingBytes <= 0;
+
+  void addWrites(String path, List<ByteWrite> writes) {
+    if (writes.isEmpty) return;
+    final list = _writes.putIfAbsent(path, () => <ByteWrite>[]);
+    for (final w in writes) {
+      if (w.bytes.isEmpty) continue;
+      list.add(w);
+      _pendingBytes += w.bytes.length;
+    }
+  }
+
+  /// Coalesce adjacent spans and write each path. On IO failure the buffer is
+  /// left intact so a retry overwrites the same page offsets (idempotent).
+  Future<void> commit(StorageInterface storage, {bool flush = false}) async {
+    if (_writes.isEmpty) return;
+    for (final entry in _writes.entries) {
+      final coalesced = _coalesceAdjacent(entry.value);
+      if (coalesced.isEmpty) continue;
+      await storage.writeManyAsBytesAt(entry.key, coalesced, flush: flush);
+    }
+    _writes.clear();
+    _pendingBytes = 0;
+  }
+
+  static List<ByteWrite> _coalesceAdjacent(List<ByteWrite> writes) {
+    if (writes.length <= 1) return writes;
+    final items = List<ByteWrite>.from(writes)
+      ..sort((a, b) => a.offset.compareTo(b.offset));
+    final out = <ByteWrite>[];
+    var runStart = items[0].offset;
+    var runParts = <Uint8List>[items[0].bytes];
+    var runLen = items[0].bytes.length;
+    var runEnd = runStart + runLen;
+
+    void flushRun() {
+      if (runParts.length == 1) {
+        out.add(ByteWrite(offset: runStart, bytes: runParts[0]));
+        return;
+      }
+      final buf = Uint8List(runLen);
+      var o = 0;
+      for (final part in runParts) {
+        buf.setRange(o, o + part.length, part);
+        o += part.length;
+      }
+      out.add(ByteWrite(offset: runStart, bytes: buf));
+    }
+
+    for (int i = 1; i < items.length; i++) {
+      final w = items[i];
+      final adjacent = w.offset == runEnd;
+      final canMerge = adjacent && runLen + w.bytes.length <= maxStagedBytes;
+      if (canMerge) {
+        runParts.add(w.bytes);
+        runLen += w.bytes.length;
+        runEnd += w.bytes.length;
+      } else {
+        flushRun();
+        runStart = w.offset;
+        runParts = <Uint8List>[w.bytes];
+        runLen = w.bytes.length;
+        runEnd = runStart + runLen;
+      }
+    }
+    flushRun();
+    return out;
   }
 }
 
