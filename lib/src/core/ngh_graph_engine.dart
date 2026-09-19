@@ -113,7 +113,7 @@ class _NghCompactSlot {
 final class _NghClusterSlots {
   final List<_NghCompactSlot> slots;
   final int byteSize;
-  final int entryCount;
+  int entryCount;
 
   _NghClusterSlots({
     required this.slots,
@@ -545,17 +545,7 @@ class NghGraphEngine {
     final hasBudget =
         _clusterCache.estimatedTotalSizeBytes < _clusterCacheMaxBytes;
     if (!hasBudget) return false;
-
-    if (hasIncompleteOrMissing) return true;
-
-    for (final c in centroids) {
-      if (c.isCoarse || c.entryCount <= 0) continue;
-      if (!_clusterCache.containsPoint3(
-          tableUid.value, indexUid.value, c.centroidId)) {
-        return true;
-      }
-    }
-    return false;
+    return hasIncompleteOrMissing;
   }
 
   String _cacheKey(TableUid tableUid, IndexUid indexUid) =>
@@ -575,12 +565,17 @@ class NghGraphEngine {
   }
 
   /// O(1) cache freshness check comparing live entry counts.
+  ///
+  /// [slots.length] must cover [entryCount] (tombstones may make it larger).
+  /// A short list with a matching entryCount is an incomplete load that would
+  /// otherwise stay "fresh" and skip posting I/O forever.
   bool _clusterCacheIsFresh(
     _NghClusterSlots cached,
     NghNavCentroidNode centroid,
   ) {
     if (centroid.entryCount <= 0) return true;
-    return cached.entryCount == centroid.entryCount;
+    return cached.entryCount == centroid.entryCount &&
+        cached.slots.length >= centroid.entryCount;
   }
 
   void _putCentroidSlots({
@@ -716,7 +711,7 @@ class NghGraphEngine {
       if (clusterMap.containsKey(cId)) continue;
       expected.add(cId);
       final c = navGraph.centroids[cId];
-      if (c.postingPages.isEmpty && !c.postingDirRoot.isNone) {
+      if (!c.postingPageListReady && !c.postingDirRoot.isNone) {
         needsHydrate.add(c);
       }
     }
@@ -906,7 +901,7 @@ class NghGraphEngine {
         }
 
         expected.add(cId);
-        if (c.postingPages.isEmpty && !c.postingDirRoot.isNone) {
+        if (!c.postingPageListReady && !c.postingDirRoot.isNone) {
           batchToHydrate.add(c);
         }
       }
@@ -3354,7 +3349,7 @@ class NghGraphEngine {
     required Map<NghPagePtr, NghPostingPage> dirtyPosting,
     required Map<int, NghPostingPage> localPostingCache,
   }) async {
-    if (centroid.postingPages.isEmpty && !centroid.postingDirRoot.isNone) {
+    if (!centroid.postingPageListReady && !centroid.postingDirRoot.isNone) {
       await _partitionManager.hydratePostingDirs(table, indexUid, [centroid]);
     }
     final live = <NghPostingSlot>[];
@@ -3521,10 +3516,15 @@ class NghGraphEngine {
           touch: false,
         );
         if (cached != null) {
+          var cachedHit = false;
           for (final slot in cached.slots) {
             if (utf8.decode(slot.primaryKeyBytes) == pk) {
               slot.flags |= 0x01;
+              cachedHit = true;
             }
+          }
+          if (cachedHit) {
+            cached.entryCount = max(0, cached.entryCount - 1);
           }
         }
       }

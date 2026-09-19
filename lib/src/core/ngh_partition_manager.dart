@@ -149,6 +149,17 @@ final class NghPartitionManager {
 
   DataStoreConfig get engineConfig => _dataStore.config;
 
+  /// pdir/pkmap are mutation burst caches (repeat insert/delete on hot keys),
+  /// not the search path. Fixed caps — do not scale with indexBudget.
+  /// Charged as a full TPG2 page so empty-per-cluster dirs cannot flood the
+  /// ledger; 4MB ≈ 256 tails at 16KB.
+  static const int _pdirBurstCacheMaxBytes = 4 * 1024 * 1024;
+  static const int _pdirBurstCacheMinBytes = 256 * 1024;
+
+  /// 8MB payload covers a ~1M-key locator tree and a hot slice at 10M+.
+  static const int _pkmapBurstCacheMaxBytes = 8 * 1024 * 1024;
+  static const int _pkmapBurstCacheMinBytes = 1 * 1024 * 1024;
+
   void _initCaches(int indexBudget) {
     // Search prefers the float compact cluster cache; posting pages are the
     // I/O fill layer. Never init from a 0 quota (ResourceManager is still
@@ -172,16 +183,16 @@ final class NghPartitionManager {
       debugLabel: 'NghNavPageCache',
     );
     _pdirPageCache = TreeCache<NghPostingDirPage>(
-      sizeCalculator: (page) => page.pages.length * 8 + 32,
-      maxByteThreshold: max(1, nghBudget ~/ 4),
-      minByteThreshold: max(1, minThreshold ~/ 4),
+      sizeCalculator: (_) => configuredPageSize,
+      maxByteThreshold: _pdirBurstCacheMaxBytes,
+      minByteThreshold: _pdirBurstCacheMinBytes,
       groupDepth: 2,
       debugLabel: 'NghPdirPageCache',
     );
     _pkmapPageCache = TreeCache<NghPkMapDirtyPage>(
       sizeCalculator: (page) => page.estimatePayloadSize() + 32,
-      maxByteThreshold: max(1, nghBudget ~/ 4),
-      minByteThreshold: max(1, minThreshold ~/ 4),
+      maxByteThreshold: _pkmapBurstCacheMaxBytes,
+      minByteThreshold: _pkmapBurstCacheMinBytes,
       groupDepth: 2,
       debugLabel: 'NghPkmapPageCache',
     );
@@ -202,12 +213,12 @@ final class NghPartitionManager {
       min: max(1, minThreshold ~/ 4),
     );
     _pdirPageCache.updateByteThreshold(
-      max: max(1, nghBudget ~/ 4),
-      min: max(1, minThreshold ~/ 4),
+      max: _pdirBurstCacheMaxBytes,
+      min: _pdirBurstCacheMinBytes,
     );
     _pkmapPageCache.updateByteThreshold(
-      max: max(1, nghBudget ~/ 4),
-      min: max(1, minThreshold ~/ 4),
+      max: _pkmapBurstCacheMaxBytes,
+      min: _pkmapBurstCacheMinBytes,
     );
   }
 
@@ -661,8 +672,12 @@ final class NghPartitionManager {
     List<NghNavCentroidNode> centroids,
   ) async {
     for (final c in centroids) {
-      if (c.postingPages.isNotEmpty) continue;
-      if (c.postingDirRoot.isNone) continue;
+      if (c.postingPageListReady) continue;
+      if (c.postingDirRoot.isNone) {
+        c.postingPageListReady = true;
+        continue;
+      }
+      c.postingPages.clear();
       var current = c.postingDirRoot;
       final seen = <int>{};
       while (!current.isNone && seen.add(current.cacheKey)) {
@@ -671,6 +686,7 @@ final class NghPartitionManager {
         c.postingPages.addAll(page.pages);
         current = page.next;
       }
+      c.postingPageListReady = true;
     }
   }
 

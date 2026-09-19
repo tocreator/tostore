@@ -437,6 +437,11 @@ final class NghNavCentroidNode {
   /// Directory pages need a flush (append or rewrite).
   bool postingDirDirty;
 
+  /// True when [postingPages] is the full live list (hydrate / rewrite /
+  /// new cluster). False after loading nav from disk so search still hydrates
+  /// pdir. Insert must not flip this by appending only the new tail pages.
+  bool postingPageListReady;
+
   /// Pre-computed SIMD view for zero-allocation dot product kernels.
   Float32x4List? simdVector;
 
@@ -474,6 +479,7 @@ final class NghNavCentroidNode {
     this.childrenDirRoot = NghPageId.none,
     List<int>? childIds,
     this.postingDirDirty = false,
+    this.postingPageListReady = false,
   })  : neighbors = List<int>.of(neighbors ?? const <int>[]),
         childIds = List<int>.of(childIds ?? const <int>[]),
         postingPages = List<NghPageId>.of(
@@ -484,6 +490,9 @@ final class NghNavCentroidNode {
                 tailPostingPageNo,
               ),
         ) {
+    if (!postingPageListReady) {
+      postingPageListReady = this.postingPages.isNotEmpty;
+    }
     final len = vector.length;
     final n = len >> 2;
     if (n > 0 && (vector.offsetInBytes & 15) == 0) {
@@ -516,11 +525,15 @@ final class NghNavCentroidNode {
 
   void addPostingPage(NghPageId id) {
     if (id.isNone) return;
+    postingDirDirty = true;
+    // Disk pdir is still authoritative. Recording only the new tail pages
+    // would make postingPages non-empty and skip hydrate on search.
+    if (!postingPageListReady && !postingDirRoot.isNone) return;
     for (final e in postingPages) {
       if (e.partitionNo == id.partitionNo && e.pageNo == id.pageNo) return;
     }
     postingPages.add(id);
-    postingDirDirty = true;
+    if (postingDirRoot.isNone) postingPageListReady = true;
   }
 
   void replacePostingPages(List<NghPageId> pages) {
@@ -528,6 +541,7 @@ final class NghNavCentroidNode {
       ..clear()
       ..addAll(pages);
     postingDirDirty = true;
+    postingPageListReady = true;
   }
 
   void setHeadTailFromIds(NghPageId head, NghPageId tail) {
