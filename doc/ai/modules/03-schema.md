@@ -113,7 +113,7 @@ const FieldSchema({
 | `datetime` | `DateTime` / `String` | Stored ISO8601 |
 | `array` | `List` | |
 | `json` | `Map<String, dynamic>` | |
-| `vector` | `VectorData` / `List<num>` | Needs `vectorConfig` |
+| `vector` | `VectorData` / `List<num>` | Needs `vectorConfig.dimensions` in `1..65535` |
 | `dynamic` | arbitrary Dart | No forced conversion |
 
 ### Constraints (engine-enforced)

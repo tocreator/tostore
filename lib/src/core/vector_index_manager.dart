@@ -16,6 +16,7 @@ import '../model/table_identity.dart';
 import '../model/table_schema.dart';
 import 'data_store_impl.dart';
 import 'ngh_graph_engine.dart';
+import 'ngh_page.dart';
 import 'ngh_partition_manager.dart';
 import 'resource_manager.dart';
 import 'vector_cache.dart';
@@ -527,6 +528,7 @@ class VectorIndexManager {
     await _withNavLayoutLock(table.tableUid, indexUid, () async {
       var meta = await _loadMeta(table, indexUid);
       if (meta == null) return;
+      meta = _withPageSizes(meta);
       if (meta.isPagedLayout) {
         await _partitionManager.deleteLegacyNavBlobIfExists(table, indexUid);
         return;
@@ -558,6 +560,7 @@ class VectorIndexManager {
         table,
         indexUid,
         const NghPagePtr(NghDataCategory.nav, 0, NghIndexMeta.firstDataPageNo),
+        pageSize: _partitionManager.pageSizeFor(NghDataCategory.nav, meta),
       );
       if (orphan == null || orphan.centroids.isEmpty) return;
       final graph =
@@ -577,6 +580,12 @@ class VectorIndexManager {
     final used = _graphEngine.clusterCacheBytes;
     return max(0, clusterBudget - used);
   }
+
+  NghIndexMeta _withPageSizes(NghIndexMeta meta) =>
+      NghPageSizer.ensureIndexPageSizes(
+        meta,
+        _dataStore.configuredPageSize,
+      );
 
   // =====================================================================
   // Meta Persistence
@@ -628,10 +637,11 @@ class VectorIndexManager {
 
   /// Align in-memory meta with stable [pathKey].
   NghIndexMeta _reconcileLoadedNghMeta(NghIndexMeta meta, IndexUid pathKey) {
-    if (pathKey.isNotEmpty && meta.indexUid != pathKey) {
-      return meta.copyWith(indexUid: pathKey);
+    var next = _withPageSizes(meta);
+    if (pathKey.isNotEmpty && next.indexUid != pathKey) {
+      next = next.copyWith(indexUid: pathKey);
     }
-    return meta;
+    return next;
   }
 
   Future<void> _persistMeta(
@@ -657,7 +667,13 @@ class VectorIndexManager {
   ) async {
     // Check cache
     var meta = _vectorCache.getMeta(table, indexUid);
-    if (meta != null) return meta;
+    if (meta != null) {
+      final sized = _withPageSizes(meta);
+      if (!identical(sized, meta)) {
+        _vectorCache.putMeta(table, indexUid, sized);
+      }
+      return sized;
+    }
 
     // Try load from disk
     meta = await _loadMeta(table, indexUid);
@@ -670,12 +686,12 @@ class VectorIndexManager {
     final dims = fieldSchema.vectorConfig?.dimensions ?? 128;
     final vc = idx.vectorConfig;
 
-    meta = NghIndexMeta.createEmpty(
+    meta = _withPageSizes(NghIndexMeta.createEmpty(
       indexUid: indexUid,
       tableUid: table.tableUid,
       dimensions: dims,
       distanceMetric: vc?.distanceMetric ?? VectorDistanceMetric.cosine,
-    );
+    ));
 
     _vectorCache.putMeta(table, indexUid, meta);
     return meta;
@@ -717,13 +733,13 @@ class VectorIndexManager {
     final metric =
         indexSchema.vectorConfig?.distanceMetric ?? VectorDistanceMetric.cosine;
 
-    final initialMeta = NghIndexMeta.createEmpty(
+    final initialMeta = _withPageSizes(NghIndexMeta.createEmpty(
       indexUid: indexUid,
       tableUid: table.tableUid,
       dimensions: dims,
       distanceMetric: metric,
       isBuilding: true,
-    );
+    ));
 
     await _persistMeta(table, indexUid, initialMeta);
     _vectorCache.putMeta(table, indexUid, initialMeta);

@@ -100,6 +100,8 @@ abstract final class NghIndexMetaFieldId {
   static const int hasPkLocator = 29;
   static const int pkBackfillPartition = 30;
   static const int pkBackfillPage = 31;
+  static const int postingPageSize = 32;
+  static const int navPageSize = 33;
 }
 
 /// Discriminator for global meta blobs embedded in partition-0 page 0.
@@ -543,6 +545,14 @@ final class NghIndexMetaCodec {
     w.writeVarint(meta.pkBackfillPartition);
     w.writeFieldTag(NghIndexMetaFieldId.pkBackfillPage, WireType.varint);
     w.writeVarint(meta.pkBackfillPage);
+    if (meta.postingPageSize > 0) {
+      w.writeFieldTag(NghIndexMetaFieldId.postingPageSize, WireType.varint);
+      w.writeVarint(meta.postingPageSize);
+    }
+    if (meta.navPageSize > 0) {
+      w.writeFieldTag(NghIndexMetaFieldId.navPageSize, WireType.varint);
+      w.writeVarint(meta.navPageSize);
+    }
     return w.view;
   }
 
@@ -583,6 +593,8 @@ final class NghIndexMetaCodec {
     bool hasPkLocator = false;
     int pkBackfillPartition = 0;
     int pkBackfillPage = 0;
+    int postingPageSize = 0;
+    int navPageSize = 0;
 
     while (!reader.isEOF) {
       final (fieldId, wireType) = reader.readFieldTag();
@@ -683,6 +695,12 @@ final class NghIndexMetaCodec {
         case NghIndexMetaFieldId.pkBackfillPage:
           pkBackfillPage = reader.readVarint();
           break;
+        case NghIndexMetaFieldId.postingPageSize:
+          postingPageSize = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.navPageSize:
+          navPageSize = reader.readVarint();
+          break;
         default:
           reader.skipField(wireType);
       }
@@ -734,6 +752,8 @@ final class NghIndexMetaCodec {
       hasPkLocator: hasPkLocator,
       pkBackfillPartition: pkBackfillPartition,
       pkBackfillPage: pkBackfillPage,
+      postingPageSize: postingPageSize,
+      navPageSize: navPageSize,
     );
   }
 

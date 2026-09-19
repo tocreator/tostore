@@ -51,6 +51,9 @@ class InternalConfig {
   /// [GlobalConfig.pageSize] during upgrades. Once persisted in GlobalConfig,
   /// page size is immutable for that database lifetime.
   static const int defaultPageSize = 16 * 1024;
+
+  /// Inclusive max vector width. NGH posting/nav store dimensions as u16.
+  static const int maxVectorDimensions = 65535;
 }
 
 /// convert any object type to string

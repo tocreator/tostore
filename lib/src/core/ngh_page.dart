@@ -1,8 +1,11 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+import '../handler/common.dart';
 import '../handler/platform_byte_data.dart';
+import '../model/ngh_index_meta.dart';
 import 'btree_page.dart';
+import 'vector_quantizer.dart';
 
 // ============================================================================
 // NGH Page Structures
@@ -13,7 +16,7 @@ import 'btree_page.dart';
 // Page types:
 //   nghMeta      -- per-partition-file metadata (pageNo=0)
 //   nghPosting   -- inverted cluster posting page with inlined SQ8 vector slots
-//   nghNavGraph  -- memory/disk navigating centroid graph nodes
+//   nghNavGraph  -- memory/disk navigating centroid graph (SQ8 on disk)
 // ============================================================================
 
 // ============================================================================
@@ -205,6 +208,11 @@ final class NghPostingPage {
   /// or drop inlined PK — tens-of-billions scale uses pdir (`u32+u32`) as the
   /// page-list authority, not a posting rewrite. `nextPostingPackedRef` is a
   /// hint; unrepresentable locations write `-1`.
+  ///
+  /// `dimensions` is already u16 (max 65535). High-D indexes that cannot pack
+  /// one SQ8 slot into the database 16KB page use a larger per-index
+  /// [NghIndexMeta.postingPageSize] on **new** files only; existing 16KB
+  /// posting partitions are never rewritten.
   ///
   ///   [centroidId: u32][nextPostingPackedRef: i32][dimensions: u16][slotCount: u16]
   ///   For each slot:
@@ -717,9 +725,18 @@ final class NghNavGraphPage {
 // ============================================================================
 
 /// One TPG2 page of v2 centroid records (no inlined posting page lists).
+///
+/// Disk vectors are SQ8 (payloadVersion >= 2). Memory still uses float32
+/// ([NghNavCentroidNode.vector]) after dequantize. payloadVersion 1 is the
+/// unreleased float32 layout and remains readable.
 final class NghNavCentroidPage {
   static const int magic = 0x3256434E; // 'NCV2'
-  static const int payloadVersion = 1;
+  static const int payloadVersionFloat32 = 1;
+  static const int payloadVersionSq8 = 2;
+  static const int payloadVersion = payloadVersionSq8;
+
+  /// offset:f32 + scale:f32 + codes[D].
+  static int sq8VectorBytes(int dimensions) => 8 + dimensions;
 
   final int dimensions;
   final List<NghNavCentroidNode> centroids;
@@ -730,7 +747,7 @@ final class NghNavCentroidPage {
   });
 
   static int recordSize(int dimensions, int neighborCount, int childCount) {
-    return 58 + neighborCount * 4 + childCount * 4 + dimensions * 4;
+    return 58 + neighborCount * 4 + childCount * 4 + sq8VectorBytes(dimensions);
   }
 
   int estimatePayloadSize({int pageSize = 16 * 1024}) {
@@ -797,13 +814,33 @@ final class NghNavCentroidPage {
         bd.setUint32(off, c.childIds[n], Endian.little);
         off += 4;
       }
-      for (int d = 0; d < dimensions; d++) {
-        bd.setFloat32(
-            off, d < c.vector.length ? c.vector[d] : 0.0, Endian.little);
-        off += 4;
+      final src = c.vector;
+      final toQuantize =
+          src.length == dimensions ? src : _paddedCentroid(src, dimensions);
+      final sq8 = ScalarQuantizer.quantize(toQuantize);
+      bd.setFloat32(off, sq8.offset, Endian.little);
+      bd.setFloat32(off + 4, sq8.scale, Endian.little);
+      off += 8;
+      final codeLen =
+          sq8.codes.length < dimensions ? sq8.codes.length : dimensions;
+      if (codeLen > 0) {
+        buf.setRange(off, off + codeLen, sq8.codes);
       }
+      if (codeLen < dimensions) {
+        buf.fillRange(off + codeLen, off + dimensions, 0);
+      }
+      off += dimensions;
     }
     return buf;
+  }
+
+  static Float32List _paddedCentroid(Float32List src, int dimensions) {
+    final out = Float32List(dimensions);
+    final n = src.length < dimensions ? src.length : dimensions;
+    for (int i = 0; i < n; i++) {
+      out[i] = src[i];
+    }
+    return out;
   }
 
   static NghNavCentroidPage? tryDecodePayload(Uint8List bytes) {
@@ -845,16 +882,28 @@ final class NghNavCentroidPage {
       }
       final cLen = bd.getUint16(off, Endian.little);
       off += 2;
-      if (off + cLen * 4 + dims * 4 > bytes.length) break;
+      if (off + cLen * 4 > bytes.length) break;
       final children = <int>[];
       for (int n = 0; n < cLen; n++) {
         children.add(bd.getUint32(off, Endian.little));
         off += 4;
       }
-      final vec = Float32List(dims);
-      for (int d = 0; d < dims; d++) {
-        vec[d] = bd.getFloat32(off, Endian.little);
-        off += 4;
+      final Float32List vec;
+      if (ver >= payloadVersionSq8) {
+        if (off + 8 + dims > bytes.length) break;
+        final qOff = bd.getFloat32(off, Endian.little);
+        final qScale = bd.getFloat32(off + 4, Endian.little);
+        off += 8;
+        final codes = Uint8List.sublistView(bytes, off, off + dims);
+        off += dims;
+        vec = ScalarQuantizer.dequantize(codes, qOff, qScale);
+      } else {
+        if (off + dims * 4 > bytes.length) break;
+        vec = Float32List(dims);
+        for (int d = 0; d < dims; d++) {
+          vec[d] = bd.getFloat32(off, Endian.little);
+          off += 4;
+        }
       }
       list.add(NghNavCentroidNode(
         centroidId: cId,
@@ -998,6 +1047,20 @@ final class NghPageSizer {
   /// Safety margin for encoding/encryption overhead (header, padding, etc).
   static const int encodingSafetyMargin = 64;
 
+  /// Inclusive max vector width (posting/nav `dimensions` fields are u16).
+  static const int maxDimensions = InternalConfig.maxVectorDimensions;
+
+  /// Largest TPG2 page we will choose for a high-D NGH index (1MB).
+  static const int maxNghPageSize = 1024 * 1024;
+
+  /// PK bytes reserved when choosing a posting page size (typical keys).
+  static const int postingSlotPkBudget = 256;
+
+  /// Flush-time overhead matching [BTreePageSizer.fitsInPage] (128) plus
+  /// encoder/AEAD slack so page-size choice stays valid with encryption on.
+  static const int flushFitOverhead =
+      pageHeaderSize + 128 + encodingSafetyMargin;
+
   /// Compute how many posting slots can fit in one page for a given average PK length.
   static int estimatePostingSlotsPerPage(
     int pageSize,
@@ -1006,7 +1069,8 @@ final class NghPageSizer {
   }) {
     final slotSize = 19 + avgPkLength + dimensions;
     final usable = pageSize - pageHeaderSize - 12 - encodingSafetyMargin;
-    return usable > 0 ? (usable ~/ slotSize).clamp(1, 1024) : 1;
+    if (usable < slotSize) return 1;
+    return (usable ~/ slotSize).clamp(1, 1024);
   }
 
   /// Estimate file size given page count and page size.
@@ -1032,6 +1096,10 @@ final class NghPageSizer {
   /// Must assume **max** neighbors and inline children. Packing with
   /// `childCount=4` overflowed at ~1M vectors once coarses held 100+ children
   /// (`payload=17082 > 16384-20`).
+  ///
+  /// Returns 1 when the page was sized for a single high-D centroid. Callers
+  /// must choose [pageSize] via [chooseNavPageSize] so that 1 SQ8 record
+  /// actually fits.
   static int navCentroidsPerPage(int pageSize, int dimensions) {
     final maxChildren = maxNavInlineChildren(pageSize, dimensions);
     final rec =
@@ -1050,6 +1118,61 @@ final class NghPageSizer {
     final base = NghNavCentroidPage.recordSize(dimensions, maxNavNeighbors, 0);
     if (usable <= base + 4) return 8;
     return ((usable - base) ~/ 4).clamp(8, 256);
+  }
+
+  /// Smallest power-of-two page size that can hold [minPlainPayload] after
+  /// TPG2 header, 128-byte flush margin, and encoder/AEAD slack.
+  static int choosePageSize(int minPlainPayload, int basePageSize) {
+    var size = basePageSize > 0 ? basePageSize : InternalConfig.defaultPageSize;
+    if (size < InternalConfig.defaultPageSize) {
+      size = InternalConfig.defaultPageSize;
+    }
+    final need = minPlainPayload + flushFitOverhead;
+    while (size < need && size < maxNghPageSize) {
+      size *= 2;
+    }
+    if (size > maxNghPageSize) return maxNghPageSize;
+    return size;
+  }
+
+  /// Page size for one inlined SQ8 posting slot (frozen layout).
+  static int choosePostingPageSize(int dimensions, int basePageSize) {
+    final dim = dimensions.clamp(1, maxDimensions);
+    final payload = 12 + 19 + postingSlotPkBudget + dim;
+    return choosePageSize(payload, basePageSize);
+  }
+
+  /// Page size for one SQ8 nav centroid (max neighbors + min children).
+  ///
+  /// Disk is SQ8 (1 byte/dim + offset/scale). 4096-d fits the database 16KB
+  /// page; 65535-d needs ~128KB, same order as posting.
+  static int chooseNavPageSize(int dimensions, int basePageSize) {
+    final dim = dimensions.clamp(1, maxDimensions);
+    final payload = 12 + NghNavCentroidPage.recordSize(dim, maxNavNeighbors, 8);
+    return choosePageSize(payload, basePageSize);
+  }
+
+  /// Assign posting/nav page sizes for a new or still-empty index.
+  ///
+  /// Existing data pages freeze that category's size so on-disk offsets stay
+  /// valid (no posting rewrite). Empty nav may be resized -- the v2 nav
+  /// format is unreleased.
+  static NghIndexMeta ensureIndexPageSizes(
+    NghIndexMeta meta,
+    int basePageSize,
+  ) {
+    final needPosting = choosePostingPageSize(meta.dimensions, basePageSize);
+    final needNav = chooseNavPageSize(meta.dimensions, basePageSize);
+    final posting = meta.hasPostingData
+        ? meta.postingPageSize
+        : (needPosting > basePageSize ? needPosting : 0);
+    final nav = meta.hasNavData
+        ? meta.navPageSize
+        : (needNav > basePageSize ? needNav : 0);
+    if (posting == meta.postingPageSize && nav == meta.navPageSize) {
+      return meta;
+    }
+    return meta.copyWith(postingPageSize: posting, navPageSize: nav);
   }
 
   /// Drop out-of-range parent/child/neighbor ids and clamp inline lists so a

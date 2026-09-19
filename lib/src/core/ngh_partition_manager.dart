@@ -147,6 +147,25 @@ final class NghPartitionManager {
 
   int get configuredPageSize => _dataStore.configuredPageSize;
 
+  /// TPG2 page size for an NGH category. Posting/nav may be larger than the
+  /// database 16KB page for high-D indexes; pdir/pkmap always inherit 16KB.
+  int pageSizeFor(NghDataCategory category, NghIndexMeta? meta) {
+    if (meta == null) return configuredPageSize;
+    switch (category) {
+      case NghDataCategory.posting:
+        return meta.resolvedPostingPageSize(configuredPageSize);
+      case NghDataCategory.nav:
+        return meta.resolvedNavPageSize(configuredPageSize);
+      case NghDataCategory.pdir:
+      case NghDataCategory.pkmap:
+        return configuredPageSize;
+    }
+  }
+
+  /// A partition file must hold meta page 0 plus at least one data page.
+  int _nghMaxFileSize(int pageSize) =>
+      max(_dataStore.config.maxPartitionFileSize, pageSize * 2);
+
   DataStoreConfig get engineConfig => _dataStore.config;
 
   /// pdir/pkmap are mutation burst caches (repeat insert/delete on hot keys),
@@ -281,9 +300,9 @@ final class NghPartitionManager {
     final path = _dataStore.pathManager
         .getNghPostingPartitionPathByContext(table, indexUid, partitionNo);
     try {
-      final raw = await _dataStore.storage.readAsBytesAt(
-          path, pageNo * _dataStore.configuredPageSize,
-          length: _dataStore.configuredPageSize);
+      final pageSize = pageSizeFor(NghDataCategory.posting, meta);
+      final raw = await _dataStore.storage
+          .readAsBytesAt(path, pageNo * pageSize, length: pageSize);
       if (raw.isEmpty) return null;
 
       final parsed = BTreePageIO.parsePageBytes(raw);
@@ -341,7 +360,7 @@ final class NghPartitionManager {
 
     if (missingByPartition.isEmpty) return results;
 
-    final pageSize = _dataStore.configuredPageSize;
+    final pageSize = pageSizeFor(NghDataCategory.posting, meta);
     final tableUid = table.tableUid;
 
     Future<List<({int packedRef, NghPostingPage page})>> readOnePartition(
@@ -561,7 +580,8 @@ final class NghPartitionManager {
       );
     }
 
-    final perPage = NghPageSizer.navCentroidsPerPage(configuredPageSize, dims);
+    final navPageSize = pageSizeFor(NghDataCategory.nav, meta);
+    final perPage = NghPageSizer.navCentroidsPerPage(navPageSize, dims);
     final fromCount = expected > 0 ? (expected + perPage - 1) ~/ perPage : 0;
     final fromNext = max(0, meta.navNextPageNo - NghIndexMeta.firstDataPageNo);
     final pageCount = max(fromCount, fromNext);
@@ -572,7 +592,8 @@ final class NghPartitionManager {
     int? diskPack;
     for (int linear = 0; linear < max(pageCount, 1); linear++) {
       final ptr = _linearNavPtr(meta, linear);
-      final page = await readNavCentroidPage(table, indexUid, ptr);
+      final page = await readNavCentroidPage(table, indexUid, ptr,
+          pageSize: navPageSize);
       if (page == null) break;
       diskPack ??= page.centroids.length;
       dimensions = page.dimensions;
@@ -582,7 +603,7 @@ final class NghPartitionManager {
     if (centroids.isEmpty) return null;
     NghPageSizer.sanitizeNavGraph(
       centroids,
-      pageSize: configuredPageSize,
+      pageSize: navPageSize,
       dimensions: dimensions,
     );
     return NghNavGraphPage(
@@ -593,8 +614,8 @@ final class NghPartitionManager {
   }
 
   NghPagePtr _linearNavPtr(NghIndexMeta? meta, int linear) {
-    final pageSize = configuredPageSize;
-    final maxFile = _dataStore.config.maxPartitionFileSize;
+    final pageSize = pageSizeFor(NghDataCategory.nav, meta);
+    final maxFile = _nghMaxFileSize(pageSize);
     final dataPagesPerPart = max(1, (maxFile ~/ pageSize) - 1);
     final partition = linear ~/ dataPagesPerPart;
     final pageNo = (linear % dataPagesPerPart) + NghIndexMeta.firstDataPageNo;
@@ -604,17 +625,18 @@ final class NghPartitionManager {
   Future<NghNavCentroidPage?> readNavCentroidPage(
     TableContext table,
     IndexUid indexUid,
-    NghPagePtr ptr,
-  ) async {
+    NghPagePtr ptr, {
+    int? pageSize,
+  }) async {
     final cached = _navPageCache.getPoint4(
         table.tableUid, indexUid, ptr.partitionNo, ptr.pageNo);
     if (cached != null) return cached;
     final path =
         _partitionPath(NghDataCategory.nav, table, indexUid, ptr.partitionNo);
+    final ps = pageSize ?? configuredPageSize;
     try {
-      final raw = await _dataStore.storage.readAsBytesAt(
-          path, ptr.pageNo * configuredPageSize,
-          length: configuredPageSize);
+      final raw = await _dataStore.storage
+          .readAsBytesAt(path, ptr.pageNo * ps, length: ps);
       if (raw.isEmpty) return null;
       final parsed = BTreePageIO.parsePageBytes(raw);
       final page = NghNavCentroidPage.tryDecodePayload(
@@ -802,7 +824,8 @@ final class NghPartitionManager {
     final dirtyPdir = <NghPagePtr, NghPostingDirPage>{};
     var current = meta;
     final dims = blob.dimensions;
-    final perPage = NghPageSizer.navCentroidsPerPage(configuredPageSize, dims);
+    final navPageSize = pageSizeFor(NghDataCategory.nav, current);
+    final perPage = NghPageSizer.navCentroidsPerPage(navPageSize, dims);
     final maxPdir = NghPostingDirPage.maxEntriesForPage(configuredPageSize);
 
     final centroids = blob.centroids;
@@ -883,13 +906,14 @@ final class NghPartitionManager {
     bool rewriteAll = false,
   }) {
     if (centroids.isEmpty) return {};
+    final navPageSize = pageSizeFor(NghDataCategory.nav, meta);
     NghPageSizer.sanitizeNavGraph(
       centroids,
-      pageSize: configuredPageSize,
+      pageSize: navPageSize,
       dimensions: meta.dimensions,
     );
     var perPage =
-        NghPageSizer.navCentroidsPerPage(configuredPageSize, meta.dimensions);
+        NghPageSizer.navCentroidsPerPage(navPageSize, meta.dimensions);
     final occupancyChanged = diskRecordsPerPage != null &&
         diskRecordsPerPage > 0 &&
         diskRecordsPerPage != perPage;
@@ -926,25 +950,25 @@ final class NghPartitionManager {
     var dirty = pack(perPage, all: full);
     while (perPage > 1 &&
         dirty.values.any((p) => !_navPayloadFits(
-            p.estimatePayloadSize(pageSize: configuredPageSize)))) {
+            p.estimatePayloadSize(pageSize: navPageSize), navPageSize))) {
       perPage--;
       dirty = pack(perPage, all: true);
     }
     return dirty;
   }
 
-  /// Whether a posting payload will fit the configured TPG2 page.
-  bool postingPayloadFits(int plainPayloadLen) {
+  /// Whether a posting payload will fit this index's posting TPG2 page.
+  bool postingPayloadFits(int plainPayloadLen, {required int pageSize}) {
     return BTreePageSizer.fitsInPage(
-      pageSize: configuredPageSize,
+      pageSize: pageSize,
       plainPayloadLen: plainPayloadLen,
       config: _dataStore.config,
     );
   }
 
-  bool _navPayloadFits(int plainPayloadLen) {
+  bool _navPayloadFits(int plainPayloadLen, int pageSize) {
     return BTreePageSizer.fitsInPage(
-      pageSize: configuredPageSize,
+      pageSize: pageSize,
       plainPayloadLen: plainPayloadLen,
       config: _dataStore.config,
     );
@@ -1076,8 +1100,10 @@ final class NghPartitionManager {
     if (centroidCount <= 0) {
       return meta.copyWith(centroidCount: 0);
     }
-    final perPage =
-        NghPageSizer.navCentroidsPerPage(configuredPageSize, meta.dimensions);
+    final perPage = NghPageSizer.navCentroidsPerPage(
+      pageSizeFor(NghDataCategory.nav, meta),
+      meta.dimensions,
+    );
     final needed = max(
       navPageCount,
       (centroidCount + perPage - 1) ~/ perPage,
@@ -1104,6 +1130,7 @@ final class NghPartitionManager {
   Future<int> postingFilePageCount(
     TableContext table,
     IndexUid indexUid,
+    NghIndexMeta meta,
     int partitionNo,
   ) async {
     final path = _dataStore.pathManager
@@ -1111,7 +1138,8 @@ final class NghPartitionManager {
     try {
       if (!await _dataStore.storage.existsFile(path)) return 0;
       final size = await _dataStore.storage.getFileSize(path);
-      return size ~/ configuredPageSize;
+      final pageSize = pageSizeFor(NghDataCategory.posting, meta);
+      return size ~/ pageSize;
     } catch (_) {
       return 0;
     }
@@ -1124,6 +1152,7 @@ final class NghPartitionManager {
     NghIndexMeta meta,
   ) async {
     Future<void> rewriteCategory(NghDataCategory category, int count) async {
+      final pageSize = pageSizeFor(category, meta);
       for (int p = 0; p < max(1, count); p++) {
         final path = _partitionPath(category, table, indexUid, p);
         if (!await _dataStore.storage.existsFile(path)) continue;
@@ -1133,24 +1162,23 @@ final class NghPartitionManager {
         } catch (_) {
           continue;
         }
-        final pageCount = fileSize ~/ configuredPageSize;
+        final pageCount = fileSize ~/ pageSize;
         for (int pg = 0; pg < pageCount; pg++) {
           try {
-            final raw = await _dataStore.storage.readAsBytesAt(
-                path, pg * configuredPageSize,
-                length: configuredPageSize);
+            final raw = await _dataStore.storage
+                .readAsBytesAt(path, pg * pageSize, length: pageSize);
             if (raw.isEmpty) continue;
             final parsed = BTreePageIO.parsePageBytes(raw);
             final plain = _decodePayload(parsed.encodedPayload);
             final rebuilt = _buildPageBytes(
               parsed.type,
               plain,
-              configuredPageSize,
+              pageSize,
               _dataStore.config.encryptionConfig?.shouldEncryptVectorIndex ??
                   false,
             );
             await _dataStore.storage
-                .writeAsBytesAt(path, pg * configuredPageSize, rebuilt);
+                .writeAsBytesAt(path, pg * pageSize, rebuilt);
           } catch (_) {}
         }
       }
@@ -1211,7 +1239,21 @@ final class NghPartitionManager {
       return meta;
     }
 
-    final pageSize = _dataStore.configuredPageSize;
+    final postingPageSize = pageSizeFor(NghDataCategory.posting, meta);
+    final navPageSize = pageSizeFor(NghDataCategory.nav, meta);
+    final sidecarPageSize = configuredPageSize;
+    int sizeOf(NghDataCategory category) {
+      switch (category) {
+        case NghDataCategory.posting:
+          return postingPageSize;
+        case NghDataCategory.nav:
+          return navPageSize;
+        case NghDataCategory.pdir:
+        case NghDataCategory.pkmap:
+          return sidecarPageSize;
+      }
+    }
+
     final yc = YieldController(
       'NghPartitionManager.writeChanges',
       checkInterval: 40,
@@ -1250,13 +1292,13 @@ final class NghPartitionManager {
     final navBuilt =
         <({NghPagePtr ptr, Uint8List pageBytes, NghNavCentroidPage page})>[];
     for (final entry in dirtyNavPages.entries) {
-      final payload = entry.value.encodePayload(pageSize: pageSize);
+      final payload = entry.value.encodePayload(pageSize: navPageSize);
       navBuilt.add((
         ptr: entry.key,
         pageBytes: _buildPageBytes(
           BTreePageType.nghNavGraph,
           payload,
-          pageSize,
+          navPageSize,
           encrypt,
         ),
         page: entry.value,
@@ -1276,7 +1318,7 @@ final class NghPartitionManager {
         await _dataStore.storage.ensureDirectoryExists(p.dirname(stats.path!));
         stats.dirEnsured = true;
       }
-      stageWrite(stats.path!, ptr.pageNo * pageSize, pageBytes);
+      stageWrite(stats.path!, ptr.pageNo * sizeOf(category), pageBytes);
       stats.maxPageNoWritten = max(stats.maxPageNoWritten, ptr.pageNo);
       if (redoKind != null && recordPageRedo) {
         redoRecords.add(PageRedoLogCodec.encodePageRecord(
@@ -1302,7 +1344,8 @@ final class NghPartitionManager {
         category: category,
         statsMap: statsMap,
         ptr: ptr,
-        pageBytes: _buildPageBytes(pageType, payload, pageSize, encrypt),
+        pageBytes:
+            _buildPageBytes(pageType, payload, sizeOf(category), encrypt),
         redoKind: redoKind,
       );
     }
@@ -1322,7 +1365,7 @@ final class NghPartitionManager {
       await _ensureNghPartitionHeaderLoaded(
         stats,
         partitionNo: ptr.partitionNo,
-        pageSize: pageSize,
+        pageSize: postingPageSize,
       );
       final diskHead = stats.freeListHeadPageNo;
       if ((workingMeta.postingFreeListHeads[ptr.partitionNo] ?? -1) <
@@ -1415,10 +1458,12 @@ final class NghPartitionManager {
           .getNghPostingPartitionPathByContext(table, indexUid, 0);
     }
 
-    final sizeDeltaSum = await _computePartitionSizeDeltaSum(
-      [postingStats, navStats, pdirStats, pkmapStats],
-      pageSize,
-    );
+    final sizeDeltaSum = await _computePartitionSizeDeltaSum([
+      (stats: postingStats, pageSize: postingPageSize),
+      (stats: navStats, pageSize: navPageSize),
+      (stats: pdirStats, pageSize: sidecarPageSize),
+      (stats: pkmapStats, pageSize: sidecarPageSize),
+    ]);
     final now = DateTime.now();
     final updatedMeta = workingMeta.copyWith(
       totalVectors: max(0, workingMeta.totalVectors + vectorsDelta),
@@ -1432,14 +1477,14 @@ final class NghPartitionManager {
       entryDelta: vectorsDelta,
     );
 
-    await _stagePartitionMeta(postingStats, pageSize, updatedMeta, stageWrite,
-        yc, NghDataCategory.posting);
-    await _stagePartitionMeta(
-        navStats, pageSize, updatedMeta, stageWrite, yc, NghDataCategory.nav);
-    await _stagePartitionMeta(
-        pdirStats, pageSize, updatedMeta, stageWrite, yc, NghDataCategory.pdir);
-    await _stagePartitionMeta(pkmapStats, pageSize, updatedMeta, stageWrite, yc,
-        NghDataCategory.pkmap);
+    await _stagePartitionMeta(postingStats, postingPageSize, updatedMeta,
+        stageWrite, yc, NghDataCategory.posting);
+    await _stagePartitionMeta(navStats, navPageSize, updatedMeta, stageWrite,
+        yc, NghDataCategory.nav);
+    await _stagePartitionMeta(pdirStats, sidecarPageSize, updatedMeta,
+        stageWrite, yc, NghDataCategory.pdir);
+    await _stagePartitionMeta(pkmapStats, sidecarPageSize, updatedMeta,
+        stageWrite, yc, NghDataCategory.pkmap);
 
     if (!postingStats.containsKey(0) && staged.isNotEmpty) {
       final p0Stats = getStats(postingStats, 0);
@@ -1447,7 +1492,7 @@ final class NghPartitionManager {
           .getNghPostingPartitionPathByContext(table, indexUid, 0);
       await _stagePartitionMeta(
         {0: p0Stats},
-        pageSize,
+        postingPageSize,
         updatedMeta,
         stageWrite,
         yc,
@@ -1573,8 +1618,8 @@ final class NghPartitionManager {
   ) {
     if (count <= 0) return (const [], meta);
 
-    final maxFileSize = _dataStore.config.maxPartitionFileSize;
-    final pageSize = _dataStore.configuredPageSize;
+    final pageSize = pageSizeFor(category, meta);
+    final maxFileSize = _nghMaxFileSize(pageSize);
     final pages = <NghPagePtr>[];
     var partitionCount = _partitionCountOf(category, meta);
     var nextPg = _nextPageNoOf(category, meta);
@@ -1685,7 +1730,7 @@ final class NghPartitionManager {
     IndexUid indexUid,
     void Function(String path, int offset, Uint8List bytes) stageWrite,
   ) async {
-    final pageSize = _dataStore.configuredPageSize;
+    final pageSize = pageSizeFor(category, meta);
     final heads = _getFreeListHeads(category, meta);
     final currentHead = heads[ptr.partitionNo] ?? -1;
 
@@ -1726,7 +1771,7 @@ final class NghPartitionManager {
       if (headPageNo < NghIndexMeta.firstDataPageNo) continue;
 
       final path = _partitionPath(category, table, indexUid, partitionNo);
-      final pageSize = _dataStore.configuredPageSize;
+      final pageSize = pageSizeFor(category, meta);
 
       try {
         final raw = await _dataStore.storage
@@ -1899,20 +1944,19 @@ final class NghPartitionManager {
 
   /// Best-effort size delta across touched NGH partition files (O(touched)).
   Future<int> _computePartitionSizeDeltaSum(
-    List<Map<int, _NghPartitionStats>> statsMaps,
-    int pageSize,
+    List<({Map<int, _NghPartitionStats> stats, int pageSize})> groups,
   ) async {
     var sum = 0;
-    for (final statsMap in statsMaps) {
-      for (final entry in statsMap.entries) {
+    for (final group in groups) {
+      for (final entry in group.stats.entries) {
         final stats = entry.value;
         if (stats.path == null) continue;
         await _ensureNghPartitionHeaderLoaded(
           stats,
           partitionNo: entry.key,
-          pageSize: pageSize,
+          pageSize: group.pageSize,
         );
-        final computedSize = (stats.maxPageNoWritten + 1) * pageSize;
+        final computedSize = (stats.maxPageNoWritten + 1) * group.pageSize;
         final newSize = max(stats.oldFileSizeInBytes, computedSize);
         sum += newSize - stats.oldFileSizeInBytes;
       }

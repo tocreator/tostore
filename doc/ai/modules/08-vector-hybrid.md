@@ -28,7 +28,7 @@ FieldSchema(
   name: 'embedding',
   type: DataType.vector,
   vectorConfig: VectorFieldConfig(
-    dimensions: 128, // MUST match written vector length
+    dimensions: 128, // MUST match written vector length (1..65535)
   ),
 )
 ```
@@ -48,7 +48,7 @@ IndexSchema(
 
 | Config | Meaning |
 | :--- | :--- |
-| `dimensions` | On `VectorFieldConfig`: embedding width (must match writes/queries) |
+| `dimensions` | On `VectorFieldConfig`: embedding width **1..65535** (must match writes/queries). |
 | `indexType` | Opaque dense algorithm id; currently `ngh` (ToStore proprietary).  |
 | `distanceMetric` | Similarity metric for **insert and search**; changing it requires rebuild |
 

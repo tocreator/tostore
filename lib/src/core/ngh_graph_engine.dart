@@ -4,7 +4,10 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import '../handler/memcomparable.dart';
+import '../model/db_exception.dart';
 import '../model/ngh_index_meta.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import '../model/table_context.dart';
 import '../model/table_identity.dart';
 import '../model/table_schema.dart';
@@ -426,7 +429,11 @@ class NghGraphEngine {
   static int _leafEntryCap(int slotsPerPage) =>
       max(4096, 64 * max(1, slotsPerPage));
 
-  int get _pageSize => _partitionManager.configuredPageSize;
+  int _postingPageSize(NghIndexMeta meta) =>
+      _partitionManager.pageSizeFor(NghDataCategory.posting, meta);
+
+  int _navPageSize(NghIndexMeta meta) =>
+      _partitionManager.pageSizeFor(NghDataCategory.nav, meta);
 
   /// Current estimated nav-graph cache footprint in bytes.
   int get navGraphCacheBytes => _navGraphCache.estimatedTotalSizeBytes;
@@ -2028,12 +2035,16 @@ class NghGraphEngine {
   int _appendSlotsUntilFull(
     NghPostingPage page,
     List<NghPostingSlot> src,
-    int from,
-  ) {
+    int from, {
+    required int pageSize,
+  }) {
     var i = from;
     while (i < src.length) {
       page.slots.add(src[i]);
-      if (!_partitionManager.postingPayloadFits(page.estimatePayloadSize())) {
+      if (!_partitionManager.postingPayloadFits(
+        page.estimatePayloadSize(),
+        pageSize: pageSize,
+      )) {
         page.slots.removeLast();
         break;
       }
@@ -2065,7 +2076,12 @@ class NghGraphEngine {
 
     final dirtyPosting = <NghPagePtr, NghPostingPage>{};
     final localPostingCache = <int, NghPostingPage>{};
-    var currentMeta = meta;
+    var currentMeta = NghPageSizer.ensureIndexPageSizes(
+      meta,
+      _partitionManager.configuredPageSize,
+    );
+    final postingPageSize = _postingPageSize(currentMeta);
+    final navPageSize = _navPageSize(currentMeta);
 
     // Load or initialize navigating centroid graph
     var navGraph = await _getOrLoadNavGraph(table, indexUid, currentMeta);
@@ -2085,7 +2101,7 @@ class NghGraphEngine {
     final sq8List = ScalarQuantizer.quantizeBatch(normalizedVectors);
 
     final maxSlotsPerPage = NghPageSizer.estimatePostingSlotsPerPage(
-      _pageSize,
+      postingPageSize,
       currentMeta.dimensions,
     );
 
@@ -2149,7 +2165,7 @@ class NghGraphEngine {
       if (c.isCoarse) hasCoarse = true;
     }
     final maxChildren = NghPageSizer.maxNavInlineChildren(
-      _pageSize,
+      navPageSize,
       currentMeta.dimensions,
     );
     final leafCap = _leafEntryCap(maxSlotsPerPage);
@@ -2412,7 +2428,12 @@ class NghGraphEngine {
 
       int slotIndex = 0;
       if (tailPage != null && tailPtr != null) {
-        slotIndex = _appendSlotsUntilFull(tailPage, newSlots, slotIndex);
+        slotIndex = _appendSlotsUntilFull(
+          tailPage,
+          newSlots,
+          slotIndex,
+          pageSize: postingPageSize,
+        );
         dirtyPosting[tailPtr] = tailPage;
         localPostingCache[tailRef] = tailPage;
       }
@@ -2427,9 +2448,22 @@ class NghGraphEngine {
           dimensions: currentMeta.dimensions,
           slots: <NghPostingSlot>[],
         );
-        slotIndex = _appendSlotsUntilFull(newPage, newSlots, slotIndex);
+        slotIndex = _appendSlotsUntilFull(
+          newPage,
+          newSlots,
+          slotIndex,
+          pageSize: postingPageSize,
+        );
         if (newPage.slots.isEmpty && slotIndex < newSlots.length) {
-          newPage.slots.add(newSlots[slotIndex++]);
+          throw DbException([
+            GeneralStatus(
+              type: ResultType.engError,
+              message:
+                  'NGH posting slot does not fit in a $postingPageSize-byte page '
+                  '(dimensions=${currentMeta.dimensions}, '
+                  'pkBytes=${newSlots[slotIndex].primaryKeyUtf8.length}).',
+            )
+          ]);
         }
 
         if (tailPage != null && tailPtr != null) {
@@ -2837,7 +2871,7 @@ class NghGraphEngine {
         rewriteAll: startedEmpty,
       ));
       navGraphPage.navPackPerPage = NghPageSizer.navCentroidsPerPage(
-        _pageSize,
+        _navPageSize(currentMeta),
         currentMeta.dimensions,
       );
       currentMeta = _partitionManager.ensureNavCoverage(
@@ -2936,7 +2970,7 @@ class NghGraphEngine {
     var splitsDone = 0;
     final skippedHubs = <int>{};
     final maxChildren = NghPageSizer.maxNavInlineChildren(
-      _pageSize,
+      _navPageSize(meta),
       meta.dimensions,
     );
     var topLevelCount = _topLevelRoutingIds(centroids).length;
@@ -3442,7 +3476,10 @@ class NghGraphEngine {
     }
 
     final navGraph = await _getOrLoadNavGraph(table, indexUid, meta);
-    var currentMeta = meta;
+    var currentMeta = NghPageSizer.ensureIndexPageSizes(
+      meta,
+      _partitionManager.configuredPageSize,
+    );
     final dirtyPosting = <NghPagePtr, NghPostingPage>{};
     final dirtyNavIds = <int>{};
     final pkBatch = NghPkMapBatch(meta: currentMeta);
@@ -3561,7 +3598,7 @@ class NghGraphEngine {
         diskRecordsPerPage: navGraph.navPackPerPage,
       );
       navGraph.navPackPerPage = NghPageSizer.navCentroidsPerPage(
-        _pageSize,
+        _navPageSize(currentMeta),
         currentMeta.dimensions,
       );
     }
@@ -3641,6 +3678,7 @@ class NghGraphEngine {
     try {
       final loaded = await future;
       if (loaded != null && loaded.centroids.isNotEmpty) {
+        _restoreCentroidUnits(loaded, meta);
         final current = _navGraphCache.getPoint2(tVal, iVal, touch: false);
         if (current == null ||
             loaded.centroids.length >= current.centroids.length) {
@@ -3651,6 +3689,17 @@ class NghGraphEngine {
       return _navGraphCache.getPoint2(tVal, iVal, touch: true);
     } finally {
       _navGraphInflight.remove(key);
+    }
+  }
+
+  /// SQ8 round-trip leaves cosine centroids slightly off the unit sphere.
+  void _restoreCentroidUnits(NghNavGraphPage page, NghIndexMeta? meta) {
+    if (meta?.distanceMetric != VectorDistanceMetric.cosine) return;
+    for (final c in page.centroids) {
+      final n = _normalizeFloat32(c.vector);
+      if (!identical(n, c.vector) && n.length == c.vector.length) {
+        c.vector.setAll(0, n);
+      }
     }
   }
 
@@ -3896,7 +3945,10 @@ class NghGraphEngine {
       return NghCompactResult(meta: meta, compactedCount: 0);
     }
 
-    var currentMeta = meta;
+    var currentMeta = NghPageSizer.ensureIndexPageSizes(
+      meta,
+      _partitionManager.configuredPageSize,
+    );
     final dirtyPosting = <NghPagePtr, NghPostingPage>{};
     final dirtyPdir = <NghPagePtr, NghPostingDirPage>{};
     final freed = <NghPagePtr>[];
@@ -4018,7 +4070,7 @@ class NghGraphEngine {
         : <NghPagePtr, NghNavCentroidPage>{};
     if (currentMeta.isPagedLayout) {
       navGraph.navPackPerPage = NghPageSizer.navCentroidsPerPage(
-        _pageSize,
+        _navPageSize(currentMeta),
         currentMeta.dimensions,
       );
     }
@@ -4062,6 +4114,7 @@ class NghGraphEngine {
       final pageCount = await _partitionManager.postingFilePageCount(
         table,
         indexUid,
+        currentMeta,
         part,
       );
       if (pageCount <= NghIndexMeta.firstDataPageNo) {

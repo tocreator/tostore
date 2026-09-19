@@ -211,7 +211,7 @@ final class TreeMetaPageService {
     int? encryptionKeyId,
     bool flush = true,
   }) async {
-    final pageSize = _requireConfiguredPageSize();
+    final pageSize = meta.resolvedPostingPageSize(_requireConfiguredPageSize());
     final path = _dataStore.pathManager
         .getNghPostingPartitionPathByContext(table, indexUid, 0);
     final local = partitionLocalOverride ??

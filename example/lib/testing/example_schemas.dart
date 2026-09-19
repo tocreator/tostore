@@ -123,14 +123,18 @@ class ExampleSchemas {
     ],
   );
 
-  /// Low / mid / high widths for searchDepth alignment sweeps.
+  /// Interactive example tables. Fill and sweep one table at a time —
+  /// do not bulk-load every width together.
   ///
-  /// Engine `dimScale` is `sqrt(D/512)` clamped to `[0.85, 1.18]`:
-  /// 128 hits the floor, 512 is the calibration table, 1536 hits the cap.
-  /// Fill and sweep one table at a time — do not bulk-load all three to 1M.
+  /// 128 / 512 / 1536: searchDepth alignment.
+  /// 4096 / 8192 / 16384 / 65535: high-D insert + flush packing.
   static const int vectorDimLow = 128;
   static const int vectorDimMid = 512;
   static const int vectorDimHigh = 1536;
+  static const int vectorDim4096 = 4096;
+  static const int vectorDim8192 = 8192;
+  static const int vectorDim16384 = 16384;
+  static const int vectorDim65535 = 65535;
 
   /// 128-d (small encoders). Use to catch low-D over-probe / cheap-recall bias.
   static final TableSchema embeddings128 = _cosineNghEmbeddings(
@@ -150,10 +154,34 @@ class ExampleSchemas {
     dimensions: vectorDimHigh,
   );
 
+  static final TableSchema embeddings4096 = _cosineNghEmbeddings(
+    name: 'embeddings_4096',
+    dimensions: vectorDim4096,
+  );
+
+  static final TableSchema embeddings8192 = _cosineNghEmbeddings(
+    name: 'embeddings_8192',
+    dimensions: vectorDim8192,
+  );
+
+  static final TableSchema embeddings16384 = _cosineNghEmbeddings(
+    name: 'embeddings_16384',
+    dimensions: vectorDim16384,
+  );
+
+  static final TableSchema embeddings65535 = _cosineNghEmbeddings(
+    name: 'embeddings_65535',
+    dimensions: vectorDim65535,
+  );
+
   static List<TableSchema> get vectorTables => [
         embeddings128,
         embeddings512,
         embeddings1536,
+        embeddings4096,
+        embeddings8192,
+        embeddings16384,
+        embeddings65535,
       ];
 
   static TableSchema _cosineNghEmbeddings({

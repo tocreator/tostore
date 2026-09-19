@@ -22,7 +22,7 @@ class NghIndexMeta {
   /// Owning table unique identifier.
   final TableUid tableUid;
 
-  /// Vector dimensionality (128--4096).
+  /// Vector dimensionality (1--[InternalConfig.maxVectorDimensions]).
   final int dimensions;
 
   /// Distance metric used for similarity computation.
@@ -78,6 +78,16 @@ class NghIndexMeta {
   final int pkBackfillPartition;
   final int pkBackfillPage;
 
+  /// TPG2 page size for posting partition files. `0` = inherit the database
+  /// [GlobalConfig.pageSize] (legacy 16KB files). Frozen once posting data
+  /// exists -- changing it would require a posting rewrite.
+  final int postingPageSize;
+
+  /// TPG2 page size for navigating-centroid partition files. `0` = inherit
+  /// [GlobalConfig.pageSize]. Independent of posting. SQ8 centroids usually
+  /// share the database 16KB page; very high-D indexes may use 32KB+.
+  final int navPageSize;
+
   /// Total size of all partition files in bytes (best-effort).
   final int totalSizeBytes;
 
@@ -118,6 +128,8 @@ class NghIndexMeta {
     this.hasPkLocator = false,
     this.pkBackfillPartition = 0,
     this.pkBackfillPage = 0,
+    this.postingPageSize = 0,
+    this.navPageSize = 0,
   })  : version = version ?? InternalConfig.indexVersion,
         postingFreeListHeads = postingFreeListHeads ?? const {},
         navFreeListHeads = navFreeListHeads ?? const {},
@@ -139,6 +151,23 @@ class NghIndexMeta {
 
   bool get pkmapRootIsNull => pkmapRootPartition < 0 || pkmapRootPage <= 0;
 
+  /// True when posting partition files already have data pages. Page size is
+  /// then frozen (changing it would rewrite offsets).
+  bool get hasPostingData =>
+      totalVectors > 0 || postingNextPageNo > firstDataPageNo;
+
+  /// True when nav partition files already have data pages. Page size is then
+  /// frozen for this index.
+  bool get hasNavData => centroidCount > 0 || navNextPageNo > firstDataPageNo;
+
+  /// Posting TPG2 page size. [fallback] is the database GlobalConfig page size.
+  int resolvedPostingPageSize(int fallback) =>
+      postingPageSize > 0 ? postingPageSize : fallback;
+
+  /// Nav TPG2 page size. [fallback] is the database GlobalConfig page size.
+  int resolvedNavPageSize(int fallback) =>
+      navPageSize > 0 ? navPageSize : fallback;
+
   // ===================== Factory ===============================
 
   /// Create an initial empty [NghIndexMeta] with sane defaults.
@@ -149,6 +178,8 @@ class NghIndexMeta {
     VectorDistanceMetric distanceMetric = VectorDistanceMetric.cosine,
     DateTime? now,
     bool isBuilding = false,
+    int postingPageSize = 0,
+    int navPageSize = 0,
   }) {
     final ts = now ?? DateTime.now();
     return NghIndexMeta(
@@ -160,6 +191,8 @@ class NghIndexMeta {
       timestamps: Timestamps(created: ts, modified: ts),
       isBuilding: isBuilding,
       hasPkLocator: true,
+      postingPageSize: postingPageSize,
+      navPageSize: navPageSize,
     );
   }
 
@@ -197,6 +230,8 @@ class NghIndexMeta {
     bool? hasPkLocator,
     int? pkBackfillPartition,
     int? pkBackfillPage,
+    int? postingPageSize,
+    int? navPageSize,
   }) {
     return NghIndexMeta(
       version: version ?? this.version,
@@ -231,6 +266,8 @@ class NghIndexMeta {
       hasPkLocator: hasPkLocator ?? this.hasPkLocator,
       pkBackfillPartition: pkBackfillPartition ?? this.pkBackfillPartition,
       pkBackfillPage: pkBackfillPage ?? this.pkBackfillPage,
+      postingPageSize: postingPageSize ?? this.postingPageSize,
+      navPageSize: navPageSize ?? this.navPageSize,
     );
   }
 
@@ -279,6 +316,8 @@ class NghIndexMeta {
       hasPkLocator: (json['hasPkLocator'] as bool?) ?? false,
       pkBackfillPartition: (json['pkBackfillPartition'] as num?)?.toInt() ?? 0,
       pkBackfillPage: (json['pkBackfillPage'] as num?)?.toInt() ?? 0,
+      postingPageSize: (json['postingPageSize'] as num?)?.toInt() ?? 0,
+      navPageSize: (json['navPageSize'] as num?)?.toInt() ?? 0,
     );
   }
 
@@ -315,6 +354,8 @@ class NghIndexMeta {
       'hasPkLocator': hasPkLocator,
       'pkBackfillPartition': pkBackfillPartition,
       'pkBackfillPage': pkBackfillPage,
+      'postingPageSize': postingPageSize,
+      'navPageSize': navPageSize,
     };
   }
 

@@ -3,6 +3,7 @@ import 'dart:math' show sqrt;
 import 'dart:typed_data';
 
 import '../handler/logger.dart';
+import '../handler/common.dart';
 import '../handler/memcomparable.dart';
 import '../handler/sha256.dart';
 import '../handler/value_matcher.dart';
@@ -726,6 +727,18 @@ class TableSchema {
               type: ResultType.devInvalidSchemaIndexType,
               message:
                   'Field "${field.name}" in table "$name" is DataType.vector but must define vectorConfig.dimensions > 0.',
+              tableName: name,
+              field: field.name,
+              wrongValue: {'dimensions': dims},
+            )
+          ]);
+        }
+        if (dims > InternalConfig.maxVectorDimensions) {
+          throw DbException([
+            SchemaValidationStatus(
+              type: ResultType.devInvalidSchemaIndexType,
+              message:
+                  'Field "${field.name}" in table "$name" vectorConfig.dimensions ($dims) exceeds the maximum of ${InternalConfig.maxVectorDimensions}.',
               tableName: name,
               field: field.name,
               wrongValue: {'dimensions': dims},
@@ -3483,7 +3496,10 @@ class VectorData {
 
 /// Vector field configuration (embedding width only).
 class VectorFieldConfig {
-  /// Dimension of the vector (must match write/query width).
+  /// Inclusive max embedding width (NGH posting/nav store dimensions as u16).
+  static const int maxDimensions = InternalConfig.maxVectorDimensions;
+
+  /// Dimension of the vector (must match write/query width). Range: 1..[maxDimensions].
   final int dimensions;
 
   const VectorFieldConfig({
