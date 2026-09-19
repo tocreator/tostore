@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:math' as math;
 
+import 'package:flutter/scheduler.dart';
 import 'package:tostore/tostore.dart';
 
 import 'benchmark_models.dart';
@@ -186,19 +187,26 @@ class BenchmarkRunner {
   /// Primes JIT compiler and memory allocations with small datasets.
   Future<void> _performWarmup() async {
     const warmupCount = 10000;
-    final simpleWarmupData = List.generate(
+    final createdAt = DateTime.now().toIso8601String();
+    final simpleWarmupData = await _buildRecords(
       warmupCount,
       (i) => {'text_val': 'warmup_$i', 'num_val': i},
+      label: 'warm-up rows',
     );
-    final indexedWarmupData = List.generate(
+    final indexedWarmupData = await _buildRecords(
       warmupCount,
       (i) => {
         'name': 'warmup_$i',
         'age': 20 + (i % 50),
-        'created_at': DateTime.now().toIso8601String(),
+        'created_at': createdAt,
       },
+      label: 'warm-up indexed rows',
     );
-    final vectorWarmupData = _generateRecords(BenchmarkTier.vector, 1000);
+    final vectorWarmupData = await _generateRecords(
+      BenchmarkTier.vector,
+      1000,
+      label: 'warm-up vectors',
+    );
 
     // Batch insert and query warmup
     await db.batchInsert(
@@ -271,7 +279,12 @@ class BenchmarkRunner {
       case BenchmarkOperation.batchInsert:
         final batchInsertRounds = <List<Map<String, dynamic>>>[
           for (var round = 1; round <= iterations; round++)
-            _generateRecords(tier, scale, seedOffset: round * scale),
+            await _generateRecords(
+              tier,
+              scale,
+              seedOffset: round * scale,
+              label: '[$tierName] batch insert round $round/$iterations',
+            ),
         ];
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
@@ -297,8 +310,12 @@ class BenchmarkRunner {
         effectiveCount = math.min(scale, 10000);
         final singleInsertRounds = <List<Map<String, dynamic>>>[
           for (var round = 1; round <= iterations; round++)
-            _generateRecords(tier, effectiveCount,
-                seedOffset: round * effectiveCount),
+            await _generateRecords(
+              tier,
+              effectiveCount,
+              seedOffset: round * effectiveCount,
+              label: '[$tierName] single insert round $round/$iterations',
+            ),
         ];
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
@@ -322,9 +339,18 @@ class BenchmarkRunner {
         // once and update immediately so the pending queue keeps growing.
         final batchUpdateRounds = <List<Map<String, dynamic>>>[
           for (var round = 1; round <= iterations; round++)
-            _generateUpdateRecords(tier, scale, round),
+            await _generateUpdateRecords(
+              tier,
+              scale,
+              round,
+              label: '[$tierName] batch update round $round/$iterations',
+            ),
         ];
-        final batchUpdateBase = _generateRecords(tier, scale);
+        final batchUpdateBase = await _generateRecords(
+          tier,
+          scale,
+          label: '[$tierName] batch update base',
+        );
         await _loadBufferDataset(tableName, batchUpdateBase,
             durability: durability);
 
@@ -350,9 +376,18 @@ class BenchmarkRunner {
         effectiveCount = math.min(scale, 10000);
         final singleUpdateRounds = <List<Map<String, dynamic>>>[
           for (var round = 1; round <= iterations; round++)
-            _generateUpdateRecords(tier, effectiveCount, round),
+            await _generateUpdateRecords(
+              tier,
+              effectiveCount,
+              round,
+              label: '[$tierName] single update round $round/$iterations',
+            ),
         ];
-        final singleUpdateBase = _generateRecords(tier, effectiveCount);
+        final singleUpdateBase = await _generateRecords(
+          tier,
+          effectiveCount,
+          label: '[$tierName] single update base',
+        );
         await _loadBufferDataset(tableName, singleUpdateBase,
             durability: durability);
 
@@ -380,9 +415,18 @@ class BenchmarkRunner {
         // 50% update existing IDs, 50% insert new IDs with explicit PKs
         final batchUpsertRounds = <List<Map<String, dynamic>>>[
           for (var round = 1; round <= iterations; round++)
-            _generateUpsertRecords(tier, scale, round),
+            await _generateUpsertRecords(
+              tier,
+              scale,
+              round,
+              label: '[$tierName] batch upsert round $round/$iterations',
+            ),
         ];
-        final batchUpsertBase = _generateRecords(tier, scale);
+        final batchUpsertBase = await _generateRecords(
+          tier,
+          scale,
+          label: '[$tierName] batch upsert base',
+        );
         await _loadBufferDataset(tableName, batchUpsertBase,
             durability: durability);
 
@@ -408,7 +452,11 @@ class BenchmarkRunner {
         effectiveCount = scale;
         // Independent buffer-hot rounds: shared base payload, insert then delete
         // with no idle gap (avoids 1s pending-queue settle → disk delete).
-        final batchDeleteBase = _generateRecords(tier, scale);
+        final batchDeleteBase = await _generateRecords(
+          tier,
+          scale,
+          label: '[$tierName] batch delete base',
+        );
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
               'Running [$tierName] Batch Delete ($round/$iterations)...');
@@ -429,7 +477,11 @@ class BenchmarkRunner {
 
       case BenchmarkOperation.singleDelete:
         effectiveCount = math.min(scale, 10000);
-        final singleDeleteBase = _generateRecords(tier, effectiveCount);
+        final singleDeleteBase = await _generateRecords(
+          tier,
+          effectiveCount,
+          label: '[$tierName] single delete base',
+        );
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
               'Running [$tierName] Single Delete ($round/$iterations)...');
@@ -696,7 +748,11 @@ class BenchmarkRunner {
         if (tier != BenchmarkTier.vector) return null;
         // Cap ingest scale so NGH construction stays practical on edge devices.
         effectiveCount = math.min(scale, 10000);
-        final vectorRows = _generateRecords(tier, effectiveCount);
+        final vectorRows = await _generateRecords(
+          tier,
+          effectiveCount,
+          label: '[$tierName] vector batch',
+        );
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
               'Running [$tierName] Vector Batch Insert ($round/$iterations)...');
@@ -903,37 +959,75 @@ class BenchmarkRunner {
     if (currentCount >= scale) return;
 
     final missing = scale - currentCount;
-    final records = _generateRecords(tier, missing, seedOffset: currentCount);
+    final records = await _generateRecords(
+      tier,
+      missing,
+      seedOffset: currentCount,
+      label: 'query dataset',
+    );
     await _loadBufferDataset(tableName, records, durability: durability);
     await db.flush();
   }
 
+  /// Lets the benchmark status line paint while synthetic rows are built.
+  ///
+  /// [Future.delayed] only hits the timer queue and can resume before the
+  /// next frame, so a large generate loop still looks frozen.
+  Future<void> _yieldUiFrame() {
+    return SchedulerBinding.instance.endOfFrame;
+  }
+
+  /// Builds [count] rows, yielding a frame about every 8ms.
+  Future<List<Map<String, dynamic>>> _buildRecords(
+    int count,
+    Map<String, dynamic> Function(int i) build, {
+    required String label,
+  }) async {
+    if (count <= 0) return const [];
+    final records = List<Map<String, dynamic>>.filled(
+      count,
+      const <String, dynamic>{},
+    );
+    final slice = Stopwatch()..start();
+    for (var i = 0; i < count; i++) {
+      records[i] = build(i);
+      if (slice.elapsedMilliseconds >= 8 || i == count - 1) {
+        _updateLastOperation('Generating $label ${i + 1}/$count...');
+        await _yieldUiFrame();
+        slice.reset();
+      }
+    }
+    return records;
+  }
+
   /// Generates synthetic records for insertion.
-  List<Map<String, dynamic>> _generateRecords(
+  Future<List<Map<String, dynamic>>> _generateRecords(
     BenchmarkTier tier,
     int count, {
     int seedOffset = 0,
+    required String label,
   }) {
     switch (tier) {
       case BenchmarkTier.simple:
-        return List.generate(count, (i) {
+        return _buildRecords(count, (i) {
           final idx = seedOffset + i;
           return {
             'text_val': 'benchmark_payload_item_$idx',
             'num_val': idx,
           };
-        });
+        }, label: label);
       case BenchmarkTier.indexed:
-        return List.generate(count, (i) {
+        final createdAt = DateTime.now().toIso8601String();
+        return _buildRecords(count, (i) {
           final idx = seedOffset + i;
           return {
             'name': 'user_$idx',
             'age': 18 + (idx % 60),
-            'created_at': DateTime.now().toIso8601String(),
+            'created_at': createdAt,
           };
-        });
+        }, label: label);
       case BenchmarkTier.vector:
-        return List.generate(count, (i) {
+        return _buildRecords(count, (i) {
           // Slot-stable index based on seedOffset so Recall@K still matches after appends.
           final index = seedOffset + i + 1;
           return {
@@ -944,46 +1038,53 @@ class BenchmarkRunner {
               dimensions: BenchmarkSchemas.vectorDimensions,
             ),
           };
-        });
+        }, label: label);
       case BenchmarkTier.all:
-        return _generateRecords(BenchmarkTier.simple, count,
-            seedOffset: seedOffset);
+        return _generateRecords(
+          BenchmarkTier.simple,
+          count,
+          seedOffset: seedOffset,
+          label: label,
+        );
     }
   }
 
   /// Generates synthetic update records targeting existing primary keys.
-  List<Map<String, dynamic>> _generateUpdateRecords(
+  Future<List<Map<String, dynamic>>> _generateUpdateRecords(
     BenchmarkTier tier,
     int count,
-    int round,
-  ) {
+    int round, {
+    required String label,
+  }) {
     if (tier == BenchmarkTier.simple) {
-      return List.generate(count, (i) {
+      return _buildRecords(count, (i) {
         return {
           'id': i + 1,
           'text_val': 'updated_payload_${round}_$i',
           'num_val': (i + round) * 10,
         };
-      });
+      }, label: label);
     }
-    return List.generate(count, (i) {
+    return _buildRecords(count, (i) {
       return {
         'id': i + 1,
         'name': 'user_${i}_v$round',
         'age': 20 + ((i + round) % 55),
       };
-    });
+    }, label: label);
   }
 
   /// Generates synthetic records for upsert testing (50% updates, 50% inserts).
-  List<Map<String, dynamic>> _generateUpsertRecords(
+  Future<List<Map<String, dynamic>>> _generateUpsertRecords(
     BenchmarkTier tier,
     int count,
-    int round,
-  ) {
+    int round, {
+    required String label,
+  }) {
     final half = count ~/ 2;
+    final createdAt = DateTime.now().toIso8601String();
     if (tier == BenchmarkTier.simple) {
-      return List.generate(count, (i) {
+      return _buildRecords(count, (i) {
         final isExisting = i < half;
         final targetId =
             isExisting ? (i + 1) : (count + (round * count) + i + 1);
@@ -994,17 +1095,17 @@ class BenchmarkRunner {
               : 'upsert_new_${round}_$i',
           'num_val': i + (round * 100),
         };
-      });
+      }, label: label);
     }
-    return List.generate(count, (i) {
+    return _buildRecords(count, (i) {
       final isExisting = i < half;
       final targetId = isExisting ? (i + 1) : (count + (round * count) + i + 1);
       return {
         'id': targetId,
         'name': isExisting ? 'user_${i}_upd$round' : 'user_new_${round}_$i',
         'age': 21 + (i % 50),
-        'created_at': DateTime.now().toIso8601String(),
+        'created_at': createdAt,
       };
-    });
+    }, label: label);
   }
 }

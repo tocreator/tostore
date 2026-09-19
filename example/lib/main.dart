@@ -1141,7 +1141,27 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         const Divider(height: 1),
         // Data Table
         if (_isDataLoading)
-          const Expanded(child: Center(child: CircularProgressIndicator()))
+          Expanded(
+            child: Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const CircularProgressIndicator(),
+                  if (_isTesting) ...[
+                    const SizedBox(height: 16),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 24),
+                      child: Text(
+                        _lastOperationInfo,
+                        textAlign: TextAlign.center,
+                        style: Theme.of(context).textTheme.bodyMedium,
+                      ),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          )
         else if (_tableData.isEmpty)
           const Expanded(
             child: Center(
@@ -2737,13 +2757,21 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
       setState(() {
         _isTesting = true; // Use the tests view's testing flag
         _isDataLoading = true;
-        _lastOperationInfo =
-            'Adding $count records (${method == InsertMethod.batch ? 'batch' : 'one-by-one'})...';
+        _lastOperationInfo = 'Generating $count test records...';
       });
+      // Dialog pop only schedules a frame. Paint that frame (dialog gone,
+      // spinner visible) before mock-data generation starts.
+      await WidgetsBinding.instance.endOfFrame;
+      if (!mounted) return;
 
       int elapsed = -1;
 
       try {
+        void onStatus(String status) {
+          if (!mounted) return;
+          setState(() => _lastOperationInfo = status);
+        }
+
         if (method == InsertMethod.batch) {
           // Use the existing benchmark logic for batch adding
           elapsed = await widget.example.addExamples(
@@ -2752,6 +2780,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
             foreignKeyValues: foreignKeyValues,
             foreignKeyModes: foreignKeyModes,
             foreignKeyIdLists: foreignKeyIdLists,
+            onStatus: onStatus,
           );
         } else {
           // Use the existing benchmark logic for one-by-one adding
@@ -2761,6 +2790,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
             foreignKeyValues: foreignKeyValues,
             foreignKeyModes: foreignKeyModes,
             foreignKeyIdLists: foreignKeyIdLists,
+            onStatus: onStatus,
           );
         }
       } catch (e, s) {
@@ -2775,7 +2805,8 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
       if (elapsed >= 0) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Added $count records in ${elapsed}ms'),
+            content:
+                Text('Inserted $count records in ${elapsed}ms (database time)'),
             duration: const Duration(seconds: 3),
             backgroundColor: Colors.green,
           ),

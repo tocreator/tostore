@@ -592,6 +592,9 @@ class WebStorageImpl implements StorageInterface {
   @override
   Future<Uint8List> readAsBytesAt(String path, int start, {int? length}) async {
     await _initCompleter.future;
+    if (_closed) {
+      throw DbClosedException('Storage is closed');
+    }
     try {
       final normalizedPath = _normalizePath(path);
       final buffered = _writeBuffer[normalizedPath];
@@ -614,6 +617,10 @@ class WebStorageImpl implements StorageInterface {
 
       return fullData.sublist(start, end);
     } catch (e) {
+      if (e is DbClosedException) rethrow;
+      if (_closed) {
+        throw DbClosedException('Storage is closed');
+      }
       Logger.error('Read bytes at offset failed', rawError: e);
       return Uint8List(0);
     }
@@ -626,6 +633,9 @@ class WebStorageImpl implements StorageInterface {
   ) async {
     if (ranges.isEmpty) return const [];
     await _initCompleter.future;
+    if (_closed) {
+      throw DbClosedException('Storage is closed');
+    }
     try {
       final normalizedPath = _normalizePath(path);
       final buffered = _writeBuffer[normalizedPath];
@@ -655,6 +665,10 @@ class WebStorageImpl implements StorageInterface {
       }
       return results;
     } catch (e) {
+      if (e is DbClosedException) rethrow;
+      if (_closed) {
+        throw DbClosedException('Storage is closed');
+      }
       Logger.error('Batch read bytes at offset failed', rawError: e);
       return List<Uint8List>.filled(ranges.length, Uint8List(0),
           growable: false);

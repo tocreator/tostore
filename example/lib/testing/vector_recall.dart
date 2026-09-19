@@ -92,7 +92,7 @@ class ExampleVectorCorpus {
   }) {
     final groupId = groupIdForIndex(index);
     final memberId = memberIdForIndex(index);
-    final (center, dir) = _frame(groupId, dimensions);
+    final (center, dir) = _cachedFrame(groupId, dimensions);
     final t = memberT(memberId);
     final values = List<double>.generate(
       dimensions,
@@ -104,7 +104,7 @@ class ExampleVectorCorpus {
 
   /// Query for [groupId]: off-center on the group ray (not stored).
   static VectorData groupQuery(int groupId, int dimensions) {
-    final (center, dir) = _frame(groupId, dimensions);
+    final (center, dir) = _cachedFrame(groupId, dimensions);
     final values = List<double>.generate(
       dimensions,
       (d) => center[d] + queryT * dir[d],
@@ -144,6 +144,33 @@ class ExampleVectorCorpus {
           originIndex: originIndex,
         ),
     ];
+  }
+
+  /// Last orthonormal frame. Sequential inserts reuse one frame per group
+  /// (16 members), so bulk generation does not redo the Gaussian basis.
+  static int? _cachedFrameGroup;
+  static int? _cachedFrameDims;
+  static List<double>? _cachedCenter;
+  static List<double>? _cachedDir;
+
+  static (List<double>, List<double>) _cachedFrame(
+    int groupId,
+    int dimensions,
+  ) {
+    final center = _cachedCenter;
+    final dir = _cachedDir;
+    if (center != null &&
+        dir != null &&
+        _cachedFrameGroup == groupId &&
+        _cachedFrameDims == dimensions) {
+      return (center, dir);
+    }
+    final frame = _frame(groupId, dimensions);
+    _cachedFrameGroup = groupId;
+    _cachedFrameDims = dimensions;
+    _cachedCenter = frame.$1;
+    _cachedDir = frame.$2;
+    return frame;
   }
 
   static (List<double>, List<double>) _frame(int groupId, int dimensions) {

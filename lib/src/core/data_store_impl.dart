@@ -7146,7 +7146,7 @@ class DataStoreImpl {
           final y18 = yieldController.maybeYield();
           if (y18 != null) await y18;
         } catch (e) {
-          if (shouldAbortBackgroundScan) break;
+          if (shouldAbortBackgroundScan || e is DbClosedException) break;
           if (_isDevTableNotFound(e)) {
             continue;
           }
@@ -7188,7 +7188,7 @@ class DataStoreImpl {
             if (yVec != null) await yVec;
           }
         } catch (e) {
-          if (shouldAbortBackgroundScan) break;
+          if (shouldAbortBackgroundScan || e is DbClosedException) break;
           if (_isDevTableNotFound(e)) {
             continue;
           }
@@ -7211,7 +7211,7 @@ class DataStoreImpl {
         prewarmBudgetBytes: remainingPrewarmBytes,
       );
     } catch (e) {
-      if (_isInitialized) {
+      if (_isInitialized && e is! DbClosedException) {
         Logger.error('Error in _executePrewarm', rawError: e);
       }
     } finally {
@@ -7367,7 +7367,7 @@ class DataStoreImpl {
         final y19 = yieldController.maybeYield();
         if (y19 != null) await y19;
       } catch (e) {
-        if (shouldAbortBackgroundScan) {
+        if (shouldAbortBackgroundScan || e is DbClosedException) {
           return remainingBytes;
         }
         Logger.warn('Prewarm KV store failed for $tableName', rawError: e);
@@ -7477,7 +7477,7 @@ class DataStoreImpl {
         final y22 = yieldController.maybeYield();
         if (y22 != null) await y22;
       } catch (e) {
-        if (shouldAbortBackgroundScan) break;
+        if (shouldAbortBackgroundScan || e is DbClosedException) break;
         // Same race as boundary prewarm: dropped tables vs stale name snapshot.
         if (_isDevTableNotFound(e)) {
           continue;

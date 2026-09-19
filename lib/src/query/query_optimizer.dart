@@ -3,6 +3,7 @@ import 'dart:math';
 import '../handler/logger.dart';
 import '../handler/value_matcher.dart';
 import '../core/data_store_impl.dart';
+import '../model/db_exception.dart';
 import '../model/table_context.dart';
 import '../model/table_schema.dart';
 import 'query_plan.dart';
@@ -167,6 +168,7 @@ class QueryOptimizer {
         naturalOrderBy: <String>[schema.primaryKey],
       );
     } catch (e) {
+      if (e is DbClosedException) rethrow;
       Logger.error('query optimization failed', rawError: e);
       // use full table scan when error occurs
       return _createTableScanPlan(table);

@@ -1,6 +1,7 @@
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/scheduler.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:tostore/tostore.dart';
@@ -646,6 +647,49 @@ class ToStoreExample {
     return record;
   }
 
+  /// Lets the example UI paint a frame during mock-data generation.
+  ///
+  /// [Future.delayed] only hits the timer queue and can resume before the
+  /// next frame, so a large generate loop still looks like the engine froze.
+  Future<void> _yieldUiFrame() {
+    return SchedulerBinding.instance.endOfFrame;
+  }
+
+  /// Builds mock rows in short slices so the UI can keep painting.
+  Future<List<Map<String, dynamic>>> _generateRecordsChunked({
+    required TableSchema schema,
+    required int firstIndex,
+    required int count,
+    required int alreadyDone,
+    required int total,
+    required Set<String> foreignKeyFields,
+    Map<String, dynamic>? foreignKeyValues,
+    Map<String, ForeignKeyMode>? foreignKeyModes,
+    Map<String, List<dynamic>>? foreignKeyIdLists,
+    void Function(String status)? onStatus,
+  }) async {
+    final records = <Map<String, dynamic>>[];
+    final slice = Stopwatch()..start();
+    for (var i = 0; i < count; i++) {
+      records.add(_generateRecord(
+        schema,
+        firstIndex + i,
+        foreignKeyValues: foreignKeyValues,
+        foreignKeyModes: foreignKeyModes,
+        foreignKeyIdLists: foreignKeyIdLists,
+        foreignKeyFields: foreignKeyFields,
+        random: _sharedRandom,
+      ));
+      final done = alreadyDone + i + 1;
+      if (slice.elapsedMilliseconds >= 8 || i == count - 1) {
+        onStatus?.call('Generating test data $done/$total...');
+        await _yieldUiFrame();
+        slice.reset();
+      }
+    }
+    return records;
+  }
+
   /// Adds a specified number of example records to a given table using batch inserts.
   /// Optimized for 1M+ ultra-large dataset insertions to avoid memory-IO dual pressure.
   Future<int> addExamples(
@@ -654,6 +698,7 @@ class ToStoreExample {
     Map<String, dynamic>? foreignKeyValues,
     Map<String, ForeignKeyMode>? foreignKeyModes,
     Map<String, List<dynamic>>? foreignKeyIdLists,
+    void Function(String status)? onStatus,
   }) async {
     final schema = await db.getTableSchema(tableName);
     if (schema == null) {
@@ -682,20 +727,26 @@ class ToStoreExample {
 
     while (processedCount < count) {
       final currentBatchSize = min(batchSize, count - processedCount);
-      final records = <Map<String, dynamic>>[];
 
-      // 1. Generate data for current 100k chunk
-      for (var i = 0; i < currentBatchSize; i++) {
-        records.add(_generateRecord(
-          schema,
-          baseIndex + processedCount + i + 1,
-          foreignKeyValues: foreignKeyValues,
-          foreignKeyModes: foreignKeyModes,
-          foreignKeyIdLists: foreignKeyIdLists,
-          foreignKeyFields: fkFields,
-          random: _sharedRandom,
-        ));
-      }
+      // 1. Generate data for current 100k chunk, yielding so the UI stays live.
+      final records = await _generateRecordsChunked(
+        schema: schema,
+        firstIndex: baseIndex + processedCount + 1,
+        count: currentBatchSize,
+        alreadyDone: processedCount,
+        total: count,
+        foreignKeyFields: fkFields,
+        foreignKeyValues: foreignKeyValues,
+        foreignKeyModes: foreignKeyModes,
+        foreignKeyIdLists: foreignKeyIdLists,
+        onStatus: onStatus,
+      );
+
+      // Paint "inserting" before the engine call so generation time is not
+      // mistaken for database time.
+      onStatus?.call(
+          'Inserting ${processedCount + currentBatchSize}/$count records...');
+      await _yieldUiFrame();
 
       // 2. Insert current chunk (measure pure database time)
       dbStopwatch.start();
@@ -738,6 +789,7 @@ class ToStoreExample {
     Map<String, dynamic>? foreignKeyValues,
     Map<String, ForeignKeyMode>? foreignKeyModes,
     Map<String, List<dynamic>>? foreignKeyIdLists,
+    void Function(String status)? onStatus,
   }) async {
     final schema = await db.getTableSchema(tableName);
     if (schema == null) {
@@ -758,23 +810,21 @@ class ToStoreExample {
     };
 
     // Pre-generate data to measure insert performance accurately (excluding data generation time)
-    final records = <Map<String, dynamic>>[];
-    for (var i = 0; i < count; i++) {
-      records.add(_generateRecord(
-        schema,
-        baseIndex + i + 1,
-        foreignKeyValues: foreignKeyValues,
-        foreignKeyModes: foreignKeyModes,
-        foreignKeyIdLists: foreignKeyIdLists,
-        foreignKeyFields: fkFields,
-        random: _sharedRandom,
-      ));
-      // Yield periodically during generation to keep UI responsive
-      if (i > 0 && i % 1000 == 0) {
-        await Future.delayed(Duration.zero);
-      }
-    }
+    final records = await _generateRecordsChunked(
+      schema: schema,
+      firstIndex: baseIndex + 1,
+      count: count,
+      alreadyDone: 0,
+      total: count,
+      foreignKeyFields: fkFields,
+      foreignKeyValues: foreignKeyValues,
+      foreignKeyModes: foreignKeyModes,
+      foreignKeyIdLists: foreignKeyIdLists,
+      onStatus: onStatus,
+    );
     logService.add('Data generation complete. Starting insertion...');
+    onStatus?.call('Inserting $count records one by one...');
+    await _yieldUiFrame();
 
     final stopwatch = Stopwatch()..start();
 

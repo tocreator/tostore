@@ -537,8 +537,20 @@ class FileStorageImpl implements StorageInterface {
         s.contains('errno = 2');
   }
 
+  /// Close/switchSpace must not be turned into empty bytes. Callers treat
+  /// empty offset reads as a missing page (overflow / B+Tree / vector).
+  void _rethrowIfClosed(Object e) {
+    if (e is DbClosedException) throw e;
+    if (_closed || _closing) {
+      throw DbClosedException('Storage is closed');
+    }
+  }
+
   @override
   Future<Uint8List> readAsBytesAt(String path, int start, {int? length}) async {
+    if (_closed) {
+      throw DbClosedException('Storage is closed');
+    }
     final normalized = _canonicalPath(path);
     final key = _poolKey(path, FileMode.read);
     try {
@@ -567,6 +579,7 @@ class FileStorageImpl implements StorageInterface {
         return await raf.read(readLen);
       });
     } catch (e) {
+      _rethrowIfClosed(e);
       if (_isFileNotFound(e)) {
         return Uint8List(0);
       }
@@ -581,6 +594,9 @@ class FileStorageImpl implements StorageInterface {
     List<ByteReadRange> ranges,
   ) async {
     if (ranges.isEmpty) return const [];
+    if (_closed) {
+      throw DbClosedException('Storage is closed');
+    }
     final normalized = _canonicalPath(path);
     final key = _poolKey(path, FileMode.read);
     try {
@@ -619,6 +635,7 @@ class FileStorageImpl implements StorageInterface {
         return results;
       });
     } catch (e) {
+      _rethrowIfClosed(e);
       if (_isFileNotFound(e)) {
         return List<Uint8List>.filled(ranges.length, Uint8List(0),
             growable: false);
@@ -1447,6 +1464,7 @@ class FileStorageImpl implements StorageInterface {
   }
 
   DbException _wrapIoError(Object e, String operation, String path) {
+    if (e is DbClosedException) return e;
     ResultType type = ResultType.sysIoGeneric;
     String message = e.toString();
 

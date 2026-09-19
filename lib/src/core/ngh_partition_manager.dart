@@ -8,6 +8,7 @@ import '../handler/meta_binary_codec.dart';
 import '../handler/parallel_processor.dart';
 import '../interface/storage_interface.dart';
 import '../model/data_store_config.dart';
+import '../model/db_exception.dart';
 import '../model/ngh_index_meta.dart';
 import '../model/parallel_journal_entry.dart';
 import '../model/table_context.dart';
@@ -283,6 +284,7 @@ final class NghPartitionManager {
           tableUid, indexUid, partitionNo, pageNo, page);
       return page;
     } catch (e) {
+      if (e is DbClosedException) rethrow;
       Logger.warn(
         'NGH posting page corrupted or torn at partition $partitionNo, page $pageNo for index "$indexUid". Gracefully degrading to null.',
         rawError: e,
@@ -611,6 +613,7 @@ final class NghPartitionManager {
           table.tableUid, indexUid, ptr.partitionNo, ptr.pageNo, page);
       return page;
     } catch (e) {
+      if (e is DbClosedException) rethrow;
       Logger.warn(
         'NGH nav page torn at p${ptr.partitionNo} pg${ptr.pageNo} for "$indexUid".',
         rawError: e,
@@ -643,6 +646,7 @@ final class NghPartitionManager {
           table.tableUid, indexUid, id.partitionNo, id.pageNo, page);
       return page;
     } catch (e) {
+      if (e is DbClosedException) rethrow;
       Logger.warn(
         'NGH pdir page torn at p${id.partitionNo} pg${id.pageNo} for "$indexUid".',
         rawError: e,
@@ -701,6 +705,7 @@ final class NghPartitionManager {
           table.tableUid, indexUid, ptr.partitionNo, ptr.pageNo, page);
       return page;
     } catch (e) {
+      if (e is DbClosedException) rethrow;
       Logger.warn(
         'NGH pkmap page torn at p${ptr.partitionNo} pg${ptr.pageNo} for "$indexUid".',
         rawError: e,

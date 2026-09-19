@@ -41,8 +41,13 @@ class DbException implements Exception {
     ]);
   }
 
+  /// True when [e] is a close / switchSpace cancellation, not a data error.
+  static bool isClosed(Object? e) => e is DbClosedException;
+
   /// Force wrap any exception into a new [DbException] with the specified [forceType].
   ///
+  /// - [DbClosedException] is returned as-is so close/switchSpace races are not
+  ///   relabeled as page corruption.
   /// - If [e] is a [DbException], all of its diagnostic statuses are flattened and appended
   ///   after the new forced [GeneralStatus] to preserve the causal chain.
   /// - Otherwise, [e] is appended as a nested [GeneralStatus] representing the original cause.
@@ -51,6 +56,7 @@ class DbException implements Exception {
     required ResultType forceType,
     required String message,
   }) {
+    if (e is DbClosedException) return e;
     final parentStatus = GeneralStatus(
       type: forceType,
       message: message,

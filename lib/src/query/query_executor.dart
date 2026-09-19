@@ -1563,7 +1563,9 @@ class QueryExecutor {
         executionTimeMs: stopwatch.elapsedMilliseconds,
       );
     } catch (e) {
-      Logger.error('query execution failed', rawError: e);
+      if (e is! DbClosedException) {
+        Logger.error('query execution failed', rawError: e);
+      }
       rethrow;
     }
   }
@@ -2370,6 +2372,9 @@ class QueryExecutor {
         decodeFieldStructureOverride: decodeFieldStructureOverride,
       );
     } catch (e) {
+      if (e is DbClosedException) {
+        return TableScanResult(records: []);
+      }
       Logger.error('Table scan failed', rawError: e);
       return TableScanResult(records: []);
     }
@@ -3182,6 +3187,9 @@ class QueryExecutor {
         records: selector.toSortedList(),
       );
     } catch (e) {
+      if (e is DbClosedException) {
+        return TableScanResult(records: []);
+      }
       Logger.error('Index scan failed', rawError: e);
       return await _performTableScan(table, matcher,
           limit: limit,
