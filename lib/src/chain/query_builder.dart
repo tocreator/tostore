@@ -973,6 +973,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
               groupBy: _groupByFields,
               clauseFlags: _clauseFlags,
               applyPromoteResultTransform: true,
+              selectedFields: _selectedFields,
             ) ??
         const ExecuteResult.empty();
 

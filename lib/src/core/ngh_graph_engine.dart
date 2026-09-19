@@ -1889,8 +1889,9 @@ class NghGraphEngine {
               slot.invNorm,
               stride: coarseStride,
             );
-            if (distanceThreshold != null && roughDist > distanceThreshold)
+            if (distanceThreshold != null && roughDist > distanceThreshold) {
               continue;
+            }
             if (!candidateHeap.isFull || roughDist < candidateHeap.peekDist) {
               candidateHeap.push(slot, roughDist);
             }
@@ -1907,8 +1908,9 @@ class NghGraphEngine {
               slot.scale,
               stride: coarseStride,
             );
-            if (distanceThreshold != null && roughDist > distanceThreshold)
+            if (distanceThreshold != null && roughDist > distanceThreshold) {
               continue;
+            }
             if (!candidateHeap.isFull || roughDist < candidateHeap.peekDist) {
               candidateHeap.push(slot, roughDist);
             }
@@ -1927,8 +1929,9 @@ class NghGraphEngine {
               slot.squaredNorm,
               stride: coarseStride,
             );
-            if (distanceThreshold != null && roughDist > distanceThreshold)
+            if (distanceThreshold != null && roughDist > distanceThreshold) {
               continue;
+            }
             if (!candidateHeap.isFull || roughDist < candidateHeap.peekDist) {
               candidateHeap.push(slot, roughDist);
             }

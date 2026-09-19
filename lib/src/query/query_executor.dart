@@ -485,6 +485,10 @@ class QueryExecutor {
     /// Engine-internal mutation path (delete/update/ttl): skip user-facing
     /// post-processing (schema normalize, cursor pagination).
     bool engineInternal = false,
+
+    /// Forwarded only into hybrid/vector retrieval after ANN hits.
+    /// Ignored on peek, point lookup, btree, and table-scan paths.
+    List<String>? selectedFields,
   }) async {
     final schemaMgr = _dataStore.tableMetaManager;
     if (schemaMgr == null) {
@@ -749,6 +753,7 @@ class QueryExecutor {
         readFromFileOnly: readFromFileOnly,
         promoteDesc: promoteDesc,
         applyPromoteResultTransform: applyPromoteResultTransform,
+        selectedFields: selectedFields,
       );
     }
 
@@ -4388,6 +4393,7 @@ class QueryExecutor {
     bool readFromFileOnly = false,
     PromoteRuntimeDescriptor? promoteDesc,
     bool applyPromoteResultTransform = false,
+    List<String>? selectedFields,
   }) async {
     final stopwatch = Stopwatch()..start();
     final effectiveLimit = limit ?? _dataStore.config.defaultQueryLimit;
@@ -4406,10 +4412,12 @@ class QueryExecutor {
           readFromFileOnly: readFromFileOnly,
           promoteDesc: promoteDesc,
           applyPromoteResultTransform: applyPromoteResultTransform,
+          selectedFields: selectedFields,
           stopwatch: stopwatch,
         );
       } else {
-        // AND filtered vector search (Structured + Vector)
+        // AND filtered vector search still needs table rows for the structured
+        // matcher; PK-only covering does not apply here.
         return _executeVectorWithFilterRetrieval(
           table,
           spec: shape.singleVectorSpec!,
@@ -4434,6 +4442,7 @@ class QueryExecutor {
       readFromFileOnly: readFromFileOnly,
       promoteDesc: promoteDesc,
       applyPromoteResultTransform: applyPromoteResultTransform,
+      selectedFields: selectedFields,
       stopwatch: stopwatch,
     );
   }
@@ -4446,6 +4455,7 @@ class QueryExecutor {
     bool readFromFileOnly = false,
     PromoteRuntimeDescriptor? promoteDesc,
     bool applyPromoteResultTransform = false,
+    List<String>? selectedFields,
     Stopwatch? stopwatch,
   }) async {
     final vectorIndexMgr = _dataStore.vectorIndexManager;
@@ -4492,6 +4502,38 @@ class QueryExecutor {
     final pageCandidates = start == 0 && end == candidates.length
         ? candidates
         : candidates.sublist(start, end);
+
+    if (selectedFields != null && promoteDesc == null) {
+      final pkField = table.schema.primaryKey;
+      if (selectedFields.length == 1 && selectedFields.first == pkField) {
+        final records = <Map<String, dynamic>>[];
+        final entries = <RetrievalEntry>[];
+        for (final cand in pageCandidates) {
+          records.add(<String, dynamic>{pkField: cand.primaryKey});
+          entries.add(RetrievalEntry(
+            score: cand.score,
+            channel: RetrievalChannel.vector,
+            rawScore: cand.distance,
+            meta: {
+              'distance': cand.distance,
+              'field': spec.field,
+            },
+          ));
+        }
+        stopwatch?.stop();
+        return ExecuteResult(
+          records: records,
+          retrieval: RetrievalContext(
+            entries: entries,
+            fusionMethod: RetrievalFusionMethod.single,
+          ),
+          hasMore: hasMore,
+          hasPrev: effectiveOffset > 0,
+          count: records.length,
+          executionTimeMs: stopwatch?.elapsedMilliseconds,
+        );
+      }
+    }
 
     final pks = [for (final c in pageCandidates) c.primaryKey];
     final recordsMap = await _dataStore.tableDataManager.queryRecordsMapBatch(
@@ -4671,6 +4713,7 @@ class QueryExecutor {
     bool readFromFileOnly = false,
     PromoteRuntimeDescriptor? promoteDesc,
     bool applyPromoteResultTransform = false,
+    List<String>? selectedFields,
     Stopwatch? stopwatch,
   }) async {
     final need = effectiveOffset + effectiveLimit;
@@ -4832,6 +4875,62 @@ class QueryExecutor {
 
     final double maxRrf =
         sortedPks.isNotEmpty ? rrfScores[sortedPks.first]! : 1.0;
+
+    if (selectedFields != null &&
+        globalMatcher == null &&
+        promoteDesc == null) {
+      final pkField = table.schema.primaryKey;
+      if (selectedFields.length == 1 && selectedFields.first == pkField) {
+        final records = <Map<String, dynamic>>[];
+        final entries = <RetrievalEntry>[];
+        final start = min(effectiveOffset, sortedPks.length);
+        final end = min(sortedPks.length, effectiveOffset + effectiveLimit);
+        for (int i = start; i < end; i++) {
+          final pk = sortedPks[i];
+          records.add(<String, dynamic>{pkField: pk});
+          final rawRrf = rrfScores[pk] ?? 0.0;
+          final normalizedScore = maxRrf > 0 ? (rawRrf / maxRrf) : 0.0;
+          final contribs = pkContributions[pk];
+          final bool isMultiHit = contribs != null && contribs.length > 1;
+          RetrievalChannel primaryChannel;
+          if (isMultiHit) {
+            primaryChannel = RetrievalChannel.hybrid;
+          } else {
+            final cName = contribs?.values.first['channel'];
+            if (cName == RetrievalChannel.vector.name) {
+              primaryChannel = RetrievalChannel.vector;
+            } else {
+              primaryChannel = RetrievalChannel.structured;
+            }
+          }
+          entries.add(RetrievalEntry(
+            score: normalizedScore,
+            channel: primaryChannel,
+            rawScore: rawRrf,
+            meta: {
+              'rrfScore': rawRrf,
+              'channelContributions': contribs,
+            },
+          ));
+        }
+        stopwatch?.stop();
+        return ExecuteResult(
+          records: records,
+          retrieval: RetrievalContext(
+            entries: entries,
+            fusionMethod: RetrievalFusionMethod.rrf,
+            meta: {
+              'totalCandidates': sortedPks.length,
+              'channels': channelWeights,
+            },
+          ),
+          hasMore: records.length == effectiveLimit,
+          hasPrev: effectiveOffset > 0,
+          count: records.length,
+          executionTimeMs: stopwatch?.elapsedMilliseconds,
+        );
+      }
+    }
 
     final records = <Map<String, dynamic>>[];
     final entries = <RetrievalEntry>[];
