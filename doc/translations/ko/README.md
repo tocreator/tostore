@@ -776,7 +776,7 @@ final queryVector =
 // 1) Recommended: chained hybrid retrieval (pure vector ANN)
 final result = await db
     .query('embeddings')
-    .matchVector('embedding', queryVector) // 기본 searchDepth = 50(약 95% 리콜 의도)
+    .matchVector('embedding', queryVector) // 기본 searchDepth = 50
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
@@ -818,7 +818,7 @@ print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
 **체인 검색 매개변수**(`matchVector` / `orMatchVector`, 및 쿼리 체인의 `limit`):
 
 - `field` / `vector`: 대상 벡터 필드와 쿼리 벡터(`VectorData` / `List<num>` / `Float32List`)
-- `searchDepth`: 선택적 깊이 `[1, 100]`, 리콜 **의도** `[90 %, 100 %]`에 매핑(`0.90 + depth/1000`; `50` → 약 95 % 프로덕션 기준, `80` → 약 98 %). 엔진은 최소 비용 프로브 예산 선택 — best-effort ANN, **recall@K 보장 아님**. 생략 시 기본값 `50`
+- `searchDepth`: 선택적 검색 깊이(`>= 1`, 기본값 `50`). 값을 키우면 보통 리콜이 오르고 지연도 늘어납니다. 근사 최근접 이웃이며 **recall@K를 보장하지 않습니다**. 코퍼스가 커지면 더 많은 이웃을 찾고 싶을 때 올리세요.
 - `weight`: 다중 경로 리콜 시 해당 채널의 융합 가중치. 기본값 `1.0`
 - `minScore`: 정규화 유사도 하한 `[0.0 ~ 1.0]`. 임계값 미만 후보는 제거됩니다
 - `distanceThreshold`: 거리 상한. 초과 후보는 제외됩니다

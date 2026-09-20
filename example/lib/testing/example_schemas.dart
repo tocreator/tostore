@@ -126,7 +126,7 @@ class ExampleSchemas {
   /// Interactive example tables. Fill and sweep one table at a time —
   /// do not bulk-load every width together.
   ///
-  /// 128 / 512 / 1536: searchDepth alignment.
+  /// 128 / 512 / 1536: everyday embedding widths.
   /// 4096 / 8192 / 16384 / 65535: high-D insert + flush packing.
   static const int vectorDimLow = 128;
   static const int vectorDimMid = 512;
@@ -142,7 +142,7 @@ class ExampleSchemas {
     dimensions: vectorDimLow,
   );
 
-  /// 512-d default. searchDepth probe budget is calibrated on this table.
+  /// 512-d default embedding width.
   static final TableSchema embeddings512 = _cosineNghEmbeddings(
     name: 'embeddings_512',
     dimensions: vectorDimMid,

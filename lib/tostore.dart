@@ -511,11 +511,9 @@ class ToStore implements DataStoreInterface {
   /// [fieldName] The name of the vector field.
   /// [queryVector] The target vector to search for.
   /// [topK] Number of most similar results to return.
-  /// [searchDepth] Search depth in `[1, 100]` mapped to recall intent
-  /// `[90%, 100%]` (`targetRecall = 0.90 + depth/1000`; depth 50 → 95% baseline,
-  /// 80 → 98%). Engine picks a minimum-cost probe budget for that intent;
-  /// not a guaranteed recall@K. When null, uses
-  /// [VectorIndexConfig.defaultSearchDepth] (`50`).
+  /// [searchDepth] Search depth (`>= 1`). Larger values typically raise
+  /// recall and latency. Approximate nearest neighbor — not a guaranteed
+  /// recall@K. When null, uses [VectorIndexConfig.defaultSearchDepth] (`50`).
   /// [distanceThreshold] Maximum distance for results to be included.
   /// Returns a list of [VectorSearchResult] sorted by similarity.
   ///
@@ -538,9 +536,9 @@ class ToStore implements DataStoreInterface {
   /// [fieldName] 向量字段名称。
   /// [queryVector] 查询目标向量。
   /// [topK] 返回最相似的结果数量。
-  /// [searchDepth] 检索深度 `[1, 100]`，映射到召回意图 `[90%, 100%]`
-  /// （`0.90 + depth/1000`；50→95% 基线，80→98%）。引擎按最小代价对齐该意图；
-  /// 非保证 recall@K。未传时使用引擎默认 `50`。
+  /// [searchDepth] 检索深度（`>= 1`）。数值越大通常召回越高、耗时也越大。
+  /// 近似最近邻，不保证 recall@K。未传时使用
+  /// [VectorIndexConfig.defaultSearchDepth]（`50`）。
   /// [distanceThreshold] 距离阈值，超过此值的记录将被过滤。
   /// 返回按相似度排序的 [VectorSearchResult] 列表。
   @override

@@ -3574,11 +3574,10 @@ enum VectorIndexType {
 /// )
 /// ```
 class VectorIndexConfig {
-  /// Default ANN searchDepth when a query omits it (`1..100`).
+  /// Default ANN searchDepth when a query omits it.
   ///
-  /// Maps to recall intent in `[90%, 100%]` via
-  /// `targetRecall = 0.90 + depth/1000` (depth 50 → 95% production baseline).
-  /// Best-effort ANN intent under a latency budget — not a guaranteed recall@K.
+  /// Larger values typically raise recall and latency. Best-effort ANN —
+  /// not a guaranteed recall@K.
   static const int defaultSearchDepth = 50;
 
   /// Dense vector algorithm id. Defaults to [VectorIndexType.ngh].

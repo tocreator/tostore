@@ -576,6 +576,12 @@ final class NghNavGraphPage {
   /// Cached count of leaf centroids.
   int? cachedNLeaves;
 
+  /// True after coarse centroids were rewritten as subtree means.
+  bool? cachedCoarseMeansReady;
+
+  /// Cached posting-list ids (leaves / leftover coarses with data).
+  List<int>? cachedSearchableListIds;
+
   NghNavGraphPage({
     required this.dimensions,
     required this.centroids,
@@ -583,6 +589,8 @@ final class NghNavGraphPage {
     this.cachedTopLevelRoutingIds,
     this.cachedImbalance,
     this.cachedNLeaves,
+    this.cachedCoarseMeansReady,
+    this.cachedSearchableListIds,
   });
 
   Uint8List encodePayload() {
@@ -1184,16 +1192,16 @@ final class NghPageSizer {
   }) {
     final n = centroids.length;
     if (n == 0) return;
-    final dims = dimensions ?? centroids.first.vector.length;
-    final maxChildren = maxNavInlineChildren(pageSize, dims);
+    // pageSize / dimensions size the on-disk inline child cap at encode time.
+    assert(pageSize >= 0 || dimensions == null);
     for (final c in centroids) {
       if (c.parentId < -1 || c.parentId >= n) {
         c.parentId = -1;
       }
       c.childIds.removeWhere((id) => id < 0 || id >= n);
-      if (c.childIds.length > maxChildren) {
-        c.childIds.removeRange(maxChildren, c.childIds.length);
-      }
+      // Do not drop overflow children here. Encode still writes at most
+      // [maxChildren] inline ids; insert must split before exceeding that.
+      // Truncating in memory would hide a fanout bug and lose nested lists.
       c.neighbors.removeWhere((id) => id < 0 || id >= n);
       if (c.neighbors.length > maxNavNeighbors) {
         c.neighbors.removeRange(maxNavNeighbors, c.neighbors.length);

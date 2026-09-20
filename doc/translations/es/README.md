@@ -776,7 +776,7 @@ final queryVector =
 // 1) Recommended: chained hybrid retrieval (pure vector ANN)
 final result = await db
     .query('embeddings')
-    .matchVector('embedding', queryVector) // searchDepth predeterminado = 50 (~95 % intención de recall)
+    .matchVector('embedding', queryVector) // searchDepth predeterminado = 50
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
@@ -818,7 +818,7 @@ print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
 **Parámetros de recuperación encadenada** (`matchVector` / `orMatchVector`, más `limit` en la cadena de consulta):
 
 - `field` / `vector`: campo vectorial de destino y vector de consulta (`VectorData` / `List<num>` / `Float32List`)
-- `searchDepth`: profundidad opcional `[1, 100]`, mapeada a **intención** de recall `[90 %, 100 %]` (`0.90 + depth/1000`; `50` → ~95 % baseline de producción, `80` → ~98 %); el motor elige un presupuesto mínimo de sondas — ANN best-effort, **no** recall@K garantizado; omitir → `50` por defecto
+- `searchDepth`: profundidad de búsqueda opcional (`>= 1`, valor predeterminado `50`). Valores mayores suelen subir el recall y la latencia. Vecino más cercano aproximado — **no** es un recall@K garantizado. Auméntalo si el corpus crece y quieres encontrar más vecinos.
 - `weight`: peso de fusión de este canal de recuperación en la recuperación multi-vía; valor predeterminado `1.0`
 - `minScore`: umbral inferior de similitud normalizada en `[0.0 ~ 1.0]`; los candidatos por debajo se descartan
 - `distanceThreshold`: techo de distancia; los candidatos que lo superen se excluyen

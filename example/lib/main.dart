@@ -5230,11 +5230,10 @@ class VectorSearchDialog extends StatefulWidget {
 }
 
 class _VectorSearchDialogState extends State<VectorSearchDialog> {
-  // Presets aligned to recall-intent mapping (depth → ~90–100%).
-  static const int _depthMin = 1; // ~90.1%
-  static const int _depthFast = 30; // ~93%
-  static const int _depthBalanced = 50; // ~95% production baseline
-  static const int _depthDeep = 80; // ~98%
+  static const int _depthMin = 1;
+  static const int _depthFast = 30;
+  static const int _depthBalanced = 50;
+  static const int _depthDeep = 80;
 
   int _iterations = 100;
   int _topK = 10;
@@ -5250,10 +5249,10 @@ class _VectorSearchDialogState extends State<VectorSearchDialog> {
   }
 
   void _setSearchDepth(int depth) {
-    final clamped = depth.clamp(1, 100);
+    final next = depth < 1 ? 1 : depth;
     setState(() {
-      _searchDepth = clamped;
-      _depthController.text = clamped.toString();
+      _searchDepth = next;
+      _depthController.text = next.toString();
     });
   }
 
@@ -5292,7 +5291,7 @@ class _VectorSearchDialogState extends State<VectorSearchDialog> {
             ),
             Center(child: Text('$_topK results per search')),
             const SizedBox(height: 24),
-            const Text('Search Depth (1–100):',
+            const Text('Search Depth:',
                 style: TextStyle(fontWeight: FontWeight.bold)),
             const SizedBox(height: 8),
             Wrap(
@@ -5329,11 +5328,11 @@ class _VectorSearchDialogState extends State<VectorSearchDialog> {
                 border: OutlineInputBorder(),
                 prefixIcon: Icon(Icons.layers),
                 helperText:
-                    '1–100: higher depth raises recall intent (~90% to 100%) and latency',
+                    'Larger depth typically raises recall and latency',
               ),
               onChanged: (v) {
                 final val = int.tryParse(v);
-                if (val != null && val >= 1 && val <= 100) {
+                if (val != null && val >= 1) {
                   setState(() => _searchDepth = val);
                 }
               },
@@ -5394,7 +5393,7 @@ class _VectorSearchDialogState extends State<VectorSearchDialog> {
             Text(
               'One click runs searchDepth '
               '${vectorSearchDepthSweepPoints.join(", ")} at the current corpus '
-              'size and prints a compact recall-vs-intent table.',
+              'size and prints recall and latency for each depth.',
               style: const TextStyle(fontSize: 12, color: Colors.grey),
             ),
           ],
@@ -5408,7 +5407,9 @@ class _VectorSearchDialogState extends State<VectorSearchDialog> {
         OutlinedButton(
           onPressed: () {
             final parsedDepth = int.tryParse(_depthController.text.trim());
-            final depth = (parsedDepth ?? _searchDepth).clamp(1, 100);
+            final depth = parsedDepth != null && parsedDepth >= 1
+                ? parsedDepth
+                : _searchDepth;
             Navigator.of(context).pop({
               'sweep': 1,
               'iterations': _iterations,
@@ -5421,7 +5422,9 @@ class _VectorSearchDialogState extends State<VectorSearchDialog> {
         ElevatedButton(
           onPressed: () {
             final parsedDepth = int.tryParse(_depthController.text.trim());
-            final depth = (parsedDepth ?? _searchDepth).clamp(1, 100);
+            final depth = parsedDepth != null && parsedDepth >= 1
+                ? parsedDepth
+                : _searchDepth;
             Navigator.of(context).pop({
               'iterations': _iterations,
               'topK': _topK,

@@ -776,7 +776,7 @@ final queryVector =
 // 1) Recommended: chained hybrid retrieval (pure vector ANN)
 final result = await db
     .query('embeddings')
-    .matchVector('embedding', queryVector) // searchDepth по умолчанию = 50 (~95% намерения recall)
+    .matchVector('embedding', queryVector) // searchDepth по умолчанию = 50
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
@@ -818,7 +818,7 @@ print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
 **Параметры цепочечного поиска** (`matchVector` / `orMatchVector`, а также `limit` в цепочке):
 
 - `field` / `vector`: целевое векторное поле и вектор запроса (`VectorData` / `List<num>` / `Float32List`)
-- `searchDepth`: необязательная глубина `[1, 100]`, отображается в **намерение** recall `[90 %, 100 %]` (`0.90 + depth/1000`; `50` → ~95 % production baseline, `80` → ~98 %); движок выбирает минимальный бюджет зондов — best-effort ANN, **не** гарантированный recall@K; по умолчанию `50`
+- `searchDepth`: необязательная глубина поиска (`>= 1`, по умолчанию `50`). Большее значение обычно повышает recall и задержку. Приближённый поиск ближайших соседей — **не** гарантированный recall@K. Увеличивайте параметр, если корпус растёт и нужно находить больше соседей.
 - `weight`: вес слияния этого канала отзыва при многоканальном поиске; по умолчанию `1.0`
 - `minScore`: нижний порог нормализованного сходства `[0.0 ~ 1.0]`; кандидаты ниже отбрасываются
 - `distanceThreshold`: верхний порог расстояния; превышающие исключаются

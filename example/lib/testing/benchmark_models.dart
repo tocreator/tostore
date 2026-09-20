@@ -3,7 +3,6 @@ import 'dart:math' as math;
 import 'package:tostore/tostore.dart';
 
 import 'benchmark_schemas.dart';
-import 'vector_recall.dart';
 
 /// Short labels / descriptions for benchmark durability chips and reports.
 extension BenchmarkRecoveryDurabilityX on RecoveryDurability {
@@ -94,7 +93,7 @@ enum BenchmarkOperation {
   vectorHybridSearch(
       'Vector Hybrid Search', 'Filter plus vector search (full rows)'),
   vectorRecallCheck('Vector Recall',
-      'Checks Recall@K at the default searchDepth. Not a ceiling — depth 1–100 targets about 90%–100%');
+      'Checks Recall@K at the default searchDepth. Larger searchDepth typically raises recall and latency');
 
   final String label;
   final String description;
@@ -260,18 +259,13 @@ class BenchmarkSummary {
   bool get hasVectorRecall =>
       metrics.any((m) => m.name == BenchmarkOperation.vectorRecallCheck.label);
 
-  /// Visible under the results table. States that default depth is an
-  /// operating point (~95% at 50), not the engine's recall ceiling.
+  /// Visible under the results table.
   String? get vectorRecallCaption {
     if (!hasVectorRecall) return null;
     final depth = VectorIndexConfig.defaultSearchDepth;
-    final intent =
-        (VectorRecallHarness.recallIntent(depth) * 100).toStringAsFixed(0);
-    return 'Recall checks the default searchDepth ($depth → about $intent% intent), '
+    return 'Recall checks the default searchDepth ($depth), '
         'the same point used by the ANN and hybrid rows. '
-        'That is the production operating point, not maximum recall. '
-        'Raise searchDepth from 1 to 100 to target about 90%–100% '
-        '(higher depth costs more latency).';
+        'Larger searchDepth typically raises recall and latency.';
   }
 
   /// Formats the benchmark results as a clean Markdown table.
@@ -318,7 +312,7 @@ class BenchmarkSummary {
     if (qualityRows.isNotEmpty) {
       buffer.writeln();
       buffer.writeln(
-          '**Quality notes** (Result = whether Recall@K met the searchDepth intent, not a ceiling; Count = queries):');
+          '**Quality notes** (Result = measured Recall@K at the chosen searchDepth; Count = queries):');
       for (final m in qualityRows) {
         buffer.writeln('- **${m.name}**: ${m.qualityNote}');
       }

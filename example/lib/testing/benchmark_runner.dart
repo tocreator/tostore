@@ -895,8 +895,6 @@ class BenchmarkRunner {
         final canScore =
             lastReport?.canScoreRecall == true && neighborPossible > 0;
         final recallFraction = canScore ? neighborHits / neighborPossible : 0.0;
-        // Headline is the operating point, not a raw percentage. A default
-        // depth of 50 is ~95% intent; printing "95%" reads as a ceiling.
         compactHighlight = VectorRecallHarness.suiteHighlight(
           canScore: canScore,
           recallFraction: recallFraction,

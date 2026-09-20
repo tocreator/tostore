@@ -776,7 +776,7 @@ final queryVector =
 // 1) Recommended: chained hybrid retrieval (pure vector ANN)
 final result = await db
     .query('embeddings')
-    .matchVector('embedding', queryVector) // デフォルト searchDepth = 50（約 95% リコール意図）
+    .matchVector('embedding', queryVector) // デフォルト searchDepth = 50
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
@@ -818,7 +818,7 @@ print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
 **チェーン検索パラメータ**（`matchVector` / `orMatchVector`、およびクエリチェーン上の `limit`）：
 
 - `field` / `vector`: 対象ベクトルフィールドとクエリベクトル（`VectorData` / `List<num>` / `Float32List`）
-- `searchDepth`: 任意の深度 `[1, 100]`。リコール**意図** `[90 %, 100 %]` にマップ（`0.90 + depth/1000`；`50` → 約 95 % 本番基線、`80` → 約 98 %）。エンジンは最小コストのプローブ予算を選択 — best-effort ANN で **recall@K 保証ではありません**。未指定時はデフォルト `50`
+- `searchDepth`: 任意の検索深度（`>= 1`、デフォルト `50`）。値を大きくすると、通常はリコールが上がり、レイテンシも増えます。近似最近傍であり **recall@K を保証しません**。コーパスが大きくなったら、より多くの近傍を拾いたい場合に上げてください。
 - `weight`: 多路リコール時の当該チャネルの融合ウェイト。デフォルトは `1.0`
 - `minScore`: 正規化類似度の下限 `[0.0 ~ 1.0]`。閾値未満の候補は切り捨てられます
 - `distanceThreshold`: 距離の上限。超えた候補は除外されます

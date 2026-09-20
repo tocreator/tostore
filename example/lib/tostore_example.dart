@@ -1004,7 +1004,7 @@ class ToStoreExample {
 
   /// Vector search latency and Recall@K versus known nearest neighbors.
   ///
-  /// [searchDepth] `[1, 100]` (null = engine default 50 → ~95% recall intent).
+  /// [searchDepth] `>= 1` (null = engine default 50).
   /// Set [verbose] false to suppress per-run logs (used by depth sweeps).
   Future<VectorSearchBenchmarkResult?> vectorSearchBenchmark(
     String tableName,
@@ -1014,12 +1014,10 @@ class ToStoreExample {
     bool verbose = true,
     bool runIdentityDiagnostic = true,
   }) async {
-    final depth =
-        (searchDepth ?? VectorIndexConfig.defaultSearchDepth).clamp(1, 100);
+    final depth = VectorRecallHarness.normalizeDepth(searchDepth);
     if (verbose) {
       logService.add('Starting Vector Search Benchmark: table="$tableName", '
-          'iterations=$iterations, topK=$topK, searchDepth=$depth '
-          '(recall intent ${((VectorRecallHarness.recallIntent(depth)) * 100).toStringAsFixed(1)}%)');
+          'iterations=$iterations, topK=$topK, searchDepth=$depth');
     }
 
     final schema = await db.getTableSchema(tableName);
@@ -1134,7 +1132,7 @@ class ToStoreExample {
   }
 
   /// Runs [vectorSearchDepthSweepPoints] at the current corpus size and logs
-  /// one compact table for recall-vs-intent alignment.
+  /// one compact table of recall and latency versus searchDepth.
   Future<void> vectorSearchDepthSweep(
     String tableName, {
     int iterations = 100,
@@ -1151,7 +1149,7 @@ class ToStoreExample {
 
     final rows = <VectorSearchBenchmarkResult>[];
     for (var i = 0; i < sweepDepths.length; i++) {
-      final depth = sweepDepths[i].clamp(1, 100);
+      final depth = VectorRecallHarness.normalizeDepth(sweepDepths[i]);
       onProgress?.call(i, sweepDepths.length);
 
       final row = await vectorSearchBenchmark(
@@ -1203,11 +1201,7 @@ class ToStoreExample {
     final totalSearchMs =
         latenciesMs.isEmpty ? 0.0 : latenciesMs.reduce((a, b) => a + b);
 
-    final intentPct = (recall.recallIntent * 100).toStringAsFixed(1);
     final recallPct = (recall.recallAtK * 100).toStringAsFixed(1);
-    final gap = recall.intentGapPp;
-    final gapLabel =
-        '${gap >= 0 ? '+' : ''}${gap.toStringAsFixed(1)} vs intent';
     final identityPct = recall.identityAt1 == null
         ? 'n/a'
         : '${(recall.identityAt1! * 100).toStringAsFixed(1)}% '
@@ -1240,14 +1234,14 @@ class ToStoreExample {
     report.writeln('-' * 78);
     if (recall.canScoreRecall) {
       report.writeln('  RECALL@K:');
-      report.writeln('    searchDepth        : $depth  →  intent $intentPct%');
+      report.writeln('    searchDepth        : $depth');
       report.writeln(
-          '    ${'Recall@${recall.topK}'.padRight(19)}: $recallPct% (${recall.neighborHits}/${recall.neighborPossible})  $gapLabel');
+          '    ${'Recall@${recall.topK}'.padRight(19)}: $recallPct% (${recall.neighborHits}/${recall.neighborPossible})');
       report.writeln('    Queries            : ${recall.queryCount}'
           '${recall.queryCount < iterations ? ' for Recall@K; $iterations timed' : ''}');
     } else {
       report.writeln('  RECALL@K:');
-      report.writeln('    searchDepth        : $depth  →  intent $intentPct%');
+      report.writeln('    searchDepth        : $depth');
       report.writeln(
           '    Status             : Skipped (insert example vector rows to measure Recall@K)');
     }

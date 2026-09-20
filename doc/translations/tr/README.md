@@ -776,7 +776,7 @@ final queryVector =
 // 1) Recommended: chained hybrid retrieval (pure vector ANN)
 final result = await db
     .query('embeddings')
-    .matchVector('embedding', queryVector) // varsayılan searchDepth = 50 (~%95 recall niyeti)
+    .matchVector('embedding', queryVector) // varsayılan searchDepth = 50
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
@@ -818,7 +818,7 @@ print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
 **Zincirli getirme parametreleri** (`matchVector` / `orMatchVector` ve sorgu zincirindeki `limit`):
 
 - `field` / `vector`: hedef vektör alanı ve sorgu vektörü (`VectorData` / `List<num>` / `Float32List`)
-- `searchDepth`: isteğe bağlı derinlik `[1, 100]`, recall **niyeti** `[90 %, 100 %]` ile eşlenir (`0.90 + depth/1000`; `50` → ~%95 üretim tabanı, `80` → ~%98); motor minimum maliyetli prob bütçesi seçer — best-effort ANN, **garantili recall@K değil**; varsayılan `50`
+- `searchDepth`: isteğe bağlı arama derinliği (`>= 1`, varsayılan `50`). Daha büyük değerler genellikle recall ve gecikmeyi artırır. Yaklaşık en yakın komşu — **garanti recall@K değil**. Derlem büyüdükçe daha fazla komşu bulmak istiyorsanız yükseltin.
 - `weight`: çok yollu getirmede bu kanalın füzyon ağırlığı; varsayılan `1.0`
 - `minScore`: normalize benzerlik alt sınırı `[0.0 ~ 1.0]`; altındakiler elenir
 - `distanceThreshold`: mesafe üst sınırı; aşan adaylar dışlanır

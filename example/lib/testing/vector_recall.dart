@@ -237,34 +237,19 @@ class ExampleVectorCorpus {
 class VectorRecallHarness {
   VectorRecallHarness._();
 
-  /// Recall intent for [searchDepth] in 1–100: ~90% at 1, ~100% at 100.
-  static double recallIntent(int searchDepth) {
-    final depth = searchDepth.clamp(1, 100);
-    return 0.90 + depth / 1000.0;
+  static int normalizeDepth(int? searchDepth) {
+    final raw = searchDepth ?? VectorIndexConfig.defaultSearchDepth;
+    return raw < 1 ? VectorIndexConfig.defaultSearchDepth : raw;
   }
 
-  /// Measured recall within this of intent still counts as met.
-  ///
-  /// One percentage point covers sampling noise on the suite's query probe.
-  static const double intentMetTolerance = 0.01;
-
-  /// Short suite-table cell, about as wide as an ops/s pill.
-  ///
-  /// Depth and "not a ceiling" live in the results caption, not this cell.
-  /// Exact Recall@K stays in [VectorRecallReport.qualityNote].
+  /// Short suite-table cell with measured Recall@K.
   static String suiteHighlight({
     required bool canScore,
     required double recallFraction,
     required int searchDepth,
   }) {
     if (!canScore) return 'n/a';
-    final intent = recallIntent(searchDepth);
-    if (recallFraction + 1e-9 >= intent - intentMetTolerance) {
-      return 'intent met';
-    }
-    final measured = (recallFraction * 100).toStringAsFixed(0);
-    final target = (intent * 100).toStringAsFixed(0);
-    return '$measured% vs $target%';
+    return '${(recallFraction * 100).toStringAsFixed(0)}% @ $searchDepth';
   }
 
   static const int maxRecallQueries = 200;
@@ -355,7 +340,7 @@ class VectorRecallHarness {
       return null;
     }
 
-    final depth = searchDepth.clamp(1, 100);
+    final depth = normalizeDepth(searchDepth);
     final isSequentialPk =
         schema.primaryKeyConfig.type == PrimaryKeyType.sequential;
 
@@ -677,7 +662,6 @@ class VectorRecallHarness {
       topK: recallK,
       requestedTopK: topK,
       searchDepth: depth,
-      recallIntent: recallIntent(depth),
       queryCount: evalQueryCount,
       requestedQueries: requestedQueries,
       recallAtK: recallAtK,
@@ -835,7 +819,6 @@ class VectorRecallHarness {
       topK: topK,
       requestedTopK: topK,
       searchDepth: depth,
-      recallIntent: recallIntent(depth),
       queryCount: sampleQueries.length,
       requestedQueries: requestedQueries,
       recallAtK: 0.0,
@@ -863,7 +846,6 @@ class VectorRecallReport {
   final int topK;
   final int requestedTopK;
   final int searchDepth;
-  final double recallIntent;
   final int queryCount;
   final int requestedQueries;
   final double recallAtK;
@@ -888,7 +870,6 @@ class VectorRecallReport {
     required this.topK,
     required this.requestedTopK,
     required this.searchDepth,
-    required this.recallIntent,
     required this.queryCount,
     required this.requestedQueries,
     required this.recallAtK,
@@ -906,8 +887,6 @@ class VectorRecallReport {
     this.completeGroups = 0,
   });
 
-  double get intentGapPp => (recallAtK - recallIntent) * 100.0;
-
   String get metricLabel => switch (metric) {
         VectorDistanceMetric.cosine => 'Cosine',
         VectorDistanceMetric.l2 => 'L2',
@@ -921,14 +900,11 @@ class VectorRecallReport {
         searchDepth: searchDepth,
       );
 
-  /// Default depth is an operating point (~95% at 50), not the maximum.
   String get operatingPointNote {
-    final intent = (recallIntent * 100).toStringAsFixed(1);
     final where = searchDepth == VectorIndexConfig.defaultSearchDepth
         ? 'default searchDepth=$searchDepth'
         : 'searchDepth=$searchDepth';
-    return '$where (intent $intent%). Not a recall ceiling — '
-        'searchDepth 1–100 targets ~90%–100%';
+    return '$where. Larger searchDepth typically raises recall and latency.';
   }
 
   String get qualityNote {
@@ -937,19 +913,18 @@ class VectorRecallReport {
         : 'Self-Recall=${(identityAt1! * 100).toStringAsFixed(1)}% '
             '($identityHits/$identityProbes)';
     if (!canScoreRecall) {
-      return '$operatingPointNote. '
+      return '$operatingPointNote '
           'Recall@$topK=n/a (example vector data required); $self; queries=$queryCount; corpus=$corpusSize';
     }
-    return '$operatingPointNote. '
+    return '$operatingPointNote '
         'Recall@$topK=${(recallAtK * 100).toStringAsFixed(1)}% '
         '($neighborHits/$neighborPossible); '
-        'gap ${intentGapPp >= 0 ? '+' : ''}${intentGapPp.toStringAsFixed(1)}pp vs intent; '
         'Top-1 Hit Rate=${(top1HitRate * 100).toStringAsFixed(1)}%; '
         '$self; queries=$queryCount; corpus=$corpusSize';
   }
 }
 
-/// Standard [searchDepth] points for recall-vs-intent alignment sweeps.
+/// Standard [searchDepth] points for recall-vs-latency sweeps.
 const List<int> vectorSearchDepthSweepPoints = [
   1,
   10,
@@ -1014,15 +989,9 @@ class VectorSearchBenchmarkResult {
 
   String _pct(double value) => '${(value * 100).toStringAsFixed(1)}%';
 
-  String _gapLabel() {
-    final gap = recall.intentGapPp;
-    return '${gap >= 0 ? '+' : ''}${gap.toStringAsFixed(1)}';
-  }
-
   String sweepTableRow() {
     final recallCol =
         recall.canScoreRecall ? _pct(recall.recallAtK).padLeft(7) : '    n/a';
-    final gapCol = recall.canScoreRecall ? _gapLabel().padLeft(7) : '    n/a';
     final top1Col = recall.canScoreRecall
         ? _pct(recall.top1HitRate).padLeft(8)
         : '     n/a';
@@ -1030,9 +999,7 @@ class VectorSearchBenchmarkResult {
         ? '    n/a'
         : _pct(recall.identityAt1!).padLeft(7);
     return '${recall.searchDepth.toString().padLeft(11)} | '
-        '${_pct(recall.recallIntent).padLeft(7)} | '
         '$recallCol | '
-        '$gapCol | '
         '$top1Col | '
         '$selfCol | '
         '${avgLatencyMs.toStringAsFixed(2).padLeft(6)} | '
@@ -1063,15 +1030,14 @@ String formatVectorDepthSweepSummary({
     ..writeln('depths=$depths'
         '${canScore ? '' : ' (Recall@K n/a — need example vector rows)'}')
     ..writeln(
-        'searchDepth | intent% | recall@$topK | gap(pp) | top1_hit | self_rc | avg_ms | p95_ms | qps');
+        'searchDepth | recall@$topK | top1_hit | self_rc | avg_ms | p95_ms | qps');
 
   for (final row in rows) {
     header.writeln(row.sweepTableRow());
   }
 
   header.writeln(
-      '# intent%=target recall for depth; gap(pp)=recall@$topK minus intent; '
-      'top1_hit=true nearest at rank 1; self_rc=own vector returns itself first');
+      '# top1_hit=true nearest at rank 1; self_rc=own vector returns itself first');
 
   return header.toString().trimRight();
 }

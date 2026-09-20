@@ -778,7 +778,7 @@ final queryVector =
 // 1) Recommended: chained hybrid retrieval (pure vector ANN)
 final result = await db
     .query('embeddings')
-    .matchVector('embedding', queryVector) // default searchDepth = 50 (~95% recall intent)
+    .matchVector('embedding', queryVector) // default searchDepth = 50
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
@@ -820,7 +820,7 @@ print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
 **Chained retrieval parameters** (`matchVector` / `orMatchVector`, plus `limit` on the query chain):
 
 - `field` / `vector`: target vector field and query vector (`VectorData` / `List<num>` / `Float32List`)
-- `searchDepth`: optional depth in `[1, 100]` mapped to recall **intent** `[90%, 100%]` via `0.90 + depth/1000` (depth `50` → ~95% production baseline, `80` → ~98%); engine picks a minimum-cost probe budget — best-effort ANN, not a guaranteed recall@K; omit → default `50`
+- `searchDepth`: optional search depth (`>= 1`, default `50`). Larger values typically raise recall and latency. Approximate nearest neighbor — not a guaranteed recall@K. Raise it as the corpus grows when you want more neighbors found.
 - `weight`: fusion weight for this recall channel in multi-way retrieval; default `1.0`
 - `minScore`: normalized similarity floor in `[0.0 ~ 1.0]`; candidates below it are dropped
 - `distanceThreshold`: distance ceiling; candidates beyond it are excluded
