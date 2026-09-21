@@ -5327,8 +5327,7 @@ class _VectorSearchDialogState extends State<VectorSearchDialog> {
                 labelText: 'Custom Search Depth',
                 border: OutlineInputBorder(),
                 prefixIcon: Icon(Icons.layers),
-                helperText:
-                    'Larger depth typically raises recall and latency',
+                helperText: 'Larger depth typically raises recall and latency',
               ),
               onChanged: (v) {
                 final val = int.tryParse(v);

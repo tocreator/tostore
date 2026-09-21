@@ -126,10 +126,11 @@ class ExampleSchemas {
   /// Interactive example tables. Fill and sweep one table at a time —
   /// do not bulk-load every width together.
   ///
-  /// 128 / 512 / 1536: everyday embedding widths.
+  /// 128 / 512 / 768 / 1536: everyday embedding widths.
   /// 4096 / 8192 / 16384 / 65535: high-D insert + flush packing.
   static const int vectorDimLow = 128;
   static const int vectorDimMid = 512;
+  static const int vectorDim768 = 768;
   static const int vectorDimHigh = 1536;
   static const int vectorDim4096 = 4096;
   static const int vectorDim8192 = 8192;
@@ -146,6 +147,12 @@ class ExampleSchemas {
   static final TableSchema embeddings512 = _cosineNghEmbeddings(
     name: 'embeddings_512',
     dimensions: vectorDimMid,
+  );
+
+  /// 768-d (BERT / sentence-transformer class).
+  static final TableSchema embeddings768 = _cosineNghEmbeddings(
+    name: 'embeddings_768',
+    dimensions: vectorDim768,
   );
 
   /// 1536-d (large encoders). Use to catch high-D under-probe / concentration.
@@ -177,6 +184,7 @@ class ExampleSchemas {
   static List<TableSchema> get vectorTables => [
         embeddings128,
         embeddings512,
+        embeddings768,
         embeddings1536,
         embeddings4096,
         embeddings8192,
