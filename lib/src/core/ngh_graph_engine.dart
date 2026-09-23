@@ -40,14 +40,14 @@ import 'yield_controller.dart';
 //     a parent is full (that left giant leaves and search avalanches).
 //   - Leaf posting size is hard-capped (~4k–64 pages). Three levels at
 //     256×256×256×~4k ≈ 68B before a children-dir / fourth level.
-//   - nprobe is on L0 count. Each probed coarse expands an exact child-
-//     nprobe recursively down to leaves (always includes the nearest child).
-//   - searchDepth is a 1..100 recall-intent knob (90%–100%). Scoring
-//     count is wantLeaves (linear in depth, log10(N) endpoints) and is a
-//     hard floor — slot trim must not collapse every depth to 1–2 lists.
-//     Caps: d1=12, d50=20, d100=24 typical lists. 10M 95% is ~19 lists
-//     (√nLeaves × 1M's 6), not 11 (≈1 leaf at 1M / ~70%) and not 60
-//     (corpus-fraction / ~400ms).
+//   - nprobe is on L0 count. Each probed coarse expands toward leaves with
+//     insert-path child picks (nearest parent first; no cross-parent leaf
+//     centroid trim — that cut Recall@10 ~3–20pp at the same list count).
+//     Scoring count is wantLeaves (log10(N) + √(nLeaves/256) fine scale),
+//     hard-capped for interactive latency (~12 / 20 / 36 at depth 1 / 50 / 100).
+//   - searchDepth anchors: 1→91%, 50→95%, 98→98% (±5 / ±3 / ±5 pp). No hard
+//     max — depth>100 continues the same average Δlists/Δdepth (and recall
+//     pp/depth) as the 1→100 band until capped by nLeaves.
 //   - Engine v4 never rewrites nav_graph.ngh. New writes are paged nav/pdir
 //     only. Posting slot layout (including inlined PK) stays frozen; pdir is
 //     the page-list authority. Packed i32 `next` may be -1 at huge partition
@@ -180,22 +180,19 @@ class NghGraphEngine {
   /// Typical IVF leaf occupancy used for slot-budget estimates.
   static const int _typicalLeafSlots = 4096;
 
-  /// Hard cap on scored posting lists (depth=100).
-  ///
+  /// Interactive scoring cap at depth 100 (keeps p95 interactive on 1M–10M).
+  static const int _maxInteractiveLeaves = 44;
 
-  /// Map [searchDepth] (1..100) → target recall intent in [0.901, 1.0].
+  /// Map [searchDepth] → target recall intent.
   ///
-  /// Hard contract: depth only spans 90%–100% recall intent.
-  /// depth 1 → 90.1%, depth 50 → 95% (production baseline), depth 100 → 100%.
-  /// Values above 100 are clamped; 200/300 is not a higher-recall mode.
-  /// Map [searchDepth] (1..100) → target recall intent in [0.91, 1.0].
-  ///
-  /// Hard contract: depth spans recall intent:
-  /// depth 1 → 91.0% (anchor)
-  /// depth 50 → 95.0% (strict production baseline)
-  /// depth 98 → 98.0% (anchor)
-  /// depth 100 → 98.5%–99.0%
-  /// Values above 100 extrapolate smoothly without hard capping.
+  /// Hard contract (anchors, no hard max):
+  /// depth 1 → 91.0% (±5pp)
+  /// depth 50 → 95.0% (±3pp strict production baseline)
+  /// depth 98 → 98.0% (±5pp)
+  /// depth 100 → ~98.6%
+  /// depth >100 continues the same average pp/depth as the 1→100 band
+  /// until 100% (≈ depth 118), then stays saturated — probe budget may
+  /// still rise via [_wantLeavesForDepth] for large corpora.
   static double targetRecallFromDepth(int searchDepth) {
     if (searchDepth <= 1) return 0.91;
     if (searchDepth <= 50) {
@@ -207,8 +204,9 @@ class NghGraphEngine {
     if (searchDepth <= 100) {
       return 0.98 + (0.986 - 0.98) * ((searchDepth - 98) / 2.0);
     }
-    // Smooth extrapolation for depth > 100
-    return min(1.0, 0.986 + 0.01 * ((searchDepth - 100) / 50.0));
+    // Match average slope of the base band: (98.6% - 91%) / 99 depths.
+    const ppPerDepth = (0.986 - 0.91) / 99.0;
+    return min(1.0, 0.986 + ppPerDepth * (searchDepth - 100));
   }
 
   /// Imbalance = max(entryCount) / avg(entryCount); 1.0 = perfectly even.
@@ -232,12 +230,15 @@ class NghGraphEngine {
 
   /// Map recall intent → minimum-cost nprobe / scoring plan.
   ///
-  /// [wantLeaves] is the number of posting lists we *will* score (hard
-  /// floor after trim/clamp). L0 nprobe is a slightly larger candidate
-  /// pool so hierarchical child-pick can choose the nearest leaves.
+  /// [wantLeaves] is the number of posting lists scored (latency). L0 nprobe
+  /// stays only slightly above that so expand can follow insert-path children.
+  /// When leaves nest under L0 (`nLeaves > nL0`), add a small routing / score
+  /// bump — measured 1.7M depth50 sat ~79% at 14 lists; ~18–20 lists close
+  /// the remaining gap toward the 95%±3 baseline without the 200ms path.
   _NprobePlan _resolveNprobePlan({
     required int nCentroids,
     required int nLeaves,
+    required int nCoarse,
     required int totalVectors,
     required double imbalance,
     int? searchDepth,
@@ -270,7 +271,22 @@ class NghGraphEngine {
       );
     }
 
-    final routingExtra = nLeaves < 96 ? 0 : (depth < 50 ? 2 : 4);
+    // Nesting cliff: postings hide under coarses (typical past ~1M).
+    // 1.7M measured: 14 lists ~79%, ~23 lists ~85%; push ~28–30 toward 95%±3.
+    final cliff = nLeaves > nlist;
+    if (cliff) {
+      wantLeaves = min(
+        max(1, nLeaves),
+        max(
+          wantLeaves,
+          (wantLeaves * 1.45).round(),
+        ),
+      );
+    }
+
+    final routingExtra = nLeaves < 96
+        ? 0
+        : (cliff ? (depth < 50 ? 4 : 8) : (depth < 50 ? 1 : 2));
     final nprobe = min(nlist, min(_hardNprobeCap, wantLeaves + routingExtra));
 
     final avgCluster = nLeaves > 0
@@ -281,7 +297,7 @@ class NghGraphEngine {
       nLeaves: nLeaves,
       totalVectors: totalVectors,
     );
-    var maxCandidates = (_typicalLeafSlots * wantLeaves * 1.25).round();
+    var maxCandidates = (_typicalLeafSlots * wantLeaves * 1.10).round();
     maxCandidates = min(maxCandidates, slotCap);
     maxCandidates = min(maxCandidates, max(1, totalVectors));
     if (nLeaves > 0) {
@@ -299,17 +315,33 @@ class NghGraphEngine {
     );
   }
 
+  /// Interactive scoring cap: depth 1→14, 50→28, 100→44 typical lists.
+  /// Depth >100 drops the interactive ceiling — [_wantLeavesForDepth] owns
+  /// the rate (same average Δlists/Δdepth as the delivered 1→100 band);
+  /// hard stop is leaf inventory.
   static int _maxLeavesForDepth(
     int searchDepth, {
     required int nLeaves,
     required int totalVectors,
   }) {
-    final want = _wantLeavesForDepth(
-      searchDepth: searchDepth,
-      nLeaves: nLeaves,
-      totalVectors: totalVectors,
-    );
-    return max(want, (want * 1.35).round());
+    const cap1 = 14;
+    const cap50 = 28;
+    const cap100 = _maxInteractiveLeaves;
+    final depth = max(1, searchDepth);
+    final int cap;
+    if (depth <= 1) {
+      cap = cap1;
+    } else if (depth <= 50) {
+      final x = depth / 100.0;
+      cap = (cap1 + (cap50 - cap1) * (x / 0.50)).round();
+    } else if (depth <= 100) {
+      final x = depth / 100.0;
+      cap = (cap50 + (cap100 - cap50) * ((x - 0.50) / 0.50)).round();
+    } else {
+      // Probe budget past 100 is owned by wantLeaves slope; inventory only.
+      return nLeaves > 0 ? nLeaves : cap100;
+    }
+    return nLeaves > 0 ? min(nLeaves, cap) : cap;
   }
 
   static int _slotCapForDepth(
@@ -323,16 +355,15 @@ class NghGraphEngine {
                 nLeaves: nLeaves,
                 totalVectors: totalVectors,
               ) *
-              1.25)
+              1.10)
           .round();
 
-  /// Min-cost posting lists for [searchDepth] vs corpus size [totalVectors] and [nLeaves].
-  ///
-  /// Smooth power-law physics-based model ensuring stability from 10k to 10M+ to tens of billions:
-  ///   depth = 1  -> ~91% recall (+-5%)
-  ///   depth = 50 -> ~95% recall (+-3% strict)
-  ///   depth = 98 -> ~98% recall (+-5%)
-  ///   depth = 100 -> ~98.5%+ recall
+  /// Min-cost posting lists — calibrated IVF points (insert-path children):
+  ///   50k:  2 lists ~95%; 250k: 2–3 lists; 1M: 4 / 6 / 11 ~87 / 92 / 94%.
+  ///   Finer tessellation (nLeaves > 256) multiplies by √(nLeaves/256).
+  /// Anchors: depth 1 / 50 / 98 / 100 → n1 / n50 / n98 / n100.
+  /// Depth >100 continues the average Δlists/Δdepth of the delivered 1→100
+  /// band so each extra depth buys at least as much budget as before.
   static int _wantLeavesForDepth({
     required int searchDepth,
     required int nLeaves,
@@ -341,40 +372,79 @@ class NghGraphEngine {
     final nl = max(1, nLeaves);
     if (nl <= 1) return 1;
 
-    // Smooth scale factor combining corpus size and leaf count
-    final n = max(10000, totalVectors).toDouble();
-    final corpusScale = pow(n / 10000.0, 0.28).toDouble();
-    final leafScale = sqrt(nl / 48.0);
-    final scale = max(1.0, 0.45 * corpusScale + 0.55 * leafScale);
+    final logN = log(max(1000, totalVectors).toDouble()) / ln10;
+    var n1 = min(8, max(2, (2.0 + 8.0 * max(0.0, logN - 5.50)).round()));
+    var n50 = min(
+      16,
+      max(
+        n1,
+        (2.0 +
+                (logN >= 5.38 ? 1.0 : 0.0) +
+                (logN >= 5.55 ? 1.0 : 0.0) +
+                14.0 * max(0.0, logN - 5.50))
+            .round(),
+      ),
+    );
+    // Depth ≤100 is gated by [_maxLeavesForDepth] (interactive). Keep the
+    // depth-100 anchor uncapped here so depth>100 can extrapolate on large
+    // nested corpora instead of freezing at the interactive leaf count.
+    var n100 = max(
+      n50 + 4,
+      (n50 + 4.0 + 38.0 * max(0.0, logN - 5.50)).round(),
+    );
 
-    // Anchor points calibrated against measured IVF points (10k / 50k / 250k / 1M / 10M):
-    // depth 1: ~91%
-    final w1 = max(1, (1.0 * scale).round());
-    // depth 50: ~95% (strict anchor)
-    final w50 = max(w1 + 1, (1.8 * scale).round());
-    // depth 98: ~98%
-    final w98 = max(w50 + 1, (3.2 * scale).round());
-    // depth 100: ~98.5%+
-    final w100 = max(w98 + 1, (3.6 * scale).round());
+    // 1M @ ~256 lists is the measured 4 / 6 / 11 point. Finer tessellation
+    // (past L0 capacity / nesting) multiplies those counts by √(nLeaves/256).
+    // 1.7M depth50: aim ~28–30 scored lists after cliff boost (~12ms class).
+    const refLeaves = 256.0;
+    final fine = sqrt(nl / refLeaves);
+    if (fine > 1.05) {
+      n1 = max(n1, min(16, (8.0 * fine).round()));
+      n50 = max(n50, min(28, (16.0 * fine).round()));
+      n100 = max(n100, (22.0 * fine).round());
+    }
+
+    final n98 = max(n50 + 1, n50 + ((n100 - n50) * 48 / 50.0).round());
+    final cap = _maxLeavesForDepth(
+      searchDepth,
+      nLeaves: nl,
+      totalVectors: totalVectors,
+    );
+
+    // Delivered endpoints of the base band (after interactive clamp).
+    final at1 = min(
+        nl,
+        min(
+          _maxLeavesForDepth(1, nLeaves: nl, totalVectors: totalVectors),
+          max(1, n1),
+        ));
+    final at100 = min(nl, min(_maxInteractiveLeaves, max(n1, n100)));
 
     final double raw;
     if (searchDepth <= 1) {
-      raw = w1.toDouble();
+      raw = n1.toDouble();
     } else if (searchDepth <= 50) {
+      // Convex: depth 20 stays near n1 (avoid early overshoot).
       final u = (searchDepth - 1) / 49.0;
-      raw = w1 + (w50 - w1) * pow(u, 0.95).toDouble();
+      raw = n1 + (n50 - n1) * (u * u);
     } else if (searchDepth <= 98) {
       final v = (searchDepth - 50) / 48.0;
-      raw = w50 + (w98 - w50) * v;
+      raw = n50 + (n98 - n50) * v;
     } else if (searchDepth <= 100) {
       final w = (searchDepth - 98) / 2.0;
-      raw = w98 + (w100 - w98) * w;
+      raw = n98 + (n100 - n98) * w;
     } else {
-      final ext = (searchDepth - 100) / 100.0;
-      raw = w100 + (w100 - w98) * 2.0 * ext;
+      // Continue the average 1→100 list slope. Prefer the corpus-delivered
+      // slope; never fall below the interactive-cap slope when inventory
+      // still remains (so >100 is never a weaker knob than 1→100).
+      const floorSlope = (_maxInteractiveLeaves - 14) / 99.0;
+      final deliveredSlope = (at100 - at1) / 99.0;
+      final slope = at100 < nl
+          ? max(deliveredSlope, floorSlope)
+          : max(0.0, deliveredSlope);
+      raw = at100 + slope * (searchDepth - 100);
     }
-
-    return min(nl, max(1, raw.round()));
+    return min(nl, min(cap, max(n1, raw.round())));
   }
 
   /// Soft ceiling for navigating centroid graph cache.
@@ -1515,12 +1585,8 @@ class NghGraphEngine {
   /// Do **not** globally re-rank children across parents. A leaf of parent 2
   /// can sit closer to the query than the home leaf of parent 1; insert still
   /// wrote the vector under parent 1. Cross-parent trim dropped 1M self_rc
-  /// to 93.8% and Recall@10 from ~87% to 84% at the same list count.
-  /// Replace coarse probes with an exact child-nprobe (multi-level IVF).
-  ///
-  /// Guarantees that every probed coarse retains its nearest child (ensuring
-  /// home-cluster self-recall matches insert), and fills any remaining
-  /// [wantLeaves] budget with the globally closest secondary children across coarses.
+  /// and Recall@10 several points at the same list count — and was the gap
+  /// vs the ~95%@11ms 1.7M sweep.
   List<int> _expandCoarseChildren({
     required List<int> probes,
     required NghNavGraphPage navGraph,
@@ -1533,85 +1599,82 @@ class NghGraphEngine {
     var current = probes;
     for (var hop = 0; hop < _maxIvfDepth + 1; hop++) {
       var sawCoarse = false;
-      final coarseNodes = <int>[];
-      final orphanLeaves = <int>[];
-
+      final out = <int>[];
+      final seen = <int>{};
+      var firstCoarse = true;
+      var coarseRank = 0;
+      var leafBudget = max(1, wantLeaves);
       for (final id in current) {
         if (id < 0 || id >= n) continue;
         final c = navGraph.centroids[id];
         if (c.isCoarse && c.childIds.isNotEmpty) {
           sawCoarse = true;
-          coarseNodes.add(id);
-        } else {
-          orphanLeaves.add(id);
-        }
-      }
-
-      if (!sawCoarse) return current;
-
-      final selected = <int>[];
-      final seen = <int>{};
-
-      // Step 1: For each coarse node, guarantee its nearest child is retained.
-      // The nearest 2 coarse nodes retain top 2 children if available.
-      final secondaryCandidates = <int>[];
-      for (var i = 0; i < coarseNodes.length; i++) {
-        final cId = coarseNodes[i];
-        final c = navGraph.centroids[cId];
-        final children = [
-          for (final ch in c.childIds)
-            if (ch >= 0 && ch < n) ch,
-        ];
-        if (children.isEmpty) continue;
-
-        final nearestChild = _selectExactNearestIds(
-          vec: query,
-          centroids: navGraph.centroids,
-          routing: children,
-          metric: metric,
-          nprobe: i < 2 ? min(2, children.length) : 1,
-          vecSimd: querySimd,
-        );
-        for (final ch in nearestChild) {
-          if (seen.add(ch)) {
-            selected.add(ch);
+          final children = <int>[
+            for (final ch in c.childIds)
+              if (ch >= 0 && ch < n) ch,
+          ];
+          if (children.isEmpty) continue;
+          final take = _leafNprobeForChildren(
+            children.length,
+            wantLeaves: wantLeaves,
+            nearestParent: firstCoarse,
+            parentRank: coarseRank++,
+          );
+          firstCoarse = false;
+          if (take <= 0 || leafBudget <= 0) continue;
+          final picked = _selectExactNearestIds(
+            vec: query,
+            centroids: navGraph.centroids,
+            routing: children,
+            metric: metric,
+            nprobe: min(take, leafBudget),
+            vecSimd: querySimd,
+          );
+          for (final ch in picked) {
+            if (seen.add(ch)) {
+              out.add(ch);
+              leafBudget--;
+            }
           }
-        }
-        for (final ch in children) {
-          if (!seen.contains(ch)) {
-            secondaryCandidates.add(ch);
-          }
+        } else if (seen.add(id)) {
+          out.add(id);
+          leafBudget--;
         }
       }
-
-      for (final id in orphanLeaves) {
-        if (seen.add(id)) {
-          selected.add(id);
-        }
-      }
-
-      // Step 2: Fill remaining wantLeaves budget from secondary candidates
-      final remaining = wantLeaves - selected.length;
-      if (remaining > 0 && secondaryCandidates.isNotEmpty) {
-        final extra = _selectExactNearestIds(
-          vec: query,
-          centroids: navGraph.centroids,
-          routing: secondaryCandidates,
-          metric: metric,
-          nprobe: remaining,
-          vecSimd: querySimd,
-        );
-        for (final ch in extra) {
-          if (seen.add(ch)) {
-            selected.add(ch);
-          }
-        }
-      }
-
-      current = selected;
+      if (!sawCoarse) return out.isNotEmpty ? out : current;
+      current = out;
       if (current.isEmpty) break;
     }
     return current;
+  }
+
+  /// How many children to take under one coarse (insert-path, nearest parent first).
+  int _leafNprobeForChildren(
+    int childCount, {
+    required int wantLeaves,
+    required bool nearestParent,
+    int parentRank = 0,
+  }) {
+    if (childCount <= 1) return max(0, childCount);
+    if (nearestParent) {
+      return min(childCount, min(12, max(4, (wantLeaves * 2 + 1) ~/ 3)));
+    }
+    if (wantLeaves >= 28 && parentRank < 8) {
+      return min(childCount, 4);
+    }
+    if (wantLeaves >= 20 && parentRank < 8) {
+      return min(childCount, 3);
+    }
+    if (wantLeaves >= 14 && parentRank < 8) {
+      return min(childCount, 3);
+    }
+    if (wantLeaves >= 10 && parentRank < 10) {
+      return min(childCount, 2);
+    }
+    if (wantLeaves >= 18 && parentRank < 14) {
+      return min(childCount, 2);
+    }
+    return min(childCount, 1);
   }
 
   /// Perform ANN search on the NGH index.
@@ -1683,10 +1746,15 @@ class NghGraphEngine {
       }
       navGraph.cachedNLeaves = nLeaves;
     }
+    var nCoarse = 0;
+    for (final c in navGraph.centroids) {
+      if (c.isCoarse) nCoarse++;
+    }
     final plan = _resolveNprobePlan(
       nCentroids:
           routingIds.isNotEmpty ? routingIds.length : navGraph.centroids.length,
       nLeaves: max(1, nLeaves),
+      nCoarse: nCoarse,
       totalVectors: meta.totalVectors,
       imbalance: imbalance,
       searchDepth: searchDepth,
@@ -1701,11 +1769,14 @@ class NghGraphEngine {
       querySimd: querySimd,
     );
 
-    final depthT = plan.depth / 100.0;
+    final depthT = min(1.0, plan.depth / 100.0);
     // Graph hops recover split-drift identity; more than 1–2 just rescore
-    // the same hubs (1M depth 90–100: +30ms for +0.3pp).
-    final maxNeighborExtra =
-        (nLeaves < 96 || depthT < 0.45) ? 0 : (depthT < 0.80 ? 1 : 2);
+    // the same hubs (1M depth 90–100: +30ms for +0.3pp). Nesting cliff
+    // allows one extra hop — home often sits on a neighbor of the top L0.
+    final cliff = nLeaves > routingIds.length;
+    final maxNeighborExtra = (nLeaves < 96 || depthT < 0.35)
+        ? 0
+        : (cliff ? (depthT < 0.80 ? 2 : 3) : (depthT < 0.80 ? 1 : 2));
     var probeCentroids = maxNeighborExtra <= 0
         ? primaryProbes
         : _expandProbeWithNeighbors(
@@ -2133,8 +2204,10 @@ class NghGraphEngine {
 
       final rawBest = bestId[i];
       final rawSecond = secondId[i];
-      final bestDist = bestD[i];
-      final secondDist = secondD[i];
+      // L0 distances (vs coarses ∪ orphan leaves) — used only for top-level
+      // orphan spawn while the routing skeleton can still grow.
+      final l0BestDist = bestD[i];
+      final l0SecondDist = secondD[i];
       final bestCId = hasCoarse
           ? _resolveLeafCentroid(rawBest, centroids, vec, assignMetric)
           : (rawBest < 0 ? 0 : rawBest);
@@ -2144,6 +2217,22 @@ class NghGraphEngine {
               ? _resolveLeafCentroid(rawSecond, centroids, vec, assignMetric)
               : rawSecond);
       if (secondCId == bestCId) secondCId = -1;
+
+      // Spawn / multi-assign farness must use the *resolved leaf*, not the
+      // covering coarse — otherwise points near a coarse but far from every
+      // leaf skip spawn and inflate hubs (recall cliff past ~1M).
+      var bestDist = l0BestDist;
+      var secondDist = l0SecondDist;
+      if (hasCoarse) {
+        if (bestCId >= 0 && bestCId < centroids.length) {
+          bestDist =
+              _exactDistance(vec, centroids[bestCId].vector, assignMetric);
+        }
+        if (secondCId >= 0 && secondCId < centroids.length) {
+          secondDist =
+              _exactDistance(vec, centroids[secondCId].vector, assignMetric);
+        }
+      }
 
       final canGrowTop = topLevelIds.length < routingCap;
       final softCap = softCapForK(max(1, leafK));
@@ -2161,8 +2250,9 @@ class NghGraphEngine {
                   : max(0.25, splitDistThreshold * sqrt(kRatio))))
           : splitDistThreshold;
 
-      // Distance spawn for far points only (new tiny centroid).
-      if (canGrowTop && bestDist > effectiveSplitThreshold) {
+      // Distance spawn for far points only (new tiny centroid at L0).
+      // Use L0 distance so growth follows the same exact router as search.
+      if (canGrowTop && l0BestDist > effectiveSplitThreshold) {
         final newCentroidId = centroids.length;
         final parentId = bestCId;
         final newNode = NghNavCentroidNode(

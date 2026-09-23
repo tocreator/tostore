@@ -81,7 +81,7 @@ QueryBuilder orMatchVector(...); // same params, OR branch
 | Param | Meaning |
 | :--- | :--- |
 | `weight` | Multi-way fusion weight (default 1.0) |
-| `searchDepth` | Per-query search depth (`>= 1`); omit → default `50`. Larger values typically raise recall and latency. Best-effort ANN — **not** a guaranteed recall@K |
+| `searchDepth` | Per-query search depth (`>= 1`, **no max**); omit → default `50`. Larger values typically raise recall and latency. Best-effort ANN — **not** a guaranteed recall@K |
 | `minScore` | Normalized similarity floor `[0,1]` |
 | `distanceThreshold` | Distance ceiling |
 | chain `limit` | Acts as topK |
@@ -136,7 +136,19 @@ Prefer `query().matchVector` when combining filters or multi-way fusion.
 
 ## searchDepth guidance
 
-`searchDepth` is the per-query search depth. Omit it to use `50`. A larger value probes deeper: recall typically rises and latency rises with it. Raise it as the corpus grows when you want more neighbors found. ANN remains approximate — not a guaranteed recall@K.
+`searchDepth` is the per-query recall-intent knob (`>= 1`, **no hard maximum**). Omit it to use `50`.
+
+Intent anchors (best-effort Recall@K, not a hard guarantee):
+
+| searchDepth | Target recall | Allowed deviation |
+| :--- | :--- | :--- |
+| `1` | ~91% | ±5 percentage points |
+| `50` (default) | ~95% | ±3 percentage points (strict) |
+| `98` | ~98% | ±5 percentage points |
+| `100` | ~98.6%+ | — |
+| `>100` | still higher recall (same step size as below 100; useful on very large corpora) | — |
+
+Larger depth typically raises both recall and latency. Prefer the anchors above; raise past `100` only when a large corpus still needs more recall. ANN remains approximate — not a guaranteed recall@K.
 
 ## Rules
 
