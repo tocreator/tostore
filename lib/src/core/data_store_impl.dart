@@ -7657,7 +7657,8 @@ class DataStoreImpl {
       await ensureInitialized();
     }
     if (_vectorIndexManager == null) return const [];
-    final table = await getTableContext(tableName);
+    final table =
+        getTableContextSync(tableName) ?? await getTableContext(tableName);
     return _vectorIndexManager!.vectorSearch(
       table: table,
       fieldName: fieldName,

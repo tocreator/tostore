@@ -1,9 +1,13 @@
 import 'dart:convert';
+import 'dart:math';
 import 'dart:typed_data';
 
 import '../handler/common.dart';
 import '../handler/platform_byte_data.dart';
+import '../model/db_exception.dart';
 import '../model/ngh_index_meta.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
 import 'btree_page.dart';
 import 'vector_quantizer.dart';
 
@@ -128,6 +132,10 @@ final class NghPostingSlot {
   /// Pre-computed squared L2 norm for fast exact/approximate distance calculations.
   double squaredNorm;
 
+  /// Cached 48-d SIMD view for Level 2A coarse scoring
+  Float32List? low48D;
+  Float32x4List? low48DSimd;
+
   NghPostingSlot({
     required this.nodeId,
     this.flags = 0,
@@ -137,7 +145,42 @@ final class NghPostingSlot {
     required this.offset,
     required this.scale,
     required this.squaredNorm,
-  }) : _decodedPrimaryKey = primaryKey;
+    this.low48D,
+  }) : _decodedPrimaryKey = primaryKey {
+    if (low48D != null) {
+      low48DSimd = Float32x4List.sublistView(low48D!);
+    }
+  }
+
+  Float32x4List getLow48DSimd(int dimensions) {
+    if (low48DSimd != null) return low48DSimd!;
+    final low = Float32List(48);
+    final limit = dimensions < 48 ? dimensions : 48;
+    double norm = 0.0;
+    for (int d = 0; d < limit; d++) {
+      final val = offset + sq8Codes[d] * scale;
+      low[d] = val;
+      norm += val * val;
+    }
+    norm = sqrt(norm);
+    if (norm > 0) {
+      for (int d = 0; d < limit; d++) {
+        low[d] /= norm;
+      }
+    }
+    low48D = low;
+    low48DSimd = Float32x4List.sublistView(low);
+    return low48DSimd!;
+  }
+
+  Float32List getLow48D(int dimensions) {
+    if (low48D != null) return low48D!;
+    getLow48DSimd(dimensions);
+    return low48D!;
+  }
+
+  /// True when Level-2A 48-D view is already resident (no SQ8 rebuild).
+  bool get hasLow48 => low48DSimd != null;
 
   /// Original string primary key (decoded on demand for disk-loaded slots).
   String get primaryKey {
@@ -205,9 +248,8 @@ final class NghPostingPage {
   /// Encode posting page payload.
   ///
   /// **Frozen wire layout** (engine v4 and later). Do not change field widths
-  /// or drop inlined PK — tens-of-billions scale uses pdir (`u32+u32`) as the
-  /// page-list authority, not a posting rewrite. `nextPostingPackedRef` is a
-  /// hint; unrepresentable locations write `-1`.
+  /// or drop inlined PK. `nextPostingPackedRef` is a hint; unrepresentable
+  /// locations write `-1`.
   ///
   /// `dimensions` is already u16 (max 65535). High-D indexes that cannot pack
   /// one SQ8 slot into the database 16KB page use a larger per-index
@@ -307,12 +349,34 @@ final class NghPostingPage {
       ));
     }
 
-    return NghPostingPage(
+    final page = NghPostingPage(
       centroidId: cId,
       nextPostingPageNo: nextPg,
       dimensions: dims,
       slots: slots,
     );
+    // Disk wire has no low48; materialize once at decode so the first ANN
+    // probe does not pay per-slot SQ8→48D rebuild during scoring.
+    page.ensureLow48Ready();
+    return page;
+  }
+
+  /// Build normalized 48-D SIMD views for every live slot (no-op if already warm).
+  void ensureLow48Ready() {
+    for (final s in slots) {
+      if ((s.flags & 0x01) != 0) continue;
+      if (s.hasLow48) continue;
+      s.getLow48DSimd(dimensions);
+    }
+  }
+
+  /// Wire payload plus resident low48 scratch (~192 B/slot when materialized).
+  int estimateResidentBytes() {
+    var size = estimatePayloadSize() + 64;
+    for (final s in slots) {
+      if (s.hasLow48) size += 192;
+    }
+    return size;
   }
 
   int estimatePayloadSize() {
@@ -439,15 +503,13 @@ final class NghNavCentroidNode {
   /// Overflow children directory (inline [childIds] is preferred).
   NghPageId childrenDirRoot;
 
-  /// Inline child centroid ids (hierarchical IVF). Empty for flat leaves.
+  /// Inline child centroid ids (hierarchical tree). Empty for flat leaves.
   final List<int> childIds;
 
   /// Directory pages need a flush (append or rewrite).
   bool postingDirDirty;
 
-  /// True when [postingPages] is the full live list (hydrate / rewrite /
-  /// new cluster). False after loading nav from disk so search still hydrates
-  /// pdir. Insert must not flip this by appending only the new tail pages.
+  /// True when [postingPages] is the full live list.
   bool postingPageListReady;
 
   /// Pre-computed SIMD view for zero-allocation dot product kernels.
@@ -534,8 +596,6 @@ final class NghNavCentroidNode {
   void addPostingPage(NghPageId id) {
     if (id.isNone) return;
     postingDirDirty = true;
-    // Disk pdir is still authoritative. Recording only the new tail pages
-    // would make postingPages non-empty and skip hydrate on search.
     if (!postingPageListReady && !postingDirRoot.isNone) return;
     for (final e in postingPages) {
       if (e.partitionNo == id.partitionNo && e.pageNo == id.pageNo) return;
@@ -860,9 +920,11 @@ final class NghNavCentroidPage {
       final level = bytes[off + 4];
       final parentRaw = bd.getUint32(off + 6, Endian.little);
       final entries = bd.getUint32(off + 10, Endian.little);
-      final pdirRoot = NghPageId.fromWire(bd.getUint32(off + 14, Endian.little),
+      final postingRoot = NghPageId.fromWire(
+          bd.getUint32(off + 14, Endian.little),
           bd.getUint32(off + 18, Endian.little));
-      final pdirTail = NghPageId.fromWire(bd.getUint32(off + 22, Endian.little),
+      final postingTail = NghPageId.fromWire(
+          bd.getUint32(off + 22, Endian.little),
           bd.getUint32(off + 26, Endian.little));
       final head = NghPageId.fromWire(bd.getUint32(off + 30, Endian.little),
           bd.getUint32(off + 34, Endian.little));
@@ -915,73 +977,13 @@ final class NghNavCentroidPage {
         postingPages: <NghPageId>[],
         level: level,
         parentId: parentRaw == NghPageId.noneWire ? -1 : parentRaw,
-        postingDirRoot: pdirRoot,
-        postingDirTail: pdirTail,
+        postingDirRoot: postingRoot,
+        postingDirTail: postingTail,
         childrenDirRoot: childDir,
         childIds: children,
       ));
     }
     return NghNavCentroidPage(dimensions: dims, centroids: list);
-  }
-}
-
-/// Linked directory of posting [NghPageId]s for one leaf centroid.
-final class NghPostingDirPage {
-  static const int magic = 0x32564450; // 'PDV2'
-  static const int headerSize = 20;
-
-  final int centroidId;
-  NghPageId next;
-  final List<NghPageId> pages;
-
-  NghPostingDirPage({
-    required this.centroidId,
-    this.next = NghPageId.none,
-    List<NghPageId>? pages,
-  }) : pages = pages ?? <NghPageId>[];
-
-  static int maxEntriesForPage(int pageSize) {
-    final usable =
-        pageSize - BTreePageHeader.size - NghPageSizer.encodingSafetyMargin;
-    final body = usable - headerSize;
-    return body > 8 ? body ~/ 8 : 1;
-  }
-
-  Uint8List encodePayload() {
-    final buf = Uint8List(headerSize + pages.length * 8);
-    final bd = ByteData.sublistView(buf);
-    bd.setUint32(0, magic, Endian.little);
-    bd.setUint32(4, centroidId, Endian.little);
-    bd.setUint32(8, next.wirePartition, Endian.little);
-    bd.setUint32(12, next.wirePage, Endian.little);
-    bd.setUint16(16, pages.length, Endian.little);
-    bd.setUint16(18, 0, Endian.little);
-    int off = headerSize;
-    for (final p in pages) {
-      bd.setUint32(off, p.wirePartition, Endian.little);
-      bd.setUint32(off + 4, p.wirePage, Endian.little);
-      off += 8;
-    }
-    return buf;
-  }
-
-  static NghPostingDirPage? tryDecodePayload(Uint8List bytes) {
-    if (bytes.length < headerSize) return null;
-    final bd = ByteData.sublistView(bytes);
-    if (bd.getUint32(0, Endian.little) != magic) return null;
-    final cId = bd.getUint32(4, Endian.little);
-    final next = NghPageId.fromWire(
-        bd.getUint32(8, Endian.little), bd.getUint32(12, Endian.little));
-    final count = bd.getUint16(16, Endian.little);
-    int off = headerSize;
-    final pages = <NghPageId>[];
-    for (int i = 0; i < count; i++) {
-      if (off + 8 > bytes.length) break;
-      pages.add(NghPageId.fromWire(bd.getUint32(off, Endian.little),
-          bd.getUint32(off + 4, Endian.little)));
-      off += 8;
-    }
-    return NghPostingDirPage(centroidId: cId, next: next, pages: pages);
   }
 }
 
@@ -1062,6 +1064,13 @@ final class NghPageSizer {
       pageHeaderSize + 128 + encodingSafetyMargin;
 
   /// Compute how many posting slots can fit in one page for a given average PK length.
+  ///
+  /// Soft-caps occupancy at [searchCalibMaxSlotsPerPage] so low-D indexes
+  /// (128D would otherwise pack ~99 vectors into 16KB) keep leaf fanout near
+  /// the 768D search calibration (~20–32 slots/page). Otherwise L2A scans
+  /// 5× more vectors per probed leaf and density hacks fight QPS vs recall.
+  static const int searchCalibMaxSlotsPerPage = 32;
+
   static int estimatePostingSlotsPerPage(
     int pageSize,
     int dimensions, {
@@ -1070,7 +1079,8 @@ final class NghPageSizer {
     final slotSize = 19 + avgPkLength + dimensions;
     final usable = pageSize - pageHeaderSize - 12 - encodingSafetyMargin;
     if (usable < slotSize) return 1;
-    return (usable ~/ slotSize).clamp(1, 1024);
+    final fit = (usable ~/ slotSize).clamp(1, 1024);
+    return min(fit, searchCalibMaxSlotsPerPage);
   }
 
   /// Estimate file size given page count and page size.
@@ -1199,5 +1209,281 @@ final class NghPageSizer {
         c.neighbors.removeRange(maxNavNeighbors, c.neighbors.length);
       }
     }
+  }
+}
+
+// ============================================================================
+// Centroid B+Tree Hardware SIMD Kernels (Pure Dart, 0 FFI)
+// ============================================================================
+
+/// High-speed 48-d Hardware SIMD Inner Product (15 ns).
+@pragma('vm:prefer-inline')
+double innerProduct48(Float32x4List q, Float32x4List flat48, int base) {
+  final acc0 = q[0] * flat48[base] +
+      q[1] * flat48[base + 1] +
+      q[2] * flat48[base + 2] +
+      q[3] * flat48[base + 3];
+  final acc1 = q[4] * flat48[base + 4] +
+      q[5] * flat48[base + 5] +
+      q[6] * flat48[base + 6] +
+      q[7] * flat48[base + 7];
+  final acc2 = q[8] * flat48[base + 8] +
+      q[9] * flat48[base + 9] +
+      q[10] * flat48[base + 10] +
+      q[11] * flat48[base + 11];
+  final acc = (acc0 + acc1) + acc2;
+  return acc.x + acc.y + acc.z + acc.w;
+}
+
+/// Ultra-fast 48-d Hardware SIMD Inner Product with register preloading (0 memory reads for q).
+@pragma('vm:prefer-inline')
+double innerProduct48Reg(
+  Float32x4 q0,
+  Float32x4 q1,
+  Float32x4 q2,
+  Float32x4 q3,
+  Float32x4 q4,
+  Float32x4 q5,
+  Float32x4 q6,
+  Float32x4 q7,
+  Float32x4 q8,
+  Float32x4 q9,
+  Float32x4 q10,
+  Float32x4 q11,
+  Float32x4List flat48,
+  int base,
+) {
+  final acc0 = q0 * flat48[base] +
+      q1 * flat48[base + 1] +
+      q2 * flat48[base + 2] +
+      q3 * flat48[base + 3];
+  final acc1 = q4 * flat48[base + 4] +
+      q5 * flat48[base + 5] +
+      q6 * flat48[base + 6] +
+      q7 * flat48[base + 7];
+  final acc2 = q8 * flat48[base + 8] +
+      q9 * flat48[base + 9] +
+      q10 * flat48[base + 10] +
+      q11 * flat48[base + 11];
+  final acc = (acc0 + acc1) + acc2;
+  return acc.x + acc.y + acc.z + acc.w;
+}
+
+// ============================================================================
+// Centroid B+Tree Navigating Structures (Level 0 Root & Level 1 Internal Pages)
+// ============================================================================
+
+/// An entry in an internal branch page pointing to a physical leaf posting page.
+final class CentroidBranchEntry {
+  int centroidId;
+  NghPageId leafPageId;
+  int leafSlotCount;
+  Float32List centroid48D;
+  Float32x4List centroid48DSimd;
+
+  CentroidBranchEntry({
+    required this.centroidId,
+    required this.leafPageId,
+    required this.leafSlotCount,
+    required this.centroid48D,
+  }) : centroid48DSimd = Float32x4List.sublistView(centroid48D);
+}
+
+/// Internal branch page of the Centroid B+Tree stored in `.nav` partitions.
+final class NghNavBTreePage {
+  static const int magic = 0x434E4254; // 'CNBT'
+  static const int version = 2;
+  static const int headerSize = 20;
+
+  /// Maximum entries that fit safely in a 16KB Nav page.
+  /// 16384 - 20 (BTreePageHeader) - 20 (NghNavBTreePage header) = 16344 bytes.
+  /// Floor(16344 / 206) = 79 max. 64 provides generous 3.1KB safety margin.
+  static const int maxEntriesPerPage = 64;
+
+  final int rootCentroidId;
+  NghPageId nextInternalPage;
+  final List<CentroidBranchEntry> entries;
+
+  NghNavBTreePage({
+    required this.rootCentroidId,
+    this.nextInternalPage = NghPageId.none,
+    required this.entries,
+  });
+
+  Uint8List encodePayload() {
+    final count = entries.length;
+    if (count > 79) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'NghNavBTreePage entry overflow: count=$count > 79 (pageSize=16384)',
+        )
+      ]);
+    }
+    final totalBytes = headerSize + count * 206;
+    final buf = Uint8List(totalBytes);
+    final bd = ByteData.sublistView(buf);
+
+    bd.setUint32(0, magic, Endian.little);
+    bd.setUint16(4, version, Endian.little);
+    bd.setUint16(6, count, Endian.little);
+    bd.setUint32(8, rootCentroidId, Endian.little);
+    bd.setUint32(12, nextInternalPage.wirePartition, Endian.little);
+    bd.setUint32(16, nextInternalPage.wirePage, Endian.little);
+
+    int off = headerSize;
+    for (int i = 0; i < count; i++) {
+      final e = entries[i];
+      bd.setUint32(off, e.centroidId, Endian.little);
+      bd.setUint32(off + 4, e.leafPageId.wirePartition, Endian.little);
+      bd.setUint32(off + 8, e.leafPageId.wirePage, Endian.little);
+      bd.setUint16(off + 12, e.leafSlotCount, Endian.little);
+      off += 14;
+
+      final c48 = e.centroid48D;
+      for (int d = 0; d < 48; d++) {
+        bd.setFloat32(off, c48[d], Endian.little);
+        off += 4;
+      }
+    }
+    return buf;
+  }
+
+  static NghNavBTreePage? tryDecodePayload(Uint8List bytes) {
+    if (bytes.length < headerSize) return null;
+    final bd = ByteData.sublistView(bytes);
+    if (bd.getUint32(0, Endian.little) != magic) return null;
+    final ver = bd.getUint16(4, Endian.little);
+    if (ver != version) return null;
+
+    final count = bd.getUint16(6, Endian.little);
+    final rId = bd.getUint32(8, Endian.little);
+    final nextPart = bd.getUint32(12, Endian.little);
+    final nextPg = bd.getUint32(16, Endian.little);
+    final nextId = NghPageId.fromWire(nextPart, nextPg);
+
+    int off = headerSize;
+    final entries = <CentroidBranchEntry>[];
+    for (int i = 0; i < count; i++) {
+      if (off + 206 > bytes.length) break;
+      final cId = bd.getUint32(off, Endian.little);
+      final part = bd.getUint32(off + 4, Endian.little);
+      final pg = bd.getUint32(off + 8, Endian.little);
+      final slotCount = bd.getUint16(off + 12, Endian.little);
+      off += 14;
+
+      final c48 = Float32List(48);
+      for (int d = 0; d < 48; d++) {
+        c48[d] = bd.getFloat32(off, Endian.little);
+        off += 4;
+      }
+
+      entries.add(CentroidBranchEntry(
+        centroidId: cId,
+        leafPageId: NghPageId.fromWire(part, pg),
+        leafSlotCount: slotCount,
+        centroid48D: c48,
+      ));
+    }
+
+    return NghNavBTreePage(
+      rootCentroidId: rId,
+      nextInternalPage: nextId,
+      entries: entries,
+    );
+  }
+}
+
+/// Root table page stored at page 1 of partition 0 in `.nav` files.
+final class NghNavRootPage {
+  static const int magic = 0x434E5254; // 'CNRT'
+  static const int version = 2;
+  static const int headerSize = 16;
+
+  final int lowDim;
+  final int fullDim;
+  final List<
+          ({int rootId, NghPageId firstInternalPage, Float32List centroid48D})>
+      roots;
+
+  NghNavRootPage({
+    this.lowDim = 48,
+    required this.fullDim,
+    required this.roots,
+  });
+
+  Uint8List encodePayload() {
+    final count = roots.length;
+    final totalBytes = headerSize + count * 204;
+    final buf = Uint8List(totalBytes);
+    final bd = ByteData.sublistView(buf);
+
+    bd.setUint32(0, magic, Endian.little);
+    bd.setUint16(4, version, Endian.little);
+    bd.setUint16(6, count, Endian.little);
+    bd.setUint16(8, lowDim, Endian.little);
+    bd.setUint16(10, fullDim, Endian.little);
+    bd.setUint32(12, 0, Endian.little); // reserved
+
+    int off = headerSize;
+    for (int i = 0; i < count; i++) {
+      final r = roots[i];
+      bd.setUint32(off, r.rootId, Endian.little);
+      bd.setUint32(off + 4, r.firstInternalPage.wirePartition, Endian.little);
+      bd.setUint32(off + 8, r.firstInternalPage.wirePage, Endian.little);
+      off += 12;
+
+      final c48 = r.centroid48D;
+      for (int d = 0; d < 48; d++) {
+        bd.setFloat32(off, c48[d], Endian.little);
+        off += 4;
+      }
+    }
+    return buf;
+  }
+
+  static NghNavRootPage? tryDecodePayload(Uint8List bytes) {
+    if (bytes.length < headerSize) return null;
+    final bd = ByteData.sublistView(bytes);
+    if (bd.getUint32(0, Endian.little) != magic) return null;
+    final ver = bd.getUint16(4, Endian.little);
+    if (ver != version) return null;
+
+    final count = bd.getUint16(6, Endian.little);
+    final lDim = bd.getUint16(8, Endian.little);
+    final fDim = bd.getUint16(10, Endian.little);
+
+    int off = headerSize;
+    final roots = <({
+      int rootId,
+      NghPageId firstInternalPage,
+      Float32List centroid48D
+    })>[];
+    for (int i = 0; i < count; i++) {
+      if (off + 204 > bytes.length) break;
+      final rId = bd.getUint32(off, Endian.little);
+      final part = bd.getUint32(off + 4, Endian.little);
+      final pg = bd.getUint32(off + 8, Endian.little);
+      off += 12;
+
+      final c48 = Float32List(48);
+      for (int d = 0; d < 48; d++) {
+        c48[d] = bd.getFloat32(off, Endian.little);
+        off += 4;
+      }
+
+      roots.add((
+        rootId: rId,
+        firstInternalPage: NghPageId.fromWire(part, pg),
+        centroid48D: c48,
+      ));
+    }
+
+    return NghNavRootPage(
+      lowDim: lDim,
+      fullDim: fDim,
+      roots: roots,
+    );
   }
 }

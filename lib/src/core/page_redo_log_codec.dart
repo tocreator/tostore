@@ -45,10 +45,7 @@ enum PageRedoTreeKind {
   ngh,
 
   /// NGH paged navigating-centroid pages (layoutVersion >= 2).
-  nghNav,
-
-  /// NGH posting-page directory pages (layoutVersion >= 2).
-  nghPdir;
+  nghNav;
 
   /// Index uid is required on the redo record.
   bool get requiresIndexUid {
@@ -58,7 +55,6 @@ enum PageRedoTreeKind {
       case PageRedoTreeKind.indexTree:
       case PageRedoTreeKind.ngh:
       case PageRedoTreeKind.nghNav:
-      case PageRedoTreeKind.nghPdir:
         return true;
     }
   }

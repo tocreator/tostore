@@ -290,94 +290,100 @@ class _BenchmarkDialogState extends State<BenchmarkDialog> {
           ),
           const SizedBox(height: 16),
 
-          // Data Table
-          ClipRRect(
-            borderRadius: BorderRadius.circular(10),
-            child: Container(
-              decoration: BoxDecoration(
-                border: Border.all(color: const Color(0xFFE2E8F0)),
+          // Data Table — border hugs intrinsic table width so Min/Max is not
+          // left with a large empty strip inside a full-width frame.
+          Align(
+            alignment: Alignment.centerLeft,
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: ClipRRect(
                 borderRadius: BorderRadius.circular(10),
-              ),
-              child: SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                child: DataTable(
-                  headingRowColor: WidgetStateProperty.all(
-                    const Color(0xFFF1F5F9),
+                child: Container(
+                  decoration: BoxDecoration(
+                    border: Border.all(color: const Color(0xFFE2E8F0)),
+                    borderRadius: BorderRadius.circular(10),
                   ),
-                  headingTextStyle: const TextStyle(
-                    fontWeight: FontWeight.w700,
-                    fontSize: 13,
-                    color: Color(0xFF1E293B),
-                  ),
-                  dataRowMinHeight: 40,
-                  dataRowMaxHeight: 48,
-                  columnSpacing: 18,
-                  horizontalMargin: 14,
-                  columns: const [
-                    DataColumn(label: Text('Model')),
-                    DataColumn(label: Text('Operation')),
-                    DataColumn(label: Text('Count'), numeric: true),
-                    DataColumn(label: Text('Avg Time'), numeric: true),
-                    DataColumn(label: Text('Result')),
-                    DataColumn(label: Text('Avg Latency'), numeric: true),
-                    DataColumn(label: Text('Min / Max'), numeric: true),
-                  ],
-                  rows: summary.metrics.map((m) {
-                    final isQuality = m.compactHighlight != null;
-                    return DataRow(
-                      cells: [
-                        DataCell(Text(m.tierName,
-                            style: const TextStyle(
-                                fontSize: 12.5, fontWeight: FontWeight.w600))),
-                        DataCell(Text(m.name,
-                            style: const TextStyle(fontSize: 12.5))),
-                        DataCell(Text('${m.recordCount}',
-                            style: const TextStyle(
-                                fontSize: 12.5, color: Color(0xFF64748B)))),
-                        DataCell(Text(
-                            isQuality
-                                ? '—'
-                                : '${m.avgMilliseconds.toStringAsFixed(2)} ms',
-                            style: const TextStyle(
-                                fontSize: 12.5, fontWeight: FontWeight.w500))),
-                        DataCell(
-                          Tooltip(
-                            message: m.qualityNote ?? m.highlightLabel,
-                            waitDuration: const Duration(milliseconds: 400),
-                            child: Container(
-                              padding: const EdgeInsets.symmetric(
-                                  horizontal: 6, vertical: 2),
-                              decoration: BoxDecoration(
-                                color: primaryColor.withAlpha(20),
-                                borderRadius: BorderRadius.circular(4),
-                              ),
-                              child: Text(
-                                m.highlightLabel,
-                                style: TextStyle(
+                  child: DataTable(
+                    headingRowColor: WidgetStateProperty.all(
+                      const Color(0xFFF1F5F9),
+                    ),
+                    headingTextStyle: const TextStyle(
+                      fontWeight: FontWeight.w700,
+                      fontSize: 13,
+                      color: Color(0xFF1E293B),
+                    ),
+                    dataRowMinHeight: 40,
+                    dataRowMaxHeight: 48,
+                    columnSpacing: 18,
+                    horizontalMargin: 14,
+                    columns: const [
+                      DataColumn(label: Text('Model')),
+                      DataColumn(label: Text('Operation')),
+                      DataColumn(label: Text('Count'), numeric: true),
+                      DataColumn(label: Text('Avg Time'), numeric: true),
+                      DataColumn(label: Text('Result')),
+                      DataColumn(label: Text('Avg Latency'), numeric: true),
+                      DataColumn(label: Text('Min / Max'), numeric: true),
+                    ],
+                    rows: summary.metrics.map((m) {
+                      final isQuality = m.compactHighlight != null;
+                      return DataRow(
+                        cells: [
+                          DataCell(Text(m.tierName,
+                              style: const TextStyle(
                                   fontSize: 12.5,
-                                  fontWeight: FontWeight.bold,
-                                  color: primaryColor,
+                                  fontWeight: FontWeight.w600))),
+                          DataCell(Text(m.name,
+                              style: const TextStyle(fontSize: 12.5))),
+                          DataCell(Text('${m.recordCount}',
+                              style: const TextStyle(
+                                  fontSize: 12.5, color: Color(0xFF64748B)))),
+                          DataCell(Text(
+                              isQuality
+                                  ? '—'
+                                  : '${m.avgMilliseconds.toStringAsFixed(2)} ms',
+                              style: const TextStyle(
+                                  fontSize: 12.5,
+                                  fontWeight: FontWeight.w500))),
+                          DataCell(
+                            Tooltip(
+                              message: m.qualityNote ?? m.highlightLabel,
+                              waitDuration: const Duration(milliseconds: 400),
+                              child: Container(
+                                padding: const EdgeInsets.symmetric(
+                                    horizontal: 6, vertical: 2),
+                                decoration: BoxDecoration(
+                                  color: primaryColor.withAlpha(20),
+                                  borderRadius: BorderRadius.circular(4),
+                                ),
+                                child: Text(
+                                  m.highlightLabel,
+                                  style: TextStyle(
+                                    fontSize: 12.5,
+                                    fontWeight: FontWeight.bold,
+                                    color: primaryColor,
+                                  ),
                                 ),
                               ),
                             ),
                           ),
-                        ),
-                        DataCell(Text(
+                          DataCell(Text(
+                              isQuality
+                                  ? '—'
+                                  : '${m.avgLatencyUs.toStringAsFixed(2)} μs',
+                              style: const TextStyle(
+                                  fontSize: 12.5, color: Color(0xFF475569)))),
+                          DataCell(Text(
                             isQuality
                                 ? '—'
-                                : '${m.avgLatencyUs.toStringAsFixed(2)} μs',
+                                : '${(m.minMicroseconds / 1000.0).toStringAsFixed(1)} / ${(m.maxMicroseconds / 1000.0).toStringAsFixed(1)} ms',
                             style: const TextStyle(
-                                fontSize: 12.5, color: Color(0xFF475569)))),
-                        DataCell(Text(
-                          isQuality
-                              ? '—'
-                              : '${(m.minMicroseconds / 1000.0).toStringAsFixed(1)} / ${(m.maxMicroseconds / 1000.0).toStringAsFixed(1)} ms',
-                          style: const TextStyle(
-                              fontSize: 12, color: Color(0xFF94A3B8)),
-                        )),
-                      ],
-                    );
-                  }).toList(),
+                                fontSize: 12, color: Color(0xFF94A3B8)),
+                          )),
+                        ],
+                      );
+                    }).toList(),
+                  ),
                 ),
               ),
             ),

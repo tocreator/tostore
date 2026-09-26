@@ -2,8 +2,8 @@ import 'dart:convert';
 import 'dart:math' show sqrt;
 import 'dart:typed_data';
 
-import '../handler/logger.dart';
 import '../handler/common.dart';
+import '../handler/logger.dart';
 import '../handler/memcomparable.dart';
 import '../handler/sha256.dart';
 import '../handler/value_matcher.dart';
@@ -3577,8 +3577,9 @@ class VectorIndexConfig {
   /// Default ANN searchDepth when a query omits it.
   ///
   /// Production baseline (~95% recall intent). Larger values typically raise
-  /// recall and latency. No hard maximum — depth>100 continues to raise the
-  /// probe budget. Best-effort ANN — not a guaranteed recall@K.
+  /// recall and latency. No hard maximum — depth>100 continues with the same
+  /// average probe-budget step as below 100 (escape hatch on very large
+  /// corpora). Best-effort ANN — not a guaranteed recall@K.
   static const int defaultSearchDepth = 50;
 
   /// Dense vector algorithm id. Defaults to [VectorIndexType.ngh].

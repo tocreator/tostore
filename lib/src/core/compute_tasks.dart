@@ -1912,7 +1912,6 @@ Uint8List _resolveBTreePagePayload(
     case BTreePageType.nghMeta:
     case BTreePageType.nghPosting:
     case BTreePageType.nghNavGraph:
-    case BTreePageType.nghPdir:
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,

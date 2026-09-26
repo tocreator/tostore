@@ -13,7 +13,7 @@ class NghIndexMeta {
   /// Metadata format version for forward-compatibility (shared indexVersion).
   final int version;
 
-  /// On-disk NGH layout. 1 = leftover nav_graph.ngh (read-only after engine v4); 2 = paged nav/pdir/pkmap (the only write path).
+  /// On-disk NGH layout. 1 = leftover nav_graph.ngh (legacy read-only); 2 = paged Centroid B+Tree / posting / pkmap.
   final int layoutVersion;
 
   /// Stable index uid for NGH paths and caches.
@@ -59,10 +59,6 @@ class NghIndexMeta {
   final int navPartitionCount;
   final int navNextPageNo;
   final Map<int, int> navFreeListHeads;
-
-  final int pdirPartitionCount;
-  final int pdirNextPageNo;
-  final Map<int, int> pdirFreeListHeads;
 
   final int pkmapPartitionCount;
   final int pkmapNextPageNo;
@@ -116,9 +112,6 @@ class NghIndexMeta {
     this.navPartitionCount = 1,
     this.navNextPageNo = firstDataPageNo,
     Map<int, int>? navFreeListHeads,
-    this.pdirPartitionCount = 1,
-    this.pdirNextPageNo = firstDataPageNo,
-    Map<int, int>? pdirFreeListHeads,
     this.pkmapPartitionCount = 1,
     this.pkmapNextPageNo = firstDataPageNo,
     Map<int, int>? pkmapFreeListHeads,
@@ -133,7 +126,6 @@ class NghIndexMeta {
   })  : version = version ?? InternalConfig.indexVersion,
         postingFreeListHeads = postingFreeListHeads ?? const {},
         navFreeListHeads = navFreeListHeads ?? const {},
-        pdirFreeListHeads = pdirFreeListHeads ?? const {},
         pkmapFreeListHeads = pkmapFreeListHeads ?? const {};
 
   // ===================== Defaults ==============================
@@ -144,7 +136,7 @@ class NghIndexMeta {
   /// Legacy whole-file `nav_graph.ngh`.
   static const int layoutLegacy = 1;
 
-  /// Paged nav + posting directory + PK map sidecars.
+  /// Paged Centroid B+Tree + posting + PK map sidecars.
   static const int layoutPaged = 2;
 
   bool get isPagedLayout => layoutVersion >= layoutPaged;
@@ -218,9 +210,6 @@ class NghIndexMeta {
     int? navPartitionCount,
     int? navNextPageNo,
     Map<int, int>? navFreeListHeads,
-    int? pdirPartitionCount,
-    int? pdirNextPageNo,
-    Map<int, int>? pdirFreeListHeads,
     int? pkmapPartitionCount,
     int? pkmapNextPageNo,
     Map<int, int>? pkmapFreeListHeads,
@@ -254,9 +243,6 @@ class NghIndexMeta {
       navPartitionCount: navPartitionCount ?? this.navPartitionCount,
       navNextPageNo: navNextPageNo ?? this.navNextPageNo,
       navFreeListHeads: navFreeListHeads ?? this.navFreeListHeads,
-      pdirPartitionCount: pdirPartitionCount ?? this.pdirPartitionCount,
-      pdirNextPageNo: pdirNextPageNo ?? this.pdirNextPageNo,
-      pdirFreeListHeads: pdirFreeListHeads ?? this.pdirFreeListHeads,
       pkmapPartitionCount: pkmapPartitionCount ?? this.pkmapPartitionCount,
       pkmapNextPageNo: pkmapNextPageNo ?? this.pkmapNextPageNo,
       pkmapFreeListHeads: pkmapFreeListHeads ?? this.pkmapFreeListHeads,
@@ -302,10 +288,6 @@ class NghIndexMeta {
       navNextPageNo:
           (json['navNextPageNo'] as num?)?.toInt() ?? firstDataPageNo,
       navFreeListHeads: _parseIntIntMap(json['navFreeListHeads']),
-      pdirPartitionCount: (json['pdirPartitionCount'] as num?)?.toInt() ?? 1,
-      pdirNextPageNo:
-          (json['pdirNextPageNo'] as num?)?.toInt() ?? firstDataPageNo,
-      pdirFreeListHeads: _parseIntIntMap(json['pdirFreeListHeads']),
       pkmapPartitionCount: (json['pkmapPartitionCount'] as num?)?.toInt() ?? 1,
       pkmapNextPageNo:
           (json['pkmapNextPageNo'] as num?)?.toInt() ?? firstDataPageNo,
@@ -342,9 +324,6 @@ class NghIndexMeta {
       'navPartitionCount': navPartitionCount,
       'navNextPageNo': navNextPageNo,
       'navFreeListHeads': _serializeIntIntMap(navFreeListHeads),
-      'pdirPartitionCount': pdirPartitionCount,
-      'pdirNextPageNo': pdirNextPageNo,
-      'pdirFreeListHeads': _serializeIntIntMap(pdirFreeListHeads),
       'pkmapPartitionCount': pkmapPartitionCount,
       'pkmapNextPageNo': pkmapNextPageNo,
       'pkmapFreeListHeads': _serializeIntIntMap(pkmapFreeListHeads),

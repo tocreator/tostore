@@ -92,8 +92,10 @@ enum BenchmarkOperation {
       'Vector ANN Search', 'Nearest-neighbor search (primary key + score)'),
   vectorHybridSearch(
       'Vector Hybrid Search', 'Filter plus vector search (full rows)'),
-  vectorRecallCheck('Vector Recall',
-      'Checks Recall@K at the default searchDepth. Larger searchDepth typically raises recall and latency');
+  vectorRecallCheck(
+      'Recall @ default OP',
+      'Opt-in quality check: Recall@K at default searchDepth only — not a recall ceiling. '
+          'Larger searchDepth typically raises recall and latency');
 
   final String label;
   final String description;
@@ -148,7 +150,6 @@ enum BenchmarkOperation {
     BenchmarkOperation.vectorBatchInsert,
     BenchmarkOperation.vectorSearch,
     BenchmarkOperation.vectorHybridSearch,
-    BenchmarkOperation.vectorRecallCheck,
   };
 }
 
@@ -263,8 +264,8 @@ class BenchmarkSummary {
   String? get vectorRecallCaption {
     if (!hasVectorRecall) return null;
     final depth = VectorIndexConfig.defaultSearchDepth;
-    return 'Recall checks the default searchDepth ($depth), '
-        'the same point used by the ANN and hybrid rows. '
+    return 'Recall@K is measured only at default searchDepth=$depth '
+        '(same OP as ANN/hybrid rows) — not the maximum achievable recall. '
         'Larger searchDepth typically raises recall and latency.';
   }
 
@@ -312,7 +313,7 @@ class BenchmarkSummary {
     if (qualityRows.isNotEmpty) {
       buffer.writeln();
       buffer.writeln(
-          '**Quality notes** (Result = measured Recall@K at the chosen searchDepth; Count = queries):');
+          '**Quality notes** (Result = Recall@K at the chosen searchDepth operating point, not a ceiling; Count = queries):');
       for (final m in qualityRows) {
         buffer.writeln('- **${m.name}**: ${m.qualityNote}');
       }

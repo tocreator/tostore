@@ -88,20 +88,17 @@ abstract final class NghIndexMetaFieldId {
   static const int navPartitionCount = 17;
   static const int navNextPageNo = 18;
   static const int navFreeListHeads = 19;
-  static const int pdirPartitionCount = 20;
-  static const int pdirNextPageNo = 21;
-  static const int pdirFreeListHeads = 22;
-  static const int pkmapPartitionCount = 23;
-  static const int pkmapNextPageNo = 24;
-  static const int pkmapFreeListHeads = 25;
-  static const int pkmapRootPartition = 26;
-  static const int pkmapRootPage = 27;
-  static const int pkmapHeight = 28;
-  static const int hasPkLocator = 29;
-  static const int pkBackfillPartition = 30;
-  static const int pkBackfillPage = 31;
-  static const int postingPageSize = 32;
-  static const int navPageSize = 33;
+  static const int pkmapPartitionCount = 20;
+  static const int pkmapNextPageNo = 21;
+  static const int pkmapFreeListHeads = 22;
+  static const int pkmapRootPartition = 23;
+  static const int pkmapRootPage = 24;
+  static const int pkmapHeight = 25;
+  static const int hasPkLocator = 26;
+  static const int pkBackfillPartition = 27;
+  static const int pkBackfillPage = 28;
+  static const int postingPageSize = 29;
+  static const int navPageSize = 30;
 }
 
 /// Discriminator for global meta blobs embedded in partition-0 page 0.
@@ -521,12 +518,6 @@ final class NghIndexMetaCodec {
     w.writeVarint(meta.navNextPageNo);
     _writeIntIntMap(
         w, NghIndexMetaFieldId.navFreeListHeads, meta.navFreeListHeads);
-    w.writeFieldTag(NghIndexMetaFieldId.pdirPartitionCount, WireType.varint);
-    w.writeVarint(meta.pdirPartitionCount);
-    w.writeFieldTag(NghIndexMetaFieldId.pdirNextPageNo, WireType.varint);
-    w.writeVarint(meta.pdirNextPageNo);
-    _writeIntIntMap(
-        w, NghIndexMetaFieldId.pdirFreeListHeads, meta.pdirFreeListHeads);
     w.writeFieldTag(NghIndexMetaFieldId.pkmapPartitionCount, WireType.varint);
     w.writeVarint(meta.pkmapPartitionCount);
     w.writeFieldTag(NghIndexMetaFieldId.pkmapNextPageNo, WireType.varint);
@@ -581,9 +572,6 @@ final class NghIndexMetaCodec {
     int navPartitionCount = 1;
     int navNextPageNo = NghIndexMeta.firstDataPageNo;
     Map<int, int> navFreeListHeads = const {};
-    int pdirPartitionCount = 1;
-    int pdirNextPageNo = NghIndexMeta.firstDataPageNo;
-    Map<int, int> pdirFreeListHeads = const {};
     int pkmapPartitionCount = 1;
     int pkmapNextPageNo = NghIndexMeta.firstDataPageNo;
     Map<int, int> pkmapFreeListHeads = const {};
@@ -659,15 +647,6 @@ final class NghIndexMetaCodec {
         case NghIndexMetaFieldId.navFreeListHeads:
           navFreeListHeads = _readIntIntMap(reader);
           break;
-        case NghIndexMetaFieldId.pdirPartitionCount:
-          pdirPartitionCount = reader.readVarint();
-          break;
-        case NghIndexMetaFieldId.pdirNextPageNo:
-          pdirNextPageNo = reader.readVarint();
-          break;
-        case NghIndexMetaFieldId.pdirFreeListHeads:
-          pdirFreeListHeads = _readIntIntMap(reader);
-          break;
         case NghIndexMetaFieldId.pkmapPartitionCount:
           pkmapPartitionCount = reader.readVarint();
           break;
@@ -740,9 +719,6 @@ final class NghIndexMetaCodec {
       navPartitionCount: navPartitionCount,
       navNextPageNo: navNextPageNo,
       navFreeListHeads: navFreeListHeads,
-      pdirPartitionCount: pdirPartitionCount,
-      pdirNextPageNo: pdirNextPageNo,
-      pdirFreeListHeads: pdirFreeListHeads,
       pkmapPartitionCount: pkmapPartitionCount,
       pkmapNextPageNo: pkmapNextPageNo,
       pkmapFreeListHeads: pkmapFreeListHeads,

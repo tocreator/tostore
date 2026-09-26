@@ -8,6 +8,13 @@ class BenchmarkSchemas {
   /// Top-K used by pure ANN (vectorSearch) and hybrid search benches.
   static const int vectorTopK = 10;
 
+  /// Timed ANN / hybrid query count per round (Count column / QPS sample).
+  static const int vectorSearchProbes = 10000;
+
+  /// Steady-state warmup queries on the real corpus before timed ANN/hybrid
+  /// rounds (excluded from the stopwatch).
+  static const int vectorSearchWarmup = 10000;
+
   /// Query count for Recall@K (Count column).
   static const int vectorRecallProbes = 100;
 

@@ -255,19 +255,6 @@ class PathManager {
     );
   }
 
-  /// Synchronous NGH posting-page directory partition path.
-  String getNghPdirPartitionPathByContext(
-    TableContext table,
-    IndexUid indexUid,
-    int partitionNo,
-  ) {
-    final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
-    return pathJoin(
-      _nghPartitionDirPathByContext(table, indexUid, 'pdir', dirIndex),
-      'p$partitionNo.ngh',
-    );
-  }
-
   /// Synchronous NGH PK-locator B+Tree partition path.
   String getNghPkmapPartitionPathByContext(
     TableContext table,

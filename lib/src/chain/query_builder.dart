@@ -8,6 +8,17 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   List<QueryAggregation> _extraAggregations =
       const []; // To store inline Agg objects
 
+  /// Cached pure matchVector args for the direct-ANN fast path.
+  /// Cleared when additional clauses make the query non-pure.
+  ({
+    String field,
+    VectorData vector,
+    double weight,
+    int? searchDepth,
+    double? distanceThreshold,
+    double? minScore,
+  })? _cachedPureVector;
+
   // related query related properties
   List<JoinClause>? _joins;
 
@@ -27,6 +38,10 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   QueryCondition? _havingCondition;
   List<QueryAggregation>? _aggregations;
 
+  /// Flags that keep the pure-ANN cache valid (anything else clears it).
+  static const int _pureMatchVectorOkFlags =
+      QueryClauseMask.matchVector | QueryClauseMask.selectedFields;
+
   QueryBuilder(super.db, super.tableName, {super.binding});
 
   void _invalidateFuture() {
@@ -38,9 +53,19 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   @override
   void _onChanged() {
     _invalidateFuture();
+    // Invalidate at write-time so execute() only needs a null check.
+    final cached = _cachedPureVector;
+    if (cached == null) return;
+    if (_conditionCount != 1 ||
+        (_clauseFlags & ~_pureMatchVectorOkFlags) != 0) {
+      _cachedPureVector = null;
+    }
   }
 
   void _prewarm({String? nextCursor, int? nextOffset}) {
+    // ANN / hybrid vector pages re-run full search for each offset; a background
+    // next-page prewarm roughly doubles throughput cost under query storms.
+    if (_clauseFlags & QueryClauseMask.matchVector != 0) return;
     if (!_db.isLowPressure()) return;
 
     // Safety Threshold: Avoid pre-warming excessively large result sets.
@@ -84,6 +109,8 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
             onlyCount: false,
             aggregations: combinedAggs.isNotEmpty ? combinedAggs : null,
             groupBy: _groupByFields,
+            clauseFlags: _clauseFlags,
+            selectedFields: _selectedFields,
           );
         } finally {
           lease.release();
@@ -221,6 +248,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       operator: operator,
       secondKey: secondKey,
     ));
+    _clauseFlags |= QueryClauseMask.joins;
     _onChanged();
     return this;
   }
@@ -251,6 +279,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       tableName: tableName,
       type: type,
     ));
+    _clauseFlags |= QueryClauseMask.joins;
     _onChanged();
     return this;
   }
@@ -437,6 +466,10 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     );
     _clauseFlags |= QueryClauseMask.matchVector;
     _onChanged();
+    // O(1) cache from QueryCondition.matchVector (null if non-pure).
+    if (_conditionCount == 1) {
+      _cachedPureVector = _condition!.tryExtractPureVectorMatch();
+    }
     return this;
   }
 
@@ -735,6 +768,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     if (_aggregations != null) {
       builder._aggregations = List<QueryAggregation>.from(_aggregations!);
     }
+    builder._cachedPureVector = _cachedPureVector;
 
     return builder;
   }
@@ -800,8 +834,11 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
           : null,
     );
 
-    // Trigger background pre-warm for next page if conditions are met (only on first execution)
-    if (isFirstRun && queryResult.hasMore) {
+    // Trigger background pre-warm for next page if conditions are met (only on first execution).
+    // Skip for matchVector: next-page ANN re-searches from scratch and would ~2x QPS cost.
+    if (isFirstRun &&
+        queryResult.hasMore &&
+        (_clauseFlags & QueryClauseMask.matchVector) == 0) {
       if (queryResult.nextCursorToken != null) {
         _prewarm(nextCursor: queryResult.nextCursorToken);
       } else {
@@ -949,6 +986,16 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       await _resolveForeignKeyJoins();
     }
 
+    // Pure matchVector: cache is maintained at write-time; one null check here.
+    ExecuteResult? pureResult;
+    final pure = _cachedPureVector;
+    if (pure != null && !onlyCount && extraAggregations == null) {
+      pureResult = await _executePureMatchVector(pure);
+      if (pureResult != null && pureResult.isProjected) {
+        return pureResult;
+      }
+    }
+
     // Execute Query including extra inline aggregations defined in select()
     final combinedAggs = <QueryAggregation>[];
     if (_aggregations != null) combinedAggs.addAll(_aggregations!);
@@ -957,7 +1004,8 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
 
     final table = _db.getTableContextSync(_tableName) ??
         await _db.getTableContext(_tableName);
-    final result = await _db.getQueryExecutor()?.execute(
+    final result = pureResult ??
+        await _db.getQueryExecutor()?.execute(
               table,
               condition: queryCondition,
               orderBy: _orderBy,
@@ -976,9 +1024,10 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
             ) ??
         const ExecuteResult.empty();
 
-    // Fast-path: Point query straight-through (zero post-processing checks and allocations)
-    if (result.isPointDirect &&
-        (_selectedFields == null || _selectedFields!.isEmpty)) {
+    // Fast-path: already projected / point lookup — skip post-processing.
+    if (result.isProjected ||
+        (result.isPointDirect &&
+            (_selectedFields == null || _selectedFields!.isEmpty))) {
       return result;
     }
 
@@ -1281,6 +1330,122 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     }
 
     return processedResults;
+  }
+
+  /// Pure [matchVector] ANN path — same core call as [DataStoreImpl.vectorSearch],
+  /// avoiding QueryExecutor planning / cache / normalize overhead.
+  Future<ExecuteResult?> _executePureMatchVector(
+    ({
+      String field,
+      VectorData vector,
+      double weight,
+      int? searchDepth,
+      double? distanceThreshold,
+      double? minScore,
+    }) pure,
+  ) async {
+    final vim = _db.vectorIndexManager;
+    if (vim == null) return null;
+
+    final table = _db.getTableContextSync(_tableName) ??
+        await _db.getTableContext(_tableName);
+    // Skip when promote dual-write is active (field remap required).
+    if (_db.migrationManager?.getPromoteRuntime(table.tableUid) != null) {
+      return null;
+    }
+
+    final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
+    if (effectiveLimit <= 0) return null;
+
+    // Exact topK — same ANN cost as db.vectorSearch(topK).
+    // hasMore is inferred from a full page (rare false-positive when corpus
+    // size equals topK exactly).
+    var vecResults = await vim.vectorSearch(
+      table: table,
+      fieldName: pure.field,
+      queryVector: pure.vector,
+      topK: effectiveLimit,
+      searchDepth: pure.searchDepth,
+      distanceThreshold: pure.distanceThreshold,
+    );
+
+    if (pure.minScore != null) {
+      final minScore = pure.minScore!;
+      vecResults = [
+        for (final r in vecResults)
+          if (r.score >= minScore) r
+      ];
+    }
+
+    final hasMore = vecResults.length >= effectiveLimit;
+    final page = vecResults;
+
+    if (page.isEmpty) {
+      return const ExecuteResult(
+        records: [],
+        retrieval: RetrievalContext(
+          entries: [],
+          fusionMethod: RetrievalFusionMethod.single,
+        ),
+        count: 0,
+        isProjected: true,
+      );
+    }
+
+    final pkField = table.schema.primaryKey;
+    final selected = _selectedFields;
+    final bool pkOnly =
+        selected != null && selected.length == 1 && selected.first == pkField;
+    // No select / PK-only → final shape; other selects remap in post-process.
+    final bool projected = selected == null || selected.isEmpty || pkOnly;
+
+    final records = <Map<String, dynamic>>[];
+    final entries = <RetrievalEntry>[];
+    final fieldName = pure.field;
+
+    if (pkOnly) {
+      for (final cand in page) {
+        records.add(<String, dynamic>{pkField: cand.primaryKey});
+        entries.add(RetrievalEntry(
+          score: cand.score,
+          channel: RetrievalChannel.vector,
+          rawScore: cand.distance,
+          meta: {
+            'distance': cand.distance,
+            'field': fieldName,
+          },
+        ));
+      }
+    } else {
+      final pks = [for (final c in page) c.primaryKey];
+      final recordsMap =
+          await _db.tableDataManager.queryRecordsMapBatch(table, pks);
+      for (final cand in page) {
+        final rec = recordsMap[cand.primaryKey];
+        if (rec == null) continue;
+        records.add(rec);
+        entries.add(RetrievalEntry(
+          score: cand.score,
+          channel: RetrievalChannel.vector,
+          rawScore: cand.distance,
+          meta: {
+            'distance': cand.distance,
+            'field': fieldName,
+          },
+        ));
+      }
+    }
+
+    return ExecuteResult(
+      records: records,
+      retrieval: RetrievalContext(
+        entries: entries,
+        fusionMethod: RetrievalFusionMethod.single,
+      ),
+      hasMore: hasMore,
+      count: records.length,
+      isProjected: projected,
+    );
   }
 
   /// Get field alias, support "field as alias" or "table.field as alias" format

@@ -26,6 +26,7 @@ class QueryCondition {
     _hasCalculatedSingleEq = false;
     _cachedSingleEq = null;
     _cachedBuiltMap = null;
+    _cachedPureVectorMatch = null;
   }
 
   // Order by, limit, offset related properties
@@ -34,6 +35,17 @@ class QueryCondition {
   int? _offset;
   String? _cursor;
   bool _hasVectorMatch = false;
+
+  /// Hot-path cache set by [matchVector] when the condition is still a pure
+  /// single-vector predicate. Cleared on any subsequent clause / OR.
+  ({
+    String field,
+    VectorData vector,
+    double weight,
+    int? searchDepth,
+    double? distanceThreshold,
+    double? minScore,
+  })? _cachedPureVectorMatch;
 
   /// Whether this condition tree contains any vector search predicates.
   bool get hasVectorMatch => _hasVectorMatch;
@@ -992,6 +1004,69 @@ class QueryCondition {
     }
   }
 
+  /// Extract a pure single-vector predicate (no AND filters / OR branches).
+  ///
+  /// Prefer the O(1) cache written by [matchVector]; falls back to a shallow
+  /// tree walk for [QueryCondition.fromMap] / rebuilt conditions.
+  ({
+    String field,
+    VectorData vector,
+    double weight,
+    int? searchDepth,
+    double? distanceThreshold,
+    double? minScore,
+  })? tryExtractPureVectorMatch() {
+    if (!_hasVectorMatch) return null;
+    final cached = _cachedPureVectorMatch;
+    if (cached != null && _conditionCount == 1) return cached;
+
+    if (_root == null) return null;
+
+    ConditionNode? leaf;
+    if (_root!.type == NodeType.leaf) {
+      leaf = _root;
+    } else if (_root!.type == NodeType.and) {
+      if (_root!.children.length == 1) {
+        final c1 = _root!.children.first;
+        if (c1.type == NodeType.leaf) {
+          leaf = c1;
+        } else if (c1.type == NodeType.and &&
+            c1.children.length == 1 &&
+            c1.children.first.type == NodeType.leaf) {
+          leaf = c1.children.first;
+        }
+      }
+    }
+
+    if (leaf == null || leaf.condition.isEmpty || leaf.condition.length != 1) {
+      return null;
+    }
+
+    final entry = leaf.condition.entries.first;
+    final field = entry.key;
+    if (field == 'AND' || field == 'OR') return null;
+
+    final rawVal = entry.value;
+    if (rawVal is! Map ||
+        rawVal.length != 1 ||
+        !rawVal.containsKey(r'$vector')) {
+      return null;
+    }
+    final payload = rawVal[r'$vector'];
+    if (payload is! Map) return null;
+    final vec = payload['vector'];
+    if (vec is! VectorData) return null;
+
+    return _cachedPureVectorMatch = (
+      field: field,
+      vector: vec,
+      weight: (payload['weight'] as num?)?.toDouble() ?? 1.0,
+      searchDepth: payload['searchDepth'] as int?,
+      distanceThreshold: (payload['distanceThreshold'] as num?)?.toDouble(),
+      minScore: (payload['minScore'] as num?)?.toDouble(),
+    );
+  }
+
   /// Match records using dense vector similarity search.
   QueryCondition matchVector(
     String field,
@@ -1032,7 +1107,20 @@ class QueryCondition {
     };
 
     _hasVectorMatch = true;
-    return where(field, r'$vector', payload);
+    where(field, r'$vector', payload);
+    // where() invalidates caches; re-stash while this remains a single predicate.
+    if (_conditionCount == 1) {
+      final cleanField = field.contains('.') ? field.split('.').last : field;
+      _cachedPureVectorMatch = (
+        field: cleanField,
+        vector: vectorData,
+        weight: weight,
+        searchDepth: searchDepth,
+        distanceThreshold: distanceThreshold,
+        minScore: minScore,
+      );
+    }
+    return this;
   }
 
   /// OR branch with vector similarity search.
@@ -1044,7 +1132,7 @@ class QueryCondition {
     double? distanceThreshold,
     double? minScore,
   }) {
-    return or().matchVector(
+    final result = or().matchVector(
       field,
       vector,
       weight: weight,
@@ -1052,5 +1140,8 @@ class QueryCondition {
       distanceThreshold: distanceThreshold,
       minScore: minScore,
     );
+    // OR branch is never a pure single-vector query.
+    _cachedPureVectorMatch = null;
+    return result;
   }
 }

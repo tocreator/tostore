@@ -47,11 +47,8 @@ import 'yield_controller.dart';
 //     hard-capped for interactive latency (~12 / 20 / 36 at depth 1 / 50 / 100).
 //   - searchDepth anchors: 1→91%, 50→95%, 98→98% (±5 / ±3 / ±5 pp). No hard
 //     max — depth>100 continues the same average Δlists/Δdepth (and recall
-//     pp/depth) as the 1→100 band until capped by nLeaves.
-//   - Engine v4 never rewrites nav_graph.ngh. New writes are paged nav/pdir
-//     only. Posting slot layout (including inlined PK) stays frozen; pdir is
-//     the page-list authority. Packed i32 `next` may be -1 at huge partition
-//     counts — that is not a posting rewrite trigger.
+//   - Engine v4 never rewrites nav_graph.ngh. New writes are paged Centroid
+//     B+Tree and posting partitions only. Posting slot layout stays frozen.
 // ============================================================================
 
 /// A search result with node ID, primary key, and distance.
@@ -149,6 +146,268 @@ final class _NghClusterSlots {
   }
 }
 
+// ----------------------------------------------------------------------------
+// Candidate Min-Heap for Zero Heap GC
+// ----------------------------------------------------------------------------
+final class CandidateMinHeapIP {
+  final Int32List ids;
+  final Float64List scores;
+  int size = 0;
+  final int capacity;
+  double minScore = -1e9;
+
+  CandidateMinHeapIP(this.capacity)
+      : ids = Int32List(capacity + 1),
+        scores = Float64List(capacity + 1);
+
+  @pragma('vm:prefer-inline')
+  void clear() {
+    size = 0;
+    minScore = -1e9;
+  }
+
+  @pragma('vm:prefer-inline')
+  void push(int id, double score) {
+    if (size >= capacity) {
+      if (score <= scores[1]) return;
+      var i = 1;
+      var child = 2;
+      while (child <= size) {
+        if (child < size && scores[child + 1] < scores[child]) {
+          child++;
+        }
+        if (score <= scores[child]) break;
+        ids[i] = ids[child];
+        scores[i] = scores[child];
+        i = child;
+        child = i << 1;
+      }
+      ids[i] = id;
+      scores[i] = score;
+      minScore = scores[1];
+      return;
+    }
+
+    size++;
+    var i = size;
+    var parent = i >> 1;
+    while (i > 1 && scores[parent] > score) {
+      ids[i] = ids[parent];
+      scores[i] = scores[parent];
+      i = parent;
+      parent = i >> 1;
+    }
+    ids[i] = id;
+    scores[i] = score;
+    if (size == capacity) {
+      minScore = scores[1];
+    }
+  }
+}
+
+// Streaming Slot Heap for Level 2A Pruning
+final class SlotCandidateHeap {
+  final List<NghPostingSlot?> slots;
+  final Float64List scores;
+  int size = 0;
+  int capacity;
+  final int maxCapacity;
+  double minScore = -1e9;
+
+  SlotCandidateHeap(this.maxCapacity)
+      : capacity = maxCapacity,
+        slots = List<NghPostingSlot?>.filled(maxCapacity + 1, null),
+        scores = Float64List(maxCapacity + 1);
+
+  @pragma('vm:prefer-inline')
+  void reset(int limit) {
+    capacity = limit.clamp(1, maxCapacity);
+    size = 0;
+    minScore = -1e9;
+  }
+
+  @pragma('vm:prefer-inline')
+  void clear() {
+    size = 0;
+    minScore = -1e9;
+  }
+
+  @pragma('vm:prefer-inline')
+  void push(NghPostingSlot slot, double score) {
+    if (size >= capacity) {
+      if (score <= scores[1]) return;
+      var i = 1;
+      var child = 2;
+      while (child <= size) {
+        if (child < size && scores[child + 1] < scores[child]) {
+          child++;
+        }
+        if (score <= scores[child]) break;
+        slots[i] = slots[child];
+        scores[i] = scores[child];
+        i = child;
+        child = i << 1;
+      }
+      slots[i] = slot;
+      scores[i] = score;
+      minScore = scores[1];
+      return;
+    }
+
+    size++;
+    var i = size;
+    var parent = i >> 1;
+    while (i > 1 && scores[parent] > score) {
+      slots[i] = slots[parent];
+      scores[i] = scores[parent];
+      i = parent;
+      parent = i >> 1;
+    }
+    slots[i] = slot;
+    scores[i] = score;
+    if (size == capacity) {
+      minScore = scores[1];
+    }
+  }
+}
+
+// Streaming Branch Heap for Level 1 Pruning
+final class BranchMinHeap {
+  final List<CentroidBranchEntry?> entries;
+  final Float64List scores;
+  int size = 0;
+  int capacity;
+  final int maxCapacity;
+  double minScore = -1e9;
+
+  BranchMinHeap(this.maxCapacity)
+      : capacity = maxCapacity,
+        entries = List<CentroidBranchEntry?>.filled(maxCapacity + 1, null),
+        scores = Float64List(maxCapacity + 1);
+
+  @pragma('vm:prefer-inline')
+  void reset(int limit) {
+    capacity = limit.clamp(1, maxCapacity);
+    size = 0;
+    minScore = -1e9;
+  }
+
+  @pragma('vm:prefer-inline')
+  void clear() {
+    size = 0;
+    minScore = -1e9;
+  }
+
+  @pragma('vm:prefer-inline')
+  void push(CentroidBranchEntry entry, double score) {
+    if (size >= capacity) {
+      if (score <= scores[1]) return;
+      var i = 1;
+      var child = 2;
+      while (child <= size) {
+        if (child < size && scores[child + 1] < scores[child]) {
+          child++;
+        }
+        if (score <= scores[child]) break;
+        entries[i] = entries[child];
+        scores[i] = scores[child];
+        i = child;
+        child = i << 1;
+      }
+      entries[i] = entry;
+      scores[i] = score;
+      minScore = scores[1];
+      return;
+    }
+
+    size++;
+    var i = size;
+    var parent = i >> 1;
+    while (i > 1 && scores[parent] > score) {
+      entries[i] = entries[parent];
+      scores[i] = scores[parent];
+      i = parent;
+      parent = i >> 1;
+    }
+    entries[i] = entry;
+    scores[i] = score;
+    if (size == capacity) {
+      minScore = scores[1];
+    }
+  }
+}
+
+// In-Memory Centroid B+Tree State (Level 0 Root + Level 1 Internal Branch Pages)
+//
+// Search-hot posting leaves live in [NghGraphEngine._btreeLeafCache] (TreeCache
+// + ResourceManager vector budget). This state only holds routing + scratch.
+final class CentroidBTreeState {
+  final int numRootCentroids;
+  final Float32List rootCentroids48Flat;
+  final Float32x4List rootCentroids48Simd;
+  final Map<int, List<({NghPageId pageId, NghNavBTreePage page})>>
+      internalChains;
+
+  NghPageId rootPageId;
+  int nextCentroidId;
+
+  // Pre-allocated scratchpads for Zero Heap GC search
+  final Float32List scratchQLow = Float32List(48);
+  late final Float32x4List scratchQLowSimd =
+      Float32x4List.sublistView(scratchQLow);
+  final Float32List scratchQFull;
+
+  final SlotCandidateHeap slotHeap = SlotCandidateHeap(2048);
+  final BranchMinHeap branchHeap = BranchMinHeap(256);
+  final CandidateMinHeapIP heap = CandidateMinHeapIP(10);
+
+  final Float64List rootScores = Float64List(256);
+  final Int32List rootIndices = Int32List(256);
+  final Int32List probedRoots = Int32List(256);
+  final List<CentroidBranchEntry?> pickedLeaves =
+      List<CentroidBranchEntry?>.filled(1024, null);
+
+  /// Resolved hot posting pages for [pickedLeaves] (avoids TreeCache re-lookup).
+  final List<NghPostingPage?> pickedLeafPages =
+      List<NghPostingPage?>.filled(1024, null);
+
+  /// Reused Top-K heap (avoids per-query _FixedHeap alloc).
+  _FixedHeap? _resultHeap;
+
+  // Fast single-cycle direct indexing visited tag (1M nodes capacity, 4MB pre-allocated)
+  final Int32List visitedTag = Int32List(1048576);
+  int currentStamp = 0;
+
+  @pragma('vm:prefer-inline')
+  void nextQueryStamp() {
+    currentStamp++;
+    if (currentStamp >= 2147483640) {
+      visitedTag.fillRange(0, visitedTag.length, 0);
+      currentStamp = 1;
+    }
+  }
+
+  @pragma('vm:prefer-inline')
+  bool isVisited(int nodeId) {
+    if (nodeId < visitedTag.length) {
+      if (visitedTag[nodeId] == currentStamp) return true;
+      visitedTag[nodeId] = currentStamp;
+      return false;
+    }
+    return false;
+  }
+
+  CentroidBTreeState({
+    required this.numRootCentroids,
+    required this.rootPageId,
+    required int dimensions,
+    this.nextCentroidId = 1,
+  })  : rootCentroids48Flat = Float32List(numRootCentroids * 48),
+        rootCentroids48Simd = Float32x4List(numRootCentroids * 12),
+        internalChains = {},
+        scratchQFull = Float32List(dimensions);
+}
+
 /// Resolved probe plan for one ANN query (recall-intent → cost budget).
 class _NprobePlan {
   final int depth;
@@ -177,7 +436,7 @@ class NghGraphEngine {
   /// Absolute L0 nprobe ceiling (routing only; scoring uses [wantLeaves]).
   static const int _hardNprobeCap = 256;
 
-  /// Typical IVF leaf occupancy used for slot-budget estimates.
+  /// Typical leaf occupancy used for slot-budget estimates.
   static const int _typicalLeafSlots = 4096;
 
   /// Interactive scoring cap at depth 100 (keeps p95 interactive on 1M–10M).
@@ -185,14 +444,14 @@ class NghGraphEngine {
 
   /// Map [searchDepth] → target recall intent.
   ///
-  /// Hard contract (anchors, no hard max):
+  /// Anchors (no hard max):
   /// depth 1 → 91.0% (±5pp)
   /// depth 50 → 95.0% (±3pp strict production baseline)
   /// depth 98 → 98.0% (±5pp)
-  /// depth 100 → ~98.6%
-  /// depth >100 continues the same average pp/depth as the 1→100 band
-  /// until 100% (≈ depth 118), then stays saturated — probe budget may
-  /// still rise via [_wantLeavesForDepth] for large corpora.
+  /// depth 100 → ~99.0%
+  /// depth >100 continues the 50→100 intent slope (~5pp per 50 depth)
+  /// until 100%, then stays saturated — probe budget still rises so large
+  /// corpora can catch the same knob feel.
   static double targetRecallFromDepth(int searchDepth) {
     if (searchDepth <= 1) return 0.91;
     if (searchDepth <= 50) {
@@ -202,11 +461,12 @@ class NghGraphEngine {
       return 0.95 + (0.98 - 0.95) * ((searchDepth - 50) / 48.0);
     }
     if (searchDepth <= 100) {
-      return 0.98 + (0.986 - 0.98) * ((searchDepth - 98) / 2.0);
+      // 98 → 98%, 100 → 99%: short tip so depth 100 is distinctly above 98.
+      return 0.98 + (0.99 - 0.98) * ((searchDepth - 98) / 2.0);
     }
-    // Match average slope of the base band: (98.6% - 91%) / 99 depths.
-    const ppPerDepth = (0.986 - 0.91) / 99.0;
-    return min(1.0, 0.986 + ppPerDepth * (searchDepth - 100));
+    // Same increment as 50→100 (~4pp / 50 depth), not the shallower 1→100 mean.
+    const ppPerDepth = (0.99 - 0.95) / 50.0;
+    return min(1.0, 0.99 + ppPerDepth * (searchDepth - 100));
   }
 
   /// Imbalance = max(entryCount) / avg(entryCount); 1.0 = perfectly even.
@@ -358,7 +618,7 @@ class NghGraphEngine {
               1.10)
           .round();
 
-  /// Min-cost posting lists — calibrated IVF points (insert-path children):
+  /// Min-cost posting lists — calibrated routing points (insert-path children):
   ///   50k:  2 lists ~95%; 250k: 2–3 lists; 1M: 4 / 6 / 11 ~87 / 92 / 94%.
   ///   Finer tessellation (nLeaves > 256) multiplies by √(nLeaves/256).
   /// Anchors: depth 1 / 50 / 98 / 100 → n1 / n50 / n98 / n100.
@@ -411,13 +671,7 @@ class NghGraphEngine {
       totalVectors: totalVectors,
     );
 
-    // Delivered endpoints of the base band (after interactive clamp).
-    final at1 = min(
-        nl,
-        min(
-          _maxLeavesForDepth(1, nLeaves: nl, totalVectors: totalVectors),
-          max(1, n1),
-        ));
+    // Delivered endpoint of the base band (after interactive clamp).
     final at100 = min(nl, min(_maxInteractiveLeaves, max(n1, n100)));
 
     final double raw;
@@ -434,11 +688,16 @@ class NghGraphEngine {
       final w = (searchDepth - 98) / 2.0;
       raw = n98 + (n100 - n98) * w;
     } else {
-      // Continue the average 1→100 list slope. Prefer the corpus-delivered
-      // slope; never fall below the interactive-cap slope when inventory
-      // still remains (so >100 is never a weaker knob than 1→100).
-      const floorSlope = (_maxInteractiveLeaves - 14) / 99.0;
-      final deliveredSlope = (at100 - at1) / 99.0;
+      // Same Δlists as 50→100 (~5pp intent / 50 depth), not 1→100 average.
+      final at50 = min(
+        nl,
+        min(
+          _maxLeavesForDepth(50, nLeaves: nl, totalVectors: totalVectors),
+          max(n1, n50),
+        ),
+      );
+      const floorSlope = (_maxInteractiveLeaves - 28) / 50.0;
+      final deliveredSlope = (at100 - at50) / 50.0;
       final slope = at100 < nl
           ? max(deliveredSlope, floorSlope)
           : max(0.0, deliveredSlope);
@@ -480,23 +739,45 @@ class NghGraphEngine {
     debugLabel: 'NghClusterCache',
   );
 
+  /// Soft ceiling for Centroid B+Tree search-hot posting leaves.
+  /// Synced from ResourceManager via [configureBTreeLeafCacheBudget].
+  int _btreeLeafCacheMaxBytes = 32 * 1024 * 1024;
+
+  /// Paged ANN leaf working set. Key: `[tableUid, indexUid, partitionNo, pageNo]`.
+  ///
+  /// Budgeted by the same vector quota as the legacy compact cluster cache so
+  /// insert thrash cannot silently shrink the hot set below startup prewarm.
+  late final TreeCache<NghPostingPage> _btreeLeafCache =
+      TreeCache<NghPostingPage>(
+    groupDepth: 2,
+    sizeCalculator: (page) => page.estimateResidentBytes(),
+    evictionMode: TreeCacheEvictionMode.lru,
+    maxByteThreshold: _btreeLeafCacheMaxBytes,
+    minByteThreshold: max(16 * 1024 * 1024, _btreeLeafCacheMaxBytes ~/ 2),
+    debugLabel: 'NghBTreeLeafCache',
+  );
+
   final Map<String, Future<void>> _clusterLoadInflight = {};
 
   late final NghPkMapEngine _pkMap =
       NghPkMapEngine(_partitionManager, _partitionManager.engineConfig);
 
+  /// Centroid B+Tree in-memory states (L0 root centroids + L1 internal branch pages).
+  /// Key: `tableUid.value:indexUid.value`.
+  final Map<String, CentroidBTreeState> _btreeStates = {};
+
   NghGraphEngine(this._partitionManager);
 
-  /// Format / page-directory cap for top-level IVF ids.
+  /// Format / page-directory cap for top-level centroid ids.
   static const int _maxTargetK = 16384;
 
-  /// L0 IVF lists (roots: coarses ∪ orphan leaves). Exact-scanned on insert.
+  /// L0 routing lists (roots: coarses ∪ orphan leaves). Exact-scanned on insert.
   /// Nested coarses are children, not L0 — otherwise K grows past 256 and
   /// 10k-flush assignment returns to minutes at 10M+.
   static const int _maxTopLevelRouting = 256;
 
   /// Coarse→mid→leaf hops. 256^3 × ~4k ≈ 68B; deeper would need childrenDir.
-  static const int _maxIvfDepth = 2;
+  static const int _maxTreeDepth = 2;
 
   /// Hard cap on live vectors in one leaf. Fair-share softCap must not exceed
   /// this or 10B corpora collapse into ~610k-slot lists (search I/O avalanche).
@@ -532,13 +813,66 @@ class NghGraphEngine {
   /// Current compact-cache ceiling in bytes.
   int get clusterCacheMaxBytes => _clusterCacheMaxBytes;
 
-  /// Configure cluster-cache ceiling (typically a share of the index budget).
+  /// Resident Centroid B+Tree posting-leaf cache bytes (all indexes).
+  int get btreeLeafCacheBytes => _btreeLeafCache.estimatedTotalSizeBytes;
+
+  /// Current B+Tree leaf-cache ceiling in bytes.
+  int get btreeLeafCacheMaxBytes => _btreeLeafCacheMaxBytes;
+
+  /// Configure cluster-cache ceiling (vector quota from ResourceManager).
   void configureClusterCacheBudget(int maxBytes) {
     _clusterCacheMaxBytes = max(4 * 1024 * 1024, maxBytes);
     _clusterCache.updateByteThreshold(
       max: _clusterCacheMaxBytes,
       min: max(4 * 1024 * 1024, _clusterCacheMaxBytes ~/ 2),
     );
+  }
+
+  /// Configure paged ANN leaf-cache ceiling (same vector quota family).
+  void configureBTreeLeafCacheBudget(int maxBytes) {
+    _btreeLeafCacheMaxBytes = max(16 * 1024 * 1024, maxBytes);
+    _btreeLeafCache.updateByteThreshold(
+      max: _btreeLeafCacheMaxBytes,
+      min: max(16 * 1024 * 1024, _btreeLeafCacheMaxBytes ~/ 2),
+    );
+  }
+
+  NghPostingPage? _btreeLeafGet(
+    TableUid tableUid,
+    IndexUid indexUid,
+    NghPageId id, {
+    bool touch = true,
+  }) {
+    if (id.isNone) return null;
+    return _btreeLeafCache.getPoint4(
+      tableUid.value,
+      indexUid.value,
+      id.partitionNo,
+      id.pageNo,
+      touch: touch,
+    );
+  }
+
+  void _btreeLeafPut(
+    TableUid tableUid,
+    IndexUid indexUid,
+    NghPageId id,
+    NghPostingPage page,
+  ) {
+    if (id.isNone) return;
+    page.ensureLow48Ready();
+    _btreeLeafCache.putPoint4(
+      tableUid.value,
+      indexUid.value,
+      id.partitionNo,
+      id.pageNo,
+      page,
+      size: page.estimateResidentBytes(),
+    );
+  }
+
+  void _btreeLeafClearForIndex(TableUid tableUid, IndexUid indexUid) {
+    _btreeLeafCache.remove([tableUid.value, indexUid.value]);
   }
 
   List<_NghCompactSlot> _compactNewSlots(
@@ -694,27 +1028,38 @@ class NghGraphEngine {
     await _clusterCache.cleanup(removeRatio: ratio);
   }
 
+  /// Evict a ratio of paged ANN leaf caches.
+  Future<void> evictBTreeLeafCache({double ratio = 0.3}) async {
+    await _btreeLeafCache.cleanup(removeRatio: ratio);
+  }
+
   /// Clear cluster cache for a specific table.
   void clearCacheForTable(TableUid tableUid) {
     _clusterCache.remove([tableUid.value]);
     _navGraphCache.remove([tableUid.value]);
+    _btreeLeafCache.remove([tableUid.value]);
     final prefix = '${tableUid.value}/';
     _navGraphInflight.removeWhere((k, _) => k.startsWith(prefix));
+    _btreeStates.removeWhere((k, _) => k.startsWith(prefix));
   }
 
   /// Clear cluster cache for a specific index.
   void clearCacheForIndex(TableUid tableUid, IndexUid indexUid) {
     _clusterCache.remove([tableUid.value, indexUid.value]);
     _navGraphCache.remove([tableUid.value, indexUid.value]);
+    _btreeLeafClearForIndex(tableUid, indexUid);
     final key = _cacheKey(tableUid, indexUid);
     _navGraphInflight.remove(key);
+    _btreeStates.remove(key);
   }
 
   /// Clear all cluster caches.
   void clearCache() {
     _clusterCache.clear();
     _navGraphCache.clear();
+    _btreeLeafCache.clear();
     _navGraphInflight.clear();
+    _btreeStates.clear();
   }
 
   void _ingestLoadedPagesIntoClusterMap({
@@ -772,7 +1117,6 @@ class NghGraphEngine {
     final pageOwnerByCacheKey = <int, int>{};
     final packedOwner = <int, int>{};
 
-    final needsHydrate = <NghNavCentroidNode>[];
     for (final cId in probeCentroids) {
       if (cId < 0 || cId >= navGraph.centroids.length) continue;
       final cached = _clusterCache.getPoint3(
@@ -791,14 +1135,6 @@ class NghGraphEngine {
       }
       if (clusterMap.containsKey(cId)) continue;
       expected.add(cId);
-      final c = navGraph.centroids[cId];
-      if (!c.postingPageListReady && !c.postingDirRoot.isNone) {
-        needsHydrate.add(c);
-      }
-    }
-
-    if (needsHydrate.isNotEmpty) {
-      await _partitionManager.hydratePostingDirs(table, indexUid, needsHydrate);
     }
 
     for (final cId in expected) {
@@ -920,6 +1256,18 @@ class NghGraphEngine {
     bool aborted() => shouldAbort?.call() ?? false;
     if (maxBytes <= 0 || meta.totalVectors <= 0 || aborted()) return 0;
 
+    // Paged Centroid B+Tree search uses leafCache, not the legacy compact
+    // cluster cache. Warm posting leaves + low48 so the first query is hot.
+    if (meta.layoutVersion >= NghIndexMeta.layoutPaged) {
+      return _prewarmBTreeLeaves(
+        table: table,
+        indexUid: indexUid,
+        meta: meta,
+        maxBytes: maxBytes,
+        shouldAbort: shouldAbort,
+      );
+    }
+
     final beforeBytes = clusterCacheBytes;
     final navGraph = await _getOrLoadNavGraph(table, indexUid, meta);
     if (navGraph == null || navGraph.centroids.isEmpty || aborted()) return 0;
@@ -963,7 +1311,6 @@ class NghGraphEngine {
       final packedOwner = <int, int>{};
       final batchEnd = min(batchStart + clustersPerBatch, order.length);
 
-      final batchToHydrate = <NghNavCentroidNode>[];
       for (var i = batchStart; i < batchEnd; i++) {
         final cId = order[i];
         if (_clusterCache.containsPoint3(
@@ -982,14 +1329,6 @@ class NghGraphEngine {
         }
 
         expected.add(cId);
-        if (!c.postingPageListReady && !c.postingDirRoot.isNone) {
-          batchToHydrate.add(c);
-        }
-      }
-
-      if (batchToHydrate.isNotEmpty) {
-        await _partitionManager.hydratePostingDirs(
-            table, indexUid, batchToHydrate);
       }
 
       for (final cId in expected) {
@@ -1098,6 +1437,168 @@ class NghGraphEngine {
     return max(0, clusterCacheBytes - beforeBytes);
   }
 
+  /// Rebuild the budgeted B+Tree leaf TreeCache after insert (startup-prewarm shape).
+  ///
+  /// Dirty pages remain in the partition posting [TreeCache]. Clearing the leaf
+  /// working set then re-prewarming under [btreeLeafCacheMaxBytes] keeps the
+  /// hot set aligned with ResourceManager vector quotas.
+  Future<void> rebuildPagedLeafCacheAfterInsert({
+    required TableContext table,
+    required IndexUid indexUid,
+    required NghIndexMeta meta,
+    bool Function()? shouldAbort,
+  }) async {
+    if (meta.layoutVersion < NghIndexMeta.layoutPaged) return;
+    if (_btreeStates[_cacheKey(table.tableUid, indexUid)] == null) return;
+    _btreeLeafClearForIndex(table.tableUid, indexUid);
+    if (shouldAbort?.call() ?? false) return;
+    await _prewarmBTreeLeaves(
+      table: table,
+      indexUid: indexUid,
+      meta: meta,
+      maxBytes: _btreeLeafCacheMaxBytes,
+      shouldAbort: shouldAbort,
+    );
+    if (shouldAbort?.call() ?? false) return;
+    await warmSearchPath(table: table, indexUid: indexUid, meta: meta);
+  }
+
+  /// Prefetch posting leaves into [_btreeLeafCache] under [maxBytes].
+  ///
+  /// Hottest leaves (highest [CentroidBranchEntry.leafSlotCount]) first so
+  /// typical ANN probes hit memory on the first query after open/insert.
+  Future<int> _prewarmBTreeLeaves({
+    required TableContext table,
+    required IndexUid indexUid,
+    required NghIndexMeta meta,
+    required int maxBytes,
+    bool Function()? shouldAbort,
+  }) async {
+    bool aborted() => shouldAbort?.call() ?? false;
+    if (maxBytes <= 0 || aborted()) return 0;
+
+    final state = await _getOrLoadBTreeState(table, indexUid, meta);
+    if (state == null || aborted()) return 0;
+
+    final beforeBytes = _btreeLeafCache.estimatedTotalSizeBytes;
+    final candidates = <({NghPageId id, int slots})>[];
+    final seen = <int>{};
+    for (final chain in state.internalChains.values) {
+      for (final it in chain) {
+        for (final e in it.page.entries) {
+          final id = e.leafPageId;
+          if (id.isNone) continue;
+          if (!seen.add(id.cacheKey)) continue;
+          final cached = _btreeLeafGet(table.tableUid, indexUid, id);
+          if (cached != null) {
+            cached.ensureLow48Ready();
+            continue;
+          }
+          candidates.add((id: id, slots: max(1, e.leafSlotCount)));
+        }
+      }
+    }
+    if (candidates.isEmpty) {
+      return max(0, _btreeLeafCache.estimatedTotalSizeBytes - beforeBytes);
+    }
+
+    candidates.sort((a, b) => b.slots.compareTo(a.slots));
+
+    final bytesPerSlot = 24 + meta.dimensions + 192;
+    var planned = 0;
+    final toLoad = <NghPageId>[];
+    final room = max(0, maxBytes - _btreeLeafCache.estimatedTotalSizeBytes);
+    for (final c in candidates) {
+      if (aborted()) break;
+      final est = c.slots * bytesPerSlot;
+      if (planned + est > room && toLoad.isNotEmpty) break;
+      if (est > room && toLoad.isEmpty) {
+        toLoad.add(c.id);
+        break;
+      }
+      if (planned + est > room) break;
+      planned += est;
+      toLoad.add(c.id);
+    }
+
+    const batchSize = 32;
+    final yieldController =
+        YieldController('NghGraphEngine.prewarmBTreeLeaves', checkInterval: 1);
+    for (var i = 0; i < toLoad.length && !aborted(); i += batchSize) {
+      final y = yieldController.maybeYield();
+      if (y != null) await y;
+      if (aborted()) break;
+      if (_btreeLeafCache.estimatedTotalSizeBytes >= maxBytes) break;
+      final chunk = toLoad.sublist(i, min(i + batchSize, toLoad.length));
+      await _hydrateBTreeLeaves(
+        table: table,
+        indexUid: indexUid,
+        meta: meta,
+        leafIds: chunk,
+      );
+    }
+
+    return max(0, _btreeLeafCache.estimatedTotalSizeBytes - beforeBytes);
+  }
+
+  /// Batch-load missing posting leaves into [_btreeLeafCache] and materialize low48.
+  /// Hot path returns a completed future without scheduling when all pages are resident.
+  Future<void> _hydrateBTreeLeaves({
+    required TableContext table,
+    required IndexUid indexUid,
+    required NghIndexMeta meta,
+    required Iterable<NghPageId> leafIds,
+    Map<NghPageId, NghPostingPage>? insertScratch,
+  }) {
+    final missing = <NghPageId>[];
+    for (final id in leafIds) {
+      if (id.isNone) continue;
+      final scratch = insertScratch?[id];
+      if (scratch != null) {
+        scratch.ensureLow48Ready();
+        continue;
+      }
+      final cached = _btreeLeafGet(table.tableUid, indexUid, id);
+      if (cached != null) {
+        // Already in TreeCache — low48 materialised on put/prewarm.
+        continue;
+      }
+      missing.add(id);
+    }
+    if (missing.isEmpty) return Future<void>.value();
+
+    return _hydrateBTreeLeavesIO(
+      table: table,
+      indexUid: indexUid,
+      meta: meta,
+      missing: missing,
+      insertScratch: insertScratch,
+    );
+  }
+
+  Future<void> _hydrateBTreeLeavesIO({
+    required TableContext table,
+    required IndexUid indexUid,
+    required NghIndexMeta meta,
+    required List<NghPageId> missing,
+    Map<NghPageId, NghPostingPage>? insertScratch,
+  }) async {
+    final loaded = await _partitionManager.readPostingPagesByIds(
+      table,
+      indexUid,
+      meta,
+      missing,
+    );
+    for (final item in loaded) {
+      if (insertScratch != null) {
+        item.page.ensureLow48Ready();
+        insertScratch.putIfAbsent(item.id, () => item.page);
+      } else {
+        _btreeLeafPut(table.tableUid, indexUid, item.id, item.page);
+      }
+    }
+  }
+
   /// Compile hot ANN loops and populate routing/cluster caches after prewarm.
   Future<void> warmSearchPath({
     required TableContext table,
@@ -1126,7 +1627,7 @@ class NghGraphEngine {
   // Search -- centroid-routed filter + candidate ranking
   // =====================================================================
 
-  /// Top-level IVF routing nodes: coarses plus orphan (unsplit) leaves.
+  /// Top-level centroid routing nodes: coarses plus orphan (unsplit) leaves.
   ///
   /// Mixed graphs must keep leftover flat leaves in the same exact scan as
   /// coarses. Routing only among coarses is what made identity recall collapse
@@ -1576,7 +2077,7 @@ class NghGraphEngine {
     return out;
   }
 
-  /// Replace coarse probes with an exact child-nprobe (multi-level IVF).
+  /// Replace coarse probes with an exact child-nprobe (multi-level hierarchical routing).
   ///
   /// One hop is not enough once hubs nest (parent-full → mid-coarse). Recurse
   /// to leaves; each hop keeps the nearest child so identity routing matches
@@ -1597,7 +2098,7 @@ class NghGraphEngine {
   }) {
     final n = navGraph.centroids.length;
     var current = probes;
-    for (var hop = 0; hop < _maxIvfDepth + 1; hop++) {
+    for (var hop = 0; hop < _maxTreeDepth + 1; hop++) {
       var sawCoarse = false;
       final out = <int>[];
       final seen = <int>{};
@@ -1677,6 +2178,1684 @@ class NghGraphEngine {
     return min(childCount, 1);
   }
 
+  // ============================================================================
+  // Centroid B+Tree (Zero-LSM Hierarchical Navigation Engine)
+  // ============================================================================
+
+  static Float32List _extractLow48(Float32List full) {
+    final low = Float32List(48);
+    _extractLow48Into(full, low);
+    return low;
+  }
+
+  /// Write normalized low-48 into [out] (no allocation — search hot path).
+  @pragma('vm:prefer-inline')
+  static void _extractLow48Into(Float32List full, Float32List out) {
+    double norm = 0.0;
+    final limit = min(48, full.length);
+    for (int d = 0; d < limit; d++) {
+      out[d] = full[d];
+      norm += full[d] * full[d];
+    }
+    for (int d = limit; d < 48; d++) {
+      out[d] = 0.0;
+    }
+    norm = sqrt(norm);
+    if (norm > 0) {
+      final inv = 1.0 / norm;
+      for (int d = 0; d < limit; d++) {
+        out[d] *= inv;
+      }
+    }
+  }
+
+  static Float32List _computeMean48(List<NghPostingSlot> slots) {
+    final mean = Float32List(48);
+    final count = slots.length;
+    if (count == 0) return mean;
+    for (final s in slots) {
+      final low = s.getLow48D(48);
+      for (int d = 0; d < 48; d++) {
+        mean[d] += low[d];
+      }
+    }
+    double norm = 0.0;
+    for (int d = 0; d < 48; d++) {
+      mean[d] /= count;
+      norm += mean[d] * mean[d];
+    }
+    norm = sqrt(norm);
+    if (norm > 0) {
+      for (int d = 0; d < 48; d++) {
+        mean[d] /= norm;
+      }
+    }
+    return mean;
+  }
+
+  List<Float32List> _kMeansInit48({
+    required List<Float32List> samples,
+    required int k,
+    int iterations = 6,
+  }) {
+    final rand = Random(42);
+    final n = samples.length;
+    final centers = <Float32List>[];
+    for (int i = 0; i < k; i++) {
+      centers.add(Float32List.fromList(samples[rand.nextInt(n)]));
+    }
+
+    for (int iter = 0; iter < iterations; iter++) {
+      final counts = Int32List(k);
+      final sums = List.generate(k, (_) => Float32List(48));
+      for (int i = 0; i < n; i++) {
+        final s = samples[i];
+        final sSimd = Float32x4List.sublistView(s);
+        int bestC = 0;
+        double maxSim = -1e9;
+        for (int c = 0; c < k; c++) {
+          final cSimd = Float32x4List.sublistView(centers[c]);
+          final sim = innerProduct48(sSimd, cSimd, 0);
+          if (sim > maxSim) {
+            maxSim = sim;
+            bestC = c;
+          }
+        }
+        counts[bestC]++;
+        for (int d = 0; d < 48; d++) {
+          sums[bestC][d] += s[d];
+        }
+      }
+
+      for (int c = 0; c < k; c++) {
+        if (counts[c] == 0) continue;
+        double norm = 0.0;
+        for (int d = 0; d < 48; d++) {
+          sums[c][d] /= counts[c];
+          norm += sums[c][d] * sums[c][d];
+        }
+        norm = sqrt(norm);
+        if (norm > 0) {
+          for (int d = 0; d < 48; d++) {
+            centers[c][d] = sums[c][d] / norm;
+          }
+        }
+      }
+    }
+    return centers;
+  }
+
+  Future<CentroidBTreeState?> _getOrLoadBTreeState(
+    TableContext table,
+    IndexUid indexUid,
+    NghIndexMeta meta,
+  ) {
+    final key = _cacheKey(table.tableUid, indexUid);
+    final cached = _btreeStates[key];
+    if (cached != null) return Future<CentroidBTreeState?>.value(cached);
+    return _loadBTreeState(table, indexUid, meta, key);
+  }
+
+  Future<CentroidBTreeState?> _loadBTreeState(
+    TableContext table,
+    IndexUid indexUid,
+    NghIndexMeta meta,
+    String key,
+  ) async {
+    final rootPage = await _partitionManager.readNavRootPage(
+      table,
+      indexUid,
+      meta: meta,
+      partitionNo: 0,
+      pageNo: 1,
+    );
+    if (rootPage == null || rootPage.roots.isEmpty) {
+      return null;
+    }
+
+    final state = CentroidBTreeState(
+      numRootCentroids: rootPage.roots.length,
+      rootPageId: const NghPageId(0, 1),
+      dimensions: meta.dimensions,
+    );
+
+    int maxCentroidId = rootPage.roots.length;
+    for (int i = 0; i < rootPage.roots.length; i++) {
+      final r = rootPage.roots[i];
+      final c = r.centroid48D;
+      for (int d = 0; d < 48; d++) {
+        state.rootCentroids48Flat[i * 48 + d] = c[d];
+      }
+      var currPageId = r.firstInternalPage;
+      final chain = <({NghPageId pageId, NghNavBTreePage page})>[];
+      while (currPageId != NghPageId.none) {
+        final internalPage = await _partitionManager.readNavBTreePage(
+          table,
+          indexUid,
+          currPageId,
+          meta: meta,
+        );
+        if (internalPage == null) break;
+        for (final entry in internalPage.entries) {
+          if (entry.centroidId > maxCentroidId) {
+            maxCentroidId = entry.centroidId;
+          }
+        }
+        chain.add((pageId: currPageId, page: internalPage));
+        currPageId = internalPage.nextInternalPage;
+      }
+      if (chain.isEmpty) {
+        chain.add((
+          pageId: r.firstInternalPage,
+          page: NghNavBTreePage(
+            rootCentroidId: r.rootId,
+            entries: [],
+          ),
+        ));
+      }
+      state.internalChains[r.rootId] = chain;
+    }
+    state.nextCentroidId = maxCentroidId;
+
+    final view = Float32x4List.sublistView(state.rootCentroids48Flat);
+    for (int i = 0; i < state.rootCentroids48Simd.length; i++) {
+      state.rootCentroids48Simd[i] = view[i];
+    }
+
+    _btreeStates[key] = state;
+    return state;
+  }
+
+  /// Map [searchDepth], corpus size and [topK] to Centroid B+Tree probe plan.
+  ///
+  /// LOCKED contract (user tuning must stay valid across engine releases):
+  /// - No hard max on [searchDepth]. Depth is recall-intent, not absolute cost.
+  /// - Anchors: 1→~91%, 50→~95%, 98→~98%, 100→~99% (best-effort).
+  /// - depth>100 uses the 50→100 Δbudget (not the shallower 1→100 mean).
+  static ({int wantRoots, int wantLeaves, int candSlots})
+      _resolveCentroidBTreeProbePlan({
+    required int totalVectors,
+    required int topK,
+    required int dimensions,
+    int postingPageSize = 16384,
+    int? searchDepth,
+  }) {
+    final rawDepth = searchDepth ?? VectorIndexConfig.defaultSearchDepth;
+    final depth = max(1, rawDepth);
+
+    // Auto N-scale (holds recall intent; does not change depth→slope).
+    final logN = log(max(1000, totalVectors).toDouble()) / ln10;
+    final scaleLeaves = max(0.0, (logN - 5.0) * 3.0).round();
+    final scaleRoots = max(0.0, (logN - 6.0) * 2.0).round();
+    final scaleSlots = max(0.0, (logN - 5.0) * 10.0).round();
+
+    const leaf1 = 7.0;
+    const leaf50 = 12.0;
+    const leaf100 = 20.0;
+    const root50 = 6.0;
+    const root100 = 10.0;
+    const tipLeaves100 = 8; // applied at depth ≥100
+    const tipRoots100 = 4;
+    const tipSlots100 = 16;
+    // 50→100 *delivered* slope (includes depth-100 tip). +50 depth after
+    // 100 must buy the same extra probes as 50→100, or 150/600 feel flat.
+    const leafSlope50 = (leaf100 + tipLeaves100 - leaf50) / 50.0; // 0.32
+    const rootSlope50 = (root100 + tipRoots100 - root50) / 50.0; // 0.16
+    const slotSlope50 = (68.0 + tipSlots100 - 36.0) / 50.0; // 0.96
+
+    // 1. Leaf pages probed (cheap 48-D page scan)
+    final int baseLeaves;
+    if (depth <= 1) {
+      baseLeaves = leaf1.round();
+    } else if (depth <= 50) {
+      baseLeaves = (leaf1 + (leaf50 - leaf1) * ((depth - 1) / 49.0)).round();
+    } else if (depth <= 100) {
+      baseLeaves =
+          (leaf50 + (leaf100 - leaf50) * ((depth - 50) / 50.0)).round();
+    } else {
+      baseLeaves = (leaf100 + leafSlope50 * (depth - 100)).round();
+    }
+    var leaves = max(1, baseLeaves + scaleLeaves);
+
+    // 2. Root centroids probed (cheap 48-D; inventory-capped at search time)
+    final int baseRoots;
+    if (depth <= 30) {
+      baseRoots = 4;
+    } else if (depth <= 70) {
+      baseRoots = 6;
+    } else if (depth <= 100) {
+      baseRoots = (8.0 + 2.0 * ((depth - 70) / 30.0)).round();
+    } else {
+      baseRoots = (root100 + rootSlope50 * (depth - 100)).round();
+    }
+    var roots = max(1, baseRoots + scaleRoots);
+
+    // 3. SQ8 candidate slots (full-D — keep tight; dominates 768D+ latency)
+    final s1 = max(topK * 2, 20);
+    final s50 = max(topK * 3 + 6, 36);
+    final s100 = max(topK * 6 + 4, 68);
+    final int baseCandSlots;
+    if (depth <= 1) {
+      baseCandSlots = s1;
+    } else if (depth <= 50) {
+      baseCandSlots = (s1 + (s50 - s1) * ((depth - 1) / 49.0)).round();
+    } else if (depth <= 100) {
+      baseCandSlots = (s50 + (s100 - s50) * ((depth - 50) / 50.0)).round();
+    } else {
+      baseCandSlots = (s100 + slotSlope50 * (depth - 100)).round();
+    }
+    var slots = max(topK, baseCandSlots + scaleSlots);
+
+    // Depth ≥99 only: lift 100 toward ~99% on 768D small corpora without
+    // moving ≤98. Extra SQ8 matters — 48-D heap otherwise saturates and
+    // +leaves after 100 barely moves Recall@10.
+    if (depth >= 99) {
+      final tip = min(2, depth - 98); // 1 @99, 2 @100+
+      roots += tip * 2; // +2 / +4
+      leaves += tip * 4; // +4 / +8
+      slots += tip * 8; // +8 / +16
+    }
+
+    // Mild density nudge only. Insert soft-caps leaf occupancy at ~32
+    // ([NghPageSizer.searchCalibMaxSlotsPerPage]) so 128D no longer packs
+    // ~99 slots/page. Residual dens>1.25 (32/20) trims leaves lightly and
+    // buys cheap SQ8 — no heavy N^0.6 leaf inflation (that made 128D slower
+    // and still short of 768D recall).
+    const refSlotsPerPage = 20.0;
+    final slotsPerPage = NghPageSizer.estimatePostingSlotsPerPage(
+      max(4096, postingPageSize),
+      max(1, dimensions),
+    ).toDouble();
+    if (slotsPerPage > refSlotsPerPage * 1.25) {
+      final dens = slotsPerPage / refSlotsPerPage;
+      leaves = max(1, (leaves / dens).round());
+      // Floor so depth anchors still have multi-leaf routing.
+      final minLeaves =
+          depth <= 1 ? 3 : (depth <= 50 ? 5 : (depth <= 98 ? 8 : 12));
+      leaves = max(minLeaves, leaves);
+      slots = max(slots, (slots * min(1.8, 0.95 + 0.2 * dens)).round());
+      if (dens >= 1.5 && depth >= 50) {
+        roots = min(256, roots + 1);
+      }
+    }
+
+    // Soft safety caps only — must not stall the depth>100 escape hatch early.
+    // Runtime still clamps roots to validRoots / leaves to hydrated inventory.
+    return (
+      wantRoots: min(256, roots),
+      wantLeaves: min(1024, leaves),
+      candSlots: min(2048, slots),
+    );
+  }
+
+  Future<List<NghSearchResult>> _searchCentroidBTree({
+    required TableContext table,
+    required IndexUid indexUid,
+    required NghIndexMeta meta,
+    required CentroidBTreeState state,
+    required Float32List query,
+    required int topK,
+    int? searchDepth,
+    double? distanceThreshold,
+    bool queryAlreadyNormalized = false,
+    Set<String>? pendingDeletePks,
+  }) {
+    final hot = _searchCentroidBTreeTryHot(
+      table: table,
+      indexUid: indexUid,
+      meta: meta,
+      state: state,
+      query: query,
+      topK: topK,
+      searchDepth: searchDepth,
+      distanceThreshold: distanceThreshold,
+      queryAlreadyNormalized: queryAlreadyNormalized,
+      pendingDeletePks: pendingDeletePks,
+      allowHydrate: true,
+    );
+    if (hot.sync != null) {
+      return Future<List<NghSearchResult>>.value(hot.sync!);
+    }
+    return hot.async!;
+  }
+
+  /// Shared Centroid B+Tree probe. When [allowHydrate] is false and leaves are
+  /// missing, returns sync=null / async=null (caller treats as cold miss).
+  ({List<NghSearchResult>? sync, Future<List<NghSearchResult>>? async})
+      _searchCentroidBTreeTryHot({
+    required TableContext table,
+    required IndexUid indexUid,
+    required NghIndexMeta meta,
+    required CentroidBTreeState state,
+    required Float32List query,
+    required int topK,
+    int? searchDepth,
+    double? distanceThreshold,
+    bool queryAlreadyNormalized = false,
+    Set<String>? pendingDeletePks,
+    bool allowHydrate = false,
+  }) {
+    final isCosine = meta.distanceMetric == VectorDistanceMetric.cosine;
+    final isIP = meta.distanceMetric == VectorDistanceMetric.innerProduct;
+
+    Float32List searchQuery = query;
+    if (isCosine && !queryAlreadyNormalized) {
+      // Normalize into scratch — avoid per-query Float32List alloc.
+      _normalizeFloat32Into(query, state.scratchQFull);
+      searchQuery = state.scratchQFull;
+    }
+
+    _extractLow48Into(searchQuery, state.scratchQLow);
+    final qLowSimd = state.scratchQLowSimd;
+    double qFullSum = 0.0;
+    int qd = 0;
+    final dim = meta.dimensions;
+    final unroll16Sum = dim - 15;
+    while (qd < unroll16Sum) {
+      qFullSum += (searchQuery[qd] + searchQuery[qd + 1]) +
+          (searchQuery[qd + 2] + searchQuery[qd + 3]) +
+          (searchQuery[qd + 4] + searchQuery[qd + 5]) +
+          (searchQuery[qd + 6] + searchQuery[qd + 7]) +
+          (searchQuery[qd + 8] + searchQuery[qd + 9]) +
+          (searchQuery[qd + 10] + searchQuery[qd + 11]) +
+          (searchQuery[qd + 12] + searchQuery[qd + 13]) +
+          (searchQuery[qd + 14] + searchQuery[qd + 15]);
+      qd += 16;
+    }
+    while (qd < dim) {
+      qFullSum += searchQuery[qd];
+      qd++;
+    }
+
+    state.nextQueryStamp();
+
+    final q0 = qLowSimd[0];
+    final q1 = qLowSimd[1];
+    final q2 = qLowSimd[2];
+    final q3 = qLowSimd[3];
+    final q4 = qLowSimd[4];
+    final q5 = qLowSimd[5];
+    final q6 = qLowSimd[6];
+    final q7 = qLowSimd[7];
+    final q8 = qLowSimd[8];
+    final q9 = qLowSimd[9];
+    final q10 = qLowSimd[10];
+    final q11 = qLowSimd[11];
+
+    final plan = _resolveCentroidBTreeProbePlan(
+      totalVectors: meta.totalVectors,
+      topK: topK,
+      dimensions: meta.dimensions,
+      postingPageSize: _postingPageSize(meta),
+      searchDepth: searchDepth,
+    );
+
+    // 1. Level 0: Top-R root selection (register track when R≤4 — matches
+    // tool/test_centroid_btree_engine.dart hot path).
+    final numRoots = state.numRootCentroids;
+    final wantRoots = plan.wantRoots;
+    int rootsToProbe = 0;
+
+    if (wantRoots <= 4) {
+      int r0 = 0, r1 = 0, r2 = 0, r3 = 0;
+      double s0 = -1e9, s1 = -1e9, s2 = -1e9, s3 = -1e9;
+      var nValid = 0;
+      for (int i = 0; i < numRoots; i++) {
+        final chain = state.internalChains[i];
+        if (chain == null || chain.isEmpty) continue;
+        var hasEntries = false;
+        for (int c = 0; c < chain.length; c++) {
+          if (chain[c].page.entries.isNotEmpty) {
+            hasEntries = true;
+            break;
+          }
+        }
+        if (!hasEntries) continue;
+        nValid++;
+        final s = innerProduct48Reg(
+          q0,
+          q1,
+          q2,
+          q3,
+          q4,
+          q5,
+          q6,
+          q7,
+          q8,
+          q9,
+          q10,
+          q11,
+          state.rootCentroids48Simd,
+          i * 12,
+        );
+        if (s > s0) {
+          s3 = s2;
+          r3 = r2;
+          s2 = s1;
+          r2 = r1;
+          s1 = s0;
+          r1 = r0;
+          s0 = s;
+          r0 = i;
+        } else if (s > s1) {
+          s3 = s2;
+          r3 = r2;
+          s2 = s1;
+          r2 = r1;
+          s1 = s;
+          r1 = i;
+        } else if (s > s2) {
+          s3 = s2;
+          r3 = r2;
+          s2 = s;
+          r2 = i;
+        } else if (s > s3) {
+          s3 = s;
+          r3 = i;
+        }
+      }
+      rootsToProbe = min(wantRoots, nValid);
+      if (rootsToProbe > 0) state.probedRoots[0] = r0;
+      if (rootsToProbe > 1) state.probedRoots[1] = r1;
+      if (rootsToProbe > 2) state.probedRoots[2] = r2;
+      if (rootsToProbe > 3) state.probedRoots[3] = r3;
+    } else {
+      int validRoots = 0;
+      final maxTrack = min(numRoots, state.rootScores.length);
+      for (int i = 0; i < numRoots && validRoots < maxTrack; i++) {
+        final chain = state.internalChains[i];
+        if (chain == null || chain.isEmpty) continue;
+        var hasEntries = false;
+        for (int c = 0; c < chain.length; c++) {
+          if (chain[c].page.entries.isNotEmpty) {
+            hasEntries = true;
+            break;
+          }
+        }
+        if (!hasEntries) continue;
+
+        state.rootScores[validRoots] = innerProduct48Reg(
+          q0,
+          q1,
+          q2,
+          q3,
+          q4,
+          q5,
+          q6,
+          q7,
+          q8,
+          q9,
+          q10,
+          q11,
+          state.rootCentroids48Simd,
+          i * 12,
+        );
+        state.rootIndices[validRoots] = i;
+        validRoots++;
+      }
+
+      rootsToProbe = min(wantRoots, validRoots);
+      for (int i = 0; i < rootsToProbe; i++) {
+        var bestIdx = i;
+        var bestScore = state.rootScores[i];
+        for (int j = i + 1; j < validRoots; j++) {
+          if (state.rootScores[j] > bestScore) {
+            bestScore = state.rootScores[j];
+            bestIdx = j;
+          }
+        }
+        if (bestIdx != i) {
+          final ts = state.rootScores[i];
+          state.rootScores[i] = state.rootScores[bestIdx];
+          state.rootScores[bestIdx] = ts;
+          final ti = state.rootIndices[i];
+          state.rootIndices[i] = state.rootIndices[bestIdx];
+          state.rootIndices[bestIdx] = ti;
+        }
+        state.probedRoots[i] = state.rootIndices[i];
+      }
+    }
+
+    // 2. Level 1: Streaming min-heap branch selection
+    final maxLeavesToRead = min(plan.wantLeaves, state.pickedLeaves.length);
+    state.branchHeap.reset(maxLeavesToRead);
+    for (int r = 0; r < rootsToProbe; r++) {
+      final rootId = state.probedRoots[r];
+      final chain = state.internalChains[rootId];
+      if (chain == null || chain.isEmpty) continue;
+      for (int c = 0; c < chain.length; c++) {
+        final entries = chain[c].page.entries;
+        for (int e = 0; e < entries.length; e++) {
+          final entry = entries[e];
+          final score = innerProduct48Reg(
+            q0,
+            q1,
+            q2,
+            q3,
+            q4,
+            q5,
+            q6,
+            q7,
+            q8,
+            q9,
+            q10,
+            q11,
+            entry.centroid48DSimd,
+            0,
+          );
+          if (state.branchHeap.size >= maxLeavesToRead &&
+              score <= state.branchHeap.minScore) {
+            continue;
+          }
+          state.branchHeap.push(entry, score);
+        }
+      }
+    }
+
+    final leavesToPick = state.branchHeap.size;
+    var allCached = true;
+    for (int i = 0; i < leavesToPick; i++) {
+      final entry = state.branchHeap.entries[i + 1]!;
+      state.pickedLeaves[i] = entry;
+      final page = _btreeLeafGet(
+        table.tableUid,
+        indexUid,
+        entry.leafPageId,
+        touch: false,
+      );
+      state.pickedLeafPages[i] = page;
+      if (page == null) allCached = false;
+    }
+
+    if (!allCached) {
+      if (!allowHydrate) {
+        return (sync: null, async: null);
+      }
+      return (
+        sync: null,
+        async: _searchCentroidBTreeHydrateAndRank(
+          table: table,
+          indexUid: indexUid,
+          meta: meta,
+          state: state,
+          searchQuery: searchQuery,
+          topK: topK,
+          leavesToPick: leavesToPick,
+          planCandSlots: plan.candSlots,
+          qFullSum: qFullSum,
+          q0: q0,
+          q1: q1,
+          q2: q2,
+          q3: q3,
+          q4: q4,
+          q5: q5,
+          q6: q6,
+          q7: q7,
+          q8: q8,
+          q9: q9,
+          q10: q10,
+          q11: q11,
+          isCosine: isCosine,
+          isIP: isIP,
+          distanceThreshold: distanceThreshold,
+          pendingDeletePks: pendingDeletePks,
+        ),
+      );
+    }
+
+    return (
+      sync: _rankCentroidBTreeLeaves(
+        state: state,
+        searchQuery: searchQuery,
+        topK: topK,
+        leavesToPick: leavesToPick,
+        planCandSlots: plan.candSlots,
+        qFullSum: qFullSum,
+        q0: q0,
+        q1: q1,
+        q2: q2,
+        q3: q3,
+        q4: q4,
+        q5: q5,
+        q6: q6,
+        q7: q7,
+        q8: q8,
+        q9: q9,
+        q10: q10,
+        q11: q11,
+        dimensions: dim,
+        isCosine: isCosine,
+        isIP: isIP,
+        distanceThreshold: distanceThreshold,
+        pendingDeletePks: pendingDeletePks,
+      ),
+      async: null,
+    );
+  }
+
+  Future<List<NghSearchResult>> _searchCentroidBTreeHydrateAndRank({
+    required TableContext table,
+    required IndexUid indexUid,
+    required NghIndexMeta meta,
+    required CentroidBTreeState state,
+    required Float32List searchQuery,
+    required int topK,
+    required int leavesToPick,
+    required int planCandSlots,
+    required double qFullSum,
+    required Float32x4 q0,
+    required Float32x4 q1,
+    required Float32x4 q2,
+    required Float32x4 q3,
+    required Float32x4 q4,
+    required Float32x4 q5,
+    required Float32x4 q6,
+    required Float32x4 q7,
+    required Float32x4 q8,
+    required Float32x4 q9,
+    required Float32x4 q10,
+    required Float32x4 q11,
+    required bool isCosine,
+    required bool isIP,
+    double? distanceThreshold,
+    Set<String>? pendingDeletePks,
+  }) async {
+    final pickIds = <NghPageId>[
+      for (int l = 0; l < leavesToPick; l++) state.pickedLeaves[l]!.leafPageId,
+    ];
+    await _hydrateBTreeLeaves(
+      table: table,
+      indexUid: indexUid,
+      meta: meta,
+      leafIds: pickIds,
+    );
+    for (int i = 0; i < leavesToPick; i++) {
+      state.pickedLeafPages[i] = _btreeLeafGet(
+        table.tableUid,
+        indexUid,
+        state.pickedLeaves[i]!.leafPageId,
+        touch: false,
+      );
+    }
+    return _rankCentroidBTreeLeaves(
+      state: state,
+      searchQuery: searchQuery,
+      topK: topK,
+      leavesToPick: leavesToPick,
+      planCandSlots: planCandSlots,
+      qFullSum: qFullSum,
+      q0: q0,
+      q1: q1,
+      q2: q2,
+      q3: q3,
+      q4: q4,
+      q5: q5,
+      q6: q6,
+      q7: q7,
+      q8: q8,
+      q9: q9,
+      q10: q10,
+      q11: q11,
+      dimensions: meta.dimensions,
+      isCosine: isCosine,
+      isIP: isIP,
+      distanceThreshold: distanceThreshold,
+      pendingDeletePks: pendingDeletePks,
+    );
+  }
+
+  List<NghSearchResult> _rankCentroidBTreeLeaves({
+    required CentroidBTreeState state,
+    required Float32List searchQuery,
+    required int topK,
+    required int leavesToPick,
+    required int planCandSlots,
+    required double qFullSum,
+    required Float32x4 q0,
+    required Float32x4 q1,
+    required Float32x4 q2,
+    required Float32x4 q3,
+    required Float32x4 q4,
+    required Float32x4 q5,
+    required Float32x4 q6,
+    required Float32x4 q7,
+    required Float32x4 q8,
+    required Float32x4 q9,
+    required Float32x4 q10,
+    required Float32x4 q11,
+    required int dimensions,
+    required bool isCosine,
+    required bool isIP,
+    double? distanceThreshold,
+    Set<String>? pendingDeletePks,
+  }) {
+    state.slotHeap.reset(planCandSlots);
+    for (int l = 0; l < leavesToPick; l++) {
+      final leafPage = state.pickedLeafPages[l];
+      if (leafPage == null) continue;
+
+      final slots = leafPage.slots;
+      for (int i = 0; i < slots.length; i++) {
+        final slot = slots[i];
+        if ((slot.flags & 0x01) != 0) continue;
+        if (state.isVisited(slot.nodeId)) continue;
+
+        // Prefer already-materialized 48-D (prewarm / hydrate); avoid rebuild.
+        final sSimd = slot.low48DSimd ?? slot.getLow48DSimd(dimensions);
+        final s48 = innerProduct48Reg(
+          q0,
+          q1,
+          q2,
+          q3,
+          q4,
+          q5,
+          q6,
+          q7,
+          q8,
+          q9,
+          q10,
+          q11,
+          sSimd,
+          0,
+        );
+        if (state.slotHeap.size >= state.slotHeap.capacity &&
+            s48 <= state.slotHeap.minScore) {
+          continue;
+        }
+        state.slotHeap.push(slot, s48);
+      }
+    }
+
+    final q = searchQuery;
+    final dim = dimensions;
+    var resultHeap = state._resultHeap;
+    if (resultHeap == null || resultHeap.capacity < topK) {
+      resultHeap = _FixedHeap(topK, maxHeap: true);
+      state._resultHeap = resultHeap;
+    } else {
+      resultHeap.clear();
+    }
+
+    for (int i = 1; i <= state.slotHeap.size; i++) {
+      final slot = state.slotHeap.slots[i]!;
+      if (pendingDeletePks != null &&
+          pendingDeletePks.contains(slot.primaryKey)) {
+        continue;
+      }
+
+      final codes = slot.sq8Codes;
+      double dot0 = 0.0;
+      double dot1 = 0.0;
+      int d = 0;
+      final unroll16 = dim - 15;
+      while (d < unroll16) {
+        dot0 += q[d] * codes[d] +
+            q[d + 2] * codes[d + 2] +
+            q[d + 4] * codes[d + 4] +
+            q[d + 6] * codes[d + 6] +
+            q[d + 8] * codes[d + 8] +
+            q[d + 10] * codes[d + 10] +
+            q[d + 12] * codes[d + 12] +
+            q[d + 14] * codes[d + 14];
+        dot1 += q[d + 1] * codes[d + 1] +
+            q[d + 3] * codes[d + 3] +
+            q[d + 5] * codes[d + 5] +
+            q[d + 7] * codes[d + 7] +
+            q[d + 9] * codes[d + 9] +
+            q[d + 11] * codes[d + 11] +
+            q[d + 13] * codes[d + 13] +
+            q[d + 15] * codes[d + 15];
+        d += 16;
+      }
+      while (d < dim) {
+        dot0 += q[d] * codes[d];
+        d++;
+      }
+
+      final ip = slot.offset * qFullSum + slot.scale * (dot0 + dot1);
+      final double dist;
+      if (isCosine) {
+        // Cosine inserts store unit vectors → squaredNorm ≈ 1; skip sqrt.
+        final sn = slot.squaredNorm;
+        final cosSim = (sn > 0.99 && sn < 1.01) ? ip : ip / sqrt(sn);
+        dist = max(0.0, 1.0 - cosSim);
+      } else if (isIP) {
+        dist = -ip;
+      } else {
+        dist = max(0.0, 1.0 + slot.squaredNorm - 2.0 * ip);
+      }
+
+      if (distanceThreshold != null && dist > distanceThreshold) continue;
+      // Prefer resident wire bytes — avoid utf8.encode via primaryKeyUtf8.
+      resultHeap.pushWithPk(
+        slot.nodeId,
+        dist,
+        slot.primaryKeyBytes ?? slot.primaryKeyUtf8,
+      );
+    }
+
+    final rawResults = resultHeap.drainSortedWithPk();
+    return [
+      for (final r in rawResults)
+        NghSearchResult(
+          nodeId: r.nodeId,
+          distance: r.distance,
+          primaryKey: r.primaryKeyBytes != null
+              ? utf8.decode(r.primaryKeyBytes!)
+              : null,
+        ),
+    ];
+  }
+
+  /// Migrate legacy single-file `nav_graph.ngh` (or unpaged centroids) directly
+  /// into the modern Centroid B+Tree layout.
+  ///
+  /// Takes the existing centroid nodes from [blob], clusters their 48-D projections
+  /// into up to 64 root centroids via in-memory k-means (taking < 5ms for thousands of
+  /// centroids), links each existing centroid into its nearest root internal page chain
+  /// preserving all physical posting page associations, writes out [dirtyNavRootPage]
+  /// and [dirtyNavBTreePages], and updates [meta] with modern B+Tree pointers.
+  Future<
+      ({
+        NghIndexMeta meta,
+        Map<NghPagePtr, NghNavBTreePage> dirtyNavBTreePages,
+        ({NghPagePtr ptr, NghNavRootPage page}) dirtyNavRootPage,
+      })> migrateLegacyNavToBTree({
+    required TableContext table,
+    required IndexUid indexUid,
+    required NghIndexMeta meta,
+    required NghNavGraphPage blob,
+  }) async {
+    final dims = blob.dimensions;
+    final centroids = blob.centroids;
+    var currentMeta = meta;
+
+    final dirtyNavBTreePages = <NghPagePtr, NghNavBTreePage>{};
+
+    if (centroids.isEmpty) {
+      final (rootPages, metaAfterAlloc) =
+          _partitionManager.allocatePagesBatchSync(
+        NghDataCategory.nav,
+        currentMeta,
+        1,
+      );
+      currentMeta = metaAfterAlloc;
+      final rootPtr = rootPages.first;
+      final emptyRootPage = NghNavRootPage(
+        lowDim: 48,
+        fullDim: dims,
+        roots: const [],
+      );
+      currentMeta = currentMeta.copyWith(
+        layoutVersion: NghIndexMeta.layoutPaged,
+        centroidCount: 0,
+      );
+      return (
+        meta: currentMeta,
+        dirtyNavBTreePages: dirtyNavBTreePages,
+        dirtyNavRootPage: (ptr: rootPtr, page: emptyRootPage),
+      );
+    }
+
+    final isCosine = currentMeta.distanceMetric == VectorDistanceMetric.cosine;
+
+    // 1. Extract normalized 48-D projections of existing centroids
+    final low48List = List<Float32List>.generate(
+      centroids.length,
+      (i) {
+        final v = centroids[i].vector;
+        return _extractLow48(isCosine ? _normalizeFloat32(v) : v);
+      },
+      growable: false,
+    );
+
+    // 2. K-means clustering over centroids to produce up to 64 root seeds
+    const targetRoots = 64;
+    final numRoots = min(targetRoots, max(1, centroids.length));
+    final rootSeeds = _kMeansInit48(
+      samples: low48List,
+      k: numRoots,
+      iterations: 6,
+    );
+
+    // 3. Assign each legacy centroid to its nearest root centroid
+    final rootMembers = List<List<int>>.generate(numRoots, (_) => <int>[]);
+    final rootSeedsSimd = List<Float32x4List>.generate(
+      numRoots,
+      (r) => Float32x4List.sublistView(rootSeeds[r]),
+      growable: false,
+    );
+
+    for (int i = 0; i < centroids.length; i++) {
+      final sSimd = Float32x4List.sublistView(low48List[i]);
+      int bestRoot = 0;
+      double maxSim = -1e9;
+      for (int r = 0; r < numRoots; r++) {
+        final sim = innerProduct48(sSimd, rootSeedsSimd[r], 0);
+        if (sim > maxSim) {
+          maxSim = sim;
+          bestRoot = r;
+        }
+      }
+      rootMembers[bestRoot].add(i);
+    }
+
+    // 4. Calculate total entries per root (expanding multiple posting pages if any)
+    final rootEntries = List<List<CentroidBranchEntry>>.generate(
+      numRoots,
+      (_) => <CentroidBranchEntry>[],
+    );
+    int maxCentroidId = 0;
+
+    for (int r = 0; r < numRoots; r++) {
+      for (final cIdx in rootMembers[r]) {
+        final c = centroids[cIdx];
+        if (c.centroidId > maxCentroidId) {
+          maxCentroidId = c.centroidId;
+        }
+        final cPages = c.postingPages.isNotEmpty
+            ? c.postingPages
+            : (c.postingPageNos.isNotEmpty
+                ? c.postingPageNos
+                    .map(NghPageId.fromPacked)
+                    .toList(growable: false)
+                : (c.headPostingPageNo >= 0
+                    ? [NghPageId.fromPacked(c.headPostingPageNo)]
+                    : const <NghPageId>[]));
+
+        if (cPages.isEmpty) {
+          rootEntries[r].add(CentroidBranchEntry(
+            centroidId: c.centroidId,
+            leafPageId: NghPageId.none,
+            leafSlotCount: c.entryCount,
+            centroid48D: low48List[cIdx],
+          ));
+        } else {
+          final countPerLeaf = max(1, c.entryCount ~/ cPages.length);
+          for (final leafPageId in cPages) {
+            rootEntries[r].add(CentroidBranchEntry(
+              centroidId: c.centroidId,
+              leafPageId: leafPageId,
+              leafSlotCount: countPerLeaf,
+              centroid48D: low48List[cIdx],
+            ));
+          }
+        }
+      }
+    }
+
+    // 5. Calculate internal pages needed per root
+    final pagesNeededPerRoot = List<int>.generate(numRoots, (r) {
+      final count = rootEntries[r].length;
+      return max(
+          1,
+          (count + NghNavBTreePage.maxEntriesPerPage - 1) ~/
+              NghNavBTreePage.maxEntriesPerPage);
+    });
+    final totalInternalPages =
+        pagesNeededPerRoot.fold<int>(0, (sum, p) => sum + p);
+
+    // 6. Batch allocate nav pages: 1 root page + totalInternalPages
+    final (navPages, metaAfterAlloc) = _partitionManager.allocatePagesBatchSync(
+      NghDataCategory.nav,
+      currentMeta,
+      1 + totalInternalPages,
+    );
+    currentMeta = metaAfterAlloc;
+
+    final rootPtr = navPages[0];
+    final rootPageId = NghPageId(rootPtr.partitionNo, rootPtr.pageNo);
+
+    final rootsList = <({
+      int rootId,
+      NghPageId firstInternalPage,
+      Float32List centroid48D,
+    })>[];
+
+    final state = CentroidBTreeState(
+      numRootCentroids: numRoots,
+      rootPageId: rootPageId,
+      dimensions: dims,
+    );
+
+    int navPageCursor = 1;
+
+    for (int r = 0; r < numRoots; r++) {
+      final entries = rootEntries[r];
+      final pagesCount = pagesNeededPerRoot[r];
+      final rootPagePtrs =
+          navPages.sublist(navPageCursor, navPageCursor + pagesCount);
+      navPageCursor += pagesCount;
+
+      final firstInternalPtr = rootPagePtrs.first;
+      final firstInternalPageId =
+          NghPageId(firstInternalPtr.partitionNo, firstInternalPtr.pageNo);
+
+      rootsList.add((
+        rootId: r,
+        firstInternalPage: firstInternalPageId,
+        centroid48D: rootSeeds[r],
+      ));
+
+      final internalChain = <({NghPageId pageId, NghNavBTreePage page})>[];
+
+      for (int pIdx = 0; pIdx < pagesCount; pIdx++) {
+        final pagePtr = rootPagePtrs[pIdx];
+        final pageId = NghPageId(pagePtr.partitionNo, pagePtr.pageNo);
+        final nextPageId = (pIdx + 1 < pagesCount)
+            ? NghPageId(rootPagePtrs[pIdx + 1].partitionNo,
+                rootPagePtrs[pIdx + 1].pageNo)
+            : NghPageId.none;
+
+        final startIdx = pIdx * NghNavBTreePage.maxEntriesPerPage;
+        final endIdx =
+            min(startIdx + NghNavBTreePage.maxEntriesPerPage, entries.length);
+        final pageEntries = entries.sublist(startIdx, endIdx);
+
+        final btreePage = NghNavBTreePage(
+          rootCentroidId: r,
+          nextInternalPage: nextPageId,
+          entries: pageEntries,
+        );
+        dirtyNavBTreePages[pagePtr] = btreePage;
+        internalChain.add((pageId: pageId, page: btreePage));
+      }
+
+      state.internalChains[r] = internalChain;
+
+      final c48 = rootSeeds[r];
+      for (int d = 0; d < 48; d++) {
+        state.rootCentroids48Flat[r * 48 + d] = c48[d];
+      }
+    }
+
+    state.nextCentroidId = maxCentroidId;
+
+    final view = Float32x4List.sublistView(state.rootCentroids48Flat);
+    for (int i = 0; i < state.rootCentroids48Simd.length; i++) {
+      state.rootCentroids48Simd[i] = view[i];
+    }
+
+    _btreeStates[_cacheKey(table.tableUid, indexUid)] = state;
+
+    final rootPage = NghNavRootPage(
+      lowDim: 48,
+      fullDim: dims,
+      roots: rootsList,
+    );
+    final dirtyNavRootPage = (ptr: rootPtr, page: rootPage);
+
+    currentMeta = currentMeta.copyWith(
+      layoutVersion: NghIndexMeta.layoutPaged,
+      centroidCount: centroids.length,
+    );
+
+    return (
+      meta: currentMeta,
+      dirtyNavBTreePages: dirtyNavBTreePages,
+      dirtyNavRootPage: dirtyNavRootPage,
+    );
+  }
+
+  Future<NghInsertResult> _insertBatchCentroidBTree({
+    required TableContext table,
+    required IndexUid indexUid,
+    required NghIndexMeta meta,
+    required List<Float32List> vectors,
+    required List<String> primaryKeys,
+    int? yieldBudgetMs,
+  }) async {
+    if (vectors.isEmpty) {
+      return NghInsertResult(
+        meta: meta,
+        dirtyPostingPages: const {},
+        insertedCount: 0,
+      );
+    }
+
+    var currentMeta = NghPageSizer.ensureIndexPageSizes(
+      meta,
+      _partitionManager.configuredPageSize,
+    );
+    final isCosine = currentMeta.distanceMetric == VectorDistanceMetric.cosine;
+
+    final normalizedVectors = isCosine
+        ? List<Float32List>.generate(
+            vectors.length,
+            (i) => _normalizeFloat32(vectors[i]),
+            growable: false,
+          )
+        : vectors;
+
+    final dirtyPostingPages = <NghPagePtr, NghPostingPage>{};
+    final dirtyNavBTreePages = <NghPagePtr, NghNavBTreePage>{};
+    ({NghPagePtr ptr, NghNavRootPage page})? dirtyNavRootPage;
+    // Mutation-local leaves (not TreeCache) so mid-insert puts cannot evict
+    // pages still being written. Flushed into posting TreeCache; search hot
+    // set is rebuilt via [rebuildPagedLeafCacheAfterInsert].
+    final insertLeaves = <NghPageId, NghPostingPage>{};
+
+    var state = await _getOrLoadBTreeState(table, indexUid, currentMeta);
+    if (state == null) {
+      // Cold-start training 64 Root Centroids (48-D)
+      const targetRoots = 64;
+      final numRoots = min(targetRoots, max(1, vectors.length));
+      final low48List = List<Float32List>.generate(
+        normalizedVectors.length,
+        (i) => _extractLow48(normalizedVectors[i]),
+      );
+      final rootSeeds = _kMeansInit48(
+        samples: low48List,
+        k: numRoots,
+        iterations: 6,
+      );
+
+      final (navPages, metaWithNav) = _partitionManager.allocatePagesBatchSync(
+        NghDataCategory.nav,
+        currentMeta,
+        1 + numRoots,
+      );
+      currentMeta = metaWithNav;
+
+      final rootPtr = navPages[0];
+      final rootPageId = NghPageId(rootPtr.partitionNo, rootPtr.pageNo);
+
+      final rootsList = <({
+        int rootId,
+        NghPageId firstInternalPage,
+        Float32List centroid48D
+      })>[];
+      for (int r = 0; r < numRoots; r++) {
+        final internalPtr = navPages[1 + r];
+        final internalPageId =
+            NghPageId(internalPtr.partitionNo, internalPtr.pageNo);
+        final c48 = rootSeeds[r];
+        rootsList.add((
+          rootId: r,
+          firstInternalPage: internalPageId,
+          centroid48D: c48,
+        ));
+        final internalPage = NghNavBTreePage(
+          rootCentroidId: r,
+          entries: [],
+        );
+        dirtyNavBTreePages[internalPtr] = internalPage;
+      }
+
+      final rootPage = NghNavRootPage(
+        lowDim: 48,
+        fullDim: currentMeta.dimensions,
+        roots: rootsList,
+      );
+      dirtyNavRootPage = (ptr: rootPtr, page: rootPage);
+
+      state = CentroidBTreeState(
+        numRootCentroids: numRoots,
+        rootPageId: rootPageId,
+        dimensions: currentMeta.dimensions,
+      );
+      for (int r = 0; r < numRoots; r++) {
+        final c = rootsList[r].centroid48D;
+        for (int d = 0; d < 48; d++) {
+          state.rootCentroids48Flat[r * 48 + d] = c[d];
+        }
+        final intPtr = navPages[1 + r];
+        final intPageId = NghPageId(intPtr.partitionNo, intPtr.pageNo);
+        state.internalChains[r] = [
+          (pageId: intPageId, page: dirtyNavBTreePages[intPtr]!)
+        ];
+      }
+      final view = Float32x4List.sublistView(state.rootCentroids48Flat);
+      for (int i = 0; i < state.rootCentroids48Simd.length; i++) {
+        state.rootCentroids48Simd[i] = view[i];
+      }
+      _btreeStates[_cacheKey(table.tableUid, indexUid)] = state;
+    }
+
+    final postingPageSize = _postingPageSize(currentMeta);
+    final maxSlotsPerPage = NghPageSizer.estimatePostingSlotsPerPage(
+      postingPageSize,
+      currentMeta.dimensions,
+    );
+
+    void insertSlotIntoLeaf(
+      int rootId,
+      CentroidBranchEntry branchEntry,
+      ({NghPageId pageId, NghNavBTreePage page}) ownerInternal,
+      NghPostingSlot newSlot,
+    ) {
+      final leafPageId = branchEntry.leafPageId;
+      final ptr = NghPagePtr(
+          NghDataCategory.posting, leafPageId.partitionNo, leafPageId.pageNo);
+      var leafPage = dirtyPostingPages[ptr] ??
+          insertLeaves[leafPageId] ??
+          _btreeLeafGet(table.tableUid, indexUid, leafPageId, touch: false);
+      leafPage ??= NghPostingPage(
+        centroidId: branchEntry.centroidId,
+        dimensions: currentMeta.dimensions,
+        slots: [],
+      );
+      insertLeaves[leafPageId] = leafPage;
+
+      final currentPayload = leafPage.estimatePayloadSize();
+      final newSlotBytes = 19 +
+          (newSlot.primaryKeyBytes?.length ?? newSlot.primaryKeyUtf8.length) +
+          currentMeta.dimensions;
+      final fitsInPhysicalPage =
+          (20 + currentPayload + newSlotBytes) <= (postingPageSize - 64);
+
+      if (leafPage.slots.length < maxSlotsPerPage && fitsInPhysicalPage) {
+        leafPage.slots.add(newSlot);
+        branchEntry.leafSlotCount = leafPage.slots.length;
+        branchEntry.centroid48D = _computeMean48(leafPage.slots);
+        branchEntry.centroid48DSimd =
+            Float32x4List.sublistView(branchEntry.centroid48D);
+
+        final ptr = NghPagePtr(
+            NghDataCategory.posting, leafPageId.partitionNo, leafPageId.pageNo);
+        dirtyPostingPages[ptr] = leafPage;
+        final ownerPtr = NghPagePtr(NghDataCategory.nav,
+            ownerInternal.pageId.partitionNo, ownerInternal.pageId.pageNo);
+        dirtyNavBTreePages[ownerPtr] = ownerInternal.page;
+      } else {
+        // 50/50 Balanced Geometric Hyperplane Split
+        leafPage.slots.add(newSlot);
+
+        final seedASimd =
+            leafPage.slots[0].getLow48DSimd(currentMeta.dimensions);
+        int bestBIdx = 1;
+        double minSimToA = 1e9;
+        for (int i = 1; i < leafPage.slots.length; i++) {
+          final sSimd = leafPage.slots[i].getLow48DSimd(currentMeta.dimensions);
+          final sim = innerProduct48(seedASimd, sSimd, 0);
+          if (sim < minSimToA) {
+            minSimToA = sim;
+            bestBIdx = i;
+          }
+        }
+        final seedBSimd =
+            leafPage.slots[bestBIdx].getLow48DSimd(currentMeta.dimensions);
+
+        final projScores = Float64List(leafPage.slots.length);
+        final projIndices = Int32List(leafPage.slots.length);
+        for (int i = 0; i < leafPage.slots.length; i++) {
+          final slot = leafPage.slots[i];
+          final sSimd = slot.getLow48DSimd(currentMeta.dimensions);
+          final simA = innerProduct48(seedASimd, sSimd, 0);
+          final simB = innerProduct48(seedBSimd, sSimd, 0);
+          projScores[i] = simA - simB;
+          projIndices[i] = i;
+        }
+
+        for (int i = 0; i < leafPage.slots.length; i++) {
+          int maxIdx = i;
+          for (int j = i + 1; j < leafPage.slots.length; j++) {
+            if (projScores[j] > projScores[maxIdx]) maxIdx = j;
+          }
+          final ts = projScores[i];
+          projScores[i] = projScores[maxIdx];
+          projScores[maxIdx] = ts;
+          final ti = projIndices[i];
+          projIndices[i] = projIndices[maxIdx];
+          projIndices[maxIdx] = ti;
+        }
+
+        final groupA = <NghPostingSlot>[];
+        final groupB = <NghPostingSlot>[];
+        final mid = leafPage.slots.length ~/ 2;
+        for (int i = 0; i < mid; i++) {
+          groupA.add(leafPage.slots[projIndices[i]]);
+        }
+        for (int i = mid; i < leafPage.slots.length; i++) {
+          groupB.add(leafPage.slots[projIndices[i]]);
+        }
+
+        leafPage.slots.clear();
+        leafPage.slots.addAll(groupA);
+        branchEntry.leafSlotCount = groupA.length;
+        branchEntry.centroid48D = _computeMean48(groupA);
+        branchEntry.centroid48DSimd =
+            Float32x4List.sublistView(branchEntry.centroid48D);
+
+        final ptrA = NghPagePtr(
+            NghDataCategory.posting, leafPageId.partitionNo, leafPageId.pageNo);
+        dirtyPostingPages[ptrA] = leafPage;
+        final ownerPtr = NghPagePtr(NghDataCategory.nav,
+            ownerInternal.pageId.partitionNo, ownerInternal.pageId.pageNo);
+        dirtyNavBTreePages[ownerPtr] = ownerInternal.page;
+
+        final (newPostingPtrs, nextPostingMeta) =
+            _partitionManager.allocatePagesBatchSync(
+          NghDataCategory.posting,
+          currentMeta,
+          1,
+        );
+        currentMeta = nextPostingMeta;
+        final newLeafPtr = newPostingPtrs.first;
+        final newLeafPageId =
+            NghPageId(newLeafPtr.partitionNo, newLeafPtr.pageNo);
+
+        final nextCentroidId = ++state!.nextCentroidId;
+        final newPostingPage = NghPostingPage(
+          centroidId: nextCentroidId,
+          dimensions: currentMeta.dimensions,
+          slots: groupB,
+        );
+        insertLeaves[newLeafPageId] = newPostingPage;
+        dirtyPostingPages[newLeafPtr] = newPostingPage;
+
+        final newCentroid48 = _computeMean48(groupB);
+        final newBranchEntry = CentroidBranchEntry(
+          centroidId: nextCentroidId,
+          leafPageId: newLeafPageId,
+          leafSlotCount: groupB.length,
+          centroid48D: newCentroid48,
+        );
+
+        final chain = state.internalChains[rootId]!;
+        final lastPageItem = chain.last;
+        if (lastPageItem.page.entries.length <
+            NghNavBTreePage.maxEntriesPerPage) {
+          lastPageItem.page.entries.add(newBranchEntry);
+          dirtyNavBTreePages[NghPagePtr(
+              NghDataCategory.nav,
+              lastPageItem.pageId.partitionNo,
+              lastPageItem.pageId.pageNo)] = lastPageItem.page;
+        } else {
+          final (navPtrs, nextNavMeta) =
+              _partitionManager.allocatePagesBatchSync(
+            NghDataCategory.nav,
+            currentMeta,
+            1,
+          );
+          currentMeta = nextNavMeta;
+          final newNavPtr = navPtrs.first;
+          final newNavPageId =
+              NghPageId(newNavPtr.partitionNo, newNavPtr.pageNo);
+
+          lastPageItem.page.nextInternalPage = newNavPageId;
+          dirtyNavBTreePages[NghPagePtr(
+              NghDataCategory.nav,
+              lastPageItem.pageId.partitionNo,
+              lastPageItem.pageId.pageNo)] = lastPageItem.page;
+
+          final newInternalPage = NghNavBTreePage(
+            rootCentroidId: rootId,
+            nextInternalPage: NghPageId.none,
+            entries: [newBranchEntry],
+          );
+          chain.add((pageId: newNavPageId, page: newInternalPage));
+          dirtyNavBTreePages[newNavPtr] = newInternalPage;
+        }
+      }
+    }
+
+    void insertIntoRoot(
+      int rootId,
+      NghPostingSlot newSlot,
+      Float32x4List qLowSimd,
+    ) {
+      var chain = state!.internalChains[rootId];
+      if (chain == null || chain.isEmpty) {
+        final (pPtrs, pMeta) = _partitionManager.allocatePagesBatchSync(
+          NghDataCategory.nav,
+          currentMeta,
+          1,
+        );
+        currentMeta = pMeta;
+        final pPtr = pPtrs.first;
+        final pId = NghPageId(pPtr.partitionNo, pPtr.pageNo);
+        final emptyP = NghNavBTreePage(rootCentroidId: rootId, entries: []);
+        chain = [(pageId: pId, page: emptyP)];
+        state.internalChains[rootId] = chain;
+        dirtyNavBTreePages[pPtr] = emptyP;
+      }
+
+      bool allEmpty = true;
+      for (final it in chain) {
+        if (it.page.entries.isNotEmpty) {
+          allEmpty = false;
+          break;
+        }
+      }
+
+      if (allEmpty) {
+        final (ptrs, nextM) = _partitionManager.allocatePagesBatchSync(
+          NghDataCategory.posting,
+          currentMeta,
+          1,
+        );
+        currentMeta = nextM;
+        final leafPtr = ptrs.first;
+        final leafPageId = NghPageId(leafPtr.partitionNo, leafPtr.pageNo);
+
+        final nextCentroidId = ++state.nextCentroidId;
+        final postingPage = NghPostingPage(
+          centroidId: nextCentroidId,
+          dimensions: currentMeta.dimensions,
+          slots: [newSlot],
+        );
+        insertLeaves[leafPageId] = postingPage;
+        dirtyPostingPages[leafPtr] = postingPage;
+
+        final newCentroid48 = Float32List.fromList(newSlot.low48D!);
+        final firstItem = chain.first;
+        firstItem.page.entries.add(CentroidBranchEntry(
+          centroidId: nextCentroidId,
+          leafPageId: leafPageId,
+          leafSlotCount: 1,
+          centroid48D: newCentroid48,
+        ));
+        dirtyNavBTreePages[NghPagePtr(
+            NghDataCategory.nav,
+            firstItem.pageId.partitionNo,
+            firstItem.pageId.pageNo)] = firstItem.page;
+        return;
+      }
+
+      CentroidBranchEntry? bestEntry;
+      ({NghPageId pageId, NghNavBTreePage page})? bestOwner;
+      double maxBranchScore = -1e9;
+      for (final it in chain) {
+        final p = it.page;
+        for (int i = 0; i < p.entries.length; i++) {
+          final entry = p.entries[i];
+          final s = innerProduct48(qLowSimd, entry.centroid48DSimd, 0);
+          if (s > maxBranchScore) {
+            maxBranchScore = s;
+            bestEntry = entry;
+            bestOwner = it;
+          }
+        }
+      }
+
+      insertSlotIntoLeaf(rootId, bestEntry!, bestOwner!, newSlot);
+    }
+
+    // Pre-warm / batch-hydrate cold leaf posting pages from disk
+    final neededLeafIds = <NghPageId>{};
+    for (int i = 0; i < vectors.length; i++) {
+      final fullVec = normalizedVectors[i];
+      final lowVec = _extractLow48(fullVec);
+      state.scratchQLow.setRange(0, 48, lowVec);
+      final qLowSimd = state.scratchQLowSimd;
+
+      int bestRoot0 = 0, bestRoot1 = 0;
+      double maxScore0 = -1e9, maxScore1 = -1e9;
+      for (int r = 0; r < state.numRootCentroids; r++) {
+        final s = innerProduct48(qLowSimd, state.rootCentroids48Simd, r * 12);
+        if (s > maxScore0) {
+          maxScore1 = maxScore0;
+          bestRoot1 = bestRoot0;
+          maxScore0 = s;
+          bestRoot0 = r;
+        } else if (s > maxScore1) {
+          maxScore1 = s;
+          bestRoot1 = r;
+        }
+      }
+
+      void probeChain(int rootId) {
+        final chain = state!.internalChains[rootId];
+        if (chain == null || chain.isEmpty) return;
+        CentroidBranchEntry? bestEntry;
+        double maxScore = -1e9;
+        for (final it in chain) {
+          for (final entry in it.page.entries) {
+            final s = innerProduct48(qLowSimd, entry.centroid48DSimd, 0);
+            if (s > maxScore) {
+              maxScore = s;
+              bestEntry = entry;
+            }
+          }
+        }
+        if (bestEntry != null) {
+          neededLeafIds.add(bestEntry.leafPageId);
+        }
+      }
+
+      probeChain(bestRoot0);
+      if (maxScore1 >= maxScore0 * 0.94) {
+        probeChain(bestRoot1);
+      }
+    }
+
+    await _hydrateBTreeLeaves(
+      table: table,
+      indexUid: indexUid,
+      meta: currentMeta,
+      leafIds: neededLeafIds,
+      insertScratch: insertLeaves,
+    );
+
+    // Globally unique nodeIds across flushes
+    final baseNodeId = currentMeta.nextNodeId;
+    for (int i = 0; i < vectors.length; i++) {
+      final fullVec = normalizedVectors[i];
+      final pk = primaryKeys[i];
+      final lowVec = _extractLow48(fullVec);
+
+      state.scratchQLow.setRange(0, 48, lowVec);
+      final qLowSimd = state.scratchQLowSimd;
+
+      final sq8 = ScalarQuantizer.quantize(fullVec);
+      final newSlot = NghPostingSlot(
+        nodeId: baseNodeId + i,
+        primaryKey: pk,
+        sq8Codes: sq8.codes,
+        offset: sq8.offset,
+        scale: sq8.scale,
+        squaredNorm: sq8.squaredNorm,
+        low48D: lowVec,
+      );
+
+      int bestRoot0 = 0, bestRoot1 = 0;
+      double maxScore0 = -1e9, maxScore1 = -1e9;
+      for (int r = 0; r < state.numRootCentroids; r++) {
+        final s = innerProduct48(qLowSimd, state.rootCentroids48Simd, r * 12);
+        if (s > maxScore0) {
+          maxScore1 = maxScore0;
+          bestRoot1 = bestRoot0;
+          maxScore0 = s;
+          bestRoot0 = r;
+        } else if (s > maxScore1) {
+          maxScore1 = s;
+          bestRoot1 = r;
+        }
+      }
+
+      insertIntoRoot(bestRoot0, newSlot, qLowSimd);
+      if (maxScore1 >= maxScore0 * 0.94) {
+        insertIntoRoot(bestRoot1, newSlot, qLowSimd);
+      }
+    }
+
+    // Populate exact PK Map locators
+    final pkBatch = NghPkMapBatch(meta: currentMeta);
+    final pkLocators = <String, List<NghPkLocator>>{};
+    for (final entry in dirtyPostingPages.entries) {
+      final ptr = entry.key;
+      final page = entry.value;
+      // Keep insert-hot pages searchable without a cold low48 rebuild.
+      page.ensureLow48Ready();
+      for (int s = 0; s < page.slots.length; s++) {
+        final slot = page.slots[s];
+        if (slot.isDeleted) continue;
+        pkLocators.putIfAbsent(slot.primaryKey, () => []).add(
+              NghPkLocator(
+                centroidId: page.centroidId,
+                partitionNo: ptr.partitionNo,
+                pageNo: ptr.pageNo,
+                slotIndex: s,
+              ),
+            );
+      }
+    }
+
+    final pkEntries = <NghPkMapWrite>[];
+    for (final e in pkLocators.entries) {
+      var locs = e.value;
+      if (locs.length > 2) locs = locs.sublist(0, 2);
+      pkEntries.add(NghPkMapWrite(
+        key: _pkMapKey(e.key),
+        locators: locs,
+      ));
+    }
+    pkEntries.sort((a, b) => MemComparableKey.compare(a.key, b.key));
+    await _pkMap.upsertSorted(
+      table: table,
+      indexUid: indexUid,
+      batch: pkBatch,
+      entries: pkEntries,
+      rewrittenIds: const {},
+    );
+    currentMeta = pkBatch.meta.copyWith(
+      centroidCount: state.numRootCentroids,
+      nextNodeId: baseNodeId + vectors.length,
+    );
+
+    return NghInsertResult(
+      meta: currentMeta,
+      dirtyPostingPages: dirtyPostingPages,
+      dirtyNavBTreePages: dirtyNavBTreePages,
+      dirtyNavRootPage: dirtyNavRootPage,
+      dirtyPkmapPages: pkBatch.dirty,
+      insertedCount: vectors.length,
+    );
+  }
+
+  /// Synchronous ANN when btree state + probed leaves are already resident.
+  /// Returns null when I/O / cold load is required (caller should [search]).
+  List<NghSearchResult>? searchHotSync({
+    required TableContext table,
+    required IndexUid indexUid,
+    required NghIndexMeta meta,
+    required Float32List query,
+    required int topK,
+    int? searchDepth,
+    double? distanceThreshold,
+    bool queryAlreadyNormalized = false,
+    Set<String>? pendingDeletePks,
+  }) {
+    if (meta.totalVectors == 0) return const [];
+    if (meta.layoutVersion < NghIndexMeta.layoutPaged) return null;
+    final cached = _btreeStates[_cacheKey(table.tableUid, indexUid)];
+    if (cached == null || cached.numRootCentroids <= 0) return null;
+    return _searchCentroidBTreeTryHot(
+      table: table,
+      indexUid: indexUid,
+      meta: meta,
+      state: cached,
+      query: query,
+      topK: topK,
+      searchDepth: searchDepth,
+      distanceThreshold: distanceThreshold,
+      queryAlreadyNormalized: queryAlreadyNormalized,
+      pendingDeletePks: pendingDeletePks,
+      allowHydrate: false,
+    ).sync;
+  }
+
   /// Perform ANN search on the NGH index.
   ///
   /// Steps:
@@ -1694,9 +3873,94 @@ class NghGraphEngine {
     double? distanceThreshold,
     bool queryAlreadyNormalized = false,
     Set<String>? pendingDeletePks,
-  }) async {
-    if (meta.totalVectors == 0) return const [];
+  }) {
+    if (meta.totalVectors == 0) {
+      return Future<List<NghSearchResult>>.value(const []);
+    }
 
+    if (meta.layoutVersion >= NghIndexMeta.layoutPaged) {
+      final key = _cacheKey(table.tableUid, indexUid);
+      final cached = _btreeStates[key];
+      if (cached != null && cached.numRootCentroids > 0) {
+        return _searchCentroidBTree(
+          table: table,
+          indexUid: indexUid,
+          meta: meta,
+          state: cached,
+          query: query,
+          topK: topK,
+          searchDepth: searchDepth,
+          distanceThreshold: distanceThreshold,
+          queryAlreadyNormalized: queryAlreadyNormalized,
+          pendingDeletePks: pendingDeletePks,
+        );
+      }
+      return _searchCentroidBTreeLoad(
+        table: table,
+        indexUid: indexUid,
+        meta: meta,
+        query: query,
+        topK: topK,
+        searchDepth: searchDepth,
+        distanceThreshold: distanceThreshold,
+        queryAlreadyNormalized: queryAlreadyNormalized,
+        pendingDeletePks: pendingDeletePks,
+      );
+    }
+
+    return _searchLegacyIvf(
+      table: table,
+      indexUid: indexUid,
+      meta: meta,
+      query: query,
+      topK: topK,
+      searchDepth: searchDepth,
+      distanceThreshold: distanceThreshold,
+      queryAlreadyNormalized: queryAlreadyNormalized,
+      pendingDeletePks: pendingDeletePks,
+    );
+  }
+
+  Future<List<NghSearchResult>> _searchCentroidBTreeLoad({
+    required TableContext table,
+    required IndexUid indexUid,
+    required NghIndexMeta meta,
+    required Float32List query,
+    required int topK,
+    int? searchDepth,
+    double? distanceThreshold,
+    bool queryAlreadyNormalized = false,
+    Set<String>? pendingDeletePks,
+  }) async {
+    final btreeState = await _getOrLoadBTreeState(table, indexUid, meta);
+    if (btreeState == null || btreeState.numRootCentroids <= 0) {
+      return const [];
+    }
+    return _searchCentroidBTree(
+      table: table,
+      indexUid: indexUid,
+      meta: meta,
+      state: btreeState,
+      query: query,
+      topK: topK,
+      searchDepth: searchDepth,
+      distanceThreshold: distanceThreshold,
+      queryAlreadyNormalized: queryAlreadyNormalized,
+      pendingDeletePks: pendingDeletePks,
+    );
+  }
+
+  Future<List<NghSearchResult>> _searchLegacyIvf({
+    required TableContext table,
+    required IndexUid indexUid,
+    required NghIndexMeta meta,
+    required Float32List query,
+    required int topK,
+    int? searchDepth,
+    double? distanceThreshold,
+    bool queryAlreadyNormalized = false,
+    Set<String>? pendingDeletePks,
+  }) async {
     final key = _cacheKey(table.tableUid, indexUid);
     final clusterMap = <int, List<_NghCompactSlot>>{};
 
@@ -2046,6 +4310,17 @@ class NghGraphEngine {
       );
     }
 
+    if (meta.layoutVersion >= NghIndexMeta.layoutPaged) {
+      return _insertBatchCentroidBTree(
+        table: table,
+        indexUid: indexUid,
+        meta: meta,
+        vectors: vectors,
+        primaryKeys: primaryKeys,
+        yieldBudgetMs: yieldBudgetMs,
+      );
+    }
+
     final dirtyPosting = <NghPagePtr, NghPostingPage>{};
     final localPostingCache = <int, NghPostingPage>{};
     var currentMeta = NghPageSizer.ensureIndexPageSizes(
@@ -2089,7 +4364,7 @@ class NghGraphEngine {
             ? -0.68
             : 0.65);
 
-    // Dynamic centroids: leaf K capped; format supports two-level IVF beyond this.
+    // Dynamic centroids: leaf K capped; format supports two-level hierarchical centroids beyond this.
     final int projectedN = currentMeta.totalVectors + vectors.length;
     final int targetK = min(
       _maxTargetK,
@@ -2101,7 +4376,7 @@ class NghGraphEngine {
     if (centroids.isEmpty) {
       final initialK = min(targetK, max(16, min(vectors.length, 64)));
       // Full-batch k-means++ on 10k×512×64 is several seconds; 1024 seeds
-      // give the same IVF skeleton and the insert loop still assigns all rows.
+      // give the same centroid skeleton and the insert loop still assigns all rows.
       final kmPool = _kMeansSample(normalizedVectors, 1024);
       final seeds = _kMeansInit(
         samples: kmPool,
@@ -2587,7 +4862,7 @@ class NghGraphEngine {
       nextNodeId: currentMeta.nextNodeId + vectors.length,
     );
 
-    // Step 6: Persist paged nav/pdir/pkmap sidecars (or migrate legacy blob).
+    // Step 6: Persist paged nav/pkmap partitions (or migrate legacy blob).
     final navGraphPage = NghNavGraphPage(
       dimensions: currentMeta.dimensions,
       centroids: centroids,
@@ -2653,7 +4928,7 @@ class NghGraphEngine {
     VectorDistanceMetric metric,
   ) {
     var cur = id;
-    for (var hop = 0; hop < _maxIvfDepth + 2; hop++) {
+    for (var hop = 0; hop < _maxTreeDepth + 2; hop++) {
       if (cur < 0 || cur >= centroids.length) return 0;
       final node = centroids[cur];
       if (!node.isCoarse) return cur;
@@ -2682,7 +4957,7 @@ class NghGraphEngine {
     return cur < 0 || cur >= centroids.length ? 0 : cur;
   }
 
-  int _nodeIvfDepth(List<NghNavCentroidNode> centroids, int id) {
+  int _nodeTreeDepth(List<NghNavCentroidNode> centroids, int id) {
     var d = 0;
     var cur = id;
     final seen = <int>{};
@@ -2815,7 +5090,6 @@ class NghGraphEngine {
   }) async {
     var currentMeta = meta;
     final dirtyNav = <NghPagePtr, NghNavCentroidPage>{};
-    final dirtyPdir = <NghPagePtr, NghPostingDirPage>{};
     var deleteLegacy = false;
 
     if (!currentMeta.isPagedLayout) {
@@ -2827,32 +5101,13 @@ class NghGraphEngine {
       );
       currentMeta = migrated.meta;
       dirtyNav.addAll(migrated.nav);
-      dirtyPdir.addAll(migrated.pdir);
       deleteLegacy = true;
       for (final c in centroids) {
         c.postingDirDirty = false;
       }
     } else {
       for (final c in centroids) {
-        if (!c.postingDirDirty || c.isCoarse) continue;
-        if (rewrittenIds.contains(c.centroidId) || c.postingDirRoot.isNone) {
-          currentMeta = await _partitionManager.rewritePostingDir(
-            table: table,
-            indexUid: indexUid,
-            meta: currentMeta,
-            centroid: c,
-            dirtyPdir: dirtyPdir,
-          );
-        } else {
-          currentMeta = await _partitionManager.appendPostingDir(
-            table: table,
-            indexUid: indexUid,
-            meta: currentMeta,
-            centroid: c,
-            newPages: newDirPages[c.centroidId] ?? const [],
-            dirtyPdir: dirtyPdir,
-          );
-        }
+        c.postingDirDirty = false;
       }
       final dirtyIds = <int>{
         ...touchedCentroidIds,
@@ -2930,7 +5185,6 @@ class NghGraphEngine {
       meta: currentMeta,
       dirtyPostingPages: dirtyPosting,
       dirtyNavPages: dirtyNav,
-      dirtyPdirPages: dirtyPdir,
       dirtyPkmapPages: pkBatch.dirty,
       deleteLegacyNavGraph: deleteLegacy,
       insertedCount: insertedCount,
@@ -3011,10 +5265,10 @@ class NghGraphEngine {
       final isOrphanTop = parentId < 0 ||
           parentId >= centroids.length ||
           !centroids[parentId].isCoarse;
-      final hubDepth = _nodeIvfDepth(centroids, hubId);
+      final hubDepth = _nodeTreeDepth(centroids, hubId);
       var makeCoarse = false;
       if (parentFull) {
-        if (hubDepth >= _maxIvfDepth) {
+        if (hubDepth >= _maxTreeDepth) {
           final before = centroids.length;
           final newCoarseId = _splitCoarseFanout(
             centroids: centroids,
@@ -3387,9 +5641,6 @@ class NghGraphEngine {
     required Map<NghPagePtr, NghPostingPage> dirtyPosting,
     required Map<int, NghPostingPage> localPostingCache,
   }) async {
-    if (!centroid.postingPageListReady && !centroid.postingDirRoot.isNone) {
-      await _partitionManager.hydratePostingDirs(table, indexUid, [centroid]);
-    }
     final live = <NghPostingSlot>[];
     final ids = centroid.postingPages.isNotEmpty
         ? List<NghPageId>.from(centroid.postingPages)
@@ -3479,7 +5730,6 @@ class NghGraphEngine {
       return NghDeleteResult(meta: meta, deletedCount: 0);
     }
 
-    final navGraph = await _getOrLoadNavGraph(table, indexUid, meta);
     var currentMeta = NghPageSizer.ensureIndexPageSizes(
       meta,
       _partitionManager.configuredPageSize,
@@ -3503,6 +5753,10 @@ class NghGraphEngine {
         loc.pageNo,
       );
     }
+
+    final NghNavGraphPage? navGraph = currentMeta.isPagedLayout
+        ? null
+        : await _getOrLoadNavGraph(table, indexUid, meta);
 
     for (final pk in primaryKeys) {
       if (pk.isEmpty) continue;
@@ -3579,7 +5833,6 @@ class NghGraphEngine {
 
     currentMeta = pkBatch.meta;
     var dirtyNav = <NghPagePtr, NghNavCentroidPage>{};
-    var dirtyPdir = <NghPagePtr, NghPostingDirPage>{};
     var deleteLegacy = false;
     if (navGraph != null && deleted > 0 && !currentMeta.isPagedLayout) {
       final migrated = await _partitionManager.migrateLegacyNavGraph(
@@ -3590,7 +5843,6 @@ class NghGraphEngine {
       );
       currentMeta = migrated.meta;
       dirtyNav = migrated.nav;
-      dirtyPdir = migrated.pdir;
       deleteLegacy = true;
     } else if (navGraph != null &&
         dirtyNavIds.isNotEmpty &&
@@ -3618,7 +5870,6 @@ class NghGraphEngine {
       meta: currentMeta,
       dirtyPostingPages: dirtyPosting,
       dirtyNavPages: dirtyNav,
-      dirtyPdirPages: dirtyPdir,
       dirtyPkmapPages: pkBatch.dirty,
       deleteLegacyNavGraph: deleteLegacy,
       deletedCount: deleted,
@@ -3636,6 +5887,11 @@ class NghGraphEngine {
     IndexUid indexUid, {
     NghIndexMeta? meta,
   }) {
+    if (meta != null && meta.layoutVersion >= NghIndexMeta.layoutPaged) {
+      final key = _cacheKey(table.tableUid, indexUid);
+      final btree = _btreeStates[key];
+      return btree != null && btree.numRootCentroids > 0;
+    }
     final cached = _navGraphCache.getPoint2(
       table.tableUid.value,
       indexUid.value,
@@ -3653,6 +5909,10 @@ class NghGraphEngine {
     NghIndexMeta? meta,
   }) async {
     if (isNavGraphCached(table, indexUid, meta: meta)) return;
+    if (meta != null && meta.layoutVersion >= NghIndexMeta.layoutPaged) {
+      await _getOrLoadBTreeState(table, indexUid, meta);
+      return;
+    }
     await _getOrLoadNavGraph(table, indexUid, meta);
   }
 
@@ -3800,7 +6060,31 @@ class NghGraphEngine {
     if (norm == 0) return v;
     final inv = 1.0 / sqrt(norm);
     final out = Float32List(len);
-    if (n > 0 && (v.offsetInBytes & 15) == 0) {
+    _scaleFloat32Into(v, out, inv);
+    return out;
+  }
+
+  /// Normalize [v] into preallocated [out] (search hot path — no alloc).
+  void _normalizeFloat32Into(Float32List v, Float32List out) {
+    final len = min(v.length, out.length);
+    double norm = 0;
+    for (int i = 0; i < len; i++) {
+      norm += v[i] * v[i];
+    }
+    if (norm == 0) {
+      for (int i = 0; i < len; i++) {
+        out[i] = v[i];
+      }
+      return;
+    }
+    _scaleFloat32Into(v, out, 1.0 / sqrt(norm));
+  }
+
+  @pragma('vm:prefer-inline')
+  void _scaleFloat32Into(Float32List v, Float32List out, double inv) {
+    final len = min(v.length, out.length);
+    final n = len >> 2;
+    if (n > 0 && (v.offsetInBytes & 15) == 0 && (out.offsetInBytes & 15) == 0) {
       final vv = Float32x4List.view(v.buffer, v.offsetInBytes, n);
       final ov = Float32x4List.view(out.buffer, out.offsetInBytes, n);
       final scale = Float32x4.splat(inv);
@@ -3815,7 +6099,6 @@ class NghGraphEngine {
         out[i] = v[i] * inv;
       }
     }
-    return out;
   }
 
   /// Fast synchronous Mini-Batch K-Means initialization on sample vectors (0 I/O, <8ms).
@@ -3954,7 +6237,6 @@ class NghGraphEngine {
       _partitionManager.configuredPageSize,
     );
     final dirtyPosting = <NghPagePtr, NghPostingPage>{};
-    final dirtyPdir = <NghPagePtr, NghPostingDirPage>{};
     final freed = <NghPagePtr>[];
     final dirtyNavIds = <int>{};
     final pkBatch = NghPkMapBatch(meta: currentMeta);
@@ -4051,13 +6333,6 @@ class NghGraphEngine {
       }
       if (dirChanged) {
         c.replacePostingPages(livePages);
-        currentMeta = await _partitionManager.rewritePostingDir(
-          table: table,
-          indexUid: indexUid,
-          meta: currentMeta,
-          centroid: c,
-          dirtyPdir: dirtyPdir,
-        );
         dirtyNavIds.add(c.centroidId);
       }
     }
@@ -4083,7 +6358,6 @@ class NghGraphEngine {
       meta: currentMeta,
       dirtyPostingPages: dirtyPosting,
       dirtyNavPages: dirtyNav,
-      dirtyPdirPages: dirtyPdir,
       dirtyPkmapPages: pkBatch.dirty,
       freePostingPages: freed,
       compactedCount: compacted,
@@ -4244,8 +6518,9 @@ class NghInsertResult {
   final NghIndexMeta meta;
   final Map<NghPagePtr, NghPostingPage> dirtyPostingPages;
   final Map<NghPagePtr, NghNavCentroidPage> dirtyNavPages;
-  final Map<NghPagePtr, NghPostingDirPage> dirtyPdirPages;
   final Map<NghPagePtr, NghPkMapDirtyPage> dirtyPkmapPages;
+  final Map<NghPagePtr, NghNavBTreePage> dirtyNavBTreePages;
+  final ({NghPagePtr ptr, NghNavRootPage page})? dirtyNavRootPage;
   final bool deleteLegacyNavGraph;
   final int insertedCount;
   final int tombstonedCount;
@@ -4259,8 +6534,9 @@ class NghInsertResult {
     required this.meta,
     this.dirtyPostingPages = const {},
     this.dirtyNavPages = const {},
-    this.dirtyPdirPages = const {},
     this.dirtyPkmapPages = const {},
+    this.dirtyNavBTreePages = const {},
+    this.dirtyNavRootPage,
     this.deleteLegacyNavGraph = false,
     required this.insertedCount,
     this.tombstonedCount = 0,
@@ -4273,8 +6549,9 @@ class NghDeleteResult {
   final NghIndexMeta meta;
   final Map<NghPagePtr, NghPostingPage> dirtyPostingPages;
   final Map<NghPagePtr, NghNavCentroidPage> dirtyNavPages;
-  final Map<NghPagePtr, NghPostingDirPage> dirtyPdirPages;
   final Map<NghPagePtr, NghPkMapDirtyPage> dirtyPkmapPages;
+  final Map<NghPagePtr, NghNavBTreePage> dirtyNavBTreePages;
+  final ({NghPagePtr ptr, NghNavRootPage page})? dirtyNavRootPage;
   final bool deleteLegacyNavGraph;
   final int deletedCount;
   final List<String> unresolvedPks;
@@ -4283,8 +6560,9 @@ class NghDeleteResult {
     required this.meta,
     this.dirtyPostingPages = const {},
     this.dirtyNavPages = const {},
-    this.dirtyPdirPages = const {},
     this.dirtyPkmapPages = const {},
+    this.dirtyNavBTreePages = const {},
+    this.dirtyNavRootPage,
     this.deleteLegacyNavGraph = false,
     required this.deletedCount,
     this.unresolvedPks = const [],
@@ -4296,7 +6574,6 @@ class NghCompactResult {
   final NghIndexMeta meta;
   final Map<NghPagePtr, NghPostingPage> dirtyPostingPages;
   final Map<NghPagePtr, NghNavCentroidPage> dirtyNavPages;
-  final Map<NghPagePtr, NghPostingDirPage> dirtyPdirPages;
   final Map<NghPagePtr, NghPkMapDirtyPage> dirtyPkmapPages;
   final List<NghPagePtr> freePostingPages;
   final int compactedCount;
@@ -4305,7 +6582,6 @@ class NghCompactResult {
     required this.meta,
     this.dirtyPostingPages = const {},
     this.dirtyNavPages = const {},
-    this.dirtyPdirPages = const {},
     this.dirtyPkmapPages = const {},
     this.freePostingPages = const [],
     required this.compactedCount,
@@ -4336,6 +6612,11 @@ class _FixedHeap {
   bool get isFull => _size >= capacity;
   int get length => _size;
   double get peekDist => _size > 0 ? _dists[0] : double.infinity;
+
+  @pragma('vm:prefer-inline')
+  void clear() {
+    _size = 0;
+  }
 
   void pushWithPk(int id, double dist, Uint8List? pkBytes) {
     if (_size < capacity) {

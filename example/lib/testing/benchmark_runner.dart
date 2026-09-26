@@ -777,29 +777,42 @@ class BenchmarkRunner {
         final datasetScale = math.min(scale, 10000);
         await _ensureDurableDataset(tableName, tier, datasetScale,
             durability: durability);
-        // Query sample count: enough for stable QPS without multi-minute stalls.
-        effectiveCount = math.min(datasetScale, 1000);
-        final random = math.Random(4242);
+        effectiveCount = math.min(
+          datasetScale,
+          BenchmarkSchemas.vectorSearchProbes,
+        );
+        final groups =
+            math.max(1, datasetScale ~/ ExampleVectorCorpus.groupSize);
+        // Prebuild query vectors outside the stopwatch — groupQuery allocates
+        // and normalizes; including it in the timed loop roughly halves QPS.
+        final queryVectors = List<VectorData>.generate(
+          effectiveCount,
+          (i) => ExampleVectorCorpus.groupQuery(
+            i % groups,
+            BenchmarkSchemas.vectorDimensions,
+          ),
+        );
+
+        _updateLastOperation('Warming [$tierName] Vector ANN Search '
+            '(${BenchmarkSchemas.vectorSearchWarmup} queries)...');
+        for (var i = 0; i < BenchmarkSchemas.vectorSearchWarmup; i++) {
+          await db.vectorSearch(
+            tableName,
+            fieldName: 'embedding',
+            queryVector: queryVectors[i % queryVectors.length],
+            topK: BenchmarkSchemas.vectorTopK,
+          );
+        }
 
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
               'Running [$tierName] Vector ANN Search ($round/$iterations)...');
-          final querySeeds = List.generate(
-            effectiveCount,
-            (_) => random.nextInt(datasetScale),
-          );
-
-          final groups =
-              math.max(1, datasetScale ~/ ExampleVectorCorpus.groupSize);
           final sw = Stopwatch()..start();
-          for (final seed in querySeeds) {
+          for (final q in queryVectors) {
             await db.vectorSearch(
               tableName,
               fieldName: 'embedding',
-              queryVector: ExampleVectorCorpus.groupQuery(
-                seed % groups,
-                BenchmarkSchemas.vectorDimensions,
-              ),
+              queryVector: q,
               topK: BenchmarkSchemas.vectorTopK,
             );
           }
@@ -814,32 +827,46 @@ class BenchmarkRunner {
         final hybridScale = math.min(scale, 10000);
         await _ensureDurableDataset(tableName, tier, hybridScale,
             durability: durability);
-        effectiveCount = math.min(hybridScale, 1000);
-        final random = math.Random(5252);
+        effectiveCount = math.min(
+          hybridScale,
+          BenchmarkSchemas.vectorSearchProbes,
+        );
+        final hybridQueries =
+            List<({int category, VectorData vector})>.generate(
+          effectiveCount,
+          (i) {
+            final index = (i % hybridScale) + 1;
+            final groupId = ExampleVectorCorpus.groupIdForIndex(index);
+            return (
+              category: groupId % 16,
+              vector: ExampleVectorCorpus.groupQuery(
+                groupId,
+                BenchmarkSchemas.vectorDimensions,
+              ),
+            );
+          },
+        );
+
+        _updateLastOperation('Warming [$tierName] Vector Hybrid Search '
+            '(${BenchmarkSchemas.vectorSearchWarmup} queries)...');
+        for (var i = 0; i < BenchmarkSchemas.vectorSearchWarmup; i++) {
+          final q = hybridQueries[i % hybridQueries.length];
+          await db
+              .query(tableName)
+              .where('category', '=', q.category)
+              .matchVector('embedding', q.vector)
+              .limit(BenchmarkSchemas.vectorTopK);
+        }
 
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
               'Running [$tierName] Vector Hybrid Search ($round/$iterations)...');
-          final querySeeds = List.generate(
-            effectiveCount,
-            (_) => random.nextInt(hybridScale),
-          );
-
           final sw = Stopwatch()..start();
-          for (final seed in querySeeds) {
-            final index = seed + 1;
-            final groupId = ExampleVectorCorpus.groupIdForIndex(index);
-            final category = groupId % 16;
+          for (final q in hybridQueries) {
             await db
                 .query(tableName)
-                .where('category', '=', category)
-                .matchVector(
-                  'embedding',
-                  ExampleVectorCorpus.groupQuery(
-                    groupId,
-                    BenchmarkSchemas.vectorDimensions,
-                  ),
-                )
+                .where('category', '=', q.category)
+                .matchVector('embedding', q.vector)
                 .limit(BenchmarkSchemas.vectorTopK);
           }
           sw.stop();
@@ -866,7 +893,7 @@ class BenchmarkRunner {
 
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
-              'Running [$tierName] Vector Recall@K ($round/$iterations)...');
+              'Running [$tierName] Recall @ default OP ($round/$iterations)...');
           final report = await VectorRecallHarness.evaluate(
             db: db,
             tableName: tableName,

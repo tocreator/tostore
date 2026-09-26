@@ -641,6 +641,93 @@ class QueryExecutor {
     }
 
     // =========================================================================
+    // VECTOR / HYBRID FAST PATH
+    // Bypass result-cache identity strings (would serialize Float32 query
+    // vectors via QueryCacheKey) and jump straight to ANN / hybrid retrieval.
+    // =========================================================================
+    final bool isVectorByFlags =
+        clauseFlags != -1 && (clauseFlags & QueryClauseMask.matchVector != 0);
+    final bool isVectorByCondition = !isVectorByFlags &&
+        clauseFlags == -1 &&
+        condition != null &&
+        condition.hasVectorMatch;
+    if (isVectorByFlags || isVectorByCondition) {
+      // Pure single-vector ANN: skip normalize/build/shape analysis.
+      if (promoteDesc == null &&
+          condition != null &&
+          (joins == null || joins.isEmpty) &&
+          (orderBy == null || orderBy.isEmpty) &&
+          !onlyCount &&
+          (aggregations == null || aggregations.isEmpty) &&
+          (groupBy == null || groupBy.isEmpty) &&
+          (cursor == null || cursor.isEmpty)) {
+        final pure = condition.tryExtractPureVectorMatch();
+        if (pure != null) {
+          return _executeSingleVectorRetrieval(
+            table,
+            spec: _VectorMatchSpec(
+              field: pure.field,
+              vector: pure.vector,
+              weight: pure.weight,
+              searchDepth: pure.searchDepth,
+              distanceThreshold: pure.distanceThreshold,
+              minScore: pure.minScore,
+            ),
+            effectiveLimit: limit ?? _dataStore.config.defaultQueryLimit,
+            effectiveOffset: offset ?? 0,
+            readFromFileOnly: readFromFileOnly,
+            promoteDesc: null,
+            applyPromoteResultTransform: applyPromoteResultTransform,
+            selectedFields: selectedFields,
+          );
+        }
+      }
+
+      var effectiveOrderBy = orderBy;
+      if (promoteDesc != null) {
+        if (condition != null && !condition.isEmpty) {
+          remapPromoteConditionNewToOld(condition, promoteDesc);
+        }
+        effectiveOrderBy = remapPromoteOrderByNewToOld(orderBy, promoteDesc);
+      }
+
+      final schemas = <String, TableSchema>{tableName: schema};
+      if (condition != null && !condition.isEmpty) {
+        if (joins != null && joins.isNotEmpty) {
+          for (final join in joins) {
+            final joinSchema =
+                await schemaMgr.getTableSchemaByName(TableName(join.table));
+            if (joinSchema != null) {
+              schemas[join.table] = joinSchema;
+            }
+          }
+        }
+        condition.normalize(schemas, tableName);
+      }
+
+      Map<String, dynamic>? where = condition?.build();
+      if (where != null &&
+          where.isNotEmpty &&
+          joins != null &&
+          joins.isNotEmpty) {
+        where = _prefixMainTableForJoinWhere(table, where);
+      }
+
+      return await _executeHybridRetrieval(
+        table,
+        condition: condition ?? QueryCondition(),
+        where: where ?? const {},
+        orderBy: effectiveOrderBy,
+        limit: limit,
+        offset: offset,
+        readFromFileOnly: readFromFileOnly,
+        promoteDesc: promoteDesc,
+        applyPromoteResultTransform: applyPromoteResultTransform,
+        selectedFields: selectedFields,
+      );
+    }
+
+    // =========================================================================
     // LEVEL 3: NON-POINT RESULT CACHE LOOKUP
     // Non-point queries check the hotspot result set cache.
     // =========================================================================
@@ -735,26 +822,6 @@ class QueryExecutor {
       // For JOIN queries, unprefixed fields are assumed to belong to the main table.
       // This preserves existing QueryBuilder behavior while centralizing planning here.
       where = _prefixMainTableForJoinWhere(table, where);
-    }
-
-    // Hybrid retrieval and vector multi-way recall interception (O(1) bitmask check)
-    final bool isVectorQuery = clauseFlags != -1
-        ? (clauseFlags & QueryClauseMask.matchVector != 0)
-        : _VectorMatchSpec.containsVector(where);
-
-    if (isVectorQuery) {
-      return await _executeHybridRetrieval(
-        table,
-        condition: condition ?? QueryCondition(),
-        where: where ?? const {},
-        orderBy: effectiveOrderBy,
-        limit: limit,
-        offset: offset,
-        readFromFileOnly: readFromFileOnly,
-        promoteDesc: promoteDesc,
-        applyPromoteResultTransform: applyPromoteResultTransform,
-        selectedFields: selectedFields,
-      );
     }
 
     // Plan Cache lookup by structural shape
@@ -4476,7 +4543,10 @@ class QueryExecutor {
       ]);
     }
 
-    final int candidateK = effectiveOffset + effectiveLimit + 1;
+    // Exact topK when offset==0 (same ANN cost as db.vectorSearch).
+    // With offset>0, fetch through the page end + 1 to probe hasMore.
+    final int need = effectiveOffset + effectiveLimit;
+    final int candidateK = effectiveOffset == 0 ? effectiveLimit : need + 1;
 
     final vecResults = await vectorIndexMgr.vectorSearch(
       table: table,
@@ -4504,9 +4574,14 @@ class QueryExecutor {
       candidates = candidates.where((r) => r.score >= spec.minScore!).toList();
     }
 
-    final bool hasMore = candidates.length > (effectiveOffset + effectiveLimit);
-    final int start = min(effectiveOffset, candidates.length);
-    final int end = min(candidates.length, effectiveOffset + effectiveLimit);
+    final bool hasMore = effectiveOffset == 0
+        ? candidates.length >= effectiveLimit
+        : candidates.length > need;
+    final int start =
+        effectiveOffset == 0 ? 0 : min(effectiveOffset, candidates.length);
+    final int end = effectiveOffset == 0
+        ? min(candidates.length, effectiveLimit)
+        : min(candidates.length, need);
     final pageCandidates = start == 0 && end == candidates.length
         ? candidates
         : candidates.sublist(start, end);
@@ -4516,6 +4591,7 @@ class QueryExecutor {
       if (selectedFields.length == 1 && selectedFields.first == pkField) {
         final records = <Map<String, dynamic>>[];
         final entries = <RetrievalEntry>[];
+        final fieldName = spec.field;
         for (final cand in pageCandidates) {
           records.add(<String, dynamic>{pkField: cand.primaryKey});
           entries.add(RetrievalEntry(
@@ -4524,7 +4600,7 @@ class QueryExecutor {
             rawScore: cand.distance,
             meta: {
               'distance': cand.distance,
-              'field': spec.field,
+              'field': fieldName,
             },
           ));
         }
@@ -4539,6 +4615,7 @@ class QueryExecutor {
           hasPrev: effectiveOffset > 0,
           count: records.length,
           executionTimeMs: stopwatch?.elapsedMilliseconds,
+          isProjected: true,
         );
       }
     }
@@ -4936,6 +5013,7 @@ class QueryExecutor {
           hasPrev: effectiveOffset > 0,
           count: records.length,
           executionTimeMs: stopwatch?.elapsedMilliseconds,
+          isProjected: true,
         );
       }
     }
@@ -5244,6 +5322,10 @@ class ExecuteResult {
   /// that bypassed full table scans, joins, aggregations, and query planners.
   final bool isPointDirect;
 
+  /// True when [records] already match the caller's select projection
+  /// (e.g. vector PK-only covering). Skip QueryBuilder select remapping.
+  final bool isProjected;
+
   const ExecuteResult({
     required this.records,
     this.retrieval,
@@ -5255,6 +5337,7 @@ class ExecuteResult {
     this.count,
     this.aggregateResult,
     this.isPointDirect = false,
+    this.isProjected = false,
   });
 
   const ExecuteResult.empty()
@@ -5267,7 +5350,8 @@ class ExecuteResult {
         executionTimeMs = null,
         count = null,
         aggregateResult = null,
-        isPointDirect = false;
+        isPointDirect = false,
+        isProjected = false;
 }
 
 enum _CursorMode {

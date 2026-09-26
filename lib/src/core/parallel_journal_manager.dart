@@ -2826,13 +2826,6 @@ class ParallelJournalManager {
                 _resolveRedoIndexUid(tableContext.schema, key.indexUid);
             path = _dataStore.pathManager.getNghNavPartitionPathByContext(
                 tableContext, indexUid, key.partitionNo);
-          } else if (key.kind == PageRedoTreeKind.nghPdir) {
-            final tableContext = await _tableContextFromUid(key.tableUid);
-            if (tableContext == null) continue;
-            final indexUid =
-                _resolveRedoIndexUid(tableContext.schema, key.indexUid);
-            path = _dataStore.pathManager.getNghPdirPartitionPathByContext(
-                tableContext, indexUid, key.partitionNo);
           } else {
             final tableContext = await _tableContextFromUid(key.tableUid);
             if (tableContext == null) continue;
@@ -2889,8 +2882,7 @@ class ParallelJournalManager {
               _dataStore.indexManager
                   ?.invalidateIndexMetaCache(key.tableUid, indexUid);
             } else if (key.kind == PageRedoTreeKind.ngh ||
-                key.kind == PageRedoTreeKind.nghNav ||
-                key.kind == PageRedoTreeKind.nghPdir) {
+                key.kind == PageRedoTreeKind.nghNav) {
               final indexUid =
                   _resolveRedoIndexUid(tableContext.schema, key.indexUid);
               _dataStore.vectorIndexManager
