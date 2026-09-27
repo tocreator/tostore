@@ -2046,6 +2046,19 @@ class DataStoreImpl {
         );
       }
 
+      // Memory mode: vector indexes never flush — apply into search caches.
+      // Skip open transactions (commit path applies via addBatchToBuffer).
+      if (_config?.persistenceMode == PersistenceMode.memory &&
+          (txId == null || TransactionContext.isApplyingCommit())) {
+        final vectorApply = tableDataManager.applyMemoryVectorIndexChanges(
+          table: table,
+          schema: schema,
+          operation: BufferOperationType.insert,
+          records: [orderedValidData],
+        );
+        if (vectorApply != null) await vectorApply;
+      }
+
       // Advance generator and maxId if user provided a manual primary key
       if (userProvidedPk &&
           schema.primaryKeyConfig.type == PrimaryKeyType.sequential) {
@@ -3441,6 +3454,19 @@ class DataStoreImpl {
               );
             }
 
+            if (_config?.persistenceMode == PersistenceMode.memory &&
+                (txId == null || TransactionContext.isApplyingCommit())) {
+              final vectorApply =
+                  tableDataManager.applyMemoryVectorIndexChanges(
+                table: table,
+                schema: schema,
+                operation: BufferOperationType.update,
+                records: [updatedRecord],
+                oldRecordsList: [oldRecordValues],
+              );
+              if (vectorApply != null) await vectorApply;
+            }
+
             final displayPk = promoteDesc != null
                 ? _promoteUserFacingSuccessKey(
                     updatedRecord,
@@ -4149,6 +4175,17 @@ class DataStoreImpl {
             walPointer,
             flushToStorage: effDurability == RecoveryDurability.durable,
           );
+        }
+
+        if (_config?.persistenceMode == PersistenceMode.memory &&
+            (txId == null || TransactionContext.isApplyingCommit())) {
+          final vectorApply = tableDataManager.applyMemoryVectorIndexChanges(
+            table: table,
+            schema: table.schema,
+            operation: BufferOperationType.delete,
+            records: [recordsToDelete.first],
+          );
+          if (vectorApply != null) await vectorApply;
         }
       } else {
         await tableDataManager.addToDeleteBuffer(

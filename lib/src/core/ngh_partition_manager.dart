@@ -1727,6 +1727,64 @@ final class NghPartitionManager {
     _postingPageCache.removePoint4(tableUid, indexUid, partitionNo, pageNo);
   }
 
+  /// Memory-mode / cache-only commit of dirty NGH pages (no disk I/O).
+  ///
+  /// Mirrors the in-memory residency side of [writeChanges] without staging,
+  /// redo, or partition file writes. Search-hot posting leaves should still be
+  /// promoted via [NghGraphEngine.promotePagedLeavesAfterInsertSync].
+  NghIndexMeta applyDirtyPagesToCache({
+    required TableContext table,
+    required IndexUid indexUid,
+    required NghIndexMeta meta,
+    Map<NghPagePtr, NghPostingPage> dirtyPostingPages = const {},
+    Map<NghPagePtr, NghNavCentroidPage> dirtyNavPages = const {},
+    Map<NghPagePtr, NghPkMapDirtyPage> dirtyPkmapPages = const {},
+    int vectorsDelta = 0,
+    int deletedDelta = 0,
+  }) {
+    final tableUid = table.tableUid;
+
+    for (final entry in dirtyPostingPages.entries) {
+      final ptr = entry.key;
+      _postingPageCache.putPoint4(
+        tableUid,
+        indexUid,
+        ptr.partitionNo,
+        ptr.pageNo,
+        entry.value,
+      );
+    }
+    for (final entry in dirtyNavPages.entries) {
+      final ptr = entry.key;
+      _navPageCache.putPoint4(
+        tableUid,
+        indexUid,
+        ptr.partitionNo,
+        ptr.pageNo,
+        entry.value,
+      );
+    }
+    for (final entry in dirtyPkmapPages.entries) {
+      final ptr = entry.key;
+      _pkmapPageCache.putPoint4(
+        tableUid,
+        indexUid,
+        ptr.partitionNo,
+        ptr.pageNo,
+        entry.value,
+      );
+    }
+
+    if (vectorsDelta == 0 && deletedDelta == 0) {
+      return meta;
+    }
+    return meta.copyWith(
+      totalVectors: max(0, meta.totalVectors + vectorsDelta),
+      deletedCount: max(0, meta.deletedCount + deletedDelta),
+      timestamps: meta.timestamps.copyWith(modified: DateTime.now()),
+    );
+  }
+
   /// Clear caches for a specific index.
   void clearPageCacheForIndex(TableUid tableUid, IndexUid indexUid) {
     _postingPageCache.remove([tableUid, indexUid]);

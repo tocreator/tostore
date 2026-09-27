@@ -834,10 +834,10 @@ class NghGraphEngine {
 
   /// Configure nav-graph cache ceiling (adaptive based on memory budget).
   void configureNavGraphCacheBudget(int maxBytes) {
-    _navGraphCacheMaxBytes = max(32 * 1024 * 1024, maxBytes);
+    _navGraphCacheMaxBytes = max(64 * 1024 * 1024, maxBytes);
     _navGraphCache.updateByteThreshold(
       max: _navGraphCacheMaxBytes,
-      min: max(16 * 1024 * 1024, _navGraphCacheMaxBytes ~/ 2),
+      min: max(32 * 1024 * 1024, _navGraphCacheMaxBytes ~/ 2),
     );
   }
 
@@ -855,19 +855,19 @@ class NghGraphEngine {
 
   /// Configure cluster-cache ceiling (vector quota from ResourceManager).
   void configureClusterCacheBudget(int maxBytes) {
-    _clusterCacheMaxBytes = max(4 * 1024 * 1024, maxBytes);
+    _clusterCacheMaxBytes = max(64 * 1024 * 1024, maxBytes);
     _clusterCache.updateByteThreshold(
       max: _clusterCacheMaxBytes,
-      min: max(4 * 1024 * 1024, _clusterCacheMaxBytes ~/ 2),
+      min: max(32 * 1024 * 1024, _clusterCacheMaxBytes ~/ 2),
     );
   }
 
   /// Configure paged ANN leaf-cache ceiling (same vector quota family).
   void configureBTreeLeafCacheBudget(int maxBytes) {
-    _btreeLeafCacheMaxBytes = max(16 * 1024 * 1024, maxBytes);
+    _btreeLeafCacheMaxBytes = max(64 * 1024 * 1024, maxBytes);
     _btreeLeafCache.updateByteThreshold(
       max: _btreeLeafCacheMaxBytes,
-      min: max(16 * 1024 * 1024, _btreeLeafCacheMaxBytes ~/ 2),
+      min: max(32 * 1024 * 1024, _btreeLeafCacheMaxBytes ~/ 2),
     );
   }
 
@@ -1481,6 +1481,36 @@ class NghGraphEngine {
   /// - Untouched leaves and live Centroid B+Tree state are kept as-is.
   /// - Matching posting I/O-fill entries for those dirty pages are dropped
   ///   (point removes) — no index-wide cache clear / disk rebuild.
+  /// Synchronous leaf-cache promote for memory mode (no disk, no JIT warmup).
+  void promotePagedLeavesAfterInsertSync({
+    required TableContext table,
+    required IndexUid indexUid,
+    required NghIndexMeta meta,
+    required Map<NghPagePtr, NghPostingPage> dirtyPostingPages,
+  }) {
+    if (meta.layoutVersion < NghIndexMeta.layoutPaged) return;
+    if (_btreeStates[_cacheKey(table.tableUid, indexUid)] == null) return;
+    if (dirtyPostingPages.isEmpty) return;
+
+    final tableUid = table.tableUid;
+    for (final e in dirtyPostingPages.entries) {
+      final ptr = e.key;
+      if (ptr.category != NghDataCategory.posting) continue;
+      if (ptr.isNull || ptr.pageNo <= 0) continue;
+
+      final shaped =
+          NghPostingPage.tryDecodePayload(e.value.encodePayload()) ?? e.value;
+      final pageId = NghPageId(ptr.partitionNo, ptr.pageNo);
+      _btreeLeafPut(tableUid, indexUid, pageId, shaped);
+      _partitionManager.evictPostingPage(
+        tableUid,
+        indexUid,
+        ptr.partitionNo,
+        ptr.pageNo,
+      );
+    }
+  }
+
   Future<void> promotePagedLeavesAfterInsert({
     required TableContext table,
     required IndexUid indexUid,

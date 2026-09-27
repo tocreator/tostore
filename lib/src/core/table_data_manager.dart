@@ -12,6 +12,7 @@ import '../model/buffer_entry.dart';
 import '../model/data_store_config.dart';
 import '../model/db_exception.dart';
 import '../model/id_generator.dart';
+import '../model/index_entry.dart';
 import '../model/meta_info.dart';
 import '../model/parallel_journal_entry.dart';
 import '../model/query_aggregation.dart';
@@ -33,6 +34,7 @@ import 'data_store_impl.dart';
 import 'resource_manager.dart';
 import 'transaction_context.dart';
 import 'tree_cache.dart';
+import 'vector_index_manager.dart';
 import 'weight_manager.dart';
 import 'yield_controller.dart';
 
@@ -383,7 +385,7 @@ class TableDataManager {
     }
   }
 
-  /// Cap for flush→hot-row promotion (benchmark / working-set retention).
+  /// Cap for flush hot-row promotion (benchmark / working-set retention).
   /// Beyond this, skip promote so hot cache is not flooded by every flush batch.
   static const int flushPromoteHotCacheBudgetBytes = 50 * 1024 * 1024;
 
@@ -1558,6 +1560,94 @@ class TableDataManager {
     return _getPartitionSizeLimit(table);
   }
 
+  /// Memory-mode vector index apply (cache-only, no [writeChanges]).
+  ///
+  /// Returns `null` when there is nothing to do so callers avoid async
+  /// microtask overhead on non-memory / non-vector hot paths. Gate order:
+  /// persistence mode ? manager presence ? [TableMetaManager.hasVectorIndexes].
+  Future<void>? applyMemoryVectorIndexChanges({
+    required TableContext table,
+    required TableSchema schema,
+    required BufferOperationType operation,
+    required List<Map<String, dynamic>> records,
+    List<Map<String, dynamic>?>? oldRecordsList,
+  }) {
+    if (records.isEmpty) return null;
+    if (_dataStore.config.persistenceMode != PersistenceMode.memory) {
+      return null;
+    }
+    final schemaMgr = _dataStore.tableMetaManager;
+    final vectorMgr = _dataStore.vectorIndexManager;
+    if (schemaMgr == null || vectorMgr == null) return null;
+    // O(1): non-vector tables pay only a cache lookup + isNotEmpty.
+    if (!schemaMgr.hasVectorIndexes(schema)) return null;
+
+    return _applyMemoryVectorIndexChangesBody(
+      table: table,
+      schema: schema,
+      operation: operation,
+      records: records,
+      oldRecordsList: oldRecordsList,
+      vectorMgr: vectorMgr,
+    );
+  }
+
+  Future<void> _applyMemoryVectorIndexChangesBody({
+    required TableContext table,
+    required TableSchema schema,
+    required BufferOperationType operation,
+    required List<Map<String, dynamic>> records,
+    List<Map<String, dynamic>?>? oldRecordsList,
+    required VectorIndexManager vectorMgr,
+  }) async {
+    try {
+      switch (operation) {
+        case BufferOperationType.insert:
+          await vectorMgr.applyMemoryChanges(
+            table: table,
+            inserts: records,
+            schemaOverride: schema,
+          );
+        case BufferOperationType.delete:
+          await vectorMgr.applyMemoryChanges(
+            table: table,
+            deletes: records,
+            schemaOverride: schema,
+          );
+        case BufferOperationType.update:
+          final pkName = schema.primaryKey;
+          final updates = <IndexRecordUpdate>[];
+          for (int i = 0; i < records.length; i++) {
+            final row = records[i];
+            final pk = row[pkName]?.toString();
+            if (pk == null || pk.isEmpty) continue;
+            final old = oldRecordsList != null && i < oldRecordsList.length
+                ? oldRecordsList[i]
+                : null;
+            updates.add(IndexRecordUpdate(
+              primaryKey: pk,
+              oldValues: old,
+              newValues: row,
+            ));
+          }
+          if (updates.isEmpty) return;
+          await vectorMgr.applyMemoryChanges(
+            table: table,
+            updates: updates,
+            schemaOverride: schema,
+          );
+        case BufferOperationType.rewrite:
+          // Memory mode does not emit rewrite ops for vector indexes.
+          return;
+      }
+    } catch (e) {
+      Logger.warn(
+        'Memory vector index apply failed: ${table.tableName}',
+        rawError: e,
+      );
+    }
+  }
+
   /// Add record to buffer
   Future<void> addToBuffer(
     TableContext table,
@@ -1678,6 +1768,15 @@ class TableDataManager {
           );
         }
       }
+      final vectorApply = applyMemoryVectorIndexChanges(
+        table: table,
+        schema: schema,
+        operation: finalOperation,
+        records: [data],
+        oldRecordsList: oldValues != null ? [oldValues] : null,
+      );
+      if (vectorApply != null) await vectorApply;
+      _dataStore.queryExecutor.invalidateQueryCacheForTable(table);
       return;
     }
 
@@ -1864,6 +1963,9 @@ class TableDataManager {
           );
         }
       }
+      // Same as file-mode path: bump query-result generation so pagination /
+      // list caches cannot serve pre-update rows.
+      _dataStore.queryExecutor.invalidateQueryCacheForTable(table);
       return const WalPointer(partitionIndex: -1, entrySeq: -1);
     }
 
@@ -2021,6 +2123,10 @@ class TableDataManager {
 
     // 2. Memory Mode Path: Direct cache writes (no WAL/IO)
     if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
+      final appliedRecords = <Map<String, dynamic>>[];
+      final appliedOldRecords = operation == BufferOperationType.update
+          ? <Map<String, dynamic>?>[]
+          : null;
       for (int i = 0; i < records.length; i++) {
         final r = records[i];
         final recordId = r[pkName]?.toString();
@@ -2078,6 +2184,10 @@ class TableDataManager {
             );
           }
           successIds.add(recordId);
+          appliedRecords.add(r);
+          if (appliedOldRecords != null) {
+            appliedOldRecords.add(oldR);
+          }
         } catch (e) {
           Logger.warn('Memory batch op failed: ${table.tableName} pk=$recordId',
               rawError: e);
@@ -2094,6 +2204,19 @@ class TableDataManager {
           }
           failedIds.add(recordId);
         }
+      }
+
+      final vectorApply = applyMemoryVectorIndexChanges(
+        table: table,
+        schema: schema,
+        operation: operation,
+        records: appliedRecords,
+        oldRecordsList: appliedOldRecords,
+      );
+      if (vectorApply != null) await vectorApply;
+
+      if (successIds.isNotEmpty && !deferQueryCacheInvalidation) {
+        _dataStore.queryExecutor.invalidateQueryCacheForTable(table);
       }
 
       return (successRecordIds: successIds, failedRecordIds: failedIds);
@@ -2167,7 +2290,7 @@ class TableDataManager {
 
     final int validCount = validBatchRecordIds.length;
     final List<String> recordIds = validBatchRecordIds;
-    // List.filled shares one sentinel then overwrite — avoids generate closure.
+    // List.filled shares one sentinel then overwrite avoids generating a closure.
     final sentinel = BufferEntry(
       data: const <String, dynamic>{},
       operation: operation,

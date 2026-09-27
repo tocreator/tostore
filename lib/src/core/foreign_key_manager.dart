@@ -3,6 +3,7 @@ import 'dart:math' as math;
 
 import '../handler/logger.dart';
 import '../interface/chain_builder.dart';
+import '../model/data_store_config.dart';
 import '../model/db_exception.dart';
 import '../model/db_result.dart';
 import '../model/foreign_key_operation.dart';
@@ -64,8 +65,8 @@ class ForeignKeyManager {
   /// Performance: O(m) where m is the number of foreign keys (typically much smaller
   /// than the number of tables), instead of O(n) where n is the number of tables.
   ///
-  /// Fallback: If the system table doesn't exist or is empty, falls back to
-  /// rebuilding from schemas and populating the system table.
+  /// Fallback: file mode treats an empty system table as "no FKs" (no schema
+  /// scan). Memory mode rebuilds from registered schemas instead.
   ///
   /// Note: This is called lazily on first access, not during database startup.
   /// This avoids unnecessary I/O during initialization when foreign key operations
@@ -101,12 +102,17 @@ class ForeignKeyManager {
       final loaded = await _loadCacheFromSystemTable();
 
       if (!loaded) {
-        // System table doesn't exist or is empty (first install / no foreign keys defined).
-        // Set empty map immediately without scanning table schemas, avoiding performance penalties
-        // in databases with thousands of tables.
-        _referencingTablesCache =
-            <TableUid, Map<TableUid, List<ForeignKeySchema>>>{};
-        _cacheNeedsRebuild = false;
+        // File mode: system table is the sole authority. Empty means "no FKs" —
+        // do NOT scan all schemas (O(n) on large DBs with thousands of tables).
+        // Memory mode: no system FK rows — lazily rebuild from registered schemas
+        // on first FK use (no open-time preload).
+        if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
+          await _rebuildCacheFromSchemas();
+        } else {
+          _referencingTablesCache =
+              <TableUid, Map<TableUid, List<ForeignKeySchema>>>{};
+          _cacheNeedsRebuild = false;
+        }
       }
     } catch (e) {
       Logger.error('Failed to load foreign key cache', rawError: e);
@@ -114,6 +120,41 @@ class ForeignKeyManager {
       // Cache will be retried on next access
       _cacheNeedsRebuild = true;
     }
+  }
+
+  /// Build reverse FK mapping from in-memory table schemas (no disk I/O).
+  ///
+  /// Lazy path for [PersistenceMode.memory] when `_system_fk_references` is empty.
+  Future<void> _rebuildCacheFromSchemas() async {
+    final schemaMgr = _dataStore.tableMetaManager;
+    final cache = <TableUid, Map<TableUid, List<ForeignKeySchema>>>{};
+    if (schemaMgr == null) {
+      _referencingTablesCache = cache;
+      _cacheNeedsRebuild = false;
+      return;
+    }
+
+    final tableNames = await schemaMgr.listAllTables(onlyUserTables: true);
+    for (final name in tableNames) {
+      final schema = await schemaMgr.getTableSchemaByName(TableName(name));
+      if (schema == null || schema.foreignKeys.isEmpty) continue;
+
+      final referencingUid = schema.tableUid;
+      if (referencingUid.isEmpty) continue;
+
+      for (final fk in schema.foreignKeys) {
+        if (!fk.enabled) continue;
+        final referencedUid = await _uidForName(fk.referencedTable);
+        if (referencedUid == null || referencedUid.isEmpty) continue;
+
+        final byChild = cache.putIfAbsent(
+            referencedUid, () => <TableUid, List<ForeignKeySchema>>{});
+        byChild.putIfAbsent(referencingUid, () => <ForeignKeySchema>[]).add(fk);
+      }
+    }
+
+    _referencingTablesCache = cache;
+    _cacheNeedsRebuild = false;
   }
 
   /// Load reverse mapping cache from system table

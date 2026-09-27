@@ -398,6 +398,208 @@ class VectorIndexManager {
   }
 
   // =====================================================================
+  // Memory mode -- cache-only apply (no writeChanges / no disk)
+  // =====================================================================
+
+  /// Apply vector mutations directly into search-resident caches.
+  ///
+  /// Pure memory mode never runs the flush pipeline, so [writeChanges] never
+  /// lands pages/meta. Callers must gate with
+  /// [TableMetaManager.hasVectorIndexes] before entering this branch.
+  Future<void> applyMemoryChanges({
+    required TableContext table,
+    List<Map<String, dynamic>> inserts = const [],
+    List<IndexRecordUpdate> updates = const [],
+    List<Map<String, dynamic>> deletes = const [],
+    TableSchema? schemaOverride,
+  }) async {
+    if (inserts.isEmpty && updates.isEmpty && deletes.isEmpty) return;
+
+    final schema = schemaOverride ?? table.schema;
+    final vectorIndexes =
+        _dataStore.tableMetaManager?.getVectorIndexesFor(schema) ??
+            const <IndexSchema>[];
+    if (vectorIndexes.isEmpty) return;
+
+    final pkName = schema.primaryKey;
+
+    for (final idx in vectorIndexes) {
+      final indexUid = idx.indexUid;
+      final fieldName = idx.fields.first;
+      FieldSchema? fieldSchema;
+      try {
+        fieldSchema = schema.fields.firstWhere((f) => f.name == fieldName);
+      } catch (_) {
+        continue;
+      }
+
+      var meta =
+          _getOrCreateMetaSync(table, indexUid, fieldName, fieldSchema, idx);
+
+      final insertRecords = <Map<String, dynamic>>[...inserts];
+      final deleteRecords = <Map<String, dynamic>>[...deletes];
+      for (final update in updates) {
+        final changed = update.changedFields;
+        final fieldChanged = changed == null ||
+            changed.contains(fieldName) ||
+            changed.contains(pkName);
+        if (!fieldChanged) continue;
+        final oldRow = <String, dynamic>{
+          ...?update.oldValues,
+          pkName: update.primaryKey,
+        };
+        deleteRecords.add(oldRow);
+        insertRecords.add({
+          ...update.newValues,
+          pkName: update.primaryKey,
+        });
+      }
+
+      if (deleteRecords.isNotEmpty) {
+        final deletePks = <String>[];
+        for (final row in deleteRecords) {
+          final pk = row[pkName]?.toString();
+          if (pk != null && pk.isNotEmpty) deletePks.add(pk);
+        }
+        if (deletePks.isNotEmpty) {
+          var liveMeta = _vectorCache.getMeta(table, indexUid) ?? meta;
+          final result = await _graphEngine.deleteBatch(
+            table: table,
+            indexUid: indexUid,
+            meta: liveMeta,
+            primaryKeys: deletePks,
+          );
+          meta = result.meta;
+          if (result.unresolvedPks.isNotEmpty) {
+            _mergePendingDeletesMemory(
+              table.tableUid,
+              indexUid,
+              result.unresolvedPks,
+            );
+          }
+          meta = _partitionManager.applyDirtyPagesToCache(
+            table: table,
+            indexUid: indexUid,
+            meta: meta,
+            dirtyPostingPages: result.dirtyPostingPages,
+            dirtyNavPages: result.dirtyNavPages,
+            dirtyPkmapPages: result.dirtyPkmapPages,
+            vectorsDelta: -result.deletedCount,
+            deletedDelta: result.deletedCount,
+          );
+          if (result.dirtyPostingPages.isNotEmpty) {
+            _graphEngine.promotePagedLeavesAfterInsertSync(
+              table: table,
+              indexUid: indexUid,
+              meta: meta,
+              dirtyPostingPages: result.dirtyPostingPages,
+            );
+          }
+          _vectorCache.putMeta(table, indexUid, meta);
+        }
+      }
+
+      if (insertRecords.isNotEmpty) {
+        final prepared = _prepareInsertVectorsBatch(
+          records: insertRecords,
+          fieldName: fieldName,
+          primaryKeyField: pkName,
+          dimensions: meta.dimensions,
+        );
+        if (prepared.vectors.isNotEmpty) {
+          var liveMeta = _vectorCache.getMeta(table, indexUid) ?? meta;
+          final insertResult = await _graphEngine.insertBatch(
+            table: table,
+            indexUid: indexUid,
+            meta: liveMeta,
+            vectors: prepared.vectors,
+            primaryKeys: prepared.primaryKeys,
+            yieldBudgetMs: 100,
+          );
+          meta = insertResult.meta;
+          meta = _partitionManager.applyDirtyPagesToCache(
+            table: table,
+            indexUid: indexUid,
+            meta: meta,
+            dirtyPostingPages: insertResult.dirtyPostingPages,
+            dirtyNavPages: insertResult.dirtyNavPages,
+            dirtyPkmapPages: insertResult.dirtyPkmapPages,
+            vectorsDelta: insertResult.insertedCount,
+          );
+          if (insertResult.dirtyPostingPages.isNotEmpty) {
+            _graphEngine.promotePagedLeavesAfterInsertSync(
+              table: table,
+              indexUid: indexUid,
+              meta: meta,
+              dirtyPostingPages: insertResult.dirtyPostingPages,
+            );
+          }
+          _removePendingDeletesMemory(
+            table.tableUid,
+            indexUid,
+            prepared.primaryKeys,
+          );
+          _vectorCache.putMeta(table, indexUid, meta);
+        }
+      }
+    }
+  }
+
+  /// Cache-only meta create for pure memory mode (never touches disk).
+  NghIndexMeta _getOrCreateMetaSync(
+    TableContext table,
+    IndexUid indexUid,
+    String fieldName,
+    FieldSchema fieldSchema,
+    IndexSchema idx,
+  ) {
+    var meta = _vectorCache.getMeta(table, indexUid);
+    if (meta != null) {
+      final sized = _withPageSizes(meta);
+      if (!identical(sized, meta)) {
+        _vectorCache.putMeta(table, indexUid, sized);
+      }
+      return sized;
+    }
+
+    final dims = fieldSchema.vectorConfig?.dimensions ?? 128;
+    final vc = idx.vectorConfig;
+    meta = _withPageSizes(NghIndexMeta.createEmpty(
+      indexUid: indexUid,
+      tableUid: table.tableUid,
+      dimensions: dims,
+      distanceMetric: vc?.distanceMetric ?? VectorDistanceMetric.cosine,
+    ));
+    _vectorCache.putMeta(table, indexUid, meta);
+    return meta;
+  }
+
+  void _mergePendingDeletesMemory(
+    TableUid tableUid,
+    IndexUid indexUid,
+    List<String> extra,
+  ) {
+    if (extra.isEmpty) return;
+    final cacheKey = _pendingKey(tableUid, indexUid);
+    final current = _pendingDeleteCache.putIfAbsent(cacheKey, () => <String>{});
+    current.addAll(extra);
+  }
+
+  void _removePendingDeletesMemory(
+    TableUid tableUid,
+    IndexUid indexUid,
+    List<String> pks,
+  ) {
+    if (pks.isEmpty) return;
+    final cacheKey = _pendingKey(tableUid, indexUid);
+    final current = _pendingDeleteCache[cacheKey];
+    if (current == null || current.isEmpty) return;
+    for (final pk in pks) {
+      current.remove(pk);
+    }
+  }
+
+  // =====================================================================
   // vectorSearch -- Public Search API
   // =====================================================================
 
