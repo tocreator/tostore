@@ -88,8 +88,10 @@ enum BenchmarkOperation {
   // Vector Operations (Vector tier only)
   vectorBatchInsert('Vector Batch Insert',
       'Bulk insert 128-d embeddings with NGH index maintenance'),
-  vectorSearch(
-      'Vector ANN Search', 'Nearest-neighbor search (primary key + score)'),
+  vectorSearchPeak('ANN @ depth 1 (~91%)',
+      'Peak-throughput ANN at searchDepth=1 (~91% recall) — industry-comparable OP'),
+  vectorSearch('ANN @ depth 50 (~95%)',
+      'Production-default ANN at searchDepth=50 (~95% recall intent)'),
   vectorHybridSearch(
       'Vector Hybrid Search', 'Filter plus vector search (full rows)'),
   vectorRecallCheck(
@@ -103,6 +105,7 @@ enum BenchmarkOperation {
 
   bool get isVectorOperation =>
       this == BenchmarkOperation.vectorBatchInsert ||
+      this == BenchmarkOperation.vectorSearchPeak ||
       this == BenchmarkOperation.vectorSearch ||
       this == BenchmarkOperation.vectorHybridSearch ||
       this == BenchmarkOperation.vectorRecallCheck;
@@ -148,6 +151,7 @@ enum BenchmarkOperation {
   /// Default ops when configuring a Vector-only suite.
   static const Set<BenchmarkOperation> defaultVectorOps = {
     BenchmarkOperation.vectorBatchInsert,
+    BenchmarkOperation.vectorSearchPeak,
     BenchmarkOperation.vectorSearch,
     BenchmarkOperation.vectorHybridSearch,
   };

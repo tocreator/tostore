@@ -7652,21 +7652,42 @@ class DataStoreImpl {
     int topK = 10,
     int? searchDepth,
     double? distanceThreshold,
-  }) async {
+  }) {
+    // Avoid `async` on the hot path — an async body always schedules a
+    // microtask even when table context + ANN are already resident.
     if (!_isInitialized) {
-      await ensureInitialized();
+      return ensureInitialized().then((_) => vectorSearch(
+            tableName,
+            fieldName: fieldName,
+            queryVector: queryVector,
+            topK: topK,
+            searchDepth: searchDepth,
+            distanceThreshold: distanceThreshold,
+          ));
     }
-    if (_vectorIndexManager == null) return const [];
-    final table =
-        getTableContextSync(tableName) ?? await getTableContext(tableName);
-    return _vectorIndexManager!.vectorSearch(
-      table: table,
-      fieldName: fieldName,
-      queryVector: queryVector,
-      topK: topK,
-      searchDepth: searchDepth,
-      distanceThreshold: distanceThreshold,
-    );
+    final mgr = _vectorIndexManager;
+    if (mgr == null) {
+      return Future<List<VectorSearchResult>>.value(const []);
+    }
+    final syncTable = getTableContextSync(tableName);
+    if (syncTable != null) {
+      return mgr.vectorSearch(
+        table: syncTable,
+        fieldName: fieldName,
+        queryVector: queryVector,
+        topK: topK,
+        searchDepth: searchDepth,
+        distanceThreshold: distanceThreshold,
+      );
+    }
+    return getTableContext(tableName).then((table) => mgr.vectorSearch(
+          table: table,
+          fieldName: fieldName,
+          queryVector: queryVector,
+          topK: topK,
+          searchDepth: searchDepth,
+          distanceThreshold: distanceThreshold,
+        ));
   }
 
   /// Pause encoding-key migration before tearing down space files / storage.

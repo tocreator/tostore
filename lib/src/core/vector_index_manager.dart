@@ -154,13 +154,13 @@ class VectorIndexManager {
     return resolved;
   }
 
-  Future<({List<Float32List> vectors, List<String> primaryKeys})>
+  ({List<Float32List> vectors, List<String> primaryKeys})
       _prepareInsertVectorsBatch({
     required List<Map<String, dynamic>> records,
     required String fieldName,
     required String primaryKeyField,
     required int dimensions,
-  }) async {
+  }) {
     if (records.isEmpty) {
       return (vectors: const <Float32List>[], primaryKeys: const <String>[]);
     }
@@ -311,7 +311,7 @@ class VectorIndexManager {
       }
 
       if (insertRecords.isNotEmpty) {
-        final preparedVectors = await _prepareInsertVectorsBatch(
+        final preparedVectors = _prepareInsertVectorsBatch(
           records: insertRecords,
           fieldName: fieldName,
           primaryKeyField: pkName,
@@ -347,15 +347,16 @@ class VectorIndexManager {
               batchContext: batchContext,
             );
             await _removePendingDeletes(table, indexUid, pks);
-            // Insert leaves an unbounded leafCache (all dirty pages). Rebuild to
-            // the same budgeted hot set as restart prewarm — otherwise post-insert
-            // QPS stays ~2× slower from GC / working-set bloat even on repeat queries.
+            // Incremental: reshape only this flush's dirty posting leaves into
+            // the search-hot leaf cache (no full-index clear/reload).
             if (meta.layoutVersion >= NghIndexMeta.layoutPaged) {
-              if (!_dataStore.shouldAbortBackgroundScan) {
-                await _graphEngine.rebuildPagedLeafCacheAfterInsert(
+              if (!_dataStore.shouldAbortBackgroundScan &&
+                  insertResult.dirtyPostingPages.isNotEmpty) {
+                await _graphEngine.promotePagedLeavesAfterInsert(
                   table: table,
                   indexUid: indexUid,
                   meta: meta,
+                  dirtyPostingPages: insertResult.dirtyPostingPages,
                   shouldAbort: () => _dataStore.shouldAbortBackgroundScan,
                 );
               }
@@ -493,6 +494,7 @@ class VectorIndexManager {
       if (hot.isEmpty) {
         return Future<List<VectorSearchResult>>.value(const []);
       }
+      final metric = meta.distanceMetric;
       final entries = <VectorSearchResult>[];
       for (final r in hot) {
         final pk = r.primaryKey;
@@ -500,7 +502,7 @@ class VectorIndexManager {
         entries.add(VectorSearchResult(
           primaryKey: pk,
           distance: r.distance,
-          score: _distanceToScore(r.distance, meta.distanceMetric),
+          score: _distanceToScore(r.distance, metric),
         ));
       }
       return Future<List<VectorSearchResult>>.value(entries);
@@ -1005,6 +1007,9 @@ class VectorIndexManager {
   void clearCacheForTable(TableUid tableUid) {
     final prefix = '${tableUid.value}/';
     _fieldIndexUidCache.removeWhere((k, _) => k.startsWith(prefix));
+    _pendingDeleteCache.removeWhere((k, _) => k.startsWith(prefix));
+    _metaLoadingFutures.removeWhere((k, _) => k.startsWith(prefix));
+    _navLayoutLocks.removeWhere((k, _) => k.startsWith(prefix));
     _vectorCache.clearForTable(tableUid);
     _partitionManager.clearPageCacheForTable(tableUid);
     _graphEngine.clearCacheForTable(tableUid);
@@ -1012,6 +1017,17 @@ class VectorIndexManager {
 
   /// Clear all caches for a specific index.
   void clearCacheForIndex(TableUid tableUid, IndexUid indexUid) {
+    final key = _pendingKey(tableUid, indexUid);
+    _pendingDeleteCache.remove(key);
+    _navLayoutLocks.remove(key);
+    final metaPrefix = '${tableUid.value}/';
+    _metaLoadingFutures.removeWhere(
+      (k, _) =>
+          k == key || (k.startsWith(metaPrefix) && k.contains(indexUid.value)),
+    );
+    _fieldIndexUidCache.removeWhere(
+      (k, v) => k.startsWith(metaPrefix) && v == indexUid,
+    );
     _vectorCache.clearForIndex(tableUid, indexUid);
     _partitionManager.clearFullyCachedForIndex(tableUid, indexUid);
     _partitionManager.clearPageCacheForIndex(tableUid, indexUid);

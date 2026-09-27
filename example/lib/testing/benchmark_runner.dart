@@ -36,6 +36,7 @@ class BenchmarkRunner {
     BenchmarkOperation.paginationHot,
     BenchmarkOperation.paginationRandom,
     BenchmarkOperation.count,
+    BenchmarkOperation.vectorSearchPeak,
     BenchmarkOperation.vectorSearch,
     BenchmarkOperation.vectorHybridSearch,
     BenchmarkOperation.vectorRecallCheck,
@@ -119,6 +120,7 @@ class BenchmarkRunner {
               op == BenchmarkOperation.paginationHot ||
               op == BenchmarkOperation.paginationRandom ||
               op == BenchmarkOperation.count ||
+              op == BenchmarkOperation.vectorSearchPeak ||
               op == BenchmarkOperation.vectorSearch ||
               op == BenchmarkOperation.vectorHybridSearch ||
               op == BenchmarkOperation.vectorRecallCheck;
@@ -772,8 +774,12 @@ class BenchmarkRunner {
         }
         break;
 
+      case BenchmarkOperation.vectorSearchPeak:
       case BenchmarkOperation.vectorSearch:
         if (tier != BenchmarkTier.vector) return null;
+        final searchDepth = op == BenchmarkOperation.vectorSearchPeak
+            ? 1
+            : VectorIndexConfig.defaultSearchDepth;
         final datasetScale = math.min(scale, 10000);
         await _ensureDurableDataset(tableName, tier, datasetScale,
             durability: durability);
@@ -793,7 +799,7 @@ class BenchmarkRunner {
           ),
         );
 
-        _updateLastOperation('Warming [$tierName] Vector ANN Search '
+        _updateLastOperation('Warming [$tierName] ${op.label} '
             '(${BenchmarkSchemas.vectorSearchWarmup} queries)...');
         for (var i = 0; i < BenchmarkSchemas.vectorSearchWarmup; i++) {
           await db.vectorSearch(
@@ -801,12 +807,13 @@ class BenchmarkRunner {
             fieldName: 'embedding',
             queryVector: queryVectors[i % queryVectors.length],
             topK: BenchmarkSchemas.vectorTopK,
+            searchDepth: searchDepth,
           );
         }
 
         for (var round = 1; round <= iterations; round++) {
           _updateLastOperation(
-              'Running [$tierName] Vector ANN Search ($round/$iterations)...');
+              'Running [$tierName] ${op.label} ($round/$iterations)...');
           final sw = Stopwatch()..start();
           for (final q in queryVectors) {
             await db.vectorSearch(
@@ -814,12 +821,14 @@ class BenchmarkRunner {
               fieldName: 'embedding',
               queryVector: q,
               topK: BenchmarkSchemas.vectorTopK,
+              searchDepth: searchDepth,
             );
           }
           sw.stop();
           roundMicroseconds.add(sw.elapsedMicroseconds);
           await Future.delayed(const Duration(milliseconds: 5));
         }
+        qualityNote = 'searchDepth=$searchDepth';
         break;
 
       case BenchmarkOperation.vectorHybridSearch:

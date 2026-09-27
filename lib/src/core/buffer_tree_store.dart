@@ -238,8 +238,8 @@ class BufferTreeStore {
     }
     // Prefer meta-manager cached lists when available (avoids getAllIndexes alloc).
     final meta = _dataStore.tableMetaManager;
-    final Iterable<IndexSchema> allIdx =
-        meta?.getAllIndexesFor(schema) ?? schema.getAllIndexes();
+    final Iterable<IndexSchema> allIdx = meta?.getBtreeIndexesFor(schema) ??
+        schema.getAllIndexes().where((i) => i.type != IndexType.vector);
     for (final idx in allIdx) {
       if (idx.fields.isEmpty) continue;
       if (!includeUniques && idx.unique) continue;

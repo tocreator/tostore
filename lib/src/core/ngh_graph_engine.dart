@@ -348,6 +348,10 @@ final class CentroidBTreeState {
   final Map<int, List<({NghPageId pageId, NghNavBTreePage page})>>
       internalChains;
 
+  /// Dense parallel of [internalChains] — O(1) L0/L1 lookup (no Map hash).
+  late final List<List<({NghPageId pageId, NghNavBTreePage page})>?>
+      chainsByRoot;
+
   NghPageId rootPageId;
   int nextCentroidId;
 
@@ -397,6 +401,31 @@ final class CentroidBTreeState {
     return false;
   }
 
+  /// Write [chain] into both the Map (mutation/compat) and dense [chainsByRoot].
+  @pragma('vm:prefer-inline')
+  void putRootChain(
+    int rootId,
+    List<({NghPageId pageId, NghNavBTreePage page})> chain,
+  ) {
+    internalChains[rootId] = chain;
+    if (rootId >= 0 && rootId < chainsByRoot.length) {
+      chainsByRoot[rootId] = chain;
+    }
+  }
+
+  /// Rebuild dense root→chain after bulk Map updates (nav load / rebuild).
+  void syncChainsByRoot() {
+    for (int i = 0; i < chainsByRoot.length; i++) {
+      chainsByRoot[i] = null;
+    }
+    for (final e in internalChains.entries) {
+      final id = e.key;
+      if (id >= 0 && id < chainsByRoot.length) {
+        chainsByRoot[id] = e.value;
+      }
+    }
+  }
+
   CentroidBTreeState({
     required this.numRootCentroids,
     required this.rootPageId,
@@ -405,6 +434,11 @@ final class CentroidBTreeState {
   })  : rootCentroids48Flat = Float32List(numRootCentroids * 48),
         rootCentroids48Simd = Float32x4List(numRootCentroids * 12),
         internalChains = {},
+        chainsByRoot =
+            List<List<({NghPageId pageId, NghNavBTreePage page})>?>.filled(
+          numRootCentroids,
+          null,
+        ),
         scratchQFull = Float32List(dimensions);
 }
 
@@ -1040,6 +1074,7 @@ class NghGraphEngine {
     _btreeLeafCache.remove([tableUid.value]);
     final prefix = '${tableUid.value}/';
     _navGraphInflight.removeWhere((k, _) => k.startsWith(prefix));
+    _clusterLoadInflight.removeWhere((k, _) => k.startsWith(prefix));
     _btreeStates.removeWhere((k, _) => k.startsWith(prefix));
   }
 
@@ -1050,6 +1085,7 @@ class NghGraphEngine {
     _btreeLeafClearForIndex(tableUid, indexUid);
     final key = _cacheKey(tableUid, indexUid);
     _navGraphInflight.remove(key);
+    _clusterLoadInflight.remove(key);
     _btreeStates.remove(key);
   }
 
@@ -1059,6 +1095,7 @@ class NghGraphEngine {
     _navGraphCache.clear();
     _btreeLeafCache.clear();
     _navGraphInflight.clear();
+    _clusterLoadInflight.clear();
     _btreeStates.clear();
   }
 
@@ -1437,30 +1474,89 @@ class NghGraphEngine {
     return max(0, clusterCacheBytes - beforeBytes);
   }
 
-  /// Rebuild the budgeted B+Tree leaf TreeCache after insert (startup-prewarm shape).
+  /// Incrementally promote flush-dirty posting leaves into the search-hot cache.
   ///
-  /// Dirty pages remain in the partition posting [TreeCache]. Clearing the leaf
-  /// working set then re-prewarming under [btreeLeafCacheMaxBytes] keeps the
-  /// hot set aligned with ResourceManager vector quotas.
-  Future<void> rebuildPagedLeafCacheAfterInsert({
+  /// True incremental (per flush, not per corpus):
+  /// - Only [dirtyPostingPages] are reshaped and upserted into [_btreeLeafCache].
+  /// - Untouched leaves and live Centroid B+Tree state are kept as-is.
+  /// - Matching posting I/O-fill entries for those dirty pages are dropped
+  ///   (point removes) — no index-wide cache clear / disk rebuild.
+  Future<void> promotePagedLeavesAfterInsert({
     required TableContext table,
     required IndexUid indexUid,
     required NghIndexMeta meta,
+    required Map<NghPagePtr, NghPostingPage> dirtyPostingPages,
     bool Function()? shouldAbort,
   }) async {
     if (meta.layoutVersion < NghIndexMeta.layoutPaged) return;
     if (_btreeStates[_cacheKey(table.tableUid, indexUid)] == null) return;
-    _btreeLeafClearForIndex(table.tableUid, indexUid);
-    if (shouldAbort?.call() ?? false) return;
-    await _prewarmBTreeLeaves(
-      table: table,
-      indexUid: indexUid,
-      meta: meta,
-      maxBytes: _btreeLeafCacheMaxBytes,
-      shouldAbort: shouldAbort,
+    if (dirtyPostingPages.isEmpty) return;
+
+    final beforeLeafBytes = _btreeLeafCache.estimatedTotalSizeBytes;
+    final tableUid = table.tableUid;
+    for (final e in dirtyPostingPages.entries) {
+      if (shouldAbort?.call() ?? false) return;
+      final ptr = e.key;
+      if (ptr.category != NghDataCategory.posting) continue;
+      if (ptr.isNull || ptr.pageNo <= 0) continue;
+
+      // In-memory wire reshape → search-fast slot/PK/low48 (same as prewarm).
+      final shaped =
+          NghPostingPage.tryDecodePayload(e.value.encodePayload()) ?? e.value;
+      final pageId = NghPageId(ptr.partitionNo, ptr.pageNo);
+      _btreeLeafPut(tableUid, indexUid, pageId, shaped);
+      // Drop duplicate residency in posting I/O fill for this page only.
+      _partitionManager.evictPostingPage(
+        tableUid,
+        indexUid,
+        ptr.partitionNo,
+        ptr.pageNo,
+      );
+    }
+
+    if (_btreeLeafCache.estimatedTotalSizeBytes > _btreeLeafCacheMaxBytes) {
+      await _btreeLeafCache.cleanup(removeRatio: 0.15);
+    }
+
+    // JIT warm only when this flush created the first resident leaves.
+    if (beforeLeafBytes <= 0 && !(shouldAbort?.call() ?? false)) {
+      await warmSearchPath(table: table, indexUid: indexUid, meta: meta);
+    }
+  }
+
+  /// Diagnostic: how many posting leaves are inventored vs resident in leaf cache.
+  ({int inventored, int cached, int leafCacheBytes, int leafCacheMaxBytes})
+      btreeLeafCacheCoverage(TableUid tableUid, IndexUid indexUid) {
+    final state = _btreeStates[_cacheKey(tableUid, indexUid)];
+    if (state == null) {
+      return (
+        inventored: 0,
+        cached: 0,
+        leafCacheBytes: _btreeLeafCache.estimatedTotalSizeBytes,
+        leafCacheMaxBytes: _btreeLeafCacheMaxBytes,
+      );
+    }
+    final seen = <int>{};
+    var inventored = 0;
+    var cached = 0;
+    for (final chain in state.internalChains.values) {
+      for (final it in chain) {
+        for (final e in it.page.entries) {
+          final id = e.leafPageId;
+          if (id.isNone || !seen.add(id.cacheKey)) continue;
+          inventored++;
+          if (_btreeLeafGet(tableUid, indexUid, id, touch: false) != null) {
+            cached++;
+          }
+        }
+      }
+    }
+    return (
+      inventored: inventored,
+      cached: cached,
+      leafCacheBytes: _btreeLeafCache.estimatedTotalSizeBytes,
+      leafCacheMaxBytes: _btreeLeafCacheMaxBytes,
     );
-    if (shouldAbort?.call() ?? false) return;
-    await warmSearchPath(table: table, indexUid: indexUid, meta: meta);
   }
 
   /// Prefetch posting leaves into [_btreeLeafCache] under [maxBytes].
@@ -1583,11 +1679,14 @@ class NghGraphEngine {
     required List<NghPageId> missing,
     Map<NghPageId, NghPostingPage>? insertScratch,
   }) async {
+    // Keep search-hot leaves in [_btreeLeafCache] only — do not also park them
+    // in the posting I/O fill cache (double residency → GC / quota thrash).
     final loaded = await _partitionManager.readPostingPagesByIds(
       table,
       indexUid,
       meta,
       missing,
+      populatePageCache: false,
     );
     for (final item in loaded) {
       if (insertScratch != null) {
@@ -1608,19 +1707,40 @@ class NghGraphEngine {
     if (meta.totalVectors <= 0 || meta.dimensions <= 0) return;
     final dims = meta.dimensions;
     final q = Float32List(dims);
-    final inv = 1.0 / sqrt(dims);
-    for (var i = 0; i < dims; i++) {
-      q[i] = inv;
+    // A few distinct unit probes so Tier-2 JIT sees the real ranking loops
+    // (matches tool/test_centroid_btree_engine warmup intent, but cheap).
+    const probes = 8;
+    for (var p = 0; p < probes; p++) {
+      final inv = 1.0 / sqrt(dims.toDouble());
+      final phase = (p * 17) % dims;
+      for (var i = 0; i < dims; i++) {
+        q[i] = ((i + phase) % 3 == 0) ? inv : -inv * 0.5;
+      }
+      // Renormalize for cosine.
+      if (meta.distanceMetric == VectorDistanceMetric.cosine) {
+        var nSq = 0.0;
+        for (var i = 0; i < dims; i++) {
+          nSq += q[i] * q[i];
+        }
+        final n = sqrt(nSq);
+        if (n > 0) {
+          final s = 1.0 / n;
+          for (var i = 0; i < dims; i++) {
+            q[i] *= s;
+          }
+        }
+      }
+      await search(
+        table: table,
+        indexUid: indexUid,
+        meta: meta,
+        query: q,
+        topK: 10,
+        searchDepth: 1,
+        queryAlreadyNormalized:
+            meta.distanceMetric == VectorDistanceMetric.cosine,
+      );
     }
-    await search(
-      table: table,
-      indexUid: indexUid,
-      meta: meta,
-      query: q,
-      topK: 10,
-      queryAlreadyNormalized:
-          meta.distanceMetric == VectorDistanceMetric.cosine,
-    );
   }
 
   // =====================================================================
@@ -2191,8 +2311,37 @@ class NghGraphEngine {
   /// Write normalized low-48 into [out] (no allocation — search hot path).
   @pragma('vm:prefer-inline')
   static void _extractLow48Into(Float32List full, Float32List out) {
-    double norm = 0.0;
     final limit = min(48, full.length);
+    if (limit == 48 &&
+        (full.offsetInBytes & 15) == 0 &&
+        (out.offsetInBytes & 15) == 0) {
+      final src = Float32x4List.view(full.buffer, full.offsetInBytes, 12);
+      final dst = Float32x4List.view(out.buffer, out.offsetInBytes, 12);
+      var sum0 = Float32x4.zero();
+      var sum1 = Float32x4.zero();
+      var sum2 = Float32x4.zero();
+      for (int i = 0; i < 12; i += 3) {
+        final a = src[i];
+        final b = src[i + 1];
+        final c = src[i + 2];
+        dst[i] = a;
+        dst[i + 1] = b;
+        dst[i + 2] = c;
+        sum0 += a * a;
+        sum1 += b * b;
+        sum2 += c * c;
+      }
+      final sum = (sum0 + sum1) + sum2;
+      final normSq = sum.x + sum.y + sum.z + sum.w;
+      if (normSq > 0) {
+        final inv = Float32x4.splat(1.0 / sqrt(normSq));
+        for (int i = 0; i < 12; i++) {
+          dst[i] = dst[i] * inv;
+        }
+      }
+      return;
+    }
+    double norm = 0.0;
     for (int d = 0; d < limit; d++) {
       out[d] = full[d];
       norm += full[d] * full[d];
@@ -2353,7 +2502,7 @@ class NghGraphEngine {
           ),
         ));
       }
-      state.internalChains[r.rootId] = chain;
+      state.putRootChain(r.rootId, chain);
     }
     state.nextCentroidId = maxCentroidId;
 
@@ -2547,24 +2696,55 @@ class NghGraphEngine {
 
     _extractLow48Into(searchQuery, state.scratchQLow);
     final qLowSimd = state.scratchQLowSimd;
-    double qFullSum = 0.0;
-    int qd = 0;
+    // SIMD sum of query (matches tool/test_centroid_btree_engine.dart).
+    double qFullSum;
     final dim = meta.dimensions;
-    final unroll16Sum = dim - 15;
-    while (qd < unroll16Sum) {
-      qFullSum += (searchQuery[qd] + searchQuery[qd + 1]) +
-          (searchQuery[qd + 2] + searchQuery[qd + 3]) +
-          (searchQuery[qd + 4] + searchQuery[qd + 5]) +
-          (searchQuery[qd + 6] + searchQuery[qd + 7]) +
-          (searchQuery[qd + 8] + searchQuery[qd + 9]) +
-          (searchQuery[qd + 10] + searchQuery[qd + 11]) +
-          (searchQuery[qd + 12] + searchQuery[qd + 13]) +
-          (searchQuery[qd + 14] + searchQuery[qd + 15]);
-      qd += 16;
-    }
-    while (qd < dim) {
-      qFullSum += searchQuery[qd];
-      qd++;
+    final qFullAligned = (searchQuery.offsetInBytes & 15) == 0;
+    if (qFullAligned && dim >= 16) {
+      final n4 = dim >> 2;
+      final qSimd =
+          Float32x4List.view(searchQuery.buffer, searchQuery.offsetInBytes, n4);
+      var sum0 = Float32x4.zero();
+      var sum1 = Float32x4.zero();
+      var sum2 = Float32x4.zero();
+      var sum3 = Float32x4.zero();
+      int i = 0;
+      final unroll = n4 - 3;
+      while (i < unroll) {
+        sum0 += qSimd[i];
+        sum1 += qSimd[i + 1];
+        sum2 += qSimd[i + 2];
+        sum3 += qSimd[i + 3];
+        i += 4;
+      }
+      while (i < n4) {
+        sum0 += qSimd[i];
+        i++;
+      }
+      final sumAll = (sum0 + sum1) + (sum2 + sum3);
+      qFullSum = sumAll.x + sumAll.y + sumAll.z + sumAll.w;
+      for (int d = n4 << 2; d < dim; d++) {
+        qFullSum += searchQuery[d];
+      }
+    } else {
+      qFullSum = 0.0;
+      int qd = 0;
+      final unroll16Sum = dim - 15;
+      while (qd < unroll16Sum) {
+        qFullSum += (searchQuery[qd] + searchQuery[qd + 1]) +
+            (searchQuery[qd + 2] + searchQuery[qd + 3]) +
+            (searchQuery[qd + 4] + searchQuery[qd + 5]) +
+            (searchQuery[qd + 6] + searchQuery[qd + 7]) +
+            (searchQuery[qd + 8] + searchQuery[qd + 9]) +
+            (searchQuery[qd + 10] + searchQuery[qd + 11]) +
+            (searchQuery[qd + 12] + searchQuery[qd + 13]) +
+            (searchQuery[qd + 14] + searchQuery[qd + 15]);
+        qd += 16;
+      }
+      while (qd < dim) {
+        qFullSum += searchQuery[qd];
+        qd++;
+      }
     }
 
     state.nextQueryStamp();
@@ -2590,28 +2770,19 @@ class NghGraphEngine {
       searchDepth: searchDepth,
     );
 
-    // 1. Level 0: Top-R root selection (register track when R≤4 — matches
-    // tool/test_centroid_btree_engine.dart hot path).
+    // 1. Level 0: score every root (test-tool hot path). Empty roots are
+    // cheap to score and skipped at L1 — avoid Map + nested emptiness scans.
     final numRoots = state.numRootCentroids;
     final wantRoots = plan.wantRoots;
+    final rootSimd = state.rootCentroids48Simd;
+    final chainsByRoot = state.chainsByRoot;
     int rootsToProbe = 0;
 
-    if (wantRoots <= 4) {
-      int r0 = 0, r1 = 0, r2 = 0, r3 = 0;
-      double s0 = -1e9, s1 = -1e9, s2 = -1e9, s3 = -1e9;
-      var nValid = 0;
+    if (wantRoots <= 6) {
+      // Register-track top-R (R≤6 covers depth≤70 default plan).
+      int r0 = 0, r1 = 0, r2 = 0, r3 = 0, r4 = 0, r5 = 0;
+      double s0 = -1e9, s1 = -1e9, s2 = -1e9, s3 = -1e9, s4 = -1e9, s5 = -1e9;
       for (int i = 0; i < numRoots; i++) {
-        final chain = state.internalChains[i];
-        if (chain == null || chain.isEmpty) continue;
-        var hasEntries = false;
-        for (int c = 0; c < chain.length; c++) {
-          if (chain[c].page.entries.isNotEmpty) {
-            hasEntries = true;
-            break;
-          }
-        }
-        if (!hasEntries) continue;
-        nValid++;
         final s = innerProduct48Reg(
           q0,
           q1,
@@ -2625,10 +2796,14 @@ class NghGraphEngine {
           q9,
           q10,
           q11,
-          state.rootCentroids48Simd,
+          rootSimd,
           i * 12,
         );
         if (s > s0) {
+          s5 = s4;
+          r5 = r4;
+          s4 = s3;
+          r4 = r3;
           s3 = s2;
           r3 = r2;
           s2 = s1;
@@ -2638,6 +2813,10 @@ class NghGraphEngine {
           s0 = s;
           r0 = i;
         } else if (s > s1) {
+          s5 = s4;
+          r5 = r4;
+          s4 = s3;
+          r4 = r3;
           s3 = s2;
           r3 = r2;
           s2 = s1;
@@ -2645,36 +2824,42 @@ class NghGraphEngine {
           s1 = s;
           r1 = i;
         } else if (s > s2) {
+          s5 = s4;
+          r5 = r4;
+          s4 = s3;
+          r4 = r3;
           s3 = s2;
           r3 = r2;
           s2 = s;
           r2 = i;
         } else if (s > s3) {
+          s5 = s4;
+          r5 = r4;
+          s4 = s3;
+          r4 = r3;
           s3 = s;
           r3 = i;
+        } else if (s > s4) {
+          s5 = s4;
+          r5 = r4;
+          s4 = s;
+          r4 = i;
+        } else if (s > s5) {
+          s5 = s;
+          r5 = i;
         }
       }
-      rootsToProbe = min(wantRoots, nValid);
+      rootsToProbe = min(wantRoots, numRoots);
       if (rootsToProbe > 0) state.probedRoots[0] = r0;
       if (rootsToProbe > 1) state.probedRoots[1] = r1;
       if (rootsToProbe > 2) state.probedRoots[2] = r2;
       if (rootsToProbe > 3) state.probedRoots[3] = r3;
+      if (rootsToProbe > 4) state.probedRoots[4] = r4;
+      if (rootsToProbe > 5) state.probedRoots[5] = r5;
     } else {
-      int validRoots = 0;
       final maxTrack = min(numRoots, state.rootScores.length);
-      for (int i = 0; i < numRoots && validRoots < maxTrack; i++) {
-        final chain = state.internalChains[i];
-        if (chain == null || chain.isEmpty) continue;
-        var hasEntries = false;
-        for (int c = 0; c < chain.length; c++) {
-          if (chain[c].page.entries.isNotEmpty) {
-            hasEntries = true;
-            break;
-          }
-        }
-        if (!hasEntries) continue;
-
-        state.rootScores[validRoots] = innerProduct48Reg(
+      for (int i = 0; i < maxTrack; i++) {
+        state.rootScores[i] = innerProduct48Reg(
           q0,
           q1,
           q2,
@@ -2687,13 +2872,12 @@ class NghGraphEngine {
           q9,
           q10,
           q11,
-          state.rootCentroids48Simd,
+          rootSimd,
           i * 12,
         );
-        state.rootIndices[validRoots] = i;
-        validRoots++;
+        state.rootIndices[i] = i;
       }
-
+      final validRoots = maxTrack;
       rootsToProbe = min(wantRoots, validRoots);
       for (int i = 0; i < rootsToProbe; i++) {
         var bestIdx = i;
@@ -2716,12 +2900,14 @@ class NghGraphEngine {
       }
     }
 
-    // 2. Level 1: Streaming min-heap branch selection
+    // 2. Level 1: Streaming min-heap branch selection (dense chain lookup)
     final maxLeavesToRead = min(plan.wantLeaves, state.pickedLeaves.length);
     state.branchHeap.reset(maxLeavesToRead);
     for (int r = 0; r < rootsToProbe; r++) {
       final rootId = state.probedRoots[r];
-      final chain = state.internalChains[rootId];
+      final chain = (rootId >= 0 && rootId < chainsByRoot.length)
+          ? chainsByRoot[rootId]
+          : null;
       if (chain == null || chain.isEmpty) continue;
       for (int c = 0; c < chain.length; c++) {
         final entries = chain[c].page.entries;
@@ -2930,6 +3116,8 @@ class NghGraphEngine {
     Set<String>? pendingDeletePks,
   }) {
     state.slotHeap.reset(planCandSlots);
+    final stampCheck = state.visitedTag;
+    final stamp = state.currentStamp;
     for (int l = 0; l < leavesToPick; l++) {
       final leafPage = state.pickedLeafPages[l];
       if (leafPage == null) continue;
@@ -2938,10 +3126,39 @@ class NghGraphEngine {
       for (int i = 0; i < slots.length; i++) {
         final slot = slots[i];
         if ((slot.flags & 0x01) != 0) continue;
-        if (state.isVisited(slot.nodeId)) continue;
+        final nodeId = slot.nodeId;
+        if (nodeId < stampCheck.length) {
+          if (stampCheck[nodeId] == stamp) continue;
+          stampCheck[nodeId] = stamp;
+        }
 
-        // Prefer already-materialized 48-D (prewarm / hydrate); avoid rebuild.
-        final sSimd = slot.low48DSimd ?? slot.getLow48DSimd(dimensions);
+        // Pages in leaf cache call ensureLow48Ready — prefer direct SIMD.
+        final sSimd = slot.low48DSimd;
+        if (sSimd == null) {
+          final built = slot.getLow48DSimd(dimensions);
+          final s48 = innerProduct48Reg(
+            q0,
+            q1,
+            q2,
+            q3,
+            q4,
+            q5,
+            q6,
+            q7,
+            q8,
+            q9,
+            q10,
+            q11,
+            built,
+            0,
+          );
+          if (state.slotHeap.size >= state.slotHeap.capacity &&
+              s48 <= state.slotHeap.minScore) {
+            continue;
+          }
+          state.slotHeap.push(slot, s48);
+          continue;
+        }
         final s48 = innerProduct48Reg(
           q0,
           q1,
@@ -2976,10 +3193,13 @@ class NghGraphEngine {
       resultHeap.clear();
     }
 
+    final hasPending = pendingDeletePks != null;
+    final hasThreshold = distanceThreshold != null;
+    final threshold = distanceThreshold ?? 0.0;
+
     for (int i = 1; i <= state.slotHeap.size; i++) {
       final slot = state.slotHeap.slots[i]!;
-      if (pendingDeletePks != null &&
-          pendingDeletePks.contains(slot.primaryKey)) {
+      if (hasPending && pendingDeletePks.contains(slot.primaryKey)) {
         continue;
       }
 
@@ -3018,33 +3238,24 @@ class NghGraphEngine {
         // Cosine inserts store unit vectors → squaredNorm ≈ 1; skip sqrt.
         final sn = slot.squaredNorm;
         final cosSim = (sn > 0.99 && sn < 1.01) ? ip : ip / sqrt(sn);
-        dist = max(0.0, 1.0 - cosSim);
+        dist = cosSim >= 1.0 ? 0.0 : (cosSim <= 0.0 ? 1.0 : 1.0 - cosSim);
       } else if (isIP) {
         dist = -ip;
       } else {
         dist = max(0.0, 1.0 + slot.squaredNorm - 2.0 * ip);
       }
 
-      if (distanceThreshold != null && dist > distanceThreshold) continue;
-      // Prefer resident wire bytes — avoid utf8.encode via primaryKeyUtf8.
+      if (hasThreshold && dist > threshold) continue;
+      // Prefer resident String PK (insert path) — avoid utf8.decode on emit.
       resultHeap.pushWithPk(
         slot.nodeId,
         dist,
         slot.primaryKeyBytes ?? slot.primaryKeyUtf8,
+        slot.cachedPrimaryKey,
       );
     }
 
-    final rawResults = resultHeap.drainSortedWithPk();
-    return [
-      for (final r in rawResults)
-        NghSearchResult(
-          nodeId: r.nodeId,
-          distance: r.distance,
-          primaryKey: r.primaryKeyBytes != null
-              ? utf8.decode(r.primaryKeyBytes!)
-              : null,
-        ),
-    ];
+    return resultHeap.drainSortedToSearchResults();
   }
 
   /// Migrate legacy single-file `nav_graph.ngh` (or unpaged centroids) directly
@@ -3261,7 +3472,7 @@ class NghGraphEngine {
         internalChain.add((pageId: pageId, page: btreePage));
       }
 
-      state.internalChains[r] = internalChain;
+      state.putRootChain(r, internalChain);
 
       final c48 = rootSeeds[r];
       for (int d = 0; d < 48; d++) {
@@ -3332,10 +3543,11 @@ class NghGraphEngine {
     ({NghPagePtr ptr, NghNavRootPage page})? dirtyNavRootPage;
     // Mutation-local leaves (not TreeCache) so mid-insert puts cannot evict
     // pages still being written. Flushed into posting TreeCache; search hot
-    // set is rebuilt via [rebuildPagedLeafCacheAfterInsert].
+    // set is promoted via [promotePagedLeavesAfterInsert].
     final insertLeaves = <NghPageId, NghPostingPage>{};
 
-    var state = await _getOrLoadBTreeState(table, indexUid, currentMeta);
+    var state = _btreeStates[_cacheKey(table.tableUid, indexUid)];
+    state ??= await _getOrLoadBTreeState(table, indexUid, currentMeta);
     if (state == null) {
       // Cold-start training 64 Root Centroids (48-D)
       const targetRoots = 64;
@@ -3401,9 +3613,9 @@ class NghGraphEngine {
         }
         final intPtr = navPages[1 + r];
         final intPageId = NghPageId(intPtr.partitionNo, intPtr.pageNo);
-        state.internalChains[r] = [
-          (pageId: intPageId, page: dirtyNavBTreePages[intPtr]!)
-        ];
+        state.putRootChain(r, [
+          (pageId: intPageId, page: dirtyNavBTreePages[intPtr]!),
+        ]);
       }
       final view = Float32x4List.sublistView(state.rootCentroids48Flat);
       for (int i = 0; i < state.rootCentroids48Simd.length; i++) {
@@ -3607,7 +3819,7 @@ class NghGraphEngine {
         final pId = NghPageId(pPtr.partitionNo, pPtr.pageNo);
         final emptyP = NghNavBTreePage(rootCentroidId: rootId, entries: []);
         chain = [(pageId: pId, page: emptyP)];
-        state.internalChains[rootId] = chain;
+        state.putRootChain(rootId, chain);
         dirtyNavBTreePages[pPtr] = emptyP;
       }
 
@@ -3739,9 +3951,11 @@ class NghGraphEngine {
       final qLowSimd = state.scratchQLowSimd;
 
       final sq8 = ScalarQuantizer.quantize(fullVec);
+      final pkBytes = Uint8List.fromList(utf8.encode(pk));
       final newSlot = NghPostingSlot(
         nodeId: baseNodeId + i,
         primaryKey: pk,
+        primaryKeyBytes: pkBytes,
         sq8Codes: sq8.codes,
         offset: sq8.offset,
         scale: sq8.scale,
@@ -6599,12 +6813,14 @@ class _FixedHeap {
   late final Int32List _ids;
   late final Float64List _dists;
   late final List<Uint8List?> _pks;
+  late final List<String?> _pkStrings;
   int _size = 0;
 
   _FixedHeap(this.capacity, {this.maxHeap = false}) {
     _ids = Int32List(capacity);
     _dists = Float64List(capacity);
     _pks = List<Uint8List?>.filled(capacity, null);
+    _pkStrings = List<String?>.filled(capacity, null);
   }
 
   bool get isEmpty => _size == 0;
@@ -6618,12 +6834,13 @@ class _FixedHeap {
     _size = 0;
   }
 
-  void pushWithPk(int id, double dist, Uint8List? pkBytes) {
+  void pushWithPk(int id, double dist, Uint8List? pkBytes, [String? pkString]) {
     if (_size < capacity) {
       final i = _size;
       _ids[i] = id;
       _dists[i] = dist;
       _pks[i] = pkBytes;
+      _pkStrings[i] = pkString;
       _size = i + 1;
       _siftUp(i);
     } else if ((maxHeap && dist < _dists[0]) ||
@@ -6631,6 +6848,7 @@ class _FixedHeap {
       _ids[0] = id;
       _dists[0] = dist;
       _pks[0] = pkBytes;
+      _pkStrings[0] = pkString;
       _siftDown(0);
     }
   }
@@ -6647,6 +6865,7 @@ class _FixedHeap {
         _ids[0] = _ids[_size];
         _dists[0] = _dists[_size];
         _pks[0] = _pks[_size];
+        _pkStrings[0] = _pkStrings[_size];
         _siftDown(0);
       }
       result.add(_SearchCandidate(id, dist, pk));
@@ -6660,6 +6879,39 @@ class _FixedHeap {
       }
     }
     return result;
+  }
+
+  /// Drain as [NghSearchResult] (one list; prefer cached String PK over utf8).
+  List<NghSearchResult> drainSortedToSearchResults() {
+    if (_size == 0) return const [];
+    final out = <NghSearchResult>[];
+    while (_size > 0) {
+      final id = _ids[0];
+      final dist = _dists[0];
+      final pkStr = _pkStrings[0];
+      final pkBytes = _pks[0];
+      _size--;
+      if (_size > 0) {
+        _ids[0] = _ids[_size];
+        _dists[0] = _dists[_size];
+        _pks[0] = _pks[_size];
+        _pkStrings[0] = _pkStrings[_size];
+        _siftDown(0);
+      }
+      out.add(NghSearchResult(
+        nodeId: id,
+        distance: dist,
+        primaryKey: pkStr ?? (pkBytes != null ? utf8.decode(pkBytes) : null),
+      ));
+    }
+    if (maxHeap && out.length > 1) {
+      for (var i = 0, j = out.length - 1; i < j; i++, j--) {
+        final tmp = out[i];
+        out[i] = out[j];
+        out[j] = tmp;
+      }
+    }
+    return out;
   }
 
   void _siftUp(int idx) {
@@ -6702,13 +6954,16 @@ class _FixedHeap {
     final tempId = _ids[a];
     final tempDist = _dists[a];
     final tempPk = _pks[a];
+    final tempPkStr = _pkStrings[a];
 
     _ids[a] = _ids[b];
     _dists[a] = _dists[b];
     _pks[a] = _pks[b];
+    _pkStrings[a] = _pkStrings[b];
 
     _ids[b] = tempId;
     _dists[b] = tempDist;
     _pks[b] = tempPk;
+    _pkStrings[b] = tempPkStr;
   }
 }

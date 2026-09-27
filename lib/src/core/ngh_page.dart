@@ -191,6 +191,9 @@ final class NghPostingSlot {
     return _decodedPrimaryKey = utf8.decode(bytes);
   }
 
+  /// Already-decoded PK if resident (search emit — avoids utf8.decode).
+  String? get cachedPrimaryKey => _decodedPrimaryKey;
+
   set primaryKey(String value) {
     _decodedPrimaryKey = value;
     primaryKeyBytes = null;
@@ -362,9 +365,17 @@ final class NghPostingPage {
   }
 
   /// Build normalized 48-D SIMD views for every live slot (no-op if already warm).
+  /// Also materializes UTF-8 PK bytes so search emit never utf8.encodes per query.
   void ensureLow48Ready() {
     for (final s in slots) {
       if ((s.flags & 0x01) != 0) continue;
+      if (s.primaryKeyBytes == null) {
+        final pk = s.cachedPrimaryKey;
+        if (pk != null) {
+          s.primaryKeyBytes =
+              pk.isEmpty ? Uint8List(0) : Uint8List.fromList(utf8.encode(pk));
+        }
+      }
       if (s.hasLow48) continue;
       s.getLow48DSimd(dimensions);
     }

@@ -1707,6 +1707,26 @@ final class NghPartitionManager {
     _pkmapPageCache.remove([tableUid]);
   }
 
+  /// Clear posting I/O fill for one index (search-hot leaves live elsewhere).
+  void clearPostingPageCacheForIndex(TableUid tableUid, IndexUid indexUid) {
+    _postingPageCache.remove([tableUid, indexUid]);
+  }
+
+  /// Clear nav page I/O fill for one index (Centroid B+Tree state is separate).
+  void clearNavPageCacheForIndex(TableUid tableUid, IndexUid indexUid) {
+    _navPageCache.remove([tableUid, indexUid]);
+  }
+
+  /// Drop one posting page from the I/O fill cache (leaf cache is independent).
+  void evictPostingPage(
+    TableUid tableUid,
+    IndexUid indexUid,
+    int partitionNo,
+    int pageNo,
+  ) {
+    _postingPageCache.removePoint4(tableUid, indexUid, partitionNo, pageNo);
+  }
+
   /// Clear caches for a specific index.
   void clearPageCacheForIndex(TableUid tableUid, IndexUid indexUid) {
     _postingPageCache.remove([tableUid, indexUid]);

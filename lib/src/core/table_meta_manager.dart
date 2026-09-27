@@ -1116,6 +1116,14 @@ class TableMetaManager {
     return _indexCacheEntryFor(schema).vectorIndexes;
   }
 
+  /// O(1) gate: whether [schema] has any vector index (cached list).
+  ///
+  /// Hot write paths must call this before any vector work so non-vector
+  /// tables pay only a cache lookup + `isNotEmpty`.
+  bool hasVectorIndexes(TableSchema schema) {
+    return _indexCacheEntryFor(schema).vectorIndexes.isNotEmpty;
+  }
+
   /// Shared index lists are bound only to the **hot** schema instance
   /// ([_peekTableSchema]). Migration / foreign snapshots are built ephemerally
   /// and never written into [_indexListCache] (avoids pinning stale schemas).
