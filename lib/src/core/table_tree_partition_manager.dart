@@ -1406,11 +1406,34 @@ final class TableTreePartitionManager {
     }
 
     OverflowBatchAllocator? overflowAllocator;
-    OverflowWriteBuffer? overflowWriteBuffer;
     var overflowSizeDeltaSum = 0;
     final preStoredOverflow = <String, Uint8List>{};
+    final overflowPartitionCountBefore = meta.overflowPartitionCount;
+    Future<void> rollbackOverflowReservation() async {
+      final alloc = overflowAllocator;
+      if (alloc == null) return;
+      try {
+        await _dataStore.overflowManager.rollbackBatchAllocation(
+          table: table,
+          allocator: alloc,
+          pageSize: _dataStore.configuredPageSize,
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+          flush: false,
+        );
+      } catch (_) {}
+      // Undo in-memory partition count bump from a failed rotation attempt.
+      if (meta.overflowPartitionCount > overflowPartitionCountBefore) {
+        meta = meta.copyWith(
+          overflowPartitionCount: overflowPartitionCountBefore,
+        );
+      }
+      overflowAllocator = null;
+    }
+
     if (totalOverflowChunks > 0) {
-      overflowAllocator = await _dataStore.overflowManager.startBatchAllocation(
+      final batchAllocator =
+          await _dataStore.overflowManager.startBatchAllocation(
         totalChunks: totalOverflowChunks,
         table: table,
         pageSize: _dataStore.configuredPageSize,
@@ -1419,13 +1442,13 @@ final class TableTreePartitionManager {
         encryptionKeyId: encryptionKeyId,
         flush: false,
       );
-      overflowWriteBuffer = OverflowWriteBuffer();
-      overflowSizeDeltaSum = overflowAllocator.sizeDeltaBytes;
-      if (overflowAllocator.updatedOverflowPartitionCount >
+      overflowAllocator = batchAllocator;
+      final batchWriteBuffer = OverflowWriteBuffer();
+      overflowSizeDeltaSum = batchAllocator.sizeDeltaBytes;
+      if (batchAllocator.updatedOverflowPartitionCount >
           meta.overflowPartitionCount) {
         meta = meta.copyWith(
-          overflowPartitionCount:
-              overflowAllocator.updatedOverflowPartitionCount,
+          overflowPartitionCount: batchAllocator.updatedOverflowPartitionCount,
         );
       }
       // Write overflow pages before any leaf is published. markLeafDirty
@@ -1450,8 +1473,8 @@ final class TableTreePartitionManager {
             encryptionKey: encryptionKey,
             encryptionKeyId: encryptionKeyId,
             flush: false,
-            allocator: overflowAllocator,
-            writeBuffer: overflowWriteBuffer,
+            allocator: batchAllocator,
+            writeBuffer: batchWriteBuffer,
           );
           overflowSizeDeltaSum += allocRes.sizeDeltaBytes;
           if (allocRes.overflowPartitionCount > meta.overflowPartitionCount) {
@@ -1468,10 +1491,20 @@ final class TableTreePartitionManager {
           preStoredOverflow[op.pk] =
               StoredValue.overflow(allocRes.ref).encode();
         }
-      } finally {
-        if (!overflowWriteBuffer.isEmpty) {
-          await overflowWriteBuffer.commit(_storage, flush: false);
+        if (!batchWriteBuffer.isEmpty) {
+          await batchWriteBuffer.commit(_storage, flush: false);
         }
+        await _dataStore.overflowManager.commitBatchAllocation(
+          table: table,
+          allocator: batchAllocator,
+          pageSize: _dataStore.configuredPageSize,
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+          flush: false,
+        );
+      } catch (_) {
+        await rollbackOverflowReservation();
+        rethrow;
       }
     }
     for (final op in opList) {

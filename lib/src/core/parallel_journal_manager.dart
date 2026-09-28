@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' show min;
 import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
@@ -48,6 +49,11 @@ class ParallelJournalManager {
   Future<void>? _loopFuture;
   StreamSubscription<int>? _bufSizeSub;
   bool _flushInProgress = false;
+
+  /// When set, online flush pumps back off instead of immediately retrying
+  /// after disk-full (avoids overflow partition churn while the disk is full).
+  DateTime? _diskFullPauseUntil;
+  int _diskFullBackoffMs = 0;
 
   /// When true, online pump [whenComplete] must not chain another
   /// [scheduleFlushIfNeeded] (owned by [flushCompletely] / stop drain).
@@ -635,6 +641,20 @@ class ParallelJournalManager {
     // _flushInProgress and immediately no-ops inside _pumpFlush.
     if (_isRecovering) return;
 
+    final pauseUntil = _diskFullPauseUntil;
+    if (pauseUntil != null) {
+      final remaining = pauseUntil.difference(DateTime.now());
+      if (remaining.inMilliseconds > 0) {
+        // Keep the gate clear so a timer can reschedule after the pause.
+        Future<void>.delayed(remaining, () {
+          if (!_running || _isRecovering) return;
+          scheduleFlushIfNeeded();
+        });
+        return;
+      }
+      _diskFullPauseUntil = null;
+    }
+
     final hasNormalData = !_bufferManager.isEmpty;
     final hasBackgroundWriteData = !_dataStore.backgroundWriteScheduler.isEmpty;
 
@@ -662,6 +682,34 @@ class ParallelJournalManager {
         scheduleFlushIfNeeded();
       }
     });
+  }
+
+  static bool _isDiskFullError(Object e) {
+    if (e is DbException) {
+      return e.statuses.any((s) => s.type == ResultType.sysIoDiskFull);
+    }
+    final msg = e.toString().toLowerCase();
+    return msg.contains('sys_io_disk_full') ||
+        msg.contains('no space left') ||
+        msg.contains('disk full') ||
+        msg.contains('quota exceeded') ||
+        msg.contains('errno = 112') ||
+        msg.contains('errno = 28') ||
+        msg.contains('errno=112') ||
+        msg.contains('errno=28');
+  }
+
+  void _noteDiskFullFailure() {
+    // 5s, 10s, 20s, 40s… capped at 60s between retries while disk stays full.
+    _diskFullBackoffMs =
+        _diskFullBackoffMs <= 0 ? 5000 : min(60000, _diskFullBackoffMs * 2);
+    _diskFullPauseUntil =
+        DateTime.now().add(Duration(milliseconds: _diskFullBackoffMs));
+  }
+
+  void _clearDiskFullPause() {
+    _diskFullPauseUntil = null;
+    _diskFullBackoffMs = 0;
   }
 
   /// Tail-wait strategy for normal online flush:
@@ -1508,6 +1556,7 @@ class ParallelJournalManager {
           }
         }
         await _dataStore.tableDataManager.persistRuntimeMetaIfNeeded();
+        _clearDiskFullPause();
       } catch (e) {
         _inFlightFlushCount = 0;
         _notifyBusyWaiters();
@@ -1522,8 +1571,17 @@ class ParallelJournalManager {
             _bufferManager.requeueFront(batch);
           } catch (_) {}
         }
-        // Backoff on errors and exit pump to avoid tight retry
-        await Future.delayed(const Duration(milliseconds: 100));
+        if (_isDiskFullError(e)) {
+          _noteDiskFullFailure();
+          Logger.error(
+            'Disk full: pausing flush retries for ${_diskFullBackoffMs}ms '
+            'to avoid overflow partition churn',
+          );
+          await Future.delayed(Duration(milliseconds: _diskFullBackoffMs));
+        } else {
+          // Backoff on errors and exit pump to avoid tight retry
+          await Future.delayed(const Duration(milliseconds: 100));
+        }
         break;
       }
     }

@@ -44,9 +44,11 @@ import 'yield_controller.dart';
 //     insert-path child picks (nearest parent first; no cross-parent leaf
 //     centroid trim — that cut Recall@10 ~3–20pp at the same list count).
 //     Scoring count is wantLeaves (log10(N) + √(nLeaves/256) fine scale),
-//     hard-capped for interactive latency (~12 / 20 / 36 at depth 1 / 50 / 100).
+//     hard-capped for interactive latency (~14 / 28 / 44 at depth 1 / 50 / 100).
+//     Nesting uses an absolute leaf floor (not a blind ×budget) so min-cost
+//     stays near the measured ~28–30 @ depth50 without overshooting to ~40.
 //   - searchDepth anchors: 1→91%, 50→95%, 98→98% (±5 / ±3 / ±5 pp). No hard
-//     max — depth>100 continues the same average Δlists/Δdepth (and recall
+//     max — depth>100 continues the same average Δlists/Δdepth (and recall).
 //   - Engine v4 never rewrites nav_graph.ngh. New writes are paged Centroid
 //     B+Tree and posting partitions only. Posting slot layout stays frozen.
 // ============================================================================
@@ -526,9 +528,10 @@ class NghGraphEngine {
   ///
   /// [wantLeaves] is the number of posting lists scored (latency). L0 nprobe
   /// stays only slightly above that so expand can follow insert-path children.
-  /// When leaves nest under L0 (`nLeaves > nL0`), add a small routing / score
-  /// bump — measured 1.7M depth50 sat ~79% at 14 lists; ~18–20 lists close
-  /// the remaining gap toward the 95%±3 baseline without the 200ms path.
+  /// When leaves nest under L0 (`nLeaves > nL0`), lift to an absolute nest
+  /// floor (measured ~28–30 lists @ depth50 for 95%±3) — never a blind
+  /// ×budget, which overshot to ~40 lists after fine-scale already hit the
+  /// floor and burned latency without moving recall.
   _NprobePlan _resolveNprobePlan({
     required int nCentroids,
     required int nLeaves,
@@ -566,21 +569,25 @@ class NghGraphEngine {
     }
 
     // Nesting cliff: postings hide under coarses (typical past ~1M).
-    // 1.7M measured: 14 lists ~79%, ~23 lists ~85%; push ~28–30 toward 95%±3.
+    // Meet the calibrated absolute floor; do not multiply past it.
     final cliff = nLeaves > nlist;
     if (cliff) {
-      wantLeaves = min(
-        max(1, nLeaves),
-        max(
-          wantLeaves,
-          (wantLeaves * 1.45).round(),
-        ),
+      final nestFloor = _nestLeafFloorForDepth(
+        depth,
+        nLeaves: max(1, nLeaves),
+        totalVectors: totalVectors,
       );
+      if (nestFloor > wantLeaves) {
+        wantLeaves = min(max(1, nLeaves), nestFloor);
+      }
     }
 
+    // Routing headroom for insert-path expand. Keep modest — L0 is cheap vs
+    // full-D scoring, but +8 on every nested depth50 query was pure pad once
+    // wantLeaves already sits on the nest floor.
     final routingExtra = nLeaves < 96
         ? 0
-        : (cliff ? (depth < 50 ? 4 : 8) : (depth < 50 ? 1 : 2));
+        : (cliff ? (depth < 50 ? 3 : 5) : (depth < 50 ? 1 : 2));
     final nprobe = min(nlist, min(_hardNprobeCap, wantLeaves + routingExtra));
 
     final avgCluster = nLeaves > 0
@@ -591,7 +598,9 @@ class NghGraphEngine {
       nLeaves: nLeaves,
       totalVectors: totalVectors,
     );
-    var maxCandidates = (_typicalLeafSlots * wantLeaves * 1.10).round();
+    // Slot budget tracks wantLeaves tightly — the old ×1.10 pad only helped
+    // when neighbor-expand left extras, and minKeep already protects recall.
+    var maxCandidates = (_typicalLeafSlots * wantLeaves).round();
     maxCandidates = min(maxCandidates, slotCap);
     maxCandidates = min(maxCandidates, max(1, totalVectors));
     if (nLeaves > 0) {
@@ -607,6 +616,49 @@ class NghGraphEngine {
       nlist: nlist,
       imbalance: imbalance,
     );
+  }
+
+  /// Absolute scored-list floor once postings nest under L0.
+  ///
+  /// Anchors track the same recall intent as [_wantLeavesForDepth], but as a
+  /// nesting-specific floor (1.7M sweep: ~17 @1, ~29 @50, ~40 @100) instead of
+  /// multiplying the already fine-scaled budget.
+  static int _nestLeafFloorForDepth(
+    int searchDepth, {
+    required int nLeaves,
+    required int totalVectors,
+  }) {
+    final logN = log(max(1000, totalVectors).toDouble()) / ln10;
+    // Below ~300k the base wantLeaves path already meets anchors.
+    if (logN < 5.5) return 0;
+
+    final scale = max(0.0, logN - 5.50);
+    final f1 = min(18, max(10, (10.0 + 10.0 * scale).round()));
+    final f50 = min(30, max(f1, (16.0 + 18.0 * scale).round()));
+    final f100 = min(
+      _maxInteractiveLeaves,
+      max(f50 + 4, (24.0 + 26.0 * scale).round()),
+    );
+    final f98 = max(f50 + 1, f50 + ((f100 - f50) * 48 / 50.0).round());
+
+    final depth = max(1, searchDepth);
+    final double raw;
+    if (depth <= 1) {
+      raw = f1.toDouble();
+    } else if (depth <= 50) {
+      final u = (depth - 1) / 49.0;
+      raw = f1 + (f50 - f1) * (u * u);
+    } else if (depth <= 98) {
+      final v = (depth - 50) / 48.0;
+      raw = f50 + (f98 - f50) * v;
+    } else if (depth <= 100) {
+      final w = (depth - 98) / 2.0;
+      raw = f98 + (f100 - f98) * w;
+    } else {
+      final slope = (f100 - f50) / 50.0;
+      raw = f100 + slope * (depth - 100);
+    }
+    return min(max(1, nLeaves), max(1, raw.round()));
   }
 
   /// Interactive scoring cap: depth 1→14, 50→28, 100→44 typical lists.
@@ -643,14 +695,12 @@ class NghGraphEngine {
     required int nLeaves,
     required int totalVectors,
   }) =>
-      (_typicalLeafSlots *
-              _maxLeavesForDepth(
-                searchDepth,
-                nLeaves: nLeaves,
-                totalVectors: totalVectors,
-              ) *
-              1.10)
-          .round();
+      _typicalLeafSlots *
+      _maxLeavesForDepth(
+        searchDepth,
+        nLeaves: nLeaves,
+        totalVectors: totalVectors,
+      );
 
   /// Min-cost posting lists — calibrated routing points (insert-path children):
   ///   50k:  2 lists ~95%; 250k: 2–3 lists; 1M: 4 / 6 / 11 ~87 / 92 / 94%.
@@ -2969,10 +3019,28 @@ class NghGraphEngine {
     }
 
     final leavesToPick = state.branchHeap.size;
+    // Best-first leaf order: same final slotHeap membership, but fills the
+    // candSlots heap with stronger 48-D hits first so later leaves prune
+    // harder (lower avg 48-D work, recall unchanged).
+    for (int i = 0; i < leavesToPick; i++) {
+      state.pickedLeaves[i] = state.branchHeap.entries[i + 1];
+      state.rootScores[i] = state.branchHeap.scores[i + 1];
+    }
+    for (int i = 1; i < leavesToPick; i++) {
+      final entry = state.pickedLeaves[i];
+      final score = state.rootScores[i];
+      var j = i - 1;
+      while (j >= 0 && state.rootScores[j] < score) {
+        state.pickedLeaves[j + 1] = state.pickedLeaves[j];
+        state.rootScores[j + 1] = state.rootScores[j];
+        j--;
+      }
+      state.pickedLeaves[j + 1] = entry;
+      state.rootScores[j + 1] = score;
+    }
     var allCached = true;
     for (int i = 0; i < leavesToPick; i++) {
-      final entry = state.branchHeap.entries[i + 1]!;
-      state.pickedLeaves[i] = entry;
+      final entry = state.pickedLeaves[i]!;
       final page = _btreeLeafGet(
         table.tableUid,
         indexUid,
@@ -4339,7 +4407,9 @@ class NghGraphEngine {
       );
     }
 
-    final scoreBudget = min(slotCap, (plan.maxCandidates * 1.15).round());
+    // Keep score budget on the calibrated candidate cap — the old ×1.15 pad
+    // let far giant lists linger after minKeep already protected recall.
+    final scoreBudget = min(slotCap, plan.maxCandidates);
     probeCentroids = _clampProbesToScoreBudget(
       ranked: rankedProbes,
       current: probeCentroids,
@@ -4447,18 +4517,23 @@ class NghGraphEngine {
     // Full SQ8 precision scoring for all selected clusters.
     // probeCentroids is ordered nearest-first, allowing resultHeap to quickly
     // tighten its peekDist threshold and skip distant vectors with minimal cost.
-    final yc = YieldController(
-      'NghGraphEngine.search.score',
-      checkInterval: 1,
-      budgetMs: 16,
-    );
+    // Yield only on large probe sets — every-cluster checks burned QPS on the
+    // min-cost (depth≤50) path without helping recall.
+    final scoreCount = probeCentroids.length;
+    final yc = scoreCount > 12
+        ? YieldController(
+            'NghGraphEngine.search.score',
+            checkInterval: 4,
+            budgetMs: 16,
+          )
+        : null;
 
-    for (var c = 0; c < probeCentroids.length; c++) {
-      final cId = probeCentroids[c];
-      scoreClusterFull(cId);
-
-      final y = yc.maybeYield();
-      if (y != null) await y;
+    for (var c = 0; c < scoreCount; c++) {
+      scoreClusterFull(probeCentroids[c]);
+      if (yc != null) {
+        final y = yc.maybeYield();
+        if (y != null) await y;
+      }
     }
 
     final rawResults = resultHeap.drainSortedWithPk();

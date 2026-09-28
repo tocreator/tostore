@@ -762,7 +762,8 @@ class FileStorageImpl implements StorageInterface {
       });
     } catch (e) {
       Logger.error('Write many bytes at offsets failed', rawError: e);
-      rethrow;
+      if (e is DbException) rethrow;
+      throw _wrapIoError(e, 'writeManyAsBytesAt', path);
     }
   }
 
