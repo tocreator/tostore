@@ -1252,8 +1252,9 @@ final class NghPartitionManager {
         pageType: BTreePageType.nghPosting,
         payload: entry.value.encodePayload(),
       );
-      _postingPageCache.putPoint4(tableUid, indexUid, entry.key.partitionNo,
-          entry.key.pageNo, entry.value);
+      // Do not park dirty posting in the I/O fill cache. Search-hot residency
+      // is NghGraphEngine._btreeLeafCache (pin at insert end / promote).
+      // Putting here would create short dual residency until promote evicts.
     }
 
     for (final item in navBuilt) {
@@ -1730,8 +1731,9 @@ final class NghPartitionManager {
   /// Memory-mode / cache-only commit of dirty NGH pages (no disk I/O).
   ///
   /// Mirrors the in-memory residency side of [writeChanges] without staging,
-  /// redo, or partition file writes. Search-hot posting leaves should still be
-  /// promoted via [NghGraphEngine.promotePagedLeavesAfterInsertSync].
+  /// redo, or partition file writes. Dirty posting is NOT parked in the posting
+  /// I/O fill — promote via [NghGraphEngine.promotePagedLeavesAfterInsertSync]
+  /// into the search-hot leaf cache instead.
   NghIndexMeta applyDirtyPagesToCache({
     required TableContext table,
     required IndexUid indexUid,
@@ -1744,16 +1746,8 @@ final class NghPartitionManager {
   }) {
     final tableUid = table.tableUid;
 
-    for (final entry in dirtyPostingPages.entries) {
-      final ptr = entry.key;
-      _postingPageCache.putPoint4(
-        tableUid,
-        indexUid,
-        ptr.partitionNo,
-        ptr.pageNo,
-        entry.value,
-      );
-    }
+    // Dirty posting: do not fill _postingPageCache. Memory-mode callers promote
+    // into NghGraphEngine search-hot leaf cache instead.
     for (final entry in dirtyNavPages.entries) {
       final ptr = entry.key;
       _navPageCache.putPoint4(

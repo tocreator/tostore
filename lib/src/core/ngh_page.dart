@@ -1281,45 +1281,92 @@ double innerProduct48Reg(
 }
 
 // ============================================================================
-// Centroid B+Tree Navigating Structures (Level 0 Root & Level 1 Internal Pages)
+// Centroid Navigation Tree (L0 root + fanout-bounded nav pages)
+//
+// LOCKED scale contract (tens of billions):
+//   - Each nav page holds ≤64 children (one physical page = one tree node).
+//   - Growth is SPLIT + optional mid promotion — never sibling linked lists.
+//   - Leaf-level pages: entries.child → posting leaf.
+//   - Mid-level pages: entries.child → child nav page.
+//   - Fanout 64 × 3 hops × ~4k slots/leaf ≫ tens of billions with bounded
+//     probe cost: O(L0 + hops × 64 × beam), independent of corpus size N.
+//
+// Wire version = 2 (NGH/vector v2 not yet released). Do not bump to 3.
+// Online production is still monolithic nav_graph.ngh — only that needs migrate.
 // ============================================================================
 
-/// An entry in an internal branch page pointing to a physical leaf posting page.
+/// Branch entry under a nav page: child is posting leaf OR child nav page.
 final class CentroidBranchEntry {
   int centroidId;
-  NghPageId leafPageId;
-  int leafSlotCount;
+
+  /// Posting page when parent [NghNavBTreePage.isLeafLevel]; else child nav page.
+  NghPageId childPageId;
+
+  /// Posting slot count (leaf-level) or approx child weight (mid-level).
+  int childWeight;
   Float32List centroid48D;
   Float32x4List centroid48DSimd;
 
   CentroidBranchEntry({
     required this.centroidId,
-    required this.leafPageId,
-    required this.leafSlotCount,
+    required NghPageId leafPageId,
+    required int leafSlotCount,
     required this.centroid48D,
-  }) : centroid48DSimd = Float32x4List.sublistView(centroid48D);
+  })  : childPageId = leafPageId,
+        childWeight = leafSlotCount,
+        centroid48DSimd = Float32x4List.sublistView(centroid48D);
+
+  /// Leaf-level alias — child is a posting page.
+  NghPageId get leafPageId => childPageId;
+  set leafPageId(NghPageId v) => childPageId = v;
+
+  int get leafSlotCount => childWeight;
+  set leafSlotCount(int v) => childWeight = v;
 }
 
-/// Internal branch page of the Centroid B+Tree stored in `.nav` partitions.
+/// Fanout-bounded nav node stored in `.nav` partitions.
+///
+/// One node = one page; [isLeafLevel] selects whether children are posting
+/// leaves or child nav pages. Growth is split + mid promotion only.
 final class NghNavBTreePage {
   static const int magic = 0x434E4254; // 'CNBT'
+  /// NGH/vector wire v2 (unreleased). Do not bump without a real format break.
   static const int version = 2;
   static const int headerSize = 20;
+
+  /// bit0: leaf-level (children are posting pages). Clear = mid-level.
+  static const int flagLeafLevel = 0x1;
 
   /// Maximum entries that fit safely in a 16KB Nav page.
   /// 16384 - 20 (BTreePageHeader) - 20 (NghNavBTreePage header) = 16344 bytes.
   /// Floor(16344 / 206) = 79 max. 64 provides generous 3.1KB safety margin.
   static const int maxEntriesPerPage = 64;
 
+  /// Safety hop cap while descending `!isLeafLevel` (cycle / corrupt tree).
+  /// Normal stop is the leaf-level flag — never rewrite mid pages as leaves.
+  /// 64^8 leaf pages ≫ tens of trillions of vectors.
+  static const int maxTreeHops = 8;
+
   final int rootCentroidId;
-  NghPageId nextInternalPage;
+
+  /// [flagLeafLevel] etc.
+  int flags;
   final List<CentroidBranchEntry> entries;
 
   NghNavBTreePage({
     required this.rootCentroidId,
-    this.nextInternalPage = NghPageId.none,
+    this.flags = flagLeafLevel,
     required this.entries,
   });
+
+  bool get isLeafLevel => (flags & flagLeafLevel) != 0;
+  set isLeafLevel(bool v) {
+    if (v) {
+      flags |= flagLeafLevel;
+    } else {
+      flags &= ~flagLeafLevel;
+    }
+  }
 
   /// Approximate resident bytes for TreeCache budgeting (object + 48-D vectors).
   int estimateResidentBytes() => 96 + entries.length * 280;
@@ -1343,16 +1390,16 @@ final class NghNavBTreePage {
     bd.setUint16(4, version, Endian.little);
     bd.setUint16(6, count, Endian.little);
     bd.setUint32(8, rootCentroidId, Endian.little);
-    bd.setUint32(12, nextInternalPage.wirePartition, Endian.little);
-    bd.setUint32(16, nextInternalPage.wirePage, Endian.little);
+    bd.setUint32(12, flags, Endian.little);
+    bd.setUint32(16, 0, Endian.little); // reserved
 
     int off = headerSize;
     for (int i = 0; i < count; i++) {
       final e = entries[i];
       bd.setUint32(off, e.centroidId, Endian.little);
-      bd.setUint32(off + 4, e.leafPageId.wirePartition, Endian.little);
-      bd.setUint32(off + 8, e.leafPageId.wirePage, Endian.little);
-      bd.setUint16(off + 12, e.leafSlotCount, Endian.little);
+      bd.setUint32(off + 4, e.childPageId.wirePartition, Endian.little);
+      bd.setUint32(off + 8, e.childPageId.wirePage, Endian.little);
+      bd.setUint16(off + 12, e.childWeight.clamp(0, 0xFFFF), Endian.little);
       off += 14;
 
       final c48 = e.centroid48D;
@@ -1373,9 +1420,7 @@ final class NghNavBTreePage {
 
     final count = bd.getUint16(6, Endian.little);
     final rId = bd.getUint32(8, Endian.little);
-    final nextPart = bd.getUint32(12, Endian.little);
-    final nextPg = bd.getUint32(16, Endian.little);
-    final nextId = NghPageId.fromWire(nextPart, nextPg);
+    final flags = bd.getUint32(12, Endian.little);
 
     int off = headerSize;
     final entries = <CentroidBranchEntry>[];
@@ -1403,7 +1448,7 @@ final class NghNavBTreePage {
 
     return NghNavBTreePage(
       rootCentroidId: rId,
-      nextInternalPage: nextId,
+      flags: flags,
       entries: entries,
     );
   }

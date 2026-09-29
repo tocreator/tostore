@@ -376,21 +376,7 @@ class VectorIndexManager {
                   indexUid: indexUid,
                   meta: meta,
                   dirtyPostingPages: insertResult.dirtyPostingPages,
-                  shouldAbort: () => _dataStore.shouldAbortBackgroundScan,
-                );
-              }
-            } else if (insertResult.needsCompactGapFill) {
-              final remain = max(
-                0,
-                _graphEngine.clusterCacheMaxBytes -
-                    _graphEngine.clusterCacheBytes,
-              );
-              if (remain > 0 && !_dataStore.shouldAbortBackgroundScan) {
-                await _graphEngine.prewarmClusters(
-                  table: table,
-                  indexUid: indexUid,
-                  meta: meta,
-                  maxBytes: remain,
+                  dirtyNavBTreePages: insertResult.dirtyNavBTreePages,
                   shouldAbort: () => _dataStore.shouldAbortBackgroundScan,
                 );
               }
@@ -506,12 +492,14 @@ class VectorIndexManager {
             vectorsDelta: -result.deletedCount,
             deletedDelta: result.deletedCount,
           );
-          if (result.dirtyPostingPages.isNotEmpty) {
+          if (result.dirtyPostingPages.isNotEmpty ||
+              result.dirtyNavBTreePages.isNotEmpty) {
             _graphEngine.promotePagedLeavesAfterInsertSync(
               table: table,
               indexUid: indexUid,
               meta: meta,
               dirtyPostingPages: result.dirtyPostingPages,
+              dirtyNavBTreePages: result.dirtyNavBTreePages,
             );
           }
           _vectorCache.putMeta(table, indexUid, meta);
@@ -545,12 +533,14 @@ class VectorIndexManager {
             dirtyPkmapPages: insertResult.dirtyPkmapPages,
             vectorsDelta: insertResult.insertedCount,
           );
-          if (insertResult.dirtyPostingPages.isNotEmpty) {
+          if (insertResult.dirtyPostingPages.isNotEmpty ||
+              insertResult.dirtyNavBTreePages.isNotEmpty) {
             _graphEngine.promotePagedLeavesAfterInsertSync(
               table: table,
               indexUid: indexUid,
               meta: meta,
               dirtyPostingPages: insertResult.dirtyPostingPages,
+              dirtyNavBTreePages: insertResult.dirtyNavBTreePages,
             );
           }
           _removePendingDeletesMemory(
@@ -687,15 +677,10 @@ class VectorIndexManager {
       final cacheKey = _pendingKey(table.tableUid, indexUid);
       pending = _pendingDeleteCache[cacheKey];
       if (pending == null) {
-        return _vectorSearchCold(
-          table: table,
-          fieldName: fieldName,
-          indexUid: indexUid,
-          queryVector: queryVector,
-          topK: topK,
-          searchDepth: searchDepth,
-          distanceThreshold: distanceThreshold,
-        );
+        // Do not force cold forever: pending load is only needed for deletes.
+        // Empty set keeps searchHotSync; cold path can hydrate deletes later.
+        pending = const <String>{};
+        _pendingDeleteCache[cacheKey] = pending;
       }
     }
 
@@ -802,12 +787,12 @@ class VectorIndexManager {
     return entries;
   }
 
-  /// Prewarm vector index meta, nav graph, and posting clusters into cache.
+  /// Prewarm vector index meta, nav, and posting into search-hot caches.
   ///
-  /// Respects [maxBytes] (and the global cluster-cache ceiling) to avoid OOM.
-  /// Loads clusters in cooperative batches so close / switchSpace can abort
-  /// promptly (mirrors table/index row prewarm).
-  /// Returns approximate bytes added to the cluster compact cache.
+  /// **Open / explicit prewarm only** (Phase 2 of DataStore cache prewarm).
+  /// Respects [maxBytes] and cluster/leaf soft ceilings. Never invoked from
+  /// writeChanges — flush only promotes dirty pages of that batch.
+  /// Returns approximate bytes added to the posting/cluster hot cache.
   Future<int> prewarmVectorIndex(
     TableContext table,
     IndexUid indexUid, {

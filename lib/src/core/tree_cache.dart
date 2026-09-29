@@ -1481,6 +1481,7 @@ class TreeCache<T> {
     final completer = Completer<void>();
     _cleanupLock = completer.future;
 
+    var removedTotal = 0;
     try {
       if (beforeCleanup != null) {
         try {
@@ -1496,7 +1497,6 @@ class TreeCache<T> {
       if (_totalEntries <= 0) return;
 
       final targetRemove = math.max(1, (_totalEntries * removeRatio).ceil());
-      var removedTotal = 0;
 
       final groups = <_Group<T>>[];
       _collectGroups(_groupsRoot, depth: 1, out: groups);
@@ -1560,6 +1560,13 @@ class TreeCache<T> {
         _cleanupLock = null;
       }
       completer.complete();
+    }
+
+    // Converge under soft ceiling without requiring callers to loop-await, and
+    // without waiting for the 5s put throttle in [_maybeScheduleCleanup].
+    if (removedTotal > 0 && _estimatedTotalSizeBytes > _maxByteThreshold) {
+      // ignore: discarded_futures
+      cleanup(removeRatio: removeRatio);
     }
   }
 
