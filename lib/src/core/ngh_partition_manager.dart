@@ -27,8 +27,10 @@ import 'yield_controller.dart';
 // NGH Partition Manager
 //
 // Page I/O for NGH partition files:
-//   posting/ -- inverted cluster SQ8 pages (frozen slot layout, incl. PK)
-//   nav/     -- paged Centroid B+Tree pages (the only write path)
+//   posting/ -- inverted cluster SQ8 pages
+//              redo: full page when dims≤[NghPostingPage.fullPageRedoMaxDimensions],
+//              else structure+PK (PageRedoTreeKind.ngh + NGPK payload)
+//   nav/     -- paged Centroid B+Tree pages (page redo: PageRedoTreeKind.nghNav)
 //   pkmap/   -- PK locator B+Tree (no page redo)
 // Read-only until migrated: ngh/nav_graph.ngh (layoutVersion == 1). Never
 // rewritten after engine v4.
@@ -426,24 +428,25 @@ final class NghPartitionManager {
   }) async {
     if (headPackedRef <= 0) return const [];
     final pages = <({int packedRef, NghPostingPage page})>[];
-    int current = headPackedRef;
+    var current = NghPageId.fromPacked(headPackedRef);
     final visited = <int>{};
 
-    while (current > 0 && !visited.contains(current)) {
-      visited.add(current);
-      final (part, pageNo) = NghPagePtr.unpackRef(current);
-      if (pageNo <= 0) break;
+    while (!current.isNone && !visited.contains(current.cacheKey)) {
+      visited.add(current.cacheKey);
       final pg = await readPostingPage(
         table,
         indexUid,
         meta,
-        part,
-        pageNo,
+        current.partitionNo,
+        current.pageNo,
         localCache: localCache,
       );
       if (pg == null) break;
-      pages.add((packedRef: current, page: pg));
-      current = pg.nextPostingPageNo;
+      pages.add((
+        packedRef: current.tryPack() ?? current.cacheKey,
+        page: pg,
+      ));
+      current = pg.nextPostingPage;
     }
     return pages;
   }
@@ -1164,6 +1167,7 @@ final class NghPartitionManager {
       required NghPagePtr ptr,
       required Uint8List pageBytes,
       PageRedoTreeKind? redoKind,
+      Uint8List? redoPayload,
     }) async {
       final stats = getStats(statsMap, ptr.partitionNo);
       stats.path ??= _partitionPath(category, table, indexUid, ptr.partitionNo);
@@ -1180,7 +1184,7 @@ final class NghPartitionManager {
           indexUid: indexUid,
           partitionNo: ptr.partitionNo,
           pageNo: ptr.pageNo,
-          payload: pageBytes,
+          payload: redoPayload ?? pageBytes,
         ));
       }
     }
@@ -1192,6 +1196,7 @@ final class NghPartitionManager {
       required BTreePageType pageType,
       required Uint8List payload,
       PageRedoTreeKind? redoKind,
+      Uint8List? redoPayload,
     }) async {
       await stageBuilt(
         category: category,
@@ -1200,6 +1205,7 @@ final class NghPartitionManager {
         pageBytes:
             _buildPageBytes(pageType, payload, sizeOf(category), encrypt),
         redoKind: redoKind,
+        redoPayload: redoPayload,
       );
     }
 
@@ -1241,16 +1247,23 @@ final class NghPartitionManager {
       stats.maxPageNoWritten = max(stats.maxPageNoWritten, ptr.pageNo);
     }
 
+    final usePkPostingRedo =
+        NghPostingPage.prefersPkStructureRedo(meta.dimensions);
     for (final entry in dirtyPostingPages.entries) {
       if (freedKeys.contains(entry.key.cacheKey)) continue;
       final y0 = yc.maybeYield();
       if (y0 != null) await y0;
+      final posting = entry.value;
       await stageTyped(
         category: NghDataCategory.posting,
         statsMap: postingStats,
         ptr: entry.key,
         pageType: BTreePageType.nghPosting,
-        payload: entry.value.encodePayload(),
+        payload: posting.encodePayload(),
+        // dims≤64: full page image. dims>64: structure+PK (rebuild from table).
+        redoKind: PageRedoTreeKind.ngh,
+        redoPayload:
+            usePkPostingRedo ? posting.encodePkStructureRedoPayload() : null,
       );
       // Do not park dirty posting in the I/O fill cache. Search-hot residency
       // is NghGraphEngine._btreeLeafCache (pin at insert end / promote).
@@ -1798,6 +1811,19 @@ final class NghPartitionManager {
   /// When [encrypt] is true, routes payload through [BTreePageCodec.encodePayload]
   /// which respects [EncryptionConfig.encryptionType] (ChaCha20/AES-GCM/XOR/none).
   /// When false, uses raw payload directly for maximum throughput.
+  Uint8List buildPostingPageBytes({
+    required NghPostingPage page,
+    required int pageSize,
+    required bool encrypt,
+  }) {
+    return _buildPageBytes(
+      BTreePageType.nghPosting,
+      page.encodePayload(),
+      pageSize,
+      encrypt,
+    );
+  }
+
   Uint8List _buildPageBytes(
     BTreePageType type,
     Uint8List payload,

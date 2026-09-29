@@ -33,6 +33,7 @@ import 'compute/wal_decode_batch_runner.dart';
 import 'cpu_work_chunk.dart';
 import 'data_store_impl.dart';
 import 'migration_manager.dart';
+import 'ngh_page.dart';
 import 'page_redo_log_codec.dart';
 import 'resource_manager.dart';
 import 'storage_adapter.dart';
@@ -2853,101 +2854,174 @@ class ParallelJournalManager {
       final writeYc = YieldController(
           'ParallelJournalManager._replayPageRedoLog.write',
           checkInterval: 5);
+
+      Future<String?> resolveRedoPath(
+        ({
+          PageRedoTreeKind kind,
+          TableUid tableUid,
+          IndexUid indexUid,
+          int partitionNo
+        }) key,
+      ) async {
+        try {
+          if (key.kind == PageRedoTreeKind.table) {
+            final tableContext = await _tableContextFromUid(key.tableUid);
+            if (tableContext == null) return null;
+            return _dataStore.pathManager
+                .getPartitionFilePathByContext(tableContext, key.partitionNo);
+          }
+          if (key.kind == PageRedoTreeKind.ngh) {
+            final tableContext = await _tableContextFromUid(key.tableUid);
+            if (tableContext == null) return null;
+            final indexUid =
+                _resolveRedoIndexUid(tableContext.schema, key.indexUid);
+            return _dataStore.pathManager.getNghPostingPartitionPathByContext(
+                tableContext, indexUid, key.partitionNo);
+          }
+          if (key.kind == PageRedoTreeKind.nghNav) {
+            final tableContext = await _tableContextFromUid(key.tableUid);
+            if (tableContext == null) return null;
+            final indexUid =
+                _resolveRedoIndexUid(tableContext.schema, key.indexUid);
+            return _dataStore.pathManager.getNghNavPartitionPathByContext(
+                tableContext, indexUid, key.partitionNo);
+          }
+          final tableContext = await _tableContextFromUid(key.tableUid);
+          if (tableContext == null) return null;
+          final indexUid =
+              _resolveRedoIndexUid(tableContext.schema, key.indexUid);
+          return _dataStore.pathManager.getIndexPartitionPathByContext(
+              tableContext, indexUid, key.partitionNo);
+        } catch (_) {
+          return null;
+        }
+      }
+
+      Future<void> invalidateMetaIfNeeded(
+        ({
+          PageRedoTreeKind kind,
+          TableUid tableUid,
+          IndexUid indexUid,
+          int partitionNo
+        }) key,
+        Map<int, Uint8List> pages,
+      ) async {
+        if (key.partitionNo != 0 || !pages.containsKey(0)) return;
+        final tableContext = await _tableContextFromUid(key.tableUid);
+        if (tableContext == null) return;
+        if (key.kind == PageRedoTreeKind.table) {
+          _dataStore.tableDataManager
+              .invalidateTableDataMetaCacheForTable(tableContext);
+        } else if (key.kind == PageRedoTreeKind.indexTree) {
+          final indexUid =
+              _resolveRedoIndexUid(tableContext.schema, key.indexUid);
+          _dataStore.indexManager
+              ?.invalidateIndexMetaCache(key.tableUid, indexUid);
+        } else if (key.kind == PageRedoTreeKind.ngh ||
+            key.kind == PageRedoTreeKind.nghNav) {
+          final indexUid =
+              _resolveRedoIndexUid(tableContext.schema, key.indexUid);
+          _dataStore.vectorIndexManager
+              ?.clearCacheForIndex(key.tableUid, indexUid);
+        }
+      }
+
+      // Pass 1: full page images (table/index/nav/full posting). Skip NGPK so
+      // table rows land on disk before structure+PK materialization.
       for (final e in byPartition.entries) {
         final y8 = writeYc.maybeYield();
         if (y8 != null) await y8;
         final key = e.key;
         final pages = e.value;
         if (pages.isEmpty) continue;
-        if (key.kind.requiresIndexUid && key.indexUid.isEmpty) {
-          continue;
-        }
+        if (key.kind.requiresIndexUid && key.indexUid.isEmpty) continue;
 
-        String path;
-        try {
-          if (key.kind == PageRedoTreeKind.table) {
-            final tableContext = await _tableContextFromUid(key.tableUid);
-            if (tableContext == null) continue;
-            path = _dataStore.pathManager
-                .getPartitionFilePathByContext(tableContext, key.partitionNo);
-          } else if (key.kind == PageRedoTreeKind.ngh) {
-            final tableContext = await _tableContextFromUid(key.tableUid);
-            if (tableContext == null) continue;
-            final indexUid =
-                _resolveRedoIndexUid(tableContext.schema, key.indexUid);
-            path = _dataStore.pathManager.getNghPostingPartitionPathByContext(
-                tableContext, indexUid, key.partitionNo);
-          } else if (key.kind == PageRedoTreeKind.nghNav) {
-            final tableContext = await _tableContextFromUid(key.tableUid);
-            if (tableContext == null) continue;
-            final indexUid =
-                _resolveRedoIndexUid(tableContext.schema, key.indexUid);
-            path = _dataStore.pathManager.getNghNavPartitionPathByContext(
-                tableContext, indexUid, key.partitionNo);
-          } else {
-            final tableContext = await _tableContextFromUid(key.tableUid);
-            if (tableContext == null) continue;
-            final indexUid =
-                _resolveRedoIndexUid(tableContext.schema, key.indexUid);
-            path = _dataStore.pathManager.getIndexPartitionPathByContext(
-                tableContext, indexUid, key.partitionNo);
-          }
-        } catch (_) {
-          continue;
-        }
-
-        // Ensure directory exists before writing.
+        final path = await resolveRedoPath(key);
+        if (path == null) continue;
         try {
           await _dataStore.storage.ensureDirectoryExists(p.dirname(path));
         } catch (_) {}
 
-        // Use a consistent pageSize for this partition; skip inconsistent payloads.
         int pageSize = 0;
         for (final v in pages.values) {
-          if (v.isNotEmpty) {
-            pageSize = v.length;
-            break;
-          }
+          if (v.isEmpty) continue;
+          if (NghPostingPage.isPkStructureRedoPayload(v)) continue;
+          pageSize = v.length;
+          break;
         }
         if (pageSize <= 0) continue;
 
-        final pageNos = pages.keys.toList(growable: false)..sort();
         final writes = <ByteWrite>[];
+        final pageNos = pages.keys.toList(growable: false)..sort();
         for (final pg in pageNos) {
           if (pg < 0) continue;
           final payload = pages[pg];
           if (payload == null || payload.isEmpty) continue;
+          if (NghPostingPage.isPkStructureRedoPayload(payload)) continue;
           if (payload.length != pageSize) continue;
-          final off = pg * pageSize;
-          writes.add(ByteWrite(offset: off, bytes: payload));
+          writes.add(ByteWrite(offset: pg * pageSize, bytes: payload));
         }
         if (writes.isEmpty) continue;
         writes.sort((a, b) => a.offset.compareTo(b.offset));
         await _dataStore.storage.writeManyAsBytesAt(path, writes, flush: true);
+        await invalidateMetaIfNeeded(key, pages);
+      }
 
-        // Partition-0 page0 carries global TableDataMeta / IndexMeta / NghIndexMeta.
-        // Invalidate meta caches so later recovery reads the restored page0, not
-        // a pre-crash in-memory snapshot.
-        if (key.partitionNo == 0 && pages.containsKey(0)) {
-          final tableContext = await _tableContextFromUid(key.tableUid);
-          if (tableContext != null) {
-            if (key.kind == PageRedoTreeKind.table) {
-              _dataStore.tableDataManager
-                  .invalidateTableDataMetaCacheForTable(tableContext);
-            } else if (key.kind == PageRedoTreeKind.indexTree) {
-              final indexUid =
-                  _resolveRedoIndexUid(tableContext.schema, key.indexUid);
-              _dataStore.indexManager
-                  ?.invalidateIndexMetaCache(key.tableUid, indexUid);
-            } else if (key.kind == PageRedoTreeKind.ngh ||
-                key.kind == PageRedoTreeKind.nghNav) {
-              final indexUid =
-                  _resolveRedoIndexUid(tableContext.schema, key.indexUid);
-              _dataStore.vectorIndexManager
-                  ?.clearCacheForIndex(key.tableUid, indexUid);
-            }
+      // Pass 2: NGPK posting pages — rebuild SQ8 from table, write full images.
+      for (final e in byPartition.entries) {
+        final yPk = writeYc.maybeYield();
+        if (yPk != null) await yPk;
+        final key = e.key;
+        if (key.kind != PageRedoTreeKind.ngh) continue;
+        if (key.indexUid.isEmpty) continue;
+        final pages = e.value;
+        final hasNgPk = pages.values.any(
+            (v) => v.isNotEmpty && NghPostingPage.isPkStructureRedoPayload(v));
+        if (!hasNgPk) continue;
+
+        final tableContext = await _tableContextFromUid(key.tableUid);
+        if (tableContext == null) continue;
+        final indexUid =
+            _resolveRedoIndexUid(tableContext.schema, key.indexUid);
+        final path = await resolveRedoPath(key);
+        if (path == null) continue;
+        try {
+          await _dataStore.storage.ensureDirectoryExists(p.dirname(path));
+        } catch (_) {}
+
+        final writes = <ByteWrite>[];
+        int? pageSize;
+        final pageNos = pages.keys.toList(growable: false)..sort();
+        for (final pg in pageNos) {
+          if (pg < 0) continue;
+          final payload = pages[pg];
+          if (payload == null ||
+              payload.isEmpty ||
+              !NghPostingPage.isPkStructureRedoPayload(payload)) {
+            continue;
           }
+          final built =
+              await _dataStore.vectorIndexManager?.materializePostingPkRedoPage(
+            table: tableContext,
+            indexUid: indexUid,
+            pkRedoPayload: payload,
+          );
+          if (built == null || built.isEmpty) {
+            Logger.warn(
+              'NGH PK-structure redo materialize failed '
+              '(table=${key.tableUid}, index=$indexUid, '
+              'p${key.partitionNo} pg$pg)',
+            );
+            continue;
+          }
+          pageSize ??= built.length;
+          if (built.length != pageSize) continue;
+          writes.add(ByteWrite(offset: pg * pageSize, bytes: built));
         }
+        if (writes.isEmpty) continue;
+        writes.sort((a, b) => a.offset.compareTo(b.offset));
+        await _dataStore.storage.writeManyAsBytesAt(path, writes, flush: true);
+        await invalidateMetaIfNeeded(key, pages);
       }
 
       // Legacy TreeMetaRecord: only apply when partition-0 page0 was NOT restored

@@ -143,14 +143,15 @@ final class _NghClusterSlots {
 // Candidate Min-Heap for Zero Heap GC
 // ----------------------------------------------------------------------------
 final class CandidateMinHeapIP {
-  final Int32List ids;
+  /// Node ids as Dart [int] — must not truncate wide posting nodeIds.
+  final List<int> ids;
   final Float64List scores;
   int size = 0;
   final int capacity;
   double minScore = -1e9;
 
   CandidateMinHeapIP(this.capacity)
-      : ids = Int32List(capacity + 1),
+      : ids = List<int>.filled(capacity + 1, 0),
         scores = Float64List(capacity + 1);
 
   @pragma('vm:prefer-inline')
@@ -3157,30 +3158,6 @@ class NghGraphEngine {
     }
   }
 
-  static Float32List _computeMean48(List<NghPostingSlot> slots) {
-    final mean = Float32List(48);
-    final count = slots.length;
-    if (count == 0) return mean;
-    for (final s in slots) {
-      final low = s.getLow48D(48);
-      for (int d = 0; d < 48; d++) {
-        mean[d] += low[d];
-      }
-    }
-    double norm = 0.0;
-    for (int d = 0; d < 48; d++) {
-      mean[d] /= count;
-      norm += mean[d] * mean[d];
-    }
-    norm = sqrt(norm);
-    if (norm > 0) {
-      for (int d = 0; d < 48; d++) {
-        mean[d] /= norm;
-      }
-    }
-    return mean;
-  }
-
   List<Float32List> _kMeansInit48({
     required List<Float32List> samples,
     required int k,
@@ -4795,16 +4772,148 @@ class NghGraphEngine {
       );
     }
 
-    Future<void> insertSlotIntoLeaf(
+    void applySlotToLeaf(
       int rootId,
       CentroidBranchEntry branchEntry,
       ({NghPageId pageId, NghNavBTreePage page}) ownerInternal,
       List<({NghPageId pageId, NghNavBTreePage page, int childIdx})> path,
       NghPostingSlot newSlot,
-    ) async {
+      NghPagePtr ptr,
+      NghPostingPage leafPage,
+    ) {
+      final currentPayload = leafPage.estimatePayloadSize();
+      final pkLen =
+          newSlot.primaryKeyBytes?.length ?? newSlot.primaryKeyUtf8.length;
+      final pageWide = leafPage.needsWideNodeIds ||
+          newSlot.nodeId > NghPostingPage.maxCompactNodeId;
+      final newSlotBytes =
+          NghPostingPage.slotFixedHeaderBytes(wideNodeIds: pageWide) +
+              pkLen +
+              currentMeta.dimensions;
+      final upgradeCost = leafPage.wideUpgradeCostBytes(newSlot.nodeId);
+      final fitsInPhysicalPage =
+          (20 + currentPayload + upgradeCost + newSlotBytes) <=
+              (postingPageSize - 64);
+
+      if (leafPage.slots.length < maxSlotsPerPage && fitsInPhysicalPage) {
+        leafPage.addSlot(newSlot);
+        branchEntry.leafSlotCount = leafPage.slots.length;
+        branchEntry.centroid48D = leafPage.normalizedMean48();
+        branchEntry.centroid48DSimd =
+            Float32x4List.sublistView(branchEntry.centroid48D);
+
+        dirtyPostingPages[ptr] = leafPage;
+        markInsertNav(ownerInternal.pageId, ownerInternal.page);
+        return;
+      }
+
+      // 50/50 Balanced Geometric Hyperplane Split
+      leafPage.addSlot(newSlot);
+
+      final seedASimd = leafPage.slots[0].getLow48DSimd(currentMeta.dimensions);
+      int bestBIdx = 1;
+      double minSimToA = 1e9;
+      for (int i = 1; i < leafPage.slots.length; i++) {
+        final sSimd = leafPage.slots[i].getLow48DSimd(currentMeta.dimensions);
+        final sim = innerProduct48(seedASimd, sSimd, 0);
+        if (sim < minSimToA) {
+          minSimToA = sim;
+          bestBIdx = i;
+        }
+      }
+      final seedBSimd =
+          leafPage.slots[bestBIdx].getLow48DSimd(currentMeta.dimensions);
+
+      final projScores = Float64List(leafPage.slots.length);
+      final projIndices = Int32List(leafPage.slots.length);
+      for (int i = 0; i < leafPage.slots.length; i++) {
+        final slot = leafPage.slots[i];
+        final sSimd = slot.getLow48DSimd(currentMeta.dimensions);
+        final simA = innerProduct48(seedASimd, sSimd, 0);
+        final simB = innerProduct48(seedBSimd, sSimd, 0);
+        projScores[i] = simA - simB;
+        projIndices[i] = i;
+      }
+
+      for (int i = 0; i < leafPage.slots.length; i++) {
+        int maxIdx = i;
+        for (int j = i + 1; j < leafPage.slots.length; j++) {
+          if (projScores[j] > projScores[maxIdx]) maxIdx = j;
+        }
+        final ts = projScores[i];
+        projScores[i] = projScores[maxIdx];
+        projScores[maxIdx] = ts;
+        final ti = projIndices[i];
+        projIndices[i] = projIndices[maxIdx];
+        projIndices[maxIdx] = ti;
+      }
+
+      final groupA = <NghPostingSlot>[];
+      final groupB = <NghPostingSlot>[];
+      final mid = leafPage.slots.length ~/ 2;
+      for (int i = 0; i < mid; i++) {
+        groupA.add(leafPage.slots[projIndices[i]]);
+      }
+      for (int i = mid; i < leafPage.slots.length; i++) {
+        groupB.add(leafPage.slots[projIndices[i]]);
+      }
+
+      leafPage.replaceSlots(groupA);
+      branchEntry.leafSlotCount = groupA.length;
+      branchEntry.centroid48D = leafPage.normalizedMean48();
+      branchEntry.centroid48DSimd =
+          Float32x4List.sublistView(branchEntry.centroid48D);
+
+      dirtyPostingPages[ptr] = leafPage;
+      markInsertNav(ownerInternal.pageId, ownerInternal.page);
+
+      final (newPostingPtrs, nextPostingMeta) =
+          _partitionManager.allocatePagesBatchSync(
+        NghDataCategory.posting,
+        currentMeta,
+        1,
+      );
+      currentMeta = nextPostingMeta;
+      final newLeafPtr = newPostingPtrs.first;
+      final newLeafPageId =
+          NghPageId(newLeafPtr.partitionNo, newLeafPtr.pageNo);
+
+      final nextCentroidId = ++state!.nextCentroidId;
+      final newPostingPage = NghPostingPage(
+        centroidId: nextCentroidId,
+        dimensions: currentMeta.dimensions,
+        slots: <NghPostingSlot>[],
+      )..replaceSlots(groupB);
+      insertLeaves[newLeafPageId] = newPostingPage;
+      dirtyPostingPages[newLeafPtr] = newPostingPage;
+
+      final newCentroid48 = newPostingPage.normalizedMean48();
+      final newBranchEntry = CentroidBranchEntry(
+        centroidId: nextCentroidId,
+        leafPageId: newLeafPageId,
+        leafSlotCount: groupB.length,
+        centroid48D: newCentroid48,
+      );
+
+      appendLeafLevelEntry(
+        rootId: rootId,
+        ownerId: ownerInternal.pageId,
+        ownerPage: ownerInternal.page,
+        newBranchEntry: newBranchEntry,
+        path: path,
+      );
+    }
+
+    /// Resolve/allocate leaf and apply [newSlot]. Returns false if the posting
+    /// page is not in memory (caller must async-load).
+    bool insertSlotIntoLeafSync(
+      int rootId,
+      CentroidBranchEntry branchEntry,
+      ({NghPageId pageId, NghNavBTreePage page}) ownerInternal,
+      List<({NghPageId pageId, NghNavBTreePage page, int childIdx})> path,
+      NghPostingSlot newSlot,
+    ) {
       var leafPageId = branchEntry.leafPageId;
-      // Legacy / migrate entries may point at none — allocate a real leaf
-      // instead of writing through an invalid page id.
       if (leafPageId.isNone) {
         final (leafPtrs, leafMeta) = _partitionManager.allocatePagesBatchSync(
           NghDataCategory.posting,
@@ -4815,154 +4924,205 @@ class NghGraphEngine {
         final leafPtr = leafPtrs.first;
         leafPageId = NghPageId(leafPtr.partitionNo, leafPtr.pageNo);
         branchEntry.leafPageId = leafPageId;
-        final leafPage = NghPostingPage(
+        final leafPage = NghPostingPage.empty(
           centroidId: branchEntry.centroidId,
           dimensions: currentMeta.dimensions,
-          slots: [],
         );
         insertLeaves[leafPageId] = leafPage;
         dirtyPostingPages[leafPtr] = leafPage;
       }
       final ptr = NghPagePtr(
           NghDataCategory.posting, leafPageId.partitionNo, leafPageId.pageNo);
-      var leafPage = dirtyPostingPages[ptr] ??
+      final leafPage = dirtyPostingPages[ptr] ??
           insertLeaves[leafPageId] ??
           _btreeLeafGet(table.tableUid, indexUid, leafPageId, touch: false);
-      if (leafPage == null) {
-        leafPage = await _partitionManager.readPostingPage(
-          table,
-          indexUid,
-          currentMeta,
-          leafPageId.partitionNo,
-          leafPageId.pageNo,
+      if (leafPage == null) return false;
+      insertLeaves[leafPageId] = leafPage;
+      applySlotToLeaf(
+        rootId,
+        branchEntry,
+        ownerInternal,
+        path,
+        newSlot,
+        ptr,
+        leafPage,
+      );
+      return true;
+    }
+
+    Future<void> insertSlotIntoLeaf(
+      int rootId,
+      CentroidBranchEntry branchEntry,
+      ({NghPageId pageId, NghNavBTreePage page}) ownerInternal,
+      List<({NghPageId pageId, NghNavBTreePage page, int childIdx})> path,
+      NghPostingSlot newSlot,
+    ) async {
+      if (insertSlotIntoLeafSync(
+        rootId,
+        branchEntry,
+        ownerInternal,
+        path,
+        newSlot,
+      )) {
+        return;
+      }
+      var leafPageId = branchEntry.leafPageId;
+      final ptr = NghPagePtr(
+          NghDataCategory.posting, leafPageId.partitionNo, leafPageId.pageNo);
+      var leafPage = await _partitionManager.readPostingPage(
+        table,
+        indexUid,
+        currentMeta,
+        leafPageId.partitionNo,
+        leafPageId.pageNo,
+      );
+      if (leafPage != null) {
+        leafPage.ensureLow48Ready();
+      } else {
+        leafPage = NghPostingPage.empty(
+          centroidId: branchEntry.centroidId,
+          dimensions: currentMeta.dimensions,
         );
-        if (leafPage != null) {
-          leafPage.ensureLow48Ready();
-        } else {
-          leafPage = NghPostingPage(
-            centroidId: branchEntry.centroidId,
-            dimensions: currentMeta.dimensions,
-            slots: [],
-          );
-        }
       }
       insertLeaves[leafPageId] = leafPage;
+      applySlotToLeaf(
+        rootId,
+        branchEntry,
+        ownerInternal,
+        path,
+        newSlot,
+        ptr,
+        leafPage,
+      );
+    }
 
-      final currentPayload = leafPage.estimatePayloadSize();
-      final newSlotBytes = 19 +
-          (newSlot.primaryKeyBytes?.length ?? newSlot.primaryKeyUtf8.length) +
-          currentMeta.dimensions;
-      final fitsInPhysicalPage =
-          (20 + currentPayload + newSlotBytes) <= (postingPageSize - 64);
+    /// In-memory insert after batch pin/hydrate. Returns false if any nav/leaf
+    /// page still needs disk I/O (caller falls back to [insertIntoRoot]).
+    bool insertIntoRootSync(
+      int rootId,
+      NghPostingSlot newSlot,
+      Float32x4List qLowSimd,
+    ) {
+      if (!insertNavRootsReady.contains(rootId)) return false;
 
-      if (leafPage.slots.length < maxSlotsPerPage && fitsInPhysicalPage) {
-        leafPage.slots.add(newSlot);
-        branchEntry.leafSlotCount = leafPage.slots.length;
-        branchEntry.centroid48D = _computeMean48(leafPage.slots);
-        branchEntry.centroid48DSimd =
-            Float32x4List.sublistView(branchEntry.centroid48D);
+      var headId = state!.firstInternalByRoot[rootId];
+      if (headId.isNone) {
+        final (pPtrs, pMeta) = _partitionManager.allocatePagesBatchSync(
+          NghDataCategory.nav,
+          currentMeta,
+          1,
+        );
+        currentMeta = pMeta;
+        final pPtr = pPtrs.first;
+        headId = NghPageId(pPtr.partitionNo, pPtr.pageNo);
+        final emptyP = NghNavBTreePage(
+          rootCentroidId: rootId,
+          flags: NghNavBTreePage.flagLeafLevel,
+          entries: [],
+        );
+        markInsertNav(headId, emptyP);
+        state.setFirstInternal(rootId, headId);
+      }
 
-        dirtyPostingPages[ptr] = leafPage;
-        markInsertNav(ownerInternal.pageId, ownerInternal.page);
-      } else {
-        // 50/50 Balanced Geometric Hyperplane Split
-        leafPage.slots.add(newSlot);
+      var curId = headId;
+      final head = resolveInsertNav(curId);
+      if (head == null) return false;
+      var cur = head;
+      final path = <({NghPageId pageId, NghNavBTreePage page, int childIdx})>[];
 
-        final seedASimd =
-            leafPage.slots[0].getLow48DSimd(currentMeta.dimensions);
-        int bestBIdx = 1;
-        double minSimToA = 1e9;
-        for (int i = 1; i < leafPage.slots.length; i++) {
-          final sSimd = leafPage.slots[i].getLow48DSimd(currentMeta.dimensions);
-          final sim = innerProduct48(seedASimd, sSimd, 0);
-          if (sim < minSimToA) {
-            minSimToA = sim;
-            bestBIdx = i;
+      var hop = 0;
+      while (!cur.isLeafLevel) {
+        if (++hop > NghNavBTreePage.maxTreeHops) {
+          throw DbException([
+            GeneralStatus(
+              type: ResultType.engError,
+              message:
+                  'NGH insert descent exceeded maxTreeHops=${NghNavBTreePage.maxTreeHops} '
+                  '(root=$rootId). Refusing to rewrite a mid page as a posting leaf.',
+            )
+          ]);
+        }
+        if (cur.entries.isEmpty) {
+          throw DbException([
+            GeneralStatus(
+              type: ResultType.engError,
+              message:
+                  'NGH insert mid nav page has no children (root=$rootId, page=$curId).',
+            )
+          ]);
+        }
+        var bestIdx = 0;
+        var bestScore = -1e9;
+        for (int i = 0; i < cur.entries.length; i++) {
+          final s = innerProduct48(qLowSimd, cur.entries[i].centroid48DSimd, 0);
+          if (s > bestScore) {
+            bestScore = s;
+            bestIdx = i;
           }
         }
-        final seedBSimd =
-            leafPage.slots[bestBIdx].getLow48DSimd(currentMeta.dimensions);
-
-        final projScores = Float64List(leafPage.slots.length);
-        final projIndices = Int32List(leafPage.slots.length);
-        for (int i = 0; i < leafPage.slots.length; i++) {
-          final slot = leafPage.slots[i];
-          final sSimd = slot.getLow48DSimd(currentMeta.dimensions);
-          final simA = innerProduct48(seedASimd, sSimd, 0);
-          final simB = innerProduct48(seedBSimd, sSimd, 0);
-          projScores[i] = simA - simB;
-          projIndices[i] = i;
+        final childId = cur.entries[bestIdx].childPageId;
+        if (childId.isNone) {
+          throw DbException([
+            GeneralStatus(
+              type: ResultType.engError,
+              message:
+                  'NGH insert mid entry has no child page (root=$rootId, page=$curId).',
+            )
+          ]);
         }
+        path.add((pageId: curId, page: cur, childIdx: bestIdx));
+        curId = childId;
+        final next = resolveInsertNav(curId);
+        if (next == null) return false;
+        cur = next;
+      }
 
-        for (int i = 0; i < leafPage.slots.length; i++) {
-          int maxIdx = i;
-          for (int j = i + 1; j < leafPage.slots.length; j++) {
-            if (projScores[j] > projScores[maxIdx]) maxIdx = j;
-          }
-          final ts = projScores[i];
-          projScores[i] = projScores[maxIdx];
-          projScores[maxIdx] = ts;
-          final ti = projIndices[i];
-          projIndices[i] = projIndices[maxIdx];
-          projIndices[maxIdx] = ti;
-        }
-
-        final groupA = <NghPostingSlot>[];
-        final groupB = <NghPostingSlot>[];
-        final mid = leafPage.slots.length ~/ 2;
-        for (int i = 0; i < mid; i++) {
-          groupA.add(leafPage.slots[projIndices[i]]);
-        }
-        for (int i = mid; i < leafPage.slots.length; i++) {
-          groupB.add(leafPage.slots[projIndices[i]]);
-        }
-
-        leafPage.slots.clear();
-        leafPage.slots.addAll(groupA);
-        branchEntry.leafSlotCount = groupA.length;
-        branchEntry.centroid48D = _computeMean48(groupA);
-        branchEntry.centroid48DSimd =
-            Float32x4List.sublistView(branchEntry.centroid48D);
-
-        dirtyPostingPages[ptr] = leafPage;
-        markInsertNav(ownerInternal.pageId, ownerInternal.page);
-
-        final (newPostingPtrs, nextPostingMeta) =
-            _partitionManager.allocatePagesBatchSync(
+      if (cur.entries.isEmpty) {
+        final (leafPtrs, leafMeta) = _partitionManager.allocatePagesBatchSync(
           NghDataCategory.posting,
           currentMeta,
           1,
         );
-        currentMeta = nextPostingMeta;
-        final newLeafPtr = newPostingPtrs.first;
-        final newLeafPageId =
-            NghPageId(newLeafPtr.partitionNo, newLeafPtr.pageNo);
-
-        final nextCentroidId = ++state!.nextCentroidId;
-        final newPostingPage = NghPostingPage(
-          centroidId: nextCentroidId,
+        currentMeta = leafMeta;
+        final leafPtr = leafPtrs.first;
+        final leafId = NghPageId(leafPtr.partitionNo, leafPtr.pageNo);
+        final leafCentroidId = ++state.nextCentroidId;
+        final leafPage = NghPostingPage(
+          centroidId: leafCentroidId,
           dimensions: currentMeta.dimensions,
-          slots: groupB,
-        );
-        insertLeaves[newLeafPageId] = newPostingPage;
-        dirtyPostingPages[newLeafPtr] = newPostingPage;
+          slots: <NghPostingSlot>[],
+        )..addSlot(newSlot);
+        insertLeaves[leafId] = leafPage;
+        dirtyPostingPages[leafPtr] = leafPage;
 
-        final newCentroid48 = _computeMean48(groupB);
-        final newBranchEntry = CentroidBranchEntry(
-          centroidId: nextCentroidId,
-          leafPageId: newLeafPageId,
-          leafSlotCount: groupB.length,
-          centroid48D: newCentroid48,
+        final entry = CentroidBranchEntry(
+          centroidId: leafCentroidId,
+          leafPageId: leafId,
+          leafSlotCount: 1,
+          centroid48D: leafPage.normalizedMean48(),
         );
-
-        appendLeafLevelEntry(
-          rootId: rootId,
-          ownerId: ownerInternal.pageId,
-          ownerPage: ownerInternal.page,
-          newBranchEntry: newBranchEntry,
-          path: path,
-        );
+        cur.entries.add(entry);
+        markInsertNav(curId, cur);
+        return true;
       }
+
+      CentroidBranchEntry? bestEntry;
+      var bestScore = -1e9;
+      for (final entry in cur.entries) {
+        final s = innerProduct48(qLowSimd, entry.centroid48DSimd, 0);
+        if (s > bestScore) {
+          bestScore = s;
+          bestEntry = entry;
+        }
+      }
+
+      return insertSlotIntoLeafSync(
+        rootId,
+        bestEntry!,
+        (pageId: curId, page: cur),
+        path,
+        newSlot,
+      );
     }
 
     Future<void> insertIntoRoot(
@@ -4970,6 +5130,8 @@ class NghGraphEngine {
       NghPostingSlot newSlot,
       Float32x4List qLowSimd,
     ) async {
+      if (insertIntoRootSync(rootId, newSlot, qLowSimd)) return;
+
       await ensureInsertRootNav(rootId);
 
       var headId = state!.firstInternalByRoot[rootId];
@@ -5055,8 +5217,8 @@ class NghGraphEngine {
         final leafPage = NghPostingPage(
           centroidId: leafCentroidId,
           dimensions: currentMeta.dimensions,
-          slots: [newSlot],
-        );
+          slots: <NghPostingSlot>[],
+        )..addSlot(newSlot);
         insertLeaves[leafId] = leafPage;
         dirtyPostingPages[leafPtr] = leafPage;
 
@@ -5064,7 +5226,7 @@ class NghGraphEngine {
           centroidId: leafCentroidId,
           leafPageId: leafId,
           leafSlotCount: 1,
-          centroid48D: _computeMean48(leafPage.slots),
+          centroid48D: leafPage.normalizedMean48(),
         );
         cur.entries.add(entry);
         markInsertNav(curId, cur);
@@ -5233,9 +5395,13 @@ class NghGraphEngine {
         }
       }
 
-      await insertIntoRoot(bestRoot0, newSlot, qLowSimd);
+      if (!insertIntoRootSync(bestRoot0, newSlot, qLowSimd)) {
+        await insertIntoRoot(bestRoot0, newSlot, qLowSimd);
+      }
       if (maxScore1 >= maxScore0 * 0.94) {
-        await insertIntoRoot(bestRoot1, newSlot, qLowSimd);
+        if (!insertIntoRootSync(bestRoot1, newSlot, qLowSimd)) {
+          await insertIntoRoot(bestRoot1, newSlot, qLowSimd);
+        }
       }
     }
 
@@ -5821,12 +5987,12 @@ class NghGraphEngine {
   }) {
     var i = from;
     while (i < src.length) {
-      page.slots.add(src[i]);
+      page.addSlot(src[i]);
       if (!_partitionManager.postingPayloadFits(
         page.estimatePayloadSize(),
         pageSize: pageSize,
       )) {
-        page.slots.removeLast();
+        page.removeLastSlot();
         break;
       }
       i++;
@@ -6291,7 +6457,7 @@ class NghGraphEngine {
         }
 
         if (tailPage != null && tailPtr != null) {
-          tailPage.nextPostingPageNo = newPacked;
+          tailPage.setNextPostingPage(newPtr.pageId);
           dirtyPosting[tailPtr] = tailPage;
           localPostingCache[tailRef] = tailPage;
         } else if (centroid.headPostingPageNo <= 0) {
@@ -7034,22 +7200,25 @@ class NghGraphEngine {
         offset += take;
         final ptr = pagePool[poolIdx++];
         final packed = ptr.packedRef;
+        final cacheKey = packed > 0 ? packed : ptr.pageId.cacheKey;
         final page = NghPostingPage(
           centroidId: centroidId,
-          nextPostingPageNo: -1,
           dimensions: dims,
           slots: chunk,
         );
         if (prevPage != null && prevPtr != null) {
-          prevPage.nextPostingPageNo = packed;
+          prevPage.setNextPostingPage(ptr.pageId);
           dirtyPosting[prevPtr] = prevPage;
-          localPostingCache[prevPtr.packedRef] = prevPage;
+          final prevKey = prevPtr.packedRef > 0
+              ? prevPtr.packedRef
+              : prevPtr.pageId.cacheKey;
+          localPostingCache[prevKey] = prevPage;
         }
         dirtyPosting[ptr] = page;
-        localPostingCache[packed] = page;
-        if (head <= 0) head = packed;
-        tail = packed;
-        refs.add(packed);
+        localPostingCache[cacheKey] = page;
+        if (head <= 0) head = packed > 0 ? packed : cacheKey;
+        tail = packed > 0 ? packed : cacheKey;
+        refs.add(packed > 0 ? packed : cacheKey);
         prevPage = page;
         prevPtr = ptr;
       }
@@ -7830,7 +7999,7 @@ class NghGraphEngine {
         }
         dirtyPosting[ptr] = NghPostingPage(
           centroidId: page.centroidId,
-          nextPostingPageNo: page.nextPostingPageNo,
+          nextPostingPage: page.nextPostingPage,
           dimensions: page.dimensions,
           slots: live,
         );
@@ -8141,14 +8310,15 @@ class _FixedHeap {
   final int capacity;
   final bool maxHeap;
 
-  late final Int32List _ids;
+  /// Node ids as Dart [int] (not [Int32List]) so wide posting nodeId (>2^32) survives.
+  late final List<int> _ids;
   late final Float64List _dists;
   late final List<Uint8List?> _pks;
   late final List<String?> _pkStrings;
   int _size = 0;
 
   _FixedHeap(this.capacity, {this.maxHeap = false}) {
-    _ids = Int32List(capacity);
+    _ids = List<int>.filled(capacity, 0);
     _dists = Float64List(capacity);
     _pks = List<Uint8List?>.filled(capacity, null);
     _pkStrings = List<String?>.filled(capacity, null);

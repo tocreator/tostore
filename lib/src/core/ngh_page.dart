@@ -108,10 +108,13 @@ final class NghPartitionMetaPage {
 
 /// Inlined SQ8 compressed vector entry with metadata inside an inverted cluster posting page.
 final class NghPostingSlot {
-  /// Unique vector node/document ID.
+  /// Tombstone bit (logical delete).
+  static const int flagDeleted = 0x01;
+
+  /// Unique vector node/document ID (Dart [int]; wire may be u32 or u64).
   int nodeId;
 
-  /// Logical deletion / tombstone flag (0 = active, 1 = deleted).
+  /// Slot flags: [flagDeleted], …
   int flags;
 
   /// Lazily decoded primary key (set on insert, or first access after disk decode).
@@ -206,35 +209,94 @@ final class NghPostingSlot {
     return Uint8List.fromList(utf8.encode(primaryKey));
   }
 
-  bool get isDeleted => (flags & 0x01) != 0;
+  bool get isDeleted => (flags & flagDeleted) != 0;
 
   /// Approximate in-memory / serialized byte size of this slot.
   int estimateSize() {
     final pkLen = primaryKeyBytes?.length ?? (primaryKey.length * 2);
-    return 20 + pkLen + sq8Codes.length;
+    final idBytes = nodeId > NghPostingPage.maxCompactNodeId ? 8 : 4;
+    return 16 + idBytes + pkLen + sq8Codes.length;
   }
 }
 
 /// An inverted cluster posting page storing multiple inlined [NghPostingSlot]s.
 final class NghPostingPage {
+  /// Max nodeId that fits the legacy compact (u32) slot wire.
+  static const int maxCompactNodeId = 0xFFFFFFFF;
+
+  /// High bit of the u16 slotCount word: page uses u64 nodeId on every slot.
+  /// Untouched legacy pages never set this bit — decode stays u32-compatible.
+  static const int slotCountWideNodeIdFlag = 0x8000;
+
+  /// Bit14 of slotCount: advisory — next uses wide u32+u32 extension after the
+  /// 12-byte header (authoritative marker is [wideNextSentinel] at offset 4).
+  static const int slotCountWideNextFlag = 0x4000;
+
+  /// i32 next field value meaning "u32 partition + u32 page follow at offset 12".
+  static const int wideNextSentinel = -2;
+
+  static const int _slotCountFlagMask =
+      slotCountWideNodeIdFlag | slotCountWideNextFlag;
+
+  /// Max live slots when both wide flags are reserved in the count word.
+  static const int maxSlotCount = 0x3FFF; // 16383
+
+  /// Fixed bytes after nodeId on wire: flags + 3×f32 + pkLen.
+  static const int _slotTailFixedBytes = 15; // 1+4+4+4+2
+
   /// Owning cluster/centroid ID.
   final int centroidId;
 
-  /// Next chained posting page packed ref (`partitionNo<<20|pageNo`), or -1.
-  int nextPostingPageNo;
+  /// Next chained posting page (none = end of chain).
+  ///
+  /// Wire: legacy pages store packed i32 at offset 4; when [needsWideNext],
+  /// offset 4 holds [wideNextSentinel] and u32+u32 follow before slots
+  /// (partition ≥2048 / pageNo ≥2^20 safe). Dims/count stay at offsets 8/10.
+  NghPageId nextPostingPage;
+
+  /// Legacy packed-int view of [nextPostingPage] (tryPack, or -1 if none/unrepresentable).
+  /// Prefer reading/writing [nextPostingPage] for partition ≥2048.
+  int get nextPostingPageNo {
+    if (nextPostingPage.isNone) return -1;
+    return nextPostingPage.tryPack() ?? -1;
+  }
+
+  set nextPostingPageNo(int packed) {
+    final next = packed <= 0 ? NghPageId.none : NghPageId.fromPacked(packed);
+    _setNextPostingPage(next);
+  }
 
   /// Vector dimensionality.
   final int dimensions;
 
   /// List of vector entries stored in this page.
+  ///
+  /// Prefer [addSlot] / [replaceSlots] for mutations so layout/centroid caches
+  /// stay coherent. Direct list edits must call [invalidateCaches].
   final List<NghPostingSlot> slots;
+
+  /// Cached [needsWideNodeIds]; null = unknown.
+  bool? _wideCache;
+
+  /// Cached [estimatePayloadSize]; null = unknown.
+  int? _payloadCache;
+
+  /// Running sum of slot low48 (unnormalized); null = unknown.
+  Float32List? _sum48;
+
+  /// Cached [needsWideNext]; null = unknown.
+  bool? _wideNextCache;
 
   NghPostingPage({
     required this.centroidId,
-    this.nextPostingPageNo = -1,
+    NghPageId? nextPostingPage,
+    int nextPostingPageNo = -1,
     required this.dimensions,
     required this.slots,
-  });
+  }) : nextPostingPage = nextPostingPage ??
+            (nextPostingPageNo <= 0
+                ? NghPageId.none
+                : NghPageId.fromPacked(nextPostingPageNo));
 
   /// Create an empty posting page for a cluster.
   factory NghPostingPage.empty({
@@ -245,56 +307,271 @@ final class NghPostingPage {
       centroidId: centroidId,
       dimensions: dimensions,
       slots: [],
-    );
+    )
+      .._wideCache = false
+      .._wideNextCache = false
+      .._payloadCache = 12
+      .._sum48 = Float32List(48);
+  }
+
+  /// Drop layout + centroid-sum caches (call after raw [slots] mutation).
+  void invalidateCaches() {
+    _wideCache = null;
+    _wideNextCache = null;
+    _payloadCache = null;
+    _sum48 = null;
+  }
+
+  void _setNextPostingPage(NghPageId next) {
+    if (next == nextPostingPage) return;
+    final prevWideNext = needsWideNext;
+    nextPostingPage = next;
+    _wideNextCache = null;
+    if (prevWideNext != needsWideNext) {
+      _payloadCache = null;
+    }
+  }
+
+  /// Assign next chain pointer (invalidates payload cache if header width changes).
+  void setNextPostingPage(NghPageId next) => _setNextPostingPage(next);
+
+  /// True when next cannot fit legacy i32 pack (or already encoded wide).
+  bool get needsWideNext {
+    final cached = _wideNextCache;
+    if (cached != null) return cached;
+    if (nextPostingPage.isNone) return _wideNextCache = false;
+    return _wideNextCache = nextPostingPage.tryPack() == null;
+  }
+
+  static int headerBytes({required bool wideNext}) => wideNext ? 20 : 12;
+
+  /// True when any slot needs u64 nodeId (page must encode in wide mode).
+  bool get needsWideNodeIds {
+    final cached = _wideCache;
+    if (cached != null) return cached;
+    for (final s in slots) {
+      if (s.nodeId > maxCompactNodeId) {
+        return _wideCache = true;
+      }
+    }
+    return _wideCache = false;
+  }
+
+  /// Wire bytes for one slot's fixed header (nodeId + tail), given page mode.
+  static int slotFixedHeaderBytes({required bool wideNodeIds}) =>
+      (wideNodeIds ? 8 : 4) + _slotTailFixedBytes;
+
+  int _slotPkLen(NghPostingSlot s) => s.primaryKeyUtf8.length;
+
+  /// Append one slot and keep wide/payload/sum caches incremental (O(1) / O(48)).
+  void addSlot(NghPostingSlot slot) {
+    final pkLen = _slotPkLen(slot);
+    final wasWide = needsWideNodeIds;
+    final becomesWide = !wasWide && slot.nodeId > maxCompactNodeId;
+    if (becomesWide) {
+      // Compact→wide: every existing slot gains 4 header bytes.
+      final prev = _payloadCache ?? estimatePayloadSize();
+      slots.add(slot);
+      _wideCache = true;
+      _payloadCache = prev +
+          (slots.length - 1) * 4 +
+          slotFixedHeaderBytes(wideNodeIds: true) +
+          pkLen +
+          dimensions;
+    } else {
+      final prev = _payloadCache ?? estimatePayloadSize();
+      slots.add(slot);
+      // wasWide already true, or slot is compact — wide flag unchanged unless
+      // slot itself is wide (only reachable when wasWide).
+      if (slot.nodeId > maxCompactNodeId) _wideCache = true;
+      _payloadCache = prev +
+          slotFixedHeaderBytes(wideNodeIds: wasWide) +
+          pkLen +
+          dimensions;
+    }
+    _addToSum48(slot);
+  }
+
+  /// Pop the last slot; reverses sum when warm, drops layout caches (wide may
+  /// have been solely due to the removed slot).
+  void removeLastSlot() {
+    if (slots.isEmpty) return;
+    final last = slots.removeLast();
+    if (_sum48 != null) {
+      final low = last.getLow48D(48);
+      final sum = _sum48!;
+      for (int d = 0; d < 48; d++) {
+        sum[d] -= low[d];
+      }
+    }
+    _wideCache = null;
+    _payloadCache = null;
+  }
+
+  /// Replace all slots (split / rebuild); rebuilds caches in one pass.
+  void replaceSlots(List<NghPostingSlot> next) {
+    if (identical(next, slots)) {
+      _rebuildCachesFromSlots();
+      return;
+    }
+    slots
+      ..clear()
+      ..addAll(next);
+    _rebuildCachesFromSlots();
+  }
+
+  void _rebuildCachesFromSlots() {
+    var wide = false;
+    final wideNext = needsWideNext;
+    var payload = headerBytes(wideNext: wideNext);
+    final sum = Float32List(48);
+    for (final s in slots) {
+      if (s.nodeId > maxCompactNodeId) wide = true;
+      final pkLen = _slotPkLen(s);
+      // Header width depends on final page mode — second pass avoided by
+      // accumulating compact first then adding upgrade if wide.
+      payload += slotFixedHeaderBytes(wideNodeIds: false) + pkLen + dimensions;
+      final low = s.getLow48D(48);
+      for (int d = 0; d < 48; d++) {
+        sum[d] += low[d];
+      }
+    }
+    if (wide) payload += slots.length * 4;
+    _wideCache = wide;
+    _payloadCache = payload;
+    _sum48 = sum;
+  }
+
+  void _ensureSum48() {
+    if (_sum48 != null) return;
+    final sum = Float32List(48);
+    for (final s in slots) {
+      final low = s.getLow48D(48);
+      for (int d = 0; d < 48; d++) {
+        sum[d] += low[d];
+      }
+    }
+    _sum48 = sum;
+  }
+
+  void _addToSum48(NghPostingSlot slot) {
+    _ensureSum48();
+    final sum = _sum48!;
+    final low = slot.getLow48D(48);
+    for (int d = 0; d < 48; d++) {
+      sum[d] += low[d];
+    }
+  }
+
+  /// L2-normalized arithmetic mean of slot low48 (uses running sum when warm).
+  Float32List normalizedMean48() {
+    final count = slots.length;
+    final mean = Float32List(48);
+    if (count == 0) return mean;
+    _ensureSum48();
+    final sum = _sum48!;
+    double norm = 0.0;
+    final inv = 1.0 / count;
+    for (int d = 0; d < 48; d++) {
+      final v = sum[d] * inv;
+      mean[d] = v;
+      norm += v * v;
+    }
+    norm = sqrt(norm);
+    if (norm > 0) {
+      final scale = 1.0 / norm;
+      for (int d = 0; d < 48; d++) {
+        mean[d] *= scale;
+      }
+    }
+    return mean;
+  }
+
+  /// Extra payload bytes if [addingNodeId] forces a compact→wide page upgrade.
+  int wideUpgradeCostBytes(int addingNodeId) {
+    if (addingNodeId <= maxCompactNodeId || needsWideNodeIds) return 0;
+    return slots.length * 4;
   }
 
   /// Encode posting page payload.
   ///
-  /// **Frozen wire layout** (engine v4 and later). Do not change field widths
-  /// or drop inlined PK. `nextPostingPackedRef` is a hint; unrepresentable
-  /// locations write `-1`.
+  /// Base header (offsets fixed for legacy readers):
+  ///   [centroidId: u32][next: i32][dimensions: u16][slotCount: u16]
+  ///   next = packed ref | -1 (none) | [wideNextSentinel] (−2)
+  /// When next == [wideNextSentinel]:
+  ///   [nextPart: u32][nextPage: u32] then slots (total header 20 bytes)
+  /// slotCount bit15 = wide nodeId; bit14 = advisory wide-next flag.
   ///
-  /// `dimensions` is already u16 (max 65535). High-D indexes that cannot pack
-  /// one SQ8 slot into the database 16KB page use a larger per-index
-  /// [NghIndexMeta.postingPageSize] on **new** files only; existing 16KB
-  /// posting partitions are never rewritten.
-  ///
-  ///   [centroidId: u32][nextPostingPackedRef: i32][dimensions: u16][slotCount: u16]
-  ///   For each slot:
-  ///     [nodeId: u32][flags: u8][offset: f32][scale: f32][sqNorm: f32]
-  ///     [pkLen: u16][pkBytes: pkLen][sq8Codes: D bytes]
+  /// Untouched legacy pages stay compact forever. Only dirty pages that need
+  /// wide nodeId and/or wide next rewrite that page (no full-index rewrite).
   Uint8List encodePayload() {
     final slotCount = slots.length;
-    int totalBytes = 12; // 4 + 4 + 2 + 2
+    if (slotCount > maxSlotCount) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'NghPostingPage slotCount overflow: $slotCount > $maxSlotCount',
+        )
+      ]);
+    }
+    final wide = needsWideNodeIds;
+    final wideNext = needsWideNext;
+    final fixed = slotFixedHeaderBytes(wideNodeIds: wide);
+    final hdr = headerBytes(wideNext: wideNext);
+    int totalBytes = hdr;
 
     final pks =
         List<Uint8List>.filled(slotCount, Uint8List(0), growable: false);
     for (int i = 0; i < slotCount; i++) {
       final pkBytes = slots[i].primaryKeyUtf8;
       pks[i] = pkBytes;
-      totalBytes += 19 + pkBytes.length + dimensions;
+      totalBytes += fixed + pkBytes.length + dimensions;
     }
 
     final buf = Uint8List(totalBytes);
     final bd = ByteData.sublistView(buf);
 
     bd.setUint32(0, centroidId, Endian.little);
-    bd.setInt32(4, nextPostingPageNo, Endian.little);
-    bd.setUint16(8, dimensions, Endian.little);
-    bd.setUint16(10, slotCount, Endian.little);
+    var flags = 0;
+    if (wide) flags |= slotCountWideNodeIdFlag;
+    if (wideNext) flags |= slotCountWideNextFlag;
+    if (wideNext) {
+      bd.setInt32(4, wideNextSentinel, Endian.little);
+      bd.setUint16(8, dimensions, Endian.little);
+      bd.setUint16(10, slotCount | flags, Endian.little);
+      bd.setUint32(12, nextPostingPage.wirePartition, Endian.little);
+      bd.setUint32(16, nextPostingPage.wirePage, Endian.little);
+    } else {
+      final packed =
+          nextPostingPage.isNone ? -1 : (nextPostingPage.tryPack() ?? -1);
+      bd.setInt32(4, packed, Endian.little);
+      bd.setUint16(8, dimensions, Endian.little);
+      bd.setUint16(10, slotCount | flags, Endian.little);
+    }
 
-    int off = 12;
+    int off = hdr;
     for (int i = 0; i < slotCount; i++) {
       final slot = slots[i];
       final pkBytes = pks[i];
 
-      bd.setUint32(off, slot.nodeId, Endian.little);
-      buf[off + 4] = slot.flags;
-      bd.setFloat32(off + 5, slot.offset, Endian.little);
-      bd.setFloat32(off + 9, slot.scale, Endian.little);
-      bd.setFloat32(off + 13, slot.squaredNorm, Endian.little);
-      bd.setUint16(off + 17, pkBytes.length, Endian.little);
-      off += 19;
+      if (wide) {
+        PlatformByteData.setUint64(bd, off, slot.nodeId, Endian.little);
+        buf[off + 8] = slot.flags;
+        bd.setFloat32(off + 9, slot.offset, Endian.little);
+        bd.setFloat32(off + 13, slot.scale, Endian.little);
+        bd.setFloat32(off + 17, slot.squaredNorm, Endian.little);
+        bd.setUint16(off + 21, pkBytes.length, Endian.little);
+        off += 23;
+      } else {
+        bd.setUint32(off, slot.nodeId, Endian.little);
+        buf[off + 4] = slot.flags;
+        bd.setFloat32(off + 5, slot.offset, Endian.little);
+        bd.setFloat32(off + 9, slot.scale, Endian.little);
+        bd.setFloat32(off + 13, slot.squaredNorm, Endian.little);
+        bd.setUint16(off + 17, pkBytes.length, Endian.little);
+        off += 19;
+      }
 
       buf.setRange(off, off + pkBytes.length, pkBytes);
       off += pkBytes.length;
@@ -306,38 +583,70 @@ final class NghPostingPage {
     return buf;
   }
 
-  /// Decode posting page payload.
+  /// Decode posting page payload (compact/wide nodeId + compact/wide next).
   static NghPostingPage? tryDecodePayload(Uint8List bytes) {
     if (bytes.length < 12) return null;
     final bd = ByteData.sublistView(bytes);
 
     final cId = bd.getUint32(0, Endian.little);
-    final nextPg = bd.getInt32(4, Endian.little);
+    final nextRaw = bd.getInt32(4, Endian.little);
     final dims = bd.getUint16(8, Endian.little);
-    final count = bd.getUint16(10, Endian.little);
+    final countWord = bd.getUint16(10, Endian.little);
+    final wide = (countWord & slotCountWideNodeIdFlag) != 0;
+    final wideNext = nextRaw == wideNextSentinel;
+    final count = countWord & ~_slotCountFlagMask;
 
     if (dims == 0) return null;
 
-    int off = 12;
+    final NghPageId nextId;
+    final int off0;
+    if (wideNext) {
+      if (bytes.length < 20) return null;
+      nextId = NghPageId.fromWire(
+        bd.getUint32(12, Endian.little),
+        bd.getUint32(16, Endian.little),
+      );
+      off0 = 20;
+    } else {
+      nextId = NghPageId.fromPacked(nextRaw);
+      off0 = 12;
+    }
+
+    final fixed = slotFixedHeaderBytes(wideNodeIds: wide);
+    int off = off0;
     final slots = <NghPostingSlot>[];
 
     for (int i = 0; i < count; i++) {
-      if (off + 19 > bytes.length) break;
-      final nodeId = bd.getUint32(off, Endian.little);
-      final flags = bytes[off + 4];
-      final offset = bd.getFloat32(off + 5, Endian.little);
-      final scale = bd.getFloat32(off + 9, Endian.little);
-      final sqNorm = bd.getFloat32(off + 13, Endian.little);
-      final pkLen = bd.getUint16(off + 17, Endian.little);
-      off += 19;
+      if (off + fixed > bytes.length) break;
+      final int nodeId;
+      final int flags;
+      final double offset;
+      final double scale;
+      final double sqNorm;
+      final int pkLen;
+      if (wide) {
+        nodeId = PlatformByteData.getUint64(bd, off, Endian.little);
+        flags = bytes[off + 8];
+        offset = bd.getFloat32(off + 9, Endian.little);
+        scale = bd.getFloat32(off + 13, Endian.little);
+        sqNorm = bd.getFloat32(off + 17, Endian.little);
+        pkLen = bd.getUint16(off + 21, Endian.little);
+        off += 23;
+      } else {
+        nodeId = bd.getUint32(off, Endian.little);
+        flags = bytes[off + 4];
+        offset = bd.getFloat32(off + 5, Endian.little);
+        scale = bd.getFloat32(off + 9, Endian.little);
+        sqNorm = bd.getFloat32(off + 13, Endian.little);
+        pkLen = bd.getUint16(off + 17, Endian.little);
+        off += 19;
+      }
 
       if (off + pkLen + dims > bytes.length) break;
 
-      // Keep UTF-8 view; decode only when primaryKey is accessed.
       final pkBytes = Uint8List.sublistView(bytes, off, off + pkLen);
       off += pkLen;
 
-      // View into page buffer — avoid per-slot SQ8 copies on decode.
       final sq8Codes = Uint8List.sublistView(bytes, off, off + dims);
       off += dims;
 
@@ -354,12 +663,15 @@ final class NghPostingPage {
 
     final page = NghPostingPage(
       centroidId: cId,
-      nextPostingPageNo: nextPg,
+      nextPostingPage: nextId,
       dimensions: dims,
       slots: slots,
     );
-    // Disk wire has no low48; materialize once at decode so the first ANN
-    // probe does not pay per-slot SQ8→48D rebuild during scoring.
+    page._wideCache = wide;
+    page._wideNextCache = wideNext && !nextId.isNone;
+    if (slots.length == count) {
+      page._payloadCache = bytes.length;
+    }
     page.ensureLow48Ready();
     return page;
   }
@@ -368,7 +680,7 @@ final class NghPostingPage {
   /// Also materializes UTF-8 PK bytes so search emit never utf8.encodes per query.
   void ensureLow48Ready() {
     for (final s in slots) {
-      if ((s.flags & 0x01) != 0) continue;
+      if ((s.flags & NghPostingSlot.flagDeleted) != 0) continue;
       if (s.primaryKeyBytes == null) {
         final pk = s.cachedPrimaryKey;
         if (pk != null) {
@@ -391,12 +703,119 @@ final class NghPostingPage {
   }
 
   int estimatePayloadSize() {
-    int size = 12;
+    final cached = _payloadCache;
+    if (cached != null) return cached;
+    final wide = needsWideNodeIds;
+    final fixed = slotFixedHeaderBytes(wideNodeIds: wide);
+    int size = headerBytes(wideNext: needsWideNext);
     for (final s in slots) {
-      final pkLen = s.primaryKeyBytes?.length ?? s.primaryKey.length * 2;
-      size += 19 + pkLen + dimensions;
+      size += fixed + s.primaryKeyUtf8.length + dimensions;
     }
-    return size;
+    return _payloadCache = size;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Page-redo: full page (low-D) vs structure+PK (mid/high-D)
+  // ---------------------------------------------------------------------------
+
+  /// Below/equal: posting page redo stores full page bytes (cheap vs PK path).
+  /// Above: redo stores centroid/next/nodeId/flags/PK only; recovery reloads
+  /// vectors from the table and re-quantizes (avoids ~3× write amp at high-D).
+  static const int fullPageRedoMaxDimensions = 64;
+
+  /// Magic for compact posting redo payloads embedded in [PageRedoPageRecord].
+  static const int pkStructureRedoMagic = 0x4B50474E; // 'NGPK'
+
+  static bool prefersPkStructureRedo(int dimensions) =>
+      dimensions > fullPageRedoMaxDimensions;
+
+  static bool isPkStructureRedoPayload(Uint8List bytes) {
+    if (bytes.length < 4) return false;
+    return ByteData.sublistView(bytes).getUint32(0, Endian.little) ==
+        pkStructureRedoMagic;
+  }
+
+  /// Compact crash-redo body: page identity lives on the [PageRedoPageRecord];
+  /// this payload keeps centroid, next pointer, and per-slot nodeId/flags/PK.
+  Uint8List encodePkStructureRedoPayload() {
+    final slotCount = slots.length;
+    if (slotCount > maxSlotCount) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'NghPostingPage PK redo slotCount overflow: $slotCount > $maxSlotCount',
+        )
+      ]);
+    }
+    final pks = List<Uint8List>.generate(
+      slotCount,
+      (i) => slots[i].primaryKeyUtf8,
+      growable: false,
+    );
+    var total =
+        4 + 4 + 4 + 4 + 2 + 2; // magic+centroid+nextPart+nextPage+dims+count
+    for (final pk in pks) {
+      total += 8 + 1 + 2 + pk.length; // nodeId + flags + pkLen + pk
+    }
+    final buf = Uint8List(total);
+    final bd = ByteData.sublistView(buf);
+    bd.setUint32(0, pkStructureRedoMagic, Endian.little);
+    bd.setUint32(4, centroidId, Endian.little);
+    bd.setUint32(8, nextPostingPage.wirePartition, Endian.little);
+    bd.setUint32(12, nextPostingPage.wirePage, Endian.little);
+    bd.setUint16(16, dimensions, Endian.little);
+    bd.setUint16(18, slotCount, Endian.little);
+    var off = 20;
+    for (int i = 0; i < slotCount; i++) {
+      final s = slots[i];
+      final pk = pks[i];
+      PlatformByteData.setUint64(bd, off, s.nodeId, Endian.little);
+      buf[off + 8] = s.flags;
+      bd.setUint16(off + 9, pk.length, Endian.little);
+      off += 11;
+      buf.setRange(off, off + pk.length, pk);
+      off += pk.length;
+    }
+    return buf;
+  }
+
+  /// Decode [encodePkStructureRedoPayload] body, or null if not NGPK / truncated.
+  static ({
+    int centroidId,
+    NghPageId nextPostingPage,
+    int dimensions,
+    List<({int nodeId, int flags, Uint8List pkBytes})> slots,
+  })? tryDecodePkStructureRedoPayload(Uint8List bytes) {
+    if (!isPkStructureRedoPayload(bytes) || bytes.length < 20) return null;
+    final bd = ByteData.sublistView(bytes);
+    final centroidId = bd.getUint32(4, Endian.little);
+    final next = NghPageId.fromWire(
+      bd.getUint32(8, Endian.little),
+      bd.getUint32(12, Endian.little),
+    );
+    final dims = bd.getUint16(16, Endian.little);
+    final count = bd.getUint16(18, Endian.little);
+    if (dims == 0 || count > maxSlotCount) return null;
+    var off = 20;
+    final slots = <({int nodeId, int flags, Uint8List pkBytes})>[];
+    for (int i = 0; i < count; i++) {
+      if (off + 11 > bytes.length) return null;
+      final nodeId = PlatformByteData.getUint64(bd, off, Endian.little);
+      final flags = bytes[off + 8];
+      final pkLen = bd.getUint16(off + 9, Endian.little);
+      off += 11;
+      if (off + pkLen > bytes.length) return null;
+      final pkBytes = Uint8List.sublistView(bytes, off, off + pkLen);
+      off += pkLen;
+      slots.add((nodeId: nodeId, flags: flags, pkBytes: pkBytes));
+    }
+    return (
+      centroidId: centroidId,
+      nextPostingPage: next,
+      dimensions: dims,
+      slots: slots,
+    );
   }
 }
 

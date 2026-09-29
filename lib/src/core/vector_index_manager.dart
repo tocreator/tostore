@@ -20,6 +20,7 @@ import 'ngh_page.dart';
 import 'ngh_partition_manager.dart';
 import 'resource_manager.dart';
 import 'vector_cache.dart';
+import 'vector_quantizer.dart';
 import 'workload_scheduler.dart';
 import 'yield_controller.dart';
 
@@ -940,6 +941,128 @@ class VectorIndexManager {
   Future<NghIndexMeta?> getNghIndexMeta(
           TableContext table, IndexUid indexUid) =>
       _loadMeta(table, indexUid);
+
+  /// Rebuild a posting page image from an NGPK structure+PK redo payload.
+  ///
+  /// Loads live vectors from the table by primary key (file-backed),
+  /// re-quantizes to SQ8, and returns a full TPG2 page suitable for partition
+  /// write. Returns null when the payload is not NGPK or meta/schema is missing.
+  Future<Uint8List?> materializePostingPkRedoPage({
+    required TableContext table,
+    required IndexUid indexUid,
+    required Uint8List pkRedoPayload,
+  }) async {
+    final decoded =
+        NghPostingPage.tryDecodePkStructureRedoPayload(pkRedoPayload);
+    if (decoded == null) return null;
+
+    final meta = await _loadMeta(table, indexUid);
+    if (meta == null) return null;
+    final schema =
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
+    if (schema == null) return null;
+
+    final vectorIndexes =
+        _dataStore.tableMetaManager?.getVectorIndexesFor(schema) ??
+            const <IndexSchema>[];
+    String? fieldName;
+    for (final idx in vectorIndexes) {
+      final uid = _resolveVectorIndexUid(table, idx.fields.first);
+      if (uid == indexUid) {
+        fieldName = idx.fields.first;
+        break;
+      }
+    }
+    fieldName ??=
+        vectorIndexes.isNotEmpty ? vectorIndexes.first.fields.first : null;
+    if (fieldName == null) return null;
+
+    final pkName = schema.primaryKey;
+    final dims = decoded.dimensions;
+    final slots = <NghPostingSlot>[];
+    final emptyCodes = Uint8List(dims);
+
+    for (final s in decoded.slots) {
+      final pk = utf8.decode(s.pkBytes, allowMalformed: true);
+      if ((s.flags & NghPostingSlot.flagDeleted) != 0) {
+        slots.add(NghPostingSlot(
+          nodeId: s.nodeId,
+          flags: s.flags,
+          primaryKeyBytes: Uint8List.fromList(s.pkBytes),
+          sq8Codes: emptyCodes,
+          offset: 0,
+          scale: 1,
+          squaredNorm: 0,
+        ));
+        continue;
+      }
+
+      final rec = await _dataStore.tableDataManager.getRecordByPrimaryKey(
+        table,
+        pk,
+        readFromFileOnly: true,
+        decodeSchema: schema,
+      );
+      Float32List? f32;
+      if (rec != null) {
+        final prepared = _prepareInsertVectorsBatch(
+          records: [rec],
+          fieldName: fieldName,
+          primaryKeyField: pkName,
+          dimensions: dims,
+        );
+        if (prepared.vectors.isNotEmpty) {
+          f32 = prepared.vectors.first;
+        }
+      }
+      if (f32 == null) {
+        Logger.warn(
+          'NGH PK-redo missing table vector for pk="$pk" '
+          '(table=${table.tableUid}, index=$indexUid); slot kept empty',
+        );
+        slots.add(NghPostingSlot(
+          nodeId: s.nodeId,
+          flags: s.flags,
+          primaryKeyBytes: Uint8List.fromList(s.pkBytes),
+          sq8Codes: emptyCodes,
+          offset: 0,
+          scale: 1,
+          squaredNorm: 0,
+        ));
+        continue;
+      }
+
+      final sq8 = ScalarQuantizer.quantize(f32);
+      slots.add(NghPostingSlot(
+        nodeId: s.nodeId,
+        flags: s.flags,
+        primaryKeyBytes: Uint8List.fromList(s.pkBytes),
+        sq8Codes: sq8.codes,
+        offset: sq8.offset,
+        scale: sq8.scale,
+        squaredNorm: sq8.squaredNorm,
+      ));
+    }
+
+    final page = NghPostingPage(
+      centroidId: decoded.centroidId,
+      nextPostingPage: decoded.nextPostingPage,
+      dimensions: dims,
+      slots: slots,
+    );
+    page.ensureLow48Ready();
+    final pageSize = _partitionManager.pageSizeFor(
+      NghDataCategory.posting,
+      meta,
+    );
+    final encrypt =
+        _dataStore.config.encryptionConfig?.shouldEncryptVectorIndex ?? false;
+    return _partitionManager.buildPostingPageBytes(
+      page: page,
+      pageSize: pageSize,
+      encrypt: encrypt,
+    );
+  }
 
   /// Load meta from disk with coalesce: concurrent callers share a single I/O.
   Future<NghIndexMeta?> _loadMeta(TableContext table, IndexUid indexUid) {
