@@ -1321,6 +1321,9 @@ final class NghNavBTreePage {
     required this.entries,
   });
 
+  /// Approximate resident bytes for TreeCache budgeting (object + 48-D vectors).
+  int estimateResidentBytes() => 96 + entries.length * 280;
+
   Uint8List encodePayload() {
     final count = entries.length;
     if (count > 79) {
@@ -1414,6 +1417,10 @@ final class NghNavRootPage {
 
   final int lowDim;
   final int fullDim;
+
+  /// High-water centroid id for leaf splits (persisted; avoids full L1 scan on open).
+  final int nextCentroidId;
+
   final List<
           ({int rootId, NghPageId firstInternalPage, Float32List centroid48D})>
       roots;
@@ -1421,6 +1428,7 @@ final class NghNavRootPage {
   NghNavRootPage({
     this.lowDim = 48,
     required this.fullDim,
+    this.nextCentroidId = 0,
     required this.roots,
   });
 
@@ -1435,7 +1443,7 @@ final class NghNavRootPage {
     bd.setUint16(6, count, Endian.little);
     bd.setUint16(8, lowDim, Endian.little);
     bd.setUint16(10, fullDim, Endian.little);
-    bd.setUint32(12, 0, Endian.little); // reserved
+    bd.setUint32(12, nextCentroidId, Endian.little);
 
     int off = headerSize;
     for (int i = 0; i < count; i++) {
@@ -1464,6 +1472,7 @@ final class NghNavRootPage {
     final count = bd.getUint16(6, Endian.little);
     final lDim = bd.getUint16(8, Endian.little);
     final fDim = bd.getUint16(10, Endian.little);
+    final nextCentroidId = bd.getUint32(12, Endian.little);
 
     int off = headerSize;
     final roots = <({
@@ -1494,6 +1503,7 @@ final class NghNavRootPage {
     return NghNavRootPage(
       lowDim: lDim,
       fullDim: fDim,
+      nextCentroidId: nextCentroidId,
       roots: roots,
     );
   }

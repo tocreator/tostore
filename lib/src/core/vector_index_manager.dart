@@ -43,6 +43,13 @@ class VectorIndexManager {
   /// Key: "$tableUid/$fieldName"
   final Map<String, IndexUid?> _fieldIndexUidCache = {};
 
+  /// Last applied budgets; skip reconfigure when ResourceManager re-syncs
+  /// with unchanged thresholds.
+  int? _lastSyncedIndexBudget;
+  int? _lastSyncedVectorBudget;
+  int? _lastSyncedNavBudget;
+  int? _lastSyncedPostingBudget;
+
   VectorIndexManager(this._dataStore) {
     _partitionManager = NghPartitionManager(_dataStore);
     _graphEngine = NghGraphEngine(_partitionManager);
@@ -56,11 +63,11 @@ class VectorIndexManager {
     return 128 * 1024 * 1024;
   }
 
-  /// Compact SQ8 search cache budget.
+  /// Compact SQ8 search cache budget (cluster + paged leaf share this).
   ///
-  /// Lazily anchors to [vectorCacheBudgetRatio] (default 50%) of the total memory threshold.
-  /// This allocation is zero-cost when no vector queries occur, but prevents disk I/O
-  /// thrashing under large corpora (e.g. 1M 512D vectors) by keeping posting clusters in memory.
+  /// Anchors to [vectorCacheBudgetRatio] (default 50%) of the total memory
+  /// threshold. Floor 64MB matches the former configure-side lift so engine
+  /// apply can take the resolved value as-is.
   int _resolveCompactVectorClusterBudget() {
     final totalBudgetMB = _dataStore.resourceManager?.memoryThresholdInMB ?? 0;
     final resolvedMB = totalBudgetMB > 0
@@ -69,21 +76,22 @@ class VectorIndexManager {
     final ratio =
         (_dataStore.config.vectorCacheBudgetRatio ?? 0.50).clamp(0.10, 0.85);
     final targetBytes = (resolvedMB * 1024 * 1024 * ratio).round();
-    return max(32 * 1024 * 1024, targetBytes);
+    return max(64 * 1024 * 1024, targetBytes);
   }
 
-  /// Resolve navigating centroid graph cache budget.
+  /// Resolve navigating centroid graph cache budget from [clusterBudget].
   ///
-  /// Nav graph is the entry routing backbone. Keeping it 100% in RAM prevents
-  /// disk I/O jitter during centroid navigation across millions/billions of vectors.
-  /// Minimum floor: 32MB on mobile, 128MB on desktop/server.
-  /// Dynamically expands to ~15% of the total vector cache budget.
-  int _resolveNavGraphCacheBudget() {
-    final clusterBudget = _resolveCompactVectorClusterBudget();
-    final floor =
+  /// Legacy flat nav_graph may stay fully resident under this budget.
+  /// Paged Centroid B+Tree keeps only L0 roots always-hot; L1 internal pages
+  /// share this budget via an LRU page cache so billion-scale indexes do not
+  /// OOM from full-chain residency.
+  /// Platform floor: 32MB mobile / 128MB desktop; absolute floor 64MB.
+  /// Dynamically expands to ~15% of the vector cache budget.
+  int _resolveNavGraphCacheBudget(int clusterBudget) {
+    final platformFloor =
         PlatformHandler.isMobile ? 32 * 1024 * 1024 : 128 * 1024 * 1024;
     final targetBytes = (clusterBudget * 0.15).round();
-    return max(floor, targetBytes);
+    return max(64 * 1024 * 1024, max(platformFloor, targetBytes));
   }
 
   /// Re-apply cache ceilings after ResourceManager computes real quotas.
@@ -94,15 +102,26 @@ class VectorIndexManager {
   void syncClusterCacheBudget() {
     final indexBudget = _resolveIndexCacheBudget();
     final vectorBudget = _resolveCompactVectorClusterBudget();
-    _graphEngine.configureClusterCacheBudget(vectorBudget);
-    _graphEngine.configureBTreeLeafCacheBudget(vectorBudget);
-    _graphEngine.configureNavGraphCacheBudget(_resolveNavGraphCacheBudget());
+    final navBudget = _resolveNavGraphCacheBudget(vectorBudget);
     // Posting fill layer: max(index*30%, vector*45%) so paged search survives
     // large insert bursts without immediate TreeCache eviction.
     final postingBudget = max(
       (indexBudget * 0.30).round(),
       (vectorBudget * 0.45).round(),
     );
+    if (_lastSyncedIndexBudget == indexBudget &&
+        _lastSyncedVectorBudget == vectorBudget &&
+        _lastSyncedNavBudget == navBudget &&
+        _lastSyncedPostingBudget == postingBudget) {
+      return;
+    }
+    _lastSyncedIndexBudget = indexBudget;
+    _lastSyncedVectorBudget = vectorBudget;
+    _lastSyncedNavBudget = navBudget;
+    _lastSyncedPostingBudget = postingBudget;
+
+    _graphEngine.configureVectorSearchCacheBudget(vectorBudget);
+    _graphEngine.configureNavGraphCacheBudget(navBudget);
     _partitionManager.syncCacheBudget(
       indexBudget: indexBudget,
       vectorPostingBudget: postingBudget,
