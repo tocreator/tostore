@@ -156,16 +156,23 @@ final class OverflowManager {
           flush: flush,
         );
 
-        final diskMeta = await _healMetaIfAheadOfFile(
-          path: path,
-          pageSize: pageSize,
-          partitionNo: activePNo,
-          encryptionKey: encryptionKey,
-          encryptionKeyId: encryptionKeyId,
-          flush: flush,
-        );
-        // Prefer in-flight reservation so concurrent/chunked allocs stack.
-        final meta = _inflightMeta[path] ?? diskMeta;
+        final PartitionMetaPage meta;
+        final inflight = _inflightMeta[path];
+        if (inflight != null) {
+          // Active batch reservations are intentionally ahead of durable file
+          // bytes (pages are written later). Healing would shrink meta and
+          // reissue page numbers already handed to the allocator.
+          meta = inflight;
+        } else {
+          meta = await _healMetaIfAheadOfFile(
+            path: path,
+            pageSize: pageSize,
+            partitionNo: activePNo,
+            encryptionKey: encryptionKey,
+            encryptionKeyId: encryptionKeyId,
+            flush: flush,
+          );
+        }
 
         final growRoom = pageSize <= 0
             ? 0
@@ -372,7 +379,7 @@ final class OverflowManager {
     );
   }
 
-  /// Commit every segment reserved by [allocator].
+  /// Commit every partition reserved by [allocator].
   Future<void> commitBatchAllocation({
     required TableContext table,
     required OverflowBatchAllocator allocator,
@@ -393,7 +400,7 @@ final class OverflowManager {
     }
   }
 
-  /// Roll back every segment reserved by [allocator].
+  /// Roll back every partition reserved by [allocator].
   Future<void> rollbackBatchAllocation({
     required TableContext table,
     required OverflowBatchAllocator allocator,
@@ -402,7 +409,9 @@ final class OverflowManager {
     int? encryptionKeyId,
     bool flush = false,
   }) async {
-    for (final seg in allocator.segments) {
+    // One segment per partition (first rollbackMeta). Reverse is harmless and
+    // keeps same-partition layering safe if that invariant ever changes.
+    for (final seg in allocator.segments.reversed) {
       final prev = seg.rollbackMeta;
       if (prev == null) continue;
       try {
@@ -419,8 +428,13 @@ final class OverflowManager {
     }
   }
 
+  /// Reserve overflow pages for a known list of ValueRef chain lengths.
+  ///
+  /// Packs **whole chains** into partitions (never splits one chain across
+  /// files, never reserves unusable leftovers). Each reserved page is assigned
+  /// to exactly one chain and will be written by a matching [next] / stage call.
   Future<OverflowBatchAllocator> startBatchAllocation({
-    required int totalChunks,
+    required List<int> chainPageCounts,
     required TableContext table,
     required int pageSize,
     int overflowPartitionCount = 1,
@@ -428,65 +442,222 @@ final class OverflowManager {
     int? encryptionKeyId,
     bool flush = true,
   }) async {
-    if (totalChunks <= 0) {
+    final filtered = <int>[
+      for (final c in chainPageCounts)
+        if (c > 0) c,
+    ];
+    if (filtered.isEmpty) {
       return OverflowBatchAllocator(
-        segments: const [],
+        segments: <OverflowAllocSegment>[],
+        chains: const [],
         updatedOverflowPartitionCount:
             overflowPartitionCount < 1 ? 1 : overflowPartitionCount,
       );
     }
 
-    var remaining = totalChunks;
     var partitionCount =
         overflowPartitionCount < 1 ? 1 : overflowPartitionCount;
-    final segments = <OverflowAllocSegment>[];
+    final chains = <OverflowChainSlot>[];
+    final segmentsByPartition = <int, OverflowAllocSegment>{};
     var totalSizeDelta = 0;
-    // Guard against allocate-returning-0 loops.
     var emptyRounds = 0;
+    var index = 0;
 
-    while (remaining > 0) {
-      final allocRes = await _allocatePages(
-        count: remaining,
+    while (index < filtered.length) {
+      final packed = await _allocatePackedChains(
+        chainPageCounts: filtered,
+        startIndex: index,
         table: table,
         pageSize: pageSize,
         overflowPartitionCount: partitionCount,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
         flush: flush,
-        requireAllInOnePartition: false,
       );
-      if (allocRes.pageNos.isEmpty) {
+      if (packed.pageNos.isEmpty || packed.packedCounts.isEmpty) {
         if (++emptyRounds > 8) {
           throw DbException([
             GeneralStatus(
               type: ResultType.sysResourceExhausted,
               message: 'Overflow batch allocation made no progress '
-                  '(remaining=$remaining, partitions=$partitionCount)',
+                  '(remainingChains=${filtered.length - index}, '
+                  'partitions=$partitionCount)',
             ),
           ]);
         }
-        // Force open a new partition slot and retry.
-        partitionCount =
-            max(partitionCount, allocRes.updatedPartitionCount) + 1;
+        partitionCount += 1;
         continue;
       }
       emptyRounds = 0;
-      segments.add(OverflowAllocSegment(
-        partitionNo: allocRes.partitionNo,
-        pages: allocRes.pageNos,
-        rollbackMeta: allocRes.rollbackMeta,
-        sizeDeltaBytes: allocRes.sizeDeltaBytes,
-      ));
-      totalSizeDelta += allocRes.sizeDeltaBytes;
-      partitionCount = max(partitionCount, allocRes.updatedPartitionCount);
-      remaining -= allocRes.pageNos.length;
+
+      var pageOffset = 0;
+      for (final len in packed.packedCounts) {
+        chains.add(OverflowChainSlot(
+          partitionNo: packed.partitionNo,
+          pages: packed.pageNos.sublist(pageOffset, pageOffset + len),
+        ));
+        pageOffset += len;
+      }
+
+      final existing = segmentsByPartition[packed.partitionNo];
+      if (existing == null) {
+        segmentsByPartition[packed.partitionNo] = OverflowAllocSegment(
+          partitionNo: packed.partitionNo,
+          pages: packed.pageNos,
+          rollbackMeta: packed.rollbackMeta,
+          sizeDeltaBytes: packed.sizeDeltaBytes,
+        );
+      } else {
+        // Same partition revisited after packing more chains: keep the earliest
+        // rollback meta so a full batch rollback restores the pre-batch state.
+        segmentsByPartition[packed.partitionNo] = OverflowAllocSegment(
+          partitionNo: packed.partitionNo,
+          pages: <int>[...existing.pages, ...packed.pageNos],
+          rollbackMeta: existing.rollbackMeta,
+          sizeDeltaBytes: existing.sizeDeltaBytes + packed.sizeDeltaBytes,
+        );
+      }
+
+      totalSizeDelta += packed.sizeDeltaBytes;
+      partitionCount = max(partitionCount, packed.updatedPartitionCount);
+      index += packed.packedCounts.length;
     }
 
     return OverflowBatchAllocator(
-      segments: segments,
+      segments: List<OverflowAllocSegment>.unmodifiable(
+        segmentsByPartition.values,
+      ),
+      chains: chains,
       updatedOverflowPartitionCount: partitionCount,
       sizeDeltaBytes: totalSizeDelta,
     );
+  }
+
+  /// Place as many whole chains as fit in one partition allocation.
+  Future<
+      ({
+        int partitionNo,
+        List<int> pageNos,
+        List<int> packedCounts,
+        int updatedPartitionCount,
+        int sizeDeltaBytes,
+        PartitionMetaPage? rollbackMeta,
+      })> _allocatePackedChains({
+    required List<int> chainPageCounts,
+    required int startIndex,
+    required TableContext table,
+    required int pageSize,
+    required int overflowPartitionCount,
+    Uint8List? encryptionKey,
+    int? encryptionKeyId,
+    bool flush = true,
+  }) async {
+    int activePNo =
+        (overflowPartitionCount - 1) < 0 ? 0 : overflowPartitionCount - 1;
+    int currentCount = overflowPartitionCount < 1 ? 1 : overflowPartitionCount;
+    final maxPartitionSize = _dataStore.config.maxPartitionFileSize;
+    var rotations = 0;
+    const maxRotations = 256;
+
+    while (true) {
+      final path = _overflowPath(table, activePNo);
+      final allocated = await _getLock(path).synchronized(() async {
+        await _ensureFileInitialized(
+          path: path,
+          pageSize: pageSize,
+          partitionNo: activePNo,
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+          flush: flush,
+        );
+
+        final PartitionMetaPage meta;
+        final inflight = _inflightMeta[path];
+        if (inflight != null) {
+          meta = inflight;
+        } else {
+          meta = await _healMetaIfAheadOfFile(
+            path: path,
+            pageSize: pageSize,
+            partitionNo: activePNo,
+            encryptionKey: encryptionKey,
+            encryptionKeyId: encryptionKeyId,
+            flush: flush,
+          );
+        }
+
+        final growRoom = pageSize <= 0
+            ? 0
+            : max(0, (maxPartitionSize - meta.totalSizeBytes) ~/ pageSize);
+        final available = meta.freePageCount + growRoom;
+        final bool isEmptyPartition = meta.totalSizeBytes <= pageSize;
+
+        final packedCounts = <int>[];
+        var pagesNeeded = 0;
+        for (var j = startIndex; j < chainPageCounts.length; j++) {
+          final c = chainPageCounts[j];
+          if (c <= 0) continue;
+          if (pagesNeeded + c <= available) {
+            packedCounts.add(c);
+            pagesNeeded += c;
+            continue;
+          }
+          // Chain does not fit. Soft-max overrun only for an empty partition
+          // file so a single huge ValueRef can still land in one file.
+          if (packedCounts.isEmpty && isEmptyPartition) {
+            packedCounts.add(c);
+            pagesNeeded += c;
+          }
+          break;
+        }
+
+        if (packedCounts.isEmpty || pagesNeeded <= 0) {
+          return null; // Rotate
+        }
+
+        final pageAlloc = await _allocatePageNos(
+          count: pagesNeeded,
+          path: path,
+          pageSize: pageSize,
+          partitionNo: activePNo,
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+          flush: flush,
+          cachedMeta: meta,
+        );
+        return (
+          pageNos: pageAlloc.pageNos,
+          packedCounts: packedCounts,
+          sizeDeltaBytes: pageAlloc.sizeDeltaBytes,
+          rollbackMeta: pageAlloc.rollbackMeta,
+        );
+      });
+
+      if (allocated != null) {
+        return (
+          partitionNo: activePNo,
+          pageNos: allocated.pageNos,
+          packedCounts: allocated.packedCounts,
+          updatedPartitionCount: currentCount,
+          sizeDeltaBytes: allocated.sizeDeltaBytes,
+          rollbackMeta: allocated.rollbackMeta,
+        );
+      }
+
+      if (++rotations > maxRotations) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.sysResourceExhausted,
+            message:
+                'Overflow chain packing failed after skipping $maxRotations '
+                'full partitions (last=$activePNo)',
+          ),
+        ]);
+      }
+
+      activePNo += 1;
+      currentCount = activePNo + 1;
+    }
   }
 
   Future<OverflowAllocationResult> putLargeValue({
@@ -525,8 +696,7 @@ final class OverflowManager {
     PartitionMetaPage? localRollbackMeta;
 
     if (allocator != null) {
-      // next() may advance to a later segment so the whole value fits in one
-      // partition; read partitionNo after the reservation.
+      // Pre-assigned whole-chain reservation from startBatchAllocation.
       pageNos = allocator.next(chunks.length);
       targetPartitionNo = allocator.partitionNo;
       updatedPartitionCount = allocator.updatedOverflowPartitionCount;
@@ -583,25 +753,33 @@ final class OverflowManager {
         writeBuffer.addWrites(path, writes);
         if (writeBuffer.pendingBytes >= OverflowWriteBuffer.maxStagedBytes) {
           await writeBuffer.commit(_dataStore.storage, flush: false);
+          // Batch reservations stay in [_inflightMeta] until
+          // [commitBatchAllocation]. Committing the full reservation while
+          // only a prefix of pages is on disk makes meta ahead of the file;
+          // a later alloc would heal/shrink and reissue those page numbers.
+          if (allocator == null) {
+            await _commitInflightMeta(
+              path: path,
+              pageSize: pageSize,
+              partitionNo: targetPartitionNo,
+              encryptionKey: encryptionKey,
+              encryptionKeyId: encryptionKeyId,
+              flush: false,
+            );
+          }
+        }
+      } else {
+        await _dataStore.storage.writeManyAsBytesAt(path, writes, flush: flush);
+        if (allocator == null) {
           await _commitInflightMeta(
             path: path,
             pageSize: pageSize,
             partitionNo: targetPartitionNo,
             encryptionKey: encryptionKey,
             encryptionKeyId: encryptionKeyId,
-            flush: false,
+            flush: flush,
           );
         }
-      } else {
-        await _dataStore.storage.writeManyAsBytesAt(path, writes, flush: flush);
-        await _commitInflightMeta(
-          path: path,
-          pageSize: pageSize,
-          partitionNo: targetPartitionNo,
-          encryptionKey: encryptionKey,
-          encryptionKeyId: encryptionKeyId,
-          flush: flush,
-        );
       }
     } catch (e) {
       // Solo alloc: drop reservation immediately. Batch allocators are rolled
@@ -641,6 +819,86 @@ final class OverflowManager {
       ref: ref,
       overflowPartitionCount: updatedPartitionCount,
       sizeDeltaBytes: sizeDeltaBytes,
+    );
+  }
+
+  /// Synchronous batch staging: take a pre-reserved chain and append page
+  /// writes to [writeBuffer] without scheduling a microtask.
+  ///
+  /// Returns whether the caller should await [OverflowWriteBuffer.commit].
+  /// Does **not** commit overflow meta; that stays in-flight until
+  /// [commitBatchAllocation].
+  ({OverflowAllocationResult result, bool bufferNeedsCommit})
+      stageLargeValueWithAllocator({
+    required TableContext table,
+    required Uint8List valueBytes,
+    required int pageSize,
+    required OverflowBatchAllocator allocator,
+    required OverflowWriteBuffer writeBuffer,
+    Uint8List? encryptionKey,
+    int? encryptionKeyId,
+  }) {
+    if (valueBytes.isEmpty) {
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.engError,
+          message: 'stage large value: valueBytes must not be empty',
+          parameterName: 'valueBytes',
+          passedValue: valueBytes.length,
+        ),
+      ]);
+    }
+
+    final crc = Crc32.of(valueBytes);
+    final maxChunk = _maxChunkLen(
+      pageSize,
+      encryptionKeyId: encryptionKeyId,
+    );
+    final chunks = _splitIntoChunks(valueBytes, maxChunk);
+    final pageNos = allocator.next(chunks.length);
+    final targetPartitionNo = allocator.partitionNo;
+    final path = _overflowPath(table, targetPartitionNo);
+
+    final writes = <ByteWrite>[];
+    for (int i = 0; i < pageNos.length; i++) {
+      final pn = pageNos[i];
+      final next = (i + 1 < pageNos.length) ? pageNos[i + 1] : -1;
+      final page = OverflowPage(nextPageNo: next, data: chunks[i]);
+      final payload = page.encodePayload();
+      final encodedPayload = BTreePageCodec.encodePayload(
+        payload,
+        config: _dataStore.config,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+        aad: _aadForOverflowPage(targetPartitionNo, pn),
+      );
+      writes.add(ByteWrite(
+        offset: pn * pageSize,
+        bytes: BTreePageIO.buildPageBytes(
+          type: BTreePageType.overflow,
+          encodedPayload: encodedPayload,
+          pageSize: pageSize,
+        ),
+      ));
+      _pageCache.putPoint3(table.tableUid, targetPartitionNo, pn, page);
+    }
+
+    writeBuffer.addWrites(path, writes);
+
+    final ref = ValueRef.overflow(
+      overflowPartitionNo: targetPartitionNo,
+      startPageNo: pageNos.first,
+      totalLen: valueBytes.length,
+      crc32: crc,
+    );
+    return (
+      result: OverflowAllocationResult(
+        ref: ref,
+        overflowPartitionCount: allocator.updatedOverflowPartitionCount,
+        sizeDeltaBytes: 0,
+      ),
+      bufferNeedsCommit:
+          writeBuffer.pendingBytes >= OverflowWriteBuffer.maxStagedBytes,
     );
   }
 
@@ -1330,33 +1588,45 @@ final class OverflowAllocSegment {
   });
 }
 
+/// Pages reserved for a single ValueRef overflow chain (one partition).
+final class OverflowChainSlot {
+  final int partitionNo;
+  final List<int> pages;
+
+  const OverflowChainSlot({
+    required this.partitionNo,
+    required this.pages,
+  });
+}
+
 /// Helper to allocate overflow pages in bulk across one or more partitions.
 ///
-/// Large mobile flushes (e.g. 50k vectors) often need more pages than a single
-/// [DataStoreConfig.maxPartitionFileSize] allows; segments keep each ValueRef
-/// chain inside one partition while spreading the batch across files.
+/// Chains are packed whole into partitions so each [next] call receives pages
+/// that already fit one ValueRef; no segment-boundary leftovers are reserved.
 class OverflowBatchAllocator {
+  /// One entry per touched overflow partition (for commit/rollback).
   final List<OverflowAllocSegment> segments;
+
+  /// Pre-assigned page lists in the same order callers will stage values.
+  final List<OverflowChainSlot> chains;
+
   final int updatedOverflowPartitionCount;
 
   /// File-size growth from the upfront batch allocation (freelist reuse => 0).
   final int sizeDeltaBytes;
 
-  int _segIndex = 0;
-  int _offset = 0;
+  int _chainIndex = 0;
+  int _lastPartitionNo = 0;
 
   OverflowBatchAllocator({
     required this.segments,
+    required this.chains,
     required this.updatedOverflowPartitionCount,
     this.sizeDeltaBytes = 0,
   });
 
   /// Partition used by the most recent successful [next] call.
-  int get partitionNo {
-    if (segments.isEmpty) return 0;
-    final i = _segIndex.clamp(0, segments.length - 1);
-    return segments[i].partitionNo;
-  }
+  int get partitionNo => _lastPartitionNo;
 
   /// First segment rollback meta (legacy single-partition callers).
   PartitionMetaPage? get rollbackMeta =>
@@ -1364,25 +1634,27 @@ class OverflowBatchAllocator {
 
   List<int> next(int count) {
     if (count <= 0) return const <int>[];
-    while (_segIndex < segments.length) {
-      final seg = segments[_segIndex];
-      final remaining = seg.pages.length - _offset;
-      if (remaining >= count) {
-        final range = seg.pages.sublist(_offset, _offset + count);
-        _offset += count;
-        return range;
-      }
-      // Not enough pages left in this segment for one ValueRef chain — move on.
-      // Leftover reserved pages stay allocated (small boundary waste).
-      _segIndex++;
-      _offset = 0;
+    if (_chainIndex >= chains.length) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Batch allocator exhausted: needed $count pages '
+              '(chainsUsed=$_chainIndex/${chains.length})',
+        ),
+      ]);
     }
-    throw DbException([
-      GeneralStatus(
-        type: ResultType.engError,
-        message: 'Batch allocator exhausted: needed $count pages',
-      ),
-    ]);
+    final slot = chains[_chainIndex++];
+    if (slot.pages.length != count) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Batch allocator chain size mismatch: reserved '
+              '${slot.pages.length} pages, requested $count',
+        ),
+      ]);
+    }
+    _lastPartitionNo = slot.partitionNo;
+    return slot.pages;
   }
 }
 

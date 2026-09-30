@@ -1368,7 +1368,7 @@ final class TableTreePartitionManager {
 
     // Pre-calculate overflow requirements and cache encoded records.
     final Map<String, Uint8List> preEncoded = {};
-    int totalOverflowChunks = 0;
+    final overflowChainPageCounts = <int>[];
 
     final putOps = <_TableOp>[];
     final putRecords = <Map<String, dynamic>>[];
@@ -1396,10 +1396,12 @@ final class TableTreePartitionManager {
 
         if (_dataStore.overflowManager
             .shouldExternalize(_dataStore.configuredPageSize, encoded.length)) {
-          totalOverflowChunks += _dataStore.overflowManager.estimatePageCount(
-            valueLen: encoded.length,
-            pageSize: _dataStore.configuredPageSize,
-            encryptionKeyId: encryptionKeyId,
+          overflowChainPageCounts.add(
+            _dataStore.overflowManager.estimatePageCount(
+              valueLen: encoded.length,
+              pageSize: _dataStore.configuredPageSize,
+              encryptionKeyId: encryptionKeyId,
+            ),
           );
         }
       }
@@ -1431,10 +1433,10 @@ final class TableTreePartitionManager {
       overflowAllocator = null;
     }
 
-    if (totalOverflowChunks > 0) {
+    if (overflowChainPageCounts.isNotEmpty) {
       final batchAllocator =
           await _dataStore.overflowManager.startBatchAllocation(
-        totalChunks: totalOverflowChunks,
+        chainPageCounts: overflowChainPageCounts,
         table: table,
         pageSize: _dataStore.configuredPageSize,
         overflowPartitionCount: meta.overflowPartitionCount,
@@ -1465,17 +1467,21 @@ final class TableTreePartitionManager {
               _dataStore.configuredPageSize, encoded.length)) {
             continue;
           }
-          final allocRes = await _dataStore.overflowManager.putLargeValue(
+          // Sync stage avoids 1 microtask per row; await only on buffer flush.
+          final staged =
+              _dataStore.overflowManager.stageLargeValueWithAllocator(
             table: table,
             valueBytes: encoded,
             pageSize: _dataStore.configuredPageSize,
-            overflowPartitionCount: meta.overflowPartitionCount,
-            encryptionKey: encryptionKey,
-            encryptionKeyId: encryptionKeyId,
-            flush: false,
             allocator: batchAllocator,
             writeBuffer: batchWriteBuffer,
+            encryptionKey: encryptionKey,
+            encryptionKeyId: encryptionKeyId,
           );
+          final allocRes = staged.result;
+          if (staged.bufferNeedsCommit) {
+            await batchWriteBuffer.commit(_storage, flush: false);
+          }
           overflowSizeDeltaSum += allocRes.sizeDeltaBytes;
           if (allocRes.overflowPartitionCount > meta.overflowPartitionCount) {
             meta = meta.copyWith(
@@ -1545,6 +1551,10 @@ final class TableTreePartitionManager {
               encryptionKey: encryptionKey,
               encryptionKeyId: encryptionKeyId,
             );
+            final overflowPath = _dataStore.pathManager
+                .getOverflowPartitionFilePathByContext(
+                    table, oldSv.ref!.overflowPartitionNo);
+            dirtyOverflowPaths.add(overflowPath);
           }
         } catch (_) {
           // Best effort on corruption.
