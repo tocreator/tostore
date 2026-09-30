@@ -962,6 +962,7 @@ class VectorSearchBenchmarkResult {
   static VectorSearchBenchmarkResult fromLatencies({
     required VectorRecallReport recall,
     required List<double> latenciesMs,
+    double? wallClockQps,
   }) {
     final sorted = List<double>.from(latenciesMs)..sort();
     final lastIdx = sorted.isEmpty ? 0 : sorted.length - 1;
@@ -982,7 +983,9 @@ class VectorSearchBenchmarkResult {
       p50LatencyMs: p50,
       p95LatencyMs: p95,
       p99LatencyMs: p99,
-      qps: avg > 0 ? 1000.0 / avg : 0.0,
+      // Prefer batch wall-clock QPS (matches benchmark_runner). Fallback to
+      // 1000/avg when only per-query samples are available.
+      qps: wallClockQps ?? (avg > 0 ? 1000.0 / avg : 0.0),
       totalSearches: sorted.length,
     );
   }

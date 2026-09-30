@@ -6,6 +6,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:tostore/tostore.dart';
 
+import 'testing/benchmark_schemas.dart';
 import 'testing/example_schemas.dart';
 import 'testing/log_service.dart';
 import 'testing/vector_recall.dart';
@@ -1006,6 +1007,8 @@ class ToStoreExample {
   ///
   /// [searchDepth] `>= 1` (null = engine default 50).
   /// Set [verbose] false to suppress per-run logs (used by depth sweeps).
+  ///
+  /// Throughput is measured like [BenchmarkRunner] vector search
   Future<VectorSearchBenchmarkResult?> vectorSearchBenchmark(
     String tableName,
     int iterations,
@@ -1013,6 +1016,7 @@ class ToStoreExample {
     int? searchDepth,
     bool verbose = true,
     bool runIdentityDiagnostic = true,
+    bool warmup = false,
   }) async {
     final depth = VectorRecallHarness.normalizeDepth(searchDepth);
     if (verbose) {
@@ -1059,12 +1063,18 @@ class ToStoreExample {
 
     Future<void> yieldUi() => Future<void>.delayed(Duration.zero);
 
+    // Recall@K only (capped). Latencies from this pass are quality-side noise
+    // — do not fold them into the throughput QPS sample.
+    final recallQueries = min(
+      max(1, iterations),
+      VectorRecallHarness.maxRecallQueries,
+    );
     final recall = await VectorRecallHarness.evaluate(
       db: db,
       tableName: tableName,
       topK: topK,
       searchDepth: depth,
-      requestedQueries: max(1, iterations),
+      requestedQueries: recallQueries,
       runIdentityDiagnostic: runIdentityDiagnostic,
       yieldUi: yieldUi,
       onLog: verbose ? (msg) => logService.add(msg, LogLevel.info) : null,
@@ -1073,58 +1083,88 @@ class ToStoreExample {
       return null;
     }
 
-    final latenciesMs = List<double>.from(recall.annLatenciesMs);
-    final extra = max(0, iterations - recall.queryCount);
-    if (extra > 0 && recall.queryVectors.isNotEmpty) {
+    final timedCount = max(1, iterations);
+    final groups = max(
+        1,
+        recall.completeGroups > 0
+            ? recall.completeGroups
+            : max(1, recall.corpusSize ~/ ExampleVectorCorpus.groupSize));
+
+    // Prebuild outside the stopwatch — groupQuery allocates/normalizes; doing
+    // that inside the timed loop roughly halves measured QPS.
+    final List<VectorData> queryVectors;
+    if (recall.queryVectors.isNotEmpty) {
+      queryVectors = [
+        for (var i = 0; i < timedCount; i++)
+          recall.queryVectors[i % recall.queryVectors.length],
+      ];
+    } else {
+      queryVectors = [
+        for (var i = 0; i < timedCount; i++)
+          ExampleVectorCorpus.groupQuery(i % groups, dims),
+      ];
+    }
+
+    var warmupCount = 0;
+    if (warmup) {
+      // Optional only — never default on for sweep / large corpora.
+      warmupCount = timedCount >= 1000
+          ? min(BenchmarkSchemas.vectorSearchWarmup, timedCount)
+          : min(200, timedCount);
       if (verbose) {
-        logService.add('Running $extra additional searches for latency...');
+        logService
+            .add('Warming $warmupCount searches before throughput timing...');
       }
-      final random = Random();
-      for (var i = 0; i < extra; i++) {
-        final queryVector = (recall.canScoreRecall && recall.completeGroups > 0)
-            ? ExampleVectorCorpus.groupQuery(
-                random.nextInt(recall.completeGroups),
-                recall.dimensions,
-              )
-            : recall.queryVectors[i % recall.queryVectors.length];
-        final querySw = Stopwatch()..start();
+      for (var i = 0; i < warmupCount; i++) {
         await db.vectorSearch(
           tableName,
           fieldName: vectorFieldName,
-          queryVector: queryVector,
+          queryVector: queryVectors[i % queryVectors.length],
           topK: topK,
           searchDepth: depth,
         );
-        querySw.stop();
-        latenciesMs.add(querySw.elapsedMicroseconds / 1000.0);
-
-        if (verbose &&
-            iterations >= 100 &&
-            (recall.queryCount + i + 1) % (iterations ~/ 5) == 0 &&
-            (recall.queryCount + i + 1) < iterations) {
-          final done = recall.queryCount + i + 1;
-          final pct = (done / iterations * 100).toStringAsFixed(0);
-          logService.add(
-              '⏳ Benchmark Progress: $done/$iterations completed ($pct%)...',
-              LogLevel.info);
-        }
-        if (i > 0 && i % 50 == 0) {
-          await yieldUi();
-        }
       }
+      await yieldUi();
     }
+
+    if (verbose) {
+      logService.add('Timing $timedCount searches (tight loop)...');
+    }
+    final latenciesMs = List<double>.filled(timedCount, 0.0);
+    final batchSw = Stopwatch()..start();
+    for (var i = 0; i < timedCount; i++) {
+      final querySw = Stopwatch()..start();
+      await db.vectorSearch(
+        tableName,
+        fieldName: vectorFieldName,
+        queryVector: queryVectors[i],
+        topK: topK,
+        searchDepth: depth,
+      );
+      querySw.stop();
+      latenciesMs[i] = querySw.elapsedMicroseconds / 1000.0;
+    }
+    batchSw.stop();
+
+    // Wall-clock QPS matches benchmark_runner (batch elapsed / count).
+    final wallClockQps = batchSw.elapsedMicroseconds > 0
+        ? timedCount / (batchSw.elapsedMicroseconds / 1e6)
+        : 0.0;
 
     final result = VectorSearchBenchmarkResult.fromLatencies(
       recall: recall,
       latenciesMs: latenciesMs,
+      wallClockQps: wallClockQps,
     );
 
     if (verbose) {
       _logVectorSearchBenchmarkSummary(
-        iterations: iterations,
+        iterations: timedCount,
         topK: topK,
         depth: depth,
         result: result,
+        warmupCount: warmupCount,
+        batchElapsedMs: batchSw.elapsedMicroseconds / 1000.0,
       );
     }
 
@@ -1159,6 +1199,7 @@ class ToStoreExample {
         searchDepth: depth,
         verbose: false,
         runIdentityDiagnostic: true,
+        warmup: false,
       );
       if (row != null) {
         rows.add(row);
@@ -1195,11 +1236,12 @@ class ToStoreExample {
     required int topK,
     required int depth,
     required VectorSearchBenchmarkResult result,
+    int warmupCount = 0,
+    double? batchElapsedMs,
   }) {
     final recall = result.recall;
-    final latenciesMs = List<double>.from(recall.annLatenciesMs);
     final totalSearchMs =
-        latenciesMs.isEmpty ? 0.0 : latenciesMs.reduce((a, b) => a + b);
+        batchElapsedMs ?? (result.avgLatencyMs * result.totalSearches);
 
     final recallPct = (recall.recallAtK * 100).toStringAsFixed(1);
     final identityPct = recall.identityAt1 == null
@@ -1226,6 +1268,9 @@ class ToStoreExample {
         '${recall.canScoreRecall ? '' : ' (latency only)'}');
     report.writeln(
         '  Total Executed       : ${result.totalSearches} searches (Top-$topK)');
+    if (warmupCount > 0) {
+      report.writeln('  Warmup (excluded)    : $warmupCount searches');
+    }
     report.writeln(
         '  Total Search Time    : ${totalSearchMs.toStringAsFixed(2)} ms');
     if (recall.gtElapsedMs > 0) {
