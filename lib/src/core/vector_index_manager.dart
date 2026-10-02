@@ -367,11 +367,11 @@ class VectorIndexManager {
               batchContext: batchContext,
             );
             await _removePendingDeletes(table, indexUid, pks);
-            // Incremental: reshape only this flush's dirty posting leaves into
-            // the search-hot leaf cache (no full-index clear/reload).
+            // Dirty reshape + search-hot top-up
             if (meta.layoutVersion >= NghIndexMeta.layoutPaged) {
               if (!_dataStore.shouldAbortBackgroundScan &&
-                  insertResult.dirtyPostingPages.isNotEmpty) {
+                  (insertResult.dirtyPostingPages.isNotEmpty ||
+                      insertResult.dirtyNavBTreePages.isNotEmpty)) {
                 await _graphEngine.promotePagedLeavesAfterInsert(
                   table: table,
                   indexUid: indexUid,
@@ -791,9 +791,11 @@ class VectorIndexManager {
   /// Prewarm vector index meta, nav, and posting into search-hot caches.
   ///
   /// **Open / explicit prewarm only** (Phase 2 of DataStore cache prewarm).
-  /// Respects [maxBytes] and cluster/leaf soft ceilings. Never invoked from
-  /// writeChanges — flush only promotes dirty pages of that batch.
-  /// Returns approximate bytes added to the posting/cluster hot cache.
+  /// Always runs on open (including large spaces that skip row/index warm).
+  /// Default ceiling is the dedicated vector compact budget from
+  /// [vectorCacheBudgetRatio]; optional [maxBytes] can only shrink it.
+  /// Never invoked from writeChanges — flush only promotes dirty pages of
+  /// that batch. Returns approximate bytes added to the posting/cluster hot cache.
   Future<int> prewarmVectorIndex(
     TableContext table,
     IndexUid indexUid, {
@@ -809,6 +811,8 @@ class VectorIndexManager {
       }
       await _graphEngine.prefetchNavGraph(table, indexUid, meta: meta);
 
+      // Dedicated vector ceiling (vectorCacheBudgetRatio); caller maxBytes
+      // may only tighten — never expand past the compact cluster budget.
       final defaultBudget = _defaultPrewarmBudget();
       final budget =
           maxBytes != null ? min(maxBytes, defaultBudget) : defaultBudget;

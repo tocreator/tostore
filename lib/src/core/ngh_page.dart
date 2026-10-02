@@ -158,17 +158,48 @@ final class NghPostingSlot {
   Float32x4List getLow48DSimd(int dimensions) {
     if (low48DSimd != null) return low48DSimd!;
     final low = Float32List(48);
-    final limit = dimensions < 48 ? dimensions : 48;
-    double norm = 0.0;
-    for (int d = 0; d < limit; d++) {
-      final val = offset + sq8Codes[d] * scale;
-      low[d] = val;
-      norm += val * val;
-    }
-    norm = sqrt(norm);
-    if (norm > 0) {
-      for (int d = 0; d < limit; d++) {
-        low[d] /= norm;
+    final dims = dimensions < 1 ? sq8Codes.length : dimensions;
+    final n = min(dims, sq8Codes.length);
+    if (n <= 48) {
+      double norm = 0.0;
+      for (int d = 0; d < n; d++) {
+        final val = offset + sq8Codes[d] * scale;
+        low[d] = val;
+        norm += val * val;
+      }
+      if (norm > 0) {
+        final inv = 1.0 / sqrt(norm);
+        for (int d = 0; d < n; d++) {
+          low[d] *= inv;
+        }
+      }
+    } else {
+      // Match NghGraphEngine._extractLow48Into: fold SQ8 dims into 48 bins.
+      // Chunked path avoids per-element modulo (materialize / cold-page cost).
+      for (int i = 0; i < 48; i++) {
+        low[i] = 0.0;
+      }
+      final fullChunks = n - (n % 48);
+      var d = 0;
+      while (d < fullChunks) {
+        for (int i = 0; i < 48; i++) {
+          low[i] += offset + sq8Codes[d + i] * scale;
+        }
+        d += 48;
+      }
+      while (d < n) {
+        low[d - fullChunks] += offset + sq8Codes[d] * scale;
+        d++;
+      }
+      double norm = 0.0;
+      for (int i = 0; i < 48; i++) {
+        norm += low[i] * low[i];
+      }
+      if (norm > 0) {
+        final inv = 1.0 / sqrt(norm);
+        for (int i = 0; i < 48; i++) {
+          low[i] *= inv;
+        }
       }
     }
     low48D = low;

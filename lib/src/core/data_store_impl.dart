@@ -7115,10 +7115,10 @@ class DataStoreImpl {
       await _resourceManager?.ensureInitialized();
       _vectorIndexManager?.syncClusterCacheBudget();
 
-      // Resolve prewarm budget up front so vector posting preload can stop at threshold.
+      // Row/index TreeCache budget (independent of the vector compact cache).
       final effectivePrewarmThresholdMB =
           await _resourceManager!.initializeEffectivePrewarmThresholdMB();
-      var remainingPrewarmBytes = effectivePrewarmThresholdMB * 1024 * 1024;
+      final rowPrewarmBudgetBytes = effectivePrewarmThresholdMB * 1024 * 1024;
 
       // From tableMetaManager get all schemas (empty tables skip data load below).
       final allTables = await getTableNames();
@@ -7138,7 +7138,8 @@ class DataStoreImpl {
       // =========================================================================
       // Phase 1: Boundary leaf pages of all tables and B+Tree indexes (Highest priority).
       // Extremely lightweight (few KB/table) and essential for fast index positioning
-      // and append writes. MUST NOT be crowded out by any data or vector loads.
+      // and append writes. ALWAYS runs — including large spaces over the row
+      // prewarm threshold — and MUST NOT be crowded out by data or vector loads.
       // =========================================================================
       for (final tableName in selectedTables) {
         if (shouldAbortBackgroundScan) break;
@@ -7197,13 +7198,12 @@ class DataStoreImpl {
 
       // =========================================================================
       // Phase 2: Vector index prewarm (Nav centroid graph & compact posting clusters).
-      // Executed strictly AFTER all table boundary pages, and BEFORE full row scans.
-      // Operates within its dedicated compact cluster cache budget (governed by
-      // vectorCacheBudgetRatio), ensuring complete in-memory residency without
-      // competing with or crowding out table boundary pages.
+      // ALWAYS runs (including large spaces). Uses the dedicated vector compact
+      // cache ceiling from vectorCacheBudgetRatio — NOT the shared row-prewarm
+      // threshold — so million-row corpora still fill the ANN hot set.
       // =========================================================================
       for (final tableName in selectedTables) {
-        if (shouldAbortBackgroundScan || remainingPrewarmBytes <= 0) break;
+        if (shouldAbortBackgroundScan) break;
         try {
           final schema =
               await schemaMgr.getTableSchemaByName(TableName(tableName));
@@ -7213,14 +7213,13 @@ class DataStoreImpl {
 
           final table = await getTableContext(tableName);
           for (final vIdx in vectorIndexes) {
-            if (shouldAbortBackgroundScan || remainingPrewarmBytes <= 0) break;
-            final loaded = await _vectorIndexManager?.prewarmVectorIndex(
-                  table,
-                  vIdx.indexUid,
-                  maxBytes: remainingPrewarmBytes,
-                ) ??
-                0;
-            remainingPrewarmBytes = max(0, remainingPrewarmBytes - loaded);
+            if (shouldAbortBackgroundScan) break;
+            // Omit maxBytes: prewarmVectorIndex stops at the vector cluster
+            // budget (vectorCacheBudgetRatio of cacheMemoryBudgetMB).
+            await _vectorIndexManager?.prewarmVectorIndex(
+              table,
+              vIdx.indexUid,
+            );
             final yVec = yieldController.maybeYield();
             if (yVec != null) await yVec;
           }
@@ -7237,9 +7236,14 @@ class DataStoreImpl {
 
       if (shouldAbortBackgroundScan) return;
 
-      remainingPrewarmBytes = await _prewarmKvStore(
-        maxPrewarmBytes: remainingPrewarmBytes,
+      var remainingPrewarmBytes = await _prewarmKvStore(
+        maxPrewarmBytes: rowPrewarmBudgetBytes,
       );
+
+      final spaceStats = await getSpaceStats();
+      final isLargeSpace = spaceStats.totalSizeBytes >= rowPrewarmBudgetBytes ||
+          spaceStats.totalRecordCount > _prewarmMaxRecords;
+      if (isLargeSpace) return;
 
       if (shouldAbortBackgroundScan) return;
 
@@ -7416,9 +7420,10 @@ class DataStoreImpl {
 
   /// Prewarm user table rows + B-tree indexes up to [prewarmBudgetBytes].
   ///
-  /// Large spaces / million-row tables still get a **partial** leading warm
-  /// (never all-or-nothing skip). Boundary leaf pages are warmed earlier in
-  /// [_executePrewarm] and are independent of this budget.
+  /// Only invoked for spaces still under the row-prewarm threshold. Large
+  /// spaces skip this phase entirely in [_executePrewarm] (boundary pages +
+  /// vector hot set still warm). Small spaces get a partial leading warm
+  /// capped by budget and [_prewarmMaxRecords].
   Future<void> _prewarmUserTables({
     List<String>? prioritizedTables,
     required int prewarmBudgetBytes,
