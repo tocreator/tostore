@@ -11,8 +11,8 @@ import '../model/ngh_index_meta.dart';
 import '../model/parallel_journal_entry.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
-import '../model/table_identity.dart';
 import '../model/table_context.dart';
+import '../model/table_identity.dart';
 import 'btree_page.dart';
 import 'data_store_impl.dart';
 import 'page_redo_log_codec.dart';
@@ -42,10 +42,16 @@ final class TreeMetaPageService {
   // Global meta -- table
   // ---------------------------------------------------------------------------
 
-  Future<TableDataMeta?> readTableGlobalMeta(TableContext table) async {
+  Future<TableDataMeta?> readTableGlobalMeta(
+    TableContext table, {
+    String? spaceName,
+  }) async {
     final parsed = await _readPayload(
-      partitionPath:
-          _dataStore.pathManager.getPartitionFilePathByContext(table, 0),
+      partitionPath: _dataStore.pathManager.getPartitionFilePathByContext(
+        table,
+        0,
+        spaceName: spaceName,
+      ),
       partitionNo: 0,
       pageType: BTreePageType.meta,
     );
@@ -185,7 +191,7 @@ final class TreeMetaPageService {
     IndexUid indexUid,
   ) async {
     final path = _dataStore.pathManager
-        .getNghPostingPartitionPathByContext(table, indexUid, 0);
+        .getNghLeafPartitionPathByContext(table, indexUid, 0);
     final parsed = await _readPayload(
       partitionPath: path,
       partitionNo: 0,
@@ -211,9 +217,9 @@ final class TreeMetaPageService {
     int? encryptionKeyId,
     bool flush = true,
   }) async {
-    final pageSize = meta.resolvedPostingPageSize(_requireConfiguredPageSize());
+    final pageSize = meta.resolvedLeafPageSize(_requireConfiguredPageSize());
     final path = _dataStore.pathManager
-        .getNghPostingPartitionPathByContext(table, indexUid, 0);
+        .getNghLeafPartitionPathByContext(table, indexUid, 0);
     final local = partitionLocalOverride ??
         (await readPartitionLocal(
           path: path,

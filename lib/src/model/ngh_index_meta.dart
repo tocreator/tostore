@@ -13,7 +13,7 @@ class NghIndexMeta {
   /// Metadata format version for forward-compatibility (shared indexVersion).
   final int version;
 
-  /// On-disk NGH layout. 1 = leftover nav_graph.ngh (legacy read-only); 2 = paged Centroid B+Tree / posting / pkmap.
+  /// On-disk NGH layout. Hierarchical nav + physical leaves (+ pkmap).
   final int layoutVersion;
 
   /// Stable index uid for NGH paths and caches.
@@ -48,13 +48,13 @@ class NghIndexMeta {
   // ===================== Partition Layout ======================
 
   /// Number of posting partition files.
-  final int postingPartitionCount;
+  final int leafPartitionCount;
 
   /// Next page number in the active posting partition.
-  final int postingNextPageNo;
+  final int leafNextPageNo;
 
   /// Posting partition free-list heads.
-  final Map<int, int> postingFreeListHeads;
+  final Map<int, int> leafFreeListHeads;
 
   final int navPartitionCount;
   final int navNextPageNo;
@@ -77,7 +77,7 @@ class NghIndexMeta {
   /// TPG2 page size for posting partition files. `0` = inherit the database
   /// [GlobalConfig.pageSize] (legacy 16KB files). Frozen once posting data
   /// exists -- changing it would require a posting rewrite.
-  final int postingPageSize;
+  final int leafPageSize;
 
   /// TPG2 page size for navigating-centroid partition files. `0` = inherit
   /// [GlobalConfig.pageSize]. Independent of posting. SQ8 centroids usually
@@ -94,7 +94,7 @@ class NghIndexMeta {
 
   NghIndexMeta({
     int? version,
-    this.layoutVersion = layoutLegacy,
+    this.layoutVersion = layoutPaged,
     required this.indexUid,
     required this.tableUid,
     required this.dimensions,
@@ -106,9 +106,9 @@ class NghIndexMeta {
     this.centroidCount = 0,
     this.totalSizeBytes = 0,
     this.isBuilding = false,
-    this.postingPartitionCount = 1,
-    this.postingNextPageNo = firstDataPageNo,
-    Map<int, int>? postingFreeListHeads,
+    this.leafPartitionCount = 1,
+    this.leafNextPageNo = firstDataPageNo,
+    Map<int, int>? leafFreeListHeads,
     this.navPartitionCount = 1,
     this.navNextPageNo = firstDataPageNo,
     Map<int, int>? navFreeListHeads,
@@ -121,10 +121,10 @@ class NghIndexMeta {
     this.hasPkLocator = false,
     this.pkBackfillPartition = 0,
     this.pkBackfillPage = 0,
-    this.postingPageSize = 0,
+    this.leafPageSize = 0,
     this.navPageSize = 0,
   })  : version = version ?? InternalConfig.indexVersion,
-        postingFreeListHeads = postingFreeListHeads ?? const {},
+        leafFreeListHeads = leafFreeListHeads ?? const {},
         navFreeListHeads = navFreeListHeads ?? const {},
         pkmapFreeListHeads = pkmapFreeListHeads ?? const {};
 
@@ -145,16 +145,15 @@ class NghIndexMeta {
 
   /// True when posting partition files already have data pages. Page size is
   /// then frozen (changing it would rewrite offsets).
-  bool get hasPostingData =>
-      totalVectors > 0 || postingNextPageNo > firstDataPageNo;
+  bool get hasLeafData => totalVectors > 0 || leafNextPageNo > firstDataPageNo;
 
   /// True when nav partition files already have data pages. Page size is then
   /// frozen for this index.
   bool get hasNavData => centroidCount > 0 || navNextPageNo > firstDataPageNo;
 
   /// Posting TPG2 page size. [fallback] is the database GlobalConfig page size.
-  int resolvedPostingPageSize(int fallback) =>
-      postingPageSize > 0 ? postingPageSize : fallback;
+  int resolvedLeafPageSize(int fallback) =>
+      leafPageSize > 0 ? leafPageSize : fallback;
 
   /// Nav TPG2 page size. [fallback] is the database GlobalConfig page size.
   int resolvedNavPageSize(int fallback) =>
@@ -170,7 +169,7 @@ class NghIndexMeta {
     VectorDistanceMetric distanceMetric = VectorDistanceMetric.cosine,
     DateTime? now,
     bool isBuilding = false,
-    int postingPageSize = 0,
+    int leafPageSize = 0,
     int navPageSize = 0,
   }) {
     final ts = now ?? DateTime.now();
@@ -183,7 +182,7 @@ class NghIndexMeta {
       timestamps: Timestamps(created: ts, modified: ts),
       isBuilding: isBuilding,
       hasPkLocator: true,
-      postingPageSize: postingPageSize,
+      leafPageSize: leafPageSize,
       navPageSize: navPageSize,
     );
   }
@@ -204,9 +203,9 @@ class NghIndexMeta {
     int? centroidCount,
     int? totalSizeBytes,
     bool? isBuilding,
-    int? postingPartitionCount,
-    int? postingNextPageNo,
-    Map<int, int>? postingFreeListHeads,
+    int? leafPartitionCount,
+    int? leafNextPageNo,
+    Map<int, int>? leafFreeListHeads,
     int? navPartitionCount,
     int? navNextPageNo,
     Map<int, int>? navFreeListHeads,
@@ -219,7 +218,7 @@ class NghIndexMeta {
     bool? hasPkLocator,
     int? pkBackfillPartition,
     int? pkBackfillPage,
-    int? postingPageSize,
+    int? leafPageSize,
     int? navPageSize,
   }) {
     return NghIndexMeta(
@@ -236,10 +235,9 @@ class NghIndexMeta {
       centroidCount: centroidCount ?? this.centroidCount,
       totalSizeBytes: totalSizeBytes ?? this.totalSizeBytes,
       isBuilding: isBuilding ?? this.isBuilding,
-      postingPartitionCount:
-          postingPartitionCount ?? this.postingPartitionCount,
-      postingNextPageNo: postingNextPageNo ?? this.postingNextPageNo,
-      postingFreeListHeads: postingFreeListHeads ?? this.postingFreeListHeads,
+      leafPartitionCount: leafPartitionCount ?? this.leafPartitionCount,
+      leafNextPageNo: leafNextPageNo ?? this.leafNextPageNo,
+      leafFreeListHeads: leafFreeListHeads ?? this.leafFreeListHeads,
       navPartitionCount: navPartitionCount ?? this.navPartitionCount,
       navNextPageNo: navNextPageNo ?? this.navNextPageNo,
       navFreeListHeads: navFreeListHeads ?? this.navFreeListHeads,
@@ -252,7 +250,7 @@ class NghIndexMeta {
       hasPkLocator: hasPkLocator ?? this.hasPkLocator,
       pkBackfillPartition: pkBackfillPartition ?? this.pkBackfillPartition,
       pkBackfillPage: pkBackfillPage ?? this.pkBackfillPage,
-      postingPageSize: postingPageSize ?? this.postingPageSize,
+      leafPageSize: leafPageSize ?? this.leafPageSize,
       navPageSize: navPageSize ?? this.navPageSize,
     );
   }
@@ -262,7 +260,7 @@ class NghIndexMeta {
   factory NghIndexMeta.fromJson(Map<String, dynamic> json) {
     return NghIndexMeta(
       version: (json['version'] as num?)?.toInt(),
-      layoutVersion: (json['layoutVersion'] as num?)?.toInt() ?? layoutLegacy,
+      layoutVersion: (json['layoutVersion'] as num?)?.toInt() ?? layoutPaged,
       indexUid:
           IndexUid.tryParse(json['indexUid'] as String?) ?? IndexUid.empty,
       tableUid: TableUid((json['tableUid'] ?? json['tableName']) as String),
@@ -279,11 +277,10 @@ class NghIndexMeta {
                   ?.toInt() ??
               0,
       isBuilding: (json['isBuilding'] as bool?) ?? false,
-      postingPartitionCount:
-          (json['postingPartitionCount'] as num?)?.toInt() ?? 1,
-      postingNextPageNo:
-          (json['postingNextPageNo'] as num?)?.toInt() ?? firstDataPageNo,
-      postingFreeListHeads: _parseIntIntMap(json['postingFreeListHeads']),
+      leafPartitionCount: (json['leafPartitionCount'] as num?)?.toInt() ?? 1,
+      leafNextPageNo:
+          (json['leafNextPageNo'] as num?)?.toInt() ?? firstDataPageNo,
+      leafFreeListHeads: _parseIntIntMap(json['leafFreeListHeads']),
       navPartitionCount: (json['navPartitionCount'] as num?)?.toInt() ?? 1,
       navNextPageNo:
           (json['navNextPageNo'] as num?)?.toInt() ?? firstDataPageNo,
@@ -298,7 +295,7 @@ class NghIndexMeta {
       hasPkLocator: (json['hasPkLocator'] as bool?) ?? false,
       pkBackfillPartition: (json['pkBackfillPartition'] as num?)?.toInt() ?? 0,
       pkBackfillPage: (json['pkBackfillPage'] as num?)?.toInt() ?? 0,
-      postingPageSize: (json['postingPageSize'] as num?)?.toInt() ?? 0,
+      leafPageSize: (json['leafPageSize'] as num?)?.toInt() ?? 0,
       navPageSize: (json['navPageSize'] as num?)?.toInt() ?? 0,
     );
   }
@@ -318,9 +315,9 @@ class NghIndexMeta {
       'centroidCount': centroidCount,
       'totalSizeBytes': totalSizeBytes,
       'isBuilding': isBuilding,
-      'postingPartitionCount': postingPartitionCount,
-      'postingNextPageNo': postingNextPageNo,
-      'postingFreeListHeads': _serializeIntIntMap(postingFreeListHeads),
+      'leafPartitionCount': leafPartitionCount,
+      'leafNextPageNo': leafNextPageNo,
+      'leafFreeListHeads': _serializeIntIntMap(leafFreeListHeads),
       'navPartitionCount': navPartitionCount,
       'navNextPageNo': navNextPageNo,
       'navFreeListHeads': _serializeIntIntMap(navFreeListHeads),
@@ -333,7 +330,7 @@ class NghIndexMeta {
       'hasPkLocator': hasPkLocator,
       'pkBackfillPartition': pkBackfillPartition,
       'pkBackfillPage': pkBackfillPage,
-      'postingPageSize': postingPageSize,
+      'leafPageSize': leafPageSize,
       'navPageSize': navPageSize,
     };
   }
@@ -368,5 +365,5 @@ class NghIndexMeta {
   String toString() => 'NghIndexMeta(uid: $indexUid, table: $tableUid, '
       'dim: $dimensions, vectors: $totalVectors, '
       'deleted: $deletedCount, layout: $layoutVersion, '
-      'postingPartitions: $postingPartitionCount)';
+      'postingPartitions: $leafPartitionCount)';
 }

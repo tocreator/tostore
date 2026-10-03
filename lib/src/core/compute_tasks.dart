@@ -1910,8 +1910,8 @@ Uint8List _resolveBTreePagePayload(
     case BTreePageType.free:
     case BTreePageType.overflow:
     case BTreePageType.nghMeta:
-    case BTreePageType.nghPosting:
-    case BTreePageType.nghNavGraph:
+    case BTreePageType.nghLeaf:
+    case BTreePageType.nghNav:
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,

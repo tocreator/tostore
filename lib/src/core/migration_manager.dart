@@ -395,6 +395,51 @@ class MigrationManager {
   /// Get all currently pending migration tasks.
   List<MigrationTask> get pendingTasks => List.unmodifiable(_pendingTasks);
 
+  /// Unfinished = remaining spaces, **or** promote-to-PK still awaiting
+  /// shadow finalize (`shadowTableUid` is only used there). Ordinary
+  /// addIndex / rewrite tasks are unfinished iff spaces remain.
+  bool _isUnfinishedSchemaTask(MigrationTask task) {
+    return task.pendingMigrationSpaces.isNotEmpty ||
+        task.shadowTableUid != null;
+  }
+
+  /// Unfinished schema tasks for [tableUid] from memory, then disk.
+  ///
+  /// Safe before [initialize] (engine upgrades). Does not mutate mappings.
+  Future<List<MigrationTask>> unfinishedTasksForTable(TableUid tableUid) async {
+    final out = <MigrationTask>[];
+    final seen = <String>{};
+    for (final task in _pendingTasks) {
+      if (task.tableUid != tableUid) continue;
+      if (!_isUnfinishedSchemaTask(task)) continue;
+      out.add(task);
+      seen.add(task.taskId);
+    }
+
+    final meta = await _getOrLoadMigrationMeta();
+    if (meta.directoryMapping.idToDir.isEmpty) return out;
+
+    for (final entry in meta.directoryMapping.idToDir.entries) {
+      final taskId = entry.key;
+      if (seen.contains(taskId)) continue;
+      try {
+        final taskPath =
+            _dataStore.pathManager.getMigrationTaskPath(entry.value, taskId);
+        if (!await _dataStore.storage.existsFile(taskPath)) continue;
+        final bytes = await _dataStore.storage.readAsBytes(taskPath);
+        if (bytes.isEmpty) continue;
+        final task = MigrationTaskCodec.decodeFile(bytes);
+        if (task.tableUid != tableUid) continue;
+        if (!_isUnfinishedSchemaTask(task)) continue;
+        out.add(task);
+        seen.add(taskId);
+      } catch (_) {
+        continue;
+      }
+    }
+    return out;
+  }
+
   /// Check if there is an unfinished migration task for the table that builds the specified index.
   bool hasPendingIndexBuild(TableUid tableUid, IndexUid indexUid) {
     for (final task in _pendingTasks) {
@@ -7184,9 +7229,7 @@ class MigrationManager {
     final found = <String>[];
 
     for (final task in _pendingTasks) {
-      if (task.pendingMigrationSpaces.isEmpty && task.shadowTableUid == null) {
-        continue;
-      }
+      if (!_isUnfinishedSchemaTask(task)) continue;
       if (tableUid != null && task.tableUid != tableUid) continue;
       found.add(task.taskId);
     }
@@ -7213,8 +7256,7 @@ class MigrationManager {
         final content = await _dataStore.storage.readAsBytes(taskPath);
         if (content.isNotEmpty) {
           final task = MigrationTaskCodec.decodeFile(content);
-          if (task.pendingMigrationSpaces.isEmpty &&
-              task.shadowTableUid == null) {
+          if (!_isUnfinishedSchemaTask(task)) {
             continue;
           }
           if (tableUid != null && task.tableUid != tableUid) continue;

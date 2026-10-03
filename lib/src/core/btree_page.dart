@@ -44,11 +44,11 @@ enum BTreePageType {
   /// NGH per-file metadata page (pageNo=0 in each partition file).
   nghMeta,
 
-  /// NGH posting page containing inlined SQ8 vector slots for inverted cluster.
-  nghPosting,
+  /// NGH physical vector-leaf page
+  nghLeaf,
 
-  /// NGH navigating graph page containing centroid vectors and cluster topology.
-  nghNavGraph,
+  /// NGH hierarchical-nav page
+  nghNav,
 }
 
 // ============================================================================

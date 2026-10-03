@@ -28,7 +28,7 @@ import 'yield_controller.dart';
 //
 // Page I/O for NGH partition files:
 //   posting/ -- inverted cluster SQ8 pages
-//              redo: full page when dims≤[NghPostingPage.fullPageRedoMaxDimensions],
+//              redo: full page when dims≤[NghLeafPage.fullPageRedoMaxDimensions],
 //              else structure+PK (PageRedoTreeKind.ngh + NGPK payload)
 //   nav/     -- paged Centroid B+Tree pages (page redo: PageRedoTreeKind.nghNav)
 //   pkmap/   -- PK locator B+Tree (no page redo)
@@ -38,7 +38,7 @@ import 'yield_controller.dart';
 
 /// Category of NGH partition data.
 enum NghDataCategory {
-  posting,
+  leaf,
   nav,
   pkmap,
 }
@@ -58,7 +58,7 @@ final class NghPagePtr {
   final int pageNo;
 
   const NghPagePtr(this.category, this.partitionNo, this.pageNo);
-  static const NghPagePtr nullPtr = NghPagePtr(NghDataCategory.posting, -1, -1);
+  static const NghPagePtr nullPtr = NghPagePtr(NghDataCategory.leaf, -1, -1);
   bool get isNull => partitionNo < 0 || pageNo < 0;
 
   /// Packed `(partitionNo << 20) | pageNo` for **legacy posting `next` only**.
@@ -130,7 +130,7 @@ final class NghPartitionManager {
 
   // -- Page Caches --
   // Inverted posting pages with inlined SQ8 vector slots.
-  late final TreeCache<NghPostingPage> _postingPageCache;
+  late final TreeCache<NghLeafPage> _leafPageCache;
   late final TreeCache<NghNavCentroidPage> _navPageCache;
   late final TreeCache<NghPkMapDirtyPage> _pkmapPageCache;
 
@@ -147,8 +147,8 @@ final class NghPartitionManager {
   int pageSizeFor(NghDataCategory category, NghIndexMeta? meta) {
     if (meta == null) return configuredPageSize;
     switch (category) {
-      case NghDataCategory.posting:
-        return meta.resolvedPostingPageSize(configuredPageSize);
+      case NghDataCategory.leaf:
+        return meta.resolvedLeafPageSize(configuredPageSize);
       case NghDataCategory.nav:
         return meta.resolvedNavPageSize(configuredPageSize);
       case NghDataCategory.pkmap:
@@ -168,11 +168,11 @@ final class NghPartitionManager {
 
   /// Nav page cache vs posting: Centroid B+Tree routing is ~MB-class (48-D
   /// branch entries), while posting holds full-D SQ8. Legacy `~/4` overshot.
-  /// Keep a small share of [postingBudget] with a platform floor.
-  static (int maxBytes, int minBytes) _navPageCacheBudget(int postingBudget) {
+  /// Keep a small share of [leafBudget] with a platform floor.
+  static (int maxBytes, int minBytes) _navPageCacheBudget(int leafBudget) {
     final floor = PlatformHandler.isMobile ? 8 * 1024 * 1024 : 16 * 1024 * 1024;
     final ratio = PlatformHandler.isMobile ? 0.05 : 0.08;
-    final maxBytes = max(floor, (postingBudget * ratio).round());
+    final maxBytes = max(floor, (leafBudget * ratio).round());
     final minBytes = max(floor ~/ 2, maxBytes ~/ 2);
     return (maxBytes, minBytes);
   }
@@ -185,12 +185,12 @@ final class NghPartitionManager {
     final int minThreshold =
         max(8 * 1024 * 1024, min(nghBudget ~/ 2, 32 * 1024 * 1024));
     final (navMax, navMin) = _navPageCacheBudget(nghBudget);
-    _postingPageCache = TreeCache<NghPostingPage>(
+    _leafPageCache = TreeCache<NghLeafPage>(
       sizeCalculator: (page) => page.estimateResidentBytes(),
       maxByteThreshold: nghBudget,
       minByteThreshold: minThreshold,
       groupDepth: 2,
-      debugLabel: 'NghPostingPageCache',
+      debugLabel: 'NghLeafPageCache',
     );
     _navPageCache = TreeCache<NghNavCentroidPage>(
       sizeCalculator: (page) =>
@@ -212,15 +212,15 @@ final class NghPartitionManager {
   /// Refresh TreeCache byte ceilings after ResourceManager finishes sizing.
   void syncCacheBudget({
     required int indexBudget,
-    int? vectorPostingBudget,
+    int? vectorLeafBudget,
   }) {
     final budget = indexBudget > 0 ? indexBudget : 128 * 1024 * 1024;
     final fromIndex = max(16 * 1024 * 1024, (budget * 0.30).round());
-    final nghBudget = max(fromIndex, vectorPostingBudget ?? fromIndex);
+    final nghBudget = max(fromIndex, vectorLeafBudget ?? fromIndex);
     final minThreshold =
         max(8 * 1024 * 1024, min(nghBudget ~/ 2, 32 * 1024 * 1024));
     final (navMax, navMin) = _navPageCacheBudget(nghBudget);
-    _postingPageCache.updateByteThreshold(
+    _leafPageCache.updateByteThreshold(
       max: nghBudget,
       min: minThreshold,
     );
@@ -239,7 +239,7 @@ final class NghPartitionManager {
     TableContext table,
     IndexUid indexUid,
   ) async {
-    _postingPageCache.remove([table.tableUid, indexUid]);
+    _leafPageCache.remove([table.tableUid, indexUid]);
     _navPageCache.remove([table.tableUid, indexUid]);
     _pkmapPageCache.remove([table.tableUid, indexUid]);
 
@@ -250,31 +250,43 @@ final class NghPartitionManager {
     }
   }
 
+  /// Delete the live `ngh/` root only (keep `ngh_old/` during v4 rebuild).
+  Future<void> deleteLiveNghRoot(TableContext table, IndexUid indexUid) async {
+    _leafPageCache.remove([table.tableUid, indexUid]);
+    _navPageCache.remove([table.tableUid, indexUid]);
+    _pkmapPageCache.remove([table.tableUid, indexUid]);
+    final nghPath =
+        _dataStore.pathManager.getNghIndexPathByContext(table, indexUid);
+    if (await _dataStore.storage.existsDirectory(nghPath)) {
+      await _dataStore.storage.deleteDirectory(nghPath);
+    }
+  }
+
   /// Clear all in-memory caches and reset state.
   Future<void> dispose() async {
-    _postingPageCache.clear();
+    _leafPageCache.clear();
     _navPageCache.clear();
     _pkmapPageCache.clear();
   }
 
   /// Synchronous memory cache lookup for an inverted posting page (0 I/O).
-  NghPostingPage? getCachedPostingPage(
+  NghLeafPage? getCachedLeafPage(
     TableUid tableUid,
     IndexUid indexUid,
     int partitionNo,
     int pageNo,
   ) {
-    return _postingPageCache.getPoint4(tableUid, indexUid, partitionNo, pageNo);
+    return _leafPageCache.getPoint4(tableUid, indexUid, partitionNo, pageNo);
   }
 
   /// Read an inverted posting page from cache or disk.
-  Future<NghPostingPage?> readPostingPage(
+  Future<NghLeafPage?> readLeafPage(
     TableContext table,
     IndexUid indexUid,
     NghIndexMeta meta,
     int partitionNo,
     int pageNo, {
-    Map<int, NghPostingPage>? localCache,
+    Map<int, NghLeafPage>? localCache,
   }) async {
     final tableUid = table.tableUid;
     final cacheKey = _cacheKey(partitionNo, pageNo);
@@ -285,24 +297,23 @@ final class NghPartitionManager {
     }
 
     final cached =
-        _postingPageCache.getPoint4(tableUid, indexUid, partitionNo, pageNo);
+        _leafPageCache.getPoint4(tableUid, indexUid, partitionNo, pageNo);
     if (cached != null) return cached;
 
     final path = _dataStore.pathManager
-        .getNghPostingPartitionPathByContext(table, indexUid, partitionNo);
+        .getNghLeafPartitionPathByContext(table, indexUid, partitionNo);
     try {
-      final pageSize = pageSizeFor(NghDataCategory.posting, meta);
+      final pageSize = pageSizeFor(NghDataCategory.leaf, meta);
       final raw = await _dataStore.storage
           .readAsBytesAt(path, pageNo * pageSize, length: pageSize);
       if (raw.isEmpty) return null;
 
       final parsed = BTreePageIO.parsePageBytes(raw);
-      final page = NghPostingPage.tryDecodePayload(
-          _decodePayload(parsed.encodedPayload));
+      final page =
+          NghLeafPage.tryDecodePayload(_decodePayload(parsed.encodedPayload));
       if (page == null) return null;
 
-      _postingPageCache.putPoint4(
-          tableUid, indexUid, partitionNo, pageNo, page);
+      _leafPageCache.putPoint4(tableUid, indexUid, partitionNo, pageNo, page);
       return page;
     } catch (e) {
       if (e is DbClosedException) rethrow;
@@ -317,16 +328,16 @@ final class NghPartitionManager {
   /// Read specific posting pages by packed refs, grouped by partition for parallel I/O.
   ///
   /// Each entry in [packedRefs] is `partitionNo<<20|pageNo` (legacy bare pageNo = p0).
-  Future<List<({int packedRef, NghPostingPage page})>> readPostingPagesBatch(
+  Future<List<({int packedRef, NghLeafPage page})>> readLeafPagesBatch(
     TableContext table,
     IndexUid indexUid,
     NghIndexMeta meta,
     List<int> packedRefs, {
-    Map<int, NghPostingPage>? localCache,
+    Map<int, NghLeafPage>? localCache,
     bool populatePageCache = true,
   }) async {
     if (packedRefs.isEmpty) return const [];
-    final results = <({int packedRef, NghPostingPage page})>[];
+    final results = <({int packedRef, NghLeafPage page})>[];
     // partitionNo -> packed refs still needing disk I/O
     final missingByPartition = <int, List<int>>{};
 
@@ -341,7 +352,7 @@ final class NghPartitionManager {
         continue;
       }
       final cached =
-          _postingPageCache.getPoint4(table.tableUid, indexUid, part, pageNo);
+          _leafPageCache.getPoint4(table.tableUid, indexUid, part, pageNo);
       if (cached != null) {
         results.add((packedRef: packed, page: cached));
         continue;
@@ -351,16 +362,16 @@ final class NghPartitionManager {
 
     if (missingByPartition.isEmpty) return results;
 
-    final pageSize = pageSizeFor(NghDataCategory.posting, meta);
+    final pageSize = pageSizeFor(NghDataCategory.leaf, meta);
     final tableUid = table.tableUid;
 
-    Future<List<({int packedRef, NghPostingPage page})>> readOnePartition(
+    Future<List<({int packedRef, NghLeafPage page})>> readOnePartition(
       int part,
       List<int> missingPacked,
     ) async {
-      final partResults = <({int packedRef, NghPostingPage page})>[];
+      final partResults = <({int packedRef, NghLeafPage page})>[];
       final path = _dataStore.pathManager
-          .getNghPostingPartitionPathByContext(table, indexUid, part);
+          .getNghLeafPartitionPathByContext(table, indexUid, part);
       final ranges = <ByteReadRange>[
         for (final packed in missingPacked)
           ByteReadRange(
@@ -379,12 +390,11 @@ final class NghPartitionManager {
         if (raw.isEmpty) continue;
         try {
           final parsed = BTreePageIO.parsePageBytes(raw);
-          final page = NghPostingPage.tryDecodePayload(
+          final page = NghLeafPage.tryDecodePayload(
               _decodePayload(parsed.encodedPayload));
           if (page != null) {
             if (populatePageCache) {
-              _postingPageCache.putPoint4(
-                  tableUid, indexUid, part, pageNo, page);
+              _leafPageCache.putPoint4(tableUid, indexUid, part, pageNo, page);
             }
             localCache?[packed] = page;
             partResults.add((packedRef: packed, page: page));
@@ -406,10 +416,10 @@ final class NghPartitionManager {
           () => readOnePartition(entry.key, entry.value),
       ];
       final partLists = await ParallelProcessor.execute<
-          List<({int packedRef, NghPostingPage page})>>(
+          List<({int packedRef, NghLeafPage page})>>(
         tasks,
         concurrency: min(5, tasks.length),
-        label: 'readPostingPagesBatch',
+        label: 'readLeafPagesBatch',
       );
       for (final partList in partLists) {
         if (partList != null) results.addAll(partList);
@@ -419,21 +429,21 @@ final class NghPartitionManager {
   }
 
   /// Read the entire posting cluster chain starting at [headPackedRef].
-  Future<List<({int packedRef, NghPostingPage page})>> readPostingCluster(
+  Future<List<({int packedRef, NghLeafPage page})>> readPostingCluster(
     TableContext table,
     IndexUid indexUid,
     NghIndexMeta meta,
     int headPackedRef, {
-    Map<int, NghPostingPage>? localCache,
+    Map<int, NghLeafPage>? localCache,
   }) async {
     if (headPackedRef <= 0) return const [];
-    final pages = <({int packedRef, NghPostingPage page})>[];
+    final pages = <({int packedRef, NghLeafPage page})>[];
     var current = NghPageId.fromPacked(headPackedRef);
     final visited = <int>{};
 
     while (!current.isNone && !visited.contains(current.cacheKey)) {
       visited.add(current.cacheKey);
-      final pg = await readPostingPage(
+      final pg = await readLeafPage(
         table,
         indexUid,
         meta,
@@ -446,19 +456,19 @@ final class NghPartitionManager {
         packedRef: current.tryPack() ?? current.cacheKey,
         page: pg,
       ));
-      current = pg.nextPostingPage;
+      current = pg.nextLeafPage;
     }
     return pages;
   }
 
   /// Batch read multiple posting clusters in parallel or sequentially.
-  Future<List<List<({int packedRef, NghPostingPage page})>>>
-      readPostingClustersBatch(
+  Future<List<List<({int packedRef, NghLeafPage page})>>>
+      readLeafPagesChainsBatch(
     TableContext table,
     IndexUid indexUid,
     NghIndexMeta meta,
     List<int> headPackedRefs, {
-    Map<int, NghPostingPage>? localCache,
+    Map<int, NghLeafPage>? localCache,
     int concurrency = 4,
   }) async {
     if (headPackedRefs.isEmpty) return const [];
@@ -468,14 +478,12 @@ final class NghPartitionManager {
             localCache: localCache),
     ];
     final res = await ParallelProcessor.execute<
-        List<({int packedRef, NghPostingPage page})>>(
+        List<({int packedRef, NghLeafPage page})>>(
       tasks,
       concurrency: min(concurrency, tasks.length),
-      label: 'readPostingClustersBatch',
+      label: 'readLeafPagesChainsBatch',
     );
-    return res
-        .whereType<List<({int packedRef, NghPostingPage page})>>()
-        .toList();
+    return res.whereType<List<({int packedRef, NghLeafPage page})>>().toList();
   }
 
   /// Read the navigating centroid graph from disk (legacy blob or paged v2).
@@ -736,12 +744,12 @@ final class NghPartitionManager {
   }
 
   /// Read posting pages by v2 page ids (partition >= 2048 safe).
-  Future<List<({NghPageId id, NghPostingPage page})>> readPostingPagesByIds(
+  Future<List<({NghPageId id, NghLeafPage page})>> readLeafPagesByIds(
     TableContext table,
     IndexUid indexUid,
     NghIndexMeta meta,
     List<NghPageId> ids, {
-    Map<int, NghPostingPage>? localCache,
+    Map<int, NghLeafPage>? localCache,
     bool populatePageCache = true,
   }) async {
     if (ids.isEmpty) return const [];
@@ -758,9 +766,9 @@ final class NghPartitionManager {
         unpacked.add(id);
       }
     }
-    final out = <({NghPageId id, NghPostingPage page})>[];
+    final out = <({NghPageId id, NghLeafPage page})>[];
     if (packed.isNotEmpty) {
-      final loaded = await readPostingPagesBatch(
+      final loaded = await readLeafPagesBatch(
         table,
         indexUid,
         meta,
@@ -777,7 +785,7 @@ final class NghPartitionManager {
       }
     }
     for (final id in unpacked) {
-      final page = await readPostingPage(
+      final page = await readLeafPage(
         table,
         indexUid,
         meta,
@@ -965,11 +973,11 @@ final class NghPartitionManager {
     int partitionNo,
   ) async {
     final path = _dataStore.pathManager
-        .getNghPostingPartitionPathByContext(table, indexUid, partitionNo);
+        .getNghLeafPartitionPathByContext(table, indexUid, partitionNo);
     try {
       if (!await _dataStore.storage.existsFile(path)) return 0;
       final size = await _dataStore.storage.getFileSize(path);
-      final pageSize = pageSizeFor(NghDataCategory.posting, meta);
+      final pageSize = pageSizeFor(NghDataCategory.leaf, meta);
       return size ~/ pageSize;
     } catch (_) {
       return 0;
@@ -1015,7 +1023,7 @@ final class NghPartitionManager {
       }
     }
 
-    await rewriteCategory(NghDataCategory.posting, meta.postingPartitionCount);
+    await rewriteCategory(NghDataCategory.leaf, meta.leafPartitionCount);
     await rewriteCategory(NghDataCategory.nav, meta.navPartitionCount);
     await rewriteCategory(NghDataCategory.pkmap, meta.pkmapPartitionCount);
   }
@@ -1031,7 +1039,7 @@ final class NghPartitionManager {
   /// Clear fully-cached markers for an index after write.
   void clearFullyCachedForIndex(TableUid tableUid, IndexUid indexUid) {
     final prefix = _indexPrefix(tableUid, indexUid);
-    _postingPageCache.setFullyCached(prefix, false);
+    _leafPageCache.setFullyCached(prefix, false);
   }
 
   // =====================================================================
@@ -1047,12 +1055,12 @@ final class NghPartitionManager {
     required TableContext table,
     required IndexUid indexUid,
     required NghIndexMeta meta,
-    Map<NghPagePtr, NghPostingPage> dirtyPostingPages = const {},
+    Map<NghPagePtr, NghLeafPage> dirtyLeafPages = const {},
     Map<NghPagePtr, NghNavCentroidPage> dirtyNavPages = const {},
     Map<NghPagePtr, NghNavBTreePage> dirtyNavBTreePages = const {},
     ({NghPagePtr ptr, NghNavRootPage page})? dirtyNavRootPage,
     Map<NghPagePtr, NghPkMapDirtyPage> dirtyPkmapPages = const {},
-    List<NghPagePtr> freePostingPages = const [],
+    List<NghPagePtr> freeLeafPages = const [],
     bool deleteLegacyNavGraph = false,
     int vectorsDelta = 0,
     int deletedDelta = 0,
@@ -1061,23 +1069,23 @@ final class NghPartitionManager {
     int? yieldBudgetMs,
   }) async {
     final tableUid = table.tableUid;
-    if (dirtyPostingPages.isEmpty &&
+    if (dirtyLeafPages.isEmpty &&
         dirtyNavPages.isEmpty &&
         dirtyNavBTreePages.isEmpty &&
         dirtyNavRootPage == null &&
         dirtyPkmapPages.isEmpty &&
-        freePostingPages.isEmpty &&
+        freeLeafPages.isEmpty &&
         !deleteLegacyNavGraph) {
       return meta;
     }
 
-    final postingPageSize = pageSizeFor(NghDataCategory.posting, meta);
+    final leafPageSize = pageSizeFor(NghDataCategory.leaf, meta);
     final navPageSize = pageSizeFor(NghDataCategory.nav, meta);
     final sidecarPageSize = configuredPageSize;
     int sizeOf(NghDataCategory category) {
       switch (category) {
-        case NghDataCategory.posting:
-          return postingPageSize;
+        case NghDataCategory.leaf:
+          return leafPageSize;
         case NghDataCategory.nav:
           return navPageSize;
         case NghDataCategory.pkmap:
@@ -1126,7 +1134,7 @@ final class NghPartitionManager {
       navBuilt.add((
         ptr: entry.key,
         pageBytes: _buildPageBytes(
-          BTreePageType.nghNavGraph,
+          BTreePageType.nghNav,
           payload,
           navPageSize,
           encrypt,
@@ -1139,7 +1147,7 @@ final class NghPartitionManager {
       navBuilt.add((
         ptr: entry.key,
         pageBytes: _buildPageBytes(
-          BTreePageType.nghNavGraph,
+          BTreePageType.nghNav,
           payload,
           navPageSize,
           encrypt,
@@ -1152,7 +1160,7 @@ final class NghPartitionManager {
       navBuilt.add((
         ptr: dirtyNavRootPage.ptr,
         pageBytes: _buildPageBytes(
-          BTreePageType.nghNavGraph,
+          BTreePageType.nghNav,
           payload,
           navPageSize,
           encrypt,
@@ -1211,12 +1219,12 @@ final class NghPartitionManager {
 
     var workingMeta = meta;
     final freedKeys = <int>{
-      for (final ptr in freePostingPages) ptr.cacheKey,
+      for (final ptr in freeLeafPages) ptr.cacheKey,
     };
-    for (final ptr in freePostingPages) {
+    for (final ptr in freeLeafPages) {
       final stats = getStats(postingStats, ptr.partitionNo);
       stats.path ??= _partitionPath(
-          NghDataCategory.posting, table, indexUid, ptr.partitionNo);
+          NghDataCategory.leaf, table, indexUid, ptr.partitionNo);
       if (!stats.dirEnsured) {
         await _dataStore.storage.ensureDirectoryExists(p.dirname(stats.path!));
         stats.dirEnsured = true;
@@ -1224,18 +1232,18 @@ final class NghPartitionManager {
       await _ensureNghPartitionHeaderLoaded(
         stats,
         partitionNo: ptr.partitionNo,
-        pageSize: postingPageSize,
+        pageSize: leafPageSize,
       );
       final diskHead = stats.freeListHeadPageNo;
-      if ((workingMeta.postingFreeListHeads[ptr.partitionNo] ?? -1) <
+      if ((workingMeta.leafFreeListHeads[ptr.partitionNo] ?? -1) <
               NghIndexMeta.firstDataPageNo &&
           diskHead >= NghIndexMeta.firstDataPageNo) {
-        final heads = Map<int, int>.from(workingMeta.postingFreeListHeads);
+        final heads = Map<int, int>.from(workingMeta.leafFreeListHeads);
         heads[ptr.partitionNo] = diskHead;
-        workingMeta = workingMeta.copyWith(postingFreeListHeads: heads);
+        workingMeta = workingMeta.copyWith(leafFreeListHeads: heads);
       }
       workingMeta = await pushFreePage(
-        NghDataCategory.posting,
+        NghDataCategory.leaf,
         workingMeta,
         ptr,
         table,
@@ -1248,17 +1256,17 @@ final class NghPartitionManager {
     }
 
     final usePkPostingRedo =
-        NghPostingPage.prefersPkStructureRedo(meta.dimensions);
-    for (final entry in dirtyPostingPages.entries) {
+        NghLeafPage.prefersPkStructureRedo(meta.dimensions);
+    for (final entry in dirtyLeafPages.entries) {
       if (freedKeys.contains(entry.key.cacheKey)) continue;
       final y0 = yc.maybeYield();
       if (y0 != null) await y0;
       final posting = entry.value;
       await stageTyped(
-        category: NghDataCategory.posting,
+        category: NghDataCategory.leaf,
         statsMap: postingStats,
         ptr: entry.key,
-        pageType: BTreePageType.nghPosting,
+        pageType: BTreePageType.nghLeaf,
         payload: posting.encodePayload(),
         // dims≤64: full page image. dims>64: structure+PK (rebuild from table).
         redoKind: PageRedoTreeKind.ngh,
@@ -1306,11 +1314,11 @@ final class NghPartitionManager {
     if (deleteLegacyNavGraph) {
       final p0 = getStats(postingStats, 0);
       p0.path ??= _dataStore.pathManager
-          .getNghPostingPartitionPathByContext(table, indexUid, 0);
+          .getNghLeafPartitionPathByContext(table, indexUid, 0);
     }
 
     final sizeDeltaSum = await _computePartitionSizeDeltaSum([
-      (stats: postingStats, pageSize: postingPageSize),
+      (stats: postingStats, pageSize: leafPageSize),
       (stats: navStats, pageSize: navPageSize),
       (stats: pkmapStats, pageSize: sidecarPageSize),
     ]);
@@ -1327,8 +1335,8 @@ final class NghPartitionManager {
       entryDelta: vectorsDelta,
     );
 
-    await _stagePartitionMeta(postingStats, postingPageSize, updatedMeta,
-        stageWrite, yc, NghDataCategory.posting);
+    await _stagePartitionMeta(postingStats, leafPageSize, updatedMeta,
+        stageWrite, yc, NghDataCategory.leaf);
     await _stagePartitionMeta(navStats, navPageSize, updatedMeta, stageWrite,
         yc, NghDataCategory.nav);
     await _stagePartitionMeta(pkmapStats, sidecarPageSize, updatedMeta,
@@ -1337,14 +1345,14 @@ final class NghPartitionManager {
     if (!postingStats.containsKey(0) && staged.isNotEmpty) {
       final p0Stats = getStats(postingStats, 0);
       p0Stats.path ??= _dataStore.pathManager
-          .getNghPostingPartitionPathByContext(table, indexUid, 0);
+          .getNghLeafPartitionPathByContext(table, indexUid, 0);
       await _stagePartitionMeta(
         {0: p0Stats},
-        postingPageSize,
+        leafPageSize,
         updatedMeta,
         stageWrite,
         yc,
-        NghDataCategory.posting,
+        NghDataCategory.leaf,
       );
     }
 
@@ -1496,8 +1504,8 @@ final class NghPartitionManager {
 
   int _partitionCountOf(NghDataCategory category, NghIndexMeta meta) {
     switch (category) {
-      case NghDataCategory.posting:
-        return meta.postingPartitionCount;
+      case NghDataCategory.leaf:
+        return meta.leafPartitionCount;
       case NghDataCategory.nav:
         return meta.navPartitionCount;
       case NghDataCategory.pkmap:
@@ -1507,8 +1515,8 @@ final class NghPartitionManager {
 
   int _nextPageNoOf(NghDataCategory category, NghIndexMeta meta) {
     switch (category) {
-      case NghDataCategory.posting:
-        return meta.postingNextPageNo;
+      case NghDataCategory.leaf:
+        return meta.leafNextPageNo;
       case NghDataCategory.nav:
         return meta.navNextPageNo;
       case NghDataCategory.pkmap:
@@ -1523,10 +1531,10 @@ final class NghPartitionManager {
     int nextPageNo,
   ) {
     switch (category) {
-      case NghDataCategory.posting:
+      case NghDataCategory.leaf:
         return meta.copyWith(
-          postingPartitionCount: partitionCount,
-          postingNextPageNo: nextPageNo,
+          leafPartitionCount: partitionCount,
+          leafNextPageNo: nextPageNo,
         );
       case NghDataCategory.nav:
         return meta.copyWith(
@@ -1651,8 +1659,8 @@ final class NghPartitionManager {
   /// Get the free-list heads map for a given category.
   Map<int, int> _getFreeListHeads(NghDataCategory category, NghIndexMeta meta) {
     switch (category) {
-      case NghDataCategory.posting:
-        return Map<int, int>.from(meta.postingFreeListHeads);
+      case NghDataCategory.leaf:
+        return Map<int, int>.from(meta.leafFreeListHeads);
       case NghDataCategory.nav:
         return Map<int, int>.from(meta.navFreeListHeads);
       case NghDataCategory.pkmap:
@@ -1664,8 +1672,8 @@ final class NghPartitionManager {
   NghIndexMeta _setFreeListHeads(
       NghDataCategory category, NghIndexMeta meta, Map<int, int> heads) {
     switch (category) {
-      case NghDataCategory.posting:
-        return meta.copyWith(postingFreeListHeads: heads);
+      case NghDataCategory.leaf:
+        return meta.copyWith(leafFreeListHeads: heads);
       case NghDataCategory.nav:
         return meta.copyWith(navFreeListHeads: heads);
       case NghDataCategory.pkmap:
@@ -1678,8 +1686,8 @@ final class NghPartitionManager {
       IndexUid indexUid, int partitionNo) {
     final pm = _dataStore.pathManager;
     switch (category) {
-      case NghDataCategory.posting:
-        return pm.getNghPostingPartitionPathByContext(
+      case NghDataCategory.leaf:
+        return pm.getNghLeafPartitionPathByContext(
             table, indexUid, partitionNo);
       case NghDataCategory.nav:
         return pm.getNghNavPartitionPathByContext(table, indexUid, partitionNo);
@@ -1695,35 +1703,35 @@ final class NghPartitionManager {
 
   /// Current total size of all NGH page caches.
   int getCurrentPageCacheSize() {
-    return _postingPageCache.estimatedTotalSizeBytes +
+    return _leafPageCache.estimatedTotalSizeBytes +
         _navPageCache.estimatedTotalSizeBytes +
         _pkmapPageCache.estimatedTotalSizeBytes;
   }
 
   /// Evict a portion of all NGH page caches.
   Future<void> evictPageCache({double ratio = 0.3}) async {
-    await _postingPageCache.cleanup(removeRatio: ratio);
+    await _leafPageCache.cleanup(removeRatio: ratio);
     await _navPageCache.cleanup(removeRatio: ratio);
     await _pkmapPageCache.cleanup(removeRatio: ratio);
   }
 
   /// Clear all NGH page caches synchronously.
   void clearPageCacheSync() {
-    _postingPageCache.clear();
+    _leafPageCache.clear();
     _navPageCache.clear();
     _pkmapPageCache.clear();
   }
 
   /// Clear caches for a specific table.
   void clearPageCacheForTable(TableUid tableUid) {
-    _postingPageCache.remove([tableUid]);
+    _leafPageCache.remove([tableUid]);
     _navPageCache.remove([tableUid]);
     _pkmapPageCache.remove([tableUid]);
   }
 
   /// Clear posting I/O fill for one index (search-hot leaves live elsewhere).
-  void clearPostingPageCacheForIndex(TableUid tableUid, IndexUid indexUid) {
-    _postingPageCache.remove([tableUid, indexUid]);
+  void clearLeafPageCacheForIndex(TableUid tableUid, IndexUid indexUid) {
+    _leafPageCache.remove([tableUid, indexUid]);
   }
 
   /// Clear nav page I/O fill for one index (Centroid B+Tree state is separate).
@@ -1732,13 +1740,13 @@ final class NghPartitionManager {
   }
 
   /// Drop one posting page from the I/O fill cache (leaf cache is independent).
-  void evictPostingPage(
+  void evictLeafPage(
     TableUid tableUid,
     IndexUid indexUid,
     int partitionNo,
     int pageNo,
   ) {
-    _postingPageCache.removePoint4(tableUid, indexUid, partitionNo, pageNo);
+    _leafPageCache.removePoint4(tableUid, indexUid, partitionNo, pageNo);
   }
 
   /// Memory-mode / cache-only commit of dirty NGH pages (no disk I/O).
@@ -1751,7 +1759,7 @@ final class NghPartitionManager {
     required TableContext table,
     required IndexUid indexUid,
     required NghIndexMeta meta,
-    Map<NghPagePtr, NghPostingPage> dirtyPostingPages = const {},
+    Map<NghPagePtr, NghLeafPage> dirtyLeafPages = const {},
     Map<NghPagePtr, NghNavCentroidPage> dirtyNavPages = const {},
     Map<NghPagePtr, NghPkMapDirtyPage> dirtyPkmapPages = const {},
     int vectorsDelta = 0,
@@ -1759,7 +1767,7 @@ final class NghPartitionManager {
   }) {
     final tableUid = table.tableUid;
 
-    // Dirty posting: do not fill _postingPageCache. Memory-mode callers promote
+    // Dirty posting: do not fill _leafPageCache. Memory-mode callers promote
     // into NghGraphEngine search-hot leaf cache instead.
     for (final entry in dirtyNavPages.entries) {
       final ptr = entry.key;
@@ -1794,7 +1802,7 @@ final class NghPartitionManager {
 
   /// Clear caches for a specific index.
   void clearPageCacheForIndex(TableUid tableUid, IndexUid indexUid) {
-    _postingPageCache.remove([tableUid, indexUid]);
+    _leafPageCache.remove([tableUid, indexUid]);
     _navPageCache.remove([tableUid, indexUid]);
     _pkmapPageCache.remove([tableUid, indexUid]);
   }
@@ -1812,12 +1820,12 @@ final class NghPartitionManager {
   /// which respects [EncryptionConfig.encryptionType] (ChaCha20/AES-GCM/XOR/none).
   /// When false, uses raw payload directly for maximum throughput.
   Uint8List buildPostingPageBytes({
-    required NghPostingPage page,
+    required NghLeafPage page,
     required int pageSize,
     required bool encrypt,
   }) {
     return _buildPageBytes(
-      BTreePageType.nghPosting,
+      BTreePageType.nghLeaf,
       page.encodePayload(),
       pageSize,
       encrypt,
@@ -1937,7 +1945,7 @@ final class NghPartitionManager {
 
       // NghIndexMeta lives only on posting partition 0 (same as table/index p0).
       Uint8List? treeGlobalMeta;
-      if (category == NghDataCategory.posting && pNo == 0) {
+      if (category == NghDataCategory.leaf && pNo == 0) {
         treeGlobalMeta = TreeGlobalMetaBlobCodec.encode(
           TreeGlobalMetaKind.ngh,
           NghIndexMetaCodec.encode(meta),

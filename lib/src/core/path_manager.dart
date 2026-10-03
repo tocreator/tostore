@@ -114,38 +114,53 @@ class PathManager {
   //==================================
 
   /// Synchronous table path using [TableContext] layout fields (no meta lookup).
-  String getTablePathByContext(TableContext table) {
+  String getTablePathByContext(TableContext table, {String? spaceName}) {
     if (dataStore.config.persistenceMode == PersistenceMode.memory) {
-      return 'memory://${dataStore.currentSpaceName}/tables/${table.tableUid}';
+      return 'memory://${spaceName ?? dataStore.currentSpaceName}/tables/${table.tableUid}';
     }
 
     final parentDir = table.isGlobal
         ? pathJoin(_instancePath, 'global')
-        : getSpacePath(spaceName: dataStore.currentSpaceName);
+        : getSpacePath(spaceName: spaceName ?? dataStore.currentSpaceName);
 
     return pathJoin(parentDir, 'tables_${table.dirIndex}', table.tableUid);
   }
 
   /// Synchronous table data root directory path.
-  String getDataDirPathByContext(TableContext table) {
-    return pathJoin(getTablePathByContext(table), 'data');
+  String getDataDirPathByContext(TableContext table, {String? spaceName}) {
+    return pathJoin(getTablePathByContext(table, spaceName: spaceName), 'data');
   }
 
   /// Synchronous table B+Tree partitions directory path.
-  String getPartitionsDirPathByContext(TableContext table) {
-    return pathJoin(getDataDirPathByContext(table), 'btree');
+  String getPartitionsDirPathByContext(TableContext table,
+      {String? spaceName}) {
+    return pathJoin(
+      getDataDirPathByContext(table, spaceName: spaceName),
+      'btree',
+    );
   }
 
   /// Synchronous table B+Tree partition directory path by dir shard.
-  String getPartitionDirPathByContext(TableContext table, int dirIndex) {
-    return pathJoin(getPartitionsDirPathByContext(table), 'dir_$dirIndex');
+  String getPartitionDirPathByContext(
+    TableContext table,
+    int dirIndex, {
+    String? spaceName,
+  }) {
+    return pathJoin(
+      getPartitionsDirPathByContext(table, spaceName: spaceName),
+      'dir_$dirIndex',
+    );
   }
 
   /// Synchronous table B+Tree partition file path by partitionNo.
-  String getPartitionFilePathByContext(TableContext table, int partitionNo) {
+  String getPartitionFilePathByContext(
+    TableContext table,
+    int partitionNo, {
+    String? spaceName,
+  }) {
     final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
     return pathJoin(
-      getPartitionDirPathByContext(table, dirIndex),
+      getPartitionDirPathByContext(table, dirIndex, spaceName: spaceName),
       'p$partitionNo.dat',
     );
   }
@@ -220,21 +235,20 @@ class PathManager {
     );
   }
 
-  /// Synchronous NGH inverted cluster posting partition file path by partitionNo.
-  String getNghPostingPartitionPathByContext(
+  /// Physical vector-leaf partition file path by partitionNo.
+  String getNghLeafPartitionPathByContext(
     TableContext table,
     IndexUid indexUid,
     int partitionNo,
   ) {
     final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
     return pathJoin(
-      _nghPartitionDirPathByContext(table, indexUid, 'posting', dirIndex),
+      _nghPartitionDirPathByContext(table, indexUid, 'leaf', dirIndex),
       'p$partitionNo.ngh',
     );
   }
 
-  /// Synchronous NGH navigating centroid graph file path (layoutVersion=1).
-  /// Read-only after engine v4; new writes use paged [getNghNavPartitionPathByContext].
+  /// Navigating graph blob under live `ngh/` (pre-v4 leftover only).
   String getNghNavGraphPathByContext(TableContext table, IndexUid indexUid) {
     return pathJoin(
       getNghIndexPathByContext(table, indexUid),

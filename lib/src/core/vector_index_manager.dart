@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
@@ -23,6 +22,8 @@ import 'vector_cache.dart';
 import 'vector_quantizer.dart';
 import 'workload_scheduler.dart';
 import 'yield_controller.dart';
+import '../upgrades/legacy_ngh/legacy_ngh_io.dart';
+import '../upgrades/legacy_ngh/legacy_ngh_search.dart';
 
 /// Manages all NGH vector indexes for the data store.
 class VectorIndexManager {
@@ -31,6 +32,8 @@ class VectorIndexManager {
   late final NghPartitionManager _partitionManager;
   late final NghGraphEngine _graphEngine;
   NghGraphEngine get graphEngine => _graphEngine;
+  late final LegacyNghIo _legacyIo;
+  late final LegacyNghSearch _legacySearch;
   late final VectorCache _vectorCache;
 
   /// In-flight meta loads -- prevents parallel readers from each hitting disk.
@@ -49,11 +52,13 @@ class VectorIndexManager {
   int? _lastSyncedIndexBudget;
   int? _lastSyncedVectorBudget;
   int? _lastSyncedNavBudget;
-  int? _lastSyncedPostingBudget;
+  int? _lastSyncedLeafBudget;
 
   VectorIndexManager(this._dataStore) {
     _partitionManager = NghPartitionManager(_dataStore);
     _graphEngine = NghGraphEngine(_partitionManager);
+    _legacyIo = LegacyNghIo(_dataStore);
+    _legacySearch = LegacyNghSearch(_legacyIo);
     _vectorCache = VectorCache();
     syncClusterCacheBudget();
   }
@@ -106,53 +111,28 @@ class VectorIndexManager {
     final navBudget = _resolveNavGraphCacheBudget(vectorBudget);
     // Posting fill layer: max(index*30%, vector*45%) so paged search survives
     // large insert bursts without immediate TreeCache eviction.
-    final postingBudget = max(
+    final leafBudget = max(
       (indexBudget * 0.30).round(),
       (vectorBudget * 0.45).round(),
     );
     if (_lastSyncedIndexBudget == indexBudget &&
         _lastSyncedVectorBudget == vectorBudget &&
         _lastSyncedNavBudget == navBudget &&
-        _lastSyncedPostingBudget == postingBudget) {
+        _lastSyncedLeafBudget == leafBudget) {
       return;
     }
     _lastSyncedIndexBudget = indexBudget;
     _lastSyncedVectorBudget = vectorBudget;
     _lastSyncedNavBudget = navBudget;
-    _lastSyncedPostingBudget = postingBudget;
+    _lastSyncedLeafBudget = leafBudget;
 
     _graphEngine.configureVectorSearchCacheBudget(vectorBudget);
     _graphEngine.configureNavGraphCacheBudget(navBudget);
+    _legacySearch.configureClusterCacheBudget(vectorBudget);
     _partitionManager.syncCacheBudget(
       indexBudget: indexBudget,
-      vectorPostingBudget: postingBudget,
+      vectorLeafBudget: leafBudget,
     );
-  }
-
-  /// Serializes layout-1 → paged nav migrate with the first flush that
-  /// still sees a legacy blob (background catch-up vs insert).
-  final Map<String, Future<void>> _navLayoutLocks = {};
-
-  Future<T> _withNavLayoutLock<T>(
-    TableUid tableUid,
-    IndexUid indexUid,
-    Future<T> Function() body,
-  ) async {
-    final key = '${tableUid.value}/${indexUid.value}';
-    final prev = _navLayoutLocks[key];
-    final gate = Completer<void>();
-    _navLayoutLocks[key] = gate.future;
-    if (prev != null) {
-      await prev;
-    }
-    try {
-      return await body();
-    } finally {
-      gate.complete();
-      if (identical(_navLayoutLocks[key], gate.future)) {
-        _navLayoutLocks.remove(key);
-      }
-    }
   }
 
   IndexUid? _resolveVectorIndexUid(TableContext table, String fieldName) {
@@ -279,6 +259,7 @@ class VectorIndexManager {
         };
         deleteRecords.add(oldRow);
         insertRecords.add({
+          ...?update.oldValues,
           ...update.newValues,
           pkName: update.primaryKey,
         });
@@ -307,7 +288,7 @@ class VectorIndexManager {
               table: table,
               indexUid: indexUid,
               meta: meta,
-              dirtyPostingPages: result.dirtyPostingPages,
+              dirtyLeafPages: result.dirtyLeafPages,
               dirtyNavPages: result.dirtyNavPages,
               dirtyNavBTreePages: result.dirtyNavBTreePages,
               dirtyNavRootPage: result.dirtyNavRootPage,
@@ -320,12 +301,6 @@ class VectorIndexManager {
             );
           }
 
-          if (!meta.isPagedLayout) {
-            await migrateLegacyNavIfNeeded(table, indexUid);
-            meta = _vectorCache.getMeta(table, indexUid) ??
-                await _loadMeta(table, indexUid) ??
-                meta;
-          }
           await flushDelete();
         }
       }
@@ -356,7 +331,7 @@ class VectorIndexManager {
               table: table,
               indexUid: indexUid,
               meta: meta,
-              dirtyPostingPages: insertResult.dirtyPostingPages,
+              dirtyLeafPages: insertResult.dirtyLeafPages,
               dirtyNavPages: insertResult.dirtyNavPages,
               dirtyNavBTreePages: insertResult.dirtyNavBTreePages,
               dirtyNavRootPage: insertResult.dirtyNavRootPage,
@@ -367,29 +342,20 @@ class VectorIndexManager {
               batchContext: batchContext,
             );
             await _removePendingDeletes(table, indexUid, pks);
-            // Dirty reshape + search-hot top-up
-            if (meta.layoutVersion >= NghIndexMeta.layoutPaged) {
-              if (!_dataStore.shouldAbortBackgroundScan &&
-                  (insertResult.dirtyPostingPages.isNotEmpty ||
-                      insertResult.dirtyNavBTreePages.isNotEmpty)) {
-                await _graphEngine.promotePagedLeavesAfterInsert(
-                  table: table,
-                  indexUid: indexUid,
-                  meta: meta,
-                  dirtyPostingPages: insertResult.dirtyPostingPages,
-                  dirtyNavBTreePages: insertResult.dirtyNavBTreePages,
-                  shouldAbort: () => _dataStore.shouldAbortBackgroundScan,
-                );
-              }
+            if (!_dataStore.shouldAbortBackgroundScan &&
+                (insertResult.dirtyLeafPages.isNotEmpty ||
+                    insertResult.dirtyNavBTreePages.isNotEmpty)) {
+              await _graphEngine.promotePagedLeavesAfterInsert(
+                table: table,
+                indexUid: indexUid,
+                meta: meta,
+                dirtyLeafPages: insertResult.dirtyLeafPages,
+                dirtyNavBTreePages: insertResult.dirtyNavBTreePages,
+                shouldAbort: () => _dataStore.shouldAbortBackgroundScan,
+              );
             }
           }
 
-          if (!meta.isPagedLayout) {
-            await migrateLegacyNavIfNeeded(table, indexUid);
-            meta = _vectorCache.getMeta(table, indexUid) ??
-                await _loadMeta(table, indexUid) ??
-                meta;
-          }
           await flushInsert();
         }
       }
@@ -456,6 +422,7 @@ class VectorIndexManager {
         };
         deleteRecords.add(oldRow);
         insertRecords.add({
+          ...?update.oldValues,
           ...update.newValues,
           pkName: update.primaryKey,
         });
@@ -487,19 +454,19 @@ class VectorIndexManager {
             table: table,
             indexUid: indexUid,
             meta: meta,
-            dirtyPostingPages: result.dirtyPostingPages,
+            dirtyLeafPages: result.dirtyLeafPages,
             dirtyNavPages: result.dirtyNavPages,
             dirtyPkmapPages: result.dirtyPkmapPages,
             vectorsDelta: -result.deletedCount,
             deletedDelta: result.deletedCount,
           );
-          if (result.dirtyPostingPages.isNotEmpty ||
+          if (result.dirtyLeafPages.isNotEmpty ||
               result.dirtyNavBTreePages.isNotEmpty) {
             _graphEngine.promotePagedLeavesAfterInsertSync(
               table: table,
               indexUid: indexUid,
               meta: meta,
-              dirtyPostingPages: result.dirtyPostingPages,
+              dirtyLeafPages: result.dirtyLeafPages,
               dirtyNavBTreePages: result.dirtyNavBTreePages,
             );
           }
@@ -529,18 +496,18 @@ class VectorIndexManager {
             table: table,
             indexUid: indexUid,
             meta: meta,
-            dirtyPostingPages: insertResult.dirtyPostingPages,
+            dirtyLeafPages: insertResult.dirtyLeafPages,
             dirtyNavPages: insertResult.dirtyNavPages,
             dirtyPkmapPages: insertResult.dirtyPkmapPages,
             vectorsDelta: insertResult.insertedCount,
           );
-          if (insertResult.dirtyPostingPages.isNotEmpty ||
+          if (insertResult.dirtyLeafPages.isNotEmpty ||
               insertResult.dirtyNavBTreePages.isNotEmpty) {
             _graphEngine.promotePagedLeavesAfterInsertSync(
               table: table,
               indexUid: indexUid,
               meta: meta,
-              dirtyPostingPages: insertResult.dirtyPostingPages,
+              dirtyLeafPages: insertResult.dirtyLeafPages,
               dirtyNavBTreePages: insertResult.dirtyNavBTreePages,
             );
           }
@@ -630,7 +597,7 @@ class VectorIndexManager {
     }
 
     var meta = _vectorCache.getMeta(table, indexUid);
-    if (meta == null || meta.isBuilding || meta.totalVectors == 0) {
+    if (meta == null) {
       return _vectorSearchCold(
         table: table,
         fieldName: fieldName,
@@ -641,16 +608,18 @@ class VectorIndexManager {
         distanceThreshold: distanceThreshold,
       );
     }
-    if (!meta.isPagedLayout) {
-      return _vectorSearchCold(
+    if (meta.isBuilding) {
+      return _vectorSearchLegacy(
         table: table,
-        fieldName: fieldName,
         indexUid: indexUid,
         queryVector: queryVector,
         topK: topK,
         searchDepth: searchDepth,
         distanceThreshold: distanceThreshold,
       );
+    }
+    if (meta.totalVectors == 0) {
+      return Future<List<VectorSearchResult>>.value(const []);
     }
     if (!_graphEngine.isNavGraphCached(table, indexUid, meta: meta)) {
       return _vectorSearchCold(
@@ -737,14 +706,18 @@ class VectorIndexManager {
   }) async {
     var meta = _vectorCache.getMeta(table, indexUid);
     meta ??= await _loadMeta(table, indexUid);
-    if (meta == null || meta.isBuilding || meta.totalVectors == 0) {
-      return const [];
+    if (meta == null || meta.isBuilding) {
+      return _vectorSearchLegacy(
+        table: table,
+        indexUid: indexUid,
+        queryVector: queryVector,
+        topK: topK,
+        searchDepth: searchDepth,
+        distanceThreshold: distanceThreshold,
+      );
     }
-    if (!meta.isPagedLayout) {
-      await migrateLegacyNavIfNeeded(table, indexUid);
-      meta = _vectorCache.getMeta(table, indexUid) ??
-          await _loadMeta(table, indexUid) ??
-          meta;
+    if (meta.totalVectors == 0) {
+      return const [];
     }
     if (!_graphEngine.isNavGraphCached(table, indexUid, meta: meta)) {
       await _graphEngine.prefetchNavGraph(table, indexUid, meta: meta);
@@ -788,6 +761,51 @@ class VectorIndexManager {
     return entries;
   }
 
+  Future<List<VectorSearchResult>> _vectorSearchLegacy({
+    required TableContext table,
+    required IndexUid indexUid,
+    required VectorData queryVector,
+    required int topK,
+    int? searchDepth,
+    double? distanceThreshold,
+  }) async {
+    if (!await _legacyIo.hasOldIndex(table, indexUid)) {
+      return const [];
+    }
+    final meta = await _legacyIo.readMeta(table, indexUid);
+    if (meta == null || meta.totalVectors <= 0) {
+      return const [];
+    }
+    final rawValues = queryVector.values;
+    final Float32List queryF32;
+    if (rawValues is Float32List && rawValues.length == meta.dimensions) {
+      queryF32 = rawValues;
+    } else {
+      queryF32 = _toFloat32(rawValues, meta.dimensions);
+    }
+    final results = await _legacySearch.search(
+      table: table,
+      indexUid: indexUid,
+      meta: meta,
+      query: queryF32,
+      topK: topK,
+      searchDepth: searchDepth,
+      distanceThreshold: distanceThreshold,
+    );
+    if (results.isEmpty) return const [];
+    final entries = <VectorSearchResult>[];
+    for (final r in results) {
+      final pk = r.primaryKey;
+      if (pk == null || pk.isEmpty) continue;
+      entries.add(VectorSearchResult(
+        primaryKey: pk,
+        distance: r.distance,
+        score: _distanceToScore(r.distance, meta.distanceMetric),
+      ));
+    }
+    return entries;
+  }
+
   /// Prewarm vector index meta, nav, and posting into search-hot caches.
   ///
   /// **Open / explicit prewarm only** (Phase 2 of DataStore cache prewarm).
@@ -806,7 +824,23 @@ class VectorIndexManager {
 
       final meta = await _loadMeta(table, indexUid);
       if (_dataStore.shouldAbortBackgroundScan) return 0;
-      if (meta == null || meta.isBuilding || meta.totalVectors <= 0) {
+      if (meta == null || meta.isBuilding) {
+        if (!await _legacyIo.hasOldIndex(table, indexUid)) return 0;
+        final oldMeta = await _legacyIo.readMeta(table, indexUid);
+        if (oldMeta == null || oldMeta.totalVectors <= 0) return 0;
+        await _legacySearch.prefetchNavGraph(table, indexUid);
+        final defaultBudget = _defaultPrewarmBudget();
+        final budget =
+            maxBytes != null ? min(maxBytes, defaultBudget) : defaultBudget;
+        if (budget <= 0) return 0;
+        return await _legacySearch.prewarmClusters(
+          table: table,
+          indexUid: indexUid,
+          meta: oldMeta,
+          maxBytes: budget,
+        );
+      }
+      if (meta.totalVectors <= 0) {
         return 0;
       }
       await _graphEngine.prefetchNavGraph(table, indexUid, meta: meta);
@@ -872,59 +906,6 @@ class VectorIndexManager {
     return totalLoaded;
   }
 
-  /// Convert legacy single-file `nav_graph.ngh` or unrooted paged nav to modern Centroid B+Tree.
-  ///
-  /// No-op when [NghIndexMeta.isPagedLayout] and [NghIndexMeta.navBTreeRootPtr] is valid.
-  /// Does not rewrite posting slots.
-  Future<void> migrateLegacyNavIfNeeded(
-    TableContext table,
-    IndexUid indexUid,
-  ) async {
-    await _withNavLayoutLock(table.tableUid, indexUid, () async {
-      var meta = await _loadMeta(table, indexUid);
-      if (meta == null) return;
-      meta = _withPageSizes(meta);
-      if (meta.isPagedLayout) {
-        await _partitionManager.deleteLegacyNavBlobIfExists(table, indexUid);
-        return;
-      }
-
-      // 1. Try reading legacy monolithic nav_graph.ngh
-      var blob =
-          await _partitionManager.readLegacyNavGraphBlob(table, indexUid);
-
-      // 2. If blob is gone, try reading unrooted paged nav centroids from p0.ngh
-      blob ??= await _partitionManager.readPagedNavGraph(table, indexUid, meta);
-
-      if (blob != null && blob.centroids.isNotEmpty) {
-        final migrated = await _graphEngine.migrateLegacyNavToBTree(
-          table: table,
-          indexUid: indexUid,
-          meta: meta,
-          blob: blob,
-        );
-        meta = await _partitionManager.writeChanges(
-          table: table,
-          indexUid: indexUid,
-          meta: migrated.meta,
-          dirtyNavBTreePages: migrated.dirtyNavBTreePages,
-          dirtyNavRootPage: migrated.dirtyNavRootPage,
-          deleteLegacyNavGraph: true,
-        );
-        await _persistMeta(table, indexUid, meta);
-        _vectorCache.putMeta(table, indexUid, meta);
-        return;
-      }
-
-      // If no nav centroids can be read at all, mark as paged to prevent repeated checks
-      if (!meta.isPagedLayout) {
-        meta = meta.copyWith(layoutVersion: NghIndexMeta.layoutPaged);
-        await _persistMeta(table, indexUid, meta);
-        _vectorCache.putMeta(table, indexUid, meta);
-      }
-    });
-  }
-
   int _defaultPrewarmBudget() {
     final clusterBudget = _resolveCompactVectorClusterBudget();
     final used = _graphEngine.clusterCacheBytes;
@@ -951,13 +932,12 @@ class VectorIndexManager {
   /// Loads live vectors from the table by primary key (file-backed),
   /// re-quantizes to SQ8, and returns a full TPG2 page suitable for partition
   /// write. Returns null when the payload is not NGPK or meta/schema is missing.
-  Future<Uint8List?> materializePostingPkRedoPage({
+  Future<Uint8List?> materializeLeafPkRedoPage({
     required TableContext table,
     required IndexUid indexUid,
     required Uint8List pkRedoPayload,
   }) async {
-    final decoded =
-        NghPostingPage.tryDecodePkStructureRedoPayload(pkRedoPayload);
+    final decoded = NghLeafPage.tryDecodePkStructureRedoPayload(pkRedoPayload);
     if (decoded == null) return null;
 
     final meta = await _loadMeta(table, indexUid);
@@ -983,13 +963,13 @@ class VectorIndexManager {
 
     final pkName = schema.primaryKey;
     final dims = decoded.dimensions;
-    final slots = <NghPostingSlot>[];
+    final slots = <NghLeafSlot>[];
     final emptyCodes = Uint8List(dims);
 
     for (final s in decoded.slots) {
       final pk = utf8.decode(s.pkBytes, allowMalformed: true);
-      if ((s.flags & NghPostingSlot.flagDeleted) != 0) {
-        slots.add(NghPostingSlot(
+      if ((s.flags & NghLeafSlot.flagDeleted) != 0) {
+        slots.add(NghLeafSlot(
           nodeId: s.nodeId,
           flags: s.flags,
           primaryKeyBytes: Uint8List.fromList(s.pkBytes),
@@ -1024,7 +1004,7 @@ class VectorIndexManager {
           'NGH PK-redo missing table vector for pk="$pk" '
           '(table=${table.tableUid}, index=$indexUid); slot kept empty',
         );
-        slots.add(NghPostingSlot(
+        slots.add(NghLeafSlot(
           nodeId: s.nodeId,
           flags: s.flags,
           primaryKeyBytes: Uint8List.fromList(s.pkBytes),
@@ -1037,7 +1017,7 @@ class VectorIndexManager {
       }
 
       final sq8 = ScalarQuantizer.quantize(f32);
-      slots.add(NghPostingSlot(
+      slots.add(NghLeafSlot(
         nodeId: s.nodeId,
         flags: s.flags,
         primaryKeyBytes: Uint8List.fromList(s.pkBytes),
@@ -1048,15 +1028,15 @@ class VectorIndexManager {
       ));
     }
 
-    final page = NghPostingPage(
+    final page = NghLeafPage(
       centroidId: decoded.centroidId,
-      nextPostingPage: decoded.nextPostingPage,
+      nextLeafPage: decoded.nextLeafPage,
       dimensions: dims,
       slots: slots,
     );
     page.ensureLow48Ready();
     final pageSize = _partitionManager.pageSizeFor(
-      NghDataCategory.posting,
+      NghDataCategory.leaf,
       meta,
     );
     final encrypt =
@@ -1116,7 +1096,7 @@ class VectorIndexManager {
     return next;
   }
 
-  Future<void> _persistMeta(
+  Future<bool> _persistMeta(
       TableContext table, IndexUid indexUid, NghIndexMeta meta) async {
     try {
       await _dataStore.treeMetaPageService.persistNghGlobalMeta(
@@ -1125,8 +1105,10 @@ class VectorIndexManager {
         meta: meta,
         flush: false,
       );
+      return true;
     } catch (e) {
       Logger.error('Failed to persist NGH meta', rawError: e);
+      return false;
     }
   }
 
@@ -1179,6 +1161,8 @@ class VectorIndexManager {
     IndexUid indexUid,
   ) async {
     _vectorCache.clearForIndex(table.tableUid, indexUid);
+    _legacySearch.clearCacheForIndex(table.tableUid, indexUid);
+    await _legacyIo.deleteOldIndex(table, indexUid);
     await _partitionManager.deletePhysicalIndexArtifacts(table, indexUid);
   }
 
@@ -1190,7 +1174,9 @@ class VectorIndexManager {
     final indexUid = indexSchema.indexUid;
     if (indexUid.isEmpty) return;
 
-    await deletePhysicalIndexArtifacts(table, indexUid);
+    _vectorCache.clearForIndex(table.tableUid, indexUid);
+    _graphEngine.clearCacheForIndex(table.tableUid, indexUid);
+    await _partitionManager.deleteLiveNghRoot(table, indexUid);
 
     int dims = 128;
     if (indexSchema.fields.isNotEmpty) {
@@ -1225,11 +1211,17 @@ class VectorIndexManager {
     if (indexUid.isEmpty) return;
     var meta = _vectorCache.getMeta(table, indexUid);
     meta ??= await _loadMeta(table, indexUid);
-    if (meta == null || !meta.isBuilding) return;
+    if (meta == null) return;
 
-    final updated = meta.copyWith(isBuilding: false);
-    await _persistMeta(table, indexUid, updated);
-    _vectorCache.putMeta(table, indexUid, updated);
+    if (meta.isBuilding) {
+      final updated = meta.copyWith(isBuilding: false);
+      if (!await _persistMeta(table, indexUid, updated)) {
+        return;
+      }
+      _vectorCache.putMeta(table, indexUid, updated);
+    }
+    await _legacyIo.deleteOldIndex(table, indexUid);
+    _legacySearch.clearCacheForIndex(table.tableUid, indexUid);
   }
 
   // =====================================================================
@@ -1258,15 +1250,7 @@ class VectorIndexManager {
       final indexUid = idx.indexUid;
       var meta = _vectorCache.getMeta(table, indexUid);
       meta ??= await _loadMeta(table, indexUid);
-      if (meta == null) continue;
-      if (!meta.isPagedLayout) {
-        await migrateLegacyNavIfNeeded(table, indexUid);
-        meta = _vectorCache.getMeta(table, indexUid) ??
-            await _loadMeta(table, indexUid);
-        if (meta == null || !meta.isPagedLayout) continue;
-      } else {
-        await _partitionManager.deleteLegacyNavBlobIfExists(table, indexUid);
-      }
+      if (meta == null || meta.isBuilding) continue;
 
       // Skip if deletion ratio is low (< 10%)
       if (meta.totalVectors == 0 ||
@@ -1281,19 +1265,19 @@ class VectorIndexManager {
         maxVisitedPages: maxVisitedPages,
       );
 
-      if (result.dirtyPostingPages.isNotEmpty ||
+      if (result.dirtyLeafPages.isNotEmpty ||
           result.dirtyNavPages.isNotEmpty ||
           result.dirtyPkmapPages.isNotEmpty ||
-          result.freePostingPages.isNotEmpty) {
+          result.freeLeafPages.isNotEmpty) {
         meta = result.meta;
         meta = await _partitionManager.writeChanges(
           table: table,
           indexUid: indexUid,
           meta: meta,
-          dirtyPostingPages: result.dirtyPostingPages,
+          dirtyLeafPages: result.dirtyLeafPages,
           dirtyNavPages: result.dirtyNavPages,
           dirtyPkmapPages: result.dirtyPkmapPages,
-          freePostingPages: result.freePostingPages,
+          freeLeafPages: result.freeLeafPages,
           deletedDelta: -result.compactedCount,
         );
         await _persistMeta(table, indexUid, meta);
@@ -1312,7 +1296,8 @@ class VectorIndexManager {
         _partitionManager.getCurrentPageCacheSize() +
         _graphEngine.clusterCacheBytes +
         _graphEngine.btreeLeafCacheBytes +
-        _graphEngine.navGraphCacheBytes;
+        _graphEngine.navGraphCacheBytes +
+        _legacySearch.clusterCacheBytes;
   }
 
   /// Evict caches under memory pressure.
@@ -1329,6 +1314,11 @@ class VectorIndexManager {
     if (force || isCritical || clusterBytes > clusterMax) {
       await _graphEngine.evictClusterCache(ratio: ratio);
     }
+    final legacyBytes = _legacySearch.clusterCacheBytes;
+    final legacyMax = _legacySearch.clusterCacheMaxBytes;
+    if (force || isCritical || legacyBytes > legacyMax) {
+      _legacySearch.evictClusterCache(ratio: ratio);
+    }
     final leafBytes = _graphEngine.btreeLeafCacheBytes;
     final leafMax = _graphEngine.btreeLeafCacheMaxBytes;
     if (force || isCritical || leafBytes > leafMax) {
@@ -1342,17 +1332,16 @@ class VectorIndexManager {
     _fieldIndexUidCache.removeWhere((k, _) => k.startsWith(prefix));
     _pendingDeleteCache.removeWhere((k, _) => k.startsWith(prefix));
     _metaLoadingFutures.removeWhere((k, _) => k.startsWith(prefix));
-    _navLayoutLocks.removeWhere((k, _) => k.startsWith(prefix));
     _vectorCache.clearForTable(tableUid);
     _partitionManager.clearPageCacheForTable(tableUid);
     _graphEngine.clearCacheForTable(tableUid);
+    _legacySearch.clearCacheForTable(tableUid);
   }
 
   /// Clear all caches for a specific index.
   void clearCacheForIndex(TableUid tableUid, IndexUid indexUid) {
     final key = _pendingKey(tableUid, indexUid);
     _pendingDeleteCache.remove(key);
-    _navLayoutLocks.remove(key);
     final metaPrefix = '${tableUid.value}/';
     _metaLoadingFutures.removeWhere(
       (k, _) =>
@@ -1365,6 +1354,7 @@ class VectorIndexManager {
     _partitionManager.clearFullyCachedForIndex(tableUid, indexUid);
     _partitionManager.clearPageCacheForIndex(tableUid, indexUid);
     _graphEngine.clearCacheForIndex(tableUid, indexUid);
+    _legacySearch.clearCacheForIndex(tableUid, indexUid);
   }
 
   /// Clear all caches.
@@ -1381,6 +1371,7 @@ class VectorIndexManager {
     _vectorCache.clear();
     _partitionManager.clearPageCacheSync();
     _graphEngine.clearCache();
+    _legacySearch.clearCache();
     _pendingDeleteCache.clear();
   }
 
@@ -1527,13 +1518,12 @@ class VectorIndexManager {
       pendingDeletePks: pending,
     );
     var next = result.meta;
-    if (result.dirtyPostingPages.isNotEmpty ||
-        result.dirtyPkmapPages.isNotEmpty) {
+    if (result.dirtyLeafPages.isNotEmpty || result.dirtyPkmapPages.isNotEmpty) {
       next = await _partitionManager.writeChanges(
         table: table,
         indexUid: indexUid,
         meta: next,
-        dirtyPostingPages: result.dirtyPostingPages,
+        dirtyLeafPages: result.dirtyLeafPages,
         dirtyPkmapPages: result.dirtyPkmapPages,
         vectorsDelta: -result.tombstonedCount,
         deletedDelta: result.tombstonedCount,

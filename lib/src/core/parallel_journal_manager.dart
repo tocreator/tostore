@@ -2875,7 +2875,7 @@ class ParallelJournalManager {
             if (tableContext == null) return null;
             final indexUid =
                 _resolveRedoIndexUid(tableContext.schema, key.indexUid);
-            return _dataStore.pathManager.getNghPostingPartitionPathByContext(
+            return _dataStore.pathManager.getNghLeafPartitionPathByContext(
                 tableContext, indexUid, key.partitionNo);
           }
           if (key.kind == PageRedoTreeKind.nghNav) {
@@ -2945,7 +2945,7 @@ class ParallelJournalManager {
         int pageSize = 0;
         for (final v in pages.values) {
           if (v.isEmpty) continue;
-          if (NghPostingPage.isPkStructureRedoPayload(v)) continue;
+          if (NghLeafPage.isPkStructureRedoPayload(v)) continue;
           pageSize = v.length;
           break;
         }
@@ -2957,7 +2957,7 @@ class ParallelJournalManager {
           if (pg < 0) continue;
           final payload = pages[pg];
           if (payload == null || payload.isEmpty) continue;
-          if (NghPostingPage.isPkStructureRedoPayload(payload)) continue;
+          if (NghLeafPage.isPkStructureRedoPayload(payload)) continue;
           if (payload.length != pageSize) continue;
           writes.add(ByteWrite(offset: pg * pageSize, bytes: payload));
         }
@@ -2976,7 +2976,7 @@ class ParallelJournalManager {
         if (key.indexUid.isEmpty) continue;
         final pages = e.value;
         final hasNgPk = pages.values.any(
-            (v) => v.isNotEmpty && NghPostingPage.isPkStructureRedoPayload(v));
+            (v) => v.isNotEmpty && NghLeafPage.isPkStructureRedoPayload(v));
         if (!hasNgPk) continue;
 
         final tableContext = await _tableContextFromUid(key.tableUid);
@@ -2997,11 +2997,11 @@ class ParallelJournalManager {
           final payload = pages[pg];
           if (payload == null ||
               payload.isEmpty ||
-              !NghPostingPage.isPkStructureRedoPayload(payload)) {
+              !NghLeafPage.isPkStructureRedoPayload(payload)) {
             continue;
           }
           final built =
-              await _dataStore.vectorIndexManager?.materializePostingPkRedoPage(
+              await _dataStore.vectorIndexManager?.materializeLeafPkRedoPage(
             table: tableContext,
             indexUid: indexUid,
             pkRedoPayload: payload,

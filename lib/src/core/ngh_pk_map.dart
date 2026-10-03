@@ -95,7 +95,9 @@ final class NghPkMapEngine {
     ({NghPagePtr ptr, LeafPage page})? cursor;
     for (final e in entries) {
       var locs = e.locators;
-      if (locs.length > 2) locs = locs.sublist(0, 2);
+      if (locs.length > NghPkLocator.maxLocatorsPerPk) {
+        locs = locs.sublist(0, NghPkLocator.maxLocatorsPerPk);
+      }
       if (batch.meta.pkmapRootIsNull) {
         await upsert(
           table: table,
@@ -125,7 +127,9 @@ final class NghPkMapEngine {
             if (!rewrittenIds.contains(l.centroidId)) l,
           ...locs,
         ];
-        locs = merged.length > 2 ? merged.sublist(0, 2) : merged;
+        locs = merged.length > NghPkLocator.maxLocatorsPerPk
+            ? merged.sublist(0, NghPkLocator.maxLocatorsPerPk)
+            : merged;
       }
       cursor.page.upsert(e.key, NghPkLocator.encodeList(locs));
       batch.dirty[cursor.ptr] = NghPkMapDirtyPage.leaf(cursor.page);
