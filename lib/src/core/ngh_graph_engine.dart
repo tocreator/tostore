@@ -380,6 +380,7 @@ final class _CentroidSearchScratch {
   late final Float32x4List scratchQLowSimd =
       Float32x4List.sublistView(scratchQLow);
   final Float32List scratchQFull;
+  late final Float32x4List scratchQFullSimd;
 
   final SlotCandidateHeap slotHeap = SlotCandidateHeap(2048);
   final BranchMinHeap branchHeap = BranchMinHeap(256);
@@ -402,7 +403,13 @@ final class _CentroidSearchScratch {
   int currentStamp = 0;
 
   _CentroidSearchScratch({required this.dimensions})
-      : scratchQFull = Float32List(dimensions);
+      : scratchQFull = Float32List(dimensions) {
+    scratchQFullSimd = Float32x4List.view(
+      scratchQFull.buffer,
+      0,
+      max(0, dimensions >> 2),
+    );
+  }
 
   @pragma('vm:prefer-inline')
   void nextQueryStamp() {
@@ -1805,16 +1812,24 @@ class NghGraphEngine {
   }
 
   /// Write normalized 48-D routing sketch into [out] (no allocation).
+  /// Pass resident [fullSimd]/[outSimd] to avoid per-query typed-data views.
   @pragma('vm:prefer-inline')
-  static void _extractLow48Into(Float32List full, Float32List out) {
+  static void _extractLow48Into(
+    Float32List full,
+    Float32List out, {
+    Float32x4List? fullSimd,
+    Float32x4List? outSimd,
+  }) {
     final n = full.length;
     if (n <= 48) {
       // Identity sketch — same as legacy for D≤48.
       if (n == 48 &&
-          (full.offsetInBytes & 15) == 0 &&
-          (out.offsetInBytes & 15) == 0) {
-        final src = Float32x4List.view(full.buffer, full.offsetInBytes, 12);
-        final dst = Float32x4List.view(out.buffer, out.offsetInBytes, 12);
+          fullSimd != null &&
+          outSimd != null &&
+          fullSimd.length >= 12 &&
+          outSimd.length >= 12) {
+        final src = fullSimd;
+        final dst = outSimd;
         var sum0 = Float32x4.zero();
         var sum1 = Float32x4.zero();
         var sum2 = Float32x4.zero();
@@ -1858,16 +1873,66 @@ class NghGraphEngine {
 
     // D>48: fold all coordinates into 48 bins (dim-agnostic).
     // Chunked add avoids per-element modulo — hot on every 128–768D query.
+    // Independent bins: SIMD += is bit-identical to scalar += per bin.
     for (int i = 0; i < 48; i++) {
       out[i] = 0.0;
     }
     final fullChunks = n - (n % 48);
     var d = 0;
-    while (d < fullChunks) {
-      for (int i = 0; i < 48; i++) {
-        out[i] += full[d + i];
+    final src = fullSimd;
+    final dst = outSimd;
+    if (fullChunks >= 48 &&
+        src != null &&
+        dst != null &&
+        src.length >= (fullChunks >> 2) &&
+        dst.length >= 12) {
+      var a0 = Float32x4.zero();
+      var a1 = Float32x4.zero();
+      var a2 = Float32x4.zero();
+      var a3 = Float32x4.zero();
+      var a4 = Float32x4.zero();
+      var a5 = Float32x4.zero();
+      var a6 = Float32x4.zero();
+      var a7 = Float32x4.zero();
+      var a8 = Float32x4.zero();
+      var a9 = Float32x4.zero();
+      var a10 = Float32x4.zero();
+      var a11 = Float32x4.zero();
+      while (d < fullChunks) {
+        final base = d >> 2;
+        a0 += src[base];
+        a1 += src[base + 1];
+        a2 += src[base + 2];
+        a3 += src[base + 3];
+        a4 += src[base + 4];
+        a5 += src[base + 5];
+        a6 += src[base + 6];
+        a7 += src[base + 7];
+        a8 += src[base + 8];
+        a9 += src[base + 9];
+        a10 += src[base + 10];
+        a11 += src[base + 11];
+        d += 48;
       }
-      d += 48;
+      dst[0] = a0;
+      dst[1] = a1;
+      dst[2] = a2;
+      dst[3] = a3;
+      dst[4] = a4;
+      dst[5] = a5;
+      dst[6] = a6;
+      dst[7] = a7;
+      dst[8] = a8;
+      dst[9] = a9;
+      dst[10] = a10;
+      dst[11] = a11;
+    } else {
+      while (d < fullChunks) {
+        for (int i = 0; i < 48; i++) {
+          out[i] += full[d + i];
+        }
+        d += 48;
+      }
     }
     while (d < n) {
       out[d - fullChunks] += full[d];
@@ -2344,15 +2409,30 @@ class NghGraphEngine {
       searchQuery = scratch.scratchQFull;
     }
 
-    _extractLow48Into(searchQuery, scratch.scratchQLow);
+    final searchQuerySimd = identical(searchQuery, scratch.scratchQFull)
+        ? scratch.scratchQFullSimd
+        : ((searchQuery.offsetInBytes & 15) == 0 && searchQuery.length >= 4
+            ? Float32x4List.view(
+                searchQuery.buffer,
+                searchQuery.offsetInBytes,
+                searchQuery.length >> 2,
+              )
+            : null);
+
+    _extractLow48Into(
+      searchQuery,
+      scratch.scratchQLow,
+      fullSimd: searchQuerySimd,
+      outSimd: scratch.scratchQLowSimd,
+    );
     final qLowSimd = scratch.scratchQLowSimd;
     // SIMD sum of query (matches tool/test_centroid_btree_engine.dart).
     double qFullSum;
     final dim = meta.dimensions;
     final qFullAligned = (searchQuery.offsetInBytes & 15) == 0;
-    if (qFullAligned && dim >= 16) {
+    if (dim >= 16 && (searchQuerySimd != null || qFullAligned)) {
       final n4 = dim >> 2;
-      final qSimd =
+      final qSimd = searchQuerySimd ??
           Float32x4List.view(searchQuery.buffer, searchQuery.offsetInBytes, n4);
       var sum0 = Float32x4.zero();
       var sum1 = Float32x4.zero();
@@ -2890,9 +2970,121 @@ class NghGraphEngine {
     scratch.slotHeap.reset(planCandSlots);
     final stampCheck = scratch.visitedTag;
     final stamp = scratch.currentStamp;
+    final heap = scratch.slotHeap;
+    final heapCap = heap.capacity;
     for (int l = 0; l < leavesToPick; l++) {
       final leafPage = scratch.pickedLeafPages[l];
       if (leafPage == null) continue;
+
+      if (leafPage.searchLow48Simd == null) {
+        leafPage.ensureLow48Ready();
+      }
+      final packed = leafPage.searchLow48Simd;
+      final liveSlots = leafPage.searchLiveSlots;
+      if (packed != null && liveSlots != null) {
+        final n = liveSlots.length;
+        var i = 0;
+        final n2 = n - 1;
+        while (i < n2) {
+          final slot0 = liveSlots[i];
+          final slot1 = liveSlots[i + 1];
+          final id0 = slot0.nodeId;
+          final id1 = slot1.nodeId;
+          var skip0 = (slot0.flags & 0x01) != 0;
+          var skip1 = (slot1.flags & 0x01) != 0;
+          if (!skip0 && id0 < stampCheck.length) {
+            if (stampCheck[id0] == stamp) {
+              skip0 = true;
+            } else {
+              stampCheck[id0] = stamp;
+            }
+          }
+          if (!skip1 && id1 < stampCheck.length) {
+            if (stampCheck[id1] == stamp) {
+              skip1 = true;
+            } else {
+              stampCheck[id1] = stamp;
+            }
+          }
+          if (!skip0) {
+            final s48 = innerProduct48Reg(
+              q0,
+              q1,
+              q2,
+              q3,
+              q4,
+              q5,
+              q6,
+              q7,
+              q8,
+              q9,
+              q10,
+              q11,
+              packed,
+              i * 12,
+            );
+            if (!(heap.size >= heapCap && s48 <= heap.minScore)) {
+              heap.push(slot0, s48);
+            }
+          }
+          if (!skip1) {
+            final s48 = innerProduct48Reg(
+              q0,
+              q1,
+              q2,
+              q3,
+              q4,
+              q5,
+              q6,
+              q7,
+              q8,
+              q9,
+              q10,
+              q11,
+              packed,
+              (i + 1) * 12,
+            );
+            if (!(heap.size >= heapCap && s48 <= heap.minScore)) {
+              heap.push(slot1, s48);
+            }
+          }
+          i += 2;
+        }
+        if (i < n) {
+          final slot = liveSlots[i];
+          final nodeId = slot.nodeId;
+          var skip = (slot.flags & 0x01) != 0;
+          if (!skip && nodeId < stampCheck.length) {
+            if (stampCheck[nodeId] == stamp) {
+              skip = true;
+            } else {
+              stampCheck[nodeId] = stamp;
+            }
+          }
+          if (!skip) {
+            final s48 = innerProduct48Reg(
+              q0,
+              q1,
+              q2,
+              q3,
+              q4,
+              q5,
+              q6,
+              q7,
+              q8,
+              q9,
+              q10,
+              q11,
+              packed,
+              i * 12,
+            );
+            if (!(heap.size >= heapCap && s48 <= heap.minScore)) {
+              heap.push(slot, s48);
+            }
+          }
+        }
+        continue;
+      }
 
       final slots = leafPage.slots;
       for (int i = 0; i < slots.length; i++) {
@@ -2924,11 +3116,10 @@ class NghGraphEngine {
             built,
             0,
           );
-          if (scratch.slotHeap.size >= scratch.slotHeap.capacity &&
-              s48 <= scratch.slotHeap.minScore) {
+          if (heap.size >= heapCap && s48 <= heap.minScore) {
             continue;
           }
-          scratch.slotHeap.push(slot, s48);
+          heap.push(slot, s48);
           continue;
         }
         final s48 = innerProduct48Reg(
@@ -2947,11 +3138,10 @@ class NghGraphEngine {
           sSimd,
           0,
         );
-        if (scratch.slotHeap.size >= scratch.slotHeap.capacity &&
-            s48 <= scratch.slotHeap.minScore) {
+        if (heap.size >= heapCap && s48 <= heap.minScore) {
           continue;
         }
-        scratch.slotHeap.push(slot, s48);
+        heap.push(slot, s48);
       }
     }
 
@@ -2971,6 +3161,7 @@ class NghGraphEngine {
 
     for (int i = 1; i <= scratch.slotHeap.size; i++) {
       final slot = scratch.slotHeap.slots[i]!;
+      if ((slot.flags & NghLeafSlot.flagDeleted) != 0) continue;
       if (hasPending && pendingDeletePks.contains(slot.primaryKey)) {
         continue;
       }
@@ -4977,6 +5168,15 @@ class NghGraphEngine {
       final ptr = NghPagePtr(NghDataCategory.leaf, loc.partitionNo, loc.pageNo);
       final existing = dirtyLeaves[ptr];
       if (existing != null) return existing;
+      final pageId = NghPageId(loc.partitionNo, loc.pageNo);
+      // Tombstone the search-hot instance so L2A pack is dropped in place.
+      final hot = _btreeLeafGet(
+        table.tableUid,
+        indexUid,
+        pageId,
+        touch: false,
+      );
+      if (hot != null) return hot;
       return _partitionManager.readLeafPage(
         table,
         indexUid,
@@ -5008,7 +5208,7 @@ class NghGraphEngine {
         var hit = false;
         for (final slot in page.slots) {
           if (!slot.isDeleted && slot.primaryKey == pk) {
-            slot.flags |= NghLeafSlot.flagDeleted;
+            page.markSlotDeleted(slot);
             hit = true;
           }
         }
@@ -5204,6 +5404,12 @@ class NghGraphEngine {
       visited++;
       final ptr = NghPagePtr.fromPageId(NghDataCategory.leaf, pid);
       final page = dirtyLeaves[ptr] ??
+          _btreeLeafGet(
+            table.tableUid,
+            indexUid,
+            pid,
+            touch: false,
+          ) ??
           await _partitionManager.readLeafPage(
             table,
             indexUid,
@@ -5221,12 +5427,14 @@ class NghGraphEngine {
           if (!s.isDeleted) s
       ];
       compacted += page.slots.length - live.length;
-      dirtyLeaves[ptr] = NghLeafPage(
+      final compactedPage = NghLeafPage(
         centroidId: page.centroidId,
         nextLeafPage: page.nextLeafPage,
         dimensions: page.dimensions,
         slots: live,
       );
+      dirtyLeaves[ptr] = compactedPage;
+      _btreeLeafPut(table.tableUid, indexUid, pid, compactedPage);
       if (live.isEmpty) continue;
       for (int i = 0; i < live.length; i++) {
         final pk = live[i].primaryKey;
@@ -5318,13 +5526,22 @@ class NghGraphEngine {
       }
       while (page < pageCount && visited < maxPages) {
         visited++;
-        final loaded = await _partitionManager.readLeafPage(
-          table,
-          indexUid,
-          currentMeta,
-          part,
-          page,
-        );
+        final pageId = NghPageId(part, page);
+        final ptr = NghPagePtr(NghDataCategory.leaf, part, page);
+        final loaded = dirtyLeaves[ptr] ??
+            _btreeLeafGet(
+              table.tableUid,
+              indexUid,
+              pageId,
+              touch: false,
+            ) ??
+            await _partitionManager.readLeafPage(
+              table,
+              indexUid,
+              currentMeta,
+              part,
+              page,
+            );
         final pgNo = page;
         page++;
         if (loaded == null) continue;
@@ -5335,7 +5552,7 @@ class NghGraphEngine {
           if (pk.isEmpty) continue;
           if (pendingDeletePks.contains(pk)) {
             if (!slot.isDeleted) {
-              slot.flags |= 0x01;
+              loaded.markSlotDeleted(slot);
               modified = true;
               tombstoned++;
             }
@@ -5371,6 +5588,12 @@ class NghGraphEngine {
         }
         if (modified) {
           dirtyLeaves[NghPagePtr(NghDataCategory.leaf, part, pgNo)] = loaded;
+          _btreeLeafPut(
+            table.tableUid,
+            indexUid,
+            NghPageId(part, pgNo),
+            loaded,
+          );
         }
       }
       if (page >= pageCount) {

@@ -318,6 +318,13 @@ final class NghLeafPage {
   /// Cached [needsWideNext]; null = unknown.
   bool? _wideNextCache;
 
+  /// Contiguous live-slot 48-D SIMD rows for L2A (12 Float32x4 per slot).
+  /// Same values as per-slot [NghLeafSlot.low48DSimd]; layout only.
+  Float32x4List? _search48Simd;
+
+  /// Live (non-tombstone) slots parallel to [_search48Simd] rows.
+  List<NghLeafSlot>? _searchLiveSlots;
+
   NghLeafPage({
     required this.centroidId,
     NghPageId? nextLeafPage,
@@ -351,7 +358,31 @@ final class NghLeafPage {
     _wideNextCache = null;
     _payloadCache = null;
     _sum48 = null;
+    _clearSearch48Pack();
   }
+
+  void _clearSearch48Pack() {
+    _search48Simd = null;
+    _searchLiveSlots = null;
+  }
+
+  /// Soft-delete [slot] and drop search/nav summaries that included it.
+  ///
+  /// Wire payload still contains the tombstone (slot stays on the page).
+  /// [_sum48] is dropped (not incrementally subtracted) so the next
+  /// [normalizedMean48] rebuilds over live slots only.
+  void markSlotDeleted(NghLeafSlot slot) {
+    if ((slot.flags & NghLeafSlot.flagDeleted) != 0) return;
+    slot.flags |= NghLeafSlot.flagDeleted;
+    _clearSearch48Pack();
+    _sum48 = null;
+  }
+
+  /// Packed L2A 48-D rows (null until [ensureLow48Ready]).
+  Float32x4List? get searchLow48Simd => _search48Simd;
+
+  /// Live slots aligned with [searchLow48Simd] (null until [ensureLow48Ready]).
+  List<NghLeafSlot>? get searchLiveSlots => _searchLiveSlots;
 
   void _setNextLeafPage(NghPageId next) {
     if (next == nextLeafPage) return;
@@ -421,6 +452,7 @@ final class NghLeafPage {
           dimensions;
     }
     _addToSum48(slot);
+    _clearSearch48Pack();
   }
 
   /// Pop the last slot; reverses sum when warm, drops layout caches (wide may
@@ -428,7 +460,7 @@ final class NghLeafPage {
   void removeLastSlot() {
     if (slots.isEmpty) return;
     final last = slots.removeLast();
-    if (_sum48 != null) {
+    if (_sum48 != null && (last.flags & NghLeafSlot.flagDeleted) == 0) {
       final low = last.getLow48D(48);
       final sum = _sum48!;
       for (int d = 0; d < 48; d++) {
@@ -437,6 +469,7 @@ final class NghLeafPage {
     }
     _wideCache = null;
     _payloadCache = null;
+    _clearSearch48Pack();
   }
 
   /// Replace all slots (split / rebuild); rebuilds caches in one pass.
@@ -462,6 +495,7 @@ final class NghLeafPage {
       // Header width depends on final page mode — second pass avoided by
       // accumulating compact first then adding upgrade if wide.
       payload += slotFixedHeaderBytes(wideNodeIds: false) + pkLen + dimensions;
+      if ((s.flags & NghLeafSlot.flagDeleted) != 0) continue;
       final low = s.getLow48D(48);
       for (int d = 0; d < 48; d++) {
         sum[d] += low[d];
@@ -471,12 +505,14 @@ final class NghLeafPage {
     _wideCache = wide;
     _payloadCache = payload;
     _sum48 = sum;
+    _clearSearch48Pack();
   }
 
   void _ensureSum48() {
     if (_sum48 != null) return;
     final sum = Float32List(48);
     for (final s in slots) {
+      if ((s.flags & NghLeafSlot.flagDeleted) != 0) continue;
       final low = s.getLow48D(48);
       for (int d = 0; d < 48; d++) {
         sum[d] += low[d];
@@ -486,6 +522,7 @@ final class NghLeafPage {
   }
 
   void _addToSum48(NghLeafSlot slot) {
+    if ((slot.flags & NghLeafSlot.flagDeleted) != 0) return;
     _ensureSum48();
     final sum = _sum48!;
     final low = slot.getLow48D(48);
@@ -494,9 +531,17 @@ final class NghLeafPage {
     }
   }
 
-  /// L2-normalized arithmetic mean of slot low48 (uses running sum when warm).
+  int get _liveSlotCount {
+    var n = 0;
+    for (final s in slots) {
+      if ((s.flags & NghLeafSlot.flagDeleted) == 0) n++;
+    }
+    return n;
+  }
+
+  /// L2-normalized arithmetic mean of **live** slot low48 (tombstones excluded).
   Float32List normalizedMean48() {
-    final count = slots.length;
+    final count = _liveSlotCount;
     final mean = Float32List(48);
     if (count == 0) return mean;
     _ensureSum48();
@@ -707,6 +752,7 @@ final class NghLeafPage {
 
   /// Build normalized 48-D SIMD views for every live slot (no-op if already warm).
   /// Also materializes UTF-8 PK bytes so search emit never utf8.encodes per query.
+  /// Rebuilds packed L2A rows only after [_clearSearch48Pack] (never by live count).
   void ensureLow48Ready() {
     for (final s in slots) {
       if ((s.flags & NghLeafSlot.flagDeleted) != 0) continue;
@@ -720,6 +766,34 @@ final class NghLeafPage {
       if (s.hasLow48) continue;
       s.getLow48DSimd(dimensions);
     }
+    if (_search48Simd == null || _searchLiveSlots == null) {
+      _rebuildSearch48Pack();
+    }
+  }
+
+  void _rebuildSearch48Pack() {
+    final liveSlots = <NghLeafSlot>[];
+    for (final s in slots) {
+      if ((s.flags & NghLeafSlot.flagDeleted) != 0) continue;
+      if (!s.hasLow48) {
+        s.getLow48DSimd(dimensions);
+      }
+      liveSlots.add(s);
+    }
+    final live = liveSlots.length;
+    if (live <= 0) {
+      _search48Simd = Float32x4List(0);
+      _searchLiveSlots = const <NghLeafSlot>[];
+      return;
+    }
+    final packed = Float32List(live * 48);
+    var row = 0;
+    for (final s in liveSlots) {
+      packed.setRange(row, row + 48, s.low48D!);
+      row += 48;
+    }
+    _search48Simd = Float32x4List.sublistView(packed);
+    _searchLiveSlots = liveSlots;
   }
 
   /// Wire payload plus resident low48 scratch (~192 B/slot when materialized).
@@ -728,6 +802,8 @@ final class NghLeafPage {
     for (final s in slots) {
       if (s.hasLow48) size += 192;
     }
+    final packed = _search48Simd;
+    if (packed != null) size += packed.length * 16;
     return size;
   }
 

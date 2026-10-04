@@ -643,13 +643,7 @@ class VectorIndexManager {
       );
     }
 
-    final rawValues = queryVector.values;
-    final Float32List queryF32;
-    if (rawValues is Float32List && rawValues.length == meta.dimensions) {
-      queryF32 = rawValues;
-    } else {
-      queryF32 = _toFloat32(rawValues, meta.dimensions);
-    }
+    final queryF32 = _queryAsFloat32(queryVector, meta.dimensions);
     // Let the engine normalize into scratch (no alloc here).
 
     Set<String>? pending;
@@ -733,13 +727,7 @@ class VectorIndexManager {
       await _graphEngine.prefetchNavGraph(table, indexUid, meta: meta);
     }
 
-    final rawValues = queryVector.values;
-    final Float32List queryF32;
-    if (rawValues is Float32List && rawValues.length == meta.dimensions) {
-      queryF32 = rawValues;
-    } else {
-      queryF32 = _toFloat32(rawValues, meta.dimensions);
-    }
+    final queryF32 = _queryAsFloat32(queryVector, meta.dimensions);
 
     final pending =
         meta.hasPkLocator ? null : await _loadPendingDeletes(table, indexUid);
@@ -786,13 +774,7 @@ class VectorIndexManager {
     if (meta == null || meta.totalVectors <= 0) {
       return const [];
     }
-    final rawValues = queryVector.values;
-    final Float32List queryF32;
-    if (rawValues is Float32List && rawValues.length == meta.dimensions) {
-      queryF32 = rawValues;
-    } else {
-      queryF32 = _toFloat32(rawValues, meta.dimensions);
-    }
+    final queryF32 = _queryAsFloat32(queryVector, meta.dimensions);
     final results = await _legacySearch.search(
       table: table,
       indexUid: indexUid,
@@ -1553,6 +1535,14 @@ class VectorIndexManager {
       await _persistPendingDeletes(table, indexUid, <String>{});
     }
     return next;
+  }
+
+  Float32List _queryAsFloat32(VectorData queryVector, int dimensions) {
+    final rawValues = queryVector.values;
+    if (rawValues is Float32List && rawValues.length == dimensions) {
+      return rawValues;
+    }
+    return _toFloat32(rawValues, dimensions);
   }
 
   /// Convert double list to Float32List, ensuring correct dimensions.
