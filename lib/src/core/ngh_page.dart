@@ -103,10 +103,10 @@ final class NghPartitionMetaPage {
 }
 
 // ============================================================================
-// NGH Posting Page (Inverted Cluster Data Page)
+// NGH Physical Leaf Page
 // ============================================================================
 
-/// Inlined SQ8 compressed vector entry with metadata inside an inverted cluster posting page.
+/// Inlined SQ8 compressed vector entry with metadata inside a physical vector leaf page.
 final class NghLeafSlot {
   /// Tombstone bit (logical delete).
   static const int flagDeleted = 0x01;
@@ -250,7 +250,7 @@ final class NghLeafSlot {
   }
 }
 
-/// An inverted cluster posting page storing multiple inlined [NghLeafSlot]s.
+/// A physical vector leaf page storing multiple inlined [NghLeafSlot]s.
 final class NghLeafPage {
   /// Max nodeId that fits the legacy compact (u32) slot wire.
   static const int maxCompactNodeId = 0xFFFFFFFF;
@@ -275,10 +275,10 @@ final class NghLeafPage {
   /// Fixed bytes after nodeId on wire: flags + 3×f32 + pkLen.
   static const int _slotTailFixedBytes = 15; // 1+4+4+4+2
 
-  /// Owning cluster/centroid ID.
+  /// Owning nav centroid ID.
   final int centroidId;
 
-  /// Next chained posting page (none = end of chain).
+  /// Next chained leaf page (none = end of chain).
   ///
   /// Wire: legacy pages store packed i32 at offset 4; when [needsWideNext],
   /// offset 4 holds [wideNextSentinel] and u32+u32 follow before slots
@@ -329,7 +329,7 @@ final class NghLeafPage {
                 ? NghPageId.none
                 : NghPageId.fromPacked(nextLeafPageNo));
 
-  /// Create an empty posting page for a cluster.
+  /// Create an empty leaf page for a nav centroid.
   factory NghLeafPage.empty({
     required int centroidId,
     required int dimensions,
@@ -524,7 +524,7 @@ final class NghLeafPage {
     return slots.length * 4;
   }
 
-  /// Encode posting page payload.
+  /// Encode leaf page payload.
   ///
   /// Base header (offsets fixed for legacy readers):
   ///   [centroidId: u32][next: i32][dimensions: u16][slotCount: u16]
@@ -612,7 +612,7 @@ final class NghLeafPage {
     return buf;
   }
 
-  /// Decode posting page payload (compact/wide nodeId + compact/wide next).
+  /// Decode leaf page payload (compact/wide nodeId + compact/wide next).
   static NghLeafPage? tryDecodePayload(Uint8List bytes) {
     if (bytes.length < 12) return null;
     final bd = ByteData.sublistView(bytes);
@@ -747,12 +747,12 @@ final class NghLeafPage {
   // Page-redo: full page (low-D) vs structure+PK (mid/high-D)
   // ---------------------------------------------------------------------------
 
-  /// Below/equal: posting page redo stores full page bytes (cheap vs PK path).
+  /// Below/equal: leaf page redo stores full page bytes (cheap vs PK path).
   /// Above: redo stores centroid/next/nodeId/flags/PK only; recovery reloads
   /// vectors from the table and re-quantizes (avoids ~3× write amp at high-D).
   static const int fullPageRedoMaxDimensions = 64;
 
-  /// Magic for compact posting redo payloads embedded in [PageRedoPageRecord].
+  /// Magic for compact leaf redo payloads embedded in [PageRedoPageRecord].
   static const int pkStructureRedoMagic = 0x4B50474E; // 'NGPK'
 
   static bool prefersPkStructureRedo(int dimensions) =>
@@ -868,7 +868,7 @@ final class NghPageId {
   /// Cache / map key (Dart int is arbitrary-width).
   int get cacheKey => (partitionNo << 32) | (pageNo & 0xFFFFFFFF);
 
-  /// Legacy i32 pack used inside v1 posting `next` fields. Null if unrepresentable.
+  /// Legacy i32 pack used inside v1 leaf `next` fields. Null if unrepresentable.
   int? tryPack() {
     if (isNone) return -1;
     if (partitionNo > _maxPackedPartition ||
@@ -928,36 +928,36 @@ final class NghNavCentroidNode {
   /// Centroid vector (Float32List of length [dimensions]).
   final Float32List vector;
 
-  /// Head posting page packed ref (`partitionNo<<20|pageNo`), or -1.
-  int headPostingPageNo;
+  /// Head leaf page packed ref (`partitionNo<<20|pageNo`), or -1.
+  int headLeafPageNo;
 
-  /// Tail posting page packed ref (`partitionNo<<20|pageNo`), or -1.
-  int tailPostingPageNo;
+  /// Tail leaf page packed ref (`partitionNo<<20|pageNo`), or -1.
+  int tailLeafPageNo;
 
-  /// Total number of active vectors belonging to this cluster.
+  /// Total number of active vectors belonging to this centroid.
   int entryCount;
 
   /// Out-degree and neighbor centroid IDs in the navigating graph.
   final List<int> neighbors;
 
-  /// All physical inverted posting pages for this cluster (v2 source of truth).
-  final List<NghPageId> postingPages;
+  /// All physical vector leaf pages for this leaf-level centroid (v2 source of truth).
+  final List<NghPageId> leafPages;
 
-  /// Packed posting refs for search batch I/O when they still fit in i32.
-  List<int> get postingPageNos => [
-        for (final p in postingPages)
+  /// Packed leaf-page refs for search batch I/O when they still fit in i32.
+  List<int> get leafPageNos => [
+        for (final p in leafPages)
           if (p.tryPack() != null) p.tryPack()!,
       ];
 
-  /// 0 = coarse (no posting, has children), 1 = leaf (owns posting lists).
+  /// 0 = coarse (no leaf pages, has children), 1 = leaf (owns leaf pages).
   int level;
 
   /// Parent coarse centroid, or -1.
   int parentId;
 
-  /// Root / tail of the posting-page directory chain.
-  NghPageId postingDirRoot;
-  NghPageId postingDirTail;
+  /// Root / tail of the leaf-page directory chain.
+  NghPageId leafDirRoot;
+  NghPageId leafDirTail;
 
   /// Overflow children directory (inline [childIds] is preferred).
   NghPageId childrenDirRoot;
@@ -966,10 +966,10 @@ final class NghNavCentroidNode {
   final List<int> childIds;
 
   /// Directory pages need a flush (append or rewrite).
-  bool postingDirDirty;
+  bool leafDirDirty;
 
-  /// True when [postingPages] is the full live list.
-  bool postingPageListReady;
+  /// True when [leafPages] is the full live list.
+  bool leafPageListReady;
 
   /// Pre-computed SIMD view for zero-allocation dot product kernels.
   Float32x4List? simdVector;
@@ -995,32 +995,32 @@ final class NghNavCentroidNode {
   NghNavCentroidNode({
     required this.centroidId,
     required this.vector,
-    this.headPostingPageNo = -1,
-    this.tailPostingPageNo = -1,
+    this.headLeafPageNo = -1,
+    this.tailLeafPageNo = -1,
     this.entryCount = 0,
     List<int>? neighbors,
-    List<int>? postingPageNos,
-    List<NghPageId>? postingPages,
+    List<int>? leafPageNos,
+    List<NghPageId>? leafPages,
     this.level = levelLeaf,
     this.parentId = -1,
-    this.postingDirRoot = NghPageId.none,
-    this.postingDirTail = NghPageId.none,
+    this.leafDirRoot = NghPageId.none,
+    this.leafDirTail = NghPageId.none,
     this.childrenDirRoot = NghPageId.none,
     List<int>? childIds,
-    this.postingDirDirty = false,
-    this.postingPageListReady = false,
+    this.leafDirDirty = false,
+    this.leafPageListReady = false,
   })  : neighbors = List<int>.of(neighbors ?? const <int>[]),
         childIds = List<int>.of(childIds ?? const <int>[]),
-        postingPages = List<NghPageId>.of(
-          postingPages ??
+        leafPages = List<NghPageId>.of(
+          leafPages ??
               _pagesFromPacked(
-                postingPageNos,
-                headPostingPageNo,
-                tailPostingPageNo,
+                leafPageNos,
+                headLeafPageNo,
+                tailLeafPageNo,
               ),
         ) {
-    if (!postingPageListReady) {
-      postingPageListReady = this.postingPages.isNotEmpty;
+    if (!leafPageListReady) {
+      leafPageListReady = this.leafPages.isNotEmpty;
     }
     final len = vector.length;
     final n = len >> 2;
@@ -1052,28 +1052,28 @@ final class NghNavCentroidNode {
     return <NghPageId>[];
   }
 
-  void addPostingPage(NghPageId id) {
+  void addLeafPage(NghPageId id) {
     if (id.isNone) return;
-    postingDirDirty = true;
-    if (!postingPageListReady && !postingDirRoot.isNone) return;
-    for (final e in postingPages) {
+    leafDirDirty = true;
+    if (!leafPageListReady && !leafDirRoot.isNone) return;
+    for (final e in leafPages) {
       if (e.partitionNo == id.partitionNo && e.pageNo == id.pageNo) return;
     }
-    postingPages.add(id);
-    if (postingDirRoot.isNone) postingPageListReady = true;
+    leafPages.add(id);
+    if (leafDirRoot.isNone) leafPageListReady = true;
   }
 
-  void replacePostingPages(List<NghPageId> pages) {
-    postingPages
+  void replaceLeafPages(List<NghPageId> pages) {
+    leafPages
       ..clear()
       ..addAll(pages);
-    postingDirDirty = true;
-    postingPageListReady = true;
+    leafDirDirty = true;
+    leafPageListReady = true;
   }
 
   void setHeadTailFromIds(NghPageId head, NghPageId tail) {
-    headPostingPageNo = head.tryPack() ?? -1;
-    tailPostingPageNo = tail.tryPack() ?? -1;
+    headLeafPageNo = head.tryPack() ?? -1;
+    tailLeafPageNo = tail.tryPack() ?? -1;
   }
 }
 
@@ -1117,7 +1117,7 @@ final class NghNavGraphPage {
           2 +
           c.neighbors.length * 2 +
           2 +
-          c.postingPageNos.length * 4);
+          c.leafPageNos.length * 4);
     }
 
     final buf = Uint8List(totalBytes);
@@ -1129,8 +1129,8 @@ final class NghNavGraphPage {
     int off = 4;
     for (final c in centroids) {
       bd.setUint32(off, c.centroidId, Endian.little);
-      bd.setInt32(off + 4, c.headPostingPageNo, Endian.little);
-      bd.setInt32(off + 8, c.tailPostingPageNo, Endian.little);
+      bd.setInt32(off + 4, c.headLeafPageNo, Endian.little);
+      bd.setInt32(off + 8, c.tailLeafPageNo, Endian.little);
       bd.setInt32(off + 12, c.entryCount, Endian.little);
       off += 16;
 
@@ -1148,12 +1148,12 @@ final class NghNavGraphPage {
         off += 2;
       }
 
-      final pLen = c.postingPageNos.length;
+      final pLen = c.leafPageNos.length;
       bd.setUint16(off, pLen, Endian.little);
       off += 2;
 
       for (int p = 0; p < pLen; p++) {
-        bd.setInt32(off, c.postingPageNos[p], Endian.little);
+        bd.setInt32(off, c.leafPageNos[p], Endian.little);
         off += 4;
       }
     }
@@ -1197,33 +1197,33 @@ final class NghNavGraphPage {
         off += 2;
       }
 
-      final postingPageNos = <int>[];
+      final leafPageNos = <int>[];
       if (off + 2 <= bytes.length) {
         final pLen = bd.getUint16(off, Endian.little);
         off += 2;
         if (off + pLen * 4 <= bytes.length) {
           for (int p = 0; p < pLen; p++) {
-            postingPageNos.add(bd.getInt32(off, Endian.little));
+            leafPageNos.add(bd.getInt32(off, Endian.little));
             off += 4;
           }
         }
       }
 
-      if (postingPageNos.isEmpty && headPg > 0) {
-        postingPageNos.add(headPg);
+      if (leafPageNos.isEmpty && headPg > 0) {
+        leafPageNos.add(headPg);
         if (tailPg > 0 && tailPg != headPg) {
-          postingPageNos.add(tailPg);
+          leafPageNos.add(tailPg);
         }
       }
 
       list.add(NghNavCentroidNode(
         centroidId: cId,
         vector: vec,
-        headPostingPageNo: headPg,
-        tailPostingPageNo: tailPg,
+        headLeafPageNo: headPg,
+        tailLeafPageNo: tailPg,
         entryCount: countEntries,
         neighbors: neighbors,
-        postingPageNos: postingPageNos,
+        leafPageNos: leafPageNos,
       ));
     }
 
@@ -1240,10 +1240,10 @@ final class NghNavGraphPage {
 }
 
 // ============================================================================
-// NGH v2 paged centroid + posting directory (TPG2 payloads)
+// NGH v2 paged centroid + leaf directory (TPG2 payloads)
 // ============================================================================
 
-/// One TPG2 page of v2 centroid records (no inlined posting page lists).
+/// One TPG2 page of v2 centroid records (no inlined leaf page lists).
 ///
 /// Disk vectors are SQ8 (payloadVersion >= 2). Memory still uses float32
 /// ([NghNavCentroidNode.vector]) after dequantize. payloadVersion 1 is the
@@ -1303,12 +1303,12 @@ final class NghNavCentroidPage {
           Endian.little);
       bd.setUint32(
           off + 10, c.entryCount < 0 ? 0 : c.entryCount, Endian.little);
-      bd.setUint32(off + 14, c.postingDirRoot.wirePartition, Endian.little);
-      bd.setUint32(off + 18, c.postingDirRoot.wirePage, Endian.little);
-      bd.setUint32(off + 22, c.postingDirTail.wirePartition, Endian.little);
-      bd.setUint32(off + 26, c.postingDirTail.wirePage, Endian.little);
-      final head = NghPageId.fromPacked(c.headPostingPageNo);
-      final tail = NghPageId.fromPacked(c.tailPostingPageNo);
+      bd.setUint32(off + 14, c.leafDirRoot.wirePartition, Endian.little);
+      bd.setUint32(off + 18, c.leafDirRoot.wirePage, Endian.little);
+      bd.setUint32(off + 22, c.leafDirTail.wirePartition, Endian.little);
+      bd.setUint32(off + 26, c.leafDirTail.wirePage, Endian.little);
+      final head = NghPageId.fromPacked(c.headLeafPageNo);
+      final tail = NghPageId.fromPacked(c.tailLeafPageNo);
       bd.setUint32(off + 30, head.wirePartition, Endian.little);
       bd.setUint32(off + 34, head.wirePage, Endian.little);
       bd.setUint32(off + 38, tail.wirePartition, Endian.little);
@@ -1379,10 +1379,10 @@ final class NghNavCentroidPage {
       final level = bytes[off + 4];
       final parentRaw = bd.getUint32(off + 6, Endian.little);
       final entries = bd.getUint32(off + 10, Endian.little);
-      final postingRoot = NghPageId.fromWire(
+      final leafDirRootWire = NghPageId.fromWire(
           bd.getUint32(off + 14, Endian.little),
           bd.getUint32(off + 18, Endian.little));
-      final postingTail = NghPageId.fromWire(
+      final leafDirTailWire = NghPageId.fromWire(
           bd.getUint32(off + 22, Endian.little),
           bd.getUint32(off + 26, Endian.little));
       final head = NghPageId.fromWire(bd.getUint32(off + 30, Endian.little),
@@ -1429,15 +1429,15 @@ final class NghNavCentroidPage {
       list.add(NghNavCentroidNode(
         centroidId: cId,
         vector: vec,
-        headPostingPageNo: head.tryPack() ?? -1,
-        tailPostingPageNo: tail.tryPack() ?? -1,
+        headLeafPageNo: head.tryPack() ?? -1,
+        tailLeafPageNo: tail.tryPack() ?? -1,
         entryCount: entries,
         neighbors: neighbors,
-        postingPages: <NghPageId>[],
+        leafPages: <NghPageId>[],
         level: level,
         parentId: parentRaw == NghPageId.noneWire ? -1 : parentRaw,
-        postingDirRoot: postingRoot,
-        postingDirTail: postingTail,
+        leafDirRoot: leafDirRootWire,
+        leafDirTail: leafDirTailWire,
         childrenDirRoot: childDir,
         childIds: children,
       ));
@@ -1511,13 +1511,13 @@ final class NghPageSizer {
   /// Safety margin for encoding/encryption overhead (header, padding, etc).
   static const int encodingSafetyMargin = 64;
 
-  /// Inclusive max vector width (posting/nav `dimensions` fields are u16).
+  /// Inclusive max vector width (leaf/nav `dimensions` fields are u16).
   static const int maxDimensions = InternalConfig.maxVectorDimensions;
 
   /// Largest TPG2 page we will choose for a high-D NGH index (1MB).
   static const int maxNghPageSize = 1024 * 1024;
 
-  /// PK bytes reserved when choosing a posting page size (typical keys).
+  /// PK bytes reserved when choosing a leaf page size (typical keys).
   static const int leafSlotPkBudget = 256;
 
   /// Flush-time overhead matching [BTreePageSizer.fitsInPage] (128) plus
@@ -1525,7 +1525,7 @@ final class NghPageSizer {
   static const int flushFitOverhead =
       pageHeaderSize + 128 + encodingSafetyMargin;
 
-  /// Compute how many posting slots can fit in one page for a given average PK length.
+  /// Compute how many leaf slots can fit in one page for a given average PK length.
   ///
   /// Soft-caps occupancy at [searchCalibMaxSlotsPerPage] so low-D indexes
   /// (128D would otherwise pack ~99 vectors into 16KB) keep leaf fanout near
@@ -1607,7 +1607,7 @@ final class NghPageSizer {
     return size;
   }
 
-  /// Page size for one inlined SQ8 posting slot (frozen layout).
+  /// Page size for one inlined SQ8 leaf slot (frozen layout).
   static int chooseLeafPageSize(int dimensions, int basePageSize) {
     final dim = dimensions.clamp(1, maxDimensions);
     final payload = 12 + 19 + leafSlotPkBudget + dim;
@@ -1617,17 +1617,17 @@ final class NghPageSizer {
   /// Page size for one SQ8 nav centroid (max neighbors + min children).
   ///
   /// Disk is SQ8 (1 byte/dim + offset/scale). 4096-d fits the database 16KB
-  /// page; 65535-d needs ~128KB, same order as posting.
+  /// page; 65535-d needs ~128KB, same order as leaf pages.
   static int chooseNavPageSize(int dimensions, int basePageSize) {
     final dim = dimensions.clamp(1, maxDimensions);
     final payload = 12 + NghNavCentroidPage.recordSize(dim, maxNavNeighbors, 8);
     return choosePageSize(payload, basePageSize);
   }
 
-  /// Assign posting/nav page sizes for a new or still-empty index.
+  /// Assign leaf/nav page sizes for a new or still-empty index.
   ///
   /// Existing data pages freeze that category's size so on-disk offsets stay
-  /// valid (no posting rewrite). Empty nav may be resized -- the v2 nav
+  /// valid (no leaf rewrite). Empty nav may be resized -- the v2 nav
   /// format is unreleased.
   static NghIndexMeta ensureIndexPageSizes(
     NghIndexMeta meta,
@@ -1635,16 +1635,16 @@ final class NghPageSizer {
   ) {
     final needLeaf = chooseLeafPageSize(meta.dimensions, basePageSize);
     final needNav = chooseNavPageSize(meta.dimensions, basePageSize);
-    final posting = meta.hasLeafData
+    final leafSize = meta.hasLeafData
         ? meta.leafPageSize
         : (needLeaf > basePageSize ? needLeaf : 0);
     final nav = meta.hasNavData
         ? meta.navPageSize
         : (needNav > basePageSize ? needNav : 0);
-    if (posting == meta.leafPageSize && nav == meta.navPageSize) {
+    if (leafSize == meta.leafPageSize && nav == meta.navPageSize) {
       return meta;
     }
-    return meta.copyWith(leafPageSize: posting, navPageSize: nav);
+    return meta.copyWith(leafPageSize: leafSize, navPageSize: nav);
   }
 
   /// Drop out-of-range parent/child/neighbor ids and clamp inline lists so a
@@ -1737,7 +1737,7 @@ double innerProduct48Reg(
 // LOCKED scale contract (tens of billions):
 //   - Each nav page holds ≤64 children (one physical page = one tree node).
 //   - Growth is SPLIT + optional mid promotion — never sibling linked lists.
-//   - Leaf-level pages: entries.child → posting leaf.
+//   - Leaf-level pages: entries.child → physical leaf page.
 //   - Mid-level pages: entries.child → child nav page.
 //   - Fanout 64 × 3 hops × ~4k slots/leaf ≫ tens of billions with bounded
 //     probe cost: O(L0 + hops × 64 × beam), independent of corpus size N.
@@ -1746,14 +1746,14 @@ double innerProduct48Reg(
 // Online production is still monolithic nav_graph.ngh — only that needs migrate.
 // ============================================================================
 
-/// Branch entry under a nav page: child is posting leaf OR child nav page.
+/// Branch entry under a nav page: child is leaf OR child nav page.
 final class CentroidBranchEntry {
   int centroidId;
 
-  /// Posting page when parent [NghNavBTreePage.isLeafLevel]; else child nav page.
+  /// Physical leaf page when parent [NghNavBTreePage.isLeafLevel]; else child nav page.
   NghPageId childPageId;
 
-  /// Posting slot count (leaf-level) or approx child weight (mid-level).
+  /// Leaf slot count (leaf-level) or approx child weight (mid-level).
   int childWeight;
   Float32List centroid48D;
   Float32x4List centroid48DSimd;
@@ -1767,7 +1767,7 @@ final class CentroidBranchEntry {
         childWeight = leafSlotCount,
         centroid48DSimd = Float32x4List.sublistView(centroid48D);
 
-  /// Leaf-level alias — child is a posting page.
+  /// Leaf-level alias — child is a leaf page.
   NghPageId get leafPageId => childPageId;
   set leafPageId(NghPageId v) => childPageId = v;
 
@@ -1777,15 +1777,15 @@ final class CentroidBranchEntry {
 
 /// Fanout-bounded nav node stored in `.nav` partitions.
 ///
-/// One node = one page; [isLeafLevel] selects whether children are posting
-/// leaves or child nav pages. Growth is split + mid promotion only.
+/// One node = one page; [isLeafLevel] selects whether children are
+/// physical leaf pages or child nav pages. Growth is split + mid promotion only.
 final class NghNavBTreePage {
   static const int magic = 0x434E4254; // 'CNBT'
   /// NGH/vector wire v2 (unreleased). Do not bump without a real format break.
   static const int version = 2;
   static const int headerSize = 20;
 
-  /// bit0: leaf-level (children are posting pages). Clear = mid-level.
+  /// bit0: leaf-level (children are leaf pages). Clear = mid-level.
   static const int flagLeafLevel = 0x1;
 
   /// Maximum entries that fit safely in a 16KB Nav page.

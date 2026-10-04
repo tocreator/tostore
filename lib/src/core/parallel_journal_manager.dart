@@ -2926,7 +2926,7 @@ class ParallelJournalManager {
         }
       }
 
-      // Pass 1: full page images (table/index/nav/full posting). Skip NGPK so
+      // Pass 1: full page images (table/index/nav/full leaf). Skip NGPK so
       // table rows land on disk before structure+PK materialization.
       for (final e in byPartition.entries) {
         final y8 = writeYc.maybeYield();
@@ -2963,11 +2963,21 @@ class ParallelJournalManager {
         }
         if (writes.isEmpty) continue;
         writes.sort((a, b) => a.offset.compareTo(b.offset));
-        await _dataStore.storage.writeManyAsBytesAt(path, writes, flush: true);
-        await invalidateMetaIfNeeded(key, pages);
+        try {
+          await _dataStore.storage
+              .writeManyAsBytesAt(path, writes, flush: true);
+          await invalidateMetaIfNeeded(key, pages);
+        } catch (e) {
+          Logger.warn(
+            'Page redo write skipped '
+            '(kind=${key.kind.name}, table=${key.tableUid}, '
+            'p${key.partitionNo})',
+            rawError: e,
+          );
+        }
       }
 
-      // Pass 2: NGPK posting pages — rebuild SQ8 from table, write full images.
+      // Pass 2: NGPK leaf pages — rebuild SQ8 from table, write full images.
       for (final e in byPartition.entries) {
         final yPk = writeYc.maybeYield();
         if (yPk != null) await yPk;
@@ -3000,12 +3010,23 @@ class ParallelJournalManager {
               !NghLeafPage.isPkStructureRedoPayload(payload)) {
             continue;
           }
-          final built =
-              await _dataStore.vectorIndexManager?.materializeLeafPkRedoPage(
-            table: tableContext,
-            indexUid: indexUid,
-            pkRedoPayload: payload,
-          );
+          Uint8List? built;
+          try {
+            built =
+                await _dataStore.vectorIndexManager?.materializeLeafPkRedoPage(
+              table: tableContext,
+              indexUid: indexUid,
+              pkRedoPayload: payload,
+            );
+          } catch (e) {
+            Logger.warn(
+              'NGH PK-structure redo materialize threw '
+              '(table=${key.tableUid}, index=$indexUid, '
+              'p${key.partitionNo} pg$pg)',
+              rawError: e,
+            );
+            continue;
+          }
           if (built == null || built.isEmpty) {
             Logger.warn(
               'NGH PK-structure redo materialize failed '
@@ -3020,8 +3041,17 @@ class ParallelJournalManager {
         }
         if (writes.isEmpty) continue;
         writes.sort((a, b) => a.offset.compareTo(b.offset));
-        await _dataStore.storage.writeManyAsBytesAt(path, writes, flush: true);
-        await invalidateMetaIfNeeded(key, pages);
+        try {
+          await _dataStore.storage
+              .writeManyAsBytesAt(path, writes, flush: true);
+          await invalidateMetaIfNeeded(key, pages);
+        } catch (e) {
+          Logger.warn(
+            'NGH PK-structure redo write skipped '
+            '(table=${key.tableUid}, p${key.partitionNo})',
+            rawError: e,
+          );
+        }
       }
 
       // Legacy TreeMetaRecord: only apply when partition-0 page0 was NOT restored

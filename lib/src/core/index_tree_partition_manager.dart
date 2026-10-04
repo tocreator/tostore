@@ -455,10 +455,11 @@ final class IndexTreePartitionManager {
   ) {
     final root = meta.btreeRoot;
     if (root.isNull) return meta.btreeFirstLeaf;
-    if (meta.btreeHeight <= 0) return root;
+    final height = meta.btreeHeight;
+    if (height <= 0) return root;
     TreePagePtr cur = root;
     final tableUid = table.tableUid;
-    for (int depth = meta.btreeHeight; depth > 0; depth--) {
+    for (int depth = height; depth > 0; depth--) {
       final node = _internalPageCache.getPoint4(
         tableUid,
         indexUid,
@@ -468,6 +469,7 @@ final class IndexTreePartitionManager {
       if (node == null) return null; // Cache miss
       if (node.children.isEmpty) return meta.btreeFirstLeaf;
       final idx = node.childIndexForKey(keyBytes);
+      if (idx < 0 || idx >= node.children.length) return meta.btreeFirstLeaf;
       cur = node.children[idx];
     }
     return cur;
@@ -485,9 +487,10 @@ final class IndexTreePartitionManager {
     final root = meta.btreeRoot;
     final firstLeaf = meta.btreeFirstLeaf;
     if (root.isNull) return firstLeaf;
-    if (meta.btreeHeight <= 0) return root;
+    final height = meta.btreeHeight;
+    if (height <= 0) return root;
     TreePagePtr cur = root;
-    for (int depth = meta.btreeHeight; depth > 0; depth--) {
+    for (int depth = height; depth > 0; depth--) {
       try {
         final node = await _readInternal(table, indexUid, meta, cur,
             encryptionKey: encryptionKey,
@@ -495,6 +498,7 @@ final class IndexTreePartitionManager {
             readFromFileOnly: readFromFileOnly);
         if (node.children.isEmpty) return firstLeaf;
         final idx = node.childIndexForKey(keyBytes);
+        if (idx < 0 || idx >= node.children.length) return firstLeaf;
         cur = node.children[idx];
       } catch (e) {
         Logger.warn(
@@ -517,9 +521,10 @@ final class IndexTreePartitionManager {
     final root = meta.btreeRoot;
     final lastLeaf = meta.btreeLastLeaf;
     if (root.isNull) return lastLeaf;
-    if (meta.btreeHeight <= 0) return root;
+    final height = meta.btreeHeight;
+    if (height <= 0) return root;
     TreePagePtr cur = root;
-    for (int depth = meta.btreeHeight; depth > 0; depth--) {
+    for (int depth = height; depth > 0; depth--) {
       try {
         final node = await _readInternal(table, indexUid, meta, cur,
             encryptionKey: encryptionKey,
@@ -1901,9 +1906,10 @@ final class IndexTreePartitionManager {
 
     Future<TreePagePtr> descendToLeaf(
         Uint8List key, List<_IFrame> frames) async {
-      if (meta.btreeHeight <= 0) return meta.btreeRoot;
+      final height = meta.btreeHeight;
+      if (height <= 0) return meta.btreeRoot;
       TreePagePtr cur = meta.btreeRoot;
-      for (int depth = meta.btreeHeight; depth > 0; depth--) {
+      for (int depth = height; depth > 0; depth--) {
         final node = await _readInternal(table, indexUid, meta, cur,
             encryptionKey: encryptionKey, encryptionKeyId: encryptionKeyId);
         if (node.children.isEmpty) return meta.btreeFirstLeaf;

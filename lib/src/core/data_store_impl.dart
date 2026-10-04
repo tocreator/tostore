@@ -7111,9 +7111,9 @@ class DataStoreImpl {
       final schemaMgr = tableMetaManager;
       if (schemaMgr == null) return;
 
-      // Ensure system memory threshold and vector cluster budget are fully computed
+      // Ensure system memory threshold and vector leaf-cache budget are fully computed
       await _resourceManager?.ensureInitialized();
-      _vectorIndexManager?.syncClusterCacheBudget();
+      _vectorIndexManager?.syncVectorSearchCacheBudget();
 
       // Row/index TreeCache budget (independent of the vector compact cache).
       final effectivePrewarmThresholdMB =
@@ -7197,7 +7197,7 @@ class DataStoreImpl {
       if (shouldAbortBackgroundScan) return;
 
       // =========================================================================
-      // Phase 2: Vector index prewarm (Nav centroid graph & compact posting clusters).
+      // Phase 2: Vector index prewarm (Nav centroid graph & search-hot leaves).
       // ALWAYS runs (including large spaces). Uses the dedicated vector compact
       // cache ceiling from vectorCacheBudgetRatio — NOT the shared row-prewarm
       // threshold — so million-row corpora still fill the ANN hot set.
@@ -7214,7 +7214,7 @@ class DataStoreImpl {
           final table = await getTableContext(tableName);
           for (final vIdx in vectorIndexes) {
             if (shouldAbortBackgroundScan) break;
-            // Omit maxBytes: prewarmVectorIndex stops at the vector cluster
+            // Omit maxBytes: prewarmVectorIndex stops at the vector leaf cache
             // budget (vectorCacheBudgetRatio of cacheMemoryBudgetMB).
             await _vectorIndexManager?.prewarmVectorIndex(
               table,

@@ -449,7 +449,7 @@ class ResourceManager {
     _queryCacheSize = (totalThresholdBytes * _queryCacheRatio).toInt();
     _schemaCacheSize = (totalThresholdBytes * _schemaCacheRatio).toInt();
     _metaCacheSize = (totalThresholdBytes * _metaCacheRatio).toInt();
-    _dataStore?.vectorIndexManager?.syncClusterCacheBudget();
+    _dataStore?.vectorIndexManager?.syncVectorSearchCacheBudget();
   }
 
   /// Register cache eviction callback

@@ -23,9 +23,9 @@ import 'yield_controller.dart';
 // Responsibilities:
 //   1. L0-resident + budgeted L1 Centroid B+Tree routing (microsecond hot path
 //      when probed L1/leaves are cached; never full L1 inventory residency)
-//   2. High-speed inverted cluster search via inlined SQ8 vector slots (0 random secondary I/O)
+//   2. High-speed physical-leaf search via inlined SQ8 vector slots (0 random secondary I/O)
 //   3. Streaming incremental insert with angle-aware multi-assignment
-//   4. Hub governance: softCap (~1.75× fair share) + batch-end 2-means posting rewrite
+//   4. Hub governance: softCap (~1.75× fair share) + batch-end 2-means leaf rewrite
 //   5. Tombstone deletion and compaction
 //
 // Scale lock (identity recall + tens of billions):
@@ -33,7 +33,7 @@ import 'yield_controller.dart';
 //     typically ≤79 on 16KB / ≤256 hard cap), then exact among children of
 //     ONE nav page per hop (fanout ≤64).
 //   - Nav growth is SPLIT + mid promotion + optional L0 far-spawn /
-//     heavy-root-split. One page = one tree node. Never rewrite posting to
+//     heavy-root-split. One page = one tree node. Never rewrite leaves to
 //     fix routing.
 //   - Probe cost is O(L0 + hops×64×beam + wantLeaves×slots) — independent of N.
 //     wantLeaves: ~14 / 28 / 44 at depth 1 / 50 / 100; depth>100 continues the
@@ -42,8 +42,8 @@ import 'yield_controller.dart';
 //   - searchDepth has no hard max. Anchors: 1→91%, 50→95%, 98→98% (±5 / ±3 / ±5).
 //     depth>100 keeps buying recall budget at the 50→100 rate until abs cap.
 //   - Engine never rewrites online monolithic nav_graph.ngh in place. New writes
-//     are paged Centroid nav tree + posting partitions; migrate is one-shot from
-//     the production big-file layout. Posting slot layout stays frozen.
+//     are paged Centroid nav tree + leaf partitions; migrate is one-shot from
+//     the production big-file layout. Leaf slot layout stays frozen.
 //   - Nav page wire version stays 2
 // ============================================================================
 
@@ -76,53 +76,11 @@ class _SearchCandidate implements Comparable<_SearchCandidate> {
   int compareTo(_SearchCandidate other) => distance.compareTo(other.distance);
 }
 
-/// In-memory compact vector slot for hot ANN search.
-///
-/// Keeps SQ8 codes (1 byte/dim) so many clusters stay resident. Scoring uses
-/// SIMD kernels; math is identical to the scalar SQ8 path (recall unchanged).
-class _NghCompactSlot {
-  final int nodeId;
-  int flags; // 0x01: deleted
-  /// UTF-8 primary key bytes (decoded only for top-K emit / delete).
-  final Uint8List primaryKeyBytes;
-  final Uint8List sq8Codes;
-  final double offset;
-  final double scale;
-  final double squaredNorm;
-  final double invNorm;
-  final int pageNo;
-
-  _NghCompactSlot({
-    required this.nodeId,
-    required this.flags,
-    required this.primaryKeyBytes,
-    required this.sq8Codes,
-    required this.offset,
-    required this.scale,
-    required this.squaredNorm,
-    double? invNorm,
-    required this.pageNo,
-  }) : invNorm = invNorm ?? (squaredNorm > 0 ? 1.0 / sqrt(squaredNorm) : 1.0);
-}
-
-/// In-memory compact cluster slot container with precomputed size and entry count.
-final class _NghClusterSlots {
-  final List<_NghCompactSlot> slots;
-  final int byteSize;
-  int entryCount;
-
-  _NghClusterSlots({
-    required this.slots,
-    required this.byteSize,
-    required this.entryCount,
-  });
-}
-
 // ----------------------------------------------------------------------------
 // Candidate Min-Heap for Zero Heap GC
 // ----------------------------------------------------------------------------
 final class CandidateMinHeapIP {
-  /// Node ids as Dart [int] — must not truncate wide posting nodeIds.
+  /// Node ids as Dart [int] — must not truncate wide leaf nodeIds.
   final List<int> ids;
   final Float64List scores;
   int size = 0;
@@ -312,7 +270,7 @@ final class BranchMinHeap {
 
 // In-Memory Centroid B+Tree State (L0 roots only — L1 pages are TreeCache'd)
 //
-// Search-hot posting leaves live in [NghGraphEngine._btreeLeafCache] (TreeCache
+// Search-hot leaves live in [NghGraphEngine._btreeLeafCache] (TreeCache
 // + ResourceManager vector budget). L1 internal nav pages live in
 // [NghGraphEngine._navInternalCache] under the nav-graph budget. This state
 // only holds always-resident L0 routing — never the full L1 inventory and
@@ -432,7 +390,7 @@ final class _CentroidSearchScratch {
   final List<CentroidBranchEntry?> pickedLeaves =
       List<CentroidBranchEntry?>.filled(1024, null);
 
-  /// Resolved hot posting pages for [pickedLeaves] (avoids TreeCache re-lookup).
+  /// Resolved hot leaf pages for [pickedLeaves] (avoids TreeCache re-lookup).
   final List<NghLeafPage?> pickedLeafPages =
       List<NghLeafPage?>.filled(1024, null);
 
@@ -567,27 +525,13 @@ class NghGraphEngine {
   /// Inflight futures for navigating centroid graph loading.
   final Map<String, Future<NghNavGraphPage?>> _navGraphInflight = {};
 
-  /// Soft ceiling for cluster compact cache; enforced after load/prewarm.
-  int _clusterCacheMaxBytes = 32 * 1024 * 1024;
-
-  /// Per-centroid compact SQ8 cache. Key: `[tableUid.value, indexUid.value, centroidId]`.
-  late final TreeCache<_NghClusterSlots> _clusterCache =
-      TreeCache<_NghClusterSlots>(
-    groupDepth: 2,
-    sizeCalculator: (cluster) => cluster.byteSize,
-    evictionMode: TreeCacheEvictionMode.lru,
-    maxByteThreshold: _clusterCacheMaxBytes,
-    minByteThreshold: _clusterCacheMaxBytes ~/ 2,
-    debugLabel: 'NghClusterCache',
-  );
-
-  /// Soft ceiling for Centroid B+Tree search-hot posting leaves.
+  /// Soft ceiling for Nav B+Tree search-hot leaves.
   /// Synced from ResourceManager via [configureVectorSearchCacheBudget].
   int _btreeLeafCacheMaxBytes = 32 * 1024 * 1024;
 
   /// Paged ANN leaf working set. Key: `[tableUid, indexUid, partitionNo, pageNo]`.
   ///
-  /// Budgeted by the same vector quota as the legacy compact cluster cache so
+  /// Budgeted by the same vector quota as the dedicated vector leaf quota so
   /// insert thrash cannot silently shrink the hot set below startup prewarm.
   late final TreeCache<NghLeafPage> _btreeLeafCache = TreeCache<NghLeafPage>(
     groupDepth: 2,
@@ -598,14 +542,16 @@ class NghGraphEngine {
     debugLabel: 'NghBTreeLeafCache',
   );
 
-  final Map<String, Future<void>> _clusterLoadInflight = {};
-
   late final NghPkMapEngine _pkMap =
       NghPkMapEngine(_partitionManager, _partitionManager.engineConfig);
 
   /// Centroid B+Tree in-memory states (L0 roots + firstInternal heads).
   /// Key: `tableUid.value:indexUid.value`.
   final Map<String, CentroidBTreeState> _btreeStates = {};
+
+  /// Indexes whose hot ANN loops have been JIT-compiled on this engine instance.
+  /// Key: `tableUid.value/indexUid.value`.
+  final Set<String> _warmedSearchIndexes = {};
 
   /// Per-dimension pool of [_CentroidSearchScratch] for concurrent ANN.
   /// Cap bounds peak memory ≈ concurrent_searches × scratch_size, not QPS.
@@ -734,28 +680,16 @@ class NghGraphEngine {
   /// Current L1 internal-page cache ceiling in bytes.
   int get navInternalCacheMaxBytes => _navInternalCacheMaxBytes;
 
-  /// Current estimated cluster-cache footprint in bytes.
-  int get clusterCacheBytes => _clusterCache.estimatedTotalSizeBytes;
-
-  /// Current compact-cache ceiling in bytes.
-  int get clusterCacheMaxBytes => _clusterCacheMaxBytes;
-
-  /// Resident Centroid B+Tree posting-leaf cache bytes (all indexes).
+  /// Resident search-hot leaf cache bytes (all indexes).
   int get btreeLeafCacheBytes => _btreeLeafCache.estimatedTotalSizeBytes;
 
-  /// Current B+Tree leaf-cache ceiling in bytes.
+  /// Current search-hot leaf-cache ceiling in bytes.
   int get btreeLeafCacheMaxBytes => _btreeLeafCacheMaxBytes;
 
-  /// Configure compact-cluster + paged leaf ceilings (same vector quota).
+  /// Configure search-hot leaf cache ceiling (vector quota).
   ///
   /// [maxBytes] must already include the 64MB floor from the resolver.
   void configureVectorSearchCacheBudget(int maxBytes) {
-    _applyCacheBudget(
-      _clusterCache,
-      maxBytes,
-      currentMax: _clusterCacheMaxBytes,
-      setMax: (v) => _clusterCacheMaxBytes = v,
-    );
     _applyCacheBudget(
       _btreeLeafCache,
       maxBytes,
@@ -764,8 +698,8 @@ class NghGraphEngine {
     );
   }
 
-  /// Search-hot posting leaf cache. Steady-state residency is here only —
-  /// [_partitionManager] posting I/O fill is short-lived and must be evicted
+  /// Search-hot leaf cache. Steady-state residency is here only —
+  /// [_partitionManager] leaf I/O fill is short-lived and must be evicted
   /// when a page is pinned hot (see [_btreeLeafPut]).
   NghLeafPage? _btreeLeafGet(
     TableUid tableUid,
@@ -878,7 +812,7 @@ class NghGraphEngine {
     return _navInternalGet(tableUid, indexUid, id, touch: touch);
   }
 
-  /// Score posting-leaf candidates under one L0 root with bounded hop descent.
+  /// Score leaf candidates under one L0 root with bounded hop descent.
   ///
   /// Each hop scores ≤[NghNavBTreePage.maxEntriesPerPage] children of ONE page,
   /// then beams to top-[beam] mids. Cost is O(hops×64×beam), not O(N).
@@ -951,7 +885,7 @@ class NghGraphEngine {
             type: ResultType.engError,
             message:
                 'NGH nav descent exceeded maxTreeHops=${NghNavBTreePage.maxTreeHops} '
-                '(root=$rootId). Refusing to treat a mid page as a posting leaf.',
+                '(root=$rootId). Refusing to treat a mid page as a leaf.',
           )
         ]);
       }
@@ -1064,7 +998,7 @@ class NghGraphEngine {
             type: ResultType.engError,
             message:
                 'NGH nav descent exceeded maxTreeHops=${NghNavBTreePage.maxTreeHops} '
-                '(root=$rootId). Refusing to treat a mid page as a posting leaf.',
+                '(root=$rootId). Refusing to treat a mid page as a leaf.',
           )
         ]);
       }
@@ -1225,7 +1159,7 @@ class NghGraphEngine {
         maxNavBytes: _navInternalCacheMaxBytes,
       );
 
-  /// Pages needed for a nav subtree holding [leafEntryCount] posting-leaf entries.
+  /// Pages needed for a nav subtree holding [leafEntryCount] leaf entries.
   /// Always ≥1 (empty root still gets one leaf-level page).
   static int _navTreePagesNeeded(int leafEntryCount) {
     final fanout = NghNavBTreePage.maxEntriesPerPage;
@@ -1266,7 +1200,7 @@ class NghGraphEngine {
     return w;
   }
 
-  /// Far-pair / projection 50-50 split (same spirit as posting leaf split).
+  /// Far-pair / projection 50-50 split (same spirit as leaf split).
   (List<CentroidBranchEntry>, List<CentroidBranchEntry>)
       _splitBranchEntriesBalanced(
     List<CentroidBranchEntry> entries,
@@ -1335,7 +1269,7 @@ class NghGraphEngine {
     );
   }
 
-  /// Pack posting-leaf branch entries into a mid/leaf nav subtree.
+  /// Pack leaf branch entries into a mid/leaf nav subtree.
   /// [pageIds] length must be [_navTreePagesNeeded(leafEntries.length)].
   NghPageId _writeNavSubtree({
     required int rootId,
@@ -1409,61 +1343,53 @@ class NghGraphEngine {
   String _cacheKey(TableUid tableUid, IndexUid indexUid) =>
       '${tableUid.value}/${indexUid.value}';
 
-  /// Evict a ratio of cluster compact caches (oldest centroids first via TreeCache).
-  Future<void> evictClusterCache({double ratio = 0.3}) async {
-    await _clusterCache.cleanup(removeRatio: ratio);
-  }
-
   /// Evict a ratio of paged ANN leaf caches.
   Future<void> evictBTreeLeafCache({double ratio = 0.3}) async {
     await _btreeLeafCache.cleanup(removeRatio: ratio);
   }
 
-  /// Clear cluster cache for a specific table.
+  /// Clear nav/leaf caches for a specific table.
   void clearCacheForTable(TableUid tableUid) {
-    _clusterCache.remove([tableUid.value]);
     _navGraphCache.remove([tableUid.value]);
     _btreeLeafCache.remove([tableUid.value]);
     _navInternalCache.remove([tableUid.value]);
     final prefix = '${tableUid.value}/';
     _navGraphInflight.removeWhere((k, _) => k.startsWith(prefix));
-    _clusterLoadInflight.removeWhere((k, _) => k.startsWith(prefix));
     _btreeStates.removeWhere((k, _) => k.startsWith(prefix));
+    _warmedSearchIndexes.removeWhere((k) => k.startsWith(prefix));
   }
 
-  /// Clear cluster cache for a specific index.
+  /// Clear nav/leaf caches for a specific index.
   void clearCacheForIndex(TableUid tableUid, IndexUid indexUid) {
-    _clusterCache.remove([tableUid.value, indexUid.value]);
     _navGraphCache.remove([tableUid.value, indexUid.value]);
     _btreeLeafClearForIndex(tableUid, indexUid);
     _navInternalCache.remove([tableUid.value, indexUid.value]);
     final key = _cacheKey(tableUid, indexUid);
     _navGraphInflight.remove(key);
-    _clusterLoadInflight.remove(key);
     _btreeStates.remove(key);
+    _warmedSearchIndexes.remove(key);
   }
 
-  /// Clear all cluster caches.
+  /// Clear all nav/leaf caches.
   void clearCache() {
-    _clusterCache.clear();
     _navGraphCache.clear();
     _btreeLeafCache.clear();
     _navInternalCache.clear();
     _navGraphInflight.clear();
-    _clusterLoadInflight.clear();
     _btreeStates.clear();
     _searchScratchPools.clear();
+    _warmedSearchIndexes.clear();
   }
 
-  /// Startup/runtime prewarm: load posting into the search-hot cache.
+  /// Startup/runtime prewarm: load leaves into the search-hot cache.
   ///
   /// **Open / explicit prewarm only** — must not run on every writeChanges.
-  /// Stops once [maxBytes] would be exceeded (OOM guard). Hot clusters/leaves
+  /// Stops once [maxBytes] would be exceeded (OOM guard). Hot leaves
   /// first. Returns bytes added.
   ///
   /// Loads in small batches and yields so [shouldAbort] (close / switchSpace)
   /// can stop promptly — same cooperative pattern as table/index row prewarm.
-  Future<int> prewarmClusters({
+  Future<int> prewarmLeaves({
     required TableContext table,
     required IndexUid indexUid,
     required NghIndexMeta meta,
@@ -1481,7 +1407,7 @@ class NghGraphEngine {
     );
   }
 
-  /// Promote flush-dirty posting leaves into the search-hot cache.
+  /// Promote flush-dirty leaves into the search-hot cache.
   ///
   void promotePagedLeavesAfterInsertSync({
     required TableContext table,
@@ -1489,11 +1415,21 @@ class NghGraphEngine {
     required NghIndexMeta meta,
     required Map<NghPagePtr, NghLeafPage> dirtyLeafPages,
     Map<NghPagePtr, NghNavBTreePage> dirtyNavBTreePages = const {},
+    Map<NghPageId, NghNavBTreePage> touchedNavPages = const {},
   }) {
     if (_btreeStates[_cacheKey(table.tableUid, indexUid)] == null) return;
-    if (dirtyLeafPages.isEmpty && dirtyNavBTreePages.isEmpty) return;
+    if (dirtyLeafPages.isEmpty &&
+        dirtyNavBTreePages.isEmpty &&
+        touchedNavPages.isEmpty) {
+      return;
+    }
 
     final tableUid = table.tableUid;
+    for (final e in touchedNavPages.entries) {
+      final id = e.key;
+      if (id.isNone || id.pageNo <= 0) continue;
+      _navInternalPut(tableUid, indexUid, id, e.value);
+    }
     for (final e in dirtyNavBTreePages.entries) {
       final ptr = e.key;
       if (ptr.isNull || ptr.pageNo <= 0) continue;
@@ -1529,12 +1465,23 @@ class NghGraphEngine {
     required NghIndexMeta meta,
     required Map<NghPagePtr, NghLeafPage> dirtyLeafPages,
     Map<NghPagePtr, NghNavBTreePage> dirtyNavBTreePages = const {},
+    Map<NghPageId, NghNavBTreePage> touchedNavPages = const {},
     bool Function()? shouldAbort,
   }) async {
     if (_btreeStates[_cacheKey(table.tableUid, indexUid)] == null) return;
-    if (dirtyLeafPages.isEmpty && dirtyNavBTreePages.isEmpty) return;
+    if (dirtyLeafPages.isEmpty &&
+        dirtyNavBTreePages.isEmpty &&
+        touchedNavPages.isEmpty) {
+      return;
+    }
 
     final tableUid = table.tableUid;
+    for (final e in touchedNavPages.entries) {
+      if (shouldAbort?.call() ?? false) return;
+      final id = e.key;
+      if (id.isNone || id.pageNo <= 0) continue;
+      _navInternalPut(tableUid, indexUid, id, e.value);
+    }
     for (final e in dirtyNavBTreePages.entries) {
       if (shouldAbort?.call() ?? false) return;
       final ptr = e.key;
@@ -1560,13 +1507,16 @@ class NghGraphEngine {
       _btreeLeafPut(tableUid, indexUid, pageId, shaped);
     }
 
-    // Tier-2 JIT only (8 depth-1 probes). Not a leaf/nav fill.
-    if (dirtyLeafPages.length >= 64 && !(shouldAbort?.call() ?? false)) {
+    final key = _cacheKey(tableUid, indexUid);
+    final needWarm = !_warmedSearchIndexes.contains(key);
+    if ((needWarm || dirtyLeafPages.length >= 64) &&
+        !(shouldAbort?.call() ?? false)) {
+      _warmedSearchIndexes.add(key);
       await warmSearchPath(table: table, indexUid: indexUid, meta: meta);
     }
   }
 
-  /// Diagnostic: how many posting leaves are inventored vs resident in leaf cache.
+  /// Diagnostic: how many leaves are inventored vs resident in leaf cache.
   ({int inventored, int cached, int leafCacheBytes, int leafCacheMaxBytes})
       btreeLeafCacheCoverage(TableUid tableUid, IndexUid indexUid) {
     final state = _btreeStates[_cacheKey(tableUid, indexUid)];
@@ -1617,7 +1567,7 @@ class NghGraphEngine {
     );
   }
 
-  /// Prefetch posting leaves into [_btreeLeafCache] under [maxBytes].
+  /// Prefetch leaves into [_btreeLeafCache] under [maxBytes].
   ///
   /// Hottest leaves (highest [CentroidBranchEntry.leafSlotCount]) first so
   /// typical ANN probes hit memory on the first query after open/insert.
@@ -1731,7 +1681,7 @@ class NghGraphEngine {
     return max(0, _btreeLeafCache.estimatedTotalSizeBytes - beforeBytes);
   }
 
-  /// Batch-load missing posting leaves into [_btreeLeafCache] and materialize low48.
+  /// Batch-load missing leaves into [_btreeLeafCache] and materialize low48.
   /// Hot path returns a completed future without scheduling when all pages are resident.
   Future<void> _hydrateBTreeLeaves({
     required TableContext table,
@@ -1774,7 +1724,7 @@ class NghGraphEngine {
     Map<NghPageId, NghLeafPage>? insertScratch,
   }) async {
     // Keep search-hot leaves in [_btreeLeafCache] only — do not also park them
-    // in the posting I/O fill cache (double residency → GC / quota thrash).
+    // in the leaf I/O fill cache (double residency → GC / quota thrash).
     final loaded = await _partitionManager.readLeafPagesByIds(
       table,
       indexUid,
@@ -1792,13 +1742,14 @@ class NghGraphEngine {
     }
   }
 
-  /// Compile hot ANN loops and populate routing/cluster caches after prewarm.
+  /// Compile hot ANN loops and populate routing/leaf caches after prewarm.
   Future<void> warmSearchPath({
     required TableContext table,
     required IndexUid indexUid,
     required NghIndexMeta meta,
   }) async {
     if (meta.totalVectors <= 0 || meta.dimensions <= 0) return;
+    _warmedSearchIndexes.add(_cacheKey(table.tableUid, indexUid));
     final dims = meta.dimensions;
     final q = Float32List(dims);
     // A few distinct unit probes so Tier-2 JIT sees the real ranking loops
@@ -2110,9 +2061,9 @@ class NghGraphEngine {
     required int dimensions,
     int leafPageSize = 16384,
 
-    /// Live posting-leaf page count when known (`leafNextPageNo - first`).
+    /// Live leaf page count when known (`leafNextPageNo - first`).
     /// Prefer this over N/spp — underfull + dual-home pages exceed packing.
-    int postingPageCount = 0,
+    int leafPageCount = 0,
     int? searchDepth,
   }) {
     final rawDepth = searchDepth ?? VectorIndexConfig.defaultSearchDepth;
@@ -2239,7 +2190,7 @@ class NghGraphEngine {
     // - dens>1.25 (low-D packed): trim leaf *count* only. Do not inflate
     //   candSlots/roots — denser pages already fill the heap.
     // - slotsPerPage<8 (high-D sparse): raise leaf count for candidate volume.
-    // - Inventory: real posting pages ∪ dual-home floor (never ceil(N/spp)=1).
+    // - Inventory: real leaf pages ∪ dual-home floor (never ceil(N/spp)=1).
     // No ≤50k qpsLean on depth≤70 — that cut 128D/~10k recall far below
     // anchors whether the tree was one-shot or incremental.
     const refSlotsPerPage = 20.0;
@@ -2252,14 +2203,14 @@ class NghGraphEngine {
     final packedLeaves = max(1, (totalVectors / spp).ceil());
     // Never let a stale/low leafNextPageNo (or packed N/spp=1) pin
     // wantLeaves at 1 — dual-home + underfull pages exceed packing, and
-    // `postingPageCount > 0` must not *replace* that floor.
+    // `leafPageCount > 0` must not *replace* that floor.
     final dualHomeFloor =
         min(_absScoredLeafCap, min(totalVectors, packedLeaves * 3 + 2));
     final inventoryLeaves = max(
       1,
       max(
         packedLeaves,
-        max(postingPageCount, dualHomeFloor),
+        max(leafPageCount, dualHomeFloor),
       ),
     );
 
@@ -2466,7 +2417,7 @@ class NghGraphEngine {
       topK: topK,
       dimensions: meta.dimensions,
       leafPageSize: _leafPageSize(meta),
-      postingPageCount: max(
+      leafPageCount: max(
             0,
             meta.leafNextPageNo - NghIndexMeta.firstDataPageNo,
           ) +
@@ -3082,9 +3033,9 @@ class NghGraphEngine {
   /// Migrate legacy single-file `nav_graph.ngh` (or unpaged centroids) directly
   /// into the paged Centroid nav tree (fanout-bounded mid/leaf).
   ///
-  /// Clusters existing centroid 48-D projections into up to 64 L0 roots, packs
-  /// each root's posting-leaf entries into a SPLIT/mid nav subtree (no sibling
-  /// chains), preserves physical posting page associations, and writes
+  /// Groups existing centroid 48-D projections into up to 64 L0 roots, packs
+  /// each root's leaf entries into a SPLIT/mid nav subtree (no sibling
+  /// chains), preserves physical leaf page associations, and writes
   /// [dirtyNavRootPage] / [dirtyNavBTreePages].
   Future<
       ({
@@ -3172,7 +3123,7 @@ class NghGraphEngine {
       rootMembers[bestRoot].add(i);
     }
 
-    // 4. Calculate total entries per root (expanding multiple posting pages if any)
+    // 4. Calculate total entries per root (expanding multiple leaf pages if any)
     final rootEntries = List<List<CentroidBranchEntry>>.generate(
       numRoots,
       (_) => <CentroidBranchEntry>[],
@@ -3185,14 +3136,14 @@ class NghGraphEngine {
         if (c.centroidId > maxCentroidId) {
           maxCentroidId = c.centroidId;
         }
-        final cPages = c.postingPages.isNotEmpty
-            ? c.postingPages
-            : (c.postingPageNos.isNotEmpty
-                ? c.postingPageNos
+        final cPages = c.leafPages.isNotEmpty
+            ? c.leafPages
+            : (c.leafPageNos.isNotEmpty
+                ? c.leafPageNos
                     .map(NghPageId.fromPacked)
                     .toList(growable: false)
-                : (c.headPostingPageNo >= 0
-                    ? [NghPageId.fromPacked(c.headPostingPageNo)]
+                : (c.headLeafPageNo >= 0
+                    ? [NghPageId.fromPacked(c.headLeafPageNo)]
                     : const <NghPageId>[]));
 
         if (cPages.isEmpty) {
@@ -3345,7 +3296,7 @@ class NghGraphEngine {
     final dirtyNavBTreePages = <NghPagePtr, NghNavBTreePage>{};
     ({NghPagePtr ptr, NghNavRootPage page})? dirtyNavRootPage;
     // Mutation-local leaves (not TreeCache) so mid-insert puts cannot evict
-    // pages still being written. Flushed into posting TreeCache; search hot
+    // pages still being written. Flushed into leaf TreeCache; search hot
     // set is promoted via [promotePagedLeavesAfterInsert].
     final insertLeaves = <NghPageId, NghLeafPage>{};
     // Mutation-local nav pages for probed roots (tree, not inventory).
@@ -3526,6 +3477,7 @@ class NghGraphEngine {
       );
       for (final c in head) {
         insertNavPages[c.pageId] = c.page;
+        _navInternalPut(table.tableUid, indexUid, c.pageId, c.page);
       }
       insertNavRootsReady.add(rootId);
     }
@@ -3803,27 +3755,27 @@ class NghGraphEngine {
       dirtyLeafPages[ptr] = leafPage;
       markInsertNav(ownerInternal.pageId, ownerInternal.page);
 
-      final (newPostingPtrs, nextPostingMeta) =
+      final (newLeafPtrs, nextLeafMeta) =
           _partitionManager.allocatePagesBatchSync(
         NghDataCategory.leaf,
         currentMeta,
         1,
       );
-      currentMeta = nextPostingMeta;
-      final newLeafPtr = newPostingPtrs.first;
+      currentMeta = nextLeafMeta;
+      final newLeafPtr = newLeafPtrs.first;
       final newLeafPageId =
           NghPageId(newLeafPtr.partitionNo, newLeafPtr.pageNo);
 
       final nextCentroidId = ++state!.nextCentroidId;
-      final newPostingPage = NghLeafPage(
+      final splitLeafPage = NghLeafPage(
         centroidId: nextCentroidId,
         dimensions: currentMeta.dimensions,
         slots: <NghLeafSlot>[],
       )..replaceSlots(groupB);
-      insertLeaves[newLeafPageId] = newPostingPage;
-      dirtyLeafPages[newLeafPtr] = newPostingPage;
+      insertLeaves[newLeafPageId] = splitLeafPage;
+      dirtyLeafPages[newLeafPtr] = splitLeafPage;
 
-      final newCentroid48 = newPostingPage.normalizedMean48();
+      final newCentroid48 = splitLeafPage.normalizedMean48();
       final newBranchEntry = CentroidBranchEntry(
         centroidId: nextCentroidId,
         leafPageId: newLeafPageId,
@@ -3840,7 +3792,7 @@ class NghGraphEngine {
       );
     }
 
-    /// Resolve/allocate leaf and apply [newSlot]. Returns false if the posting
+    /// Resolve/allocate leaf and apply [newSlot]. Returns false if the leaf
     /// page is not in memory (caller must async-load).
     bool insertSlotIntoLeafSync(
       int rootId,
@@ -3978,7 +3930,7 @@ class NghGraphEngine {
               type: ResultType.engError,
               message:
                   'NGH insert descent exceeded maxTreeHops=${NghNavBTreePage.maxTreeHops} '
-                  '(root=$rootId). Refusing to rewrite a mid page as a posting leaf.',
+                  '(root=$rootId). Refusing to rewrite a mid page as a leaf.',
             )
           ]);
         }
@@ -4185,7 +4137,7 @@ class NghGraphEngine {
               type: ResultType.engError,
               message:
                   'NGH insert descent exceeded maxTreeHops=${NghNavBTreePage.maxTreeHops} '
-                  '(root=$rootId). Refusing to rewrite a mid page as a posting leaf.',
+                  '(root=$rootId). Refusing to rewrite a mid page as a leaf.',
             )
           ]);
         }
@@ -4340,7 +4292,7 @@ class NghGraphEngine {
       }
     }
 
-    NghPageId? peekBestPostingLeafSync(int rootId, Float32x4List qLowSimd) {
+    NghPageId? peekBestLeafSync(int rootId, Float32x4List qLowSimd) {
       var curId = state!.firstInternalByRoot[rootId];
       if (curId.isNone) return null;
       final head = resolveInsertNav(curId);
@@ -4406,7 +4358,7 @@ class NghGraphEngine {
       );
     }
 
-    /// Far from all L0 → new root + empty leaf-level head (no posting rewrite).
+    /// Far from all L0 → new root + empty leaf-level head (no leaf rewrite).
     int? spawnFarL0Root(Float32List low48) {
       if (!state!.canGrowRoot) return null;
       final (navPtrs, navMeta) = _partitionManager.allocatePagesBatchSync(
@@ -4527,7 +4479,7 @@ class NghGraphEngine {
     /// Tiny cold-start (1 / 100 rows) leaves L0 far below the sample-rich
     /// target. Far-spawn + heavy-split alone never catch a subsequent 10k
     /// flush (depth1–70 recall cliff, self_rc dips). Seed empty L0 heads from
-    /// this batch once — O(sample×k), no posting rewrite.
+    /// this batch once — O(sample×k), no leaf rewrite.
     void expandUndersizedL0FromBatch() {
       if (!state!.canGrowRoot || vectors.isEmpty) return;
       final projectedN = currentMeta.totalVectors + vectors.length;
@@ -4611,10 +4563,10 @@ class NghGraphEngine {
           bestRoot1 = r;
         }
       }
-      final leaf0 = peekBestPostingLeafSync(bestRoot0, qLowSimd);
+      final leaf0 = peekBestLeafSync(bestRoot0, qLowSimd);
       if (leaf0 != null && !leaf0.isNone) neededLeafIds.add(leaf0);
       if (maxScore1 >= maxScore0 * _boundaryDualRatio) {
-        final leaf1 = peekBestPostingLeafSync(bestRoot1, qLowSimd);
+        final leaf1 = peekBestLeafSync(bestRoot1, qLowSimd);
         if (leaf1 != null && !leaf1.isNone) neededLeafIds.add(leaf1);
       }
     }
@@ -4693,7 +4645,7 @@ class NghGraphEngine {
     }
 
     // Refresh every resident L0 head so cold k-means seeds drift toward live
-    // subtree mass without posting rewrite / extra I/O.
+    // subtree mass without leaf rewrite / extra I/O.
     for (int r = 0; r < state.numRootCentroids; r++) {
       refreshRootCentroidFromHead(r);
     }
@@ -4739,7 +4691,16 @@ class NghGraphEngine {
       );
     }
 
-    // Promote dirty L1 pages into the budgeted search-hot nav cache.
+    // Promote all touched L1 pages (descent paths + dirty) into the budgeted search-hot nav cache.
+    for (final e in insertNavPages.entries) {
+      if (e.key.isNone || e.key.pageNo <= 0) continue;
+      _navInternalPut(
+        table.tableUid,
+        indexUid,
+        e.key,
+        e.value,
+      );
+    }
     for (final e in dirtyNavBTreePages.entries) {
       final ptr = e.key;
       _navInternalPut(
@@ -4750,7 +4711,7 @@ class NghGraphEngine {
       );
     }
     // Search scores [_btreeLeafCache] only. Pin dirty leaves now; [_btreeLeafPut]
-    // evicts any posting I/O twin (steady-state: no dual residency).
+    // evicts any leaf I/O twin (steady-state: no dual residency).
     for (final e in dirtyLeafPages.entries) {
       final ptr = e.key;
       if (ptr.category != NghDataCategory.leaf) continue;
@@ -4834,6 +4795,7 @@ class NghGraphEngine {
       dirtyNavRootPage: dirtyNavRootPage,
       dirtyPkmapPages: pkBatch.dirty,
       insertedCount: vectors.length,
+      touchedNavPages: insertNavPages,
     );
   }
 
@@ -4878,8 +4840,8 @@ class NghGraphEngine {
   ///
   /// Steps:
   ///   1. Exact centroid routing on in-memory navigating graph
-  ///   2. On-demand load only probed clusters (prewarmed: 0 I/O)
-  ///   3. SQ8 distance scoring across all slots in probed clusters
+  ///   2. On-demand load only probed leaves (prewarmed: 0 I/O)
+  ///   3. SQ8 distance scoring across all slots in probed leaves
   ///   4. Global Top-K extraction via fixed heap
   Future<List<NghSearchResult>> search({
     required TableContext table,
@@ -4988,10 +4950,10 @@ class NghGraphEngine {
   Uint8List _pkMapKey(String pk) => MemComparableKey.encodeTextLex(pk);
 
   // =====================================================================
-  // Deletion -- Tombstone in Posting Pages
+  // Deletion -- Tombstone in Leaf Pages
   // =====================================================================
 
-  /// Mark posting slots deleted via PK locator (never a full-cluster scan).
+  /// Mark leaf slots deleted via PK locator (never a full-leaf scan).
   Future<NghDeleteResult> deleteBatch({
     required TableContext table,
     required IndexUid indexUid,
@@ -5318,7 +5280,7 @@ class NghGraphEngine {
     );
   }
 
-  /// Scan posting pages to fill the PK locator tree. Tombstones pending-delete
+  /// Scan leaf pages to fill the PK locator tree. Tombstones pending-delete
   /// PKs as they are encountered. Never falls back to a full delete scan.
   Future<NghInsertResult> backfillPkLocator({
     required TableContext table,
@@ -5343,7 +5305,7 @@ class NghGraphEngine {
     final partLimit = max(1, currentMeta.leafPartitionCount);
 
     while (visited < maxPages && part < partLimit) {
-      final pageCount = await _partitionManager.postingFilePageCount(
+      final pageCount = await _partitionManager.leafFilePageCount(
         table,
         indexUid,
         currentMeta,
@@ -5444,12 +5406,13 @@ class NghInsertResult {
   final Map<NghPagePtr, NghNavCentroidPage> dirtyNavPages;
   final Map<NghPagePtr, NghPkMapDirtyPage> dirtyPkmapPages;
   final Map<NghPagePtr, NghNavBTreePage> dirtyNavBTreePages;
+  final Map<NghPageId, NghNavBTreePage> touchedNavPages;
   final ({NghPagePtr ptr, NghNavRootPage page})? dirtyNavRootPage;
   final bool deleteLegacyNavGraph;
   final int insertedCount;
   final int tombstonedCount;
 
-  /// True when this flush should load *missing* compact clusters after persist.
+  /// True when this flush should load *missing* search-hot leaves after persist.
   ///
   /// Not "index fits budget" — that would re-prewarm every small-corpus flush.
   final bool needsCompactGapFill;
@@ -5460,6 +5423,7 @@ class NghInsertResult {
     this.dirtyNavPages = const {},
     this.dirtyPkmapPages = const {},
     this.dirtyNavBTreePages = const {},
+    this.touchedNavPages = const {},
     this.dirtyNavRootPage,
     this.deleteLegacyNavGraph = false,
     required this.insertedCount,
@@ -5520,7 +5484,7 @@ class _FixedHeap {
   final int capacity;
   final bool maxHeap;
 
-  /// Node ids as Dart [int] (not [Int32List]) so wide posting nodeId (>2^32) survives.
+  /// Node ids as Dart [int] (not [Int32List]) so wide leaf nodeId (>2^32) survives.
   late final List<int> _ids;
   late final Float64List _dists;
   late final List<Uint8List?> _pks;

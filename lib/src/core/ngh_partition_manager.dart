@@ -27,10 +27,12 @@ import 'yield_controller.dart';
 // NGH Partition Manager
 //
 // Page I/O for NGH partition files:
-//   posting/ -- inverted cluster SQ8 pages
-//              redo: full page when dims≤[NghLeafPage.fullPageRedoMaxDimensions],
+//   leaf/ -- physical vector-leaf SQ8 pages
+//              redo: dirty leaves + free pages + partition page0;
+//              leaf body: full page when dims≤[NghLeafPage.fullPageRedoMaxDimensions],
 //              else structure+PK (PageRedoTreeKind.ngh + NGPK payload)
 //   nav/     -- paged Centroid B+Tree pages (page redo: PageRedoTreeKind.nghNav)
+//              including partition page0
 //   pkmap/   -- PK locator B+Tree (no page redo)
 // Read-only until migrated: ngh/nav_graph.ngh (layoutVersion == 1). Never
 // rewritten after engine v4.
@@ -61,7 +63,7 @@ final class NghPagePtr {
   static const NghPagePtr nullPtr = NghPagePtr(NghDataCategory.leaf, -1, -1);
   bool get isNull => partitionNo < 0 || pageNo < 0;
 
-  /// Packed `(partitionNo << 20) | pageNo` for **legacy posting `next` only**.
+  /// Packed `(partitionNo << 20) | pageNo` for **legacy leaf `next` only**.
   int get packedRef => packRef(partitionNo, pageNo);
 
   factory NghPagePtr.fromPacked(NghDataCategory category, int packed) {
@@ -129,7 +131,7 @@ final class NghPartitionManager {
   final DataStoreImpl _dataStore;
 
   // -- Page Caches --
-  // Inverted posting pages with inlined SQ8 vector slots.
+  // Inverted leaf pages with inlined SQ8 vector slots.
   late final TreeCache<NghLeafPage> _leafPageCache;
   late final TreeCache<NghNavCentroidPage> _navPageCache;
   late final TreeCache<NghPkMapDirtyPage> _pkmapPageCache;
@@ -142,7 +144,7 @@ final class NghPartitionManager {
 
   int get configuredPageSize => _dataStore.configuredPageSize;
 
-  /// TPG2 page size for an NGH category. Posting/nav may be larger than the
+  /// TPG2 page size for an NGH category. Leaf/nav may be larger than the
   /// database 16KB page for high-D indexes; pkmap always inherits 16KB.
   int pageSizeFor(NghDataCategory category, NghIndexMeta? meta) {
     if (meta == null) return configuredPageSize;
@@ -166,8 +168,8 @@ final class NghPartitionManager {
   static const int _pkmapBurstCacheMaxBytes = 8 * 1024 * 1024;
   static const int _pkmapBurstCacheMinBytes = 1 * 1024 * 1024;
 
-  /// Nav page cache vs posting: Centroid B+Tree routing is ~MB-class (48-D
-  /// branch entries), while posting holds full-D SQ8. Legacy `~/4` overshot.
+  /// Nav page cache vs leaf pages: Centroid B+Tree routing is ~MB-class (48-D
+  /// branch entries), while leaf pages hold full-D SQ8. Legacy `~/4` overshot.
   /// Keep a small share of [leafBudget] with a platform floor.
   static (int maxBytes, int minBytes) _navPageCacheBudget(int leafBudget) {
     final floor = PlatformHandler.isMobile ? 8 * 1024 * 1024 : 16 * 1024 * 1024;
@@ -179,7 +181,7 @@ final class NghPartitionManager {
 
   void _initCaches(int indexBudget) {
     // Search-hot leaves use NghGraphEngine._btreeLeafCache (vector quota).
-    // Posting pages are the I/O fill layer and must track vector scale —
+    // Leaf pages are the I/O fill layer and must track vector scale —
     // indexBudget*30% alone thrashs after tens of thousands of inserts.
     final nghBudget = max(32 * 1024 * 1024, (indexBudget * 0.30).round());
     final int minThreshold =
@@ -269,7 +271,7 @@ final class NghPartitionManager {
     _pkmapPageCache.clear();
   }
 
-  /// Synchronous memory cache lookup for an inverted posting page (0 I/O).
+  /// Synchronous memory cache lookup for an vector leaf page (0 I/O).
   NghLeafPage? getCachedLeafPage(
     TableUid tableUid,
     IndexUid indexUid,
@@ -279,7 +281,7 @@ final class NghPartitionManager {
     return _leafPageCache.getPoint4(tableUid, indexUid, partitionNo, pageNo);
   }
 
-  /// Read an inverted posting page from cache or disk.
+  /// Read an vector leaf page from cache or disk.
   Future<NghLeafPage?> readLeafPage(
     TableContext table,
     IndexUid indexUid,
@@ -318,14 +320,14 @@ final class NghPartitionManager {
     } catch (e) {
       if (e is DbClosedException) rethrow;
       Logger.warn(
-        'NGH posting page corrupted or torn at partition $partitionNo, page $pageNo for index "$indexUid". Gracefully degrading to null.',
+        'NGH leaf page corrupted or torn at partition $partitionNo, page $pageNo for index "$indexUid". Gracefully degrading to null.',
         rawError: e,
       );
       return null;
     }
   }
 
-  /// Read specific posting pages by packed refs, grouped by partition for parallel I/O.
+  /// Read specific leaf pages by packed refs, grouped by partition for parallel I/O.
   ///
   /// Each entry in [packedRefs] is `partitionNo<<20|pageNo` (legacy bare pageNo = p0).
   Future<List<({int packedRef, NghLeafPage page})>> readLeafPagesBatch(
@@ -428,8 +430,8 @@ final class NghPartitionManager {
     return results;
   }
 
-  /// Read the entire posting cluster chain starting at [headPackedRef].
-  Future<List<({int packedRef, NghLeafPage page})>> readPostingCluster(
+  /// Read the entire leaf-page chain starting at [headPackedRef].
+  Future<List<({int packedRef, NghLeafPage page})>> readLeafPageChain(
     TableContext table,
     IndexUid indexUid,
     NghIndexMeta meta,
@@ -461,7 +463,7 @@ final class NghPartitionManager {
     return pages;
   }
 
-  /// Batch read multiple posting clusters in parallel or sequentially.
+  /// Batch read multiple leaf pages in parallel or sequentially.
   Future<List<List<({int packedRef, NghLeafPage page})>>>
       readLeafPagesChainsBatch(
     TableContext table,
@@ -474,7 +476,7 @@ final class NghPartitionManager {
     if (headPackedRefs.isEmpty) return const [];
     final tasks = [
       for (final headRef in headPackedRefs)
-        () => readPostingCluster(table, indexUid, meta, headRef,
+        () => readLeafPageChain(table, indexUid, meta, headRef,
             localCache: localCache),
     ];
     final res = await ParallelProcessor.execute<
@@ -743,7 +745,7 @@ final class NghPartitionManager {
     }
   }
 
-  /// Read posting pages by v2 page ids (partition >= 2048 safe).
+  /// Read leaf pages by v2 page ids (partition >= 2048 safe).
   Future<List<({NghPageId id, NghLeafPage page})>> readLeafPagesByIds(
     TableContext table,
     IndexUid indexUid,
@@ -799,7 +801,7 @@ final class NghPartitionManager {
   }
 
   /// Convert a legacy `nav_graph.ngh` blob into paged nav. Does not
-  /// rewrite posting files.
+  /// rewrite leaf files.
   Future<
       ({
         NghIndexMeta meta,
@@ -819,12 +821,12 @@ final class NghPartitionManager {
     final centroids = blob.centroids;
     for (final c in centroids) {
       c.level = NghNavCentroidNode.levelLeaf;
-      if (c.postingPages.isEmpty) {
-        for (final packed in c.postingPageNos) {
-          c.addPostingPage(NghPageId.fromPacked(packed));
+      if (c.leafPages.isEmpty) {
+        for (final packed in c.leafPageNos) {
+          c.addLeafPage(NghPageId.fromPacked(packed));
         }
       }
-      c.postingDirDirty = false;
+      c.leafDirDirty = false;
     }
 
     for (int i = 0; i < centroids.length; i += perPage) {
@@ -913,8 +915,8 @@ final class NghPartitionManager {
     return dirty;
   }
 
-  /// Whether a posting payload will fit this index's posting TPG2 page.
-  bool postingPayloadFits(int plainPayloadLen, {required int pageSize}) {
+  /// Whether a leaf payload will fit this index's leaf TPG2 page.
+  bool leafPayloadFits(int plainPayloadLen, {required int pageSize}) {
     return BTreePageSizer.fitsInPage(
       pageSize: pageSize,
       plainPayloadLen: plainPayloadLen,
@@ -965,8 +967,8 @@ final class NghPartitionManager {
     );
   }
 
-  /// Number of pages in a posting partition file (including page 0 meta).
-  Future<int> postingFilePageCount(
+  /// Number of pages in a leaf partition file (including page 0 meta).
+  Future<int> leafFilePageCount(
     TableContext table,
     IndexUid indexUid,
     NghIndexMeta meta,
@@ -1079,6 +1081,35 @@ final class NghPartitionManager {
       return meta;
     }
 
+    // Disk leaf/nav writes must land in a pending-batch redo log. Callers
+    // that omit [batchContext] (compact, pk backfill) used to skip leaf redo
+    // entirely — a crash then left torn TPG2 pages with no replay image.
+    if ((batchContext == null || batchContext.batchId.isEmpty) &&
+        _dataStore.config.enableJournal) {
+      return _dataStore.parallelJournalManager.runWithPageRedoBatch(
+        table: table,
+        action: (ctx, {required bool ownedBatch}) {
+          return writeChanges(
+            table: table,
+            indexUid: indexUid,
+            meta: meta,
+            dirtyLeafPages: dirtyLeafPages,
+            dirtyNavPages: dirtyNavPages,
+            dirtyNavBTreePages: dirtyNavBTreePages,
+            dirtyNavRootPage: dirtyNavRootPage,
+            dirtyPkmapPages: dirtyPkmapPages,
+            freeLeafPages: freeLeafPages,
+            deleteLegacyNavGraph: deleteLegacyNavGraph,
+            vectorsDelta: vectorsDelta,
+            deletedDelta: deletedDelta,
+            batchContext: ctx,
+            concurrency: concurrency,
+            yieldBudgetMs: yieldBudgetMs,
+          );
+        },
+      );
+    }
+
     final leafPageSize = pageSizeFor(NghDataCategory.leaf, meta);
     final navPageSize = pageSizeFor(NghDataCategory.nav, meta);
     final sidecarPageSize = configuredPageSize;
@@ -1105,7 +1136,7 @@ final class NghPartitionManager {
       staged.putIfAbsent(path, () => <int, Uint8List>{})[offset] = bytes;
     }
 
-    final postingStats = <int, _NghPartitionStats>{};
+    final leafStats = <int, _NghPartitionStats>{};
     final navStats = <int, _NghPartitionStats>{};
     final pkmapStats = <int, _NghPartitionStats>{};
 
@@ -1118,7 +1149,7 @@ final class NghPartitionManager {
     final redoRecords = <Uint8List>[];
     final redoBatch = (batchContext != null && batchContext.batchId.isNotEmpty)
         ? batchContext
-        : _dataStore.parallelJournalManager.activeBatchContext;
+        : null;
     final recordPageRedo = redoBatch != null &&
         redoBatch.batchId.isNotEmpty &&
         redoBatch.recordsPageRedo &&
@@ -1222,7 +1253,7 @@ final class NghPartitionManager {
       for (final ptr in freeLeafPages) ptr.cacheKey,
     };
     for (final ptr in freeLeafPages) {
-      final stats = getStats(postingStats, ptr.partitionNo);
+      final stats = getStats(leafStats, ptr.partitionNo);
       stats.path ??= _partitionPath(
           NghDataCategory.leaf, table, indexUid, ptr.partitionNo);
       if (!stats.dirEnsured) {
@@ -1249,31 +1280,32 @@ final class NghPartitionManager {
         table,
         indexUid,
         stageWrite,
+        redoRecords: recordPageRedo ? redoRecords : null,
+        redoKind: recordPageRedo ? PageRedoTreeKind.ngh : null,
       );
       stats.freeListHeadPageNo = ptr.pageNo;
       stats.freePageCount += 1;
       stats.maxPageNoWritten = max(stats.maxPageNoWritten, ptr.pageNo);
     }
 
-    final usePkPostingRedo =
-        NghLeafPage.prefersPkStructureRedo(meta.dimensions);
+    final usePkLeafRedo = NghLeafPage.prefersPkStructureRedo(meta.dimensions);
     for (final entry in dirtyLeafPages.entries) {
       if (freedKeys.contains(entry.key.cacheKey)) continue;
       final y0 = yc.maybeYield();
       if (y0 != null) await y0;
-      final posting = entry.value;
+      final leafPage = entry.value;
       await stageTyped(
         category: NghDataCategory.leaf,
-        statsMap: postingStats,
+        statsMap: leafStats,
         ptr: entry.key,
         pageType: BTreePageType.nghLeaf,
-        payload: posting.encodePayload(),
+        payload: leafPage.encodePayload(),
         // dims≤64: full page image. dims>64: structure+PK (rebuild from table).
         redoKind: PageRedoTreeKind.ngh,
         redoPayload:
-            usePkPostingRedo ? posting.encodePkStructureRedoPayload() : null,
+            usePkLeafRedo ? leafPage.encodePkStructureRedoPayload() : null,
       );
-      // Do not park dirty posting in the I/O fill cache. Search-hot residency
+      // Do not park dirty leaves in the I/O fill cache. Search-hot residency
       // is NghGraphEngine._btreeLeafCache (pin at insert end / promote).
       // Putting here would create short dual residency until promote evicts.
     }
@@ -1309,16 +1341,16 @@ final class NghPartitionManager {
     }
 
     // Engine v4: never rewrite nav_graph.ngh.
-    // Persist posting p0 NghIndexMeta *before* deleting the blob so a crash
+    // Persist leaf p0 NghIndexMeta *before* deleting the blob so a crash
     // cannot leave layout=1 with no readable nav.
     if (deleteLegacyNavGraph) {
-      final p0 = getStats(postingStats, 0);
+      final p0 = getStats(leafStats, 0);
       p0.path ??= _dataStore.pathManager
           .getNghLeafPartitionPathByContext(table, indexUid, 0);
     }
 
     final sizeDeltaSum = await _computePartitionSizeDeltaSum([
-      (stats: postingStats, pageSize: leafPageSize),
+      (stats: leafStats, pageSize: leafPageSize),
       (stats: navStats, pageSize: navPageSize),
       (stats: pkmapStats, pageSize: sidecarPageSize),
     ]);
@@ -1335,15 +1367,23 @@ final class NghPartitionManager {
       entryDelta: vectorsDelta,
     );
 
-    await _stagePartitionMeta(postingStats, leafPageSize, updatedMeta,
-        stageWrite, yc, NghDataCategory.leaf);
-    await _stagePartitionMeta(navStats, navPageSize, updatedMeta, stageWrite,
-        yc, NghDataCategory.nav);
+    await _stagePartitionMeta(leafStats, leafPageSize, updatedMeta, stageWrite,
+        yc, NghDataCategory.leaf,
+        redoRecords: recordPageRedo ? redoRecords : null,
+        redoKind: recordPageRedo ? PageRedoTreeKind.ngh : null,
+        tableUid: table.tableUid,
+        indexUid: indexUid);
+    await _stagePartitionMeta(
+        navStats, navPageSize, updatedMeta, stageWrite, yc, NghDataCategory.nav,
+        redoRecords: recordPageRedo ? redoRecords : null,
+        redoKind: recordPageRedo ? PageRedoTreeKind.nghNav : null,
+        tableUid: table.tableUid,
+        indexUid: indexUid);
     await _stagePartitionMeta(pkmapStats, sidecarPageSize, updatedMeta,
         stageWrite, yc, NghDataCategory.pkmap);
 
-    if (!postingStats.containsKey(0) && staged.isNotEmpty) {
-      final p0Stats = getStats(postingStats, 0);
+    if (!leafStats.containsKey(0) && staged.isNotEmpty) {
+      final p0Stats = getStats(leafStats, 0);
       p0Stats.path ??= _dataStore.pathManager
           .getNghLeafPartitionPathByContext(table, indexUid, 0);
       await _stagePartitionMeta(
@@ -1353,6 +1393,10 @@ final class NghPartitionManager {
         stageWrite,
         yc,
         NghDataCategory.leaf,
+        redoRecords: recordPageRedo ? redoRecords : null,
+        redoKind: recordPageRedo ? PageRedoTreeKind.ngh : null,
+        tableUid: table.tableUid,
+        indexUid: indexUid,
       );
     }
 
@@ -1575,8 +1619,10 @@ final class NghPartitionManager {
     NghPagePtr ptr,
     TableContext table,
     IndexUid indexUid,
-    void Function(String path, int offset, Uint8List bytes) stageWrite,
-  ) async {
+    void Function(String path, int offset, Uint8List bytes) stageWrite, {
+    List<Uint8List>? redoRecords,
+    PageRedoTreeKind? redoKind,
+  }) async {
     final pageSize = pageSizeFor(category, meta);
     final heads = _getFreeListHeads(category, meta);
     final currentHead = heads[ptr.partitionNo] ?? -1;
@@ -1590,6 +1636,16 @@ final class NghPartitionManager {
 
     final path = _partitionPath(category, table, indexUid, ptr.partitionNo);
     stageWrite(path, ptr.pageNo * pageSize, freeBytes);
+    if (redoRecords != null && redoKind != null) {
+      redoRecords.add(PageRedoLogCodec.encodePageRecord(
+        treeKind: redoKind,
+        tableUid: table.tableUid,
+        indexUid: indexUid,
+        partitionNo: ptr.partitionNo,
+        pageNo: ptr.pageNo,
+        payload: freeBytes,
+      ));
+    }
 
     final updatedHeads = Map<int, int>.from(heads);
     updatedHeads[ptr.partitionNo] = ptr.pageNo;
@@ -1729,7 +1785,7 @@ final class NghPartitionManager {
     _pkmapPageCache.remove([tableUid]);
   }
 
-  /// Clear posting I/O fill for one index (search-hot leaves live elsewhere).
+  /// Clear leaf I/O fill for one index (search-hot leaves live elsewhere).
   void clearLeafPageCacheForIndex(TableUid tableUid, IndexUid indexUid) {
     _leafPageCache.remove([tableUid, indexUid]);
   }
@@ -1739,7 +1795,7 @@ final class NghPartitionManager {
     _navPageCache.remove([tableUid, indexUid]);
   }
 
-  /// Drop one posting page from the I/O fill cache (leaf cache is independent).
+  /// Drop one leaf page from the I/O fill cache (leaf cache is independent).
   void evictLeafPage(
     TableUid tableUid,
     IndexUid indexUid,
@@ -1752,7 +1808,7 @@ final class NghPartitionManager {
   /// Memory-mode / cache-only commit of dirty NGH pages (no disk I/O).
   ///
   /// Mirrors the in-memory residency side of [writeChanges] without staging,
-  /// redo, or partition file writes. Dirty posting is NOT parked in the posting
+  /// redo, or partition file writes. Dirty leaves are NOT parked in the leaf
   /// I/O fill — promote via [NghGraphEngine.promotePagedLeavesAfterInsertSync]
   /// into the search-hot leaf cache instead.
   NghIndexMeta applyDirtyPagesToCache({
@@ -1767,7 +1823,7 @@ final class NghPartitionManager {
   }) {
     final tableUid = table.tableUid;
 
-    // Dirty posting: do not fill _leafPageCache. Memory-mode callers promote
+    // Dirty leaves: do not fill _leafPageCache. Memory-mode callers promote
     // into NghGraphEngine search-hot leaf cache instead.
     for (final entry in dirtyNavPages.entries) {
       final ptr = entry.key;
@@ -1819,7 +1875,7 @@ final class NghPartitionManager {
   /// When [encrypt] is true, routes payload through [BTreePageCodec.encodePayload]
   /// which respects [EncryptionConfig.encryptionType] (ChaCha20/AES-GCM/XOR/none).
   /// When false, uses raw payload directly for maximum throughput.
-  Uint8List buildPostingPageBytes({
+  Uint8List buildLeafPageBytes({
     required NghLeafPage page,
     required int pageSize,
     required bool encrypt,
@@ -1923,8 +1979,12 @@ final class NghPartitionManager {
     NghIndexMeta meta,
     void Function(String path, int offset, Uint8List bytes) stageWrite,
     YieldController yc,
-    NghDataCategory category,
-  ) async {
+    NghDataCategory category, {
+    List<Uint8List>? redoRecords,
+    PageRedoTreeKind? redoKind,
+    TableUid? tableUid,
+    IndexUid? indexUid,
+  }) async {
     for (final entry in statsMap.entries) {
       final y6 = yc.maybeYield();
       if (y6 != null) await y6;
@@ -1943,7 +2003,7 @@ final class NghPartitionManager {
       final computedSize = (stats.maxPageNoWritten + 1) * pageSize;
       final newSize = max(stats.oldFileSizeInBytes, computedSize);
 
-      // NghIndexMeta lives only on posting partition 0 (same as table/index p0).
+      // NghIndexMeta lives only on leaf partition 0 (same as table/index p0).
       Uint8List? treeGlobalMeta;
       if (category == NghDataCategory.leaf && pNo == 0) {
         treeGlobalMeta = TreeGlobalMetaBlobCodec.encode(
@@ -1967,6 +2027,19 @@ final class NghPartitionManager {
         treeGlobalMeta: treeGlobalMeta,
       );
       stageWrite(stats.path!, 0, metaBytes);
+      if (redoRecords != null &&
+          redoKind != null &&
+          tableUid != null &&
+          indexUid != null) {
+        redoRecords.add(PageRedoLogCodec.encodePageRecord(
+          treeKind: redoKind,
+          tableUid: tableUid,
+          indexUid: indexUid,
+          partitionNo: pNo,
+          pageNo: 0,
+          payload: metaBytes,
+        ));
+      }
     }
   }
 }

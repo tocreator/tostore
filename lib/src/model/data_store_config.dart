@@ -86,7 +86,7 @@ class DataStoreConfig {
   /// index cache ceiling (0.0 to 0.85).
   ///
   /// Defaults to null, which automatically uses an adaptive **0.50** (50% of the
-  /// total cache memory budget) as the independent vector cluster cache ceiling.
+  /// total cache memory budget) as the independent vector cache ceiling.
   ///
   /// This allocation is lazy and zero-cost when no vector operations are performed.
   final double? vectorCacheBudgetRatio;

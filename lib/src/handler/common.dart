@@ -52,7 +52,7 @@ class InternalConfig {
   /// page size is immutable for that database lifetime.
   static const int defaultPageSize = 16 * 1024;
 
-  /// Inclusive max vector width. NGH posting/nav store dimensions as u16.
+  /// Inclusive max vector width. NGH leaf/nav store dimensions as u16.
   static const int maxVectorDimensions = 65535;
 }
 

@@ -3496,7 +3496,7 @@ class VectorData {
 
 /// Vector field configuration (embedding width only).
 class VectorFieldConfig {
-  /// Inclusive max embedding width (NGH posting/nav store dimensions as u16).
+  /// Inclusive max embedding width (NGH store dimensions as u16).
   static const int maxDimensions = InternalConfig.maxVectorDimensions;
 
   /// Dimension of the vector (must match write/query width). Range: 1..[maxDimensions].

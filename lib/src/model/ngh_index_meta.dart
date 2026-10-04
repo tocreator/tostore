@@ -47,13 +47,13 @@ class NghIndexMeta {
 
   // ===================== Partition Layout ======================
 
-  /// Number of posting partition files.
+  /// Number of leaf partition files.
   final int leafPartitionCount;
 
-  /// Next page number in the active posting partition.
+  /// Next page number in the active leaf partition.
   final int leafNextPageNo;
 
-  /// Posting partition free-list heads.
+  /// Leaf partition free-list heads.
   final Map<int, int> leafFreeListHeads;
 
   final int navPartitionCount;
@@ -67,20 +67,20 @@ class NghIndexMeta {
   final int pkmapRootPage;
   final int pkmapHeight;
 
-  /// True when every live posting slot has a PK locator (new indexes start true).
+  /// True when every live leaf slot has a PK locator (new indexes start true).
   final bool hasPkLocator;
 
-  /// Backfill cursor (posting partition / page). Page 0 is meta.
+  /// Backfill cursor (leaf partition / page). Page 0 is meta.
   final int pkBackfillPartition;
   final int pkBackfillPage;
 
-  /// TPG2 page size for posting partition files. `0` = inherit the database
-  /// [GlobalConfig.pageSize] (legacy 16KB files). Frozen once posting data
-  /// exists -- changing it would require a posting rewrite.
+  /// TPG2 page size for leaf partition files. `0` = inherit the database
+  /// [GlobalConfig.pageSize] (legacy 16KB files). Frozen once leaf data
+  /// exists -- changing it would require a leaf rewrite.
   final int leafPageSize;
 
   /// TPG2 page size for navigating-centroid partition files. `0` = inherit
-  /// [GlobalConfig.pageSize]. Independent of posting. SQ8 centroids usually
+  /// [GlobalConfig.pageSize]. Independent of leaf pages. SQ8 centroids usually
   /// share the database 16KB page; very high-D indexes may use 32KB+.
   final int navPageSize;
 
@@ -136,14 +136,14 @@ class NghIndexMeta {
   /// Legacy whole-file `nav_graph.ngh`.
   static const int layoutLegacy = 1;
 
-  /// Paged Centroid B+Tree + posting + PK map sidecars.
+  /// Paged nav B+Tree + physical leaves + PK map sidecars.
   static const int layoutPaged = 2;
 
   bool get isPagedLayout => layoutVersion >= layoutPaged;
 
   bool get pkmapRootIsNull => pkmapRootPartition < 0 || pkmapRootPage <= 0;
 
-  /// True when posting partition files already have data pages. Page size is
+  /// True when leaf partition files already have data pages. Page size is
   /// then frozen (changing it would rewrite offsets).
   bool get hasLeafData => totalVectors > 0 || leafNextPageNo > firstDataPageNo;
 
@@ -151,7 +151,7 @@ class NghIndexMeta {
   /// frozen for this index.
   bool get hasNavData => centroidCount > 0 || navNextPageNo > firstDataPageNo;
 
-  /// Posting TPG2 page size. [fallback] is the database GlobalConfig page size.
+  /// Leaf TPG2 page size. [fallback] is the database GlobalConfig page size.
   int resolvedLeafPageSize(int fallback) =>
       leafPageSize > 0 ? leafPageSize : fallback;
 
@@ -365,5 +365,5 @@ class NghIndexMeta {
   String toString() => 'NghIndexMeta(uid: $indexUid, table: $tableUid, '
       'dim: $dimensions, vectors: $totalVectors, '
       'deleted: $deletedCount, layout: $layoutVersion, '
-      'postingPartitions: $leafPartitionCount)';
+      'leafPartitions: $leafPartitionCount)';
 }

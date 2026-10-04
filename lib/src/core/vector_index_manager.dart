@@ -60,7 +60,7 @@ class VectorIndexManager {
     _legacyIo = LegacyNghIo(_dataStore);
     _legacySearch = LegacyNghSearch(_legacyIo);
     _vectorCache = VectorCache();
-    syncClusterCacheBudget();
+    syncVectorSearchCacheBudget();
   }
 
   int _resolveIndexCacheBudget() {
@@ -69,12 +69,12 @@ class VectorIndexManager {
     return 128 * 1024 * 1024;
   }
 
-  /// Compact SQ8 search cache budget (cluster + paged leaf share this).
+  /// SQ8 search-hot leaf cache budget.
   ///
   /// Anchors to [vectorCacheBudgetRatio] (default 50%) of the total memory
   /// threshold. Floor 64MB matches the former configure-side lift so engine
   /// apply can take the resolved value as-is.
-  int _resolveCompactVectorClusterBudget() {
+  int _resolveVectorLeafCacheBudget() {
     final totalBudgetMB = _dataStore.resourceManager?.memoryThresholdInMB ?? 0;
     final resolvedMB = totalBudgetMB > 0
         ? totalBudgetMB
@@ -85,7 +85,7 @@ class VectorIndexManager {
     return max(64 * 1024 * 1024, targetBytes);
   }
 
-  /// Resolve navigating centroid graph cache budget from [clusterBudget].
+  /// Resolve navigating centroid graph cache budget from [vectorBudget].
   ///
   /// Legacy flat nav_graph may stay fully resident under this budget.
   /// Paged Centroid B+Tree keeps only L0 roots always-hot; L1 internal pages
@@ -93,23 +93,24 @@ class VectorIndexManager {
   /// OOM from full-chain residency.
   /// Platform floor: 32MB mobile / 128MB desktop; absolute floor 64MB.
   /// Dynamically expands to ~15% of the vector cache budget.
-  int _resolveNavGraphCacheBudget(int clusterBudget) {
+  int _resolveNavGraphCacheBudget(int vectorBudget) {
     final platformFloor =
         PlatformHandler.isMobile ? 32 * 1024 * 1024 : 128 * 1024 * 1024;
-    final targetBytes = (clusterBudget * 0.15).round();
+    final targetBytes = (vectorBudget * 0.15).round();
     return max(64 * 1024 * 1024, max(platformFloor, targetBytes));
   }
 
   /// Re-apply cache ceilings after ResourceManager computes real quotas.
   ///
   /// Vector ANN must not inherit only `indexCache * 30%` — that thrashs the
-  /// posting I/O layer after a few tens of thousands of inserts. Leaf + posting
-  /// share the dedicated vector compact budget from [vectorCacheBudgetRatio].
-  void syncClusterCacheBudget() {
+  /// leaf I/O layer after a few tens of thousands of inserts. Leaf I/O fill
+  /// and search-hot leaves share the dedicated vector budget from
+  /// [vectorCacheBudgetRatio].
+  void syncVectorSearchCacheBudget() {
     final indexBudget = _resolveIndexCacheBudget();
-    final vectorBudget = _resolveCompactVectorClusterBudget();
+    final vectorBudget = _resolveVectorLeafCacheBudget();
     final navBudget = _resolveNavGraphCacheBudget(vectorBudget);
-    // Posting fill layer: max(index*30%, vector*45%) so paged search survives
+    // Leaf I/O fill layer: max(index*30%, vector*45%) so paged search survives
     // large insert bursts without immediate TreeCache eviction.
     final leafBudget = max(
       (indexBudget * 0.30).round(),
@@ -344,13 +345,15 @@ class VectorIndexManager {
             await _removePendingDeletes(table, indexUid, pks);
             if (!_dataStore.shouldAbortBackgroundScan &&
                 (insertResult.dirtyLeafPages.isNotEmpty ||
-                    insertResult.dirtyNavBTreePages.isNotEmpty)) {
+                    insertResult.dirtyNavBTreePages.isNotEmpty ||
+                    insertResult.touchedNavPages.isNotEmpty)) {
               await _graphEngine.promotePagedLeavesAfterInsert(
                 table: table,
                 indexUid: indexUid,
                 meta: meta,
                 dirtyLeafPages: insertResult.dirtyLeafPages,
                 dirtyNavBTreePages: insertResult.dirtyNavBTreePages,
+                touchedNavPages: insertResult.touchedNavPages,
                 shouldAbort: () => _dataStore.shouldAbortBackgroundScan,
               );
             }
@@ -361,10 +364,15 @@ class VectorIndexManager {
       }
 
       if (!meta.hasPkLocator) {
-        meta = await _runPkBackfill(table, indexUid, meta);
+        meta = await _runPkBackfill(
+          table,
+          indexUid,
+          meta,
+          batchContext: batchContext,
+        );
       }
 
-      await _persistMeta(table, indexUid, meta);
+      await _persistMeta(table, indexUid, meta, batchContext: batchContext);
       _vectorCache.putMeta(table, indexUid, meta);
     }
   }
@@ -502,13 +510,15 @@ class VectorIndexManager {
             vectorsDelta: insertResult.insertedCount,
           );
           if (insertResult.dirtyLeafPages.isNotEmpty ||
-              insertResult.dirtyNavBTreePages.isNotEmpty) {
+              insertResult.dirtyNavBTreePages.isNotEmpty ||
+              insertResult.touchedNavPages.isNotEmpty) {
             _graphEngine.promotePagedLeavesAfterInsertSync(
               table: table,
               indexUid: indexUid,
               meta: meta,
               dirtyLeafPages: insertResult.dirtyLeafPages,
               dirtyNavBTreePages: insertResult.dirtyNavBTreePages,
+              touchedNavPages: insertResult.touchedNavPages,
             );
           }
           _removePendingDeletesMemory(
@@ -806,14 +816,14 @@ class VectorIndexManager {
     return entries;
   }
 
-  /// Prewarm vector index meta, nav, and posting into search-hot caches.
+  /// Prewarm vector index meta, nav, and leaves into search-hot caches.
   ///
   /// **Open / explicit prewarm only** (Phase 2 of DataStore cache prewarm).
   /// Always runs on open (including large spaces that skip row/index warm).
   /// Default ceiling is the dedicated vector compact budget from
   /// [vectorCacheBudgetRatio]; optional [maxBytes] can only shrink it.
   /// Never invoked from writeChanges — flush only promotes dirty pages of
-  /// that batch. Returns approximate bytes added to the posting/cluster hot cache.
+  /// that batch. Returns approximate bytes added to the leaf hot cache.
   Future<int> prewarmVectorIndex(
     TableContext table,
     IndexUid indexUid, {
@@ -846,13 +856,13 @@ class VectorIndexManager {
       await _graphEngine.prefetchNavGraph(table, indexUid, meta: meta);
 
       // Dedicated vector ceiling (vectorCacheBudgetRatio); caller maxBytes
-      // may only tighten — never expand past the compact cluster budget.
+      // may only tighten — never expand past the search-hot leaf budget.
       final defaultBudget = _defaultPrewarmBudget();
       final budget =
           maxBytes != null ? min(maxBytes, defaultBudget) : defaultBudget;
       if (budget <= 0) return 0;
 
-      final added = await _graphEngine.prewarmClusters(
+      final added = await _graphEngine.prewarmLeaves(
         table: table,
         indexUid: indexUid,
         meta: meta,
@@ -862,7 +872,7 @@ class VectorIndexManager {
 
       if (_dataStore.shouldAbortBackgroundScan) return added;
 
-      // JIT-compile scoring kernels and prime cluster routing on this isolate.
+      // JIT-compile scoring kernels and prime nav routing on this isolate.
       await _graphEngine.warmSearchPath(
         table: table,
         indexUid: indexUid,
@@ -907,9 +917,9 @@ class VectorIndexManager {
   }
 
   int _defaultPrewarmBudget() {
-    final clusterBudget = _resolveCompactVectorClusterBudget();
-    final used = _graphEngine.clusterCacheBytes;
-    return max(0, clusterBudget - used);
+    final leafBudget = _resolveVectorLeafCacheBudget();
+    final used = _graphEngine.btreeLeafCacheBytes;
+    return max(0, leafBudget - used);
   }
 
   NghIndexMeta _withPageSizes(NghIndexMeta meta) =>
@@ -927,7 +937,7 @@ class VectorIndexManager {
           TableContext table, IndexUid indexUid) =>
       _loadMeta(table, indexUid);
 
-  /// Rebuild a posting page image from an NGPK structure+PK redo payload.
+  /// Rebuild a leaf page image from an NGPK structure+PK redo payload.
   ///
   /// Loads live vectors from the table by primary key (file-backed),
   /// re-quantizes to SQ8, and returns a full TPG2 page suitable for partition
@@ -1041,7 +1051,7 @@ class VectorIndexManager {
     );
     final encrypt =
         _dataStore.config.encryptionConfig?.shouldEncryptVectorIndex ?? false;
-    return _partitionManager.buildPostingPageBytes(
+    return _partitionManager.buildLeafPageBytes(
       page: page,
       pageSize: pageSize,
       encrypt: encrypt,
@@ -1068,7 +1078,10 @@ class VectorIndexManager {
       if (diskLoad == null) return null;
 
       final reconciled = _reconcileLoadedNghMeta(diskLoad, indexUid);
-      if (reconciled != diskLoad) {
+      // Recovery replay holds partition file locks / torn page0; a side-effect
+      // persist here can nest page-redo writes into the same startup path.
+      if (reconciled != diskLoad &&
+          !_dataStore.parallelJournalManager.isInRecoveryMode) {
         _persistMeta(table, indexUid, reconciled);
       }
       _vectorCache.putMeta(table, indexUid, reconciled);
@@ -1097,12 +1110,17 @@ class VectorIndexManager {
   }
 
   Future<bool> _persistMeta(
-      TableContext table, IndexUid indexUid, NghIndexMeta meta) async {
+    TableContext table,
+    IndexUid indexUid,
+    NghIndexMeta meta, {
+    BatchContext? batchContext,
+  }) async {
     try {
       await _dataStore.treeMetaPageService.persistNghGlobalMeta(
         table: table,
         indexUid: indexUid,
         meta: meta,
+        batchContext: batchContext,
         flush: false,
       );
       return true;
@@ -1269,19 +1287,25 @@ class VectorIndexManager {
           result.dirtyNavPages.isNotEmpty ||
           result.dirtyPkmapPages.isNotEmpty ||
           result.freeLeafPages.isNotEmpty) {
-        meta = result.meta;
-        meta = await _partitionManager.writeChanges(
+        final compactedMeta = result.meta;
+        await _dataStore.parallelJournalManager.runWithPageRedoBatch(
           table: table,
-          indexUid: indexUid,
-          meta: meta,
-          dirtyLeafPages: result.dirtyLeafPages,
-          dirtyNavPages: result.dirtyNavPages,
-          dirtyPkmapPages: result.dirtyPkmapPages,
-          freeLeafPages: result.freeLeafPages,
-          deletedDelta: -result.compactedCount,
+          action: (ctx, {required bool ownedBatch}) async {
+            final next = await _partitionManager.writeChanges(
+              table: table,
+              indexUid: indexUid,
+              meta: compactedMeta,
+              dirtyLeafPages: result.dirtyLeafPages,
+              dirtyNavPages: result.dirtyNavPages,
+              dirtyPkmapPages: result.dirtyPkmapPages,
+              freeLeafPages: result.freeLeafPages,
+              deletedDelta: -result.compactedCount,
+              batchContext: ctx,
+            );
+            await _persistMeta(table, indexUid, next, batchContext: ctx);
+            _vectorCache.putMeta(table, indexUid, next);
+          },
         );
-        await _persistMeta(table, indexUid, meta);
-        _vectorCache.putMeta(table, indexUid, meta);
       }
     }
   }
@@ -1294,7 +1318,6 @@ class VectorIndexManager {
   int getCurrentCacheSize() {
     return _vectorCache.estimatedSizeBytes +
         _partitionManager.getCurrentPageCacheSize() +
-        _graphEngine.clusterCacheBytes +
         _graphEngine.btreeLeafCacheBytes +
         _graphEngine.navGraphCacheBytes +
         _legacySearch.clusterCacheBytes;
@@ -1309,11 +1332,6 @@ class VectorIndexManager {
     // ResourceManager-synced ceilings, or under critical memory pressure.
     final isCritical =
         _dataStore.resourceManager?.status == ResourceStatus.critical;
-    final clusterBytes = _graphEngine.clusterCacheBytes;
-    final clusterMax = _graphEngine.clusterCacheMaxBytes;
-    if (force || isCritical || clusterBytes > clusterMax) {
-      await _graphEngine.evictClusterCache(ratio: ratio);
-    }
     final legacyBytes = _legacySearch.clusterCacheBytes;
     final legacyMax = _legacySearch.clusterCacheMaxBytes;
     if (force || isCritical || legacyBytes > legacyMax) {
@@ -1375,7 +1393,7 @@ class VectorIndexManager {
     _pendingDeleteCache.clear();
   }
 
-  /// Re-encrypt NGH TPG2 pages for key migration (nav/pkmap/posting).
+  /// Re-encrypt NGH TPG2 pages for key migration (nav/pkmap/leaf).
   Future<void> rewriteEncryptedPages(
     TableContext table,
     IndexUid indexUid,
@@ -1508,8 +1526,9 @@ class VectorIndexManager {
   Future<NghIndexMeta> _runPkBackfill(
     TableContext table,
     IndexUid indexUid,
-    NghIndexMeta meta,
-  ) async {
+    NghIndexMeta meta, {
+    BatchContext? batchContext,
+  }) async {
     final pending = await _loadPendingDeletes(table, indexUid);
     final result = await _graphEngine.backfillPkLocator(
       table: table,
@@ -1527,6 +1546,7 @@ class VectorIndexManager {
         dirtyPkmapPages: result.dirtyPkmapPages,
         vectorsDelta: -result.tombstonedCount,
         deletedDelta: result.tombstonedCount,
+        batchContext: batchContext,
       );
     }
     if (next.hasPkLocator) {

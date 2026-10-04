@@ -183,7 +183,7 @@ final class TreeMetaPageService {
   }
 
   // ---------------------------------------------------------------------------
-  // Global meta -- NGH vector (stored on posting partition 0 page 0)
+  // Global meta -- NGH vector (stored on leaf partition 0 page 0)
   // ---------------------------------------------------------------------------
 
   Future<NghIndexMeta?> readNghGlobalMeta(

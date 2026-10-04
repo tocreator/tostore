@@ -417,10 +417,10 @@ class LegacyNghSearch {
       if (cId < 0 || cId >= navGraph.centroids.length) continue;
       expected.add(cId);
       final c = navGraph.centroids[cId];
-      if (c.postingPageNos.isNotEmpty) {
-        packedRefsToRead.addAll(c.postingPageNos);
-      } else if (c.headPostingPageNo > 0) {
-        chainHeads.add(c.headPostingPageNo);
+      if (c.leafPageNos.isNotEmpty) {
+        packedRefsToRead.addAll(c.leafPageNos);
+      } else if (c.headLeafPageNo > 0) {
+        chainHeads.add(c.headLeafPageNo);
       } else {
         clusterMap[cId] = <_NghCompactSlot>[];
       }
@@ -510,10 +510,10 @@ class LegacyNghSearch {
       }
 
       expected.add(cId);
-      if (c.postingPageNos.isNotEmpty) {
-        packedBatch.addAll(c.postingPageNos);
-      } else if (c.headPostingPageNo > 0) {
-        chainHeads.add(c.headPostingPageNo);
+      if (c.leafPageNos.isNotEmpty) {
+        packedBatch.addAll(c.leafPageNos);
+      } else if (c.headLeafPageNo > 0) {
+        chainHeads.add(c.headLeafPageNo);
       } else {
         clusterMap[cId] = <_NghCompactSlot>[];
       }

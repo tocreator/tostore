@@ -41,7 +41,7 @@ enum PageRedoTreeKind {
   table,
   indexTree,
 
-  /// NGH posting partition-0 page 0 (global [NghIndexMeta]).
+  /// NGH leaf partition-0 page 0 (global [NghIndexMeta]).
   ngh,
 
   /// NGH paged navigating-centroid pages (layoutVersion >= 2).
@@ -253,6 +253,16 @@ final class PageRedoLogCodec {
     return out;
   }
 
+  /// Invalid UTF-8 in a complete-looking record is treated as truncated
+  /// garbage so recovery never throws out of [collectApplicableRecords].
+  static String? _tryDecodeUtf8(Uint8List bytes, int pos, int len) {
+    try {
+      return utf8.decode(Uint8List.sublistView(bytes, pos, pos + len));
+    } on FormatException {
+      return null;
+    }
+  }
+
   static Uint8List encodeChunkBegin() =>
       _encodeMarker(_recTypeChunkBegin, PageRedoChunkBeginRecord.magic);
 
@@ -311,7 +321,12 @@ final class PageRedoLogCodec {
     }
 
     while (pos < bytes.length) {
-      final rec = decodeRecord(bytes, pos);
+      PageRedoLogRecord? rec;
+      try {
+        rec = decodeRecord(bytes, pos);
+      } catch (_) {
+        break;
+      }
       if (rec == null) break;
       if (rec.nextStart <= pos) break;
       pos = rec.nextStart;
@@ -393,18 +408,23 @@ final class PageRedoLogCodec {
     final tableLen = bd.getUint16(pos, Endian.little);
     pos += 2;
     if (pos + tableLen > end) return null;
-    final tableUid = TableUid(
-        utf8.decode(Uint8List.sublistView(bytes, pos, pos + tableLen)));
+    final tableStr = _tryDecodeUtf8(bytes, pos, tableLen);
+    if (tableStr == null) return null;
+    final tableUid = TableUid(tableStr);
     pos += tableLen;
 
     if (pos + 2 > end) return null;
     final indexLen = bd.getUint16(pos, Endian.little);
     pos += 2;
     if (pos + indexLen > end) return null;
-    final IndexUid? indexUid = indexLen == 0
-        ? null
-        : IndexUid(
-            utf8.decode(Uint8List.sublistView(bytes, pos, pos + indexLen)));
+    IndexUid? indexUid;
+    if (indexLen == 0) {
+      indexUid = null;
+    } else {
+      final indexStr = _tryDecodeUtf8(bytes, pos, indexLen);
+      if (indexStr == null) return null;
+      indexUid = IndexUid(indexStr);
+    }
     pos += indexLen;
 
     switch (recType) {
