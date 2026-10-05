@@ -77,6 +77,7 @@ class ResourceManager {
     MemoryQuotaType.tableData: null,
     MemoryQuotaType.queryResult: null,
     MemoryQuotaType.indexData: null,
+    MemoryQuotaType.vectorIndex: null,
     MemoryQuotaType.schema: null,
     MemoryQuotaType.meta: null,
   };
@@ -339,7 +340,9 @@ class ResourceManager {
           return;
         }
 
-        // Clean up cache in order of priority, from low priority to high priority
+        // Structured caches first. Vector ANN is last among data caches so a
+        // brief LOW during a large insert can recover after table/index flush
+        // without dropping search-hot leaves.
         await _evictCacheAndCheck(MemoryQuotaType.tableData);
         if (_status == ResourceStatus.normal) return;
 
@@ -347,6 +350,9 @@ class ResourceManager {
         if (_status == ResourceStatus.normal) return;
 
         await _evictCacheAndCheck(MemoryQuotaType.indexData);
+        if (_status == ResourceStatus.normal) return;
+
+        await _evictCacheAndCheck(MemoryQuotaType.vectorIndex);
       } catch (e) {
         if (e is DbClosedException) return;
         Logger.error('An error occurred during cache eviction process',
@@ -415,8 +421,10 @@ class ResourceManager {
           return _dataStore!.cacheManager.getCurrentQueryCacheSize();
         case MemoryQuotaType.indexData:
           return await _dataStore!.indexManager
-                  ?.getCurrentIndexDataCacheSize() ??
+                  ?.getCurrentBtreeIndexDataCacheSize() ??
               0;
+        case MemoryQuotaType.vectorIndex:
+          return _dataStore!.vectorIndexManager?.getCurrentCacheSize() ?? 0;
         case MemoryQuotaType.schema:
           return _dataStore!.cacheManager.getCurrentSchemaCacheSize();
         case MemoryQuotaType.meta:
@@ -547,20 +555,26 @@ class ResourceManager {
         await _getCurrentCacheSizeByType(MemoryQuotaType.tableData);
     final indexUsage =
         await _getCurrentCacheSizeByType(MemoryQuotaType.indexData);
+    final vectorUsage =
+        await _getCurrentCacheSizeByType(MemoryQuotaType.vectorIndex);
     final queryUsage =
         await _getCurrentCacheSizeByType(MemoryQuotaType.queryResult);
     final schemaUsage =
         await _getCurrentCacheSizeByType(MemoryQuotaType.schema);
     final metaUsage = await _getCurrentCacheSizeByType(MemoryQuotaType.meta);
 
-    final totalUsage =
-        tableDataUsage + indexUsage + queryUsage + schemaUsage + metaUsage;
+    final totalUsage = tableDataUsage +
+        indexUsage +
+        vectorUsage +
+        queryUsage +
+        schemaUsage +
+        metaUsage;
 
     final info = MemoryInfo(
       totalThresholdMB: _memoryThresholdInMB,
       tableDataCacheUsage: tableDataUsage,
       tableDataCacheLimit: _tableDataCacheSize,
-      indexCacheUsage: indexUsage,
+      indexCacheUsage: indexUsage + vectorUsage,
       indexCacheLimit: _indexCacheSize,
       queryCacheUsage: queryUsage,
       queryCacheLimit: _queryCacheSize,
@@ -585,6 +599,8 @@ class ResourceManager {
       case MemoryQuotaType.tableData:
         return (total * 0.5).toInt(); // 50% of protection budget
       case MemoryQuotaType.indexData:
+        return (total * 0.25).toInt(); // 25%
+      case MemoryQuotaType.vectorIndex:
         return (total * 0.25).toInt(); // 25%
       case MemoryQuotaType.queryResult:
         return (total * 0.125).toInt(); // 12.5%
@@ -634,6 +650,9 @@ enum MemoryQuotaType {
 
   /// Index data cache
   indexData,
+
+  /// Vector / NGH ANN caches (after structured table+index still LOW)
+  vectorIndex,
 
   /// Table structure cache (clean up last)
   schema,

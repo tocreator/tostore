@@ -39,7 +39,8 @@ import 'yield_controller.dart';
 //     wantLeaves: ~14 / 28 / 44 at depth 1 / 50 / 100; depth>100 continues the
 //     same 50→100 Δlists/Δdepth up to abs ≤256 (escape hatch). NEVER auto-raise
 //     scored leaves with N — that is the recall↔throughput cliff at 1e7+.
-//   - searchDepth has no hard max. Anchors: 1→91%, 50→95%, 98→98% (±5 / ±3 / ±5).
+//   - searchDepth has no hard max. Anchors: 1→91% (±5), 50→95% (±3 strict),
+//     100→98% (±5; 99% is not the interactive ceiling — too expensive).
 //     depth>100 keeps buying recall budget at the 50→100 rate until abs cap.
 //   - Engine never rewrites online monolithic nav_graph.ngh in place. New writes
 //     are paged Centroid nav tree + leaf partitions; migrate is one-shot from
@@ -436,26 +437,20 @@ class NghGraphEngine {
   /// Anchors (no hard max):
   /// depth 1 → 91.0% (±5pp)
   /// depth 50 → 95.0% (±3pp strict production baseline)
-  /// depth 98 → 98.0% (±5pp)
-  /// depth 100 → ~99.0%
-  /// depth >100 continues the 50→100 intent slope (~5pp per 50 depth)
-  /// until 100%, then stays saturated — probe budget still rises so large
-  /// corpora can catch the same knob feel.
+  /// depth 100 → 98.0% (±5pp; 99% is not the interactive ceiling)
+  /// depth >100 continues the 50→100 intent slope until 100%, then stays
+  /// saturated — probe budget still rises so large corpora can catch the
+  /// same knob feel.
   static double targetRecallFromDepth(int searchDepth) {
     if (searchDepth <= 1) return 0.91;
     if (searchDepth <= 50) {
       return 0.91 + (0.95 - 0.91) * ((searchDepth - 1) / 49.0);
     }
-    if (searchDepth <= 98) {
-      return 0.95 + (0.98 - 0.95) * ((searchDepth - 50) / 48.0);
-    }
     if (searchDepth <= 100) {
-      // 98 → 98%, 100 → 99%: short tip so depth 100 is distinctly above 98.
-      return 0.98 + (0.99 - 0.98) * ((searchDepth - 98) / 2.0);
+      return 0.95 + (0.98 - 0.95) * ((searchDepth - 50) / 50.0);
     }
-    // Same increment as 50→100 (~4pp / 50 depth), not the shallower 1→100 mean.
-    const ppPerDepth = (0.99 - 0.95) / 50.0;
-    return min(1.0, 0.99 + ppPerDepth * (searchDepth - 100));
+    const ppPerDepth = (0.98 - 0.95) / 50.0;
+    return min(1.0, 0.98 + ppPerDepth * (searchDepth - 100));
   }
 
   /// Interactive scoring cap: depth 1→14, 50→28, 100→44 typical lists.
@@ -819,6 +814,146 @@ class NghGraphEngine {
     return _navInternalGet(tableUid, indexUid, id, touch: touch);
   }
 
+  /// Beam from recall-intent [searchDepth], with a log10(N) floor for mid trees.
+  ///
+  /// depth≤1 → 2; ≤50 → 3; ≤100 → 4; then +1 per 50 depth.
+  /// N floor (knees 4.2 / 5.0 / 5.5) so mid hops at 30k–4M are not starved.
+  /// Depth-scaled cap: 5 / 6 / 8 at depth 1 / 50 / 100 so large-N does not
+  /// saturate every depth at 8 (searchDepth would collapse). Floor 2.
+  static int _navBeamWidth({
+    required int searchDepth,
+    required int wantLeaves,
+    required int totalVectors,
+  }) {
+    final depth = max(1, searchDepth);
+    final int fromDepth;
+    if (depth <= 1) {
+      fromDepth = 2;
+    } else if (depth <= 50) {
+      fromDepth = 3;
+    } else if (depth <= 100) {
+      fromDepth = 4;
+    } else {
+      fromDepth = 4 + ((depth - 100) ~/ 50);
+    }
+    final logN = log(max(1000, totalVectors).toDouble()) / ln10;
+    final nFloor = 2 +
+        max(0.0, (logN - 4.2) * 2.0).round() +
+        max(0.0, (logN - 5.0) * 1.5).round() +
+        max(0.0, (logN - 5.5) * 2.0).round();
+    final int depthCap;
+    if (depth <= 1) {
+      depthCap = 5;
+    } else if (depth <= 50) {
+      depthCap = 6;
+    } else {
+      depthCap = 8;
+    }
+    final fromLeaves = max(2, wantLeaves ~/ 3);
+    final target = max(fromDepth, max(nFloor, fromLeaves));
+    return max(2, min(depthCap, target));
+  }
+
+  void _forEachScoredNavEntry({
+    required NghNavBTreePage page,
+    required Float32x4 q0,
+    required Float32x4 q1,
+    required Float32x4 q2,
+    required Float32x4 q3,
+    required Float32x4 q4,
+    required Float32x4 q5,
+    required Float32x4 q6,
+    required Float32x4 q7,
+    required Float32x4 q8,
+    required Float32x4 q9,
+    required Float32x4 q10,
+    required Float32x4 q11,
+    required void Function(CentroidBranchEntry entry, double score) fn,
+  }) {
+    page.ensureSearch48Ready();
+    final packed = page.search48Simd!;
+    final entries = page.entries;
+    final n = entries.length;
+    for (int i = 0; i < n; i++) {
+      fn(
+        entries[i],
+        innerProduct48Reg(
+          q0,
+          q1,
+          q2,
+          q3,
+          q4,
+          q5,
+          q6,
+          q7,
+          q8,
+          q9,
+          q10,
+          q11,
+          packed,
+          i * 12,
+        ),
+      );
+    }
+  }
+
+  ({int bestIdx, double bestScore, int secondIdx, double secondScore})
+      _top2NavChildren(NghNavBTreePage page, Float32x4List qLowSimd) {
+    page.ensureSearch48Ready();
+    final packed = page.search48Simd!;
+    final n = page.entries.length;
+    var bestIdx = 0;
+    var secondIdx = -1;
+    var bestScore = -1e9;
+    var secondScore = -1e9;
+    for (int i = 0; i < n; i++) {
+      final s = innerProduct48(qLowSimd, packed, i * 12);
+      if (s > bestScore) {
+        secondScore = bestScore;
+        secondIdx = bestIdx;
+        bestScore = s;
+        bestIdx = i;
+      } else if (s > secondScore) {
+        secondScore = s;
+        secondIdx = i;
+      }
+    }
+    return (
+      bestIdx: bestIdx,
+      bestScore: bestScore,
+      secondIdx: secondIdx,
+      secondScore: secondScore,
+    );
+  }
+
+  void _bubbleNavSummaryUp({
+    required int rootId,
+    required NghPageId childId,
+    required NghNavBTreePage childPage,
+    required List<({NghPageId pageId, NghNavBTreePage page, int childIdx})>
+        path,
+    required void Function(NghPageId id, NghNavBTreePage page) mark,
+  }) {
+    if (path.isEmpty) return;
+    var cId = childId;
+    var cPage = childPage;
+    for (var i = path.length - 1; i >= 0; i--) {
+      final parent = path[i];
+      if (parent.childIdx < 0 ||
+          parent.childIdx >= parent.page.entries.length) {
+        break;
+      }
+      parent.page.entries[parent.childIdx] = _summaryEntryForChild(
+        childPageId: cId,
+        childPage: cPage,
+        fallbackCentroidId: rootId,
+      );
+      mark(parent.pageId, parent.page);
+      cId = parent.pageId;
+      cPage = parent.page;
+    }
+  }
+
   /// Score leaf candidates under one L0 root with bounded hop descent.
   ///
   /// Each hop scores ≤[NghNavBTreePage.maxEntriesPerPage] children of ONE page,
@@ -866,23 +1001,6 @@ class NghGraphEngine {
       leafHeap.push(entry, score);
     }
 
-    double scoreEntry(CentroidBranchEntry entry) => innerProduct48Reg(
-          q0,
-          q1,
-          q2,
-          q3,
-          q4,
-          q5,
-          q6,
-          q7,
-          q8,
-          q9,
-          q10,
-          q11,
-          entry.centroid48DSimd,
-          0,
-        );
-
     var frontier = <NghPageId>[head];
     var hop = 0;
     while (frontier.isNotEmpty) {
@@ -902,15 +1020,43 @@ class NghGraphEngine {
         final page = pageOf(pageId);
         if (page == null) return false;
         if (page.isLeafLevel) {
-          for (final e in page.entries) {
-            pushLeaf(e, scoreEntry(e));
-          }
+          _forEachScoredNavEntry(
+            page: page,
+            q0: q0,
+            q1: q1,
+            q2: q2,
+            q3: q3,
+            q4: q4,
+            q5: q5,
+            q6: q6,
+            q7: q7,
+            q8: q8,
+            q9: q9,
+            q10: q10,
+            q11: q11,
+            fn: pushLeaf,
+          );
         } else {
           sawMid = true;
-          for (final e in page.entries) {
-            if (e.childPageId.isNone) continue;
-            midScored.add((child: e.childPageId, score: scoreEntry(e)));
-          }
+          _forEachScoredNavEntry(
+            page: page,
+            q0: q0,
+            q1: q1,
+            q2: q2,
+            q3: q3,
+            q4: q4,
+            q5: q5,
+            q6: q6,
+            q7: q7,
+            q8: q8,
+            q9: q9,
+            q10: q10,
+            q11: q11,
+            fn: (e, s) {
+              if (e.childPageId.isNone) return;
+              midScored.add((child: e.childPageId, score: s));
+            },
+          );
         }
       }
       if (!sawMid) return true;
@@ -979,23 +1125,6 @@ class NghGraphEngine {
       leafHeap.push(entry, score);
     }
 
-    double scoreEntry(CentroidBranchEntry entry) => innerProduct48Reg(
-          q0,
-          q1,
-          q2,
-          q3,
-          q4,
-          q5,
-          q6,
-          q7,
-          q8,
-          q9,
-          q10,
-          q11,
-          entry.centroid48DSimd,
-          0,
-        );
-
     var frontier = <NghPageId>[head];
     var hop = 0;
     while (frontier.isNotEmpty) {
@@ -1015,15 +1144,43 @@ class NghGraphEngine {
         final page = await pageOf(pageId);
         if (page == null) continue;
         if (page.isLeafLevel) {
-          for (final e in page.entries) {
-            pushLeaf(e, scoreEntry(e));
-          }
+          _forEachScoredNavEntry(
+            page: page,
+            q0: q0,
+            q1: q1,
+            q2: q2,
+            q3: q3,
+            q4: q4,
+            q5: q5,
+            q6: q6,
+            q7: q7,
+            q8: q8,
+            q9: q9,
+            q10: q10,
+            q11: q11,
+            fn: pushLeaf,
+          );
         } else {
           sawMid = true;
-          for (final e in page.entries) {
-            if (e.childPageId.isNone) continue;
-            midScored.add((child: e.childPageId, score: scoreEntry(e)));
-          }
+          _forEachScoredNavEntry(
+            page: page,
+            q0: q0,
+            q1: q1,
+            q2: q2,
+            q3: q3,
+            q4: q4,
+            q5: q5,
+            q6: q6,
+            q7: q7,
+            q8: q8,
+            q9: q9,
+            q10: q10,
+            q11: q11,
+            fn: (e, s) {
+              if (e.childPageId.isNone) return;
+              midScored.add((child: e.childPageId, score: s));
+            },
+          );
         }
       }
       if (!sawMid) return;
@@ -1349,6 +1506,24 @@ class NghGraphEngine {
 
   String _cacheKey(TableUid tableUid, IndexUid indexUid) =>
       '${tableUid.value}/${indexUid.value}';
+
+  /// LRU-trim search-hot SQ8 leaves only.
+  ///
+  /// L0 (~48KB) lives in [CentroidBTreeState] and is never stored here.
+  /// Mid-1/Mid-2 nav pages share [_navInternalCache] with deeper hops — do
+  /// not LRU that cache on ordinary LOW (see [evictNavWorkingSet]).
+  Future<void> evictHotSearchCaches({double ratio = 0.3}) async {
+    await _btreeLeafCache.cleanup(removeRatio: ratio);
+  }
+
+  /// LRU-trim nav working set (deeper mid / leaf-nav, plus legacy graph blob).
+  ///
+  /// Call only under CRITICAL or when the nav budget is already exceeded.
+  /// Hot Mid-1/Mid-2 pages stay if they were touched recently (every descent).
+  Future<void> evictNavWorkingSet({double ratio = 0.3}) async {
+    await _navInternalCache.cleanup(removeRatio: ratio);
+    await _navGraphCache.cleanup(removeRatio: ratio);
+  }
 
   /// Evict a ratio of paged ANN leaf caches.
   Future<void> evictBTreeLeafCache({double ratio = 0.3}) async {
@@ -2111,7 +2286,7 @@ class NghGraphEngine {
   /// - Depth is recall-*intent*. Depth has **no hard max**: 1→100 is the primary
   ///   band; depth>100 continues the same 50→100 Δbudget/Δdepth so a user who
   ///   is short of recall at depth=100 can keep tuning (escape hatch).
-  /// - Anchors: 1→~91%, 50→~95%, 98→~98%, 100→~99% (best-effort) inside the
+  /// - Anchors: 1→~91% (±5), 50→~95% (±3), 100→~98% (±5) inside the
   ///   interactive leaf band. Hold large-N recall by precise L0/mid routing;
   ///   never by auto-growing wantLeaves with N (throughput cliff at 1e7+).
   /// - depth≤100: wantLeaves hard-capped by interactive band (~14 / 28 / 44).
@@ -2134,21 +2309,18 @@ class NghGraphEngine {
     final rawDepth = searchDepth ?? VectorIndexConfig.defaultSearchDepth;
     final depth = max(1, rawDepth);
 
-    // Post-rebuild cost reclaim (measured):
-    // - ≤50k: lean bases → ~92/95/99 @depth1/50/100, QPS strong — hold.
-    // - 1M after lean cut: ~89/91/96 with ~4× QPS vs fat budget, but short
-    //   of 91/95/98. Add continuous mid/high hedge after ~200k (5.3) / ~300k
-    //   (5.5) without touching ≤50k (knees inactive there).
-    // - depth100 ≈98% is the ceiling sweet spot; no depth150 chase.
+    // Post-rebuild: 10k stays lean (logN knees inactive). Mid-N (50k–1M)
+    // was below 91/95 anchors because dens-trim + late largeN hedge.
     // Continuous log10(N) only — no discrete N switches.
     final logN = log(max(1000, totalVectors).toDouble()) / ln10;
     final midN = max(0.0, logN - 5.3); // 0 @≤200k; ~0.7 @1M
     final largeN = max(0.0, logN - 5.5); // 0 @≤300k; ~0.5 @1M
-    final scaleLeaves = max(0.0, (logN - 4.2) * 1.0).round() +
+    final scaleLeaves = max(0.0, (logN - 4.2) * 1.5).round() +
         max(0.0, (logN - 5.0) * 1.2).round() +
         (midN * 2.0).round() +
-        (largeN * 2.0).round(); // 50k:~1; 1M:~2+1+1+1=5
+        (largeN * 2.0).round(); // 50k:~1; 1M:~3+1+1+1=6
     final scaleRoots = max(0.0, (logN - 4.2) * 1.5).round() +
+        max(0.0, (logN - 4.7) * 1.5).round() +
         max(0.0, (logN - 5.5) * 2.5).round() +
         (largeN * 2.0).round();
     final scaleSlots = max(0.0, (logN - 4.2) * 2.5).round() +
@@ -2184,7 +2356,8 @@ class NghGraphEngine {
       baseLeaves =
           (_maxInteractiveLeaves + leafSlope50 * (depth - 100)).round();
     }
-    var leaves = max(1, baseLeaves + scaleLeaves);
+    var leaves = max(1,
+        baseLeaves + (depth <= 1 ? (scaleLeaves * 0.7).round() : scaleLeaves));
 
     // 2. Root centroids probed (cheap 48-D; inventory-capped at search time)
     final int baseRoots;
@@ -2199,7 +2372,8 @@ class NghGraphEngine {
       final at100Roots = root100 + tipRoots100; // 13
       baseRoots = (at100Roots + rootSlope50 * (depth - 100)).round();
     }
-    var roots = max(1, baseRoots + scaleRoots);
+    var roots = max(
+        1, baseRoots + (depth <= 1 ? (scaleRoots * 0.75).round() : scaleRoots));
 
     //   Two-step bake ≈ original×0.5 kept R@10 at depth 1/50/98 identical to the
     //   pre-cut baseline on that corpus while roughly doubling QPS. Leaf/root
@@ -2229,7 +2403,8 @@ class NghGraphEngine {
       slots += 1 + ramp ~/ 4;
       if (depth >= 90) roots += 1;
       if (depth >= 90) {
-        final bridge = (midN * 4.0).round() + (largeN * 4.0).round(); // ~+5 @1M
+        final bridge =
+            max(0.0, (logN - 5.0) * 5.0).round() + (largeN * 4.0).round();
         leaves += bridge;
         slots += bridge * 2;
       }
@@ -2238,15 +2413,17 @@ class NghGraphEngine {
       roots += tip * 2;
       leaves += tip * 3;
       slots += tip * 6;
-      final bridge = (midN * 4.0).round() + (largeN * 4.0).round();
+      final bridge =
+          max(0.0, (logN - 5.0) * 5.0).round() + (largeN * 4.0).round();
       leaves += bridge;
       slots += bridge * 2;
     }
 
-    // Mid-band (≥40) large-N: depth50 at 1M was ~90.6% after lean cut —
-    // add a few leaves only where the 50-anchor lives (≤50k: largeN=0).
+    // Mid-band (≥40): 50-anchor valley was 100k–1M because largeN is 0
+    // until ~300k. Start a light continuous boost at ~50k (4.7).
     if (depth >= 40 && depth <= 70) {
-      final midBoost = (largeN * 6.0).round(); // +3 @1M
+      final midBoost =
+          max(0.0, (logN - 4.7) * 3.5).round() + (largeN * 4.0).round();
       leaves += midBoost;
       slots += midBoost * 2;
     }
@@ -2285,8 +2462,19 @@ class NghGraphEngine {
         .clamp(0.0, 1.0);
     if (dens > 1.25) {
       leaves = max(1, (leaves / dens).round());
+      // nBump follows depth so 1M+ does not pin depth1 near the depth100
+      // floor (searchDepth would collapse). 10k nBump=0 unchanged.
+      final nBump = max(0.0, (logN - 4.2) * 2.0).round() +
+          max(0.0, (logN - 5.0) * 2.0).round();
+      final nBumpScaled = depth <= 1
+          ? (nBump * 0.55).round()
+          : depth <= 50
+              ? (nBump * 0.65).round()
+              : nBump;
+      final d1Min = logN >= 4.8 ? 4 : 3;
       final minLeaves =
-          depth <= 1 ? 3 : (depth <= 50 ? 5 : (depth <= 98 ? 8 : 12));
+          (depth <= 1 ? d1Min : (depth <= 50 ? 5 : (depth <= 98 ? 8 : 12))) +
+              nBumpScaled;
       leaves = max(minLeaves, leaves);
       slots = max(topK, (slots / (0.95 + 0.15 * dens)).round());
     } else if (slotsPerPage < 8) {
@@ -2309,12 +2497,23 @@ class NghGraphEngine {
     final sparseFactor = slotsPerPage < 8
         ? min(8.0, refSlotsPerPage / spp) // was uncapped 20 → depth1 hit 256
         : 1.0;
-    final capRelief = (largeN * 4.0).round();
+    final capRelief = depth >= 80
+        ? max(0.0, (logN - 5.0) * 4.0).round() + (largeN * 4.0).round()
+        : depth >= 40
+            ? (largeN * 2.0).round()
+            : 0;
     final effectiveCap = min(
       _absScoredLeafCap,
       min(inventoryLeaves, (leafCap * sparseFactor).round() + capRelief),
     );
     leaves = min(leaves, effectiveCap);
+    // High-depth large-N: add after dens-trim so depth100 can sit ~2–3pp
+    // above depth50. Depth1 does not get this.
+    if (depth >= 90) {
+      final highN =
+          max(0.0, (logN - 5.0) * 5.0).round() + (largeN * 4.0).round();
+      leaves = min(effectiveCap, leaves + highN);
+    }
     if (tinyCover > 0) {
       final coverLeaves = max(
         1,
@@ -2634,20 +2833,13 @@ class NghGraphEngine {
       }
     }
 
-    // Modest beam. ≤~25k floor=2 (128D/10k nav cheap); ≥50k/1M widen for
-    // mid-band leaf fill. Continuous log10 — no discrete N switch.
+    // Beam follows searchDepth with a logN floor; depth-scaled cap 5/6/8.
     final maxLeavesToRead = min(plan.wantLeaves, scratch.pickedLeaves.length);
-    final logNBeam = log(max(1000, meta.totalVectors).toDouble()) / ln10;
-    final int beamExtra = max(0.0, (logNBeam - 4.0) * 1.0).round() +
-        max(0.0, (logNBeam - 5.3) * 2.0).round() +
-        max(0.0, (logNBeam - 5.5) * 2.0).round(); // 50k:0–1; 1M:~4
-    final int beamCap = min(18, 8 + beamExtra);
-    final int beamFloor = 2 +
-        max(0.0, (logNBeam - 4.2) * 1.5).round() +
-        max(0.0, (logNBeam - 5.0) * 1.5).round() +
-        max(0.0, (logNBeam - 5.5) * 2.0).round(); // 10k:2; 50k:~4; 1M:~7
-    final int beamWidth =
-        max(2, min(beamCap, max(beamFloor, plan.wantLeaves ~/ 3)));
+    final int beamWidth = _navBeamWidth(
+      searchDepth: max(1, searchDepth ?? VectorIndexConfig.defaultSearchDepth),
+      wantLeaves: plan.wantLeaves,
+      totalVectors: meta.totalVectors,
+    );
     scratch.branchHeap.reset(maxLeavesToRead);
     var l1AllCached = true;
     for (int r = 0; r < rootsToProbe; r++) {
@@ -3581,6 +3773,7 @@ class NghGraphEngine {
     final insertQLowSimd = Float32x4List.sublistView(insertQLow);
 
     void markInsertNav(NghPageId id, NghNavBTreePage page) {
+      page.invalidateSearch48Pack();
       insertNavPages[id] = page;
       dirtyNavBTreePages[NghPagePtr(
         NghDataCategory.nav,
@@ -3602,24 +3795,13 @@ class NghGraphEngine {
       required List<({NghPageId pageId, NghNavBTreePage page, int childIdx})>
           path,
     }) {
-      if (path.isEmpty) return;
-      var cId = childId;
-      var cPage = childPage;
-      for (var i = path.length - 1; i >= 0; i--) {
-        final parent = path[i];
-        if (parent.childIdx < 0 ||
-            parent.childIdx >= parent.page.entries.length) {
-          break;
-        }
-        parent.page.entries[parent.childIdx] = _summaryEntryForChild(
-          childPageId: cId,
-          childPage: cPage,
-          fallbackCentroidId: rootId,
-        );
-        markInsertNav(parent.pageId, parent.page);
-        cId = parent.pageId;
-        cPage = parent.page;
-      }
+      _bubbleNavSummaryUp(
+        rootId: rootId,
+        childId: childId,
+        childPage: childPage,
+        path: path,
+        mark: markInsertNav,
+      );
     }
 
     NghNavBTreePage? resolveInsertNav(NghPageId id) {
@@ -4055,14 +4237,17 @@ class NghGraphEngine {
         leafPageId.partitionNo,
         leafPageId.pageNo,
       );
-      if (leafPage != null) {
-        leafPage.ensureLow48Ready();
-      } else {
-        leafPage = NghLeafPage.empty(
-          centroidId: branchEntry.centroidId,
-          dimensions: currentMeta.dimensions,
-        );
+      if (leafPage == null) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.sysIoDataCorrupted,
+            message:
+                'NGH leaf p${leafPageId.partitionNo} pg${leafPageId.pageNo} '
+                'for "$indexUid" missing during insert; refusing empty overwrite.',
+          ),
+        ]);
       }
+      leafPage.ensureLow48Ready();
       insertLeaves[leafPageId] = leafPage;
       applySlotToLeaf(
         rootId,
@@ -4134,22 +4319,11 @@ class NghGraphEngine {
             )
           ]);
         }
-        var bestIdx = 0;
-        var secondIdx = -1;
-        var bestScore = -1e9;
-        var secondScore = -1e9;
-        for (int i = 0; i < cur.entries.length; i++) {
-          final s = innerProduct48(qLowSimd, cur.entries[i].centroid48DSimd, 0);
-          if (s > bestScore) {
-            secondScore = bestScore;
-            secondIdx = bestIdx;
-            bestScore = s;
-            bestIdx = i;
-          } else if (s > secondScore) {
-            secondScore = s;
-            secondIdx = i;
-          }
-        }
+        final top = _top2NavChildren(cur, qLowSimd);
+        final bestIdx = top.bestIdx;
+        final secondIdx = top.secondIdx;
+        final bestScore = top.bestScore;
+        final secondScore = top.secondScore;
         // Remember near-second mid child at this hop; overwritten each hop so
         // only the last mid (parent of leaf-level) dual-forks.
         dualMidChildId = null;
@@ -4220,16 +4394,13 @@ class NghGraphEngine {
       CentroidBranchEntry? secondEntry;
       var bestScore = -1e9;
       var secondScore = -1e9;
-      for (final entry in cur.entries) {
-        final s = innerProduct48(qLowSimd, entry.centroid48DSimd, 0);
-        if (s > bestScore) {
-          secondScore = bestScore;
-          secondEntry = bestEntry;
-          bestScore = s;
-          bestEntry = entry;
-        } else if (s > secondScore) {
-          secondScore = s;
-          secondEntry = entry;
+      final leafTop = _top2NavChildren(cur, qLowSimd);
+      if (cur.entries.isNotEmpty) {
+        bestEntry = cur.entries[leafTop.bestIdx];
+        bestScore = leafTop.bestScore;
+        if (leafTop.secondIdx >= 0) {
+          secondEntry = cur.entries[leafTop.secondIdx];
+          secondScore = leafTop.secondScore;
         }
       }
 
@@ -4261,24 +4432,15 @@ class NghGraphEngine {
       if (midAltId != null && midAltPath != null) {
         final alt = resolveInsertNav(midAltId);
         if (alt != null && alt.isLeafLevel && alt.entries.isNotEmpty) {
-          CentroidBranchEntry? altBest;
-          var altBestScore = -1e9;
-          for (final entry in alt.entries) {
-            final s = innerProduct48(qLowSimd, entry.centroid48DSimd, 0);
-            if (s > altBestScore) {
-              altBestScore = s;
-              altBest = entry;
-            }
-          }
-          if (altBest != null) {
-            insertSlotIntoLeafSync(
-              rootId,
-              altBest,
-              (pageId: midAltId, page: alt),
-              midAltPath,
-              newSlot,
-            );
-          }
+          final altTop = _top2NavChildren(alt, qLowSimd);
+          final altBest = alt.entries[altTop.bestIdx];
+          insertSlotIntoLeafSync(
+            rootId,
+            altBest,
+            (pageId: midAltId, page: alt),
+            midAltPath,
+            newSlot,
+          );
         }
       }
       return true;
@@ -4341,22 +4503,11 @@ class NghGraphEngine {
             )
           ]);
         }
-        var bestIdx = 0;
-        var secondIdx = -1;
-        var bestScore = -1e9;
-        var secondScore = -1e9;
-        for (int i = 0; i < cur.entries.length; i++) {
-          final s = innerProduct48(qLowSimd, cur.entries[i].centroid48DSimd, 0);
-          if (s > bestScore) {
-            secondScore = bestScore;
-            secondIdx = bestIdx;
-            bestScore = s;
-            bestIdx = i;
-          } else if (s > secondScore) {
-            secondScore = s;
-            secondIdx = i;
-          }
-        }
+        final top = _top2NavChildren(cur, qLowSimd);
+        final bestIdx = top.bestIdx;
+        final secondIdx = top.secondIdx;
+        final bestScore = top.bestScore;
+        final secondScore = top.secondScore;
         dualMidChildId = null;
         dualMidPath = null;
         if (secondIdx >= 0 && secondScore >= bestScore * _boundaryDualRatio) {
@@ -4424,16 +4575,13 @@ class NghGraphEngine {
       CentroidBranchEntry? secondEntry;
       var bestScore = -1e9;
       var secondScore = -1e9;
-      for (final entry in cur.entries) {
-        final s = innerProduct48(qLowSimd, entry.centroid48DSimd, 0);
-        if (s > bestScore) {
-          secondScore = bestScore;
-          secondEntry = bestEntry;
-          bestScore = s;
-          bestEntry = entry;
-        } else if (s > secondScore) {
-          secondScore = s;
-          secondEntry = entry;
+      final leafTop = _top2NavChildren(cur, qLowSimd);
+      if (cur.entries.isNotEmpty) {
+        bestEntry = cur.entries[leafTop.bestIdx];
+        bestScore = leafTop.bestScore;
+        if (leafTop.secondIdx >= 0) {
+          secondEntry = cur.entries[leafTop.secondIdx];
+          secondScore = leafTop.secondScore;
         }
       }
 
@@ -4461,24 +4609,14 @@ class NghGraphEngine {
       if (midAltId != null && midAltPath != null) {
         final alt = resolveInsertNav(midAltId) ?? await loadInsertNav(midAltId);
         if (alt.isLeafLevel && alt.entries.isNotEmpty) {
-          CentroidBranchEntry? altBest;
-          var altBestScore = -1e9;
-          for (final entry in alt.entries) {
-            final s = innerProduct48(qLowSimd, entry.centroid48DSimd, 0);
-            if (s > altBestScore) {
-              altBestScore = s;
-              altBest = entry;
-            }
-          }
-          if (altBest != null) {
-            await insertSlotIntoLeaf(
-              rootId,
-              altBest,
-              (pageId: midAltId, page: alt),
-              midAltPath,
-              newSlot,
-            );
-          }
+          final altTop = _top2NavChildren(alt, qLowSimd);
+          await insertSlotIntoLeaf(
+            rootId,
+            alt.entries[altTop.bestIdx],
+            (pageId: midAltId, page: alt),
+            midAltPath,
+            newSlot,
+          );
         }
       }
     }
@@ -4494,15 +4632,7 @@ class NghGraphEngine {
         if (++hop > NghNavBTreePage.maxTreeHops || cur.entries.isEmpty) {
           return null;
         }
-        var bestIdx = 0;
-        var bestScore = -1e9;
-        for (int i = 0; i < cur.entries.length; i++) {
-          final s = innerProduct48(qLowSimd, cur.entries[i].centroid48DSimd, 0);
-          if (s > bestScore) {
-            bestScore = s;
-            bestIdx = i;
-          }
-        }
+        final bestIdx = _top2NavChildren(cur, qLowSimd).bestIdx;
         final childId = cur.entries[bestIdx].childPageId;
         if (childId.isNone) return null;
         curId = childId;
@@ -4511,15 +4641,7 @@ class NghGraphEngine {
         cur = next;
       }
       if (cur.entries.isEmpty) return null;
-      var best = cur.entries.first;
-      var bestScore = -1e9;
-      for (final e in cur.entries) {
-        final s = innerProduct48(qLowSimd, e.centroid48DSimd, 0);
-        if (s > bestScore) {
-          bestScore = s;
-          best = e;
-        }
-      }
+      final best = cur.entries[_top2NavChildren(cur, qLowSimd).bestIdx];
       return best.leafPageId;
     }
 
@@ -5140,6 +5262,319 @@ class NghGraphEngine {
 
   Uint8List _pkMapKey(String pk) => MemComparableKey.encodeTextLex(pk);
 
+  Float32List _normalize48Mean(Float32List v) {
+    var nSq = 0.0;
+    for (int d = 0; d < 48; d++) {
+      nSq += v[d] * v[d];
+    }
+    if (nSq <= 1e-12) return v;
+    final inv = 1.0 / sqrt(nSq);
+    for (int d = 0; d < 48; d++) {
+      v[d] *= inv;
+    }
+    return v;
+  }
+
+  ({NghPagePtr ptr, NghNavRootPage page}) _encodeNavRootPage(
+    CentroidBTreeState state,
+    int dimensions,
+  ) {
+    final rootsList = <({
+      int rootId,
+      NghPageId firstInternalPage,
+      Float32List centroid48D
+    })>[];
+    for (int r = 0; r < state.numRootCentroids; r++) {
+      final c48 = Float32List(48);
+      for (int d = 0; d < 48; d++) {
+        c48[d] = state.rootCentroids48Flat[r * 48 + d];
+      }
+      rootsList.add((
+        rootId: r,
+        firstInternalPage: state.firstInternalByRoot[r],
+        centroid48D: c48,
+      ));
+    }
+    return (
+      ptr: NghPagePtr(
+        NghDataCategory.nav,
+        state.rootPageId.partitionNo,
+        state.rootPageId.pageNo,
+      ),
+      page: NghNavRootPage(
+        lowDim: 48,
+        fullDim: dimensions,
+        nextCentroidId: state.nextCentroidId,
+        roots: rootsList,
+      ),
+    );
+  }
+
+  Future<
+      ({
+        int rootId,
+        NghPageId navId,
+        NghNavBTreePage navPage,
+        int entryIdx,
+        List<({NghPageId pageId, NghNavBTreePage page, int childIdx})> path,
+      })?> _locateLeafNavEntry({
+    required TableContext table,
+    required IndexUid indexUid,
+    required NghIndexMeta meta,
+    required CentroidBTreeState state,
+    required NghPageId leafId,
+    required Float32x4List leafMeanSimd,
+    required Map<NghPagePtr, NghNavBTreePage> dirtyNav,
+  }) async {
+    Future<NghNavBTreePage?> load(NghPageId id, {bool touch = true}) async {
+      if (id.isNone) return null;
+      final hit = _resolveNavInternalPage(
+        tableUid: table.tableUid,
+        indexUid: indexUid,
+        id: id,
+        dirtyOverlay: dirtyNav,
+        touch: touch,
+      );
+      if (hit != null) return hit;
+      final loaded = await _partitionManager.readNavBTreePage(
+        table,
+        indexUid,
+        id,
+        meta: meta,
+      );
+      if (loaded == null) return null;
+      _navInternalPut(table.tableUid, indexUid, id, loaded);
+      return loaded;
+    }
+
+    ({
+      int rootId,
+      NghPageId navId,
+      NghNavBTreePage navPage,
+      int entryIdx,
+      List<({NghPageId pageId, NghNavBTreePage page, int childIdx})> path,
+    })? scanLeafLevel(
+      int rootId,
+      NghPageId id,
+      NghNavBTreePage page,
+      List<({NghPageId pageId, NghNavBTreePage page, int childIdx})> path,
+    ) {
+      final key = leafId.cacheKey;
+      for (int i = 0; i < page.entries.length; i++) {
+        if (page.entries[i].childPageId.cacheKey == key) {
+          return (
+            rootId: rootId,
+            navId: id,
+            navPage: page,
+            entryIdx: i,
+            path: path,
+          );
+        }
+      }
+      return null;
+    }
+
+    ({
+      int rootId,
+      NghPageId navId,
+      NghNavBTreePage navPage,
+      int entryIdx,
+      List<({NghPageId pageId, NghNavBTreePage page, int childIdx})> path,
+    })? walkCached(
+      int rootId,
+      NghPageId id,
+      List<({NghPageId pageId, NghNavBTreePage page, int childIdx})> path,
+      int hop,
+    ) {
+      if (hop > NghNavBTreePage.maxTreeHops) return null;
+      final page = _resolveNavInternalPage(
+        tableUid: table.tableUid,
+        indexUid: indexUid,
+        id: id,
+        dirtyOverlay: dirtyNav,
+        touch: false,
+      );
+      if (page == null) return null;
+      if (page.isLeafLevel) {
+        return scanLeafLevel(rootId, id, page, path);
+      }
+      for (int i = 0; i < page.entries.length; i++) {
+        final child = page.entries[i].childPageId;
+        if (child.isNone) continue;
+        final hit = walkCached(
+          rootId,
+          child,
+          [...path, (pageId: id, page: page, childIdx: i)],
+          hop + 1,
+        );
+        if (hit != null) return hit;
+      }
+      return null;
+    }
+
+    for (int r = 0; r < state.numRootCentroids; r++) {
+      final head = state.firstInternalByRoot[r];
+      if (head.isNone) continue;
+      final hit = walkCached(
+        r,
+        head,
+        <({NghPageId pageId, NghNavBTreePage page, int childIdx})>[],
+        0,
+      );
+      if (hit != null) return hit;
+    }
+
+    final nRoots = state.numRootCentroids;
+    final order = List<int>.generate(nRoots, (i) => i);
+    final scores = Float64List(nRoots);
+    for (int r = 0; r < nRoots; r++) {
+      scores[r] = innerProduct48(
+        leafMeanSimd,
+        state.rootCentroids48Simd,
+        r * 12,
+      );
+    }
+    order.sort((a, b) => scores[b].compareTo(scores[a]));
+
+    for (final rootId in order) {
+      var curId = state.firstInternalByRoot[rootId];
+      if (curId.isNone) continue;
+      final first = await load(curId);
+      if (first == null) continue;
+      var cur = first;
+      final path = <({NghPageId pageId, NghNavBTreePage page, int childIdx})>[];
+      var hop = 0;
+      var missed = false;
+      while (!cur.isLeafLevel) {
+        if (++hop > NghNavBTreePage.maxTreeHops || cur.entries.isEmpty) {
+          missed = true;
+          break;
+        }
+        final bestIdx = _top2NavChildren(cur, leafMeanSimd).bestIdx;
+        final childId = cur.entries[bestIdx].childPageId;
+        if (childId.isNone) {
+          missed = true;
+          break;
+        }
+        path.add((pageId: curId, page: cur, childIdx: bestIdx));
+        curId = childId;
+        final next = await load(curId);
+        if (next == null) {
+          missed = true;
+          break;
+        }
+        cur = next;
+      }
+      if (missed) continue;
+      final direct = scanLeafLevel(rootId, curId, cur, path);
+      if (direct != null) return direct;
+      if (path.isEmpty) continue;
+      final parent = path.last;
+      for (int i = 0; i < parent.page.entries.length; i++) {
+        if (i == parent.childIdx) continue;
+        final sibId = parent.page.entries[i].childPageId;
+        if (sibId.isNone) continue;
+        final sib = await load(sibId);
+        if (sib == null || !sib.isLeafLevel) continue;
+        final sibPath = [
+          ...path.sublist(0, path.length - 1),
+          (pageId: parent.pageId, page: parent.page, childIdx: i),
+        ];
+        final sibHit = scanLeafLevel(rootId, sibId, sib, sibPath);
+        if (sibHit != null) return sibHit;
+      }
+    }
+    return null;
+  }
+
+  Future<
+      ({
+        Map<NghPagePtr, NghNavBTreePage> dirtyNav,
+        ({NghPagePtr ptr, NghNavRootPage page})? dirtyRoot,
+      })> _refreshNavAfterLeafDeletes({
+    required TableContext table,
+    required IndexUid indexUid,
+    required NghIndexMeta meta,
+    required Map<NghPagePtr, NghLeafPage> dirtyLeaves,
+  }) async {
+    final dirtyNav = <NghPagePtr, NghNavBTreePage>{};
+    if (dirtyLeaves.isEmpty) {
+      return (dirtyNav: dirtyNav, dirtyRoot: null);
+    }
+    final state = await _getOrLoadBTreeState(table, indexUid, meta);
+    if (state == null || state.numRootCentroids <= 0) {
+      return (dirtyNav: dirtyNav, dirtyRoot: null);
+    }
+
+    void mark(NghPageId id, NghNavBTreePage page) {
+      page.invalidateSearch48Pack();
+      dirtyNav[NghPagePtr(
+        NghDataCategory.nav,
+        id.partitionNo,
+        id.pageNo,
+      )] = page;
+      _navInternalPut(table.tableUid, indexUid, id, page);
+    }
+
+    final touchedRoots = <int>{};
+    for (final e in dirtyLeaves.entries) {
+      final ptr = e.key;
+      if (ptr.category != NghDataCategory.leaf) continue;
+      final leaf = e.value;
+      final leafId = NghPageId(ptr.partitionNo, ptr.pageNo);
+      final mean = leaf.normalizedMean48();
+      final meanSimd = Float32x4List.sublistView(mean);
+      final loc = await _locateLeafNavEntry(
+        table: table,
+        indexUid: indexUid,
+        meta: meta,
+        state: state,
+        leafId: leafId,
+        leafMeanSimd: meanSimd,
+        dirtyNav: dirtyNav,
+      );
+      if (loc == null) continue;
+      final entry = loc.navPage.entries[loc.entryIdx];
+      entry.centroid48D = mean;
+      entry.centroid48DSimd = Float32x4List.sublistView(mean);
+      entry.childWeight = leaf.liveSlotCount;
+      mark(loc.navId, loc.navPage);
+      _bubbleNavSummaryUp(
+        rootId: loc.rootId,
+        childId: loc.navId,
+        childPage: loc.navPage,
+        path: loc.path,
+        mark: mark,
+      );
+      touchedRoots.add(loc.rootId);
+    }
+
+    for (final r in touchedRoots) {
+      if (r < 0 || r >= state.numRootCentroids) continue;
+      final headId = state.firstInternalByRoot[r];
+      if (headId.isNone) continue;
+      final page = _resolveNavInternalPage(
+        tableUid: table.tableUid,
+        indexUid: indexUid,
+        id: headId,
+        dirtyOverlay: dirtyNav,
+        touch: true,
+      );
+      if (page == null || page.entries.isEmpty) continue;
+      state.setRootCentroid48(
+        r,
+        _normalize48Mean(_mean48BranchEntries(page.entries)),
+      );
+    }
+
+    ({NghPagePtr ptr, NghNavRootPage page})? dirtyRoot;
+    if (state.rootTableNeedsPersist) {
+      state.rootTableNeedsPersist = false;
+      dirtyRoot = _encodeNavRootPage(state, meta.dimensions);
+    }
+    return (dirtyNav: dirtyNav, dirtyRoot: dirtyRoot);
+  }
+
   // =====================================================================
   // Deletion -- Tombstone in Leaf Pages
   // =====================================================================
@@ -5235,10 +5670,19 @@ class NghGraphEngine {
 
     currentMeta = pkBatch.meta;
 
+    final navRefresh = await _refreshNavAfterLeafDeletes(
+      table: table,
+      indexUid: indexUid,
+      meta: currentMeta,
+      dirtyLeaves: dirtyLeaves,
+    );
+
     return NghDeleteResult(
       meta: currentMeta,
       dirtyLeafPages: dirtyLeaves,
       dirtyPkmapPages: pkBatch.dirty,
+      dirtyNavBTreePages: navRefresh.dirtyNav,
+      dirtyNavRootPage: navRefresh.dirtyRoot,
       deletedCount: deleted,
       unresolvedPks: unresolved,
     );
@@ -5609,10 +6053,19 @@ class NghGraphEngine {
       hasPkLocator: done ? true : currentMeta.hasPkLocator,
     );
 
+    final navRefresh = await _refreshNavAfterLeafDeletes(
+      table: table,
+      indexUid: indexUid,
+      meta: currentMeta,
+      dirtyLeaves: dirtyLeaves,
+    );
+
     return NghInsertResult(
       meta: currentMeta,
       dirtyLeafPages: dirtyLeaves,
       dirtyPkmapPages: pkBatch.dirty,
+      dirtyNavBTreePages: navRefresh.dirtyNav,
+      dirtyNavRootPage: navRefresh.dirtyRoot,
       insertedCount: 0,
       tombstonedCount: tombstoned,
     );

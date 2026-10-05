@@ -1234,11 +1234,10 @@ Intent anchors (best-effort Recall@K, not a hard guarantee):
 | :--- | :--- | :--- |
 | `1` | ~91% | ±5 percentage points |
 | `50` (default) | ~95% | ±3 percentage points (strict) |
-| `98` | ~98% | ±5 percentage points |
-| `100` | ~99% | ±5 percentage points |
-| `>100` | continues above ~99% toward saturation | **same Δbudget as 50→100** (~3–5pp intent per +50 depth, until saturation) |
+| `100` | ~98% | ±5 percentage points (99% is not the interactive ceiling) |
+| `>100` | continues above ~98% toward saturation | **same average Δbudget/Δdepth as the 50→100 band** (not steeper) |
 
-Larger depth typically raises both recall and latency. Prefer the anchors above. Raise past `100` when a large corpus still undershoots — each extra 50 depth should feel like 50→100, not a plateau. ANN remains approximate — not a guaranteed recall@K.
+Larger depth typically raises both recall and latency. Prefer the anchors above; raise past `100` only when a large corpus still needs more recall. ANN remains approximate — not a guaranteed recall@K.
 
 ## Rules
 

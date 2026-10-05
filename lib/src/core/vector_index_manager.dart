@@ -1306,23 +1306,33 @@ class VectorIndexManager {
   }
 
   /// Evict caches under memory pressure.
+  ///
+  /// I/O-fill / meta layers always LRU-trim. Search-hot SQ8 leaves also
+  /// trim when still LOW after structured eviction. Nav internals (Mid-1/2
+  /// share that cache) wait for CRITICAL or an over-budget nav working set.
   Future<void> evictCache({double ratio = 0.3, bool force = false}) async {
     await _vectorCache.evict(ratio: ratio);
     await _partitionManager.evictPageCache(ratio: ratio);
 
-    // Protect dedicated vector hot caches: only evict when over their own
-    // ResourceManager-synced ceilings, or under critical memory pressure.
-    final isCritical =
-        _dataStore.resourceManager?.status == ResourceStatus.critical;
+    final status = _dataStore.resourceManager?.status;
+    final stillLow = status != null && status != ResourceStatus.normal;
+    final isCritical = status == ResourceStatus.critical;
     final legacyBytes = _legacySearch.clusterCacheBytes;
     final legacyMax = _legacySearch.clusterCacheMaxBytes;
-    if (force || isCritical || legacyBytes > legacyMax) {
+    if (force || isCritical || stillLow || legacyBytes > legacyMax) {
       _legacySearch.evictClusterCache(ratio: ratio);
     }
     final leafBytes = _graphEngine.btreeLeafCacheBytes;
     final leafMax = _graphEngine.btreeLeafCacheMaxBytes;
-    if (force || isCritical || leafBytes > leafMax) {
-      await _graphEngine.evictBTreeLeafCache(ratio: ratio);
+    if (force || isCritical || stillLow || leafBytes > leafMax) {
+      await _graphEngine.evictHotSearchCaches(ratio: ratio);
+    }
+    final navBytes =
+        _graphEngine.navInternalCacheBytes + _graphEngine.navGraphCacheBytes;
+    final navMax = _graphEngine.navInternalCacheMaxBytes +
+        _graphEngine.navGraphCacheMaxBytes;
+    if (force || isCritical || navBytes > navMax) {
+      await _graphEngine.evictNavWorkingSet(ratio: ratio);
     }
   }
 
@@ -1519,13 +1529,18 @@ class VectorIndexManager {
       pendingDeletePks: pending,
     );
     var next = result.meta;
-    if (result.dirtyLeafPages.isNotEmpty || result.dirtyPkmapPages.isNotEmpty) {
+    if (result.dirtyLeafPages.isNotEmpty ||
+        result.dirtyPkmapPages.isNotEmpty ||
+        result.dirtyNavBTreePages.isNotEmpty ||
+        result.dirtyNavRootPage != null) {
       next = await _partitionManager.writeChanges(
         table: table,
         indexUid: indexUid,
         meta: next,
         dirtyLeafPages: result.dirtyLeafPages,
         dirtyPkmapPages: result.dirtyPkmapPages,
+        dirtyNavBTreePages: result.dirtyNavBTreePages,
+        dirtyNavRootPage: result.dirtyNavRootPage,
         vectorsDelta: -result.tombstonedCount,
         deletedDelta: result.tombstonedCount,
         batchContext: batchContext,

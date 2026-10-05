@@ -162,6 +162,10 @@ final class NghPartitionManager {
   int _nghMaxFileSize(int pageSize) =>
       max(_dataStore.config.maxPartitionFileSize, pageSize * 2);
 
+  /// One shared/exclusive storage lock covers this much I/O, then yields so
+  /// the other side of a leaf-file RMW can acquire. Not a whole-file slurp.
+  static const int _maxPartitionIoChunkBytes = 1024 * 1024;
+
   DataStoreConfig get engineConfig => _dataStore.config;
 
   /// 8MB payload covers a ~1M-key locator tree and a hot slice at 10M+.
@@ -306,8 +310,11 @@ final class NghPartitionManager {
         .getNghLeafPartitionPathByContext(table, indexUid, partitionNo);
     try {
       final pageSize = pageSizeFor(NghDataCategory.leaf, meta);
-      final raw = await _dataStore.storage
-          .readAsBytesAt(path, pageNo * pageSize, length: pageSize);
+      final raw = await _retryLockTimeout(
+        () => _dataStore.storage
+            .readAsBytesAt(path, pageNo * pageSize, length: pageSize),
+        label: 'readLeafPage p$partitionNo pg$pageNo',
+      );
       if (raw.isEmpty) return null;
 
       final parsed = BTreePageIO.parsePageBytes(raw);
@@ -319,6 +326,7 @@ final class NghPartitionManager {
       return page;
     } catch (e) {
       if (e is DbClosedException) rethrow;
+      if (e is DbException) rethrow;
       Logger.warn(
         'NGH leaf page corrupted or torn at partition $partitionNo, page $pageNo for index "$indexUid". Gracefully degrading to null.',
         rawError: e,
@@ -374,34 +382,45 @@ final class NghPartitionManager {
       final partResults = <({int packedRef, NghLeafPage page})>[];
       final path = _dataStore.pathManager
           .getNghLeafPartitionPathByContext(table, indexUid, part);
-      final ranges = <ByteReadRange>[
-        for (final packed in missingPacked)
-          ByteReadRange(
-            offset: NghPagePtr.unpackRef(packed).$2 * pageSize,
-            length: pageSize,
-          ),
-      ];
+      final chunkPages = max(1, _maxPartitionIoChunkBytes ~/ max(pageSize, 1));
 
-      final rawBlocks =
-          await _dataStore.storage.readManyAsBytesAt(path, ranges);
+      for (int start = 0; start < missingPacked.length; start += chunkPages) {
+        final end = min(start + chunkPages, missingPacked.length);
+        final slice = missingPacked.sublist(start, end);
+        final ranges = <ByteReadRange>[
+          for (final packed in slice)
+            ByteReadRange(
+              offset: NghPagePtr.unpackRef(packed).$2 * pageSize,
+              length: pageSize,
+            ),
+        ];
 
-      for (int i = 0; i < missingPacked.length; i++) {
-        final packed = missingPacked[i];
-        final pageNo = NghPagePtr.unpackRef(packed).$2;
-        final raw = (i < rawBlocks.length) ? rawBlocks[i] : Uint8List(0);
-        if (raw.isEmpty) continue;
-        try {
-          final parsed = BTreePageIO.parsePageBytes(raw);
-          final page = NghLeafPage.tryDecodePayload(
-              _decodePayload(parsed.encodedPayload));
-          if (page != null) {
-            if (populatePageCache) {
-              _leafPageCache.putPoint4(tableUid, indexUid, part, pageNo, page);
+        final rawBlocks = await _retryLockTimeout(
+          () => _dataStore.storage.readManyAsBytesAt(path, ranges),
+          label: 'readLeafPagesBatch p$part',
+        );
+
+        for (int i = 0; i < slice.length; i++) {
+          final packed = slice[i];
+          final pageNo = NghPagePtr.unpackRef(packed).$2;
+          final raw = (i < rawBlocks.length) ? rawBlocks[i] : Uint8List(0);
+          if (raw.isEmpty) continue;
+          try {
+            final parsed = BTreePageIO.parsePageBytes(raw);
+            final page = NghLeafPage.tryDecodePayload(
+                _decodePayload(parsed.encodedPayload));
+            if (page != null) {
+              if (populatePageCache) {
+                _leafPageCache.putPoint4(
+                    tableUid, indexUid, part, pageNo, page);
+              }
+              localCache?[packed] = page;
+              partResults.add((packedRef: packed, page: page));
             }
-            localCache?[packed] = page;
-            partResults.add((packedRef: packed, page: page));
+          } catch (e) {
+            if (e is DbClosedException || e is DbException) rethrow;
           }
-        } catch (_) {}
+        }
       }
       return partResults;
     }
@@ -421,6 +440,8 @@ final class NghPartitionManager {
           List<({int packedRef, NghLeafPage page})>>(
         tasks,
         concurrency: min(5, tasks.length),
+        timeout: ParallelProcessor.noTimeout,
+        continueOnError: false,
         label: 'readLeafPagesBatch',
       );
       for (final partList in partLists) {
@@ -1441,8 +1462,7 @@ final class NghPartitionManager {
             ByteWrite(offset: off, bytes: e.value[off]!),
         ];
         tasks.add(() async {
-          await _dataStore.storage
-              .writeManyAsBytesAt(path, writes, flush: false);
+          await _writeManyChunked(path, writes);
         });
       }
 
@@ -1471,6 +1491,7 @@ final class NghPartitionManager {
           await ParallelProcessor.execute<void>(
             tasks,
             concurrency: min(tasks.length, max(1, lease.tokens)),
+            timeout: ParallelProcessor.noTimeout,
             label: 'NghPartitionManager.writeChanges.flush',
             continueOnError: false,
           );
@@ -1485,6 +1506,44 @@ final class NghPartitionManager {
     }
 
     return updatedMeta;
+  }
+
+  Future<void> _writeManyChunked(String path, List<ByteWrite> writes) async {
+    if (writes.isEmpty) return;
+    var i = 0;
+    while (i < writes.length) {
+      var nbytes = 0;
+      var j = i;
+      while (j < writes.length) {
+        final add = writes[j].bytes.length;
+        if (j > i && nbytes + add > _maxPartitionIoChunkBytes) break;
+        nbytes += add;
+        j++;
+      }
+      final slice = writes.sublist(i, j);
+      await _retryLockTimeout(
+        () => _dataStore.storage.writeManyAsBytesAt(path, slice, flush: false),
+        label: 'writeManyChunked',
+      );
+      i = j;
+    }
+  }
+
+  /// Lock timeout already waited ~5 minutes; one short retry catches the
+  /// writer-just-released race. A second failure is thrown for journal requeue.
+  Future<T> _retryLockTimeout<T>(
+    Future<T> Function() op, {
+    required String label,
+  }) async {
+    try {
+      return await op();
+    } on DbException catch (e) {
+      if (!DbException.isLockTimeout(e)) rethrow;
+      Logger.warn('NGH $label lock timeout; retrying once after 200ms',
+          rawError: e);
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      return await op();
+    }
   }
 
   /// Delete leftover `nav_graph.ngh` after a successful paged migrate.

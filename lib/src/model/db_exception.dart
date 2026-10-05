@@ -44,6 +44,14 @@ class DbException implements Exception {
   /// True when [e] is a close / switchSpace cancellation, not a data error.
   static bool isClosed(Object? e) => e is DbClosedException;
 
+  /// True when lock wait or parallel-task timeout already expired.
+  static bool isLockTimeout(Object? e) {
+    if (e is! DbException) return false;
+    return e.statuses.any((s) =>
+        s.type == ResultType.sysTimeoutLockAcquisition ||
+        s.type == ResultType.sysTimeout);
+  }
+
   /// Force wrap any exception into a new [DbException] with the specified [forceType].
   ///
   /// - [DbClosedException] is returned as-is so close/switchSpace races are not

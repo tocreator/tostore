@@ -539,6 +539,9 @@ final class NghLeafPage {
     return n;
   }
 
+  /// Live (non-tombstone) slot count.
+  int get liveSlotCount => _liveSlotCount;
+
   /// L2-normalized arithmetic mean of **live** slot low48 (tombstones excluded).
   Float32List normalizedMean48() {
     final count = _liveSlotCount;
@@ -1895,8 +1898,41 @@ final class NghNavBTreePage {
     }
   }
 
+  /// Contiguous child 48-D SIMD rows (12 Float32x4 per entry).
+  /// Same values as [CentroidBranchEntry.centroid48DSimd]; layout only.
+  Float32x4List? _search48Simd;
+
+  /// Packed nav 48-D rows (null until [ensureSearch48Ready]).
+  Float32x4List? get search48Simd => _search48Simd;
+
+  void invalidateSearch48Pack() {
+    _search48Simd = null;
+  }
+
+  /// Rebuild packed child 48-D (no-op if already warm). Wire format unchanged.
+  void ensureSearch48Ready() {
+    if (_search48Simd != null) return;
+    final n = entries.length;
+    if (n <= 0) {
+      _search48Simd = Float32x4List(0);
+      return;
+    }
+    final packed = Float32List(n * 48);
+    var row = 0;
+    for (final e in entries) {
+      packed.setRange(row, row + 48, e.centroid48D);
+      row += 48;
+    }
+    _search48Simd = Float32x4List.sublistView(packed);
+  }
+
   /// Approximate resident bytes for TreeCache budgeting (object + 48-D vectors).
-  int estimateResidentBytes() => 96 + entries.length * 280;
+  int estimateResidentBytes() {
+    var size = 96 + entries.length * 280;
+    final packed = _search48Simd;
+    if (packed != null) size += packed.length * 16;
+    return size;
+  }
 
   Uint8List encodePayload() {
     final count = entries.length;

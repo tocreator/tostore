@@ -3280,22 +3280,27 @@ class IndexManager {
       }
     }
 
-    final Future<void>? vectorFuture =
-        vectorTargets.isNotEmpty && _dataStore.vectorIndexManager != null
-            ? _dataStore.vectorIndexManager!.writeChanges(
-                table: table,
-                inserts: inserts,
-                updates: updates,
-                deletes: deletes,
-                batchContext: batchContext,
-                concurrency: concurrency,
-                schemaOverride: schema,
-                targetIndexesOverride: vectorTargets,
-              )
-            : null;
+    // Vector NGH is read-modify-write on leaf files. Run it to completion
+    // before B+Tree flush so hydrate cannot wait on (or be starved by)
+    // overlapping index I/O under the same storage lock manager.
+    Future<void> flushVectorIndexes() async {
+      if (vectorTargets.isEmpty || _dataStore.vectorIndexManager == null) {
+        return;
+      }
+      await _dataStore.vectorIndexManager!.writeChanges(
+        table: table,
+        inserts: inserts,
+        updates: updates,
+        deletes: deletes,
+        batchContext: batchContext,
+        concurrency: concurrency,
+        schemaOverride: schema,
+        targetIndexesOverride: vectorTargets,
+      );
+    }
 
+    await flushVectorIndexes();
     if (btreeTargets.isEmpty) {
-      if (vectorFuture != null) await vectorFuture;
       return;
     }
 
@@ -3374,9 +3379,6 @@ class IndexManager {
         encryptionKeyId: encryptionKeyId,
       );
     }
-
-    // Await vector index write that was dispatched in parallel with B+Tree tasks.
-    if (vectorFuture != null) await vectorFuture;
   }
 
   /// Probe the WriteBuffer for a specific unique key.
@@ -4439,15 +4441,19 @@ class IndexManager {
     }
   }
 
-  /// Get current index data cache size in bytes (Data Partition + Range Partition Data + B+Tree pages)
-  Future<int> getCurrentIndexDataCacheSize() async {
-    // Include both data cache and page cache (B+Tree pages) + NGH vector caches
+  /// Get current structured B+Tree index cache size (no NGH / vector).
+  Future<int> getCurrentBtreeIndexDataCacheSize() async {
     final dataCacheSize = _indexDataCache.estimatedTotalSizeBytes;
     final pageCacheSize =
         _dataStore.indexTreePartitionManager?.getCurrentPageCacheSize() ?? 0;
+    return dataCacheSize + pageCacheSize;
+  }
+
+  /// Get current index data cache size in bytes (B+Tree pages + NGH vector).
+  Future<int> getCurrentIndexDataCacheSize() async {
     final vectorCacheSize =
         _dataStore.vectorIndexManager?.getCurrentCacheSize() ?? 0;
-    return dataCacheSize + pageCacheSize + vectorCacheSize;
+    return (await getCurrentBtreeIndexDataCacheSize()) + vectorCacheSize;
   }
 
   /// Get current index metadata cache size in bytes (Schema/Directories)

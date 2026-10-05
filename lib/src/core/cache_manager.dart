@@ -49,7 +49,7 @@ final class CacheManager {
       }
     });
 
-    // Index data (data cache + B+Tree pages + NGH vector pages)
+    // Structured B+Tree index pages (not vector ANN — that is vectorIndex).
     mm.registerCacheEvictionCallback(MemoryQuotaType.indexData, () async {
       if (isMemoryMode) return;
       try {
@@ -58,6 +58,10 @@ final class CacheManager {
       } catch (e) {
         Logger.warn('Evict index page cache failed', rawError: e);
       }
+    });
+
+    mm.registerCacheEvictionCallback(MemoryQuotaType.vectorIndex, () async {
+      if (isMemoryMode) return;
       try {
         // Evict NGH vector index caches
         await _dataStore.vectorIndexManager?.evictCache(ratio: 0.3);
