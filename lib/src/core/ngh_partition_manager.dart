@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
+import '../handler/common.dart';
 import '../handler/logger.dart';
 import '../handler/meta_binary_codec.dart';
 import '../handler/parallel_processor.dart';
@@ -144,8 +145,15 @@ final class NghPartitionManager {
 
   int get configuredPageSize => _dataStore.configuredPageSize;
 
-  /// TPG2 page size for an NGH category. Leaf/nav may be larger than the
-  /// database 16KB page for high-D indexes; pkmap always inherits 16KB.
+  String _indexDisplayName(TableContext table, IndexUid indexUid) {
+    final idx = _dataStore.tableMetaManager
+        ?.findIndexSchemaByUid(table.schema, indexUid);
+    return idx?.actualIndexName ?? 'index';
+  }
+
+  /// TPG2 page size for an NGH category. Leaf may be smaller (low-D 4KB/8KB)
+  /// or larger (high-D) than the database 16KB page; nav is ≥16KB (grows for
+  /// high-D); pkmap always inherits 16KB.
   int pageSizeFor(NghDataCategory category, NghIndexMeta? meta) {
     if (meta == null) return configuredPageSize;
     switch (category) {
@@ -1092,6 +1100,9 @@ final class NghPartitionManager {
     int? yieldBudgetMs,
   }) async {
     final tableUid = table.tableUid;
+    final tableName = table.tableName;
+    final indexLogName = _indexDisplayName(table, indexUid);
+    final sw = Stopwatch()..start();
     if (dirtyLeafPages.isEmpty &&
         dirtyNavPages.isEmpty &&
         dirtyNavBTreePages.isEmpty &&
@@ -1421,7 +1432,10 @@ final class NghPartitionManager {
       );
     }
 
+    final encodeMs = sw.elapsedMilliseconds;
+    var redoMs = 0;
     if (redoRecords.isNotEmpty && recordPageRedo) {
+      final redoStart = sw.elapsedMilliseconds;
       final batchId = redoBatch.batchId;
       final redoPath = _dataStore.pathManager.getPageRedoLogPath(
         batchId,
@@ -1443,9 +1457,13 @@ final class NghPartitionManager {
         PageRedoLogCodec.wrapChunk(merged),
         flush: true,
       );
+      redoMs = sw.elapsedMilliseconds - redoStart;
     }
 
+    var flushMs = 0;
+    var ioConcurrency = 1;
     if (staged.isNotEmpty) {
+      final flushStart = sw.elapsedMilliseconds;
       final flushYc = YieldController(
         'NghPartitionManager.writeChanges.flush',
         checkInterval: 20,
@@ -1485,12 +1503,12 @@ final class NghPartitionManager {
             workloadType,
             requestedTokens: requested,
             minTokens: 1,
-            label:
-                'NghPartitionManager.writeChanges(${table.tableName}.$indexUid)',
+            label: 'NghPartitionManager.writeChanges($tableName.$indexLogName)',
           );
+          ioConcurrency = min(tasks.length, max(1, lease.tokens));
           await ParallelProcessor.execute<void>(
             tasks,
-            concurrency: min(tasks.length, max(1, lease.tokens)),
+            concurrency: ioConcurrency,
             timeout: ParallelProcessor.noTimeout,
             label: 'NghPartitionManager.writeChanges.flush',
             continueOnError: false,
@@ -1499,10 +1517,22 @@ final class NghPartitionManager {
           lease?.release();
         }
       }
+      flushMs = sw.elapsedMilliseconds - flushStart;
     }
 
     if (deleteLegacyNavGraph) {
       await deleteLegacyNavBlobIfExists(table, indexUid);
+    }
+
+    if (InternalConfig.showLoggerInternalLabel) {
+      final now = DateTime.now();
+      final at =
+          '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}.${now.millisecond.toString().padLeft(3, '0')}';
+      final dirtyNavCount = dirtyNavPages.length +
+          dirtyNavBTreePages.length +
+          (dirtyNavRootPage != null ? 1 : 0);
+      Logger.debug(
+          'Vector page persistence: table=$tableName, index=$indexLogName, partitions=${updatedMeta.leafPartitionCount}, dirtyPages=leaves=${dirtyLeafPages.length}/nav=$dirtyNavCount/pkmap=${dirtyPkmapPages.length}/free=${freeLeafPages.length}, files=${staged.length}, vectorsDelta=$vectorsDelta, totalVectors=${updatedMeta.totalVectors}, totalSize=${(updatedMeta.totalSizeBytes / 1024 / 1024).toStringAsFixed(2)}MB, concurrency=$ioConcurrency, encode=${encodeMs}ms, redo=${redoMs}ms, flush=${flushMs}ms, cost=${sw.elapsedMilliseconds}ms, at: $at');
     }
 
     return updatedMeta;

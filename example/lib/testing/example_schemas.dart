@@ -126,9 +126,14 @@ class ExampleSchemas {
   /// Interactive example tables. Fill and sweep one table at a time —
   /// do not bulk-load every width together.
   ///
-  /// 128 / 512 / 768 / 1536: everyday embedding widths.
+  /// 16 / 32 / 48: packing + throughput (48 is the NGH routing width).
+  /// 128 / 256 / 512 / 768 / 1536: everyday + 8KB leaf band (256).
   /// 4096 / 8192 / 16384 / 65535: high-D insert + flush packing.
+  static const int vectorDim16 = 16;
+  static const int vectorDim32 = 32;
+  static const int vectorDim48 = 48;
   static const int vectorDimLow = 128;
+  static const int vectorDim256 = 256;
   static const int vectorDimMid = 512;
   static const int vectorDim768 = 768;
   static const int vectorDimHigh = 1536;
@@ -137,10 +142,34 @@ class ExampleSchemas {
   static const int vectorDim16384 = 16384;
   static const int vectorDim65535 = 65535;
 
+  /// 16-d packing probe (4KB leaves). Not a product recall proxy.
+  static final TableSchema embeddings16 = _cosineNghEmbeddings(
+    name: 'embeddings_16',
+    dimensions: vectorDim16,
+  );
+
+  /// 32-d packing probe (4KB leaves). Not a product recall proxy.
+  static final TableSchema embeddings32 = _cosineNghEmbeddings(
+    name: 'embeddings_32',
+    dimensions: vectorDim32,
+  );
+
+  /// 48-d native routing width. Large-N navigation proxy; bridge vs 128.
+  static final TableSchema embeddings48 = _cosineNghEmbeddings(
+    name: 'embeddings_48',
+    dimensions: vectorDim48,
+  );
+
   /// 128-d (small encoders). Use to catch low-D over-probe / cheap-recall bias.
   static final TableSchema embeddings128 = _cosineNghEmbeddings(
     name: 'embeddings_128',
     dimensions: vectorDimLow,
+  );
+
+  /// 256-d (8KB leaves). Covers the mid packing band between 128 and 512.
+  static final TableSchema embeddings256 = _cosineNghEmbeddings(
+    name: 'embeddings_256',
+    dimensions: vectorDim256,
   );
 
   /// 512-d default embedding width.
@@ -182,7 +211,11 @@ class ExampleSchemas {
   );
 
   static List<TableSchema> get vectorTables => [
+        embeddings16,
+        embeddings32,
+        embeddings48,
         embeddings128,
+        embeddings256,
         embeddings512,
         embeddings768,
         embeddings1536,

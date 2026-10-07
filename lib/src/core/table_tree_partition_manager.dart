@@ -21,6 +21,7 @@ import '../model/result_type.dart';
 import '../model/stored_value.dart';
 import '../model/table_context.dart';
 import '../model/table_schema.dart';
+import '../model/value_ref.dart';
 import 'btree_page.dart';
 import 'compute/btree_page_encode_batch_runner.dart';
 import 'compute/compute_batch_planner.dart';
@@ -30,6 +31,8 @@ import 'compute_tasks.dart';
 import 'cpu_work_chunk.dart';
 import 'data_store_impl.dart';
 import 'overflow_manager.dart';
+import 'overflow_pack_session.dart';
+import 'toast_planner.dart';
 import 'page_redo_log_codec.dart';
 import 'storage_adapter.dart';
 import 'tree_cache.dart';
@@ -52,6 +55,9 @@ final class TableTreePartitionManager {
   String keyOfPtr(TreePagePtr p) => '${p.partitionNo}:${p.pageNo}';
 
   /// Fast synchronous inline decode for normal (non-overflow) records.
+  ///
+  /// Returns null when the spine contains field-level overflow refs (must go
+  /// async) or when the leaf cell itself is a record-level overflow ref.
   Map<String, dynamic>? _tryDecodeStoredRecordSync(
     Uint8List storedValue,
     List<FieldStructure> fieldStruct,
@@ -61,9 +67,92 @@ final class TableTreePartitionManager {
     final bytes = sv.inlineBytes;
     if (bytes.length >= 2 &&
         ((bytes[0] << 8) | bytes[1]) == fieldStruct.length) {
+      final refs =
+          BinarySchemaCodec.collectFieldOverflowRefs(bytes, fieldStruct);
+      if (refs.isNotEmpty) return null;
       return BinarySchemaCodec.decodeRecord(bytes, fieldStruct);
     }
     return null;
+  }
+
+  /// Collect overflow partition file paths referenced by a leaf StoredValue.
+  void _collectOverflowPathsFromStored({
+    required TableContext table,
+    required Uint8List storedValue,
+    required List<FieldStructure> fieldStruct,
+    required Set<String> into,
+  }) {
+    try {
+      final sv = StoredValue.decode(storedValue);
+      if (sv.tag == StoredValue.tagOverflowRef && sv.ref != null) {
+        into.add(
+          _dataStore.pathManager.getOverflowPartitionFilePathByContext(
+            table,
+            sv.ref!.overflowPartitionNo,
+          ),
+        );
+        return;
+      }
+      for (final r in BinarySchemaCodec.collectFieldOverflowRefs(
+        sv.inlineBytes,
+        fieldStruct,
+      )) {
+        into.add(
+          _dataStore.pathManager.getOverflowPartitionFilePathByContext(
+            table,
+            r.overflowPartitionNo,
+          ),
+        );
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _deleteStoredOverflowTree({
+    required TableContext table,
+    required Uint8List storedValue,
+    required List<FieldStructure> fieldStruct,
+    Uint8List? encryptionKey,
+    int? encryptionKeyId,
+    BatchContext? batchContext,
+  }) async {
+    try {
+      final sv = StoredValue.decode(storedValue);
+      Uint8List? spine;
+      if (sv.tag == StoredValue.tagOverflowRef && sv.ref != null) {
+        spine = await _dataStore.overflowManager.getLargeValue(
+          table: table,
+          ref: sv.ref!,
+          pageSize: _dataStore.configuredPageSize,
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+        );
+        await _dataStore.overflowManager.deleteLargeValue(
+          table: table,
+          ref: sv.ref!,
+          pageSize: _dataStore.configuredPageSize,
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+          batchContext: batchContext,
+        );
+      } else {
+        spine = sv.inlineBytes;
+      }
+      if (spine.isEmpty) return;
+      final fieldRefs =
+          BinarySchemaCodec.collectFieldOverflowRefs(spine, fieldStruct);
+      for (final fr in fieldRefs) {
+        try {
+          await _dataStore.overflowManager.deleteLargeValue(
+            table: table,
+            ref: fr,
+            pageSize: _dataStore.configuredPageSize,
+            encryptionKey: encryptionKey,
+            encryptionKeyId: encryptionKeyId,
+            batchContext: batchContext,
+          );
+        } catch (_) {}
+      }
+    } catch (_) {}
   }
 
   Future<Map<String, dynamic>?> _decodeStoredRecord({
@@ -75,14 +164,20 @@ final class TableTreePartitionManager {
     Uint8List? primaryKeyBytes,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
+    Set<String>? neededFields,
   }) async {
-    final syncDecoded = _tryDecodeStoredRecordSync(storedValue, fieldStruct);
-    if (syncDecoded != null) return syncDecoded;
+    // Projection with field-overflow still needs the async path.
+    if (neededFields == null) {
+      final syncDecoded = _tryDecodeStoredRecordSync(storedValue, fieldStruct);
+      if (syncDecoded != null) return syncDecoded;
+    }
 
     final tableUid = table.tableUid;
     final sv = StoredValue.decode(storedValue);
     Uint8List bytes;
     if (sv.tag == StoredValue.tagOverflowRef) {
+      // v1 whole-row overflow: must load full blob (no field skip).
+      // v2 spine overflow: load spine then resolve field refs selectively.
       bytes = await _dataStore.overflowManager.getLargeValue(
         table: table,
         ref: sv.ref!,
@@ -103,9 +198,28 @@ final class TableTreePartitionManager {
     final hasRuntimeMigration = migrationManager != null &&
         migrationManager.hasRuntimeMigrationForTable(table);
 
+    Future<Uint8List?> resolveFieldOverflow(ValueRef ref) async {
+      try {
+        return await _dataStore.overflowManager.getLargeValue(
+          table: table,
+          ref: ref,
+          pageSize: _dataStore.configuredPageSize,
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+        );
+      } catch (_) {
+        return null;
+      }
+    }
+
     // Tier 1: Direct decoding if slot counts match
     if (storedFieldCount != null && storedFieldCount == fieldStruct.length) {
-      final decoded = BinarySchemaCodec.decodeRecord(bytes, fieldStruct);
+      final decoded = await BinarySchemaCodec.decodeRecordAsync(
+        bytes,
+        fieldStruct,
+        neededFields: neededFields,
+        resolveOverflow: resolveFieldOverflow,
+      );
       if (decoded != null) {
         return decoded;
       }
@@ -124,8 +238,12 @@ final class TableTreePartitionManager {
           layoutOverride: resolved.layout,
         );
         if (historicFieldStruct != null && historicFieldStruct.isNotEmpty) {
-          final decoded =
-              BinarySchemaCodec.decodeRecord(bytes, historicFieldStruct);
+          final decoded = await BinarySchemaCodec.decodeRecordAsync(
+            bytes,
+            historicFieldStruct,
+            neededFields: neededFields,
+            resolveOverflow: resolveFieldOverflow,
+          );
           if (decoded != null) {
             return migrationManager.normalizeRecordToLatestSync(
               table,
@@ -158,8 +276,12 @@ final class TableTreePartitionManager {
           if (!f.deleted) f,
       ];
       if (activeStruct.length == storedFieldCount) {
-        final activeDecoded =
-            BinarySchemaCodec.decodeRecord(bytes, activeStruct);
+        final activeDecoded = await BinarySchemaCodec.decodeRecordAsync(
+          bytes,
+          activeStruct,
+          neededFields: neededFields,
+          resolveOverflow: resolveFieldOverflow,
+        );
         if (activeDecoded != null) {
           return activeDecoded;
         }
@@ -178,7 +300,12 @@ final class TableTreePartitionManager {
         }
       }
       if (!deletedInPrefix) {
-        final prefixDecoded = BinarySchemaCodec.decodeRecord(bytes, prefix);
+        final prefixDecoded = await BinarySchemaCodec.decodeRecordAsync(
+          bytes,
+          prefix,
+          neededFields: neededFields,
+          resolveOverflow: resolveFieldOverflow,
+        );
         if (prefixDecoded != null) {
           return prefixDecoded;
         }
@@ -186,7 +313,12 @@ final class TableTreePartitionManager {
     }
 
     // Tier 4b: Exact-match fallback with the provided layout
-    final fallbackDecoded = BinarySchemaCodec.decodeRecord(bytes, fieldStruct);
+    final fallbackDecoded = await BinarySchemaCodec.decodeRecordAsync(
+      bytes,
+      fieldStruct,
+      neededFields: neededFields,
+      resolveOverflow: resolveFieldOverflow,
+    );
     if (fallbackDecoded != null) {
       return fallbackDecoded;
     }
@@ -1373,11 +1505,16 @@ final class TableTreePartitionManager {
       return cur;
     }
 
+    /// Overflow files written by toast pack — must fsync before leaf publish.
     final dirtyOverflowPaths = <String>{};
 
-    // Pre-calculate overflow requirements and cache encoded records.
-    final Map<String, Uint8List> preEncoded = {};
-    final overflowChainPageCounts = <int>[];
+    /// Old leaf cells whose overflow must be reclaimed only after leaf pages
+    /// that drop those ValueRefs are durable (avoids dangling refs on crash).
+    final pendingOverflowReclaims = <Uint8List>[];
+
+    // Pre-encode / toast-plan put ops into leaf StoredValue bytes.
+    final Map<String, Uint8List> preStored = {};
+    var overflowSizeDeltaSum = 0;
 
     final putOps = <_TableOp>[];
     final putRecords = <Map<String, dynamic>>[];
@@ -1389,137 +1526,103 @@ final class TableTreePartitionManager {
         putRecords.add(op.record);
       }
     }
-    if (putOps.isNotEmpty) {
-      final encodedRecords = await _encodeRecordPayloadsForWrite(
-        records: putRecords,
-        primaryKeyField: schema.primaryKey,
-        fieldStruct: fieldStruct,
-      );
 
-      for (int i = 0; i < putOps.length; i++) {
-        final y7 = yc.maybeYield();
-        if (y7 != null) await y7;
-        final op = putOps[i];
-        final encoded = encodedRecords[i];
-        preEncoded[op.pk] = encoded;
-
-        if (_dataStore.overflowManager
-            .shouldExternalize(_dataStore.configuredPageSize, encoded.length)) {
-          overflowChainPageCounts.add(
-            _dataStore.overflowManager.estimatePageCount(
-              valueLen: encoded.length,
-              pageSize: _dataStore.configuredPageSize,
-              encryptionKeyId: encryptionKeyId,
-            ),
-          );
-        }
-      }
-    }
-
-    OverflowBatchAllocator? overflowAllocator;
-    var overflowSizeDeltaSum = 0;
-    final preStoredOverflow = <String, Uint8List>{};
     final overflowPartitionCountBefore = meta.overflowPartitionCount;
+    OverflowPackSession? packSession;
     Future<void> rollbackOverflowReservation() async {
-      final alloc = overflowAllocator;
-      if (alloc == null) return;
+      final session = packSession;
+      if (session == null) return;
       try {
-        await _dataStore.overflowManager.rollbackBatchAllocation(
-          table: table,
-          allocator: alloc,
-          pageSize: _dataStore.configuredPageSize,
-          encryptionKey: encryptionKey,
-          encryptionKeyId: encryptionKeyId,
-          flush: false,
-        );
+        await session.rollback();
       } catch (_) {}
-      // Undo in-memory partition count bump from a failed rotation attempt.
       if (meta.overflowPartitionCount > overflowPartitionCountBefore) {
         meta = meta.copyWith(
           overflowPartitionCount: overflowPartitionCountBefore,
         );
       }
-      overflowAllocator = null;
+      packSession = null;
     }
 
-    if (overflowChainPageCounts.isNotEmpty) {
-      final batchAllocator =
-          await _dataStore.overflowManager.startBatchAllocation(
-        chainPageCounts: overflowChainPageCounts,
-        table: table,
-        pageSize: _dataStore.configuredPageSize,
-        overflowPartitionCount: meta.overflowPartitionCount,
-        encryptionKey: encryptionKey,
-        encryptionKeyId: encryptionKeyId,
-        flush: false,
+    if (putOps.isNotEmpty) {
+      // Cheap size probe: full encode without toast to see if any row needs it.
+      final probeEncoded = await _encodeRecordPayloadsForWrite(
+        records: putRecords,
+        primaryKeyField: schema.primaryKey,
+        fieldStruct: fieldStruct,
       );
-      overflowAllocator = batchAllocator;
-      final batchWriteBuffer = OverflowWriteBuffer();
-      overflowSizeDeltaSum = batchAllocator.sizeDeltaBytes;
-      if (batchAllocator.updatedOverflowPartitionCount >
-          meta.overflowPartitionCount) {
-        meta = meta.copyWith(
-          overflowPartitionCount: batchAllocator.updatedOverflowPartitionCount,
-        );
+      var anyToast = false;
+      for (final encoded in probeEncoded) {
+        if (_dataStore.overflowManager
+            .shouldExternalize(_dataStore.configuredPageSize, encoded.length)) {
+          anyToast = true;
+          break;
+        }
       }
-      // Write overflow pages before any leaf is published. markLeafDirty
-      // publishes ValueRefs into the live page cache; a concurrent decode
-      // (or LRU eviction of the overflow page cache) must hit durable pages,
-      // not an in-memory write buffer.
-      try {
+
+      if (!anyToast) {
         for (int i = 0; i < putOps.length; i++) {
-          final yPre = yc.maybeYield();
-          if (yPre != null) await yPre;
-          final op = putOps[i];
-          final encoded = preEncoded[op.pk]!;
-          if (!_dataStore.overflowManager.shouldExternalize(
-              _dataStore.configuredPageSize, encoded.length)) {
-            continue;
+          preStored[putOps[i].pk] =
+              StoredValue.inline(probeEncoded[i]).encode();
+        }
+      } else {
+        final batchWriteBuffer = OverflowWriteBuffer();
+        packSession = await _dataStore.overflowManager.beginPackSession(
+          table: table,
+          pageSize: _dataStore.configuredPageSize,
+          overflowPartitionCount: meta.overflowPartitionCount,
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+          writeBuffer: batchWriteBuffer,
+          flush: false,
+          // Recovery reflush skips page redo — never overwrite live mixed pages.
+          allowSharedPageOverwrite:
+              batchContext == null || batchContext.recordsPageRedo,
+        );
+        try {
+          for (int i = 0; i < putOps.length; i++) {
+            final yPre = yc.maybeYield();
+            if (yPre != null) await yPre;
+            final op = putOps[i];
+            final toast = ToastPlanner.encodeWithSession(
+              record: op.record,
+              fieldStructure: fieldStruct,
+              nullifyField: schema.primaryKey,
+              pageSize: _dataStore.configuredPageSize,
+              overflowManager: _dataStore.overflowManager,
+              session: packSession!,
+              encodeStoredOverflow: (ref) => StoredValue.overflow(ref).encode(),
+              encodeStoredInline: (bytes) => StoredValue.inline(bytes).encode(),
+            );
+            preStored[op.pk] = toast.storedValueBytes;
+            if (batchWriteBuffer.pendingBytes >=
+                OverflowWriteBuffer.maxStagedBytes) {
+              await packSession!.flushPersist(
+                batchContext: batchContext,
+                flush: false,
+              );
+            }
           }
-          // Sync stage avoids 1 microtask per row; await only on buffer flush.
-          final staged =
-              _dataStore.overflowManager.stageLargeValueWithAllocator(
-            table: table,
-            valueBytes: encoded,
-            pageSize: _dataStore.configuredPageSize,
-            allocator: batchAllocator,
-            writeBuffer: batchWriteBuffer,
-            encryptionKey: encryptionKey,
-            encryptionKeyId: encryptionKeyId,
+          final fin = await packSession!.finish(
+            flush: false,
+            batchContext: batchContext,
           );
-          final allocRes = staged.result;
-          if (staged.bufferNeedsCommit) {
-            await batchWriteBuffer.commit(_storage, flush: false);
-          }
-          overflowSizeDeltaSum += allocRes.sizeDeltaBytes;
-          if (allocRes.overflowPartitionCount > meta.overflowPartitionCount) {
+          overflowSizeDeltaSum += fin.sizeDeltaBytes;
+          if (fin.overflowPartitionCount > meta.overflowPartitionCount) {
             meta = meta.copyWith(
-              overflowPartitionCount: allocRes.overflowPartitionCount,
+              overflowPartitionCount: fin.overflowPartitionCount,
             );
           }
           dirtyOverflowPaths.add(
             _dataStore.pathManager.getOverflowPartitionFilePathByContext(
               table,
-              allocRes.ref.overflowPartitionNo,
+              packSession!.partitionNo,
             ),
           );
-          preStoredOverflow[op.pk] =
-              StoredValue.overflow(allocRes.ref).encode();
+          packSession = null;
+        } catch (_) {
+          await rollbackOverflowReservation();
+          rethrow;
         }
-        if (!batchWriteBuffer.isEmpty) {
-          await batchWriteBuffer.commit(_storage, flush: false);
-        }
-        await _dataStore.overflowManager.commitBatchAllocation(
-          table: table,
-          allocator: batchAllocator,
-          pageSize: _dataStore.configuredPageSize,
-          encryptionKey: encryptionKey,
-          encryptionKeyId: encryptionKeyId,
-          flush: false,
-        );
-      } catch (_) {
-        await rollbackOverflowReservation();
-        rethrow;
       }
     }
     for (final op in opList) {
@@ -1548,26 +1651,8 @@ final class TableTreePartitionManager {
         final i = leaf.find(keyBytes);
         if (i == null) continue;
 
-        // Check and free old overflow value if exists.
         final oldStoredBytes = leaf.values[i];
-        try {
-          final oldSv = StoredValue.decode(oldStoredBytes);
-          if (oldSv.tag == StoredValue.tagOverflowRef && oldSv.ref != null) {
-            await _dataStore.overflowManager.deleteLargeValue(
-              table: table,
-              ref: oldSv.ref!,
-              pageSize: _dataStore.configuredPageSize,
-              encryptionKey: encryptionKey,
-              encryptionKeyId: encryptionKeyId,
-            );
-            final overflowPath = _dataStore.pathManager
-                .getOverflowPartitionFilePathByContext(
-                    table, oldSv.ref!.overflowPartitionNo);
-            dirtyOverflowPaths.add(overflowPath);
-          }
-        } catch (_) {
-          // Best effort on corruption.
-        }
+        pendingOverflowReclaims.add(oldStoredBytes);
 
         leaf.delete(keyBytes);
         getStats(leafPtr.partitionNo).recordsDelta -= 1;
@@ -1584,66 +1669,16 @@ final class TableTreePartitionManager {
         lastDeleteLeafPtr = leafPtr;
         continue;
       } else {
-        // Encoded value is already cached.
-        final encoded = preEncoded[op.pk]!;
+        final stored = preStored[op.pk];
+        if (stored == null) continue;
 
         final oldIdx = leaf.find(keyBytes);
         final existed = oldIdx != null;
 
         if (existed) {
-          // Check and free old overflow value if it's being replaced.
-          final oldStoredBytes = leaf.values[oldIdx];
-          try {
-            final oldSv = StoredValue.decode(oldStoredBytes);
-            if (oldSv.tag == StoredValue.tagOverflowRef && oldSv.ref != null) {
-              await _dataStore.overflowManager.deleteLargeValue(
-                table: table,
-                ref: oldSv.ref!,
-                pageSize: _dataStore.configuredPageSize,
-                encryptionKey: encryptionKey,
-                encryptionKeyId: encryptionKeyId,
-              );
-              final overflowPath = _dataStore.pathManager
-                  .getOverflowPartitionFilePathByContext(
-                      table, oldSv.ref!.overflowPartitionNo);
-              dirtyOverflowPaths.add(overflowPath);
-            }
-          } catch (_) {}
+          pendingOverflowReclaims.add(leaf.values[oldIdx]);
         }
 
-        Uint8List stored;
-        final preparedOverflow = preStoredOverflow[op.pk];
-        if (preparedOverflow != null) {
-          stored = preparedOverflow;
-        } else if (_dataStore.overflowManager
-            .shouldExternalize(_dataStore.configuredPageSize, encoded.length)) {
-          // Estimate missed this row (should be rare). Write immediately so
-          // the ValueRef is never published without overflow pages on disk.
-          final allocRes = await _dataStore.overflowManager.putLargeValue(
-            table: table,
-            valueBytes: encoded,
-            pageSize: _dataStore.configuredPageSize,
-            overflowPartitionCount: meta.overflowPartitionCount,
-            encryptionKey: encryptionKey,
-            encryptionKeyId: encryptionKeyId,
-            flush: false,
-          );
-          overflowSizeDeltaSum += allocRes.sizeDeltaBytes;
-          if (allocRes.overflowPartitionCount > meta.overflowPartitionCount) {
-            meta = meta.copyWith(
-              overflowPartitionCount: allocRes.overflowPartitionCount,
-            );
-          }
-          dirtyOverflowPaths.add(
-            _dataStore.pathManager.getOverflowPartitionFilePathByContext(
-              table,
-              allocRes.ref.overflowPartitionNo,
-            ),
-          );
-          stored = StoredValue.overflow(allocRes.ref).encode();
-        } else {
-          stored = StoredValue.inline(encoded).encode();
-        }
         leaf.upsert(keyBytes, stored);
         // Only count as +1 if it's a new insert (idempotent for recovery).
         if (op.isInsert && !existed) {
@@ -1715,8 +1750,8 @@ final class TableTreePartitionManager {
       } catch (_) {}
     }
 
-    // Freelist updates from replace/delete are written immediately; fsync
-    // overflow files before B+Tree leaves become durable.
+    // New toast pages must be durable before leaf ValueRefs are published.
+    // Reclaim of replaced/deleted overflow is deferred until after leaf flush.
     if (dirtyOverflowPaths.isNotEmpty) {
       for (final path in dirtyOverflowPaths) {
         await _storage.flushFile(path);
@@ -2266,6 +2301,41 @@ final class TableTreePartitionManager {
       }
     }
 
+    // Leaf pages (without old ValueRefs) are durable — safe to reclaim toast.
+    // Skip when: (1) recovery reflush skips page redo (mixed reclaim has no
+    // after-image), or (2) leaf IO was skipped because pages were already
+    // durable for this batch (old ValueRefs still published on disk).
+    final leafAlreadyDurable = dirtyLeaves.keys.any(
+      (ptr) => getStats(ptr.partitionNo).alreadyDurableForBatch,
+    );
+    final canReclaimOverflow = pendingOverflowReclaims.isNotEmpty &&
+        recordPageRedo &&
+        !leafAlreadyDurable;
+    if (canReclaimOverflow) {
+      final reclaimPaths = <String>{};
+      for (final stored in pendingOverflowReclaims) {
+        final yReclaim = yc.maybeYield();
+        if (yReclaim != null) await yReclaim;
+        _collectOverflowPathsFromStored(
+          table: table,
+          storedValue: stored,
+          fieldStruct: fieldStruct,
+          into: reclaimPaths,
+        );
+        await _deleteStoredOverflowTree(
+          table: table,
+          storedValue: stored,
+          fieldStruct: fieldStruct,
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+          batchContext: batchContext,
+        );
+      }
+      for (final path in reclaimPaths) {
+        await _storage.flushFile(path);
+      }
+    }
+
     await _dataStore.tableDataManager.mutateTableDataMeta(
       table,
       (current) {
@@ -2716,6 +2786,7 @@ final class TableTreePartitionManager {
     TableSchema? schemaOverride,
     List<FieldStructure>? decodeFieldStructureOverride,
     bool readFromFileOnly = false,
+    Set<String>? neededFields,
   }) async {
     if (keys.isEmpty) return const <Map<String, dynamic>>[];
     final schema = schemaOverride ??
@@ -2784,8 +2855,9 @@ final class TableTreePartitionManager {
 
         // Fast pure synchronous inline decoding (0 await for normal inline records)
         final rawStored = leaf.values[pos];
-        Map<String, dynamic>? decoded =
-            _tryDecodeStoredRecordSync(rawStored, fieldStruct);
+        Map<String, dynamic>? decoded = neededFields == null
+            ? _tryDecodeStoredRecordSync(rawStored, fieldStruct)
+            : null;
         decoded ??= await _decodeStoredRecord(
           table: table,
           meta: meta,
@@ -2795,6 +2867,7 @@ final class TableTreePartitionManager {
           primaryKeyBytes: keyBytes,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
+          neededFields: neededFields,
         );
         if (decoded == null) continue;
         out.add(TableSchema.rowWithPrimaryKeyFirst(primaryKey, pk, decoded));
@@ -3535,6 +3608,7 @@ final class TableTreePartitionManager {
     TableSchema? decodeSchema,
     List<FieldStructure>? decodeFieldStructureOverride,
     bool readFromFileOnly = false,
+    Set<String>? neededFields,
   }) async {
     final out = <Map<String, dynamic>>[];
     await forEachRecordByPrimaryKeyRange(
@@ -3549,6 +3623,7 @@ final class TableTreePartitionManager {
       decodeSchema: decodeSchema,
       decodeFieldStructureOverride: decodeFieldStructureOverride,
       readFromFileOnly: readFromFileOnly,
+      neededFields: neededFields,
       onRecord: (r) {
         out.add(r);
         return true;
@@ -3571,6 +3646,7 @@ final class TableTreePartitionManager {
     TableSchema? decodeSchema,
     List<FieldStructure>? decodeFieldStructureOverride,
     bool readFromFileOnly = false,
+    Set<String>? neededFields,
   }) async {
     final schema = decodeSchema ??
         await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
@@ -3759,10 +3835,9 @@ final class TableTreePartitionManager {
           final pk = MemComparableKey.decodeLastText(k);
           Map<String, dynamic> row;
           if (decodeRecord) {
-            var decoded = _tryDecodeStoredRecordSync(
-              leaf.values[i],
-              fieldStruct,
-            );
+            var decoded = neededFields == null
+                ? _tryDecodeStoredRecordSync(leaf.values[i], fieldStruct)
+                : null;
             decoded ??= await _decodeStoredRecord(
               table: table,
               meta: meta,
@@ -3772,6 +3847,7 @@ final class TableTreePartitionManager {
               primaryKeyBytes: k,
               encryptionKey: encryptionKey,
               encryptionKeyId: encryptionKeyId,
+              neededFields: neededFields,
             );
             if (decoded == null) continue;
             row = pk != null
@@ -3816,10 +3892,9 @@ final class TableTreePartitionManager {
           final pk = MemComparableKey.decodeLastText(k);
           Map<String, dynamic> row;
           if (decodeRecord) {
-            var decoded = _tryDecodeStoredRecordSync(
-              leaf.values[i],
-              fieldStruct,
-            );
+            var decoded = neededFields == null
+                ? _tryDecodeStoredRecordSync(leaf.values[i], fieldStruct)
+                : null;
             decoded ??= await _decodeStoredRecord(
               table: table,
               meta: meta,
@@ -3829,6 +3904,7 @@ final class TableTreePartitionManager {
               primaryKeyBytes: k,
               encryptionKey: encryptionKey,
               encryptionKeyId: encryptionKeyId,
+              neededFields: neededFields,
             );
             if (decoded == null) continue;
             row = pk != null

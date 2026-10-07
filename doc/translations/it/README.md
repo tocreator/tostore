@@ -726,7 +726,7 @@ await db.kv.setMany(settingsMap, durability: RecoveryDurability.durable);
 
 ### <a id="vector-advanced"></a>Campi vettoriali, indici vettoriali e recupero ibrido
 
-Il recupero vettoriale usa la catena unificata `db.query(...).matchVector(...)`: può essere combinato con predicati strutturati sulla stessa catena, o fuso con altri rami di richiamo. Punteggi e diagnostica di canale tornano in `QueryResult.retrieval`, allineati 1:1 con le righe di `data`. Gli esempi attuali si concentrano su percorsi vettoriale + strutturato; canali lessicali, a grafo e altri seguiranno lo stesso modello di recupero ibrido a catena.
+Il recupero vettoriale usa la catena unificata `db.query(...).matchVector(...)`: può essere combinato con predicati strutturati sulla stessa catena, o fuso con altri rami di richiamo. Punteggi e diagnostica di canale tornano in `QueryResult.retrieval`, allineati 1:1 con le righe di `data`. Se servono solo chiavi primarie e punteggi, preferisci `.select(['id'])` (o il nome del campo PK) così il motore evita di idratare le righe complete — altrimenti il recupero ibrido materializza i record interi (incluse embedding grandi) e il throughput può crollare. Per ANN dedicato senza filtri o fusione, `db.vectorSearch(...)` restituisce `List<VectorSearchResult>` (chiave primaria + punteggio) con lo stesso percorso di ricerca centrale. Gli esempi attuali si concentrano su percorsi vettoriale + strutturato; canali lessicali, a grafo e altri seguiranno lo stesso modello di recupero ibrido a catena.
 
 ```dart
 await db.createTables([
@@ -774,19 +774,22 @@ final queryVector =
     VectorData.fromList(List.generate(128, (i) => i * 0.01)); // Must match dimensions
 
 // 1) Recommended: chained hybrid retrieval (pure vector ANN)
+// Prefer .select([pk]) for primary key + score only — avoids full-row hydration.
 final result = await db
     .query('embeddings')
+    .select(['id'])
     .matchVector('embedding', queryVector) // searchDepth predefinito = 50
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
   final row = result.data[i];
   final entry = result.retrieval?.entries[i];
-  final score = entry?.score;
-  final distance = entry?.meta?['distance'];
-  print('pk=${row['id']}, title=${row['document_title']}, '
-      'score=$score, distance=$distance');
+  print('pk=${row['id']}, score=${entry?.score}, '
+      'distance=${entry?.meta?['distance']}');
 }
+
+// Need business columns? omit select() (or project the fields you need) —
+// the engine then loads full table rows for matched PKs (heavier).
 
 // 2) Structured filter + vector (AND hybrid)
 final filtered = await db
@@ -807,6 +810,14 @@ final fused = await db
     .limit(10);
 
 print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
+
+// Dedicated ANN (same core path; PK + score only, no query chain / fusion)
+final ann = await db.vectorSearch(
+  'embeddings',
+  fieldName: 'embedding',
+  queryVector: queryVector,
+  topK: 5,
+);
 ```
 
 **Configurazione schema / indice vettoriale** (`VectorFieldConfig`, `VectorIndexConfig`):
@@ -827,9 +838,11 @@ print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
 **Note sul risultato** (`QueryResult`):
 
 - Le righe di business sono in `data`; punteggi e info di canale in `retrieval.entries`, allineati **1:1** con `data`
+- Per alto throughput in ANN / richiamo ibrido, usa `.select(['id'])` (nome del campo PK) così `data` contiene solo la PK e i punteggi restano in `retrieval`
 - `entry.score`: punteggio di similarità / fusione normalizzato, tipicamente `0 ~ 1`; più alto = più rilevante
 - `entry.meta['distance']`: distanza grezza (comune sul canale vettoriale); per `l2` / `cosine`, più piccolo di solito significa più vicino
 - `retrieval.fusionMethod`: di solito `single` per un canale; il richiamo multi-via è tipicamente `rrf` (Reciprocal Rank Fusion)
+- L'API di primo livello `db.vectorSearch(...)` restituisce `List<VectorSearchResult>` (`primaryKey` / `score` / `distance`) quando serve solo ANN dedicato senza filtri strutturati né fusione multi-via
 
 ### <a id="ttl-config"></a>TTL a livello di tabella (scadenza automatica basata sul tempo)
 

@@ -726,7 +726,7 @@ await db.kv.setMany(settingsMap, durability: RecoveryDurability.durable);
 
 ### <a id="vector-advanced"></a>Vektorfelder, Vektorindizes und Hybridabruf
 
-Vektorabruf nutzt die einheitliche Abfragekette `db.query(...).matchVector(...)`: sie lässt sich mit strukturierten Prädikaten in derselben Kette kombinieren oder mit anderen Recall-Zweigen fusionieren. Scores und Kanaldiagnosen werden in `QueryResult.retrieval` zurückgegeben und sind 1:1 auf `data`-Zeilen ausgerichtet. Die aktuellen Beispiele fokussieren Vektor + strukturiert; lexikalische, Graph- und weitere Kanäle erweitern dasselbe verkettete Hybridabruf-Modell.
+Vektorabruf nutzt die einheitliche Abfragekette `db.query(...).matchVector(...)`: sie lässt sich mit strukturierten Prädikaten in derselben Kette kombinieren oder mit anderen Recall-Zweigen fusionieren. Scores und Kanaldiagnosen werden in `QueryResult.retrieval` zurückgegeben und sind 1:1 auf `data`-Zeilen ausgerichtet. Wenn nur Primärschlüssel und Scores nötig sind, bevorzugen Sie `.select(['id'])` (oder Ihren PK-Feldnamen), damit die Engine keine vollständigen Tabellenzeilen materialisiert — sonst lädt der Hybridabruf komplette Datensätze (inkl. großer Embeddings) und der Durchsatz kann stark sinken. Für dediziertes ANN ohne Filter oder Fusion liefert `db.vectorSearch(...)` mit demselben Kernsuchpfad `List<VectorSearchResult>` (Primärschlüssel + Score). Die aktuellen Beispiele fokussieren Vektor + strukturiert; lexikalische, Graph- und weitere Kanäle erweitern dasselbe verkettete Hybridabruf-Modell.
 
 ```dart
 await db.createTables([
@@ -774,19 +774,22 @@ final queryVector =
     VectorData.fromList(List.generate(128, (i) => i * 0.01)); // Must match dimensions
 
 // 1) Recommended: chained hybrid retrieval (pure vector ANN)
+// Prefer .select([pk]) for primary key + score only — avoids full-row hydration.
 final result = await db
     .query('embeddings')
+    .select(['id'])
     .matchVector('embedding', queryVector) // Standard searchDepth = 50
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
   final row = result.data[i];
   final entry = result.retrieval?.entries[i];
-  final score = entry?.score;
-  final distance = entry?.meta?['distance'];
-  print('pk=${row['id']}, title=${row['document_title']}, '
-      'score=$score, distance=$distance');
+  print('pk=${row['id']}, score=${entry?.score}, '
+      'distance=${entry?.meta?['distance']}');
 }
+
+// Need business columns? omit select() (or project the fields you need) —
+// the engine then loads full table rows for matched PKs (heavier).
 
 // 2) Structured filter + vector (AND hybrid)
 final filtered = await db
@@ -807,6 +810,14 @@ final fused = await db
     .limit(10);
 
 print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
+
+// Dedicated ANN (same core path; PK + score only, no query chain / fusion)
+final ann = await db.vectorSearch(
+  'embeddings',
+  fieldName: 'embedding',
+  queryVector: queryVector,
+  topK: 5,
+);
 ```
 
 **Schema- / Vektorindex-Konfiguration** (`VectorFieldConfig`, `VectorIndexConfig`):
@@ -827,9 +838,11 @@ print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
 **Ergebnisnotizen** (`QueryResult`):
 
 - Geschäftszeilen liegen in `data`; Abruf-Scores und Kanalinfos in `retrieval.entries`, **1:1** zu `data`
+- Für hohen Durchsatz bei ANN / Hybridabruf `.select(['id'])` (PK-Feldname) nutzen, damit `data` nur den PK enthält und Scores in `retrieval` bleiben
 - `entry.score`: normalisierter Ähnlichkeits- / Fusionsscore, typisch `0 ~ 1`; größer = relevanter
 - `entry.meta['distance']`: Rohdistanz (häufig im Vektorkanal); bei `l2` / `cosine` bedeutet kleiner meist näher
 - `retrieval.fusionMethod`: bei einem Kanal meist `single`; Mehrweg-Fusion typisch `rrf` (Reciprocal Rank Fusion)
+- Top-Level `db.vectorSearch(...)` liefert `List<VectorSearchResult>` (`primaryKey` / `score` / `distance`), wenn nur dediziertes ANN ohne strukturierte Filter oder Mehrweg-Fusion nötig ist
 
 ### <a id="ttl-config"></a>TTL auf Tabellenebene (automatischer zeitbasierter Ablauf)
 

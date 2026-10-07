@@ -344,10 +344,6 @@ class WriteBufferManager {
         ? null
         : (entries.isEmpty ? null : entries.first.transactionId);
 
-    final bp = _dataStore.parallelJournalManager
-        .applyEnqueueBackpressure(recordIds.length);
-    if (bp != null) await bp;
-
     for (int i = 0; i < recordIds.length; i++) {
       final y = yieldController.maybeYield();
       if (y != null) await y;
@@ -396,10 +392,6 @@ class WriteBufferManager {
       table,
       insertDelta: count,
     );
-
-    final bp =
-        _dataStore.parallelJournalManager.applyEnqueueBackpressure(count);
-    if (bp != null) await bp;
 
     final tableUid = table.tableUid;
     final recordCache = trees.pendingRecordCache;
@@ -473,10 +465,6 @@ class WriteBufferManager {
         ? null
         : (entries.isEmpty ? null : entries.first.transactionId);
 
-    final bp = _dataStore.parallelJournalManager
-        .applyEnqueueBackpressure(recordIds.length);
-    if (bp != null) await bp;
-
     final pendingQueue = <WriteQueueEntry>[];
     for (int i = 0; i < recordIds.length; i++) {
       final y = yieldController.maybeYield();
@@ -549,10 +537,6 @@ class WriteBufferManager {
     );
     final tableUid = table.tableUid;
     final schema = table.schema;
-
-    final bp = _dataStore.parallelJournalManager
-        .applyEnqueueBackpressure(recordIds.length);
-    if (bp != null) await bp;
 
     for (int i = 0; i < recordIds.length; i++) {
       final y = yieldController.maybeYield();

@@ -542,29 +542,37 @@ final class NghLeafPage {
   /// Live (non-tombstone) slot count.
   int get liveSlotCount => _liveSlotCount;
 
-  /// L2-normalized arithmetic mean of **live** slot low48 (tombstones excluded).
-  Float32List normalizedMean48() {
+  /// Writes the L2-normalized live-slot mean into [out] (length ≥ 48).
+  ///
+  /// Insert hot path can reuse [CentroidBranchEntry.centroid48D] and keep the
+  /// existing SIMD view instead of allocating a fresh [Float32List] each slot.
+  Float32List writeNormalizedMean48(Float32List out) {
     final count = _liveSlotCount;
-    final mean = Float32List(48);
-    if (count == 0) return mean;
+    if (count == 0) {
+      out.fillRange(0, 48, 0.0);
+      return out;
+    }
     _ensureSum48();
     final sum = _sum48!;
     double norm = 0.0;
     final inv = 1.0 / count;
     for (int d = 0; d < 48; d++) {
       final v = sum[d] * inv;
-      mean[d] = v;
+      out[d] = v;
       norm += v * v;
     }
     norm = sqrt(norm);
     if (norm > 0) {
       final scale = 1.0 / norm;
       for (int d = 0; d < 48; d++) {
-        mean[d] *= scale;
+        out[d] *= scale;
       }
     }
-    return mean;
+    return out;
   }
+
+  /// L2-normalized arithmetic mean of **live** slot low48 (tombstones excluded).
+  Float32List normalizedMean48() => writeNormalizedMean48(Float32List(48));
 
   /// Extra payload bytes if [addingNodeId] forces a compact→wide page upgrade.
   int wideUpgradeCostBytes(int addingNodeId) {
@@ -1596,6 +1604,10 @@ final class NghPageSizer {
   /// Largest TPG2 page we will choose for a high-D NGH index (1MB).
   static const int maxNghPageSize = 1024 * 1024;
 
+  /// Smallest NGH leaf page. Below this, OS/AEAD overhead dominates.
+  /// Nav pages still floor at [InternalConfig.defaultPageSize] (16KB).
+  static const int minNghLeafPageSize = 4 * 1024;
+
   /// PK bytes reserved when choosing a leaf page size (typical keys).
   static const int leafSlotPkBudget = 256;
 
@@ -1606,22 +1618,54 @@ final class NghPageSizer {
 
   /// Compute how many leaf slots can fit in one page for a given average PK length.
   ///
-  /// Soft-caps occupancy at [searchCalibMaxSlotsPerPage] so low-D indexes
-  /// (128D would otherwise pack ~99 vectors into 16KB) keep leaf fanout near
-  /// the 768D search calibration (~20–32 slots/page). Otherwise L2A scans
-  /// 5× more vectors per probed leaf and density hacks fight QPS vs recall.
+  /// Soft-caps occupancy at [searchCalibMaxSlotsPerPage] so a leftover-large
+  /// page (or a frozen 16KB low-D index) cannot pack 5× the 768D calibration
+  /// (~20–32 slots/page). New low-D indexes shrink the page instead; this cap
+  /// still bounds L2A scans per probed leaf.
   static const int searchCalibMaxSlotsPerPage = 32;
+
+  /// Packing *target* when growing leaf pages (not a reject floor).
+  /// Insert/search accept fewer slots; [NghGraphEngine] only special-cases
+  /// `slotsPerPage < 8` for sparse probe relief.
+  static const int searchCalibMinSlotsPerPage = 20;
+
+  /// Matches search sparse knee (`slotsPerPage < 8`). Below this, occupancy
+  /// growth may take one more doubling up to [maxLeafSparseReliefPageSize].
+  static const int leafSparseSlotsThreshold = 8;
+
+  /// Soft I/O ceiling while growing toward [searchCalibMinSlotsPerPage].
+  /// Keeps interactive probes (`wantLeaves × page`) bounded (~≤2MB @ depth 50).
+  static const int maxLeafOccupancyPageSize = 64 * 1024;
+
+  /// Harder I/O ceiling used only to escape [leafSparseSlotsThreshold] when a
+  /// 64KB page still packs fewer than 8 typical slots (e.g. 8192-d → 128KB/15).
+  static const int maxLeafSparseReliefPageSize = 128 * 1024;
 
   static int estimateLeafSlotsPerPage(
     int pageSize,
     int dimensions, {
     int avgPkLength = 16,
   }) {
+    final fit = _physicalLeafSlotsPerPage(
+      pageSize,
+      dimensions,
+      avgPkLength: avgPkLength,
+    );
+    if (fit <= 0) return 1;
+    return min(fit, searchCalibMaxSlotsPerPage);
+  }
+
+  /// Uncapped slot count for page-size choice (0 if even one typical slot
+  /// cannot fit).
+  static int _physicalLeafSlotsPerPage(
+    int pageSize,
+    int dimensions, {
+    int avgPkLength = 16,
+  }) {
     final slotSize = 19 + avgPkLength + dimensions;
     final usable = pageSize - pageHeaderSize - 12 - encodingSafetyMargin;
-    if (usable < slotSize) return 1;
-    final fit = (usable ~/ slotSize).clamp(1, 1024);
-    return min(fit, searchCalibMaxSlotsPerPage);
+    if (slotSize <= 0 || usable < slotSize) return 0;
+    return usable ~/ slotSize;
   }
 
   /// Estimate file size given page count and page size.
@@ -1673,6 +1717,10 @@ final class NghPageSizer {
 
   /// Smallest power-of-two page size that can hold [minPlainPayload] after
   /// TPG2 header, 128-byte flush margin, and encoder/AEAD slack.
+  ///
+  /// Floors at [InternalConfig.defaultPageSize] (16KB). Used by nav so L0
+  /// root-table capacity stays page-fit (~79 on 16KB). Leaf uses
+  /// [chooseLeafPageSize], which may go down to [minNghLeafPageSize].
   static int choosePageSize(int minPlainPayload, int basePageSize) {
     var size = basePageSize > 0 ? basePageSize : InternalConfig.defaultPageSize;
     if (size < InternalConfig.defaultPageSize) {
@@ -1686,17 +1734,66 @@ final class NghPageSizer {
     return size;
   }
 
-  /// Page size for one inlined SQ8 leaf slot (frozen layout).
+  static int _pow2AtLeast(int floor, int needBytes) {
+    var size = floor < minNghLeafPageSize ? minNghLeafPageSize : floor;
+    if ((size & (size - 1)) != 0) {
+      var p = minNghLeafPageSize;
+      while (p < size && p < maxNghPageSize) {
+        p *= 2;
+      }
+      size = min(p, maxNghPageSize);
+    }
+    while (size < needBytes && size < maxNghPageSize) {
+      size *= 2;
+    }
+    return size;
+  }
+
+  /// Leaf TPG2 page for [dimensions].
+  ///
+  /// 1. Smallest power-of-two that holds one worst-case-PK SQ8 slot (may exceed
+  ///    16KB for extreme D; never below [minNghLeafPageSize]).
+  /// 2. Grow toward ~[searchCalibMinSlotsPerPage] while ≤[maxLeafOccupancyPageSize]
+  ///    so large-N nav inventory stays O(N/slots). **Fewer than 20 is allowed** —
+  ///    this is a packing target, not a schema/insert reject.
+  /// 3. If still `< [leafSparseSlotsThreshold]` and a larger page actually adds
+  ///    slots, grow up to [maxLeafSparseReliefPageSize] so search does not treat
+  ///    the leaf as spp<8 sparse.
+  ///
+  /// [basePageSize] is unused for occupancy (kept for call-site symmetry with
+  /// nav); low-D shrinks below the database 16KB page on purpose.
   static int chooseLeafPageSize(int dimensions, int basePageSize) {
     final dim = dimensions.clamp(1, maxDimensions);
-    final payload = 12 + 19 + leafSlotPkBudget + dim;
-    return choosePageSize(payload, basePageSize);
+    final oneSlotNeed = 12 + 19 + leafSlotPkBudget + dim + flushFitOverhead;
+    var size = _pow2AtLeast(minNghLeafPageSize, oneSlotNeed);
+
+    // Phase 1: prefer the 20–32 calibration band without huge leaf I/O.
+    while (size < maxLeafOccupancyPageSize &&
+        _physicalLeafSlotsPerPage(size, dim) < searchCalibMinSlotsPerPage) {
+      final next = size * 2;
+      if (next > maxLeafOccupancyPageSize || next > maxNghPageSize) break;
+      size = next;
+    }
+
+    // Phase 2: escape spp<8 when one more doubling still fits the relief cap
+    // and actually packs more vectors (no-op grow for 32k+/65k-d).
+    while (size < maxLeafSparseReliefPageSize &&
+        _physicalLeafSlotsPerPage(size, dim) < leafSparseSlotsThreshold) {
+      final next = size * 2;
+      if (next > maxLeafSparseReliefPageSize || next > maxNghPageSize) break;
+      if (_physicalLeafSlotsPerPage(next, dim) <=
+          _physicalLeafSlotsPerPage(size, dim)) {
+        break;
+      }
+      size = next;
+    }
+    return size;
   }
 
   /// Page size for one SQ8 nav centroid (max neighbors + min children).
   ///
-  /// Disk is SQ8 (1 byte/dim + offset/scale). 4096-d fits the database 16KB
-  /// page; 65535-d needs ~128KB, same order as leaf pages.
+  /// Disk is SQ8 (1 byte/dim + offset/scale). Grows with D so one centroid
+  /// record fits; independent of leaf occupancy (leaf may be larger or smaller).
   static int chooseNavPageSize(int dimensions, int basePageSize) {
     final dim = dimensions.clamp(1, maxDimensions);
     final payload = 12 + NghNavCentroidPage.recordSize(dim, maxNavNeighbors, 8);
@@ -1714,9 +1811,9 @@ final class NghPageSizer {
   ) {
     final needLeaf = chooseLeafPageSize(meta.dimensions, basePageSize);
     final needNav = chooseNavPageSize(meta.dimensions, basePageSize);
-    final leafSize = meta.hasLeafData
-        ? meta.leafPageSize
-        : (needLeaf > basePageSize ? needLeaf : 0);
+    // Persist explicit leaf size even when smaller than the 16KB database
+    // page; 0 would resolve back to 16KB and reintroduce hollow low-D pages.
+    final leafSize = meta.hasLeafData ? meta.leafPageSize : needLeaf;
     final nav = meta.hasNavData
         ? meta.navPageSize
         : (needNav > basePageSize ? needNav : 0);

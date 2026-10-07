@@ -39,8 +39,8 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   List<QueryAggregation>? _aggregations;
 
   /// Flags that keep the pure-ANN cache valid (anything else clears it).
-  static const int _pureMatchVectorOkFlags =
-      QueryClauseMask.matchVector | QueryClauseMask.selectedFields;
+  /// select() does not touch clauseFlags (projection is field-list only).
+  static const int _pureMatchVectorOkFlags = QueryClauseMask.matchVector;
 
   QueryBuilder(super.db, super.tableName, {super.binding});
 
@@ -145,7 +145,9 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
         ]);
       }
     }
-    _clauseFlags |= QueryClauseMask.selectedFields;
+    // Do not set QueryClauseMask.selectedFields: point-hotspot detection is
+    // clauseFlags == 0; projection is applied after isPointDirect from
+    // _selectedFields.
     if (_extraAggregations.isNotEmpty) {
       _clauseFlags |= QueryClauseMask.aggregations;
     }
@@ -175,7 +177,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
         ]);
       }
     }
-    _clauseFlags |= QueryClauseMask.selectedFields;
+    // See select(): never set selectedFields bit on clauseFlags.
     if (_aggregations!.isNotEmpty) {
       _clauseFlags |= QueryClauseMask.aggregations;
     }
@@ -354,6 +356,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       limit: _limit,
       offset: _offset,
       cursor: _cursor,
+      selectedFields: _selectedFields,
     );
     return _db.queryExecutor.clearQueryCacheForKey(cacheKey);
   }

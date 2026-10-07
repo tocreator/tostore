@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:math' show max, min;
+import 'dart:math' show max;
 import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
@@ -8,6 +8,7 @@ import '../handler/logger.dart';
 import '../interface/storage_interface.dart';
 import '../model/data_store_config.dart';
 import '../model/db_exception.dart';
+import '../model/parallel_journal_entry.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/table_context.dart';
@@ -15,6 +16,8 @@ import '../model/table_identity.dart';
 import '../model/value_ref.dart';
 import 'btree_page.dart';
 import 'data_store_impl.dart';
+import 'overflow_pack_session.dart';
+import 'page_redo_log_codec.dart';
 import 'tree_cache.dart';
 
 /// Out-of-line large value store (TOAST-like), page based.
@@ -49,8 +52,8 @@ final class OverflowAllocationResult {
 final class OverflowManager {
   final DataStoreImpl _dataStore;
 
-  // Page cache for fast retrieval: [tableUid, partitionNo, pageNo] -> OverflowPage
-  late final TreeCache<OverflowPage> _pageCache;
+  // Page cache: OverflowPage (OVP1) | OverflowPackedPage (OVP2)
+  late final TreeCache<Object> _pageCache;
 
   OverflowManager(this._dataStore) {
     final resourceManager = _dataStore.resourceManager;
@@ -61,8 +64,12 @@ final class OverflowManager {
     final bool isMemoryMode =
         _dataStore.config.persistenceMode == PersistenceMode.memory;
 
-    _pageCache = TreeCache<OverflowPage>(
-      sizeCalculator: (page) => page.data.length + 32,
+    _pageCache = TreeCache<Object>(
+      sizeCalculator: (page) {
+        if (page is OverflowPage) return page.data.length + 32;
+        if (page is OverflowPackedPage) return page.capacity + 32;
+        return 64;
+      },
       maxByteThreshold: overflowCacheSize,
       minByteThreshold: 30 * 1024 * 1024, // 30MB minimum
       groupDepth: 1, // Group by tableUid
@@ -70,6 +77,388 @@ final class OverflowManager {
           isMemoryMode ? TreeCacheEvictionMode.none : TreeCacheEvictionMode.lru,
       debugLabel: 'OverflowPageCache',
     );
+  }
+
+  StorageInterface get storage => _dataStore.storage;
+
+  /// Field-level toast threshold (default ~1KB at 16KB page).
+  int fieldExternalizeThreshold(int pageSize) {
+    final t = pageSize ~/ 16;
+    return t < 512 ? 512 : t;
+  }
+
+  bool shouldExternalizeField(int pageSize, int valueLen) {
+    return valueLen >= fieldExternalizeThreshold(pageSize);
+  }
+
+  void cachePackedPage(
+    TableUid tableUid,
+    int partitionNo,
+    int pageNo,
+    OverflowPackedPage page,
+  ) {
+    _pageCache.putPoint3(tableUid, partitionNo, pageNo, page);
+  }
+
+  OverflowPackedPage? getCachedPackedPage(
+    TableUid tableUid,
+    int partitionNo,
+    int pageNo,
+  ) {
+    final p = _pageCache.getPoint3(tableUid, partitionNo, pageNo);
+    return p is OverflowPackedPage ? p : null;
+  }
+
+  OverflowPackedPage? loadPackedPageSyncHint(
+    TableUid tableUid,
+    int partitionNo,
+    int pageNo,
+  ) =>
+      getCachedPackedPage(tableUid, partitionNo, pageNo);
+
+  /// Drop one cached overflow page (e.g. after page-redo replay).
+  void invalidateCachedPage(TableUid tableUid, int partitionNo, int pageNo) {
+    _pageCache.removePoint3(tableUid, partitionNo, pageNo);
+  }
+
+  /// Append overflow mixed-page after-images to the batch page redo log and
+  /// fsync before the corresponding overflow page IO.
+  Future<void> appendOverflowPageRedoIfNeeded({
+    required BatchContext? batchContext,
+    required List<Uint8List> redoRecords,
+  }) async {
+    if (redoRecords.isEmpty) return;
+    if (batchContext == null ||
+        !batchContext.recordsPageRedo ||
+        batchContext.batchId.isEmpty) {
+      return;
+    }
+    final redoPath = _dataStore.pathManager.getPageRedoLogPath(
+      batchContext.batchId,
+      spaceName: _dataStore.currentSpaceName,
+    );
+    await _dataStore.storage.ensureDirectoryExists(p.dirname(redoPath));
+    final int totalLen = redoRecords.fold<int>(0, (sum, b) => sum + b.length);
+    final Uint8List merged;
+    if (redoRecords.length == 1) {
+      merged = redoRecords.first;
+    } else {
+      merged = Uint8List(totalLen);
+      var offset = 0;
+      for (final b in redoRecords) {
+        merged.setRange(offset, offset + b.length, b);
+        offset += b.length;
+      }
+    }
+    await _dataStore.storage.appendBytes(
+      redoPath,
+      PageRedoLogCodec.wrapChunk(merged),
+      flush: true,
+    );
+  }
+
+  Uint8List buildOverflowPageBytes({
+    required int partitionNo,
+    required int pageNo,
+    required Uint8List payload,
+    required int pageSize,
+    Uint8List? encryptionKey,
+    int? encryptionKeyId,
+  }) {
+    final encodedPayload = BTreePageCodec.encodePayload(
+      payload,
+      config: _dataStore.config,
+      encryptionKey: encryptionKey,
+      encryptionKeyId: encryptionKeyId,
+      aad: _aadForOverflowPage(partitionNo, pageNo),
+    );
+    return BTreePageIO.buildPageBytes(
+      type: BTreePageType.overflow,
+      encodedPayload: encodedPayload,
+      pageSize: pageSize,
+    );
+  }
+
+  Uint8List buildFreePageBytes({
+    required int partitionNo,
+    required int pageNo,
+    required int nextFreePageNo,
+    required int pageSize,
+    Uint8List? encryptionKey,
+    int? encryptionKeyId,
+  }) {
+    final encodedPayload = BTreePageCodec.encodePayload(
+      FreePage(nextFreePageNo: nextFreePageNo).encodePayload(),
+      config: _dataStore.config,
+      encryptionKey: encryptionKey,
+      encryptionKeyId: encryptionKeyId,
+      aad: _aadForOverflowPage(partitionNo, pageNo),
+    );
+    return BTreePageIO.buildPageBytes(
+      type: BTreePageType.free,
+      encodedPayload: encodedPayload,
+      pageSize: pageSize,
+    );
+  }
+
+  Future<void> commitPackSessionMeta({
+    required String path,
+    required int pageSize,
+    required int partitionNo,
+    required PartitionMetaPage meta,
+    Uint8List? encryptionKey,
+    int? encryptionKeyId,
+    bool flush = false,
+    bool alreadyHoldingLock = false,
+    bool keepInflight = false,
+  }) async {
+    Future<void> body() async {
+      _inflightMeta[path] = meta;
+      await _writeMeta(
+        path: path,
+        pageSize: pageSize,
+        partitionNo: partitionNo,
+        meta: meta,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+        flush: flush,
+      );
+      if (!keepInflight) {
+        _inflightMeta.remove(path);
+      }
+    }
+
+    if (alreadyHoldingLock) {
+      await body();
+    } else {
+      await _getLock(path).synchronized(body);
+    }
+  }
+
+  int _maxPackedPayloadLen(int pageSize, {int? encryptionKeyId}) {
+    int lo = 0;
+    int hi = pageSize;
+    while (lo < hi) {
+      final mid = (lo + hi + 1) >> 1;
+      final ok = BTreePageSizer.fitsInPage(
+        pageSize: pageSize,
+        plainPayloadLen: mid,
+        config: _dataStore.config,
+        encryptionKeyId: encryptionKeyId,
+      );
+      if (ok) {
+        lo = mid;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    if (lo < OverflowPackedPage.headerSize + OverflowPackedPage.slotEntrySize) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Overflow pageSize too small for OVP2: pageSize=$pageSize',
+        ),
+      ]);
+    }
+    return lo;
+  }
+
+  int maxPackedChunkLen(int pageSize, {int? encryptionKeyId}) {
+    final cap =
+        _maxPackedPayloadLen(pageSize, encryptionKeyId: encryptionKeyId);
+    return OverflowPackedPage.maxChunkForCapacity(cap);
+  }
+
+  /// Open a mixed-packing session on the active overflow partition.
+  ///
+  /// Holds the partition [SimpleLock] until [OverflowPackSession.finish] or
+  /// [OverflowPackSession.rollback] so no concurrent delete/put can interleave.
+  ///
+  /// When [allowSharedPageOverwrite] is false (e.g. recovery reflush that
+  /// skips page redo), only freelist-empty and file-growth pages are used so
+  /// live mixed slots are never overwritten without after-images.
+  Future<OverflowPackSession> beginPackSession({
+    required TableContext table,
+    required int pageSize,
+    int overflowPartitionCount = 1,
+    Uint8List? encryptionKey,
+    int? encryptionKeyId,
+    OverflowWriteBuffer? writeBuffer,
+    bool flush = false,
+    bool allowSharedPageOverwrite = true,
+  }) async {
+    final pNo =
+        (overflowPartitionCount - 1) < 0 ? 0 : overflowPartitionCount - 1;
+    final path = _overflowPath(table, pNo);
+    final lock = _getLock(path);
+    await lock.acquire();
+    try {
+      await _ensureFileInitialized(
+        path: path,
+        pageSize: pageSize,
+        partitionNo: pNo,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+        flush: flush,
+      );
+      var meta = await _healMetaIfAheadOfFile(
+        path: path,
+        pageSize: pageSize,
+        partitionNo: pNo,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+        flush: flush,
+      );
+      final diskMetaAtOpen = meta;
+      final payloadCap =
+          _maxPackedPayloadLen(pageSize, encryptionKeyId: encryptionKeyId);
+      final maxChunk = OverflowPackedPage.maxChunkForCapacity(payloadCap);
+      var fsm = OverflowFsmPage();
+      if (meta.fsmPageNo > 0) {
+        try {
+          final fsmPage = await _readPackedOrFsmPayload(
+            path: path,
+            pageSize: pageSize,
+            partitionNo: pNo,
+            pageNo: meta.fsmPageNo,
+            encryptionKey: encryptionKey,
+            encryptionKeyId: encryptionKeyId,
+          );
+          final decoded = OverflowFsmPage.tryDecodePayload(fsmPage);
+          if (decoded != null) fsm = decoded;
+        } catch (_) {}
+      }
+      // Preload FSM candidate pages into cache for sync packing.
+      // Drop entries that cannot be loaded — never invent empty packed pages.
+      final fsmPages = fsm.freeByPage.keys.toList(growable: false);
+      for (final pageNo in fsmPages) {
+        try {
+          final packed = await _readAndCachePackedPage(
+            table: table,
+            path: path,
+            pageSize: pageSize,
+            partitionNo: pNo,
+            pageNo: pageNo,
+            encryptionKey: encryptionKey,
+            encryptionKeyId: encryptionKeyId,
+          );
+          if (packed == null) {
+            fsm.setFree(pageNo, 0);
+          }
+        } catch (_) {
+          fsm.setFree(pageNo, 0);
+        }
+      }
+
+      // Pre-pop freelist pages so packValue can reuse them synchronously.
+      // Only add a page after it verifies as FreePage — never trust a stale
+      // head (would invent an empty OVP2 page and wipe live slots).
+      final reusable = <int>[];
+      var freeHead = meta.freeListHeadPageNo;
+      var freeCount = meta.freePageCount;
+      var guard = 0;
+      while (freeHead > 0 && freeCount > 0 && guard++ < 4096) {
+        try {
+          final pageBytes = await _dataStore.storage
+              .readAsBytesAt(path, freeHead * pageSize, length: pageSize);
+          final parsed = BTreePageIO.parsePageBytes(pageBytes);
+          if (parsed.type != BTreePageType.free) {
+            freeHead = -1;
+            freeCount = 0;
+            break;
+          }
+          final decoded = BTreePageCodec.decodePayload(
+            parsed.encodedPayload,
+            encryptionKey: encryptionKey,
+            encryptionKeyId: encryptionKeyId,
+            aad: _aadForOverflowPage(pNo, freeHead),
+          );
+          final fp = FreePage.tryDecodePayload(decoded);
+          if (fp == null) {
+            freeHead = -1;
+            freeCount = 0;
+            break;
+          }
+          reusable.add(freeHead);
+          freeHead = fp.nextFreePageNo;
+          freeCount -= 1;
+        } catch (_) {
+          freeHead = -1;
+          freeCount = 0;
+          break;
+        }
+      }
+      meta = meta.copyWith(
+        freeListHeadPageNo: freeHead,
+        freePageCount: freeCount < 0 ? 0 : freeCount,
+      );
+
+      _inflightMeta[path] = meta;
+      return OverflowPackSession(
+        manager: this,
+        table: table,
+        pageSize: pageSize,
+        partitionNo: pNo,
+        path: path,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+        writeBuffer: writeBuffer ?? OverflowWriteBuffer(),
+        payloadCapacity: payloadCap,
+        maxChunkLen: maxChunk,
+        meta: meta,
+        rollbackMeta: diskMetaAtOpen,
+        fsm: fsm,
+        reusableFreePages: reusable,
+        releaseLock: lock.release,
+        allowSharedPageOverwrite: allowSharedPageOverwrite,
+      );
+    } catch (_) {
+      lock.release();
+      rethrow;
+    }
+  }
+
+  Future<Uint8List> _readPackedOrFsmPayload({
+    required String path,
+    required int pageSize,
+    required int partitionNo,
+    required int pageNo,
+    Uint8List? encryptionKey,
+    int? encryptionKeyId,
+  }) async {
+    final pageBytes = await _dataStore.storage
+        .readAsBytesAt(path, pageNo * pageSize, length: pageSize);
+    final parsed = BTreePageIO.parsePageBytes(pageBytes);
+    return BTreePageCodec.decodePayload(
+      parsed.encodedPayload,
+      encryptionKey: encryptionKey,
+      encryptionKeyId: encryptionKeyId,
+      aad: _aadForOverflowPage(partitionNo, pageNo),
+    );
+  }
+
+  Future<OverflowPackedPage?> _readAndCachePackedPage({
+    required TableContext table,
+    required String path,
+    required int pageSize,
+    required int partitionNo,
+    required int pageNo,
+    Uint8List? encryptionKey,
+    int? encryptionKeyId,
+  }) async {
+    final payload = await _readPackedOrFsmPayload(
+      path: path,
+      pageSize: pageSize,
+      partitionNo: partitionNo,
+      pageNo: pageNo,
+      encryptionKey: encryptionKey,
+      encryptionKeyId: encryptionKeyId,
+    );
+    final packed = OverflowPackedPage.tryDecodePayload(payload);
+    if (packed != null) {
+      _pageCache.putPoint3(table.tableUid, partitionNo, pageNo, packed);
+    }
+    return packed;
   }
 
   // Locks to prevent concurrent metadata updates (race on free list/file size).
@@ -106,140 +495,12 @@ final class OverflowManager {
     return (valueLen + maxChunk - 1) ~/ maxChunk;
   }
 
-  Future<
-      ({
-        int partitionNo,
-        List<int> pageNos,
-        int updatedPartitionCount,
-        int sizeDeltaBytes,
-        PartitionMetaPage? rollbackMeta,
-      })> _allocatePages({
-    required int count,
-    required TableContext table,
-    required int pageSize,
-    required int overflowPartitionCount,
-    Uint8List? encryptionKey,
-    int? encryptionKeyId,
-    bool flush = true,
-    bool requireAllInOnePartition = false,
-  }) async {
-    if (count <= 0) {
-      final pNo =
-          (overflowPartitionCount - 1) < 0 ? 0 : overflowPartitionCount - 1;
-      return (
-        partitionNo: pNo,
-        pageNos: const <int>[],
-        updatedPartitionCount:
-            overflowPartitionCount < 1 ? 1 : overflowPartitionCount,
-        sizeDeltaBytes: 0,
-        rollbackMeta: null,
-      );
-    }
-
-    int activePNo =
-        (overflowPartitionCount - 1) < 0 ? 0 : overflowPartitionCount - 1;
-    int currentCount = overflowPartitionCount < 1 ? 1 : overflowPartitionCount;
-    final maxPartitionSize = _dataStore.config.maxPartitionFileSize;
-    // Skip full partitions; bound the walk so a corrupt meta chain cannot loop.
-    var rotations = 0;
-    const maxRotations = 256;
-
-    while (true) {
-      final path = _overflowPath(table, activePNo);
-      final allocated = await _getLock(path).synchronized(() async {
-        await _ensureFileInitialized(
-          path: path,
-          pageSize: pageSize,
-          partitionNo: activePNo,
-          encryptionKey: encryptionKey,
-          encryptionKeyId: encryptionKeyId,
-          flush: flush,
-        );
-
-        final PartitionMetaPage meta;
-        final inflight = _inflightMeta[path];
-        if (inflight != null) {
-          // Active batch reservations are intentionally ahead of durable file
-          // bytes (pages are written later). Healing would shrink meta and
-          // reissue page numbers already handed to the allocator.
-          meta = inflight;
-        } else {
-          meta = await _healMetaIfAheadOfFile(
-            path: path,
-            pageSize: pageSize,
-            partitionNo: activePNo,
-            encryptionKey: encryptionKey,
-            encryptionKeyId: encryptionKeyId,
-            flush: flush,
-          );
-        }
-
-        final growRoom = pageSize <= 0
-            ? 0
-            : max(0, (maxPartitionSize - meta.totalSizeBytes) ~/ pageSize);
-        final available = meta.freePageCount + growRoom;
-        final bool isEmptyPartition = meta.totalSizeBytes <= pageSize;
-
-        int take;
-        if (requireAllInOnePartition) {
-          if (available >= count) {
-            take = count;
-          } else if (isEmptyPartition) {
-            // One ValueRef must stay in one file; allow soft-max overrun.
-            take = count;
-          } else {
-            return null; // Rotate to a fresher partition
-          }
-        } else {
-          if (available <= 0) {
-            return null; // Rotate
-          }
-          take = min(count, available);
-        }
-
-        return await _allocatePageNos(
-          count: take,
-          path: path,
-          pageSize: pageSize,
-          partitionNo: activePNo,
-          encryptionKey: encryptionKey,
-          encryptionKeyId: encryptionKeyId,
-          flush: flush,
-          cachedMeta: meta,
-        );
-      });
-
-      if (allocated != null) {
-        return (
-          partitionNo: activePNo,
-          pageNos: allocated.pageNos,
-          updatedPartitionCount: currentCount,
-          sizeDeltaBytes: allocated.sizeDeltaBytes,
-          rollbackMeta: allocated.rollbackMeta,
-        );
-      }
-
-      if (++rotations > maxRotations) {
-        throw DbException([
-          GeneralStatus(
-            type: ResultType.sysResourceExhausted,
-            message:
-                'Overflow allocation failed: cannot place $count pages after '
-                'skipping $maxRotations full partitions (last=$activePNo)',
-          ),
-        ]);
-      }
-
-      // Rotate to next partition
-      activePNo += 1;
-      currentCount = activePNo + 1;
-    }
-  }
-
-  /// If meta.totalSizeBytes ran ahead of durable file bytes (common after
-  /// disk-full: meta updated in [_allocatePageNos] then page writes failed),
-  /// shrink meta to the page-aligned file size so the next retry reuses this
-  /// partition instead of rotating to a new pN.dat.
+  /// Align meta.totalSizeBytes with the durable file size.
+  ///
+  /// - Meta ahead of file (disk-full after reservation): shrink so retries
+  ///   reuse this partition instead of rotating.
+  /// - File ahead of meta (mid-flush pages durable, meta not yet written):
+  ///   advance so the next alloc never reissues those page numbers.
   Future<PartitionMetaPage> _healMetaIfAheadOfFile({
     required String path,
     required int pageSize,
@@ -266,19 +527,20 @@ final class OverflowManager {
     if (fileSize < pageSize) return meta;
 
     final durableSize = (fileSize ~/ pageSize) * pageSize;
-    if (meta.totalSizeBytes <= durableSize) return meta;
+    if (meta.totalSizeBytes == durableSize) return meta;
 
-    Logger.debug(
-      'Overflow meta ahead of file; healing totalSizeBytes '
-      '${meta.totalSizeBytes} -> $durableSize (partition=$partitionNo)',
-    );
-    final healed = PartitionMetaPage(
-      partitionNo: meta.partitionNo,
-      totalEntryCount: meta.totalEntryCount,
-      totalSizeBytes: durableSize,
-      freeListHeadPageNo: meta.freeListHeadPageNo,
-      freePageCount: meta.freePageCount,
-    );
+    if (meta.totalSizeBytes > durableSize) {
+      Logger.debug(
+        'Overflow meta ahead of file; healing totalSizeBytes '
+        '${meta.totalSizeBytes} -> $durableSize (partition=$partitionNo)',
+      );
+    } else {
+      Logger.debug(
+        'Overflow file ahead of meta; advancing totalSizeBytes '
+        '${meta.totalSizeBytes} -> $durableSize (partition=$partitionNo)',
+      );
+    }
+    final healed = meta.copyWith(totalSizeBytes: durableSize);
     await _writeMeta(
       path: path,
       pageSize: pageSize,
@@ -304,9 +566,10 @@ final class OverflowManager {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
     bool flush = false,
+    bool alreadyHoldingLock = false,
   }) async {
     final path = _overflowPath(table, partitionNo);
-    await _getLock(path).synchronized(() async {
+    Future<void> body() async {
       _inflightMeta.remove(path);
       if (!await _dataStore.storage.existsFile(path)) return;
       try {
@@ -332,7 +595,13 @@ final class OverflowManager {
           );
         } catch (_) {}
       }
-    });
+    }
+
+    if (alreadyHoldingLock) {
+      await body();
+    } else {
+      await _getLock(path).synchronized(body);
+    }
   }
 
   Future<void> _commitInflightMeta({
@@ -660,6 +929,10 @@ final class OverflowManager {
     }
   }
 
+  /// Store a large value using OVP2 mixed pages + ValueRef v2.
+  ///
+  /// [allocator] is ignored for new writes (kept for call-site compatibility);
+  /// prefer [beginPackSession] + pack for multi-value batches that share pages.
   Future<OverflowAllocationResult> putLargeValue({
     required TableContext table,
     required Uint8List valueBytes,
@@ -671,163 +944,51 @@ final class OverflowManager {
     OverflowBatchAllocator? allocator,
     OverflowWriteBuffer? writeBuffer,
   }) async {
-    if (valueBytes.isEmpty) {
-      throw DbException([
-        InvalidArgumentStatus(
-          type: ResultType.engError,
-          message: 'put large value: valueBytes must not be empty',
-          parameterName: 'valueBytes',
-          passedValue: valueBytes.length,
-        ),
-      ]);
-    }
-
-    final crc = Crc32.of(valueBytes);
-    final maxChunk = _maxChunkLen(
-      pageSize,
+    final session = await beginPackSession(
+      table: table,
+      pageSize: pageSize,
+      overflowPartitionCount: overflowPartitionCount,
+      encryptionKey: encryptionKey,
       encryptionKeyId: encryptionKeyId,
+      writeBuffer: writeBuffer,
+      flush: flush,
     );
-    final chunks = _splitIntoChunks(valueBytes, maxChunk);
-
-    final int targetPartitionNo;
-    final List<int> pageNos;
-    final int updatedPartitionCount;
-    final int sizeDeltaBytes;
-    PartitionMetaPage? localRollbackMeta;
-
-    if (allocator != null) {
-      // Pre-assigned whole-chain reservation from startBatchAllocation.
-      pageNos = allocator.next(chunks.length);
-      targetPartitionNo = allocator.partitionNo;
-      updatedPartitionCount = allocator.updatedOverflowPartitionCount;
-      // Batch allocator already accounted file growth at startBatchAllocation.
-      sizeDeltaBytes = 0;
-    } else {
-      final allocRes = await _allocatePages(
-        count: chunks.length,
-        table: table,
-        pageSize: pageSize,
-        overflowPartitionCount: overflowPartitionCount,
-        encryptionKey: encryptionKey,
-        encryptionKeyId: encryptionKeyId,
-        flush: flush,
-        requireAllInOnePartition: true,
-      );
-      targetPartitionNo = allocRes.partitionNo;
-      pageNos = allocRes.pageNos;
-      updatedPartitionCount = allocRes.updatedPartitionCount;
-      sizeDeltaBytes = allocRes.sizeDeltaBytes;
-      localRollbackMeta = allocRes.rollbackMeta;
-    }
-
-    final path = _overflowPath(table, targetPartitionNo);
-    final writes = <ByteWrite>[];
-    for (int i = 0; i < pageNos.length; i++) {
-      final pn = pageNos[i];
-      final next = (i + 1 < pageNos.length) ? pageNos[i + 1] : -1;
-      final page = OverflowPage(nextPageNo: next, data: chunks[i]);
-      final payload = page.encodePayload();
-      final encodedPayload = BTreePageCodec.encodePayload(
-        payload,
-        config: _dataStore.config,
-        encryptionKey: encryptionKey,
-        encryptionKeyId: encryptionKeyId,
-        aad: _aadForOverflowPage(targetPartitionNo, pn),
-      );
-      writes.add(ByteWrite(
-        offset: pn * pageSize,
-        bytes: BTreePageIO.buildPageBytes(
-          type: BTreePageType.overflow,
-          encodedPayload: encodedPayload,
-          pageSize: pageSize,
-        ),
-      ));
-    }
-
-    // Overflow pages must be on disk before ValueRefs are published. Batch
-    // apply stages pages and commits in sequential runs (same bytes / page
-    // numbers; each commit is awaited). Meta is committed only after durable
-    // page IO so disk-full cannot strand ghost totalSizeBytes.
     try {
-      if (writeBuffer != null) {
-        writeBuffer.addWrites(path, writes);
-        if (writeBuffer.pendingBytes >= OverflowWriteBuffer.maxStagedBytes) {
-          await writeBuffer.commit(_dataStore.storage, flush: false);
-          // Batch reservations stay in [_inflightMeta] until
-          // [commitBatchAllocation]. Committing the full reservation while
-          // only a prefix of pages is on disk makes meta ahead of the file;
-          // a later alloc would heal/shrink and reissue those page numbers.
-          if (allocator == null) {
-            await _commitInflightMeta(
-              path: path,
-              pageSize: pageSize,
-              partitionNo: targetPartitionNo,
-              encryptionKey: encryptionKey,
-              encryptionKeyId: encryptionKeyId,
-              flush: false,
-            );
-          }
-        }
-      } else {
-        await _dataStore.storage.writeManyAsBytesAt(path, writes, flush: flush);
-        if (allocator == null) {
-          await _commitInflightMeta(
-            path: path,
-            pageSize: pageSize,
-            partitionNo: targetPartitionNo,
-            encryptionKey: encryptionKey,
-            encryptionKeyId: encryptionKeyId,
-            flush: flush,
-          );
-        }
-      }
+      final ref = session.packValue(valueBytes);
+      final fin = await session.finish(flush: flush);
+      final updatedCount = fin.overflowPartitionCount > overflowPartitionCount
+          ? fin.overflowPartitionCount
+          : (overflowPartitionCount < 1 ? 1 : overflowPartitionCount);
+      return OverflowAllocationResult(
+        ref: ref,
+        overflowPartitionCount: updatedCount,
+        sizeDeltaBytes: fin.sizeDeltaBytes,
+      );
     } catch (e) {
-      // Solo alloc: drop reservation immediately. Batch allocators are rolled
-      // back by the caller after the whole staging/commit attempt fails.
-      if (allocator == null && localRollbackMeta != null) {
-        try {
-          await rollbackAllocation(
-            table: table,
-            partitionNo: targetPartitionNo,
-            pageSize: pageSize,
-            previousMeta: localRollbackMeta,
-            encryptionKey: encryptionKey,
-            encryptionKeyId: encryptionKeyId,
-            flush: false,
-          );
-        } catch (_) {}
-      }
+      await session.rollback();
       rethrow;
     }
+  }
 
-    // Warm cache with newly written pages
-    for (int i = 0; i < pageNos.length; i++) {
-      final pn = pageNos[i];
-      final next = (i + 1 < pageNos.length) ? pageNos[i + 1] : -1;
-      final page = OverflowPage(nextPageNo: next, data: chunks[i]);
-      _pageCache.putPoint3(table.tableUid, targetPartitionNo, pn, page);
-    }
-
-    final ref = ValueRef.overflow(
-      overflowPartitionNo: targetPartitionNo,
-      startPageNo: pageNos.first,
-      totalLen: valueBytes.length,
-      crc32: crc,
-    );
-
-    return OverflowAllocationResult(
-      ref: ref,
-      overflowPartitionCount: updatedPartitionCount,
-      sizeDeltaBytes: sizeDeltaBytes,
+  /// Pack one value into an open [OverflowPackSession] (batch mixed write).
+  ({OverflowAllocationResult result, bool bufferNeedsCommit})
+      stageLargeValueInSession({
+    required OverflowPackSession session,
+    required Uint8List valueBytes,
+  }) {
+    final ref = session.packValue(valueBytes);
+    return (
+      result: OverflowAllocationResult(
+        ref: ref,
+        overflowPartitionCount: session.partitionNo + 1,
+        sizeDeltaBytes: 0,
+      ),
+      bufferNeedsCommit: session.writeBuffer.pendingBytes >=
+          OverflowWriteBuffer.maxStagedBytes,
     );
   }
 
-  /// Synchronous batch staging: take a pre-reserved chain and append page
-  /// writes to [writeBuffer] without scheduling a microtask.
-  ///
-  /// Returns whether the caller should await [OverflowWriteBuffer.commit].
-  /// Does **not** commit overflow meta; that stays in-flight until
-  /// [commitBatchAllocation].
+  /// Legacy exclusive-chain staging (OVP1). Prefer [stageLargeValueInSession].
   ({OverflowAllocationResult result, bool bufferNeedsCommit})
       stageLargeValueWithAllocator({
     required TableContext table,
@@ -902,15 +1063,30 @@ final class OverflowManager {
     );
   }
 
-  /// Free overflow pages back to the freelist.
+  /// Free overflow pages / slots. v1 walks OVP1 chains; v2 frees by fragments.
+  ///
+  /// When [batchContext] records page redo, in-place rewrites of mixed pages
+  /// that still hold other live slots are logged before the page write.
   Future<void> deleteLargeValue({
     required TableContext table,
     required ValueRef ref,
     required int pageSize,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
+    BatchContext? batchContext,
   }) async {
     if (ref.kind != ValueRef.kindOverflow) return;
+    if (ref.isV2) {
+      await _deleteLargeValueV2(
+        table: table,
+        ref: ref,
+        pageSize: pageSize,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+        batchContext: batchContext,
+      );
+      return;
+    }
 
     final path = _overflowPath(table, ref.overflowPartitionNo);
     if (!await _dataStore.storage.existsFile(path)) return;
@@ -930,7 +1106,7 @@ final class OverflowManager {
           ref.overflowPartitionNo,
           curPageNo,
         );
-        if (cached != null) {
+        if (cached is OverflowPage) {
           curPageNo = cached.nextPageNo;
           continue;
         }
@@ -1002,12 +1178,8 @@ final class OverflowManager {
       await _dataStore.storage.writeManyAsBytesAt(path, writes, flush: false);
 
       // 5. Update meta.
-      final newMeta = PartitionMetaPage(
-        partitionNo: meta.partitionNo,
-        totalEntryCount: meta.totalEntryCount,
-        totalSizeBytes: meta.totalSizeBytes,
-        freeListHeadPageNo:
-            pageNos.first, // The first page in our reconstructed chain
+      final newMeta = meta.copyWith(
+        freeListHeadPageNo: pageNos.first,
         freePageCount: meta.freePageCount + pageNos.length,
       );
       await _writeMeta(
@@ -1022,6 +1194,230 @@ final class OverflowManager {
     });
   }
 
+  Future<void> _deleteLargeValueV2({
+    required TableContext table,
+    required ValueRef ref,
+    required int pageSize,
+    Uint8List? encryptionKey,
+    int? encryptionKeyId,
+    BatchContext? batchContext,
+  }) async {
+    final path = _overflowPath(table, ref.overflowPartitionNo);
+    if (!await _dataStore.storage.existsFile(path)) return;
+
+    await _getLock(path).synchronized(() async {
+      var frags = ref.fragments;
+      if (ref.indirectDirectory && frags.isNotEmpty) {
+        final dir = await _readSlotBytes(
+          table: table,
+          path: path,
+          partitionNo: ref.overflowPartitionNo,
+          pageNo: frags.first.pageNo,
+          slotId: frags.first.slotId,
+          pageSize: pageSize,
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+        );
+        if (dir != null) {
+          frags = decodeOverflowFragmentDirectory(dir);
+        }
+      }
+
+      var meta = await _readMeta(
+        path: path,
+        pageSize: pageSize,
+        partitionNo: ref.overflowPartitionNo,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+      );
+      var fsm = OverflowFsmPage();
+      if (meta.fsmPageNo > 0) {
+        try {
+          final payload = await _readPackedOrFsmPayload(
+            path: path,
+            pageSize: pageSize,
+            partitionNo: ref.overflowPartitionNo,
+            pageNo: meta.fsmPageNo,
+            encryptionKey: encryptionKey,
+            encryptionKeyId: encryptionKeyId,
+          );
+          fsm = OverflowFsmPage.tryDecodePayload(payload) ?? fsm;
+        } catch (_) {}
+      }
+
+      final writes = <ByteWrite>[];
+      final redoRecords = <Uint8List>[];
+      final payloadCap =
+          _maxPackedPayloadLen(pageSize, encryptionKeyId: encryptionKeyId);
+      final emptyPages = <int>[];
+
+      Future<void> touchPacked(
+          int pageNo, void Function(OverflowPackedPage) mut) async {
+        var page = getCachedPackedPage(
+            table.tableUid, ref.overflowPartitionNo, pageNo);
+        page ??= await _readAndCachePackedPage(
+          table: table,
+          path: path,
+          pageSize: pageSize,
+          partitionNo: ref.overflowPartitionNo,
+          pageNo: pageNo,
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+        );
+        if (page == null) return;
+        final mutable = OverflowPackedPage(
+          capacity: page.capacity,
+          slots: List<Uint8List?>.from(page.slots),
+        );
+        mut(mutable);
+        final stillLive = mutable.hasLiveSlots;
+        if (!stillLive) {
+          emptyPages.add(pageNo);
+          fsm.setFree(pageNo, 0);
+          _pageCache.removePoint3(
+              table.tableUid, ref.overflowPartitionNo, pageNo);
+        } else {
+          fsm.setFree(pageNo, mutable.freeBytes);
+          cachePackedPage(
+              table.tableUid, ref.overflowPartitionNo, pageNo, mutable);
+          final pageBytes = buildOverflowPageBytes(
+            partitionNo: ref.overflowPartitionNo,
+            pageNo: pageNo,
+            payload: mutable.encodePayload(),
+            pageSize: pageSize,
+            encryptionKey: encryptionKey,
+            encryptionKeyId: encryptionKeyId,
+          );
+          // Other live slots remain — redo before overwrite.
+          redoRecords.add(PageRedoLogCodec.encodePageRecord(
+            treeKind: PageRedoTreeKind.overflow,
+            tableUid: table.tableUid,
+            partitionNo: ref.overflowPartitionNo,
+            pageNo: pageNo,
+            payload: pageBytes,
+          ));
+          writes.add(ByteWrite(
+            offset: pageNo * pageSize,
+            bytes: pageBytes,
+          ));
+        }
+      }
+
+      for (final f in frags) {
+        if (f.kind == OverflowFragmentKind.extent) {
+          for (int i = 0; i < f.pageCount; i++) {
+            emptyPages.add(f.pageNo + i);
+            fsm.setFree(f.pageNo + i, 0);
+            _pageCache.removePoint3(
+                table.tableUid, ref.overflowPartitionNo, f.pageNo + i);
+          }
+        } else {
+          await touchPacked(f.pageNo, (p) => p.removeSlot(f.slotId));
+        }
+      }
+
+      // Also free directory slot if indirect.
+      if (ref.indirectDirectory && ref.fragments.isNotEmpty) {
+        final df = ref.fragments.first;
+        if (df.kind == OverflowFragmentKind.slot) {
+          await touchPacked(df.pageNo, (p) => p.removeSlot(df.slotId));
+        }
+      }
+
+      // Convert empty pages to freelist.
+      var freeHead = meta.freeListHeadPageNo;
+      for (final pn in emptyPages.toSet()) {
+        final freePage = FreePage(nextFreePageNo: freeHead);
+        final encodedPayload = BTreePageCodec.encodePayload(
+          freePage.encodePayload(),
+          config: _dataStore.config,
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+          aad: _aadForOverflowPage(ref.overflowPartitionNo, pn),
+        );
+        writes.add(ByteWrite(
+          offset: pn * pageSize,
+          bytes: BTreePageIO.buildPageBytes(
+            type: BTreePageType.free,
+            encodedPayload: encodedPayload,
+            pageSize: pageSize,
+          ),
+        ));
+        freeHead = pn;
+      }
+
+      // Persist FSM
+      var fsmPageNo = meta.fsmPageNo;
+      if (fsmPageNo <= 0 && fsm.freeByPage.isNotEmpty) {
+        // Grow one page for FSM
+        fsmPageNo = meta.totalSizeBytes ~/ pageSize;
+        if (fsmPageNo < 1) fsmPageNo = 1;
+        meta = meta.copyWith(
+          fsmPageNo: fsmPageNo,
+          totalSizeBytes: (fsmPageNo + 1) * pageSize,
+        );
+      }
+      if (fsmPageNo > 0) {
+        writes.add(ByteWrite(
+          offset: fsmPageNo * pageSize,
+          bytes: buildOverflowPageBytes(
+            partitionNo: ref.overflowPartitionNo,
+            pageNo: fsmPageNo,
+            payload: fsm.encodePayload(capacity: payloadCap),
+            pageSize: pageSize,
+            encryptionKey: encryptionKey,
+            encryptionKeyId: encryptionKeyId,
+          ),
+        ));
+      }
+
+      if (writes.isNotEmpty) {
+        await appendOverflowPageRedoIfNeeded(
+          batchContext: batchContext,
+          redoRecords: redoRecords,
+        );
+        await _dataStore.storage.writeManyAsBytesAt(path, writes, flush: false);
+      }
+      meta = meta.copyWith(
+        freeListHeadPageNo: freeHead,
+        freePageCount: meta.freePageCount + emptyPages.toSet().length,
+        fsmPageNo: fsmPageNo,
+      );
+      await _writeMeta(
+        path: path,
+        pageSize: pageSize,
+        partitionNo: ref.overflowPartitionNo,
+        meta: meta,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+        flush: false,
+      );
+    });
+  }
+
+  Future<Uint8List?> _readSlotBytes({
+    required TableContext table,
+    required String path,
+    required int partitionNo,
+    required int pageNo,
+    required int slotId,
+    required int pageSize,
+    Uint8List? encryptionKey,
+    int? encryptionKeyId,
+  }) async {
+    var page = getCachedPackedPage(table.tableUid, partitionNo, pageNo);
+    page ??= await _readAndCachePackedPage(
+      table: table,
+      path: path,
+      pageSize: pageSize,
+      partitionNo: partitionNo,
+      pageNo: pageNo,
+      encryptionKey: encryptionKey,
+      encryptionKeyId: encryptionKeyId,
+    );
+    return page?.slotData(slotId);
+  }
+
   Future<Uint8List> getLargeValue({
     required TableContext table,
     required ValueRef ref,
@@ -1029,6 +1425,16 @@ final class OverflowManager {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
   }) async {
+    if (ref.isV2) {
+      return _getLargeValueV2(
+        table: table,
+        ref: ref,
+        pageSize: pageSize,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+      );
+    }
+
     final out = BytesBuilder(copy: false);
     int remaining = ref.totalLen;
     int pageNo = ref.startPageNo;
@@ -1045,14 +1451,13 @@ final class OverflowManager {
         ]);
       }
 
-      // 1. Check page cache first (point 3: tableUid, partitionNo, pageNo)
-      OverflowPage? page = _pageCache.getPoint3(
+      final cached = _pageCache.getPoint3(
         table.tableUid,
         ref.overflowPartitionNo,
         pageNo,
       );
+      OverflowPage? page = cached is OverflowPage ? cached : null;
 
-      // 2. On cache miss, read from disk
       if (page == null) {
         resolvedPath ??= _overflowPath(table, ref.overflowPartitionNo);
         final pageBytes = await _dataStore.storage
@@ -1121,6 +1526,124 @@ final class OverflowManager {
         GeneralStatus(
           type: ResultType.engError,
           message: 'Overflow CRC mismatch: expected=${ref.crc32} actual=$crc',
+        ),
+      ]);
+    }
+    return bytes;
+  }
+
+  Future<Uint8List> _getLargeValueV2({
+    required TableContext table,
+    required ValueRef ref,
+    required int pageSize,
+    Uint8List? encryptionKey,
+    int? encryptionKeyId,
+  }) async {
+    final path = _overflowPath(table, ref.overflowPartitionNo);
+    var frags = ref.fragments;
+    if (ref.indirectDirectory && frags.isNotEmpty) {
+      final dir = await _readSlotBytes(
+        table: table,
+        path: path,
+        partitionNo: ref.overflowPartitionNo,
+        pageNo: frags.first.pageNo,
+        slotId: frags.first.slotId,
+        pageSize: pageSize,
+        encryptionKey: encryptionKey,
+        encryptionKeyId: encryptionKeyId,
+      );
+      if (dir == null) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'Overflow v2 directory slot missing',
+          ),
+        ]);
+      }
+      frags = decodeOverflowFragmentDirectory(dir);
+    }
+
+    // Parallel-friendly: collect unique pages then read missing ones.
+    final pageNos = <int>{};
+    for (final f in frags) {
+      if (f.kind == OverflowFragmentKind.extent) {
+        for (int i = 0; i < f.pageCount; i++) {
+          pageNos.add(f.pageNo + i);
+        }
+      } else {
+        pageNos.add(f.pageNo);
+      }
+    }
+    final reads = <Future<void>>[];
+    for (final pn in pageNos) {
+      if (getCachedPackedPage(table.tableUid, ref.overflowPartitionNo, pn) !=
+          null) {
+        continue;
+      }
+      reads.add(() async {
+        await _readAndCachePackedPage(
+          table: table,
+          path: path,
+          pageSize: pageSize,
+          partitionNo: ref.overflowPartitionNo,
+          pageNo: pn,
+          encryptionKey: encryptionKey,
+          encryptionKeyId: encryptionKeyId,
+        );
+      }());
+    }
+    if (reads.isNotEmpty) await Future.wait(reads);
+
+    final out = BytesBuilder(copy: false);
+    for (final f in frags) {
+      if (f.kind == OverflowFragmentKind.extent) {
+        for (int i = 0; i < f.pageCount; i++) {
+          final page = getCachedPackedPage(
+              table.tableUid, ref.overflowPartitionNo, f.pageNo + i);
+          if (page == null || page.slots.isEmpty || page.slots.first == null) {
+            throw DbException([
+              GeneralStatus(
+                type: ResultType.engError,
+                message: 'Overflow v2 extent page missing ${f.pageNo + i}',
+              ),
+            ]);
+          }
+          out.add(page.slots.first!);
+        }
+      } else {
+        final page = getCachedPackedPage(
+            table.tableUid, ref.overflowPartitionNo, f.pageNo);
+        final data = page?.slotData(f.slotId);
+        if (data == null) {
+          throw DbException([
+            GeneralStatus(
+              type: ResultType.engError,
+              message:
+                  'Overflow v2 slot missing page=${f.pageNo} slot=${f.slotId}',
+            ),
+          ]);
+        }
+        out.add(data);
+      }
+    }
+
+    final bytes = out.toBytes();
+    if (bytes.length != ref.totalLen) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Overflow v2 length mismatch: expected=${ref.totalLen} actual=${bytes.length}',
+        ),
+      ]);
+    }
+    final crc = Crc32.of(bytes);
+    if (crc != ref.crc32) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Overflow v2 CRC mismatch: expected=${ref.crc32} actual=$crc',
         ),
       ]);
     }
@@ -1659,8 +2182,13 @@ class OverflowBatchAllocator {
 }
 
 /// A simple async lock to serialize operations.
+///
+/// Supports short [synchronized] critical sections and long-lived
+/// [acquire]/[release] ownership (pack sessions hold the partition lock
+/// across pack/flush/finish so delete/put cannot interleave).
 class SimpleLock {
   Future<void>? _last;
+  Completer<void>? _held;
 
   Future<T> synchronized<T>(Future<T> Function() callback) async {
     final prev = _last;
@@ -1675,6 +2203,27 @@ class SimpleLock {
       return await callback();
     } finally {
       completer.complete();
+    }
+  }
+
+  /// Acquire exclusive ownership until [release].
+  Future<void> acquire() async {
+    final prev = _last;
+    final completer = Completer<void>();
+    _last = completer.future;
+    _held = completer;
+    if (prev != null) {
+      try {
+        await prev;
+      } catch (_) {}
+    }
+  }
+
+  void release() {
+    final held = _held;
+    _held = null;
+    if (held != null && !held.isCompleted) {
+      held.complete();
     }
   }
 }

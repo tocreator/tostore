@@ -45,12 +45,19 @@ enum PageRedoTreeKind {
   ngh,
 
   /// NGH paged navigating-centroid pages (layoutVersion >= 2).
-  nghNav;
+  nghNav,
+
+  /// Overflow partition data pages (OVP2 mixed-page overwrites only).
+  ///
+  /// New empty / freelist-first pages are not recorded; only in-place rewrites
+  /// of pages that already held live slots use this kind.
+  overflow;
 
   /// Index uid is required on the redo record.
   bool get requiresIndexUid {
     switch (this) {
       case PageRedoTreeKind.table:
+      case PageRedoTreeKind.overflow:
         return false;
       case PageRedoTreeKind.indexTree:
       case PageRedoTreeKind.ngh:

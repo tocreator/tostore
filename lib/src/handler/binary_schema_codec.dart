@@ -5,6 +5,7 @@ import '../model/db_exception.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/table_schema.dart' show VectorData;
+import '../model/value_ref.dart';
 import 'binary_map_codec.dart';
 import 'platform_byte_data.dart';
 
@@ -25,6 +26,9 @@ class BinarySchemaCodec {
 
   // MessagePack ext type for BigInt
   static const int _extTypeBigInt = 1;
+
+  /// MessagePack ext type for field-level overflow ValueRef (v1/v2).
+  static const int extTypeOverflowRef = 3;
 
   /// Encode a record using field structure (values only, no field names).
   ///
@@ -62,13 +66,85 @@ class BinarySchemaCodec {
     return buffer.toBytes();
   }
 
-  /// Decode a record using field structure.
+  /// Encode a single field value to MessagePack bytes (no fieldCount header).
+  static Uint8List encodeFieldValue(dynamic value) {
+    final buffer = BytesBuilder(copy: false);
+    _writeValue(buffer, value);
+    return buffer.toBytes();
+  }
+
+  /// Encode record where some slots are already [ValueRef] (field overflow).
   ///
-  /// Returns null if decoding fails.
-  static Map<String, dynamic>? decodeRecord(
+  /// [slotOverrides] maps field name → ValueRef or raw value replacement.
+  static Uint8List encodeRecordWithSlotOverrides(
+    Map<String, dynamic> record,
+    List<FieldStructure> fieldStructure, {
+    Map<String, dynamic>? slotOverrides,
+    String? nullifyField,
+  }) {
+    final buffer = BytesBuilder(copy: false);
+    final fieldCount = fieldStructure.length;
+    if (fieldCount > maxFieldCount) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'Binary schema codec: Field count $fieldCount exceeds maximum limit of $maxFieldCount.',
+        )
+      ]);
+    }
+    _writeU16be(buffer, fieldCount);
+    for (int i = 0; i < fieldCount; i++) {
+      final field = fieldStructure[i];
+      if (field.deleted) {
+        _writeValue(buffer, null);
+        continue;
+      }
+      if (nullifyField != null && field.name == nullifyField) {
+        _writeValue(buffer, null);
+        continue;
+      }
+      final override = slotOverrides?[field.name];
+      if (override != null) {
+        _writeValue(buffer, override);
+      } else {
+        _writeValue(buffer, record[field.name]);
+      }
+    }
+    return buffer.toBytes();
+  }
+
+  /// Collect field-level overflow refs from a spine payload (for delete/GC).
+  static List<ValueRef> collectFieldOverflowRefs(
     Uint8List data,
     List<FieldStructure> fieldStructure,
   ) {
+    final out = <ValueRef>[];
+    if (data.isEmpty) return out;
+    try {
+      final r = _Reader(data);
+      final fieldCount = r.u16be();
+      if (fieldCount != fieldStructure.length) return out;
+      for (int i = 0; i < fieldCount; i++) {
+        final raw = _readValue(r);
+        if (raw is ValueRef) out.add(raw);
+      }
+    } catch (_) {}
+    return out;
+  }
+
+  /// Decode a record using field structure.
+  ///
+  /// Returns null if decoding fails.
+  /// When [neededFields] is non-null, only those fields are returned; field
+  /// overflow refs for other slots are skipped without calling [resolveOverflow].
+  /// Unresolved overflow refs (when [resolveOverflow] is null) are omitted.
+  static Map<String, dynamic>? decodeRecord(
+    Uint8List data,
+    List<FieldStructure> fieldStructure, {
+    Set<String>? neededFields,
+    dynamic Function(ValueRef ref)? resolveOverflowSync,
+  }) {
     if (data.isEmpty) return null;
     try {
       final r = _Reader(data);
@@ -90,9 +166,61 @@ class BinarySchemaCodec {
         final raw = _readValue(r);
         // Deleted slots keep positional alignment only — never expose to callers.
         if (field.deleted || raw == null) continue;
+        if (neededFields != null && !neededFields.contains(field.name)) {
+          continue; // skip overflow IO for unselected fields
+        }
+        if (raw is ValueRef) {
+          if (resolveOverflowSync == null) continue;
+          final resolved = resolveOverflowSync(raw);
+          if (resolved == null) continue;
+          result[field.name] = _coerceByTypeIndex(field.typeIndex, resolved);
+          continue;
+        }
         result[field.name] = _coerceByTypeIndex(field.typeIndex, raw);
       }
 
+      return result;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// Async decode with field-overflow resolution and optional projection.
+  ///
+  /// When [neededFields] is non-null, overflow IO is skipped for fields not
+  /// in the set (same contract as [decodeRecord]).
+  static Future<Map<String, dynamic>?> decodeRecordAsync(
+    Uint8List data,
+    List<FieldStructure> fieldStructure, {
+    Set<String>? neededFields,
+    required Future<Uint8List?> Function(ValueRef ref) resolveOverflow,
+  }) async {
+    if (data.isEmpty) return null;
+    try {
+      final r = _Reader(data);
+      final fieldCount = r.u16be();
+      if (fieldCount > maxFieldCount) return null;
+      if (fieldCount != fieldStructure.length) return null;
+
+      final result = <String, dynamic>{};
+      for (int i = 0; i < fieldCount; i++) {
+        final field = fieldStructure[i];
+        final raw = _readValue(r);
+        if (field.deleted || raw == null) continue;
+        if (neededFields != null && !neededFields.contains(field.name)) {
+          continue; // skip overflow IO for unselected fields
+        }
+        if (raw is ValueRef) {
+          final bytes = await resolveOverflow(raw);
+          if (bytes == null) continue;
+          // Field overflow stores encodeFieldValue bytes.
+          final inner = _Reader(bytes);
+          final value = _readValue(inner);
+          result[field.name] = _coerceByTypeIndex(field.typeIndex, value);
+          continue;
+        }
+        result[field.name] = _coerceByTypeIndex(field.typeIndex, raw);
+      }
       return result;
     } catch (_) {
       return null;
@@ -209,6 +337,12 @@ class BinarySchemaCodec {
       return;
     }
 
+    // 11. Field-level overflow pointer
+    if (value is ValueRef) {
+      _writeOverflowRefExt(b, value);
+      return;
+    }
+
     if (value is DateTime) {
       _writeString(b, value.toIso8601String());
       return;
@@ -290,6 +424,29 @@ class BinarySchemaCodec {
     b.addByte(0xC9);
     _writeU32be(b, len);
     b.addByte(_extTypeBigInt);
+    b.add(payload);
+  }
+
+  static void _writeOverflowRefExt(BytesBuilder b, ValueRef ref) {
+    final payload = ref.encode();
+    final len = payload.length;
+    if (len <= 0xff) {
+      b.addByte(0xC7); // ext8
+      b.addByte(len);
+      b.addByte(extTypeOverflowRef);
+      b.add(payload);
+      return;
+    }
+    if (len <= 0xffff) {
+      b.addByte(0xC8); // ext16
+      _writeU16be(b, len);
+      b.addByte(extTypeOverflowRef);
+      b.add(payload);
+      return;
+    }
+    b.addByte(0xC9); // ext32
+    _writeU32be(b, len);
+    b.addByte(extTypeOverflowRef);
     b.add(payload);
   }
 
@@ -439,6 +596,9 @@ class BinarySchemaCodec {
     if (type == _extTypeBigInt) {
       final s = utf8.decode(payload, allowMalformed: true);
       return BigInt.tryParse(s) ?? BigInt.zero;
+    }
+    if (type == extTypeOverflowRef) {
+      return ValueRef.tryDecode(payload) ?? payload;
     }
     // Unknown extension: return raw bytes.
     return payload;

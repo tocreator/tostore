@@ -75,8 +75,9 @@ class NghIndexMeta {
   final int pkBackfillPage;
 
   /// TPG2 page size for leaf partition files. `0` = inherit the database
-  /// [GlobalConfig.pageSize] (legacy 16KB files). Frozen once leaf data
-  /// exists -- changing it would require a leaf rewrite.
+  /// [GlobalConfig.pageSize] (legacy 16KB files). New indexes persist an
+  /// explicit size (low-D 4KB/8KB, 768D 16KB, high-D larger). Frozen once
+  /// leaf data exists -- changing it would require a leaf rewrite.
   final int leafPageSize;
 
   /// TPG2 page size for navigating-centroid partition files. `0` = inherit

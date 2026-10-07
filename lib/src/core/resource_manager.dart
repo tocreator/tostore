@@ -5,6 +5,7 @@ import '../handler/logger.dart';
 import '../handler/platform_handler.dart';
 import '../model/data_store_config.dart';
 import '../model/db_exception.dart';
+import '../model/flush_pressure_state.dart';
 import '../model/memory_info.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
@@ -143,6 +144,22 @@ class ResourceManager {
     _initialized = true;
   }
 
+  /// Total physical system memory in MB (cached on initialization).
+  int _systemMemoryMB = 0;
+  int get systemMemoryMB => _systemMemoryMB;
+
+  /// Cached warning memory threshold in MB.
+  int _warningMemoryThresholdMB = 256;
+  int get warningMemoryThresholdMB => _warningMemoryThresholdMB;
+
+  /// Cached critical memory threshold in MB.
+  int _criticalMemoryThresholdMB = 32;
+  int get criticalMemoryThresholdMB => _criticalMemoryThresholdMB;
+
+  /// Cached recovery hysteresis margin in MB.
+  int _recoveryMarginMB = 64;
+  int get recoveryMarginMB => _recoveryMarginMB;
+
   /// Configure memory threshold
   Future<void> _configureMemoryThreshold(DataStoreConfig config) async {
     try {
@@ -150,6 +167,12 @@ class ResourceManager {
       int availableMemoryMB =
           await PlatformHandler.getAvailableSystemMemoryMB();
       int systemMemoryMB = await PlatformHandler.getSystemMemoryMB();
+      _systemMemoryMB = systemMemoryMB;
+      _warningMemoryThresholdMB =
+          calculateWarningMemoryThresholdMB(systemMemoryMB);
+      _criticalMemoryThresholdMB =
+          calculateCriticalMemoryThresholdMB(systemMemoryMB);
+      _recoveryMarginMB = max(64, (systemMemoryMB * 0.03).toInt());
 
       // Get the smaller value between available memory and total memory as the base value
       int baseMemoryMB = availableMemoryMB < systemMemoryMB * 0.7
@@ -172,6 +195,12 @@ class ResourceManager {
       Logger.error('Failed to configure memory threshold', rawError: e);
       // Set default threshold
       _memoryThresholdInMB = _getDefaultMemoryThreshold();
+      _systemMemoryMB = _getDefaultMemoryThreshold() * 2;
+      _warningMemoryThresholdMB =
+          calculateWarningMemoryThresholdMB(_systemMemoryMB);
+      _criticalMemoryThresholdMB =
+          calculateCriticalMemoryThresholdMB(_systemMemoryMB);
+      _recoveryMarginMB = 64;
     }
   }
 
@@ -199,12 +228,147 @@ class ResourceManager {
     }
   }
 
+  /// Current interval used for periodic resource monitoring
+  ExecuteInterval _currentMonitorInterval = ExecuteInterval.seconds30;
+
+  /// Consecutive sample count showing normal memory levels before downgrading to 30s
+  int _normalRecoveryCount = 0;
+
+  /// Whether the database is currently experiencing active disk flush pressure
+  bool get _isFlushBusy =>
+      _dataStore?.parallelJournalManager.pressureState ==
+      FlushPressureState.busy;
+
+  /// Current recommended cache eviction ratio based on status severity
+  double get currentEvictionRatio =>
+      getEvictionRatio(MemoryQuotaType.tableData);
+
+  /// Get specialized eviction ratio based on cache quota type and flush pressure.
+  ///
+  /// Protects flush working-set (B+ tree pages) from over-eviction while
+  /// aggressively pruning non-essential caches (query results, row record caches)
+  /// under active flush pressure.
+  double getEvictionRatio(MemoryQuotaType type) {
+    if (_status == ResourceStatus.critical) {
+      switch (type) {
+        case MemoryQuotaType.queryResult:
+          return 1.0; // Evict all query caches in emergency
+        case MemoryQuotaType.tableData:
+          return 0.50; // Prune half of table data cache
+        case MemoryQuotaType.indexData:
+          return 0.35; // Preserve index B+tree pages for flush recovery
+        case MemoryQuotaType.vectorIndex:
+          return 0.50;
+        case MemoryQuotaType.schema:
+        case MemoryQuotaType.meta:
+          return 0.0;
+      }
+    }
+
+    if (_status == ResourceStatus.warning) {
+      if (_isFlushBusy) {
+        switch (type) {
+          case MemoryQuotaType.queryResult:
+            return 0.85; // Clean 85% of query caches to release non-flush memory
+          case MemoryQuotaType.tableData:
+            return 0.40; // Prune record maps, protect B+tree page cache
+          case MemoryQuotaType.indexData:
+            return 0.25; // Strictly protect index B+tree pages needed for flushing
+          case MemoryQuotaType.vectorIndex:
+            return 0.30;
+          case MemoryQuotaType.schema:
+          case MemoryQuotaType.meta:
+            return 0.0;
+        }
+      }
+      return 0.30; // Standard warning ratio
+    }
+
+    return 0.20; // Normal baseline
+  }
+
+  /// Specialized eviction ratio for hot record cache (heap Map objects)
+  double getRecordCacheEvictionRatio() {
+    if (_status == ResourceStatus.critical) return 0.60;
+    if (_status == ResourceStatus.warning) {
+      return _isFlushBusy ? 0.50 : 0.35;
+    }
+    return 0.20;
+  }
+
+  /// Specialized eviction ratio for B+Tree page caches (disk IO protection)
+  double getPageCacheEvictionRatio() {
+    if (_status == ResourceStatus.critical)
+      return 0.35; // Never wipe B+tree pages
+    if (_status == ResourceStatus.warning) {
+      return _isFlushBusy ? 0.20 : 0.25; // Protect pages during active flush
+    }
+    return 0.15;
+  }
+
+  /// Current eviction cooldown duration in seconds based on severity and flush pressure
+  int get _currentEvictionCooldownSeconds {
+    switch (_status) {
+      case ResourceStatus.critical:
+        return 2;
+      case ResourceStatus.warning:
+        return _isFlushBusy ? 1 : 5;
+      case ResourceStatus.normal:
+        return 10;
+    }
+  }
+
+  /// Calculate dynamic warning threshold in MB based on total system memory.
+  /// Uses 15% of total system memory as baseline, capped at 2048 MB (sufficient
+  /// safety buffer for 1M-record batch flush) and floored at 64 MB.
+  static int calculateWarningMemoryThresholdMB(int systemMemoryMB) {
+    if (systemMemoryMB <= 0) return 64;
+    final ratioMB = (systemMemoryMB * 0.15).toInt();
+    return ratioMB.clamp(64, 2048);
+  }
+
+  /// Calculate dynamic critical threshold in MB based on total system memory.
+  /// Uses 3.5% of total system memory as baseline, capped at 512 MB and floored
+  /// at 32 MB for emergency write blocking.
+  static int calculateCriticalMemoryThresholdMB(int systemMemoryMB) {
+    if (systemMemoryMB <= 0) return 32;
+    final ratioMB = (systemMemoryMB * 0.035).toInt();
+    return ratioMB.clamp(32, 512);
+  }
+
   /// Register resource monitoring periodic task
   void _registerResourceMonitor() {
-    // Use CrontabManager to register resource monitoring task
-    // Default to 30 seconds to reduce overhead; during high pressure,
-    // the system can trigger immediate checks reactively.
-    CrontabManager.addCallback(ExecuteInterval.seconds30, _checkResourceUsage);
+    _currentMonitorInterval = ExecuteInterval.seconds30;
+    _normalRecoveryCount = 0;
+    CrontabManager.addCallback(_currentMonitorInterval, _checkResourceUsage);
+  }
+
+  /// Adapt monitor interval dynamically based on resource status
+  void _adjustMonitorInterval(ResourceStatus status) {
+    if (status != ResourceStatus.normal) {
+      _normalRecoveryCount = 0;
+      if (_currentMonitorInterval != ExecuteInterval.seconds3) {
+        CrontabManager.removeCallback(
+            _currentMonitorInterval, _checkResourceUsage);
+        _currentMonitorInterval = ExecuteInterval.seconds3;
+        CrontabManager.addCallback(
+            _currentMonitorInterval, _checkResourceUsage);
+        Logger.debug(
+            'ResourceManager: monitor interval accelerated to 3s (status: ${status.name})');
+      }
+    } else {
+      _normalRecoveryCount++;
+      if (_normalRecoveryCount >= 2 &&
+          _currentMonitorInterval != ExecuteInterval.seconds30) {
+        CrontabManager.removeCallback(
+            _currentMonitorInterval, _checkResourceUsage);
+        _currentMonitorInterval = ExecuteInterval.seconds30;
+        CrontabManager.addCallback(
+            _currentMonitorInterval, _checkResourceUsage);
+        Logger.debug(
+            'ResourceManager: monitor interval restored to 30s after recovery');
+      }
+    }
   }
 
   // Throttle immediate checks to avoid storming the resource manager
@@ -213,10 +377,10 @@ class ResourceManager {
   /// Trigger an immediate resource check (bypassing the timer).
   ///
   /// Useful when large operations finish and system pressure might have changed.
-  /// This call is throttled to at most once per 2 seconds.
   Future<void> triggerImmediateCheck() async {
     final now = DateTime.now();
-    if (now.difference(_lastImmediateCheckTime).inMilliseconds < 2000) {
+    final int throttleMs = _isFlushBusy ? 500 : 2000;
+    if (now.difference(_lastImmediateCheckTime).inMilliseconds < throttleMs) {
       return;
     }
     _lastImmediateCheckTime = now;
@@ -226,7 +390,7 @@ class ResourceManager {
   /// Check resource usage (Memory and Disk) and trigger cleanup if needed
   Future<void> _checkResourceUsage() async {
     try {
-      await _updateResourceStatus();
+      await _updateResourceStatus(forceRefresh: true);
 
       // Update last measured total usage and trigger cleanup if warning or higher
       final info = await getMemoryInfo();
@@ -242,20 +406,26 @@ class ResourceManager {
   }
 
   /// Update internal resource status based on current metrics
-  Future<void> _updateResourceStatus() async {
-    final availableMemoryMB =
-        await PlatformHandler.getAvailableSystemMemoryMB();
-    final systemMemoryMB = await PlatformHandler.getSystemMemoryMB();
+  Future<void> _updateResourceStatus({bool forceRefresh = false}) async {
+    final availableMemoryMB = await PlatformHandler.getAvailableSystemMemoryMB(
+        forceRefresh: forceRefresh);
     final availableDiskMB = await _getAvailableDiskSpace();
 
     _refreshEffectivePrewarmThresholdMB(availableMemoryMB);
 
-    // Determine memory status
+    final totalSysMB = _systemMemoryMB > 0 ? _systemMemoryMB : 1024;
+
+    // Determine memory status with precalculated thresholds and hysteresis
     ResourceStatus memoryStatus = ResourceStatus.normal;
-    if (availableMemoryMB < systemMemoryMB * 0.02 || availableMemoryMB < 32) {
+    if (availableMemoryMB < _criticalMemoryThresholdMB) {
       memoryStatus = ResourceStatus.critical;
-    } else if (availableMemoryMB < systemMemoryMB * 0.1) {
+    } else if (availableMemoryMB < _warningMemoryThresholdMB) {
       memoryStatus = ResourceStatus.warning;
+    } else if (_memoryStatus != ResourceStatus.normal) {
+      // Hysteresis: require margin above warning threshold before exiting warning
+      if (availableMemoryMB < _warningMemoryThresholdMB + _recoveryMarginMB) {
+        memoryStatus = _memoryStatus; // Stay in warning until clear recovery
+      }
     }
     _memoryStatus = memoryStatus;
 
@@ -281,21 +451,26 @@ class ResourceManager {
                 : ResultType.sysResourceExhaustedMemory);
 
         Logger.critical(
-            'CRITICAL RESOURCE SHORTAGE! Write operations will be blocked. Memory: $availableMemoryMB/$systemMemoryMB MB, Disk: $availableDiskMB MB',
+            'CRITICAL RESOURCE SHORTAGE! Write operations will be blocked. Memory: $availableMemoryMB/$totalSysMB MB, Disk: $availableDiskMB MB',
             rawError: GeneralStatus(
               type: type,
               message:
-                  'CRITICAL RESOURCE SHORTAGE! Write operations will be blocked. Memory: $availableMemoryMB/$systemMemoryMB MB, Disk: $availableDiskMB MB',
+                  'CRITICAL RESOURCE SHORTAGE! Write operations will be blocked. Memory: $availableMemoryMB/$totalSysMB MB, Disk: $availableDiskMB MB',
             ));
       } else if (newStatus == ResourceStatus.warning) {
-        Logger.warn(
-          'Low resources detected! Triggering cache eviction. Memory: $availableMemoryMB/$systemMemoryMB MB, Disk: $availableDiskMB MB',
+        Logger.debug(
+          'Low resources detected! Triggering cache eviction. Memory: $availableMemoryMB/$totalSysMB MB, Disk: $availableDiskMB MB',
         );
       } else {
-        Logger.info('Resources recovered to normal levels.');
+        Logger.debug(
+          'Resources recovered to normal levels. Memory: $availableMemoryMB/$totalSysMB MB, Disk: $availableDiskMB MB',
+        );
       }
       _status = newStatus;
     }
+
+    // Adapt monitor interval dynamically based on resource status
+    _adjustMonitorInterval(_status);
   }
 
   /// Get current available disk space for the database path
@@ -321,8 +496,9 @@ class ResourceManager {
 
     final now = DateTime.now();
 
-    // Ensure at least 30 seconds interval between two cleanups to avoid frequent cleanup
-    if (now.difference(_lastCacheClearTime).inSeconds < 30) {
+    // Ensure interval between two cleanups to avoid frequent cleanup
+    if (now.difference(_lastCacheClearTime).inSeconds <
+        _currentEvictionCooldownSeconds) {
       return;
     }
 
@@ -367,8 +543,8 @@ class ResourceManager {
   Future<void> _evictCacheAndCheck(MemoryQuotaType cacheType) async {
     await _evictCacheByType(cacheType);
 
-    // Refresh status after eviction without re-triggering eviction process
-    await _updateResourceStatus();
+    // Refresh status after eviction with fresh system readings
+    await _updateResourceStatus(forceRefresh: true);
   }
 
   /// Execute specific type cache cleanup
@@ -613,28 +789,42 @@ class ResourceManager {
 
   /// Get global minimum total cache size to trigger any eviction based on platform
   int _getMinTotalCacheToEvict() {
+    int baselineBytes;
     if (PlatformHandler.isServerEnvironment) {
-      return 512 * 1024 * 1024; // 512MB for high-throughput servers
+      baselineBytes = 512 * 1024 * 1024; // 512MB for high-throughput servers
     } else if (PlatformHandler.isDesktop) {
-      return 256 * 1024 * 1024; // 256MB for desktops
+      baselineBytes = 256 * 1024 * 1024; // 256MB for desktops
     } else if (PlatformHandler.isWeb) {
-      return 64 * 1024 * 1024; // 64MB (more restricted environments)
+      baselineBytes = 64 * 1024 * 1024; // 64MB (more restricted environments)
     } else {
-      return 128 * 1024 * 1024; // 128MB for modern mobile devices
+      baselineBytes = 128 * 1024 * 1024; // 128MB for modern mobile devices
     }
+
+    // Baseline protection must never exceed 50% of configured total cache budget
+    if (_memoryThresholdInMB > 0) {
+      final maxAllowedBaseline =
+          (_memoryThresholdInMB * 1024 * 1024 * 0.5).toInt();
+      baselineBytes = min(baselineBytes, maxAllowedBaseline);
+    }
+    return max(baselineBytes, 16 * 1024 * 1024);
   }
 
   /// Clean up all resources
   void dispose() {
     // Deregister periodic monitor callback from CrontabManager
-    CrontabManager.removeCallback(
-        ExecuteInterval.seconds30, _checkResourceUsage);
+    CrontabManager.removeCallback(_currentMonitorInterval, _checkResourceUsage);
+    _currentMonitorInterval = ExecuteInterval.seconds30;
+    _normalRecoveryCount = 0;
 
     _cacheEvictionCallbacks.updateAll((key, value) => null);
     _dataStore = null;
     _effectivePrewarmThresholdMB = null;
     _status = ResourceStatus.normal;
     _memoryStatus = ResourceStatus.normal;
+    _systemMemoryMB = 0;
+    _warningMemoryThresholdMB = 256;
+    _criticalMemoryThresholdMB = 32;
+    _recoveryMarginMB = 64;
     _initialized = false;
     _initFuture = null;
   }

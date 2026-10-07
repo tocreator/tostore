@@ -313,13 +313,37 @@ final class PartitionMetaPage {
   /// Number of free pages in freelist (best-effort).
   final int freePageCount;
 
+  /// PageNo of the durable half-full Free Space Map page (-1 = none).
+  ///
+  /// Survives close/reopen so mixed OVP2 pages keep accepting new slots.
+  final int fsmPageNo;
+
   const PartitionMetaPage({
     required this.partitionNo,
     required this.totalEntryCount,
     required this.totalSizeBytes,
     this.freeListHeadPageNo = -1,
     this.freePageCount = 0,
+    this.fsmPageNo = -1,
   });
+
+  PartitionMetaPage copyWith({
+    int? partitionNo,
+    int? totalEntryCount,
+    int? totalSizeBytes,
+    int? freeListHeadPageNo,
+    int? freePageCount,
+    int? fsmPageNo,
+  }) {
+    return PartitionMetaPage(
+      partitionNo: partitionNo ?? this.partitionNo,
+      totalEntryCount: totalEntryCount ?? this.totalEntryCount,
+      totalSizeBytes: totalSizeBytes ?? this.totalSizeBytes,
+      freeListHeadPageNo: freeListHeadPageNo ?? this.freeListHeadPageNo,
+      freePageCount: freePageCount ?? this.freePageCount,
+      fsmPageNo: fsmPageNo ?? this.fsmPageNo,
+    );
+  }
 
   Uint8List encodePayload() {
     final bd = ByteData(payloadSize);
@@ -333,6 +357,7 @@ final class PartitionMetaPage {
     // [32..] reserved for future fields.
     bd.setInt32(32, freeListHeadPageNo, Endian.little);
     bd.setInt32(36, freePageCount, Endian.little);
+    bd.setInt32(40, fsmPageNo, Endian.little);
     return bd.buffer.asUint8List();
   }
 
@@ -348,9 +373,13 @@ final class PartitionMetaPage {
     final size = PlatformByteData.getInt64(bd, 24, Endian.little);
     int freeHead = -1;
     int freeCount = 0;
+    int fsmPage = -1;
     if (bytes.length >= 40) {
       freeHead = bd.getInt32(32, Endian.little);
       freeCount = bd.getInt32(36, Endian.little);
+    }
+    if (bytes.length >= 44) {
+      fsmPage = bd.getInt32(40, Endian.little);
     }
     return PartitionMetaPage(
       partitionNo: pNo,
@@ -358,6 +387,7 @@ final class PartitionMetaPage {
       totalSizeBytes: size < 0 ? 0 : size,
       freeListHeadPageNo: freeHead,
       freePageCount: freeCount < 0 ? 0 : freeCount,
+      fsmPageNo: fsmPage,
     );
   }
 }
@@ -366,7 +396,10 @@ final class PartitionMetaPage {
 // Overflow Page (TOAST-like)
 // ============================================================================
 
-/// A fixed-size page used to store a chunk of a large value out-of-line.
+/// Legacy exclusive overflow page (OVP1): one chain chunk per page + nextPageNo.
+///
+/// New writes use [OverflowPackedPage] (OVP2). OVP1 remains readable for
+/// ValueRef v1 chains.
 ///
 /// Payload format (little-endian):
 /// - magic:u32 = 'OVP1'
@@ -420,6 +453,270 @@ final class OverflowPage {
     final overhead = 16;
     final max = maxPayload - overhead;
     return max < 0 ? 0 : max;
+  }
+}
+
+/// Mixed overflow page (OVP2): multiple chunks from different values share one page.
+///
+/// Layout (little-endian), classic heap style:
+/// `[header 16][data....][free....][slotN]...[slot0]`
+///
+/// Header:
+/// - magic:u32 = 'OVP2'
+/// - version:u16
+/// - flags:u16
+/// - slotCount:u16
+/// - freeBytes:u16
+///
+/// Each slot (4 bytes, from the end): `[offset:u16][length:u16]`
+/// Tombstone: length == 0.
+final class OverflowPackedPage {
+  static const int payloadVersion = 1;
+  static const int headerSize = 16;
+  static const int slotEntrySize = 4;
+  static const int _payloadMagic = 0x3250564F; // 'OVP2' little-endian
+
+  /// Payload capacity this page was built for (data+slots+header).
+  final int capacity;
+
+  final List<Uint8List?> slots;
+
+  const OverflowPackedPage({
+    required this.capacity,
+    required this.slots,
+  });
+
+  factory OverflowPackedPage.empty(int capacity) {
+    return OverflowPackedPage(capacity: capacity, slots: <Uint8List?>[]);
+  }
+
+  int get slotCount => slots.length;
+
+  int get usedDataBytes {
+    var n = 0;
+    for (final s in slots) {
+      if (s != null) n += s.length;
+    }
+    return n;
+  }
+
+  int get freeBytes {
+    final dir = slots.length * slotEntrySize;
+    final free = capacity - headerSize - usedDataBytes - dir;
+    return free < 0 ? 0 : free;
+  }
+
+  /// Bytes required to insert [dataLen] (data + one new slot entry if no tombstone).
+  int bytesNeededFor(int dataLen, {bool reuseTombstone = false}) {
+    return dataLen + (reuseTombstone ? 0 : slotEntrySize);
+  }
+
+  bool canFit(int dataLen) {
+    final tomb = slots.indexWhere((s) => s == null);
+    return freeBytes >= bytesNeededFor(dataLen, reuseTombstone: tomb >= 0);
+  }
+
+  /// Insert [data]; returns slot id. Throws if it does not fit.
+  int insert(Uint8List data) {
+    if (!canFit(data.length)) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message:
+              'OVP2 insert: dataLen=${data.length} does not fit freeBytes=$freeBytes',
+        ),
+      ]);
+    }
+    final tomb = slots.indexWhere((s) => s == null);
+    if (tomb >= 0) {
+      slots[tomb] = data;
+      return tomb;
+    }
+    slots.add(data);
+    return slots.length - 1;
+  }
+
+  /// Remove slot; returns whether the page has any live slots left.
+  bool removeSlot(int slotId) {
+    if (slotId < 0 || slotId >= slots.length) return usedDataBytes > 0;
+    slots[slotId] = null;
+    // Compact trailing tombstones.
+    while (slots.isNotEmpty && slots.last == null) {
+      slots.removeLast();
+    }
+    return hasLiveSlots;
+  }
+
+  bool get hasLiveSlots => slots.any((s) => s != null);
+
+  Uint8List? slotData(int slotId) {
+    if (slotId < 0 || slotId >= slots.length) return null;
+    return slots[slotId];
+  }
+
+  Uint8List encodePayload() {
+    // Encode with dense slot array matching [slots] length (including tombs).
+    final slotCount = slots.length;
+    final dataLen = usedDataBytes;
+    final dirSize = slotCount * slotEntrySize;
+    final need = headerSize + dataLen + dirSize;
+    if (need > capacity) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'OVP2 encode overflow: need=$need capacity=$capacity',
+        ),
+      ]);
+    }
+    final out = Uint8List(capacity);
+    final bd = ByteData.sublistView(out);
+    bd.setUint32(0, _payloadMagic, Endian.little);
+    bd.setUint16(4, payloadVersion, Endian.little);
+    bd.setUint16(6, 0, Endian.little);
+    bd.setUint16(8, slotCount, Endian.little);
+    bd.setUint16(10, freeBytes, Endian.little);
+
+    var dataOff = headerSize;
+    final offsets = List<int>.filled(slotCount, 0);
+    final lengths = List<int>.filled(slotCount, 0);
+    for (int i = 0; i < slotCount; i++) {
+      final s = slots[i];
+      if (s == null) continue;
+      offsets[i] = dataOff;
+      lengths[i] = s.length;
+      out.setRange(dataOff, dataOff + s.length, s);
+      dataOff += s.length;
+    }
+    // Slot directory from the end, slot0 closest to end.
+    for (int i = 0; i < slotCount; i++) {
+      final entryOff = capacity - (i + 1) * slotEntrySize;
+      bd.setUint16(entryOff, offsets[i], Endian.little);
+      bd.setUint16(entryOff + 2, lengths[i], Endian.little);
+    }
+    return out;
+  }
+
+  static OverflowPackedPage? tryDecodePayload(Uint8List bytes) {
+    if (bytes.length < headerSize) return null;
+    final bd = ByteData.sublistView(bytes);
+    final magic = bd.getUint32(0, Endian.little);
+    if (magic != _payloadMagic) return null;
+    final v = bd.getUint16(4, Endian.little);
+    if (v <= 0) return null;
+    final slotCount = bd.getUint16(8, Endian.little);
+    if (slotCount * slotEntrySize + headerSize > bytes.length) return null;
+    final slots = List<Uint8List?>.filled(slotCount, null, growable: true);
+    for (int i = 0; i < slotCount; i++) {
+      final entryOff = bytes.length - (i + 1) * slotEntrySize;
+      final off = bd.getUint16(entryOff, Endian.little);
+      final len = bd.getUint16(entryOff + 2, Endian.little);
+      if (len == 0) continue;
+      if (off < headerSize ||
+          off + len > bytes.length - slotCount * slotEntrySize) {
+        return null;
+      }
+      slots[i] = bytes.sublist(off, off + len);
+    }
+    return OverflowPackedPage(capacity: bytes.length, slots: slots);
+  }
+
+  /// Max data bytes for one slot on an empty packed page of [payloadCapacity].
+  static int maxChunkForCapacity(int payloadCapacity) {
+    final max = payloadCapacity - headerSize - slotEntrySize;
+    return max < 0 ? 0 : max;
+  }
+}
+
+/// Durable Free Space Map for half-full OVP2 pages (survives restart).
+///
+/// Stored as a dedicated page payload (BTreePageType.overflow with magic OFSM).
+final class OverflowFsmPage {
+  static const int payloadVersion = 1;
+  static const int _payloadMagic = 0x4D53464F; // 'OFSM' little-endian
+  static const int headerSize = 8;
+  static const int entrySize = 6; // pageNo:u32 + freeBytes:u16
+
+  /// pageNo -> freeBytes (only half-full pages; full-empty use freelist).
+  final Map<int, int> freeByPage;
+
+  OverflowFsmPage({Map<int, int>? freeByPage})
+      : freeByPage = freeByPage ?? <int, int>{};
+
+  int? findPageWithSpace(int need) {
+    int? bestPage;
+    int bestFree = 0x7fffffff;
+    freeByPage.forEach((pageNo, free) {
+      if (free >= need && free < bestFree) {
+        bestFree = free;
+        bestPage = pageNo;
+      }
+    });
+    return bestPage;
+  }
+
+  void setFree(int pageNo, int freeBytes) {
+    if (pageNo <= 0) return;
+    if (freeBytes <= 0) {
+      freeByPage.remove(pageNo);
+    } else {
+      freeByPage[pageNo] = freeBytes;
+    }
+  }
+
+  /// Drop lowest-priority entries so the FSM fits [capacity].
+  ///
+  /// Keeps pages with the most free space. Call before [encodePayload] so
+  /// in-memory map matches what will be written (no silent truncate mismatch).
+  void compactToFit(int capacity) {
+    final maxEntries = (capacity - headerSize) ~/ entrySize;
+    if (maxEntries < 0) {
+      freeByPage.clear();
+      return;
+    }
+    if (freeByPage.length <= maxEntries) return;
+    final entries = freeByPage.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    freeByPage
+      ..clear()
+      ..addEntries(entries.take(maxEntries));
+  }
+
+  Uint8List encodePayload({required int capacity}) {
+    compactToFit(capacity);
+    final entries = freeByPage.entries.toList()
+      ..sort((a, b) => a.key.compareTo(b.key));
+    final out = Uint8List(capacity);
+    final bd = ByteData.sublistView(out);
+    bd.setUint32(0, _payloadMagic, Endian.little);
+    bd.setUint16(4, payloadVersion, Endian.little);
+    bd.setUint16(6, entries.length, Endian.little);
+    var off = headerSize;
+    for (final e in entries) {
+      bd.setUint32(off, e.key, Endian.little);
+      bd.setUint16(off + 4, e.value.clamp(0, 0xffff), Endian.little);
+      off += entrySize;
+    }
+    return out;
+  }
+
+  static OverflowFsmPage? tryDecodePayload(Uint8List bytes) {
+    if (bytes.length < headerSize) return null;
+    final bd = ByteData.sublistView(bytes);
+    final magic = bd.getUint32(0, Endian.little);
+    if (magic != _payloadMagic) return null;
+    final v = bd.getUint16(4, Endian.little);
+    if (v <= 0) return null;
+    final count = bd.getUint16(6, Endian.little);
+    if (headerSize + count * entrySize > bytes.length) return null;
+    final map = <int, int>{};
+    var off = headerSize;
+    for (int i = 0; i < count; i++) {
+      final pageNo = bd.getUint32(off, Endian.little);
+      final free = bd.getUint16(off + 4, Endian.little);
+      if (pageNo > 0 && free > 0) map[pageNo] = free;
+      off += entrySize;
+    }
+    return OverflowFsmPage(freeByPage: map);
   }
 }
 

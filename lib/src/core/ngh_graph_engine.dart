@@ -939,11 +939,22 @@ class NghGraphEngine {
     var cPage = childPage;
     for (var i = path.length - 1; i >= 0; i--) {
       final parent = path[i];
-      if (parent.childIdx < 0 ||
-          parent.childIdx >= parent.page.entries.length) {
-        break;
+      // Prefer recorded childIdx, but re-resolve by childPageId after mid
+      // splits reorder/resize entries (stale idx must not write the wrong row).
+      var idx = parent.childIdx;
+      if (idx < 0 ||
+          idx >= parent.page.entries.length ||
+          parent.page.entries[idx].childPageId != cId) {
+        idx = -1;
+        for (var j = 0; j < parent.page.entries.length; j++) {
+          if (parent.page.entries[j].childPageId == cId) {
+            idx = j;
+            break;
+          }
+        }
+        if (idx < 0) break;
       }
-      parent.page.entries[parent.childIdx] = _summaryEntryForChild(
+      parent.page.entries[idx] = _summaryEntryForChild(
         childPageId: cId,
         childPage: cPage,
         fallbackCentroidId: rootId,
@@ -3773,6 +3784,10 @@ class NghGraphEngine {
     final insertQLowSimd = Float32x4List.sublistView(insertQLow);
 
     void markInsertNav(NghPageId id, NghNavBTreePage page) {
+      // Always drop search48: leaf-level entry centroids are mutated in place
+      // on objects that may also sit in TreeCache; a warm pack would score
+      // stale rows. Insert descent uses [insertTop2Nav] (live entries) so this
+      // is not on the insert hot path.
       page.invalidateSearch48Pack();
       insertNavPages[id] = page;
       dirtyNavBTreePages[NghPagePtr(
@@ -3801,6 +3816,114 @@ class NghGraphEngine {
         childPage: childPage,
         path: path,
         mark: markInsertNav,
+      );
+    }
+
+    // Coalesce ordinary (non-split) ancestor bubbles: leaf-level branch
+    // entries update immediately for live routing; mid parents flush once
+    // before the next descent scores them (or at batch end / before splits).
+    final pendingBubbles = <NghPageId,
+        ({
+      int rootId,
+      NghPageId childId,
+      NghNavBTreePage childPage,
+      List<({NghPageId pageId, NghNavBTreePage page, int childIdx})> path,
+    })>{};
+    // Fast ancestor → owners index for [flushPendingBubblesUnder] (avoids
+    // O(pending×hops) scans on every mid hop).
+    final pendingByAncestor = <NghPageId, Set<NghPageId>>{};
+
+    void unindexPending(NghPageId ownerId,
+        List<({NghPageId pageId, NghNavBTreePage page, int childIdx})> path) {
+      for (final step in path) {
+        final set = pendingByAncestor[step.pageId];
+        if (set == null) continue;
+        set.remove(ownerId);
+        if (set.isEmpty) pendingByAncestor.remove(step.pageId);
+      }
+    }
+
+    void schedulePendingBubble({
+      required NghPageId ownerId,
+      required int rootId,
+      required NghNavBTreePage ownerPage,
+      required List<({NghPageId pageId, NghNavBTreePage page, int childIdx})>
+          path,
+    }) {
+      if (path.isEmpty) return;
+      final prev = pendingBubbles[ownerId];
+      if (prev != null) unindexPending(ownerId, prev.path);
+      pendingBubbles[ownerId] = (
+        rootId: rootId,
+        childId: ownerId,
+        childPage: ownerPage,
+        path: List.of(path),
+      );
+      for (final step in path) {
+        pendingByAncestor
+            .putIfAbsent(step.pageId, () => <NghPageId>{})
+            .add(ownerId);
+      }
+    }
+
+    void flushPendingBubble(NghPageId ownerId) {
+      final pending = pendingBubbles.remove(ownerId);
+      if (pending == null) return;
+      unindexPending(ownerId, pending.path);
+      bubbleSummaryUp(
+        rootId: pending.rootId,
+        childId: pending.childId,
+        childPage: pending.childPage,
+        path: pending.path,
+      );
+    }
+
+    /// Flush deferred bubbles that would update entries on [navPageId].
+    void flushPendingBubblesUnder(NghPageId navPageId) {
+      final owners = pendingByAncestor[navPageId];
+      if (owners == null || owners.isEmpty) return;
+      for (final ownerId in List<NghPageId>.of(owners)) {
+        flushPendingBubble(ownerId);
+      }
+    }
+
+    void flushAllPendingBubbles() {
+      if (pendingBubbles.isEmpty) return;
+      final owners = pendingBubbles.keys.toList(growable: false);
+      for (final ownerId in owners) {
+        flushPendingBubble(ownerId);
+      }
+    }
+
+    /// Insert-path top-2 from live entry centroids (no search48 rebuild).
+    ({
+      int bestIdx,
+      double bestScore,
+      int secondIdx,
+      double secondScore,
+    }) insertTop2Nav(NghNavBTreePage page, Float32x4List qLowSimd) {
+      final n = page.entries.length;
+      var bestIdx = 0;
+      var secondIdx = -1;
+      var bestScore = -1e9;
+      var secondScore = -1e9;
+      for (int i = 0; i < n; i++) {
+        final s = innerProduct48(qLowSimd, page.entries[i].centroid48DSimd, 0);
+        if (s > bestScore) {
+          secondScore = bestScore;
+          secondIdx = bestIdx;
+          bestScore = s;
+          bestIdx = i;
+        } else if (s > secondScore) {
+          secondScore = s;
+          secondIdx = i;
+        }
+      }
+      return (
+        bestIdx: bestIdx,
+        bestScore: bestScore,
+        secondIdx: secondIdx,
+        secondScore: secondScore,
       );
     }
 
@@ -3869,15 +3992,32 @@ class NghGraphEngine {
       required NghPageId splitChildId,
       required NghNavBTreePage splitChildPage,
     }) {
+      // Topology change — never leave deferred bubbles with stale childIdx.
+      flushAllPendingBubbles();
+
       // Refresh the path child's summary after the split.
       if (path.isNotEmpty) {
         final parent = path.last;
-        parent.page.entries[parent.childIdx] = _summaryEntryForChild(
-          childPageId: splitChildId,
-          childPage: splitChildPage,
-          fallbackCentroidId: rootId,
-        );
-        markInsertNav(parent.pageId, parent.page);
+        var idx = parent.childIdx;
+        if (idx < 0 ||
+            idx >= parent.page.entries.length ||
+            parent.page.entries[idx].childPageId != splitChildId) {
+          idx = -1;
+          for (var j = 0; j < parent.page.entries.length; j++) {
+            if (parent.page.entries[j].childPageId == splitChildId) {
+              idx = j;
+              break;
+            }
+          }
+        }
+        if (idx >= 0) {
+          parent.page.entries[idx] = _summaryEntryForChild(
+            childPageId: splitChildId,
+            childPage: splitChildPage,
+            fallbackCentroidId: rootId,
+          );
+          markInsertNav(parent.pageId, parent.page);
+        }
       }
 
       if (path.isEmpty) {
@@ -3967,6 +4107,8 @@ class NghGraphEngine {
       required List<({NghPageId pageId, NghNavBTreePage page, int childIdx})>
           path,
     }) {
+      // Topology change — drain deferred mid bubbles first.
+      flushAllPendingBubbles();
       if (!ownerPage.isLeafLevel) {
         throw DbException([
           GeneralStatus(
@@ -4052,21 +4194,32 @@ class NghGraphEngine {
       if (leafPage.slots.length < maxSlotsPerPage && fitsInPhysicalPage) {
         leafPage.addSlot(newSlot);
         branchEntry.leafSlotCount = leafPage.slots.length;
-        branchEntry.centroid48D = leafPage.normalizedMean48();
-        branchEntry.centroid48DSimd =
-            Float32x4List.sublistView(branchEntry.centroid48D);
+        // In-place mean into the existing 48-D buffer so centroid48DSimd
+        // stays valid — no per-slot Float32List allocation.
+        if (branchEntry.centroid48D.length >= 48) {
+          leafPage.writeNormalizedMean48(branchEntry.centroid48D);
+        } else {
+          branchEntry.centroid48D = leafPage.normalizedMean48();
+          branchEntry.centroid48DSimd =
+              Float32x4List.sublistView(branchEntry.centroid48D);
+        }
 
         dirtyLeafPages[ptr] = leafPage;
+        // Leaf-level entry centroids are live for [insertTop2Nav]; ancestor
+        // mid summaries are deferred (see pendingBubbles) and flushed before
+        // the next descent scores those pages.
         markInsertNav(ownerInternal.pageId, ownerInternal.page);
-        // Keep ancestor mid centroids coherent with the drifted leaf mean.
-        bubbleSummaryUp(
+        schedulePendingBubble(
+          ownerId: ownerInternal.pageId,
           rootId: rootId,
-          childId: ownerInternal.pageId,
-          childPage: ownerInternal.page,
+          ownerPage: ownerInternal.page,
           path: path,
         );
         return;
       }
+
+      // Split changes topology — flush deferred bubbles for this subtree first.
+      flushAllPendingBubbles();
 
       // 50/50 Balanced Geometric Hyperplane Split
       leafPage.addSlot(newSlot);
@@ -4319,7 +4472,9 @@ class NghGraphEngine {
             )
           ]);
         }
-        final top = _top2NavChildren(cur, qLowSimd);
+        // Pull deferred child summaries into this mid before scoring.
+        flushPendingBubblesUnder(curId);
+        final top = insertTop2Nav(cur, qLowSimd);
         final bestIdx = top.bestIdx;
         final secondIdx = top.secondIdx;
         final bestScore = top.bestScore;
@@ -4356,6 +4511,7 @@ class NghGraphEngine {
       }
 
       if (cur.entries.isEmpty) {
+        flushAllPendingBubbles();
         final (leafPtrs, leafMeta) = _partitionManager.allocatePagesBatchSync(
           NghDataCategory.leaf,
           currentMeta,
@@ -4394,7 +4550,7 @@ class NghGraphEngine {
       CentroidBranchEntry? secondEntry;
       var bestScore = -1e9;
       var secondScore = -1e9;
-      final leafTop = _top2NavChildren(cur, qLowSimd);
+      final leafTop = insertTop2Nav(cur, qLowSimd);
       if (cur.entries.isNotEmpty) {
         bestEntry = cur.entries[leafTop.bestIdx];
         bestScore = leafTop.bestScore;
@@ -4432,7 +4588,7 @@ class NghGraphEngine {
       if (midAltId != null && midAltPath != null) {
         final alt = resolveInsertNav(midAltId);
         if (alt != null && alt.isLeafLevel && alt.entries.isNotEmpty) {
-          final altTop = _top2NavChildren(alt, qLowSimd);
+          final altTop = insertTop2Nav(alt, qLowSimd);
           final altBest = alt.entries[altTop.bestIdx];
           insertSlotIntoLeafSync(
             rootId,
@@ -4503,7 +4659,8 @@ class NghGraphEngine {
             )
           ]);
         }
-        final top = _top2NavChildren(cur, qLowSimd);
+        flushPendingBubblesUnder(curId);
+        final top = insertTop2Nav(cur, qLowSimd);
         final bestIdx = top.bestIdx;
         final secondIdx = top.secondIdx;
         final bestScore = top.bestScore;
@@ -4537,6 +4694,7 @@ class NghGraphEngine {
       }
 
       if (cur.entries.isEmpty) {
+        flushAllPendingBubbles();
         final (leafPtrs, leafMeta) = _partitionManager.allocatePagesBatchSync(
           NghDataCategory.leaf,
           currentMeta,
@@ -4575,7 +4733,7 @@ class NghGraphEngine {
       CentroidBranchEntry? secondEntry;
       var bestScore = -1e9;
       var secondScore = -1e9;
-      final leafTop = _top2NavChildren(cur, qLowSimd);
+      final leafTop = insertTop2Nav(cur, qLowSimd);
       if (cur.entries.isNotEmpty) {
         bestEntry = cur.entries[leafTop.bestIdx];
         bestScore = leafTop.bestScore;
@@ -4609,7 +4767,7 @@ class NghGraphEngine {
       if (midAltId != null && midAltPath != null) {
         final alt = resolveInsertNav(midAltId) ?? await loadInsertNav(midAltId);
         if (alt.isLeafLevel && alt.entries.isNotEmpty) {
-          final altTop = _top2NavChildren(alt, qLowSimd);
+          final altTop = insertTop2Nav(alt, qLowSimd);
           await insertSlotIntoLeaf(
             rootId,
             alt.entries[altTop.bestIdx],
@@ -4632,7 +4790,8 @@ class NghGraphEngine {
         if (++hop > NghNavBTreePage.maxTreeHops || cur.entries.isEmpty) {
           return null;
         }
-        final bestIdx = _top2NavChildren(cur, qLowSimd).bestIdx;
+        flushPendingBubblesUnder(curId);
+        final bestIdx = insertTop2Nav(cur, qLowSimd).bestIdx;
         final childId = cur.entries[bestIdx].childPageId;
         if (childId.isNone) return null;
         curId = childId;
@@ -4641,7 +4800,7 @@ class NghGraphEngine {
         cur = next;
       }
       if (cur.entries.isEmpty) return null;
-      final best = cur.entries[_top2NavChildren(cur, qLowSimd).bestIdx];
+      final best = cur.entries[insertTop2Nav(cur, qLowSimd).bestIdx];
       return best.leafPageId;
     }
 
@@ -4780,6 +4939,7 @@ class NghGraphEngine {
     }
 
     void tryHeavyRootSplit() {
+      flushAllPendingBubbles();
       // Grow L0 toward target/page-fit: more splits while under-target.
       final budget = !state!.canGrowRoot
           ? 0
@@ -4828,13 +4988,28 @@ class NghGraphEngine {
 
     expandUndersizedL0FromBatch();
 
-    // Pin L0 heads for roots this batch is likely to touch (L0 scores).
+    // Single-pass L0 score → pin + insertWork; one peek after ensure for
+    // hydrate/sort. Removes the prior triple L0 / double-peek prepare loops.
+    // Insert still descends via insertIntoRoot* (no fast-path skip).
     final pinRoots = <int>{};
+    final baseNodeId = currentMeta.nextNodeId;
+    final insertWork = <({
+      Float32List lowVec,
+      NghLeafSlot slot,
+      int bestRoot0,
+      int bestRoot1,
+      double maxScore0,
+      double maxScore1,
+      int leafSortKey,
+    })>[];
+
     for (int i = 0; i < vectors.length; i++) {
       final fullVec = normalizedVectors[i];
+      final pk = primaryKeys[i];
       final lowVec = _extractLow48(fullVec);
       insertQLow.setRange(0, 48, lowVec);
       final qLowSimd = insertQLowSimd;
+
       int bestRoot0 = 0, bestRoot1 = 0;
       double maxScore0 = -1e9, maxScore1 = -1e9;
       for (int r = 0; r < state.numRootCentroids; r++) {
@@ -4849,40 +5024,66 @@ class NghGraphEngine {
           bestRoot1 = r;
         }
       }
+
       pinRoots.add(bestRoot0);
-      if (maxScore1 >= maxScore0 * _boundaryDualRatio) pinRoots.add(bestRoot1);
+      if (maxScore1 >= maxScore0 * _boundaryDualRatio) {
+        pinRoots.add(bestRoot1);
+      }
+
+      final sq8 = ScalarQuantizer.quantize(fullVec);
+      final pkBytes = Uint8List.fromList(utf8.encode(pk));
+      insertWork.add((
+        lowVec: lowVec,
+        slot: NghLeafSlot(
+          nodeId: baseNodeId + i,
+          primaryKey: pk,
+          primaryKeyBytes: pkBytes,
+          sq8Codes: sq8.codes,
+          offset: sq8.offset,
+          scale: sq8.scale,
+          squaredNorm: sq8.squaredNorm,
+          low48D: lowVec,
+        ),
+        bestRoot0: bestRoot0,
+        bestRoot1: bestRoot1,
+        maxScore0: maxScore0,
+        maxScore1: maxScore1,
+        leafSortKey: -1,
+      ));
     }
+
     for (final rootId in pinRoots) {
       await ensureInsertRootNav(rootId);
     }
 
     final neededLeafIds = <NghPageId>{};
-    for (int i = 0; i < vectors.length; i++) {
-      final fullVec = normalizedVectors[i];
-      final lowVec = _extractLow48(fullVec);
-      insertQLow.setRange(0, 48, lowVec);
+    for (var i = 0; i < insertWork.length; i++) {
+      final w = insertWork[i];
+      insertQLow.setRange(0, 48, w.lowVec);
       final qLowSimd = insertQLowSimd;
-      int bestRoot0 = 0, bestRoot1 = 0;
-      double maxScore0 = -1e9, maxScore1 = -1e9;
-      for (int r = 0; r < state.numRootCentroids; r++) {
-        final s = innerProduct48(qLowSimd, state.rootCentroids48Simd, r * 12);
-        if (s > maxScore0) {
-          maxScore1 = maxScore0;
-          bestRoot1 = bestRoot0;
-          maxScore0 = s;
-          bestRoot0 = r;
-        } else if (s > maxScore1) {
-          maxScore1 = s;
-          bestRoot1 = r;
-        }
+      final leaf0 = peekBestLeafSync(w.bestRoot0, qLowSimd);
+      var leafSortKey = -1;
+      if (leaf0 != null && !leaf0.isNone) {
+        neededLeafIds.add(leaf0);
+        leafSortKey = (leaf0.partitionNo << 32) | (leaf0.pageNo & 0xffffffff);
       }
-      final leaf0 = peekBestLeafSync(bestRoot0, qLowSimd);
-      if (leaf0 != null && !leaf0.isNone) neededLeafIds.add(leaf0);
-      if (maxScore1 >= maxScore0 * _boundaryDualRatio) {
-        final leaf1 = peekBestLeafSync(bestRoot1, qLowSimd);
+      if (w.maxScore1 >= w.maxScore0 * _boundaryDualRatio) {
+        final leaf1 = peekBestLeafSync(w.bestRoot1, qLowSimd);
         if (leaf1 != null && !leaf1.isNone) neededLeafIds.add(leaf1);
       }
+      if (leafSortKey != w.leafSortKey) {
+        insertWork[i] = (
+          lowVec: w.lowVec,
+          slot: w.slot,
+          bestRoot0: w.bestRoot0,
+          bestRoot1: w.bestRoot1,
+          maxScore0: w.maxScore0,
+          maxScore1: w.maxScore1,
+          leafSortKey: leafSortKey,
+        );
+      }
     }
+
     if (neededLeafIds.isNotEmpty) {
       await _hydrateBTreeLeaves(
         table: table,
@@ -4893,43 +5094,21 @@ class NghGraphEngine {
       );
     }
 
-    // Globally unique nodeIds across flushes
-    final baseNodeId = currentMeta.nextNodeId;
-    for (int i = 0; i < vectors.length; i++) {
-      final fullVec = normalizedVectors[i];
-      final pk = primaryKeys[i];
-      final lowVec = _extractLow48(fullVec);
+    insertWork.sort((a, b) {
+      final byRoot = a.bestRoot0.compareTo(b.bestRoot0);
+      if (byRoot != 0) return byRoot;
+      return a.leafSortKey.compareTo(b.leafSortKey);
+    });
 
-      insertQLow.setRange(0, 48, lowVec);
+    for (final w in insertWork) {
+      insertQLow.setRange(0, 48, w.lowVec);
       final qLowSimd = insertQLowSimd;
-
-      final sq8 = ScalarQuantizer.quantize(fullVec);
-      final pkBytes = Uint8List.fromList(utf8.encode(pk));
-      final newSlot = NghLeafSlot(
-        nodeId: baseNodeId + i,
-        primaryKey: pk,
-        primaryKeyBytes: pkBytes,
-        sq8Codes: sq8.codes,
-        offset: sq8.offset,
-        scale: sq8.scale,
-        squaredNorm: sq8.squaredNorm,
-        low48D: lowVec,
-      );
-
-      int bestRoot0 = 0, bestRoot1 = 0;
-      double maxScore0 = -1e9, maxScore1 = -1e9;
-      for (int r = 0; r < state.numRootCentroids; r++) {
-        final s = innerProduct48(qLowSimd, state.rootCentroids48Simd, r * 12);
-        if (s > maxScore0) {
-          maxScore1 = maxScore0;
-          bestRoot1 = bestRoot0;
-          maxScore0 = s;
-          bestRoot0 = r;
-        } else if (s > maxScore1) {
-          maxScore1 = s;
-          bestRoot1 = r;
-        }
-      }
+      final newSlot = w.slot;
+      final bestRoot0 = w.bestRoot0;
+      final bestRoot1 = w.bestRoot1;
+      final maxScore0 = w.maxScore0;
+      final maxScore1 = w.maxScore1;
+      final lowVec = w.lowVec;
 
       // Far from every L0 → spawn a precise new root (keeps wantLeaves fixed).
       final farThresh = _l0FarSpawnThreshold(
@@ -4956,6 +5135,9 @@ class NghGraphEngine {
         }
       }
     }
+
+    // Drain coalesced mid summaries before L0 refresh / heavy-root split.
+    flushAllPendingBubbles();
 
     // Refresh every resident L0 head so cold k-means seeds drift toward live
     // subtree mass without leaf rewrite / extra I/O.

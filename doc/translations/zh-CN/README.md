@@ -747,7 +747,7 @@ await db.kv.setMany(settingsMap, durability: RecoveryDurability.durable);
 
 ### <a id="vector-advanced"></a>向量字段、向量索引与混合检索
 
-向量检索走统一的 `db.query(...).matchVector(...)` 查询链：可与结构化条件同链组合，也可与其它召回分支做多路融合；分数与通道诊断在 `QueryResult.retrieval` 中返回，与 `data` 行一一对应。当前示例以向量 + 结构化为主，词法、图检索等通道将沿同一套链式混合检索模型扩展。
+向量检索走统一的 `db.query(...).matchVector(...)` 查询链：可与结构化条件同链组合，也可与其它召回分支做多路融合；分数与通道诊断在 `QueryResult.retrieval` 中返回，与 `data` 行一一对应。若只需主键与评分，请优先 `.select(['id'])`（或你的主键字段名），引擎会跳过表侧完整行物化；否则混合检索会回表加载整行（含大体积 embedding），吞吐量可能大幅下降。纯 ANN、无需过滤/融合时，也可用顶层 `db.vectorSearch(...)`，直接返回 `List<VectorSearchResult>`（主键 + 评分），核心检索路径相同。当前示例以向量 + 结构化为主，词法、图检索等通道将沿同一套链式混合检索模型扩展。
 
 ```dart
 await db.createTables([
@@ -795,19 +795,21 @@ final queryVector =
     VectorData.fromList(List.generate(128, (i) => i * 0.01)); // 长度需与 dimensions 一致
 
 // 1) 主推：链式混合检索（纯向量近邻）
+// 仅需主键 + 评分时用 .select([主键])，避免回表加载完整行
 final result = await db
     .query('embeddings')
+    .select(['id'])
     .matchVector('embedding', queryVector) // 默认 searchDepth = 50
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
   final row = result.data[i];
   final entry = result.retrieval?.entries[i];
-  final score = entry?.score;
-  final distance = entry?.meta?['distance'];
-  print('pk=${row['id']}, title=${row['document_title']}, '
-      'score=$score, distance=$distance');
+  print('pk=${row['id']}, score=${entry?.score}, '
+      'distance=${entry?.meta?['distance']}');
 }
+
+// 需要业务字段时再省略 select()（或显式投影所需列）——引擎会对命中主键回表取整行（更重）
 
 // 2) 结构化过滤 + 向量（AND 混合）
 final filtered = await db
@@ -828,6 +830,14 @@ final fused = await db
     .limit(10);
 
 print('fusion=${fused.retrieval?.fusionMethod}'); // 多路时通常为 rrf
+
+// 顶层专用 ANN（同一核心路径；仅主键 + 评分，无查询链 / 融合）
+final ann = await db.vectorSearch(
+  'embeddings',
+  fieldName: 'embedding',
+  queryVector: queryVector,
+  topK: 5,
+);
 ```
 
 **表结构 / 向量索引配置**（`VectorFieldConfig`、`VectorIndexConfig`）：
@@ -848,9 +858,11 @@ print('fusion=${fused.retrieval?.fusionMethod}'); // 多路时通常为 rrf
 **结果说明**（`QueryResult`）：
 
 - 业务行数据在 `data`；检索分数与通道信息在 `retrieval.entries`，与 `data` **一一对应**。
+- 高吞吐 ANN / 混合召回请用 `.select(['id'])`（主键字段名），使 `data` 仅含主键，评分仍在 `retrieval`。
 - `entry.score`：归一化后的相似度 / 融合分数，范围通常在 `0 ~ 1`，值越大表示越相关。
 - `entry.meta['distance']`：原始距离（向量通道常见）；对 `l2` / `cosine` 场景通常越小表示越相近。
 - `retrieval.fusionMethod`：单通道多为 `single`；多路融合召回多为 `rrf`（Reciprocal Rank Fusion）。
+- 顶层 `db.vectorSearch(...)` 返回 `List<VectorSearchResult>`（`primaryKey` / `score` / `distance`），适合无需结构化过滤或多路融合的专用 ANN。
 
 ### <a id="ttl-config"></a>表级 TTL（按时间自动过期清理）
 

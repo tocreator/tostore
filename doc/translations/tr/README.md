@@ -726,7 +726,7 @@ await db.kv.setMany(settingsMap, durability: RecoveryDurability.durable);
 
 ### <a id="vector-advanced"></a>Vektör Alanları, Vektör İndeksleri ve Hibrit Getirme
 
-Vektör getirme, birleşik `db.query(...).matchVector(...)` sorgu zincirini kullanır: aynı zincirde yapılandırılmış koşullarla birleştirilebilir veya diğer getirme dallarıyla kaynaştırılabilir. Skorlar ve kanal tanıları `QueryResult.retrieval` içinde döner ve `data` satırlarıyla 1:1 hizalanır. Güncel örnekler vektör + yapılandırılmış yollara odaklanır; sözcüksel, grafik ve diğer kanallar aynı zincirli hibrit getirme modeliyle genişletilecektir.
+Vektör getirme, birleşik `db.query(...).matchVector(...)` sorgu zincirini kullanır: aynı zincirde yapılandırılmış koşullarla birleştirilebilir veya diğer getirme dallarıyla kaynaştırılabilir. Skorlar ve kanal tanıları `QueryResult.retrieval` içinde döner ve `data` satırlarıyla 1:1 hizalanır. Yalnızca birincil anahtar ve skor gerektiğinde `.select(['id'])` (veya PK alan adınız) tercih edin; böylece motor tam satırları yüklemez — aksi halde hibrit getirme eksiksiz kayıtları (büyük embedding’ler dahil) materyalize eder ve verim keskin düşebilir. Filtre veya füzyon olmadan özel ANN için `db.vectorSearch(...)` aynı çekirdek arama yoluyla `List<VectorSearchResult>` (birincil anahtar + skor) döndürür. Güncel örnekler vektör + yapılandırılmış yollara odaklanır; sözcüksel, grafik ve diğer kanallar aynı zincirli hibrit getirme modeliyle genişletilecektir.
 
 ```dart
 await db.createTables([
@@ -774,19 +774,22 @@ final queryVector =
     VectorData.fromList(List.generate(128, (i) => i * 0.01)); // Must match dimensions
 
 // 1) Recommended: chained hybrid retrieval (pure vector ANN)
+// Prefer .select([pk]) for primary key + score only — avoids full-row hydration.
 final result = await db
     .query('embeddings')
+    .select(['id'])
     .matchVector('embedding', queryVector) // varsayılan searchDepth = 50
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
   final row = result.data[i];
   final entry = result.retrieval?.entries[i];
-  final score = entry?.score;
-  final distance = entry?.meta?['distance'];
-  print('pk=${row['id']}, title=${row['document_title']}, '
-      'score=$score, distance=$distance');
+  print('pk=${row['id']}, score=${entry?.score}, '
+      'distance=${entry?.meta?['distance']}');
 }
+
+// Need business columns? omit select() (or project the fields you need) —
+// the engine then loads full table rows for matched PKs (heavier).
 
 // 2) Structured filter + vector (AND hybrid)
 final filtered = await db
@@ -807,6 +810,14 @@ final fused = await db
     .limit(10);
 
 print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
+
+// Dedicated ANN (same core path; PK + score only, no query chain / fusion)
+final ann = await db.vectorSearch(
+  'embeddings',
+  fieldName: 'embedding',
+  queryVector: queryVector,
+  topK: 5,
+);
 ```
 
 **Şema / vektör indeks yapılandırması** (`VectorFieldConfig`, `VectorIndexConfig`):
@@ -827,9 +838,11 @@ print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
 **Sonuç notları** (`QueryResult`):
 
 - İş satırları `data` içinde; getirme skorları ve kanal bilgisi `retrieval.entries` içinde, `data` ile **1:1** hizalı
+- Yüksek verimli ANN / hibrit getirme için `.select(['id'])` (PK alan adı) kullanın; böylece `data` yalnızca PK olur, skorlar `retrieval`’da kalır
 - `entry.score`: normalize benzerlik / füzyon skoru, tipik olarak `0 ~ 1`; büyük = daha ilgili
 - `entry.meta['distance']`: ham mesafe (vektör kanalında yaygındır); `l2` / `cosine` için küçük genellikle daha yakındır
 - `retrieval.fusionMethod`: tek kanalda genellikle `single`; çok yollu füzyon tipik olarak `rrf` (Reciprocal Rank Fusion)
+- Üst düzey `db.vectorSearch(...)`, yapılandırılmış filtre veya çok yollu füzyon olmadan yalnızca özel ANN gerektiğinde `List<VectorSearchResult>` (`primaryKey` / `score` / `distance`) döndürür
 
 ### <a id="ttl-config"></a>Tablo düzeyinde TTL (Otomatik Zamana Dayalı Sona Erme)
 

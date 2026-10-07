@@ -1177,8 +1177,10 @@ QueryBuilder orMatchVector(...); // same params, OR branch
 | chain `limit` | Acts as topK |
 
 ```dart
-// Pure ANN (default searchDepth 50)
+// Pure ANN (default searchDepth 50). Prefer .select([pk]) for PK + score
+// only — skips full-row hydration (large embeddings hurt throughput).
 final result = await db.query('embeddings')
+  .select(['id'])
   .matchVector('embedding', queryVector)
   .limit(5);
 
@@ -1205,6 +1207,7 @@ await db.query('embeddings')
 ### QueryResult.retrieval
 
 - `data[i]` ↔ `retrieval.entries[i]` **1:1**
+- With `.select([pk])`, `data` is PK-only; scores stay in `retrieval`
 - `entry.score` — normalized / fused score (higher ≈ better)
 - `entry.meta['distance']` — raw distance on vector channel
 - `retrieval.fusionMethod` — `single` or typically `rrf` for multi-way

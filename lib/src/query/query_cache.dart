@@ -211,6 +211,12 @@ class QueryCacheKey {
   final List<String>? groupBy;
   final bool onlyCount;
 
+  /// Normalized SELECT field list (null / empty = all columns).
+  ///
+  /// Must be part of the cache key so projected results never collide with
+  /// full-row results under the same WHERE/ORDER/LIMIT.
+  final List<String>? selectedFields;
+
   /// Cached identity string / hash.
   String? _cachedString;
   int? _cachedHash;
@@ -226,6 +232,7 @@ class QueryCacheKey {
     this.aggregations,
     this.groupBy,
     this.onlyCount = false,
+    this.selectedFields,
   });
 
   @override
@@ -266,6 +273,10 @@ class QueryCacheKey {
     }
     if (groupBy != null && groupBy!.isNotEmpty) {
       _writeStringList(b, 'g', groupBy!);
+    }
+    if (selectedFields != null && selectedFields!.isNotEmpty) {
+      final normalized = List<String>.from(selectedFields!)..sort();
+      _writeStringList(b, 's', normalized);
     }
     if (joins != null && joins!.isNotEmpty) {
       b.write('j');

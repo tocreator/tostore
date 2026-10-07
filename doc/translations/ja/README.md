@@ -726,7 +726,7 @@ await db.kv.setMany(settingsMap, durability: RecoveryDurability.durable);
 
 ### <a id="vector-advanced"></a>ベクトル フィールド、ベクトル インデックス、ハイブリッド検索
 
-ベクトル検索は統一された `db.query(...).matchVector(...)` クエリチェーンを使用します。同一チェーン上で構造化条件と組み合わせることも、他のリコール分岐と多路融合することもできます。スコアとチャネル診断は `QueryResult.retrieval` で返され、`data` 行と 1:1 で対応します。現在の例はベクトル＋構造化パスを中心としており、語彙・グラフなどのチャネルも同じチェーン型ハイブリッド検索モデルに沿って拡張されます。
+ベクトル検索は統一された `db.query(...).matchVector(...)` クエリチェーンを使用します。同一チェーン上で構造化条件と組み合わせることも、他のリコール分岐と多路融合することもできます。スコアとチャネル診断は `QueryResult.retrieval` で返され、`data` 行と 1:1 で対応します。主キーとスコアだけが必要な場合は `.select(['id'])`（または PK フィールド名）を優先し、エンジンが表側の完全行マテリアライズをスキップできるようにしてください。省略するとハイブリッド検索は完全レコード（大きな embedding を含む）を読み込み、スループットが大きく低下することがあります。フィルタや融合が不要な専用 ANN では、同じコア検索パスで `db.vectorSearch(...)` が `List<VectorSearchResult>`（主キー + スコア）を返します。現在の例はベクトル＋構造化パスを中心としており、語彙・グラフなどのチャネルも同じチェーン型ハイブリッド検索モデルに沿って拡張されます。
 
 ```dart
 await db.createTables([
@@ -774,19 +774,22 @@ final queryVector =
     VectorData.fromList(List.generate(128, (i) => i * 0.01)); // Must match dimensions
 
 // 1) Recommended: chained hybrid retrieval (pure vector ANN)
+// Prefer .select([pk]) for primary key + score only — avoids full-row hydration.
 final result = await db
     .query('embeddings')
+    .select(['id'])
     .matchVector('embedding', queryVector) // デフォルト searchDepth = 50
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
   final row = result.data[i];
   final entry = result.retrieval?.entries[i];
-  final score = entry?.score;
-  final distance = entry?.meta?['distance'];
-  print('pk=${row['id']}, title=${row['document_title']}, '
-      'score=$score, distance=$distance');
+  print('pk=${row['id']}, score=${entry?.score}, '
+      'distance=${entry?.meta?['distance']}');
 }
+
+// Need business columns? omit select() (or project the fields you need) —
+// the engine then loads full table rows for matched PKs (heavier).
 
 // 2) Structured filter + vector (AND hybrid)
 final filtered = await db
@@ -807,6 +810,14 @@ final fused = await db
     .limit(10);
 
 print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
+
+// Dedicated ANN (same core path; PK + score only, no query chain / fusion)
+final ann = await db.vectorSearch(
+  'embeddings',
+  fieldName: 'embedding',
+  queryVector: queryVector,
+  topK: 5,
+);
 ```
 
 **スキーマ / ベクトルインデックス設定**（`VectorFieldConfig`、`VectorIndexConfig`）：
@@ -827,9 +838,11 @@ print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
 **結果のメモ**（`QueryResult`）：
 
 - 業務行データは `data`、検索スコアとチャネル情報は `retrieval.entries` にあり、`data` と **1:1** で対応します
+- 高スループットの ANN / ハイブリッドリコールでは `.select(['id'])`（PK フィールド名）を使い、`data` を PK のみにし、スコアは `retrieval` に残します
 - `entry.score`: 正規化された類似度 / 融合スコア。通常は `0 ~ 1` の範囲で、大きいほど関連性が高いことを意味します
 - `entry.meta['distance']`: 生の距離（ベクトルチャネルで一般的）。`l2` / `cosine` の場合、通常小さいほど近いことを意味します
 - `retrieval.fusionMethod`: 単一チャネルでは多くが `single`、多路融合リコールでは多くが `rrf`（Reciprocal Rank Fusion）です
+- トップレベル `db.vectorSearch(...)` は、構造化フィルタや多路融合が不要な専用 ANN 向けに `List<VectorSearchResult>`（`primaryKey` / `score` / `distance`）を返します
 
 ### <a id="ttl-config"></a>テーブルレベルの TTL (時間ベースの自動有効期限)
 

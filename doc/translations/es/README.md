@@ -726,7 +726,7 @@ await db.kv.setMany(settingsMap, durability: RecoveryDurability.durable);
 
 ### <a id="vector-advanced"></a>Campos vectoriales, índices vectoriales y recuperación híbrida
 
-La recuperación vectorial utiliza la cadena unificada `db.query(...).matchVector(...)`: puede combinarse con predicados estructurados en la misma cadena, o fusionarse con otras ramas de recuperación. Las puntuaciones y los diagnósticos de canal se devuelven en `QueryResult.retrieval`, alineados 1:1 con las filas de `data`. Los ejemplos actuales se centran en rutas vectoriales + estructuradas; los canales léxicos, de grafos y otros se extenderán siguiendo el mismo modelo de recuperación híbrida encadenada.
+La recuperación vectorial utiliza la cadena unificada `db.query(...).matchVector(...)`: puede combinarse con predicados estructurados en la misma cadena, o fusionarse con otras ramas de recuperación. Las puntuaciones y los diagnósticos de canal se devuelven en `QueryResult.retrieval`, alineados 1:1 con las filas de `data`. Si solo necesita claves primarias y puntuaciones, prefiera `.select(['id'])` (o el nombre de su campo PK) para que el motor omita hidratar filas completas; de lo contrario, la recuperación híbrida materializa registros completos (incluidas incrustaciones grandes) y el rendimiento puede caer bruscamente. Para ANN dedicado sin filtros ni fusión, `db.vectorSearch(...)` devuelve `List<VectorSearchResult>` (clave primaria + puntuación) con la misma ruta de búsqueda central. Los ejemplos actuales se centran en rutas vectoriales + estructuradas; los canales léxicos, de grafos y otros se extenderán siguiendo el mismo modelo de recuperación híbrida encadenada.
 
 ```dart
 await db.createTables([
@@ -774,19 +774,22 @@ final queryVector =
     VectorData.fromList(List.generate(128, (i) => i * 0.01)); // Must match dimensions
 
 // 1) Recommended: chained hybrid retrieval (pure vector ANN)
+// Prefer .select([pk]) for primary key + score only — avoids full-row hydration.
 final result = await db
     .query('embeddings')
+    .select(['id'])
     .matchVector('embedding', queryVector) // searchDepth predeterminado = 50
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
   final row = result.data[i];
   final entry = result.retrieval?.entries[i];
-  final score = entry?.score;
-  final distance = entry?.meta?['distance'];
-  print('pk=${row['id']}, title=${row['document_title']}, '
-      'score=$score, distance=$distance');
+  print('pk=${row['id']}, score=${entry?.score}, '
+      'distance=${entry?.meta?['distance']}');
 }
+
+// Need business columns? omit select() (or project the fields you need) —
+// the engine then loads full table rows for matched PKs (heavier).
 
 // 2) Structured filter + vector (AND hybrid)
 final filtered = await db
@@ -807,6 +810,14 @@ final fused = await db
     .limit(10);
 
 print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
+
+// Dedicated ANN (same core path; PK + score only, no query chain / fusion)
+final ann = await db.vectorSearch(
+  'embeddings',
+  fieldName: 'embedding',
+  queryVector: queryVector,
+  topK: 5,
+);
 ```
 
 **Configuración de esquema / índice vectorial** (`VectorFieldConfig`, `VectorIndexConfig`):
@@ -827,9 +838,11 @@ print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
 **Notas sobre el resultado** (`QueryResult`):
 
 - Las filas de negocio están en `data`; las puntuaciones de recuperación y la información de canal están en `retrieval.entries`, alineadas **1:1** con `data`
+- Para alto rendimiento en ANN / recuperación híbrida, use `.select(['id'])` (nombre del campo PK) para que `data` solo tenga la PK y las puntuaciones queden en `retrieval`
 - `entry.score`: puntuación de similitud / fusión normalizada, normalmente en `0 ~ 1`; mayor significa más relevante
 - `entry.meta['distance']`: distancia bruta (habitual en el canal vectorial); para `l2` / `cosine`, menor suele significar más cercano
 - `retrieval.fusionMethod`: suele ser `single` para un canal; la recuperación fusionada multi-vía es típicamente `rrf` (Reciprocal Rank Fusion)
+- El API de nivel superior `db.vectorSearch(...)` devuelve `List<VectorSearchResult>` (`primaryKey` / `score` / `distance`) cuando solo necesita ANN dedicado sin filtros estructurados ni fusión multi-vía
 
 ### <a id="ttl-config"></a>TTL a nivel de tabla (vencimiento automático basado en tiempo)
 

@@ -726,7 +726,7 @@ await db.kv.setMany(settingsMap, durability: RecoveryDurability.durable);
 
 ### <a id="vector-advanced"></a>Векторные поля, векторные индексы и гибридный поиск
 
-Векторный поиск использует единую цепочку `db.query(...).matchVector(...)`: её можно сочетать со структурированными условиями в той же цепочке или сливать с другими ветвями отзыва. Оценки и диагностика каналов возвращаются в `QueryResult.retrieval` и выровнены 1:1 со строками `data`. Текущие примеры сосредоточены на путях «вектор + структурированный»; лексические, графовые и другие каналы будут расширяться по той же модели цепочечного гибридного поиска.
+Векторный поиск использует единую цепочку `db.query(...).matchVector(...)`: её можно сочетать со структурированными условиями в той же цепочке или сливать с другими ветвями отзыва. Оценки и диагностика каналов возвращаются в `QueryResult.retrieval` и выровнены 1:1 со строками `data`. Если нужны только первичные ключи и оценки, предпочитайте `.select(['id'])` (или имя поля PK), чтобы движок не материализовал полные строки таблицы — иначе гибридный поиск загружает целые записи (включая крупные embedding) и пропускная способность может резко упасть. Для выделенного ANN без фильтров и слияния `db.vectorSearch(...)` возвращает `List<VectorSearchResult>` (первичный ключ + оценка) по тому же основному пути поиска. Текущие примеры сосредоточены на путях «вектор + структурированный»; лексические, графовые и другие каналы будут расширяться по той же модели цепочечного гибридного поиска.
 
 ```dart
 await db.createTables([
@@ -774,19 +774,22 @@ final queryVector =
     VectorData.fromList(List.generate(128, (i) => i * 0.01)); // Must match dimensions
 
 // 1) Recommended: chained hybrid retrieval (pure vector ANN)
+// Prefer .select([pk]) for primary key + score only — avoids full-row hydration.
 final result = await db
     .query('embeddings')
+    .select(['id'])
     .matchVector('embedding', queryVector) // searchDepth по умолчанию = 50
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
   final row = result.data[i];
   final entry = result.retrieval?.entries[i];
-  final score = entry?.score;
-  final distance = entry?.meta?['distance'];
-  print('pk=${row['id']}, title=${row['document_title']}, '
-      'score=$score, distance=$distance');
+  print('pk=${row['id']}, score=${entry?.score}, '
+      'distance=${entry?.meta?['distance']}');
 }
+
+// Need business columns? omit select() (or project the fields you need) —
+// the engine then loads full table rows for matched PKs (heavier).
 
 // 2) Structured filter + vector (AND hybrid)
 final filtered = await db
@@ -807,6 +810,14 @@ final fused = await db
     .limit(10);
 
 print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
+
+// Dedicated ANN (same core path; PK + score only, no query chain / fusion)
+final ann = await db.vectorSearch(
+  'embeddings',
+  fieldName: 'embedding',
+  queryVector: queryVector,
+  topK: 5,
+);
 ```
 
 **Конфигурация схемы / векторного индекса** (`VectorFieldConfig`, `VectorIndexConfig`):
@@ -827,9 +838,11 @@ print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
 **Примечания к результату** (`QueryResult`):
 
 - Бизнес-строки в `data`; оценки и сведения о каналах в `retrieval.entries`, выровнены **1:1** с `data`
+- Для высокой пропускной способности ANN / гибридного отбора используйте `.select(['id'])` (имя поля PK), чтобы в `data` был только PK, а оценки оставались в `retrieval`
 - `entry.score`: нормализованная оценка сходства / слияния, обычно `0 ~ 1`; больше = релевантнее
 - `entry.meta['distance']`: сырое расстояние (часто на векторном канале); для `l2` / `cosine` меньшее обычно означает ближе
 - `retrieval.fusionMethod`: для одного канала обычно `single`; многоканальное слияние типично `rrf` (Reciprocal Rank Fusion)
+- Верхнеуровневый `db.vectorSearch(...)` возвращает `List<VectorSearchResult>` (`primaryKey` / `score` / `distance`), когда нужен только выделенный ANN без структурированных фильтров и многоканального слияния
 
 ### <a id="ttl-config"></a>TTL на уровне таблицы (автоматический срок действия на основе времени)
 

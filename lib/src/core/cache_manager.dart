@@ -29,21 +29,25 @@ final class CacheManager {
     // Table data (hot records + B+Tree pages)
     mm.registerCacheEvictionCallback(MemoryQuotaType.tableData, () async {
       if (isMemoryMode) return;
+      final recordRatio = mm.getRecordCacheEvictionRatio();
+      final pageRatio = mm.getPageCacheEvictionRatio();
       try {
-        // Evict record cache first
-        await _dataStore.tableDataManager.evictTableRecordCache(ratio: 0.3);
+        // Evict record cache first (heap-heavy row maps)
+        await _dataStore.tableDataManager
+            .evictTableRecordCache(ratio: recordRatio);
       } catch (e) {
         Logger.warn('Evict hot record cache failed', rawError: e);
       }
       try {
-        // Then evict page cache (B+Tree pages)
-        await _dataStore.tableTreePartitionManager?.evictPageCache(ratio: 0.3);
+        // Then evict page cache (B+Tree pages) with conservative page ratio to protect flush IO
+        await _dataStore.tableTreePartitionManager
+            ?.evictPageCache(ratio: pageRatio);
       } catch (e) {
         Logger.warn('Evict page cache failed', rawError: e);
       }
       try {
         // Evict overflow page cache
-        await _dataStore.overflowManager.evictPageCache(ratio: 0.3);
+        await _dataStore.overflowManager.evictPageCache(ratio: pageRatio);
       } catch (e) {
         Logger.warn('Evict overflow page cache failed', rawError: e);
       }
@@ -52,9 +56,11 @@ final class CacheManager {
     // Structured B+Tree index pages (not vector ANN — that is vectorIndex).
     mm.registerCacheEvictionCallback(MemoryQuotaType.indexData, () async {
       if (isMemoryMode) return;
+      final ratio = mm.getPageCacheEvictionRatio();
       try {
-        // Evict B+Tree page cache
-        await _dataStore.indexTreePartitionManager?.evictPageCache(ratio: 0.3);
+        // Evict B+Tree page cache conservatively
+        await _dataStore.indexTreePartitionManager
+            ?.evictPageCache(ratio: ratio);
       } catch (e) {
         Logger.warn('Evict index page cache failed', rawError: e);
       }
@@ -62,9 +68,10 @@ final class CacheManager {
 
     mm.registerCacheEvictionCallback(MemoryQuotaType.vectorIndex, () async {
       if (isMemoryMode) return;
+      final ratio = mm.getEvictionRatio(MemoryQuotaType.vectorIndex);
       try {
         // Evict NGH vector index caches
-        await _dataStore.vectorIndexManager?.evictCache(ratio: 0.3);
+        await _dataStore.vectorIndexManager?.evictCache(ratio: ratio);
       } catch (e) {
         Logger.warn('Evict vector index cache failed', rawError: e);
       }
@@ -72,8 +79,9 @@ final class CacheManager {
 
     // Query result cache (QueryExecutor + HotspotCache)
     mm.registerCacheEvictionCallback(MemoryQuotaType.queryResult, () async {
+      final ratio = mm.getEvictionRatio(MemoryQuotaType.queryResult);
       try {
-        await _dataStore.queryExecutor.evictQueryCache(ratio: 0.3);
+        await _dataStore.queryExecutor.evictQueryCache(ratio: ratio);
       } catch (e) {
         Logger.warn('Evict query cache failed', rawError: e);
       }
@@ -81,8 +89,9 @@ final class CacheManager {
 
     // Schema cache (tableMetaManager + HotspotCache)
     mm.registerCacheEvictionCallback(MemoryQuotaType.schema, () async {
+      final ratio = mm.currentEvictionRatio;
       try {
-        await _dataStore.tableMetaManager?.evictSchemaCache(ratio: 0.3);
+        await _dataStore.tableMetaManager?.evictSchemaCache(ratio: ratio);
       } catch (e) {
         Logger.warn('Evict schema cache failed', rawError: e);
       }
@@ -90,13 +99,14 @@ final class CacheManager {
 
     // Meta caches (table data meta + index meta)
     mm.registerCacheEvictionCallback(MemoryQuotaType.meta, () async {
+      final ratio = mm.currentEvictionRatio;
       try {
-        await _dataStore.tableDataManager.evictTableDataMetaCache(ratio: 0.3);
+        await _dataStore.tableDataManager.evictTableDataMetaCache(ratio: ratio);
       } catch (e) {
         Logger.warn('Evict table data meta cache failed', rawError: e);
       }
       try {
-        await _dataStore.indexManager?.evictIndexMetaCache(0.3);
+        await _dataStore.indexManager?.evictIndexMetaCache(ratio);
       } catch (e) {
         Logger.warn('Evict index meta cache failed', rawError: e);
       }

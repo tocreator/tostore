@@ -1,11 +1,12 @@
 import 'dart:async';
-import 'dart:math' show min;
+import 'dart:math' show max, min;
 import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
 import '../handler/encryption.dart';
 import '../handler/logger.dart';
+import '../handler/parallel_processor.dart';
 import '../handler/platform_handler.dart';
 import '../handler/value_matcher.dart';
 import '../interface/storage_interface.dart';
@@ -21,7 +22,6 @@ import '../model/index_entry.dart';
 import '../model/meta_info.dart';
 import '../model/migration_write_mode.dart';
 import '../model/parallel_journal_entry.dart';
-import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/space_stats.dart';
 import '../model/system_table.dart';
@@ -38,6 +38,7 @@ import 'page_redo_log_codec.dart';
 import 'resource_manager.dart';
 import 'storage_adapter.dart';
 import 'wal_manager.dart';
+import 'workload_scheduler.dart';
 import 'write_buffer_manager.dart';
 import 'yield_controller.dart';
 
@@ -179,15 +180,23 @@ class ParallelJournalManager {
     }
   }
 
-  /// Suspend caller until total pending drops below [busyThreshold] or timeout.
-  Future<void> _waitUntilPressureRelieved({
-    Duration timeout = const Duration(seconds: 120),
-  }) async {
+  /// Suspend caller until total pending drops below [busyThreshold].
+  ///
+  /// Implements strict backpressure without leaky timeouts: writes are safely
+  /// throttled to match disk throughput, preventing memory exhaustion while
+  /// guaranteeing forward progress via active pump scheduling.
+  Future<void> waitUntilPressureRelieved() async {
     if (pressureState != FlushPressureState.busy) return;
-    final deadline = DateTime.now().add(timeout);
 
     while (_running && pressureState == FlushPressureState.busy) {
-      if (DateTime.now().isAfter(deadline)) break;
+      // Active forward progress: ensure flush pump is running and tail wait is unblocked
+      scheduleFlushIfNeeded();
+      final wake = _tailWaitWake;
+      if (wake != null && !wake.isCompleted) {
+        wake.complete();
+      }
+
+      // Dual-wait: event-driven wake + 50ms polling tick
       final c = Completer<void>();
       _busyWaiters.add(c);
       try {
@@ -325,7 +334,7 @@ class ParallelJournalManager {
   ///
   /// Returns `null` on the hot path (normal pressure state / healthy system memory).
   /// Returns a [Future] only when flush is busy or hard resource wait is needed.
-  Future<void>? applyEnqueueBackpressure([int count = 1]) {
+  Future<void>? applyEnqueueBackpressure() {
     // Fast-path: When pressure is normal or idle and memory status is healthy,
     // execute pure-sync zero await to guarantee maximum throughput.
     if (pressureState != FlushPressureState.busy) {
@@ -338,10 +347,10 @@ class ParallelJournalManager {
       return null;
     }
     if (_isRecovering) return null;
-    return _applyEnqueueBackpressureSlow(count);
+    return _applyEnqueueBackpressureSlow();
   }
 
-  Future<void> _applyEnqueueBackpressureSlow(int count) async {
+  Future<void> _applyEnqueueBackpressureSlow() async {
     final rm = _dataStore.resourceManager;
     if (rm != null) {
       if (pressureState == FlushPressureState.busy ||
@@ -349,18 +358,8 @@ class ParallelJournalManager {
         await rm.triggerImmediateCheck();
       }
 
-      if (rm.isWriteBlocked) {
-        throw DbException([
-          GeneralStatus(
-            type: ResultType.sysResourceExhaustedMemory,
-            message:
-                'Write buffer enqueue blocked: system memory is critically low.',
-            operation: 'applyEnqueueBackpressure',
-          ),
-        ]);
-      }
-
-      if (rm.memoryStatus == ResourceStatus.warning) {
+      if (rm.memoryStatus == ResourceStatus.warning ||
+          rm.memoryStatus == ResourceStatus.critical) {
         scheduleFlushIfNeeded();
         final wake = _tailWaitWake;
         if (wake != null && !wake.isCompleted) {
@@ -375,7 +374,7 @@ class ParallelJournalManager {
       if (wake != null && !wake.isCompleted) {
         wake.complete();
       }
-      await _waitUntilPressureRelieved(timeout: const Duration(seconds: 60));
+      await waitUntilPressureRelieved();
     }
   }
 
@@ -2400,7 +2399,6 @@ class ParallelJournalManager {
         if (!_running) return;
         _flushInProgress = true;
         try {
-          await _replayPageRedoLogIfExists(captureBatchId);
           await _pumpFlush(
             drainCompletely: false,
             recoveryBatchContext: BatchContext(
@@ -2870,6 +2868,12 @@ class ParallelJournalManager {
             return _dataStore.pathManager
                 .getPartitionFilePathByContext(tableContext, key.partitionNo);
           }
+          if (key.kind == PageRedoTreeKind.overflow) {
+            final tableContext = await _tableContextFromUid(key.tableUid);
+            if (tableContext == null) return null;
+            return _dataStore.pathManager.getOverflowPartitionFilePathByContext(
+                tableContext, key.partitionNo);
+          }
           if (key.kind == PageRedoTreeKind.ngh) {
             final tableContext = await _tableContextFromUid(key.tableUid);
             if (tableContext == null) return null;
@@ -2906,6 +2910,13 @@ class ParallelJournalManager {
         }) key,
         Map<int, Uint8List> pages,
       ) async {
+        if (key.kind == PageRedoTreeKind.overflow) {
+          for (final pageNo in pages.keys) {
+            _dataStore.overflowManager
+                .invalidateCachedPage(key.tableUid, key.partitionNo, pageNo);
+          }
+          return;
+        }
         if (key.partitionNo != 0 || !pages.containsKey(0)) return;
         final tableContext = await _tableContextFromUid(key.tableUid);
         if (tableContext == null) return;
@@ -2928,6 +2939,19 @@ class ParallelJournalManager {
 
       // Pass 1: full page images (table/index/nav/full leaf). Skip NGPK so
       // table rows land on disk before structure+PK materialization.
+      // Group by path then write distinct files in parallel (same pattern as
+      // table/index flushFiles).
+      final pass1ByPath = <String,
+          ({
+        ({
+          PageRedoTreeKind kind,
+          TableUid tableUid,
+          IndexUid indexUid,
+          int partitionNo
+        }) key,
+        Map<int, Uint8List> pages,
+        List<ByteWrite> writes,
+      })>{};
       for (final e in byPartition.entries) {
         final y8 = writeYc.maybeYield();
         if (y8 != null) await y8;
@@ -2938,9 +2962,6 @@ class ParallelJournalManager {
 
         final path = await resolveRedoPath(key);
         if (path == null) continue;
-        try {
-          await _dataStore.storage.ensureDirectoryExists(p.dirname(path));
-        } catch (_) {}
 
         int pageSize = 0;
         for (final v in pages.values) {
@@ -2962,22 +2983,60 @@ class ParallelJournalManager {
           writes.add(ByteWrite(offset: pg * pageSize, bytes: payload));
         }
         if (writes.isEmpty) continue;
-        writes.sort((a, b) => a.offset.compareTo(b.offset));
-        try {
-          await _dataStore.storage
-              .writeManyAsBytesAt(path, writes, flush: true);
-          await invalidateMetaIfNeeded(key, pages);
-        } catch (e) {
-          Logger.warn(
-            'Page redo write skipped '
-            '(kind=${key.kind.name}, table=${key.tableUid}, '
-            'p${key.partitionNo})',
-            rawError: e,
-          );
+
+        final existing = pass1ByPath[path];
+        if (existing != null) {
+          // Last-write-wins per offset: overlapping spans would make
+          // writeManyAsBytesAt throw and skip the whole file.
+          final byOffset = <int, ByteWrite>{
+            for (final w in existing.writes) w.offset: w,
+          };
+          for (final w in writes) {
+            byOffset[w.offset] = w;
+          }
+          existing.writes
+            ..clear()
+            ..addAll(byOffset.values);
+          existing.pages.addAll(pages);
+        } else {
+          pass1ByPath[path] = (key: key, pages: Map.of(pages), writes: writes);
         }
       }
 
+      final pass1Tasks = <Future<void> Function()>[];
+      for (final e in pass1ByPath.entries) {
+        final path = e.key;
+        final staged = e.value;
+        staged.writes.sort((a, b) => a.offset.compareTo(b.offset));
+        final key = staged.key;
+        final pages = staged.pages;
+        final writes = List<ByteWrite>.of(staged.writes);
+        pass1Tasks.add(() async {
+          try {
+            try {
+              await _dataStore.storage.ensureDirectoryExists(p.dirname(path));
+            } catch (_) {}
+            await _dataStore.storage
+                .writeManyAsBytesAt(path, writes, flush: false);
+            await _dataStore.storage.flushFile(path);
+            await invalidateMetaIfNeeded(key, pages);
+          } catch (err) {
+            Logger.warn(
+              'Page redo write skipped '
+              '(kind=${key.kind.name}, table=${key.tableUid}, '
+              'p${key.partitionNo})',
+              rawError: err,
+            );
+          }
+        });
+      }
+      await _runParallelPageRedoFileWrites(
+        pass1Tasks,
+        label: 'ParallelJournalManager._replayPageRedoLog.pass1',
+      );
+
       // Pass 2: NGPK leaf pages — rebuild SQ8 from table, write full images.
+      final pass2Tasks = <Future<void> Function()>[];
       for (final e in byPartition.entries) {
         final yPk = writeYc.maybeYield();
         if (yPk != null) await yPk;
@@ -2995,64 +3054,72 @@ class ParallelJournalManager {
             _resolveRedoIndexUid(tableContext.schema, key.indexUid);
         final path = await resolveRedoPath(key);
         if (path == null) continue;
-        try {
-          await _dataStore.storage.ensureDirectoryExists(p.dirname(path));
-        } catch (_) {}
 
-        final writes = <ByteWrite>[];
-        int? pageSize;
-        final pageNos = pages.keys.toList(growable: false)..sort();
-        for (final pg in pageNos) {
-          if (pg < 0) continue;
-          final payload = pages[pg];
-          if (payload == null ||
-              payload.isEmpty ||
-              !NghLeafPage.isPkStructureRedoPayload(payload)) {
-            continue;
-          }
-          Uint8List? built;
+        pass2Tasks.add(() async {
           try {
-            built =
-                await _dataStore.vectorIndexManager?.materializeLeafPkRedoPage(
-              table: tableContext,
-              indexUid: indexUid,
-              pkRedoPayload: payload,
-            );
-          } catch (e) {
+            try {
+              await _dataStore.storage.ensureDirectoryExists(p.dirname(path));
+            } catch (_) {}
+
+            final writes = <ByteWrite>[];
+            int? pageSize;
+            final pageNos = pages.keys.toList(growable: false)..sort();
+            for (final pg in pageNos) {
+              if (pg < 0) continue;
+              final payload = pages[pg];
+              if (payload == null ||
+                  payload.isEmpty ||
+                  !NghLeafPage.isPkStructureRedoPayload(payload)) {
+                continue;
+              }
+              Uint8List? built;
+              try {
+                built = await _dataStore.vectorIndexManager
+                    ?.materializeLeafPkRedoPage(
+                  table: tableContext,
+                  indexUid: indexUid,
+                  pkRedoPayload: payload,
+                );
+              } catch (err) {
+                Logger.warn(
+                  'NGH PK-structure redo materialize threw '
+                  '(table=${key.tableUid}, index=$indexUid, '
+                  'p${key.partitionNo} pg$pg)',
+                  rawError: err,
+                );
+                continue;
+              }
+              if (built == null || built.isEmpty) {
+                Logger.warn(
+                  'NGH PK-structure redo materialize failed '
+                  '(table=${key.tableUid}, index=$indexUid, '
+                  'p${key.partitionNo} pg$pg)',
+                );
+                continue;
+              }
+              pageSize ??= built.length;
+              if (built.length != pageSize) continue;
+              writes.add(ByteWrite(offset: pg * pageSize, bytes: built));
+            }
+            if (writes.isEmpty) return;
+            writes.sort((a, b) => a.offset.compareTo(b.offset));
+            await _dataStore.storage
+                .writeManyAsBytesAt(path, writes, flush: false);
+            await _dataStore.storage.flushFile(path);
+            await invalidateMetaIfNeeded(key, pages);
+          } catch (err) {
             Logger.warn(
-              'NGH PK-structure redo materialize threw '
-              '(table=${key.tableUid}, index=$indexUid, '
-              'p${key.partitionNo} pg$pg)',
-              rawError: e,
+              'NGH PK-structure redo write skipped '
+              '(table=${key.tableUid}, p${key.partitionNo})',
+              rawError: err,
             );
-            continue;
           }
-          if (built == null || built.isEmpty) {
-            Logger.warn(
-              'NGH PK-structure redo materialize failed '
-              '(table=${key.tableUid}, index=$indexUid, '
-              'p${key.partitionNo} pg$pg)',
-            );
-            continue;
-          }
-          pageSize ??= built.length;
-          if (built.length != pageSize) continue;
-          writes.add(ByteWrite(offset: pg * pageSize, bytes: built));
-        }
-        if (writes.isEmpty) continue;
-        writes.sort((a, b) => a.offset.compareTo(b.offset));
-        try {
-          await _dataStore.storage
-              .writeManyAsBytesAt(path, writes, flush: true);
-          await invalidateMetaIfNeeded(key, pages);
-        } catch (e) {
-          Logger.warn(
-            'NGH PK-structure redo write skipped '
-            '(table=${key.tableUid}, p${key.partitionNo})',
-            rawError: e,
-          );
-        }
+        });
       }
+      await _runParallelPageRedoFileWrites(
+        pass2Tasks,
+        label: 'ParallelJournalManager._replayPageRedoLog.pass2',
+      );
 
       // Legacy TreeMetaRecord: only apply when partition-0 page0 was NOT restored
       // in this redo (old logs before global meta lived in page0). New write path
@@ -3143,6 +3210,48 @@ class ParallelJournalManager {
         '(missing, empty, or unreadable log)',
         rawError: e,
       );
+    }
+  }
+
+  /// Parallel file writes for page-redo recovery (one task per distinct path).
+  ///
+  /// Matches table/index [flushFiles]: scheduler-bounded [ParallelProcessor],
+  /// serial fallback when concurrency is 1 or disabled.
+  Future<void> _runParallelPageRedoFileWrites(
+    List<Future<void> Function()> tasks, {
+    required String label,
+  }) async {
+    if (tasks.isEmpty) return;
+    final scheduler = _dataStore.workloadScheduler;
+    if (scheduler.globalMax <= 0 || tasks.length <= 1) {
+      for (final t in tasks) {
+        await t();
+      }
+      return;
+    }
+    WorkloadLease? lease;
+    try {
+      final requested =
+          min(scheduler.capacityTokens(WorkloadType.flush), tasks.length);
+      lease = await scheduler.acquire(
+        WorkloadType.flush,
+        requestedTokens: max(1, requested),
+        minTokens: 1,
+        label: label,
+      );
+      final ioConcurrency = min(tasks.length, max(1, lease.tokens));
+      // Recovery redo can rewrite large partitions; global IO timeout must not
+      // abandon in-flight writes (timeout does not cancel the Future) or Pass2
+      // would start while Pass1 tasks are still writing.
+      await ParallelProcessor.execute<void>(
+        tasks,
+        concurrency: ioConcurrency,
+        timeout: ParallelProcessor.noTimeout,
+        label: label,
+        continueOnError: true,
+      );
+    } finally {
+      lease?.release();
     }
   }
 

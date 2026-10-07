@@ -4,6 +4,7 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
 
+import '../handler/common.dart';
 import '../handler/logger.dart';
 import '../handler/platform_handler.dart';
 import '../model/index_entry.dart';
@@ -234,6 +235,19 @@ class VectorIndexManager {
     for (final idx in vectorIndexes) {
       final y4 = yc.maybeYield();
       if (y4 != null) await y4;
+      final indexLogName = idx.actualIndexName;
+      final sw = Stopwatch()..start();
+      var graphDeleteMs = 0;
+      var graphInsertMs = 0;
+      var persistMs = 0;
+      var promoteMs = 0;
+      var persistMetaMs = 0;
+      var pkBackfillMs = 0;
+      var batchDeletes = 0;
+      var batchInserts = 0;
+      var dirtyLeaves = 0;
+      var dirtyNav = 0;
+      var dirtyPkmap = 0;
       final indexUid = idx.indexUid;
       final fieldName = idx.fields.first; // vector index is single-field
       FieldSchema? fieldSchema;
@@ -273,18 +287,28 @@ class VectorIndexManager {
           if (pk != null && pk.isNotEmpty) deletePks.add(pk);
         }
         if (deletePks.isNotEmpty) {
+          batchDeletes = deletePks.length;
           Future<void> flushDelete() async {
             var liveMeta = _vectorCache.getMeta(table, indexUid) ?? meta;
+            final phase = Stopwatch()..start();
             final result = await _graphEngine.deleteBatch(
               table: table,
               indexUid: indexUid,
               meta: liveMeta,
               primaryKeys: deletePks,
             );
+            graphDeleteMs += phase.elapsedMilliseconds;
+            dirtyLeaves += result.dirtyLeafPages.length;
+            dirtyNav += result.dirtyNavPages.length +
+                result.dirtyNavBTreePages.length +
+                (result.dirtyNavRootPage != null ? 1 : 0);
+            dirtyPkmap += result.dirtyPkmapPages.length;
             meta = result.meta;
             if (result.unresolvedPks.isNotEmpty) {
               await _mergePendingDeletes(table, indexUid, result.unresolvedPks);
             }
+            phase.reset();
+            phase.start();
             meta = await _partitionManager.writeChanges(
               table: table,
               indexUid: indexUid,
@@ -300,6 +324,7 @@ class VectorIndexManager {
               batchContext: batchContext,
               concurrency: concurrency,
             );
+            persistMs += phase.elapsedMilliseconds;
           }
 
           await flushDelete();
@@ -317,8 +342,10 @@ class VectorIndexManager {
         final pks = preparedVectors.primaryKeys;
 
         if (vectors.isNotEmpty) {
+          batchInserts = vectors.length;
           Future<void> flushInsert() async {
             var liveMeta = _vectorCache.getMeta(table, indexUid) ?? meta;
+            final phase = Stopwatch()..start();
             final insertResult = await _graphEngine.insertBatch(
               table: table,
               indexUid: indexUid,
@@ -327,7 +354,15 @@ class VectorIndexManager {
               primaryKeys: pks,
               yieldBudgetMs: 100,
             );
+            graphInsertMs += phase.elapsedMilliseconds;
+            dirtyLeaves += insertResult.dirtyLeafPages.length;
+            dirtyNav += insertResult.dirtyNavPages.length +
+                insertResult.dirtyNavBTreePages.length +
+                (insertResult.dirtyNavRootPage != null ? 1 : 0);
+            dirtyPkmap += insertResult.dirtyPkmapPages.length;
             meta = insertResult.meta;
+            phase.reset();
+            phase.start();
             meta = await _partitionManager.writeChanges(
               table: table,
               indexUid: indexUid,
@@ -342,11 +377,14 @@ class VectorIndexManager {
               concurrency: concurrency,
               batchContext: batchContext,
             );
+            persistMs += phase.elapsedMilliseconds;
             await _removePendingDeletes(table, indexUid, pks);
             if (!_dataStore.shouldAbortBackgroundScan &&
                 (insertResult.dirtyLeafPages.isNotEmpty ||
                     insertResult.dirtyNavBTreePages.isNotEmpty ||
                     insertResult.touchedNavPages.isNotEmpty)) {
+              phase.reset();
+              phase.start();
               await _graphEngine.promotePagedLeavesAfterInsert(
                 table: table,
                 indexUid: indexUid,
@@ -356,6 +394,7 @@ class VectorIndexManager {
                 touchedNavPages: insertResult.touchedNavPages,
                 shouldAbort: () => _dataStore.shouldAbortBackgroundScan,
               );
+              promoteMs += phase.elapsedMilliseconds;
             }
           }
 
@@ -364,16 +403,32 @@ class VectorIndexManager {
       }
 
       if (!meta.hasPkLocator) {
+        final phase = Stopwatch()..start();
         meta = await _runPkBackfill(
           table,
           indexUid,
           meta,
           batchContext: batchContext,
         );
+        pkBackfillMs += phase.elapsedMilliseconds;
       }
 
+      final persistMetaPhase = Stopwatch()..start();
       await _persistMeta(table, indexUid, meta, batchContext: batchContext);
+      persistMetaMs += persistMetaPhase.elapsedMilliseconds;
       _vectorCache.putMeta(table, indexUid, meta);
+
+      if (InternalConfig.showLoggerInternalLabel &&
+          (batchInserts > 0 ||
+              batchDeletes > 0 ||
+              persistMs > 0 ||
+              pkBackfillMs > 0)) {
+        final now = DateTime.now();
+        final at =
+            '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}.${now.millisecond.toString().padLeft(3, '0')}';
+        Logger.debug(
+            'Vector persistence: table=${table.tableName}, index=$indexLogName, partitions=${meta.leafPartitionCount}, batchInserts=$batchInserts, batchDeletes=$batchDeletes, dirtyPages=leaves=$dirtyLeaves/nav=$dirtyNav/pkmap=$dirtyPkmap, totalVectors=${meta.totalVectors}, totalSize=${(meta.totalSizeBytes / 1024 / 1024).toStringAsFixed(2)}MB, concurrency=${concurrency ?? 1}, graphDelete=${graphDeleteMs}ms, graphInsert=${graphInsertMs}ms, persist=${persistMs}ms, promote=${promoteMs}ms, pkBackfill=${pkBackfillMs}ms, persistMeta=${persistMetaMs}ms, cost=${sw.elapsedMilliseconds}ms, at: $at');
+      }
     }
   }
 

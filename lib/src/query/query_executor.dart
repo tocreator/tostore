@@ -41,6 +41,56 @@ class QueryExecutor {
   late final TreeCache<QueryResultCacheEntry> _queryCache;
   final Map<String, int> _tableQueryGenerations = <String, int>{};
 
+  /// Build decode projection set for partial row decode.
+  ///
+  /// Includes SELECT ∪ matcher ∪ PK ∪ orderBy ∪ aggregation/groupBy fields.
+  /// Returns null when no SELECT (full-row decode). **Call once per query** and
+  /// pass the set down — never recompute in scan/batch loops.
+  static Set<String>? resolveNeededFields({
+    List<String>? selectedFields,
+    ConditionRecordMatcher? matcher,
+    String? primaryKey,
+    List<String>? orderBy,
+    List<QueryAggregation>? aggregations,
+    List<String>? groupBy,
+  }) {
+    if (selectedFields == null || selectedFields.isEmpty) return null;
+    final out = <String>{};
+    _addNeededFieldNames(out, selectedFields);
+    if (matcher != null) out.addAll(matcher.fields);
+    if (primaryKey != null && primaryKey.isNotEmpty) out.add(primaryKey);
+    if (orderBy != null) _addNeededFieldNames(out, orderBy);
+    if (aggregations != null) {
+      for (final a in aggregations) {
+        _addNeededFieldName(out, a.field);
+      }
+    }
+    if (groupBy != null) _addNeededFieldNames(out, groupBy);
+    return out.isEmpty ? null : out;
+  }
+
+  static void _addNeededFieldNames(Set<String> out, List<String> raws) {
+    for (final raw in raws) {
+      _addNeededFieldName(out, raw);
+    }
+  }
+
+  static void _addNeededFieldName(Set<String> out, String raw) {
+    var name = raw.trim();
+    final asIdx = name.indexOf(' as ');
+    if (asIdx >= 0) name = name.substring(0, asIdx).trim();
+    if (name.startsWith('-')) name = name.substring(1).trim();
+    final upper = name.toUpperCase();
+    if (upper.endsWith(' DESC')) {
+      name = name.substring(0, name.length - 5).trim();
+    } else if (upper.endsWith(' ASC')) {
+      name = name.substring(0, name.length - 4).trim();
+    }
+    final dot = name.lastIndexOf('.');
+    if (dot >= 0) name = name.substring(dot + 1);
+    if (name.isNotEmpty) out.add(name);
+  }
+
   // Plan Cache: data-independent compiled execution plan cache.
   final Map<String, CompiledExecutionPlan> _planCache =
       <String, CompiledExecutionPlan>{};
@@ -486,8 +536,8 @@ class QueryExecutor {
     /// post-processing (schema normalize, cursor pagination).
     bool engineInternal = false,
 
-    /// Forwarded only into hybrid/vector retrieval after ANN hits.
-    /// Ignored on peek, point lookup, btree, and table-scan paths.
+    /// Projection: point cold-path and scan/index paths use this to skip
+    /// unselected field-overflow IO. Memory hotspot hits stay full-row.
     List<String>? selectedFields,
   }) async {
     final schemaMgr = _dataStore.tableMetaManager;
@@ -546,6 +596,13 @@ class QueryExecutor {
     // LEVEL 1: PRIMARY KEY POINT LOOKUP
     // Zero secondary index lookups, zero ResultCache overhead.
     // =========================================================================
+    // SELECT projection for cold point reads: skip unselected field-overflow IO.
+    // Memory/row-cache hits stay full-row (never store partials); builder projects.
+    final Set<String>? pointNeededFields = resolveNeededFields(
+      selectedFields: selectedFields,
+      primaryKey: schema.primaryKey,
+    );
+
     if (hasSingleEq &&
         (identical(pointFieldName, schema.primaryKey) ||
             pointFieldName == schema.primaryKey)) {
@@ -571,6 +628,7 @@ class QueryExecutor {
           table,
           pk,
           readFromFileOnly: readFromFileOnly,
+          neededFields: pointNeededFields,
         );
         if (rec != null) {
           return _wrapPointRecordResult(
@@ -626,6 +684,7 @@ class QueryExecutor {
             table,
             pk,
             readFromFileOnly: readFromFileOnly,
+            neededFields: pointNeededFields,
           );
           if (rec != null) {
             return _wrapPointRecordResult(
@@ -761,6 +820,7 @@ class QueryExecutor {
           aggregations: aggregations,
           groupBy: groupBy,
           onlyCount: onlyCount,
+          selectedFields: selectedFields,
         );
         final gen = _getTableQueryGeneration(resultCacheKey.tableUid);
         resultCacheStartGen = gen;
@@ -952,6 +1012,7 @@ class QueryExecutor {
       groupBy: effectiveGroupBy,
       readFromFileOnly: readFromFileOnly,
       engineInternal: engineInternal,
+      selectedFields: selectedFields,
     );
 
     if (promoteDesc != null &&
@@ -1161,6 +1222,7 @@ class QueryExecutor {
     TableSchema? decodeSchema,
     List<FieldStructure>? decodeFieldStructureOverride,
     bool engineInternal = false,
+    List<String>? selectedFields,
   }) async {
     final tableName = table.tableName;
     try {
@@ -1416,6 +1478,7 @@ class QueryExecutor {
         readFromFileOnly: readFromFileOnly,
         decodeSchema: decodeSchema,
         decodeFieldStructureOverride: decodeFieldStructureOverride,
+        selectedFields: selectedFields,
       );
 
       if (onlyCount) {
@@ -1658,6 +1721,7 @@ class QueryExecutor {
     bool readFromFileOnly = false,
     TableSchema? decodeSchema,
     List<FieldStructure>? decodeFieldStructureOverride,
+    List<String>? selectedFields,
   }) async {
     final tableName = table.tableName;
     final schema = decodeSchema ??
@@ -1668,6 +1732,16 @@ class QueryExecutor {
     if (schema == null) {
       return PlanExecutionResult([], onlyCount ? 0 : null, null);
     }
+
+    // Resolve once per query plan — never recompute in scan/batch loops.
+    final neededFields = resolveNeededFields(
+      selectedFields: selectedFields,
+      matcher: matcher,
+      primaryKey: schema.primaryKey,
+      orderBy: orderBy,
+      aggregations: aggregations,
+      groupBy: groupBy,
+    );
 
     // For sort-key cursor mode, build a keyset filter that will be applied during
     // base scan selection (and also used to pre-filter buffer inserts).
@@ -1714,6 +1788,7 @@ class QueryExecutor {
             readFromFileOnly: readFromFileOnly,
             decodeSchema: decodeSchema,
             decodeFieldStructureOverride: decodeFieldStructureOverride,
+            neededFields: neededFields,
           );
           results = scanRes.records;
           totalCount = scanRes.count;
@@ -1753,6 +1828,7 @@ class QueryExecutor {
             readFromFileOnly: readFromFileOnly,
             decodeSchema: decodeSchema,
             decodeFieldStructureOverride: decodeFieldStructureOverride,
+            neededFields: neededFields,
           );
           results = indexRes.records;
           totalCount = indexRes.count;
@@ -1804,6 +1880,7 @@ class QueryExecutor {
             readFromFileOnly: readFromFileOnly,
             decodeSchema: decodeSchema,
             decodeFieldStructureOverride: decodeFieldStructureOverride,
+            neededFields: neededFields,
           );
           results = unionRes.records;
           totalCount = unionRes.count;
@@ -1848,6 +1925,7 @@ class QueryExecutor {
     bool readFromFileOnly = false,
     TableSchema? decodeSchema,
     List<FieldStructure>? decodeFieldStructureOverride,
+    Set<String>? neededFields,
   }) async {
     final tableName = table.tableName;
     final tblSchema = decodeSchema ??
@@ -1907,6 +1985,23 @@ class QueryExecutor {
               }
             }
 
+            // Merge clause filter fields into the once-resolved projection set.
+            Set<String>? branchNeeded = neededFields;
+            if (neededFields != null &&
+                clauseMatcher != null &&
+                clauseMatcher.fields.isNotEmpty) {
+              var missing = false;
+              for (final f in clauseMatcher.fields) {
+                if (!neededFields.contains(f)) {
+                  missing = true;
+                  break;
+                }
+              }
+              if (missing) {
+                branchNeeded = {...neededFields, ...clauseMatcher.fields};
+              }
+            }
+
             switch (op.type) {
               case QueryOperationType.tableScan:
                 final scan = await _performTableScan(
@@ -1921,6 +2016,7 @@ class QueryExecutor {
                   readFromFileOnly: readFromFileOnly,
                   decodeSchema: decodeSchema,
                   decodeFieldStructureOverride: decodeFieldStructureOverride,
+                  neededFields: branchNeeded,
                 );
                 return scan.records;
               case QueryOperationType.indexScan:
@@ -1949,6 +2045,7 @@ class QueryExecutor {
                   readFromFileOnly: readFromFileOnly,
                   decodeSchema: decodeSchema,
                   decodeFieldStructureOverride: decodeFieldStructureOverride,
+                  neededFields: branchNeeded,
                 ))
                     .records;
               case QueryOperationType.union:
@@ -1975,7 +2072,11 @@ class QueryExecutor {
                             false, // Must fetch records to deduplicate in UNION
                         aggregations: aggregations,
                         groupBy: groupBy,
-                        readFromFileOnly: readFromFileOnly))
+                        readFromFileOnly: readFromFileOnly,
+                        decodeSchema: decodeSchema,
+                        decodeFieldStructureOverride:
+                            decodeFieldStructureOverride,
+                        neededFields: neededFields))
                     .records;
             }
           },
@@ -2421,6 +2522,7 @@ class QueryExecutor {
     bool readFromFileOnly = false,
     TableSchema? decodeSchema,
     List<FieldStructure>? decodeFieldStructureOverride,
+    Set<String>? neededFields,
   }) async {
     try {
       return await _dataStore.tableDataManager.searchTableData(
@@ -2437,6 +2539,7 @@ class QueryExecutor {
         readFromFileOnly: readFromFileOnly,
         decodeSchema: decodeSchema,
         decodeFieldStructureOverride: decodeFieldStructureOverride,
+        neededFields: neededFields,
       );
     } catch (e) {
       if (e is DbClosedException) {
@@ -2596,6 +2699,7 @@ class QueryExecutor {
     bool readFromFileOnly = false,
     TableSchema? decodeSchema,
     List<FieldStructure>? decodeFieldStructureOverride,
+    Set<String>? neededFields,
   }) async {
     final tableName = table.tableName;
     try {
@@ -2653,7 +2757,8 @@ class QueryExecutor {
             onlyCount: onlyCount,
             aggregations: aggregations,
             groupBy: groupBy,
-            readFromFileOnly: readFromFileOnly);
+            readFromFileOnly: readFromFileOnly,
+            neededFields: neededFields);
       }
       if (!onlyCount && limit != null && limit <= 0) {
         return TableScanResult(records: const []);
@@ -2769,7 +2874,8 @@ class QueryExecutor {
                 onlyCount: onlyCount,
                 aggregations: aggregations,
                 groupBy: groupBy,
-                readFromFileOnly: readFromFileOnly);
+                readFromFileOnly: readFromFileOnly,
+                neededFields: neededFields);
           }
 
           final pks = indexResults.primaryKeys;
@@ -2863,6 +2969,7 @@ class QueryExecutor {
                     readFromFileOnly: readFromFileOnly,
                     decodeSchema: decodeSchema,
                     decodeFieldStructureOverride: decodeFieldStructureOverride,
+                    neededFields: neededFields,
                   ))
                     .records;
 
@@ -3131,7 +3238,10 @@ class QueryExecutor {
               orderBy: orderBy,
               filter: filter,
               onlyCount: onlyCount,
-              readFromFileOnly: readFromFileOnly);
+              aggregations: aggregations,
+              groupBy: groupBy,
+              readFromFileOnly: readFromFileOnly,
+              neededFields: neededFields);
         }
 
         final pks = indexResults.primaryKeys;
@@ -3155,6 +3265,7 @@ class QueryExecutor {
                 readFromFileOnly: readFromFileOnly,
                 decodeSchema: decodeSchema,
                 decodeFieldStructureOverride: decodeFieldStructureOverride,
+                neededFields: neededFields,
               ))
                 .records;
 
@@ -3264,7 +3375,10 @@ class QueryExecutor {
           orderBy: orderBy,
           filter: filter,
           onlyCount: onlyCount,
-          readFromFileOnly: readFromFileOnly);
+          aggregations: aggregations,
+          groupBy: groupBy,
+          readFromFileOnly: readFromFileOnly,
+          neededFields: neededFields);
     }
   }
 
@@ -4621,10 +4735,15 @@ class QueryExecutor {
     }
 
     final pks = [for (final c in pageCandidates) c.primaryKey];
+    final neededFields = resolveNeededFields(
+      selectedFields: selectedFields,
+      primaryKey: table.schema.primaryKey,
+    );
     final recordsMap = await _dataStore.tableDataManager.queryRecordsMapBatch(
       table,
       pks,
       readFromFileOnly: readFromFileOnly,
+      neededFields: neededFields,
     );
 
     final records = <Map<String, dynamic>>[];
@@ -4729,6 +4848,7 @@ class QueryExecutor {
       candidatePks.add(cand.primaryKey);
     }
 
+    // Full-row decode: filter matcher may reference any column before SELECT.
     final recordsMap = candidatePks.isEmpty
         ? const <String, Map<String, dynamic>>{}
         : await _dataStore.tableDataManager.queryRecordsMapBatch(
@@ -4825,6 +4945,11 @@ class QueryExecutor {
         table.tableName.toString(),
       );
     }
+    final neededFields = resolveNeededFields(
+      selectedFields: selectedFields,
+      matcher: globalMatcher,
+      primaryKey: table.schema.primaryKey,
+    );
 
     // Run independent recall channels concurrently (vector + structured).
     final branchTasks = <Future<
@@ -5031,6 +5156,7 @@ class QueryExecutor {
             table,
             batchPks,
             readFromFileOnly: readFromFileOnly,
+            neededFields: neededFields,
           );
 
     for (int i = 0; i < sortedPks.length; i++) {

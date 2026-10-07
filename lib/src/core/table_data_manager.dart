@@ -320,10 +320,14 @@ class TableDataManager {
     return bufferEntry.operation == BufferOperationType.delete;
   }
 
-  /// Cache a single table record
+  /// Cache a single table record (full row only).
+  ///
+  /// [isPartialProjection] must be true for SELECT-projected / field-overflow-
+  /// skipped maps so they never poison the PK hot cache used by full-row paths.
   void cacheTableRecord(TableContext table, String pk,
       Map<String, dynamic> record, TableSchema schema,
-      {bool force = false}) {
+      {bool force = false, bool isPartialProjection = false}) {
+    if (isPartialProjection) return;
     final tableUid = table.tableUid;
     if (_tableRecordCache.maxByteThreshold <= 0) {
       return;
@@ -352,7 +356,9 @@ class TableDataManager {
     required TableSchema schema,
     bool isInsertOperation = false,
     bool force = false,
+    bool isPartialProjection = false,
   }) {
+    if (isPartialProjection) return;
     if (records.isEmpty) return;
     final tableUid = table.tableUid;
     if (_tableRecordCache.maxByteThreshold <= 0) {
@@ -1648,210 +1654,7 @@ class TableDataManager {
     }
   }
 
-  /// Add record to buffer
-  Future<void> addToBuffer(
-    TableContext table,
-    Map<String, dynamic> data,
-    BufferOperationType operationType, {
-    Map<String, dynamic>? oldValues,
-    String? transactionId,
-    required String schemaVersion,
-    RecoveryDurability? durability,
-  }) async {
-    final schema = table.schema;
-    final primaryKey = schema.primaryKey;
-    final recordId = data[primaryKey]?.toString();
-    if (recordId == null) {
-      Logger.error(
-        'Record in table ${table.tableName} does not have a primary key value, cannot add to buffer',
-      );
-      return;
-    }
-
-    // Transaction-aware interception (must run BEFORE touching existing buffer state)
-    final String? currentTxId =
-        transactionId ?? TransactionContext.getCurrentTransactionId();
-    if (currentTxId != null && !TransactionContext.isApplyingCommit()) {
-      final finalData = Map<String, dynamic>.from(data);
-      final entry = BufferEntry(
-        data: finalData,
-        operation: operationType,
-        timestamp: DateTime.now(),
-        walPointer: null,
-        transactionId: currentTxId,
-        oldValues: oldValues,
-        schemaVersion: schemaVersion,
-      );
-
-      // PK overlay + txn index trees (merge/cancel handled inside applyRecord).
-      // Unique reservation is expected at call sites before addToBuffer.
-      _dataStore.writeBufferManager.applyTxnRecord(
-        transactionId: currentTxId,
-        table: table,
-        recordId: recordId,
-        entry: entry,
-      );
-
-      _trackTransactionBufferBatch(
-        currentTxId,
-        [finalData],
-        oldValues != null ? {recordId: oldValues} : null,
-        primaryKey,
-      );
-      _txnIdsWithOps.add(currentTxId);
-      return;
-    }
-
-    if (operationType == BufferOperationType.update) {
-      final priorBuffered =
-          _dataStore.writeBufferManager.getBufferedRecord(table, recordId);
-      if (priorBuffered != null &&
-          priorBuffered.operation == BufferOperationType.delete) {
-        throw DbException([
-          ConstraintStatus(
-            type: ResultType.bizRecordNotFound,
-            tableName: table.tableName,
-            fields: [primaryKey],
-            conflictingKeys: [recordId],
-            message:
-                'Cannot update record $recordId in table ${table.tableName} because it has already been deleted',
-          ),
-        ]);
-      }
-    }
-
-    // -------------------- Memory mode: TreeCache-only (no WAL, no write queue, no IO) --------------------
-    if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
-      final BufferOperationType finalOperation = operationType;
-
-      if (finalOperation == BufferOperationType.delete) {
-        removeTableRecord(table, recordId);
-        // Best-effort stats.
-        final cur = _tableRecordCounts[table.tableUid];
-        if (cur != null && cur > 0) {
-          _tableRecordCounts[table.tableUid] = cur - 1;
-        }
-      } else {
-        // Insert/Update both materialize the full record in the table record cache.
-        // Use force=true so memory mode treats cache as the primary store.
-        cacheTableRecord(table, recordId, data, schema, force: true);
-        if (finalOperation == BufferOperationType.insert) {
-          _tableRecordCounts[table.tableUid] =
-              (_tableRecordCounts[table.tableUid] ?? 0) + 1;
-        }
-      }
-
-      // Update index cache
-      if (_dataStore.indexManager != null) {
-        Map<String, dynamic>? indexOldData;
-        Map<String, dynamic>? indexNewData;
-
-        if (finalOperation == BufferOperationType.insert) {
-          indexOldData = null;
-          indexNewData = data;
-        } else if (finalOperation == BufferOperationType.update) {
-          indexOldData = oldValues;
-          indexNewData = data;
-        } else if (finalOperation == BufferOperationType.delete) {
-          indexOldData = data;
-          indexNewData = null;
-        }
-
-        if (indexOldData != null || indexNewData != null) {
-          // Fire and forget, don't block main flow
-          _dataStore.indexManager!.updateIndexDataCacheSync(
-            table,
-            recordId,
-            indexOldData,
-            indexNewData,
-            force: true,
-          );
-        }
-      }
-      final vectorApply = applyMemoryVectorIndexChanges(
-        table: table,
-        schema: schema,
-        operation: finalOperation,
-        records: [data],
-        oldRecordsList: oldValues != null ? [oldValues] : null,
-      );
-      if (vectorApply != null) await vectorApply;
-      _dataStore.queryExecutor.invalidateQueryCacheForTable(table);
-      return;
-    }
-
-    // WAL + write buffer path
-    final BufferOperationType finalOperation = operationType;
-
-    // Create BufferEntry
-    final Map<String, dynamic> bufferedData = data;
-    final updateOldValues =
-        finalOperation == BufferOperationType.update ? oldValues : null;
-    final DateTime now = DateTime.now();
-    // Append WAL (if enabled) and get pointer
-    final walPointer = await _dataStore.walManager.append({
-      'op': finalOperation.index,
-      'table': table.tableUid,
-      'data': bufferedData,
-      'ts': now.toIso8601String(),
-      if (currentTxId != null) 'txId': currentTxId,
-      if (updateOldValues != null) 'oldValues': updateOldValues,
-    }, durability: durability);
-
-    // Create BufferEntry with WAL pointer
-    final entry = BufferEntry(
-        data: bufferedData,
-        operation: finalOperation,
-        timestamp: now,
-        transactionId: currentTxId,
-        walPointer: walPointer,
-        oldValues:
-            finalOperation == BufferOperationType.update ? oldValues : null,
-        schemaVersion: schemaVersion);
-
-    // Enqueue into write buffer/queue (in-memory)
-    await _dataStore.writeBufferManager.addRecord(
-      table: table,
-      recordId: recordId,
-      entry: entry,
-    );
-
-    // Update full index cache (Real-time population)
-    // Skip index cache update during batch operations for better performance
-    if (_dataStore.indexManager != null) {
-      Map<String, dynamic>? indexOldData;
-      Map<String, dynamic>? indexNewData;
-
-      if (finalOperation == BufferOperationType.update) {
-        indexOldData = oldValues;
-        indexNewData = bufferedData;
-      } else if (finalOperation == BufferOperationType.delete) {
-        indexOldData = bufferedData;
-      }
-
-      if (indexOldData != null || indexNewData != null) {
-        // Fire and forget, don't block main flow
-        _dataStore.indexManager!.updateIndexDataCacheSync(
-          table,
-          recordId,
-          indexOldData,
-          indexNewData,
-        );
-      }
-    }
-
-    // Sync to TableRecordCache
-    if (finalOperation == BufferOperationType.delete) {
-      removeTableRecord(table, recordId);
-    } else if (finalOperation == BufferOperationType.update) {
-      cacheTableRecord(table, recordId, bufferedData, schema);
-    }
-
-    _markSpaceStatsDirty(table);
-    _dataStore.queryExecutor.invalidateQueryCacheForTable(table);
-  }
-
-  /// Fully synchronous fast-path of [addToBuffer] for single-record CRUD.
+  /// Fully synchronous single-record CRUD path into write buffer / WAL.
   /// Completely eliminates async/await microtask scheduling overhead.
   WalPointer addToBufferSync(
     TableContext table,
@@ -2263,6 +2066,10 @@ class TableDataManager {
       return (successRecordIds: successIds, failedRecordIds: failedIds);
     }
 
+    // Apply backpressure flow control before touching WAL, TableRecordCache, or IndexCache
+    final bp = _dataStore.parallelJournalManager.applyEnqueueBackpressure();
+    if (bp != null) await bp;
+
     late final List<WalPointer> pointers;
     try {
       pointers = await _dataStore.walManager.appendBatchDirect(
@@ -2561,7 +2368,6 @@ class TableDataManager {
     if (recordId == null) return;
 
     // 1. Add to WriteBufferManager (reconstructs queue state)
-    // We bypass the standard addToBuffer/batchInsert path to inject the *exact*
     // original WAL entry (preserving timestamp, walPointer, etc.)
     await _dataStore.writeBufferManager.addRecord(
       table: table,
@@ -4663,6 +4469,7 @@ class TableDataManager {
     bool readFromFileOnly = false,
     TableSchema? decodeSchema,
     List<FieldStructure>? decodeFieldStructureOverride,
+    Set<String>? neededFields,
   }) async {
     if (key == null) return null;
     final pk = key.toString();
@@ -4677,7 +4484,8 @@ class TableDataManager {
       return mem.record;
     }
 
-    // Fall back to disk
+    // Fall back to disk (neededFields skips unselected field-overflow IO;
+    // partial rows are not read-through cached -> see queryRecordsBatch).
     final batchRes = await queryRecordsBatch(
       table,
       [key],
@@ -4686,6 +4494,7 @@ class TableDataManager {
       readFromFileOnly: readFromFileOnly,
       decodeSchema: decodeSchema,
       decodeFieldStructureOverride: decodeFieldStructureOverride,
+      neededFields: neededFields,
     );
     if (batchRes.records.isNotEmpty) {
       return batchRes.records.first;
@@ -4704,6 +4513,7 @@ class TableDataManager {
     bool readFromFileOnly = false,
     TableSchema? decodeSchema,
     List<FieldStructure>? decodeFieldStructureOverride,
+    Set<String>? neededFields,
   }) async {
     if (keys.isEmpty) {
       return <String, Map<String, dynamic>>{};
@@ -4790,6 +4600,7 @@ class TableDataManager {
       schemaOverride: schema,
       decodeFieldStructureOverride: decodeFieldStructureOverride,
       readFromFileOnly: readFromFileOnly,
+      neededFields: neededFields,
     );
 
     if (diskResults != null && diskResults.isNotEmpty) {
@@ -4810,8 +4621,10 @@ class TableDataManager {
         }
       }
 
-      // Read-Through: Cache live rows only (skip tombstones / buffer-superseded).
-      if (fusedDiskRows.isNotEmpty && !readFromFileOnly) {
+      // Read-Through: never cache SELECT/projection-partial rows.
+      if (fusedDiskRows.isNotEmpty &&
+          !readFromFileOnly &&
+          neededFields == null) {
         _asyncCacheDiskResults(
           table: table,
           diskResults: fusedDiskRows,
@@ -4834,6 +4647,7 @@ class TableDataManager {
     bool readFromFileOnly = false,
     TableSchema? decodeSchema,
     List<FieldStructure>? decodeFieldStructureOverride,
+    Set<String>? neededFields,
   }) async {
     final results = <Map<String, dynamic>>[];
     final stillMissing = <dynamic>[];
@@ -4880,6 +4694,7 @@ class TableDataManager {
         schemaOverride: schema,
         decodeFieldStructureOverride: decodeFieldStructureOverride,
         readFromFileOnly: readFromFileOnly,
+        neededFields: neededFields,
       );
       if (diskResults == null) {
         return TableScanResult(records: results);
@@ -4899,8 +4714,10 @@ class TableDataManager {
         }
       }
 
-      // Read-Through: Cache live rows only (skip tombstones / buffer-superseded).
-      if (fusedDiskRows.isNotEmpty && !readFromFileOnly) {
+      // Read-Through: never cache SELECT/projection-partial rows.
+      if (fusedDiskRows.isNotEmpty &&
+          !readFromFileOnly &&
+          neededFields == null) {
         _asyncCacheDiskResults(
           table: table,
           diskResults: fusedDiskRows,
@@ -4936,6 +4753,7 @@ class TableDataManager {
     TableSchema? decodeSchema,
     List<FieldStructure>? decodeFieldStructureOverride,
     bool readFromFileOnly = false,
+    Set<String>? neededFields,
   }) async {
     final isMemoryMode =
         _dataStore.config.persistenceMode == PersistenceMode.memory;
@@ -5038,6 +4856,7 @@ class TableDataManager {
           decodeSchema: decodeSchema,
           decodeFieldStructureOverride: decodeFieldStructureOverride,
           readFromFileOnly: fileOnly,
+          neededFields: neededFields,
         );
         return;
       }
@@ -5326,6 +5145,7 @@ class TableDataManager {
     bool readFromFileOnly = false,
     TableSchema? decodeSchema,
     List<FieldStructure>? decodeFieldStructureOverride,
+    Set<String>? neededFields,
   }) async {
     // Increment table access weight for caching optimization
     _dataStore.weightManager?.incrementAccess(
@@ -5431,6 +5251,7 @@ class TableDataManager {
         readFromFileOnly: readFromFileOnly,
         decodeSchema: decodeSchema,
         decodeFieldStructureOverride: decodeFieldStructureOverride,
+        neededFields: neededFields,
       );
       final recs = batchRes.records;
 
@@ -5792,6 +5613,7 @@ class TableDataManager {
           decodeSchema: decodeSchema,
           decodeFieldStructureOverride: decodeFieldStructureOverride,
           readFromFileOnly: readFromFileOnly,
+          neededFields: neededFields,
           acceptRow: acceptRow,
           onRecord: (r) {
             totalCount++;
@@ -5824,6 +5646,7 @@ class TableDataManager {
           decodeSchema: decodeSchema,
           decodeFieldStructureOverride: decodeFieldStructureOverride,
           readFromFileOnly: readFromFileOnly,
+          neededFields: neededFields,
           acceptRow: acceptRow,
           onRecord: (r) {
             agg.accumulate(r);
@@ -5852,6 +5675,7 @@ class TableDataManager {
           decodeSchema: decodeSchema,
           decodeFieldStructureOverride: decodeFieldStructureOverride,
           readFromFileOnly: readFromFileOnly,
+          neededFields: neededFields,
           acceptRow: acceptRow,
           onRecord: (r) {
             out.add(r);
@@ -5916,6 +5740,7 @@ class TableDataManager {
         decodeSchema: decodeSchema,
         decodeFieldStructureOverride: decodeFieldStructureOverride,
         readFromFileOnly: readFromFileOnly,
+        neededFields: neededFields,
         acceptRow: needsPostFilter ? rowMatches : null,
         onRecord: (r) {
           out.add(r);
@@ -5971,6 +5796,7 @@ class TableDataManager {
       decodeSchema: decodeSchema,
       decodeFieldStructureOverride: decodeFieldStructureOverride,
       readFromFileOnly: readFromFileOnly,
+      neededFields: neededFields,
       acceptRow: needsPostFilter ? rowMatches : null,
       onRecord: (r) {
         globalTop.offer(r);
