@@ -728,6 +728,8 @@ await db.kv.setMany(settingsMap, durability: RecoveryDurability.durable);
 
 Vektorabruf nutzt die einheitliche Abfragekette `db.query(...).matchVector(...)`: sie lässt sich mit strukturierten Prädikaten in derselben Kette kombinieren oder mit anderen Recall-Zweigen fusionieren. Scores und Kanaldiagnosen werden in `QueryResult.retrieval` zurückgegeben und sind 1:1 auf `data`-Zeilen ausgerichtet. Wenn nur Primärschlüssel und Scores nötig sind, bevorzugen Sie `.select(['id'])` (oder Ihren PK-Feldnamen), damit die Engine keine vollständigen Tabellenzeilen materialisiert — sonst lädt der Hybridabruf komplette Datensätze (inkl. großer Embeddings) und der Durchsatz kann stark sinken. Für dediziertes ANN ohne Filter oder Fusion liefert `db.vectorSearch(...)` mit demselben Kernsuchpfad `List<VectorSearchResult>` (Primärschlüssel + Score). Die aktuellen Beispiele fokussieren Vektor + strukturiert; lexikalische, Graph- und weitere Kanäle erweitern dasselbe verkettete Hybridabruf-Modell.
 
+**Suchsichtbarkeit**: Nach erfolgreichem Insert/Update sind normale Indizes sofort suchbar; Vektorindizes werden nicht an den Schreibpfad gekoppelt (um den Durchsatz nicht zu belasten) und sind nicht sofort suchbar. Wenn Sie sie für die Suche brauchen, rufen Sie nach Ihrem Geschäftsbatch `await db.flush()` auf (optionale Bequemlichkeit); erst danach nehmen sie an `matchVector` / `vectorSearch` teil.
+
 ```dart
 await db.createTables([
   const TableSchema(

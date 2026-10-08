@@ -298,8 +298,9 @@ class ResourceManager {
 
   /// Specialized eviction ratio for B+Tree page caches (disk IO protection)
   double getPageCacheEvictionRatio() {
-    if (_status == ResourceStatus.critical)
+    if (_status == ResourceStatus.critical) {
       return 0.35; // Never wipe B+tree pages
+    }
     if (_status == ResourceStatus.warning) {
       return _isFlushBusy ? 0.20 : 0.25; // Protect pages during active flush
     }
@@ -353,8 +354,6 @@ class ResourceManager {
         _currentMonitorInterval = ExecuteInterval.seconds3;
         CrontabManager.addCallback(
             _currentMonitorInterval, _checkResourceUsage);
-        Logger.debug(
-            'ResourceManager: monitor interval accelerated to 3s (status: ${status.name})');
       }
     } else {
       _normalRecoveryCount++;
@@ -365,8 +364,6 @@ class ResourceManager {
         _currentMonitorInterval = ExecuteInterval.seconds30;
         CrontabManager.addCallback(
             _currentMonitorInterval, _checkResourceUsage);
-        Logger.debug(
-            'ResourceManager: monitor interval restored to 30s after recovery');
       }
     }
   }

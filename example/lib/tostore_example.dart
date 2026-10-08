@@ -582,8 +582,7 @@ class ToStoreExample {
         case DataType.datetime:
           break;
         case DataType.vector:
-          // Width comes from the selected table schema (128 / 512 / 1536),
-          // not a hardcoded 512-d default.
+          // Width comes from the selected table schema, not a hardcoded default.
           if (field.vectorConfig != null) {
             final dims = field.vectorConfig!.dimensions;
             record[field.name] = ExampleVectorCorpus.memberVector(

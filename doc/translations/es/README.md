@@ -728,6 +728,8 @@ await db.kv.setMany(settingsMap, durability: RecoveryDurability.durable);
 
 La recuperación vectorial utiliza la cadena unificada `db.query(...).matchVector(...)`: puede combinarse con predicados estructurados en la misma cadena, o fusionarse con otras ramas de recuperación. Las puntuaciones y los diagnósticos de canal se devuelven en `QueryResult.retrieval`, alineados 1:1 con las filas de `data`. Si solo necesita claves primarias y puntuaciones, prefiera `.select(['id'])` (o el nombre de su campo PK) para que el motor omita hidratar filas completas; de lo contrario, la recuperación híbrida materializa registros completos (incluidas incrustaciones grandes) y el rendimiento puede caer bruscamente. Para ANN dedicado sin filtros ni fusión, `db.vectorSearch(...)` devuelve `List<VectorSearchResult>` (clave primaria + puntuación) con la misma ruta de búsqueda central. Los ejemplos actuales se centran en rutas vectoriales + estructuradas; los canales léxicos, de grafos y otros se extenderán siguiendo el mismo modelo de recuperación híbrida encadenada.
 
+**Visibilidad de búsqueda**: Tras un insert/update exitoso, los índices normales son buscables de inmediato; los índices vectoriales no se construyen en la ruta de escritura (para no afectar el rendimiento) y no son buscables al instante. Cuando necesite incluirlos en la búsqueda, ejecute `await db.flush()` al final del lote de negocio (conveniencia opcional); solo entonces participan en `matchVector` / `vectorSearch`.
+
 ```dart
 await db.createTables([
   const TableSchema(

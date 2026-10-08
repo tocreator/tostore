@@ -734,6 +734,63 @@ final class NghPartitionManager {
     }
   }
 
+  /// Read multiple Centroid B+Tree internal branch pages from nav partitions in batches.
+  Future<List<({NghPageId id, NghNavBTreePage page})>> readNavBTreePagesBatch(
+    TableContext table,
+    IndexUid indexUid,
+    Iterable<NghPageId> ids, {
+    NghIndexMeta? meta,
+  }) async {
+    final validIds = ids.where((id) => !id.isNone && id.pageNo > 0).toList();
+    if (validIds.isEmpty) return const [];
+    final byPart = <int, List<NghPageId>>{};
+    for (final id in validIds) {
+      byPart.putIfAbsent(id.partitionNo, () => []).add(id);
+    }
+    final pageSize = pageSizeFor(NghDataCategory.nav, meta);
+    final results = <({NghPageId id, NghNavBTreePage page})>[];
+
+    await Future.wait(byPart.entries.map((entry) async {
+      final part = entry.key;
+      final partIds = entry.value;
+      final path = _partitionPath(NghDataCategory.nav, table, indexUid, part);
+      final chunkPages = max(1, _maxPartitionIoChunkBytes ~/ max(pageSize, 1));
+
+      for (int start = 0; start < partIds.length; start += chunkPages) {
+        final end = min(start + chunkPages, partIds.length);
+        final slice = partIds.sublist(start, end);
+        final ranges = [
+          for (final id in slice)
+            ByteReadRange(offset: id.pageNo * pageSize, length: pageSize)
+        ];
+        try {
+          final rawBlocks = await _retryLockTimeout(
+            () => _dataStore.storage.readManyAsBytesAt(path, ranges),
+            label: 'readNavBTreePagesBatch p$part',
+          );
+          for (int i = 0; i < slice.length && i < rawBlocks.length; i++) {
+            final raw = rawBlocks[i];
+            if (raw.isEmpty) continue;
+            final parsed = BTreePageIO.parsePageBytes(raw);
+            final page = NghNavBTreePage.tryDecodePayload(
+                _decodePayload(parsed.encodedPayload));
+            if (page != null) {
+              results.add((id: slice[i], page: page));
+            }
+          }
+        } catch (e) {
+          if (e is DbClosedException) rethrow;
+          Logger.warn(
+            'NGH nav batch read failed for "$indexUid" p$part '
+            '(${slice.length} pages).',
+            rawError: e,
+          );
+        }
+      }
+    }));
+    return results;
+  }
+
   Future<NghPkMapDirtyPage?> readPkmapPage(
     TableContext table,
     IndexUid indexUid,

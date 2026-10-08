@@ -728,6 +728,8 @@ await db.kv.setMany(settingsMap, durability: RecoveryDurability.durable);
 
 La récupération vectorielle utilise la chaîne unifiée `db.query(...).matchVector(...)` : elle peut être combinée avec des prédicats structurés sur la même chaîne, ou fusionnée avec d'autres branches de rappel. Les scores et diagnostics de canal sont renvoyés dans `QueryResult.retrieval`, alignés 1:1 avec les lignes de `data`. Si vous n'avez besoin que des clés primaires et des scores, préférez `.select(['id'])` (ou le nom de votre champ PK) pour que le moteur évite d'hydrater les lignes complètes — sinon la récupération hybride matérialise les enregistrements entiers (y compris de gros embeddings) et le débit peut chuter fortement. Pour un ANN dédié sans filtres ni fusion, `db.vectorSearch(...)` renvoie `List<VectorSearchResult>` (clé primaire + score) avec le même chemin de recherche central. Les exemples actuels se concentrent sur les chemins vectoriel + structuré ; les canaux lexicaux, graphes et autres s'étendront selon le même modèle de récupération hybride chaînée.
 
+**Visibilité de recherche** : Après un insert/update réussi, les index ordinaires sont immédiatement interrogeables ; les index vectoriels ne sont pas construits sur le chemin d'écriture (pour ne pas nuire au débit) et ne sont pas immédiatement recherchables. Quand vous devez les inclure dans la recherche, appelez `await db.flush()` après votre lot métier (commodité optionnelle) ; ce n'est qu'alors qu'ils participent à `matchVector` / `vectorSearch`.
+
 ```dart
 await db.createTables([
   const TableSchema(

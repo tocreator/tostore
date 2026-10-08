@@ -728,6 +728,8 @@ await db.kv.setMany(settingsMap, durability: RecoveryDurability.durable);
 
 Vektör getirme, birleşik `db.query(...).matchVector(...)` sorgu zincirini kullanır: aynı zincirde yapılandırılmış koşullarla birleştirilebilir veya diğer getirme dallarıyla kaynaştırılabilir. Skorlar ve kanal tanıları `QueryResult.retrieval` içinde döner ve `data` satırlarıyla 1:1 hizalanır. Yalnızca birincil anahtar ve skor gerektiğinde `.select(['id'])` (veya PK alan adınız) tercih edin; böylece motor tam satırları yüklemez — aksi halde hibrit getirme eksiksiz kayıtları (büyük embedding’ler dahil) materyalize eder ve verim keskin düşebilir. Filtre veya füzyon olmadan özel ANN için `db.vectorSearch(...)` aynı çekirdek arama yoluyla `List<VectorSearchResult>` (birincil anahtar + skor) döndürür. Güncel örnekler vektör + yapılandırılmış yollara odaklanır; sözcüksel, grafik ve diğer kanallar aynı zincirli hibrit getirme modeliyle genişletilecektir.
 
+**Arama görünürlüğü**: Insert/update başarı döndükten sonra sıradan dizinler hemen aramaya katılır; vektör dizinleri yazma yoluna bağlanarak oluşturulmaz (işlem hızını etkilememek için) ve hemen aranabilir olmaz. Aramaya katılmaları gerektiğinde iş toplu işlemi bitince `await db.flush()` çağırın (isteğe bağlı kolaylık); ancak bundan sonra `matchVector` / `vectorSearch` içinde yer alırlar.
+
 ```dart
 await db.createTables([
   const TableSchema(

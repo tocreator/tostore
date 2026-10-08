@@ -730,6 +730,8 @@ await db.kv.setMany(settingsMap, durability: RecoveryDurability.durable);
 
 Vector retrieval uses the unified `db.query(...).matchVector(...)` query chain: it can be combined with structured predicates on the same chain, or fused with other recall branches. Scores and channel diagnostics are returned in `QueryResult.retrieval`, aligned 1:1 with `data` rows. When you only need primary keys and scores, prefer `.select(['id'])` (or your PK field name) so the engine skips hydrating full table rows — otherwise hybrid retrieval materializes complete records (including large embeddings) and throughput can drop sharply. For dedicated ANN without filters or fusion, `db.vectorSearch(...)` returns `List<VectorSearchResult>` (primary key + score) with the same core search path. Current examples focus on vector + structured paths; lexical, graph, and other channels will extend along the same chained hybrid retrieval model.
 
+**Search visibility**: After insert/update returns success, regular indexes are immediately searchable; vector indexes are not built on the write path (to avoid hurting throughput) and are not searchable right away. When you need them in retrieval, call `await db.flush()` after your business batch (optional convenience); only then do they participate in `matchVector` / `vectorSearch`.
+
 ```dart
 await db.createTables([
   const TableSchema(

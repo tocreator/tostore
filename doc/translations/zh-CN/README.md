@@ -749,6 +749,8 @@ await db.kv.setMany(settingsMap, durability: RecoveryDurability.durable);
 
 向量检索走统一的 `db.query(...).matchVector(...)` 查询链：可与结构化条件同链组合，也可与其它召回分支做多路融合；分数与通道诊断在 `QueryResult.retrieval` 中返回，与 `data` 行一一对应。若只需主键与评分，请优先 `.select(['id'])`（或你的主键字段名），引擎会跳过表侧完整行物化；否则混合检索会回表加载整行（含大体积 embedding），吞吐量可能大幅下降。纯 ANN、无需过滤/融合时，也可用顶层 `db.vectorSearch(...)`，直接返回 `List<VectorSearchResult>`（主键 + 评分），核心检索路径相同。当前示例以向量 + 结构化为主，词法、图检索等通道将沿同一套链式混合检索模型扩展。
 
+**检索可见性**：插入/更新返回成功后，普通索引等可立即参与检索；向量索引为避免捆绑构建影响吞吐量，并不会立刻可搜。需要参与检索时，可在业务批量结束后执行 `await db.flush()`（可选便利），完成后才会进入 `matchVector` / `vectorSearch`。
+
 ```dart
 await db.createTables([
   const TableSchema(

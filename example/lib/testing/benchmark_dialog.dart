@@ -1,7 +1,11 @@
+import 'dart:ui' as ui;
+
 import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:tostore/tostore.dart';
 
+import 'benchmark_image_export.dart';
 import 'benchmark_models.dart';
 
 /// Modal dialog for configuring, starting, and reviewing benchmark suite results.
@@ -26,6 +30,9 @@ class _BenchmarkDialogState extends State<BenchmarkDialog> {
   late int _selectedIterations;
   late RecoveryDurability _selectedDurability;
   late Set<BenchmarkOperation> _selectedOperations;
+
+  final GlobalKey _captureKey = GlobalKey();
+  bool _savingImage = false;
 
   static const List<int> _scalarScaleOptions = [10000, 50000, 100000];
   static const List<int> _vectorScaleOptions = [1000, 5000, 10000];
@@ -131,49 +138,54 @@ class _BenchmarkDialogState extends State<BenchmarkDialog> {
     return AlertDialog(
       insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
       titlePadding: const EdgeInsets.fromLTRB(24, 20, 24, 12),
+      // Results view embeds logo+title inside the capture card; keep dialog
+      // title chrome minimal there so Save Image does not need a second header.
       title: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Row(
-            children: [
-              Icon(
-                _isViewingResults
-                    ? Icons.insights_rounded
-                    : Icons.speed_rounded,
-                color: primaryColor,
-                size: 26,
-              ),
-              const SizedBox(width: 10),
-              Text(
-                _isViewingResults
-                    ? 'Benchmark Results'
-                    : 'Performance Benchmark',
-                style:
-                    const TextStyle(fontWeight: FontWeight.bold, fontSize: 18),
-              ),
-            ],
-          ),
-          if (widget.lastSummary != null)
+          if (_isViewingResults)
+            const SizedBox.shrink()
+          else
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                Image.asset(
+                  'assets/logo-tostore.png',
+                  height: 36,
+                  fit: BoxFit.contain,
+                  errorBuilder: (context, error, stackTrace) => Icon(
+                    Icons.speed_rounded,
+                    color: primaryColor,
+                    size: 28,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                const Text(
+                  'Performance Benchmark',
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.w600,
+                    color: Color(0xFF0F172A),
+                  ),
+                ),
+              ],
+            ),
+          // Results actions live in the bottom "More" menu; config view keeps
+          // a single View Results shortcut when a prior run exists.
+          if (!_isViewingResults && widget.lastSummary != null)
             TextButton.icon(
               style: TextButton.styleFrom(
                 padding:
                     const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
                 visualDensity: VisualDensity.compact,
               ),
-              icon: Icon(
-                _isViewingResults
-                    ? Icons.tune_rounded
-                    : Icons.bar_chart_rounded,
-                size: 16,
-              ),
-              label: Text(
-                _isViewingResults ? 'Configure' : 'View Results',
-                style: const TextStyle(fontSize: 13),
+              icon: const Icon(Icons.bar_chart_rounded, size: 16),
+              label: const Text(
+                'View Results',
+                style: TextStyle(fontSize: 13),
               ),
               onPressed: () {
-                setState(() {
-                  _isViewingResults = !_isViewingResults;
-                });
+                setState(() => _isViewingResults = true);
               },
             ),
         ],
@@ -188,11 +200,10 @@ class _BenchmarkDialogState extends State<BenchmarkDialog> {
       ),
       actionsPadding: const EdgeInsets.fromLTRB(24, 0, 24, 20),
       actions: [
-        _buildActionBar(
-          _isViewingResults
-              ? _buildResultsActionButtons(context, widget.lastSummary!)
-              : _buildConfigActionButtons(context),
-        ),
+        if (_isViewingResults)
+          _buildResultsActionBar(context, widget.lastSummary!)
+        else
+          _buildActionBar(_buildConfigActionButtons(context)),
       ],
     );
   }
@@ -220,186 +231,254 @@ class _BenchmarkDialogState extends State<BenchmarkDialog> {
     final primaryColor = Theme.of(context).colorScheme.primary;
     final dateStr = summary.timestamp.toIso8601String().split('T').first;
 
+    // Capture card excludes dialog chrome / action buttons / Copy Markdown.
     return SingleChildScrollView(
       child: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          // Header summary bar
-          Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
+          RepaintBoundary(
+            key: _captureKey,
+            child: ColoredBox(
               color: Colors.white,
-              borderRadius: BorderRadius.circular(10),
-              border: Border.all(color: const Color(0xFFE2E8F0)),
-            ),
-            child: Wrap(
-              spacing: 12,
-              runSpacing: 8,
-              alignment: WrapAlignment.spaceBetween,
-              crossAxisAlignment: WrapCrossAlignment.center,
-              children: [
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 6,
+              child: Padding(
+                // Match standalone showcase card margins (balanced on all sides).
+                padding: const EdgeInsets.fromLTRB(24, 22, 24, 20),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
                   children: [
-                    _buildBadge('Tier: ${summary.config.tier.label}',
-                        primaryColor.withAlpha(25), primaryColor),
-                    _buildBadge(
-                        'Scale: ${_formatScaleLabel(summary.config.scale)} records',
-                        Colors.grey.shade100,
-                        const Color(0xFF334155)),
-                    _buildBadge('${summary.config.iterations} Rounds',
-                        Colors.grey.shade100, const Color(0xFF334155)),
-                    _buildBadge(
-                        'Durability: ${summary.config.durability.benchmarkLabel}',
-                        Colors.grey.shade100,
-                        const Color(0xFF334155)),
-                    _buildBadge(
-                        dateStr, Colors.grey.shade100, const Color(0xFF64748B)),
-                  ],
-                ),
-                OutlinedButton.icon(
-                  style: OutlinedButton.styleFrom(
-                    padding:
-                        const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                    visualDensity: VisualDensity.compact,
-                    side: const BorderSide(color: Color(0xFFCBD5E1)),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(8),
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Image.asset(
+                          'assets/logo-tostore.png',
+                          height: 36,
+                          fit: BoxFit.contain,
+                          errorBuilder: (_, __, ___) => Icon(
+                            Icons.speed_rounded,
+                            size: 28,
+                            color: primaryColor,
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                        const Text(
+                          'Benchmark Results',
+                          style: TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.w600,
+                            color: Color(0xFF0F172A),
+                          ),
+                        ),
+                      ],
                     ),
-                  ),
-                  icon: const Icon(Icons.copy_rounded, size: 15),
-                  label: const Text('Copy Markdown',
-                      style: TextStyle(fontSize: 12.5)),
-                  onPressed: () {
-                    Clipboard.setData(
-                        ClipboardData(text: summary.toMarkdownTable()));
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                        content:
-                            Text('✅ Benchmark Markdown copied to clipboard!'),
-                        duration: Duration(seconds: 2),
-                        backgroundColor: Color(0xFF006CC3),
+                    const SizedBox(height: 14),
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: const Color(0xFFE2E8F0)),
                       ),
-                    );
-                  },
-                ),
-              ],
-            ),
-          ),
-          const SizedBox(height: 16),
-
-          // Data Table — border hugs intrinsic table width so Min/Max is not
-          // left with a large empty strip inside a full-width frame.
-          Align(
-            alignment: Alignment.centerLeft,
-            child: SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: ClipRRect(
-                borderRadius: BorderRadius.circular(10),
-                child: Container(
-                  decoration: BoxDecoration(
-                    border: Border.all(color: const Color(0xFFE2E8F0)),
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                  child: DataTable(
-                    headingRowColor: WidgetStateProperty.all(
-                      const Color(0xFFF1F5F9),
+                      child: Wrap(
+                        spacing: 8,
+                        runSpacing: 6,
+                        children: [
+                          _buildBadge('Tier: ${summary.config.tier.label}',
+                              primaryColor.withAlpha(25), primaryColor),
+                          _buildBadge(
+                              'Scale: ${_formatScaleLabel(summary.config.scale)} records',
+                              Colors.grey.shade100,
+                              const Color(0xFF334155)),
+                          _buildBadge('${summary.config.iterations} Rounds',
+                              Colors.grey.shade100, const Color(0xFF334155)),
+                          _buildBadge(
+                              'Durability: ${summary.config.durability.benchmarkLabel}',
+                              Colors.grey.shade100,
+                              const Color(0xFF334155)),
+                          _buildBadge(dateStr, Colors.grey.shade100,
+                              const Color(0xFF64748B)),
+                        ],
+                      ),
                     ),
-                    headingTextStyle: const TextStyle(
-                      fontWeight: FontWeight.w700,
-                      fontSize: 13,
-                      color: Color(0xFF1E293B),
-                    ),
-                    dataRowMinHeight: 40,
-                    dataRowMaxHeight: 48,
-                    columnSpacing: 18,
-                    horizontalMargin: 14,
-                    columns: const [
-                      DataColumn(label: Text('Model')),
-                      DataColumn(label: Text('Operation')),
-                      DataColumn(label: Text('Count'), numeric: true),
-                      DataColumn(label: Text('Avg Time'), numeric: true),
-                      DataColumn(label: Text('Result')),
-                      DataColumn(label: Text('Avg Latency'), numeric: true),
-                      DataColumn(label: Text('Min / Max'), numeric: true),
-                    ],
-                    rows: summary.metrics.map((m) {
-                      final isQuality = m.compactHighlight != null;
-                      return DataRow(
-                        cells: [
-                          DataCell(Text(m.tierName,
-                              style: const TextStyle(
-                                  fontSize: 12.5,
-                                  fontWeight: FontWeight.w600))),
-                          DataCell(Text(m.name,
-                              style: const TextStyle(fontSize: 12.5))),
-                          DataCell(Text('${m.recordCount}',
-                              style: const TextStyle(
-                                  fontSize: 12.5, color: Color(0xFF64748B)))),
-                          DataCell(Text(
-                              isQuality
-                                  ? '—'
-                                  : '${m.avgMilliseconds.toStringAsFixed(2)} ms',
-                              style: const TextStyle(
-                                  fontSize: 12.5,
-                                  fontWeight: FontWeight.w500))),
-                          DataCell(
-                            Tooltip(
-                              message: m.qualityNote ?? m.highlightLabel,
-                              waitDuration: const Duration(milliseconds: 400),
-                              child: Container(
-                                padding: const EdgeInsets.symmetric(
-                                    horizontal: 6, vertical: 2),
-                                decoration: BoxDecoration(
-                                  color: primaryColor.withAlpha(20),
-                                  borderRadius: BorderRadius.circular(4),
-                                ),
-                                child: Text(
-                                  m.highlightLabel,
-                                  style: TextStyle(
-                                    fontSize: 12.5,
-                                    fontWeight: FontWeight.bold,
-                                    color: primaryColor,
-                                  ),
-                                ),
+                    const SizedBox(height: 16),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: SingleChildScrollView(
+                        scrollDirection: Axis.horizontal,
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(10),
+                          child: Container(
+                            decoration: BoxDecoration(
+                              border:
+                                  Border.all(color: const Color(0xFFE2E8F0)),
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            child: DataTable(
+                              headingRowColor: WidgetStateProperty.all(
+                                const Color(0xFFE8EEF5),
                               ),
+                              headingTextStyle: const TextStyle(
+                                fontWeight: FontWeight.w700,
+                                fontSize: 13,
+                                color: Color(0xFF0F172A),
+                              ),
+                              dataRowMinHeight: 40,
+                              dataRowMaxHeight: 48,
+                              headingRowHeight: 44,
+                              columnSpacing: 18,
+                              horizontalMargin: 14,
+                              columns: const [
+                                DataColumn(label: Text('Model')),
+                                DataColumn(label: Text('Operation')),
+                                DataColumn(label: Text('Count'), numeric: true),
+                                DataColumn(
+                                    label: Text('Avg Time'), numeric: true),
+                                DataColumn(label: Text('Result')),
+                                DataColumn(
+                                    label: Text('Avg Latency'), numeric: true),
+                                DataColumn(
+                                    label: Text('Min / Max'), numeric: true),
+                              ],
+                              rows: summary.metrics.map((m) {
+                                final isQuality = m.compactHighlight != null;
+                                return DataRow(
+                                  cells: [
+                                    DataCell(Text(m.tierName,
+                                        style: const TextStyle(
+                                            fontSize: 12.5,
+                                            fontWeight: FontWeight.w600))),
+                                    DataCell(Text(m.name,
+                                        style:
+                                            const TextStyle(fontSize: 12.5))),
+                                    DataCell(Text('${m.recordCount}',
+                                        style: const TextStyle(
+                                            fontSize: 12.5,
+                                            color: Color(0xFF64748B)))),
+                                    DataCell(Text(
+                                        isQuality
+                                            ? '—'
+                                            : '${m.avgMilliseconds.toStringAsFixed(2)} ms',
+                                        style: const TextStyle(
+                                            fontSize: 12.5,
+                                            fontWeight: FontWeight.w500))),
+                                    DataCell(
+                                      Container(
+                                        padding: const EdgeInsets.symmetric(
+                                            horizontal: 6, vertical: 2),
+                                        decoration: BoxDecoration(
+                                          color: primaryColor.withAlpha(20),
+                                          borderRadius:
+                                              BorderRadius.circular(4),
+                                        ),
+                                        child: Text(
+                                          m.highlightLabel,
+                                          style: TextStyle(
+                                            fontSize: 12.5,
+                                            fontWeight: FontWeight.w600,
+                                            color: primaryColor,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                    DataCell(Text(
+                                        isQuality
+                                            ? '—'
+                                            : '${m.avgLatencyUs.toStringAsFixed(2)} μs',
+                                        style: const TextStyle(
+                                            fontSize: 12.5,
+                                            color: Color(0xFF475569)))),
+                                    DataCell(Text(
+                                      isQuality
+                                          ? '—'
+                                          : '${(m.minMicroseconds / 1000.0).toStringAsFixed(1)} / ${(m.maxMicroseconds / 1000.0).toStringAsFixed(1)} ms',
+                                      style: const TextStyle(
+                                          fontSize: 12,
+                                          color: Color(0xFF94A3B8)),
+                                    )),
+                                  ],
+                                );
+                              }).toList(),
                             ),
                           ),
-                          DataCell(Text(
-                              isQuality
-                                  ? '—'
-                                  : '${m.avgLatencyUs.toStringAsFixed(2)} μs',
-                              style: const TextStyle(
-                                  fontSize: 12.5, color: Color(0xFF475569)))),
-                          DataCell(Text(
-                            isQuality
-                                ? '—'
-                                : '${(m.minMicroseconds / 1000.0).toStringAsFixed(1)} / ${(m.maxMicroseconds / 1000.0).toStringAsFixed(1)} ms',
-                            style: const TextStyle(
-                                fontSize: 12, color: Color(0xFF94A3B8)),
-                          )),
-                        ],
-                      );
-                    }).toList(),
-                  ),
+                        ),
+                      ),
+                    ),
+                    if (summary.vectorRecallCaption != null) ...[
+                      const SizedBox(height: 10),
+                      Text(
+                        summary.vectorRecallCaption!,
+                        style: const TextStyle(
+                          fontSize: 12,
+                          height: 1.4,
+                          color: Color(0xFF64748B),
+                        ),
+                      ),
+                    ],
+                  ],
                 ),
               ),
             ),
           ),
-          if (summary.vectorRecallCaption != null) ...[
-            const SizedBox(height: 10),
-            Text(
-              summary.vectorRecallCaption!,
-              style: const TextStyle(
-                fontSize: 12,
-                height: 1.4,
-                color: Color(0xFF64748B),
-              ),
-            ),
-          ],
         ],
+      ),
+    );
+  }
+
+  Future<void> _saveResultsImage(BenchmarkSummary summary) async {
+    if (_savingImage || !canExportBenchmarkImage) return;
+    setState(() => _savingImage = true);
+    try {
+      await Future<void>.delayed(const Duration(milliseconds: 80));
+      await WidgetsBinding.instance.endOfFrame;
+
+      final boundary = _captureKey.currentContext?.findRenderObject()
+          as RenderRepaintBoundary?;
+      if (boundary == null) {
+        throw StateError('Capture target not ready');
+      }
+
+      final image = await boundary.toImage(pixelRatio: 3.0);
+      final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
+      image.dispose();
+      if (byteData == null) {
+        throw StateError('Failed to encode PNG');
+      }
+
+      final dateStr = summary.timestamp.toIso8601String().split('T').first;
+      final path = await exportBenchmarkPng(
+        bytes: byteData.buffer.asUint8List(),
+        fileName: 'tostore_benchmark_$dateStr.png',
+      );
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Saved: $path'),
+          duration: const Duration(seconds: 5),
+          backgroundColor: const Color(0xFF006CC3),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Save image failed: $e'),
+          backgroundColor: Colors.red.shade700,
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _savingImage = false);
+    }
+  }
+
+  void _copyMarkdown(BenchmarkSummary summary) {
+    Clipboard.setData(ClipboardData(text: summary.toMarkdownTable()));
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('✅ Benchmark Markdown copied to clipboard!'),
+        duration: Duration(seconds: 2),
+        backgroundColor: Color(0xFF006CC3),
       ),
     );
   }
@@ -419,51 +498,106 @@ class _BenchmarkDialogState extends State<BenchmarkDialog> {
     );
   }
 
-  List<Widget> _buildResultsActionButtons(
+  /// Results footer: More on the far left; Close + Re-run grouped on the right.
+  Widget _buildResultsActionBar(
       BuildContext context, BenchmarkSummary summary) {
     final compact = _isCompactActions(context);
     final buttonPadding = EdgeInsets.symmetric(
       horizontal: compact ? 10 : 14,
       vertical: compact ? 8 : 10,
     );
+    final sharedShape = RoundedRectangleBorder(
+      borderRadius: BorderRadius.circular(8),
+    );
+    final outlinedStyle = OutlinedButton.styleFrom(
+      padding: buttonPadding,
+      visualDensity: VisualDensity.standard,
+      minimumSize: const Size(0, 40),
+      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      shape: sharedShape,
+    );
+    final elevatedStyle = ElevatedButton.styleFrom(
+      foregroundColor: Colors.white,
+      backgroundColor: const Color.fromARGB(255, 10, 150, 210),
+      padding: buttonPadding,
+      visualDensity: VisualDensity.standard,
+      minimumSize: const Size(0, 40),
+      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+      shape: sharedShape,
+    );
+    final textStyle = TextButton.styleFrom(
+      padding: buttonPadding,
+      visualDensity: VisualDensity.standard,
+      minimumSize: const Size(0, 40),
+      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+    );
 
-    return [
-      TextButton(
-        onPressed: () => Navigator.of(context).pop(),
-        child: const Text('Close'),
-      ),
-      OutlinedButton.icon(
-        style: OutlinedButton.styleFrom(
-          padding: buttonPadding,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(8),
+    return SizedBox(
+      width: double.infinity,
+      child: Row(
+        children: [
+          MenuAnchor(
+            builder: (context, controller, child) {
+              return OutlinedButton.icon(
+                style: outlinedStyle,
+                icon: const Icon(Icons.more_horiz_rounded, size: 18),
+                label: const Text('More'),
+                onPressed: _savingImage
+                    ? null
+                    : () {
+                        if (controller.isOpen) {
+                          controller.close();
+                        } else {
+                          controller.open();
+                        }
+                      },
+              );
+            },
+            menuChildren: [
+              MenuItemButton(
+                leadingIcon: const Icon(Icons.copy_rounded, size: 20),
+                onPressed: () => _copyMarkdown(summary),
+                child: const Text('Copy Markdown'),
+              ),
+              if (canExportBenchmarkImage)
+                MenuItemButton(
+                  leadingIcon: _savingImage
+                      ? const SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.image_outlined, size: 20),
+                  onPressed:
+                      _savingImage ? null : () => _saveResultsImage(summary),
+                  child: Text(_savingImage ? 'Saving…' : 'Save Image'),
+                ),
+              MenuItemButton(
+                leadingIcon: const Icon(Icons.tune_rounded, size: 20),
+                onPressed: () => setState(() => _isViewingResults = false),
+                child: const Text('New Benchmark'),
+              ),
+            ],
           ),
-        ),
-        icon: const Icon(Icons.tune_rounded, size: 18),
-        label: Text(compact ? 'New' : 'New Benchmark'),
-        onPressed: () {
-          setState(() {
-            _isViewingResults = false;
-          });
-        },
-      ),
-      ElevatedButton.icon(
-        style: ElevatedButton.styleFrom(
-          foregroundColor: Colors.white,
-          backgroundColor: const Color.fromARGB(255, 10, 150, 210),
-          padding: buttonPadding,
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(8),
+          const Spacer(),
+          TextButton(
+            style: textStyle,
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Close'),
           ),
-        ),
-        icon: const Icon(Icons.refresh_rounded, size: 18),
-        label: Text(
-          compact ? 'Re-run' : 'Re-run Test',
-          style: const TextStyle(fontWeight: FontWeight.bold),
-        ),
-        onPressed: () => _onStart(summary.config),
+          const SizedBox(width: 8),
+          ElevatedButton.icon(
+            style: elevatedStyle,
+            icon: const Icon(Icons.refresh_rounded, size: 18),
+            label: Text(
+              compact ? 'Re-run' : 'Re-run Test',
+              style: const TextStyle(fontWeight: FontWeight.bold),
+            ),
+            onPressed: () => _onStart(summary.config),
+          ),
+        ],
       ),
-    ];
+    );
   }
 
   // --- Configuration View Widgets ---

@@ -728,6 +728,8 @@ await db.kv.setMany(settingsMap, durability: RecoveryDurability.durable);
 
 벡터 검색은 통합된 `db.query(...).matchVector(...)` 쿼리 체인을 사용합니다. 동일 체인에서 구조화 조건과 조합하거나, 다른 리콜 분기와 다중 경로 융합할 수 있습니다. 점수와 채널 진단은 `QueryResult.retrieval`로 반환되며 `data` 행과 1:1로 대응합니다. 기본키와 점수만 필요할 때는 `.select(['id'])`(또는 PK 필드명)를 우선해 엔진이 전체 행 하이드레이션을 건너뛰게 하세요. 그렇지 않으면 하이브리드 검색이 완전한 레코드(큰 임베딩 포함)를 로드해 처리량이 크게 떨어질 수 있습니다. 필터·융합이 필요 없는 전용 ANN에는 같은 코어 검색 경로로 `db.vectorSearch(...)`가 `List<VectorSearchResult>`(기본키 + 점수)를 반환합니다. 현재 예제는 벡터 + 구조화 경로 중심이며, 어휘·그래프 등 채널도 동일한 체인형 하이브리드 검색 모델을 따라 확장됩니다.
 
+**검색 가시성**: 삽입/업데이트가 성공을 반환한 직후, 일반 인덱스 등은 바로 검색에 참여할 수 있습니다. 벡터 인덱스는 처리량에 영향을 주지 않도록 쓰기 경로에 묶여 구축되지 않으며, 즉시 검색되지 않습니다. 검색에 참여시키려면 업무 배치가 끝난 뒤 `await db.flush()`(선택적 편의 API)를 호출하고, 완료 후에야 `matchVector` / `vectorSearch`에 반영됩니다.
+
 ```dart
 await db.createTables([
   const TableSchema(

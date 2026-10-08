@@ -2116,6 +2116,34 @@ final class TableTreePartitionManager {
       sizeDeltaSum += partitionSizeDelta;
     }
 
+    // Recovery reflush ([BatchContext.skipPageRedoRecord]): page redo may already
+    // have applied leaf after-images, so the tree-walk treats inserts as
+    // `existed` and [recordsDelta] stays 0. Memory/disk meta was rolled to
+    // batch-base by repair — using tree delta would persist base+0 and lose
+    // the batch on the next cold start (count cache still looks fine until then).
+    if (batchContext?.skipPageRedoRecord == true) {
+      var plannedRecords = 0;
+      for (final op in ops.values) {
+        if (op.type == _OpType.del) {
+          plannedRecords -= 1;
+        } else if (op.isInsert) {
+          plannedRecords += 1;
+        }
+      }
+      recordsDeltaSum = plannedRecords;
+      if (sizeDeltaSum == 0 && partitionStats.isNotEmpty) {
+        // Durable partitions already carry post-redo file sizes in headers;
+        // do not shrink global totalSizeBytes back to batch-base.
+        var partsSize = 0;
+        for (final s in partitionStats.values) {
+          partsSize += s.oldFileSizeInBytes;
+        }
+        if (partsSize > meta.totalSizeBytes) {
+          sizeDeltaSum = partsSize - meta.totalSizeBytes;
+        }
+      }
+    }
+
     final now = DateTime.now();
     final updatedMeta = meta.copyWith(
       totalRecordCount: max(0, meta.totalRecordCount + recordsDeltaSum),
