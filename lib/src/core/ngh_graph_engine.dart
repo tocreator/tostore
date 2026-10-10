@@ -2,6 +2,8 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
+import '../handler/common.dart';
+import '../handler/logger.dart';
 import '../handler/memcomparable.dart';
 import '../model/db_exception.dart';
 import '../model/ngh_index_meta.dart';
@@ -1759,14 +1761,11 @@ class NghGraphEngine {
     for (final e in dirtyNavBTreePages.entries) {
       final ptr = e.key;
       if (ptr.isNull || ptr.pageNo <= 0) continue;
-      // Same search-resident shape as disk prewarm (compact wire decode).
-      final shaped =
-          NghNavBTreePage.tryDecodePayload(e.value.encodePayload()) ?? e.value;
       _navInternalPut(
         tableUid,
         indexUid,
         NghPageId(ptr.partitionNo, ptr.pageNo),
-        shaped,
+        e.value,
       );
     }
     for (final e in dirtyLeafPages.entries) {
@@ -1774,13 +1773,8 @@ class NghGraphEngine {
       if (ptr.category != NghDataCategory.leaf) continue;
       if (ptr.isNull || ptr.pageNo <= 0) continue;
 
-      // Wire round-trip → same layout as open+prewarm (compact slots/SQ8/low48).
-      // Insert-mutated growable pages stay fragmented and can be ~2× slower on
-      // the SQ8 hot loop even when TreeCache hits and low48 is already warm.
-      final shaped =
-          NghLeafPage.tryDecodePayload(e.value.encodePayload()) ?? e.value;
       final pageId = NghPageId(ptr.partitionNo, ptr.pageNo);
-      _btreeLeafPut(tableUid, indexUid, pageId, shaped);
+      _btreeLeafPut(tableUid, indexUid, pageId, e.value);
     }
   }
 
@@ -1812,13 +1806,11 @@ class NghGraphEngine {
       if (shouldAbort?.call() ?? false) return;
       final ptr = e.key;
       if (ptr.isNull || ptr.pageNo <= 0) continue;
-      final shaped =
-          NghNavBTreePage.tryDecodePayload(e.value.encodePayload()) ?? e.value;
       _navInternalPut(
         tableUid,
         indexUid,
         NghPageId(ptr.partitionNo, ptr.pageNo),
-        shaped,
+        e.value,
       );
     }
     for (final e in dirtyLeafPages.entries) {
@@ -1827,12 +1819,9 @@ class NghGraphEngine {
       if (ptr.category != NghDataCategory.leaf) continue;
       if (ptr.isNull || ptr.pageNo <= 0) continue;
 
-      final shaped =
-          NghLeafPage.tryDecodePayload(e.value.encodePayload()) ?? e.value;
       final pageId = NghPageId(ptr.partitionNo, ptr.pageNo);
-      _btreeLeafPut(tableUid, indexUid, pageId, shaped);
+      _btreeLeafPut(tableUid, indexUid, pageId, e.value);
     }
-
   }
 
   /// Diagnostic: how many leaves are inventored vs resident in leaf cache.
@@ -2014,7 +2003,6 @@ class NghGraphEngine {
       if (id.isNone) continue;
       final scratch = insertScratch?[id];
       if (scratch != null) {
-        scratch.ensureLow48Ready();
         continue;
       }
       final cached = _btreeLeafGet(table.tableUid, indexUid, id);
@@ -2053,7 +2041,6 @@ class NghGraphEngine {
     );
     for (final item in loaded) {
       if (insertScratch != null) {
-        item.page.ensureLow48Ready();
         insertScratch.putIfAbsent(item.id, () => item.page);
       } else {
         _btreeLeafPut(table.tableUid, indexUid, item.id, item.page);
@@ -3798,6 +3785,15 @@ class NghGraphEngine {
       );
     }
 
+    final phaseSw = Stopwatch()..start();
+    var phaseMarkMs = 0;
+    int takePhaseMs() {
+      final now = phaseSw.elapsedMilliseconds;
+      final d = now - phaseMarkMs;
+      phaseMarkMs = now;
+      return d;
+    }
+
     var currentMeta = NghPageSizer.ensureIndexPageSizes(
       meta,
       _partitionManager.configuredPageSize,
@@ -5036,67 +5032,6 @@ class NghGraphEngine {
       }
     }
 
-    /// Collect best + boundary dual leaf targets for [rootId] (leaf-level second
-    /// home and mid dual-fork best leaf). Used to hydrate before insertLoop so
-    /// [insertIntoRootSync] does not fall back solely for missing dual leaves.
-    /// Returns the best-path leaf id (for sort locality), or null if unresolved.
-    NghPageId? collectInsertProbeLeavesSync(
-      int rootId,
-      Float32x4List qLowSimd,
-      Set<NghPageId> out,
-    ) {
-      var curId = state!.firstInternalByRoot[rootId];
-      if (curId.isNone) return null;
-      final head = resolveInsertNav(curId);
-      if (head == null) return null;
-      var cur = head;
-      var hop = 0;
-      NghPageId? dualMidChildId;
-      while (!cur.isLeafLevel) {
-        if (++hop > NghNavBTreePage.maxTreeHops || cur.entries.isEmpty) {
-          return null;
-        }
-        flushPendingBubblesUnder(curId);
-        final top = insertTop2Nav(cur, qLowSimd);
-        dualMidChildId = null;
-        if (top.secondIdx >= 0 &&
-            top.secondScore >= top.bestScore * _boundaryDualRatio) {
-          final altId = cur.entries[top.secondIdx].childPageId;
-          if (!altId.isNone) dualMidChildId = altId;
-        }
-        final childId = cur.entries[top.bestIdx].childPageId;
-        if (childId.isNone) return null;
-        curId = childId;
-        final next = resolveInsertNav(curId);
-        if (next == null) return null;
-        cur = next;
-      }
-      if (cur.entries.isEmpty) return null;
-      final leafTop = insertTop2Nav(cur, qLowSimd);
-      final best = cur.entries[leafTop.bestIdx];
-      NghPageId? bestLeaf;
-      if (!best.leafPageId.isNone) {
-        out.add(best.leafPageId);
-        bestLeaf = best.leafPageId;
-      }
-      if (leafTop.secondIdx >= 0 &&
-          leafTop.secondScore >= leafTop.bestScore * _boundaryDualRatio) {
-        final second = cur.entries[leafTop.secondIdx];
-        if (!identical(second, best) && !second.leafPageId.isNone) {
-          out.add(second.leafPageId);
-        }
-      }
-      final midAltId = dualMidChildId;
-      if (midAltId != null) {
-        final alt = resolveInsertNav(midAltId);
-        if (alt != null && alt.isLeafLevel && alt.entries.isNotEmpty) {
-          final altBest = alt.entries[insertTop2Nav(alt, qLowSimd).bestIdx];
-          if (!altBest.leafPageId.isNone) out.add(altBest.leafPageId);
-        }
-      }
-      return bestLeaf;
-    }
-
     Float32List normalize48InPlace(Float32List v) {
       var nSq = 0.0;
       for (int d = 0; d < 48; d++) {
@@ -5312,6 +5247,7 @@ class NghGraphEngine {
     }
 
     expandUndersizedL0FromBatch();
+    final setupMs = takePhaseMs();
 
     // Single-pass L0 score → pin + insertWork; one peek after ensure for
     // hydrate/sort. Removes the prior triple L0 / double-peek prepare loops.
@@ -5376,65 +5312,118 @@ class NghGraphEngine {
         leafSortKey: -1,
       ));
     }
+    final prepareMs = takePhaseMs();
 
     for (final rootId in pinRoots) {
       await ensureInsertRootNav(rootId);
     }
+    final ensureNavMs = takePhaseMs();
 
-    // Level-wise Batch Prefetch: batch-load all internal and leaf-level navigation pages
-    // along the probe trajectories so that peek and insertLoop operate 100% in memory synchronously.
-    // Only successfully loaded ids are marked attempted; a round that loads nothing
-    // stops the loop so insert can still fall back sync→async.
+    // Unified pre-mutation probe: load missing nav along trajectories and
+    // collect dual leaf targets for hydrate. Previously this was two full
+    // N×tree descents (nav prefetch while + collectInsertProbeLeavesSync);
+    // assignment scoring is identical — only the redundant second walk is gone.
     final attemptedNavIds = <NghPageId>{};
+    final neededLeafIds = <NghPageId>{};
     while (true) {
       final missingNavIds = <NghPageId>{};
-      for (final w in insertWork) {
+      for (var i = 0; i < insertWork.length; i++) {
+        final w = insertWork[i];
         insertQLow.setRange(0, 48, w.lowVec);
         final qLowSimd = insertQLowSimd;
 
-        void collectMissingNav(int rootId) {
+        NghPageId? probeRoot(int rootId) {
           var curId = state!.firstInternalByRoot[rootId];
-          if (curId.isNone) return;
+          if (curId.isNone) return null;
           final initialPage = resolveInsertNav(curId);
           if (initialPage == null) {
             if (!attemptedNavIds.contains(curId)) missingNavIds.add(curId);
-            return;
+            return null;
           }
           var curPage = initialPage;
           var hop = 0;
+          NghPageId? dualMidChildId;
           while (!curPage.isLeafLevel) {
             if (++hop > NghNavBTreePage.maxTreeHops ||
                 curPage.entries.isEmpty) {
-              break;
+              return null;
             }
             flushPendingBubblesUnder(curId);
             final top = insertTop2Nav(curPage, qLowSimd);
+            dualMidChildId = null;
             if (top.secondIdx >= 0 &&
                 top.secondScore >= top.bestScore * _boundaryDualRatio) {
               final altId = curPage.entries[top.secondIdx].childPageId;
-              if (!altId.isNone &&
-                  resolveInsertNav(altId) == null &&
-                  !attemptedNavIds.contains(altId)) {
-                missingNavIds.add(altId);
+              if (!altId.isNone) {
+                dualMidChildId = altId;
+                if (resolveInsertNav(altId) == null &&
+                    !attemptedNavIds.contains(altId)) {
+                  missingNavIds.add(altId);
+                }
               }
             }
             final childId = curPage.entries[top.bestIdx].childPageId;
-            if (childId.isNone) break;
+            if (childId.isNone) return null;
             final next = resolveInsertNav(childId);
             if (next == null) {
               if (!attemptedNavIds.contains(childId)) {
                 missingNavIds.add(childId);
               }
-              break;
+              return null;
             }
             curId = childId;
             curPage = next;
           }
+          if (curPage.entries.isEmpty) return null;
+          final leafTop = insertTop2Nav(curPage, qLowSimd);
+          final best = curPage.entries[leafTop.bestIdx];
+          NghPageId? bestLeaf;
+          if (!best.leafPageId.isNone) {
+            neededLeafIds.add(best.leafPageId);
+            bestLeaf = best.leafPageId;
+          }
+          if (leafTop.secondIdx >= 0 &&
+              leafTop.secondScore >= leafTop.bestScore * _boundaryDualRatio) {
+            final second = curPage.entries[leafTop.secondIdx];
+            if (!identical(second, best) && !second.leafPageId.isNone) {
+              neededLeafIds.add(second.leafPageId);
+            }
+          }
+          final midAltId = dualMidChildId;
+          if (midAltId != null) {
+            final alt = resolveInsertNav(midAltId);
+            if (alt == null) {
+              if (!attemptedNavIds.contains(midAltId)) {
+                missingNavIds.add(midAltId);
+              }
+            } else if (alt.isLeafLevel && alt.entries.isNotEmpty) {
+              final altBest = alt.entries[insertTop2Nav(alt, qLowSimd).bestIdx];
+              if (!altBest.leafPageId.isNone) {
+                neededLeafIds.add(altBest.leafPageId);
+              }
+            }
+          }
+          return bestLeaf;
         }
 
-        collectMissingNav(w.bestRoot0);
+        final leaf0 = probeRoot(w.bestRoot0);
+        var leafSortKey = -1;
+        if (leaf0 != null && !leaf0.isNone) {
+          leafSortKey = (leaf0.partitionNo << 32) | (leaf0.pageNo & 0xffffffff);
+        }
         if (w.maxScore1 >= w.maxScore0 * _boundaryDualRatio) {
-          collectMissingNav(w.bestRoot1);
+          probeRoot(w.bestRoot1);
+        }
+        if (leafSortKey != w.leafSortKey) {
+          insertWork[i] = (
+            lowVec: w.lowVec,
+            slot: w.slot,
+            bestRoot0: w.bestRoot0,
+            bestRoot1: w.bestRoot1,
+            maxScore0: w.maxScore0,
+            maxScore1: w.maxScore1,
+            leafSortKey: leafSortKey,
+          );
         }
       }
 
@@ -5459,33 +5448,7 @@ class NghGraphEngine {
         attemptedNavIds.add(item.id);
       }
     }
-
-    final neededLeafIds = <NghPageId>{};
-    for (var i = 0; i < insertWork.length; i++) {
-      final w = insertWork[i];
-      insertQLow.setRange(0, 48, w.lowVec);
-      final qLowSimd = insertQLowSimd;
-      final leaf0 =
-          collectInsertProbeLeavesSync(w.bestRoot0, qLowSimd, neededLeafIds);
-      var leafSortKey = -1;
-      if (leaf0 != null && !leaf0.isNone) {
-        leafSortKey = (leaf0.partitionNo << 32) | (leaf0.pageNo & 0xffffffff);
-      }
-      if (w.maxScore1 >= w.maxScore0 * _boundaryDualRatio) {
-        collectInsertProbeLeavesSync(w.bestRoot1, qLowSimd, neededLeafIds);
-      }
-      if (leafSortKey != w.leafSortKey) {
-        insertWork[i] = (
-          lowVec: w.lowVec,
-          slot: w.slot,
-          bestRoot0: w.bestRoot0,
-          bestRoot1: w.bestRoot1,
-          maxScore0: w.maxScore0,
-          maxScore1: w.maxScore1,
-          leafSortKey: leafSortKey,
-        );
-      }
-    }
+    final probeMs = takePhaseMs();
 
     if (neededLeafIds.isNotEmpty) {
       await _hydrateBTreeLeaves(
@@ -5496,6 +5459,7 @@ class NghGraphEngine {
         insertScratch: insertLeaves,
       );
     }
+    final hydrateMs = takePhaseMs();
 
     insertWork.sort((a, b) {
       final byRoot = a.bestRoot0.compareTo(b.bestRoot0);
@@ -5542,6 +5506,7 @@ class NghGraphEngine {
         }
       }
     }
+    final insertMs = takePhaseMs();
 
     // Drain coalesced mid summaries before L0 refresh / heavy-root split.
     flushAllPendingBubbles();
@@ -5595,6 +5560,7 @@ class NghGraphEngine {
         ),
       );
     }
+    final postL0Ms = takePhaseMs();
 
     // Promote all touched L1 pages (descent paths + dirty) into the budgeted search-hot nav cache.
     for (final e in insertNavPages.entries) {
@@ -5628,22 +5594,26 @@ class NghGraphEngine {
         e.value,
       );
     }
+    final pinMs = takePhaseMs();
 
     // Populate exact PK Map locators
     final pkBatch = NghPkMapBatch(meta: currentMeta);
     final pkLocators = <String, List<NghPkLocator>>{};
 
     // 1. Append-only dirty leaves: directly record newly appended slot locators (zero scans on historical slots)
+    final splitLeafKeys = <int>{
+      for (final p in splitLeafPages)
+        if (p.category == NghDataCategory.leaf && !p.isNull && p.pageNo > 0)
+          (p.partitionNo << 32) | (p.pageNo & 0xFFFFFFFF),
+    };
     for (final e in appendedPkLocators.entries) {
       final locs = e.value;
       for (final loc in locs) {
-        final leafPtr = NghPagePtr(
-          NghDataCategory.leaf,
-          loc.partitionNo,
-          loc.pageNo,
-        );
         // If the page later split, all its slots are scanned below with updated slot indices
-        if (splitLeafPages.contains(leafPtr)) continue;
+        if (splitLeafKeys
+            .contains((loc.partitionNo << 32) | (loc.pageNo & 0xFFFFFFFF))) {
+          continue;
+        }
         pkLocators.putIfAbsent(e.key, () => []).add(loc);
       }
     }
@@ -5652,7 +5622,6 @@ class NghGraphEngine {
     for (final ptr in splitLeafPages) {
       final page = dirtyLeafPages[ptr];
       if (page == null) continue;
-      page.ensureLow48Ready();
       for (int s = 0; s < page.slots.length; s++) {
         final slot = page.slots[s];
         if (slot.isDeleted) continue;
@@ -5667,57 +5636,49 @@ class NghGraphEngine {
       }
     }
 
-    // Ensure insert-hot pages remain searchable without a cold low48 rebuild.
-    for (final entry in dirtyLeafPages.entries) {
-      if (!splitLeafPages.contains(entry.key)) {
-        entry.value.ensureLow48Ready();
-      }
-    }
-
+    final dirtyLeafKeys = <int>{
+      for (final p in dirtyLeafPages.keys)
+        if (p.category == NghDataCategory.leaf && !p.isNull && p.pageNo > 0)
+          (p.partitionNo << 32) | (p.pageNo & 0xFFFFFFFF),
+    };
     final pkEntries = <NghPkMapWrite>[];
     for (final e in pkLocators.entries) {
-      final old = pkBatch.meta.pkmapRootIsNull
-          ? const <NghPkLocator>[]
-          : await _pkMap.lookup(
-              table: table,
-              indexUid: indexUid,
-              batch: pkBatch,
-              key: _pkMapKey(e.key),
-            );
-      // Drop any old locator that points at a leaf dirtied in this batch
-      // (append or split) so stale slot indices / deleted homes cannot linger.
-      final merged = <NghPkLocator>[
-        for (final l in old)
-          if (!dirtyLeafPages.containsKey(NghPagePtr(
-            NghDataCategory.leaf,
-            l.partitionNo,
-            l.pageNo,
-          )))
-            l,
-        ...e.value,
-      ];
-      var locs = merged;
-      if (locs.length > NghPkLocator.maxLocatorsPerPk) {
-        // Prefer newest locators (tail) so dual/reinsert homes are kept.
-        locs = locs.sublist(locs.length - NghPkLocator.maxLocatorsPerPk);
-      }
       pkEntries.add(NghPkMapWrite(
         key: _pkMapKey(e.key),
-        locators: locs,
+        locators: e.value,
       ));
     }
     pkEntries.sort((a, b) => MemComparableKey.compare(a.key, b.key));
+    final pkBuildMs = takePhaseMs();
     await _pkMap.upsertSorted(
       table: table,
       indexUid: indexUid,
       batch: pkBatch,
       entries: pkEntries,
-      rewrittenIds: const {},
+      dirtyLeafKeys: dirtyLeafKeys,
     );
+    final pkUpsertMs = takePhaseMs();
     currentMeta = pkBatch.meta.copyWith(
       centroidCount: state.numRootCentroids,
       nextNodeId: baseNodeId + vectors.length,
     );
+
+    if (InternalConfig.showInternalLogs) {
+      final now = DateTime.now();
+      final at =
+          '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}.${now.millisecond.toString().padLeft(3, '0')}';
+      Logger.debug(
+        'NGH insertBatch: table=${table.tableName}, index=${indexUid.value}, '
+        'vectors=${vectors.length}, dims=${currentMeta.dimensions}, '
+        'L0=${state.numRootCentroids}, dirtyLeaves=${dirtyLeafPages.length}, '
+        'dirtyNav=${dirtyNavBTreePages.length}, pkEntries=${pkEntries.length}, '
+        'neededLeaves=${neededLeafIds.length}, splits=${splitLeafPages.length}, '
+        'setup=${setupMs}ms, prepare=${prepareMs}ms, ensureNav=${ensureNavMs}ms, '
+        'probe=${probeMs}ms, hydrate=${hydrateMs}ms, insert=${insertMs}ms, '
+        'postL0=${postL0Ms}ms, pin=${pinMs}ms, pkBuild=${pkBuildMs}ms, '
+        'pkUpsert=${pkUpsertMs}ms, cost=${phaseSw.elapsedMilliseconds}ms, at: $at',
+      );
+    }
 
     return NghInsertResult(
       meta: currentMeta,

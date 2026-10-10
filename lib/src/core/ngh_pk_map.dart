@@ -90,15 +90,22 @@ final class NghPkMapEngine {
     required NghPkMapBatch batch,
     required List<NghPkMapWrite> entries,
     Set<int> rewrittenIds = const {},
+    Set<int>? dirtyLeafKeys,
   }) async {
     if (entries.isEmpty) return;
     ({NghPagePtr ptr, LeafPage page})? cursor;
+    final filterDirty = dirtyLeafKeys != null && dirtyLeafKeys.isNotEmpty;
+    final filterRewrite = rewrittenIds.isNotEmpty;
+    // Merge only when a filter is present — bare mergeRewritten would keep
+    // every old locator and can duplicate / thrash the maxLocators cap.
+    final mergeOld = filterDirty || filterRewrite;
+
     for (final e in entries) {
       var locs = e.locators;
-      if (locs.length > NghPkLocator.maxLocatorsPerPk) {
-        locs = locs.sublist(0, NghPkLocator.maxLocatorsPerPk);
-      }
       if (batch.meta.pkmapRootIsNull) {
+        if (locs.length > NghPkLocator.maxLocatorsPerPk) {
+          locs = locs.sublist(locs.length - NghPkLocator.maxLocatorsPerPk);
+        }
         await upsert(
           table: table,
           indexUid: indexUid,
@@ -117,19 +124,25 @@ final class NghPkMapEngine {
         e.key,
       );
       if (cursor == null) continue;
-      if (e.mergeRewritten && rewrittenIds.isNotEmpty) {
+      if (mergeOld) {
         final idx = cursor.page.find(e.key);
-        final old = idx == null
-            ? const <NghPkLocator>[]
-            : NghPkLocator.decodeList(cursor.page.values[idx]);
-        final merged = <NghPkLocator>[
-          for (final l in old)
-            if (!rewrittenIds.contains(l.centroidId)) l,
-          ...locs,
-        ];
-        locs = merged.length > NghPkLocator.maxLocatorsPerPk
-            ? merged.sublist(0, NghPkLocator.maxLocatorsPerPk)
-            : merged;
+        if (idx != null) {
+          final old = NghPkLocator.decodeList(cursor.page.values[idx]);
+          final merged = <NghPkLocator>[
+            for (final l in old)
+              if ((!filterDirty ||
+                      !dirtyLeafKeys.contains(
+                          (l.partitionNo << 32) | (l.pageNo & 0xFFFFFFFF))) &&
+                  (!filterRewrite || !rewrittenIds.contains(l.centroidId)))
+                l,
+            ...locs,
+          ];
+          locs = merged;
+        }
+      }
+      if (locs.length > NghPkLocator.maxLocatorsPerPk) {
+        // Prefer newest locators (tail) so dual/reinsert homes are kept.
+        locs = locs.sublist(locs.length - NghPkLocator.maxLocatorsPerPk);
       }
       cursor.page.upsert(e.key, NghPkLocator.encodeList(locs));
       batch.dirty[cursor.ptr] = NghPkMapDirtyPage.leaf(cursor.page);

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:convert';
 import 'dart:io' if (dart.library.html) '../interface/io_stub.dart';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:path/path.dart' as p;
@@ -614,24 +615,75 @@ class FileStorageImpl implements StorageInterface {
 
         final results = List<Uint8List>.filled(ranges.length, Uint8List(0),
             growable: false);
+        final validSpans = <_ReadSpan>[];
         for (int i = 0; i < ranges.length; i++) {
           final r = ranges[i];
-          final start = r.offset;
-          final length = r.length;
-          if (start < 0 || length <= 0) continue;
-          if (fileSize != null && start + length > fileSize) {
+          if (r.offset >= 0 && r.length > 0) {
+            validSpans
+                .add(_ReadSpan(offset: r.offset, length: r.length, order: i));
+          }
+        }
+        if (validSpans.isEmpty) return results;
+
+        validSpans.sort((a, b) {
+          final c = a.offset.compareTo(b.offset);
+          return c != 0 ? c : a.order.compareTo(b.order);
+        });
+
+        // Maximum size of a single coalesced read buffer (4MB)
+        const maxCoalescedBytes = 4 * 1024 * 1024;
+
+        Future<void> dispatchChunk(
+            int start, int end, List<_ReadSpan> spans) async {
+          if (fileSize != null && end > fileSize!) {
             try {
               fileSize = await raf.length();
-              _fileLengths[normalized] = fileSize;
+              final curSize = fileSize;
+              if (curSize != null) {
+                _fileLengths[normalized] = curSize;
+              }
             } catch (_) {}
           }
-          if (start >= fileSize!) continue;
-          final readLen =
-              (start + length > fileSize) ? fileSize - start : length;
-          if (readLen <= 0) continue;
+          final curSize = fileSize;
+          if (curSize == null || start >= curSize) return;
+          final readLen = (end > curSize) ? curSize - start : end - start;
+          if (readLen <= 0) return;
+
           await raf.setPosition(start);
-          results[i] = await raf.read(readLen);
+          final chunkBytes = await raf.read(readLen);
+
+          for (final s in spans) {
+            final relStart = s.offset - start;
+            if (relStart >= chunkBytes.length) continue;
+            final avail = chunkBytes.length - relStart;
+            final takeLen = (s.length > avail) ? avail : s.length;
+            if (takeLen <= 0) continue;
+            results[s.order] =
+                Uint8List.sublistView(chunkBytes, relStart, relStart + takeLen);
+          }
         }
+
+        var chunkStart = validSpans[0].offset;
+        var chunkEnd = validSpans[0].offset + validSpans[0].length;
+        var chunkSpans = <_ReadSpan>[validSpans[0]];
+
+        for (int i = 1; i < validSpans.length; i++) {
+          final s = validSpans[i];
+          final sEnd = s.offset + s.length;
+          if (s.offset <= chunkEnd &&
+              (max(chunkEnd, sEnd) - chunkStart) <= maxCoalescedBytes) {
+            if (sEnd > chunkEnd) {
+              chunkEnd = sEnd;
+            }
+            chunkSpans.add(s);
+          } else {
+            await dispatchChunk(chunkStart, chunkEnd, chunkSpans);
+            chunkStart = s.offset;
+            chunkEnd = sEnd;
+            chunkSpans = [s];
+          }
+        }
+        await dispatchChunk(chunkStart, chunkEnd, chunkSpans);
         return results;
       });
     } catch (e) {
@@ -728,20 +780,59 @@ class FileStorageImpl implements StorageInterface {
           }
           int currentPos = -1;
           int maxEnd = cachedLen;
-          for (final s in items) {
-            final data = s.bytes;
-            if (data.isEmpty) {
+          const maxCoalescedWriteBytes = 4 * 1024 * 1024;
+          int i = 0;
+          while (i < items.length) {
+            final first = items[i];
+            if (first.bytes.isEmpty) {
+              i++;
               continue;
             }
-            if (currentPos != s.offset) {
-              await raf.setPosition(s.offset);
-              currentPos = s.offset;
+            int j = i + 1;
+            int totalBytes = first.bytes.length;
+            int lastOffsetEnd = first.offset + first.bytes.length;
+            while (j < items.length) {
+              final next = items[j];
+              if (next.bytes.isEmpty) {
+                j++;
+                continue;
+              }
+              if (next.offset == lastOffsetEnd &&
+                  totalBytes + next.bytes.length <= maxCoalescedWriteBytes) {
+                totalBytes += next.bytes.length;
+                lastOffsetEnd = next.offset + next.bytes.length;
+                j++;
+              } else {
+                break;
+              }
             }
-            await raf.writeFrom(data);
-            currentPos += data.length;
+
+            if (currentPos != first.offset) {
+              await raf.setPosition(first.offset);
+              currentPos = first.offset;
+            }
+
+            if (j == i + 1) {
+              await raf.writeFrom(first.bytes);
+              currentPos += first.bytes.length;
+            } else {
+              final merged = Uint8List(totalBytes);
+              var off = 0;
+              for (int k = i; k < j; k++) {
+                final b = items[k].bytes;
+                if (b.isNotEmpty) {
+                  merged.setRange(off, off + b.length, b);
+                  off += b.length;
+                }
+              }
+              await raf.writeFrom(merged);
+              currentPos += totalBytes;
+            }
+
             if (currentPos > maxEnd) {
               maxEnd = currentPos;
             }
+            i = j;
           }
           if (flush) {
             await raf.flush();
@@ -1542,6 +1633,14 @@ class FileStorageImpl implements StorageInterface {
     );
     return DbException([status]);
   }
+}
+
+final class _ReadSpan {
+  final int offset;
+  final int length;
+  final int order;
+  const _ReadSpan(
+      {required this.offset, required this.length, required this.order});
 }
 
 final class _WriteSpan {

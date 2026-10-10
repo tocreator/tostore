@@ -392,9 +392,13 @@ final class NghPartitionManager {
           .getNghLeafPartitionPathByContext(table, indexUid, part);
       final chunkPages = max(1, _maxPartitionIoChunkBytes ~/ max(pageSize, 1));
 
-      for (int start = 0; start < missingPacked.length; start += chunkPages) {
-        final end = min(start + chunkPages, missingPacked.length);
-        final slice = missingPacked.sublist(start, end);
+      final uniquePacked = missingPacked.toSet().toList(growable: false);
+      uniquePacked.sort((a, b) =>
+          NghPagePtr.unpackRef(a).$2.compareTo(NghPagePtr.unpackRef(b).$2));
+
+      for (int start = 0; start < uniquePacked.length; start += chunkPages) {
+        final end = min(start + chunkPages, uniquePacked.length);
+        final slice = uniquePacked.sublist(start, end);
         final ranges = <ByteReadRange>[
           for (final packed in slice)
             ByteReadRange(
@@ -1296,20 +1300,46 @@ final class NghPartitionManager {
       ));
     }
 
-    Future<void> stageBuilt({
+    // Pre-ensure partition paths/directories for all touched categories
+    final allPartitionsToEnsure = <(NghDataCategory, int)>{};
+    for (final ptr in dirtyNavPages.keys) {
+      allPartitionsToEnsure.add((NghDataCategory.nav, ptr.partitionNo));
+    }
+    for (final ptr in dirtyNavBTreePages.keys) {
+      allPartitionsToEnsure.add((NghDataCategory.nav, ptr.partitionNo));
+    }
+    if (dirtyNavRootPage != null) {
+      allPartitionsToEnsure
+          .add((NghDataCategory.nav, dirtyNavRootPage.ptr.partitionNo));
+    }
+    for (final ptr in dirtyLeafPages.keys) {
+      allPartitionsToEnsure.add((NghDataCategory.leaf, ptr.partitionNo));
+    }
+    for (final ptr in dirtyPkmapPages.keys) {
+      allPartitionsToEnsure.add((NghDataCategory.pkmap, ptr.partitionNo));
+    }
+    for (final (cat, pNo) in allPartitionsToEnsure) {
+      final statsMap = (cat == NghDataCategory.leaf)
+          ? leafStats
+          : (cat == NghDataCategory.nav ? navStats : pkmapStats);
+      final stats = getStats(statsMap, pNo);
+      stats.path ??= _partitionPath(cat, table, indexUid, pNo);
+      if (!stats.dirEnsured) {
+        await _dataStore.storage.ensureDirectoryExists(p.dirname(stats.path!));
+        stats.dirEnsured = true;
+      }
+    }
+
+    void stageBuiltSync({
       required NghDataCategory category,
       required Map<int, _NghPartitionStats> statsMap,
       required NghPagePtr ptr,
       required Uint8List pageBytes,
       PageRedoTreeKind? redoKind,
       Uint8List? redoPayload,
-    }) async {
+    }) {
       final stats = getStats(statsMap, ptr.partitionNo);
       stats.path ??= _partitionPath(category, table, indexUid, ptr.partitionNo);
-      if (!stats.dirEnsured) {
-        await _dataStore.storage.ensureDirectoryExists(p.dirname(stats.path!));
-        stats.dirEnsured = true;
-      }
       stageWrite(stats.path!, ptr.pageNo * sizeOf(category), pageBytes);
       stats.maxPageNoWritten = max(stats.maxPageNoWritten, ptr.pageNo);
       if (redoKind != null && recordPageRedo) {
@@ -1324,7 +1354,7 @@ final class NghPartitionManager {
       }
     }
 
-    Future<void> stageTyped({
+    void stageTypedSync({
       required NghDataCategory category,
       required Map<int, _NghPartitionStats> statsMap,
       required NghPagePtr ptr,
@@ -1332,8 +1362,8 @@ final class NghPartitionManager {
       required Uint8List payload,
       PageRedoTreeKind? redoKind,
       Uint8List? redoPayload,
-    }) async {
-      await stageBuilt(
+    }) {
+      stageBuiltSync(
         category: category,
         statsMap: statsMap,
         ptr: ptr,
@@ -1390,7 +1420,7 @@ final class NghPartitionManager {
       final y0 = yc.maybeYield();
       if (y0 != null) await y0;
       final leafPage = entry.value;
-      await stageTyped(
+      stageTypedSync(
         category: NghDataCategory.leaf,
         statsMap: leafStats,
         ptr: entry.key,
@@ -1398,8 +1428,9 @@ final class NghPartitionManager {
         payload: leafPage.encodePayload(),
         // dims≤64: full page image. dims>64: structure+PK (rebuild from table).
         redoKind: PageRedoTreeKind.ngh,
-        redoPayload:
-            usePkLeafRedo ? leafPage.encodePkStructureRedoPayload() : null,
+        redoPayload: (recordPageRedo && usePkLeafRedo)
+            ? leafPage.encodePkStructureRedoPayload()
+            : null,
       );
       // Do not park dirty leaves in the I/O fill cache. Search-hot residency
       // is NghGraphEngine._btreeLeafCache (pin at insert end / promote).
@@ -1409,7 +1440,7 @@ final class NghPartitionManager {
     for (final item in navBuilt) {
       final y1 = yc.maybeYield();
       if (y1 != null) await y1;
-      await stageBuilt(
+      stageBuiltSync(
         category: NghDataCategory.nav,
         statsMap: navStats,
         ptr: item.ptr,
@@ -1425,7 +1456,7 @@ final class NghPartitionManager {
     for (final entry in dirtyPkmapPages.entries) {
       final y3 = yc.maybeYield();
       if (y3 != null) await y3;
-      await stageTyped(
+      stageTypedSync(
         category: NghDataCategory.pkmap,
         statsMap: pkmapStats,
         ptr: entry.key,

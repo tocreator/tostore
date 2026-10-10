@@ -325,6 +325,9 @@ final class NghLeafPage {
   /// Live (non-tombstone) slots parallel to [_search48Simd] rows.
   List<NghLeafSlot>? _searchLiveSlots;
 
+  /// Cached live slot count; null = recompute. Kept incremental on add/delete.
+  int? _liveCount;
+
   NghLeafPage({
     required this.centroidId,
     NghPageId? nextLeafPage,
@@ -349,7 +352,8 @@ final class NghLeafPage {
       .._wideCache = false
       .._wideNextCache = false
       .._payloadCache = 12
-      .._sum48 = Float32List(48);
+      .._sum48 = Float32List(48)
+      .._liveCount = 0;
   }
 
   /// Drop layout + centroid-sum caches (call after raw [slots] mutation).
@@ -358,6 +362,7 @@ final class NghLeafPage {
     _wideNextCache = null;
     _payloadCache = null;
     _sum48 = null;
+    _liveCount = null;
     _clearSearch48Pack();
   }
 
@@ -374,6 +379,8 @@ final class NghLeafPage {
   void markSlotDeleted(NghLeafSlot slot) {
     if ((slot.flags & NghLeafSlot.flagDeleted) != 0) return;
     slot.flags |= NghLeafSlot.flagDeleted;
+    final live = _liveCount;
+    if (live != null && live > 0) _liveCount = live - 1;
     _clearSearch48Pack();
     _sum48 = null;
   }
@@ -452,6 +459,10 @@ final class NghLeafPage {
           dimensions;
     }
     _addToSum48(slot);
+    if ((slot.flags & NghLeafSlot.flagDeleted) == 0) {
+      final live = _liveCount;
+      _liveCount = live == null ? null : live + 1;
+    }
     _clearSearch48Pack();
   }
 
@@ -466,6 +477,11 @@ final class NghLeafPage {
       for (int d = 0; d < 48; d++) {
         sum[d] -= low[d];
       }
+    }
+    if (_liveCount != null &&
+        (last.flags & NghLeafSlot.flagDeleted) == 0 &&
+        _liveCount! > 0) {
+      _liveCount = _liveCount! - 1;
     }
     _wideCache = null;
     _payloadCache = null;
@@ -489,6 +505,7 @@ final class NghLeafPage {
     final wideNext = needsWideNext;
     var payload = headerBytes(wideNext: wideNext);
     final sum = Float32List(48);
+    var live = 0;
     for (final s in slots) {
       if (s.nodeId > maxCompactNodeId) wide = true;
       final pkLen = _slotPkLen(s);
@@ -496,6 +513,7 @@ final class NghLeafPage {
       // accumulating compact first then adding upgrade if wide.
       payload += slotFixedHeaderBytes(wideNodeIds: false) + pkLen + dimensions;
       if ((s.flags & NghLeafSlot.flagDeleted) != 0) continue;
+      live++;
       final low = s.getLow48D(48);
       for (int d = 0; d < 48; d++) {
         sum[d] += low[d];
@@ -505,6 +523,7 @@ final class NghLeafPage {
     _wideCache = wide;
     _payloadCache = payload;
     _sum48 = sum;
+    _liveCount = live;
     _clearSearch48Pack();
   }
 
@@ -532,11 +551,13 @@ final class NghLeafPage {
   }
 
   int get _liveSlotCount {
+    final cached = _liveCount;
+    if (cached != null) return cached;
     var n = 0;
     for (final s in slots) {
       if ((s.flags & NghLeafSlot.flagDeleted) == 0) n++;
     }
-    return n;
+    return _liveCount = n;
   }
 
   /// Live (non-tombstone) slot count.
@@ -864,15 +885,10 @@ final class NghLeafPage {
         )
       ]);
     }
-    final pks = List<Uint8List>.generate(
-      slotCount,
-      (i) => slots[i].primaryKeyUtf8,
-      growable: false,
-    );
-    var total =
-        4 + 4 + 4 + 4 + 2 + 2; // magic+centroid+nextPart+nextPage+dims+count
-    for (final pk in pks) {
-      total += 8 + 1 + 2 + pk.length; // nodeId + flags + pkLen + pk
+    var total = 20; // magic+centroid+nextPart+nextPage+dims+count
+    for (int i = 0; i < slotCount; i++) {
+      total +=
+          11 + slots[i].primaryKeyUtf8.length; // nodeId + flags + pkLen + pk
     }
     final buf = Uint8List(total);
     final bd = ByteData.sublistView(buf);
@@ -885,7 +901,7 @@ final class NghLeafPage {
     var off = 20;
     for (int i = 0; i < slotCount; i++) {
       final s = slots[i];
-      final pk = pks[i];
+      final pk = s.primaryKeyUtf8;
       PlatformByteData.setUint64(bd, off, s.nodeId, Endian.little);
       buf[off + 8] = s.flags;
       bd.setUint16(off + 9, pk.length, Endian.little);
