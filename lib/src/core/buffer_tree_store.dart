@@ -284,6 +284,25 @@ class BufferTreeStore {
     return pendingRecordCache.hasGroupEntries(tableUid);
   }
 
+  /// TableUids that currently have pending record rows (O(pending tables)).
+  ///
+  /// Uses [TreeCache.listNonEmptyRootKeys], which requires each table group to
+  /// still hold child PK payloads — not merely that the TableUid key was ever
+  /// inserted into the group map.
+  List<TableUid> listPendingTableUids() {
+    final keys = pendingRecordCache.listNonEmptyRootKeys();
+    if (keys.isEmpty) return const <TableUid>[];
+    final out = <TableUid>[];
+    for (final k in keys) {
+      if (k is TableUid) {
+        if (k.isNotEmpty) out.add(k);
+      } else if (k is String && k.isNotEmpty) {
+        out.add(TableUid(k));
+      }
+    }
+    return out;
+  }
+
   // -------------------- PK overlay apply --------------------
 
   /// Apply a buffer operation into pending or txn record/index trees.

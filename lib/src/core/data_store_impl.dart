@@ -1780,6 +1780,38 @@ class DataStoreImpl {
     return tableMetaManager?.getTableContextByNameSync(tableName);
   }
 
+  /// Write admission under CRITICAL resources.
+  ///
+  /// Hot path: returns `null` synchronously (no Future) when not critical /
+  /// system op — callers must not await the null case.
+  /// Slow path: returns a Future that completes with `null` (admitted) or an
+  /// error [DbResult] (disk critical, memory mode, or wait timeout).
+  Future<DbResult?>? _guardWriteAdmission(String operationLabel) {
+    final rm = _resourceManager;
+    if (rm == null || !rm.isWriteBlocked) return null;
+    if (TransactionContext.isSystemOperation()) return null;
+
+    return () async {
+      final isMemoryMode = _config?.persistenceMode == PersistenceMode.memory;
+      final admitted = await rm.awaitWriteAdmission(
+        isMemoryMode: isMemoryMode,
+        onKickRecovery: () async {
+          parallelJournalManager.scheduleFlushIfNeeded();
+        },
+      );
+      if (admitted) return null;
+
+      final type = rm.isDiskCritical
+          ? ResultType.sysIoDiskFull
+          : ResultType.sysResourceExhausted;
+      return DbResult.error(
+        type: type,
+        message:
+            '$operationLabel operation blocked: System resources are critically low.',
+      );
+    }();
+  }
+
   /// Insert data complete process
   ///
   /// [retryOnPkConflict] is an internal flag to avoid infinite recursion when
@@ -1796,13 +1828,10 @@ class DataStoreImpl {
       await ensureInitialized();
     }
 
-    // Emergency Resource Check
-    if (_resourceManager?.isWriteBlocked ?? false) {
-      return finish(DbResult.error(
-        type: ResultType.sysResourceExhausted,
-        message:
-            'Insert operation blocked: System resources are critically low.',
-      ));
+    final admission = _guardWriteAdmission('Insert');
+    if (admission != null) {
+      final blocked = await admission;
+      if (blocked != null) return finish(blocked);
     }
 
     // Capture transaction id once for performance and consistent visibility rules
@@ -2243,13 +2272,10 @@ class DataStoreImpl {
       await ensureInitialized();
     }
 
-    // Emergency Resource Check
-    if (_resourceManager?.isWriteBlocked ?? false) {
-      return finish(DbResult.error(
-        type: ResultType.sysResourceExhausted,
-        message:
-            'Upsert operation blocked: System resources are critically low.',
-      ));
+    final admission = _guardWriteAdmission('Upsert');
+    if (admission != null) {
+      final blocked = await admission;
+      if (blocked != null) return finish(blocked);
     }
 
     return await batchUpsert(tableName, [data], durability: durability);
@@ -2357,13 +2383,10 @@ class DataStoreImpl {
       await ensureInitialized();
     }
 
-    // Emergency Resource Check
-    if (_resourceManager?.isWriteBlocked ?? false) {
-      return finish(DbResult.error(
-        type: ResultType.sysResourceExhausted,
-        message:
-            'update operation blocked: System resources are critically low.',
-      ));
+    final admission = _guardWriteAdmission('Update');
+    if (admission != null) {
+      final blocked = await admission;
+      if (blocked != null) return finish(blocked);
     }
 
     // Capture transaction id once
@@ -3801,13 +3824,10 @@ class DataStoreImpl {
       await ensureInitialized();
     }
 
-    // Emergency Resource Check
-    if (_resourceManager?.isWriteBlocked ?? false) {
-      return finish(DbResult.error(
-        type: ResultType.sysResourceExhausted,
-        message:
-            'Delete operation blocked: System resources are critically low.',
-      ));
+    final admission = _guardWriteAdmission('Delete');
+    if (admission != null) {
+      final blocked = await admission;
+      if (blocked != null) return finish(blocked);
     }
 
     // check if condition is empty, avoid accidental deletion of all records
@@ -4789,13 +4809,10 @@ class DataStoreImpl {
       await ensureInitialized();
     }
 
-    // Emergency Resource Check
-    if (_resourceManager?.isWriteBlocked ?? false) {
-      return finish(DbResult.error(
-        type: ResultType.sysResourceExhausted,
-        message:
-            'Insert operation blocked: System resources are critically low.',
-      ));
+    final admission = _guardWriteAdmission('Insert');
+    if (admission != null) {
+      final blocked = await admission;
+      if (blocked != null) return finish(blocked);
     }
 
     if (records.isEmpty) {
@@ -4935,7 +4952,7 @@ class DataStoreImpl {
 
       try {
         final int bufferBatchSize =
-            (isPurePkCandidate || !hasForeignKeys) ? 100000 : 50000;
+            (isPurePkCandidate || !hasForeignKeys) ? 2000 : 1000;
         int start = 0;
         final batchTimestamp = DateTime.now();
         final String sharedNowIso = batchTimestamp.toIso8601String();
@@ -5967,12 +5984,10 @@ class DataStoreImpl {
       await ensureInitialized();
     }
 
-    if (_resourceManager?.isWriteBlocked ?? false) {
-      return finish(DbResult.error(
-        type: ResultType.sysResourceExhausted,
-        message:
-            'upsert operation blocked: System resources are critically low.',
-      ));
+    final admission = _guardWriteAdmission('Upsert');
+    if (admission != null) {
+      final blocked = await admission;
+      if (blocked != null) return finish(blocked);
     }
 
     if (records.isEmpty) {
@@ -6256,13 +6271,10 @@ class DataStoreImpl {
       await ensureInitialized();
     }
 
-    // Emergency Resource Check
-    if (_resourceManager?.isWriteBlocked ?? false) {
-      return finish(DbResult.error(
-        type: ResultType.sysResourceExhausted,
-        message:
-            'batch update operation blocked: System resources are critically low.',
-      ));
+    final admission = _guardWriteAdmission('Batch update');
+    if (admission != null) {
+      final blocked = await admission;
+      if (blocked != null) return finish(blocked);
     }
 
     if (records.isEmpty) {

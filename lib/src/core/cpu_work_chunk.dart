@@ -84,7 +84,7 @@ class EngineCpuChunk {
       final int end = start + cs < length ? start + cs : length;
       process(start, end);
       if (shouldYield && end < length) {
-        await Future<void>.delayed(Duration.zero);
+        await Future<void>.delayed(YieldController.eventLoopYieldDelay);
       }
     }
   }
@@ -106,7 +106,7 @@ class EngineCpuChunk {
       final int end = start + cs < length ? start + cs : length;
       await process(start, end);
       if (shouldYield && end < length) {
-        await Future<void>.delayed(Duration.zero);
+        await Future<void>.delayed(YieldController.eventLoopYieldDelay);
       }
     }
   }
@@ -148,7 +148,7 @@ class EngineCpuChunk {
       process(item);
       n++;
       if (shouldYield && n % cs == 0) {
-        await Future<void>.delayed(Duration.zero);
+        await Future<void>.delayed(YieldController.eventLoopYieldDelay);
       }
     }
   }
@@ -185,7 +185,7 @@ class EngineCpuChunk {
         list.setRange(start, end, chunk);
       }
       if (end < n) {
-        await Future<void>.delayed(Duration.zero);
+        await Future<void>.delayed(YieldController.eventLoopYieldDelay);
       }
     }
 
@@ -199,7 +199,7 @@ class EngineCpuChunk {
         final int mid = math.min(left + width, n);
         final int right = math.min(left + 2 * width, n);
         _mergeSortedRuns(src, dst, left, mid, right, compare);
-        await Future<void>.delayed(Duration.zero);
+        await Future<void>.delayed(YieldController.eventLoopYieldDelay);
       }
       resultInList = !resultInList;
     }

@@ -43,6 +43,10 @@ class TableMetaManager {
   final Map<TableUid, _IndexListCacheEntry> _indexListCache =
       <TableUid, _IndexListCacheEntry>{};
 
+  /// Tables whose hot schema currently has at least one vector index.
+  /// Used for O(1) [hasAnyVectorIndex] (flush batch sizing); not a full scan.
+  final Set<TableUid> _tablesWithVectorIndex = <TableUid>{};
+
   /// Per-table TreeCache matcher registry derived from hot [TableSchema].
   final Map<TableUid, TableTreeMatcherEntry> _treeMatcherCache =
       <TableUid, TableTreeMatcherEntry>{};
@@ -325,6 +329,7 @@ class TableMetaManager {
     _ensureTableSchemaCache().put(tableUid, schema);
     final indexEntry = _buildIndexListCache(schema);
     _indexListCache[tableUid] = indexEntry;
+    _syncTablesWithVectorIndex(tableUid, indexEntry);
     _treeMatcherCache[tableUid] = buildTableTreeMatcherEntry(
       schema,
       indexes: indexEntry.allIndexes,
@@ -332,6 +337,31 @@ class TableMetaManager {
     _storageFieldStructCache.remove(tableUid);
     if (schema.schemaVersion != null) {
       _dataStore.migrationManager?.registerSchemaVersion(schema);
+    }
+  }
+
+  /// Whether any cached user/system schema currently has a vector index.
+  ///
+  /// O(1). Gate only — flush sizing must still check pending tables via
+  /// [anyOfTablesHasVectorIndex]. May be briefly false until the first
+  /// vector table schema is cached after open.
+  bool get hasAnyVectorIndex => _tablesWithVectorIndex.isNotEmpty;
+
+  /// Whether any of [tableUids] has a vector index (O(n) set lookups).
+  bool anyOfTablesHasVectorIndex(Iterable<TableUid> tableUids) {
+    if (_tablesWithVectorIndex.isEmpty) return false;
+    for (final uid in tableUids) {
+      if (_tablesWithVectorIndex.contains(uid)) return true;
+    }
+    return false;
+  }
+
+  void _syncTablesWithVectorIndex(
+      TableUid tableUid, _IndexListCacheEntry entry) {
+    if (entry.vectorIndexes.isNotEmpty) {
+      _tablesWithVectorIndex.add(tableUid);
+    } else {
+      _tablesWithVectorIndex.remove(tableUid);
     }
   }
 
@@ -498,6 +528,7 @@ class TableMetaManager {
     _tableMetaCache?.remove(tableUid);
     _tableContextCache.remove(tableUid);
     _indexListCache.remove(tableUid);
+    _tablesWithVectorIndex.remove(tableUid);
     _treeMatcherCache.remove(tableUid);
     _tableFieldLayoutCache.remove(tableUid);
     _storageFieldStructCache.remove(tableUid);
@@ -630,6 +661,7 @@ class TableMetaManager {
     _nameByUid.remove(uid);
     _globalTableUids.remove(uid);
     _tableContextCache.remove(uid);
+    _tablesWithVectorIndex.remove(uid);
   }
 
   /// Clear all in-memory caches and reset state.
@@ -644,6 +676,7 @@ class TableMetaManager {
     _tableMetaCache?.clear();
     _tableContextCache.clear();
     _indexListCache.clear();
+    _tablesWithVectorIndex.clear();
     _treeMatcherCache.clear();
     _tableFieldLayoutCache.clear();
     _storageFieldStructCache.clear();
@@ -678,6 +711,7 @@ class TableMetaManager {
     _globalDirCounts.clear();
     _nonGlobalDirCounts.clear();
     _indexListCache.clear();
+    _tablesWithVectorIndex.clear();
     _treeMatcherCache.clear();
     _tableFieldLayoutCache.clear();
     _storageFieldStructCache.clear();
@@ -700,6 +734,7 @@ class TableMetaManager {
     _globalDirCounts.clear();
     _nonGlobalDirCounts.clear();
     _indexListCache.clear();
+    _tablesWithVectorIndex.clear();
     _treeMatcherCache.clear();
     _tableFieldLayoutCache.clear();
     _storageFieldStructCache.clear();
@@ -1135,6 +1170,7 @@ class TableMetaManager {
       if (existing != null) return existing;
       final entry = _buildIndexListCache(schema);
       _indexListCache[cacheKey] = entry;
+      _syncTablesWithVectorIndex(cacheKey, entry);
       return entry;
     }
     return _buildIndexListCache(schema);

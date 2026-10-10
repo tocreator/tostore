@@ -14,6 +14,8 @@ import '../model/query_result.dart';
 import '../model/table_context.dart';
 import '../model/table_identity.dart';
 import '../model/table_schema.dart';
+import '../upgrades/legacy_ngh/legacy_ngh_io.dart';
+import '../upgrades/legacy_ngh/legacy_ngh_search.dart';
 import 'data_store_impl.dart';
 import 'ngh_graph_engine.dart';
 import 'ngh_page.dart';
@@ -23,12 +25,40 @@ import 'vector_cache.dart';
 import 'vector_quantizer.dart';
 import 'workload_scheduler.dart';
 import 'yield_controller.dart';
-import '../upgrades/legacy_ngh/legacy_ngh_io.dart';
-import '../upgrades/legacy_ngh/legacy_ngh_search.dart';
 
 /// Manages all NGH vector indexes for the data store.
 class VectorIndexManager {
   final DataStoreImpl _dataStore;
+
+  /// Soft ceiling on leaf page-redo bytes staged in one apply chunk.
+  static const int _vectorApplyTargetLeafRedoBytes = 32 * 1024 * 1024;
+
+  /// Floor/ceiling on vectors per insertBatch/deleteBatch + writeChanges.
+  static const int _vectorApplyChunkMin = 2048;
+  static const int _vectorApplyChunkMax = 16384;
+
+  /// Vectors/PKs per apply cycle from leaf page size × slots/page.
+  ///
+  /// Caps dirty-leaf redo ≈ [_vectorApplyTargetLeafRedoBytes], then
+  /// `chunk ≈ maxDirtyLeaves * slotsPerPage`. Higher-D (larger pages, fewer
+  /// slots) naturally yields smaller chunks; too-small chunks are floored so
+  /// the same pages are not rewritten every few hundred vectors.
+  int _vectorApplyChunkSizeForMeta(NghIndexMeta meta) {
+    final basePs = _partitionManager.configuredPageSize;
+    final dims = meta.dimensions > 0 ? meta.dimensions : 768;
+    final leafPs = meta.resolvedLeafPageSize(basePs);
+    final pageSize =
+        leafPs > 0 ? leafPs : NghPageSizer.chooseLeafPageSize(dims, basePs);
+    final slots = max(
+      1,
+      NghPageSizer.estimateLeafSlotsPerPage(pageSize, dims),
+    );
+    final maxDirtyLeaves = max(32, _vectorApplyTargetLeafRedoBytes ~/ pageSize);
+    final raw = maxDirtyLeaves * slots;
+    if (raw < _vectorApplyChunkMin) return _vectorApplyChunkMin;
+    if (raw > _vectorApplyChunkMax) return _vectorApplyChunkMax;
+    return raw;
+  }
 
   late final NghPartitionManager _partitionManager;
   late final NghGraphEngine _graphEngine;
@@ -288,43 +318,54 @@ class VectorIndexManager {
         }
         if (deletePks.isNotEmpty) {
           batchDeletes = deletePks.length;
+          final applyChunk = _vectorApplyChunkSizeForMeta(meta);
           Future<void> flushDelete() async {
-            var liveMeta = _vectorCache.getMeta(table, indexUid) ?? meta;
-            final phase = Stopwatch()..start();
-            final result = await _graphEngine.deleteBatch(
-              table: table,
-              indexUid: indexUid,
-              meta: liveMeta,
-              primaryKeys: deletePks,
-            );
-            graphDeleteMs += phase.elapsedMilliseconds;
-            dirtyLeaves += result.dirtyLeafPages.length;
-            dirtyNav += result.dirtyNavPages.length +
-                result.dirtyNavBTreePages.length +
-                (result.dirtyNavRootPage != null ? 1 : 0);
-            dirtyPkmap += result.dirtyPkmapPages.length;
-            meta = result.meta;
-            if (result.unresolvedPks.isNotEmpty) {
-              await _mergePendingDeletes(table, indexUid, result.unresolvedPks);
+            // Chunk so dirty leaf/nav + page-redo peak stays bounded.
+            // Always thread the progressive [meta] across chunks — never prefer
+            // a stale _vectorCache snapshot (would reuse page numbers / corrupt nav).
+            for (var offset = 0;
+                offset < deletePks.length;
+                offset += applyChunk) {
+              final end = min(offset + applyChunk, deletePks.length);
+              final chunkPks = deletePks.sublist(offset, end);
+              final phase = Stopwatch()..start();
+              final result = await _graphEngine.deleteBatch(
+                table: table,
+                indexUid: indexUid,
+                meta: meta,
+                primaryKeys: chunkPks,
+              );
+              graphDeleteMs += phase.elapsedMilliseconds;
+              dirtyLeaves += result.dirtyLeafPages.length;
+              dirtyNav += result.dirtyNavPages.length +
+                  result.dirtyNavBTreePages.length +
+                  (result.dirtyNavRootPage != null ? 1 : 0);
+              dirtyPkmap += result.dirtyPkmapPages.length;
+              meta = result.meta;
+              if (result.unresolvedPks.isNotEmpty) {
+                await _mergePendingDeletes(
+                    table, indexUid, result.unresolvedPks);
+              }
+              phase.reset();
+              phase.start();
+              meta = await _partitionManager.writeChanges(
+                table: table,
+                indexUid: indexUid,
+                meta: meta,
+                dirtyLeafPages: result.dirtyLeafPages,
+                dirtyNavPages: result.dirtyNavPages,
+                dirtyNavBTreePages: result.dirtyNavBTreePages,
+                dirtyNavRootPage: result.dirtyNavRootPage,
+                dirtyPkmapPages: result.dirtyPkmapPages,
+                deleteLegacyNavGraph: result.deleteLegacyNavGraph,
+                vectorsDelta: -result.deletedCount,
+                deletedDelta: result.deletedCount,
+                batchContext: batchContext,
+                concurrency: concurrency,
+              );
+              _vectorCache.putMeta(table, indexUid, meta);
+              persistMs += phase.elapsedMilliseconds;
             }
-            phase.reset();
-            phase.start();
-            meta = await _partitionManager.writeChanges(
-              table: table,
-              indexUid: indexUid,
-              meta: meta,
-              dirtyLeafPages: result.dirtyLeafPages,
-              dirtyNavPages: result.dirtyNavPages,
-              dirtyNavBTreePages: result.dirtyNavBTreePages,
-              dirtyNavRootPage: result.dirtyNavRootPage,
-              dirtyPkmapPages: result.dirtyPkmapPages,
-              deleteLegacyNavGraph: result.deleteLegacyNavGraph,
-              vectorsDelta: -result.deletedCount,
-              deletedDelta: result.deletedCount,
-              batchContext: batchContext,
-              concurrency: concurrency,
-            );
-            persistMs += phase.elapsedMilliseconds;
           }
 
           await flushDelete();
@@ -343,58 +384,69 @@ class VectorIndexManager {
 
         if (vectors.isNotEmpty) {
           batchInserts = vectors.length;
+          final applyChunk = _vectorApplyChunkSizeForMeta(meta);
           Future<void> flushInsert() async {
-            var liveMeta = _vectorCache.getMeta(table, indexUid) ?? meta;
-            final phase = Stopwatch()..start();
-            final insertResult = await _graphEngine.insertBatch(
-              table: table,
-              indexUid: indexUid,
-              meta: liveMeta,
-              vectors: vectors,
-              primaryKeys: pks,
-              yieldBudgetMs: 100,
-            );
-            graphInsertMs += phase.elapsedMilliseconds;
-            dirtyLeaves += insertResult.dirtyLeafPages.length;
-            dirtyNav += insertResult.dirtyNavPages.length +
-                insertResult.dirtyNavBTreePages.length +
-                (insertResult.dirtyNavRootPage != null ? 1 : 0);
-            dirtyPkmap += insertResult.dirtyPkmapPages.length;
-            meta = insertResult.meta;
-            phase.reset();
-            phase.start();
-            meta = await _partitionManager.writeChanges(
-              table: table,
-              indexUid: indexUid,
-              meta: meta,
-              dirtyLeafPages: insertResult.dirtyLeafPages,
-              dirtyNavPages: insertResult.dirtyNavPages,
-              dirtyNavBTreePages: insertResult.dirtyNavBTreePages,
-              dirtyNavRootPage: insertResult.dirtyNavRootPage,
-              dirtyPkmapPages: insertResult.dirtyPkmapPages,
-              deleteLegacyNavGraph: insertResult.deleteLegacyNavGraph,
-              vectorsDelta: insertResult.insertedCount,
-              concurrency: concurrency,
-              batchContext: batchContext,
-            );
-            persistMs += phase.elapsedMilliseconds;
-            await _removePendingDeletes(table, indexUid, pks);
-            if (!_dataStore.shouldAbortBackgroundScan &&
-                (insertResult.dirtyLeafPages.isNotEmpty ||
-                    insertResult.dirtyNavBTreePages.isNotEmpty ||
-                    insertResult.touchedNavPages.isNotEmpty)) {
+            // Chunk apply: each cycle stages/flushes dirty pages then drops them.
+            // Always thread the progressive [meta] across chunks — never prefer
+            // a stale _vectorCache snapshot (would reuse page numbers / corrupt nav).
+            for (var offset = 0;
+                offset < vectors.length;
+                offset += applyChunk) {
+              final end = min(offset + applyChunk, vectors.length);
+              final chunkVectors = vectors.sublist(offset, end);
+              final chunkPks = pks.sublist(offset, end);
+              final phase = Stopwatch()..start();
+              final insertResult = await _graphEngine.insertBatch(
+                table: table,
+                indexUid: indexUid,
+                meta: meta,
+                vectors: chunkVectors,
+                primaryKeys: chunkPks,
+                yieldBudgetMs: 100,
+              );
+              graphInsertMs += phase.elapsedMilliseconds;
+              dirtyLeaves += insertResult.dirtyLeafPages.length;
+              dirtyNav += insertResult.dirtyNavPages.length +
+                  insertResult.dirtyNavBTreePages.length +
+                  (insertResult.dirtyNavRootPage != null ? 1 : 0);
+              dirtyPkmap += insertResult.dirtyPkmapPages.length;
+              meta = insertResult.meta;
               phase.reset();
               phase.start();
-              await _graphEngine.promotePagedLeavesAfterInsert(
+              meta = await _partitionManager.writeChanges(
                 table: table,
                 indexUid: indexUid,
                 meta: meta,
                 dirtyLeafPages: insertResult.dirtyLeafPages,
+                dirtyNavPages: insertResult.dirtyNavPages,
                 dirtyNavBTreePages: insertResult.dirtyNavBTreePages,
-                touchedNavPages: insertResult.touchedNavPages,
-                shouldAbort: () => _dataStore.shouldAbortBackgroundScan,
+                dirtyNavRootPage: insertResult.dirtyNavRootPage,
+                dirtyPkmapPages: insertResult.dirtyPkmapPages,
+                deleteLegacyNavGraph: insertResult.deleteLegacyNavGraph,
+                vectorsDelta: insertResult.insertedCount,
+                concurrency: concurrency,
+                batchContext: batchContext,
               );
-              promoteMs += phase.elapsedMilliseconds;
+              _vectorCache.putMeta(table, indexUid, meta);
+              persistMs += phase.elapsedMilliseconds;
+              await _removePendingDeletes(table, indexUid, chunkPks);
+              if (!_dataStore.shouldAbortBackgroundScan &&
+                  (insertResult.dirtyLeafPages.isNotEmpty ||
+                      insertResult.dirtyNavBTreePages.isNotEmpty ||
+                      insertResult.touchedNavPages.isNotEmpty)) {
+                phase.reset();
+                phase.start();
+                await _graphEngine.promotePagedLeavesAfterInsert(
+                  table: table,
+                  indexUid: indexUid,
+                  meta: meta,
+                  dirtyLeafPages: insertResult.dirtyLeafPages,
+                  dirtyNavBTreePages: insertResult.dirtyNavBTreePages,
+                  touchedNavPages: insertResult.touchedNavPages,
+                  shouldAbort: () => _dataStore.shouldAbortBackgroundScan,
+                );
+                promoteMs += phase.elapsedMilliseconds;
+              }
             }
           }
 
@@ -418,7 +470,7 @@ class VectorIndexManager {
       persistMetaMs += persistMetaPhase.elapsedMilliseconds;
       _vectorCache.putMeta(table, indexUid, meta);
 
-      if (InternalConfig.showLoggerInternalLabel &&
+      if (InternalConfig.showInternalLogs &&
           (batchInserts > 0 ||
               batchDeletes > 0 ||
               persistMs > 0 ||
@@ -498,11 +550,11 @@ class VectorIndexManager {
           if (pk != null && pk.isNotEmpty) deletePks.add(pk);
         }
         if (deletePks.isNotEmpty) {
-          var liveMeta = _vectorCache.getMeta(table, indexUid) ?? meta;
+          // Prefer progressive [meta] — never a possibly-stale cache snapshot.
           final result = await _graphEngine.deleteBatch(
             table: table,
             indexUid: indexUid,
-            meta: liveMeta,
+            meta: meta,
             primaryKeys: deletePks,
           );
           meta = result.meta;
@@ -545,11 +597,11 @@ class VectorIndexManager {
           dimensions: meta.dimensions,
         );
         if (prepared.vectors.isNotEmpty) {
-          var liveMeta = _vectorCache.getMeta(table, indexUid) ?? meta;
+          // Prefer progressive [meta] — never a possibly-stale cache snapshot.
           final insertResult = await _graphEngine.insertBatch(
             table: table,
             indexUid: indexUid,
-            meta: liveMeta,
+            meta: meta,
             vectors: prepared.vectors,
             primaryKeys: prepared.primaryKeys,
             yieldBudgetMs: 100,

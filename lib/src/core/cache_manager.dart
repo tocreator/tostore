@@ -27,10 +27,13 @@ final class CacheManager {
         _dataStore.config.persistenceMode == PersistenceMode.memory;
 
     // Table data (hot records + B+Tree pages)
-    mm.registerCacheEvictionCallback(MemoryQuotaType.tableData, () async {
+    mm.registerCacheEvictionCallback(MemoryQuotaType.tableData, (
+        {int? oneShotNeedFreeMB}) async {
       if (isMemoryMode) return;
-      final recordRatio = mm.getRecordCacheEvictionRatio();
-      final pageRatio = mm.getPageCacheEvictionRatio();
+      final recordRatio =
+          mm.getRecordCacheEvictionRatio(oneShotNeedFreeMB: oneShotNeedFreeMB);
+      final pageRatio =
+          mm.getPageCacheEvictionRatio(oneShotNeedFreeMB: oneShotNeedFreeMB);
       try {
         // Evict record cache first (heap-heavy row maps)
         await _dataStore.tableDataManager
@@ -54,9 +57,11 @@ final class CacheManager {
     });
 
     // Structured B+Tree index pages (not vector ANN — that is vectorIndex).
-    mm.registerCacheEvictionCallback(MemoryQuotaType.indexData, () async {
+    mm.registerCacheEvictionCallback(MemoryQuotaType.indexData, (
+        {int? oneShotNeedFreeMB}) async {
       if (isMemoryMode) return;
-      final ratio = mm.getPageCacheEvictionRatio();
+      final ratio =
+          mm.getPageCacheEvictionRatio(oneShotNeedFreeMB: oneShotNeedFreeMB);
       try {
         // Evict B+Tree page cache conservatively
         await _dataStore.indexTreePartitionManager
@@ -66,9 +71,11 @@ final class CacheManager {
       }
     });
 
-    mm.registerCacheEvictionCallback(MemoryQuotaType.vectorIndex, () async {
+    mm.registerCacheEvictionCallback(MemoryQuotaType.vectorIndex, (
+        {int? oneShotNeedFreeMB}) async {
       if (isMemoryMode) return;
-      final ratio = mm.getEvictionRatio(MemoryQuotaType.vectorIndex);
+      final ratio = mm.getEvictionRatio(MemoryQuotaType.vectorIndex,
+          oneShotNeedFreeMB: oneShotNeedFreeMB);
       try {
         // Evict NGH vector index caches
         await _dataStore.vectorIndexManager?.evictCache(ratio: ratio);
@@ -78,8 +85,10 @@ final class CacheManager {
     });
 
     // Query result cache (QueryExecutor + HotspotCache)
-    mm.registerCacheEvictionCallback(MemoryQuotaType.queryResult, () async {
-      final ratio = mm.getEvictionRatio(MemoryQuotaType.queryResult);
+    mm.registerCacheEvictionCallback(MemoryQuotaType.queryResult, (
+        {int? oneShotNeedFreeMB}) async {
+      final ratio = mm.getEvictionRatio(MemoryQuotaType.queryResult,
+          oneShotNeedFreeMB: oneShotNeedFreeMB);
       try {
         await _dataStore.queryExecutor.evictQueryCache(ratio: ratio);
       } catch (e) {
@@ -88,8 +97,10 @@ final class CacheManager {
     });
 
     // Schema cache (tableMetaManager + HotspotCache)
-    mm.registerCacheEvictionCallback(MemoryQuotaType.schema, () async {
-      final ratio = mm.currentEvictionRatio;
+    mm.registerCacheEvictionCallback(MemoryQuotaType.schema, (
+        {int? oneShotNeedFreeMB}) async {
+      final ratio = mm.getEvictionRatio(MemoryQuotaType.tableData,
+          oneShotNeedFreeMB: oneShotNeedFreeMB);
       try {
         await _dataStore.tableMetaManager?.evictSchemaCache(ratio: ratio);
       } catch (e) {
@@ -98,8 +109,10 @@ final class CacheManager {
     });
 
     // Meta caches (table data meta + index meta)
-    mm.registerCacheEvictionCallback(MemoryQuotaType.meta, () async {
-      final ratio = mm.currentEvictionRatio;
+    mm.registerCacheEvictionCallback(MemoryQuotaType.meta, (
+        {int? oneShotNeedFreeMB}) async {
+      final ratio = mm.getEvictionRatio(MemoryQuotaType.tableData,
+          oneShotNeedFreeMB: oneShotNeedFreeMB);
       try {
         await _dataStore.tableDataManager.evictTableDataMetaCache(ratio: ratio);
       } catch (e) {

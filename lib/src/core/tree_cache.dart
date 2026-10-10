@@ -137,13 +137,53 @@ class TreeCache<T> {
   }
 
   /// Entry count for an exact group key (`key` length == [groupDepth]).
+  ///
+  /// Returns 0 when the group shell exists but has no child payloads (stale
+  /// [entryCount] / pinned empty group after flush eviction).
   int groupEntryCount(dynamic key) {
     final k = _normalizeKey(key);
     if (k.length != groupDepth) return 0;
-    return _getGroupForKey(k, create: false)?.entryCount ?? 0;
+    final g = _getGroupForKey(k, create: false);
+    if (g == null || !g.hasChildData) return 0;
+    return g.entryCount;
   }
 
-  bool hasGroupEntries(dynamic key) => groupEntryCount(key) > 0;
+  bool hasGroupEntries(dynamic key) {
+    final k = _normalizeKey(key);
+    if (k.length != groupDepth) return false;
+    final g = _getGroupForKey(k, create: false);
+    return g != null && g.hasChildData;
+  }
+
+  /// Non-empty top-level group keys (groupDepth=1: one key per group).
+  ///
+  /// A root key remaining in [_groupsRoot] after the first insert is not enough
+  /// — the group shell can outlive its rows (pin / deferred remove). Only keys
+  /// whose group still has child payloads are returned.
+  ///
+  /// Used by buffer pending trees to list tableUids with pending rows without
+  /// scanning the WAL flush queue.
+  List<Object?> listNonEmptyRootKeys() {
+    final out = <Object?>[];
+    if (groupDepth == 1) {
+      for (final e in _groupsRoot.entries) {
+        final v = e.value;
+        if (v is _Group<T> && v.hasChildData) {
+          out.add(e.key);
+        }
+      }
+      return out;
+    }
+    final groups = <_Group<T>>[];
+    _collectGroups(_groupsRoot, depth: 1, out: groups);
+    final seen = <Object?>{};
+    for (final g in groups) {
+      if (!g.hasChildData || g.groupPath.isEmpty) continue;
+      final k = g.groupPath[0];
+      if (seen.add(k)) out.add(k);
+    }
+    return out;
+  }
 
   bool isFullyCached(dynamic keyOrPrefix) {
     final p = _normalizeKey(keyOrPrefix);
@@ -1474,9 +1514,10 @@ class TreeCache<T> {
     if (removeRatio > 1) removeRatio = 1;
     if (_estimatedTotalSizeBytes <= _minByteThreshold) return;
 
-    if (_cleanupLock != null) {
+    // Wait for in-flight cleanup, then run our own pass (do not drop the request).
+    while (_cleanupLock != null) {
       await _cleanupLock;
-      return;
+      if (_estimatedTotalSizeBytes <= _minByteThreshold) return;
     }
     final completer = Completer<void>();
     _cleanupLock = completer.future;
@@ -2026,6 +2067,21 @@ final class _Group<T> {
   bool _hasExact = false;
 
   bool get hasExact => _hasExact;
+
+  /// True when this group still holds at least one live payload.
+  ///
+  /// Prefer this over [entryCount] alone when deciding if a root key is
+  /// "pending": the group node may remain under [_groupsRoot] after children
+  /// were removed (pin / empty shell), while [entryCount] can be stale.
+  bool get hasChildData {
+    if (_hasExact) return true;
+    if (flat.isNotEmpty) return true;
+    final live = flatLive;
+    if (live != null && live.isNotEmpty) return true;
+    final d = deep;
+    if (d != null && d.isNotEmpty) return true;
+    return false;
+  }
 
   /// Single-suffix: `key.length == groupDepth + 1` (none-mode plain [T]).
   final Map<Object?, T> flat = <Object?, T>{};

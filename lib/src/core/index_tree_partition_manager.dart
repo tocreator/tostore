@@ -1769,7 +1769,7 @@ final class IndexTreePartitionManager {
     }
 
     // Log persistence statistics
-    if (InternalConfig.showLoggerInternalLabel && totalDeltas > 0) {
+    if (InternalConfig.showInternalLogs && totalDeltas > 0) {
       final now = DateTime.now();
       final at =
           '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}.${now.millisecond.toString().padLeft(3, '0')}';

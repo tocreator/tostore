@@ -10,8 +10,8 @@ const int schemaMaxPartitionFileSize = 512 * 1024; // 512KB
 
 /// internal configuration
 class InternalConfig {
-  /// whether to show Logger specific label
-  static const bool showLoggerInternalLabel = false;
+  /// Whether to emit engine-internal diagnostic logs (via Logger.debug).
+  static const bool showInternalLogs = false;
 
   /// public label
   static const String publicLabel = 'ToStore';

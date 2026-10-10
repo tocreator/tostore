@@ -1167,7 +1167,14 @@ final class NghPartitionManager {
         dirtyPkmapPages.isEmpty &&
         freeLeafPages.isEmpty &&
         !deleteLegacyNavGraph) {
-      return meta;
+      // Still apply counter deltas (callers may report inserts/deletes with no
+      // dirty pages — must not drop totalVectors / deletedCount).
+      if (vectorsDelta == 0 && deletedDelta == 0) return meta;
+      return meta.copyWith(
+        totalVectors: max(0, meta.totalVectors + vectorsDelta),
+        deletedCount: max(0, meta.deletedCount + deletedDelta),
+        timestamps: meta.timestamps.copyWith(modified: DateTime.now()),
+      );
     }
 
     // Disk leaf/nav writes must land in a pending-batch redo log. Callers
@@ -1581,7 +1588,7 @@ final class NghPartitionManager {
       await deleteLegacyNavBlobIfExists(table, indexUid);
     }
 
-    if (InternalConfig.showLoggerInternalLabel) {
+    if (InternalConfig.showInternalLogs) {
       final now = DateTime.now();
       final at =
           '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}.${now.millisecond.toString().padLeft(3, '0')}';

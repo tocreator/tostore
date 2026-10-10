@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:math' as math;
 
+import '../handler/platform_handler.dart';
+
 /// A utility to prevent UI jank by yielding to the event loop periodically
 /// based on elapsed time rather than iteration count.
 ///
@@ -46,6 +48,16 @@ class YieldController {
   /// Global settings instance
   static final YieldControllerSettings globalSettings =
       YieldControllerSettings();
+
+  /// Delay used by [maybeYield] / engine CPU chunkers when parking the isolate.
+  ///
+  /// On Flutter Windows (merged UI/platform threads), `Duration.zero` can flood
+  /// the Dart task queue so native Win32 messages never run. Task Manager then
+  /// shows Not Responding and collapses the working set to tens of MB while
+  /// Dart still burns CPU. A 1ms timer lets the Windows message pump run.
+  static Duration get eventLoopYieldDelay => PlatformHandler.isWindows
+      ? const Duration(milliseconds: 1)
+      : Duration.zero;
 
   /// The default time budget before yielding (in milliseconds).
   /// Target is 8ms, leaving buffer within a standard 16ms (60fps) or
@@ -141,15 +153,15 @@ class YieldController {
     final elapsed = _stopwatch.elapsedMilliseconds;
 
     if (elapsed >= _budgetMs) {
-      // Budget exceeded: yield to allow UI updates
-      // Recalculate adaptive interval based on this batch's throughput
+      // Budget exceeded: yield to allow UI updates.
+      // Reset *after* the delay -- [Stopwatch.reset] while running zeros
+      // elapsed but keeps ticking. Resetting before the delay would count
+      // parked wait time as CPU and collapse [_currentCheckInterval].
       _updateAdaptiveInterval(elapsed);
-
-      // Reset state for the next batch
-      _stopwatch.reset();
       _iterationsSinceCheck = 0;
-
-      return Future.delayed(Duration.zero);
+      return Future<void>.delayed(eventLoopYieldDelay).then((_) {
+        _stopwatch.reset();
+      });
     } else {
       // Budget not exceeded yet
       if (elapsed > 0) {

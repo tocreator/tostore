@@ -30,15 +30,17 @@ import 'yield_controller.dart';
 //
 // Scale lock (identity recall + tens of billions):
 //   - Insert and search share one router: exact among L0 roots (page-fit,
-//     typically ≤79 on 16KB / ≤256 hard cap), then exact among children of
-//     ONE nav page per hop (fanout ≤64).
+//     ~79 on legacy 16KB / ~158 on 32KB CNRT / ≤256 hard cap), then exact
+//     among children of ONE nav page per hop (fanout ≤64).
 //   - Nav growth is SPLIT + mid promotion + optional L0 far-spawn /
 //     heavy-root-split. One page = one tree node. Never rewrite leaves to
-//     fix routing.
+//     fix routing. Split siblings get 48-D repulsion so search is not left
+//     with near-twin L0 cells (the multi-M insert-batch recall dip).
 //   - Probe cost is O(L0 + hops×64×beam + wantLeaves×slots) — independent of N.
 //     wantLeaves: ~14 / 28 / 44 at depth 1 / 50 / 100; depth>100 continues the
 //     same 50→100 Δlists/Δdepth up to abs ≤256 (escape hatch). NEVER auto-raise
 //     scored leaves with N — that is the recall↔throughput cliff at 1e7+.
+//     Mid beam may widen by at most +2 when top-2 scores are ambiguous.
 //   - searchDepth has no hard max. Anchors: 1→91% (±5), 50→95% (±3 strict),
 //     100→98% (±5; 99% is not the interactive ceiling — too expensive).
 //     depth>100 keeps buying recall budget at the 50→100 rate until abs cap.
@@ -576,14 +578,20 @@ class NghGraphEngine {
   NghGraphEngine(this._partitionManager);
 
   /// Steady-state L0 target after bootstrap (precise routing, cheap exact scan).
-  /// Multi-million corpora need denser L0 than 64 — push toward page-fit so
-  /// interactive wantRoots covers a finer partition (rebuild required).
-  static const int _targetL0Roots = 96;
+  /// Multi-million corpora need denser L0 — push toward page-fit so each root
+  /// holds fewer leaf-nav children and mid beam=8 still covers. Empty indexes
+  /// size nav pages for [NghPageSizer.targetL0RootTableCapacity] (~32KB);
+  /// legacy 16KB stays ~79.
+  static const int _targetL0Roots = NghPageSizer.targetL0RootTableCapacity;
 
   /// L0 / mid / leaf boundary multi-assign ratio (48-D IP).
   /// 0.94 was too tight at 768D/3M: true neighbors often sit just outside
   /// the primary cell and were never dual-homed → depth100 plateau ~93%.
   static const double _boundaryDualRatio = 0.88;
+
+  /// After heavy-root-split, sibling L0 48-D means above this IP are treated as
+  /// near-twins and gently repelled (no leaf rewrite).
+  static const double _l0SiblingNearTwinIp = 0.90;
 
   /// Below this corpus size L0 may still be sparse; grow via far-spawn/split.
   /// Crossing it does NOT freeze L0 — Steady still allows growth to
@@ -600,12 +608,11 @@ class NghGraphEngine {
     if (numRoots >= cap) return 0.0;
     if (numRoots < _targetL0Roots) {
       final kRatio = numRoots / _targetL0Roots;
-      return 0.55 - 0.18 * kRatio; // ~0.55 → ~0.37
+      return 0.58 - 0.16 * kRatio; // ~0.58 → ~0.42
     }
-    // 64 → page-fit: keep a soft far-spawn door (0.40 → ~0.30).
-    // Uses target as the knee even when target > 64.
+    // Target → page-fit: soft far-spawn door (slightly more open than before).
     final t = (numRoots - _targetL0Roots) / max(1, cap - _targetL0Roots);
-    return 0.40 - 0.10 * t.clamp(0.0, 1.0);
+    return 0.42 - 0.08 * t.clamp(0.0, 1.0);
   }
 
   /// Initial L0 count for cold-start / migrate pack — never overfit tiny N to 64.
@@ -820,6 +827,7 @@ class NghGraphEngine {
   /// N floor (knees 4.2 / 5.0 / 5.5) so mid hops at 30k–4M are not starved.
   /// Depth-scaled cap: 5 / 6 / 8 at depth 1 / 50 / 100 so large-N does not
   /// saturate every depth at 8 (searchDepth would collapse). Floor 2.
+  /// depth>100 may raise the cap to 10 (escape hatch) — still not ∝N.
   static int _navBeamWidth({
     required int searchDepth,
     required int wantLeaves,
@@ -846,12 +854,137 @@ class NghGraphEngine {
       depthCap = 5;
     } else if (depth <= 50) {
       depthCap = 6;
-    } else {
+    } else if (depth <= 100) {
       depthCap = 8;
+    } else {
+      depthCap = 8 + min(2, (depth - 100) ~/ 50); // 8→10
     }
     final fromLeaves = max(2, wantLeaves ~/ 3);
     final target = max(fromDepth, max(nFloor, fromLeaves));
     return max(2, min(depthCap, target));
+  }
+
+  /// How many mid children to keep after scoring one hop.
+  /// Widens by at most +2 when top-1/top-2 are ambiguous — not ∝N.
+  static int _navBeamTake({
+    required int beamWidth,
+    required List<({NghPageId child, double score})> midScored,
+  }) {
+    if (midScored.isEmpty) return 0;
+    var take = min(beamWidth, midScored.length);
+    if (take >= 2 && midScored.length > take) {
+      final topGap = midScored[0].score - midScored[1].score;
+      if (topGap < 0.03) {
+        take = min(beamWidth + 2, midScored.length);
+      }
+    }
+    return take;
+  }
+
+  static double _dot48Flat(Float32List a, int ao, Float32List b, int bo) {
+    var s = 0.0;
+    for (int d = 0; d < 48; d++) {
+      s += a[ao + d] * b[bo + d];
+    }
+    return s;
+  }
+
+  /// Blend subtree means toward a far cross-partition pair when the two L0
+  /// cells would otherwise be near-twins (common right after heavy-root-split).
+  static (Float32List left, Float32List right) _l0SiblingCentroids({
+    required List<CentroidBranchEntry> left,
+    required List<CentroidBranchEntry> right,
+    required Float32List leftMean,
+    required Float32List rightMean,
+  }) {
+    final ip = _dot48Flat(leftMean, 0, rightMean, 0);
+    if (ip < _l0SiblingNearTwinIp || left.isEmpty || right.isEmpty) {
+      return (leftMean, rightMean);
+    }
+    var bestIp = 2.0;
+    var bestL = left.first.centroid48D;
+    var bestR = right.first.centroid48D;
+    for (final le in left) {
+      final lc = le.centroid48D;
+      for (final re in right) {
+        final rc = re.centroid48D;
+        final s = _dot48Flat(lc, 0, rc, 0);
+        if (s < bestIp) {
+          bestIp = s;
+          bestL = lc;
+          bestR = rc;
+        }
+      }
+    }
+    final outL = Float32List(48);
+    final outR = Float32List(48);
+    for (int d = 0; d < 48; d++) {
+      outL[d] = 0.55 * leftMean[d] + 0.45 * bestL[d];
+      outR[d] = 0.55 * rightMean[d] + 0.45 * bestR[d];
+    }
+    _normalize48ListInPlace(outL);
+    _normalize48ListInPlace(outR);
+    // Soft repulsion if still too close after the blend.
+    if (_dot48Flat(outL, 0, outR, 0) >= _l0SiblingNearTwinIp) {
+      for (int d = 0; d < 48; d++) {
+        final diff = outL[d] - outR[d];
+        outL[d] += 0.20 * diff;
+        outR[d] -= 0.20 * diff;
+      }
+      _normalize48ListInPlace(outL);
+      _normalize48ListInPlace(outR);
+    }
+    return (outL, outR);
+  }
+
+  static void _normalize48ListInPlace(Float32List v) {
+    var nSq = 0.0;
+    for (int d = 0; d < 48; d++) {
+      nSq += v[d] * v[d];
+    }
+    if (nSq > 1e-12) {
+      final inv = 1.0 / sqrt(nSq);
+      for (int d = 0; d < 48; d++) {
+        v[d] *= inv;
+      }
+    }
+  }
+
+  /// Final pass: gently separate a just-split L0 pair if refresh left them close.
+  static void _repelL0SiblingPair(
+    CentroidBTreeState state,
+    int rootA,
+    int rootB,
+  ) {
+    final n = state.numRootCentroids;
+    if (rootA < 0 || rootB < 0 || rootA >= n || rootB >= n || rootA == rootB) {
+      return;
+    }
+    final flat = state.rootCentroids48Flat;
+    final oa = rootA * 48;
+    final ob = rootB * 48;
+    if (_dot48Flat(flat, oa, flat, ob) < _l0SiblingNearTwinIp) return;
+    final a = Float32List(48);
+    final b = Float32List(48);
+    for (int d = 0; d < 48; d++) {
+      final diff = flat[oa + d] - flat[ob + d];
+      a[d] = flat[oa + d] + 0.25 * diff;
+      b[d] = flat[ob + d] - 0.25 * diff;
+    }
+    // Identical means → zero diff; nudge on a stable axis.
+    var diffSq = 0.0;
+    for (int d = 0; d < 48; d++) {
+      final diff = a[d] - b[d];
+      diffSq += diff * diff;
+    }
+    if (diffSq < 1e-10) {
+      a[0] += 0.15;
+      b[0] -= 0.15;
+    }
+    _normalize48ListInPlace(a);
+    _normalize48ListInPlace(b);
+    state.setRootCentroid48(rootA, a);
+    state.setRootCentroid48(rootB, b);
   }
 
   void _forEachScoredNavEntry({
@@ -1072,7 +1205,7 @@ class NghGraphEngine {
       }
       if (!sawMid) return true;
       midScored.sort((a, b) => b.score.compareTo(a.score));
-      final take = min(beamWidth, midScored.length);
+      final take = _navBeamTake(beamWidth: beamWidth, midScored: midScored);
       frontier = [
         for (int i = 0; i < take; i++) midScored[i].child,
       ];
@@ -1196,7 +1329,7 @@ class NghGraphEngine {
       }
       if (!sawMid) return;
       midScored.sort((a, b) => b.score.compareTo(a.score));
-      final take = min(beamWidth, midScored.length);
+      final take = _navBeamTake(beamWidth: beamWidth, midScored: midScored);
       frontier = [
         for (int i = 0; i < take; i++) midScored[i].child,
       ];
@@ -1700,13 +1833,6 @@ class NghGraphEngine {
       _btreeLeafPut(tableUid, indexUid, pageId, shaped);
     }
 
-    final key = _cacheKey(tableUid, indexUid);
-    final needWarm = !_warmedSearchIndexes.contains(key);
-    if ((needWarm || dirtyLeafPages.length >= 64) &&
-        !(shouldAbort?.call() ?? false)) {
-      _warmedSearchIndexes.add(key);
-      await warmSearchPath(table: table, indexUid: indexUid, meta: meta);
-    }
   }
 
   /// Diagnostic: how many leaves are inventored vs resident in leaf cache.
@@ -5026,9 +5152,9 @@ class NghGraphEngine {
     }
 
     /// Split heaviest L0 firstInternal into two L0 roots (local nav only).
-    /// Returns true when a split was applied.
-    bool tryHeavyRootSplitOnce() {
-      if (!state!.canGrowRoot || state.numRootCentroids <= 0) return false;
+    /// Returns the (leftRoot, rightRoot) pair when a split was applied.
+    (int, int)? tryHeavyRootSplitOnce() {
+      if (!state!.canGrowRoot || state.numRootCentroids <= 0) return null;
       var bestRoot = -1;
       var bestWeight = 0;
       var secondWeight = 0;
@@ -5054,20 +5180,22 @@ class NghGraphEngine {
           secondWeight = w;
         }
       }
-      if (bestRoot < 0 || bestPage == null || bestPageId == null) return false;
+      if (bestRoot < 0 || bestPage == null || bestPageId == null) return null;
 
       final projectedN = currentMeta.totalVectors + vectors.length;
       final fair = max(1, projectedN ~/ max(1, state.numRootCentroids));
       final avgW = weighedRoots > 0 ? max(1, weightSum ~/ weighedRoots) : fair;
-      // Split earlier so L0 stays balanced through multi-M growth (rebuild).
-      final heavyThresh = max(512, min(fair, avgW) * 115 ~/ 100); // ~1.15×
+      // Split earlier under target so L0 densifies through multi-M growth.
+      final underTarget = state.numRootCentroids < _targetL0Roots;
+      final heavyThresh =
+          max(512, min(fair, avgW) * (underTarget ? 110 : 115) ~/ 100);
       final peerHot = secondWeight > 0 && bestWeight >= secondWeight * 3 ~/ 2;
-      if (bestWeight < heavyThresh && !peerHot) return false;
+      if (bestWeight < heavyThresh && !peerHot) return null;
 
       final (left, right) = _splitBranchEntriesBalanced(
         List<CentroidBranchEntry>.from(bestPage.entries),
       );
-      if (left.isEmpty || right.isEmpty) return false;
+      if (left.isEmpty || right.isEmpty) return null;
 
       final wasLeaf = bestPage.isLeafLevel;
       bestPage.entries
@@ -5075,10 +5203,15 @@ class NghGraphEngine {
         ..addAll(left);
       bestPage.isLeafLevel = wasLeaf;
       markInsertNav(bestPageId, bestPage);
-      state.setRootCentroid48(
-        bestRoot,
-        normalize48InPlace(_mean48BranchEntries(left)),
+      final leftMean = normalize48InPlace(_mean48BranchEntries(left));
+      final rightMean = normalize48InPlace(_mean48BranchEntries(right));
+      final (sepLeft, sepRight) = _l0SiblingCentroids(
+        left: left,
+        right: right,
+        leftMean: leftMean,
+        rightMean: rightMean,
       );
+      state.setRootCentroid48(bestRoot, sepLeft);
 
       final (rightPtrs, rightMeta) = _partitionManager.allocatePagesBatchSync(
         NghDataCategory.nav,
@@ -5089,37 +5222,51 @@ class NghGraphEngine {
       final rightPtr = rightPtrs.first;
       final rightId = NghPageId(rightPtr.partitionNo, rightPtr.pageNo);
       final newRootId = state.numRootCentroids;
-      final rightMean = normalize48InPlace(_mean48BranchEntries(right));
       final rightPage = NghNavBTreePage(
         rootCentroidId: newRootId,
         flags: wasLeaf ? NghNavBTreePage.flagLeafLevel : 0,
         entries: right,
       );
       final assigned = state.appendRoot(
-        centroid48D: rightMean,
+        centroid48D: sepRight,
         firstInternal: rightId,
       );
-      if (assigned < 0) return false;
+      if (assigned < 0) return null;
       markInsertNav(rightId, rightPage);
       insertNavRootsReady.add(assigned);
-      return true;
+      return (bestRoot, assigned);
     }
 
-    void tryHeavyRootSplit() {
+    /// Grow L0 toward target/page-fit. Returns sibling pairs created this batch.
+    List<(int, int)> tryHeavyRootSplit() {
       flushAllPendingBubbles();
-      // Grow L0 toward target/page-fit: more splits while under-target.
-      final budget = !state!.canGrowRoot
+      final n = state!.numRootCentroids;
+      final cap = state.maxRoots;
+      // Under target: densify fast. Near page-fit: cooler to avoid twin churn.
+      final budget = !state.canGrowRoot
           ? 0
-          : (state.numRootCentroids < _targetL0Roots ? 4 : 3);
+          : (n < _targetL0Roots ? 5 : (n < (cap * 9) ~/ 10 ? 2 : 1));
+      final pairs = <(int, int)>[];
       for (int i = 0; i < budget; i++) {
-        if (!tryHeavyRootSplitOnce()) break;
+        final pair = tryHeavyRootSplitOnce();
+        if (pair == null) break;
+        pairs.add(pair);
       }
+      return pairs;
     }
 
     /// Tiny cold-start (1 / 100 rows) leaves L0 far below the sample-rich
     /// target. Far-spawn + heavy-split alone never catch a subsequent 10k
-    /// flush (depth1–70 recall cliff, self_rc dips). Seed empty L0 heads from
-    /// this batch once — O(sample×k), no leaf rewrite.
+    /// flush (depth1–70 recall cliff, self_rc dips). When this batch is
+    /// sample-rich, seed empty L0 heads up to the *target* in one shot —
+    /// same coverage as a 10k cold start. Do NOT drip toward page-fit with
+    /// empty k-means (those vacant cells steal wantRoots forever).
+    ///
+    /// Growth after catch-up is NOT frozen: later batches still far-spawn and
+    /// heavy-root-split toward page-fit; mid/leaf nav keeps splitting under
+    /// each root. Only *this* batch skips far-spawn when catch-up reached
+    /// most of the target (avoid stacking a second wave of vacant cells).
+    var catchUpExpandedL0 = false;
     void expandUndersizedL0FromBatch() {
       if (!state!.canGrowRoot || vectors.isEmpty) return;
       final projectedN = currentMeta.totalVectors + vectors.length;
@@ -5149,8 +5296,19 @@ class NghGraphEngine {
       );
       for (final seed in seeds) {
         if (!state.canGrowRoot) break;
+        var tooClose = false;
+        for (int r = 0; r < state.numRootCentroids; r++) {
+          if (_dot48Flat(seed, 0, state.rootCentroids48Flat, r * 48) >= 0.92) {
+            tooClose = true;
+            break;
+          }
+        }
+        if (tooClose) continue;
         spawnFarL0Root(seed);
       }
+      // Only suppress same-batch far-spawn when we actually reached ~target.
+      // A partial catch-up (most seeds tooClose) must keep far-spawn open.
+      catchUpExpandedL0 = state.numRootCentroids >= (want * 3) ~/ 4;
     }
 
     expandUndersizedL0FromBatch();
@@ -5356,10 +5514,14 @@ class NghGraphEngine {
       final lowVec = w.lowVec;
 
       // Far from every L0 → spawn a precise new root (keeps wantLeaves fixed).
-      final farThresh = _l0FarSpawnThreshold(
-        state.numRootCentroids,
-        maxRoots: state.maxRoots,
-      );
+      // After a catch-up expand, this batch already has target k-means cells;
+      // extra far-spawns would re-create the vacant-root recall dip.
+      final farThresh = catchUpExpandedL0
+          ? 0.0
+          : _l0FarSpawnThreshold(
+              state.numRootCentroids,
+              maxRoots: state.maxRoots,
+            );
       if (state.canGrowRoot && maxScore0 < farThresh) {
         final spawned = spawnFarL0Root(lowVec);
         if (spawned != null) {
@@ -5384,13 +5546,16 @@ class NghGraphEngine {
     // Drain coalesced mid summaries before L0 refresh / heavy-root split.
     flushAllPendingBubbles();
 
-    // Refresh every resident L0 head so cold k-means seeds drift toward live
-    // subtree mass without leaf rewrite / extra I/O.
+    // Heavy-root-split first (uses current heads), then refresh means, then
+    // re-separate any near-twin sibling pair created this batch. Refreshing
+    // before split used to overwrite a careful post-split separation.
+    final splitPairs = tryHeavyRootSplit();
     for (int r = 0; r < state.numRootCentroids; r++) {
       refreshRootCentroidFromHead(r);
     }
-    // At most two heavy-root splits per batch (O(1) nav pages).
-    tryHeavyRootSplit();
+    for (final pair in splitPairs) {
+      _repelL0SiblingPair(state, pair.$1, pair.$2);
+    }
 
     // Persist root table when nextCentroidId advanced, cold-start dirtied it,
     // or open recovered a legacy nextCentroidId that still needs a disk write.

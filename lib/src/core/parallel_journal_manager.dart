@@ -127,37 +127,83 @@ class ParallelJournalManager {
   }
 
   /// Dynamically calculated writeBatchSize based on target bytes and average record size.
+  ///
+  /// Caps at 50k only when the **pending buffer** currently includes a table
+  /// that has a vector index (not merely because the DB has some vector table).
   int get effectiveWriteBatchSize {
     final int targetBytes = _getTargetFlushBatchBytes();
     final int avgBytes =
         _averageRecordSizeBytes > 0 ? _averageRecordSizeBytes : 200;
     final int calculated = targetBytes ~/ avgBytes;
-    if (PlatformHandler.isWeb) {
-      return calculated.clamp(500, 10000);
-    } else if (PlatformHandler.isMobile) {
-      return calculated.clamp(50000, 200000);
-    } else if (PlatformHandler.isServerEnvironment) {
-      return calculated.clamp(50000, 500000);
+    final pendingHasVector = _pendingFlushTouchesVectorIndex();
+    if (pendingHasVector) {
+      if (PlatformHandler.isWeb) {
+        return calculated.clamp(500, 5000);
+      } else if (PlatformHandler.isMobile) {
+        return calculated.clamp(10000, 50000);
+      } else if (PlatformHandler.isServerEnvironment) {
+        return calculated.clamp(10000, 80000);
+      } else {
+        return calculated.clamp(10000, 50000);
+      }
     } else {
-      return calculated.clamp(50000, 200000);
+      if (PlatformHandler.isWeb) {
+        return calculated.clamp(500, 10000);
+      } else if (PlatformHandler.isMobile) {
+        return calculated.clamp(50000, 200000);
+      } else if (PlatformHandler.isServerEnvironment) {
+        return calculated.clamp(50000, 500000);
+      } else {
+        return calculated.clamp(50000, 200000);
+      }
     }
+  }
+
+  /// True when the WAL flush queue is non-empty and pending trees still hold
+  /// rows for at least one vector-indexed table.
+  ///
+  /// - Empty write queue → false (pending shells / deferred-evict residue must
+  ///   not permanently pin the vector batch cap).
+  /// - Pending listing requires child PK payloads under each TableUid group
+  ///   ([TreeCache.listNonEmptyRootKeys]), not merely that the root key exists.
+  bool _pendingFlushTouchesVectorIndex() {
+    if (_bufferManager.queueLength == 0) return false;
+    final schemaMgr = _dataStore.tableMetaManager;
+    if (schemaMgr == null || !schemaMgr.hasAnyVectorIndex) return false;
+    final pendingUids = _bufferManager.bufferTrees.listPendingTableUids();
+    if (pendingUids.isEmpty) return false;
+    return schemaMgr.anyOfTablesHasVectorIndex(pendingUids);
   }
 
   /// Total records pending persistence: queued in buffer + actively in-flight flushing.
   int get totalPending => _bufferManager.queueLength + _inFlightFlushCount;
 
+  /// Estimated heap for pending + in-flight flush records (bytes).
+  ///
+  /// Uses the running average record size (same basis as flush headroom).
+  /// Does not include temporary grouping/classify structures — callers that
+  /// need a safety margin should apply their own factor (e.g. ×1.5).
+  int get estimatedPendingFlushBytes {
+    final avg = _averageRecordSizeBytes > 0 ? _averageRecordSizeBytes : 200;
+    return totalPending * avg;
+  }
+
   /// Flush busy threshold calculated from 30% of ResourceManager memory threshold.
-  /// Clamped between 3x and 10x [effectiveWriteBatchSize].
+  ///
+  /// - Memory healthy: clamp between 3x and 10x [effectiveWriteBatchSize] so a
+  ///   live batchInsert can finish without enqueue stalls.
+  /// - LOW / CRITICAL: hard-cap at 3x batch size (~3 pending flush batches) so
+  ///   enqueue backpressure waits for disk and stops heap growth.
   int get busyThreshold {
     final rm = _dataStore.resourceManager;
     final int memoryThresholdMB = rm != null ? rm.memoryThresholdInMB : 256;
     final int avgBytes =
-        _averageRecordSizeBytes > 0 ? _averageRecordSizeBytes : 200;
+        _averageRecordSizeBytes > 0 ? _averageRecordSizeBytes * 2 : 200;
     final int availableBytes = (memoryThresholdMB * 0.30 * 1024 * 1024).toInt();
     final int maxPendingByMemory = availableBytes ~/ avgBytes;
     final int currentBatchSize = effectiveWriteBatchSize;
     return maxPendingByMemory.clamp(
-        currentBatchSize * 3, currentBatchSize * 10);
+        currentBatchSize * 2, currentBatchSize * 10);
   }
 
   /// Current flush pressure state.
@@ -197,6 +243,43 @@ class ParallelJournalManager {
       }
 
       // Dual-wait: event-driven wake + 50ms polling tick
+      final c = Completer<void>();
+      _busyWaiters.add(c);
+      try {
+        await Future.any<void>([
+          Future<void>.delayed(const Duration(milliseconds: 50)),
+          c.future,
+        ]);
+      } finally {
+        _busyWaiters.remove(c);
+      }
+    }
+  }
+
+  /// Suspend enqueue until OS/cache memory leaves [ResourceStatus.critical].
+  ///
+  /// Flush itself is never gated on critical — this wait only slows new
+  /// enqueue so flush/eviction can reclaim memory. Disk-critical exits early
+  /// (waiting cannot free disk); callers rely on write-admission reject.
+  Future<void> waitUntilMemoryCriticalRelieved() async {
+    final rm = _dataStore.resourceManager;
+    if (rm == null || rm.memoryStatus != ResourceStatus.critical) return;
+    if (rm.isDiskCritical) return;
+
+    while (_running &&
+        rm.memoryStatus == ResourceStatus.critical &&
+        !rm.isDiskCritical) {
+      scheduleFlushIfNeeded();
+      final wake = _tailWaitWake;
+      if (wake != null && !wake.isCompleted) {
+        wake.complete();
+      }
+
+      await rm.triggerImmediateCheck(force: true);
+      if (rm.memoryStatus != ResourceStatus.critical || rm.isDiskCritical) {
+        return;
+      }
+
       final c = Completer<void>();
       _busyWaiters.add(c);
       try {
@@ -365,6 +448,11 @@ class ParallelJournalManager {
         if (wake != null && !wake.isCompleted) {
           wake.complete();
         }
+      }
+
+      // Memory CRITICAL: wait for flush/eviction to reclaim before more enqueue.
+      if (rm.memoryStatus == ResourceStatus.critical) {
+        await waitUntilMemoryCriticalRelieved();
       }
     }
 
@@ -875,6 +963,16 @@ class ParallelJournalManager {
           break;
         }
 
+        // Proactive headroom before materializing flush Maps/Lists (no await).
+        final headroomCount = batch.length + bgEntries.length;
+        if (headroomCount >= (effectiveWriteBatchSize * 0.25).ceil()) {
+          final avgBytes =
+              _averageRecordSizeBytes > 0 ? _averageRecordSizeBytes : 200;
+          // ×2 covers temporary grouping/classify structures on top of batch.
+          _dataStore.resourceManager
+              ?.requestHeadroom(headroomCount * avgBytes * 2);
+        }
+
         // Mute trailing SpaceStats KV singleton only: length short-circuit then
         // O(1) recordId == const key (InternalKv pk). No extra state.
         final quietSpaceStatsLog =
@@ -931,15 +1029,22 @@ class ParallelJournalManager {
           );
         }
 
+        // Resolve table contexts once per uid (avoid 50k awaits on a single-table batch).
+        final batchTableContexts = <TableUid, TableContext>{};
+        for (final e in batch) {
+          if (batchTableContexts.containsKey(e.tableUid)) continue;
+          final ctx = await _tableContextFromUid(e.tableUid);
+          if (ctx != null) batchTableContexts[e.tableUid] = ctx;
+        }
+
         // Process business writes (as the "newer" data, overwriting migration).
-        // Chunked so dual-pressure with batchInsert does not collapse yield interval.
-        await EngineCpuChunk.forEachRangeAsync(
+        await EngineCpuChunk.forEachRange(
           length: batch.length,
           kind: CpuChunkKind.medium,
-          process: (start, end) async {
+          process: (start, end) {
             for (int i = start; i < end; i++) {
               final e = batch[i];
-              final tableContext = await _tableContextFromUid(e.tableUid);
+              final tableContext = batchTableContexts[e.tableUid];
               if (tableContext == null) continue;
               tableEpochs.putIfAbsent(
                   e.tableUid, () => _bufferManager.getClearEpoch(tableContext));
@@ -1115,7 +1220,8 @@ class ParallelJournalManager {
           final yTable = tableYieldController.maybeYield();
           if (yTable != null) await yTable;
 
-          final tableContext = await _tableContextFromUid(tableUid);
+          final tableContext = batchTableContexts[tableUid] ??
+              await _tableContextFromUid(tableUid);
           if (tableContext == null) continue;
           final tableName = tableContext.tableName;
           // Use the epoch captured before/during grouping

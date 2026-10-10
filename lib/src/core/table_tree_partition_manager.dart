@@ -2380,7 +2380,7 @@ final class TableTreePartitionManager {
     );
 
     // Log persistence statistics
-    if (InternalConfig.showLoggerInternalLabel && totalRecordCount > 0) {
+    if (InternalConfig.showInternalLogs && totalRecordCount > 0) {
       final now = DateTime.now();
       final at =
           '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}:${now.second.toString().padLeft(2, '0')}.${now.millisecond.toString().padLeft(3, '0')}';

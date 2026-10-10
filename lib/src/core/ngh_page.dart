@@ -1719,7 +1719,8 @@ final class NghPageSizer {
   /// TPG2 header, 128-byte flush margin, and encoder/AEAD slack.
   ///
   /// Floors at [InternalConfig.defaultPageSize] (16KB). Used by nav so L0
-  /// root-table capacity stays page-fit (~79 on 16KB). Leaf uses
+  /// root-table capacity stays page-fit (~79 on 16KB, ~158 on 32KB when
+  /// [chooseNavPageSize] sizes for [targetL0RootTableCapacity]). Leaf uses
   /// [chooseLeafPageSize], which may go down to [minNghLeafPageSize].
   static int choosePageSize(int minPlainPayload, int basePageSize) {
     var size = basePageSize > 0 ? basePageSize : InternalConfig.defaultPageSize;
@@ -1790,14 +1791,23 @@ final class NghPageSizer {
     return size;
   }
 
+  /// CNRT roots to size empty nav pages for. Denser L0 keeps leaf-nav/root
+  /// smaller so mid beam coverage holds at multi-M without raising wantLeaves.
+  /// Legacy indexes with frozen 16KB nav stay at ~79 page-fit.
+  static const int targetL0RootTableCapacity = 128;
+
   /// Page size for one SQ8 nav centroid (max neighbors + min children).
   ///
   /// Disk is SQ8 (1 byte/dim + offset/scale). Grows with D so one centroid
-  /// record fits; independent of leaf occupancy (leaf may be larger or smaller).
+  /// record fits; also grows so the L0 root table ([NghNavRootPage]) can hold
+  /// [targetL0RootTableCapacity] roots on a single page (~32KB).
   static int chooseNavPageSize(int dimensions, int basePageSize) {
     final dim = dimensions.clamp(1, maxDimensions);
-    final payload = 12 + NghNavCentroidPage.recordSize(dim, maxNavNeighbors, 8);
-    return choosePageSize(payload, basePageSize);
+    final forCentroid =
+        12 + NghNavCentroidPage.recordSize(dim, maxNavNeighbors, 8);
+    final forL0Roots =
+        NghNavRootPage.headerSize + targetL0RootTableCapacity * 204;
+    return choosePageSize(max(forCentroid, forL0Roots), basePageSize);
   }
 
   /// Assign leaf/nav page sizes for a new or still-empty index.
