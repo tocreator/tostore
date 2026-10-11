@@ -10,44 +10,44 @@ import '../model/result_status.dart';
 import '../model/result_type.dart';
 
 // ============================================================================
-// B+Tree Page Types and Constants
+// Store Page — shared fixed-size page frame
 // ============================================================================
+// Physical page format used by B+Tree indexes, NGH vector indexes, overflow
+// storage, and freelist reuse. On-disk enum indices are stable; append new
+// [StorePageType] values only at the end.
 
-/// Page type enumeration for B+Tree nodes.
-enum BTreePageType {
-  /// Leaf page containing key-value pairs.
+/// Discriminator for a fixed-size store page payload.
+///
+/// Values are persisted as `pageType:u8` in [StorePageHeader]. Do not reorder
+/// existing entries; append new ones at the end.
+enum StorePageType {
+  /// B+Tree leaf: sorted key-value pairs.
   leaf,
 
-  /// Internal page containing child pointers.
+  /// B+Tree internal: fence keys and child pointers.
   internal,
 
-  /// Partition meta page (pageNo=0) for per-file statistics.
+  /// Partition meta page (`pageNo=0`) for per-file statistics.
   ///
-  /// This page is not part of the B+Tree structure. It is stored in-band as a
-  /// normal page to avoid shifting offsets and to allow updating metadata by
-  /// rewriting only a single page.
+  /// Stored in-band as a normal page so metadata can be rewritten without
+  /// shifting other pages or file offsets.
   meta,
 
-  /// Free page used for page reuse (freelist).
+  /// Freelist node for O(1) page reuse within a partition.
   ///
-  /// A freed page is stored in-band and linked via a per-partition freelist head
-  /// stored in [PartitionMetaPage]. This enables O(1) page reuse without scanning.
+  /// Linked from [PartitionMetaPage.freeListHeadPageNo].
   free,
 
-  /// Overflow (TOAST-like) data page for large values stored out-of-line.
-  ///
-  /// IMPORTANT: appended at end to preserve on-disk enum indices.
+  /// Overflow page for large values stored out-of-line.
   overflow,
 
-  // -- NGH Vector Index Page Types --
-
-  /// NGH per-file metadata page (pageNo=0 in each partition file).
+  /// NGH partition meta page (`pageNo=0` in each NGH partition file).
   nghMeta,
 
-  /// NGH physical vector-leaf page
+  /// NGH physical vector-leaf page.
   nghLeaf,
 
-  /// NGH hierarchical-nav page
+  /// NGH hierarchical navigation page.
   nghNav,
 }
 
@@ -113,10 +113,10 @@ final class ByteKey {
 }
 
 // ============================================================================
-// Page Header and IO
+// Store Page Header and IO
 // ============================================================================
 
-/// Fixed page header (little-endian). Header is NOT encrypted.
+/// Fixed store-page header (little-endian). The header is never encrypted.
 ///
 /// Layout:
 /// - magic:u32 = 'TPG2'
@@ -124,18 +124,18 @@ final class ByteKey {
 /// - pageType:u8
 /// - flags:u8
 /// - payloadLen:u32   (bytes of encoded payload)
-/// - payloadCrc32:u32 (crc over encoded payload bytes)
-/// - reserved:u32     (future use)
-final class BTreePageHeader {
+/// - payloadCrc32:u32 (CRC over encoded payload bytes)
+/// - reserved:u32     (reserved for future use)
+final class StorePageHeader {
   static const int size = 4 + 2 + 1 + 1 + 4 + 4 + 4;
   static const int _magic = 0x32475054; // 'TPG2' little-endian
 
-  final BTreePageType pageType;
+  final StorePageType pageType;
   final int payloadLen;
   final int payloadCrc32;
   final int flags;
 
-  const BTreePageHeader({
+  const StorePageHeader({
     required this.pageType,
     required this.payloadLen,
     required this.payloadCrc32,
@@ -156,7 +156,7 @@ final class BTreePageHeader {
   }
 
   /// Try to decode header from page bytes. Returns null if invalid.
-  static BTreePageHeader? tryDecode(Uint8List pageBytes) {
+  static StorePageHeader? tryDecode(Uint8List pageBytes) {
     if (pageBytes.length < size) return null;
     final bd = ByteData.sublistView(pageBytes, 0, size);
     final magic = bd.getUint32(0, Endian.little);
@@ -164,12 +164,12 @@ final class BTreePageHeader {
     final hs = bd.getUint16(4, Endian.little);
     if (hs != size) return null;
     final pt = bd.getUint8(6);
-    if (pt < 0 || pt >= BTreePageType.values.length) return null;
+    if (pt < 0 || pt >= StorePageType.values.length) return null;
     final flags = bd.getUint8(7);
     final len = bd.getUint32(8, Endian.little);
     final crc = bd.getUint32(12, Endian.little);
-    return BTreePageHeader(
-      pageType: BTreePageType.values[pt],
+    return StorePageHeader(
+      pageType: StorePageType.values[pt],
       payloadLen: len,
       payloadCrc32: crc,
       flags: flags,
@@ -177,44 +177,44 @@ final class BTreePageHeader {
   }
 }
 
-/// Page IO helper: wraps encoded payload with header + crc + padding.
-final class BTreePageIO {
-  /// Build complete page bytes from encoded payload.
+/// Assembles and parses fixed-size store pages (header + CRC + payload + pad).
+final class StorePageIO {
+  /// Build a full page buffer from an already-encoded payload.
   static Uint8List buildPageBytes({
-    required BTreePageType type,
+    required StorePageType type,
     required Uint8List encodedPayload,
     required int pageSize,
   }) {
-    final hdr = BTreePageHeader(
+    final hdr = StorePageHeader(
       pageType: type,
       payloadLen: encodedPayload.length,
       payloadCrc32: Crc32.of(encodedPayload),
     );
     final headerBytes = hdr.encode();
-    final total = BTreePageHeader.size + encodedPayload.length;
+    final total = StorePageHeader.size + encodedPayload.length;
     if (total > pageSize) {
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,
           message: 'Page overflow ($type): total=$total > pageSize=$pageSize '
-              '(header=${BTreePageHeader.size}, payload=${encodedPayload.length}, '
+              '(header=${StorePageHeader.size}, payload=${encodedPayload.length}, '
               'overflow=${total - pageSize} bytes). '
               'This indicates the page size estimation was inaccurate. '
-              'Consider checking BTreePageSizer.fitsInPage before encoding.',
+              'Consider checking StorePageSizer.fitsInPage before encoding.',
         )
       ]);
     }
     final out = Uint8List(pageSize);
-    out.setRange(0, BTreePageHeader.size, headerBytes);
-    out.setRange(BTreePageHeader.size,
-        BTreePageHeader.size + encodedPayload.length, encodedPayload);
+    out.setRange(0, StorePageHeader.size, headerBytes);
+    out.setRange(StorePageHeader.size,
+        StorePageHeader.size + encodedPayload.length, encodedPayload);
     return out;
   }
 
-  /// Parse page bytes and return type + encoded payload.
-  static ({BTreePageType type, Uint8List encodedPayload}) parsePageBytes(
+  /// Parse a full page buffer into page type and encoded payload.
+  static ({StorePageType type, Uint8List encodedPayload}) parsePageBytes(
       Uint8List pageBytes) {
-    final hdr = BTreePageHeader.tryDecode(pageBytes);
+    final hdr = StorePageHeader.tryDecode(pageBytes);
     if (hdr == null) {
       throw DbException([
         GeneralStatus(
@@ -224,7 +224,7 @@ final class BTreePageIO {
         )
       ]);
     }
-    final int off = BTreePageHeader.size;
+    final int off = StorePageHeader.size;
     final int end = off + hdr.payloadLen;
     if (hdr.payloadLen < 0 || end > pageBytes.length) {
       throw DbException([
@@ -251,14 +251,14 @@ final class BTreePageIO {
     return (type: hdr.pageType, encodedPayload: payload);
   }
 
-  /// Decode payload from an already-validated header + contiguous payload bytes.
+  /// Decode payload from a validated header and contiguous payload bytes.
   ///
-  /// Used by bootstrap two-phase IO (header -> payloadLen) when
-  /// [GlobalConfig.pageSize] is not yet known. Prefer a single full-page read
-  /// via [BTreePageIO.parsePageBytes] once page size is configured.
-  static ({BTreePageType type, Uint8List encodedPayload})
+  /// Used for two-phase IO (header then payload) when page size is not yet
+  /// known. Prefer a single full-page read via [parsePageBytes] once
+  /// page size is configured.
+  static ({StorePageType type, Uint8List encodedPayload})
       parseHeaderAndPayload({
-    required BTreePageHeader header,
+    required StorePageHeader header,
     required Uint8List encodedPayload,
   }) {
     if (encodedPayload.length != header.payloadLen) {
@@ -290,11 +290,10 @@ final class BTreePageIO {
 // Partition Meta Page (pageNo = 0)
 // ============================================================================
 
-/// Per-partition-file statistics stored in-band at pageNo=0.
+/// Per-partition-file statistics stored in-band at `pageNo=0`.
 ///
-/// This page is intentionally **fixed-size payload** (with a reserved area) so that
-/// adding future fields only requires rewriting this single page, without shifting
-/// any other pages or offsets in the partition file.
+/// Payload size is fixed (with reserved space) so new fields can be added by
+/// rewriting only this page, without shifting other pages or file offsets.
 final class PartitionMetaPage {
   static const int payloadVersion = 1;
   static const int _payloadMagic = 0x31485054; // 'TPH1' little-endian
@@ -446,10 +445,10 @@ final class OverflowPage {
   }
 
   /// Max data bytes that can fit in one overflow page given a [pageSize] and
-  /// encoded/encrypted payload overhead already applied at page layer.
+  /// encoded/encrypted payload overhead already applied at the store-page layer.
   static int maxChunkLenForPageSize(int pageSize) {
-    // BTree page header is outside payload; within payload we reserve 16 bytes.
-    final maxPayload = pageSize - BTreePageHeader.size;
+    // Store page header is outside payload; within payload we reserve 16 bytes.
+    final maxPayload = pageSize - StorePageHeader.size;
     final overhead = 16;
     final max = maxPayload - overhead;
     return max < 0 ? 0 : max;
@@ -627,9 +626,9 @@ final class OverflowPackedPage {
   }
 }
 
-/// Durable Free Space Map for half-full OVP2 pages (survives restart).
+/// Durable free-space map for half-full OVP2 pages (survives restart).
 ///
-/// Stored as a dedicated page payload (BTreePageType.overflow with magic OFSM).
+/// Stored as a dedicated page payload ([StorePageType.overflow] with magic OFSM).
 final class OverflowFsmPage {
   static const int payloadVersion = 1;
   static const int _payloadMagic = 0x4D53464F; // 'OFSM' little-endian
@@ -724,7 +723,7 @@ final class OverflowFsmPage {
 // Free Page (Freelist Node)
 // ============================================================================
 
-/// A freelist node stored in-band as a normal fixed-size page.
+/// Freelist node stored in-band as a fixed-size store page.
 ///
 /// Payload format (little-endian, fixed 16 bytes):
 /// - magic:u32 = 'FPG1'
@@ -763,31 +762,35 @@ final class FreePage {
 }
 
 // ============================================================================
-// Leaf Page
+// B+Tree Leaf Page Payload
 // ============================================================================
 
-/// A compact leaf page that is rewritten as a whole on update (page-granularity).
+/// B+Tree leaf payload: rewritten as a whole on update (page granularity).
 ///
-/// Format (all little-endian):
+/// Format (little-endian):
 /// [count:u16][highKeyLen:u16][prevP:i32][prevPg:i32][nextP:i32][nextPg:i32]
 /// [highKey bytes]
-/// then repeated count times:
+/// then repeated [count] times:
 ///   [kLen:u16][vLen:u32][keyBytes][valBytes]
 ///
 /// Key ordering uses [MemComparableKey.compare] on encoded key bytes.
-final class LeafPage {
+final class BTreeLeafPage {
   TreePagePtr prev;
   TreePagePtr next;
 
-  /// High key (inclusive) for this leaf's key range.
-  /// - Empty means +INF (rightmost leaf).
-  /// - This is a **range boundary**, not necessarily equal to the current max record key.
+  /// Inclusive high key for this leaf's key range.
+  ///
+  /// Empty means +INF (rightmost leaf). This is a range boundary and is not
+  /// required to equal the current max record key.
   Uint8List highKey;
 
-  final List<Uint8List> keys; // sorted
-  final List<Uint8List> values; // aligned
+  /// Sorted keys.
+  final List<Uint8List> keys;
 
-  LeafPage({
+  /// Values aligned with [keys].
+  final List<Uint8List> values;
+
+  BTreeLeafPage({
     required this.prev,
     required this.next,
     required this.highKey,
@@ -795,7 +798,7 @@ final class LeafPage {
     required this.values,
   });
 
-  factory LeafPage.empty() => LeafPage(
+  factory BTreeLeafPage.empty() => BTreeLeafPage(
         prev: TreePagePtr.nullPtr,
         next: TreePagePtr.nullPtr,
         highKey: Uint8List(0),
@@ -803,8 +806,8 @@ final class LeafPage {
         values: <Uint8List>[],
       );
 
-  /// Try to decode payload bytes into a LeafPage.
-  static LeafPage? tryDecodePayload(Uint8List bytes) {
+  /// Try to decode payload bytes into a BTreeLeafPage.
+  static BTreeLeafPage? tryDecodePayload(Uint8List bytes) {
     // [count:u16][highKeyLen:u16][prevP:i32][prevPg:i32][nextP:i32][nextPg:i32][highKey][entries...]
     if (bytes.length < 2 + 2 + 16) return null;
     final bd = ByteData.sublistView(bytes);
@@ -841,7 +844,7 @@ final class LeafPage {
       vals[i] = v;
     }
 
-    return LeafPage(
+    return BTreeLeafPage(
       prev: prev,
       next: next,
       highKey: highKey,
@@ -884,10 +887,7 @@ final class LeafPage {
     return b.toBytes();
   }
 
-  /// Estimate plaintext payload size in bytes for this leaf page.
-  ///
-  /// This avoids allocating the payload buffer and is used for fast overflow checks
-  /// in hot write paths (e.g. batch inserts).
+  /// Estimate plaintext payload size without allocating the encoded buffer.
   int estimatePayloadSize() {
     // [count:u16][highKeyLen:u16][prevP:i32][prevPg:i32][nextP:i32][nextPg:i32]
     int size = 2 + 2 + 16;
@@ -899,7 +899,7 @@ final class LeafPage {
     return size;
   }
 
-  /// Current max record key (NOT the page boundary).
+  /// Current max record key (not the page range boundary).
   Uint8List maxRecordKey() => keys.isEmpty ? Uint8List(0) : keys.last;
 
   int _lowerBound(Uint8List key) {
@@ -946,10 +946,10 @@ final class LeafPage {
     return true;
   }
 
-  /// Split this leaf page into two pages (left=this mutated, right returned).
+  /// Split this leaf into two pages (mutates this as left; returns right).
   ///
-  /// Returns the separator key (max key of left) and the right page content.
-  ({Uint8List oldMaxKey, Uint8List leftMaxKey, LeafPage right}) split() {
+  /// Returns the previous high key, the new left max key, and the right page.
+  ({Uint8List oldMaxKey, Uint8List leftMaxKey, BTreeLeafPage right}) split() {
     final oldHigh = highKey;
     final n = keys.length;
     final mid = n >> 1;
@@ -957,12 +957,11 @@ final class LeafPage {
     final rightVals = values.sublist(mid);
     keys.removeRange(mid, n);
     values.removeRange(mid, n);
-    // After split:
-    // - left highKey becomes the boundary between left/right (max record key in left)
-    // - right highKey keeps the old highKey (+INF or previous boundary)
+    // Left highKey becomes the left/right boundary (max record key in left).
+    // Right highKey keeps the previous highKey (+INF or prior boundary).
     final leftMax = maxRecordKey();
     highKey = leftMax;
-    final right = LeafPage(
+    final right = BTreeLeafPage(
       prev: TreePagePtr.nullPtr,
       next: TreePagePtr.nullPtr,
       highKey: oldHigh,
@@ -974,26 +973,29 @@ final class LeafPage {
 }
 
 // ============================================================================
-// Internal Page
+// B+Tree Internal Page Payload
 // ============================================================================
 
-/// Internal node page: stores fences (maxKey -> childPtr), like a multi-level directory.
+/// B+Tree internal payload: fence keys mapped to child page pointers.
 ///
 /// Payload format:
 /// [count:u16]
-/// repeated count:
+/// repeated [count] times:
 ///   [kLen:u16][childP:i32][childPg:i32][keyBytes]
-final class InternalPage {
-  final List<Uint8List> maxKeys; // sorted
-  final List<TreePagePtr> children; // aligned
+final class BTreeInternalPage {
+  /// Sorted fence keys (inclusive high keys for each child).
+  final List<Uint8List> maxKeys;
 
-  InternalPage({required this.maxKeys, required this.children});
+  /// Child pointers aligned with [maxKeys].
+  final List<TreePagePtr> children;
 
-  factory InternalPage.empty() =>
-      InternalPage(maxKeys: <Uint8List>[], children: <TreePagePtr>[]);
+  BTreeInternalPage({required this.maxKeys, required this.children});
 
-  /// Try to decode payload bytes into an InternalPage.
-  static InternalPage? tryDecodePayload(Uint8List bytes) {
+  factory BTreeInternalPage.empty() =>
+      BTreeInternalPage(maxKeys: <Uint8List>[], children: <TreePagePtr>[]);
+
+  /// Try to decode payload bytes into an BTreeInternalPage.
+  static BTreeInternalPage? tryDecodePayload(Uint8List bytes) {
     if (bytes.length < 2) return null;
     final bd = ByteData.sublistView(bytes);
     final count = bd.getUint16(0, Endian.little);
@@ -1017,7 +1019,7 @@ final class InternalPage {
       keys[i] = k;
       kids[i] = TreePagePtr(p, pg);
     }
-    return InternalPage(maxKeys: keys, children: kids);
+    return BTreeInternalPage(maxKeys: keys, children: kids);
   }
 
   /// Encode this internal page to payload bytes.
@@ -1039,10 +1041,7 @@ final class InternalPage {
     return b.toBytes();
   }
 
-  /// Estimate plaintext payload size in bytes for this internal page.
-  ///
-  /// This avoids allocating the payload buffer and is used for fast overflow checks
-  /// in hot write paths (e.g. batch inserts).
+  /// Estimate plaintext payload size without allocating the encoded buffer.
   int estimatePayloadSize() {
     // [count:u16] then repeated:
     //   [kLen:u16][childP:i32][childPg:i32][keyBytes]
@@ -1061,10 +1060,10 @@ final class InternalPage {
     return MemComparableKey.compare(highKey, key);
   }
 
-  /// Find child index for a given key.
+  /// Child index whose fence covers [key].
   int childIndexForKey(Uint8List key) {
     if (children.isEmpty || maxKeys.isEmpty) return 0;
-    // first maxKey >= key
+    // First maxKey >= key.
     int lo = 0;
     int hi = maxKeys.length;
     while (lo < hi) {
@@ -1075,7 +1074,6 @@ final class InternalPage {
         hi = mid;
       }
     }
-    // Clamp to children length (may be smaller if corrupted).
     if (lo >= children.length) return children.length - 1;
     return lo;
   }
@@ -1090,7 +1088,8 @@ final class InternalPage {
     children.insert(index, child);
   }
 
-  ({Uint8List oldMaxKey, Uint8List leftMaxKey, InternalPage right}) split() {
+  ({Uint8List oldMaxKey, Uint8List leftMaxKey, BTreeInternalPage right})
+      split() {
     final oldMax = maxKey();
     final n = maxKeys.length;
     final mid = n >> 1;
@@ -1098,18 +1097,18 @@ final class InternalPage {
     final rightKids = children.sublist(mid);
     maxKeys.removeRange(mid, n);
     children.removeRange(mid, n);
-    final right = InternalPage(maxKeys: rightKeys, children: rightKids);
+    final right = BTreeInternalPage(maxKeys: rightKeys, children: rightKids);
     return (oldMaxKey: oldMax, leftMaxKey: maxKey(), right: right);
   }
 }
 
 // ============================================================================
-// Page Codec (Encryption Support)
+// Store Page Codec (Encryption)
 // ============================================================================
 
-/// Helpers to encode/decode a page payload with optional encryption.
-final class BTreePageCodec {
-  /// Encode payload with optional encryption.
+/// Encode or decode a store-page payload with optional encryption wrapping.
+final class StorePageCodec {
+  /// Encode plaintext payload; returns plaintext when encryption is disabled.
   static Uint8List encodePayload(
     Uint8List payload, {
     required DataStoreConfig config,
@@ -1128,7 +1127,7 @@ final class BTreePageCodec {
     );
   }
 
-  /// Decode payload with optional decryption.
+  /// Decode an encoded payload; plaintext passes through when unencrypted.
   static Uint8List decodePayload(
     Uint8List encoded, {
     Uint8List? encryptionKey,
@@ -1145,15 +1144,14 @@ final class BTreePageCodec {
 }
 
 // ============================================================================
-// Page Size Estimation Helpers
+// Store Page Size Estimation
 // ============================================================================
 
-/// Fast estimators for B+Tree page encoded sizes.
+/// Fast estimators for encoded store-page sizes.
 ///
-/// These helpers avoid repeatedly building full page byte buffers just to detect
-/// overflow during hot write loops. They intentionally mirror `EncoderHandler.encodeBytes`
-/// output sizes (header + optional AEAD overhead).
-final class BTreePageSizer {
+/// Avoids building full page buffers during hot write loops. Size math mirrors
+/// `EncoderHandler.encodeBytes` output (encoder header + optional AEAD overhead).
+final class StorePageSizer {
   // EncoderHandler header format:
   //   <prefix>v<ver>_k<keyId>_
   // where <prefix> is always 5 ASCII chars in current format (e.g. "ToU8_").
@@ -1225,20 +1223,18 @@ final class BTreePageSizer {
       config: config,
       encryptionKeyId: encryptionKeyId,
     );
-    // 128-byte margin to avoid page overflow during batch flush/recovery.
-    // The previous 24-byte margin was insufficient for certain variable-length
-    // encoder headers or crypto overheads, causing "total > pageSize" crashes.
+    // Margin covers encoder header / keyId digit variance and AEAD overhead.
     const int safetyMargin = 128;
-    return BTreePageHeader.size + encodedLen + safetyMargin <= pageSize;
+    return StorePageHeader.size + encodedLen + safetyMargin <= pageSize;
   }
 }
 
 // ============================================================================
-// Tree Allocator Helper
+// Store Page Allocator Helper
 // ============================================================================
 
-/// Estimates file size for page allocation decisions.
-final class BTreeAllocator {
+/// Estimates partition-file size for page allocation decisions.
+final class StorePageAllocator {
   /// Estimate file size after allocating one more page.
   static int estimateFileSizeBytes(int pageSize, int nextPageNoInclusive) {
     if (nextPageNoInclusive < 0) return 0;

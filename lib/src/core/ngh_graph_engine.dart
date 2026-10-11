@@ -633,7 +633,7 @@ class NghGraphEngine {
 
   /// Max L0 roots that fit in one nav root-table page (header + 204B/root).
   static int _maxL0RootsForNavPageSize(int navPageSize) {
-    // BTree page header (~20) + CNRT header (16) + encrypt margin.
+    // Store page header (~20) + CNRT header (16) + encrypt margin.
     final usable = max(204, navPageSize - 96);
     final fit = usable ~/ 204;
     return min(CentroidBTreeState.maxRootCapacity, max(1, fit));

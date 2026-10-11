@@ -7,7 +7,7 @@ import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/table_context.dart';
 import '../model/value_ref.dart';
-import 'btree_page.dart';
+import 'store_page.dart';
 import 'overflow_manager.dart';
 import 'page_redo_log_codec.dart';
 

@@ -15,7 +15,7 @@ import '../model/ngh_index_meta.dart';
 import '../model/parallel_journal_entry.dart';
 import '../model/table_context.dart';
 import '../model/table_identity.dart';
-import 'btree_page.dart';
+import 'store_page.dart';
 import 'data_store_impl.dart';
 import 'ngh_page.dart';
 import 'ngh_pk_map.dart';
@@ -325,7 +325,7 @@ final class NghPartitionManager {
       );
       if (raw.isEmpty) return null;
 
-      final parsed = BTreePageIO.parsePageBytes(raw);
+      final parsed = StorePageIO.parsePageBytes(raw);
       final page =
           NghLeafPage.tryDecodePayload(_decodePayload(parsed.encodedPayload));
       if (page == null) return null;
@@ -418,7 +418,7 @@ final class NghPartitionManager {
           final raw = (i < rawBlocks.length) ? rawBlocks[i] : Uint8List(0);
           if (raw.isEmpty) continue;
           try {
-            final parsed = BTreePageIO.parsePageBytes(raw);
+            final parsed = StorePageIO.parsePageBytes(raw);
             final page = NghLeafPage.tryDecodePayload(
                 _decodePayload(parsed.encodedPayload));
             if (page != null) {
@@ -550,7 +550,7 @@ final class NghPartitionManager {
 
     if (bytes.length >= 20 && bytes[0] == 0x54 && bytes[1] == 0x53) {
       try {
-        final parsed = BTreePageIO.parsePageBytes(bytes);
+        final parsed = StorePageIO.parsePageBytes(bytes);
         final page = NghNavGraphPage.tryDecodePayload(
             _decodePayload(parsed.encodedPayload));
         if (page != null) {
@@ -673,7 +673,7 @@ final class NghPartitionManager {
       final raw = await _dataStore.storage
           .readAsBytesAt(path, ptr.pageNo * ps, length: ps);
       if (raw.isEmpty) return null;
-      final parsed = BTreePageIO.parsePageBytes(raw);
+      final parsed = StorePageIO.parsePageBytes(raw);
       final page = NghNavCentroidPage.tryDecodePayload(
           _decodePayload(parsed.encodedPayload));
       if (page == null) return null;
@@ -705,7 +705,7 @@ final class NghPartitionManager {
       final raw = await _dataStore.storage
           .readAsBytesAt(path, pageNo * pageSize, length: pageSize);
       if (raw.isEmpty) return null;
-      final parsed = BTreePageIO.parsePageBytes(raw);
+      final parsed = StorePageIO.parsePageBytes(raw);
       return NghNavRootPage.tryDecodePayload(
           _decodePayload(parsed.encodedPayload));
     } catch (e) {
@@ -729,7 +729,7 @@ final class NghPartitionManager {
       final raw = await _dataStore.storage
           .readAsBytesAt(path, id.pageNo * pageSize, length: pageSize);
       if (raw.isEmpty) return null;
-      final parsed = BTreePageIO.parsePageBytes(raw);
+      final parsed = StorePageIO.parsePageBytes(raw);
       return NghNavBTreePage.tryDecodePayload(
           _decodePayload(parsed.encodedPayload));
     } catch (e) {
@@ -775,7 +775,7 @@ final class NghPartitionManager {
           for (int i = 0; i < slice.length && i < rawBlocks.length; i++) {
             final raw = rawBlocks[i];
             if (raw.isEmpty) continue;
-            final parsed = BTreePageIO.parsePageBytes(raw);
+            final parsed = StorePageIO.parsePageBytes(raw);
             final page = NghNavBTreePage.tryDecodePayload(
                 _decodePayload(parsed.encodedPayload));
             if (page != null) {
@@ -810,15 +810,15 @@ final class NghPartitionManager {
           path, ptr.pageNo * configuredPageSize,
           length: configuredPageSize);
       if (raw.isEmpty) return null;
-      final parsed = BTreePageIO.parsePageBytes(raw);
+      final parsed = StorePageIO.parsePageBytes(raw);
       final payload = _decodePayload(parsed.encodedPayload);
       final NghPkMapDirtyPage page;
-      if (parsed.type == BTreePageType.internal) {
-        final inner = InternalPage.tryDecodePayload(payload);
+      if (parsed.type == StorePageType.internal) {
+        final inner = BTreeInternalPage.tryDecodePayload(payload);
         if (inner == null) return null;
         page = NghPkMapDirtyPage.internal(inner);
       } else {
-        final leaf = LeafPage.tryDecodePayload(payload);
+        final leaf = BTreeLeafPage.tryDecodePayload(payload);
         if (leaf == null) return null;
         page = NghPkMapDirtyPage.leaf(leaf);
       }
@@ -1007,7 +1007,7 @@ final class NghPartitionManager {
 
   /// Whether a leaf payload will fit this index's leaf TPG2 page.
   bool leafPayloadFits(int plainPayloadLen, {required int pageSize}) {
-    return BTreePageSizer.fitsInPage(
+    return StorePageSizer.fitsInPage(
       pageSize: pageSize,
       plainPayloadLen: plainPayloadLen,
       config: _dataStore.config,
@@ -1015,7 +1015,7 @@ final class NghPartitionManager {
   }
 
   bool _navPayloadFits(int plainPayloadLen, int pageSize) {
-    return BTreePageSizer.fitsInPage(
+    return StorePageSizer.fitsInPage(
       pageSize: pageSize,
       plainPayloadLen: plainPayloadLen,
       config: _dataStore.config,
@@ -1099,7 +1099,7 @@ final class NghPartitionManager {
             final raw = await _dataStore.storage
                 .readAsBytesAt(path, pg * pageSize, length: pageSize);
             if (raw.isEmpty) continue;
-            final parsed = BTreePageIO.parsePageBytes(raw);
+            final parsed = StorePageIO.parsePageBytes(raw);
             final plain = _decodePayload(parsed.encodedPayload);
             final rebuilt = _buildPageBytes(
               parsed.type,
@@ -1265,7 +1265,7 @@ final class NghPartitionManager {
       navBuilt.add((
         ptr: entry.key,
         pageBytes: _buildPageBytes(
-          BTreePageType.nghNav,
+          StorePageType.nghNav,
           payload,
           navPageSize,
           encrypt,
@@ -1278,7 +1278,7 @@ final class NghPartitionManager {
       navBuilt.add((
         ptr: entry.key,
         pageBytes: _buildPageBytes(
-          BTreePageType.nghNav,
+          StorePageType.nghNav,
           payload,
           navPageSize,
           encrypt,
@@ -1291,7 +1291,7 @@ final class NghPartitionManager {
       navBuilt.add((
         ptr: dirtyNavRootPage.ptr,
         pageBytes: _buildPageBytes(
-          BTreePageType.nghNav,
+          StorePageType.nghNav,
           payload,
           navPageSize,
           encrypt,
@@ -1358,7 +1358,7 @@ final class NghPartitionManager {
       required NghDataCategory category,
       required Map<int, _NghPartitionStats> statsMap,
       required NghPagePtr ptr,
-      required BTreePageType pageType,
+      required StorePageType pageType,
       required Uint8List payload,
       PageRedoTreeKind? redoKind,
       Uint8List? redoPayload,
@@ -1424,7 +1424,7 @@ final class NghPartitionManager {
         category: NghDataCategory.leaf,
         statsMap: leafStats,
         ptr: entry.key,
-        pageType: BTreePageType.nghLeaf,
+        pageType: StorePageType.nghLeaf,
         payload: leafPage.encodePayload(),
         // dims≤64: full page image. dims>64: structure+PK (rebuild from table).
         redoKind: PageRedoTreeKind.ngh,
@@ -1812,8 +1812,8 @@ final class NghPartitionManager {
     final currentHead = heads[ptr.partitionNo] ?? -1;
 
     final freePayload = FreePage(nextFreePageNo: currentHead).encodePayload();
-    final freeBytes = BTreePageIO.buildPageBytes(
-      type: BTreePageType.free,
+    final freeBytes = StorePageIO.buildPageBytes(
+      type: StorePageType.free,
       encodedPayload: freePayload,
       pageSize: pageSize,
     );
@@ -1869,8 +1869,8 @@ final class NghPartitionManager {
           continue;
         }
 
-        final parsed = BTreePageIO.parsePageBytes(raw);
-        if (parsed.type != BTreePageType.free) {
+        final parsed = StorePageIO.parsePageBytes(raw);
+        if (parsed.type != StorePageType.free) {
           final updatedHeads = Map<int, int>.from(heads)..[partitionNo] = -1;
           meta = _setFreeListHeads(category, meta, updatedHeads);
           continue;
@@ -2056,7 +2056,7 @@ final class NghPartitionManager {
 
   /// Build raw page bytes (header + payload + padding).
   ///
-  /// When [encrypt] is true, routes payload through [BTreePageCodec.encodePayload]
+  /// When [encrypt] is true, routes payload through [StorePageCodec.encodePayload]
   /// which respects [EncryptionConfig.encryptionType] (ChaCha20/AES-GCM/XOR/none).
   /// When false, uses raw payload directly for maximum throughput.
   Uint8List buildLeafPageBytes({
@@ -2065,7 +2065,7 @@ final class NghPartitionManager {
     required bool encrypt,
   }) {
     return _buildPageBytes(
-      BTreePageType.nghLeaf,
+      StorePageType.nghLeaf,
       page.encodePayload(),
       pageSize,
       encrypt,
@@ -2073,21 +2073,21 @@ final class NghPartitionManager {
   }
 
   Uint8List _buildPageBytes(
-    BTreePageType type,
+    StorePageType type,
     Uint8List payload,
     int pageSize,
     bool encrypt,
   ) {
     final Uint8List encodedPayload;
     if (encrypt) {
-      encodedPayload = BTreePageCodec.encodePayload(
+      encodedPayload = StorePageCodec.encodePayload(
         payload,
         config: _dataStore.config,
       );
     } else {
       encodedPayload = payload;
     }
-    return BTreePageIO.buildPageBytes(
+    return StorePageIO.buildPageBytes(
       type: type,
       encodedPayload: encodedPayload,
       pageSize: pageSize,
@@ -2096,7 +2096,7 @@ final class NghPartitionManager {
 
   /// Decode page payload, applying decryption if vector encryption is enabled.
   Uint8List _decodePayload(Uint8List encodedPayload) {
-    return BTreePageCodec.decodePayload(
+    return StorePageCodec.decodePayload(
       encodedPayload,
     );
   }
@@ -2137,7 +2137,7 @@ final class NghPartitionManager {
             _dataStore.treeMetaPageService.parsePartitionLocalFromPageBytes(
           raw0,
           partitionNo: partitionNo,
-          pageType: BTreePageType.nghMeta,
+          pageType: StorePageType.nghMeta,
         );
         if (local != null) {
           stats.oldTotalEntries = local.totalEntryCount;
@@ -2199,7 +2199,7 @@ final class NghPartitionManager {
       final metaBytes = _dataStore.treeMetaPageService.buildPartitionPage0Bytes(
         pageSize: pageSize,
         partitionNo: pNo,
-        pageType: BTreePageType.nghMeta,
+        pageType: StorePageType.nghMeta,
         partitionLocal: PartitionLocalStats(
           partitionNo: pNo,
           dataCategory: category.index,

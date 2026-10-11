@@ -1,7 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 import 'data_store_impl.dart';
-import 'btree_page.dart';
+import 'store_page.dart';
 import 'table_meta_manager.dart';
 import '../handler/logger.dart';
 import '../model/db_exception.dart';
@@ -162,8 +162,8 @@ class IntegrityChecker {
             Logger.error('Partition file meta page is empty (pNo=$pNo)');
             return false;
           }
-          final parsed0 = BTreePageIO.parsePageBytes(raw0);
-          if (parsed0.type != BTreePageType.meta) {
+          final parsed0 = StorePageIO.parsePageBytes(raw0);
+          if (parsed0.type != StorePageType.meta) {
             Logger.error(
                 'Partition file missing meta page (pNo=$pNo, type=${parsed0.type})');
             return false;
@@ -172,7 +172,7 @@ class IntegrityChecker {
               _dataStore.treeMetaPageService.parsePartitionLocalFromPageBytes(
             raw0,
             partitionNo: pNo,
-            pageType: BTreePageType.meta,
+            pageType: StorePageType.meta,
           );
           if (local == null) {
             Logger.error(
@@ -533,13 +533,13 @@ class IntegrityChecker {
           final raw0 = await _dataStore.storage
               .readAsBytesAt(path, 0, length: _dataStore.configuredPageSize);
           if (raw0.isEmpty) return false;
-          final parsed0 = BTreePageIO.parsePageBytes(raw0);
-          if (parsed0.type != BTreePageType.meta) return false;
+          final parsed0 = StorePageIO.parsePageBytes(raw0);
+          if (parsed0.type != StorePageType.meta) return false;
           final local =
               _dataStore.treeMetaPageService.parsePartitionLocalFromPageBytes(
             raw0,
             partitionNo: partitionNo,
-            pageType: BTreePageType.meta,
+            pageType: StorePageType.meta,
           );
           if (local == null) return false;
           return local.partitionNo == partitionNo;

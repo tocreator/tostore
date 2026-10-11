@@ -13,7 +13,7 @@ import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/table_context.dart';
 import '../model/table_identity.dart';
-import 'btree_page.dart';
+import 'store_page.dart';
 import 'data_store_impl.dart';
 import 'page_redo_log_codec.dart';
 import 'storage_adapter.dart';
@@ -53,7 +53,7 @@ final class TreeMetaPageService {
         spaceName: spaceName,
       ),
       partitionNo: 0,
-      pageType: BTreePageType.meta,
+      pageType: StorePageType.meta,
     );
     if (parsed == null || parsed.treeGlobalMeta == null) return null;
     final blob = TreeGlobalMetaBlobCodec.decode(parsed.treeGlobalMeta!);
@@ -79,7 +79,7 @@ final class TreeMetaPageService {
         (await readPartitionLocal(
           path: path,
           partitionNo: 0,
-          pageType: BTreePageType.meta,
+          pageType: StorePageType.meta,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
         )) ??
@@ -96,7 +96,7 @@ final class TreeMetaPageService {
         path: path,
         pageSize: pageSize,
         partitionNo: 0,
-        pageType: BTreePageType.meta,
+        pageType: StorePageType.meta,
         partitionLocal: _applyBatchMarkers(local, ctx),
         treeGlobalMeta: globalBlob,
         batchContext: ctx,
@@ -122,7 +122,7 @@ final class TreeMetaPageService {
     final parsed = await _readPayload(
       partitionPath: path,
       partitionNo: 0,
-      pageType: BTreePageType.meta,
+      pageType: StorePageType.meta,
     );
     if (parsed == null || parsed.treeGlobalMeta == null) return null;
     final blob = TreeGlobalMetaBlobCodec.decode(parsed.treeGlobalMeta!);
@@ -151,7 +151,7 @@ final class TreeMetaPageService {
         (await readPartitionLocal(
           path: path,
           partitionNo: 0,
-          pageType: BTreePageType.meta,
+          pageType: StorePageType.meta,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
         )) ??
@@ -168,7 +168,7 @@ final class TreeMetaPageService {
         path: path,
         pageSize: pageSize,
         partitionNo: 0,
-        pageType: BTreePageType.meta,
+        pageType: StorePageType.meta,
         partitionLocal: _applyBatchMarkers(local, ctx),
         treeGlobalMeta: globalBlob,
         batchContext: ctx,
@@ -195,7 +195,7 @@ final class TreeMetaPageService {
     final parsed = await _readPayload(
       partitionPath: path,
       partitionNo: 0,
-      pageType: BTreePageType.nghMeta,
+      pageType: StorePageType.nghMeta,
     );
     if (parsed == null || parsed.treeGlobalMeta == null) return null;
     final blob = TreeGlobalMetaBlobCodec.decode(parsed.treeGlobalMeta!);
@@ -224,7 +224,7 @@ final class TreeMetaPageService {
         (await readPartitionLocal(
           path: path,
           partitionNo: 0,
-          pageType: BTreePageType.nghMeta,
+          pageType: StorePageType.nghMeta,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
         )) ??
@@ -241,7 +241,7 @@ final class TreeMetaPageService {
         path: path,
         pageSize: pageSize,
         partitionNo: 0,
-        pageType: BTreePageType.nghMeta,
+        pageType: StorePageType.nghMeta,
         partitionLocal: _applyBatchMarkers(local, ctx),
         treeGlobalMeta: globalBlob,
         batchContext: ctx,
@@ -267,7 +267,7 @@ final class TreeMetaPageService {
   Future<PartitionLocalStats?> readPartitionLocal({
     required String path,
     required int partitionNo,
-    required BTreePageType pageType,
+    required StorePageType pageType,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
   }) async {
@@ -285,7 +285,7 @@ final class TreeMetaPageService {
   Uint8List buildPartitionPage0Bytes({
     required int pageSize,
     required int partitionNo,
-    required BTreePageType pageType,
+    required StorePageType pageType,
     required PartitionLocalStats partitionLocal,
     Uint8List? treeGlobalMeta,
     Uint8List? encryptionKey,
@@ -296,14 +296,14 @@ final class TreeMetaPageService {
       treeGlobalMeta: treeGlobalMeta,
     ).encodePlainPayload();
     final keys = _resolveEncryptionKeys(encryptionKey, encryptionKeyId);
-    final encoded = BTreePageCodec.encodePayload(
+    final encoded = StorePageCodec.encodePayload(
       payload,
       config: _config,
       encryptionKey: keys.key,
       encryptionKeyId: keys.keyId,
       aad: _aad(partitionNo, pageType),
     );
-    return BTreePageIO.buildPageBytes(
+    return StorePageIO.buildPageBytes(
       type: pageType,
       encodedPayload: encoded,
       pageSize: pageSize,
@@ -348,7 +348,7 @@ final class TreeMetaPageService {
     required String path,
     required int pageSize,
     required int partitionNo,
-    required BTreePageType pageType,
+    required StorePageType pageType,
     required PartitionLocalStats partitionLocal,
     Uint8List? treeGlobalMeta,
     BatchContext? batchContext,
@@ -418,13 +418,13 @@ final class TreeMetaPageService {
   PartitionLocalStats? parsePartitionLocalFromPageBytes(
     Uint8List pageBytes, {
     required int partitionNo,
-    required BTreePageType pageType,
+    required StorePageType pageType,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
   }) {
     if (pageBytes.isEmpty) return null;
     try {
-      final parsedPage = BTreePageIO.parsePageBytes(pageBytes);
+      final parsedPage = StorePageIO.parsePageBytes(pageBytes);
       final plain = _decodePayloadAlways(
         parsedPage.encodedPayload,
         partitionNo: partitionNo,
@@ -459,16 +459,16 @@ final class TreeMetaPageService {
 
   /// Read and decode page 0.
   ///
-  /// Page layout is `[BTreePageHeader][encodedPayload][zero padding to pageSize]`.
+  /// Page layout is `[StorePageHeader][encodedPayload][zero padding to pageSize]`.
   ///
   /// - When [DataStoreImpl.hasConfiguredPageSize]: one IO of the full padded
   ///   page (normal path; page size is immutable and known).
-  /// - Otherwise: two-phase IO (fixed header -> [BTreePageHeader.payloadLen])
+  /// - Otherwise: two-phase IO (fixed header -> [StorePageHeader.payloadLen])
   ///   so v3 / bootstrap can decode meta before GlobalConfig.pageSize exists.
   Future<TreeMetaPagePayload?> _readPayload({
     required String partitionPath,
     required int partitionNo,
-    required BTreePageType pageType,
+    required StorePageType pageType,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
   }) async {
@@ -480,7 +480,7 @@ final class TreeMetaPageService {
       );
       if (pageBytes.isEmpty) return null;
       try {
-        final parsedPage = BTreePageIO.parsePageBytes(pageBytes);
+        final parsedPage = StorePageIO.parsePageBytes(pageBytes);
         final plain = _decodePayloadAlways(
           parsedPage.encodedPayload,
           partitionNo: partitionNo,
@@ -498,22 +498,22 @@ final class TreeMetaPageService {
     final headerBytes = await _storage.readAsBytesAt(
       partitionPath,
       0,
-      length: BTreePageHeader.size,
+      length: StorePageHeader.size,
     );
-    if (headerBytes.length < BTreePageHeader.size) return null;
+    if (headerBytes.length < StorePageHeader.size) return null;
 
-    final header = BTreePageHeader.tryDecode(headerBytes);
+    final header = StorePageHeader.tryDecode(headerBytes);
     if (header == null || header.payloadLen <= 0) return null;
 
     final encodedPayload = await _storage.readAsBytesAt(
       partitionPath,
-      BTreePageHeader.size,
+      StorePageHeader.size,
       length: header.payloadLen,
     );
     if (encodedPayload.length != header.payloadLen) return null;
 
     try {
-      final parsedPage = BTreePageIO.parseHeaderAndPayload(
+      final parsedPage = StorePageIO.parseHeaderAndPayload(
         header: header,
         encodedPayload: encodedPayload,
       );
@@ -533,12 +533,12 @@ final class TreeMetaPageService {
   Uint8List _decodePayloadAlways(
     Uint8List encoded, {
     required int partitionNo,
-    required BTreePageType pageType,
+    required StorePageType pageType,
     Uint8List? encryptionKey,
     int? encryptionKeyId,
   }) {
     final keys = _resolveEncryptionKeys(encryptionKey, encryptionKeyId);
-    return BTreePageCodec.decodePayload(
+    return StorePageCodec.decodePayload(
       encoded,
       encryptionKey: keys.key,
       encryptionKeyId: keys.keyId,
@@ -560,7 +560,7 @@ final class TreeMetaPageService {
     return (key: state.activeKey, keyId: state.keyId);
   }
 
-  Uint8List _aad(int partitionNo, BTreePageType type) {
+  Uint8List _aad(int partitionNo, StorePageType type) {
     final bd = ByteData(9);
     bd.setInt32(0, partitionNo, Endian.little);
     bd.setInt32(4, 0, Endian.little);

@@ -6,7 +6,7 @@ import '../model/meta_info.dart';
 import '../model/ngh_index_meta.dart';
 import '../model/table_context.dart';
 import '../model/table_identity.dart';
-import 'btree_page.dart';
+import 'store_page.dart';
 import 'ngh_page.dart';
 import 'ngh_partition_manager.dart';
 
@@ -26,15 +26,15 @@ final class NghPkMapWrite {
 /// In-memory PK-map node (leaf or internal) staged for flush. No page redo.
 final class NghPkMapDirtyPage {
   final bool isLeaf;
-  final LeafPage? leaf;
-  final InternalPage? internal;
+  final BTreeLeafPage? leaf;
+  final BTreeInternalPage? internal;
 
-  NghPkMapDirtyPage.leaf(LeafPage page)
+  NghPkMapDirtyPage.leaf(BTreeLeafPage page)
       : isLeaf = true,
         leaf = page,
         internal = null;
 
-  NghPkMapDirtyPage.internal(InternalPage page)
+  NghPkMapDirtyPage.internal(BTreeInternalPage page)
       : isLeaf = false,
         leaf = null,
         internal = page;
@@ -47,8 +47,8 @@ final class NghPkMapDirtyPage {
       ? (leaf?.encodePayload() ?? Uint8List(0))
       : (internal?.encodePayload() ?? Uint8List(0));
 
-  BTreePageType get pageType =>
-      isLeaf ? BTreePageType.leaf : BTreePageType.internal;
+  StorePageType get pageType =>
+      isLeaf ? StorePageType.leaf : StorePageType.internal;
 }
 
 /// Mutable PK-map write batch (dirty nodes + meta).
@@ -93,7 +93,7 @@ final class NghPkMapEngine {
     Set<int>? dirtyLeafKeys,
   }) async {
     if (entries.isEmpty) return;
-    ({NghPagePtr ptr, LeafPage page})? cursor;
+    ({NghPagePtr ptr, BTreeLeafPage page})? cursor;
     final filterDirty = dirtyLeafKeys != null && dirtyLeafKeys.isNotEmpty;
     final filterRewrite = rewrittenIds.isNotEmpty;
     // Merge only when a filter is present — bare mergeRewritten would keep
@@ -171,7 +171,7 @@ final class NghPkMapEngine {
         pkmapRootPage: ptr.first.pageNo,
         pkmapHeight: 1,
       );
-      final leaf = LeafPage.empty();
+      final leaf = BTreeLeafPage.empty();
       leaf.upsert(key, value);
       batch.dirty[ptr.first] = NghPkMapDirtyPage.leaf(leaf);
       return;
@@ -197,22 +197,22 @@ final class NghPkMapEngine {
     batch.dirty[found.ptr] = NghPkMapDirtyPage.leaf(found.page);
   }
 
-  bool _fits(int plainLen) => BTreePageSizer.fitsInPage(
+  bool _fits(int plainLen) => StorePageSizer.fitsInPage(
         pageSize: _pageSize,
         plainPayloadLen: plainLen,
         config: _config,
       );
 
-  bool _keyFitsLeaf(LeafPage leaf, Uint8List key) {
+  bool _keyFitsLeaf(BTreeLeafPage leaf, Uint8List key) {
     if (leaf.highKey.isEmpty) return true;
     return MemComparableKey.compare(key, leaf.highKey) <= 0;
   }
 
-  Future<({NghPagePtr ptr, LeafPage page})?> _leafForSortedKey(
+  Future<({NghPagePtr ptr, BTreeLeafPage page})?> _leafForSortedKey(
     TableContext table,
     IndexUid indexUid,
     NghPkMapBatch batch,
-    ({NghPagePtr ptr, LeafPage page})? cursor,
+    ({NghPagePtr ptr, BTreeLeafPage page})? cursor,
     Uint8List key,
   ) async {
     var cur = cursor;
@@ -235,7 +235,7 @@ final class NghPkMapEngine {
     return _findLeaf(table, indexUid, batch, key);
   }
 
-  Future<({NghPagePtr ptr, LeafPage page})?> _findLeaf(
+  Future<({NghPagePtr ptr, BTreeLeafPage page})?> _findLeaf(
     TableContext table,
     IndexUid indexUid,
     NghPkMapBatch batch,
@@ -278,7 +278,7 @@ final class NghPkMapEngine {
     IndexUid indexUid,
     NghPkMapBatch batch,
     NghPagePtr leftPtr,
-    LeafPage left,
+    BTreeLeafPage left,
   ) async {
     final split = left.split();
     final (rightPtrs, metaAfter) = _partitions.allocatePagesBatchSync(
@@ -301,7 +301,7 @@ final class NghPkMapEngine {
         1,
       );
       batch.meta = meta2;
-      final root = InternalPage.empty();
+      final root = BTreeInternalPage.empty();
       root.maxKeys.add(split.leftMaxKey);
       root.children.add(TreePagePtr(leftPtr.partitionNo, leftPtr.pageNo));
       root.maxKeys.add(Uint8List(0));
@@ -338,7 +338,7 @@ final class NghPkMapEngine {
     var part = batch.meta.pkmapRootPartition;
     var pageNo = batch.meta.pkmapRootPage;
     NghPagePtr? parentPtr;
-    InternalPage? parent;
+    BTreeInternalPage? parent;
     for (int level = batch.meta.pkmapHeight; level > parentHeight; level--) {
       final ptr = NghPagePtr(NghDataCategory.pkmap, part, pageNo);
       final node = await _load(table, indexUid, batch, ptr);
@@ -382,7 +382,7 @@ final class NghPkMapEngine {
         1,
       );
       batch.meta = meta2;
-      final root = InternalPage.empty();
+      final root = BTreeInternalPage.empty();
       root.maxKeys.add(split.leftMaxKey);
       root.children.add(TreePagePtr(parentPtr.partitionNo, parentPtr.pageNo));
       root.maxKeys.add(Uint8List(0));

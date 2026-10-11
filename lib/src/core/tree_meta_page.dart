@@ -2,7 +2,7 @@ import 'dart:typed_data';
 
 import '../handler/binary_codec.dart';
 import '../handler/meta_binary_codec.dart';
-import 'btree_page.dart';
+import 'store_page.dart';
 import 'ngh_page.dart';
 
 /// Stable field IDs for [TreeMetaPagePayload]. Reserved: 3..127, 128..255 extension.

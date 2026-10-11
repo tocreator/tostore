@@ -8,14 +8,14 @@ import '../model/db_exception.dart';
 import '../model/ngh_index_meta.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
-import 'btree_page.dart';
+import 'store_page.dart';
 import 'vector_quantizer.dart';
 
 // ============================================================================
 // NGH Page Structures
 //
-// All pages reuse BTreePageHeader (20-byte header with magic/CRC/type/flags)
-// and BTreePageIO for encoding/decoding.
+// All pages reuse StorePageHeader (20-byte header with magic/CRC/type/flags)
+// and StorePageIO for encoding/decoding.
 //
 // Page types:
 //   nghMeta -- per-partition-file metadata (pageNo=0)
@@ -1609,7 +1609,7 @@ final class NghPkLocator {
 final class NghPageSizer {
   NghPageSizer._();
 
-  static const int pageHeaderSize = BTreePageHeader.size; // 20
+  static const int pageHeaderSize = StorePageHeader.size; // 20
 
   /// Safety margin for encoding/encryption overhead (header, padding, etc).
   static const int encodingSafetyMargin = 64;
@@ -1627,7 +1627,7 @@ final class NghPageSizer {
   /// PK bytes reserved when choosing a leaf page size (typical keys).
   static const int leafSlotPkBudget = 256;
 
-  /// Flush-time overhead matching [BTreePageSizer.fitsInPage] (128) plus
+  /// Flush-time overhead matching [StorePageSizer.fitsInPage] (128) plus
   /// encoder/AEAD slack so page-size choice stays valid with encryption on.
   static const int flushFitOverhead =
       pageHeaderSize + 128 + encodingSafetyMargin;
@@ -1695,7 +1695,7 @@ final class NghPageSizer {
   }
 
   /// Bytes reserved besides the centroid records: TPG2 header, page payload
-  /// header, encoder/AEAD slack, and [BTreePageSizer] 128-byte flush margin.
+  /// header, encoder/AEAD slack, and [StorePageSizer] 128-byte flush margin.
   static const int navPagePackReserve =
       pageHeaderSize + 12 + encodingSafetyMargin + 128 + 48;
 
@@ -1991,7 +1991,7 @@ final class NghNavBTreePage {
   static const int flagLeafLevel = 0x1;
 
   /// Maximum entries that fit safely in a 16KB Nav page.
-  /// 16384 - 20 (BTreePageHeader) - 20 (NghNavBTreePage header) = 16344 bytes.
+  /// 16384 - 20 (StorePageHeader) - 20 (NghNavBTreePage header) = 16344 bytes.
   /// Floor(16344 / 206) = 79 max. 64 provides generous 3.1KB safety margin.
   static const int maxEntriesPerPage = 64;
 

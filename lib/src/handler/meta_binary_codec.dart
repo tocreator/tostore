@@ -1,6 +1,6 @@
 import 'dart:typed_data';
 
-import '../core/btree_page.dart';
+import '../core/store_page.dart';
 import '../core/ngh_page.dart';
 import '../model/db_exception.dart';
 import '../model/meta_info.dart';

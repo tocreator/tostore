@@ -22,7 +22,6 @@ import '../model/stored_value.dart';
 import '../model/table_context.dart';
 import '../model/table_schema.dart';
 import '../model/value_ref.dart';
-import 'btree_page.dart';
 import 'compute/btree_page_encode_batch_runner.dart';
 import 'compute/compute_batch_planner.dart';
 import 'compute/table_record_encode_compute.dart';
@@ -32,9 +31,10 @@ import 'cpu_work_chunk.dart';
 import 'data_store_impl.dart';
 import 'overflow_manager.dart';
 import 'overflow_pack_session.dart';
-import 'toast_planner.dart';
 import 'page_redo_log_codec.dart';
 import 'storage_adapter.dart';
+import 'store_page.dart';
+import 'toast_planner.dart';
 import 'tree_cache.dart';
 import 'workload_scheduler.dart';
 import 'yield_controller.dart';
@@ -354,8 +354,8 @@ final class TableTreePartitionManager {
   // Key format: [tableName, partitionNo, pageNo]
   // This cache significantly reduces IO reads for frequently accessed pages,
   // especially internal nodes which are shared across many queries.
-  late final TreeCache<LeafPage> _leafPageCache;
-  late final TreeCache<InternalPage> _internalPageCache;
+  late final TreeCache<BTreeLeafPage> _leafPageCache;
+  late final TreeCache<BTreeInternalPage> _internalPageCache;
   final Map<String, Uint8List?> _physicalMaxPkBytesCache = {};
 
   TableTreePartitionManager(this._dataStore) {
@@ -368,7 +368,7 @@ final class TableTreePartitionManager {
     final int leafCacheSize = (pageCacheSize * 0.50).toInt();
     final int internalCacheSize = pageCacheSize - leafCacheSize;
 
-    _leafPageCache = TreeCache<LeafPage>(
+    _leafPageCache = TreeCache<BTreeLeafPage>(
       sizeCalculator: _estimateLeafPageSize,
       maxByteThreshold: leafCacheSize,
       minByteThreshold: 50 * 1024 * 1024, // 50MB minimum
@@ -376,7 +376,7 @@ final class TableTreePartitionManager {
       debugLabel: 'TableLeafPageCache',
     );
 
-    _internalPageCache = TreeCache<InternalPage>(
+    _internalPageCache = TreeCache<BTreeInternalPage>(
       sizeCalculator: _estimateInternalPageSize,
       maxByteThreshold: internalCacheSize,
       minByteThreshold: 50 * 1024 * 1024, // 50MB minimum
@@ -445,8 +445,8 @@ final class TableTreePartitionManager {
     return merged;
   }
 
-  /// Estimate size in bytes for a LeafPage
-  int _estimateLeafPageSize(LeafPage page) {
+  /// Estimate size in bytes for a BTreeLeafPage
+  int _estimateLeafPageSize(BTreeLeafPage page) {
     int size = 64; // Object overhead
     size += page.highKey.length;
     for (final k in page.keys) {
@@ -458,8 +458,8 @@ final class TableTreePartitionManager {
     return size;
   }
 
-  /// Estimate size in bytes for an InternalPage
-  int _estimateInternalPageSize(InternalPage page) {
+  /// Estimate size in bytes for an BTreeInternalPage
+  int _estimateInternalPageSize(BTreeInternalPage page) {
     int size = 64; // Object overhead
     for (final k in page.maxKeys) {
       size += k.length;
@@ -508,14 +508,14 @@ final class TableTreePartitionManager {
 
   /// Authoritative publish after writeChanges mutates a page.
   /// Force-overwrite so concurrent file reads cannot keep a stale page.
-  void _publishLeafPage(String tableUid, TreePagePtr ptr, LeafPage leaf) {
+  void _publishLeafPage(String tableUid, TreePagePtr ptr, BTreeLeafPage leaf) {
     if (ptr.isNull) return;
     _leafPageCache.putPoint3(tableUid, ptr.partitionNo, ptr.pageNo, leaf);
     _physicalMaxPkBytesCache.remove(tableUid);
   }
 
   void _publishInternalPage(
-      String tableUid, TreePagePtr ptr, InternalPage page) {
+      String tableUid, TreePagePtr ptr, BTreeInternalPage page) {
     if (ptr.isNull) return;
     _internalPageCache.putPoint3(tableUid, ptr.partitionNo, ptr.pageNo, page);
   }
@@ -528,14 +528,15 @@ final class TableTreePartitionManager {
   }
 
   /// File-read populate: never overwrite a page published by writeChanges.
-  void _offerLeafPageFromFile(String tableUid, TreePagePtr ptr, LeafPage leaf) {
+  void _offerLeafPageFromFile(
+      String tableUid, TreePagePtr ptr, BTreeLeafPage leaf) {
     if (ptr.isNull || leaf.keys.isEmpty) return;
     _leafPageCache.putIfAbsentPoint3(
         tableUid, ptr.partitionNo, ptr.pageNo, leaf);
   }
 
   void _offerInternalPageFromFile(
-      String tableUid, TreePagePtr ptr, InternalPage page) {
+      String tableUid, TreePagePtr ptr, BTreeInternalPage page) {
     if (ptr.isNull || page.children.isEmpty) return;
     _internalPageCache.putIfAbsentPoint3(
         tableUid, ptr.partitionNo, ptr.pageNo, page);
@@ -620,18 +621,18 @@ final class TableTreePartitionManager {
   TableDataMeta _consumeNextPageNo(TableDataMeta state) =>
       state.copyWith(btreeNextPageNo: state.btreeNextPageNo + 1);
 
-  Future<LeafPage> _readLeafPage(
+  Future<BTreeLeafPage> _readLeafPage(
     TableContext table,
     TableDataMeta meta,
     TreePagePtr ptr, {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
-    Map<String, LeafPage>? localCache,
+    Map<String, BTreeLeafPage>? localCache,
     bool readFromFileOnly = false,
   }) async {
     final tableName = table.tableName;
     final tableUid = table.tableUid;
-    if (ptr.isNull) return LeafPage.empty();
+    if (ptr.isNull) return BTreeLeafPage.empty();
 
     // Check local cache first (for writeChanges batch consistency)
     if (localCache != null) {
@@ -654,24 +655,25 @@ final class TableTreePartitionManager {
     // Cache miss: read from disk
     final count = meta.btreePartitionCount;
     if (ptr.partitionNo < 0 || ptr.partitionNo >= count) {
-      return LeafPage.empty();
+      return BTreeLeafPage.empty();
     }
     final path = _partitionFilePath(table, meta, ptr.partitionNo);
     final offset = ptr.pageNo * _dataStore.configuredPageSize;
     final raw = await _storage.readAsBytesAt(path, offset,
         length: _dataStore.configuredPageSize);
-    if (raw.isEmpty) return LeafPage.empty();
+    if (raw.isEmpty) return BTreeLeafPage.empty();
     try {
-      final parsed = BTreePageIO.parsePageBytes(raw);
-      if (parsed.type == BTreePageType.free) return LeafPage.empty();
-      if (parsed.type != BTreePageType.leaf) return LeafPage.empty();
-      final payload = BTreePageCodec.decodePayload(
+      final parsed = StorePageIO.parsePageBytes(raw);
+      if (parsed.type == StorePageType.free) return BTreeLeafPage.empty();
+      if (parsed.type != StorePageType.leaf) return BTreeLeafPage.empty();
+      final payload = StorePageCodec.decodePayload(
         parsed.encodedPayload,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
         aad: _aad(ptr, parsed.type),
       );
-      final leaf = LeafPage.tryDecodePayload(payload) ?? LeafPage.empty();
+      final leaf =
+          BTreeLeafPage.tryDecodePayload(payload) ?? BTreeLeafPage.empty();
 
       // Cache the page (both local and instance-level).
       // Instance put is putIfAbsent -- never stomp writeChanges-published pages.
@@ -694,7 +696,7 @@ final class TableTreePartitionManager {
     }
   }
 
-  Uint8List _aad(TreePagePtr ptr, BTreePageType type) {
+  Uint8List _aad(TreePagePtr ptr, StorePageType type) {
     // AAD = [partitionNo:i32][pageNo:i32][type:u8]
     final bd = ByteData(9);
     bd.setInt32(0, ptr.partitionNo, Endian.little);
@@ -703,18 +705,18 @@ final class TableTreePartitionManager {
     return bd.buffer.asUint8List();
   }
 
-  Future<InternalPage> _readInternalPage(
+  Future<BTreeInternalPage> _readInternalPage(
     TableContext table,
     TableDataMeta meta,
     TreePagePtr ptr, {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
-    Map<String, InternalPage>? localCache,
+    Map<String, BTreeInternalPage>? localCache,
     bool readFromFileOnly = false,
   }) async {
     final tableName = table.tableName;
     final tableUid = table.tableUid;
-    if (ptr.isNull) return InternalPage.empty();
+    if (ptr.isNull) return BTreeInternalPage.empty();
 
     // Check local cache first (for writeChanges batch consistency)
     if (localCache != null) {
@@ -737,25 +739,27 @@ final class TableTreePartitionManager {
     // Cache miss: read from disk
     final count = meta.btreePartitionCount;
     if (ptr.partitionNo < 0 || ptr.partitionNo >= count) {
-      return InternalPage.empty();
+      return BTreeInternalPage.empty();
     }
     final path = _partitionFilePath(table, meta, ptr.partitionNo);
     final offset = ptr.pageNo * _dataStore.configuredPageSize;
     final raw = await _storage.readAsBytesAt(path, offset,
         length: _dataStore.configuredPageSize);
-    if (raw.isEmpty) return InternalPage.empty();
+    if (raw.isEmpty) return BTreeInternalPage.empty();
     try {
-      final parsed = BTreePageIO.parsePageBytes(raw);
-      if (parsed.type == BTreePageType.free) return InternalPage.empty();
-      if (parsed.type != BTreePageType.internal) return InternalPage.empty();
-      final payload = BTreePageCodec.decodePayload(
+      final parsed = StorePageIO.parsePageBytes(raw);
+      if (parsed.type == StorePageType.free) return BTreeInternalPage.empty();
+      if (parsed.type != StorePageType.internal) {
+        return BTreeInternalPage.empty();
+      }
+      final payload = StorePageCodec.decodePayload(
         parsed.encodedPayload,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
         aad: _aad(ptr, parsed.type),
       );
-      final page =
-          InternalPage.tryDecodePayload(payload) ?? InternalPage.empty();
+      final page = BTreeInternalPage.tryDecodePayload(payload) ??
+          BTreeInternalPage.empty();
 
       // Cache the page (both local and instance-level).
       // Instance put is putIfAbsent -- never stomp writeChanges-published pages.
@@ -830,7 +834,7 @@ final class TableTreePartitionManager {
       lastLeafPtr.partitionNo,
       lastLeafPtr.pageNo,
     );
-    LeafPage leaf;
+    BTreeLeafPage leaf;
     try {
       leaf = cachedLeaf ?? await _readLeafPage(table, meta, lastLeafPtr);
     } catch (_) {
@@ -1114,8 +1118,8 @@ final class TableTreePartitionManager {
     // ---- Local page cache to avoid re-reading within this batch ----
     // Moved from instance variables to local variables to prevent memory bloat
     // in large-scale data scenarios. Cache is automatically cleared after method returns.
-    final Map<String, LeafPage> leafCache = {};
-    final Map<String, InternalPage> internalCache = {};
+    final Map<String, BTreeLeafPage> leafCache = {};
+    final Map<String, BTreeInternalPage> internalCache = {};
 
     _PartitionStats getStats(int pNo) =>
         partitionStats.putIfAbsent(pNo, () => _PartitionStats());
@@ -1143,7 +1147,7 @@ final class TableTreePartitionManager {
               _dataStore.treeMetaPageService.parsePartitionLocalFromPageBytes(
             raw0,
             partitionNo: pNo,
-            pageType: BTreePageType.meta,
+            pageType: StorePageType.meta,
             encryptionKey: encryptionKey,
             encryptionKeyId: encryptionKeyId,
           );
@@ -1190,8 +1194,8 @@ final class TableTreePartitionManager {
         stats.dirEnsured = true;
       }
       final next = stats.freeListHeadPageNo;
-      final freeBytes = BTreePageIO.buildPageBytes(
-        type: BTreePageType.free,
+      final freeBytes = StorePageIO.buildPageBytes(
+        type: StorePageType.free,
         encodedPayload: FreePage(nextFreePageNo: next).encodePayload(),
         pageSize: _dataStore.configuredPageSize,
       );
@@ -1215,8 +1219,8 @@ final class TableTreePartitionManager {
           await _storage.readAsBytesAt(stats.path!, off, length: pageSize);
       if (raw.isEmpty) return null;
       try {
-        final parsed = BTreePageIO.parsePageBytes(raw);
-        if (parsed.type != BTreePageType.free) {
+        final parsed = StorePageIO.parsePageBytes(raw);
+        if (parsed.type != StorePageType.free) {
           throw DbException([
             GeneralStatus(
               type: ResultType.engError,
@@ -1252,12 +1256,13 @@ final class TableTreePartitionManager {
     }
 
     // ---- Dirty pages (encode once per page at end) ----
-    final Map<TreePagePtr, LeafPage> dirtyLeaves = <TreePagePtr, LeafPage>{};
-    final Map<TreePagePtr, InternalPage> dirtyInternals =
-        <TreePagePtr, InternalPage>{};
+    final Map<TreePagePtr, BTreeLeafPage> dirtyLeaves =
+        <TreePagePtr, BTreeLeafPage>{};
+    final Map<TreePagePtr, BTreeInternalPage> dirtyInternals =
+        <TreePagePtr, BTreeInternalPage>{};
 
-    bool leafFits(LeafPage leaf) {
-      return BTreePageSizer.fitsInPage(
+    bool leafFits(BTreeLeafPage leaf) {
+      return StorePageSizer.fitsInPage(
         pageSize: _dataStore.configuredPageSize,
         plainPayloadLen: leaf.estimatePayloadSize(),
         config: _config,
@@ -1265,8 +1270,8 @@ final class TableTreePartitionManager {
       );
     }
 
-    bool internalFits(InternalPage page) {
-      return BTreePageSizer.fitsInPage(
+    bool internalFits(BTreeInternalPage page) {
+      return StorePageSizer.fitsInPage(
         pageSize: _dataStore.configuredPageSize,
         plainPayloadLen: page.estimatePayloadSize(),
         config: _config,
@@ -1274,7 +1279,7 @@ final class TableTreePartitionManager {
       );
     }
 
-    void markLeafDirty(TreePagePtr ptr, LeafPage leaf) {
+    void markLeafDirty(TreePagePtr ptr, BTreeLeafPage leaf) {
       leafCache[keyOfPtr(ptr)] = leaf;
       dirtyLeaves[ptr] = leaf;
       _publishLeafPage(tableUid, ptr, leaf);
@@ -1282,7 +1287,7 @@ final class TableTreePartitionManager {
       stats.maxPageNoWritten = max(stats.maxPageNoWritten, ptr.pageNo);
     }
 
-    void markInternalDirty(TreePagePtr ptr, InternalPage page) {
+    void markInternalDirty(TreePagePtr ptr, BTreeInternalPage page) {
       internalCache[keyOfPtr(ptr)] = page;
       dirtyInternals[ptr] = page;
       _publishInternalPage(tableUid, ptr, page);
@@ -1290,14 +1295,14 @@ final class TableTreePartitionManager {
       stats.maxPageNoWritten = max(stats.maxPageNoWritten, ptr.pageNo);
     }
 
-    Future<LeafPage> getLeaf(TreePagePtr ptr) async {
+    Future<BTreeLeafPage> getLeaf(TreePagePtr ptr) async {
       return await _readLeafPage(table, meta, ptr,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           localCache: leafCache);
     }
 
-    Future<InternalPage> getInternal(TreePagePtr ptr) async {
+    Future<BTreeInternalPage> getInternal(TreePagePtr ptr) async {
       return await _readInternalPage(table, meta, ptr,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
@@ -1314,7 +1319,7 @@ final class TableTreePartitionManager {
 
       final pageSize = _dataStore.configuredPageSize;
       final nextPg = meta.btreeNextPageNo;
-      if (BTreeAllocator.estimateFileSizeBytes(pageSize, nextPg) >
+      if (StorePageAllocator.estimateFileSizeBytes(pageSize, nextPg) >
           _config.maxPartitionFileSize) {
         meta = _rotatePartition(meta);
       }
@@ -1327,7 +1332,7 @@ final class TableTreePartitionManager {
     Future<TreePagePtr> ensureRootLeaf() async {
       if (!meta.btreeRoot.isNull) return meta.btreeRoot;
       final ptr = await allocatePage();
-      final leaf = LeafPage.empty(); // highKey empty => +INF (rightmost)
+      final leaf = BTreeLeafPage.empty(); // highKey empty => +INF (rightmost)
       meta = meta.copyWith(
           btreeFirstLeaf: ptr,
           btreeLastLeaf: ptr,
@@ -1368,7 +1373,7 @@ final class TableTreePartitionManager {
     }) async {
       if (frames.isEmpty) {
         // New root.
-        final root = InternalPage(
+        final root = BTreeInternalPage(
           maxKeys: <Uint8List>[leftHighKey, rightHighKey],
           children: <TreePagePtr>[leftPtr, rightPtr],
         );
@@ -1406,7 +1411,7 @@ final class TableTreePartitionManager {
       );
     }
 
-    bool isLeafUnderfull(LeafPage leaf) {
+    bool isLeafUnderfull(BTreeLeafPage leaf) {
       if (leaf.keys.isEmpty) return false;
       // Approximate fill based on plaintext payload; good enough for heuristic.
       final int used = leaf.estimatePayloadSize();
@@ -1416,7 +1421,7 @@ final class TableTreePartitionManager {
 
     Future<void> tryMergeLeafWithRightSibling(
       TreePagePtr leafPtr,
-      LeafPage leaf,
+      BTreeLeafPage leaf,
       List<_Frame> frames,
     ) async {
       if (meta.btreeHeight <= 0) return;
@@ -1433,7 +1438,7 @@ final class TableTreePartitionManager {
       final right = await getLeaf(rightPtr);
       if (right.keys.isEmpty) return;
 
-      final merged = LeafPage(
+      final merged = BTreeLeafPage(
         prev: leaf.prev,
         next: right.next,
         highKey: right.highKey,
@@ -1488,7 +1493,7 @@ final class TableTreePartitionManager {
 
     // Bulk cursor: for sorted keys, avoid descending the tree for every record.
     TreePagePtr? curLeafPtr;
-    LeafPage? curLeaf;
+    BTreeLeafPage? curLeaf;
 
     Future<TreePagePtr> descendToLeafPtrOnly(Uint8List key) async {
       await ensureRootLeaf();
@@ -1631,7 +1636,7 @@ final class TableTreePartitionManager {
       final keyBytes = op.pkBytes;
 
       TreePagePtr leafPtr;
-      LeafPage leaf;
+      BTreeLeafPage leaf;
       final lp = curLeafPtr;
       final lf = curLeaf;
       if (lp != null &&
@@ -1797,7 +1802,7 @@ final class TableTreePartitionManager {
       final bool useIsolateForPageEncode =
           shouldUseIsolateForPageEncode(totalPagesToEncode);
 
-      bool payloadFitsInPage(int plainPayloadLen) => BTreePageSizer.fitsInPage(
+      bool payloadFitsInPage(int plainPayloadLen) => StorePageSizer.fitsInPage(
             pageSize: _dataStore.configuredPageSize,
             plainPayloadLen: plainPayloadLen,
             config: _config,
@@ -1897,14 +1902,14 @@ final class TableTreePartitionManager {
           }
           pendingPtrs.add(ptr);
           pending.add(BTreePageEncodeItem(
-            typeIndex: BTreePageType.leaf.index,
+            typeIndex: StorePageType.leaf.index,
             partitionNo: ptr.partitionNo,
             pageNo: ptr.pageNo,
             payload: leftPayload,
           ));
           pendingPtrs.add(rightPtr);
           pending.add(BTreePageEncodeItem(
-            typeIndex: BTreePageType.leaf.index,
+            typeIndex: StorePageType.leaf.index,
             partitionNo: rightPtr.partitionNo,
             pageNo: rightPtr.pageNo,
             payload: rightPayload,
@@ -1979,14 +1984,14 @@ final class TableTreePartitionManager {
           }
           pendingPtrs.add(ptr);
           pending.add(BTreePageEncodeItem(
-            typeIndex: BTreePageType.internal.index,
+            typeIndex: StorePageType.internal.index,
             partitionNo: ptr.partitionNo,
             pageNo: ptr.pageNo,
             payload: leftPayload,
           ));
           pendingPtrs.add(rightNodePtr);
           pending.add(BTreePageEncodeItem(
-            typeIndex: BTreePageType.internal.index,
+            typeIndex: StorePageType.internal.index,
             partitionNo: rightNodePtr.partitionNo,
             pageNo: rightNodePtr.pageNo,
             payload: rightPayload,
@@ -2033,7 +2038,7 @@ final class TableTreePartitionManager {
                 _dataStore.treeMetaPageService.parsePartitionLocalFromPageBytes(
               raw0,
               partitionNo: pNo,
-              pageType: BTreePageType.meta,
+              pageType: StorePageType.meta,
               encryptionKey: encryptionKey,
               encryptionKeyId: encryptionKeyId,
             );
@@ -2088,7 +2093,7 @@ final class TableTreePartitionManager {
               _dataStore.treeMetaPageService.buildPartitionPage0Bytes(
             pageSize: pageSize,
             partitionNo: pNo,
-            pageType: BTreePageType.meta,
+            pageType: StorePageType.meta,
             partitionLocal: PartitionLocalStats(
               partitionNo: pNo,
               totalEntryCount: newEntries,
@@ -2200,7 +2205,7 @@ final class TableTreePartitionManager {
         final p0Bytes = _dataStore.treeMetaPageService.buildPartitionPage0Bytes(
           pageSize: pageSize,
           partitionNo: 0,
-          pageType: BTreePageType.meta,
+          pageType: StorePageType.meta,
           partitionLocal: PartitionLocalStats(
             partitionNo: 0,
             totalEntryCount: p0NewEntries,
@@ -2439,7 +2444,7 @@ final class TableTreePartitionManager {
               _dataStore.treeMetaPageService.parsePartitionLocalFromPageBytes(
             raw0,
             partitionNo: pNo,
-            pageType: BTreePageType.meta,
+            pageType: StorePageType.meta,
             encryptionKey: encryptionKey,
             encryptionKeyId: encryptionKeyId,
           );
@@ -2469,8 +2474,8 @@ final class TableTreePartitionManager {
         s.dirEnsured = true;
       }
       final next = s.freeListHeadPageNo;
-      final freeBytes = BTreePageIO.buildPageBytes(
-        type: BTreePageType.free,
+      final freeBytes = StorePageIO.buildPageBytes(
+        type: StorePageType.free,
         encodedPayload: FreePage(nextFreePageNo: next).encodePayload(),
         pageSize: _dataStore.configuredPageSize,
       );
@@ -2481,39 +2486,39 @@ final class TableTreePartitionManager {
       s.maxPageNoWritten = max(s.maxPageNoWritten, pagePtr.pageNo);
     }
 
-    Uint8List encodeLeaf(TreePagePtr p, LeafPage leaf) {
+    Uint8List encodeLeaf(TreePagePtr p, BTreeLeafPage leaf) {
       final plain = leaf.encodePayload();
-      final enc = BTreePageCodec.encodePayload(
+      final enc = StorePageCodec.encodePayload(
         plain,
         config: _config,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
-        aad: _aad(p, BTreePageType.leaf),
+        aad: _aad(p, StorePageType.leaf),
       );
-      return BTreePageIO.buildPageBytes(
-        type: BTreePageType.leaf,
+      return StorePageIO.buildPageBytes(
+        type: StorePageType.leaf,
         encodedPayload: enc,
         pageSize: _dataStore.configuredPageSize,
       );
     }
 
-    Uint8List encodeInternal(TreePagePtr p, InternalPage node) {
+    Uint8List encodeInternal(TreePagePtr p, BTreeInternalPage node) {
       final plain = node.encodePayload();
-      final enc = BTreePageCodec.encodePayload(
+      final enc = StorePageCodec.encodePayload(
         plain,
         config: _config,
         encryptionKey: encryptionKey,
         encryptionKeyId: encryptionKeyId,
-        aad: _aad(p, BTreePageType.internal),
+        aad: _aad(p, StorePageType.internal),
       );
-      return BTreePageIO.buildPageBytes(
-        type: BTreePageType.internal,
+      return StorePageIO.buildPageBytes(
+        type: StorePageType.internal,
         encodedPayload: enc,
         pageSize: _dataStore.configuredPageSize,
       );
     }
 
-    bool underfull(LeafPage leaf) {
+    bool underfull(BTreeLeafPage leaf) {
       if (leaf.keys.isEmpty) return false;
       final used = leaf.estimatePayloadSize();
       return used > 0 && used < (_dataStore.configuredPageSize * 0.25).floor();
@@ -2582,14 +2587,14 @@ final class TableTreePartitionManager {
         continue;
       }
 
-      final mergedLeaf = LeafPage(
+      final mergedLeaf = BTreeLeafPage(
         prev: leaf.prev,
         next: right.next,
         highKey: right.highKey,
         keys: <Uint8List>[...leaf.keys, ...right.keys],
         values: <Uint8List>[...leaf.values, ...right.values],
       );
-      if (!BTreePageSizer.fitsInPage(
+      if (!StorePageSizer.fitsInPage(
         pageSize: _dataStore.configuredPageSize,
         plainPayloadLen: mergedLeaf.estimatePayloadSize(),
         config: _config,
@@ -2699,7 +2704,7 @@ final class TableTreePartitionManager {
             _dataStore.treeMetaPageService.buildPartitionPage0Bytes(
               pageSize: _dataStore.configuredPageSize,
               partitionNo: 0,
-              pageType: BTreePageType.meta,
+              pageType: StorePageType.meta,
               partitionLocal: local,
               treeGlobalMeta: globalBlob,
               encryptionKey: encryptionKey,
@@ -2713,7 +2718,7 @@ final class TableTreePartitionManager {
             _dataStore.treeMetaPageService.buildPartitionPage0Bytes(
               pageSize: _dataStore.configuredPageSize,
               partitionNo: pNo,
-              pageType: BTreePageType.meta,
+              pageType: StorePageType.meta,
               partitionLocal: local,
               encryptionKey: encryptionKey,
               encryptionKeyId: encryptionKeyId,
@@ -2867,7 +2872,7 @@ final class TableTreePartitionManager {
       final y16 = yc?.maybeYield();
       if (y16 != null) await y16;
       final ptr = e.key;
-      LeafPage? leaf = readFromFileOnly
+      BTreeLeafPage? leaf = readFromFileOnly
           ? null
           : _leafPageCache.getPoint3(tableUid, ptr.partitionNo, ptr.pageNo);
       leaf ??= await _readLeafPage(table, meta, ptr,
@@ -2926,7 +2931,7 @@ final class TableTreePartitionManager {
     if (ptr.isNull) ptr = (meta.btreeFirstLeaf);
 
     // Cache-first leaf retrieval: if in memory, 0 await and purely synchronous binary search
-    LeafPage? leaf =
+    BTreeLeafPage? leaf =
         _leafPageCache.getPoint3(table.tableUid, ptr.partitionNo, ptr.pageNo);
     leaf ??= await _readLeafPage(table, meta, ptr);
     return leaf.find(keyBytes) != null;
@@ -3010,7 +3015,7 @@ final class TableTreePartitionManager {
       final ptr = entry.key;
 
       // Cache-first leaf retrieval: if leaf page is in memory, 0 await and purely synchronous binary search!
-      LeafPage? leaf =
+      BTreeLeafPage? leaf =
           _leafPageCache.getPoint3(tableUid, ptr.partitionNo, ptr.pageNo);
       leaf ??= await _readLeafPage(table, meta, ptr);
 
@@ -3118,24 +3123,24 @@ final class TableTreePartitionManager {
         pageOffsetInRange + pageSize,
       );
 
-      LeafPage leaf;
+      BTreeLeafPage leaf;
       try {
-        final parsed = BTreePageIO.parsePageBytes(raw);
-        if (parsed.type == BTreePageType.free ||
-            parsed.type == BTreePageType.internal ||
-            parsed.type == BTreePageType.meta) {
+        final parsed = StorePageIO.parsePageBytes(raw);
+        if (parsed.type == StorePageType.free ||
+            parsed.type == StorePageType.internal ||
+            parsed.type == StorePageType.meta) {
           continue;
         }
-        if (parsed.type != BTreePageType.leaf) {
+        if (parsed.type != StorePageType.leaf) {
           continue;
         }
-        final payload = BTreePageCodec.decodePayload(
+        final payload = StorePageCodec.decodePayload(
           parsed.encodedPayload,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           aad: _aad(ptr, parsed.type),
         );
-        leaf = LeafPage.tryDecodePayload(payload) ?? LeafPage.empty();
+        leaf = BTreeLeafPage.tryDecodePayload(payload) ?? BTreeLeafPage.empty();
       } catch (e) {
         final offset = pageNo * pageSize;
         throw DbException.forceWrap(
@@ -3406,9 +3411,9 @@ final class TableTreePartitionManager {
     // One-step prefetch for the next leaf page in the chain.
     // This pipelines IO with per-record decoding work and improves large range scans
     // without changing storage interfaces or materializing large lists.
-    final Map<String, Future<LeafPage>> prefetched =
-        <String, Future<LeafPage>>{};
-    Future<LeafPage> getLeaf(TreePagePtr p) {
+    final Map<String, Future<BTreeLeafPage>> prefetched =
+        <String, Future<BTreeLeafPage>>{};
+    Future<BTreeLeafPage> getLeaf(TreePagePtr p) {
       final k = keyOfPtr(p);
       final f = prefetched.remove(k);
       if (f != null) return f;
@@ -3452,7 +3457,7 @@ final class TableTreePartitionManager {
     final visited = <int>{};
     int toKey(TreePagePtr p) => (p.partitionNo << 32) | (p.pageNo & 0xFFFFFFFF);
 
-    LeafPage? lastValidLeaf;
+    BTreeLeafPage? lastValidLeaf;
     TreePagePtr lastValidPtr = TreePagePtr.nullPtr;
 
     while (!ptr.isNull && remaining > 0) {
@@ -3472,7 +3477,7 @@ final class TableTreePartitionManager {
 
       final y21 = yc.maybeYield();
       if (y21 != null) await y21;
-      LeafPage leaf;
+      BTreeLeafPage leaf;
       try {
         leaf = await getLeaf(ptr);
       } catch (e) {
@@ -3718,9 +3723,9 @@ final class TableTreePartitionManager {
         checkInterval: 50);
 
     // One-step prefetch for the next leaf page in the chain.
-    final Map<String, Future<LeafPage>> prefetched =
-        <String, Future<LeafPage>>{};
-    Future<LeafPage> getLeaf(TreePagePtr p) {
+    final Map<String, Future<BTreeLeafPage>> prefetched =
+        <String, Future<BTreeLeafPage>>{};
+    Future<BTreeLeafPage> getLeaf(TreePagePtr p) {
       final k = keyOfPtr(p);
       final f = prefetched.remove(k);
       if (f != null) return f;
@@ -3763,7 +3768,7 @@ final class TableTreePartitionManager {
     final visited = <int>{};
     int toKey(TreePagePtr p) => (p.partitionNo << 32) | (p.pageNo & 0xFFFFFFFF);
 
-    LeafPage? lastValidLeaf;
+    BTreeLeafPage? lastValidLeaf;
     TreePagePtr lastValidPtr = TreePagePtr.nullPtr;
 
     while (!ptr.isNull && remaining > 0) {
@@ -3783,7 +3788,7 @@ final class TableTreePartitionManager {
 
       final y22 = yc.maybeYield();
       if (y22 != null) await y22;
-      LeafPage leaf;
+      BTreeLeafPage leaf;
       try {
         leaf = await getLeaf(ptr);
       } catch (e) {
@@ -3998,7 +4003,7 @@ final class _TableOp {
 
 final class _Frame {
   final TreePagePtr ptr;
-  final InternalPage node;
+  final BTreeInternalPage node;
   final int childIndex;
   _Frame({required this.ptr, required this.node, required this.childIndex});
 }

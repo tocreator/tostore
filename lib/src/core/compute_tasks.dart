@@ -16,7 +16,7 @@ import '../model/result_type.dart';
 import '../model/table_identity.dart';
 import '../model/table_schema.dart';
 import '../model/wal_pointer.dart';
-import 'btree_page.dart';
+import 'store_page.dart';
 import 'page_redo_log_codec.dart';
 import 'yield_controller.dart';
 
@@ -1655,7 +1655,7 @@ Future<BatchWalEncodeResult> batchEncodeWal(
 ///   B+Tree page DTOs composed from those values).
 /// - Do NOT use `TransferableTypedData` here to keep web / non-isolate platforms compatible.
 final class BTreePageEncodeItem {
-  /// Index into [BTreePageType.values].
+  /// Index into [StorePageType.values].
   final int typeIndex;
   final int partitionNo;
   final int pageNo;
@@ -1663,10 +1663,10 @@ final class BTreePageEncodeItem {
   /// Plaintext payload bytes (NOT encrypted), when the caller already encoded it.
   final Uint8List? payload;
 
-  /// Optional raw page objects. When present, payload encoding is also done by
-  /// the compute worker so large dirty-page batches do less work on the caller.
-  final LeafPage? leafPage;
-  final InternalPage? internalPage;
+  /// Optional B+Tree page objects. When present, payload encoding runs in the
+  /// compute worker so large dirty-page batches do less work on the caller.
+  final BTreeLeafPage? leafPage;
+  final BTreeInternalPage? internalPage;
 
   const BTreePageEncodeItem({
     required this.typeIndex,
@@ -1679,8 +1679,8 @@ final class BTreePageEncodeItem {
   BTreePageEncodeItem.leaf({
     required this.partitionNo,
     required this.pageNo,
-    required LeafPage page,
-  })  : typeIndex = BTreePageType.leaf.index,
+    required BTreeLeafPage page,
+  })  : typeIndex = StorePageType.leaf.index,
         payload = null,
         leafPage = page,
         internalPage = null;
@@ -1688,8 +1688,8 @@ final class BTreePageEncodeItem {
   BTreePageEncodeItem.internal({
     required this.partitionNo,
     required this.pageNo,
-    required InternalPage page,
-  })  : typeIndex = BTreePageType.internal.index,
+    required BTreeInternalPage page,
+  })  : typeIndex = StorePageType.internal.index,
         payload = null,
         leafPage = null,
         internalPage = page;
@@ -1705,7 +1705,7 @@ final class BatchBTreePageEncodeRequest {
   /// Full encoder state so isolates can use the same active key / keyId.
   final EncoderConfig encoderConfig;
 
-  /// Optional per-call key override (mirrors `BTreePageCodec.encodePayload`).
+  /// Optional per-call key override (same contract as [StorePageCodec.encodePayload]).
   final Uint8List? customKey;
   final int? customKeyId;
 
@@ -1790,15 +1790,15 @@ Future<BatchBTreePageEncodeResult> batchEncodeBTreePages(
     final y9 = yieldController.maybeYield();
     if (y9 != null) await y9;
     final p = pages[i];
-    if (p.typeIndex < 0 || p.typeIndex >= BTreePageType.values.length) {
+    if (p.typeIndex < 0 || p.typeIndex >= StorePageType.values.length) {
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,
-          message: 'Invalid BTree page type index: ${p.typeIndex}',
+          message: 'Invalid store page type index: ${p.typeIndex}',
         )
       ]);
     }
-    final pageType = BTreePageType.values[p.typeIndex];
+    final pageType = StorePageType.values[p.typeIndex];
     final plainPayload = _resolveBTreePagePayload(p, pageType);
 
     final Uint8List encodedPayload;
@@ -1816,7 +1816,7 @@ Future<BatchBTreePageEncodeResult> batchEncodeBTreePages(
     }
 
     // Extra guardrail: provide full context if caller's sizing/splitting is wrong.
-    final int totalLen = BTreePageHeader.size + encodedPayload.length;
+    final int totalLen = StorePageHeader.size + encodedPayload.length;
     if (totalLen > pageSize) {
       final int keyId =
           request.customKeyId ?? EncryptionManager.getCurrentKeyId();
@@ -1824,8 +1824,8 @@ Future<BatchBTreePageEncodeResult> batchEncodeBTreePages(
         GeneralStatus(
           type: ResultType.engError,
           message:
-              'BTree page overflow (pre-build): total=$totalLen > pageSize=$pageSize '
-              '(header=${BTreePageHeader.size}, encodedPayload=${encodedPayload.length}, '
+              'Store page overflow (pre-build): total=$totalLen > pageSize=$pageSize '
+              '(header=${StorePageHeader.size}, encodedPayload=${encodedPayload.length}, '
               'plainPayload=${plainPayload.length}, typeIndex=${p.typeIndex}, '
               'partitionNo=${p.partitionNo}, pageNo=${p.pageNo}, '
               'encryptionTypeIndex=${request.encryptionTypeIndex}, keyId=$keyId).',
@@ -1833,7 +1833,7 @@ Future<BatchBTreePageEncodeResult> batchEncodeBTreePages(
       ]);
     }
 
-    final pageBytes = BTreePageIO.buildPageBytes(
+    final pageBytes = StorePageIO.buildPageBytes(
       type: pageType,
       encodedPayload: encodedPayload,
       pageSize: pageSize,
@@ -1878,13 +1878,13 @@ Future<BatchBTreePageEncodeResult> batchEncodeBTreePages(
 
 Uint8List _resolveBTreePagePayload(
   BTreePageEncodeItem item,
-  BTreePageType pageType,
+  StorePageType pageType,
 ) {
   final payload = item.payload;
   if (payload != null) return payload;
 
   switch (pageType) {
-    case BTreePageType.leaf:
+    case StorePageType.leaf:
       final page = item.leafPage;
       if (page == null) {
         throw DbException([
@@ -1895,7 +1895,7 @@ Uint8List _resolveBTreePagePayload(
         ]);
       }
       return page.encodePayload();
-    case BTreePageType.internal:
+    case StorePageType.internal:
       final page = item.internalPage;
       if (page == null) {
         throw DbException([
@@ -1906,17 +1906,17 @@ Uint8List _resolveBTreePagePayload(
         ]);
       }
       return page.encodePayload();
-    case BTreePageType.meta:
-    case BTreePageType.free:
-    case BTreePageType.overflow:
-    case BTreePageType.nghMeta:
-    case BTreePageType.nghLeaf:
-    case BTreePageType.nghNav:
+    case StorePageType.meta:
+    case StorePageType.free:
+    case StorePageType.overflow:
+    case StorePageType.nghMeta:
+    case StorePageType.nghLeaf:
+    case StorePageType.nghNav:
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,
           message:
-              'BTree page encode item for $pageType requires a prebuilt payload',
+              'B+Tree encode item for $pageType requires a prebuilt payload',
         )
       ]);
   }

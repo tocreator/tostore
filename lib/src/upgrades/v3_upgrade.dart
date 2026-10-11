@@ -4,7 +4,7 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as path;
 
-import '../core/btree_page.dart';
+import '../core/store_page.dart';
 import '../core/data_store_impl.dart';
 import '../core/wal_manager.dart';
 import '../handler/common.dart';
@@ -1230,7 +1230,7 @@ class V3Upgrade {
         local = await _dataStore.treeMetaPageService.readPartitionLocal(
               path: part0Path,
               partitionNo: 0,
-              pageType: BTreePageType.meta,
+              pageType: StorePageType.meta,
             ) ??
             local;
       }
@@ -1239,7 +1239,7 @@ class V3Upgrade {
         path: part0Path,
         pageSize: _upgradePageSize,
         partitionNo: 0,
-        pageType: BTreePageType.meta,
+        pageType: StorePageType.meta,
         partitionLocal: local,
         treeGlobalMeta: TreeGlobalMetaBlobCodec.encode(
           TreeGlobalMetaKind.table,
@@ -1307,7 +1307,7 @@ class V3Upgrade {
           local = await _dataStore.treeMetaPageService.readPartitionLocal(
                 path: part0Path,
                 partitionNo: 0,
-                pageType: BTreePageType.meta,
+                pageType: StorePageType.meta,
               ) ??
               local;
         }
@@ -1316,7 +1316,7 @@ class V3Upgrade {
           path: part0Path,
           pageSize: _upgradePageSize,
           partitionNo: 0,
-          pageType: BTreePageType.meta,
+          pageType: StorePageType.meta,
           partitionLocal: local,
           treeGlobalMeta: TreeGlobalMetaBlobCodec.encode(
             TreeGlobalMetaKind.indexTree,

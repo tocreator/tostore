@@ -14,7 +14,7 @@ import '../model/result_type.dart';
 import '../model/table_context.dart';
 import '../model/table_identity.dart';
 import '../model/value_ref.dart';
-import 'btree_page.dart';
+import 'store_page.dart';
 import 'data_store_impl.dart';
 import 'overflow_pack_session.dart';
 import 'page_redo_log_codec.dart';
@@ -165,15 +165,15 @@ final class OverflowManager {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
   }) {
-    final encodedPayload = BTreePageCodec.encodePayload(
+    final encodedPayload = StorePageCodec.encodePayload(
       payload,
       config: _dataStore.config,
       encryptionKey: encryptionKey,
       encryptionKeyId: encryptionKeyId,
       aad: _aadForOverflowPage(partitionNo, pageNo),
     );
-    return BTreePageIO.buildPageBytes(
-      type: BTreePageType.overflow,
+    return StorePageIO.buildPageBytes(
+      type: StorePageType.overflow,
       encodedPayload: encodedPayload,
       pageSize: pageSize,
     );
@@ -187,15 +187,15 @@ final class OverflowManager {
     Uint8List? encryptionKey,
     int? encryptionKeyId,
   }) {
-    final encodedPayload = BTreePageCodec.encodePayload(
+    final encodedPayload = StorePageCodec.encodePayload(
       FreePage(nextFreePageNo: nextFreePageNo).encodePayload(),
       config: _dataStore.config,
       encryptionKey: encryptionKey,
       encryptionKeyId: encryptionKeyId,
       aad: _aadForOverflowPage(partitionNo, pageNo),
     );
-    return BTreePageIO.buildPageBytes(
-      type: BTreePageType.free,
+    return StorePageIO.buildPageBytes(
+      type: StorePageType.free,
       encodedPayload: encodedPayload,
       pageSize: pageSize,
     );
@@ -240,7 +240,7 @@ final class OverflowManager {
     int hi = pageSize;
     while (lo < hi) {
       final mid = (lo + hi + 1) >> 1;
-      final ok = BTreePageSizer.fitsInPage(
+      final ok = StorePageSizer.fitsInPage(
         pageSize: pageSize,
         plainPayloadLen: mid,
         config: _dataStore.config,
@@ -361,13 +361,13 @@ final class OverflowManager {
         try {
           final pageBytes = await _dataStore.storage
               .readAsBytesAt(path, freeHead * pageSize, length: pageSize);
-          final parsed = BTreePageIO.parsePageBytes(pageBytes);
-          if (parsed.type != BTreePageType.free) {
+          final parsed = StorePageIO.parsePageBytes(pageBytes);
+          if (parsed.type != StorePageType.free) {
             freeHead = -1;
             freeCount = 0;
             break;
           }
-          final decoded = BTreePageCodec.decodePayload(
+          final decoded = StorePageCodec.decodePayload(
             parsed.encodedPayload,
             encryptionKey: encryptionKey,
             encryptionKeyId: encryptionKeyId,
@@ -428,8 +428,8 @@ final class OverflowManager {
   }) async {
     final pageBytes = await _dataStore.storage
         .readAsBytesAt(path, pageNo * pageSize, length: pageSize);
-    final parsed = BTreePageIO.parsePageBytes(pageBytes);
-    return BTreePageCodec.decodePayload(
+    final parsed = StorePageIO.parsePageBytes(pageBytes);
+    return StorePageCodec.decodePayload(
       parsed.encodedPayload,
       encryptionKey: encryptionKey,
       encryptionKeyId: encryptionKeyId,
@@ -1026,7 +1026,7 @@ final class OverflowManager {
       final next = (i + 1 < pageNos.length) ? pageNos[i + 1] : -1;
       final page = OverflowPage(nextPageNo: next, data: chunks[i]);
       final payload = page.encodePayload();
-      final encodedPayload = BTreePageCodec.encodePayload(
+      final encodedPayload = StorePageCodec.encodePayload(
         payload,
         config: _dataStore.config,
         encryptionKey: encryptionKey,
@@ -1035,8 +1035,8 @@ final class OverflowManager {
       );
       writes.add(ByteWrite(
         offset: pn * pageSize,
-        bytes: BTreePageIO.buildPageBytes(
-          type: BTreePageType.overflow,
+        bytes: StorePageIO.buildPageBytes(
+          type: StorePageType.overflow,
           encodedPayload: encodedPayload,
           pageSize: pageSize,
         ),
@@ -1117,9 +1117,9 @@ final class OverflowManager {
             .readAsBytesAt(path, curPageNo * pageSize, length: pageSize);
         if (pageBytes.isEmpty) break;
         try {
-          final parsed = BTreePageIO.parsePageBytes(pageBytes);
-          if (parsed.type != BTreePageType.overflow) break;
-          final decodedPayload = BTreePageCodec.decodePayload(
+          final parsed = StorePageIO.parsePageBytes(pageBytes);
+          if (parsed.type != StorePageType.overflow) break;
+          final decodedPayload = StorePageCodec.decodePayload(
             parsed.encodedPayload,
             encryptionKey: encryptionKey,
             encryptionKeyId: encryptionKeyId,
@@ -1158,15 +1158,15 @@ final class OverflowManager {
         final pn = pageNos[i];
         final freePage = FreePage(nextFreePageNo: nextInFree);
         final payload = freePage.encodePayload();
-        final encodedPayload = BTreePageCodec.encodePayload(
+        final encodedPayload = StorePageCodec.encodePayload(
           payload,
           config: _dataStore.config,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
           aad: _aadForOverflowPage(ref.overflowPartitionNo, pn),
         );
-        final pageBytes = BTreePageIO.buildPageBytes(
-          type: BTreePageType.free,
+        final pageBytes = StorePageIO.buildPageBytes(
+          type: StorePageType.free,
           encodedPayload: encodedPayload,
           pageSize: pageSize,
         );
@@ -1328,7 +1328,7 @@ final class OverflowManager {
       var freeHead = meta.freeListHeadPageNo;
       for (final pn in emptyPages.toSet()) {
         final freePage = FreePage(nextFreePageNo: freeHead);
-        final encodedPayload = BTreePageCodec.encodePayload(
+        final encodedPayload = StorePageCodec.encodePayload(
           freePage.encodePayload(),
           config: _dataStore.config,
           encryptionKey: encryptionKey,
@@ -1337,8 +1337,8 @@ final class OverflowManager {
         );
         writes.add(ByteWrite(
           offset: pn * pageSize,
-          bytes: BTreePageIO.buildPageBytes(
-            type: BTreePageType.free,
+          bytes: StorePageIO.buildPageBytes(
+            type: StorePageType.free,
             encodedPayload: encodedPayload,
             pageSize: pageSize,
           ),
@@ -1471,8 +1471,8 @@ final class OverflowManager {
             ),
           ]);
         }
-        final parsed = BTreePageIO.parsePageBytes(pageBytes);
-        if (parsed.type != BTreePageType.overflow) {
+        final parsed = StorePageIO.parsePageBytes(pageBytes);
+        if (parsed.type != StorePageType.overflow) {
           throw DbException([
             GeneralStatus(
               type: ResultType.engError,
@@ -1480,7 +1480,7 @@ final class OverflowManager {
             ),
           ]);
         }
-        final decodedPayload = BTreePageCodec.decodePayload(
+        final decodedPayload = StorePageCodec.decodePayload(
           parsed.encodedPayload,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,
@@ -1722,7 +1722,7 @@ final class OverflowManager {
     while (lo < hi) {
       final mid = (lo + hi + 1) >> 1;
       final plainLen = overflowPayloadHeader + mid;
-      final ok = BTreePageSizer.fitsInPage(
+      final ok = StorePageSizer.fitsInPage(
         pageSize: pageSize,
         plainPayloadLen: plainLen,
         config: _dataStore.config,
@@ -1768,15 +1768,15 @@ final class OverflowManager {
       freePageCount: 0,
     );
     final payload = meta.encodePayload();
-    final encodedPayload = BTreePageCodec.encodePayload(
+    final encodedPayload = StorePageCodec.encodePayload(
       payload,
       config: _dataStore.config,
       encryptionKey: encryptionKey,
       encryptionKeyId: encryptionKeyId,
       aad: _aadForOverflowPage(partitionNo, 0),
     );
-    final page0 = BTreePageIO.buildPageBytes(
-      type: BTreePageType.meta,
+    final page0 = StorePageIO.buildPageBytes(
+      type: StorePageType.meta,
       encodedPayload: encodedPayload,
       pageSize: pageSize,
     );
@@ -1792,8 +1792,8 @@ final class OverflowManager {
   }) async {
     final page0 =
         await _dataStore.storage.readAsBytesAt(path, 0, length: pageSize);
-    final parsed = BTreePageIO.parsePageBytes(page0);
-    if (parsed.type != BTreePageType.meta) {
+    final parsed = StorePageIO.parsePageBytes(page0);
+    if (parsed.type != StorePageType.meta) {
       throw DbException([
         GeneralStatus(
           type: ResultType.engError,
@@ -1801,7 +1801,7 @@ final class OverflowManager {
         ),
       ]);
     }
-    final decodedPayload = BTreePageCodec.decodePayload(
+    final decodedPayload = StorePageCodec.decodePayload(
       parsed.encodedPayload,
       encryptionKey: encryptionKey,
       encryptionKeyId: encryptionKeyId,
@@ -1829,15 +1829,15 @@ final class OverflowManager {
     bool flush = true,
   }) async {
     final payload = meta.encodePayload();
-    final encodedPayload = BTreePageCodec.encodePayload(
+    final encodedPayload = StorePageCodec.encodePayload(
       payload,
       config: _dataStore.config,
       encryptionKey: encryptionKey,
       encryptionKeyId: encryptionKeyId,
       aad: _aadForOverflowPage(partitionNo, 0),
     );
-    final page0 = BTreePageIO.buildPageBytes(
-      type: BTreePageType.meta,
+    final page0 = StorePageIO.buildPageBytes(
+      type: StorePageType.meta,
       encodedPayload: encodedPayload,
       pageSize: pageSize,
     );
@@ -1915,15 +1915,15 @@ final class OverflowManager {
       }
 
       try {
-        final parsed = BTreePageIO.parsePageBytes(bytes);
-        if (parsed.type != BTreePageType.free) {
+        final parsed = StorePageIO.parsePageBytes(bytes);
+        if (parsed.type != StorePageType.free) {
           Logger.warn(
               'Overflow freelist corrupted at page=$head (type: ${parsed.type}), resetting freelist head');
           currentFreeHead = -1;
           currentFreeCount = 0;
           break;
         }
-        final decodedPayload = BTreePageCodec.decodePayload(
+        final decodedPayload = StorePageCodec.decodePayload(
           parsed.encodedPayload,
           encryptionKey: encryptionKey,
           encryptionKeyId: encryptionKeyId,

@@ -1,6 +1,6 @@
 import 'dart:math';
 
-import '../../core/btree_page.dart';
+import '../../core/store_page.dart';
 import '../../core/data_store_impl.dart';
 import '../../core/ngh_page.dart';
 import '../../core/ngh_partition_manager.dart';
@@ -55,8 +55,8 @@ final class LegacyNghIo {
       final raw =
           await _dataStore.storage.readAsBytesAt(path, 0, length: pageSize);
       if (raw.isEmpty) return null;
-      final parsed = BTreePageIO.parsePageBytes(raw);
-      final plain = BTreePageCodec.decodePayload(parsed.encodedPayload);
+      final parsed = StorePageIO.parsePageBytes(raw);
+      final plain = StorePageCodec.decodePayload(parsed.encodedPayload);
       final payload = TreeMetaPagePayload.tryDecodePlainPayload(plain);
       if (payload?.treeGlobalMeta == null) return null;
       final blob = TreeGlobalMetaBlobCodec.decode(payload!.treeGlobalMeta!);
@@ -87,9 +87,9 @@ final class LegacyNghIo {
       if (bytes.isEmpty) return null;
       if (bytes.length >= 20 && bytes[0] == 0x54 && bytes[1] == 0x53) {
         try {
-          final parsed = BTreePageIO.parsePageBytes(bytes);
+          final parsed = StorePageIO.parsePageBytes(bytes);
           final page = NghNavGraphPage.tryDecodePayload(
-            BTreePageCodec.decodePayload(parsed.encodedPayload),
+            StorePageCodec.decodePayload(parsed.encodedPayload),
           );
           if (page != null) return page;
         } catch (_) {}
@@ -122,9 +122,9 @@ final class LegacyNghIo {
       final raw = await _dataStore.storage
           .readAsBytesAt(path, pageNo * pageSize, length: pageSize);
       if (raw.isEmpty) return null;
-      final parsed = BTreePageIO.parsePageBytes(raw);
+      final parsed = StorePageIO.parsePageBytes(raw);
       final page = NghLeafPage.tryDecodePayload(
-        BTreePageCodec.decodePayload(parsed.encodedPayload),
+        StorePageCodec.decodePayload(parsed.encodedPayload),
       );
       if (page != null && localCache != null) {
         localCache[cacheKey] = page;
