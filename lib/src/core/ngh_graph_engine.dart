@@ -23,8 +23,9 @@ import 'yield_controller.dart';
 // NGH Graph Engine
 //
 // Responsibilities:
-//   1. L0-resident + budgeted L1 Centroid B+Tree routing (microsecond hot path
-//      when probed L1/leaves are cached; never full L1 inventory residency)
+//   1. L0 + Mid-1/Mid-2 resident routing; leaf-nav / deeper mid are budgeted
+//      LRU (microsecond hot path when probed deeper pages + leaves are cached;
+//      never full leaf-nav inventory residency at billion scale)
 //   2. High-speed physical-leaf search via inlined SQ8 vector slots (0 random secondary I/O)
 //   3. Streaming incremental insert with angle-aware multi-assignment
 //   4. Hub governance: softCap (~1.75× fair share) + batch-end 2-means leaf rewrite
@@ -273,13 +274,14 @@ final class BranchMinHeap {
   }
 }
 
-// In-Memory Centroid B+Tree State (L0 roots only — L1 pages are TreeCache'd)
+// In-Memory Centroid B+Tree State (L0 roots only — mid/leaf-nav are TreeCache'd)
 //
 // Search-hot leaves live in [NghGraphEngine._btreeLeafCache] (TreeCache
-// + ResourceManager vector budget). L1 internal nav pages live in
+// + ResourceManager vector budget). Mid + leaf-nav pages live in
 // [NghGraphEngine._navInternalCache] under the nav-graph budget. This state
-// only holds always-resident L0 routing — never the full L1 inventory and
-// never per-query scratch (see [_CentroidSearchScratch] pool).
+// only holds always-resident L0 routing. Startup prewarm full-loads Mid-1/Mid-2
+// then budget-fills leaf-nav / deeper mid (see [_hydrateNavChainsForRoots]).
+// Never per-query scratch here (see [_CentroidSearchScratch] pool).
 //
 // L0 is growable up to [maxRootCapacity] via far-spawn / heavy-root-split.
 // Growing L0 must NOT widen search wantLeaves — only cheap 48-D routing.
@@ -298,8 +300,8 @@ final class CentroidBTreeState {
   final Float32List rootCentroids48Flat;
   late final Float32x4List rootCentroids48Simd;
 
-  /// Always-resident L1 subtree heads (one page id per L0 root). Child nav
-  /// pages load on demand into [_navInternalCache].
+  /// Always-resident Mid-1 heads (one page id per L0 root). Mid-1/Mid-2 pages
+  /// are startup-prewarmed; leaf-nav / deeper mid load into [_navInternalCache].
   final List<NghPageId> firstInternalByRoot;
 
   NghPageId rootPageId;
@@ -511,13 +513,15 @@ class NghGraphEngine {
     debugLabel: 'NghNavGraphCache',
   );
 
-  /// Soft ceiling for Centroid B+Tree L1 internal nav pages (paged layout).
+  /// Soft ceiling for Centroid B+Tree mid / leaf-nav pages (paged layout).
   /// Shares the nav-graph budget family from ResourceManager.
+  /// Mid-1/Mid-2 are full-prewarmed first; leaf-nav fills the remainder only.
   int _navInternalCacheMaxBytes = 32 * 1024 * 1024;
 
-  /// Budgeted L1 internal branch pages. Key: `[tableUid, indexUid, part, page]`.
+  /// Mid + leaf-nav branch pages. Key: `[tableUid, indexUid, part, page]`.
   ///
-  /// L0 roots stay in [CentroidBTreeState]; L1 inventory is NOT fully resident.
+  /// L0 roots stay in [CentroidBTreeState]. Startup full-loads Mid-1/Mid-2;
+  /// leaf-nav / deeper mid share this LRU under the nav budget (stop at ceiling).
   late final TreeCache<NghNavBTreePage> _navInternalCache =
       TreeCache<NghNavBTreePage>(
     groupDepth: 2,
@@ -667,8 +671,9 @@ class NghGraphEngine {
 
   /// Configure nav-graph cache ceiling (adaptive based on memory budget).
   ///
-  /// Also applies to paged Centroid B+Tree L1 internal pages
-  /// ([_navInternalCache]) — L0 roots remain always-resident and tiny.
+  /// Also applies to paged Centroid B+Tree mid/leaf-nav pages
+  /// ([_navInternalCache]) — L0 stays always-resident; Mid-1/Mid-2 are
+  /// startup full-prewarmed; leaf-nav fills only up to this ceiling.
   /// [maxBytes] must already include any platform / ratio floors.
   void configureNavGraphCacheBudget(int maxBytes) {
     _applyCacheBudget(
@@ -1338,68 +1343,238 @@ class NghGraphEngine {
     }
   }
 
-  /// Prefetch nav pages under [rootIds] for warmup (no query vector).
-  /// Heuristic first-N children per mid; search must not use this for recall.
-  Future<void> _hydrateNavDescentForRoots({
+  /// Put [page] only when it fits under [maxNavBytes] (no overshoot → no LRU thrash).
+  ///
+  /// Packs 48-D search rows before sizing so the ledger matches the search-hot
+  /// footprint (avoid under-counting then silently overflowing).
+  bool _tryPutNavInternalWithinBudget({
+    required TableUid tableUid,
+    required IndexUid indexUid,
+    required NghPageId pageId,
+    required NghNavBTreePage page,
+    required int maxNavBytes,
+  }) {
+    if (pageId.isNone) return false;
+    if (_navInternalGet(tableUid, indexUid, pageId, touch: false) != null) {
+      return true;
+    }
+    page.ensureSearch48Ready();
+    final est = page.estimateResidentBytes();
+    if (_navInternalCache.estimatedTotalSizeBytes + est > maxNavBytes) {
+      return false;
+    }
+    _navInternalPut(tableUid, indexUid, pageId, page);
+    return true;
+  }
+
+  /// Prefers Mid-1 then Mid-2 mid residency; still stops at [maxNavBytes].
+  ///
+  /// Two passes so a tight budget cannot deep-fill root0 Mid-2 and starve
+  /// Mid-1 heads of later roots. Hop-1 leaf-nav is deferred to layer-4 so it
+  /// cannot crowd out Mid-2 mid pages. L0 stays in [CentroidBTreeState].
+  Future<List<NghPageId>> _prewarmNavTopThreeLayers({
     required TableContext table,
     required IndexUid indexUid,
     required NghIndexMeta meta,
     required CentroidBTreeState state,
     required Iterable<int> rootIds,
-    int beamWidth = 4,
+    required int maxNavBytes,
     bool Function()? shouldAbort,
-    int? maxNavBytes,
   }) async {
-    final prefetchCap = max(1, beamWidth * 2);
-    bool aborted() => shouldAbort?.call() ?? false;
-    bool overNavBudget() =>
-        maxNavBytes != null &&
-        _navInternalCache.estimatedTotalSizeBytes >= maxNavBytes;
+    final deeperFrontier = <NghPageId>[];
+    if (maxNavBytes <= 0) return deeperFrontier;
 
+    bool aborted() => shouldAbort?.call() ?? false;
+    final seenDeeper = <int>{};
+    final hop1Ids = <NghPageId>[];
+    final seenHop1 = <int>{};
+    var budgetOpen = true;
+
+    void enqueueDeeper(NghPageId id) {
+      if (id.isNone || !seenDeeper.add(id.cacheKey)) return;
+      deeperFrontier.add(id);
+    }
+
+    void enqueueHop1(NghPageId id) {
+      if (id.isNone || !seenHop1.add(id.cacheKey)) return;
+      hop1Ids.add(id);
+    }
+
+    Future<NghNavBTreePage?> loadWithinBudget(NghPageId pageId) async {
+      if (pageId.isNone || !budgetOpen) return null;
+      final cached =
+          _navInternalGet(table.tableUid, indexUid, pageId, touch: false);
+      if (cached != null) return cached;
+      final page = await _partitionManager.readNavBTreePage(
+        table,
+        indexUid,
+        pageId,
+        meta: meta,
+      );
+      if (page == null) return null;
+      if (!_tryPutNavInternalWithinBudget(
+        tableUid: table.tableUid,
+        indexUid: indexUid,
+        pageId: pageId,
+        page: page,
+        maxNavBytes: maxNavBytes,
+      )) {
+        budgetOpen = false;
+        return null;
+      }
+      return page;
+    }
+
+    // Pass 1: all Mid-1 heads across roots (breadth before depth).
     for (final rootId in rootIds) {
-      if (aborted() || overNavBudget()) return;
+      if (aborted() || !budgetOpen) break;
       if (rootId < 0 || rootId >= state.firstInternalByRoot.length) continue;
-      var frontier = <NghPageId>[state.firstInternalByRoot[rootId]];
-      var hop = 0;
-      while (frontier.isNotEmpty) {
-        if (aborted() || overNavBudget()) return;
-        if (++hop > NghNavBTreePage.maxTreeHops) {
-          throw DbException([
-            GeneralStatus(
-              type: ResultType.engError,
-              message:
-                  'NGH nav hydrate exceeded maxTreeHops=${NghNavBTreePage.maxTreeHops} '
-                  '(root=$rootId).',
-            )
-          ]);
-        }
-        final next = <NghPageId>[];
-        for (final pageId in frontier) {
-          if (aborted() || overNavBudget()) return;
-          if (pageId.isNone) continue;
-          var page = _navInternalGet(table.tableUid, indexUid, pageId);
-          if (page == null) {
-            page = await _partitionManager.readNavBTreePage(
-              table,
-              indexUid,
-              pageId,
-              meta: meta,
-            );
-            if (page == null) continue;
-            _navInternalPut(table.tableUid, indexUid, pageId, page);
+      final headId = state.firstInternalByRoot[rootId];
+      if (headId.isNone) continue;
+
+      final mid1 = await loadWithinBudget(headId);
+      if (mid1 == null) {
+        if (!budgetOpen) break;
+        continue;
+      }
+      if (mid1.isLeafLevel) continue; // shallow leaf-nav head already resident
+      for (final e in mid1.entries) {
+        enqueueHop1(e.childPageId);
+      }
+    }
+
+    // Pass 2: Mid-2 mid only. Hop-1 leaf-nav goes to layer-4 frontier (no put).
+    if (!aborted() && budgetOpen) {
+      for (final childId in hop1Ids) {
+        if (aborted() || !budgetOpen) break;
+
+        var mid2 =
+            _navInternalGet(table.tableUid, indexUid, childId, touch: false);
+        if (mid2 == null) {
+          mid2 = await _partitionManager.readNavBTreePage(
+            table,
+            indexUid,
+            childId,
+            meta: meta,
+          );
+          if (mid2 == null) continue;
+          if (mid2.isLeafLevel) {
+            enqueueDeeper(childId);
+            continue;
           }
-          if (page.isLeafLevel) continue;
-          var n = 0;
-          for (final e in page.entries) {
-            if (e.childPageId.isNone) continue;
-            next.add(e.childPageId);
-            if (++n >= prefetchCap) break;
+          if (!_tryPutNavInternalWithinBudget(
+            tableUid: table.tableUid,
+            indexUid: indexUid,
+            pageId: childId,
+            page: mid2,
+            maxNavBytes: maxNavBytes,
+          )) {
+            budgetOpen = false;
+            break;
+          }
+        } else if (mid2.isLeafLevel) {
+          enqueueDeeper(childId);
+          continue;
+        }
+
+        for (final ce in mid2.entries) {
+          enqueueDeeper(ce.childPageId);
+        }
+      }
+    }
+
+    return deeperFrontier;
+  }
+
+  /// Budget-fill leaf-nav / deeper mid. Stops before exceeding [maxNavBytes]
+  /// so startup preload cannot LRU-evict Mid-1/Mid-2 just loaded above.
+  Future<void> _prewarmNavLayerFourBudgeted({
+    required TableContext table,
+    required IndexUid indexUid,
+    required NghIndexMeta meta,
+    required List<NghPageId> frontierIn,
+    required int maxNavBytes,
+    bool Function()? shouldAbort,
+  }) async {
+    if (frontierIn.isEmpty || maxNavBytes <= 0) return;
+    bool aborted() => shouldAbort?.call() ?? false;
+
+    var frontier = List<NghPageId>.from(frontierIn);
+    final seen = <int>{
+      for (final id in frontierIn)
+        if (!id.isNone) id.cacheKey,
+    };
+    var hop = 0;
+
+    while (frontier.isNotEmpty) {
+      if (aborted()) return;
+      if (_navInternalCache.estimatedTotalSizeBytes >= maxNavBytes) return;
+      if (++hop > NghNavBTreePage.maxTreeHops) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'NGH nav layer-4 hydrate exceeded maxTreeHops='
+                '${NghNavBTreePage.maxTreeHops}.',
+          )
+        ]);
+      }
+
+      final next = <NghPageId>[];
+      for (final pageId in frontier) {
+        if (aborted()) return;
+        if (_navInternalCache.estimatedTotalSizeBytes >= maxNavBytes) return;
+        if (pageId.isNone) continue;
+
+        var page =
+            _navInternalGet(table.tableUid, indexUid, pageId, touch: false);
+        if (page == null) {
+          page = await _partitionManager.readNavBTreePage(
+            table,
+            indexUid,
+            pageId,
+            meta: meta,
+          );
+          if (page == null) continue;
+          if (!_tryPutNavInternalWithinBudget(
+            tableUid: table.tableUid,
+            indexUid: indexUid,
+            pageId: pageId,
+            page: page,
+            maxNavBytes: maxNavBytes,
+          )) {
+            return; // budget full — stop; do not thrash LRU
           }
         }
-        if (next.isEmpty) break;
-        frontier = next.length > prefetchCap
-            ? next.take(prefetchCap).toList(growable: false)
-            : next;
+
+        if (page.isLeafLevel) continue;
+        for (final e in page.entries) {
+          final child = e.childPageId;
+          if (child.isNone || !seen.add(child.cacheKey)) continue;
+          next.add(child);
+        }
+      }
+      frontier = next;
+    }
+  }
+
+  /// Re-touch Mid-1/Mid-2 so they stay MRU after a budgeted leaf-nav fill.
+  void _touchNavTopThreeLayers(
+    TableUid tableUid,
+    IndexUid indexUid,
+    CentroidBTreeState state,
+    Iterable<int> rootIds,
+  ) {
+    for (final rootId in rootIds) {
+      if (rootId < 0 || rootId >= state.firstInternalByRoot.length) continue;
+      final headId = state.firstInternalByRoot[rootId];
+      if (headId.isNone) continue;
+      final mid1 = _navInternalGet(tableUid, indexUid, headId, touch: true);
+      if (mid1 == null || mid1.isLeafLevel) continue;
+      for (final e in mid1.entries) {
+        final childId = e.childPageId;
+        if (childId.isNone) continue;
+        final mid2 = _navInternalGet(tableUid, indexUid, childId, touch: true);
+        if (mid2 == null || mid2.isLeafLevel) continue;
       }
     }
   }
@@ -1449,7 +1624,10 @@ class NghGraphEngine {
     return out;
   }
 
-  /// Startup/open nav sample for leaf ranking — beam-capped, never full tree.
+  /// Startup/open nav prewarm: Mid-1 → Mid-2 mid → budgeted leaf-nav.
+  ///
+  /// Breadth-first on Mid-1 so a tight budget cannot starve later roots.
+  /// Leaf-nav is last and stops before [_navInternalCacheMaxBytes].
   Future<void> _hydrateNavChainsForRoots({
     required TableContext table,
     required IndexUid indexUid,
@@ -1457,17 +1635,32 @@ class NghGraphEngine {
     required CentroidBTreeState state,
     required Iterable<int> rootIds,
     bool Function()? shouldAbort,
-  }) =>
-      _hydrateNavDescentForRoots(
-        table: table,
-        indexUid: indexUid,
-        meta: meta,
-        state: state,
-        rootIds: rootIds,
-        beamWidth: 8,
-        shouldAbort: shouldAbort,
-        maxNavBytes: _navInternalCacheMaxBytes,
-      );
+  }) async {
+    final roots = rootIds.toList(growable: false);
+    final maxNavBytes = _navInternalCacheMaxBytes;
+    final layerFourFrontier = await _prewarmNavTopThreeLayers(
+      table: table,
+      indexUid: indexUid,
+      meta: meta,
+      state: state,
+      rootIds: roots,
+      maxNavBytes: maxNavBytes,
+      shouldAbort: shouldAbort,
+    );
+    if (shouldAbort?.call() ?? false) return;
+
+    await _prewarmNavLayerFourBudgeted(
+      table: table,
+      indexUid: indexUid,
+      meta: meta,
+      frontierIn: layerFourFrontier,
+      maxNavBytes: maxNavBytes,
+      shouldAbort: shouldAbort,
+    );
+
+    // Keep Mid-1/Mid-2 MRU after leaf-nav fill (shared LRU cache).
+    _touchNavTopThreeLayers(table.tableUid, indexUid, state, roots);
+  }
 
   /// Pages needed for a nav subtree holding [leafEntryCount] leaf entries.
   /// Always ≥1 (empty root still gets one leaf-level page).
@@ -1892,7 +2085,7 @@ class NghGraphEngine {
     final state = await _getOrLoadBTreeState(table, indexUid, meta);
     if (state == null || aborted()) return 0;
 
-    // Budget-load L1 pages so leaf candidates can be ranked.
+    // Full Mid-1/Mid-2 + budgeted leaf-nav so leaf candidates can be ranked.
     await _hydrateNavChainsForRoots(
       table: table,
       indexUid: indexUid,

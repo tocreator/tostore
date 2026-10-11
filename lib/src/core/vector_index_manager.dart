@@ -119,9 +119,8 @@ class VectorIndexManager {
   /// Resolve navigating centroid graph cache budget from [vectorBudget].
   ///
   /// Legacy flat nav_graph may stay fully resident under this budget.
-  /// Paged Centroid B+Tree keeps only L0 roots always-hot; L1 internal pages
-  /// share this budget via an LRU page cache so billion-scale indexes do not
-  /// OOM from full-chain residency.
+  /// Paged Centroid B+Tree: L0 always-hot; Mid-1/Mid-2 full-prewarmed at open;
+  /// leaf-nav / deeper mid share this LRU ceiling (stop at budget — no thrash).
   /// Platform floor: 32MB mobile / 128MB desktop; absolute floor 64MB.
   /// Dynamically expands to ~15% of the vector cache budget.
   int _resolveNavGraphCacheBudget(int vectorBudget) {
