@@ -1848,15 +1848,15 @@ final db = await ToStore.open(
 
 ### 基准测试
 
-亮点——10 万条基准套件与十亿级边缘实测（3 轮，2026-08-29）：
+亮点——10 万条基准套件与十亿级边缘实测（3 轮，standard 持久性，2026-10-08）：
 
 | 指标 | 结果 |
 | :--- | :--- |
 | 冷启动 | **约 35 ms**（与数据规模解耦） |
-| PK Read（热缓存） | **452 万 ops/s** |
-| Batch Insert | **54 万 ops/s** |
-| Pagination（热缓存） | **60 万 ops/s** |
-| Vector ANN Search | **1715 ops/s** |
+| PK Read（热缓存） | **454 万 ops/s** |
+| Batch Insert | **59 万 ops/s** |
+| Pagination（热缓存） | **58 万 ops/s** |
+| ANN @ depth 1（~91%） | **3.6 万 ops/s** |
 
 完整图表与全部操作项见 **[基准测试](../../BENCHMARKS.md)**。
 

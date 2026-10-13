@@ -993,12 +993,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
               child: ClipRRect(
                 borderRadius: panelRadius,
                 child: Container(
-                  decoration: const BoxDecoration(
-                    color: Colors.white,
-                    border: Border(
-                      top: BorderSide(color: Color(0xFFE2E8F0), width: 1),
-                    ),
-                  ),
+                  color: Colors.white,
                   child: _buildLogPanel(scrollController),
                 ),
               ),
@@ -2655,12 +2650,16 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
       final iterations = result['iterations'] ?? 1;
       final topK = result['topK'] ?? 10;
       final searchDepth = result['searchDepth'] ?? 50;
+      final diverseThroughput = result['diverseThroughput'] == 1;
+      final mixLabel = diverseThroughput ? 'diverse' : 'hot';
 
       setState(() {
         _isTesting = true;
         _lastOperationInfo = isSweep
-            ? 'Depth sweep: $iterations queries × Top-$topK across 11 depths...'
-            : 'Running $iterations vector search iterations (Top-$topK, depth=$searchDepth)...';
+            ? 'Depth sweep ($mixLabel): $iterations queries × Top-$topK '
+                'across 11 depths...'
+            : 'Running $iterations vector searches ($mixLabel, Top-$topK, '
+                'depth=$searchDepth)...';
       });
 
       try {
@@ -2669,11 +2668,13 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
             _selectedTable,
             iterations: iterations,
             topK: topK,
+            diverseThroughput: diverseThroughput,
             onProgress: (done, total) {
               if (!mounted) return;
               setState(() {
                 _lastOperationInfo =
-                    'Depth sweep: $done/$total depths (Top-$topK, $iterations queries)...';
+                    'Depth sweep ($mixLabel): $done/$total depths '
+                    '(Top-$topK, $iterations queries)...';
               });
             },
           );
@@ -2683,6 +2684,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
             iterations,
             topK,
             searchDepth: searchDepth,
+            diverseThroughput: diverseThroughput,
           );
         }
       } catch (e) {
@@ -5238,6 +5240,9 @@ class _VectorSearchDialogState extends State<VectorSearchDialog> {
   int _iterations = 100;
   int _topK = 10;
   int _searchDepth = _depthBalanced;
+
+  /// false = hot (reuse Recall@K set); true = diverse shuffled groups.
+  bool _diverseThroughput = false;
   final _customController = TextEditingController(text: '100');
   final _depthController = TextEditingController(text: '$_depthBalanced');
 
@@ -5386,13 +5391,62 @@ class _VectorSearchDialogState extends State<VectorSearchDialog> {
               style: TextStyle(fontSize: 12, color: Colors.grey),
             ),
             const SizedBox(height: 24),
+            const Text('Throughput Query Mix',
+                style: TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              children: [
+                ChoiceChip(
+                  label: const Text('Hot'),
+                  selected: !_diverseThroughput,
+                  selectedColor: const Color(0xff0aa6e8),
+                  checkmarkColor: Colors.white,
+                  labelStyle: TextStyle(
+                    color: !_diverseThroughput ? Colors.white : Colors.black,
+                  ),
+                  onSelected: (selected) {
+                    if (selected) {
+                      setState(() => _diverseThroughput = false);
+                    }
+                  },
+                ),
+                ChoiceChip(
+                  label: const Text('Diverse'),
+                  selected: _diverseThroughput,
+                  selectedColor: const Color(0xff0aa6e8),
+                  checkmarkColor: Colors.white,
+                  labelStyle: TextStyle(
+                    color: _diverseThroughput ? Colors.white : Colors.black,
+                  ),
+                  onSelected: (selected) {
+                    if (selected) {
+                      setState(() => _diverseThroughput = true);
+                    }
+                  },
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Text(
+              _diverseThroughput
+                  ? 'Diverse: shuffled group queries each run — colder leaf '
+                      'working set; QPS reflects cross-corpus / file-backed cost. '
+                      'Applies to Single Depth and Sweep All Depths.'
+                  : 'Hot (default): reuse the Recall@K query set — warm leaf '
+                      'pages; peak steady-state QPS. Applies to Single Depth '
+                      'and Sweep All Depths.',
+              style: const TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+            const SizedBox(height: 24),
             const Text('Depth Sweep',
                 style: TextStyle(fontWeight: FontWeight.bold)),
             const SizedBox(height: 8),
             Text(
               'One click runs searchDepth '
               '${vectorSearchDepthSweepPoints.join(", ")} at the current corpus '
-              'size and prints recall and latency for each depth.',
+              'size and prints recall and latency for each depth '
+              '(uses the Hot/Diverse mix above).',
               style: const TextStyle(fontSize: 12, color: Colors.grey),
             ),
           ],
@@ -5414,6 +5468,7 @@ class _VectorSearchDialogState extends State<VectorSearchDialog> {
               'iterations': _iterations,
               'topK': _topK,
               'searchDepth': depth,
+              'diverseThroughput': _diverseThroughput ? 1 : 0,
             });
           },
           child: const Text('Sweep All Depths'),
@@ -5428,6 +5483,7 @@ class _VectorSearchDialogState extends State<VectorSearchDialog> {
               'iterations': _iterations,
               'topK': _topK,
               'searchDepth': depth,
+              'diverseThroughput': _diverseThroughput ? 1 : 0,
             });
           },
           style: ElevatedButton.styleFrom(

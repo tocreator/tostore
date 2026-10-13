@@ -787,8 +787,13 @@ class BenchmarkRunner {
           datasetScale,
           BenchmarkSchemas.vectorSearchProbes,
         );
-        final groups =
-            math.max(1, datasetScale ~/ ExampleVectorCorpus.groupSize);
+        final groups = math.max(
+          1,
+          ExampleVectorCorpus.scorableGroupCount(
+            dimensions: BenchmarkSchemas.vectorDimensions,
+            corpusSize: datasetScale,
+          ),
+        );
         // Prebuild query vectors outside the stopwatch — groupQuery allocates
         // and normalizes; including it in the timed loop roughly halves QPS.
         final queryVectors = List<VectorData>.generate(

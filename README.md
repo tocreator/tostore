@@ -1818,15 +1818,15 @@ final db = await ToStore.open(
 
 ### Benchmarks
 
-Highlights from the 100K suite and **1e9**-record edge validation (3 rounds, 2026-08-29):
+Highlights from the 100K suite and **1e9**-record edge validation (3 rounds, standard durability, 2026-10-08):
 
 | Metric | Result |
 | :--- | :--- |
 | Cold start | **~35 ms** (stable vs data scale) |
 | PK Read (Hot Cache) | **4.5M ops/s** |
-| Batch Insert | **541K ops/s** |
-| Pagination (Hot Cache) | **604K ops/s** |
-| Vector ANN Search | **1715 ops/s** |
+| Batch Insert | **588K ops/s** |
+| Pagination (Hot Cache) | **579K ops/s** |
+| ANN @ depth 1 (~91%) | **36K ops/s** |
 
 Full charts and every operation: **[Benchmarks](doc/BENCHMARKS.md)**.
 

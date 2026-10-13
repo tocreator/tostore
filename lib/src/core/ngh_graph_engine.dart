@@ -435,8 +435,8 @@ class NghGraphEngine {
   /// Typical leaf occupancy used for slot-budget estimates.
   static const int _typicalLeafSlots = 4096;
 
-  /// Interactive scoring cap at depth 100 (keeps p95 interactive on 1M–10M).
-  static const int _maxInteractiveLeaves = 44;
+  /// Interactive scoring cap at depth 100.
+  static const int _maxInteractiveLeaves = 128;
 
   /// Map [searchDepth] → target recall intent.
   ///
@@ -459,10 +459,9 @@ class NghGraphEngine {
     return min(1.0, 0.98 + ppPerDepth * (searchDepth - 100));
   }
 
-  /// Interactive scoring cap: depth 1→14, 50→28, 100→44 typical lists.
+  /// Interactive scoring cap: depth 1→32, 50→64, 100→128 lists.
   /// Depth >100 continues the same 50→100 Δlists/Δdepth so users can keep
-  /// tuning recall when depth=100 is not enough — absolute-capped only to
-  /// forbid inventory-wide brute force (never the old soft 1024 flood).
+  /// tuning recall when depth=100 is not enough — absolute-capped at [_absScoredLeafCap].
   static const int _absScoredLeafCap = 256;
 
   static int _maxLeavesForDepth(
@@ -470,8 +469,8 @@ class NghGraphEngine {
     required int nLeaves,
     required int totalVectors,
   }) {
-    const cap1 = 14;
-    const cap50 = 28;
+    const cap1 = 32;
+    const cap50 = 64;
     const cap100 = _maxInteractiveLeaves;
     final depth = max(1, searchDepth);
     final int cap;
@@ -486,9 +485,7 @@ class NghGraphEngine {
     } else {
       // Escape hatch: depth 150/200/… keeps buying lists at the 50→100 rate
       // until [_absScoredLeafCap]. searchDepth has no hard max.
-
-      // Same delivered slope as depth 50→100 (incl. interactive endpoint).
-      const slopePerDepth = (cap100 - cap50) / 50.0; // 0.32
+      const slopePerDepth = (cap100 - cap50) / 50.0; // 1.28
       cap = min(
         _absScoredLeafCap,
         (cap100 + slopePerDepth * (depth - 100)).round(),
@@ -591,13 +588,31 @@ class NghGraphEngine {
   static const int _targetL0Roots = NghPageSizer.targetL0RootTableCapacity;
 
   /// L0 / mid / leaf boundary multi-assign ratio (48-D IP).
-  /// 0.94 was too tight at 768D/3M: true neighbors often sit just outside
-  /// the primary cell and were never dual-homed → depth100 plateau ~93%.
-  static const double _boundaryDualRatio = 0.88;
+  ///
+  /// Mid/high-D keeps 0.88 (0.94 was too tight at 768D/3M). Ultra-low-D
+  /// cosine space is crowded — a loose gate dual-homes almost everything and
+  /// smears nav cells; tighten only for D≤16. Does **not** change search
+  /// wantLeaves (directed budget stays depth-locked).
+  static double _boundaryDualRatioFor(int dimensions) {
+    // Hot path first: mid/high-D (128/768…) is the common case.
+    if (dimensions > 16) return 0.88;
+    if (dimensions > 8) return 0.93;
+    return 0.965;
+  }
 
-  /// After heavy-root-split, sibling L0 48-D means above this IP are treated as
-  /// near-twins and gently repelled (no leaf rewrite).
-  static const double _l0SiblingNearTwinIp = 0.90;
+  /// L0 catch-up seed rejection: drop seeds at/above this cosine to an existing
+  /// root. Ultra-low-D needs a higher twin bar so useful near-roots are kept.
+  static double _l0TwinCosineFor(int dimensions) {
+    if (dimensions > 16) return 0.92;
+    if (dimensions > 8) return 0.96;
+    return 0.985;
+  }
+
+  /// Mid-hop beam: top1−top2 below this → widen by at most +2 (ambiguous cut).
+  static const double _navBeamGapLow = 0.03;
+
+  /// Mid-hop beam: top1−top2 at/above this → tighten by 1 (high confidence).
+  static const double _navBeamGapHigh = 0.08;
 
   /// Below this corpus size L0 may still be sparse; grow via far-spawn/split.
   /// Crossing it does NOT freeze L0 — Steady still allows growth to
@@ -608,6 +623,9 @@ class NghGraphEngine {
   /// Aggressive while under [_targetL0Roots]; past target still grows toward
   /// [maxRoots] (page-fit) so distribution drift can open new cells — never
   /// freezes at the target for the rest of the corpus lifetime.
+  ///
+  /// Dimension-agnostic on purpose (insert hot path). Ultra-low-D raises the
+  /// door via a batch-hoisted boost at the call site — not branched here.
   static double _l0FarSpawnThreshold(int numRoots, {required int maxRoots}) {
     if (numRoots <= 0) return 1.0;
     final cap = max(1, maxRoots);
@@ -828,62 +846,21 @@ class NghGraphEngine {
     return _navInternalGet(tableUid, indexUid, id, touch: touch);
   }
 
-  /// Beam from recall-intent [searchDepth], with a log10(N) floor for mid trees.
-  ///
-  /// depth≤1 → 2; ≤50 → 3; ≤100 → 4; then +1 per 50 depth.
-  /// N floor (knees 4.2 / 5.0 / 5.5) so mid hops at 30k–4M are not starved.
-  /// Depth-scaled cap: 5 / 6 / 8 at depth 1 / 50 / 100 so large-N does not
-  /// saturate every depth at 8 (searchDepth would collapse). Floor 2.
-  /// depth>100 may raise the cap to 10 (escape hatch) — still not ∝N.
-  static int _navBeamWidth({
-    required int searchDepth,
-    required int wantLeaves,
-    required int totalVectors,
-  }) {
-    final depth = max(1, searchDepth);
-    final int fromDepth;
-    if (depth <= 1) {
-      fromDepth = 2;
-    } else if (depth <= 50) {
-      fromDepth = 3;
-    } else if (depth <= 100) {
-      fromDepth = 4;
-    } else {
-      fromDepth = 4 + ((depth - 100) ~/ 50);
-    }
-    final logN = log(max(1000, totalVectors).toDouble()) / ln10;
-    final nFloor = 2 +
-        max(0.0, (logN - 4.2) * 2.0).round() +
-        max(0.0, (logN - 5.0) * 1.5).round() +
-        max(0.0, (logN - 5.5) * 2.0).round();
-    final int depthCap;
-    if (depth <= 1) {
-      depthCap = 5;
-    } else if (depth <= 50) {
-      depthCap = 6;
-    } else if (depth <= 100) {
-      depthCap = 8;
-    } else {
-      depthCap = 8 + min(2, (depth - 100) ~/ 50); // 8→10
-    }
-    final fromLeaves = max(2, wantLeaves ~/ 3);
-    final target = max(fromDepth, max(nFloor, fromLeaves));
-    return max(2, min(depthCap, target));
-  }
-
   /// How many mid children to keep after scoring one hop.
-  /// Widens by at most +2 when top-1/top-2 are ambiguous — not ∝N.
+  /// Fixed [wantLeaves]: tighten when top-1≫top-2, widen ≤+2 when ambiguous.
+  /// Does not move leaf budget across hops — only clamps mid branching.
   static int _navBeamTake({
     required int beamWidth,
     required List<({NghPageId child, double score})> midScored,
   }) {
     if (midScored.isEmpty) return 0;
     var take = min(beamWidth, midScored.length);
-    if (take >= 2 && midScored.length > take) {
-      final topGap = midScored[0].score - midScored[1].score;
-      if (topGap < 0.03) {
-        take = min(beamWidth + 2, midScored.length);
-      }
+    if (midScored.length < 2) return take;
+    final topGap = midScored[0].score - midScored[1].score;
+    if (topGap >= _navBeamGapHigh) {
+      if (take > 2) take -= 1;
+    } else if (topGap < _navBeamGapLow && midScored.length > take) {
+      take = min(beamWidth + 2, midScored.length);
     }
     return take;
   }
@@ -894,104 +871,6 @@ class NghGraphEngine {
       s += a[ao + d] * b[bo + d];
     }
     return s;
-  }
-
-  /// Blend subtree means toward a far cross-partition pair when the two L0
-  /// cells would otherwise be near-twins (common right after heavy-root-split).
-  static (Float32List left, Float32List right) _l0SiblingCentroids({
-    required List<CentroidBranchEntry> left,
-    required List<CentroidBranchEntry> right,
-    required Float32List leftMean,
-    required Float32List rightMean,
-  }) {
-    final ip = _dot48Flat(leftMean, 0, rightMean, 0);
-    if (ip < _l0SiblingNearTwinIp || left.isEmpty || right.isEmpty) {
-      return (leftMean, rightMean);
-    }
-    var bestIp = 2.0;
-    var bestL = left.first.centroid48D;
-    var bestR = right.first.centroid48D;
-    for (final le in left) {
-      final lc = le.centroid48D;
-      for (final re in right) {
-        final rc = re.centroid48D;
-        final s = _dot48Flat(lc, 0, rc, 0);
-        if (s < bestIp) {
-          bestIp = s;
-          bestL = lc;
-          bestR = rc;
-        }
-      }
-    }
-    final outL = Float32List(48);
-    final outR = Float32List(48);
-    for (int d = 0; d < 48; d++) {
-      outL[d] = 0.55 * leftMean[d] + 0.45 * bestL[d];
-      outR[d] = 0.55 * rightMean[d] + 0.45 * bestR[d];
-    }
-    _normalize48ListInPlace(outL);
-    _normalize48ListInPlace(outR);
-    // Soft repulsion if still too close after the blend.
-    if (_dot48Flat(outL, 0, outR, 0) >= _l0SiblingNearTwinIp) {
-      for (int d = 0; d < 48; d++) {
-        final diff = outL[d] - outR[d];
-        outL[d] += 0.20 * diff;
-        outR[d] -= 0.20 * diff;
-      }
-      _normalize48ListInPlace(outL);
-      _normalize48ListInPlace(outR);
-    }
-    return (outL, outR);
-  }
-
-  static void _normalize48ListInPlace(Float32List v) {
-    var nSq = 0.0;
-    for (int d = 0; d < 48; d++) {
-      nSq += v[d] * v[d];
-    }
-    if (nSq > 1e-12) {
-      final inv = 1.0 / sqrt(nSq);
-      for (int d = 0; d < 48; d++) {
-        v[d] *= inv;
-      }
-    }
-  }
-
-  /// Final pass: gently separate a just-split L0 pair if refresh left them close.
-  static void _repelL0SiblingPair(
-    CentroidBTreeState state,
-    int rootA,
-    int rootB,
-  ) {
-    final n = state.numRootCentroids;
-    if (rootA < 0 || rootB < 0 || rootA >= n || rootB >= n || rootA == rootB) {
-      return;
-    }
-    final flat = state.rootCentroids48Flat;
-    final oa = rootA * 48;
-    final ob = rootB * 48;
-    if (_dot48Flat(flat, oa, flat, ob) < _l0SiblingNearTwinIp) return;
-    final a = Float32List(48);
-    final b = Float32List(48);
-    for (int d = 0; d < 48; d++) {
-      final diff = flat[oa + d] - flat[ob + d];
-      a[d] = flat[oa + d] + 0.25 * diff;
-      b[d] = flat[ob + d] - 0.25 * diff;
-    }
-    // Identical means → zero diff; nudge on a stable axis.
-    var diffSq = 0.0;
-    for (int d = 0; d < 48; d++) {
-      final diff = a[d] - b[d];
-      diffSq += diff * diff;
-    }
-    if (diffSq < 1e-10) {
-      a[0] += 0.15;
-      b[0] -= 0.15;
-    }
-    _normalize48ListInPlace(a);
-    _normalize48ListInPlace(b);
-    state.setRootCentroid48(rootA, a);
-    state.setRootCentroid48(rootB, b);
   }
 
   void _forEachScoredNavEntry({
@@ -1703,7 +1582,9 @@ class NghGraphEngine {
     return w;
   }
 
-  /// Far-pair / projection 50-50 split (same spirit as leaf split).
+  /// 2-pass far-pair projection split + weight-balanced cut.
+  /// Pass1: farthest from weighted mean → A; Pass2: farthest from A → B.
+  /// Axis A−B minimizes mid-boundary overlap vs seedA=entries[0].
   (List<CentroidBranchEntry>, List<CentroidBranchEntry>)
       _splitBranchEntriesBalanced(
     List<CentroidBranchEntry> entries,
@@ -1711,27 +1592,42 @@ class NghGraphEngine {
     if (entries.length <= 1) {
       return (List<CentroidBranchEntry>.from(entries), <CentroidBranchEntry>[]);
     }
-    final seedA = entries[0].centroid48DSimd;
-    var bestB = 1;
-    var minSim = 1e9;
-    for (int i = 1; i < entries.length; i++) {
+    final center = _normalize48Mean(_mean48BranchEntries(entries));
+    final centerSimd = Float32x4List.sublistView(center);
+    var bestA = 0;
+    var minToCenter = 1e9;
+    for (int i = 0; i < entries.length; i++) {
+      final sim = innerProduct48(centerSimd, entries[i].centroid48DSimd, 0);
+      if (sim < minToCenter) {
+        minToCenter = sim;
+        bestA = i;
+      }
+    }
+    final seedA = entries[bestA].centroid48DSimd;
+    var bestB = bestA == 0 ? 1 : 0;
+    var minToA = 1e9;
+    for (int i = 0; i < entries.length; i++) {
+      if (i == bestA) continue;
       final sim = innerProduct48(seedA, entries[i].centroid48DSimd, 0);
-      if (sim < minSim) {
-        minSim = sim;
+      if (sim < minToA) {
+        minToA = sim;
         bestB = i;
       }
     }
     final seedB = entries[bestB].centroid48DSimd;
-    final scores = Float64List(entries.length);
-    final indices = Int32List(entries.length);
-    for (int i = 0; i < entries.length; i++) {
+    final n = entries.length;
+    final scores = Float64List(n);
+    final indices = Int32List(n);
+    final weights = Int32List(n);
+    for (int i = 0; i < n; i++) {
       final s = entries[i].centroid48DSimd;
       scores[i] = innerProduct48(seedA, s, 0) - innerProduct48(seedB, s, 0);
       indices[i] = i;
+      weights[i] = max(1, entries[i].childWeight);
     }
-    for (int i = 0; i < entries.length; i++) {
+    for (int i = 0; i < n; i++) {
       var maxIdx = i;
-      for (int j = i + 1; j < entries.length; j++) {
+      for (int j = i + 1; j < n; j++) {
         if (scores[j] > scores[maxIdx]) maxIdx = j;
       }
       final ts = scores[i];
@@ -1740,18 +1636,43 @@ class NghGraphEngine {
       final ti = indices[i];
       indices[i] = indices[maxIdx];
       indices[maxIdx] = ti;
+      final tw = weights[i];
+      weights[i] = weights[maxIdx];
+      weights[maxIdx] = tw;
     }
-    final mid = entries.length ~/ 2;
+    var totalW = 0;
+    for (int i = 0; i < n; i++) {
+      totalW += weights[i];
+    }
+    // Cut on projection order that best balances subtree weight (not count).
+    var leftW = 0;
+    var bestCut = 1;
+    var bestImbalance = 1 << 30;
+    var bestMidDist = n;
+    for (int cut = 1; cut < n; cut++) {
+      leftW += weights[cut - 1];
+      final rightW = totalW - leftW;
+      final imbalance = (leftW - rightW).abs();
+      final midDist = (cut - (n ~/ 2)).abs();
+      if (imbalance < bestImbalance ||
+          (imbalance == bestImbalance && midDist < bestMidDist)) {
+        bestImbalance = imbalance;
+        bestMidDist = midDist;
+        bestCut = cut;
+      }
+    }
     final left = <CentroidBranchEntry>[];
     final right = <CentroidBranchEntry>[];
-    for (int i = 0; i < mid; i++) {
+    for (int i = 0; i < bestCut; i++) {
       left.add(entries[indices[i]]);
     }
-    for (int i = mid; i < entries.length; i++) {
+    for (int i = bestCut; i < n; i++) {
       right.add(entries[indices[i]]);
     }
     if (left.isEmpty && right.isNotEmpty) {
       left.add(right.removeLast());
+    } else if (right.isEmpty && left.isNotEmpty) {
+      right.add(left.removeLast());
     }
     return (left, right);
   }
@@ -2599,19 +2520,11 @@ class NghGraphEngine {
 
   /// Map [searchDepth], corpus size and [topK] to Centroid B+Tree probe plan.
   ///
-  /// LOCKED scale contract (tens of billions — do not weaken for recall patches):
-  /// - Depth is recall-*intent*. Depth has **no hard max**: 1→100 is the primary
-  ///   band; depth>100 continues the same 50→100 Δbudget/Δdepth so a user who
-  ///   is short of recall at depth=100 can keep tuning (escape hatch).
-  /// - Anchors: 1→~91% (±5), 50→~95% (±3), 100→~98% (±5) inside the
-  ///   interactive leaf band. Hold large-N recall by precise L0/mid routing;
-  ///   never by auto-growing wantLeaves with N (throughput cliff at 1e7+).
-  /// - depth≤100: wantLeaves hard-capped by interactive band (~14 / 28 / 44).
-  /// - depth>100: continues that slope up to [_absScoredLeafCap] (256) — never
-  ///   inventory-wide / 1024 brute force.
-  /// - Mild continuous log10(N) hedge (knee ~16k) only inside those caps —
-  ///   ~+0 @10k (QPS), ~+1 @30k, ~+4 @1M. Not a per-N special case.
-  static ({int wantRoots, int wantLeaves, int candSlots})
+  /// Scale contract:
+  /// - Directed navigation: lean roots (6 @depth1, 10 @depth50, 16 @depth100).
+  /// - Candidate leaves kept intact without aggressive pruning (32 @depth1, 64 @depth50, 128 @depth100).
+  /// - Independent of N; depth>100 linear continuation up to [_absScoredLeafCap] (256).
+  static ({int wantRoots, int wantLeaves, int candSlots, int beamWidth})
       _resolveCentroidBTreeProbePlan({
     required int totalVectors,
     required int topK,
@@ -2626,143 +2539,119 @@ class NghGraphEngine {
     final rawDepth = searchDepth ?? VectorIndexConfig.defaultSearchDepth;
     final depth = max(1, rawDepth);
 
-    // Post-rebuild: 10k stays lean (logN knees inactive). Mid-N (50k–1M)
-    // was below 91/95 anchors because dens-trim + late largeN hedge.
-    // Continuous log10(N) only — no discrete N switches.
+    // Compute logN and continuous scale factor t once for the entire probe plan.
     final logN = log(max(1000, totalVectors).toDouble()) / ln10;
-    final midN = max(0.0, logN - 5.3); // 0 @≤200k; ~0.7 @1M
-    final largeN = max(0.0, logN - 5.5); // 0 @≤300k; ~0.5 @1M
-    final scaleLeaves = max(0.0, (logN - 4.2) * 1.5).round() +
-        max(0.0, (logN - 5.0) * 1.2).round() +
-        (midN * 2.0).round() +
-        (largeN * 2.0).round(); // 50k:~1; 1M:~3+1+1+1=6
-    final scaleRoots = max(0.0, (logN - 4.2) * 1.5).round() +
-        max(0.0, (logN - 4.7) * 1.5).round() +
-        max(0.0, (logN - 5.5) * 2.5).round() +
-        (largeN * 2.0).round();
-    final scaleSlots = max(0.0, (logN - 4.2) * 2.5).round() +
-        max(0.0, (logN - 5.0) * 1.5).round() +
-        (midN * 2.0).round();
+    final t = ((logN - 4.0) / 3.477).clamp(0.0, 1.0);
 
-    // Lean low-depth bases (≤50k calibrated). Mid/high N uses scale* above.
-    const leaf1 = 5.0;
-    const leaf50 = 10.0;
-    const leaf100 = 18.0;
-    const root50 = 6.0;
-    const root100 = 10.0;
-    const tipLeaves100 = 7; // hold ~98% @depth100
-    const tipRoots100 = 3;
-    const tipSlots100 = 6;
-    const leafSlope50 = (leaf100 + tipLeaves100 - leaf50) / 50.0; // 0.30
-    const rootSlope50 = (root100 + tipRoots100 - root50) / 50.0; // 0.14
-    const slotSlope50 = (34.0 + tipSlots100 - 18.0) / 50.0; // 0.44
-
-    // 1. Leaf pages probed (cheap 48-D page scan → then SQ8 score those leaves)
+    // -------------------------------------------------------------
+    // Branch-specific lazy evaluation per searchDepth:
+    // Only compute the parameters necessary for the requested depth,
+    // avoiding wasted float ops and round() calls for unused depths.
+    // -------------------------------------------------------------
     final int baseLeaves;
-    if (depth <= 1) {
-      baseLeaves = leaf1.round();
-    } else if (depth <= 50) {
-      baseLeaves = (leaf1 + (leaf50 - leaf1) * ((depth - 1) / 49.0)).round();
-    } else if (depth <= 100) {
-      baseLeaves =
-          (leaf50 + (leaf100 - leaf50) * ((depth - 50) / 50.0)).round();
-    } else {
-      // CRITICAL: continue from interactive depth-100 ceiling (44), not bare
-      // leaf100 (20). Otherwise depth 101 regresses vs depth 100 and the
-      // escape hatch is useless when recall is already short at 100.
-      baseLeaves =
-          (_maxInteractiveLeaves + leafSlope50 * (depth - 100)).round();
-    }
-    var leaves = max(1,
-        baseLeaves + (depth <= 1 ? (scaleLeaves * 0.7).round() : scaleLeaves));
-
-    // 2. Root centroids probed (cheap 48-D; inventory-capped at search time)
     final int baseRoots;
-    if (depth <= 30) {
-      baseRoots = 4;
-    } else if (depth <= 70) {
-      baseRoots = 5 + (largeN * 2.0).round(); // +1 @1M mid band
-    } else if (depth <= 100) {
-      baseRoots =
-          (7.0 + 2.0 * ((depth - 70) / 30.0)).round() + (largeN * 2.0).round();
-    } else {
-      final at100Roots = root100 + tipRoots100; // 13
-      baseRoots = (at100Roots + rootSlope50 * (depth - 100)).round();
-    }
-    var roots = max(
-        1, baseRoots + (depth <= 1 ? (scaleRoots * 0.75).round() : scaleRoots));
-
-    //   Two-step bake ≈ original×0.5 kept R@10 at depth 1/50/98 identical to the
-    //   pre-cut baseline on that corpus while roughly doubling QPS. Leaf/root
-    //   cuts were weaker and more recall-sensitive — left alone.
-    final s1 = max(topK * 2, 10);
-    final s50 = max(topK * 2 + 2, 18);
-    final s100 = max(topK * 3 + 4, 34);
     final int baseCandSlots;
+    final int beamWidth;
+
     if (depth <= 1) {
-      baseCandSlots = s1;
-    } else if (depth <= 50) {
-      baseCandSlots = (s1 + (s50 - s1) * ((depth - 1) / 49.0)).round();
+      // Branch A: depth <= 1 (ultra-fast register-tracked path)
+      baseLeaves = (5.0 + 27.0 * t).round();
+      baseRoots = (4.0 + 4.0 * t).round();
+      beamWidth = (2.0 + 2.0 * t).round();
+      final s1Small = max(topK * 2, 16);
+      final s1Large = max(topK * 8, 128);
+      baseCandSlots = (s1Small + (s1Large - s1Small) * t).round();
+    } else if (depth == 50) {
+      // Branch B: depth == 50 (production default — majority of queries)
+      baseLeaves = (6.0 + 58.0 * t).round();
+      baseRoots = (6.0 + 8.0 * t).round();
+      beamWidth = (2.0 + 3.0 * t).round();
+      final s50Small = max(topK * 3, 28);
+      final s50Large = max(topK * 16, 256);
+      baseCandSlots = (s50Small + (s50Large - s50Small) * t).round();
+    } else if (depth < 50) {
+      // Branch C: 1 < depth < 50
+      final x = (depth - 1) / 49.0;
+      final l1 = 5.0 + 27.0 * t;
+      final l50 = 6.0 + 58.0 * t;
+      baseLeaves = (l1 + (l50 - l1) * x).round();
+
+      final r1 = 4.0 + 4.0 * t;
+      final r50 = 6.0 + 8.0 * t;
+      baseRoots = (r1 + (r50 - r1) * x).round();
+
+      final b1 = 2.0 + 2.0 * t;
+      final b50 = 2.0 + 3.0 * t;
+      beamWidth = (b1 + (b50 - b1) * x).round();
+
+      final s1Small = max(topK * 2, 16);
+      final s1Large = max(topK * 8, 128);
+      final s50Small = max(topK * 3, 28);
+      final s50Large = max(topK * 16, 256);
+      final s1 = s1Small + (s1Large - s1Small) * t;
+      final s50 = s50Small + (s50Large - s50Small) * t;
+      baseCandSlots = (s1 + (s50 - s1) * x).round();
     } else if (depth <= 100) {
-      baseCandSlots = (s50 + (s100 - s50) * ((depth - 50) / 50.0)).round();
+      // Branch D: 50 < depth <= 100
+      final x = (depth - 50) / 50.0;
+      final l50 = 6.0 + 58.0 * t;
+      final l100 = 20.0 + 108.0 * t;
+      baseLeaves = (l50 + (l100 - l50) * x).round();
+
+      final r50 = 6.0 + 8.0 * t;
+      final r100 = 10.0 + 12.0 * t;
+      baseRoots = (r50 + (r100 - r50) * x).round();
+
+      final b50 = 2.0 + 3.0 * t;
+      final b100 = 3.0 + 3.0 * t;
+      beamWidth = (b50 + (b100 - b50) * x).round();
+
+      final s50Small = max(topK * 3, 28);
+      final s50Large = max(topK * 16, 256);
+      final s100Small = max(topK * 5, 56);
+      final s100Large = max(topK * 32, 512);
+      final s50 = s50Small + (s50Large - s50Small) * t;
+      final s100 = s100Small + (s100Large - s100Small) * t;
+      baseCandSlots = (s50 + (s100 - s50) * x).round();
     } else {
-      baseCandSlots =
-          (s100 + tipSlots100 + slotSlope50 * (depth - 100)).round();
-    }
-    var slots = max(topK, baseCandSlots + scaleSlots);
+      // Branch E: depth > 100 (extrapolation escape hatch)
+      final l50 = 6.0 + 58.0 * t;
+      final l100 = 20.0 + 108.0 * t;
+      final slopePerDepth = (l100 - l50) / 50.0;
+      baseLeaves = min(
+        _absScoredLeafCap,
+        (l100 + slopePerDepth * (depth - 100)).round(),
+      );
 
-    // Depth 80–98: mild ramp. ≥200k gets a light high-depth leaf tip so 1M
-    // depth100 returns toward ~98% without ≤50k cost.
-    // Depth 99–100: tip. Depth >100: tip folded into continue-from-ceiling.
-    if (depth >= 80 && depth < 99) {
-      final ramp = depth - 79; // 1@80 … 19@98
-      leaves += 1 + ramp ~/ 7; // +1@80 … +3@98
-      slots += 1 + ramp ~/ 4;
-      if (depth >= 90) roots += 1;
-      if (depth >= 90) {
-        final bridge =
-            max(0.0, (logN - 5.0) * 5.0).round() + (largeN * 4.0).round();
-        leaves += bridge;
-        slots += bridge * 2;
-      }
-    } else if (depth >= 99 && depth <= 100) {
-      final tip = min(2, depth - 98); // 1 @99, 2 @100
-      roots += tip * 2;
-      leaves += tip * 3;
-      slots += tip * 6;
-      final bridge =
-          max(0.0, (logN - 5.0) * 5.0).round() + (largeN * 4.0).round();
-      leaves += bridge;
-      slots += bridge * 2;
-    }
+      final r50 = 6.0 + 8.0 * t;
+      final r100 = 10.0 + 12.0 * t;
+      final maxR = (10.0 + 18.0 * t).round();
+      final slopeR = (r100 - r50) / 50.0;
+      baseRoots = min(maxR, (r100 + slopeR * (depth - 100)).round());
 
-    // Mid-band (≥40): 50-anchor valley was 100k–1M because largeN is 0
-    // until ~300k. Start a light continuous boost at ~50k (4.7).
-    if (depth >= 40 && depth <= 70) {
-      final midBoost =
-          max(0.0, (logN - 4.7) * 3.5).round() + (largeN * 4.0).round();
-      leaves += midBoost;
-      slots += midBoost * 2;
-    }
+      final b100 = (3.0 + 3.0 * t).round();
+      beamWidth = min(8, b100 + ((depth - 100) ~/ 50));
 
-    // Density compensation vs the ~20-slot 768D calibration leaf:
-    // - dens>1.25 (low-D packed): trim leaf *count* only. Do not inflate
-    //   candSlots/roots — denser pages already fill the heap.
-    // - slotsPerPage<8 (high-D sparse): raise leaf count for candidate volume.
-    // - Inventory: real leaf pages ∪ dual-home floor (never ceil(N/spp)=1).
-    // No ≤50k qpsLean on depth≤70 — that cut 128D/~10k recall far below
-    // anchors whether the tree was one-shot or incremental.
-    const refSlotsPerPage = 20.0;
+      final s50Small = max(topK * 3, 28);
+      final s50Large = max(topK * 16, 256);
+      final s100Small = max(topK * 5, 56);
+      final s100Large = max(topK * 32, 512);
+      final s50 = s50Small + (s50Large - s50Small) * t;
+      final s100 = s100Small + (s100Large - s100Small) * t;
+      final slopeS = (s100 - s50) / 50.0;
+      baseCandSlots = min(1536, (s100 + slopeS * (depth - 100)).round());
+    }
+    var leaves = baseLeaves;
+    var roots = baseRoots;
+    var slots = baseCandSlots;
+
+    // Inventory bounds (real leaf pages ∪ dual-home floor).
     final slotsPerPage = NghPageSizer.estimateLeafSlotsPerPage(
       max(4096, leafPageSize),
       max(1, dimensions),
     ).toDouble();
-    final dens = slotsPerPage / refSlotsPerPage;
     final spp = max(1.0, slotsPerPage);
     final packedLeaves = max(1, (totalVectors / spp).ceil());
-    // Never let a stale/low leafNextPageNo (or packed N/spp=1) pin
-    // wantLeaves at 1 — dual-home + underfull pages exceed packing, and
-    // `leafPageCount > 0` must not *replace* that floor.
     final dualHomeFloor =
         min(_absScoredLeafCap, min(totalVectors, packedLeaves * 3 + 2));
     final inventoryLeaves = max(
@@ -2773,79 +2662,30 @@ class NghGraphEngine {
       ),
     );
 
-    final tinyCover = (1.0 -
-            max(0.0,
-                (log(max(16, totalVectors).toDouble()) / ln10 - 1.2) / 1.6))
-        .clamp(0.0, 1.0);
-    if (dens > 1.25) {
-      leaves = max(1, (leaves / dens).round());
-      // nBump follows depth so 1M+ does not pin depth1 near the depth100
-      // floor (searchDepth would collapse). 10k nBump=0 unchanged.
-      final nBump = max(0.0, (logN - 4.2) * 2.0).round() +
-          max(0.0, (logN - 5.0) * 2.0).round();
-      final nBumpScaled = depth <= 1
-          ? (nBump * 0.55).round()
-          : depth <= 50
-              ? (nBump * 0.65).round()
-              : nBump;
-      final d1Min = logN >= 4.8 ? 4 : 3;
-      final minLeaves =
-          (depth <= 1 ? d1Min : (depth <= 50 ? 5 : (depth <= 98 ? 8 : 12))) +
-              nBumpScaled;
-      leaves = max(minLeaves, leaves);
-      slots = max(topK, (slots / (0.95 + 0.15 * dens)).round());
-    } else if (slotsPerPage < 8) {
-      // Target the same candidate *count* as 768D at this depth, not leaf×20
-      // blindly when spp=1 (that forced wantLeaves→100–256 and full-D SQ8
-      // on nearly the whole tiny corpus).
-      final targetCand = max(topK * 24, (leaves * refSlotsPerPage).round());
+    // Ultra-sparse pages (slotsPerPage < 8) ensure candidate volume matches target.
+    if (slotsPerPage < 8) {
+      final targetCand = max(topK * 24, leaves * 20);
       final needLeaves = max(leaves, (targetCand / spp).ceil());
       leaves = min(needLeaves, inventoryLeaves);
       slots = max(slots, min(2048, leaves * spp.round() + topK));
     }
 
-    // HARD CAPS — interactive band. Sparse pages may raise the cap enough to
-    // hit targetCand, but never above inventory or abs scored-leaf cap.
+    // HARD CAPS — interactive band. All dimensions treated equally.
     final leafCap = _maxLeavesForDepth(
       depth,
       nLeaves: 1 << 20,
       totalVectors: totalVectors,
     );
-    final sparseFactor = slotsPerPage < 8
-        ? min(8.0, refSlotsPerPage / spp) // was uncapped 20 → depth1 hit 256
-        : 1.0;
-    final capRelief = depth >= 80
-        ? max(0.0, (logN - 5.0) * 4.0).round() + (largeN * 4.0).round()
-        : depth >= 40
-            ? (largeN * 2.0).round()
-            : 0;
-    final effectiveCap = min(
-      _absScoredLeafCap,
-      min(inventoryLeaves, (leafCap * sparseFactor).round() + capRelief),
-    );
+    final effectiveCap = min(_absScoredLeafCap, min(inventoryLeaves, leafCap));
     leaves = min(leaves, effectiveCap);
-    // High-depth large-N: add after dens-trim so depth100 can sit ~2–3pp
-    // above depth50. Depth1 does not get this.
-    if (depth >= 90) {
-      final highN =
-          max(0.0, (logN - 5.0) * 5.0).round() + (largeN * 4.0).round();
-      leaves = min(effectiveCap, leaves + highN);
-    }
-    if (tinyCover > 0) {
-      final coverLeaves = max(
-        1,
-        min(inventoryLeaves, (inventoryLeaves * tinyCover).ceil()),
-      );
-      leaves = max(leaves, min(effectiveCap, coverLeaves));
-      roots = max(roots, min(256, (4 + 28 * tinyCover).round()));
-      slots = max(slots, min(totalVectors, (totalVectors * tinyCover).ceil()));
-    }
+
     slots = min(slots, leaves * _typicalLeafSlots);
 
     return (
       wantRoots: min(256, roots),
       wantLeaves: leaves,
       candSlots: min(2048, slots),
+      beamWidth: beamWidth,
     );
   }
 
@@ -3150,13 +2990,8 @@ class NghGraphEngine {
       }
     }
 
-    // Beam follows searchDepth with a logN floor; depth-scaled cap 5/6/8.
     final maxLeavesToRead = min(plan.wantLeaves, scratch.pickedLeaves.length);
-    final int beamWidth = _navBeamWidth(
-      searchDepth: max(1, searchDepth ?? VectorIndexConfig.defaultSearchDepth),
-      wantLeaves: plan.wantLeaves,
-      totalVectors: meta.totalVectors,
-    );
+    final int beamWidth = plan.beamWidth;
     scratch.branchHeap.reset(maxLeavesToRead);
     var l1AllCached = true;
     for (int r = 0; r < rootsToProbe; r++) {
@@ -3675,46 +3510,74 @@ class NghGraphEngine {
         continue;
       }
 
-      final codes = slot.sq8Codes;
-      double dot0 = 0.0;
-      double dot1 = 0.0;
-      int d = 0;
-      final unroll16 = dim - 15;
-      while (d < unroll16) {
-        dot0 += q[d] * codes[d] +
-            q[d + 2] * codes[d + 2] +
-            q[d + 4] * codes[d + 4] +
-            q[d + 6] * codes[d + 6] +
-            q[d + 8] * codes[d + 8] +
-            q[d + 10] * codes[d + 10] +
-            q[d + 12] * codes[d + 12] +
-            q[d + 14] * codes[d + 14];
-        dot1 += q[d + 1] * codes[d + 1] +
-            q[d + 3] * codes[d + 3] +
-            q[d + 5] * codes[d + 5] +
-            q[d + 7] * codes[d + 7] +
-            q[d + 9] * codes[d + 9] +
-            q[d + 11] * codes[d + 11] +
-            q[d + 13] * codes[d + 13] +
-            q[d + 15] * codes[d + 15];
-        d += 16;
-      }
-      while (d < dim) {
-        dot0 += q[d] * codes[d];
-        d++;
-      }
-
-      final ip = slot.offset * qFullSum + slot.scale * (dot0 + dot1);
       final double dist;
-      if (isCosine) {
-        // Cosine inserts store unit vectors → squaredNorm ≈ 1; skip sqrt.
-        final sn = slot.squaredNorm;
-        final cosSim = (sn > 0.99 && sn < 1.01) ? ip : ip / sqrt(sn);
-        dist = cosSim >= 1.0 ? 0.0 : (cosSim <= 0.0 ? 1.0 : 1.0 - cosSim);
-      } else if (isIP) {
-        dist = -ip;
+      if (dim > 16) {
+        final codes = slot.sq8Codes;
+        double dot0 = 0.0;
+        double dot1 = 0.0;
+        int d = 0;
+        final unroll16 = dim - 15;
+        while (d < unroll16) {
+          dot0 += q[d] * codes[d] +
+              q[d + 2] * codes[d + 2] +
+              q[d + 4] * codes[d + 4] +
+              q[d + 6] * codes[d + 6] +
+              q[d + 8] * codes[d + 8] +
+              q[d + 10] * codes[d + 10] +
+              q[d + 12] * codes[d + 12] +
+              q[d + 14] * codes[d + 14];
+          dot1 += q[d + 1] * codes[d + 1] +
+              q[d + 3] * codes[d + 3] +
+              q[d + 5] * codes[d + 5] +
+              q[d + 7] * codes[d + 7] +
+              q[d + 9] * codes[d + 9] +
+              q[d + 11] * codes[d + 11] +
+              q[d + 13] * codes[d + 13] +
+              q[d + 15] * codes[d + 15];
+          d += 16;
+        }
+        while (d < dim) {
+          dot0 += q[d] * codes[d];
+          d++;
+        }
+
+        final ip = slot.offset * qFullSum + slot.scale * (dot0 + dot1);
+        if (isCosine) {
+          // Cosine inserts store unit vectors → squaredNorm ≈ 1; skip sqrt.
+          final sn = slot.squaredNorm;
+          final cosSim = (sn > 0.99 && sn < 1.01) ? ip : ip / sqrt(sn);
+          dist = cosSim >= 1.0 ? 0.0 : (cosSim <= 0.0 ? 1.0 : 1.0 - cosSim);
+        } else if (isIP) {
+          dist = -ip;
+        } else {
+          dist = max(0.0, 1.0 + slot.squaredNorm - 2.0 * ip);
+        }
       } else {
-        dist = max(0.0, 1.0 + slot.squaredNorm - 2.0 * ip);
+        final sSimd = slot.low48DSimd ?? slot.getLow48DSimd(dim);
+        final ip = innerProduct48Reg(
+          q0,
+          q1,
+          q2,
+          q3,
+          q4,
+          q5,
+          q6,
+          q7,
+          q8,
+          q9,
+          q10,
+          q11,
+          sSimd,
+          0,
+        );
+        if (isCosine) {
+          dist = ip >= 1.0 ? 0.0 : (ip <= 0.0 ? 1.0 : 1.0 - ip);
+        } else if (isIP) {
+          dist = -ip;
+        } else {
+          // Both sketches are L2-normalized → ||q-x||² = 2-2⟨q,x⟩.
+          dist = max(0.0, 2.0 - 2.0 * ip);
+        }
       }
 
       if (hasThreshold && dist > threshold) continue;
@@ -3991,6 +3854,22 @@ class NghGraphEngine {
       meta,
       _partitionManager.configuredPageSize,
     );
+    // Dim gates are fixed for the batch — hoist off the per-vector hot path.
+    final dualRatio = _boundaryDualRatioFor(currentMeta.dimensions);
+    final l0TwinCosine = _l0TwinCosineFor(currentMeta.dimensions);
+    // Ultra-low-D only: raise far-spawn door. null = mid/high-D (no extra work).
+    final double? l0FarSpawnBoost;
+    final double l0FarSpawnCap;
+    if (currentMeta.dimensions > 16) {
+      l0FarSpawnBoost = null;
+      l0FarSpawnCap = 0.0;
+    } else if (currentMeta.dimensions > 8) {
+      l0FarSpawnBoost = 0.10;
+      l0FarSpawnCap = 0.88;
+    } else {
+      l0FarSpawnBoost = 0.22;
+      l0FarSpawnCap = 0.92;
+    }
     final isCosine = currentMeta.distanceMetric == VectorDistanceMetric.cosine;
 
     final normalizedVectors = isCosine
@@ -4873,7 +4752,7 @@ class NghGraphEngine {
         // only the last mid (parent of leaf-level) dual-forks.
         dualMidChildId = null;
         dualMidPath = null;
-        if (secondIdx >= 0 && secondScore >= bestScore * _boundaryDualRatio) {
+        if (secondIdx >= 0 && secondScore >= bestScore * dualRatio) {
           final altId = cur.entries[secondIdx].childPageId;
           if (!altId.isNone) {
             dualMidChildId = altId;
@@ -4977,7 +4856,7 @@ class NghGraphEngine {
 
       final needLeafDual = secondEntry != null &&
           !identical(secondEntry, bestEntry) &&
-          secondScore >= bestScore * _boundaryDualRatio;
+          secondScore >= bestScore * dualRatio;
       final midAltId = dualMidChildId;
       final midAltPath = dualMidPath;
       NghNavBTreePage? midAltPage;
@@ -5105,7 +4984,7 @@ class NghGraphEngine {
         final secondScore = top.secondScore;
         dualMidChildId = null;
         dualMidPath = null;
-        if (secondIdx >= 0 && secondScore >= bestScore * _boundaryDualRatio) {
+        if (secondIdx >= 0 && secondScore >= bestScore * dualRatio) {
           final altId = cur.entries[secondIdx].childPageId;
           if (!altId.isNone) {
             dualMidChildId = altId;
@@ -5199,7 +5078,7 @@ class NghGraphEngine {
       );
       if (secondEntry != null &&
           !identical(secondEntry, bestEntry) &&
-          secondScore >= bestScore * _boundaryDualRatio) {
+          secondScore >= bestScore * dualRatio) {
         await insertSlotIntoLeaf(
           rootId,
           secondEntry,
@@ -5280,9 +5159,9 @@ class NghGraphEngine {
     }
 
     /// Split heaviest L0 firstInternal into two L0 roots (local nav only).
-    /// Returns the (leftRoot, rightRoot) pair when a split was applied.
-    (int, int)? tryHeavyRootSplitOnce() {
-      if (!state!.canGrowRoot || state.numRootCentroids <= 0) return null;
+    /// Returns true when a split was applied (true subtree means, no repulsion).
+    bool tryHeavyRootSplitOnce() {
+      if (!state!.canGrowRoot || state.numRootCentroids <= 0) return false;
       var bestRoot = -1;
       var bestWeight = 0;
       var secondWeight = 0;
@@ -5308,7 +5187,7 @@ class NghGraphEngine {
           secondWeight = w;
         }
       }
-      if (bestRoot < 0 || bestPage == null || bestPageId == null) return null;
+      if (bestRoot < 0 || bestPage == null || bestPageId == null) return false;
 
       final projectedN = currentMeta.totalVectors + vectors.length;
       final fair = max(1, projectedN ~/ max(1, state.numRootCentroids));
@@ -5318,12 +5197,12 @@ class NghGraphEngine {
       final heavyThresh =
           max(512, min(fair, avgW) * (underTarget ? 110 : 115) ~/ 100);
       final peerHot = secondWeight > 0 && bestWeight >= secondWeight * 3 ~/ 2;
-      if (bestWeight < heavyThresh && !peerHot) return null;
+      if (bestWeight < heavyThresh && !peerHot) return false;
 
       final (left, right) = _splitBranchEntriesBalanced(
         List<CentroidBranchEntry>.from(bestPage.entries),
       );
-      if (left.isEmpty || right.isEmpty) return null;
+      if (left.isEmpty || right.isEmpty) return false;
 
       final wasLeaf = bestPage.isLeafLevel;
       bestPage.entries
@@ -5333,13 +5212,7 @@ class NghGraphEngine {
       markInsertNav(bestPageId, bestPage);
       final leftMean = normalize48InPlace(_mean48BranchEntries(left));
       final rightMean = normalize48InPlace(_mean48BranchEntries(right));
-      final (sepLeft, sepRight) = _l0SiblingCentroids(
-        left: left,
-        right: right,
-        leftMean: leftMean,
-        rightMean: rightMean,
-      );
-      state.setRootCentroid48(bestRoot, sepLeft);
+      state.setRootCentroid48(bestRoot, leftMean);
 
       final (rightPtrs, rightMeta) = _partitionManager.allocatePagesBatchSync(
         NghDataCategory.nav,
@@ -5356,17 +5229,17 @@ class NghGraphEngine {
         entries: right,
       );
       final assigned = state.appendRoot(
-        centroid48D: sepRight,
+        centroid48D: rightMean,
         firstInternal: rightId,
       );
-      if (assigned < 0) return null;
+      if (assigned < 0) return false;
       markInsertNav(rightId, rightPage);
       insertNavRootsReady.add(assigned);
-      return (bestRoot, assigned);
+      return true;
     }
 
-    /// Grow L0 toward target/page-fit. Returns sibling pairs created this batch.
-    List<(int, int)> tryHeavyRootSplit() {
+    /// Grow L0 toward target/page-fit via heavy firstInternal splits.
+    void tryHeavyRootSplit() {
       flushAllPendingBubbles();
       final n = state!.numRootCentroids;
       final cap = state.maxRoots;
@@ -5374,13 +5247,9 @@ class NghGraphEngine {
       final budget = !state.canGrowRoot
           ? 0
           : (n < _targetL0Roots ? 5 : (n < (cap * 9) ~/ 10 ? 2 : 1));
-      final pairs = <(int, int)>[];
       for (int i = 0; i < budget; i++) {
-        final pair = tryHeavyRootSplitOnce();
-        if (pair == null) break;
-        pairs.add(pair);
+        if (!tryHeavyRootSplitOnce()) break;
       }
-      return pairs;
     }
 
     /// Tiny cold-start (1 / 100 rows) leaves L0 far below the sample-rich
@@ -5426,7 +5295,8 @@ class NghGraphEngine {
         if (!state.canGrowRoot) break;
         var tooClose = false;
         for (int r = 0; r < state.numRootCentroids; r++) {
-          if (_dot48Flat(seed, 0, state.rootCentroids48Flat, r * 48) >= 0.92) {
+          if (_dot48Flat(seed, 0, state.rootCentroids48Flat, r * 48) >=
+              l0TwinCosine) {
             tooClose = true;
             break;
           }
@@ -5480,7 +5350,7 @@ class NghGraphEngine {
       }
 
       pinRoots.add(bestRoot0);
-      if (maxScore1 >= maxScore0 * _boundaryDualRatio) {
+      if (maxScore1 >= maxScore0 * dualRatio) {
         pinRoots.add(bestRoot1);
       }
 
@@ -5545,7 +5415,7 @@ class NghGraphEngine {
             final top = insertTop2Nav(curPage, qLowSimd);
             dualMidChildId = null;
             if (top.secondIdx >= 0 &&
-                top.secondScore >= top.bestScore * _boundaryDualRatio) {
+                top.secondScore >= top.bestScore * dualRatio) {
               final altId = curPage.entries[top.secondIdx].childPageId;
               if (!altId.isNone) {
                 dualMidChildId = altId;
@@ -5576,7 +5446,7 @@ class NghGraphEngine {
             bestLeaf = best.leafPageId;
           }
           if (leafTop.secondIdx >= 0 &&
-              leafTop.secondScore >= leafTop.bestScore * _boundaryDualRatio) {
+              leafTop.secondScore >= leafTop.bestScore * dualRatio) {
             final second = curPage.entries[leafTop.secondIdx];
             if (!identical(second, best) && !second.leafPageId.isNone) {
               neededLeafIds.add(second.leafPageId);
@@ -5604,7 +5474,7 @@ class NghGraphEngine {
         if (leaf0 != null && !leaf0.isNone) {
           leafSortKey = (leaf0.partitionNo << 32) | (leaf0.pageNo & 0xffffffff);
         }
-        if (w.maxScore1 >= w.maxScore0 * _boundaryDualRatio) {
+        if (w.maxScore1 >= w.maxScore0 * dualRatio) {
           probeRoot(w.bestRoot1);
         }
         if (leafSortKey != w.leafSortKey) {
@@ -5673,12 +5543,16 @@ class NghGraphEngine {
       // Far from every L0 → spawn a precise new root (keeps wantLeaves fixed).
       // After a catch-up expand, this batch already has target k-means cells;
       // extra far-spawns would re-create the vacant-root recall dip.
-      final farThresh = catchUpExpandedL0
+      var farThresh = catchUpExpandedL0
           ? 0.0
           : _l0FarSpawnThreshold(
               state.numRootCentroids,
               maxRoots: state.maxRoots,
             );
+      final farBoost = l0FarSpawnBoost;
+      if (farBoost != null) {
+        farThresh = min(l0FarSpawnCap, farThresh + farBoost);
+      }
       if (state.canGrowRoot && maxScore0 < farThresh) {
         final spawned = spawnFarL0Root(lowVec);
         if (spawned != null) {
@@ -5693,7 +5567,7 @@ class NghGraphEngine {
         await insertIntoRoot(bestRoot0, newSlot, qLowSimd);
       }
       // Boundary dual-assign — ratio calibrated for 768D multi-M (was 0.94).
-      if (maxScore1 >= maxScore0 * _boundaryDualRatio) {
+      if (maxScore1 >= maxScore0 * dualRatio) {
         if (!insertIntoRootSync(bestRoot1, newSlot, qLowSimd)) {
           await insertIntoRoot(bestRoot1, newSlot, qLowSimd);
         }
@@ -5704,15 +5578,10 @@ class NghGraphEngine {
     // Drain coalesced mid summaries before L0 refresh / heavy-root split.
     flushAllPendingBubbles();
 
-    // Heavy-root-split first (uses current heads), then refresh means, then
-    // re-separate any near-twin sibling pair created this batch. Refreshing
-    // before split used to overwrite a careful post-split separation.
-    final splitPairs = tryHeavyRootSplit();
+    // Heavy-root-split first (true subtree means), then refresh all L0 heads.
+    tryHeavyRootSplit();
     for (int r = 0; r < state.numRootCentroids; r++) {
       refreshRootCentroidFromHead(r);
-    }
-    for (final pair in splitPairs) {
-      _repelL0SiblingPair(state, pair.$1, pair.$2);
     }
 
     // Persist root table when nextCentroidId advanced, cold-start dirtied it,

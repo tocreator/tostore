@@ -126,14 +126,12 @@ class ExampleSchemas {
   /// Interactive example tables. Fill and sweep one table at a time —
   /// do not bulk-load every width together.
   ///
-  /// 16 / 32 / 48: packing + throughput (48 is the NGH routing width).
-  /// 128 / 256 / 512 / 768 / 1536: everyday + 8KB leaf band (256).
-  /// 4096 / 8192 / 16384 / 65535: high-D insert + flush packing.
+
+  static const int vectorDim4 = 4;
+  static const int vectorDim8 = 8;
   static const int vectorDim16 = 16;
-  static const int vectorDim32 = 32;
   static const int vectorDim48 = 48;
   static const int vectorDimLow = 128;
-  static const int vectorDim256 = 256;
   static const int vectorDimMid = 512;
   static const int vectorDim768 = 768;
   static const int vectorDimHigh = 1536;
@@ -142,49 +140,49 @@ class ExampleSchemas {
   static const int vectorDim16384 = 16384;
   static const int vectorDim65535 = 65535;
 
-  /// 16-d packing probe (4KB leaves). Not a product recall proxy.
+  /// 4-d ultra-low demo (bridge before 8-d).
+  static final TableSchema embeddings4 = _cosineNghEmbeddings(
+    name: 'embeddings_4',
+    dimensions: vectorDim4,
+  );
+
+  /// 8-d demo table. Clear and re-insert after example data updates.
+  static final TableSchema embeddings8 = _cosineNghEmbeddings(
+    name: 'embeddings_8',
+    dimensions: vectorDim8,
+  );
+
+  /// 16-d low-width demo.
   static final TableSchema embeddings16 = _cosineNghEmbeddings(
     name: 'embeddings_16',
     dimensions: vectorDim16,
   );
 
-  /// 32-d packing probe (4KB leaves). Not a product recall proxy.
-  static final TableSchema embeddings32 = _cosineNghEmbeddings(
-    name: 'embeddings_32',
-    dimensions: vectorDim32,
-  );
-
-  /// 48-d native routing width. Large-N navigation proxy; bridge vs 128.
+  /// 48-d mid-width demo.
   static final TableSchema embeddings48 = _cosineNghEmbeddings(
     name: 'embeddings_48',
     dimensions: vectorDim48,
   );
 
-  /// 128-d (small encoders). Use to catch low-D over-probe / cheap-recall bias.
+  /// 128-d everyday small-encoder width.
   static final TableSchema embeddings128 = _cosineNghEmbeddings(
     name: 'embeddings_128',
     dimensions: vectorDimLow,
   );
 
-  /// 256-d (8KB leaves). Covers the mid packing band between 128 and 512.
-  static final TableSchema embeddings256 = _cosineNghEmbeddings(
-    name: 'embeddings_256',
-    dimensions: vectorDim256,
-  );
-
-  /// 512-d default embedding width.
+  /// 512-d common embedding width.
   static final TableSchema embeddings512 = _cosineNghEmbeddings(
     name: 'embeddings_512',
     dimensions: vectorDimMid,
   );
 
-  /// 768-d (BERT / sentence-transformer class).
+  /// 768-d common embedding width.
   static final TableSchema embeddings768 = _cosineNghEmbeddings(
     name: 'embeddings_768',
     dimensions: vectorDim768,
   );
 
-  /// 1536-d (large encoders). Use to catch high-D under-probe / concentration.
+  /// 1536-d large-encoder width.
   static final TableSchema embeddings1536 = _cosineNghEmbeddings(
     name: 'embeddings_1536',
     dimensions: vectorDimHigh,
@@ -211,11 +209,10 @@ class ExampleSchemas {
   );
 
   static List<TableSchema> get vectorTables => [
+        embeddings8,
         embeddings16,
-        embeddings32,
         embeddings48,
         embeddings128,
-        embeddings256,
         embeddings512,
         embeddings768,
         embeddings1536,

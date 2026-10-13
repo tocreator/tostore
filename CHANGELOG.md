@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## 3.5.2
+## 3.6.0
 
 ### Added
 - Added `RecoveryDurability` (`standard`, `durable`, `async`) and optional `durability` parameter across write operations (CRUD, batch, KV, and chained updates/deletes) to configure self-healing recovery policies when returning operation results.

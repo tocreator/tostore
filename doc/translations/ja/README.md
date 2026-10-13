@@ -1813,15 +1813,15 @@ final db = await ToStore.open(
 
 ### ベンチマーク
 
-ハイライト — 100K スイートと 10 億規模エッジ実測（3 ラウンド、2026-08-29）：
+ハイライト — 100K スイートと 10 億規模エッジ実測（3 ラウンド、standard durability、2026-10-08）：
 
 | Metric | Result |
 | :--- | :--- |
 | Cold start | **~35 ms** (stable vs data scale) |
 | PK Read (Hot Cache) | **4.5M ops/s** |
-| Batch Insert | **541K ops/s** |
-| Pagination (Hot Cache) | **604K ops/s** |
-| Vector ANN Search | **1715 ops/s** |
+| Batch Insert | **588K ops/s** |
+| Pagination (Hot Cache) | **579K ops/s** |
+| ANN @ depth 1 (~91%) | **36K ops/s** |
 
 詳細チャートと全項目: **[Benchmarks](../../BENCHMARKS.md)**。
 

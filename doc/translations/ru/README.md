@@ -1813,15 +1813,15 @@ final db = await ToStore.open(
 
 ### Тесты
 
-Ключевые результаты suite 100K и edge-валидации в масштабе миллиарда (3 раунда, 2026-08-29):
+Ключевые результаты suite 100K и edge-валидации в масштабе миллиарда (3 раунда, standard durability, 2026-10-08):
 
 | Metric | Result |
 | :--- | :--- |
 | Cold start | **~35 ms** (stable vs data scale) |
 | PK Read (Hot Cache) | **4.5M ops/s** |
-| Batch Insert | **541K ops/s** |
-| Pagination (Hot Cache) | **604K ops/s** |
-| Vector ANN Search | **1715 ops/s** |
+| Batch Insert | **588K ops/s** |
+| Pagination (Hot Cache) | **579K ops/s** |
+| ANN @ depth 1 (~91%) | **36K ops/s** |
 
 Полные графики и все операции: **[Benchmarks](../../BENCHMARKS.md)**.
 

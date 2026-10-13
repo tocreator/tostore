@@ -1007,7 +1007,11 @@ class ToStoreExample {
   /// [searchDepth] `>= 1` (null = engine default 50).
   /// Set [verbose] false to suppress per-run logs (used by depth sweeps).
   ///
-  /// Throughput is measured like [BenchmarkRunner] vector search
+  /// Throughput is measured like [BenchmarkRunner] vector search.
+  ///
+  /// [diverseThroughput] false (default) = hot: reuse the Recall@K query set
+  /// so leaf pages stay warm. true = diverse: shuffle group queries so QPS
+  /// reflects cross-corpus / colder leaf working sets.
   Future<VectorSearchBenchmarkResult?> vectorSearchBenchmark(
     String tableName,
     int iterations,
@@ -1016,11 +1020,13 @@ class ToStoreExample {
     bool verbose = true,
     bool runIdentityDiagnostic = true,
     bool warmup = false,
+    bool diverseThroughput = false,
   }) async {
     final depth = VectorRecallHarness.normalizeDepth(searchDepth);
     if (verbose) {
       logService.add('Starting Vector Search Benchmark: table="$tableName", '
-          'iterations=$iterations, topK=$topK, searchDepth=$depth');
+          'iterations=$iterations, topK=$topK, searchDepth=$depth, '
+          'throughput=${diverseThroughput ? 'diverse' : 'hot'}');
     }
 
     final schema = await db.getTableSchema(tableName);
@@ -1092,7 +1098,25 @@ class ToStoreExample {
     // Prebuild outside the stopwatch — groupQuery allocates/normalizes; doing
     // that inside the timed loop roughly halves measured QPS.
     final List<VectorData> queryVectors;
-    if (recall.queryVectors.isNotEmpty) {
+    var throughputSeed = 0;
+    if (diverseThroughput) {
+      // Independent of the Recall@K sample: shuffle groups so repeated clicks
+      // are not the same hot leaf set (avoids "always cache-hit the same 200").
+      throughputSeed = DateTime.now().microsecondsSinceEpoch;
+      final thrRng = Random(throughputSeed);
+      final order = List<int>.generate(groups, (i) => i)..shuffle(thrRng);
+      queryVectors = List<VectorData>.generate(
+        timedCount,
+        (i) => ExampleVectorCorpus.groupQuery(order[i % groups], dims),
+        growable: false,
+      );
+      if (verbose) {
+        logService.add(
+          'Throughput queries: diverse seed=$throughputSeed over $groups '
+          'groups ($timedCount draws; not the Recall@K sample set).',
+        );
+      }
+    } else if (recall.queryVectors.isNotEmpty) {
       queryVectors = [
         for (var i = 0; i < timedCount; i++)
           recall.queryVectors[i % recall.queryVectors.length],
@@ -1164,6 +1188,8 @@ class ToStoreExample {
         result: result,
         warmupCount: warmupCount,
         batchElapsedMs: batchSw.elapsedMicroseconds / 1000.0,
+        diverseThroughput: diverseThroughput,
+        throughputSeed: throughputSeed,
       );
     }
 
@@ -1177,6 +1203,7 @@ class ToStoreExample {
     int iterations = 100,
     int topK = 10,
     List<int>? depths,
+    bool diverseThroughput = false,
     void Function(int completed, int total)? onProgress,
   }) async {
     final sweepDepths = depths ?? vectorSearchDepthSweepPoints;
@@ -1199,6 +1226,7 @@ class ToStoreExample {
         verbose: false,
         runIdentityDiagnostic: true,
         warmup: false,
+        diverseThroughput: diverseThroughput,
       );
       if (row != null) {
         rows.add(row);
@@ -1225,6 +1253,7 @@ class ToStoreExample {
         topK: topK,
         iterations: iterations,
         rows: rows,
+        diverseThroughput: diverseThroughput,
       ),
       LogLevel.info,
     );
@@ -1237,6 +1266,8 @@ class ToStoreExample {
     required VectorSearchBenchmarkResult result,
     int warmupCount = 0,
     double? batchElapsedMs,
+    bool diverseThroughput = false,
+    int throughputSeed = 0,
   }) {
     final recall = result.recall;
     final totalSearchMs =
@@ -1299,6 +1330,11 @@ class ToStoreExample {
         '    Self-Recall        : $identityPct  (stored vector returns itself first)');
     report.writeln('-' * 78);
     report.writeln('  LATENCY & THROUGHPUT:');
+    final mixLabel = diverseThroughput
+        ? 'diverse (shuffled groups'
+            '${throughputSeed > 0 ? ', seed=$throughputSeed' : ''})'
+        : 'hot (Recall@K set reuse)';
+    report.writeln('    Query Mix          : $mixLabel');
     report.writeln(
         '    Average Latency    : ${result.avgLatencyMs.toStringAsFixed(2)} ms/query');
     report.writeln(

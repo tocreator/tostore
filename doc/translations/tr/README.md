@@ -1812,15 +1812,15 @@ final db = await ToStore.open(
 
 ### Karşılaştırmalar
 
-100K suite ve milyar ölçekli edge doğrulama öne çıkanlar (3 tur, 2026-08-29):
+100K suite ve milyar ölçekli edge doğrulama öne çıkanlar (3 tur, standard durability, 2026-10-08):
 
 | Metric | Result |
 | :--- | :--- |
 | Cold start | **~35 ms** (stable vs data scale) |
 | PK Read (Hot Cache) | **4.5M ops/s** |
-| Batch Insert | **541K ops/s** |
-| Pagination (Hot Cache) | **604K ops/s** |
-| Vector ANN Search | **1715 ops/s** |
+| Batch Insert | **588K ops/s** |
+| Pagination (Hot Cache) | **579K ops/s** |
+| ANN @ depth 1 (~91%) | **36K ops/s** |
 
 Tam grafikler ve tüm işlemler: **[Benchmarks](../../BENCHMARKS.md)**.
 

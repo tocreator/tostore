@@ -3,21 +3,68 @@ import 'dart:typed_data';
 
 import 'package:tostore/tostore.dart';
 
-/// Example embeddings with known nearest neighbors for Recall@K.
+/// Example embeddings with known nearest neighbors for Recall@K demos.
 ///
-/// Consecutive [groupSize] records share a local neighborhood. Query vectors
-/// are not stored. Sequential primary keys from the example insert path.
+/// Consecutive [groupSize] rows share one local neighborhood. Query vectors
+/// are not stored in the table.
+///
+/// Ultra-low-D (≤6): [usesIslandFillerLayout] — a fixed set of scorable
+/// "island" groups sit in a northern cap; extra rows are southern fillers that
+/// cannot enter island Top-K. Recall@K stays planted (no full-table GT) at any N.
 class ExampleVectorCorpus {
   ExampleVectorCorpus._();
 
   /// Neighbors per group. Covers industry-standard Recall@10 with headroom.
   static const int groupSize = 16;
 
-  /// Ray spacing. 10th neighbor of the query is still well above random
-  /// max-cosine at 5M / 128-d (≈ 0.49).
-  static const double rayStep = 0.16;
+  /// Island+filler layout for dimensions at or below this value.
+  static const int islandFillerMaxDimensions = 6;
 
-  /// Query offset on the group ray. Members sit at t = ±0.08, ±0.24, …
+  /// Pull island centers toward +e₀ / fillers toward −e₀ (unit-sphere cap).
+  static const double _capPolePull = 0.55;
+
+  /// Max cosine between distinct island centers (members stay below planted K).
+  static const double _maxIslandCenterCosine = 0.90;
+
+  /// Ray spacing at the 128-d calibration point (and all D≥128).
+  static const double referenceRayStep = 0.16;
+
+  /// Dimension used to calibrate [referenceRayStep].
+  static const int referenceDimensions = 128;
+
+  /// Design corpus size for the high-D random-center safety check.
+  static const int designCorpusN = 10000000;
+
+  /// Extra cosine gap required before a high-D (≥128) neighbor counts for Recall@K.
+  static const double gtCosineMargin = 0.04;
+
+  /// How many result ranks count as a top-1 / self hit.
+  ///
+  /// Below 48-d, neighbors in a group can be very close; a small window
+  /// avoids treating near-ties as hard failures.
+  static int rankWindowForDimensions(int dimensions) {
+    final d = dimensions.clamp(1, 65535);
+    if (d >= 48) return 1;
+    if (d >= 32) return 2;
+    return 3;
+  }
+
+  static bool pkInRankWindow(
+    List<String> annPks,
+    String pk, {
+    required int window,
+  }) {
+    final n = min(window, annPks.length);
+    for (var i = 0; i < n; i++) {
+      if (annPks[i] == pk) return true;
+    }
+    return false;
+  }
+
+  /// Legacy alias — prefer [rayStepFor].
+  static const double rayStep = referenceRayStep;
+
+  /// Legacy alias — prefer [queryTFor].
   static const double queryT = -0.04;
 
   static const String labelPrefix = 'nghgt:';
@@ -33,8 +80,228 @@ class ExampleVectorCorpus {
 
   static int memberIdForIndex(int index) => (index - 1) % groupSize;
 
-  static double memberT(int memberId) =>
-      (memberId - (groupSize - 1) / 2.0) * rayStep;
+  /// Whether this dimension uses fixed islands + background fillers.
+  static bool usesIslandFillerLayout(int dimensions) =>
+      dimensions >= 1 && dimensions <= islandFillerMaxDimensions;
+
+  /// Fixed count of scorable neighborhood groups (independent of corpus N).
+  ///
+  /// Kept small enough that greedy northern-cap packing keeps island–island
+  /// cosine well below planted Top-10 (~0.998).
+  static int scorableIslandCount(int dimensions) {
+    final d = dimensions.clamp(1, islandFillerMaxDimensions);
+    // 2D circle capacity is tiny once ray members are included.
+    if (d <= 2) return 6;
+    if (d <= 4) return 24;
+    return 48; // 5–6D
+  }
+
+  /// Groups that may be used for planted Recall@K / island queries.
+  static int scorableGroupCount({
+    required int dimensions,
+    required int corpusSize,
+  }) {
+    final total = max(0, corpusSize ~/ groupSize);
+    if (!usesIslandFillerLayout(dimensions)) return total;
+    return min(total, scorableIslandCount(dimensions));
+  }
+
+  /// Complete groups available for scoring after an optional non-zero start.
+  static int scorableCompleteGroups({
+    required int dimensions,
+    required int startGroup,
+    required int rawCompleteGroups,
+  }) {
+    if (!usesIslandFillerLayout(dimensions)) return rawCompleteGroups;
+    final lim = scorableIslandCount(dimensions);
+    if (startGroup >= lim || rawCompleteGroups <= 0) return 0;
+    return min(rawCompleteGroups, lim - startGroup);
+  }
+
+  static bool isFillerGroup(int groupId, int dimensions) =>
+      usesIslandFillerLayout(dimensions) &&
+      groupId >= scorableIslandCount(dimensions);
+
+  /// Spacing between neighbors in a group. Lower dimensions use a slightly
+  /// smaller step so each group's Top-K stays closer than other groups.
+  static double rayStepFor(int dimensions) {
+    final d = dimensions.clamp(1, 65535);
+    if (d >= referenceDimensions) return referenceRayStep;
+    final step = referenceRayStep * sqrt(d / referenceDimensions);
+    // Island layout: keep rays tight — fillers are capped away in the south.
+    if (usesIslandFillerLayout(d)) {
+      // Tighter than mid-D: island members must beat adjacent-island rays.
+      return min(step, d <= 2 ? 0.008 : 0.012);
+    }
+    if (d <= 8) return min(step, 0.020);
+    return step.clamp(0.08, referenceRayStep);
+  }
+
+  /// Query offset on the group ray (`-rayStep/4`, same ratio as legacy).
+  static double queryTFor(int dimensions) => -rayStepFor(dimensions) / 4.0;
+
+  static double memberT(int memberId, [int dimensions = referenceDimensions]) =>
+      (memberId - (groupSize - 1) / 2.0) * rayStepFor(dimensions);
+
+  /// Cosine between query and member on the unit-sphere ray model.
+  static double plantedCosine(int memberId, int dimensions) {
+    final t = memberT(memberId, dimensions);
+    final q = queryTFor(dimensions);
+    return (1.0 + q * t) / (sqrt(1.0 + q * q) * sqrt(1.0 + t * t));
+  }
+
+  /// Approx max cosine among [corpusSize] random unit vectors in [dimensions].
+  ///
+  /// Uses N(0, 1/d) tail quantile Φ^{-1}(1-1/N)/√d — good mid/high-D gate.
+  /// Near 1.0 the Gaussian model is crude; callers still treat D≲16 multi-100k
+  /// as packing-only when [maxReliableRecallK] returns 0.
+  static double approxRandomMaxCosine(int dimensions, int corpusSize) {
+    final d = max(1, dimensions);
+    final n = max(2, corpusSize);
+    final z = _invNormApprox(1.0 - 1.0 / n);
+    return min(0.9995, z / sqrt(d.toDouble()));
+  }
+
+  /// Largest K that the example generator can still score fairly.
+  ///
+  /// Uses a foreign-center cosine floor: planted neighbors must stay clearly
+  /// closer than typical nearest other-group centers (low-D packing) or the
+  /// random-sphere envelope (D≥128). Returns 0 when even Top-1 is ambiguous.
+  static int maxReliableRecallK({
+    required int dimensions,
+    required int corpusSize,
+    int wantK = 10,
+  }) {
+    final limit = min(wantK, groupSize);
+    // Island+filler: scorable neighborhoods stay unambiguous at any N.
+    if (usesIslandFillerLayout(dimensions)) {
+      if (scorableGroupCount(
+            dimensions: dimensions,
+            corpusSize: corpusSize,
+          ) <=
+          0) {
+        return 0;
+      }
+      return limit;
+    }
+    final groups = max(1, corpusSize ~/ groupSize);
+    final foreign = dimensions < referenceDimensions
+        ? approxNearestForeignCenterCosine(dimensions, groups)
+        : approxRandomMaxCosine(dimensions, corpusSize);
+    final double gap;
+    if (dimensions < referenceDimensions) {
+      // 1 - cos(center, outermost member) on the unit-sphere ray model.
+      final tOuter = (groupSize - 1) / 2.0 * rayStepFor(dimensions);
+      final shell = 1.0 - 1.0 / sqrt(1.0 + tOuter * tOuter);
+      gap = max(
+        shell + 0.002,
+        max(0.002, min(gtCosineMargin, (1.0 - foreign) * 0.75)),
+      );
+    } else {
+      gap = gtCosineMargin;
+    }
+    // Do not early-out on foreign+gap≥1 — floor is clamped below; let the
+    // planted loop decide (avoids 4D@70k→n/a while Top-3 is still fair).
+    if (foreign >= 0.9999) return 0;
+    final floor = min(0.9998, foreign + gap);
+    final members = neighborMemberIds(dimensions);
+    var k = 0;
+    for (var i = 0; i < limit; i++) {
+      if (plantedCosine(members[i], dimensions) <= floor) break;
+      k = i + 1;
+    }
+    return k;
+  }
+
+  /// Typical nearest-other-group center cosine for the separated packing.
+  ///
+  static double approxNearestForeignCenterCosine(int dimensions, int groups) {
+    final d = max(1, dimensions);
+    final g = max(1, groups);
+    if (g <= 1) return -1.0;
+    if (d == 2) {
+      // Weyl/golden circle ≈ uniform; nearest gap ~ 2π/G.
+      return cos(2 * pi / g);
+    }
+    final probes = min(48, g);
+    final catalog = min(g, 4096);
+    var sum = 0.0;
+    for (var p = 0; p < probes; p++) {
+      final gid = (p * 9973) % g;
+      final center = _separatedCenter(gid, d);
+      var best = -2.0;
+      final stride = max(1, g ~/ catalog);
+      for (var h = 0; h < catalog; h++) {
+        final other = (gid + 1 + h * stride) % g;
+        if (other == gid) continue;
+        final o = _separatedCenter(other, d);
+        var dot = 0.0;
+        for (var i = 0; i < d; i++) {
+          dot += center[i] * o[i];
+        }
+        if (dot > best) best = dot;
+      }
+      sum += best;
+    }
+    return sum / probes;
+  }
+
+  /// Beasley-Springer-Moro inverse normal CDF (for GT envelope only).
+  static double _invNormApprox(double p) {
+    const a = <double>[
+      -3.969683028665376e+01,
+      2.209460984245205e+02,
+      -2.759285104469687e+02,
+      1.383577518672690e+02,
+      -3.066479806614716e+01,
+      2.506628277459239e+00,
+    ];
+    const b = <double>[
+      -5.447609879822406e+01,
+      1.615858368580409e+02,
+      -1.556989798598866e+02,
+      6.680131188771972e+01,
+      -1.328068155288572e+01,
+    ];
+    const c = <double>[
+      -7.784894002430293e-03,
+      -3.223964580411365e-01,
+      -2.400758277161838e+00,
+      -2.549732539343734e+00,
+      4.374664141464968e+00,
+      2.938163982698783e+00,
+    ];
+    const dCoef = <double>[
+      7.784695709041462e-03,
+      3.224671290700398e-01,
+      2.445134137142996e+00,
+      3.754408661907416e+00,
+    ];
+    const plow = 0.02425;
+    final phigh = 1.0 - plow;
+    if (p <= 0) return -8.0;
+    if (p >= 1) return 8.0;
+    if (p < plow) {
+      final q = sqrt(-2.0 * log(p));
+      return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q +
+              c[5]) /
+          ((((dCoef[0] * q + dCoef[1]) * q + dCoef[2]) * q + dCoef[3]) * q +
+              1.0);
+    }
+    if (p > phigh) {
+      final q = sqrt(-2.0 * log(1.0 - p));
+      return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q +
+              c[5]) /
+          ((((dCoef[0] * q + dCoef[1]) * q + dCoef[2]) * q + dCoef[3]) * q +
+              1.0);
+    }
+    final q = p - 0.5;
+    final r = q * q;
+    return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r +
+            a[5]) *
+        q /
+        (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0);
+  }
 
   static String recordLabel(int index) {
     final g = groupIdForIndex(index);
@@ -75,11 +342,12 @@ class ExampleVectorCorpus {
   }
 
   /// Member ids nearest to the query first (unique nearest neighbor at member 7).
-  static List<int> neighborMemberIds() {
+  /// Sorted by true ray-cosine (not |t−q|); ranks 13–14 can differ from |t−q|.
+  static List<int> neighborMemberIds([int dimensions = referenceDimensions]) {
     final ids = List<int>.generate(groupSize, (m) => m);
     ids.sort((a, b) {
       final c =
-          (memberT(a) - queryT).abs().compareTo((memberT(b) - queryT).abs());
+          plantedCosine(b, dimensions).compareTo(plantedCosine(a, dimensions));
       if (c != 0) return c;
       return a.compareTo(b);
     });
@@ -91,9 +359,12 @@ class ExampleVectorCorpus {
     required int dimensions,
   }) {
     final groupId = groupIdForIndex(index);
+    if (isFillerGroup(groupId, dimensions)) {
+      return VectorData(_fillerVector(index, dimensions));
+    }
     final memberId = memberIdForIndex(index);
     final (center, dir) = _cachedFrame(groupId, dimensions);
-    final t = memberT(memberId);
+    final t = memberT(memberId, dimensions);
     final values = List<double>.generate(
       dimensions,
       (d) => center[d] + t * dir[d],
@@ -103,11 +374,22 @@ class ExampleVectorCorpus {
   }
 
   /// Query for [groupId]: off-center on the group ray (not stored).
+  ///
+  /// For island layouts, prefer [groupId] &lt; [scorableIslandCount]; filler
+  /// group ids still produce a deterministic vector but are not Recall GT.
   static VectorData groupQuery(int groupId, int dimensions) {
+    if (isFillerGroup(groupId, dimensions)) {
+      // Deterministic probe near the filler dump (throughput only).
+      return VectorData(_fillerVector(
+        groupId * groupSize + 1,
+        dimensions,
+      ));
+    }
     final (center, dir) = _cachedFrame(groupId, dimensions);
+    final q = queryTFor(dimensions);
     final values = List<double>.generate(
       dimensions,
-      (d) => center[d] + queryT * dir[d],
+      (d) => center[d] + q * dir[d],
     );
     _normalizeInPlace(values);
     return VectorData(values);
@@ -132,8 +414,9 @@ class ExampleVectorCorpus {
     required int groupId,
     required int k,
     int originIndex = 1,
+    int dimensions = referenceDimensions,
   }) {
-    final members = neighborMemberIds();
+    final members = neighborMemberIds(dimensions);
     final n = min(k, members.length);
     return [
       for (var i = 0; i < n; i++)
@@ -175,8 +458,9 @@ class ExampleVectorCorpus {
 
   static (List<double>, List<double>) _frame(int groupId, int dimensions) {
     final rng = Random(groupId * 10007 + dimensions);
-    final center = _gaussian(rng, dimensions);
-    _normalizeInPlace(center);
+    final center = dimensions < referenceDimensions
+        ? _separatedCenter(groupId, dimensions)
+        : _gaussianCenter(rng, dimensions);
     final dir = _gaussian(rng, dimensions);
     var dot = 0.0;
     for (var i = 0; i < dimensions; i++) {
@@ -205,11 +489,175 @@ class ExampleVectorCorpus {
         nSq += x * x;
       }
     }
+    if (nSq < 1e-12) {
+      // Still no tangent (e.g. D=1): leave a unit fallback without /0 → NaN.
+      for (var i = 0; i < dimensions; i++) {
+        dir[i] = i == 0 ? 1.0 : 0.0;
+      }
+      return (center, dir);
+    }
     final n = sqrt(nSq);
     for (var i = 0; i < dimensions; i++) {
       dir[i] /= n;
     }
     return (center, dir);
+  }
+
+  static List<double> _gaussianCenter(Random rng, int dimensions) {
+    final center = _gaussian(rng, dimensions);
+    _normalizeInPlace(center);
+    return center;
+  }
+
+  /// Spread-out neighborhood centers below 128-d so demo groups do not overlap.
+  ///
+  /// D≤6: northern-cap islands ([_islandCenter]). D=7–8: full-sphere Weyl.
+  /// From 16-d: one main axis plus a little side noise.
+  static List<double> _separatedCenter(int groupId, int dimensions) {
+    final d = max(1, dimensions);
+    if (usesIslandFillerLayout(d)) {
+      return _islandCenter(groupId, d);
+    }
+    if (d <= 8) {
+      return _weylSphereCenter(groupId, d);
+    }
+    final out = List<double>.filled(d, 0.0);
+    final axis = groupId % d;
+    final sub = groupId ~/ d;
+    out[axis] = 1.0;
+    final alpha = d < 16 ? 1.15 : 0.75;
+    final noiseRng = Random(sub * 99991 + d * 17 + axis);
+    final noise = _gaussian(noiseRng, d);
+    noise[axis] = 0.0;
+    var nSq = 0.0;
+    for (final x in noise) {
+      nSq += x * x;
+    }
+    if (nSq > 1e-12) {
+      final inv = 1.0 / sqrt(nSq);
+      for (var i = 0; i < d; i++) {
+        out[i] += alpha * noise[i] * inv;
+      }
+    } else {
+      out[(axis + 1) % d] += alpha;
+    }
+    _normalizeInPlace(out);
+    return out;
+  }
+
+  static final Map<int, List<List<double>>> _islandCentersByDim = {};
+
+  /// Scorable island center in the northern cap (+e₀), greedily separated.
+  static List<double> _islandCenter(int groupId, int d) {
+    final all = _islandCentersCached(d);
+    return List<double>.from(all[groupId % all.length]);
+  }
+
+  static List<List<double>> _islandCentersCached(int d) {
+    final cached = _islandCentersByDim[d];
+    if (cached != null) return cached;
+    final want = scorableIslandCount(d);
+    final chosen = <List<double>>[];
+    if (d == 2) {
+      // Even arc — keep half-width small so adjacent centers stay ≪ planted K.
+      const alpha = 0.50; // rad; south arc remains for fillers
+      for (var g = 0; g < want; g++) {
+        final t = want <= 1 ? 0.0 : (g / (want - 1)) * 2 * alpha - alpha;
+        chosen.add([cos(t), sin(t)]);
+      }
+    } else {
+      var cand = 0;
+      while (chosen.length < want && cand < want * 400) {
+        final v = _northCapCandidate(cand, d);
+        cand++;
+        var ok = true;
+        for (final c in chosen) {
+          var s = 0.0;
+          for (var i = 0; i < d; i++) {
+            s += v[i] * c[i];
+          }
+          if (s > _maxIslandCenterCosine) {
+            ok = false;
+            break;
+          }
+        }
+        if (ok) chosen.add(v);
+      }
+      // Pad if the cap could not fit [want] (should not happen at current S).
+      while (chosen.length < want) {
+        chosen.add(_northCapCandidate(chosen.length + 9000, d));
+      }
+    }
+    _islandCentersByDim[d] = chosen;
+    return chosen;
+  }
+
+  static List<double> _northCapCandidate(int seed, int d) {
+    final v = _weylSphereCenter(seed, d);
+    if (v[0] < 0) {
+      for (var i = 0; i < d; i++) {
+        v[i] = -v[i];
+      }
+    }
+    v[0] += _capPolePull;
+    _normalizeInPlace(v);
+    return v;
+  }
+
+  /// Background filler: southern cap (−e₀), O(D) — no scan over islands.
+  static List<double> _fillerVector(int index, int dimensions) {
+    final d = max(1, dimensions);
+    final v = _weylSphereCenter(index + 7919, d);
+    if (v[0] > 0) {
+      for (var i = 0; i < d; i++) {
+        v[i] = -v[i];
+      }
+    }
+    v[0] -= _capPolePull;
+    final rng = Random(index * 100003 + d * 17);
+    final noise = _gaussian(rng, d);
+    const jitter = 0.06;
+    for (var i = 0; i < d; i++) {
+      v[i] += jitter * noise[i];
+    }
+    _normalizeInPlace(v);
+    return v;
+  }
+
+  /// Deterministic well-spaced unit vector for ultra-low-D demo groups.
+  static List<double> _weylSphereCenter(int groupId, int d) {
+    final out = List<double>.filled(d, 0.0);
+    if (d == 2) {
+      // Golden-angle circle — optimal packing on S^1.
+      final theta = 2 * pi * _weylUnit(groupId, 0);
+      out[0] = cos(theta);
+      out[1] = sin(theta);
+      return out;
+    }
+    // Weyl → inverse-normal coordinates, then project to S^{d-1}.
+    for (var i = 0; i < d; i++) {
+      out[i] = _invNormApprox(_weylUnit(groupId, i).clamp(1e-6, 1.0 - 1e-6));
+    }
+    _normalizeInPlace(out);
+    return out;
+  }
+
+  /// Irrational Weyl sequence in [0, 1). Distinct alphas per axis.
+  static double _weylUnit(int groupId, int axis) {
+    // Plastic/golden-family irrationals; axis offset avoids diagonal collapse.
+    const alphas = <double>[
+      0.618033988749895,
+      0.414213562373095,
+      0.732050807568877,
+      0.236067977499790,
+      0.645751311064591,
+      0.316624790355400,
+      0.872983091405302,
+      0.123105625617661,
+    ];
+    final a = alphas[axis % alphas.length];
+    final u = (groupId + 1) * a;
+    return u - u.floorToDouble();
   }
 
   static List<double> _gaussian(Random rng, int dimensions) {
@@ -447,7 +895,7 @@ class VectorRecallHarness {
         : (lastIndex % ExampleVectorCorpus.groupSize == 0
             ? lastIndex
             : lastIndex - (lastIndex % ExampleVectorCorpus.groupSize));
-    final completeGroupCount = hasPkHoles
+    final rawCompleteGroupCount = hasPkHoles
         ? min(
             corpusSize ~/ ExampleVectorCorpus.groupSize,
             (maxPk! - originPk + 1) ~/ ExampleVectorCorpus.groupSize,
@@ -457,6 +905,11 @@ class VectorRecallHarness {
             : (lastComplete - firstComplete + 1) ~/
                 ExampleVectorCorpus.groupSize);
     final startGroup = ExampleVectorCorpus.groupIdForIndex(firstComplete);
+    final completeGroupCount = ExampleVectorCorpus.scorableCompleteGroups(
+      dimensions: dims,
+      startGroup: startGroup,
+      rawCompleteGroups: rawCompleteGroupCount,
+    );
     if (completeGroupCount <= 0) {
       onLog?.call(
         'Recall failed: need at least ${ExampleVectorCorpus.groupSize} vectors '
@@ -472,7 +925,56 @@ class VectorRecallHarness {
       );
     }
 
-    final recallK = min(topK, ExampleVectorCorpus.groupSize);
+    if (ExampleVectorCorpus.usesIslandFillerLayout(dims) &&
+        rawCompleteGroupCount > completeGroupCount) {
+      onLog?.call(
+        'Notice: ${dims}D island layout — scoring $completeGroupCount '
+        'planted islands; '
+        '${rawCompleteGroupCount - completeGroupCount} filler groups '
+        'are background only (Recall@K stays planted at any N).',
+      );
+    }
+
+    final reliableK = ExampleVectorCorpus.maxReliableRecallK(
+      dimensions: dims,
+      corpusSize: corpusSize,
+      wantK: min(topK, ExampleVectorCorpus.groupSize),
+    );
+    if (reliableK <= 0) {
+      onLog?.call(
+        'Notice: Recall@K scoring is skipped for ${dims}D @ N=$corpusSize — '
+        'example groups are not distinct enough at this size. '
+        'Measuring latency and Self-Recall only. '
+        'Clear and re-insert this table if you generated it with an older example.',
+      );
+      return _latencyFallback(
+        db: db,
+        tableName: tableName,
+        pkName: pkName,
+        vectorFieldName: vectorField.name,
+        dims: dims,
+        metric: metric,
+        topK: topK,
+        depth: depth,
+        requestedQueries: requestedQueries,
+        corpusSize: corpusSize,
+        isSequentialPk: isSequentialPk,
+        minPk: minPk,
+        maxPk: maxPk,
+        setupSw: setupSw,
+        querySeedOffset: querySeedOffset,
+        runIdentityDiagnostic: runIdentityDiagnostic,
+        yieldUi: yieldUi,
+        onLog: onLog,
+      );
+    }
+    final recallK = reliableK;
+    if (recallK < topK) {
+      onLog?.call(
+        'Notice: scoring Recall@$recallK (not @$topK) — at ${dims}D / N=$corpusSize '
+        'only the first $recallK known neighbors stay unambiguous.',
+      );
+    }
     final queryCount = resolveQueryCount(
       requested: requestedQueries,
       completeGroups: completeGroupCount,
@@ -546,15 +1048,18 @@ class VectorRecallHarness {
     ];
     setupSw.stop();
 
+    final rankWindow = ExampleVectorCorpus.rankWindowForDimensions(dims);
     onLog?.call(
       'Scoring Recall@$recallK on ${groups.length} queries '
-      '($corpusSize vectors, ${dims}D ${metric.name})...',
+      '($corpusSize vectors, ${dims}D ${metric.name}'
+      '${rankWindow > 1 ? ', top1/self window=top$rankWindow' : ''})...',
     );
 
     final annLatenciesMs = <double>[];
     var neighborHits = 0;
     var top1Hits = 0;
     final perQueryRecall = <double>[];
+    final searchTopK = max(topK, rankWindow);
 
     for (var i = 0; i < groups.length; i++) {
       final querySw = Stopwatch()..start();
@@ -562,7 +1067,7 @@ class VectorRecallHarness {
         tableName,
         fieldName: vectorField.name,
         queryVector: queries[i],
-        topK: topK,
+        topK: searchTopK,
         searchDepth: depth,
       );
       querySw.stop();
@@ -574,6 +1079,7 @@ class VectorRecallHarness {
         groupId: groups[i],
         k: recallK,
         originIndex: stampedOrigin,
+        dimensions: dims,
       );
       final gtSet = gtPks.toSet();
       var hits = 0;
@@ -587,8 +1093,11 @@ class VectorRecallHarness {
       );
 
       if (gtPks.isNotEmpty &&
-          annPks.isNotEmpty &&
-          annPks.first == gtPks.first) {
+          ExampleVectorCorpus.pkInRankWindow(
+            annPks,
+            gtPks.first,
+            window: rankWindow,
+          )) {
         top1Hits++;
       }
 
@@ -609,7 +1118,8 @@ class VectorRecallHarness {
         groups.length * ExampleVectorCorpus.groupSize,
       );
       onLog?.call(
-        'Self-Recall: checking $identityProbes stored vectors...',
+        'Self-Recall: checking $identityProbes stored vectors'
+        '${rankWindow > 1 ? ' (hit if PK in top$rankWindow)' : ''}...',
       );
       final idRng = Random(4242 + querySeedOffset);
       for (var i = 0; i < identityProbes; i++) {
@@ -638,12 +1148,17 @@ class VectorRecallHarness {
           tableName,
           fieldName: vectorField.name,
           queryVector: vec,
-          topK: 1,
+          topK: max(rankWindow, topK),
           searchDepth: depth,
         );
         querySw.stop();
         identityLatenciesMs.add(querySw.elapsedMicroseconds / 1000.0);
-        if (results.isNotEmpty && results.first.primaryKey == pk) {
+        final annPks = [for (final r in results) r.primaryKey];
+        if (ExampleVectorCorpus.pkInRankWindow(
+          annPks,
+          pk,
+          window: rankWindow,
+        )) {
           identityHits++;
         }
       }
@@ -789,6 +1304,7 @@ class VectorRecallHarness {
     var identityProbes = 0;
     final identityLatenciesMs = <double>[];
     if (runIdentityDiagnostic && sampleDocs.isNotEmpty) {
+      final rankWindow = ExampleVectorCorpus.rankWindowForDimensions(dims);
       identityProbes = min(maxIdentityProbes, sampleDocs.length);
       for (var i = 0; i < identityProbes; i++) {
         final doc = sampleDocs[i];
@@ -800,12 +1316,17 @@ class VectorRecallHarness {
           tableName,
           fieldName: vectorFieldName,
           queryVector: v,
-          topK: 1,
+          topK: max(rankWindow, topK),
           searchDepth: depth,
         );
         querySw.stop();
         identityLatenciesMs.add(querySw.elapsedMicroseconds / 1000.0);
-        if (results.isNotEmpty && results.first.primaryKey == pk) {
+        final annPks = [for (final r in results) r.primaryKey];
+        if (ExampleVectorCorpus.pkInRankWindow(
+          annPks,
+          pk,
+          window: rankWindow,
+        )) {
           identityHits++;
         }
       }
@@ -1017,6 +1538,7 @@ String formatVectorDepthSweepSummary({
   required int topK,
   required int iterations,
   required List<VectorSearchBenchmarkResult> rows,
+  bool diverseThroughput = false,
 }) {
   if (rows.isEmpty) {
     return '[Vector Depth Sweep] No results.';
@@ -1025,22 +1547,25 @@ String formatVectorDepthSweepSummary({
   final first = rows.first.recall;
   final canScore = rows.any((r) => r.recall.canScoreRecall);
   final depths = rows.map((r) => r.recall.searchDepth).join(',');
+  // Scored K can be below the requested topK when groups get crowded.
+  final scoredK =
+      rows.map((r) => r.recall.topK).fold<int>(topK, (a, b) => min(a, b));
 
   final header = StringBuffer()
     ..writeln('[Vector Depth Sweep] table=$tableName '
         '${first.dimensions}D ${first.metricLabel}, '
-        'corpus=${first.corpusSize}, topK=$topK, queries=$iterations')
+        'corpus=${first.corpusSize}, topK=$topK'
+        '${scoredK != topK ? ' (scored@$scoredK)' : ''}, '
+        'queries=$iterations, '
+        'throughput=${diverseThroughput ? 'diverse' : 'hot'}')
     ..writeln('depths=$depths'
-        '${canScore ? '' : ' (Recall@K n/a — need example vector rows)'}')
+        '${canScore ? '' : ' (Recall@K n/a — example neighbors not distinct at this size)'}')
     ..writeln(
-        'searchDepth | recall@$topK | top1_hit | self_rc | avg_ms | p95_ms | qps');
+        'searchDepth | recall@$scoredK | top1_hit | self_rc | avg_ms | p95_ms | qps');
 
   for (final row in rows) {
     header.writeln(row.sweepTableRow());
   }
-
-  header.writeln(
-      '# top1_hit=true nearest at rank 1; self_rc=own vector returns itself first');
 
   return header.toString().trimRight();
 }
