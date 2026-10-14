@@ -1,9 +1,4 @@
-import 'dart:typed_data';
-
 import '../handler/value_matcher.dart';
-import '../model/db_exception.dart';
-import '../model/result_status.dart';
-import '../model/result_type.dart';
 import '../model/table_schema.dart';
 
 /// Query Condition Builder
@@ -1070,36 +1065,14 @@ class QueryCondition {
   /// Match records using dense vector similarity search.
   QueryCondition matchVector(
     String field,
-    dynamic vector, {
+    VectorData queryVector, {
     double weight = 1.0,
     int? searchDepth,
     double? distanceThreshold,
     double? minScore,
   }) {
-    final VectorData vectorData;
-    if (vector is VectorData) {
-      vectorData = vector;
-    } else if (vector is List<num>) {
-      vectorData = VectorData.fromList(vector);
-    } else if (vector is Float32List) {
-      vectorData =
-          VectorData(vector.map((e) => e.toDouble()).toList(growable: false));
-    } else if (vector is List<double>) {
-      vectorData = VectorData(vector);
-    } else {
-      throw DbException([
-        InvalidArgumentStatus(
-          type: ResultType.devInvalidArgumentFormat,
-          message:
-              'matchVector parameter [vector] must be VectorData, List<num>, or Float32List, got ${vector.runtimeType}',
-          parameterName: 'vector',
-          passedValue: vector.runtimeType.toString(),
-        )
-      ]);
-    }
-
     final payload = <String, dynamic>{
-      'vector': vectorData,
+      'vector': queryVector,
       'weight': weight,
       if (searchDepth != null) 'searchDepth': searchDepth,
       if (distanceThreshold != null) 'distanceThreshold': distanceThreshold,
@@ -1113,7 +1086,7 @@ class QueryCondition {
       final cleanField = field.contains('.') ? field.split('.').last : field;
       _cachedPureVectorMatch = (
         field: cleanField,
-        vector: vectorData,
+        vector: queryVector,
         weight: weight,
         searchDepth: searchDepth,
         distanceThreshold: distanceThreshold,
@@ -1126,7 +1099,7 @@ class QueryCondition {
   /// OR branch with vector similarity search.
   QueryCondition orMatchVector(
     String field,
-    dynamic vector, {
+    VectorData queryVector, {
     double weight = 1.0,
     int? searchDepth,
     double? distanceThreshold,
@@ -1134,7 +1107,7 @@ class QueryCondition {
   }) {
     final result = or().matchVector(
       field,
-      vector,
+      queryVector,
       weight: weight,
       searchDepth: searchDepth,
       distanceThreshold: distanceThreshold,

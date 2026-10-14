@@ -442,7 +442,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   /// Match records using dense vector similarity search.
   ///
   /// [field] The vector field name to search on.
-  /// [vector] Query vector (accepts [VectorData], `List<num>`, or `Float32List`).
+  /// [queryVector] Query target vector (same type as [ToStore.vectorSearch]).
   /// [weight] Fusion weight multiplier (default: 1.0).
   /// [searchDepth] ANN search depth (`>= 1`). Larger values typically raise
   /// recall and latency. Approximate nearest neighbor — not a guaranteed
@@ -451,7 +451,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   /// [minScore] Minimum normalized similarity score threshold (0.0 ~ 1.0).
   QueryBuilder matchVector(
     String field,
-    dynamic vector, {
+    VectorData queryVector, {
     double weight = 1.0,
     int? searchDepth,
     double? distanceThreshold,
@@ -461,7 +461,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     _ensureConditionTree();
     _condition!.matchVector(
       field,
-      vector,
+      queryVector,
       weight: weight,
       searchDepth: searchDepth,
       distanceThreshold: distanceThreshold,
@@ -479,7 +479,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   /// OR branch with vector similarity search.
   QueryBuilder orMatchVector(
     String field,
-    dynamic vector, {
+    VectorData queryVector, {
     double weight = 1.0,
     int? searchDepth,
     double? distanceThreshold,
@@ -489,7 +489,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     _ensureConditionTree();
     _condition!.orMatchVector(
       field,
-      vector,
+      queryVector,
       weight: weight,
       searchDepth: searchDepth,
       distanceThreshold: distanceThreshold,

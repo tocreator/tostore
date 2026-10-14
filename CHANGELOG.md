@@ -13,6 +13,7 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - Optimized database initialization and first-startup performance.
 - Optimized vector search throughput (up to ~10×) and vector index build speed (about 2× faster / ~50% less build time).
+- `matchVector` / `orMatchVector` now take `VectorData queryVector` (aligned with `db.vectorSearch`); wrap lists via `VectorData.fromList(...)`.
 - `db.flush()` now defaults to `FlushMode.full`. Deprecated `flushStorage`; use `mode` instead.
 - `deleteDatabase` closes with `flush: false` before removing files.
 

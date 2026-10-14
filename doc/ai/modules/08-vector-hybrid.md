@@ -62,14 +62,14 @@ Engine ranks by a **distance** (lower = closer):
 | `innerProduct` | **negated** IP | Engine does **not** auto-normalize; normalize caller-side for semantic IP |
 | `cosine` | `1 - cosine` | Engine auto-normalizes |
 
-`VectorData.fromList(...)` (or `List<num>` / `Float32List`) for query vectors.
+Build query vectors with `VectorData(...)` / `VectorData.fromList(...)` (same type as `vectorSearch`).
 
 ## Preferred: chained hybrid retrieval
 
 ```dart
 QueryBuilder matchVector(
   String field,
-  dynamic vector, {
+  VectorData queryVector, {
   double weight = 1.0,
   int? searchDepth, // default VectorIndexConfig.defaultSearchDepth (50)
   double? distanceThreshold,
