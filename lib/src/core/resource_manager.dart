@@ -6,7 +6,6 @@ import '../handler/logger.dart';
 import '../handler/platform_handler.dart';
 import '../model/data_store_config.dart';
 import '../model/db_exception.dart';
-import '../model/flush_pressure_state.dart';
 import '../model/memory_info.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
@@ -290,8 +289,7 @@ class ResourceManager {
 
   /// Whether the database is currently experiencing active disk flush pressure
   bool get _isFlushBusy =>
-      _dataStore?.parallelJournalManager.pressureState ==
-      FlushPressureState.busy;
+      _dataStore?.parallelJournalManager.isPressureBusy ?? false;
 
   /// Current recommended cache eviction ratio based on status severity
   double get currentEvictionRatio =>

@@ -126,11 +126,17 @@ class ParallelJournalManager {
     }
   }
 
-  /// Dynamically calculated writeBatchSize based on target bytes and average record size.
+  /// Cached effective write batch size.
+  int _cachedEffectiveWriteBatchSize = 50000;
+
+  /// Cached busy threshold for fast backpressure evaluation.
+  int _cachedBusyThreshold = 150000;
+
+  /// Recompute batch size and busy threshold when relevant state changes.
   ///
-  /// Caps at 50k only when the **pending buffer** currently includes a table
-  /// that has a vector index (not merely because the DB has some vector table).
-  int get effectiveWriteBatchSize {
+  /// Executed on startup, after average record size sampling, or when vector
+  /// pending writes toggle between empty and non-empty.
+  void _recomputeBatchSizeAndBusyThreshold() {
     final int targetBytes = _getTargetFlushBatchBytes();
     final int avgBytes =
         _averageRecordSizeBytes > 0 ? _averageRecordSizeBytes : 200;
@@ -138,34 +144,44 @@ class ParallelJournalManager {
     final pendingHasVector = _pendingFlushTouchesVectorIndex();
     if (pendingHasVector) {
       if (PlatformHandler.isWeb) {
-        return calculated.clamp(500, 5000);
+        _cachedEffectiveWriteBatchSize = calculated.clamp(500, 5000);
       } else if (PlatformHandler.isMobile) {
-        return calculated.clamp(10000, 50000);
+        _cachedEffectiveWriteBatchSize = calculated.clamp(10000, 50000);
       } else if (PlatformHandler.isServerEnvironment) {
-        return calculated.clamp(10000, 80000);
+        _cachedEffectiveWriteBatchSize = calculated.clamp(10000, 80000);
       } else {
-        return calculated.clamp(10000, 50000);
+        _cachedEffectiveWriteBatchSize = calculated.clamp(10000, 50000);
       }
     } else {
       if (PlatformHandler.isWeb) {
-        return calculated.clamp(500, 10000);
+        _cachedEffectiveWriteBatchSize = calculated.clamp(500, 10000);
       } else if (PlatformHandler.isMobile) {
-        return calculated.clamp(50000, 200000);
+        _cachedEffectiveWriteBatchSize = calculated.clamp(50000, 200000);
       } else if (PlatformHandler.isServerEnvironment) {
-        return calculated.clamp(50000, 500000);
+        _cachedEffectiveWriteBatchSize = calculated.clamp(50000, 500000);
       } else {
-        return calculated.clamp(50000, 200000);
+        _cachedEffectiveWriteBatchSize = calculated.clamp(50000, 200000);
       }
     }
+
+    final rm = _dataStore.resourceManager;
+    final int memoryThresholdMB = rm != null ? rm.memoryThresholdInMB : 256;
+    final int availableBytes = (memoryThresholdMB * 0.30 * 1024 * 1024).toInt();
+    final int maxPendingByMemory = availableBytes ~/ avgBytes;
+    final int currentBatchSize = _cachedEffectiveWriteBatchSize;
+    _cachedBusyThreshold =
+        maxPendingByMemory.clamp(currentBatchSize * 3, currentBatchSize * 10);
   }
 
-  /// True when the WAL flush queue is non-empty and pending trees still hold
+  /// Dynamically calculated writeBatchSize based on target bytes and average record size.
+  ///
+  /// O(1) access to cached batch size.
+  int get effectiveWriteBatchSize => _cachedEffectiveWriteBatchSize;
+
+  /// True when the WAL flush queue is non-empty and pending buffer still holds
   /// rows for at least one vector-indexed table.
   ///
-  /// - Empty write queue → false (pending shells / deferred-evict residue must
-  ///   not permanently pin the vector batch cap).
-  /// - Pending listing requires child PK payloads under each TableUid group
-  ///   ([TreeCache.listNonEmptyRootKeys]), not merely that the root key exists.
+  /// O(1) check using [_bufferManager.hasPendingVectorWrites].
   bool _pendingFlushTouchesVectorIndex() {
     if (_bufferManager.queueLength == 0) return false;
     final schemaMgr = _dataStore.tableMetaManager;
@@ -190,27 +206,19 @@ class ParallelJournalManager {
 
   /// Flush busy threshold calculated from 30% of ResourceManager memory threshold.
   ///
-  /// - Memory healthy: clamp between 3x and 10x [effectiveWriteBatchSize] so a
-  ///   live batchInsert can finish without enqueue stalls.
-  /// - LOW / CRITICAL: hard-cap at 3x batch size (~3 pending flush batches) so
-  ///   enqueue backpressure waits for disk and stops heap growth.
-  int get busyThreshold {
-    final rm = _dataStore.resourceManager;
-    final int memoryThresholdMB = rm != null ? rm.memoryThresholdInMB : 256;
-    final int avgBytes =
-        _averageRecordSizeBytes > 0 ? _averageRecordSizeBytes * 2 : 200;
-    final int availableBytes = (memoryThresholdMB * 0.30 * 1024 * 1024).toInt();
-    final int maxPendingByMemory = availableBytes ~/ avgBytes;
-    final int currentBatchSize = effectiveWriteBatchSize;
-    return maxPendingByMemory.clamp(
-        currentBatchSize * 2, currentBatchSize * 10);
-  }
+  /// O(1) access to cached busy threshold.
+  int get busyThreshold => _cachedBusyThreshold;
+
+  /// Ultra-fast O(1) zero-allocation backpressure check for write hot paths.
+  @pragma('vm:prefer-inline')
+  bool get isPressureBusy =>
+      (_bufferManager.queueLength + _inFlightFlushCount) > _cachedBusyThreshold;
 
   /// Current flush pressure state.
   FlushPressureState get pressureState {
     final pending = totalPending;
     if (pending == 0) return FlushPressureState.idle;
-    if (pending <= busyThreshold) return FlushPressureState.normal;
+    if (pending <= _cachedBusyThreshold) return FlushPressureState.normal;
     return FlushPressureState.busy;
   }
 
@@ -299,6 +307,7 @@ class ParallelJournalManager {
     final clamped = sampleBytes.clamp(32, 100 * 1024 * 1024);
     _averageRecordSizeBytes =
         ((_averageRecordSizeBytes * 0.7) + (clamped * 0.3)).round();
+    _recomputeBatchSizeAndBusyThreshold();
 
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     const int oneDayMs = 24 * 60 * 60 * 1000;
@@ -339,7 +348,9 @@ class ParallelJournalManager {
   }
 
   ParallelJournalManager(
-      this._dataStore, this._walManager, this._bufferManager);
+      this._dataStore, this._walManager, this._bufferManager) {
+    _recomputeBatchSizeAndBusyThreshold();
+  }
 
   /// Current active batch context during flush/recovery; null if idle
   BatchContext? get activeBatchContext => _activeBatchContext;
@@ -420,7 +431,7 @@ class ParallelJournalManager {
   Future<void>? applyEnqueueBackpressure() {
     // Fast-path: When pressure is normal or idle and memory status is healthy,
     // execute pure-sync zero await to guarantee maximum throughput.
-    if (pressureState != FlushPressureState.busy) {
+    if (!isPressureBusy) {
       final rm = _dataStore.resourceManager;
       if (rm == null || rm.memoryStatus == ResourceStatus.normal) {
         return null;
@@ -436,8 +447,7 @@ class ParallelJournalManager {
   Future<void> _applyEnqueueBackpressureSlow() async {
     final rm = _dataStore.resourceManager;
     if (rm != null) {
-      if (pressureState == FlushPressureState.busy ||
-          rm.memoryStatus != ResourceStatus.normal) {
+      if (isPressureBusy || rm.memoryStatus != ResourceStatus.normal) {
         await rm.triggerImmediateCheck();
       }
 
@@ -456,7 +466,7 @@ class ParallelJournalManager {
       }
     }
 
-    if (pressureState == FlushPressureState.busy) {
+    if (isPressureBusy) {
       scheduleFlushIfNeeded();
       final wake = _tailWaitWake;
       if (wake != null && !wake.isCompleted) {
@@ -478,6 +488,7 @@ class ParallelJournalManager {
         _lastAverageRecordSavedAtMs = globalCfg.lastAverageRecordSavedAtMs;
       }
     } catch (_) {}
+    _recomputeBatchSizeAndBusyThreshold();
 
     // Reconcile incomplete pending batches: load flush WAL into buffer first;
     // do not start recovery flush until _recoverFromWal finishes, so the
@@ -814,7 +825,7 @@ class ParallelJournalManager {
       if (before <= 0 && _inFlightFlushCount <= 0) return;
 
       // If pressure is already busy, flush immediately to relieve backpressure.
-      if (pressureState == FlushPressureState.busy) return;
+      if (isPressureBusy) return;
 
       final wake = Completer<void>();
       _tailWaitWake = wake;
@@ -832,7 +843,7 @@ class ParallelJournalManager {
 
       final after = _bufferManager.queueLength;
       // If busy threshold reached, trigger flush now.
-      if (pressureState == FlushPressureState.busy) return;
+      if (isPressureBusy) return;
 
       // If active batch operations are in-flight and state is normal, yield and keep waiting.
       if (_activeBatchOperationCount > 0) {
@@ -1697,7 +1708,7 @@ class ParallelJournalManager {
     if (!_running) return;
 
     // If newly enqueued writes cause busy state, immediately wake tail-wait to pump flush.
-    if (pressureState == FlushPressureState.busy) {
+    if (isPressureBusy) {
       final wake = _tailWaitWake;
       if (wake != null && !wake.isCompleted) {
         wake.complete();
@@ -2930,10 +2941,12 @@ class ParallelJournalManager {
         IndexUid indexUid
       }),
           PageRedoTreeMetaRecord>{};
-      const yieldInterval = 50;
       final parseYc = YieldController(
-          'ParallelJournalManager._replayPageRedoLog.parse',
-          checkInterval: yieldInterval);
+        'ParallelJournalManager._replayPageRedoLog.parse',
+        budgetMs: 50,
+        checkInterval: 256,
+        minCheckInterval: 64,
+      );
       for (var i = 0; i < applicable.pages.length; i++) {
         final y7 = parseYc.maybeYield();
         if (y7 != null) await y7;
@@ -2955,10 +2968,22 @@ class ParallelJournalManager {
         );
         treeMeta[key] = rec;
       }
+      // Recovery is CPU/IO heavy; prefer larger budgets than UI-oriented 8ms.
       final writeYc = YieldController(
-          'ParallelJournalManager._replayPageRedoLog.write',
-          checkInterval: 5);
+        'ParallelJournalManager._replayPageRedoLog.write',
+        budgetMs: 10,
+        checkInterval: 5,
+      );
 
+      // Only cache successful resolves -- sticky null would skip a table that
+      // becomes resolvable later in the same recovery pass.
+      final pathCache = <({
+        PageRedoTreeKind kind,
+        TableUid tableUid,
+        IndexUid indexUid,
+        int partitionNo
+      }),
+          String>{};
       Future<String?> resolveRedoPath(
         ({
           PageRedoTreeKind kind,
@@ -2967,41 +2992,55 @@ class ParallelJournalManager {
           int partitionNo
         }) key,
       ) async {
+        final cached = pathCache[key];
+        if (cached != null) return cached;
         try {
           if (key.kind == PageRedoTreeKind.table) {
             final tableContext = await _tableContextFromUid(key.tableUid);
             if (tableContext == null) return null;
-            return _dataStore.pathManager
+            final path = _dataStore.pathManager
                 .getPartitionFilePathByContext(tableContext, key.partitionNo);
+            pathCache[key] = path;
+            return path;
           }
           if (key.kind == PageRedoTreeKind.overflow) {
             final tableContext = await _tableContextFromUid(key.tableUid);
             if (tableContext == null) return null;
-            return _dataStore.pathManager.getOverflowPartitionFilePathByContext(
-                tableContext, key.partitionNo);
+            final path = _dataStore.pathManager
+                .getOverflowPartitionFilePathByContext(
+                    tableContext, key.partitionNo);
+            pathCache[key] = path;
+            return path;
           }
           if (key.kind == PageRedoTreeKind.ngh) {
             final tableContext = await _tableContextFromUid(key.tableUid);
             if (tableContext == null) return null;
             final indexUid =
                 _resolveRedoIndexUid(tableContext.schema, key.indexUid);
-            return _dataStore.pathManager.getNghLeafPartitionPathByContext(
-                tableContext, indexUid, key.partitionNo);
+            final path = _dataStore.pathManager
+                .getNghLeafPartitionPathByContext(
+                    tableContext, indexUid, key.partitionNo);
+            pathCache[key] = path;
+            return path;
           }
           if (key.kind == PageRedoTreeKind.nghNav) {
             final tableContext = await _tableContextFromUid(key.tableUid);
             if (tableContext == null) return null;
             final indexUid =
                 _resolveRedoIndexUid(tableContext.schema, key.indexUid);
-            return _dataStore.pathManager.getNghNavPartitionPathByContext(
+            final path = _dataStore.pathManager.getNghNavPartitionPathByContext(
                 tableContext, indexUid, key.partitionNo);
+            pathCache[key] = path;
+            return path;
           }
           final tableContext = await _tableContextFromUid(key.tableUid);
           if (tableContext == null) return null;
           final indexUid =
               _resolveRedoIndexUid(tableContext.schema, key.indexUid);
-          return _dataStore.pathManager.getIndexPartitionPathByContext(
+          final path = _dataStore.pathManager.getIndexPartitionPathByContext(
               tableContext, indexUid, key.partitionNo);
+          pathCache[key] = path;
+          return path;
         } catch (_) {
           return null;
         }
@@ -3023,13 +3062,25 @@ class ParallelJournalManager {
           }
           return;
         }
-        if (key.partitionNo != 0 || !pages.containsKey(0)) return;
         final tableContext = await _tableContextFromUid(key.tableUid);
         if (tableContext == null) return;
+
+        // Table page images may change on any partition; drop leaf/row caches
+        // so Pass2 PK materialization cannot read pre-crash / torn pages.
         if (key.kind == PageRedoTreeKind.table) {
-          _dataStore.tableDataManager
-              .invalidateTableDataMetaCacheForTable(tableContext);
-        } else if (key.kind == PageRedoTreeKind.indexTree) {
+          _dataStore.tableTreePartitionManager
+              ?.clearPageCacheForTable(tableContext);
+          await _dataStore.tableDataManager
+              .clearTableRecordsForTable(tableContext);
+          if (key.partitionNo == 0 && pages.containsKey(0)) {
+            _dataStore.tableDataManager
+                .invalidateTableDataMetaCacheForTable(tableContext);
+          }
+          return;
+        }
+
+        if (key.partitionNo != 0 || !pages.containsKey(0)) return;
+        if (key.kind == PageRedoTreeKind.indexTree) {
           final indexUid =
               _resolveRedoIndexUid(tableContext.schema, key.indexUid);
           _dataStore.indexManager
@@ -3142,7 +3193,22 @@ class ParallelJournalManager {
       );
 
       // Pass 2: NGPK leaf pages — rebuild SQ8 from table, write full images.
-      final pass2Tasks = <Future<void> Function()>[];
+      // Preload all live PKs once per (table, index) so materialize does not
+      // walk the table B+Tree once per slot (that path was ~O(n) cold IO and
+      // could stall startup for minutes on mid/high-D vector batches).
+      final vim = _dataStore.vectorIndexManager;
+      final pass2Jobs = <({
+        ({
+          PageRedoTreeKind kind,
+          TableUid tableUid,
+          IndexUid indexUid,
+          int partitionNo
+        }) key,
+        TableContext tableContext,
+        IndexUid indexUid,
+        String path,
+        Map<int, Uint8List> pages,
+      })>[];
       for (final e in byPartition.entries) {
         final yPk = writeYc.maybeYield();
         if (yPk != null) await yPk;
@@ -3160,7 +3226,96 @@ class ParallelJournalManager {
             _resolveRedoIndexUid(tableContext.schema, key.indexUid);
         final path = await resolveRedoPath(key);
         if (path == null) continue;
+        pass2Jobs.add((
+          key: key,
+          tableContext: tableContext,
+          indexUid: indexUid,
+          path: path,
+          pages: pages,
+        ));
+      }
 
+      final recordsByTableIndex =
+          <(TableUid, IndexUid), Map<String, Map<String, dynamic>>>{};
+      if (vim != null && pass2Jobs.isNotEmpty) {
+        // Table pages may already be durable (absent from this redo) while
+        // leaf caches still hold torn pre-crash images. Drop them before the
+        // shared PK preload so materialize reads Pass1 / on-disk truth.
+        final clearedTables = <TableUid>{};
+        for (final job in pass2Jobs) {
+          final tableContext = job.tableContext;
+          if (!clearedTables.add(tableContext.tableUid)) continue;
+          _dataStore.tableTreePartitionManager
+              ?.clearPageCacheForTable(tableContext);
+          await _dataStore.tableDataManager
+              .clearTableRecordsForTable(tableContext);
+        }
+
+        final payloadsByTableIndex = <(TableUid, IndexUid), List<Uint8List>>{};
+        for (final job in pass2Jobs) {
+          final gkey = (job.tableContext.tableUid, job.indexUid);
+          final list =
+              payloadsByTableIndex.putIfAbsent(gkey, () => <Uint8List>[]);
+          for (final payload in job.pages.values) {
+            if (payload.isNotEmpty &&
+                NghLeafPage.isPkStructureRedoPayload(payload)) {
+              list.add(payload);
+            }
+          }
+        }
+        for (final entry in payloadsByTableIndex.entries) {
+          final yPre = writeYc.maybeYield();
+          if (yPre != null) await yPre;
+          final tableUid = entry.key.$1;
+          final indexUid = entry.key.$2;
+          final tableContext = await _tableContextFromUid(tableUid);
+          if (tableContext == null) continue;
+          final livePks =
+              vim.collectLivePksFromPkStructureRedoPayloads(entry.value);
+          if (livePks.isEmpty) {
+            recordsByTableIndex[entry.key] =
+                const <String, Map<String, dynamic>>{};
+            continue;
+          }
+          try {
+            final loaded = await vim.preloadRecordsForPkRedo(
+              table: tableContext,
+              indexUid: indexUid,
+              primaryKeys: livePks,
+            );
+            if (loaded == null) {
+              Logger.warn(
+                'NGH PK-structure redo preload skipped '
+                '(table=$tableUid, index=$indexUid); '
+                'schema/vector field unresolved — per-page fallback',
+              );
+              // Omit map entry so materializeLeafPkRedoPage loads per page.
+            } else {
+              recordsByTableIndex[entry.key] = loaded;
+            }
+          } catch (err) {
+            Logger.warn(
+              'NGH PK-structure redo preload failed '
+              '(table=$tableUid, index=$indexUid); '
+              'falling back to per-page batch load',
+              rawError: err,
+            );
+            // Omit map entry so materializeLeafPkRedoPage loads per page.
+          }
+        }
+      }
+
+      final pass2Tasks = <Future<void> Function()>[];
+      for (final job in pass2Jobs) {
+        final key = job.key;
+        final tableContext = job.tableContext;
+        final indexUid = job.indexUid;
+        final path = job.path;
+        final pages = job.pages;
+        final recordsByPk = recordsByTableIndex[(
+          tableContext.tableUid,
+          indexUid,
+        )];
         pass2Tasks.add(() async {
           try {
             try {
@@ -3180,11 +3335,11 @@ class ParallelJournalManager {
               }
               Uint8List? built;
               try {
-                built = await _dataStore.vectorIndexManager
-                    ?.materializeLeafPkRedoPage(
+                built = await vim?.materializeLeafPkRedoPage(
                   table: tableContext,
                   indexUid: indexUid,
                   pkRedoPayload: payload,
+                  recordsByPk: recordsByPk,
                 );
               } catch (err) {
                 Logger.warn(

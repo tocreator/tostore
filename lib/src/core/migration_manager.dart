@@ -1058,9 +1058,23 @@ class MigrationManager {
     if (KeyMigrationRunner.isTableMigrating(table)) {
       return;
     }
+    final liveIndexes = <IndexSchema>[
+      ...table.schema.getAllIndexes(),
+      ...indexManager.getEngineManagedBtreeIndexes(table, table.schema),
+    ];
     for (final indexUid in specific) {
       if (hasPendingIndexBuild(task.tableUid, indexUid)) continue;
-      await indexManager.endIndexBuild(table, indexUid);
+      final idxSchema = _resolveSpecificIndexSchemaForTask(
+        task,
+        liveIndexes,
+        indexUid,
+      );
+      // Prefer task-snapshot type: live schema may already have dropped the uid.
+      if (idxSchema.type == IndexType.vector) {
+        await _dataStore.vectorIndexManager?.endIndexBuild(table, indexUid);
+      } else {
+        await indexManager.endIndexBuild(table, indexUid);
+      }
     }
   }
 
@@ -1090,10 +1104,18 @@ class MigrationManager {
     ];
 
     for (final indexField in task.specificIndexUids!) {
-      final idxSchema = _resolveSpecificIndexSchema(allIndexes, indexField);
+      final idxSchema = _resolveSpecificIndexSchemaForTask(
+        task,
+        allIndexes,
+        indexField,
+      );
       if (idxSchema.indexUid.isEmpty) continue;
       if (recordCount > 0) {
         await indexManager.beginIndexBuild(indexTableCtx, idxSchema);
+      } else if (idxSchema.type == IndexType.vector) {
+        // Never write btree IndexMeta for vector indexes.
+        await _dataStore.vectorIndexManager
+            ?.resetEmptyIndexMeta(indexTableCtx, idxSchema);
       } else {
         await indexManager.deletePhysicalIndexArtifacts(
           indexTableCtx,
@@ -3419,6 +3441,31 @@ class MigrationManager {
     return IndexSchema(indexName: field.value, fields: const []);
   }
 
+  /// Resolve a task-owned IndexUid against live schema, then task snapshots.
+  ///
+  /// Engine vector rebuilds (v3/v4 indexOnly) may still list IndexUids from the
+  /// pre-cutover snapshot after a newer schema task has already rewritten live
+  /// meta. Falling back to the task snapshot keeps begin/endIndexBuild from
+  /// being skipped -- skipping endIndexBuild leaves `ngh_old/` forever.
+  IndexSchema _resolveSpecificIndexSchemaForTask(
+    MigrationTask task,
+    List<IndexSchema> liveIndexes,
+    IndexUid field,
+  ) {
+    final fromLive = _resolveSpecificIndexSchema(liveIndexes, field);
+    if (fromLive.indexUid.isNotEmpty) return fromLive;
+    for (final schema in <TableSchema?>[
+      task.targetSchemaSnapshot,
+      task.oldSchemaSnapshot,
+    ]) {
+      if (schema == null) continue;
+      final fromSnap =
+          _resolveSpecificIndexSchema(schema.getAllIndexes(), field);
+      if (fromSnap.indexUid.isNotEmpty) return fromSnap;
+    }
+    return IndexSchema(indexName: field.value, fields: const []);
+  }
+
   void _markIndexRemoved(Set<String> removed, IndexSchema index) {
     if (index.indexUid.isNotEmpty) {
       removed.add(index.indexUid.value);
@@ -5363,8 +5410,9 @@ class MigrationManager {
             final schemaMgr = migrationInstance.tableMetaManager;
             final taskTableUid = TableUid(currentTask.tableUid);
             if (schemaMgr != null) {
-              exists = await schemaMgr
-                          .getUidByName(TableName(originalTableName)) !=
+              exists = (taskTableUid.isNotEmpty &&
+                      await schemaMgr.getTableContext(taskTableUid) != null) ||
+                  await schemaMgr.getUidByName(TableName(originalTableName)) !=
                       null ||
                   await schemaMgr.getUidByName(TableName(currentTableName)) !=
                       null;
@@ -5395,9 +5443,35 @@ class MigrationManager {
               );
             }
 
-            final migrationTableCtx =
-                await schemaMgr?.getTableContext(taskTableUid) ??
-                    await migrationInstance.getTableContext(currentTableName);
+            // Resolve TableContext by uid first (rename-safe). Name lookups are
+            // fallback only for legacy tasks without tableUid.
+            TableContext? resolvedTableCtx;
+            if (schemaMgr != null) {
+              if (taskTableUid.isNotEmpty) {
+                resolvedTableCtx =
+                    await schemaMgr.getTableContext(taskTableUid);
+              }
+              if (resolvedTableCtx == null) {
+                final byName = await schemaMgr
+                        .getUidByName(TableName(currentTableName)) ??
+                    await schemaMgr.getUidByName(TableName(originalTableName));
+                if (byName != null) {
+                  resolvedTableCtx = await schemaMgr.getTableContext(byName);
+                }
+              }
+            }
+            if (resolvedTableCtx == null) {
+              Logger.info(
+                'Skip migration for table [$originalTableName] in space [$space]: '
+                'table context not resolved (uid=${taskTableUid.value})',
+              );
+              currentTask = currentTask.removePendingSpace(space);
+              await _saveMigrationTask(currentTask);
+              _updatePendingTaskInMemory(currentTask);
+              return;
+            }
+            // Non-null local so closures (queryEachBatch) keep promotion.
+            final migrationTableCtx = resolvedTableCtx;
 
             await _reconcileSchemaSideEffectsAfterSchemaCutover(
               migrationInstance,
@@ -5412,8 +5486,9 @@ class MigrationManager {
             final shouldDropTable = sortedOperations
                 .any((op) => op.type == MigrationType.dropTable);
             if (shouldDropTable) {
+              // Use post-cutover name -- task.tableName may be the pre-rename name.
               await migrationInstance.dropTable(
-                currentTask.tableName,
+                migrationTableCtx.tableName.value,
                 isMigration: true,
               );
             }
@@ -5508,23 +5583,33 @@ class MigrationManager {
                 final spaceRecordCount = tableDataMeta?.totalRecordCount ?? 0;
                 final targetSchema = await migrationInstance.tableMetaManager
                     ?.getTableSchema(migrationTableCtx.tableUid);
-                if (targetSchema != null) {
-                  final allIndexes = <IndexSchema>[
-                    ...targetSchema.getAllIndexes(),
+                final liveIndexes = <IndexSchema>[
+                  if (targetSchema != null) ...targetSchema.getAllIndexes(),
+                  if (targetSchema != null)
                     ...?migrationInstance.indexManager
                         ?.getEngineManagedBtreeIndexes(
                             migrationTableCtx, targetSchema),
-                  ];
-                  for (final indexField in currentTask.specificIndexUids!) {
-                    final idxSchema = _resolveSpecificIndexSchema(
-                      allIndexes,
-                      indexField,
-                    );
-                    final indexUid = idxSchema.indexUid;
-                    if (indexUid.isEmpty) continue;
+                ];
+                for (final indexField in currentTask.specificIndexUids!) {
+                  // Prefer live schema; fall back to task snapshots so a later
+                  // schema cutover does not skip begin for engine rebuilds.
+                  final idxSchema = _resolveSpecificIndexSchemaForTask(
+                    currentTask,
+                    liveIndexes,
+                    indexField,
+                  );
+                  final indexUid = idxSchema.indexUid;
+                  if (indexUid.isEmpty) continue;
 
-                    if (spaceRecordCount <= 0) {
-                      if (!isResume) {
+                  if (spaceRecordCount <= 0) {
+                    if (!isResume) {
+                      if (idxSchema.type == IndexType.vector) {
+                        await migrationInstance.vectorIndexManager
+                            ?.resetEmptyIndexMeta(
+                          migrationTableCtx,
+                          idxSchema,
+                        );
+                      } else {
                         await migrationInstance.indexManager!
                             .deletePhysicalIndexArtifacts(
                           migrationTableCtx,
@@ -5541,34 +5626,38 @@ class MigrationManager {
                           ),
                         );
                       }
-                      continue;
                     }
+                    continue;
+                  }
 
-                    if (!isResume) {
-                      await migrationInstance.indexManager!.beginIndexBuild(
-                        migrationTableCtx,
-                        idxSchema,
+                  if (!isResume) {
+                    await migrationInstance.indexManager!.beginIndexBuild(
+                      migrationTableCtx,
+                      idxSchema,
+                    );
+                  } else if (idxSchema.type == IndexType.vector) {
+                    // Btree getIndexMeta/updateIndexMeta cannot see NGH meta.
+                    await migrationInstance.vectorIndexManager
+                        ?.ensureIndexBuilding(migrationTableCtx, idxSchema);
+                  } else {
+                    final existingMeta =
+                        await migrationInstance.indexManager!.getIndexMeta(
+                      migrationTableCtx.tableUid,
+                      indexUid,
+                    );
+                    if (existingMeta == null || !existingMeta.isBuilding) {
+                      await migrationInstance.indexManager!.updateIndexMeta(
+                        table: migrationTableCtx,
+                        indexUid: indexUid,
+                        updatedMeta: (existingMeta != null)
+                            ? existingMeta.copyWith(isBuilding: true)
+                            : IndexMeta.createEmpty(
+                                indexUid: indexUid,
+                                tableUid: migrationTableCtx.tableUid,
+                                isUnique: idxSchema.unique,
+                                isBuilding: true,
+                              ),
                       );
-                    } else {
-                      final existingMeta =
-                          await migrationInstance.indexManager!.getIndexMeta(
-                        migrationTableCtx.tableUid,
-                        indexUid,
-                      );
-                      if (existingMeta == null || !existingMeta.isBuilding) {
-                        await migrationInstance.indexManager!.updateIndexMeta(
-                          table: migrationTableCtx,
-                          indexUid: indexUid,
-                          updatedMeta: (existingMeta != null)
-                              ? existingMeta.copyWith(isBuilding: true)
-                              : IndexMeta.createEmpty(
-                                  indexUid: indexUid,
-                                  tableUid: migrationTableCtx.tableUid,
-                                  isUnique: idxSchema.unique,
-                                  isBuilding: true,
-                                ),
-                        );
-                      }
                     }
                   }
                 }
@@ -5668,28 +5757,38 @@ class MigrationManager {
               // flushCompletely() waits until the PJM queue is fully drained to disk.
               await migrationInstance.parallelJournalManager.flushCompletely();
 
-              // Unlock isBuilding = false
+              // Unlock isBuilding = false after this space's rebuild finishes.
+              // Use task-snapshot type when live schema no longer lists the uid
+              // (IndexManager.endIndexBuild types from live schema only).
               if (migrationInstance.indexManager != null &&
                   currentTask.specificIndexUids != null &&
                   currentTask.specificIndexUids!.isNotEmpty) {
+                final unlockSchema = await migrationInstance.tableMetaManager
+                    ?.getTableSchema(migrationTableCtx.tableUid);
+                final unlockIndexes = <IndexSchema>[
+                  if (unlockSchema != null) ...unlockSchema.getAllIndexes(),
+                  if (unlockSchema != null)
+                    ...?migrationInstance.indexManager
+                        ?.getEngineManagedBtreeIndexes(
+                            migrationTableCtx, unlockSchema),
+                ];
                 for (final indexField in currentTask.specificIndexUids!) {
-                  final unlockSchema = await migrationInstance.tableMetaManager
-                      ?.getTableSchema(migrationTableCtx.tableUid);
-                  final idxSchema = unlockSchema != null
-                      ? _resolveSpecificIndexSchema(
-                          <IndexSchema>[
-                            ...unlockSchema.getAllIndexes(),
-                            ...?migrationInstance.indexManager
-                                ?.getEngineManagedBtreeIndexes(
-                                    migrationTableCtx, unlockSchema),
-                          ],
-                          indexField,
-                        )
-                      : IndexSchema(indexName: indexField, fields: const []);
-                  final indexUid = idxSchema.indexUid;
+                  final idxSchema = _resolveSpecificIndexSchemaForTask(
+                    currentTask,
+                    unlockIndexes,
+                    indexField,
+                  );
+                  final indexUid = idxSchema.indexUid.isNotEmpty
+                      ? idxSchema.indexUid
+                      : indexField;
                   if (indexUid.isEmpty) continue;
-                  await migrationInstance.indexManager!
-                      .endIndexBuild(migrationTableCtx, indexUid);
+                  if (idxSchema.type == IndexType.vector) {
+                    await migrationInstance.vectorIndexManager
+                        ?.endIndexBuild(migrationTableCtx, indexUid);
+                  } else {
+                    await migrationInstance.indexManager!
+                        .endIndexBuild(migrationTableCtx, indexUid);
+                  }
                 }
               }
 
@@ -5744,7 +5843,8 @@ class MigrationManager {
           }
           _activeControllers.remove(space);
           _activeSpaceMigrationTasks.remove(space);
-          _activeReadCursors.remove(currentTableName);
+          // Map is keyed by tableUid (see queryEachBatch above).
+          _activeReadCursors.remove(currentTask.tableUid);
         }
 
         spaceStopwatch.stop();
@@ -6111,8 +6211,10 @@ class MigrationManager {
           final childTableUid = entry.key;
           final childSchema = await schemaMgr.getTableSchema(childTableUid);
           if (childSchema != null) {
+            // Prefer uid -- child may have been renamed since the task was created.
             final childTableCtx =
-                await migrationInstance.getTableContext(childSchema.name);
+                await schemaMgr.getTableContext(childTableUid);
+            if (childTableCtx == null) continue;
             for (final indexUid in entry.value) {
               await migrationInstance.indexManager
                   ?.deletePhysicalIndexArtifacts(
@@ -9007,6 +9109,7 @@ class MigrationManager {
     // 1. Index builds across chained tasks (newest wins), including started tasks
     //    after cooperative abort when an IndexUid is removed or reclaimed.
     final removedIndexes = <String>{};
+    final explicitlyRemovedIndexes = <String>{};
     final claimedIndexUids = <String>{};
     for (int i = component.length - 1; i >= 0; i--) {
       final taskId = component[i].taskId;
@@ -9016,11 +9119,14 @@ class MigrationManager {
 
       if (task.specificIndexUids != null &&
           task.specificIndexUids!.isNotEmpty) {
-        final filtered = task.specificIndexUids!
-            .where((idx) =>
-                !removedIndexes.contains(idx.value) &&
-                !claimedIndexUids.contains(idx.value))
-            .toList();
+        final protectEngineIndexOnly = task.isAutoGenerated &&
+            task.writeMode == MigrationWriteMode.indexOnly;
+        final filtered = task.specificIndexUids!.where((idx) {
+          if (claimedIndexUids.contains(idx.value)) return false;
+          if (explicitlyRemovedIndexes.contains(idx.value)) return false;
+          if (protectEngineIndexOnly) return true;
+          return !removedIndexes.contains(idx.value);
+        }).toList();
 
         if (filtered.length != task.specificIndexUids!.length) {
           final isTaskStarted = await _isMigrationTaskPhysicallyStarted(task);
@@ -9044,7 +9150,11 @@ class MigrationManager {
             task = _pendingTasks[after];
           } else {
             // Task deleted; still harvest removeIndex / schema-diff markers.
-            _collectRemovedIndexesFromTask(component[i], removedIndexes);
+            _collectRemovedIndexesFromTask(
+              component[i],
+              removedIndexes,
+              explicitOnly: explicitlyRemovedIndexes,
+            );
             continue;
           }
         }
@@ -9056,7 +9166,11 @@ class MigrationManager {
         }
       }
 
-      _collectRemovedIndexesFromTask(task, removedIndexes);
+      _collectRemovedIndexesFromTask(
+        task,
+        removedIndexes,
+        explicitOnly: explicitlyRemovedIndexes,
+      );
     }
 
     // 2. Fold older table-rewrite / invalidate indexOnly on PK change.
@@ -9175,11 +9289,13 @@ class MigrationManager {
 
   void _collectRemovedIndexesFromTask(
     MigrationTask task,
-    Set<String> removedIndexes,
-  ) {
+    Set<String> removedIndexes, {
+    Set<String>? explicitOnly,
+  }) {
     for (final op in task.operations) {
       if (op.type == MigrationType.removeIndex && op.indexName != null) {
         removedIndexes.add(op.indexName!);
+        explicitOnly?.add(op.indexName!);
         // Prefer old snapshot (still contains the index) then target.
         final schemas = <TableSchema?>[
           task.oldSchemaSnapshot,
@@ -9191,6 +9307,9 @@ class MigrationManager {
               ?.findIndexSchemaByField(schema, op.indexName!);
           if (idx != null) {
             _markIndexRemoved(removedIndexes, idx);
+            if (explicitOnly != null) {
+              _markIndexRemoved(explicitOnly, idx);
+            }
             break;
           }
         }
@@ -9201,6 +9320,9 @@ class MigrationManager {
             for (final idx in schema.getAllIndexes()) {
               if (_areIndexFieldsEqual(idx.fields, op.fields!)) {
                 _markIndexRemoved(removedIndexes, idx);
+                if (explicitOnly != null) {
+                  _markIndexRemoved(explicitOnly, idx);
+                }
               }
             }
           }
@@ -9219,6 +9341,7 @@ class MigrationManager {
       for (final oldIdx in task.oldSchemaSnapshot!.getAllIndexes()) {
         if (!targetIdxNames.contains(oldIdx.actualIndexName) &&
             !targetIdxUids.contains(oldIdx.indexUid.value)) {
+          // Schema-diff disappearance only -- not an explicit removeIndex.
           _markIndexRemoved(removedIndexes, oldIdx);
         }
       }

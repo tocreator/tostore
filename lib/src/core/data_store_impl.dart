@@ -25,7 +25,6 @@ import '../model/db_result.dart';
 import '../model/db_startup_stage.dart';
 import '../model/expr.dart';
 import '../model/flush_mode.dart';
-import '../model/flush_pressure_state.dart';
 import '../model/foreign_key_operation.dart';
 import '../model/global_config.dart';
 import '../model/id_generator.dart';
@@ -2058,7 +2057,7 @@ class DataStoreImpl {
       }
 
       // Fast backpressure check before synchronous write pipeline
-      if (parallelJournalManager.pressureState == FlushPressureState.busy &&
+      if (parallelJournalManager.isPressureBusy &&
           _config?.persistenceMode != PersistenceMode.memory) {
         await parallelJournalManager.waitUntilPressureRelieved();
       }
@@ -3461,8 +3460,7 @@ class DataStoreImpl {
             final oldRecordValues = oldRecordsToCommit.first;
             final pkVal = commitPkVals.first;
 
-            if (parallelJournalManager.pressureState ==
-                    FlushPressureState.busy &&
+            if (parallelJournalManager.isPressureBusy &&
                 _config?.persistenceMode != PersistenceMode.memory) {
               await parallelJournalManager.waitUntilPressureRelieved();
             }
@@ -4191,7 +4189,7 @@ class DataStoreImpl {
       }
 
       if (recordsToDelete.length == 1) {
-        if (parallelJournalManager.pressureState == FlushPressureState.busy &&
+        if (parallelJournalManager.isPressureBusy &&
             _config?.persistenceMode != PersistenceMode.memory) {
           await parallelJournalManager.waitUntilPressureRelieved();
         }

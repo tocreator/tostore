@@ -1025,15 +1025,87 @@ class VectorIndexManager {
           TableContext table, IndexUid indexUid) =>
       _loadMeta(table, indexUid);
 
+  /// Collect live primary keys from NGPK structure+PK redo payloads.
+  ///
+  /// Used by page-redo Pass2 to preload table rows in one batch before
+  /// materializing many leaf pages (avoids per-slot B+Tree walks).
+  List<String> collectLivePksFromPkStructureRedoPayloads(
+    Iterable<Uint8List> pkRedoPayloads,
+  ) {
+    final out = <String>[];
+    final seen = <String>{};
+    for (final payload in pkRedoPayloads) {
+      if (payload.isEmpty || !NghLeafPage.isPkStructureRedoPayload(payload)) {
+        continue;
+      }
+      final decoded = NghLeafPage.tryDecodePkStructureRedoPayload(payload);
+      if (decoded == null) continue;
+      for (final s in decoded.slots) {
+        if ((s.flags & NghLeafSlot.flagDeleted) != 0) continue;
+        final pk = utf8.decode(s.pkBytes, allowMalformed: true);
+        if (pk.isEmpty || !seen.add(pk)) continue;
+        out.add(pk);
+      }
+    }
+    return out;
+  }
+
+  /// Batch-load table rows needed to materialize NGPK redo pages.
+  ///
+  /// Prefer this over per-slot [getRecordByPrimaryKey]: one tree walk batch
+  /// with leaf grouping + page cache, instead of N cold root-to-leaf IO paths.
+  ///
+  Future<Map<String, Map<String, dynamic>>?> preloadRecordsForPkRedo({
+    required TableContext table,
+    required IndexUid indexUid,
+    required List<String> primaryKeys,
+  }) async {
+    if (primaryKeys.isEmpty) {
+      return const <String, Map<String, dynamic>>{};
+    }
+    final schema =
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
+    if (schema == null) return null;
+    final fieldName = _vectorFieldNameForIndex(table, schema, indexUid);
+    if (fieldName == null) return null;
+    return _dataStore.tableDataManager.queryRecordsMapBatch(
+      table,
+      primaryKeys,
+      decodeSchema: schema,
+      neededFields: <String>{schema.primaryKey, fieldName},
+    );
+  }
+
+  String? _vectorFieldNameForIndex(
+    TableContext table,
+    TableSchema schema,
+    IndexUid indexUid,
+  ) {
+    final vectorIndexes =
+        _dataStore.tableMetaManager?.getVectorIndexesFor(schema) ??
+            const <IndexSchema>[];
+    for (final idx in vectorIndexes) {
+      final uid = _resolveVectorIndexUid(table, idx.fields.first);
+      if (uid == indexUid) return idx.fields.first;
+    }
+    // Unambiguous single vector index: allow legacy uid/name mismatch.
+    if (vectorIndexes.length == 1) return vectorIndexes.first.fields.first;
+    return null;
+  }
+
   /// Rebuild a leaf page image from an NGPK structure+PK redo payload.
   ///
-  /// Loads live vectors from the table by primary key (file-backed),
-  /// re-quantizes to SQ8, and returns a full TPG2 page suitable for partition
-  /// write. Returns null when the payload is not NGPK or meta/schema is missing.
+  /// Loads live vectors from the table by primary key, re-quantizes to SQ8,
+  /// and returns a full TPG2 page suitable for partition write. Returns null
+  /// when the payload is not NGPK or meta/schema is missing.
+  ///
+  /// Pass [recordsByPk] from [preloadRecordsForPkRedo] when materializing many
+  /// pages so table IO is shared across the whole Pass2 set.
   Future<Uint8List?> materializeLeafPkRedoPage({
     required TableContext table,
     required IndexUid indexUid,
     required Uint8List pkRedoPayload,
+    Map<String, Map<String, dynamic>>? recordsByPk,
   }) async {
     final decoded = NghLeafPage.tryDecodePkStructureRedoPayload(pkRedoPayload);
     if (decoded == null) return null;
@@ -1044,25 +1116,33 @@ class VectorIndexManager {
         await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
     if (schema == null) return null;
 
-    final vectorIndexes =
-        _dataStore.tableMetaManager?.getVectorIndexesFor(schema) ??
-            const <IndexSchema>[];
-    String? fieldName;
-    for (final idx in vectorIndexes) {
-      final uid = _resolveVectorIndexUid(table, idx.fields.first);
-      if (uid == indexUid) {
-        fieldName = idx.fields.first;
-        break;
-      }
-    }
-    fieldName ??=
-        vectorIndexes.isNotEmpty ? vectorIndexes.first.fields.first : null;
+    final fieldName = _vectorFieldNameForIndex(table, schema, indexUid);
     if (fieldName == null) return null;
 
     final pkName = schema.primaryKey;
     final dims = decoded.dimensions;
     final slots = <NghLeafSlot>[];
     final emptyCodes = Uint8List(dims);
+
+    // One batch for this page when caller did not preload.
+    Map<String, Map<String, dynamic>> rows =
+        recordsByPk ?? const <String, Map<String, dynamic>>{};
+    if (recordsByPk == null) {
+      final livePks = <String>[];
+      for (final s in decoded.slots) {
+        if ((s.flags & NghLeafSlot.flagDeleted) != 0) continue;
+        final pk = utf8.decode(s.pkBytes, allowMalformed: true);
+        if (pk.isNotEmpty) livePks.add(pk);
+      }
+      if (livePks.isNotEmpty) {
+        rows = await preloadRecordsForPkRedo(
+              table: table,
+              indexUid: indexUid,
+              primaryKeys: livePks,
+            ) ??
+            const <String, Map<String, dynamic>>{};
+      }
+    }
 
     for (final s in decoded.slots) {
       final pk = utf8.decode(s.pkBytes, allowMalformed: true);
@@ -1079,12 +1159,7 @@ class VectorIndexManager {
         continue;
       }
 
-      final rec = await _dataStore.tableDataManager.getRecordByPrimaryKey(
-        table,
-        pk,
-        readFromFileOnly: true,
-        decodeSchema: schema,
-      );
+      final rec = rows[pk];
       Float32List? f32;
       if (rec != null) {
         final prepared = _prepareInsertVectorsBatch(
@@ -1317,17 +1392,74 @@ class VectorIndexManager {
     if (indexUid.isEmpty) return;
     var meta = _vectorCache.getMeta(table, indexUid);
     meta ??= await _loadMeta(table, indexUid);
-    if (meta == null) return;
 
-    if (meta.isBuilding) {
+    if (meta != null && meta.isBuilding) {
       final updated = meta.copyWith(isBuilding: false);
-      if (!await _persistMeta(table, indexUid, updated)) {
-        return;
+      if (await _persistMeta(table, indexUid, updated)) {
+        _vectorCache.putMeta(table, indexUid, updated);
       }
-      _vectorCache.putMeta(table, indexUid, updated);
     }
     await _legacyIo.deleteOldIndex(table, indexUid);
     _legacySearch.clearCacheForIndex(table.tableUid, indexUid);
+  }
+
+  /// Resume-safe: set isBuilding without wiping live NGH artifacts.
+  ///
+  /// If meta is missing (crash before begin finished), falls back to a full
+  /// [beginIndexBuild]. Never use btree IndexMeta APIs for vector indexes.
+  Future<void> ensureIndexBuilding(
+    TableContext table,
+    IndexSchema indexSchema,
+  ) async {
+    final indexUid = indexSchema.indexUid;
+    if (indexUid.isEmpty) return;
+
+    var meta = _vectorCache.getMeta(table, indexUid);
+    meta ??= await _loadMeta(table, indexUid);
+    if (meta == null) {
+      await beginIndexBuild(table, indexSchema);
+      return;
+    }
+    if (meta.isBuilding) return;
+
+    final updated = meta.copyWith(isBuilding: true);
+    if (await _persistMeta(table, indexUid, updated)) {
+      _vectorCache.putMeta(table, indexUid, updated);
+    }
+  }
+
+  /// Empty-table authority: clear artifacts and leave meta with isBuilding=false.
+  Future<void> resetEmptyIndexMeta(
+    TableContext table,
+    IndexSchema indexSchema,
+  ) async {
+    final indexUid = indexSchema.indexUid;
+    if (indexUid.isEmpty) return;
+
+    await deletePhysicalIndexArtifacts(table, indexUid);
+
+    int dims = 128;
+    if (indexSchema.fields.isNotEmpty) {
+      final fieldName = indexSchema.fields.first;
+      final fieldSchema = table.schema.fields
+          .cast<FieldSchema?>()
+          .firstWhere((f) => f?.name == fieldName, orElse: () => null);
+      if (fieldSchema?.vectorConfig != null) {
+        dims = fieldSchema!.vectorConfig!.dimensions;
+      }
+    }
+    final metric =
+        indexSchema.vectorConfig?.distanceMetric ?? VectorDistanceMetric.cosine;
+
+    final emptyMeta = _withPageSizes(NghIndexMeta.createEmpty(
+      indexUid: indexUid,
+      tableUid: table.tableUid,
+      dimensions: dims,
+      distanceMetric: metric,
+      isBuilding: false,
+    ));
+    await _persistMeta(table, indexUid, emptyMeta);
+    _vectorCache.putMeta(table, indexUid, emptyMeta);
   }
 
   // =====================================================================
