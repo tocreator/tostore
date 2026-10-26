@@ -1,4 +1,4 @@
-import '../query/query_condition.dart';
+import '../core/query/query_condition.dart';
 
 /// Represents a subscription to a specific query
 class QuerySubscription {

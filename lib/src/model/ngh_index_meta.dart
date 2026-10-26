@@ -1,4 +1,4 @@
-import '../handler/common.dart';
+import 'global_config.dart';
 import 'meta_info.dart';
 import 'table_identity.dart';
 import 'table_schema.dart';

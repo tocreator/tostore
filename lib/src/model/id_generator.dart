@@ -2,9 +2,9 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:math';
 
-import '../core/compute_manager.dart';
-import '../core/compute_tasks.dart';
-import '../core/lock_manager.dart';
+import '../core/compute/compute_manager.dart';
+import '../core/compute/compute_tasks.dart';
+import '../core/txn/lock_manager.dart';
 import '../handler/logger.dart';
 import '../model/data_store_config.dart';
 import '../model/table_identity.dart';

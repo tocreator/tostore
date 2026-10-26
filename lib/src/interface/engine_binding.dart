@@ -1,6 +1,6 @@
 import 'dart:async';
 
-import '../core/data_store_impl.dart';
+import '../core/engine/data_store_impl.dart';
 
 /// Live engine pointer for APIs that must survive [ToStore.switchSpace].
 ///

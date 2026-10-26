@@ -1,8 +1,13 @@
 import 'dart:async';
 
-import '../core/data_store_impl.dart';
-import '../core/workload_scheduler.dart';
-import '../core/yield_controller.dart';
+import '../core/compute/workload_scheduler.dart';
+import '../core/compute/yield_controller.dart';
+import '../core/engine/data_store_impl.dart';
+import '../core/query/query_cache.dart';
+import '../core/query/query_condition.dart';
+import '../core/query/query_executor.dart';
+import '../core/wmbp/wmbp_scheduler.dart';
+import '../core/wmbp/wmbp_score.dart';
 import '../handler/logger.dart';
 import '../interface/future_builder_mixin.dart';
 import '../model/data_store_config.dart';
@@ -19,16 +24,11 @@ import '../model/table_context.dart';
 import '../model/table_identity.dart';
 import '../model/table_schema.dart';
 import '../model/text_query.dart';
-import '../core/wmbp_scheduler.dart';
-import '../core/wmbp_score.dart';
-import '../query/query_cache.dart';
-import '../query/query_condition.dart';
-import '../query/query_executor.dart';
 import 'engine_binding.dart';
 
-part '../chain/delete_builder.dart';
-part '../chain/query_builder.dart';
-part '../chain/update_builder.dart';
+part '../core/chain/delete_builder.dart';
+part '../core/chain/query_builder.dart';
+part '../core/chain/update_builder.dart';
 
 /// Integer bitmask flags for query clauses to enable O(1) point query detection.
 abstract final class QueryClauseMask {

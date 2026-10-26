@@ -3,10 +3,10 @@ import 'dart:typed_data';
 
 import '../../handler/encryption.dart';
 import '../../handler/platform_handler.dart';
-import '../../handler/wal_encoder.dart';
 import '../../model/encoder_config.dart';
-import '../compute_manager.dart';
+import '../codec/wal_encoder.dart';
 import 'compute_batch_planner.dart';
+import 'compute_manager.dart';
 
 final class WalDecodeChunkRange {
   final int startOffset;

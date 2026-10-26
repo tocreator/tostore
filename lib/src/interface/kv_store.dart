@@ -1,7 +1,7 @@
 import 'dart:async';
 
-import '../chain/kv_query_builder.dart';
-import '../core/data_store_impl.dart';
+import '../core/chain/kv_query_builder.dart';
+import '../core/engine/data_store_impl.dart';
 import '../model/data_store_config.dart';
 import '../model/db_result.dart';
 import '../model/system_table.dart';

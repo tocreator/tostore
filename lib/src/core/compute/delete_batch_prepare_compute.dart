@@ -1,6 +1,6 @@
 import '../../handler/logger.dart';
 import '../../model/table_identity.dart';
-import '../yield_controller.dart';
+import 'yield_controller.dart';
 
 /// Pure-compute request for trimming delete-buffer records.
 class DeleteBatchPrepareRequest {

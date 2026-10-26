@@ -2,12 +2,12 @@ import 'dart:convert';
 import 'dart:math' show sqrt;
 import 'dart:typed_data';
 
-import '../handler/common.dart';
+import '../core/query/value_matcher.dart';
 import '../handler/logger.dart';
 import '../handler/memcomparable.dart';
 import '../handler/sha256.dart';
-import '../handler/value_matcher.dart';
 import 'db_exception.dart';
+import 'global_config.dart';
 import 'id_generator.dart';
 import 'result_status.dart';
 import 'result_type.dart';

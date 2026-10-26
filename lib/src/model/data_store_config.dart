@@ -1,8 +1,8 @@
 import 'dart:math';
 
-import '../handler/common.dart';
 import '../handler/logger.dart';
 import '../handler/platform_handler.dart';
+import 'encoder_config.dart';
 import 'migration_config.dart';
 
 /// data store config

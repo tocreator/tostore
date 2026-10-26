@@ -3,14 +3,14 @@ import 'dart:typed_data';
 
 import '../../handler/memcomparable.dart';
 import '../../model/data_block_entry.dart';
-import '../../model/index_entry.dart';
-import '../../model/system_table.dart';
-import '../../model/table_schema.dart';
 import '../../model/db_exception.dart';
+import '../../model/index_entry.dart';
 import '../../model/result_status.dart';
 import '../../model/result_type.dart';
+import '../../model/system_table.dart';
 import '../../model/table_identity.dart';
-import '../yield_controller.dart';
+import '../../model/table_schema.dart';
+import 'yield_controller.dart';
 
 /// Operation kind for batched B+Tree index delta preparation.
 enum IndexDeltaOperationKind {

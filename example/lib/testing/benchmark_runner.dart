@@ -504,7 +504,7 @@ class BenchmarkRunner {
         break;
 
       case BenchmarkOperation.pointReadHot:
-        // Query phase already flushed once; ensure durable row count for seeks.
+        // Query phase already flushed once; ensure durable record count for seeks.
         await _ensureDurableDataset(tableName, tier, scale,
             durability: durability);
         effectiveCount = scale;

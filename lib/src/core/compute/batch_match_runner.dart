@@ -2,10 +2,10 @@ import 'dart:math';
 
 import '../../model/table_context.dart';
 import '../../model/table_schema.dart';
-import '../compute_manager.dart';
-import '../yield_controller.dart';
 import 'batch_match_compute.dart';
 import 'compute_batch_planner.dart';
+import 'compute_manager.dart';
+import 'yield_controller.dart';
 
 /// Shared batch matcher orchestrator that keeps pure matching work generic and reusable.
 class ConditionBatchMatcher {

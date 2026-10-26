@@ -1,0 +1,6752 @@
+import 'dart:convert';
+import 'dart:math';
+import 'dart:typed_data';
+
+import '../../handler/logger.dart';
+import '../../handler/memcomparable.dart';
+import '../../handler/parallel_processor.dart';
+import '../../handler/topk_heap.dart';
+import '../../interface/chain_builder.dart';
+import '../../model/cancellation_token.dart';
+import '../../model/db_exception.dart';
+import '../../model/index_search.dart';
+import '../../model/join_clause.dart';
+import '../../model/query_aggregation.dart';
+import '../../model/query_result.dart';
+import '../../model/result_status.dart';
+import '../../model/result_type.dart';
+import '../../model/sparse_vector_data.dart';
+import '../../model/table_context.dart';
+import '../../model/table_identity.dart';
+import '../../model/table_schema.dart';
+import '../../model/text_query.dart';
+import '../btree/tree_cache.dart';
+import '../codec/binary_schema_codec.dart';
+import '../compute/batch_match_runner.dart';
+import '../compute/workload_scheduler.dart';
+import '../compute/yield_controller.dart';
+import '../engine/data_store_impl.dart';
+import '../engine/index_manager.dart';
+import '../maintenance/promote_primary_key.dart';
+import '../txn/transaction_context.dart';
+import '../wmbp/wmbp_scheduler.dart';
+import '../wmbp/wmbp_score.dart';
+import 'query_cache.dart';
+import 'query_condition.dart';
+import 'query_plan.dart';
+import 'value_matcher.dart';
+
+/// query executor
+class QueryExecutor {
+  final DataStoreImpl _dataStore;
+  final IndexManager _indexManager;
+
+  // Query result hotspot cache (MemoryQuotaType.queryResult).
+  late final TreeCache<QueryResultCacheEntry> _queryCache;
+  final Map<String, int> _tableQueryGenerations = <String, int>{};
+
+  /// Build decode projection set for partial row decode.
+  ///
+  /// Includes SELECT + matcher + PK + orderBy + aggregation/groupBy fields.
+  /// Returns null when no SELECT (full-record decode). Call once per query and
+  /// pass the set down - never recompute in scan/batch loops.
+  static Set<String>? resolveNeededFields({
+    List<String>? selectedFields,
+    ConditionRecordMatcher? matcher,
+    String? primaryKey,
+    List<String>? orderBy,
+    List<QueryAggregation>? aggregations,
+    List<String>? groupBy,
+  }) {
+    if (selectedFields == null || selectedFields.isEmpty) return null;
+    final out = <String>{};
+    _addNeededFieldNames(out, selectedFields);
+    if (matcher != null) out.addAll(matcher.fields);
+    if (primaryKey != null && primaryKey.isNotEmpty) out.add(primaryKey);
+    if (orderBy != null) _addNeededFieldNames(out, orderBy);
+    if (aggregations != null) {
+      for (final a in aggregations) {
+        _addNeededFieldName(out, a.field);
+      }
+    }
+    if (groupBy != null) _addNeededFieldNames(out, groupBy);
+    return out.isEmpty ? null : out;
+  }
+
+  static void _addNeededFieldNames(Set<String> out, List<String> raws) {
+    for (final raw in raws) {
+      _addNeededFieldName(out, raw);
+    }
+  }
+
+  static void _addNeededFieldName(Set<String> out, String raw) {
+    var name = raw.trim();
+    final asIdx = name.indexOf(' as ');
+    if (asIdx >= 0) name = name.substring(0, asIdx).trim();
+    if (name.startsWith('-')) name = name.substring(1).trim();
+    final upper = name.toUpperCase();
+    if (upper.endsWith(' DESC')) {
+      name = name.substring(0, name.length - 5).trim();
+    } else if (upper.endsWith(' ASC')) {
+      name = name.substring(0, name.length - 4).trim();
+    }
+    final dot = name.lastIndexOf('.');
+    if (dot >= 0) name = name.substring(dot + 1);
+    if (name.isNotEmpty) out.add(name);
+  }
+
+  // Plan Cache: data-independent compiled execution plan cache.
+  final Map<String, CompiledExecutionPlan> _planCache =
+      <String, CompiledExecutionPlan>{};
+  final Map<String, Set<String>> _tablePlanKeys = <String, Set<String>>{};
+  static const int _maxPlanCacheSize = 4096;
+
+  QueryExecutor(
+    this._dataStore,
+    this._indexManager,
+  ) {
+    final res = _dataStore.resourceManager;
+    final int maxBytes = res?.getQueryCacheSize() ?? (50 * 1024 * 1024);
+    _queryCache = TreeCache<QueryResultCacheEntry>(
+      sizeCalculator: (e) => e.sizeBytes,
+      maxByteThreshold: maxBytes,
+      minByteThreshold: 20 * 1024 * 1024,
+      debugLabel: 'QueryResult',
+    );
+  }
+
+  /// Helper to wrap a single point lookup record into ExecuteResult with zero overhead.
+  static ExecuteResult _wrapPointRecordResult(
+    Map<String, dynamic> rec, {
+    PromoteRuntimeDescriptor? promoteDesc,
+    bool applyPromoteResultTransform = false,
+    bool onlyCount = false,
+  }) {
+    final Map<String, dynamic> resultRow;
+    if (promoteDesc != null && applyPromoteResultTransform) {
+      resultRow = Map<String, dynamic>.from(rec);
+      transformPromoteOldToNewInPlace(resultRow, promoteDesc);
+    } else {
+      resultRow = rec;
+    }
+    return ExecuteResult(
+      records: onlyCount ? const [] : [resultRow],
+      count: 1,
+      hasMore: false,
+      hasPrev: false,
+      executionTimeMs: 0,
+      isPointDirect: true,
+    );
+  }
+
+  /// Execute query with optional cursor/keyset pagination.
+  ///
+  /// - When [cursor] is provided, cursor pagination is used (mutually exclusive with [offset]).
+  /// - Returns [ExecuteResult] containing records, nextCursor, and hasMore.
+  /// - Supports:
+  ///   - Table scan ordered by primary key (default / explicit PK orderBy, ASC/DESC)
+  ///   - Index scan ordered by index key (when orderBy matches index fields, ASC/DESC)
+  /// Synchronously execute query in pure memory tier (Result Cache / Point Cache / WriteBuffer).
+  ///
+  /// Priority #1: Direct PK Point / Unique Index Point lookup.
+  /// Priority #2: Non-Point Result Cache (range, pagination, multi-predicate, etc.).
+  /// Never hits disk/files; returns empty result if memory caches miss.
+  /// Designed for extreme QPS throughput (3M+ QPS for point lookups).
+  ExecuteResult executePeek(
+    TableContext table, {
+    QueryCondition? condition,
+    List<String>? orderBy,
+    int? limit,
+    int? offset,
+    String? cursor,
+    List<JoinClause>? joins,
+    bool enableQueryCache = true,
+    Duration? queryCacheExpiry,
+    bool onlyCount = false,
+    List<QueryAggregation>? aggregations,
+    List<String>? groupBy,
+    int clauseFlags = -1,
+    bool applyPromoteResultTransform = false,
+  }) {
+    final schema = table.schema;
+    final tableUid = table.tableUid;
+
+    final promoteDesc =
+        (_dataStore.migrationManager?.hasAnyActivePromotes == true)
+            ? _dataStore.migrationManager!.getPromoteRuntime(table.tableUid)
+            : null;
+
+    // -------------------------------------------------------------------------
+    // Fast single-equality condition extraction (shared by PK and Unique index)
+    // -------------------------------------------------------------------------
+    final bool isPointCandidate = (clauseFlags != -1)
+        ? (clauseFlags == 0 &&
+            !onlyCount &&
+            condition != null &&
+            !condition.isEmpty)
+        : (!onlyCount &&
+            (aggregations == null || aggregations.isEmpty) &&
+            (groupBy == null || groupBy.isEmpty) &&
+            (joins == null || joins.isEmpty) &&
+            (offset == null || offset <= 0) &&
+            (cursor == null || cursor.isEmpty) &&
+            (limit == null || limit >= 1) &&
+            condition != null &&
+            !condition.isEmpty);
+
+    final singleEq =
+        isPointCandidate ? condition.extractSingleEquality() : null;
+    String? pointFieldName;
+    dynamic pointRawVal;
+    final bool hasSingleEq = singleEq != null;
+
+    if (singleEq != null) {
+      pointFieldName = (promoteDesc != null)
+          ? promoteDesc.remapFieldNameNewToOld(singleEq.field)
+          : singleEq.field;
+      pointRawVal = singleEq.value;
+    }
+
+    // =========================================================================
+    // LEVEL 1: PRIMARY KEY POINT LOOKUP
+    // Zero secondary index lookups, zero ResultCache overhead.
+    // =========================================================================
+    if (hasSingleEq &&
+        (identical(pointFieldName, schema.primaryKey) ||
+            pointFieldName == schema.primaryKey)) {
+      final pk = pointRawVal?.toString();
+      if (pk != null && pk.isNotEmpty) {
+        final rec = _dataStore.tableDataManager.getRecordByPrimaryKeySync(
+          table,
+          pk,
+        );
+        if (rec != null) {
+          return _wrapPointRecordResult(
+            rec,
+            promoteDesc: promoteDesc,
+            applyPromoteResultTransform: applyPromoteResultTransform,
+            onlyCount: onlyCount,
+          );
+        } else {
+          return const ExecuteResult.empty();
+        }
+      }
+    }
+
+    // =========================================================================
+    // LEVEL 2: UNIQUE INDEX POINT LOOKUP
+    // Evaluated only when the query predicate is not on the primary key.
+    // =========================================================================
+    if (hasSingleEq && pointFieldName != null) {
+      final fastUniqueIndex = findFastUniqueIndex(schema, pointFieldName);
+      if (fastUniqueIndex != null) {
+        final pk = _dataStore.indexManager?.lookupUniquePrimaryKeySync(
+          table,
+          fastUniqueIndex.indexUid,
+          pointRawVal,
+        );
+        if (pk != null && pk.isNotEmpty) {
+          final rec = _dataStore.tableDataManager.getRecordByPrimaryKeySync(
+            table,
+            pk,
+          );
+          if (rec != null) {
+            return _wrapPointRecordResult(
+              rec,
+              promoteDesc: promoteDesc,
+              applyPromoteResultTransform: applyPromoteResultTransform,
+              onlyCount: onlyCount,
+            );
+          }
+        }
+        return const ExecuteResult.empty();
+      }
+    }
+
+    // =========================================================================
+    // LEVEL 3: NON-POINT RESULT CACHE LOOKUP
+    // Non-point queries check the hotspot result set cache.
+    // =========================================================================
+    final bool inTxn = TransactionContext.getCurrentTransactionId() != null;
+    final bool canUseResultCache =
+        enableQueryCache && !inTxn && (joins == null || joins.isEmpty);
+
+    if (canUseResultCache) {
+      final int defaultLimit = _dataStore.config.defaultQueryLimit;
+      final int effectiveLimitForCache =
+          limit ?? (defaultLimit > 0 ? defaultLimit : 500);
+      final bool isWithinResultCacheLimit = effectiveLimitForCache <= 500 ||
+          onlyCount ||
+          (aggregations != null && aggregations.isNotEmpty);
+
+      if (isWithinResultCacheLimit) {
+        final resultCacheKey = QueryCacheKey(
+          tableUid: TableUid(tableUid),
+          condition: condition ?? QueryCondition(),
+          orderBy: orderBy,
+          limit: limit,
+          offset: offset,
+          cursor: cursor,
+          joins: joins,
+          aggregations: aggregations,
+          groupBy: groupBy,
+          onlyCount: onlyCount,
+        );
+        final gen = _getTableQueryGeneration(resultCacheKey.tableUid);
+        final queryStr = resultCacheKey.toString();
+        final entry =
+            _queryCache.getPoint3(resultCacheKey.tableUid.value, gen, queryStr);
+        if (entry != null) {
+          if (entry.isExpired()) {
+            _queryCache.removePoint3(
+                resultCacheKey.tableUid.value, gen, queryStr);
+          } else {
+            return ExecuteResult(
+              records: _copyResultList(entry.records),
+              nextCursor: entry.nextCursor,
+              prevCursor: entry.prevCursor,
+              hasMore: entry.hasMore,
+              hasPrev: entry.hasPrev,
+              executionTimeMs: 0,
+              count: entry.count,
+              aggregateResult: entry.aggregateResult,
+            );
+          }
+        }
+      }
+    }
+
+    // In disk persistence mode, cache miss on peek returns empty immediately
+    return const ExecuteResult.empty();
+  }
+
+  /// Synchronously retrieve the first matching record in pure memory tier.
+  ///
+  /// Priority #1: Direct PK Point / Unique Index Point lookup (Zero ExecuteResult/List allocation!).
+  /// Priority #2: Result Cache / executePeek fallback.
+  Map<String, dynamic>? executePeekFirst(
+    TableContext table, {
+    QueryCondition? condition,
+    String? fastSingleEqField,
+    dynamic fastSingleEqVal,
+    String? fastSingleEqOp,
+    List<JoinClause>? joins,
+    bool applyPromoteResultTransform = true,
+  }) {
+    // =========================================================================
+    // PRIORITY #1: POINT FAST PATH (PK & Unique Index Pure Memory) - 0 ALLOCATIONS
+    // =========================================================================
+    if (joins == null || joins.isEmpty) {
+      String? pointFieldName;
+      dynamic pointRawVal;
+      bool hasSingleEq = false;
+
+      if (fastSingleEqField != null &&
+          (fastSingleEqOp == null ||
+              fastSingleEqOp == '=' ||
+              fastSingleEqOp == '==')) {
+        pointFieldName = fastSingleEqField;
+        pointRawVal = fastSingleEqVal;
+        hasSingleEq = true;
+      } else if (condition != null && !condition.isEmpty) {
+        final singleEq = condition.extractSingleEquality();
+        if (singleEq != null) {
+          pointFieldName = singleEq.field;
+          pointRawVal = singleEq.value;
+          hasSingleEq = true;
+        }
+      }
+
+      if (hasSingleEq && pointFieldName != null) {
+        final schema = table.schema;
+        final String pkField = schema.primaryKey;
+
+        // Fast-path 1.1: Primary key point lookup (hottest path)
+        if (pointFieldName == pkField) {
+          final rec = _dataStore.tableDataManager.getRecordByPrimaryKeySync(
+            table,
+            pointRawVal,
+          );
+          if (rec == null) return null;
+          final promoteDesc =
+              (_dataStore.migrationManager?.hasAnyActivePromotes == true)
+                  ? _dataStore.migrationManager!
+                      .getPromoteRuntime(table.tableUid)
+                  : null;
+          if (promoteDesc != null && applyPromoteResultTransform) {
+            final resultRow = Map<String, dynamic>.from(rec);
+            transformPromoteOldToNewInPlace(resultRow, promoteDesc);
+            return resultRow;
+          }
+          return rec;
+        }
+
+        final promoteDesc =
+            (_dataStore.migrationManager?.hasAnyActivePromotes == true)
+                ? _dataStore.migrationManager!.getPromoteRuntime(table.tableUid)
+                : null;
+        if (promoteDesc != null) {
+          if (pointFieldName.contains('.')) {
+            pointFieldName = pointFieldName.split('.').last;
+          }
+          pointFieldName = promoteDesc.remapFieldNameNewToOld(pointFieldName);
+        }
+
+        // Fast-path 1.2: Unique index point lookup
+        final lookupName = pointFieldName.contains('.')
+            ? pointFieldName.split('.').last
+            : pointFieldName;
+        final fastUniqueIndex = findFastUniqueIndex(schema, lookupName);
+        if (fastUniqueIndex != null) {
+          final pk = _dataStore.indexManager?.lookupUniquePrimaryKeySync(
+            table,
+            fastUniqueIndex.indexUid,
+            pointRawVal,
+          );
+          if (pk != null && pk.isNotEmpty) {
+            final rec = _dataStore.tableDataManager.getRecordByPrimaryKeySync(
+              table,
+              pk,
+            );
+            if (rec != null) {
+              if (promoteDesc != null && applyPromoteResultTransform) {
+                final resultRow = Map<String, dynamic>.from(rec);
+                transformPromoteOldToNewInPlace(resultRow, promoteDesc);
+                return resultRow;
+              }
+              return rec;
+            }
+            return null;
+          }
+          return null;
+        }
+      }
+    }
+
+    // =========================================================================
+    // PRIORITY #2: NON-POINT PEEK (Result Cache / Pure Memory Scan)
+    // =========================================================================
+    final result = executePeek(
+      table,
+      condition: condition,
+      limit: 1,
+      joins: joins,
+      applyPromoteResultTransform: applyPromoteResultTransform,
+    );
+    return result.records.isEmpty ? null : result.records.first;
+  }
+
+  /// Synchronously check if matching record exists in pure memory tier.
+  bool executePeekExists(
+    TableContext table, {
+    QueryCondition? condition,
+    String? fastSingleEqField,
+    dynamic fastSingleEqVal,
+    String? fastSingleEqOp,
+    List<JoinClause>? joins,
+  }) {
+    if (joins == null || joins.isEmpty) {
+      if (fastSingleEqField != null ||
+          (condition != null && !condition.isEmpty)) {
+        final rec = executePeekFirst(
+          table,
+          condition: condition,
+          fastSingleEqField: fastSingleEqField,
+          fastSingleEqVal: fastSingleEqVal,
+          fastSingleEqOp: fastSingleEqOp,
+          applyPromoteResultTransform: false,
+        );
+        return rec != null;
+      }
+    }
+    final result = executePeek(
+      table,
+      condition: condition,
+      limit: 1,
+      joins: joins,
+      onlyCount: true,
+    );
+    final count = result.count ?? result.records.length;
+    return count > 0;
+  }
+
+  /// Synchronously count matching records in pure memory tier.
+  int executePeekCount(
+    TableContext table, {
+    QueryCondition? condition,
+    String? fastSingleEqField,
+    dynamic fastSingleEqVal,
+    String? fastSingleEqOp,
+    List<JoinClause>? joins,
+  }) {
+    if (joins == null || joins.isEmpty) {
+      if (fastSingleEqField != null ||
+          (condition != null && !condition.isEmpty)) {
+        final rec = executePeekFirst(
+          table,
+          condition: condition,
+          fastSingleEqField: fastSingleEqField,
+          fastSingleEqVal: fastSingleEqVal,
+          fastSingleEqOp: fastSingleEqOp,
+          applyPromoteResultTransform: false,
+        );
+        return rec != null ? 1 : 0;
+      }
+
+      // Fast-path: When condition and joins are empty, return table total record count directly from memory.
+      final totalCount =
+          _dataStore.tableDataManager.getTableRecordCountSync(table);
+      if (totalCount != null) {
+        return totalCount;
+      }
+    }
+    final result = executePeek(
+      table,
+      condition: condition,
+      joins: joins,
+      onlyCount: true,
+    );
+    return result.count ?? result.records.length;
+  }
+
+  /// - Not supported:
+  ///   - UNION/OR plans
+  ///   - JOINs (cursor semantics become ambiguous due to row multiplication)
+  Future<ExecuteResult> execute(
+    TableContext table, {
+    QueryCondition? condition,
+    List<String>? orderBy,
+    int? limit,
+    int? offset,
+    String? cursor,
+    List<JoinClause>? joins,
+    bool enableQueryCache = true,
+    Duration? queryCacheExpiry,
+    bool onlyCount = false,
+    List<QueryAggregation>? aggregations,
+    List<String>? groupBy,
+    bool readFromFileOnly = false,
+
+    /// Bitmask of active clauses from QueryBuilder (0 indicates pure point query candidate).
+    int clauseFlags = -1,
+
+    /// When true, reshape promote result records from old-working -> user-facing
+    /// target schema. Default false: engine/migration/system paths operate on
+    /// the physical old table and must not transform. User-facing entry points
+    /// ([QueryBuilder], [DataStoreImpl.executeUserQuery]) pass true explicitly.
+    bool applyPromoteResultTransform = false,
+
+    /// Engine-internal mutation path (delete/update/ttl): skip user-facing
+    /// post-processing (schema normalize, cursor pagination).
+    bool engineInternal = false,
+
+    /// Projection: point cold-path and scan/index paths use this to skip
+    /// unselected field-overflow IO. Memory hotspot hits stay full-record.
+    List<String>? selectedFields,
+
+    /// Multi-way fusion strategy. Null defaults to weighted absolute relevance.
+    RetrievalFusionMethod? fusionMethod,
+  }) async {
+    final schemaMgr = _dataStore.tableMetaManager;
+    if (schemaMgr == null) {
+      if (!_dataStore.isInitialized) return ExecuteResult.empty();
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Schema manager not initialized',
+        )
+      ]);
+    }
+
+    final tableName = table.tableName;
+    final schema = table.schema;
+    final tableUid = table.tableUid;
+
+    // Promote dual-write era: queries read only the old working table.
+    // Remap user-facing field names, then convert result records to target shape.
+    final promoteDesc =
+        _dataStore.migrationManager?.getPromoteRuntime(table.tableUid);
+
+    // =========================================================================
+    // FAST PATH / POINT QUERY DETECTION
+    // Zero string operations: fast single equality condition is pre-normalized.
+    // =========================================================================
+    final bool isPointCandidate = (clauseFlags != -1)
+        ? (clauseFlags == 0 &&
+            !onlyCount &&
+            condition != null &&
+            !condition.isEmpty)
+        : (!onlyCount &&
+            (aggregations == null || aggregations.isEmpty) &&
+            (groupBy == null || groupBy.isEmpty) &&
+            (joins == null || joins.isEmpty) &&
+            (offset == null || offset <= 0) &&
+            (cursor == null || cursor.isEmpty) &&
+            (limit == null || limit >= 1) &&
+            condition != null &&
+            !condition.isEmpty);
+
+    final singleEq =
+        isPointCandidate ? condition.extractSingleEquality() : null;
+    String? pointFieldName;
+    dynamic pointRawVal;
+    final bool hasSingleEq = singleEq != null;
+
+    if (singleEq != null) {
+      pointFieldName = (promoteDesc != null)
+          ? promoteDesc.remapFieldNameNewToOld(singleEq.field)
+          : singleEq.field;
+      pointRawVal = singleEq.value;
+    }
+
+    // =========================================================================
+    // LEVEL 1: PRIMARY KEY POINT LOOKUP
+    // Zero secondary index lookups, zero ResultCache overhead.
+    // =========================================================================
+    // SELECT projection for cold point reads: skip unselected field-overflow IO.
+    // Memory/row-cache hits stay full-record (never store partials); builder projects.
+    final Set<String>? pointNeededFields = resolveNeededFields(
+      selectedFields: selectedFields,
+      primaryKey: schema.primaryKey,
+    );
+
+    if (hasSingleEq &&
+        (identical(pointFieldName, schema.primaryKey) ||
+            pointFieldName == schema.primaryKey)) {
+      final pk = pointRawVal?.toString();
+      if (pk != null && pk.isNotEmpty) {
+        // Fast-path: Synchronous memory tier check (WriteBuffer / TableRecordCache / Txn)
+        if (!readFromFileOnly) {
+          final syncRec = _dataStore.tableDataManager.getRecordByPrimaryKeySync(
+            table,
+            pk,
+          );
+          if (syncRec != null) {
+            return _wrapPointRecordResult(
+              syncRec,
+              promoteDesc: promoteDesc,
+              applyPromoteResultTransform: applyPromoteResultTransform,
+              onlyCount: onlyCount,
+            );
+          }
+        }
+
+        final rec = await _dataStore.tableDataManager.getRecordByPrimaryKey(
+          table,
+          pk,
+          readFromFileOnly: readFromFileOnly,
+          neededFields: pointNeededFields,
+        );
+        if (rec != null) {
+          return _wrapPointRecordResult(
+            rec,
+            promoteDesc: promoteDesc,
+            applyPromoteResultTransform: applyPromoteResultTransform,
+            onlyCount: onlyCount,
+          );
+        } else {
+          return const ExecuteResult.empty();
+        }
+      }
+    }
+
+    // =========================================================================
+    // LEVEL 2: UNIQUE INDEX POINT LOOKUP
+    // Evaluated only when the query predicate is not on the primary key.
+    // =========================================================================
+    if (hasSingleEq && pointFieldName != null) {
+      final fastUniqueIndex = findFastUniqueIndex(schema, pointFieldName);
+      if (fastUniqueIndex != null) {
+        if (!readFromFileOnly) {
+          final syncPk = _dataStore.indexManager?.lookupUniquePrimaryKeySync(
+            table,
+            fastUniqueIndex.indexUid,
+            pointRawVal,
+          );
+          if (syncPk != null && syncPk.isNotEmpty) {
+            final syncRec =
+                _dataStore.tableDataManager.getRecordByPrimaryKeySync(
+              table,
+              syncPk,
+            );
+            if (syncRec != null) {
+              return _wrapPointRecordResult(
+                syncRec,
+                promoteDesc: promoteDesc,
+                applyPromoteResultTransform: applyPromoteResultTransform,
+                onlyCount: onlyCount,
+              );
+            }
+          }
+        }
+
+        final pk = await _indexManager.lookupUniquePrimaryKey(
+          table,
+          fastUniqueIndex.indexUid,
+          pointRawVal,
+          readFromFileOnly: readFromFileOnly,
+        );
+        if (pk != null && pk.isNotEmpty) {
+          final rec = await _dataStore.tableDataManager.getRecordByPrimaryKey(
+            table,
+            pk,
+            readFromFileOnly: readFromFileOnly,
+            neededFields: pointNeededFields,
+          );
+          if (rec != null) {
+            return _wrapPointRecordResult(
+              rec,
+              promoteDesc: promoteDesc,
+              applyPromoteResultTransform: applyPromoteResultTransform,
+              onlyCount: onlyCount,
+            );
+          }
+        }
+        return const ExecuteResult.empty();
+      }
+    }
+
+    // =========================================================================
+    // VECTOR / HYBRID FAST PATH
+    // Bypass result-cache identity strings (would serialize Float32 query
+    // vectors via QueryCacheKey) and jump straight to ANN / hybrid retrieval.
+    // =========================================================================
+    final bool isRetrieval = (clauseFlags != -1)
+        ? (clauseFlags & QueryClauseMask.retrieval != 0)
+        : (condition != null && condition.hasRetrievalMatch);
+    if (isRetrieval) {
+      // Pure single-vector ANN: skip normalize/build/shape analysis.
+      if (promoteDesc == null &&
+          condition != null &&
+          (joins == null || joins.isEmpty) &&
+          (orderBy == null || orderBy.isEmpty) &&
+          !onlyCount &&
+          (aggregations == null || aggregations.isEmpty) &&
+          (groupBy == null || groupBy.isEmpty) &&
+          (cursor == null || cursor.isEmpty)) {
+        final pure = condition.tryExtractPureVectorMatch();
+        if (pure != null) {
+          final stopwatch = Stopwatch()..start();
+          return _executeSingleVectorRetrieval(
+            table,
+            spec: _VectorMatchSpec(
+              field: pure.field,
+              vector: pure.vector,
+              weight: pure.weight,
+              searchDepth: pure.searchDepth,
+              distanceThreshold: pure.distanceThreshold,
+              minScore: pure.minScore,
+            ),
+            effectiveLimit: limit ?? _dataStore.config.defaultQueryLimit,
+            effectiveOffset: offset ?? 0,
+            readFromFileOnly: readFromFileOnly,
+            promoteDesc: null,
+            applyPromoteResultTransform: applyPromoteResultTransform,
+            selectedFields: selectedFields,
+            stopwatch: stopwatch,
+          );
+        }
+
+        final pureText = condition.tryExtractPureTextMatch();
+        if (pureText != null) {
+          final stopwatch = Stopwatch()..start();
+          return _executeSingleWmbpRetrieval(
+            table,
+            text: _TextMatchSpec(
+              field: pureText.field,
+              query: pureText.query,
+              operator: pureText.operator,
+              weight: pureText.weight,
+              minScore: pureText.minScore,
+            ),
+            effectiveLimit: limit ?? _dataStore.config.defaultQueryLimit,
+            effectiveOffset: offset ?? 0,
+            readFromFileOnly: readFromFileOnly,
+            promoteDesc: null,
+            applyPromoteResultTransform: applyPromoteResultTransform,
+            selectedFields: selectedFields,
+            stopwatch: stopwatch,
+          );
+        }
+
+        final pureSparse = condition.tryExtractPureSparseMatch();
+        if (pureSparse != null) {
+          final stopwatch = Stopwatch()..start();
+          return _executeSingleWmbpRetrieval(
+            table,
+            sparse: _SparseMatchSpec(
+              field: pureSparse.field,
+              query: pureSparse.query,
+              weight: pureSparse.weight,
+              minScore: pureSparse.minScore,
+            ),
+            effectiveLimit: limit ?? _dataStore.config.defaultQueryLimit,
+            effectiveOffset: offset ?? 0,
+            readFromFileOnly: readFromFileOnly,
+            promoteDesc: null,
+            applyPromoteResultTransform: applyPromoteResultTransform,
+            selectedFields: selectedFields,
+            stopwatch: stopwatch,
+          );
+        }
+
+        // Single retrieval + structured filters: skip build/analyze/fromMap.
+        final filtered = condition.tryExtractSingleRetrievalWithFilter();
+        if (filtered != null) {
+          final schemas = <String, TableSchema>{tableName: schema};
+          filtered.filter.normalize(schemas, tableName);
+          final effectiveLimit = limit ?? _dataStore.config.defaultQueryLimit;
+          final effectiveOffset = offset ?? 0;
+          final stopwatch = Stopwatch()..start();
+          final v = filtered.vector;
+          if (v != null) {
+            return _executeVectorWithFilterRetrieval(
+              table,
+              spec: _VectorMatchSpec(
+                field: v.field,
+                vector: v.vector,
+                weight: v.weight,
+                searchDepth: v.searchDepth,
+                distanceThreshold: v.distanceThreshold,
+                minScore: v.minScore,
+              ),
+              filterCondition: filtered.filter,
+              effectiveLimit: effectiveLimit,
+              effectiveOffset: effectiveOffset,
+              readFromFileOnly: readFromFileOnly,
+              promoteDesc: null,
+              applyPromoteResultTransform: applyPromoteResultTransform,
+              stopwatch: stopwatch,
+            );
+          }
+          final t = filtered.text;
+          if (t != null) {
+            return _executeSingleWmbpRetrieval(
+              table,
+              text: _TextMatchSpec(
+                field: t.field,
+                query: t.query,
+                operator: t.operator,
+                weight: t.weight,
+                minScore: t.minScore,
+              ),
+              filterCondition: filtered.filter,
+              effectiveLimit: effectiveLimit,
+              effectiveOffset: effectiveOffset,
+              readFromFileOnly: readFromFileOnly,
+              promoteDesc: null,
+              applyPromoteResultTransform: applyPromoteResultTransform,
+              selectedFields: selectedFields,
+              stopwatch: stopwatch,
+            );
+          }
+          final s = filtered.sparse;
+          if (s != null) {
+            return _executeSingleWmbpRetrieval(
+              table,
+              sparse: _SparseMatchSpec(
+                field: s.field,
+                query: s.query,
+                weight: s.weight,
+                minScore: s.minScore,
+              ),
+              filterCondition: filtered.filter,
+              effectiveLimit: effectiveLimit,
+              effectiveOffset: effectiveOffset,
+              readFromFileOnly: readFromFileOnly,
+              promoteDesc: null,
+              applyPromoteResultTransform: applyPromoteResultTransform,
+              selectedFields: selectedFields,
+              stopwatch: stopwatch,
+            );
+          }
+        }
+      }
+
+      var effectiveOrderBy = orderBy;
+      if (promoteDesc != null) {
+        if (condition != null && !condition.isEmpty) {
+          remapPromoteConditionNewToOld(condition, promoteDesc);
+        }
+        effectiveOrderBy = remapPromoteOrderByNewToOld(orderBy, promoteDesc);
+      }
+
+      final schemas = <String, TableSchema>{tableName: schema};
+      if (condition != null && !condition.isEmpty) {
+        if (joins != null && joins.isNotEmpty) {
+          for (final join in joins) {
+            final joinSchema =
+                await schemaMgr.getTableSchemaByName(TableName(join.table));
+            if (joinSchema != null) {
+              schemas[join.table] = joinSchema;
+            }
+          }
+        }
+        condition.normalize(schemas, tableName);
+      }
+
+      Map<String, dynamic>? where = condition?.build();
+      if (where != null &&
+          where.isNotEmpty &&
+          joins != null &&
+          joins.isNotEmpty) {
+        where = _prefixMainTableForJoinWhere(table, where);
+      }
+
+      return await _executeHybridRetrieval(
+        table,
+        condition: condition ?? QueryCondition(),
+        where: where ?? const {},
+        orderBy: effectiveOrderBy,
+        limit: limit,
+        offset: offset,
+        readFromFileOnly: readFromFileOnly,
+        promoteDesc: promoteDesc,
+        applyPromoteResultTransform: applyPromoteResultTransform,
+        selectedFields: selectedFields,
+        fusionMethod: fusionMethod,
+      );
+    }
+
+    // =========================================================================
+    // LEVEL 3: NON-POINT RESULT CACHE LOOKUP
+    // Non-point queries check the hotspot result set cache.
+    // =========================================================================
+    final bool inTxn = TransactionContext.getCurrentTransactionId() != null;
+    final bool canUseResultCache = enableQueryCache &&
+        !readFromFileOnly &&
+        !inTxn &&
+        (joins == null || joins.isEmpty);
+
+    QueryCacheKey? resultCacheKey;
+    int? resultCacheStartGen;
+    bool isWithinResultCacheLimit = false;
+
+    if (canUseResultCache) {
+      final int defaultLimit = _dataStore.config.defaultQueryLimit;
+      final int effectiveLimitForCache =
+          limit ?? (defaultLimit > 0 ? defaultLimit : 500);
+      isWithinResultCacheLimit = effectiveLimitForCache <= 500 ||
+          onlyCount ||
+          (aggregations != null && aggregations.isNotEmpty);
+
+      if (isWithinResultCacheLimit) {
+        resultCacheKey = QueryCacheKey(
+          tableUid: TableUid(tableUid),
+          condition: condition ?? QueryCondition(),
+          orderBy: orderBy,
+          limit: limit,
+          offset: offset,
+          cursor: cursor,
+          joins: joins,
+          aggregations: aggregations,
+          groupBy: groupBy,
+          onlyCount: onlyCount,
+          selectedFields: selectedFields,
+        );
+        final gen = _getTableQueryGeneration(resultCacheKey.tableUid);
+        resultCacheStartGen = gen;
+        final queryStr = resultCacheKey.toString();
+        final entry =
+            _queryCache.getPoint3(resultCacheKey.tableUid.value, gen, queryStr);
+        if (entry != null) {
+          if (entry.isExpired()) {
+            _queryCache.removePoint3(
+                resultCacheKey.tableUid.value, gen, queryStr);
+          } else {
+            return ExecuteResult(
+              records: _copyResultList(entry.records),
+              nextCursor: entry.nextCursor,
+              prevCursor: entry.prevCursor,
+              hasMore: entry.hasMore,
+              hasPrev: entry.hasPrev,
+              executionTimeMs: 0,
+              count: entry.count,
+              aggregateResult: entry.aggregateResult,
+            );
+          }
+        }
+      }
+    }
+
+    // =========================================================================
+    // TIER-2: PLAN CACHE & GENERAL QUERY EXECUTION
+    // =========================================================================
+    var effectiveOrderBy = orderBy;
+    var effectiveGroupBy = groupBy;
+    if (promoteDesc != null) {
+      if (condition != null && !condition.isEmpty) {
+        remapPromoteConditionNewToOld(condition, promoteDesc);
+      }
+      effectiveOrderBy = remapPromoteOrderByNewToOld(orderBy, promoteDesc);
+      effectiveGroupBy = remapPromoteFieldListNewToOld(groupBy, promoteDesc);
+    }
+
+    final schemas = <String, TableSchema>{tableName: schema};
+    if (condition != null && !condition.isEmpty) {
+      if (joins != null && joins.isNotEmpty) {
+        for (final join in joins) {
+          final joinSchema =
+              await schemaMgr.getTableSchemaByName(TableName(join.table));
+          if (joinSchema != null) {
+            schemas[join.table] = joinSchema;
+          }
+        }
+      }
+      condition.normalize(schemas, tableName);
+    }
+
+    Map<String, dynamic>? where = condition?.build();
+    if (where != null &&
+        where.isNotEmpty &&
+        joins != null &&
+        joins.isNotEmpty) {
+      // For JOIN queries, unprefixed fields are assumed to belong to the main table.
+      // This preserves existing QueryBuilder behavior while centralizing planning here.
+      where = _prefixMainTableForJoinWhere(table, where);
+    }
+
+    // Plan Cache lookup by structural shape
+    final shapeKey = QueryShapeKey.fromQuery(
+      tableUid: TableUid(tableUid),
+      condition: condition,
+      orderBy: effectiveOrderBy,
+      limit: limit,
+      offset: offset,
+      cursor: cursor,
+      onlyCount: onlyCount,
+      joins: joins,
+      aggregations: aggregations,
+      groupBy: effectiveGroupBy,
+    );
+
+    CompiledExecutionPlan? compiledPlan = _getCompiledPlan(shapeKey);
+    QueryPlan plan;
+
+    if (compiledPlan != null) {
+      switch (compiledPlan.routeType) {
+        case PlanRouteType.indexRangeScan:
+          plan = QueryPlan(
+            QueryOperation(
+              type: QueryOperationType.indexScan,
+              indexUid: compiledPlan.indexUid,
+              value: <String, dynamic>{
+                'table': table.tableUid,
+                'where': where,
+              },
+            ),
+            naturalOrderBy: compiledPlan.naturalOrderBy,
+          );
+          break;
+        case PlanRouteType.tableScan:
+          plan = QueryPlan(
+            QueryOperation(
+              type: QueryOperationType.tableScan,
+              value: <String, dynamic>{
+                'table': table.tableUid,
+                'where': where,
+              },
+            ),
+            naturalOrderBy: compiledPlan.naturalOrderBy,
+          );
+          break;
+        case PlanRouteType.unionScan:
+        case PlanRouteType.primaryKeyPoint:
+        case PlanRouteType.uniqueIndexPoint:
+          final optimizer = _dataStore.getQueryOptimizer();
+          if (optimizer == null) {
+            if (!_dataStore.isInitialized) return ExecuteResult.empty();
+            throw DbException([
+              GeneralStatus(
+                type: ResultType.engError,
+                message: 'Query optimizer not initialized',
+              )
+            ]);
+          }
+          plan = await optimizer.optimize(
+            table,
+            where,
+            orderBy: effectiveOrderBy,
+            limit: limit,
+            offset: offset,
+          );
+          break;
+      }
+    } else {
+      final optimizer = _dataStore.getQueryOptimizer();
+      if (optimizer == null) {
+        if (!_dataStore.isInitialized) return ExecuteResult.empty();
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.engError,
+            message: 'Query optimizer not initialized',
+          )
+        ]);
+      }
+
+      plan = await optimizer.optimize(
+        table,
+        where,
+        orderBy: effectiveOrderBy,
+        limit: limit,
+        offset: offset,
+      );
+
+      // Cache the compiled plan
+      final PlanRouteType routeType;
+      switch (plan.operation.type) {
+        case QueryOperationType.indexScan:
+          routeType = PlanRouteType.indexRangeScan;
+          break;
+        case QueryOperationType.union:
+          routeType = PlanRouteType.unionScan;
+          break;
+        case QueryOperationType.tableScan:
+          routeType = PlanRouteType.tableScan;
+          break;
+      }
+
+      compiledPlan = CompiledExecutionPlan(
+        routeType: routeType,
+        tableUid: TableUid(tableUid),
+        indexUid: plan.operation.indexUid,
+        naturalOrderBy: plan.naturalOrderBy,
+        rawPlan: plan,
+      );
+      _putCompiledPlan(shapeKey, compiledPlan);
+    }
+
+    final result = await _executeWithPlan(
+      plan,
+      table,
+      schemas: schemas,
+      condition: condition,
+      where: where,
+      orderBy: effectiveOrderBy,
+      limit: limit,
+      offset: offset,
+      cursor: cursor,
+      joins: joins,
+      enableQueryCache: false, // Handled at top-level Result Cache
+      queryCacheExpiry: queryCacheExpiry,
+      onlyCount: onlyCount,
+      aggregations: aggregations,
+      groupBy: effectiveGroupBy,
+      readFromFileOnly: readFromFileOnly,
+      engineInternal: engineInternal,
+      selectedFields: selectedFields,
+    );
+
+    if (promoteDesc != null &&
+        applyPromoteResultTransform &&
+        !onlyCount &&
+        result.records.isNotEmpty) {
+      final yieldController = YieldController(
+        'QueryExecutor.promoteResultTransform',
+        checkInterval: 64,
+      );
+      for (final row in result.records) {
+        final y1 = yieldController.maybeYield();
+        if (y1 != null) await y1;
+        transformPromoteOldToNewInPlace(row, promoteDesc);
+      }
+    }
+
+    if (resultCacheKey != null && resultCacheStartGen != null) {
+      final currentGen = _getTableQueryGeneration(resultCacheKey.tableUid);
+      // Optimistic generation verification: only cache if the table has NOT mutated
+      // during the query execution time window (prevents stale result cache write).
+      if (currentGen == resultCacheStartGen && result.records.length <= 500) {
+        final maxBytes = _queryCache.maxByteThreshold;
+        if (_shouldCacheQueryResults(result.records, maxBytes: maxBytes)) {
+          final copied = _copyResultList(result.records);
+          final size = _estimateQueryResultSizeBytes(copied);
+          final entry = QueryResultCacheEntry(
+            records: copied,
+            nextCursor: result.nextCursor,
+            prevCursor: result.prevCursor,
+            hasMore: result.hasMore,
+            hasPrev: result.hasPrev,
+            count: result.count,
+            aggregateResult: result.aggregateResult,
+            createdAt: DateTime.now(),
+            expiry: queryCacheExpiry,
+            sizeBytes: size,
+          );
+          _queryCache.putPoint3(
+            resultCacheKey.tableUid.value,
+            resultCacheStartGen,
+            resultCacheKey.toString(),
+            entry,
+            size: size,
+          );
+        }
+      }
+    }
+
+    return result;
+  }
+
+  IndexSchema? findFastUniqueIndex(TableSchema schema, String fieldName) {
+    final cached = _dataStore.tableMetaManager
+        ?.findSingleFieldUniqueIndex(schema, fieldName);
+    if (cached != null) return cached;
+    for (final idx in schema.getAllIndexes()) {
+      if (idx.unique &&
+          idx.fields.length == 1 &&
+          idx.fields.first == fieldName) {
+        return idx;
+      }
+    }
+    return null;
+  }
+
+  /// Prefix unqualified where-clause fields with main table name for JOIN queries.
+  Map<String, dynamic> _prefixMainTableForJoinWhere(
+    TableContext table,
+    Map<String, dynamic> conditions,
+  ) {
+    final mainTableName = table.tableName;
+    Map<String, dynamic> convert(Map<String, dynamic> node) {
+      final out = <String, dynamic>{};
+      for (final entry in node.entries) {
+        final k = entry.key;
+        final v = entry.value;
+        if (k == 'OR' || k == 'AND') {
+          if (v is List) {
+            final converted = <Map<String, dynamic>>[];
+            for (final it in v) {
+              if (it is Map<String, dynamic>) {
+                converted.add(convert(it));
+              }
+            }
+            out[k] = converted;
+          } else {
+            out[k] = v;
+          }
+          continue;
+        }
+
+        if (k.contains('.')) {
+          out[k] = v;
+          continue;
+        }
+
+        // Default: apply to main table.
+        out['$mainTableName.$k'] = v;
+      }
+      return out;
+    }
+
+    return convert(conditions);
+  }
+
+  /// Extract a main-table-only condition tree for pre-JOIN scanning.
+  ///
+  /// This function is intentionally **superset-preserving** for JOIN queries:
+  /// predicates that reference other tables are rewritten to `TRUE` (empty map)
+  /// so we won't accidentally drop records that could match after JOIN.
+  Map<String, dynamic> _extractTableConditionTreeForExecution(
+    TableContext table,
+    Map<String, dynamic> node,
+  ) {
+    final mainTableName = table.tableName;
+    Map<String, dynamic> extract(Map<String, dynamic> n) {
+      final hasAnd = n.containsKey('AND') && n['AND'] is List;
+      final hasOr = n.containsKey('OR') && n['OR'] is List;
+
+      // Leaf predicates for this node (main table only).
+      final leaf = <String, dynamic>{};
+      for (final e in n.entries) {
+        final k = e.key;
+        if (k == 'AND' || k == 'OR') continue;
+        final v = e.value;
+
+        if (k.contains('.')) {
+          final parts = k.split('.');
+          if (parts.length == 2 && parts.first == mainTableName) {
+            leaf[parts.last] = v;
+          }
+          // Other-table predicate => ignored here (handled by post-join matcher).
+          continue;
+        }
+
+        // Unprefixed => main table.
+        leaf[k] = v;
+      }
+
+      if (hasOr) {
+        final outChildren = <Map<String, dynamic>>[];
+        final list = n['OR'] as List;
+        for (final c in list) {
+          if (c is! Map<String, dynamic>) continue;
+          final sub = extract(c);
+          // Any TRUE branch makes the whole OR TRUE (superset).
+          if (sub.isEmpty) return <String, dynamic>{};
+          outChildren.add(sub);
+        }
+
+        if (outChildren.isEmpty) {
+          // OR with no effective children: reduce to leaf.
+          return leaf;
+        }
+
+        final orNode =
+            (outChildren.length == 1) ? outChildren.first : {'OR': outChildren};
+        if (leaf.isEmpty) return orNode;
+        return {
+          'AND': <Map<String, dynamic>>[
+            orNode,
+            leaf,
+          ]
+        };
+      }
+
+      if (hasAnd) {
+        final outChildren = <Map<String, dynamic>>[];
+        final list = n['AND'] as List;
+        for (final c in list) {
+          if (c is! Map<String, dynamic>) continue;
+          final sub = extract(c);
+          // TRUE child does not constrain AND.
+          if (sub.isEmpty) continue;
+          outChildren.add(sub);
+        }
+        if (leaf.isNotEmpty) outChildren.add(leaf);
+        if (outChildren.isEmpty) return <String, dynamic>{};
+        if (outChildren.length == 1) return outChildren.first;
+        return <String, dynamic>{'AND': outChildren};
+      }
+
+      return leaf;
+    }
+
+    return extract(node);
+  }
+
+  Future<ExecuteResult> _executeWithPlan(
+    QueryPlan plan,
+    TableContext table, {
+    required Map<String, TableSchema> schemas,
+    QueryCondition? condition,
+    Map<String, dynamic>? where,
+    List<String>? orderBy,
+    int? limit,
+    int? offset,
+    String? cursor,
+    List<JoinClause>? joins,
+    bool enableQueryCache = false,
+    Duration? queryCacheExpiry,
+    bool onlyCount = false,
+    List<QueryAggregation>? aggregations,
+    List<String>? groupBy,
+    bool readFromFileOnly = false,
+    TableSchema? decodeSchema,
+    List<FieldStructure>? decodeFieldStructureOverride,
+    bool engineInternal = false,
+    List<String>? selectedFields,
+  }) async {
+    final tableName = table.tableName;
+    try {
+      // Cursor and offset are mutually exclusive at the API level.
+      // We implicitly use cursor mode if no token is provided but offset is 0/null.
+      final bool hasToken = cursor != null && cursor.trim().isNotEmpty;
+      final bool isCursorIntent = hasToken || (offset == null || offset <= 0);
+
+      bool useCursor = engineInternal ? false : isCursorIntent;
+
+      if (useCursor && offset != null && offset > 0) {
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidCursorPagination,
+            message:
+                'Cursor pagination and offset are mutually exclusive. Use cursor() or offset(), not both.',
+            parameterName: 'offset',
+            passedValue: {'cursor': cursor, 'offset': offset},
+          ),
+        ]);
+      }
+
+      if (useCursor) {
+        bool supported = true;
+        String? reason;
+
+        // JOIN constraint: only allow sorting by main table fields
+        if (joins != null && joins.isNotEmpty) {
+          if (orderBy != null && orderBy.isNotEmpty) {
+            for (final f in orderBy) {
+              final field = f.startsWith('-') ? f.substring(1) : f;
+              if (field.contains('.') && !field.startsWith('$tableName.')) {
+                supported = false;
+                reason =
+                    'Cursor pagination with JOIN only supports ordering by main table fields.';
+                break;
+              }
+            }
+          }
+        }
+
+        if (!supported) {
+          if (hasToken) {
+            throw DbException([
+              GeneralStatus(
+                type: ResultType.devInvalidCursorPagination,
+                message: reason ??
+                    'Cursor pagination is not supported for this query type.',
+              ),
+            ]);
+          } else {
+            useCursor = false;
+          }
+        }
+      }
+
+      final bool hasCursor = useCursor;
+
+      // Apply global pagination safety defaults (configurable).
+      int effectiveOffset = hasCursor ? 0 : (offset ?? 0);
+      if (effectiveOffset < 0) effectiveOffset = 0;
+      final int maxOffset = _dataStore.config.maxQueryOffset;
+      if (maxOffset > 0 && effectiveOffset > maxOffset && !hasCursor) {
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidArgumentFormat,
+            message:
+                'Query offset ($effectiveOffset) exceeds maxQueryOffset ($maxOffset). Use keyset pagination instead.',
+            parameterName: 'offset',
+            passedValue: effectiveOffset,
+          ),
+        ]);
+      }
+
+      bool isDefaultLimitApplied = false;
+      int? effectiveLimit;
+
+      if (limit != null) {
+        effectiveLimit = limit;
+      } else {
+        if (aggregations != null && aggregations.isNotEmpty) {
+          // Aggregations (sum/avg/min/max) need all matching data for correct
+          // results. These are stream-computed and will not cause OOM.
+          effectiveLimit = null;
+        } else {
+          // Both normal queries and count() with conditions use defaultQueryLimit
+          // as a safety cap. count() without conditions already uses metadata
+          // (handled in QueryBuilder.count()) and never reaches this path.
+          final int defaultLimit = _dataStore.config.defaultQueryLimit;
+          if (defaultLimit <= 0) {
+            if (onlyCount) {
+              // count() is stream-computed (no record loading), safe without limit.
+              effectiveLimit = null;
+            } else {
+              // Safety: never allow unbounded reads in ultra-large datasets.
+              throw DbException([
+                GeneralStatus(
+                  type: ResultType.devInvalidArgumentFormat,
+                  message:
+                      'Unbounded queries are not allowed. Please specify .limit() or set DataStoreConfig.defaultQueryLimit (> 0).',
+                ),
+              ]);
+            }
+          } else {
+            effectiveLimit = defaultLimit;
+            isDefaultLimitApplied = true;
+          }
+        }
+      }
+
+      if (effectiveLimit != null && effectiveLimit <= 0) {
+        return const ExecuteResult.empty();
+      }
+
+      // Fetch one extra record to detect whether there are more results.
+      // This is valuable even when cursor pagination is not supported, so the caller
+      // can still know if there is another page beyond [limit].
+      // Engine-internal callers (delete/update) never need pagination probes.
+      final int? fetchLimit = engineInternal
+          ? effectiveLimit
+          : (effectiveLimit != null ? effectiveLimit + 1 : null);
+
+      final stopwatch = Stopwatch()..start();
+      final schema = schemas[tableName]!;
+      ConditionRecordMatcher? matcher;
+      ConditionRecordMatcher? postJoinMatcher;
+
+      // Decode + validate cursor against the user-facing query identity BEFORE any
+      // internal orderBy stripping (count / unbounded aggregation optimizations).
+      final _QueryCursorToken? cursorToken =
+          cursor != null ? _QueryCursorToken.tryDecode(cursor) : null;
+      if (cursorToken != null) {
+        if (cursorToken.tableUid != schema.tableUid) {
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.devInvalidCursorTable,
+              message: 'Cursor does not match target table.',
+              parameterName: 'cursor',
+              passedValue: cursor,
+            ),
+          ]);
+        }
+
+        if (cursorToken.querySigHash != null) {
+          final currentSigHash = _buildQuerySignatureHash(
+            tableUid: schema.tableUid,
+            where: where,
+            orderBy: orderBy,
+            joins: joins,
+            groupBy: groupBy,
+            aggregations: aggregations,
+          );
+          // Compare as unsigned 32-bit bit-patterns (FNV hash is not a signed int).
+          if ((cursorToken.querySigHash! & 0xFFFFFFFF) !=
+              (currentSigHash & 0xFFFFFFFF)) {
+            throw DbException([
+              InvalidArgumentStatus(
+                type: ResultType.devInvalidCursorSignature,
+                message:
+                    'Mismatched cursor: The query conditions or sorting used for this cursor do not match the current query parameters.',
+                parameterName: 'cursor',
+                passedValue: cursor,
+              ),
+            ]);
+          }
+        }
+      }
+
+      // count() never needs ordering - stripping orderBy forces the fast PK-scan
+      // path (B+Tree Stream Scan) instead of the TopKHeap sorting path.
+      if (onlyCount) {
+        orderBy = null;
+      } else if ((aggregations != null && aggregations.isNotEmpty) &&
+          effectiveLimit == null &&
+          effectiveOffset == 0) {
+        // Unbounded aggregations without offsets are not affected by ordering.
+        orderBy = null;
+      }
+
+      if (condition != null && !condition.isEmpty) {
+        final fullMatcher =
+            ConditionRecordMatcher.prepare(condition, schemas, tableName);
+
+        // JOIN queries may include conditions on joined tables (e.g. users.age),
+        // which cannot be evaluated against the main-table records before JOIN.
+        // For correctness, use a main-table-only matcher for the base scan, and
+        // apply the full matcher after JOIN as a final filter.
+        if (joins != null && joins.isNotEmpty) {
+          final mainOnlyTree =
+              _extractTableConditionTreeForExecution(table, condition.build());
+          final mainOnlyCondition = QueryCondition.fromMap(mainOnlyTree);
+          // Values are already normalized in [condition], but running normalize again is safe.
+          mainOnlyCondition.normalize(schemas, tableName);
+          matcher = ConditionRecordMatcher.prepare(
+              mainOnlyCondition, schemas, tableName);
+          postJoinMatcher = fullMatcher;
+        } else {
+          matcher = fullMatcher;
+        }
+      }
+
+      // Determine cursor mode (for building next/prev cursors even on first page)
+      // Returns null if the query configuration does not support cursor-based pagination.
+      final bool effectiveIsBackward = cursorToken?.isBackward ?? false;
+      // Do NOT blindly default to PK ordering for index scans:
+      // - It disables index-key cursor pagination
+      // - It can trigger incorrect/inefficient execution paths for large datasets
+      final List<String> userOrderBy =
+          (orderBy != null && orderBy.isNotEmpty) ? orderBy : const <String>[];
+
+      List<String> effectiveOrderBy = userOrderBy;
+      if (effectiveOrderBy.isEmpty) {
+        final natural = plan.naturalOrderBy;
+        effectiveOrderBy = natural.isNotEmpty
+            ? natural
+            : _defaultOrderByForPlan(schema: schema, plan: plan);
+      }
+
+      // Backward fetch logic: reverse all orderBy directions to scan in opposite direction
+      if (effectiveIsBackward) {
+        final actualOrderBy = effectiveOrderBy;
+        effectiveOrderBy = actualOrderBy.map((f) {
+          final parsed = _parseSortField(f);
+          return parsed.descending ? parsed.field : '-${parsed.field}';
+        }).toList();
+      }
+
+      final _CursorMode? cursorMode = _determineCursorMode(
+        table: table,
+        schema: schema,
+        plan: plan,
+        orderBy: effectiveOrderBy,
+        cursorToken: cursorToken,
+      );
+
+      final planResult = await _executeQueryPlan(
+        plan,
+        table,
+        condition,
+        schemas,
+        matcher,
+        limit: onlyCount ? effectiveLimit : fetchLimit,
+        offset: effectiveOffset,
+        orderBy: effectiveOrderBy,
+        enableQueryCache: enableQueryCache,
+        queryCacheExpiry: queryCacheExpiry,
+        cursor: cursor,
+        cursorToken: cursorToken,
+        cursorMode: cursorMode,
+        onlyCount: onlyCount,
+        aggregations: aggregations,
+        groupBy: groupBy,
+        readFromFileOnly: readFromFileOnly,
+        decodeSchema: decodeSchema,
+        decodeFieldStructureOverride: decodeFieldStructureOverride,
+        selectedFields: selectedFields,
+      );
+
+      if (onlyCount) {
+        stopwatch.stop();
+        return ExecuteResult(
+          records: const [],
+          count: planResult.count ?? 0,
+          executionTimeMs: stopwatch.elapsedMilliseconds,
+        );
+      }
+
+      if (aggregations != null && aggregations.isNotEmpty) {
+        stopwatch.stop();
+        return ExecuteResult(
+          records: const [],
+          aggregateResult: planResult.aggregateResult,
+          executionTimeMs: stopwatch.elapsedMilliseconds,
+        );
+      }
+
+      var results = planResult.records;
+
+      // Manual Offset skip if not applied at lower level (e.g. table scans with matcher)
+      if (effectiveOffset > 0) {
+        if (results.length > effectiveOffset) {
+          results = results.sublist(effectiveOffset);
+        } else {
+          results = [];
+        }
+      }
+
+      // If joins are present, chain join operations
+      if (joins != null && joins.isNotEmpty) {
+        for (final join in joins) {
+          results = await _performJoin(
+            results,
+            join.table,
+            join.firstKey,
+            join.operator,
+            join.secondKey,
+            join.type.toString().split('.').last,
+            schemas,
+            table,
+            enableQueryCache: enableQueryCache,
+            limit: effectiveLimit,
+            offset: effectiveOffset,
+            queryCacheExpiry: queryCacheExpiry,
+          );
+        }
+
+        // Apply deferred predicates that reference joined tables.
+        if (postJoinMatcher != null && results.isNotEmpty) {
+          final filtered = <Map<String, dynamic>>[];
+          final yieldController =
+              YieldController('QueryExecutor._postJoinFilter');
+          for (final r in results) {
+            final y2 = yieldController.maybeYield();
+            if (y2 != null) await y2;
+            if (postJoinMatcher.matches(r)) {
+              filtered.add(r);
+            }
+          }
+          results = filtered;
+        }
+      }
+
+      // Final sort: single place after offset/joins, before limit truncation.
+      // Skip when the storage scan already returned records in [effectiveOrderBy]
+      // order. Re-sorting large PK-ordered pages was the delete-path regression
+      final bool needPostSort = effectiveOrderBy.isNotEmpty &&
+          results.length > 1 &&
+          ((joins != null && joins.isNotEmpty) ||
+              !_storageScanAlreadyOrdered(
+                plan: plan,
+                schema: schema,
+                effectiveOrderBy: effectiveOrderBy,
+                fetchLimit: fetchLimit,
+                where: where,
+              ));
+
+      if (needPostSort) {
+        // For index cursor mode, validate orderBy matches index key order.
+        if (cursorMode == _CursorMode.indexKey) {
+          _validateIndexOrderByForCursor(
+            table: table,
+            schema: schema,
+            plan: plan,
+            orderBy: effectiveOrderBy,
+          );
+        }
+        results = await _applySort(results, effectiveOrderBy, schemas, table);
+      }
+
+      // CRITICAL: Apply limit truncation BEFORE pagination status check.
+      // Buffer merging may have returned more records than needed, so we must truncate here.
+      // Always keep at most (limit+1) records for hasMore/hasPrev detection.
+      if (effectiveLimit != null) {
+        final int targetLimit = effectiveLimit + 1;
+        if (results.length > targetLimit) {
+          results.removeRange(targetLimit, results.length);
+        }
+
+        // If we reached the default limit and have extra records, warn the user about truncation.
+        if (isDefaultLimitApplied && results.length > effectiveLimit) {
+          Logger.info(
+            'Query results for table "$tableName" reached the default limit of $effectiveLimit. '
+            'Some records may have been truncated. To prevent memory issues with many records, '
+            'please explicitly call .limit() if you need more data.',
+          );
+        }
+      }
+
+      // Pagination status (internal use for cursor generation)
+      String? nextCursor;
+      String? prevCursor;
+      bool hasMore = false;
+      bool hasPrev = false;
+
+      if (effectiveIsBackward) {
+        // Backward scan: was there more "above" the cursor?
+        if (effectiveLimit != null) {
+          hasPrev = results.length > effectiveLimit;
+          if (hasPrev) {
+            results
+                .removeLast(); // Remove the extra record (furthest from cursor)
+          }
+        }
+
+        // Reverse results back to requested order (scan was reverse direction)
+        results = results.reversed.toList();
+        // If we came from a cursor, we know there's record forward.
+        hasMore = hasToken || (effectiveOffset > 0);
+      } else {
+        // Forward scan: was there more "below"?
+        if (effectiveLimit != null) {
+          hasMore = results.length > effectiveLimit;
+          if (hasMore) {
+            results.removeLast(); // Remove the extra record
+          }
+        }
+        hasPrev = hasToken || (effectiveOffset > 0);
+      }
+
+      // Build cursors if supported and records exist
+      if (cursorMode != null && results.isNotEmpty) {
+        final firstRec = results.first;
+        final lastRec = results.last;
+
+        try {
+          if (hasMore) {
+            nextCursor = _buildNextCursor(
+              mode: cursorMode,
+              table: table,
+              schema: schema,
+              plan: plan,
+              orderBy: orderBy,
+              lastRecord: lastRec,
+              where: where,
+              joins: joins,
+              groupBy: groupBy,
+              aggregations: aggregations,
+              isBackward: false,
+            );
+          }
+
+          if (hasPrev) {
+            prevCursor = _buildNextCursor(
+              mode: cursorMode,
+              table: table,
+              schema: schema,
+              plan: plan,
+              orderBy: orderBy,
+              lastRecord: firstRec,
+              where: where,
+              joins: joins,
+              groupBy: groupBy,
+              aggregations: aggregations,
+              isBackward: true,
+            );
+          }
+        } catch (e) {
+          if (hasCursor) rethrow;
+          Logger.debug('Implicit cursor building failed: $e');
+        }
+      }
+
+      // Single-table query tail normalization (user-facing API only):
+      // - remove internal/deleted-slot payload fields
+      // - fill missing schema fields with defaults
+      // - enforce user-defined schema field order
+      if (!engineInternal &&
+          (joins == null || joins.isEmpty) &&
+          results.isNotEmpty) {
+        final schemaMgr = _dataStore.tableMetaManager;
+        if (schemaMgr != null) {
+          results = List<Map<String, dynamic>>.generate(
+            results.length,
+            (i) => schemaMgr.normalizeRecordToSchema(schema, results[i]),
+            growable: false,
+          );
+        }
+      }
+
+      stopwatch.stop();
+
+      return ExecuteResult(
+        records: results,
+        nextCursor: nextCursor,
+        prevCursor: prevCursor,
+        hasMore: hasMore,
+        hasPrev: hasPrev,
+        executionTimeMs: stopwatch.elapsedMilliseconds,
+      );
+    } catch (e) {
+      if (e is! DbClosedException) {
+        Logger.error('query execution failed', rawError: e);
+      }
+      rethrow;
+    }
+  }
+
+  /// execute query plan
+  Future<PlanExecutionResult> _executeQueryPlan(
+    QueryPlan plan,
+    TableContext table,
+    QueryCondition? condition,
+    Map<String, TableSchema> schemas,
+    ConditionRecordMatcher? matcher, {
+    int? limit,
+    int? offset,
+    List<String>? orderBy,
+    bool enableQueryCache = false,
+    Duration? queryCacheExpiry,
+    String? cursor,
+    _QueryCursorToken? cursorToken,
+    _CursorMode? cursorMode,
+    bool onlyCount = false,
+    List<QueryAggregation>? aggregations,
+    List<String>? groupBy,
+    bool readFromFileOnly = false,
+    TableSchema? decodeSchema,
+    List<FieldStructure>? decodeFieldStructureOverride,
+    List<String>? selectedFields,
+  }) async {
+    final tableName = table.tableName;
+    final schema = decodeSchema ??
+        (table.schema.name.isNotEmpty
+            ? table.schema
+            : await _dataStore.tableMetaManager
+                ?.getTableSchema(table.tableUid));
+    if (schema == null) {
+      return PlanExecutionResult([], onlyCount ? 0 : null, null);
+    }
+
+    // Resolve once per query plan - never recompute in scan/batch loops.
+    final neededFields = resolveNeededFields(
+      selectedFields: selectedFields,
+      matcher: matcher,
+      primaryKey: schema.primaryKey,
+      orderBy: orderBy,
+      aggregations: aggregations,
+      groupBy: groupBy,
+    );
+
+    // For sort-key cursor mode, build a keyset filter that will be applied during
+    // base scan selection (and also used to pre-filter buffer inserts).
+    bool Function(Map<String, dynamic>)? cursorFilter;
+    if (cursorToken != null &&
+        cursorMode == _CursorMode.sortKey &&
+        cursorToken.mode == _CursorMode.sortKey) {
+      cursorFilter = _buildSortKeyCursorFilter(
+        table: table,
+        schema: schema,
+        schemas: schemas,
+        orderBy: orderBy ?? const <String>[],
+        cursorToken: cursorToken,
+      );
+    }
+
+    // Execute actual operation (range-partitioned IO; no full-table caching here)
+    // Capture snapshot for consistency (Local View)
+    final int? localViewId =
+        readFromFileOnly ? null : _dataStore.readViewManager.registerReadView();
+    try {
+      List<Map<String, dynamic>> results;
+      int? totalCount;
+      dynamic aggregateResult;
+      final operation = plan.operation;
+      switch (operation.type) {
+        case QueryOperationType.tableScan:
+          final String? startAfterPk = (cursorMode == _CursorMode.primaryKey &&
+                  cursorToken != null &&
+                  cursorToken.mode == _CursorMode.primaryKey)
+              ? cursorToken.primaryKey
+              : null;
+          final scanRes = await _performTableScan(
+            table,
+            matcher,
+            limit: limit,
+            offset: offset,
+            orderBy: orderBy,
+            startAfterPrimaryKey: startAfterPk,
+            filter: cursorFilter,
+            onlyCount: onlyCount,
+            aggregations: aggregations,
+            groupBy: groupBy,
+            readFromFileOnly: readFromFileOnly,
+            decodeSchema: decodeSchema,
+            decodeFieldStructureOverride: decodeFieldStructureOverride,
+            neededFields: neededFields,
+          );
+          results = scanRes.records;
+          totalCount = scanRes.count;
+          aggregateResult = scanRes.aggregateResult;
+          break;
+        case QueryOperationType.indexScan:
+          final opVal = operation.value;
+          final Map<String, dynamic> cond = (opVal is Map<String, dynamic> &&
+                  opVal['where'] is Map<String, dynamic>)
+              ? (opVal['where'] as Map<String, dynamic>)
+              : const <String, dynamic>{};
+          final Uint8List? startAfterIndexKey =
+              (cursorMode == _CursorMode.indexKey &&
+                      cursorToken != null &&
+                      cursorToken.mode == _CursorMode.indexKey)
+                  ? cursorToken.indexKey
+                  : null;
+          final bool reverse = _parseIndexOrderByForCursor(
+            schema: schemas[tableName]!,
+            plan: plan,
+            orderBy: orderBy,
+          );
+          final indexRes = await _performIndexScan(
+            table,
+            operation.indexUid!,
+            cond,
+            matcher,
+            limit: limit,
+            offset: offset,
+            orderBy: orderBy,
+            startAfterIndexKey: startAfterIndexKey,
+            reverse: reverse,
+            filter: cursorFilter,
+            onlyCount: onlyCount,
+            aggregations: aggregations,
+            groupBy: groupBy,
+            readFromFileOnly: readFromFileOnly,
+            decodeSchema: decodeSchema,
+            decodeFieldStructureOverride: decodeFieldStructureOverride,
+            neededFields: neededFields,
+          );
+          results = indexRes.records;
+          totalCount = indexRes.count;
+          aggregateResult = indexRes.aggregateResult;
+          break;
+        case QueryOperationType.union:
+          final opVal = operation.value;
+          final children = (opVal is Map<String, dynamic>)
+              ? (opVal['children'] as List?)
+              : null;
+          if (children == null || children.isEmpty) {
+            results = const [];
+            break;
+          }
+          final plans = <QueryPlan>[];
+          for (final c in children) {
+            if (c is QueryPlan) plans.add(c);
+          }
+          final Uint8List? startAfterIndexKey =
+              (cursorMode == _CursorMode.indexKey &&
+                      cursorToken != null &&
+                      cursorToken.mode == _CursorMode.indexKey)
+                  ? cursorToken.indexKey
+                  : null;
+          final String? startAfterPk = (cursorMode == _CursorMode.primaryKey &&
+                  cursorToken != null &&
+                  cursorToken.mode == _CursorMode.primaryKey)
+              ? cursorToken.primaryKey
+              : null;
+          final bool reverse = _parseIndexOrderByForCursor(
+            schema: schemas[tableName]!,
+            plan: plan,
+            orderBy: orderBy,
+          );
+
+          final unionRes = await _performUnionPlans(
+            table,
+            plans,
+            schemas,
+            limit: limit,
+            offset: offset,
+            orderBy: orderBy,
+            startAfterPrimaryKey: startAfterPk,
+            startAfterIndexKey: startAfterIndexKey,
+            reverse: reverse,
+            onlyCount: onlyCount,
+            aggregations: aggregations,
+            groupBy: groupBy,
+            readFromFileOnly: readFromFileOnly,
+            decodeSchema: decodeSchema,
+            decodeFieldStructureOverride: decodeFieldStructureOverride,
+            neededFields: neededFields,
+          );
+          results = unionRes.records;
+          totalCount = unionRes.count;
+          aggregateResult = unionRes.aggregateResult;
+          break;
+      }
+
+      if (onlyCount) {
+        // Counts already include pending/txn via table/index logical fusion.
+        return PlanExecutionResult(const [], totalCount ?? 0, null);
+      }
+
+      if (aggregations != null && aggregations.isNotEmpty) {
+        return PlanExecutionResult(const [], null, aggregateResult);
+      }
+
+      return PlanExecutionResult(results, totalCount, null);
+    } finally {
+      if (localViewId != null) {
+        _dataStore.readViewManager.releaseReadView(localViewId);
+      }
+    }
+  }
+
+  /// Execute a UNION plan (OR / DNF), de-duplicating by primary key.
+  ///
+  /// Each child plan is executed with its own predicate matcher so that range-partition
+  /// pruning remains effective even when the original query contains nested OR.
+  Future<TableScanResult> _performUnionPlans(
+    TableContext table,
+    List<QueryPlan> plans,
+    Map<String, TableSchema> schemas, {
+    int? limit,
+    int? offset,
+    List<String>? orderBy,
+    String? startAfterPrimaryKey,
+    Uint8List? startAfterIndexKey,
+    bool reverse = false,
+    bool onlyCount = false,
+    List<QueryAggregation>? aggregations,
+    List<String>? groupBy,
+    bool readFromFileOnly = false,
+    TableSchema? decodeSchema,
+    List<FieldStructure>? decodeFieldStructureOverride,
+    Set<String>? neededFields,
+  }) async {
+    final tableName = table.tableName;
+    final tblSchema = decodeSchema ??
+        schemas[tableName] ??
+        await _dataStore.tableMetaManager?.getTableSchema(table.tableUid);
+    if (tblSchema == null) {
+      return TableScanResult(records: const [], count: onlyCount ? 0 : null);
+    }
+
+    int effectiveOffset = offset ?? 0;
+    if (effectiveOffset < 0) effectiveOffset = 0;
+
+    final resultByPk = <String, Map<String, dynamic>>{};
+
+    // Execute UNION branches in parallel (I/O-bound). This significantly improves
+    // OR/DNF performance on large datasets with many branches.
+    final int maxIo = _dataStore.config.maxIoConcurrency > 0
+        ? _dataStore.config.maxIoConcurrency
+        : plans.length;
+    final int desiredConc = min(plans.length, max(1, maxIo));
+    final int capTok =
+        _dataStore.workloadScheduler.capacityTokens(WorkloadType.query);
+    final int needTok = (desiredConc * 3 + 9) ~/ 10; // ceil(desiredConc * 0.3)
+    final int requestTok = min(capTok, max(1, needTok));
+    final lease = await _dataStore.workloadScheduler.tryAcquire(
+      WorkloadType.query,
+      requestedTokens: requestTok,
+      minTokens: 1,
+      label: 'QueryExecutor._performUnionPlans',
+    );
+
+    try {
+      final int conc =
+          min(plans.length, min(desiredConc, lease?.asConcurrency(0.3) ?? 1));
+
+      final tasks = <Future<List<Map<String, dynamic>>> Function()>[
+        for (final p in plans)
+          () async {
+            final op = p.operation;
+
+            ConditionRecordMatcher? clauseMatcher;
+            Map<String, dynamic>? clauseWhere;
+            final v = op.value;
+            if (v is Map<String, dynamic>) {
+              final w = v['where'];
+              if (w is Map<String, dynamic> && w.isNotEmpty) {
+                clauseWhere = w;
+              }
+            }
+            if (clauseWhere != null) {
+              final qc = QueryCondition.fromMap(clauseWhere);
+              // Normalize values for correct matcher behavior and pruning logic downstream.
+              qc.normalize(schemas, tableName);
+              if (!qc.isEmpty) {
+                clauseMatcher =
+                    ConditionRecordMatcher.prepare(qc, schemas, tableName);
+              }
+            }
+
+            // Merge clause filter fields into the once-resolved projection set.
+            Set<String>? branchNeeded = neededFields;
+            if (neededFields != null &&
+                clauseMatcher != null &&
+                clauseMatcher.fields.isNotEmpty) {
+              var missing = false;
+              for (final f in clauseMatcher.fields) {
+                if (!neededFields.contains(f)) {
+                  missing = true;
+                  break;
+                }
+              }
+              if (missing) {
+                branchNeeded = {...neededFields, ...clauseMatcher.fields};
+              }
+            }
+
+            switch (op.type) {
+              case QueryOperationType.tableScan:
+                final scan = await _performTableScan(
+                  table,
+                  clauseMatcher,
+                  limit: limit,
+                  offset: 0,
+                  orderBy: orderBy,
+                  startAfterPrimaryKey: startAfterPrimaryKey,
+                  aggregations: null,
+                  groupBy: null,
+                  readFromFileOnly: readFromFileOnly,
+                  decodeSchema: decodeSchema,
+                  decodeFieldStructureOverride: decodeFieldStructureOverride,
+                  neededFields: branchNeeded,
+                );
+                return scan.records;
+              case QueryOperationType.indexScan:
+                final vv = op.value;
+                final Map<String, dynamic> cond = (vv is Map<String, dynamic> &&
+                            vv['where'] is Map<String, dynamic> ||
+                        vv is Map<String, dynamic> &&
+                            vv.containsKey(
+                                'OR')) // OR in index scan? unexpected but handle op.value correctly
+                    ? (vv['where'] ?? vv) as Map<String, dynamic>
+                    : const <String, dynamic>{};
+                return (await _performIndexScan(
+                  table,
+                  op.indexUid!,
+                  cond,
+                  clauseMatcher,
+                  limit: limit,
+                  offset: 0,
+                  orderBy: orderBy,
+                  startAfterIndexKey: startAfterIndexKey,
+                  reverse: reverse,
+                  onlyCount:
+                      false, // Must fetch records to deduplicate in UNION
+                  aggregations: aggregations,
+                  groupBy: groupBy,
+                  readFromFileOnly: readFromFileOnly,
+                  decodeSchema: decodeSchema,
+                  decodeFieldStructureOverride: decodeFieldStructureOverride,
+                  neededFields: branchNeeded,
+                ))
+                    .records;
+              case QueryOperationType.union:
+                final vv = op.value;
+                final children = (vv is Map<String, dynamic>)
+                    ? (vv['children'] as List?)
+                    : null;
+                if (children == null || children.isEmpty) {
+                  return const <Map<String, dynamic>>[];
+                }
+                final subPlans = <QueryPlan>[];
+                for (final c in children) {
+                  if (c is QueryPlan) subPlans.add(c);
+                }
+                if (subPlans.isEmpty) return const <Map<String, dynamic>>[];
+                return (await _performUnionPlans(table, subPlans, schemas,
+                        limit: limit,
+                        offset: 0,
+                        orderBy: orderBy,
+                        startAfterPrimaryKey: startAfterPrimaryKey,
+                        startAfterIndexKey: startAfterIndexKey,
+                        reverse: reverse,
+                        onlyCount:
+                            false, // Must fetch records to deduplicate in UNION
+                        aggregations: aggregations,
+                        groupBy: groupBy,
+                        readFromFileOnly: readFromFileOnly,
+                        decodeSchema: decodeSchema,
+                        decodeFieldStructureOverride:
+                            decodeFieldStructureOverride,
+                        neededFields: neededFields))
+                    .records;
+            }
+          },
+      ];
+
+      final branchResults =
+          await ParallelProcessor.execute<List<Map<String, dynamic>>>(
+        tasks,
+        concurrency: conc,
+        label: 'QueryExecutor._performUnionPlans',
+      );
+
+      final yieldController =
+          YieldController('QueryExecutor._performUnionPlans.merge');
+      for (final records in branchResults) {
+        final list = records ?? const <Map<String, dynamic>>[];
+        for (final r in list) {
+          final y4 = yieldController.maybeYield();
+          if (y4 != null) await y4;
+          final pk = r[tblSchema.primaryKey]?.toString();
+          if (pk == null || pk.isEmpty) continue;
+          resultByPk[pk] = r;
+        }
+      }
+    } finally {
+      lease?.release();
+    }
+
+    var out = resultByPk.values.toList(growable: true);
+
+    // Preserve deterministic default order (PK asc) when caller didn't specify orderBy.
+    if (orderBy == null || orderBy.isEmpty) {
+      final pk = tblSchema.primaryKey;
+      out =
+          await ValueMatcher.sortMapList(out, [pk], [true], schemas, tableName);
+    }
+
+    if (onlyCount) {
+      int finalCount = out.length;
+      if (offset != null && offset > 0) {
+        finalCount = max(0, finalCount - offset);
+      }
+      return TableScanResult(
+        records: const [],
+        count: finalCount,
+      );
+    }
+
+    if (aggregations != null && aggregations.isNotEmpty) {
+      final aggRes =
+          await _dataStore.tableDataManager.calculateAggregateResultBatch(
+        out,
+        aggregations,
+        groupBy: groupBy,
+      );
+      return TableScanResult(records: const [], aggregateResult: aggRes);
+    }
+
+    // 4. Apply manual offset/limit if needed.
+    // Since UNION branches can overlap, the actual total count retrieved might exceed limit.
+    if (effectiveOffset > 0) {
+      if (effectiveOffset >= out.length) {
+        return TableScanResult(records: const []);
+      }
+      out = out.sublist(effectiveOffset);
+    }
+    if (limit != null && out.length > limit) {
+      out = out.sublist(0, limit);
+    }
+
+    return TableScanResult(
+      records: out,
+    );
+  }
+
+  /// Execute table join operation
+  Future<List<Map<String, dynamic>>> _performJoin(
+      List<Map<String, dynamic>> leftRecords,
+      String rightTableName,
+      String leftKey,
+      String operator,
+      String rightKey,
+      String joinType,
+      Map<String, TableSchema> schemas,
+      TableContext mainTable,
+      {bool enableQueryCache = false,
+      int? limit,
+      int? offset,
+      Duration? queryCacheExpiry}) async {
+    // Optimization: Instead of a full table scan, collect join keys from the left
+    // records and perform a selective query on the right table.
+    final leftKeyName =
+        leftKey.contains('.') ? leftKey.split('.').last : leftKey;
+
+    final leftJoinKeys = <dynamic>{};
+    final yieldControllerKeys =
+        YieldController('QueryExecutor._performJoin.keys');
+    for (final r in leftRecords) {
+      final y5 = yieldControllerKeys.maybeYield();
+      if (y5 != null) await y5;
+      final k = r[leftKeyName];
+      if (k != null) leftJoinKeys.add(k);
+    }
+
+    if (leftJoinKeys.isEmpty && joinType != 'right') {
+      // If there are no keys to join on, for INNER and LEFT joins,
+      // the result depends on the join type.
+      if (joinType == 'inner') {
+        return []; // No keys, so no matches possible.
+      }
+      if (joinType == 'left') {
+        // Return all left records with nulls for the right.
+        final rightSchema = schemas[rightTableName];
+        if (rightSchema == null) return leftRecords;
+        return leftRecords.map((leftRecord) {
+          final joinedRecord = Map<String, dynamic>.from(leftRecord);
+          for (var field in rightSchema.fields) {
+            joinedRecord['$rightTableName.${field.name}'] = null;
+          }
+          return joinedRecord;
+        }).toList();
+      }
+    }
+
+    final rightKeyName =
+        rightKey.contains('.') ? rightKey.split('.').last : rightKey;
+    List<Map<String, dynamic>> rightRecords;
+
+    // Real routing (dirIndex / isGlobal / uid) - never fabricate from schema alone.
+    TableContext rightTable;
+    try {
+      rightTable = await _dataStore.getTableContext(rightTableName);
+    } catch (_) {
+      return [];
+    }
+    final rightSchema = rightTable.schema;
+
+    if (leftJoinKeys.isNotEmpty) {
+      final rightTableCondition =
+          QueryCondition().where(rightKeyName, 'IN', leftJoinKeys.toList());
+      final rightMatcher = ConditionRecordMatcher.prepare(
+          rightTableCondition, {rightTableName: rightSchema}, rightTableName);
+      // Use optimizer + full single-table pipeline (with caches)
+      final rightPlan = await _dataStore
+          .getQueryOptimizer()
+          ?.optimize(rightTable, rightTableCondition.build());
+      if (rightPlan == null) {
+        return [];
+      }
+      final rightPlanResult = await _executeQueryPlan(rightPlan, rightTable,
+          rightTableCondition, {rightTableName: rightSchema}, rightMatcher,
+          enableQueryCache: enableQueryCache,
+          queryCacheExpiry: queryCacheExpiry);
+      rightRecords = rightPlanResult.records;
+    } else {
+      // LEFT keys empty (e.g., RIGHT JOIN needs full right scan): route through normal pipeline
+      final rightCondition = QueryCondition(); // full scan
+      final rightPlan = await _dataStore
+          .getQueryOptimizer()
+          ?.optimize(rightTable, rightCondition.build());
+      if (rightPlan != null) {
+        // Use full pipeline (with overlay application)
+        final rightPlanResult = await _executeQueryPlan(rightPlan, rightTable,
+            rightCondition, {rightTableName: rightSchema}, null,
+            enableQueryCache: enableQueryCache,
+            limit: limit,
+            offset: offset,
+            queryCacheExpiry: queryCacheExpiry);
+        rightRecords = rightPlanResult.records;
+      } else {
+        // Fallback: raw table scan
+        final int localViewId = _dataStore.readViewManager.registerReadView();
+        try {
+          final scanRes = await _performTableScan(rightTable, null);
+          rightRecords = scanRes.records;
+        } finally {
+          _dataStore.readViewManager.releaseReadView(localViewId);
+        }
+      }
+    }
+
+    // Get all records from the right table
+    final resultRecords = <Map<String, dynamic>>[];
+
+    // Determine left table name (main table name)
+    String leftTableName = mainTable.tableName;
+    if (leftKey.contains('.')) {
+      leftTableName = leftKey.split('.')[0];
+    }
+
+    // Pre-compiled matchers and accessors for performance
+    final leftFieldName =
+        leftKey.contains('.') ? leftKey.split('.').last : leftKey;
+    final leftSchema = ConditionRecordMatcher.getSchemaForField(
+        leftKey, schemas, mainTable.tableName);
+    final matcher = leftSchema != null
+        ? ValueMatcher.getMatcher(leftSchema.getFieldMatcherType(leftFieldName))
+        : ValueMatcher.getMatcher(MatcherType.unsupported);
+
+    // Closures to avoid repeated string parsing/key hunting in getFieldValue
+    leftValGetter(Map<String, dynamic> r) =>
+        ConditionRecordMatcher.getFieldValue(r, leftKey);
+    rightValGetter(Map<String, dynamic> r) =>
+        ConditionRecordMatcher.getFieldValue(r, rightKey);
+
+    final isEquality = operator == '=';
+
+    // Helper to canonicalize values for Hash Join (supports loose equality like int vs String)
+    dynamic canonicalizeKey(dynamic val) {
+      if (val == null) return null;
+      // Convert primitives to string to ensure 1 == "1" matches
+      if (val is num || val is String || val is bool) {
+        return val.toString();
+      }
+      return val;
+    }
+
+    // Build lookup table if equality join for O(N+M)
+    Map<dynamic, List<Map<String, dynamic>>>? rightLookup;
+    if (isEquality) {
+      rightLookup = {};
+      final yieldBuild =
+          YieldController('QueryExecutor._performJoin.rightLookup');
+      for (final rr in rightRecords) {
+        final y6 = yieldBuild.maybeYield();
+        if (y6 != null) await y6;
+        final val = rightValGetter(rr);
+        final key = canonicalizeKey(val);
+        rightLookup.putIfAbsent(key, () => []).add(rr);
+      }
+    }
+
+    // Helper to merge records
+    void mergeAndAdd(
+        Map<String, dynamic> left, Map<String, dynamic> right, bool isInner) {
+      final joinedRecord = <String, dynamic>{};
+
+      // Process left table fields
+      for (var entry in left.entries) {
+        final key = entry.key;
+        if (key.contains('.')) {
+          joinedRecord[key] = entry.value;
+        } else if (leftTableName.isNotEmpty) {
+          joinedRecord['$leftTableName.$key'] = entry.value;
+        } else {
+          joinedRecord[key] = entry.value;
+        }
+      }
+
+      // Process right table fields
+      if (right.isNotEmpty) {
+        for (var entry in right.entries) {
+          joinedRecord['$rightTableName.${entry.key}'] = entry.value;
+        }
+      } else {
+        // Null right record (LEFT/RIGHT JOIN mismatch)
+        for (var field in (schemas[rightTableName]?.fields ?? [])) {
+          joinedRecord['$rightTableName.${field.name}'] = null;
+        }
+      }
+      resultRecords.add(joinedRecord);
+    }
+
+    final yieldController = YieldController('QueryExecutor._performJoin');
+
+    // Handle Join Logic
+    if (joinType == 'inner') {
+      for (final lr in leftRecords) {
+        final y7 = yieldController.maybeYield();
+        if (y7 != null) await y7;
+        final lVal = leftValGetter(lr);
+
+        if (isEquality && rightLookup != null) {
+          final lKey = canonicalizeKey(lVal);
+          final matches = rightLookup[lKey];
+          if (matches != null) {
+            for (final mr in matches) {
+              final y8 = yieldController.maybeYield();
+              if (y8 != null) await y8;
+              mergeAndAdd(lr, mr, true);
+            }
+          }
+        } else {
+          // Fallback to O(N*M) for non-equality or failed lookup
+          for (final rr in rightRecords) {
+            final y9 = yieldController.maybeYield();
+            if (y9 != null) await y9;
+            final rVal = rightValGetter(rr);
+            if (_evaluateJoinMatch(matcher, lVal, operator, rVal)) {
+              mergeAndAdd(lr, rr, true);
+            }
+          }
+        }
+      }
+    } else if (joinType == 'left') {
+      for (final lr in leftRecords) {
+        final y10 = yieldController.maybeYield();
+        if (y10 != null) await y10;
+        final lVal = leftValGetter(lr);
+        bool hasMatch = false;
+
+        if (isEquality && rightLookup != null) {
+          final lKey = canonicalizeKey(lVal);
+          final matches = rightLookup[lKey];
+          if (matches != null) {
+            hasMatch = true;
+            for (final mr in matches) {
+              mergeAndAdd(lr, mr, false);
+            }
+          }
+        } else {
+          for (final rr in rightRecords) {
+            final y11 = yieldController.maybeYield();
+            if (y11 != null) await y11;
+            final rVal = rightValGetter(rr);
+            if (_evaluateJoinMatch(matcher, lVal, operator, rVal)) {
+              hasMatch = true;
+              mergeAndAdd(lr, rr, false);
+            }
+          }
+        }
+
+        if (!hasMatch) {
+          // Left record with null right record
+          mergeAndAdd(lr, const {}, false);
+        }
+      }
+    } else if (joinType == 'right') {
+      // Build left lookup for right join equality
+      Map<dynamic, List<Map<String, dynamic>>>? leftLookupMap;
+      if (isEquality) {
+        leftLookupMap = {};
+        for (final lr in leftRecords) {
+          final y12 = yieldController.maybeYield();
+          if (y12 != null) await y12;
+          final val = leftValGetter(lr);
+          final key = canonicalizeKey(val);
+          leftLookupMap.putIfAbsent(key, () => []).add(lr);
+        }
+      }
+
+      for (final rr in rightRecords) {
+        final y13 = yieldController.maybeYield();
+        if (y13 != null) await y13;
+        final rVal = rightValGetter(rr);
+        bool hasMatch = false;
+
+        if (isEquality && leftLookupMap != null) {
+          final rKey = canonicalizeKey(rVal);
+          final matches = leftLookupMap[rKey];
+          if (matches != null) {
+            hasMatch = true;
+            for (final ml in matches) {
+              final y14 = yieldController.maybeYield();
+              if (y14 != null) await y14;
+              mergeAndAdd(ml, rr, false);
+            }
+          }
+        } else {
+          for (final lr in leftRecords) {
+            final y15 = yieldController.maybeYield();
+            if (y15 != null) await y15;
+            final lVal = leftValGetter(lr);
+            if (_evaluateJoinMatch(matcher, lVal, operator, rVal)) {
+              hasMatch = true;
+              mergeAndAdd(lr, rr, false);
+            }
+          }
+        }
+
+        if (!hasMatch) {
+          _mergeRightWithNullLeft(rr, rightTableName, leftTableName,
+              schemas[leftTableName], resultRecords);
+        }
+      }
+    }
+
+    return resultRecords;
+  }
+
+  void _mergeRightWithNullLeft(
+      Map<String, dynamic> right,
+      String rightTableName,
+      String leftTableName,
+      TableSchema? leftSchema,
+      List<Map<String, dynamic>> target) {
+    final joinedRecord = <String, dynamic>{};
+    if (leftSchema != null) {
+      for (var f in leftSchema.fields) {
+        joinedRecord['$leftTableName.${f.name}'] = null;
+      }
+    }
+    for (var entry in right.entries) {
+      joinedRecord['$rightTableName.${entry.key}'] = entry.value;
+    }
+    target.add(joinedRecord);
+  }
+
+  bool _evaluateJoinMatch(MatcherFunction matcher, dynamic leftVal,
+      String operator, dynamic rightVal) {
+    if (leftVal == null || rightVal == null) {
+      if (operator == '=') return leftVal == rightVal;
+      if (operator == '!=' || operator == '<>') return leftVal != rightVal;
+      return false;
+    }
+    final comparison = matcher(leftVal, rightVal);
+    switch (operator) {
+      case '=':
+        return comparison == 0;
+      case '<':
+        return comparison < 0;
+      case '>':
+        return comparison > 0;
+      case '<=':
+        return comparison <= 0;
+      case '>=':
+        return comparison >= 0;
+      case '!=':
+      case '<>':
+        return comparison != 0;
+      default:
+        return false;
+    }
+  }
+
+  /// Perform table scan using the range-partition manager (incremental-first,
+  /// footer + sparse index + binaryfuse filter + grouped IO) to avoid read amplification.
+  ///
+  /// Note: full-table caching and leader/wait synchronization have been intentionally
+  /// retired in favor of precise range-partition reads + default limits to avoid
+  /// read amplification and cross-query blocking.
+  Future<TableScanResult> _performTableScan(
+    TableContext table,
+    ConditionRecordMatcher? matcher, {
+    int? limit,
+    int? offset,
+    List<String>? orderBy,
+    String? startAfterPrimaryKey,
+    bool Function(Map<String, dynamic>)? filter,
+    bool onlyCount = false,
+    List<QueryAggregation>? aggregations,
+    List<String>? groupBy,
+    bool readFromFileOnly = false,
+    TableSchema? decodeSchema,
+    List<FieldStructure>? decodeFieldStructureOverride,
+    Set<String>? neededFields,
+  }) async {
+    try {
+      return await _dataStore.tableDataManager.searchTableData(
+        table,
+        matcher,
+        limit: limit,
+        offset: offset,
+        orderBy: orderBy,
+        startAfterPrimaryKey: startAfterPrimaryKey,
+        filter: filter,
+        onlyCount: onlyCount,
+        aggregations: aggregations,
+        groupBy: groupBy,
+        readFromFileOnly: readFromFileOnly,
+        decodeSchema: decodeSchema,
+        decodeFieldStructureOverride: decodeFieldStructureOverride,
+        neededFields: neededFields,
+      );
+    } catch (e) {
+      if (e is DbClosedException) {
+        return TableScanResult(records: []);
+      }
+      Logger.error('Table scan failed', rawError: e);
+      return TableScanResult(records: []);
+    }
+  }
+
+  bool _isPrefixLikePattern(String pattern) {
+    return ValueMatcher.isOptimizablePrefixLikePattern(pattern);
+  }
+
+  IndexFieldCondition? _parseIndexFieldCondition(String field, dynamic raw) {
+    if (raw == null) return null;
+
+    if (raw is! Map<String, dynamic>) {
+      return IndexFieldCondition(field: field, operator: '=', value: raw);
+    }
+
+    if (raw.containsKey('=')) {
+      return IndexFieldCondition(field: field, operator: '=', value: raw['=']);
+    }
+
+    if (raw.containsKey('IN')) {
+      final value = raw['IN'];
+      if (value is List && value.isNotEmpty) {
+        return IndexFieldCondition(field: field, operator: 'IN', value: value);
+      }
+      return null;
+    }
+
+    if (raw.containsKey('BETWEEN')) {
+      final value = raw['BETWEEN'];
+      if (value is List && value.length == 2) {
+        return IndexFieldCondition(
+          field: field,
+          operator: 'BETWEEN',
+          value: value[0],
+          endValue: value[1],
+        );
+      }
+      if (value is Map<String, dynamic>) {
+        return IndexFieldCondition(
+          field: field,
+          operator: 'BETWEEN',
+          value: value['start'],
+          endValue: value['end'],
+        );
+      }
+      return null;
+    }
+
+    for (final op in const ['>', '>=', '<', '<=']) {
+      if (raw.containsKey(op)) {
+        return IndexFieldCondition(field: field, operator: op, value: raw[op]);
+      }
+    }
+
+    final likePattern = raw['LIKE'] ?? raw['like'];
+    if (likePattern is String && _isPrefixLikePattern(likePattern)) {
+      return IndexFieldCondition(
+        field: field,
+        operator: 'LIKE',
+        value: likePattern,
+      );
+    }
+
+    return null;
+  }
+
+  IndexCondition? _buildIndexConditionForSchema(
+    IndexSchema? indexSchema,
+    IndexUid indexUid,
+    Map<String, dynamic> conditions,
+  ) {
+    if (indexSchema == null || indexSchema.fields.isEmpty) {
+      final legacyName = indexUid.value;
+      if (legacyName.startsWith('uniq_') && legacyName.length > 5) {
+        final fieldName = legacyName.substring(5);
+        if (!conditions.containsKey(fieldName)) return null;
+        final raw = conditions[fieldName];
+        if (raw is Map<String, dynamic>) {
+          final likePattern = raw['LIKE'] ?? raw['like'];
+          if (likePattern is String) {
+            return IndexCondition.like(likePattern);
+          }
+          return IndexCondition.fromMap(raw);
+        }
+        return IndexCondition.equals(raw);
+      }
+      return null;
+    }
+
+    if (indexSchema.fields.length == 1) {
+      final fieldName = indexSchema.fields.first;
+      if (!conditions.containsKey(fieldName)) return null;
+      final raw = conditions[fieldName];
+      if (raw is Map<String, dynamic>) {
+        final likePattern = raw['LIKE'] ?? raw['like'];
+        if (likePattern is String) {
+          return IndexCondition.like(likePattern);
+        }
+        return IndexCondition.fromMap(raw);
+      }
+      return IndexCondition.equals(raw);
+    }
+
+    final components = <IndexFieldCondition>[];
+    for (final field in indexSchema.fields) {
+      if (!conditions.containsKey(field)) {
+        break;
+      }
+      final parsed = _parseIndexFieldCondition(field, conditions[field]);
+      if (parsed == null) {
+        break;
+      }
+      components.add(parsed);
+
+      final op = parsed.operator.toUpperCase();
+      if (op != '=') {
+        break;
+      }
+    }
+
+    if (components.isEmpty) {
+      return null;
+    }
+
+    final allEquality = components.length == indexSchema.fields.length &&
+        components.every((c) => c.operator.toUpperCase() == '=');
+    if (allEquality) {
+      return IndexCondition.equals(
+        components.map((c) => c.value).toList(growable: false),
+      );
+    }
+
+    return IndexCondition.composite(components);
+  }
+
+  /// perform index scan
+  Future<TableScanResult> _performIndexScan(
+    TableContext table,
+    IndexUid indexUid,
+    Map<String, dynamic> conditions,
+    ConditionRecordMatcher? matcher, {
+    int? limit,
+    int? offset,
+    List<String>? orderBy,
+    Uint8List? startAfterIndexKey,
+    bool reverse = false,
+    bool Function(Map<String, dynamic>)? filter,
+    bool onlyCount = false,
+    List<QueryAggregation>? aggregations,
+    List<String>? groupBy,
+    bool readFromFileOnly = false,
+    TableSchema? decodeSchema,
+    List<FieldStructure>? decodeFieldStructureOverride,
+    Set<String>? neededFields,
+  }) async {
+    final tableName = table.tableName;
+    try {
+      final schema = decodeSchema ??
+          (table.schema.name.isNotEmpty
+              ? table.schema
+              : await _dataStore.tableMetaManager
+                  ?.getTableSchema(table.tableUid));
+      if (schema == null) {
+        return TableScanResult(records: const [], count: onlyCount ? 0 : null);
+      }
+
+      // Index uid from query plan is the stable engine identifier.
+      IndexSchema? indexSchema;
+      try {
+        final allIndexes =
+            _dataStore.tableMetaManager?.getAllIndexesFor(schema) ??
+                <IndexSchema>[];
+        indexSchema = allIndexes.firstWhere(
+          (idx) => idx.indexUid == indexUid,
+        );
+      } catch (_) {
+        indexSchema = null;
+      }
+
+      final IndexCondition? builtCondition = _buildIndexConditionForSchema(
+        indexSchema,
+        indexUid,
+        conditions,
+      );
+      final IndexCondition indexCondition = builtCondition ??
+          (indexSchema != null
+              ? IndexCondition.fromMap({'SCAN': true})
+              : (throw DbException([
+                  GeneralStatus(
+                    type: ResultType.devIndexNotFound,
+                    message: 'Index condition is not available for index scan.',
+                  ),
+                ])));
+
+      // use searchIndex to get pointers
+      // IMPORTANT: offset is applied by the final pagination step in QueryExecutor.
+      // Therefore, we must request at least (offset + limit) candidates here to avoid returning
+      // too few records for index-based pagination.
+      final int effectiveOffset = (offset == null || offset <= 0) ? 0 : offset;
+
+      // Safety: avoid unbounded index reads that can OOM on large tables.
+      // Higher-level executor applies default limits; if it doesn't, we fall back to a bounded table scan.
+      if (!onlyCount && limit == null) {
+        return await _performTableScan(table, matcher,
+            limit: limit,
+            offset: offset,
+            orderBy: orderBy,
+            filter: filter,
+            onlyCount: onlyCount,
+            aggregations: aggregations,
+            groupBy: groupBy,
+            readFromFileOnly: readFromFileOnly,
+            neededFields: neededFields);
+      }
+      if (!onlyCount && limit != null && limit <= 0) {
+        return TableScanResult(records: const []);
+      }
+
+      final targetNeed = effectiveOffset + (limit ?? 0);
+      if (!onlyCount && targetNeed <= 0) {
+        return TableScanResult(records: const []);
+      }
+
+      final tblSchema = schema;
+      final pkMatcher =
+          ValueMatcher.getMatcher(tblSchema.getPrimaryKeyMatcherType());
+      final matcherCondition = matcher?.condition.build();
+
+      // Decide whether the requested order can be produced directly by this index scan.
+      // If orderBy does NOT match this index, we must scan the full index range and keep
+      // only the topK (offset+limit) records in memory to guarantee correct ordering.
+      final List<String> ob = orderBy ?? const <String>[];
+      final bool hasOrderBy = ob.isNotEmpty;
+      bool orderByAligned = true;
+      // May flip when full-equality cover makes PK-only orderBy free via leaf order.
+      var effectiveReverse = reverse;
+      if (hasOrderBy) {
+        try {
+          final spec = _resolveIndexSpecForCursor(schema, indexUid);
+          final alignment = _resolveIndexOrderByAlignment(
+            schema: tblSchema,
+            indexFields: spec.fields,
+            isUnique: spec.isUnique,
+            orderBy: ob,
+            indexCondition: indexCondition,
+            callerReverse: reverse,
+          );
+          orderByAligned = alignment.aligned;
+          effectiveReverse = alignment.reverse;
+        } catch (_) {
+          orderByAligned = false;
+        }
+      }
+
+      final yieldController =
+          YieldController('QueryExecutor._performIndexScan');
+
+      // Hard guard against pathological non-progress loops.
+      const int maxLoops = 1000000;
+      // Index scan batch size for memory-efficient iteration, particularly useful when counting.
+      const int countBatchSize = 1000;
+
+      Uint8List? resumeKey = startAfterIndexKey;
+
+      // -------------------- Case A: orderBy aligns with index or no sort needed => streaming, can stop early --------------------
+      final aggregator = aggregations != null && aggregations.isNotEmpty
+          ? QueryAggregator(aggregations, groupBy: groupBy)
+          : null;
+      if ((onlyCount || (aggregations != null && aggregations.isNotEmpty)) ||
+          !hasOrderBy ||
+          orderByAligned) {
+        final out = <Map<String, dynamic>>[];
+        int outCount = 0;
+        int loops = 0;
+        // For onlyCount/aggregations: if targetNeed > 0, stop when count reaches it;
+        // if targetNeed <= 0, scan all matching records (unbounded).
+        bool shouldContinue() {
+          if (onlyCount) {
+            return targetNeed <= 0 || outCount < targetNeed;
+          }
+          if (aggregations != null && aggregations.isNotEmpty) {
+            return true; // aggregations always scan all
+          }
+          return out.length < targetNeed;
+        }
+
+        while (shouldContinue()) {
+          final y16 = yieldController.maybeYield();
+          if (y16 != null) await y16;
+          if (!_dataStore.isInitialized) break;
+
+          loops++;
+          if (loops > maxLoops) break;
+
+          final int remaining;
+          if (onlyCount) {
+            remaining = (targetNeed > 0)
+                ? min(countBatchSize, targetNeed - outCount)
+                : countBatchSize;
+          } else if (aggregations != null && aggregations.isNotEmpty) {
+            remaining = countBatchSize;
+          } else {
+            remaining = targetNeed - out.length;
+          }
+          final int batch =
+              remaining > countBatchSize ? countBatchSize : remaining;
+
+          final indexResults = await _indexManager.searchIndex(
+            table,
+            indexUid,
+            indexCondition,
+            limit: batch,
+            offset: null,
+            startAfterKey: resumeKey,
+            reverse: effectiveReverse,
+            orderBy: orderBy,
+            readFromFileOnly: readFromFileOnly,
+          );
+
+          if (indexResults.requiresTableScan) {
+            return await _performTableScan(table, matcher,
+                limit: limit,
+                offset: offset,
+                orderBy: orderBy,
+                filter: filter,
+                onlyCount: onlyCount,
+                aggregations: aggregations,
+                groupBy: groupBy,
+                readFromFileOnly: readFromFileOnly,
+                neededFields: neededFields);
+          }
+
+          final pks = indexResults.primaryKeys;
+          final lastKey = indexResults.lastKey;
+
+          // End reached: no more index entries to scan.
+          if ((pks.isEmpty) && (lastKey == null)) break;
+
+          // Index-Only Scan Optimization:
+          // If all fields required by the matcher are present in the index,
+          // we can bypass the full record fetch (table storage query) and
+          // match directly against the index key's decoded tuple.
+          final bool isIndexOnlyCoverage = onlyCount &&
+              indexResults.entries != null &&
+              indexSchema != null &&
+              (matcher == null ||
+                  (matcher.fields.isNotEmpty &&
+                      matcher.fields.every((f) =>
+                          indexSchema!.fields.contains(f) ||
+                          f == tblSchema.primaryKey)));
+
+          final recordByPk = <String, Map<String, dynamic>>{};
+          if (isIndexOnlyCoverage) {
+            final entries = indexResults.entries!;
+            final virtualRecords = <Map<String, dynamic>>[];
+            for (int i = 0; i < entries.length; i++) {
+              final entry = entries[i];
+              final pk = entry.primaryKey;
+
+              // Early break when target count reached
+              if (targetNeed > 0 && outCount >= targetNeed) break;
+
+              // Decode index key to get field values for matching
+              final decoded = MemComparableKey.decodeTuple(entry.keyBytes);
+              final virtualRec = <String, dynamic>{};
+              for (int j = 0; j < indexSchema.fields.length; j++) {
+                virtualRec[indexSchema.fields[j]] = decoded[j];
+              }
+              virtualRec[tblSchema.primaryKey] = pk;
+              virtualRecords.add(virtualRec);
+              recordByPk[pk] = virtualRec;
+            }
+
+            final matchedVirtualIndices = await _matchRecordIndicesIfNeeded(
+              schema: tblSchema,
+              table: table,
+              matcherCondition: matcherCondition,
+              records: virtualRecords,
+            );
+
+            if (matchedVirtualIndices != null) {
+              final matchedVirtualYieldController =
+                  YieldController('QueryExecutor._performIndexScan.virtual');
+              for (final matchedIndex in matchedVirtualIndices) {
+                final y17 = matchedVirtualYieldController.maybeYield();
+                if (y17 != null) await y17;
+                final virtualRec = virtualRecords[matchedIndex];
+                if (filter != null && !filter(virtualRec)) {
+                  continue;
+                }
+                outCount++;
+                if (targetNeed > 0 && outCount >= targetNeed) {
+                  break;
+                }
+              }
+            } else {
+              for (final virtualRec in virtualRecords) {
+                if (filter == null || filter(virtualRec)) {
+                  outCount++;
+                  if (targetNeed > 0 && outCount >= targetNeed) {
+                    break;
+                  }
+                }
+              }
+            }
+          } else {
+            final idxFields = indexSchema?.fields;
+            final bool isCoveredByIndexScan = matcher == null ||
+                (idxFields != null &&
+                    matcher.fields.isNotEmpty &&
+                    matcher.fields.every((f) =>
+                        idxFields.contains(f) || f == tblSchema.primaryKey) &&
+                    (matcherCondition == null ||
+                        !matcherCondition.containsKey('OR')));
+
+            final records = pks.isEmpty
+                ? const <Map<String, dynamic>>[]
+                : (await _dataStore.tableDataManager.queryRecordsBatch(
+                    table,
+                    pks,
+                    readFromFileOnly: readFromFileOnly,
+                    decodeSchema: decodeSchema,
+                    decodeFieldStructureOverride: decodeFieldStructureOverride,
+                    neededFields: neededFields,
+                  ))
+                    .records;
+
+            for (final r in records) {
+              final pk = r[tblSchema.primaryKey]?.toString();
+              if (pk != null && pk.isNotEmpty) {
+                recordByPk[pk] = r;
+              }
+            }
+
+            if (pks.isNotEmpty) {
+              if (isCoveredByIndexScan) {
+                for (final pk in pks) {
+                  if (onlyCount && targetNeed > 0 && outCount >= targetNeed) {
+                    break;
+                  }
+                  if (!(onlyCount ||
+                          (aggregations != null && aggregations.isNotEmpty)) &&
+                      out.length >= targetNeed) {
+                    break;
+                  }
+                  final rec = recordByPk[pk];
+                  if (rec == null) {
+                    continue;
+                  }
+                  if (filter != null && !filter(rec)) {
+                    continue;
+                  }
+                  if (onlyCount) {
+                    outCount++;
+                    if (targetNeed > 0 && outCount >= targetNeed) {
+                      break;
+                    }
+                  } else if (aggregator != null) {
+                    aggregator.accumulate(rec);
+                  } else {
+                    out.add(rec);
+                    if (out.length >= targetNeed) {
+                      break;
+                    }
+                  }
+                }
+              } else {
+                final candidateRecords = <Map<String, dynamic>>[];
+                for (final pk in pks) {
+                  if (onlyCount && targetNeed > 0 && outCount >= targetNeed) {
+                    break;
+                  }
+                  if (!(onlyCount ||
+                          (aggregations != null && aggregations.isNotEmpty)) &&
+                      out.length >= targetNeed) {
+                    break;
+                  }
+                  final rec = recordByPk[pk];
+                  if (rec == null) {
+                    continue;
+                  }
+                  candidateRecords.add(rec);
+                }
+
+                final matchedCandidateIndices =
+                    await _matchRecordIndicesIfNeeded(
+                  schema: tblSchema,
+                  table: table,
+                  matcherCondition: matcherCondition,
+                  records: candidateRecords,
+                );
+
+                if (matchedCandidateIndices != null) {
+                  final matchedCandidateYieldController = YieldController(
+                      'QueryExecutor._performIndexScan.candidates');
+                  for (final matchedIndex in matchedCandidateIndices) {
+                    final y18 = matchedCandidateYieldController.maybeYield();
+                    if (y18 != null) await y18;
+                    final rec = candidateRecords[matchedIndex];
+                    if (filter != null && !filter(rec)) {
+                      continue;
+                    }
+                    if (onlyCount) {
+                      outCount++;
+                      if (targetNeed > 0 && outCount >= targetNeed) {
+                        break;
+                      }
+                    } else if (aggregator != null) {
+                      aggregator.accumulate(rec);
+                    } else {
+                      out.add(rec);
+                      if (out.length >= targetNeed) {
+                        break;
+                      }
+                    }
+                  }
+                } else {
+                  for (final rec in candidateRecords) {
+                    if (filter != null && !filter(rec)) {
+                      continue;
+                    }
+                    if (onlyCount) {
+                      outCount++;
+                      if (targetNeed > 0 && outCount >= targetNeed) {
+                        break;
+                      }
+                    } else if (aggregator != null) {
+                      aggregator.accumulate(rec);
+                    } else {
+                      out.add(rec);
+                      if (out.length >= targetNeed) {
+                        break;
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          // Progress cursor.
+          if (lastKey != null && lastKey.isNotEmpty) {
+            if (resumeKey != null &&
+                resumeKey.isNotEmpty &&
+                MemComparableKey.compare(lastKey, resumeKey) == 0) {
+              break;
+            }
+            resumeKey = lastKey;
+          } else {
+            if (pks.isEmpty) break;
+            // Best-effort: compute a resume key from the last fetched record.
+            final lastPk = pks.last;
+            final lastRec = recordByPk[lastPk];
+            if (lastRec == null) break;
+            try {
+              final spec = _resolveIndexSpecForCursor(schema, indexUid);
+              final comps = <Uint8List>[];
+              final bool truncateText = !spec.isUnique;
+              for (final f in spec.fields) {
+                final v = lastRec[f];
+                final c = schema.encodeFieldComponentToMemComparable(
+                  f,
+                  v,
+                  truncateText: truncateText,
+                );
+                if (c == null) {
+                  throw DbException([
+                    InvalidArgumentStatus(
+                      type: ResultType.devIndexFieldMissing,
+                      message: 'Missing index field $f',
+                      parameterName: 'cursor',
+                      passedValue: f,
+                    )
+                  ]);
+                }
+                comps.add(c);
+              }
+              if (!spec.isUnique) {
+                comps.add(schema.encodePrimaryKeyComponent(lastPk));
+              }
+              final computed = MemComparableKey.encodeTuple(comps);
+              if (computed.isNotEmpty) {
+                resumeKey = computed;
+              } else {
+                break;
+              }
+            } catch (_) {
+              break;
+            }
+          }
+        }
+        if (onlyCount) {
+          int finalCount = outCount;
+          if (offset != null && offset > 0) {
+            finalCount = max(0, finalCount - offset);
+          }
+          return TableScanResult(
+            records: const [],
+            count: finalCount,
+          );
+        }
+        if (aggregations != null && aggregations.isNotEmpty) {
+          return TableScanResult(
+            records: const [],
+            aggregateResult: aggregator!.result,
+          );
+        }
+        return TableScanResult(records: out);
+      }
+
+      // -------------------- Case B: orderBy does NOT align with index => full scan + topK --------------------
+      // Parse orderBy into comparable fields and directions.
+      final sortFields = <String>[];
+      final sortDirections = <bool>[]; // true=ASC, false=DESC
+      for (final raw in ob) {
+        String f = raw.trim();
+        bool asc = true;
+        if (f.startsWith('-')) {
+          asc = false;
+          f = f.substring(1).trim();
+        } else if (f.toUpperCase().endsWith(' DESC')) {
+          asc = false;
+          f = f.substring(0, f.length - 5).trim();
+        } else if (f.toUpperCase().endsWith(' ASC')) {
+          asc = true;
+          f = f.substring(0, f.length - 4).trim();
+        }
+        sortFields.add(f);
+        sortDirections.add(asc);
+      }
+
+      // Pre-build matchers for topK compare (critical for performance).
+      final schemas = <String, TableSchema>{tableName: schema};
+      final orderMatchers = <MatcherFunction>[];
+      for (final f in sortFields) {
+        final s =
+            ConditionRecordMatcher.getSchemaForField(f, schemas, tableName);
+        final fieldName = f.contains('.') ? f.split('.').last : f;
+        orderMatchers.add(
+          ValueMatcher.getMatcher(
+              s?.getFieldMatcherType(fieldName) ?? MatcherType.unsupported),
+        );
+      }
+
+      int compareRecords(Map<String, dynamic> a, Map<String, dynamic> b) {
+        for (int i = 0; i < sortFields.length; i++) {
+          final f = sortFields[i];
+          final asc = sortDirections[i];
+          final matcherFn = orderMatchers[i];
+          final va = ConditionRecordMatcher.getFieldValue(a, f);
+          final vb = ConditionRecordMatcher.getFieldValue(b, f);
+          final c = matcherFn(va, vb);
+          if (c != 0) return asc ? c : -c;
+        }
+        // Stable tie-breaker: primary key ASC.
+        final ka = a[tblSchema.primaryKey];
+        final kb = b[tblSchema.primaryKey];
+        return pkMatcher(ka, kb);
+      }
+
+      final selector = TopKHeap<Map<String, dynamic>>(
+          k: onlyCount ? 1 : targetNeed, compare: compareRecords);
+      int fullOutCount = 0;
+
+      int loops = 0;
+      while (true) {
+        final y19 = yieldController.maybeYield();
+        if (y19 != null) await y19;
+        loops++;
+        if (loops > maxLoops) break;
+
+        final int batch = onlyCount ? countBatchSize : targetNeed;
+
+        final indexResults = await _indexManager.searchIndex(
+          table,
+          indexUid,
+          indexCondition,
+          limit: batch,
+          offset: null,
+          startAfterKey: resumeKey,
+          reverse: effectiveReverse,
+          orderBy: orderBy,
+          readFromFileOnly: readFromFileOnly,
+        );
+
+        if (indexResults.requiresTableScan) {
+          return await _performTableScan(table, matcher,
+              limit: limit,
+              offset: offset,
+              orderBy: orderBy,
+              filter: filter,
+              onlyCount: onlyCount,
+              aggregations: aggregations,
+              groupBy: groupBy,
+              readFromFileOnly: readFromFileOnly,
+              neededFields: neededFields);
+        }
+
+        final pks = indexResults.primaryKeys;
+        final lastKey = indexResults.lastKey;
+        if ((pks.isEmpty) && (lastKey == null)) break;
+
+        final idxFields = indexSchema?.fields;
+        final bool isCoveredByIndexScan = matcher == null ||
+            (idxFields != null &&
+                matcher.fields.isNotEmpty &&
+                matcher.fields.every((f) =>
+                    idxFields.contains(f) || f == tblSchema.primaryKey) &&
+                (matcherCondition == null ||
+                    !matcherCondition.containsKey('OR')));
+
+        final records = pks.isEmpty
+            ? const <Map<String, dynamic>>[]
+            : (await _dataStore.tableDataManager.queryRecordsBatch(
+                table,
+                pks,
+                readFromFileOnly: readFromFileOnly,
+                decodeSchema: decodeSchema,
+                decodeFieldStructureOverride: decodeFieldStructureOverride,
+                neededFields: neededFields,
+              ))
+                .records;
+
+        final recordByPk = <String, Map<String, dynamic>>{};
+        for (final r in records) {
+          final pk = r[tblSchema.primaryKey]?.toString();
+          if (pk != null && pk.isNotEmpty) {
+            recordByPk[pk] = r;
+          }
+        }
+
+        if (pks.isNotEmpty) {
+          if (isCoveredByIndexScan) {
+            for (final pk in pks) {
+              final rec = recordByPk[pk];
+              if (rec == null) continue;
+              if (filter != null && !filter(rec)) {
+                continue;
+              }
+              if (onlyCount) {
+                fullOutCount++;
+              } else {
+                selector.offer(rec);
+              }
+            }
+          } else {
+            final candidateRecords = <Map<String, dynamic>>[];
+            for (final pk in pks) {
+              final rec = recordByPk[pk];
+              if (rec == null) continue;
+              candidateRecords.add(rec);
+            }
+
+            final matchedCandidateIndices = await _matchRecordIndicesIfNeeded(
+              schema: tblSchema,
+              table: table,
+              matcherCondition: matcherCondition,
+              records: candidateRecords,
+            );
+
+            if (matchedCandidateIndices != null) {
+              final matchedCandidateYieldController = YieldController(
+                  'QueryExecutor._performIndexScan.topKCandidates');
+              for (final matchedIndex in matchedCandidateIndices) {
+                final y20 = matchedCandidateYieldController.maybeYield();
+                if (y20 != null) await y20;
+                final rec = candidateRecords[matchedIndex];
+                if (filter != null && !filter(rec)) {
+                  continue;
+                }
+                if (onlyCount) {
+                  fullOutCount++;
+                } else {
+                  selector.offer(rec);
+                }
+              }
+            } else {
+              for (final rec in candidateRecords) {
+                if (filter != null && !filter(rec)) {
+                  continue;
+                }
+                if (onlyCount) {
+                  fullOutCount++;
+                } else {
+                  selector.offer(rec);
+                }
+              }
+            }
+          }
+        }
+
+        if (lastKey != null && lastKey.isNotEmpty) {
+          if (resumeKey != null &&
+              resumeKey.isNotEmpty &&
+              MemComparableKey.compare(lastKey, resumeKey) == 0) {
+            break;
+          }
+          resumeKey = lastKey;
+        } else {
+          if (pks.isEmpty) break;
+          // Without lastKey we cannot reliably continue a full scan.
+          break;
+        }
+      }
+
+      if (onlyCount) {
+        int finalCount = fullOutCount;
+        if (offset != null && offset > 0) {
+          finalCount = max(0, finalCount - offset);
+        }
+        return TableScanResult(
+          records: const [],
+          count: finalCount,
+        );
+      }
+      return TableScanResult(
+        records: selector.toSortedList(),
+      );
+    } catch (e) {
+      if (e is DbClosedException) {
+        return TableScanResult(records: []);
+      }
+      Logger.error('Index scan failed', rawError: e);
+      return await _performTableScan(table, matcher,
+          limit: limit,
+          offset: offset,
+          orderBy: orderBy,
+          filter: filter,
+          onlyCount: onlyCount,
+          aggregations: aggregations,
+          groupBy: groupBy,
+          readFromFileOnly: readFromFileOnly,
+          neededFields: neededFields);
+    }
+  }
+
+  Future<List<int>?> _matchRecordIndicesIfNeeded({
+    required TableSchema schema,
+    required TableContext table,
+    required Map<String, dynamic>? matcherCondition,
+    required List<Map<String, dynamic>> records,
+  }) async {
+    if (records.isEmpty ||
+        matcherCondition == null ||
+        matcherCondition.isEmpty) {
+      return null;
+    }
+
+    final matchResult = await ConditionBatchMatcher.matchRecordIndices(
+      schema: schema,
+      table: table,
+      condition: matcherCondition,
+      records: records,
+      estimateRecordBytes: _dataStore.tableDataManager.resolveRecordSizeBytes,
+    );
+    return matchResult.matchedIndices;
+  }
+
+  /// apply sort
+  Future<List<Map<String, dynamic>>> _applySort(
+      List<Map<String, dynamic>> data,
+      List<String> orderBy,
+      Map<String, TableSchema> schemas,
+      TableContext table) async {
+    final tableName = table.tableName;
+    try {
+      if (data.isEmpty) return data;
+
+      // Create sort directions list with same length as orderBy, default all to ascending (true)
+      final List<bool> sortDirections = List.filled(orderBy.length, true);
+      final List<String> sortFields = List.filled(orderBy.length, '');
+
+      // Process possible sort direction information in orderBy
+      final yieldController = YieldController('QueryExecutor._applySort');
+      for (int i = 0; i < orderBy.length; i++) {
+        final y21 = yieldController.maybeYield();
+        if (y21 != null) await y21;
+        String field = orderBy[i];
+
+        // 1. Field with "-" prefix indicates descending order
+        if (field.startsWith('-')) {
+          sortFields[i] = field.substring(1); // Remove "-" symbol
+          sortDirections[i] = false; // Set to descending
+        }
+        // 2. Field with DESC/ASC suffix
+        else if (field.toUpperCase().endsWith(' DESC')) {
+          // Remove DESC and set sort direction to descending
+          sortFields[i] = field.substring(0, field.length - 5).trim();
+          sortDirections[i] = false;
+        } else if (field.toUpperCase().endsWith(' ASC')) {
+          // Remove ASC, keep ascending
+          sortFields[i] = field.substring(0, field.length - 4).trim();
+          sortDirections[i] = true;
+        } else {
+          // No special marker, use original field name, default ascending
+          sortFields[i] = field;
+        }
+      }
+
+      // Offload sorting to isolate
+      final y22 = yieldController.maybeYield(); // Keep the yield
+      if (y22 != null) await y22;
+      data = await ValueMatcher.sortMapList(
+          data, sortFields, sortDirections, schemas, tableName);
+      return data;
+    } catch (e) {
+      Logger.error('Sort failed', rawError: e);
+      throw DbException.wrap(
+        e,
+        fallbackType: ResultType.devInvalidArgumentFormat,
+        fallbackMessage: 'Error applying sort',
+      );
+    }
+  }
+
+  /// Parse a sort field string into its field name and direction.
+  ({String field, bool descending}) _parseSortField(String sortField) {
+    sortField = sortField.trim();
+    if (sortField.startsWith('-')) {
+      return (field: sortField.substring(1).trim(), descending: true);
+    }
+    final upper = sortField.toUpperCase();
+    if (upper.endsWith(' DESC')) {
+      return (
+        field: sortField.substring(0, sortField.length - 5).trim(),
+        descending: true
+      );
+    }
+    if (upper.endsWith(' ASC')) {
+      return (
+        field: sortField.substring(0, sortField.length - 4).trim(),
+        descending: false
+      );
+    }
+    return (field: sortField, descending: false);
+  }
+
+  String _normalizeCursorFieldName(String field) {
+    final f = field.trim();
+    final dot = f.lastIndexOf('.');
+    return dot == -1 ? f : f.substring(dot + 1);
+  }
+
+  /// Parse primary key order from orderBy list.
+  ({bool isPkOrder, bool reverse}) _parsePrimaryKeyOrder(
+      List<String>? orderBy, String primaryKey) {
+    bool isPkOrder = true;
+    bool reverse = false;
+    if (orderBy != null && orderBy.isNotEmpty) {
+      if (orderBy.length == 1) {
+        String f = orderBy[0];
+        final parsed = _parseSortField(f);
+        f = parsed.field;
+        final isDesc = parsed.descending;
+        final bareField = _normalizeCursorFieldName(f);
+        isPkOrder = (bareField == primaryKey);
+        reverse = isPkOrder && isDesc;
+      } else {
+        isPkOrder = false;
+      }
+    }
+    return (isPkOrder: isPkOrder, reverse: reverse);
+  }
+
+  /// Whether [indexCondition] fully equality-covers every field of a non-unique
+  /// index. In that case the leaf order inside the bucket is primary-key order
+  /// (ASC; DESC via reverse scan) -- free, no TopK.
+  bool _isFullEqualityIndexCover({
+    required List<String> indexFields,
+    required bool isUnique,
+    required IndexCondition condition,
+  }) {
+    if (isUnique || indexFields.isEmpty) return false;
+
+    final comps = condition.components;
+    if (comps == null || comps.isEmpty) {
+      // Compact form from [_buildIndexConditionForSchema]:
+      // - single-field: equals(value)
+      // - multi-field all-eq: equals([v1, v2, ...])
+      if (condition.operator.toUpperCase() != '=') return false;
+      if (indexFields.length == 1) return true;
+      final v = condition.value;
+      return v is List && v.length == indexFields.length;
+    }
+    if (comps.length != indexFields.length) return false;
+    for (int i = 0; i < comps.length; i++) {
+      if (comps[i].field != indexFields[i]) return false;
+      if (comps[i].operator.toUpperCase() != '=') return false;
+    }
+    return true;
+  }
+
+  /// Resolve whether [orderBy] can be satisfied by streaming this index scan.
+  ///
+  /// Special case (performance-critical): non-unique index + full equality cover
+  /// -> leaf order is (fields..., pk). Ordering by PK alone (or fields + PK) is
+  /// then aligned and must use Case A early-stop -- never Case B full-bucket TopK.
+  ({bool aligned, bool reverse}) _resolveIndexOrderByAlignment({
+    required TableSchema schema,
+    required List<String> indexFields,
+    required bool isUnique,
+    required List<String> orderBy,
+    required IndexCondition indexCondition,
+    required bool callerReverse,
+  }) {
+    if (orderBy.isEmpty) {
+      return (aligned: true, reverse: callerReverse);
+    }
+
+    final pkName = schema.primaryKey;
+    final parsed = <({String field, bool descending})>[];
+    for (final raw in orderBy) {
+      final p = _parseSortField(raw);
+      parsed.add((
+        field: _normalizeCursorFieldName(p.field),
+        descending: p.descending,
+      ));
+    }
+
+    // 1) Standard: orderBy is a prefix of index fields, uniform direction.
+    if (parsed.length <= indexFields.length) {
+      bool? firstDesc;
+      var prefixOk = true;
+      for (int i = 0; i < parsed.length; i++) {
+        if (parsed[i].field != indexFields[i]) {
+          prefixOk = false;
+          break;
+        }
+        if (i == 0) {
+          firstDesc = parsed[i].descending;
+        } else if (firstDesc != parsed[i].descending) {
+          prefixOk = false;
+          break;
+        }
+      }
+      if (prefixOk) {
+        return (
+          aligned: true,
+          reverse: firstDesc ?? callerReverse,
+        );
+      }
+    }
+
+    // 2) Full equality cover on non-unique index: PK leaf order is free.
+    final fullEq = _isFullEqualityIndexCover(
+      indexFields: indexFields,
+      isUnique: isUnique,
+      condition: indexCondition,
+    );
+    if (!fullEq) {
+      return (aligned: false, reverse: callerReverse);
+    }
+
+    // 2a) orderBy = PK only.
+    if (parsed.length == 1 && parsed[0].field == pkName) {
+      return (aligned: true, reverse: parsed[0].descending);
+    }
+
+    // 2b) orderBy = index fields... + trailing PK, uniform direction.
+    if (parsed.length == indexFields.length + 1 &&
+        parsed.last.field == pkName) {
+      final dir = parsed.first.descending;
+      for (int i = 0; i < indexFields.length; i++) {
+        if (parsed[i].field != indexFields[i]) {
+          return (aligned: false, reverse: callerReverse);
+        }
+        if (parsed[i].descending != dir) {
+          return (aligned: false, reverse: callerReverse);
+        }
+      }
+      if (parsed.last.descending != dir) {
+        return (aligned: false, reverse: callerReverse);
+      }
+      return (aligned: true, reverse: dir);
+    }
+
+    return (aligned: false, reverse: callerReverse);
+  }
+
+  /// Whether [_executeQueryPlan] / [TableDataManager.searchTableData] already
+  /// produced [effectiveOrderBy] ordering, so [_applySort] would be redundant.
+  ///
+  /// - [QueryOperationType.tableScan]: PK-ordered range scan, or bounded TopK
+  ///   for non-PK order (unbounded non-PK still defers sort to this layer).
+  /// - [QueryOperationType.indexScan]: aligned index-key stream order.
+  /// - [QueryOperationType.union]: branches merged by PK map -- not globally sorted.
+  bool _storageScanAlreadyOrdered({
+    required QueryPlan plan,
+    required TableSchema schema,
+    required List<String> effectiveOrderBy,
+    int? fetchLimit,
+    Map<String, dynamic>? where,
+  }) {
+    if (effectiveOrderBy.isEmpty) return true;
+
+    switch (plan.operation.type) {
+      case QueryOperationType.union:
+        return false;
+      case QueryOperationType.tableScan:
+        if (effectiveOrderBy.length == 1) {
+          final parsed = _parseSortField(effectiveOrderBy[0]);
+          final bare = parsed.field.contains('.')
+              ? parsed.field.split('.').last
+              : parsed.field;
+          if (bare == schema.primaryKey) return true;
+        }
+        // searchTableData: bounded non-PK uses TopK (sorted); unbounded relies on
+        // QueryExecutor._applySort (see table_data_manager.dart needCount <= 0 path).
+        return fetchLimit != null && fetchLimit > 0;
+      case QueryOperationType.indexScan:
+        final idxUid = plan.operation.indexUid;
+        if (idxUid == null || idxUid.isEmpty) return false;
+        try {
+          final spec = _resolveIndexSpecForCursor(schema, idxUid);
+          final idxSchema =
+              _dataStore.tableMetaManager?.findIndexSchemaByUid(schema, idxUid);
+          final indexCond = _buildIndexConditionForSchema(
+            idxSchema,
+            idxUid,
+            where ?? const <String, dynamic>{},
+          );
+          if (indexCond == null) return false;
+          final alignment = _resolveIndexOrderByAlignment(
+            schema: schema,
+            indexFields: spec.fields,
+            isUnique: idxSchema?.unique ?? false,
+            orderBy: effectiveOrderBy,
+            indexCondition: indexCond,
+            callerReverse: false,
+          );
+          return alignment.aligned;
+        } catch (_) {
+          return false;
+        }
+    }
+  }
+
+  /// Default ordering when caller does not provide [orderBy].
+  ///
+  /// IMPORTANT: If the plan is an INDEX SCAN, default to index-field order
+  /// instead of primary key order. This enables index-key cursor pagination
+  /// and avoids forcing expensive post-sorts on large datasets.
+  List<String> _defaultOrderByForPlan({
+    required TableSchema schema,
+    required QueryPlan plan,
+  }) {
+    final op = plan.operation;
+    if (op.type == QueryOperationType.indexScan) {
+      final idxUid = op.indexUid;
+      if (idxUid != null && idxUid.isNotEmpty) {
+        try {
+          final spec = _resolveIndexSpecForCursor(schema, idxUid);
+          if (spec.fields.isNotEmpty) {
+            return List<String>.from(spec.fields, growable: false);
+          }
+        } catch (_) {}
+      }
+    }
+    // UNION and TABLE SCAN default to PK ordering.
+    return <String>[schema.primaryKey];
+  }
+
+  /// Parse index orderBy to determine reverse flag for index cursor.
+  bool _parseIndexOrderByForCursor({
+    required TableSchema schema,
+    required QueryPlan plan,
+    required List<String>? orderBy,
+  }) {
+    if (orderBy == null || orderBy.isEmpty) return false;
+    final idxUid = plan.operation.indexUid;
+    if (idxUid == null) return false;
+    final idx =
+        _dataStore.tableMetaManager?.findIndexSchemaByUid(schema, idxUid);
+    if (idx == null) return false;
+    if (orderBy.length != idx.fields.length) return false;
+    // We assume validation has already passed and all fields have uniform direction.
+    final parsed = _parseSortField(orderBy[0]);
+    return parsed.descending;
+  }
+
+  /// User-facing index label for error/explain messages (never expose stable [IndexUid]).
+  String _indexDisplayLabel(TableSchema schema, IndexUid indexUid) {
+    if (indexUid.isEmpty) return 'index';
+    final idx =
+        _dataStore.tableMetaManager?.findIndexSchemaByUid(schema, indexUid);
+    if (idx != null) {
+      final name = idx.indexName;
+      if (name != null && name.isNotEmpty) return name;
+      return idx.actualIndexName;
+    }
+    // Legacy logical names (idx_*/uniq_*) are user-visible; stable uids are not.
+    if (!indexUid.looksLikeStableUid) return indexUid.value;
+    return 'index';
+  }
+
+  /// Resolve index spec for cursor building.
+  ({List<String> fields, bool isUnique}) _resolveIndexSpecForCursor(
+      TableSchema schema, IndexUid indexUid) {
+    final idx =
+        _dataStore.tableMetaManager?.findIndexSchemaByUid(schema, indexUid);
+    if (idx != null) {
+      return (fields: idx.fields, isUnique: idx.unique);
+    }
+    // Fallback for implicit unique single-field indexes (uniq_field).
+    final legacyName = indexUid.value;
+    if (legacyName.startsWith('uniq_') && legacyName.length > 5) {
+      return (fields: <String>[legacyName.substring(5)], isUnique: true);
+    }
+    final label = _indexDisplayLabel(schema, indexUid);
+    final message = label == 'index'
+        ? 'Index schema not found for cursor pagination.'
+        : 'Index schema not found for cursor pagination on index "$label".';
+    throw DbException([
+      GeneralStatus(
+        type: ResultType.devIndexNotFound,
+        message: message,
+      ),
+    ]);
+  }
+
+  /// Validate that orderBy matches index key order for cursor pagination.
+  void _validateIndexOrderByForCursor({
+    required TableContext table,
+    required TableSchema schema,
+    required QueryPlan plan,
+    required List<String> orderBy,
+  }) {
+    final idxUid = plan.operation.indexUid;
+    if (idxUid == null) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.devIndexNotFound,
+          message:
+              'Index scan plan is missing index selection for cursor pagination.',
+        ),
+      ]);
+    }
+    final spec = _resolveIndexSpecForCursor(schema, idxUid);
+
+    // Dynamic tie-breaker PK normalization:
+    // If the user specifies the primary key at the end of orderBy (e.g. ['age', 'score', 'id']
+    // on a composite index of ['age', 'score'] where 'id' is the primary key),
+    // we strip the trailing PK before index prefix checking since PK is already physically
+    // appended to all non-unique index keys for total stable sorting.
+    if (orderBy.isEmpty) return;
+
+    // orderBy fields mapping
+    final cleanOrderBy = orderBy.toList();
+    if (cleanOrderBy.isNotEmpty) {
+      final lastField = _parseSortField(cleanOrderBy.last).field;
+      if (lastField == schema.primaryKey) {
+        cleanOrderBy.removeLast();
+      }
+    }
+
+    if (cleanOrderBy.isEmpty && orderBy.isNotEmpty) {
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devInvalidCursorOrderBy,
+          message:
+              'Index-key cursor pagination requires orderBy to include index fields.',
+          parameterName: 'orderBy',
+          passedValue: orderBy,
+        ),
+      ]);
+    }
+
+    if (cleanOrderBy.length > spec.fields.length) {
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devInvalidCursorOrderBy,
+          message:
+              'Index-key cursor pagination requires orderBy to match index fields prefix.',
+          parameterName: 'orderBy',
+          passedValue: orderBy,
+        ),
+      ]);
+    }
+    bool firstIsDesc = false;
+    for (int i = 0; i < cleanOrderBy.length; i++) {
+      String f = cleanOrderBy[i];
+      final parsed = _parseSortField(f);
+      f = parsed.field;
+      final isDesc = parsed.descending;
+
+      if (f != spec.fields[i]) {
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidCursorOrderBy,
+            message:
+                'Index-key cursor pagination requires orderBy to match index fields in the same order.',
+            parameterName: 'orderBy',
+            passedValue: orderBy,
+          ),
+        ]);
+      }
+
+      if (i == 0) {
+        firstIsDesc = isDesc;
+      } else if (isDesc != firstIsDesc) {
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidCursorOrderBy,
+            message:
+                'Cursor pagination for multi-field indexes requires a uniform sort direction (all ASC or all DESC).',
+            parameterName: 'orderBy',
+            passedValue: orderBy,
+          ),
+        ]);
+      }
+    }
+  }
+
+  bool _sameStringList(List<String> a, List<String> b) {
+    if (identical(a, b)) return true;
+    if (a.length != b.length) return false;
+    for (int i = 0; i < a.length; i++) {
+      if (a[i] != b[i]) return false;
+    }
+    return true;
+  }
+
+  bool Function(Map<String, dynamic>) _buildSortKeyCursorFilter({
+    required TableContext table,
+    required TableSchema schema,
+    required Map<String, TableSchema> schemas,
+    required List<String> orderBy,
+    required _QueryCursorToken cursorToken,
+  }) {
+    final tableName = table.tableName;
+    if (cursorToken.mode != _CursorMode.sortKey) {
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devInvalidCursorMode,
+          message: 'Cursor token mode mismatch (expected sortKey).',
+          parameterName: 'cursor',
+          passedValue: cursorToken.mode.toString(),
+        ),
+      ]);
+    }
+    final tokenFields = cursorToken.sortFields;
+    final keyBytes = cursorToken.sortKey;
+    if (tokenFields == null ||
+        tokenFields.isEmpty ||
+        keyBytes == null ||
+        keyBytes.isEmpty) {
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devInvalidCursorPayload,
+          message: 'Invalid sort-key cursor token.',
+          parameterName: 'cursor',
+          passedValue: null,
+        ),
+      ]);
+    }
+    if (orderBy.isEmpty) {
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devInvalidCursorOrderBy,
+          message: 'Sort-key cursor requires explicit orderBy.',
+          parameterName: 'orderBy',
+          passedValue: orderBy,
+        ),
+      ]);
+    }
+
+    final orderFieldsRaw = <String>[];
+    final orderDesc = <bool>[];
+    final normalizedFields = <String>[];
+    for (final raw in orderBy) {
+      final parsed = _parseSortField(raw);
+      orderFieldsRaw.add(parsed.field);
+      orderDesc.add(parsed.descending);
+      normalizedFields.add(_normalizeCursorFieldName(parsed.field));
+    }
+
+    if (!_sameStringList(normalizedFields, tokenFields)) {
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devInvalidCursorOrderBy,
+          message: 'Cursor orderBy fields do not match current query orderBy.',
+          parameterName: 'orderBy',
+          passedValue: orderBy,
+        ),
+      ]);
+    }
+
+    final tokenDesc = cursorToken.sortDesc;
+    if (tokenDesc == null || tokenDesc.length != tokenFields.length) {
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devInvalidCursorPayload,
+          message: 'Invalid sort-key cursor token (missing direction).',
+          parameterName: 'cursor',
+          passedValue: null,
+        ),
+      ]);
+    }
+    for (int i = 0; i < orderDesc.length; i++) {
+      final expected = tokenDesc[i] ^ cursorToken.isBackward;
+      if (orderDesc[i] != expected) {
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidCursorOrderBy,
+            message: 'Cursor orderBy direction does not match current orderBy.',
+            parameterName: 'orderBy',
+            passedValue: orderBy,
+          ),
+        ]);
+      }
+    }
+
+    final pivotValues = MemComparableKey.decodeTuple(keyBytes);
+    final expectedLen = tokenFields.length + 1; // + primary key tie-breaker
+    if (pivotValues.length != expectedLen) {
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devInvalidCursorPayload,
+          message: 'Invalid sort-key cursor payload.',
+          parameterName: 'cursor',
+          passedValue: null,
+        ),
+      ]);
+    }
+
+    final matchers = <MatcherFunction>[];
+    for (int i = 0; i < tokenFields.length; i++) {
+      final schemaForField = ConditionRecordMatcher.getSchemaForField(
+              orderFieldsRaw[i], schemas, tableName) ??
+          schema;
+      matchers.add(
+        ValueMatcher.getMatcher(
+            schemaForField.getFieldMatcherType(tokenFields[i])),
+      );
+    }
+
+    final pkName = schema.primaryKey;
+    final pkMatcher =
+        ValueMatcher.getMatcher(schema.getPrimaryKeyMatcherType());
+    final pivotPk = pivotValues.last;
+
+    return (record) {
+      int cmp = 0;
+      for (int i = 0; i < tokenFields.length; i++) {
+        final val =
+            ConditionRecordMatcher.getFieldValue(record, orderFieldsRaw[i]);
+        final c0 = matchers[i](val, pivotValues[i]);
+        if (c0 != 0) {
+          cmp = orderDesc[i] ? -c0 : c0;
+          break;
+        }
+      }
+      if (cmp == 0) {
+        final pkVal = record[pkName] ?? record['$tableName.$pkName'];
+        cmp = pkMatcher(pkVal, pivotPk);
+      }
+      // Cursor token represents the last returned record in the scan direction.
+      // We want records strictly AFTER the cursor in the same direction.
+      return cmp > 0;
+    };
+  }
+
+  /// Determine cursor mode based on plan and orderBy.
+  /// Returns null if the current query configuration (e.g. non-indexed orderBy)
+  /// does not support cursor-based pagination.
+  _CursorMode? _determineCursorMode({
+    required TableContext table,
+    required TableSchema schema,
+    required QueryPlan plan,
+    required List<String> orderBy,
+    required _QueryCursorToken? cursorToken,
+  }) {
+    if (cursorToken != null) {
+      return cursorToken.mode;
+    }
+
+    final op = plan.operation;
+    final pkOrder = _parsePrimaryKeyOrder(orderBy, schema.primaryKey);
+
+    // First page: choose based on plan type.
+    if (op.type == QueryOperationType.tableScan) {
+      if (!pkOrder.isPkOrder) {
+        // Sorting by non-primary key: fall back to sort-key cursor (orderBy + PK).
+        return orderBy.isNotEmpty ? _CursorMode.sortKey : null;
+      }
+      return _CursorMode.primaryKey;
+    }
+
+    if (op.type == QueryOperationType.indexScan) {
+      final idxUid = op.indexUid ?? IndexUid.empty;
+      if (idxUid.isEmpty) {
+        throw DbException([
+          GeneralStatus(
+            type: ResultType.devIndexNotFound,
+            message:
+                'Index scan plan is missing index selection for cursor pagination.',
+          ),
+        ]);
+      }
+
+      // Check if orderBy aligns with index fields (or empty).
+      bool orderByAligned = true;
+      if (orderBy.isNotEmpty) {
+        try {
+          _validateIndexOrderByForCursor(
+            table: table,
+            schema: schema,
+            plan: plan,
+            orderBy: orderBy,
+          );
+        } catch (_) {
+          orderByAligned = false;
+        }
+      }
+
+      if (orderByAligned) {
+        return _CursorMode.indexKey;
+      } else {
+        // If orderBy does not align with the index, fall back to sortKey cursor
+        // to filter correctly during TopK in-memory sort scan.
+        return orderBy.isNotEmpty ? _CursorMode.sortKey : _CursorMode.indexKey;
+      }
+    }
+
+    return null;
+  }
+
+  String _buildNextCursor({
+    required _CursorMode mode,
+    required TableContext table,
+    required TableSchema schema,
+    required QueryPlan plan,
+    required List<String>? orderBy,
+    required Map<String, dynamic> lastRecord,
+    required Map<String, dynamic>? where,
+    List<JoinClause>? joins,
+    List<String>? groupBy,
+    List<QueryAggregation>? aggregations,
+    bool isBackward = false,
+  }) {
+    final tableName = table.tableName;
+    final sigHash = _buildQuerySignatureHash(
+      tableUid: schema.tableUid,
+      where: where,
+      orderBy: orderBy,
+      joins: joins,
+      groupBy: groupBy,
+      aggregations: aggregations,
+    );
+
+    if (mode == _CursorMode.primaryKey) {
+      final pkName = schema.primaryKey;
+      final pkVal =
+          (lastRecord[pkName] ?? lastRecord['$tableName.$pkName'])?.toString();
+      if (pkVal == null || pkVal.isEmpty) {
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidCursorPagination,
+            message:
+                'Cannot build next cursor: primary key is missing from the last record.',
+            parameterName: 'cursor',
+          ),
+        ]);
+      }
+      final pkOrder = _parsePrimaryKeyOrder(orderBy, pkName);
+      if (!pkOrder.isPkOrder) {
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidCursorOrderBy,
+            message:
+                'Cannot build primary-key cursor when orderBy is not primary key.',
+            parameterName: 'orderBy',
+            passedValue: orderBy,
+          ),
+        ]);
+      }
+      return _QueryCursorToken.primaryKey(
+        tableUid: schema.tableUid,
+        primaryKey: pkVal,
+        reverse: pkOrder.reverse,
+        isBackward: isBackward,
+        querySigHash: sigHash,
+      ).encode();
+    }
+
+    if (mode == _CursorMode.sortKey) {
+      final ob = orderBy ?? const <String>[];
+      if (ob.isEmpty) {
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidCursorOrderBy,
+            message: 'Cannot build sort-key cursor without orderBy.',
+            parameterName: 'orderBy',
+            passedValue: orderBy,
+          ),
+        ]);
+      }
+
+      final sortFields = <String>[];
+      final sortDesc = <bool>[];
+      final comps = <Uint8List>[];
+      for (final raw in ob) {
+        final parsed = _parseSortField(raw);
+        final rawField = parsed.field;
+        final fieldName = _normalizeCursorFieldName(rawField);
+        sortFields.add(fieldName);
+        sortDesc.add(parsed.descending);
+
+        final v = ConditionRecordMatcher.getFieldValue(lastRecord, rawField);
+        final c = (v == null)
+            ? MemComparableKey.encodeNull()
+            : schema.encodeFieldComponentToMemComparable(
+                  fieldName,
+                  v,
+                  truncateText: false,
+                ) ??
+                MemComparableKey.encodeTextLex(v.toString());
+        comps.add(c);
+      }
+
+      final pkName = schema.primaryKey;
+      final pkVal =
+          (lastRecord[pkName] ?? lastRecord['$tableName.$pkName'])?.toString();
+      if (pkVal == null || pkVal.isEmpty) {
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidCursorPagination,
+            message:
+                'Cannot build sort-key cursor: primary key is missing from the last record.',
+            parameterName: 'cursor',
+          ),
+        ]);
+      }
+      comps.add(schema.encodePrimaryKeyComponent(pkVal));
+
+      return _QueryCursorToken.sortKey(
+        tableUid: schema.tableUid,
+        sortFields: sortFields,
+        sortDesc: sortDesc,
+        sortKey: MemComparableKey.encodeTuple(comps),
+        isBackward: isBackward,
+        querySigHash: sigHash,
+      ).encode();
+    }
+
+    // indexKey cursor
+    final idxUid = plan.operation.indexUid;
+    if (idxUid == null || idxUid.isEmpty) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.devIndexNotFound,
+          message:
+              'Cannot build next cursor: missing index selection from query plan.',
+        ),
+      ]);
+    }
+    final spec = _resolveIndexSpecForCursor(schema, idxUid);
+    if (spec.fields.isEmpty) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.devIndexNotFound,
+          message: 'Cannot build next cursor: index has no fields.',
+        ),
+      ]);
+    }
+
+    final bool truncateText = !spec.isUnique;
+    final comps = <Uint8List>[];
+    for (final f in spec.fields) {
+      final v = lastRecord[f] ?? lastRecord['$tableName.$f'];
+      final c = (v == null)
+          ? MemComparableKey.encodeNull()
+          : schema.encodeFieldComponentToMemComparable(
+                f,
+                v,
+                truncateText: truncateText,
+              ) ??
+              MemComparableKey.encodeTextLex(v.toString());
+      comps.add(c);
+    }
+    if (!spec.isUnique) {
+      final pkName = schema.primaryKey;
+      final pkVal =
+          (lastRecord[pkName] ?? lastRecord['$tableName.$pkName'])?.toString();
+      if (pkVal == null) {
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidCursorPagination,
+            message:
+                'Cannot build next cursor: primary key is missing for non-unique index cursor.',
+            parameterName: 'cursor',
+          ),
+        ]);
+      }
+      comps.add(schema.encodePrimaryKeyComponent(pkVal));
+    }
+
+    final idx =
+        _dataStore.tableMetaManager?.findIndexSchemaByUid(schema, idxUid);
+    final resolvedIndexUid = idx?.indexUid ?? idxUid;
+
+    return _QueryCursorToken.indexKey(
+      tableUid: schema.tableUid,
+      indexUid: resolvedIndexUid,
+      indexKey: MemComparableKey.encodeTuple(comps),
+      isBackward: isBackward,
+      querySigHash: sigHash,
+    ).encode();
+  }
+
+  int _getTableQueryGeneration(TableUid tableUid) {
+    return _tableQueryGenerations[tableUid.value] ?? 0;
+  }
+
+  List<Object> _buildQueryCacheKey(QueryCacheKey key) {
+    final gen = _getTableQueryGeneration(key.tableUid);
+    // Use hierarchical key [tableUid, gen, queryStr] for efficient table-wide purging.
+    return [key.tableUid.value, gen, key.toString()];
+  }
+
+  /// Invalidate query result cache for a table (O(1)).
+  void invalidateQueryCacheForTable(TableContext table) {
+    final tableUidStr = table.tableUid.value;
+    final cur = _tableQueryGenerations[tableUidStr] ?? 0;
+    // Keep it positive and bounded.
+    _tableQueryGenerations[tableUidStr] = (cur + 1) & 0x7fffffff;
+    // Explicitly purge all query cache entries for this table using hierarchical prefix.
+    _queryCache.remove([tableUidStr]);
+  }
+
+  /// Clear a specific cached query entry for the current generation.
+  bool clearQueryCacheForKey(QueryCacheKey key) {
+    _queryCache.remove(_buildQueryCacheKey(key));
+    return true;
+  }
+
+  /// Clear all cached query entries synchronously (used on shutdown).
+  void clearAllQueryCacheSync() {
+    _queryCache.clear();
+    _tableQueryGenerations.clear();
+  }
+
+  /// Evict a ratio of cached query entries under memory pressure.
+  Future<void> evictQueryCache({double ratio = 0.3}) async {
+    await _queryCache.cleanup(removeRatio: ratio);
+  }
+
+  /// Get current query cache size in bytes.
+  int getCurrentQueryCacheSizeBytes() => _queryCache.estimatedTotalSizeBytes;
+
+  CompiledExecutionPlan? _getCompiledPlan(QueryShapeKey shapeKey) {
+    return _planCache[shapeKey.toString()];
+  }
+
+  void _putCompiledPlan(QueryShapeKey shapeKey, CompiledExecutionPlan plan) {
+    final keyStr = shapeKey.toString();
+    if (_planCache.length >= _maxPlanCacheSize) {
+      final evictKey = _planCache.keys.first;
+      _planCache.remove(evictKey);
+    }
+    _planCache[keyStr] = plan;
+    (_tablePlanKeys[shapeKey.tableUid.value] ??= <String>{}).add(keyStr);
+  }
+
+  /// Invalidate execution plan cache for a table when its schema or index structure changes.
+  void invalidatePlanCacheForTable(TableUid tableUid) {
+    final keys = _tablePlanKeys.remove(tableUid.value);
+    if (keys != null) {
+      for (final k in keys) {
+        _planCache.remove(k);
+      }
+    }
+  }
+
+  /// Clear all cached execution plans.
+  void clearAllPlanCache() {
+    _planCache.clear();
+    _tablePlanKeys.clear();
+  }
+
+  bool _shouldCacheQueryResults(
+    List<Map<String, dynamic>> results, {
+    required int maxBytes,
+  }) {
+    if (results.isEmpty) return false;
+    if (maxBytes <= 0) return false;
+
+    // Avoid caching extremely large result sets (usually scans).
+    if (results.length > 5000) return false;
+
+    // If cache is already highly utilized, avoid churn.
+    if (_queryCache.estimatedTotalSizeBytes > (maxBytes * 0.9).toInt()) {
+      return false;
+    }
+
+    // A single query result should not occupy more than 25% of total query cache.
+    final estimated = _estimateQueryResultSizeBytes(results);
+    final singleThreshold = (maxBytes * 0.25).toInt();
+    if (estimated >= singleThreshold) return false;
+
+    return true;
+  }
+
+  List<Map<String, dynamic>> _copyResultList(
+      List<Map<String, dynamic>> results) {
+    if (results.isEmpty) return const <Map<String, dynamic>>[];
+    return List<Map<String, dynamic>>.generate(
+      results.length,
+      (i) => Map<String, dynamic>.from(results[i]),
+      growable: true,
+    );
+  }
+
+  int _estimateQueryResultSizeBytes(List<Map<String, dynamic>> records) {
+    if (records.isEmpty) return 0;
+    final spaceAvg = _dataStore.tableDataManager.averageTableRecordSizeBytes;
+    if (spaceAvg != null && spaceAvg > 0) {
+      return spaceAvg * records.length;
+    }
+    const int sample = 6;
+    final int take = min(sample, records.length);
+    int sum = 0;
+    for (int i = 0; i < take; i++) {
+      sum += _estimateRecordSizeBytes(records[i]);
+    }
+    final int avg = (sum / take).ceil();
+    return avg * records.length;
+  }
+
+  int _estimateRecordSizeBytes(Map<String, dynamic> record) {
+    int size = 64; // base overhead
+    if (record.isEmpty) return size;
+
+    const int maxFieldsSample = 24;
+    int sampled = 0;
+    for (final e in record.entries) {
+      size += 16;
+      size += e.key.length * 2;
+      size += _estimateDynamicSizeBytes(e.value, depth: 0);
+      sampled++;
+      if (sampled >= maxFieldsSample) break;
+    }
+
+    if (record.length > sampled && sampled > 0) {
+      final int per = ((size - 64) / sampled).ceil().clamp(0, 1024 * 1024);
+      size = 64 + per * record.length;
+    }
+    return size;
+  }
+
+  int _estimateDynamicSizeBytes(dynamic v, {required int depth}) {
+    if (v == null) return 0;
+    if (v is bool) return 1;
+    if (v is int) return 8;
+    if (v is double) return 8;
+    if (v is num) return 16;
+    if (v is DateTime) return 16;
+    if (v is Uint8List) return v.length;
+    if (v is String) return v.length * 2;
+
+    // Bound recursion depth.
+    if (depth >= 2) return 32;
+
+    if (v is List) {
+      const int sample = 6;
+      int size = 24;
+      final int n = v.length;
+      final int take = n < sample ? n : sample;
+      for (int i = 0; i < take; i++) {
+        size += _estimateDynamicSizeBytes(v[i], depth: depth + 1);
+      }
+      if (n > take && take > 0) {
+        final int per = ((size - 24) / take).ceil().clamp(0, 1024 * 1024);
+        size = 24 + per * n;
+      }
+      return size;
+    }
+
+    if (v is Map) {
+      const int sample = 6;
+      int size = 48;
+      int taken = 0;
+      for (final e in v.entries) {
+        size += 16;
+        final k = e.key;
+        if (k is String) {
+          size += k.length * 2;
+        } else {
+          size += 16;
+        }
+        size += _estimateDynamicSizeBytes(e.value, depth: depth + 1);
+        taken++;
+        if (taken >= sample) break;
+      }
+      if (v.length > taken && taken > 0) {
+        final int per = ((size - 48) / taken).ceil().clamp(0, 1024 * 1024);
+        size = 48 + per * v.length;
+      }
+      return size;
+    }
+
+    return 64;
+  }
+
+  /// Construct a primary key cursor token for a table.
+  static String buildPrimaryKeyCursor(TableContext table, String primaryKeyStr,
+      {bool reverse = false}) {
+    return _QueryCursorToken.primaryKey(
+      tableUid: table.tableUid,
+      primaryKey: primaryKeyStr,
+      reverse: reverse,
+    ).encode();
+  }
+
+  /// Query data batch-by-batch using cursors directly from files (bypassing WriteBuffer and read views).
+  /// Enforces a flush before starting.
+  Future<void> queryEachBatch(
+    TableContext table, {
+    required int batchSize,
+    required Future<bool> Function(List<Map<String, dynamic>> batch,
+            String? currentCursor, String? nextCursor)
+        onBatch,
+    QueryCondition? condition,
+    List<String>? orderBy,
+    String? checkpointCursor,
+    CancellationToken? cancellationToken,
+    TableSchema? decodeSchema,
+    List<FieldStructure>? decodeFieldStructureOverride,
+  }) async {
+    // 1. Force flush to ensure storage files are fully up-to-date
+    await _dataStore.flush();
+
+    // 2. Resolve Table Schema
+    final schemaMgr = _dataStore.tableMetaManager;
+    if (schemaMgr == null) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Schema manager not initialized',
+        )
+      ]);
+    }
+    final tableName = table.tableName;
+    final schema = decodeSchema ?? table.schema;
+
+    final schemas = <String, TableSchema>{tableName: schema};
+    if (condition != null && !condition.isEmpty) {
+      condition.normalize(schemas, tableName);
+    }
+
+    // 3. Optimize query plan
+    final optimizer = _dataStore.getQueryOptimizer();
+    if (optimizer == null) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Query optimizer not initialized',
+        )
+      ]);
+    }
+
+    final Map<String, dynamic>? where = condition?.build();
+    final plan = await optimizer.optimize(
+      table,
+      where,
+      orderBy: orderBy,
+      limit: batchSize,
+    );
+
+    // 4. Batch execution loop
+    String? currentCursor = checkpointCursor;
+    bool hasMore = true;
+
+    final globalToken = _dataStore.globalQueryCancelToken;
+
+    while (hasMore) {
+      if ((cancellationToken != null && cancellationToken.isCancelled) ||
+          globalToken.isCancelled ||
+          !_dataStore.isInitialized) {
+        break;
+      }
+
+      final startCursor = currentCursor;
+
+      final result = await _executeWithPlan(
+        plan,
+        table,
+        schemas: schemas,
+        condition: condition,
+        where: where,
+        orderBy: orderBy,
+        limit: batchSize,
+        cursor: startCursor,
+        enableQueryCache: false,
+        readFromFileOnly: true,
+        decodeSchema: decodeSchema,
+        decodeFieldStructureOverride: decodeFieldStructureOverride,
+      );
+
+      if (result.records.isEmpty) {
+        break;
+      }
+
+      hasMore = result.hasMore;
+      currentCursor = result.nextCursor;
+
+      if ((cancellationToken != null && cancellationToken.isCancelled) ||
+          globalToken.isCancelled ||
+          !_dataStore.isInitialized) {
+        break;
+      }
+
+      // Invoke client callback. If callback returns false, stop batch processing.
+      final shouldContinue =
+          await onBatch(result.records, startCursor, currentCursor);
+      if (!shouldContinue) {
+        break;
+      }
+
+      if (currentCursor == null || currentCursor.isEmpty) {
+        break;
+      }
+    }
+  }
+
+  /// Hybrid retrieval and fusion execution entry point.
+  Future<ExecuteResult> _executeSingleWmbpRetrieval(
+    TableContext table, {
+    _TextMatchSpec? text,
+    _SparseMatchSpec? sparse,
+    required int effectiveLimit,
+    required int effectiveOffset,
+    Map<String, dynamic>? structuredWhere,
+    QueryCondition? filterCondition,
+    bool readFromFileOnly = false,
+    PromoteRuntimeDescriptor? promoteDesc,
+    bool applyPromoteResultTransform = false,
+    List<String>? selectedFields,
+    Stopwatch? stopwatch,
+  }) async {
+    final manager = _dataStore.wmbpIndexManager;
+    if (manager == null) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Text index manager is not initialized',
+        )
+      ]);
+    }
+    final QueryCondition? resolvedFilter = filterCondition ??
+        ((structuredWhere != null && structuredWhere.isNotEmpty)
+            ? QueryCondition.fromMap(structuredWhere)
+            : null);
+    final bool hasFilter = resolvedFilter != null && !resolvedFilter.isEmpty;
+    final int need = effectiveOffset + effectiveLimit;
+    final int candidateK = hasFilter
+        ? max(need, min(need * 3, max(need + 64, 512)))
+        : (effectiveOffset == 0 ? effectiveLimit : need + 1);
+    final List<WmbpHit> found;
+    final String field;
+    final double? minScore;
+    final RetrievalChannel channel;
+    if (text != null) {
+      field = text.field;
+      minScore = text.minScore;
+      channel = RetrievalChannel.text;
+      final syncHits = manager.searchTextSync(
+        table: table,
+        fieldName: text.field,
+        query: text.query,
+        topK: candidateK,
+        operator: text.operator,
+      );
+      found = syncHits ??
+          await manager.searchText(
+            table: table,
+            fieldName: text.field,
+            query: text.query,
+            topK: candidateK,
+            operator: text.operator,
+          );
+    } else {
+      field = sparse!.field;
+      minScore = sparse.minScore;
+      channel = RetrievalChannel.sparse;
+      found = await manager.searchSparse(
+        table: table,
+        fieldName: sparse.field,
+        query: sparse.query,
+        topK: candidateK,
+      );
+    }
+    var candidates = found;
+    if (minScore != null) {
+      candidates = candidates
+          .where((hit) => _wmbpPublicScore(channel, hit.rawUnits) >= minScore!)
+          .toList();
+    }
+    if (!hasFilter) {
+      final bool hasMore = effectiveOffset == 0
+          ? candidates.length >= effectiveLimit
+          : candidates.length > need;
+      final int start =
+          effectiveOffset == 0 ? 0 : min(effectiveOffset, candidates.length);
+      final int end = effectiveOffset == 0
+          ? min(candidates.length, effectiveLimit)
+          : min(candidates.length, need);
+      final page = start == 0 && end == candidates.length
+          ? candidates
+          : candidates.sublist(start, end);
+      return _materializeWmbpPage(
+        table,
+        page: page,
+        channel: channel,
+        field: field,
+        hasMore: hasMore,
+        effectiveOffset: effectiveOffset,
+        readFromFileOnly: readFromFileOnly,
+        promoteDesc: promoteDesc,
+        applyPromoteResultTransform: applyPromoteResultTransform,
+        selectedFields: selectedFields,
+        stopwatch: stopwatch,
+      );
+    }
+
+    final matcher = ConditionRecordMatcher.prepare(
+      resolvedFilter,
+      {table.tableName.toString(): table.schema},
+      table.tableName.toString(),
+    );
+    final recordsMap = candidates.isEmpty
+        ? const <String, Map<String, dynamic>>{}
+        : await _dataStore.tableDataManager.queryRecordsMapBatch(
+            table,
+            [for (final hit in candidates) hit.primaryKey],
+            readFromFileOnly: readFromFileOnly,
+          );
+    final kept = <WmbpHit>[];
+    for (final hit in candidates) {
+      final rec = recordsMap[hit.primaryKey];
+      if (rec != null && matcher.matches(rec)) kept.add(hit);
+    }
+    final bool hasMore = kept.length > need;
+    final int start = min(effectiveOffset, kept.length);
+    final int end = min(kept.length, need);
+    final page = kept.sublist(start, end);
+    return _materializeWmbpPage(
+      table,
+      page: page,
+      channel: channel,
+      field: field,
+      hasMore: hasMore,
+      effectiveOffset: effectiveOffset,
+      readFromFileOnly: readFromFileOnly,
+      promoteDesc: promoteDesc,
+      applyPromoteResultTransform: applyPromoteResultTransform,
+      selectedFields: selectedFields,
+      stopwatch: stopwatch,
+      knownRecords: recordsMap,
+    );
+  }
+
+  Future<ExecuteResult> _materializeWmbpPage(
+    TableContext table, {
+    required List<WmbpHit> page,
+    required RetrievalChannel channel,
+    required String field,
+    required bool hasMore,
+    required int effectiveOffset,
+    bool readFromFileOnly = false,
+    PromoteRuntimeDescriptor? promoteDesc,
+    bool applyPromoteResultTransform = false,
+    List<String>? selectedFields,
+    Stopwatch? stopwatch,
+    Map<String, Map<String, dynamic>>? knownRecords,
+  }) async {
+    if (page.isEmpty) {
+      stopwatch?.stop();
+      return ExecuteResult(
+        records: const [],
+        retrieval: const RetrievalContext(
+          entries: [],
+          fusionMethod: null,
+        ),
+        executionTimeMs: stopwatch?.elapsedMilliseconds,
+      );
+    }
+    final pkField = table.schema.primaryKey;
+    if (selectedFields != null &&
+        promoteDesc == null &&
+        selectedFields.length == 1 &&
+        selectedFields.first == pkField) {
+      stopwatch?.stop();
+      return ExecuteResult(
+        records: [
+          for (final hit in page) <String, dynamic>{pkField: hit.primaryKey}
+        ],
+        retrieval: RetrievalContext(
+          entries: [
+            for (final hit in page)
+              RetrievalEntry(
+                score: _wmbpPublicScore(channel, hit.rawUnits),
+                channel: channel,
+                rawScore: _wmbpPublicRawScore(channel, hit.rawUnits),
+                meta: {'field': field},
+              ),
+          ],
+          fusionMethod: null,
+        ),
+        hasMore: hasMore,
+        hasPrev: effectiveOffset > 0,
+        count: page.length,
+        executionTimeMs: stopwatch?.elapsedMilliseconds,
+        isProjected: true,
+      );
+    }
+    final recordsMap = knownRecords ??
+        await _dataStore.tableDataManager.queryRecordsMapBatch(
+          table,
+          [for (final hit in page) hit.primaryKey],
+          readFromFileOnly: readFromFileOnly,
+        );
+    final records = <Map<String, dynamic>>[];
+    final entries = <RetrievalEntry>[];
+    for (final hit in page) {
+      final rec = recordsMap[hit.primaryKey];
+      if (rec == null) continue;
+      final Map<String, dynamic> row;
+      if (promoteDesc != null && applyPromoteResultTransform) {
+        row = Map<String, dynamic>.from(rec);
+        transformPromoteOldToNewInPlace(row, promoteDesc);
+      } else {
+        row = rec;
+      }
+      records.add(row);
+      entries.add(RetrievalEntry(
+        score: _wmbpPublicScore(channel, hit.rawUnits),
+        channel: channel,
+        rawScore: _wmbpPublicRawScore(channel, hit.rawUnits),
+        meta: {'field': field},
+      ));
+    }
+    stopwatch?.stop();
+    return ExecuteResult(
+      records: records,
+      retrieval: RetrievalContext(
+        entries: entries,
+        fusionMethod: null,
+      ),
+      hasMore: hasMore,
+      hasPrev: effectiveOffset > 0,
+      count: records.length,
+      executionTimeMs: stopwatch?.elapsedMilliseconds,
+    );
+  }
+
+  Future<ExecuteResult> _executeHybridRetrieval(
+    TableContext table, {
+    required QueryCondition condition,
+    required Map<String, dynamic> where,
+    List<String>? orderBy,
+    int? limit,
+    int? offset,
+    bool readFromFileOnly = false,
+    PromoteRuntimeDescriptor? promoteDesc,
+    bool applyPromoteResultTransform = false,
+    List<String>? selectedFields,
+    RetrievalFusionMethod? fusionMethod,
+  }) async {
+    final effectiveFusion = fusionMethod ?? RetrievalFusionMethod.weightedScore;
+    final stopwatch = Stopwatch()..start();
+    final effectiveLimit = limit ?? _dataStore.config.defaultQueryLimit;
+    final effectiveOffset = offset ?? 0;
+
+    final shape = _HybridQueryShape.analyze(where);
+
+    if (!shape.isMultiWay && shape.singleVectorSpec != null) {
+      if (shape.globalFilter == null || shape.globalFilter!.isEmpty) {
+        // Pure single-vector search
+        return _executeSingleVectorRetrieval(
+          table,
+          spec: shape.singleVectorSpec!,
+          effectiveLimit: effectiveLimit,
+          effectiveOffset: effectiveOffset,
+          readFromFileOnly: readFromFileOnly,
+          promoteDesc: promoteDesc,
+          applyPromoteResultTransform: applyPromoteResultTransform,
+          selectedFields: selectedFields,
+          stopwatch: stopwatch,
+        );
+      } else {
+        // AND filtered vector search still needs table records for the structured
+        // matcher; PK-only covering does not apply here.
+        return _executeVectorWithFilterRetrieval(
+          table,
+          spec: shape.singleVectorSpec!,
+          structuredWhere: shape.globalFilter!,
+          effectiveLimit: effectiveLimit,
+          effectiveOffset: effectiveOffset,
+          readFromFileOnly: readFromFileOnly,
+          promoteDesc: promoteDesc,
+          applyPromoteResultTransform: applyPromoteResultTransform,
+          stopwatch: stopwatch,
+        );
+      }
+    }
+
+    if (!shape.isMultiWay && shape.singleTextSpec != null) {
+      return _executeSingleWmbpRetrieval(
+        table,
+        text: shape.singleTextSpec,
+        effectiveLimit: effectiveLimit,
+        effectiveOffset: effectiveOffset,
+        structuredWhere: shape.globalFilter,
+        readFromFileOnly: readFromFileOnly,
+        promoteDesc: promoteDesc,
+        applyPromoteResultTransform: applyPromoteResultTransform,
+        selectedFields: selectedFields,
+        stopwatch: stopwatch,
+      );
+    }
+    if (!shape.isMultiWay && shape.singleSparseSpec != null) {
+      return _executeSingleWmbpRetrieval(
+        table,
+        sparse: shape.singleSparseSpec,
+        effectiveLimit: effectiveLimit,
+        effectiveOffset: effectiveOffset,
+        structuredWhere: shape.globalFilter,
+        readFromFileOnly: readFromFileOnly,
+        promoteDesc: promoteDesc,
+        applyPromoteResultTransform: applyPromoteResultTransform,
+        selectedFields: selectedFields,
+        stopwatch: stopwatch,
+      );
+    }
+
+    // Multi-way Hybrid Recall (OR branches, text, vector, structured)
+    return await _executeMultiWayHybridFusion(
+      table,
+      recallBranches: shape.recallBranches,
+      globalFilter: shape.globalFilter,
+      effectiveLimit: effectiveLimit,
+      effectiveOffset: effectiveOffset,
+      readFromFileOnly: readFromFileOnly,
+      promoteDesc: promoteDesc,
+      applyPromoteResultTransform: applyPromoteResultTransform,
+      selectedFields: selectedFields,
+      stopwatch: stopwatch,
+      fusionMethod: effectiveFusion,
+    );
+  }
+
+  Future<ExecuteResult> _executeSingleVectorRetrieval(
+    TableContext table, {
+    required _VectorMatchSpec spec,
+    required int effectiveLimit,
+    required int effectiveOffset,
+    bool readFromFileOnly = false,
+    PromoteRuntimeDescriptor? promoteDesc,
+    bool applyPromoteResultTransform = false,
+    List<String>? selectedFields,
+    Stopwatch? stopwatch,
+  }) async {
+    final vectorIndexMgr = _dataStore.vectorIndexManager;
+    if (vectorIndexMgr == null) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Vector index manager is not initialized',
+        )
+      ]);
+    }
+
+    // Exact topK when offset==0 (same ANN cost as db.vectorSearch).
+    // With offset>0, fetch through the page end + 1 to probe hasMore.
+    final int need = effectiveOffset + effectiveLimit;
+    final int candidateK = effectiveOffset == 0 ? effectiveLimit : need + 1;
+
+    final vecResults = await vectorIndexMgr.vectorSearch(
+      table: table,
+      fieldName: spec.field,
+      queryVector: spec.vector,
+      topK: candidateK,
+      searchDepth: spec.searchDepth,
+      distanceThreshold: spec.distanceThreshold,
+    );
+
+    if (vecResults.isEmpty) {
+      stopwatch?.stop();
+      return ExecuteResult(
+        records: const [],
+        retrieval: const RetrievalContext(
+          entries: [],
+          fusionMethod: null,
+        ),
+        executionTimeMs: stopwatch?.elapsedMilliseconds,
+      );
+    }
+
+    var candidates = vecResults;
+    if (spec.minScore != null) {
+      candidates = candidates.where((r) => r.score >= spec.minScore!).toList();
+    }
+
+    final bool hasMore = effectiveOffset == 0
+        ? candidates.length >= effectiveLimit
+        : candidates.length > need;
+    final int start =
+        effectiveOffset == 0 ? 0 : min(effectiveOffset, candidates.length);
+    final int end = effectiveOffset == 0
+        ? min(candidates.length, effectiveLimit)
+        : min(candidates.length, need);
+    final pageCandidates = start == 0 && end == candidates.length
+        ? candidates
+        : candidates.sublist(start, end);
+
+    if (selectedFields != null && promoteDesc == null) {
+      final pkField = table.schema.primaryKey;
+      if (selectedFields.length == 1 && selectedFields.first == pkField) {
+        final records = <Map<String, dynamic>>[];
+        final entries = <RetrievalEntry>[];
+        final fieldName = spec.field;
+        for (final cand in pageCandidates) {
+          records.add(<String, dynamic>{pkField: cand.primaryKey});
+          entries.add(RetrievalEntry(
+            score: cand.score,
+            channel: RetrievalChannel.vector,
+            rawScore: cand.score,
+            meta: {
+              'distance': cand.distance,
+              'field': fieldName,
+            },
+          ));
+        }
+        stopwatch?.stop();
+        return ExecuteResult(
+          records: records,
+          retrieval: RetrievalContext(
+            entries: entries,
+            fusionMethod: null,
+          ),
+          hasMore: hasMore,
+          hasPrev: effectiveOffset > 0,
+          count: records.length,
+          executionTimeMs: stopwatch?.elapsedMilliseconds,
+          isProjected: true,
+        );
+      }
+    }
+
+    final pks = [for (final c in pageCandidates) c.primaryKey];
+    final neededFields = resolveNeededFields(
+      selectedFields: selectedFields,
+      primaryKey: table.schema.primaryKey,
+    );
+    final recordsMap = await _dataStore.tableDataManager.queryRecordsMapBatch(
+      table,
+      pks,
+      readFromFileOnly: readFromFileOnly,
+      neededFields: neededFields,
+    );
+
+    final records = <Map<String, dynamic>>[];
+    final entries = <RetrievalEntry>[];
+
+    for (int i = 0; i < pageCandidates.length; i++) {
+      final cand = pageCandidates[i];
+      final rec = recordsMap[cand.primaryKey];
+      if (rec != null) {
+        final Map<String, dynamic> row;
+        if (promoteDesc != null && applyPromoteResultTransform) {
+          row = Map<String, dynamic>.from(rec);
+          transformPromoteOldToNewInPlace(row, promoteDesc);
+        } else {
+          row = rec;
+        }
+        records.add(row);
+        entries.add(RetrievalEntry(
+          score: cand.score,
+          channel: RetrievalChannel.vector,
+          rawScore: cand.score,
+          meta: {
+            'distance': cand.distance,
+            'field': spec.field,
+          },
+        ));
+      }
+    }
+
+    stopwatch?.stop();
+    return ExecuteResult(
+      records: records,
+      retrieval: RetrievalContext(
+        entries: entries,
+        fusionMethod: null,
+      ),
+      hasMore: hasMore,
+      hasPrev: effectiveOffset > 0,
+      count: records.length,
+      executionTimeMs: stopwatch?.elapsedMilliseconds,
+    );
+  }
+
+  Future<ExecuteResult> _executeVectorWithFilterRetrieval(
+    TableContext table, {
+    required _VectorMatchSpec spec,
+    Map<String, dynamic>? structuredWhere,
+    QueryCondition? filterCondition,
+    required int effectiveLimit,
+    required int effectiveOffset,
+    bool readFromFileOnly = false,
+    PromoteRuntimeDescriptor? promoteDesc,
+    bool applyPromoteResultTransform = false,
+    Stopwatch? stopwatch,
+  }) async {
+    final vectorIndexMgr = _dataStore.vectorIndexManager;
+    if (vectorIndexMgr == null) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'Vector index manager is not initialized',
+        )
+      ]);
+    }
+
+    final int need = effectiveOffset + effectiveLimit;
+    // Over-fetch for AND filters, but never explode with large limits (UI freeze).
+    final int recallPool = max(need, min(need * 3, max(need + 64, 512)));
+
+    final vecResults = await vectorIndexMgr.vectorSearch(
+      table: table,
+      fieldName: spec.field,
+      queryVector: spec.vector,
+      topK: recallPool,
+      searchDepth: spec.searchDepth,
+      distanceThreshold: spec.distanceThreshold,
+    );
+
+    if (vecResults.isEmpty) {
+      stopwatch?.stop();
+      return ExecuteResult(
+        records: const [],
+        retrieval: const RetrievalContext(
+          entries: [],
+          fusionMethod: null,
+        ),
+        executionTimeMs: stopwatch?.elapsedMilliseconds,
+      );
+    }
+
+    final QueryCondition resolvedFilter =
+        filterCondition ?? QueryCondition.fromMap(structuredWhere!);
+    final matcher = ConditionRecordMatcher.prepare(
+      resolvedFilter,
+      {table.tableName.toString(): table.schema},
+      table.tableName.toString(),
+    );
+
+    final candidatePks = <String>[];
+    final scoreFiltered = <VectorSearchResult>[];
+    for (final cand in vecResults) {
+      if (spec.minScore != null && cand.score < spec.minScore!) continue;
+      scoreFiltered.add(cand);
+      candidatePks.add(cand.primaryKey);
+    }
+
+    // full-record decode: filter matcher may reference any column before SELECT.
+    final recordsMap = candidatePks.isEmpty
+        ? const <String, Map<String, dynamic>>{}
+        : await _dataStore.tableDataManager.queryRecordsMapBatch(
+            table,
+            candidatePks,
+            readFromFileOnly: readFromFileOnly,
+          );
+
+    final qualifiedCandidates =
+        <({VectorSearchResult result, Map<String, dynamic> record})>[];
+
+    for (final cand in scoreFiltered) {
+      final rec = recordsMap[cand.primaryKey];
+      if (rec != null && matcher.matches(rec)) {
+        qualifiedCandidates.add((result: cand, record: rec));
+      }
+    }
+
+    final bool hasMore =
+        qualifiedCandidates.length > (effectiveOffset + effectiveLimit);
+    final page =
+        qualifiedCandidates.skip(effectiveOffset).take(effectiveLimit).toList();
+
+    final records = <Map<String, dynamic>>[];
+    final entries = <RetrievalEntry>[];
+
+    for (final item in page) {
+      final Map<String, dynamic> row;
+      if (promoteDesc != null && applyPromoteResultTransform) {
+        row = Map<String, dynamic>.from(item.record);
+        transformPromoteOldToNewInPlace(row, promoteDesc);
+      } else {
+        row = item.record;
+      }
+      records.add(row);
+      entries.add(RetrievalEntry(
+        score: item.result.score,
+        channel: RetrievalChannel.vector,
+        rawScore: item.result.score,
+        meta: {
+          'distance': item.result.distance,
+          'field': spec.field,
+        },
+      ));
+    }
+
+    stopwatch?.stop();
+    return ExecuteResult(
+      records: records,
+      retrieval: RetrievalContext(
+        entries: entries,
+        fusionMethod: null,
+      ),
+      hasMore: hasMore,
+      hasPrev: effectiveOffset > 0,
+      count: records.length,
+      executionTimeMs: stopwatch?.elapsedMilliseconds,
+    );
+  }
+
+  Future<ExecuteResult> _executeMultiWayHybridFusion(
+    TableContext table, {
+    required List<Map<String, dynamic>> recallBranches,
+    Map<String, dynamic>? globalFilter,
+    required int effectiveLimit,
+    required int effectiveOffset,
+    bool readFromFileOnly = false,
+    PromoteRuntimeDescriptor? promoteDesc,
+    bool applyPromoteResultTransform = false,
+    List<String>? selectedFields,
+    Stopwatch? stopwatch,
+    RetrievalFusionMethod fusionMethod = RetrievalFusionMethod.weightedScore,
+  }) async {
+    final effectiveFusion = fusionMethod;
+    final need = effectiveOffset + effectiveLimit;
+    // Cap channel recall so large limits don't inflate ANN heap / UI work.
+    final int recallPerChannel = max(need, min(need * 3, max(need + 64, 256)));
+
+    final channelHits = <String,
+        Map<
+            String,
+            ({
+              int rank,
+              double? rawScore,
+              double score,
+              RetrievalChannel channel,
+              Map<String, dynamic>? meta
+            })>>{};
+    final channelWeights = <String, double>{};
+
+    ConditionRecordMatcher? globalMatcher;
+    if (globalFilter != null && globalFilter.isNotEmpty) {
+      globalMatcher = ConditionRecordMatcher.prepare(
+        QueryCondition.fromMap(globalFilter),
+        {table.tableName.toString(): table.schema},
+        table.tableName.toString(),
+      );
+    }
+    final neededFields = resolveNeededFields(
+      selectedFields: selectedFields,
+      matcher: globalMatcher,
+      primaryKey: table.schema.primaryKey,
+    );
+
+    // Run independent recall channels concurrently (vector + structured).
+    final branchTasks = <Future<
+        ({
+          String branchKey,
+          double weight,
+          Map<
+              String,
+              ({
+                int rank,
+                double? rawScore,
+                double score,
+                RetrievalChannel channel,
+                Map<String, dynamic>? meta
+              })> hits
+        })>>[];
+
+    // Denominator is every vector/text/sparse channel in the query. A miss
+    // contributes 0, so a second hit raises the fused score. Weights mix
+    // already aligned channel scores; they do not rescale a channel.
+    var retrievalQueryWeight = 0.0;
+    for (final branch in recallBranches) {
+      final double? weight = _TextMatchSpec.extract(branch)?.weight ??
+          _SparseMatchSpec.extract(branch)?.weight ??
+          _VectorMatchSpec.extract(branch)?.weight;
+      if (weight != null && weight > 0) retrievalQueryWeight += weight;
+    }
+
+    for (int branchIdx = 0; branchIdx < recallBranches.length; branchIdx++) {
+      final branch = recallBranches[branchIdx];
+      final branchKey = 'channel_$branchIdx';
+      branchTasks.add(() async {
+        final hits = <String,
+            ({
+          int rank,
+          double? rawScore,
+          double score,
+          RetrievalChannel channel,
+          Map<String, dynamic>? meta
+        })>{};
+        var weight = 1.0;
+
+        if (_TextMatchSpec.contains(branch)) {
+          final spec = _TextMatchSpec.extract(branch);
+          if (spec != null) {
+            weight = spec.weight;
+            final textResults = await _dataStore.wmbpIndexManager?.searchText(
+                  table: table,
+                  fieldName: spec.field,
+                  query: spec.query,
+                  topK: recallPerChannel,
+                  operator: spec.operator,
+                ) ??
+                const <WmbpHit>[];
+            int rank = 1;
+            for (final r in textResults) {
+              final raw = WmbpScore.textRawScore(r.rawUnits);
+              final relevance = WmbpScore.relevanceFromRaw(raw);
+              if (spec.minScore != null && relevance < spec.minScore!) continue;
+              hits[r.primaryKey] = (
+                rank: rank++,
+                rawScore: raw,
+                score: relevance,
+                channel: RetrievalChannel.text,
+                meta: {'field': spec.field},
+              );
+            }
+          }
+        } else if (_SparseMatchSpec.contains(branch)) {
+          final spec = _SparseMatchSpec.extract(branch);
+          if (spec != null) {
+            weight = spec.weight;
+            final sparseResults =
+                await _dataStore.wmbpIndexManager?.searchSparse(
+                      table: table,
+                      fieldName: spec.field,
+                      query: spec.query,
+                      topK: recallPerChannel,
+                    ) ??
+                    const <WmbpHit>[];
+            int rank = 1;
+            for (final r in sparseResults) {
+              final raw = WmbpScore.sparseRawScore(r.rawUnits);
+              final relevance = WmbpScore.relevanceFromRaw(raw);
+              if (spec.minScore != null && relevance < spec.minScore!) continue;
+              hits[r.primaryKey] = (
+                rank: rank++,
+                rawScore: raw,
+                score: relevance,
+                channel: RetrievalChannel.sparse,
+                meta: {'field': spec.field},
+              );
+            }
+          }
+        } else if (_VectorMatchSpec.containsVector(branch)) {
+          final spec = _VectorMatchSpec.extract(branch);
+          if (spec != null) {
+            weight = spec.weight;
+            final vecResults =
+                await _dataStore.vectorIndexManager?.vectorSearch(
+                      table: table,
+                      fieldName: spec.field,
+                      queryVector: spec.vector,
+                      topK: recallPerChannel,
+                      searchDepth: spec.searchDepth,
+                      distanceThreshold: spec.distanceThreshold,
+                    ) ??
+                    const <VectorSearchResult>[];
+
+            int rank = 1;
+            for (final r in vecResults) {
+              if (spec.minScore != null && r.score < spec.minScore!) continue;
+              hits[r.primaryKey] = (
+                rank: rank++,
+                rawScore: r.score,
+                score: r.score,
+                channel: RetrievalChannel.vector,
+                meta: {'distance': r.distance, 'field': spec.field},
+              );
+            }
+          }
+        } else {
+          final subResult = await execute(
+            table,
+            condition: QueryCondition.fromMap(branch),
+            limit: recallPerChannel,
+            readFromFileOnly: readFromFileOnly,
+          );
+
+          final pkField = table.schema.primaryKey;
+          for (int rank = 0; rank < subResult.records.length; rank++) {
+            final rec = subResult.records[rank];
+            final pk = rec[pkField]?.toString();
+            if (pk != null && pk.isNotEmpty) {
+              hits[pk] = (
+                rank: rank + 1,
+                rawScore: null,
+                score: 0.0,
+                channel: RetrievalChannel.structured,
+                meta: {'structuredBranch': branch},
+              );
+            }
+          }
+        }
+
+        return (branchKey: branchKey, weight: weight, hits: hits);
+      }());
+    }
+
+    final branchResults = await Future.wait(branchTasks);
+    for (final branchResult in branchResults) {
+      channelWeights[branchResult.branchKey] = branchResult.weight;
+      channelHits[branchResult.branchKey] = branchResult.hits;
+    }
+
+    final rrfScores = <String, double>{};
+    final relevanceSum = <String, double>{};
+    final relevanceWeight = <String, double>{};
+    final pkContributions = <String, Map<String, dynamic>>{};
+
+    for (final entry in channelHits.entries) {
+      final channelKey = entry.key;
+      final hits = entry.value;
+      final weight = channelWeights[channelKey] ?? 1.0;
+
+      for (final hit in hits.entries) {
+        final pk = hit.key;
+        final info = hit.value;
+        final rrfDelta = weight / (60.0 + info.rank);
+        rrfScores[pk] = (rrfScores[pk] ?? 0.0) + rrfDelta;
+        // Structured branches have no absolute relevance; they must not pull
+        // fused scores toward zero or invent a relative 1.0.
+        if (info.channel == RetrievalChannel.text ||
+            info.channel == RetrievalChannel.sparse ||
+            info.channel == RetrievalChannel.vector) {
+          relevanceSum[pk] = (relevanceSum[pk] ?? 0.0) + weight * info.score;
+          relevanceWeight[pk] = (relevanceWeight[pk] ?? 0.0) + weight;
+        }
+
+        final contrib =
+            pkContributions.putIfAbsent(pk, () => <String, dynamic>{});
+        contrib[channelKey] = {
+          'channel': info.channel.name,
+          'rank': info.rank,
+          'score': info.score,
+          if (info.rawScore != null) 'rawScore': info.rawScore,
+          if (info.meta != null) ...info.meta!,
+        };
+      }
+    }
+
+    if (rrfScores.isEmpty) {
+      stopwatch?.stop();
+      return ExecuteResult(
+        records: const [],
+        retrieval: RetrievalContext(
+          entries: const [],
+          fusionMethod: effectiveFusion,
+        ),
+        executionTimeMs: stopwatch?.elapsedMilliseconds,
+      );
+    }
+
+    double fusedRelevance(String pk) {
+      if (retrievalQueryWeight <= 0) return 0;
+      return (relevanceSum[pk] ?? 0) / retrievalQueryWeight;
+    }
+
+    final bool useRrf = effectiveFusion == RetrievalFusionMethod.rrf;
+    double publicScore(String pk) =>
+        useRrf ? (rrfScores[pk] ?? 0.0) : fusedRelevance(pk);
+
+    final sortedPks = <String>{
+      ...relevanceSum.keys,
+      ...rrfScores.keys,
+    }.toList()
+      ..sort((a, b) {
+        final int byScore = publicScore(b).compareTo(publicScore(a));
+        if (byScore != 0) return byScore;
+        if (!useRrf) {
+          final int byRrf = (rrfScores[b] ?? 0).compareTo(rrfScores[a] ?? 0);
+          if (byRrf != 0) return byRrf;
+        }
+        return a.compareTo(b);
+      });
+
+    if (selectedFields != null &&
+        globalMatcher == null &&
+        promoteDesc == null) {
+      final pkField = table.schema.primaryKey;
+      if (selectedFields.length == 1 && selectedFields.first == pkField) {
+        final records = <Map<String, dynamic>>[];
+        final entries = <RetrievalEntry>[];
+        final start = min(effectiveOffset, sortedPks.length);
+        final end = min(sortedPks.length, effectiveOffset + effectiveLimit);
+        for (int i = start; i < end; i++) {
+          final pk = sortedPks[i];
+          records.add(<String, dynamic>{pkField: pk});
+          final rawRrf = rrfScores[pk] ?? 0.0;
+          final contribs = pkContributions[pk];
+          final bool isMultiHit = contribs != null && contribs.length > 1;
+          RetrievalChannel primaryChannel;
+          if (isMultiHit) {
+            primaryChannel = RetrievalChannel.hybrid;
+          } else {
+            primaryChannel =
+                _retrievalChannelByName(contribs?.values.first['channel']);
+          }
+          final fused = publicScore(pk);
+          entries.add(RetrievalEntry(
+            score: fused,
+            channel: primaryChannel,
+            rawScore: fused,
+            meta: {
+              'rrfScore': rawRrf,
+              if (!useRrf) 'relevanceScore': fusedRelevance(pk),
+              'channelContributions': contribs,
+            },
+          ));
+        }
+        stopwatch?.stop();
+        return ExecuteResult(
+          records: records,
+          retrieval: RetrievalContext(
+            entries: entries,
+            fusionMethod: effectiveFusion,
+            meta: {
+              'totalCandidates': sortedPks.length,
+              'channels': channelWeights,
+            },
+          ),
+          hasMore: records.length == effectiveLimit,
+          hasPrev: effectiveOffset > 0,
+          count: records.length,
+          executionTimeMs: stopwatch?.elapsedMilliseconds,
+          isProjected: true,
+        );
+      }
+    }
+
+    final records = <Map<String, dynamic>>[];
+    final entries = <RetrievalEntry>[];
+    int qualifiedOffsetCount = 0;
+    final fetchCount = globalMatcher != null
+        ? min(sortedPks.length, max(need * 3, need + 16))
+        : min(sortedPks.length, need);
+    final batchPks = sortedPks.sublist(0, fetchCount);
+    final recordsMap = batchPks.isEmpty
+        ? const <String, Map<String, dynamic>>{}
+        : await _dataStore.tableDataManager.queryRecordsMapBatch(
+            table,
+            batchPks,
+            readFromFileOnly: readFromFileOnly,
+            neededFields: neededFields,
+          );
+
+    for (int i = 0; i < sortedPks.length; i++) {
+      if (records.length >= effectiveLimit) {
+        break;
+      }
+
+      final pk = sortedPks[i];
+      Map<String, dynamic>? rec = recordsMap[pk];
+      if (rec == null && i >= fetchCount) {
+        // Rare: overfetch window exhausted under heavy filter rejection.
+        if (!readFromFileOnly) {
+          rec =
+              _dataStore.tableDataManager.getRecordByPrimaryKeySync(table, pk);
+        }
+        rec ??= await _dataStore.tableDataManager.getRecordByPrimaryKey(
+          table,
+          pk,
+          readFromFileOnly: readFromFileOnly,
+        );
+      }
+
+      if (rec != null) {
+        // Global pre-filter validation (if global filter is specified)
+        if (globalMatcher != null && !globalMatcher.matches(rec)) {
+          continue;
+        }
+
+        if (qualifiedOffsetCount < effectiveOffset) {
+          qualifiedOffsetCount++;
+          continue;
+        }
+
+        final Map<String, dynamic> row;
+        if (promoteDesc != null && applyPromoteResultTransform) {
+          row = Map<String, dynamic>.from(rec);
+          transformPromoteOldToNewInPlace(row, promoteDesc);
+        } else {
+          row = rec;
+        }
+        records.add(row);
+
+        final rawRrf = rrfScores[pk] ?? 0.0;
+        final contribs = pkContributions[pk];
+        final bool isMultiHit = contribs != null && contribs.length > 1;
+
+        RetrievalChannel primaryChannel;
+        if (isMultiHit) {
+          primaryChannel = RetrievalChannel.hybrid;
+        } else {
+          primaryChannel =
+              _retrievalChannelByName(contribs?.values.first['channel']);
+        }
+
+        final fused = publicScore(pk);
+        entries.add(RetrievalEntry(
+          score: fused,
+          channel: primaryChannel,
+          rawScore: fused,
+          meta: {
+            'rrfScore': rawRrf,
+            if (!useRrf) 'relevanceScore': fusedRelevance(pk),
+            'channelContributions': contribs,
+          },
+        ));
+      }
+    }
+
+    final bool hasMore = (records.length == effectiveLimit);
+
+    stopwatch?.stop();
+    return ExecuteResult(
+      records: records,
+      retrieval: RetrievalContext(
+        entries: entries,
+        fusionMethod: effectiveFusion,
+        meta: {
+          'totalCandidates': sortedPks.length,
+          'channels': channelWeights,
+        },
+      ),
+      hasMore: hasMore,
+      hasPrev: effectiveOffset > 0,
+      count: records.length,
+      executionTimeMs: stopwatch?.elapsedMilliseconds,
+    );
+  }
+}
+
+class _HybridQueryShape {
+  final Map<String, dynamic>? globalFilter;
+  final List<Map<String, dynamic>> recallBranches;
+  final _VectorMatchSpec? singleVectorSpec;
+  final _TextMatchSpec? singleTextSpec;
+  final _SparseMatchSpec? singleSparseSpec;
+  final bool isMultiWay;
+
+  _HybridQueryShape({
+    this.globalFilter,
+    required this.recallBranches,
+    this.singleVectorSpec,
+    this.singleTextSpec,
+    this.singleSparseSpec,
+    required this.isMultiWay,
+  });
+
+  static _HybridQueryShape analyze(Map<String, dynamic> where) {
+    // Check if root is OR
+    if (where.containsKey('OR') &&
+        where['OR'] is List &&
+        (where['OR'] as List).isNotEmpty) {
+      final arms = <Map<String, dynamic>>[
+        for (final arm in (where['OR'] as List))
+          if (arm is Map<String, dynamic>) arm,
+      ];
+      if (_orArmsContainRetrieval(arms)) {
+        return _splitRetrievalOr(arms);
+      }
+      return _HybridQueryShape(
+        recallBranches: arms,
+        isMultiWay: true,
+      );
+    }
+
+    // Check if root is AND containing an OR branch
+    if (where.containsKey('AND') && where['AND'] is List) {
+      final andList = where['AND'] as List;
+      Map<String, dynamic>? orBranchMap;
+      final globalFilters = <Map<String, dynamic>>[];
+
+      for (final item in andList) {
+        if (item is Map<String, dynamic>) {
+          if (item.containsKey('OR') && item['OR'] is List) {
+            orBranchMap = item;
+          } else {
+            globalFilters.add(item);
+          }
+        }
+      }
+
+      if (orBranchMap != null) {
+        final arms = <Map<String, dynamic>>[
+          for (final arm in (orBranchMap['OR'] as List))
+            if (arm is Map<String, dynamic>) arm,
+        ];
+        final split = _orArmsContainRetrieval(arms)
+            ? _splitRetrievalOr(arms)
+            : _HybridQueryShape(
+                recallBranches: arms,
+                isMultiWay: true,
+              );
+        final filters = <Map<String, dynamic>>[
+          ...globalFilters,
+          if (split.globalFilter != null) split.globalFilter!,
+        ];
+        final Map<String, dynamic>? combinedGlobalFilter = filters.isEmpty
+            ? null
+            : (filters.length == 1 ? filters.first : {'AND': filters});
+        return _HybridQueryShape(
+          globalFilter: combinedGlobalFilter,
+          recallBranches: split.recallBranches,
+          isMultiWay: true,
+        );
+      }
+    }
+
+    final retrievalBranches = <Map<String, dynamic>>[];
+    final filters = <Map<String, dynamic>>[];
+    void take(Map<String, dynamic> item) {
+      if (_isRetrievalLeaf(item)) {
+        retrievalBranches.add(item);
+      } else {
+        filters.add(item);
+      }
+    }
+
+    if (where.containsKey('AND') && where['AND'] is List) {
+      for (final item in (where['AND'] as List)) {
+        if (item is Map<String, dynamic>) take(item);
+      }
+    } else {
+      take(where);
+    }
+
+    Map<String, dynamic>? combinedFilter;
+    if (filters.isNotEmpty) {
+      combinedFilter = filters.length == 1 ? filters.first : {'AND': filters};
+    }
+
+    if (retrievalBranches.length >= 2) {
+      return _HybridQueryShape(
+        globalFilter: combinedFilter,
+        recallBranches: retrievalBranches,
+        isMultiWay: true,
+      );
+    }
+
+    final single = retrievalBranches.isEmpty ? where : retrievalBranches.first;
+    return _HybridQueryShape(
+      globalFilter: combinedFilter ??
+          (retrievalBranches.isEmpty ? null : _stripRetrieval(single)),
+      recallBranches: [single],
+      singleVectorSpec: _VectorMatchSpec.extract(single),
+      singleTextSpec: _TextMatchSpec.extract(single),
+      singleSparseSpec: _SparseMatchSpec.extract(single),
+      isMultiWay: false,
+    );
+  }
+}
+
+bool _isRetrievalLeaf(Map<String, dynamic> item) {
+  for (final value in item.values) {
+    if (value is Map) {
+      if (value.containsKey(r'$vector') ||
+          value.containsKey(r'$text') ||
+          value.containsKey(r'$sparse')) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool _orArmsContainRetrieval(List<Map<String, dynamic>> arms) {
+  for (final arm in arms) {
+    if (_mapTreeContainsRetrieval(arm)) return true;
+  }
+  return false;
+}
+
+bool _mapTreeContainsRetrieval(Map<String, dynamic> where) {
+  if (where.containsKey('AND') && where['AND'] is List) {
+    for (final item in where['AND'] as List) {
+      if (item is Map<String, dynamic> && _mapTreeContainsRetrieval(item)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (where.containsKey('OR') && where['OR'] is List) {
+    for (final item in where['OR'] as List) {
+      if (item is Map<String, dynamic> && _mapTreeContainsRetrieval(item)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  for (final value in where.values) {
+    if (value is Map &&
+        (value.containsKey(r'$vector') ||
+            value.containsKey(r'$text') ||
+            value.containsKey(r'$sparse'))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// Pull structured predicates out of a retrieval OR so they filter every arm.
+_HybridQueryShape _splitRetrievalOr(List<Map<String, dynamic>> arms) {
+  final branches = <Map<String, dynamic>>[];
+  final filters = <Map<String, dynamic>>[];
+  for (final arm in arms) {
+    _splitRetrievalArm(arm, branches, filters);
+  }
+  Map<String, dynamic>? globalFilter;
+  if (filters.length == 1) {
+    globalFilter = filters.first;
+  } else if (filters.length > 1) {
+    globalFilter = {'AND': filters};
+  }
+  return _HybridQueryShape(
+    globalFilter: globalFilter,
+    recallBranches: branches,
+    isMultiWay: true,
+  );
+}
+
+void _splitRetrievalArm(
+  Map<String, dynamic> arm,
+  List<Map<String, dynamic>> branches,
+  List<Map<String, dynamic>> filters,
+) {
+  if (arm.containsKey('AND') && arm['AND'] is List) {
+    for (final item in arm['AND'] as List) {
+      if (item is Map<String, dynamic>) {
+        _splitRetrievalArm(item, branches, filters);
+      }
+    }
+    return;
+  }
+  if (arm.containsKey('OR') && arm['OR'] is List) {
+    for (final item in arm['OR'] as List) {
+      if (item is Map<String, dynamic>) {
+        _splitRetrievalArm(item, branches, filters);
+      }
+    }
+    return;
+  }
+  if (_mapTreeContainsRetrieval(arm)) {
+    branches.add(arm);
+  } else if (arm.isNotEmpty) {
+    filters.add(arm);
+  }
+}
+
+Map<String, dynamic>? _stripRetrieval(Map<String, dynamic>? where) {
+  if (where == null || where.isEmpty) return null;
+  if (where.containsKey('AND') && where['AND'] is List) {
+    final kept = <Map<String, dynamic>>[];
+    for (final item in (where['AND'] as List)) {
+      if (item is Map<String, dynamic>) {
+        final next = _stripRetrieval(item);
+        if (next != null && next.isNotEmpty) kept.add(next);
+      }
+    }
+    if (kept.isEmpty) return null;
+    if (kept.length == 1) return kept.first;
+    return {'AND': kept};
+  }
+  final result = <String, dynamic>{};
+  for (final entry in where.entries) {
+    if (entry.value is Map) {
+      final payload = entry.value as Map;
+      if (payload.containsKey(r'$vector') ||
+          payload.containsKey(r'$text') ||
+          payload.containsKey(r'$sparse')) {
+        continue;
+      }
+    }
+    result[entry.key] = entry.value;
+  }
+  return result.isEmpty ? null : result;
+}
+
+double _wmbpPublicRawScore(RetrievalChannel channel, int rawUnits) {
+  if (channel == RetrievalChannel.sparse) {
+    return WmbpScore.sparseRawScore(rawUnits);
+  }
+  return WmbpScore.textRawScore(rawUnits);
+}
+
+double _wmbpPublicScore(RetrievalChannel channel, int rawUnits) {
+  return WmbpScore.relevanceFromRaw(_wmbpPublicRawScore(channel, rawUnits));
+}
+
+RetrievalChannel _retrievalChannelByName(Object? name) {
+  if (name == RetrievalChannel.text.name) return RetrievalChannel.text;
+  if (name == RetrievalChannel.sparse.name) return RetrievalChannel.sparse;
+  if (name == RetrievalChannel.vector.name) return RetrievalChannel.vector;
+  if (name == RetrievalChannel.graph.name) return RetrievalChannel.graph;
+  if (name == RetrievalChannel.hybrid.name) return RetrievalChannel.hybrid;
+  return RetrievalChannel.structured;
+}
+
+class _TextMatchSpec {
+  final String field;
+  final TextQuery query;
+  final TextMatchOperator operator;
+  final double weight;
+  final double? minScore;
+
+  _TextMatchSpec({
+    required this.field,
+    required this.query,
+    this.operator = TextMatchOperator.or,
+    this.weight = 1.0,
+    this.minScore,
+  });
+
+  static bool contains(Map<String, dynamic>? where) =>
+      _containsPayload(where, r'$text');
+
+  static _TextMatchSpec? extract(Map<String, dynamic>? where) {
+    final found = _extractPayload(where, r'$text');
+    if (found == null) return null;
+    final query = found.payload['query'];
+    if (query is! TextQuery) return null;
+    return _TextMatchSpec(
+      field: found.field,
+      query: query,
+      operator: found.payload['operator'] == TextMatchOperator.and.name
+          ? TextMatchOperator.and
+          : TextMatchOperator.or,
+      weight: (found.payload['weight'] as num?)?.toDouble() ?? 1.0,
+      minScore: (found.payload['minScore'] as num?)?.toDouble(),
+    );
+  }
+}
+
+class _SparseMatchSpec {
+  final String field;
+  final SparseVectorData query;
+  final double weight;
+  final double? minScore;
+
+  _SparseMatchSpec({
+    required this.field,
+    required this.query,
+    this.weight = 1.0,
+    this.minScore,
+  });
+
+  static bool contains(Map<String, dynamic>? where) =>
+      _containsPayload(where, r'$sparse');
+
+  static _SparseMatchSpec? extract(Map<String, dynamic>? where) {
+    final found = _extractPayload(where, r'$sparse');
+    if (found == null) return null;
+    final query = found.payload['query'];
+    if (query is! SparseVectorData) return null;
+    return _SparseMatchSpec(
+      field: found.field,
+      query: query,
+      weight: (found.payload['weight'] as num?)?.toDouble() ?? 1.0,
+      minScore: (found.payload['minScore'] as num?)?.toDouble(),
+    );
+  }
+}
+
+({String field, Map payload})? _extractPayload(
+  Map<String, dynamic>? where,
+  String operator,
+) {
+  if (where == null || where.isEmpty) return null;
+  if (where.containsKey('AND') && where['AND'] is List) {
+    for (final item in (where['AND'] as List)) {
+      if (item is Map<String, dynamic>) {
+        final found = _extractPayload(item, operator);
+        if (found != null) return found;
+      }
+    }
+    return null;
+  }
+  for (final entry in where.entries) {
+    if (entry.value is Map && (entry.value as Map).containsKey(operator)) {
+      final payload = (entry.value as Map)[operator];
+      if (payload is Map) {
+        return (field: entry.key, payload: payload);
+      }
+    }
+  }
+  return null;
+}
+
+bool _containsPayload(Map<String, dynamic>? where, String operator) {
+  if (where == null || where.isEmpty) return false;
+  for (final entry in where.entries) {
+    if (entry.key == 'AND' || entry.key == 'OR') {
+      if (entry.value is List) {
+        for (final item in (entry.value as List)) {
+          if (item is Map<String, dynamic> &&
+              _containsPayload(item, operator)) {
+            return true;
+          }
+        }
+      }
+    } else if (entry.value is Map &&
+        (entry.value as Map).containsKey(operator)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+class _VectorMatchSpec {
+  final String field;
+  final VectorData vector;
+  final double weight;
+  final int? searchDepth;
+  final double? distanceThreshold;
+  final double? minScore;
+
+  _VectorMatchSpec({
+    required this.field,
+    required this.vector,
+    this.weight = 1.0,
+    this.searchDepth,
+    this.distanceThreshold,
+    this.minScore,
+  });
+
+  static _VectorMatchSpec? extract(Map<String, dynamic>? where) {
+    if (where == null || where.isEmpty) return null;
+    if (where.containsKey('AND') && where['AND'] is List) {
+      for (final item in (where['AND'] as List)) {
+        if (item is Map<String, dynamic>) {
+          final s = extract(item);
+          if (s != null) return s;
+        }
+      }
+      return null;
+    }
+    for (final entry in where.entries) {
+      if (entry.value is Map && (entry.value as Map).containsKey(r'$vector')) {
+        final payload = (entry.value as Map)[r'$vector'] as Map;
+        final vec = payload['vector'];
+        if (vec is VectorData) {
+          return _VectorMatchSpec(
+            field: entry.key,
+            vector: vec,
+            weight: (payload['weight'] as num?)?.toDouble() ?? 1.0,
+            searchDepth: payload['searchDepth'] as int?,
+            distanceThreshold:
+                (payload['distanceThreshold'] as num?)?.toDouble(),
+            minScore: (payload['minScore'] as num?)?.toDouble(),
+          );
+        }
+      }
+    }
+    return null;
+  }
+
+  static bool containsVector(Map<String, dynamic>? where) {
+    if (where == null || where.isEmpty) return false;
+    for (final entry in where.entries) {
+      if (entry.key == 'AND' || entry.key == 'OR') {
+        if (entry.value is List) {
+          for (final item in (entry.value as List)) {
+            if (item is Map<String, dynamic> && containsVector(item)) {
+              return true;
+            }
+          }
+        }
+      } else if (entry.value is Map &&
+          (entry.value as Map).containsKey(r'$vector')) {
+        return true;
+      }
+    }
+    return false;
+  }
+}
+
+class TableScanResult {
+  final List<Map<String, dynamic>> records;
+  final int? count;
+  final dynamic aggregateResult;
+
+  TableScanResult({
+    required this.records,
+    this.count,
+    this.aggregateResult,
+  });
+}
+
+class PlanExecutionResult {
+  final List<Map<String, dynamic>> records;
+  final int? count;
+  final dynamic aggregateResult;
+  PlanExecutionResult(this.records, [this.count, this.aggregateResult]);
+}
+
+class ExecuteResult {
+  final List<Map<String, dynamic>> records;
+  final RetrievalContext? retrieval;
+  final String? nextCursor;
+  final String? prevCursor;
+  final bool hasMore;
+  final bool hasPrev;
+
+  final int? executionTimeMs;
+  final int? count;
+  final dynamic aggregateResult;
+
+  /// True when this result represents a direct point lookup (PK / Unique Index)
+  /// that bypassed full table scans, joins, aggregations, and query planners.
+  final bool isPointDirect;
+
+  /// True when [records] already match the caller's select projection
+  /// (e.g. vector PK-only covering). Skip QueryBuilder select remapping.
+  final bool isProjected;
+
+  const ExecuteResult({
+    required this.records,
+    this.retrieval,
+    this.nextCursor,
+    this.prevCursor,
+    this.hasMore = false,
+    this.hasPrev = false,
+    this.executionTimeMs,
+    this.count,
+    this.aggregateResult,
+    this.isPointDirect = false,
+    this.isProjected = false,
+  });
+
+  const ExecuteResult.empty()
+      : records = const [],
+        retrieval = null,
+        nextCursor = null,
+        prevCursor = null,
+        hasMore = false,
+        hasPrev = false,
+        executionTimeMs = null,
+        count = null,
+        aggregateResult = null,
+        isPointDirect = false,
+        isProjected = false;
+}
+
+enum _CursorMode {
+  primaryKey,
+  indexKey,
+  sortKey,
+}
+
+final class _QueryCursorToken {
+  static const int _currentVersion = 1;
+
+  final int version;
+  final _CursorMode mode;
+  final TableUid tableUid;
+  final int? querySigHash;
+
+  // primaryKey mode
+  final String? primaryKey;
+  final bool reverse;
+
+  // indexKey mode
+  final IndexUid indexUid;
+  final Uint8List? indexKey;
+
+  // sortKey mode (orderBy fields + primary key tie-breaker)
+  final List<String>? sortFields;
+  final List<bool>? sortDesc;
+  final Uint8List? sortKey;
+
+  // pagination direction
+  final bool isBackward;
+
+  const _QueryCursorToken._({
+    required this.version,
+    required this.mode,
+    required this.tableUid,
+    required this.primaryKey,
+    required this.reverse,
+    required this.indexUid,
+    required this.indexKey,
+    required this.sortFields,
+    required this.sortDesc,
+    required this.sortKey,
+    this.isBackward = false,
+    this.querySigHash,
+  });
+
+  factory _QueryCursorToken.primaryKey({
+    required TableUid tableUid,
+    required String primaryKey,
+    required bool reverse,
+    bool isBackward = false,
+    int? querySigHash,
+  }) {
+    return _QueryCursorToken._(
+      version: _currentVersion,
+      mode: _CursorMode.primaryKey,
+      tableUid: tableUid,
+      primaryKey: primaryKey,
+      reverse: reverse,
+      indexUid: IndexUid.empty,
+      indexKey: null,
+      sortFields: null,
+      sortDesc: null,
+      sortKey: null,
+      isBackward: isBackward,
+      querySigHash: querySigHash,
+    );
+  }
+
+  factory _QueryCursorToken.indexKey({
+    required TableUid tableUid,
+    required IndexUid indexUid,
+    required Uint8List indexKey,
+    bool isBackward = false,
+    int? querySigHash,
+  }) {
+    return _QueryCursorToken._(
+      version: _currentVersion,
+      mode: _CursorMode.indexKey,
+      tableUid: tableUid,
+      primaryKey: null,
+      reverse: false,
+      indexUid: indexUid,
+      indexKey: indexKey,
+      sortFields: null,
+      sortDesc: null,
+      sortKey: null,
+      isBackward: isBackward,
+      querySigHash: querySigHash,
+    );
+  }
+
+  factory _QueryCursorToken.sortKey({
+    required TableUid tableUid,
+    required List<String> sortFields,
+    required List<bool> sortDesc,
+    required Uint8List sortKey,
+    bool isBackward = false,
+    int? querySigHash,
+  }) {
+    return _QueryCursorToken._(
+      version: _currentVersion,
+      mode: _CursorMode.sortKey,
+      tableUid: tableUid,
+      primaryKey: null,
+      reverse: false,
+      indexUid: IndexUid.empty,
+      indexKey: null,
+      sortFields: List<String>.from(sortFields, growable: false),
+      sortDesc: List<bool>.from(sortDesc, growable: false),
+      sortKey: sortKey,
+      isBackward: isBackward,
+      querySigHash: querySigHash,
+    );
+  }
+
+  String encode() {
+    final builder = BytesBuilder(copy: false);
+    builder.addByte(0xFE);
+    builder.addByte(version);
+    builder.addByte(mode.index);
+    builder.addByte(isBackward ? 1 : 0);
+
+    final tBytes = utf8.encode(tableUid);
+    final bdLen = ByteData(2)..setUint16(0, tBytes.length, Endian.big);
+    builder.add(bdLen.buffer.asUint8List());
+    builder.add(tBytes);
+
+    if (querySigHash != null) {
+      builder.addByte(1);
+      // FNV signature is an unsigned 32-bit bit-pattern.
+      final bdata = ByteData(4)
+        ..setUint32(0, querySigHash! & 0xFFFFFFFF, Endian.big);
+      builder.add(bdata.buffer.asUint8List());
+    } else {
+      builder.addByte(0);
+    }
+
+    if (mode == _CursorMode.primaryKey) {
+      builder.addByte(reverse ? 1 : 0);
+      final pkBytes = utf8.encode(primaryKey ?? '');
+      final bd = ByteData(4)..setInt32(0, pkBytes.length, Endian.big);
+      builder.add(bd.buffer.asUint8List());
+      builder.add(pkBytes);
+    } else if (mode == _CursorMode.indexKey) {
+      final iBytes = utf8.encode(indexUid);
+      final bdIdx = ByteData(2)..setUint16(0, iBytes.length, Endian.big);
+      builder.add(bdIdx.buffer.asUint8List());
+      builder.add(iBytes);
+
+      final keyBytes = indexKey ?? Uint8List(0);
+      final bd = ByteData(4)..setInt32(0, keyBytes.length, Endian.big);
+      builder.add(bd.buffer.asUint8List());
+      builder.add(keyBytes);
+    } else {
+      final fields = sortFields ?? const <String>[];
+      final descs = sortDesc ?? const <bool>[];
+      // Wire format uses u8 counts - keep encode/decode symmetric so tokens
+      // always round-trip. This is not a query policy cap.
+      if (fields.length != descs.length) {
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidCursorPayload,
+            message:
+                'Cannot encode sort-key cursor: field/direction count mismatch.',
+            parameterName: 'cursor',
+          ),
+        ]);
+      }
+      if (fields.length > 255) {
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidCursorPayload,
+            message:
+                'Cannot encode sort-key cursor: orderBy field count exceeds wire limit (255).',
+            parameterName: 'orderBy',
+            passedValue: fields.length,
+          ),
+        ]);
+      }
+      builder.addByte(fields.length);
+      for (final f in fields) {
+        final fb = utf8.encode(f);
+        final bd = ByteData(2)..setUint16(0, fb.length, Endian.big);
+        builder.add(bd.buffer.asUint8List());
+        builder.add(fb);
+      }
+      builder.addByte(descs.length);
+      for (final d in descs) {
+        builder.addByte(d ? 1 : 0);
+      }
+      final keyBytes = sortKey ?? Uint8List(0);
+      final bd = ByteData(4)..setInt32(0, keyBytes.length, Endian.big);
+      builder.add(bd.buffer.asUint8List());
+      builder.add(keyBytes);
+    }
+
+    return base64Url.encode(builder.takeBytes());
+  }
+
+  static _QueryCursorToken? tryDecode(String? raw) {
+    if (raw == null || raw.trim().isEmpty) return null;
+    final token = raw.trim();
+    try {
+      final bytes = base64Url.decode(base64Url.normalize(token));
+      if (bytes.isEmpty) return null;
+
+      // Only binary cursor tokens (magic 0xFE) are accepted.
+      if (bytes[0] != 0xFE) {
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidCursorPayload,
+            message:
+                'Unsupported cursor token format (expected binary 0xFE prefix).',
+            parameterName: 'cursor',
+            passedValue: {'tokenLength': token.length},
+          ),
+        ]);
+      }
+      return _tryDecodeBinary(bytes);
+    } catch (e) {
+      if (e is DbException) rethrow;
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devInvalidCursorPayload,
+          message: 'Failed to decode cursor token: $e',
+          parameterName: 'cursor',
+          passedValue: {'tokenLength': token.length},
+        ),
+      ]);
+    }
+  }
+
+  static Never _invalidCursorPayload(String message) {
+    throw DbException([
+      InvalidArgumentStatus(
+        type: ResultType.devInvalidCursorPayload,
+        message: message,
+        parameterName: 'cursor',
+      ),
+    ]);
+  }
+
+  /// Ensure `[offset, offset + length)` is inside [bytes].
+  /// Only structural bounds - no business caps that would reject valid tokens.
+  static void _ensureCursorBytes(
+    Uint8List bytes,
+    int offset,
+    int length,
+  ) {
+    if (length < 0 ||
+        offset < 0 ||
+        offset > bytes.length ||
+        length > bytes.length - offset) {
+      _invalidCursorPayload('Invalid binary cursor payload (truncated).');
+    }
+  }
+
+  static int _readCursorUint8(Uint8List bytes, int offset) {
+    _ensureCursorBytes(bytes, offset, 1);
+    return bytes[offset];
+  }
+
+  static int _readCursorUint16(Uint8List bytes, int offset) {
+    _ensureCursorBytes(bytes, offset, 2);
+    return ByteData.sublistView(bytes, offset, offset + 2)
+        .getUint16(0, Endian.big);
+  }
+
+  static int _readCursorInt32(Uint8List bytes, int offset) {
+    _ensureCursorBytes(bytes, offset, 4);
+    return ByteData.sublistView(bytes, offset, offset + 4)
+        .getInt32(0, Endian.big);
+  }
+
+  static int _readCursorUint32(Uint8List bytes, int offset) {
+    _ensureCursorBytes(bytes, offset, 4);
+    return ByteData.sublistView(bytes, offset, offset + 4)
+        .getUint32(0, Endian.big);
+  }
+
+  static Uint8List _readCursorSlice(Uint8List bytes, int offset, int length) {
+    _ensureCursorBytes(bytes, offset, length);
+    return bytes.sublist(offset, offset + length);
+  }
+
+  static String _readCursorUtf8(Uint8List bytes, int offset, int length) {
+    return utf8.decode(_readCursorSlice(bytes, offset, length));
+  }
+
+  static _QueryCursorToken _tryDecodeBinary(Uint8List bytes) {
+    int offset = 1;
+    _ensureCursorBytes(bytes, offset, 3); // version + mode + isBackward
+
+    final v = bytes[offset++];
+    if (v != _currentVersion) {
+      _invalidCursorPayload('Unsupported cursor token version: $v');
+    }
+
+    final modeIndex = bytes[offset++];
+    if (modeIndex < 0 || modeIndex >= _CursorMode.values.length) {
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devInvalidCursorMode,
+          message: 'Unknown binary cursor token mode.',
+          parameterName: 'cursor',
+        ),
+      ]);
+    }
+    final mode = _CursorMode.values[modeIndex];
+    final isBackward = bytes[offset++] == 1;
+
+    final tLen = _readCursorUint16(bytes, offset);
+    offset += 2;
+    final tableUid = TableUid(_readCursorUtf8(bytes, offset, tLen));
+    offset += tLen;
+
+    final hasSigHash = _readCursorUint8(bytes, offset) == 1;
+    offset += 1;
+    int? querySigHash;
+    if (hasSigHash) {
+      querySigHash = _readCursorUint32(bytes, offset);
+      offset += 4;
+    }
+
+    String? primaryKey;
+    bool reverse = false;
+    IndexUid indexUid = IndexUid.empty;
+    Uint8List? indexKey;
+    List<String>? sortFields;
+    List<bool>? sortDesc;
+    Uint8List? sortKey;
+
+    if (mode == _CursorMode.primaryKey) {
+      reverse = _readCursorUint8(bytes, offset) == 1;
+      offset += 1;
+      final pkLen = _readCursorInt32(bytes, offset);
+      offset += 4;
+      primaryKey = _readCursorUtf8(bytes, offset, pkLen);
+      offset += pkLen;
+    } else if (mode == _CursorMode.indexKey) {
+      final iLen = _readCursorUint16(bytes, offset);
+      offset += 2;
+      indexUid = IndexUid(_readCursorUtf8(bytes, offset, iLen));
+      offset += iLen;
+      final kLen = _readCursorInt32(bytes, offset);
+      offset += 4;
+      indexKey = Uint8List.fromList(_readCursorSlice(bytes, offset, kLen));
+      offset += kLen;
+    } else {
+      // sortKey: encode writes fieldCount (u8), fields..., descCount (u8),
+      // descs..., keyLen (i32), keyBytes. fieldCount/descCount are the same
+      // wire width as encode (single byte) - do not invent tighter caps.
+      final fieldCount = _readCursorUint8(bytes, offset);
+      offset += 1;
+      sortFields = <String>[];
+      for (int i = 0; i < fieldCount; i++) {
+        final fLen = _readCursorUint16(bytes, offset);
+        offset += 2;
+        sortFields.add(_readCursorUtf8(bytes, offset, fLen));
+        offset += fLen; // must advance past field name bytes
+      }
+
+      final descCount = _readCursorUint8(bytes, offset);
+      offset += 1;
+      // Encode always emits matching counts; mismatch means corruption, not a
+      // legitimate older/newer dialect - safe to reject without false positives.
+      if (descCount != fieldCount) {
+        _invalidCursorPayload(
+          'Invalid sort-key cursor token (field/direction count mismatch).',
+        );
+      }
+      sortDesc = <bool>[];
+      for (int i = 0; i < descCount; i++) {
+        sortDesc.add(_readCursorUint8(bytes, offset) == 1);
+        offset += 1;
+      }
+
+      final kLen = _readCursorInt32(bytes, offset);
+      offset += 4;
+      sortKey = Uint8List.fromList(_readCursorSlice(bytes, offset, kLen));
+      offset += kLen;
+    }
+
+    // Trailing bytes are ignored for forward compatibility with future fields.
+    return _QueryCursorToken._(
+      version: v,
+      mode: mode,
+      tableUid: tableUid,
+      primaryKey: primaryKey,
+      reverse: reverse,
+      indexUid: indexUid,
+      indexKey: indexKey,
+      sortFields: sortFields,
+      sortDesc: sortDesc,
+      sortKey: sortKey,
+      isBackward: isBackward,
+      querySigHash: querySigHash,
+    );
+  }
+}
+
+int _buildQuerySignatureHash({
+  required TableUid tableUid,
+  required Map<String, dynamic>? where,
+  required List<String>? orderBy,
+  List<JoinClause>? joins,
+  List<String>? groupBy,
+  List<QueryAggregation>? aggregations,
+}) {
+  int hash = 2166136261;
+
+  void hashByte(int b) {
+    hash ^= b;
+    hash = (hash * 16777619) & 0xFFFFFFFF;
+  }
+
+  void hashString(String s) {
+    final codeUnits = s.codeUnits;
+    for (int i = 0; i < codeUnits.length; i++) {
+      final unit = codeUnits[i];
+      if (unit <= 0x7f) {
+        hashByte(unit);
+      } else {
+        hashByte(unit & 0xff);
+        hashByte((unit >> 8) & 0xff);
+      }
+    }
+  }
+
+  void hashObject(dynamic obj) {
+    if (obj == null) {
+      hashByte(0x00);
+    } else if (obj is bool) {
+      hashByte(obj ? 0x01 : 0x02);
+    } else if (obj is int) {
+      hashByte(0x03);
+      hashString(obj.toString());
+    } else if (obj is double) {
+      hashByte(obj.isNaN || obj.isInfinite ? 0x04 : 0x05);
+      hashString(obj.toString());
+    } else if (obj is String) {
+      hashByte(0x06);
+      hashString(obj);
+    } else if (obj is Map) {
+      hashByte(0x07);
+      final sortedKeys = obj.keys.map((k) => k.toString()).toList()..sort();
+      for (final k in sortedKeys) {
+        hashString(k);
+        hashObject(obj[k]);
+      }
+    } else if (obj is List) {
+      hashByte(0x08);
+      for (final item in obj) {
+        hashObject(item);
+      }
+    } else if (obj is DateTime) {
+      hashByte(0x09);
+      hashString(obj.toUtc().toIso8601String());
+    } else {
+      hashByte(0x0A);
+      try {
+        final dynamic toJsonResult = (obj as dynamic).toJson();
+        hashObject(toJsonResult);
+      } catch (_) {
+        hashString(obj.toString());
+      }
+    }
+  }
+
+  // Normalize empty containers so QueryBuilder / direct execute paths agree.
+  final Map<String, dynamic>? normWhere =
+      (where == null || where.isEmpty) ? null : where;
+  final List<String>? normOrderBy =
+      (orderBy == null || orderBy.isEmpty) ? null : orderBy;
+  final List<String>? normGroupBy =
+      (groupBy == null || groupBy.isEmpty) ? null : groupBy;
+
+  List<Map<String, String>>? joinsFp;
+  if (joins != null && joins.isNotEmpty) {
+    joinsFp = <Map<String, String>>[
+      for (final j in joins)
+        <String, String>{
+          't': j.type.name,
+          'table': j.table,
+          'fk': j.firstKey,
+          'op': j.operator,
+          'sk': j.secondKey,
+        },
+    ];
+  }
+
+  List<Map<String, String>>? aggsFp;
+  if (aggregations != null && aggregations.isNotEmpty) {
+    aggsFp = <Map<String, String>>[
+      for (final a in aggregations)
+        <String, String>{
+          'type': a.type.name,
+          'field': a.field,
+          if (a.alias != null) 'alias': a.alias!,
+        },
+    ];
+  }
+
+  hashString(tableUid);
+  hashByte(0x7C);
+  hashObject(normWhere);
+  hashByte(0x7C);
+  hashObject(normOrderBy);
+  hashByte(0x7C);
+  hashObject(joinsFp);
+  hashByte(0x7C);
+  hashObject(normGroupBy);
+  hashByte(0x7C);
+  hashObject(aggsFp);
+
+  // Unsigned 32-bit FNV bit-pattern (must match setUint32/getUint32 on the wire).
+  return hash & 0xFFFFFFFF;
+}

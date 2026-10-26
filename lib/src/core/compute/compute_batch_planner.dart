@@ -1,7 +1,7 @@
 import 'dart:math';
 
 import '../../handler/platform_handler.dart';
-import '../compute_manager.dart';
+import 'compute_manager.dart';
 
 /// Range descriptor for splitting a batch into balanced sub-tasks.
 class ComputeTaskRange {

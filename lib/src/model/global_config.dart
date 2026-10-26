@@ -1,4 +1,3 @@
-import '../handler/common.dart';
 import 'applied_encryption.dart';
 
 /// global config model
@@ -196,4 +195,52 @@ class GlobalConfig {
   GlobalConfig setUserVersion(int newVersion) {
     return copyWith(userVersion: newVersion);
   }
+}
+
+/// internal configuration
+class InternalConfig {
+  /// Whether to emit engine-internal diagnostic logs (via Logger.debug).
+  static const bool showInternalLogs = false;
+
+  /// public label
+  static const String publicLabel = 'ToStore';
+
+  /// engine/storage version (global config + space config)
+  static const int engineVersion = 4;
+  static const int legacyEngineVersion = 0; // legacy file default value
+
+  /// schema version (table schemas + schema partitions)
+  static const int schemaVersion = 2;
+  static const int legacySchemaVersion = 0; // legacy file default value
+
+  /// table data version (table data files + partitions)
+  static const int tableDataVersion = 1;
+  static const int legacyTableDataVersion = 0; // legacy file default value
+
+  /// index version (index files + partitions)
+  static const int indexVersion = 1;
+  static const int legacyIndexVersion = 0; // legacy file default value
+
+  /// backup package format version used by backup
+  /// v1 = legacy `meta.json`; v2 = `meta.tobf` (field-tag + optional full-scope AEAD)
+  static const int currentBackupFormatVersion = 2;
+  static const int legacyBackupFormatVersion = 1; // legacy JSON default
+
+  /// Max entries (files/subdirs) per directory.
+  ///
+  /// NOTE:
+  /// - This is **engine-managed**, not a user-facing config.
+  /// - Persisted in [GlobalConfig.maxEntriesPerDir] for forward-compatibility.
+  /// - Used for deterministic sharding: `dirIndex = pIndex ~/ maxEntriesPerDir`.
+  static const int defaultMaxEntriesPerDir = 2000;
+
+  /// Default B+Tree / NGH page size (16KB).
+  ///
+  /// Used only when creating a brand-new database or filling missing
+  /// [GlobalConfig.pageSize] during upgrades. Once persisted in GlobalConfig,
+  /// page size is immutable for that database lifetime.
+  static const int defaultPageSize = 16 * 1024;
+
+  /// Inclusive max vector width. NGH leaf/nav store dimensions as u16.
+  static const int maxVectorDimensions = 65535;
 }

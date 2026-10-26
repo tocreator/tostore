@@ -1,5 +1,5 @@
 import '../../model/query_aggregation.dart';
-import '../yield_controller.dart';
+import 'yield_controller.dart';
 
 class QueryAggregateChunkRequest {
   final List<Map<String, dynamic>> records;

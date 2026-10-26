@@ -1596,8 +1596,8 @@ String formatVectorDepthSweepSummary({
     ..writeln(
         'searchDepth | recall@$scoredK | top1_hit | self_rc | avg_ms | p95_ms | qps');
 
-  for (final row in records) {
-    header.writeln(row.sweepTableRow());
+  for (final record in records) {
+    header.writeln(record.sweepTableRow());
   }
 
   return header.toString().trimRight();

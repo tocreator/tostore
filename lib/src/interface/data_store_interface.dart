@@ -1,7 +1,7 @@
 import 'dart:async';
 
-import '../chain/schema_builder.dart';
-import '../chain/stream_query_builder.dart';
+import '../core/chain/schema_builder.dart';
+import '../core/chain/stream_query_builder.dart';
 import '../interface/chain_builder.dart';
 import '../interface/kv_store.dart';
 import '../model/backup_scope.dart';

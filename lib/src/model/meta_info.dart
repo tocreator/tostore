@@ -1,5 +1,5 @@
-import '../handler/common.dart';
 import 'db_exception.dart';
+import 'global_config.dart';
 import 'result_status.dart';
 import 'result_type.dart';
 import 'table_identity.dart';
@@ -1253,4 +1253,16 @@ String? _resolveIndexTableUidFromJson(
   return _nonEmptyString(json['tableUid']) ??
       (fallback != null && fallback.isNotEmpty ? fallback.value : null) ??
       _nonEmptyString(json['tableName']);
+}
+
+/// Safely parse persisted version values with backward compatibility.
+int resolveVersionValue(dynamic value, int fallback) {
+  if (value == null) return fallback;
+  if (value is int) return value;
+  if (value is num) return value.toInt();
+  if (value is String) {
+    final parsed = int.tryParse(value);
+    if (parsed != null) return parsed;
+  }
+  return fallback;
 }

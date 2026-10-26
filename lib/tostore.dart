@@ -14,9 +14,9 @@ library;
 
 import 'dart:async';
 
-import 'src/chain/schema_builder.dart';
-import 'src/chain/stream_query_builder.dart';
-import 'src/core/data_store_impl.dart';
+import 'src/core/chain/schema_builder.dart';
+import 'src/core/chain/stream_query_builder.dart';
+import 'src/core/engine/data_store_impl.dart';
 import 'src/handler/logger.dart';
 import 'src/interface/chain_builder.dart';
 import 'src/interface/data_store_interface.dart';
@@ -39,7 +39,8 @@ import 'src/model/table_info.dart';
 import 'src/model/table_schema.dart';
 import 'src/model/transaction_result.dart';
 
-export 'src/chain/kv_query_builder.dart';
+export 'src/core/chain/kv_query_builder.dart';
+export 'src/core/query/query_condition.dart';
 export 'src/handler/logger.dart' show LogLevel, LogRecord, LogConfig, LogType;
 export 'src/handler/to_crypto.dart';
 export 'src/interface/chain_builder.dart';
@@ -67,7 +68,6 @@ export 'src/model/table_info.dart';
 export 'src/model/table_schema.dart';
 export 'src/model/text_query.dart';
 export 'src/model/transaction_result.dart';
-export 'src/query/query_condition.dart';
 
 /// High-performance storage engine
 /// Features:

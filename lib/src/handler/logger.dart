@@ -1,9 +1,10 @@
+import 'dart:convert';
 import 'dart:developer';
 
 import '../model/db_exception.dart';
+import '../model/global_config.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
-import 'common.dart';
 import 'platform_handler.dart';
 
 /// Log level, each level represents showing logs of that level and higher
@@ -235,7 +236,7 @@ class Logger {
     // Auto-wrap empty status for error and critical levels
     if (status == null &&
         (level == LogLevel.error || level == LogLevel.critical)) {
-      final msgStr = message != null ? toStringWithAll(message) : '';
+      final msgStr = message != null ? _stringifyLogMessage(message) : '';
       status = GeneralStatus(
         type: ResultType.engError,
         message: msgStr.isNotEmpty
@@ -250,7 +251,7 @@ class Logger {
     // ignoring fallback message to prevent duplicate processing.
     final String text;
     if (message != null && status != null) {
-      final ctx = message is String ? message : toStringWithAll(message);
+      final ctx = message is String ? message : _stringifyLogMessage(message);
       final detail = status.message;
       if (ctx == detail || message is ResultStatus || message is DbException) {
         text = ctx;
@@ -262,7 +263,7 @@ class Logger {
     } else if (message is String) {
       text = message;
     } else if (message != null) {
-      text = toStringWithAll(message);
+      text = _stringifyLogMessage(message);
     } else {
       text = '';
     }
@@ -421,3 +422,19 @@ class LogConfig {
 // log type enum
 @Deprecated('Use LogLevel instead')
 enum LogType { info, debug, warn, error, critical }
+
+String _stringifyLogMessage(Object? object) {
+  String value = '';
+  try {
+    if (object is String) {
+      value = object;
+    } else if (object is Map || object is List) {
+      value = jsonEncode(object);
+    } else {
+      value = object.toString();
+    }
+  } catch (e) {
+    Logger.error('cannot convert ${object.runtimeType} to string', rawError: e);
+  }
+  return value;
+}

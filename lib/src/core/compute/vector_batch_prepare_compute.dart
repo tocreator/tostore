@@ -2,7 +2,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import '../../model/table_schema.dart';
-import '../yield_controller.dart';
+import 'yield_controller.dart';
 
 /// Pure-compute request for preparing a vector batch chunk.
 class VectorBatchPrepareRequest {

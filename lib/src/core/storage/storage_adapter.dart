@@ -1,0 +1,1205 @@
+import 'dart:async';
+import 'dart:typed_data';
+
+import 'package:path/path.dart' as path;
+
+import '../../handler/logger.dart';
+import '../../handler/platform_handler.dart';
+import '../../interface/file_storage_impl_stub.dart'
+    if (dart.library.io) 'file_storage_impl.dart';
+import '../../interface/storage_interface.dart';
+import '../../model/db_exception.dart';
+import '../../model/id_generator.dart';
+import '../../model/result_status.dart';
+import '../../model/result_type.dart';
+import '../txn/lock_manager.dart';
+import 'path_manager.dart';
+// Import platform-specific implementations with conditional imports
+import 'web_storage_impl.dart'
+    if (dart.library.io) '../../interface/web_storage_impl_stub.dart';
+
+/// Storage adapter to handle platform-specific storage implementations
+class StorageAdapter implements StorageInterface {
+  void _throwLockTimeout(String message, String resource) {
+    throw DbException([
+      GeneralStatus(
+        type: ResultType.sysTimeoutLockAcquisition,
+        message: message,
+        target: resource,
+        operation: 'acquire',
+      )
+    ]);
+  }
+
+  late final StorageInterface _storage;
+
+  /// lock manager
+  final LockManager _lockManager;
+
+  /// Guard against concurrent flushAll executions
+  bool _flushInProgress = false;
+
+  /// Serializes flushAll so closeHandles:true never silently skips when a
+  /// best-effort burst flush is already running (critical in release timing).
+  Future<void> _flushQueue = Future<void>.value();
+
+  /// Guard against I/O after close.
+  ///
+  /// Business read/write/append/replace throw [DbClosedException] after [close]
+  /// so late async cannot reopen pooled handles or treat empty reads as data.
+  /// Filesystem surgery used by restore/deleteDatabase remains available:
+  /// [existsFile], [existsDirectory], [deleteFile], [deleteDirectory],
+  /// [listDirectory], [ensureDirectoryExists], [copyFile], [copyDirectory],
+  /// [moveDirectory], [flushAll], and [close].
+  bool _isClosed = false;
+  bool get isClosed => _isClosed;
+
+  void _ensureOpen() {
+    if (_isClosed) {
+      throw DbClosedException('Storage adapter is closed');
+    }
+  }
+
+  /// Global scheduler and activity tracking (shared across adapters)
+  static final Set<StorageAdapter> _instances = <StorageAdapter>{};
+  static DateTime? _lastWriteAt;
+  static DateTime? _lastFlushAt;
+
+  static Timer? _burstTimer;
+  static DateTime? _lastBurstAt;
+  static const Duration _burstMinGap = Duration(seconds: 1);
+
+  /// operation prefix
+  static const String _readOpPrefix = 'read-';
+  static const String _writeOpPrefix = 'write-';
+  static const String _listOpPrefix = 'list-';
+  static const String _deleteOpPrefix = 'delete-';
+  static const String _writeOpSerializePrefix = 'write-serialize-';
+  StorageAdapter({
+    required LockManager lockManager,
+    StorageInterface? overrideStorage,
+  }) : _lockManager = lockManager {
+    if (overrideStorage != null) {
+      _storage = overrideStorage;
+    } else {
+      if (PlatformHandler.isWeb) {
+        _storage = WebStorageImpl('db');
+      } else {
+        _storage = FileStorageImpl();
+      }
+    }
+
+    // Register instance for global flush operations
+    _instances.add(this);
+  }
+
+  /// Create a storage adapter with a provided storage implementation.
+  /// Used for pure in-memory mode (no IO) and testing.
+  StorageAdapter.forStorage(StorageInterface storage,
+      {required LockManager lockManager})
+      : this(overrideStorage: storage, lockManager: lockManager);
+
+  /// Unified configuration entry to reduce initialization redundancy
+  Future<void> configure({int? maxOpenHandles}) async {
+    try {
+      await configureStorage(maxOpenHandles: maxOpenHandles);
+    } catch (e) {
+      Logger.error('Configure storage failed', rawError: e);
+    }
+  }
+
+  /// generate lock resource name for resource path
+  String _getLockResource(String filePath) {
+    // Canonicalize ensure consistent representation (case, separators, dots)
+    final canonicalPath = path.canonicalize(filePath);
+
+    // use hash to handle long path, avoid lock resource name too long.
+    // Increased limit to 384 to support deep hierarchical locking on Windows.
+    if (canonicalPath.length > 384) {
+      // Use more stable hash method and add prefix for better identification
+      final hash = canonicalPath.hashCode.abs();
+      return 'path-hash-$hash';
+    }
+
+    return 'path-$canonicalPath';
+  }
+
+  /// generate write serialization lock resource name for resource path
+  String _getWriteLockResource(String filePath) {
+    final normalizedPath = path.normalize(filePath);
+
+    if (normalizedPath.length > 128) {
+      final hash = normalizedPath.hashCode.abs();
+      return '$_writeOpSerializePrefix$hash';
+    }
+
+    return '$_writeOpSerializePrefix$normalizedPath';
+  }
+
+  /// Build a temporary file path for crash-safe atomic replacement.
+  ///
+  /// For paths under a database space root (`.../spaces/{spaceName}/...`),
+  /// place all temporary files under that space's `tmp` directory with
+  /// Place temporary files under the space's `tmp` directory or target directory,
+  /// delegated to [PathManager.buildTempPath].
+  String _buildTempPath(String filePath) => PathManager.buildTempPath(filePath);
+
+  Future<void> _cleanupTemp(String? tempPath) async {
+    if (tempPath == null) return;
+    try {
+      if (await _storage.existsFile(tempPath)) {
+        await _storage.deleteFile(tempPath);
+      }
+    } catch (_) {}
+  }
+
+  //========================================================================
+  // In-flight temp write tracking & safe drain for temp directory reset
+  //========================================================================
+
+  int _activeTempWrites = 0;
+  bool _tempResetting = false;
+  Completer<void>? _tempResetCompleter;
+  Completer<void>? _activeTempWritesDrainCompleter;
+
+  /// Wait out an in-progress temp-dir reset (no-op on the fast path).
+  Future<void> _checkTempResetGate() async {
+    while (_tempResetting) {
+      final completer = _tempResetCompleter;
+      if (completer == null || completer.isCompleted) {
+        // Flag/completer being torn down; yield and re-check.
+        await Future<void>.value();
+        continue;
+      }
+      await completer.future;
+    }
+  }
+
+  /// Enter the temp-staging critical section.
+  ///
+  /// Must not leave a window where reset sees count==0 after the gate passed:
+  /// wait -> begin is retried if reset started in between (single-isolate safe
+  /// once begin and the re-check are synchronous).
+  Future<void> _enterTempWrite() async {
+    while (true) {
+      await _checkTempResetGate();
+      _beginTempWrite();
+      if (!_tempResetting) {
+        return;
+      }
+      // Lost the race with reset: undo and wait for it to finish.
+      _endTempWrite();
+    }
+  }
+
+  /// Synchronous in-flight counter increment.
+  void _beginTempWrite() {
+    _activeTempWrites++;
+  }
+
+  /// Synchronous in-flight counter decrement and drain notification.
+  void _endTempWrite() {
+    _activeTempWrites--;
+    if (_activeTempWrites <= 0) {
+      _activeTempWrites = 0;
+      final drainCompleter = _activeTempWritesDrainCompleter;
+      if (drainCompleter != null && !drainCompleter.isCompleted) {
+        drainCompleter.complete();
+      }
+    }
+  }
+
+  /// True when [filePath] is under `spaces/<name>/tmp/` (atomic staging area).
+  static bool _isSpaceTempPath(String filePath) {
+    final parts = path.split(path.normalize(filePath));
+    final idx = parts.indexOf('spaces');
+    return idx != -1 && idx + 2 < parts.length && parts[idx + 2] == 'tmp';
+  }
+
+  /// Wait for in-flight atomic temp writers, then delete and recreate [tempDir].
+  ///
+  /// Does not time out into an unsafe delete: if drain is slow we keep waiting.
+  /// Concurrent callers join the in-flight reset instead of no-op'ing.
+  Future<void> drainAndResetTempDirectory(String tempDir) async {
+    _ensureOpen();
+    if (_tempResetting) {
+      final inFlight = _tempResetCompleter;
+      if (inFlight != null && !inFlight.isCompleted) {
+        await inFlight.future;
+      }
+      return;
+    }
+
+    _tempResetting = true;
+    _tempResetCompleter = Completer<void>();
+
+    try {
+      while (_activeTempWrites > 0) {
+        final drainCompleter = Completer<void>();
+        _activeTempWritesDrainCompleter = drainCompleter;
+        // Double-check in case writes completed right before setting completer.
+        if (_activeTempWrites > 0) {
+          await drainCompleter.future;
+        }
+        _activeTempWritesDrainCompleter = null;
+      }
+
+      await _storage.deleteDirectory(tempDir);
+      await _storage.ensureDirectoryExists(tempDir);
+    } finally {
+      _tempResetting = false;
+      final resetCompleter = _tempResetCompleter;
+      _tempResetCompleter = null;
+      if (resetCompleter != null && !resetCompleter.isCompleted) {
+        resetCompleter.complete();
+      }
+    }
+  }
+
+  /// generate operation id with high uniqueness
+  String _generateOperationId(String prefix) {
+    return GlobalIdGenerator.generate(prefix);
+  }
+
+  // Debounced event-driven flush for recovery artifacts (pooled handles).
+  static void _scheduleBurstFlush() {
+    // If a burst timer is already pending, do not reschedule; coalesce triggers.
+    if (_burstTimer != null && _burstTimer!.isActive) {
+      return;
+    }
+    final now = DateTime.now();
+    final last = _lastWriteAt;
+    if (last == null) return;
+
+    final since = now.difference(last);
+    final Duration delay;
+    if (since.inMinutes >= 1) {
+      return; // idle
+    } else if (since.inSeconds <= 30) {
+      delay = const Duration(milliseconds: 200); // busy
+    } else {
+      delay = const Duration(milliseconds: 500); // normal
+    }
+
+    _burstTimer = Timer(delay, () async {
+      final now = DateTime.now();
+      // Prevent overly frequent bursts
+      if (_lastBurstAt != null &&
+          now.difference(_lastBurstAt!) < _burstMinGap) {
+        return;
+      }
+      // Skip if no new write since last flush
+      final lastWrite = _lastWriteAt;
+      if (lastWrite == null) return;
+      if (_lastFlushAt != null && !lastWrite.isAfter(_lastFlushAt!)) return;
+
+      _lastBurstAt = now;
+      try {
+        final instances = _instances.toList(growable: false);
+        await Future.wait(instances.map((inst) async {
+          try {
+            await inst.flushAll();
+          } catch (_) {}
+        }));
+        _lastFlushAt = DateTime.now();
+      } catch (_) {}
+    });
+  }
+
+  static void notifyRecoveryWrite() {
+    _lastWriteAt = DateTime.now();
+    _scheduleBurstFlush();
+  }
+
+  @override
+  Future<void> writeAsString(String path, String content,
+      {bool append = false,
+      bool flush = true,
+      bool closeHandleAfterFlush = false}) async {
+    _ensureOpen();
+    final resource = _getLockResource(path);
+    final writeResource = _getWriteLockResource(path);
+    final opId = _generateOperationId(_writeOpPrefix);
+    final serializeOpId = '$opId-serialize';
+
+    bool serializeAcquired = false;
+    try {
+      // Serialize writers to avoid concurrent overwrites while allowing readers during temp write.
+      serializeAcquired =
+          await _lockManager.acquireExclusiveLock(writeResource, serializeOpId);
+      if (!serializeAcquired) {
+        _throwLockTimeout(
+            'Failed to acquire serialize lock for write: $writeResource',
+            writeResource);
+      }
+
+      // Atomic path for non-append + flush=true: long write goes to temp without blocking readers.
+      if (!append && flush) {
+        final tempPath = _buildTempPath(path);
+        await _enterTempWrite();
+        try {
+          await _storage.writeAsString(tempPath, content,
+              append: false, flush: true, closeHandleAfterFlush: true);
+
+          final replaceOpId = '$opId-replace';
+          bool replaceAcquired = false;
+          try {
+            replaceAcquired =
+                await _lockManager.acquireExclusiveLock(resource, replaceOpId);
+            if (!replaceAcquired) {
+              _throwLockTimeout(
+                  'Failed to acquire exclusive lock for atomic replace: $resource',
+                  resource);
+            }
+            await _storage.replaceFileAtomic(tempPath, path);
+          } finally {
+            if (replaceAcquired) {
+              _lockManager.releaseExclusiveLock(resource, replaceOpId);
+            }
+          }
+        } finally {
+          try {
+            await _cleanupTemp(tempPath);
+          } finally {
+            _endTempWrite();
+          }
+        }
+        return;
+      }
+
+      bool acquired = false;
+      try {
+        // Legacy path for append or flush=false: hold write lock to protect readers.
+        acquired = await _lockManager.acquireExclusiveLock(resource, opId);
+        if (!acquired) {
+          _throwLockTimeout(
+              'Failed to acquire exclusive lock for write: $resource',
+              resource);
+        }
+
+        await _storage.writeAsString(path, content,
+            append: append,
+            flush: flush,
+            closeHandleAfterFlush: closeHandleAfterFlush);
+      } finally {
+        if (acquired) {
+          _lockManager.releaseExclusiveLock(resource, opId);
+        }
+      }
+    } finally {
+      if (serializeAcquired) {
+        _lockManager.releaseExclusiveLock(writeResource, serializeOpId);
+      }
+    }
+  }
+
+  @override
+  Future<void> writeAsBytes(String path, Uint8List bytes,
+      {bool flush = true, bool closeHandleAfterFlush = false}) async {
+    _ensureOpen();
+    final resource = _getLockResource(path);
+    final writeResource = _getWriteLockResource(path);
+    final opId = _generateOperationId(_writeOpPrefix);
+    final serializeOpId = '$opId-serialize';
+
+    bool serializeAcquired = false;
+    try {
+      serializeAcquired =
+          await _lockManager.acquireExclusiveLock(writeResource, serializeOpId);
+      if (!serializeAcquired) {
+        _throwLockTimeout(
+            'Failed to acquire serialize lock for writeBytes: $writeResource',
+            writeResource);
+      }
+
+      if (flush) {
+        final tempPath = _buildTempPath(path);
+        await _enterTempWrite();
+        try {
+          await _storage.writeAsBytes(tempPath, bytes,
+              flush: true, closeHandleAfterFlush: true);
+
+          final replaceOpId = '$opId-replace';
+          bool replaceAcquired = false;
+          try {
+            replaceAcquired =
+                await _lockManager.acquireExclusiveLock(resource, replaceOpId);
+            if (!replaceAcquired) {
+              _throwLockTimeout(
+                  'Failed to acquire exclusive lock for atomic replace: $resource',
+                  resource);
+            }
+            await _storage.replaceFileAtomic(tempPath, path);
+          } finally {
+            if (replaceAcquired) {
+              _lockManager.releaseExclusiveLock(resource, replaceOpId);
+            }
+          }
+        } finally {
+          try {
+            await _cleanupTemp(tempPath);
+          } finally {
+            _endTempWrite();
+          }
+        }
+        return;
+      }
+
+      bool acquired = false;
+      try {
+        acquired = await _lockManager.acquireExclusiveLock(resource, opId);
+        if (!acquired) {
+          _throwLockTimeout(
+              'Failed to acquire exclusive lock for writeBytes: $resource',
+              resource);
+        }
+
+        await _storage.writeAsBytes(path, bytes,
+            flush: flush, closeHandleAfterFlush: closeHandleAfterFlush);
+      } finally {
+        if (acquired) {
+          _lockManager.releaseExclusiveLock(resource, opId);
+        }
+      }
+    } finally {
+      if (serializeAcquired) {
+        _lockManager.releaseExclusiveLock(writeResource, serializeOpId);
+      }
+    }
+  }
+
+  @override
+  Future<String?> readAsString(String path) async {
+    _ensureOpen();
+    final resource = _getLockResource(path);
+    final opId = _generateOperationId(_readOpPrefix);
+
+    bool acquired = false;
+    try {
+      acquired = await _lockManager.acquireSharedLock(resource, opId);
+      if (!acquired) {
+        _throwLockTimeout(
+            'Failed to acquire shared lock for read: $resource', resource);
+      }
+      return await _storage.readAsString(path);
+    } finally {
+      if (acquired) {
+        _lockManager.releaseSharedLock(resource, opId);
+      }
+    }
+  }
+
+  @override
+  Future<void> deleteFile(String path) async {
+    // Allowed after close: deleteDatabase / cleanup must still remove files.
+    final resource = _getLockResource(path);
+    final opId = _generateOperationId(_deleteOpPrefix);
+
+    bool acquired = false;
+    try {
+      acquired = await _lockManager.acquireExclusiveLock(resource, opId);
+      if (!acquired) {
+        _throwLockTimeout(
+            'Failed to acquire exclusive lock for deleteFile: $resource',
+            resource);
+      }
+      await _storage.deleteFile(path);
+    } finally {
+      if (acquired) {
+        _lockManager.releaseExclusiveLock(resource, opId);
+      }
+    }
+  }
+
+  @override
+  Future<bool> existsDirectory(String path) => _storage.existsDirectory(path);
+
+  @override
+  Future<bool> existsFile(String path) async {
+    return _storage.existsFile(path);
+  }
+
+  @override
+  Future<List<String>> listDirectory(String path,
+      {bool recursive = false}) async {
+    // Allowed after close: restore / cleanup enumerates directories.
+    final resource = _getLockResource(path);
+    final opId = _generateOperationId(_listOpPrefix);
+
+    bool acquired = false;
+    try {
+      acquired = await _lockManager.acquireSharedLock(resource, opId);
+      if (!acquired) {
+        _throwLockTimeout(
+            'Failed to acquire shared lock for list: $resource', resource);
+      }
+      return await _storage.listDirectory(path, recursive: recursive);
+    } finally {
+      if (acquired) {
+        _lockManager.releaseSharedLock(resource, opId);
+      }
+    }
+  }
+
+  @override
+  Future<void> close() async {
+    if (_isClosed) return;
+    _isClosed = true;
+    // Always release the backend:
+    // - Native FileStorageImpl: per-adapter handle pool (must close).
+    // - Web WebStorageImpl: shared IndexedDB; refcounted until last retainer.
+    try {
+      await _storage.close();
+    } finally {
+      // Unregister even if backend close throws, so global flushAll
+      // does not keep operating on a half-closed adapter.
+      _instances.remove(this);
+    }
+  }
+
+  @override
+  Future<DateTime?> getFileCreationTime(String path) async {
+    _ensureOpen();
+    final resource = _getLockResource(path);
+    final opId = _generateOperationId(_readOpPrefix);
+
+    bool acquired = false;
+    try {
+      acquired = await _lockManager.acquireSharedLock(resource, opId);
+      if (!acquired) {
+        _throwLockTimeout(
+            'Failed to acquire shared lock for getFileCreationTime: $resource',
+            resource);
+      }
+      return await _storage.getFileCreationTime(path);
+    } finally {
+      if (acquired) {
+        _lockManager.releaseSharedLock(resource, opId);
+      }
+    }
+  }
+
+  @override
+  Future<Uint8List> readAsBytes(String path) async {
+    _ensureOpen();
+    final resource = _getLockResource(path);
+    final opId = _generateOperationId(_readOpPrefix);
+
+    bool acquired = false;
+    try {
+      acquired = await _lockManager.acquireSharedLock(resource, opId);
+      if (!acquired) {
+        _throwLockTimeout(
+            'Failed to acquire shared lock for readBytes: $resource', resource);
+      }
+      return await _storage.readAsBytes(path);
+    } finally {
+      if (acquired) {
+        _lockManager.releaseSharedLock(resource, opId);
+      }
+    }
+  }
+
+  @override
+  Future<Uint8List> readAsBytesAt(String path, int start, {int? length}) async {
+    _ensureOpen();
+    final resource = _getLockResource(path);
+    final opId = _generateOperationId(_readOpPrefix);
+
+    bool acquired = false;
+    try {
+      acquired = await _lockManager.acquireSharedLock(resource, opId);
+      if (!acquired) {
+        _throwLockTimeout(
+            'Failed to acquire shared lock for readBytesAt: $resource',
+            resource);
+      }
+      return await _storage.readAsBytesAt(path, start, length: length);
+    } finally {
+      if (acquired) {
+        _lockManager.releaseSharedLock(resource, opId);
+      }
+    }
+  }
+
+  @override
+  Future<List<Uint8List>> readManyAsBytesAt(
+    String path,
+    List<ByteReadRange> ranges,
+  ) async {
+    if (ranges.isEmpty) return const [];
+    _ensureOpen();
+    final resource = _getLockResource(path);
+    final opId = _generateOperationId(_readOpPrefix);
+
+    bool acquired = false;
+    try {
+      acquired = await _lockManager.acquireSharedLock(resource, opId);
+      if (!acquired) {
+        _throwLockTimeout(
+            'Failed to acquire shared lock for readManyAsBytesAt: $resource',
+            resource);
+      }
+      return await _storage.readManyAsBytesAt(path, ranges);
+    } finally {
+      if (acquired) {
+        _lockManager.releaseSharedLock(resource, opId);
+      }
+    }
+  }
+
+  @override
+  Future<void> writeAsBytesAt(String path, int start, Uint8List bytes,
+      {bool flush = true, bool closeHandleAfterFlush = false}) async {
+    _ensureOpen();
+    if (bytes.isEmpty) return;
+    if (start < 0) {
+      throw DbException([
+        GeneralStatus(
+          type: ResultType.engError,
+          message: 'writeAsBytesAt: start must be >= 0, got $start.',
+        ),
+      ]);
+    }
+    final resource = _getLockResource(path);
+    final writeResource = _getWriteLockResource(path);
+    final opId = _generateOperationId(_writeOpPrefix);
+
+    bool serializeAcquired = false;
+    bool resourceAcquired = false;
+    try {
+      // Serialize writes on the same path to avoid handle/position races.
+      serializeAcquired =
+          await _lockManager.acquireExclusiveLock(writeResource, opId);
+      if (!serializeAcquired) {
+        _throwLockTimeout(
+            'Failed to acquire serialize lock for writeAsBytesAt: $writeResource',
+            writeResource);
+      }
+
+      // Block concurrent readers while applying random writes.
+      resourceAcquired =
+          await _lockManager.acquireExclusiveLock(resource, '$opId-path');
+      if (!resourceAcquired) {
+        _throwLockTimeout(
+            'Failed to acquire exclusive lock for writeAsBytesAt: $resource',
+            resource);
+      }
+
+      await _storage.writeAsBytesAt(path, start, bytes,
+          flush: flush, closeHandleAfterFlush: closeHandleAfterFlush);
+    } finally {
+      if (resourceAcquired) {
+        _lockManager.releaseExclusiveLock(resource, '$opId-path');
+      }
+      if (serializeAcquired) {
+        _lockManager.releaseExclusiveLock(writeResource, opId);
+      }
+    }
+  }
+
+  @override
+  Future<void> writeManyAsBytesAt(String path, List<ByteWrite> writes,
+      {bool flush = true, bool closeHandleAfterFlush = false}) async {
+    _ensureOpen();
+    if (writes.isEmpty) return;
+    final resource = _getLockResource(path);
+    final writeResource = _getWriteLockResource(path);
+    final opId = _generateOperationId(_writeOpPrefix);
+
+    bool serializeAcquired = false;
+    bool resourceAcquired = false;
+    try {
+      serializeAcquired =
+          await _lockManager.acquireExclusiveLock(writeResource, opId);
+      if (!serializeAcquired) {
+        _throwLockTimeout(
+            'Failed to acquire serialize lock for writeManyAsBytesAt: $writeResource',
+            writeResource);
+      }
+
+      // Block concurrent readers while applying random writes batch.
+      resourceAcquired =
+          await _lockManager.acquireExclusiveLock(resource, '$opId-path');
+      if (!resourceAcquired) {
+        _throwLockTimeout(
+            'Failed to acquire exclusive lock for writeManyAsBytesAt: $resource',
+            resource);
+      }
+
+      await _storage.writeManyAsBytesAt(path, writes,
+          flush: flush, closeHandleAfterFlush: closeHandleAfterFlush);
+    } finally {
+      if (resourceAcquired) {
+        _lockManager.releaseExclusiveLock(resource, '$opId-path');
+      }
+      if (serializeAcquired) {
+        _lockManager.releaseExclusiveLock(writeResource, opId);
+      }
+    }
+  }
+
+  @override
+  Future<DateTime?> getFileModifiedTime(String path) async {
+    _ensureOpen();
+    final resource = _getLockResource(path);
+    final opId = _generateOperationId(_readOpPrefix);
+
+    bool acquired = false;
+    try {
+      acquired = await _lockManager.acquireSharedLock(resource, opId);
+
+      if (!acquired) {
+        _throwLockTimeout(
+            'Failed to acquire shared lock for getFileModifiedTime: $resource',
+            resource);
+      }
+
+      return await _storage.getFileModifiedTime(path);
+    } finally {
+      if (acquired) {
+        _lockManager.releaseSharedLock(resource, opId);
+      }
+    }
+  }
+
+  @override
+  Future<int> getFileSize(String path) async {
+    _ensureOpen();
+    final resource = _getLockResource(path);
+    final opId = _generateOperationId(_readOpPrefix);
+
+    bool acquired = false;
+    try {
+      acquired = await _lockManager.acquireSharedLock(resource, opId);
+      if (!acquired) {
+        _throwLockTimeout(
+            'Failed to acquire shared lock for getFileSize: $resource',
+            resource);
+      }
+      return await _storage.getFileSize(path);
+    } finally {
+      if (acquired) {
+        _lockManager.releaseSharedLock(resource, opId);
+      }
+    }
+  }
+
+  @override
+  Future<void> deleteDirectory(String path) async {
+    // Allowed after close: deleteDatabase / space cleanup.
+    final resource = _getLockResource(path);
+    final opId = _generateOperationId(_deleteOpPrefix);
+
+    bool acquired = false;
+    try {
+      acquired = await _lockManager.acquireExclusiveLock(resource, opId);
+      if (!acquired) {
+        _throwLockTimeout(
+            'Failed to acquire exclusive lock for deleteDirectory: $resource',
+            resource);
+      }
+
+      await _storage.deleteDirectory(path);
+    } finally {
+      if (acquired) {
+        _lockManager.releaseExclusiveLock(resource, opId);
+      }
+    }
+  }
+
+  @override
+  Future<void> copyDirectory(String sourcePath, String destinationPath) async {
+    // Allowed after close: backup restore copies trees without pooled handles.
+    final sourceResource = _getLockResource(sourcePath);
+    final destResource = _getLockResource(destinationPath);
+    final opId = _generateOperationId(_writeOpPrefix);
+
+    // Enforce deterministic lock ordering to avoid deadlocks
+    final firstResource = sourceResource.compareTo(destResource) <= 0
+        ? sourceResource
+        : destResource;
+    final secondResource =
+        firstResource == sourceResource ? destResource : sourceResource;
+
+    final firstIsSource = firstResource == sourceResource;
+    final secondIsSource = !firstIsSource;
+
+    bool firstAcquired = false;
+    bool secondAcquired = false;
+    try {
+      // Acquire first lock (shared if source, exclusive if dest)
+      if (firstIsSource) {
+        firstAcquired =
+            await _lockManager.acquireSharedLock(firstResource, '$opId-first');
+      } else {
+        firstAcquired = await _lockManager.acquireExclusiveLock(
+            firstResource, '$opId-first');
+      }
+      if (!firstAcquired) {
+        _throwLockTimeout(
+            'Failed to acquire lock for copyDirectory first: $firstResource',
+            firstResource);
+      }
+
+      // Acquire second lock
+      if (secondIsSource) {
+        secondAcquired = await _lockManager.acquireSharedLock(
+            secondResource, '$opId-second');
+      } else {
+        secondAcquired = await _lockManager.acquireExclusiveLock(
+            secondResource, '$opId-second');
+      }
+      if (!secondAcquired) {
+        _throwLockTimeout(
+            'Failed to acquire lock for copyDirectory second: $secondResource',
+            secondResource);
+      }
+
+      await _storage.copyDirectory(sourcePath, destinationPath);
+    } finally {
+      // Release in reverse order
+      if (secondAcquired) {
+        if (secondIsSource) {
+          _lockManager.releaseSharedLock(secondResource, '$opId-second');
+        } else {
+          _lockManager.releaseExclusiveLock(secondResource, '$opId-second');
+        }
+      }
+      if (firstAcquired) {
+        if (firstIsSource) {
+          _lockManager.releaseSharedLock(firstResource, '$opId-first');
+        } else {
+          _lockManager.releaseExclusiveLock(firstResource, '$opId-first');
+        }
+      }
+    }
+  }
+
+  @override
+  Future<void> moveDirectory(String sourcePath, String destinationPath) async {
+    // Allowed after close: restore / space maintenance may rename trees.
+    final sourceResource = _getLockResource(sourcePath);
+    final destResource = _getLockResource(destinationPath);
+    final opId = _generateOperationId(_writeOpPrefix);
+
+    final firstResource = sourceResource.compareTo(destResource) <= 0
+        ? sourceResource
+        : destResource;
+    final secondResource =
+        firstResource == sourceResource ? destResource : sourceResource;
+
+    bool firstAcquired = false;
+    bool secondAcquired = false;
+    try {
+      firstAcquired =
+          await _lockManager.acquireExclusiveLock(firstResource, '$opId-first');
+      if (!firstAcquired) {
+        _throwLockTimeout(
+            'Failed to acquire lock for moveDirectory first: $firstResource',
+            firstResource);
+      }
+
+      secondAcquired = await _lockManager.acquireExclusiveLock(
+          secondResource, '$opId-second');
+      if (!secondAcquired) {
+        _throwLockTimeout(
+            'Failed to acquire lock for moveDirectory second: $secondResource',
+            secondResource);
+      }
+
+      await _storage.moveDirectory(sourcePath, destinationPath);
+    } finally {
+      if (secondAcquired) {
+        _lockManager.releaseExclusiveLock(secondResource, '$opId-second');
+      }
+      if (firstAcquired) {
+        _lockManager.releaseExclusiveLock(firstResource, '$opId-first');
+      }
+    }
+  }
+
+  @override
+  Future<void> copyFile(String sourcePath, String destinationPath) async {
+    // Allowed after close: backup restore copies files via OS copy (no pool).
+    final sourceResource = _getLockResource(sourcePath);
+    final destResource = _getLockResource(destinationPath);
+    final opId = _generateOperationId(_writeOpPrefix);
+
+    // Enforce deterministic lock ordering to avoid deadlocks
+    final firstResource = sourceResource.compareTo(destResource) <= 0
+        ? sourceResource
+        : destResource;
+    final secondResource =
+        firstResource == sourceResource ? destResource : sourceResource;
+
+    final firstIsSource = firstResource == sourceResource;
+    final secondIsSource = !firstIsSource;
+
+    bool firstAcquired = false;
+    bool secondAcquired = false;
+    try {
+      // Acquire first lock (shared if source, exclusive if dest)
+      if (firstIsSource) {
+        firstAcquired =
+            await _lockManager.acquireSharedLock(firstResource, '$opId-first');
+      } else {
+        firstAcquired = await _lockManager.acquireExclusiveLock(
+            firstResource, '$opId-first');
+      }
+      if (!firstAcquired) {
+        _throwLockTimeout(
+            'Failed to acquire lock for copyFile first: $firstResource',
+            firstResource);
+      }
+
+      // Acquire second lock
+      if (secondIsSource) {
+        secondAcquired = await _lockManager.acquireSharedLock(
+            secondResource, '$opId-second');
+      } else {
+        secondAcquired = await _lockManager.acquireExclusiveLock(
+            secondResource, '$opId-second');
+      }
+      if (!secondAcquired) {
+        _throwLockTimeout(
+            'Failed to acquire lock for copyFile second: $secondResource',
+            secondResource);
+      }
+
+      await _storage.copyFile(sourcePath, destinationPath);
+    } finally {
+      // Release in reverse order
+      if (secondAcquired) {
+        if (secondIsSource) {
+          _lockManager.releaseSharedLock(secondResource, '$opId-second');
+        } else {
+          _lockManager.releaseExclusiveLock(secondResource, '$opId-second');
+        }
+      }
+      if (firstAcquired) {
+        if (firstIsSource) {
+          _lockManager.releaseSharedLock(firstResource, '$opId-first');
+        } else {
+          _lockManager.releaseExclusiveLock(firstResource, '$opId-first');
+        }
+      }
+    }
+  }
+
+  @override
+  Stream<String> readLinesStream(String path, {int offset = 0}) async* {
+    _ensureOpen();
+    final resource = _getLockResource(path);
+    final opId = _generateOperationId(_readOpPrefix);
+
+    bool acquired = false;
+    try {
+      acquired = await _lockManager.acquireSharedLock(resource, opId);
+      if (!acquired) {
+        _throwLockTimeout(
+            'Failed to acquire shared lock for readLinesStream: $resource',
+            resource);
+      }
+
+      final stream = _storage.readLinesStream(path, offset: offset);
+      await for (final line in stream) {
+        yield line;
+      }
+    } finally {
+      if (acquired) {
+        _lockManager.releaseSharedLock(resource, opId);
+      }
+    }
+  }
+
+  @override
+  Future<void> writeLinesStream(String path, Stream<String> lines,
+      {bool append = false}) async {
+    _ensureOpen();
+    final resource = _getLockResource(path);
+    final opId = _generateOperationId(_writeOpPrefix);
+
+    bool acquired = false;
+    try {
+      acquired = await _lockManager.acquireExclusiveLock(resource, opId);
+      if (!acquired) {
+        _throwLockTimeout(
+            'Failed to acquire exclusive lock for writeLinesStream: $resource',
+            resource);
+      }
+      await _storage.writeLinesStream(path, lines, append: append);
+    } finally {
+      if (acquired) {
+        _lockManager.releaseExclusiveLock(resource, opId);
+      }
+    }
+  }
+
+  @override
+  Future<void> ensureDirectoryExists(String path) async {
+    // Allowed after close: restore recreates space/global directories.
+    return _storage.ensureDirectoryExists(path);
+  }
+
+  @override
+  Future<int> appendBytes(String path, Uint8List bytes,
+      {bool flush = true, bool closeHandleAfterFlush = false}) async {
+    _ensureOpen();
+    final resource = _getLockResource(path);
+    final opId = _generateOperationId(_writeOpPrefix);
+    bool acquired = false;
+    try {
+      acquired = await _lockManager.acquireExclusiveLock(resource, opId);
+      if (!acquired) {
+        _throwLockTimeout(
+            'Failed to acquire exclusive lock for appendBytes: $resource',
+            resource);
+      }
+      final off = await _storage.appendBytes(path, bytes,
+          flush: flush, closeHandleAfterFlush: closeHandleAfterFlush);
+      return off;
+    } finally {
+      if (acquired) {
+        _lockManager.releaseExclusiveLock(resource, opId);
+      }
+    }
+  }
+
+  @override
+  int appendBytesSync(String path, List<int> bytes,
+      {int offset = 0, int? length}) {
+    _ensureOpen();
+    return _storage.appendBytesSync(path, bytes,
+        offset: offset, length: length);
+  }
+
+  @override
+  Future<int> appendString(String path, String content,
+      {bool flush = true, bool closeHandleAfterFlush = false}) async {
+    _ensureOpen();
+    final resource = _getLockResource(path);
+    final opId = _generateOperationId(_writeOpPrefix);
+    bool acquired = false;
+    try {
+      acquired = await _lockManager.acquireExclusiveLock(resource, opId);
+      if (!acquired) {
+        _throwLockTimeout(
+            'Failed to acquire exclusive lock for appendString: $resource',
+            resource);
+      }
+      final off = await _storage.appendString(path, content,
+          flush: flush, closeHandleAfterFlush: closeHandleAfterFlush);
+      return off;
+    } finally {
+      if (acquired) {
+        _lockManager.releaseExclusiveLock(resource, opId);
+      }
+    }
+  }
+
+  @override
+  Future<List<String>> readAsLines(String path, {int offset = 0}) async {
+    _ensureOpen();
+    final resource = _getLockResource(path);
+    final opId = _generateOperationId(_readOpPrefix);
+    bool acquired = false;
+    try {
+      acquired = await _lockManager.acquireSharedLock(resource, opId);
+      if (!acquired) {
+        _throwLockTimeout(
+            'Failed to acquire shared lock for readAsLines: $resource',
+            resource);
+      }
+      return await _storage.readAsLines(path, offset: offset);
+    } finally {
+      if (acquired) {
+        _lockManager.releaseSharedLock(resource, opId);
+      }
+    }
+  }
+
+  @override
+  Future<void> flushFile(String path) async {
+    _ensureOpen();
+    return _storage.flushFile(path);
+  }
+
+  @override
+  void flushFileSync(String path) {
+    _ensureOpen();
+    _storage.flushFileSync(path);
+  }
+
+  @override
+  void deleteFileSync(String path) {
+    _ensureOpen();
+    _storage.deleteFileSync(path);
+  }
+
+  @override
+  Future<void> flushAll(
+      {String? path, List<String>? paths, bool closeHandles = false}) async {
+    // Best-effort burst flushes may coalesce; must-close never skips.
+    if (!closeHandles && _flushInProgress) return;
+
+    final previous = _flushQueue;
+    final gate = Completer<void>();
+    _flushQueue = gate.future;
+    try {
+      await previous;
+      if (!closeHandles && _flushInProgress) return;
+      _flushInProgress = true;
+      try {
+        await _storage.flushAll(
+            path: path, paths: paths, closeHandles: closeHandles);
+      } finally {
+        _flushInProgress = false;
+      }
+    } finally {
+      if (!gate.isCompleted) {
+        gate.complete();
+      }
+    }
+  }
+
+  @override
+  Future<void> configureStorage({int? maxOpenHandles}) async {
+    _ensureOpen();
+    return _storage.configureStorage(maxOpenHandles: maxOpenHandles);
+  }
+
+  @override
+  Future<void> replaceFileAtomic(String tempPath, String finalPath) async {
+    _ensureOpen();
+    // writeAs* already counts via _enterTempWrite and calls _storage.replace...
+    // Only track direct callers that stage under space tmp.
+    final trackTemp = _isSpaceTempPath(tempPath);
+    if (trackTemp) {
+      await _enterTempWrite();
+    }
+    try {
+      // Acquire exclusive lock on final path to serialize atomic replacement
+      final resource = _getLockResource(finalPath);
+      final opId = _generateOperationId(_writeOpPrefix);
+      bool acquired = false;
+      try {
+        acquired = await _lockManager.acquireExclusiveLock(resource, opId);
+        if (!acquired) {
+          _throwLockTimeout(
+              'Failed to acquire exclusive lock for replaceFileAtomic: $resource',
+              resource);
+        }
+        await _storage.replaceFileAtomic(tempPath, finalPath);
+      } finally {
+        if (acquired) {
+          _lockManager.releaseExclusiveLock(resource, opId);
+        }
+      }
+    } finally {
+      if (trackTemp) {
+        _endTempWrite();
+      }
+    }
+  }
+}

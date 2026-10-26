@@ -869,7 +869,7 @@ class DatabaseTester {
           .orderByAsc('id')
           .limit(10);
       isTestPassed &= _expect(
-        'Migrated renamed users table row count',
+        'Migrated renamed users table record count',
         migratedUsers.length,
         3,
       );
@@ -918,7 +918,7 @@ class DatabaseTester {
           .orderByAsc('id')
           .limit(10);
       isTestPassed &=
-          _expect('Migrated child table row count', migratedPosts.length, 1);
+          _expect('Migrated child table record count', migratedPosts.length, 1);
       if (!isTestPassed || migratedPosts.data.isEmpty) {
         return false;
       }
@@ -965,7 +965,7 @@ class DatabaseTester {
           .orderByAsc('id')
           .limit(10);
       isTestPassed &= _expect(
-          'Reopened renamed users table row count', reopenedUsers.length, 3);
+          'Reopened renamed users table record count', reopenedUsers.length, 3);
       if (!isTestPassed || reopenedUsers.data.isEmpty) {
         return false;
       }
@@ -986,7 +986,7 @@ class DatabaseTester {
           .orderByAsc('id')
           .limit(10);
       isTestPassed &=
-          _expect('Reopened child table row count', reopenedPosts.length, 1);
+          _expect('Reopened child table record count', reopenedPosts.length, 1);
       if (!isTestPassed || reopenedPosts.data.isEmpty) {
         return false;
       }
@@ -1918,13 +1918,13 @@ class DatabaseTester {
           1,
         );
         if (insertedWatchData != null && insertedWatchData.isNotEmpty) {
-          final row = insertedWatchData.first;
+          final record = insertedWatchData.first;
+          isTestPassed &= _expect(
+              'Watch insert event username', record['username'], username);
           isTestPassed &=
-              _expect('Watch insert event username', row['username'], username);
+              _expect('Watch insert event email', record['email'], email);
           isTestPassed &=
-              _expect('Watch insert event email', row['email'], email);
-          isTestPassed &=
-              _expect('Watch insert event age', row['age'], insertedAge);
+              _expect('Watch insert event age', record['age'], insertedAge);
         }
       }
 
@@ -1970,9 +1970,9 @@ class DatabaseTester {
           1,
         );
         if (updatedWatchData != null && updatedWatchData.isNotEmpty) {
-          final row = updatedWatchData.first;
+          final record = updatedWatchData.first;
           isTestPassed &=
-              _expect('Watch update event age', row['age'], updatedAge);
+              _expect('Watch update event age', record['age'], updatedAge);
         }
       }
 
@@ -3175,7 +3175,7 @@ class DatabaseTester {
     final invalidRowIsParentMissing =
         firstBadStatus != null && _isFkParentMissing(firstBadStatus.type);
     ok &= _expect(
-      'batchInsert invalid row is parent-missing',
+      'batchInsert invalid record is parent-missing',
       invalidRowIsParentMissing,
       true,
     );
@@ -3239,11 +3239,11 @@ class DatabaseTester {
     final childCount = children.successCount;
     ok &= _expect('all 3 children inserted', childCount, 3);
 
-    final singleRow = <String, dynamic>{
+    final singleRecord = <String, dynamic>{
       'title': 'buf_child_single',
       'user_id': parentId,
     };
-    final single = await db.insert(ExampleSchemas.posts.name, singleRow);
+    final single = await db.insert(ExampleSchemas.posts.name, singleRecord);
     final singleOk = !single.hasErrors;
     ok &= _expect('single insert child against unflushed parent succeeds',
         singleOk, true);
@@ -3289,7 +3289,7 @@ class DatabaseTester {
       {'post_id': p2Id, 'user_id': commenterId, 'content': 'c'},
     ]);
 
-    // Single-row path: delete one post -> cascade comments for that post
+    // Single-record path: delete one post -> cascade comments for that post
     final delOne =
         await db.delete(ExampleSchemas.posts.name).where('id', '=', p1Id);
     ok &= _expect('single cascade delete post', !delOne.hasErrors, true);
@@ -3680,7 +3680,7 @@ class DatabaseTester {
       ok &= _expect('create FK action tables', !created.hasErrors, true);
       if (!ok) return false;
 
-      // ---- Shared parents: first row must be id=1 (SET DEFAULT target) ----
+      // ---- Shared parents: first record must be id=1 (SET DEFAULT target) ----
       final sentinel = await db.insert(_fkActParent, {'name': 'sentinel'});
       ok &= _expect('sentinel parent inserted', !sentinel.hasErrors, true);
       final sentinelId = sentinel.firstPrimaryKey;
@@ -3770,8 +3770,8 @@ class DatabaseTester {
           await db.query(_fkActSetNull).where('label', 'like', 'n%');
       ok &= _expect('SET NULL children remain', nullKids.length, 2);
       var setNullAllNull = true;
-      for (final row in nullKids.data) {
-        if (row['parent_id'] != null) {
+      for (final record in nullKids.data) {
+        if (record['parent_id'] != null) {
           setNullAllNull = false;
           break;
         }
@@ -3801,8 +3801,8 @@ class DatabaseTester {
           await db.query(_fkActSetDefault).where('label', 'like', 'd%');
       ok &= _expect('SET DEFAULT children remain', defKids.length, 2);
       var setDefaultAllOne = true;
-      for (final row in defKids.data) {
-        if (_pk(row['parent_id']) != '1') {
+      for (final record in defKids.data) {
+        if (_pk(record['parent_id']) != '1') {
           setDefaultAllOne = false;
           break;
         }
@@ -5720,10 +5720,10 @@ class DatabaseTester {
           .limit(10);
       ok &= _expect(
           'filtered text success', filtered.type == ResultType.success, true);
-      for (final row in filtered.data) {
+      for (final record in filtered.data) {
         ok &= _expect(
           'where filters category',
-          row['category']?.toString(),
+          record['category']?.toString(),
           'tech',
         );
       }
@@ -6028,9 +6028,9 @@ class DatabaseTester {
       ok &=
           _expect('three-way success', three.type == ResultType.success, true);
       ok &= _expect('three-way filtered to tech', three.data.isNotEmpty, true);
-      for (final row in three.data) {
-        ok &=
-            _expect('three-way category', row['category']?.toString(), 'tech');
+      for (final record in three.data) {
+        ok &= _expect(
+            'three-way category', record['category']?.toString(), 'tech');
       }
       ok &= _expect(
         'life filtered from three-way',

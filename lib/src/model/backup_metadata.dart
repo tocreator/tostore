@@ -1,5 +1,5 @@
-import '../handler/common.dart';
 import 'backup_scope.dart';
+import 'global_config.dart';
 
 /// Structured backup metadata stored as `meta.tobf` (v2+) inside each backup.
 ///

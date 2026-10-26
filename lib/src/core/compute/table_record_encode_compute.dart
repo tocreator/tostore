@@ -1,7 +1,7 @@
 import 'dart:typed_data';
 
-import '../../handler/binary_schema_codec.dart';
-import '../yield_controller.dart';
+import '../codec/binary_schema_codec.dart';
+import 'yield_controller.dart';
 
 /// Pure-compute request for encoding table records before B+Tree persistence.
 class TableRecordEncodeRequest {

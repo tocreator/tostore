@@ -1,8 +1,8 @@
-import '../../handler/value_matcher.dart';
 import '../../model/table_context.dart';
 import '../../model/table_schema.dart';
-import '../../query/query_condition.dart';
-import '../yield_controller.dart';
+import '../query/query_condition.dart';
+import '../query/value_matcher.dart';
+import 'yield_controller.dart';
 
 /// Pure-compute request for matching a condition against a batch of records.
 class BatchMatchRequest {

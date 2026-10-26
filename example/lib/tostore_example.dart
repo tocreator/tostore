@@ -765,14 +765,14 @@ class ToStoreExample {
       );
     final entries = preview.retrieval?.entries ?? const <RetrievalEntry>[];
     for (var i = 0; i < preview.data.length; i++) {
-      final row = preview.data[i];
+      final record = preview.data[i];
       final score = i < entries.length ? entries[i].score : null;
       final raw = i < entries.length ? entries[i].rawScore : null;
-      final title = row['title'];
+      final title = record['title'];
       final scoreText = score == null ? '-' : score.toStringAsFixed(4);
       final rawText = raw == null ? '-' : raw.toStringAsFixed(3);
       report.write(
-        '#${i + 1} $pk=${row[pk]} score=$scoreText rawScore=$rawText'
+        '#${i + 1} $pk=${record[pk]} score=$scoreText rawScore=$rawText'
         '${title == null ? '' : ' title=$title'}',
       );
       if (i != preview.data.length - 1 || runs > 1) report.writeln();
@@ -891,14 +891,14 @@ class ToStoreExample {
       );
     final entries = preview.retrieval?.entries ?? const <RetrievalEntry>[];
     for (var i = 0; i < preview.data.length; i++) {
-      final row = preview.data[i];
+      final record = preview.data[i];
       final score = i < entries.length ? entries[i].score : null;
       final raw = i < entries.length ? entries[i].rawScore : null;
-      final title = row['title'];
+      final title = record['title'];
       final scoreText = score == null ? '-' : score.toStringAsFixed(4);
       final rawText = raw == null ? '-' : raw.toStringAsFixed(3);
       report.write(
-        '#${i + 1} $pk=${row[pk]} score=$scoreText rawScore=$rawText'
+        '#${i + 1} $pk=${record[pk]} score=$scoreText rawScore=$rawText'
         '${title == null ? '' : ' title=$title'}',
       );
       if (i != preview.data.length - 1 || runs > 1) report.writeln();
@@ -1072,15 +1072,15 @@ class ToStoreExample {
       ..writeln('Hits ${preview.data.length}/$k in $timeLabel');
     final entries = preview.retrieval?.entries ?? const <RetrievalEntry>[];
     for (var i = 0; i < preview.data.length; i++) {
-      final row = preview.data[i];
+      final record = preview.data[i];
       final entry = i < entries.length ? entries[i] : null;
       final scoreText = entry == null ? '-' : entry.score.toStringAsFixed(4);
       final channel = entry?.channel.name ?? '-';
-      final headline = row['headline'] ?? row['title'];
+      final headline = record['headline'] ?? record['title'];
       report.write(
-        '#${i + 1} $pk=${row[pk]} channel=$channel score=$scoreText'
-        '${row['category'] == null ? '' : ' category=${row['category']}'}'
-        '${row['year'] == null ? '' : ' year=${row['year']}'}'
+        '#${i + 1} $pk=${record[pk]} channel=$channel score=$scoreText'
+        '${record['category'] == null ? '' : ' category=${record['category']}'}'
+        '${record['year'] == null ? '' : ' year=${record['year']}'}'
         '${headline == null ? '' : ' headline=$headline'}',
       );
       if (i != preview.data.length - 1 || runs > 1) report.writeln();
@@ -1719,7 +1719,7 @@ class ToStoreExample {
       final depth = VectorRecallHarness.normalizeDepth(sweepDepths[i]);
       onProgress?.call(i, sweepDepths.length);
 
-      final row = await vectorSearchBenchmark(
+      final record = await vectorSearchBenchmark(
         tableName,
         iterations,
         topK,
@@ -1729,8 +1729,8 @@ class ToStoreExample {
         warmup: false,
         diverseThroughput: diverseThroughput,
       );
-      if (row != null) {
-        records.add(row);
+      if (record != null) {
+        records.add(record);
       } else {
         logService.add(
           'Depth sweep stopped at depth=$depth (benchmark failed).',

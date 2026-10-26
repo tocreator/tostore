@@ -3,9 +3,9 @@ import 'dart:typed_data';
 import '../../model/data_store_config.dart';
 import '../../model/encoder_config.dart';
 import '../../model/table_identity.dart';
-import '../compute_manager.dart';
-import '../compute_tasks.dart';
 import 'compute_batch_planner.dart';
+import 'compute_manager.dart';
+import 'compute_tasks.dart';
 
 /// Shared dispatcher for pure B+Tree page encoding work.
 ///

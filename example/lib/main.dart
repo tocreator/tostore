@@ -196,7 +196,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
   String? _watchTable;
   String? _watchPkField;
   dynamic _watchPkValue;
-  Map<String, dynamic>? _watchRow;
+  Map<String, dynamic>? _watchRecord;
   bool _watchMissing = false;
   int _watchPulse = 0;
   StreamSubscription<List<Map<String, dynamic>>>? _watchSub;
@@ -1197,11 +1197,11 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         ? 'MISSING  $_watchTable.$_watchPkField=$_watchPkValue'
         : 'LIVE  $_watchTable.$_watchPkField=$_watchPkValue';
     final body = _watchMissing
-        ? 'No row in current space (deleted or never existed here). '
+        ? 'No record in current space (deleted or never existed here). '
             'Edits in another space with the same id will appear after switch.'
-        : (_watchRow == null
+        : (_watchRecord == null
             ? 'Waiting for first watch emission…'
-            : _watchRow!.entries
+            : _watchRecord!.entries
                 .map((e) => '${e.key}:${e.value ?? 'NULL'}')
                 .join(' · '));
 
@@ -1285,7 +1285,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         content: Text(
           'Start a live query().watch() on\n'
           '$_selectedTable.$_primaryKey = $pk\n\n'
-          'A strip above the log panel will show the row and update on '
+          'A strip above the log panel will show the record and update on '
           'modify/delete. After switchSpace, the same id in the new space '
           'keeps driving this watch.',
         ),
@@ -1322,7 +1322,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
       _watchTable = table;
       _watchPkField = pkField;
       _watchPkValue = pkValue;
-      _watchRow = null;
+      _watchRecord = null;
       _watchMissing = false;
       _watchPulse = 0;
     });
@@ -1337,10 +1337,10 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
           _watchPulse++;
           if (records.isEmpty) {
             _watchMissing = true;
-            _watchRow = null;
+            _watchRecord = null;
           } else {
             _watchMissing = false;
-            _watchRow = Map<String, dynamic>.from(records.first);
+            _watchRecord = Map<String, dynamic>.from(records.first);
           }
         });
         logService.add(
@@ -1372,7 +1372,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
       _watchTable = null;
       _watchPkField = null;
       _watchPkValue = null;
-      _watchRow = null;
+      _watchRecord = null;
       _watchMissing = false;
     });
     if (notify) {
@@ -1618,7 +1618,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                           Text(
                             _selectedRecords.length == 1
                                 ? 'Watch PK ${_selectedRecords.first}'
-                                : 'Watch PK (select 1 row)',
+                                : 'Watch PK (select 1 record)',
                           ),
                         ],
                       ),
@@ -1802,8 +1802,8 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                   },
                 ),
             ],
-            rows: _tableData.map((row) {
-              final pkValue = _primaryKey != null ? row[_primaryKey] : null;
+            rows: _tableData.map((record) {
+              final pkValue = _primaryKey != null ? record[_primaryKey] : null;
               return DataRow(
                 selected: pkValue != null && _selectedRecords.contains(pkValue),
                 onSelectChanged: pkValue == null
@@ -1821,12 +1821,13 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                   for (final colName in _tableColumns)
                     DataCell(
                       Text(
-                        '${row[colName] ?? 'NULL'}',
+                        '${record[colName] ?? 'NULL'}',
                         overflow: TextOverflow.ellipsis,
                       ),
                       onLongPress: () {
-                        if (_primaryKey != null && row[_primaryKey] != null) {
-                          _showEditRowDialog(row);
+                        if (_primaryKey != null &&
+                            record[_primaryKey] != null) {
+                          _showEditRowDialog(record);
                         }
                       },
                     ),
@@ -1837,12 +1838,12 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
               if (_primaryKey == null) return;
               setState(() {
                 if (isSelected ?? false) {
-                  for (final row in _tableData) {
-                    _selectedRecords.add(row[_primaryKey]);
+                  for (final record in _tableData) {
+                    _selectedRecords.add(record[_primaryKey]);
                   }
                 } else {
-                  for (final row in _tableData) {
-                    _selectedRecords.remove(row[_primaryKey]);
+                  for (final record in _tableData) {
+                    _selectedRecords.remove(record[_primaryKey]);
                   }
                 }
               });
@@ -3148,7 +3149,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     if (updatedData != null) {
       setState(() {
         _isDataLoading = true;
-        _lastOperationInfo = 'Updating row...';
+        _lastOperationInfo = 'Updating record...';
       });
 
       final pkValue = rowData[schema.primaryKeyConfig.name];
@@ -3159,18 +3160,18 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
             .where(schema.primaryKeyConfig.name, '=', pkValue);
 
         if (!result.hasErrors) {
-          logService.add('Row successfully updated.', LogLevel.info);
+          logService.add('Record successfully updated.', LogLevel.info);
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               const SnackBar(
-                content: Text('Row updated!'),
+                content: Text('Record updated!'),
                 duration: Duration(seconds: 2),
               ),
             );
           }
         } else {
           final errorMsg = _dbResultErrorMessage(result);
-          logService.add('Failed to update row: $errorMsg', LogLevel.error);
+          logService.add('Failed to update record: $errorMsg', LogLevel.error);
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
               SnackBar(
@@ -3558,8 +3559,8 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         .prefix(prefix)
         .orderByKeyDesc()
         .limit(1);
-    for (final row in page.data) {
-      final key = row['key']?.toString() ?? '';
+    for (final record in page.data) {
+      final key = record['key']?.toString() ?? '';
       if (!key.startsWith(prefix)) continue;
       final parsed = int.tryParse(key.substring(prefix.length));
       if (parsed != null && parsed > 0) return parsed + 1;
@@ -4742,7 +4743,7 @@ String _demoReadOnlyFieldSummary(FieldSchema field, dynamic value) {
   return '${text.substring(0, 77)}... — read-only in this editor';
 }
 
-/// A dialog for editing a single row of data.
+/// A dialog for editing a single record of data.
 class EditRowDialog extends StatefulWidget {
   final TableSchema schema;
   final Map<String, dynamic> initialData;
