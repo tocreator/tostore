@@ -13,7 +13,8 @@ import 'testing/database_tester.dart';
 import 'testing/example_schemas.dart';
 import 'testing/log_service.dart';
 import 'testing/vector_recall.dart' show vectorSearchDepthSweepPoints;
-import 'tostore_example.dart' show ForeignKeyMode, ToStoreExample;
+import 'tostore_example.dart'
+    show ExampleTextCorpus, ForeignKeyMode, ToStoreExample;
 
 String _dbResultErrorMessage(DbResult result) {
   final errors = result.statuses
@@ -134,13 +135,19 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     ExampleSchemas.users.name,
     ExampleSchemas.posts.name,
     ExampleSchemas.comments.name,
-    ...ExampleSchemas.vectorTables.map((schema) => schema.name),
     ExampleSchemas.settings.name,
     _kKvSpaceLabel,
     _kKvGlobalLabel,
+    ...ExampleSchemas.textTables.map((schema) => schema.name),
+    ...ExampleSchemas.sparseTables.map((schema) => schema.name),
+    ...ExampleSchemas.hybridTables.map((schema) => schema.name),
+    ...ExampleSchemas.vectorTables.map((schema) => schema.name),
   ];
   String _selectedTable = ExampleSchemas.users.name;
   bool _hasVectorSupport = false;
+  bool _hasTextSupport = false;
+  bool _hasSparseSupport = false;
+  bool _hasHybridSupport = false;
 
   bool get _isKvMode =>
       _selectedTable == _kKvSpaceLabel || _selectedTable == _kKvGlobalLabel;
@@ -157,7 +164,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
   bool _isCountLimited =
       false; // Indicates if count might be limited by defaultQueryLimit
   String? _primaryKey;
-  final Set<dynamic> _selectedRows = {};
+  final Set<dynamic> _selectedRecords = {};
 
   // Pagination state
   PaginationMode _paginationMode = PaginationMode.cursor;
@@ -182,7 +189,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
   List<Map<String, dynamic>> _activeFilters = [];
 
   /// Collapsed log handle height — watch strip matches this so the main list
-  /// stays usable while a single-row live watch is open.
+  /// stays usable while a single-record live watch is open.
   static const double _kBottomChromeHeight = 60;
 
   /// Live single-record watch (query().watch on PK). Survives switchSpace.
@@ -235,7 +242,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
       _isDataLoading = true;
       if (resetPage) {
         _currentPage = 1;
-        _selectedRows.clear();
+        _selectedRecords.clear();
         _sortColumn = null; // Reset sort on page reset
         _nextCursor = null;
         _prevCursor = null;
@@ -253,10 +260,18 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         }
         _hasVectorSupport =
             schema.indexes.any((idx) => idx.type == IndexType.vector);
+        _hasTextSupport =
+            schema.indexes.any((idx) => idx.type == IndexType.text);
+        _hasSparseSupport =
+            schema.indexes.any((idx) => idx.type == IndexType.sparse);
+        _hasHybridSupport = _hasVectorSupport && _hasTextSupport;
       } else {
         _tableColumns = [];
         _primaryKey = 'key';
         _hasVectorSupport = false;
+        _hasTextSupport = false;
+        _hasSparseSupport = false;
+        _hasHybridSupport = false;
       }
 
       // 2. Base query for data fetching
@@ -394,7 +409,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
       _isDataLoading = true;
       if (resetPage) {
         _currentPage = 1;
-        _selectedRows.clear();
+        _selectedRecords.clear();
         _sortColumn = null;
         _nextCursor = null;
         _prevCursor = null;
@@ -407,6 +422,9 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
       _tableColumns = const ['key', 'value', 'updated_at'];
       _primaryKey = 'key';
       _hasVectorSupport = false;
+      _hasTextSupport = false;
+      _hasSparseSupport = false;
+      _hasHybridSupport = false;
       _isCountLimited = false;
 
       String? prefix;
@@ -465,7 +483,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
       if (result.hasErrors) {
         logService.add('KV query failed: ${result.message}', LogLevel.error);
       }
-      final rows = result.data.map((record) {
+      final records = result.data.map((record) {
         return <String, dynamic>{
           'key': record['key'],
           'value': _formatKvDisplayValue(record['value']),
@@ -475,7 +493,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
 
       if (!mounted || currentSeq != _fetchSequence) return;
       setState(() {
-        _tableData = rows;
+        _tableData = records;
         if (_paginationMode == PaginationMode.cursor) {
           _nextCursor = result.nextCursorToken;
           _prevCursor = result.prevCursorToken;
@@ -493,7 +511,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
       final elapsedMs = result.executionTimeMs;
       logService.add(
           'Query KV ($scope, $prefixHint, $modeHint): '
-          'fetched ${rows.length} records '
+          'fetched ${records.length} records '
           'in ${elapsedMs ?? '?'}ms',
           LogLevel.info);
 
@@ -1256,10 +1274,10 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
   }
 
   Future<void> _offerWatchSelectedRecord() async {
-    if (_isKvMode || _primaryKey == null || _selectedRows.length != 1) {
+    if (_isKvMode || _primaryKey == null || _selectedRecords.length != 1) {
       return;
     }
-    final pk = _selectedRows.first;
+    final pk = _selectedRecords.first;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -1313,24 +1331,24 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         widget.example.db.query(table).where(pkField, '=', pkValue).watch();
 
     _watchSub = stream.listen(
-      (rows) {
+      (records) {
         if (!mounted) return;
         setState(() {
           _watchPulse++;
-          if (rows.isEmpty) {
+          if (records.isEmpty) {
             _watchMissing = true;
             _watchRow = null;
           } else {
             _watchMissing = false;
-            _watchRow = Map<String, dynamic>.from(rows.first);
+            _watchRow = Map<String, dynamic>.from(records.first);
           }
         });
         logService.add(
-          rows.isEmpty
+          records.isEmpty
               ? 'Watch $_watchTable.$_watchPkField=$_watchPkValue → empty '
                   '(missing in current space)'
               : 'Watch $_watchTable.$_watchPkField=$_watchPkValue → '
-                  '${rows.first}',
+                  '${records.first}',
           LogLevel.info,
         );
       },
@@ -1449,16 +1467,16 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                   ),
                 ),
                 ElevatedButton.icon(
-                  onPressed: _selectedRows.isEmpty || _isDataLoading
+                  onPressed: _selectedRecords.isEmpty || _isDataLoading
                       ? null
                       : _confirmDeleteSelected,
                   icon: const Icon(Icons.delete, size: 16),
-                  label: Text('Del(${_selectedRows.length})'),
+                  label: Text('Del(${_selectedRecords.length})'),
                   style: ElevatedButton.styleFrom(
                     padding:
                         const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
                     backgroundColor:
-                        _selectedRows.isEmpty ? Colors.grey : Colors.red,
+                        _selectedRecords.isEmpty ? Colors.grey : Colors.red,
                     foregroundColor: Colors.white,
                     textStyle: const TextStyle(fontSize: 14),
                     tapTargetSize: MaterialTapTargetSize.shrinkWrap,
@@ -1481,7 +1499,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                   ),
                 ),
                 ElevatedButton.icon(
-                  onPressed: _selectedRows.isEmpty || _isDataLoading
+                  onPressed: _selectedRecords.isEmpty || _isDataLoading
                       ? null
                       : _showBatchUpdateDialog,
                   icon: const Icon(Icons.edit, size: 16),
@@ -1490,7 +1508,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                     padding:
                         const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
                     backgroundColor:
-                        _selectedRows.isEmpty ? Colors.grey : Colors.green,
+                        _selectedRecords.isEmpty ? Colors.grey : Colors.green,
                     foregroundColor: Colors.white,
                     textStyle: const TextStyle(fontSize: 14),
                     tapTargetSize: MaterialTapTargetSize.shrinkWrap,
@@ -1498,16 +1516,16 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                   ),
                 ),
                 ElevatedButton.icon(
-                  onPressed: _selectedRows.isEmpty || _isDataLoading
+                  onPressed: _selectedRecords.isEmpty || _isDataLoading
                       ? null
                       : _confirmDeleteSelected,
                   icon: const Icon(Icons.delete, size: 16),
-                  label: Text('Del(${_selectedRows.length})'),
+                  label: Text('Del(${_selectedRecords.length})'),
                   style: ElevatedButton.styleFrom(
                     padding:
                         const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
                     backgroundColor:
-                        _selectedRows.isEmpty ? Colors.grey : Colors.red,
+                        _selectedRecords.isEmpty ? Colors.grey : Colors.red,
                     foregroundColor: Colors.white,
                     textStyle: const TextStyle(fontSize: 14),
                     tapTargetSize: MaterialTapTargetSize.shrinkWrap,
@@ -1538,6 +1556,12 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                     _showVectorSearchBenchmarkDialog();
                   } else if (value == 'vector_depth_sweep') {
                     _runVectorSearchDepthSweep();
+                  } else if (value == 'text_search') {
+                    _showTextSearchDialog();
+                  } else if (value == 'sparse_search') {
+                    _showSparseSearchDialog();
+                  } else if (value == 'hybrid_search') {
+                    _showHybridSearchDialog();
                   }
                 },
                 itemBuilder: (context) => [
@@ -1578,7 +1602,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                   if (!_isKvMode) ...[
                     PopupMenuItem(
                       value: 'watch_pk',
-                      enabled: _selectedRows.length == 1 &&
+                      enabled: _selectedRecords.length == 1 &&
                           _primaryKey != null &&
                           !_isDataLoading,
                       child: Row(
@@ -1586,14 +1610,14 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                           Icon(
                             Icons.visibility_outlined,
                             size: 18,
-                            color: _selectedRows.length == 1
+                            color: _selectedRecords.length == 1
                                 ? const Color(0xFF7C3AED)
                                 : Colors.grey,
                           ),
                           const SizedBox(width: 8),
                           Text(
-                            _selectedRows.length == 1
-                                ? 'Watch PK ${_selectedRows.first}'
+                            _selectedRecords.length == 1
+                                ? 'Watch PK ${_selectedRecords.first}'
                                 : 'Watch PK (select 1 row)',
                           ),
                         ],
@@ -1632,6 +1656,45 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                                 size: 18, color: Color(0xff0aa6e8)),
                             SizedBox(width: 8),
                             Text('Depth Sweep (Recall)'),
+                          ],
+                        ),
+                      ),
+                    if ((_hasTextSupport || _hasSparseSupport) &&
+                        !_hasVectorSupport)
+                      const PopupMenuDivider(),
+                    if (_hasTextSupport)
+                      const PopupMenuItem(
+                        value: 'text_search',
+                        child: Row(
+                          children: [
+                            Icon(Icons.manage_search,
+                                size: 18, color: Color(0xff0aa6e8)),
+                            SizedBox(width: 8),
+                            Text('Text Search'),
+                          ],
+                        ),
+                      ),
+                    if (_hasSparseSupport)
+                      const PopupMenuItem(
+                        value: 'sparse_search',
+                        child: Row(
+                          children: [
+                            Icon(Icons.scatter_plot_outlined,
+                                size: 18, color: Color(0xff0aa6e8)),
+                            SizedBox(width: 8),
+                            Text('Sparse Search'),
+                          ],
+                        ),
+                      ),
+                    if (_hasHybridSupport)
+                      const PopupMenuItem(
+                        value: 'hybrid_search',
+                        child: Row(
+                          children: [
+                            Icon(Icons.hub_outlined,
+                                size: 18, color: Color(0xff0aa6e8)),
+                            SizedBox(width: 8),
+                            Text('Hybrid Search'),
                           ],
                         ),
                       ),
@@ -1742,15 +1805,15 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
             rows: _tableData.map((row) {
               final pkValue = _primaryKey != null ? row[_primaryKey] : null;
               return DataRow(
-                selected: pkValue != null && _selectedRows.contains(pkValue),
+                selected: pkValue != null && _selectedRecords.contains(pkValue),
                 onSelectChanged: pkValue == null
                     ? null
                     : (isSelected) {
                         setState(() {
                           if (isSelected ?? false) {
-                            _selectedRows.add(pkValue);
+                            _selectedRecords.add(pkValue);
                           } else {
-                            _selectedRows.remove(pkValue);
+                            _selectedRecords.remove(pkValue);
                           }
                         });
                       },
@@ -1775,11 +1838,11 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
               setState(() {
                 if (isSelected ?? false) {
                   for (final row in _tableData) {
-                    _selectedRows.add(row[_primaryKey]);
+                    _selectedRecords.add(row[_primaryKey]);
                   }
                 } else {
                   for (final row in _tableData) {
-                    _selectedRows.remove(row[_primaryKey]);
+                    _selectedRecords.remove(row[_primaryKey]);
                   }
                 }
               });
@@ -2655,11 +2718,15 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
 
       setState(() {
         _isTesting = true;
-        _lastOperationInfo = isSweep
-            ? 'Depth sweep ($mixLabel): $iterations queries × Top-$topK '
-                'across 11 depths...'
-            : 'Running $iterations vector searches ($mixLabel, Top-$topK, '
-                'depth=$searchDepth)...';
+        if (isSweep) {
+          _lastOperationInfo =
+              'Depth sweep ($mixLabel): $iterations queries × Top-$topK '
+              'across 11 depths...';
+        } else {
+          _lastOperationInfo =
+              'Running $iterations vector searches ($mixLabel, Top-$topK, '
+              'depth=$searchDepth)...';
+        }
       });
 
       try {
@@ -2726,6 +2793,155 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     } catch (e) {
       logService.add('Depth sweep failed: $e', LogLevel.error);
       _updateOperationInfo('❌ Vector depth sweep failed.');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isTesting = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _showTextSearchDialog() async {
+    final result = await showDialog<Map<String, Object>>(
+      context: context,
+      builder: (context) => const TextSearchDialog(),
+    );
+    if (!mounted || result == null) return;
+
+    final query = result['query'] as String? ?? '';
+    final iterations = result['iterations'] as int? ?? 1;
+    final topK = result['topK'] as int? ?? 10;
+    final operatorName = result['operator'] as String? ?? 'or';
+    final operator =
+        operatorName == 'and' ? TextMatchOperator.and : TextMatchOperator.or;
+    final preTokenized = result['preTokenized'] == 1;
+
+    setState(() {
+      _isTesting = true;
+      _lastOperationInfo = iterations <= 1
+          ? 'Text search "$query" (Top-$topK, ${operator.name})...'
+          : 'Text search "$query" × $iterations (Top-$topK, ${operator.name})...';
+    });
+
+    try {
+      await widget.example.textSearchTest(
+        _selectedTable,
+        queryText: query,
+        topK: topK,
+        iterations: iterations,
+        operator: operator,
+        preTokenized: preTokenized,
+      );
+      if (mounted) {
+        setState(() {
+          _lastOperationInfo =
+              'Text search finished. See logs for hits and QPS.';
+        });
+      }
+    } catch (e) {
+      logService.add('Text search failed: $e', LogLevel.error);
+      _updateOperationInfo('Text search failed.');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isTesting = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _showSparseSearchDialog() async {
+    final result = await showDialog<Map<String, Object>>(
+      context: context,
+      builder: (context) => const SparseSearchDialog(),
+    );
+    if (!mounted || result == null) return;
+
+    final query = result['query'] as String? ?? '';
+    final iterations = result['iterations'] as int? ?? 1;
+    final topK = result['topK'] as int? ?? 10;
+
+    setState(() {
+      _isTesting = true;
+      _lastOperationInfo = iterations <= 1
+          ? 'Sparse search (Top-$topK)...'
+          : 'Sparse search × $iterations (Top-$topK)...';
+    });
+
+    try {
+      await widget.example.sparseSearchTest(
+        _selectedTable,
+        queryText: query,
+        topK: topK,
+        iterations: iterations,
+      );
+      if (mounted) {
+        setState(() {
+          _lastOperationInfo =
+              'Sparse search finished. See logs for hits and QPS.';
+        });
+      }
+    } catch (e) {
+      logService.add('Sparse search failed: $e', LogLevel.error);
+      _updateOperationInfo('Sparse search failed.');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isTesting = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _showHybridSearchDialog() async {
+    final result = await showDialog<Map<String, Object>>(
+      context: context,
+      builder: (context) => const HybridSearchDialog(),
+    );
+    if (!mounted || result == null) return;
+
+    final query = result['query'] as String? ?? '';
+    final iterations = result['iterations'] as int? ?? 1;
+    final topK = result['topK'] as int? ?? 10;
+    final searchDepth = result['searchDepth'] as int? ?? 50;
+    final category = result['category'] as String? ?? '';
+    final year = result['year'] as int? ?? 0;
+    final useVector = result['useVector'] == 1;
+    final useText = result['useText'] == 1;
+    final fusionName = result['fusionMethod'] as String? ?? 'weightedScore';
+    final fusionMethod = fusionName == 'rrf'
+        ? RetrievalFusionMethod.rrf
+        : RetrievalFusionMethod.weightedScore;
+
+    setState(() {
+      _isTesting = true;
+      _lastOperationInfo = useVector && useText
+          ? 'Hybrid search (Top-$topK, ${fusionMethod.name})...'
+          : 'Hybrid search (Top-$topK)...';
+    });
+
+    try {
+      await widget.example.hybridSearchTest(
+        _selectedTable,
+        queryText: query,
+        category: category.isEmpty ? null : category,
+        year: year == 0 ? null : year,
+        useVector: useVector,
+        useText: useText,
+        topK: topK,
+        iterations: iterations,
+        searchDepth: searchDepth,
+        fusionMethod: fusionMethod,
+      );
+      if (mounted) {
+        setState(() {
+          _lastOperationInfo = 'Hybrid search finished. See logs.';
+        });
+      }
+    } catch (e) {
+      logService.add('Hybrid search failed: $e', LogLevel.error);
+      _updateOperationInfo('Hybrid search failed.');
     } finally {
       if (mounted) {
         setState(() {
@@ -2839,7 +3055,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
       builder: (context) => AlertDialog(
         title: const Text('Confirm Deletion'),
         content: Text(
-            'Are you sure you want to delete ${_selectedRows.length} selected record(s)?'),
+            'Are you sure you want to delete ${_selectedRecords.length} selected record(s)?'),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(context).pop(false),
@@ -2862,12 +3078,12 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
 
       setState(() {
         _isDataLoading = true;
-        _lastOperationInfo = 'Deleting ${_selectedRows.length} records...';
+        _lastOperationInfo = 'Deleting ${_selectedRecords.length} records...';
       });
 
       try {
         if (_isKvMode) {
-          final keys = _selectedRows.map((e) => e.toString()).toList();
+          final keys = _selectedRecords.map((e) => e.toString()).toList();
           final result = await widget.example.db.kv
               .removeKeys(keys, isGlobal: _isKvGlobal);
           logService.add(
@@ -2881,10 +3097,10 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         } else {
           final result = await widget.example.db
               .delete(_selectedTable)
-              .whereIn(_primaryKey!, _selectedRows.toList());
+              .whereIn(_primaryKey!, _selectedRecords.toList());
 
           logService.add(
-              'Deleted ${result.successCount} of ${_selectedRows.length} records.',
+              'Deleted ${result.successCount} of ${_selectedRecords.length} records.',
               !result.hasErrors ? LogLevel.info : LogLevel.warn);
 
           if (result.failedCount > 0) {
@@ -2898,7 +3114,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         logService.add('Stacktrace: $s', LogLevel.error);
       }
 
-      _selectedRows.clear();
+      _selectedRecords.clear();
       await _fetchTableData(); // Refresh the view
     }
   }
@@ -2977,7 +3193,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     final schema = await widget.example.db.getTableSchema(_selectedTable);
     if (schema == null) {
       logService.add(
-          'Cannot modify rows: Schema not found for $_selectedTable.',
+          'Cannot modify records: Schema not found for $_selectedTable.',
           LogLevel.warn);
       return;
     }
@@ -2995,17 +3211,17 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
 
       setState(() {
         _isDataLoading = true;
-        _lastOperationInfo = 'Updating ${_selectedRows.length} records...';
+        _lastOperationInfo = 'Updating ${_selectedRecords.length} records...';
       });
 
       try {
         final result = await widget.example.db
             .update(_selectedTable, {fieldToUpdate: newValue})
-            .whereIn(_primaryKey!, _selectedRows.toList())
+            .whereIn(_primaryKey!, _selectedRecords.toList())
             .allowPartialErrors();
 
         final successMsg =
-            'Successfully updated ${result.successCount} of ${_selectedRows.length} records.';
+            'Successfully updated ${result.successCount} of ${_selectedRecords.length} records.';
         logService.add(successMsg, LogLevel.info);
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
@@ -3035,7 +3251,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         logService.add('Stacktrace: $s', LogLevel.error);
       }
 
-      _selectedRows.clear();
+      _selectedRecords.clear();
       await _fetchTableData();
     }
   }
@@ -4487,6 +4703,45 @@ class _AddDataDialogState extends State<AddDataDialog> {
   }
 }
 
+/// Fields that this demo editor cannot safely round-trip via text inputs.
+bool _isDemoNonEditableField(FieldSchema field) {
+  switch (field.type) {
+    case DataType.vector:
+    case DataType.sparse:
+    case DataType.blob:
+      return true;
+    default:
+      return false;
+  }
+}
+
+String _demoFieldTypeLabel(FieldSchema field) {
+  switch (field.type) {
+    case DataType.vector:
+      final dims = field.vectorConfig?.dimensions;
+      return dims != null ? 'vector ${dims}d' : 'vector';
+    case DataType.sparse:
+      return 'sparse';
+    case DataType.blob:
+      return 'blob';
+    default:
+      return field.type.name;
+  }
+}
+
+String _demoReadOnlyFieldSummary(FieldSchema field, dynamic value) {
+  if (value == null) return 'null';
+  if (value is VectorData) {
+    return 'VectorData(${value.dimensions}d) — edit via Add / Clear, not here';
+  }
+  if (value is SparseVectorData) {
+    return 'SparseVector — read-only in this editor';
+  }
+  final text = value.toString();
+  if (text.length <= 80) return '$text — read-only in this editor';
+  return '${text.substring(0, 77)}... — read-only in this editor';
+}
+
 /// A dialog for editing a single row of data.
 class EditRowDialog extends StatefulWidget {
   final TableSchema schema;
@@ -4507,19 +4762,19 @@ class _EditRowDialogState extends State<EditRowDialog> {
   @override
   void initState() {
     super.initState();
-    _updatedData = Map.from(widget.initialData);
+    // Only editable fields are submitted; PK / vector / sparse / blob stay out.
+    _updatedData = <String, dynamic>{};
 
-    // Initialize controllers for all fields defined in the schema
+    final pkName = widget.schema.primaryKeyConfig.name;
     _controllers = {
-      for (var field in widget.schema.fields)
-        field.name: TextEditingController(
-            text: '${widget.initialData[field.name] ?? ''}'),
+      for (final field in widget.schema.fields)
+        if (field.name != pkName && !_isDemoNonEditableField(field))
+          field.name: TextEditingController(
+            text: '${widget.initialData[field.name] ?? ''}',
+          ),
     };
 
-    // Also add a controller for the primary key, which will be read-only
-    final pkName = widget.schema.primaryKeyConfig.name;
-    if (!_controllers.containsKey(pkName) &&
-        widget.initialData.containsKey(pkName)) {
+    if (widget.initialData.containsKey(pkName)) {
       _controllers[pkName] =
           TextEditingController(text: '${widget.initialData[pkName]}');
     }
@@ -4568,7 +4823,6 @@ class _EditRowDialogState extends State<EditRowDialog> {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              // Display the primary key as read-only if it exists
               if (_controllers.containsKey(pkName))
                 Padding(
                   padding: const EdgeInsets.symmetric(vertical: 8.0),
@@ -4583,10 +4837,29 @@ class _EditRowDialogState extends State<EditRowDialog> {
                     ),
                   ),
                 ),
-              // Editable fields from schema
               ...widget.schema.fields.map((field) {
-                // Don't show the primary key again if it's also listed in fields
                 if (field.name == pkName) return const SizedBox.shrink();
+
+                if (_isDemoNonEditableField(field)) {
+                  return Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 8.0),
+                    child: TextFormField(
+                      initialValue: _demoReadOnlyFieldSummary(
+                        field,
+                        widget.initialData[field.name],
+                      ),
+                      readOnly: true,
+                      maxLines: 2,
+                      decoration: InputDecoration(
+                        labelText:
+                            '${field.name} (${_demoFieldTypeLabel(field)}, read-only)',
+                        border: const OutlineInputBorder(),
+                        filled: true,
+                        fillColor: Colors.grey.shade200,
+                      ),
+                    ),
+                  );
+                }
 
                 return Padding(
                   padding: const EdgeInsets.symmetric(vertical: 8.0),
@@ -4644,10 +4917,11 @@ class _BatchUpdateDialogState extends State<BatchUpdateDialog> {
   @override
   void initState() {
     super.initState();
-    // Exclude primary key and unique fields from batch updates
+    // Exclude primary key, unique, and non-text-editable payload fields.
     final pkName = widget.schema.primaryKeyConfig.name;
     _updatableFields = widget.schema.fields
-        .where((f) => f.name != pkName && !f.unique)
+        .where(
+            (f) => f.name != pkName && !f.unique && !_isDemoNonEditableField(f))
         .toList();
     if (_updatableFields.isNotEmpty) {
       _selectedField = _updatableFields.first.name;
@@ -4722,7 +4996,7 @@ class _BatchUpdateDialogState extends State<BatchUpdateDialog> {
                     controller: _valueController,
                     decoration: const InputDecoration(
                       labelText: 'New Value',
-                      hintText: 'Enter the new value for all selected rows',
+                      hintText: 'Enter the new value for all selected records',
                       border: OutlineInputBorder(),
                     ),
                     validator: (value) {
@@ -5222,6 +5496,642 @@ class _FilterCondition {
     required this.operator,
     required this.valueController,
   });
+}
+
+class HybridSearchDialog extends StatefulWidget {
+  const HybridSearchDialog({super.key});
+
+  @override
+  State<HybridSearchDialog> createState() => _HybridSearchDialogState();
+}
+
+class _HybridSearchDialogState extends State<HybridSearchDialog> {
+  final _queryController = TextEditingController(text: 'distributed database');
+  final _iterationsController = TextEditingController(text: '1');
+  int _topK = 10;
+  int _iterations = 1;
+  int _searchDepth = 50;
+  bool _useVector = true;
+  bool _useText = true;
+  RetrievalFusionMethod _fusionMethod = RetrievalFusionMethod.weightedScore;
+  String _category = ExampleTextCorpus.categories.first;
+  int _year = 0;
+
+  @override
+  void dispose() {
+    _queryController.dispose();
+    _iterationsController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Row(
+        children: [
+          Icon(Icons.hub_outlined, color: Color(0xff0aa6e8)),
+          SizedBox(width: 10),
+          Expanded(
+            child: Text('Hybrid Search', overflow: TextOverflow.ellipsis),
+          ),
+        ],
+      ),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Vector and text are fused. Category and year are structured AND filters.',
+              style: TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 8,
+              children: [
+                FilterChip(
+                  label: const Text('Vector'),
+                  selected: _useVector,
+                  selectedColor: const Color(0xff0aa6e8),
+                  checkmarkColor: Colors.white,
+                  labelStyle: TextStyle(
+                    color: _useVector ? Colors.white : Colors.black,
+                  ),
+                  onSelected: (selected) =>
+                      setState(() => _useVector = selected),
+                ),
+                FilterChip(
+                  label: const Text('Text'),
+                  selected: _useText,
+                  selectedColor: const Color(0xff0aa6e8),
+                  checkmarkColor: Colors.white,
+                  labelStyle: TextStyle(
+                    color: _useText ? Colors.white : Colors.black,
+                  ),
+                  onSelected: (selected) => setState(() => _useText = selected),
+                ),
+              ],
+            ),
+            if (_useVector && _useText) ...[
+              const SizedBox(height: 12),
+              const Text('Fusion method',
+                  style: TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 8,
+                children: [
+                  ChoiceChip(
+                    label: const Text('weightedScore'),
+                    selected:
+                        _fusionMethod == RetrievalFusionMethod.weightedScore,
+                    selectedColor: const Color(0xff0aa6e8),
+                    checkmarkColor: Colors.white,
+                    labelStyle: TextStyle(
+                      color:
+                          _fusionMethod == RetrievalFusionMethod.weightedScore
+                              ? Colors.white
+                              : Colors.black,
+                    ),
+                    onSelected: (selected) {
+                      if (selected) {
+                        setState(() => _fusionMethod =
+                            RetrievalFusionMethod.weightedScore);
+                      }
+                    },
+                  ),
+                  ChoiceChip(
+                    label: const Text('rrf'),
+                    selected: _fusionMethod == RetrievalFusionMethod.rrf,
+                    selectedColor: const Color(0xff0aa6e8),
+                    checkmarkColor: Colors.white,
+                    labelStyle: TextStyle(
+                      color: _fusionMethod == RetrievalFusionMethod.rrf
+                          ? Colors.white
+                          : Colors.black,
+                    ),
+                    onSelected: (selected) {
+                      if (selected) {
+                        setState(
+                            () => _fusionMethod = RetrievalFusionMethod.rrf);
+                      }
+                    },
+                  ),
+                ],
+              ),
+              const SizedBox(height: 4),
+              Text(
+                _fusionMethod == RetrievalFusionMethod.weightedScore
+                    ? 'weightedScore (default): sum of channel scores × weights, '
+                        'normalized by total channel weight. Prefer when absolute '
+                        'relevance thresholds matter.'
+                    : 'rrf: Reciprocal Rank Fusion from per-channel ranks. '
+                        'Relative ordering only — not absolute score thresholds.',
+                style: const TextStyle(fontSize: 12, color: Colors.grey),
+              ),
+            ],
+            const SizedBox(height: 12),
+            TextField(
+              controller: _queryController,
+              enabled: _useText,
+              decoration: const InputDecoration(
+                labelText: 'Text query',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            const Text('Category'),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                ChoiceChip(
+                  label: const Text('Any'),
+                  selected: _category.isEmpty,
+                  selectedColor: const Color(0xff0aa6e8),
+                  checkmarkColor: Colors.white,
+                  labelStyle: TextStyle(
+                    color: _category.isEmpty ? Colors.white : Colors.black,
+                  ),
+                  onSelected: (selected) {
+                    if (selected) setState(() => _category = '');
+                  },
+                ),
+                ...ExampleTextCorpus.categories.map((category) {
+                  final selected = _category == category;
+                  return ChoiceChip(
+                    label: Text(category),
+                    selected: selected,
+                    selectedColor: const Color(0xff0aa6e8),
+                    checkmarkColor: Colors.white,
+                    labelStyle: TextStyle(
+                      color: selected ? Colors.white : Colors.black,
+                    ),
+                    onSelected: (on) {
+                      if (on) setState(() => _category = category);
+                    },
+                  );
+                }),
+              ],
+            ),
+            const SizedBox(height: 12),
+            const Text('Year'),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                ChoiceChip(
+                  label: const Text('Any'),
+                  selected: _year == 0,
+                  selectedColor: const Color(0xff0aa6e8),
+                  checkmarkColor: Colors.white,
+                  labelStyle: TextStyle(
+                    color: _year == 0 ? Colors.white : Colors.black,
+                  ),
+                  onSelected: (selected) {
+                    if (selected) setState(() => _year = 0);
+                  },
+                ),
+                ...ExampleTextCorpus.years.map((year) {
+                  final selected = _year == year;
+                  return ChoiceChip(
+                    label: Text('$year'),
+                    selected: selected,
+                    selectedColor: const Color(0xff0aa6e8),
+                    checkmarkColor: Colors.white,
+                    labelStyle: TextStyle(
+                      color: selected ? Colors.white : Colors.black,
+                    ),
+                    onSelected: (on) {
+                      if (on) setState(() => _year = year);
+                    },
+                  );
+                }),
+              ],
+            ),
+            const SizedBox(height: 12),
+            const Text('Top-K'),
+            Slider(
+              value: _topK.toDouble(),
+              min: 1,
+              max: 50,
+              divisions: 49,
+              label: _topK.toString(),
+              activeColor: const Color(0xff0aa6e8),
+              onChanged: (v) => setState(() => _topK = v.toInt()),
+            ),
+            const Text('Vector search depth'),
+            Slider(
+              value: _searchDepth.toDouble(),
+              min: 1,
+              max: 100,
+              divisions: 99,
+              label: _searchDepth.toString(),
+              activeColor: const Color(0xff0aa6e8),
+              onChanged: _useVector
+                  ? (v) => setState(() => _searchDepth = v.toInt())
+                  : null,
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _iterationsController,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                labelText: 'Iterations',
+                border: OutlineInputBorder(),
+                helperText: 'More than 1 repeats this query and reports QPS.',
+              ),
+              onChanged: (value) {
+                final parsed = int.tryParse(value);
+                if (parsed != null && parsed > 0) {
+                  setState(() => _iterations = parsed);
+                }
+              },
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        ElevatedButton(
+          onPressed: () {
+            if (_useText && _queryController.text.trim().isEmpty) return;
+            if (!_useVector && !_useText && _category.isEmpty && _year == 0) {
+              return;
+            }
+            final parsed = int.tryParse(_iterationsController.text.trim());
+            Navigator.of(context).pop({
+              'query': _queryController.text.trim(),
+              'topK': _topK,
+              'iterations': parsed != null && parsed > 0 ? parsed : _iterations,
+              'searchDepth': _searchDepth,
+              'category': _category,
+              'year': _year,
+              'useVector': _useVector ? 1 : 0,
+              'useText': _useText ? 1 : 0,
+              'fusionMethod': _fusionMethod.name,
+            });
+          },
+          style: ElevatedButton.styleFrom(
+            backgroundColor: const Color(0xff0aa6e8),
+            foregroundColor: Colors.white,
+          ),
+          child: const Text('Search'),
+        ),
+      ],
+    );
+  }
+}
+
+class TextSearchDialog extends StatefulWidget {
+  const TextSearchDialog({super.key});
+
+  @override
+  State<TextSearchDialog> createState() => _TextSearchDialogState();
+}
+
+class _TextSearchDialogState extends State<TextSearchDialog> {
+  final _queryController = TextEditingController(text: 'distributed database');
+  final _iterationsController = TextEditingController(text: '1');
+  int _topK = 10;
+  int _iterations = 1;
+  bool _preTokenized = false;
+  TextMatchOperator _operator = TextMatchOperator.or;
+
+  @override
+  void dispose() {
+    _queryController.dispose();
+    _iterationsController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Row(
+        children: [
+          Icon(Icons.manage_search, color: Color(0xff0aa6e8)),
+          SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              'Text Search',
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ],
+      ),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextField(
+              controller: _queryController,
+              decoration: InputDecoration(
+                labelText: 'Query',
+                border: const OutlineInputBorder(),
+                helperText: _preTokenized
+                    ? 'Pre-tokenized terms, split on spaces, commas, or |. The engine does not segment them again.'
+                    : 'Add records first. Mock docs use words such as distributed, database, 检索.',
+              ),
+              minLines: 1,
+              maxLines: 3,
+            ),
+            const SizedBox(height: 16),
+            const Text('Input', style: TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              children: [
+                ChoiceChip(
+                  label: const Text('Text'),
+                  selected: !_preTokenized,
+                  selectedColor: const Color(0xff0aa6e8),
+                  checkmarkColor: Colors.white,
+                  labelStyle: TextStyle(
+                    color: !_preTokenized ? Colors.white : Colors.black,
+                  ),
+                  onSelected: (selected) {
+                    if (selected) setState(() => _preTokenized = false);
+                  },
+                ),
+                ChoiceChip(
+                  label: const Text('Terms'),
+                  selected: _preTokenized,
+                  selectedColor: const Color(0xff0aa6e8),
+                  checkmarkColor: Colors.white,
+                  labelStyle: TextStyle(
+                    color: _preTokenized ? Colors.white : Colors.black,
+                  ),
+                  onSelected: (selected) {
+                    if (selected) setState(() => _preTokenized = true);
+                  },
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            const Text('Top-K'),
+            Slider(
+              value: _topK.toDouble(),
+              min: 1,
+              max: 50,
+              divisions: 49,
+              label: _topK.toString(),
+              activeColor: const Color(0xff0aa6e8),
+              onChanged: (v) => setState(() => _topK = v.toInt()),
+            ),
+            Center(child: Text('$_topK results')),
+            const SizedBox(height: 12),
+            const Text('Match', style: TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              children: [
+                ChoiceChip(
+                  label: const Text('OR'),
+                  selected: _operator == TextMatchOperator.or,
+                  selectedColor: const Color(0xff0aa6e8),
+                  checkmarkColor: Colors.white,
+                  labelStyle: TextStyle(
+                    color: _operator == TextMatchOperator.or
+                        ? Colors.white
+                        : Colors.black,
+                  ),
+                  onSelected: (selected) {
+                    if (selected) {
+                      setState(() => _operator = TextMatchOperator.or);
+                    }
+                  },
+                ),
+                ChoiceChip(
+                  label: const Text('AND'),
+                  selected: _operator == TextMatchOperator.and,
+                  selectedColor: const Color(0xff0aa6e8),
+                  checkmarkColor: Colors.white,
+                  labelStyle: TextStyle(
+                    color: _operator == TextMatchOperator.and
+                        ? Colors.white
+                        : Colors.black,
+                  ),
+                  onSelected: (selected) {
+                    if (selected) {
+                      setState(() => _operator = TextMatchOperator.and);
+                    }
+                  },
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            const Text('Iterations',
+                style: TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              children: [1, 100, 1000].map((count) {
+                final selected = _iterations == count;
+                return ChoiceChip(
+                  label: Text(count == 1 ? 'Once' : count.toString()),
+                  selected: selected,
+                  selectedColor: const Color(0xff0aa6e8),
+                  checkmarkColor: Colors.white,
+                  labelStyle: TextStyle(
+                    color: selected ? Colors.white : Colors.black,
+                  ),
+                  onSelected: (on) {
+                    if (!on) return;
+                    setState(() {
+                      _iterations = count;
+                      _iterationsController.text = count.toString();
+                    });
+                  },
+                );
+              }).toList(),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _iterationsController,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                labelText: 'Custom iterations',
+                border: OutlineInputBorder(),
+                helperText: 'More than 1 repeats this query and reports QPS.',
+              ),
+              onChanged: (value) {
+                final parsed = int.tryParse(value);
+                if (parsed != null && parsed > 0) {
+                  setState(() => _iterations = parsed);
+                }
+              },
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        ElevatedButton(
+          onPressed: () {
+            final query = _queryController.text.trim();
+            if (query.isEmpty) return;
+            final parsed = int.tryParse(_iterationsController.text.trim());
+            Navigator.of(context).pop({
+              'query': query,
+              'topK': _topK,
+              'iterations': parsed != null && parsed > 0 ? parsed : _iterations,
+              'operator': _operator == TextMatchOperator.and ? 'and' : 'or',
+              'preTokenized': _preTokenized ? 1 : 0,
+            });
+          },
+          style: ElevatedButton.styleFrom(
+            backgroundColor: const Color(0xff0aa6e8),
+            foregroundColor: Colors.white,
+          ),
+          child: const Text('Search'),
+        ),
+      ],
+    );
+  }
+}
+
+class SparseSearchDialog extends StatefulWidget {
+  const SparseSearchDialog({super.key});
+
+  @override
+  State<SparseSearchDialog> createState() => _SparseSearchDialogState();
+}
+
+class _SparseSearchDialogState extends State<SparseSearchDialog> {
+  final _queryController = TextEditingController(text: '10:1.0,42:0.8');
+  final _iterationsController = TextEditingController(text: '1');
+  int _topK = 10;
+  int _iterations = 1;
+
+  @override
+  void dispose() {
+    _queryController.dispose();
+    _iterationsController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Row(
+        children: [
+          Icon(Icons.scatter_plot_outlined, color: Color(0xff0aa6e8)),
+          SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              'Sparse Search',
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ],
+      ),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextField(
+              controller: _queryController,
+              decoration: const InputDecoration(
+                labelText: 'Query dims',
+                border: OutlineInputBorder(),
+                helperText: 'dim or dim:weight, separated by spaces/commas/|. '
+                    'Mock docs plant 10, 42, 777, 120000.',
+              ),
+              minLines: 1,
+              maxLines: 3,
+            ),
+            const SizedBox(height: 16),
+            const Text('Top-K'),
+            Slider(
+              value: _topK.toDouble(),
+              min: 1,
+              max: 50,
+              divisions: 49,
+              label: _topK.toString(),
+              activeColor: const Color(0xff0aa6e8),
+              onChanged: (v) => setState(() => _topK = v.toInt()),
+            ),
+            Center(child: Text('$_topK results')),
+            const SizedBox(height: 16),
+            const Text('Iterations',
+                style: TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              children: [1, 100, 1000].map((count) {
+                final selected = _iterations == count;
+                return ChoiceChip(
+                  label: Text(count == 1 ? 'Once' : count.toString()),
+                  selected: selected,
+                  selectedColor: const Color(0xff0aa6e8),
+                  checkmarkColor: Colors.white,
+                  labelStyle: TextStyle(
+                    color: selected ? Colors.white : Colors.black,
+                  ),
+                  onSelected: (on) {
+                    if (!on) return;
+                    setState(() {
+                      _iterations = count;
+                      _iterationsController.text = count.toString();
+                    });
+                  },
+                );
+              }).toList(),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _iterationsController,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                labelText: 'Custom iterations',
+                border: OutlineInputBorder(),
+                helperText: 'More than 1 repeats this query and reports QPS.',
+              ),
+              onChanged: (value) {
+                final parsed = int.tryParse(value);
+                if (parsed != null && parsed > 0) {
+                  setState(() => _iterations = parsed);
+                }
+              },
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        ElevatedButton(
+          onPressed: () {
+            final query = _queryController.text.trim();
+            if (query.isEmpty) return;
+            final parsed = int.tryParse(_iterationsController.text.trim());
+            Navigator.of(context).pop({
+              'query': query,
+              'topK': _topK,
+              'iterations': parsed != null && parsed > 0 ? parsed : _iterations,
+            });
+          },
+          style: ElevatedButton.styleFrom(
+            backgroundColor: const Color(0xff0aa6e8),
+            foregroundColor: Colors.white,
+          ),
+          child: const Text('Search'),
+        ),
+      ],
+    );
+  }
 }
 
 class VectorSearchDialog extends StatefulWidget {

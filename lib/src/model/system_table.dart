@@ -88,7 +88,7 @@ class SystemTable {
   static const String keyMigrationCheckpointField = 'checkpoint_key';
   static const String keyMigrationProgressKeyField = 'progress_key';
 
-  /// Scope marker for global tables in key migration progress rows.
+  /// Scope marker for global tables in key migration progress records.
   static const String globalMigrationScope = '__global__';
 
   static const Set<String> _systemTableNames = {

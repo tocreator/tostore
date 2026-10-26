@@ -211,6 +211,26 @@ class SequentialIdGenerator implements IdGenerator {
     return result;
   }
 
+  /// Pure synchronous fast-path for allocating and assigning local IDs in-place.
+  List<String>? tryAllocateAndAssignSync(
+    int count,
+    List<Map<String, dynamic>> records,
+    int start,
+    String pkField,
+  ) {
+    if (count <= 0) return const <String>[];
+    if (_canAllocateLocalRangeSync) {
+      _updateRequestStats(count);
+      return _allocateLocalRange(
+        count,
+        assignTo: records,
+        assignStart: start,
+        assignField: pkField,
+      );
+    }
+    return null;
+  }
+
   /// Allocates [count] IDs and writes them onto [records] in a single pass.
   ///
   /// Uses the same [_currentId] cursor as [getId] / [getSingleIdSync]. The

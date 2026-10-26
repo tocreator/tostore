@@ -93,7 +93,7 @@ enum BenchmarkOperation {
   vectorSearch('ANN @ depth 50 (~95%)',
       'Production-default ANN at searchDepth=50 (~95% recall intent)'),
   vectorHybridSearch(
-      'Vector Hybrid Search', 'Filter plus vector search (full rows)'),
+      'Vector Hybrid Search', 'Filter plus vector search (full records)'),
   vectorRecallCheck(
       'Recall @ default OP',
       'Opt-in quality check: Recall@K at default searchDepth only — not a recall ceiling. '
@@ -269,7 +269,7 @@ class BenchmarkSummary {
     if (!hasVectorRecall) return null;
     final depth = VectorIndexConfig.defaultSearchDepth;
     return 'Recall@K is measured only at default searchDepth=$depth '
-        '(same OP as ANN/hybrid rows) — not the maximum achievable recall. '
+        '(same OP as ANN/hybrid records) — not the maximum achievable recall. '
         'Larger searchDepth typically raises recall and latency.';
   }
 
@@ -312,13 +312,13 @@ class BenchmarkSummary {
           '| ${m.tierName} | ${m.name} | ${m.recordCount} | $avgTimeStr | $highlightStr | $latencyStr | $minMaxStr |');
     }
 
-    final qualityRows = metrics
+    final qualityRecords = metrics
         .where((m) => m.qualityNote != null && m.qualityNote!.isNotEmpty);
-    if (qualityRows.isNotEmpty) {
+    if (qualityRecords.isNotEmpty) {
       buffer.writeln();
       buffer.writeln(
           '**Quality notes** (Result = Recall@K at the chosen searchDepth operating point, not a ceiling; Count = queries):');
-      for (final m in qualityRows) {
+      for (final m in qualityRecords) {
         buffer.writeln('- **${m.name}**: ${m.qualityNote}');
       }
     }

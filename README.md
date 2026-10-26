@@ -592,7 +592,7 @@ For more complex Key-Value scenarios, it is recommended to use the `db.kv` names
   | `prefix(String)` | Filter by key prefix |
   | `orderByKeyAsc` / `orderByKeyDesc` | Sort by key (primary key) |
   | `orderByUpdatedAtAsc` / `orderByUpdatedAtDesc` | Sort by `updated_at` |
-  | `limit(n)` | Max rows for this page (always specify explicitly) |
+  | `limit(n)` | Max records for this page (always specify explicitly) |
   | `offset(n)` | Offset pagination (clears cursor) |
   | `cursor(token)` | Special cases only: pass a pagination token across process/network |
   | `includeExpired([true])` | Include expired records that have not been cleaned up yet |
@@ -728,7 +728,7 @@ await db.kv.setMany(settingsMap, durability: RecoveryDurability.durable);
 
 ### Vector Fields, Vector Indexes, and Hybrid Retrieval
 
-Vector retrieval uses the unified `db.query(...).matchVector(...)` query chain: it can be combined with structured predicates on the same chain, or fused with other recall branches. Scores and channel diagnostics are returned in `QueryResult.retrieval`, aligned 1:1 with `data` rows. When you only need primary keys and scores, prefer `.select(['id'])` (or your PK field name) so the engine skips hydrating full table rows — otherwise hybrid retrieval materializes complete records (including large embeddings) and throughput can drop sharply. For dedicated ANN without filters or fusion, `db.vectorSearch(...)` returns `List<VectorSearchResult>` (primary key + score) with the same core search path. Current examples focus on vector + structured paths; lexical, graph, and other channels will extend along the same chained hybrid retrieval model.
+Vector retrieval uses the unified `db.query(...).matchVector(...)` query chain: it can be combined with structured predicates on the same chain, or fused with other recall branches. Scores and channel diagnostics are returned in `QueryResult.retrieval`, aligned 1:1 with `data` records. When you only need primary keys and scores, prefer `.select(['id'])` (or your PK field name) so the engine skips hydrating full table records — otherwise hybrid retrieval materializes complete records (including large embeddings) and throughput can drop sharply. For dedicated ANN without filters or fusion, `db.vectorSearch(...)` returns `List<VectorSearchResult>` (primary key + score) with the same core search path. Current examples focus on vector + structured paths; lexical, graph, and other channels will extend along the same chained hybrid retrieval model.
 
 **Search visibility**: After insert/update returns success, regular indexes are immediately searchable; vector indexes are not built on the write path (to avoid hurting throughput) and are not searchable right away. When you need them in retrieval, call `await db.flush()` after your business batch (optional convenience); only then do they participate in `matchVector` / `vectorSearch`.
 
@@ -778,7 +778,7 @@ final queryVector =
     VectorData.fromList(List.generate(128, (i) => i * 0.01)); // Must match dimensions
 
 // 1) Recommended: chained hybrid retrieval (pure vector ANN)
-// Prefer .select([pk]) for primary key + score only — avoids full-row hydration.
+// Prefer .select([pk]) for primary key + score only — avoids full-record hydration.
 final result = await db
     .query('embeddings')
     .select(['id'])
@@ -786,14 +786,14 @@ final result = await db
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
-  final row = result.data[i];
+  final record = result.data[i];
   final entry = result.retrieval?.entries[i];
-  print('pk=${row['id']}, score=${entry?.score}, '
+  print('pk=${record['id']}, score=${entry?.score}, '
       'distance=${entry?.meta?['distance']}');
 }
 
 // Need business columns? omit select() (or project the fields you need) —
-// the engine then loads full table rows for matched PKs (heavier).
+// the engine then loads full table records for matched PKs (heavier).
 
 // 2) Structured filter + vector (AND hybrid)
 final filtered = await db
@@ -841,7 +841,7 @@ final ann = await db.vectorSearch(
 
 **Result notes** (`QueryResult`):
 
-- Business rows are in `data`; retrieval scores and channel info are in `retrieval.entries`, aligned **1:1** with `data`
+- Business records are in `data`; retrieval scores and channel info are in `retrieval.entries`, aligned **1:1** with `data`
 - For high-throughput ANN / hybrid recall, use `.select(['id'])` (PK field name) so `data` is PK-only and scores stay in `retrieval`
 - `entry.score`: normalized similarity / fusion score, typically in `0 ~ 1`; larger means more relevant
 - `entry.meta['distance']`: raw distance (common on the vector channel); for `l2` / `cosine`, smaller usually means closer
@@ -896,7 +896,7 @@ await db.upsert('users', {
 });
 
 // Batch upsert (supports atomic mode or partial-success mode)
-// allowPartialErrors: true means some rows may fail while others still succeed
+// allowPartialErrors: true means some records may fail while others still succeed
 final batchResult = await db.batchUpsert('users', [
   {'username': 'a', 'email': 'a@example.com'},
   {'username': 'b', 'email': 'b@example.com'},
@@ -985,7 +985,7 @@ final stats = await db.query('orders')
 #### 3. Helper Query Methods
 - **`exists()` (high-performance)**: checks whether any record matches. Unlike `count() > 0`, it short-circuits as soon as one match is found, which is excellent for very large datasets.
 - **`count()`**: efficiently returns the number of matching records.
-- **`first()`**: a convenience method equivalent to `limit(1)` and returning the first row directly as a `Map`.
+- **`first()`**: a convenience method equivalent to `limit(1)` and returning the first record directly as a `Map`.
 - **`distinct([fields])`**: deduplicates results. If `fields` are provided, uniqueness is calculated based on those fields.
 
 ```dart
@@ -1102,8 +1102,8 @@ Suitable for scenarios where the data volume is small (e.g., under 10k) or when 
 ```dart
 final result = await db.query('users')
     .orderByDesc('created_at')
-    .offset(40) // Skip the first 40 rows
-    .limit(20); // Take 20 rows
+    .offset(40) // Skip the first 40 records
+    .limit(20); // Take 20 records
 ```
 > [!TIP]
 > When `offset` becomes very large, the database must scan and discard a large number of records, and performance degrades linearly. For deep pagination or larger datasets, it is recommended to use **Cursor Mode**.
@@ -1160,7 +1160,7 @@ if (nextToken != null) {
 | :--- | :--- | :--- |
 | **Query Performance** | Degrades as page count increases | Constant speed for deep paging |
 | **Best for** | Small datasets, exact page jumping | **Massive datasets, infinite scrolling** |
-| **Consistency under changes** | Data changes can cause skipped/duplicate rows | Avoids duplicates and omissions caused by data changes |
+| **Consistency under changes** | Data changes can cause skipped/duplicate records | Avoids duplicates and omissions caused by data changes |
 
 
 ### Memory Probe and Sync Retrieval (peek)
@@ -1332,7 +1332,7 @@ final users = await db.query('users')
 > [!CAUTION]
 > **Query Performance Guide (Index vs Full-Scan)**
 >
-> In large-scale data scenarios (millions of rows or more), please follow these principles to avoid main thread lag and query timeouts:
+> In large-scale data scenarios (millions of records or more), please follow these principles to avoid main thread lag and query timeouts:
 >
 > 1. **Index Optimized - \[Recommended\]**:
 >    *   **Semantic Methods**: `whereEqual`, `whereGreaterThan`, `whereLessThan`, `whereIn`, `whereBetween`, `whereNull`, `whereTrue`, `whereFalse`, and **`whereStartsWith`** (prefix match).

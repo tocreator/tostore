@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:math';
+import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
@@ -8,6 +8,7 @@ import 'package:tostore/tostore.dart';
 
 import 'example_schemas.dart';
 import 'log_service.dart';
+import 'vector_recall.dart';
 
 /// A comprehensive testing suite for validating ToStore's core functionalities.
 /// It covers basic CRUD, upsert, joins, multi-space, and various edge cases.
@@ -181,6 +182,34 @@ class DatabaseTester {
         },
         {'name': 'Count Verification', 'test': _testCountVerification},
         {'name': 'Concurrency Stress Test', 'test': _testConcurrencyStress},
+        {
+          'name': 'Vector Index CRUD & Flush Visibility',
+          'test': _testVectorCrudFlushAndSearch,
+        },
+        {
+          'name': 'Vector Score Calibration & Filters',
+          'test': _testVectorScoreAndFilters,
+        },
+        {
+          'name': 'Vector Hybrid Fusion & Multi-Space',
+          'test': _testVectorHybridAndMultiSpace,
+        },
+        {
+          'name': 'Text/Sparse CRUD & Persistence',
+          'test': _testTextSparseCrudAndPersistence,
+        },
+        {
+          'name': 'Text Query & Score Calibration',
+          'test': _testTextQueryAndScores,
+        },
+        {
+          'name': 'Sparse Retrieval & Scores',
+          'test': _testSparseRetrievalAndScores,
+        },
+        {
+          'name': 'Text/Sparse Hybrid & Traps',
+          'test': _testTextSparseHybridAndTraps,
+        },
       ];
 
       for (var i = 0; i < tests.length; i++) {
@@ -214,6 +243,7 @@ class DatabaseTester {
       // CRITICAL: Clean up all tables after tests are finished to ensure a clean state.
       _updateLastOperation('Cleaning up test data...');
       await _clearTablesSafely();
+      await _clearVectorTables();
       log.add('--- All test data cleared. ---', LogLevel.info);
     }
 
@@ -248,6 +278,73 @@ class DatabaseTester {
     }
     await db.clear(ExampleSchemas.posts.name);
     await db.clear(ExampleSchemas.users.name);
+  }
+
+  Future<void> _clearVectorTables() async {
+    // Clear demo retrieval tables last; log each step so a hang is locatable.
+    log.add('cleanup: clear ${ExampleSchemas.embeddings128.name}...',
+        LogLevel.debug);
+    await db.clear(ExampleSchemas.embeddings128.name);
+    log.add(
+        'cleanup: clear ${ExampleSchemas.hybridDocs.name}...', LogLevel.debug);
+    await db.clear(ExampleSchemas.hybridDocs.name);
+    log.add('cleanup: retrieval tables cleared', LogLevel.debug);
+  }
+
+  /// Float assertion used by vector score checks.
+  bool _expectClose(
+    String description,
+    double actual,
+    double expected, {
+    double eps = 0.05,
+  }) {
+    if ((actual - expected).abs() <= eps) {
+      _passTest(
+        '$description: $actual ~ $expected (+/-$eps).',
+      );
+      return true;
+    }
+    return _failTest(
+      '$description: expected ~ $expected (+/-$eps), got $actual.',
+    );
+  }
+
+  /// Expected public text [RetrievalEntry.score] for one exact term hit.
+  ///
+  /// Mirrors engine `WmbpScore`: idfMilli × weightMilli × tf-q8 → raw →
+  /// `raw / (raw + 2)`. Plant docs with known [activeDocs]/[df]/[tf] so the
+  /// recalled score can be checked against this value directly.
+  double _expectedTextRelevance({
+    required int activeDocs,
+    required int df,
+    int tf = 1,
+    double queryWeight = 1.0,
+  }) {
+    if (activeDocs <= 0 || df <= 0 || tf <= 0 || queryWeight <= 0) {
+      return 0;
+    }
+    var idfMilli = (1000.0 * math.log((activeDocs + 1) / (df + 0.5))).ceil();
+    if (idfMilli < 1) idfMilli = 1;
+    final weightMilli = (queryWeight * 1000.0).round();
+    if (weightMilli <= 0) return 0;
+    final sat = tf / (tf + 1.2);
+    var q8 = (sat * 255.0).round();
+    if (q8 < 1) q8 = 1;
+    if (q8 > 255) q8 = 255;
+    final raw = (idfMilli * weightMilli * q8) / (1000.0 * 1000.0 * 255.0);
+    if (raw <= 0) return 0;
+    return raw / (raw + 2.0);
+  }
+
+  VectorData _axisVector(int dims) {
+    final values = List<double>.filled(dims, 0.0);
+    values[0] = 1.0;
+    return VectorData.fromList(values);
+  }
+
+  VectorData _vectorAtCosine(VectorData reference, double cosine,
+      {int seed = 1}) {
+    return ExampleVectorCorpus.unitAtCosineTo(reference, cosine, seed: seed);
   }
 
   /// CRITICAL TEST: Verifies that clearing a table or deleting all records works as expected.
@@ -1506,7 +1603,7 @@ class DatabaseTester {
 
       isTestPassed &= _expect(
           'Batch Insert should be successful', !insertResult.hasErrors, true);
-      isTestPassed &= _expect('Batch Insert should affect $count rows',
+      isTestPassed &= _expect('Batch Insert should affect $count records',
           insertResult.successCount, count);
 
       if (!isTestPassed || insertResult.successCount == 0) return false;
@@ -1531,7 +1628,7 @@ class DatabaseTester {
 
       isTestPassed &= _expect(
           'Batch Update should be successful', !updateResult.hasErrors, true);
-      isTestPassed &= _expect('Batch Update should affect $count rows',
+      isTestPassed &= _expect('Batch Update should affect $count records',
           updateResult.successCount, count);
 
       // 4. Verify Correctness
@@ -2609,7 +2706,7 @@ class DatabaseTester {
       await db.clear(ExampleSchemas.users.name);
       await db.clear(ExampleSchemas.settings.name);
 
-      final random = Random();
+      final random = math.Random();
       // Store closures to DEFER execution until the concurrent phase.
       // Previously, futures fired immediately when added, causing UI jank.
       final operations = <Future Function()>[];
@@ -2977,7 +3074,7 @@ class DatabaseTester {
 
   /// Comprehensive foreign-key / cascade correctness suite.
   ///
-  /// Covers single-row and batch paths for insert/update/delete/clear, plus
+  /// Covers single-record and batch paths for insert/update/delete/clear, plus
   /// every [ForeignKeyCascadeAction] via dedicated temporary tables.
   Future<bool> _testForeignKeyOperations() async {
     log.add('--- Testing: Foreign Key Operations ---', LogLevel.debug);
@@ -3130,11 +3227,12 @@ class DatabaseTester {
     if (!ok) return false;
     final parentId = parent.firstPrimaryKey;
 
-    final childRows = <Map<String, dynamic>>[];
-    childRows.add({'title': 'buf_child_1', 'user_id': parentId});
-    childRows.add({'title': 'buf_child_2', 'user_id': parentId});
-    childRows.add({'title': 'buf_child_3', 'user_id': parentId});
-    final children = await db.batchInsert(ExampleSchemas.posts.name, childRows);
+    final childRecords = <Map<String, dynamic>>[];
+    childRecords.add({'title': 'buf_child_1', 'user_id': parentId});
+    childRecords.add({'title': 'buf_child_2', 'user_id': parentId});
+    childRecords.add({'title': 'buf_child_3', 'user_id': parentId});
+    final children =
+        await db.batchInsert(ExampleSchemas.posts.name, childRecords);
     final childrenOk = !children.hasErrors;
     ok &= _expect('batchInsert children against unflushed parent succeeds',
         childrenOk, true);
@@ -3569,7 +3667,7 @@ class DatabaseTester {
   }
 
   /// Dedicated tables: cascade / restrict / setNull / setDefault / noAction,
-  /// each exercised with single-row and batch delete/update.
+  /// each exercised with single-record and batch delete/update.
   Future<bool> _testFkAllCascadeActionsTables() async {
     log.add(
         '--- Sub-test: All ForeignKeyCascadeAction (temp tables, single+batch) ---',
@@ -4373,6 +4471,1719 @@ class DatabaseTester {
       _failTest('Exception in _testKvStoreOperations: $e\n$s');
     }
     return isTestPassed;
+  }
+
+  /// Vector ANN: insert/update/delete + flush visibility + hot-path stability.
+  ///
+  /// Durable vector indexes are applied in the flush pipeline - pre-flush ANN
+  /// must not see new vectors. Post-flush searches are queried twice to catch
+  /// stale hot-cache / ghost-delete bugs (same pattern as row-cache tests).
+  Future<bool> _testVectorCrudFlushAndSearch() async {
+    log.add('--- Testing: Vector Index CRUD & Flush Visibility ---',
+        LogLevel.debug);
+    var ok = true;
+    final table = ExampleSchemas.embeddings128;
+    const field = 'embedding';
+    const dims = ExampleSchemas.vectorDimLow;
+
+    try {
+      await db.clear(table.name);
+      await db.flush();
+
+      final vExact = _axisVector(dims);
+      final vNear = _vectorAtCosine(vExact, 0.90, seed: 11);
+      final vWeak = _vectorAtCosine(vExact, 0.30, seed: 12);
+
+      final insA = await db.insert(table.name, {
+        'name': 'vec_a',
+        'embedding': vExact,
+      });
+      ok &= _expect('vector insert A success', !insA.hasErrors, true);
+      final pkA = insA.firstPrimaryKey;
+      ok &= _expect(
+          'vector insert A has pk', pkA != null && pkA.isNotEmpty, true);
+
+      final insB = await db.insert(table.name, {
+        'name': 'vec_b',
+        'embedding': vNear,
+      });
+      ok &= _expect('vector insert B success', !insB.hasErrors, true);
+      final pkB = insB.firstPrimaryKey!;
+
+      // Pre-flush: durable ANN must not expose unflushed inserts.
+      final beforeFlush = await db.vectorSearch(
+        table.name,
+        fieldName: field,
+        queryVector: vExact,
+        topK: 5,
+        searchDepth: 50,
+      );
+      final beforePks = beforeFlush.map((h) => h.primaryKey).toSet();
+      ok &= _expect(
+        'pre-flush ANN must not contain unflushed pkA',
+        beforePks.contains(pkA),
+        false,
+      );
+
+      await db.flush();
+
+      Future<List<VectorSearchResult>> searchExact() => db.vectorSearch(
+            table.name,
+            fieldName: field,
+            queryVector: vExact,
+            topK: 5,
+            searchDepth: 80,
+          );
+
+      final after1 = await searchExact();
+      final after2 = await searchExact();
+      ok &= _expect('post-flush ANN non-empty', after1.isNotEmpty, true);
+      ok &=
+          _expect('post-flush top1 is pkA (1st)', after1.first.primaryKey, pkA);
+      ok &= _expect(
+          'post-flush top1 is pkA (2nd/hot)', after2.first.primaryKey, pkA);
+      ok &= _expectClose(
+          'post-flush identical score~1', after1.first.score, 1.0,
+          eps: 0.02);
+      ok &= _expectClose(
+        'hot-path score stable',
+        after2.first.score,
+        after1.first.score,
+        eps: 1e-6,
+      );
+
+      // Chain matchVector + select(pk) alignment.
+      final chained = await db
+          .query(table.name)
+          .select(['id'])
+          .matchVector(field, vExact, searchDepth: 80)
+          .limit(5);
+      ok &= _expect(
+          'matchVector success', chained.type == ResultType.success, true);
+      ok &=
+          _expect('matchVector returns records', chained.data.isNotEmpty, true);
+      ok &= _expect(
+        'retrieval entries align 1:1 with data',
+        chained.retrieval?.entries.length,
+        chained.data.length,
+      );
+      if (chained.data.isNotEmpty && chained.retrieval != null) {
+        ok &= _expect(
+          'matchVector top1 pk',
+          chained.data.first['id']?.toString(),
+          pkA,
+        );
+        ok &= _expectClose(
+          'matchVector top1 score~1',
+          chained.retrieval!.entries.first.score,
+          1.0,
+          eps: 0.02,
+        );
+      }
+
+      // Update embedding -> flush -> old vector no longer tops; new self-recalls.
+      final vUpdated = _vectorAtCosine(vExact, 0.05, seed: 99);
+      final upd = await db.update(table.name, {
+        'embedding': vUpdated,
+        'name': 'vec_a_updated'
+      }).whereEqual('id', pkA);
+      ok &= _expect('vector update success', !upd.hasErrors, true);
+      await db.flush();
+
+      final afterUpdate = await db.vectorSearch(
+        table.name,
+        fieldName: field,
+        queryVector: vExact,
+        topK: 5,
+        searchDepth: 80,
+      );
+      ok &= _expect(
+        'after vector update, exact query top1 is not pkA',
+        afterUpdate.isEmpty ? true : afterUpdate.first.primaryKey != pkA,
+        true,
+      );
+
+      final selfUpdated1 = await db.vectorSearch(
+        table.name,
+        fieldName: field,
+        queryVector: vUpdated,
+        topK: 3,
+        searchDepth: 80,
+      );
+      final selfUpdated2 = await db.vectorSearch(
+        table.name,
+        fieldName: field,
+        queryVector: vUpdated,
+        topK: 3,
+        searchDepth: 80,
+      );
+      ok &= _expect(
+        'updated vector self-recall (1st)',
+        selfUpdated1.isNotEmpty && selfUpdated1.first.primaryKey == pkA,
+        true,
+      );
+      ok &= _expect(
+        'updated vector self-recall (2nd/hot)',
+        selfUpdated2.isNotEmpty && selfUpdated2.first.primaryKey == pkA,
+        true,
+      );
+
+      // Non-vector field update must not disturb ANN identity.
+      await db
+          .update(table.name, {'name': 'vec_b_renamed'}).whereEqual('id', pkB);
+      await db.flush();
+      final stillNear = await db.vectorSearch(
+        table.name,
+        fieldName: field,
+        queryVector: vNear,
+        topK: 3,
+        searchDepth: 80,
+      );
+      ok &= _expect(
+        'non-vector update keeps B self-recall',
+        stillNear.isNotEmpty && stillNear.first.primaryKey == pkB,
+        true,
+      );
+
+      // Delete -> flush -> ghost must not reappear on repeated search.
+      final del = await db.delete(table.name).whereEqual('id', pkA);
+      ok &= _expect('vector delete success', !del.hasErrors, true);
+      await db.flush();
+      final gone1 = await db.vectorSearch(
+        table.name,
+        fieldName: field,
+        queryVector: vUpdated,
+        topK: 10,
+        searchDepth: 80,
+      );
+      final gone2 = await db.vectorSearch(
+        table.name,
+        fieldName: field,
+        queryVector: vUpdated,
+        topK: 10,
+        searchDepth: 80,
+      );
+      ok &= _expect(
+        'deleted pk absent (1st)',
+        gone1.any((h) => h.primaryKey == pkA),
+        false,
+      );
+      ok &= _expect(
+        'deleted pk absent (2nd/hot - no ghost)',
+        gone2.any((h) => h.primaryKey == pkA),
+        false,
+      );
+
+      // Re-insert same logical vector under new pk after delete.
+      final insC = await db.insert(table.name, {
+        'name': 'vec_c',
+        'embedding': vWeak,
+      });
+      final pkC = insC.firstPrimaryKey;
+      await db.flush();
+      final weakHit = await db.vectorSearch(
+        table.name,
+        fieldName: field,
+        queryVector: vWeak,
+        topK: 3,
+        searchDepth: 80,
+      );
+      ok &= _expect(
+        're-insert after delete is searchable',
+        weakHit.isNotEmpty && weakHit.first.primaryKey == pkC,
+        true,
+      );
+
+      // clear table -> ANN empty.
+      await db.clear(table.name);
+      await db.flush();
+      final cleared = await db.vectorSearch(
+        table.name,
+        fieldName: field,
+        queryVector: vExact,
+        topK: 5,
+      );
+      ok &= _expect('ANN empty after clear+flush', cleared.isEmpty, true);
+
+      // Dimension mismatch must not silently succeed.
+      var dimRejected = false;
+      try {
+        await db.insert(table.name, {
+          'name': 'bad_dim',
+          'embedding': VectorData.fromList(List.filled(dims + 1, 0.1)),
+        });
+      } catch (_) {
+        dimRejected = true;
+      }
+      if (!dimRejected) {
+        final bad = await db.insert(table.name, {
+          'name': 'bad_dim',
+          'embedding': VectorData.fromList(List.filled(dims + 1, 0.1)),
+        });
+        dimRejected = bad.hasErrors;
+      }
+      ok &= _expect('dimension mismatch rejected', dimRejected, true);
+    } catch (e, s) {
+      ok = false;
+      _failTest('Exception in _testVectorCrudFlushAndSearch: $e\n$s');
+    } finally {
+      try {
+        await db.clear(table.name);
+        await db.flush();
+      } catch (_) {}
+    }
+    return ok;
+  }
+
+  /// Planted cosine tiers, weak-band probe, minScore / searchDepth filters.
+  Future<bool> _testVectorScoreAndFilters() async {
+    log.add(
+        '--- Testing: Vector Score Calibration & Filters ---', LogLevel.debug);
+    var ok = true;
+    final table = ExampleSchemas.embeddings128;
+    const field = 'embedding';
+    const dims = ExampleSchemas.vectorDimLow;
+
+    try {
+      await db.clear(table.name);
+      await db.flush();
+
+      final query = _axisVector(dims);
+      final planted = <({String name, double cos, VectorData vec})>[
+        (name: 'exact', cos: 1.0, vec: query),
+        (name: 'strong', cos: 0.80, vec: _vectorAtCosine(query, 0.80, seed: 2)),
+        (name: 'mid', cos: 0.55, vec: _vectorAtCosine(query, 0.55, seed: 3)),
+        (name: 'weak', cos: 0.30, vec: _vectorAtCosine(query, 0.30, seed: 4)),
+        (name: 'noise', cos: 0.10, vec: _vectorAtCosine(query, 0.10, seed: 5)),
+        (name: 'ortho', cos: 0.0, vec: _vectorAtCosine(query, 0.0, seed: 6)),
+      ];
+
+      final pkByName = <String, String>{};
+      for (final p in planted) {
+        final res = await db.insert(table.name, {
+          'name': p.name,
+          'embedding': p.vec,
+        });
+        ok &= _expect('insert ${p.name}', !res.hasErrors, true);
+        pkByName[p.name] = res.firstPrimaryKey!;
+      }
+      await db.flush();
+
+      final hits = await db.vectorSearch(
+        table.name,
+        fieldName: field,
+        queryVector: query,
+        topK: planted.length,
+        searchDepth: 100,
+      );
+      ok &= _expect('calibration ANN count', hits.length >= 4, true);
+      ok &= _expect(
+          'calibration top1 exact', hits.first.primaryKey, pkByName['exact']);
+
+      final byPk = {for (final h in hits) h.primaryKey: h};
+      for (final p in planted) {
+        final hit = byPk[pkByName[p.name]];
+        if (hit == null) {
+          // ortho/noise may fall out of approximate topK on tiny graphs.
+          if (p.cos >= 0.55) {
+            ok = _failTest('missing planted hit ${p.name}');
+          }
+          continue;
+        }
+        final expectedScore = p.cos < 0 ? 0.0 : p.cos;
+        ok &= _expectClose(
+          'score for ${p.name} (target cos ${p.cos})',
+          hit.score,
+          expectedScore,
+          eps: p.cos >= 0.5 ? 0.06 : 0.08,
+        );
+      }
+
+      // Score calibration: plant query at cos≈0.30 to axis, then for each ANN
+      // hit compare reported score to true cosine(query, stored). False
+      // inflation = trueCos < 0.40 while score >= 0.50. Geometry may recall a
+      // stronger neighbor than the planted pair — that is fine if score tracks.
+      final weakQuery = _vectorAtCosine(query, 0.30, seed: 77);
+      final weakHits = await db.vectorSearch(
+        table.name,
+        fieldName: field,
+        queryVector: weakQuery,
+        topK: 5,
+        searchDepth: 100,
+      );
+      ok &= _expect('calib probe returns hits', weakHits.isNotEmpty, true);
+      ok &= _expect(
+        'calib probe respects topK (no overflow)',
+        weakHits.length <= 5,
+        true,
+      );
+
+      final plantedVecByPk = {
+        for (final p in planted) pkByName[p.name]!: p.vec,
+      };
+      var falseInflation = 0;
+      var calibrated = 0;
+      for (final hit in weakHits) {
+        final stored = plantedVecByPk[hit.primaryKey];
+        if (stored == null) continue;
+        final trueCos =
+            weakQuery.cosineSimilarity(stored).clamp(0.0, 1.0).toDouble();
+        calibrated++;
+        ok &= _expectClose(
+          'calib score~trueCos pk=${hit.primaryKey}',
+          hit.score,
+          trueCos,
+          eps: 0.08,
+        );
+        if (trueCos < 0.40 && hit.score >= 0.50) {
+          falseInflation++;
+        }
+      }
+      ok &= _expect('calib resolved planted hits', calibrated > 0, true);
+      ok &= _expect(
+        'calib no false inflation (trueCos<0.4, score>=0.5)',
+        falseInflation,
+        0,
+      );
+
+      // minScore filters weak neighbors.
+      final strict = await db
+          .query(table.name)
+          .select(['id', 'name'])
+          .matchVector(field, query, minScore: 0.6, searchDepth: 100)
+          .limit(10);
+      ok &= _expect(
+          'minScore query success', strict.type == ResultType.success, true);
+      for (final entry
+          in strict.retrieval?.entries ?? const <RetrievalEntry>[]) {
+        ok &= _expect('minScore entry >=0.6', entry.score >= 0.6 - 1e-9, true);
+      }
+      final strictNames = strict.data.map((r) => r['name']?.toString()).toSet();
+      ok &=
+          _expect('minScore keeps exact', strictNames.contains('exact'), true);
+      ok &= _expect('minScore drops weak', strictNames.contains('weak'), false);
+      ok &=
+          _expect('minScore drops noise', strictNames.contains('noise'), false);
+
+      // searchDepth=1 still returns <= topK and includes exact on tiny corpus.
+      final shallow = await db.vectorSearch(
+        table.name,
+        fieldName: field,
+        queryVector: query,
+        topK: 3,
+        searchDepth: 1,
+      );
+      ok &= _expect(
+        'searchDepth=1 respects topK (<=3)',
+        shallow.length <= 3,
+        true,
+      );
+      ok &= _expect(
+        'searchDepth=1 still finds exact on tiny corpus',
+        shallow.any((h) => h.primaryKey == pkByName['exact']),
+        true,
+      );
+
+      // Formula unit checks (no I/O).
+      ok &= _expectClose(
+        'cosine similarityFromDistance(0.3)',
+        VectorDistanceMetric.cosine.similarityFromDistance(0.3),
+        0.7,
+        eps: 1e-12,
+      );
+      ok &= _expectClose(
+        'cosine clamps opposite hemisphere',
+        VectorDistanceMetric.cosine.similarityFromDistance(1.5),
+        0.0,
+        eps: 1e-12,
+      );
+    } catch (e, s) {
+      ok = false;
+      _failTest('Exception in _testVectorScoreAndFilters: $e\n$s');
+    } finally {
+      try {
+        await db.clear(table.name);
+        await db.flush();
+      } catch (_) {}
+    }
+    return ok;
+  }
+
+  /// Hybrid text+vector fusion and multi-space vector isolation.
+  Future<bool> _testVectorHybridAndMultiSpace() async {
+    log.add(
+        '--- Testing: Vector Hybrid Fusion & Multi-Space ---', LogLevel.debug);
+    var ok = true;
+    final originalSpace = (await db.getSpaceInfo()).spaceName;
+    final hybrid = ExampleSchemas.hybridDocs;
+    final embTable = ExampleSchemas.embeddings128;
+    const dims = ExampleSchemas.vectorDimLow;
+
+    try {
+      await db.clear(hybrid.name);
+      await db.clear(embTable.name);
+      await db.flush();
+
+      final vTech = _axisVector(dims);
+      final vOther = _vectorAtCosine(vTech, 0.2, seed: 21);
+
+      final h1 = await db.insert(hybrid.name, {
+        'headline': 'tech doc',
+        'content': 'distributed database vector index kernel',
+        'category': 'tech',
+        'year': 2024,
+        'embedding': vTech,
+      });
+      final h2 = await db.insert(hybrid.name, {
+        'headline': 'other doc',
+        'content': 'cooking recipes and kitchen tips',
+        'category': 'life',
+        'year': 2023,
+        'embedding': vOther,
+      });
+      ok &= _expect('hybrid insert1', !h1.hasErrors, true);
+      ok &= _expect('hybrid insert2', !h2.hasErrors, true);
+      await db.flush();
+
+      final fused = await db
+          .query(hybrid.name)
+          .select(['id', 'headline', 'category'])
+          .whereEqual('category', 'tech')
+          .matchVector('embedding', vTech, weight: 1.0, searchDepth: 50)
+          .matchText(
+            'content',
+            TextQuery.text('distributed database'),
+            weight: 1.0,
+          )
+          .fusionMethod(RetrievalFusionMethod.weightedScore)
+          .limit(5);
+      ok &= _expect(
+          'hybrid fused success', fused.type == ResultType.success, true);
+      ok &= _expect('hybrid fused has hits', fused.data.isNotEmpty, true);
+      if (fused.data.isNotEmpty) {
+        ok &= _expect(
+          'structured AND keeps tech category',
+          fused.data.first['category'],
+          'tech',
+        );
+      }
+      ok &= _expect(
+        'hybrid retrieval present',
+        fused.retrieval != null && fused.retrieval!.entries.isNotEmpty,
+        true,
+      );
+      if (fused.retrieval != null && fused.retrieval!.entries.isNotEmpty) {
+        final entry = fused.retrieval!.entries.first;
+        ok &= _expect(
+          'fused score in [0,1]',
+          entry.score >= 0 && entry.score <= 1.0,
+          true,
+        );
+        // Absolute fusion must not force top hit to exactly 1.0.
+        ok &= _expect(
+          'fused top score not forced to 1.0',
+          entry.score == 1.0,
+          false,
+        );
+      }
+
+      // Same channels with RRF (rank fusion) — ordering-only scores.
+      final fusedRrf = await db
+          .query(hybrid.name)
+          .select(['id', 'headline', 'category'])
+          .whereEqual('category', 'tech')
+          .matchVector('embedding', vTech, weight: 1.0, searchDepth: 50)
+          .matchText(
+            'content',
+            TextQuery.text('distributed database'),
+            weight: 1.0,
+          )
+          .fusionMethod(RetrievalFusionMethod.rrf)
+          .limit(5);
+      ok &= _expect(
+          'hybrid rrf success', fusedRrf.type == ResultType.success, true);
+      ok &= _expect('hybrid rrf has hits', fusedRrf.data.isNotEmpty, true);
+      if (fusedRrf.data.isNotEmpty) {
+        ok &= _expect(
+          'rrf structured AND keeps tech',
+          fusedRrf.data.first['category'],
+          'tech',
+        );
+      }
+      if (fusedRrf.retrieval != null &&
+          fusedRrf.retrieval!.entries.isNotEmpty) {
+        ok &= _expect(
+          'rrf top score not forced to 1.0',
+          fusedRrf.retrieval!.entries.first.score == 1.0,
+          false,
+        );
+      }
+
+      // Multi-space isolation for vector ANN (128-d edge-cloud primary).
+      // Sequential PKs often collide across spaces (both "1") — assert by name.
+      await db.switchSpace(spaceName: 'vec_space_a');
+      await db.clear(embTable.name);
+      final aIns = await db.insert(embTable.name, {
+        'name': 'space_a_vec',
+        'embedding': vTech,
+      });
+      ok &= _expect('space A insert', !aIns.hasErrors, true);
+      await db.flush();
+
+      await db.switchSpace(spaceName: 'vec_space_b');
+      await db.clear(embTable.name);
+      await db.flush();
+      final inBRecords = await db
+          .query(embTable.name)
+          .select(['id', 'name'])
+          .matchVector('embedding', vTech, searchDepth: 50)
+          .limit(5);
+      ok &= _expect(
+        'space B does not see space A name',
+        inBRecords.data.any((r) => r['name']?.toString() == 'space_a_vec'),
+        false,
+      );
+
+      final bIns = await db.insert(embTable.name, {
+        'name': 'space_b_vec',
+        'embedding': vTech,
+      });
+      ok &= _expect('space B insert', !bIns.hasErrors, true);
+      await db.flush();
+      final inB2 = await db
+          .query(embTable.name)
+          .select(['id', 'name'])
+          .matchVector('embedding', vTech, searchDepth: 50)
+          .limit(5);
+      ok &= _expect(
+        'space B finds its own vector',
+        inB2.data.any((r) => r['name']?.toString() == 'space_b_vec'),
+        true,
+      );
+
+      await db.switchSpace(spaceName: 'vec_space_a');
+      final inA = await db
+          .query(embTable.name)
+          .select(['id', 'name'])
+          .matchVector('embedding', vTech, searchDepth: 50)
+          .limit(5);
+      ok &= _expect(
+        'space A still finds its vector',
+        inA.data.any((r) => r['name']?.toString() == 'space_a_vec'),
+        true,
+      );
+      ok &= _expect(
+        'space A does not see space B name',
+        inA.data.any((r) => r['name']?.toString() == 'space_b_vec'),
+        false,
+      );
+    } catch (e, s) {
+      ok = false;
+      _failTest('Exception in _testVectorHybridAndMultiSpace: $e\n$s');
+    } finally {
+      try {
+        await db.switchSpace(spaceName: originalSpace);
+        await _clearVectorTables();
+        await db.flush();
+      } catch (_) {}
+    }
+    return ok;
+  }
+
+  /// Text/sparse: pre-flush visibility, seal, CRUD ghosts, overflow, multi-flush.
+  ///
+  /// Unlike durable vector ANN, text/sparse inserts are searchable before
+  /// flush. Flush still seals pages; post-flush queries are run twice for
+  /// hot-cache / ghost regressions.
+  Future<bool> _testTextSparseCrudAndPersistence() async {
+    log.add('--- Testing: Text/Sparse CRUD & Persistence ---', LogLevel.debug);
+    var ok = true;
+    final table = ExampleSchemas.hybridDocs;
+    const textField = 'content';
+    const sparseField = 'features';
+
+    try {
+      await db.clear(table.name);
+      await db.flush();
+
+      final ins1 = await db.insert(table.name, {
+        'headline': 'Doc One',
+        'content':
+            'distributed database storage engine architecture with inverted index',
+        'category': 'tech',
+        'year': 2024,
+        'features':
+            SparseVectorData.fromMap({10: 0.95, 500: 0.45, 120000: 0.88}),
+      });
+      ok &= _expect('text/sparse insert1', !ins1.hasErrors, true);
+      final pk1 = ins1.firstPrimaryKey!;
+
+      final ins2 = await db.insert(table.name, {
+        'headline': 'Doc Two',
+        'content':
+            'neural sparse vector retrieval and micro block pruning for extreme throughput',
+        'category': 'tech',
+        'year': 2024,
+        'features':
+            SparseVectorData.fromMap({10: 0.20, 777: 0.99, 120000: 0.31}),
+      });
+      ok &= _expect('text/sparse insert2', !ins2.hasErrors, true);
+      final pk2 = ins2.firstPrimaryKey!;
+
+      // Pre-flush: text and sparse MUST be searchable (contrast with vector ANN).
+      final textBefore = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(textField, TextQuery.text('database architecture'))
+          .limit(10);
+      ok &= _expect(
+        'pre-flush matchText success',
+        textBefore.type == ResultType.success,
+        true,
+      );
+      final textBeforeIds =
+          textBefore.data.map((r) => r['id']?.toString()).toSet();
+      ok &= _expect(
+        'pre-flush matchText hits pk1',
+        textBeforeIds.contains(pk1),
+        true,
+      );
+
+      final sparseBefore = await db
+          .query(table.name)
+          .select(['id'])
+          .matchSparse(
+            sparseField,
+            SparseVectorData.fromMap({120000: 1.0, 777: 0.5}),
+          )
+          .limit(10);
+      ok &= _expect(
+        'pre-flush matchSparse success',
+        sparseBefore.type == ResultType.success,
+        true,
+      );
+      ok &= _expect(
+        'pre-flush matchSparse non-empty',
+        sparseBefore.data.isNotEmpty,
+        true,
+      );
+      if (sparseBefore.data.isNotEmpty) {
+        final top = sparseBefore.data.first['id']?.toString();
+        ok &= _expect(
+          'pre-flush sparse top is pk1 or pk2',
+          top == pk1 || top == pk2,
+          true,
+        );
+      }
+      ok &= _expect(
+        'retrieval aligns 1:1 (pre-flush text)',
+        textBefore.retrieval?.entries.length,
+        textBefore.data.length,
+      );
+
+      await db.flush();
+
+      Future<QueryResult> sealedText() => db
+          .query(table.name)
+          .select(['id'])
+          .matchText(textField, TextQuery.text('distributed inverted'))
+          .limit(10);
+      final sealed1 = await sealedText();
+      final sealed2 = await sealedText();
+      ok &= _expect(
+        'post-flush text top1 pk1 (1st)',
+        sealed1.data.isNotEmpty && sealed1.data.first['id']?.toString() == pk1,
+        true,
+      );
+      ok &= _expect(
+        'post-flush text top1 pk1 (2nd/hot)',
+        sealed2.data.isNotEmpty && sealed2.data.first['id']?.toString() == pk1,
+        true,
+      );
+
+      final sparseSealed = await db
+          .query(table.name)
+          .select(['id'])
+          .matchSparse(sparseField, SparseVectorData.fromMap({777: 1.0}))
+          .limit(10);
+      ok &= _expect(
+        'post-flush sparse dim777 -> pk2',
+        sparseSealed.data.isNotEmpty &&
+            sparseSealed.data.first['id']?.toString() == pk2,
+        true,
+      );
+
+      // Overflow terms (>8192 unique) + needle.
+      final buf = StringBuffer();
+      for (var i = 0; i < 8200; i++) {
+        buf.write('tok$i ');
+      }
+      buf.write('target_needle_term');
+      final huge = await db.insert(table.name, {
+        'headline': 'Huge',
+        'content': buf.toString(),
+        'category': 'overflow',
+        'year': 2024,
+        'features': SparseVectorData.fromMap({200000: 0.75}),
+      });
+      final pkHuge = huge.firstPrimaryKey;
+      ok &= _expect(
+        'overflow insert',
+        pkHuge != null && pkHuge.isNotEmpty,
+        true,
+      );
+      final needle = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(textField, TextQuery.text('target_needle_term'))
+          .limit(5);
+      ok &= _expect(
+        'overflow needle hit',
+        needle.data.isNotEmpty && needle.data.first['id']?.toString() == pkHuge,
+        true,
+      );
+
+      // Update content+features: old terms/dims must lose, new must win.
+      final upd = await db.update(table.name, {
+        'content': 'completely rewritten cooking recipes and kitchen tips',
+        'features': SparseVectorData.fromMap({42: 0.9}),
+      }).whereEqual('id', pk1);
+      ok &= _expect('content/features update', !upd.hasErrors, true);
+      await db.flush();
+
+      final oldText = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(textField, TextQuery.text('distributed inverted'))
+          .limit(10);
+      ok &= _expect(
+        'updated pk1 absent from old text query',
+        oldText.data.any((r) => r['id']?.toString() == pk1),
+        false,
+      );
+      final newText = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(textField, TextQuery.text('cooking recipes'))
+          .limit(10);
+      ok &= _expect(
+        'updated pk1 hits new text',
+        newText.data.any((r) => r['id']?.toString() == pk1),
+        true,
+      );
+      final oldDim = await db
+          .query(table.name)
+          .select(['id'])
+          .matchSparse(sparseField, SparseVectorData.fromMap({120000: 1.0}))
+          .limit(10);
+      ok &= _expect(
+        'updated pk1 absent from old sparse dim',
+        oldDim.data.any((r) => r['id']?.toString() == pk1),
+        false,
+      );
+      final newDim = await db
+          .query(table.name)
+          .select(['id'])
+          .matchSparse(sparseField, SparseVectorData.fromMap({42: 1.0}))
+          .limit(10);
+      ok &= _expect(
+        'updated pk1 hits new sparse dim',
+        newDim.data.any((r) => r['id']?.toString() == pk1),
+        true,
+      );
+
+      // Delete -> flush -> no ghost on repeated search.
+      final del = await db.delete(table.name).whereEqual('id', pk1);
+      ok &= _expect('delete pk1', !del.hasErrors, true);
+      await db.flush();
+      final goneText1 = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(textField, TextQuery.text('cooking recipes'))
+          .limit(10);
+      final goneText2 = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(textField, TextQuery.text('cooking recipes'))
+          .limit(10);
+      ok &= _expect(
+        'deleted pk1 absent text (1st)',
+        goneText1.data.any((r) => r['id']?.toString() == pk1),
+        false,
+      );
+      ok &= _expect(
+        'deleted pk1 absent text (2nd/hot)',
+        goneText2.data.any((r) => r['id']?.toString() == pk1),
+        false,
+      );
+      final goneSparse1 = await db
+          .query(table.name)
+          .select(['id'])
+          .matchSparse(sparseField, SparseVectorData.fromMap({42: 1.0}))
+          .limit(10);
+      final goneSparse2 = await db
+          .query(table.name)
+          .select(['id'])
+          .matchSparse(sparseField, SparseVectorData.fromMap({42: 1.0}))
+          .limit(10);
+      ok &= _expect(
+        'deleted pk1 absent sparse (1st)',
+        goneSparse1.data.any((r) => r['id']?.toString() == pk1),
+        false,
+      );
+      ok &= _expect(
+        'deleted pk1 absent sparse (2nd/hot)',
+        goneSparse2.data.any((r) => r['id']?.toString() == pk1),
+        false,
+      );
+
+      // Multi-flush sparse merge: same dim across two flush batches.
+      final batchA = await db.insert(table.name, {
+        'headline': 'Sparse Batch A',
+        'content': 'sparse flush batch alpha',
+        'category': 'sparse',
+        'year': 2024,
+        'features': SparseVectorData.fromMap({42: 0.9, 99: 0.5}),
+      });
+      final pkA = batchA.firstPrimaryKey;
+      await db.flush();
+      final batchB = await db.insert(table.name, {
+        'headline': 'Sparse Batch B',
+        'content': 'sparse flush batch beta',
+        'category': 'sparse',
+        'year': 2024,
+        'features': SparseVectorData.fromMap({42: 0.4, 12345: 0.95}),
+      });
+      final pkB = batchB.firstPrimaryKey;
+      await db.flush();
+      final multi = await db
+          .query(table.name)
+          .select(['id'])
+          .matchSparse(sparseField, SparseVectorData.fromMap({42: 1.0}))
+          .limit(10);
+      final multiIds = multi.data.map((r) => r['id']?.toString()).toSet();
+      ok &= _expect(
+        'multi-flush sparse keeps batch A',
+        multiIds.contains(pkA),
+        true,
+      );
+      ok &= _expect(
+        'multi-flush sparse keeps batch B',
+        multiIds.contains(pkB),
+        true,
+      );
+      final dim12345 = await db
+          .query(table.name)
+          .select(['id'])
+          .matchSparse(sparseField, SparseVectorData.fromMap({12345: 1.0}))
+          .limit(10);
+      ok &= _expect(
+        'multi-flush dim12345 -> batch B',
+        dim12345.data.isNotEmpty &&
+            dim12345.data.first['id']?.toString() == pkB,
+        true,
+      );
+
+      // Empty / null sparse must not crash.
+      final emptySparse = await db.insert(table.name, {
+        'headline': 'Empty sparse',
+        'content': 'plain latin tokens only here',
+        'category': 'edge',
+        'year': 2024,
+        'features': SparseVectorData.fromMap({}),
+      });
+      ok &= _expect('empty sparse insert ok', !emptySparse.hasErrors, true);
+      final nullSparse = await db.insert(table.name, {
+        'headline': 'Null sparse',
+        'content': 'another plain document without features',
+        'category': 'edge',
+        'year': 2024,
+      });
+      ok &= _expect('null sparse insert ok', !nullSparse.hasErrors, true);
+    } catch (e, s) {
+      ok = false;
+      _failTest('Exception in _testTextSparseCrudAndPersistence: $e\n$s');
+    } finally {
+      try {
+        await db.clear(table.name);
+        await db.flush();
+      } catch (_) {}
+    }
+    return ok;
+  }
+
+  /// TextQuery forms, AND/OR, CJK softening, score bands, structured filter.
+  Future<bool> _testTextQueryAndScores() async {
+    log.add('--- Testing: Text Query & Score Calibration ---', LogLevel.debug);
+    var ok = true;
+    final table = ExampleSchemas.hybridDocs;
+    const textField = 'content';
+
+    try {
+      await db.clear(table.name);
+      await db.flush();
+
+      final latin = await db.insert(table.name, {
+        'headline': 'Latin',
+        'content': 'distributed kernel storage engine zxqvunique71',
+        'category': 'tech',
+        'year': 2024,
+      });
+      final pkLatin = latin.firstPrimaryKey!;
+
+      final cjkBigram = await db.insert(table.name, {
+        'headline': 'CJK bigram',
+        'content': '数据库内核存储引擎',
+        'category': 'cjk',
+        'year': 2024,
+      });
+      final pkCjk = cjkBigram.firstPrimaryKey!;
+
+      final cjkUniOnly = await db.insert(table.name, {
+        'headline': 'CJK uni',
+        // Intentionally weak: single characters without strong bigram overlap
+        // against a longer phrase query are soft signals.
+        'content': '数 据 库',
+        'category': 'cjk',
+        'year': 2024,
+      });
+      final pkUni = cjkUniOnly.firstPrimaryKey!;
+
+      final other = await db.insert(table.name, {
+        'headline': 'Other',
+        'content': 'cooking recipes and kitchen tips',
+        'category': 'life',
+        'year': 2024,
+      });
+      final pkOther = other.firstPrimaryKey!;
+
+      // Rare CJK unigram (not shared with other planted docs) for weight checks.
+      final rareCjk = await db.insert(table.name, {
+        'headline': 'Rare CJK',
+        'content': '天空有云朵漂浮',
+        'category': 'cjk',
+        'year': 2024,
+      });
+      ok &= _expect('rare CJK insert', !rareCjk.hasErrors, true);
+      await db.flush();
+      // Planted corpus size is the IDF denominator for the checks below.
+      final plantedDocs = await db.query(table.name).count();
+
+      // TextQuery.text OR (default).
+      final textOr = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(textField, TextQuery.text('kernel storage'))
+          .limit(5);
+      ok &= _expect('TextQuery.text hits', textOr.data.isNotEmpty, true);
+      ok &= _expect(
+        'TextQuery.text top is latin',
+        textOr.data.first['id']?.toString(),
+        pkLatin,
+      );
+      // Strong exact term (df=1): score must match the planted-corpus formula.
+      // Docs' ~0.71 is the large-N asymptote of the same formula — not a
+      // micro-corpus constant. Low-relevance baseline is the soft CJK path below.
+      final strongOne = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(textField, TextQuery.terms(['zxqvunique71']))
+          .limit(1);
+      if (strongOne.retrieval != null &&
+          strongOne.retrieval!.entries.isNotEmpty) {
+        final s = strongOne.retrieval!.entries.first.score;
+        final expectedStrong = _expectedTextRelevance(
+          activeDocs: plantedDocs,
+          df: 1,
+        );
+        ok &= _expectClose(
+          'strong latin score == planted expectation',
+          s,
+          expectedStrong,
+          eps: 0.04,
+        );
+        ok &= _expect('strong text score not forced to 1.0', s == 1.0, false);
+      }
+
+      // Pre-tokenized terms: case-sensitive exact match.
+      final lower = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(textField, TextQuery.terms(['kernel']))
+          .limit(5);
+      ok &= _expect(
+        'terms lowercase hits',
+        lower.data.any((r) => r['id']?.toString() == pkLatin),
+        true,
+      );
+      final upper = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(textField, TextQuery.terms(['Kernel']))
+          .limit(5);
+      ok &= _expect(
+        'terms Kernel (capital K) misses indexed kernel',
+        upper.data.any((r) => r['id']?.toString() == pkLatin),
+        false,
+      );
+
+      // Repeated terms raise weight vs single.
+      final once = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(textField, TextQuery.terms(['kernel']))
+          .limit(1);
+      final twice = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(textField, TextQuery.terms(['kernel', 'kernel']))
+          .limit(1);
+      if (once.retrieval != null &&
+          once.retrieval!.entries.isNotEmpty &&
+          twice.retrieval != null &&
+          twice.retrieval!.entries.isNotEmpty) {
+        ok &= _expect(
+          'repeated terms score >= single',
+          twice.retrieval!.entries.first.score >=
+              once.retrieval!.entries.first.score - 1e-9,
+          true,
+        );
+      }
+
+      // termsWeighted: explicit weight; non-positive dropped.
+      final weighted = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(
+            textField,
+            TextQuery.termsWeighted([
+              const TextTerm('kernel', weight: 2.0),
+              const TextTerm('missing', weight: 0.0),
+              const TextTerm('bogus', weight: -1.0),
+            ]),
+          )
+          .limit(5);
+      ok &= _expect(
+        'termsWeighted hits latin',
+        weighted.data.any((r) => r['id']?.toString() == pkLatin),
+        true,
+      );
+
+      // AND: missing term => empty channel.
+      final andMiss = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(
+            textField,
+            TextQuery.terms(['kernel', 'nonexistenttermxyz']),
+            operator: TextMatchOperator.and,
+          )
+          .limit(5);
+      ok &= _expect('AND missing term empty', andMiss.data.isEmpty, true);
+
+      final andHit = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(
+            textField,
+            TextQuery.terms(['kernel', 'storage']),
+            operator: TextMatchOperator.and,
+          )
+          .limit(5);
+      ok &= _expect(
+        'AND all terms present',
+        andHit.data.any((r) => r['id']?.toString() == pkLatin),
+        true,
+      );
+
+      // Low-relevance baseline: TextQuery.text solo CJK unigram is ×1/5.
+      // Rare 「云」(df=1) → score == soft formula and stay <0.40 for discard.
+      final uniQ = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(textField, TextQuery.text('云'))
+          .limit(5);
+      double? uniScore;
+      if (uniQ.retrieval != null && uniQ.retrieval!.entries.isNotEmpty) {
+        uniScore = uniQ.retrieval!.entries.first.score;
+        final expectedSoft = _expectedTextRelevance(
+          activeDocs: plantedDocs,
+          df: 1,
+          queryWeight: 1.0 / 5.0,
+        );
+        ok &= _expectClose(
+          'CJK soft unigram score == planted expectation',
+          uniScore,
+          expectedSoft,
+          eps: 0.04,
+        );
+        ok &= _expect(
+          'CJK unigram TextQuery.text soft discard band (<0.40)',
+          uniScore < 0.40,
+          true,
+        );
+      }
+      // Plant phrase after unigram probe so 「云」stays rare for soft scoring.
+      final phrase = await db.insert(table.name, {
+        'headline': 'CJK phrase',
+        'content': '远处有云彩',
+        'category': 'cjk',
+        'year': 2024,
+      });
+      ok &= _expect('CJK phrase insert', !phrase.hasErrors, true);
+      await db.flush();
+      final docsAfterPhrase = plantedDocs + 1;
+      final biQ = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(textField, TextQuery.text('云彩'))
+          .limit(5);
+      ok &= _expect('CJK bigram query hits', biQ.data.isNotEmpty, true);
+      if (biQ.retrieval != null && biQ.retrieval!.entries.isNotEmpty) {
+        final biScore = biQ.retrieval!.entries.first.score;
+        if (uniScore != null) {
+          ok &= _expect(
+            'CJK bigram score > softened unigram',
+            biScore > uniScore,
+            true,
+          );
+        }
+        ok &= _expect(
+          'CJK bigram score not near-zero',
+          biScore > 0.05,
+          true,
+        );
+      }
+      // Longer Chinese OR leans on bigrams over spaced unigrams.
+      final cjkOr = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(textField, TextQuery.text('数据库内核'))
+          .limit(5);
+      if (cjkOr.data.length >= 2) {
+        final top = cjkOr.data.first['id']?.toString();
+        ok &= _expect(
+          'CJK phrase prefers bigram doc over spaced unigrams',
+          top == pkCjk || top != pkUni,
+          true,
+        );
+      } else if (cjkOr.data.isNotEmpty) {
+        ok &= _expect(
+          'CJK phrase top is bigram doc',
+          cjkOr.data.first['id']?.toString(),
+          pkCjk,
+        );
+      }
+
+      // Pre-tokenized CJK: no auto-soften — full weight, df=1 「漂」.
+      final uniTerms = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(
+            textField,
+            TextQuery.termsWeighted([const TextTerm('漂', weight: 1.0)]),
+          )
+          .limit(5);
+      if (uniTerms.retrieval != null &&
+          uniTerms.retrieval!.entries.isNotEmpty) {
+        final s = uniTerms.retrieval!.entries.first.score;
+        final expectedFull = _expectedTextRelevance(
+          activeDocs: docsAfterPhrase,
+          df: 1,
+        );
+        ok &= _expectClose(
+          'pre-tokenized CJK uni score == planted expectation',
+          s,
+          expectedFull,
+          eps: 0.04,
+        );
+        if (uniScore != null) {
+          ok &= _expect(
+            'pre-tokenized CJK uni stronger than softened TextQuery.text',
+            s > uniScore + 0.05,
+            true,
+          );
+        }
+        ok &= _expect(
+          'pre-tokenized CJK uni not forced to 1.0',
+          s == 1.0,
+          false,
+        );
+      }
+
+      // Structured where + matchText.
+      final filtered = await db
+          .query(table.name)
+          .select(['id', 'category'])
+          .whereEqual('category', 'tech')
+          .matchText(textField, TextQuery.text('kernel cooking'))
+          .limit(10);
+      ok &= _expect(
+          'filtered text success', filtered.type == ResultType.success, true);
+      for (final row in filtered.data) {
+        ok &= _expect(
+          'where filters category',
+          row['category']?.toString(),
+          'tech',
+        );
+      }
+      ok &= _expect(
+        'life doc filtered out',
+        filtered.data.any((r) => r['id']?.toString() == pkOther),
+        false,
+      );
+
+      // orMatchText branch.
+      final orBranch = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(textField, TextQuery.text('nonexistenttermxyz'))
+          .orMatchText(textField, TextQuery.text('cooking recipes'))
+          .limit(5);
+      ok &= _expect(
+        'orMatchText recovers cooking doc',
+        orBranch.data.any((r) => r['id']?.toString() == pkOther),
+        true,
+      );
+
+      // limit = topK.
+      final top1 = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(textField, TextQuery.text('distributed kernel storage'))
+          .limit(1);
+      ok &= _expect('limit 1 returns at most 1', top1.data.length <= 1, true);
+    } catch (e, s) {
+      ok = false;
+      _failTest('Exception in _testTextQueryAndScores: $e\n$s');
+    } finally {
+      try {
+        await db.clear(table.name);
+        await db.flush();
+      } catch (_) {}
+    }
+    return ok;
+  }
+
+  /// Sparse ranking, update dims, large dim ids, orMatchSparse.
+  Future<bool> _testSparseRetrievalAndScores() async {
+    log.add('--- Testing: Sparse Retrieval & Scores ---', LogLevel.debug);
+    var ok = true;
+    final table = ExampleSchemas.hybridDocs;
+    const sparseField = 'features';
+
+    try {
+      await db.clear(table.name);
+      await db.flush();
+
+      final a = await db.insert(table.name, {
+        'headline': 'A',
+        'content': 'sparse doc alpha tokens',
+        'category': 's',
+        'year': 2024,
+        'features': SparseVectorData.fromMap({10: 1.0, 500: 0.2}),
+      });
+      final pkA = a.firstPrimaryKey!;
+      final b = await db.insert(table.name, {
+        'headline': 'B',
+        'content': 'sparse doc beta tokens',
+        'category': 's',
+        'year': 2024,
+        'features': SparseVectorData.fromMap({10: 0.2, 777: 1.0}),
+      });
+      final pkB = b.firstPrimaryKey!;
+      final c = await db.insert(table.name, {
+        'headline': 'C',
+        'content': 'sparse doc gamma tokens',
+        'category': 's',
+        'year': 2024,
+        'features': SparseVectorData.fromMap({99999: 0.9, 120000: 0.85}),
+      });
+      final pkC = c.firstPrimaryKey!;
+      await db.flush();
+
+      final by777 = await db
+          .query(table.name)
+          .select(['id'])
+          .matchSparse(sparseField, SparseVectorData.fromMap({777: 1.0}))
+          .limit(5);
+      ok &= _expect(
+        'dim777 tops pkB',
+        by777.data.isNotEmpty && by777.data.first['id']?.toString() == pkB,
+        true,
+      );
+      if (by777.retrieval != null && by777.retrieval!.entries.isNotEmpty) {
+        ok &= _expectClose(
+          'saturated sparse score ~0.71',
+          by777.retrieval!.entries.first.score,
+          0.71,
+          eps: 0.08,
+        );
+      }
+
+      final multi = await db
+          .query(table.name)
+          .select(['id'])
+          .matchSparse(
+            sparseField,
+            SparseVectorData.fromMap({10: 1.0, 500: 1.0}),
+          )
+          .limit(5);
+      ok &= _expect(
+        'multi-dim prefers overlap-heavy A',
+        multi.data.isNotEmpty && multi.data.first['id']?.toString() == pkA,
+        true,
+      );
+
+      final miss = await db
+          .query(table.name)
+          .select(['id'])
+          .matchSparse(sparseField, SparseVectorData.fromMap({424242: 1.0}))
+          .limit(5);
+      ok &= _expect('unrelated dim empty', miss.data.isEmpty, true);
+
+      // Partial overlap still hits (disjunctive).
+      final partial = await db
+          .query(table.name)
+          .select(['id'])
+          .matchSparse(
+            sparseField,
+            SparseVectorData.fromMap({10: 1.0, 424242: 1.0}),
+          )
+          .limit(5);
+      ok &= _expect(
+        'partial dim still hits',
+        partial.data.any((r) => r['id']?.toString() == pkA),
+        true,
+      );
+
+      // Large dim ids.
+      final large = await db
+          .query(table.name)
+          .select(['id'])
+          .matchSparse(
+            sparseField,
+            SparseVectorData.fromMap({120000: 1.0}),
+          )
+          .limit(5);
+      ok &= _expect(
+        'large dim 120000 hits C',
+        large.data.any((r) => r['id']?.toString() == pkC),
+        true,
+      );
+
+      // Update sparse dims.
+      final upd = await db.update(table.name, {
+        'features': SparseVectorData.fromMap({888: 1.0}),
+      }).whereEqual('id', pkA);
+      ok &= _expect('sparse update', !upd.hasErrors, true);
+      await db.flush();
+      final afterOld = await db
+          .query(table.name)
+          .select(['id'])
+          .matchSparse(sparseField, SparseVectorData.fromMap({10: 1.0}))
+          .limit(10);
+      ok &= _expect(
+        'updated A absent from dim10',
+        afterOld.data.any((r) => r['id']?.toString() == pkA),
+        false,
+      );
+      final afterNew = await db
+          .query(table.name)
+          .select(['id'])
+          .matchSparse(sparseField, SparseVectorData.fromMap({888: 1.0}))
+          .limit(5);
+      ok &= _expect(
+        'updated A hits dim888',
+        afterNew.data.any((r) => r['id']?.toString() == pkA),
+        true,
+      );
+
+      // orMatchSparse recovers when primary branch misses.
+      final orSparse = await db
+          .query(table.name)
+          .select(['id'])
+          .matchSparse(sparseField, SparseVectorData.fromMap({424242: 1.0}))
+          .orMatchSparse(sparseField, SparseVectorData.fromMap({777: 1.0}))
+          .limit(5);
+      ok &= _expect(
+        'orMatchSparse recovers pkB',
+        orSparse.data.any((r) => r['id']?.toString() == pkB),
+        true,
+      );
+    } catch (e, s) {
+      ok = false;
+      _failTest('Exception in _testSparseRetrievalAndScores: $e\n$s');
+    } finally {
+      try {
+        await db.clear(table.name);
+        await db.flush();
+      } catch (_) {}
+    }
+    return ok;
+  }
+
+  /// Text+sparse(+vector) fusion, RRF, multi-space, update-before-flush ghost.
+  Future<bool> _testTextSparseHybridAndTraps() async {
+    log.add('--- Testing: Text/Sparse Hybrid & Traps ---', LogLevel.debug);
+    var ok = true;
+    final originalSpace = (await db.getSpaceInfo()).spaceName;
+    final table = ExampleSchemas.hybridDocs;
+    const dims = ExampleSchemas.vectorDimLow;
+
+    try {
+      await db.clear(table.name);
+      await db.flush();
+
+      final vTech = _axisVector(dims);
+      final vOther = _vectorAtCosine(vTech, 0.15, seed: 31);
+
+      final h1 = await db.insert(table.name, {
+        'headline': 'tech',
+        'content': 'distributed database vector index kernel',
+        'category': 'tech',
+        'year': 2024,
+        'features': SparseVectorData.fromMap({100: 1.0, 200: 0.5}),
+        'embedding': vTech,
+      });
+      final pk1 = h1.firstPrimaryKey!;
+      final h2 = await db.insert(table.name, {
+        'headline': 'life',
+        'content': 'cooking recipes and kitchen tips',
+        'category': 'life',
+        'year': 2024,
+        'features': SparseVectorData.fromMap({300: 1.0}),
+        'embedding': vOther,
+      });
+      final pk2 = h2.firstPrimaryKey!;
+      await db.flush();
+
+      // Text + sparse weightedScore.
+      final fused = await db
+          .query(table.name)
+          .select(['id', 'category'])
+          .matchText(
+            'content',
+            TextQuery.text('distributed database'),
+            weight: 1.0,
+          )
+          .matchSparse(
+            'features',
+            SparseVectorData.fromMap({100: 1.0}),
+            weight: 1.0,
+          )
+          .fusionMethod(RetrievalFusionMethod.weightedScore)
+          .limit(5);
+      ok &= _expect(
+          'text+sparse fusion success', fused.type == ResultType.success, true);
+      ok &= _expect('text+sparse has hits', fused.data.isNotEmpty, true);
+      if (fused.data.isNotEmpty) {
+        ok &= _expect(
+          'dual-channel top is tech',
+          fused.data.first['id']?.toString(),
+          pk1,
+        );
+      }
+      if (fused.retrieval != null && fused.retrieval!.entries.isNotEmpty) {
+        final s = fused.retrieval!.entries.first.score;
+        ok &= _expect('fused score in [0,1]', s >= 0 && s <= 1.0, true);
+        ok &= _expect('fused top not forced to 1.0', s == 1.0, false);
+      }
+
+      // Miss on one channel still keeps the other.
+      final missSparse = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(
+            'content',
+            TextQuery.text('distributed database'),
+            weight: 1.0,
+          )
+          .matchSparse(
+            'features',
+            SparseVectorData.fromMap({424242: 1.0}),
+            weight: 1.0,
+          )
+          .limit(5);
+      ok &= _expect(
+        'text hit survives sparse miss',
+        missSparse.data.any((r) => r['id']?.toString() == pk1),
+        true,
+      );
+
+      // Three-way + where filter.
+      final three = await db
+          .query(table.name)
+          .select(['id', 'category'])
+          .whereEqual('category', 'tech')
+          .matchText('content', TextQuery.text('distributed'), weight: 0.4)
+          .matchSparse(
+            'features',
+            SparseVectorData.fromMap({100: 1.0}),
+            weight: 0.3,
+          )
+          .matchVector('embedding', vTech, weight: 0.3, searchDepth: 50)
+          .fusionMethod(RetrievalFusionMethod.weightedScore)
+          .limit(5);
+      ok &=
+          _expect('three-way success', three.type == ResultType.success, true);
+      ok &= _expect('three-way filtered to tech', three.data.isNotEmpty, true);
+      for (final row in three.data) {
+        ok &=
+            _expect('three-way category', row['category']?.toString(), 'tech');
+      }
+      ok &= _expect(
+        'life filtered from three-way',
+        three.data.any((r) => r['id']?.toString() == pk2),
+        false,
+      );
+
+      // RRF path runs without forcing absolute 1.0.
+      final rrf = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText('content', TextQuery.text('distributed cooking'),
+              weight: 1.0)
+          .matchSparse(
+            'features',
+            SparseVectorData.fromMap({100: 1.0, 300: 1.0}),
+            weight: 1.0,
+          )
+          .fusionMethod(RetrievalFusionMethod.rrf)
+          .limit(5);
+      ok &= _expect('rrf success', rrf.type == ResultType.success, true);
+      ok &= _expect('rrf has hits', rrf.data.isNotEmpty, true);
+      if (rrf.retrieval != null && rrf.retrieval!.entries.isNotEmpty) {
+        ok &= _expect(
+          'rrf top not forced to 1.0',
+          rrf.retrieval!.entries.first.score == 1.0,
+          false,
+        );
+      }
+
+      // Update-before-flush ghost: rewrite content, search before flush must
+      // not keep sealed old terms for the same pk.
+      await db.update(table.name, {
+        'content': 'totally different gardening soil compost',
+        'features': SparseVectorData.fromMap({555: 1.0}),
+      }).whereEqual('id', pk1);
+      final ghostText = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText('content', TextQuery.text('distributed database'))
+          .limit(10);
+      ok &= _expect(
+        'pre-flush after update: old text must not hit pk1',
+        ghostText.data.any((r) => r['id']?.toString() == pk1),
+        false,
+      );
+      final ghostSparse = await db
+          .query(table.name)
+          .select(['id'])
+          .matchSparse('features', SparseVectorData.fromMap({100: 1.0}))
+          .limit(10);
+      ok &= _expect(
+        'pre-flush after update: old sparse dim must not hit pk1',
+        ghostSparse.data.any((r) => r['id']?.toString() == pk1),
+        false,
+      );
+      await db.flush();
+      final ghostText2 = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText('content', TextQuery.text('distributed database'))
+          .limit(10);
+      ok &= _expect(
+        'post-flush after update: old text still absent',
+        ghostText2.data.any((r) => r['id']?.toString() == pk1),
+        false,
+      );
+
+      // Multi-space isolation for text/sparse.
+      // Sequential PKs collide across spaces — assert by headline.
+      await db.switchSpace(spaceName: 'text_sparse_space_a');
+      await db.clear(table.name);
+      final aIns = await db.insert(table.name, {
+        'headline': 'space_a_doc',
+        'content': 'unique space alpha phrase xyzzy',
+        'category': 'a',
+        'year': 2024,
+        'features': SparseVectorData.fromMap({901: 1.0}),
+      });
+      ok &= _expect('space A text insert', !aIns.hasErrors, true);
+      await db.flush();
+
+      await db.switchSpace(spaceName: 'text_sparse_space_b');
+      await db.clear(table.name);
+      await db.flush();
+      final inB = await db
+          .query(table.name)
+          .select(['id', 'headline'])
+          .matchText('content', TextQuery.text('xyzzy'))
+          .limit(5);
+      ok &= _expect(
+        'space B does not see space A text',
+        inB.data.any((r) => r['headline']?.toString() == 'space_a_doc'),
+        false,
+      );
+      final inBSparse = await db
+          .query(table.name)
+          .select(['id', 'headline'])
+          .matchSparse('features', SparseVectorData.fromMap({901: 1.0}))
+          .limit(5);
+      ok &= _expect(
+        'space B does not see space A sparse',
+        inBSparse.data.any((r) => r['headline']?.toString() == 'space_a_doc'),
+        false,
+      );
+
+      final bIns = await db.insert(table.name, {
+        'headline': 'space_b_doc',
+        'content': 'unique space beta phrase xyzzy',
+        'category': 'b',
+        'year': 2024,
+        'features': SparseVectorData.fromMap({902: 1.0}),
+      });
+      ok &= _expect('space B text insert', !bIns.hasErrors, true);
+      await db.flush();
+      final inB2 = await db
+          .query(table.name)
+          .select(['id', 'headline'])
+          .matchText('content', TextQuery.text('xyzzy'))
+          .limit(5);
+      ok &= _expect(
+        'space B finds its text',
+        inB2.data.any((r) => r['headline']?.toString() == 'space_b_doc'),
+        true,
+      );
+
+      await db.switchSpace(spaceName: 'text_sparse_space_a');
+      final inA = await db
+          .query(table.name)
+          .select(['id', 'headline'])
+          .matchText('content', TextQuery.text('xyzzy'))
+          .limit(5);
+      ok &= _expect(
+        'space A still finds its text',
+        inA.data.any((r) => r['headline']?.toString() == 'space_a_doc'),
+        true,
+      );
+      ok &= _expect(
+        'space A does not see space B headline',
+        inA.data.any((r) => r['headline']?.toString() == 'space_b_doc'),
+        false,
+      );
+    } catch (e, s) {
+      ok = false;
+      _failTest('Exception in _testTextSparseHybridAndTraps: $e\n$s');
+    } finally {
+      try {
+        await db.switchSpace(spaceName: originalSpace);
+        await _clearVectorTables();
+        await db.flush();
+      } catch (_) {}
+    }
+    return ok;
   }
 }
 

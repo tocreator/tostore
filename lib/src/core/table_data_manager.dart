@@ -36,6 +36,7 @@ import 'transaction_context.dart';
 import 'tree_cache.dart';
 import 'vector_index_manager.dart';
 import 'weight_manager.dart';
+import 'wmbp_index_manager.dart';
 import 'yield_controller.dart';
 
 /// table data manager - schedule data read/write, backup, index update, etc.
@@ -323,7 +324,7 @@ class TableDataManager {
   /// Cache a single table record (full row only).
   ///
   /// [isPartialProjection] must be true for SELECT-projected / field-overflow-
-  /// skipped maps so they never poison the PK hot cache used by full-row paths.
+  /// skipped maps so they never poison the PK hot cache used by full-record paths.
   void cacheTableRecord(TableContext table, String pk,
       Map<String, dynamic> record, TableSchema schema,
       {bool force = false, bool isPartialProjection = false}) {
@@ -395,7 +396,7 @@ class TableDataManager {
   /// Beyond this, skip promote so hot cache is not flooded by every flush batch.
   static const int flushPromoteHotCacheBudgetBytes = 50 * 1024 * 1024;
 
-  /// Whether flush eviction may still promote rows into the hot cache.
+  /// Whether flush eviction may still promote records into the hot cache.
   bool get canFlushPromoteToHotCache =>
       _tableRecordCache.maxByteThreshold > 0 &&
       _tableRecordCache.estimatedTotalSizeBytes <
@@ -420,7 +421,7 @@ class TableDataManager {
     final data = entry.data;
     final record = data.containsKey(pkName)
         ? data
-        : TableSchema.rowWithPrimaryKeyFirst(pkName, pk, data);
+        : TableSchema.recordWithPrimaryKeyFirst(pkName, pk, data);
     cacheTableRecord(table, pk, record, schema, force: true);
     return canFlushPromoteToHotCache;
   }
@@ -460,7 +461,7 @@ class TableDataManager {
         if (pk == null) continue;
 
         // Only cache if the record is NOT superseded by a live write-buffer entry.
-        // Caching disk rows while pending insert/update exists pollutes the
+        // Caching disk records while pending insert/update exists pollutes the
         // read-through cache with stale values under concurrent flush.
         final bufferEntry =
             _dataStore.writeBufferManager.getBufferedRecordForRead(
@@ -950,7 +951,7 @@ class TableDataManager {
   /// O(1) table-data flush occupancy: SpaceStats size delta + last-flush avg.
   ///
   /// [sizeDelta] should include B+Tree partition growth **and** overflow file
-  /// growth for the same flush (large rows live mostly in overflow).
+  /// growth for the same flush (large records live mostly in overflow).
   ///
   /// Last-flush table average updates only on net growth
   /// ([recordDelta] > 0 and [sizeDelta] > 0). PJM batch-sizing average also
@@ -1196,6 +1197,40 @@ class TableDataManager {
     return _maxIds[table.tableUid];
   }
 
+  /// Synchronous update of max ID in memory when updateFileMeta is false.
+  void updateMaxIdInMemorySync(TableContext table, String id) {
+    try {
+      final currentMaxId = _maxIds[table.tableUid];
+      bool shouldUpdate = false;
+
+      if (currentMaxId == null) {
+        _maxIds[table.tableUid] = id;
+        _maxIdsDirty[table.tableUid] = true;
+        shouldUpdate = true;
+      } else {
+        final matcher = ValueMatcher.getMatcher(MatcherType.pkNumericString);
+        if (matcher(id, currentMaxId) > 0) {
+          _maxIds[table.tableUid] = id;
+          _maxIdsDirty[table.tableUid] = true;
+          shouldUpdate = true;
+        }
+      }
+
+      if (shouldUpdate) {
+        final generator = _idGenerators[table.tableUid];
+        if (generator != null) {
+          generator.purgeIdsLessThanOrEqualTo(id);
+          if (generator is SequentialIdGenerator) {
+            final intId = int.tryParse(id);
+            if (intId != null && generator.currentId < intId) {
+              generator.setCurrentId(intId);
+            }
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
   /// Update max ID value (only in memory)
   /// [updateFileMeta] if true, also updates FileMeta.maxAutoIncrementId to keep cache consistent
   Future<void> updateMaxIdInMemory(TableContext table, dynamic id,
@@ -1350,6 +1385,34 @@ class TableDataManager {
       Logger.error('Failed to get next ID', rawError: e);
       return '';
     }
+  }
+
+  /// Pure synchronous batch ID allocation for in-memory sequential generators.
+  List<String>? tryGetBatchIdsSync(
+    TableContext table,
+    int count, {
+    List<Map<String, dynamic>>? assignTo,
+    int assignStart = 0,
+    String? assignField,
+  }) {
+    if (count <= 0) return const <String>[];
+    final schema = table.schema;
+    if (schema.primaryKeyConfig.type != PrimaryKeyType.sequential) return null;
+    if (!_maxIds.containsKey(table.tableUid)) return null;
+    final generator = _idGenerators[table.tableUid];
+    if (generator is! SequentialIdGenerator) return null;
+
+    final ids = generator.tryAllocateAndAssignSync(
+      count,
+      assignTo ?? const [],
+      assignStart,
+      assignField ?? '',
+    );
+    if (ids == null) return null;
+
+    updateMaxIdInMemorySync(table, ids.last);
+    _saveIdRange(table);
+    return ids;
   }
 
   /// Get batch of IDs (used for optimizing bulk insert scenarios).
@@ -1654,6 +1717,129 @@ class TableDataManager {
     }
   }
 
+  /// Applies text / sparse index changes as soon as the row is visible.
+  ///
+  /// Unlike dense vector indexes, WMBP stays searchable before the page flush
+  /// by scoring the pending read cache.
+  Future<void>? applyWmbpIndexChanges({
+    required TableContext table,
+    required TableSchema schema,
+    required BufferOperationType operation,
+    required List<Map<String, dynamic>> records,
+    List<Map<String, dynamic>?>? oldRecordsList,
+  }) {
+    if (records.isEmpty) return null;
+    final schemaMgr = _dataStore.tableMetaManager;
+    final wmbp = _dataStore.wmbpIndexManager;
+    if (schemaMgr == null || wmbp == null) return null;
+    if (!schemaMgr.hasWmbpIndexes(schema)) return null;
+    if ((operation == BufferOperationType.insert ||
+            operation == BufferOperationType.rewrite) &&
+        oldRecordsList == null &&
+        wmbp.applyChangesSync(
+          table: table,
+          schema: schema,
+          inserts: records,
+        )) {
+      return null;
+    }
+    if (operation == BufferOperationType.delete &&
+        wmbp.applyChangesSync(
+          table: table,
+          schema: schema,
+          deletes: records,
+        )) {
+      return null;
+    }
+    if (operation == BufferOperationType.update) {
+      final pkName = schema.primaryKey;
+      final updates = <IndexRecordUpdate>[];
+      for (int i = 0; i < records.length; i++) {
+        final row = records[i];
+        final pk = row[pkName]?.toString();
+        if (pk == null || pk.isEmpty) continue;
+        final old = oldRecordsList != null && i < oldRecordsList.length
+            ? oldRecordsList[i]
+            : null;
+        updates.add(IndexRecordUpdate(
+          primaryKey: pk,
+          oldValues: old,
+          newValues: row,
+        ));
+      }
+      if (updates.isNotEmpty &&
+          wmbp.applyChangesSync(
+            table: table,
+            schema: schema,
+            updates: updates,
+          )) {
+        return null;
+      }
+    }
+    return _applyWmbpIndexChangesBody(
+      table: table,
+      schema: schema,
+      operation: operation,
+      records: records,
+      oldRecordsList: oldRecordsList,
+      wmbp: wmbp,
+    );
+  }
+
+  Future<void> _applyWmbpIndexChangesBody({
+    required TableContext table,
+    required TableSchema schema,
+    required BufferOperationType operation,
+    required List<Map<String, dynamic>> records,
+    List<Map<String, dynamic>?>? oldRecordsList,
+    required WmbpIndexManager wmbp,
+  }) async {
+    try {
+      switch (operation) {
+        case BufferOperationType.insert:
+        case BufferOperationType.rewrite:
+          await wmbp.applyChanges(
+            table: table,
+            schema: schema,
+            inserts: records,
+          );
+        case BufferOperationType.delete:
+          await wmbp.applyChanges(
+            table: table,
+            schema: schema,
+            deletes: records,
+          );
+        case BufferOperationType.update:
+          final pkName = schema.primaryKey;
+          final updates = <IndexRecordUpdate>[];
+          for (int i = 0; i < records.length; i++) {
+            final row = records[i];
+            final pk = row[pkName]?.toString();
+            if (pk == null || pk.isEmpty) continue;
+            final old = oldRecordsList != null && i < oldRecordsList.length
+                ? oldRecordsList[i]
+                : null;
+            updates.add(IndexRecordUpdate(
+              primaryKey: pk,
+              oldValues: old,
+              newValues: row,
+            ));
+          }
+          if (updates.isEmpty) return;
+          await wmbp.applyChanges(
+            table: table,
+            schema: schema,
+            updates: updates,
+          );
+      }
+    } catch (e) {
+      Logger.warn(
+        'WMBP index apply failed: ${table.tableName}',
+        rawError: e,
+      );
+    }
+  }
+
   /// Fully synchronous single-record CRUD path into write buffer / WAL.
   /// Completely eliminates async/await microtask scheduling overhead.
   WalPointer addToBufferSync(
@@ -1767,7 +1953,7 @@ class TableDataManager {
         }
       }
       // Same as file-mode path: bump query-result generation so pagination /
-      // list caches cannot serve pre-update rows.
+      // list caches cannot serve pre-update records.
       _dataStore.queryExecutor.invalidateQueryCacheForTable(table);
       return const WalPointer(partitionIndex: -1, entrySeq: -1);
     }
@@ -1850,7 +2036,7 @@ class TableDataManager {
     bool installUniquesOnApply = false,
     bool deferQueryCacheInvalidation = false,
 
-    /// When true, skip per-row index hot-cache sync on batch update.
+    /// When true, skip per-record index hot-cache sync on batch update.
     /// Safe when changed columns do not affect any index (e.g. simple PK-only tables).
     bool skipIndexCacheSync = false,
     RecoveryDurability? durability,
@@ -2017,6 +2203,14 @@ class TableDataManager {
         oldRecordsList: appliedOldRecords,
       );
       if (vectorApply != null) await vectorApply;
+      final wmbpApply = applyWmbpIndexChanges(
+        table: table,
+        schema: schema,
+        operation: operation,
+        records: appliedRecords,
+        oldRecordsList: appliedOldRecords,
+      );
+      if (wmbpApply != null) await wmbpApply;
 
       if (successIds.isNotEmpty && !deferQueryCacheInvalidation) {
         _dataStore.queryExecutor.invalidateQueryCacheForTable(table);
@@ -2156,14 +2350,23 @@ class TableDataManager {
     }
 
     if (operation == BufferOperationType.insert) {
-      if (!schema.hasSecondaryIndexes &&
+      final bool hasBtreeSecondary =
+          _dataStore.tableMetaManager?.getBtreeIndexesFor(schema).isNotEmpty ??
+              schema.hasSecondaryIndexes;
+      if (!hasBtreeSecondary &&
           !schema.isGlobal &&
           (applyingCommit || installUniquesOnApply)) {
-        await _dataStore.writeBufferManager.addPurePkInsertBatch(
+        if (!_dataStore.writeBufferManager.addPurePkInsertBatchSync(
           table: table,
           recordIds: recordIds,
           entries: entries,
-        );
+        )) {
+          await _dataStore.writeBufferManager.addPurePkInsertBatch(
+            table: table,
+            recordIds: recordIds,
+            entries: entries,
+          );
+        }
       } else {
         await _dataStore.writeBufferManager.addInsertBatch(
           table: table,
@@ -2183,6 +2386,19 @@ class TableDataManager {
       await _dataStore.writeBufferManager
           .addDeleteBatch(table: table, recordIds: recordIds, entries: entries);
     }
+
+    // File mode: keep text/sparse searchable from the pending corpus before
+    // IndexManager.writeChanges seals pages. Open transactions defer until
+    // commit apply (handled by the early txn return above).
+    final wmbpApply = applyWmbpIndexChanges(
+      table: table,
+      schema: schema,
+      operation: operation,
+      records: validBatchRecords,
+      oldRecordsList: validBatchOldValues,
+    );
+    if (wmbpApply != null) await wmbpApply;
+
     if (!deferQueryCacheInvalidation) {
       _dataStore.queryExecutor.invalidateQueryCacheForTable(table);
     }
@@ -2243,6 +2459,24 @@ class TableDataManager {
           _needSaveStats = true;
         }
       }
+    }
+  }
+
+  /// Pure synchronous batch update of record count cache when count is already loaded.
+  @pragma('vm:prefer-inline')
+  void updateTableRecordCountDeltaSync(
+    TableContext table, {
+    int insertDelta = 0,
+    int deleteDelta = 0,
+  }) {
+    final int delta = insertDelta - deleteDelta;
+    if (delta == 0) return;
+    final current = _tableRecordCounts[table.tableUid];
+    if (current == null) return;
+    _tableRecordCounts[table.tableUid] = max(0, current + delta);
+    if (_contributesToSpaceStats(table)) {
+      _deltaRecordCount += delta;
+      _needSaveStats = true;
     }
   }
 
@@ -2606,6 +2840,10 @@ class TableDataManager {
   TableDataMeta? peekTableDataMeta(TableUid tableUid) {
     return _tableDataMetaCache.get(tableUid);
   }
+
+  /// Synchronous table data meta check (cache only).
+  TableDataMeta? getTableDataMetaSync(TableUid tableUid) =>
+      _tableDataMetaCache.get(tableUid);
 
   /// Get table data meta (cache first, disk on miss).
   Future<TableDataMeta?> getTableDataMeta(TableUid tableUid) async {
@@ -3173,7 +3411,7 @@ class TableDataManager {
     final bool isMemoryMode =
         _dataStore.config.persistenceMode == PersistenceMode.memory;
 
-    // Empty disk does not mean empty result: pending/txn may still have rows.
+    // Empty disk does not mean empty result: pending/txn may still have records.
     bool diskEmpty = false;
     if (!isMemoryMode) {
       final fileMeta = await getTableDataMeta(table.tableUid);
@@ -3826,7 +4064,7 @@ class TableDataManager {
 
     // Non-PK / unbounded: point-overlay the base page only (O(|base|)).
     // Do NOT full-scan pending trees -- that destroys latency at scale.
-    return _pointOverlayBaseRows(
+    return _pointOverlayBaseRecords(
       table,
       base,
       matcher: matcher,
@@ -3867,8 +4105,8 @@ class TableDataManager {
       return true;
     }
 
-    // 1) Point-overlay base rows (O(|base|) gets).
-    final baseRows = <Map<String, dynamic>>[];
+    // 1) Point-overlay base records (O(|base|) gets).
+    final baseRecords = <Map<String, dynamic>>[];
     for (final row in base) {
       final pk = row[pkName]?.toString();
       if (pk == null || pk.isEmpty) continue;
@@ -3900,17 +4138,17 @@ class TableDataManager {
         final c = pkMatcher(pkVal, afterPrimaryKey);
         if (reverse ? c >= 0 : c <= 0) continue;
       }
-      baseRows.add(visible);
+      baseRecords.add(visible);
     }
 
-    if (baseRows.length > 1) {
-      baseRows.sort((a, b) {
+    if (baseRecords.length > 1) {
+      baseRecords.sort((a, b) {
         final c = pkMatcher(a[pkName], b[pkName]);
         return reverse ? -c : c;
       });
     }
 
-    // 2) Ranged scan: seek to cursor, early-stop after [limit] visible rows.
+    // 2) Ranged scan: seek to cursor, early-stop after [limit] visible records.
     //    ASC: startPk=cursor (LowerBound), end=null
     //    DESC: startPk=null, endPk=cursor (LastLE) -- never walk from group max.
     Future<List<Map<String, dynamic>>> scanBufferSource({
@@ -3954,7 +4192,7 @@ class TableDataManager {
     }
 
     final hasPending = trees.hasPendingWritesForUid(table.tableUid);
-    final pendingRows = hasPending
+    final pendingRecords = hasPending
         ? await scanBufferSource(
             forEach: (
                 {startPk, endPk, reverse = false, limit, required onEntry}) {
@@ -3970,9 +4208,9 @@ class TableDataManager {
           )
         : const <Map<String, dynamic>>[];
 
-    List<Map<String, dynamic>> txnRows = const [];
+    List<Map<String, dynamic>> txnRecords = const [];
     if (useTxn) {
-      txnRows = await scanBufferSource(
+      txnRecords = await scanBufferSource(
         forEach: ({startPk, endPk, reverse = false, limit, required onEntry}) {
           return trees.forEachTxnRecord(
             txId,
@@ -3988,20 +4226,20 @@ class TableDataManager {
     }
 
     // Fast path: no file base and single buffer source.
-    if (baseRows.isEmpty && txnRows.isEmpty) {
-      if (pendingRows.length > limit) {
-        return pendingRows.sublist(0, limit);
+    if (baseRecords.isEmpty && txnRecords.isEmpty) {
+      if (pendingRecords.length > limit) {
+        return pendingRecords.sublist(0, limit);
       }
-      return pendingRows;
+      return pendingRecords;
     }
-    if (baseRows.isEmpty && pendingRows.isEmpty) {
-      if (txnRows.length > limit) return txnRows.sublist(0, limit);
-      return txnRows;
+    if (baseRecords.isEmpty && pendingRecords.isEmpty) {
+      if (txnRecords.length > limit) return txnRecords.sublist(0, limit);
+      return txnRecords;
     }
 
     // 3) K-way merge by PK (txn > pending > base on equal key).
     return _kWayMergeByPk(
-      sources: [txnRows, pendingRows, baseRows],
+      sources: [txnRecords, pendingRecords, baseRecords],
       pkName: pkName,
       pkMatcher: pkMatcher,
       reverse: reverse,
@@ -4072,7 +4310,7 @@ class TableDataManager {
   }
 
   /// Point-get overlay for each base row only -- O(|base|).
-  Future<List<Map<String, dynamic>>> _pointOverlayBaseRows(
+  Future<List<Map<String, dynamic>>> _pointOverlayBaseRecords(
     TableContext table,
     List<Map<String, dynamic>> base, {
     bool Function(Map<String, dynamic>)? matcher,
@@ -4485,7 +4723,7 @@ class TableDataManager {
     }
 
     // Fall back to disk (neededFields skips unselected field-overflow IO;
-    // partial rows are not read-through cached -> see queryRecordsBatch).
+    // partial records are not read-through cached -> see queryRecordsBatch).
     final batchRes = await queryRecordsBatch(
       table,
       [key],
@@ -4500,6 +4738,70 @@ class TableDataManager {
       return batchRes.records.first;
     }
     return null;
+  }
+
+  /// Synchronous batch lookup from resident memory tiers (`Txn > WriteBuffer >
+  /// _tableRecordCache > B+Tree PageCache`). Returns `null` if any requested
+  /// key requires disk I/O so the caller can fall back to [queryRecordsMapBatch].
+  Map<String, Map<String, dynamic>>? queryRecordsMapBatchSync(
+    TableContext table,
+    List<String> keys, {
+    TableSchema? decodeSchema,
+  }) {
+    if (keys.isEmpty) {
+      return <String, Map<String, dynamic>>{};
+    }
+
+    final resultsMap = <String, Map<String, dynamic>>{};
+    final trees = _dataStore.writeBufferManager.bufferTrees;
+    final txId = TransactionContext.getCurrentTransactionId();
+    final useTxn = txId != null &&
+        !TransactionContext.isApplyingCommit() &&
+        _txnIdsWithOps.contains(txId);
+    final tableUid = table.tableUid;
+
+    for (int i = 0; i < keys.length; i++) {
+      final pk = keys[i];
+      BufferEntry? entry;
+      var fromTxn = false;
+      if (useTxn) {
+        final tx = trees.getTxnRecord(txId, tableUid, pk);
+        if (tx != null) {
+          entry = tx;
+          fromTxn = true;
+        }
+      }
+      entry ??=
+          _dataStore.writeBufferManager.getBufferedRecordForRead(table, pk);
+      if (entry != null) {
+        if (entry.operation != BufferOperationType.delete) {
+          resultsMap[pk] = fromTxn ? _visibleTxnRecord(entry.data) : entry.data;
+        }
+        continue;
+      }
+
+      final cached = _tableRecordCache.getPoint2(tableUid, pk);
+      if (cached != null) {
+        resultsMap[pk] = cached;
+        continue;
+      }
+
+      final pageHit = _dataStore.tableTreePartitionManager
+          ?.queryRecordByPrimaryKeyFromPageCacheSync(
+        table: table,
+        pk: pk,
+        schemaOverride: decodeSchema,
+      );
+      if (pageHit != null) {
+        resultsMap[pk] = pageHit;
+        _schedulePageCacheReadThrough(table, pk, pageHit);
+        continue;
+      }
+
+      return null;
+    }
+
+    return resultsMap;
   }
 
   /// High-throughput batch query directly returning a `Map<String, Map<String, dynamic>>`
@@ -4604,7 +4906,7 @@ class TableDataManager {
     );
 
     if (diskResults != null && diskResults.isNotEmpty) {
-      final fusedDiskRows = <Map<String, dynamic>>[];
+      final fusedDiskRecords = <Map<String, dynamic>>[];
       for (final diskRow in diskResults) {
         final fused = _fuseDiskRowAfterRead(
           table,
@@ -4616,18 +4918,18 @@ class TableDataManager {
           final pkVal = fused[pkName]?.toString();
           if (pkVal != null && pkVal.isNotEmpty) {
             resultsMap[pkVal] = fused;
-            fusedDiskRows.add(fused);
+            fusedDiskRecords.add(fused);
           }
         }
       }
 
-      // Read-Through: never cache SELECT/projection-partial rows.
-      if (fusedDiskRows.isNotEmpty &&
+      // Read-Through: never cache SELECT/projection-partial records.
+      if (fusedDiskRecords.isNotEmpty &&
           !readFromFileOnly &&
           neededFields == null) {
         _asyncCacheDiskResults(
           table: table,
-          diskResults: fusedDiskRows,
+          diskResults: fusedDiskRecords,
           schema: schema,
         );
       }
@@ -4700,7 +5002,7 @@ class TableDataManager {
         return TableScanResult(records: results);
       }
 
-      final fusedDiskRows = <Map<String, dynamic>>[];
+      final fusedDiskRecords = <Map<String, dynamic>>[];
       for (final diskRow in diskResults) {
         final fused = _fuseDiskRowAfterRead(
           table,
@@ -4710,17 +5012,17 @@ class TableDataManager {
         );
         if (fused != null) {
           results.add(fused);
-          fusedDiskRows.add(fused);
+          fusedDiskRecords.add(fused);
         }
       }
 
-      // Read-Through: never cache SELECT/projection-partial rows.
-      if (fusedDiskRows.isNotEmpty &&
+      // Read-Through: never cache SELECT/projection-partial records.
+      if (fusedDiskRecords.isNotEmpty &&
           !readFromFileOnly &&
           neededFields == null) {
         _asyncCacheDiskResults(
           table: table,
-          diskResults: fusedDiskRows,
+          diskResults: fusedDiskRecords,
           schema: schema,
         );
       }
@@ -4990,7 +5292,7 @@ class TableDataManager {
       return out;
     }
 
-    final pendingRows = hasPending
+    final pendingRecords = hasPending
         ? await scanBufferSource(
             forEach: (
                 {startPk, endPk, reverse = false, limit, required onEntry}) {
@@ -5006,7 +5308,7 @@ class TableDataManager {
           )
         : const <Map<String, dynamic>>[];
 
-    final txnRows = useTxn
+    final txnRecords = useTxn
         ? await scanBufferSource(
             forEach: (
                 {startPk, endPk, reverse = false, limit, required onEntry}) {
@@ -5023,7 +5325,7 @@ class TableDataManager {
           )
         : const <Map<String, dynamic>>[];
 
-    if (pendingRows.isEmpty && txnRows.isEmpty) {
+    if (pendingRecords.isEmpty && txnRecords.isEmpty) {
       await forEachBase(
         onBase: (r) {
           final visible = resolveOverlay(r);
@@ -5049,8 +5351,8 @@ class TableDataManager {
 
     bool flushBuffersBefore(dynamic filePk) {
       while (continueScan) {
-        final t = ti < txnRows.length ? txnRows[ti] : null;
-        final p = pi < pendingRows.length ? pendingRows[pi] : null;
+        final t = ti < txnRecords.length ? txnRecords[ti] : null;
+        final p = pi < pendingRecords.length ? pendingRecords[pi] : null;
         if (t == null && p == null) return true;
 
         Map<String, dynamic>? best;

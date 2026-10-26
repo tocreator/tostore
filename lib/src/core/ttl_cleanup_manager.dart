@@ -437,18 +437,18 @@ class TtlCleanupManager {
         if (y1 != null) await y1;
         if (_dataStore.isClosing) break;
 
-        final rows = (await _dataStore.queryExecutor.execute(
+        final records = (await _dataStore.queryExecutor.execute(
           table,
           condition: QueryCondition()..where(pkName, '=', entry.primaryKey),
           limit: 1,
         ))
             .records;
-        if (rows.isEmpty) {
+        if (records.isEmpty) {
           await _removeKvExpiryIndexEntry(table, entry.keyBytes);
           continue;
         }
 
-        final row = rows.first;
+        final row = records.first;
         final currentExpiresAtIso =
             _normalizeDateTimeIso(row[SystemTable.keyValueExpiresAtField]);
         if (currentExpiresAtIso == null) {
@@ -593,7 +593,7 @@ class TtlCleanupManager {
                       ?.resolveTableNameFromField(plan.tableUid) ??
                   TableName(plan.tableUid.value);
               Logger.info(
-                'TTL cleanup deleted ${result.deleted} rows from table $resolvedName',
+                'TTL cleanup deleted ${result.deleted} records from table $resolvedName',
               );
             }
 
@@ -627,7 +627,7 @@ class TtlCleanupManager {
                 roundDeleted += result.deleted;
                 totalDeleted += result.deleted;
                 Logger.info(
-                  'KV TTL cleanup deleted ${result.deleted} rows from table ${table.tableName}',
+                  'KV TTL cleanup deleted ${result.deleted} records from table ${table.tableName}',
                 );
               }
 
@@ -676,7 +676,7 @@ class TtlCleanupManager {
       if (totalDeleted > 0) {
         final elapsedMs = DateTime.now().millisecondsSinceEpoch - cycleStartMs;
         Logger.info(
-          'TTL cleanup cycle deleted $totalDeleted rows in ${elapsedMs}ms',
+          'TTL cleanup cycle deleted $totalDeleted records in ${elapsedMs}ms',
         );
       }
     } catch (e) {

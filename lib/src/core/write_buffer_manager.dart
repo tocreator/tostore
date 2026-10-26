@@ -377,6 +377,50 @@ class WriteBufferManager {
     CrontabManager.notifyActivity();
   }
 
+  /// Pure synchronous fast-path for pure PK batch inserts when counts are cached in memory.
+  /// Returns true if applied synchronously without any event loop yield.
+  bool addPurePkInsertBatchSync({
+    required TableContext table,
+    required List<String> recordIds,
+    required List<BufferEntry> entries,
+  }) {
+    final int count = recordIds.length;
+    if (count == 0) return true;
+
+    final currentCount =
+        _dataStore.tableDataManager.getTableRecordCountSync(table);
+    if (currentCount == null) return false;
+
+    _dataStore.tableDataManager.updateTableRecordCountDeltaSync(
+      table,
+      insertDelta: count,
+    );
+
+    final tableUid = table.tableUid;
+    final recordCache = trees.pendingRecordCache;
+    final bgScheduler = _dataStore.backgroundWriteScheduler;
+    final bool bgMaybeActive = !bgScheduler.isEmpty;
+
+    recordCache.putFlatBatchNone(tableUid, recordIds, entries);
+
+    for (int i = 0; i < count; i++) {
+      final wp = entries[i].walPointer;
+      if (wp == null) continue;
+      if (bgMaybeActive) {
+        bgScheduler.handleOnlineWrite(table, recordIds[i]);
+      }
+      _writeQueue.add(WriteQueueEntry(
+        tableUid: tableUid,
+        recordId: recordIds[i],
+        walPointer: wp,
+      ));
+    }
+
+    _emitSizeChanged();
+    CrontabManager.notifyActivity();
+    return true;
+  }
+
   /// High-throughput batch insertion for tables with ONLY a primary key,
   /// skipping index plan lookups and reservation checks. The write-queue
   /// build loop yields so a large window cannot monopolize the UI isolate.
@@ -388,10 +432,19 @@ class WriteBufferManager {
     final int count = recordIds.length;
     if (count == 0) return;
 
-    await _dataStore.tableDataManager.updateTableRecordCountDelta(
-      table,
-      insertDelta: count,
-    );
+    final currentCount =
+        _dataStore.tableDataManager.getTableRecordCountSync(table);
+    if (currentCount != null) {
+      _dataStore.tableDataManager.updateTableRecordCountDeltaSync(
+        table,
+        insertDelta: count,
+      );
+    } else {
+      await _dataStore.tableDataManager.updateTableRecordCountDelta(
+        table,
+        insertDelta: count,
+      );
+    }
 
     final tableUid = table.tableUid;
     final recordCache = trees.pendingRecordCache;
@@ -488,7 +541,7 @@ class WriteBufferManager {
       );
 
       // Always enqueue (O(1)). insert→update coalesces in trees; skipping the
-      // queue previously stranded rows when flush already popped the insert.
+      // queue previously stranded records when flush already popped the insert.
       if (effective != null && effective.walPointer != null) {
         pendingQueue.add(WriteQueueEntry(
           tableUid: table.tableUid,
@@ -821,7 +874,7 @@ class WriteBufferManager {
     trees.rollbackReserved(rollbackKeys, transactionId: transactionId);
   }
 
-  /// Release many reserved rows by their path lists (update abort / chunk abort).
+  /// Release many reserved records by their path lists (update abort / chunk abort).
   Future<void> releaseReservedUniquesByPaths({
     required TableContext table,
     required Map<String, List<List<dynamic>>> pathsByPk,

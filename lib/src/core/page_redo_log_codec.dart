@@ -51,7 +51,22 @@ enum PageRedoTreeKind {
   ///
   /// New empty / freelist-first pages are not recorded; only in-place rewrites
   /// of pages that already held live slots use this kind.
-  overflow;
+  overflow,
+
+  /// WMBP dictionary pages (`dict/`).
+  wmbpDict,
+
+  /// WMBP posting pages (`post/`).
+  wmbpPost,
+
+  /// WMBP active-mask pages (`win/`).
+  wmbpWin,
+
+  /// WMBP forward-map pages (`fwd/`).
+  wmbpFwd,
+
+  /// WMBP reverse-map pages (`rev/`).
+  wmbpRev;
 
   /// Index uid is required on the redo record.
   bool get requiresIndexUid {
@@ -62,8 +77,53 @@ enum PageRedoTreeKind {
       case PageRedoTreeKind.indexTree:
       case PageRedoTreeKind.ngh:
       case PageRedoTreeKind.nghNav:
+      case PageRedoTreeKind.wmbpDict:
+      case PageRedoTreeKind.wmbpPost:
+      case PageRedoTreeKind.wmbpWin:
+      case PageRedoTreeKind.wmbpFwd:
+      case PageRedoTreeKind.wmbpRev:
         return true;
     }
+  }
+
+  /// WMBP storage category for this kind, or null for other trees.
+  String? get wmbpCategory {
+    switch (this) {
+      case PageRedoTreeKind.wmbpDict:
+        return 'dict';
+      case PageRedoTreeKind.wmbpPost:
+        return 'post';
+      case PageRedoTreeKind.wmbpWin:
+        return 'win';
+      case PageRedoTreeKind.wmbpFwd:
+        return 'fwd';
+      case PageRedoTreeKind.wmbpRev:
+        return 'rev';
+      case PageRedoTreeKind.table:
+      case PageRedoTreeKind.indexTree:
+      case PageRedoTreeKind.ngh:
+      case PageRedoTreeKind.nghNav:
+      case PageRedoTreeKind.overflow:
+        return null;
+    }
+  }
+}
+
+/// Maps a WMBP category directory name to its page-redo kind.
+PageRedoTreeKind? pageRedoKindForWmbp(String category) {
+  switch (category) {
+    case 'dict':
+      return PageRedoTreeKind.wmbpDict;
+    case 'post':
+      return PageRedoTreeKind.wmbpPost;
+    case 'win':
+      return PageRedoTreeKind.wmbpWin;
+    case 'fwd':
+      return PageRedoTreeKind.wmbpFwd;
+    case 'rev':
+      return PageRedoTreeKind.wmbpRev;
+    default:
+      return null;
   }
 }
 

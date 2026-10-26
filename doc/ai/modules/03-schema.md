@@ -114,6 +114,7 @@ const FieldSchema({
 | `array` | `List` | |
 | `json` | `Map<String, dynamic>` | |
 | `vector` | `VectorData` / `List<num>` | Needs `vectorConfig.dimensions` in `1..65535` |
+| `sparse` | `SparseVectorData` / `Map<int, num>` | Learned sparse vector dimensions and weights |
 | `dynamic` | arbitrary Dart | No forced conversion |
 
 ### Constraints (engine-enforced)
@@ -127,7 +128,7 @@ const FieldSchema({
 - `createIndex: true` — auto single-field normal index
 - `fieldId` — optional stable field id for **declarative** rename detection (same mobile/`open(schemas:)` path as `tableId`). Server/Agent runtime `updateSchema` renames do not need it.
 
-Composite / named / vector indexes: declare in `indexes` (`IndexSchema`).
+Composite / named / vector / text / sparse indexes: declare in `indexes` (`IndexSchema`).
 
 ## IndexSchema
 
@@ -136,8 +137,8 @@ IndexSchema({
   String? indexName,
   required List<String> fields,
   bool unique = false,
-  IndexType type = IndexType.btree, // btree | vector
-  // vector indexes also use VectorIndexConfig (see Vector module)
+  IndexType type = IndexType.btree, // btree | vector | text | sparse
+  // vector indexes also use VectorIndexConfig (see Vector/Hybrid module)
 });
 ```
 
@@ -211,7 +212,7 @@ Target field MUST be **unique and non-null**.
 
 | API | Returns |
 | :--- | :--- |
-| `tableExists(name)` | schema exists (not “has rows”) |
+| `tableExists(name)` | schema exists (not “has records”) |
 | `getTableSchema(name)` | `TableSchema?` |
 | `getTableNames({isGlobal})` | filter global / non-global / all |
 | `getTableInfo(name)` | counts, sizes, schema meta |

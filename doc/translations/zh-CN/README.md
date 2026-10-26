@@ -805,9 +805,9 @@ final result = await db
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
-  final row = result.data[i];
+  final record = result.data[i];
   final entry = result.retrieval?.entries[i];
-  print('pk=${row['id']}, score=${entry?.score}, '
+  print('pk=${record['id']}, score=${entry?.score}, '
       'distance=${entry?.meta?['distance']}');
 }
 

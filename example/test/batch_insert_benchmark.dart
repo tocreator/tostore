@@ -203,7 +203,7 @@ void main() async {
           avgOpsMap[tier.label]![durability] = avgWarmOps;
         }
 
-        // Verify last round, then wipe so leftover rows/flush do not overlap
+        // Verify last round, then wipe so leftover records/flush do not overlap
         stdout.writeln('  Verifying sample data integrity:');
         final sampleFirst = await db.query(tableName).where('id', '=', '1');
         stdout.writeln('  First record: ${sampleFirst.data.firstOrNull}');

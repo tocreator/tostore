@@ -775,7 +775,7 @@ final queryVector =
     VectorData.fromList(List.generate(128, (i) => i * 0.01)); // Must match dimensions
 
 // 1) Recommended: chained hybrid retrieval (pure vector ANN)
-// Prefer .select([pk]) for primary key + score only — avoids full-row hydration.
+// Prefer .select([pk]) for primary key + score only — avoids full-record hydration.
 final result = await db
     .query('embeddings')
     .select(['id'])
@@ -783,14 +783,14 @@ final result = await db
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
-  final row = result.data[i];
+  final record = result.data[i];
   final entry = result.retrieval?.entries[i];
-  print('pk=${row['id']}, score=${entry?.score}, '
+  print('pk=${record['id']}, score=${entry?.score}, '
       'distance=${entry?.meta?['distance']}');
 }
 
 // Need business columns? omit select() (or project the fields you need) —
-// the engine then loads full table rows for matched PKs (heavier).
+// the engine then loads full table records for matched PKs (heavier).
 
 // 2) Structured filter + vector (AND hybrid)
 final filtered = await db

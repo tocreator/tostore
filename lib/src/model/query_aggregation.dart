@@ -86,39 +86,39 @@ class QueryAggregator {
   // Grouped state
   final Map<String, List<_AggState>> _groupedState = {};
 
-  // Keep track of the first row of each group to retain group keys
+  // Keep track of the first record of each group to retain group keys
   final Map<String, Map<String, dynamic>> _groupKeys = {};
 
   QueryAggregator(this.aggregations, {this.groupBy})
       : _singleState = List.generate(aggregations.length, (_) => _AggState());
 
-  void accumulate(Map<String, dynamic> row) {
+  void accumulate(Map<String, dynamic> record) {
     if (groupBy == null || groupBy!.isEmpty) {
-      _accumulateState(_singleState, row);
+      _accumulateState(_singleState, record);
     } else {
-      final String groupKey = _buildGroupKey(row);
+      final String groupKey = _buildGroupKey(record);
       if (!_groupedState.containsKey(groupKey)) {
         _groupedState[groupKey] =
             List.generate(aggregations.length, (_) => _AggState());
 
-        // Store the grouped fields from the first row of this group
+        // Store the grouped fields from the first record of this group
         final Map<String, dynamic> keyData = {};
         for (final field in groupBy!) {
-          keyData[field] = _extractValue(row, field);
+          keyData[field] = _extractValue(record, field);
         }
         _groupKeys[groupKey] = keyData;
       }
-      _accumulateState(_groupedState[groupKey]!, row);
+      _accumulateState(_groupedState[groupKey]!, record);
     }
   }
 
-  String _buildGroupKey(Map<String, dynamic> row) {
+  String _buildGroupKey(Map<String, dynamic> record) {
     return groupBy!
-        .map((f) => _extractValue(row, f)?.toString() ?? 'null')
+        .map((f) => _extractValue(record, f)?.toString() ?? 'null')
         .join('|');
   }
 
-  void _accumulateState(List<_AggState> states, Map<String, dynamic> row) {
+  void _accumulateState(List<_AggState> states, Map<String, dynamic> record) {
     for (int i = 0; i < aggregations.length; i++) {
       final agg = aggregations[i];
       final state = states[i];
@@ -128,7 +128,7 @@ class QueryAggregator {
         continue;
       }
 
-      final val = _extractNumValue(row, agg.field);
+      final val = _extractNumValue(record, agg.field);
       if (val != null) {
         if (agg.type == QueryAggregationType.sum ||
             agg.type == QueryAggregationType.avg) {
@@ -145,9 +145,9 @@ class QueryAggregator {
     }
   }
 
-  static dynamic _extractValue(Map<String, dynamic> row, String fieldName) {
+  static dynamic _extractValue(Map<String, dynamic> record, String fieldName) {
     if (fieldName.contains('.')) {
-      Map<String, dynamic>? current = row;
+      Map<String, dynamic>? current = record;
       final parts = fieldName.split('.');
       for (int i = 0; i < parts.length - 1; i++) {
         final p = parts[i];
@@ -159,11 +159,11 @@ class QueryAggregator {
       }
       return current?[parts.last];
     }
-    return row[fieldName];
+    return record[fieldName];
   }
 
-  static num? _extractNumValue(Map<String, dynamic> row, String fieldName) {
-    final val = _extractValue(row, fieldName);
+  static num? _extractNumValue(Map<String, dynamic> record, String fieldName) {
+    final val = _extractValue(record, fieldName);
     if (val is num) return val;
     return null;
   }
@@ -270,22 +270,22 @@ class QueryAggregator {
   // Get list of results with field names and grouped keys
   List<Map<String, dynamic>> getGroupedResults() {
     if (groupBy == null || groupBy!.isEmpty) {
-      final Map<String, dynamic> row = {};
+      final Map<String, dynamic> record = {};
       for (int i = 0; i < aggregations.length; i++) {
-        row[aggregations[i].outputName] =
+        record[aggregations[i].outputName] =
             _getResultValue(aggregations[i], _singleState[i]);
       }
-      return [row];
+      return [record];
     }
 
     final List<Map<String, dynamic>> results = [];
     _groupedState.forEach((key, states) {
-      final Map<String, dynamic> row = Map.from(_groupKeys[key]!);
+      final Map<String, dynamic> record = Map.from(_groupKeys[key]!);
       for (int i = 0; i < aggregations.length; i++) {
-        row[aggregations[i].outputName] =
+        record[aggregations[i].outputName] =
             _getResultValue(aggregations[i], states[i]);
       }
-      results.add(row);
+      results.add(record);
     });
     return results;
   }

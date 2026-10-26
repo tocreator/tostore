@@ -5,8 +5,17 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     with FutureBuilderMixin<QueryResult<Map<String, dynamic>>> {
   Future<ExecuteResult>? _future;
   List<String>? _selectedFields;
+  bool _hasComplexProjection = false;
   List<QueryAggregation> _extraAggregations =
       const []; // To store inline Agg objects
+
+  static final RegExp _asPattern = RegExp(r'\s+[aA][sS]\s+');
+
+  static bool _isComplexField(String field) {
+    if (field.contains('.')) return true;
+    if (!field.contains(' ')) return false;
+    return _asPattern.hasMatch(field);
+  }
 
   /// Cached pure matchVector args for the direct-ANN fast path.
   /// Cleared when additional clauses make the query non-pure.
@@ -29,6 +38,9 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   bool _enableQueryCache = true;
   Duration? _queryCacheExpiry;
 
+  /// Multi-way fusion strategy. Null uses [RetrievalFusionMethod.weightedScore].
+  RetrievalFusionMethod? _fusionMethod;
+
   // distinct modifier
   bool _distinct = false;
   List<String>? _distinctFields;
@@ -42,6 +54,32 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   /// select() does not touch clauseFlags (projection is field-list only).
   static const int _pureMatchVectorOkFlags = QueryClauseMask.matchVector;
 
+  /// Cached pure matchText args for the direct-WMBP fast path.
+  /// Cleared when additional clauses make the query non-pure.
+  ({
+    String field,
+    TextQuery query,
+    TextMatchOperator operator,
+    double weight,
+    double? minScore,
+  })? _cachedPureText;
+
+  static const int _pureMatchTextOkFlags = QueryClauseMask.matchText;
+  static final Map<String, Map<String, dynamic>> _pureTextFieldMetaCache =
+      <String, Map<String, dynamic>>{};
+
+  /// Cached pure matchSparse args for the direct-WMBP sync fast path.
+  ({
+    String field,
+    SparseVectorData query,
+    double weight,
+    double? minScore,
+  })? _cachedPureSparse;
+
+  static const int _pureMatchSparseOkFlags = QueryClauseMask.matchSparse;
+  static final Map<String, Map<String, dynamic>> _pureSparseFieldMetaCache =
+      <String, Map<String, dynamic>>{};
+
   QueryBuilder(super.db, super.tableName, {super.binding});
 
   void _invalidateFuture() {
@@ -54,18 +92,33 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   void _onChanged() {
     _invalidateFuture();
     // Invalidate at write-time so execute() only needs a null check.
-    final cached = _cachedPureVector;
-    if (cached == null) return;
-    if (_conditionCount != 1 ||
-        (_clauseFlags & ~_pureMatchVectorOkFlags) != 0) {
-      _cachedPureVector = null;
+    final cachedVec = _cachedPureVector;
+    if (cachedVec != null) {
+      if (_conditionCount != 1 ||
+          (_clauseFlags & ~_pureMatchVectorOkFlags) != 0) {
+        _cachedPureVector = null;
+      }
+    }
+    final cachedTxt = _cachedPureText;
+    if (cachedTxt != null) {
+      if (_conditionCount != 1 ||
+          (_clauseFlags & ~_pureMatchTextOkFlags) != 0) {
+        _cachedPureText = null;
+      }
+    }
+    final cachedSparse = _cachedPureSparse;
+    if (cachedSparse != null) {
+      if (_conditionCount != 1 ||
+          (_clauseFlags & ~_pureMatchSparseOkFlags) != 0) {
+        _cachedPureSparse = null;
+      }
     }
   }
 
   void _prewarm({String? nextCursor, int? nextOffset}) {
     // ANN / hybrid vector pages re-run full search for each offset; a background
     // next-page prewarm roughly doubles throughput cost under query storms.
-    if (_clauseFlags & QueryClauseMask.matchVector != 0) return;
+    if (_clauseFlags & QueryClauseMask.retrieval != 0) return;
     if (!_db.isLowPressure()) return;
 
     // Safety Threshold: Avoid pre-warming excessively large result sets.
@@ -128,11 +181,16 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   QueryBuilder select(List<dynamic> fields) {
     _selectedFields = [];
     _extraAggregations = [];
+    _hasComplexProjection = false;
     for (final field in fields) {
       if (field is String) {
         _selectedFields!.add(field);
+        if (!_hasComplexProjection && _isComplexField(field)) {
+          _hasComplexProjection = true;
+        }
       } else if (field is QueryAggregation) {
         _extraAggregations.add(field);
+        _hasComplexProjection = true;
       } else {
         throw DbException([
           InvalidArgumentStatus(
@@ -159,11 +217,16 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   QueryBuilder selectAgg(List<dynamic> items) {
     _selectedFields = [];
     _aggregations = [];
+    _hasComplexProjection = false;
     for (var item in items) {
       if (item is String) {
         _selectedFields!.add(item);
+        if (!_hasComplexProjection && _isComplexField(item)) {
+          _hasComplexProjection = true;
+        }
       } else if (item is QueryAggregation) {
         _aggregations!.add(item);
+        _hasComplexProjection = true;
       } else {
         throw DbException([
           InvalidArgumentStatus(
@@ -445,7 +508,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   /// [queryVector] Query target vector (same type as [ToStore.vectorSearch]).
   /// [weight] Fusion weight multiplier (default: 1.0).
   /// [searchDepth] ANN search depth (`>= 1`). Larger values typically raise
-  /// recall and latency. Approximate nearest neighbor — not a guaranteed
+  /// recall and latency. Approximate nearest neighbor is not a guaranteed
   /// recall@K. When null, uses [VectorIndexConfig.defaultSearchDepth] (`50`).
   /// [distanceThreshold] Maximum distance threshold to consider as a candidate.
   /// [minScore] Minimum normalized similarity score threshold (0.0 ~ 1.0).
@@ -496,6 +559,126 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       minScore: minScore,
     );
     _clauseFlags |= QueryClauseMask.matchVector;
+    _onChanged();
+    return this;
+  }
+
+  /// Set how multi-channel recall scores are combined (not a recall channel).
+  ///
+  /// Applies only to multi-way recall. Default is
+  /// [RetrievalFusionMethod.weightedScore] (weighted sum of aligned channel
+  /// scores divided by the query's total channel weight; a miss contributes 0).
+  /// [RetrievalFusionMethod.rrf] is relative score from ranks
+  /// inside each channel's result set. One-channel queries ignore this setting.
+  QueryBuilder fusionMethod(RetrievalFusionMethod method) {
+    _fusionMethod = method;
+    _onChanged();
+    return this;
+  }
+
+  /// Match records by text retrieval on an [IndexType.text] field.
+  ///
+  /// [query] is either raw text or pre-tokenized weights.
+  /// [operator] is [TextMatchOperator.or] (any term) or [TextMatchOperator.and]
+  /// (every term).
+  /// [weight] is the fusion weight when this branch is combined with others.
+  /// [minScore] drops hits whose normalized score is below the threshold.
+  QueryBuilder matchText(
+    String field,
+    TextQuery query, {
+    TextMatchOperator operator = TextMatchOperator.or,
+    double weight = 1.0,
+    double? minScore,
+  }) {
+    _conditionCount++;
+    _ensureConditionTree();
+    _condition!.matchText(
+      field,
+      query,
+      operator: operator,
+      weight: weight,
+      minScore: minScore,
+    );
+    _clauseFlags |= QueryClauseMask.matchText;
+    _onChanged();
+    if (_conditionCount == 1) {
+      _cachedPureText = (
+        field: field,
+        query: query,
+        operator: operator,
+        weight: weight,
+        minScore: minScore,
+      );
+    }
+    return this;
+  }
+
+  /// OR branch with text retrieval.
+  QueryBuilder orMatchText(
+    String field,
+    TextQuery query, {
+    TextMatchOperator operator = TextMatchOperator.or,
+    double weight = 1.0,
+    double? minScore,
+  }) {
+    _conditionCount++;
+    _ensureConditionTree();
+    _condition!.orMatchText(
+      field,
+      query,
+      operator: operator,
+      weight: weight,
+      minScore: minScore,
+    );
+    _clauseFlags |= QueryClauseMask.matchText;
+    _onChanged();
+    return this;
+  }
+
+  /// Match records by neural sparse retrieval on an [IndexType.sparse] field.
+  QueryBuilder matchSparse(
+    String field,
+    SparseVectorData query, {
+    double weight = 1.0,
+    double? minScore,
+  }) {
+    _conditionCount++;
+    _ensureConditionTree();
+    _condition!.matchSparse(
+      field,
+      query,
+      weight: weight,
+      minScore: minScore,
+    );
+    _clauseFlags |= QueryClauseMask.matchSparse;
+    _onChanged();
+    if (_conditionCount == 1) {
+      _cachedPureSparse = (
+        field: field,
+        query: query,
+        weight: weight,
+        minScore: minScore,
+      );
+    }
+    return this;
+  }
+
+  /// OR branch with neural sparse retrieval.
+  QueryBuilder orMatchSparse(
+    String field,
+    SparseVectorData query, {
+    double weight = 1.0,
+    double? minScore,
+  }) {
+    _conditionCount++;
+    _ensureConditionTree();
+    _condition!.orMatchSparse(
+      field,
+      query,
+      weight: weight,
+      minScore: minScore,
+    );
+    _clauseFlags |= QueryClauseMask.matchSparse;
     _onChanged();
     return this;
   }
@@ -760,6 +943,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     }
     builder._enableQueryCache = _enableQueryCache;
     builder._queryCacheExpiry = _queryCacheExpiry;
+    builder._fusionMethod = _fusionMethod;
     builder._distinct = _distinct;
     if (_distinctFields != null) {
       builder._distinctFields = List<String>.from(_distinctFields!);
@@ -772,8 +956,35 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       builder._aggregations = List<QueryAggregation>.from(_aggregations!);
     }
     builder._cachedPureVector = _cachedPureVector;
+    builder._cachedPureText = _cachedPureText;
+    builder._cachedPureSparse = _cachedPureSparse;
+    builder._hasComplexProjection = _hasComplexProjection;
 
     return builder;
+  }
+
+  @override
+  Future<R> then<R>(
+    FutureOr<R> Function(QueryResult<Map<String, dynamic>> value) onValue, {
+    Function? onError,
+  }) {
+    final pureText = _cachedPureText;
+    if (pureText != null && _future == null) {
+      final syncResult = _tryExecutePureMatchTextSync(pureText);
+      if (syncResult != null) {
+        return _SyncFuture<QueryResult<Map<String, dynamic>>>(syncResult)
+            .then<R>(onValue, onError: onError);
+      }
+    }
+    final pureSparse = _cachedPureSparse;
+    if (pureSparse != null && _future == null) {
+      final syncResult = _tryExecutePureMatchSparseSync(pureSparse);
+      if (syncResult != null) {
+        return _SyncFuture<QueryResult<Map<String, dynamic>>>(syncResult)
+            .then<R>(onValue, onError: onError);
+      }
+    }
+    return super.then(onValue, onError: onError);
   }
 
   @override
@@ -800,7 +1011,31 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       return queryResult;
     }
 
-    final queryResult = QueryResult.success(
+    final queryResult = _buildQueryResult(result);
+
+    // Trigger background pre-warm for next page if conditions are met (only on first execution).
+    // Skip for matchVector: next-page ANN re-searches from scratch and would ~2x QPS cost.
+    if (isFirstRun &&
+        queryResult.hasMore &&
+        (_clauseFlags & QueryClauseMask.retrieval) == 0) {
+      if (queryResult.nextCursorToken != null) {
+        _prewarm(nextCursor: queryResult.nextCursorToken);
+      } else {
+        // Offset-based pagination pre-warm: calculate and warm up next page
+        // Use default limit if not specified to ensure correct page boundary
+        final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
+        if (effectiveLimit > 0) {
+          final currentOffset = _offset ?? 0;
+          _prewarm(nextOffset: currentOffset + effectiveLimit);
+        }
+      }
+    }
+
+    return queryResult;
+  }
+
+  QueryResult<Map<String, dynamic>> _buildQueryResult(ExecuteResult result) {
+    return QueryResult.success(
       data: result.records,
       retrieval: result.retrieval,
       prevCursor: result.prevCursor,
@@ -836,26 +1071,6 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
             }
           : null,
     );
-
-    // Trigger background pre-warm for next page if conditions are met (only on first execution).
-    // Skip for matchVector: next-page ANN re-searches from scratch and would ~2x QPS cost.
-    if (isFirstRun &&
-        queryResult.hasMore &&
-        (_clauseFlags & QueryClauseMask.matchVector) == 0) {
-      if (queryResult.nextCursorToken != null) {
-        _prewarm(nextCursor: queryResult.nextCursorToken);
-      } else {
-        // Offset-based pagination pre-warm: calculate and warm up next page
-        // Use default limit if not specified to ensure correct page boundary
-        final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
-        if (effectiveLimit > 0) {
-          final currentOffset = _offset ?? 0;
-          _prewarm(nextOffset: currentOffset + effectiveLimit);
-        }
-      }
-    }
-
-    return queryResult;
   }
 
   /// Watch for changes matching this query
@@ -999,6 +1214,24 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       }
     }
 
+    // Pure matchText: direct WMBP fast path -- avoid QueryExecutor planning/lock overhead.
+    final pureText = _cachedPureText;
+    if (pureText != null && !onlyCount && extraAggregations == null) {
+      pureResult = await _executePureMatchText(pureText);
+      if (pureResult != null && pureResult.isProjected) {
+        return pureResult;
+      }
+    }
+
+    // Pure matchSparse: same sync-first WMBP fast path as matchText.
+    final pureSparse = _cachedPureSparse;
+    if (pureSparse != null && !onlyCount && extraAggregations == null) {
+      pureResult = await _executePureMatchSparse(pureSparse);
+      if (pureResult != null && pureResult.isProjected) {
+        return pureResult;
+      }
+    }
+
     // Execute Query including extra inline aggregations defined in select()
     final combinedAggs = <QueryAggregation>[];
     if (_aggregations != null) combinedAggs.addAll(_aggregations!);
@@ -1024,10 +1257,11 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
               clauseFlags: _clauseFlags,
               applyPromoteResultTransform: true,
               selectedFields: _selectedFields,
+              fusionMethod: _fusionMethod,
             ) ??
         const ExecuteResult.empty();
 
-    // Fast-path: already projected / point lookup — skip post-processing.
+    // Fast-path: already projected / point lookup -- skip post-processing.
     if (result.isProjected ||
         (result.isPointDirect &&
             (_selectedFields == null || _selectedFields!.isEmpty))) {
@@ -1072,8 +1306,9 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
 
         for (final field in _selectedFields!) {
           // handle field alias (e.g. "name as username")
+          final hasAlias = _asPattern.hasMatch(field);
           final fieldName =
-              field.contains(' as ') ? field.split(' as ')[0].trim() : field;
+              hasAlias ? field.split(_asPattern)[0].trim() : field;
           final aliasName = _getFieldAlias(field);
 
           // handle field with table name prefix (e.g. "users.id")
@@ -1240,9 +1475,9 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
         for (final field in _selectedFields!) {
           // handle field alias (e.g. "name as username")
           // detect AS keyword in case-insensitive way
-          final asPattern = RegExp(r'\s+[aA][sS]\s+');
-          final hasAlias = asPattern.hasMatch(field);
-          final fieldName = hasAlias ? field.split(asPattern)[0].trim() : field;
+          final hasAlias = _asPattern.hasMatch(field);
+          final fieldName =
+              hasAlias ? field.split(_asPattern)[0].trim() : field;
           final aliasName = _getFieldAlias(field);
 
           dynamic fieldValue;
@@ -1335,7 +1570,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     return processedResults;
   }
 
-  /// Pure [matchVector] ANN path — same core call as [DataStoreImpl.vectorSearch],
+  /// Pure [matchVector] ANN path -- same core call as [DataStoreImpl.vectorSearch],
   /// avoiding QueryExecutor planning / cache / normalize overhead.
   Future<ExecuteResult?> _executePureMatchVector(
     ({
@@ -1347,6 +1582,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       double? minScore,
     }) pure,
   ) async {
+    final stopwatch = Stopwatch()..start();
     final vim = _db.vectorIndexManager;
     if (vim == null) return null;
 
@@ -1360,7 +1596,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
     if (effectiveLimit <= 0) return null;
 
-    // Exact topK — same ANN cost as db.vectorSearch(topK).
+    // Exact topK -- same ANN cost as db.vectorSearch(topK).
     // hasMore is inferred from a full page (rare false-positive when corpus
     // size equals topK exactly).
     var vecResults = await vim.vectorSearch(
@@ -1384,14 +1620,16 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     final page = vecResults;
 
     if (page.isEmpty) {
-      return const ExecuteResult(
-        records: [],
-        retrieval: RetrievalContext(
+      stopwatch.stop();
+      return ExecuteResult(
+        records: const [],
+        retrieval: const RetrievalContext(
           entries: [],
-          fusionMethod: RetrievalFusionMethod.single,
+          fusionMethod: null,
         ),
         count: 0,
         isProjected: true,
+        executionTimeMs: stopwatch.elapsedMilliseconds,
       );
     }
 
@@ -1399,7 +1637,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     final selected = _selectedFields;
     final bool pkOnly =
         selected != null && selected.length == 1 && selected.first == pkField;
-    // No select / PK-only → final shape; other selects remap in post-process.
+    // No select / PK-only -- final shape; other selects remap in post-process.
     final bool projected = selected == null || selected.isEmpty || pkOnly;
 
     final records = <Map<String, dynamic>>[];
@@ -1412,7 +1650,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
         entries.add(RetrievalEntry(
           score: cand.score,
           channel: RetrievalChannel.vector,
-          rawScore: cand.distance,
+          rawScore: cand.score,
           meta: {
             'distance': cand.distance,
             'field': fieldName,
@@ -1422,7 +1660,8 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     } else {
       final pks = [for (final c in page) c.primaryKey];
       final recordsMap =
-          await _db.tableDataManager.queryRecordsMapBatch(table, pks);
+          _db.tableDataManager.queryRecordsMapBatchSync(table, pks) ??
+              await _db.tableDataManager.queryRecordsMapBatch(table, pks);
       for (final cand in page) {
         final rec = recordsMap[cand.primaryKey];
         if (rec == null) continue;
@@ -1430,7 +1669,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
         entries.add(RetrievalEntry(
           score: cand.score,
           channel: RetrievalChannel.vector,
-          rawScore: cand.distance,
+          rawScore: cand.score,
           meta: {
             'distance': cand.distance,
             'field': fieldName,
@@ -1439,15 +1678,654 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
       }
     }
 
+    stopwatch.stop();
     return ExecuteResult(
       records: records,
       retrieval: RetrievalContext(
         entries: entries,
-        fusionMethod: RetrievalFusionMethod.single,
+        fusionMethod: null,
       ),
       hasMore: hasMore,
       count: records.length,
       isProjected: projected,
+      executionTimeMs: stopwatch.elapsedMilliseconds,
+    );
+  }
+
+  /// Pure [matchText] retrieval path -- direct call to [WmbpIndexManager.searchTextSync],
+  /// bypassing QueryExecutor planning / lock / tree walk overhead.
+  Future<ExecuteResult?> _executePureMatchText(
+    ({
+      String field,
+      TextQuery query,
+      TextMatchOperator operator,
+      double weight,
+      double? minScore,
+    }) pure,
+  ) async {
+    final stopwatch = Stopwatch()..start();
+    final manager = _db.wmbpIndexManager;
+    if (manager == null) return null;
+
+    final table = _db.getTableContextSync(_tableName) ??
+        await _db.getTableContext(_tableName);
+    // Skip when promote dual-write is active (field remap required).
+    if (_db.migrationManager?.getPromoteRuntime(table.tableUid) != null) {
+      return null;
+    }
+
+    final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
+    if (effectiveLimit <= 0) return null;
+
+    final hits = manager.searchTextSync(
+          table: table,
+          fieldName: pure.field,
+          query: pure.query,
+          topK: effectiveLimit,
+          operator: pure.operator,
+        ) ??
+        await manager.searchText(
+          table: table,
+          fieldName: pure.field,
+          query: pure.query,
+          topK: effectiveLimit,
+          operator: pure.operator,
+        );
+
+    var candidates = hits;
+    if (pure.minScore != null) {
+      final minScore = pure.minScore!;
+      candidates = [
+        for (final hit in candidates)
+          if (WmbpScore.relevanceFromRaw(
+                  WmbpScore.textRawScore(hit.rawUnits)) >=
+              minScore)
+            hit
+      ];
+    }
+
+    final hasMore = candidates.length >= effectiveLimit;
+    final page = candidates;
+
+    if (page.isEmpty) {
+      stopwatch.stop();
+      return ExecuteResult(
+        records: const [],
+        retrieval: const RetrievalContext(
+          entries: [],
+          fusionMethod: null,
+        ),
+        count: 0,
+        isProjected: true,
+        executionTimeMs: stopwatch.elapsedMilliseconds,
+      );
+    }
+
+    final selected = _selectedFields;
+    final bool fullRecord = selected == null || selected.isEmpty;
+    final pkField = table.schema.primaryKey;
+    final bool pkOnly =
+        !fullRecord && selected.length == 1 && selected.first == pkField;
+    final bool simpleSelect = !fullRecord && !pkOnly && !_hasComplexProjection;
+    final bool projected = fullRecord || pkOnly || simpleSelect;
+
+    final fieldName = pure.field;
+    final fieldMeta =
+        _pureTextFieldMetaCache[fieldName] ??= {'field': fieldName};
+
+    if (pkOnly) {
+      final records = <Map<String, dynamic>>[];
+      final entries = <RetrievalEntry>[];
+      for (final hit in page) {
+        records.add(<String, dynamic>{pkField: hit.primaryKey});
+        final raw = WmbpScore.textRawScore(hit.rawUnits);
+        entries.add(RetrievalEntry(
+          score: WmbpScore.relevanceFromRaw(raw),
+          channel: RetrievalChannel.text,
+          rawScore: raw,
+          meta: fieldMeta,
+        ));
+      }
+      stopwatch.stop();
+      return ExecuteResult(
+        records: records,
+        retrieval: RetrievalContext(
+          entries: entries,
+          fusionMethod: null,
+        ),
+        hasMore: hasMore,
+        count: records.length,
+        isProjected: projected,
+        executionTimeMs: stopwatch.elapsedMilliseconds,
+      );
+    }
+
+    final pks = [for (final c in page) c.primaryKey];
+    final recordsMap =
+        _db.tableDataManager.queryRecordsMapBatchSync(table, pks) ??
+            await _db.tableDataManager.queryRecordsMapBatch(table, pks);
+
+    return _materializePureTextRecords(
+      page: page,
+      recordsMap: recordsMap,
+      hasMore: hasMore,
+      simpleSelect: simpleSelect,
+      projected: projected,
+      selected: selected,
+      fieldMeta: fieldMeta,
+      stopwatch: stopwatch,
+    );
+  }
+
+  /// Pure synchronous fast-path for in-memory WMBP queries.
+  ///
+  /// Resolves entirely synchronously when WMBP index caches and requested table
+  /// records are resident in memory (no Future / microtask hop). If WMBP hits are
+  /// computed synchronously but a record misses in memory, binds an async record-fetch
+  /// task to [_future] so the escalated execution does not re-run WMBP or
+  /// repeat minScore filtering.
+  QueryResult<Map<String, dynamic>>? _tryExecutePureMatchTextSync(
+    ({
+      String field,
+      TextQuery query,
+      TextMatchOperator operator,
+      double weight,
+      double? minScore,
+    }) pure,
+  ) {
+    final stopwatch = Stopwatch()..start();
+    if (!_db.isInitialized) return null;
+    if (_extraAggregations.isNotEmpty ||
+        (_aggregations != null && _aggregations!.isNotEmpty) ||
+        (_pendingForeignKeyJoins != null &&
+            _pendingForeignKeyJoins!.isNotEmpty)) {
+      return null;
+    }
+    final manager = _db.wmbpIndexManager;
+    if (manager == null) return null;
+
+    final table = _db.getTableContextSync(_tableName);
+    if (table == null) return null;
+    if (_db.migrationManager?.getPromoteRuntime(table.tableUid) != null) {
+      return null;
+    }
+
+    final selected = _selectedFields;
+    final bool fullRecord = selected == null || selected.isEmpty;
+    final pkField = table.schema.primaryKey;
+    final bool pkOnly =
+        !fullRecord && selected.length == 1 && selected.first == pkField;
+    final bool simpleSelect = !fullRecord && !pkOnly && !_hasComplexProjection;
+    if (!pkOnly && !fullRecord && !simpleSelect) return null;
+
+    final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
+    if (effectiveLimit <= 0) return null;
+
+    final hits = manager.searchTextSync(
+      table: table,
+      fieldName: pure.field,
+      query: pure.query,
+      topK: effectiveLimit,
+      operator: pure.operator,
+    );
+    if (hits == null) return null;
+
+    var candidates = hits;
+    if (pure.minScore != null) {
+      final minScore = pure.minScore!;
+      candidates = [
+        for (final hit in candidates)
+          if (WmbpScore.relevanceFromRaw(
+                  WmbpScore.textRawScore(hit.rawUnits)) >=
+              minScore)
+            hit
+      ];
+    }
+
+    final hasMore = candidates.length >= effectiveLimit;
+    final page = candidates;
+    final int pageLen = page.length;
+    final fieldName = pure.field;
+    final fieldMeta =
+        _pureTextFieldMetaCache[fieldName] ??= {'field': fieldName};
+
+    if (pageLen == 0) {
+      stopwatch.stop();
+      return _buildQueryResult(
+        ExecuteResult(
+          records: const [],
+          retrieval: const RetrievalContext(
+            entries: [],
+            fusionMethod: null,
+          ),
+          count: 0,
+          isProjected: true,
+          executionTimeMs: stopwatch.elapsedMilliseconds,
+        ),
+      );
+    }
+
+    if (pkOnly) {
+      final records = List<Map<String, dynamic>>.generate(
+        pageLen,
+        (i) => <String, dynamic>{pkField: page[i].primaryKey},
+        growable: false,
+      );
+      final entries = List<RetrievalEntry>.generate(
+        pageLen,
+        (i) {
+          final hit = page[i];
+          final raw = WmbpScore.textRawScore(hit.rawUnits);
+          return RetrievalEntry(
+            score: WmbpScore.relevanceFromRaw(raw),
+            channel: RetrievalChannel.text,
+            rawScore: raw,
+            meta: fieldMeta,
+          );
+        },
+        growable: false,
+      );
+      stopwatch.stop();
+      return _buildQueryResult(
+        ExecuteResult(
+          records: records,
+          retrieval: RetrievalContext(
+            entries: entries,
+            fusionMethod: null,
+          ),
+          hasMore: hasMore,
+          count: records.length,
+          isProjected: true,
+          executionTimeMs: stopwatch.elapsedMilliseconds,
+        ),
+      );
+    }
+
+    final pks = [for (final c in page) c.primaryKey];
+    final recordsMap =
+        _db.tableDataManager.queryRecordsMapBatchSync(table, pks);
+    if (recordsMap == null) {
+      _future = _completePureTextRecordsAsync(
+        table: table,
+        page: page,
+        pks: pks,
+        hasMore: hasMore,
+        simpleSelect: simpleSelect,
+        projected: true,
+        selected: selected,
+        fieldMeta: fieldMeta,
+        stopwatch: stopwatch,
+      );
+      return null;
+    }
+
+    return _buildQueryResult(
+      _materializePureTextRecords(
+        page: page,
+        recordsMap: recordsMap,
+        hasMore: hasMore,
+        simpleSelect: simpleSelect,
+        projected: true,
+        selected: selected,
+        fieldMeta: fieldMeta,
+        stopwatch: stopwatch,
+      ),
+    );
+  }
+
+  Future<ExecuteResult> _completePureTextRecordsAsync({
+    required TableContext table,
+    required List<WmbpHit> page,
+    required List<String> pks,
+    required bool hasMore,
+    required bool simpleSelect,
+    required bool projected,
+    required List<String>? selected,
+    required Map<String, dynamic> fieldMeta,
+    required Stopwatch stopwatch,
+  }) async {
+    final recordsMap =
+        await _db.tableDataManager.queryRecordsMapBatch(table, pks);
+    return _materializePureTextRecords(
+      page: page,
+      recordsMap: recordsMap,
+      hasMore: hasMore,
+      simpleSelect: simpleSelect,
+      projected: projected,
+      selected: selected,
+      fieldMeta: fieldMeta,
+      stopwatch: stopwatch,
+    );
+  }
+
+  ExecuteResult _materializePureTextRecords({
+    required List<WmbpHit> page,
+    required Map<String, Map<String, dynamic>> recordsMap,
+    required bool hasMore,
+    required bool simpleSelect,
+    required bool projected,
+    required List<String>? selected,
+    required Map<String, dynamic> fieldMeta,
+    required Stopwatch stopwatch,
+  }) {
+    final records = <Map<String, dynamic>>[];
+    final entries = <RetrievalEntry>[];
+    final pageLen = page.length;
+    final selectedCount = selected?.length ?? 0;
+    for (int i = 0; i < pageLen; i++) {
+      final hit = page[i];
+      final rec = recordsMap[hit.primaryKey];
+      if (rec == null) continue;
+      if (simpleSelect && selected != null) {
+        final projectedRecord = <String, dynamic>{};
+        for (int j = 0; j < selectedCount; j++) {
+          final f = selected[j];
+          final val = rec[f];
+          if (val != null) {
+            projectedRecord[f] = val;
+          } else if (rec.containsKey(f)) {
+            projectedRecord[f] = null;
+          }
+        }
+        records.add(projectedRecord);
+      } else {
+        records.add(rec);
+      }
+      final raw = WmbpScore.textRawScore(hit.rawUnits);
+      entries.add(RetrievalEntry(
+        score: WmbpScore.relevanceFromRaw(raw),
+        channel: RetrievalChannel.text,
+        rawScore: raw,
+        meta: fieldMeta,
+      ));
+    }
+    stopwatch.stop();
+    return ExecuteResult(
+      records: records,
+      retrieval: RetrievalContext(
+        entries: entries,
+        fusionMethod: null,
+      ),
+      hasMore: hasMore,
+      count: records.length,
+      isProjected: projected,
+      executionTimeMs: stopwatch.elapsedMilliseconds,
+    );
+  }
+
+  /// Pure [matchSparse] retrieval path — sync-first via [searchSparseSync].
+  Future<ExecuteResult?> _executePureMatchSparse(
+    ({
+      String field,
+      SparseVectorData query,
+      double weight,
+      double? minScore,
+    }) pure,
+  ) async {
+    final stopwatch = Stopwatch()..start();
+    final manager = _db.wmbpIndexManager;
+    if (manager == null) return null;
+
+    final table = _db.getTableContextSync(_tableName) ??
+        await _db.getTableContext(_tableName);
+    if (_db.migrationManager?.getPromoteRuntime(table.tableUid) != null) {
+      return null;
+    }
+
+    final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
+    if (effectiveLimit <= 0) return null;
+
+    final hits = manager.searchSparseSync(
+          table: table,
+          fieldName: pure.field,
+          query: pure.query,
+          topK: effectiveLimit,
+        ) ??
+        await manager.searchSparse(
+          table: table,
+          fieldName: pure.field,
+          query: pure.query,
+          topK: effectiveLimit,
+        );
+
+    var candidates = hits;
+    if (pure.minScore != null) {
+      final minScore = pure.minScore!;
+      candidates = [
+        for (final hit in candidates)
+          if (WmbpScore.relevanceFromRaw(
+                  WmbpScore.sparseRawScore(hit.rawUnits)) >=
+              minScore)
+            hit
+      ];
+    }
+
+    final hasMore = candidates.length >= effectiveLimit;
+    final page = candidates;
+
+    if (page.isEmpty) {
+      stopwatch.stop();
+      return ExecuteResult(
+        records: const [],
+        retrieval: const RetrievalContext(
+          entries: [],
+          fusionMethod: null,
+        ),
+        count: 0,
+        isProjected: true,
+        executionTimeMs: stopwatch.elapsedMilliseconds,
+      );
+    }
+
+    final selected = _selectedFields;
+    final bool fullRecord = selected == null || selected.isEmpty;
+    final pkField = table.schema.primaryKey;
+    final bool pkOnly =
+        !fullRecord && selected.length == 1 && selected.first == pkField;
+    final bool simpleSelect = !fullRecord && !pkOnly && !_hasComplexProjection;
+    final bool projected = fullRecord || pkOnly || simpleSelect;
+
+    final fieldName = pure.field;
+    final fieldMeta =
+        _pureSparseFieldMetaCache[fieldName] ??= {'field': fieldName};
+
+    if (pkOnly) {
+      final records = <Map<String, dynamic>>[];
+      final entries = <RetrievalEntry>[];
+      for (final hit in page) {
+        records.add(<String, dynamic>{pkField: hit.primaryKey});
+        final raw = WmbpScore.sparseRawScore(hit.rawUnits);
+        entries.add(RetrievalEntry(
+          score: WmbpScore.relevanceFromRaw(raw),
+          channel: RetrievalChannel.sparse,
+          rawScore: raw,
+          meta: fieldMeta,
+        ));
+      }
+      stopwatch.stop();
+      return ExecuteResult(
+        records: records,
+        retrieval: RetrievalContext(
+          entries: entries,
+          fusionMethod: null,
+        ),
+        hasMore: hasMore,
+        count: records.length,
+        isProjected: projected,
+        executionTimeMs: stopwatch.elapsedMilliseconds,
+      );
+    }
+
+    final pks = [for (final hit in page) hit.primaryKey];
+    final recordsMap =
+        _db.tableDataManager.queryRecordsMapBatchSync(table, pks) ??
+            await _db.tableDataManager.queryRecordsMapBatch(table, pks);
+    final records = <Map<String, dynamic>>[];
+    final entries = <RetrievalEntry>[];
+    for (final hit in page) {
+      final rec = recordsMap[hit.primaryKey];
+      if (rec == null) continue;
+      if (simpleSelect) {
+        final projectedRec = <String, dynamic>{};
+        for (final f in selected) {
+          if (rec.containsKey(f)) projectedRec[f] = rec[f];
+        }
+        records.add(projectedRec);
+      } else {
+        records.add(rec);
+      }
+      final raw = WmbpScore.sparseRawScore(hit.rawUnits);
+      entries.add(RetrievalEntry(
+        score: WmbpScore.relevanceFromRaw(raw),
+        channel: RetrievalChannel.sparse,
+        rawScore: raw,
+        meta: fieldMeta,
+      ));
+    }
+    stopwatch.stop();
+    return ExecuteResult(
+      records: records,
+      retrieval: RetrievalContext(
+        entries: entries,
+        fusionMethod: null,
+      ),
+      hasMore: hasMore,
+      count: records.length,
+      isProjected: projected,
+      executionTimeMs: stopwatch.elapsedMilliseconds,
+    );
+  }
+
+  QueryResult<Map<String, dynamic>>? _tryExecutePureMatchSparseSync(
+    ({
+      String field,
+      SparseVectorData query,
+      double weight,
+      double? minScore,
+    }) pure,
+  ) {
+    final stopwatch = Stopwatch()..start();
+    if (!_db.isInitialized) return null;
+    if (_extraAggregations.isNotEmpty ||
+        (_aggregations != null && _aggregations!.isNotEmpty) ||
+        (_pendingForeignKeyJoins != null &&
+            _pendingForeignKeyJoins!.isNotEmpty)) {
+      return null;
+    }
+    final manager = _db.wmbpIndexManager;
+    if (manager == null) return null;
+
+    final table = _db.getTableContextSync(_tableName);
+    if (table == null) return null;
+    if (_db.migrationManager?.getPromoteRuntime(table.tableUid) != null) {
+      return null;
+    }
+
+    final selected = _selectedFields;
+    final bool fullRecord = selected == null || selected.isEmpty;
+    final pkField = table.schema.primaryKey;
+    final bool pkOnly =
+        !fullRecord && selected.length == 1 && selected.first == pkField;
+    final bool simpleSelect = !fullRecord && !pkOnly && !_hasComplexProjection;
+    if (!pkOnly && !fullRecord && !simpleSelect) return null;
+
+    final effectiveLimit = _limit ?? _db.config.defaultQueryLimit;
+    if (effectiveLimit <= 0) return null;
+
+    final hits = manager.searchSparseSync(
+      table: table,
+      fieldName: pure.field,
+      query: pure.query,
+      topK: effectiveLimit,
+    );
+    if (hits == null) return null;
+
+    var candidates = hits;
+    if (pure.minScore != null) {
+      final minScore = pure.minScore!;
+      candidates = [
+        for (final hit in candidates)
+          if (WmbpScore.relevanceFromRaw(
+                  WmbpScore.sparseRawScore(hit.rawUnits)) >=
+              minScore)
+            hit
+      ];
+    }
+
+    final hasMore = candidates.length >= effectiveLimit;
+    final page = candidates;
+    final fieldName = pure.field;
+    final fieldMeta =
+        _pureSparseFieldMetaCache[fieldName] ??= {'field': fieldName};
+
+    if (page.isEmpty) {
+      stopwatch.stop();
+      return _buildQueryResult(
+        ExecuteResult(
+          records: const [],
+          retrieval: const RetrievalContext(
+            entries: [],
+            fusionMethod: null,
+          ),
+          count: 0,
+          isProjected: true,
+          executionTimeMs: stopwatch.elapsedMilliseconds,
+        ),
+      );
+    }
+
+    final records = <Map<String, dynamic>>[];
+    final entries = <RetrievalEntry>[];
+    if (pkOnly) {
+      for (final hit in page) {
+        records.add(<String, dynamic>{pkField: hit.primaryKey});
+        final raw = WmbpScore.sparseRawScore(hit.rawUnits);
+        entries.add(RetrievalEntry(
+          score: WmbpScore.relevanceFromRaw(raw),
+          channel: RetrievalChannel.sparse,
+          rawScore: raw,
+          meta: fieldMeta,
+        ));
+      }
+    } else {
+      final pks = [for (final hit in page) hit.primaryKey];
+      final recordsMap =
+          _db.tableDataManager.queryRecordsMapBatchSync(table, pks);
+      if (recordsMap == null) return null;
+      for (final hit in page) {
+        final rec = recordsMap[hit.primaryKey];
+        if (rec == null) continue;
+        if (simpleSelect) {
+          final projectedRec = <String, dynamic>{};
+          for (final f in selected) {
+            if (rec.containsKey(f)) projectedRec[f] = rec[f];
+          }
+          records.add(projectedRec);
+        } else {
+          records.add(rec);
+        }
+        final raw = WmbpScore.sparseRawScore(hit.rawUnits);
+        entries.add(RetrievalEntry(
+          score: WmbpScore.relevanceFromRaw(raw),
+          channel: RetrievalChannel.sparse,
+          rawScore: raw,
+          meta: fieldMeta,
+        ));
+      }
+    }
+    stopwatch.stop();
+    return _buildQueryResult(
+      ExecuteResult(
+        records: records,
+        retrieval: RetrievalContext(
+          entries: entries,
+          fusionMethod: null,
+        ),
+        hasMore: hasMore,
+        count: records.length,
+        isProjected: true,
+        executionTimeMs: stopwatch.elapsedMilliseconds,
+      ),
     );
   }
 
@@ -1455,9 +2333,8 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   /// Support any case format of AS keyword
   String _getFieldAlias(String field) {
     // Use regular expression to match AS keyword case-insensitively
-    final asPattern = RegExp(r'\s+[aA][sS]\s+');
-    if (asPattern.hasMatch(field)) {
-      final parts = field.split(asPattern);
+    if (_asPattern.hasMatch(field)) {
+      final parts = field.split(_asPattern);
       if (parts.length > 1) {
         final alias = parts[1].trim();
         // Validate alias format, only allow letters, numbers, and underscores

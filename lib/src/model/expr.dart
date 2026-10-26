@@ -117,7 +117,7 @@ class FunctionCall extends ExprNode {
   String toString() => 'FunctionCall($functionName, $arguments)';
 }
 
-/// Predicate: true when the current operation is an update (e.g. upsert matched existing row).
+/// Predicate: true when the current operation is an update (e.g. upsert matched existing record).
 class IsUpdate extends ExprNode {
   const IsUpdate();
 
@@ -125,7 +125,7 @@ class IsUpdate extends ExprNode {
   String toString() => 'IsUpdate()';
 }
 
-/// Predicate: true when the current operation is an insert (e.g. upsert inserted new row).
+/// Predicate: true when the current operation is an insert (e.g. upsert inserted new record).
 class IsInsert extends ExprNode {
   const IsInsert();
 
@@ -310,10 +310,10 @@ class Expr {
   /// ```
   static FunctionCall abs(ExprNode x) => FunctionCall('abs', [x]);
 
-  /// Predicate: true when the current operation is an update (e.g. upsert matched existing row).
+  /// Predicate: true when the current operation is an update (e.g. upsert matched existing record).
   static IsUpdate isUpdate() => const IsUpdate();
 
-  /// Predicate: true when the current operation is an insert (e.g. upsert inserted new row).
+  /// Predicate: true when the current operation is an insert (e.g. upsert inserted new record).
   static IsInsert isInsert() => const IsInsert();
 
   /// Conditional: if condition then thenValue else elseValue.

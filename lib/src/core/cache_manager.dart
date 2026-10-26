@@ -69,6 +69,11 @@ final class CacheManager {
       } catch (e) {
         Logger.warn('Evict index page cache failed', rawError: e);
       }
+      try {
+        await _dataStore.wmbpIndexManager?.evictCaches(ratio: ratio);
+      } catch (e) {
+        Logger.warn('Evict WMBP index cache failed', rawError: e);
+      }
     });
 
     mm.registerCacheEvictionCallback(MemoryQuotaType.vectorIndex, (
@@ -176,6 +181,7 @@ final class CacheManager {
     _dataStore.queryExecutor.clearAllPlanCache();
     _dataStore.tableTreePartitionManager?.clearPageCacheSync();
     _dataStore.indexTreePartitionManager?.clearPageCacheSync();
+    _dataStore.wmbpIndexManager?.clearAll();
     _dataStore.weightManager?.clearMemory();
     _dataStore.clearAllTtlPlanCache();
 
@@ -195,6 +201,7 @@ final class CacheManager {
     bool invalidateIndexMeta = true,
     bool invalidateIndexPages = true,
     bool invalidateVectorCache = true,
+    bool invalidateWmbpCache = true,
     bool invalidateForeignKey = true,
     bool invalidateCompactionHints = true,
     bool removeTableState = false,
@@ -233,6 +240,10 @@ final class CacheManager {
 
       if (invalidateVectorCache) {
         _dataStore.vectorIndexManager?.clearCacheForTable(table.tableUid);
+      }
+
+      if (invalidateWmbpCache) {
+        _dataStore.wmbpIndexManager?.clearTable(table.tableUid);
       }
 
       if (invalidateForeignKey) {

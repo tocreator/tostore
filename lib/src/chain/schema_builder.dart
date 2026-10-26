@@ -1,14 +1,14 @@
 import '../core/data_store_impl.dart';
-import '../model/migration_task.dart';
-import '../model/table_schema.dart';
-import '../interface/future_builder_mixin.dart';
 import '../handler/platform_handler.dart';
+import '../interface/future_builder_mixin.dart';
 import '../model/db_exception.dart';
+import '../model/migration_task.dart';
+import '../model/migration_write_mode.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/schema_update_result.dart';
-import '../model/migration_write_mode.dart';
 import '../model/table_identity.dart';
+import '../model/table_schema.dart';
 
 /// Schema builder for chain operations
 class SchemaBuilder with FutureBuilderMixin<SchemaUpdateResult> {
@@ -127,13 +127,20 @@ class SchemaBuilder with FutureBuilderMixin<SchemaUpdateResult> {
         ),
       ]);
     }
-    if (type == IndexType.vector) {
+    if (type == IndexType.vector ||
+        type == IndexType.text ||
+        type == IndexType.sparse) {
+      final kind = type == IndexType.vector
+          ? 'Vector'
+          : type == IndexType.text
+              ? 'Text'
+              : 'Sparse';
       if (fields.length != 1) {
         throw DbException([
           SchemaValidationStatus(
             type: ResultType.devInvalidSchemaIndexType,
             message:
-                'Vector index on table "$_tableName" can only be created on a single field, but ${fields.length} fields were specified (${fields.join(', ')}).',
+                '$kind index on table "$_tableName" can only be created on a single field, but ${fields.length} fields were specified (${fields.join(', ')}).',
             tableName: _tableName,
             field: fields.join(','),
             wrongValue: fields.length,
@@ -144,8 +151,7 @@ class SchemaBuilder with FutureBuilderMixin<SchemaUpdateResult> {
         throw DbException([
           SchemaValidationStatus(
             type: ResultType.devInvalidSchemaIndexType,
-            message:
-                'Vector index on table "$_tableName" cannot be unique. Vector indices do not support unique constraints.',
+            message: '$kind index on table "$_tableName" cannot be unique.',
             tableName: _tableName,
             field: fields.first,
             wrongValue: true,

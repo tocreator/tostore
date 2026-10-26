@@ -13,6 +13,9 @@ enum EncryptionDomain {
   /// Vector / NGH pages when encrypted under [EncryptionScope.full].
   vectorIndex,
 
+  /// Text and sparse index pages when encrypted under [EncryptionScope.full].
+  textIndex,
+
   /// Table partition page0 TableDataMeta shells (incl. empty trees).
   tableMeta,
 
@@ -42,6 +45,7 @@ abstract final class EncryptionDomainPolicy {
       case EncryptionDomain.tableData:
       case EncryptionDomain.btreeIndex:
       case EncryptionDomain.vectorIndex:
+      case EncryptionDomain.textIndex:
       case EncryptionDomain.tableMeta:
       case EncryptionDomain.indexMeta:
       case EncryptionDomain.migrationMeta:
@@ -63,6 +67,7 @@ abstract final class EncryptionDomainPolicy {
       case EncryptionDomain.tableData:
       case EncryptionDomain.btreeIndex:
       case EncryptionDomain.vectorIndex:
+      case EncryptionDomain.textIndex:
       case EncryptionDomain.tableMeta:
       case EncryptionDomain.indexMeta:
       case EncryptionDomain.migrationMeta:
@@ -76,6 +81,7 @@ abstract final class EncryptionDomainPolicy {
       case EncryptionDomain.tableData:
       case EncryptionDomain.btreeIndex:
       case EncryptionDomain.vectorIndex:
+      case EncryptionDomain.textIndex:
         return true;
       case EncryptionDomain.tableMeta:
       case EncryptionDomain.indexMeta:
@@ -97,6 +103,7 @@ abstract final class EncryptionDomainPolicy {
       case EncryptionDomain.tableData:
       case EncryptionDomain.btreeIndex:
       case EncryptionDomain.vectorIndex:
+      case EncryptionDomain.textIndex:
       case EncryptionDomain.wal:
       case EncryptionDomain.pageRedoLog:
       case EncryptionDomain.transactionLog:
@@ -108,6 +115,7 @@ abstract final class EncryptionDomainPolicy {
   static bool isFullScopeEncodingDomain(EncryptionDomain domain) {
     switch (domain) {
       case EncryptionDomain.vectorIndex:
+      case EncryptionDomain.textIndex:
       case EncryptionDomain.migrationMeta:
         return true;
       case EncryptionDomain.tableData:

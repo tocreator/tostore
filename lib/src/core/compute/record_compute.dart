@@ -71,10 +71,10 @@ Map<String, dynamic>? validateAndProcessRecordPure({
     } else {
       var needs = false;
       for (final field in fields) {
-        if (field.maxLength != null ||
-            field.minLength != null ||
-            field.minValue != null ||
-            field.maxValue != null) {
+        // Length/range constraints, plus vector width (dimensions) which is
+        // enforced in FieldSchema.checkConstraints — must not skip that pass
+        // for embeddings-only schemas (no maxLength/minValue).
+        if (field.hasValueConstraints) {
           needs = true;
           break;
         }

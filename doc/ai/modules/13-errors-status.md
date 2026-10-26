@@ -40,7 +40,7 @@ Both channels share the same `code` / `codeKey` / `ResultType` system.
 | `firstStatus` / `firstType` | First / primary diagnostic |
 | `message` | Human summary (batched messages capped) |
 
-Partial batch outcome: `hasErrors && successCount > 0` (inspect `statuses` per row).
+Partial batch outcome: `hasErrors && successCount > 0` (inspect `statuses` per record).
 
 ```dart
 final result = await db.insert('users', data);
@@ -52,7 +52,7 @@ if (result.hasErrors) {
 ```
 
 ```dart
-final batch = await db.batchInsert('users', rows);
+final batch = await db.batchInsert('users', records);
 if (batch.hasErrors) {
   for (final s in batch.statuses) {
     if (s is ConstraintStatus) { /* fields, tableName, … */ }
@@ -67,7 +67,7 @@ if (batch.hasErrors) {
 | Member | Meaning |
 | :--- | :--- |
 | `type` / `hasErrors` | Overall status (`hasErrors` ⇔ `type != success`) |
-| `data` | Rows |
+| `data` | records |
 | `message` | Detail |
 | `retrieval` | Vector/hybrid context |
 | Pagination | `hasMore`/`hasPrev`, `next`/`prev`, cursor tokens (see Query module) |

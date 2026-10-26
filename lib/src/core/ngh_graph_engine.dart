@@ -1224,7 +1224,7 @@ class NghGraphEngine {
 
   /// Put [page] only when it fits under [maxNavBytes] (no overshoot → no LRU thrash).
   ///
-  /// Packs 48-D search rows before sizing so the ledger matches the search-hot
+  /// Packs 48-D search records before sizing so the ledger matches the search-hot
   /// footprint (avoid under-counting then silently overflowing).
   bool _tryPutNavInternalWithinBudget({
     required TableUid tableUid,
@@ -3312,6 +3312,15 @@ class NghGraphEngine {
     Set<String>? pendingDeletePks,
   }) {
     scratch.slotHeap.reset(planCandSlots);
+    var qSquaredNorm = 0.0;
+    if (!isCosine && !isIP) {
+      final int n =
+          dimensions < searchQuery.length ? dimensions : searchQuery.length;
+      for (int d = 0; d < n; d++) {
+        final double v = searchQuery[d];
+        qSquaredNorm += v * v;
+      }
+    }
     final stampCheck = scratch.visitedTag;
     final stamp = scratch.currentStamp;
     final heap = scratch.slotHeap;
@@ -3492,7 +3501,9 @@ class NghGraphEngine {
     final q = searchQuery;
     final dim = dimensions;
     var resultHeap = scratch.resultHeap;
-    if (resultHeap == null || resultHeap.capacity < topK) {
+    // Must match [topK] exactly: a larger leftover heap (prior search with
+    // bigger topK) would otherwise return more than the caller asked for.
+    if (resultHeap == null || resultHeap.capacity != topK) {
       resultHeap = _FixedHeap(topK, maxHeap: true);
       scratch.resultHeap = resultHeap;
     } else {
@@ -3550,33 +3561,28 @@ class NghGraphEngine {
         } else if (isIP) {
           dist = -ip;
         } else {
-          dist = max(0.0, 1.0 + slot.squaredNorm - 2.0 * ip);
+          final double d2 = qSquaredNorm + slot.squaredNorm - 2.0 * ip;
+          dist = d2 < 0 ? 0.0 : d2;
         }
       } else {
-        final sSimd = slot.low48DSimd ?? slot.getLow48DSimd(dim);
-        final ip = innerProduct48Reg(
-          q0,
-          q1,
-          q2,
-          q3,
-          q4,
-          q5,
-          q6,
-          q7,
-          q8,
-          q9,
-          q10,
-          q11,
-          sSimd,
-          0,
-        );
+        // Rescore from SQ8. The 48-d sketch is L2-normalized, so it is not
+        // a raw inner product or a squared L2.
+        double dot = 0.0;
+        final codes = slot.sq8Codes;
+        final int n = dim < codes.length ? dim : codes.length;
+        for (int d = 0; d < n; d++) {
+          dot += q[d] * codes[d];
+        }
+        final ip = slot.offset * qFullSum + slot.scale * dot;
         if (isCosine) {
-          dist = ip >= 1.0 ? 0.0 : (ip <= 0.0 ? 1.0 : 1.0 - ip);
+          final sn = slot.squaredNorm;
+          final cosSim = (sn > 0.99 && sn < 1.01) ? ip : ip / sqrt(sn);
+          dist = cosSim >= 1.0 ? 0.0 : (cosSim <= 0.0 ? 1.0 : 1.0 - cosSim);
         } else if (isIP) {
           dist = -ip;
         } else {
-          // Both sketches are L2-normalized → ||q-x||² = 2-2⟨q,x⟩.
-          dist = max(0.0, 2.0 - 2.0 * ip);
+          final double d2 = qSquaredNorm + slot.squaredNorm - 2.0 * ip;
+          dist = d2 < 0 ? 0.0 : d2;
         }
       }
 
@@ -3701,13 +3707,11 @@ class NghGraphEngine {
         }
         final cPages = c.leafPages.isNotEmpty
             ? c.leafPages
-            : (c.leafPageNos.isNotEmpty
-                ? c.leafPageNos
-                    .map(NghPageId.fromPacked)
-                    .toList(growable: false)
-                : (c.headLeafPageNo >= 0
-                    ? [NghPageId.fromPacked(c.headLeafPageNo)]
-                    : const <NghPageId>[]));
+            : (!c.headLeafPage.isNone
+                ? (!c.tailLeafPage.isNone && c.tailLeafPage != c.headLeafPage
+                    ? <NghPageId>[c.headLeafPage, c.tailLeafPage]
+                    : <NghPageId>[c.headLeafPage])
+                : const <NghPageId>[]);
 
         if (cPages.isEmpty) {
           rootEntries[r].add(CentroidBranchEntry(
@@ -4041,7 +4045,7 @@ class NghGraphEngine {
     void markInsertNav(NghPageId id, NghNavBTreePage page) {
       // Always drop search48: leaf-level entry centroids are mutated in place
       // on objects that may also sit in TreeCache; a warm pack would score
-      // stale rows. Insert descent uses [insertTop2Nav] (live entries) so this
+      // stale records. Insert descent uses [insertTop2Nav] (live entries) so this
       // is not on the insert hot path.
       page.invalidateSearch48Pack();
       insertNavPages[id] = page;
@@ -5252,7 +5256,7 @@ class NghGraphEngine {
       }
     }
 
-    /// Tiny cold-start (1 / 100 rows) leaves L0 far below the sample-rich
+    /// Tiny cold-start (1 / 100 records) leaves L0 far below the sample-rich
     /// target. Far-spawn + heavy-split alone never catch a subsequent 10k
     /// flush (depth1–70 recall cliff, self_rc dips). When this batch is
     /// sample-rich, seed empty L0 heads up to the *target* in one shot —

@@ -4,7 +4,7 @@ import 'meta_info.dart';
 import 'table_identity.dart';
 import 'table_schema.dart';
 
-/// In-memory table metadata (mirrors one `_system_table_meta` row).
+/// In-memory table metadata (mirrors one `_system_table_meta` record).
 ///
 /// [schema], [fieldLayout], and [extra] are full models in memory; they are
 /// serialized to binary blobs only when persisting to the system table.

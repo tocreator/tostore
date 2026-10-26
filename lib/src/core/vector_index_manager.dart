@@ -37,6 +37,19 @@ class VectorIndexManager {
   static const int _vectorApplyChunkMin = 2048;
   static const int _vectorApplyChunkMax = 16384;
 
+  /// Width for a new empty NGH meta from [fieldSchema].
+  ///
+  /// New tables must declare `vectorConfig.dimensions > 0` at create/schema
+  /// validation. This path still accepts legacy schemas that omitted it so
+  /// existing corpora remain usable — do not re-throw here.
+  static const int _legacyDefaultDimensions = 128;
+
+  int _dimensionsFromField(FieldSchema fieldSchema) {
+    final d = fieldSchema.vectorConfig?.dimensions;
+    if (d != null && d > 0) return d;
+    return _legacyDefaultDimensions;
+  }
+
   /// Vectors/PKs per apply cycle from leaf page size × slots/page.
   ///
   /// Caps dirty-leaf redo ≈ [_vectorApplyTargetLeafRedoBytes], then
@@ -655,7 +668,7 @@ class VectorIndexManager {
       return sized;
     }
 
-    final dims = fieldSchema.vectorConfig?.dimensions ?? 128;
+    final dims = _dimensionsFromField(fieldSchema);
     final vc = idx.vectorConfig;
     meta = _withPageSizes(NghIndexMeta.createEmpty(
       indexUid: indexUid,
@@ -918,10 +931,10 @@ class VectorIndexManager {
     int? maxBytes,
   }) async {
     try {
-      if (_dataStore.shouldAbortBackgroundScan) return 0;
+      if (_dataStore.shouldAbortPrewarmForTable(table.tableUid)) return 0;
 
       final meta = await _loadMeta(table, indexUid);
-      if (_dataStore.shouldAbortBackgroundScan) return 0;
+      if (_dataStore.shouldAbortPrewarmForTable(table.tableUid)) return 0;
       if (meta == null || meta.isBuilding) {
         if (!await _legacyIo.hasOldIndex(table, indexUid)) return 0;
         final oldMeta = await _legacyIo.readMeta(table, indexUid);
@@ -955,10 +968,11 @@ class VectorIndexManager {
         indexUid: indexUid,
         meta: meta,
         maxBytes: budget,
-        shouldAbort: () => _dataStore.shouldAbortBackgroundScan,
+        shouldAbort: () =>
+            _dataStore.shouldAbortPrewarmForTable(table.tableUid),
       );
 
-      if (_dataStore.shouldAbortBackgroundScan) return added;
+      if (_dataStore.shouldAbortPrewarmForTable(table.tableUid)) return added;
 
       // JIT-compile scoring kernels and prime nav routing on this isolate.
       await _graphEngine.warmSearchPath(
@@ -994,7 +1008,7 @@ class VectorIndexManager {
 
     var totalLoaded = 0;
     for (final vIdx in vectorIndexes) {
-      if (_dataStore.shouldAbortBackgroundScan) break;
+      if (_dataStore.shouldAbortPrewarmForTable(table.tableUid)) break;
       totalLoaded += await prewarmVectorIndex(
         table,
         vIdx.indexUid,
@@ -1027,7 +1041,7 @@ class VectorIndexManager {
 
   /// Collect live primary keys from NGPK structure+PK redo payloads.
   ///
-  /// Used by page-redo Pass2 to preload table rows in one batch before
+  /// Used by page-redo Pass2 to preload table records in one batch before
   /// materializing many leaf pages (avoids per-slot B+Tree walks).
   List<String> collectLivePksFromPkStructureRedoPayloads(
     Iterable<Uint8List> pkRedoPayloads,
@@ -1050,7 +1064,7 @@ class VectorIndexManager {
     return out;
   }
 
-  /// Batch-load table rows needed to materialize NGPK redo pages.
+  /// Batch-load table records needed to materialize NGPK redo pages.
   ///
   /// Prefer this over per-slot [getRecordByPrimaryKey]: one tree walk batch
   /// with leaf grouping + page cache, instead of N cold root-to-leaf IO paths.
@@ -1125,7 +1139,7 @@ class VectorIndexManager {
     final emptyCodes = Uint8List(dims);
 
     // One batch for this page when caller did not preload.
-    Map<String, Map<String, dynamic>> rows =
+    Map<String, Map<String, dynamic>> records =
         recordsByPk ?? const <String, Map<String, dynamic>>{};
     if (recordsByPk == null) {
       final livePks = <String>[];
@@ -1135,7 +1149,7 @@ class VectorIndexManager {
         if (pk.isNotEmpty) livePks.add(pk);
       }
       if (livePks.isNotEmpty) {
-        rows = await preloadRecordsForPkRedo(
+        records = await preloadRecordsForPkRedo(
               table: table,
               indexUid: indexUid,
               primaryKeys: livePks,
@@ -1159,7 +1173,7 @@ class VectorIndexManager {
         continue;
       }
 
-      final rec = rows[pk];
+      final rec = records[pk];
       Float32List? f32;
       if (rec != null) {
         final prepared = _prepareInsertVectorsBatch(
@@ -1317,8 +1331,8 @@ class VectorIndexManager {
       return meta;
     }
 
-    // Create new
-    final dims = fieldSchema.vectorConfig?.dimensions ?? 128;
+    // Create new (schema gate for dimensions is create-table / validate only).
+    final dims = _dimensionsFromField(fieldSchema);
     final vc = idx.vectorConfig;
 
     meta = _withPageSizes(NghIndexMeta.createEmpty(
@@ -1359,14 +1373,14 @@ class VectorIndexManager {
     _graphEngine.clearCacheForIndex(table.tableUid, indexUid);
     await _partitionManager.deleteLiveNghRoot(table, indexUid);
 
-    int dims = 128;
+    var dims = _legacyDefaultDimensions;
     if (indexSchema.fields.isNotEmpty) {
       final fieldName = indexSchema.fields.first;
       final fieldSchema = table.schema.fields
           .cast<FieldSchema?>()
           .firstWhere((f) => f?.name == fieldName, orElse: () => null);
-      if (fieldSchema?.vectorConfig != null) {
-        dims = fieldSchema!.vectorConfig!.dimensions;
+      if (fieldSchema != null) {
+        dims = _dimensionsFromField(fieldSchema);
       }
     }
     final metric =
@@ -1438,14 +1452,14 @@ class VectorIndexManager {
 
     await deletePhysicalIndexArtifacts(table, indexUid);
 
-    int dims = 128;
+    var dims = _legacyDefaultDimensions;
     if (indexSchema.fields.isNotEmpty) {
       final fieldName = indexSchema.fields.first;
       final fieldSchema = table.schema.fields
           .cast<FieldSchema?>()
           .firstWhere((f) => f?.name == fieldName, orElse: () => null);
-      if (fieldSchema?.vectorConfig != null) {
-        dims = fieldSchema!.vectorConfig!.dimensions;
+      if (fieldSchema != null) {
+        dims = _dimensionsFromField(fieldSchema);
       }
     }
     final metric =
@@ -1811,18 +1825,8 @@ class VectorIndexManager {
     return f32;
   }
 
-  /// Convert distance to similarity score in [0, 1].
+  /// Convert ANN distance to public similarity (`higher` = better).
   double _distanceToScore(double distance, VectorDistanceMetric metric) {
-    switch (metric) {
-      case VectorDistanceMetric.l2:
-        // L2 distance -> score: 1 / (1 + distance)
-        return 1.0 / (1.0 + distance);
-      case VectorDistanceMetric.innerProduct:
-        // Inner product was negated for min-heap; negate back and sigmoid
-        return 1.0 / (1.0 + exp(-(-distance)));
-      case VectorDistanceMetric.cosine:
-        // Cosine distance = 1 - similarity -> score = 1 - distance
-        return (1.0 - distance).clamp(0.0, 1.0);
-    }
+    return metric.similarityFromDistance(distance);
   }
 }

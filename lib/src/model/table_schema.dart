@@ -11,6 +11,7 @@ import 'db_exception.dart';
 import 'id_generator.dart';
 import 'result_status.dart';
 import 'result_type.dart';
+import 'sparse_vector_data.dart';
 import 'table_identity.dart';
 
 /// table schema
@@ -185,15 +186,15 @@ class TableSchema {
   }
 
   /// Returns a new map with primary key first, then other fields in original order.
-  /// Use when returning rows from storage so display/serialization shows PK first.
-  static Map<String, dynamic> rowWithPrimaryKeyFirst(
+  /// Use when returning records from storage so display/serialization shows PK first.
+  static Map<String, dynamic> recordWithPrimaryKeyFirst(
     String primaryKeyName,
     dynamic primaryKeyValue,
-    Map<String, dynamic> row,
+    Map<String, dynamic> record,
   ) {
     final out = <String, dynamic>{};
     out[primaryKeyName] = primaryKeyValue;
-    for (final e in row.entries) {
+    for (final e in record.entries) {
       if (e.key == primaryKeyName) continue;
       out[e.key] = e.value;
     }
@@ -1159,6 +1160,69 @@ class TableSchema {
           )
         ]);
       }
+
+      // Index-side algorithm/metric config is mandatory for vector indexes —
+      // do not silently default; callers must opt into metric/indexType.
+      if (index.vectorConfig == null) {
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.devInvalidSchemaIndexType,
+            message:
+                'Vector index "${index.actualIndexName}" in table "$name" must define vectorConfig (indexType and distanceMetric).',
+            tableName: name,
+            field: targetFieldName,
+            wrongValue: null,
+          )
+        ]);
+      }
+    } else if (index.type == IndexType.text || index.type == IndexType.sparse) {
+      final kind = index.type == IndexType.text ? 'Text' : 'Sparse';
+      final requiredType =
+          index.type == IndexType.text ? DataType.text : DataType.sparse;
+      if (index.fields.length != 1) {
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.devInvalidSchemaIndexType,
+            message:
+                '$kind index "${index.actualIndexName}" in table "$name" can only be created on a single field, but ${index.fields.length} fields were specified (${index.fields.join(', ')}).',
+            tableName: name,
+            field: index.fields.join(','),
+            wrongValue: index.fields.length,
+          )
+        ]);
+      }
+      if (index.unique) {
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.devInvalidSchemaIndexType,
+            message:
+                '$kind index "${index.actualIndexName}" in table "$name" cannot be unique.',
+            tableName: name,
+            field: index.fields.first,
+            wrongValue: true,
+          )
+        ]);
+      }
+      final targetFieldName = index.fields.first;
+      FieldSchema? targetField;
+      for (final f in fields) {
+        if (f.name == targetFieldName) {
+          targetField = f;
+          break;
+        }
+      }
+      if (targetField != null && targetField.type != requiredType) {
+        throw DbException([
+          SchemaValidationStatus(
+            type: ResultType.devInvalidSchemaIndexType,
+            message:
+                '$kind index "${index.actualIndexName}" in table "$name" requires field "$targetFieldName" to be ${requiredType.name}, but got ${targetField.type.name}.',
+            tableName: name,
+            field: targetFieldName,
+            wrongValue: targetField.type.name,
+          )
+        ]);
+      }
     } else if (index.type == IndexType.btree) {
       for (final fieldName in index.fields) {
         if (fieldName == primaryKeyName ||
@@ -1179,7 +1243,8 @@ class TableSchema {
               t == DataType.blob ||
               t == DataType.json ||
               t == DataType.array ||
-              t == DataType.dynamic) {
+              t == DataType.dynamic ||
+              t == DataType.sparse) {
             throw DbException([
               SchemaValidationStatus(
                 type: ResultType.devInvalidSchemaIndexType,
@@ -1936,7 +2001,11 @@ class FieldSchema {
   /// Default value type, used for special default value processing (e.g. timestamp)
   final DefaultValueType defaultValueType;
 
-  /// Configuration for vector fields (only valid when type is DataType.vector)
+  /// Configuration for vector fields ([dimensions]).
+  ///
+  /// **Required** when [type] is [DataType.vector] (`dimensions` in 1..max).
+  /// Nullable only so non-vector fields can omit it; schema validation rejects
+  /// `DataType.vector` without a positive [VectorFieldConfig.dimensions].
   final VectorFieldConfig? vectorConfig;
 
   const FieldSchema({
@@ -2282,6 +2351,18 @@ class FieldSchema {
         return null;
       case DataType.dynamic:
         return value;
+      case DataType.sparse:
+        if (value is SparseVectorData) return value;
+        if (value is Map) {
+          try {
+            return SparseVectorData.fromMap(value.map(
+              (key, item) => MapEntry(key as Object, (item as num)),
+            ));
+          } catch (_) {
+            return null;
+          }
+        }
+        return null;
     }
   }
 
@@ -2377,15 +2458,35 @@ class FieldSchema {
           ]);
         }
       }
+
+      // Vector width must match field config (insert / update).
+      if (type == DataType.vector && value is VectorData) {
+        final expected = vectorConfig?.dimensions;
+        if (expected != null && expected > 0 && value.dimensions != expected) {
+          throw DbException([
+            InvalidArgumentStatus(
+              type: ResultType.devVectorDimensionMismatch,
+              message:
+                  'Field $name expects $expected dimensions but got ${value.dimensions} (table $tableName)',
+              parameterName: name,
+              passedValue: value.dimensions,
+            )
+          ]);
+        }
+      }
     }
   }
 
-  /// Whether this field has min/max length or value constraints configured.
+  /// Whether this field has min/max length/value or vector-width constraints.
+  ///
+  /// Any [DataType.vector] needs the insert [checkConstraints] pass so width
+  /// mismatches are rejected ([vectorConfig] is already required at schema open).
   bool get hasValueConstraints =>
       maxLength != null ||
       minLength != null ||
       minValue != null ||
-      maxValue != null;
+      maxValue != null ||
+      type == DataType.vector;
 
   /// Fast validation and conversion in one pass for batch update/insert paths.
   ///
@@ -2609,6 +2710,8 @@ class FieldSchema {
         return value is VectorData ||
             (value is List && value.every((v) => v is num)) ||
             value is Uint8List;
+      case DataType.sparse:
+        return value is SparseVectorData || value is Map;
       case DataType.json:
         return value is Map;
       case DataType.dynamic:
@@ -2646,7 +2749,11 @@ class IndexSchema {
   final bool unique;
   final IndexType type;
 
-  /// Vector index configuration (only valid when type is IndexType.vector)
+  /// Vector index configuration.
+  ///
+  /// **Required** when [type] is [IndexType.vector] (algorithm + distance
+  /// metric). Omitting it fails [TableSchema] validation — there is no
+  /// silent default at schema open time.
   final VectorIndexConfig? vectorConfig;
 
   /// Stable unique identifier (immutable across renames).
@@ -2709,6 +2816,10 @@ class IndexSchema {
           return IndexType.btree;
         case 'vector':
           return IndexType.vector;
+        case 'text':
+          return IndexType.text;
+        case 'sparse':
+          return IndexType.sparse;
         default:
           return IndexType.btree;
       }
@@ -2916,12 +3027,17 @@ enum DataType {
 
   /// Dynamic or untyped data. Holds arbitrary Dart objects (int, double, bool, String, Map, List, Uint8List, etc.) without forced type conversions.
   dynamic,
+
+  /// Neural sparse vector. Non-zero dimension ids plus weights.
+  sparse,
 }
 
 /// index type enum
 enum IndexType {
   btree, // default, btree index
   vector, // vector similarity index
+  text, // text retrieval index
+  sparse, // neural sparse retrieval index
 }
 
 /// Field default value type
@@ -3546,7 +3662,39 @@ enum VectorDistanceMetric {
   innerProduct,
 
   /// Cosine distance `1 - similarity` (engine auto-normalizes).
-  cosine,
+  cosine;
+
+  /// Public relevance from an ANN [distance] (`higher` = more similar).
+  ///
+  /// This is the vector channel [RetrievalEntry.rawScore] / [VectorSearchResult.score].
+  /// Cosine and normalized inner product share one `[0, 1]` discard band with
+  /// text and sparse scores:
+  /// - [l2]: `1 - distance / 2` clamped to `[0, 1]`, where [distance] is
+  ///   squared L2. For unit-length vectors this equals cosine (`distance` is
+  ///   `2 * (1 - cosine)`). Squared distance ≥ 2 scores 0. Identical vectors
+  ///   score 1. Use unit-length data when sharing `minScore` with cosine.
+  /// - [innerProduct]: recovered IP (`-distance`) clamped to `[0, 1]`. Matches
+  ///   cosine when the caller normalized both sides. IP above 1 saturates at 1.
+  /// - [cosine]: `1 - distance` clamped to `[0, 1]`
+  double similarityFromDistance(double distance) {
+    switch (this) {
+      case VectorDistanceMetric.l2:
+        final double s = 1.0 - distance / 2.0;
+        if (s <= 0) return 0;
+        if (s >= 1) return 1;
+        return s;
+      case VectorDistanceMetric.innerProduct:
+        final double ip = -distance;
+        if (ip <= 0) return 0;
+        if (ip >= 1) return 1;
+        return ip;
+      case VectorDistanceMetric.cosine:
+        final double s = 1.0 - distance;
+        if (s < 0) return 0;
+        if (s > 1) return 1;
+        return s;
+    }
+  }
 }
 
 /// Dense vector index algorithm family.
@@ -3644,13 +3792,13 @@ class VectorIndexConfig {
 enum ForeignKeyCascadeAction {
   /// Restrict operation (RESTRICT)
   ///
-  /// If there are rows referencing this record in the child table, prohibit deleting or updating the record in the parent table
+  /// If there are records referencing this record in the child table, prohibit deleting or updating the record in the parent table
   /// This is the strictest constraint, ensuring data integrity
   restrict,
 
   /// Cascade delete/update (CASCADE)
   ///
-  /// When the record in the parent table is deleted or updated, automatically delete or update all rows referencing this record in the child table
+  /// When the record in the parent table is deleted or updated, automatically delete or update all records referencing this record in the child table
   /// For example: when deleting a user, automatically delete all orders of the user
   cascade,
 

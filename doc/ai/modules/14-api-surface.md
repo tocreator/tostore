@@ -98,7 +98,7 @@ import 'package:tostore/tostore.dart';
 
 | Type | Entry | Key methods (see topic modules) |
 | :--- | :--- | :--- |
-| `QueryBuilder` | `query` | select, join*, agg, peek*, watch, cache, matchVector, … |
+| `QueryBuilder` | `query` | select, join*, agg, peek*, watch, cache, matchVector, matchText, matchSparse, fusionMethod, … |
 | `UpdateBuilder` | `update` | set*, compute, allow*, inherits ChainBuilder where* |
 | `DeleteBuilder` | `delete` | allowDeleteAll, allowLargeScaleOperation, where* |
 | `StreamQueryBuilder` | `streamQuery` | where*, select, stream/listen |
@@ -139,6 +139,8 @@ Agents MAY import these via `package:tostore/tostore.dart`:
 | `space_info.dart` | `SpaceInfo` |
 | `table_info.dart` | `TableInfo` |
 | `table_schema.dart` | `TableSchema`, `FieldSchema`, `IndexSchema`, `TableTtlConfig`, `DataType`, `IndexType`, `DefaultValueType`, `PrimaryKeyType`, `SequentialIdConfig`, `PrimaryKeyConfig`, `VectorData`, `VectorFieldConfig`, `VectorIndexType`, `VectorDistanceMetric`, `VectorIndexConfig`, `ForeignKeyCascadeAction`, `ForeignKeySchema`, … |
+| `text_query.dart` | `TextQuery`, `TextTerm`, `TextMatchOperator` |
+| `sparse_vector_data.dart` | `SparseVectorData` |
 | `transaction_result.dart` | `TransactionResult`, `TransactionStatus`, `TransactionErrorType`, `TransactionError` |
 | `query_condition.dart` | `QueryCondition` |
 

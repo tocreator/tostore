@@ -544,6 +544,32 @@ class ToStoreExample {
         continue;
       }
 
+      if (_textIndexedFields(schema).contains(field.name)) {
+        record[field.name] = ExampleTextCorpus.document(index, rng);
+        continue;
+      }
+      if ((schema.name == ExampleSchemas.textDocs.name &&
+              field.name == 'title') ||
+          (schema.name == ExampleSchemas.sparseDocs.name &&
+              field.name == 'title') ||
+          (schema.name == ExampleSchemas.hybridDocs.name &&
+              field.name == 'headline')) {
+        record[field.name] = ExampleTextCorpus.title(index);
+        continue;
+      }
+      if ((schema.name == ExampleSchemas.textDocs.name ||
+              schema.name == ExampleSchemas.sparseDocs.name ||
+              schema.name == ExampleSchemas.hybridDocs.name) &&
+          field.name == 'category') {
+        record[field.name] = ExampleTextCorpus.category(index);
+        continue;
+      }
+      if (schema.name == ExampleSchemas.hybridDocs.name &&
+          field.name == 'year') {
+        record[field.name] = ExampleTextCorpus.year(index);
+        continue;
+      }
+
       // Generate data based on field name patterns for more realistic mock data
       if (field.name.contains('email')) {
         record[field.name] = 'user_$index@example.com';
@@ -600,6 +626,9 @@ class ToStoreExample {
         case DataType.dynamic:
           // Skip dynamic for mock data generation
           break;
+        case DataType.sparse:
+          record[field.name] = ExampleSparseCorpus.document(index, rng);
+          break;
       }
     }
 
@@ -613,6 +642,474 @@ class ToStoreExample {
       }
     }
     return record;
+  }
+
+  Set<String> _textIndexedFields(TableSchema schema) {
+    return {
+      for (final index in schema.indexes)
+        if (index.type == IndexType.text && index.fields.isNotEmpty)
+          index.fields.first,
+    };
+  }
+
+  Set<String> _sparseIndexedFields(TableSchema schema) {
+    return {
+      for (final index in schema.indexes)
+        if (index.type == IndexType.sparse && index.fields.isNotEmpty)
+          index.fields.first,
+    };
+  }
+
+  void _logTextGeneration(TableSchema schema) {
+    final fields = _textIndexedFields(schema);
+    if (fields.isEmpty) return;
+    logService.add(
+      'Generating text documents for "${schema.name}" '
+      '(indexed: ${fields.join(', ')}, lexicon=${ExampleTextCorpus.lexicon.length}).',
+      LogLevel.info,
+    );
+  }
+
+  void _logSparseGeneration(TableSchema schema) {
+    final fields = _sparseIndexedFields(schema);
+    if (fields.isEmpty) return;
+    logService.add(
+      'Generating sparse vectors for "${schema.name}" '
+      '(indexed: ${fields.join(', ')}, '
+      'vocab=${ExampleSparseCorpus.vocabSize}, '
+      'nnz≈${ExampleSparseCorpus.defaultNnz}).',
+      LogLevel.info,
+    );
+  }
+
+  /// Runs one [matchText] and, when [iterations] > 1, times that many repeats.
+  Future<void> textSearchTest(
+    String tableName, {
+    required String queryText,
+    int topK = 10,
+    int iterations = 1,
+    TextMatchOperator operator = TextMatchOperator.or,
+    bool preTokenized = false,
+  }) async {
+    final query = queryText.trim();
+    if (query.isEmpty) {
+      logService.add('Text search skipped: query is empty.', LogLevel.warn);
+      return;
+    }
+
+    final TextQuery textQuery;
+    if (preTokenized) {
+      final terms = query
+          .split(RegExp(r'[\s,|]+'))
+          .where((term) => term.isNotEmpty)
+          .toList();
+      if (terms.isEmpty) {
+        logService.add('Text search skipped: no terms.', LogLevel.warn);
+        return;
+      }
+      textQuery = TextQuery.terms(terms);
+    } else {
+      textQuery = TextQuery.text(query);
+    }
+
+    final schema = await db.getTableSchema(tableName);
+    if (schema == null) {
+      logService.add('Text search failed: schema for "$tableName" not found.',
+          LogLevel.error);
+      return;
+    }
+
+    final textFields = _textIndexedFields(schema);
+    if (textFields.isEmpty) {
+      logService.add('Text search failed: "$tableName" has no text index.',
+          LogLevel.error);
+      return;
+    }
+    final fieldName = textFields.first;
+    final pk = schema.primaryKeyConfig.name;
+    final selectFields = <String>[pk];
+    if (schema.fields.any((field) => field.name == 'title')) {
+      selectFields.add('title');
+    }
+
+    final recordCount = await db.query(tableName).count();
+    final k = topK < 1 ? 1 : topK;
+    final runs = iterations < 1 ? 1 : iterations;
+
+    Future<QueryResult> search() {
+      return db
+          .query(tableName)
+          .select(selectFields)
+          .matchText(
+            fieldName,
+            textQuery,
+            operator: operator,
+          )
+          .limit(k);
+    }
+
+    final preview = await search();
+    if (preview.type != ResultType.success) {
+      logService.add('Text search failed: ${preview.message}', LogLevel.error);
+      return;
+    }
+
+    final report = StringBuffer()
+      ..writeln(
+        'Text search "$query" on $tableName.$fieldName '
+        'input=${preTokenized ? 'terms' : 'text'} '
+        'operator=${operator.name} topK=$k records=$recordCount',
+      )
+      ..writeln(
+        'Hits ${preview.data.length}/$k in ${preview.executionTimeMs} ms',
+      );
+    final entries = preview.retrieval?.entries ?? const <RetrievalEntry>[];
+    for (var i = 0; i < preview.data.length; i++) {
+      final row = preview.data[i];
+      final score = i < entries.length ? entries[i].score : null;
+      final raw = i < entries.length ? entries[i].rawScore : null;
+      final title = row['title'];
+      final scoreText = score == null ? '-' : score.toStringAsFixed(4);
+      final rawText = raw == null ? '-' : raw.toStringAsFixed(3);
+      report.write(
+        '#${i + 1} $pk=${row[pk]} score=$scoreText rawScore=$rawText'
+        '${title == null ? '' : ' title=$title'}',
+      );
+      if (i != preview.data.length - 1 || runs > 1) report.writeln();
+    }
+
+    if (runs > 1) {
+      final sw = Stopwatch()..start();
+      var hits = 0;
+      for (var i = 0; i < runs; i++) {
+        final result = await search();
+        if (result.type != ResultType.success) {
+          report
+              .writeln('Text search failed on iteration $i: ${result.message}');
+          logService.add(report.toString().trimRight(), LogLevel.error);
+          return;
+        }
+        hits += result.data.length;
+      }
+      sw.stop();
+      final seconds = sw.elapsedMicroseconds / 1000000.0;
+      final qps = seconds > 0 ? runs / seconds : 0.0;
+      final avgHits = hits / runs;
+      report.write(
+        'Throughput: $runs queries in ${sw.elapsedMilliseconds} ms, '
+        '${qps.toStringAsFixed(1)} QPS, '
+        'avgHits ${avgHits.toStringAsFixed(1)}/$k',
+      );
+    }
+
+    logService.add(report.toString().trimRight());
+  }
+
+  /// Runs one [matchSparse] and, when [iterations] > 1, times that many repeats.
+  ///
+  /// [queryText] accepts `dim` or `dim:weight` pairs separated by spaces,
+  /// commas, or `|` (e.g. `10:1.0, 777:0.5` or `42 99`).
+  Future<void> sparseSearchTest(
+    String tableName, {
+    required String queryText,
+    int topK = 10,
+    int iterations = 1,
+  }) async {
+    final query = queryText.trim();
+    if (query.isEmpty) {
+      logService.add('Sparse search skipped: query is empty.', LogLevel.warn);
+      return;
+    }
+
+    final SparseVectorData sparseQuery;
+    try {
+      sparseQuery = ExampleSparseCorpus.parseQuery(query);
+    } catch (e) {
+      logService.add(
+          'Sparse search skipped: invalid query ($e).', LogLevel.warn);
+      return;
+    }
+    if (sparseQuery.nnz == 0) {
+      logService.add(
+          'Sparse search skipped: no dimensions parsed.', LogLevel.warn);
+      return;
+    }
+
+    final schema = await db.getTableSchema(tableName);
+    if (schema == null) {
+      logService.add('Sparse search failed: schema for "$tableName" not found.',
+          LogLevel.error);
+      return;
+    }
+
+    final sparseFields = _sparseIndexedFields(schema);
+    if (sparseFields.isEmpty) {
+      logService.add('Sparse search failed: "$tableName" has no sparse index.',
+          LogLevel.error);
+      return;
+    }
+    final fieldName = sparseFields.first;
+    final pk = schema.primaryKeyConfig.name;
+    final selectFields = <String>[pk];
+    if (schema.fields.any((field) => field.name == 'title')) {
+      selectFields.add('title');
+    }
+
+    final recordCount = await db.query(tableName).count();
+    final k = topK < 1 ? 1 : topK;
+    final runs = iterations < 1 ? 1 : iterations;
+
+    Future<QueryResult> search() {
+      return db
+          .query(tableName)
+          .select(selectFields)
+          .matchSparse(fieldName, sparseQuery)
+          .limit(k);
+    }
+
+    final preview = await search();
+    if (preview.type != ResultType.success) {
+      logService.add(
+          'Sparse search failed: ${preview.message}', LogLevel.error);
+      return;
+    }
+
+    final dimsPreview = StringBuffer();
+    for (var i = 0; i < sparseQuery.nnz && i < 8; i++) {
+      if (i > 0) dimsPreview.write(',');
+      dimsPreview.write('${sparseQuery.indices[i]}:${sparseQuery.values[i]}');
+    }
+    if (sparseQuery.nnz > 8) dimsPreview.write(',…');
+
+    final report = StringBuffer()
+      ..writeln(
+        'Sparse search dims=[$dimsPreview] (nnz=${sparseQuery.nnz}) '
+        'on $tableName.$fieldName topK=$k records=$recordCount',
+      )
+      ..writeln(
+        'Hits ${preview.data.length}/$k in ${preview.executionTimeMs} ms',
+      );
+    final entries = preview.retrieval?.entries ?? const <RetrievalEntry>[];
+    for (var i = 0; i < preview.data.length; i++) {
+      final row = preview.data[i];
+      final score = i < entries.length ? entries[i].score : null;
+      final raw = i < entries.length ? entries[i].rawScore : null;
+      final title = row['title'];
+      final scoreText = score == null ? '-' : score.toStringAsFixed(4);
+      final rawText = raw == null ? '-' : raw.toStringAsFixed(3);
+      report.write(
+        '#${i + 1} $pk=${row[pk]} score=$scoreText rawScore=$rawText'
+        '${title == null ? '' : ' title=$title'}',
+      );
+      if (i != preview.data.length - 1 || runs > 1) report.writeln();
+    }
+
+    if (runs > 1) {
+      final sw = Stopwatch()..start();
+      var hits = 0;
+      for (var i = 0; i < runs; i++) {
+        final result = await search();
+        if (result.type != ResultType.success) {
+          report.writeln(
+              'Sparse search failed on iteration $i: ${result.message}');
+          logService.add(report.toString().trimRight(), LogLevel.error);
+          return;
+        }
+        hits += result.data.length;
+      }
+      sw.stop();
+      final seconds = sw.elapsedMicroseconds / 1000000.0;
+      final qps = seconds > 0 ? runs / seconds : 0.0;
+      final avgHits = hits / runs;
+      report.write(
+        'Throughput: $runs queries in ${sw.elapsedMilliseconds} ms, '
+        '${qps.toStringAsFixed(1)} QPS, '
+        'avgHits ${avgHits.toStringAsFixed(1)}/$k',
+      );
+    }
+
+    logService.add(report.toString().trimRight());
+  }
+
+  /// One fused query over structured filters, vector ANN, and text match.
+  ///
+  /// Vector and text are OR-fused. [category] and [year] are AND filters.
+  /// The whole run is one log entry.
+  Future<void> hybridSearchTest(
+    String tableName, {
+    required String queryText,
+    String? category,
+    int? year,
+    bool useVector = true,
+    bool useText = true,
+    int topK = 10,
+    int iterations = 1,
+    int searchDepth = 50,
+    int vectorGroupId = 0,
+    TextMatchOperator operator = TextMatchOperator.or,
+    RetrievalFusionMethod fusionMethod = RetrievalFusionMethod.weightedScore,
+  }) async {
+    final query = queryText.trim();
+    if (useText && query.isEmpty) {
+      logService.add(
+          'Hybrid search skipped: text query is empty.', LogLevel.warn);
+      return;
+    }
+    if (!useVector && !useText && category == null && year == null) {
+      logService.add(
+          'Hybrid search skipped: pick a vector, text, or structured filter.',
+          LogLevel.warn);
+      return;
+    }
+
+    final schema = await db.getTableSchema(tableName);
+    if (schema == null) {
+      logService.add('Hybrid search failed: schema for "$tableName" not found.',
+          LogLevel.error);
+      return;
+    }
+
+    final textFields = _textIndexedFields(schema);
+    String? vectorField;
+    var vectorDims = 0;
+    for (final field in schema.fields) {
+      if (field.type == DataType.vector && field.vectorConfig != null) {
+        vectorField = field.name;
+        vectorDims = field.vectorConfig!.dimensions;
+        break;
+      }
+    }
+    if (useText && textFields.isEmpty) {
+      logService.add('Hybrid search failed: "$tableName" has no text index.',
+          LogLevel.error);
+      return;
+    }
+    if (useVector && (vectorField == null || vectorDims <= 0)) {
+      logService.add('Hybrid search failed: "$tableName" has no vector field.',
+          LogLevel.error);
+      return;
+    }
+
+    final pk = schema.primaryKeyConfig.name;
+    final selectFields = <String>[pk];
+    for (final name in ['headline', 'title', 'category', 'year']) {
+      if (schema.fields.any((field) => field.name == name)) {
+        selectFields.add(name);
+      }
+    }
+
+    final k = topK < 1 ? 1 : topK;
+    final runs = iterations < 1 ? 1 : iterations;
+    final depth = searchDepth < 1 ? 1 : searchDepth;
+    final textQuery = useText ? TextQuery.text(query) : null;
+    final queryVector = useVector
+        ? ExampleVectorCorpus.groupQuery(vectorGroupId, vectorDims)
+        : null;
+    final recordCount = await db.query(tableName).count();
+
+    Future<QueryResult> search() {
+      var builder = db.query(tableName).select(selectFields);
+      if (useVector) {
+        builder = builder.matchVector(
+          vectorField!,
+          queryVector!,
+          searchDepth: depth,
+        );
+      }
+      if (useText) {
+        builder = useVector
+            ? builder.orMatchText(
+                textFields.first,
+                textQuery!,
+                operator: operator,
+              )
+            : builder.matchText(
+                textFields.first,
+                textQuery!,
+                operator: operator,
+              );
+      }
+      if (category != null && category.isNotEmpty) {
+        builder = builder.whereEqual('category', category);
+      }
+      if (year != null) {
+        builder = builder.whereEqual('year', year);
+      }
+      // Multi-way recall: apply chosen fusion (no-op for a single channel).
+      if (useVector && useText) {
+        builder = builder.fusionMethod(fusionMethod);
+      }
+      return builder.limit(k);
+    }
+
+    final previewSw = Stopwatch()..start();
+    final preview = await search();
+    previewSw.stop();
+    if (preview.type != ResultType.success) {
+      logService.add(
+          'Hybrid search failed: ${preview.message}', LogLevel.error);
+      return;
+    }
+
+    final channels = <String>[
+      if (useVector) 'vector',
+      if (useText) 'text',
+      if (category != null && category.isNotEmpty) 'category=$category',
+      if (year != null) 'year=$year',
+    ];
+    final us = previewSw.elapsedMicroseconds;
+    final timeLabel =
+        us >= 1000 ? '${(us / 1000).toStringAsFixed(2)} ms' : '$us μs';
+    final fusionLabel =
+        useVector && useText ? ' fusion=${fusionMethod.name}' : '';
+    final report = StringBuffer()
+      ..writeln(
+        'Hybrid search on $tableName [${channels.join(' + ')}] '
+        'topK=$k depth=$depth records=$recordCount$fusionLabel'
+        '${useText ? ' query="$query"' : ''}'
+        '${useVector ? ' vectorGroup=$vectorGroupId' : ''}',
+      )
+      ..writeln('Hits ${preview.data.length}/$k in $timeLabel');
+    final entries = preview.retrieval?.entries ?? const <RetrievalEntry>[];
+    for (var i = 0; i < preview.data.length; i++) {
+      final row = preview.data[i];
+      final entry = i < entries.length ? entries[i] : null;
+      final scoreText = entry == null ? '-' : entry.score.toStringAsFixed(4);
+      final channel = entry?.channel.name ?? '-';
+      final headline = row['headline'] ?? row['title'];
+      report.write(
+        '#${i + 1} $pk=${row[pk]} channel=$channel score=$scoreText'
+        '${row['category'] == null ? '' : ' category=${row['category']}'}'
+        '${row['year'] == null ? '' : ' year=${row['year']}'}'
+        '${headline == null ? '' : ' headline=$headline'}',
+      );
+      if (i != preview.data.length - 1 || runs > 1) report.writeln();
+    }
+
+    if (runs > 1) {
+      final sw = Stopwatch()..start();
+      var hits = 0;
+      for (var i = 0; i < runs; i++) {
+        final result = await search();
+        if (result.type != ResultType.success) {
+          report.writeln(
+              'Hybrid search failed on iteration $i: ${result.message}');
+          logService.add(report.toString().trimRight(), LogLevel.error);
+          return;
+        }
+        hits += result.data.length;
+      }
+      sw.stop();
+      final seconds = sw.elapsedMicroseconds / 1000000.0;
+      final qps = seconds > 0 ? runs / seconds : 0.0;
+      report.write(
+        'Throughput: $runs queries in ${sw.elapsedMilliseconds} ms, '
+        '${qps.toStringAsFixed(1)} QPS, '
+        'avgHits ${(hits / runs).toStringAsFixed(1)}/$k',
+      );
+    }
+
+    logService.add(report.toString().trimRight());
   }
 
   void _logVectorGenerationWidth(TableSchema schema) {
@@ -642,7 +1139,7 @@ class ToStoreExample {
     return SchedulerBinding.instance.endOfFrame;
   }
 
-  /// Builds mock rows in short slices so the UI can keep painting.
+  /// Builds mock records in short slices so the UI can keep painting.
   Future<List<Map<String, dynamic>>> _generateRecordsChunked({
     required TableSchema schema,
     required int firstIndex,
@@ -695,6 +1192,8 @@ class ToStoreExample {
       return -1;
     }
     _logVectorGenerationWidth(schema);
+    _logTextGeneration(schema);
+    _logSparseGeneration(schema);
 
     // Get a generation base for derived text fields (email, username, etc.).
     final baseIndex = await _resolveExampleBaseIndex(tableName, schema);
@@ -787,6 +1286,8 @@ class ToStoreExample {
       return -1;
     }
     _logVectorGenerationWidth(schema);
+    _logTextGeneration(schema);
+    _logSparseGeneration(schema);
 
     // This base is only used for generated field values, not for assigning
     // the primary key itself.
@@ -1213,7 +1714,7 @@ class ToStoreExample {
       return;
     }
 
-    final rows = <VectorSearchBenchmarkResult>[];
+    final records = <VectorSearchBenchmarkResult>[];
     for (var i = 0; i < sweepDepths.length; i++) {
       final depth = VectorRecallHarness.normalizeDepth(sweepDepths[i]);
       onProgress?.call(i, sweepDepths.length);
@@ -1229,7 +1730,7 @@ class ToStoreExample {
         diverseThroughput: diverseThroughput,
       );
       if (row != null) {
-        rows.add(row);
+        records.add(row);
       } else {
         logService.add(
           'Depth sweep stopped at depth=$depth (benchmark failed).',
@@ -1242,7 +1743,7 @@ class ToStoreExample {
       await Future<void>.delayed(Duration.zero);
     }
 
-    if (rows.isEmpty) {
+    if (records.isEmpty) {
       logService.add('Depth sweep produced no results.', LogLevel.error);
       return;
     }
@@ -1252,7 +1753,7 @@ class ToStoreExample {
         tableName: tableName,
         topK: topK,
         iterations: iterations,
-        rows: rows,
+        records: records,
         diverseThroughput: diverseThroughput,
       ),
       LogLevel.info,
@@ -1318,7 +1819,7 @@ class ToStoreExample {
       report.writeln('  RECALL@K:');
       report.writeln('    searchDepth        : $depth');
       report.writeln(
-          '    Status             : Skipped (insert example vector rows to measure Recall@K)');
+          '    Status             : Skipped (insert example vector records to measure Recall@K)');
     }
     report.writeln('-' * 78);
     report.writeln('  CHECKS:');
@@ -1385,4 +1886,134 @@ class ToStoreExample {
 enum ForeignKeyMode {
   fixed, // Fixed value
   random, // Random value
+}
+
+/// Shared lexicon for [ExampleSchemas.textDocs] mock records and search tests.
+class ExampleTextCorpus {
+  ExampleTextCorpus._();
+
+  static const List<String> lexicon = [
+    'distributed',
+    'database',
+    'storage',
+    'index',
+    'query',
+    'vector',
+    'search',
+    'token',
+    'block',
+    'partition',
+    'engine',
+    'flush',
+    'schema',
+    'record',
+    'latency',
+    'recall',
+    'hybrid',
+    'sparse',
+    'embedding',
+    '全文',
+    '检索',
+    '分布式',
+    '数据库',
+    '索引',
+    '微块',
+    '向量',
+    '查询',
+  ];
+
+  static const List<String> categories = [
+    'tech',
+    'docs',
+    'news',
+    'notes',
+  ];
+
+  static const List<int> years = [2022, 2023, 2024, 2025, 2026];
+
+  static String title(int index) {
+    final a = lexicon[index % lexicon.length];
+    final b = lexicon[(index * 3) % lexicon.length];
+    return '$a $b $index';
+  }
+
+  static String category(int index) => categories[index % categories.length];
+
+  static int year(int index) => years[index % years.length];
+
+  /// Short passage built from the shared lexicon so typed queries can hit.
+  static String document(int index, Random rng) {
+    final buf = StringBuffer('doc_$index ');
+    const target = 48;
+    for (var i = 0; i < target; i++) {
+      final u = rng.nextDouble();
+      final rank =
+          (u * u * lexicon.length).floor().clamp(0, lexicon.length - 1);
+      buf.write(lexicon[rank]);
+      buf.write(' ');
+    }
+    return buf.toString();
+  }
+}
+
+/// Synthetic neural-sparse vectors for [ExampleSchemas.sparseDocs] / hybrid.
+///
+/// Docs share a fixed vocab and a few planted hot dims so UI queries like
+/// `10:1.0,42:0.8` reliably recall after bulk fill.
+class ExampleSparseCorpus {
+  ExampleSparseCorpus._();
+
+  /// Synthetic vocabulary size (dim ids in `1..vocabSize`).
+  static const int vocabSize = 100000;
+
+  /// Default non-zeros per mock document.
+  static const int defaultNnz = 64;
+
+  /// Dims forced into every Nth document so interactive search can hit.
+  static const List<int> plantedHotDims = [10, 42, 777, 120000];
+
+  static SparseVectorData document(
+    int index,
+    Random rng, {
+    int nnz = defaultNnz,
+  }) {
+    final target = nnz < 1 ? 1 : nnz;
+    final map = <int, double>{};
+    // Plant one rotating hot dim so short queries always have recall.
+    final hot = plantedHotDims[index % plantedHotDims.length];
+    if (hot > 0 && hot <= 0xFFFFFFFF) {
+      map[hot] = 0.85 + (index % 15) * 0.01;
+    }
+    while (map.length < target) {
+      final dim = 1 + _zipfIndex(rng, vocabSize);
+      if (map.containsKey(dim)) continue;
+      // Doc-side weights in (0, 1]; avoid exact 0.
+      map[dim] = 0.05 + rng.nextDouble() * 0.95;
+    }
+    return SparseVectorData.fromMap(map);
+  }
+
+  /// Parse `dim` / `dim:weight` tokens separated by spaces, commas, or `|`.
+  static SparseVectorData parseQuery(String raw) {
+    final map = <Object, num>{};
+    for (final token in raw.split(RegExp(r'[\s,|]+'))) {
+      if (token.isEmpty) continue;
+      final parts = token.split(':');
+      final dim = int.tryParse(parts[0]);
+      if (dim == null) {
+        throw FormatException('not an integer dim: $token');
+      }
+      final weight = parts.length > 1 ? double.tryParse(parts[1]) : 1.0;
+      if (weight == null || weight <= 0) {
+        throw FormatException('invalid weight: $token');
+      }
+      map[dim] = weight;
+    }
+    return SparseVectorData.fromMap(map);
+  }
+
+  static int _zipfIndex(Random rng, int size) {
+    final u = rng.nextDouble();
+    return (u * u * size).floor().clamp(0, size - 1);
+  }
 }

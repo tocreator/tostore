@@ -48,7 +48,7 @@ await db.close(keepActiveSpace: false);
 
 ## Table-level TTL
 
-Background cleanup of expired rows (logs, events, telemetry).
+Background cleanup of expired records (logs, events, telemetry).
 
 ```dart
 TableTtlConfig({

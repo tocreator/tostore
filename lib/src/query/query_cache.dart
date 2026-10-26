@@ -214,7 +214,7 @@ class QueryCacheKey {
   /// Normalized SELECT field list (null / empty = all columns).
   ///
   /// Must be part of the cache key so projected results never collide with
-  /// full-row results under the same WHERE/ORDER/LIMIT.
+  /// full-record results under the same WHERE/ORDER/LIMIT.
   final List<String>? selectedFields;
 
   /// Cached identity string / hash.

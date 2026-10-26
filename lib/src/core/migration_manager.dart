@@ -754,7 +754,7 @@ class MigrationManager {
   ///
   /// Also drops **all** buffered [BackgroundWriteScheduler] entries for the
   /// table (schema / key migration / large update / large delete) and stops
-  /// producers that could re-enqueue, so a late flush cannot resurrect rows.
+  /// producers that could re-enqueue, so a late flush cannot resurrect records.
   ///
   /// Returns `true` when key migration was paused for this table; the caller
   /// must call [resumeKeyMigrationAfterDestructive] **after** the physical
@@ -1079,7 +1079,7 @@ class MigrationManager {
   }
 
   /// Active-space authority: mark target indexes building only when the table
-  /// already has persisted rows. Empty tables get empty meta with isBuilding=false.
+  /// already has persisted records. Empty tables get empty meta with isBuilding=false.
   Future<void> _applyIndexBuildingFlagsForActiveSpace(
     MigrationTask task, {
     int? recordCountOverride,
@@ -5553,7 +5553,7 @@ class MigrationManager {
                     currentTask.taskId, tableDataMeta.totalRecordCount);
               }
 
-              // One summary warn before rewrite - never per-row in
+              // One summary warn before rewrite - never per-record in
               // applyFieldModification (avoids UI freezes on large tables).
               if (_operationsMayAdjustFieldValues(sortedOperations)) {
                 final n = tableDataMeta?.totalRecordCount;
@@ -5561,7 +5561,7 @@ class MigrationManager {
                   'Table "${migrationTableCtx.tableName}" will adjust row values '
                   'for field type/constraint changes'
                   '${n != null ? ' (approximately $n records)' : ''}; '
-                  'per-row details omitted.',
+                  'per-record details omitted.',
                 );
               }
 
@@ -5575,7 +5575,7 @@ class MigrationManager {
                   : null;
 
               // Initialize index locks (isBuilding = true) only when this space
-              // has persisted rows. Empty tables never own isBuilding=true.
+              // has persisted records. Empty tables never own isBuilding=true.
               if (migrationInstance.indexManager != null &&
                   currentTask.specificIndexUids != null &&
                   currentTask.specificIndexUids!.isNotEmpty) {
@@ -6539,7 +6539,7 @@ class MigrationManager {
   ///
   /// Checks **all** migration scopes for non-global tables (shared meta +
   /// per-space data). Current-space-only probes would falsely take the empty
-  /// cutover path and corrupt other spaces that still hold old-PK rows.
+  /// cutover path and corrupt other spaces that still hold old-PK records.
   ///
   /// Relies on persisted/buffer record counts -- no query scan.
   Future<bool> _probePromoteNonEmptyHint(
@@ -6560,7 +6560,7 @@ class MigrationManager {
     }
   }
 
-  /// True when [tableUid] has committed or buffered rows in [space].
+  /// True when [tableUid] has committed or buffered records in [space].
   Future<bool> _probePromoteNonEmptyInSpace(
     TableUid tableUid,
     String space,
@@ -6660,7 +6660,7 @@ class MigrationManager {
   /// Backfill one space for promoteFieldToPrimaryKey (old -> shadow via upsert).
   ///
   /// Old table is the source of truth. Concurrent online dual-writes already
-  /// upsert the shadow; this scan catches remaining rows. Uses batchUpsert
+  /// upsert the shadow; this scan catches remaining records. Uses batchUpsert
   /// (idempotent) instead of point-query skip + batchInsert.
   Future<void> _backfillPromoteSpace({
     required DataStoreImpl migrationInstance,
@@ -6748,7 +6748,7 @@ class MigrationManager {
         checkInterval: 64,
       );
 
-      // Old-working rows already include sibling ops; promote PK reshape only
+      // Old-working records already include sibling ops; promote PK reshape only
       // (same as online dual-write mirror).
       final isKvTable = SystemTable.isKeyValueTable(currentTask.tableName);
       final toUpsert = <Map<String, dynamic>>[];
@@ -6874,7 +6874,7 @@ class MigrationManager {
         );
         return;
       }
-      // No dirs: space had no persisted rows / never created trees. First write
+      // No dirs: space had no persisted records / never created trees. First write
       // after meta cutover will create the logical directory.
       Logger.info(
         'Promote swap space=$space task=$taskId: no shadow/logical dirs at '
@@ -7576,9 +7576,9 @@ class MigrationManager {
       return false;
     }
 
-    // Source layout is what unre-written rows still use (same totalSlots as
+    // Source layout is what unre-written records still use (same totalSlots as
     // pre-cutover meta for typical remove-only evolves). Compact must not
-    // collapse to that count or Tier2 cannot tell old rows from new ones.
+    // collapse to that count or Tier2 cannot tell old records from new ones.
     if (sourceLayout != null &&
         sourceLayout.totalSlots == targetCompactedSlotsCount) {
       Logger.debug(

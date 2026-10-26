@@ -39,7 +39,7 @@ class KvQueryBuilder
   Future<QueryResult<Map<String, dynamic>>>? _future;
 
   /// Max engine pages to skip when post-filtering removes an entire page of
-  /// expired rows (avoids returning an empty page while hasMore is true).
+  /// expired records (avoids returning an empty page while hasMore is true).
   static const int _maxEmptyPageSkips = 32;
 
   KvQueryBuilder(this._db, {required bool isGlobal}) : _isGlobal = isGlobal;
@@ -115,7 +115,7 @@ class KvQueryBuilder
 
   /// When true, include expired-but-not-yet-cleaned records.
   ///
-  /// Default false: expired rows are dropped after the engine page is fetched
+  /// Default false: expired records are dropped after the engine page is fetched
   /// (not in SQL where -- wall-clock predicates break cursor signatures and OR
   /// plans disable cursor mode). A page may therefore contain fewer than
   /// [limit] records when some keys in the window are expired.
@@ -179,7 +179,7 @@ class KvQueryBuilder
   /// Synchronously retrieve query results from pure memory cache.
   ///
   /// Never hits disk/files; returns empty result if memory caches miss.
-  /// Expired rows are filtered out (same semantics as [future]).
+  /// Expired records are filtered out (same semantics as [future]).
   QueryResult<Map<String, dynamic>> peek() {
     final result = _executePeekSync();
 
@@ -266,11 +266,11 @@ class KvQueryBuilder
     DateTime now,
   ) {
     final data = <Map<String, dynamic>>[];
-    for (final row in records) {
-      if (!_includeExpired && _db.isKvRecordExpired(row, now: now)) {
-        _db.scheduleExpiredKvCleanup(table, row);
+    for (final record in records) {
+      if (!_includeExpired && _db.isKvRecordExpired(record, now: now)) {
+        _db.scheduleExpiredKvCleanup(table, record);
       } else {
-        data.add(_db.mapUserFacingKvRecord(row));
+        data.add(_db.mapUserFacingKvRecord(record));
       }
     }
     return data;
@@ -338,11 +338,11 @@ class KvQueryBuilder
     YieldController yieldController,
   ) async {
     final data = <Map<String, dynamic>>[];
-    for (final row in records) {
-      if (!_includeExpired && _db.isKvRecordExpired(row, now: now)) {
-        _db.scheduleExpiredKvCleanup(table, row);
+    for (final record in records) {
+      if (!_includeExpired && _db.isKvRecordExpired(record, now: now)) {
+        _db.scheduleExpiredKvCleanup(table, record);
       } else {
-        data.add(_db.mapUserFacingKvRecord(row));
+        data.add(_db.mapUserFacingKvRecord(record));
       }
       // Large limit / heavy JSON values: yield so UI stays responsive.
       final y = yieldController.maybeYield();

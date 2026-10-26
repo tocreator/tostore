@@ -1151,6 +1151,16 @@ class TableMetaManager {
     return _indexCacheEntryFor(schema).vectorIndexes;
   }
 
+  /// Text and neural-sparse indexes sharing the WMBP kernel.
+  List<IndexSchema> getWmbpIndexesFor(TableSchema schema) {
+    return _indexCacheEntryFor(schema).wmbpIndexes;
+  }
+
+  /// O(1) gate: whether [schema] has a text or sparse index.
+  bool hasWmbpIndexes(TableSchema schema) {
+    return _indexCacheEntryFor(schema).wmbpIndexes.isNotEmpty;
+  }
+
   /// O(1) gate: whether [schema] has any vector index (cached list).
   ///
   /// Hot write paths must call this before any vector work so non-vector
@@ -1424,16 +1434,16 @@ class TableMetaManager {
     }
     try {
       _ensureMetaTableIoLayout();
-      final rows = (await _dataStore.queryExecutor.execute(
+      final records = (await _dataStore.queryExecutor.execute(
         bootstrapTableMetaContext(),
         condition: QueryCondition()
           ..where(SystemTable.tableMetaUidField, '=', tableUid.value),
         limit: 1,
       ))
           .records;
-      if (rows.isEmpty) return null;
+      if (records.isEmpty) return null;
 
-      final meta = TableMetaCodec.decodeRow(rows.first);
+      final meta = TableMetaCodec.decodeRow(records.first);
       if (expectEpoch != null && expectEpoch != _cacheEpoch) {
         return meta;
       }
@@ -1491,16 +1501,16 @@ class TableMetaManager {
 
     try {
       _ensureMetaTableIoLayout();
-      final rows = (await _dataStore.queryExecutor.execute(
+      final records = (await _dataStore.queryExecutor.execute(
         bootstrapTableMetaContext(),
         condition: QueryCondition()
           ..where(SystemTable.tableMetaNameField, '=', tableName.value),
         limit: 1,
       ))
           .records;
-      if (rows.isEmpty) return null;
+      if (records.isEmpty) return null;
 
-      final meta = TableMetaCodec.decodeRow(rows.first);
+      final meta = TableMetaCodec.decodeRow(records.first);
       // Register before any further await so re-entrant name resolves
       // (e.g. internal KV -> getTableContext) hit memory.
       _registerMetaInLookups(meta);
@@ -1934,7 +1944,7 @@ class TableMetaManager {
 
   /// List table names.
   ///
-  /// Default: **entire database** (all `_system_table_meta` rows).
+  /// Default: **entire database** (all `_system_table_meta` records).
   ///
   /// [isGlobal] filters by table scope (`true` = global only, `false` =
   /// non-global only, `null` = both). Non-global schemas are shared across
@@ -2031,7 +2041,7 @@ class TableMetaManager {
     }
   }
 
-  /// Load all rows from `_system_table_meta` into memory (with yield).
+  /// Load all records from `_system_table_meta` into memory (with yield).
   ///
   Future<void> loadAllTableMetaAsync() {
     final existing = _loadAllMetaFuture;
@@ -2054,18 +2064,18 @@ class TableMetaManager {
       // Layout only - do not register bootstrap stub as "table exists".
       _ensureMetaTableIoLayout();
 
-      final rows = (await _dataStore.queryExecutor.execute(
+      final records = (await _dataStore.queryExecutor.execute(
         bootstrapTableMetaContext(),
         condition: QueryCondition()
           ..where(SystemTable.tableMetaUidField, '>=', ''),
       ))
           .records;
 
-      for (final row in rows) {
+      for (final row in records) {
         final y1 = yieldController.maybeYield();
         if (y1 != null) await y1;
         final meta = TableMetaCodec.decodeRow(row);
-        // Skip per-row dir increments; rebuild once after the scan.
+        // Skip per-record dir increments; rebuild once after the scan.
         _registerMetaInLookups(meta, updateDirCounts: false);
         _cacheTableMeta(meta);
       }
@@ -2142,6 +2152,7 @@ class _IndexListCacheEntry {
   final List<IndexSchema> uniqueIndexes;
   final List<IndexSchema> vectorIndexes;
   final List<IndexSchema> btreeIndexes;
+  final List<IndexSchema> wmbpIndexes;
   final Map<String, IndexSchema> byUid;
   final Map<String, IndexSchema> byAlias;
   final Map<String, IndexSchema> uniqueBySingleField;
@@ -2151,6 +2162,7 @@ class _IndexListCacheEntry {
     required this.uniqueIndexes,
     required this.vectorIndexes,
     required this.btreeIndexes,
+    required this.wmbpIndexes,
     required this.byUid,
     required this.byAlias,
     required this.uniqueBySingleField,
@@ -2167,6 +2179,7 @@ _IndexListCacheEntry _buildIndexListCache(TableSchema schema) {
       uniqueIndexes: emptyList,
       vectorIndexes: emptyList,
       btreeIndexes: emptyList,
+      wmbpIndexes: emptyList,
       byUid: {},
       byAlias: {},
       uniqueBySingleField: {},
@@ -2176,6 +2189,7 @@ _IndexListCacheEntry _buildIndexListCache(TableSchema schema) {
   final unique = <IndexSchema>[];
   final vector = <IndexSchema>[];
   final btree = <IndexSchema>[];
+  final wmbp = <IndexSchema>[];
   final byUid = <String, IndexSchema>{};
   final byAlias = <String, IndexSchema>{};
   final uniqueBySingleField = <String, IndexSchema>{};
@@ -2189,6 +2203,8 @@ _IndexListCacheEntry _buildIndexListCache(TableSchema schema) {
     }
     if (idx.type == IndexType.vector) {
       vector.add(idx);
+    } else if (idx.type == IndexType.text || idx.type == IndexType.sparse) {
+      wmbp.add(idx);
     } else {
       btree.add(idx);
     }
@@ -2207,6 +2223,7 @@ _IndexListCacheEntry _buildIndexListCache(TableSchema schema) {
     uniqueIndexes: List<IndexSchema>.unmodifiable(unique),
     vectorIndexes: List<IndexSchema>.unmodifiable(vector),
     btreeIndexes: List<IndexSchema>.unmodifiable(btree),
+    wmbpIndexes: List<IndexSchema>.unmodifiable(wmbp),
     byUid: Map<String, IndexSchema>.unmodifiable(byUid),
     byAlias: Map<String, IndexSchema>.unmodifiable(byAlias),
     uniqueBySingleField:

@@ -88,7 +88,7 @@ Depending on the `code` / `codeKey` range and the specific subclass of `ResultSt
 
   | Field | Type | Details |
   | :--- | :--- | :--- |
-  | `primaryKey` | `String?` | **Optional**. Returned only on single-row writes (e.g., `insert`) or updates (e.g., `update`) representing the physically generated or modified record primary key. |
+  | `primaryKey` | `String?` | **Optional**. Returned only on single-record writes (e.g., `insert`) or updates (e.g., `update`) representing the physically generated or modified record primary key. |
 
 - **JSON Example**:
   ```json
@@ -114,7 +114,7 @@ Depending on the `code` / `codeKey` range and the specific subclass of `ResultSt
   | `constraintName` | `String?` | **Optional**. The name of the specific constraint that caused the error (e.g., `fk_users_profile` for foreign key, index name for unique conflict, or `null` for non-null/cast errors). |
   | `fields` | `List<String>` | **Required**. List of fields causing the conflict. |
   | `conflictingKeys` | `List<dynamic>` | **Required**. List of input values causing the conflict, mapping 1:1 to `fields`. If a field is null, the corresponding item in the list is `null`. |
-  | `primaryKey` | `String?` | **Optional**. Associated record primary key. If not a single-row write, or blocked at memory stage, this will be `null`. |
+  | `primaryKey` | `String?` | **Optional**. Associated record primary key. If not a single-record write, or blocked at memory stage, this will be `null`. |
   | `referencedTable` | `String?` | **Optional**. Parent table name in foreign key conflicts. |
 
 - **Leaf Code Guidelines**:
@@ -358,7 +358,7 @@ void handleDatabaseWriteResult(DbResult result) {
   if (!result.hasErrors) {
     print("All write operations succeeded. Affected: ${result.successCount}");
 
-    // For single-row writes, fetch key directly without iterating statuses
+    // For single-record writes, fetch key directly without iterating statuses
     if (result.firstPrimaryKey != null) {
       print("Primary key of the first successful record: ${result.firstPrimaryKey}");
     }

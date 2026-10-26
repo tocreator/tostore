@@ -104,7 +104,7 @@ class ForeignKeyManager {
       if (!loaded) {
         // File mode: system table is the sole authority. Empty means "no FKs" —
         // do NOT scan all schemas (O(n) on large DBs with thousands of tables).
-        // Memory mode: no system FK rows — lazily rebuild from registered schemas
+        // Memory mode: no system FK records — lazily rebuild from registered schemas
         // on first FK use (no open-time preload).
         if (_dataStore.config.persistenceMode == PersistenceMode.memory) {
           await _rebuildCacheFromSchemas();
@@ -329,7 +329,7 @@ class ForeignKeyManager {
         for (int i = 0; i < records.length; i++) {
           if (violations[i] != null) continue;
           final r = records[i];
-          // Match single-row update semantics: absent FK fields are not being
+          // Match single-record update semantics: absent FK fields are not being
           // written, so skip (do not treat Map-miss as NULL).
           if (!r.containsKey(fkField)) {
             if (operation == ForeignKeyOperation.update) {
@@ -1416,7 +1416,7 @@ class ForeignKeyManager {
           // 3. Therefore, all child records referencing the parent table should be deleted
           try {
             // Engine path: deleteInternal defaults allow large-scale (clear may
-            // wipe large child tables). whereNotNull matches rows that still
+            // wipe large child tables). whereNotNull matches records that still
             // reference the parent (SQL != NULL is never true).
             final childTable = await _dataStore.getTableContext(childTableName);
             final condition = QueryCondition();
@@ -2421,7 +2421,7 @@ class ForeignKeyManager {
     TableSchema schema, {
     bool throwOnError = false,
   }) async {
-    // Empty foreignKeys still runs so stale system-table rows are deleted.
+    // Empty foreignKeys still runs so stale system-table records are deleted.
     final referencingName = table.tableName.value;
     try {
       final fkTableName = SystemTable.getFkReferencesName();

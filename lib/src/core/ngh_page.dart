@@ -318,11 +318,11 @@ final class NghLeafPage {
   /// Cached [needsWideNext]; null = unknown.
   bool? _wideNextCache;
 
-  /// Contiguous live-slot 48-D SIMD rows for L2A (12 Float32x4 per slot).
+  /// Contiguous live-slot 48-D SIMD records for L2A (12 Float32x4 per slot).
   /// Same values as per-slot [NghLeafSlot.low48DSimd]; layout only.
   Float32x4List? _search48Simd;
 
-  /// Live (non-tombstone) slots parallel to [_search48Simd] rows.
+  /// Live (non-tombstone) slots parallel to [_search48Simd] records.
   List<NghLeafSlot>? _searchLiveSlots;
 
   /// Cached live slot count; null = recompute. Kept incremental on add/delete.
@@ -385,7 +385,7 @@ final class NghLeafPage {
     _sum48 = null;
   }
 
-  /// Packed L2A 48-D rows (null until [ensureLow48Ready]).
+  /// Packed L2A 48-D records (null until [ensureLow48Ready]).
   Float32x4List? get searchLow48Simd => _search48Simd;
 
   /// Live slots aligned with [searchLow48Simd] (null until [ensureLow48Ready]).
@@ -784,7 +784,7 @@ final class NghLeafPage {
 
   /// Build normalized 48-D SIMD views for every live slot (no-op if already warm).
   /// Also materializes UTF-8 PK bytes so search emit never utf8.encodes per query.
-  /// Rebuilds packed L2A rows only after [_clearSearch48Pack] (never by live count).
+  /// Rebuilds packed L2A records only after [_clearSearch48Pack] (never by live count).
   void ensureLow48Ready() {
     for (final s in slots) {
       if ((s.flags & NghLeafSlot.flagDeleted) != 0) continue;
@@ -1031,11 +1031,23 @@ final class NghNavCentroidNode {
   /// Centroid vector (Float32List of length [dimensions]).
   final Float32List vector;
 
-  /// Head leaf page packed ref (`partitionNo<<20|pageNo`), or -1.
-  int headLeafPageNo;
+  /// Head leaf page (wide pointer; TPG2 / in-memory source of truth).
+  NghPageId headLeafPage;
 
-  /// Tail leaf page packed ref (`partitionNo<<20|pageNo`), or -1.
-  int tailLeafPageNo;
+  /// Tail leaf page (wide pointer; TPG2 / in-memory source of truth).
+  NghPageId tailLeafPage;
+
+  /// Legacy packed view of [headLeafPage], or -1 if none/unrepresentable.
+  int get headLeafPageNo => headLeafPage.tryPack() ?? -1;
+  set headLeafPageNo(int packed) {
+    headLeafPage = packed <= 0 ? NghPageId.none : NghPageId.fromPacked(packed);
+  }
+
+  /// Legacy packed view of [tailLeafPage], or -1 if none/unrepresentable.
+  int get tailLeafPageNo => tailLeafPage.tryPack() ?? -1;
+  set tailLeafPageNo(int packed) {
+    tailLeafPage = packed <= 0 ? NghPageId.none : NghPageId.fromPacked(packed);
+  }
 
   /// Total number of active vectors belonging to this centroid.
   int entryCount;
@@ -1046,7 +1058,10 @@ final class NghNavCentroidNode {
   /// All physical vector leaf pages for this leaf-level centroid (v2 source of truth).
   final List<NghPageId> leafPages;
 
-  /// Packed leaf-page refs for search batch I/O when they still fit in i32.
+  /// Legacy packed subset of [leafPages] that still fit in i32.
+  ///
+  /// May omit partition >= 2048 / pageNo >= 2^20. Do not use as a complete
+  /// list on search or migrate hot paths — prefer [leafPages] / [headLeafPage].
   List<int> get leafPageNos => [
         for (final p in leafPages)
           if (p.tryPack() != null) p.tryPack()!,
@@ -1098,8 +1113,10 @@ final class NghNavCentroidNode {
   NghNavCentroidNode({
     required this.centroidId,
     required this.vector,
-    this.headLeafPageNo = -1,
-    this.tailLeafPageNo = -1,
+    NghPageId? headLeafPage,
+    NghPageId? tailLeafPage,
+    int headLeafPageNo = -1,
+    int tailLeafPageNo = -1,
     this.entryCount = 0,
     List<int>? neighbors,
     List<int>? leafPageNos,
@@ -1112,16 +1129,30 @@ final class NghNavCentroidNode {
     List<int>? childIds,
     this.leafDirDirty = false,
     this.leafPageListReady = false,
-  })  : neighbors = List<int>.of(neighbors ?? const <int>[]),
+  })  : headLeafPage = headLeafPage ??
+            (headLeafPageNo <= 0
+                ? NghPageId.none
+                : NghPageId.fromPacked(headLeafPageNo)),
+        tailLeafPage = tailLeafPage ??
+            (tailLeafPageNo <= 0
+                ? NghPageId.none
+                : NghPageId.fromPacked(tailLeafPageNo)),
+        neighbors = List<int>.of(neighbors ?? const <int>[]),
         childIds = List<int>.of(childIds ?? const <int>[]),
-        leafPages = List<NghPageId>.of(
-          leafPages ??
-              _pagesFromPacked(
-                leafPageNos,
-                headLeafPageNo,
-                tailLeafPageNo,
-              ),
-        ) {
+        leafPages = List<NghPageId>.of(leafPages ?? const <NghPageId>[]) {
+    if (this.leafPages.isEmpty) {
+      if (leafPageNos != null && leafPageNos.isNotEmpty) {
+        for (final p in leafPageNos) {
+          if (p > 0) this.leafPages.add(NghPageId.fromPacked(p));
+        }
+      } else if (!this.headLeafPage.isNone) {
+        this.leafPages.add(this.headLeafPage);
+        if (!this.tailLeafPage.isNone &&
+            this.tailLeafPage != this.headLeafPage) {
+          this.leafPages.add(this.tailLeafPage);
+        }
+      }
+    }
     if (!leafPageListReady) {
       leafPageListReady = this.leafPages.isNotEmpty;
     }
@@ -1132,27 +1163,9 @@ final class NghNavCentroidNode {
     }
   }
 
-  static List<NghPageId> _pagesFromPacked(
-    List<int>? packed,
-    int headPacked,
-    int tailPacked,
-  ) {
-    if (packed != null && packed.isNotEmpty) {
-      return [
-        for (final p in packed)
-          if (p > 0) NghPageId.fromPacked(p)
-      ];
-    }
-    if (headPacked > 0) {
-      if (tailPacked > 0 && tailPacked != headPacked) {
-        return [
-          NghPageId.fromPacked(headPacked),
-          NghPageId.fromPacked(tailPacked),
-        ];
-      }
-      return [NghPageId.fromPacked(headPacked)];
-    }
-    return <NghPageId>[];
+  void setHeadTailFromIds(NghPageId head, NghPageId tail) {
+    headLeafPage = head;
+    tailLeafPage = tail;
   }
 
   void addLeafPage(NghPageId id) {
@@ -1172,11 +1185,6 @@ final class NghNavCentroidNode {
       ..addAll(pages);
     leafDirDirty = true;
     leafPageListReady = true;
-  }
-
-  void setHeadTailFromIds(NghPageId head, NghPageId tail) {
-    headLeafPageNo = head.tryPack() ?? -1;
-    tailLeafPageNo = tail.tryPack() ?? -1;
   }
 }
 
@@ -1209,9 +1217,16 @@ final class NghNavGraphPage {
 
   Uint8List encodePayload() {
     final count = centroids.length;
+    // Snapshot packed leaf refs once per centroid — [leafPageNos] allocates.
+    final packedLeafRefs = List<List<int>>.generate(
+      count,
+      (i) => centroids[i].leafPageNos,
+      growable: false,
+    );
     int totalBytes = 4; // dims: u16, count: u16
 
-    for (final c in centroids) {
+    for (int i = 0; i < count; i++) {
+      final c = centroids[i];
       totalBytes += (4 +
           4 +
           4 +
@@ -1220,7 +1235,7 @@ final class NghNavGraphPage {
           2 +
           c.neighbors.length * 2 +
           2 +
-          c.leafPageNos.length * 4);
+          packedLeafRefs[i].length * 4);
     }
 
     final buf = Uint8List(totalBytes);
@@ -1230,7 +1245,8 @@ final class NghNavGraphPage {
     bd.setUint16(2, count, Endian.little);
 
     int off = 4;
-    for (final c in centroids) {
+    for (int i = 0; i < count; i++) {
+      final c = centroids[i];
       bd.setUint32(off, c.centroidId, Endian.little);
       bd.setInt32(off + 4, c.headLeafPageNo, Endian.little);
       bd.setInt32(off + 8, c.tailLeafPageNo, Endian.little);
@@ -1251,12 +1267,13 @@ final class NghNavGraphPage {
         off += 2;
       }
 
-      final pLen = c.leafPageNos.length;
+      final pNos = packedLeafRefs[i];
+      final pLen = pNos.length;
       bd.setUint16(off, pLen, Endian.little);
       off += 2;
 
       for (int p = 0; p < pLen; p++) {
-        bd.setInt32(off, c.leafPageNos[p], Endian.little);
+        bd.setInt32(off, pNos[p], Endian.little);
         off += 4;
       }
     }
@@ -1410,12 +1427,10 @@ final class NghNavCentroidPage {
       bd.setUint32(off + 18, c.leafDirRoot.wirePage, Endian.little);
       bd.setUint32(off + 22, c.leafDirTail.wirePartition, Endian.little);
       bd.setUint32(off + 26, c.leafDirTail.wirePage, Endian.little);
-      final head = NghPageId.fromPacked(c.headLeafPageNo);
-      final tail = NghPageId.fromPacked(c.tailLeafPageNo);
-      bd.setUint32(off + 30, head.wirePartition, Endian.little);
-      bd.setUint32(off + 34, head.wirePage, Endian.little);
-      bd.setUint32(off + 38, tail.wirePartition, Endian.little);
-      bd.setUint32(off + 42, tail.wirePage, Endian.little);
+      bd.setUint32(off + 30, c.headLeafPage.wirePartition, Endian.little);
+      bd.setUint32(off + 34, c.headLeafPage.wirePage, Endian.little);
+      bd.setUint32(off + 38, c.tailLeafPage.wirePartition, Endian.little);
+      bd.setUint32(off + 42, c.tailLeafPage.wirePage, Endian.little);
       bd.setUint32(off + 46, c.childrenDirRoot.wirePartition, Endian.little);
       bd.setUint32(off + 50, c.childrenDirRoot.wirePage, Endian.little);
       off += 54;
@@ -1532,8 +1547,8 @@ final class NghNavCentroidPage {
       list.add(NghNavCentroidNode(
         centroidId: cId,
         vector: vec,
-        headLeafPageNo: head.tryPack() ?? -1,
-        tailLeafPageNo: tail.tryPack() ?? -1,
+        headLeafPage: head,
+        tailLeafPage: tail,
         entryCount: entries,
         neighbors: neighbors,
         leafPages: <NghPageId>[],
@@ -2021,11 +2036,11 @@ final class NghNavBTreePage {
     }
   }
 
-  /// Contiguous child 48-D SIMD rows (12 Float32x4 per entry).
+  /// Contiguous child 48-D SIMD records (12 Float32x4 per entry).
   /// Same values as [CentroidBranchEntry.centroid48DSimd]; layout only.
   Float32x4List? _search48Simd;
 
-  /// Packed nav 48-D rows (null until [ensureSearch48Ready]).
+  /// Packed nav 48-D records (null until [ensureSearch48Ready]).
   Float32x4List? get search48Simd => _search48Simd;
 
   void invalidateSearch48Pack() {

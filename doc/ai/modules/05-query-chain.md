@@ -74,6 +74,8 @@ QueryBuilder query(String tableName);
 | `join` / `leftJoin` / `rightJoin` | Relational joins |
 | `joinWithForeignKey` / `joinReferencedTable` / `joinReferencingTable` | FK-aware joins |
 | `matchVector` / `orMatchVector` | Hybrid vector (see Vector module) |
+| `matchText` / `orMatchText` | Text Top-K (`TextQuery`, `IndexType.text`) |
+| `matchSparse` / `orMatchSparse` | Neural sparse Top-K (`SparseVectorData`, `IndexType.sparse`) |
 | `useQueryCache([Duration?])` / `noQueryCache()` / `clearQueryCache()` | Result cache |
 | `first` / `count` / `exists` | Convenience |
 | `sum` / `avg` / `min` / `max` | Single-field aggregates |
@@ -84,7 +86,7 @@ QueryBuilder query(String tableName);
 
 | Field / API | Use |
 | :--- | :--- |
-| `data` | Rows |
+| `data` | records |
 | `hasMore` / `hasPrev` | Page flags |
 | `next()` / `prev()` | **Preferred** in-process paging |
 | `nextCursorToken` / `prevCursorToken` | Cross-process / network only |

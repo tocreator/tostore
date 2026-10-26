@@ -1,5 +1,10 @@
 import '../handler/value_matcher.dart';
+import '../model/db_exception.dart';
+import '../model/result_status.dart';
+import '../model/result_type.dart';
+import '../model/sparse_vector_data.dart';
 import '../model/table_schema.dart';
+import '../model/text_query.dart';
 
 /// Query Condition Builder
 class QueryCondition {
@@ -22,6 +27,8 @@ class QueryCondition {
     _cachedSingleEq = null;
     _cachedBuiltMap = null;
     _cachedPureVectorMatch = null;
+    _cachedPureTextMatch = null;
+    _cachedPureSparseMatch = null;
   }
 
   // Order by, limit, offset related properties
@@ -29,7 +36,14 @@ class QueryCondition {
   int? _limit;
   int? _offset;
   String? _cursor;
-  bool _hasVectorMatch = false;
+
+  static const int _retrievalMaskVector = 1 << 0;
+  static const int _retrievalMaskText = 1 << 1;
+  static const int _retrievalMaskSparse = 1 << 2;
+  static const int _retrievalMaskAll =
+      _retrievalMaskVector | _retrievalMaskText | _retrievalMaskSparse;
+
+  int _retrievalFlags = 0;
 
   /// Hot-path cache set by [matchVector] when the condition is still a pure
   /// single-vector predicate. Cleared on any subsequent clause / OR.
@@ -42,8 +56,40 @@ class QueryCondition {
     double? minScore,
   })? _cachedPureVectorMatch;
 
+  /// Hot-path cache set by [matchText] when the condition is still a pure
+  /// single-text predicate. Cleared on any subsequent clause / OR.
+  ({
+    String field,
+    TextQuery query,
+    TextMatchOperator operator,
+    double weight,
+    double? minScore,
+  })? _cachedPureTextMatch;
+
+  /// Hot-path cache set by [matchSparse] when the condition is still a pure
+  /// single-sparse predicate. Cleared on any subsequent clause / OR.
+  ({
+    String field,
+    SparseVectorData query,
+    double weight,
+    double? minScore,
+  })? _cachedPureSparseMatch;
+
   /// Whether this condition tree contains any vector search predicates.
-  bool get hasVectorMatch => _hasVectorMatch;
+  @pragma('vm:prefer-inline')
+  bool get hasVectorMatch => (_retrievalFlags & _retrievalMaskVector) != 0;
+
+  /// Whether this condition tree contains any text retrieval predicates.
+  @pragma('vm:prefer-inline')
+  bool get hasTextMatch => (_retrievalFlags & _retrievalMaskText) != 0;
+
+  /// Whether this condition tree contains any sparse retrieval predicates.
+  @pragma('vm:prefer-inline')
+  bool get hasSparseMatch => (_retrievalFlags & _retrievalMaskSparse) != 0;
+
+  /// Whether this condition tree contains any hybrid retrieval predicate.
+  @pragma('vm:prefer-inline')
+  bool get hasRetrievalMatch => _retrievalFlags != 0;
 
   /// Create a new query condition builder
   QueryCondition();
@@ -51,7 +97,7 @@ class QueryCondition {
   /// Creates a QueryCondition from a map representation.
   factory QueryCondition.fromMap(Map<String, dynamic> map) {
     final qc = QueryCondition();
-    qc._hasVectorMatch = _containsVectorInMap(map);
+    qc._retrievalFlags = _detectRetrievalFlags(map);
     qc._root = ConditionNode(type: NodeType.and);
     qc._root!.children.add(_nodeFromMap(map));
     qc._current = qc._root;
@@ -95,22 +141,28 @@ class QueryCondition {
     }
   }
 
-  static bool _containsVectorInMap(Map<String, dynamic> map) {
+  static int _detectRetrievalFlags(Map<dynamic, dynamic> map) {
+    int flags = 0;
     for (final entry in map.entries) {
-      if (entry.key == 'AND' || entry.key == 'OR') {
-        if (entry.value is List) {
-          for (final item in (entry.value as List)) {
-            if (item is Map<String, dynamic> && _containsVectorInMap(item)) {
-              return true;
+      final key = entry.key;
+      final value = entry.value;
+      if (key == 'AND' || key == 'OR') {
+        if (value is List) {
+          for (final item in value) {
+            if (item is Map) {
+              flags |= _detectRetrievalFlags(item);
+              if (flags == _retrievalMaskAll) return flags;
             }
           }
         }
-      } else if (entry.value is Map &&
-          (entry.value as Map).containsKey(r'$vector')) {
-        return true;
+      } else if (value is Map) {
+        if (value.containsKey(r'$vector')) flags |= _retrievalMaskVector;
+        if (value.containsKey(r'$text')) flags |= _retrievalMaskText;
+        if (value.containsKey(r'$sparse')) flags |= _retrievalMaskSparse;
+        if (flags == _retrievalMaskAll) return flags;
       }
     }
-    return false;
+    return flags;
   }
 
   /// Expose the root for external evaluators
@@ -199,6 +251,23 @@ class QueryCondition {
     }
     // If the current node is an OR node, special handling is needed to maintain correct grouping
     else if (_current!.type == NodeType.or) {
+      // Skip map/tree retrieval scans when this builder has no retrieval flags.
+      if (hasRetrievalMatch) {
+        final bool incomingRetrieval = _mapContainsRetrieval(condition);
+        // A structured predicate after a retrieval OR filters every arm.
+        // Example: matchVector().orMatchText().whereEqual(...) is
+        // (vector OR text) AND field = value, not vector OR (text AND field).
+        if (!incomingRetrieval && _nodeContainsRetrieval(_current!)) {
+          _andBesideOr(_current!, condition);
+          return this;
+        }
+        if (incomingRetrieval) {
+          _current!.children.add(
+            ConditionNode(type: NodeType.leaf, condition: condition),
+          );
+          return this;
+        }
+      }
       // Create a new AND node under the OR node
       final andNode = ConditionNode(type: NodeType.and);
 
@@ -252,6 +321,54 @@ class QueryCondition {
     }
 
     return this;
+  }
+
+  /// AND [condition] with the whole [orNode], not with its last arm.
+  void _andBesideOr(ConditionNode orNode, Map<String, dynamic> condition) {
+    final leaf = ConditionNode(type: NodeType.leaf, condition: condition);
+    final parent = _findParent(_root!, orNode);
+    if (parent != null && parent.type == NodeType.and) {
+      parent.children.add(leaf);
+      _current = parent;
+      return;
+    }
+    final andNode = ConditionNode(type: NodeType.and);
+    andNode.children.add(orNode);
+    andNode.children.add(leaf);
+    if (parent == null || orNode == _root) {
+      _root = andNode;
+      _current = andNode;
+      return;
+    }
+    final index = parent.children.indexOf(orNode);
+    if (index >= 0) {
+      parent.children[index] = andNode;
+    } else {
+      parent.children.add(andNode);
+    }
+    _current = andNode;
+  }
+
+  static bool _mapContainsRetrieval(Map<String, dynamic> condition) {
+    for (final value in condition.values) {
+      if (value is Map &&
+          (value.containsKey(r'$vector') ||
+              value.containsKey(r'$text') ||
+              value.containsKey(r'$sparse'))) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  static bool _nodeContainsRetrieval(ConditionNode node) {
+    if (node.type == NodeType.leaf) {
+      return _mapContainsRetrieval(node.condition);
+    }
+    for (final child in node.children) {
+      if (_nodeContainsRetrieval(child)) return true;
+    }
+    return false;
   }
 
   /// Find the parent node of a node
@@ -366,7 +483,7 @@ class QueryCondition {
   /// Add another condition as an AND condition
   QueryCondition condition(QueryCondition other) {
     if (other.isEmpty) return this;
-    _hasVectorMatch = _hasVectorMatch || other._hasVectorMatch;
+    _retrievalFlags |= other._retrievalFlags;
     _ensureTreeInitialized();
     other._ensureTreeInitialized();
 
@@ -448,7 +565,7 @@ class QueryCondition {
   /// Add another condition as an OR condition
   QueryCondition orCondition(QueryCondition other) {
     if (other.isEmpty) return this;
-    _hasVectorMatch = _hasVectorMatch || other._hasVectorMatch;
+    _retrievalFlags |= other._retrievalFlags;
     _ensureTreeInitialized();
     other._ensureTreeInitialized();
 
@@ -606,6 +723,16 @@ class QueryCondition {
       case r'$vector':
         return {
           field: {r'$vector': value}
+        };
+      case r'$TEXT':
+      case r'$text':
+        return {
+          field: {r'$text': value}
+        };
+      case r'$SPARSE':
+      case r'$sparse':
+        return {
+          field: {r'$sparse': value}
         };
     }
     return {
@@ -901,7 +1028,7 @@ class QueryCondition {
       // It's an operator map like {'>': 10} or {'BETWEEN': {'start': 1, 'end': 5}}
       final newMap = <String, dynamic>{};
       value.forEach((op, opValue) {
-        if (op == r'$vector') {
+        if (op == r'$vector' || op == r'$text' || op == r'$sparse') {
           newMap[op] = opValue;
         } else if (op.toUpperCase() == 'BETWEEN' && opValue is Map) {
           newMap[op] = {
@@ -1011,7 +1138,7 @@ class QueryCondition {
     double? distanceThreshold,
     double? minScore,
   })? tryExtractPureVectorMatch() {
-    if (!_hasVectorMatch) return null;
+    if ((_retrievalFlags & _retrievalMaskVector) == 0) return null;
     final cached = _cachedPureVectorMatch;
     if (cached != null && _conditionCount == 1) return cached;
 
@@ -1062,6 +1189,312 @@ class QueryCondition {
     );
   }
 
+  /// Extracts pure single-text query parameters in O(1) if available, or falls back to
+  /// tree walk for [QueryCondition.fromMap] / rebuilt conditions.
+  ({
+    String field,
+    TextQuery query,
+    TextMatchOperator operator,
+    double weight,
+    double? minScore,
+  })? tryExtractPureTextMatch() {
+    if ((_retrievalFlags & _retrievalMaskText) == 0) return null;
+    final cached = _cachedPureTextMatch;
+    if (cached != null && _conditionCount == 1) return cached;
+
+    if (_root == null) return null;
+
+    ConditionNode? leaf;
+    if (_root!.type == NodeType.leaf) {
+      leaf = _root;
+    } else if (_root!.type == NodeType.and) {
+      if (_root!.children.length == 1) {
+        final c1 = _root!.children.first;
+        if (c1.type == NodeType.leaf) {
+          leaf = c1;
+        } else if (c1.type == NodeType.and &&
+            c1.children.length == 1 &&
+            c1.children.first.type == NodeType.leaf) {
+          leaf = c1.children.first;
+        }
+      }
+    }
+
+    if (leaf == null || leaf.condition.isEmpty || leaf.condition.length != 1) {
+      return null;
+    }
+
+    final entry = leaf.condition.entries.first;
+    final field = entry.key;
+    if (field == 'AND' || field == 'OR') return null;
+
+    final rawVal = entry.value;
+    if (rawVal is! Map || rawVal.length != 1 || !rawVal.containsKey(r'$text')) {
+      return null;
+    }
+    final payload = rawVal[r'$text'];
+    if (payload is! Map) return null;
+    final q = payload['query'];
+    if (q is! TextQuery) return null;
+    final opName = payload['operator'] as String? ?? 'or';
+    final op = opName == 'and' ? TextMatchOperator.and : TextMatchOperator.or;
+
+    return _cachedPureTextMatch = (
+      field: field,
+      query: q,
+      operator: op,
+      weight: (payload['weight'] as num?)?.toDouble() ?? 1.0,
+      minScore: (payload['minScore'] as num?)?.toDouble(),
+    );
+  }
+
+  /// Extract a pure single-sparse predicate (no AND filters / OR branches).
+  ///
+  /// Prefer the O(1) cache written by [matchSparse]; falls back to a shallow
+  /// tree walk for [QueryCondition.fromMap] / rebuilt conditions.
+  ({
+    String field,
+    SparseVectorData query,
+    double weight,
+    double? minScore,
+  })? tryExtractPureSparseMatch() {
+    if ((_retrievalFlags & _retrievalMaskSparse) == 0) return null;
+    final cached = _cachedPureSparseMatch;
+    if (cached != null && _conditionCount == 1) return cached;
+
+    if (_root == null) return null;
+
+    ConditionNode? leaf;
+    if (_root!.type == NodeType.leaf) {
+      leaf = _root;
+    } else if (_root!.type == NodeType.and) {
+      if (_root!.children.length == 1) {
+        final c1 = _root!.children.first;
+        if (c1.type == NodeType.leaf) {
+          leaf = c1;
+        } else if (c1.type == NodeType.and &&
+            c1.children.length == 1 &&
+            c1.children.first.type == NodeType.leaf) {
+          leaf = c1.children.first;
+        }
+      }
+    }
+
+    if (leaf == null || leaf.condition.isEmpty || leaf.condition.length != 1) {
+      return null;
+    }
+
+    final entry = leaf.condition.entries.first;
+    final field = entry.key;
+    if (field == 'AND' || field == 'OR') return null;
+
+    final rawVal = entry.value;
+    if (rawVal is! Map ||
+        rawVal.length != 1 ||
+        !rawVal.containsKey(r'$sparse')) {
+      return null;
+    }
+    final payload = rawVal[r'$sparse'];
+    if (payload is! Map) return null;
+    final q = payload['query'];
+    if (q is! SparseVectorData) return null;
+
+    return _cachedPureSparseMatch = (
+      field: field,
+      query: q,
+      weight: (payload['weight'] as num?)?.toDouble() ?? 1.0,
+      minScore: (payload['minScore'] as num?)?.toDouble(),
+    );
+  }
+
+  /// Single retrieval channel AND non-empty structured filters (no multi-way
+  /// recall OR). Used by the executor to skip build/analyze/fromMap on the
+  /// common `matchX().whereEqual(...)` shape.
+  ///
+  /// Exactly one of [vector] / [text] / [sparse] is set. Returns null for pure
+  /// retrieval (use [tryExtractPureVectorMatch] etc.) or hybrid multi-way trees.
+  ({
+    ({
+      String field,
+      VectorData vector,
+      double weight,
+      int? searchDepth,
+      double? distanceThreshold,
+      double? minScore,
+    })? vector,
+    ({
+      String field,
+      TextQuery query,
+      TextMatchOperator operator,
+      double weight,
+      double? minScore,
+    })? text,
+    ({
+      String field,
+      SparseVectorData query,
+      double weight,
+      double? minScore,
+    })? sparse,
+    QueryCondition filter,
+  })? tryExtractSingleRetrievalWithFilter() {
+    if (_retrievalFlags == 0 || _root == null) return null;
+
+    final retrievalLeaves = <Map<String, dynamic>>[];
+    final filterNodes = <ConditionNode>[];
+    if (!_collectSingleRetrievalAndFilters(
+        _root!, retrievalLeaves, filterNodes)) {
+      return null;
+    }
+    if (retrievalLeaves.length != 1 || filterNodes.isEmpty) return null;
+
+    final leaf = retrievalLeaves.first;
+    final vector = _parseVectorLeaf(leaf);
+    final text = vector == null ? _parseTextLeaf(leaf) : null;
+    final sparse =
+        vector == null && text == null ? _parseSparseLeaf(leaf) : null;
+    if (vector == null && text == null && sparse == null) return null;
+
+    return (
+      vector: vector,
+      text: text,
+      sparse: sparse,
+      filter: _filterConditionFromNodes(filterNodes),
+    );
+  }
+
+  /// Walk an AND-tree: collect at most one retrieval leaf and structured
+  /// siblings. Returns false when a retrieval OR (multi-way recall) is found.
+  static bool _collectSingleRetrievalAndFilters(
+    ConditionNode node,
+    List<Map<String, dynamic>> retrievalOut,
+    List<ConditionNode> filterOut,
+  ) {
+    if (node.type == NodeType.leaf) {
+      if (node.condition.isEmpty) return true;
+      if (_mapContainsRetrieval(node.condition)) {
+        retrievalOut.add(node.condition);
+      } else {
+        filterOut.add(node);
+      }
+      return true;
+    }
+    if (node.type == NodeType.or) {
+      // Retrieval under OR ⇒ multi-way hybrid; structured-only OR is one filter.
+      if (_nodeContainsRetrieval(node)) return false;
+      filterOut.add(node);
+      return true;
+    }
+    for (final child in node.children) {
+      if (!_collectSingleRetrievalAndFilters(child, retrievalOut, filterOut)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static QueryCondition _filterConditionFromNodes(List<ConditionNode> nodes) {
+    final qc = QueryCondition();
+    qc._root = ConditionNode(type: NodeType.and);
+    final and = ConditionNode(type: NodeType.and);
+    qc._root!.children.add(and);
+    for (final n in nodes) {
+      and.children.add(n.clone());
+    }
+    qc._current = and;
+    qc._conditionCount = nodes.length;
+    return qc;
+  }
+
+  static ({
+    String field,
+    VectorData vector,
+    double weight,
+    int? searchDepth,
+    double? distanceThreshold,
+    double? minScore,
+  })? _parseVectorLeaf(Map<String, dynamic> condition) {
+    if (condition.length != 1) return null;
+    final entry = condition.entries.first;
+    final field = entry.key;
+    if (field == 'AND' || field == 'OR') return null;
+    final rawVal = entry.value;
+    if (rawVal is! Map ||
+        rawVal.length != 1 ||
+        !rawVal.containsKey(r'$vector')) {
+      return null;
+    }
+    final payload = rawVal[r'$vector'];
+    if (payload is! Map) return null;
+    final vec = payload['vector'];
+    if (vec is! VectorData) return null;
+    return (
+      field: field,
+      vector: vec,
+      weight: (payload['weight'] as num?)?.toDouble() ?? 1.0,
+      searchDepth: payload['searchDepth'] as int?,
+      distanceThreshold: (payload['distanceThreshold'] as num?)?.toDouble(),
+      minScore: (payload['minScore'] as num?)?.toDouble(),
+    );
+  }
+
+  static ({
+    String field,
+    TextQuery query,
+    TextMatchOperator operator,
+    double weight,
+    double? minScore,
+  })? _parseTextLeaf(Map<String, dynamic> condition) {
+    if (condition.length != 1) return null;
+    final entry = condition.entries.first;
+    final field = entry.key;
+    if (field == 'AND' || field == 'OR') return null;
+    final rawVal = entry.value;
+    if (rawVal is! Map || rawVal.length != 1 || !rawVal.containsKey(r'$text')) {
+      return null;
+    }
+    final payload = rawVal[r'$text'];
+    if (payload is! Map) return null;
+    final q = payload['query'];
+    if (q is! TextQuery) return null;
+    final opName = payload['operator'] as String? ?? 'or';
+    final op = opName == 'and' ? TextMatchOperator.and : TextMatchOperator.or;
+    return (
+      field: field,
+      query: q,
+      operator: op,
+      weight: (payload['weight'] as num?)?.toDouble() ?? 1.0,
+      minScore: (payload['minScore'] as num?)?.toDouble(),
+    );
+  }
+
+  static ({
+    String field,
+    SparseVectorData query,
+    double weight,
+    double? minScore,
+  })? _parseSparseLeaf(Map<String, dynamic> condition) {
+    if (condition.length != 1) return null;
+    final entry = condition.entries.first;
+    final field = entry.key;
+    if (field == 'AND' || field == 'OR') return null;
+    final rawVal = entry.value;
+    if (rawVal is! Map ||
+        rawVal.length != 1 ||
+        !rawVal.containsKey(r'$sparse')) {
+      return null;
+    }
+    final payload = rawVal[r'$sparse'];
+    if (payload is! Map) return null;
+    final q = payload['query'];
+    if (q is! SparseVectorData) return null;
+    return (
+      field: field,
+      query: q,
+      weight: (payload['weight'] as num?)?.toDouble() ?? 1.0,
+      minScore: (payload['minScore'] as num?)?.toDouble(),
+    );
+  }
+
   /// Match records using dense vector similarity search.
   QueryCondition matchVector(
     String field,
@@ -1079,7 +1512,7 @@ class QueryCondition {
       if (minScore != null) 'minScore': minScore,
     };
 
-    _hasVectorMatch = true;
+    _retrievalFlags |= _retrievalMaskVector;
     where(field, r'$vector', payload);
     // where() invalidates caches; re-stash while this remains a single predicate.
     if (_conditionCount == 1) {
@@ -1115,6 +1548,108 @@ class QueryCondition {
     );
     // OR branch is never a pure single-vector query.
     _cachedPureVectorMatch = null;
+    return result;
+  }
+
+  /// Match records by text retrieval on an [IndexType.text] field.
+  QueryCondition matchText(
+    String field,
+    TextQuery query, {
+    TextMatchOperator operator = TextMatchOperator.or,
+    double weight = 1.0,
+    double? minScore,
+  }) {
+    if (operator != TextMatchOperator.or && operator != TextMatchOperator.and) {
+      throw DbException([
+        InvalidArgumentStatus(
+          type: ResultType.devInvalidArgumentType,
+          message:
+              'Text match supports TextMatchOperator.or and TextMatchOperator.and',
+          parameterName: 'operator',
+          passedValue: operator.name,
+        )
+      ]);
+    }
+    final payload = <String, dynamic>{
+      'query': query,
+      'operator': operator.name,
+      'weight': weight,
+      if (minScore != null) 'minScore': minScore,
+    };
+    _retrievalFlags |= _retrievalMaskText;
+    where(field, r'$text', payload);
+    if (_conditionCount == 1) {
+      final cleanField = field.contains('.') ? field.split('.').last : field;
+      _cachedPureTextMatch = (
+        field: cleanField,
+        query: query,
+        operator: operator,
+        weight: weight,
+        minScore: minScore,
+      );
+    }
+    return this;
+  }
+
+  /// OR branch with text retrieval.
+  QueryCondition orMatchText(
+    String field,
+    TextQuery query, {
+    TextMatchOperator operator = TextMatchOperator.or,
+    double weight = 1.0,
+    double? minScore,
+  }) {
+    final result = or().matchText(
+      field,
+      query,
+      operator: operator,
+      weight: weight,
+      minScore: minScore,
+    );
+    _cachedPureTextMatch = null;
+    return result;
+  }
+
+  /// Match records by neural sparse retrieval on an [IndexType.sparse] field.
+  QueryCondition matchSparse(
+    String field,
+    SparseVectorData query, {
+    double weight = 1.0,
+    double? minScore,
+  }) {
+    final payload = <String, dynamic>{
+      'query': query,
+      'weight': weight,
+      if (minScore != null) 'minScore': minScore,
+    };
+    _retrievalFlags |= _retrievalMaskSparse;
+    where(field, r'$sparse', payload);
+    if (_conditionCount == 1) {
+      final cleanField = field.contains('.') ? field.split('.').last : field;
+      _cachedPureSparseMatch = (
+        field: cleanField,
+        query: query,
+        weight: weight,
+        minScore: minScore,
+      );
+    }
+    return this;
+  }
+
+  /// OR branch with neural sparse retrieval.
+  QueryCondition orMatchSparse(
+    String field,
+    SparseVectorData query, {
+    double weight = 1.0,
+    double? minScore,
+  }) {
+    final result = or().matchSparse(
+      field,
+      query,
+      weight: weight,
+      minScore: minScore,
+    );
+    _cachedPureSparseMatch = null;
     return result;
   }
 }

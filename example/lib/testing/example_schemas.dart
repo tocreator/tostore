@@ -123,6 +123,63 @@ class ExampleSchemas {
     ],
   );
 
+  /// Passage-length documents with a full-text index on [textDocs] `content`.
+  static const TableSchema textDocs = TableSchema(
+    name: 'text_docs',
+    primaryKeyConfig: PrimaryKeyConfig(
+      name: 'id',
+      type: PrimaryKeyType.sequential,
+    ),
+    fields: [
+      FieldSchema(name: 'title', type: DataType.text, nullable: false),
+      FieldSchema(name: 'content', type: DataType.text, nullable: false),
+      FieldSchema(
+        name: 'category',
+        type: DataType.text,
+        nullable: false,
+        defaultValue: 'general',
+      ),
+    ],
+    indexes: [
+      IndexSchema(
+        fields: ['content'],
+        type: IndexType.text,
+      ),
+    ],
+  );
+
+  static List<TableSchema> get textTables => [textDocs];
+
+  /// Neural-sparse documents with a sparse index on [sparseDocs] `features`.
+  ///
+  /// Dedicated table for large-scale insert / flush / matchSparse observation
+  /// (see `example/test/sparse_search_throughput_benchmark.dart`).
+  static const TableSchema sparseDocs = TableSchema(
+    name: 'sparse_docs',
+    primaryKeyConfig: PrimaryKeyConfig(
+      name: 'id',
+      type: PrimaryKeyType.sequential,
+    ),
+    fields: [
+      FieldSchema(name: 'title', type: DataType.text, nullable: false),
+      FieldSchema(name: 'features', type: DataType.sparse, nullable: false),
+      FieldSchema(
+        name: 'category',
+        type: DataType.text,
+        nullable: false,
+        defaultValue: 'general',
+      ),
+    ],
+    indexes: [
+      IndexSchema(
+        fields: ['features'],
+        type: IndexType.sparse,
+      ),
+    ],
+  );
+
+  static List<TableSchema> get sparseTables => [sparseDocs];
+
   /// Interactive example tables. Fill and sweep one table at a time —
   /// do not bulk-load every width together.
   ///
@@ -139,6 +196,45 @@ class ExampleSchemas {
   static const int vectorDim8192 = 8192;
   static const int vectorDim16384 = 16384;
   static const int vectorDim65535 = 65535;
+
+  /// Structured filters plus text, sparse, and 128-d vector indexes (demo + tests).
+  static final TableSchema hybridDocs = TableSchema(
+    name: 'hybrid_docs',
+    primaryKeyConfig: const PrimaryKeyConfig(
+      name: 'id',
+      type: PrimaryKeyType.sequential,
+    ),
+    fields: [
+      const FieldSchema(name: 'headline', type: DataType.text, nullable: false),
+      const FieldSchema(name: 'content', type: DataType.text, nullable: false),
+      const FieldSchema(name: 'category', type: DataType.text, nullable: false),
+      const FieldSchema(name: 'year', type: DataType.integer, nullable: false),
+      const FieldSchema(
+          name: 'features', type: DataType.sparse, nullable: true),
+      FieldSchema(
+        name: 'embedding',
+        type: DataType.vector,
+        nullable: true,
+        vectorConfig: VectorFieldConfig(dimensions: vectorDimLow),
+      ),
+    ],
+    indexes: const [
+      IndexSchema(fields: ['category']),
+      IndexSchema(fields: ['year']),
+      IndexSchema(fields: ['content'], type: IndexType.text),
+      IndexSchema(fields: ['features'], type: IndexType.sparse),
+      IndexSchema(
+        fields: ['embedding'],
+        type: IndexType.vector,
+        vectorConfig: VectorIndexConfig(
+          indexType: VectorIndexType.ngh,
+          distanceMetric: VectorDistanceMetric.cosine,
+        ),
+      ),
+    ],
+  );
+
+  static List<TableSchema> get hybridTables => [hybridDocs];
 
   /// 4-d ultra-low demo (bridge before 8-d).
   static final TableSchema embeddings4 = _cosineNghEmbeddings(
@@ -255,11 +351,15 @@ class ExampleSchemas {
     );
   }
 
+  /// Demo / data-view schemas opened with the example app.
   static List<TableSchema> get all => [
         users,
         posts,
         comments,
         settings,
+        ...textTables,
+        ...sparseTables,
+        ...hybridTables,
         ...vectorTables,
       ];
 }

@@ -272,10 +272,12 @@ class VectorSearchResult {
   /// Primary key of the matching record.
   final String primaryKey;
 
-  /// Distance from the query vector (lower = more similar for L2/cosine).
+  /// ANN distance for the field [VectorDistanceMetric] (`lower` = closer).
   final double distance;
 
-  /// Similarity score normalised to `[0, 1]` (higher = more similar).
+  /// Metric-aware similarity in `[0, 1]` (`higher` = more similar).
+  ///
+  /// Same value used as vector-channel [RetrievalEntry.rawScore] / [RetrievalEntry.score].
   final double score;
 
   VectorSearchResult({
@@ -296,10 +298,10 @@ enum RetrievalChannel {
   /// Dense vector similarity search (NGH).
   vector,
 
-  /// Lexical / Fulltext search (BM25 / Inverted Index / Token Match)
+  /// Text retrieval.
   text,
 
-  /// Neural sparse retrieval (SPLADE / learned sparse representation)
+  /// Neural sparse retrieval
   sparse,
 
   /// Knowledge graph / graph traversal retrieval
@@ -313,26 +315,47 @@ enum RetrievalChannel {
 }
 
 /// Strategy used to combine multi-channel retrieval results into a unified score.
+///
+/// Applies only to multi-way recall. Configure via [QueryBuilder.fusionMethod];
+/// default is [weightedScore].
 enum RetrievalFusionMethod {
-  /// Reciprocal Rank Fusion: score = sum(weight_i / (k + rank_i))
-  rrf,
-
-  /// Weighted normalized score linear combination: score = sum(weight_i * normalized_score_i)
+  /// Sum of `weight × channel score` divided by the total weight of every
+  /// vector, text, and sparse channel in the query. A miss contributes 0.
+  /// Default for multi-way recall.
   weightedScore,
 
-  /// Pure single channel (no fusion needed)
-  single,
+  /// Relative score from ranks inside each channel's result set (Reciprocal Rank
+  /// Fusion). Prefer [weightedScore] when absolute relevance thresholds matter.
+  rrf,
 }
 
-/// Detailed retrieval context entry for a single result row.
+/// Detailed retrieval context entry for a single result record.
 class RetrievalEntry {
-  /// Unified normalized fusion score in `[0.0, 1.0]` (higher = more relevant).
+  /// Ranking score for this record (`higher` = better).
+  ///
+  /// - One recall channel: that channel's public score (text/sparse absolute
+  ///   relevance in `[0, 1)`; vector similarity in `[0, 1]`).
+  /// - Multi-way [RetrievalFusionMethod.weightedScore]: weighted sum of
+  ///   channel scores divided by the query's total channel weight. A channel
+  ///   that does not hit contributes 0.
+  /// - Multi-way [RetrievalFusionMethod.rrf]: relative score from ranks inside
+  ///   each channel's result set.
+  ///
+  /// One-channel / weighted scores are not forced to `1.0` for the top hit.
   final double score;
 
   /// The channel/modality that produced or primarily contributed to this match.
   final RetrievalChannel channel;
 
-  /// Raw metric/score before fusion/normalization (e.g. raw cosine similarity, L2 distance, BM25 score).
+  /// Channel or fusion metric (`higher` = better). Same rules as [score].
+  ///
+  /// One recall channel:
+  /// - [RetrievalChannel.text] / [RetrievalChannel.sparse]: continuous match
+  ///   quality (short queries commonly `0..30`; long queries may exceed `100`).
+  /// - [RetrievalChannel.vector]: similarity in `[0, 1]`; ANN distance in
+  ///   `meta['distance']`.
+  ///
+  /// Multi-way: same value as [score] (absolute relevance or relative RRF).
   final double? rawScore;
 
   /// Optional extended channel metadata (e.g. distanceMetric, channelScores, matchedTerms).
@@ -371,29 +394,40 @@ class RetrievalEntry {
 
 /// Retrieval context associated with a [QueryResult], providing scores and fusion diagnostics.
 class RetrievalContext {
-  /// Entries corresponding 1:1 to each row in [QueryResult.data].
+  /// Entries corresponding 1:1 to each record in [QueryResult.data].
   final List<RetrievalEntry> entries;
 
-  /// The fusion strategy applied if multiple channels were queried.
-  final RetrievalFusionMethod fusionMethod;
+  /// Fusion strategy when the query used multi-way recall.
+  ///
+  /// Absent on one-channel results. On multi-way results defaults to
+  /// [RetrievalFusionMethod.weightedScore] unless overridden by
+  /// [QueryBuilder.fusionMethod].
+  final RetrievalFusionMethod? fusionMethod;
 
   /// Overall diagnostics / execution metrics (e.g. total candidates per channel, fusion latency).
   final Map<String, dynamic>? meta;
 
   const RetrievalContext({
     required this.entries,
-    this.fusionMethod = RetrievalFusionMethod.single,
+    this.fusionMethod,
     this.meta,
   });
 
   Map<String, dynamic> toJson() => {
         'entries': entries.map((e) => e.toJson()).toList(),
-        'fusionMethod': fusionMethod.name,
+        if (fusionMethod != null) 'fusionMethod': fusionMethod!.name,
         if (meta != null && meta!.isNotEmpty) 'meta': meta,
       };
 
   factory RetrievalContext.fromJson(Map<String, dynamic> json) {
     final rawEntries = json['entries'] as List?;
+    final fusionName = json['fusionMethod'];
+    RetrievalFusionMethod? fusion;
+    if (fusionName == RetrievalFusionMethod.rrf.name) {
+      fusion = RetrievalFusionMethod.rrf;
+    } else if (fusionName == RetrievalFusionMethod.weightedScore.name) {
+      fusion = RetrievalFusionMethod.weightedScore;
+    }
     return RetrievalContext(
       entries: rawEntries != null
           ? rawEntries
@@ -401,10 +435,7 @@ class RetrievalContext {
                   RetrievalEntry.fromJson(Map<String, dynamic>.from(e as Map)))
               .toList()
           : const [],
-      fusionMethod: RetrievalFusionMethod.values.firstWhere(
-        (m) => m.name == json['fusionMethod'],
-        orElse: () => RetrievalFusionMethod.single,
-      ),
+      fusionMethod: fusion,
       meta: json['meta'] as Map<String, dynamic>?,
     );
   }

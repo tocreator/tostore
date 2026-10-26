@@ -417,8 +417,9 @@ class LegacyNghSearch {
       if (cId < 0 || cId >= navGraph.centroids.length) continue;
       expected.add(cId);
       final c = navGraph.centroids[cId];
-      if (c.leafPageNos.isNotEmpty) {
-        packedRefsToRead.addAll(c.leafPageNos);
+      final pNos = c.leafPageNos;
+      if (pNos.isNotEmpty) {
+        packedRefsToRead.addAll(pNos);
       } else if (c.headLeafPageNo > 0) {
         chainHeads.add(c.headLeafPageNo);
       } else {
@@ -510,8 +511,9 @@ class LegacyNghSearch {
       }
 
       expected.add(cId);
-      if (c.leafPageNos.isNotEmpty) {
-        packedBatch.addAll(c.leafPageNos);
+      final pNos = c.leafPageNos;
+      if (pNos.isNotEmpty) {
+        packedBatch.addAll(pNos);
       } else if (c.headLeafPageNo > 0) {
         chainHeads.add(c.headLeafPageNo);
       } else {

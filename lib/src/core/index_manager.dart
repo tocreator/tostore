@@ -379,7 +379,7 @@ class IndexManager {
     _indexDataCache = TreeCache<dynamic>(
       sizeCalculator: _indexDataCacheSizeBytes,
       maxByteThreshold: isMemoryMode ? 1 : (maxBytes * 0.70).toInt(),
-      minByteThreshold: isMemoryMode ? 1 : 150 * 1024 * 1024,
+      minByteThreshold: isMemoryMode ? 1 : 50 * 1024 * 1024,
       groupDepth: 2,
       comparatorFactory: _indexComparatorFactory,
       weightQueryCallback: isMemoryMode ? null : _queryIndexDataWeight,
@@ -1171,7 +1171,7 @@ class IndexManager {
   /// `!_isDiskIndexFileUsable(meta)`.
   ///
   /// Under parallel table+index flush, table meta may already show persisted
-  /// rows while index meta is still empty; pending/txn overlays remain until
+  /// records while index meta is still empty; pending/txn overlays remain until
   /// cleanupAfterBatch, so prefer fuse over tableScan in that window.
   Future<IndexSearchResult?> _gateUnusableDiskIndexSearch({
     required TableContext table,
@@ -1200,7 +1200,7 @@ class IndexManager {
         await _dataStore.tableDataManager.getTableDataMeta(table.tableUid);
     final persistedTableRecords = tableDataMeta?.totalRecordCount ?? 0;
     if (persistedTableRecords > 0) {
-      // True inconsistency: persisted rows, empty index, no live overlay.
+      // True inconsistency: persisted records, empty index, no live overlay.
       if (!metaWasMissing) {
         Logger.warn(
           'Index ${table.tableName}.'
@@ -1216,7 +1216,7 @@ class IndexManager {
     if (metaWasMissing) {
       return IndexSearchResult.empty();
     }
-    // Empty disk index + no persisted rows: fall through so pending/txn fuse
+    // Empty disk index + no persisted records: fall through so pending/txn fuse
     // can serve unflushed inserts ("insert then query before flush").
     return null;
   }
@@ -1658,6 +1658,14 @@ class IndexManager {
       await _dataStore.vectorIndexManager?.beginIndexBuild(table, indexSchema);
       return;
     }
+    if (indexSchema.type == IndexType.text ||
+        indexSchema.type == IndexType.sparse) {
+      // Wipe durable .wmbp partitions before dropping the in-memory corpus so
+      // rebuild / migration cannot merge onto stale posting chains.
+      await deletePhysicalIndexArtifacts(table, indexUid);
+      _dataStore.wmbpIndexManager?.dropIndex(table, indexSchema);
+      return;
+    }
 
     await deletePhysicalIndexArtifacts(table, indexUid);
     await updateIndexMeta(
@@ -1680,6 +1688,10 @@ class IndexManager {
         ?.findIndexSchemaByUid(table.schema, resolved);
     if (idxSchema?.type == IndexType.vector) {
       await _dataStore.vectorIndexManager?.endIndexBuild(table, resolved);
+      return;
+    }
+    if (idxSchema?.type == IndexType.text ||
+        idxSchema?.type == IndexType.sparse) {
       return;
     }
 
@@ -1964,6 +1976,7 @@ class IndexManager {
   Future<void> clearIndexesForTable(TableContext table) async {
     try {
       _dataStore.vectorIndexManager?.clearCacheForTable(table.tableUid);
+      _dataStore.wmbpIndexManager?.clearTable(table.tableUid);
       _indexMetaCache.remove([table.tableUid]);
       _indexDataCache.remove([table.tableUid]);
       _metaLoadingFutures
@@ -2058,7 +2071,7 @@ class IndexManager {
       }
 
       // Online insert after tryReserveUniques uses skipBufferCheck=true.
-      // With no committed rows there is nothing left to validate here.
+      // With no committed records there is nothing left to validate here.
       if (skipDiskUniqueChecks && skipBufferCheck && !isMemoryMode) {
         return null;
       }
@@ -3271,10 +3284,13 @@ class IndexManager {
 
     // Single pass: split vector vs B+Tree indexes, count B+Tree for budget.
     final vectorTargets = <IndexSchema>[];
+    final wmbpTargets = <IndexSchema>[];
     final btreeTargets = <IndexSchema>[];
     for (final idx in targets) {
       if (idx.type == IndexType.vector) {
         vectorTargets.add(idx);
+      } else if (idx.type == IndexType.text || idx.type == IndexType.sparse) {
+        wmbpTargets.add(idx);
       } else {
         btreeTargets.add(idx);
       }
@@ -3300,6 +3316,19 @@ class IndexManager {
     }
 
     await flushVectorIndexes();
+    if (wmbpTargets.isNotEmpty && _dataStore.wmbpIndexManager != null) {
+      await _dataStore.wmbpIndexManager!.applyChanges(
+        table: table,
+        schema: schema,
+        inserts: inserts,
+        updates: updates,
+        deletes: deletes,
+        seal: true,
+        batchContext: batchContext,
+        concurrency: concurrency,
+        targetIndexes: wmbpTargets,
+      );
+    }
     if (btreeTargets.isEmpty) {
       return;
     }
@@ -4441,9 +4470,13 @@ class IndexManager {
     }
   }
 
+  /// Sync B+Tree index entry TreeCache bytes (excludes page cache / WMBP).
+  int get indexDataCacheEstimatedBytes =>
+      _indexDataCache.estimatedTotalSizeBytes;
+
   /// Get current structured B+Tree index cache size (no NGH / vector).
   Future<int> getCurrentBtreeIndexDataCacheSize() async {
-    final dataCacheSize = _indexDataCache.estimatedTotalSizeBytes;
+    final dataCacheSize = indexDataCacheEstimatedBytes;
     final pageCacheSize =
         _dataStore.indexTreePartitionManager?.getCurrentPageCacheSize() ?? 0;
     return dataCacheSize + pageCacheSize;

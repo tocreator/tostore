@@ -266,7 +266,7 @@ final class TableTreePartitionManager {
 
     // Tier 3.5: Payload encoded without deleted slots (fieldCount == active
     // slots) while current structure still includes deleted markers -- e.g.
-    // promote shadow rows after an evolve layout was incorrectly applied.
+    // promote shadow records after an evolve layout was incorrectly applied.
     // Synthetic names match TableMetaManager deleted-slot encode convention.
     // Must run BEFORE append-only prefix fallback so leading deleted slots
     // are never silently filled from a compacted payload.
@@ -2158,7 +2158,7 @@ final class TableTreePartitionManager {
       timestamps: Timestamps(created: meta.timestamps.created, modified: now),
     );
     // Table occupancy = B+Tree partition growth + overflow file growth.
-    // Large rows (e.g. VectorData) live mostly in overflow; leaf only keeps a ref.
+    // Large records (e.g. VectorData) live mostly in overflow; leaf only keeps a ref.
     _dataStore.tableDataManager.applyTableOccupancyDelta(
       table,
       sizeDelta: sizeDeltaSum + overflowSizeDeltaSum,
@@ -2903,7 +2903,7 @@ final class TableTreePartitionManager {
           neededFields: neededFields,
         );
         if (decoded == null) continue;
-        out.add(TableSchema.rowWithPrimaryKeyFirst(primaryKey, pk, decoded));
+        out.add(TableSchema.recordWithPrimaryKeyFirst(primaryKey, pk, decoded));
       }
     }
     return out;
@@ -2972,7 +2972,7 @@ final class TableTreePartitionManager {
 
     // Step 1: Physical Right-Edge Pruning (B+Tree mathematical ordering)
     // If the minimum key in this batch is strictly greater than the physical maximum key on disk,
-    // it is mathematically impossible for any key in this batch to collide with existing disk rows.
+    // it is mathematically impossible for any key in this batch to collide with existing disk records.
     try {
       final maxDiskKeyBytes =
           await getPhysicalMaxPrimaryKeyBytes(table, metaSnapshot: meta);
@@ -3170,7 +3170,8 @@ final class TableTreePartitionManager {
         if (decoded == null) continue;
         final pk = MemComparableKey.decodeLastText(leaf.keys[i]);
         out.add(pk != null
-            ? TableSchema.rowWithPrimaryKeyFirst(schema.primaryKey, pk, decoded)
+            ? TableSchema.recordWithPrimaryKeyFirst(
+                schema.primaryKey, pk, decoded)
             : decoded);
       }
     }
@@ -3336,7 +3337,8 @@ final class TableTreePartitionManager {
         if (decoded == null) continue;
         final pk = MemComparableKey.decodeLastText(leaf.keys[i]);
         out.add(pk != null
-            ? TableSchema.rowWithPrimaryKeyFirst(schema.primaryKey, pk, decoded)
+            ? TableSchema.recordWithPrimaryKeyFirst(
+                schema.primaryKey, pk, decoded)
             : decoded);
       }
     }
@@ -3569,7 +3571,7 @@ final class TableTreePartitionManager {
           if (decoded == null) continue;
           final pk = MemComparableKey.decodeLastText(k);
           final row = pk != null
-              ? TableSchema.rowWithPrimaryKeyFirst(
+              ? TableSchema.recordWithPrimaryKeyFirst(
                   schema.primaryKey, pk, decoded)
               : decoded;
           if (recordPredicate != null && !recordPredicate(row)) continue;
@@ -3617,7 +3619,7 @@ final class TableTreePartitionManager {
           if (decoded == null) continue;
           final pk = MemComparableKey.decodeLastText(k);
           final row = pk != null
-              ? TableSchema.rowWithPrimaryKeyFirst(
+              ? TableSchema.recordWithPrimaryKeyFirst(
                   schema.primaryKey, pk, decoded)
               : decoded;
           if (recordPredicate != null && !recordPredicate(row)) continue;
@@ -3884,7 +3886,7 @@ final class TableTreePartitionManager {
             );
             if (decoded == null) continue;
             row = pk != null
-                ? TableSchema.rowWithPrimaryKeyFirst(
+                ? TableSchema.recordWithPrimaryKeyFirst(
                     schema.primaryKey, pk, decoded)
                 : decoded;
           } else {
@@ -3941,7 +3943,7 @@ final class TableTreePartitionManager {
             );
             if (decoded == null) continue;
             row = pk != null
-                ? TableSchema.rowWithPrimaryKeyFirst(
+                ? TableSchema.recordWithPrimaryKeyFirst(
                     schema.primaryKey, pk, decoded)
                 : decoded;
           } else {

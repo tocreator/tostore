@@ -1,14 +1,15 @@
 import 'package:path/path.dart' as path;
-import '../model/table_context.dart';
-import '../model/data_store_config.dart';
+
 import '../handler/common.dart';
 import '../handler/weight_snapshot_codec.dart';
-import 'data_store_impl.dart';
+import '../model/data_store_config.dart';
 import '../model/db_exception.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/system_table.dart';
+import '../model/table_context.dart';
 import '../model/table_identity.dart';
+import 'data_store_impl.dart';
 
 /// path manager
 /// responsible for all file path related operations, including table paths, index paths, data paths, etc.
@@ -430,6 +431,126 @@ class PathManager {
     } catch (_) {
       return -1;
     }
+  }
+
+  String _wmbpPartitionDirPathByContext(
+    TableContext table,
+    IndexUid indexUid,
+    String category,
+    int dirIndex,
+  ) {
+    return pathJoin(
+      getWmbpCategoryRootPathByContext(table, indexUid, category),
+      'dir_$dirIndex',
+    );
+  }
+
+  /// Category root: `index/<indexUid>/wmbp/<category>/` (contains `dir_*`).
+  String getWmbpCategoryRootPathByContext(
+    TableContext table,
+    IndexUid indexUid,
+    String category,
+  ) {
+    return pathJoin(
+      getIndexPathByContext(table, indexUid),
+      'wmbp',
+      category,
+    );
+  }
+
+  /// WMBP dictionary partition: `index/<indexUid>/wmbp/dict/dir_<dir>/p<n>.wmbp`.
+  String getWmbpDictPartitionPathByContext(
+    TableContext table,
+    IndexUid indexUid,
+    int partitionNo,
+  ) {
+    final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
+    return pathJoin(
+      _wmbpPartitionDirPathByContext(table, indexUid, 'dict', dirIndex),
+      'p$partitionNo.wmbp',
+    );
+  }
+
+  /// WMBP posting partition: `index/<indexUid>/wmbp/post/dir_<dir>/p<n>.wmbp`.
+  String getWmbpPostPartitionPathByContext(
+    TableContext table,
+    IndexUid indexUid,
+    int partitionNo,
+  ) {
+    final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
+    return pathJoin(
+      _wmbpPartitionDirPathByContext(table, indexUid, 'post', dirIndex),
+      'p$partitionNo.wmbp',
+    );
+  }
+
+  /// WMBP active-mask partition: `index/<indexUid>/wmbp/win/dir_<dir>/p<n>.wmbp`.
+  String getWmbpWinPartitionPathByContext(
+    TableContext table,
+    IndexUid indexUid,
+    int partitionNo,
+  ) {
+    final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
+    return pathJoin(
+      _wmbpPartitionDirPathByContext(table, indexUid, 'win', dirIndex),
+      'p$partitionNo.wmbp',
+    );
+  }
+
+  /// WMBP forward-map partition: `index/<indexUid>/wmbp/fwd/dir_<dir>/p<n>.wmbp`.
+  String getWmbpFwdPartitionPathByContext(
+    TableContext table,
+    IndexUid indexUid,
+    int partitionNo,
+  ) {
+    final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
+    return pathJoin(
+      _wmbpPartitionDirPathByContext(table, indexUid, 'fwd', dirIndex),
+      'p$partitionNo.wmbp',
+    );
+  }
+
+  /// WMBP partition file for [category] (`dict`, `post`, `win`, `fwd`, `rev`).
+  String getWmbpPartitionPathByContext(
+    TableContext table,
+    IndexUid indexUid,
+    String category,
+    int partitionNo,
+  ) {
+    switch (category) {
+      case 'dict':
+        return getWmbpDictPartitionPathByContext(table, indexUid, partitionNo);
+      case 'post':
+        return getWmbpPostPartitionPathByContext(table, indexUid, partitionNo);
+      case 'win':
+        return getWmbpWinPartitionPathByContext(table, indexUid, partitionNo);
+      case 'fwd':
+        return getWmbpFwdPartitionPathByContext(table, indexUid, partitionNo);
+      case 'rev':
+        return getWmbpRevPartitionPathByContext(table, indexUid, partitionNo);
+      default:
+        throw DbException([
+          InvalidArgumentStatus(
+            type: ResultType.devInvalidArgumentType,
+            message: 'Unknown WMBP category $category',
+            parameterName: 'category',
+            passedValue: category,
+          ),
+        ]);
+    }
+  }
+
+  /// WMBP reverse-map partition: `index/<indexUid>/wmbp/rev/dir_<dir>/p<n>.wmbp`.
+  String getWmbpRevPartitionPathByContext(
+    TableContext table,
+    IndexUid indexUid,
+    int partitionNo,
+  ) {
+    final dirIndex = partitionNo ~/ dataStore.maxEntriesPerDir;
+    return pathJoin(
+      _wmbpPartitionDirPathByContext(table, indexUid, 'rev', dirIndex),
+      'p$partitionNo.wmbp',
+    );
   }
 
   //==================================

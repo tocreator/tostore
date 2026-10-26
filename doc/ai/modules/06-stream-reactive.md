@@ -22,7 +22,7 @@ Process large result sets without loading everything at once, and push live upda
 
 | Need | API |
 | :--- | :--- |
-| Stream rows as read (large scan) | `streamQuery` |
+| Stream records as read (large scan) | `streamQuery` |
 | Re-run query when matching table data changes | `query(...).watch()` |
 | Watch one/many KV keys | `watchValue` / `watchValues` or `db.kv.watch` |
 
@@ -36,15 +36,15 @@ StreamQueryBuilder streamQuery(String tableName);
 | :--- | :--- |
 | `select(List<String> fields)` | Projection |
 | `where` / `whereIn` / `whereBetween` / `whereNull` / `whereNotNull` / `or` | Filters |
-| `stream` / `asStream` / `execute` | `Stream<Map<String, dynamic>>` of **rows** |
+| `stream` / `asStream` / `execute` | `Stream<Map<String, dynamic>>` of **records** |
 | `listen(...)` | Convenience subscription |
 
 ```dart
-db.streamQuery('users').where('age', '>', 18).listen((row) {
+db.streamQuery('users').where('age', '>', 18).listen((record) {
   // one record at a time
 });
 
-await for (final row in db.streamQuery('users').whereEqual('id', id).stream) {
+await for (final record in db.streamQuery('users').whereEqual('id', id).stream) {
   // ...
 }
 ```
@@ -97,4 +97,4 @@ db.kv.watch<int>('unread_count').listen((c) { /* ... */ });
 1. Prefer `watch` / `watchValue` over polling for UI sync.
 2. Always `limit` reactive list queries when possible.
 3. Cancel subscriptions when widgets dispose.
-4. `streamQuery` = per-row stream; `watch` = full result refresh stream — do not confuse them.
+4. `streamQuery` = per-record stream; `watch` = full result refresh stream — do not confuse them.

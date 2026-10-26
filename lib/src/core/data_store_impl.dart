@@ -86,6 +86,7 @@ import 'ttl_cleanup_manager.dart';
 import 'vector_index_manager.dart';
 import 'wal_manager.dart';
 import 'weight_manager.dart';
+import 'wmbp_index_manager.dart';
 import 'workload_scheduler.dart';
 import 'write_buffer_manager.dart';
 import 'yield_controller.dart';
@@ -156,6 +157,15 @@ class DataStoreImpl {
   /// [_closing] / [globalQueryCancelToken] and does not await this future.
   Future<void>? _prewarmFuture;
 
+  /// Per-table startup-prewarm gates.
+  ///
+  /// Keyed by [TableUid] (extension type over [String] — same hash cost as
+  /// `.value`). Present while that table's warm body runs and/or while
+  /// clear/drop excludes it. Removed when exclude depth is 0 and no body is
+  /// in flight so a later warm gets a fresh [CancellationToken].
+  final Map<TableUid, _TablePrewarmGate> _tablePrewarmGates =
+      <TableUid, _TablePrewarmGate>{};
+
   /// True when long-running leaf scans should stop (close /
   /// global query cancel). Checked on each leaf page boundary.
   ///
@@ -165,8 +175,17 @@ class DataStoreImpl {
   ///
   /// Do NOT add sticky generation/epoch here: a stuck flag permanently aborts
   /// core scans. Space switch isolation is instance replacement in [ToStore].
+  /// Per-table clear/drop uses [shouldAbortPrewarmForTable] only.
   bool get shouldAbortBackgroundScan =>
       _closing || _globalQueryCancelToken.isCancelled;
+
+  /// Close/global cancel, or this table's prewarm [CancellationToken] was
+  /// cancelled by clear/drop (other tables keep warming).
+  bool shouldAbortPrewarmForTable(TableUid tableUid) {
+    if (shouldAbortBackgroundScan) return true;
+    final gate = _tablePrewarmGates[tableUid];
+    return gate != null && gate.token.isCancelled;
+  }
 
   // Global configuration cache
   GlobalConfig? _globalConfigCache;
@@ -183,6 +202,7 @@ class DataStoreImpl {
 
   IndexManager? _indexManager;
   VectorIndexManager? _vectorIndexManager;
+  WmbpIndexManager? _wmbpIndexManager;
   QueryOptimizer? _queryOptimizer;
   QueryExecutor? _queryExecutor;
   ForeignKeyManager? _foreignKeyManager;
@@ -399,6 +419,9 @@ class DataStoreImpl {
 
   /// Get vector index manager
   VectorIndexManager? get vectorIndexManager => _vectorIndexManager;
+
+  /// Text and neural-sparse index manager.
+  WmbpIndexManager? get wmbpIndexManager => _wmbpIndexManager;
 
   /// Get resource manager
   ResourceManager? get resourceManager => _resourceManager;
@@ -665,6 +688,7 @@ class DataStoreImpl {
 
     _initializing = true;
     _closing = false;
+    _resetTablePrewarmGates();
     _startupProgressCallback?.call(0.0, DbStartupStage.opening);
     try {
       if (_config != null && (reinitialize || _isInitialized)) {
@@ -678,6 +702,7 @@ class DataStoreImpl {
         // mid-init system ops do not hit DbClosedException from ensureInitialized.
         _initializing = true;
         _closing = false;
+        _resetTablePrewarmGates();
       }
       _globalQueryCancelToken = CancellationToken();
       // Ensure this instance is re-registered after successful initialization
@@ -773,8 +798,16 @@ class DataStoreImpl {
       tableMetaManager = TableMetaManager(this);
       _pathManager = PathManager(this);
 
-      // Initialize resource manager
+      // Start memory/disk probe early, but do not await yet — overlaps with
+      // GlobalConfig / activeSpace work below. Join the *same* Future before
+      // TreeCache-owning managers construct. Do not use ensureInitialized()
+      // here: initialize()'s finally clears _initFuture, so a failed or
+      // already-finished probe would no-op and leave quotas at 0.
       _resourceManager = ResourceManager();
+      final resourceInitFuture =
+          _resourceManager!.initialize(_config!, this).catchError((Object e) {
+        Logger.warn('ResourceManager startup init failed', rawError: e);
+      });
 
       // Create key manager instance but don't initialize yet
       _keyManager = KeyManager(this);
@@ -799,8 +832,11 @@ class DataStoreImpl {
         }
       }
 
+      await resourceInitFuture;
+
       _indexManager = IndexManager(this);
       _vectorIndexManager = VectorIndexManager(this);
+      _wmbpIndexManager = WmbpIndexManager(this);
       indexTreePartitionManager = IndexTreePartitionManager(this);
       tableTreePartitionManager = TableTreePartitionManager(this);
       _tableDataManager = TableDataManager(this);
@@ -1051,7 +1087,7 @@ class DataStoreImpl {
           }
         }
 
-        // Without journal: no WAL replay path, so meta rows must hit disk now.
+        // Without journal: no WAL replay path, so meta records must hit disk now.
         await _flushFirstInstallDurabilityBarrier();
         await tableMetaManager?.updateSchemaHashes(
           systemSchemas: systemSchemas,
@@ -1140,7 +1176,7 @@ class DataStoreImpl {
 
   /// Durability before persisting first-install schema hashes.
   ///
-  /// Journal on: only ensure WAL entries are on disk (meta rows recover on
+  /// Journal on: only ensure WAL entries are on disk (meta records recover on
   /// next open). Journal off: full buffer/WAL/storage flush.
   Future<void> _flushFirstInstallDurabilityBarrier() async {
     if (!config.enableJournal) {
@@ -1204,6 +1240,7 @@ class DataStoreImpl {
         } catch (_) {}
         _indexManager = null;
         _vectorIndexManager = null;
+        _wmbpIndexManager = null;
         _weightManager = null;
         _keyManager = null;
         tableMetaManager = null;
@@ -1372,6 +1409,7 @@ class DataStoreImpl {
         indexTreePartitionManager = null;
         _treeMetaPageService = null;
         _vectorIndexManager = null;
+        _wmbpIndexManager = null;
         _tableDataManager = null;
         _queryOptimizer = null;
         _queryExecutor = null;
@@ -2093,6 +2131,15 @@ class DataStoreImpl {
         );
         if (vectorApply != null) await vectorApply;
       }
+      if (txId == null || TransactionContext.isApplyingCommit()) {
+        final wmbpApply = tableDataManager.applyWmbpIndexChanges(
+          table: table,
+          schema: schema,
+          operation: BufferOperationType.insert,
+          records: [orderedValidData],
+        );
+        if (wmbpApply != null) await wmbpApply;
+      }
 
       // Advance generator and maxId if user provided a manual primary key
       if (userProvidedPk &&
@@ -2354,7 +2401,7 @@ class DataStoreImpl {
   /// Engine-facing update.
   ///
   /// Defaults allow large-scale ops ([allowLargeScaleOperation] true) while
-  /// still collecting per-row details on the normal path ([returnResultDetails]
+  /// still collecting per-record details on the normal path ([returnResultDetails]
   /// true). Public builders must pass [allowLargeScaleOperation] false unless
   /// the user chained [UpdateBuilder.allowLargeScaleOperation]. Large-scale
   /// path never returns primary-key lists (only [DbResult.successCount]).
@@ -2569,7 +2616,7 @@ class DataStoreImpl {
         // - table data meta is unknown or size invalid
         // - size < 50MB (unconditional minimum threshold)
         // - size < 30% of record cache size
-        // Include overflow files: large VectorData rows live mostly out-of-line.
+        // Include overflow files: large VectorData records live mostly out-of-line.
         const int minSmallTableBytes = 50 * 1024 * 1024; // 50MB
         final tableDataSizeBytes =
             await tableDataManager.sumTableDataSizeBytes(table);
@@ -2643,7 +2690,7 @@ class DataStoreImpl {
         }
         if (!allowLargeScaleOperation) {
           const message =
-              'This is a large-scale data update operation. To prevent memory overflow, you must explicitly call allowLargeScaleOperation(). The operation will run in background batches and block until completion; success/failure primary keys and per-row status details are not returned. If interrupted, already-persisted changes are kept and you must retry to continue.';
+              'This is a large-scale data update operation. To prevent memory overflow, you must explicitly call allowLargeScaleOperation(). The operation will run in background batches and block until completion; success/failure primary keys and per-record status details are not returned. If interrupted, already-persisted changes are kept and you must retry to continue.';
           Logger.warn(message);
           return finish(DbResult.error(
             type: ResultType.devLargeScaleOperationRequired,
@@ -2778,7 +2825,7 @@ class DataStoreImpl {
           }
         }
 
-        // Mirror successful old-working rows before returning; skip when the
+        // Mirror successful old-working records before returning; skip when the
         // active transaction will abort and roll back those writes.
         Future<DbResult> finishWithPromoteMirror(DbResult r) async {
           // Non-txn row locks must not survive early returns (unique/FK/cascade).
@@ -3500,6 +3547,16 @@ class DataStoreImpl {
               );
               if (vectorApply != null) await vectorApply;
             }
+            if (txId == null || TransactionContext.isApplyingCommit()) {
+              final wmbpApply = tableDataManager.applyWmbpIndexChanges(
+                table: table,
+                schema: schema,
+                operation: BufferOperationType.update,
+                records: [updatedRecord],
+                oldRecordsList: [oldRecordValues],
+              );
+              if (wmbpApply != null) await wmbpApply;
+            }
 
             final displayPk = promoteDesc != null
                 ? _promoteUserFacingSuccessKey(
@@ -3686,92 +3743,120 @@ class DataStoreImpl {
       await ensureInitialized();
     }
 
-    String? clearOpId;
     try {
-      final table = await getTableContext(tableName);
+      final table =
+          getTableContextSync(tableName) ?? await getTableContext(tableName);
 
-      if (registerWalOp && config.enableJournal) {
+      // Cancel only this table's startup prewarm token; other tables keep warming.
+      return await _withTableExcludedFromPrewarm(table.tableUid, () async {
+        String? clearOpId;
         try {
-          final cutoff = walManager.currentPointer;
-          final opId = GlobalIdGenerator.generate('tbl_clear_');
-          final op = TableOpMeta(
-            opId: opId,
-            tableUid: table.tableUid,
-            type: 'clear',
-            cutoff: cutoff,
-            createdAt: DateTime.now().toIso8601String(),
-          );
-          await walManager.registerTableOp(op);
-          clearOpId = opId;
-        } catch (e) {
-          Logger.warn('Register clear table op failed', rawError: e);
-        }
-      }
-
-      // Handle foreign key cascade operations before clearing the table
-      // This ensures data consistency: child records are handled according to foreign key policies
-      if (_foreignKeyManager != null) {
-        try {
-          await _foreignKeyManager!.handleCascadeClear(table);
-        } catch (e) {
-          Logger.error('Cascade clear failed', rawError: e);
-          // RESTRICT rejects before mutating children - drop the pending WAL op
-          // so restart will not keep replaying a clear that never started.
-          // Mid-cascade failures keep the op so resume can finish the wipe.
-          if (_isFkRestrictBeforeMutation(e)) {
-            await _abortRegisteredTableOp(clearOpId);
+          if (registerWalOp && config.enableJournal) {
+            try {
+              final cutoff = walManager.currentPointer;
+              final opId = GlobalIdGenerator.generate('tbl_clear_');
+              final op = TableOpMeta(
+                opId: opId,
+                tableUid: table.tableUid,
+                type: 'clear',
+                cutoff: cutoff,
+                createdAt: DateTime.now().toIso8601String(),
+              );
+              await walManager.registerTableOp(op);
+              clearOpId = opId;
+            } catch (e) {
+              Logger.warn('Register clear table op failed', rawError: e);
+            }
           }
-          return finish(_normalizeCascadeError(e, 'clear'));
-        }
-      }
 
-      // Abort in-flight / queued schema rewrites and purge all background writes
-      // before wiping rows; otherwise a late flush could resurrect cleared data.
-      // Key migration pause is global - always resume in finally after wipe.
-      var keyMigrationPaused = false;
-      try {
-        keyMigrationPaused =
-            await migrationManager?.reconcileOnClear(table) ?? false;
+          // Handle foreign key cascade operations before clearing the table
+          // This ensures data consistency: child records are handled according to foreign key policies
+          if (_foreignKeyManager != null) {
+            try {
+              await _foreignKeyManager!.handleCascadeClear(table);
+            } catch (e) {
+              Logger.error('Cascade clear failed', rawError: e);
+              // RESTRICT rejects before mutating children - drop the pending WAL op
+              // so restart will not keep replaying a clear that never started.
+              // Mid-cascade failures keep the op so resume can finish the wipe.
+              if (_isFkRestrictBeforeMutation(e)) {
+                await _abortRegisteredTableOp(clearOpId);
+              }
+              return finish(_normalizeCascadeError(e, 'clear'));
+            }
+          }
 
-        // NOTE: clear() removes table data but keeps schema (esp. memory mode).
-        await cacheManager.invalidateCache(table, invalidateSchema: false);
-        await tableDataManager.clearTable(table);
-        await _indexManager?.clearIndexesForTable(table);
+          // Abort in-flight / queued schema rewrites and purge all background writes
+          // before wiping records; otherwise a late flush could resurrect cleared data.
+          // Key migration pause is global - always resume in finally after wipe.
+          var keyMigrationPaused = false;
+          try {
+            keyMigrationPaused =
+                await migrationManager?.reconcileOnClear(table) ?? false;
 
-        final promoteDesc = _promoteRuntimeForDualWrite(
-          table.tableUid,
-          enablePromoteDualWrite: enablePromoteDualWrite,
-        );
-        if (promoteDesc != null) {
-          await _promoteMirrorClearShadow(promoteDesc);
-        }
-      } finally {
-        // Restarts KeyMigrationRunner for remaining tables (and this empty one).
-        migrationManager
-            ?.resumeKeyMigrationAfterDestructive(keyMigrationPaused);
-      }
+            // NOTE: clear() removes table data but keeps schema (esp. memory mode).
+            await cacheManager.invalidateCache(table, invalidateSchema: false);
+            await tableDataManager.clearTable(table);
+            await _indexManager?.clearIndexesForTable(table);
 
-      // Notify watchers that the table has been cleared
-      notificationManager.notify(ChangeEvent(
-        type: ChangeType.clear,
-        tableUid: table.tableUid,
-      ));
+            final promoteDesc = _promoteRuntimeForDualWrite(
+              table.tableUid,
+              enablePromoteDualWrite: enablePromoteDualWrite,
+            );
+            if (promoteDesc != null) {
+              await _promoteMirrorClearShadow(promoteDesc);
+            }
+          } finally {
+            // Restarts KeyMigrationRunner for remaining tables (and this empty one).
+            migrationManager
+                ?.resumeKeyMigrationAfterDestructive(keyMigrationPaused);
+          }
 
-      // If there is no WAL segment newer than the cutoff (i.e. cutoff is at
-      // or before checkpoint), the clear/drop op does not need to stay in
-      // WAL meta for skip semantics. After a successful clear we can mark
-      // the op as completed so that it will be removed if safe.
-      if (registerWalOp && config.enableJournal && clearOpId != null) {
-        try {
-          await walManager.completeTableOp(clearOpId);
+          // Notify watchers that the table has been cleared
+          notificationManager.notify(ChangeEvent(
+            type: ChangeType.clear,
+            tableUid: table.tableUid,
+          ));
+
+          // If there is no WAL segment newer than the cutoff (i.e. cutoff is at
+          // or before checkpoint), the clear/drop op does not need to stay in
+          // WAL meta for skip semantics. After a successful clear we can mark
+          // the op as completed so that it will be removed if safe.
+          if (registerWalOp && config.enableJournal && clearOpId != null) {
+            try {
+              await walManager.completeTableOp(clearOpId);
+            } catch (e) {
+              Logger.warn('Complete clear table op failed', rawError: e);
+            }
+          }
+
+          return finish(DbResult.success(
+            message: 'Table $tableName cleared successfully',
+          ));
         } catch (e) {
-          Logger.warn('Complete clear table op failed', rawError: e);
+          if (_isDevTableNotFound(e)) {
+            if (isInTransactionWithRollback()) {
+              rethrow;
+            }
+            return finish(DbResult.error(
+              type: ResultType.devTableNotFound,
+              message: 'Table $tableName does not exist',
+              statuses: (e as DbException).statuses,
+            ));
+          }
+          Logger.warn('Clear table failed', rawError: e);
+          if (isInTransactionWithRollback()) {
+            rethrow;
+          }
+          final dbEx = DbException.wrap(e,
+              fallbackType: ResultType.engError,
+              fallbackMessage: 'Failed to clear table $tableName');
+          return finish(DbResult.batch(
+            statuses: dbEx.statuses,
+            failedCount: dbEx.statuses.length,
+          ));
         }
-      }
-
-      return finish(DbResult.success(
-        message: 'Table $tableName cleared successfully',
-      ));
+      });
     } catch (e) {
       if (_isDevTableNotFound(e)) {
         if (isInTransactionWithRollback()) {
@@ -3783,22 +3868,12 @@ class DataStoreImpl {
           statuses: (e as DbException).statuses,
         ));
       }
-      Logger.warn('Clear table failed', rawError: e);
-      if (isInTransactionWithRollback()) {
-        rethrow;
-      }
-      final dbEx = DbException.wrap(e,
-          fallbackType: ResultType.engError,
-          fallbackMessage: 'Failed to clear table $tableName');
-      return finish(DbResult.batch(
-        statuses: dbEx.statuses,
-        failedCount: dbEx.statuses.length,
-      ));
+      rethrow;
     }
   }
 
   /// Engine-facing delete. Defaults allow large-scale ops ([allowLargeScaleOperation]
-  /// true) while still collecting per-row details on the normal path
+  /// true) while still collecting per-record details on the normal path
   /// ([returnResultDetails] true). Public builders must pass
   /// [allowLargeScaleOperation] false unless the user chained
   /// [DeleteBuilder.allowLargeScaleOperation]. Large-scale path never returns
@@ -3931,7 +4006,7 @@ class DataStoreImpl {
         // - table data meta is unknown or size invalid
         // - size < 50MB (unconditional minimum threshold)
         // - size < 30% of record cache size
-        // Include overflow files: large VectorData rows live mostly out-of-line.
+        // Include overflow files: large VectorData records live mostly out-of-line.
         const int minSmallTableBytes = 50 * 1024 * 1024; // 50MB
         final tableDataSizeBytes =
             await tableDataManager.sumTableDataSizeBytes(table);
@@ -4005,7 +4080,7 @@ class DataStoreImpl {
           }
           if (!allowLargeScaleOperation) {
             const message =
-                'This is a large-scale data delete operation. To prevent memory overflow, you must explicitly call allowLargeScaleOperation(). The operation will run in background batches and block until completion; success/failure primary keys and per-row status details are not returned. If interrupted, already-persisted changes are kept and you must retry to continue.';
+                'This is a large-scale data delete operation. To prevent memory overflow, you must explicitly call allowLargeScaleOperation(). The operation will run in background batches and block until completion; success/failure primary keys and per-record status details are not returned. If interrupted, already-persisted changes are kept and you must retry to continue.';
             Logger.warn(message);
             return finish(DbResult.error(
               type: ResultType.devLargeScaleOperationRequired,
@@ -4222,6 +4297,15 @@ class DataStoreImpl {
             records: [recordsToDelete.first],
           );
           if (vectorApply != null) await vectorApply;
+        }
+        if (txId == null || TransactionContext.isApplyingCommit()) {
+          final wmbpApply = tableDataManager.applyWmbpIndexChanges(
+            table: table,
+            schema: table.schema,
+            operation: BufferOperationType.delete,
+            records: [recordsToDelete.first],
+          );
+          if (wmbpApply != null) await wmbpApply;
         }
       } else {
         await tableDataManager.addToDeleteBuffer(
@@ -4579,136 +4663,164 @@ class DataStoreImpl {
     DbResult finish(DbResult r) =>
         _returnOrThrowIfTxn(r, 'dropTable', tableName);
 
+    if (registerWalOp) {
+      await ensureInitialized();
+    }
+
     try {
-      if (registerWalOp) {
-        await ensureInitialized();
-      }
-
       final table = await getTableContext(tableName);
-      String? dropOpId;
-      if (isMigration) {
-        // During migration, only delete the table data directory in the current space
-        Logger.info(
-          'Deleting table $tableName data in space $_currentSpaceName during migration',
-        );
 
-        final tablePath = _pathManager!.getTablePathByContext(table);
-        if (await storage.existsDirectory(tablePath)) {
-          await storage.deleteDirectory(tablePath);
-          Logger.info(
-            'Deleted data directory for table $tableName in space $_currentSpaceName: $tablePath',
-          );
-        }
-        await tableMetaManager?.deleteTableMeta(table.tableUid);
-
-        return finish(DbResult.success(
-          message:
-              'Table $tableName data deleted in space $_currentSpaceName during migration',
-        ));
-      } else {
-        if (registerWalOp && config.enableJournal) {
-          try {
-            final cutoff = walManager.currentPointer;
-            final opId = GlobalIdGenerator.generate('tbl_drop_');
-            final op = TableOpMeta(
-              opId: opId,
-              tableUid: table.tableUid,
-              type: 'drop',
-              cutoff: cutoff,
-              createdAt: DateTime.now().toIso8601String(),
-            );
-            await walManager.registerTableOp(op);
-            dropOpId = opId;
-          } catch (e) {
-            Logger.warn('Register drop table op failed', rawError: e);
-          }
-        }
-
-        // Handle foreign key cascade operations before dropping the table
-        if (_foreignKeyManager != null) {
-          try {
-            await _foreignKeyManager!.handleCascadeClear(table);
-          } catch (e) {
-            Logger.error('Cascade drop failed', rawError: e);
-            if (_isFkRestrictBeforeMutation(e)) {
-              await _abortRegisteredTableOp(dropOpId);
-            }
-            return finish(_normalizeCascadeError(e, 'drop'));
-          }
-
-          // Clean up system table entries for the dropped table
-          await _foreignKeyManager!.cleanupSystemTableForDroppedTable(table);
-        }
-
-        // Abort and remove all pending/running schema tasks for this table
-        // before physical delete rewrites must not touch a dropped table.
-        // Key migration pause is global always resume in finally after drop.
-        var keyMigrationPaused = false;
+      // Cancel only this table's startup prewarm token before deleting dirs.
+      return await _withTableExcludedFromPrewarm(table.tableUid, () async {
         try {
-          keyMigrationPaused =
-              await migrationManager?.reconcileOnDrop(table) ?? false;
+          String? dropOpId;
+          if (isMigration) {
+            // During migration, only delete the table data directory in the current space
+            Logger.info(
+              'Deleting table $tableName data in space $_currentSpaceName during migration',
+            );
 
-          // Clear table memory caches and table-manager state (not disk wipe).
-          await cacheManager.invalidateCache(table, removeTableState: true);
+            final tablePath = _pathManager!.getTablePathByContext(table);
+            if (await storage.existsDirectory(tablePath)) {
+              await storage.deleteDirectory(tablePath);
+              Logger.info(
+                'Deleted data directory for table $tableName in space $_currentSpaceName: $tablePath',
+              );
+            }
+            await tableMetaManager?.deleteTableMeta(table.tableUid);
 
-          // Deleting a table requires updating statistics
-          await tableDataManager.tableDeleted(table);
+            return finish(DbResult.success(
+              message:
+                  'Table $tableName data deleted in space $_currentSpaceName during migration',
+            ));
+          }
 
-          // Get table path
-          String? tablePath;
+          if (registerWalOp && config.enableJournal) {
+            try {
+              final cutoff = walManager.currentPointer;
+              final opId = GlobalIdGenerator.generate('tbl_drop_');
+              final op = TableOpMeta(
+                opId: opId,
+                tableUid: table.tableUid,
+                type: 'drop',
+                cutoff: cutoff,
+                createdAt: DateTime.now().toIso8601String(),
+              );
+              await walManager.registerTableOp(op);
+              dropOpId = opId;
+            } catch (e) {
+              Logger.warn('Register drop table op failed', rawError: e);
+            }
+          }
+
+          // Handle foreign key cascade operations before dropping the table
+          if (_foreignKeyManager != null) {
+            try {
+              await _foreignKeyManager!.handleCascadeClear(table);
+            } catch (e) {
+              Logger.error('Cascade drop failed', rawError: e);
+              if (_isFkRestrictBeforeMutation(e)) {
+                await _abortRegisteredTableOp(dropOpId);
+              }
+              return finish(_normalizeCascadeError(e, 'drop'));
+            }
+
+            // Clean up system table entries for the dropped table
+            await _foreignKeyManager!.cleanupSystemTableForDroppedTable(table);
+          }
+
+          // Abort and remove all pending/running schema tasks for this table
+          // before physical delete rewrites must not touch a dropped table.
+          // Key migration pause is global always resume in finally after drop.
+          var keyMigrationPaused = false;
           try {
-            tablePath = _pathManager!.getTablePathByContext(table);
-          } catch (e) {
-            // skip
+            keyMigrationPaused =
+                await migrationManager?.reconcileOnDrop(table) ?? false;
+
+            // Clear table memory caches and table-manager state (not disk wipe).
+            await cacheManager.invalidateCache(table, removeTableState: true);
+
+            // Deleting a table requires updating statistics
+            await tableDataManager.tableDeleted(table);
+
+            // Get table path
+            String? tablePath;
+            try {
+              tablePath = _pathManager!.getTablePathByContext(table);
+            } catch (e) {
+              // skip
+            }
+
+            // Delete table structure
+            if (tableMetaManager != null) {
+              await tableMetaManager!.deleteTableMeta(table.tableUid);
+            }
+
+            // Delete table directory and all related files
+            if (tablePath != null && await storage.existsDirectory(tablePath)) {
+              await storage.deleteDirectory(tablePath);
+            }
+          } finally {
+            migrationManager
+                ?.resumeKeyMigrationAfterDestructive(keyMigrationPaused);
           }
 
-          // Delete table structure
-          if (tableMetaManager != null) {
-            await tableMetaManager!.deleteTableMeta(table.tableUid);
+          if (registerWalOp) {
+            // Cross-space cleanup: pass schema snapshot because current-space
+            // meta/dir are already deleted above.
+            await migrationManager?.addMigrationTask(
+              table.tableUid,
+              [const MigrationOperation(type: MigrationType.dropTable)],
+              oldSchemaSnapshot: table.schema,
+            );
           }
 
-          // Delete table directory and all related files
-          if (tablePath != null && await storage.existsDirectory(tablePath)) {
-            await storage.deleteDirectory(tablePath);
+          // Same rationale as clear(): after the physical drop has completed,
+          // try to mark the table-op as completed so that it can be removed
+          // from WAL meta when its cutoff is not newer than checkpoint.
+          if (registerWalOp && config.enableJournal && dropOpId != null) {
+            try {
+              await walManager.completeTableOp(dropOpId);
+            } catch (e) {
+              Logger.warn('Complete drop table op failed', rawError: e);
+            }
           }
-        } finally {
-          migrationManager
-              ?.resumeKeyMigrationAfterDestructive(keyMigrationPaused);
+
+          Logger.info('Table $tableName has been successfully deleted');
+
+          // Notify watchers that the table has been dropped/cleared
+          notificationManager.notify(ChangeEvent(
+            type: ChangeType.clear,
+            tableUid: table.tableUid,
+          ));
+
+          return finish(DbResult.success(
+            message: 'Table $tableName dropped successfully',
+          ));
+        } catch (e) {
+          if (_isDevTableNotFound(e)) {
+            if (isInTransactionWithRollback()) {
+              rethrow;
+            }
+            return finish(DbResult.error(
+              type: ResultType.devTableNotFound,
+              message: 'Table $tableName does not exist',
+              statuses: (e as DbException).statuses,
+            ));
+          }
+          Logger.error('Failed to delete table', rawError: e);
+          if (isInTransactionWithRollback()) {
+            rethrow;
+          }
+          final dbEx = DbException.wrap(e,
+              fallbackType: ResultType.engError,
+              fallbackMessage: 'Failed to drop table $tableName');
+          return finish(DbResult.batch(
+            statuses: dbEx.statuses,
+            failedCount: dbEx.statuses.length,
+          ));
         }
-
-        if (registerWalOp) {
-          // Cross-space cleanup: pass schema snapshot because current-space
-          // meta/dir are already deleted above.
-          await migrationManager?.addMigrationTask(
-            table.tableUid,
-            [const MigrationOperation(type: MigrationType.dropTable)],
-            oldSchemaSnapshot: table.schema,
-          );
-        }
-
-        // Same rationale as clear(): after the physical drop has completed,
-        // try to mark the table-op as completed so that it can be removed
-        // from WAL meta when its cutoff is not newer than checkpoint.
-        if (registerWalOp && config.enableJournal && dropOpId != null) {
-          try {
-            await walManager.completeTableOp(dropOpId);
-          } catch (e) {
-            Logger.warn('Complete drop table op failed', rawError: e);
-          }
-        }
-
-        Logger.info('Table $tableName has been successfully deleted');
-
-        // Notify watchers that the table has been dropped/cleared
-        notificationManager.notify(ChangeEvent(
-          type: ChangeType.clear,
-          tableUid: table.tableUid,
-        ));
-
-        return finish(DbResult.success(
-          message: 'Table $tableName dropped successfully',
-        ));
-      }
+      });
     } catch (e) {
       if (_isDevTableNotFound(e)) {
         if (isInTransactionWithRollback()) {
@@ -4720,17 +4832,7 @@ class DataStoreImpl {
           statuses: (e as DbException).statuses,
         ));
       }
-      Logger.error('Failed to delete table', rawError: e);
-      if (isInTransactionWithRollback()) {
-        rethrow;
-      }
-      final dbEx = DbException.wrap(e,
-          fallbackType: ResultType.engError,
-          fallbackMessage: 'Failed to drop table $tableName');
-      return finish(DbResult.batch(
-        statuses: dbEx.statuses,
-        failedCount: dbEx.statuses.length,
-      ));
+      rethrow;
     }
   }
 
@@ -4829,7 +4931,8 @@ class DataStoreImpl {
     parallelJournalManager.beginBatchOperation();
     try {
       // 1. Get table schema and validate data
-      final table = await getTableContext(tableName);
+      final table =
+          getTableContextSync(tableName) ?? await getTableContext(tableName);
       tableForRelease = table;
       schema = table.schema;
       if (schema.name.isEmpty) {
@@ -4856,11 +4959,11 @@ class DataStoreImpl {
           _promoteRemapRecordNewToOld(record, promoteDesc);
         }
       }
-      // Collect successful rows for shadow mirror when dual-write is enabled.
+      // Collect successful records for shadow mirror when dual-write is enabled.
       final promoteWritten =
           promoteDesc != null ? <Map<String, dynamic>>[] : null;
 
-      // Mirror successful old-working rows before returning; skip when the
+      // Mirror successful old-working records before returning; skip when the
       // active transaction will abort and roll back those writes.
       Future<DbResult> finishWithPromoteMirror(DbResult r) async {
         final String? activeTxId = Zone.current[_txnZoneKey] as String?;
@@ -4890,7 +4993,8 @@ class DataStoreImpl {
 
       // Snapshot table data meta once: avoids repeated meta reads in hot loops.
       final tableDataMeta =
-          await tableDataManager.getTableDataMeta(table.tableUid);
+          tableDataManager.getTableDataMetaSync(table.tableUid) ??
+              await tableDataManager.getTableDataMeta(table.tableUid);
       // We can safely skip disk unique checks if there is no committed data.
       final bool hasCommittedData =
           tableDataMeta != null && tableDataMeta.totalRecordCount > 0;
@@ -4910,10 +5014,7 @@ class DataStoreImpl {
       var needsConstraintPass = false;
       var schemaHasNoDefaults = true;
       for (final field in tableSchema.fields) {
-        if (field.maxLength != null ||
-            field.minLength != null ||
-            field.minValue != null ||
-            field.maxValue != null) {
+        if (field.hasValueConstraints) {
           needsConstraintPass = true;
         }
         if (schemaHasNoDefaults &&
@@ -4979,13 +5080,20 @@ class DataStoreImpl {
 
             if (missingCount == windowLen) {
               isWindowAllAutoPk = true;
-              newIds = await tableDataManager.getBatchIds(
-                table,
-                windowLen,
-                assignTo: records,
-                assignStart: start,
-                assignField: primaryKey,
-              );
+              newIds = tableDataManager.tryGetBatchIdsSync(
+                    table,
+                    windowLen,
+                    assignTo: records,
+                    assignStart: start,
+                    assignField: primaryKey,
+                  ) ??
+                  await tableDataManager.getBatchIds(
+                    table,
+                    windowLen,
+                    assignTo: records,
+                    assignStart: start,
+                    assignField: primaryKey,
+                  );
               if (newIds.length != windowLen) {
                 if (!allowPartialErrors) {
                   return finish(DbResult.error(
@@ -6111,10 +6219,10 @@ class DataStoreImpl {
       // batchInsert disable dual-write; pass promoteResultKeyDesc so success
       // keys are still O(1) user-facing reads without a post-mirror remap.
       // When promote is active, always collect keys so mirror can filter to
-      // successful rows only (even if caller skipped returnResultDetails).
+      // successful records only (even if caller skipped returnResultDetails).
       final trackKeys = returnResultDetails || promoteDesc != null;
 
-      Future<void> mirrorSuccessfulPromoteRows(List<String> userKeys) async {
+      Future<void> mirrorSuccessfulPromoteRecords(List<String> userKeys) async {
         if (promoteDesc == null || userKeys.isEmpty) return;
         final successSet = userKeys.toSet();
         final toMirror = <Map<String, dynamic>>[];
@@ -6154,7 +6262,7 @@ class DataStoreImpl {
           failedCount += upResult.failedCount;
         } else {
           // Prior sub-batches may already have landed on the old table.
-          await mirrorSuccessfulPromoteRows(upResult.successKeys);
+          await mirrorSuccessfulPromoteRecords(upResult.successKeys);
           return finish(
             returnResultDetails
                 ? upResult
@@ -6187,7 +6295,7 @@ class DataStoreImpl {
         successCount += insResult.successCount;
         failedCount += insResult.failedCount;
         if (!allowPartialErrors && insResult.hasErrors) {
-          await mirrorSuccessfulPromoteRows(successKeys);
+          await mirrorSuccessfulPromoteRecords(successKeys);
           return finish(
             returnResultDetails
                 ? insResult
@@ -6203,8 +6311,8 @@ class DataStoreImpl {
       }
 
       // Online dual-write: old table already written above; mirror only
-      // successful rows to the shadow (never re-write the old table).
-      await mirrorSuccessfulPromoteRows(successKeys);
+      // successful records to the shadow (never re-write the old table).
+      await mirrorSuccessfulPromoteRecords(successKeys);
 
       String message = 'Batch upsert completed';
       if (failedCount > 0) {
@@ -6312,7 +6420,7 @@ class DataStoreImpl {
     final promoteWritten =
         promoteDesc != null ? <Map<String, dynamic>>[] : null;
 
-    // Mirror successful old-working rows before returning; skip when the
+    // Mirror successful old-working records before returning; skip when the
     // active transaction will abort and roll back those writes.
     Future<DbResult> finishWithPromoteMirror(DbResult r) async {
       final String? activeTxId = Zone.current[_txnZoneKey] as String?;
@@ -7089,9 +7197,81 @@ class DataStoreImpl {
     }
   }
 
+  void _resetTablePrewarmGates() {
+    for (final gate in _tablePrewarmGates.values) {
+      gate.token.cancel();
+      final done = gate.bodyDone;
+      if (done != null && !done.isCompleted) {
+        done.complete();
+      }
+    }
+    _tablePrewarmGates.clear();
+  }
+
+  /// Cancel [tableUid]'s prewarm token for the duration of [action].
+  ///
+  /// If a warm body is in flight on that table, waits until it exits (path
+  /// locks released). Other tables keep warming. [excludeDepth] nests for FK
+  /// cascade. Close does not use this — it discards the instance.
+  Future<T> _withTableExcludedFromPrewarm<T>(
+    TableUid tableUid,
+    Future<T> Function() action,
+  ) async {
+    final gate =
+        _tablePrewarmGates.putIfAbsent(tableUid, _TablePrewarmGate.new);
+    gate.excludeDepth++;
+    gate.token.cancel();
+    try {
+      final pending = gate.bodyDone?.future;
+      if (pending != null) {
+        try {
+          await pending;
+        } catch (_) {}
+      }
+      return await action();
+    } finally {
+      gate.excludeDepth--;
+      if (gate.excludeDepth <= 0 && gate.bodyDone == null) {
+        _tablePrewarmGates.remove(tableUid);
+      }
+    }
+  }
+
+  /// Run one table's prewarm body under a non-cancelled gate.
+  ///
+  /// Registers [CancellationToken] while the body runs; removes the gate when
+  /// finished unless clear/drop still holds exclude depth.
+  Future<void> _runPrewarmForTable(
+    TableContext table,
+    Future<void> Function() body,
+  ) async {
+    final tableUid = table.tableUid;
+    final gate =
+        _tablePrewarmGates.putIfAbsent(tableUid, _TablePrewarmGate.new);
+    if (gate.excludeDepth > 0 || gate.token.isCancelled) return;
+    if (gate.bodyDone != null) return;
+
+    final done = Completer<void>();
+    gate.bodyDone = done;
+    try {
+      if (shouldAbortPrewarmForTable(tableUid)) return;
+      await body();
+    } finally {
+      gate.bodyDone = null;
+      if (!done.isCompleted) done.complete();
+      if (gate.excludeDepth <= 0 &&
+          identical(_tablePrewarmGates[tableUid], gate)) {
+        _tablePrewarmGates.remove(tableUid);
+      }
+    }
+  }
+
   /// Startup / explicit cache warm.
   ///
   Future<void> loadDataToCache() async {
+    if (shouldAbortBackgroundScan) {
+      return;
+    }
     if (_isGlobalPrewarming || _prewarmFuture != null) {
       return;
     }
@@ -7109,6 +7289,9 @@ class DataStoreImpl {
 
     unawaited(() async {
       try {
+        if (shouldAbortBackgroundScan) {
+          return;
+        }
         // Priority 1: Preload foreign key system table cache first
         // This ensures the cache is loaded before user table caches consume memory,
         // preventing it from being evicted due to memory pressure
@@ -7117,10 +7300,11 @@ class DataStoreImpl {
         }
 
         await _executePrewarm();
-        if (!completer.isCompleted) completer.complete();
       } catch (e, s) {
         if (!completer.isCompleted) completer.completeError(e, s);
       } finally {
+        // Always complete so clear/drop waiters on in-flight warm cannot hang.
+        if (!completer.isCompleted) completer.complete();
         _isGlobalPrewarming = false;
         _prewarmFuture = null;
       }
@@ -7172,45 +7356,44 @@ class DataStoreImpl {
       for (final tableName in selectedTables) {
         if (shouldAbortBackgroundScan) break;
         try {
-          if (shouldAbortBackgroundScan) {
-            continue;
-          }
-
           final table = await getTableContext(tableName);
-          final tableDataMeta =
-              await tableDataManager.getTableDataMeta(table.tableUid);
-          if (tableDataMeta != null && !tableDataMeta.btreeFirstLeaf.isNull) {
-            await tableTreePartitionManager?.prewarmBoundaryPages(
-              table,
-              meta: tableDataMeta,
-            );
-          }
-
-          final schema =
-              await schemaMgr.getTableSchemaByName(TableName(tableName));
-          if (schema != null) {
-            final indexes = schemaMgr
-                .getBtreeIndexesFor(schema)
-                .where((index) => index.type == IndexType.btree);
-            for (final index in indexes) {
-              if (shouldAbortBackgroundScan) break;
-              final indexMeta = await _indexManager?.getIndexMeta(
-                  table.tableUid, index.indexUid);
-              if (indexMeta == null || indexMeta.btreeFirstLeaf.isNull) {
-                continue;
-              }
-              await indexTreePartitionManager?.prewarmBoundaryPages(
+          if (shouldAbortPrewarmForTable(table.tableUid)) continue;
+          await _runPrewarmForTable(table, () async {
+            final tableDataMeta =
+                await tableDataManager.getTableDataMeta(table.tableUid);
+            if (tableDataMeta != null && !tableDataMeta.btreeFirstLeaf.isNull) {
+              await tableTreePartitionManager?.prewarmBoundaryPages(
                 table,
-                index.indexUid,
-                meta: indexMeta,
+                meta: tableDataMeta,
               );
-              final y17 = yieldController.maybeYield();
-              if (y17 != null) await y17;
             }
-          }
 
-          final y18 = yieldController.maybeYield();
-          if (y18 != null) await y18;
+            final schema =
+                await schemaMgr.getTableSchemaByName(TableName(tableName));
+            if (schema != null) {
+              final indexes = schemaMgr
+                  .getBtreeIndexesFor(schema)
+                  .where((index) => index.type == IndexType.btree);
+              for (final index in indexes) {
+                if (shouldAbortPrewarmForTable(table.tableUid)) break;
+                final indexMeta = await _indexManager?.getIndexMeta(
+                    table.tableUid, index.indexUid);
+                if (indexMeta == null || indexMeta.btreeFirstLeaf.isNull) {
+                  continue;
+                }
+                await indexTreePartitionManager?.prewarmBoundaryPages(
+                  table,
+                  index.indexUid,
+                  meta: indexMeta,
+                );
+                final y17 = yieldController.maybeYield();
+                if (y17 != null) await y17;
+              }
+            }
+
+            final y18 = yieldController.maybeYield();
+            if (y18 != null) await y18;
+          });
         } catch (e) {
           if (shouldAbortBackgroundScan || e is DbClosedException) break;
           if (_isDevTableNotFound(e)) {
@@ -7225,7 +7408,53 @@ class DataStoreImpl {
       if (shouldAbortBackgroundScan) return;
 
       // =========================================================================
-      // Phase 2: Vector index prewarm (Nav centroid graph & search-hot leaves).
+      // Phase 2: Text/sparse WMBP search caches.
+      // Shares the structured index budget (getIndexCacheSize) with B+Tree
+      // index pages — stop immediately once btree+wmbp usage hits the ceiling.
+      // ALWAYS runs (including large spaces) so retrieval is not cold-IO bound.
+      // =========================================================================
+      final wmbpBudget = _resourceManager?.getIndexCacheSize() ??
+          (_wmbpIndexManager?.resolveWmbpCacheBudget() ?? (128 * 1024 * 1024));
+      int sharedIndexUsageBytes() {
+        final btreePages =
+            indexTreePartitionManager?.getCurrentPageCacheSize() ?? 0;
+        final btreeData = _indexManager?.indexDataCacheEstimatedBytes ?? 0;
+        final wmbp = _wmbpIndexManager?.getCurrentCacheSize() ?? 0;
+        return btreePages + btreeData + wmbp;
+      }
+
+      for (final tableName in selectedTables) {
+        if (shouldAbortBackgroundScan) break;
+        if (sharedIndexUsageBytes() >= wmbpBudget) break;
+        try {
+          final schema =
+              await schemaMgr.getTableSchemaByName(TableName(tableName));
+          if (schema == null || !schemaMgr.hasWmbpIndexes(schema)) continue;
+          final table = await getTableContext(tableName);
+          if (shouldAbortPrewarmForTable(table.tableUid)) continue;
+          await _runPrewarmForTable(table, () async {
+            await _wmbpIndexManager?.prewarmTable(
+              table,
+              sharedBudgetBytes: wmbpBudget,
+              sharedUsageBytes: sharedIndexUsageBytes,
+            );
+            final yWmbp = yieldController.maybeYield();
+            if (yWmbp != null) await yWmbp;
+          });
+        } catch (e) {
+          if (shouldAbortBackgroundScan || e is DbClosedException) break;
+          if (_isDevTableNotFound(e)) {
+            continue;
+          }
+          Logger.error('Phase 2 WMBP prewarm failed: $tableName', rawError: e);
+          continue;
+        }
+      }
+
+      if (shouldAbortBackgroundScan) return;
+
+      // =========================================================================
+      // Phase 3: Vector index prewarm (Nav centroid graph & search-hot leaves).
       // ALWAYS runs (including large spaces). Uses the dedicated vector compact
       // cache ceiling from vectorCacheBudgetRatio — NOT the shared row-prewarm
       // threshold — so million-row corpora still fill the ANN hot set.
@@ -7240,23 +7469,26 @@ class DataStoreImpl {
           if (vectorIndexes.isEmpty) continue;
 
           final table = await getTableContext(tableName);
-          for (final vIdx in vectorIndexes) {
-            if (shouldAbortBackgroundScan) break;
-            // Omit maxBytes: prewarmVectorIndex stops at the vector leaf cache
-            // budget (vectorCacheBudgetRatio of cacheMemoryBudgetMB).
-            await _vectorIndexManager?.prewarmVectorIndex(
-              table,
-              vIdx.indexUid,
-            );
-            final yVec = yieldController.maybeYield();
-            if (yVec != null) await yVec;
-          }
+          if (shouldAbortPrewarmForTable(table.tableUid)) continue;
+          await _runPrewarmForTable(table, () async {
+            for (final vIdx in vectorIndexes) {
+              if (shouldAbortPrewarmForTable(table.tableUid)) break;
+              // Omit maxBytes: prewarmVectorIndex stops at the vector leaf cache
+              // budget (vectorCacheBudgetRatio of cacheMemoryBudgetMB).
+              await _vectorIndexManager?.prewarmVectorIndex(
+                table,
+                vIdx.indexUid,
+              );
+              final yVec = yieldController.maybeYield();
+              if (yVec != null) await yVec;
+            }
+          });
         } catch (e) {
           if (shouldAbortBackgroundScan || e is DbClosedException) break;
           if (_isDevTableNotFound(e)) {
             continue;
           }
-          Logger.error('Phase 2 vector prewarm failed: $tableName',
+          Logger.error('Phase 3 vector prewarm failed: $tableName',
               rawError: e);
           continue;
         }
@@ -7288,13 +7520,13 @@ class DataStoreImpl {
     }
   }
 
-  /// Max rows to warm into TreeCache (covers typical < 200k datasets).
+  /// Max records to warm into TreeCache (covers typical < 200k datasets).
   static const int _prewarmMaxRecords = 200000;
 
   /// Per-batch size so Flutter can paint between chunks (avoid one 200k scan).
   static const int _prewarmBatchSize = 1000;
 
-  /// Prewarm table rows via cursor batches; yields to the event loop each batch.
+  /// Prewarm table records via cursor batches; yields to the event loop each batch.
   Future<void> _prewarmQueryInBatches({
     required TableContext table,
     required QueryCondition condition,
@@ -7305,7 +7537,7 @@ class DataStoreImpl {
     String? cursor;
     var loaded = 0;
     while (loaded < maxRecords) {
-      if (shouldAbortBackgroundScan) return;
+      if (shouldAbortPrewarmForTable(table.tableUid)) return;
       final limit = min(batchSize, maxRecords - loaded);
       final result = await queryExecutor.execute(
         table,
@@ -7339,7 +7571,7 @@ class DataStoreImpl {
     var startKey = Uint8List(0);
     var loaded = 0;
     while (loaded < maxRecords) {
-      if (shouldAbortBackgroundScan) return;
+      if (shouldAbortPrewarmForTable(table.tableUid)) return;
       final limit = min(batchSize, maxRecords - loaded);
       final result = await tree.searchByKeyRange(
         table: table,
@@ -7446,7 +7678,7 @@ class DataStoreImpl {
     return remainingBytes;
   }
 
-  /// Prewarm user table rows + B-tree indexes up to [prewarmBudgetBytes].
+  /// Prewarm user table records + B-tree indexes up to [prewarmBudgetBytes].
   ///
   /// Only invoked for spaces still under the row-prewarm threshold. Large
   /// spaces skip this phase entirely in [_executePrewarm] (boundary pages +
@@ -7482,70 +7714,75 @@ class DataStoreImpl {
     for (final tableName in userTables) {
       if (shouldAbortBackgroundScan || remainingBytes <= 0) break;
       try {
-        if (shouldAbortBackgroundScan) continue;
-
         final table = await getTableContext(tableName);
-        final tableDataMeta =
-            await tableDataManager.getTableDataMeta(table.tableUid);
-        if (tableDataMeta == null || tableDataMeta.totalRecordCount <= 0) {
-          continue;
-        }
+        if (shouldAbortPrewarmForTable(table.tableUid)) continue;
 
-        final schema = table.schema;
-        final hasVector = schema.fields.any((f) => f.type == DataType.vector);
-        final indexBytes = await _estimateTableIndexBytes(table);
-        final tableDataSize =
-            await tableDataManager.sumTableDataSizeBytes(table);
-        final rawCap = _prewarmRecordCap(
-          remainingBytes: remainingBytes,
-          totalRecordCount: tableDataMeta.totalRecordCount,
-          tableDataSizeBytes: tableDataSize,
-          indexBytes: indexBytes,
-        );
-        // Tables with vector fields already have their vector index prewarmed.
-        // Cap row-level prewarm to 50% of the raw budget capacity (rawCap ~/ 2)
-        // to balance rich point-lookup cache coverage against large vector row footprints.
-        final maxRecords = hasVector ? (rawCap ~/ 2) : rawCap;
-        if (maxRecords <= 0) {
-          continue;
-        }
+        await _runPrewarmForTable(table, () async {
+          final tableDataMeta =
+              await tableDataManager.getTableDataMeta(table.tableUid);
+          if (tableDataMeta == null || tableDataMeta.totalRecordCount <= 0) {
+            return;
+          }
 
-        await _prewarmQueryInBatches(
-          table: table,
-          condition: QueryCondition()..where(schema.primaryKey, '>=', ''),
-          maxRecords: maxRecords,
-        );
-        final y20 = yieldController.maybeYield();
-        if (y20 != null) await y20;
+          final schema = table.schema;
+          final hasVector = schema.fields.any((f) => f.type == DataType.vector);
+          final indexBytes = await _estimateTableIndexBytes(table);
+          final tableDataSize =
+              await tableDataManager.sumTableDataSizeBytes(table);
+          final rawCap = _prewarmRecordCap(
+            remainingBytes: remainingBytes,
+            totalRecordCount: tableDataMeta.totalRecordCount,
+            tableDataSizeBytes: tableDataSize,
+            indexBytes: indexBytes,
+          );
+          // Tables with vector fields already have their vector index prewarmed.
+          // Cap row-level prewarm to 50% of the raw budget capacity (rawCap ~/ 2)
+          // to balance rich point-lookup cache coverage against large vector row footprints.
+          final maxRecords = hasVector ? (rawCap ~/ 2) : rawCap;
+          if (maxRecords <= 0) {
+            return;
+          }
 
-        final indexes = schemaMgr.getBtreeIndexesFor(schema);
-        for (final index in indexes) {
-          if (shouldAbortBackgroundScan || remainingBytes <= 0) break;
-          final indexMeta =
-              await _indexManager?.getIndexMeta(table.tableUid, index.indexUid);
-          if (indexMeta == null || indexMeta.btreeFirstLeaf.isNull) continue;
-
-          await _prewarmIndexInBatches(
+          await _prewarmQueryInBatches(
             table: table,
-            indexUid: index.indexUid,
-            meta: indexMeta,
+            condition: QueryCondition()..where(schema.primaryKey, '>=', ''),
             maxRecords: maxRecords,
           );
-          final y21 = yieldController.maybeYield();
-          if (y21 != null) await y21;
-        }
+          final y20 = yieldController.maybeYield();
+          if (y20 != null) await y20;
 
-        final used = min(
-          remainingBytes,
-          max(
-            1,
-            ((tableDataSize + indexBytes) * maxRecords) ~/
-                max(1, tableDataMeta.totalRecordCount),
-          ),
-        );
-        remainingBytes -= used;
-        final y22 = yieldController.maybeYield();
-        if (y22 != null) await y22;
+          final indexes = schemaMgr.getBtreeIndexesFor(schema);
+          for (final index in indexes) {
+            if (shouldAbortPrewarmForTable(table.tableUid) ||
+                remainingBytes <= 0) {
+              break;
+            }
+            final indexMeta = await _indexManager?.getIndexMeta(
+                table.tableUid, index.indexUid);
+            if (indexMeta == null || indexMeta.btreeFirstLeaf.isNull) continue;
+
+            await _prewarmIndexInBatches(
+              table: table,
+              indexUid: index.indexUid,
+              meta: indexMeta,
+              maxRecords: maxRecords,
+            );
+            final y21 = yieldController.maybeYield();
+            if (y21 != null) await y21;
+          }
+
+          final used = min(
+            remainingBytes,
+            max(
+              1,
+              ((tableDataSize + indexBytes) * maxRecords) ~/
+                  max(1, tableDataMeta.totalRecordCount),
+            ),
+          );
+          remainingBytes -= used;
+          final y22 = yieldController.maybeYield();
+          if (y22 != null) await y22;
+        });
       } catch (e) {
         if (shouldAbortBackgroundScan || e is DbClosedException) break;
         // Same race as boundary prewarm: dropped tables vs stale name snapshot.
@@ -8076,7 +8313,7 @@ class DataStoreImpl {
   /// Synchronously peek a key-value pair from pure memory (Point Cache).
   ///
   /// Never hits disk/files; returns null if the key is absent or not in memory.
-  /// Expired rows are treated as absent and scheduled for lazy cleanup.
+  /// Expired records are treated as absent and scheduled for lazy cleanup.
   dynamic peekValue(String key, {bool isGlobal = false}) {
     if (!_isInitialized) return null;
     final tableName = SystemTable.getKeyValueName(isGlobal);
@@ -8150,7 +8387,7 @@ class DataStoreImpl {
       condition.whereStartsWith(_kvKeyField, prefix);
     }
 
-    final rows = (await queryExecutor.execute(
+    final records = (await queryExecutor.execute(
       table,
       condition: condition,
       orderBy: [_kvKeyField],
@@ -8161,7 +8398,7 @@ class DataStoreImpl {
     final now = DateTime.now();
     final keys = <String>[];
 
-    for (final row in rows) {
+    for (final row in records) {
       if (!_isKvRowExpired(row, now: now)) {
         keys.add(row[_kvKeyField].toString());
       } else {
@@ -8311,12 +8548,12 @@ class DataStoreImpl {
         condition: condition,
         distinct: distinct,
         loadSnapshot: () async {
-          final rows = (await queryExecutor.execute(
+          final records = (await queryExecutor.execute(
             table,
             condition: condition,
           ))
               .records;
-          if (rows.isEmpty) {
+          if (records.isEmpty) {
             return (
               value: defaultValue,
               fingerprint: Object.hash(key, false, null),
@@ -8324,7 +8561,7 @@ class DataStoreImpl {
             );
           }
 
-          final row = rows.first;
+          final row = records.first;
           final rawExpiresAt = row[_kvExpiresAtField];
           final expiresAt = _parseKvDateTime(rawExpiresAt);
           if (expiresAt != null && !expiresAt.isAfter(DateTime.now())) {
@@ -8372,13 +8609,13 @@ class DataStoreImpl {
         condition: condition,
         distinct: distinct,
         loadSnapshot: () async {
-          final rows = (await queryExecutor.execute(
+          final records = (await queryExecutor.execute(
             table,
             condition: condition,
           ))
               .records;
           final rowsByKey = <String, Map<String, dynamic>>{};
-          for (final row in rows) {
+          for (final row in records) {
             final rowKey = row[_kvKeyField];
             if (rowKey != null) {
               rowsByKey[rowKey.toString()] = row;
@@ -8724,7 +8961,7 @@ class DataStoreImpl {
     transformPromoteNewToOldInPlace(record, desc);
   }
 
-  /// Upsert transformed old-table rows onto the promote shadow table.
+  /// Upsert transformed old-table records onto the promote shadow table.
   ///
   /// Does not own user-facing success keys - callers read the source-field
   /// value (O(1)) from the already-successful old-table record.
@@ -8774,7 +9011,7 @@ class DataStoreImpl {
     }
   }
 
-  /// Flush collected successful old-working rows to the promote shadow, then
+  /// Flush collected successful old-working records to the promote shadow, then
   /// clear [written] only after mirror completes without a hard failure.
   Future<void> _promoteFlushMirrorWritten(
     PromoteRuntimeDescriptor? desc,
@@ -8802,7 +9039,7 @@ class DataStoreImpl {
         '';
   }
 
-  /// Delete matching rows from the promote shadow table by target PK.
+  /// Delete matching records from the promote shadow table by target PK.
   ///
   /// Same failure policy as [_promoteMirrorUpsertToShadow].
   Future<void> _promoteMirrorDeleteFromShadow(
@@ -9038,7 +9275,7 @@ class DataStoreImpl {
         schemasToRefresh.values.any((schema) => schema.foreignKeys.isNotEmpty);
 
     // Meta already points at [newTableName]; old name no longer resolves.
-    // Cleanup matches FK rows by the logical name string, so pass a context
+    // Cleanup matches FK records by the logical name string, so pass a context
     // that still carries the pre-rename name while keeping the stable uid.
     final renamedCtx = await getTableContext(newTableName);
     await fkManager.cleanupSystemTableForDroppedTable(
@@ -9067,19 +9304,16 @@ class DataStoreImpl {
 
   /// Start independent startup metadata loads without awaiting.
   ///
-  /// Only loads that are safe before version upgrades (GlobalConfig +
-  /// ResourceManager). WAL / txn / migration meta are started in
-  /// [_kickoffPostUpgradeMetadataLoads] after JSON→TOBF migrations.
+  /// Only loads that are safe before version upgrades (GlobalConfig).
+  /// ResourceManager is started earlier and joined via its own Future before
+  /// TreeCache-owning managers construct. WAL / txn / migration meta are
+  /// started in [_kickoffPostUpgradeMetadataLoads] after JSON→TOBF migrations.
   void _kickoffStartupMetadataLoads({required bool isMemoryMode}) {
     if (!isMemoryMode) {
       // Zone-handle completion errors so prefetch cannot spam unhandled async
       // errors; the next [getGlobalConfig] consumer still loads / joins correctly.
       unawaited(getGlobalConfig().catchError((Object _) => null));
     }
-    unawaited(
-        _resourceManager!.initialize(_config!, this).catchError((Object e) {
-      Logger.warn('ResourceManager startup init failed', rawError: e);
-    }));
     // Memory mode has no version upgrades / meta format migration.
     if (isMemoryMode) {
       unawaited(transactionManager!.initialize().catchError((Object e) {
@@ -9622,4 +9856,16 @@ class _DbStatusImpl implements DbStatus {
     }
     return await _db.migrationManager!.queryTaskStatus(taskId);
   }
+}
+
+/// Per-table startup-prewarm control.
+///
+/// [token] is cancelled by clear/drop so that table's warm body bails without
+/// stopping other tables. [bodyDone] lets clear await in-flight warm exit
+/// (CancellationToken alone cannot signal completion). [excludeDepth] nests
+/// for FK cascade clear of parent+child.
+class _TablePrewarmGate {
+  final CancellationToken token = CancellationToken();
+  int excludeDepth = 0;
+  Completer<void>? bodyDone;
 }

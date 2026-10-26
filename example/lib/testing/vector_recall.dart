@@ -5,11 +5,11 @@ import 'package:tostore/tostore.dart';
 
 /// Example embeddings with known nearest neighbors for Recall@K demos.
 ///
-/// Consecutive [groupSize] rows share one local neighborhood. Query vectors
+/// Consecutive [groupSize] records share one local neighborhood. Query vectors
 /// are not stored in the table.
 ///
 /// Ultra-low-D (≤6): [usesIslandFillerLayout] — a fixed set of scorable
-/// "island" groups sit in a northern cap; extra rows are southern fillers that
+/// "island" groups sit in a northern cap; extra records are southern fillers that
 /// cannot enter island Top-K. Recall@K stays planted (no full-table GT) at any N.
 class ExampleVectorCorpus {
   ExampleVectorCorpus._();
@@ -371,6 +371,39 @@ class ExampleVectorCorpus {
     );
     _normalizeInPlace(values);
     return VectorData(values);
+  }
+
+  /// Unit vector with cosine ≈ [cosine] to [reference] (score-calibration probes).
+  ///
+  /// Builds an orthonormal complement with a deterministic [seed], then
+  /// `cos * ref + sin * ortho`. Cosine to [reference] is ≈ [cosine]; other
+  /// stored group members may be closer. Calibration must compare each ANN
+  /// hit's reported [score] to `cosine(query, thatHit)` — not to [cosine] alone.
+  static VectorData unitAtCosineTo(
+    VectorData reference,
+    double cosine, {
+    int seed = 1,
+  }) {
+    final ref = reference.normalize().values;
+    final dims = ref.length;
+    final c = cosine.clamp(-1.0, 1.0);
+    final rng = Random(seed);
+    final raw = List<double>.generate(dims, (_) => rng.nextDouble() * 2 - 1);
+    var dot = 0.0;
+    for (var i = 0; i < dims; i++) {
+      dot += raw[i] * ref[i];
+    }
+    for (var i = 0; i < dims; i++) {
+      raw[i] -= dot * ref[i];
+    }
+    _normalizeInPlace(raw);
+    final s = sqrt(max(0.0, 1.0 - c * c));
+    final out = List<double>.generate(
+      dims,
+      (i) => c * ref[i] + s * raw[i],
+    );
+    _normalizeInPlace(out);
+    return VectorData(out);
   }
 
   /// Query for [groupId]: off-center on the group ray (not stored).
@@ -817,7 +850,7 @@ class VectorRecallHarness {
       }
     }
 
-    // Stamped example rows (nghgt:g########:m##). The minimum PK is not
+    // Stamped example records (nghgt:g########:m##). The minimum PK is not
     // required to be generation index 1: vector batch-insert rounds use a
     // seed offset, and clear() restarts sequential ids at 1. Generation
     // index i maps to minPk + (i - originIndex). A mismatched end stamp
@@ -920,7 +953,7 @@ class VectorRecallHarness {
 
     if (hasPkHoles) {
       onLog?.call(
-        'Notice: some rows are missing from this table. '
+        'Notice: some records are missing from this table. '
         'Checking remaining data before scoring Recall@K...',
       );
     }
@@ -1537,19 +1570,19 @@ String formatVectorDepthSweepSummary({
   required String tableName,
   required int topK,
   required int iterations,
-  required List<VectorSearchBenchmarkResult> rows,
+  required List<VectorSearchBenchmarkResult> records,
   bool diverseThroughput = false,
 }) {
-  if (rows.isEmpty) {
+  if (records.isEmpty) {
     return '[Vector Depth Sweep] No results.';
   }
 
-  final first = rows.first.recall;
-  final canScore = rows.any((r) => r.recall.canScoreRecall);
-  final depths = rows.map((r) => r.recall.searchDepth).join(',');
+  final first = records.first.recall;
+  final canScore = records.any((r) => r.recall.canScoreRecall);
+  final depths = records.map((r) => r.recall.searchDepth).join(',');
   // Scored K can be below the requested topK when groups get crowded.
   final scoredK =
-      rows.map((r) => r.recall.topK).fold<int>(topK, (a, b) => min(a, b));
+      records.map((r) => r.recall.topK).fold<int>(topK, (a, b) => min(a, b));
 
   final header = StringBuffer()
     ..writeln('[Vector Depth Sweep] table=$tableName '
@@ -1563,7 +1596,7 @@ String formatVectorDepthSweepSummary({
     ..writeln(
         'searchDepth | recall@$scoredK | top1_hit | self_rc | avg_ms | p95_ms | qps');
 
-  for (final row in rows) {
+  for (final row in records) {
     header.writeln(row.sweepTableRow());
   }
 

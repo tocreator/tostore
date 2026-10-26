@@ -158,10 +158,10 @@ class TreeCache<T> {
   /// Non-empty top-level group keys (groupDepth=1: one key per group).
   ///
   /// A root key remaining in [_groupsRoot] after the first insert is not enough
-  /// — the group shell can outlive its rows (pin / deferred remove). Only keys
+  /// — the group shell can outlive its records (pin / deferred remove). Only keys
   /// whose group still has child payloads are returned.
   ///
-  /// Used by buffer pending trees to list tableUids with pending rows without
+  /// Used by buffer pending trees to list tableUids with pending records without
   /// scanning the WAL flush queue.
   List<Object?> listNonEmptyRootKeys() {
     final out = <Object?>[];

@@ -9,7 +9,7 @@ class UpdateBuilder extends ChainBuilder<UpdateBuilder>
   bool _allowAll = false;
   // add flag to indicate whether to continue on partial errors
   bool _continueOnPartialErrors = false;
-  // Public API: large-scale must be opted in; also skips per-row result details
+  // Public API: large-scale must be opted in; also skips per-record result details
   bool _allowLargeScaleOperation = false;
   // Recovery durability override for this update
   RecoveryDurability? _durability;
@@ -238,7 +238,7 @@ class UpdateBuilder extends ChainBuilder<UpdateBuilder>
   /// allowed via this method. The operation runs in background batches through the
   /// unified write scheduler and **blocks until completion** before returning.
   /// The result includes [DbResult.successCount] only -- success/failure primary
-  /// keys and per-row status details are not returned.
+  /// keys and per-record status details are not returned.
   /// Not allowed inside a transaction (rejected via [DbResult] / rollback).
   /// If the process is interrupted unexpectedly, already-persisted changes are
   /// kept; the caller must retry to continue.

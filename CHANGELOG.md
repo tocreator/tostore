@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## 3.6.1
+
+### Added
+- Added text indexes (`IndexType.text`) and neural sparse indexes (`IndexType.sparse`) with retrieval APIs (`matchText` / `matchSparse`, hybrid fusion), designed to scale beyond tens of billions of records.
+
 ## 3.6.0
 
 ### Added
@@ -18,7 +23,7 @@ All notable changes to this project will be documented in this file.
 - `deleteDatabase` closes with `flush: false` before removing files.
 
 ### Fixed
-- Fixed child-table foreign key cascade during batch insert incorrectly treating newly inserted parent rows as missing.
+- Fixed child-table foreign key cascade during batch insert incorrectly treating newly inserted parent records as missing.
 
 ## 3.5.1
 

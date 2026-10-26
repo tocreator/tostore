@@ -193,7 +193,7 @@ class BenchmarkRunner {
     final simpleWarmupData = await _buildRecords(
       warmupCount,
       (i) => {'text_val': 'warmup_$i', 'num_val': i},
-      label: 'warm-up rows',
+      label: 'warm-up records',
     );
     final indexedWarmupData = await _buildRecords(
       warmupCount,
@@ -202,7 +202,7 @@ class BenchmarkRunner {
         'age': 20 + (i % 50),
         'created_at': createdAt,
       },
-      label: 'warm-up indexed rows',
+      label: 'warm-up indexed records',
     );
     final vectorWarmupData = await _generateRecords(
       BenchmarkTier.vector,
@@ -308,7 +308,7 @@ class BenchmarkRunner {
         break;
 
       case BenchmarkOperation.singleInsert:
-        // Cap single-row insert scale to keep wall-clock reasonable.
+        // Cap single-record insert scale to keep wall-clock reasonable.
         effectiveCount = math.min(scale, 10000);
         final singleInsertRounds = <List<Map<String, dynamic>>>[
           for (var round = 1; round <= iterations; round++)
@@ -750,7 +750,7 @@ class BenchmarkRunner {
         if (tier != BenchmarkTier.vector) return null;
         // Cap ingest scale so NGH construction stays practical on edge devices.
         effectiveCount = math.min(scale, 10000);
-        final vectorRows = await _generateRecords(
+        final vectorRecords = await _generateRecords(
           tier,
           effectiveCount,
           label: '[$tierName] vector batch',
@@ -763,7 +763,7 @@ class BenchmarkRunner {
           final sw = Stopwatch()..start();
           await db.batchInsert(
             tableName,
-            vectorRows,
+            vectorRecords,
             allowPartialErrors: false,
             returnResultDetails: false,
             durability: durability,
@@ -983,11 +983,11 @@ class BenchmarkRunner {
     );
   }
 
-  /// Ensures the table has at least [scale] rows for query benches.
+  /// Ensures the table has at least [scale] records for query benches.
   ///
   /// Repopulates only when short; flushes that refill so reads hit a settled
   /// disk pipeline. Prefer the suite-level flush before the query phase when
-  /// mutation left enough rows already.
+  /// mutation left enough records already.
   Future<void> _ensureDurableDataset(
     String tableName,
     BenchmarkTier tier,
@@ -1008,7 +1008,7 @@ class BenchmarkRunner {
     await db.flush();
   }
 
-  /// Lets the benchmark status line paint while synthetic rows are built.
+  /// Lets the benchmark status line paint while synthetic records are built.
   ///
   /// [Future.delayed] only hits the timer queue and can resume before the
   /// next frame, so a large generate loop still looks frozen.
@@ -1016,7 +1016,7 @@ class BenchmarkRunner {
     return SchedulerBinding.instance.endOfFrame;
   }
 
-  /// Builds [count] rows, yielding a frame about every 8ms.
+  /// Builds [count] records, yielding a frame about every 8ms.
   Future<List<Map<String, dynamic>>> _buildRecords(
     int count,
     Map<String, dynamic> Function(int i) build, {

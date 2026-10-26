@@ -82,7 +82,7 @@ typedef TxnTableCodecResolver = Future<TxnTableCodecContext?> Function(
 /// `[Length:4B LE][Magic:4B][Version:1B][BodyLen:4B][EncryptedBody]`
 ///
 /// Magic: `ToTX` (0x546F5458). Body is a [BinaryWriter] tagged message;
-/// table rows use [BinarySchemaCodec], sparse maps use [BinaryMapCodec].
+/// table records use [BinarySchemaCodec], sparse maps use [BinaryMapCodec].
 class TxnEncoder {
   /// Magic number: "ToTX" in ASCII
   static const int txnMagic = 0x546F5458;

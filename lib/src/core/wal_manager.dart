@@ -703,7 +703,7 @@ class WalManager {
   WalPointer get appendedPointer => _appended;
 
   /// Current WAL write queue, in logical records (an encoded chunk of 50k
-  /// rows still counts as 50000 so idle/compaction signals stay honest).
+  /// records still counts as 50000 so idle/compaction signals stay honest).
   int get pendingQueueLength => _queuedRecordCount;
 
   bool get hasPendingParallelBatches => _meta.pendingBatches.isNotEmpty;
@@ -1699,7 +1699,7 @@ class WalManager {
   ///
   /// Table pages are already flushed. A crash between two separate writes used
   /// to leave checkpoint at [checkpoint] while the batch handle still existed,
-  /// so the next start would reflush already-durable rows.
+  /// so the next start would reflush already-durable records.
   Future<void> completePendingFlushBatch({
     required String batchId,
     required WalPointer checkpoint,

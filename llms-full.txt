@@ -99,7 +99,7 @@ RFC 2119 keywords apply.
 8. Agents MUST NOT read/write/drop/clear/query system tables via public ToStore APIs (engine rejects with developer error).
 9. Unconditional `update` / `delete` MUST use `.allowUpdateAll()` / `.allowDeleteAll()` deliberately.
 10. Large-scale `update` / `delete` that would risk OOM MUST use `.allowLargeScaleOperation()`; MUST NOT use it inside a transaction.
-11. After large-scale ops, agents SHOULD only rely on `DbResult.successCount` (no per-row key details).
+11. After large-scale ops, agents SHOULD only rely on `DbResult.successCount` (no per-record key details).
 
 ## KV
 
@@ -374,6 +374,7 @@ const FieldSchema({
 | `array` | `List` | |
 | `json` | `Map<String, dynamic>` | |
 | `vector` | `VectorData` / `List<num>` | Needs `vectorConfig.dimensions` in `1..65535` |
+| `sparse` | `SparseVectorData` / `Map<int, num>` | Learned sparse vector dimensions and weights |
 | `dynamic` | arbitrary Dart | No forced conversion |
 
 ### Constraints (engine-enforced)
@@ -387,7 +388,7 @@ const FieldSchema({
 - `createIndex: true` — auto single-field normal index
 - `fieldId` — optional stable field id for **declarative** rename detection (same mobile/`open(schemas:)` path as `tableId`). Server/Agent runtime `updateSchema` renames do not need it.
 
-Composite / named / vector indexes: declare in `indexes` (`IndexSchema`).
+Composite / named / vector / text / sparse indexes: declare in `indexes` (`IndexSchema`).
 
 ## IndexSchema
 
@@ -396,8 +397,8 @@ IndexSchema({
   String? indexName,
   required List<String> fields,
   bool unique = false,
-  IndexType type = IndexType.btree, // btree | vector
-  // vector indexes also use VectorIndexConfig (see Vector module)
+  IndexType type = IndexType.btree, // btree | vector | text | sparse
+  // vector indexes also use VectorIndexConfig (see Vector/Hybrid module)
 });
 ```
 
@@ -471,7 +472,7 @@ Target field MUST be **unique and non-null**.
 
 | API | Returns |
 | :--- | :--- |
-| `tableExists(name)` | schema exists (not “has rows”) |
+| `tableExists(name)` | schema exists (not “has records”) |
 | `getTableSchema(name)` | `TableSchema?` |
 | `getTableNames({isGlobal})` | filter global / non-global / all |
 | `getTableInfo(name)` | counts, sizes, schema meta |
@@ -537,16 +538,16 @@ status: complete
 
 ## Purpose
 
-Write paths for single-row, builder-conditioned, and bulk operations; atomic field expressions via `Expr`.
+Write paths for single-record, builder-conditioned, and bulk operations; atomic field expressions via `Expr`.
 
-## Single-row writes
+## Single-record writes
 
 ```dart
 Future<DbResult> insert(String tableName, Map<String, dynamic> data, {RecoveryDurability? durability});
 Future<DbResult> upsert(String tableName, Map<String, dynamic> data, {RecoveryDurability? durability});
 ```
 
-- `insert`: new row; on success read `firstPrimaryKey`.
+- `insert`: new record; on success read `firstPrimaryKey`.
 - `upsert`: update if PK/unique match, else insert.
 - `durability`: optional recovery guarantee level (`RecoveryDurability.standard` default crash-safe before ack, `durable` power-loss safe before ack, `async` immediate response with brief few-ms window on small writes).
 - MUST check `!result.hasErrors` (or inspect `statuses`). Constraint failures return results; they do not always throw.
@@ -578,7 +579,7 @@ Awaiting the builder (or `.future`) executes.
 | `compute(field, ExprNode)` | Explicit expression |
 | `durability(RecoveryDurability)` | Set recovery guarantee level for this update (durable / standard / async) |
 | `allowUpdateAll()` | REQUIRED if no condition |
-| `allowPartialErrors()` | Continue on per-row failures |
+| `allowPartialErrors()` | Continue on per-record failures |
 | `allowLargeScaleOperation()` | Large update; blocks until done; returns `successCount` only; **MUST NOT** inside transaction |
 
 Without a condition and without `allowUpdateAll()`, update is rejected (safety).
@@ -606,7 +607,7 @@ DeleteBuilder delete(String tableName);
 
 ```dart
 Future<DbResult> dropTable(String tableName);
-Future<DbResult> clear(String tableName); // delete all rows, keep schema
+Future<DbResult> clear(String tableName); // delete all records, keep schema
 ```
 
 System tables MUST NOT be targeted (engine throws developer error).
@@ -628,9 +629,9 @@ Future<DbResult> batchUpdate(...); // same options
 | :--- | :--- | :--- |
 | `batchInsert` | All non-null fields | Insert only; highest throughput |
 | `batchUpsert` | All non-null fields **and** unique-index fields; table MUST have unique constraints | Insert or update by unique match |
-| `batchUpdate` | Each row MUST include PK (or unique identity) + fields to change | Partial update; non-null fields not all required |
+| `batchUpdate` | Each record MUST include PK (or unique identity) + fields to change | Partial update; non-null fields not all required |
 
-- `allowPartialErrors: true` (default): one bad row does not abort the batch.
+- `allowPartialErrors: true` (default): one bad record does not abort the batch.
 - `returnResultDetails: false`: skip success/failure key collection — better perf / less memory.
 - `durability`: optional per-batch recovery guarantee override (`durable` power-loss safe, `standard` crash-safe default, `async` immediate response with brief few-ms window on small writes).
 
@@ -642,7 +643,7 @@ Structured AST only — MUST NOT inject raw expression strings.
 
 | API | Meaning |
 | :--- | :--- |
-| `Expr.field(name)` | Current row field |
+| `Expr.field(name)` | Current record field |
 | `Expr.value(num)` | Constant |
 | `Expr.now()` | Server timestamp |
 | `Expr.min` / `max` / `round` / `floor` / `ceil` / `abs` | Functions |
@@ -766,6 +767,8 @@ QueryBuilder query(String tableName);
 | `join` / `leftJoin` / `rightJoin` | Relational joins |
 | `joinWithForeignKey` / `joinReferencedTable` / `joinReferencingTable` | FK-aware joins |
 | `matchVector` / `orMatchVector` | Hybrid vector (see Vector module) |
+| `matchText` / `orMatchText` | Text Top-K (`TextQuery`, `IndexType.text`) |
+| `matchSparse` / `orMatchSparse` | Neural sparse Top-K (`SparseVectorData`, `IndexType.sparse`) |
 | `useQueryCache([Duration?])` / `noQueryCache()` / `clearQueryCache()` | Result cache |
 | `first` / `count` / `exists` | Convenience |
 | `sum` / `avg` / `min` / `max` | Single-field aggregates |
@@ -776,7 +779,7 @@ QueryBuilder query(String tableName);
 
 | Field / API | Use |
 | :--- | :--- |
-| `data` | Rows |
+| `data` | records |
 | `hasMore` / `hasPrev` | Page flags |
 | `next()` / `prev()` | **Preferred** in-process paging |
 | `nextCursorToken` / `prevCursorToken` | Cross-process / network only |
@@ -876,7 +879,7 @@ Process large result sets without loading everything at once, and push live upda
 
 | Need | API |
 | :--- | :--- |
-| Stream rows as read (large scan) | `streamQuery` |
+| Stream records as read (large scan) | `streamQuery` |
 | Re-run query when matching table data changes | `query(...).watch()` |
 | Watch one/many KV keys | `watchValue` / `watchValues` or `db.kv.watch` |
 
@@ -890,15 +893,15 @@ StreamQueryBuilder streamQuery(String tableName);
 | :--- | :--- |
 | `select(List<String> fields)` | Projection |
 | `where` / `whereIn` / `whereBetween` / `whereNull` / `whereNotNull` / `or` | Filters |
-| `stream` / `asStream` / `execute` | `Stream<Map<String, dynamic>>` of **rows** |
+| `stream` / `asStream` / `execute` | `Stream<Map<String, dynamic>>` of **records** |
 | `listen(...)` | Convenience subscription |
 
 ```dart
-db.streamQuery('users').where('age', '>', 18).listen((row) {
+db.streamQuery('users').where('age', '>', 18).listen((record) {
   // one record at a time
 });
 
-await for (final row in db.streamQuery('users').whereEqual('id', id).stream) {
+await for (final record in db.streamQuery('users').whereEqual('id', id).stream) {
   // ...
 }
 ```
@@ -951,7 +954,7 @@ db.kv.watch<int>('unread_count').listen((c) { /* ... */ });
 1. Prefer `watch` / `watchValue` over polling for UI sync.
 2. Always `limit` reactive list queries when possible.
 3. Cancel subscriptions when widgets dispose.
-4. `streamQuery` = per-row stream; `watch` = full result refresh stream — do not confuse them.
+4. `streamQuery` = per-record stream; `watch` = full result refresh stream — do not confuse them.
 
 ---
 
@@ -1048,7 +1051,7 @@ Returns **records**: `key`, `value`, `updated_at`, `expires_at`.
 | `orderByKeyAsc` / `orderByKeyDesc` | Sort by key |
 | `orderByUpdatedAtAsc` / `orderByUpdatedAtDesc` | Sort by update time |
 | `limit` / `offset` / `cursor` | Pagination (same rules as table query) |
-| `includeExpired([true])` | Include uncleared expired rows (default filtered) |
+| `includeExpired([true])` | Include uncleared expired records (default filtered) |
 | `count()` / `first()` | Aggregates |
 | `peek()` / `peekFirst()` | Sync memory probe |
 | await / `.future` | `QueryResult` |
@@ -1096,7 +1099,18 @@ source_apis:
   - ToStore.vectorSearch
   - QueryBuilder.matchVector
   - QueryBuilder.orMatchVector
+  - QueryBuilder.matchText
+  - QueryBuilder.orMatchText
+  - QueryBuilder.matchSparse
+  - QueryBuilder.orMatchSparse
+  - QueryBuilder.fusionMethod
+  - RetrievalFusionMethod
   - VectorData
+  - SparseVectorData
+  - TextQuery
+  - TextTerm
+  - TextMatchOperator
+  - TextSearchMode
   - VectorFieldConfig
   - VectorIndexConfig
 version: 3.x
@@ -1146,11 +1160,11 @@ IndexSchema(
 
 Engine ranks by a **distance** (lower = closer):
 
-| Metric | ANN distance | Notes |
+| Metric | ANN distance | Public `score` / `rawScore` |
 | :--- | :--- | :--- |
-| `l2` | **squared** L2 | No square-root |
-| `innerProduct` | **negated** IP | Engine does **not** auto-normalize; normalize caller-side for semantic IP |
-| `cosine` | `1 - cosine` | Engine auto-normalizes |
+| `l2` | **squared** L2 (query norm + vector norm - 2 * dot) | `1 - distance / 2` clamped to `[0, 1]`. For unit-length vectors this equals cosine. Squared distance ≥ 2 scores 0. |
+| `innerProduct` | **negated** IP | Recovered IP clamped to `[0, 1]`. Engine does **not** auto-normalize; after caller-side normalization this matches cosine. IP above 1 saturates at 1. |
+| `cosine` | `1 - cosine` | `1 - distance` clamped to `[0, 1]`. Engine auto-normalizes. |
 
 Build query vectors with `VectorData(...)` / `VectorData.fromList(...)` (same type as `vectorSearch`).
 
@@ -1178,7 +1192,7 @@ QueryBuilder orMatchVector(...); // same params, OR branch
 
 ```dart
 // Pure ANN (default searchDepth 50). Prefer .select([pk]) for PK + score
-// only — skips full-row hydration (large embeddings hurt throughput).
+// only — skips full-record hydration (large embeddings hurt throughput).
 final result = await db.query('embeddings')
   .select(['id'])
   .matchVector('embedding', queryVector)
@@ -1208,9 +1222,20 @@ await db.query('embeddings')
 
 - `data[i]` ↔ `retrieval.entries[i]` **1:1**
 - With `.select([pk])`, `data` is PK-only; scores stay in `retrieval`
-- `entry.score` — normalized / fused score (higher ≈ better)
-- `entry.meta['distance']` — raw distance on vector channel
-- `retrieval.fusionMethod` — `single` or typically `rrf` for multi-way
+
+**One recall channel** — `entry.score` / `entry.rawScore` are that channel's scores (`higher` = better):
+
+| Channel | `score` | `rawScore` | Notes |
+| :--- | :--- | :--- | :--- |
+| text / sparse | `[0,1)` from `raw / (raw + 2)` | continuous match quality | Same discard band as cosine. One strong text term and one saturated sparse feature (query weight 1, full stored impact) both land near raw 5 → ~0.71. raw ≈ 1 → ~0.33, raw ≈ 30 → ~0.94. Short text queries commonly `rawScore` `0..30`. Top hit is not forced to `1.0`. |
+| vector | similarity in `[0,1]` | same as `score` | Cosine, normalized inner product, and unit-length L2 share that band. ANN distance in `meta['distance']`. |
+
+**Multi-way recall** (two or more of `matchText` / `matchSparse` / `matchVector` / structured OR branches) — scores are fused. Configure with `.fusionMethod(...)`; default is `weightedScore`:
+
+| `.fusionMethod(...)` | Scoring |
+| :--- | :--- |
+| `weightedScore` (default) | Sum of `weight × channel score`, divided by the total weight of every vector, text, and sparse channel in the query. A miss contributes 0, so a second hit raises the score. Weights mix already aligned scores; they do not rescale a channel. Higher = better. |
+| `rrf` | Relative score from ranks inside each channel's result set (Reciprocal Rank Fusion). |
 
 ## Standalone ANN
 
@@ -1246,7 +1271,32 @@ Larger depth typically raises both recall and latency. Prefer the anchors above;
 
 1. Dimensions MUST match field config.
 2. Prefer chain `matchVector` + `limit` over inventing custom ANN APIs.
-3. Read scores from `retrieval`, not by guessing row fields.
+3. Read scores from `retrieval`, not by guessing record fields.
+
+## Text and neural sparse retrieval
+
+Text and sparse channels share one Top-K kernel. `TextMatchOperator.or` ranks the union of terms. `TextMatchOperator.and` keeps a document only when every positive-weight term has impact, then ranks with the same additive integer score. A missing term yields an empty text channel. Phrase matching is not supported. Sparse retrieval stays disjunctive.
+
+| Channel | Chain | Index | Field type | Query value |
+| :--- | :--- | :--- | :--- | :--- |
+| text | `matchText` / `orMatchText` | `IndexType.text` | `DataType.text` | `TextQuery.text(...)`, `TextQuery.terms(...)`, or `TextQuery.termsWeighted(...)` |
+| sparse | `matchSparse` / `orMatchSparse` | `IndexType.sparse` | `DataType.sparse` | `SparseVectorData` |
+
+```dart
+final results = await db.query('articles')
+  .select(['id'])
+  .matchText(
+    'body',
+    TextQuery.text('distributed kernel storage'),
+    weight: 0.4,
+  )
+  .matchVector('embedding', queryVector, weight: 0.6)
+  .limit(10);
+```
+
+`TextQuery.text` is segmented by the engine. `TextQuery.terms(List<String>)` is pre-tokenized with weight 1 per term; repeated strings add weight. `TextQuery.termsWeighted(List<TextTerm>)` is pre-tokenized with an explicit weight on each `TextTerm` (`term`, `weight`); weights of the same term are summed, and non-positive weights are dropped. Pre-tokenized terms are matched exactly: the engine does not segment them, expand CJK bigrams, or change case. Built-in indexing lowercases Latin tokens, so a pre-tokenized query must use the same term strings that were indexed.
+
+For `TextQuery.text`, a CJK single-character match is treated as a weak signal (typically `score` below ~0.40), while CJK bigrams and Latin words keep the strong exact-term band (~0.71 for one strong hit). Longer Chinese `OR` queries therefore lean on bigrams rather than stacking many unigrams. `TextQuery.terms` / `termsWeighted` do not apply that automatic softening — caller weights are used as given. `matchText` followed by `matchVector` on the same chain is multi-way fusion (default `weightedScore`). Opt into rank-only fusion with `.fusionMethod(RetrievalFusionMethod.rrf)`. A structured `where*` on that chain is a filter over the recalled records. Inserts are searchable before flush. `limit` is topK. Scores are in `retrieval.entries`, aligned with `data` (see scoring tables above).
 
 ---
 
@@ -1302,7 +1352,7 @@ await db.close(keepActiveSpace: false);
 
 ## Table-level TTL
 
-Background cleanup of expired rows (logs, events, telemetry).
+Background cleanup of expired records (logs, events, telemetry).
 
 ```dart
 TableTtlConfig({
@@ -1747,7 +1797,7 @@ Both channels share the same `code` / `codeKey` / `ResultType` system.
 | `firstStatus` / `firstType` | First / primary diagnostic |
 | `message` | Human summary (batched messages capped) |
 
-Partial batch outcome: `hasErrors && successCount > 0` (inspect `statuses` per row).
+Partial batch outcome: `hasErrors && successCount > 0` (inspect `statuses` per record).
 
 ```dart
 final result = await db.insert('users', data);
@@ -1759,7 +1809,7 @@ if (result.hasErrors) {
 ```
 
 ```dart
-final batch = await db.batchInsert('users', rows);
+final batch = await db.batchInsert('users', records);
 if (batch.hasErrors) {
   for (final s in batch.statuses) {
     if (s is ConstraintStatus) { /* fields, tableName, … */ }
@@ -1774,7 +1824,7 @@ if (batch.hasErrors) {
 | Member | Meaning |
 | :--- | :--- |
 | `type` / `hasErrors` | Overall status (`hasErrors` ⇔ `type != success`) |
-| `data` | Rows |
+| `data` | records |
 | `message` | Detail |
 | `retrieval` | Vector/hybrid context |
 | Pagination | `hasMore`/`hasPrev`, `next`/`prev`, cursor tokens (see Query module) |
@@ -1947,7 +1997,7 @@ import 'package:tostore/tostore.dart';
 
 | Type | Entry | Key methods (see topic modules) |
 | :--- | :--- | :--- |
-| `QueryBuilder` | `query` | select, join*, agg, peek*, watch, cache, matchVector, … |
+| `QueryBuilder` | `query` | select, join*, agg, peek*, watch, cache, matchVector, matchText, matchSparse, fusionMethod, … |
 | `UpdateBuilder` | `update` | set*, compute, allow*, inherits ChainBuilder where* |
 | `DeleteBuilder` | `delete` | allowDeleteAll, allowLargeScaleOperation, where* |
 | `StreamQueryBuilder` | `streamQuery` | where*, select, stream/listen |
@@ -1988,6 +2038,8 @@ Agents MAY import these via `package:tostore/tostore.dart`:
 | `space_info.dart` | `SpaceInfo` |
 | `table_info.dart` | `TableInfo` |
 | `table_schema.dart` | `TableSchema`, `FieldSchema`, `IndexSchema`, `TableTtlConfig`, `DataType`, `IndexType`, `DefaultValueType`, `PrimaryKeyType`, `SequentialIdConfig`, `PrimaryKeyConfig`, `VectorData`, `VectorFieldConfig`, `VectorIndexType`, `VectorDistanceMetric`, `VectorIndexConfig`, `ForeignKeyCascadeAction`, `ForeignKeySchema`, … |
+| `text_query.dart` | `TextQuery`, `TextTerm`, `TextMatchOperator` |
+| `sparse_vector_data.dart` | `SparseVectorData` |
 | `transaction_result.dart` | `TransactionResult`, `TransactionStatus`, `TransactionErrorType`, `TransactionError` |
 | `query_condition.dart` | `QueryCondition` |
 

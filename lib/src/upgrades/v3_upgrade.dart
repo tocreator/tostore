@@ -4,8 +4,8 @@ import 'dart:typed_data';
 
 import 'package:path/path.dart' as path;
 
-import '../core/store_page.dart';
 import '../core/data_store_impl.dart';
+import '../core/store_page.dart';
 import '../core/wal_manager.dart';
 import '../handler/common.dart';
 import '../handler/logger.dart';
@@ -35,7 +35,7 @@ import 'weight_format_migration.dart';
 /// Version 3 upgrade:
 /// - Bootstraps `_system_table_meta` + internal KV + `_system_fk_references` +
 ///   `_system_key_migration`; migrates 3.1.2 schema partitions (user + existing
-///   system tables) into `TableMeta` rows via memory + durable writeChanges,
+///   system tables) into `TableMeta` records via memory + durable writeChanges,
 ///   then renames directories to stable UIDs (no SchemaMeta/routes rewrite).
 /// - Restructures storage directory names from physical table/index names to stable UIDs.
 /// - Primes [GlobalConfig.pageSize] (sample legacy meta.json / default) before
@@ -357,9 +357,9 @@ class V3Upgrade {
         }
       }
     }
-    await _durablyPersistTableMetaRows(pendingIngestMetas);
+    await _durablyPersistTableMetaRecords(pendingIngestMetas);
     if (pendingFkMetas.isNotEmpty) {
-      await _durablyPersistFkReferencesRows(pendingFkMetas);
+      await _durablyPersistFkReferencesRecords(pendingFkMetas);
     }
 
     // Dir high-water is folded into the single GlobalConfig write below.
@@ -534,7 +534,7 @@ class V3Upgrade {
       }
     }
 
-    await _durablyPersistTableMetaRows(pendingDurable);
+    await _durablyPersistTableMetaRecords(pendingDurable);
   }
 
   /// Memory-only [TableMeta] + empty index page0. Returns meta when newly
@@ -583,11 +583,11 @@ class V3Upgrade {
     return saved;
   }
 
-  /// Insert missing `_system_table_meta` rows (+ secondary indexes) on disk.
+  /// Insert missing `_system_table_meta` records (+ secondary indexes) on disk.
   ///
   /// Idempotent: skips UIDs already present in partition files (crash resume).
   /// Does not touch WriteBuffer (avoids double-apply after journal starts).
-  Future<void> _durablyPersistTableMetaRows(List<TableMeta> metas) async {
+  Future<void> _durablyPersistTableMetaRecords(List<TableMeta> metas) async {
     if (metas.isEmpty) return;
 
     final schemaMgr = _dataStore.tableMetaManager;
@@ -626,10 +626,11 @@ class V3Upgrade {
     );
   }
 
-  /// Insert missing `_system_fk_references` rows (+ secondary indexes) on disk.
+  /// Insert missing `_system_fk_references` records (+ secondary indexes) on disk.
   ///
   /// Idempotent: skips foreign keys already present in the system table (crash resume).
-  Future<void> _durablyPersistFkReferencesRows(List<TableMeta> fkMetas) async {
+  Future<void> _durablyPersistFkReferencesRecords(
+      List<TableMeta> fkMetas) async {
     if (fkMetas.isEmpty) return;
 
     final schemaMgr = _dataStore.tableMetaManager;

@@ -3,25 +3,25 @@ import 'dart:typed_data';
 
 import '../handler/logger.dart';
 import '../model/applied_encryption.dart';
-import '../model/db_exception.dart';
 import '../model/background_write_entry.dart';
-import '../model/encryption_domain.dart';
-import '../model/migration_write_mode.dart';
 import '../model/background_write_type.dart';
 import '../model/buffer_entry.dart';
 import '../model/cancellation_token.dart';
+import '../model/data_store_config.dart';
+import '../model/db_exception.dart';
+import '../model/encryption_domain.dart';
 import '../model/key_migration_info.dart';
+import '../model/migration_write_mode.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
 import '../model/system_table.dart';
 import '../model/table_context.dart';
+import '../model/table_identity.dart';
 import '../model/table_schema.dart' show TableSchema;
-import '../model/data_store_config.dart';
 import 'data_store_impl.dart';
 import 'key_migration_progress.dart';
 import 'resource_manager.dart';
 import 'yield_controller.dart';
-import '../model/table_identity.dart';
 
 /// Background key re-encryption via [BackgroundWriteScheduler].
 class KeyMigrationRunner {
@@ -493,6 +493,7 @@ class KeyMigrationRunner {
     await _markDomainDone(dataStore, EncryptionDomain.tableData);
     await _markDomainDone(dataStore, EncryptionDomain.btreeIndex);
     await _rewriteVectorIndexDomain(dataStore);
+    await _rewriteTextIndexDomain(dataStore);
   }
 
   static Future<void> _rewriteVectorIndexDomain(DataStoreImpl dataStore) async {
@@ -536,6 +537,27 @@ class KeyMigrationRunner {
       }
     }
     await _markDomainDone(dataStore, EncryptionDomain.vectorIndex);
+  }
+
+  static Future<void> _rewriteTextIndexDomain(DataStoreImpl dataStore) async {
+    final info = await dataStore.migrationManager?.getKeyMigrationInfo();
+    if (info != null && info.isDomainDone(EncryptionDomain.textIndex)) {
+      return;
+    }
+    if (!EncryptionDomainPolicy.participatesInEncodingKeyMigration(
+      EncryptionDomain.textIndex,
+      dataStore.config.encryptionConfig,
+    )) {
+      await _markDomainDone(dataStore, EncryptionDomain.textIndex);
+      return;
+    }
+    final wmbp = dataStore.wmbpIndexManager;
+    if (wmbp == null) {
+      await _markDomainDone(dataStore, EncryptionDomain.textIndex);
+      return;
+    }
+    await wmbp.rewriteEncryptedPages();
+    await _markDomainDone(dataStore, EncryptionDomain.textIndex);
   }
 
   static bool _rewriteDomainsComplete(KeyMigrationInfo info) {

@@ -62,8 +62,10 @@ export 'src/model/result_status.dart';
 export 'src/model/result_type.dart';
 export 'src/model/schema_update_result.dart';
 export 'src/model/space_info.dart';
+export 'src/model/sparse_vector_data.dart';
 export 'src/model/table_info.dart';
 export 'src/model/table_schema.dart';
+export 'src/model/text_query.dart';
 export 'src/model/transaction_result.dart';
 export 'src/query/query_condition.dart';
 
@@ -697,7 +699,7 @@ class ToStore implements DataStoreInterface {
   /// - `.allowLargeScaleOperation()` -- explicitly allow a large-scale data update
   ///     that would otherwise be rejected to prevent OOM. Runs in background batches
   ///     via the unified write scheduler and **blocks until completion**. Returns
-  ///     [DbResult.successCount] only (no success/failure primary keys or per-row
+  ///     [DbResult.successCount] only (no success/failure primary keys or per-record
   ///     status details). Not allowed inside a transaction (rejected with rollback).
   ///     If interrupted, already-persisted changes are kept; retry to continue.
   /// - `.allowUpdateAll()` -- allow updating all records without a condition
@@ -799,8 +801,8 @@ class ToStore implements DataStoreInterface {
   ///
   /// - Each record must contain all non-nullable (nullable=false) fields except the primary key,
   ///   as well as all fields that participate in unique indexes.
-  /// - For each record, existing rows are located using unique indexes; if found, the row is updated,
-  ///   otherwise a new row is inserted.
+  /// - For each record, existing records are located using unique indexes; if found, the record is updated,
+  ///   otherwise a new record is inserted.
   /// - When the table has no unique constraints, this operation is not supported and will return an error.
   /// [tableName] Table name.
   /// [dataList] List of records to upsert.
@@ -1139,7 +1141,7 @@ class ToStore implements DataStoreInterface {
   /// - `.allowLargeScaleOperation()` -- explicitly allow a large-scale data delete
   ///     that would otherwise be rejected to prevent OOM. Runs in background batches
   ///     via the unified write scheduler and **blocks until completion**. Returns
-  ///     [DbResult.successCount] only (no success/failure primary keys or per-row
+  ///     [DbResult.successCount] only (no success/failure primary keys or per-record
   ///     status details). Not allowed inside a transaction (rejected with rollback).
   ///     If interrupted, already-persisted changes are kept; retry to continue.
   /// - `.allowDeleteAll()` -- allow deleting all records without a condition
@@ -1216,7 +1218,7 @@ class ToStore implements DataStoreInterface {
   /// Check if a table has been defined in the current database (space-agnostic).
   ///
   /// This method only checks whether the table structure exists and can be used,
-  /// not whether the table contains any rows.
+  /// not whether the table contains any records.
   ///
   /// [tableName] The name of the table to check.
   /// Returns true if the table structure exists.

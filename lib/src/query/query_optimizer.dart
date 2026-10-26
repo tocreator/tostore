@@ -1,8 +1,8 @@
 import 'dart:math';
 
+import '../core/data_store_impl.dart';
 import '../handler/logger.dart';
 import '../handler/value_matcher.dart';
-import '../core/data_store_impl.dart';
 import '../model/db_exception.dart';
 import '../model/table_context.dart';
 import '../model/table_schema.dart';
@@ -88,7 +88,7 @@ class QueryOptimizer {
             ? _dataStore.config.defaultQueryLimit
             : limit;
         final int need = max(1, effOffset + max(1, effLimit));
-        final int totalRecordCount = _estimateTotalRowsSync(table);
+        final int totalRecordCount = _estimateTotalRecordsSync(table);
         final fieldSel = _estimateFieldSelectivity(
           schema: schema,
           where: tableWhere,
@@ -640,7 +640,7 @@ class QueryOptimizer {
     return const <String, dynamic>{};
   }
 
-  int _estimateTotalRowsSync(TableContext table) {
+  int _estimateTotalRecordsSync(TableContext table) {
     try {
       final n = _dataStore.tableDataManager.getTableRecordCountSync(table);
       if (n != null) return max(1, n);

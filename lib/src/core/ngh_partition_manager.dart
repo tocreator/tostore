@@ -294,6 +294,9 @@ final class NghPartitionManager {
   }
 
   /// Read an vector leaf page from cache or disk.
+  ///
+  /// [localCache] keys must be [NghPageId.cacheKey] / [_cacheKey]
+  /// (`partitionNo<<32|pageNo`), never legacy packed i32.
   Future<NghLeafPage?> readLeafPage(
     TableContext table,
     IndexUid indexUid,
@@ -312,7 +315,10 @@ final class NghPartitionManager {
 
     final cached =
         _leafPageCache.getPoint4(tableUid, indexUid, partitionNo, pageNo);
-    if (cached != null) return cached;
+    if (cached != null) {
+      localCache?[cacheKey] = cached;
+      return cached;
+    }
 
     final path = _dataStore.pathManager
         .getNghLeafPartitionPathByContext(table, indexUid, partitionNo);
@@ -331,6 +337,7 @@ final class NghPartitionManager {
       if (page == null) return null;
 
       _leafPageCache.putPoint4(tableUid, indexUid, partitionNo, pageNo, page);
+      localCache?[cacheKey] = page;
       return page;
     } catch (e) {
       if (e is DbClosedException) rethrow;
@@ -343,78 +350,82 @@ final class NghPartitionManager {
     }
   }
 
-  /// Read specific leaf pages by packed refs, grouped by partition for parallel I/O.
+  /// Read leaf pages by v2 page ids (any partition, including >= 2048).
   ///
-  /// Each entry in [packedRefs] is `partitionNo<<20|pageNo` (legacy bare pageNo = p0).
-  Future<List<({int packedRef, NghLeafPage page})>> readLeafPagesBatch(
+  /// Groups by [NghPageId.partitionNo], merges sorted page ranges per
+  /// partition, and runs multi-partition I/O via [ParallelProcessor].
+  /// [localCache] keys are always [NghPageId.cacheKey].
+  Future<List<({NghPageId id, NghLeafPage page})>> readLeafPagesByIds(
     TableContext table,
     IndexUid indexUid,
     NghIndexMeta meta,
-    List<int> packedRefs, {
+    List<NghPageId> ids, {
     Map<int, NghLeafPage>? localCache,
     bool populatePageCache = true,
   }) async {
-    if (packedRefs.isEmpty) return const [];
-    final results = <({int packedRef, NghLeafPage page})>[];
-    // partitionNo -> packed refs still needing disk I/O
-    final missingByPartition = <int, List<int>>{};
+    if (ids.isEmpty) return const [];
+    final results = <({NghPageId id, NghLeafPage page})>[];
+    final missingByPartition = <int, List<NghPageId>>{};
+    final tableUid = table.tableUid;
 
-    for (final packed in packedRefs) {
-      if (packed <= 0) continue;
-      final (part, pageNo) = NghPagePtr.unpackRef(packed);
-      if (pageNo <= 0) continue;
-
-      final local = localCache?[packed];
+    for (final id in ids) {
+      if (id.isNone) continue;
+      final local = localCache?[id.cacheKey];
       if (local != null) {
-        results.add((packedRef: packed, page: local));
+        results.add((id: id, page: local));
         continue;
       }
-      final cached =
-          _leafPageCache.getPoint4(table.tableUid, indexUid, part, pageNo);
+      final cached = _leafPageCache.getPoint4(
+          tableUid, indexUid, id.partitionNo, id.pageNo);
       if (cached != null) {
-        results.add((packedRef: packed, page: cached));
+        localCache?[id.cacheKey] = cached;
+        results.add((id: id, page: cached));
         continue;
       }
-      missingByPartition.putIfAbsent(part, () => <int>[]).add(packed);
+      missingByPartition
+          .putIfAbsent(id.partitionNo, () => <NghPageId>[])
+          .add(id);
     }
 
     if (missingByPartition.isEmpty) return results;
 
     final pageSize = pageSizeFor(NghDataCategory.leaf, meta);
-    final tableUid = table.tableUid;
 
-    Future<List<({int packedRef, NghLeafPage page})>> readOnePartition(
+    Future<List<({NghPageId id, NghLeafPage page})>> readOnePartition(
       int part,
-      List<int> missingPacked,
+      List<NghPageId> missingIds,
     ) async {
-      final partResults = <({int packedRef, NghLeafPage page})>[];
+      final partResults = <({NghPageId id, NghLeafPage page})>[];
       final path = _dataStore.pathManager
           .getNghLeafPartitionPathByContext(table, indexUid, part);
       final chunkPages = max(1, _maxPartitionIoChunkBytes ~/ max(pageSize, 1));
 
-      final uniquePacked = missingPacked.toSet().toList(growable: false);
-      uniquePacked.sort((a, b) =>
-          NghPagePtr.unpackRef(a).$2.compareTo(NghPagePtr.unpackRef(b).$2));
+      // Dedupe by pageNo; keep first id for each page.
+      final byPage = <int, NghPageId>{};
+      for (final id in missingIds) {
+        byPage.putIfAbsent(id.pageNo, () => id);
+      }
+      final uniqueIds = byPage.values.toList(growable: false);
+      uniqueIds.sort((a, b) => a.pageNo.compareTo(b.pageNo));
 
-      for (int start = 0; start < uniquePacked.length; start += chunkPages) {
-        final end = min(start + chunkPages, uniquePacked.length);
-        final slice = uniquePacked.sublist(start, end);
+      for (int start = 0; start < uniqueIds.length; start += chunkPages) {
+        final end = min(start + chunkPages, uniqueIds.length);
+        final slice = uniqueIds.sublist(start, end);
         final ranges = <ByteReadRange>[
-          for (final packed in slice)
+          for (final id in slice)
             ByteReadRange(
-              offset: NghPagePtr.unpackRef(packed).$2 * pageSize,
+              offset: id.pageNo * pageSize,
               length: pageSize,
             ),
         ];
 
         final rawBlocks = await _retryLockTimeout(
           () => _dataStore.storage.readManyAsBytesAt(path, ranges),
-          label: 'readLeafPagesBatch p$part',
+          label: 'readLeafPagesByIds p$part',
         );
 
         for (int i = 0; i < slice.length; i++) {
-          final packed = slice[i];
-          final pageNo = NghPagePtr.unpackRef(packed).$2;
+          final id = slice[i];
           final raw = (i < rawBlocks.length) ? rawBlocks[i] : Uint8List(0);
           if (raw.isEmpty) continue;
           try {
@@ -424,10 +435,10 @@ final class NghPartitionManager {
             if (page != null) {
               if (populatePageCache) {
                 _leafPageCache.putPoint4(
-                    tableUid, indexUid, part, pageNo, page);
+                    tableUid, indexUid, part, id.pageNo, page);
               }
-              localCache?[packed] = page;
-              partResults.add((packedRef: packed, page: page));
+              localCache?[id.cacheKey] = page;
+              partResults.add((id: id, page: page));
             }
           } catch (e) {
             if (e is DbClosedException || e is DbException) rethrow;
@@ -449,12 +460,12 @@ final class NghPartitionManager {
           () => readOnePartition(entry.key, entry.value),
       ];
       final partLists = await ParallelProcessor.execute<
-          List<({int packedRef, NghLeafPage page})>>(
+          List<({NghPageId id, NghLeafPage page})>>(
         tasks,
         concurrency: min(5, tasks.length),
         timeout: ParallelProcessor.noTimeout,
         continueOnError: false,
-        label: 'readLeafPagesBatch',
+        label: 'readLeafPagesByIds',
       );
       for (final partList in partLists) {
         if (partList != null) results.addAll(partList);
@@ -463,17 +474,57 @@ final class NghPartitionManager {
     return results;
   }
 
-  /// Read the entire leaf-page chain starting at [headPackedRef].
-  Future<List<({int packedRef, NghLeafPage page})>> readLeafPageChain(
+  /// Legacy packed-ref batch reader. Delegates to [readLeafPagesByIds].
+  ///
+  /// Each entry in [packedRefs] is `partitionNo<<20|pageNo` (bare pageNo = p0).
+  /// Prefer [readLeafPagesByIds] for partition >= 2048.
+  Future<List<({int packedRef, NghLeafPage page})>> readLeafPagesBatch(
     TableContext table,
     IndexUid indexUid,
     NghIndexMeta meta,
-    int headPackedRef, {
+    List<int> packedRefs, {
+    Map<int, NghLeafPage>? localCache,
+    bool populatePageCache = true,
+  }) async {
+    if (packedRefs.isEmpty) return const [];
+    final ids = <NghPageId>[];
+    final packedByCacheKey = <int, int>{};
+    for (final packed in packedRefs) {
+      if (packed <= 0) continue;
+      final id = NghPageId.fromPacked(packed);
+      if (id.isNone) continue;
+      ids.add(id);
+      packedByCacheKey[id.cacheKey] = packed;
+    }
+    final loaded = await readLeafPagesByIds(
+      table,
+      indexUid,
+      meta,
+      ids,
+      localCache: localCache,
+      populatePageCache: populatePageCache,
+    );
+    return [
+      for (final item in loaded)
+        (
+          packedRef: packedByCacheKey[item.id.cacheKey] ??
+              (item.id.tryPack() ?? item.id.cacheKey),
+          page: item.page,
+        ),
+    ];
+  }
+
+  /// Read the entire leaf-page chain starting at [headPageId].
+  Future<List<({NghPageId id, NghLeafPage page})>> readLeafPageChainById(
+    TableContext table,
+    IndexUid indexUid,
+    NghIndexMeta meta,
+    NghPageId headPageId, {
     Map<int, NghLeafPage>? localCache,
   }) async {
-    if (headPackedRef <= 0) return const [];
-    final pages = <({int packedRef, NghLeafPage page})>[];
-    var current = NghPageId.fromPacked(headPackedRef);
+    if (headPageId.isNone) return const [];
+    final pages = <({NghPageId id, NghLeafPage page})>[];
+    var current = headPageId;
     final visited = <int>{};
 
     while (!current.isNone && !visited.contains(current.cacheKey)) {
@@ -487,16 +538,38 @@ final class NghPartitionManager {
         localCache: localCache,
       );
       if (pg == null) break;
-      pages.add((
-        packedRef: current.tryPack() ?? current.cacheKey,
-        page: pg,
-      ));
+      pages.add((id: current, page: pg));
       current = pg.nextLeafPage;
     }
     return pages;
   }
 
-  /// Batch read multiple leaf pages in parallel or sequentially.
+  /// Legacy packed-ref chain reader. Delegates to [readLeafPageChainById].
+  Future<List<({int packedRef, NghLeafPage page})>> readLeafPageChain(
+    TableContext table,
+    IndexUid indexUid,
+    NghIndexMeta meta,
+    int headPackedRef, {
+    Map<int, NghLeafPage>? localCache,
+  }) async {
+    if (headPackedRef <= 0) return const [];
+    final loaded = await readLeafPageChainById(
+      table,
+      indexUid,
+      meta,
+      NghPageId.fromPacked(headPackedRef),
+      localCache: localCache,
+    );
+    return [
+      for (final item in loaded)
+        (
+          packedRef: item.id.tryPack() ?? item.id.cacheKey,
+          page: item.page,
+        ),
+    ];
+  }
+
+  /// Batch read multiple leaf page chains (legacy packed heads).
   Future<List<List<({int packedRef, NghLeafPage page})>>>
       readLeafPagesChainsBatch(
     TableContext table,
@@ -835,61 +908,6 @@ final class NghPartitionManager {
     }
   }
 
-  /// Read leaf pages by v2 page ids (partition >= 2048 safe).
-  Future<List<({NghPageId id, NghLeafPage page})>> readLeafPagesByIds(
-    TableContext table,
-    IndexUid indexUid,
-    NghIndexMeta meta,
-    List<NghPageId> ids, {
-    Map<int, NghLeafPage>? localCache,
-    bool populatePageCache = true,
-  }) async {
-    if (ids.isEmpty) return const [];
-    final packed = <int>[];
-    final packedToId = <int, NghPageId>{};
-    final unpacked = <NghPageId>[];
-    for (final id in ids) {
-      if (id.isNone) continue;
-      final p = id.tryPack();
-      if (p != null && p > 0) {
-        packed.add(p);
-        packedToId[p] = id;
-      } else {
-        unpacked.add(id);
-      }
-    }
-    final out = <({NghPageId id, NghLeafPage page})>[];
-    if (packed.isNotEmpty) {
-      final loaded = await readLeafPagesBatch(
-        table,
-        indexUid,
-        meta,
-        packed,
-        localCache: localCache,
-        populatePageCache: populatePageCache,
-      );
-      for (final item in loaded) {
-        out.add((
-          id: packedToId[item.packedRef] ??
-              NghPageId.fromPacked(item.packedRef),
-          page: item.page,
-        ));
-      }
-    }
-    for (final id in unpacked) {
-      final page = await readLeafPage(
-        table,
-        indexUid,
-        meta,
-        id.partitionNo,
-        id.pageNo,
-        localCache: localCache,
-      );
-      if (page != null) out.add((id: id, page: page));
-    }
-    return out;
-  }
-
   /// Convert a legacy `nav_graph.ngh` blob into paged nav. Does not
   /// rewrite leaf files.
   Future<
@@ -912,8 +930,11 @@ final class NghPartitionManager {
     for (final c in centroids) {
       c.level = NghNavCentroidNode.levelLeaf;
       if (c.leafPages.isEmpty) {
-        for (final packed in c.leafPageNos) {
-          c.addLeafPage(NghPageId.fromPacked(packed));
+        if (!c.headLeafPage.isNone) {
+          c.addLeafPage(c.headLeafPage);
+          if (!c.tailLeafPage.isNone && c.tailLeafPage != c.headLeafPage) {
+            c.addLeafPage(c.tailLeafPage);
+          }
         }
       }
       c.leafDirDirty = false;

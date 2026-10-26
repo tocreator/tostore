@@ -28,7 +28,7 @@ RFC 2119 keywords apply.
 8. Agents MUST NOT read/write/drop/clear/query system tables via public ToStore APIs (engine rejects with developer error).
 9. Unconditional `update` / `delete` MUST use `.allowUpdateAll()` / `.allowDeleteAll()` deliberately.
 10. Large-scale `update` / `delete` that would risk OOM MUST use `.allowLargeScaleOperation()`; MUST NOT use it inside a transaction.
-11. After large-scale ops, agents SHOULD only rely on `DbResult.successCount` (no per-row key details).
+11. After large-scale ops, agents SHOULD only rely on `DbResult.successCount` (no per-record key details).
 
 ## KV
 

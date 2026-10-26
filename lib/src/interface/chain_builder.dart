@@ -14,8 +14,13 @@ import '../model/query_aggregation.dart';
 import '../model/query_result.dart';
 import '../model/result_status.dart';
 import '../model/result_type.dart';
+import '../model/sparse_vector_data.dart';
+import '../model/table_context.dart';
 import '../model/table_identity.dart';
 import '../model/table_schema.dart';
+import '../model/text_query.dart';
+import '../core/wmbp_scheduler.dart';
+import '../core/wmbp_score.dart';
 import '../query/query_cache.dart';
 import '../query/query_condition.dart';
 import '../query/query_executor.dart';
@@ -38,6 +43,9 @@ abstract final class QueryClauseMask {
   static const int orderBy = 1 << 8;
   static const int onlyCount = 1 << 9;
   static const int matchVector = 1 << 10;
+  static const int matchText = 1 << 11;
+  static const int matchSparse = 1 << 12;
+  static const int retrieval = matchVector | matchText | matchSparse;
 }
 
 /// chain builder base class
@@ -220,8 +228,16 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
   SELF condition(QueryCondition condition) {
     _ensureConditionTree();
     _condition!.condition(condition);
-    if (condition.hasVectorMatch) {
-      _clauseFlags |= QueryClauseMask.matchVector;
+    if (condition.hasRetrievalMatch) {
+      if (condition.hasVectorMatch) {
+        _clauseFlags |= QueryClauseMask.matchVector;
+      }
+      if (condition.hasTextMatch) {
+        _clauseFlags |= QueryClauseMask.matchText;
+      }
+      if (condition.hasSparseMatch) {
+        _clauseFlags |= QueryClauseMask.matchSparse;
+      }
     }
 
     condition.$internalApplySettings(
@@ -239,8 +255,16 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
   SELF orCondition(QueryCondition condition) {
     _ensureConditionTree();
     _condition!.orCondition(condition);
-    if (condition.hasVectorMatch) {
-      _clauseFlags |= QueryClauseMask.matchVector;
+    if (condition.hasRetrievalMatch) {
+      if (condition.hasVectorMatch) {
+        _clauseFlags |= QueryClauseMask.matchVector;
+      }
+      if (condition.hasTextMatch) {
+        _clauseFlags |= QueryClauseMask.matchText;
+      }
+      if (condition.hasSparseMatch) {
+        _clauseFlags |= QueryClauseMask.matchSparse;
+      }
     }
 
     condition.$internalApplySettings(
@@ -407,5 +431,72 @@ abstract class ChainBuilder<SELF extends ChainBuilder<SELF>> {
   QueryCondition get queryCondition {
     _ensureConditionTree();
     return _condition!;
+  }
+}
+
+int _syncFutureDepth = 0;
+
+/// Zero-microtask synchronous Future implementation for pure in-memory fast paths.
+class _SyncFuture<T> implements Future<T> {
+  final T _value;
+  const _SyncFuture(this._value);
+
+  @override
+  Stream<T> asStream() => Stream<T>.value(_value);
+
+  @override
+  Future<T> catchError(Function onError, {bool Function(Object error)? test}) =>
+      this;
+
+  @override
+  Future<R> then<R>(
+    FutureOr<R> Function(T value) onValue, {
+    Function? onError,
+  }) {
+    if (_syncFutureDepth >= 64) {
+      final f = Future<R>.microtask(() {
+        _syncFutureDepth = 0;
+        return onValue(_value);
+      });
+      if (onError != null) {
+        return f.catchError(onError);
+      }
+      return f;
+    }
+
+    _syncFutureDepth++;
+    try {
+      final res = onValue(_value);
+      if (res is Future<R>) return res;
+      return _SyncFuture<R>(res);
+    } catch (e, s) {
+      if (onError != null) {
+        try {
+          final errRes = onError(e, s);
+          if (errRes is Future<R>) return errRes;
+          return _SyncFuture<R>(errRes as R);
+        } catch (e2, s2) {
+          return Future<R>.error(e2, s2);
+        }
+      }
+      return Future<R>.error(e, s);
+    } finally {
+      _syncFutureDepth--;
+    }
+  }
+
+  @override
+  Future<T> timeout(Duration timeLimit, {FutureOr<T> Function()? onTimeout}) =>
+      this;
+
+  @override
+  Future<T> whenComplete(FutureOr Function() action) {
+    try {
+      final res = action();
+      if (res is Future) return res.then((_) => _value);
+      return this;
+    } catch (e, s) {
+      return Future<T>.error(e, s);
+    }
   }
 }

@@ -217,6 +217,18 @@ class BufferTreeStore {
     return TreeCache.compareNative;
   }
 
+  /// Scalar B+Tree indexes only - never text / sparse / vector (WMBP / NGH).
+  Iterable<IndexSchema> _btreeIndexesFor(TableSchema schema) {
+    final meta = _dataStore.tableMetaManager;
+    if (meta != null) return meta.getBtreeIndexesFor(schema);
+    return schema.getAllIndexes().where(
+          (i) =>
+              i.type != IndexType.vector &&
+              i.type != IndexType.text &&
+              i.type != IndexType.sparse,
+        );
+  }
+
   /// Once-per-batch index plan.
   ///
   /// When [includeUniques] is false, only non-unique slots (reserve owns uniques).
@@ -237,9 +249,7 @@ class BufferTreeStore {
       uniqueFlags.add(true);
     }
     // Prefer meta-manager cached lists when available (avoids getAllIndexes alloc).
-    final meta = _dataStore.tableMetaManager;
-    final Iterable<IndexSchema> allIdx = meta?.getBtreeIndexesFor(schema) ??
-        schema.getAllIndexes().where((i) => i.type != IndexType.vector);
+    final Iterable<IndexSchema> allIdx = _btreeIndexesFor(schema);
     for (final idx in allIdx) {
       if (idx.fields.isEmpty) continue;
       if (!includeUniques && idx.unique) continue;
@@ -284,10 +294,10 @@ class BufferTreeStore {
     return pendingRecordCache.hasGroupEntries(tableUid);
   }
 
-  /// TableUids that currently have pending record rows (O(pending tables)).
+  /// TableUids that currently have pending record records (O(pending tables)).
   ///
   /// Uses [TreeCache.listNonEmptyRootKeys], which requires each table group to
-  /// still hold child PK payloads — not merely that the TableUid key was ever
+  /// still hold child PK payloads - not merely that the TableUid key was ever
   /// inserted into the group map.
   List<TableUid> listPendingTableUids() {
     final keys = pendingRecordCache.listNonEmptyRootKeys();
@@ -516,7 +526,7 @@ class BufferTreeStore {
   /// Virgin insert using a precomputed [IndexWritePlan] (batch hot path).
   ///
   /// Per row: record put + one loop over plan slots (unique putIfAbsent /
-  /// non-unique put). No per-row `getAllIndexes` / comparator ensure.
+  /// non-unique put). No per-record `getAllIndexes` / comparator ensure.
   void applyVirginInsertWithPlan({
     required IndexWritePlan plan,
     required String pk,
@@ -714,7 +724,7 @@ class BufferTreeStore {
       transactionId: transactionId,
       isUnique: true,
     );
-    for (final idx in schema.getAllIndexes()) {
+    for (final idx in _btreeIndexesFor(schema)) {
       final parts = _indexFieldsValue(data, idx.fields);
       if (parts.isEmpty) continue;
       _removeUniqueIndexKey(
@@ -757,7 +767,7 @@ class BufferTreeStore {
       return;
     }
 
-    for (final idx in schema.getAllIndexes()) {
+    for (final idx in _btreeIndexesFor(schema)) {
       final touches = changedFields == null ||
           changedFields.isEmpty ||
           idx.fields.any(changedFields.contains);
@@ -1453,7 +1463,7 @@ class BufferTreeStore {
         isUnique: true,
       ),
     ];
-    for (final idx in schema.getAllIndexes()) {
+    for (final idx in _btreeIndexesFor(schema)) {
       final parts = _indexFieldsValue(entry.data, idx.fields);
       if (parts.isEmpty) continue;
       paths.add(

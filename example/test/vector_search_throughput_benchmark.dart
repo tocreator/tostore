@@ -6,7 +6,7 @@ import 'package:tostore/tostore.dart';
 /// Vector search throughput benchmark (128-d and 768-d, Top-K 10, default
 /// searchDepth).
 ///
-/// Reuses a fixed database directory across runs. Existing rows are kept;
+/// Reuses a fixed database directory across runs. Existing records are kept;
 /// only the deficit to [corpusSize] is inserted. After any insert, [ToStore.flush]
 /// runs so ANN search can see durable index pages.
 ///
@@ -154,7 +154,7 @@ Future<_DimSummary> _runDimension({
       '----------------------------------------------------------------');
 
   final existingCount = await db.query(tableName).count();
-  stdout.writeln('Existing rows:     $existingCount');
+  stdout.writeln('Existing records:     $existingCount');
 
   if (existingCount < corpusSize) {
     final missing = corpusSize - existingCount;
@@ -199,9 +199,9 @@ Future<_DimSummary> _runDimension({
   }
 
   final readyCount = await db.query(tableName).count();
-  stdout.writeln('Rows after setup:  $readyCount\n');
+  stdout.writeln('records after setup:  $readyCount\n');
   if (readyCount <= 0) {
-    throw StateError('No rows available for vector search ($tableName).');
+    throw StateError('No records available for vector search ($tableName).');
   }
 
   stdout.writeln('Building $searchCount query vectors (${dimensions}D)...');

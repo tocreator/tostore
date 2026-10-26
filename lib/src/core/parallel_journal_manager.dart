@@ -179,7 +179,7 @@ class ParallelJournalManager {
   int get effectiveWriteBatchSize => _cachedEffectiveWriteBatchSize;
 
   /// True when the WAL flush queue is non-empty and pending buffer still holds
-  /// rows for at least one vector-indexed table.
+  /// records for at least one vector-indexed table.
   ///
   /// O(1) check using [_bufferManager.hasPendingVectorWrites].
   bool _pendingFlushTouchesVectorIndex() {
@@ -1146,7 +1146,7 @@ class ParallelJournalManager {
           }
           try {
             // Prefer schema already on [TableContext] -- avoids getTableMeta
-            // cold load / bootstrap deadlock while flushing recovered meta rows.
+            // cold load / bootstrap deadlock while flushing recovered meta records.
             final schema = tableContext.schema.name.isNotEmpty
                 ? tableContext.schema
                 : await _dataStore.tableMetaManager
@@ -1979,7 +1979,7 @@ class ParallelJournalManager {
               entry: be.copyWith(walPointer: walPtr),
             );
 
-            // Meta rows land in the write buffer only; hydrate memory inventory
+            // Meta records land in the write buffer only; hydrate memory inventory
             if (resolvedTable == SystemTable.tableMetaTableUid &&
                 (op == BufferOperationType.insert ||
                     op == BufferOperationType.update)) {
@@ -2077,7 +2077,7 @@ class ParallelJournalManager {
         final task = await _recoverPendingBatch(b);
         if (task != null) {
           tasks.add(task);
-          // Flush batches own table/index/WAL rows. Maintenance is metadata
+          // Flush batches own table/index/WAL records. Maintenance is metadata
           // redo only and must not move the WAL replay start.
           if (b.batchType == BatchType.flush && b.end.partitionIndex >= 0) {
             replayCheckpoint = replayCheckpoint == null
@@ -2369,7 +2369,7 @@ class ParallelJournalManager {
 
       // Durable checkpoint and pending-batch removal are one meta write.
       // A leftover flush handle whose end is already at or before checkpoint
-      // must not roll totals back or reflush table/index rows.
+      // must not roll totals back or reflush table/index records.
       if (batch.end.partitionIndex >= 0 &&
           _walManager.isAtOrBefore(batch.end, _walManager.meta.checkpoint)) {
         Logger.debug(
@@ -3033,6 +3033,21 @@ class ParallelJournalManager {
             pathCache[key] = path;
             return path;
           }
+          final wmbpCategory = key.kind.wmbpCategory;
+          if (wmbpCategory != null) {
+            final tableContext = await _tableContextFromUid(key.tableUid);
+            if (tableContext == null) return null;
+            final indexUid =
+                _resolveRedoIndexUid(tableContext.schema, key.indexUid);
+            final path = _dataStore.pathManager.getWmbpPartitionPathByContext(
+              tableContext,
+              indexUid,
+              wmbpCategory,
+              key.partitionNo,
+            );
+            pathCache[key] = path;
+            return path;
+          }
           final tableContext = await _tableContextFromUid(key.tableUid);
           if (tableContext == null) return null;
           final indexUid =
@@ -3060,6 +3075,11 @@ class ParallelJournalManager {
             _dataStore.overflowManager
                 .invalidateCachedPage(key.tableUid, key.partitionNo, pageNo);
           }
+          return;
+        }
+        if (key.kind.wmbpCategory != null) {
+          _dataStore.wmbpIndexManager
+              ?.invalidateIndex(key.tableUid, key.indexUid);
           return;
         }
         final tableContext = await _tableContextFromUid(key.tableUid);
@@ -3095,7 +3115,7 @@ class ParallelJournalManager {
       }
 
       // Pass 1: full page images (table/index/nav/full leaf). Skip NGPK so
-      // table rows land on disk before structure+PK materialization.
+      // table records land on disk before structure+PK materialization.
       // Group by path then write distinct files in parallel (same pattern as
       // table/index flushFiles).
       final pass1ByPath = <String,

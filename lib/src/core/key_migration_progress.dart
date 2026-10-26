@@ -1,13 +1,13 @@
 import '../model/system_table.dart';
 import '../model/table_context.dart';
+import '../model/table_identity.dart';
 import 'data_store_impl.dart';
 import 'transaction_context.dart';
-import '../model/table_identity.dart';
 
-/// Persistence helpers for [_system_key_migration] progress rows.
+/// Persistence helpers for [_system_key_migration] progress records.
 ///
-/// Rows are keyed by stable [TableUid] (via [progressKey] and [table_uid]),
-/// so table renames do not require rewriting progress rows.
+/// records are keyed by stable [TableUid] (via [progressKey] and [table_uid]),
+/// so table renames do not require rewriting progress records.
 class KeyMigrationProgressStore {
   KeyMigrationProgressStore._();
 
@@ -45,14 +45,14 @@ class KeyMigrationProgressStore {
     final progressTable = await _progressTableContext(dataStore);
     if (progressTable == null) return null;
     final pk = progressKey(table.tableUid, spaceName);
-    final rows = await dataStore.queryBy(
+    final records = await dataStore.queryBy(
       progressTable,
       SystemTable.keyMigrationProgressKeyField,
       pk,
     );
 
-    if (rows.isEmpty) return null;
-    final checkpoint = rows.first[SystemTable.keyMigrationCheckpointField];
+    if (records.isEmpty) return null;
+    final checkpoint = records.first[SystemTable.keyMigrationCheckpointField];
     if (checkpoint == null) return null;
     return checkpoint.toString();
   }
@@ -95,13 +95,14 @@ class KeyMigrationProgressStore {
     final progressTable = await _progressTableContext(dataStore);
     if (progressTable == null) return false;
     final pk = progressKey(table.tableUid, spaceName);
-    final rows = await dataStore.queryBy(
+    final records = await dataStore.queryBy(
       progressTable,
       SystemTable.keyMigrationProgressKeyField,
       pk,
     );
-    if (rows.isEmpty) return false;
-    final status = rows.first[SystemTable.keyMigrationStatusField]?.toString();
+    if (records.isEmpty) return false;
+    final status =
+        records.first[SystemTable.keyMigrationStatusField]?.toString();
     return status == 'completed';
   }
 

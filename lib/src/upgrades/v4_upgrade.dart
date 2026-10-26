@@ -70,13 +70,13 @@ class V4Upgrade {
       final ctx = await tableMetaManager.getTableContext(uid);
       if (ctx == null) continue;
 
-      final hadOldWithRows = await _prepareTableSpaces(
+      final hadOldWithRecords = await _prepareTableSpaces(
         table: ctx,
         schema: schema,
         indexes: vectorIndexes,
         spaces: spaces,
       );
-      if (!hadOldWithRows) continue;
+      if (!hadOldWithRecords) continue;
 
       final wantUids = {for (final idx in vectorIndexes) idx.indexUid};
       if (await _alreadyQueuedRebuild(uid, wantUids)) continue;
@@ -117,17 +117,17 @@ class V4Upgrade {
         spaceName: null,
       );
     }
-    var hadOldWithRows = false;
+    var hadOldWithRecords = false;
     for (final space in spaces) {
       if (await _prepareTableIndexRoots(
         table: table,
         indexes: indexes,
         spaceName: space,
       )) {
-        hadOldWithRows = true;
+        hadOldWithRecords = true;
       }
     }
-    return hadOldWithRows;
+    return hadOldWithRecords;
   }
 
   Future<bool> _alreadyQueuedRebuild(
@@ -165,7 +165,7 @@ class V4Upgrade {
     final tablePath = _dataStore.pathManager
         .getTablePathByContext(table, spaceName: spaceName);
     var anyOld = false;
-    final hasRows = await _tableHasRows(table, spaceName);
+    final hasRecords = await _tableHasRecords(table, spaceName);
 
     for (final idx in indexes) {
       final live =
@@ -192,7 +192,7 @@ class V4Upgrade {
         anyOld = true;
       }
 
-      if (!hasRows && anyOld) {
+      if (!hasRecords && anyOld) {
         if (await storage.existsDirectory(old)) {
           await storage.deleteDirectory(old);
         }
@@ -202,10 +202,10 @@ class V4Upgrade {
         anyOld = false;
       }
     }
-    return anyOld && hasRows;
+    return anyOld && hasRecords;
   }
 
-  Future<bool> _tableHasRows(TableContext table, String? spaceName) async {
+  Future<bool> _tableHasRecords(TableContext table, String? spaceName) async {
     final meta = await _dataStore.treeMetaPageService.readTableGlobalMeta(
       table,
       spaceName: spaceName,

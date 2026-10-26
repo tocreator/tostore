@@ -44,6 +44,21 @@ class PlatformByteData {
     }
   }
 
+  /// Low 32 bits of an unsigned value (web-safe; no `>>`/`<<` beyond 31).
+  static int lo32(int value) => value & 0xFFFFFFFF;
+
+  /// High 32 bits of an unsigned value (web-safe; uses division, not `>> 32`).
+  ///
+  /// Matches the limb split used by [setUint64] / [setInt64] on every platform.
+  static int hi32(int value) => (value / 0x100000000).floor() & 0xFFFFFFFF;
+
+  /// Combine unsigned lo/hi limbs into a Dart [int].
+  ///
+  /// Exact on the VM. On dart2js, exact only while the result is ≤ 2^53
+  /// (covers WMBP docIds through the 10^10 design target).
+  static int fromLoHi32(int lo, int hi) =>
+      (hi & 0xFFFFFFFF) * 0x100000000 + (lo & 0xFFFFFFFF);
+
   // --- Web Implementations ---
 
   static void _setInt64Web(

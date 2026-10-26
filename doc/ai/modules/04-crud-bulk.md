@@ -21,16 +21,16 @@ status: complete
 
 ## Purpose
 
-Write paths for single-row, builder-conditioned, and bulk operations; atomic field expressions via `Expr`.
+Write paths for single-record, builder-conditioned, and bulk operations; atomic field expressions via `Expr`.
 
-## Single-row writes
+## Single-record writes
 
 ```dart
 Future<DbResult> insert(String tableName, Map<String, dynamic> data, {RecoveryDurability? durability});
 Future<DbResult> upsert(String tableName, Map<String, dynamic> data, {RecoveryDurability? durability});
 ```
 
-- `insert`: new row; on success read `firstPrimaryKey`.
+- `insert`: new record; on success read `firstPrimaryKey`.
 - `upsert`: update if PK/unique match, else insert.
 - `durability`: optional recovery guarantee level (`RecoveryDurability.standard` default crash-safe before ack, `durable` power-loss safe before ack, `async` immediate response with brief few-ms window on small writes).
 - MUST check `!result.hasErrors` (or inspect `statuses`). Constraint failures return results; they do not always throw.
@@ -62,7 +62,7 @@ Awaiting the builder (or `.future`) executes.
 | `compute(field, ExprNode)` | Explicit expression |
 | `durability(RecoveryDurability)` | Set recovery guarantee level for this update (durable / standard / async) |
 | `allowUpdateAll()` | REQUIRED if no condition |
-| `allowPartialErrors()` | Continue on per-row failures |
+| `allowPartialErrors()` | Continue on per-record failures |
 | `allowLargeScaleOperation()` | Large update; blocks until done; returns `successCount` only; **MUST NOT** inside transaction |
 
 Without a condition and without `allowUpdateAll()`, update is rejected (safety).
@@ -90,7 +90,7 @@ DeleteBuilder delete(String tableName);
 
 ```dart
 Future<DbResult> dropTable(String tableName);
-Future<DbResult> clear(String tableName); // delete all rows, keep schema
+Future<DbResult> clear(String tableName); // delete all records, keep schema
 ```
 
 System tables MUST NOT be targeted (engine throws developer error).
@@ -112,9 +112,9 @@ Future<DbResult> batchUpdate(...); // same options
 | :--- | :--- | :--- |
 | `batchInsert` | All non-null fields | Insert only; highest throughput |
 | `batchUpsert` | All non-null fields **and** unique-index fields; table MUST have unique constraints | Insert or update by unique match |
-| `batchUpdate` | Each row MUST include PK (or unique identity) + fields to change | Partial update; non-null fields not all required |
+| `batchUpdate` | Each record MUST include PK (or unique identity) + fields to change | Partial update; non-null fields not all required |
 
-- `allowPartialErrors: true` (default): one bad row does not abort the batch.
+- `allowPartialErrors: true` (default): one bad record does not abort the batch.
 - `returnResultDetails: false`: skip success/failure key collection — better perf / less memory.
 - `durability`: optional per-batch recovery guarantee override (`durable` power-loss safe, `standard` crash-safe default, `async` immediate response with brief few-ms window on small writes).
 
@@ -126,7 +126,7 @@ Structured AST only — MUST NOT inject raw expression strings.
 
 | API | Meaning |
 | :--- | :--- |
-| `Expr.field(name)` | Current row field |
+| `Expr.field(name)` | Current record field |
 | `Expr.value(num)` | Constant |
 | `Expr.now()` | Server timestamp |
 | `Expr.min` / `max` / `round` / `floor` / `ceil` / `abs` | Functions |

@@ -535,7 +535,7 @@ class LargeOperationRunner {
     int skippedForOffset = 0;
     final offsetBudget = op.offset ?? 0;
     final conditionMap = op.condition;
-    // PK renames are single-row and always take the online update path.
+    // PK renames are single-record and always take the online update path.
     // Large-scale batches ignore any primary-key field in the payload.
     final validData = op.updateData;
     validData.remove(primaryKey);

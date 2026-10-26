@@ -31,7 +31,8 @@ class ResourceManager {
   factory ResourceManager() => _instance;
   ResourceManager._internal();
 
-  /// Total cache memory budget (MB). Default: 75% of available at first init.
+  /// Total cache memory budget (MB).
+  /// Default: 75% (server) / 70% (non-server) of available at first init.
   int _memoryThresholdInMB = 0;
 
   /// Configured memory threshold in megabytes
@@ -213,14 +214,20 @@ class ResourceManager {
           calculateCriticalMemoryThresholdMB(systemMemoryMB);
       _recoveryMarginMB = max(64, (systemMemoryMB * 0.03).toInt());
 
-      // Default budget: 75% of available at first init (fixed for process lifetime).
-      final int baseMemoryMB = (availableMemoryMB * 0.75).toInt();
+      // Default budget of available at first init (fixed for process lifetime).
+      // Server keeps 75%; clients/desktop sustain closer to 70% for flush headroom.
+      final double baseAvailableRatio =
+          PlatformHandler.isServerEnvironment ? 0.75 : 0.70;
+      final int baseMemoryMB = (availableMemoryMB * baseAvailableRatio).toInt();
 
       // Soft ceiling so an oversized user budget cannot push the process into OOM.
+      // Server may use up to 90% of available; non-server caps at 70%.
+      final double maxAvailableRatio =
+          PlatformHandler.isServerEnvironment ? 0.90 : 0.70;
       final int maxBudgetMB = max(
         _getMinimumMemoryThreshold(),
         min(
-          (availableMemoryMB * 0.9).toInt(),
+          (availableMemoryMB * maxAvailableRatio).toInt(),
           max(0, systemMemoryMB - _criticalMemoryThresholdMB),
         ),
       );
@@ -408,15 +415,21 @@ class ResourceManager {
   /// OS polling safeguard (available MB below this → warning eviction).
   ///
   /// Init-time headroom decides how early to fire (fixed for process lifetime):
-  /// - [availableMemoryMB] >= 32% of system (≈ used ≤ 68%) → warn at
+  /// - Non-server: warn at available < 30% (≈ used 70%) so clients sustain
+  ///   more OS/UI headroom during continuous flush
+  /// - Server + headroom ([availableMemoryMB] >= 32% of system) → warn at
   ///   available < 25% (≈ used 75%), leaving room for vector split / page-redo
-  /// - otherwise (already tight) → warn at available < 10% (≈ used 90%)
-  ///   to avoid thrashing cleanup on constrained devices
+  /// - Server already tight → warn at available < 10% (≈ used 90%)
+  ///   to avoid thrashing cleanup on constrained hosts
   static int calculateWarningMemoryThresholdMB(
     int systemMemoryMB, {
     int? availableMemoryMB,
   }) {
     if (systemMemoryMB <= 0) return 64;
+    if (!PlatformHandler.isServerEnvironment) {
+      final ratioMB = (systemMemoryMB * 0.30).toInt();
+      return ratioMB.clamp(64, 4096);
+    }
     // 32%: hosts often already sit near ~68% used at open.
     final hasHeadroom = availableMemoryMB != null &&
         availableMemoryMB >= (systemMemoryMB * 0.32).toInt();
@@ -858,9 +871,11 @@ class ResourceManager {
         case MemoryQuotaType.queryResult:
           return _dataStore!.cacheManager.getCurrentQueryCacheSize();
         case MemoryQuotaType.indexData:
-          return await _dataStore!.indexManager
+          final btree = await _dataStore!.indexManager
                   ?.getCurrentBtreeIndexDataCacheSize() ??
               0;
+          final wmbp = _dataStore!.wmbpIndexManager?.getCurrentCacheSize() ?? 0;
+          return btree + wmbp;
         case MemoryQuotaType.vectorIndex:
           return _dataStore!.vectorIndexManager?.getCurrentCacheSize() ?? 0;
         case MemoryQuotaType.schema:
