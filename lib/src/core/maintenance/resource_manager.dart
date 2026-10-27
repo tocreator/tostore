@@ -215,15 +215,15 @@ class ResourceManager {
       _recoveryMarginMB = max(64, (systemMemoryMB * 0.03).toInt());
 
       // Default budget of available at first init (fixed for process lifetime).
-      // Server keeps 75%; clients/desktop sustain closer to 70% for flush headroom.
+      // Server keeps 70%; clients/desktop sustain closer to 65% for flush headroom.
       final double baseAvailableRatio =
-          PlatformHandler.isServerEnvironment ? 0.75 : 0.70;
+          PlatformHandler.isServerEnvironment ? 0.70 : 0.65;
       final int baseMemoryMB = (availableMemoryMB * baseAvailableRatio).toInt();
 
       // Soft ceiling so an oversized user budget cannot push the process into OOM.
-      // Server may use up to 90% of available; non-server caps at 70%.
+      // Server may use up to 90% of available; non-server caps at 65%.
       final double maxAvailableRatio =
-          PlatformHandler.isServerEnvironment ? 0.90 : 0.70;
+          PlatformHandler.isServerEnvironment ? 0.90 : 0.65;
       final int maxBudgetMB = max(
         _getMinimumMemoryThreshold(),
         min(
@@ -426,14 +426,15 @@ class ResourceManager {
     int? availableMemoryMB,
   }) {
     if (systemMemoryMB <= 0) return 64;
-    if (!PlatformHandler.isServerEnvironment) {
-      final ratioMB = (systemMemoryMB * 0.30).toInt();
-      return ratioMB.clamp(64, 4096);
-    }
     // 32%: hosts often already sit near ~68% used at open.
     final hasHeadroom = availableMemoryMB != null &&
         availableMemoryMB >= (systemMemoryMB * 0.32).toInt();
-    final ratio = hasHeadroom ? 0.25 : 0.10;
+    double ratio = 0.25;
+    if (hasHeadroom) {
+      ratio = !PlatformHandler.isServerEnvironment ? 0.30 : 0.25;
+    } else {
+      ratio = 0.10;
+    }
     final ratioMB = (systemMemoryMB * ratio).toInt();
     return ratioMB.clamp(64, hasHeadroom ? 4096 : 2048);
   }
