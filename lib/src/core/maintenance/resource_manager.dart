@@ -298,6 +298,15 @@ class ResourceManager {
   bool get _isFlushBusy =>
       _dataStore?.parallelJournalManager.isPressureBusy ?? false;
 
+  /// Public flush-pressure signal for eviction callers (protect seal/nav caches).
+  bool get isFlushBusy => _isFlushBusy;
+
+  /// True when measured cache usage is at or under the safe ceiling.
+  bool isUnderSafeCacheCeiling([int? usageBytes]) {
+    final usage = usageBytes ?? _lastMeasuredTotalUsageBytes;
+    return _budgetWarningUsageBytes <= 0 || usage <= _budgetWarningUsageBytes;
+  }
+
   /// Current recommended cache eviction ratio based on status severity
   double get currentEvictionRatio =>
       getEvictionRatio(MemoryQuotaType.tableData);

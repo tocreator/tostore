@@ -32,9 +32,15 @@ class WmbpCorpus implements WmbpPostingSource {
   final Map<int, _TermChain> _terms = <int, _TermChain>{};
   final Map<int, Uint32List> _masks = <int, Uint32List>{};
   final Map<int, int> _activeCount = <int, int>{};
+
+  /// Resident `_docs` count per window — O(1) empty-window checks on evict.
+  final Map<int, int> _windowDocCounts = <int, int>{};
   final Map<int, _Doc> _pending = <int, _Doc>{};
   final Set<int> _inactive = <int>{};
   final Map<int, WalPointer> _deleteMarks = <int, WalPointer>{};
+
+  /// PK for each inactive sealed docId (scoped seal filters by flush PKs).
+  final Map<int, String> _inactivePkByDoc = <int, String>{};
   int _deleteSeq = 1;
   final Map<int, int> _inactiveWindows = <int, int>{};
   final Set<String> _removedPks = <String>{};
@@ -54,6 +60,10 @@ class WmbpCorpus implements WmbpPostingSource {
   /// Sealed already subtracted these; they may still sit in [_inactive].
   int _handoffInactiveExtra = 0;
 
+  /// Inactive docIds compensated during handoff; cleared in [_evictFlushed].
+  /// May include sealed PK-overwrite expands that were still in [_inactive].
+  List<int>? _handoffInactiveClear;
+
   /// Local df still includes these term credits that sealed already published.
   Map<int, int>? _handoffDfCredit;
 
@@ -64,6 +74,17 @@ class WmbpCorpus implements WmbpPostingSource {
   int get nextDocId => _nextDocId;
 
   int get residentDocCount => _docs.length;
+
+  /// Coarse overlay heap for ResourceManager polls (O(1) lengths only).
+  ///
+  /// Intentionally rough — covers the large residents (`_docs` / `_terms` /
+  /// `_pkToDoc` / `_masks`). Smaller maps are ignored; OS low-memory still
+  /// triggers eviction as a backstop when this under-reports.
+  int get estimatedResidentBytes =>
+      _docs.length * 512 +
+      _terms.length * 48 +
+      _pkToDoc.length * 64 +
+      _masks.length * WmbpConstants.activeMaskBytes;
 
   bool get prefersPagedSearch => _sealed != null;
 
@@ -304,6 +325,7 @@ class WmbpCorpus implements WmbpPostingSource {
     _pending.remove(docId);
     if (doc == null) return;
     _subDf(doc.impacts);
+    _decWindowDocCount(WmbpConstants.windowIdOf(docId));
     if (doc.sealed) {
       _setActiveBit(docId, false);
       final int windowId = WmbpConstants.windowIdOf(docId);
@@ -315,6 +337,20 @@ class WmbpCorpus implements WmbpPostingSource {
       }
     }
     if (_activeDocs > 0) _activeDocs--;
+  }
+
+  void _incWindowDocCount(int windowId) {
+    _windowDocCounts[windowId] = (_windowDocCounts[windowId] ?? 0) + 1;
+  }
+
+  void _decWindowDocCount(int windowId) {
+    final int? cur = _windowDocCounts[windowId];
+    if (cur == null) return;
+    if (cur <= 1) {
+      _windowDocCounts.remove(windowId);
+    } else {
+      _windowDocCounts[windowId] = cur - 1;
+    }
   }
 
   /// Moves every pending document into sealed windows.
@@ -427,6 +463,7 @@ class WmbpCorpus implements WmbpPostingSource {
       docId = await sealed.lookupPk(primaryKey) ?? -1;
     }
     if (docId < 0 || !_inactive.add(docId)) return;
+    _inactivePkByDoc[docId] = primaryKey;
     _deleteMarks[docId] =
         flushedAt ?? WalPointer(partitionIndex: 0, entrySeq: _deleteSeq++);
     final int windowId = WmbpConstants.windowIdOf(docId);
@@ -453,6 +490,7 @@ class WmbpCorpus implements WmbpPostingSource {
       return true;
     }
     if (docId >= 0 && _inactive.add(docId)) {
+      _inactivePkByDoc[docId] = primaryKey;
       _deleteMarks[docId] =
           flushedAt ?? WalPointer(partitionIndex: 0, entrySeq: _deleteSeq++);
       final int windowId = WmbpConstants.windowIdOf(docId);
@@ -467,10 +505,22 @@ class WmbpCorpus implements WmbpPostingSource {
       _pendingDeactivatePks.containsKey(primaryKey);
 
   /// Resolve cold-rev pending deactivations during seal (batch I/O).
-  Future<void> resolvePendingDeactivations() async {
+  ///
+  /// When [sealPks] is set, only those PKs are resolved; others stay queued
+  /// for a later flush-scoped seal.
+  Future<void> resolvePendingDeactivations({Set<String>? sealPks}) async {
     if (_pendingDeactivatePks.isEmpty) return;
-    final pending = Map<String, WalPointer?>.of(_pendingDeactivatePks);
-    _pendingDeactivatePks.clear();
+    final pending = <String, WalPointer?>{};
+    if (sealPks == null) {
+      pending.addAll(_pendingDeactivatePks);
+      _pendingDeactivatePks.clear();
+    } else {
+      for (final pk in sealPks) {
+        if (!_pendingDeactivatePks.containsKey(pk)) continue;
+        pending[pk] = _pendingDeactivatePks.remove(pk);
+      }
+      if (pending.isEmpty) return;
+    }
     final yc = YieldController(
       'wmbp_resolve_pending_deactivations',
       checkInterval: 128,
@@ -486,10 +536,21 @@ class WmbpCorpus implements WmbpPostingSource {
   }
 
   /// Remap reminted pending term ids onto sealed dictionary ids (async I/O).
-  Future<void> _canonicalizePendingTerms() async {
+  ///
+  /// When [termIds] is set, only those pending names are probed (flush-scoped).
+  Future<void> _canonicalizePendingTerms({Set<int>? termIds}) async {
     final view = _sealed;
     if (view == null || _pendingTermNames.isEmpty) return;
-    final pending = Map<int, String>.of(_pendingTermNames);
+    final pending = <int, String>{};
+    if (termIds == null) {
+      pending.addAll(_pendingTermNames);
+    } else {
+      for (final id in termIds) {
+        final name = _pendingTermNames[id];
+        if (name != null) pending[id] = name;
+      }
+      if (pending.isEmpty) return;
+    }
     final folds = <int, int>{};
     final yc = YieldController(
       'wmbp_canonicalize_pending_terms',
@@ -511,15 +572,30 @@ class WmbpCorpus implements WmbpPostingSource {
     _foldTermIds(folds);
   }
 
-  Future<void> commitDurable() async {
+  /// Persist pending corpus to durable sealed pages.
+  ///
+  /// [sealPks] scopes the commit to primary keys touched by the current table
+  /// flush batch. Omitting it seals the entire resident corpus (maintenance).
+  Future<void> commitDurable({Set<String>? sealPks}) async {
     final view = _sealed;
     if (view == null) return;
-    await resolvePendingDeactivations();
-    // Fold any reminted pending term ids onto durable dictionary ids before
-    // seal. Sync upserts can mint duplicates when name pages are cold; sealing
-    // those ids would overwrite the dict and orphan the historical chain.
-    await _canonicalizePendingTerms();
-    final batch = _peekBatch();
+    await resolvePendingDeactivations(sealPks: sealPks);
+    // Fold reminted pending term ids onto durable dictionary ids before seal.
+    // Sync upserts can mint duplicates when name pages are cold; sealing those
+    // ids would overwrite the dict and orphan the historical chain.
+    Set<int>? canonTermIds;
+    if (sealPks != null) {
+      canonTermIds = <int>{};
+      for (final pk in sealPks) {
+        final int? docId = _pkToDoc[pk];
+        if (docId == null) continue;
+        final doc = _docs[docId];
+        if (doc == null) continue;
+        canonTermIds.addAll(doc.impacts.keys);
+      }
+    }
+    await _canonicalizePendingTerms(termIds: canonTermIds);
+    final batch = _peekBatch(sealPks: sealPks);
     if (batch.added.isEmpty &&
         batch.deactivated.isEmpty &&
         batch.removedPks.isEmpty) {
@@ -820,6 +896,7 @@ class WmbpCorpus implements WmbpPostingSource {
     _pending[docId] = doc;
     _pkToDoc[primaryKey] = docId;
     _pkSig[primaryKey] = sig;
+    _incWindowDocCount(WmbpConstants.windowIdOf(docId));
     for (final termId in impacts.keys) {
       final chain = _terms[termId] ?? (_terms[termId] = _TermChain());
       chain.df++;
@@ -1029,13 +1106,25 @@ class WmbpCorpus implements WmbpPostingSource {
     _queryPlanCache[query] = compiled;
   }
 
-  /// Memory-pressure trim for overlay caches; sealed pages go through the view.
-  Future<void> evictCaches({required double ratio}) async {
+  /// Memory-pressure trim: ephemeral overlays first, then sealed tiers.
+  ///
+  /// See [WmbpSealedView.evictCaches] for tier order and stop-on-relief.
+  Future<void> evictCaches({
+    required double ratio,
+    Future<bool> Function()? shouldContinue,
+    bool protectFlushNav = false,
+  }) async {
     if (ratio <= 0.0) return;
+    // T0 — query/compile overlays (cheap, fully rebuildable).
     _pruneHotTermIds(ratio);
     _dropSetRatio(_missingTerms, ratio);
     _dropMapRatio(_queryPlanCache, ratio);
-    await _sealed?.evictCaches(ratio: ratio);
+    if (shouldContinue != null && !await shouldContinue()) return;
+    await _sealed?.evictCaches(
+      ratio: ratio,
+      shouldContinue: shouldContinue,
+      protectFlushNav: protectFlushNav,
+    );
   }
 
   /// Drop sealed-resolved hot names not referenced by resident docs.
@@ -1170,40 +1259,143 @@ class WmbpCorpus implements WmbpPostingSource {
     );
   }
 
-  WmbpCommitBatch _peekBatch() {
+  /// Build a durable seal batch.
+  ///
+  /// When [sealPks] is set (flush path), only those PKs are packed — O(batch)
+  /// via [_pkToDoc], not O(resident). Survivors stay searchable in pending.
+  WmbpCommitBatch _peekBatch({Set<String>? sealPks}) {
     // Share impact maps: commit only reads them, then [_evictFlushed] drops
     // the docs. Copying every map dominated long-document seal CPU.
-    final added = <WmbpSealDoc>[
-      for (final doc in _docs.values)
-        WmbpSealDoc(
+    final added = <WmbpSealDoc>[];
+    if (sealPks == null) {
+      for (final doc in _docs.values) {
+        added.add(WmbpSealDoc(
           docId: doc.docId,
           primaryKey: doc.primaryKey,
           impacts: doc.impacts,
-        ),
-    ];
+        ));
+      }
+    } else {
+      for (final pk in sealPks) {
+        final int? docId = _pkToDoc[pk];
+        if (docId == null) continue;
+        final doc = _docs[docId];
+        if (doc == null) continue;
+        added.add(WmbpSealDoc(
+          docId: doc.docId,
+          primaryKey: doc.primaryKey,
+          impacts: doc.impacts,
+        ));
+      }
+    }
     final addedPks = <String>{for (final doc in added) doc.primaryKey};
     WalPointer? flushedDelete;
     final deactivated = <int>[];
-    for (final id in _inactive) {
-      final mark = _deleteMarks[id];
-      if (mark == null) continue;
-      deactivated.add(id);
-      if (flushedDelete == null || mark.isNewerThan(flushedDelete, 1 << 30)) {
-        flushedDelete = mark;
+    if (sealPks == null) {
+      for (final id in _inactive) {
+        final mark = _deleteMarks[id];
+        if (mark == null) continue;
+        deactivated.add(id);
+        if (flushedDelete == null || mark.isNewerThan(flushedDelete, 1 << 30)) {
+          flushedDelete = mark;
+        }
+      }
+    } else {
+      for (final id in _inactive) {
+        final mark = _deleteMarks[id];
+        if (mark == null) continue;
+        final pk = _inactivePkByDoc[id];
+        if (pk == null || !sealPks.contains(pk)) continue;
+        deactivated.add(id);
+        if (flushedDelete == null || mark.isNewerThan(flushedDelete, 1 << 30)) {
+          flushedDelete = mark;
+        }
       }
     }
-    // Only newly minted names still waiting for durable dict write.
-    final termNames = Map<int, String>.of(_pendingTermNames);
+    // Pending names referenced by this batch's added docs only (scoped seal
+    // must not strip survivor reminted names from [_pendingTermNames]).
+    // Also track impact-term high-water here so scoped nextTermId needs no
+    // second O(postings) pass (_peekBatch is sync; cannot YieldController).
+    final termNames = <int, String>{};
+    var scopedTermHigh = (_sealed?.nextTermId ?? 1) - 1;
+    if (sealPks == null) {
+      termNames.addAll(_pendingTermNames);
+    } else {
+      for (final doc in added) {
+        for (final termId in doc.impacts.keys) {
+          if (termId > scopedTermHigh) scopedTermHigh = termId;
+          final name = _pendingTermNames[termId];
+          if (name != null) termNames[termId] = name;
+        }
+      }
+    }
+    final removedPks = <String>[];
+    if (sealPks == null) {
+      for (final pk in _removedPks) {
+        if (!addedPks.contains(pk)) removedPks.add(pk);
+      }
+    } else {
+      for (final pk in sealPks) {
+        if (!_removedPks.contains(pk) || addedPks.contains(pk)) continue;
+        removedPks.add(pk);
+      }
+    }
+    // Scoped seal must not advance sealed nextDocId past survivor windows:
+    // openWindow = windowIdOf(nextDocId-1), and closed windows are w < open.
+    // Advancing into/past a window that still has unflushed residents would
+    // force OPEN_RAW→closed rebuild / premature micro-seal. Use
+    // [_windowDocCounts] (O(windows)) — never scan residents.
+    final int batchNextDocId;
+    if (sealPks == null) {
+      batchNextDocId = _nextDocId;
+    } else if (added.isEmpty) {
+      batchNextDocId = _sealed?.nextDocId ?? 0;
+    } else {
+      var maxDocId = -1;
+      final sealedPerWindow = <int, int>{};
+      for (final doc in added) {
+        if (doc.docId > maxDocId) maxDocId = doc.docId;
+        final int w = WmbpConstants.windowIdOf(doc.docId);
+        sealedPerWindow[w] = (sealedPerWindow[w] ?? 0) + 1;
+      }
+      var proposed = maxDocId + 1;
+      int? minSurvivorWindow;
+      for (final entry in _windowDocCounts.entries) {
+        final int rem = entry.value - (sealedPerWindow[entry.key] ?? 0);
+        if (rem <= 0) continue;
+        final int w = entry.key;
+        if (minSurvivorWindow == null || w < minSurvivorWindow) {
+          minSurvivorWindow = w;
+        }
+      }
+      if (minSurvivorWindow != null) {
+        // windowIdOf(nextDocId - 1) <= minSurvivorWindow
+        // <=> nextDocId <= (minSurvivorWindow + 1) * windowSize
+        final int maxSafeNext =
+            (minSurvivorWindow + 1) * WmbpConstants.windowSize;
+        if (proposed > maxSafeNext) proposed = maxSafeNext;
+      }
+      batchNextDocId = proposed;
+    }
+    // Scoped seal: only raise the durable term watermark to cover ids this
+    // batch actually persists (names + postings). Corpus [_nextTermId] may
+    // sit far ahead for reminted survivors still awaiting a later flush.
+    // [scopedTermHigh] was folded into the termNames scan above.
+    final int batchNextTermId;
+    if (sealPks == null) {
+      batchNextTermId = _nextTermId;
+    } else {
+      final int proposed = scopedTermHigh + 1;
+      final int sealedNext = _sealed?.nextTermId ?? 1;
+      batchNextTermId = proposed < sealedNext ? sealedNext : proposed;
+    }
     return WmbpCommitBatch(
-      nextDocId: _nextDocId,
-      nextTermId: _nextTermId,
+      nextDocId: batchNextDocId,
+      nextTermId: batchNextTermId,
       added: added,
       termNames: termNames,
       deactivated: deactivated,
-      removedPks: [
-        for (final pk in _removedPks)
-          if (!addedPks.contains(pk)) pk,
-      ],
+      removedPks: removedPks,
       flushedDelete: flushedDelete,
     );
   }
@@ -1229,22 +1421,25 @@ class WmbpCorpus implements WmbpPostingSource {
         credit[termId] = (credit[termId] ?? 0) + 1;
       }
     }
-    var inactiveExtra = 0;
-    for (final id in deactivated) {
-      final y = yc.maybeYield();
-      if (y != null) await y;
-      if (_inactive.contains(id)) inactiveExtra++;
-    }
-    _handoffLocalDocs = localDocs;
-    _handoffInactiveExtra = inactiveExtra;
-    _handoffDfCredit = credit;
-    // Keep window prune bounds correct once sealed counters publish: drop the
-    // soon-to-clear inactive credits from [_inactiveWindows] now (full rebuild
-    // still runs at the end of [_evictFlushed]).
+    // [deactivated] may be expanded by sealed PK-overwrite discovery. Any of
+    // those still in [_inactive] must be compensated AND cleared on evict —
+    // otherwise sealed already subtracted while local keeps counting them.
+    final inactiveClear = <int>[];
     for (final id in deactivated) {
       final y = yc.maybeYield();
       if (y != null) await y;
       if (!_inactive.contains(id)) continue;
+      inactiveClear.add(id);
+    }
+    _handoffLocalDocs = localDocs;
+    _handoffInactiveExtra = inactiveClear.length;
+    _handoffInactiveClear = inactiveClear;
+    _handoffDfCredit = credit;
+    // Drop soon-to-clear inactive credits now; [_evictFlushed] removes the
+    // matching [_inactive] entries and does not rebuild this map.
+    for (final id in inactiveClear) {
+      final y = yc.maybeYield();
+      if (y != null) await y;
       final int wid = WmbpConstants.windowIdOf(id);
       final int? cur = _inactiveWindows[wid];
       if (cur == null) continue;
@@ -1259,12 +1454,13 @@ class WmbpCorpus implements WmbpPostingSource {
   void _clearPublishHandoff() {
     _handoffLocalDocs = 0;
     _handoffInactiveExtra = 0;
+    _handoffInactiveClear = null;
     _handoffDfCredit = null;
   }
 
   Future<void> _evictFlushed(WmbpCommitBatch batch) async {
-    // High-water eviction: drop exactly the sealed batch prefix and subtract
-    // their term dfs in place — do not clear+rebuild _terms for survivors.
+    // Evict exactly [batch.added] and subtract their term dfs in place.
+    // Survivors stay in [_docs]/[_pending] — never clear+rebuild O(resident).
     // Yields are safe: [_handoffLocalDocs] / [_handoffDfCredit] keep search
     // counters correct while sealed is already published.
     final yc = YieldController(
@@ -1272,15 +1468,17 @@ class WmbpCorpus implements WmbpPostingSource {
       checkInterval: 256,
       minCheckInterval: 64,
     );
-    var flushedMaxDocId = -1;
+    final touchedWindows = <int>{};
     for (final sealDoc in batch.added) {
       final y = yc.maybeYield();
       if (y != null) await y;
       final int id = sealDoc.docId;
-      if (id > flushedMaxDocId) flushedMaxDocId = id;
+      final int windowId = WmbpConstants.windowIdOf(id);
+      touchedWindows.add(windowId);
       final doc = _docs.remove(id);
       _pending.remove(id);
       if (doc == null) continue;
+      _decWindowDocCount(windowId);
       _subDf(doc.impacts);
       final credit = _handoffDfCredit;
       if (credit != null) {
@@ -1300,60 +1498,57 @@ class WmbpCorpus implements WmbpPostingSource {
       }
       if (_activeDocs > 0) _activeDocs--;
     }
-    final flushedMark = batch.flushedDelete;
-    if (flushedMark != null) {
-      final drop = <int>[];
-      for (final entry in _deleteMarks.entries) {
-        final y = yc.maybeYield();
-        if (y != null) await y;
-        if (!entry.value.isNewerThan(flushedMark, 1 << 30)) {
-          drop.add(entry.key);
-        }
-      }
-      for (final id in drop) {
-        final y = yc.maybeYield();
-        if (y != null) await y;
-        if (_inactive.remove(id) && _handoffInactiveExtra > 0) {
-          _handoffInactiveExtra--;
-        }
-        _deleteMarks.remove(id);
-      }
-    }
-    final settledPks = <String>{
-      ...batch.removedPks,
-      for (final doc in batch.added) doc.primaryKey,
-    };
-    if (settledPks.isNotEmpty) {
-      _removedPks.removeWhere(settledPks.contains);
-    }
-    _inactiveWindows.clear();
-    for (final id in _inactive) {
+    // Drop inactive entries compensated in [_beginPublishHandoff] (batch
+    // deactivated ∪ sealed overwrite expands that were still local-inactive).
+    // A flushedDelete watermark sweep would clear unrelated older marks still
+    // awaiting a later flush-scoped seal. [_inactiveWindows] was already
+    // decremented in handoff — do not clear+rebuild from [_inactive].
+    final inactiveClear = _handoffInactiveClear ?? batch.deactivated;
+    for (final id in inactiveClear) {
       final y = yc.maybeYield();
       if (y != null) await y;
-      final int windowId = WmbpConstants.windowIdOf(id);
-      _inactiveWindows[windowId] = (_inactiveWindows[windowId] ?? 0) + 1;
+      if (_inactive.remove(id) && _handoffInactiveExtra > 0) {
+        _handoffInactiveExtra--;
+      }
+      _deleteMarks.remove(id);
+      _inactivePkByDoc.remove(id);
     }
-    // Drop sealed window masks / active counts for windows fully below the
-    // high-water (survivors keep their pending overlays).
-    if (flushedMaxDocId >= 0) {
-      final int sealedThrough = WmbpConstants.windowIdOf(flushedMaxDocId);
-      _masks.removeWhere((windowId, _) => windowId < sealedThrough);
-      _activeCount.removeWhere((windowId, _) => windowId < sealedThrough);
+    // Batch-declared deactivations without a live [_inactive] entry still
+    // drop their delete marks / PK map (e.g. already cleared races).
+    // Size tracks the flush batch — yield like the inactiveClear loop above.
+    if (!identical(inactiveClear, batch.deactivated)) {
+      for (final id in batch.deactivated) {
+        final y = yc.maybeYield();
+        if (y != null) await y;
+        _deleteMarks.remove(id);
+        _inactivePkByDoc.remove(id);
+      }
     }
-    // Re-home survivors into pending without clearing term dfs.
-    _pending.clear();
+    // O(flush) — same scale as added/removedPks; no intermediate Set.
+    for (final pk in batch.removedPks) {
+      final y = yc.maybeYield();
+      if (y != null) await y;
+      _removedPks.remove(pk);
+    }
+    for (final doc in batch.added) {
+      final y = yc.maybeYield();
+      if (y != null) await y;
+      _removedPks.remove(doc.primaryKey);
+    }
+    // O(1) per touched window via [_windowDocCounts].
+    for (final windowId in touchedWindows) {
+      if ((_windowDocCounts[windowId] ?? 0) > 0) continue;
+      _masks.remove(windowId);
+      _activeCount.remove(windowId);
+    }
+    // Only strip names that this batch wrote; survivors keep pending names
+    // and remain in [_pending] without a full rebuild.
     for (final entry in batch.termNames.entries) {
       final y = yc.maybeYield();
       if (y != null) await y;
       _pendingTermNames.remove(entry.key);
       _pendingTermIds.remove(entry.value);
       _rememberHot(entry.value, entry.key);
-    }
-    for (final doc in _docs.values) {
-      final y = yc.maybeYield();
-      if (y != null) await y;
-      doc.sealed = false;
-      _pending[doc.docId] = doc;
     }
   }
 

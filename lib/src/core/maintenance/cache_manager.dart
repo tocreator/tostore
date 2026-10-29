@@ -69,8 +69,29 @@ final class CacheManager {
       } catch (e) {
         Logger.warn('Evict index page cache failed', rawError: e);
       }
+
+      // Stop-on-relief before WMBP: B+Tree reclaim may already be enough.
       try {
-        await _dataStore.wmbpIndexManager?.evictCaches(ratio: ratio);
+        final afterBtree = await mm.getMemoryInfo();
+        if (mm.isUnderSafeCacheCeiling(afterBtree.totalUsageBytes)) return;
+      } catch (_) {}
+
+      try {
+        // WMBP: payload → result maps → search nav → flush nav; stop when
+        // total cache is back under the safe ceiling. Skip rev caches while
+        // flush is busy so seal lookupPk does not cold-read avalanche.
+        await _dataStore.wmbpIndexManager?.evictCaches(
+          ratio: ratio,
+          protectFlushNav: mm.isFlushBusy,
+          shouldContinue: () async {
+            try {
+              final info = await mm.getMemoryInfo();
+              return !mm.isUnderSafeCacheCeiling(info.totalUsageBytes);
+            } catch (_) {
+              return true;
+            }
+          },
+        );
       } catch (e) {
         Logger.warn('Evict WMBP index cache failed', rawError: e);
       }
@@ -82,8 +103,18 @@ final class CacheManager {
       final ratio = mm.getEvictionRatio(MemoryQuotaType.vectorIndex,
           oneShotNeedFreeMB: oneShotNeedFreeMB);
       try {
-        // Evict NGH vector index caches
-        await _dataStore.vectorIndexManager?.evictCache(ratio: ratio);
+        // Leaf → pkmap → nav → meta; stop when total cache is under safe ceiling.
+        await _dataStore.vectorIndexManager?.evictCache(
+          ratio: ratio,
+          shouldContinue: () async {
+            try {
+              final info = await mm.getMemoryInfo();
+              return !mm.isUnderSafeCacheCeiling(info.totalUsageBytes);
+            } catch (_) {
+              return true;
+            }
+          },
+        );
       } catch (e) {
         Logger.warn('Evict vector index cache failed', rawError: e);
       }

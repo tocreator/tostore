@@ -65,6 +65,7 @@ import '../maintenance/key_manager.dart';
 import '../maintenance/large_operation_runner.dart';
 import '../maintenance/migration_manager.dart';
 import '../maintenance/notification_manager.dart';
+import '../maintenance/prewarm_budget_ledger.dart';
 import '../maintenance/promote_primary_key.dart';
 import '../maintenance/resource_manager.dart';
 import '../maintenance/ttl_cleanup_manager.dart';
@@ -439,8 +440,10 @@ class DataStoreImpl {
     if (!high && _resourceManager != null) {
       if (_resourceManager!.isLowMemoryMode) {
         high = true;
-      } else {
-        // Compare against the cached effective prewarm threshold.
+      } else if (!_isGlobalPrewarming) {
+        // During startup prewarm the structured cache is intentionally filled
+        // toward its budget; do not treat "usage >= prewarmThreshold" as a
+        // reason to kick eviction mid-warm (that reopens room and thrashs I/O).
         final usageMB = _resourceManager!.lastMeasuredTotalUsageMB;
         final thresholdMB = _resourceManager!.getEffectivePrewarmThresholdMB();
         if (usageMB >= thresholdMB) {
@@ -454,7 +457,8 @@ class DataStoreImpl {
 
     // Reactive: If transitioning to high pressure, trigger an immediate resource check
     // to see if memory eviction is needed to relieve system stress.
-    if (_isHighPressure && !oldHigh) {
+    // Skip during global prewarm — OS warn/critical still polled by ResourceManager.
+    if (_isHighPressure && !oldHigh && !_isGlobalPrewarming) {
       _resourceManager?.triggerImmediateCheck();
     }
   }
@@ -7406,25 +7410,37 @@ class DataStoreImpl {
 
       if (shouldAbortBackgroundScan) return;
 
+      // Space footprint gate (before Phase 2/3 payload decisions).
+      final spaceStats = await getSpaceStats();
+      final skipRecordBulk = isPrewarmPayloadWorthless(
+            dataBytes: spaceStats.totalSizeBytes,
+            budgetBytes: rowPrewarmBudgetBytes,
+          ) ||
+          spaceStats.totalRecordCount > _prewarmMaxRecords;
+
       // =========================================================================
       // Phase 2: Text/sparse WMBP search caches.
-      // Shares the structured index budget (getIndexCacheSize) with B+Tree
-      // index pages — stop immediately once btree+wmbp usage hits the ceiling.
-      // ALWAYS runs (including large spaces) so retrieval is not cold-IO bound.
+      // Shared index pool ledger: charges are monotonic so eviction cannot
+      // reopen the budget. Corpus > budget×1.5 → navigation/metadata only.
       // =========================================================================
       final wmbpBudget = _resourceManager?.getIndexCacheSize() ??
           (_wmbpIndexManager?.resolveWmbpCacheBudget() ?? (128 * 1024 * 1024));
-      int sharedIndexUsageBytes() {
-        final btreePages =
-            indexTreePartitionManager?.getCurrentPageCacheSize() ?? 0;
-        final btreeData = _indexManager?.indexDataCacheEstimatedBytes ?? 0;
-        final wmbp = _wmbpIndexManager?.getCurrentCacheSize() ?? 0;
-        return btreePages + btreeData + wmbp;
-      }
+      final indexBaseline =
+          (indexTreePartitionManager?.getCurrentPageCacheSize() ?? 0) +
+              (_indexManager?.indexDataCacheEstimatedBytes ?? 0) +
+              (_wmbpIndexManager?.getCurrentCacheSize() ?? 0);
+      final wmbpLedger = PrewarmBudgetLedger(
+        capBytes: wmbpBudget,
+        initialCommittedBytes: indexBaseline,
+      );
+      final wmbpNavOnly = isPrewarmPayloadWorthless(
+        dataBytes: spaceStats.totalIndexDataSizeBytes,
+        budgetBytes: wmbpBudget,
+      );
 
       for (final tableName in selectedTables) {
         if (shouldAbortBackgroundScan) break;
-        if (sharedIndexUsageBytes() >= wmbpBudget) break;
+        if (wmbpLedger.isExhausted) break;
         try {
           final schema =
               await schemaMgr.getTableSchemaByName(TableName(tableName));
@@ -7434,8 +7450,8 @@ class DataStoreImpl {
           await _runPrewarmForTable(table, () async {
             await _wmbpIndexManager?.prewarmTable(
               table,
-              sharedBudgetBytes: wmbpBudget,
-              sharedUsageBytes: sharedIndexUsageBytes,
+              ledger: wmbpLedger,
+              navOnly: wmbpNavOnly,
             );
             final yWmbp = yieldController.maybeYield();
             if (yWmbp != null) await yWmbp;
@@ -7453,11 +7469,11 @@ class DataStoreImpl {
       if (shouldAbortBackgroundScan) return;
 
       // =========================================================================
-      // Phase 3: Vector index prewarm (Nav centroid graph & search-hot leaves).
-      // ALWAYS runs (including large spaces). Uses the dedicated vector compact
-      // cache ceiling from vectorCacheBudgetRatio — NOT the shared row-prewarm
-      // threshold — so million-row corpora still fill the ANN hot set.
+      // Phase 3: Vector index prewarm (nav always; leaves only when corpus
+      // fits within budget×1.5). Dedicated vector ledger — not row prewarm.
       // =========================================================================
+      final vectorLedger = _vectorIndexManager?.createLeafPrewarmLedger();
+
       for (final tableName in selectedTables) {
         if (shouldAbortBackgroundScan) break;
         try {
@@ -7472,11 +7488,12 @@ class DataStoreImpl {
           await _runPrewarmForTable(table, () async {
             for (final vIdx in vectorIndexes) {
               if (shouldAbortPrewarmForTable(table.tableUid)) break;
-              // Omit maxBytes: prewarmVectorIndex stops at the vector leaf cache
-              // budget (vectorCacheBudgetRatio of cacheMemoryBudgetMB).
+              if (vectorLedger != null && vectorLedger.isExhausted) break;
+              // Per-index navOnly decided inside via meta.totalSizeBytes×1.5.
               await _vectorIndexManager?.prewarmVectorIndex(
                 table,
                 vIdx.indexUid,
+                leafLedger: vectorLedger,
               );
               final yVec = yieldController.maybeYield();
               if (yVec != null) await yVec;
@@ -7498,11 +7515,7 @@ class DataStoreImpl {
       var remainingPrewarmBytes = await _prewarmKvStore(
         maxPrewarmBytes: rowPrewarmBudgetBytes,
       );
-
-      final spaceStats = await getSpaceStats();
-      final isLargeSpace = spaceStats.totalSizeBytes >= rowPrewarmBudgetBytes ||
-          spaceStats.totalRecordCount > _prewarmMaxRecords;
-      if (isLargeSpace) return;
+      if (skipRecordBulk) return;
 
       if (shouldAbortBackgroundScan) return;
 
@@ -7679,10 +7692,9 @@ class DataStoreImpl {
 
   /// Prewarm user table records + B-tree indexes up to [prewarmBudgetBytes].
   ///
-  /// Only invoked for spaces still under the row-prewarm threshold. Large
-  /// spaces skip this phase entirely in [_executePrewarm] (boundary pages +
-  /// vector hot set still warm). Small spaces get a partial leading warm
-  /// capped by budget and [_prewarmMaxRecords].
+  /// Only invoked when space data is within budget×1.5 (and under
+  /// [_prewarmMaxRecords]). Larger spaces skip this phase in [_executePrewarm]
+  /// (boundary pages + WMBP/vector nav still warm).
   Future<void> _prewarmUserTables({
     List<String>? prioritizedTables,
     required int prewarmBudgetBytes,

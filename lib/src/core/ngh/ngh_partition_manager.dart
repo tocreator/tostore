@@ -1969,11 +1969,27 @@ final class NghPartitionManager {
         _pkmapPageCache.estimatedTotalSizeBytes;
   }
 
-  /// Evict a portion of all NGH page caches.
-  Future<void> evictPageCache({double ratio = 0.3}) async {
+  /// Evict leaf I/O-fill pages (search payload; preferred first reclaim).
+  Future<void> evictLeafPageCache({double ratio = 0.3}) async {
     await _leafPageCache.cleanup(removeRatio: ratio);
-    await _navPageCache.cleanup(removeRatio: ratio);
+  }
+
+  /// Evict PK-map burst pages (write/lookup; after leaves, before nav).
+  Future<void> evictPkmapPageCache({double ratio = 0.3}) async {
     await _pkmapPageCache.cleanup(removeRatio: ratio);
+  }
+
+  /// Evict nav centroid I/O-fill pages (routing; reclaim only if still low).
+  Future<void> evictNavPageCache({double ratio = 0.3}) async {
+    await _navPageCache.cleanup(removeRatio: ratio);
+  }
+
+  /// Evict all NGH page caches (leaf → pkmap → nav). Prefer [evictLeafPageCache]
+  /// / [evictNavPageCache] with stop-on-relief from [VectorIndexManager.evictCache].
+  Future<void> evictPageCache({double ratio = 0.3}) async {
+    await evictLeafPageCache(ratio: ratio);
+    await evictPkmapPageCache(ratio: ratio);
+    await evictNavPageCache(ratio: ratio);
   }
 
   /// Clear all NGH page caches synchronously.

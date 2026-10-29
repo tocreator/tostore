@@ -19,6 +19,7 @@ import '../../upgrade/legacy_ngh/legacy_ngh_search.dart';
 import '../compute/workload_scheduler.dart';
 import '../compute/yield_controller.dart';
 import '../engine/data_store_impl.dart';
+import '../maintenance/prewarm_budget_ledger.dart';
 import '../maintenance/resource_manager.dart';
 import 'ngh_graph_engine.dart';
 import 'ngh_page.dart';
@@ -127,6 +128,20 @@ class VectorIndexManager {
         (_dataStore.config.vectorCacheBudgetRatio ?? 0.50).clamp(0.10, 0.85);
     final targetBytes = (resolvedMB * 1024 * 1024 * ratio).round();
     return max(64 * 1024 * 1024, targetBytes);
+  }
+
+  /// Public leaf/cluster warm ceiling (same as [_resolveVectorLeafCacheBudget]).
+  int resolveVectorLeafCacheBudget() => _resolveVectorLeafCacheBudget();
+
+  /// Shared startup ledger for Phase 3 leaf/cluster fill across indexes.
+  PrewarmBudgetLedger createLeafPrewarmLedger({int? maxBytes}) {
+    final leafBudget = _resolveVectorLeafCacheBudget();
+    final cap = maxBytes != null ? min(maxBytes, leafBudget) : leafBudget;
+    return PrewarmBudgetLedger(
+      capBytes: cap,
+      initialCommittedBytes:
+          _graphEngine.btreeLeafCacheBytes + _legacySearch.clusterCacheBytes,
+    );
   }
 
   /// Resolve navigating centroid graph cache budget from [vectorBudget].
@@ -919,16 +934,16 @@ class VectorIndexManager {
 
   /// Prewarm vector index meta, nav, and leaves into search-hot caches.
   ///
-  /// **Open / explicit prewarm only** (Phase 2 of DataStore cache prewarm).
-  /// Always runs on open (including large spaces that skip row/index warm).
-  /// Default ceiling is the dedicated vector compact budget from
-  /// [vectorCacheBudgetRatio]; optional [maxBytes] can only shrink it.
-  /// Never invoked from writeChanges — flush only promotes dirty pages of
-  /// that batch. Returns approximate bytes added to the leaf hot cache.
+  /// **Open / explicit prewarm only**. Navigation always warms; leaf/cluster
+  /// payload fill runs only when the corpus is within
+  /// [prewarmPayloadWorthlessRatio] of the vector budget (unless [navOnly]).
+  /// [leafLedger] charges are monotonic so eviction cannot reopen the budget.
   Future<int> prewarmVectorIndex(
     TableContext table,
     IndexUid indexUid, {
     int? maxBytes,
+    bool navOnly = false,
+    PrewarmBudgetLedger? leafLedger,
   }) async {
     try {
       if (_dataStore.shouldAbortPrewarmForTable(table.tableUid)) return 0;
@@ -940,15 +955,27 @@ class VectorIndexManager {
         final oldMeta = await _legacyIo.readMeta(table, indexUid);
         if (oldMeta == null || oldMeta.totalVectors <= 0) return 0;
         await _legacySearch.prefetchNavGraph(table, indexUid);
-        final defaultBudget = _defaultPrewarmBudget();
-        final budget =
-            maxBytes != null ? min(maxBytes, defaultBudget) : defaultBudget;
-        if (budget <= 0) return 0;
+        final leafBudget = _resolveVectorLeafCacheBudget();
+        final skipPayload = navOnly ||
+            isPrewarmPayloadWorthless(
+              dataBytes: oldMeta.totalSizeBytes > 0
+                  ? oldMeta.totalSizeBytes
+                  : oldMeta.totalVectors * max(1, oldMeta.dimensions + 24),
+              budgetBytes: leafBudget,
+            );
+        if (skipPayload) return 0;
+        final ledger = leafLedger ??
+            PrewarmBudgetLedger(
+              capBytes:
+                  maxBytes != null ? min(maxBytes, leafBudget) : leafBudget,
+              initialCommittedBytes: _legacySearch.clusterCacheBytes,
+            );
+        if (ledger.isExhausted) return 0;
         return await _legacySearch.prewarmClusters(
           table: table,
           indexUid: indexUid,
           meta: oldMeta,
-          maxBytes: budget,
+          ledger: ledger,
         );
       }
       if (meta.totalVectors <= 0) {
@@ -956,25 +983,43 @@ class VectorIndexManager {
       }
       await _graphEngine.prefetchNavGraph(table, indexUid, meta: meta);
 
-      // Dedicated vector ceiling (vectorCacheBudgetRatio); caller maxBytes
-      // may only tighten — never expand past the search-hot leaf budget.
-      final defaultBudget = _defaultPrewarmBudget();
-      final budget =
-          maxBytes != null ? min(maxBytes, defaultBudget) : defaultBudget;
-      if (budget <= 0) return 0;
+      final leafBudget = _resolveVectorLeafCacheBudget();
+      final skipPayload = navOnly ||
+          isPrewarmPayloadWorthless(
+            dataBytes: meta.totalSizeBytes > 0
+                ? meta.totalSizeBytes
+                : meta.totalVectors * max(1, meta.dimensions + 24),
+            budgetBytes: leafBudget,
+          );
+      if (skipPayload) {
+        if (!_dataStore.shouldAbortPrewarmForTable(table.tableUid)) {
+          await _graphEngine.warmSearchPath(
+            table: table,
+            indexUid: indexUid,
+            meta: meta,
+          );
+        }
+        return 0;
+      }
+
+      final ledger = leafLedger ??
+          PrewarmBudgetLedger(
+            capBytes: maxBytes != null ? min(maxBytes, leafBudget) : leafBudget,
+            initialCommittedBytes: _graphEngine.btreeLeafCacheBytes,
+          );
+      if (ledger.isExhausted) return 0;
 
       final added = await _graphEngine.prewarmLeaves(
         table: table,
         indexUid: indexUid,
         meta: meta,
-        maxBytes: budget,
+        ledger: ledger,
         shouldAbort: () =>
             _dataStore.shouldAbortPrewarmForTable(table.tableUid),
       );
 
       if (_dataStore.shouldAbortPrewarmForTable(table.tableUid)) return added;
 
-      // JIT-compile scoring kernels and prime nav routing on this isolate.
       await _graphEngine.warmSearchPath(
         table: table,
         indexUid: indexUid,
@@ -996,6 +1041,8 @@ class VectorIndexManager {
     TableContext table, {
     String? fieldName,
     int? maxBytes,
+    bool navOnly = false,
+    PrewarmBudgetLedger? leafLedger,
   }) async {
     final schema = await _dataStore.tableMetaManager
         ?.getTableSchemaByName(TableName(table.tableName));
@@ -1009,19 +1056,16 @@ class VectorIndexManager {
     var totalLoaded = 0;
     for (final vIdx in vectorIndexes) {
       if (_dataStore.shouldAbortPrewarmForTable(table.tableUid)) break;
+      if (leafLedger != null && leafLedger.isExhausted) break;
       totalLoaded += await prewarmVectorIndex(
         table,
         vIdx.indexUid,
         maxBytes: maxBytes,
+        navOnly: navOnly,
+        leafLedger: leafLedger,
       );
     }
     return totalLoaded;
-  }
-
-  int _defaultPrewarmBudget() {
-    final leafBudget = _resolveVectorLeafCacheBudget();
-    final used = _graphEngine.btreeLeafCacheBytes;
-    return max(0, leafBudget - used);
   }
 
   NghIndexMeta _withPageSizes(NghIndexMeta meta) =>
@@ -1553,39 +1597,46 @@ class VectorIndexManager {
     return _vectorCache.estimatedSizeBytes +
         _partitionManager.getCurrentPageCacheSize() +
         _graphEngine.btreeLeafCacheBytes +
+        _graphEngine.navInternalCacheBytes +
         _graphEngine.navGraphCacheBytes +
         _legacySearch.clusterCacheBytes;
   }
 
-  /// Evict caches under memory pressure.
+  /// Tiered eviction under memory pressure.
   ///
-  /// I/O-fill / meta layers always LRU-trim. Search-hot SQ8 leaves also
-  /// trim when still LOW after structured eviction. Nav internals (Mid-1/2
-  /// share that cache) wait for CRITICAL or an over-budget nav working set.
-  Future<void> evictCache({double ratio = 0.3, bool force = false}) async {
-    await _vectorCache.evict(ratio: ratio);
-    await _partitionManager.evictPageCache(ratio: ratio);
+  /// Warning / headroom: reclaim leaf payload (+ pkmap) only — navigation
+  /// stays under TreeCache capacity ceilings. CRITICAL / [force]: also trim
+  /// nav I/O fill and Mid/leaf-nav working set. Meta is never LRU-trimmed
+  /// here (tiny, always needed).
+  Future<void> evictCache({
+    double ratio = 0.3,
+    bool force = false,
+    Future<bool> Function()? shouldContinue,
+  }) async {
+    if (ratio <= 0.0) return;
 
-    final status = _dataStore.resourceManager?.status;
-    final stillLow = status != null && status != ResourceStatus.normal;
-    final isCritical = status == ResourceStatus.critical;
-    final legacyBytes = _legacySearch.clusterCacheBytes;
-    final legacyMax = _legacySearch.clusterCacheMaxBytes;
-    if (force || isCritical || stillLow || legacyBytes > legacyMax) {
-      _legacySearch.evictClusterCache(ratio: ratio);
+    Future<bool> stillNeed() async {
+      if (force) return true;
+      if (shouldContinue != null) return shouldContinue();
+      final status = _dataStore.resourceManager?.status;
+      return status != null && status != ResourceStatus.normal;
     }
-    final leafBytes = _graphEngine.btreeLeafCacheBytes;
-    final leafMax = _graphEngine.btreeLeafCacheMaxBytes;
-    if (force || isCritical || stillLow || leafBytes > leafMax) {
-      await _graphEngine.evictHotSearchCaches(ratio: ratio);
-    }
-    final navBytes =
-        _graphEngine.navInternalCacheBytes + _graphEngine.navGraphCacheBytes;
-    final navMax = _graphEngine.navInternalCacheMaxBytes +
-        _graphEngine.navGraphCacheMaxBytes;
-    if (force || isCritical || navBytes > navMax) {
-      await _graphEngine.evictNavWorkingSet(ratio: ratio);
-    }
+
+    // T1 — leaf payload (largest reclaim; cold-read cost is per-leaf).
+    await _partitionManager.evictLeafPageCache(ratio: ratio);
+    await _graphEngine.evictHotSearchCaches(ratio: ratio);
+    _legacySearch.evictClusterCache(ratio: ratio);
+    if (!await stillNeed()) return;
+
+    // T2 — pkmap burst (small; write/lookup, not ANN routing).
+    await _partitionManager.evictPkmapPageCache(ratio: ratio);
+
+    // T3 — navigation only under CRITICAL / force; otherwise capacity LRU owns it.
+    final isCritical =
+        force || _dataStore.resourceManager?.status == ResourceStatus.critical;
+    if (!isCritical) return;
+    await _partitionManager.evictNavPageCache(ratio: ratio);
+    await _graphEngine.evictNavWorkingSet(ratio: ratio);
   }
 
   /// Clear all caches for a table.

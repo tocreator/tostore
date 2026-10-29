@@ -14,6 +14,7 @@ import '../../model/table_identity.dart';
 import '../../model/table_schema.dart';
 import '../btree/tree_cache.dart';
 import '../compute/yield_controller.dart';
+import '../maintenance/prewarm_budget_ledger.dart';
 import 'ngh_page.dart';
 import 'ngh_partition_manager.dart';
 import 'ngh_pk_map.dart';
@@ -1835,16 +1836,21 @@ class NghGraphEngine {
     required TableContext table,
     required IndexUid indexUid,
     required NghIndexMeta meta,
-    required int maxBytes,
+    required PrewarmBudgetLedger ledger,
     bool Function()? shouldAbort,
   }) async {
     bool aborted() => shouldAbort?.call() ?? false;
-    if (maxBytes <= 0 || meta.totalVectors <= 0 || aborted()) return 0;
+    if (ledger.capBytes <= 0 ||
+        ledger.isExhausted ||
+        meta.totalVectors <= 0 ||
+        aborted()) {
+      return 0;
+    }
     return _prewarmBTreeLeaves(
       table: table,
       indexUid: indexUid,
       meta: meta,
-      maxBytes: maxBytes,
+      ledger: ledger,
       shouldAbort: shouldAbort,
     );
   }
@@ -1989,19 +1995,20 @@ class NghGraphEngine {
     );
   }
 
-  /// Prefetch leaves into [_btreeLeafCache] under [maxBytes].
+  /// Prefetch leaves into [_btreeLeafCache] under [ledger].
   ///
   /// Hottest leaves (highest [CentroidBranchEntry.leafSlotCount]) first so
   /// typical ANN probes hit memory on the first query after open/insert.
+  /// Charges [ledger] per planned leaf — eviction does not reopen the budget.
   Future<int> _prewarmBTreeLeaves({
     required TableContext table,
     required IndexUid indexUid,
     required NghIndexMeta meta,
-    required int maxBytes,
+    required PrewarmBudgetLedger ledger,
     bool Function()? shouldAbort,
   }) async {
     bool aborted() => shouldAbort?.call() ?? false;
-    if (maxBytes <= 0 || aborted()) return 0;
+    if (ledger.isExhausted || aborted()) return 0;
 
     final state = await _getOrLoadBTreeState(table, indexUid, meta);
     if (state == null || aborted()) return 0;
@@ -2067,20 +2074,12 @@ class NghGraphEngine {
     candidates.sort((a, b) => b.slots.compareTo(a.slots));
 
     final bytesPerSlot = 24 + meta.dimensions + 192;
-    var planned = 0;
-    final toLoad = <NghPageId>[];
-    final room = max(0, maxBytes - _btreeLeafCache.estimatedTotalSizeBytes);
+    final toLoad = <({NghPageId id, int est})>[];
     for (final c in candidates) {
-      if (aborted()) break;
+      if (aborted() || ledger.isExhausted) break;
       final est = c.slots * bytesPerSlot;
-      if (planned + est > room && toLoad.isNotEmpty) break;
-      if (est > room && toLoad.isEmpty) {
-        toLoad.add(c.id);
-        break;
-      }
-      if (planned + est > room) break;
-      planned += est;
-      toLoad.add(c.id);
+      if (!ledger.tryCharge(est)) break;
+      toLoad.add((id: c.id, est: est));
     }
 
     const batchSize = 32;
@@ -2090,8 +2089,10 @@ class NghGraphEngine {
       final y = yieldController.maybeYield();
       if (y != null) await y;
       if (aborted()) break;
-      if (_btreeLeafCache.estimatedTotalSizeBytes >= maxBytes) break;
-      final chunk = toLoad.sublist(i, min(i + batchSize, toLoad.length));
+      final chunk = toLoad
+          .sublist(i, min(i + batchSize, toLoad.length))
+          .map((e) => e.id)
+          .toList(growable: false);
       await _hydrateBTreeLeaves(
         table: table,
         indexUid: indexUid,

@@ -10,6 +10,7 @@ import '../../model/result_type.dart';
 import '../../model/wal_pointer.dart';
 import '../btree/tree_cache.dart';
 import '../compute/yield_controller.dart';
+import '../maintenance/prewarm_budget_ledger.dart';
 import 'wmbp_constants.dart';
 import 'wmbp_scheduler.dart';
 import 'wmbp_window.dart';
@@ -314,6 +315,21 @@ final class _OpenRawSealResult {
     this.status, {
     this.idUpdate,
     this.bytesWritten = 0,
+  });
+}
+
+/// Durable pointer for one closed window's OPEN_RAW term list.
+final class _ClosedDirtyEntry {
+  int page;
+  int count;
+
+  /// In-memory term set changed; rewrite this window's term blob only.
+  bool blobDirty;
+
+  _ClosedDirtyEntry({
+    this.page = 0,
+    this.count = 0,
+    this.blobDirty = false,
   });
 }
 
@@ -630,14 +646,29 @@ class WmbpSealedView {
   /// remaining OPEN_RAW bodies. `-1` means nothing has been background-sealed.
   int sealedThroughWindowId = -1;
 
-  /// Closed/open windows that still hold OPEN_RAW for the listed term ids.
-  /// Persist with meta so restart never needs a full `_idPages` scan.
+  /// Magic for the closed-dirty **index** blob (kind 16). Text index is
+  /// unreleased — no legacy mega-blob compatibility path.
+  static const int _closedDirtyIndexMagic = 0x57444349; // 'WDCI'
+
+  /// In-memory OPEN_RAW term sets (open window + closed windows being sealed).
+  /// Closed durable state lives in [_closedDirtyIndex] as per-window blobs.
   final Map<int, Set<int>> _dirtyOpenRawByWindow = <int, Set<int>>{};
+
+  /// Closed-window durable index: windowId → per-window term blob pointer.
+  /// [_dirtySealPage]/[_dirtySealCount] store this small index on disk.
+  final Map<int, _ClosedDirtyEntry> _closedDirtyIndex =
+      <int, _ClosedDirtyEntry>{};
   int _dirtySealPage = 0;
   int _dirtySealCount = 0;
-  bool _dirtySealDirty = false;
+  bool _closedDirtyIndexDirty = false;
 
-  /// Total `(window, term)` dirty OPEN_RAW pairs (tests / maintenance metrics).
+  int _openDirtySealPage = 0;
+  int _openDirtySealCount = 0;
+
+  /// When true, next [_writeAuxiliary] rewrites the small open-window dirty blob.
+  bool _openDirtySealDirty = false;
+
+  /// Resident `(window, term)` pairs currently held in [_dirtyOpenRawByWindow].
   int get dirtyOpenRawPairCount {
     var n = 0;
     for (final set in _dirtyOpenRawByWindow.values) {
@@ -646,7 +677,20 @@ class WmbpSealedView {
     return n;
   }
 
-  /// Dirty OPEN_RAW term count for one window (0 if clean).
+  /// True when closed OPEN_RAW promotion work remains (resident or on-disk).
+  bool get hasClosedOpenRawDebt {
+    final int open = _openWindowId;
+    for (final e in _dirtyOpenRawByWindow.entries) {
+      if (e.key < open && e.value.isNotEmpty) return true;
+    }
+    for (final entry in _closedDirtyIndex.values) {
+      if (entry.page > 0 && entry.count > 0) return true;
+      if (entry.blobDirty) return true;
+    }
+    return false;
+  }
+
+  /// Dirty OPEN_RAW term count for one window (0 if none resident).
   int dirtyOpenRawTermCount(int windowId) =>
       _dirtyOpenRawByWindow[windowId]?.length ?? 0;
 
@@ -670,6 +714,21 @@ class WmbpSealedView {
 
   /// Next local page in dict; page 0 is reserved for sealed meta.
   int _dictNextPageNo = 1;
+
+  /// Contiguous dict runs freed by blob chain relocation. Session-local —
+  /// not persisted; stops further orphan growth after reopen. Existing
+  /// on-disk orphans need a rebuild/compact to reclaim.
+  ///
+  /// Only runs whose meta pointers are already durable may be allocated
+  /// from; see [_dictPendingFreeRuns].
+  final List<({int page, int count})> _dictFreeRuns =
+      <({int page, int count})>[];
+
+  /// Released blob runs waiting for sealed meta to land. Must not be handed
+  /// out by [_allocDictRun] yet — otherwise a crash after overwrite but
+  /// before meta flush would leave on-disk meta pointing at recycled pages.
+  final List<({int page, int count})> _dictPendingFreeRuns =
+      <({int page, int count})>[];
 
   /// Per-window live doc counts. `u32` so a full super-window (65536) fits.
   Uint32List _activeCounts = Uint32List(0);
@@ -717,33 +776,34 @@ class WmbpSealedView {
         fwdSlotsPerPage = WmbpConstants.fwdDocsPerPage,
         cacheBudgetBytes = cacheBudgetBytes ?? WmbpConstants.cacheLruBytes {
     // Soft ceilings: ratios sum to 1.0 of [budget] (shared index envelope).
-    // Protect floors are hardcoded absolute sizes ? not budget-derived. A
-    // ratio-scaled min collapses to a few MB on small/medium budgets and
-    // forces hot queries back to disk; half-of-max on large budgets pins
-    // min near max and skips cleanup. Same idea as B+Tree 50MB / NGH 32MB:
-    // 50MB for query-critical residency, 32MB / 16MB for the rest.
+    // Protect floors are absolute (not budget-derived) so small budgets do not
+    // collapse hot navigation to a few MB. Eviction priority (see
+    // [evictCaches]): payload floors are lower so T1/T2 reclaim first;
+    // search/flush navigation floors stay high so cold-read does not avalanche.
     final int budget =
         this.cacheBudgetBytes < (1 << 20) ? (1 << 20) : this.cacheBudgetBytes;
-    const int protect50 = 50 << 20;
-    const int protect32 = 32 << 20;
-    const int protect16 = 16 << 20;
+    const int protect50 = 50 << 20; // search-critical term heads
+    const int protect32 = 32 << 20; // dict / rev navigation
+    const int protect16 = 16 << 20; // payload / I/O fill / result maps
     int sliceMax(double ratio) {
       final n = (budget * ratio).round();
       return n < (256 << 10) ? (256 << 10) : n;
     }
 
+    // Heap accounting: see [_tcHeap] — approximate so LRU ceilings bite; OS
+    // low-memory remains the hard backstop (do not deepen for precision).
     _pages = TreeCache<Uint8List>(
       evictionMode: TreeCacheEvictionMode.lru,
       maxByteThreshold: sliceMax(0.12),
-      minByteThreshold: protect32,
-      sizeCalculator: (Uint8List value) => value.length,
+      minByteThreshold: protect16,
+      sizeCalculator: _estimatePageBytes,
       debugLabel: 'wmbp-pages',
     );
     _nameCache = TreeCache<int>(
       evictionMode: TreeCacheEvictionMode.lru,
       maxByteThreshold: sliceMax(0.10),
       minByteThreshold: protect32,
-      sizeCalculator: (int value) => 8,
+      sizeCalculator: (_) => _tcEntryHeap + 48,
       debugLabel: 'wmbp-names',
     );
     _headCache = TreeCache<_TermHead>(
@@ -756,7 +816,7 @@ class WmbpSealedView {
     _windowCache = TreeCache<WmbpEncodedWindow>(
       evictionMode: TreeCacheEvictionMode.lru,
       maxByteThreshold: sliceMax(0.30),
-      minByteThreshold: protect50,
+      minByteThreshold: protect16,
       sizeCalculator: _estimateWindowBytes,
       debugLabel: 'wmbp-windows',
     );
@@ -764,40 +824,41 @@ class WmbpSealedView {
       evictionMode: TreeCacheEvictionMode.lru,
       maxByteThreshold: sliceMax(0.05),
       minByteThreshold: protect16,
-      sizeCalculator: (Uint32List value) => value.lengthInBytes,
+      sizeCalculator: _estimateMaskBytes,
       debugLabel: 'wmbp-masks',
     );
     _fwdPkCache = TreeCache<String>(
       evictionMode: TreeCacheEvictionMode.lru,
       maxByteThreshold: sliceMax(0.08),
-      minByteThreshold: protect32,
-      sizeCalculator: (String value) => 32 + value.length,
+      minByteThreshold: protect16,
+      sizeCalculator: _estimateFwdPkBytes,
       debugLabel: 'wmbp-fwd-pk',
     );
     _revPkCache = TreeCache<int>(
       evictionMode: TreeCacheEvictionMode.lru,
       maxByteThreshold: sliceMax(0.03),
-      minByteThreshold: protect16,
-      sizeCalculator: (int value) => 48,
+      minByteThreshold: protect32,
+      sizeCalculator: (_) => _tcEntryHeap + 64,
       debugLabel: 'wmbp-rev-pk',
     );
     _idPageCache = TreeCache<List<_IdRec>>(
       evictionMode: TreeCacheEvictionMode.lru,
       maxByteThreshold: sliceMax(0.03),
-      minByteThreshold: protect16,
-      sizeCalculator: (List<_IdRec> value) => 64 + value.length * 24,
+      minByteThreshold: protect32,
+      sizeCalculator: (List<_IdRec> value) =>
+          _tcHeap(payload: value.length * 48),
       debugLabel: 'wmbp-id-pages',
     );
     _namePageCache = TreeCache<List<_NameRec>>(
       evictionMode: TreeCacheEvictionMode.lru,
       maxByteThreshold: sliceMax(0.03),
-      minByteThreshold: protect16,
+      minByteThreshold: protect32,
       sizeCalculator: (List<_NameRec> value) {
-        var n = 64;
+        var payload = 0;
         for (final rec in value) {
-          n += 16 + rec.name.length;
+          payload += 32 + _utf16(rec.name);
         }
-        return n;
+        return _tcHeap(payload: payload);
       },
       debugLabel: 'wmbp-name-pages',
     );
@@ -810,40 +871,89 @@ class WmbpSealedView {
     );
   }
 
+  // ---------------------------------------------------------------------------
+  // TreeCache heap accounting (approximate)
+  //
+  //   accounted ≈ entryHeap + strings(UTF-16) + typed/payload bytes
+  //
+  // - entryHeap: fixed Dart Map/TreeCache tax per entry. Calibrated ~1KB from
+  //   1.6M RSS isolation (names≈1933MB, fwd≈1654MB after ~660MB baseline).
+  //   Independent of document text length.
+  // - strings: length*2. Scales with PK / term length, not body text.
+  // - typed/payload: page bytes, mask bitmap, window offsets/impacts/presence,
+  //   head macro dirs. Longer docs → denser postings → larger windows/heads;
+  //   those buffers grow here automatically.
+  //
+  // Good enough for LRU ceilings + ResourceManager; OS critical is the safety
+  // net. Do not add deep walks or per-field micro-accounting on the hot path.
+  // ---------------------------------------------------------------------------
+
+  static const int _tcEntryHeap = 896;
+
+  @pragma('vm:prefer-inline')
+  static int _utf16(String s) => s.length * 2;
+
+  @pragma('vm:prefer-inline')
+  static int _tcHeap({int payload = 0}) => _tcEntryHeap + payload;
+
+  static int _nameEntryBytes(String name) =>
+      _tcHeap(payload: 32 + _utf16(name));
+
+  static int _fwdPkEntryBytes(String pk) => _tcHeap(payload: 48 + _utf16(pk));
+
+  static int _revPkEntryBytes(String pk) => _tcHeap(payload: 48 + _utf16(pk));
+
+  static int _estimatePageBytes(Uint8List page) =>
+      _tcHeap(payload: 64 + page.length);
+
+  static int _estimateMaskBytes(Uint32List words) =>
+      _tcHeap(payload: words.lengthInBytes);
+
+  static int _estimateFwdPkBytes(String pk) => _fwdPkEntryBytes(pk);
+
   static int _estimateRevNodeBytes(_RevNode node) {
-    var n = 64;
+    var payload = 64;
     if (node.leaf) {
       for (final rec in node.records) {
-        n += 48 + rec.pk.length;
+        payload += 64 + _utf16(rec.pk);
       }
-      return n;
+      return _tcHeap(payload: payload);
     }
-    n += node.children.length * 8;
+    payload += node.children.length * 16;
     for (final sep in node.separators) {
-      n += 32 + sep.length;
+      payload += 48 + _utf16(sep);
     }
-    return n;
+    return _tcHeap(payload: payload);
   }
 
   static int _estimateHeadBytes(_TermHead head) {
-    var n = 64 +
-        head.champion.length * 16 +
-        head.macroMaxImpacts.length +
-        head.macroDirPages.length * 12;
+    // Champion/macro graph; denser terms (long docs) load more macro slices.
+    var payload = 192 +
+        head.champion.length * 40 +
+        head.macroMaxImpacts.lengthInBytes +
+        head.macroDirPages.lengthInBytes +
+        head.macroDirOffsets.lengthInBytes +
+        head.macroDirLengths.lengthInBytes;
+    payload += head.macros.length * 96;
     for (final slice in head.macros.values) {
-      n += slice.windowIds.length * 16 +
-          slice.maxImpacts.length +
-          slice.bodyPages.length * 12;
+      payload += 48 +
+          slice.windowIds.length * 8 +
+          slice.maxImpacts.lengthInBytes +
+          slice.bodyPages.lengthInBytes +
+          slice.bodyOffset.lengthInBytes +
+          slice.bodyLength.lengthInBytes;
     }
-    return n;
+    return _tcHeap(payload: payload);
   }
 
   static int _estimateWindowBytes(WmbpEncodedWindow win) {
-    return 64 +
+    // Posting density scales with DF in the super-window (long docs → larger).
+    final payload = 96 +
         win.allocatedOffsetsBytes +
         win.impacts.lengthInBytes +
         (win.presence?.lengthInBytes ?? 0) +
         win.blocks.length * 48;
+    return _tcHeap(payload: payload);
   }
 
   static Future<WmbpSealedView> open(
@@ -887,20 +997,53 @@ class WmbpSealedView {
     return WmbpPagePtr.unpack(pageRef);
   }
 
-  Future<void> evictCaches({required double ratio}) async {
+  /// Tiered LRU trim under memory pressure (mirror of [prewarmCaches] order).
+  ///
+  /// Low-priority payload first; search/flush navigation last. After each
+  /// tier, [shouldContinue] may stop further reclaim so hot nav stays resident.
+  /// When [protectFlushNav] is true (active flush), reverse-map caches are
+  /// skipped entirely.
+  Future<void> evictCaches({
+    required double ratio,
+    Future<bool> Function()? shouldContinue,
+    bool protectFlushNav = false,
+  }) async {
     if (ratio <= 0.0) return;
-    await Future.wait([
-      _pages.cleanup(removeRatio: ratio),
-      _nameCache.cleanup(removeRatio: ratio),
-      _headCache.cleanup(removeRatio: ratio),
-      _windowCache.cleanup(removeRatio: ratio),
-      _maskCache.cleanup(removeRatio: ratio),
-      _fwdPkCache.cleanup(removeRatio: ratio),
-      _revPkCache.cleanup(removeRatio: ratio),
-      _idPageCache.cleanup(removeRatio: ratio),
-      _namePageCache.cleanup(removeRatio: ratio),
-      _revNodeCache.cleanup(removeRatio: ratio),
-    ]);
+
+    Future<bool> stillNeed() async {
+      if (shouldContinue == null) return true;
+      return shouldContinue();
+    }
+
+    // T1 — search payload (post window bodies + raw page I/O fill).
+    await _windowCache.cleanup(removeRatio: ratio);
+    if (!await stillNeed()) return;
+    await _pages.cleanup(removeRatio: ratio);
+    if (!await stillNeed()) return;
+
+    // T2 — result map (docId → PK); scoring does not need it.
+    await _fwdPkCache.cleanup(removeRatio: ratio);
+    if (!await stillNeed()) return;
+
+    // T3 — search navigation (term heads, dict id/name pages).
+    await _headCache.cleanup(removeRatio: ratio);
+    if (!await stillNeed()) return;
+    await _idPageCache.cleanup(removeRatio: ratio);
+    if (!await stillNeed()) return;
+    await _nameCache.cleanup(removeRatio: ratio);
+    if (!await stillNeed()) return;
+    await _namePageCache.cleanup(removeRatio: ratio);
+    if (!await stillNeed()) return;
+
+    // T4 — active masks (tiny; only if still under pressure).
+    await _maskCache.cleanup(removeRatio: ratio);
+    if (!await stillNeed()) return;
+
+    // T5 — flush / seal navigation (PK → docId); last and flush-protected.
+    if (protectFlushNav) return;
+    await _revPkCache.cleanup(removeRatio: ratio);
+    if (!await stillNeed()) return;
+    await _revNodeCache.cleanup(removeRatio: ratio);
   }
 
   int get _structuredCacheSizeBytes =>
@@ -923,33 +1066,47 @@ class WmbpSealedView {
   int get estimatedCacheSizeBytes =>
       _pages.estimatedTotalSizeBytes + _structuredCacheSizeBytes;
 
-  /// Fill search-hot caches until the shared index budget is exhausted.
+  /// Coarse on-disk footprint from durable page high-water marks (O(1)).
+  int get estimatedDiskBytes {
+    final pages = pageCountOf('dict') +
+        pageCountOf('post') +
+        pageCountOf('fwd') +
+        pageCountOf('rev') +
+        pageCountOf('win');
+    return pages * WmbpConstants.storePageSize;
+  }
+
+  /// Fill search-hot caches until [ledger] is exhausted.
   ///
-  /// [sharedBudgetBytes] is the B+Tree+WMBP ceiling ([getIndexCacheSize]).
-  /// [sharedUsageBytes] must include current B+Tree index pages plus all WMBP
-  /// corpora so prewarm stops as soon as the shared pool is full.
-  ///
-  /// Edge/small DBs typically fill the budget with dict+post+win (and leftover
-  /// fwd). Large corpora stop early - hottest terms first; fwd is lowest
-  /// priority because search scoring never reads it.
+  /// [ledger] is the shared B+Tree+WMBP warm ceiling — charges are monotonic
+  /// so ResourceManager / TreeCache eviction cannot reopen the budget and
+  /// resume colder loads. When [navOnly] (or corpus &gt; budget×1.5), only
+  /// navigation / metadata is warmed (names, id pages, masks, rev internals).
   Future<int> prewarmCaches({
-    required int sharedBudgetBytes,
-    required int Function() sharedUsageBytes,
+    required PrewarmBudgetLedger ledger,
+    bool navOnly = false,
     bool Function()? shouldAbort,
   }) async {
-    if (sharedBudgetBytes <= 0 || nextTermId <= 1) return 0;
+    if (ledger.capBytes <= 0 || nextTermId <= 1) return 0;
     bool aborted() => shouldAbort?.call() ?? false;
-    if (aborted()) return 0;
+    if (aborted() || ledger.isExhausted) return 0;
 
     final int before = _structuredCacheSizeBytes;
-    bool overBudget() => sharedUsageBytes() >= sharedBudgetBytes;
+    final payloadWorthless = navOnly ||
+        isPrewarmPayloadWorthless(
+          dataBytes: estimatedDiskBytes,
+          budgetBytes: ledger.capBytes,
+        );
+
+    bool overBudget() => ledger.isExhausted;
+
+    // Charge before a load; latch stop when the estimate no longer fits.
+    bool charge(int est) {
+      if (est <= 0) return !ledger.isExhausted;
+      return ledger.tryCharge(est);
+    }
 
     // 1) Dictionary names - TreeCache (query compile / sync resolve path).
-    // Stop before triggering TreeCache eviction on [_nameCache].
-    // Index loops (not for-in): commit may grow [_nameSkips] during await;
-    // for-in on the live GrowableList throws ConcurrentModificationError.
-    // Cached name-page lists are replaced as a whole on write, never mutated
-    // in place — so index walks need no List.of snapshot / double occupancy.
     final int nameCacheCap = (_nameCache.maxByteThreshold * 0.90).round();
     for (int si = 0; si < _nameSkips.length; si++) {
       if (aborted() ||
@@ -968,10 +1125,11 @@ class WmbpSealedView {
           }
           final rec = recs[ri];
           if (_nameCache.get(rec.name) != null) continue;
-          _nameCache.put(rec.name, rec.termId, size: rec.name.length + 8);
+          final est = _nameEntryBytes(rec.name);
+          if (!charge(est)) break;
+          _nameCache.put(rec.name, rec.termId, size: est);
         }
       } catch (_) {
-        // Skip corrupt / sparse dict pages; keep warming the rest.
         continue;
       }
     }
@@ -985,64 +1143,81 @@ class WmbpSealedView {
         break;
       }
       if (_activeCounts[winId] <= 0) continue;
+      if (_maskCache.containsKey(winId)) continue;
       try {
+        if (!charge(WmbpConstants.activeMaskBytes + 32)) break;
         await _rememberMask(winId);
       } catch (_) {
         continue;
       }
     }
 
-    // 3) Reverse PK B+Tree (internal nodes first via BFS, then leaves)
-    // and 4) Forward PK pages (docId -> primaryKey).
-    // Both are mandatory for searchTextSync to complete without falling back
-    // to async I/O. Reserve up to 35% of the remaining budget upfront so
-    // small/medium corpora warm 100% of rev+fwd before post, while huge corpora
-    // preserve at least 65% of the budget for hottest posting windows.
-    final int remainingBeforePk =
-        math.max(0, sharedBudgetBytes - sharedUsageBytes());
-    final int upfrontPkCeiling =
-        sharedUsageBytes() + (remainingBeforePk * 0.35).round();
+    // 3) Reverse PK B+Tree — navigation. Cap upfront PK share so postings
+    // (when allowed) still get most of a medium-corpus budget.
+    final int pkShareCeiling =
+        ledger.committedBytes + (ledger.remainingBytes * 0.35).round();
     bool overUpfrontPkBudget() =>
-        overBudget() || sharedUsageBytes() >= upfrontPkCeiling;
+        overBudget() || ledger.committedBytes >= pkShareCeiling;
+
+    Future<bool> chargeRevOrFwd(int est) async {
+      if (overUpfrontPkBudget()) return false;
+      return charge(est);
+    }
 
     var revFullyWarmed = _revHeight <= 0;
     if (!aborted() && !overUpfrontPkBudget() && _revHeight > 0) {
       revFullyWarmed = await _warmRevPagesBudgeted(
         aborted: aborted,
         overBudget: overUpfrontPkBudget,
+        tryCharge: chargeRevOrFwd,
       );
     }
 
+    // Fwd bulk is payload-ish; skip when navOnly / worthless corpus.
     var fwdNextPage = 0;
-    if (!aborted() && !overUpfrontPkBudget() && _fwdPageCount > 0) {
+    if (!payloadWorthless &&
+        !aborted() &&
+        !overUpfrontPkBudget() &&
+        _fwdPageCount > 0) {
       fwdNextPage = await _warmFwdPagesBudgeted(
         startPage: 0,
         aborted: aborted,
         overBudget: overUpfrontPkBudget,
+        tryCharge: chargeRevOrFwd,
       );
     }
 
-    // 5) Hottest terms first (df desc, then postPage/postOffset asc so terms
-    // sharing the same 16KB post page are decoded in a single page read):
-    // head + windows + active masks.
-    // Stop before triggering LRU eviction on [_headCache] or [_windowCache] so
-    // cold terms never evict the hottest terms warmed first.
+    // 4) Id-page catalog (term → post pointer). Budgeted; needed for nav and
+    // for ranking hottest terms when payload warm is allowed.
     final terms = <_IdRec>[];
-    // Index over [_idPages]: length may grow if commit allocates id pages
-    // mid-prewarm; freeze the high-water we intend to scan.
     final int idPageCount = _idPages.length;
+    final int idPageCap = (_idPageCache.maxByteThreshold * 0.90).round();
     for (int pageIndex = 0; pageIndex < idPageCount; pageIndex++) {
-      if (aborted()) break;
+      if (aborted() || overBudget()) break;
+      if (_idPageCache.estimatedTotalSizeBytes >= idPageCap) break;
       if (pageIndex >= _idPages.length) break;
       final int page = _idPages[pageIndex];
       if (page < 0) continue;
+      if (_idPageCache.get(page) != null) {
+        final cached = _idPageCache.get(page)!;
+        terms.addAll(cached);
+        continue;
+      }
       try {
-        // addAll is safe: id-page cache entries are replaced, not mutated.
+        if (!charge(WmbpConstants.storePageSize)) break;
         terms.addAll(await _readIdPageSlots(page, pageIndex));
       } catch (_) {
         continue;
       }
     }
+
+    if (payloadWorthless) {
+      // Nav/metadata only for this corpus — do not latch the shared ledger so
+      // other smaller indexes in the same Phase 2 pass can still fill payload.
+      _pages.clear();
+      return math.max(0, _structuredCacheSizeBytes - before);
+    }
+
     terms.sort((a, b) {
       final int cmpDf = b.df.compareTo(a.df);
       if (cmpDf != 0) return cmpDf;
@@ -1051,6 +1226,7 @@ class WmbpSealedView {
       return a.postOffset.compareTo(b.postOffset);
     });
 
+    // 5) Hottest postings: head + macros + windows.
     final int headCacheCap = (_headCache.maxByteThreshold * 0.90).round();
     final int windowCacheCap = (_windowCache.maxByteThreshold * 0.90).round();
     bool overPostSubCacheCap() =>
@@ -1068,6 +1244,8 @@ class WmbpSealedView {
       try {
         var head = _headCache.get(rec.termId);
         if (head == null) {
+          final headEst = math.max(64, rec.postLength);
+          if (!charge(headEst)) break;
           final syncHeadBytes = _tryReadPayloadRangeSync(
             'post',
             rec.postPage,
@@ -1092,19 +1270,26 @@ class WmbpSealedView {
           _putHeadCache(rec.termId, head);
           _firstWarmTermId ??= rec.termId;
         }
-        // Warm macros by maxImpact (hottest first) until budget ? no hard
-        // macro-count cap. Root stays lazy on cold decode; warm restores the
-        // sync search hit-rate that eager expansion used to provide.
         final macroOrder = _macroWarmOrder(head);
         for (final int m in macroOrder) {
           if (aborted() || overBudget() || overPostSubCacheCap()) break;
+          final int dirLen = (m >= 0 && m < head.macroDirLengths.length)
+              ? head.macroDirLengths[m]
+              : 0;
+          if (!head.macros.containsKey(m) && dirLen > 0 && !charge(dirLen)) {
+            break;
+          }
           await _ensureMacro(head, m);
+          // Macros mutate head in place — re-put so TreeCache byte estimate
+          // tracks the expanded directory (avoids under-count thrash).
+          _putHeadCache(rec.termId, head);
           final slice = head.macros[m];
           if (slice == null) continue;
           for (int wi = 0; wi < slice.windowIds.length; wi++) {
             if (aborted() || overBudget() || overPostSubCacheCap()) break;
             final int winId = slice.windowIds[wi];
             if (!_rememberMaskSync(winId)) {
+              if (!charge(WmbpConstants.activeMaskBytes + 32)) break;
               await _rememberMask(winId);
               yieldController.reset();
             }
@@ -1112,6 +1297,7 @@ class WmbpSealedView {
             if (!_windowCache.containsKey(key)) {
               final int len = slice.bodyLength[wi];
               if (len > 0) {
+                if (!charge(len + 64)) break;
                 final int bodyPage = slice.bodyPages[wi];
                 final int bodyOff = slice.bodyOffset[wi];
                 var bytes =
@@ -1133,16 +1319,16 @@ class WmbpSealedView {
       }
     }
 
-    // Release raw page buffers that have already been decoded into structured
-    // head/window/rev/fwd/dict caches so they do not double-count against budget.
+    // Drop raw page buffers so they do not double-count residency — ledger
+    // already charged structured warm and must not resume after clear.
     _pages.clear();
 
-    // 6) If upfront PK prewarm hit its 35% soft cap on a large corpus and
-    // budget still remains after warming postings, use the leftover budget.
+    // 6) Leftover ledger only (not live residency after clear).
     if (!aborted() && !overBudget() && !revFullyWarmed && _revHeight > 0) {
       await _warmRevPagesBudgeted(
         aborted: aborted,
         overBudget: overBudget,
+        tryCharge: (est) async => charge(est),
       );
     }
     if (!aborted() && !overBudget() && fwdNextPage < _fwdPageCount) {
@@ -1150,6 +1336,7 @@ class WmbpSealedView {
         startPage: fwdNextPage,
         aborted: aborted,
         overBudget: overBudget,
+        tryCharge: (est) async => charge(est),
       );
     }
     _pages.clear();
@@ -1158,17 +1345,18 @@ class WmbpSealedView {
   }
 
   void _putHeadCache(int termId, _TermHead head) =>
-      _headCache.put(termId, head);
+      _headCache.put(termId, head, size: _estimateHeadBytes(head));
 
   void _putWindowCache(List<int> key, WmbpEncodedWindow window) =>
-      _windowCache.put(key, window);
+      _windowCache.put(key, window, size: _estimateWindowBytes(window));
 
   void _rememberRevPk(String pk, int docId) =>
-      _revPkCache.put(pk, docId, size: pk.length + 8);
+      _revPkCache.put(pk, docId, size: _revPkEntryBytes(pk));
 
   void _forgetRevPk(String pk) => _revPkCache.remove(pk);
 
-  void _rememberFwdPk(int docId, String pk) => _fwdPkCache.put(docId, pk);
+  void _rememberFwdPk(int docId, String pk) =>
+      _fwdPkCache.put(docId, pk, size: _fwdPkEntryBytes(pk));
 
   void _rememberIdPageCache(int page, List<_IdRec> recs) =>
       _idPageCache.put(page, recs);
@@ -1177,7 +1365,7 @@ class WmbpSealedView {
       _namePageCache.put(page, recs);
 
   void _putMaskCache(int windowId, Uint32List words) =>
-      _maskCache.put(windowId, words);
+      _maskCache.put(windowId, words, size: _estimateMaskBytes(words));
 
   int sealedActiveCount(int windowId) {
     if (windowId < 0 || windowId >= _activeCounts.length) return 0;
@@ -1347,7 +1535,7 @@ class WmbpSealedView {
       final int cmp = recs[mid].name.compareTo(term);
       if (cmp == 0) {
         final int foundId = recs[mid].termId;
-        _nameCache.put(term, foundId, size: term.length + 8);
+        _nameCache.put(term, foundId, size: _nameEntryBytes(term));
         return foundId;
       }
       if (cmp < 0) {
@@ -1569,7 +1757,6 @@ class WmbpSealedView {
       required void Function() publish,
     }) handoff,
   }) async {
-    final int initialNextTermId = nextTermId;
     // Defer nextDocId / open-window advance until AFTER posting writes so a
     // cross-window batch can still appendOpenRaw into the previous live window.
     // Sync full-vocab OPEN_RAW→I/II/III seal is forbidden on this path (10B
@@ -1652,7 +1839,6 @@ class WmbpSealedView {
     final idUpdates = <_IdRec>[];
     final nameUpdates = <_NameRec>[];
     final publishHeads = <int, _TermHead>{};
-    final compactedTerms = <int>{};
 
     if (_postTailPage >= 0 && _postTailImage == null) {
       final existing = await _readGlobal('post', _postTailPage);
@@ -1923,18 +2109,43 @@ class WmbpSealedView {
         headAt.offset,
         headAt.length,
       ));
-      if (termId >= initialNextTermId) {
-        final name = batch.termNames[termId];
-        if (name != null && name.isNotEmpty) {
-          nameUpdates.add(_NameRec(termId, name));
-          _nameCache.put(name, termId, size: name.length + 8);
-        }
+      // Flush-scoped seal may leave survivor reminted ids below the prior
+      // nextTermId watermark. Always persist names carried in this batch —
+      // gating on `>= initialNextTermId` would permanently drop them.
+      final name = batch.termNames[termId];
+      if (name != null && name.isNotEmpty) {
+        nameUpdates.add(_NameRec(termId, name));
+        _nameCache.put(name, termId, size: _nameEntryBytes(name));
       }
+    }
+    // Names for pending terms not touched as posting heads this round (rare:
+    // deactivate-only batches). Still durable-write so scoped seals cannot
+    // strand reminted dictionary entries.
+    for (final entry in batch.termNames.entries) {
+      if (entry.value.isEmpty) continue;
+      if (byTerm.containsKey(entry.key)) continue;
+      nameUpdates.add(_NameRec(entry.key, entry.value));
+      _nameCache.put(entry.value, entry.key,
+          size: _nameEntryBytes(entry.value));
     }
 
     // Raise open window only after all OPEN_RAW appends for this batch.
+    // Newly-closed windows get a per-window term blob (O(one window)), never
+    // a rewrite of all historical closed debt.
+    final int openBefore = _openWindowId;
     if (pendingNextDocId > nextDocId) nextDocId = pendingNextDocId;
     if (pendingNextTermId > nextTermId) nextTermId = pendingNextTermId;
+    final int openAfter = _openWindowId;
+    if (openAfter > openBefore) {
+      for (int w = openBefore; w < openAfter; w++) {
+        final terms = _dirtyOpenRawByWindow[w];
+        if (terms == null || terms.isEmpty) continue;
+        final entry = _closedDirtyIndex.putIfAbsent(w, _ClosedDirtyEntry.new);
+        entry.blobDirty = true;
+      }
+      _closedDirtyIndexDirty = true;
+      _openDirtySealDirty = true;
+    }
 
     await _bulkUpsertIds(idUpdates);
     await _bulkUpsertNames(nameUpdates);
@@ -1948,40 +2159,12 @@ class WmbpSealedView {
     );
     await _applyMasks(batch.added, deactivated);
     await _appendFwd(batch.added);
-    // Tombstone GC only for closed windows below the active-count floor.
-    // Open / unfilled windows always have activeCount << 52428 and must not
-    // trigger a full-dictionary rewrite on every update/delete.
-    if (deactivated.isNotEmpty) {
-      final int openWindow = _openWindowId;
-      final touched = <int>{
-        for (final id in deactivated) WmbpConstants.windowIdOf(id),
-      };
-      final yc = YieldController(
-        'WmbpSealedView.compactTouchedWindows',
-        checkInterval: 8,
-      );
-      for (final windowId in touched) {
-        if (windowId >= openWindow) continue;
-        final y = yc.maybeYield();
-        if (y != null) await y;
-        await compactWindow(windowId, compactedTerms: compactedTerms);
-      }
-    }
+    // Do NOT run [compactWindow] on the ingest seal path. It scans every
+    // term id-page (full dictionary) and at multi-million scale made a
+    // single cold update of a sparse closed window cost ~tens of seconds —
+    // the same whether 1 or 10k rows flushed. Active-mask tombstones keep
+    // search correct; use [compactClosedWindows] for maintenance GC.
     await _flushPostTail();
-
-    // Compact rewrote df on disk -drop stale pre-compact heads so search
-    // reloads from slots instead of publishing an inflated df.
-    final compactYc = YieldController(
-      'wmbp_commit_compact_heads',
-      checkInterval: 512,
-      minCheckInterval: 128,
-    );
-    for (final termId in compactedTerms) {
-      final y = compactYc.maybeYield();
-      if (y != null) await y;
-      publishHeads.remove(termId);
-      _headCache.remove(termId);
-    }
 
     // Aggregate window deltas (100k docs often touch 1-2 windows).
     final addByWindow = <int, int>{};
@@ -2039,19 +2222,39 @@ class WmbpSealedView {
 
   void _markOpenRawDirty(int termId, int windowId) {
     final set = _dirtyOpenRawByWindow.putIfAbsent(windowId, () => <int>{});
-    if (set.add(termId)) {
-      _dirtySealDirty = true;
+    if (!set.add(termId)) return;
+    if (windowId < _openWindowId) {
+      // Touch only this window's durable slot — never rewrite all closed debt.
+      final entry =
+          _closedDirtyIndex.putIfAbsent(windowId, _ClosedDirtyEntry.new);
+      entry.blobDirty = true;
+      _closedDirtyIndexDirty = true;
+      return;
     }
+    // Open-window dirty is a small blob; checkpoint on every auxiliary write.
+    _openDirtySealDirty = true;
   }
 
   void _clearOpenRawDirty(int termId, int windowId) {
     final set = _dirtyOpenRawByWindow[windowId];
     if (set == null) return;
-    if (set.remove(termId)) {
-      _dirtySealDirty = true;
+    if (!set.remove(termId)) return;
+    if (windowId < _openWindowId) {
+      final entry = _closedDirtyIndex[windowId];
+      if (entry != null) {
+        entry.blobDirty = true;
+        _closedDirtyIndexDirty = true;
+      }
+    } else {
+      _openDirtySealDirty = true;
     }
     if (set.isEmpty) {
       _dirtyOpenRawByWindow.remove(windowId);
+      final entry = _closedDirtyIndex[windowId];
+      if (entry != null) {
+        entry.blobDirty = true;
+        _closedDirtyIndexDirty = true;
+      }
       _tryAdvanceSealedThrough();
     }
   }
@@ -2064,28 +2267,40 @@ class WmbpSealedView {
       if (next >= open) break;
       final dirty = _dirtyOpenRawByWindow[next];
       if (dirty != null && dirty.isNotEmpty) break;
+      final entry = _closedDirtyIndex[next];
+      if (entry != null &&
+          (entry.page > 0 || entry.count > 0 || entry.blobDirty)) {
+        break;
+      }
+      if (entry != null) {
+        _closedDirtyIndex.remove(next);
+        _closedDirtyIndexDirty = true;
+      }
       through = next;
     }
-    if (through != sealedThroughWindowId) {
-      sealedThroughWindowId = through;
-      _dirtySealDirty = true;
-    }
+    // Watermark lives in meta (always rewritten); do not force an index
+    // rewrite solely because sealedThrough advanced.
+    sealedThroughWindowId = through;
   }
 
-  /// Background / maintenance: promote dirty OPEN_RAW bodies on *closed*
-  /// windows to state I/II/III. Never scans the full term dictionary.
+  /// Promote dirty OPEN_RAW bodies on *closed* windows to state I/II/III.
   ///
-  /// Budgets keep ingest flush optimal: stop when any of [maxTerms],
-  /// [maxSealMs], or [maxSealBytes] is exhausted. Transient failures keep
-  /// the dirty bit (`retryLater`) so work is never silently dropped.
+  /// Uses per-window term lists (memory or durable blob). No full-dictionary
+  /// scan — text index is unreleased and does not carry legacy debt recovery.
+  ///
+  /// Budgets stop when any of [maxTerms], [maxSealMs], or [maxSealBytes]
+  /// is exhausted. Transient failures keep the dirty bit (`retryLater`).
   Future<int> sealDirtyClosedWindows({
     int maxTerms = 64,
     int maxSealMs = 0,
     int maxSealBytes = 0,
   }) async {
-    if (maxTerms <= 0 || _dirtyOpenRawByWindow.isEmpty) return 0;
+    if (maxTerms <= 0) return 0;
     final int open = _openWindowId;
-    final windowIds = _dirtyOpenRawByWindow.keys.where((w) => w < open).toList()
+    final windowIds = <int>{
+      ..._dirtyOpenRawByWindow.keys.where((w) => w < open),
+      ..._closedDirtyIndex.keys.where((w) => w < open),
+    }.toList()
       ..sort();
     if (windowIds.isEmpty) return 0;
     var sealed = 0;
@@ -2107,11 +2322,14 @@ class WmbpSealedView {
 
     for (final windowId in windowIds) {
       if (overBudget()) break;
-      final terms = _dirtyOpenRawByWindow[windowId];
+      var terms = _dirtyOpenRawByWindow[windowId];
       if (terms == null || terms.isEmpty) {
-        _dirtyOpenRawByWindow.remove(windowId);
-        _dirtySealDirty = true;
-        continue;
+        final loaded = await _ensureClosedDirtyTerms(windowId);
+        if (loaded == null || loaded.isEmpty) {
+          _dirtyOpenRawByWindow.remove(windowId);
+          continue;
+        }
+        terms = loaded;
       }
       final termList = terms.toList()..sort();
       for (final termId in termList) {
@@ -2138,7 +2356,10 @@ class WmbpSealedView {
       await _bulkUpsertIds(idUpdates);
     }
     _tryAdvanceSealedThrough();
-    if (sealed > 0 || idUpdates.isNotEmpty || _dirtySealDirty) {
+    if (sealed > 0 ||
+        idUpdates.isNotEmpty ||
+        _closedDirtyIndexDirty ||
+        _openDirtySealDirty) {
       await _flushPostTail();
       await _writeAuxiliary();
     }
@@ -2455,19 +2676,30 @@ class WmbpSealedView {
       sealedThroughWindowId = through == 0xFFFFFFFF ? -1 : through;
       _dirtySealPage = reader.u32();
       _dirtySealCount = reader.u32();
-      await _loadDirtySealBlob();
+      await _loadClosedDirtyIndex();
     } else {
       sealedThroughWindowId = -1;
       _dirtyOpenRawByWindow.clear();
+      _closedDirtyIndex.clear();
       _dirtySealPage = 0;
       _dirtySealCount = 0;
+    }
+    // Optional open-window dirty checkpoint (added after closed dirty trailer).
+    if (reader.remaining >= 8) {
+      _openDirtySealPage = reader.u32();
+      _openDirtySealCount = reader.u32();
+      await _loadOpenDirtySealBlob();
+    } else {
+      _openDirtySealPage = 0;
+      _openDirtySealCount = 0;
     }
     await _readSummary(_summaryPage, _summaryCount);
     await _readNameSkips(_nameSkipPage, _nameSkipCount);
     await _readIdDir(_idDirPage, _idDirCount);
     _nameSkipsDirty = false;
     _idDirDirty = false;
-    _dirtySealDirty = false;
+    _closedDirtyIndexDirty = false;
+    _openDirtySealDirty = false;
   }
 
   Future<void> _writeAuxiliary() async {
@@ -2496,17 +2728,11 @@ class WmbpSealedView {
       _idDirCount = ids.count;
       _idDirDirty = false;
     }
-    if (_dirtySealDirty) {
-      final dirty = await _writeBlobReusable(
-        'dict',
-        16,
-        _dirtySealBytes(),
-        page: _dirtySealPage,
-        count: _dirtySealCount,
-      );
-      _dirtySealPage = dirty.page;
-      _dirtySealCount = dirty.count;
-      _dirtySealDirty = false;
+    if (_closedDirtyIndexDirty) {
+      await _persistClosedDirtyIndex();
+    }
+    if (_openDirtySealDirty) {
+      await _persistOpenDirtySealBlob();
     }
     if (densePagesPerPartition < 1) densePagesPerPartition = 1;
     final writer = _W()
@@ -2538,46 +2764,241 @@ class WmbpSealedView {
       ..u32(_revNextPageNo)
       ..u32(sealedThroughWindowId < 0 ? 0xFFFFFFFF : sealedThroughWindowId)
       ..u32(_dirtySealPage)
-      ..u32(_dirtySealCount);
+      ..u32(_dirtySealCount)
+      ..u32(_openDirtySealPage)
+      ..u32(_openDirtySealCount);
     await _writeFramed('dict', 0, 1, writer.bytes(), stable: true);
+    // Meta now points at the new blob chains — safe to recycle prior runs.
+    _publishDictFreeRuns();
   }
 
-  Uint8List _dirtySealBytes() {
-    final windows = _dirtyOpenRawByWindow.keys.toList()..sort();
-    final writer = _W()..u32(windows.length);
+  Uint8List _closedDirtyIndexBytes() {
+    final windows = _closedDirtyIndex.keys.toList()..sort();
+    final writer = _W()
+      ..u32(_closedDirtyIndexMagic)
+      ..u32(windows.length);
     for (final windowId in windows) {
-      final terms = _dirtyOpenRawByWindow[windowId]!.toList()..sort();
+      final entry = _closedDirtyIndex[windowId]!;
       writer
         ..u32(windowId)
-        ..u32(terms.length);
-      for (final termId in terms) {
-        writer.u32(termId);
-      }
+        ..u32(entry.page)
+        ..u32(entry.count);
     }
     return writer.bytes();
   }
 
-  Future<void> _loadDirtySealBlob() async {
-    _dirtyOpenRawByWindow.clear();
+  Uint8List _closedWindowTermBytes(int windowId, Set<int> terms) {
+    final sorted = terms.toList()..sort();
+    final writer = _W()
+      ..u32(windowId)
+      ..u32(sorted.length);
+    for (final termId in sorted) {
+      writer.u32(termId);
+    }
+    return writer.bytes();
+  }
+
+  Uint8List _openDirtySealBytes() {
+    final int open = _openWindowId;
+    final set = _dirtyOpenRawByWindow[open];
+    final writer = _W()..u32(open);
+    if (set == null || set.isEmpty) {
+      writer.u32(0);
+      return writer.bytes();
+    }
+    final terms = set.toList()..sort();
+    writer.u32(terms.length);
+    for (final termId in terms) {
+      writer.u32(termId);
+    }
+    return writer.bytes();
+  }
+
+  Future<void> _persistClosedDirtyIndex() async {
+    final int open = _openWindowId;
+    // Drop open-window leftovers from the closed index.
+    _closedDirtyIndex.removeWhere((w, _) => w >= open);
+
+    final toRemove = <int>[];
+    for (final entry in _closedDirtyIndex.entries) {
+      final int windowId = entry.key;
+      final slot = entry.value;
+      if (!slot.blobDirty) continue;
+      final terms = _dirtyOpenRawByWindow[windowId];
+      if (terms == null || terms.isEmpty) {
+        if (slot.page > 0 && slot.count > 0) {
+          _releaseDictRun(slot.page, slot.count);
+        }
+        toRemove.add(windowId);
+        continue;
+      }
+      final bytes = _closedWindowTermBytes(windowId, terms);
+      final written = await _writeBlobReusable(
+        'dict',
+        18,
+        bytes,
+        page: slot.page,
+        count: slot.count,
+      );
+      slot.page = written.page;
+      slot.count = written.count;
+      slot.blobDirty = false;
+      // Evict resident terms once durable; seal reloads via lazy blob load.
+      _dirtyOpenRawByWindow.remove(windowId);
+    }
+    for (final w in toRemove) {
+      _closedDirtyIndex.remove(w);
+    }
+
+    if (_closedDirtyIndex.isEmpty) {
+      if (_dirtySealPage > 0 && _dirtySealCount > 0) {
+        _releaseDictRun(_dirtySealPage, _dirtySealCount);
+      }
+      _dirtySealPage = 0;
+      _dirtySealCount = 0;
+      _closedDirtyIndexDirty = false;
+      _tryAdvanceSealedThrough();
+      return;
+    }
+
+    final indexBytes = _closedDirtyIndexBytes();
+    final written = await _writeBlobReusable(
+      'dict',
+      16,
+      indexBytes,
+      page: _dirtySealPage,
+      count: _dirtySealCount,
+    );
+    _dirtySealPage = written.page;
+    _dirtySealCount = written.count;
+    _closedDirtyIndexDirty = false;
+    _tryAdvanceSealedThrough();
+  }
+
+  Future<void> _persistOpenDirtySealBlob() async {
+    final bytes = _openDirtySealBytes();
+    final data = ByteData.sublistView(bytes);
+    final int termCount =
+        bytes.length >= 8 ? data.getUint32(4, Endian.little) : 0;
+    if (termCount <= 0) {
+      if (_openDirtySealPage > 0 && _openDirtySealCount > 0) {
+        _releaseDictRun(_openDirtySealPage, _openDirtySealCount);
+      }
+      _openDirtySealPage = 0;
+      _openDirtySealCount = 0;
+      _openDirtySealDirty = false;
+      return;
+    }
+    final written = await _writeBlobReusable(
+      'dict',
+      17,
+      bytes,
+      page: _openDirtySealPage,
+      count: _openDirtySealCount,
+    );
+    _openDirtySealPage = written.page;
+    _openDirtySealCount = written.count;
+    _openDirtySealDirty = false;
+  }
+
+  /// Loads the closed-dirty index. Unknown/corrupt images are dropped — text
+  /// index is unreleased, so there is no legacy mega-blob recovery path.
+  Future<void> _loadClosedDirtyIndex() async {
+    _closedDirtyIndex.clear();
     if (_dirtySealPage <= 0 || _dirtySealCount <= 0) return;
     final bytes = await _readChain('dict', _dirtySealPage, _dirtySealCount);
-    if (bytes.isEmpty) return;
+    if (bytes.length < 8) {
+      _releaseDictRun(_dirtySealPage, _dirtySealCount);
+      _dirtySealPage = 0;
+      _dirtySealCount = 0;
+      return;
+    }
     final reader = _R(bytes);
-    if (reader.remaining < 4) return;
+    final int magic = reader.u32();
+    if (magic != _closedDirtyIndexMagic) {
+      _releaseDictRun(_dirtySealPage, _dirtySealCount);
+      _dirtySealPage = 0;
+      _dirtySealCount = 0;
+      return;
+    }
     final int windowCount = reader.u32();
     for (int w = 0; w < windowCount; w++) {
-      if (reader.remaining < 8) break;
+      if (reader.remaining < 12) break;
       final int windowId = reader.u32();
-      final int termCount = reader.u32();
-      final set = <int>{};
-      for (int t = 0; t < termCount; t++) {
-        if (reader.remaining < 4) break;
-        set.add(reader.u32());
-      }
-      if (set.isNotEmpty) {
-        _dirtyOpenRawByWindow[windowId] = set;
-      }
+      final int page = reader.u32();
+      final int count = reader.u32();
+      if (page <= 0 || count <= 0) continue;
+      _closedDirtyIndex[windowId] = _ClosedDirtyEntry(page: page, count: count);
     }
+  }
+
+  Future<void> _loadOpenDirtySealBlob() async {
+    if (_openDirtySealPage <= 0 || _openDirtySealCount <= 0) return;
+    final bytes =
+        await _readChain('dict', _openDirtySealPage, _openDirtySealCount);
+    if (bytes.length < 8) return;
+    final reader = _R(bytes);
+    final int windowId = reader.u32();
+    final int termCount = reader.u32();
+    if (termCount <= 0) return;
+    final set = <int>{};
+    for (int t = 0; t < termCount; t++) {
+      if (reader.remaining < 4) break;
+      set.add(reader.u32());
+    }
+    if (set.isEmpty) return;
+    final existing = _dirtyOpenRawByWindow[windowId];
+    if (existing == null) {
+      _dirtyOpenRawByWindow[windowId] = set;
+    } else {
+      existing.addAll(set);
+    }
+    // Stale open checkpoint for a window that is already closed.
+    if (windowId < _openWindowId) {
+      final entry =
+          _closedDirtyIndex.putIfAbsent(windowId, _ClosedDirtyEntry.new);
+      entry.blobDirty = true;
+      _closedDirtyIndexDirty = true;
+    }
+  }
+
+  /// Resolves closed-window terms: resident memory, else durable per-window blob.
+  Future<Set<int>?> _ensureClosedDirtyTerms(int windowId) async {
+    final resident = _dirtyOpenRawByWindow[windowId];
+    if (resident != null && resident.isNotEmpty) return resident;
+
+    final entry = _closedDirtyIndex[windowId];
+    if (entry == null) return null;
+    if (entry.page <= 0 || entry.count <= 0) {
+      _closedDirtyIndex.remove(windowId);
+      _closedDirtyIndexDirty = true;
+      return null;
+    }
+
+    final loaded = await _loadClosedWindowTermBlob(entry);
+    if (loaded != null && loaded.isNotEmpty) {
+      _dirtyOpenRawByWindow[windowId] = loaded;
+      return loaded;
+    }
+    _releaseDictRun(entry.page, entry.count);
+    _closedDirtyIndex.remove(windowId);
+    _closedDirtyIndexDirty = true;
+    return null;
+  }
+
+  Future<Set<int>?> _loadClosedWindowTermBlob(_ClosedDirtyEntry entry) async {
+    if (entry.page <= 0 || entry.count <= 0) return null;
+    final bytes = await _readChain('dict', entry.page, entry.count);
+    if (bytes.length < 8) return null;
+    final reader = _R(bytes);
+    reader.u32(); // windowId
+    final int termCount = reader.u32();
+    final set = <int>{};
+    for (int t = 0; t < termCount; t++) {
+      if (reader.remaining < 4) break;
+      set.add(reader.u32());
+    }
+    return set;
   }
 
   Future<void> _flushSummaryDirty() async {
@@ -4297,6 +4718,7 @@ class WmbpSealedView {
   Future<bool> _warmRevPagesBudgeted({
     required bool Function() aborted,
     required bool Function() overBudget,
+    Future<bool> Function(int estimatedBytes)? tryCharge,
   }) async {
     if (_revHeight <= 0) return true;
     final int revNodeCap = (_revNodeCache.maxByteThreshold * 0.90).round();
@@ -4314,6 +4736,10 @@ class WmbpSealedView {
         return false;
       }
       final int page = queue[qi++];
+      if (_revNodeCache.get(page) != null) continue;
+      if (tryCharge != null && !await tryCharge(WmbpConstants.storePageSize)) {
+        return false;
+      }
       try {
         final node = await _readRevNode(page);
         _pages.remove('rev:$page');
@@ -4339,6 +4765,7 @@ class WmbpSealedView {
     int startPage = 0,
     required bool Function() aborted,
     required bool Function() overBudget,
+    Future<bool> Function(int estimatedBytes)? tryCharge,
   }) async {
     final int fwdPkCap = (_fwdPkCache.maxByteThreshold * 0.90).round();
     final yc = YieldController(
@@ -4349,6 +4776,9 @@ class WmbpSealedView {
       if (aborted() ||
           overBudget() ||
           _fwdPkCache.estimatedTotalSizeBytes >= fwdPkCap) {
+        return pageNo;
+      }
+      if (tryCharge != null && !await tryCharge(WmbpConstants.storePageSize)) {
         return pageNo;
       }
       final page = await _readGlobal('fwd', pageNo);
@@ -4555,8 +4985,20 @@ class WmbpSealedView {
 
   int _allocDictRun(int pages) {
     _ensureDictAllocatorReady();
+    final int n = pages < 1 ? 1 : pages;
+    // Prefer recycled blob runs so dirtySeal / skip-list growth does not
+    // permanently abandon prior chains in the partition files.
+    for (int i = 0; i < _dictFreeRuns.length; i++) {
+      final run = _dictFreeRuns[i];
+      if (run.count < n) continue;
+      _dictFreeRuns.removeAt(i);
+      if (run.count > n) {
+        _dictFreeRuns.add((page: run.page + n, count: run.count - n));
+      }
+      return run.page;
+    }
     return _allocPackedRun(
-      pages: pages,
+      pages: n,
       pageCount: () => _dictPageCount,
       setPageCount: (v) => _dictPageCount = v,
       partitionCount: () => _dictPartitionCount,
@@ -4566,6 +5008,43 @@ class WmbpSealedView {
       // Rotated partitions have no reserved meta page.
       firstPageNoOnFreshPartition: 0,
     );
+  }
+
+  /// Queue a relocated dict blob chain for reuse after the next durable meta
+  /// write ([_publishDictFreeRuns]).
+  void _releaseDictRun(int page, int count) {
+    if (page <= 0 || count <= 0) return;
+    // Page 0 is sealed meta — never recycle into data allocations.
+    final (part, local) = WmbpPagePtr.unpack(page);
+    if (part == 0 && local == 0) return;
+    _dictPendingFreeRuns.add((page: page, count: count));
+  }
+
+  /// Move pending releases into the allocatable free list. Call only after
+  /// sealed meta that no longer references those runs has been written.
+  void _publishDictFreeRuns() {
+    if (_dictPendingFreeRuns.isEmpty) return;
+    _dictFreeRuns.addAll(_dictPendingFreeRuns);
+    _dictPendingFreeRuns.clear();
+  }
+
+  /// When [startPage] is the live tip of the dict allocator, grow it in place
+  /// so a larger blob does not orphan the previous contiguous chain.
+  /// Returns the new count on success, otherwise null.
+  int? _tryExtendDictRun(int startPage, int oldCount, int newCount) {
+    if (startPage <= 0 || oldCount <= 0 || newCount <= oldCount) {
+      return newCount <= oldCount && oldCount > 0 ? oldCount : null;
+    }
+    final (part, local) = WmbpPagePtr.unpack(startPage);
+    if (part < 0 || local < 0) return null;
+    if (part != _dictPartitionCount - 1) return null;
+    if (local + oldCount != _dictNextPageNo) return null;
+    final int maxLocal = _maxLocalPagesPerPartition();
+    if (local + newCount > maxLocal) return null;
+    final int extra = newCount - oldCount;
+    _dictNextPageNo += extra;
+    _dictPageCount += extra;
+    return newCount;
   }
 
   int _allocDict() => _allocDictRun(1);
@@ -4947,8 +5426,12 @@ class WmbpSealedView {
 
   /// Rewrites an existing dict blob chain when [count] still covers [payload].
   ///
-  /// Reserves a little slack on first allocation so skip-list growth does not
-  /// force a new chain on every single-doc seal.
+  /// Growth strategy (dict only — all current callers use `dict/`):
+  /// 1. Rewrite in place when reserved pages still fit
+  /// 2. Else tip-extend the live allocator run (no orphan) with geometric slack
+  /// 3. Else allocate a new geometric run and queue the old chain on
+  ///    [_dictPendingFreeRuns] (published to [_dictFreeRuns] only after meta
+  ///    is durable) so dirtySeal-style growth cannot pile O(N²) dead pages
   Future<({int page, int count})> _writeBlobReusable(
     String category,
     int kind,
@@ -4962,8 +5445,6 @@ class WmbpSealedView {
       await _writePayloadChain(category, kind, page, payload);
       return (page: page, count: count);
     }
-    // First write or overflow: allocate with one spare page of headroom when
-    // the image is still small enough that an extra page is cheap.
     // Contiguous packed run so `_writePayloadChain` `start+i` stays valid;
     // never reserve more pages than one partition file can hold.
     final int maxLocal = _maxLocalPagesPerPartition();
@@ -4977,10 +5458,38 @@ class WmbpSealedView {
         ),
       ]);
     }
-    var reserve = need < 8 ? need + 1 : need;
+    // Geometric headroom when growing: doubles prior reserve so each relocate
+    // is rare. First alloc keeps a single spare page while still tiny.
+    var reserve = need;
+    if (page > 0 && count > 0) {
+      reserve = count << 1;
+      if (reserve < need) reserve = need;
+    } else if (need < 8) {
+      reserve = need + 1;
+    }
     if (reserve > maxLocal) reserve = maxLocal;
+
+    if (category == 'dict' && page > 0 && count > 0) {
+      final int? extended = _tryExtendDictRun(page, count, reserve);
+      if (extended != null) {
+        await _writePayloadChain(category, kind, page, payload);
+        return (page: page, count: extended);
+      }
+      // Partition nearly full: extend only to exact need if that still fits.
+      if (reserve > need) {
+        final int? exact = _tryExtendDictRun(page, count, need);
+        if (exact != null) {
+          await _writePayloadChain(category, kind, page, payload);
+          return (page: page, count: exact);
+        }
+      }
+    }
+
     final int start = _allocDictRun(reserve);
     await _writePayloadChain(category, kind, start, payload);
+    if (category == 'dict' && page > 0 && count > 0) {
+      _releaseDictRun(page, count);
+    }
     return (page: start, count: reserve);
   }
 
@@ -5236,7 +5745,7 @@ class WmbpSealedView {
       WmbpConstants.storePageSize,
     );
     if (raw != null && raw.length >= WmbpConstants.storePageSize) {
-      _pages.put(key, raw, size: raw.length);
+      _pages.put(key, raw, size: _estimatePageBytes(raw));
       return raw;
     }
     return null;
@@ -5282,7 +5791,7 @@ class WmbpSealedView {
       }
       // Only cache the raw page if no write happened while readAt was in flight.
       if (_writeGeneration == startGen) {
-        _pages.put(key, bytes, size: bytes.length);
+        _pages.put(key, bytes, size: _estimatePageBytes(bytes));
       }
       return bytes;
     } finally {
@@ -5437,7 +5946,7 @@ class WmbpSealedView {
       node = _RevNode.leaf(recs);
     }
     if (cache) {
-      _revNodeCache.put(page, node);
+      _revNodeCache.put(page, node, size: _estimateRevNodeBytes(node));
       _pages.remove('rev:$page');
     }
     return node;
@@ -5450,7 +5959,7 @@ class WmbpSealedView {
   }
 
   Future<void> _writeRevNode(int page, _RevNode node, {required bool stable}) {
-    _revNodeCache.put(page, node);
+    _revNodeCache.put(page, node, size: _estimateRevNodeBytes(node));
     return _writeFramed('rev', page, node.leaf ? 7 : 13, _revNodeBytes(node),
         stable: stable);
   }

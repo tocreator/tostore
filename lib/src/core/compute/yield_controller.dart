@@ -101,20 +101,22 @@ class YieldController {
   ///           and retrieve learned optimization states for this specific task.
   /// [budgetMs] - The time budget in milliseconds before yielding (default: 6ms).
   /// [checkInterval] - Initial check interval used only if no learned history exists.
-  /// [minCheckInterval] - Floor for adaptive interval. Use a higher value on
-  ///   dual-pressure hot paths (batchInsert + flush) to avoid Future.delayed avalanche.
+  /// [minCheckInterval] - Floor for adaptive interval. Defaults to half of
+  ///   [checkInterval] (at least [absoluteMinCheckInterval]) so dual-pressure
+  ///   cannot collapse into a Future.delayed avalanche. Override higher on
+  ///   batchInsert/flush hot paths when needed.
   YieldController(
     this._topic, {
     int? budgetMs,
     int checkInterval = 256,
-    int minCheckInterval = absoluteMinCheckInterval,
+    int? minCheckInterval,
   })  : _budgetMs = budgetMs ?? globalSettings.targetBudgetMs,
         _enabled = globalSettings.enabled,
         _minCheckInterval =
-            math.max(absoluteMinCheckInterval, minCheckInterval),
+            _resolveMinCheckInterval(checkInterval, minCheckInterval),
         _currentCheckInterval = math.max(
           _topicIntervals[_topic] ?? checkInterval,
-          math.max(absoluteMinCheckInterval, minCheckInterval),
+          _resolveMinCheckInterval(checkInterval, minCheckInterval),
         ) {
     if (!_enabled) {
       return;
@@ -124,6 +126,15 @@ class YieldController {
       _recentSamples.add(_currentCheckInterval);
     }
     _stopwatch.start();
+  }
+
+  /// Dual-pressure floor: half of [checkInterval], or an explicit override.
+  static int _resolveMinCheckInterval(
+      int checkInterval, int? minCheckInterval) {
+    return math.max(
+      absoluteMinCheckInterval,
+      minCheckInterval ?? (checkInterval ~/ 2),
+    );
   }
 
   /// Checks if the time budget has been exceeded and yields if necessary.

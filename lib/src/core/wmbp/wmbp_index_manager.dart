@@ -21,6 +21,7 @@ import '../../model/text_query.dart';
 import '../compute/workload_scheduler.dart';
 import '../compute/yield_controller.dart';
 import '../engine/data_store_impl.dart';
+import '../maintenance/prewarm_budget_ledger.dart';
 import '../storage/store_page.dart';
 import '../txn/page_redo_log_codec.dart';
 import 'wmbp_constants.dart';
@@ -202,10 +203,13 @@ class WmbpIndexManager {
         checkInterval: 256,
         minCheckInterval: 64,
       );
+      // Flush-scoped seal: only these PKs enter durable commit (not all resident).
+      final sealPks = seal ? <String>{} : null;
       for (final row in inserts) {
         final y = applyYc.maybeYield();
         if (y != null) await y;
         final pk = row[pkName]?.toString() ?? '';
+        if (sealPks != null && pk.isNotEmpty) sealPks.add(pk);
         // If this record was already ingested into the pending read cache by
         // [applyChangesSync] when it entered the write buffer, reuse the
         // tokenized impacts directly and avoid deactivating + re-tokenizing.
@@ -226,6 +230,7 @@ class WmbpIndexManager {
         if (y != null) await y;
         final pk = update.primaryKey?.toString() ?? '';
         if (pk.isEmpty) continue;
+        sealPks?.add(pk);
         // Always deactivate when sealed pages exist — including when a local
         // overlay doc is present — so older sealed docIds cannot keep matching.
         if (corpus.prefersPagedSearch &&
@@ -246,6 +251,7 @@ class WmbpIndexManager {
         if (y != null) await y;
         final pk = row[pkName]?.toString() ?? '';
         if (pk.isEmpty) continue;
+        sealPks?.add(pk);
         // Always retire the sealed reverse-map entry when pages exist. The old
         // hasLocalPk→remove-only branch left sealed ghosts searchable after a
         // local overlay rewrite (upsert without deactivate, or update+delete
@@ -269,23 +275,26 @@ class WmbpIndexManager {
           // with no replay image — torn 16KB slots on crash.
           Future<void> sealDurable(BatchContext? ctx) async {
             final volume = _volumes[_key(table, index)];
+            // Flush path always scopes to sealPks so resident backlog cannot
+            // inflate one table batch into a full-corpus seal. Empty set is
+            // intentional (no-op commit), never fall back to full-corpus null.
             if (volume == null) {
-              await corpus.commitDurable();
+              await corpus.commitDurable(sealPks: sealPks);
               return;
             }
             await volume.runExclusiveCommit(() async {
               volume.batchContext = ctx;
               volume.beginCommit();
               try {
-                await corpus.commitDurable();
+                await corpus.commitDurable(sealPks: sealPks);
                 // Budgeted micro-seal into the same staged page-redo batch so
                 // closed OPEN_RAW debt drains without a second commit race.
                 final view = corpus.sealedView;
-                if (view != null && view.dirtyOpenRawPairCount > 0) {
+                if (view != null && view.hasClosedOpenRawDebt) {
                   await view.sealDirtyClosedWindows(
-                    maxTerms: 8,
-                    maxSealMs: 2,
-                    maxSealBytes: 256 * 1024,
+                    maxTerms: 64,
+                    maxSealMs: 20,
+                    maxSealBytes: 2 * 1024 * 1024,
                   );
                 }
                 await volume.flushCommit(concurrency: concurrency);
@@ -331,7 +340,7 @@ class WmbpIndexManager {
       if (corpus == null) continue;
       final view = corpus.sealedView;
       if (view == null) continue;
-      if (view.dirtyOpenRawPairCount <= 0) continue;
+      if (!view.hasClosedOpenRawDebt) continue;
       final volume = _volumes[key];
       if (volume == null) continue;
 
@@ -423,30 +432,44 @@ class WmbpIndexManager {
     return math.max(WmbpConstants.cacheLruBytes, share);
   }
 
-  /// Resident WMBP cache bytes across all open corpora (for shared index budget).
+  /// Resident WMBP bytes for shared index budget (O(1) per open corpus).
+  ///
+  /// Sealed TreeCaches (already ledgered) + coarse corpus overlay estimate.
+  /// Not exact; ResourceManager OS low-memory path remains the safety net.
   int getCurrentCacheSize() {
     var total = 0;
     for (final corpus in _corpora.values) {
+      total += corpus.estimatedResidentBytes;
       total += corpus.sealedView?.estimatedCacheSizeBytes ?? 0;
     }
     return total;
   }
 
-  Future<void> evictCaches({required double ratio}) async {
+  /// Tiered WMBP cache trim across open corpora (stop-on-relief per corpus).
+  Future<void> evictCaches({
+    required double ratio,
+    Future<bool> Function()? shouldContinue,
+    bool protectFlushNav = false,
+  }) async {
     for (final corpus in _corpora.values) {
-      await corpus.evictCaches(ratio: ratio);
+      await corpus.evictCaches(
+        ratio: ratio,
+        shouldContinue: shouldContinue,
+        protectFlushNav: protectFlushNav,
+      );
+      if (shouldContinue != null && !await shouldContinue()) return;
     }
   }
 
   /// Startup / explicit warm of text+sparse search caches.
   ///
-  /// Shares [getIndexCacheSize] with B+Tree index pages: stops as soon as
-  /// btree+wmbp usage reaches that ceiling. Returns approximate bytes added.
+  /// Shares [getIndexCacheSize] with B+Tree index pages via [ledger]. Returns
+  /// approximate resident bytes added (not ledger charges).
   Future<int> prewarmIndex(
     TableContext table,
     IndexSchema index, {
-    int? sharedBudgetBytes,
-    int Function()? sharedUsageBytes,
+    PrewarmBudgetLedger? ledger,
+    bool navOnly = false,
   }) async {
     try {
       if (_dataStore.shouldAbortPrewarmForTable(table.tableUid)) return 0;
@@ -457,22 +480,16 @@ class WmbpIndexManager {
       final view = corpus.sealedView;
       if (view == null) return 0;
 
-      final budget = sharedBudgetBytes ?? resolveWmbpCacheBudget();
-      if (budget <= 0) return 0;
-
-      final usage = sharedUsageBytes ??
-          () {
-            final btree = _dataStore.indexTreePartitionManager
-                    ?.getCurrentPageCacheSize() ??
-                0;
-            final indexData =
-                _dataStore.indexManager?.indexDataCacheEstimatedBytes ?? 0;
-            return btree + indexData + getCurrentCacheSize();
-          };
+      final budgetLedger = ledger ??
+          PrewarmBudgetLedger(
+            capBytes: resolveWmbpCacheBudget(),
+            initialCommittedBytes: _sharedIndexBaselineUsage(),
+          );
+      if (budgetLedger.capBytes <= 0 || budgetLedger.isExhausted) return 0;
 
       final added = await view.prewarmCaches(
-        sharedBudgetBytes: budget,
-        sharedUsageBytes: usage,
+        ledger: budgetLedger,
+        navOnly: navOnly,
         shouldAbort: () =>
             _dataStore.shouldAbortPrewarmForTable(table.tableUid),
       );
@@ -490,35 +507,38 @@ class WmbpIndexManager {
     }
   }
 
+  int _sharedIndexBaselineUsage() {
+    final btree =
+        _dataStore.indexTreePartitionManager?.getCurrentPageCacheSize() ?? 0;
+    final indexData =
+        _dataStore.indexManager?.indexDataCacheEstimatedBytes ?? 0;
+    return btree + indexData + getCurrentCacheSize();
+  }
+
   /// Prewarm every WMBP index on [table] under the shared index budget.
   Future<int> prewarmTable(
     TableContext table, {
-    int? sharedBudgetBytes,
-    int Function()? sharedUsageBytes,
+    PrewarmBudgetLedger? ledger,
+    bool navOnly = false,
   }) async {
     final indexes =
         _dataStore.tableMetaManager?.getWmbpIndexesFor(table.schema) ??
             const <IndexSchema>[];
     if (indexes.isEmpty) return 0;
     var added = 0;
-    final budget = sharedBudgetBytes ?? resolveWmbpCacheBudget();
-    final usage = sharedUsageBytes ??
-        () {
-          final btree =
-              _dataStore.indexTreePartitionManager?.getCurrentPageCacheSize() ??
-                  0;
-          final indexData =
-              _dataStore.indexManager?.indexDataCacheEstimatedBytes ?? 0;
-          return btree + indexData + getCurrentCacheSize();
-        };
+    final budgetLedger = ledger ??
+        PrewarmBudgetLedger(
+          capBytes: resolveWmbpCacheBudget(),
+          initialCommittedBytes: _sharedIndexBaselineUsage(),
+        );
     for (final index in indexes) {
       if (_dataStore.shouldAbortPrewarmForTable(table.tableUid)) break;
-      if (usage() >= budget) break;
+      if (budgetLedger.isExhausted) break;
       added += await prewarmIndex(
         table,
         index,
-        sharedBudgetBytes: budget,
-        sharedUsageBytes: usage,
+        ledger: budgetLedger,
+        navOnly: navOnly,
       );
     }
     return added;

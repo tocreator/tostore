@@ -4,6 +4,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import '../../core/compute/yield_controller.dart';
+import '../../core/maintenance/prewarm_budget_ledger.dart';
 import '../../core/ngh/ngh_graph_engine.dart';
 import '../../core/ngh/ngh_page.dart';
 import '../../core/ngh/vector_quantizer.dart';
@@ -465,15 +466,17 @@ class LegacyNghSearch {
 
   /// Startup/runtime prewarm: load posting clusters into compact cache.
   ///
-  /// Stops once [maxBytes] would be exceeded (OOM guard). Hot clusters
-  /// (highest entryCount) are loaded first. Returns bytes added.
+  /// Stops once [ledger] is exhausted. Hot clusters (highest entryCount) load
+  /// first. Eviction cannot reopen [ledger] and resume colder clusters.
   Future<int> prewarmClusters({
     required TableContext table,
     required IndexUid indexUid,
     required NghIndexMeta meta,
-    required int maxBytes,
+    required PrewarmBudgetLedger ledger,
   }) async {
-    if (maxBytes <= 0 || meta.totalVectors <= 0) return 0;
+    if (ledger.capBytes <= 0 || ledger.isExhausted || meta.totalVectors <= 0) {
+      return 0;
+    }
 
     final key = _cacheKey(table.tableUid, indexUid);
     final beforeBytes = _clusterCacheBytes;
@@ -484,13 +487,14 @@ class LegacyNghSearch {
     final centroids = navGraph.centroids;
     final order = List<int>.generate(centroids.length, (i) => i);
 
-    // When the whole compact index fits the budget, load every cluster so
-    // arbitrary query vectors never pay disk I/O on probed-centroid misses.
+    // When the whole compact index fits the remaining ledger, load every
+    // cluster so arbitrary query vectors never pay disk I/O on misses.
     var totalEst = 64;
     for (final c in centroids) {
       totalEst += max(1, c.entryCount) * (24 + meta.dimensions);
     }
-    final loadAll = totalEst <= maxBytes;
+    final loadAll =
+        totalEst <= ledger.remainingBytes && ledger.tryCharge(totalEst);
     if (!loadAll) {
       order.sort(
           (a, b) => centroids[b].entryCount.compareTo(centroids[a].entryCount));
@@ -499,15 +503,13 @@ class LegacyNghSearch {
     final packedBatch = <int>[];
     final chainHeads = <int>[];
     final expected = <int>{};
-    var planned = 0;
 
     for (final cId in order) {
       if (clusterMap.containsKey(cId)) continue;
       final c = centroids[cId];
       if (!loadAll) {
         final est = max(1, c.entryCount) * (24 + meta.dimensions);
-        if (planned + est > maxBytes) break;
-        planned += est;
+        if (!ledger.tryCharge(est)) break;
       }
 
       expected.add(cId);
@@ -521,10 +523,10 @@ class LegacyNghSearch {
       }
     }
 
-    // Chunked batch reads so we can stop early if decode blew past budget.
+    // Chunked batch reads; stop if ledger latched mid-pass (hottest path).
     const chunkSize = 64;
     for (var i = 0; i < packedBatch.length; i += chunkSize) {
-      if (_clusterCacheBytes - beforeBytes >= maxBytes) break;
+      if (!loadAll && ledger.isExhausted) break;
       final chunk = packedBatch.sublist(
         i,
         min(i + chunkSize, packedBatch.length),
@@ -543,9 +545,9 @@ class LegacyNghSearch {
       );
     }
 
-    if (chainHeads.isNotEmpty && _clusterCacheBytes - beforeBytes < maxBytes) {
+    if (chainHeads.isNotEmpty && (loadAll || !ledger.isExhausted)) {
       for (final head in chainHeads) {
-        if (_clusterCacheBytes - beforeBytes >= maxBytes) break;
+        if (!loadAll && ledger.isExhausted) break;
         final chain = await _io.readPostingCluster(
           table,
           indexUid,
