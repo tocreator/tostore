@@ -7970,6 +7970,7 @@ class DataStoreImpl {
     int topK = 10,
     int? searchDepth,
     double? distanceThreshold,
+    double? minScore,
   }) {
     // Avoid `async` on the hot path — an async body always schedules a
     // microtask even when table context + ANN are already resident.
@@ -7981,6 +7982,7 @@ class DataStoreImpl {
             topK: topK,
             searchDepth: searchDepth,
             distanceThreshold: distanceThreshold,
+            minScore: minScore,
           ));
     }
     final mgr = _vectorIndexManager;
@@ -7996,6 +7998,7 @@ class DataStoreImpl {
         topK: topK,
         searchDepth: searchDepth,
         distanceThreshold: distanceThreshold,
+        minScore: minScore,
       );
     }
     return getTableContext(tableName).then((table) => mgr.vectorSearch(
@@ -8005,6 +8008,7 @@ class DataStoreImpl {
           topK: topK,
           searchDepth: searchDepth,
           distanceThreshold: distanceThreshold,
+          minScore: minScore,
         ));
   }
 

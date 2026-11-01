@@ -59,7 +59,7 @@ import 'package:tostore/tostore.dart';
 | `batchInsert(String, List, {allowPartialErrors, returnResultDetails})` | `Future<DbResult>` |
 | `batchUpsert(...)` | `Future<DbResult>` |
 | `batchUpdate(...)` | `Future<DbResult>` |
-| `vectorSearch(String, {fieldName, queryVector, topK, searchDepth, distanceThreshold})` | `Future<List<VectorSearchResult>>` |
+| `vectorSearch(String, {fieldName, queryVector, topK, searchDepth, distanceThreshold, minScore})` | `Future<List<VectorSearchResult>>` |
 
 ### Instance — KV
 

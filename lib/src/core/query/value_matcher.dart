@@ -1,9 +1,9 @@
-import 'dart:math';
 import 'dart:typed_data';
 
 import '../../handler/logger.dart';
 import '../../model/table_schema.dart';
 import '../compute/compute_manager.dart';
+import '../ngh/vector_score_calibrator.dart';
 import 'query_condition.dart';
 
 // Matches are based on a > b, so 1 means a > b, -1 means a < b, 0 means a == b
@@ -708,14 +708,33 @@ class ConditionRecordMatcher {
             normA += a * a;
             normB += b * b;
           }
-          final denom = sqrt(normA) * sqrt(normB);
-          final sim = denom > 0 ? (dot / denom) : 0.0;
-          final score = (sim + 1.0) / 2.0;
-          final dist = 1.0 - sim;
-          if (distanceThreshold != null && dist > distanceThreshold) {
+          final metricName = compareValue['distanceMetric'] as String?;
+          final metric = switch (metricName) {
+            'l2' => VectorDistanceMetric.l2,
+            'innerProduct' => VectorDistanceMetric.innerProduct,
+            _ => VectorDistanceMetric.cosine,
+          };
+          final corpusSize = (compareValue['corpusSize'] as num?)?.toInt() ?? 0;
+          final mu = (compareValue['nullFloorMu'] as num?)?.toDouble();
+          final dEff = (compareValue['nullFloorDEff'] as num?)?.toDouble();
+          final calibration = VectorScoreCalibrator.forQuery(
+            recordVec.length,
+            corpusSize,
+            mu: mu,
+            dEff: dEff,
+          );
+          final scored = VectorScoreCalibrator.evaluate(
+            metric: metric,
+            innerProduct: dot,
+            querySquaredNorm: normB,
+            candidateSquaredNorm: normA,
+            calibration: calibration,
+          );
+          if (distanceThreshold != null &&
+              scored.distance > distanceThreshold) {
             return false;
           }
-          if (minScore != null && score < minScore) return false;
+          if (minScore != null && scored.score < minScore) return false;
           return true;
         }
         return true;

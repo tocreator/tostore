@@ -517,6 +517,8 @@ class ToStore implements DataStoreInterface {
   /// recall and latency. Approximate nearest neighbor — not a guaranteed
   /// recall@K. When null, uses [VectorIndexConfig.defaultSearchDepth] (`50`).
   /// [distanceThreshold] Maximum distance for results to be included.
+  /// [minScore] Minimum normalized relevance score (`[0,1]`);
+  /// candidates below it are dropped (same semantics as [QueryBuilder.matchVector]).
   /// Returns a list of [VectorSearchResult] sorted by similarity.
   ///
   /// Example:
@@ -526,6 +528,7 @@ class ToStore implements DataStoreInterface {
   ///   fieldName: 'embedding',
   ///   queryVector: VectorData([0.1, 0.2, ...]),
   ///   topK: 10,
+  ///   minScore: 0.40,
   /// );
   /// for (final r in results) {
   ///   print('pk=${r.primaryKey}, score=${r.score}');
@@ -542,6 +545,8 @@ class ToStore implements DataStoreInterface {
   /// 近似最近邻，不保证 recall@K。未传时使用
   /// [VectorIndexConfig.defaultSearchDepth]（`50`）。
   /// [distanceThreshold] 距离阈值，超过此值的记录将被过滤。
+  /// [minScore] 归一化相关度评分下限（`[0,1]`）；低于阈值的候选会被裁剪
+  /// （与 [QueryBuilder.matchVector] 语义相同）。
   /// 返回按相似度排序的 [VectorSearchResult] 列表。
   @override
   Future<List<VectorSearchResult>> vectorSearch(
@@ -551,6 +556,7 @@ class ToStore implements DataStoreInterface {
     int topK = 10,
     int? searchDepth,
     double? distanceThreshold,
+    double? minScore,
   }) {
     _checkSystemTableAccess(
         tableName, 'cannot be searched manually', 'ToStore.vectorSearch');
@@ -561,6 +567,7 @@ class ToStore implements DataStoreInterface {
       topK: topK,
       searchDepth: searchDepth,
       distanceThreshold: distanceThreshold,
+      minScore: minScore,
     );
   }
 

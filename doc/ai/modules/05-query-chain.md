@@ -17,7 +17,7 @@ status: complete
 
 ## Purpose
 
-Build structured queries with predicates, projection, JOIN, aggregation, pagination, cache, peek, and hybrid vector match on one chain.
+Build structured queries with predicates, projection, JOIN, aggregation, pagination, cache, peek, and hybrid retrieval (`matchText` / `matchVector` / `matchSparse`) on one chain.
 
 ## Entry
 
@@ -73,8 +73,8 @@ QueryBuilder query(String tableName);
 | `distinct([fields])` | Distinct |
 | `join` / `leftJoin` / `rightJoin` | Relational joins |
 | `joinWithForeignKey` / `joinReferencedTable` / `joinReferencingTable` | FK-aware joins |
-| `matchVector` / `orMatchVector` | Hybrid vector (see Vector module) |
-| `matchText` / `orMatchText` | Text Top-K (`TextQuery`, `IndexType.text`) |
+| `matchVector` / `orMatchVector` | Dense vector ANN (see Vector / Text / Hybrid module) |
+| `matchText` / `orMatchText` | Lexical text Top-K (`TextQuery`, `IndexType.text`) |
 | `matchSparse` / `orMatchSparse` | Neural sparse Top-K (`SparseVectorData`, `IndexType.sparse`) |
 | `useQueryCache([Duration?])` / `noQueryCache()` / `clearQueryCache()` | Result cache |
 | `first` / `count` / `exists` | Convenience |
@@ -92,7 +92,7 @@ QueryBuilder query(String tableName);
 | `nextCursorToken` / `prevCursorToken` | Cross-process / network only |
 | `.cursor(token)` on next query | Stateless token seek |
 | `hasErrors` / `type` / `message` | Status |
-| `retrieval` | Hybrid/vector diagnostics |
+| `retrieval` | Text / sparse / vector hybrid diagnostics |
 | `peekNext()` / `peekPrev()` | Sync page turn if cached |
 
 ### Offset vs cursor

@@ -1,6 +1,6 @@
 # ToStore
 
-> Distributed data engine (tables + KV + vectors): online schema evolution, hybrid retrieval, ACID transactions, multi-space isolation, and encryption — for apps, servers, and Agents.
+> Distributed data engine (tables + KV + dense/sparse vectors + text): online schema evolution, hybrid retrieval (lexical / dense / neural sparse), ACID transactions, multi-space isolation, and encryption — for apps, servers, and Agents.
 
 Import: `package:tostore/tostore.dart`. Prefer `ToStore.open` / `ToStore.memory`. Full AI coding rules live in the complete corpus below.
 

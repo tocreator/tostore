@@ -5053,6 +5053,7 @@ class QueryExecutor {
       topK: candidateK,
       searchDepth: spec.searchDepth,
       distanceThreshold: spec.distanceThreshold,
+      minScore: spec.minScore,
     );
 
     if (vecResults.isEmpty) {
@@ -5067,10 +5068,7 @@ class QueryExecutor {
       );
     }
 
-    var candidates = vecResults;
-    if (spec.minScore != null) {
-      candidates = candidates.where((r) => r.score >= spec.minScore!).toList();
-    }
+    final candidates = vecResults;
 
     final bool hasMore = effectiveOffset == 0
         ? candidates.length >= effectiveLimit
@@ -5095,7 +5093,7 @@ class QueryExecutor {
           entries.add(RetrievalEntry(
             score: cand.score,
             channel: RetrievalChannel.vector,
-            rawScore: cand.score,
+            rawScore: cand.rawScore,
             meta: {
               'distance': cand.distance,
               'field': fieldName,
@@ -5148,7 +5146,7 @@ class QueryExecutor {
         entries.add(RetrievalEntry(
           score: cand.score,
           channel: RetrievalChannel.vector,
-          rawScore: cand.score,
+          rawScore: cand.rawScore,
           meta: {
             'distance': cand.distance,
             'field': spec.field,
@@ -5204,6 +5202,7 @@ class QueryExecutor {
       topK: recallPool,
       searchDepth: spec.searchDepth,
       distanceThreshold: spec.distanceThreshold,
+      minScore: spec.minScore,
     );
 
     if (vecResults.isEmpty) {
@@ -5229,7 +5228,6 @@ class QueryExecutor {
     final candidatePks = <String>[];
     final scoreFiltered = <VectorSearchResult>[];
     for (final cand in vecResults) {
-      if (spec.minScore != null && cand.score < spec.minScore!) continue;
       scoreFiltered.add(cand);
       candidatePks.add(cand.primaryKey);
     }
@@ -5273,7 +5271,7 @@ class QueryExecutor {
       entries.add(RetrievalEntry(
         score: item.result.score,
         channel: RetrievalChannel.vector,
-        rawScore: item.result.score,
+        rawScore: item.result.rawScore,
         meta: {
           'distance': item.result.distance,
           'field': spec.field,
@@ -5355,15 +5353,18 @@ class QueryExecutor {
               })> hits
         })>>[];
 
-    // Denominator is every vector/text/sparse channel in the query. A miss
-    // contributes 0, so a second hit raises the fused score. Weights mix
-    // already aligned channel scores; they do not rescale a channel.
+    // Total weight of every vector/text/sparse channel in the query (used as
+    // corroboration denominator). Misses do not dilute the dominant hit.
     var retrievalQueryWeight = 0.0;
+    var retrievalMaxWeight = 0.0;
     for (final branch in recallBranches) {
       final double? weight = _TextMatchSpec.extract(branch)?.weight ??
           _SparseMatchSpec.extract(branch)?.weight ??
           _VectorMatchSpec.extract(branch)?.weight;
-      if (weight != null && weight > 0) retrievalQueryWeight += weight;
+      if (weight != null && weight > 0) {
+        retrievalQueryWeight += weight;
+        if (weight > retrievalMaxWeight) retrievalMaxWeight = weight;
+      }
     }
 
     for (int branchIdx = 0; branchIdx < recallBranches.length; branchIdx++) {
@@ -5444,15 +5445,15 @@ class QueryExecutor {
                       topK: recallPerChannel,
                       searchDepth: spec.searchDepth,
                       distanceThreshold: spec.distanceThreshold,
+                      minScore: spec.minScore,
                     ) ??
                     const <VectorSearchResult>[];
 
             int rank = 1;
             for (final r in vecResults) {
-              if (spec.minScore != null && r.score < spec.minScore!) continue;
               hits[r.primaryKey] = (
                 rank: rank++,
-                rawScore: r.score,
+                rawScore: r.rawScore,
                 score: r.score,
                 channel: RetrievalChannel.vector,
                 meta: {'distance': r.distance, 'field': spec.field},
@@ -5494,8 +5495,7 @@ class QueryExecutor {
     }
 
     final rrfScores = <String, double>{};
-    final relevanceSum = <String, double>{};
-    final relevanceWeight = <String, double>{};
+    final pkChannelScores = <String, List<({double score, double weight})>>{};
     final pkContributions = <String, Map<String, dynamic>>{};
 
     for (final entry in channelHits.entries) {
@@ -5513,8 +5513,9 @@ class QueryExecutor {
         if (info.channel == RetrievalChannel.text ||
             info.channel == RetrievalChannel.sparse ||
             info.channel == RetrievalChannel.vector) {
-          relevanceSum[pk] = (relevanceSum[pk] ?? 0.0) + weight * info.score;
-          relevanceWeight[pk] = (relevanceWeight[pk] ?? 0.0) + weight;
+          pkChannelScores
+              .putIfAbsent(pk, () => <({double score, double weight})>[])
+              .add((score: info.score, weight: weight));
         }
 
         final contrib =
@@ -5541,9 +5542,40 @@ class QueryExecutor {
       );
     }
 
+    // Dominant floor + bounded corroboration (0.35) for secondary hits
+    // above the weak-noise band (>0.30). Single-channel hit returns S_dom.
     double fusedRelevance(String pk) {
-      if (retrievalQueryWeight <= 0) return 0;
-      return (relevanceSum[pk] ?? 0) / retrievalQueryWeight;
+      final hits = pkChannelScores[pk];
+      if (hits == null || hits.isEmpty || retrievalMaxWeight <= 0) return 0.0;
+
+      var bestIdx = 0;
+      var sDom = -1.0;
+      for (var i = 0; i < hits.length; i++) {
+        final e = hits[i].score * (hits[i].weight / retrievalMaxWeight);
+        if (e > sDom) {
+          sDom = e;
+          bestIdx = i;
+        }
+      }
+      if (sDom < 0) return 0.0;
+      if (hits.length == 1 || retrievalQueryWeight <= 0) {
+        return sDom > 1.0 ? 1.0 : (sDom < 0.0 ? 0.0 : sDom);
+      }
+
+      var corrNum = 0.0;
+      for (var i = 0; i < hits.length; i++) {
+        if (i == bestIdx) continue;
+        final excess = hits[i].score - 0.30;
+        if (excess > 0.0) {
+          corrNum += hits[i].weight * excess;
+        }
+      }
+      if (corrNum <= 0.0) {
+        return sDom > 1.0 ? 1.0 : (sDom < 0.0 ? 0.0 : sDom);
+      }
+      final fused =
+          sDom + (1.0 - sDom) * 0.35 * (corrNum / retrievalQueryWeight);
+      return fused > 1.0 ? 1.0 : (fused < 0.0 ? 0.0 : fused);
     }
 
     final bool useRrf = effectiveFusion == RetrievalFusionMethod.rrf;
@@ -5551,7 +5583,7 @@ class QueryExecutor {
         useRrf ? (rrfScores[pk] ?? 0.0) : fusedRelevance(pk);
 
     final sortedPks = <String>{
-      ...relevanceSum.keys,
+      ...pkChannelScores.keys,
       ...rrfScores.keys,
     }.toList()
       ..sort((a, b) {

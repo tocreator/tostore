@@ -12,12 +12,12 @@ status: complete
 
 ToStore is a distributed data engine for applications, servers, and Agents.
 
-**What it stores:** relational tables, key-value, high-dimensional vectors, and unstructured/JSON-style data, with a unified programming model across edge devices and cloud nodes.
+**What it stores:** relational tables, key-value, dense vectors, neural sparse vectors, text fields, and unstructured/JSON-style data, with a unified programming model across edge devices and cloud nodes.
 
 **What agents rely on:**
 
 - Online schema evolution (declarative schemas / runtime schema updates) without downtime or manual migration scripts
-- Hybrid retrieval: structured predicates + vector ANN on the same query chain, with fusion scores on query results
+- Hybrid retrieval on one query chain: lexical text (`matchText`), dense vector ANN (`matchVector`), neural sparse (`matchSparse`), plus structured predicates; multi-way fusion scores on query results
 - ACID transactions, JOINs, cascading foreign keys, table-level TTL, aggregations, atomic field expressions
 - Multi-space isolation (optional global tables/KV), encryption, crash self-healing, structured status codes for automated handling
 

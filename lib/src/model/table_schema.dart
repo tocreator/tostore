@@ -3662,39 +3662,7 @@ enum VectorDistanceMetric {
   innerProduct,
 
   /// Cosine distance `1 - similarity` (engine auto-normalizes).
-  cosine;
-
-  /// Public relevance from an ANN [distance] (`higher` = more similar).
-  ///
-  /// This is the vector channel [RetrievalEntry.rawScore] / [VectorSearchResult.score].
-  /// Cosine and normalized inner product share one `[0, 1]` discard band with
-  /// text and sparse scores:
-  /// - [l2]: `1 - distance / 2` clamped to `[0, 1]`, where [distance] is
-  ///   squared L2. For unit-length vectors this equals cosine (`distance` is
-  ///   `2 * (1 - cosine)`). Squared distance ≥ 2 scores 0. Identical vectors
-  ///   score 1. Use unit-length data when sharing `minScore` with cosine.
-  /// - [innerProduct]: recovered IP (`-distance`) clamped to `[0, 1]`. Matches
-  ///   cosine when the caller normalized both sides. IP above 1 saturates at 1.
-  /// - [cosine]: `1 - distance` clamped to `[0, 1]`
-  double similarityFromDistance(double distance) {
-    switch (this) {
-      case VectorDistanceMetric.l2:
-        final double s = 1.0 - distance / 2.0;
-        if (s <= 0) return 0;
-        if (s >= 1) return 1;
-        return s;
-      case VectorDistanceMetric.innerProduct:
-        final double ip = -distance;
-        if (ip <= 0) return 0;
-        if (ip >= 1) return 1;
-        return ip;
-      case VectorDistanceMetric.cosine:
-        final double s = 1.0 - distance;
-        if (s < 0) return 0;
-        if (s > 1) return 1;
-        return s;
-    }
-  }
+  cosine,
 }
 
 /// Dense vector index algorithm family.

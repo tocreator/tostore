@@ -19,6 +19,7 @@ import 'ngh_page.dart';
 import 'ngh_partition_manager.dart';
 import 'ngh_pk_map.dart';
 import 'vector_quantizer.dart';
+import 'vector_score_calibrator.dart';
 
 // ============================================================================
 // NGH Graph Engine
@@ -54,12 +55,18 @@ import 'vector_quantizer.dart';
 //   - Nav page wire version stays 2
 // ============================================================================
 
-/// A search result with node ID, primary key, and distance.
+/// A search result with node ID, primary key, ANN distance, and scores.
 class NghSearchResult {
   final int nodeId;
 
-  /// Approximate or exact distance (L2, Cosine, or negated IP).
+  /// Approximate or exact ANN distance (L2 squared, Cosine `1-cos`, or negated IP).
   double distance;
+
+  /// Physical metric raw score (`higher` = closer for cosine/IP; L2 is Euclidean).
+  final double rawScore;
+
+  /// Normalized relevance in `[0.0, 1.0]` (`higher` = more relevant).
+  final double score;
 
   /// The primary key of the record this vector belongs to.
   final String? primaryKey;
@@ -67,6 +74,8 @@ class NghSearchResult {
   NghSearchResult({
     required this.nodeId,
     required this.distance,
+    this.rawScore = 0.0,
+    this.score = 0.0,
     this.primaryKey,
   });
 }
@@ -3209,6 +3218,12 @@ class NghGraphEngine {
         isIP: isIP,
         distanceThreshold: distanceThreshold,
         pendingDeletePks: pendingDeletePks,
+        calibration: VectorScoreCalibrator.forQuery(
+          meta.dimensions,
+          meta.totalVectors,
+          mu: meta.nullFloorMu,
+          dEff: meta.nullFloorDEff,
+        ),
       ),
       async: null,
     );
@@ -3284,6 +3299,12 @@ class NghGraphEngine {
       isIP: isIP,
       distanceThreshold: distanceThreshold,
       pendingDeletePks: pendingDeletePks,
+      calibration: VectorScoreCalibrator.forQuery(
+        meta.dimensions,
+        meta.totalVectors,
+        mu: meta.nullFloorMu,
+        dEff: meta.nullFloorDEff,
+      ),
     );
   }
 
@@ -3309,12 +3330,13 @@ class NghGraphEngine {
     required int dimensions,
     required bool isCosine,
     required bool isIP,
+    required VectorScoreCalibration calibration,
     double? distanceThreshold,
     Set<String>? pendingDeletePks,
   }) {
     scratch.slotHeap.reset(planCandSlots);
     var qSquaredNorm = 0.0;
-    if (!isCosine && !isIP) {
+    {
       final int n =
           dimensions < searchQuery.length ? dimensions : searchQuery.length;
       for (int d = 0; d < n; d++) {
@@ -3594,10 +3616,18 @@ class NghGraphEngine {
         dist,
         slot.primaryKeyBytes ?? slot.primaryKeyUtf8,
         slot.cachedPrimaryKey,
+        slot.squaredNorm,
       );
     }
 
-    return resultHeap.drainSortedToSearchResults();
+    final metric = isCosine
+        ? VectorDistanceMetric.cosine
+        : (isIP ? VectorDistanceMetric.innerProduct : VectorDistanceMetric.l2);
+    return resultHeap.drainSortedToSearchResults(
+      metric: metric,
+      querySquaredNorm: qSquaredNorm,
+      calibration: calibration,
+    );
   }
 
   /// Migrate legacy single-file `nav_graph.ngh` (or unpaged centroids) directly
@@ -6809,6 +6839,7 @@ class _FixedHeap {
   /// Node ids as Dart [int] (not [Int32List]) so wide leaf nodeId (>2^32) survives.
   late final List<int> _ids;
   late final Float64List _dists;
+  late final Float64List _slotSqNorms;
   late final List<Uint8List?> _pks;
   late final List<String?> _pkStrings;
   int _size = 0;
@@ -6816,6 +6847,7 @@ class _FixedHeap {
   _FixedHeap(this.capacity, {this.maxHeap = false}) {
     _ids = List<int>.filled(capacity, 0);
     _dists = Float64List(capacity);
+    _slotSqNorms = Float64List(capacity);
     _pks = List<Uint8List?>.filled(capacity, null);
     _pkStrings = List<String?>.filled(capacity, null);
   }
@@ -6831,11 +6863,18 @@ class _FixedHeap {
     _size = 0;
   }
 
-  void pushWithPk(int id, double dist, Uint8List? pkBytes, [String? pkString]) {
+  void pushWithPk(
+    int id,
+    double dist,
+    Uint8List? pkBytes, [
+    String? pkString,
+    double slotSqNorm = 0.0,
+  ]) {
     if (_size < capacity) {
       final i = _size;
       _ids[i] = id;
       _dists[i] = dist;
+      _slotSqNorms[i] = slotSqNorm;
       _pks[i] = pkBytes;
       _pkStrings[i] = pkString;
       _size = i + 1;
@@ -6844,6 +6883,7 @@ class _FixedHeap {
         (!maxHeap && dist > _dists[0])) {
       _ids[0] = id;
       _dists[0] = dist;
+      _slotSqNorms[0] = slotSqNorm;
       _pks[0] = pkBytes;
       _pkStrings[0] = pkString;
       _siftDown(0);
@@ -6861,6 +6901,7 @@ class _FixedHeap {
       if (_size > 0) {
         _ids[0] = _ids[_size];
         _dists[0] = _dists[_size];
+        _slotSqNorms[0] = _slotSqNorms[_size];
         _pks[0] = _pks[_size];
         _pkStrings[0] = _pkStrings[_size];
         _siftDown(0);
@@ -6878,26 +6919,59 @@ class _FixedHeap {
     return result;
   }
 
-  /// Drain as [NghSearchResult] (one list; prefer cached String PK over utf8).
-  List<NghSearchResult> drainSortedToSearchResults() {
+  /// Drain as [NghSearchResult] with public distance / rawScore / score.
+  List<NghSearchResult> drainSortedToSearchResults({
+    required VectorDistanceMetric metric,
+    required double querySquaredNorm,
+    VectorScoreCalibration calibration = VectorScoreCalibration.identity,
+  }) {
     if (_size == 0) return const [];
     final out = <NghSearchResult>[];
     while (_size > 0) {
       final id = _ids[0];
-      final dist = _dists[0];
+      final heapDist = _dists[0];
+      final slotSqNorm = _slotSqNorms[0];
       final pkStr = _pkStrings[0];
       final pkBytes = _pks[0];
       _size--;
       if (_size > 0) {
         _ids[0] = _ids[_size];
         _dists[0] = _dists[_size];
+        _slotSqNorms[0] = _slotSqNorms[_size];
         _pks[0] = _pks[_size];
         _pkStrings[0] = _pkStrings[_size];
         _siftDown(0);
       }
+
+      final ({double distance, double rawScore, double score}) scored;
+      switch (metric) {
+        case VectorDistanceMetric.cosine:
+          scored = VectorScoreCalibrator.fromCosine(
+            cosineSimilarity: 1.0 - heapDist,
+            calibration: calibration,
+            validNorms: querySquaredNorm > 0.0 && slotSqNorm > 0.0,
+          );
+        case VectorDistanceMetric.innerProduct:
+          scored = VectorScoreCalibrator.fromInnerProduct(
+            innerProduct: -heapDist,
+            querySquaredNorm: querySquaredNorm,
+            candidateSquaredNorm: slotSqNorm,
+            calibration: calibration,
+          );
+        case VectorDistanceMetric.l2:
+          scored = VectorScoreCalibrator.fromSquaredL2(
+            squaredDistance: heapDist,
+            querySquaredNorm: querySquaredNorm,
+            candidateSquaredNorm: slotSqNorm,
+            calibration: calibration,
+          );
+      }
+
       out.add(NghSearchResult(
         nodeId: id,
-        distance: dist,
+        distance: scored.distance,
+        rawScore: scored.rawScore,
+        score: scored.score,
         primaryKey: pkStr ?? (pkBytes != null ? utf8.decode(pkBytes) : null),
       ));
     }
@@ -6950,16 +7024,19 @@ class _FixedHeap {
   void _swap(int a, int b) {
     final tempId = _ids[a];
     final tempDist = _dists[a];
+    final tempSq = _slotSqNorms[a];
     final tempPk = _pks[a];
     final tempPkStr = _pkStrings[a];
 
     _ids[a] = _ids[b];
     _dists[a] = _dists[b];
+    _slotSqNorms[a] = _slotSqNorms[b];
     _pks[a] = _pks[b];
     _pkStrings[a] = _pkStrings[b];
 
     _ids[b] = tempId;
     _dists[b] = tempDist;
+    _slotSqNorms[b] = tempSq;
     _pks[b] = tempPk;
     _pkStrings[b] = tempPkStr;
   }

@@ -1556,6 +1556,8 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                     _showVectorSearchBenchmarkDialog();
                   } else if (value == 'vector_depth_sweep') {
                     _runVectorSearchDepthSweep();
+                  } else if (value == 'relevance_baseline') {
+                    unawaited(_runRelevanceBaselineTest());
                   } else if (value == 'text_search') {
                     _showTextSearchDialog();
                   } else if (value == 'sparse_search') {
@@ -1656,6 +1658,18 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
                                 size: 18, color: Color(0xff0aa6e8)),
                             SizedBox(width: 8),
                             Text('Depth Sweep (Recall)'),
+                          ],
+                        ),
+                      ),
+                    if (_hasVectorSupport)
+                      const PopupMenuItem(
+                        value: 'relevance_baseline',
+                        child: Row(
+                          children: [
+                            Icon(Icons.straighten,
+                                size: 18, color: Color(0xff0aa6e8)),
+                            SizedBox(width: 8),
+                            Text('Relevance Baseline'),
                           ],
                         ),
                       ),
@@ -2702,6 +2716,49 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     }
   }
 
+  /// Runs the read-only relevance baseline on the selected vector table.
+  Future<void> _runRelevanceBaselineTest() async {
+    if (_isTesting) return;
+    setState(() {
+      _isTesting = true;
+      _lastOperationInfo = 'Relevance baseline test...';
+    });
+    try {
+      final passed = await widget.example.vectorScoreBaselineTest(
+        _selectedTable,
+        onProgress: (done, total) {
+          if (!mounted) return;
+          setState(() {
+            _lastOperationInfo = 'Relevance baseline: $done/$total steps...';
+          });
+        },
+      );
+      if (!mounted) return;
+      setState(() {
+        if (passed == null) {
+          _lastOperationInfo =
+              'Relevance baseline skipped (table empty or no vectors).';
+        } else if (passed) {
+          _lastOperationInfo =
+              '✅ Relevance baseline passed (see logs for checkpoint table).';
+        } else {
+          _lastOperationInfo =
+              '❌ Relevance baseline failed (see logs for details).';
+        }
+      });
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _lastOperationInfo = 'Relevance baseline error: $e';
+        });
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isTesting = false);
+      }
+    }
+  }
+
   Future<void> _showVectorSearchBenchmarkDialog() async {
     final result = await showDialog<Map<String, int>>(
       context: context,
@@ -2914,12 +2971,15 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
     final fusionMethod = fusionName == 'rrf'
         ? RetrievalFusionMethod.rrf
         : RetrievalFusionMethod.weightedScore;
+    final minScore = result['minScore'] as double?;
 
     setState(() {
       _isTesting = true;
       _lastOperationInfo = useVector && useText
-          ? 'Hybrid search (Top-$topK, ${fusionMethod.name})...'
-          : 'Hybrid search (Top-$topK)...';
+          ? 'Hybrid search (Top-$topK, ${fusionMethod.name}'
+              '${minScore == null ? "" : ", minScore=${minScore.toStringAsFixed(2)}"})...'
+          : 'Hybrid search (Top-$topK'
+              '${minScore == null ? "" : ", minScore=${minScore.toStringAsFixed(2)}"})...';
     });
 
     try {
@@ -2934,6 +2994,7 @@ class _ToStoreExamplePageState extends State<ToStoreExamplePage> {
         iterations: iterations,
         searchDepth: searchDepth,
         fusionMethod: fusionMethod,
+        minScore: minScore,
       );
       if (mounted) {
         setState(() {
@@ -5509,11 +5570,13 @@ class HybridSearchDialog extends StatefulWidget {
 class _HybridSearchDialogState extends State<HybridSearchDialog> {
   final _queryController = TextEditingController(text: 'distributed database');
   final _iterationsController = TextEditingController(text: '1');
+  final _minScoreController = TextEditingController(text: '0.40');
   int _topK = 10;
   int _iterations = 1;
   int _searchDepth = 50;
   bool _useVector = true;
   bool _useText = true;
+  bool _useMinScore = true;
   RetrievalFusionMethod _fusionMethod = RetrievalFusionMethod.weightedScore;
   String _category = ExampleTextCorpus.categories.first;
   int _year = 0;
@@ -5522,6 +5585,7 @@ class _HybridSearchDialogState extends State<HybridSearchDialog> {
   void dispose() {
     _queryController.dispose();
     _iterationsController.dispose();
+    _minScoreController.dispose();
     super.dispose();
   }
 
@@ -5622,9 +5686,10 @@ class _HybridSearchDialogState extends State<HybridSearchDialog> {
               const SizedBox(height: 4),
               Text(
                 _fusionMethod == RetrievalFusionMethod.weightedScore
-                    ? 'weightedScore (default): sum of channel scores × weights, '
-                        'normalized by total channel weight. Prefer when absolute '
-                        'relevance thresholds matter.'
+                    ? 'weightedScore (default): dominant-channel floor with '
+                        'bounded corroboration (secondary hits above 0.30 add '
+                        'at most 35% of remaining headroom). A miss on another '
+                        'channel does not dilute a strong hit — use with minScore.'
                     : 'rrf: Reciprocal Rank Fusion from per-channel ranks. '
                         'Relative ordering only — not absolute score thresholds.',
                 style: const TextStyle(fontSize: 12, color: Colors.grey),
@@ -5638,6 +5703,37 @@ class _HybridSearchDialogState extends State<HybridSearchDialog> {
                 labelText: 'Text query',
                 border: OutlineInputBorder(),
               ),
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                FilterChip(
+                  label: const Text('minScore'),
+                  selected: _useMinScore,
+                  selectedColor: const Color(0xff0aa6e8),
+                  checkmarkColor: Colors.white,
+                  labelStyle: TextStyle(
+                    color: _useMinScore ? Colors.white : Colors.black,
+                  ),
+                  onSelected: (selected) =>
+                      setState(() => _useMinScore = selected),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: TextField(
+                    controller: _minScoreController,
+                    enabled: _useMinScore,
+                    keyboardType:
+                        const TextInputType.numberWithOptions(decimal: true),
+                    decoration: const InputDecoration(
+                      labelText: 'Min score filter',
+                      border: OutlineInputBorder(),
+                      helperText:
+                          'Recommended 0.40 for RAG anti-hallucination discard',
+                    ),
+                  ),
+                ),
+              ],
             ),
             const SizedBox(height: 12),
             const Text('Category'),
@@ -5765,6 +5861,16 @@ class _HybridSearchDialogState extends State<HybridSearchDialog> {
               return;
             }
             final parsed = int.tryParse(_iterationsController.text.trim());
+            double? minScore;
+            if (_useMinScore) {
+              final parsedMin =
+                  double.tryParse(_minScoreController.text.trim());
+              if (parsedMin != null && parsedMin >= 0 && parsedMin <= 1.0) {
+                minScore = parsedMin;
+              } else {
+                minScore = 0.40;
+              }
+            }
             Navigator.of(context).pop({
               'query': _queryController.text.trim(),
               'topK': _topK,
@@ -5775,6 +5881,7 @@ class _HybridSearchDialogState extends State<HybridSearchDialog> {
               'useVector': _useVector ? 1 : 0,
               'useText': _useText ? 1 : 0,
               'fusionMethod': _fusionMethod.name,
+              if (minScore != null) 'minScore': minScore,
             });
           },
           style: ElevatedButton.styleFrom(

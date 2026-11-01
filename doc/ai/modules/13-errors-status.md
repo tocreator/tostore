@@ -69,7 +69,7 @@ if (batch.hasErrors) {
 | `type` / `hasErrors` | Overall status (`hasErrors` ⇔ `type != success`) |
 | `data` | records |
 | `message` | Detail |
-| `retrieval` | Vector/hybrid context |
+| `retrieval` | Text / sparse / vector hybrid context |
 | Pagination | `hasMore`/`hasPrev`, `next`/`prev`, cursor tokens (see Query module) |
 
 Success check: `!hasErrors` or `type == ResultType.success`.

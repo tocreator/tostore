@@ -275,21 +275,31 @@ class VectorSearchResult {
   /// ANN distance for the field [VectorDistanceMetric] (`lower` = closer).
   final double distance;
 
-  /// Metric-aware similarity in `[0, 1]` (`higher` = more similar).
+  /// Normalized relevance in `[0.0, 1.0]` (`higher` = more similar).
   ///
-  /// Same value used as vector-channel [RetrievalEntry.rawScore] / [RetrievalEntry.score].
+  /// Tracks effective physical similarity (`cosine` / symmetric L2 /
+  /// directional IP). Exact self-match is `1.0`. Same value as vector-channel
+  /// [RetrievalEntry.score]. Use [rawScore] / [distance] for the underlying
+  /// physical metric.
   final double score;
+
+  /// Unnormalized physical metric (`higher` = closer for cosine/IP; L2 is
+  /// Euclidean distance). Cosine: `[-1, 1]`; inner product: unclamped dot;
+  /// L2: `‖q - x‖`. Used as vector-channel [RetrievalEntry.rawScore].
+  final double rawScore;
 
   VectorSearchResult({
     required this.primaryKey,
     required this.distance,
     required this.score,
+    required this.rawScore,
   });
 
   Map<String, dynamic> toJson() => {
         'primaryKey': primaryKey,
         'distance': distance,
         'score': score,
+        'rawScore': rawScore,
       };
 }
 
@@ -319,9 +329,9 @@ enum RetrievalChannel {
 /// Applies only to multi-way recall. Configure via [QueryBuilder.fusionMethod];
 /// default is [weightedScore].
 enum RetrievalFusionMethod {
-  /// Sum of `weight × channel score` divided by the total weight of every
-  /// vector, text, and sparse channel in the query. A miss contributes 0.
-  /// Default for multi-way recall.
+  /// Dominant-channel floor plus bounded corroboration from other hits above
+  /// the weak-noise band. A strong single-channel hit is not diluted by misses
+  /// on other channels. Default for multi-way recall.
   weightedScore,
 
   /// Relative score from ranks inside each channel's result set (Reciprocal Rank
@@ -334,10 +344,10 @@ class RetrievalEntry {
   /// Ranking score for this record (`higher` = better).
   ///
   /// - One recall channel: that channel's public score (text/sparse absolute
-  ///   relevance in `[0, 1)`; vector similarity in `[0, 1]`).
-  /// - Multi-way [RetrievalFusionMethod.weightedScore]: weighted sum of
-  ///   channel scores divided by the query's total channel weight. A channel
-  ///   that does not hit contributes 0.
+  ///   relevance in `[0.0, 1.0)`; vector similarity in `[0.0, 1.0]`).
+  /// - Multi-way [RetrievalFusionMethod.weightedScore]: dominant-channel floor
+  ///   with bounded corroboration from other hits above the weak-noise band;
+  ///   a miss on another channel does not dilute a strong hit.
   /// - Multi-way [RetrievalFusionMethod.rrf]: relative score from ranks inside
   ///   each channel's result set.
   ///
@@ -352,8 +362,8 @@ class RetrievalEntry {
   /// One recall channel:
   /// - [RetrievalChannel.text] / [RetrievalChannel.sparse]: continuous match
   ///   quality (short queries commonly `0..30`; long queries may exceed `100`).
-  /// - [RetrievalChannel.vector]: similarity in `[0, 1]`; ANN distance in
-  ///   `meta['distance']`.
+  /// - [RetrievalChannel.vector]: physical metric (`cosine` / IP / Euclidean);
+  ///   normalized relevance is [score]; ANN distance in `meta['distance']`.
   ///
   /// Multi-way: same value as [score] (absolute relevance or relative RRF).
   final double? rawScore;

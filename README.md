@@ -33,18 +33,18 @@
 - [Why ToStore](#why-choose-tostore) | [Key Features](#key-features) | [Installation Guide](#installation) | [KV Mode](#key-value-storage-kv) | [Table Mode](#structured-table-mode) | [Memory Mode](#memory-mode)
 - [Schema Definition](#schema-definition) | [Distributed Architecture](#distributed-architecture) | [Cascading Foreign Keys](#foreign-keys-and-cascading) | [Mobile/Desktop](#mobile-and-desktop-integration) | [Server/Agent](#server-and-agent-integration) | [Primary Key Algorithms](#primary-key-examples)
 - [Advanced Queries (JOIN)](#advanced-queries) | [Aggregation & Statistics](#aggregation-grouping-and-statistics) | [Complex Logic (QueryCondition)](#complex-logic-with-querycondition) | [Reactive Query (watch)](#reactive-query) | [Streaming Query](#streaming-query)
-- [Advanced KV](#advanced-key-value-operations-dbkv) | [Bulk Operations](#bulk-operations) | [Recovery Durability](#recovery-durability-guarantee) | [Vector & Hybrid Retrieval](#vector-fields-vector-indexes-and-hybrid-retrieval) | [Table-level TTL](#table-level-ttl) | [Efficient Pagination](#query-and-efficient-pagination) | [Memory Probe & Sync Retrieval (peek)](#memory-probe-and-sync-retrieval-peek) | [Query Cache](#manual-query-result-caching) | [Atomic Expressions](#atomic-expressions) | [Transactions](#transactions)
+- [Advanced KV](#advanced-key-value-operations-dbkv) | [Bulk Operations](#bulk-operations) | [Recovery Durability](#recovery-durability-guarantee) | [Hybrid Retrieval (Dense / Sparse / Text)](#vector-text-and-hybrid-retrieval) | [Table-level TTL](#table-level-ttl) | [Efficient Pagination](#query-and-efficient-pagination) | [Memory Probe & Sync Retrieval (peek)](#memory-probe-and-sync-retrieval-peek) | [Query Cache](#manual-query-result-caching) | [Atomic Expressions](#atomic-expressions) | [Transactions](#transactions)
 - [Administration](#administration-and-maintenance) | [Security Configuration](#security-configuration) | [Error Handling](#status-codes-and-error-handling) | [Performance & Diagnostics](#performance-and-experience) | [Contributing](#contributing) | [AI assistants](#for-ai-coding-assistants)
 
 ## Why Choose ToStore?
 
-ToStore is a modern data engine designed for the AGI era and edge intelligence scenarios. Built on a Self-Routing node architecture, it gives nodes high autonomy and elastic horizontal scalability while logically decoupling performance from data scale.
+ToStore is a modern data engine designed for the AGI era and edge intelligence scenarios. Built on a Self-Routing node architecture, it gives nodes high autonomy and elastic horizontal scalability while logically decoupling performance from data scale—edge and cloud single-node deployments are both designed to support 10B+ scale.
 
-Runtime modeling and non-blocking execution paths keep architecture evolution always online and fully transparent to business operations—declarative schema changes, data encoding key rotation, and massive data refactoring all happen seamlessly online. Built for Agent and automated O&M, it underpins their autonomous evolution and continuous iteration without interrupting service.
+Runtime modeling and non-blocking execution paths keep architecture evolution always online and fully transparent to business operations—declarative schema changes, data encoding key rotation, and massive data refactoring all happen seamlessly online. It supports Agents and automated O&M with runtime table creation, dynamic memory evolution, and their autonomous evolution and continuous iteration—without interrupting service.
 
-A unified data engine natively supporting relational structured data, high-dimensional vectors, and unstructured data, with built-in hybrid retrieval and multi-way recall fusion, plus enterprise-grade database capabilities including ACID transactions, complex relational queries (JOINs, cascading foreign keys), table-level TTL, aggregations, as well as distributed primary key algorithms, atomic expressions, encryption, multi-space isolation, and self-healing recovery.
+It unifies relational structured data, dense vectors, neural sparse vectors, and unstructured text in one engine, with built-in lexical text retrieval, dense vector retrieval, neural sparse retrieval, and multi-way recall fusion. Enterprise-grade capabilities include ACID transactions, complex relational queries (JOINs, cascading foreign keys), table-level TTL, aggregations, as well as distributed primary key algorithms, atomic expressions, encryption, multi-space isolation, and self-healing recovery.
 
-As computing continues shifting toward edge intelligence, devices are no longer just "content displays". They are intelligent nodes responsible for local generation, environmental awareness, real-time decision-making, and coordinated data flows. ToStore gives the edge distributed capabilities strong enough for massive datasets and complex local AI generation. Deep intelligent collaboration between edge and cloud nodes provides a reliable data foundation for multi-modal interaction, semantic vector hybrid retrieval, spatial modeling, edge autonomous collaboration, and similar scenarios.
+As computing continues shifting toward edge intelligence, devices are no longer just "content displays". They are intelligent nodes responsible for local generation, environmental awareness, real-time decision-making, and coordinated data flows. ToStore gives the edge distributed capabilities strong enough for massive datasets and complex local AI generation. Deep intelligent collaboration between edge and cloud nodes provides a reliable data foundation for multi-modal interaction, long-term memory, RAG and local knowledge bases, hybrid retrieval, spatial modeling, edge autonomous collaboration, and similar scenarios.
 
 ## Key Features
 
@@ -52,21 +52,21 @@ As computing continues shifting toward edge intelligence, devices are no longer 
   - Declarative schema changes—automatic refactoring, no manual versioning
   - Key rotation, schema migration, massive refactoring—all online, business-transparent
   - Built-in status spec for automated O&M and Agent recognition
-  - Architecture evolves continuously without interrupting service
+  - Supports autonomous evolution and continuous iteration without interrupting service
 
 - 🧠 **Self-Routing Distributed Architecture**
   - Self-routing node architecture that decouples physical addressing from data scale
   - Highly autonomous nodes collaborate to build flexible data topology
-  - Elastic horizontal scaling with deep edge-cloud node interconnection
+  - Elastic horizontal scaling; single-node deployments designed for 10B+ scale
 
 - 🌐 **Unified Cross-Platform Data Engine**
   - Unified API across mobile, desktop, web, and server environments
-  - Covers relational structured data, high-dimensional vectors, and unstructured data
+  - Covers relational data, dense / neural sparse vectors, and text retrieval
   - Complete data pipeline from local storage to edge-cloud collaboration
 
 - 🔍 **Structured Queries & Hybrid Retrieval**
   - Complex predicates, JOINs, aggregations, and table-level TTL
-  - Multi-channel recall on one query chain (vector + structured and more)
+  - Lexical text, dense vector, and neural sparse retrieval on one query chain
   - Multi-way recall fusion ranking, with scores and channel diagnostics on the result
 
 - ⚡ **Parallel Execution & Resource Scheduling**
@@ -74,7 +74,8 @@ As computing continues shifting toward edge intelligence, devices are no longer 
   - Resource-aware load scheduling; multi-node parallel task decomposition
   - Time-slicing keeps UI animations smooth even under heavy load
 
-- 🔐 **Data Security & Isolation**
+- 🔐 **Offline-First & Privacy**
+  - Keep data on-device and usable offline, reducing cloud dependence and exposure
   - Multi-space isolation with optional global sharing—multi-user / multi-tenant ready
   - Built-in ChaCha20-Poly1305 and AES-256-GCM encryption
   - Validated through multiple complex disaster recovery scenarios
@@ -321,7 +322,8 @@ const appSchemas = [userSchema];
   | `datetime` | `DateTime` / `String` | Date/time; stored internally as ISO8601 |
   | `array` | `List` | List or array type |
   | `json` | `Map<String, dynamic>` | JSON object, suitable for dynamic structured data |
-  | `vector` | `VectorData` / `List<num>` | High-dimensional vector data for AI semantic retrieval (embeddings) |
+  | `vector` | `VectorData` / `List<num>` | Dense vectors for semantic nearest-neighbor retrieval (embeddings) |
+  | `sparse` | `SparseVectorData` | Neural sparse vectors for sparse retrieval |
 
 - **`PrimaryKeyType` auto-generation strategies**:
   | Strategy | Description | Characteristics |
@@ -347,7 +349,7 @@ You can write common validation rules directly into `FieldSchema`, avoiding dupl
 - `createIndex`: create indexes for high-frequency filtering, sorting, or relationships
 - `fieldId` / `tableId`: assist rename detection for fields and tables during migration
 
-In addition, `unique: true` automatically creates a single-field unique index. `createIndex: true` and foreign keys automatically create single-field normal indexes. Use `indexes` when you need composite indexes, named indexes, or vector indexes.
+In addition, `unique: true` automatically creates a single-field unique index. `createIndex: true` and foreign keys automatically create single-field normal indexes. Use `indexes` when you need composite indexes, named indexes, or text / sparse / vector retrieval indexes.
 
 ### Schema Evolution
 
@@ -726,26 +728,22 @@ await db.kv.setMany(settingsMap, durability: RecoveryDurability.durable);
 ```
 
 
-### Vector Fields, Vector Indexes, and Hybrid Retrieval
+### Vector, Text, and Hybrid Retrieval
 
-Vector retrieval uses the unified `db.query(...).matchVector(...)` query chain: it can be combined with structured predicates on the same chain, or fused with other recall branches. Scores and channel diagnostics are returned in `QueryResult.retrieval`, aligned 1:1 with `data` records. When you only need primary keys and scores, prefer `.select(['id'])` (or your PK field name) so the engine skips hydrating full table records — otherwise hybrid retrieval materializes complete records (including large embeddings) and throughput can drop sharply. For dedicated ANN without filters or fusion, `db.vectorSearch(...)` returns `List<VectorSearchResult>` (primary key + score) with the same core search path. Current examples focus on vector + structured paths; lexical, graph, and other channels will extend along the same chained hybrid retrieval model.
+Lexical text, dense vector, and neural sparse retrieval share one query chain (`matchText` / `matchVector` / `matchSparse`): combine them with structured predicates on the same chain, or fuse multiple recall branches. Scores and channel diagnostics are returned in `QueryResult.retrieval`, aligned 1:1 with `data` records. When you only need primary keys and scores, prefer `.select(['id'])` (or your PK field name) so the engine skips hydrating full table records — otherwise hybrid retrieval materializes complete records (including large embeddings) and throughput can drop sharply. For dedicated ANN without filters or fusion, `db.vectorSearch(...)` returns `List<VectorSearchResult>` (primary key + score) with the same core search path.
 
-**Search visibility**: After insert/update returns success, regular indexes are immediately searchable; vector indexes are not built on the write path (to avoid hurting throughput) and are not searchable right away. When you need them in retrieval, call `await db.flush()` after your business batch (optional convenience); only then do they participate in `matchVector` / `vectorSearch`.
+**Search visibility**: After insert/update returns success, regular indexes, text indexes, and sparse indexes are immediately searchable; vector indexes are not built on the write path (to avoid hurting throughput) and are not searchable right away. When you need them in retrieval, call `await db.flush()` after your business batch (optional convenience); only then do they participate in `matchVector` / `vectorSearch`.
 
 ```dart
 await db.createTables([
   const TableSchema(
-    name: 'embeddings',
+    name: 'documents',
     primaryKeyConfig: PrimaryKeyConfig(
       name: 'id',
       type: PrimaryKeyType.timestampBased,
     ),
     fields: [
-      FieldSchema(
-        name: 'document_title',
-        type: DataType.text,
-        nullable: false,
-      ),
+      FieldSchema(name: 'content', type: DataType.text, nullable: false),
       FieldSchema(
         name: 'category',
         type: DataType.text,
@@ -753,8 +751,13 @@ await db.createTables([
         createIndex: true,
       ),
       FieldSchema(
+        name: 'features',
+        type: DataType.sparse, // Neural sparse vector
+        nullable: false,
+      ),
+      FieldSchema(
         name: 'embedding',
-        type: DataType.vector, // Declare a vector field
+        type: DataType.vector, // Dense vector
         nullable: false,
         vectorConfig: VectorFieldConfig(
           dimensions: 128, // Written and queried vectors must match this width
@@ -762,12 +765,14 @@ await db.createTables([
       ),
     ],
     indexes: [
+      IndexSchema(fields: ['content'], type: IndexType.text), // Lexical text index
+      IndexSchema(fields: ['features'], type: IndexType.sparse), // Neural sparse index
       IndexSchema(
-        fields: ['embedding'], // Field to index
-        type: IndexType.vector, // Build a vector index
+        fields: ['embedding'],
+        type: IndexType.vector, // Dense vector index
         vectorConfig: VectorIndexConfig(
-          indexType: VectorIndexType.ngh, // ToStore built-in proprietary dense index
-          distanceMetric: VectorDistanceMetric.cosine, // Good for normalized embeddings
+          indexType: VectorIndexType.ngh, // NGH: ToStore built-in dense index
+          distanceMetric: VectorDistanceMetric.cosine,
         ),
       ),
     ],
@@ -775,78 +780,127 @@ await db.createTables([
 ]);
 
 final queryVector =
-    VectorData.fromList(List.generate(128, (i) => i * 0.01)); // Must match dimensions
+    VectorData.fromList(List.generate(128, (i) => i * 0.01));
+final querySparse = SparseVectorData.fromMap({12: 0.8, 45: 0.6, 90: 0.3});
 
-// 1) Recommended: chained hybrid retrieval (pure vector ANN)
-// Prefer .select([pk]) for primary key + score only — avoids full-record hydration.
-final result = await db
-    .query('embeddings')
+// 1) Lexical text retrieval (engine tokenizes TextQuery.text;
+//    or use pre-tokenized TextQuery.terms / termsWeighted)
+final textHits = await db
+    .query('documents')
     .select(['id'])
-    .matchVector('embedding', queryVector) // default searchDepth = 50
+    .matchText('content', TextQuery.text('distributed kernel storage'))
+    .limit(5);
+
+// 2) Neural sparse retrieval
+final sparseHits = await db
+    .query('documents')
+    .select(['id'])
+    .matchSparse('features', querySparse, minScore: 0.30)
+    .limit(5);
+
+// 3) Dense vector ANN (default searchDepth = 50)
+final result = await db
+    .query('documents')
+    .select(['id'])
+    .matchVector('embedding', queryVector, minScore: 0.40)
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
   final record = result.data[i];
   final entry = result.retrieval?.entries[i];
   print('pk=${record['id']}, score=${entry?.score}, '
-      'distance=${entry?.meta?['distance']}');
+      'rawScore=${entry?.rawScore}, distance=${entry?.meta?['distance']}');
 }
 
-// Need business columns? omit select() (or project the fields you need) —
-// the engine then loads full table records for matched PKs (heavier).
-
-// 2) Structured filter + vector (AND hybrid)
+// 4) Structured filter + vector (AND)
 final filtered = await db
-    .query('embeddings')
+    .query('documents')
     .whereEqual('category', 'tech')
-    .matchVector('embedding', queryVector)
+    .matchVector('embedding', queryVector, minScore: 0.40)
     .limit(5);
 
-// 3) Multi-way fused recall (vector + structured paths, engine-side RRF)
-final otherVector =
-    VectorData.fromList(List.generate(128, (i) => i * 0.012));
+// 5) Multi-way fusion: text + sparse + vector (default weightedScore)
 final fused = await db
-    .query('embeddings')
-    .matchVector('embedding', queryVector, weight: 1.0)
-    .orMatchVector('embedding', otherVector, weight: 0.6, minScore: 0.2)
-    .or()
-    .whereEqual('category', 'tech')
+    .query('documents')
+    .matchText('content', TextQuery.text('distributed storage'), weight: 0.4)
+    .matchSparse('features', querySparse, weight: 0.3, minScore: 0.20)
+    .matchVector('embedding', queryVector, weight: 0.6, minScore: 0.40)
     .limit(10);
+print('fusion=${fused.retrieval?.fusionMethod}'); // weightedScore
 
-print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
+// Opt into rank-only fusion (relative scores — not absolute relevance bands)
+final fusedRrf = await db
+    .query('documents')
+    .matchText('content', TextQuery.text('distributed storage'), weight: 0.4)
+    .matchVector('embedding', queryVector, weight: 0.6, minScore: 0.40)
+    .fusionMethod(RetrievalFusionMethod.rrf)
+    .limit(10);
+print('fusion=${fusedRrf.retrieval?.fusionMethod}'); // rrf
 
-// Dedicated ANN (same core path; PK + score only, no query chain / fusion)
+// Dedicated ANN (PK + score only; no query chain / fusion)
 final ann = await db.vectorSearch(
-  'embeddings',
+  'documents',
   fieldName: 'embedding',
   queryVector: queryVector,
   topK: 5,
+  minScore: 0.40,
 );
 ```
 
-**Schema / vector index config** (`VectorFieldConfig`, `VectorIndexConfig`):
+**Channel / schema mapping**:
+
+| Channel | Field type | Index | Query API | Query value |
+| :--- | :--- | :--- | :--- | :--- |
+| Lexical text | `DataType.text` | `IndexType.text` | `matchText` / `orMatchText` | `TextQuery.text` / `terms` / `termsWeighted` |
+| Neural sparse | `DataType.sparse` | `IndexType.sparse` | `matchSparse` / `orMatchSparse` | `SparseVectorData` |
+| Dense vector | `DataType.vector` | `IndexType.vector` | `matchVector` / `orMatchVector` | `VectorData`, etc. |
+
+**Dense vector config** (`VectorFieldConfig`, `VectorIndexConfig`):
 
 - `dimensions`: must match the actual embedding width you write
-- `indexType`: opaque dense algorithm id; currently `ngh`. 
+- `indexType`: opaque dense algorithm id; currently `ngh`
 - `distanceMetric`: index-side similarity metric used for insert and search; `cosine` is common for semantic embeddings, `l2` suits Euclidean distance, and `innerProduct` suits dot-product search. Changing it after data exists requires rebuilding the vector index.
 
-**Chained retrieval parameters** (`matchVector` / `orMatchVector`, plus `limit` on the query chain):
+**Chained retrieval parameters** (each `match*` / `orMatch*`, plus `limit` on the query chain):
 
-- `field` / `vector`: target vector field and query vector (`VectorData` / `List<num>` / `Float32List`)
-- `searchDepth`: optional search depth (`>= 1`, default `50`). Larger values typically raise recall and latency. Approximate nearest neighbor — not a guaranteed recall@K. Raise it as the corpus grows when you want more neighbors found.
-- `weight`: fusion weight for this recall channel in multi-way retrieval; default `1.0`
-- `minScore`: normalized similarity floor in `[0.0 ~ 1.0]`; candidates below it are dropped
-- `distanceThreshold`: distance ceiling; candidates beyond it are excluded
-- `limit`: number of results to return (equivalent to topK in typical ANN usage)
+- Text
+  - `TextQuery.text`: tokenized by the engine
+  - `TextQuery.terms` / `termsWeighted`: pre-tokenized; no second pass; Latin terms must match the index side (usually lowercase)
+  - `operator`: `or` (default; union ranking) or `and` (every positive-weight term must hit, then rank)
+  - Phrase matching is not supported
+- Sparse
+  - `SparseVectorData` / `SparseVectorData.fromMap(...)`: sparse query vector
+  - Document-side weights should preferably fall in `(0, 1]`
+- Vector
+  - `field` / `vector`: target field and query vector
+  - `searchDepth`: `>= 1`, default `50`; larger values usually raise recall and latency; approximate nearest neighbor — **not** a guaranteed recall@K
+  - `distanceThreshold`: distance ceiling
+- Shared
+  - `weight`: multi-way fusion weight; default `1.0`
+  - `minScore`: relevance floor
+  - `limit`: result count (topK)
+  - `.fusionMethod(...)`: multi-way default `weightedScore`; switchable to `rrf`
 
-**Result notes** (`QueryResult`):
+**Result & scoring notes** (`QueryResult` / `VectorSearchResult`):
 
-- Business records are in `data`; retrieval scores and channel info are in `retrieval.entries`, aligned **1:1** with `data`
-- For high-throughput ANN / hybrid recall, use `.select(['id'])` (PK field name) so `data` is PK-only and scores stay in `retrieval`
-- `entry.score`: normalized similarity / fusion score, typically in `0 ~ 1`; larger means more relevant
-- `entry.meta['distance']`: raw distance (common on the vector channel); for `l2` / `cosine`, smaller usually means closer
-- `retrieval.fusionMethod`: usually `single` for one channel; multi-way fused recall is typically `rrf` (Reciprocal Rank Fusion)
-- Top-level `db.vectorSearch(...)` returns `List<VectorSearchResult>` (`primaryKey` / `score` / `distance`) when you only need dedicated ANN without structured filters or multi-way fusion
+- Business records are in `data`; retrieval scores and channel info are in `retrieval.entries`, aligned **1:1** with `data`. Prefer `.select(['id'])` when you only need primary keys and scores.
+- `score` (Normalized Relevance Score, `0.0 ~ 1.0`): unified relevance across text, sparse, and vector retrieval (`higher` = more relevant). Exact vector match reaches `1.0`. Use `minScore` to keep strong hits and drop weak ones. Default multi-way `weightedScore` fusion keeps a strong single-channel hit; text and sparse stay in `[0.0, 1.0)`.
+- `rawScore`: unnormalized physical metric — cosine / dot product / L2 / text impact. Use `rawScore` / `distance` when you need the underlying metric.
+- `entry.meta['distance']`: ANN distance on vector channels (`lower` = closer).
+- `retrieval.fusionMethod`: `null` for single-channel recall; multi-way recall defaults to `weightedScore` (switchable via `.fusionMethod(RetrievalFusionMethod.rrf)`).
+- Top-level `db.vectorSearch(...)` returns `List<VectorSearchResult>` (`primaryKey` / `score` / `rawScore` / `distance`) for dedicated ANN. Optional `minScore` uses the same relevance floor as `matchVector` (may return fewer than `topK`).
+
+**Relevance Score (`score`) & Threshold Reference Baseline** (single-channel and multi-way `weightedScore`; not for `rrf`). For typical embeddings (**dimensions ≥ 128**); lower dimensions may score weak neighbors high — raise `minScore` or use `rawScore` if needed:
+
+| Relevance Score (`score`) | Baseline Meaning & Typical Scenarios |
+| :--- | :--- |
+| `>= 0.85` | Same-entity match (face verification, biometrics, exact deduplication) |
+| `>= 0.70` | High-confidence semantic match (core facts, precise Q&A) |
+| `>= 0.40` | Basic semantic relevance (general RAG, knowledge-base anti-hallucination) |
+| `>= 0.30` | Broad initial recall (fuzzy discovery, pre-rerank candidate pool) |
+| `< 0.30` | Weak association or background noise |
+
+Configure channel `minScore` on demand to drop low-relevance hits.
 
 ### Table-level TTL
 

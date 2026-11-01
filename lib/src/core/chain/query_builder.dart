@@ -566,8 +566,8 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
   /// Set how multi-channel recall scores are combined (not a recall channel).
   ///
   /// Applies only to multi-way recall. Default is
-  /// [RetrievalFusionMethod.weightedScore] (weighted sum of aligned channel
-  /// scores divided by the query's total channel weight; a miss contributes 0).
+  /// [RetrievalFusionMethod.weightedScore] (dominant-channel floor with bounded
+  /// corroboration; a miss on another channel does not dilute a strong hit).
   /// [RetrievalFusionMethod.rrf] is relative score from ranks
   /// inside each channel's result set. One-channel queries ignore this setting.
   QueryBuilder fusionMethod(RetrievalFusionMethod method) {
@@ -1599,22 +1599,15 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     // Exact topK -- same ANN cost as db.vectorSearch(topK).
     // hasMore is inferred from a full page (rare false-positive when corpus
     // size equals topK exactly).
-    var vecResults = await vim.vectorSearch(
+    final vecResults = await vim.vectorSearch(
       table: table,
       fieldName: pure.field,
       queryVector: pure.vector,
       topK: effectiveLimit,
       searchDepth: pure.searchDepth,
       distanceThreshold: pure.distanceThreshold,
+      minScore: pure.minScore,
     );
-
-    if (pure.minScore != null) {
-      final minScore = pure.minScore!;
-      vecResults = [
-        for (final r in vecResults)
-          if (r.score >= minScore) r
-      ];
-    }
 
     final hasMore = vecResults.length >= effectiveLimit;
     final page = vecResults;
@@ -1650,7 +1643,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
         entries.add(RetrievalEntry(
           score: cand.score,
           channel: RetrievalChannel.vector,
-          rawScore: cand.score,
+          rawScore: cand.rawScore,
           meta: {
             'distance': cand.distance,
             'field': fieldName,
@@ -1669,7 +1662,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
         entries.add(RetrievalEntry(
           score: cand.score,
           channel: RetrievalChannel.vector,
-          rawScore: cand.score,
+          rawScore: cand.rawScore,
           meta: {
             'distance': cand.distance,
             'field': fieldName,
@@ -2053,7 +2046,7 @@ class QueryBuilder extends ChainBuilder<QueryBuilder>
     );
   }
 
-  /// Pure [matchSparse] retrieval path — sync-first via [searchSparseSync].
+  /// Pure [matchSparse] retrieval path - sync-first via [searchSparseSync].
   Future<ExecuteResult?> _executePureMatchSparse(
     ({
       String field,

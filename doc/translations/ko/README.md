@@ -33,49 +33,50 @@
 - [ToStore를 선택해야 하는 이유](#why-tostore) | [주요 기능](#key-features) | [설치 안내](#installation) | [KV 모드](#quick-start-kv) | [테이블 모드](#quick-start-table) | [메모리 모드](#quick-start-memory)
 - [스키마 정의](#schema-definition) | [분산 아키텍처](#distributed-architecture) | [계단식 외래 키](#foreign-keys) | [모바일/데스크톱](#mobile-integration) | [서버/에이전트](#server-integration) | [기본 키 알고리즘](#primary-key-examples)
 - [고급 쿼리(JOIN)](#query-advanced) | [집계 및 통계](#aggregation-stats) | [복잡한 논리(쿼리조건)](#query-condition) | [반응형 쿼리(보기)](#reactive-query) | [스트리밍 쿼리](#streaming-query)
-- [KV 고급 작업](#kv-advanced) | [일괄 작업](#bulk-operations) | [복구 보장](#recovery-durability) | [벡터 및 하이브리드 검색](#vector-advanced) | [테이블 수준 TTL](#ttl-config) | [효율적인 페이지 매김](#query-pagination) | [메모리 프로브 및 동기 검색 (peek)](#query-peek) | [쿼리 캐시](#query-cache) | [원자 표현](#atomic-expressions) | [거래](#transactions)
+- [KV 고급 작업](#kv-advanced) | [일괄 작업](#bulk-operations) | [복구 보장](#recovery-durability) | [하이브리드 검색(밀집 / 희소 / 텍스트)](#hybrid-advanced) | [테이블 수준 TTL](#ttl-config) | [효율적인 페이지 매김](#query-pagination) | [메모리 프로브 및 동기 검색 (peek)](#query-peek) | [쿼리 캐시](#query-cache) | [원자 표현](#atomic-expressions) | [거래](#transactions)
 - [관리](#database-maintenance) | [보안설정](#security-config) | [오류 처리](#error-handling) | [성능 및 진단](#performance) | [기여](#contribute) | [AI 코딩 어시스턴트](#for-ai-coding-assistants)
 
 ## <a id="why-tostore"></a>왜 ToStore를 선택해야 할까요?
 
-ToStore는 AGI 시대와 엣지 인텔리전스 시나리오를 위해 설계된 현대적인 데이터 엔진입니다. Self-Routing 노드 아키텍처를 기반으로 노드에 높은 자율성과 유연한 수평적 확장성을 제공하며, 성능과 데이터 규모를 논리적으로 분리합니다.
+ToStore는 AGI 시대와 엣지 인텔리전스 시나리오를 위해 설계된 현대적인 데이터 엔진입니다. Self-Routing 노드 아키텍처를 기반으로 노드에 높은 자율성과 유연한 수평적 확장성을 제공하며, 성능과 데이터 규모를 논리적으로 분리합니다—엣지와 클라우드 단일 노드 배포 모두 100억 건 이상 규모를 지원하도록 설계되었습니다.
 
-런타임 모델링과 논블로킹 실행 경로를 통해 아키텍처 진화는 항상 온라인이며 비즈니스에 완전히 투명합니다—선언적 스키마 변경, 데이터 인코딩 키 순환, 대규모 데이터 리팩토링이 모두 온라인에서 원활하게 수행됩니다. Agent와 자동화 운영을 위해 이들의 자율적 진화와 지속적 반복을 뒷받침하며, 서비스는 중단되지 않습니다.
+런타임 모델링과 논블로킹 실행 경로를 통해 아키텍처 진화는 항상 온라인이며 비즈니스에 완전히 투명합니다—선언적 스키마 변경, 데이터 인코딩 키 순환, 대규모 데이터 리팩토링이 모두 온라인에서 원활하게 수행됩니다. Agent와 자동화 운영을 위한 런타임 테이블 생성, 동적 메모리 진화 및 이들의 자율적 진화와 지속적 반복을 지원하며, 서비스는 중단되지 않습니다.
 
-관계형 구조화 데이터, 고차원 벡터, 비구조화 데이터를 네이티브로 지원하는 통합 데이터 엔진으로, 하이브리드 검색과 다중 경로 리콜 융합 기능을 내장하며, ACID 트랜잭션, 복잡한 관계형 쿼리(JOIN, 계단식 외래 키), 테이블 수준 TTL, 집계, 분산 기본 키 알고리즘, 원자성 표현식, 암호화, 다중 공간 격리, 자가 복구 등 엔터프라이즈급 데이터베이스 기능을 제공합니다.
+관계형 구조화 데이터, 밀집 벡터, 신경 희소 벡터, 비구조화 텍스트를 단일 엔진에 통합하며, 어휘 텍스트 검색·밀집 벡터 검색·신경 희소 검색·다중 경로 리콜 융합을 내장합니다. 아울러 ACID 트랜잭션, 복잡한 관계형 쿼리(JOIN, 계단식 외래 키), 테이블 수준 TTL, 집계, 분산 기본 키 알고리즘, 원자성 표현식, 암호화, 다중 공간 격리, 자가 복구 등 엔터프라이즈급 기능을 제공합니다.
 
-컴퓨팅이 엣지 인텔리전스로 계속 전환됨에 따라, 디바이스는 더 이상 단순한 "콘텐츠 디스플레이"가 아닌 로컬 생성, 환경 인식, 실시간 의사 결정, 조정된 데이터 흐름을 담당하는 지능형 노드입니다. ToStore는 엣지에 대규모 데이터셋과 복잡한 로컬 AI 생성을 지원하는 분산 기능을 제공하며, 엣지와 클라우드 간의 깊은 인텔리전트 협업을 통해 다중 모드 상호 작용, 의미론적 벡터 하이브리드 검색, 공간 모델링, 엣지 자율 협업 등의 시나리오에 신뢰할 수 있는 데이터 기반을 제공합니다.
+컴퓨팅이 엣지 인텔리전스로 계속 전환됨에 따라, 디바이스는 더 이상 단순한 "콘텐츠 디스플레이"가 아닌 로컬 생성, 환경 인식, 실시간 의사 결정, 조정된 데이터 흐름을 담당하는 지능형 노드입니다. ToStore는 엣지에 대규모 데이터셋과 복잡한 로컬 AI 생성을 지원하는 분산 기능을 제공하며, 엣지와 클라우드 간의 깊은 인텔리전트 협업을 통해 멀티모달 상호작용, 장기 메모리, RAG 및 로컬 지식 베이스, 하이브리드 검색, 공간 모델링, 엣지 자율 협업 등의 시나리오에 신뢰할 수 있는 데이터 기반을 제공합니다.
 
 ## <a id="key-features"></a>주요 기능
 
 - 🤖 **런타임 진화와 지능형 운영**
-  - 선언적 정의, 자동 리팩토링, 버전 관리 불필요
-  - 키 순환, 스키마 변경, 대규모 리팩토링—모두 온라인, 무중단
+  - 선언적 스키마 변경—자동 리팩토링, 수동 버전 관리 불필요
+  - 키 순환, 스키마 마이그레이션, 대규모 리팩토링—모두 온라인, 비즈니스 투명
   - 자동화 운영 및 Agent 인식을 위한 상태 사양 내장
-  - 서비스 중단 없는 핫 업그레이드로 장기 안정 운용
+  - 서비스 중단 없이 자율적 진화와 지속적 반복을 지원
 
 - 🧠 **Self-Routing 분산 아키텍처**
   - 물리적 주소 지정과 데이터 규모를 분리하는 Self-Routing 노드 아키텍처
   - 고도로 자율적인 노드가 협력하여 유연한 데이터 토폴로지 구축
-  - 탄력적 수평 확장, 엣지와 클라우드 간의 깊은 노드 간 협업
+  - 탄력적 수평 확장; 단일 노드 배포도 100억 건 이상 규모를 지원하도록 설계
 
 - 🌐 **통합 크로스 플랫폼 데이터 엔진**
   - 모바일, 데스크톱, 웹, 서버 환경 전반에 걸친 통합 API
-  - 관계형 구조화 데이터, 고차원 벡터, 비구조화 데이터 커버
+  - 관계형 데이터, 밀집 / 신경 희소 벡터, 텍스트 검색 커버
   - 로컬 스토리지부터 엣지-클라우드 협업까지 완전한 데이터 파이프라인
 
 - 🔍 **구조화 쿼리 및 하이브리드 검색**
   - 복잡한 조건, JOIN, 집계 및 테이블 수준 TTL
-  - 동일 쿼리 체인에서 다중 채널 리콜을 조합 가능(벡터, 구조화 등)
-  - 다중 경로 리콜 융합 랭킹. 점수와 채널 진단을 쿼리 결과와 함께 반환
+  - 어휘 텍스트·밀집 벡터·신경 희소 검색을 동일 쿼리 체인에서 조합
+  - 다중 경로 리콜 융합 랭킹. 점수와 채널 진단을 결과와 함께 반환
 
 - ⚡ **병렬 실행 및 리소스 스케줄링**
-  - 고가용성을 위한 리소스 인식 지능형 로드 스케줄링
-  - 다중 노드 병렬 협업 및 작업 분해
+  - 콜드 스타트는 데이터 규모와 무관하게 약 35 ms 유지
+  - 리소스 인식 로드 스케줄링; 다중 노드 병렬 작업 분해
   - 고부하 시에도 UI 애니메이션을 부드럽게 유지하는 타임 슬라이싱
 
-- 🔐 **데이터 보안 및 격리**
-  - 다중 공간 격리와 선택적 전역 공유, 다중 사용자 및 멀티테넌트 시나리오에 적합
+- 🔐 **오프라인 우선 및 프라이버시**
+  - 데이터를 기기에 보관하고 오프라인에서도 사용 가능하여 클라우드 의존성과 노출면을 줄임
+  - 다중 공간 격리와 선택적 전역 공유, 다중 사용자 / 멀티테넌트에 적합
   - ChaCha20-Poly1305 및 AES-256-GCM 암호화 내장
   - 다수의 복잡한 재해 복구 시나리오를 통해 검증됨
 
@@ -319,7 +320,8 @@ const appSchemas = [userSchema];
   | `datetime` | `DateTime` / `String` | 날짜/시간 내부적으로 ISO8601로 저장됨 |
   | `array` | `List` | 목록 또는 배열 유형 |
   | `json` | `Map<String, dynamic>` | 동적 구조화된 데이터에 적합한 JSON 객체 |
-  | `vector` | `VectorData` / `List<num>` | AI 의미 검색을 위한 고차원 벡터 데이터(임베딩) |
+  | `vector` | `VectorData` / `List<num>` | 의미 최근접 검색용 밀집 벡터(Embedding) |
+  | `sparse` | `SparseVectorData` | 희소 검색용 신경 희소 벡터 |
 
 - **`PrimaryKeyType` 자동 생성 전략**:
   | 전략 | 설명 | 특징 |
@@ -345,7 +347,7 @@ const appSchemas = [userSchema];
 - `createIndex`: 고주파 필터링, 정렬 또는 관계를 위한 인덱스 생성
 - `fieldId` / `tableId`: 마이그레이션 중 필드 및 테이블에 대한 이름 변경 감지 지원
 
-또한 `unique: true`은 단일 필드 고유 인덱스를 자동으로 생성합니다. `createIndex: true` 및 외래 키는 자동으로 단일 필드 일반 인덱스를 생성합니다. 복합 인덱스, 명명된 인덱스 또는 벡터 인덱스가 필요한 경우 `indexes`을 사용하세요.
+또한 `unique: true`은 단일 필드 고유 인덱스를 자동으로 생성합니다. `createIndex: true` 및 외래 키는 자동으로 단일 필드 일반 인덱스를 생성합니다. 복합 인덱스, 명명된 인덱스, 또는 텍스트 / 희소 / 벡터 검색 인덱스가 필요한 경우 `indexes`을 사용하세요.
 
 ### <a id="schema-evolution"></a>스키마 진화 (Schema Evolution)
 
@@ -724,26 +726,22 @@ await db.kv.setMany(settingsMap, durability: RecoveryDurability.durable);
 ```
 
 
-### <a id="vector-advanced"></a>벡터 필드, 벡터 인덱스 및 하이브리드 검색
+### <a id="hybrid-advanced"></a>벡터, 텍스트 및 하이브리드 검색
 
-벡터 검색은 통합된 `db.query(...).matchVector(...)` 쿼리 체인을 사용합니다. 동일 체인에서 구조화 조건과 조합하거나, 다른 리콜 분기와 다중 경로 융합할 수 있습니다. 점수와 채널 진단은 `QueryResult.retrieval`로 반환되며 `data` 행과 1:1로 대응합니다. 기본키와 점수만 필요할 때는 `.select(['id'])`(또는 PK 필드명)를 우선해 엔진이 전체 행 하이드레이션을 건너뛰게 하세요. 그렇지 않으면 하이브리드 검색이 완전한 레코드(큰 임베딩 포함)를 로드해 처리량이 크게 떨어질 수 있습니다. 필터·융합이 필요 없는 전용 ANN에는 같은 코어 검색 경로로 `db.vectorSearch(...)`가 `List<VectorSearchResult>`(기본키 + 점수)를 반환합니다. 현재 예제는 벡터 + 구조화 경로 중심이며, 어휘·그래프 등 채널도 동일한 체인형 하이브리드 검색 모델을 따라 확장됩니다.
+어휘 텍스트 검색·밀집 벡터 검색·신경 희소 검색은 동일한 쿼리 체인(`matchText` / `matchVector` / `matchSparse`)을 공유합니다. 동일 체인에서 구조화 조건과 조합하거나 다중 경로로 융합할 수 있습니다. 점수와 채널 진단은 `QueryResult.retrieval`로 반환되며 `data` 행과 1:1로 대응합니다. 기본키와 점수만 필요할 때는 `.select(['id'])`(또는 PK 필드명)를 우선해 엔진이 전체 행 하이드레이션을 건너뛰게 하세요. 그렇지 않으면 하이브리드 검색이 완전한 레코드(큰 임베딩 포함)를 로드해 처리량이 크게 떨어질 수 있습니다. 필터·융합이 필요 없는 전용 ANN에는 같은 코어 검색 경로로 `db.vectorSearch(...)`가 `List<VectorSearchResult>`(기본키 + 점수)를 반환합니다.
 
-**검색 가시성**: 삽입/업데이트가 성공을 반환한 직후, 일반 인덱스 등은 바로 검색에 참여할 수 있습니다. 벡터 인덱스는 처리량에 영향을 주지 않도록 쓰기 경로에 묶여 구축되지 않으며, 즉시 검색되지 않습니다. 검색에 참여시키려면 업무 배치가 끝난 뒤 `await db.flush()`(선택적 편의 API)를 호출하고, 완료 후에야 `matchVector` / `vectorSearch`에 반영됩니다.
+**검색 가시성**: 삽입/업데이트가 성공을 반환한 직후, 일반 인덱스·텍스트 인덱스·희소 인덱스는 바로 검색에 참여할 수 있습니다. 벡터 인덱스는 처리량에 영향을 주지 않도록 쓰기 경로에 묶여 구축되지 않으며, 즉시 검색되지 않습니다. 검색에 참여시키려면 업무 배치가 끝난 뒤 `await db.flush()`(선택적 편의 API)를 호출하고, 완료 후에야 `matchVector` / `vectorSearch`에 반영됩니다.
 
 ```dart
 await db.createTables([
   const TableSchema(
-    name: 'embeddings',
+    name: 'documents',
     primaryKeyConfig: PrimaryKeyConfig(
       name: 'id',
       type: PrimaryKeyType.timestampBased,
     ),
     fields: [
-      FieldSchema(
-        name: 'document_title',
-        type: DataType.text,
-        nullable: false,
-      ),
+      FieldSchema(name: 'content', type: DataType.text, nullable: false),
       FieldSchema(
         name: 'category',
         type: DataType.text,
@@ -751,8 +749,13 @@ await db.createTables([
         createIndex: true,
       ),
       FieldSchema(
+        name: 'features',
+        type: DataType.sparse, // Neural sparse vector
+        nullable: false,
+      ),
+      FieldSchema(
         name: 'embedding',
-        type: DataType.vector, // Declare a vector field
+        type: DataType.vector, // Dense vector
         nullable: false,
         vectorConfig: VectorFieldConfig(
           dimensions: 128, // Written and queried vectors must match this width
@@ -760,12 +763,14 @@ await db.createTables([
       ),
     ],
     indexes: [
+      IndexSchema(fields: ['content'], type: IndexType.text), // Lexical text index
+      IndexSchema(fields: ['features'], type: IndexType.sparse), // Neural sparse index
       IndexSchema(
-        fields: ['embedding'], // Field to index
-        type: IndexType.vector, // Build a vector index
+        fields: ['embedding'],
+        type: IndexType.vector, // Dense vector index
         vectorConfig: VectorIndexConfig(
-          indexType: VectorIndexType.ngh, // ToStore built-in proprietary dense index
-          distanceMetric: VectorDistanceMetric.cosine, // Good for normalized embeddings
+          indexType: VectorIndexType.ngh, // NGH: ToStore built-in dense index
+          distanceMetric: VectorDistanceMetric.cosine,
         ),
       ),
     ],
@@ -773,78 +778,128 @@ await db.createTables([
 ]);
 
 final queryVector =
-    VectorData.fromList(List.generate(128, (i) => i * 0.01)); // Must match dimensions
+    VectorData.fromList(List.generate(128, (i) => i * 0.01));
+final querySparse = SparseVectorData.fromMap({12: 0.8, 45: 0.6, 90: 0.3});
 
-// 1) Recommended: chained hybrid retrieval (pure vector ANN)
-// Prefer .select([pk]) for primary key + score only — avoids full-record hydration.
-final result = await db
-    .query('embeddings')
+// 1) Lexical text retrieval (engine tokenizes TextQuery.text;
+//    or use pre-tokenized TextQuery.terms / termsWeighted)
+final textHits = await db
+    .query('documents')
     .select(['id'])
-    .matchVector('embedding', queryVector) // 기본 searchDepth = 50
+    .matchText('content', TextQuery.text('distributed kernel storage'))
+    .limit(5);
+
+// 2) Neural sparse retrieval
+final sparseHits = await db
+    .query('documents')
+    .select(['id'])
+    .matchSparse('features', querySparse, minScore: 0.30)
+    .limit(5);
+
+// 3) Dense vector ANN (default searchDepth = 50)
+final result = await db
+    .query('documents')
+    .select(['id'])
+    .matchVector('embedding', queryVector, minScore: 0.40)
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
   final record = result.data[i];
   final entry = result.retrieval?.entries[i];
   print('pk=${record['id']}, score=${entry?.score}, '
-      'distance=${entry?.meta?['distance']}');
+      'rawScore=${entry?.rawScore}, distance=${entry?.meta?['distance']}');
 }
 
-// Need business columns? omit select() (or project the fields you need) —
-// the engine then loads full table records for matched PKs (heavier).
-
-// 2) Structured filter + vector (AND hybrid)
+// 4) Structured filter + vector (AND)
 final filtered = await db
-    .query('embeddings')
+    .query('documents')
     .whereEqual('category', 'tech')
-    .matchVector('embedding', queryVector)
+    .matchVector('embedding', queryVector, minScore: 0.40)
     .limit(5);
 
-// 3) Multi-way fused recall (vector + structured paths, engine-side RRF)
-final otherVector =
-    VectorData.fromList(List.generate(128, (i) => i * 0.012));
+// 5) Multi-way fusion: text + sparse + vector (default weightedScore)
 final fused = await db
-    .query('embeddings')
-    .matchVector('embedding', queryVector, weight: 1.0)
-    .orMatchVector('embedding', otherVector, weight: 0.6, minScore: 0.2)
-    .or()
-    .whereEqual('category', 'tech')
+    .query('documents')
+    .matchText('content', TextQuery.text('distributed storage'), weight: 0.4)
+    .matchSparse('features', querySparse, weight: 0.3, minScore: 0.20)
+    .matchVector('embedding', queryVector, weight: 0.6, minScore: 0.40)
     .limit(10);
+print('fusion=${fused.retrieval?.fusionMethod}'); // weightedScore
 
-print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
+// Opt into rank-only fusion (relative scores — not absolute relevance bands)
+final fusedRrf = await db
+    .query('documents')
+    .matchText('content', TextQuery.text('distributed storage'), weight: 0.4)
+    .matchVector('embedding', queryVector, weight: 0.6, minScore: 0.40)
+    .fusionMethod(RetrievalFusionMethod.rrf)
+    .limit(10);
+print('fusion=${fusedRrf.retrieval?.fusionMethod}'); // rrf
 
-// Dedicated ANN (same core path; PK + score only, no query chain / fusion)
+// Dedicated ANN (PK + score only; no query chain / fusion)
 final ann = await db.vectorSearch(
-  'embeddings',
+  'documents',
   fieldName: 'embedding',
   queryVector: queryVector,
   topK: 5,
+  minScore: 0.40,
 );
 ```
 
-**스키마 / 벡터 인덱스 설정**(`VectorFieldConfig`, `VectorIndexConfig`):
+**채널 / 스키마 대응**:
+
+| 채널 | 필드 유형 | 인덱스 | 쿼리 API | 쿼리 값 |
+| :--- | :--- | :--- | :--- | :--- |
+| 어휘 텍스트 | `DataType.text` | `IndexType.text` | `matchText` / `orMatchText` | `TextQuery.text` / `terms` / `termsWeighted` |
+| 신경 희소 | `DataType.sparse` | `IndexType.sparse` | `matchSparse` / `orMatchSparse` | `SparseVectorData` |
+| 밀집 벡터 | `DataType.vector` | `IndexType.vector` | `matchVector` / `orMatchVector` | `VectorData` 등 |
+
+**밀집 벡터 설정**(`VectorFieldConfig`, `VectorIndexConfig`):
 
 - `dimensions`: 실제로 작성하는 임베딩 너비와 일치해야 합니다
 - `indexType`: 밀집 벡터 알고리즘 식별자. 현재 `ngh`
 - `distanceMetric`: 인덱스 측 유사도 메트릭(구축·검색 공통). `cosine`은 의미 임베딩에 일반적, `l2`는 유클리드 거리, `innerProduct`는 내적 검색에 적합합니다. 데이터 기록 후 변경 시 벡터 인덱스 재구축이 필요합니다.
 
-**체인 검색 매개변수**(`matchVector` / `orMatchVector`, 및 쿼리 체인의 `limit`):
+**체인 검색 매개변수**(각 `match*` / `orMatch*`, 및 쿼리 체인의 `limit`):
 
-- `field` / `vector`: 대상 벡터 필드와 쿼리 벡터(`VectorData` / `List<num>` / `Float32List`)
-- `searchDepth`: 선택적 검색 깊이(`>= 1`, 기본값 `50`). 값을 키우면 보통 리콜이 오르고 지연도 늘어납니다. 근사 최근접 이웃이며 **recall@K를 보장하지 않습니다**. 코퍼스가 커지면 더 많은 이웃을 찾고 싶을 때 올리세요.
-- `weight`: 다중 경로 리콜 시 해당 채널의 융합 가중치. 기본값 `1.0`
-- `minScore`: 정규화 유사도 하한 `[0.0 ~ 1.0]`. 임계값 미만 후보는 제거됩니다
-- `distanceThreshold`: 거리 상한. 초과 후보는 제외됩니다
-- `limit`: 반환할 결과 수(일반적인 ANN의 topK에 해당)
+- 텍스트
+  - `TextQuery.text`: 엔진이 토큰화
+  - `TextQuery.terms` / `termsWeighted`: 사전 토큰화됨. 재토큰화 없음. 라틴 토큰은 인덱스 측과 일치해야 함(보통 소문자)
+  - `operator`: `or`(기본, 용어 합집합 랭킹) 또는 `and`(양의 가중치 용어가 모두 적중해야 랭킹)
+  - 구문 일치는 미지원
+- 희소
+  - `SparseVectorData` / `SparseVectorData.fromMap(...)`: 희소 쿼리 벡터
+  - 문서 측 가중치는 `(0, 1]`에 두는 것이 바람직
+- 벡터
+  - `field` / `vector`: 대상 필드와 쿼리 벡터
+  - `searchDepth`: `>= 1`, 기본값 `50`. 클수록 보통 리콜과 지연이 증가. 근사 최근접 이웃이며 **recall@K를 보장하지 않습니다**
+  - `distanceThreshold`: 거리 상한
+- 공통
+  - `weight`: 다중 경로 융합 가중치. 기본값 `1.0`
+  - `minScore`: 관련도 하한
+  - `limit`: 반환 건수(topK)
+  - `.fusionMethod(...)`: 다중 경로 기본값 `weightedScore`. `rrf`로 전환 가능
 
-**결과 참고 사항**(`QueryResult`):
+**결과 및 점수 설명**(`QueryResult` / `VectorSearchResult`):
 
-- 비즈니스 행 데이터는 `data`, 검색 점수와 채널 정보는 `retrieval.entries`에 있으며 `data`와 **1:1**로 대응합니다
-- 고처리량 ANN / 하이브리드 리콜에서는 `.select(['id'])`(PK 필드명)를 사용해 `data`를 PK만 남기고 점수는 `retrieval`에 둡니다
-- `entry.score`: 정규화된 유사도 / 융합 점수. 보통 `0 ~ 1` 범위이며, 클수록 더 관련성이 높음을 의미합니다
-- `entry.meta['distance']`: 원시 거리(벡터 채널에서 흔함). `l2` / `cosine`의 경우 일반적으로 작을수록 더 가깝습니다
-- `retrieval.fusionMethod`: 단일 채널은 대개 `single`, 다중 경로 융합 리콜은 대개 `rrf`(Reciprocal Rank Fusion)입니다
-- 최상위 `db.vectorSearch(...)`는 구조화 필터나 다중 경로 융합이 필요 없는 전용 ANN에 `List<VectorSearchResult>`(`primaryKey` / `score` / `distance`)를 반환합니다
+- 비즈니스 레코드는 `data`, 검색 점수와 채널 정보는 `retrieval.entries`에 있으며 `data`와 **1:1** 대응. 기본키와 점수만 필요하면 `.select(['id'])`를 우선하세요.
+- `score`(정규화 관련도, `0.0 ~ 1.0`): 텍스트 / 희소 / 벡터에서 통일(높을수록 관련). 벡터 완전 자기 일치는 `1.0`. `minScore`로 강한 히트를 유지하고 약한 히트를 제거. 기본 다중 경로 `weightedScore` 융합은 강한 단일 경로 히트를 유지. 텍스트와 희소는 `[0.0, 1.0)`에 머무름.
+- `rawScore`: 비정규화 물리량(코사인 / 내적 / L2 / 텍스트 강도). 하위 메트릭이 필요하면 `rawScore` / `distance`.
+- `entry.meta['distance']`: 벡터 채널의 ANN 거리(작을수록 가까움).
+- `retrieval.fusionMethod`: 단일 채널은 `null`; 다중 경로는 기본 `weightedScore`(`.fusionMethod(RetrievalFusionMethod.rrf)`로 전환 가능).
+- 최상위 `db.vectorSearch(...)`는 전용 ANN용 `List<VectorSearchResult>`(`primaryKey` / `score` / `rawScore` / `distance`)를 반환. 선택적 `minScore`는 `matchVector`와 동일한 관련도 하한(건수는 `topK`보다 적을 수 있음).
+
+**관련도(`score`) 및 임계값 참조 기준**(단일 채널 및 다중 경로 `weightedScore`; `rrf` 제외). 일반 embedding(**차원 ≥ 128**)용; 저차원에서는 약한 이웃도 높은 점수가 날 수 있으므로 필요 시 `minScore`를 높이거나 `rawScore`를 사용하세요:
+
+| 관련도 (`score`) | 의미 및 대표 시나리오 |
+| :--- | :--- |
+| `>= 0.85` | 동일 엔티티(얼굴 검증, 생체, 정확 중복 제거) |
+| `>= 0.70` | 고신뢰 시맨틱(핵심 사실, 정밀 Q&A) |
+| `>= 0.40` | 기본 시맨틱 관련(일반 RAG, 환각 억제) |
+| `>= 0.30` | 넓은 초기 리콜(퍼지 탐색, 재순위 후보 풀) |
+| `< 0.30` | 약한 연관 또는 배경 잡음 |
+
+필요에 따라 채널 `minScore`로 저관련 히트를 필터링하세요.
+
 
 ### <a id="ttl-config"></a>테이블 수준 TTL(자동 시간 기반 만료)
 

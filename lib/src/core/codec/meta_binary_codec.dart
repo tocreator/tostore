@@ -99,6 +99,10 @@ abstract final class NghIndexMetaFieldId {
   static const int pkBackfillPage = 28;
   static const int leafPageSize = 29;
   static const int navPageSize = 30;
+  static const int nullFloorMu = 31;
+  static const int nullFloorDEff = 32;
+  static const int nullFloorAtVectors = 33;
+  static const int nullFloorVersion = 34;
 }
 
 /// Discriminator for global meta blobs embedded in partition-0 page 0.
@@ -544,6 +548,22 @@ final class NghIndexMetaCodec {
       w.writeFieldTag(NghIndexMetaFieldId.navPageSize, WireType.varint);
       w.writeVarint(meta.navPageSize);
     }
+    if (meta.nullFloorMu != null) {
+      w.writeFieldTag(NghIndexMetaFieldId.nullFloorMu, WireType.fixed64);
+      w.writeDouble(meta.nullFloorMu!);
+    }
+    if (meta.nullFloorDEff != null) {
+      w.writeFieldTag(NghIndexMetaFieldId.nullFloorDEff, WireType.fixed64);
+      w.writeDouble(meta.nullFloorDEff!);
+    }
+    if (meta.nullFloorAtVectors != null) {
+      w.writeFieldTag(NghIndexMetaFieldId.nullFloorAtVectors, WireType.varint);
+      w.writeVarint(meta.nullFloorAtVectors!);
+    }
+    if (meta.nullFloorVersion != null) {
+      w.writeFieldTag(NghIndexMetaFieldId.nullFloorVersion, WireType.varint);
+      w.writeVarint(meta.nullFloorVersion!);
+    }
     return w.view;
   }
 
@@ -583,6 +603,10 @@ final class NghIndexMetaCodec {
     int pkBackfillPage = 0;
     int leafPageSize = 0;
     int navPageSize = 0;
+    double? nullFloorMu;
+    double? nullFloorDEff;
+    int? nullFloorAtVectors;
+    int? nullFloorVersion;
 
     while (!reader.isEOF) {
       final (fieldId, wireType) = reader.readFieldTag();
@@ -680,6 +704,18 @@ final class NghIndexMetaCodec {
         case NghIndexMetaFieldId.navPageSize:
           navPageSize = reader.readVarint();
           break;
+        case NghIndexMetaFieldId.nullFloorMu:
+          nullFloorMu = reader.readDouble();
+          break;
+        case NghIndexMetaFieldId.nullFloorDEff:
+          nullFloorDEff = reader.readDouble();
+          break;
+        case NghIndexMetaFieldId.nullFloorAtVectors:
+          nullFloorAtVectors = reader.readVarint();
+          break;
+        case NghIndexMetaFieldId.nullFloorVersion:
+          nullFloorVersion = reader.readVarint();
+          break;
         default:
           reader.skipField(wireType);
       }
@@ -730,6 +766,10 @@ final class NghIndexMetaCodec {
       pkBackfillPage: pkBackfillPage,
       leafPageSize: leafPageSize,
       navPageSize: navPageSize,
+      nullFloorMu: nullFloorMu,
+      nullFloorDEff: nullFloorDEff,
+      nullFloorAtVectors: nullFloorAtVectors,
+      nullFloorVersion: nullFloorVersion,
     );
   }
 

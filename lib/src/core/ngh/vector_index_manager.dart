@@ -22,6 +22,7 @@ import '../engine/data_store_impl.dart';
 import '../maintenance/prewarm_budget_ledger.dart';
 import '../maintenance/resource_manager.dart';
 import 'ngh_graph_engine.dart';
+import 'ngh_null_floor_estimator.dart';
 import 'ngh_page.dart';
 import 'ngh_partition_manager.dart';
 import 'vector_cache.dart';
@@ -727,6 +728,8 @@ class VectorIndexManager {
   /// Perform approximate nearest neighbor search on a vector field.
   ///
   /// Returns the top-[topK] most similar records, sorted by similarity.
+  /// When [minScore] is set, drops hits whose normalized score is below
+  /// the floor (same semantics as `matchVector`).
   Future<List<VectorSearchResult>> vectorSearch({
     required TableContext table,
     required String fieldName,
@@ -734,6 +737,7 @@ class VectorIndexManager {
     int topK = 10,
     int? searchDepth,
     double? distanceThreshold,
+    double? minScore,
   }) {
     final indexUid = _resolveVectorIndexUid(table, fieldName);
     if (indexUid == null) {
@@ -750,6 +754,7 @@ class VectorIndexManager {
         topK: topK,
         searchDepth: searchDepth,
         distanceThreshold: distanceThreshold,
+        minScore: minScore,
       );
     }
     if (meta.isBuilding) {
@@ -760,6 +765,7 @@ class VectorIndexManager {
         topK: topK,
         searchDepth: searchDepth,
         distanceThreshold: distanceThreshold,
+        minScore: minScore,
       );
     }
     if (meta.totalVectors == 0) {
@@ -774,6 +780,7 @@ class VectorIndexManager {
         topK: topK,
         searchDepth: searchDepth,
         distanceThreshold: distanceThreshold,
+        minScore: minScore,
       );
     }
 
@@ -808,15 +815,16 @@ class VectorIndexManager {
       if (hot.isEmpty) {
         return Future<List<VectorSearchResult>>.value(const []);
       }
-      final metric = meta.distanceMetric;
       final entries = <VectorSearchResult>[];
       for (final r in hot) {
         final pk = r.primaryKey;
         if (pk == null || pk.isEmpty) continue;
+        if (minScore != null && r.score < minScore) continue;
         entries.add(VectorSearchResult(
           primaryKey: pk,
           distance: r.distance,
-          score: _distanceToScore(r.distance, metric),
+          score: r.score,
+          rawScore: r.rawScore,
         ));
       }
       return Future<List<VectorSearchResult>>.value(entries);
@@ -830,6 +838,7 @@ class VectorIndexManager {
       topK: topK,
       searchDepth: searchDepth,
       distanceThreshold: distanceThreshold,
+      minScore: minScore,
     );
   }
 
@@ -841,6 +850,7 @@ class VectorIndexManager {
     required int topK,
     int? searchDepth,
     double? distanceThreshold,
+    double? minScore,
   }) async {
     var meta = _vectorCache.getMeta(table, indexUid);
     meta ??= await _loadMeta(table, indexUid);
@@ -852,6 +862,7 @@ class VectorIndexManager {
         topK: topK,
         searchDepth: searchDepth,
         distanceThreshold: distanceThreshold,
+        minScore: minScore,
       );
     }
     if (meta.totalVectors == 0) {
@@ -884,10 +895,12 @@ class VectorIndexManager {
     for (final r in results) {
       final pk = r.primaryKey;
       if (pk == null || pk.isEmpty) continue;
+      if (minScore != null && r.score < minScore) continue;
       entries.add(VectorSearchResult(
         primaryKey: pk,
         distance: r.distance,
-        score: _distanceToScore(r.distance, meta.distanceMetric),
+        score: r.score,
+        rawScore: r.rawScore,
       ));
     }
     return entries;
@@ -900,6 +913,7 @@ class VectorIndexManager {
     required int topK,
     int? searchDepth,
     double? distanceThreshold,
+    double? minScore,
   }) async {
     if (!await _legacyIo.hasOldIndex(table, indexUid)) {
       return const [];
@@ -923,10 +937,12 @@ class VectorIndexManager {
     for (final r in results) {
       final pk = r.primaryKey;
       if (pk == null || pk.isEmpty) continue;
+      if (minScore != null && r.score < minScore) continue;
       entries.add(VectorSearchResult(
         primaryKey: pk,
         distance: r.distance,
-        score: _distanceToScore(r.distance, meta.distanceMetric),
+        score: r.score,
+        rawScore: r.rawScore,
       ));
     }
     return entries;
@@ -1528,7 +1544,7 @@ class VectorIndexManager {
   ///
   /// Repairs graph edges around deleted nodes and reclaims tombstone slots.
   /// Should be called periodically by the compaction manager, using
-  /// [WorkloadType.maintenance] tokens.
+  /// [WorkloadType.maintenance] tokens. Also refreshes low-D null-floor stats.
   Future<void> compactTombstones(TableContext table,
       {int maxVisitedPages = 100}) async {
     final vectorIndexes =
@@ -1548,44 +1564,147 @@ class VectorIndexManager {
       meta ??= await _loadMeta(table, indexUid);
       if (meta == null || meta.isBuilding) continue;
 
-      // Skip if deletion ratio is low (< 10%)
-      if (meta.totalVectors == 0 ||
-          meta.deletedCount / meta.totalVectors < 0.1) {
-        continue;
+      // Skip compaction if deletion ratio is low (< 10%), but still try
+      // null-floor estimation for eligible low-D indexes.
+      final needsCompact =
+          meta.totalVectors > 0 && meta.deletedCount / meta.totalVectors >= 0.1;
+      if (needsCompact) {
+        final result = await _graphEngine.compactTombstones(
+          table: table,
+          indexUid: indexUid,
+          meta: meta,
+          maxVisitedPages: maxVisitedPages,
+        );
+
+        if (result.dirtyLeafPages.isNotEmpty ||
+            result.dirtyNavPages.isNotEmpty ||
+            result.dirtyPkmapPages.isNotEmpty ||
+            result.freeLeafPages.isNotEmpty) {
+          final compactedMeta = result.meta;
+          await _dataStore.parallelJournalManager.runWithPageRedoBatch(
+            table: table,
+            action: (ctx, {required bool ownedBatch}) async {
+              final next = await _partitionManager.writeChanges(
+                table: table,
+                indexUid: indexUid,
+                meta: compactedMeta,
+                dirtyLeafPages: result.dirtyLeafPages,
+                dirtyNavPages: result.dirtyNavPages,
+                dirtyPkmapPages: result.dirtyPkmapPages,
+                freeLeafPages: result.freeLeafPages,
+                deletedDelta: -result.compactedCount,
+                batchContext: ctx,
+              );
+              await _persistMeta(table, indexUid, next, batchContext: ctx);
+              _vectorCache.putMeta(table, indexUid, next);
+            },
+          );
+          meta = _vectorCache.getMeta(table, indexUid) ?? meta;
+        }
       }
 
-      final result = await _graphEngine.compactTombstones(
-        table: table,
-        indexUid: indexUid,
-        meta: meta,
-        maxVisitedPages: maxVisitedPages,
-      );
+      await _maybeEstimateNullFloor(table, indexUid, meta, yc);
+    }
+  }
 
-      if (result.dirtyLeafPages.isNotEmpty ||
-          result.dirtyNavPages.isNotEmpty ||
-          result.dirtyPkmapPages.isNotEmpty ||
-          result.freeLeafPages.isNotEmpty) {
-        final compactedMeta = result.meta;
-        await _dataStore.parallelJournalManager.runWithPageRedoBatch(
-          table: table,
-          action: (ctx, {required bool ownedBatch}) async {
-            final next = await _partitionManager.writeChanges(
-              table: table,
-              indexUid: indexUid,
-              meta: compactedMeta,
-              dirtyLeafPages: result.dirtyLeafPages,
-              dirtyNavPages: result.dirtyNavPages,
-              dirtyPkmapPages: result.dirtyPkmapPages,
-              freeLeafPages: result.freeLeafPages,
-              deletedDelta: -result.compactedCount,
-              batchContext: ctx,
-            );
-            await _persistMeta(table, indexUid, next, batchContext: ctx);
-            _vectorCache.putMeta(table, indexUid, next);
-          },
+  /// O(1) cached meta peek for query calibration injection.
+  NghIndexMeta? peekMetaForField(TableContext table, String fieldName) {
+    final indexUid = _resolveVectorIndexUid(table, fieldName);
+    if (indexUid == null) return null;
+    return _vectorCache.getMeta(table, indexUid);
+  }
+
+  Future<void> _maybeEstimateNullFloor(
+    TableContext table,
+    IndexUid indexUid,
+    NghIndexMeta meta,
+    YieldController yc,
+  ) async {
+    if (!NghNullFloorEstimator.shouldEstimate(meta)) return;
+    try {
+      final samples = await _sampleLiveUnitVectors(table, indexUid, meta, yc);
+      if (samples.length < 64) return;
+      final rng = Random(
+        NghNullFloorEstimator.seedFor(indexUid.value, meta.totalVectors),
+      );
+      final fit = NghNullFloorEstimator.fitMomentMatching(
+        unitSamples: samples,
+        dimensions: meta.dimensions,
+        rng: rng,
+      );
+      if (fit == null) return;
+      final next = meta.copyWith(
+        nullFloorMu: fit.mu,
+        nullFloorDEff: fit.dEff,
+        nullFloorAtVectors: meta.totalVectors,
+        nullFloorVersion: NghNullFloorEstimator.algorithmVersion,
+      );
+      await _persistMeta(table, indexUid, next);
+      _vectorCache.putMeta(table, indexUid, next);
+    } catch (e) {
+      Logger.warn(
+        'Null-floor estimate failed: table=${table.tableName}, index=$indexUid',
+        rawError: e,
+      );
+    }
+  }
+
+  Future<List<Float32List>> _sampleLiveUnitVectors(
+    TableContext table,
+    IndexUid indexUid,
+    NghIndexMeta meta,
+    YieldController yc,
+  ) async {
+    final int target = NghNullFloorEstimator.sampleSize(meta.dimensions);
+    final int dim = meta.dimensions;
+    final out = <Float32List>[];
+    final rng = Random(
+      NghNullFloorEstimator.seedFor(indexUid.value, meta.totalVectors),
+    );
+    final int partCount = max(1, meta.leafPartitionCount);
+    final int maxPage = max(NghIndexMeta.firstDataPageNo, meta.leafNextPageNo);
+    final int maxAttempts = min(512, target * 2 + 16);
+
+    for (int attempt = 0;
+        attempt < maxAttempts && out.length < target;
+        attempt++) {
+      final y = yc.maybeYield();
+      if (y != null) await y;
+      final part = rng.nextInt(partCount);
+      final pageNo = NghIndexMeta.firstDataPageNo +
+          rng.nextInt(max(1, maxPage - NghIndexMeta.firstDataPageNo + 1));
+      final page = await _partitionManager.readLeafPage(
+        table,
+        indexUid,
+        meta,
+        part,
+        pageNo,
+      );
+      if (page == null) continue;
+      for (final slot in page.slots) {
+        if (slot.isDeleted) continue;
+        if (out.length >= target) break;
+        final raw = ScalarQuantizer.reconstructSq8(
+          slot.sq8Codes,
+          slot.offset,
+          slot.scale,
         );
+        // Truncate / pad to declared dimensions.
+        Float32List vec;
+        if (raw.length == dim) {
+          vec = raw;
+        } else {
+          vec = Float32List(dim);
+          final n = min(dim, raw.length);
+          for (int i = 0; i < n; i++) {
+            vec[i] = raw[i];
+          }
+        }
+        final unit = NghNullFloorEstimator.toUnit(vec);
+        if (unit != null) out.add(unit);
       }
     }
+    return out;
   }
 
   // =====================================================================
@@ -1874,10 +1993,5 @@ class VectorIndexManager {
       }
     }
     return f32;
-  }
-
-  /// Convert ANN distance to public similarity (`higher` = better).
-  double _distanceToScore(double distance, VectorDistanceMetric metric) {
-    return metric.similarityFromDistance(distance);
   }
 }

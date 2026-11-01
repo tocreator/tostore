@@ -113,8 +113,8 @@ const FieldSchema({
 | `datetime` | `DateTime` / `String` | Stored ISO8601 |
 | `array` | `List` | |
 | `json` | `Map<String, dynamic>` | |
-| `vector` | `VectorData` / `List<num>` | Needs `vectorConfig.dimensions` in `1..65535` |
-| `sparse` | `SparseVectorData` / `Map<int, num>` | Learned sparse vector dimensions and weights |
+| `vector` | `VectorData` / `List<num>` | Dense embedding; needs `vectorConfig.dimensions` in `1..65535` |
+| `sparse` | `SparseVectorData` / `Map<int, num>` | Neural sparse vector (non-zero dim → weight); prefer doc weights in `(0, 1]` |
 | `dynamic` | arbitrary Dart | No forced conversion |
 
 ### Constraints (engine-enforced)

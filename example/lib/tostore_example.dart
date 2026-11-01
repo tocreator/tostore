@@ -10,6 +10,7 @@ import 'testing/benchmark_schemas.dart';
 import 'testing/example_schemas.dart';
 import 'testing/log_service.dart';
 import 'testing/vector_recall.dart';
+import 'testing/vector_score_baseline_tester.dart';
 
 String _statusErrorMessage(
   Iterable<ResultStatus> statuses, {
@@ -948,6 +949,7 @@ class ToStoreExample {
     int vectorGroupId = 0,
     TextMatchOperator operator = TextMatchOperator.or,
     RetrievalFusionMethod fusionMethod = RetrievalFusionMethod.weightedScore,
+    double? minScore,
   }) async {
     final query = queryText.trim();
     if (useText && query.isEmpty) {
@@ -1014,6 +1016,7 @@ class ToStoreExample {
           vectorField!,
           queryVector!,
           searchDepth: depth,
+          minScore: minScore,
         );
       }
       if (useText) {
@@ -1022,11 +1025,13 @@ class ToStoreExample {
                 textFields.first,
                 textQuery!,
                 operator: operator,
+                minScore: minScore,
               )
             : builder.matchText(
                 textFields.first,
                 textQuery!,
                 operator: operator,
+                minScore: minScore,
               );
       }
       if (category != null && category.isNotEmpty) {
@@ -1040,6 +1045,14 @@ class ToStoreExample {
         builder = builder.fusionMethod(fusionMethod);
       }
       return builder.limit(k);
+    }
+
+    String relevanceBand(double score) {
+      if (score >= 0.85) return 'Entity>=0.85';
+      if (score >= 0.70) return 'HighConf>=0.70';
+      if (score >= 0.40) return 'RAG>=0.40';
+      if (score >= 0.30) return 'Broad>=0.30';
+      return 'Low/Noise<0.30';
     }
 
     final previewSw = Stopwatch()..start();
@@ -1062,28 +1075,41 @@ class ToStoreExample {
         us >= 1000 ? '${(us / 1000).toStringAsFixed(2)} ms' : '$us μs';
     final fusionLabel =
         useVector && useText ? ' fusion=${fusionMethod.name}' : '';
+    final minScoreLabel =
+        minScore == null ? '' : ' minScore=${minScore.toStringAsFixed(2)}';
     final report = StringBuffer()
       ..writeln(
         'Hybrid search on $tableName [${channels.join(' + ')}] '
-        'topK=$k depth=$depth records=$recordCount$fusionLabel'
+        'topK=$k depth=$depth records=$recordCount$fusionLabel$minScoreLabel'
         '${useText ? ' query="$query"' : ''}'
         '${useVector ? ' vectorGroup=$vectorGroupId' : ''}',
       )
-      ..writeln('Hits ${preview.data.length}/$k in $timeLabel');
+      ..writeln('Hits ${preview.data.length}/$k in $timeLabel'
+          '${minScore == null ? "" : " (filtered by minScore; discarded below floor)"}');
     final entries = preview.retrieval?.entries ?? const <RetrievalEntry>[];
+    var belowRag = 0;
     for (var i = 0; i < preview.data.length; i++) {
       final record = preview.data[i];
       final entry = i < entries.length ? entries[i] : null;
       final scoreText = entry == null ? '-' : entry.score.toStringAsFixed(4);
+      final band = entry == null ? '-' : relevanceBand(entry.score);
+      if (entry != null && entry.score < 0.40) belowRag++;
       final channel = entry?.channel.name ?? '-';
       final headline = record['headline'] ?? record['title'];
       report.write(
-        '#${i + 1} $pk=${record[pk]} channel=$channel score=$scoreText'
+        '#${i + 1} $pk=${record[pk]} channel=$channel '
+        'score=$scoreText [$band]'
         '${record['category'] == null ? '' : ' category=${record['category']}'}'
         '${record['year'] == null ? '' : ' year=${record['year']}'}'
         '${headline == null ? '' : ' headline=$headline'}',
       );
-      if (i != preview.data.length - 1 || runs > 1) report.writeln();
+      report.writeln();
+    }
+    if (minScore == null && preview.data.isNotEmpty) {
+      report.writeln(
+        'Low/noise below RAG floor (<0.40): $belowRag/${preview.data.length} '
+        '(set minScore=0.40 to discard and reduce hallucination risk)',
+      );
     }
 
     if (runs > 1) {
@@ -1758,6 +1784,35 @@ class ToStoreExample {
       ),
       LogLevel.info,
     );
+  }
+
+  /// Runs read-only relevance baseline calibration and `minScore` cutoff
+  /// verification on [tableName] using its existing records.
+  ///
+  /// Returns `true` on pass, `false` on failure, or `null` when skipped (e.g.
+  /// empty table).
+  Future<bool?> vectorScoreBaselineTest(
+    String tableName, {
+    int searchDepth = 50,
+    int topK = 10,
+    void Function(int completed, int total)? onProgress,
+  }) async {
+    final report = await VectorScoreBaselineTester.run(
+      db: db,
+      tableName: tableName,
+      searchDepth: searchDepth,
+      topK: topK,
+      onProgress: onProgress,
+      onLog: (msg) => logService.add(msg, LogLevel.warn),
+    );
+    if (report == null) {
+      return null;
+    }
+    logService.add(
+      report.formatSummary(),
+      report.allPassed ? LogLevel.info : LogLevel.error,
+    );
+    return report.allPassed;
   }
 
   void _logVectorSearchBenchmarkSummary({

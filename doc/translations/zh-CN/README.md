@@ -39,21 +39,19 @@
 - [为什么选择ToStore](#why-tostore) | [核心特性](#key-features) | [安装指南](#installation) | [KV模式](#quick-start-kv) | [表模式](#quick-start-table) | [内存模式](#quick-start-memory)
 - [表结构定义](#schema-definition) | [分布式架构](#distributed-architecture) | [级联外键](#foreign-keys) | [移动/桌面端](#mobile-integration) | [服务端/智能体](#server-integration) | [主键算法](#primary-key-examples)
 - [高级查询 (JOIN)](#query-advanced) | [聚合与统计](#aggregation-stats) | [复杂逻辑 (Condition)](#query-condition) | [响应式监听 (watch)](#reactive-query) | [流式查询](#streaming-query)
-- [KV进阶](#kv-advanced) | [批量操作](#bulk-operations) | [恢复保障](#recovery-durability) | [向量与混合检索](#vector-advanced) | [表级 TTL](#ttl-config) | [高效分页](#query-pagination) | [内存探针与同步检索 (peek)](#query-peek) | [查询缓存](#query-cache) | [原子操作](#atomic-expressions) | [事务](#transactions)
+- [KV进阶](#kv-advanced) | [批量操作](#bulk-operations) | [恢复保障](#recovery-durability) | [混合检索（稠密 / 稀疏 / 文本）](#hybrid-advanced) | [表级 TTL](#ttl-config) | [高效分页](#query-pagination) | [内存探针与同步检索 (peek)](#query-peek) | [查询缓存](#query-cache) | [原子操作](#atomic-expressions) | [事务](#transactions)
 - [管理维护](#database-maintenance) | [安全配置](#security-config) | [错误处理](#error-handling) | [性能与诊断](#performance) | [欢迎贡献](#contribute) | [AI 编程助手](#for-ai-coding-assistants)
 
 
 ## <a id="why-tostore"></a>为什么选择 ToStore？
 
-ToStore 是面向 AGI 时代与边缘智能场景设计的现代化数据引擎。基于自寻径节点架构 (Self-Routing)，节点拥有较高自治性与弹性水平扩展，性能表现与数据规模逻辑解耦。
+ToStore 是面向 AGI 时代与边缘智能场景设计的现代化数据引擎。基于自寻径节点架构 (Self-Routing)，节点高自治、可弹性水平扩展，性能与数据规模逻辑解耦——边缘与云端单机均设计支撑百亿级以上数据量。
 
-运行态建模与非阻塞执行路径，架构演进全程在线、业务完全无感——表结构声明式变更、密钥轮换、海量数据重构均可在线无感完成。面向 Agent 与自动化运维，支撑其自主演进与持续迭代，服务不中断。
+运行态建模与非阻塞执行路径，架构演进全程在线、业务完全无感——表结构声明式变更、密钥轮换、海量数据重构均可在线无感完成。支撑智能体与自动化运维的运行时建表、动态记忆演化及其自主演进与持续迭代，服务不中断。
 
-原生支持关系型结构化数据、高维向量数据与非结构化数据的统一数据引擎，内建混合检索与多路召回融合能力，兼具工业级数据库能力，如 ACID 事务、复杂关系查询（JOIN、级联外键）、表级 TTL、聚合计算，以及分布式主键算法、原子性表达式、加密保护、多空间隔离与故障自愈等。
+统一承载关系型结构化数据、稠密向量、神经稀疏向量与非结构化文本；内建词法文本检索、稠密向量检索、神经稀疏检索及多路召回融合。兼具 ACID 事务、复杂关系查询（JOIN、级联外键）、表级 TTL、聚合计算，以及分布式主键算法、原子性表达式、加密保护、多空间隔离与故障自愈等工业级能力。
 
-随着计算重心持续向端侧边缘智能偏移，终端设备不再只是"内容展示器"，而是承担局部生成、环境感知、实时决策与数据协同的智能节点。ToStore 赋予边缘端支撑海量数据与复杂 AI 局部生成的分布式能力，边云节点深度智能协同，为多模态交互、语义向量混合检索、空间建模及边缘自主协同等场景提供可靠的数据基座。
-
-
+随着计算重心持续向端侧边缘智能偏移，终端不再只是"内容展示器"，而是承担局部生成、环境感知、实时决策与数据协同的智能节点。ToStore 为边缘端提供海量数据与复杂 AI 局部生成所需的分布式能力，边云深度协同，为多模态交互、长期记忆、RAG 检索增强生成与本地知识库、混合检索、空间建模及边缘自主协同提供可靠数据基座。
 
 
 ## <a id="key-features"></a>核心特性
@@ -62,21 +60,21 @@ ToStore 是面向 AGI 时代与边缘智能场景设计的现代化数据引擎�
   - 表结构声明式变更——自动识别重构，无需手动维护版本
   - 密钥轮换、表结构迁移、海量重构——全程在线，业务无感
   - 内置状态规范，支撑自动化运维与智能体精准识别
-  - 架构自主演进、持续迭代，服务不中断
+  - 支撑自主演进与持续迭代，服务不中断
 
 - 🧠 **自寻径分布式架构**
   - 自寻径节点架构，物理寻址与数据规模解耦
   - 高自治节点互联协同，构建灵活的数据拓扑
-  - 弹性水平扩展，边缘智能节点与云端深度协同
+  - 弹性水平扩展；单机亦设计支撑百亿级以上数据量
 
 - 🌐 **统一的跨平台数据引擎**
   - 移动端、桌面端、Web 与服务端统一 API
-  - 覆盖关系型结构化数据、高维向量与非结构化数据
+  - 覆盖关系型数据、稠密 / 神经稀疏向量与文本检索
   - 从本地存储到边云协同的完整数据链路
 
 - 🔍 **结构化查询与混合检索**
   - 复杂条件、JOIN、聚合与表级 TTL
-  - 多通道召回同链组合（向量 + 结构化等）
+  - 词法文本检索、稠密向量检索、神经稀疏检索同链组合
   - 多路召回融合排序，分数与通道诊断随结果返回
 
 - ⚡ **并行执行与资源调度**
@@ -84,7 +82,8 @@ ToStore 是面向 AGI 时代与边缘智能场景设计的现代化数据引擎�
   - 资源感知负载调度；多节点并行协同与任务拆分
   - 时间切片机制，高负载下 UI 动画依然流畅
 
-- 🔐 **数据安全与隔离**
+- 🔐 **离线优先与隐私安全**
+  - 数据可留存本端、离线可用，降低云端依赖与外泄面
   - 多空间隔离与可选全局共享，天然适配多用户 / 多租户
   - 内置 ChaCha20-Poly1305 与 AES-256-GCM 加密
   - 经多重复杂灾难性场景恢复验证
@@ -335,7 +334,8 @@ const appSchemas = [userSchema];
   | `datetime` | `DateTime` / `String` | 日期时间，底层以 ISO8601 存储 |
   | `array` | `List` | 列表/数组类型 |
   | `json` | `Map<String, dynamic>` | JSON 对象，适合存储动态结构化数据 |
-  | `vector` | `VectorData` / `List<num>` | 高维向量数据，用于 AI 语义检索 (Embedding) |
+  | `vector` | `VectorData` / `List<num>` | 稠密向量，用于语义近邻检索 (Embedding) |
+  | `sparse` | `SparseVectorData` | 神经稀疏向量，用于稀疏检索 |
 
 - **`PrimaryKeyType` 主键自动生成策略**：
   | 策略 | 说明 | 特点 |
@@ -361,7 +361,7 @@ const appSchemas = [userSchema];
 - `fieldId` / `tableId`：辅助识别字段或表重命名，便于迁移
 
 
-其中，`unique: true` 及会自动生成单字段唯一索引，`createIndex: true` 、外键会自动生成单字段普通索引；`indexes` 更适合定义组合索引、命名索引或向量索引。
+其中，`unique: true` 会自动生成单字段唯一索引，`createIndex: true` 、外键会自动生成单字段普通索引；`indexes` 更适合定义组合索引、命名索引，以及文本 / 稀疏 / 向量检索索引。
 
 ### <a id="schema-evolution"></a>表结构自动演进 (Schema Evolution)
 
@@ -745,26 +745,22 @@ await db.kv.setMany(settingsMap, durability: RecoveryDurability.durable);
 ```
 
 
-### <a id="vector-advanced"></a>向量字段、向量索引与混合检索
+### <a id="hybrid-advanced"></a>向量、文本与混合检索
 
-向量检索走统一的 `db.query(...).matchVector(...)` 查询链：可与结构化条件同链组合，也可与其它召回分支做多路融合；分数与通道诊断在 `QueryResult.retrieval` 中返回，与 `data` 行一一对应。若只需主键与评分，请优先 `.select(['id'])`（或你的主键字段名），引擎会跳过表侧完整行物化；否则混合检索会回表加载整行（含大体积 embedding），吞吐量可能大幅下降。纯 ANN、无需过滤/融合时，也可用顶层 `db.vectorSearch(...)`，直接返回 `List<VectorSearchResult>`（主键 + 评分），核心检索路径相同。当前示例以向量 + 结构化为主，词法、图检索等通道将沿同一套链式混合检索模型扩展。
+词法文本检索、稠密向量检索、神经稀疏检索走同一查询链（`matchText` / `matchVector` / `matchSparse`）：可与结构化条件同链组合，也可多路融合；分数与通道诊断在 `QueryResult.retrieval` 中返回，与 `data` 行一一对应。若只需主键与评分，请优先 `.select(['id'])`（或你的主键字段名），引擎会跳过表侧完整行物化；否则混合检索会回表加载整行（含大体积 embedding），吞吐量可能大幅下降。纯 ANN、无需过滤/融合时，也可用顶层 `db.vectorSearch(...)`，直接返回 `List<VectorSearchResult>`（主键 + 评分），核心检索路径相同。
 
-**检索可见性**：插入/更新返回成功后，普通索引等可立即参与检索；向量索引为避免捆绑构建影响吞吐量，并不会立刻可搜。需要参与检索时，可在业务批量结束后执行 `await db.flush()`（可选便利），完成后才会进入 `matchVector` / `vectorSearch`。
+**检索可见性**：插入/更新返回成功后，普通索引、文本索引与稀疏索引即可参与检索；向量索引为避免捆绑构建影响吞吐量，并不会立刻可搜。需要参与检索时，可在业务批量结束后执行 `await db.flush()`（可选便利），完成后才会进入 `matchVector` / `vectorSearch`。
 
 ```dart
 await db.createTables([
   const TableSchema(
-    name: 'embeddings',
+    name: 'documents',
     primaryKeyConfig: PrimaryKeyConfig(
       name: 'id',
       type: PrimaryKeyType.timestampBased,
     ),
     fields: [
-      FieldSchema(
-        name: 'document_title',
-        type: DataType.text,
-        nullable: false,
-      ),
+      FieldSchema(name: 'content', type: DataType.text, nullable: false),
       FieldSchema(
         name: 'category',
         type: DataType.text,
@@ -772,21 +768,28 @@ await db.createTables([
         createIndex: true,
       ),
       FieldSchema(
+        name: 'features',
+        type: DataType.sparse, // 神经稀疏向量
+        nullable: false,
+      ),
+      FieldSchema(
         name: 'embedding',
-        type: DataType.vector,  // 声明向量类型
+        type: DataType.vector, // 稠密向量
         nullable: false,
         vectorConfig: VectorFieldConfig(
-          dimensions: 128, // 向量维度；写入和查询时的向量长度都必须一致
+          dimensions: 128, // 写入与查询向量长度必须一致
         ),
       ),
     ],
     indexes: [
+      IndexSchema(fields: ['content'], type: IndexType.text), // 词法文本索引
+      IndexSchema(fields: ['features'], type: IndexType.sparse), // 神经稀疏索引
       IndexSchema(
-        fields: ['embedding'], // 要建立向量索引的字段
-        type: IndexType.vector,  // 构建向量索引
+        fields: ['embedding'],
+        type: IndexType.vector, // 稠密向量索引
         vectorConfig: VectorIndexConfig(
-          indexType: VectorIndexType.ngh,  // NGH：ToStore 自研稠密向量索引
-          distanceMetric: VectorDistanceMetric.cosine, // 距离度量；适合归一化后的 embedding
+          indexType: VectorIndexType.ngh, // NGH：ToStore 自研稠密索引
+          distanceMetric: VectorDistanceMetric.cosine,
         ),
       ),
     ],
@@ -794,77 +797,126 @@ await db.createTables([
 ]);
 
 final queryVector =
-    VectorData.fromList(List.generate(128, (i) => i * 0.01)); // 长度需与 dimensions 一致
+    VectorData.fromList(List.generate(128, (i) => i * 0.01));
+final querySparse = SparseVectorData.fromMap({12: 0.8, 45: 0.6, 90: 0.3});
 
-// 1) 主推：链式混合检索（纯向量近邻）
-// 仅需主键 + 评分时用 .select([主键])，避免回表加载完整行
-final result = await db
-    .query('embeddings')
+// 1) 词法文本检索（TextQuery.text引擎自动分词；也可用预分词 TextQuery.terms / termsWeighted）
+final textHits = await db
+    .query('documents')
     .select(['id'])
-    .matchVector('embedding', queryVector) // 默认 searchDepth = 50
+    .matchText('content', TextQuery.text('分布式 存储 内核'))
+    .limit(5);
+
+// 2) 神经稀疏检索
+final sparseHits = await db
+    .query('documents')
+    .select(['id'])
+    .matchSparse('features', querySparse, minScore: 0.30)
+    .limit(5);
+
+// 3) 稠密向量近邻（默认 searchDepth = 50）
+final result = await db
+    .query('documents')
+    .select(['id'])
+    .matchVector('embedding', queryVector, minScore: 0.40)
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
   final record = result.data[i];
   final entry = result.retrieval?.entries[i];
   print('pk=${record['id']}, score=${entry?.score}, '
-      'distance=${entry?.meta?['distance']}');
+      'rawScore=${entry?.rawScore}, distance=${entry?.meta?['distance']}');
 }
 
-// 需要业务字段时再省略 select()（或显式投影所需列）——引擎会对命中主键回表取整行（更重）
-
-// 2) 结构化过滤 + 向量（AND 混合）
+// 4) 结构化过滤 + 向量（AND）
 final filtered = await db
-    .query('embeddings')
+    .query('documents')
     .whereEqual('category', 'tech')
-    .matchVector('embedding', queryVector)
+    .matchVector('embedding', queryVector, minScore: 0.40)
     .limit(5);
 
-// 3) 多路融合召回（向量路 + 结构化路，引擎侧 RRF 融合）
-final otherVector =
-    VectorData.fromList(List.generate(128, (i) => i * 0.012));
+// 5) 多路融合：文本 + 稀疏 + 向量（默认 weightedScore）
 final fused = await db
-    .query('embeddings')
-    .matchVector('embedding', queryVector, weight: 1.0)
-    .orMatchVector('embedding', otherVector, weight: 0.6, minScore: 0.2)
-    .or()
-    .whereEqual('category', 'tech')
+    .query('documents')
+    .matchText('content', TextQuery.text('分布式 存储'), weight: 0.4)
+    .matchSparse('features', querySparse, weight: 0.3, minScore: 0.20)
+    .matchVector('embedding', queryVector, weight: 0.6, minScore: 0.40)
     .limit(10);
+print('fusion=${fused.retrieval?.fusionMethod}'); // weightedScore
 
-print('fusion=${fused.retrieval?.fusionMethod}'); // 多路时通常为 rrf
+// 切换为排名融合（相对分，不适用绝对相关度门槛）
+final fusedRrf = await db
+    .query('documents')
+    .matchText('content', TextQuery.text('分布式 存储'), weight: 0.4)
+    .matchVector('embedding', queryVector, weight: 0.6, minScore: 0.40)
+    .fusionMethod(RetrievalFusionMethod.rrf)
+    .limit(10);
+print('fusion=${fusedRrf.retrieval?.fusionMethod}'); // rrf
 
-// 顶层专用 ANN（同一核心路径；仅主键 + 评分，无查询链 / 融合）
+// 顶层专用 ANN（仅主键 + 评分，无查询链 / 融合）
 final ann = await db.vectorSearch(
-  'embeddings',
+  'documents',
   fieldName: 'embedding',
   queryVector: queryVector,
   topK: 5,
+  minScore: 0.40,
 );
 ```
 
-**表结构 / 向量索引配置**（`VectorFieldConfig`、`VectorIndexConfig`）：
+**通道与表结构对照**：
+
+| 通道 | 字段类型 | 索引 | 查询 API | 查询值 |
+| :--- | :--- | :--- | :--- | :--- |
+| 词法文本 | `DataType.text` | `IndexType.text` | `matchText` / `orMatchText` | `TextQuery.text` / `terms` / `termsWeighted` |
+| 神经稀疏 | `DataType.sparse` | `IndexType.sparse` | `matchSparse` / `orMatchSparse` | `SparseVectorData` |
+| 稠密向量 | `DataType.vector` | `IndexType.vector` | `matchVector` / `orMatchVector` | `VectorData` 等 |
+
+**稠密向量配置**（`VectorFieldConfig`、`VectorIndexConfig`）：
 
 - `dimensions`：向量维度，必须与实际写入的 embedding 长度一致。
 - `indexType`：稠密向量算法标识；当前为 `ngh`。
 - `distanceMetric`：索引侧相似度度量（构建与检索共用）；`cosine` 常用于语义 embedding，`l2` 适合欧氏距离场景，`innerProduct` 适合点积检索。数据写入后若修改通常需要重建向量索引。
 
-**链式检索参数**（`matchVector` / `orMatchVector`，以及查询链上的 `limit`）：
+**链式检索参数**（各 `match*` / `orMatch*`，以及查询链上的 `limit`）：
 
-- `field` / `vector`：目标向量字段与查询向量（`VectorData` / `List<num>` / `Float32List`）。
-- `searchDepth`：可选检索深度（`>= 1`，默认 `50`）。数值越大通常召回越高、耗时也越大。近似最近邻，**不保证** recall@K。数据量增大后如需找到更多邻居，可自行加大。
-- `weight`：多路召回时该通道的融合权重，默认 `1.0`。
-- `minScore`：归一化相似度下限 `[0.0 ~ 1.0]`，低于阈值的候选会被裁剪。
-- `distanceThreshold`：距离上限，超出则不作为候选。
-- `limit`：返回结果数量（对应常见 ANN 场景中的 topK）。
+- 文本
+  - `TextQuery.text`：由引擎分词
+  - `TextQuery.terms` / `termsWeighted`：预分词，不再二次分词；拉丁词需与索引侧一致（一般为小写）
+  - `operator`：`or`（默认，词项并集排序）或 `and`（正权重词项均须命中后再排序）
+  - 不支持短语匹配
+- 稀疏
+  - `SparseVectorData` / `SparseVectorData.fromMap(...)`：稀疏查询向量
+  - 文档侧权重建议落在 `(0, 1]`
+- 向量
+  - `field` / `vector`：目标字段与查询向量
+  - `searchDepth`：`>= 1`，默认 `50`；越大通常召回越高、耗时也越大；近似最近邻，**不保证** recall@K
+  - `distanceThreshold`：距离上限
+- 共用
+  - `weight`：多路融合权重，默认 `1.0`
+  - `minScore`：相关度下限
+  - `limit`：返回条数（topK）
+  - `.fusionMethod(...)`：多路默认 `weightedScore`，可切 `rrf`
 
-**结果说明**（`QueryResult`）：
+**结果与评分说明**（`QueryResult` / `VectorSearchResult`）：
 
-- 业务行数据在 `data`；检索分数与通道信息在 `retrieval.entries`，与 `data` **一一对应**。
-- 高吞吐 ANN / 混合召回请用 `.select(['id'])`（主键字段名），使 `data` 仅含主键，评分仍在 `retrieval`。
-- `entry.score`：归一化后的相似度 / 融合分数，范围通常在 `0 ~ 1`，值越大表示越相关。
-- `entry.meta['distance']`：原始距离（向量通道常见）；对 `l2` / `cosine` 场景通常越小表示越相近。
-- `retrieval.fusionMethod`：单通道多为 `single`；多路融合召回多为 `rrf`（Reciprocal Rank Fusion）。
-- 顶层 `db.vectorSearch(...)` 返回 `List<VectorSearchResult>`（`primaryKey` / `score` / `distance`），适合无需结构化过滤或多路融合的专用 ANN。
+- 业务行在 `data`；检索分数与通道信息在 `retrieval.entries`，与 `data` **一一对应**。若只需主键与评分，优先 `.select(['id'])`。
+- `score`（归一化相关度评分，`0.0 ~ 1.0`）：文本 / 稀疏 / 向量统一的相关度（越大越相关）。向量精确自匹配为 `1.0`。用 `minScore` 保留强命中、过滤弱命中。默认多路 `weightedScore` 融合会保留强单路命中；文本与稀疏保持在 `[0.0, 1.0)`。
+- `rawScore`：通道未归一化的物理量（余弦 / 点积 / L2 / 文本强度）。需要底层度量时读 `rawScore` / `distance`。
+- `entry.meta['distance']`：向量通道的 ANN 距离（越小越近）。
+- `retrieval.fusionMethod`：单通道为 `null`；多路默认 `weightedScore`（可通过 `.fusionMethod(RetrievalFusionMethod.rrf)` 切换）。
+- 顶层 `db.vectorSearch(...)` 返回 `List<VectorSearchResult>`（`primaryKey` / `score` / `rawScore` / `distance`），适用于专用 ANN。可选 `minScore` 与 `matchVector` 使用同一相关度下限（结果条数可能少于 `topK`）。
+
+**相关度评分（`score`）与门槛参考基线**（单通道与多路 `weightedScore`；不适用于 `rrf`）。适用于常见 embedding 宽度（**维度 ≥ 128**）；更低维时弱邻居也可能得高分，请酌情提高 `minScore` 或改用 `rawScore`：
+
+| 相关度评分（`score`） | 基线含义与典型场景 |
+| :--- | :--- |
+| `>= 0.85` | 同实体匹配（人脸核验、生物特征、精确去重） |
+| `>= 0.70` | 高置信语义匹配（核心事实、精确问答） |
+| `>= 0.40` | 基础语义相关（通用 RAG、知识库防幻觉） |
+| `>= 0.30` | 宽召回初筛（模糊发现、重排候选池） |
+| `< 0.30` | 弱关联或背景噪声 |
+
+按需配置通道 `minScore` 过滤低相关度评分命中。
 
 ### <a id="ttl-config"></a>表级 TTL（按时间自动过期清理）
 

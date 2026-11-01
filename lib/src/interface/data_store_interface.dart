@@ -139,6 +139,7 @@ abstract class DataStoreInterface {
     int topK = 10,
     int? searchDepth,
     double? distanceThreshold,
+    double? minScore,
   });
 
   /// switch space

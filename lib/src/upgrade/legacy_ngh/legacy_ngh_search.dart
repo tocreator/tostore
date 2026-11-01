@@ -8,6 +8,7 @@ import '../../core/maintenance/prewarm_budget_ledger.dart';
 import '../../core/ngh/ngh_graph_engine.dart';
 import '../../core/ngh/ngh_page.dart';
 import '../../core/ngh/vector_quantizer.dart';
+import '../../core/ngh/vector_score_calibrator.dart';
 import '../../model/ngh_index_meta.dart';
 import '../../model/table_context.dart';
 import '../../model/table_identity.dart';
@@ -1129,7 +1130,12 @@ class LegacyNghSearch {
             );
             if (distanceThreshold != null && dist > distanceThreshold) continue;
             if (!resultHeap.isFull || dist < resultHeap.peekDist) {
-              resultHeap.pushWithPk(slot.nodeId, dist, slot.primaryKeyBytes);
+              resultHeap.pushWithPk(
+                slot.nodeId,
+                dist,
+                slot.primaryKeyBytes,
+                slot.squaredNorm,
+              );
             }
           }
         }
@@ -1184,23 +1190,27 @@ class LegacyNghSearch {
       runScoreSync();
     }
 
-    final rawResults = resultHeap.drainSortedWithPk();
-    final out = <NghSearchResult>[];
-    for (final r in rawResults) {
-      final pk =
-          r.primaryKeyBytes != null ? utf8.decode(r.primaryKeyBytes!) : null;
-      if (pk != null &&
-          pendingDeletePks != null &&
-          pendingDeletePks.contains(pk)) {
-        continue;
-      }
-      out.add(NghSearchResult(
-        nodeId: r.nodeId,
-        distance: r.distance,
-        primaryKey: pk,
-      ));
+    final metric = isCosine
+        ? VectorDistanceMetric.cosine
+        : (isIP ? VectorDistanceMetric.innerProduct : VectorDistanceMetric.l2);
+    final calibration = VectorScoreCalibrator.forQuery(
+      searchQuery.length,
+      meta.totalVectors,
+      mu: meta.nullFloorMu,
+      dEff: meta.nullFloorDEff,
+    );
+    final out = resultHeap.drainSortedToSearchResults(
+      metric: metric,
+      querySquaredNorm: querySqNorm,
+      calibration: calibration,
+    );
+    if (pendingDeletePks == null || pendingDeletePks.isEmpty) {
+      return out;
     }
-    return out;
+    return [
+      for (final r in out)
+        if (r.primaryKey == null || !pendingDeletePks.contains(r.primaryKey)) r
+    ];
   }
 
   (double, double) _prepQueryStats(Float32List searchQuery) {
@@ -1280,7 +1290,12 @@ class LegacyNghSearch {
             slot.invNorm,
           );
           if (!resultHeap.isFull || dist < resultHeap.peekDist) {
-            resultHeap.pushWithPk(slot.nodeId, dist, slot.primaryKeyBytes);
+            resultHeap.pushWithPk(
+              slot.nodeId,
+              dist,
+              slot.primaryKeyBytes,
+              slot.squaredNorm,
+            );
           }
         }
       }
@@ -1326,7 +1341,12 @@ class LegacyNghSearch {
           slot.invNorm,
         );
         if (!resultHeap.isFull || dist < resultHeap.peekDist) {
-          resultHeap.pushWithPk(slot.nodeId, dist, slot.primaryKeyBytes);
+          resultHeap.pushWithPk(
+            slot.nodeId,
+            dist,
+            slot.primaryKeyBytes,
+            slot.squaredNorm,
+          );
         }
       }
     }
@@ -1359,6 +1379,7 @@ class LegacyNghSearch {
         slot.invNorm,
       );
     } else if (isIP) {
+      // fastDotProduct already returns negated IP (lower = closer).
       dist = ScalarQuantizer.fastDotProduct(
         searchQuery,
         querySum,
@@ -1381,7 +1402,12 @@ class LegacyNghSearch {
     if (distanceThreshold != null && dist > distanceThreshold) return;
 
     if (!resultHeap.isFull || dist < resultHeap.peekDist) {
-      resultHeap.pushWithPk(slot.nodeId, dist, slot.primaryKeyBytes);
+      resultHeap.pushWithPk(
+        slot.nodeId,
+        dist,
+        slot.primaryKeyBytes,
+        slot.squaredNorm,
+      );
     }
   }
 
@@ -1599,12 +1625,14 @@ class _FixedHeap {
 
   late final Int32List _ids;
   late final Float64List _dists;
+  late final Float64List _slotSqNorms;
   late final List<Uint8List?> _pks;
   int _size = 0;
 
   _FixedHeap(this.capacity, {this.maxHeap = false}) {
     _ids = Int32List(capacity);
     _dists = Float64List(capacity);
+    _slotSqNorms = Float64List(capacity);
     _pks = List<Uint8List?>.filled(capacity, null);
   }
 
@@ -1614,11 +1642,17 @@ class _FixedHeap {
   int get length => _size;
   double get peekDist => _size > 0 ? _dists[0] : double.infinity;
 
-  void pushWithPk(int id, double dist, Uint8List? pkBytes) {
+  void pushWithPk(
+    int id,
+    double dist,
+    Uint8List? pkBytes, [
+    double slotSqNorm = 0.0,
+  ]) {
     if (_size < capacity) {
       final i = _size;
       _ids[i] = id;
       _dists[i] = dist;
+      _slotSqNorms[i] = slotSqNorm;
       _pks[i] = pkBytes;
       _size = i + 1;
       _siftUp(i);
@@ -1626,6 +1660,7 @@ class _FixedHeap {
         (!maxHeap && dist > _dists[0])) {
       _ids[0] = id;
       _dists[0] = dist;
+      _slotSqNorms[0] = slotSqNorm;
       _pks[0] = pkBytes;
       _siftDown(0);
     }
@@ -1642,13 +1677,13 @@ class _FixedHeap {
       if (_size > 0) {
         _ids[0] = _ids[_size];
         _dists[0] = _dists[_size];
+        _slotSqNorms[0] = _slotSqNorms[_size];
         _pks[0] = _pks[_size];
         _siftDown(0);
       }
       result.add(_SearchCandidate(id, dist, pk));
     }
     if (maxHeap) {
-      // In-place reverse (worst-first → best-first); avoids second list alloc.
       for (var i = 0, j = result.length - 1; i < j; i++, j--) {
         final tmp = result[i];
         result[i] = result[j];
@@ -1656,6 +1691,69 @@ class _FixedHeap {
       }
     }
     return result;
+  }
+
+  List<NghSearchResult> drainSortedToSearchResults({
+    required VectorDistanceMetric metric,
+    required double querySquaredNorm,
+    VectorScoreCalibration calibration = VectorScoreCalibration.identity,
+  }) {
+    if (_size == 0) return const [];
+    final out = <NghSearchResult>[];
+    while (_size > 0) {
+      final id = _ids[0];
+      final heapDist = _dists[0];
+      final slotSqNorm = _slotSqNorms[0];
+      final pkBytes = _pks[0];
+      _size--;
+      if (_size > 0) {
+        _ids[0] = _ids[_size];
+        _dists[0] = _dists[_size];
+        _slotSqNorms[0] = _slotSqNorms[_size];
+        _pks[0] = _pks[_size];
+        _siftDown(0);
+      }
+
+      final ({double distance, double rawScore, double score}) scored;
+      switch (metric) {
+        case VectorDistanceMetric.cosine:
+          scored = VectorScoreCalibrator.fromCosine(
+            cosineSimilarity: 1.0 - heapDist,
+            calibration: calibration,
+            validNorms: querySquaredNorm > 0.0 && slotSqNorm > 0.0,
+          );
+        case VectorDistanceMetric.innerProduct:
+          scored = VectorScoreCalibrator.fromInnerProduct(
+            innerProduct: -heapDist,
+            querySquaredNorm: querySquaredNorm,
+            candidateSquaredNorm: slotSqNorm,
+            calibration: calibration,
+          );
+        case VectorDistanceMetric.l2:
+          scored = VectorScoreCalibrator.fromSquaredL2(
+            squaredDistance: heapDist,
+            querySquaredNorm: querySquaredNorm,
+            candidateSquaredNorm: slotSqNorm,
+            calibration: calibration,
+          );
+      }
+
+      out.add(NghSearchResult(
+        nodeId: id,
+        distance: scored.distance,
+        rawScore: scored.rawScore,
+        score: scored.score,
+        primaryKey: pkBytes != null ? utf8.decode(pkBytes) : null,
+      ));
+    }
+    if (maxHeap && out.length > 1) {
+      for (var i = 0, j = out.length - 1; i < j; i++, j--) {
+        final tmp = out[i];
+        out[i] = out[j];
+        out[j] = tmp;
+      }
+    }
+    return out;
   }
 
   void _siftUp(int idx) {
@@ -1697,14 +1795,17 @@ class _FixedHeap {
   void _swap(int a, int b) {
     final tempId = _ids[a];
     final tempDist = _dists[a];
+    final tempSq = _slotSqNorms[a];
     final tempPk = _pks[a];
 
     _ids[a] = _ids[b];
     _dists[a] = _dists[b];
+    _slotSqNorms[a] = _slotSqNorms[b];
     _pks[a] = _pks[b];
 
     _ids[b] = tempId;
     _dists[b] = tempDist;
+    _slotSqNorms[b] = tempSq;
     _pks[b] = tempPk;
   }
 }

@@ -33,49 +33,50 @@
 - [Neden Saklamalı](#why-tostore) | [Temel Özellikler](#key-features) | [Kurulum Kılavuzu](#installation) | [KV Modu](#quick-start-kv) | [Tablo Modu](#quick-start-table) | [Bellek Modu](#quick-start-memory)
 - [Şema Tanımı](#schema-definition) | [Dağıtılmış Mimari](#distributed-architecture) | [Basamaklı Yabancı Anahtarlar](#foreign-keys) | [Mobil/Masaüstü](#mobile-integration) | [Sunucu/Aracı](#server-integration) | [Birincil Anahtar Algoritmaları](#primary-key-examples)
 - [Gelişmiş Sorgular (KATIL)](#query-advanced) | [Toplama ve İstatistikler](#aggregation-stats) | [Karmaşık Mantık (Sorgu Durumu)](#query-condition) | [Reaktif Sorgu (izle)](#reactive-query) | [Akış Sorgusu](#streaming-query)
-- [Gelişmiş KV](#kv-advanced) | [Toplu İşlemler](#bulk-operations) | [Kurtarma Garantisi](#recovery-durability) | [Vektör ve Hibrit Getirme](#vector-advanced) | [Tablo düzeyinde TTL](#ttl-config) | [Etkili Sayfalandırma](#query-pagination) | [Bellek Probu ve Senkron Arama (peek)](#query-peek) | [Sorgu Önbelleği](#query-cache) | [Atomik İfadeler](#atomic-expressions) | [İşlemler](#transactions)
+- [Gelişmiş KV](#kv-advanced) | [Toplu İşlemler](#bulk-operations) | [Kurtarma Garantisi](#recovery-durability) | [Hibrit getirme (yoğun / seyrek / metin)](#hybrid-advanced) | [Tablo düzeyinde TTL](#ttl-config) | [Etkili Sayfalandırma](#query-pagination) | [Bellek Probu ve Senkron Arama (peek)](#query-peek) | [Sorgu Önbelleği](#query-cache) | [Atomik İfadeler](#atomic-expressions) | [İşlemler](#transactions)
 - [Yönetim](#database-maintenance) | [Güvenlik Yapılandırması](#security-config) | [Hata İşleme](#error-handling) | [Performans ve Tanılama](#performance) | [Katkıda Bulunma](#contribute) | [YZ asistanları](#for-ai-coding-assistants)
 
 ## <a id="why-tostore"></a>Neden ToStore'u Seçmelisiniz?
 
-ToStore, AGI çağı ve uç zeka senaryoları için tasarlanmış modern bir veri motorudur. Kendi kendini yönlendiren (Self-Routing) düğüm mimarisi üzerine kurulu olan bu sistem, düğümlere yüksek özerklik ve esnek yatay ölçeklenebilirlik sağlarken performansı veri ölçeğinden mantıksal olarak ayırır.
+ToStore, AGI çağı ve uç zeka senaryoları için tasarlanmış modern bir veri motorudur. Kendi kendini yönlendiren (Self-Routing) düğüm mimarisi üzerine kurulu olan bu sistem, düğümlere yüksek özerklik ve esnek yatay ölçeklenebilirlik sağlarken performansı veri ölçeğinden mantıksal olarak ayırır — uç ve bulut tek düğüm dağıtımları 10 milyar+ ölçeği destekleyecek şekilde tasarlanmıştır.
 
-Çalışma zamanı modellemesi ve engelsiz yürütme yolları, mimari evrimi her zaman çevrimiçi ve iş operasyonlarına tamamen şeffaf tutar — bildirimsel şema değişiklikleri, veri kodlama anahtarı rotasyonu ve büyük ölçekli veri yeniden yapılandırması kesintisiz olarak gerçekleşir. Ajan ve otomatik işletime yönelik olarak, onların özerk evrimini ve sürekli yinelemesini hizmeti kesmeden destekler.
+Çalışma zamanı modellemesi ve engelsiz yürütme yolları, mimari evrimi her zaman çevrimiçi ve iş operasyonlarına tamamen şeffaf tutar — bildirimsel şema değişiklikleri, veri kodlama anahtarı rotasyonu ve büyük ölçekli veri yeniden yapılandırması kesintisiz olarak gerçekleşir. Ajanları ve otomatik işletimi destekler: çalışma zamanında tablo oluşturma, dinamik bellek evrimi ile bunların özerk evrimi ve sürekli yinelemesi — hizmet kesintisi olmadan.
 
-İlişkisel yapılandırılmış verileri, yüksek boyutlu vektörleri ve yapılandırılmamış verileri yerel olarak destekleyen birleşik bir veri motoru; yerleşik hibrit getirme ve çok yollu getirme füzyonu ile birlikte ACID işlemleri, karmaşık ilişkisel sorgular (JOIN'ler, basamaklı yabancı anahtarlar), tablo düzeyinde TTL, toplama işlemlerinin yanı sıra dağıtık birincil anahtar algoritmaları, atomik ifadeler, şifreleme, çoklu alan yalıtımı ve otomatik kurtarma gibi kurumsal düzeyde veritabanı yetenekleri sunar.
+İlişkisel yapılandırılmış verileri, yoğun vektörleri, nöral seyrek vektörleri ve yapılandırılmamış metni tek motorda birleştirir; yerleşik sözcüksel metin getirme, yoğun vektör getirme, nöral seyrek getirme ve çok yollu getirme füzyonu sunar. Kurumsal düzey yetenekler arasında ACID işlemleri, karmaşık ilişkisel sorgular (JOIN'ler, basamaklı yabancı anahtarlar), tablo düzeyinde TTL, toplama işlemleri ile dağıtık birincil anahtar algoritmaları, atomik ifadeler, şifreleme, çoklu alan yalıtımı ve kendi kendine iyileşen kurtarma yer alır.
 
-Bilgi işlem uç zekaya doğru kaymaya devam ettikçe, cihazlar artık yalnızca "içerik ekranları" değil, yerel üretimden, çevre algılamasından, gerçek zamanlı karar alma ve veri koordinasyonundan sorumlu akıllı düğümlerdir. ToStore, uca büyük veri kümeleri ve karmaşık yerel yapay zeka üretimi için dağıtık yetenekler sunar. Uç ve bulut düğümleri arasındaki derin akıllı işbirliği, çok modlu etkileşim, anlamsal vektör hibrit getirme, uzamsal modelleme, uç özerk işbirliği ve benzer senaryolar için güvenilir bir veri temeli sağlar.
+Bilgi işlem uç zekaya doğru kaymaya devam ettikçe, cihazlar artık yalnızca "içerik ekranları" değil, yerel üretimden, çevre algılamasından, gerçek zamanlı karar alma ve veri koordinasyonundan sorumlu akıllı düğümlerdir. ToStore, uca büyük veri kümeleri ve karmaşık yerel yapay zeka üretimi için yeterli dağıtık yetenekler sunar. Uç ve bulut düğümleri arasındaki derin akıllı işbirliği, çok modlu etkileşim, uzun vadeli bellek, RAG ve yerel bilgi tabanları, hibrit getirme, uzamsal modelleme, uç özerk işbirliği ve benzer senaryolar için güvenilir bir veri temeli sağlar.
 
 ## <a id="key-features"></a>Temel Özellikler
 
 - 🤖 **Çalışma Zamanı Evrimi ve Akıllı İşletim**
-  - Bildirimsel tanım, otomatik yeniden yapılandırma, sürüm yönetimi gereksiz
-  - Anahtar rotasyonu, şema değişiklikleri, büyük ölçekli yeniden yapılandırma—tümü çevrimiçi, kesintisiz
+  - Bildirimsel şema değişiklikleri—otomatik yeniden yapılandırma, manuel sürüm yönetimi yok
+  - Anahtar rotasyonu, şema geçişi, büyük ölçekli yeniden yapılandırma—tümü çevrimiçi, işe şeffaf
   - Otomatik işletim ve Ajan algılaması için entegre durum özellikleri
-  - Uzun vadeli kararlılık için hizmet kesintisi olmadan sıcak güncellemeler
+  - Hizmeti kesmeden özerk evrim ve sürekli yinelemeyi destekler
 
 - 🧠 **Kendi Kendini Yönlendiren Dağıtık Mimari**
   - Fiziksel adreslemeyi veri ölçeğinden ayıran kendi kendini yönlendiren düğüm mimarisi
   - Yüksek düzeyde özerk düğümler esnek bir veri topolojisi oluşturmak için işbirliği yapar
-  - Uç ve bulut düğümleri arasında derin bağlantı ile esnek yatay ölçeklendirme
+  - Esnek yatay ölçeklendirme; tek düğüm dağıtımları 10 milyar+ ölçeği destekleyecek şekilde tasarlanmıştır
 
 - 🌐 **Birleşik Platformlar Arası Veri Motoru**
   - Mobil, masaüstü, web ve sunucu ortamlarında birleşik API
-  - İlişkisel yapılandırılmış verileri, yüksek boyutlu vektörleri ve yapılandırılmamış verileri kapsar
+  - İlişkisel verileri, yoğun / nöral seyrek vektörleri ve metin getirmeyi kapsar
   - Yerel depolamadan uç-bulut işbirliğine kadar eksiksiz veri hattı
 
 - 🔍 **Yapılandırılmış Sorgular ve Hibrit Getirme**
   - Karmaşık yüklemler, JOIN'ler, toplama işlemleri ve tablo düzeyinde TTL
-  - Çok kanallı getirme aynı sorgu zincirinde birleştirilebilir (vektör, yapılandırılmış ve daha fazlası)
-  - Çok yollu getirme füzyon sıralaması; puanlar ve kanal tanılaması sorgu sonucunda döner
+  - Sözcüksel metin, yoğun vektör ve nöral seyrek getirme aynı sorgu zincirinde
+  - Çok yollu getirme füzyon sıralaması; puanlar ve kanal tanılaması sonuçta döner
 
 - ⚡ **Paralel Yürütme ve Kaynak Planlama**
-  - Yüksek kullanılabilirlik için kaynağa duyarlı akıllı yük planlaması
-  - Çok düğümlü paralel işbirliği ve görev ayrıştırma
-  - Ağır yük altında bile kullanıcı arayüzü animasyonlarını akıcı tutan zaman dilimleme
+  - Soğuk başlatma veri ölçeğinden bağımsız olarak yaklaşık 35 ms kalır
+  - Kaynağa duyarlı yük planlaması; çok düğümlü paralel görev ayrıştırma
+  - Zaman dilimleme, ağır yük altında bile kullanıcı arayüzü animasyonlarını akıcı tutar
 
-- 🔐 **Veri Güvenliği ve Yalıtımı**
-  - İsteğe bağlı küresel paylaşımla çoklu alan yalıtımı, çok kullanıcılı ve çoklu kiracı senaryoları için ideal
+- 🔐 **Çevrimdışı Öncelikli ve Gizlilik**
+  - Verileri cihazda tutun ve çevrimdışı kullanılabilir kılın; bulut bağımlılığını ve maruziyet yüzeyini azaltın
+  - İsteğe bağlı küresel paylaşımla çoklu alan yalıtımı—çok kullanıcılı / çoklu kiracıya hazır
   - Entegre ChaCha20-Poly1305 ve AES-256-GCM şifrelemesi
   - Birden fazla karmaşık afet kurtarma senaryosu ile doğrulanmıştır
 
@@ -319,7 +320,8 @@ const appSchemas = [userSchema];
   | `datetime` | `DateTime` / `String` | Tarih/saat; dahili olarak ISO8601 olarak saklanır |
   | `array` | `List` | Liste veya dizi türü |
   | `json` | `Map<String, dynamic>` | Dinamik yapılandırılmış verilere uygun JSON nesnesi |
-  | `vector` | `VectorData` / `List<num>` | Yapay zeka anlamsal alımı (gömmeler) için yüksek boyutlu vektör verileri |
+  | `vector` | `VectorData` / `List<num>` | Anlamsal en yakın komşu getirme için yoğun vektörler (Embedding) |
+  | `sparse` | `SparseVectorData` | Seyrek getirme için nöral seyrek vektörler |
 
 - **`PrimaryKeyType` otomatik oluşturma stratejileri**:
   | Strateji | Açıklama | Özellikler |
@@ -345,7 +347,7 @@ Uygulama kodunda yinelenen mantıktan kaçınarak ortak doğrulama kurallarını
 - `createIndex`: yüksek frekanslı filtreleme, sıralama veya ilişkiler için dizinler oluşturun
 - `fieldId` / `tableId`: geçiş sırasında alanlar ve tablolar için yeniden adlandırma tespitine yardımcı olun
 
-Ayrıca `unique: true` otomatik olarak tek alanlı benzersiz bir dizin oluşturur. `createIndex: true` ve yabancı anahtarlar otomatik olarak tek alanlı normal dizinler oluşturur. Bileşik dizinlere, adlandırılmış dizinlere veya vektör dizinlere ihtiyaç duyduğunuzda `indexes` kullanın.
+Ayrıca `unique: true` otomatik olarak tek alanlı benzersiz bir dizin oluşturur. `createIndex: true` ve yabancı anahtarlar otomatik olarak tek alanlı normal dizinler oluşturur; `indexes` bileşik dizinler, adlandırılmış dizinler ile metin / seyrek / vektör getirme dizinleri tanımlamak için daha uygundur.
 
 ### <a id="schema-evolution"></a>Şema gelişimi (Schema Evolution)
 
@@ -724,26 +726,22 @@ await db.kv.setMany(settingsMap, durability: RecoveryDurability.durable);
 ```
 
 
-### <a id="vector-advanced"></a>Vektör Alanları, Vektör İndeksleri ve Hibrit Getirme
+### <a id="hybrid-advanced"></a>Vektör, Metin ve Hibrit Getirme
 
-Vektör getirme, birleşik `db.query(...).matchVector(...)` sorgu zincirini kullanır: aynı zincirde yapılandırılmış koşullarla birleştirilebilir veya diğer getirme dallarıyla kaynaştırılabilir. Skorlar ve kanal tanıları `QueryResult.retrieval` içinde döner ve `data` satırlarıyla 1:1 hizalanır. Yalnızca birincil anahtar ve skor gerektiğinde `.select(['id'])` (veya PK alan adınız) tercih edin; böylece motor tam satırları yüklemez — aksi halde hibrit getirme eksiksiz kayıtları (büyük embedding’ler dahil) materyalize eder ve verim keskin düşebilir. Filtre veya füzyon olmadan özel ANN için `db.vectorSearch(...)` aynı çekirdek arama yoluyla `List<VectorSearchResult>` (birincil anahtar + skor) döndürür. Güncel örnekler vektör + yapılandırılmış yollara odaklanır; sözcüksel, grafik ve diğer kanallar aynı zincirli hibrit getirme modeliyle genişletilecektir.
+Sözcüksel metin, yoğun vektör ve nöral seyrek getirme aynı sorgu zincirini paylaşır (`matchText` / `matchVector` / `matchSparse`): aynı zincirde yapılandırılmış koşullarla birleştirilebilir veya birden fazla getirme dalı kaynaştırılabilir. Skorlar ve kanal tanıları `QueryResult.retrieval` içinde döner ve `data` satırlarıyla 1:1 hizalanır. Yalnızca birincil anahtar ve skor gerektiğinde `.select(['id'])` (veya PK alan adınız) tercih edin; böylece motor tam satırları yüklemez — aksi halde hibrit getirme eksiksiz kayıtları (büyük embedding’ler dahil) materyalize eder ve verim keskin düşebilir. Filtre veya füzyon olmadan özel ANN için `db.vectorSearch(...)` aynı çekirdek arama yoluyla `List<VectorSearchResult>` (birincil anahtar + skor) döndürür.
 
-**Arama görünürlüğü**: Insert/update başarı döndükten sonra sıradan dizinler hemen aramaya katılır; vektör dizinleri yazma yoluna bağlanarak oluşturulmaz (işlem hızını etkilememek için) ve hemen aranabilir olmaz. Aramaya katılmaları gerektiğinde iş toplu işlemi bitince `await db.flush()` çağırın (isteğe bağlı kolaylık); ancak bundan sonra `matchVector` / `vectorSearch` içinde yer alırlar.
+**Arama görünürlüğü**: Insert/update başarı döndükten sonra sıradan dizinler, metin dizinleri ve seyrek dizinler hemen aramaya katılır; vektör dizinleri yazma yoluna bağlanarak oluşturulmaz (işlem hızını etkilememek için) ve hemen aranabilir olmaz. Aramaya katılmaları gerektiğinde iş toplu işlemi bitince `await db.flush()` çağırın (isteğe bağlı kolaylık); ancak bundan sonra `matchVector` / `vectorSearch` içinde yer alırlar.
 
 ```dart
 await db.createTables([
   const TableSchema(
-    name: 'embeddings',
+    name: 'documents',
     primaryKeyConfig: PrimaryKeyConfig(
       name: 'id',
       type: PrimaryKeyType.timestampBased,
     ),
     fields: [
-      FieldSchema(
-        name: 'document_title',
-        type: DataType.text,
-        nullable: false,
-      ),
+      FieldSchema(name: 'content', type: DataType.text, nullable: false),
       FieldSchema(
         name: 'category',
         type: DataType.text,
@@ -751,8 +749,13 @@ await db.createTables([
         createIndex: true,
       ),
       FieldSchema(
+        name: 'features',
+        type: DataType.sparse, // Neural sparse vector
+        nullable: false,
+      ),
+      FieldSchema(
         name: 'embedding',
-        type: DataType.vector, // Declare a vector field
+        type: DataType.vector, // Dense vector
         nullable: false,
         vectorConfig: VectorFieldConfig(
           dimensions: 128, // Written and queried vectors must match this width
@@ -760,12 +763,14 @@ await db.createTables([
       ),
     ],
     indexes: [
+      IndexSchema(fields: ['content'], type: IndexType.text), // Lexical text index
+      IndexSchema(fields: ['features'], type: IndexType.sparse), // Neural sparse index
       IndexSchema(
-        fields: ['embedding'], // Field to index
-        type: IndexType.vector, // Build a vector index
+        fields: ['embedding'],
+        type: IndexType.vector, // Dense vector index
         vectorConfig: VectorIndexConfig(
-          indexType: VectorIndexType.ngh, // ToStore built-in proprietary dense index
-          distanceMetric: VectorDistanceMetric.cosine, // Good for normalized embeddings
+          indexType: VectorIndexType.ngh, // NGH: ToStore built-in dense index
+          distanceMetric: VectorDistanceMetric.cosine,
         ),
       ),
     ],
@@ -773,78 +778,127 @@ await db.createTables([
 ]);
 
 final queryVector =
-    VectorData.fromList(List.generate(128, (i) => i * 0.01)); // Must match dimensions
+    VectorData.fromList(List.generate(128, (i) => i * 0.01));
+final querySparse = SparseVectorData.fromMap({12: 0.8, 45: 0.6, 90: 0.3});
 
-// 1) Recommended: chained hybrid retrieval (pure vector ANN)
-// Prefer .select([pk]) for primary key + score only — avoids full-record hydration.
-final result = await db
-    .query('embeddings')
+// 1) Lexical text retrieval (engine tokenizes TextQuery.text;
+//    or use pre-tokenized TextQuery.terms / termsWeighted)
+final textHits = await db
+    .query('documents')
     .select(['id'])
-    .matchVector('embedding', queryVector) // varsayılan searchDepth = 50
+    .matchText('content', TextQuery.text('distributed kernel storage'))
+    .limit(5);
+
+// 2) Neural sparse retrieval
+final sparseHits = await db
+    .query('documents')
+    .select(['id'])
+    .matchSparse('features', querySparse, minScore: 0.30)
+    .limit(5);
+
+// 3) Dense vector ANN (default searchDepth = 50)
+final result = await db
+    .query('documents')
+    .select(['id'])
+    .matchVector('embedding', queryVector, minScore: 0.40)
     .limit(5);
 
 for (var i = 0; i < result.data.length; i++) {
   final record = result.data[i];
   final entry = result.retrieval?.entries[i];
   print('pk=${record['id']}, score=${entry?.score}, '
-      'distance=${entry?.meta?['distance']}');
+      'rawScore=${entry?.rawScore}, distance=${entry?.meta?['distance']}');
 }
 
-// Need business columns? omit select() (or project the fields you need) —
-// the engine then loads full table records for matched PKs (heavier).
-
-// 2) Structured filter + vector (AND hybrid)
+// 4) Structured filter + vector (AND)
 final filtered = await db
-    .query('embeddings')
+    .query('documents')
     .whereEqual('category', 'tech')
-    .matchVector('embedding', queryVector)
+    .matchVector('embedding', queryVector, minScore: 0.40)
     .limit(5);
 
-// 3) Multi-way fused recall (vector + structured paths, engine-side RRF)
-final otherVector =
-    VectorData.fromList(List.generate(128, (i) => i * 0.012));
+// 5) Multi-way fusion: text + sparse + vector (default weightedScore)
 final fused = await db
-    .query('embeddings')
-    .matchVector('embedding', queryVector, weight: 1.0)
-    .orMatchVector('embedding', otherVector, weight: 0.6, minScore: 0.2)
-    .or()
-    .whereEqual('category', 'tech')
+    .query('documents')
+    .matchText('content', TextQuery.text('distributed storage'), weight: 0.4)
+    .matchSparse('features', querySparse, weight: 0.3, minScore: 0.20)
+    .matchVector('embedding', queryVector, weight: 0.6, minScore: 0.40)
     .limit(10);
+print('fusion=${fused.retrieval?.fusionMethod}'); // weightedScore
 
-print('fusion=${fused.retrieval?.fusionMethod}'); // Multi-way is typically rrf
+// Opt into rank-only fusion (relative scores — not absolute relevance bands)
+final fusedRrf = await db
+    .query('documents')
+    .matchText('content', TextQuery.text('distributed storage'), weight: 0.4)
+    .matchVector('embedding', queryVector, weight: 0.6, minScore: 0.40)
+    .fusionMethod(RetrievalFusionMethod.rrf)
+    .limit(10);
+print('fusion=${fusedRrf.retrieval?.fusionMethod}'); // rrf
 
-// Dedicated ANN (same core path; PK + score only, no query chain / fusion)
+// Dedicated ANN (PK + score only; no query chain / fusion)
 final ann = await db.vectorSearch(
-  'embeddings',
+  'documents',
   fieldName: 'embedding',
   queryVector: queryVector,
   topK: 5,
+  minScore: 0.40,
 );
 ```
 
-**Şema / vektör indeks yapılandırması** (`VectorFieldConfig`, `VectorIndexConfig`):
+**Kanal / şema eşlemesi**:
+
+| Kanal | Alan türü | İndeks | Sorgu API | Sorgu değeri |
+| :--- | :--- | :--- | :--- | :--- |
+| Sözcüksel metin | `DataType.text` | `IndexType.text` | `matchText` / `orMatchText` | `TextQuery.text` / `terms` / `termsWeighted` |
+| Nöral seyrek | `DataType.sparse` | `IndexType.sparse` | `matchSparse` / `orMatchSparse` | `SparseVectorData` |
+| Yoğun vektör | `DataType.vector` | `IndexType.vector` | `matchVector` / `orMatchVector` | `VectorData` vb. |
+
+**Yoğun vektör yapılandırması** (`VectorFieldConfig`, `VectorIndexConfig`):
 
 - `dimensions`: yazılan embedding genişliğiyle eşleşmelidir
-- `indexType`: yoğun vektör algoritması tanımlayıcısı; şu an `ngh`
+- `indexType`: opak yoğun algoritma kimliği; şu an `ngh`
 - `distanceMetric`: indeks tarafı benzerlik ölçüsü (oluşturma ve arama); `cosine` anlamsal embedding için yaygındır, `l2` Öklid mesafesi, `innerProduct` nokta çarpımı araması içindir. Veri yazıldıktan sonra değiştirmek genellikle vektör indeksini yeniden oluşturmayı gerektirir.
 
-**Zincirli getirme parametreleri** (`matchVector` / `orMatchVector` ve sorgu zincirindeki `limit`):
+**Zincirli getirme parametreleri** (her `match*` / `orMatch*` ve sorgu zincirindeki `limit`):
 
-- `field` / `vector`: hedef vektör alanı ve sorgu vektörü (`VectorData` / `List<num>` / `Float32List`)
-- `searchDepth`: isteğe bağlı arama derinliği (`>= 1`, varsayılan `50`). Daha büyük değerler genellikle recall ve gecikmeyi artırır. Yaklaşık en yakın komşu — **garanti recall@K değil**. Derlem büyüdükçe daha fazla komşu bulmak istiyorsanız yükseltin.
-- `weight`: çok yollu getirmede bu kanalın füzyon ağırlığı; varsayılan `1.0`
-- `minScore`: normalize benzerlik alt sınırı `[0.0 ~ 1.0]`; altındakiler elenir
-- `distanceThreshold`: mesafe üst sınırı; aşan adaylar dışlanır
-- `limit`: döndürülecek sonuç sayısı (tipik ANN kullanımında topK karşılığı)
+- Metin
+  - `TextQuery.text`: motor tarafından tokenleştirilir
+  - `TextQuery.terms` / `termsWeighted`: önceden tokenleştirilmiş; ikinci geçiş yok; Latin terimler indeks tarafıyla eşleşmeli (genellikle küçük harf)
+  - `operator`: `or` (varsayılan; birleşim sıralaması) veya `and` (her pozitif ağırlıklı terim isabet etmeli, sonra sırala)
+  - İfade eşleştirme desteklenmez
+- Seyrek
+  - `SparseVectorData` / `SparseVectorData.fromMap(...)`: seyrek sorgu vektörü
+  - Belge tarafı ağırlıklar tercihen `(0, 1]` aralığında olmalı
+- Vektör
+  - `field` / `vector`: hedef alan ve sorgu vektörü
+  - `searchDepth`: `>= 1`, varsayılan `50`; daha büyük değerler genellikle recall ve gecikmeyi artırır; yaklaşık en yakın komşu — **garanti recall@K değil**
+  - `distanceThreshold`: mesafe üst sınırı
+- Ortak
+  - `weight`: çok yollu füzyon ağırlığı; varsayılan `1.0`
+  - `minScore`: ilgililik alt sınırı
+  - `limit`: sonuç sayısı (topK)
+  - `.fusionMethod(...)`: çok yolluda varsayılan `weightedScore`; `rrf`’ye geçilebilir
 
-**Sonuç notları** (`QueryResult`):
+**Sonuç ve skor notları** (`QueryResult` / `VectorSearchResult`):
 
-- İş satırları `data` içinde; getirme skorları ve kanal bilgisi `retrieval.entries` içinde, `data` ile **1:1** hizalı
-- Yüksek verimli ANN / hibrit getirme için `.select(['id'])` (PK alan adı) kullanın; böylece `data` yalnızca PK olur, skorlar `retrieval`’da kalır
-- `entry.score`: normalize benzerlik / füzyon skoru, tipik olarak `0 ~ 1`; büyük = daha ilgili
-- `entry.meta['distance']`: ham mesafe (vektör kanalında yaygındır); `l2` / `cosine` için küçük genellikle daha yakındır
-- `retrieval.fusionMethod`: tek kanalda genellikle `single`; çok yollu füzyon tipik olarak `rrf` (Reciprocal Rank Fusion)
-- Üst düzey `db.vectorSearch(...)`, yapılandırılmış filtre veya çok yollu füzyon olmadan yalnızca özel ANN gerektiğinde `List<VectorSearchResult>` (`primaryKey` / `score` / `distance`) döndürür
+- İş kayıtları `data` içinde; getirme skorları ve kanal bilgisi `retrieval.entries` içinde, `data` ile **1:1** hizalı. Yalnızca birincil anahtar ve skor gerekiyorsa `.select(['id'])` tercih edin.
+- `score` (normalize ilgililik skoru, `0.0 ~ 1.0`): metin, seyrek ve vektör getirmede birleşik ilgililik (`yüksek` = daha ilgili). Tam vektör öz-eşleşmesi `1.0`’dır. Güçlü isabetleri tutmak ve zayıf olanları elemek için `minScore` kullanın. Varsayılan çok yollu `weightedScore` füzyonu güçlü tek kanallı isabeti korur; metin ve seyrek `[0.0, 1.0)` aralığında kalır.
+- `rawScore`: normalize edilmemiş fiziksel ölçü — kosinüs / nokta çarpımı / L2 / metin etkisi. Altta yatan ölçü gerektiğinde `rawScore` / `distance` okuyun.
+- `entry.meta['distance']`: vektör kanallarında ANN mesafesi (`düşük` = daha yakın).
+- `retrieval.fusionMethod`: tek kanalda `null`; çok yolluda varsayılan `weightedScore` (`.fusionMethod(RetrievalFusionMethod.rrf)` ile değiştirilebilir).
+- Üst düzey `db.vectorSearch(...)` özel ANN için `List<VectorSearchResult>` (`primaryKey` / `score` / `rawScore` / `distance`) döndürür. İsteğe bağlı `minScore`, `matchVector` ile aynı ilgililik alt sınırını kullanır (`topK`’dan daha az dönebilir).
+
+**İlgililik skoru (`score`) ve eşik referans baseli** (tek kanal ve çok yollu `weightedScore`; `rrf` için değil). Tipik embedding’ler için (**boyut ≥ 128**); daha düşük boyutta zayıf komşular yüksek skor alabilir — gerekirse `minScore`’u yükseltin veya `rawScore` kullanın:
+
+| İlgililik skoru (`score`) | Baseline anlamı ve tipik senaryolar |
+| :--- | :--- |
+| `>= 0.85` | Aynı varlık eşleşmesi (yüz doğrulama, biyometri, kesin tekilleştirme) |
+| `>= 0.70` | Yüksek güvenli anlamsal eşleşme (çekirdek olgular, kesin S&C) |
+| `>= 0.40` | Temel anlamsal ilgililik (genel RAG, bilgi tabanı anti-halüsinasyon) |
+| `>= 0.30` | Geniş ilk recall (bulanık keşif, yeniden sıralama aday havuzu) |
+| `< 0.30` | Zayıf ilişki veya arka plan gürültüsü |
+
+Düşük ilgililik isabetlerini elemek için kanal `minScore`’unu ihtiyaca göre yapılandırın.
 
 ### <a id="ttl-config"></a>Tablo düzeyinde TTL (Otomatik Zamana Dayalı Sona Erme)
 

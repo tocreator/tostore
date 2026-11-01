@@ -91,6 +91,20 @@ class NghIndexMeta {
   /// Whether this index is currently being built by a background migration task.
   final bool isBuilding;
 
+  // ===================== Null-floor stats (optional) ============
+
+  /// Pairwise cosine mean from background moment matching (`null` = L1 only).
+  final double? nullFloorMu;
+
+  /// Effective dimension from background moment matching.
+  final double? nullFloorDEff;
+
+  /// `totalVectors` when [nullFloorMu] / [nullFloorDEff] were last estimated.
+  final int? nullFloorAtVectors;
+
+  /// Estimator algorithm version (bump when fit semantics change).
+  final int? nullFloorVersion;
+
   // ===================== Constructor ===========================
 
   NghIndexMeta({
@@ -124,6 +138,10 @@ class NghIndexMeta {
     this.pkBackfillPage = 0,
     this.leafPageSize = 0,
     this.navPageSize = 0,
+    this.nullFloorMu,
+    this.nullFloorDEff,
+    this.nullFloorAtVectors,
+    this.nullFloorVersion,
   })  : version = version ?? InternalConfig.indexVersion,
         leafFreeListHeads = leafFreeListHeads ?? const {},
         navFreeListHeads = navFreeListHeads ?? const {},
@@ -221,6 +239,11 @@ class NghIndexMeta {
     int? pkBackfillPage,
     int? leafPageSize,
     int? navPageSize,
+    double? nullFloorMu,
+    double? nullFloorDEff,
+    int? nullFloorAtVectors,
+    int? nullFloorVersion,
+    bool clearNullFloor = false,
   }) {
     return NghIndexMeta(
       version: version ?? this.version,
@@ -253,6 +276,14 @@ class NghIndexMeta {
       pkBackfillPage: pkBackfillPage ?? this.pkBackfillPage,
       leafPageSize: leafPageSize ?? this.leafPageSize,
       navPageSize: navPageSize ?? this.navPageSize,
+      nullFloorMu: clearNullFloor ? null : (nullFloorMu ?? this.nullFloorMu),
+      nullFloorDEff:
+          clearNullFloor ? null : (nullFloorDEff ?? this.nullFloorDEff),
+      nullFloorAtVectors: clearNullFloor
+          ? null
+          : (nullFloorAtVectors ?? this.nullFloorAtVectors),
+      nullFloorVersion:
+          clearNullFloor ? null : (nullFloorVersion ?? this.nullFloorVersion),
     );
   }
 
@@ -298,6 +329,10 @@ class NghIndexMeta {
       pkBackfillPage: (json['pkBackfillPage'] as num?)?.toInt() ?? 0,
       leafPageSize: (json['leafPageSize'] as num?)?.toInt() ?? 0,
       navPageSize: (json['navPageSize'] as num?)?.toInt() ?? 0,
+      nullFloorMu: (json['nullFloorMu'] as num?)?.toDouble(),
+      nullFloorDEff: (json['nullFloorDEff'] as num?)?.toDouble(),
+      nullFloorAtVectors: (json['nullFloorAtVectors'] as num?)?.toInt(),
+      nullFloorVersion: (json['nullFloorVersion'] as num?)?.toInt(),
     );
   }
 
@@ -333,6 +368,10 @@ class NghIndexMeta {
       'pkBackfillPage': pkBackfillPage,
       'leafPageSize': leafPageSize,
       'navPageSize': navPageSize,
+      if (nullFloorMu != null) 'nullFloorMu': nullFloorMu,
+      if (nullFloorDEff != null) 'nullFloorDEff': nullFloorDEff,
+      if (nullFloorAtVectors != null) 'nullFloorAtVectors': nullFloorAtVectors,
+      if (nullFloorVersion != null) 'nullFloorVersion': nullFloorVersion,
     };
   }
 

@@ -4780,7 +4780,11 @@ class DatabaseTester {
       ok &= _expect(
           'calibration top1 exact', hits.first.primaryKey, pkByName['exact']);
 
+      // Physical GT on rawScore; bands apply to score (tracks similarity).
+      // At 128D: high-conf cos clears RAG; weak must not inflate.
+      const ragFloor = 0.40;
       final byPk = {for (final h in hits) h.primaryKey: h};
+      final recalledScores = <String, double>{};
       for (final p in planted) {
         final hit = byPk[pkByName[p.name]];
         if (hit == null) {
@@ -4790,19 +4794,53 @@ class DatabaseTester {
           }
           continue;
         }
-        final expectedScore = p.cos < 0 ? 0.0 : p.cos;
+        recalledScores[p.name] = hit.score;
         ok &= _expectClose(
-          'score for ${p.name} (target cos ${p.cos})',
+          'rawScore for ${p.name} (target cos ${p.cos})',
+          hit.rawScore,
+          p.cos,
+          eps: 0.03,
+        );
+        // Cross-threshold contract around the published RAG floor.
+        if (p.cos >= ragFloor) {
+          ok &= _expect(
+            '${p.name} (cos=${p.cos}) must clear RAG ($ragFloor)',
+            hit.score >= ragFloor - 1e-9,
+            true,
+          );
+        }
+        if (p.cos < ragFloor) {
+          ok &= _expect(
+            '${p.name} (cos=${p.cos}) must stay below RAG ($ragFloor)',
+            hit.score < ragFloor,
+            true,
+          );
+        }
+        // Identity mapping: score tracks planted cosine within SQ8 budget.
+        ok &= _expectClose(
+          'score~cos for ${p.name}',
           hit.score,
-          expectedScore,
-          eps: p.cos >= 0.5 ? 0.06 : 0.08,
+          p.cos,
+          eps: p.cos >= 0.999 ? 0.02 : 0.10,
+        );
+      }
+      if (recalledScores.containsKey('exact') &&
+          recalledScores.containsKey('strong') &&
+          recalledScores.containsKey('mid')) {
+        ok &= _expect(
+          'score order exact > strong',
+          recalledScores['exact']! > recalledScores['strong']!,
+          true,
+        );
+        ok &= _expect(
+          'score order strong > mid',
+          recalledScores['strong']! > recalledScores['mid']!,
+          true,
         );
       }
 
-      // Score calibration: plant query at cos≈0.30 to axis, then for each ANN
-      // hit compare reported score to true cosine(query, stored). False
-      // inflation = trueCos < 0.40 while score >= 0.50. Geometry may recall a
-      // stronger neighbor than the planted pair — that is fine if score tracks.
+      // Weak probe: rawScore tracks true cosine; scores for trueCos < RAG
+      // must not falsely clear the RAG band.
       final weakQuery = _vectorAtCosine(query, 0.30, seed: 77);
       final weakHits = await db.vectorSearch(
         table.name,
@@ -4822,26 +4860,26 @@ class DatabaseTester {
         for (final p in planted) pkByName[p.name]!: p.vec,
       };
       var falseInflation = 0;
-      var calibrated = 0;
+      var resolved = 0;
       for (final hit in weakHits) {
         final stored = plantedVecByPk[hit.primaryKey];
         if (stored == null) continue;
         final trueCos =
-            weakQuery.cosineSimilarity(stored).clamp(0.0, 1.0).toDouble();
-        calibrated++;
+            weakQuery.cosineSimilarity(stored).clamp(-1.0, 1.0).toDouble();
+        resolved++;
         ok &= _expectClose(
-          'calib score~trueCos pk=${hit.primaryKey}',
-          hit.score,
+          'calib rawScore~trueCos pk=${hit.primaryKey}',
+          hit.rawScore,
           trueCos,
-          eps: 0.08,
+          eps: 0.03,
         );
-        if (trueCos < 0.40 && hit.score >= 0.50) {
+        if (trueCos < ragFloor && hit.score >= ragFloor) {
           falseInflation++;
         }
       }
-      ok &= _expect('calib resolved planted hits', calibrated > 0, true);
+      ok &= _expect('calib resolved planted hits', resolved > 0, true);
       ok &= _expect(
-        'calib no false inflation (trueCos<0.4, score>=0.5)',
+        'calib no false inflation (trueCos<RAG, score>=RAG)',
         falseInflation,
         0,
       );
@@ -4865,6 +4903,33 @@ class DatabaseTester {
       ok &=
           _expect('minScore drops noise', strictNames.contains('noise'), false);
 
+      // Top-level vectorSearch minScore uses the same score floor.
+      final annStrict = await db.vectorSearch(
+        table.name,
+        fieldName: field,
+        queryVector: query,
+        topK: planted.length,
+        searchDepth: 100,
+        minScore: 0.6,
+      );
+      ok &= _expect(
+        'vectorSearch minScore keeps exact',
+        annStrict.any((h) => h.primaryKey == pkByName['exact']),
+        true,
+      );
+      for (final h in annStrict) {
+        ok &= _expect(
+          'vectorSearch minScore hit >=0.6',
+          h.score >= 0.6 - 1e-9,
+          true,
+        );
+      }
+      ok &= _expect(
+        'vectorSearch minScore drops weak pk',
+        annStrict.any((h) => h.primaryKey == pkByName['weak']),
+        false,
+      );
+
       // searchDepth=1 still returns <= topK and includes exact on tiny corpus.
       final shallow = await db.vectorSearch(
         table.name,
@@ -4882,20 +4947,6 @@ class DatabaseTester {
         'searchDepth=1 still finds exact on tiny corpus',
         shallow.any((h) => h.primaryKey == pkByName['exact']),
         true,
-      );
-
-      // Formula unit checks (no I/O).
-      ok &= _expectClose(
-        'cosine similarityFromDistance(0.3)',
-        VectorDistanceMetric.cosine.similarityFromDistance(0.3),
-        0.7,
-        eps: 1e-12,
-      );
-      ok &= _expectClose(
-        'cosine clamps opposite hemisphere',
-        VectorDistanceMetric.cosine.similarityFromDistance(1.5),
-        0.0,
-        eps: 1e-12,
       );
     } catch (e, s) {
       ok = false;
@@ -4979,11 +5030,180 @@ class DatabaseTester {
           entry.score >= 0 && entry.score <= 1.0,
           true,
         );
-        // Absolute fusion must not force top hit to exactly 1.0.
+        // Exact vector self-match on a dual-channel query: dominant fusion
+        // must preserve physical 1.0 (not dilute toward an average < 1).
+        ok &= _expectClose(
+          'fused preserves exact vector self-match (~1.0)',
+          entry.score,
+          1.0,
+          eps: 0.02,
+        );
+      }
+
+      // ----- Gate C: hybrid fusion invariants (writable micro-corpus) -----
+      const ragFloor = 0.40;
+      final vOrtho = _vectorAtCosine(vTech, 0.0, seed: 42);
+      final techPk = h1.firstPrimaryKey!;
+
+      Future<double?> scoreOfPk(QueryResult qr, String pk) async {
+        final entries = qr.retrieval?.entries ?? const <RetrievalEntry>[];
+        final n = math.min(qr.data.length, entries.length);
+        for (int i = 0; i < n; i++) {
+          if (qr.data[i]['id']?.toString() == pk) {
+            return entries[i].score;
+          }
+        }
+        return null;
+      }
+
+      // C1 — Dominant floor (vector-only hit): nonsense text must not dilute.
+      final domVec = await db
+          .query(hybrid.name)
+          .select(['id', 'headline'])
+          .matchText(
+            'content',
+            TextQuery.text('zzzznonexistenttoken9999'),
+            minScore: ragFloor,
+          )
+          .matchVector(
+            'embedding',
+            vTech,
+            weight: 1.0,
+            searchDepth: 50,
+            minScore: ragFloor,
+          )
+          .fusionMethod(RetrievalFusionMethod.weightedScore)
+          .limit(5);
+      ok &= _expect(
+        'C1 dominant vector survives nonsense text',
+        domVec.data.any((r) => r['id']?.toString() == techPk),
+        true,
+      );
+      final domVecScore = await scoreOfPk(domVec, techPk);
+      if (domVecScore != null) {
+        ok &= _expectClose(
+          'C1 dominant floor keeps self-match ~1.0',
+          domVecScore,
+          1.0,
+          eps: 0.02,
+        );
         ok &= _expect(
-          'fused top score not forced to 1.0',
-          entry.score == 1.0,
-          false,
+          'C1 fused score allows exact 1.0',
+          domVecScore <= 1.0 + 1e-9,
+          true,
+        );
+      } else {
+        ok = _failTest('C1 missing fused score for tech pk');
+      }
+
+      // C1b — Dominant floor (text-only hit): ortho vector must not dilute.
+      final textOnly = await db
+          .query(hybrid.name)
+          .select(['id'])
+          .matchText('content', TextQuery.text('distributed database'))
+          .limit(5);
+      final textOnlyScore = await scoreOfPk(textOnly, techPk);
+      final domText = await db
+          .query(hybrid.name)
+          .select(['id'])
+          .matchText('content', TextQuery.text('distributed database'))
+          .matchVector('embedding', vOrtho, weight: 1.0, searchDepth: 50)
+          .fusionMethod(RetrievalFusionMethod.weightedScore)
+          .limit(5);
+      final domTextScore = await scoreOfPk(domText, techPk);
+      ok &= _expect('C1b text-only hit exists', textOnlyScore != null, true);
+      ok &= _expect('C1b text+ortho hit exists', domTextScore != null, true);
+      if (textOnlyScore != null && domTextScore != null) {
+        ok &= _expect(
+          'C1b text dominant not diluted by ortho vector',
+          domTextScore + 1e-6 >= textOnlyScore,
+          true,
+        );
+        if (textOnlyScore >= ragFloor) {
+          ok &= _expect(
+            'C1b text dominant stays >= RAG when text alone clears it',
+            domTextScore >= ragFloor - 1e-9,
+            true,
+          );
+        }
+      }
+
+      // C2 — Dual-noise: nonsense text + ortho vector must be fully discarded
+      // by the published RAG floor (no false inflation into usable band).
+      final dualNoise = await db
+          .query(hybrid.name)
+          .select(['id'])
+          .matchText(
+            'content',
+            TextQuery.text('zzzznonexistenttoken9999'),
+            minScore: ragFloor,
+          )
+          .matchVector(
+            'embedding',
+            vOrtho,
+            weight: 1.0,
+            searchDepth: 80,
+            minScore: ragFloor,
+          )
+          .fusionMethod(RetrievalFusionMethod.weightedScore)
+          .limit(5);
+      ok &= _expect(
+        'C2 dual-noise fully discarded by minScore=0.40',
+        dualNoise.data.isEmpty,
+        true,
+      );
+      for (final e
+          in dualNoise.retrieval?.entries ?? const <RetrievalEntry>[]) {
+        ok &= _expect(
+          'C2 no leaked entry below RAG',
+          e.score + 1e-9 >= ragFloor,
+          true,
+        );
+      }
+
+      // C2b — Without minScore, dual-weak geometry must stay under RAG.
+      final dualWeak = await db
+          .query(hybrid.name)
+          .select(['id'])
+          .matchText('content', TextQuery.text('zzzznonexistenttoken9999'))
+          .matchVector('embedding', vOrtho, weight: 1.0, searchDepth: 80)
+          .fusionMethod(RetrievalFusionMethod.weightedScore)
+          .limit(5);
+      for (final e in dualWeak.retrieval?.entries ?? const <RetrievalEntry>[]) {
+        // Ortho/nonsense pair: fused must not invent a RAG-clearing score.
+        // (If ANN returns a true near-dup of vOrtho that was planted, skip —
+        //  this corpus only has vTech/vOther far from ortho.)
+        ok &= _expect(
+          'C2b dual-weak fused stays < RAG',
+          e.score < ragFloor,
+          true,
+        );
+      }
+
+      // C3 — Bounded corroboration: S_dom <= S_fused <= S_dom + (1-S_dom)*0.35
+      final vecOnly = await db
+          .query(hybrid.name)
+          .select(['id'])
+          .matchVector('embedding', vTech, weight: 1.0, searchDepth: 50)
+          .limit(5);
+      final sv = await scoreOfPk(vecOnly, techPk);
+      final st = textOnlyScore;
+      final sf = await scoreOfPk(fused, techPk);
+      ok &= _expect('C3 vector-only score present', sv != null, true);
+      ok &= _expect('C3 text-only score present', st != null, true);
+      ok &= _expect('C3 fused score present', sf != null, true);
+      if (sv != null && st != null && sf != null) {
+        final sDom = sv >= st ? sv : st;
+        final upper = sDom + (1.0 - sDom) * 0.35;
+        ok &= _expect(
+          'C3 fused respects dominant floor',
+          sf + 1e-6 >= sDom,
+          true,
+        );
+        ok &= _expect(
+          'C3 fused respects corroboration cap',
+          sf <= upper + 1e-6,
+          true,
         );
       }
 
@@ -5092,9 +5312,9 @@ class DatabaseTester {
 
   /// Text/sparse: pre-flush visibility, seal, CRUD ghosts, overflow, multi-flush.
   ///
-  /// Unlike durable vector ANN, text/sparse inserts are searchable before
-  /// flush. Flush still seals pages; post-flush queries are run twice for
-  /// hot-cache / ghost regressions.
+  /// Unlike durable vector ANN, text/sparse insert/update/delete are searchable
+  /// (or immediately retired) before flush. Flush still seals pages; post-flush
+  /// queries are run twice for hot-cache / ghost regressions.
   Future<bool> _testTextSparseCrudAndPersistence() async {
     log.add('--- Testing: Text/Sparse CRUD & Persistence ---', LogLevel.debug);
     var ok = true;
@@ -5243,12 +5463,55 @@ class DatabaseTester {
         true,
       );
 
-      // Update content+features: old terms/dims must lose, new must win.
+      // Update content+features: old terms/dims must lose, new must win
+      // immediately — before flush (pending WMBP corpus).
       final upd = await db.update(table.name, {
         'content': 'completely rewritten cooking recipes and kitchen tips',
         'features': SparseVectorData.fromMap({42: 0.9}),
       }).whereEqual('id', pk1);
       ok &= _expect('content/features update', !upd.hasErrors, true);
+
+      final oldTextBefore = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(textField, TextQuery.text('distributed inverted'))
+          .limit(10);
+      ok &= _expect(
+        'pre-flush update: pk1 absent from old text',
+        oldTextBefore.data.any((r) => r['id']?.toString() == pk1),
+        false,
+      );
+      final newTextBefore = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(textField, TextQuery.text('cooking recipes'))
+          .limit(10);
+      ok &= _expect(
+        'pre-flush update: pk1 hits new text',
+        newTextBefore.data.any((r) => r['id']?.toString() == pk1),
+        true,
+      );
+      final oldDimBefore = await db
+          .query(table.name)
+          .select(['id'])
+          .matchSparse(sparseField, SparseVectorData.fromMap({120000: 1.0}))
+          .limit(10);
+      ok &= _expect(
+        'pre-flush update: pk1 absent from old sparse dim',
+        oldDimBefore.data.any((r) => r['id']?.toString() == pk1),
+        false,
+      );
+      final newDimBefore = await db
+          .query(table.name)
+          .select(['id'])
+          .matchSparse(sparseField, SparseVectorData.fromMap({42: 1.0}))
+          .limit(10);
+      ok &= _expect(
+        'pre-flush update: pk1 hits new sparse dim',
+        newDimBefore.data.any((r) => r['id']?.toString() == pk1),
+        true,
+      );
+
       await db.flush();
 
       final oldText = await db
@@ -5257,7 +5520,7 @@ class DatabaseTester {
           .matchText(textField, TextQuery.text('distributed inverted'))
           .limit(10);
       ok &= _expect(
-        'updated pk1 absent from old text query',
+        'post-flush update: pk1 absent from old text',
         oldText.data.any((r) => r['id']?.toString() == pk1),
         false,
       );
@@ -5267,7 +5530,7 @@ class DatabaseTester {
           .matchText(textField, TextQuery.text('cooking recipes'))
           .limit(10);
       ok &= _expect(
-        'updated pk1 hits new text',
+        'post-flush update: pk1 hits new text',
         newText.data.any((r) => r['id']?.toString() == pk1),
         true,
       );
@@ -5277,7 +5540,7 @@ class DatabaseTester {
           .matchSparse(sparseField, SparseVectorData.fromMap({120000: 1.0}))
           .limit(10);
       ok &= _expect(
-        'updated pk1 absent from old sparse dim',
+        'post-flush update: pk1 absent from old sparse dim',
         oldDim.data.any((r) => r['id']?.toString() == pk1),
         false,
       );
@@ -5287,14 +5550,36 @@ class DatabaseTester {
           .matchSparse(sparseField, SparseVectorData.fromMap({42: 1.0}))
           .limit(10);
       ok &= _expect(
-        'updated pk1 hits new sparse dim',
+        'post-flush update: pk1 hits new sparse dim',
         newDim.data.any((r) => r['id']?.toString() == pk1),
         true,
       );
 
-      // Delete -> flush -> no ghost on repeated search.
+      // Delete: must retire immediately before flush; then seal + hot recheck.
       final del = await db.delete(table.name).whereEqual('id', pk1);
       ok &= _expect('delete pk1', !del.hasErrors, true);
+
+      final goneTextBefore = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText(textField, TextQuery.text('cooking recipes'))
+          .limit(10);
+      ok &= _expect(
+        'pre-flush delete: pk1 absent text',
+        goneTextBefore.data.any((r) => r['id']?.toString() == pk1),
+        false,
+      );
+      final goneSparseBefore = await db
+          .query(table.name)
+          .select(['id'])
+          .matchSparse(sparseField, SparseVectorData.fromMap({42: 1.0}))
+          .limit(10);
+      ok &= _expect(
+        'pre-flush delete: pk1 absent sparse',
+        goneSparseBefore.data.any((r) => r['id']?.toString() == pk1),
+        false,
+      );
+
       await db.flush();
       final goneText1 = await db
           .query(table.name)
@@ -5307,12 +5592,12 @@ class DatabaseTester {
           .matchText(textField, TextQuery.text('cooking recipes'))
           .limit(10);
       ok &= _expect(
-        'deleted pk1 absent text (1st)',
+        'post-flush delete: pk1 absent text (1st)',
         goneText1.data.any((r) => r['id']?.toString() == pk1),
         false,
       );
       ok &= _expect(
-        'deleted pk1 absent text (2nd/hot)',
+        'post-flush delete: pk1 absent text (2nd/hot)',
         goneText2.data.any((r) => r['id']?.toString() == pk1),
         false,
       );
@@ -5327,12 +5612,12 @@ class DatabaseTester {
           .matchSparse(sparseField, SparseVectorData.fromMap({42: 1.0}))
           .limit(10);
       ok &= _expect(
-        'deleted pk1 absent sparse (1st)',
+        'post-flush delete: pk1 absent sparse (1st)',
         goneSparse1.data.any((r) => r['id']?.toString() == pk1),
         false,
       );
       ok &= _expect(
-        'deleted pk1 absent sparse (2nd/hot)',
+        'post-flush delete: pk1 absent sparse (2nd/hot)',
         goneSparse2.data.any((r) => r['id']?.toString() == pk1),
         false,
       );
@@ -6061,8 +6346,8 @@ class DatabaseTester {
         );
       }
 
-      // Update-before-flush ghost: rewrite content, search before flush must
-      // not keep sealed old terms for the same pk.
+      // Update-before-flush: old sealed terms/dims must drop and new ones
+      // must be searchable immediately (pending WMBP corpus).
       await db.update(table.name, {
         'content': 'totally different gardening soil compost',
         'features': SparseVectorData.fromMap({555: 1.0}),
@@ -6087,6 +6372,26 @@ class DatabaseTester {
         ghostSparse.data.any((r) => r['id']?.toString() == pk1),
         false,
       );
+      final newTextBeforeFlush = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText('content', TextQuery.text('gardening soil'))
+          .limit(10);
+      ok &= _expect(
+        'pre-flush after update: new text must hit pk1',
+        newTextBeforeFlush.data.any((r) => r['id']?.toString() == pk1),
+        true,
+      );
+      final newSparseBeforeFlush = await db
+          .query(table.name)
+          .select(['id'])
+          .matchSparse('features', SparseVectorData.fromMap({555: 1.0}))
+          .limit(10);
+      ok &= _expect(
+        'pre-flush after update: new sparse dim must hit pk1',
+        newSparseBeforeFlush.data.any((r) => r['id']?.toString() == pk1),
+        true,
+      );
       await db.flush();
       final ghostText2 = await db
           .query(table.name)
@@ -6097,6 +6402,16 @@ class DatabaseTester {
         'post-flush after update: old text still absent',
         ghostText2.data.any((r) => r['id']?.toString() == pk1),
         false,
+      );
+      final newTextAfterFlush = await db
+          .query(table.name)
+          .select(['id'])
+          .matchText('content', TextQuery.text('gardening soil'))
+          .limit(10);
+      ok &= _expect(
+        'post-flush after update: new text still hits pk1',
+        newTextAfterFlush.data.any((r) => r['id']?.toString() == pk1),
+        true,
       );
 
       // Multi-space isolation for text/sparse.
